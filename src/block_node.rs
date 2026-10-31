@@ -595,6 +595,9 @@ pub struct ChdNode {
     /// rebuild the base; it is restored before the operation returns.
     hd: Option<ChdHd>,
     sector_size: u64,
+    /// Written since the CHD was last closed and opened again (see
+    /// [`BlockNode::flush`] below).
+    unflushed: bool,
 }
 
 impl ChdNode {
@@ -603,7 +606,7 @@ impl ChdNode {
     pub fn open(path: &str, cow: bool) -> io::Result<Self> {
         let hd = ChdHd::open(path, cow)?;
         let sector_size = u64::from(hd.sector_size());
-        Ok(Self { hd: Some(hd), sector_size })
+        Ok(Self { hd: Some(hd), sector_size, unflushed: false })
     }
 
     fn hd(&self) -> &ChdHd {
@@ -637,12 +640,26 @@ impl BlockNode for ChdNode {
             return Err(invalid("CHD writes must be sector-aligned"));
         }
         check_range(self.hd().size(), offset, buf.len() as u64)?;
+        self.unflushed = true;
         self.hd_mut().write_sectors(offset / ss, buf)
     }
 
+    /// libchdman has no flush: the writes it has accepted are all in its file
+    /// only once it is closed, and a node that is leaked, as at a
+    /// `process::exit`, never closes it (the last hunks written come back
+    /// unwritten). So close the CHD and open it again, which is the one way to
+    /// make them durable. It costs a reopen only when something was written
+    /// since the last flush.
     fn flush(&mut self) -> io::Result<()> {
-        // CHD sector writes go straight to the image (or its diff); there is no
-        // user-space write-back cache to drain.
+        if !self.unflushed {
+            return Ok(());
+        }
+        let hd = self.hd.take().expect("CHD handle present outside commit/rollback");
+        let base = hd.base_path().to_str().ok_or_else(|| invalid("non-UTF-8 CHD path"))?.to_string();
+        let cow = hd.is_cow();
+        drop(hd); // closes the file, writing out what libchdman held back
+        self.hd = Some(ChdHd::open(&base, cow)?);
+        self.unflushed = false;
         Ok(())
     }
 
@@ -701,6 +718,7 @@ impl BlockNode for ChdNode {
         // base + diff are intact even when the fold failed, so either way the
         // disk can be reopened; surface the fold error after restoring the node.
         self.hd = Some(ChdHd::open(&base_str, cow)?);
+        self.unflushed = false;
         folded?;
         Ok(1)
     }
@@ -720,6 +738,7 @@ impl BlockNode for ChdNode {
         self.hd = None; // close before reopening over the (untouched) base
         let _ = std::fs::remove_file(&diff);
         self.hd = Some(ChdHd::open(&base_str, cow)?);
+        self.unflushed = false;
         Ok(())
     }
 }
@@ -1086,6 +1105,32 @@ mod tests {
     fn cleanup(overlay: &Path) {
         let _ = std::fs::remove_file(overlay);
         let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(overlay));
+    }
+
+    /// libchdman has no flush: what it has accepted is in the file only once
+    /// it is closed, which a node left behind by `process::exit` never is.
+    /// `mem::forget` stands in for that exit; the write must still be there
+    /// when the CHD is opened again, both in a diff and with the COW flag, at
+    /// the start, middle and end of the disk.
+    #[test]
+    fn chd_flushed_writes_survive_an_exit_that_skips_drop() {
+        for cow in [false, true] {
+            for lba in [0u64, 9, 511] {
+                let base = compressed_chd(0xAB);
+                let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+                node.write(lba * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
+                node.flush().unwrap();
+                std::mem::forget(node);
+
+                let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+                let mut got = [0u8; SECTOR_BYTES];
+                node.read(lba * SECTOR_SIZE, &mut got).unwrap();
+                assert_eq!(got, [0x5A; SECTOR_BYTES], "cow={cow} lba={lba}");
+                drop(node);
+                let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
+                let _ = std::fs::remove_file(base);
+            }
+        }
     }
 
     #[test]

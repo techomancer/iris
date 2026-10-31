@@ -85,6 +85,11 @@ impl ChdHd {
         self.overlay_paths().filter(|_| self.dirty)
     }
 
+    /// The base CHD this disk was opened from.
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
     /// Whether this disk is in copy-on-write mode (the per-disk COW flag).
     pub fn is_cow(&self) -> bool {
         self.cow
