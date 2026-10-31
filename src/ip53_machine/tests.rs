@@ -477,3 +477,29 @@ fn a_counted_store_to_the_v12_returns_its_credit() {
     let _ = bus.write64(io_view | widget(11, 0x100), 0);
     assert_eq!(credit(), 1000);
 }
+
+/// A counted store the bus answers busy is made again by the processor and
+/// counted again, so the refused attempt must cost nothing: the node puts
+/// the credit back. A refund also undoes a count across the wrap.
+#[test]
+fn a_counted_store_refused_busy_is_refunded() {
+    use crate::dev::odyssey::{PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE};
+    struct Busy;
+    impl BusDevice for Busy {
+        fn write64(&self, _addr: u64, _val: u64) -> u32 {
+            crate::traits::BUS_BUSY
+        }
+    }
+    let board = board_with_v12(1);
+    let (pi, bus) = (&board.node.pi[0], &board.node.bus);
+    board.node.io.connect_widget(9, Arc::new(Busy));
+    let page = widget(9, 0) & PI_GFX_PAGE_ADDRESS;
+    assert_eq!(pi.write64(0x300, PI_GFX_PAGE_ENABLE | page), BUS_OK);
+    assert_eq!(pi.write64(0x308, 5), BUS_OK);
+    let io_view = 1u64 << 57;
+    assert_eq!(bus.write64(io_view | widget(9, 0), 0), crate::traits::BUS_BUSY);
+    assert_eq!(pi.read64(0x308).data, 5, "refunded");
+    assert_eq!(pi.write64(0x308, 0), BUS_OK);
+    assert_eq!(bus.write64(io_view | widget(9, 0), 0), crate::traits::BUS_BUSY);
+    assert_eq!(pi.read64(0x308).data, 0, "back across the wrap");
+}

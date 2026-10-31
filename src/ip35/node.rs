@@ -31,7 +31,7 @@ use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend,
 use crate::devlog::LogModule;
 use crate::irq::{InterruptController, IrqLine};
 use crate::ppmem::devmap::SLOT_SHIFT;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, MachineEvent, Signal, BUS_ERR, BUS_OK};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, MachineEvent, Signal, BUS_BUSY, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
@@ -220,7 +220,7 @@ pub(crate) struct Node {
     pub ni: Arc<BedrockNi>,
     pub xb: Arc<BedrockXb>,
     /// Set once by a board that counts graphics stores.
-    io_store_counter: Arc<OnceLock<StoreCounter>>,
+    io_store_counter: Arc<OnceLock<Box<dyn StoreCounter>>>,
     #[cfg(test)]
     pub irq: Arc<PendingIrq>,
 }
@@ -228,7 +228,7 @@ pub(crate) struct Node {
 impl Node {
     /// Count the processor's uncached I/O stores with `counter`, as a board
     /// with graphics credits does. Once, before the processor runs.
-    pub fn count_io_stores(&self, counter: StoreCounter) {
+    pub fn count_io_stores(&self, counter: Box<dyn StoreCounter>) {
         assert!(self.io_store_counter.set(counter).is_ok(), "node I/O store counter already set");
     }
 
@@ -540,15 +540,21 @@ impl BusDevice for WidgetDma {
     widget_dma_access!(read64, write64, u64, BusRead64, 8);
 }
 
-/// Whether a processor's uncached I/O store at a node I/O offset is counted
-/// against a graphics page (see [`crate::dev::odyssey::PiGfx`]).
-pub(crate) type StoreCounter = Box<dyn Fn(u64) -> bool + Send + Sync>;
+/// The processor interface's count of uncached I/O stores against a
+/// graphics page (see [`crate::dev::odyssey::PiGfx`]).
+pub(crate) trait StoreCounter: Send + Sync {
+    /// Whether the store at node I/O offset `address` is counted.
+    fn count(&self, address: u64) -> bool;
+    /// A counted store the bus answered busy did not happen: the processor
+    /// will make it again, and pays for it then.
+    fn refund(&self, address: u64);
+}
 
 /// The processor's uncached I/O view of the node. A board with graphics
 /// counts its stores; the store is forwarded marked as counted or not.
 struct IoPio {
     io: Arc<BedrockIo>,
-    counter: Arc<OnceLock<StoreCounter>>,
+    counter: Arc<OnceLock<Box<dyn StoreCounter>>>,
 }
 macro_rules! pio_access {
     ($r:ident,$w:ident,$ty:ty,$result:ident,$size:expr) => {
@@ -560,10 +566,14 @@ macro_rules! pio_access {
             }
         }
         fn $w(&self, a: u64, v: $ty) -> u32 {
-            let counted = self.counter.get().is_some_and(|count| count(a));
+            let counter = self.counter.get();
+            let counted = counter.is_some_and(|c| c.count(a));
             let previous = pi_gfx_mark_store(counted);
             let status = self.io.pio_write(a, $size, v as u64);
             pi_gfx_unmark_store(previous);
+            if let (true, BUS_BUSY, Some(c)) = (counted, status, counter) {
+                c.refund(a);
+            }
             status
         }
     };

@@ -79,7 +79,7 @@ use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::L1Config;
-use crate::dev::odyssey::{Odyssey, PacketSender, PiGfx, PiGfxLink, PI_GFX_REGS};
+use crate::dev::odyssey::{Odyssey, PacketSender, PiGfx, PiGfxLink, PI_GFX_CREDIT_MASK, PI_GFX_REGS};
 use crate::dev::pic::{Function, Pic, PicPeer, Refused};
 use crate::dev::pxbow::Pxbow;
 use crate::dev::prom_image;
@@ -90,7 +90,7 @@ use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
 use crate::ip35::CPU_PHYS_MASK;
-use crate::ip35::node::{connect_cpu, connect_serial_ports, Node, NodeConfig, SerialPort, WidgetDma};
+use crate::ip35::node::{connect_cpu, connect_serial_ports, Node, NodeConfig, SerialPort, StoreCounter, WidgetDma};
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
@@ -866,24 +866,38 @@ fn fit_v12(
         .attach_endpoint(V12_WIDGET, v12.clone() as Arc<dyn BusDevice>)
         .map_err(|e| format!("Tezro V12: {e:?}"))?;
     node.io.connect_widget(V12_WIDGET, pxbow.route(V12_WIDGET));
-    let (pi0, gfx0) = (node.pi[0].clone(), gfx[0].clone());
-    node.count_io_stores(Box::new(move |address| count_cpu0_store(&pi0, &gfx0, address)));
+    node.count_io_stores(Box::new(Cpu0Stores { pi: node.pi[0].clone(), gfx: gfx[0].clone() }));
     Ok(v12)
 }
 
-/// CPU 0's uncached I/O store, counted against PI0 slot A, the only
-/// processor that runs: whether it was counted.
-fn count_cpu0_store(pi: &BedrockPi, gfx: &Mutex<PiGfx>, address: u64) -> bool {
-    let (counted, starved) = {
-        let mut g = gfx.lock();
-        let counted = g.count_store(0, address, "Tezro PI0");
-        (counted, counted && g.take_starved(0, "Tezro PI0"))
-    };
-    if starved {
-        // The slot's graphics interrupt: bit 1 + slot of bank 0.
-        pi.set_pending(0, 1);
+/// CPU 0's uncached I/O stores, counted against PI0 slot A, the only
+/// processor that runs.
+struct Cpu0Stores {
+    pi: Arc<BedrockPi>,
+    gfx: Arc<Mutex<PiGfx>>,
+}
+impl StoreCounter for Cpu0Stores {
+    fn count(&self, address: u64) -> bool {
+        let (counted, starved) = {
+            let mut g = self.gfx.lock();
+            let counted = g.count_store(0, address, "Tezro PI0");
+            (counted, counted && g.take_starved(0, "Tezro PI0"))
+        };
+        if starved {
+            // The slot's graphics interrupt: bit 1 + slot of bank 0.
+            self.pi.set_pending(0, 1);
+        }
+        counted
     }
-    counted
+    /// Put back exactly the credit the count took. Unlike a returned credit
+    /// this never wraps the counter up, since it only undoes a count.
+    fn refund(&self, _address: u64) {
+        let mut g = self.gfx.lock();
+        g.credit[0] = (g.credit[0] + 1) & PI_GFX_CREDIT_MASK;
+        if g.credit[0] > g.bias[0] {
+            g.starved[0] = false;
+        }
+    }
 }
 
 /// The far end of a PIC's link: Bedrock IO. Interrupt packets and DMA arrive
