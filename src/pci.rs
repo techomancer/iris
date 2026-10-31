@@ -46,6 +46,50 @@ pub enum Space {
     Mem,
 }
 
+/// Initial value and writable bits for a function-specific configuration dword.
+#[derive(Clone, Copy, Debug)]
+pub struct PciRegisterPolicy {
+    /// Dword index. Header, BAR, subsystem identity, and interrupt dwords are managed separately.
+    pub reg_dword: usize,
+    /// Value restored by [`PciConfig::reset`].
+    pub initial: u32,
+    /// Bits that configuration writes may change.
+    pub writable_mask: u32,
+}
+
+/// Function-specific write behavior for a type 0 PCI configuration header.
+///
+/// Register policies are copied into the header during construction; the
+/// borrowed slice is not retained.
+#[derive(Clone, Copy, Debug)]
+pub struct PciConfigPolicy<'a> {
+    /// Fixed Status bits that read as one.
+    pub status: u16,
+    /// Device-latched Status bits that writes acknowledge with one.
+    pub status_w1c_mask: u16,
+    /// Writable Command bits.
+    pub command_mask: u16,
+    /// Writable bits in the latency timer byte.
+    pub latency_mask: u8,
+    /// Writable bits in the cache-line-size byte.
+    pub cache_line_mask: u8,
+    /// Initial values and write masks for function-specific dwords.
+    pub registers: &'a [PciRegisterPolicy],
+}
+
+impl<'a> Default for PciConfigPolicy<'a> {
+    fn default() -> Self {
+        Self {
+            status: 0x0200,
+            status_w1c_mask: 0,
+            command_mask: 0xffff,
+            latency_mask: 0,
+            cache_line_mask: 0,
+            registers: &[],
+        }
+    }
+}
+
 /// One function's type 0 configuration header.
 ///
 /// Enough of it to be discovered and configured: identity, class, command
@@ -58,6 +102,12 @@ pub struct PciConfig {
     bars: [Bar; 6],
     /// The registers as the function powers up, for [`PciConfig::reset`].
     power_on: [u32; 64],
+    status: u16,
+    status_w1c_mask: u16,
+    command_mask: u16,
+    latency_mask: u8,
+    cache_line_mask: u8,
+    writable_masks: [u32; 64],
 }
 
 impl PciConfig {
@@ -65,6 +115,27 @@ impl PciConfig {
     /// three bytes of register 0x08. `pin` is 0 for none, or [`PCI_INTA`]
     /// and on; the line register is left for firmware to assign.
     pub fn new(vendor: u16, device: u16, class: u32, revision: u8, bars: [Bar; 6], pin: u8) -> Self {
+        Self::new_with_policy(
+            vendor,
+            device,
+            class,
+            revision,
+            bars,
+            pin,
+            PciConfigPolicy::default(),
+        )
+    }
+
+    /// Construct a type 0 header with function-specific register behavior.
+    pub fn new_with_policy(
+        vendor: u16,
+        device: u16,
+        class: u32,
+        revision: u8,
+        bars: [Bar; 6],
+        pin: u8,
+        policy: PciConfigPolicy<'_>,
+    ) -> Self {
         let mut r = [0u32; 64];
         r[0] = ((device as u32) << 16) | vendor as u32;
         r[2] = (class << 8) | revision as u32;
@@ -74,7 +145,25 @@ impl PciConfig {
                 r[4 + i] = 1;
             }
         }
-        Self { regs: Mutex::new(r), bars, power_on: r }
+        let mut writable_masks = [u32::MAX; 64];
+        for register in policy.registers {
+            assert!(
+                matches!(register.reg_dword, 10 | 12..=14 | 16..=63),
+                "pci: register policy requires a function-specific dword in 0..64");
+            r[register.reg_dword] = register.initial;
+            writable_masks[register.reg_dword] = register.writable_mask;
+        }
+        Self {
+            regs: Mutex::new(r),
+            bars,
+            power_on: r,
+            status: policy.status,
+            status_w1c_mask: policy.status_w1c_mask,
+            command_mask: policy.command_mask,
+            latency_mask: policy.latency_mask,
+            cache_line_mask: policy.cache_line_mask,
+            writable_masks,
+        }
     }
 
     /// RST#: back to the power-up header. The command register clears, so
@@ -93,20 +182,38 @@ impl PciConfig {
     pub fn read(&self, reg: usize) -> u32 {
         let r = self.regs.lock().unwrap();
         match reg {
-            // Status: a medium-speed device with no errors to report.
-            1 => (r[1] & 0xffff) | 0x0200_0000,
+            1 => (r[1] & (0xffff | ((self.status_w1c_mask as u32) << 16)))
+                | ((self.status as u32) << 16),
             _ => r[reg],
         }
     }
 
     pub fn write(&self, reg: usize, val: u32) {
+        self.write_masked(reg, val, u32::MAX);
+    }
+
+    /// Write selected bits of dword `reg`. Both `val` and `mask` use the
+    /// register's bit positions. Unselected Status events are not acknowledged.
+    pub fn write_masked(&self, reg: usize, val: u32, mask: u32) {
+        if mask == 0 {
+            return;
+        }
         let mut r = self.regs.lock().unwrap();
         match reg {
             // Identity, class and header type are read-only.
-            0 | 2 | 3 => {}
-            // Command; status bits are write-one-to-clear and none are set.
-            1 => r[1] = val & 0xffff,
+            0 | 2 => {}
+            3 => {
+                let mask = mask & (((self.latency_mask as u32) << 8) | self.cache_line_mask as u32);
+                r[3] = (r[3] & !mask) | (val & mask);
+            }
+            // Command writes replace selected bits; Status events clear on ones.
+            1 => {
+                let clear = val & mask & ((self.status_w1c_mask as u32) << 16);
+                r[1] = (r[1] & !(mask & 0xffff) & !clear)
+                    | (val & mask & self.command_mask as u32);
+            }
             4..=9 => {
+                let val = (r[reg] & !mask) | (val & mask);
                 let bar = self.bars[reg - 4];
                 r[reg] = match bar {
                     Bar::Unused => 0,
@@ -118,9 +225,25 @@ impl PciConfig {
                 };
             }
             // Interrupt pin is read-only; the line is firmware's scratch.
-            15 => r[15] = (r[15] & 0xff00) | (val & !0xff00),
-            _ => r[reg] = val,
+            15 => {
+                let mask = mask & !0xff00;
+                r[15] = (r[15] & !mask) | (val & mask);
+            }
+            _ => {
+                let mask = mask & self.writable_masks[reg];
+                r[reg] = (r[reg] & !mask) | (val & mask);
+            }
         }
+    }
+
+    /// Latch selected device Status events without replacing earlier events.
+    pub fn set_status_bits(&self, bits: u16) {
+        self.regs.lock().unwrap()[1] |= ((bits & self.status_w1c_mask) as u32) << 16;
+    }
+
+    /// Set the board-assigned Subsystem ID, which survives function reset.
+    pub fn set_subsystem_identity(&self, value: u32) {
+        self.regs.lock().unwrap()[11] = value;
     }
 
     /// The base address firmware programmed into BAR `i`, type bits masked.
@@ -403,6 +526,14 @@ mod tests {
             [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA)
     }
 
+    fn scsi_like_with_policy(policy: PciConfigPolicy<'_>) -> PciConfig {
+        PciConfig::new_with_policy(
+            0x9004, 0x8078, 0x0100_00, 1,
+            [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA,
+            policy,
+        )
+    }
+
     /// Firmware learns how much space a device wants by writing all ones to
     /// a BAR and reading back which address bits stuck.
     #[test]
@@ -469,7 +600,7 @@ mod tests {
     #[test]
     fn reset_keeps_the_subsystem_identity() {
         let c = scsi_like();
-        c.write(11, 0xc304_10a9);
+        c.set_subsystem_identity(0xc304_10a9);
         c.write(4, 0x0000_1000);
         c.reset();
         assert_eq!(c.read(11), 0xc304_10a9);
@@ -483,6 +614,121 @@ mod tests {
         assert_eq!(c.read(15) & 0xffff, 0x0109, "line 9 assigned, pin A kept");
         c.write(15, 0);
         assert_eq!(c.interrupt_pin(), PCI_INTA);
+    }
+
+    #[test]
+    fn header_policies_mask_writes_and_restore_reset_values() {
+        for (status, command, latency, cache) in [(0x0200, 0xffff, 0, 0), (0x02b0, 0x0156, 0xf0, 0x0f)] {
+            let c = scsi_like_with_policy(PciConfigPolicy {
+                status,
+                status_w1c_mask: 0,
+                command_mask: command,
+                latency_mask: latency,
+                cache_line_mask: cache,
+                registers: &[PciRegisterPolicy {
+                    reg_dword: 18,
+                    initial: 0xaabb_0020,
+                    writable_mask: 0xff00,
+                }],
+            });
+            c.write(1, u32::MAX);
+            c.write(3, u32::MAX);
+            c.write(18, u32::MAX);
+            assert_eq!(c.read(1), (u32::from(status) << 16) | u32::from(command));
+            assert_eq!(c.read(3), (u32::from(latency) << 8) | u32::from(cache));
+            assert_eq!(c.read(18), 0xaabb_ff20);
+            c.reset();
+            assert_eq!(c.read(1), u32::from(status) << 16);
+            assert_eq!(c.read(3), 0);
+            assert_eq!(c.read(18), 0xaabb_0020);
+        }
+    }
+
+    #[test]
+    fn masked_writes_preserve_unselected_fields_and_status_events() {
+        let c = scsi_like_with_policy(PciConfigPolicy {
+            status: 0x0200,
+            status_w1c_mask: 0x8040,
+            command_mask: 0x0157,
+            latency_mask: 0xff,
+            cache_line_mask: 0xff,
+            registers: &[PciRegisterPolicy {
+                reg_dword: 18,
+                initial: 0xaabb_0000,
+                writable_mask: 0xffff,
+            }],
+        });
+        c.set_status_bits(0x8040);
+        c.write(1, 0x0157);
+        c.write(3, 0x1234);
+        c.write(5, 0x1234_5000);
+        c.write(4, 0x1201);
+        for (reg, value, mask, expected) in [
+            (1, 0xffff_0002, 0xff, 0x8240_0102),
+            (1, 0xffff_0000, 0x8000_0000, 0x0240_0102),
+            (1, 0x0040_0000, 0x00ff_0000, 0x0200_0102),
+            (1, u32::MAX, 0, 0x0200_0102),
+            (3, 0xffff_00ab, 0xff, 0x12ab),
+            (5, 0xabcd_ffff, 0xffff_0000, 0xabcd_5000),
+            (4, 0x3400, 0xff00, 0x3401),
+            (15, u32::MAX, 0xff00, 0x0100),
+            (18, u32::MAX, 0xff, 0xaabb_00ff),
+        ] {
+            c.write_masked(reg, value, mask);
+            assert_eq!(c.read(reg), expected, "register {reg}");
+        }
+        c.set_status_bits(u16::MAX);
+        c.reset();
+        assert_eq!(c.read(1), 0x0200_0000);
+        let default = scsi_like();
+        default.set_status_bits(u16::MAX);
+        assert_eq!(default.read(1), 0x0200_0000);
+    }
+
+    #[test]
+    fn snapshots_restore_registers_with_destination_write_policies() {
+        use crate::traits::Saveable;
+        let src = scsi_like_with_policy(PciConfigPolicy {
+            status: 0x02b0,
+            status_w1c_mask: 0xc000,
+            command_mask: 0x0157,
+            latency_mask: 0xff,
+            cache_line_mask: 0xff,
+            registers: &[PciRegisterPolicy {
+                reg_dword: 18,
+                initial: 0,
+                writable_mask: 0x100,
+            }],
+        });
+        src.set_status_bits(0x8000);
+        src.write(3, 0x1234);
+        src.write(18, 0x100);
+        let saved = src.save_state();
+        for (events, command, cache) in [(0, 7, 0x0f), (0xc000, 0x0157, 0xff)] {
+            let dst = scsi_like_with_policy(PciConfigPolicy {
+                status: 0x0200,
+                status_w1c_mask: events,
+                command_mask: command,
+                latency_mask: 0,
+                cache_line_mask: cache,
+                registers: &[PciRegisterPolicy {
+                    reg_dword: 18,
+                    initial: 0x20,
+                    writable_mask: 0x200,
+                }],
+            });
+            dst.load_state(&saved).unwrap();
+            assert_eq!(dst.save_state(), saved);
+            assert_eq!(dst.read(1), 0x0200_0000 | ((0x8000 & u32::from(events)) << 16));
+            dst.write_masked(1, u32::MAX, u32::MAX);
+            dst.write(3, u32::MAX);
+            dst.write(18, u32::MAX);
+            assert_eq!(dst.read(1), 0x0200_0000 | u32::from(command));
+            assert_eq!(dst.read(3), (0x1234 & !u32::from(cache)) | u32::from(cache));
+            assert_eq!(dst.read(18), 0x300);
+            dst.reset();
+            assert_eq!(dst.read(18), 0x20);
+        }
     }
 
     struct Nothing;

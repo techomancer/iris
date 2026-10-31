@@ -167,9 +167,26 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)). |
-| `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. |
+| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), fuel_ip34 (see [the Fuel guide](docs/fuel-ip34.md)). |
+| `machine.cpu` | `r4400` | r4400, r5000, r10000. CPU/ISA choice is independent of build features. A Fuel always runs its one R14000, and the key must be `r10000`; any other value is refused. |
 | `machine.cpus` | `1` | Processors fitted. 2 only on the Octane; see [its guide](docs/Octane/multiprocessor.md). |
+
+### [fuel]
+
+Fuel-specific settings apply when `machine.profile = "fuel_ip34"`.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `flash` | unset | Persistent 16 MiB boot-flash file. Unset, the flash is volatile. |
+| `console` | `l1` | `l1`, `ioc3a` or `ioc3b`. Selects the guest console connection. |
+| `l1_port` | `8882` | Host TCP port for the L1 console. Used when `console = "l1"`. |
+| `l1_log` | unset | Optional serial log path for L1 output when an IOC3 port is selected as console. |
+
+The machine uses one 500 MHz R14000 and fixed 512 MiB RAM in two 256 MiB
+banks. Its IOC3 has no keyboard or mouse ports, so it runs on a serial
+console. A `[fuel]` table is written to a saved config only when one of
+these keys is set. The sample configuration and supported PROM inputs are in the
+[Fuel guide](docs/fuel-ip34.md).
 
 ### [graphics]
 
@@ -206,7 +223,7 @@ An explicit non-disk kind takes precedence over the legacy cdrom flag.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `network.mode` | `nat` | nat, pcap or off (no Ethernet; O2 and Octane only). PCAP needs build support and host capture permissions; it works on every machine with an Ethernet. |
+| `network.mode` | `nat` | nat, pcap or off (no Ethernet on O2, Octane and Fuel). PCAP needs build support and host capture permissions. It works on every machine with Ethernet. |
 | `network.pcap_interface` | `auto-pick when unset` | Interface name or numeric list index; PCAP only. |
 | `network.nfs_pcap_ip` | `unset` | Virtual LAN IP for the built-in NFS responder in PCAP mode. |
 | `network.mac` | `08:00:69:12:34:56 when unset` | ec0 MAC; injected only into blank PROM battery-backed MAC slots. |
@@ -327,8 +344,8 @@ the file is loaded, with a note, and never written back.
 
 ### [octane]
 
-Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu =
-"r10000"`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
+Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu` of
+`r10000`, `r12000` or `r14000`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
 not embedded; `IP30prom.bin` is tried when it is left unset), `nvram` (the
 DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256
 or 512, filled from bank 0 with no gap, 2048 in all), `serial_port_a` and
@@ -352,8 +369,8 @@ IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
 `heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
 embedded fallback.
-The config validator permits SCSI controller 1 only on IP22, the O2 and the
-Octane, the machines with two controllers.
+The config validator permits SCSI controller 1 only on IP22, the O2, Octane
+and Fuel. These machines have two controllers.
 
 Standalone CLI options update the loaded config where supplied; boolean enable
 switches do not provide a general way to clear every saved true setting.

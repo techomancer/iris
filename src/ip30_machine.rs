@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::{CpuModel, MachineConfig};
-use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache, R14000Ip30ShadowCache};
+use crate::cpu::mips_cache_v2::CpuModel as _;
 use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
@@ -46,8 +47,12 @@ pub const OCTANE_PROM_FILE: &str = "IP30prom.bin";
 /// The 195 MHz R10000 of SGI's standard 128 MB Octane configurations (the
 /// OCTANE Technical Report): Count at half that.
 pub const OCTANE_COUNT_HZ: u64 = 97_500_000;
+/// The 360 MHz R12000 of an Octane2 (origami's `ip30-r12000.md`): Count at
+/// half that.
+pub const OCTANE2_R12000_COUNT_HZ: u64 = 180_000_000;
 /// R10000 revision 2.7, as an Octane's hinv reports it; the raw PRId is
-/// inferred from the R10000 manual's encoding.
+/// inferred from the R10000 manual's encoding. The R12000 and R14000 report
+/// the PRId of their `CpuModel`.
 pub const OCTANE_PRID: u32 = 0x0927;
 /// The Crossbow on the Octane reports revision 4.
 const XBOW_REVISION: u32 = 4;
@@ -110,8 +115,8 @@ pub struct OctaneMachine {
 
 impl OctaneMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
-        if cfg.machine.cpu != CpuModel::R10000 {
-            return Err("an Octane has an R10000 ([machine] cpu = \"r10000\")".into());
+        if !matches!(cfg.machine.cpu, CpuModel::R10000 | CpuModel::R12000 | CpuModel::R14000) {
+            return Err("an Octane has an R10000, R12000 or R14000 ([machine] cpu = \"r10000\")".into());
         }
         // `prom`, or IRIX's file name when `prom` is the shared default and
         // that file is not there: there is no embedded Octane PROM.
@@ -269,7 +274,8 @@ impl OctaneMachine {
             board.map_or("no graphics", |b| b.label())
         );
 
-        let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
+        let default_count_hz = if cfg.machine.cpu == CpuModel::R12000 { OCTANE2_R12000_COUNT_HZ } else { OCTANE_COUNT_HZ };
+        let count_hz = cfg.clock.fixed_mhz.map_or(default_count_hz, |mhz| (mhz * 1_000_000.0) as u64);
         let flash_lines: Vec<_> = (0..cpu_count)
             .map(|_| {
                 let bus: Arc<dyn BusDevice> = phys.phys.clone();
@@ -280,7 +286,14 @@ impl OctaneMachine {
         let mut ticks = vec![fasttick];
         ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
         let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
-            .map(|id| Self::build_cpu(id, cpu_count, phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .map(|id| {
+                let (sysad, cached, hz, tick) = (phys.phys.clone(), flash_lines[id as usize].clone(), count_hz.max(1), ticks[id as usize].clone());
+                match cfg.machine.cpu {
+                    CpuModel::R12000 => Self::build_cpu::<R12000ShadowCache>(id, cpu_count, sysad, cached, &timer_manager, hz, tick, R12000ShadowCache::PRID),
+                    CpuModel::R14000 => Self::build_cpu::<R14000Ip30ShadowCache>(id, cpu_count, sysad, cached, &timer_manager, hz, tick, R14000Ip30ShadowCache::PRID),
+                    _ => Self::build_cpu::<R10000ShadowCache>(id, cpu_count, sysad, cached, &timer_manager, hz, tick, OCTANE_PRID),
+                }
+            })
             .collect();
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
@@ -470,8 +483,9 @@ impl OctaneMachine {
         }
     }
 
+    /// One processor of type `C` with the PRId the board reports.
     #[allow(clippy::too_many_arguments)]
-    fn build_cpu(
+    fn build_cpu<C>(
         id: u8,
         cpu_count: u8,
         sysad: Arc<dyn BusDevice>,
@@ -479,17 +493,22 @@ impl OctaneMachine {
         tm: &Arc<TimerManager>,
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
-    ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>();
+        prid: u32,
+    ) -> Arc<dyn CpuDevice>
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>> + 'static,
+        MipsCpu<MipsTlb, C>: CpuDevice,
+    {
+        let cfg = MipsCpuConfig::for_model::<C>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
-        let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.
-        exec.cache = R10000ShadowCache::from(cached as Arc<dyn BusDevice>);
+        exec.cache = C::from(cached as Arc<dyn BusDevice>);
         exec.core.set_timer_manager(tm.clone());
         exec.core.set_count_hz(count_hz);
         exec.core.fasttick_count = fasttick;
-        exec.core.reset_prid = OCTANE_PRID;
-        exec.core.cp0_prid = OCTANE_PRID;
+        exec.core.reset_prid = prid;
+        exec.core.cp0_prid = prid;
         // IRIX zeroes Count and arms Compare a few instructions later; see
         // `MipsCore::count_write_samples`.
         exec.core.count_write_samples = true;
@@ -498,7 +517,7 @@ impl OctaneMachine {
         exec.phys_mask = (1 << 40) - 1;
         exec.core.cpu_id = id;
         exec.core.smp = cpu_count > 1;
-        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, R10000ShadowCache>| {
+        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             LAST_PC[id as usize].store(exec.core.pc, Ordering::Relaxed);
         }));
         Arc::new(MipsCpu::new(exec))

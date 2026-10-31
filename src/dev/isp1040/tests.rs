@@ -2,7 +2,8 @@
 //! and ring contract. Host memory is a flat byte array behind a fake `PciDma`; the disk
 //! is a small raw image.
 //!
-//! Ported from tests/qtest/qlogic-isp-test.c in jamesbraid/qemu-sgi-origami.
+//! Ported from tests/qtest/qlogic-isp-test.c and tests/qtest/sn0-isp12160-test.c
+//! in jamesbraid/qemu-sgi-origami.
 
 use super::*;
 use crate::irq::LevelProbe;
@@ -59,14 +60,15 @@ fn image(name: &str, blocks: usize) -> std::path::PathBuf {
 }
 
 impl Rig {
-    /// A chip on fake memory, no disks.
-    fn bare() -> Rig {
+    fn on(isp: Isp1040) -> Rig {
         let mem = FakeMem::new();
-        let isp = Isp1040::new();
         Device::start(&isp);
         isp.connect_dma(mem.clone());
         Rig { isp, mem }
     }
+
+    /// A chip on fake memory, no disks.
+    fn bare() -> Rig { Rig::on(Isp1040::new()) }
 
     /// A chip with a disk of `blocks` blocks at target `id`.
     fn with_disk(name: &str, id: u8, blocks: usize) -> Rig {
@@ -1266,4 +1268,392 @@ fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
     isp.bus().attach_image(4, &img, false).unwrap();
     assert!(isp.bus().has_target(4), "a target attached after boot goes on the same bus");
     let _ = std::fs::remove_file(img);
+}
+
+
+struct MarkerTarget(u8);
+
+impl crate::scsi::ScsiTarget for MarkerTarget {
+    fn request(&mut self, _req: &crate::scsi::ScsiRequest) -> std::io::Result<crate::scsi::ScsiResponse> {
+        Ok(crate::scsi::ScsiResponse { status: 0, data: vec![self.0] })
+    }
+}
+
+/// Target 0 on channel 1 must stay distinct from target 0 on channel 0.
+#[test]
+fn the_isp12160_routes_ring_requests_to_separate_buses() {
+    let bus0 = Isp1040::new_bus();
+    let bus1 = Isp1040::new_bus();
+    bus0.attach(0, Box::new(MarkerTarget(0x10))).unwrap();
+    bus1.attach(0, Box::new(MarkerTarget(0x20))).unwrap();
+    let r = Rig::on(Isp1040::new_12160(bus0, bus1));
+    r.init_rings(4, 4);
+
+    r.put_entry(0, &request(0x1234, 0x80, &[0x12, 0, 0, 0, 36, 0], &[(BUF, 36)]));
+    r.doorbell(1);
+    assert_eq!(r.mem.get(BUF, 1), vec![0x20], "channel 1 reaches its target 0");
+
+    r.put_entry(1, &request(0x1235, 0, &[0x12, 0, 0, 0, 36, 0], &[(BUF + 64, 36)]));
+    r.doorbell(2);
+    assert_eq!(r.mem.get(BUF + 64, 1), vec![0x10], "channel 0 keeps its own target 0");
+}
+
+struct ResetProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::scsi::ScsiTarget for ResetProbe {
+    fn request(&mut self, _req: &crate::scsi::ScsiRequest) -> std::io::Result<crate::scsi::ScsiResponse> {
+        Ok(crate::scsi::ScsiResponse { status: 0, data: Vec::new() })
+    }
+
+    fn bus_reset(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A snapshot retains both the chip-wide reset and the selected target reset,
+/// and the resumed worker delivers both through the original channel buses.
+#[test]
+fn the_isp12160_preserves_queued_bus_and_target_resets_across_save_load() {
+    let src = Isp1040::new_12160(Isp1040::new_bus(), Isp1040::new_bus());
+    {
+        let mut state = src.st.lock();
+        state.reset_targets = true;
+        state.pending_target_resets.push_back((1, Some(2)));
+    }
+    let saved = src.save_state();
+
+    let resets0 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resets1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let selected_reset = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bus0 = Isp1040::new_bus();
+    let bus1 = Isp1040::new_bus();
+    bus0.attach(1, Box::new(ResetProbe(resets0.clone()))).unwrap();
+    bus1.attach(1, Box::new(ResetProbe(resets1.clone()))).unwrap();
+    bus1.attach(2, Box::new(ResetProbe(selected_reset.clone()))).unwrap();
+    let dst = Isp1040::new_12160(bus0, bus1);
+    dst.load_state(&saved).unwrap();
+    Device::start(&dst);
+    dst.wait_idle();
+    Device::stop(&dst);
+
+    assert_eq!(resets0.load(Ordering::Relaxed), 1);
+    assert_eq!(resets1.load(Ordering::Relaxed), 1);
+    assert_eq!(selected_reset.load(Ordering::Relaxed), 2, "the full reset and queued target reset both run");
+    assert_eq!(saved.get("reset_targets").and_then(toml::Value::as_bool), Some(true));
+    assert_eq!(saved.get("target_resets").and_then(toml::Value::as_array).map(Vec::len), Some(1));
+    let after = dst.save_state();
+    assert_eq!(after.get("reset_targets").and_then(toml::Value::as_bool), Some(false));
+    assert_eq!(after.get("target_resets").and_then(toml::Value::as_array).map(Vec::len), Some(0));
+}
+
+// ---- ISP12160 second channel and recovery commands -----------------------
+
+fn rig12160() -> Rig { Rig::on(Isp1040::new_12160(Isp1040::new_bus(), Isp1040::new_bus())) }
+
+/// A 64-block image whose first block is `fill`, so a read says which disk answered.
+fn filled_image(name: &str, fill: u8) -> std::path::PathBuf {
+    let p = image(name, 64);
+    let mut data = vec![0u8; 64 * BLOCK_SIZE];
+    data[..BLOCK_SIZE].fill(fill);
+    std::fs::write(&p, data).expect("test image");
+    p
+}
+
+/// A 12160 with a different disk at target 1 on each channel.
+fn disks_on_both_channels(name: &str) -> Rig {
+    let r = rig12160();
+    for channel in 0..2u8 {
+        let img = filled_image(&format!("{name}{channel}"), 0xa0 + channel);
+        r.isp.bus_for_channel(channel).unwrap().attach_image(1, &img, false).expect("attach");
+    }
+    r
+}
+
+/// Issues entries one at a time on a 16-entry ring and returns each completion.
+struct Seq<'a> {
+    r: &'a Rig,
+    n: u16,
+}
+
+impl<'a> Seq<'a> {
+    fn new(r: &'a Rig) -> Self {
+        r.init_rings(16, 16);
+        Seq { r, n: 0 }
+    }
+    fn run(&mut self, handle: u32, target: u8, cdb: &[u8], segs: &[(u32, u32)]) -> [u8; ENTRY_SIZE] {
+        let slot = self.n;
+        self.r.put_entry(slot as u32, &request(handle, target, cdb, segs));
+        self.n += 1;
+        self.r.doorbell(self.n);
+        self.r.status(slot as u32)
+    }
+}
+
+const TUR: [u8; 6] = [0; 6];
+
+/// Counts bus resets and answers any command with a full block pair, so a read
+/// whose second buffer segment is unreachable stays outstanding.
+struct CountingDisk(Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::scsi::ScsiTarget for CountingDisk {
+    fn request(&mut self, _req: &crate::scsi::ScsiRequest) -> std::io::Result<crate::scsi::ScsiResponse> {
+        Ok(crate::scsi::ScsiResponse { status: 0, data: vec![0; 2 * BLOCK_SIZE] })
+    }
+    fn bus_reset(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+}
+
+struct Held {
+    r: Rig,
+    /// Bus resets seen by the counting disks at target 1 on channel 0, target 1 on channel 1,
+    /// and target 2 on channel 1.
+    ch0: Arc<std::sync::atomic::AtomicUsize>,
+    ch1: Arc<std::sync::atomic::AtomicUsize>,
+    ch1_other: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Held {
+    fn new() -> Held {
+        let counters: Vec<_> = (0..3).map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0))).collect();
+        let (bus0, bus1) = (Isp1040::new_bus(), Isp1040::new_bus());
+        bus0.attach(1, Box::new(CountingDisk(counters[0].clone()))).unwrap();
+        bus1.attach(1, Box::new(CountingDisk(counters[1].clone()))).unwrap();
+        bus1.attach(2, Box::new(CountingDisk(counters[2].clone()))).unwrap();
+        let r = Rig::on(Isp1040::new_12160(bus0, bus1));
+        r.init_rings(16, 16);
+        Held { r, ch0: counters[0].clone(), ch1: counters[1].clone(), ch1_other: counters[2].clone() }
+    }
+    /// A read whose payload store the fabric refuses: the adapter keeps it outstanding, which
+    /// is what the abort and reset commands act on.
+    fn hold(&self, slot: u32, handle: u32, target: u8) {
+        self.r.put_entry(slot, &request(handle, target, &cdb10(scsi_cmd::READ_10, 0, 2),
+            &[(BUF, BLOCK_SIZE as u32), (MEM as u32, BLOCK_SIZE as u32)]));
+        self.r.doorbell(slot as u16 + 1);
+        assert_eq!(g32(&self.r.status(slot), 4), 0, "handle {handle:#x} is held, not completed");
+    }
+    fn command(&self, regs: &[u16]) -> u16 {
+        let status = self.r.cmd(regs);
+        self.r.isp.wait_idle();
+        status
+    }
+    /// The completion posted in response slot `slot`: (handle, completion code).
+    fn answer(&self, slot: u32) -> (u32, u16) {
+        let s = self.r.status(slot);
+        (g32(&s, 4), g16(&s, 10))
+    }
+}
+
+const CH1: u16 = 0x8000;
+
+/// A driver sizing its queues and recognising the part reads these before any ring exists.
+#[test]
+fn the_isp12160_reports_its_own_identity_firmware_and_unmapped_registers() {
+    let r = rig12160();
+    assert_eq!(r.r(reg::ID_HIGH), 0x1216);
+    assert_eq!(r.r(reg::BUS_CFG0), 0, "no revision field on this part");
+    r.w(reg::DMA_CMD_CFG, 0xffff);
+    r.w(reg::DMA_DATA_CFG, 0xffff);
+    assert_eq!((r.r(reg::DMA_CMD_CFG), r.r(reg::DMA_DATA_CFG)), (0, 0), "the flat ISP1040 DMA blocks are not here");
+
+    // Mailbox 6 is seeded because an untouched output would also read zero.
+    r.w(r.mb(6), 0x1234);
+    r.w(r.mb(0), mbox::ABOUT_FIRMWARE);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!([r.r(r.mb(1)), r.r(r.mb(2))], [10, 4]);
+    assert_eq!(r.r(r.mb(6)), 0, "the attribute word is cleared, not echoed");
+    r.ack();
+    r.w(r.mb(0), mbox::GET_FIRMWARE_STATUS);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!([r.r(r.mb(1)), r.r(r.mb(2))], [0, MAX_REQUESTS]);
+    r.ack();
+}
+
+/// The driver switches register banks through bus configuration 1 bits 9:8; each of the
+/// four selections must show its own words, and no other bit may stick.
+#[test]
+fn the_isp12160_selects_four_distinct_banks_and_keeps_only_the_bank_field() {
+    let r = rig12160();
+    let selections = [0x0000, 0x0100, 0x0200, 0x0300];
+    for sel in selections {
+        r.w(reg::BUS_CFG1, sel);
+        r.w(reg::BANK_BASE, 0x1000 + sel);
+        r.w(reg::BANK_BASE + 0x20, 0x2000 + sel);
+    }
+    for sel in selections {
+        r.w(reg::BUS_CFG1, sel);
+        assert_eq!(r.r(reg::BANK_BASE), 0x1000 + sel, "bank {sel:#x}");
+        assert_eq!(r.r(reg::BANK_BASE + 0x20), 0x2000 + sel, "bank {sel:#x}");
+    }
+    r.w(reg::BUS_CFG1, 0xb2c5);
+    assert_eq!(r.r(reg::BUS_CFG1), 0x0200);
+
+    // A soft reset hands a re-initialising driver empty banks, not the previous run's words.
+    r.w(reg::BUS_CTRL, CTRL_SOFT_RESET);
+    assert_eq!(r.r(reg::BUS_CFG1), 0);
+    for sel in selections {
+        r.w(reg::BUS_CFG1, sel);
+        assert_eq!(r.r(reg::BANK_BASE), 0, "bank {sel:#x} after reset");
+    }
+}
+
+/// A second command submitted before the driver acknowledged the first result must not
+/// run, or it would overwrite the answer the driver has not read.
+#[test]
+fn the_isp12160_ignores_a_mailbox_submission_while_the_result_is_unacknowledged() {
+    let r = rig12160();
+    r.w(r.mb(0), mbox::NOP);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!(r.r(reg::SEMAPHORE) & SEMAPHORE_LOCK, SEMAPHORE_LOCK);
+
+    r.w(r.mb(1), 0x9999);
+    r.w(r.mb(0), mbox::ABOUT_FIRMWARE);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::ABOUT_FIRMWARE, "the second submission did not run");
+    assert_eq!(r.r(r.mb(1)), 0x9999);
+
+    r.ack();
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(r.r(r.mb(0)), mbox::COMPLETE);
+    assert_eq!(r.r(r.mb(1)), 10, "acknowledged, the same submission runs");
+    r.ack();
+}
+
+/// An empty slot on either channel times out on its own bus; a driver probing channel 1
+/// must see an absent target, not a hang or the channel 0 answer.
+#[test]
+fn a_missing_target_times_out_on_each_channel() {
+    let r = rig12160();
+    let mut seq = Seq::new(&r);
+    for (handle, target) in [(0x31, 5), (0x32, 0x80 | 5)] {
+        let s = seq.run(handle, target, &TUR, &[]);
+        assert_eq!(g32(&s, 4), handle);
+        assert_eq!(g16(&s, 10), IOCB_INCOMPLETE);
+        assert_eq!(g16(&s, 12), STATE_GOT_BUS);
+        assert_eq!(g16(&s, 14), STATUS_FLAG_TIMEOUT);
+    }
+}
+
+/// A command refused on channel 1 must not disturb its neighbour on channel 0, and
+/// a write must land on the disk of the channel it named.
+#[test]
+fn a_refused_command_on_channel_1_leaves_channel_0_and_the_media_alone() {
+    let r = disks_on_both_channels("refuse");
+    let mut seq = Seq::new(&r);
+    // Collect each disk's power-on unit attention so the reads below see real answers.
+    seq.run(0xa0, 1, &TUR, &[]);
+    seq.run(0xa1, 0x81, &TUR, &[]);
+
+    r.mem.put(BUF, &[0x5c; BLOCK_SIZE]);
+    let beyond_disk = seq.run(0xb1, 0x81, &cdb10(scsi_cmd::READ_10, 1000, 1), &[(BUF, BLOCK_SIZE as u32)]);
+    assert_eq!(g16(&beyond_disk, 8) & 0xff, CHECK_CONDITION as u16);
+    assert_eq!(r.mem.get(BUF, BLOCK_SIZE), vec![0x5c; BLOCK_SIZE], "the refused read stored nothing");
+
+    let good = seq.run(0xb0, 1, &cdb10(scsi_cmd::READ_10, 0, 1), &[(BUF + 0x1000, BLOCK_SIZE as u32)]);
+    assert_eq!(g16(&good, 10), IOCB_COMPLETE);
+    assert_eq!(r.mem.get(BUF + 0x1000, BLOCK_SIZE), vec![0xa0; BLOCK_SIZE], "channel 0 still reads its own disk");
+
+    r.mem.put(BUF + 0x2000, &[0x77; BLOCK_SIZE]);
+    seq.run(0xc0, 0x81, &cdb10(scsi_cmd::WRITE_10, 3, 1), &[(BUF + 0x2000, BLOCK_SIZE as u32)]);
+    seq.run(0xc1, 0x81, &cdb10(scsi_cmd::READ_10, 3, 1), &[(BUF + 0x3000, BLOCK_SIZE as u32)]);
+    seq.run(0xc2, 1, &cdb10(scsi_cmd::READ_10, 3, 1), &[(BUF + 0x4000, BLOCK_SIZE as u32)]);
+    assert_eq!(r.mem.get(BUF + 0x3000, BLOCK_SIZE), vec![0x77; BLOCK_SIZE], "channel 1 holds what was written");
+    assert_eq!(r.mem.get(BUF + 0x4000, BLOCK_SIZE), vec![0; BLOCK_SIZE], "channel 0's block 3 is untouched");
+}
+
+/// Abort device names a channel in the top bit of its selector; the same target number
+/// held on the other bus must stay outstanding.
+#[test]
+fn abort_device_retires_only_the_named_channels_commands() {
+    let h = Held::new();
+    h.hold(0, 0x41, 1);
+    h.hold(1, 0x42, 0x81);
+    assert_eq!(h.command(&[mbox::ABORT_DEVICE, CH1 | 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x42, IOCB_ABORTED));
+    assert_eq!(h.answer(1), (0, 0), "channel 0's command is still held");
+    // The survivor is still the adapter's to abort.
+    assert_eq!(h.command(&[mbox::ABORT_DEVICE, 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.answer(1), (0x41, IOCB_ABORTED));
+}
+
+/// Abort command names one handle: two commands to the same channel, target and unit differ
+/// only by it, and a selector that matches a held handle on the wrong channel is an error.
+#[test]
+fn abort_command_matches_the_handle_and_the_whole_selector() {
+    let h = Held::new();
+    h.hold(0, 0x51, 0x81);
+    h.hold(1, 0x52, 0x81);
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, CH1 | 0x0100, 0, 0x52]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x52, IOCB_ABORTED));
+    assert_eq!(h.answer(1), (0, 0), "its neighbour on the same target is untouched");
+
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, 0x0100, 0, 0x51]), mbox::COMMAND_ERROR,
+        "a held handle named on the wrong channel is not a match");
+    assert_eq!(h.answer(1), (0, 0));
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, CH1 | 0x0100, 0, 0x51]), mbox::COMPLETE);
+    assert_eq!(h.answer(1), (0x51, IOCB_ABORTED));
+}
+
+/// A driver clearing a device it already drained must read success, while naming a handle
+/// nothing is using must read as an error rather than claim a retirement.
+#[test]
+fn aborting_nothing_is_complete_but_aborting_an_unknown_handle_is_refused() {
+    let h = Held::new();
+    assert_eq!(h.command(&[mbox::ABORT_DEVICE, CH1 | 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.command(&[mbox::ABORT_COMMAND, CH1 | 0x0100, 0, 0x77]), mbox::COMMAND_ERROR);
+    assert_eq!(h.answer(0), (0, 0), "neither posted a completion");
+}
+
+/// Target reset reaches one target on one channel; the same number on the other channel and
+/// the neighbour on the same channel must not see it, and the reset target keeps serving.
+#[test]
+fn target_reset_is_scoped_to_one_target_on_one_channel() {
+    let h = Held::new();
+    h.hold(0, 0x41, 1);
+    h.hold(1, 0x42, 0x81);
+    assert_eq!(h.command(&[mbox::ABORT_TARGET, CH1 | 0x0100, 0, 0]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x42, IOCB_RESET));
+    assert_eq!(h.answer(1), (0, 0));
+    assert_eq!([h.ch0.load(Ordering::Relaxed), h.ch1.load(Ordering::Relaxed), h.ch1_other.load(Ordering::Relaxed)],
+        [0, 1, 0]);
+
+    h.r.put_entry(2, &request(0x43, 0x81, &TUR, &[]));
+    h.r.doorbell(3);
+    assert_eq!(h.answer(1), (0x43, IOCB_COMPLETE));
+}
+
+/// Bus reset takes its channel from mailbox 2; mailbox 1 is the reset delay and here holds a value
+/// that is not even a channel. The whole named bus resets, the other one does not.
+#[test]
+fn bus_reset_takes_its_channel_from_mailbox_two_and_resets_every_target_on_it() {
+    let h = Held::new();
+    h.hold(0, 0x41, 1);
+    h.hold(1, 0x42, 0x81);
+    assert_eq!(h.command(&[mbox::BUS_RESET, 3, 1]), mbox::COMPLETE);
+    assert_eq!(h.answer(0), (0x42, IOCB_RESET));
+    assert_eq!(h.answer(1), (0, 0));
+    assert_eq!([h.ch0.load(Ordering::Relaxed), h.ch1.load(Ordering::Relaxed), h.ch1_other.load(Ordering::Relaxed)],
+        [0, 1, 1]);
+    assert_eq!(h.command(&[mbox::BUS_RESET, 0, 2]), mbox::PARAM_ERROR, "there is no third bus");
+}
+
+/// A bus reset leaves a unit attention on the disks of that channel only; the driver's
+/// first command afterwards is expected to collect it.
+#[test]
+fn a_bus_reset_leaves_a_unit_attention_on_the_reset_channel_only() {
+    let r = disks_on_both_channels("uareset");
+    let mut seq = Seq::new(&r);
+    seq.run(0x10, 1, &TUR, &[]);
+    seq.run(0x11, 0x81, &TUR, &[]);
+    assert_eq!(g16(&seq.run(0x12, 0x81, &TUR, &[]), 8) & 0xff, 0, "attention was collected");
+
+    assert_eq!(r.cmd(&[mbox::BUS_RESET, 0, 1]), mbox::COMPLETE);
+    r.isp.wait_idle();
+    let after = seq.run(0x13, 0x81, &TUR, &[]);
+    assert_eq!(g16(&after, 8) & 0xff, CHECK_CONDITION as u16);
+    assert_eq!(after[34] & 0x0f, 0x06, "unit attention");
+    let other = seq.run(0x14, 1, &TUR, &[]);
+    assert_eq!(g16(&other, 8) & 0xff, 0, "channel 0 was not reset");
+    assert_eq!(g16(&seq.run(0x15, 0x81, &TUR, &[]), 8) & 0xff, 0, "reported once");
 }

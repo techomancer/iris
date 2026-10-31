@@ -27,6 +27,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
 
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- Added a headless Fuel profile with the 500 MHz R14000, 512 MiB RAM,
+  Bedrock, dual-head XBridge, IOC3 networking and two-channel ISP12160 SCSI.
+  The normal interpreter boot reaches the IRIX 6.5.30 root shell with PROM
+  6.210. See the [Fuel guide](docs/fuel-ip34.md).
+
+### PCI configuration
+
+- A PCI function can describe its own writable header fields and
+  write-one-to-clear status bits. Byte and halfword configuration writes
+  through a Bridge carry their byte enables, so such a function keeps the
+  status events a narrow write did not select. No Octane function has
+  write-one-to-clear status bits, so the Octane behaves as before.
+
 ### VNC, and screen and pointer commands
 
 - **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the

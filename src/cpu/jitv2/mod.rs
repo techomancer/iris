@@ -92,6 +92,7 @@ mod zz_corpus {
             // (baked immediate vs load) is identical to production.
             crate::cpu::jitv2::codegen::JitConsts {
                 core: core::num::NonZeroUsize::new(core as *mut MipsCore as usize),
+                lwr_keeps_upper: false,
             }
         };
         // Synthetic corpus-measurement geometry: 16 KiB direct-mapped L1-D

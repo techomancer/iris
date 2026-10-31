@@ -1024,7 +1024,7 @@ impl Bridge {
         let i = (reg >> 2) as usize;
         let shift = 8 * (reg & 3);
         let mask = (u64::MAX >> (64 - 8 * size)) << shift;
-        cfg.write(i, ((cfg.read(i) as u64 & !mask) | ((val << shift) & mask)) as u32);
+        cfg.write_masked(i, (val << shift) as u32, mask as u32);
         true
     }
 

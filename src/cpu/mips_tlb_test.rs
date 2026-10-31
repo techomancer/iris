@@ -492,3 +492,53 @@ fn tlb_write_inside_a_larger_entry_count_is_kept() {
     assert_eq!(r10000.read(63).entry_hi, entry.entry_hi, "...and its last slot");
 }
 }
+
+/// A mapped uncached page carries EntryLo's uncached attribute (bits 63:62)
+/// to the bus as physical bits 58:57, where IRIX on the Fuel puts its
+/// graphics FIFO's I/O space; a cached page never does, whatever those bits
+/// hold, and no attribute leaves the PFN alone. "Uncached" is the model's C
+/// table, so a model that decodes a C value differently, or a table installed
+/// after the entry was written, changes the answer.
+#[test]
+fn only_uncached_pages_carry_the_uncached_attribute() {
+    use super::{MipsTlb, Tlb, TlbEntry};
+    use crate::cpu::mips_exec::CacheAttr;
+    // MipsTlb is large; give the one instance room, as its neighbours do.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let pfn = 0x0d100u64 << 6;
+            let base = |tlb: &MipsTlb| tlb.read(0).pfn_base;
+            let write = |tlb: &mut MipsTlb, lo0: u64, lo1: u64| {
+                let mut entry = TlbEntry::new();
+                entry.entry_hi = 0xC000_0000_0004_0000;
+                entry.entry_lo = [lo0, lo1];
+                tlb.write(0, entry);
+            };
+            let mut tlb = Box::new(MipsTlb::new(64));
+            // The default table: C=2 and the reserved values are uncached.
+            for (cca, expect) in [(2u64, 1u64 << 57), (6, 1 << 57), (3, 0), (5, 0)] {
+                let lo = (1 << 62) | pfn | (cca << 3) | 0x6;
+                write(&mut tlb, lo, lo);
+                assert_eq!(base(&tlb), [0x0d10_0000 | expect; 2], "cca {cca}");
+            }
+            write(&mut tlb, pfn | (2 << 3), 0);
+            assert_eq!(base(&tlb)[0], 0x0d10_0000, "no attribute leaves the PFN alone");
+
+            // The R10000 table reads C=7 (uncached accelerated) as uncached and
+            // 5 as cacheable; a model that read 7 as cacheable carries nothing.
+            let mut table = [CacheAttr::Uncached; 8];
+            table[3] = CacheAttr::Cacheable;
+            table[5] = CacheAttr::CacheableCoherent;
+            tlb.set_cache_attrs(table);
+            let lo = (1 << 62) | pfn | (7 << 3) | 0x6;
+            write(&mut tlb, lo, lo);
+            assert_eq!(base(&tlb), [0x0d10_0000 | 1 << 57; 2], "C=7 uncached under this table");
+            table[7] = CacheAttr::Cacheable;
+            tlb.set_cache_attrs(table);
+            assert_eq!(base(&tlb), [0x0d10_0000; 2], "the table, installed later, decides");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

@@ -51,8 +51,15 @@ pub trait ScsiTarget: Send {
     /// The logical block size, for a target that has one.
     fn block_size(&self) -> Option<u64> { None }
 
-    /// A controller's bus reset: block size back to what the controller
-    /// leaves, with a CD-ROM at 512 bytes if `cdrom_512`.
+    /// A SCSI bus reset reached this target, which owes the initiator a
+    /// unit attention on its next command. The ISP12160 calls this when the
+    /// guest resets either of its buses; the WD33C93A, AIC-7880 and ISP1040
+    /// models never told their targets about a reset and still do not.
+    fn bus_reset(&mut self) {}
+
+    /// The AIC-7880's bus reset: block size back to what that controller
+    /// leaves, with a CD-ROM at 512 bytes if `cdrom_512`. Only the AIC-7880
+    /// calls this.
     fn reset_block_size(&mut self, _cdrom_512: bool) {}
 
     // ---- copy-on-write layer -----------------------------------------

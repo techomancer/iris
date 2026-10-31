@@ -818,7 +818,7 @@ impl Codegen {
         use std::fmt::Write as _;
         let _ = write!(
             s,
-            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
+            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} lwr_upper={} triple={} flags={}",
             crate::cpu::jitv2::comp::max_instrs_per_compile(),
             crate::cpu::jitv2::comp::min_instrs_to_compile(),
             Self::opt_level_speed(),
@@ -830,6 +830,7 @@ impl Codegen {
             skip_entry_preamble,
             crate::cpu::jitv2::isa::mips4_enabled(),
             self.dc_geometry,
+            self.jit_consts.lwr_keeps_upper,
             isa.triple(),
             isa.flags(),
         );
@@ -4335,6 +4336,11 @@ pub struct JitConsts {
     /// to loading from memory, exactly as before, so an un-stamped `Codegen`
     /// stays correct (just no faster).
     pub core: Option<core::num::NonZeroUsize>,
+    /// A partial LWR keeps bits 63:32 of the destination, as the R10000 family
+    /// does (`CpuModel::R10K_CACHE_OPS`). A model fact rather than a core one,
+    /// published beside the core address because both reach a worker's
+    /// `Codegen` the same way. The code-cache fingerprint carries it.
+    pub lwr_keeps_upper: bool,
 }
 
 impl JitConsts {
@@ -9998,6 +10004,15 @@ fn emit_lwr_ldr(ctx: &mut EmitCtx, size: MemSize) {
 
     let result = if size == MemSize::B8 {
         result_narrow
+    } else if size == MemSize::B4 && ctx.jit_consts.lwr_keeps_upper {
+        // Partial words keep rt[63:32]; a full word (offset 3) still
+        // sign-extends. Mirrors `MipsExecutor::exec_lwr`.
+        let upper = ctx.builder.ins().band_imm_s(rt_val, 0xFFFF_FFFF_0000_0000u64 as i64);
+        let lower = ctx.builder.ins().uextend(ir::types::I64, result_narrow);
+        let merged = ctx.builder.ins().bor(upper, lower);
+        let partial = ctx.builder.ins().icmp_imm_s(ir::condcodes::IntCC::NotEqual, byte_offset, align_mask);
+        let full = ctx.builder.ins().sextend(ir::types::I64, result_narrow);
+        ctx.builder.ins().select(partial, merged, full)
     } else {
         ctx.builder.ins().sextend(ir::types::I64, result_narrow)
     };
@@ -10765,6 +10780,18 @@ mod tests {
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+    }
+
+    #[test]
+    fn cache_fingerprint_includes_the_lwr_choice() {
+        let base = Codegen::new().cache_fingerprint(false).expect("default codegen is cacheable");
+        let mut codegen = Codegen::new();
+        codegen.jit_consts.lwr_keeps_upper = true;
+        assert_ne!(
+            codegen.cache_fingerprint(false).expect("lwr codegen is cacheable"),
+            base,
+            "the LWR choice must select a different persistent cache namespace",
+        );
     }
 
     /// `is_inlinable` must reject on *both* of its conditions, not just the

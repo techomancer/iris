@@ -1,5 +1,5 @@
-//! The Ethernet MAC inside IOC3, with the ICS1890 transceiver the Octane
-//! carries on its management bus.
+//! The Ethernet MAC inside IOC3, with the Octane ICS1890 or Fuel DP83843
+//! transceiver on its management bus.
 //!
 //! IOC3 forwards the register offsets 0xf0..=0x150 of its register BAR here
 //! through [`Ioc3EthPort`]. The MAC is SGI's own design with no vendor
@@ -17,7 +17,7 @@
 //! Ring entries and descriptor words are big-endian bytes at bus addresses,
 //! frame bytes are in wire order; the Bridge applies any programmed swap.
 //!
-//! Frames go through iris's network engine like the O2's MEC does: see
+//! Frames use iris's shared network link. The machine attaches it through
 //! [`Ioc3Eth::attach`].
 //!
 //! Approximations (the QEMU model this was ported from has the same ones,
@@ -38,8 +38,8 @@
 //!   sends whenever the PHY's data path is open (not powered down or
 //!   isolated), link or not.
 //!
-//! Ported from hw/net/sgi-ioc3-eth.c and hw/net/ics1890.c in
-//! jamesbraid/qemu-sgi-origami.
+//! Ported from hw/net/sgi-ioc3-eth.c in jamesbraid/qemu-sgi-origami. The
+//! Octane PHY model lives in `ics1890.rs`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -48,6 +48,7 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::dev::ioc3_port::Ioc3EthPort;
+use crate::dev::ics1890::Ics1890;
 use crate::pci::{PciDma, PciDmaStatus};
 use crate::traits::{Device, Resettable};
 
@@ -162,6 +163,19 @@ pub const PHY_ADDR: u8 = 1;
 /// How long the synthetic link partner takes to complete negotiation.
 pub const NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
 
+/// The management and packet-path behavior that varies between IOC3 PHYs.
+pub(crate) trait MiiPhy: Send {
+    fn address(&self) -> u8;
+    fn deadline(&self) -> Option<Instant>;
+    fn wire_enabled(&self) -> bool;
+    fn in_loopback(&self) -> bool;
+    fn sync(&mut self, now: Instant);
+    fn read(&mut self, register: u8, now: Instant) -> u16;
+    fn write(&mut self, register: u8, value: u16, now: Instant);
+    fn set_backend_link(&mut self, up: bool, now: Instant);
+    fn power_on(&mut self);
+}
+
 fn ridx(off: u32) -> usize {
     ((off - MAC_CONTROL) / 4) as usize
 }
@@ -169,345 +183,6 @@ fn ridx(off: u32) -> usize {
 // ---------------------------------------------------------------------------
 // ICS1890 transceiver
 // ---------------------------------------------------------------------------
-
-/// Ordinary and command-override writable masks, by register.
-fn phy_masks(r: usize) -> (u16, u16) {
-    match r {
-        0 => (0xff80, 0),
-        1 => (0, 0x7f80),
-        2 | 3 => (0, 0xffff),
-        4 => (0x21e0, 0x1c1f),
-        6 => (0, 0xffe0),
-        0x10 => (0x802d, 0),
-        0x12 => (0x002f, 0),
-        0x13 => (0x0011, 0),
-        _ => (0, 0),
-    }
-}
-
-/// The ICS1890 as the Octane carries it: address 1, node mode, software
-/// priority, revision 3.
-pub struct Ics1890 {
-    addr: u8,
-    bmcr: u16,
-    bmsr_caps: u16,
-    id1: u16,
-    id2: u16,
-    anar: u16,
-    partner: u16,
-    exp: u16,
-    ext_ctl: u16,
-    tenbt: u16,
-    ext2: u16,
-    override_armed: bool,
-    page_received: bool,
-    link_low_latch: bool,
-    last_link: bool,
-    backend_up: bool,
-    nego_done: bool,
-    deadline: Option<Instant>,
-    delay: Duration,
-    /// Accesses to registers the part does not implement.
-    pub unimplemented_accesses: u32,
-}
-
-impl Ics1890 {
-    pub fn new(addr: u8, delay: Duration) -> Self {
-        let mut p = Self {
-            addr,
-            bmcr: 0,
-            bmsr_caps: 0,
-            id1: 0,
-            id2: 0,
-            anar: 0,
-            partner: 0,
-            exp: 0,
-            ext_ctl: 0,
-            tenbt: 0,
-            ext2: 0,
-            override_armed: false,
-            page_received: false,
-            link_low_latch: false,
-            last_link: false,
-            backend_up: true,
-            nego_done: false,
-            deadline: None,
-            delay,
-            unimplemented_accesses: 0,
-        };
-        p.reset(Instant::now());
-        p
-    }
-
-    pub fn address(&self) -> u8 {
-        self.addr
-    }
-
-    /// Hardware and software reset: defaults, no override, no latches, and a
-    /// fresh negotiation if enabled.
-    pub fn reset(&mut self, now: Instant) {
-        self.bmcr = 0x3000;
-        self.bmsr_caps = 0x7800;
-        self.id1 = 0x0015;
-        self.id2 = 0xf423;
-        self.anar = 0x01e1;
-        self.partner = 0;
-        self.exp = 0;
-        self.ext_ctl = 0x0008;
-        self.tenbt = 0;
-        self.ext2 = 0x0001;
-        self.override_armed = false;
-        self.page_received = false;
-        self.link_low_latch = false;
-        self.nego_done = false;
-        self.deadline = None;
-        self.last_link = false;
-        self.start_negotiation(now);
-    }
-
-    fn autoneg(&self) -> bool {
-        self.bmcr & 0x1000 != 0
-    }
-    fn power_down(&self) -> bool {
-        self.bmcr & 0x0800 != 0
-    }
-    fn isolated(&self) -> bool {
-        self.bmcr & 0x0400 != 0
-    }
-
-    /// The live link: down in power-down, down without a backend, and with
-    /// negotiation enabled up only once it has completed.
-    fn link(&self) -> bool {
-        !self.power_down() && self.backend_up && (!self.autoneg() || self.nego_done)
-    }
-
-    fn start_negotiation(&mut self, now: Instant) {
-        self.nego_done = false;
-        self.partner = 0;
-        self.page_received = false;
-        self.deadline = None;
-        if self.autoneg() && self.backend_up && !self.power_down() {
-            // The synthetic peer advertises 0x01e1: IEEE 802.3, no fault.
-            let common = self.anar & 0x01e0;
-            if self.anar & 0x1f == 1 && common != 0 && self.anar & 0x2000 == 0 {
-                self.deadline = Some(now + self.delay);
-            }
-        }
-    }
-
-    /// When a negotiation in progress completes, if one is.
-    pub fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
-
-    /// Advance the negotiation deadline and note link transitions. Reads never
-    /// start or postpone negotiation; this only observes the clock.
-    pub fn sync(&mut self, now: Instant) {
-        if let Some(d) = self.deadline {
-            if now >= d && !self.power_down() && self.backend_up {
-                self.deadline = None;
-                self.nego_done = true;
-                self.partner = 0x01e1;
-                self.page_received = true;
-            }
-        }
-        let link = self.link();
-        if self.last_link && !link {
-            self.link_low_latch = true;
-        }
-        self.last_link = link;
-    }
-
-    /// The packet backend's cable state.
-    pub fn set_backend_link(&mut self, up: bool, now: Instant) {
-        self.sync(now);
-        if self.backend_up == up {
-            return;
-        }
-        self.backend_up = up;
-        if up {
-            // Recovery starts a fresh negotiation.
-            self.start_negotiation(now);
-        } else {
-            self.deadline = None;
-            self.nego_done = false;
-        }
-        self.sync(now);
-    }
-
-    /// BMCR loopback turns frames round inside the part. Isolate and
-    /// power-down take precedence.
-    pub fn in_loopback(&self) -> bool {
-        self.bmcr & 0x4000 != 0 && !self.power_down() && !self.isolated()
-    }
-
-    /// Frames may cross the MII at all.
-    pub fn data_path(&self) -> bool {
-        !self.power_down() && !self.isolated()
-    }
-
-    /// Frames may go to or come from the packet backend.
-    pub fn wire_enabled(&self) -> bool {
-        self.data_path() && self.link()
-    }
-
-    fn resolved(&self) -> (bool, bool) {
-        // (100 Mb/s, full duplex)
-        if self.autoneg() {
-            let common = self.anar & self.partner & 0x01e0;
-            if common & 0x100 != 0 {
-                (true, true)
-            } else if common & 0x80 != 0 {
-                (true, false)
-            } else if common & 0x40 != 0 {
-                (false, true)
-            } else {
-                (false, false)
-            }
-        } else {
-            (self.bmcr & 0x2000 != 0, self.bmcr & 0x0100 != 0)
-        }
-    }
-
-    pub fn read(&mut self, r: u8, now: Instant) -> u16 {
-        self.sync(now);
-        match r {
-            0 => self.bmcr,
-            1 => {
-                let mut v = 0x0009 | self.bmsr_caps;
-                if self.autoneg() && self.nego_done {
-                    v |= 0x0020;
-                }
-                if self.link() && !self.link_low_latch {
-                    v |= 0x0004;
-                }
-                self.link_low_latch = false;
-                v
-            }
-            2 => self.id1,
-            3 => self.id2,
-            4 => self.anar,
-            5 => self.partner,
-            6 => {
-                let v = (self.exp & 0xffe0)
-                    | if self.nego_done { 1 } else { 0 }
-                    | if self.page_received { 2 } else { 0 };
-                self.page_received = false;
-                v
-            }
-            0x10 => {
-                // Bit 4 is a fixed reserved read choice (stock firmware
-                // expects it set); bit 15 reads the override state.
-                (self.ext_ctl & 0x002d)
-                    | (u16::from(self.addr & 0x1f) << 6)
-                    | 0x0010
-                    | if self.override_armed { 0x8000 } else { 0 }
-            }
-            0x11 => {
-                let link = self.link();
-                let (speed, full) = self.resolved();
-                let mut v = 0;
-                if link {
-                    v |= 1;
-                    if speed {
-                        v |= 0x8000;
-                    }
-                    if full {
-                        v |= 0x4000;
-                    }
-                }
-                if self.nego_done {
-                    v |= 0x0010 | (7 << 11);
-                }
-                v
-            }
-            0x12 => (self.tenbt & 0x002f) | 0x0010,
-            // Node mode strap in bit 14, software bit 0.
-            0x13 => (self.ext2 & 0x0011) | 0x4000,
-            _ => {
-                self.unimplemented_accesses += 1;
-                0
-            }
-        }
-    }
-
-    pub fn write(&mut self, r: u8, val: u16, now: Instant) {
-        self.sync(now);
-        let r = usize::from(r);
-        let armed = self.override_armed;
-        match r {
-            0 => {
-                if val & 0x8000 != 0 {
-                    self.reset(now);
-                    self.sync(now);
-                    return;
-                }
-                let old = self.bmcr;
-                // Reset and restart are self-clearing.
-                self.bmcr = val & 0x7d80;
-                let restart = val & 0x0200 != 0;
-                let pd_now = self.power_down();
-                if pd_now && old & 0x0800 == 0 {
-                    // Entering power-down clears the latching status.
-                    self.link_low_latch = false;
-                    self.page_received = false;
-                    self.deadline = None;
-                } else if !pd_now && old & 0x0800 != 0 {
-                    // Release: enabled negotiation starts afresh.
-                    self.start_negotiation(now);
-                } else if self.autoneg() && (restart || old & 0x1000 == 0) {
-                    self.start_negotiation(now);
-                } else if !self.autoneg() {
-                    self.nego_done = false;
-                    self.deadline = None;
-                }
-                if armed {
-                    self.override_armed = false;
-                }
-            }
-            1 | 2 | 3 | 4 | 6 | 0x10 | 0x12 | 0x13 => {
-                let (ord, ovr) = phy_masks(r);
-                let mask = ord | if armed { ovr } else { 0 };
-                let cell = match r {
-                    1 => &mut self.bmsr_caps,
-                    2 => &mut self.id1,
-                    3 => &mut self.id2,
-                    4 => &mut self.anar,
-                    6 => &mut self.exp,
-                    0x10 => &mut self.ext_ctl,
-                    0x12 => &mut self.tenbt,
-                    _ => &mut self.ext2,
-                };
-                let before = *cell;
-                *cell = (before & !mask) | (val & mask);
-                // The status caps live in bits 14..7 only.
-                if r == 1 {
-                    self.bmsr_caps &= 0x7f80;
-                }
-                if r == 4 && self.anar != before && self.autoneg() {
-                    self.start_negotiation(now);
-                }
-                if armed {
-                    self.override_armed = false;
-                } else if r == 0x10 && val & 0x8000 != 0 {
-                    self.override_armed = true;
-                }
-            }
-            _ => {
-                // Partner ability, Quick Poll and unimplemented registers
-                // ignore writes. The part is addressed, so a write still
-                // consumes an armed override.
-                if r != 5 && r != 0x11 {
-                    self.unimplemented_accesses += 1;
-                }
-                if armed {
-                    self.override_armed = false;
-                }
-            }
-        }
-        self.sync(now);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Checksums and the multicast hash
@@ -615,7 +290,7 @@ struct State {
     mii_data_w: u16,
     /// Apart from its index: an index-only write must not disarm.
     rx_timer_armed: bool,
-    phy: Ics1890,
+    phy: Box<dyn MiiPhy>,
     irq_asserted: bool,
     /// Level changes not yet delivered to the callback, in order.
     irq_events: Vec<bool>,
@@ -625,20 +300,34 @@ struct State {
 }
 
 impl State {
-    fn new(delay: Duration) -> Self {
+    fn new(phy: Box<dyn MiiPhy>) -> Self {
         Self {
             regs: [0; NREGS],
             int_deferred: 0,
             mii_data: MII_ABSENT,
             mii_data_w: 0,
             rx_timer_armed: false,
-            phy: Ics1890::new(PHY_ADDR, delay),
+            phy,
             irq_asserted: false,
             irq_events: Vec::new(),
             frame: vec![0; FRAME_MAX],
             tx_frames: 0,
             rx_frames: 0,
         }
+    }
+
+    fn power_on(&mut self) {
+        self.phy.power_on();
+        self.regs = [0; NREGS];
+        self.int_deferred = 0;
+        self.mii_data = MII_ABSENT;
+        self.mii_data_w = 0;
+        self.rx_timer_armed = false;
+        self.irq_asserted = false;
+        self.irq_events.clear();
+        self.frame.fill(0);
+        self.tx_frames = 0;
+        self.rx_frames = 0;
     }
 
     fn get(&self, off: u32) -> u32 {
@@ -1024,6 +713,7 @@ type IrqFn = Box<dyn Fn(bool) + Send + Sync>;
 /// through the Bridge and HEART, which never call back into this device.
 pub struct Ioc3Eth {
     mac: [u8; 6],
+    thread_prefix: &'static str,
     st: Mutex<State>,
     dma: Mutex<Option<Arc<dyn PciDma>>>,
     irq: Mutex<Option<IrqFn>>,
@@ -1061,9 +751,19 @@ impl Ioc3Eth {
 
     /// As [`Ioc3Eth::new`], with the PHY's synthetic negotiation delay set.
     pub fn with_negotiation_delay(mac: [u8; 6], delay: Duration) -> Arc<Self> {
+        Self::with_phy(mac, Box::new(Ics1890::new(PHY_ADDR, delay)), "ip30-eth")
+    }
+
+    /// Fuel uses the DP83843 at management address 1.
+    pub fn new_fuel(mac: [u8; 6]) -> Arc<Self> {
+        Self::with_phy(mac, Box::new(crate::dev::dp83843::Dp83843::new(PHY_ADDR)), "ioc3-eth")
+    }
+
+    fn with_phy(mac: [u8; 6], phy: Box<dyn MiiPhy>, thread_prefix: &'static str) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             mac,
-            st: Mutex::new(State::new(delay)),
+            thread_prefix,
+            st: Mutex::new(State::new(phy)),
             dma: Mutex::new(None),
             irq: Mutex::new(None),
             irq_order: Mutex::new(()),
@@ -1100,13 +800,7 @@ impl Ioc3Eth {
     /// with the state saying low.
     pub fn reset(&self) {
         let _order = self.irq_order.lock();
-        {
-            let mut st = self.st.lock();
-            let delay = st.phy.delay;
-            let backend_up = st.phy.backend_up;
-            *st = State::new(delay);
-            st.phy.set_backend_link(backend_up, Instant::now());
-        }
+        self.st.lock().power_on();
         if let Some(cb) = self.irq.lock().as_ref() {
             cb(false);
         }
@@ -1174,8 +868,9 @@ impl Ioc3Eth {
     fn spawn_nat(&self) {
         let slot = self.backend.clone();
         let Some(mut engine) = slot.lock().take() else { return };
+        let thread_name = format!("{}-net", self.thread_prefix);
         let t = std::thread::Builder::new()
-            .name("ip30-eth-net".into())
+            .name(thread_name)
             .spawn(move || {
                 engine.run();
                 *slot.lock() = Some(engine);
@@ -1280,8 +975,9 @@ impl Device for Ioc3Eth {
         }
         let wake = self.rx_wake.lock().get_or_insert_with(crate::net::Wake::new).clone();
         let (me, running) = (self.me.clone(), self.running.clone());
+        let thread_name = format!("{}-rx", self.thread_prefix);
         let rx = std::thread::Builder::new()
-            .name("ip30-eth-rx".into())
+            .name(thread_name)
             .spawn(move || Self::rx_loop(me, running, wake))
             .expect("ioc3 eth rx thread");
         self.threads.lock().push(rx);

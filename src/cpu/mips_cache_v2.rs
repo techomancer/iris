@@ -556,11 +556,24 @@ pub trait CpuModel: MipsCache {
     /// "shadow" for one that keeps only what CACHE ops observe. Recorded in
     /// snapshots: a full cache's state does not load into a shadow one.
     const CACHE_KIND: &'static str = "full";
-    /// Cache ops 5/6/7 carry their R10000 meanings rather than their R4000 ones.
-    /// The executor needs this: `Index_Store_Data` takes its value from TagLo
-    /// and `Index_Load_Data` returns into it, neither of which is true of the
-    /// R4000 hit operations that share those encodings.
+    /// The part is in the R10000 family (R10000, R12000, R14000, R16000), which
+    /// shares one programming model. Cache ops 5/6/7 carry their R10000
+    /// meanings rather than their R4000 ones: `Index_Store_Data` takes its
+    /// value from TagLo and `Index_Load_Data` returns into it, neither of which
+    /// is true of the R4000 hit operations that share those encodings. The
+    /// family also keeps every implemented VPN2 bit in EntryHi and the TLB
+    /// (`VA_BITS`), carries the uncached attribute from EntryLo bits 63:62,
+    /// keeps primary-cache diagnostic data, and leaves bits 63:32 alone on a
+    /// partial LWR.
     const R10K_CACHE_OPS: bool = false;
+    /// Bits `Index_Store_Tag` keeps for the secondary cache. All of them unless
+    /// a part sets a mask. A 36-bit mask once inferred from the IP28 PROM's
+    /// walking-0s phase broke its diagnostics: the truncation it reads back
+    /// comes from the tag being assembled as `(TagHi << 32) | TagLo[31:0]`, not
+    /// from the array, and the mask only discarded the MRU bit the PROM writes
+    /// as TagHi[31]. Extending a mask to another part needs IP28 and Octane
+    /// diagnostic comparisons.
+    const SECONDARY_TAG_MASK: u64 = u64::MAX;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -1379,6 +1392,15 @@ pub mod model {
     pub const R4400: u8 = 0;
     pub const R5000: u8 = 1;
     pub const R10000: u8 = 2;
+    pub const R12000: u8 = 3;
+    pub const R14000: u8 = 4;
+    pub const R16000: u8 = 5;
+
+    /// The R10000 family: R10000 and the parts that follow it, which share one
+    /// programming model.
+    pub const fn r10k_family(model: u8) -> bool {
+        model >= R10000
+    }
 }
 
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.
@@ -3589,14 +3611,17 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
-    const R10K_CACHE_OPS: bool = MODEL == model::R10000;
-    // 44 implemented virtual address bits on the R10000, as the shadow
+    const R10K_CACHE_OPS: bool = model::r10k_family(MODEL);
+    // 44 implemented virtual address bits on the R10000 family, as the shadow
     // model already says; XContext's layout follows them.
-    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
-    const PA_BITS: u32 = if MODEL == model::R10000 { 40 } else { 36 };
+    const VA_BITS: u32 = if model::r10k_family(MODEL) { 44 } else { 40 };
+    const PA_BITS: u32 = if model::r10k_family(MODEL) { 40 } else { 36 };
     const NAME: &'static str = match MODEL {
         model::R5000 => "R5000",
         model::R10000 => "R10000",
+        model::R12000 => "R12000",
+        model::R14000 => "R14000",
+        model::R16000 => "R16000",
         _ => "R4400",
     };
 }
@@ -4206,7 +4231,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     // L2 TagLo format:
                     //   [31:13] physical tag   [12:10] state   [9:7] PIdx
                     let tag: L2Tag = self.l2.get_tag(idx);
-                    if MODEL == model::R10000 {
+                    if Self::R10K_CACHE_OPS {
                         eprintln!("ip28: C_ILT(SD) idx={idx:#x} ptag={:#x} cs={:#x} pidx={:#x}",
                                   tag.ptag(), tag.cs(), tag.pidx());
                     }

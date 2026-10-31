@@ -59,9 +59,10 @@ overlay = true
 ```
 
 Paths are relative to the directory iris runs in. Every key is listed in
-[FEATURES.md](../FEATURES.md). `machine.cpu` must be `r10000`. `[clock]
-fixed_mhz` sets CP0 Count; unset it is 97.5 MHz, half of the R10000's
-195 MHz pipeline clock.
+[FEATURES.md](../FEATURES.md). `machine.cpu` is `r10000` (the default 195 MHz part),
+`r12000` (an Octane2's 360 MHz part with revision 3.5, 2 MiB of secondary
+cache) or `r14000` (revision 2.4). `[clock] fixed_mhz` sets CP0 Count; unset it
+is half the pipeline clock: 97.5 MHz for the R10000, 180 MHz for the R12000.
 
 ## PROM and flash
 

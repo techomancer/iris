@@ -859,6 +859,12 @@ pub struct MipsCore {
     pub cp0_errorepc: u64,    // 30: Error Exception PC
 
     pub tlb_entries: u32,     // Total TLB entries
+    /// Writable EntryHi bits: region, ASID and as much VPN2 as the model keeps
+    /// (`CpuModel::VA_BITS`). Set once by the executor.
+    pub entryhi_mask: u64,
+    /// Writable EntryLo bits: the PFN and flags (29:0), and on models that have
+    /// it the uncached attribute in bits 63:62 (`CpuModel::R10K_CACHE_OPS`).
+    pub entrylo_mask: u64,
     /// CP0 PRId / CP1 FIR reset values, supplied by the CPU model at construction.
     pub reset_prid: u32,
     pub reset_fir: u32,
@@ -1391,6 +1397,8 @@ impl MipsCore {
             cp0_taghi: 0,
             cp0_errorepc: 0,
             tlb_entries: 48,
+            entryhi_mask: 0xC000_00FF_FFFF_E0FF,
+            entrylo_mask: 0x3FFF_FFFF,
             reset_prid: 0x0000_0440,
             reset_fir: 0x0000_0500,
             cp0_random_cycle: 0,
@@ -1580,6 +1588,14 @@ impl MipsCore {
     }
 
     /// Read CP0 register by index
+    /// What an EntryLo read returns: the writable field, PFN (29:6) and flags
+    /// in the low bits, plus the uncached attribute (63:62) where the model has
+    /// it. The debug and architectural reads share it.
+    #[inline]
+    fn entrylo_readback(&self, value: u64) -> u64 {
+        value & self.entrylo_mask
+    }
+
     pub fn read_cp0(&mut self, reg: u32) -> u64 {
         match reg {
             0 => self.cp0_index as u64,
@@ -1587,8 +1603,8 @@ impl MipsCore {
                 self.update_random();
                 self.cp0_random as u64
             }
-            2 => self.cp0_entrylo0 & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
-            3 => self.cp0_entrylo1 & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
+            2 => self.entrylo_readback(self.cp0_entrylo0),
+            3 => self.entrylo_readback(self.cp0_entrylo1),
             4 => self.cp0_context,
             5 => self.cp0_pagemask & 0x01FFE000, // PageMask: only bits 24:13 are valid
             6 => self.cp0_wired as u64 & 0x3F, // Wired: only bits 5:0 are valid, R4000 manual Table 4-10
@@ -1645,8 +1661,8 @@ impl MipsCore {
         match reg {
             0 => self.cp0_index as u64,
             1 => self.cp0_random as u64,
-            2 => self.cp0_entrylo0 & 0x3FFFFFFF,
-            3 => self.cp0_entrylo1 & 0x3FFFFFFF,
+            2 => self.entrylo_readback(self.cp0_entrylo0),
+            3 => self.entrylo_readback(self.cp0_entrylo1),
             4 => self.cp0_context,
             5 => self.cp0_pagemask & 0x01FFE000,
             6 => self.cp0_wired as u64 & 0x3F,
@@ -1986,8 +2002,8 @@ impl MipsCore {
             0 => self.cp0_index = (value as u32)
                     & (crate::cpu::mips_exec::CP0_INDEX_P | crate::cpu::mips_exec::CP0_INDEX_SLOT_MASK),
             1 => { /* Random is read-only */ }
-            2 => self.cp0_entrylo0 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
-            3 => self.cp0_entrylo1 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
+            2 => self.cp0_entrylo0 = value & self.entrylo_mask,
+            3 => self.cp0_entrylo1 = value & self.entrylo_mask,
             4 => {
                 //eprintln!("MTC0 Context = {:#018x} (PTEBase={:#018x})", value, value & 0xFFFFFFFF_FF800000);
                 self.cp0_context = value;
@@ -2010,16 +2026,16 @@ impl MipsCore {
             }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
                 // `log mips mask cp0` shows what the guest wrote against
-                // what survives the mask. The mask is R4400's 40-bit virtual
-                // address; the R10000 implements 44.
-                if cp0_log() && (value & !0xC000_00FF_FFFF_E0FF) != 0 {
+                // what survives the mask: the model's VPN2 width, 40 bits or the
+                // R10000 family's 44.
+                if cp0_log() && (value & !self.entryhi_mask) != 0 {
                     crate::dlog!(crate::devlog::LogModule::Mips,
                         "ip28ehi: wrote {value:#018x} -> kept {:#018x} (lost {:#018x}) pc={:#018x}",
-                        value & 0xC000_00FF_FFFF_E0FF,
-                        value & !0xC000_00FF_FFFF_E0FF,
+                        value & self.entryhi_mask,
+                        value & !self.entryhi_mask,
                         self.pc);
                 }
-                self.cp0_entryhi = value & 0xC000_00FF_FFFF_E0FF;
+                self.cp0_entryhi = value & self.entryhi_mask;
             },
             11 => {
                 // Materialize the count *first* so both new_delta below and

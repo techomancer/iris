@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 use crate::config::{CpuModel, MachineConfig};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
-use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R5000ShadowCache};
+use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R12000O2ShadowCache, R5000ShadowCache};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
@@ -238,8 +238,9 @@ impl O2Machine {
         let boot = Arc::new(BootState::new());
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
             CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
+            CpuModel::R12000 => Self::build_cpu::<R12000O2ShadowCache>(sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
             CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
+            CpuModel::R4400 | CpuModel::R14000 => return Err("an O2 has an R5000, R10000 or R12000 ([machine] cpu)".into()),
         };
 
         // ppmem: the CPU's cache and the JIT reach RAM through the memory's

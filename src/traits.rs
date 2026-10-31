@@ -209,6 +209,20 @@ pub trait BusDevice: Send + Sync {
         BUS_OK
     }
 
+    /// An uncached SB (`size` 1) or SH (`size` 2) to `addr`, with the whole
+    /// source register `gpr` for a bus that can see the lanes the store does
+    /// not select. The CPU calls this instead of `write8`/`write16` for an
+    /// uncached SB or SH.
+    ///
+    /// The architectural byte or halfword is the low bits of `gpr`, which is
+    /// all the default delivers. Which other lanes a real processor drives for
+    /// a narrow store is undefined, so only a device that models a path
+    /// observing them (Bedrock's memory ECC view) overrides this, and a bus
+    /// that forwards accesses must forward this call too.
+    fn write_narrow_from(&self, addr: u64, size: usize, gpr: u64) -> u32 {
+        if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
+    }
+
     /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
     /// for the 4KB physical page containing `addr`, or null if this device doesn't
     /// back JIT-compilable memory (MMIO, etc). RAM devices return one counter per
