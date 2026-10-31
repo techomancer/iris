@@ -48,7 +48,7 @@ fn display_identity(s: &mut Board, did: u32) {
 /// have been resolved.
 fn shown(s: &mut Board, x: i32, y: i32) -> u32 {
     s.scanout_update();
-    s.scanout.frame[(y * s.scanout.frame_width as i32 + x) as usize] & 0xff_ffff
+    s.reader.frame[(y * s.reader.frame_width as i32 + x) as usize] & 0xff_ffff
 }
 
 /// Put main drawable `id` (bits 7:3 of a pixel's id byte) on every pixel of the box [x0, x1) x [y0, y1).
@@ -310,8 +310,8 @@ fn a_frame_resolves_the_lines_it_copied_while_the_raster_unit_draws_on() {
     s.scanout_stage();
     rgb_fill(&mut s, 0, 0, 0xff, 100, 100, 110, 110);
     assert!(s.scanout_resolve().is_some());
-    let at = (105 * s.scanout.frame_width + 105) as usize;
-    assert_eq!(s.scanout.frame[at] & 0xff_ffff, 0xff0000, "the frame shows the copy");
+    let at = (105 * s.reader.frame_width + 105) as usize;
+    assert_eq!(s.reader.frame[at] & 0xff_ffff, 0xff0000, "the frame shows the copy");
     assert_eq!(shown(&mut s, 105, 105), 0x0000ff, "and the next frame the new drawing");
 }
 
@@ -751,19 +751,19 @@ fn the_dirty_counters_name_the_site_and_the_frame_rows() {
     let (mut s, _) = board("v12");
     display_identity(&mut s, 0);
     s.scanout_update();
-    s.scanout.stats = DirtyStats::default();
+    s.reader.stats = DirtyStats::default();
 
     s.scanout.invalidate_for(DirtySite::Pixel, 7, 3);
     s.scanout.repaint_for(DirtySite::Cursor, 1000, 100);
     s.scanout_update();
 
     let h = s.scanout.mode.height as u64;
-    let st = &s.scanout.stats;
+    let st = &s.reader.stats;
     assert_eq!(s.scanout.marks.site(DirtySite::Pixel), [1, 3]);
     assert_eq!(s.scanout.marks.site(DirtySite::Cursor), [1, h - 1000], "clipped to the frame");
     assert_eq!((st.frames, st.busy_frames, st.rows, st.max_rows), (1, 1, 3 + h - 1000, 3 + h - 1000));
     s.scanout_update();
-    assert_eq!((s.scanout.stats.frames, s.scanout.stats.busy_frames), (2, 1), "an idle frame counts, with no rows");
+    assert_eq!((s.reader.stats.frames, s.reader.stats.busy_frames), (2, 1), "an idle frame counts, with no rows");
 }
 
 /// The display lines a draw marked to resolve again.

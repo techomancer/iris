@@ -268,6 +268,8 @@ pub struct BoardLocks {
     pub fifo: Arc<CommandFifo>,
     pub raster: Arc<RasterQueue>,
     pub refusals: Arc<RefusalStats>,
+    /// What the display thread reads of the board.
+    pub shared: Arc<DisplayShared>,
 }
 
 /// Why the bus answered busy.
@@ -359,8 +361,8 @@ impl Default for RefusalStats {
 
 impl BoardLocks {
     pub fn new(s: Box<Board>) -> Self {
-        let (front, fifo, raster) = (s.front.clone(), s.fifo.clone(), s.raster.clone());
-        BoardLocks { board: Arc::new(Mutex::new(s)), front, fifo, raster, refusals: Arc::new(RefusalStats::new()) }
+        let (front, fifo, raster, shared) = (s.front.clone(), s.fifo.clone(), s.raster.clone(), s.scanout.shared.clone());
+        BoardLocks { board: Arc::new(Mutex::new(s)), front, fifo, raster, refusals: Arc::new(RefusalStats::new()), shared }
     }
 
     /// A processor's read: through the front alone when it can, else under the

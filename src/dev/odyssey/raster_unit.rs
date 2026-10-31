@@ -190,9 +190,9 @@ impl DrawnRows {
     /// Hand the display the rows the draws so far changed, and forget
     /// them. A row shows a change when a buffer a window shows was written
     /// there: the scanout repaints it. A row written to either buffer
-    /// joins the rows where the window's buffers may differ
-    /// (Scanout::differ), which a swap of that window repaints.
-    pub fn take(&mut self, displayed: u32, scanout: &mut Scanout) {
+    /// joins the rows where the window's buffers may differ (`differ`),
+    /// which a swap of that window repaints.
+    pub fn take(&mut self, displayed: u32, differ: &mut Differ, marks: &RowMarks) {
         if !std::mem::take(&mut self.any) {
             return;
         }
@@ -205,7 +205,7 @@ impl DrawnRows {
                         *s |= w;
                     }
                 }
-                for (d, w) in scanout.differ[id].iter_mut().zip(rows.iter_mut()) {
+                for (d, w) in differ[id].iter_mut().zip(rows.iter_mut()) {
                     *d |= std::mem::take(w);
                 }
             }
@@ -213,7 +213,7 @@ impl DrawnRows {
         self.overlay = [0; ROW_WORDS];
         for (i, mut w) in shown.into_iter().enumerate() {
             while w != 0 {
-                scanout.repaint_for(DirtySite::Raster, (i as u32 * 64 + w.trailing_zeros()) as i32, 1);
+                marks.repaint(DirtySite::Raster, (i as u32 * 64 + w.trailing_zeros()) as i32, 1);
                 w &= w - 1;
             }
         }
@@ -320,12 +320,6 @@ pub fn primitive_cost(mode: u32, points: impl Iterator<Item = Option<(f64, f64)>
 /// that finds none allocates; one finished while this many wait is freed.
 const SPARE_DRAWS: usize = 1024;
 
-thread_local! {
-    /// This thread holds the raster unit's context lock and reads the
-    /// planes under it (the display thread's resolve).
-    static PLANES_HELD: Cell<bool> = const { Cell::new(false) };
-}
-
 /// The planes as the display holds them: no raster job runs meanwhile.
 pub struct PlanesHeld<'a> {
     _ctx: MutexGuard<'a, RasterCtx>,
@@ -335,14 +329,8 @@ pub struct PlanesHeld<'a> {
 impl PlanesHeld<'_> {
     /// The colour rows the raster unit published since the last call, to
     /// the scanout (DrawnRows::take()).
-    pub fn take_rows(&mut self, displayed: u32, scanout: &mut Scanout) {
-        self.published.lock().take(displayed, scanout);
-    }
-}
-
-impl Drop for PlanesHeld<'_> {
-    fn drop(&mut self) {
-        PLANES_HELD.with(|h| h.set(false));
+    pub fn take_rows(&mut self, displayed: u32, differ: &mut Differ, marks: &RowMarks) {
+        self.published.lock().take(displayed, differ, marks);
     }
 }
 
@@ -613,11 +601,9 @@ impl RasterQueue {
         result
     }
 
-    /// Wait until every job submitted has finished. The display thread,
-    /// which holds the planes against the raster thread already, returns
-    /// at once.
+    /// Wait until every job submitted has finished.
     pub fn wait_idle(&self) {
-        if self.pending() == 0 || PLANES_HELD.with(Cell::get) {
+        if self.pending() == 0 {
             return;
         }
         crate::pf_scope!(crate::perfetto::events::ODSY_RASTER_WAIT, self.pending());
@@ -631,14 +617,12 @@ impl RasterQueue {
     /// off the next until dropped.
     pub fn planes(&self) -> PlanesHeld<'_> {
         let ctx = self.ctx.lock();
-        PLANES_HELD.with(|h| h.set(true));
         PlanesHeld { _ctx: ctx, published: &self.published }
     }
 
     /// The planes for the display if no slice is running now.
     pub fn try_planes(&self) -> Option<PlanesHeld<'_>> {
         let ctx = self.ctx.try_lock()?;
-        PLANES_HELD.with(|h| h.set(true));
         Some(PlanesHeld { _ctx: ctx, published: &self.published })
     }
 
@@ -653,11 +637,12 @@ impl RasterQueue {
         self.spare.len()
     }
 
-    /// Tests: the rows published and not yet taken, as the display would
-    /// find them, without waiting for a slice in flight.
-    #[cfg(test)]
-    pub fn take_published(&self, displayed: u32, scanout: &mut Scanout) {
-        self.published.lock().take(displayed, scanout);
+    /// The rows the raster unit published and the display has not taken:
+    /// those a window shows go to `marks`, and all join `differ`. Takes the
+    /// cell's lock and nothing else, so it does not wait for a slice in
+    /// flight.
+    pub fn take_published_rows(&self, displayed: u32, differ: &mut Differ, marks: &RowMarks) {
+        self.published.lock().take(displayed, differ, marks);
     }
 
     /// Tests: a slice holds the raster unit's context.

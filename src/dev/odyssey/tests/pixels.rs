@@ -139,7 +139,7 @@ fn read_window() -> (Box<Board>, Arc<Ram>) {
     let (mut s, ram) = window();
     pixel_write(&mut s, 30, 40, READ_PIXEL);
     // A colour-map-free RGB mode, so the pixel is a colour and not an index.
-    s.dispmode[0] = ODSY_GAMMA_GROUP << ODSY_DISPMODE_GROUP_SHIFT;
+    s.regs().edit().dispmode[0] = ODSY_GAMMA_GROUP << ODSY_DISPMODE_GROUP_SHIFT;
     (s, ram)
 }
 
@@ -235,7 +235,7 @@ fn field_codes_separate_a_colour_read_from_a_depth_or_stencil_read() {
     let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(0, 0), 0, 0), 1);
     assert_eq!(got[..2], [0xa5, 0xa5], "refused on an RGB window");
     pixel_write(&mut s, 31, 40, 0x2a);
-    s.dispmode[0] = 0;
+    s.regs().edit().dispmode[0] = 0;
     let got = dma_read(&mut s, &ram, (31, 40, 1), with_fields(read_word4(0, 0), 0, 0), 1);
     assert_eq!(got[..2], [0x2a, 0xa5]);
 }
@@ -247,7 +247,7 @@ fn field_codes_separate_a_colour_read_from_a_depth_or_stencil_read() {
 fn a_colour_index_read_returns_the_index() {
     let (mut s, ram) = read_window();
     pixel_write(&mut s, 31, 40, 0x5a3);
-    s.dispmode[0] = 0;
+    s.regs().edit().dispmode[0] = 0;
 
     let got = dma_read(&mut s, &ram, (31, 40, 1), read_word4(1, 14), 2);
     assert_eq!(got[..3], [0x05, 0xa3, 0xa5]);
@@ -255,7 +255,7 @@ fn a_colour_index_read_returns_the_index() {
     let got = dma_read(&mut s, &ram, (31, 40, 1), read_word4(0, 1), 1);
     assert_eq!(got[..2], [0x2a, 0xa5]);
 
-    s.dispmode[0] = ODSY_GAMMA_GROUP << ODSY_DISPMODE_GROUP_SHIFT;
+    s.regs().edit().dispmode[0] = ODSY_GAMMA_GROUP << ODSY_DISPMODE_GROUP_SHIFT;
     let got = dma_read(&mut s, &ram, (30, 40, 1), read_word4(0, 1), 1);
     assert_eq!(got[..2], [0xa5, 0xa5], "the red byte of 0xa55a3cff");
 }

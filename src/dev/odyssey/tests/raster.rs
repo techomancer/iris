@@ -125,7 +125,7 @@ fn a_fence_behind_a_queued_draw_lands_after_the_draw() {
 /// found without waiting for a slice in flight.
 fn published_rows(h: &BoardLocks) -> Vec<u32> {
     let mut scanout = fresh_scanout();
-    h.raster.take_published(0, &mut scanout);
+    h.raster.take_published_rows(0, &mut scanout.differ, &scanout.marks);
     scanout.marks.dirty_rows().into_iter().map(|y| y as u32).collect()
 }
 
@@ -212,11 +212,15 @@ fn a_slice_end_publishes_the_rows_drawn_in_it() {
 }
 
 /// A scanout with the whole frame resolved.
-fn fresh_scanout() -> Scanout {
-    let mut scanout = Scanout::default();
-    scanout.set_mode(&ScanoutMode { width: SGI_ODYSSEY_WIDTH, height: SGI_ODYSSEY_HEIGHT, frame_clocks: 0, clock_hz: 0 });
-    scanout.marks.clear_dirty();
-    scanout
+struct FreshRows {
+    differ: Box<Differ>,
+    marks: RowMarks,
+}
+
+fn fresh_scanout() -> FreshRows {
+    let marks = RowMarks::default();
+    marks.set_height(SGI_ODYSSEY_HEIGHT);
+    FreshRows { differ: Box::new([[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]), marks }
 }
 
 /// The display takes the planes only between the raster unit's slices: a
@@ -231,7 +235,7 @@ fn the_display_waits_out_a_raster_slice_in_flight() {
     let mut planes = h.raster.planes();
     assert_ne!(pixel(&s, 0, 10, 10), 0, "the frame saw the whole draw");
     let mut scanout = fresh_scanout();
-    planes.take_rows(0, &mut scanout);
+    planes.take_rows(0, &mut scanout.differ, &scanout.marks);
     let rows: Vec<u32> = scanout.marks.dirty_rows().into_iter().map(|y| y as u32).collect();
     assert!(rows.contains(&10), "and the display hears which rows the raster unit drew: {rows:?}");
     drop(planes);
@@ -386,7 +390,7 @@ fn a_waiting_bus_read_is_busy_until_the_raster_unit_has_drawn() {
 /// whose windows show the buffers `displayed` names.
 fn drawn_rows(h: &BoardLocks, displayed: u32) -> Vec<u32> {
     let mut scanout = fresh_scanout();
-    h.raster.planes().take_rows(displayed, &mut scanout);
+    h.raster.planes().take_rows(displayed, &mut scanout.differ, &scanout.marks);
     scanout.marks.dirty_rows().into_iter().map(|y| y as u32).collect()
 }
 
@@ -552,13 +556,13 @@ fn swap_every_window(s: &mut Board) {
 /// the test left in every row first.
 fn resolved_rows(s: &mut Board, h: &BoardLocks) -> Vec<u32> {
     const MARK: u32 = 0xdead_0000;
-    let (w, ht) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
+    let (w, ht) = (s.reader.frame_width as usize, s.reader.frame_height as usize);
 
-    s.scanout.frame.fill(MARK);
+    s.reader.frame.fill(MARK);
     let displayed = s.front.lock().displayed_buffer;
-    h.raster.planes().take_rows(displayed, &mut s.scanout);
+    s.test_take_rows(h, displayed);
     s.scanout_update();
-    (0..ht as u32).filter(|&y| s.scanout.frame[y as usize * w] != MARK).collect()
+    (0..ht as u32).filter(|&y| s.reader.frame[y as usize * w] != MARK).collect()
 }
 
 /// A swap resolves the rows where the window's two buffers differ and no
@@ -654,7 +658,7 @@ fn incremental_updates_keep_the_frame_a_whole_resolve_makes() {
     let (mut s, mut st) = gl_board();
     s.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
     let mut rng = Lcg(0x5a17);
-    for v in s.lut.iter_mut().take(4096) {
+    for v in s.regs().edit().lut.iter_mut().take(4096) {
         *v = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
     }
     // Four windows in vertical bands.
@@ -681,7 +685,7 @@ fn incremental_updates_keep_the_frame_a_whole_resolve_makes() {
             }
             3 => {
                 let i = (rng.next_u32() % 4096) as usize;
-                s.lut[i] = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
+                s.regs().edit().lut[i] = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
                 s.scanout.repaint_all();
             }
             _ => {
@@ -692,13 +696,13 @@ fn incremental_updates_keep_the_frame_a_whole_resolve_makes() {
         if rng.next_u32() % 2 == 0 {
             h.raster.wait_idle();
             let displayed = s.front.lock().displayed_buffer;
-            h.raster.planes().take_rows(displayed, &mut s.scanout);
+            s.test_take_rows(&h, displayed);
             s.scanout_update();
-            let w = s.scanout.frame_width;
+            let w = s.reader.frame_width;
             let mut want = vec![0u32; w as usize];
-            for y in 0..s.scanout.frame_height {
+            for y in 0..s.reader.frame_height {
                 s.resolve_row_generic(y, &mut want);
-                assert_eq!(&s.scanout.frame[(y * w) as usize..((y + 1) * w) as usize], &want[..], "step {step}, row {y}");
+                assert_eq!(&s.reader.frame[(y * w) as usize..((y + 1) * w) as usize], &want[..], "step {step}, row {y}");
             }
         }
     }
@@ -714,17 +718,17 @@ fn the_screen_follows_the_frame_through_frames_that_present_a_few_lines() {
     let (mut s, mut st) = gl_board();
     s.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
     let mut rng = Lcg(0xfeed);
-    for v in s.lut.iter_mut().take(4096) {
+    for v in s.regs().edit().lut.iter_mut().take(4096) {
         *v = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
     }
-    s.cursor[ODSY_CURSOR_POSITION as usize] = 100 << 16 | 40;
+    s.regs().edit().cursor[ODSY_CURSOR_POSITION as usize] = 100 << 16 | 40;
     for i in 0..ODSY_CURSOR_COLOUR_COUNT {
-        s.cursor[(ODSY_CURSOR_COLOURS + 1 + i) as usize] = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
+        s.regs().edit().cursor[(ODSY_CURSOR_COLOURS + 1 + i) as usize] = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
     }
     for w in 0..128u32 {
-        s.cursor[(ODSY_CURSOR_GLYPH + w) as usize] = rng.next_u32();
+        s.regs().edit().cursor[(ODSY_CURSOR_GLYPH + w) as usize] = rng.next_u32();
     }
-    s.cursor[ODSY_CURSOR_CONTROL as usize] = ODSY_CURSOR_CTL_ENABLE;
+    s.regs().edit().cursor[ODSY_CURSOR_CONTROL as usize] = ODSY_CURSOR_CTL_ENABLE;
     let h = BoardLocks::new(s);
     let display = Display::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     let (w, ht) = (SGI_ODYSSEY_WIDTH as usize, SGI_ODYSSEY_HEIGHT as usize);
@@ -737,7 +741,7 @@ fn the_screen_follows_the_frame_through_frames_that_present_a_few_lines() {
             st.drawable.back = target;
             small_triangle(&mut s, &st, 20.0 + 120.0 * step as f32, [1.0, (step & 1) as f32, 1.0, 1.0]);
             if step == 5 {
-                s.cursor[ODSY_CURSOR_POSITION as usize] = 200 << 16 | 500;
+                s.regs().edit().cursor[ODSY_CURSOR_POSITION as usize] = 200 << 16 | 500;
                 let span = s.cursor_span();
                 s.cursor_invalidate(span);
             }
@@ -747,11 +751,11 @@ fn the_screen_follows_the_frame_through_frames_that_present_a_few_lines() {
         }
         h.raster.wait_idle();
         Odyssey::frame(&h, &display);
-        let s = h.board.lock();
+        let reader = display.reader.lock();
         let screen = display.screen.lock();
         for y in 0..ht {
             for x in 0..w {
-                let rgb = s.scanout.frame[y * w + x];
+                let rgb = reader.frame[y * w + x];
                 let want = 0xff00_0000 | (rgb & 0xff) << 16 | rgb & 0xff00 | (rgb >> 16) & 0xff;
                 let at = y * crate::disp::FB_STRIDE + x;
                 assert_eq!((screen.fb_rgb[at], screen.rgba[at]), (want, want), "step {step} ({x}, {y})");
@@ -1047,10 +1051,10 @@ fn a_frame_waiting_for_a_slice_leaves_the_board_free() {
     assert!(h.raster.in_slice(), "the slice was still running");
 
     frame.join().unwrap();
-    let s = h.board.lock();
-    assert!(s.scanout.stats.retries >= 1, "the frame let the board go to wait");
-    assert_eq!(s.scanout.stats.fallbacks, 0);
-    assert_eq!(s.scanout.stats.frames, 1, "and then staged its lines");
-    drop(s);
+    let reader = display.reader.lock();
+    assert!(reader.stats.retries >= 1, "the frame let the board go to wait");
+    assert_eq!(reader.stats.fallbacks, 0);
+    assert_eq!(reader.stats.frames, 1, "and then staged its lines");
+    drop(reader);
     h.raster.stop();
 }

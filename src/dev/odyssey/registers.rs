@@ -158,35 +158,15 @@ impl Board {
         crate::dlog!(LogModule::Odyssey, "sgi-odyssey: cursor entry {:#x} word {:#010x}: {}", ODSY_CURSOR_BASE + index, data, what);
     }
 
-    /// The position's components, each a signed 16-bit value (inferred).
-    pub fn cursor_x(&mut self) -> i32 {
-        (self.cursor[ODSY_CURSOR_POSITION as usize] >> 16) as i16 as i32
-    }
-
-    pub fn cursor_y(&mut self) -> i32 {
-        self.cursor[ODSY_CURSOR_POSITION as usize] as i16 as i32
-    }
-
-    /// Whether anything is drawn: bit 0 set and bit 5 clear. APPROXIMATION: on
-    /// the second channel the cursor is on a display the model does not have.
-    pub fn cursor_shown(&mut self) -> bool {
-        let ctl = self.cursor[ODSY_CURSOR_CONTROL as usize];
-
-        (ctl & ODSY_CURSOR_CTL_ENABLE) != 0 && (ctl & ODSY_CURSOR_CTL_CHANNEL1) == 0
+    /// The registers the display resolves through (DisplayRegs).
+    pub fn regs(&self) -> &SharedRegs {
+        &self.scanout.shared.regs
     }
 
     /// The first and last display line the cursor covers as it stands, or
     /// None when it covers none.
     pub fn cursor_span(&mut self) -> Option<(i32, i32)> {
-        if !self.cursor_shown() {
-            return None;
-        }
-        let bottom = self.scanout.mode.height as i32 - 1;
-        if self.cursor[ODSY_CURSOR_CONTROL as usize] & ODSY_CURSOR_CTL_CROSSHAIR != 0 {
-            // The vertical line crosses every line.
-            return Some((0, bottom));
-        }
-        Some((self.cursor_y().max(0), (self.cursor_y() + ODSY_CURSOR_SIZE as i32 - 1).min(bottom)))
+        self.regs().read().cursor_span(self.scanout.mode.height as i32 - 1)
     }
 
     /// Repaint the lines of a span from cursor_span(); a span past the
@@ -272,48 +252,11 @@ impl Board {
     pub fn cursor_write(&mut self, index: u32, data: u32) {
         let old = self.cursor_span();
 
-        self.cursor[index as usize] = data;
+        self.regs().edit().cursor[index as usize] = data;
         self.cursor_check(index, data);
         let new = self.cursor_span();
         self.cursor_invalidate(old);
         self.cursor_invalidate(new);
-    }
-
-    /// Draw the cursor over display line y, already resolved into dst. With bit
-    /// 2 it is a crosshair: APPROXIMATION, a one-pixel horizontal and vertical
-    /// line across the whole raster through the position, in colour word 1. The
-    /// crosshair's extent, width and colour are unknown.
-    pub fn cursor_row(&mut self, y: u32, dst: &mut [u32], width: u32) {
-        let cx = self.cursor_x();
-        let cy = self.cursor_y();
-        let row = (y as i32).wrapping_sub(cy);
-
-        if !self.cursor_shown() {
-            return;
-        }
-        if self.cursor[ODSY_CURSOR_CONTROL as usize] & ODSY_CURSOR_CTL_CROSSHAIR != 0 {
-            let colour = cursor_rgb(self.cursor[ODSY_CURSOR_COLOURS as usize + 1]);
-
-            if row == 0 {
-                dst[..width as usize].fill(colour);
-            } else if cx >= 0 && cx < width as i32 {
-                dst[cx as usize] = colour;
-            }
-            return;
-        }
-        if row < 0 || row >= ODSY_CURSOR_SIZE as i32 {
-            return;
-        }
-        for col in 0..ODSY_CURSOR_SIZE as i32 {
-            let x = cx.wrapping_add(col);
-            let plane = (self.cursor[(ODSY_CURSOR_PLANE as i32 + row * 2 + col / 16) as usize] >> ((col % 16) * 2)) & 3;
-            let glyph = (self.cursor[(ODSY_CURSOR_GLYPH as i32 + row * 4 + col / 8) as usize] >> ((col % 8) * 4)) & 0xf;
-
-            if x < 0 || x >= width as i32 || plane != 3 || glyph == 0xf {
-                continue;
-            }
-            dst[x as usize] = cursor_rgb(self.cursor[ODSY_CURSOR_COLOURS as usize + glyph as usize]);
-        }
     }
 
     /// A backend read-window offset that names a cursor entry: its stored word.
@@ -323,7 +266,7 @@ impl Board {
         if size != 4 || addr < first || (addr & 7) != 0 || addr >= first + ((ODSY_CURSOR_ENTRIES as u64) << 3) {
             return false;
         }
-        *value = self.cursor[((addr - first) >> 3) as usize] as u64;
+        *value = self.regs().read().cursor[((addr - first) >> 3) as usize] as u64;
         true
     }
 }
@@ -518,12 +461,12 @@ impl Board {
         }
         // Scanout resolves through both, so either change repaints.
         if index < ODSY_LUT_SIZE {
-            self.lut[index as usize] = data & ODSY_LUT_ENTRY_MASK;
+            self.regs().edit().lut[index as usize] = data & ODSY_LUT_ENTRY_MASK;
             self.scanout.repaint_all_for(DirtySite::Lut);
             return;
         }
         if (ODSY_DISPMODE_BASE..ODSY_DISPMODE_BASE + ODSY_DISPMODE_COUNT).contains(&index) {
-            self.dispmode[(index - ODSY_DISPMODE_BASE) as usize] = data;
+            self.regs().edit().dispmode[(index - ODSY_DISPMODE_BASE) as usize] = data;
             self.scanout.repaint_all_for(DirtySite::Lut);
             return;
         }
@@ -532,7 +475,7 @@ impl Board {
             return;
         }
         if (ODSY_OVERLAY_MODE_BASE..ODSY_OVERLAY_MODE_BASE + ODSY_OVERLAY_IDS).contains(&index) {
-            self.overlay_mode[(index - ODSY_OVERLAY_MODE_BASE) as usize] = data;
+            self.regs().edit().overlay_mode[(index - ODSY_OVERLAY_MODE_BASE) as usize] = data;
             if (data & !ODSY_OVERLAY_MODE_KNOWN) != 0 && !self.overlay_mode_reported {
                 self.overlay_mode_reported = true;
                 crate::dlog!(LogModule::Odyssey, "sgi-odyssey: overlay mode {:#x} has bits this model does not decode", data);

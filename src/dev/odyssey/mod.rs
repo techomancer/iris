@@ -38,7 +38,8 @@
 //!   the fixed-point fast path for textured triangles; `raster_fill`: the row
 //!   loops filled triangles take, specialised by draw state and planes;
 //!   `raster_bench`: a fill-rate benchmark (tests only).
-//! - `memory`, `scanout`, `display`: board memory and planes; the scanned
+//! - `memory`, `scanout`, `reader`, `display`: board memory and planes; the
+//!   marks writers make and the display thread's own reader, with the scanned
 //!   frame and retrace; what reaches the window.
 //! - `pixel_dma`, `pi_gfx`: DMA between guest memory and planes, and graphics
 //!   credits for machines whose processor interface counts them.
@@ -86,6 +87,7 @@ pub mod raster_pixels;
 pub mod raster_texture;
 pub mod raster_triangle;
 pub mod raster_unit;
+pub mod reader;
 pub mod registers;
 pub mod scanout;
 pub mod worker;
@@ -119,6 +121,7 @@ pub use raster_pixels::*;
 pub use raster_texture::*;
 pub use raster_triangle::*;
 pub use raster_unit::*;
+pub use reader::*;
 pub use registers::*;
 pub use scanout::*;
 pub use worker::*;
@@ -218,6 +221,9 @@ impl Odyssey {
     /// retrace fires either way.
     fn frame(state: &BoardLocks, display: &Display) {
         crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
+        let mut reader = display.reader.lock();
+        reader.attach(&state.shared);
+        reader.recycle_last();
         // The planes are the raster unit's: wait out its slice in flight and
         // hold off the next while the frame's lines are copied aside. The
         // colour rows it wrote since the last frame are resolved again.
@@ -233,62 +239,54 @@ impl Odyssey {
         // Nothing is taken from the board or the planes until both are held,
         // so no dirty row or swap is lost between tries.
         let mut tries = 0;
-        let (mut s, mut planes, asked, held) = loop {
-            let mut s = state.board.lock();
-            if let Some(done) = display.done.lock().take() {
-                s.scanout_recycle(done);
-            }
-            s.scanout_poll(monotonic_ns());
+        let (s, planes, asked, held) = loop {
+            let s = state.board.lock();
+            reader.poll(monotonic_ns());
             let asked = std::time::Instant::now();
             if let Some(planes) = state.raster.try_planes() {
                 break (s, planes, asked, std::time::Instant::now());
             }
             if tries == FRAME_TRIES {
-                s.scanout.stats.fallbacks += 1;
+                reader.stats.fallbacks += 1;
                 let planes = state.raster.planes();
                 break (s, planes, asked, std::time::Instant::now());
             }
             tries += 1;
-            s.scanout.stats.retries += 1;
+            reader.stats.retries += 1;
             drop(s);
             state.raster.wait_slice();
         };
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
-        let displayed = s.front.lock().displayed_buffer;
-        planes.take_rows(displayed, &mut s.scanout);
-        s.scanout_stage();
+        reader.stage();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         drop(planes);
-        s.scanout.stats.locked(held - asked, held.elapsed());
+        reader.stats.locked(held - asked, held.elapsed());
         // The copy resolves with no lock held, so neither the front end
         // nor the raster unit waits for it.
-        let mut job = s.scanout_take();
+        let mut job = reader.take();
         drop(s);
         if let Some(job) = &mut job {
             job.resolve();
         }
-        let mut s = state.board.lock();
-        let span = job.as_mut().and_then(|job| s.scanout_commit(job));
-        let (w, h) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
-        let keep = |job: Option<ScanoutJob>| *display.done.lock() = job;
-        if w == 0 || h == 0 || s.scanout.frame.len() < w * h {
-            drop(s);
-            keep(job);
+        let s = state.board.lock();
+        let span = job.as_mut().and_then(|job| reader.commit(job));
+        drop(s);
+        let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
+        if w == 0 || h == 0 || reader.frame.len() < w * h {
+            reader.keep(job);
             crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
             return;
         }
         // A new size has nothing valid on the screen yet: take every line.
         let new_size = display.shown() != (w, h);
         if !display.due(new_size || span.is_some()) {
-            drop(s);
-            keep(job);
+            reader.keep(job);
             crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
             return;
         }
-        // Only a new size copies the frame under the board lock; otherwise
-        // the committed lines are converted from the update's own rows.
-        let whole = new_size.then(|| s.scanout.frame[..w * h].to_vec());
-        drop(s);
+        // Only a new size copies the frame whole; otherwise the committed
+        // lines are converted from the update's own rows.
+        let whole = new_size.then(|| reader.frame[..w * h].to_vec());
         set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
@@ -298,7 +296,7 @@ impl Odyssey {
             (None, None) => display.present(&[], w, h, 0),
         }
         crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
-        keep(job);
+        reader.keep(job);
     }
 }
 
@@ -357,14 +355,10 @@ impl Device for Odyssey {
                 self.state.refusals.reset();
                 Ok(())
             }
-            ["dirty"] => {
-                let s = self.state.board.lock();
-                s.scanout.stats.report(&s.scanout.marks, &mut *w).map_err(|e| e.to_string())
-            }
+            ["dirty"] => self.display.reader.lock().stats.report(&self.state.shared.marks, &mut *w).map_err(|e| e.to_string()),
             ["dirty", "reset"] => {
-                let mut s = self.state.board.lock();
-                s.scanout.stats = DirtyStats::default();
-                s.scanout.marks.reset_sites();
+                self.display.reader.lock().stats = DirtyStats::default();
+                self.state.shared.marks.reset_sites();
                 Ok(())
             }
             _ => Err("Usage: vpro refusals [reset] | vpro dirty [reset]".to_string()),

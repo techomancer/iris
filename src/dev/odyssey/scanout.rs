@@ -172,95 +172,58 @@ impl DirtyStats {
     }
 }
 
+/// The scanout as the front end sees it: the mode it set, and the marks it
+/// makes for the display to take. The presented frame, the retrace clock and
+/// the rest of what the display keeps are the display's own
+/// ([`ScanoutReader`]).
 #[derive(Clone)]
 pub struct Scanout {
     pub mode: ScanoutMode,
-    pub frame: Vec<u32>, // frame_width x frame_height of 0x00RRGGBB; empty: none
     /// The lines to resolve again, and the lines a writer touched without
     /// naming a buffer: shared with every thread that writes a plane.
     pub marks: Arc<RowMarks>,
-    pub frame_width: u32,
-    pub frame_height: u32, // what frame was allocated for
-
-    /// Per main drawable id, the rows where the two colour buffers may
-    /// differ, a bit a row. A swap of a window shows its other buffer, so
-    /// only those rows can change (Board::flip_rows()). Writers that name
-    /// their rows keep it (DrawnRows::take()). One that names a display
-    /// line, but not the buffer or the drawable, sets the line in
-    /// `RowMarks::unnamed`, and the next swap measures the buffers in those
-    /// lines.
-    pub differ: Box<[[u64; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]>,
-    /// The displayed-buffer bits the frame was last staged from.
-    pub staged_displayed: u32,
-
-    pub stats: DirtyStats,
-
-    pub retrace_deadline: i64, // virtual ns of the next retrace; -1 disarmed
-    pub epoch: i64,            // virtual time of retrace 0
-    pub frames: u64,           // retraces since the epoch
+    /// Everything the board shares with the display.
+    pub shared: Arc<DisplayShared>,
 }
 
-impl Default for Scanout {
+/// The retrace clock: the mode's frame period on the host's monotonic
+/// clock. `deadline` (-1 when disarmed) is when the next retrace is due,
+/// and [`RetraceClock::next_retrace`] reports each as it comes due.
+#[derive(Clone, Debug)]
+pub struct RetraceClock {
+    pub mode: ScanoutMode,
+    pub deadline: i64, // virtual ns of the next retrace; -1 disarmed
+    pub epoch: i64,    // virtual time of retrace 0
+    pub frames: u64,   // retraces since the epoch
+}
+
+impl Default for RetraceClock {
     fn default() -> Self {
-        Scanout {
-            mode: ScanoutMode::default(),
-            frame: Vec::new(),
-            marks: Arc::new(RowMarks::default()),
-            frame_width: 0,
-            frame_height: 0,
-            differ: Box::new([[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]),
-            staged_displayed: 0,
-            stats: DirtyStats::default(),
-            retrace_deadline: -1,
-            epoch: 0,
-            frames: 0,
-        }
+        RetraceClock { mode: ScanoutMode::default(), deadline: -1, epoch: 0, frames: 0 }
     }
 }
 
 impl Scanout {
-    /// A new mode: new frame, everything dirty, retrace phase restarted now.
+    /// A scanout over `shared`, with no mode.
+    pub fn new(shared: Arc<DisplayShared>) -> Self {
+        Scanout { mode: ScanoutMode::default(), marks: shared.marks.clone(), shared }
+    }
+
+    /// A new mode: everything dirty, retrace phase restarted when the
+    /// display next looks.
     pub fn set_mode(&mut self, mode: &ScanoutMode) {
         self.mode = *mode;
         self.mode.sanitize();
         crate::dlog!(LogModule::Odyssey, "sgi-odyssey: scanout mode: {}x{} frame {} clocks at {} Hz", self.mode.width, self.mode.height, self.mode.frame_clocks, self.mode.clock_hz);
-        self.alloc();
+        let frame = self.mode.width != 0 && self.mode.height != 0;
+        self.shared.publish_mode(self.mode);
+        self.marks.set_height(if frame { self.mode.height } else { 0 });
         self.invalidate_all_for(DirtySite::Mode);
-        self.restart();
     }
     /// Repaint and restart the retrace phase.
     pub fn reset(&mut self) {
+        self.shared.restart_retrace();
         self.invalidate_all_for(DirtySite::Mode);
-        self.restart();
-    }
-
-    /// Virtual time of retrace n of the current mode, or -1 with no retrace.
-    pub fn retrace_time(&self, n: u64) -> i64 {
-        let hz = self.mode.clock_hz as u64;
-        let fc = self.mode.frame_clocks;
-
-        if hz == 0 || fc == 0 {
-            return -1;
-        }
-        // n * fc / hz seconds, exactly, without overflowing for any n a run
-        // reaches: whole seconds' worth of frames first, then the rest, whose
-        // product fits because both factors are below 2^32.
-        (self.epoch as u64)
-            .wrapping_add((n / hz).wrapping_mul(fc).wrapping_mul(NS_PER_SECOND))
-            .wrapping_add(mul_div((n % hz).wrapping_mul(fc), NS_PER_SECOND, hz)) as i64
-    }
-
-    /// Whether a retrace has come due at `now_ns`. If so it is counted and
-    /// the next one armed, and the caller runs it; a caller that has fallen
-    /// behind gets each missed retrace in turn.
-    pub fn next_retrace(&mut self, now_ns: i64) -> bool {
-        if self.retrace_deadline < 0 || now_ns < self.retrace_deadline {
-            return false;
-        }
-        self.frames += 1;
-        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: scanout retrace: frame {}", self.frames);
-        self.arm();
-        true
     }
 
     /// Resolve lines again because something other than the colour planes
@@ -519,36 +482,45 @@ impl ScanoutMode {
     }
 }
 
-impl Scanout {
+impl RetraceClock {
+    /// Virtual time of retrace n of the current mode, or -1 with no retrace.
+    pub fn retrace_time(&self, n: u64) -> i64 {
+        let hz = self.mode.clock_hz as u64;
+        let fc = self.mode.frame_clocks;
+
+        if hz == 0 || fc == 0 {
+            return -1;
+        }
+        // n * fc / hz seconds, exactly, without overflowing for any n a run
+        // reaches: whole seconds' worth of frames first, then the rest, whose
+        // product fits because both factors are below 2^32.
+        (self.epoch as u64)
+            .wrapping_add((n / hz).wrapping_mul(fc).wrapping_mul(NS_PER_SECOND))
+            .wrapping_add(mul_div((n % hz).wrapping_mul(fc), NS_PER_SECOND, hz)) as i64
+    }
+
+    /// Whether a retrace has come due at `now_ns`. If so it is counted and
+    /// the next one armed, and the caller runs it; a caller that has fallen
+    /// behind gets each missed retrace in turn.
+    pub fn next_retrace(&mut self, now_ns: i64) -> bool {
+        if self.deadline < 0 || now_ns < self.deadline {
+            return false;
+        }
+        self.frames += 1;
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: scanout retrace: frame {}", self.frames);
+        self.arm();
+        true
+    }
+
     pub fn arm(&mut self) {
         let when = self.retrace_time(self.frames + 1);
 
-        self.retrace_deadline = if when < 0 { -1 } else { when };
+        self.deadline = if when < 0 { -1 } else { when };
     }
 
     pub fn restart(&mut self) {
         self.epoch = monotonic_ns();
         self.frames = 0;
         self.arm();
-    }
-
-    /// A frame and dirty map for the mode, when its size changed.
-    pub fn alloc(&mut self) {
-        let w = self.mode.width;
-        let h = self.mode.height;
-
-        if !self.frame.is_empty() && w == self.frame_width && h == self.frame_height {
-            return;
-        }
-        self.frame = Vec::new();
-        self.frame_width = 0;
-        self.frame_height = 0;
-        self.marks.set_height(0);
-        if w != 0 && h != 0 {
-            self.frame = vec![0u32; w as usize * h as usize];
-            self.frame_width = w;
-            self.frame_height = h;
-            self.marks.set_height(h);
-        }
     }
 }

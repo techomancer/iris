@@ -62,8 +62,8 @@ pub struct HostInterface {
     pub swap_set: u32,
     pub swap_clear: u32,
     pub displayed_buffer: u32,
-    /// A processor wrote ODSY_DISPLAYED_BUFFER: the scanout, which lives
-    /// under the board lock, repaints at its next update.
+    /// A processor wrote ODSY_DISPLAYED_BUFFER: the scanout repaints at its
+    /// next update.
     pub displayed_written: bool,
 
     /// The command FIFO (fifo.rs), whose level STATUS0 reports.
@@ -116,6 +116,48 @@ impl Default for HostInterface {
 
 // Interrupts. Every source is delivered from the front, which holds the
 // routing and the flag bank.
+
+impl HostInterface {
+    /// A vertical retrace, which the scanout's clock runs at the mode's rate
+    /// (ScanoutReader::poll()). The driver issues a swap by writing
+    /// ODSY_SWAP_ARM, a toggle mask with one bit per window whose displayed
+    /// buffer must flip at the next retrace, then waits for the retrace
+    /// interrupt. At each retrace the board first latches the pending flips
+    /// into the displayed-buffer bits and then raises the retrace source,
+    /// whose vector is byte 23:16 of ODSY_ROUTE_VECTORS. The interrupt fires
+    /// at every retrace once the routing is programmed, not only when a swap
+    /// is armed; before the driver programs the routing nothing is
+    /// delivered. Whether the board can mask this source is unknown and it is
+    /// left unmasked.
+    ///
+    /// Approximation: the board's encoding of ODSY_DISPLAYED_BUFFER is
+    /// inferred from the driver's compare, and the latch's timing within the
+    /// retrace is unknown. The model latches at its retrace callback and
+    /// repaints the rows the new selection changes (ScanoutReader::flip_rows())
+    /// in the same frame's update; a frame is never presented half from each
+    /// buffer.
+    ///
+    /// Whether a swap latched. The latch needs this lock alone.
+    pub fn retrace(&mut self) -> bool {
+        let flips = self.swap_arm;
+
+        if self.swap_set != 0 || self.swap_clear != 0 {
+            self.displayed_buffer = (self.displayed_buffer | self.swap_set) & !self.swap_clear;
+            self.swap_set = 0;
+            self.swap_clear = 0;
+        }
+        if flips != 0 {
+            self.swap_arm = 0;
+            self.displayed_buffer ^= flips;
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: swap latch: arm {:#x} displayed {:#x}", flips, self.displayed_buffer);
+        }
+        crate::pf_instant!(crate::perfetto::events::ODSY_RETRACE, self.displayed_buffer);
+        if self.routed() {
+            self.deliver_routed(ODSY_ROUTE_VECTOR_RETRACE_SHIFT, "retrace", true);
+        }
+        flips != 0
+    }
+}
 
 impl HostInterface {
     /// An interrupt packet into the widget-addressed fabric.

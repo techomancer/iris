@@ -116,17 +116,11 @@ pub struct Board {
     pub i2c_main_cmd: u32,
     pub i2c_opt_cmd: u32,
 
-    /// The display back end's colour lookup RAM (0x2000 entries), one 30-bit
-    /// colour per entry.
-    pub lut: Vec<u32>,
-    /// Back-end entries 0x2000-0x2fff as last written (0x1000 entries).
+    /// Back-end entries 0x2000-0x2fff as last written (0x1000 entries). The
+    /// colour lookup RAM, the display modes, the overlay modes and the
+    /// cursor, which the display reads, are in `scanout.shared.regs`.
     pub backend_ctl: Vec<u32>,
-    pub dispmode: [u32; 32],
-    /// The overlay ids' display modes, backend entries 0x2920 + id.
-    pub overlay_mode: [u32; 8],
     pub overlay_mode_reported: bool,
-    /// The hardware cursor's backend entries 0x2500-0x25ff.
-    pub cursor: [u32; 0x100],
     pub cursor_reported: u32,
     pub backend_index: u32,
     pub backend_count: u32,
@@ -366,7 +360,6 @@ pub struct Board {
     /// GL_DITHER, 0x0404 bit 18, as last pushed.
     pub gl_dither: bool,
     pub gl_dither_reported: bool,
-    pub scanout_group25_reported: bool,
 
     // The current fill's colour source.
     pub gl_color_index: u32,
@@ -422,14 +415,13 @@ pub struct Board {
     pub image_nbytes: u32,
     pub image_code_reported: bool,
 
-    /// The presented frame and retrace; Board::scanout_update() resolves
-    /// the colour planes into it.
+    /// The scanout's mode and the marks the display takes. The presented
+    /// frame and the retrace are the display's own (`ScanoutReader`).
     pub scanout: Scanout,
-    /// The lines of the update in progress between scanout_stage() and
-    /// scanout_resolve().
-    pub scanout_stage: ScanoutStage,
-    /// The resolved lines' buffer, kept between frames for its allocation.
-    pub scanout_rows: Vec<u32>,
+    /// Tests: the reader that stands in for the display thread
+    /// (Board::scanout_update()).
+    #[cfg(test)]
+    pub reader: ScanoutReader,
 
     // Diagnostic bookkeeping, not guest state.
     pub reported_addr: [u32; SGI_ODYSSEY_UNIMP_REPORTS as usize],
@@ -448,11 +440,14 @@ impl Default for Board {
     fn default() -> Self {
         let front: std::sync::Arc<parking_lot::Mutex<HostInterface>> = Default::default();
         let fifo = front.lock().fifo.clone();
+        let raster: std::sync::Arc<RasterQueue> = Default::default();
+        let shared = std::sync::Arc::new(DisplayShared::new(Default::default(), front.clone(), raster.clone()));
+        let scanout = Scanout::new(shared);
         Board {
             slot: 0,
             front,
             fifo,
-            raster: Default::default(),
+            raster,
             guest: None,
             nic_bus: None,
             revision: 0,
@@ -483,12 +478,8 @@ impl Default for Board {
             nic: 0,
             i2c_main_cmd: 0,
             i2c_opt_cmd: 0,
-            lut: vec![0; 0x2000],
             backend_ctl: vec![0; 0x1000],
-            dispmode: [0; 32],
-            overlay_mode: [0; 8],
             overlay_mode_reported: false,
-            cursor: [0; 0x100],
             cursor_reported: 0,
             backend_index: 0,
             backend_count: 0,
@@ -669,7 +660,6 @@ impl Default for Board {
             ctx_shadow_fail_reported: false,
             gl_dither: false,
             gl_dither_reported: false,
-            scanout_group25_reported: false,
             gl_color_index: 0,
             gl_color_is_index: false,
             colour_mode: [0; 2],
@@ -704,9 +694,9 @@ impl Default for Board {
             image_bytes: 0,
             image_nbytes: 0,
             image_code_reported: false,
-            scanout: Default::default(),
-            scanout_stage: Default::default(),
-            scanout_rows: Vec::new(),
+            scanout,
+            #[cfg(test)]
+            reader: Default::default(),
             reported_addr: [0; SGI_ODYSSEY_UNIMP_REPORTS as usize],
             reported_addr_count: 0,
             reported_cmd: [0; SGI_ODYSSEY_UNIMP_REPORTS as usize],
@@ -849,12 +839,9 @@ impl Board {
         self.nic = 0;
         self.i2c_main_cmd = 0;
         self.i2c_opt_cmd = 0;
-        self.lut.fill(0);
         self.backend_ctl.fill(0);
-        self.dispmode = [0; 32];
-        self.overlay_mode = [0; 8];
+        self.regs().edit().reset();
         self.overlay_mode_reported = false;
-        self.cursor = [0; 0x100];
         self.cursor_reported = 0;
         self.gl_aux_reported = false;
         self.aux_mask_reported = false;
@@ -1087,7 +1074,7 @@ impl Board {
         self.ctx_shadow_fail_reported = false;
         self.gl_dither = false;
         self.gl_dither_reported = false;
-        self.scanout_group25_reported = false;
+        self.scanout.shared.group25.store(false, std::sync::atomic::Ordering::Relaxed);
         self.copy_src = 0;
         self.copy_size = 0;
         self.copy_dst = 0;
@@ -1255,8 +1242,14 @@ impl Board {
             self.stencil_plane = self.stencil_mem.add_plane(&stencil).map_err(|e| format!("sgi-odyssey: stencil plane: {e}"))?;
         }
 
-        // Setting the mode allocates the scanout's frame, marks it all dirty
-        // and arms the retrace at the mode's rate.
+        // The display reads the planes through a view that lives as long as
+        // they do: they are never resized or moved after this.
+        if let Some(view) = PlaneView::of(self) {
+            let _ = self.scanout.shared.planes.set(view);
+        }
+
+        // Setting the mode marks the scanout's frame all dirty and
+        // restarts the retrace at the mode's rate.
         self.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
         Ok(())
     }
