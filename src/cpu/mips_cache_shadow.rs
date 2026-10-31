@@ -33,7 +33,9 @@
 //! and data by Index Store Data — is a real hit for later cached loads, stores
 //! and fetches, served from the shadow without a bus access. A line staged
 //! in the primary instruction cache the same way serves fetches, before the
-//! secondary cache. See [`Staged`].
+//! secondary cache. Its words are stored predecoded, and decode back for the
+//! sampled classes only (`l1i_decode`); other classes read memory, with a
+//! report. See [`Staged`].
 //! Nothing else about the shadow reaches the data path: a line the guest never
 //! staged is memory, as before, and ordinary misses never fill or evict. So a
 //! staged line lives until an explicit index or hit operation, an Index Store
@@ -48,6 +50,7 @@ use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
     C_HINV, C_HWBINV, C_IINV, C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
+use crate::cpu::mips_exec::EXEC_CACHE_ERR;
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 
@@ -124,6 +127,66 @@ const L2_STATE_DIRTY_EXCLUSIVE: u64 = 3;
 /// TagHi[3:0] PA[39:36], kept at bits 35:32 of the assembled tag.
 const L1I_TAG_PA_MASK: u64 = 0xf_ffff_ff00;
 const L1I_VALID: u64 = 1 << 6;
+
+/// CacheErr.ED: a data-field error (NEC U10278EJ4V0UM p.265).
+const L1I_CACHEERR_ED: u32 = 1 << 29;
+
+/// Even parity: the ones in the 36 data bits plus the parity bit total an even
+/// number (NEC U10278EJ4V0UM pp.190-191).
+#[inline(always)]
+fn l1i_parity_ok(p: u64, parity: u32) -> bool {
+    (p.count_ones() + parity) & 1 == 0
+}
+
+/// The parity bit that makes `p` even.
+#[cfg(test)]
+fn l1i_parity_of(p: u64) -> u32 {
+    p.count_ones() & 1
+}
+
+/// A primary instruction-cache word is the instruction predecoded: 36 bits
+/// that fetch decodes back. Neither NEC manual gives the layout. This is the
+/// one inferred from the words a shipped PROM stages, for sampled opcodes
+/// only, with `p` the 36-bit word and `f` the instruction:
+///   p[25:20] = f[5:0], p[19:15] = f[10:6], p[14:10] = f[25:21],
+///   p[28:26] = f[28:26], p[35:29] = a 7-bit class,
+///   p[4:0] and p[9:5] = f[20:16] and f[15:11] (rt and rd positions), in the
+///   order the opcode gives.
+/// f[31:29] is not in any field, so it comes from the class. The class table
+/// is what the samples cover, and it is all this model knows: an entry gives
+/// the class, f[31:29], and whether p[4:0] is the rt position. Every other
+/// class is refused (`Err(class)`), never guessed.
+///
+/// A sampled example: `addiu $4,$0,2` (0x24040002) is 0x3_4420_0004.
+const L1I_CLASSES: &[(u8, u32, bool)] = &[
+    // class, f[31:29], p[4:0] is rt
+    (0x1a, 0b001, true), // addiu
+];
+
+/// **Model choice, hardware contents unknown.** A word whose p[35:32] is 0xf
+/// is this model's encoding of a raw instruction: p[31:0] is the instruction.
+/// It exists so a word that was never in the sampled set can still round-trip
+/// through Index Load Data and Index Store Data and execute. It is not a
+/// claim about what hardware stores. It uses a p[35:32] no sampled class has.
+const L1I_RAW: u64 = 0xf;
+
+/// The instruction a staged word encodes, or the class that is refused.
+fn l1i_decode(p: u64) -> Result<u32, u8> {
+    if (p >> 32) & 0xf == L1I_RAW {
+        return Ok(p as u32);
+    }
+    let class = (p >> 29) as u8 & 0x7f;
+    let &(_, hi3, rt_low) = L1I_CLASSES.iter().find(|c| c.0 == class).ok_or(class)?;
+    let (low, high) = ((p & 0x1f) as u32, ((p >> 5) & 0x1f) as u32);
+    let (rt, rd) = if rt_low { (low, high) } else { (high, low) };
+    Ok(hi3 << 29
+        | ((p >> 26) as u32 & 7) << 26
+        | ((p >> 10) as u32 & 0x1f) << 21
+        | rt << 16
+        | rd << 11
+        | ((p >> 15) as u32 & 0x1f) << 6
+        | ((p >> 20) as u32 & 0x3f))
+}
 
 #[inline(always)]
 fn l1i_tag_of(pa: u64) -> u64 {
@@ -255,10 +318,12 @@ pub struct ShadowCache<
     /// The translated address of the CACHE operand about to arrive in
     /// `cache_op`: the R10000's secondary index and way come from it.
     op_pa: UnsafeCell<Option<u64>>,
-    /// Serve fetches from staged primary I lines. Off unless `IRIS_STAGED_L1I`
-    /// is set (or `set_staged_l1i`), because the predecoded form is unknown:
-    /// see "Model choices" in the staged primary instruction-cache section.
-    l1i_served: UnsafeCell<bool>,
+    /// Cache Error raised by the last fetch from a staged primary I word with
+    /// bad parity (`take_cache_err`), and whether errors are detected now.
+    l1i_err: UnsafeCell<u32>,
+    l1i_detect: UnsafeCell<bool>,
+    /// Predecode classes already reported as refused, to warn once each.
+    l1i_refused: UnsafeCell<Vec<u8>>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -318,7 +383,9 @@ impl<
             pd_tag_hook: UnsafeCell::new(None),
             staged: UnsafeCell::new(Staged { valid: 0, pages: HashMap::new(), changed: false }),
             op_pa: UnsafeCell::new(None),
-            l1i_served: UnsafeCell::new(Self::R10K_FAMILY && std::env::var_os("IRIS_STAGED_L1I").is_some()),
+            l1i_err: UnsafeCell::new(0),
+            l1i_detect: UnsafeCell::new(true),
+            l1i_refused: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -603,16 +670,24 @@ impl<
     //   PA[39:12]. Stated for Hit Invalidate (I), inferred for a fetch;
     // - a fetch hit does not update LRU. Unstated, and no replacement is
     //   modelled;
-    // - the instruction is TagLo[31:0] and TagHi[3:0] is ignored. The
-    //   predecoded form is unknown (neither manual defines it). This is the
-    //   plain-instruction assumption, and it is WRONG for a guest that stages
-    //   words it took from Index Load Data of hardware-predecoded lines: the
-    //   Fuel PROM stages such words (36-bit values that are not an
-    //   instruction in TagLo, with extra bits inside the word) for its own
-    //   code, and executing TagLo from them crashes it while it copies its
-    //   image. This model refills and predecodes nothing, so it cannot
-    //   reproduce those words. Hence the switch below: serving is off unless
-    //   asked for.
+    // - the stored word is the 36-bit predecoded form, decoded on a fetch hit
+    //   (`l1i_decode`) for the sampled classes only, per the inferred
+    //   layout. Any other class is refused: reported once, and the
+    //   fetch is treated as a miss and reads the secondary cache or memory.
+    //   Chosen over a Cache Error because memory holds the instruction the
+    //   word was built from in all but a few stale entries, so a miss
+    //   executes the right instruction for nearly every word a guest stages,
+    //   where an error would stop a guest the hardware runs; the report keeps
+    //   the refusal visible. This can still hide a stale entry whose class is
+    //   unsampled, which is why it is reported;
+    // - parity is checked on a fetch hit, even over the 36 bits and the parity
+    //   bit. A bad word posts a Cache Error unless Status.DE or ERL is set;
+    // - Index Load Data (I) returns the stored word and parity as they were
+    //   stored, so a readback stored back verbatim round-trips and executes.
+    //   A refill is not modelled, so a line the guest never staged reads back
+    //   as the shadow's contents, not as the predecoded memory word. Model
+    //   choice, hardware contents unknown: a word with p[35:32] = 0xf is a raw
+    //   instruction in p[31:0] (`L1I_RAW`);
     //
     // The primary data cache is not served: its tag and data layouts are
     // known, but a dirty line writes back to the secondary cache and the
@@ -625,20 +700,12 @@ impl<
             | ((set as u64 * IC_LINE as u64) & 0xfff)
     }
 
-    /// Serve fetches from staged primary I lines, from now on. Set before any
-    /// line is staged.
-    pub fn set_staged_l1i(&self, on: bool) {
-        unsafe { *self.l1i_served.get() = on };
-    }
-
     /// Store a primary I tag, keeping the staged-line index in step.
     fn set_l1i_tag(&self, idx: usize, new: u64) {
         let ic = unsafe { &mut *self.ic.get() };
         let old = ic.tags[idx];
         ic.tags[idx] = new;
-        if !unsafe { *self.l1i_served.get() } {
-            return;
-        }
+
         let page = |tag: u64| (tag & L1I_VALID != 0).then(|| self.l1i_line_pa(tag, idx / WAYS) >> 12);
         if old & L1I_VALID != 0 || new & L1I_VALID != 0 {
             self.page_move(page(old), page(new));
@@ -659,25 +726,45 @@ impl<
             .find(|&idx| ic.tags[idx] & L1I_VALID != 0 && (ic.tags[idx] ^ want) & L1I_TAG_PA_MASK == 0)
     }
 
-    /// The instruction word a fetch at `va`/`pa` finds in a staged primary I
-    /// line, then (primary before secondary) in a staged secondary line.
+    /// The instruction a fetch at `va`/`pa` finds in a staged primary I line,
+    /// then (primary before secondary) in a staged secondary line. `Err` is a
+    /// Cache Error status. `fetched` is the word being fetched, as opposed to
+    /// the one after it that opcode fusion peeks at, which never raises.
     #[inline(never)]
-    fn staged_fetch_word(&self, va: u64, pa: u64) -> Option<u32> {
-        if let Some(idx) = self.staged_l1i_line(va, pa).filter(|_| unsafe { *self.l1i_served.get() }) {
+    fn staged_fetch_word(&self, va: u64, pa: u64, fetched: bool) -> Result<Option<u32>, u32> {
+        if let Some(idx) = self.staged_l1i_line(va, pa) {
             let ic = unsafe { &*self.ic.get() };
-            let way = idx % WAYS;
-            let slot = (((va as usize) >> 2) % (ic.data.len() / WAYS)) * WAYS + way;
-            return Some(ic.data[slot] as u32);
+            let slot = (((va as usize) >> 2) % (ic.data.len() / WAYS)) * WAYS + idx % WAYS;
+            let (p, parity) = (ic.data[slot] & 0xf_ffff_ffff, ic.ecc[slot] & 1);
+            // Even parity over the 36 bits and the parity bit (NEC
+            // U10278EJ4V0UM pp.190-191). A bad word posts a Cache Error unless
+            // errors are not being detected (Status.DE, ERL).
+            if fetched && !l1i_parity_ok(p, parity) && unsafe { *self.l1i_detect.get() } {
+                // ED: data field error; the primary index in PIdx.
+                unsafe { *self.l1i_err.get() = L1I_CACHEERR_ED | (pa as u32 & 0x003f_fff8) | (va >> 12) as u32 & 7 };
+                return Err(EXEC_CACHE_ERR);
+            }
+            match l1i_decode(p) {
+                Ok(w) => return Ok(Some(w)),
+                Err(class) => {
+                    // Refused: see `l1i_decode`. The fetch is treated as a
+                    // miss and reads the secondary cache or memory, and the
+                    // class is reported once.
+                    let seen = unsafe { &mut *self.l1i_refused.get() };
+                    if !seen.contains(&class) {
+                        seen.push(class);
+                        eprintln!("iris: staged primary I word {p:#011x} at {pa:#x}: predecode class {class:#04x} is not in the sampled set; fetching memory instead");
+                    }
+                }
+            }
         }
-        self.staged_read::<4>(pa).map(|w| w as u32)
+        Ok(self.staged_read::<4>(pa).map(|w| w as u32))
     }
 
     /// Clear the valid bit of the primary I line at `idx`.
     fn l1i_invalidate(&self, idx: usize) {
         let tag = unsafe { (*self.ic.get()).tags[idx] };
-        // With serving off the primary tags are the diagnostic round-trip
-        // store they always were, and an invalidate leaves them alone.
-        if unsafe { *self.l1i_served.get() } && tag & L1I_VALID != 0 {
+        if tag & L1I_VALID != 0 {
             self.set_l1i_tag(idx, tag & !L1I_VALID);
         }
     }
@@ -869,8 +956,10 @@ impl<
                 // The word being read is at `a`; its virtual address is the
                 // fetch's, moved by the same distance.
                 let va = virt_addr.wrapping_add(a.wrapping_sub(phys_addr));
-                if let Some(w) = self.staged_fetch_word(va, a) {
-                    return Ok(w);
+                match self.staged_fetch_word(va, a, a == phys_addr) {
+                    Ok(Some(w)) => return Ok(w),
+                    Ok(None) => {}
+                    Err(status) => return Err(status),
                 }
             }
             let r = self.downstream.read32(a);
@@ -1212,6 +1301,8 @@ impl<
             e.insert("idx".into(), toml::Value::Integer(idx as i64));
             e.insert("tag".into(), u(tag));
             e.insert("words".into(), toml::Value::Array(words.collect()));
+            let parity = (0..IC_LINE / 4).map(|i| toml::Value::Integer(ic.ecc[((set * IC_LINE / 4 + i) % per_way) * WAYS + way] as i64));
+            e.insert("parity".into(), toml::Value::Array(parity.collect()));
             ilines.push(toml::Value::Table(e));
         }
         t.insert("staged_l1i".into(), toml::Value::Array(ilines));
@@ -1269,8 +1360,11 @@ impl<
             }
             let (set, way) = (idx / WAYS, idx % WAYS);
             let per_way = ic.data.len() / WAYS;
+            let parity = e.get("parity").and_then(|d| d.as_array()).ok_or("staged line: no parity")?;
             for (i, w) in words.iter().enumerate() {
-                ic.data[((set * IC_LINE / 4 + i) % per_way) * WAYS + way] = w.as_integer().ok_or("staged line: bad word")? as u64;
+                let slot = ((set * IC_LINE / 4 + i) % per_way) * WAYS + way;
+                ic.data[slot] = w.as_integer().ok_or("staged line: bad word")? as u64;
+                ic.ecc[slot] = parity.get(i).and_then(|x| x.as_integer()).ok_or("staged line: bad parity")? as u32;
             }
             self.set_l1i_tag(idx, u(e.get("tag").ok_or("staged line: no tag")?)?);
         }
@@ -1313,6 +1407,14 @@ impl<
 
     fn cache_op_ecc(&self) -> u32 {
         unsafe { *self.ecc_out.get() }
+    }
+
+    fn set_error_control(&self, _ce: bool, detect: bool) {
+        unsafe { *self.l1i_detect.get() = detect };
+    }
+
+    fn take_cache_err(&self) -> u32 {
+        unsafe { *self.l1i_err.get() }
     }
 
     fn set_cache_op_pa(&self, pa: u64) {
@@ -1815,9 +1917,7 @@ mod tests {
     /// An R10000 secondary cache (1 MiB, 128-byte lines, 4096 sets) over `Bus`.
     fn staged_cache() -> (R10000ShadowCache, Arc<Bus>) {
         let bus = Arc::new(Bus::default());
-        let c = R10000ShadowCache::from(bus.clone() as Arc<dyn BusDevice>);
-        c.set_staged_l1i(true);
-        (c, bus)
+        (R10000ShadowCache::from(bus.clone() as Arc<dyn BusDevice>), bus)
     }
 
     /// A line in set 0x20 (PA[18:7]), tag PA[35:18] = 4.
@@ -2304,9 +2404,16 @@ mod tests {
         c.cache_op(C_IST | CACH_PI, (va & !63) | way, tag);
     }
 
-    /// Index Store Data (I): the word at `va`, in `way`, is `w`.
+    /// Index Store Data (I): the word at `va`, in `way`, is the 36-bit `p`,
+    /// with the parity bit that makes it even.
+    fn stage_p(c: &R10000ShadowCache, va: u64, way: u64, p: u64) {
+        c.set_cache_ecc(l1i_parity_of(p));
+        c.cache_op(C_R10K_ISD | CACH_PI, (va & !3) | way, p);
+    }
+
+    /// The same for a plain instruction, in the model's raw encoding.
     fn stage_i_word(c: &R10000ShadowCache, va: u64, way: u64, w: u32) {
-        c.cache_op(C_R10K_ISD | CACH_PI, (va & !3) | way, w as u64);
+        stage_p(c, va, way, L1I_RAW << 32 | w as u64);
     }
 
     fn fetch_raw(c: &R10000ShadowCache, va: u64, pa: u64) -> u32 {
@@ -2393,6 +2500,105 @@ mod tests {
         c.cache_op(C_IINV | CACH_PI, va + 64, 0); // the next set
         c.cache_op(C_HINV | CACH_PI, va, pa + (1 << 20)); // misses
         assert_eq!(fetch_raw(&c, va, pa), 0x1234);
+    }
+
+    /// Decode of a sampled class against a sampled example:
+    /// `addiu $4,$0,2` (0x24040002) is 0x3_4420_0004. Each field moves where
+    /// the layout says, so a change to any one fails.
+    #[test]
+    fn a_sampled_predecoded_word_decodes_to_its_instruction() {
+        assert_eq!(l1i_decode(0x3_4420_0004), Ok(0x2404_0002));
+        // addiu $17,$9,-1: rs, rt, immediate and shamt/rd bits all move.
+        let f = 0x2531_ffffu32; // op 001001, rs 9, rt 17, imm 0xffff
+        let p = (0x1au64 << 29) | ((f as u64 >> 26) & 7) << 26 | (f as u64 & 0x3f) << 20
+            | ((f as u64 >> 6) & 0x1f) << 15 | ((f as u64 >> 21) & 0x1f) << 10
+            | ((f as u64 >> 11) & 0x1f) << 5 | ((f as u64 >> 16) & 0x1f);
+        assert_eq!(l1i_decode(p), Ok(f));
+        assert_eq!(l1i_decode(0x3_4420_0004 | 0x1f << 5), Ok(0x2404_0002 | 0x1f << 11), "p[9:5] is the rd position for addiu");
+        assert_eq!(l1i_decode(0x3_4420_0004 | 0x1f << 10), Ok(0x2404_0002 | 0x1f << 21), "p[14:10] is rs");
+        assert_eq!(l1i_decode(0x3_4420_0004 | 0x1f << 15), Ok(0x2404_0002 | 0x1f << 6), "p[19:15] is f[10:6]");
+    }
+
+    /// A class outside the sampled set is refused, not guessed: the fetch is
+    /// treated as a miss and reads memory, and the refusal is reported.
+    #[test]
+    fn an_unsampled_class_is_refused_and_the_fetch_reads_memory() {
+        assert_eq!(l1i_decode(0x5_0000_0004), Err(0x28));
+        let (c, bus) = staged_cache();
+        let (pa, va) = (0x0030_0000u64, 0xffff_ffff_8030_0000u64);
+        stage_i_tag(&c, va, pa, 1, true);
+        stage_p(&c, va, 1, 0x5_0000_0004);
+        assert_eq!(fetch_raw(&c, va, pa), 0xeeee_eeee);
+        assert!(bus.reads.load(Ordering::Relaxed) >= 1, "memory was read");
+        // The sampled class beside it still executes.
+        stage_p(&c, va + 4, 1, 0x3_4420_0004);
+        assert_eq!(fetch_raw(&c, va + 4, pa + 4), 0x2404_0002);
+    }
+
+    /// A word staged with the wrong parity bit posts a Cache Error on fetch
+    /// (ED set), unless Status.DE or ERL is set, which executes it.
+    #[test]
+    fn bad_parity_posts_a_cache_error_unless_errors_are_not_detected() {
+        let (c, _) = staged_cache();
+        let (pa, va) = (0x0030_0000u64, 0xffff_ffff_8030_0000u64);
+        stage_i_tag(&c, va, pa, 1, true);
+        c.set_cache_ecc(l1i_parity_of(0x3_4420_0004) ^ 1);
+        c.cache_op(C_R10K_ISD | CACH_PI, va | 1, 0x3_4420_0004);
+        let r = c.fetch(va, pa);
+        assert_eq!(r.status, EXEC_CACHE_ERR);
+        assert_ne!(c.take_cache_err() & L1I_CACHEERR_ED, 0);
+        c.set_error_control(false, false); // Status.DE set
+        let r = c.fetch(va, pa);
+        assert_eq!(r.status, crate::cpu::mips_exec::EXEC_COMPLETE);
+        assert_eq!(unsafe { (*r.instr).raw }, 0x2404_0002);
+        // Every single-bit flip of the 36 bits is a parity error.
+        c.set_error_control(false, true);
+        for bit in 0..36 {
+            c.set_cache_ecc(l1i_parity_of(0x3_4420_0004));
+            c.cache_op(C_R10K_ISD | CACH_PI, va | 1, 0x3_4420_0004 ^ 1 << bit);
+            assert_eq!(c.fetch(va, pa).status, EXEC_CACHE_ERR, "bit {bit}");
+        }
+    }
+
+    /// A readback stored back verbatim round-trips and executes: for a
+    /// sampled word and for one the model encodes raw (an unsampled opcode).
+    #[test]
+    fn index_load_data_then_store_data_round_trips_and_executes() {
+        let (c, _) = staged_cache();
+        let (pa, va) = (0x0030_0000u64, 0xffff_ffff_8030_0000u64);
+        stage_i_tag(&c, va, pa, 1, true);
+        stage_i_tag(&c, va + 0x4000, pa + 0x4000, 0, true);
+        for (i, (p, want)) in [(0x3_4420_0004u64, 0x2404_0002u32), (L1I_RAW << 32 | 0x7c00_0001, 0x7c00_0001)].into_iter().enumerate() {
+            let src = va + 4 * i as u64;
+            stage_p(&c, src, 1, p);
+            let got = c.cache_op(C_R10K_ILD | CACH_PI, src | 1, 0);
+            assert_eq!(got, p, "Index Load Data returns the 36 bits");
+            let ecc = c.cache_op_ecc();
+            assert_eq!(ecc & 1, l1i_parity_of(p));
+            // Store the readback into another line, with the readback's parity.
+            let dst = va + 0x4000 + 4 * i as u64;
+            c.set_cache_ecc(ecc);
+            c.cache_op(C_R10K_ISD | CACH_PI, dst, got);
+            assert_eq!(fetch_raw(&c, dst, pa + 0x4000 + 4 * i as u64), want, "word {i}");
+        }
+    }
+
+    /// A staged word that differs from memory executes the staged word: a
+    /// stale entry stays until it is invalidated.
+    #[test]
+    fn a_staged_word_differing_from_memory_executes() {
+        let (c, bus) = staged_cache();
+        let (pa, va) = (0x0030_0000u64, 0xffff_ffff_8030_0000u64);
+        assert_eq!(fetch_raw(&c, va, pa), 0xeeee_eeee);
+        stage_i_tag(&c, va, pa, 1, true);
+        stage_p(&c, va, 1, 0x3_4420_0004);
+        // The word after it too: opcode fusion peeks at it.
+        stage_i_word(&c, va + 4, 1, 0);
+        let reads = bus.reads.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            assert_eq!(fetch_raw(&c, va, pa), 0x2404_0002);
+        }
+        assert_eq!(bus.reads.load(Ordering::Relaxed), reads);
     }
 
     /// Staged primary I lines survive a snapshot round trip.
