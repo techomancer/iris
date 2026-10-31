@@ -10,13 +10,14 @@
 //! ([`Xbow::unsupported`]).
 //!
 //! The chip knows two links when it is built: the host's widget (Bedrock
-//! IO, 10) and the PIC's own. A further widget, such as the optional V12 at
-//! widget 12 on the two- and four-processor Tezro, becomes reachable when
-//! the machine attaches it with [`Pxbow::attach_endpoint`]; until then its
-//! link is absent and an access to it is a bus error. Each processor access
-//! to a widget through [`Pxbow::route`] needs both the host's link and the
-//! target's to be alive, so a link reset takes the PIC out of reach for the
-//! 20 ns of its pulse.
+//! IO, 10) and the PIC's own. A further widget, such as the second PIC at
+//! widget 11 or the optional V12 at widget 12 on the two- and
+//! four-processor Tezro, becomes reachable when the machine attaches it
+//! with [`Pxbow::attach_endpoint`]; until then its link is absent and an
+//! access to it is a bus error. Each processor access to a widget through
+//! [`Pxbow::route`] needs both the host's link and the target's to be
+//! alive, so a link reset takes the PIC out of reach for the 20 ns of its
+//! pulse.
 //!
 //! Ported from hw/pci-host/sgi-pic.c and hw/misc/sgi-xbow.c in
 //! jamesbraid/qemu-sgi-origami.

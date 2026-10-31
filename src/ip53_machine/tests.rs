@@ -1,5 +1,6 @@
 use super::*;
 use crate::traits::{BUS_ERR, BUS_OK};
+use std::sync::atomic::AtomicU64;
 
 /// A PIO offset in Bedrock IO's small window: widget in bits 27:24.
 fn widget(widget: u64, offset: u64) -> u64 {
@@ -113,6 +114,191 @@ fn two_or_four_processors_bring_the_second_pic_at_widget_11() {
     }
 }
 
+// Widget 0's crossbar as PROM 6.210 and the IP35 kernel walk it, from how the PROM finds
+// widgets 0xb and 0xf.
+// QEMU's sn/builder/tezro-two-four-processor-board in
+// tests/qtest/sn-builder-test.c still expects link 11 absent; this board
+// follows the PROM's walk instead.
+
+/// Link `n`'s register block in widget 0, as the 32-bit word address the
+/// PROM issues: the low word of each doubleword.
+fn link_word(n: u64, register: u64) -> u64 {
+    widget(0, 0x100 + (n - 8) * 0x40 + register + 4)
+}
+const LINK_CONTROL: u64 = 0x08;
+const LINK_STATUS: u64 = 0x10;
+const LINK_ARB_UPPER: u64 = 0x18;
+const LINK_ARB_LOWER: u64 = 0x20;
+const LINK_STATUS_CLEAR: u64 = 0x28;
+const LINK_RESET: u64 = 0x30;
+const LINK_AUX: u64 = 0x38;
+const ALIVE: u64 = 1 << 31;
+const PRESENT: u64 = 1 << 5;
+const FAILURE_MODE: u64 = 1 << 6;
+
+fn read_word(board: &TezroBoard, address: u64) -> u64 {
+    let r = board.node.io.pio_read(address, 4);
+    assert_eq!(r.status, BUS_OK, "{address:#x}");
+    r.data
+}
+
+/// Widget 0's part and manufacturer, from its identity word.
+fn widget_zero_part(board: &TezroBoard) -> (u64, u64) {
+    let id = read_word(board, widget(0, 4));
+    ((id >> 12) & 0xffff, (id >> 1) & 0x7ff)
+}
+
+fn alive_and_present(board: &TezroBoard, n: u64) -> (bool, bool) {
+    (read_word(board, link_word(n, LINK_STATUS)) & ALIVE != 0, read_word(board, link_word(n, LINK_AUX)) & PRESENT != 0)
+}
+
+/// The PROM's per-link test: alive and present, except that link 15 is
+/// taken regardless when widget 0 is part 0xd100.
+fn prom_uses(board: &TezroBoard, n: u64) -> bool {
+    let (alive, present) = alive_and_present(board, n);
+    (alive && present) || (n == 15 && widget_zero_part(board).0 == 0xd100)
+}
+
+/// The kernel's: alive, and present unless widget 0 is part 0xd100 with
+/// manufacturer 0 and the link is 15.
+fn kernel_uses(board: &TezroBoard, n: u64) -> bool {
+    let (alive, present) = alive_and_present(board, n);
+    alive && (present || (n == 15 && widget_zero_part(board) == (0xd100, 0)))
+}
+
+/// Links 8 to 15 that pass both tests on their own bits, without either
+/// guest's link-15 exception, as a widget mask.
+fn live_links(board: &TezroBoard) -> u16 {
+    (8..16).filter(|&n| alive_and_present(board, n) == (true, true)).fold(0, |m, n| m | 1 << n)
+}
+
+/// A board whose clock the test advances.
+fn board_with_clock(cpus: usize) -> (TezroBoard, Arc<AtomicU64>) {
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let board = TezroBoard::with_config(TezroBoardConfig {
+        payload: &[],
+        clock: Arc::new(move || clock.load(Ordering::SeqCst)),
+        flash_path: None,
+        station_mac: L1Config::default().mac,
+        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+        memory: &MemoryPopulation::default(),
+        cpus,
+        part: TezroPart::Mhz700,
+        v12: false,
+        graphics_pool: (2, 32),
+    })
+    .unwrap();
+    (board, now)
+}
+
+/// On the two- and four-processor board widget 0's crossbar shows the
+/// hub's link 10 and both PICs' links 11 and 15 alive and present, with no
+/// failure mode and arbitration bits 0 and 2 clear, so the PROM and the
+/// kernel both take 11 and 15 without leaning on the link-15 exception.
+/// Every other link reads empty. A power-on keeps the same picture.
+#[test]
+fn widget_0_shows_both_pic_links_live_on_the_larger_board() {
+    for cpus in [2, 4] {
+        let board = TezroBoard::new(cpus).unwrap();
+        for pass in ["built", "after power-on"] {
+            assert_eq!(widget_zero_part(&board), (0xd100, 0), "{cpus} CPUs, {pass}");
+            assert_eq!(read_word(&board, widget(0, 4)) & 1, 1);
+            assert_eq!(live_links(&board), 1 << 10 | 1 << 11 | 1 << 15, "{cpus} CPUs, {pass}");
+            for n in [11, 15] {
+                assert!(prom_uses(&board, n) && kernel_uses(&board, n), "link {n}, {cpus} CPUs, {pass}");
+                assert_eq!(read_word(&board, link_word(n, LINK_AUX)) & FAILURE_MODE, 0, "link {n}");
+                assert_eq!(read_word(&board, link_word(n, LINK_ARB_UPPER)) & 0b101, 0, "link {n}: unclaimed");
+            }
+            for n in [8, 9, 12, 13, 14] {
+                assert_eq!(alive_and_present(&board, n), (false, false), "link {n}, {cpus} CPUs, {pass}");
+                assert!(!prom_uses(&board, n) && !kernel_uses(&board, n));
+            }
+            board.power_on();
+        }
+    }
+}
+
+/// The one-processor board has no second PIC: link 11 reads empty and
+/// widget 11 does not answer, while link 15 stays usable.
+#[test]
+fn the_one_processor_board_shows_no_link_11() {
+    let board = TezroBoard::new(1).unwrap();
+    assert_eq!(live_links(&board), 1 << 10 | 1 << 15);
+    assert_eq!(alive_and_present(&board, 11), (false, false));
+    assert!(!prom_uses(&board, 11) && !kernel_uses(&board, 11));
+    assert!(prom_uses(&board, 15) && kernel_uses(&board, 15));
+    assert_eq!(board.node.io.pio_read(widget(11, 4), 4).status, BUS_ERR);
+}
+
+/// Widget 11 answers as a bridge-class PIC with both heads, the identity
+/// the PROM's "Found PIC" path needs (manufacturer 0x24, bit 0 set, part
+/// 0xd102 on head 0), and takes the PROM's control-word writes on both
+/// heads. Widget 15 keeps its own.
+#[test]
+fn widget_11_answers_as_a_pic_with_both_heads() {
+    use crate::dev::pic::HEAD_OFFSET;
+    let board = TezroBoard::new(4).unwrap();
+    let io = &board.node.io;
+    for (head, part) in [(0, 0xd102), (HEAD_OFFSET, 0xd112)] {
+        let id = read_word(&board, widget(11, head + 4));
+        assert_eq!((id & 1, (id >> 1) & 0x7ff, (id >> 12) & 0xffff), (1, 0x24, part), "head at {head:#x}");
+        // Widget control, as the PROM's table-driven field writes it.
+        let control = widget(11, head + 0x24);
+        let before = read_word(&board, control);
+        assert_eq!(io.pio_write(control, 4, (before & !0xf000) | 0x4000), BUS_OK);
+        assert_eq!(read_word(&board, control) & 0xf000, 0x4000, "head at {head:#x}");
+    }
+    assert_eq!(read_word(&board, widget(15, 4)) >> 12 & 0xffff, 0xd102);
+}
+
+/// The PROM's bring-up of link 11 (read the status clear, write credit 2,
+/// clear both arbitration registers, then the 0xd102 credit 3) leaves the
+/// link alive and present and the credit field reading back.
+#[test]
+fn the_proms_link_bring_up_keeps_link_11_alive() {
+    let board = TezroBoard::new(4).unwrap();
+    let io = &board.node.io;
+    read_word(&board, link_word(11, LINK_STATUS_CLEAR));
+    assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, 0x0008_0000), BUS_OK);
+    assert_eq!(io.pio_write(link_word(11, LINK_ARB_UPPER), 4, 0), BUS_OK);
+    assert_eq!(io.pio_write(link_word(11, LINK_ARB_LOWER), 4, 0), BUS_OK);
+    assert_eq!(alive_and_present(&board, 11), (true, true));
+    let control = read_word(&board, link_word(11, LINK_CONTROL));
+    assert_eq!((control >> 18) & 0x1f, 2);
+    assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, (control & !(0x1f << 18)) | 3 << 18), BUS_OK);
+    assert_eq!((read_word(&board, link_word(11, LINK_CONTROL)) >> 18) & 0x1f, 3);
+    assert_eq!(alive_and_present(&board, 11), (true, true));
+    assert_eq!(io.pio_read(widget(11, 4), 4).status, BUS_OK);
+}
+
+/// The processor reaches widget 11 through the crossbar, not around it: a
+/// reset of link 11 or of the hub's link 10 takes widget 11 out of reach
+/// for the pulse, and it answers again, registers kept, once it ends. A
+/// reset of link 15 leaves widget 11 alone.
+#[test]
+fn widget_11_is_routed_through_widget_0s_crossbar() {
+    let (board, now) = board_with_clock(4);
+    let io = &board.node.io;
+    let route = widget(11, 0x130);
+    assert_eq!(io.pio_write(route, 8, 0x1122_3344_5566_7788), BUS_OK);
+    for link in [11, 10] {
+        now.fetch_add(100, Ordering::SeqCst);
+        assert_eq!(io.pio_write(link_word(link, LINK_RESET), 4, 0), BUS_OK);
+        assert_eq!(io.pio_read(route, 8).status, BUS_ERR, "down during link {link}'s pulse");
+        now.fetch_add(20, Ordering::SeqCst);
+        let r = io.pio_read(route, 8);
+        assert_eq!((r.status, r.data), (BUS_OK, 0x1122_3344_5566_7788), "after link {link}'s pulse");
+        assert_eq!(alive_and_present(&board, 11), (true, true));
+    }
+    now.fetch_add(100, Ordering::SeqCst);
+    assert_eq!(io.pio_write(link_word(15, LINK_RESET), 4, 0), BUS_OK);
+    assert_eq!(io.pio_read(route, 8).status, BUS_OK, "link 15's pulse");
+    assert_eq!(io.pio_read(widget(15, 4), 4).status, BUS_ERR);
+    assert_eq!(board.pics[1].pxbow().unwrap().endpoint_widgets(), 1 << 11 | 1 << 15);
+    assert!(board.pics[0].pxbow().is_none(), "the second PIC has no crossbar of its own");
+}
+
 /// Every fitted processor slot reads present, in the board's order (CPU 1
 /// in PI1/A, CPUs 2 and 3 in the B slots), and only CPU 0 is enabled.
 #[test]
@@ -186,7 +372,6 @@ fn each_r16000_part_resets_with_its_own_identity_and_clock() {
 /// interval of board time while the board runs, not on every batch.
 #[test]
 fn the_poll_retires_lifted_pages_once_an_interval() {
-    use std::sync::atomic::AtomicU64;
     let now = Arc::new(AtomicU64::new(0));
     let clock = now.clone();
     let board = TezroBoard::with_config(TezroBoardConfig {

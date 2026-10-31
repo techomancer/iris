@@ -15,11 +15,13 @@
 //!   four-processor board adds a second at widget 11, with nothing on its
 //!   buses, and a V12 slot at widget 12 that is left empty. The PIC at
 //!   widget 15 is the IO9's: its PXBOW answers as widget 0 and forwards
-//!   the processor's accesses to widget 15. Its head 0 carries the IO9 PCI
-//!   bus: the IOC4 at device 1 (input 0), the ISP12160 at device 3 (input 2)
-//!   and the BCM5701 at device 4 (input 3), with REQ64# wired on the
-//!   BCM5701's slot. The PIC's interrupts and DMA go to Bedrock IO, the
-//!   host widget 10.
+//!   the processor's accesses to widget 15. On the larger board it carries
+//!   widget 11 too, and shows that link present and alive (unlike QEMU's
+//!   composition, below). Its head 0 carries the IO9 PCI bus: the IOC4 at
+//!   device 1 (input 0), the ISP12160 at device 3 (input 2) and the
+//!   BCM5701 at device 4 (input 3), with REQ64# wired on the BCM5701's
+//!   slot. The PIC's interrupts and DMA go to Bedrock IO, the host widget
+//!   10.
 //! - The IOC4 carries the DS1744-compatible clock and NVRAM in its BAR and
 //!   the PS/2 keyboard and mouse; its four ports are serial streams beside
 //!   the L1's, and the L1 is the console by default.
@@ -40,8 +42,17 @@
 //! - Only CPU 0 runs. The other fitted processors read present and stay
 //!   disabled; what would start or reach them is refused and logged by the
 //!   Bedrock PI.
-//! - The second PIC is reached directly. QEMU gives it a PXBOW too, whose
-//!   widget 0 nothing maps, so only its link-reset timing differs.
+//! - The second PIC is a port of the IO9 PIC's PXBOW, beside the host's
+//!   and the IO9 PIC's links: the PROM and IRIX learn which widgets exist
+//!   only from widget 0's link status and auxiliary status, so one
+//!   crossbar per node carries both PICs. That is a modelling consequence
+//!   of the discovery path, not a known route: whether the second PIC has
+//!   a crossbar of its own in front of it, and its part (0xd102 or 0xd112)
+//!   and link reset values beyond alive and present, are unknown. QEMU's
+//!   composition still gives the second PIC its own PXBOW, whose widget 0
+//!   nothing maps, and leaves link 11 absent on the IO9 PIC's. The second
+//!   PIC's interrupts and DMA reach Bedrock IO directly, as the IO9 PIC's
+//!   do, rather than through the crossbar.
 //! - PIC DMA aimed at a widget other than Bedrock IO is refused and logged,
 //!   as the Fuel's XBridge path refuses it.
 //! - No EEPROM image is fitted for the IO9, the node board or the BCM5701:
@@ -635,8 +646,13 @@ impl TezroBoard {
         let pics = if cpus == 1 {
             vec![io9.clone()]
         } else {
+            // The PROM finds widget 11 only as a live link of widget 0's
+            // crossbar, so the second PIC is a port of the same switch.
             let second = Pic::new(SECOND_PIC_WIDGET);
-            node.io.connect_widget(SECOND_PIC_WIDGET, second.widget());
+            pxbow
+                .attach_endpoint(SECOND_PIC_WIDGET, second.widget())
+                .map_err(|e| format!("Tezro: second PIC on the PXBOW: {e:?}"))?;
+            node.io.connect_widget(SECOND_PIC_WIDGET, pxbow.route(SECOND_PIC_WIDGET));
             vec![second, io9.clone()]
         };
         for (index, pic) in pics.iter().enumerate() {
