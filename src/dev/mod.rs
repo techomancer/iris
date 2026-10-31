@@ -13,6 +13,7 @@ pub mod mace_audio;
 pub mod mace_isa;
 pub mod crime;
 pub mod ds1687;
+pub mod ds1744;
 pub mod heart;
 pub mod heart_mem;
 pub mod ioc3;
