@@ -1337,20 +1337,28 @@ static void t_depth_colour(void)
     }
 }
 
-/* VPro: the value a depth takes through the library's host codec, which
-   keeps the single's exponent and top 18 mantissa bits, truncating the rest,
-   and decodes by refilling the low five mantissa bits from the top five
-   (origami datasheet odyssey.md, "Depth word, established as the library's
-   reading"). Other boards expect the value unchanged. */
+/* VPro: the value a depth takes through the library's host path. The word
+   holds 2S * z with 2S = 2^33 - 2^15 (the depth range's far value), so the
+   library multiplies by 2S, keeps the single's exponent and top 18 mantissa
+   bits (truncating the rest), then on readback refills the low five mantissa
+   bits from the top five and divides by 2S (origami datasheet odyssey.md,
+   "Depth word, established as the library's reading"). 2S is a hair under a
+   power of two, so the product's mantissa sits about one 18-bit step below
+   z's and the truncation lands one word lower than truncating z itself.
+   Other boards expect the value unchanged. */
 static float depth_expect(float z)
 {
     union { float f; unsigned int u; } v;
+    const float two_s = 8589901824.0f;
     if (!vpro)
         return z;
-    v.f = z;
+    v.f = z * two_s;
     v.u &= ~0x1fu;
     v.u |= (v.u >> 18) & 0x1f;
-    return v.f;
+    /* A depth read is a window depth, which GL keeps within [0, 1]; the far
+       plane's word, 2S, decodes a few steps over 2S and reads back as 1. */
+    v.f /= two_s;
+    return v.f > 1.0f ? 1.0f : v.f;
 }
 
 static void t_depth_stencil(void)
