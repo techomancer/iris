@@ -167,6 +167,8 @@ fn each_r16000_part_resets_with_its_own_identity_and_clock() {
                 memory: &MemoryPopulation::one_gib(),
                 cpus: 1,
                 part,
+                v12: false,
+                graphics_pool: (2, 32),
             })
             .unwrap();
             let cpu = build_cpu::<R16000ShadowCache>(&board);
@@ -196,6 +198,8 @@ fn the_poll_retires_lifted_pages_once_an_interval() {
         memory: &MemoryPopulation::default(),
         cpus: 1,
         part: TezroPart::Mhz700,
+        v12: false,
+        graphics_pool: (2, 32),
     })
     .unwrap();
     board.running.store(true, Ordering::SeqCst);
@@ -225,4 +229,66 @@ fn the_processor_reads_and_writes_ioc4_registers_in_its_own_byte_order() {
     assert_eq!(io.pio_read(reg(0x24), 4).data, 1, "MISC: the 66 MHz clock");
     assert_eq!(io.pio_write(reg(0x314), 4, 0x3f8), BUS_OK);
     assert_eq!(io.pio_read(reg(0x314), 4).data, 0x3f8, "port 0 TX producer");
+}
+
+// VPro host-interface registers the tests below touch, as byte offsets in
+// the board's widget space. The board's own constants are private to it.
+const ODSY_IDENTITY: u64 = 0x00;
+const ODSY_CMD_FIFO: u64 = 0x11_0000;
+
+fn board_with_v12(cpus: usize) -> TezroBoard {
+    TezroBoard::with_config(TezroBoardConfig {
+        payload: &[],
+        clock: Arc::new(|| 0),
+        flash_path: None,
+        station_mac: L1Config::default().mac,
+        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+        memory: &MemoryPopulation::default(),
+        cpus,
+        part: TezroPart::Mhz700,
+        v12: true,
+        graphics_pool: (2, 32),
+    })
+    .unwrap()
+}
+
+/// The V12 answers as widget 12 behind the PXBOW on either board, and
+/// widget 12 stays empty without one. (On the one-processor board the
+/// placement is inferred; see V12_WIDGET.)
+#[test]
+fn the_v12_answers_at_widget_12_on_both_boards() {
+    for cpus in [1, 4] {
+        let board = board_with_v12(cpus);
+        let id = board.node.io.pio_read(widget(12, ODSY_IDENTITY), 4);
+        let direct = board.v12.as_ref().unwrap().read32(ODSY_IDENTITY);
+        assert_eq!((id.status, id.data), (BUS_OK, u64::from(direct.data)), "{cpus} CPUs");
+        assert_eq!(board.pics[board.pics.len() - 1].pxbow().unwrap().endpoint_widgets() & (1 << 12), 1 << 12);
+    }
+    assert_eq!(TezroBoard::new(1).unwrap().node.io.pio_read(widget(12, ODSY_IDENTITY), 4).status, BUS_ERR);
+}
+
+/// A CPU 0 store into its enabled graphics page is counted against PI0's
+/// slot A credits, and the credit comes back along the node's graphics map
+/// as the V12 takes the store. A store outside the page costs nothing.
+/// Follows sn1/pi-gfx/ip53-odyssey-credit-return and
+/// uncovered-stores-not-counted in tests/qtest/sn1-pi-gfx-test.c.
+#[test]
+fn a_counted_store_to_the_v12_returns_its_credit() {
+    use crate::dev::bedrock_io::reg::GFX_MAP_BASE;
+    use crate::dev::odyssey::{PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE};
+    let board = board_with_v12(4);
+    let (pi, io, bus) = (&board.node.pi[0], &board.node.io, &board.node.bus);
+    let credit = || pi.read64(0x308).data;
+    // The page holding the V12's command FIFO, enabled, with 1000 credits.
+    let page = widget(12, ODSY_CMD_FIFO) & PI_GFX_PAGE_ADDRESS;
+    assert_eq!(pi.write64(0x300, PI_GFX_PAGE_ENABLE | page), BUS_OK);
+    assert_eq!(pi.write64(0x308, 1000), BUS_OK);
+    // Widget 12's credits go to node 0, PI0, slot A.
+    assert_eq!(io.write64(GFX_MAP_BASE, 12), BUS_OK);
+    let io_view = 1u64 << 57;
+    assert_eq!(bus.write64(io_view | widget(12, ODSY_CMD_FIFO), 0x0001_0046), BUS_OK);
+    assert_eq!(credit(), 1000, "one store, one credit, back");
+    // Outside the page: neither counted nor returned.
+    let _ = bus.write64(io_view | widget(11, 0x100), 0);
+    assert_eq!(credit(), 1000);
 }

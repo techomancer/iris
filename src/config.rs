@@ -870,9 +870,9 @@ pub enum GraphicsBoard {
     /// Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v10", alias = "vpro:v10", alias = "vpro_v10")]
     V10,
-    /// VPro V12: BUZZ B, 128 MB. Octane and Fuel. On the Octane it shipped
-    /// only in the Octane2 and needs Crossbow 1.4, so the machine takes the
-    /// Octane2's Crossbow and Bridge revisions.
+    /// VPro V12: BUZZ B, 128 MB. Octane, Fuel and Tezro. On the Octane it
+    /// shipped only in the Octane2 and needs Crossbow 1.4, so the machine
+    /// takes the Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
     V12,
     /// No graphics board: the machine runs on its serial console. Octane
@@ -939,7 +939,7 @@ impl GraphicsBoard {
         match profile {
             MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
             MachineProfile::FuelIp34 => matches!(self, Self::V10 | Self::V12 | Self::None),
-            MachineProfile::TezroIp53 => self == Self::None,
+            MachineProfile::TezroIp53 => matches!(self, Self::None | Self::V12),
             MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
             _ => !self.is_vpro() && !matches!(self, Self::Extreme | Self::None),
         }
@@ -2737,8 +2737,8 @@ impl MachineConfig {
                 ));
             }
             self.tezro_memory()?.check_for_cpus(usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
-            if board != GraphicsBoard::None {
-                return Err("Tezro currently supports graphics.board = \"none\" only".into());
+            if !board.supports(MachineProfile::TezroIp53) {
+                return Err(format!("graphics.board \"{}\" is not a Tezro board (valid: v12, none)", board.as_str()));
             }
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
             // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
@@ -4532,10 +4532,10 @@ mod tezro_config_tests {
     }
 
     /// The processor is one of the two R16000 parts (or the family, as on
-    /// the Fuel) and graphics is absent. Every other part is refused, and
-    /// the refusal names the 8 MB part the model does not have.
+    /// the Fuel), with no graphics board or a V12. Every other part is
+    /// refused, and the refusal names the 8 MB part the model does not have.
     #[test]
-    fn tezro_requires_an_r16000_and_no_graphics() {
+    fn tezro_requires_an_r16000_and_takes_no_graphics_or_a_v12() {
         let mut cfg = tezro();
         for cpu in [CpuModel::R16000Mhz700, CpuModel::R10000] {
             cfg.machine.cpu = cpu;
@@ -4556,6 +4556,13 @@ mod tezro_config_tests {
         assert_eq!(cfg.graphics_board(), GraphicsBoard::None);
         cfg.graphics.board = Some(GraphicsBoard::Newport);
         assert!(cfg.validate().is_err());
+        cfg.graphics.board = Some(GraphicsBoard::V10);
+        assert!(cfg.validate().is_err(), "the V10 is not a Tezro board");
+        for cpus in [1, 4] {
+            cfg.graphics.board = Some(GraphicsBoard::V12);
+            cfg.machine.cpus = Some(cpus);
+            cfg.validate().unwrap();
+        }
         let mut cfg = tezro();
         cfg.network.mode = NetMode::Off;
         cfg.validate().unwrap();

@@ -583,6 +583,26 @@ impl BusDevice for BedrockIo {
     }
 }
 
+/// Where a widget's graphics credits go, as a graphics map entry names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GfxRoute {
+    pub node: u8,
+    pub interface: usize,
+    pub slot: usize,
+}
+
+/// The graphics map's route for `widget`: widget in bits 3:0, interface in
+/// bit 4, node in bits 12:5 and slot in bit 16 (Linux sn1/hubio_next.h,
+/// IIO_IGFX_INIT). There is no valid bit; the first entry naming the widget
+/// wins.
+pub fn gfx_route(map: [u64; 2], widget: u8) -> Option<GfxRoute> {
+    map.into_iter().find(|entry| entry & 0xf == u64::from(widget)).map(|entry| GfxRoute {
+        node: ((entry >> 5) & 0xff) as u8,
+        interface: ((entry >> 4) & 1) as usize,
+        slot: ((entry >> 16) & 1) as usize,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     // Cases follow tests/qtest/sn1-bedrock-io-test.c in
@@ -807,5 +827,14 @@ mod tests {
             *memory.words.lock(),
             BTreeMap::from([(0x1000, 0x1234), (0x2000, 0x5678)])
         );
+    }
+
+    #[test]
+    fn the_graphics_map_names_node_interface_and_slot_and_the_first_match_wins() {
+        let entry = |node: u64, pi: u64, slot: u64, widget: u64| (slot << 16) | (node << 5) | (pi << 4) | widget;
+        let map = [entry(3, 1, 1, 0xc), entry(0, 0, 0, 0xc)];
+        assert_eq!(gfx_route(map, 0xc), Some(GfxRoute { node: 3, interface: 1, slot: 1 }));
+        assert_eq!(gfx_route(map, 0xb), None);
+        assert_eq!(gfx_route([0, 0], 0), Some(GfxRoute { node: 0, interface: 0, slot: 0 }), "no valid bit");
     }
 }
