@@ -31,15 +31,57 @@ fn sum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |s, b| s.wrapping_add(*b))
 }
 
-/// Apply Fuel's firmware record fields while retaining the configuration sum.
+/// The fields of the PROM's configuration block that depend on the board.
+///
+/// The PROM reads them from flash before it touches the processor, so they
+/// must agree with the CPU the machine builds: a mismatch in the boot-mode
+/// word sends it to its error routine before it initialises GP. The values
+/// are inputs the QEMU models choose for each board; none is a measured
+/// flash dump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareRecord {
+    /// The CPU boot-mode word the PROM compares with the processor's mode.
+    pub cpu_mode_word: u32,
+    /// The mode bits the processor latches into CP0 Config at reset: Config
+    /// bits 24:0 (the R10000 family's reset-mode inputs).
+    pub reset_mode: u32,
+    /// The processor clock the PROM reports and times against, in Hz.
+    pub cpu_clock_hz: u32,
+    /// The record's machine type field.
+    pub machine_type: u32,
+}
+
+impl FirmwareRecord {
+    /// The Fuel's 500 MHz R14000 with a 2 MiB secondary cache.
+    pub const FUEL: Self = Self {
+        cpu_mode_word: 0x549a_a985,
+        reset_mode: 0x009a_a985,
+        cpu_clock_hz: 500_000_000,
+        machine_type: 2,
+    };
+    /// The Tezro's 700 MHz R16000 with a 4 MiB secondary cache.
+    pub const TEZRO: Self = Self {
+        cpu_mode_word: 0x549b_ad85,
+        reset_mode: 0x009b_ad85,
+        cpu_clock_hz: 700_000_000,
+        machine_type: 0,
+    };
+    /// CP0 Config at reset: the fixed 32 KiB primary cache sizes (fields 3
+    /// in bits 31:29 and 28:26) with the board's mode bits.
+    pub const fn reset_config0(&self) -> u32 {
+        (3 << 29) | (3 << 26) | (self.reset_mode & 0x01ff_ffff)
+    }
+}
+
+/// Apply the board's firmware record while retaining the configuration sum.
 /// This policy also applies when reopening an existing persistent store.
-fn configure(data: &mut [u8]) {
+fn configure(data: &mut [u8], record: &FirmwareRecord) {
     let config = &mut data[0x60..0xb0];
     let old = sum(config);
     config[0x34..0x38].fill(0);
-    config[4..8].copy_from_slice(&0x549aa985u32.to_be_bytes());
-    config[0x14..0x18].copy_from_slice(&500_000_000u32.to_be_bytes());
-    config[0x30..0x34].copy_from_slice(&2u32.to_be_bytes());
+    config[4..8].copy_from_slice(&record.cpu_mode_word.to_be_bytes());
+    config[0x14..0x18].copy_from_slice(&record.cpu_clock_hz.to_be_bytes());
+    config[0x30..0x34].copy_from_slice(&record.machine_type.to_be_bytes());
     config[0x38..0x3c].copy_from_slice(&1u32.to_be_bytes());
     let adjustment = old.wrapping_sub(sum(config));
     config[0x34..0x38].copy_from_slice(&(adjustment as u32).to_be_bytes());
@@ -111,12 +153,13 @@ pub struct Flash {
 }
 
 impl Flash {
-    /// Format a fresh two-position store from a decoded payload.
-    pub fn new(payload: &[u8]) -> io::Result<Self> {
+    /// Format a fresh two-position store from a decoded payload, with the
+    /// board's firmware record.
+    pub fn new(payload: &[u8], record: FirmwareRecord) -> io::Result<Self> {
         if payload.len() > PART_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Fuel PROM payload exceeds 8 MiB",
+                "PROM payload exceeds 8 MiB",
             ));
         }
         let mut data = vec![0xff; FLASH_SIZE];
@@ -125,7 +168,7 @@ impl Flash {
         data[label + 0x10..label + 0x14].copy_from_slice(&0x504c4f49u32.to_be_bytes());
         data[label + 0x14..label + 0x18].copy_from_slice(&1u32.to_be_bytes());
         data[label + 0x18..label + 0x1c].copy_from_slice(&1u32.to_be_bytes());
-        configure(&mut data);
+        configure(&mut data, &record);
         Ok(Self {
             st: Mutex::new(State::new(data)),
             gen: AtomicU64::new(0),
@@ -133,22 +176,22 @@ impl Flash {
     }
 
     /// Load an exact 16 MiB store, or seed a missing/empty one. Wrong sizes are
-    /// refused without writes. Reopening reapplies Fuel's configuration policy.
+    /// refused without writes. Reopening reapplies the board's firmware record.
     /// Completed guest programming and erasure write through to this file.
-    pub fn with_file(payload: &[u8], path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut data = Self::new(payload)?.st.into_inner().data;
+    pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
+        let mut data = Self::new(payload, record)?.st.into_inner().data;
         let mut backing = FlashBacking::open(path, &mut data).map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Fuel flash store must be exactly 16 MiB (or empty)",
+                    "flash store must be exactly 16 MiB (or empty)",
                 )
             } else {
                 error
             }
         })?;
-        configure(&mut data);
-        // Opening an existing store loads it before Fuel's configuration
+        configure(&mut data, &record);
+        // Opening an existing store loads it before the board's configuration
         // fields are refreshed; an empty store was seeded from this same data.
         backing.write_range(0, &data)?;
         let flash = Self {
@@ -383,7 +426,7 @@ mod tests {
     #[test]
     fn the_seed_exposes_fuel_configuration_and_volume_label() {
         let seed = vec![0x21; 0xb0];
-        let f = Flash::new(&seed).unwrap();
+        let f = Flash::new(&seed, FirmwareRecord::FUEL).unwrap();
         let bytes = f.contents();
         assert_eq!(sum(&bytes[0x60..0xb0]), sum(&seed[0x60..0xb0]));
         assert_eq!(&bytes[0x64..0x68], &0x549aa985u32.to_be_bytes());
@@ -396,14 +439,74 @@ mod tests {
             &[0x50, 0x4c, 0x4f, 0x49, 0, 0, 0, 1, 0, 0, 0, 1]
         );
         assert!(bytes[label + 28..].iter().all(|b| *b == 0xff));
-        assert!(Flash::new(&vec![0; PART_SIZE + 1]).is_err());
+        assert!(Flash::new(&vec![0; PART_SIZE + 1], FirmwareRecord::FUEL).is_err());
+    }
+    /// The stock image's factory block: the 400 MHz mode word, machine type 0
+    /// and a zero check adjustment, before any board configures it.
+    fn factory_block() -> Vec<u8> {
+        let mut image = vec![0x21; 0xb0];
+        image[0x60..0xb0].fill(0);
+        image[0x64..0x68].copy_from_slice(&0x5219a785u32.to_be_bytes());
+        image[0x70..0x78].copy_from_slice(&400_000_000u64.to_be_bytes());
+        image
+    }
+
+    /// Whichever board configures the block, its byte sum is unchanged: the
+    /// check adjustment absorbs the difference. Follows test_ip35_configure in
+    /// tests/unit/test-sgi-initial-flash.c, which pins 0x9b for the Fuel; the
+    /// Tezro's 0xde is the same rule applied to its mode word, clock and
+    /// machine type.
+    #[test]
+    fn each_board_configures_the_block_and_keeps_its_byte_sum() {
+        for (record, adjustment) in [(FirmwareRecord::FUEL, 0x9b), (FirmwareRecord::TEZRO, 0xde)] {
+            let image = factory_block();
+            let bytes = Flash::new(&image, record).unwrap().contents();
+            let block = &bytes[0x60..0xb0];
+            assert_eq!(&block[4..8], &record.cpu_mode_word.to_be_bytes());
+            assert_eq!(&block[0x14..0x18], &record.cpu_clock_hz.to_be_bytes());
+            assert_eq!(&block[0x30..0x34], &record.machine_type.to_be_bytes());
+            assert_eq!(&block[0x38..0x3c], &1u32.to_be_bytes(), "flash program count");
+            assert_eq!(&block[0x34..0x38], &[0, 0, 0, adjustment]);
+            assert_eq!(sum(block), sum(&image[0x60..0xb0]));
+        }
+    }
+
+    /// The Tezro's record is the QEMU Tezro profile's firmware configuration,
+    /// and the Config the CPU resets to carries the same mode bits, so the
+    /// PROM's check of one against the other passes.
+    #[test]
+    fn the_tezro_record_carries_its_700_mhz_mode_and_the_config_it_implies() {
+        let bytes = Flash::new(&factory_block(), FirmwareRecord::TEZRO).unwrap().contents();
+        assert_eq!(&bytes[0x64..0x68], &0x549bad85u32.to_be_bytes());
+        assert_eq!(&bytes[0x74..0x78], &700_000_000u32.to_be_bytes());
+        assert_eq!(&bytes[0x90..0x94], &0u32.to_be_bytes(), "machine type 0");
+        assert_eq!(FirmwareRecord::TEZRO.reset_config0(), 0x6c9b_ad85);
+        assert_eq!(FirmwareRecord::FUEL.reset_config0(), 0x6c9a_a985, "the Fuel's value is unchanged");
+        // Config bits 18:16 hold the secondary cache size: 3 is 4 MiB here
+        // against the Fuel's 2 for 2 MiB.
+        assert_eq!((FirmwareRecord::TEZRO.reset_config0() >> 16) & 7, 3);
+        assert_eq!((FirmwareRecord::FUEL.reset_config0() >> 16) & 7, 2);
+    }
+
+    /// Reopening a stored image reapplies the board's record, so an image last
+    /// used by another board follows the machine that opens it.
+    #[test]
+    fn reopening_a_store_applies_the_record_of_the_board_that_opens_it() {
+        let dir = std::env::temp_dir().join(format!("bedrock-flash-record-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flash.bin");
+        drop(Flash::with_file(&factory_block(), &path, FirmwareRecord::FUEL).unwrap());
+        let tezro = Flash::with_file(&[], &path, FirmwareRecord::TEZRO).unwrap().contents();
+        assert_eq!(&tezro[0x64..0x68], &0x549bad85u32.to_be_bytes());
+        assert_eq!(sum(&tezro[0x60..0xb0]), sum(&factory_block()[0x60..0xb0]));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     /// The PROM programs through one view while executable aliases must
     /// keep reading array bytes.
     #[test]
     fn programming_changes_shared_bytes_without_exposing_status_to_instruction_fetches() {
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let local = f.boot_view();
             let remote = f.boot_view();
             let execute = f.array_view(0, PART_SIZE).unwrap();
@@ -430,7 +533,7 @@ mod tests {
             assert!(!local.read8(PART_SIZE as u64).is_ok());
         }
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             program(&v, 0, 0x200, 0x1234);
             program(&v, 0, 0x200, 0xf0ff);
@@ -457,7 +560,7 @@ mod tests {
             assert_eq!(execute.read16(0x202).data, 0x5555);
         }
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             assert_eq!(v.write64(0x550, 0x98), BUS_ERR);
             assert_eq!(v.read16(0x20).data, 0xffff);
@@ -480,7 +583,7 @@ mod tests {
     /// selected sectors change.
     #[test]
     fn erase_completes_only_for_selected_sectors_and_reset_cancels_it() {
-        let f = Arc::new(Flash::new(&[]).unwrap());
+        let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
         let v = f.boot_view();
         program(&v, 0, 0x200, 0);
         program(&v, 0, 0x10000, 0);
@@ -537,16 +640,16 @@ mod tests {
             let mut bytes = vec![0x5a; FLASH_SIZE];
             bytes[PART_SIZE] = 0xc7;
             std::fs::write(&path, &bytes).unwrap();
-            let f = Flash::with_file(&[0x11], &path).unwrap();
+            let f = Flash::with_file(&[0x11], &path, FirmwareRecord::FUEL).unwrap();
             assert_eq!(f.contents()[0], 0x5a);
             assert_eq!(f.contents()[PART_SIZE], 0xc7);
             assert_eq!(std::fs::read(&path).unwrap(), f.contents());
             drop(f);
             std::fs::write(&path, [1, 2, 3]).unwrap();
-            assert!(Flash::with_file(&[], &path).is_err());
+            assert!(Flash::with_file(&[], &path, FirmwareRecord::FUEL).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3]);
             std::fs::write(&path, []).unwrap();
-            let g = Flash::with_file(&[0x34], &path).unwrap();
+            let g = Flash::with_file(&[0x34], &path, FirmwareRecord::FUEL).unwrap();
             assert_eq!(g.contents()[0], 0x34);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), FLASH_SIZE as u64);
             drop(g);
@@ -555,13 +658,13 @@ mod tests {
         {
             let path = std::env::temp_dir().join(format!("iris-amd-persist-{}", std::process::id()));
             std::fs::write(&path, []).unwrap();
-            let f = Arc::new(Flash::with_file(&[], &path).unwrap());
+            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             program(&v, 0, 0x200, 0x1234);
             program(&v, SECOND_POSITION, (PART_SIZE - 2) as u64, 0x5678);
             drop(v);
             drop(f);
-            let f = Arc::new(Flash::with_file(&[], &path).unwrap());
+            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             assert_eq!(v.read16(0x200).data, 0x1234);
             assert_eq!(
@@ -578,7 +681,7 @@ mod tests {
             f.advance_ns(50_000 + 512_000_000);
             drop(v);
             drop(f);
-            let f = Arc::new(Flash::with_file(&[], &path).unwrap());
+            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             assert_eq!(v.read16(0x200).data, 0x1234);
             assert_eq!(
@@ -594,7 +697,7 @@ mod tests {
     #[test]
     fn failed_backing_writes_leave_array_bytes_unchanged() {
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             // A read-only descriptor makes writes fail without a special backend.
             let path = std::env::temp_dir().join(format!("iris-amd-read-only-{}", std::process::id()));
             std::fs::write(&path, []).unwrap();
@@ -610,7 +713,7 @@ mod tests {
             std::fs::remove_file(path).unwrap();
         }
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             program(&v, 0, 0x200, 0);
             let path =
