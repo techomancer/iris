@@ -7879,4 +7879,74 @@ mod tests {
             println!("{:<12} {:8.3} ns/instruction", name, ns);
         }
     }
+
+    /// R10000: a refused uncached store completes in compiled code exactly as
+    /// in the interpreter, through both store sites (SW, and SWL by the
+    /// masked-store helper), and the instructions after it run. The same access
+    /// as a load, and a store on the R5000, still fault in both engines.
+    #[test]
+    fn refused_uncached_store_matches_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_v2::{R10000Cache, R5000Cache, CpuModel};
+        use crate::cpu::mips_core::STATUS_EXL;
+        use crate::cpu::mips_isa::{OP_ADDIU, OP_LW, OP_SW, OP_SWL};
+
+        /// Nothing answers: every read and write is refused (the trait's defaults).
+        struct RefusingBus;
+        impl BusDevice for RefusingBus {}
+
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (CoreSnapshot, CoreSnapshot) {
+            let pc = 0xFFFF_FFFF_8000_0000u64;
+            let mut gpr = [0u64; 32];
+            gpr[16] = 0xFFFF_FFFF_A100_0000; // kseg1: uncached, and nothing answers
+            gpr[6] = 0x1234_5678;
+            let words = [make_i(op, 16, 6, 0), make_i(OP_ADDIU, 0, 7, 2)];
+            let build = || {
+                let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+                let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+                let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &cfg));
+                exec.core.gpr = gpr;
+                exec.core.pc = pc;
+                exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "fetchverify")]
+                { exec.core.fetch_verify_on = false; }
+                exec
+            };
+            let mut interp = build();
+            interp.jitv2_dispatch_enabled = false;
+            for (i, &word) in words.iter().enumerate() {
+                if interp.core.pc != pc + 4 * i as u64 {
+                    break; // an exception redirected the PC
+                }
+                interp.exec(word);
+            }
+
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[..words.len()].copy_from_slice(&words);
+            let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+            let mut analyzer = Analyzer::new();
+            let (walked, non_empty) = analyzer.walk_bounded(&page, 0, page_base, words.len());
+            assert!(non_empty);
+            let mut instrs_owned = *walked;
+            let mut codegen = Codegen::new();
+            let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
+                .expect("region must be compilable for this test to be meaningful");
+            let mut jit = build();
+            jit.install_jit_hooks();
+            unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
+            std::mem::forget(codegen);
+            (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
+        }
+
+        for op in [OP_SW, OP_SWL] {
+            let (interp, jit) = run::<R10000Cache>(op);
+            assert_eq!(jit, interp, "op {op:#x}: JIT and interpreter diverged");
+            assert_eq!(jit.cp0_status & STATUS_EXL, 0, "op {op:#x}: no exception");
+            assert_eq!(jit.gpr[7], 2, "op {op:#x}: the instruction after the store ran");
+        }
+        for (name, (interp, jit)) in [("R10000 load", run::<R10000Cache>(OP_LW)), ("R5000 store", run::<R5000Cache>(OP_SW))] {
+            assert_eq!(jit, interp, "{name}: JIT and interpreter diverged");
+            assert_ne!(jit.cp0_status & STATUS_EXL, 0, "{name}: must take its Data Bus Error");
+            assert_eq!(jit.gpr[7], 0, "{name}: nothing after the fault ran");
+        }
+    }
 }
