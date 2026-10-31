@@ -11,6 +11,9 @@ tasks.json
 *.img
 prom.bin
 nvram.bin
+# Runtime files iris writes in the working directory.
+nvram.bin.*.tmp
+/.iris/
 Cargo.lock
 iris.toml
 screenshot_*.png
