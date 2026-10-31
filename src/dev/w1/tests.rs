@@ -6,6 +6,7 @@ use super::crc::{crc16, crc8};
 use super::slot::{self, fields, ONE_PULSE, RESET_PULSE};
 use super::*;
 use crate::dev::w1::sgi::{board_record_part, ethernet_address_part, BoardRecord, ETHERNET_PART_SERIAL};
+use crate::dev::w1::Ds2502;
 
 const MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 
@@ -807,4 +808,48 @@ fn the_board_records_read_back_as_text() {
     }
     names.sort();
     assert_eq!(names, ["FP1", "PWR.SPPLY.SR"]);
+}
+
+fn bus() -> Bus {
+    let mut b = Bus::new();
+    b.add(Box::new(Ds2502::new(0x09, 0x1234, b"hello")));
+    b
+}
+
+/// A bus saved partway through reading a part's ROM carries on the read
+/// from the next bit after a load.
+#[test]
+fn a_read_rom_in_progress_continues_after_a_load() {
+    let mut src = bus();
+    assert!(src.reset());
+    for i in 0..8 {
+        src.slot(0x33 >> i & 1 != 0);
+    }
+    let first: Vec<bool> = (0..10).map(|_| src.slot(true)).collect();
+    let v = src.save_state();
+    let mut dst = bus();
+    dst.load_state(&v).unwrap();
+    assert_eq!(v, dst.save_state());
+    let rest: Vec<bool> = (0..54).map(|_| dst.slot(true)).collect();
+    let rom = dst.roms()[0];
+    let bits: Vec<bool> = (0..64).map(|i| rom[i / 8] >> (i % 8) & 1 != 0).collect();
+    assert_eq!([first, rest].concat(), bits);
+
+    let mut other = Bus::new();
+    other.add(Box::new(Ds2502::new(0x09, 0x9999, b"hello")));
+    assert!(other.load_state(&v).is_err());
+}
+
+/// A saved ROM phase past the ROM's 64 bits is refused rather than loaded
+/// to index past it on the next slot.
+#[test]
+fn a_rom_bit_past_the_rom_is_refused() {
+    let src = bus();
+    for tag in 1..=3u64 {
+        let mut v = src.save_state();
+        let phase = crate::snapshot::u64_slice_to_toml(&[tag, 64, 0]);
+        v.as_table_mut().unwrap().insert("phase".into(), phase);
+        let e = bus().load_state(&v).unwrap_err();
+        assert!(e.contains("ROM bit 64"), "phase {tag}: {e}");
+    }
 }
