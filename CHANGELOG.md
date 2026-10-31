@@ -196,6 +196,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   refills through 0x000, as the part does, not 0x080. The R4400 and R5000 still
   choose by the current mode.
 
+### Refused uncached stores on the R10000 family
+
+- On the R10000 family (Octane, IP28, O2), an uncached store that nothing answers now
+  completes instead of raising a Data Bus Error, as the processor does. iris prints
+  "Unsupported uncached write ... (posted, completes)" for the first four such
+  stores and then at each power of two. Loads, instruction fetches, the R4400 and
+  the R5000 are unchanged.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
