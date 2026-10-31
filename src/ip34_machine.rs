@@ -858,4 +858,3 @@ impl Drop for FuelBoard {
         self.stop();
     }
 }
-

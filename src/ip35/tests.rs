@@ -119,7 +119,7 @@ fn xkphys_uc_bits_survive_the_board_cpu_mask() {
         .stack_size(4 * 1024 * 1024)
         .spawn(|| {
             let bus = Arc::new(Ip35Bus::new(Physical::new(Vec::new())));
-            let mut cpu = crate::ip35_machine::build_cpu(bus);
+            let mut cpu = crate::ip34_machine::build_cpu(bus);
             cpu.core.write_cp0(
                 12,
                 (cpu.core.cp0_status | crate::cpu::mips_core::STATUS_KX) as u64,
@@ -141,7 +141,7 @@ fn xkphys_uc_bits_survive_the_board_cpu_mask() {
 /// RAM placed above the first GiB must remain shared by cached, uncached and DMA paths.
 #[test]
 fn cached_and_uncached_memory_keep_high_addresses() {
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     assert_eq!(board.md.md_bus().write64(8, 0x33), BUS_OK);
     let at = (1 << 30) + 0x1000;
     assert_eq!(board.md.memory_view().write64(at, 0x12345678), BUS_OK);
@@ -154,7 +154,7 @@ fn cached_and_uncached_memory_keep_high_addresses() {
 /// Memory diagnostics must notify both processor interfaces and refuse bad uncached data.
 #[test]
 fn memory_errors_reach_both_interfaces_and_uncached_reads_fail() {
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     let correctable = 1 << 61;
     board.pi[0].write64(0xb0, correctable);
     board.md.md_bus().write64(8, 0x33);
@@ -178,7 +178,7 @@ fn memory_errors_reach_both_interfaces_and_uncached_reads_fail() {
         assert_eq!(board.irq.bits() & (1 << 11), 0);
     }
 
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     board.md.md_bus().write64(8, 0x33);
     board.md.ecc_bus().write8(7, 3);
     for selector in [0, 3] {
@@ -193,7 +193,7 @@ fn memory_errors_reach_both_interfaces_and_uncached_reads_fail() {
 fn fuel_link_reset_resets_the_attached_scsi_engine() {
     use crate::dev::isp1040::{mbox, reg, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, HOST_CMD_SHIFT};
     use crate::pci::PciBusDevice;
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     let isp = &board.scsi;
     isp.config().write(1, 6);
     isp.config().write(5, 0x02000000);
@@ -215,7 +215,7 @@ fn fuel_link_reset_resets_the_attached_scsi_engine() {
 #[test]
 fn the_configured_station_address_reaches_the_l1_and_the_ethernet() {
     let mac = [0x08, 0x00, 0x69, 0x21, 0x43, 0x65];
-    let board = crate::ip35_machine::FuelBoard::with_config(crate::ip35_machine::FuelBoardConfig {
+    let board = crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: mac,
         timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
@@ -232,7 +232,7 @@ fn the_configured_station_address_reaches_the_l1_and_the_ethernet() {
 /// the board is built with replacements.
 #[test]
 fn the_l1_identity_overrides_reach_the_controller() {
-    use crate::ip35_machine::{FuelBoard, FuelBoardConfig, L1Identity};
+    use crate::ip34_machine::{FuelBoard, FuelBoardConfig, L1Identity};
     let build = |l1| FuelBoard::with_config(FuelBoardConfig {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
@@ -261,7 +261,7 @@ fn the_prom_tag_stores_reach_the_memory_controller_through_the_cpu_cache() {
 fn prom_tag_stores() {
     use crate::cpu::mips_cache_v2::MipsCache;
     use crate::cpu::mips_isa::{CACH_PD, CACH_PI, C_IST};
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     let cpu = board.build_cpu();
     let window = |at: u64| board.md.physical().read64(at).status == BUS_OK;
     assert!(!window(0x10_0000));
@@ -274,8 +274,8 @@ fn prom_tag_stores() {
     assert!(!window(0x10_0000));
 }
 
-fn fuel_dma_board() -> crate::ip35_machine::FuelBoard {
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+fn fuel_dma_board() -> crate::ip34_machine::FuelBoard {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     assert_eq!(board.md.md_bus().write64(8, 0x33), BUS_OK);
     board.xbridge.head(15).write32(0x24, 15);
     board.xbridge.set_wide_slot_mask(15, 0);
@@ -429,7 +429,7 @@ fn exact_windows_reject_padding_and_revoked_permissions() {
 /// Board default setup must preserve the direct RAM path and its shared DMA contents.
 #[test]
 fn direct_cached_banks_remain_visible_after_board_defaults_are_installed() {
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     assert_eq!(board.md.md_bus().write64(8, 0x33), BUS_OK);
     let cached = board.cached_bus();
     assert!(cached.mem_ptr(0x2000).is_some());
@@ -543,7 +543,7 @@ fn code_generations_use_the_cached_plane_and_stable_ram_endpoint() {
 /// absorbing the adjacent, independently implemented L1 UART window.
 #[test]
 fn compatibility_hub_heads_do_not_hide_the_l1_uart_window() {
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     assert_ne!(board.md.current_cell() & 1, 0);
     for base in [0x1000_0000, 0x3000_0000] {
         for offset in [0, 8, 0x40, 0x78] {
@@ -576,7 +576,7 @@ fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
     use crate::config::{FuelConsole, MachineConfig};
     let listeners: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
     let ports: Vec<_> = listeners.iter().map(|socket| socket.local_addr().unwrap().port()).collect();
-    let board = crate::ip35_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
     let mut config = MachineConfig::default();
     config.fuel.l1_port = Some(ports[0]);
     config.serial_port_a = Some(ports[1]);
@@ -588,10 +588,10 @@ fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
     config.fuel.l1_log = config.serial_log.clone();
     for (console, selection) in [FuelConsole::L1, FuelConsole::Ioc3A, FuelConsole::Ioc3B].into_iter().enumerate() {
         config.fuel.console = selection;
-        crate::ip35_machine::FuelMachine::connect_serial_for_test(&config, &board, console).unwrap();
+        crate::ip34_machine::FuelMachine::connect_serial_for_test(&config, &board, console).unwrap();
     }
     config.ci = false;
-    crate::ip35_machine::FuelMachine::connect_serial_for_test(&config, &board, 0).unwrap();
+    crate::ip34_machine::FuelMachine::connect_serial_for_test(&config, &board, 0).unwrap();
 }
 
 /// The Fuel's OHCI root ports each carry a low-speed device, and host
@@ -601,7 +601,7 @@ fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
 fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
     use crate::pci::PciBusDevice;
     let ports = |usb_input| {
-        let board = crate::ip35_machine::FuelBoard::with_config(crate::ip35_machine::FuelBoardConfig {
+        let board = crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
             payload: &[], clock: Arc::new(|| 0), flash_path: None,
             station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
             timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
@@ -687,7 +687,7 @@ fn uncached_fetch_compiles_the_uncached_view_body() {
     assert_eq!(bus.read32(reset_vector).data, addiu_r1);
     assert_eq!(bus.cached_view(ram.clone(), crate::dev::bedrock_mem::RamExtent::new(&[512])).read32(reset_vector).data, JIT_REGION_BOUNDARY_SENTINEL);
 
-    let mut cpu = crate::ip35_machine::build_cpu(bus.clone());
+    let mut cpu = crate::ip34_machine::build_cpu(bus.clone());
     cpu.enable_jitv2_uncached_views(code_bus.clone());
     // The reset vector, KSEG1: uncached, plain physical address 0x1fc00000.
     cpu.core.pc = 0xffff_ffff_bfc0_0000;
@@ -755,7 +755,7 @@ mod code_views {
 
     /// A bus whose uncached attribute-0 view of the reset frame holds an ADDIU
     /// and whose cached view holds a region boundary, as RAM over the PROM does.
-    fn bus_and_cpu(opted_in: bool) -> (Arc<Ip35Bus>, Box<crate::ip35_machine::FuelCpu>) {
+    fn bus_and_cpu(opted_in: bool) -> (Arc<Ip35Bus>, Box<crate::ip34_machine::FuelCpu>) {
         let rom = Arc::new(Words(ADDIU_R1, AtomicU64::new(0)));
         let ram = Arc::new(Words(JIT_REGION_BOUNDARY_SENTINEL, AtomicU64::new(0)));
         let physical = Physical::new(Vec::new());
@@ -770,7 +770,7 @@ mod code_views {
         }
         bus.map(0, 0x1_0000_0000, 0x1000, rom);
         let bus = Arc::new(bus);
-        let mut cpu = crate::ip35_machine::build_cpu(bus.clone());
+        let mut cpu = crate::ip34_machine::build_cpu(bus.clone());
         if opted_in {
             let cached = bus.cached_view(ram, crate::dev::bedrock_mem::RamExtent::new(&[512]));
             cpu.enable_jitv2_uncached_views(bus.code_view(cached));
@@ -868,8 +868,8 @@ mod code_views {
     }
 }
 
-fn fuel_with_graphics(graphics: crate::config::GraphicsBoard) -> crate::ip35_machine::FuelBoard {
-    crate::ip35_machine::FuelBoard::with_config(crate::ip35_machine::FuelBoardConfig {
+fn fuel_with_graphics(graphics: crate::config::GraphicsBoard) -> crate::ip34_machine::FuelBoard {
+    crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: [0x08, 0x00, 0x69, 0x21, 0x43, 0x65],
         timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
