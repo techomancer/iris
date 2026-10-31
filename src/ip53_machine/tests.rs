@@ -93,12 +93,48 @@ fn transfer_legs_keep_aligned_widths() {
     assert_eq!(BedrockPeer::legs(0x2000, 0).count(), 0);
 }
 
-/// Only the counts a board fits are accepted, and the memory must meet
-/// the processors' minimum.
+/// The two- and four-processor board adds a second PIC at widget 11 with
+/// nothing on its buses, keeps the IO9 on widget 15 behind widget 0, and
+/// leaves the V12's widget 12 empty.
+#[test]
+fn two_or_four_processors_bring_the_second_pic_at_widget_11() {
+    for cpus in [2, 4] {
+        let board = TezroBoard::new(cpus).unwrap();
+        let io = &board.node.io;
+        assert_eq!(board.pics.iter().map(|p| p.widget_number()).collect::<Vec<_>>(), [11, 15]);
+        assert_eq!(io.pio_read(widget(11, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
+        assert_eq!(io.pio_read(widget(15, 0), 8).data, u64::from(crate::dev::pic::identity(0)));
+        assert_eq!(io.pio_read(widget(12, 0), 8).status, BUS_ERR, "no V12");
+        assert_eq!((io.pio_read(widget(0, 4), 4).data >> 12) & 0xffff, u64::from(crate::dev::pxbow::PART));
+        for device in 1..=4 {
+            assert_eq!(io.pio_read(widget(11, 0x2_0000 + (device << 12)), 4).status, BUS_ERR, "widget 11 device {device}");
+        }
+        assert_eq!(io.pio_read(config_id(1), 4).data, 0x100a_10a9);
+    }
+}
+
+/// Every fitted processor slot reads present, in the board's order (CPU 1
+/// in PI1/A, CPUs 2 and 3 in the B slots), and only CPU 0 is enabled.
+#[test]
+fn fitted_processors_read_present_and_only_cpu_0_is_enabled() {
+    use crate::dev::bedrock_pi::reg::{CPU_A_ENABLE, CPU_B_ENABLE, INTERFACE_SLOT_A, INTERFACE_SLOT_B};
+    for (cpus, present) in [(1, [[1, 0], [0, 0]]), (2, [[1, 0], [1, 0]]), (4, [[1, 1], [1, 1]])] {
+        let board = TezroBoard::new(cpus).unwrap();
+        for (interface, pi) in board.node.pi.iter().enumerate() {
+            let slots = [pi.read64(INTERFACE_SLOT_A).data, pi.read64(INTERFACE_SLOT_B).data];
+            assert_eq!(slots, present[interface], "{cpus} CPUs, PI{interface}");
+            let enabled = [pi.read64(CPU_A_ENABLE).data & 1, pi.read64(CPU_B_ENABLE).data & 1];
+            assert_eq!(enabled, [u64::from(interface == 0), 0], "{cpus} CPUs, PI{interface}");
+        }
+    }
+}
+
+/// Only the counts a board fits are accepted.
 #[test]
 fn the_board_refuses_a_population_it_cannot_fit() {
     assert!(TezroBoard::new(3).is_err());
     assert!(TezroBoard::new(0).is_err());
+    assert!(TezroBoard::new(5).is_err());
 }
 
 /// A board of one processor and one GiB of memory (below 4 GiB, which a

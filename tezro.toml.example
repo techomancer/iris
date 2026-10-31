@@ -20,6 +20,8 @@ profile = "tezro_ip53"
 # "r16000_700". "r16000_800", "r16000_900" and "r16000_1000" are the others (four
 # processors only); other values are refused.
 cpu = "r16000_700"
+# Processors fitted: 1, 2 or 4 (the default). Only CPU 0 runs.
+cpus = 4
 
 [graphics]
 board = "none"

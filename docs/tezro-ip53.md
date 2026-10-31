@@ -32,15 +32,20 @@ as part of the flash record's mode word. The board's table of chips, with how
 well each value is established, is in `src/ip53_machine.rs`; each chip's PRId
 is graded in `CpuModel::prid`.
 
-`[tezro] cpus` is the number of processors fitted. The one-processor board
-has one PIC at XIO widget 15 carrying the IO9.
+`[machine] cpus` is the number of processors fitted: 1, 2 or 4, with 4 the
+default, as in the Tezros whose inventories have been seen. The count selects
+the interface board. The one-processor board has one PIC at XIO widget 15
+carrying the IO9. The two- and four-processor board adds a second PIC at
+widget 11, with nothing on its buses, and an XIO slot for a V12 at widget 12,
+which is left empty.
 
 Memory comes from `banks`: one 512 or 1024 MiB bank per locational bank, from
 bank 0 with no gaps, up to eight. Left unset, the machine fits the 4 GiB
 layout of 1024, 1024 and four 512 MiB banks, a population a real Tezro has
-been seen with. One processor needs at least 512 MiB. Banks 4 and 5 of the
-default sit above the 4 GiB physical address, outside the processor's direct
-memory window, so they answer through the slower decode table.
+been seen with. One processor needs at least 512 MiB, two or four at least
+1 GiB. Banks 4 and 5 of the default sit above the 4 GiB physical address,
+outside the processor's direct memory window, so they answer through the
+slower decode table.
 
 The `[tezro]` settings also select the flash backing file, the console and
 the L1 port and log. The console options are `l1` (the default) and `ioc4_a`
