@@ -733,3 +733,23 @@ fn zoom_2x2_sized(word4: u32, size_bits: u32) -> Box<Board> {
     cmd(&mut s, select(ODSY_REG_GL_END));
     s
 }
+
+/// An integer pixel through a logic operation, or to the id planes, marks
+/// its own display line to resolve again. The end of the primitive no
+/// longer marks the whole frame for them.
+#[test]
+fn an_integer_pixel_through_a_logic_op_or_to_the_id_planes_dirties_its_row() {
+    let (mut s, _) = window();
+    let lines = |s: &Board| (0..s.scanout.dirty.len()).filter(|&y| s.scanout.dirty[y]).collect::<Vec<_>>();
+    s.scanout_update();
+
+    s.pattern_mode |= ODSY_MODE_COLOR_LOGIC_OP;
+    s.gl_ctx.as_mut().unwrap().cur.logic_op_mode = SGI_GL_CLEAR + SGI_LOGIC_XOR;
+    s.paint_integer(40, 120, false, 0x00ff_ff00);
+    assert_eq!(lines(&s), vec![120], "a logic-op pixel");
+    s.scanout_update();
+
+    s.dest_buffer_word = ODSY_DEST_ID_PLANES;
+    s.paint_integer(40, 130, true, 0x10);
+    assert_eq!(lines(&s), vec![130], "an id-plane pixel");
+}

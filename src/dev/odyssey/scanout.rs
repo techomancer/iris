@@ -55,14 +55,12 @@ pub enum DirtySite {
     PatternFill,
     /// A DMA into the colour buffer (Board::dma_to_buffer()).
     Dma,
-    /// The end of an integer primitive (Board::gl_end()).
-    GlEnd,
     /// An integer pixel that goes through a logic operation or to the id planes.
     Integer,
 }
 
 impl DirtySite {
-    pub const ALL: [DirtySite; 16] = [
+    pub const ALL: [DirtySite; 15] = [
         DirtySite::Other,
         DirtySite::Mode,
         DirtySite::Raster,
@@ -77,8 +75,7 @@ impl DirtySite {
         DirtySite::CopyRect,
         DirtySite::PatternFill,
         DirtySite::Dma,
-        DirtySite::GlEnd,
-        DirtySite::Integer,
+                DirtySite::Integer,
     ];
 
     pub fn name(self) -> &'static str {
@@ -97,7 +94,6 @@ impl DirtySite {
             DirtySite::CopyRect => "copy_rect",
             DirtySite::PatternFill => "pattern_fill",
             DirtySite::Dma => "dma",
-            DirtySite::GlEnd => "gl_end",
             DirtySite::Integer => "integer",
         }
     }

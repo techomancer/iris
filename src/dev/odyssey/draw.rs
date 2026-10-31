@@ -337,6 +337,7 @@ impl Board {
             let use_op = (self.pattern_mode & enable) != 0 && op as u32 != SGI_LOGIC_COPY;
 
             self.paint_aux(x, y, src, if use_op { op } else { SGI_LOGIC_COPY as u8 });
+            self.scanout.invalidate_for(DirtySite::Integer, y as i32, 1);
             return;
         }
         if (self.pattern_mode & enable) == 0 || op as u32 == SGI_LOGIC_COPY {
@@ -353,6 +354,7 @@ impl Board {
                 self.buffer_store(b, x, y, if is_index { out & ODSY_INDEX_MASK } else { out | 0xff });
             }
         }
+        self.scanout.invalidate_for(DirtySite::Integer, y as i32, 1);
     }
 
     /// Board::paint_integer() at each pixel of row y from x0 up to x1, given the
