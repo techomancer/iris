@@ -20,15 +20,22 @@ const BOUND: Duration = Duration::from_secs(8);
 
 /// A renderer that counts presents and runs `on_stop` when torn down.
 #[derive(Clone)]
-struct Probe {
+pub(crate) struct Probe {
     presents: Arc<AtomicUsize>,
-    stopped: Arc<AtomicBool>,
+    pub(crate) stopped: Arc<AtomicBool>,
     on_stop: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Probe {
-    fn new(on_stop: impl Fn() + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(on_stop: impl Fn() + Send + Sync + 'static) -> Self {
         Self { presents: Arc::default(), stopped: Arc::default(), on_stop: Arc::new(on_stop) }
+    }
+
+    /// A probe that notes whether `disks_running` was true when torn down.
+    pub(crate) fn watching(disks_running: impl Fn() -> bool + Send + Sync + 'static) -> (Self, Arc<AtomicBool>) {
+        let seen = Arc::new(AtomicBool::default());
+        let flag = seen.clone();
+        (Self::new(move || if disks_running() { flag.store(true, SeqCst) }), seen)
     }
 }
 
@@ -51,7 +58,7 @@ impl Renderer for Probe {
 /// from a file; these tests run no guest code, so zeros will do). Tests run
 /// side by side in one process and each removes its own directory, so each
 /// takes a name of its own.
-fn scratch(test: &str) -> PathBuf {
+pub(crate) fn scratch(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("iris-display-stop-{test}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // A REX3 saves the shapes it drew when it stops, to $HOME/.iris unless
@@ -61,7 +68,7 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
-fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineConfig {
+pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineConfig {
     let (mb, cpu) = match profile {
         MachineProfile::OctaneIp30 => (64, CpuModel::R10000),
         MachineProfile::O2Ip32 => (32, CpuModel::R5000),
@@ -88,7 +95,7 @@ fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineC
     cfg
 }
 
-fn big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+pub(crate) fn big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(f).unwrap().join().unwrap()
 }
 
@@ -171,4 +178,24 @@ fn stopping_from_the_main_thread_never_waits_on_the_renderer() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// The graphics board can hang in its stop, so the SCSI controllers and
+/// IOC3 must already be stopped when its renderer is torn down.
+#[test]
+fn the_octane_stops_its_disks_before_its_graphics() {
+    use crate::traits::Device;
+    let dir = scratch("octane-order");
+    let cfg = config(&dir, MachineProfile::OctaneIp30, GraphicsBoard::SolidImpact);
+    let mut machine = big_stack(move || crate::ip30_machine::OctaneMachine::new(&cfg).expect("Octane"));
+    let (scsi, ioc3) = (machine.scsi.clone(), machine.ioc3.clone());
+    let (probe, overlap) = Probe::watching(move || ioc3.is_running() || scsi.iter().any(|s| s.is_running()));
+    *machine.gfx.as_ref().expect("graphics").display().renderer_slot().lock() = Some(Box::new(probe.clone()));
+    machine.restart_peripherals();
+    assert!(!machine.scsi.is_empty() && machine.scsi.iter().all(|s| s.is_running()), "the SCSI controllers are running");
+    assert!(machine.ioc3.is_running(), "IOC3 is running");
+    machine.stop();
+    assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
+    assert!(!overlap.load(SeqCst), "a disk controller was still running when the graphics stopped");
+    let _ = std::fs::remove_dir_all(&dir);
 }

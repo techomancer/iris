@@ -1022,13 +1022,15 @@ impl Machine {
 
     pub fn stop(&mut self) {
         self.cpu.stop();
+        // Graphics last: a board's stop joins its display thread, which can
+        // fail to end, and the disks must be stopped by then.
+        self.hpc3.stop();
+        self.mc.stop();
+        if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
         if let Some(mgras) = &self.board.mgras { mgras.stop_display(); }
         if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
         if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
-        self.hpc3.stop();
-        self.mc.stop();
-        if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         // Idle -> Halted is not a lifecycle transition: a machine that was
         // never started has nothing to halt, and the monitor is not up to ask.
         if self.lifecycle != GuestState::Idle {
@@ -2244,5 +2246,34 @@ mod controller_lifetime_tests {
             let err = ctrl.execute_command(cmd, args, Box::new(std::io::sink())).unwrap_err();
             assert_eq!(err, "machine is not running", "{cmd}");
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_order_tests {
+    use super::*;
+    use crate::display_stop_tests::{big_stack, Probe};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    /// The graphics board can hang in its stop, so HPC3 must already be
+    /// stopped when its renderer is torn down.
+    #[test]
+    fn stopping_the_disks_comes_before_stopping_the_graphics() {
+        // A REX3 saves its shape corpus when it stops; keep it out of $HOME.
+        let dir = crate::display_stop_tests::scratch("indy-order");
+        let mut machine = big_stack(|| {
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], crate::config::CpuModel::default());
+            cfg.headless = false;
+            Box::new(Machine::new(cfg))
+        });
+        let hpc3 = machine.hpc3.clone();
+        let (probe, overlap) = Probe::watching(move || hpc3.is_running());
+        *machine.board.rex3.clone().expect("a Newport").renderer.lock() = Some(Box::new(probe.clone()));
+        machine.restart_peripherals();
+        assert!(machine.hpc3.is_running(), "HPC3 is running");
+        machine.stop();
+        assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
+        assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

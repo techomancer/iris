@@ -528,6 +528,18 @@ impl OctaneMachine {
         d
     }
 
+    /// Reverse of start order, but graphics last: its stop joins a display
+    /// thread, which can fail to end, and the disks must be stopped by then.
+    fn stop_devices(&self) {
+        // `devices` ends with the graphics board, if there is one.
+        for d in self.devices().iter().rev().skip(self.gfx.iter().count()) {
+            d.stop();
+        }
+        if let Some(g) = &self.gfx {
+            g.stop();
+        }
+    }
+
     pub fn start(&mut self) {
         if let Ok(starting) = self.lifecycle.transition(crate::machine_state::GuestState::Starting) {
             self.lifecycle = starting;
@@ -546,9 +558,7 @@ impl OctaneMachine {
     /// and IOC3 writes its NVRAM out.
     pub fn stop(&mut self) {
         self.stop_cpus();
-        for d in self.devices().iter().rev() {
-            d.stop();
-        }
+        self.stop_devices();
         // The guest clock points into this machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
@@ -622,9 +632,7 @@ impl Drop for OctaneMachine {
             slot.lock().0 = MachineRef::null();
         }
         self.stop_cpus();
-        for d in self.devices().iter().rev() {
-            d.stop();
-        }
+        self.stop_devices();
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
     }
