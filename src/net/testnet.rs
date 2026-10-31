@@ -74,8 +74,8 @@ impl TestNet {
     }
 
     /// Put a guest frame on the NIC ring and signal, as the enet thread does.
-    /// Unlike `send`, the engine meets it inside `step`, so its replies take
-    /// the held path (`next_pass`) the real guest sees.
+    /// Unlike `send`, the engine meets it inside `step`, as the real guest's
+    /// frames are.
     pub fn send_via_nic(&mut self, frame: Vec<u8>) {
         self.tx.push(frame).expect("NIC ring full");
         self.tx_wake.notify();
@@ -1224,9 +1224,10 @@ fn silent_dns_upstream_does_not_stall_the_engine() {
     assert!(silent.recv_from(&mut buf).is_ok(), "the query still reached the upstream");
 }
 
-/// Replies to guest frames are held briefly (see `step`), but the hold must
-/// not cost a whole poll tick: lock-step TFTP paid that once per 512-byte
-/// block, capping it near 450 KB/s on Linux and 30 KB/s on Windows.
+/// A reply to a guest frame goes on the ring in the pass that read the
+/// frame. Waiting for a later pass cost a poll tick per lock-step exchange:
+/// TFTP paid it once per 512-byte block, capping it near 450 KB/s on Linux
+/// and 30 KB/s on Windows.
 #[test]
 fn tftp_blocks_are_not_paced_by_the_poll_tick() {
     const BLOCKS: usize = 300;
@@ -1265,9 +1266,9 @@ fn tftp_blocks_are_not_paced_by_the_poll_tick() {
         let f = net.route_to(gw).udp(id, 4270, 69, &[0, 4, (block >> 8) as u8, block as u8]);
         net.send_via_nic(f);
         if block == 1 {
-            // The reply is held, and the engine asks to come back for it at once.
+            // One pass reads the ACK and puts the next DATA on the ring.
             net.run_pass();
-            assert_eq!(net.e.idle_timeout(), super::engine::REPLY_HOLD);
+            assert_eq!(net.inbox.len(), 1, "the reply to an ACK waited for a later pass");
         }
         got.extend_from_slice(&next_data(&mut net, block + 1)[4..]);
     }

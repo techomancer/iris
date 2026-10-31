@@ -35,11 +35,6 @@ const SNAPSHOT_EVERY: Duration = Duration::from_millis(200);
 /// Longest sleep with nothing to do: the coarse timers (UDP and service
 /// expiry, TFTP retransmission, reassembly, half-closed TCP) run at this rate.
 const HOUSEKEEPING: Duration = Duration::from_millis(100);
-/// How long a reply to a guest frame is held before it goes on the ring
-/// (see the FIXME in `step`). Long enough to land after IRIX's TX-completion
-/// interrupt, about a LAN round trip; far shorter than a 1 ms poll tick, which
-/// paced every lock-step exchange (TFTP, NFS, DNS) at one reply per tick.
-pub(super) const REPLY_HOLD: Duration = Duration::from_micros(150);
 
 pub struct NatEngine {
     pub(super) config: GatewayConfig,
@@ -54,12 +49,8 @@ pub struct NatEngine {
     pub(super) tcp_nat: HashMap<FlowKey, TcpConn>,
     pub(super) icmp_nat: HashMap<(u32, u16), NatIcmpEntry>, // key: (dst_ip, identifier)
     pub(super) icmp_unavailable: bool, // true after the first failed ICMP socket creation
-    // Frames for the guest not yet on the ring. Replies to guest frames wait
-    // for the next pass (`next_pass`) so they don't race the TX-completion
-    // interrupt in IRIX's handler; everything else goes at the end of this one.
+    // Frames for the guest not yet on the ring; they go at the end of the pass.
     to_guest: VecDeque<Vec<u8>>,
-    next_pass: VecDeque<Vec<u8>>,
-    handling_guest_frames: bool,
     pub(super) tcp_fwd_listeners: Vec<TcpFwdListener>,
     pub(super) udp_fwd_listeners: Vec<UdpFwdListener>,
     // Next source ports to try for synthesized inbound connections.
@@ -107,7 +98,7 @@ impl NatEngine {
         Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false,
-               to_guest: VecDeque::new(), next_pass: VecDeque::new(), handling_guest_frames: false,
+               to_guest: VecDeque::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
                fwd_ephemeral_next: 49152,
                fwd_reserved_next: 512,
@@ -157,20 +148,11 @@ impl NatEngine {
             }
         }
 
-        // FIXME: investigate the interrupt race between TX completion and RX
-        // delivery. A gateway reply generated synchronously while draining TX
-        // frames can reach IRIX while its TX-completion handler is still
-        // running; IRIX writes CLRINT, which clears *all* pending interrupts and
-        // drops the RX one. Holding replies for one pass masks it.
-        let held = std::mem::take(&mut self.next_pass);
-        self.to_guest.extend(held);
         self.flush_to_ring();
 
-        self.handling_guest_frames = true;
         while let Ok(frame) = self.tx_cons.pop() {
             self.process(&frame);
         }
-        self.handling_guest_frames = false;
 
         self.poll_udp();
         self.poll_tcp();
@@ -185,16 +167,11 @@ impl NatEngine {
         }
     }
 
-    /// How long the next wait may last: until the earliest timer, a moment
-    /// if frames are waiting for room on the ring, or just the reply hold if
-    /// only held replies are pending. The guest is usually idle waiting for
-    /// exactly that reply, so nothing else would end the wait early.
+    /// How long the next wait may last: until the earliest timer, or a
+    /// moment if frames are waiting for room on the ring.
     pub(super) fn idle_timeout(&self) -> Duration {
         if !self.to_guest.is_empty() {
             return Duration::from_millis(1);
-        }
-        if !self.next_pass.is_empty() {
-            return REPLY_HOLD;
         }
         let now = Instant::now();
         self.tcp_nat.values()
@@ -255,7 +232,7 @@ impl NatEngine {
         self.tx_wake.wait(timeout.min(Duration::from_millis(1)));
     }
 
-    /// A wait shorter than a millisecond (the reply hold) can't go through
+    /// A wait shorter than a millisecond (a timer about to expire) can't go through
     /// `poll(2)` or a condvar: both round it up to a whole tick, and Windows
     /// to its ~15.6 ms timer. Sleep instead. Host sockets and guest frames are
     /// not watched for that long, which costs nothing: the pass that follows
@@ -326,16 +303,12 @@ impl NatEngine {
         if self.ctl.dbg_tcp() {
             log_frame("<<", &frame);
         }
-        if self.handling_guest_frames {
-            self.next_pass.push_back(frame);
-        } else {
-            self.to_guest.push_back(frame);
-        }
+        self.to_guest.push_back(frame);
     }
 
     /// How many more frames a bulk producer (TCP) should queue now.
     pub(super) fn queue_room(&self) -> usize {
-        QUEUE_SOFT_LIMIT.saturating_sub(self.to_guest.len() + self.next_pass.len())
+        QUEUE_SOFT_LIMIT.saturating_sub(self.to_guest.len())
     }
 
     /// Move queued frames to the ring, in order, while it has room.

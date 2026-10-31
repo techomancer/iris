@@ -60,6 +60,33 @@ Verified 2026-10-23 on IRIX: TFTP download much faster; flood ping
 (`ping -f -q -c 20000 -s 1400` to the gateway) lost 1 packet on the first
 run and 0 on five more. No sign of the CLRINT race at 150 µs.
 
+## The hold is gone (2026-10-31)
+
+The CLRINT race the hold guarded against did not show up without it. On an
+Indy (IRIX 6.5.22, R4400), 4 MB TFTP gets had no retransmits with or
+without the hold. In two pairs of boots they took 8.6-10.2 and 9.0-14.9 s
+without it, 12.2-17.7 and 13.1-15.9 s with it (four or five gets each,
+man-page indexer running). IRIX's handler reads INTPEND, writes CLRINT,
+then reads the receive control register, so a frame finishing after the
+CLRINT needs a new interrupt, which the model raises.
+
+Frames are still lost in bulk TCP, with or without the hold, and the one
+loss traced (without it) was a full receive ring. The SEEQ thread copies
+whatever the NAT has queued into the ring as fast as the host runs, while
+the guest takes the interrupt on its own clock. In the first `rsh
+192.168.0.1 cat` of 4 MB after boot, with the man-page indexer busy, 26-27
+full-size frames went in before the handler ran, the channel stopped at
+the end-of-ring descriptor, and IRIX sometimes reset the interface
+(CH_RESET, reprogram the SEEQ, NDBP back to the ring's start) and re-armed
+the filled descriptors with the same buffers: frames the model counted as
+delivered that `netstat -i` never counted. TCP recovers them. The gap
+between `seeq status` rx_delivered and Ipkts after the first transfers was
+14 and 88 with the hold, 12, 26, 79 and 186 without, and 0 in other boots
+of each; later transfers do not add to it. A wire this fast is what makes
+it possible: a 10 Mb/s SEEQ cannot take a full frame faster than every 1.2
+ms. Pacing delivery to that, or to the guest's clock, is the fix if it
+matters.
+
 ## Still open
 
 - seeq-enet keeps its 1 ms wait (0.9% of a core idle): HPC3 kicks it only when
