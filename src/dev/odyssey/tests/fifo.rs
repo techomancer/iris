@@ -269,6 +269,70 @@ fn a_counted_store_is_credited_as_it_enters_the_fifo() {
     assert_eq!(pi.count("owe"), (stores - ODSY_CFIFO_DEPTH) as i64);
 }
 
+/// A run of stores the board's thread has looked at and then runs leaves
+/// the FIFO together. The stores run in order; the level, the store count
+/// and the credits end where taking the stores out one by one leaves them,
+/// including when a counted store joins the queue after the run was taken.
+#[test]
+fn a_run_retires_with_the_levels_and_credits_of_one_by_one() {
+    fn queue(s: &mut Board) {
+        s.front.lock().test_counted_stores = 0;
+        for _ in 0..70 {
+            s.mmio_write(ODSY_CMD_FIFO, 0, 8);
+        }
+    }
+    fn counted_join(s: &mut Board) {
+        s.front.lock().test_counted_stores = 1;
+        for _ in 0..10 {
+            s.mmio_write(ODSY_CMD_FIFO, 0, 8);
+        }
+    }
+    // One at a time: the store count and the credits are the reference.
+    let (mut one, pi_one) = credit_board();
+    queue(&mut one);
+    counted_join(&mut one);
+    for _ in 0..RUN_MAX {
+        step(&mut one);
+    }
+
+    let (mut run, pi_run) = credit_board();
+    queue(&mut run);
+    let mut taken = Run::new();
+    run.fifo.take_run(&mut taken);
+    assert_eq!(taken.stores().len(), RUN_MAX, "no counted store waits yet: a full run");
+    counted_join(&mut run);
+    assert_eq!(run.fifo.stores(), 80);
+    run.fifo.retire(&run.front, &taken, RUN_MAX);
+
+    assert_eq!(run.fifo.stores(), one.fifo.stores());
+    assert_eq!(run.fifo.level(), one.fifo.level());
+    assert_eq!(pi_run.count("repay"), pi_one.count("repay"));
+    assert_eq!(pi_run.count("return"), pi_one.count("return"));
+    assert_eq!(pi_run.count("owe"), pi_one.count("owe"));
+    assert!(pi_run.count("repay") > 0, "the run moved owed stores up");
+    // With a counted store waiting the next run is one store, as before.
+    run.fifo.take_run(&mut taken);
+    assert_eq!(taken.stores().len(), 1);
+}
+
+/// A slice cut short by its budget retires only the stores it ran: the rest
+/// stay queued, in order, for the next slice.
+#[test]
+fn a_slice_cut_short_leaves_the_rest_of_its_run_queued() {
+    let (mut s, _, ram) = queued_board();
+    push_fences(&mut s);
+    assert_eq!(s.fifo.stores(), 6);
+
+    s.work_step(&mut Budget::stores(4));
+    assert_eq!(s.fifo.stores(), 2);
+    assert_eq!(s.fifo.level(), 2);
+    assert_eq!(ram.half(HOST_WRITE_BASE + 4), 0x5a00, "the first fence ran");
+    assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0, "the second fence has stores left to run");
+
+    finish(&mut s);
+    assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0xa5a5);
+}
+
 /// A reset abandons the waiting stores and cancels each owed credit
 /// (one owe of -1 per owed store); stores not owed cancel nothing.
 #[test]

@@ -499,6 +499,43 @@ and pixel data is being lost", slot.addr, GFIFO_PAYLOAD);
         }
     }
 
+    /// Copy up to `out.len()` of the oldest entries head `h` has not
+    /// consumed into `out`, leaving them queued, and return how many. One
+    /// look at `tail` serves the whole run, where `peek_nth_at` looks once
+    /// per entry. Called only from head `h`'s thread.
+    #[inline]
+    pub fn peek_run_at(&self, h: usize, out: &mut [(u32, u64)]) -> usize {
+        let head = self.local_head[h].get();
+        let tail = self.tail.load(Ordering::Acquire);
+        self.shadow_tail[h].set(tail);
+        let n = (tail.wrapping_sub(head) & Self::MASK).min(out.len());
+        for (i, e) in out[..n].iter_mut().enumerate() {
+            // SAFETY: as in peek_at: the slots are published, and only this
+            // head's thread reads behind its own head.
+            let slot = unsafe { &*self.buf.as_ptr().add(head.wrapping_add(i) & Self::MASK) };
+            *e = (slot.addr, slot.val);
+        }
+        n
+    }
+
+    /// `consume_at` for the first `n` entries of a `peek_run_at` run, with one
+    /// look at `tail` and at most one publication of the head.
+    #[inline]
+    pub fn consume_n_at(&self, h: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let head = self.local_head[h].get();
+        let next_head = head.wrapping_add(n) & Self::MASK;
+        self.local_head[h].set(next_head);
+        let tail = self.tail.load(Ordering::Acquire);
+        // The head is published at each 64-entry boundary the run crosses,
+        // and whenever the run empties the queue (see `consume_at`).
+        if (head ^ next_head) >> 6 != 0 || next_head & 63 == 0 || next_head == tail {
+            self.head[h].store(next_head, Ordering::Release);
+        }
+    }
+
     #[inline]
     pub fn flush_head(&self) {
         self.flush_head_at(0)
@@ -615,6 +652,29 @@ mod tests {
         assert_eq!(f.peek_nth_at(0, 6), None, "not pushed");
         f.consume();
         assert_eq!(f.peek_nth_at(0, 4), Some((15, 15)));
+    }
+
+    #[test]
+    fn a_run_peeked_and_consumed_across_the_wrap_matches_one_at_a_time() {
+        let f: Box<GFifo<8>> = Box::new(GFifo::new());
+        for i in 0..5 {
+            assert!(f.try_push(i, 0));
+        }
+        f.consume_n_at(0, 5);
+        for i in 10..16 {
+            assert!(f.try_push(i, i as u64));
+        }
+        let mut run = [(0u32, 0u64); 4];
+        assert_eq!(f.peek_run_at(0, &mut run), 4);
+        assert_eq!(run, [(10, 10), (11, 11), (12, 12), (13, 13)]);
+        assert_eq!(f.len(), 6, "peeking consumes nothing");
+        f.consume_n_at(0, 4);
+        let mut rest = [(0u32, 0u64); 4];
+        assert_eq!(f.peek_run_at(0, &mut rest), 2, "only what was pushed");
+        assert_eq!(rest[..2], [(14, 14), (15, 15)]);
+        f.consume_n_at(0, 2);
+        assert!(f.is_empty(), "the run that empties the queue publishes the head");
+        assert_eq!(f.peek_run_at(0, &mut rest), 0);
     }
 
     #[test]

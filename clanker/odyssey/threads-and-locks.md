@@ -123,7 +123,13 @@ The PROM's and IRIX's textports send hundreds of thousands of FIFO words per
 scrolled line, so a store must cost little. Stores go into iris's shared
 `GFifo` (`src/gfifo.rs`, 64K entries; `fifo.rs` wraps it). The processor
 pushes without the front lock and wakes the worker only when it sleeps. The
-consumer, whoever holds the board lock (worker or a draining access), pops.
+consumer, whoever holds the board lock (worker or a draining access), looks
+at up to 32 stores, runs them, and takes the ones it ran out together
+(`CommandFifo::take_run`, `retire`): the level, the store count and the
+credits move once a run, not once a store, because each store costs the
+worker little and the processor reads those words. A store that has run but
+not retired still counts in the level, so the level never reads below what the
+board has left to take. While a counted store waits a run is one store.
 While the worker runs every command store queues, so decoding and drawing
 never run on the processor's thread.
 

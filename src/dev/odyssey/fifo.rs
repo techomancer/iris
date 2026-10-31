@@ -88,6 +88,26 @@ pub fn store_words(size: u32) -> u32 {
     if size == 8 { 2 } else { 1 }
 }
 
+/// The most stores the board's thread takes out of the FIFO at a time.
+pub const RUN_MAX: usize = 32;
+
+/// Stores the board's thread has looked at and is running (`take_run`).
+pub struct Run {
+    stores: [QueuedStore; RUN_MAX],
+    len: usize,
+}
+
+impl Run {
+    pub fn new() -> Self {
+        Run { stores: [QueuedStore { value: 0, addr: 0, size: 0, counted: false, owed: false }; RUN_MAX], len: 0 }
+    }
+
+    /// The stores to run, oldest first.
+    pub fn stores(&self) -> &[QueuedStore] {
+        &self.stores[..self.len]
+    }
+}
+
 pub struct CommandFifo {
     ring: Box<CommandRing>,
     /// Serialises the producers: the processor's front stores and stores
@@ -262,21 +282,66 @@ impl CommandFifo {
         true
     }
 
-    /// The oldest waiting store, and the level after it left. The next
-    /// waiting store moves into the FIFO's last credited place and is
-    /// credited.
-    pub fn pop(&self, front: &Mutex<HostInterface>) -> Option<(QueuedStore, u32)> {
-        let _c = self.pop.lock();
-        let (addr, value) = self.ring.peek()?;
-        self.ring.consume();
-        let q = QueuedStore::from_entry(addr, value);
-        let after = self.words.fetch_sub(q.words(), SeqCst) - q.words();
-        let stores_after = self.stores.fetch_sub(1, SeqCst) - 1;
-        if q.counted {
-            self.counted.fetch_sub(1, SeqCst);
+    /// Look at the oldest waiting stores, up to `RUN_MAX`, without taking
+    /// them out; the caller runs them, then `retire`s the ones it ran. While
+    /// a counted store waits the run is one store, so each credit is settled
+    /// as that store leaves, as it always was.
+    pub fn take_run(&self, run: &mut Run) {
+        let max = if self.counted.load(SeqCst) != 0 { 1 } else { RUN_MAX };
+        let mut raw = [(0u32, 0u64); RUN_MAX];
+        run.len = self.ring.peek_run_at(0, &mut raw[..max]);
+        for (store, (addr, value)) in run.stores.iter_mut().zip(&raw[..run.len]) {
+            *store = QueuedStore::from_entry(*addr, *value);
         }
-        if stores_after >= ODSY_CFIFO_DEPTH && self.counted.load(SeqCst) != 0 {
-            if let Some((addr, value)) = self.ring.peek_nth_at(0, ODSY_CFIFO_DEPTH as usize - 1) {
+    }
+
+    /// Take the first `n` stores of `run` out of the FIFO: they have run. The
+    /// level, the stores waiting and the credits move once for the run, not
+    /// once per store, which is what the board's thread spends most of its
+    /// time on when each store costs little to decode. A store the thread has
+    /// run but not retired still counts in the level, so the level never
+    /// reads lower than the words the board has yet to take.
+    ///
+    /// The low-water flag latches if the run takes the level from the mark
+    /// or above to below it. The flag is set before the level falls, under the
+    /// front lock a status read also takes, so a read sees the flag whenever
+    /// it sees the level below the mark.
+    pub fn retire(&self, front: &Mutex<HostInterface>, run: &Run, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let ran = &run.stores[..n];
+        let words: u32 = ran.iter().map(QueuedStore::words).sum();
+        let counted_ran = ran.iter().filter(|q| q.counted).count() as u32;
+        let _c = self.pop.lock();
+        self.ring.consume_n_at(0, n);
+        if self.words.load(SeqCst) < ODSY_CFIFO_LOW_WATER + words {
+            let mut f = front.lock();
+            let before = self.words.fetch_sub(words, SeqCst);
+            if before >= ODSY_CFIFO_LOW_WATER && before - words < ODSY_CFIFO_LOW_WATER {
+                f.intr_flags |= ODSY_INTR_FIFO_LOW_WATER;
+                crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, before - words);
+                f.update_irq();
+            }
+        } else {
+            self.words.fetch_sub(words, SeqCst);
+        }
+        let stores_before = self.stores.fetch_sub(n as u32, SeqCst);
+        if counted_ran != 0 {
+            self.counted.fetch_sub(counted_ran, SeqCst);
+        }
+        if self.counted.load(SeqCst) == 0 {
+            return;
+        }
+        // The next waiting store moves into the FIFO's last credited place
+        // and is credited.
+        for k in 1..=n as u32 {
+            if stores_before - k < ODSY_CFIFO_DEPTH {
+                continue;
+            }
+            // The run is already out of the ring, so count back from its head.
+            let place = ODSY_CFIFO_DEPTH as usize - 1 - (n - k as usize);
+            if let Some((addr, value)) = self.ring.peek_nth_at(0, place) {
                 let entered = QueuedStore::from_entry(addr, value);
                 let mut f = front.lock();
                 if entered.owed {
@@ -288,7 +353,6 @@ impl CommandFifo {
                 }
             }
         }
-        Some((q, after))
     }
 
     /// Abandon every waiting store; an owed one outside the FIFO gives its

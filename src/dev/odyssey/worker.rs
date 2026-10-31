@@ -155,18 +155,27 @@ impl Board {
         }
 
         let fifo = self.fifo.clone();
-        while let Some((q, after)) = fifo.pop(&self.front) {
-            self.write_dispatch(q.addr as u64, q.value, q.size as u32);
-            // Falling below the low-water mark as the store retires latches
-            // the low-water flag, whatever the enable mask says.
-            if after + q.words() >= ODSY_CFIFO_LOW_WATER && fifo.level() < ODSY_CFIFO_LOW_WATER {
-                let mut f = self.front.lock();
-                f.intr_flags |= ODSY_INTR_FIFO_LOW_WATER;
-                crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, fifo.level());
-                f.update_irq();
-            }
-            if b.spent() {
+        let mut run = Run::new();
+        'slice: loop {
+            fifo.take_run(&mut run);
+            if run.stores().is_empty() {
                 break;
+            }
+            let mut ran = 0;
+            let mut spent = false;
+            for q in run.stores() {
+                self.write_dispatch(q.addr as u64, q.value, q.size as u32);
+                ran += 1;
+                if b.spent() {
+                    spent = true;
+                    break;
+                }
+            }
+            // The low-water flag latches as the stores retire below the
+            // mark (CommandFifo::retire).
+            fifo.retire(&self.front, &run, ran);
+            if spent {
+                break 'slice;
             }
         }
         if fifo.pending() {
