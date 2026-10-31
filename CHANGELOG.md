@@ -329,6 +329,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   PROM's. An uncached fetch now keys a code page of its own and is compiled and
   invalidated through the view the CPU fetched it by. Other machines are
   unchanged.
+- Marking an ECC doubleword or a directory line in Bedrock's memory no longer
+  rebuilds the whole memory map. The PROM's memory test marks and lifts a few
+  hundred of them thousands of times. A mark now changes only its own page,
+  and a lifted mark's page stays on Bedrock's checking path until a batch
+  returns it.
 
 ### PCI configuration
 

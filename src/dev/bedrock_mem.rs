@@ -15,10 +15,17 @@
 //! window, so cache fills cannot bypass those checks.
 //!
 //! Remapping runs on the CPU thread, or with the CPU stopped, as HEART's
-//! memory descriptors do. DMA may remove diagnostic metadata but retains
-//! the slow mapping until the next CPU-side rebuild. Physical publishes
-//! complete decode-table pages atomically; a concurrent bus master sees an
-//! old or new entry. This does not promise a transaction across a remap.
+//! memory descriptors do. A bank configuration change rebuilds the whole
+//! map. Marking a page adds only that page: it takes its entry in the decode
+//! table, and the first in a 64 MiB region takes the region out of the direct
+//! window. Lifting a mark removes nothing. The page stays on the MD endpoint,
+//! which answers as the bank would, until a batch retires every lifted page
+//! at once: the PROM's memory test marks and lifts the same few hundred pages
+//! thousands of times, and a map change for each made it take minutes in the
+//! QEMU model. DMA may remove diagnostic metadata but retains the slow
+//! mapping until a later retirement. Physical publishes complete
+//! decode-table pages atomically; a concurrent bus master sees an old or new
+//! entry. This does not promise a transaction across a remap.
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
@@ -27,7 +34,7 @@ use crate::traits::*;
 use crate::ppmem::devmap::SLOT_SHIFT;
 use crate::ppmem::{MappedMemory, BITMAP_SHIFT, WINDOW_SIZE};
 use parking_lot::Mutex;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -180,13 +187,28 @@ struct Run {
     size: u64,
 }
 
+/// Lifted pages kept on the MD endpoint before a batch retires them.
+pub(crate) const RETIRED_LIMIT: usize = 1024;
+/// How long a lifted page may idle before the next publication retires it:
+/// a second of the controller's clock.
+pub(crate) const RETIRED_IDLE_NS: u64 = 1_000_000_000;
+
 #[derive(Default)]
 struct Mapping {
     runs: Vec<Run>,
     /// Whether the decode table's slots over the startup window hold the page.
     startup_placed: bool,
-    // Bank-relative 4 KiB page numbers, bank 1 immediately after bank 0.
-    slow_pages: BTreeSet<u64>,
+    /// The pages that answer through the MD endpoint: those with a mark and
+    /// those whose mark was lifted since the last retirement. Bank-relative
+    /// 4 KiB page numbers, bank 1 immediately after bank 0.
+    placed: BTreeSet<u64>,
+    /// How many placed pages each 64 MiB region of the node's address space
+    /// holds, for the regions inside a run.
+    held: HashMap<u64, u32>,
+    /// The regions mapped into the direct window now.
+    windowed: HashSet<u64>,
+    /// When the first lifted page was seen idle, on the controller's clock.
+    idle_since: Option<u64>,
     slow: Option<Arc<dyn BusDevice>>,
 }
 
@@ -386,13 +408,32 @@ impl BedrockMemory {
     /// Publish a state snapshot after releasing MD's lock. Only the CPU
     /// thread, or a caller with the CPU stopped, may change ppmem's bitmap.
     /// A forced rebuild follows the machine setting Physical's default.
-    pub(crate) fn remap(&self, config: u64, slow_pages: BTreeSet<u64>, force: bool) {
+    /// This is the whole-map rebuild: `pages` replaces every placed page, so
+    /// it retires the lifted ones too. Without `force` it does nothing when
+    /// neither the runs nor the placed pages would change.
+    pub(crate) fn remap(&self, config: u64, pages: BTreeSet<u64>, force: bool) {
         let runs = self.runs(config);
         let mut old = self.mapping.lock();
-        if !force && old.runs == runs && old.slow_pages == slow_pages {
+        if !force && old.runs == runs && old.placed == pages {
             self.config.store(config, Ordering::Release);
             return;
         }
+        self.rebuild(&mut old, config, runs, pages);
+    }
+
+    /// The bank configuration register changed to `config`. Rebuild, with
+    /// the marked `pages`, only if it changes which banks answer where.
+    pub(crate) fn reconfigure(&self, config: u64, pages: impl FnOnce() -> BTreeSet<u64>) {
+        let runs = self.runs(config);
+        let mut old = self.mapping.lock();
+        if old.runs == runs {
+            self.config.store(config, Ordering::Release);
+            return;
+        }
+        self.rebuild(&mut old, config, runs, pages());
+    }
+
+    fn rebuild(&self, old: &mut Mapping, config: u64, runs: Vec<Run>, pages: BTreeSet<u64>) {
         let phys = &self.physical;
         let space = phys.ppmem_space();
         // Withdraw the direct window before publishing any checked page.
@@ -418,17 +459,18 @@ impl BedrockMemory {
                     (run.size - retained) >> SLOT_SHIFT, phys.default_entry());
             }
         }
+        old.held.clear();
+        old.windowed.clear();
+        old.idle_since = None;
         for run in &runs {
             #[cfg(test)]
             Cost::add(&self.cost.table_ops, 1);
             phys.fill_slots(run.base >> SLOT_SHIFT, run.size >> SLOT_SHIFT, phys.bank_view(run.bank, run.base));
             let bank_page = self.dense_base(run.bank as u64) >> SLOT_SHIFT;
-            let pages = run.size >> SLOT_SHIFT;
-            let mut checked_regions = BTreeSet::new();
-            for &page in slow_pages.range(bank_page..bank_page + pages) {
-                let offset = (page - bank_page) << SLOT_SHIFT;
-                let address = run.base + offset;
-                checked_regions.insert(offset >> BITMAP_SHIFT);
+            let run_pages = run.size >> SLOT_SHIFT;
+            for &page in pages.range(bank_page..bank_page + run_pages) {
+                let address = run.base + ((page - bank_page) << SLOT_SHIFT);
+                *old.held.entry(address >> BITMAP_SHIFT).or_default() += 1;
                 #[cfg(test)]
                 Cost::add(&self.cost.table_ops, 1);
                 phys.map(address, address + (1 << SLOT_SHIFT),
@@ -440,14 +482,16 @@ impl BedrockMemory {
                     // The startup page answers through the decode only, so the
                     // region holding it stays out of the direct window.
                     let startup = self.startup_live() && run.base + offset == 0;
+                    let region = (run.base + offset) >> BITMAP_SHIFT;
                     // Above the window the bank answers through the table alone.
                     let in_window = run.base + offset + region_size <= WINDOW_SIZE;
-                    if in_window && !startup && !checked_regions.contains(&(offset >> BITMAP_SHIFT)) {
+                    if in_window && !startup && !old.held.contains_key(&region) {
                         #[cfg(test)]
                         Cost::add(&self.cost.window_ops, 1);
-                        if let Err(error) = space.map_range(run.bank, offset, run.base + offset, region_size) {
-                            crate::dlog!(crate::devlog::LogModule::Bedrock,
-                                "Bedrock RAM window at {:#x}: {error}", run.base + offset);
+                        match space.map_range(run.bank, offset, run.base + offset, region_size) {
+                            Ok(()) => { old.windowed.insert(region); }
+                            Err(error) => crate::dlog!(crate::devlog::LogModule::Bedrock,
+                                "Bedrock RAM window at {:#x}: {error}", run.base + offset),
                         }
                     }
                 }
@@ -467,7 +511,148 @@ impl BedrockMemory {
         // so an in-flight compile cannot accept bytes from the old decode.
         self.changed_decode();
         old.runs = runs;
-        old.slow_pages = slow_pages;
+        old.placed = pages;
+    }
+
+    /// Where bank-relative `page` lies in the run holding it: the run, and the
+    /// page's byte offset in the bank.
+    fn locate(&self, runs: &[Run], page: u64) -> Option<(Run, u64)> {
+        runs.iter().find_map(|run| {
+            let first = self.dense_base(run.bank as u64) >> SLOT_SHIFT;
+            (first..first + (run.size >> SLOT_SHIFT)).contains(&page)
+                .then(|| (*run, (page - first) << SLOT_SHIFT))
+        })
+    }
+
+    /// Whether `address` lies in the startup window while its page stands.
+    fn in_startup(&self, address: u64) -> bool {
+        self.startup_live() && (STARTUP_BASE..STARTUP_BASE + STARTUP_SIZE).contains(&address)
+    }
+
+    /// Advance the counters of `pages` 4 KiB pages starting at `address`, the
+    /// bank's offset `offset` for the same bytes.
+    fn bump_pages(&self, _address: u64, _bank: usize, _offset: u64, _pages: u64) {
+        #[cfg(feature = "jitv2")]
+        {
+            for page in 0.._pages {
+                self.generations.bump(_address + (page << SLOT_SHIFT));
+                self.physical.banks()[_bank].bump_gen_off((_offset + (page << SLOT_SHIFT)) as usize);
+            }
+            #[cfg(test)]
+            Cost::add(&self.cost.bumps, 2 * _pages as usize);
+        }
+    }
+
+    /// Route the pages in `marked` through the MD endpoint, adding to what is
+    /// placed and changing nothing else. A page already placed, as a lifted
+    /// one marked again is, costs no map change. The first page in a region
+    /// takes the region out of the direct window, and a page whose mapping
+    /// changes advances its counters, so code compiled from it, or from the
+    /// region's direct path, is dropped. CPU thread only, as `remap`.
+    pub(crate) fn place(&self, marked: &[u64]) {
+        let mut m = self.mapping.lock();
+        let phys = &self.physical;
+        let space = phys.ppmem_space();
+        let region_size = 1u64 << BITMAP_SHIFT;
+        for &page in marked {
+            if !m.placed.insert(page) {
+                continue;
+            }
+            let Some((run, offset)) = self.locate(&m.runs, page) else { continue };
+            let address = run.base + offset;
+            let region = address >> BITMAP_SHIFT;
+            *m.held.entry(region).or_default() += 1;
+            // Withdraw the direct window before publishing the checked page.
+            if m.windowed.remove(&region) {
+                if let Some(space) = space {
+                    #[cfg(test)]
+                    Cost::add(&self.cost.window_ops, 1);
+                    space.unmap_range(region << BITMAP_SHIFT, region_size);
+                }
+                self.bump_pages(region << BITMAP_SHIFT, run.bank,
+                    offset & !(region_size - 1), region_size >> SLOT_SHIFT);
+            } else {
+                self.bump_pages(address, run.bank, offset, 1);
+            }
+            if !self.in_startup(address) {
+                #[cfg(test)]
+                Cost::add(&self.cost.table_ops, 1);
+                phys.map(address, address + (1 << SLOT_SHIFT),
+                    m.slow.as_ref().expect("Bedrock MD slow endpoint").clone(), "Bedrock checked RAM");
+            }
+        }
+    }
+
+    /// Whether the lifted pages are due to be retired: `active` pages of the
+    /// placed ones still hold a mark, and `now` is the controller's clock if
+    /// it has one. Due when too many lifted pages have piled up, or when the
+    /// first has idled for a second. Notes the time it first sees one.
+    pub(crate) fn retirement_due(&self, active: usize, now: Option<u64>) -> bool {
+        let mut m = self.mapping.lock();
+        if m.placed.len() <= active {
+            m.idle_since = None;
+            return false;
+        }
+        if m.placed.len() - active >= RETIRED_LIMIT {
+            return true;
+        }
+        match (now, m.idle_since) {
+            (Some(now), Some(since)) => now.saturating_sub(since) >= RETIRED_IDLE_NS,
+            (Some(now), None) => { m.idle_since = Some(now); false }
+            _ => false,
+        }
+    }
+
+    /// The placed pages for which `marked` is false, in order.
+    pub(crate) fn lifted(&self, marked: impl Fn(u64) -> bool) -> Vec<u64> {
+        self.mapping.lock().placed.iter().copied().filter(|&page| !marked(page)).collect()
+    }
+
+    /// Return every page of `lifted` to its bank in one change: its table
+    /// entry, then the direct window for each region left with no placed
+    /// page. The pages' counters advance as for any change of mapping. CPU
+    /// thread only, as `remap`.
+    pub(crate) fn retire(&self, lifted: &[u64]) {
+        let mut m = self.mapping.lock();
+        let phys = &self.physical;
+        let space = phys.ppmem_space();
+        let region_size = 1u64 << BITMAP_SHIFT;
+        let mut emptied = Vec::new();
+        for &page in lifted {
+            if !m.placed.remove(&page) {
+                continue;
+            }
+            let Some((run, offset)) = self.locate(&m.runs, page) else { continue };
+            let address = run.base + offset;
+            let region = address >> BITMAP_SHIFT;
+            if !self.in_startup(address) {
+                #[cfg(test)]
+                Cost::add(&self.cost.table_ops, 1);
+                phys.fill_slots(address >> SLOT_SHIFT, 1, phys.bank_view(run.bank, run.base));
+            }
+            self.bump_pages(address, run.bank, offset, 1);
+            let held = m.held.get_mut(&region).expect("a placed page's region is held");
+            *held -= 1;
+            if *held == 0 {
+                m.held.remove(&region);
+                emptied.push((region, run, offset & !(region_size - 1)));
+            }
+        }
+        // Return a region to the window only once none of its pages is placed.
+        for (region, run, offset) in emptied {
+            let startup = self.startup_live() && region == 0;
+            let in_window = (region + 1) << BITMAP_SHIFT <= WINDOW_SIZE;
+            if let (Some(space), true, false) = (space, in_window, startup) {
+                #[cfg(test)]
+                Cost::add(&self.cost.window_ops, 1);
+                match space.map_range(run.bank, offset, region << BITMAP_SHIFT, region_size) {
+                    Ok(()) => { m.windowed.insert(region); }
+                    Err(error) => crate::dlog!(crate::devlog::LogModule::Bedrock,
+                        "Bedrock RAM window at {:#x}: {error}", region << BITMAP_SHIFT),
+                }
+            }
+        }
+        m.idle_since = None;
     }
 
     pub(crate) fn decode(&self, config: u64, addr: u64, bytes: u64) -> Option<(usize, u64)> {

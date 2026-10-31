@@ -835,6 +835,50 @@ impl PpMemSpace {
         Ok(())
     }
 
+    /// Return `at..at + len` of the window, and its counters, to unmapped.
+    fn scrub_range(&self, at: u64, len: u64) {
+        // Best-effort: a failure here leaves the range mapped, which is
+        // still safe — it just isn't reverted.
+        // `scrub`, not `unmap`: see `AddrSpace::scrub`.
+        let _ = unsafe { self.space.scrub(at as usize, len as usize) };
+        #[cfg(feature = "jitv2")]
+        {
+            let gen_off = at / GEN_RATIO;
+            let gen_len = len / GEN_RATIO;
+            let gran = super::map::granularity() as u64;
+            if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 {
+                let _ = unsafe { self.gen_space.scrub(gen_off as usize, gen_len as usize) };
+            }
+        }
+    }
+
+    /// Withdraw `offset..offset + size` from the window, leaving whatever
+    /// else was mapped. A mapping that only partly overlaps keeps the rest,
+    /// but a bitmap bit stays set only for a region still wholly mapped, so
+    /// withdrawing part of a region takes the whole region off the direct
+    /// path.
+    pub fn unmap_range(&self, offset: u64, size: u64) {
+        assert!(offset + size <= self.window_size(), "ppmem: [{offset:#x}, +{size:#x}) escapes the window");
+        let st = unsafe { &mut *self.state.get() };
+        let end = offset + size;
+        let mut kept = Vec::with_capacity(st.mappings.len() + 1);
+        for m in std::mem::take(&mut st.mappings) {
+            if m.at >= end || m.at + m.len <= offset {
+                kept.push(m);
+                continue;
+            }
+            self.scrub_range(m.at.max(offset), (m.at + m.len).min(end) - m.at.max(offset));
+            if m.at < offset {
+                kept.push(Mapping { at: m.at, len: offset - m.at });
+            }
+            if m.at + m.len > end {
+                kept.push(Mapping { at: end, len: m.at + m.len - end });
+            }
+        }
+        st.mappings = kept;
+        Self::recompute_bitmap(st);
+    }
+
     /// Recompute the bitmap from the live mapping list.
     ///
     /// A bit is set only if the whole region (64MB in a 4GB window) is covered, so a region that
@@ -903,21 +947,7 @@ impl MappedMemory for PpMemSpace {
     fn clear_mappings(&self) {
         let st = unsafe { &mut *self.state.get() };
         for m in std::mem::take(&mut st.mappings) {
-            // Best-effort: a failure here leaves the range mapped, which is
-            // still safe — it just isn't reverted.
-            // `scrub`, not `unmap`: see `AddrSpace::scrub`.
-            let _ = unsafe { self.space.scrub(m.at as usize, m.len as usize) };
-            #[cfg(feature = "jitv2")]
-            {
-                let gen_off = m.at / GEN_RATIO;
-                let gen_len = m.len / GEN_RATIO;
-                let gran = super::map::granularity() as u64;
-                if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 {
-                    let _ = unsafe {
-                        self.gen_space.scrub(gen_off as usize, gen_len as usize)
-                    };
-                }
-            }
+            self.scrub_range(m.at, m.len);
         }
         unsafe {
             *st.sink = 0;
@@ -1495,6 +1525,29 @@ mod tests {
         assert_ne!(space.mapped_bitmap(), 0);
         space.clear_mappings();
         assert_eq!(space.mapped_bitmap(), 0, "bitmap not cleared");
+    }
+
+    /// Withdrawing one region takes only its bit and leaves the regions
+    /// either side mapped; mapping it again brings the bit back with the
+    /// bank's bytes behind it.
+    #[test]
+    fn unmap_range_withdraws_one_region_and_remap_restores_it() {
+        let (space, banks) = PpMemSpace::with_bank_sizes(&[192]).unwrap();
+        let region = 64 * MB as u64;
+        for i in 0..3 {
+            space.map_range(0, i * region, i * region, region).unwrap();
+        }
+        assert_eq!(space.mapped_bitmap(), 0b111);
+        banks[0].write64(region, 0x1234);
+        space.unmap_range(region, region);
+        assert_eq!(space.mapped_bitmap(), 0b101);
+        assert_eq!(space.mapping_count(), 2);
+        space.map_range(0, region, region, region).unwrap();
+        assert_eq!(space.mapped_bitmap(), 0b111);
+        assert_eq!(banks[0].read64(region).data, 0x1234, "the bank keeps its bytes");
+        // Part of a region leaves the whole region off the direct path.
+        space.unmap_range(region + 0x1000, 0x1000);
+        assert_eq!(space.mapped_bitmap(), 0b101);
     }
 
     /// The low-512KB alias: bank 0's first 512KB visible at physical 0, the
