@@ -567,6 +567,54 @@ fn reset_then_power_off() {
     round_trip(Machine::Indy, &[Exit::PowerOff], true, true)
 }
 
+/// A machine that records the order of its `stop` and `flush_disks` calls.
+struct Probe(Box<dyn Workstation>, std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+impl Workstation for Probe {
+    fn start(&mut self) { self.0.start() }
+    fn stop(&mut self) {
+        self.1.lock().unwrap().push("stop");
+        self.0.stop()
+    }
+    fn reset(&mut self) { self.0.reset() }
+    fn restart_peripherals(&mut self) { self.0.restart_peripherals() }
+    fn cpu_start(&self) { self.0.cpu_start() }
+    fn cpu_is_running(&self) -> bool { self.0.cpu_is_running() }
+    fn machine_slot(&mut self) -> workstation::MachineSlot { self.0.machine_slot() }
+    fn register_system_controller(&mut self) { self.0.register_system_controller() }
+    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.0.monitor_addr() }
+    fn lifecycle(&self) -> crate::machine_state::GuestState { self.0.lifecycle() }
+    fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.0.set_lifecycle(state) }
+    fn get_display(&self) -> Option<std::sync::Arc<dyn crate::gfx_display::GfxDisplay>> { self.0.get_display() }
+    fn get_ps2(&self) -> std::sync::Arc<crate::dev::ps2::Ps2Controller> { self.0.get_ps2() }
+    fn register_monitor_device(&self, device: std::sync::Arc<dyn crate::traits::Device>) { self.0.register_monitor_device(device) }
+    fn get_timer_manager(&self) -> std::sync::Arc<crate::hptimer::TimerManager> { self.0.get_timer_manager() }
+    fn get_cpu_debug(&self) -> std::sync::Arc<dyn crate::gdb_stub::CpuDebug> { self.0.get_cpu_debug() }
+    fn fasttick_count(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> { self.0.fasttick_count() }
+    fn get_ci_serial(&self) -> Option<std::sync::Arc<crate::dev::serial_host::CiSerialBackend>> { self.0.get_ci_serial() }
+    fn inject_serial_console(&self, bytes: &[u8]) { self.0.inject_serial_console(bytes) }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self.0.as_any_mut() }
+    fn flush_disks(&self) -> std::io::Result<()> {
+        self.1.lock().unwrap().push("flush");
+        self.0.flush_disks()
+    }
+}
+
+/// `stop_and_flush` itself: flush, stop, flush. Flushing first is for a stop
+/// that hangs, flushing after for the writes a running stop lets through.
+#[test]
+fn stop_and_flush_flushes_before_and_after_the_stop() {
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("order");
+        make_images(&dir);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut m = Probe(build(config(Machine::Indy, &dir, false)), log.clone());
+        let _ = workstation::stop_and_flush(&mut m, "test");
+        assert_eq!(*log.lock().unwrap(), ["flush", "stop", "flush"]);
+    });
+}
+
 /// The O2's own `stop` leaves its disks durable, not only the exits that call
 /// `stop_and_flush`.
 #[test]

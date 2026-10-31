@@ -374,8 +374,10 @@ pub fn stop_and_flush(machine: &mut dyn Workstation, at: &str) -> Flushed {
     Flushed(())
 }
 
-/// Proof that the disks were flushed, for [`exit_process`]. Only the functions
-/// here make one, so an exit cannot be handed work that does not flush.
+/// What [`exit_process`] asks its caller's work to return, so that handing it
+/// nothing does not compile. A nudge in the type, not a proof: `flushed` is
+/// public and will vouch for any result, so what the work really does is for
+/// the machine tests to check.
 #[must_use]
 pub struct Flushed(());
 

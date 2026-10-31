@@ -761,10 +761,18 @@ impl BlockNode for ChdNode {
             .to_string();
 
         self.hd = None; // close so flatten_diff can rename over the base
+        self.closed = Some(ClosedChd {
+            base: base_str,
+            cow,
+            overlay: Some((base.clone(), diff.clone())),
+            pending: None,
+            dirty: true,
+        });
         let folded = crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false);
         // base + diff are intact even when the fold failed, so either way the
         // disk can be reopened; surface the fold error after restoring the node.
-        self.hd = Some(ChdHd::open(&base_str, cow)?);
+        // A reopen that fails leaves `closed` for the next command to retry.
+        self.ensure_open()?;
         self.unflushed = false;
         folded?;
         Ok(1)
@@ -784,8 +792,15 @@ impl BlockNode for ChdNode {
             .to_string();
 
         self.hd = None; // close before reopening over the (untouched) base
+        self.closed = Some(ClosedChd {
+            base: base_str,
+            cow,
+            overlay: Some((base.clone(), diff.clone())),
+            pending: None,
+            dirty: false,
+        });
         let _ = std::fs::remove_file(&diff);
-        self.hd = Some(ChdHd::open(&base_str, cow)?);
+        self.ensure_open()?;
         self.unflushed = false;
         Ok(())
     }
@@ -1200,6 +1215,72 @@ mod tests {
         drop(node);
         let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
         let _ = std::fs::remove_file(base);
+    }
+
+    /// A CHD node whose base has been moved away and whose flush has failed
+    /// to reopen it. Returns the node and the paths to put the base back.
+    fn closed_chd_node() -> (ChdNode, PathBuf, PathBuf) {
+        let base = compressed_chd(0xAB);
+        let away = base.with_extension("away");
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
+        std::fs::rename(&base, &away).unwrap();
+        assert!(node.flush().is_err());
+        (node, base, away)
+    }
+
+    fn remove_chd(base: &Path) {
+        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(base));
+        let _ = std::fs::remove_file(base);
+    }
+
+    /// Writing, committing or rolling back a node whose reopen failed is an
+    /// error while the file is missing, not a panic, and works once it is back.
+    #[test]
+    fn chd_commands_on_a_node_that_could_not_reopen_retry() {
+        let (mut node, base, away) = closed_chd_node();
+        assert!(node.write(0, &[1; SECTOR_BYTES]).is_err());
+        assert!(node.commit().is_err());
+        assert!(node.rollback().is_err());
+        std::fs::rename(&away, &base).unwrap();
+        node.write(0, &[1; SECTOR_BYTES]).unwrap();
+        drop(node);
+
+        let (mut node, base2, away2) = closed_chd_node();
+        std::fs::rename(&away2, &base2).unwrap();
+        node.commit().unwrap();
+        drop(node);
+
+        let (mut node, base3, away3) = closed_chd_node();
+        std::fs::rename(&away3, &base3).unwrap();
+        node.rollback().unwrap();
+        let mut got = [0u8; SECTOR_BYTES];
+        node.read(9 * SECTOR_SIZE, &mut got).unwrap();
+        assert_eq!(got, [0xAB; SECTOR_BYTES], "rolled back to the base");
+        drop(node);
+        for b in [base, base2, base3] {
+            remove_chd(&b);
+        }
+    }
+
+    /// A commit or rollback whose own reopen fails leaves the node to retry,
+    /// not without a handle.
+    #[test]
+    fn chd_commit_and_rollback_that_cannot_reopen_leave_a_retryable_node() {
+        for rollback in [false, true] {
+            let base = compressed_chd(0xAB);
+            let away = base.with_extension("away");
+            let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+            node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
+            std::fs::rename(&base, &away).unwrap();
+            let r = if rollback { node.rollback().map(|_| 0) } else { node.commit() };
+            assert!(r.is_err(), "rollback={rollback}: nothing to reopen");
+            std::fs::rename(&away, &base).unwrap();
+            let mut got = [0u8; SECTOR_BYTES];
+            node.read(0, &mut got).unwrap();
+            drop(node);
+            remove_chd(&base);
+        }
     }
 
     #[test]
