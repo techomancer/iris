@@ -51,6 +51,12 @@ pub struct L1Config {
     pub mac: [u8; 6],
     pub brick_serial: Option<String>,
     pub auto_power: bool,
+    /// First integer of the port-speed reply (request 0xa). The PROM uses it
+    /// to select a display branch; it is not a link speed. Zero or one.
+    pub port_speed_first: u32,
+    /// Answer the router command-interpreter `brick` request. Only the brick
+    /// types in `router_type_name` have a reply.
+    pub router: bool,
 }
 impl Default for L1Config {
     fn default() -> Self {
@@ -63,6 +69,8 @@ impl Default for L1Config {
             mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
             brick_serial: Some(DEFAULT_BRICK_SERIAL.into()),
             auto_power: true,
+            port_speed_first: 0,
+            router: false,
         }
     }
 }
@@ -98,6 +106,30 @@ pub(super) struct State {
     reasons: [u32; 2],
     events: Option<u8>,
     power_down_pending: bool,
+    /// One reassembly per subchannel.
+    router: [Option<RouterAssembly>; 32],
+}
+
+/// A router message being reassembled from 0x3001, 0x3002 and 0x3003 chunks.
+struct RouterAssembly {
+    fragment_count: u8,
+    fragments_left: u8,
+    first_length: usize,
+    expected: usize,
+    received: usize,
+    data: Vec<u8>,
+}
+const ROUTER_MAX_FRAGMENT: usize = 0x400;
+const ROUTER_CHUNK_DATA: usize = 113;
+
+/// Brick types for which the router interpreter reply exists.
+fn router_type_name(type_code: u32) -> Option<&'static str> {
+    match type_code {
+        0x37 => Some("Chimera Server"),
+        0x39 => Some("Chimera WS"),
+        0x51 => Some("Rackmount WS"),
+        _ => None,
+    }
 }
 fn text_field(out: &mut Vec<u8>, text: &[u8]) {
     out.push(1);
@@ -202,6 +234,7 @@ impl State {
             reasons: [0; 2],
             events: None,
             power_down_pending: false,
+            router: std::array::from_fn(|_| None),
         }
     }
     pub fn reset(&mut self) {
@@ -337,6 +370,16 @@ impl State {
     }
     fn request(&mut self, p: &[u8]) {
         let channel = p[0] & 31;
+        if self.config.router
+            && p.len() >= 7
+            && p[0] & 0xe0 == 0
+            && word(&p[1..]) == 0
+            && p[5] == 0x30
+            && matches!(p[6], 1..=3)
+        {
+            self.router_chunk(p);
+            return;
+        }
         if p[0] & 0xe0 == 0x40 {
             self.port = (self.port & 0x60) | channel;
             if self.console && self.powered {
@@ -466,7 +509,7 @@ impl State {
                 field_count = 1;
             }
             9 => values.push(self.partition),
-            0xa => values.extend([0, 0]),
+            0xa => values.extend([self.config.port_speed_first, 0]),
             0xb => values.push(self.two_bit),
             0xc => values.extend([0; 8]),
             0xd => values.extend([0; 4]),
@@ -563,6 +606,178 @@ impl State {
             fields = ints(&values);
         }
         self.reply(channel, error, field_count, &fields);
+    }
+    /// The router replies are chunked and reassembled with the same three
+    /// commands; a malformed chunk drops the pending message.
+    fn router_chunk(&mut self, p: &[u8]) {
+        let channel = p[0] & 0x1f;
+        let slot = usize::from(channel);
+        if p.len() < 10 {
+            crate::dlog!(LogModule::L1, "L1 malformed router chunk");
+            return;
+        }
+        let command = u16::from_be_bytes([p[5], p[6]]);
+        let payload = &p[10..];
+        let fragment_length = u16::from_be_bytes([p[8], p[9]]) as usize;
+        match command {
+            0x3001 => {
+                let fragments = p[7];
+                if self.router[slot].take().is_some() {
+                    crate::dlog!(LogModule::L1, "L1 replacing pending router request");
+                }
+                if fragments == 0
+                    || fragments >= 128
+                    || fragment_length == 0
+                    || fragment_length > ROUTER_MAX_FRAGMENT
+                    || payload.len() > fragment_length
+                {
+                    crate::dlog!(LogModule::L1, "L1 unsupported router message start");
+                    return;
+                }
+                self.router[slot] = Some(RouterAssembly {
+                    fragment_count: fragments,
+                    fragments_left: fragments,
+                    first_length: 0,
+                    expected: fragment_length,
+                    received: payload.len(),
+                    data: payload.to_vec(),
+                });
+            }
+            0x3002 => {
+                let ok = self.router[slot].as_ref().is_some_and(|a| {
+                    a.fragments_left != 0
+                        && a.received == a.expected
+                        && fragment_length != 0
+                        && fragment_length <= ROUTER_MAX_FRAGMENT - a.data.len()
+                        && payload.len() <= fragment_length
+                });
+                let Some(a) = self.router[slot].as_mut().filter(|_| ok) else {
+                    self.router[slot] = None;
+                    crate::dlog!(LogModule::L1, "L1 invalid router next fragment");
+                    return;
+                };
+                a.expected = fragment_length;
+                a.received = payload.len();
+                a.data.extend_from_slice(payload);
+            }
+            _ => {
+                let ok = self.router[slot].as_ref().is_some_and(|a| {
+                    a.received != a.expected
+                        && payload.len() <= a.expected - a.received
+                        && payload.len() <= ROUTER_MAX_FRAGMENT - a.data.len()
+                });
+                let Some(a) = self.router[slot].as_mut().filter(|_| ok) else {
+                    self.router[slot] = None;
+                    crate::dlog!(LogModule::L1, "L1 router continuation without valid message");
+                    return;
+                };
+                a.received += payload.len();
+                a.data.extend_from_slice(payload);
+            }
+        }
+        self.router_complete(channel);
+    }
+    fn router_complete(&mut self, channel: u8) {
+        let slot = usize::from(channel);
+        let Some(a) = self.router[slot].as_mut() else { return };
+        if a.received != a.expected {
+            return;
+        }
+        if a.first_length == 0 {
+            a.first_length = a.data.len();
+        }
+        a.fragments_left -= 1;
+        if a.fragments_left != 0 {
+            return;
+        }
+        let a = self.router[slot].take().unwrap();
+        // Only the single-fragment layout has a known descriptor mapping.
+        if a.fragment_count == 1 {
+            self.router_reply(channel, &a.data[..a.first_length], a.fragment_count);
+        } else {
+            crate::dlog!(LogModule::L1, "L1 multi-fragment router dispatch is unsupported");
+        }
+    }
+    fn router_reply(&mut self, channel: u8, request: &[u8], fragment_count: u8) {
+        let Some(type_name) = router_type_name(self.config.type_code) else {
+            crate::dlog!(LogModule::L1, "L1 unsupported or malformed router request");
+            return;
+        };
+        let n = request.len();
+        // Fixed header, an all-zero scalar block, then the string descriptor
+        // (kind 0x0a, 1) carrying the interpreter command.
+        let well_formed = n >= 37
+            && usize::from(u16::from_be_bytes([request[0], request[1]])) == n
+            && request[2] == 2
+            && request[3] == 0
+            && request[5] == 0x80 | fragment_count
+            && request[6] == 0
+            && request[7] == 0
+            && word(&request[8..]) == 0x0fff_f003
+            && request[16] == 2
+            && request[20..28] == [0; 8]
+            && request[28] == 0x0a
+            && request[29] == 1
+            && word(&request[32..]) == 52
+            && usize::from(u16::from_be_bytes([request[30], request[31]])) == n - 36
+            && request[n - 1] == 0;
+        if !well_formed {
+            crate::dlog!(LogModule::L1, "L1 unsupported or malformed router request");
+            return;
+        }
+        // The captured form has one trailing space; the plain spelling is
+        // accepted too. Anything else is refused.
+        if !matches!(&request[36..], b"brick\0" | b"brick \0") {
+            crate::dlog!(LogModule::L1, "L1 router command interpreter operation refused");
+            return;
+        }
+        let partition = match self.partition {
+            0 => "none".to_string(),
+            255 => "?".to_string(),
+            p => p.to_string(),
+        };
+        let serial = self.config.brick_serial.as_deref().unwrap_or("(null)");
+        let mut text = format!(
+            "rack: {:03}, slot: {:02}, partition: {partition}, type: {type_name} \
+             [?MB flash], serial:{serial}, source: OTHER\n\n",
+            self.config.rack, self.config.bay
+        )
+        .into_bytes();
+        text.push(0);
+        let total = 36 + text.len();
+        let node_id = (self.config.rack << 6) | self.config.bay;
+        let mut response = vec![0u8; 36];
+        response[..2].copy_from_slice(&(total as u16).to_be_bytes());
+        response[2] = 2;
+        response[4] = request[4];
+        response[5] = 0x81;
+        response[6] = 1;
+        // The reply goes back to the requesting channel on this node.
+        response[8..12].copy_from_slice(&((node_id << 12) | (u32::from(channel) << 5) | 0x15).to_be_bytes());
+        response[12..16].copy_from_slice(&((node_id << 12) | 3).to_be_bytes());
+        response[16] = 2;
+        response[17] = request[17];
+        response[18..20].copy_from_slice(&request[18..20]);
+        response[28] = 0x0a;
+        response[29] = 1;
+        response[30..32].copy_from_slice(&(text.len() as u16).to_be_bytes());
+        response[32..36].copy_from_slice(&0x34u32.to_be_bytes());
+        response.extend_from_slice(&text);
+        if total > ROUTER_MAX_FRAGMENT {
+            crate::dlog!(LogModule::L1, "L1 router brick response exceeds fragment limit");
+            return;
+        }
+        for (i, part) in response.chunks(ROUTER_CHUNK_DATA).enumerate() {
+            let mut chunk = vec![0x20 | channel, 0, 0, 0, 0, 0x30, if i == 0 { 1 } else { 3 }];
+            if i == 0 {
+                chunk.push(1);
+                chunk.extend_from_slice(&(total as u16).to_be_bytes());
+            } else {
+                chunk.extend_from_slice(&[0, 0, 0]);
+            }
+            chunk.extend_from_slice(part);
+            self.emit(&chunk);
+        }
     }
     fn reason(&mut self) {
         self.reasons[1] = self.reasons[0];
