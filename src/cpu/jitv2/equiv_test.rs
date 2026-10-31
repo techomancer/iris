@@ -4383,6 +4383,63 @@ mod tests {
         }
     }
 
+    /// One LWR at 0x1000 reading 0x2000 + `offset`, interpreted and compiled, on
+    /// CPU model `C` with CP0 Status `status`. The JIT learns the model's
+    /// choices from `install_jit_hooks`, as in production.
+    fn lwr_both<C>(status: u32, offset: u64) -> (CoreSnapshot, CoreSnapshot)
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>,
+    {
+        let lwr = make_i(crate::cpu::mips_isa::OP_LWR, 1, 2, 0);
+        let build = || {
+            let mem = Arc::new(MockMemory::new_not_compilable());
+            mem.set_word(0x2000, 0xDEAD_BEEF);
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            (exec.core.gpr[1], exec.core.gpr[2], exec.core.pc) = (0x2000 + offset, 0x1122_3344_5566_7788, 0x1000);
+            exec.set_cp0_status(status);
+            exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "fetchverify")]
+            { exec.core.fetch_verify_on = false; }
+            exec
+        };
+        let mut interp = build();
+        interp.jitv2_dispatch_enabled = false;
+        interp.exec(lwr);
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = lwr;
+        let mut analyzer = Analyzer::new();
+        let mut instrs_owned = *analyzer.walk_bounded(&page, 0, 0x1000, 1).0;
+        let mut jit = build();
+        jit.install_jit_hooks();
+        // Workers read the model's choice from here; stamp the codegen from it.
+        let mut codegen = Codegen::new();
+        codegen.jit_consts.lwr_keeps_upper = jit.jitv2.lock().jit_consts.lock().lwr_keeps_upper;
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable region");
+        unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
+    }
+
+    /// Compiled and interpreted LWR agree: the R10000 keeps bits 63:32 of a
+    /// partial LWR while 64-bit operations are on for the mode; the R5000 and a
+    /// 32-bit user process (UX=0) sign-extend. Fix: partial LWR.
+    #[test]
+    fn jit_lwr_matches_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
+        use crate::cpu::mips_core::STATUS_KX;
+        const USER: u32 = 2 << 3;
+        // (Status, 64-bit operations on): the mode's own bit decides.
+        for (status, ops64) in [(STATUS_KX, true), (USER | STATUS_KX, false)] {
+            let (interp, jit) = lwr_both::<R10000ShadowCache>(status, 1);
+            assert_eq!(jit, interp, "R10000 status {status:#x}");
+            assert_eq!(interp.gpr[2] >> 32 == 0x1122_3344, ops64, "R10000 status {status:#x}");
+        }
+        let (interp, jit) = lwr_both::<R5000ShadowCache>(STATUS_KX, 1);
+        assert_eq!(jit, interp);
+        assert_ne!(interp.gpr[2] >> 32, 0x1122_3344, "R5000 sign-extends");
+    }
+
     #[test]
     fn lwl_lwr_combine_to_a_full_unaligned_word_load_matches_interpreter() {
         // The canonical compiler-generated idiom for an unaligned word
