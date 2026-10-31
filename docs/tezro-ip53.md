@@ -31,8 +31,11 @@ appears only as part of the flash record's mode word.
 default, as in the Tezros whose inventories have been seen. The count selects
 the interface board. The one-processor board has one PIC at XIO widget 15
 carrying the IO9. The two- and four-processor board adds a second PIC at
-widget 11, with nothing on its buses, and an XIO slot for a V12 at widget 12,
-which is left empty.
+widget 11, with nothing on its buses. It sits on link 11 of the IO9 PIC's
+PXBOW, beside the hub's link 10 and the IO9's link 15, so the PROM and IRIX
+find it through that crossbar's link status. Whether it has a crossbar of
+its own in front of it is not known. Either board takes a V12 at widget 12
+with `[graphics] board = "v12"`.
 
 Memory comes from `banks`: one 512 or 1024 MiB bank per locational bank, from
 bank 0 with no gaps, up to eight. Left unset, the machine fits the 4 GiB
@@ -75,9 +78,28 @@ the processor's, so give the other part a fresh `[tezro] flash` file.
 Only CPU 0 runs. The fitted processors read present to the PROM, and only CPU
 0 is enabled at power-on; a write that would start another processor, an NMI
 or an interrupt aimed at one, and per-processor timers are refused and logged
-by the Bedrock PI, not carried out. An NMI for CPU 0, and a write that clears
-its enable bit, are refused and logged by the board: the CPU has no NMI entry,
-and CPU 0 keeps running.
+by the Bedrock PI, not carried out. On the two- and four-processor board the
+PROM therefore disables every processor but CPU 0 as having failed early
+initialisation, records that in its flash log, and IRIX reports the system
+as degraded. An NMI for CPU 0, and a write that clears its enable bit, are
+refused and logged by the board: the CPU has no NMI entry, and CPU 0 keeps
+running.
+
+On this Fuel base the PROM stops after printing `Copying PROM code to
+memory` and never reaches its menu. Bank 0 covers the reset PROM window at
+physical `0x1fc00000` in every Tezro layout, since the smallest bank is
+512 MiB, and the PROM runs that stage from cache lines it stages with the
+R10000 Index Store Tag and Index Store Data operations. Iris serves such
+staged lines only with the R10000 cache index operations, which this base
+does not carry. With them on top, the Origin 300 disk boots to the IRIX
+login under the interpreter and under jitv2.
+
+The R16000 model leaves out three R16000-specific choices that QEMU's model
+makes: the CP0 diagnostic register's mask and reset value, a trap on a
+subnormal operand while FCSR.FS is clear, and the limit on CVT.L results.
+Those cases follow the behaviour the rest of the R10000 family has in Iris.
+No R16000's FIR has been published for either part; the model reports
+`0x0900`, the R12000 and R14000 value, as a model choice.
 
 Every board identity the machine reports is a software choice of the QEMU
 Tezro profiles, not a value measured on a Tezro: Bedrock board word `0x2001`,
@@ -85,8 +107,18 @@ L1 brick type `0x39` with revision 1.48.1 and the router `brick` reply, the
 PIC's revision 3 profile, the PCI devices (IOC4 at device 1, ISP12160 at 3,
 BCM5701 at 4), their revisions and their interrupt inputs, and REQ64# on the
 BCM5701's slot. No EEPROM image is fitted for the IO9 board, the node board
-or the BCM5701, because no published source gives their contents. PIC DMA to
-any widget other than Bedrock IO is refused.
+or the BCM5701, because no published source gives their contents, and the PROM
+warns at every power-on that the module's CPU configuration values mismatch.
+PIC DMA to any widget other than Bedrock IO is refused. A configuration read
+of an empty PCI slot fails as a master timeout; the error enable gating and
+the treatment of device 0 there are inferred.
+
+The IRIX 6.5.30 disks tested so far were installed on an Origin 300, not a
+Tezro, so their device numbering comes from that machine: the IOC4 serial
+ports appear as `tty5` and `tty6`. Early in every boot IRIX prints
+`NOTICE: ... Detected a link reset due to other partition reset NASID 0`
+several times and then continues; what in the model provokes it has not
+been found.
 
 `[graphics] board = "v12"` fits a VPro V12 at widget 12 behind the PXBOW,
 on either board, using the VPro model the Octane and the Fuel use. On the
@@ -100,7 +132,10 @@ leaves PI0's counter below its bias raises the graphics interrupt and stops
 the slot, as QEMU's Bedrock does: the next counted store is answered busy
 until the processor takes the interrupt or credits lift the counter above
 the bias, for at most a second. The interrupt counter is not modelled.
-Without the V12 the machine has no graphics.
+With the cache index operations on top and IRIX 6.5.30 with the VPro
+software, the PROM's Odyssey diagnostics pass, xdm starts Xsgi on the V12,
+and a root login at the greeter reaches the 4Dwm desktop. Without the V12
+the machine has no graphics.
 Machine snapshots are unsupported.
 
 ## Source basis
