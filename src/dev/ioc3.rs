@@ -62,7 +62,10 @@ use crate::dev::serial_host::SerialBackend;
 use crate::irq::{InterruptController, IrqLine};
 use crate::pci::{Bar, PciBusDevice, PciConfig, PciDma, PciDmaStatus, PCI_INTA};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
-use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
+use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
+use crate::snapshot::{
+    field, field_bool, field_bytes, field_u32, field_u32s, field_u64, field_u8, field_u8s, StateTable,
+};
 
 pub const VENDOR_ID: u16 = 0x10a9;
 pub const DEVICE_ID: u16 = 0x0003;
@@ -2742,6 +2745,279 @@ impl PciBusDevice for Ioc3 {
         *self.sh.raw_dma.lock() = Some(dma.clone());
         self.sh.st.lock().dma = Some(Arc::new(Ioc3Dma::new(dma)));
         self.sh.connect_eth();
+    }
+}
+
+// The IOC3's state for a snapshot: the SuperIO block (two UARTs and their
+// ring DMA, the PS/2 ports and their controller, the parallel port, the
+// interrupt output, the clock and its RAM), the pins, the MicroLAN and the
+// Ethernet buffer RAM. The Ethernet block is a device of its own.
+//
+// The serial DMA and the interrupt output time themselves on the host's
+// monotonic clock. Each deadline is saved as the time it had left and set
+// that far after the load, so a restored guest sees the same interval it
+// was waiting out. Deadlines are encoded as nanoseconds left plus one,
+// zero for none.
+
+fn until(due: Option<Instant>, now: Instant) -> u64 {
+    due.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
+}
+
+fn due(left: u64, now: Instant) -> Option<Instant> {
+    (left != 0).then(|| now + Duration::from_nanos(left - 1))
+}
+
+fn span(d: Option<Duration>) -> u64 {
+    d.map_or(0, |d| d.as_nanos() as u64 + 1)
+}
+
+fn unspan(n: u64) -> Option<Duration> {
+    (n != 0).then(|| Duration::from_nanos(n - 1))
+}
+
+fn usize_field(v: &toml::Value, key: &str, limit: usize) -> Result<usize, String> {
+    let n = field_u64(v, key)? as usize;
+    if n > limit {
+        return Err(format!("{key}: {n} is more than {limit}"));
+    }
+    Ok(n)
+}
+
+impl Uart {
+    fn save_state(&self) -> toml::Value {
+        StateTable::new()
+            .value("core", self.core.save_state())
+            .u8("predivider", self.predivider)
+            .u8("mcr_afe", self.mcr_afe)
+            .u8("lsr_test", self.lsr_test)
+            .u8("msr_test", self.msr_test)
+            .build()
+    }
+    fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
+        self.core.load_state(field(v, "core")?);
+        self.predivider = field_u8(v, "predivider")?;
+        self.mcr_afe = field_u8(v, "mcr_afe")?;
+        self.lsr_test = field_u8(v, "lsr_test")?;
+        self.msr_test = field_u8(v, "msr_test")?;
+        Ok(())
+    }
+}
+
+impl SdmaPort {
+    fn save_state(&self, now: Instant) -> toml::Value {
+        StateTable::new()
+            .u32s("reg", &self.reg)
+            .u8s("packer", &self.packer)
+            .u64("packed", self.packed as u64)
+            .u8s("tx_entry", &self.tx_entry)
+            .bool("tx_fetched", self.tx_fetched)
+            .u64("tx_slot", self.tx_slot as u64)
+            .bool("armed", self.armed)
+            .bool("drain_pending", self.drain_pending)
+            .bool("busy", self.busy)
+            .bool("paused", self.paused)
+            .u64("rx_due", until(self.rx_deadline, now))
+            .u32("rx_idle_count", self.rx_idle_count)
+            .u64("rx_frozen", span(self.rx_frozen))
+            .u64("tx_delay_due", until(self.tx_delay_deadline, now))
+            .u64("tx_delay_frozen", span(self.tx_delay_frozen))
+            .bool("tx_delay_irq", self.tx_delay_irq)
+            .bool("post_refused", self.post_refused)
+            .build()
+    }
+    fn load_state(v: &toml::Value, now: Instant) -> Result<Self, String> {
+        Ok(Self {
+            reg: field_u32s(v, "reg")?,
+            packer: field_u8s(v, "packer")?,
+            packed: usize_field(v, "packed", ENTRY)?,
+            tx_entry: field_u8s(v, "tx_entry")?,
+            tx_fetched: field_bool(v, "tx_fetched")?,
+            tx_slot: usize_field(v, "tx_slot", ENTRY)?,
+            armed: field_bool(v, "armed")?,
+            drain_pending: field_bool(v, "drain_pending")?,
+            busy: field_bool(v, "busy")?,
+            paused: field_bool(v, "paused")?,
+            rx_deadline: due(field_u64(v, "rx_due")?, now),
+            rx_idle_count: field_u32(v, "rx_idle_count")?,
+            rx_frozen: unspan(field_u64(v, "rx_frozen")?),
+            tx_delay_deadline: due(field_u64(v, "tx_delay_due")?, now),
+            tx_delay_frozen: unspan(field_u64(v, "tx_delay_frozen")?),
+            tx_delay_irq: field_bool(v, "tx_delay_irq")?,
+            post_refused: field_bool(v, "post_refused")?,
+        })
+    }
+}
+
+impl KbcPort {
+    fn save_state(&self) -> toml::Value {
+        StateTable::new()
+            .u8s("data", &self.data)
+            .u64("count", self.count as u64)
+            .bool("overflow", self.overflow)
+            .build()
+    }
+    fn load_state(v: &toml::Value) -> Result<Self, String> {
+        Ok(Self {
+            data: field_u8s(v, "data")?,
+            count: usize_field(v, "count", KBC_RX_SLOTS)?,
+            overflow: field_bool(v, "overflow")?,
+        })
+    }
+}
+
+impl St {
+    fn save_state(&self, now: Instant) -> toml::Value {
+        let mut sdma = StateTable::new();
+        sdma.u32("base_hi", self.sdma.base_hi)
+            .u32("base_lo", self.sdma.base_lo)
+            .value("port0", self.sdma.port[0].save_state(now))
+            .value("port1", self.sdma.port[1].save_state(now));
+        let mut kbc = StateTable::new();
+        kbc.u32("control", self.kbc.control)
+            .value("port0", self.kbc.port[0].save_state())
+            .value("port1", self.kbc.port[1].save_state());
+        let p = &self.par;
+        let fifo: Vec<u8> = p.fifo.iter().copied().collect();
+        let mut par = StateTable::new();
+        par.u32s("addr_hi", &p.addr_hi)
+            .u32s("addr_lo", &p.addr_lo)
+            .u32s("count", &p.count)
+            .u32("dma_control", p.dma_control)
+            .u8("data", p.data)
+            .u8("control", p.control)
+            .u8("config_b", p.config_b)
+            .u8("extended", p.extended)
+            .u8s("fifo", &fifo);
+        let o = &self.int_out;
+        let mut int_out = StateTable::new();
+        int_out.u32("reg", o.reg)
+            .u32("active", o.active)
+            .bool("state", o.state)
+            .bool("pulse_end", o.pulse_end)
+            .bool("square_started", o.square_started)
+            .u64("next", until(o.next, now));
+        let r = &self.rtc;
+        let mut rtc = StateTable::new();
+        rtc.value("clock", r.dev.save_state())
+            .u8("index", r.index)
+            .u8s("nv", &r.nv)
+            .u8s("ext", &r.ext)
+            .u8s("xram", &r.xram)
+            .bool("dirty", r.dirty_since.is_some());
+        StateTable::new()
+            .u32("int_status", self.int_status)
+            .u32("int_enable", self.int_enable)
+            .u32("chip_control", self.chip_control)
+            .value("int_out", int_out.build())
+            .u32("microlan", self.microlan)
+            .u32("pin_control", self.pin_control)
+            .u32("pin_data", self.pin_data)
+            .value("uart0", self.uart[0].save_state())
+            .value("uart1", self.uart[1].save_state())
+            .value("sdma", sdma.build())
+            .value("kbc", kbc.build())
+            .value("parallel", par.build())
+            .value("rtc", rtc.build())
+            .u32s("ssram", &self.ssram)
+            .value("wire", self.ow.as_ref().map_or(toml::Value::Boolean(false), |w| w.save_state()))
+            .bool("power_off_pending", self.power_off_pending)
+            .build()
+    }
+
+    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
+        let ssram = field(v, "ssram")?.as_array().ok_or("ssram: not a list")?;
+        if ssram.len() != self.ssram.len() {
+            return Err(format!("ssram: {} words, expected {}", ssram.len(), self.ssram.len()));
+        }
+        let ssram: Vec<u32> = ssram.iter().map(crate::snapshot::toml_u32).collect::<Option<_>>()
+            .ok_or("ssram: an entry is not a word")?;
+        let sdma = field(v, "sdma")?;
+        let sdma = Sdma {
+            base_hi: field_u32(sdma, "base_hi")?,
+            base_lo: field_u32(sdma, "base_lo")?,
+            port: [SdmaPort::load_state(field(sdma, "port0")?, now)?, SdmaPort::load_state(field(sdma, "port1")?, now)?],
+        };
+        let kbc = field(v, "kbc")?;
+        let kbc = Kbc {
+            control: field_u32(kbc, "control")?,
+            port: [KbcPort::load_state(field(kbc, "port0")?)?, KbcPort::load_state(field(kbc, "port1")?)?],
+        };
+        let o = field(v, "int_out")?;
+        let int_out = IntOut {
+            reg: field_u32(o, "reg")?,
+            active: field_u32(o, "active")?,
+            state: field_bool(o, "state")?,
+            pulse_end: field_bool(o, "pulse_end")?,
+            square_started: field_bool(o, "square_started")?,
+            next: due(field_u64(o, "next")?, now),
+        };
+        let p = field(v, "parallel")?;
+        let fifo = field_bytes(p, "fifo")?;
+        if fifo.len() > PAR_FIFO_DEPTH {
+            return Err(format!("parallel fifo: {} bytes", fifo.len()));
+        }
+        let wire = field(v, "wire")?;
+        match wire.as_bool() {
+            // No wire at the save: none was handed in and none built yet.
+            // The chip builds its own from the configuration on first use,
+            // as it did then.
+            Some(false) => self.ow = None,
+            Some(true) => return Err("wire: not a bus".into()),
+            None => self.wire().load_state(wire).map_err(|e| format!("MicroLAN: {e}"))?,
+        }
+        self.uart[0].load_state(field(v, "uart0")?)?;
+        self.uart[1].load_state(field(v, "uart1")?)?;
+        let r = field(v, "rtc")?;
+        self.rtc.dev.load_state(field(r, "clock")?)?;
+        self.rtc.index = field_u8(r, "index")?;
+        self.rtc.nv = field_u8s(r, "nv")?;
+        self.rtc.ext = field_u8s(r, "ext")?;
+        self.rtc.xram = field_u8s(r, "xram")?;
+        // The NVRAM file catches up with the restored RAM in the usual way.
+        self.rtc.dirty_since = (field_bool(r, "dirty")? || self.rtc.file.is_some()).then_some(now);
+        self.par.addr_hi = field_u32s(p, "addr_hi")?;
+        self.par.addr_lo = field_u32s(p, "addr_lo")?;
+        self.par.count = field_u32s(p, "count")?;
+        self.par.dma_control = field_u32(p, "dma_control")?;
+        self.par.data = field_u8(p, "data")?;
+        self.par.control = field_u8(p, "control")?;
+        self.par.config_b = field_u8(p, "config_b")?;
+        self.par.extended = field_u8(p, "extended")?;
+        self.par.fifo = fifo.into();
+        self.int_status = field_u32(v, "int_status")?;
+        self.int_enable = field_u32(v, "int_enable")?;
+        self.chip_control = field_u32(v, "chip_control")?;
+        self.int_out = int_out;
+        self.microlan = field_u32(v, "microlan")?;
+        self.pin_control = field_u32(v, "pin_control")?;
+        self.pin_data = field_u32(v, "pin_data")?;
+        self.sdma = sdma;
+        self.kbc = kbc;
+        self.ssram = ssram;
+        self.power_off_pending = field_bool(v, "power_off_pending")?;
+        Ok(())
+    }
+}
+
+impl Saveable for Ioc3 {
+    fn save_state(&self) -> toml::Value {
+        let now = Instant::now();
+        let st = self.sh.st.lock().save_state(now);
+        StateTable::new()
+            .value("chip", st)
+            .value("ps2", self.sh.ps2.save_state())
+            .build()
+    }
+
+    /// Called with the chip stopped; its timers are armed again by `start`.
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        self.sh.ps2.load_state(field(v, "ps2")?)?;
+        let now = Instant::now();
+        self.sh.st.lock().load_state(field(v, "chip")?, now)?;
+        self.sh.rearm();
+        self.sh.sync_superio();
+        self.sh.sync_pin();
+        Ok(())
     }
 }
 
