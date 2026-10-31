@@ -628,6 +628,93 @@ pub fn get_field<'a>(table: &'a Value, key: &str) -> Option<&'a Value> {
     table.as_table()?.get(key)
 }
 
+// ---- required fields ----
+//
+// For state with no sensible default: a snapshot missing one of these is
+// refused with the field's name, not loaded with a zero in its place.
+
+pub fn field<'a>(table: &'a Value, key: &str) -> Result<&'a Value, String> {
+    get_field(table, key).ok_or_else(|| format!("missing {key}"))
+}
+
+pub fn field_u64(table: &Value, key: &str) -> Result<u64, String> {
+    toml_u64(field(table, key)?).ok_or_else(|| format!("{key}: not a number"))
+}
+
+pub fn field_u32(table: &Value, key: &str) -> Result<u32, String> {
+    toml_u32(field(table, key)?).ok_or_else(|| format!("{key}: not a 32-bit number"))
+}
+
+pub fn field_u16(table: &Value, key: &str) -> Result<u16, String> {
+    toml_u16(field(table, key)?).ok_or_else(|| format!("{key}: not a 16-bit number"))
+}
+
+pub fn field_u8(table: &Value, key: &str) -> Result<u8, String> {
+    toml_u8(field(table, key)?).ok_or_else(|| format!("{key}: not a byte"))
+}
+
+pub fn field_bool(table: &Value, key: &str) -> Result<bool, String> {
+    toml_bool(field(table, key)?).ok_or_else(|| format!("{key}: not a boolean"))
+}
+
+/// A list of exactly `N` numbers, each converted by `get`.
+fn field_list<T: Copy + Default, const N: usize>(
+    table: &Value, key: &str, get: fn(&Value) -> Option<T>,
+) -> Result<[T; N], String> {
+    let items = field(table, key)?.as_array().ok_or_else(|| format!("{key}: not a list"))?;
+    if items.len() != N {
+        return Err(format!("{key}: {} entries, expected {N}", items.len()));
+    }
+    let mut out = [T::default(); N];
+    for (o, item) in out.iter_mut().zip(items) {
+        *o = get(item).ok_or_else(|| format!("{key}: an entry is out of range"))?;
+    }
+    Ok(out)
+}
+
+pub fn field_u64s<const N: usize>(table: &Value, key: &str) -> Result<[u64; N], String> {
+    field_list(table, key, toml_u64)
+}
+
+pub fn field_u32s<const N: usize>(table: &Value, key: &str) -> Result<[u32; N], String> {
+    field_list(table, key, toml_u32)
+}
+
+pub fn field_u8s<const N: usize>(table: &Value, key: &str) -> Result<[u8; N], String> {
+    field_list(table, key, toml_u8)
+}
+
+/// A byte list of any length.
+pub fn field_bytes(table: &Value, key: &str) -> Result<Vec<u8>, String> {
+    field(table, key)?.as_array().ok_or_else(|| format!("{key}: not a list"))?
+        .iter().map(|v| toml_u8(v).ok_or_else(|| format!("{key}: an entry is not a byte"))).collect()
+}
+
+/// A list of 64-bit numbers of any length.
+pub fn field_u64_vec(table: &Value, key: &str) -> Result<Vec<u64>, String> {
+    field(table, key)?.as_array().ok_or_else(|| format!("{key}: not a list"))?
+        .iter().map(|v| toml_u64(v).ok_or_else(|| format!("{key}: an entry is not a number"))).collect()
+}
+
+/// A table of state, as save_state functions build them.
+#[derive(Default)]
+pub struct StateTable(toml::map::Map<String, Value>);
+
+impl StateTable {
+    pub fn new() -> Self { Self::default() }
+    pub fn u64(&mut self, key: &str, v: u64) -> &mut Self { self.0.insert(key.into(), hex_u64(v)); self }
+    pub fn u32(&mut self, key: &str, v: u32) -> &mut Self { self.0.insert(key.into(), hex_u32(v)); self }
+    pub fn u16(&mut self, key: &str, v: u16) -> &mut Self { self.0.insert(key.into(), hex_u16(v)); self }
+    pub fn u8(&mut self, key: &str, v: u8) -> &mut Self { self.0.insert(key.into(), hex_u8(v)); self }
+    pub fn bool(&mut self, key: &str, v: bool) -> &mut Self { self.0.insert(key.into(), Value::Boolean(v)); self }
+    pub fn u64s(&mut self, key: &str, v: &[u64]) -> &mut Self { self.0.insert(key.into(), u64_slice_to_toml(v)); self }
+    pub fn u32s(&mut self, key: &str, v: &[u32]) -> &mut Self { self.0.insert(key.into(), u32_slice_to_toml(v)); self }
+    pub fn u16s(&mut self, key: &str, v: &[u16]) -> &mut Self { self.0.insert(key.into(), u16_slice_to_toml(v)); self }
+    pub fn u8s(&mut self, key: &str, v: &[u8]) -> &mut Self { self.0.insert(key.into(), u8_slice_to_toml(v)); self }
+    pub fn value(&mut self, key: &str, v: Value) -> &mut Self { self.0.insert(key.into(), v); self }
+    pub fn build(&mut self) -> Value { Value::Table(std::mem::take(&mut self.0)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,5 +1027,16 @@ mod tests {
             bin_bytes.len(),
             toml_bytes.len()
         );
+    }
+
+    #[test]
+    fn required_fields_name_what_is_missing_or_short() {
+        let v = StateTable::new().u64("a", 7).u32s("b", &[1, 2]).bool("c", true).build();
+        assert_eq!(field_u64(&v, "a"), Ok(7));
+        assert_eq!(field_u32s::<2>(&v, "b"), Ok([1, 2]));
+        assert_eq!(field_bool(&v, "c"), Ok(true));
+        assert_eq!(field_u64(&v, "z"), Err("missing z".into()));
+        assert_eq!(field_u32s::<3>(&v, "b"), Err("b: 2 entries, expected 3".into()));
+        assert!(field_bool(&v, "a").is_err());
     }
 }
