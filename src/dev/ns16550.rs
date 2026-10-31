@@ -301,6 +301,12 @@ impl Ns16550 {
             + if self.fcr & FCR_FE != 0 { self.recv_fifo.len() } else { (self.lsr & LSR_DR != 0) as usize }
     }
 
+    /// A byte is waiting to go out: only a backend that refused one leaves
+    /// any.
+    pub fn tx_pending(&self) -> bool {
+        !self.held.is_empty()
+    }
+
     /// Type characters at the port, as if the host had sent them. They wait
     /// until the port will take them, as the backend's do.
     pub fn type_in(&mut self, bytes: &[u8]) {

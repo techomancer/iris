@@ -112,6 +112,7 @@ const TX_CHARACTER: u8 = 0x40;
 const TX_MODEM: u8 = 0x80;
 pub const TX_DELAY: u8 = 0xc0;
 pub const TX_INTERRUPT: u8 = 0x20;
+const TX_UNDEFINED: u8 = 0x1f;
 const RX_OVERRUN: u8 = 0x01;
 const RX_PARITY: u8 = 0x02;
 const RX_FRAMING: u8 = 0x04;
@@ -292,6 +293,30 @@ impl SerialDma {
     /// line.
     pub fn loop_deadline(&self, p: usize) -> Option<Instant> {
         self.port[p].loop_due
+    }
+
+    /// Nothing queued, held or pending on the port: what a chip that wants
+    /// the rings left alone while they move checks before it lets a guest
+    /// change a mode.
+    pub fn port_quiescent(&self, p: usize) -> bool {
+        let port = &self.port[p];
+        port.reg[1] == port.reg[2]
+            && port.reg[3] == port.reg[4]
+            && !port.tx_fetched
+            && port.tx_delay_deadline.is_none()
+            && port.packed == 0
+            && !port.armed
+            && !port.drain_pending
+    }
+
+    /// Both ports of a pair are off, with their indices at zero and nothing
+    /// pending.
+    pub fn pair_quiescent(&self, pair: usize) -> bool {
+        (pair * PAIR..pair * PAIR + PAIR).all(|p| {
+            self.control(p) & (ctl::ENABLE | ctl::PAUSE) == 0
+                && self.port[p].reg[1..=4].iter().all(|&r| r == 0)
+                && self.port_quiescent(p)
+        })
     }
 
     /// Whether the port is stopped by a failed transfer.
@@ -515,6 +540,25 @@ impl SerialDma {
         host.uart_line_changed(p);
     }
 
+    /// The type field and bit 5 decide what a slot does; the low five bits
+    /// have no defined meaning and are reported, not obeyed. Report them once,
+    /// when the entry is fetched, for the slots up to the one that ends it.
+    fn check_entry(p: usize, entry: &[u8; ENTRY]) {
+        let mut undefined = 0;
+        for &control in &entry[ENTRY_CHARS..] {
+            undefined |= control & TX_UNDEFINED;
+            if control & TX_TYPE == 0 {
+                break;
+            }
+        }
+        if undefined != 0 {
+            crate::dlog!(
+                crate::devlog::LogModule::Ioc,
+                "serial DMA: undefined TX control bits {undefined:#04x} in an entry on port {p}"
+            );
+        }
+    }
+
     /// Each control byte types its data byte; the empty type ends the entry,
     /// wherever it sits.
     fn transmit(&mut self, p: usize, since: Instant, host: &mut dyn SerialDmaHost) {
@@ -531,7 +575,8 @@ impl SerialDma {
             if !(self.running(p) && consume & mask != produce & mask) {
                 break;
             }
-            if !self.port[p].tx_fetched {
+            let was_fetched = self.port[p].tx_fetched;
+            if !was_fetched {
                 let mut entry = [0u8; ENTRY];
                 let at = ring.saturating_add(u64::from(consume & mask));
                 if !self.dma_read(host, at, &mut entry) {
@@ -543,6 +588,9 @@ impl SerialDma {
                 port.tx_fetched = true;
             }
             let entry = self.port[p].tx_entry;
+            if !was_fetched {
+                Self::check_entry(p, &entry);
+            }
             let mut slot = self.port[p].tx_slot;
             while slot < ENTRY_CHARS {
                 let control = entry[ENTRY_CHARS + slot];

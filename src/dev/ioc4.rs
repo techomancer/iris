@@ -71,7 +71,7 @@ use parking_lot::Mutex;
 use crate::dev::ds1744::Ds1744;
 use crate::dev::ioc3_kbc::{self, Ioc3Kbc, KbcLine, KbcOwner};
 use crate::dev::ps2::Ps2Controller;
-use crate::dev::ioc_serial_dma::{off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
+use crate::dev::ioc_serial_dma::{self, off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::dev::deadline_timers::DeadlineTimers;
@@ -156,6 +156,14 @@ const KBC_STATUS: u32 = 0x0000_c33f;
 /// The receive registers carry no IOC3-only flags: bits 24 to 28 (per-slot
 /// errors, source and overflow) read clear.
 const KBC_RX_MASK: u32 = 0xe0ff_ffff;
+
+/// Serial control bits the model acts on: the threshold, drain, enable,
+/// pause and reset. The rest are stored and read back.
+const SSCR_MODELLED: u32 = 0x1ff | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 31);
+/// The receive consume index also holds the timer arm in bit 31.
+const SRCIR_TIMER_ARM: u32 = 1 << 31;
+/// The ring size select in a pair base's low word.
+const RING_4K: u32 = 1;
 
 /// Register 0x20: the DMA engines are idle.
 const SERIAL_CONTROL_IDLE: u32 = 0x80;
@@ -403,8 +411,65 @@ impl St {
     }
 
     fn uart_write(&mut self, p: usize, r: u32, v: u8) {
+        if r == 0 && !self.uart[p].dlab() && self.sdma.control(p) & ioc_serial_dma::ctl::ENABLE != 0 {
+            crate::dlog!(crate::devlog::LogModule::Ioc, "IOC4 PIO transmit on port {p} while DMA is enabled");
+        }
         self.uart[p].write(r, v);
         self.uart_changed(p);
+    }
+
+    // ----- mode-switch diagnostics -----
+
+    /// Report the DMA mode switches and the writes the model takes but does
+    /// not act on. They are reported, not refused: the UART orders PIO and
+    /// ring DMA itself, and the write goes ahead.
+    fn check_port_write(&self, p: usize, off: u32, v: u32) {
+        let log = |what: std::fmt::Arguments| crate::dlog!(crate::devlog::LogModule::Ioc, "IOC4 {what}");
+        match off {
+            sdma_off::CONTROL => {
+                if v & !SSCR_MODELLED != 0 {
+                    log(format_args!("serial control bits {:#010x} on port {p} are stored but not modelled", v & !SSCR_MODELLED));
+                }
+                self.control_check(p, v);
+            }
+            sdma_off::TX_PRODUCE | sdma_off::RX_CONSUME => {
+                let size = if self.sdma.base_read(p / 2, false) & RING_4K != 0 { 0x1000 } else { 0x400 };
+                let keep = (size - 8) | if off == sdma_off::RX_CONSUME { SRCIR_TIMER_ARM } else { 0 };
+                if v & !keep != 0 {
+                    let what = if off == sdma_off::TX_PRODUCE { "TX producer" } else { "RX consumer" };
+                    log(format_args!("{what} {v:#010x} on port {p} has bits outside the pointer field"));
+                }
+            }
+            sdma_off::RX_TIMER if v & !0xfff != 0 => {
+                log(format_args!("unsupported RX timer bits {:#010x} on port {p}", v & !0xfff));
+            }
+            _ => {}
+        }
+    }
+
+    /// Enabling DMA over a base misaligned for its rings, or over PIO data in
+    /// the UART's FIFOs, and disabling it with ring work pending.
+    fn control_check(&self, p: usize, v: u32) {
+        use ioc_serial_dma::ctl;
+        let old_on = self.sdma.control(p) & ctl::ENABLE != 0;
+        let want_on = v & ctl::ENABLE != 0;
+        if v & ctl::RESET != 0 || old_on == want_on {
+            return;
+        }
+        let log = |what: std::fmt::Arguments| crate::dlog!(crate::devlog::LogModule::Ioc, "IOC4 {what}");
+        let pair = p / 2;
+        if want_on {
+            let base = u64::from(self.sdma.base_read(pair, true)) << 32 | u64::from(self.sdma.base_read(pair, false) & !RING_4K);
+            let size: u64 = if self.sdma.base_read(pair, false) & RING_4K != 0 { 0x1000 } else { 0x400 };
+            if base & (size * 4 - 1) != 0 {
+                log(format_args!("DMA enabled on port {p} with pair base {base:#x} misaligned for its rings"));
+            }
+            if self.uart[p].rx_pending() != 0 || self.uart[p].tx_pending() {
+                log(format_args!("DMA enabled on port {p} with PIO data in the UART's FIFOs"));
+            }
+        } else if !self.sdma.port_quiescent(p) {
+            log(format_args!("DMA disabled on port {p} with ring work pending"));
+        }
     }
 
     // ----- control registers -----
@@ -439,8 +504,14 @@ impl St {
         self.sdma_catch_up(Instant::now());
         if let Some(r) = sdma_decode(a) {
             match r {
-                SdmaReg::Base { pair, high } => self.sdma.base_write(pair, high, v),
+                SdmaReg::Base { pair, high } => {
+                    if !self.sdma.pair_quiescent(pair) {
+                        crate::dlog!(crate::devlog::LogModule::Ioc, "IOC4 DMA base of pair {pair} changed while it is active");
+                    }
+                    self.sdma.base_write(pair, high, v);
+                }
                 SdmaReg::Port { port, off } => {
+                    self.check_port_write(port, off, v);
                     let (sdma, mut host) = self.sdma_engine_split();
                     sdma.port_write(port, off, v, &mut host);
                 }

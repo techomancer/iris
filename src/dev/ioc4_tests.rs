@@ -1650,3 +1650,106 @@ fn a_host_key_raises_the_pin_without_a_guest_access() {
     key(&r, winit::keyboard::KeyCode::KeyA, true);
     assert!(r.pin.level());
 }
+
+// ---------------------------------------------------------------------------
+// Reported, not refused
+// ---------------------------------------------------------------------------
+
+/// Everything the `ioc` log module has said in this process. Tests run side
+/// by side and share it, so a check looks for its own message text.
+fn device_log() -> String {
+    use std::io::Write;
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    static LOG: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dl = crate::devlog::DEVLOG.get().cloned().unwrap_or_else(crate::devlog::init_devlog);
+        dl.add_sink(Arc::new(parking_lot::Mutex::new(Sink(buf.clone()))));
+        dl.enable(crate::devlog::LogModule::Ioc);
+        buf
+    });
+    String::from_utf8_lossy(&log.lock().unwrap()).into_owned()
+}
+
+/// Ports test_dma_reports_bad_base_and_pointer: a misaligned pair base and a
+/// base change on a busy pair are reported, not refused; the enable and the
+/// new base both take effect, and an index keeps its pointer field while the
+/// stray bits are reported.
+#[test]
+fn a_bad_base_and_a_stray_pointer_bit_are_reported_not_refused() {
+    let _ = device_log();
+    let r = Rig::new();
+    r.pair_base(0, RINGS + 8, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    assert_eq!(r.sr(0, sdma_off::CONTROL) & ENABLE, ENABLE);
+    r.sw(0, sdma_off::CONTROL, 0);
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.pair_base(0, RINGS + 0x4000, 0x1000);
+    assert_eq!(r.r32(reg::SDMA_BASE), (RINGS + 0x4000) as u32 | 1);
+    r.sw(0, sdma_off::CONTROL, RESET);
+    r.sw(0, sdma_off::TX_PRODUCE, 4);
+    assert_eq!(r.sr(0, sdma_off::TX_PRODUCE), 0);
+    r.sw(0, sdma_off::RX_TIMER, 0x1_0002);
+    r.sw(0, sdma_off::CONTROL, 1 << 20);
+    let log = device_log();
+    for what in [
+        "misaligned for its rings",
+        "changed while it is active",
+        "TX producer 0x00000004 on port 0 has bits outside the pointer field",
+        "unsupported RX timer bits 0x00010000 on port 0",
+        "serial control bits 0x00100000 on port 0 are stored but not modelled",
+    ] {
+        assert!(log.contains(what), "no report of: {what}");
+    }
+}
+
+/// Ports test_dma_mode_switch_over_pio_is_reported and
+/// test_dma_tx_disable_reports_pending_delay: the UART orders PIO and ring
+/// DMA itself, so enabling DMA over queued PIO data, a PIO transmit while DMA
+/// is on, and clearing the enable over a running delay are reported and go
+/// ahead.
+#[test]
+fn a_mode_switch_over_pio_is_reported_and_goes_ahead() {
+    let _ = device_log();
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.uw(0, 2, 0x07);
+    r.type_in(0, &[0x5a]);
+    assert_eq!(r.ur(0, 5) & 1, 1);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    assert_eq!(r.sr(0, sdma_off::CONTROL) & ENABLE, ENABLE, "the enable took effect");
+    r.uw(0, 0, 0xa5);
+    assert_eq!(r.sent(0), [0xa5], "and so did the PIO byte");
+
+    r.tx_entry(0, 0x1000, 0, [30, 0, 0, 0], [TX_DELAY, 0, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 8);
+    r.sw(0, sdma_off::CONTROL, 0);
+    assert_eq!(r.sr(0, sdma_off::CONTROL) & ENABLE, 0);
+    let log = device_log();
+    assert!(log.contains("with PIO data in the UART's FIFOs"));
+    assert!(log.contains("PIO transmit on port 0 while DMA is enabled"));
+    assert!(log.contains("DMA disabled on port 0 with ring work pending"));
+}
+
+/// Ports the undefined-bits check of test_dma_tx_control_decodes_type_and_bit5.
+#[test]
+fn undefined_transmit_control_bits_are_reported() {
+    let _ = device_log();
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.tx_entry(0, 0x1000, 0, [b'q', 0, 0, 0], [TX_VALID | 0x10, 0, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 8);
+    assert_eq!(r.sent(0), b"q", "the slot is obeyed by its type");
+    assert!(device_log().contains("undefined TX control bits 0x10 in an entry on port 0"));
+}
