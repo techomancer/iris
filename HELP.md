@@ -748,6 +748,29 @@ addresses the second controller.
 
 ---
 
+## Checking a configuration
+
+`iris --validate --config FILE` reads a configuration the way a run would and
+reports what is wrong with it, without starting the machine, opening a window
+or touching the sound device. It exits 0 and prints `iris: FILE: ok (machine)`
+if a run from the command line would start, and otherwise exits 1 with one
+`Configuration error:` line per problem on stderr; a missing disk image is one,
+because a command-line run stops on it. A `Warning:` line is for something a run
+carries on past, such as a missing `prom` file on the Indy or Indigo2, which run
+their built-in PROM. Other options (`--scsi1`, `--cpu` and so on) apply first,
+as they do in a run.
+
+It checks that the file parses and has no unknown keys; that the settings agree
+(`machine.profile` with its processor, count, banks, graphics board and SCSI
+IDs, and the Unix serial sockets); that the PROM, every disk and CD image, the
+`load_elf` file and the NFS, TFTP and rsh directories exist; that the directories
+for the serial logs, serial sockets and scratch volumes exist; and that
+`serial_port_a`, `serial_port_b`, `monitor_port` and `gdb_port` are different
+ports. Whether a port is free, or a file is a valid image, is only known when a
+machine starts.
+
+---
+
 ## Command-line options
 
 All options are optional and override the corresponding `iris.toml` value.
@@ -798,6 +821,7 @@ Automation and debugging
   --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
+  --validate                  Check the --config file and exit; 0 if iris would start
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
   --serial-socket-a <PATH>    Also serve channel A on a Unix socket

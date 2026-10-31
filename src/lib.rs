@@ -161,6 +161,7 @@ pub mod build_features {
     }
 }
 
+pub mod validate_config;
 pub mod config;
 pub mod traits;
 #[macro_use]
