@@ -613,9 +613,29 @@ static double fb_comp(const unsigned char *px, int comp)
     return 0;
 }
 
+/* VPro: the library's host conversion steps the rows of an unpacked read by
+   its own stride, ceil(w * bpp / m) * m with bpp the pixel's size and
+   m = max(alignment, bpp), where GL pads the row to the alignment. They differ
+   only when bpp does not divide the alignment and the width makes w * bpp
+   miss a multiple of it: 3 shorts (bpp 6) at width 13 give 78-byte rows
+   against GL's 80. The board's data is right; the library lays it out so
+   (origami #3070, VPro RGB short read-back). Returns 0 where GL's layout
+   holds. Only the default pack state is covered. */
+static int vpro_read_stride(const Fmt *f, const Type *t, const Store *s, int w)
+{
+    int bpp, m;
+    if (!vpro || t->npacked || f->n != 3 || t->size != 2 || s->alignment != 4 || s->row_length ||
+        s->skip_pixels || s->skip_rows)
+        return 0;
+    bpp = f->n * t->size;
+    m = bpp > s->alignment ? bpp : s->alignment;
+    return m * ((w * bpp + m - 1) / m);
+}
+
 static void read_case(const Fmt *f, const Type *t, const Store *s, int w, int h, const char *tag)
 {
     int epg = t->npacked ? 1 : f->n;
+    int lib_stride = vpro_read_stride(f, t, s, w);
     int nb = image_bytes(s, w, h, epg, t->size), i, j, k;
     unsigned char *buf, *fb;
     if (!begin("read/%s/%s%s", f->name, t->name, tag))
@@ -641,7 +661,8 @@ static void read_case(const Fmt *f, const Type *t, const Store *s, int w, int h,
     /* Pixel values. */
     for (j = 0; j < h && !cur_bad; j++)
         for (i = 0; i < w && !cur_bad; i++) {
-            unsigned char *p = buf + px_offset(s, w, i, j, epg, t->size);
+            unsigned char *p = buf + (lib_stride ? j * lib_stride + i * epg * t->size
+                                                 : px_offset(s, w, i, j, epg, t->size));
             const unsigned char *px = fb + (j * w + i) * 4;
             if (t->npacked) {
                 unsigned int v = (unsigned int)get_elem(p, t, s->swap);
@@ -668,7 +689,8 @@ static void read_case(const Fmt *f, const Type *t, const Store *s, int w, int h,
         unsigned char *mark = calloc(nb, 1);
         for (j = 0; j < h; j++)
             for (i = 0; i < w; i++)
-                memset(mark + px_offset(s, w, i, j, epg, t->size), 1, epg * t->size);
+                memset(mark + (lib_stride ? j * lib_stride + i * epg * t->size
+                                          : px_offset(s, w, i, j, epg, t->size)), 1, epg * t->size);
         for (i = 0; i < nb; i++)
             if (!mark[i] && buf[i] != 0xcd) {
                 note("byte %d outside the pixels written (0x%02x)", i, buf[i]);
