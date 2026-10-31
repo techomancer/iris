@@ -2950,6 +2950,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             return;
         }
 
+        // A page holding a line the guest staged in the secondary cache is
+        // served by the cache's own read and write: an entry here would let
+        // the JIT's inline path and the window read memory instead.
+        if self.cache.page_staged(result.phys) {
+            return;
+        }
+
         // Segment shapes we decline to cache at all — currently only a
         // 64-bit xuseg VA with a nonzero bits 63:40, which is not a valid
         // user address. Everything else is cacheable regardless of which
@@ -3209,6 +3216,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.clear_pcp();
             return;
         };
+        // Compiled code is built from memory. A page with a staged secondary
+        // line must run in the interpreter, whose fetch goes through the cache.
+        if self.cache.page_staged(phys_addr) {
+            self.clear_pcp();
+            return;
+        }
         let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn };
         if same_page {
             return;
@@ -6811,6 +6824,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         // Call unified cache interface
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
+        // A line staged or dropped changes which pages must be served by the
+        // cache's own read, write and fetch. Translations filled before the
+        // change (micro-TLB entries the interpreter and the JIT's inline
+        // loads and stores use, the page being compiled from) do not know.
+        if self.cache.take_staged_changed() {
+            self.nanotlb_invalidate();
+        }
         // An I-cache write-back of a line with bad parity raises a Cache
         // Error from the CACHE instruction itself.
         #[cfg(feature = "cache-ecc")]

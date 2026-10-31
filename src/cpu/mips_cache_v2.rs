@@ -679,6 +679,21 @@ pub trait MipsCache: Send + Sync {
     /// Default `false`: a model that keeps instruction-cache state does.
     fn fetch_is_pure(&self) -> bool { false }
 
+    /// Could a cached access to the page holding `phys` be served from a
+    /// secondary line the guest staged with Index Store Tag and Index Store
+    /// Data, instead of from memory? Only the page-granular fast paths that
+    /// bypass `read`, `write` and `fetch` ask: the micro-TLB fill for the
+    /// interpreter's and the JIT's inline data accesses, and the JIT's page
+    /// tracking, which compiles from memory. A page that answers `true` is
+    /// kept off those paths. Default `false`: a model that serves every
+    /// access itself has no such line.
+    fn page_staged(&self, _phys: u64) -> bool { false }
+
+    /// Did the set of pages `page_staged` answers `true` for change since
+    /// the last call? Reading it clears it. The executor drops the
+    /// translations that were cached under the old answer.
+    fn take_staged_changed(&self) -> bool { false }
+
     /// Write every dirty line back to memory, so RAM holds everything.
     /// Default no-op: a cache that holds no data has nothing to write.
     fn writeback_all(&self) {}
