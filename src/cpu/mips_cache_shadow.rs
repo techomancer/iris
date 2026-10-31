@@ -239,6 +239,9 @@ pub struct ShadowCache<
     pd_tag_hook: UnsafeCell<Option<Box<dyn Fn(u32) + Send + Sync>>>,
     /// Secondary lines the guest staged. R10000 family only; empty otherwise.
     staged: UnsafeCell<Staged>,
+    /// The translated address of the CACHE operand about to arrive in
+    /// `cache_op`: the R10000's secondary index and way come from it.
+    op_pa: UnsafeCell<Option<u64>>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -297,6 +300,7 @@ impl<
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
             pd_tag_hook: UnsafeCell::new(None),
             staged: UnsafeCell::new(Staged { valid: 0, pages: HashMap::new(), changed: false }),
+            op_pa: UnsafeCell::new(None),
         }
     }
 
@@ -447,10 +451,10 @@ impl<
     // - the virtual-index field, TagLo[8:7]. A mismatch with the access's
     //   VA[13:12] purges primary lines at the recorded index, and there are
     //   no primary lines here to purge;
-    // - the operand's own index. The secondary index operations use the
-    //   operand address as given rather than translating it, as before, so
-    //   staging through a mapped address whose virtual and physical index
-    //   bits differ lands at the virtual one;
+    // - a CACHE operand on an uncached page. It is undefined on the R10000;
+    //   the operation goes ahead as if the page were cached;
+    // - the BadVAddr, Context and EntryHi values after a CACHE-raised TLB
+    //   exception, which the manuals do not give;
     // - coherence. Another CPU's or a DMA device's write to memory a CPU
     //   holds in a staged line does not reach the line, and the line's data
     //   are not visible to them;
@@ -871,6 +875,7 @@ impl<
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
         let sel = cache_op & 3;
         let op = cache_op & 0x1C;
+        let op_pa = unsafe { (*self.op_pa.get()).take() };
 
         if op == C_IST && sel == CACH_PD {
             if let Some(hook) = unsafe { &*self.pd_tag_hook.get() } {
@@ -891,6 +896,14 @@ impl<
         if Self::R10K_FAMILY && sel == CACH_SI {
             return 0;
         }
+        // The secondary set, way and quadword come from the operand's physical
+        // address, the primaries' from its virtual address (NEC U12754EJ1V0UMJ1
+        // pp.14-15). A caller that gives no physical address (a unit test, or
+        // an operand that was not translated) is indexed by the address given.
+        let virt_addr = match op_pa {
+            Some(pa) if Self::R10K_FAMILY && sel == CACH_SD => pa,
+            _ => virt_addr,
+        };
 
         // R4400/R5000: a tag keeps only its fields, and reads back with
         // generated check bits — exactly what the full model returns.
@@ -1134,6 +1147,10 @@ impl<
 
     fn cache_op_ecc(&self) -> u32 {
         unsafe { *self.ecc_out.get() }
+    }
+
+    fn set_cache_op_pa(&self, pa: u64) {
+        unsafe { *self.op_pa.get() = Some(pa) };
     }
 
     fn downstream(&self) -> Arc<dyn BusDevice> {
@@ -2048,6 +2065,211 @@ mod tests {
         let empty = toml::Value::Table(Default::default());
         d.load_cache_state(&empty).unwrap();
         assert_eq!(load::<8>(&d, PA + 8), MEM, "restoring a snapshot with no staged lines ends them");
+    }
+
+    /// Index Store Data (S) writes the one
+    /// quadword PA[6:4] names and leaves
+    /// the line's other quadwords alone, and a load or fetch finds each
+    /// quadword by the same bits. A quadword is stored once, the others are
+    /// rewritten many times, and the first must still read back what was
+    /// stored: for every quadword of the line, on 64- and 128-byte lines.
+    #[test]
+    fn index_store_data_writes_only_the_quadword_the_address_names() {
+        fn check<C: MipsCache + CpuModel + From<Arc<dyn BusDevice>>>(name: &str) {
+            let bus = Arc::new(Bus::default());
+            let c = C::from(bus.clone() as Arc<dyn BusDevice>);
+            let line = C::L2_LINE as u64;
+            let pa0 = 0x0020_3000u64 & !(line - 1);
+            let op = |pa: u64| 0xffff_ffff_8000_0000 | (pa & 0x1fff_fff8);
+            let quads = line / 16;
+            for target in 0..quads {
+                c.cache_op(C_IST | CACH_SD, op(pa0), l2_tag_of(pa0) | 2 << L2_STATE_SHIFT);
+                // Clear the whole line, then store the target quadword once.
+                for q in 0..quads {
+                    c.cache_op(C_R10K_ISD | CACH_SD, op(pa0 + 16 * q), 0);
+                }
+                // The upper doubleword of the quadword, to catch a mix-up of PA[3].
+                let at = pa0 + 16 * target + 8;
+                let (w0, w1) = (0x1000_0000 + target as u32, 0x2000_0000 + target as u32);
+                c.cache_op(C_R10K_ISD | CACH_SD, op(at), (w1 as u64) << 32 | w0 as u64);
+                // Rewrite every other quadword many times, both halves.
+                for round in 0..40u64 {
+                    for q in (0..quads).filter(|&q| q != target) {
+                        let half = (round + q) & 1;
+                        c.cache_op(C_R10K_ISD | CACH_SD, op(pa0 + 16 * q + 8 * half), 0xdead_0000_0000_0000 | round << 8 | q);
+                    }
+                }
+                // Index Load Data (S) of the quadword returns what was stored. The
+                // check bits on the rewrites are assumed valid: none are modelled.
+                assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, op(at), 0), (w1 as u64) << 32 | w0 as u64,
+                           "{name} quadword {target}: Index Load Data");
+                let rd = |pa: u64| c.read::<4>(op(pa), pa).data;
+                assert_eq!(rd(at), w0 as u64, "{name} quadword {target}: word at the lower address");
+                assert_eq!(rd(at + 4), w1 as u64, "{name} quadword {target}: word at +4");
+                assert_eq!(rd(at - 8), 0, "{name} quadword {target}: its other doubleword");
+                assert_eq!(rd(at - 4), 0, "{name} quadword {target}: its other doubleword");
+                let f = c.fetch(op(at), at);
+                assert_eq!(unsafe { (*f.instr).raw } as u64, w0 as u64, "{name} quadword {target}: fetch");
+                assert_eq!(bus.reads.load(Ordering::Relaxed), 0, "{name}");
+                // And the neighbours still hold what they were last given.
+                for q in (0..quads).filter(|&q| q != target) {
+                    let half = (39 + q) & 1;
+                    let v = 0xdead_0000_0000_0000u64 | 39 << 8 | q;
+                    assert_eq!(c.read::<8>(op(pa0 + 16 * q + 8 * half), pa0 + 16 * q + 8 * half).data, v.rotate_left(32),
+                               "{name} quadword {q}");
+                }
+            }
+        }
+        check::<R10000ShadowCache>("128-byte lines");
+        check::<R10000O2ShadowCache>("64-byte lines");
+        check::<R12000ShadowCache>("2 MiB, 128-byte lines");
+        check::<R16000ShadowCache>("4 MiB, 128-byte lines");
+        check::<R16000Scache8ShadowCache>("8 MiB, 128-byte lines");
+        check::<R16000Scache16ShadowCache>("16 MiB, 128-byte lines");
+    }
+
+    // ---- Mapped operands ------------------------------------------------
+
+    type MappedExec = crate::cpu::mips_exec::MipsExecutor<crate::cpu::mips_tlb::MipsTlb, R10000ShadowCache>;
+
+    /// An executor, a cached 4 KiB page at 0x200000 mapped to frame `pfn`
+    /// with cache algorithm `alg` and dirty bit `dirty`, and the bus it sits on.
+    fn mapped(alg: u64, dirty: u64, pfn: u64) -> (Box<MappedExec>, Arc<Bus>) {
+        use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor, EXEC_COMPLETE};
+        let bus = Arc::new(Bus::default());
+        let mut exec = Box::new(MipsExecutor::<crate::cpu::mips_tlb::MipsTlb, R10000ShadowCache>::new(
+            bus.clone() as Arc<dyn BusDevice>, crate::cpu::mips_tlb::MipsTlb::default(),
+            &MipsCpuConfig::for_model::<R10000ShadowCache>(Arc::new(crate::ip22_bus::memory_map(false)))));
+        #[cfg(feature = "jitv2")]
+        { exec.jitv2_dispatch_enabled = false; }
+        exec.core.cp0_config = (exec.core.cp0_config & !7) | 3; // KSEG0 cacheable
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+        exec.resync_privilege_state();
+        exec.core.cp0_index = 3;
+        exec.core.cp0_pagemask = 0;
+        exec.core.cp0_entryhi = 0x100 << 13;
+        exec.core.cp0_entrylo0 = (pfn << 6) | (alg << 3) | (dirty << 2) | (1 << 1);
+        exec.core.cp0_entrylo1 = 0;
+        use crate::cpu::mips_isa::OP_COP0;
+        assert_eq!(exec.exec((OP_COP0 << 26) | (0x10 << 21) | 0x02), EXEC_COMPLETE); // TLBWI
+        (exec, bus)
+    }
+
+    /// CACHE `op` on `va`, with TagLo/TagHi as given; the instruction's status.
+    fn cache_at(exec: &mut MappedExec, op: u32, va: u64, tag: u64) -> u32 {
+        exec.core.gpr[4] = va;
+        exec.core.cp0_taglo = tag & 0xffff_ffff;
+        exec.core.cp0_taghi = (tag >> 32) as u32;
+        exec.exec((crate::cpu::mips_isa::OP_CACHE << 26) | (4 << 21) | (op << 16))
+    }
+
+    const VA: u64 = 0x20_0000;
+
+    /// The executor is large: run on a big stack, as the other TLB tests do.
+    fn big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// The secondary set and way come from the physical address of a mapped
+    /// operand (NEC U12754EJ1V0UMJ1 pp.14-15). Stage through the mapped page, then a cached
+    /// access to the frame's kseg0 address hits, and the tag is at the frame's
+    /// set, not the virtual address's.
+    #[test]
+    fn a_mapped_index_operation_lands_on_the_physical_set() {
+        big_stack(|| {
+        use crate::cpu::mips_exec::EXEC_COMPLETE;
+        let pfn = 0x3a5; // PA 0x3a5000: set 0x4a0; the VA's set is 0
+        let (mut exec, bus) = mapped(3, 1, pfn);
+        let pa = pfn << 12 | 0x40;
+        let tag = l2_tag_of(pa) | 2 << L2_STATE_SHIFT;
+        assert_eq!(cache_at(&mut exec, 0x0b, VA + 0x40, tag), EXEC_COMPLETE);
+        assert_eq!(cache_at(&mut exec, 0x1f, VA + 0x40, 0x3333_4444_1111_2222), EXEC_COMPLETE);
+        let kseg0 = 0xffff_ffff_8000_0000 | pa;
+        assert_eq!(exec.cache.read::<4>(kseg0, pa).data, 0x1111_2222);
+        assert_eq!(exec.cache.read::<4>(kseg0 + 4, pa + 4).data, 0x3333_4444);
+        let f = exec.cache.fetch(kseg0, pa);
+        assert_eq!(unsafe { (*f.instr).raw }, 0x1111_2222, "a cached fetch through the frame");
+        assert_eq!(bus.reads.load(Ordering::Relaxed), 0);
+        // The tag is at the physical set, read back through an unmapped operand.
+        assert_eq!(cache_at(&mut exec, 0x07, 0xffff_ffff_8000_0000 | (pa & !127), 0), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_taglo | (exec.core.cp0_taghi as u64) << 32, tag);
+        // And nothing is at the set the virtual address would have chosen.
+        assert_eq!(cache_at(&mut exec, 0x07, 0xffff_ffff_8000_0000 | VA, 0), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_taglo, 0);
+        // Index Writeback Invalidate through the mapped operand ends the line.
+        assert_eq!(cache_at(&mut exec, 0x03, VA + 0x40, 0), EXEC_COMPLETE);
+        assert_eq!(exec.cache.read::<4>(kseg0, pa).data, 0xeeee_eeee);
+        })
+
+    }
+
+    /// Two virtual pages on one frame reach one secondary line; the primary
+    /// index stays virtual.
+    #[test]
+    fn aliases_share_a_secondary_line_and_the_primary_stays_virtual() {
+        big_stack(|| {
+        use crate::cpu::mips_exec::EXEC_COMPLETE;
+        let (mut exec, _) = mapped(3, 1, 0x3a5);
+        let pa = 0x3a5000u64;
+        let tag = l2_tag_of(pa) | 2 << L2_STATE_SHIFT;
+        cache_at(&mut exec, 0x0b, VA, tag);
+        // Another way to the same line: the unmapped address of the frame.
+        assert_eq!(cache_at(&mut exec, 0x07, 0xffff_ffff_8000_0000 | pa, 0), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_taglo | (exec.core.cp0_taghi as u64) << 32, tag);
+        // Primary D: indexed by VA[13:5]. Mapped store, unmapped load at the
+        // same low 14 bits but another frame.
+        assert_eq!(cache_at(&mut exec, 0x09, VA + 0x40, 0x0000_0abc), EXEC_COMPLETE);
+        assert_eq!(cache_at(&mut exec, 0x05, 0xffff_ffff_8000_0000 | 0x40, 0), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_taglo, 0x0abc);
+        })
+
+    }
+
+    /// A mapped operand takes TLB Refill when no entry maps it, and the cache
+    /// does not change.
+    #[test]
+    fn an_unmapped_operand_takes_tlb_refill() {
+        big_stack(|| {
+        use crate::cpu::mips_exec::{EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL};
+        let (mut exec, _) = mapped(3, 1, 0x3a5);
+        let st = cache_at(&mut exec, 0x0b, 0x60_0000, l2_tag_of(0x3a5000) | 2 << L2_STATE_SHIFT);
+        assert!(st & EXEC_IS_EXCEPTION != 0 && st & EXEC_IS_TLB_REFILL != 0, "status {st:#x}");
+        assert!(!exec.cache.page_staged(0x3a5000));
+        // The same through an index operation on a data cache.
+        let st = cache_at(&mut exec, 0x1d, 0x60_0000, 0);
+        assert!(st & EXEC_IS_EXCEPTION != 0 && st & EXEC_IS_TLB_REFILL != 0, "status {st:#x}");
+        })
+
+    }
+
+    /// A valid entry with the dirty bit clear is accepted: CACHE never takes
+    /// TLB Modified.
+    #[test]
+    fn a_clean_page_takes_no_tlb_modified() {
+        big_stack(|| {
+        use crate::cpu::mips_exec::EXEC_COMPLETE;
+        let (mut exec, _) = mapped(3, 0, 0x3a5);
+        let tag = l2_tag_of(0x3a5000) | 2 << L2_STATE_SHIFT;
+        assert_eq!(cache_at(&mut exec, 0x0b, VA, tag), EXEC_COMPLETE);
+        assert_eq!(cache_at(&mut exec, 0x1f, VA, 7), EXEC_COMPLETE);
+        assert_eq!(cache_at(&mut exec, 0x03, VA, 0), EXEC_COMPLETE);
+        })
+
+    }
+
+    /// A CACHE operand on an uncached page is undefined on the R10000. This
+    /// model translates it and goes ahead as if the page were cached; pinned
+    /// here so a change is deliberate.
+    #[test]
+    fn an_operand_on_an_uncached_page_goes_ahead() {
+        big_stack(|| {
+        use crate::cpu::mips_exec::EXEC_COMPLETE;
+        let (mut exec, _) = mapped(2, 1, 0x3a5);
+        let tag = l2_tag_of(0x3a5000) | 2 << L2_STATE_SHIFT;
+        assert_eq!(cache_at(&mut exec, 0x0b, VA, tag), EXEC_COMPLETE);
+        assert!(exec.cache.page_staged(0x3a5000));
+        })
+
     }
 
     /// Which pages the page-granular fast paths must leave to the cache:
