@@ -15,6 +15,7 @@ pub mod crime;
 pub mod battery_clock;
 pub mod deadline_timers;
 pub mod ds1687;
+pub mod ds1744;
 pub mod heart;
 pub mod heart_mem;
 pub mod ioc3;
