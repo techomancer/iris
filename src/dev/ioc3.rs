@@ -1,7 +1,8 @@
 //! SGI IOC3 base I/O controller, with Octane and Fuel board populations.
 //!
 //! One PCI function with one 1 MiB memory BAR. Behind it: two 16550 serial
-//! ports with a ring-DMA engine each, a PS/2 keyboard and mouse controller,
+//! ports with a ring-DMA engine each (the engine is shared with the IOC4, in
+//! `ioc_sdma.rs`), a PS/2 keyboard and mouse controller,
 //! a parallel port, a MicroLAN (one-wire) master, the GPIO pins, a DS1685
 //! clock on the Octane byte bus or Fuel's flat system Timekeeper, the
 //! Ethernet buffer RAM and, in the register range at 0xf0,
@@ -58,6 +59,9 @@ use crate::dev::ioc3_port::Ioc3EthPort;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{self, BoardRecord};
+use crate::dev::ioc_sdma::{off as sdma_off, EngineUart, Host, Params, Sdma, Source};
+#[cfg(test)]
+use crate::dev::ioc_sdma::{ctl as sdma_ctl, ARM_RX_TIMER, HELD_SHIFT, TIMER_TICK_NS, TX_DELAY, TX_INTERRUPT};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::irq::{InterruptController, IrqLine};
@@ -166,20 +170,8 @@ mod uart_reg {
     pub const MSR: u32 = 6;
     pub const SCR: u32 = 7;
 }
-const LSR_DR: u8 = 0x01;
-const LSR_OE: u8 = 0x02;
-const LSR_PE: u8 = 0x04;
-const LSR_FE: u8 = 0x08;
-const LSR_BI: u8 = 0x10;
-const MCR_DTR: u8 = 0x01;
-const MCR_RTS: u8 = 0x02;
-const MCR_OUT1: u8 = 0x04;
-const MCR_OUT2: u8 = 0x08;
-const MCR_LOOP: u8 = 0x10;
 const MCR_AFE: u8 = 0x20;
-const MSR_DCTS: u8 = 0x01;
 const MSR_CTS: u8 = 0x10;
-const MSR_DCD: u8 = 0x80;
 const LSR_TEST_MASK: u8 = 0x7f;
 const MSR_TEST_MASK: u8 = 0x0f;
 /// The reference clock of the UART crystal: the pre-divider divides it, and
@@ -233,16 +225,11 @@ impl Uart {
         self.core.check_timeout(Instant::now()) || moved
     }
 
-    /// The 16550 proper: what the ring engine sees.
-    fn read_core(&mut self, r: u32) -> u8 {
-        self.core.read(r)
-    }
-
     /// A guest's byte-wide read, with the chip's additions: the auto-flow
     /// bit in modem control, and a factory-test write to line or modem
     /// status showing in the read that follows it and no later one.
     fn read(&mut self, r: u32) -> u8 {
-        let mut v = self.read_core(r);
+        let mut v = self.core.read(r);
         match r {
             uart_reg::MCR => v |= self.mcr_afe,
             uart_reg::LSR => {
@@ -275,10 +262,31 @@ impl Uart {
         }
         self.core.write(r, v);
     }
+}
 
-    /// Modem status as the ring engine reads it with flow control looped back.
-    fn flow_cts(&self, control: u32) -> bool {
-        self.loopback() && control & sdma_ctl::FLOW_CONTROL != 0
+impl EngineUart for Uart {
+    fn loopback(&self) -> bool {
+        self.core.loopback()
+    }
+
+    fn read_core(&mut self, r: u32) -> u8 {
+        self.core.read(r)
+    }
+
+    fn write(&mut self, r: u32, v: u8) {
+        Uart::write(self, r, v);
+    }
+
+    fn lsr(&self) -> u8 {
+        self.core.lsr()
+    }
+
+    fn mcr(&self) -> u8 {
+        self.core.mcr()
+    }
+
+    fn msr(&self) -> u8 {
+        self.core.msr()
     }
 }
 
@@ -286,85 +294,16 @@ impl Uart {
 // Serial ring DMA
 // ---------------------------------------------------------------------------
 
-/// Port DMA register offsets (bytes, from the port's first register).
-mod sdma_off {
-    pub const CONTROL: u32 = 0x00;
-    pub const TX_PRODUCE: u32 = 0x04;
-    pub const TX_CONSUME: u32 = 0x08;
-    pub const RX_PRODUCE: u32 = 0x0c;
-    pub const RX_CONSUME: u32 = 0x10;
-    pub const RX_TIMER: u32 = 0x14;
-    pub const SHADOW: u32 = 0x18;
-    pub const REGS: u32 = 7;
-}
-mod sdma_ctl {
-    pub const HIGH_WATER: u32 = 0x1ff;
-    pub const TX_TIMER_RUN: u32 = 1 << 16;
-    pub const FLOW_CONTROL: u32 = 1 << 17;
-    pub const RX_TO_MEMORY: u32 = 1 << 27;
-    pub const ENABLE: u32 = 1 << 28;
-    pub const PAUSE: u32 = 1 << 29;
-    pub const PAUSED: u32 = 1 << 30;
-    pub const RESET: u32 = 1 << 31;
-    pub const UNSTORED: u32 = RESET | RX_TO_MEMORY | PAUSED | TX_TIMER_RUN;
-}
-const ENTRY: usize = 8;
-const ENTRY_CHARS: usize = 4;
-const ARM_RX_TIMER: u32 = 1 << 31;
-const HELD_SHIFT: u32 = 24;
-const TIMER_RELOAD: u32 = 0xfff;
-const TIMER_COUNT_SHIFT: u32 = 16;
-const TIMER_TICK_NS: u64 = 62_500; // 16 kHz
-const TX_TYPE: u8 = 0xc0;
-const TX_CHARACTER: u8 = 0x40;
-const TX_MODEM: u8 = 0x80;
-const TX_DELAY: u8 = 0xc0;
-const TX_INTERRUPT: u8 = 0x20;
-const RX_OVERRUN: u8 = 0x01;
-const RX_PARITY: u8 = 0x02;
-const RX_FRAMING: u8 = 0x04;
-const RX_BREAK: u8 = 0x08;
-const RX_CTS: u8 = 0x10;
-const RX_CD: u8 = 0x20;
-const RX_MODEM_OK: u8 = 0x40;
-const RX_DATA_OK: u8 = 0x80;
+/// What IOC3's engine does that IOC4's does not: it reports the packer's held
+/// count, and a failed transfer does not stop the port.
+const SDMA_PARAMS: Params = Params { held_counts: true, halt_on_dma_error: false };
+
 /// Chip control: where each engine finds its 16550 (byte offset / 8).
 const CHIP_CTRL_MASK: u32 = 0x0007_ffff;
 const CHIP_CTRL_PORT_A_SHIFT: u32 = 1;
 const CHIP_CTRL_PORT_B_SHIFT: u32 = 8;
 const CHIP_CTRL_PORT_FIELD: u32 = 0x7f;
 const CHIP_CTRL_ARB_IDLE: u32 = 1 << 22;
-
-#[derive(Default)]
-struct SdmaPort {
-    reg: [u32; 7],
-    packer: [u8; ENTRY],
-    packed: usize,
-    tx_entry: [u8; ENTRY],
-    tx_fetched: bool,
-    tx_slot: usize,
-    armed: bool,
-    drain_pending: bool,
-    busy: bool,
-    paused: bool,
-    rx_deadline: Option<Instant>,
-    rx_idle_count: u32,
-    /// Time a frozen timer had left when a pause began.
-    rx_frozen: Option<Duration>,
-    tx_delay_deadline: Option<Instant>,
-    tx_delay_frozen: Option<Duration>,
-    tx_delay_irq: bool,
-    /// An entry waits that the receive ring had no room for; drives
-    /// receive-ring-full while ring DMA is on.
-    post_refused: bool,
-}
-
-#[derive(Default)]
-struct Sdma {
-    base_hi: u32,
-    base_lo: u32,
-    port: [SdmaPort; 2],
-}
 
 // ---------------------------------------------------------------------------
 // DMA as the chip masters the bus
@@ -898,7 +837,7 @@ impl St {
             pin_control: 0,
             pin_data: 0,
             uart: [Uart::new(), Uart::new()],
-            sdma: Sdma::default(),
+            sdma: Sdma::new(2, SDMA_PARAMS),
             kbc: Kbc::default(),
             par: Parallel::default(),
             rtc: Rtc::new(),
@@ -913,7 +852,7 @@ impl St {
     fn reset(&mut self) {
         self.int_status = 0;
         self.int_enable = 0;
-        self.sdma = Sdma::default();
+        self.sdma.reset();
         for u in &mut self.uart {
             u.reset();
         }
@@ -941,10 +880,9 @@ impl St {
     /// bit can reach the line, and the NVRAM file's debounce.
     fn deadlines(&self) -> Deadlines {
         let mut d = [None; KINDS];
-        for (p, port) in self.sdma.port.iter().enumerate() {
-            d[K_RX + p] = port.rx_deadline;
-            // A paused port keeps its transmit delay frozen.
-            d[K_TX_DELAY + p] = if port.paused { None } else { port.tx_delay_deadline };
+        for p in 0..2 {
+            d[K_RX + p] = self.sdma.rx_deadline(p);
+            d[K_TX_DELAY + p] = self.sdma.tx_delay_deadline(p);
         }
         if self.int_enable & int::RT_OUTPUT_PULSE != 0 {
             d[K_INT_OUT] = self.int_out.next;
@@ -964,14 +902,12 @@ impl St {
         self.set_bit(int::serial(p, int::PASSTHROUGH), lvl);
         // On every level, not on assertion alone: the ring console receives
         // with the 16550's own interrupts disabled.
-        if !self.sdma.port[p].busy {
-            self.sdma_run(p);
-        }
+        self.sdma_run(p);
     }
 
     fn uart_read(&mut self, p: usize, r: u32) -> u8 {
         let mut v = self.uart[p].read(r);
-        if r == uart_reg::MSR && self.uart[p].flow_cts(self.sdma.port[p].reg[0]) {
+        if r == uart_reg::MSR && self.sdma.flow_cts(p, self.uart[p].loopback()) {
             v |= MSR_CTS;
         }
         self.uart_changed(p);
@@ -993,38 +929,81 @@ impl St {
         self.dma.as_ref().is_some_and(|d| d.dma_write(addr, data).is_ok())
     }
 
-    fn sdma_ctl(&self, p: usize) -> u32 {
-        self.sdma.port[p].reg[0]
+    /// The engine and the chip around it, borrowed apart so the engine can
+    /// drive the 16550s, the interrupt status and the bus master.
+    fn sdma_split(&mut self) -> (&mut Sdma, SdmaHost<'_>) {
+        let host = SdmaHost {
+            uart: &mut self.uart,
+            int_status: &mut self.int_status,
+            chip_control: self.chip_control,
+            serial: self.cfg.serial,
+            dma: self.dma.as_deref(),
+        };
+        (&mut self.sdma, host)
     }
 
-    fn sdma_ring_size(&self) -> u32 {
-        if self.sdma.base_lo & 1 != 0 { 4096 } else { 1024 }
+    fn sdma_run(&mut self, p: usize) {
+        let (sdma, mut host) = self.sdma_split();
+        sdma.run(p, &mut host);
     }
 
-    fn sdma_mask(&self) -> u32 {
-        (self.sdma_ring_size() - 1) & !(ENTRY as u32 - 1)
+    /// Expiries already due happen before an access.
+    fn sdma_catch_up(&mut self, now: Instant) {
+        let (sdma, mut host) = self.sdma_split();
+        sdma.catch_up(now, &mut host);
     }
 
-    fn sdma_ring(&self, p: usize, dir: u32) -> u64 {
-        let base = ((self.sdma.base_hi as u64) << 32) | (self.sdma.base_lo & 0xffff_f000) as u64;
-        base.saturating_add(((p as u64 % 2) * 2 + dir as u64) * self.sdma_ring_size() as u64)
+    fn sdma_port_read(&mut self, p: usize, off: u32) -> u32 {
+        let (sdma, mut host) = self.sdma_split();
+        sdma.port_read(p, off, &mut host)
     }
 
-    fn sdma_raise(&mut self, p: usize, src: u32) {
-        self.int_status |= int::serial(p, src);
+    fn sdma_port_write(&mut self, p: usize, off: u32, val: u32) {
+        let (sdma, mut host) = self.sdma_split();
+        sdma.port_write(p, off, val, &mut host);
+    }
+}
+
+/// IOC3 as the ring engine sees it: two 16550s, the SuperIO status word, and
+/// the bus master.
+struct SdmaHost<'a> {
+    uart: &'a mut [Uart; 2],
+    int_status: &'a mut u32,
+    chip_control: u32,
+    serial: [bool; 2],
+    dma: Option<&'a Ioc3Dma>,
+}
+
+impl SdmaHost<'_> {
+    fn set_bit(&mut self, mask: u32, level: bool) {
+        if level {
+            *self.int_status |= mask;
+        } else {
+            *self.int_status &= !mask;
+        }
+    }
+}
+
+impl Host for SdmaHost<'_> {
+    fn uart(&mut self, port: usize) -> &mut dyn EngineUart {
+        &mut self.uart[port]
     }
 
-    fn sdma_level(&mut self, p: usize, src: u32, level: bool) {
-        self.set_bit(int::serial(p, src), level);
+    fn raise(&mut self, port: usize, src: Source) {
+        *self.int_status |= int::serial(port, src as u32);
+    }
+
+    fn set_level(&mut self, port: usize, src: Source, level: bool) {
+        self.set_bit(int::serial(port, src as u32), level);
     }
 
     /// Chip control places each port's 16550 for its engine; aimed anywhere
     /// else, the engine does not reach the port.
-    fn sdma_reachable(&self, p: usize) -> bool {
-        if !self.cfg.serial[p] {
+    fn reachable(&self, port: usize) -> bool {
+        if !self.serial[port] {
             return false;
         }
-        let (shift, base) = if p == 1 {
+        let (shift, base) = if port == 1 {
             (CHIP_CTRL_PORT_B_SHIFT, reg::SERIAL_B)
         } else {
             (CHIP_CTRL_PORT_A_SHIFT, reg::SERIAL_A)
@@ -1032,416 +1011,18 @@ impl St {
         (self.chip_control >> shift) & CHIP_CTRL_PORT_FIELD == (base & 0xfff) / 8
     }
 
-    fn sdma_running(&self, p: usize) -> bool {
-        let c = self.sdma_ctl(p);
-        c & sdma_ctl::ENABLE != 0 && c & sdma_ctl::PAUSE == 0
+    /// Keep the pass-through bit on the 16550's level.
+    fn uart_line_changed(&mut self, port: usize) {
+        let level = self.uart[port].irq();
+        self.set_bit(int::serial(port, int::PASSTHROUGH), level);
     }
 
-    /// Transmit-ring-empty is a level: ring DMA on, nothing left in the ring
-    /// or held by the engine.
-    fn sdma_update_tx_empty(&mut self, p: usize) {
-        let mask = self.sdma_mask();
-        let port = &self.sdma.port[p];
-        let empty = self.sdma_ctl(p) & sdma_ctl::ENABLE != 0
-            && (port.reg[1] ^ port.reg[2]) & mask == 0
-            && !port.tx_fetched
-            && port.tx_delay_deadline.is_none();
-        self.sdma_level(p, int::TX_RING_EMPTY, empty);
+    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.dma.is_some_and(|d| d.dma_read(addr, buf).is_ok())
     }
 
-    /// The receive high-water mark counts ring entries; a level. So is
-    /// receive-ring-full: set while ring DMA is on and an entry waits that
-    /// the ring had no room for, so an acknowledgement does not bring it back
-    /// with every refused retry, and it falls once the consumer makes room,
-    /// posted yet or not. A ring filled exactly, with nothing waiting, does
-    /// not raise it. A model choice; what the part does is not known.
-    fn sdma_update_high_water(&mut self, p: usize) {
-        let mask = self.sdma_mask();
-        let port = &self.sdma.port[p];
-        let hw = self.sdma_ctl(p) & sdma_ctl::HIGH_WATER;
-        let waiting = port.reg[3].wrapping_sub(port.reg[4]) & mask;
-        let level = hw != 0 && waiting / ENTRY as u32 >= hw;
-        if (port.reg[3] + ENTRY as u32) & mask != port.reg[4] & mask {
-            self.sdma.port[p].post_refused = false;
-        }
-        let full = self.sdma_ctl(p) & sdma_ctl::ENABLE != 0 && self.sdma.port[p].post_refused;
-        self.sdma_level(p, int::RX_HIGH_WATER, level);
-        self.sdma_level(p, int::RX_RING_FULL, full);
-    }
-
-    /// Post the packer as one entry. Fails, keeping the characters, when the
-    /// ring is full or the write is refused.
-    fn sdma_post(&mut self, p: usize) -> bool {
-        let mask = self.sdma_mask();
-        let ring = self.sdma_ring(p, 1);
-        let (produce, consume, packer) = {
-            let port = &self.sdma.port[p];
-            (port.reg[3], port.reg[4], port.packer)
-        };
-        let next = (produce + ENTRY as u32) & mask;
-        if next == consume & mask {
-            self.sdma.port[p].post_refused = true;
-            return false;
-        }
-        if !self.dma_write(ring.saturating_add((produce & mask) as u64), &packer) {
-            self.sdma_raise(p, int::DMA_ERROR);
-            return false;
-        }
-        let port = &mut self.sdma.port[p];
-        port.reg[3] = next;
-        port.post_refused = false;
-        port.packed = 0;
-        port.packer = [0; ENTRY];
-        true
-    }
-
-    fn sdma_rx_timer_start(&mut self, p: usize, since: Instant) {
-        let port = &mut self.sdma.port[p];
-        let reload = port.reg[5] & TIMER_RELOAD;
-        port.rx_idle_count = 0;
-        let dur = Duration::from_nanos(reload as u64 * TIMER_TICK_NS);
-        if port.paused {
-            // Started while paused, it waits frozen at its full count.
-            port.rx_frozen = Some(dur);
-        } else {
-            port.rx_deadline = Some(since + dur);
-        }
-    }
-
-    fn sdma_rx_timer_expired(&mut self, p: usize) {
-        self.sdma.port[p].rx_idle_count = 0;
-        self.sdma.port[p].rx_deadline = None;
-        if self.sdma.port[p].packed != 0 {
-            self.sdma_post(p);
-        }
-        // Raised at every expiry, even over an empty ring; the arm is spent.
-        if self.sdma.port[p].armed {
-            self.sdma_raise(p, int::RX_TIMER);
-        }
-        self.sdma.port[p].armed = false;
-        self.sdma_update_high_water(p);
-    }
-
-    /// Expiries already due happen before an access.
-    fn sdma_catch_up(&mut self, now: Instant) {
-        for p in 0..2 {
-            let delay = self.sdma.port[p].tx_delay_deadline;
-            if let Some(d) = delay {
-                if !self.sdma.port[p].paused && d <= now {
-                    self.sdma_tx_delay_ended(p, d);
-                }
-            }
-            if let Some(d) = self.sdma.port[p].rx_deadline {
-                if d <= now {
-                    self.sdma_rx_timer_expired(p);
-                }
-            }
-        }
-    }
-
-    fn sdma_tx_delay_ended(&mut self, p: usize, when: Instant) {
-        let irq = {
-            let port = &mut self.sdma.port[p];
-            port.tx_delay_deadline = None;
-            std::mem::take(&mut port.tx_delay_irq)
-        };
-        if irq {
-            self.sdma_raise(p, int::TX_EXPLICIT);
-        }
-        self.sdma_run_from(p, when);
-    }
-
-    fn sdma_receive(&mut self, p: usize, since: Instant) {
-        while self.sdma_running(p) {
-            if self.sdma.port[p].packed == ENTRY_CHARS && !self.sdma_post(p) {
-                break;
-            }
-            // Line status before the character: reading it clears the latches.
-            let lsr = self.uart[p].read_core(uart_reg::LSR);
-            if lsr & LSR_DR == 0 {
-                break;
-            }
-            let data = self.uart[p].read_core(uart_reg::RBR_THR);
-            let mut msr = self.uart[p].read_core(uart_reg::MSR);
-            if self.uart[p].flow_cts(self.sdma_ctl(p)) {
-                msr |= MSR_CTS;
-            }
-            let mut status = RX_DATA_OK | RX_MODEM_OK;
-            for (bit, flag) in [(LSR_OE, RX_OVERRUN), (LSR_PE, RX_PARITY), (LSR_FE, RX_FRAMING), (LSR_BI, RX_BREAK)] {
-                if lsr & bit != 0 {
-                    status |= flag;
-                }
-            }
-            if msr & MSR_CTS != 0 {
-                status |= RX_CTS;
-            }
-            if msr & MSR_DCD != 0 {
-                status |= RX_CD;
-            }
-            let start_timer = {
-                let port = &mut self.sdma.port[p];
-                port.packer[port.packed] = data;
-                port.packer[ENTRY_CHARS + port.packed] = status;
-                port.packed += 1;
-                port.armed && port.rx_deadline.is_none() && port.rx_frozen.is_none()
-            };
-            // Started by the first character after the arm; later ones leave
-            // a running timer alone.
-            if start_timer {
-                self.sdma_rx_timer_start(p, since);
-            }
-            // A fourth character completes the entry; fewer wait for the
-            // timer or a drain.
-            if self.sdma.port[p].packed == ENTRY_CHARS {
-                self.sdma_post(p);
-            }
-        }
-        self.uart_pass_bit(p);
-    }
-
-    /// Keep the pass-through bit on the 16550's level without kicking the
-    /// engine (it is already running).
-    fn uart_pass_bit(&mut self, p: usize) {
-        let lvl = self.uart[p].irq();
-        self.set_bit(int::serial(p, int::PASSTHROUGH), lvl);
-    }
-
-    /// Each control byte types its data byte; the empty type ends the entry,
-    /// wherever it sits.
-    fn sdma_transmit(&mut self, p: usize, since: Instant) {
-        let mask = self.sdma_mask();
-        let ring = self.sdma_ring(p, 0);
-        if self.sdma.port[p].tx_delay_deadline.is_some() {
-            return;
-        }
-        loop {
-            let (produce, consume) = {
-                let port = &self.sdma.port[p];
-                (port.reg[1], port.reg[2])
-            };
-            if !(self.sdma_running(p) && consume & mask != produce & mask) {
-                break;
-            }
-            if !self.sdma.port[p].tx_fetched {
-                let mut entry = [0u8; ENTRY];
-                if !self.dma_read(ring.saturating_add((consume & mask) as u64), &mut entry) {
-                    self.sdma_raise(p, int::DMA_ERROR);
-                    break;
-                }
-                let port = &mut self.sdma.port[p];
-                port.tx_entry = entry;
-                port.tx_fetched = true;
-            }
-            let entry = self.sdma.port[p].tx_entry;
-            let mut slot = self.sdma.port[p].tx_slot;
-            while slot < ENTRY_CHARS {
-                let control = entry[ENTRY_CHARS + slot];
-                let ty = control & TX_TYPE;
-                if ty == 0 {
-                    break;
-                }
-                match ty {
-                    TX_CHARACTER => {
-                        let looped = self.uart[p].loopback();
-                        // What has already arrived goes ahead of this one.
-                        if looped {
-                            self.sdma_receive(p, since);
-                        }
-                        self.uart[p].write(uart_reg::RBR_THR, entry[slot]);
-                        // Approximation: a looped-back character arrives at
-                        // once, where the part takes a character time.
-                        self.sdma_receive(p, since);
-                    }
-                    TX_MODEM => self.uart[p].write(uart_reg::MCR, entry[slot]),
-                    TX_DELAY => {
-                        // The data byte is milliseconds of quiet.
-                        if entry[slot] != 0 {
-                            let port = &mut self.sdma.port[p];
-                            port.tx_slot = slot + 1;
-                            port.tx_delay_deadline = Some(since + Duration::from_millis(entry[slot] as u64));
-                            port.tx_delay_irq = control & TX_INTERRUPT != 0;
-                            return;
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                slot += 1;
-                self.sdma.port[p].tx_slot = slot;
-                if control & TX_INTERRUPT != 0 {
-                    self.sdma_raise(p, int::TX_EXPLICIT);
-                }
-            }
-            let port = &mut self.sdma.port[p];
-            port.tx_slot = 0;
-            port.tx_fetched = false;
-            port.reg[2] = (port.reg[2] + ENTRY as u32) & mask;
-        }
-        self.uart_pass_bit(p);
-    }
-
-    /// The drain posts what the packer holds and reads back set until it has;
-    /// it waits while ring DMA is off or paused and while the ring is full.
-    fn sdma_drain(&mut self, p: usize) {
-        if !self.sdma.port[p].drain_pending || !self.sdma_running(p) {
-            return;
-        }
-        if self.sdma.port[p].packed != 0 && !self.sdma_post(p) {
-            return;
-        }
-        self.sdma.port[p].drain_pending = false;
-    }
-
-    fn sdma_run_from(&mut self, p: usize, since: Instant) {
-        if !self.sdma_reachable(p) || self.sdma.port[p].busy {
-            return;
-        }
-        self.sdma.port[p].busy = true;
-        self.sdma_transmit(p, since);
-        self.sdma_receive(p, since);
-        self.sdma_drain(p);
-        self.sdma_update_high_water(p);
-        self.sdma_update_tx_empty(p);
-        self.sdma.port[p].busy = false;
-    }
-
-    fn sdma_run(&mut self, p: usize) {
-        self.sdma_run_from(p, Instant::now());
-    }
-
-    /// A passive mirror of the 16550's lines; no read side effects.
-    fn sdma_shadow(&self, p: usize) -> u32 {
-        let u = &self.uart[p];
-        let lsr = u.core.lsr();
-        let mcr = u.core.mcr();
-        let mut msr = u.core.msr();
-        if u.flow_cts(self.sdma_ctl(p)) {
-            msr |= MSR_CTS;
-        }
-        let mut s = lsr as u32;
-        for (m, bit) in [(MSR_DCTS, 16), (0x08, 19), (MSR_CTS, 20), (MSR_DCD, 23)] {
-            if msr & m != 0 {
-                s |= 1 << bit;
-            }
-        }
-        for (m, bit) in [(MCR_DTR, 24), (MCR_RTS, 25), (MCR_OUT1, 26), (MCR_OUT2, 27), (MCR_LOOP, 28)] {
-            if mcr & m != 0 {
-                s |= 1 << bit;
-            }
-        }
-        s
-    }
-
-    fn sdma_port_read(&mut self, p: usize, off: u32) -> u32 {
-        let now = Instant::now();
-        self.sdma_catch_up(now);
-        if off == sdma_off::SHADOW {
-            return self.sdma_shadow(p);
-        }
-        let port = &self.sdma.port[p];
-        let mut v = port.reg[(off / 4) as usize];
-        match off {
-            sdma_off::CONTROL => {
-                if v & sdma_ctl::PAUSE != 0 {
-                    v |= sdma_ctl::PAUSED;
-                }
-                if port.tx_delay_deadline.is_some() {
-                    v |= sdma_ctl::TX_TIMER_RUN;
-                }
-                if port.drain_pending {
-                    v |= sdma_ctl::RX_TO_MEMORY;
-                }
-            }
-            sdma_off::RX_CONSUME => {
-                if port.armed {
-                    v |= ARM_RX_TIMER;
-                }
-            }
-            sdma_off::RX_PRODUCE => v |= (port.packed as u32) << HELD_SHIFT,
-            sdma_off::RX_TIMER => {
-                // Ticks left while running or frozen; idle, whatever a reload
-                // write last loaded.
-                let mut ticks = port.rx_idle_count;
-                if let (true, Some(left)) = (port.paused, port.rx_frozen) {
-                    ticks = (left.as_nanos() as u64 / TIMER_TICK_NS).min(TIMER_RELOAD as u64) as u32;
-                } else if let Some(d) = port.rx_deadline {
-                    let left = d.saturating_duration_since(now);
-                    ticks = (left.as_nanos() as u64 / TIMER_TICK_NS).min(TIMER_RELOAD as u64) as u32;
-                }
-                v |= ticks << TIMER_COUNT_SHIFT;
-            }
-            _ => {}
-        }
-        v
-    }
-
-    fn sdma_port_write(&mut self, p: usize, off: u32, val: u32) {
-        let now = Instant::now();
-        self.sdma_catch_up(now);
-        let mask = self.sdma_mask();
-        match off {
-            sdma_off::CONTROL => {
-                self.sdma.port[p].reg[0] = val & !sdma_ctl::UNSTORED;
-                if val & sdma_ctl::RESET != 0 {
-                    // Resets the four indices and nothing else.
-                    let port = &mut self.sdma.port[p];
-                    port.reg[1..=4].fill(0);
-                    port.armed = false;
-                    port.drain_pending = false;
-                    port.packed = 0;
-                    port.post_refused = false;
-                    port.packer = [0; ENTRY];
-                    port.tx_slot = 0;
-                    port.tx_fetched = false;
-                    port.tx_delay_deadline = None;
-                    port.tx_delay_irq = false;
-                    port.rx_deadline = None;
-                    port.rx_frozen = None;
-                    port.rx_idle_count = 0;
-                }
-                if val & sdma_ctl::RX_TO_MEMORY != 0 {
-                    self.sdma.port[p].drain_pending = true;
-                }
-                let port = &mut self.sdma.port[p];
-                // A pause freezes the receive timer and a transmit delay;
-                // resuming lets each finish the time it had left. A model
-                // choice; no source says what the part does.
-                if val & sdma_ctl::PAUSE != 0 && !port.paused {
-                    port.paused = true;
-                    port.rx_frozen = port.rx_deadline.take().map(|d| d.saturating_duration_since(now));
-                    port.tx_delay_frozen = port.tx_delay_deadline.take().map(|d| d.saturating_duration_since(now));
-                } else if val & sdma_ctl::PAUSE == 0 && port.paused {
-                    port.paused = false;
-                    port.rx_deadline = port.rx_frozen.take().map(|l| now + l);
-                    port.tx_delay_deadline = port.tx_delay_frozen.take().map(|l| now + l);
-                }
-                if val & sdma_ctl::ENABLE == 0 {
-                    port.rx_deadline = None;
-                    port.rx_frozen = None;
-                }
-                self.sdma_run(p);
-            }
-            sdma_off::TX_PRODUCE | sdma_off::TX_CONSUME | sdma_off::RX_PRODUCE => {
-                self.sdma.port[p].reg[(off / 4) as usize] = val & mask;
-                self.sdma_run(p);
-            }
-            sdma_off::RX_CONSUME => {
-                // Bit 31 sets the arm; a write with it clear leaves it.
-                self.sdma.port[p].reg[4] = val & mask;
-                if val & ARM_RX_TIMER != 0 {
-                    self.sdma.port[p].armed = true;
-                }
-                self.sdma_run(p);
-            }
-            sdma_off::RX_TIMER => {
-                let port = &mut self.sdma.port[p];
-                port.reg[5] = val & TIMER_RELOAD;
-                port.rx_idle_count = val & TIMER_RELOAD;
-            }
-            // The shadow discards writes silently.
-            _ => {}
-        }
-        self.sdma_update_tx_empty(p);
-        self.sdma_update_high_water(p);
+    fn dma_write(&self, addr: u64, data: &[u8]) -> bool {
+        self.dma.is_some_and(|d| d.dma_write(addr, data).is_ok())
     }
 }
 
@@ -1585,8 +1166,8 @@ impl St {
             reg::PIN_DATA => self.pin_data_now(),
             0x80..=0x98 => self.par_dma_read(a),
             0x9c | 0xa0 | 0xa4 => self.kbc_read(a, c.ps2),
-            0xb0 => self.sdma.base_hi,
-            0xb4 => self.sdma.base_lo,
+            0xb0 => self.sdma.base_read(0, true),
+            0xb4 => self.sdma.base_read(0, false),
             0xb8..=0xef => {
                 let (p, off) = Self::sdma_port_of(a);
                 self.sdma_port_read(p, off)
@@ -1657,8 +1238,8 @@ impl St {
             reg::PIN_DATA => self.pin_data = val,
             0x80..=0x98 => self.par_dma_write(a, val),
             0x9c | 0xa8 | 0xac => self.kbc_write(a, val, c.ps2),
-            0xb0 => self.sdma.base_hi = val,
-            0xb4 => self.sdma.base_lo = val,
+            0xb0 => self.sdma.base_write(0, true, val),
+            0xb4 => self.sdma.base_write(0, false, val),
             0xb8..=0xef => {
                 let (p, off) = Self::sdma_port_of(a);
                 if self.cfg.serial[0] || self.cfg.serial[1] {
@@ -2828,23 +2409,23 @@ impl PciBusDevice for Ioc3 {
 // was waiting out. Deadlines are encoded as nanoseconds left plus one,
 // zero for none.
 
-fn until(due: Option<Instant>, now: Instant) -> u64 {
+pub(crate) fn until(due: Option<Instant>, now: Instant) -> u64 {
     due.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
 }
 
-fn due(left: u64, now: Instant) -> Option<Instant> {
+pub(crate) fn due(left: u64, now: Instant) -> Option<Instant> {
     (left != 0).then(|| now + Duration::from_nanos(left - 1))
 }
 
-fn span(d: Option<Duration>) -> u64 {
+pub(crate) fn span(d: Option<Duration>) -> u64 {
     d.map_or(0, |d| d.as_nanos() as u64 + 1)
 }
 
-fn unspan(n: u64) -> Option<Duration> {
+pub(crate) fn unspan(n: u64) -> Option<Duration> {
     (n != 0).then(|| Duration::from_nanos(n - 1))
 }
 
-fn usize_field(v: &toml::Value, key: &str, limit: usize) -> Result<usize, String> {
+pub(crate) fn usize_field(v: &toml::Value, key: &str, limit: usize) -> Result<usize, String> {
     let n = field_u64(v, key)? as usize;
     if n > limit {
         return Err(format!("{key}: {n} is more than {limit}"));
@@ -2872,51 +2453,6 @@ impl Uart {
     }
 }
 
-impl SdmaPort {
-    fn save_state(&self, now: Instant) -> toml::Value {
-        StateTable::new()
-            .u32s("reg", &self.reg)
-            .u8s("packer", &self.packer)
-            .u64("packed", self.packed as u64)
-            .u8s("tx_entry", &self.tx_entry)
-            .bool("tx_fetched", self.tx_fetched)
-            .u64("tx_slot", self.tx_slot as u64)
-            .bool("armed", self.armed)
-            .bool("drain_pending", self.drain_pending)
-            .bool("busy", self.busy)
-            .bool("paused", self.paused)
-            .u64("rx_due", until(self.rx_deadline, now))
-            .u32("rx_idle_count", self.rx_idle_count)
-            .u64("rx_frozen", span(self.rx_frozen))
-            .u64("tx_delay_due", until(self.tx_delay_deadline, now))
-            .u64("tx_delay_frozen", span(self.tx_delay_frozen))
-            .bool("tx_delay_irq", self.tx_delay_irq)
-            .bool("post_refused", self.post_refused)
-            .build()
-    }
-    fn load_state(v: &toml::Value, now: Instant) -> Result<Self, String> {
-        Ok(Self {
-            reg: field_u32s(v, "reg")?,
-            packer: field_u8s(v, "packer")?,
-            packed: usize_field(v, "packed", ENTRY)?,
-            tx_entry: field_u8s(v, "tx_entry")?,
-            tx_fetched: field_bool(v, "tx_fetched")?,
-            tx_slot: usize_field(v, "tx_slot", ENTRY)?,
-            armed: field_bool(v, "armed")?,
-            drain_pending: field_bool(v, "drain_pending")?,
-            busy: field_bool(v, "busy")?,
-            paused: field_bool(v, "paused")?,
-            rx_deadline: due(field_u64(v, "rx_due")?, now),
-            rx_idle_count: field_u32(v, "rx_idle_count")?,
-            rx_frozen: unspan(field_u64(v, "rx_frozen")?),
-            tx_delay_deadline: due(field_u64(v, "tx_delay_due")?, now),
-            tx_delay_frozen: unspan(field_u64(v, "tx_delay_frozen")?),
-            tx_delay_irq: field_bool(v, "tx_delay_irq")?,
-            post_refused: field_bool(v, "post_refused")?,
-        })
-    }
-}
-
 impl KbcPort {
     fn save_state(&self) -> toml::Value {
         StateTable::new()
@@ -2936,11 +2472,6 @@ impl KbcPort {
 
 impl St {
     fn save_state(&self, now: Instant) -> toml::Value {
-        let mut sdma = StateTable::new();
-        sdma.u32("base_hi", self.sdma.base_hi)
-            .u32("base_lo", self.sdma.base_lo)
-            .value("port0", self.sdma.port[0].save_state(now))
-            .value("port1", self.sdma.port[1].save_state(now));
         let mut kbc = StateTable::new();
         kbc.u32("control", self.kbc.control)
             .value("port0", self.kbc.port[0].save_state())
@@ -2983,7 +2514,7 @@ impl St {
             .u32("pin_data", self.pin_data)
             .value("uart0", self.uart[0].save_state())
             .value("uart1", self.uart[1].save_state())
-            .value("sdma", sdma.build())
+            .value("sdma", self.sdma.save_state(now))
             .value("kbc", kbc.build())
             .value("parallel", par.build())
             .value("rtc", rtc.build())
@@ -3000,12 +2531,7 @@ impl St {
         }
         let ssram: Vec<u32> = ssram.iter().map(crate::snapshot::toml_u32).collect::<Option<_>>()
             .ok_or("ssram: an entry is not a word")?;
-        let sdma = field(v, "sdma")?;
-        let sdma = Sdma {
-            base_hi: field_u32(sdma, "base_hi")?,
-            base_lo: field_u32(sdma, "base_lo")?,
-            port: [SdmaPort::load_state(field(sdma, "port0")?, now)?, SdmaPort::load_state(field(sdma, "port1")?, now)?],
-        };
+        let sdma = self.sdma.loaded(field(v, "sdma")?, now)?;
         let kbc = field(v, "kbc")?;
         let kbc = Kbc {
             control: field_u32(kbc, "control")?,

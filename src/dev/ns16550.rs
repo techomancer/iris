@@ -117,6 +117,8 @@ pub mod com_reg {
     /// LSR: a received character is waiting.
     pub const LSR_DR: u8 = 0x01;
     pub const LSR_OE: u8 = 0x02;
+    pub const LSR_PE: u8 = 0x04;
+    pub const LSR_FE: u8 = 0x08;
     pub const LSR_BI: u8 = 0x10;
     /// LSR: transmit holding register empty.
     pub const LSR_THRE: u8 = 0x20;
