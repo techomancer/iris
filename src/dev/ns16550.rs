@@ -285,6 +285,12 @@ impl Ns16550 {
         self.lcr & LCR_DLAB != 0
     }
 
+    /// How long a character takes on the line at the programmed rate and
+    /// frame.
+    pub fn char_time(&self) -> Duration {
+        self.char_transmit_time
+    }
+
     pub fn loopback(&self) -> bool {
         self.mcr & MCR_LOOP != 0
     }

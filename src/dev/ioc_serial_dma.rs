@@ -25,8 +25,6 @@
 //!
 //! # What is approximated here
 //!
-//! * A loopback character reaches the receiver inside the write that sent it;
-//!   the part takes a character time.
 //! * The receive timer and a transmit delay run on host time. A pause freezes
 //!   both where they stand and a resume lets each finish the time it had
 //!   left. No source says what the part does.
@@ -150,6 +148,8 @@ pub trait SerialDmaUart {
     /// The port can take a character from the engine. The walk waits while
     /// it cannot, and goes on when the chip next runs the engine.
     fn tx_ready(&self) -> bool;
+    /// How long a character takes on the line at the programmed rate.
+    fn char_time(&self) -> Duration;
     /// A read with the chip's side effects left out: the 16550 proper.
     fn read_core(&mut self, reg: u32) -> u8;
     fn write(&mut self, reg: u32, val: u8);
@@ -200,6 +200,10 @@ pub struct SerialDmaPort {
     tx_delay_deadline: Option<Instant>,
     tx_delay_frozen: Option<Duration>,
     tx_delay_irq: bool,
+    /// A looped-back character still on the line: when it reaches the
+    /// receiver. The 16550 core loops it back the moment it is written, and
+    /// the engine does not look at the receiver until this time.
+    loop_due: Option<Instant>,
 }
 
 pub struct SerialDma {
@@ -256,6 +260,12 @@ impl SerialDma {
     pub fn tx_delay_deadline(&self, p: usize) -> Option<Instant> {
         let port = &self.port[p];
         if port.paused { None } else { port.tx_delay_deadline }
+    }
+
+    /// When a looped-back character reaches the receiver, if one is on the
+    /// line.
+    pub fn loop_deadline(&self, p: usize) -> Option<Instant> {
+        self.port[p].loop_due
     }
 
     /// Whether the port is stopped by a failed transfer.
@@ -393,12 +403,23 @@ impl SerialDma {
                     self.tx_delay_ended(p, d, host);
                 }
             }
+            // Each arrival can send the next character; the ring bounds it.
+            while let Some(d) = self.port[p].loop_due.filter(|&d| d <= now) {
+                self.loop_arrived(p, d, host);
+            }
             if let Some(d) = self.port[p].rx_deadline {
                 if d <= now {
                     self.rx_timer_expired(p, host);
                 }
             }
         }
+    }
+
+    /// A looped-back character reaches the receiver; the walk goes on from
+    /// then.
+    fn loop_arrived(&mut self, p: usize, when: Instant, host: &mut dyn SerialDmaHost) {
+        self.port[p].loop_due = None;
+        self.run_from(p, when, host);
     }
 
     fn tx_delay_ended(&mut self, p: usize, when: Instant, host: &mut dyn SerialDmaHost) {
@@ -414,6 +435,11 @@ impl SerialDma {
     }
 
     fn receive(&mut self, p: usize, since: Instant, host: &mut dyn SerialDmaHost) {
+        // The 16550 core loops a character back the moment it is written; on
+        // the part it takes a character time on the line to arrive.
+        if self.port[p].loop_due.is_some() {
+            return;
+        }
         while self.running(p) {
             if self.port[p].packed == ENTRY_CHARS && !self.post(p, host) {
                 break;
@@ -500,7 +526,8 @@ impl SerialDma {
                 }
                 match ty {
                     TX_CHARACTER => {
-                        if !host.uart(p).tx_ready() {
+                        // In loopback the line carries one character at a time.
+                        if !host.uart(p).tx_ready() || self.port[p].loop_due.is_some() {
                             return;
                         }
                         let looped = host.uart(p).loopback();
@@ -509,8 +536,10 @@ impl SerialDma {
                             self.receive(p, since, host);
                         }
                         host.uart(p).write(UART_THR, entry[slot]);
-                        // Approximation: a looped-back character arrives at
-                        // once, where the part takes a character time.
+                        if looped {
+                            self.port[p].loop_due = Some(since + host.uart(p).char_time());
+                        }
+                        // Drain per character or loopback overruns the FIFO.
                         self.receive(p, since, host);
                     }
                     TX_MODEM => host.uart(p).write(UART_MCR, entry[slot]),
@@ -721,6 +750,10 @@ impl SerialDmaUart for Ns16550 {
         Ns16550::tx_ready(self)
     }
 
+    fn char_time(&self) -> Duration {
+        Ns16550::char_time(self)
+    }
+
     fn read_core(&mut self, r: u32) -> u8 {
         self.read(r)
     }
@@ -762,6 +795,9 @@ mod tests {
         }
         fn tx_ready(&self) -> bool {
             true
+        }
+        fn char_time(&self) -> Duration {
+            Duration::ZERO
         }
         fn read_core(&mut self, reg: u32) -> u8 {
             match reg {
@@ -947,6 +983,7 @@ impl SerialDmaPort {
             .bool("tx_delay_irq", self.tx_delay_irq)
             .bool("post_refused", self.post_refused)
             .bool("halted", self.halted)
+            .u64("loop_due", until(self.loop_due, now))
             .build()
     }
     fn load_state(v: &toml::Value, now: Instant) -> Result<Self, String> {
@@ -969,6 +1006,7 @@ impl SerialDmaPort {
             tx_delay_irq: field_bool(v, "tx_delay_irq")?,
             post_refused: field_bool(v, "post_refused")?,
             halted: field_bool(v, "halted")?,
+            loop_due: due(field_u64(v, "loop_due")?, now),
         })
     }
 }

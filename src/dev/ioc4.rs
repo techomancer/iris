@@ -35,8 +35,7 @@
 //! * The reset values, the BAR size and the PCI class are the emulator's
 //!   choices.
 //! * The serial ring engine is the one the IOC3 uses (`ioc_serial_dma.rs`) and
-//!   carries its approximations: a loopback character arrives inside the
-//!   write that sent it, timers run on host time, and receive-ring-full
+//!   carries its approximations: timers run on host time and receive-ring-full
 //!   latches on each refused post. After a failed ring transfer the port
 //!   halts until a channel reset.
 //! * Register 0x20 reads the DMA-idle bit set; transfers complete inside the
@@ -274,6 +273,7 @@ impl St {
         for p in 0..PORTS {
             d[K_RX + p] = self.sdma.rx_deadline(p);
             d[K_TX_DELAY + p] = self.sdma.tx_delay_deadline(p);
+            d[K_LOOP + p] = self.sdma.loop_deadline(p);
         }
         d
     }
@@ -473,7 +473,8 @@ const RX_IDLE: Duration = Duration::from_millis(2);
 /// The deadlines the chip keeps on host time, one timer slot each.
 const K_RX: usize = 0;
 const K_TX_DELAY: usize = PORTS;
-const KINDS: usize = 2 * PORTS;
+const K_LOOP: usize = 2 * PORTS;
+const KINDS: usize = 3 * PORTS;
 type Deadlines = [Option<Instant>; KINDS];
 
 /// Lock order: `gate`, then `line_order`, then `st`; `armed` and `line` are

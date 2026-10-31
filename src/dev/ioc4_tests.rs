@@ -173,6 +173,27 @@ impl Rig {
         self.c.service();
     }
 
+    /// Play the timers until `done`, a millisecond of host time apart.
+    fn until(&self, what: &str, done: impl Fn(&Rig) -> bool) {
+        for _ in 0..3000 {
+            self.c.service();
+            if done(self) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Divisor one: a character crosses the line in about five microseconds
+    /// instead of a millisecond, so a long loopback run stays short.
+    fn fast_line(&self, p: usize) {
+        self.uw(p, 3, 0x80);
+        self.uw(p, 0, 1);
+        self.uw(p, 1, 0);
+        self.uw(p, 3, 0x03);
+    }
+
     fn sent(&self, p: usize) -> Vec<u8> {
         self.wire[p].out.lock().unwrap().clone()
     }
@@ -611,14 +632,122 @@ fn shadow_mirrors_the_uart() {
 fn loopback_returns_through_the_rings() {
     let r = Rig::new();
     r.pair_base(0, RINGS, 0x400);
+    r.fast_line(0);
     r.uw(0, 4, 0x13);
     r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD);
     r.tx_entry(0, 0x400, 0, *b"wxyz", [TX_VALID; 4]);
     r.sw(0, sdma_off::TX_PRODUCE, 8);
+    r.until("the receive entry", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 8);
     assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 8);
-    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8, 8);
     assert_eq!(r.get(r.ring(0, 1, 0x400), 8), [b'w', b'x', b'y', b'z', RX_LOOPBACK, RX_LOOPBACK, RX_LOOPBACK, RX_LOOPBACK]);
     assert!(r.sent(0).is_empty(), "nothing reached the line");
+}
+
+/// A looped-back character takes a character time to reach the receiver, and
+/// the walk waits for it: at 9600 baud the second character of an entry is
+/// not sent for a millisecond. Ports the "still on the line" case of
+/// test_dma_loopback_tx_mcr.
+#[test]
+fn a_looped_back_character_takes_a_character_time() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x400);
+    r.uw(0, 4, 0x13);
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD);
+    r.tx_entry(0, 0x400, 0, *b"abcd", [TX_VALID; 4]);
+    r.sw(0, sdma_off::TX_PRODUCE, 8);
+    assert!(r.c.sh.st.lock().sdma.loop_deadline(0).is_some(), "the first character is on the line");
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 0, "the entry is not done");
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8, 0, "and nothing has been posted");
+    r.until("the entry", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 8);
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 8);
+}
+
+/// Ports test_dma_loopback_pio_mcr's loopback half: a full 127-entry transmit
+/// ring crosses the line and fills the receive ring, entry for entry.
+#[test]
+fn loopback_fills_the_receive_ring() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x400);
+    r.fast_line(0);
+    r.uw(0, 4, 0x13);
+    assert_eq!(r.ur(0, 4), 0x13);
+    assert_eq!(r.sr(0, sdma_off::SHADOW) & SHADOW_OUTPUTS, 0x1300_0000);
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD);
+    let expected = fill_loopback_ring(&r);
+    r.until("the transmit ring", |r| r.sr(0, sdma_off::TX_CONSUME) & 0x3f8 == 0x3f8);
+    r.until("the receive ring", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 0x3f8);
+    assert_eq!((r.sr(0, sdma_off::TX_PRODUCE), r.sr(0, sdma_off::TX_CONSUME)), (0x3f8, 0x3f8));
+    assert_eq!(r.sr(0, sdma_off::RX_CONSUME), 0);
+    assert_eq!(r.get(r.ring(0, 1, 0x400), 0x3f8), expected);
+    assert!(r.sent(0).is_empty());
+}
+
+/// Ports test_dma_loopback_tx_mcr: a modem-control slot ahead of the
+/// characters writes the UART's own register, and its characters then loop
+/// back, entry by entry, the first holding three.
+#[test]
+fn a_modem_control_slot_leads_a_looped_back_run() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x400);
+    r.fast_line(0);
+    r.uw(0, 4, 0);
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD);
+    let mut expected = vec![0u8; 0x3f8];
+    let mut count = 0usize;
+    for i in 0..127usize {
+        let (data, control): ([u8; 4], [u8; 4]) = if i == 0 {
+            ([0x13, 0, 1, 2], [TX_MCR, TX_VALID, TX_VALID, TX_VALID])
+        } else {
+            (std::array::from_fn(|j| (i * 4 + j - 1) as u8), [TX_VALID; 4])
+        };
+        for j in usize::from(i == 0)..4 {
+            expected[count / 4 * 8 + count % 4] = data[j];
+            expected[count / 4 * 8 + 4 + count % 4] = RX_LOOPBACK;
+            count += 1;
+        }
+        r.tx_entry(0, 0x400, i * 8, data, control);
+    }
+    assert_eq!(count, 507);
+    r.sw(0, sdma_off::TX_PRODUCE, 0x3f8);
+    r.until("the transmit ring", |r| r.sr(0, sdma_off::TX_CONSUME) & 0x3f8 == 0x3f8);
+    r.until("the last full entry", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 0x3f0);
+    assert_eq!(r.ur(0, 4), 0x13, "the modem-control slot wrote the UART's register");
+    assert_eq!(r.sr(0, sdma_off::SHADOW) & SHADOW_OUTPUTS, 0x1300_0000);
+    // Three characters wait in the packer for a drain.
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD | DRAIN);
+    r.until("the drain", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 0x3f8);
+    assert_eq!(r.get(r.ring(0, 1, 0x400), 0x3f8), expected);
+    assert!(r.sent(0).is_empty());
+}
+
+/// Ports test_dma_loopback_shadow_reset: a write to the shadow changes
+/// nothing, and a channel reset leaves the outputs as they were.
+#[test]
+fn the_shadow_ignores_writes_and_a_channel_reset() {
+    let r = Rig::new();
+    r.uw(0, 4, 0);
+    r.sw(0, sdma_off::SHADOW, SHADOW_OUTPUTS);
+    assert_eq!(r.ur(0, 4), 0);
+    r.uw(0, 4, 0x13);
+    r.sw(0, sdma_off::SHADOW, 0x1300_0000);
+    assert_eq!(r.ur(0, 4), 0x13);
+    r.sw(0, sdma_off::CONTROL, RESET);
+    assert_eq!(r.sr(0, sdma_off::SHADOW) & SHADOW_OUTPUTS, 0x1300_0000);
+    assert_eq!(r.ur(0, 4), 0x13);
+}
+
+/// A full 127-entry transmit ring of valid characters; the receive ring it
+/// should fill.
+fn fill_loopback_ring(r: &Rig) -> Vec<u8> {
+    let mut expected = vec![0u8; 0x3f8];
+    for i in 0..127usize {
+        let data: [u8; 4] = std::array::from_fn(|j| (i * 4 + j) as u8);
+        expected[i * 8..i * 8 + 4].copy_from_slice(&data);
+        expected[i * 8 + 4..i * 8 + 8].fill(RX_LOOPBACK);
+        r.tx_entry(0, 0x400, i * 8, data, [TX_VALID; 4]);
+    }
+    r.sw(0, sdma_off::TX_PRODUCE, 0x3f8);
+    expected
 }
 
 /// Ports test_dma_requester_ids' use of both pairs: ports 2 and 3 take their

@@ -106,6 +106,15 @@ impl Rig {
         self.w32(reg::CHIP_CONTROL, 0x0002_2e5e);
     }
 
+    /// Let `chars` looped-back characters cross the line at the reset rate
+    /// (about a millisecond each), then play the timers. A looped-back
+    /// character takes a character time to reach the receiver, as it does
+    /// on the part.
+    fn line(&self, chars: u64) {
+        std::thread::sleep(Duration::from_micros(1100 * chars + 3000));
+        self.c.service();
+    }
+
     /// DMA the way the chip sees memory: internal bytes.
     fn mem_view(&self) -> Ioc3Dma {
         Ioc3Dma::new(self.mem.clone())
@@ -682,6 +691,7 @@ fn ring_dma_loops_back_through_port_a() {
     put(&r, 0x2000, &[b'a', b'b', b'c', b'd', 0x40, 0x40, 0x40, 0x40]);
     r.w32(A, sdma_ctl::ENABLE);
     r.w32(A + sdma_off::TX_PRODUCE, 8);
+    r.line(4);
     assert_eq!(r.r32(A + sdma_off::TX_CONSUME), 8, "the engine took the entry");
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) & 0xfff, 8, "and posted one back");
     let e = get(&r, 0x3000, 8);
@@ -702,6 +712,7 @@ fn ring_dma_runs_on_port_b_too() {
     put(&r, 0x4000, &[b'w', b'x', b'y', b'z', 0x40, 0x40, 0x40, 0x40]);
     r.w32(B, sdma_ctl::ENABLE);
     r.w32(B + sdma_off::TX_PRODUCE, 8);
+    r.line(4);
     assert_eq!(r.r32(B + sdma_off::TX_CONSUME), 8);
     assert_eq!(&get(&r, 0x5000, 4), b"wxyz");
 }
@@ -716,6 +727,7 @@ fn flow_control_in_loopback_reports_cts() {
     put(&r, 0x2000, &[b'a', b'b', b'c', b'd', 0x40, 0x40, 0x40, 0x40]);
     r.w32(A, sdma_ctl::ENABLE | sdma_ctl::FLOW_CONTROL | 32);
     r.w32(A + sdma_off::TX_PRODUCE, 8);
+    r.line(4);
     let e = get(&r, 0x3000, 8);
     assert_eq!(e[4] & 0xdf, 0xd0, "data valid, modem valid, clear to send");
 }
@@ -732,6 +744,7 @@ fn an_empty_slot_ends_the_entry() {
     put(&r, 0x2008, &[b'e', b'f', b'g', b'h', 0x40, 0x40, 0x40, 0x00]);
     r.w32(A, sdma_ctl::ENABLE);
     r.w32(A + sdma_off::TX_PRODUCE, 16);
+    r.line(4);
     assert_eq!(r.r32(A + sdma_off::TX_CONSUME), 16);
     // a, then e f g: "aefg" in one receive entry.
     assert_eq!(&get(&r, 0x3000, 4), b"aefg");

@@ -33,8 +33,8 @@
 //! # What is approximated here
 //!
 //! * Nothing is timed to a baud rate: serial transmit completes inside the
-//!   write and a loopback character arrives at once (the part takes a
-//!   character time).
+//!   write. A character looped back through the ring engine does take its
+//!   character time to reach the receiver.
 //! * Serial ring DMA, the receive timer, transmit delays and the interrupt
 //!   output are evaluated lazily on every register access, and an `hptimer`
 //!   one-shot per deadline runs the same catch-up while the guest is idle.
@@ -279,6 +279,10 @@ impl SerialDmaUart for Uart {
 
     fn tx_ready(&self) -> bool {
         self.core.tx_ready()
+    }
+
+    fn char_time(&self) -> Duration {
+        self.core.char_time()
     }
 
     fn read_core(&mut self, r: u32) -> u8 {
@@ -895,6 +899,7 @@ impl St {
         for p in 0..2 {
             d[K_RX + p] = self.sdma.rx_deadline(p);
             d[K_TX_DELAY + p] = self.sdma.tx_delay_deadline(p);
+            d[K_LOOP + p] = self.sdma.loop_deadline(p);
         }
         if self.int_enable & int::RT_OUTPUT_PULSE != 0 {
             d[K_INT_OUT] = self.int_out.next;
@@ -1692,7 +1697,8 @@ const K_RX: usize = 0;
 const K_TX_DELAY: usize = 2;
 const K_INT_OUT: usize = 4;
 const K_NVRAM: usize = 5;
-const KINDS: usize = 6;
+const K_LOOP: usize = 6;
+const KINDS: usize = 8;
 type Deadlines = [Option<Instant>; KINDS];
 
 /// The least delay for a kind's timer; see [`IO_REARM_MIN`].
