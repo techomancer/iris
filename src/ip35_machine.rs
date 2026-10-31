@@ -38,7 +38,7 @@ use crate::dev::bedrock_io::{BedrockIo, SIZE as IO_SIZE};
 use crate::dev::bedrock_lb::{BedrockLb, SIZE as LB_SIZE};
 use crate::dev::bedrock_md::{BedrockMd, MemoryError};
 use crate::dev::bedrock_ni::{BedrockNi, SIZE as NI_SIZE};
-use crate::dev::bedrock_pi::{reg as pi_reg, BedrockPi, BedrockPiConfig, SIZE as PI_SIZE};
+use crate::dev::bedrock_pi::{BedrockPi, BedrockPiConfig, Population, SIZE as PI_SIZE};
 use crate::dev::bedrock_xb::{BedrockXb, SIZE as XB_SIZE};
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc3::{Ioc3, Ioc3Config};
@@ -617,12 +617,11 @@ impl FuelBoard {
                 BedrockPiConfig {
                     interface: interface as u8,
                     request_region: 0,
+                    population: Population::SINGLE,
                 },
                 clock.clone(),
             )
         });
-        // Only CPU A is fitted on the single-processor board.
-        pi[0].write64(pi_reg::CPU_A_ENABLE, 1);
         let mut l1_config = L1Config { mac: station_mac, ..Default::default() };
         if let Some(revision) = l1_identity.revision {
             l1_config.revision = Some(revision);

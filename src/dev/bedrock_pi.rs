@@ -1,9 +1,26 @@
 //! Bedrock PI exposes processor-slot control, pending interrupts, real-time
-//! counters, timers and shared graphics registers. Fuel uses PI0 slot A for
-//! its processor; the other processor slot has no device attached. Node hooks
-//! carry cache-alias changes, CPU enable and NMI events to the board.
+//! counters, timers and shared graphics registers. A node has two PIs with two
+//! processor slots each, A and B; the board names which of the four slots hold
+//! a processor ([`Population`]). Fuel fits PI0 slot A only. A Tezro fits one,
+//! two or four, filled in the order CPU 0 = PI0/A, CPU 1 = PI1/A, CPU 2 =
+//! PI0/B, CPU 3 = PI1/B. Node hooks carry cache-alias changes, CPU enable and
+//! NMI events to the board.
 //!
 //! # What is approximated here
+//!
+//! Only CPU 0 (PI0/A) runs. Every fitted slot reads present, so the PROM sees
+//! the processors the board holds, but only CPU 0 is enabled at power-on and
+//! no other processor ever starts. What follows for the other slots is not
+//! delivered, and each kind is recorded the first time it happens ([`Refused`],
+//! [`BedrockPi::refused`]) and logged under the `bedrock` module instead of
+//! being dropped silently: a write that enables the processor, an NMI, an
+//! interrupt output for the slot (an interprocessor interrupt is one) and a
+//! timer enable. The enable bit itself is stored, as the register holds it
+//! on hardware, and still reaches the node hooks.
+//!
+//! The CPU-number register answers for the reading processor's slot. The bus
+//! carries no requester identity, so it answers slot A of its interface, which
+//! is right for CPU 0, the only reader.
 //!
 //! The model accepts Linux's public `SGIrules` key at offset 0x8 for
 //! compatibility. Linux documents the literal for Hub I/O, but the available
@@ -95,10 +112,71 @@ pub mod reg {
     pub const GRAPHICS_END: u64 = 0x350;
 }
 
+/// The processor slots a board fits, as one bit per slot: bit `interface * 2
+/// + slot`, with slot 0 = A and slot 1 = B.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Population(u8);
+impl Default for Population {
+    fn default() -> Self {
+        Self::SINGLE
+    }
+}
+impl Population {
+    /// One processor, in PI0 slot A.
+    pub const SINGLE: Self = Self(0b0001);
+    /// Slots named by `mask`. CPU 0 runs in PI0/A, so it must be fitted, and
+    /// only the four slots exist.
+    pub fn new(mask: u8) -> Result<Self, String> {
+        if mask & !0b1111 != 0 {
+            return Err(format!("processor mask {mask:#x} names a slot outside the node's four"));
+        }
+        if mask & 1 == 0 {
+            return Err(format!("processor mask {mask:#x} leaves PI0 slot A empty, where CPU 0 runs"));
+        }
+        Ok(Self(mask))
+    }
+    /// `count` processors in the board's order: PI0/A, PI1/A, PI0/B, PI1/B.
+    pub fn fitted_cpus(count: usize) -> Result<Self, String> {
+        const ORDER: [u8; 4] = [0b0001, 0b0100, 0b0010, 0b1000];
+        if !(1..=4).contains(&count) {
+            return Err(format!("{count} processors; a node fits 1 to 4"));
+        }
+        Self::new(ORDER[..count].iter().fold(0, |mask, bit| mask | bit))
+    }
+    pub fn mask(self) -> u8 {
+        self.0
+    }
+    pub fn count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+    /// Whether a processor is fitted in `slot` (0 = A, 1 = B) of `interface`.
+    pub fn fitted(self, interface: u8, slot: usize) -> bool {
+        self.0 & (1 << (usize::from(interface) * 2 + slot)) != 0
+    }
+}
+/// The one processor the model starts: PI0 slot A.
+fn started(interface: u8, slot: usize) -> bool {
+    interface == 0 && slot == 0
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BedrockPiConfig {
     pub interface: u8,
     pub request_region: u8,
+    pub population: Population,
+}
+/// Something a processor slot would do or receive that the model does not
+/// carry out because no processor runs there. See the module notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// A write set the slot's CPU-enable bit.
+    Start { interface: u8, slot: usize },
+    /// A non-maskable interrupt for the slot, or for CPU 0 with no node to take it.
+    Nmi { interface: u8, slot: usize },
+    /// An interrupt output of the slot went high: output line 0..9 of the PI.
+    Interrupt { interface: u8, line: usize },
+    /// A real-time or profile timer interrupt was enabled for the slot.
+    Timer { interface: u8, slot: usize },
 }
 /// Called outside the state lock. Graphics indices 0..9 are the shared PI
 /// graphics registers at offsets 0x300..0x348. Disconnected access is observable.
@@ -269,13 +347,21 @@ pub struct BedrockPi {
     dispatch: ReentrantMutex<()>,
     driven: Mutex<[Option<bool>; 10]>,
     weak: Weak<Self>,
+    refused: Mutex<Vec<(Refused, u64)>>,
 }
 impl BedrockPi {
     pub fn new(cfg: BedrockPiConfig, clock: Clock) -> Arc<Self> {
         assert!(cfg.interface < 2 && cfg.request_region < 64);
+        // The running processor starts with its bus grant; the rest are held
+        // disabled until a guest enables them.
+        let mut state = State::new(clock());
+        for slot in 0..2 {
+            state.w[reg::CPU_A_ENABLE as usize / 8 + slot] =
+                u64::from(started(cfg.interface, slot) && cfg.population.fitted(cfg.interface, slot));
+        }
         Arc::new_cyclic(|weak| Self {
             cfg,
-            state: Mutex::new(State::new(clock())),
+            state: Mutex::new(state),
             clock,
             hooks: Mutex::new(None),
             irq: Mutex::new(None),
@@ -285,6 +371,7 @@ impl BedrockPi {
             dispatch: ReentrantMutex::new(()),
             driven: Mutex::new([None; 10]),
             weak: weak.clone(),
+            refused: Mutex::new(Vec::new()),
         })
     }
     pub fn set_node_hooks(&self, hooks: Arc<dyn NodeHooks>) {
@@ -311,11 +398,31 @@ impl BedrockPi {
             "Bedrock PI{} unsupported {} at {off:#x}", self.cfg.interface,
             if write { "write" } else { "read" });
     }
+    /// What the model could not carry out for a processor slot, with how many
+    /// times each happened. Each kind is logged once, on its first occurrence.
+    pub fn refused(&self) -> Vec<(Refused, u64)> {
+        self.refused.lock().clone()
+    }
+    fn refuse(&self, what: Refused) {
+        let mut refused = self.refused.lock();
+        if let Some((_, count)) = refused.iter_mut().find(|(seen, _)| *seen == what) {
+            *count += 1;
+        } else if refused.len() < 64 {
+            refused.push((what, 1));
+            crate::dlog!(crate::devlog::LogModule::Bedrock,
+                "Bedrock PI{}: unsupported, no processor runs there: {what:?}", self.cfg.interface);
+        }
+    }
     fn drive(&self) {
         // Serialize publication, including reentrant reads by a controller.
         // Publish one line at a time: a callback may change another line.
         let _dispatch = self.dispatch.lock();
         let irq = self.irq.lock().clone();
+        for line in 0..10 {
+            if self.state.lock().outputs()[line] && !started(self.cfg.interface, line / 5) {
+                self.refuse(Refused::Interrupt { interface: self.cfg.interface, line });
+            }
+        }
         if let Some(irq) = irq {
             for line in 0..10 {
                 let level = self.state.lock().outputs()[line];
@@ -444,8 +551,8 @@ impl BedrockPi {
         s.sync((self.clock)());
         let value = match off {
             reg::INTERFACE_ID => u64::from(self.cfg.interface) << 1,
-            reg::INTERFACE_SLOT_A => u64::from(self.cfg.interface == 0),
-            reg::INTERFACE_SLOT_B => 0,
+            reg::INTERFACE_SLOT_A => u64::from(self.cfg.population.fitted(self.cfg.interface, 0)),
+            reg::INTERFACE_SLOT_B => u64::from(self.cfg.population.fitted(self.cfg.interface, 1)),
             reg::PENDING_STATUS_A => s.pending(0),
             reg::PENDING_STATUS_B => s.pending(1),
             reg::PENDING_A_CLEAR => s.w[reg::REQUEST_A as usize / 8],
@@ -490,6 +597,7 @@ impl BedrockPi {
         let mut compare = None;
         let mut enable = None;
         let mut nmi = None;
+        let mut refused = Vec::new();
         match off {
             reg::NODE_REGION | reg::OFFSET_0010 | reg::OFFSET_0018 | reg::OFFSET_00A8 | reg::OFFSET_00B0 | reg::OFFSET_00B8 | reg::OFFSET_00C0 | reg::OFFSET_00E8 | reg::OFFSET_04C8 | reg::OFFSET_04D0 => {
                 s.w[off as usize / 8] = value
@@ -511,6 +619,9 @@ impl BedrockPi {
                 let slot = ((off - 0x50) / 8) as usize;
                 s.w[off as usize / 8] = value & 1;
                 enable = Some((slot, value & 1 != 0));
+                if value & 1 != 0 && !started(self.cfg.interface, slot) {
+                    refused.push(Refused::Start { interface: self.cfg.interface, slot });
+                }
             }
             reg::NMI_SLOT_A | reg::NMI_SLOT_B => {
                 if value & 1 != 0 {
@@ -542,7 +653,13 @@ impl BedrockPi {
                 s.arm_profile(now);
             }
             reg::RT_STATUS_A | reg::RT_STATUS_B | reg::PROFILE_STATUS_A | reg::PROFILE_STATUS_B => s.w[off as usize / 8] = 0,
-            reg::RT_ENABLE_A | reg::RT_ENABLE_B | reg::PROFILE_ENABLE_A | reg::PROFILE_ENABLE_B => s.w[off as usize / 8] = value & 1,
+            reg::RT_ENABLE_A | reg::RT_ENABLE_B | reg::PROFILE_ENABLE_A | reg::PROFILE_ENABLE_B => {
+                s.w[off as usize / 8] = value & 1;
+                let slot = usize::from(matches!(off, reg::RT_ENABLE_B | reg::PROFILE_ENABLE_B));
+                if value & 1 != 0 && !started(self.cfg.interface, slot) {
+                    refused.push(Refused::Timer { interface: self.cfg.interface, slot });
+                }
+            }
             reg::ERROR_SUMMARY_ALIAS => {
                 s.w[0x400 / 8] =
                     (s.w[0x400 / 8] & MEMORY_ERROR) | (value & ERROR_MASK & !MEMORY_ERROR)
@@ -573,7 +690,17 @@ impl BedrockPi {
             _ => self.note(off, true),
         }
         drop(s);
-        if let Some(h) = self.hooks() {
+        let hooks = self.hooks();
+        // An NMI that no running processor can take is recorded, not lost.
+        if let Some(slot) = nmi {
+            if hooks.is_none() || !started(self.cfg.interface, slot) {
+                refused.push(Refused::Nmi { interface: self.cfg.interface, slot });
+            }
+        }
+        for what in refused {
+            self.refuse(what);
+        }
+        if let Some(h) = hooks {
             if let Some(size) = alias {
                 h.cached_alias_changed(size);
             }

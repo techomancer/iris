@@ -1,6 +1,7 @@
 // Cases follow tests/qtest/sn1-bedrock-pi-test.c in jamesbraid/qemu-sgi-origami:
-// power-on-values, local-reset, pending-reflection, real-time-comparators
-// and profile-counter-wrap.
+// power-on-values, local-reset, pending-reflection, real-time-comparators,
+// profile-counter-wrap, processor-presence, sparse-processor-presence,
+// invalid-processor-masks, cpu-number-fallback, sparse-irq-and-nmi-slots and nmi.
 
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +33,7 @@ fn the_pi_reports_interface_state_and_retains_registers_across_reset() {
             BedrockPiConfig {
                 interface: 1,
                 request_region: 0,
+                population: Population::SINGLE,
             },
             Arc::new(|| 0),
         );
@@ -273,4 +275,158 @@ fn concurrent_pi_updates_publish_callbacks_in_register_order() {
         assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
         assert_eq!(r(&pi, offset), second_value);
     }
+}
+
+/// One PI of a node holding the processors `count` names, in the board's order.
+fn node(count: usize) -> [Arc<BedrockPi>; 2] {
+    let population = Population::fitted_cpus(count).unwrap();
+    std::array::from_fn(|interface| {
+        BedrockPi::new(
+            BedrockPiConfig { interface: interface as u8, request_region: 0, population },
+            Arc::new(|| 0),
+        )
+    })
+}
+
+/// The PROM counts processors from the present bits. The board fills PI0/A,
+/// then PI1/A, then PI0/B and PI1/B, so two processors sit one per
+/// interface (the qtest's sparse-processor-presence mask 5), where the
+/// qtest's processor-count shortcut fills interface 0 first.
+#[test]
+fn every_fitted_slot_reads_present_in_the_boards_order() {
+    for (count, present) in [(1, [1, 0, 0, 0]), (2, [1, 0, 1, 0]), (3, [1, 1, 1, 0]), (4, [1, 1, 1, 1])] {
+        let pis = node(count);
+        let read = |interface: usize, off| r(&pis[interface], off);
+        assert_eq!(
+            [read(0, reg::INTERFACE_SLOT_A), read(0, reg::INTERFACE_SLOT_B),
+             read(1, reg::INTERFACE_SLOT_A), read(1, reg::INTERFACE_SLOT_B)],
+            present, "{count} processors");
+    }
+    assert_eq!(Population::fitted_cpus(2).unwrap().mask(), 5);
+    assert_eq!(Population::fitted_cpus(4).unwrap().count(), 4);
+}
+
+/// A population that cannot hold CPU 0, or names a fifth slot, or a count the
+/// node cannot fit, is refused rather than built.
+#[test]
+fn a_population_without_cpu_0_or_beyond_four_slots_is_refused() {
+    for mask in [0, 0b0010, 0b1100, 0b1_0001, 0xff] {
+        assert!(Population::new(mask).is_err(), "{mask:#x}");
+    }
+    for count in [0, 5] {
+        assert!(Population::fitted_cpus(count).is_err(), "{count}");
+    }
+    assert_eq!(Population::new(0b0101).unwrap(), Population::fitted_cpus(2).unwrap());
+}
+
+/// Only CPU 0 begins with its bus grant; the other fitted processors are held
+/// disabled, and a power-on of the PI leaves that as it was.
+#[test]
+fn only_cpu_0_starts_enabled() {
+    let pis = node(4);
+    let enables = |pis: &[Arc<BedrockPi>; 2]| {
+        [r(&pis[0], reg::CPU_A_ENABLE), r(&pis[0], reg::CPU_B_ENABLE),
+         r(&pis[1], reg::CPU_A_ENABLE), r(&pis[1], reg::CPU_B_ENABLE)]
+    };
+    assert_eq!(enables(&pis), [1, 0, 0, 0]);
+    pis[1].write64(reg::CPU_B_ENABLE, 1);
+    for pi in &pis {
+        pi.power_on();
+    }
+    assert_eq!(enables(&pis), [1, 0, 0, 1], "enables survive the PI's local reset");
+    // An empty slot is not granted either.
+    assert_eq!(r(&node(1)[0], reg::CPU_B_ENABLE), 0);
+}
+
+/// The CPU-number register carries the interface in bit 1; the reader is
+/// CPU 0, which sits in slot A, so bit 0 is clear. Follows cpu-number-fallback.
+#[test]
+fn the_cpu_number_names_the_interface_and_slot_a() {
+    let pis = node(4);
+    assert_eq!((r(&pis[0], reg::INTERFACE_ID), r(&pis[1], reg::INTERFACE_ID)), (0, 2));
+    for pi in &pis {
+        pi.power_on();
+    }
+    assert_eq!((r(&pis[0], reg::INTERFACE_ID), r(&pis[1], reg::INTERFACE_ID)), (0, 2));
+}
+
+/// Enabling a processor that never runs is stored, as the register holds it,
+/// and recorded so that the guest's attempt is visible; CPU 0's own enable
+/// is not a refusal.
+#[test]
+fn enabling_another_cpu_is_stored_and_recorded_but_never_started() {
+    let pis = node(4);
+    pis[0].write64(reg::CPU_A_ENABLE, 1);
+    assert!(pis[0].refused().is_empty(), "CPU 0 runs");
+    pis[0].write64(reg::CPU_B_ENABLE, 1);
+    pis[1].write64(reg::CPU_A_ENABLE, 3);
+    pis[1].write64(reg::CPU_A_ENABLE, 1);
+    pis[1].write64(reg::CPU_B_ENABLE, 0);
+    assert_eq!(r(&pis[0], reg::CPU_B_ENABLE), 1);
+    assert_eq!(pis[0].refused(), [(Refused::Start { interface: 0, slot: 1 }, 1)]);
+    assert_eq!(pis[1].refused(), [(Refused::Start { interface: 1, slot: 0 }, 2)],
+        "counted, and a clear bit is not an attempt");
+}
+
+/// An NMI for a slot with no running processor, or for CPU 0 with no node to
+/// take it, is recorded. A node that takes CPU 0's still sees it. Follows nmi.
+#[test]
+fn an_nmi_no_running_cpu_can_take_is_recorded() {
+    struct Nmis(std::sync::Mutex<Vec<(u8, usize)>>);
+    impl NodeHooks for Nmis {
+        fn nmi(&self, interface: u8, slot: usize) {
+            self.0.lock().unwrap().push((interface, slot));
+        }
+    }
+    let pis = node(4);
+    pis[0].write64(reg::NMI_SLOT_A, 1);
+    pis[0].write64(reg::NMI_SLOT_B, u64::MAX);
+    pis[1].write64(reg::NMI_SLOT_A, 1);
+    assert_eq!(pis[0].refused(), [(Refused::Nmi { interface: 0, slot: 0 }, 1), (Refused::Nmi { interface: 0, slot: 1 }, 1)]);
+    assert_eq!(pis[1].refused(), [(Refused::Nmi { interface: 1, slot: 0 }, 1)]);
+
+    let nmis = Arc::new(Nmis(Default::default()));
+    let pis = node(4);
+    pis[0].set_node_hooks(nmis.clone());
+    pis[0].write64(reg::NMI_SLOT_A, 1);
+    assert!(pis[0].refused().is_empty());
+    pis[0].write64(reg::NMI_SLOT_B, 1);
+    assert_eq!(*nmis.0.lock().unwrap(), [(0, 0), (0, 1)], "a node still sees what it is sent");
+    assert_eq!(pis[0].refused(), [(Refused::Nmi { interface: 0, slot: 1 }, 1)]);
+}
+
+/// An interrupt output that a processor in another slot would take, such as an
+/// interprocessor interrupt aimed at slot A of PI1, goes high on its line and
+/// is recorded; CPU 0's own lines are delivered without a record.
+/// Follows sparse-irq-and-nmi-slots.
+#[test]
+fn interrupts_for_slots_without_a_running_cpu_are_recorded() {
+    let pis = node(2);
+    pis[1].write64(reg::PENDING_MODIFY, 0x107);
+    pis[1].write64(reg::OFFSET_00A8, 1 << 7);
+    assert_eq!(pis[1].refused(), [(Refused::Interrupt { interface: 1, line: 0 }, 1)]);
+    pis[1].write64(reg::OFFSET_00A8, 0);
+    assert_eq!(pis[1].refused().len(), 1, "the line going low is not a new event");
+
+    pis[0].write64(reg::PENDING_MODIFY, 0x107);
+    pis[0].write64(reg::OFFSET_00A8, 1 << 7);
+    assert!(pis[0].refused().is_empty(), "PI0 slot A is CPU 0's");
+    // Slot B of PI0 shares the pending word through its own mask.
+    pis[0].write64(reg::OFFSET_00B8, 1 << 7);
+    assert_eq!(pis[0].refused(), [(Refused::Interrupt { interface: 0, line: 5 }, 1)]);
+}
+
+/// Per-processor timers of a slot that never runs can be set but not
+/// taken: enabling one is recorded.
+#[test]
+fn timers_for_other_slots_are_recorded_when_enabled() {
+    let pis = node(4);
+    pis[0].write64(reg::RT_ENABLE_A, 1);
+    pis[0].write64(reg::PROFILE_ENABLE_A, 1);
+    assert!(pis[0].refused().is_empty());
+    pis[0].write64(reg::RT_ENABLE_B, 1);
+    pis[0].write64(reg::PROFILE_ENABLE_B, 1);
+    pis[1].write64(reg::RT_ENABLE_A, 1);
+    assert_eq!(pis[0].refused(), [(Refused::Timer { interface: 0, slot: 1 }, 2)]);
+    assert_eq!(pis[1].refused(), [(Refused::Timer { interface: 1, slot: 0 }, 1)]);
 }
