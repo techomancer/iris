@@ -1345,6 +1345,21 @@ mod tests {
         assert_eq!(bus.read64(BANK_SPAN).data, 0xaa);
     }
 
+    /// The default 1 GiB population is wholly inside ppmem's direct window: all
+    /// 16 of its 64 MiB regions are mapped, with none left to the decode table.
+    #[test]
+    fn the_default_tezro_memory_is_entirely_directly_mapped() {
+        use crate::ppmem::MappedMemory;
+        let md = BedrockMd::new(&super::super::bedrock_mem::MemoryPopulation::default().banks_mib()).unwrap();
+        md.md_bus().write64(reg::CONFIG, 0x43 | (0x43 << 8));
+        let bus = md.physical();
+        let space = bus.ppmem_space().expect("a window");
+        assert_eq!(space.mapped_bitmap(), 0xff | (0xff << 16));
+        assert_eq!(bus.write64(BANK_SPAN + (512 << 20) - 8, 7), BUS_OK);
+        assert_eq!(bus.read64(BANK_SPAN + (512 << 20) - 8).data, 7);
+        assert_eq!(bus.read64(512 << 20).status, BUS_ERR, "bank 0 ends at 512 MiB");
+    }
+
     /// Directory and ECC state is keyed per bank, so banks of different sizes
     /// never share an entry. Follows directory-bank-translation.
     #[test]

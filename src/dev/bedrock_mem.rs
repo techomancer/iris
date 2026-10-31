@@ -39,6 +39,98 @@ const MAX_BANK_MIB: u32 = 1024;
 /// Banks are mapped into the direct window in whole regions of this size.
 const REGION_MIB: u32 = 1 << (BITMAP_SHIFT - 20);
 
+/// A DIMM size the Tezro's IP53 board takes. One DIMM makes one bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BankSize {
+    Mib512,
+    Mib1024,
+}
+impl BankSize {
+    pub const fn mib(self) -> u32 {
+        match self {
+            Self::Mib512 => 512,
+            Self::Mib1024 => 1024,
+        }
+    }
+    fn from_mib(mib: u32) -> Result<Self, String> {
+        match mib {
+            512 => Ok(Self::Mib512),
+            1024 => Ok(Self::Mib1024),
+            _ => Err(format!("a Tezro bank is 512 or 1024 MiB, not {mib} MiB")),
+        }
+    }
+}
+
+/// The banks a Tezro fits, locational bank 0 upward: up to eight DIMMs of 512
+/// or 1024 MiB with none left out between them. What the board needs in total
+/// depends on its processors; see [`Self::check_for_cpus`].
+///
+/// The bank sizes and the minimums come from the Tezro manuals as the QEMU
+/// assembly layer records them. The default layout is inferred: the manuals'
+/// rules allow other 1 GiB layouts (a single 1024 MiB bank, for one), and the
+/// two banks of 512 MiB are the pair the 4 GiB kit also uses at those places.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryPopulation(Vec<BankSize>);
+impl Default for MemoryPopulation {
+    fn default() -> Self {
+        Self::gib1()
+    }
+}
+impl MemoryPopulation {
+    pub fn new(banks: &[BankSize]) -> Result<Self, String> {
+        if banks.is_empty() || banks.len() > SLOTS {
+            return Err(format!("memory: {} banks; a Tezro fits 1 to {SLOTS}", banks.len()));
+        }
+        Ok(Self(banks.to_vec()))
+    }
+    /// From sizes in MiB, rejecting any a Tezro does not take.
+    pub fn from_mib(banks: &[u32]) -> Result<Self, String> {
+        let sizes = banks.iter().map(|&mib| BankSize::from_mib(mib)).collect::<Result<Vec<_>, _>>()?;
+        Self::new(&sizes)
+    }
+    /// 1 GiB: banks 0 and 1 of 512 MiB. Everything lies below 4 GiB, inside
+    /// ppmem's direct window, and it meets the minimum for any processor count.
+    pub fn gib1() -> Self {
+        Self(vec![BankSize::Mib512; 2])
+    }
+    /// 4 GiB: 1024, 1024 and four of 512 MiB. Banks 4 and 5 sit above 4 GiB,
+    /// outside the direct window.
+    pub fn gib4() -> Self {
+        let mut banks = vec![BankSize::Mib1024; 2];
+        banks.extend([BankSize::Mib512; 4]);
+        Self(banks)
+    }
+    pub fn banks(&self) -> &[BankSize] {
+        &self.0
+    }
+    /// The sizes in MiB, as [`BedrockMd::new`](super::bedrock_md::BedrockMd::new) takes them.
+    pub fn banks_mib(&self) -> Vec<u32> {
+        self.0.iter().map(|bank| bank.mib()).collect()
+    }
+    pub fn total_mib(&self) -> u32 {
+        self.0.iter().map(|bank| bank.mib()).sum()
+    }
+    /// Whether every bank lies below 4 GiB, so the CPU reaches all of it
+    /// through the direct window.
+    pub fn fits_direct_window(&self) -> bool {
+        self.0.len() <= 4
+    }
+    /// One processor needs at least 512 MB; two or four need at least 1 GB.
+    pub fn check_for_cpus(&self, cpus: usize) -> Result<(), String> {
+        let needed = match cpus {
+            1 => 512,
+            2..=4 => 1024,
+            _ => return Err(format!("{cpus} processors; a Tezro fits 1 to 4")),
+        };
+        if self.total_mib() < needed {
+            return Err(format!(
+                "{} MiB of memory; {cpus} processor{} need at least {needed} MiB",
+                self.total_mib(), if cpus == 1 { "" } else { "s" }));
+        }
+        Ok(())
+    }
+}
+
 /// Where fitted RAM can answer: for each software slot, the most any bank the
 /// bank-select swizzle can place there holds. The swizzle permutes slots
 /// within groups of four, so a slot may hold any bank of its group.
@@ -380,5 +472,62 @@ impl BedrockMemory {
         for bank in self.physical.banks() {
             bank.bump_gen_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Tezro takes 512 and 1024 MiB DIMMs, one per bank, none left out
+    /// between, eight at most. The 4 GiB layout and the 1 GiB default are
+    /// both there, and the default's banks all lie below 4 GiB.
+    #[test]
+    fn only_512_and_1024_mib_banks_are_accepted() {
+        assert_eq!(MemoryPopulation::default(), MemoryPopulation::gib1());
+        assert_eq!(MemoryPopulation::gib1().banks_mib(), [512, 512]);
+        assert_eq!(MemoryPopulation::gib4().banks_mib(), [1024, 1024, 512, 512, 512, 512]);
+        assert_eq!(MemoryPopulation::gib4(), MemoryPopulation::from_mib(&[1024, 1024, 512, 512, 512, 512]).unwrap());
+        assert_eq!((MemoryPopulation::gib1().total_mib(), MemoryPopulation::gib4().total_mib()), (1024, 4096));
+        for bad in [&[][..], &[256], &[2048], &[512, 0], &[768, 512], &[512; 9]] {
+            assert!(MemoryPopulation::from_mib(bad).is_err(), "{bad:?}");
+        }
+        assert!(MemoryPopulation::from_mib(&[1024; 8]).is_ok());
+        assert!(MemoryPopulation::new(&[]).is_err());
+    }
+
+    /// The default keeps the whole population inside ppmem's 4 GiB window, so
+    /// the default boot never uses the decode-table path; the 4 GiB layout does
+    /// not, and both are accepted by the memory model.
+    #[test]
+    fn the_default_fits_the_direct_window_and_the_4_gib_layout_does_not() {
+        for (population, direct) in [(MemoryPopulation::gib1(), true), (MemoryPopulation::gib4(), false)] {
+            assert_eq!(population.fits_direct_window(), direct);
+            let end = |bank: usize| bank as u64 * BANK_SPAN + u64::from(population.banks()[bank].mib()) * (1 << 20);
+            let last = population.banks().len() - 1;
+            assert_eq!(end(last) <= WINDOW_SIZE, direct, "the last bank ends inside the window");
+            assert!(super::super::bedrock_md::BedrockMd::new(&population.banks_mib()).is_ok());
+        }
+    }
+
+    /// One processor needs 512 MB; two or four need 1 GB. Fewer than one or
+    /// more than four processors is not a Tezro.
+    #[test]
+    fn the_memory_must_meet_the_minimum_for_the_processors() {
+        let half = MemoryPopulation::from_mib(&[512]).unwrap();
+        assert!(half.check_for_cpus(1).is_ok());
+        for cpus in [2, 3, 4] {
+            let error = half.check_for_cpus(cpus).unwrap_err();
+            assert!(error.contains("1024"), "{error}");
+        }
+        for population in [MemoryPopulation::gib1(), MemoryPopulation::gib4()] {
+            for cpus in [1, 2, 4] {
+                assert!(population.check_for_cpus(cpus).is_ok());
+            }
+        }
+        assert!(MemoryPopulation::gib1().check_for_cpus(0).is_err());
+        assert!(MemoryPopulation::gib1().check_for_cpus(5).is_err());
+        // A single 1024 MiB bank meets the two-processor minimum too.
+        assert!(MemoryPopulation::from_mib(&[1024]).unwrap().check_for_cpus(4).is_ok());
     }
 }
