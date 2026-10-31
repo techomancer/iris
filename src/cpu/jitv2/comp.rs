@@ -127,7 +127,8 @@ fn prepare_multi_entry_compile(
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> PrepareOutcome {
     let page = unsafe { &*req.page };
-    let phys_base = page.pfn as u64 * PAGE_SIZE as u64;
+    let key = page.pfn;
+    let phys_base = page.phys_base();
 
     // Dirty-cache gate. The seqlock snapshot below reads RAM off the bus; the
     // guest CPU sees RAM overlaid with its own dirty L1-D/L2 lines, and a
@@ -166,7 +167,7 @@ fn prepare_multi_entry_compile(
         let gen0 = page.current_gen();
         let mut read_ok = true;
         for (i, w) in words.iter_mut().enumerate() {
-            let r = bus.read32(phys_base + i as u64 * 4);
+            let r = bus.read32(crate::cpu::jitv2::jitv2::key_bus_addr(key, (i as u32) * 4));
             if !r.is_ok() {
                 read_ok = false;
                 break;

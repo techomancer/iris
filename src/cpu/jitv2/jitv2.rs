@@ -80,6 +80,43 @@ pub fn pfn_of(phys_addr: u64, frames: u64) -> Option<Pfn> {
     (pfn < frames).then_some(pfn as Pfn)
 }
 
+/// Set in a page key when the CPU fetched the page uncached on a machine
+/// whose uncached bus view decodes differently from its cached one (IP35).
+/// The key is `pfn | UNCACHED_VIEW_PFN`; the other machines never set it.
+/// It is bit 22, above every frame of every machine: the largest physical
+/// window is 16 GiB, [`PFN_MAP_ENTRIES`] = 1 << 22 frames, and [`pfn_of`]
+/// admits no frame at or past the machine's `frames`. So stripping it is a
+/// no-op on a machine that never sets it, however much memory that machine
+/// has (an 8 GB Octane's frames reach bit 21). A constant, so the hot paths
+/// that strip it need no load. See [`code_key`].
+pub const UNCACHED_VIEW_PFN: Pfn = PFN_MAP_ENTRIES as Pfn;
+
+/// Set in the bus address a code page is read or generation-tracked through
+/// when the page was fetched uncached. A bus that has no separate uncached
+/// code view never sees it (the key bit is never set there).
+pub const UNCACHED_VIEW_ADDR: u64 = 1 << 63;
+
+/// The page key for a fetch at `phys_addr`: its frame below `frames`, plus
+/// [`UNCACHED_VIEW_PFN`] when `uncached_view` says this fetch reached memory
+/// through the uncached view.
+#[inline(always)]
+pub fn code_key(phys_addr: u64, frames: u64, uncached_view: bool) -> Option<Pfn> {
+    pfn_of(phys_addr, frames).map(|pfn| pfn | (UNCACHED_VIEW_PFN & (0 as Pfn).wrapping_sub(uncached_view as Pfn)))
+}
+
+/// Physical base address of the frame a page key names, without the view bit.
+#[inline(always)]
+pub fn key_phys_base(key: Pfn) -> u64 {
+    (key & !UNCACHED_VIEW_PFN) as u64 * PAGE_SIZE as u64
+}
+
+/// Bus address for reading or tracking the page `key`, in the view it names.
+#[inline(always)]
+pub fn key_bus_addr(key: Pfn, offset: u32) -> u64 {
+    let addr = key_phys_base(key) + offset as u64;
+    if key & UNCACHED_VIEW_PFN != 0 { addr | UNCACHED_VIEW_ADDR } else { addr }
+}
+
 /// Direct-mapped `pfn -> PageSlot` lookup, replacing the `HashMap<Pfn,
 /// PageSlot>` both page pools used to carry.
 ///
@@ -1285,6 +1322,18 @@ impl PhysicalCodePage {
         self.pfn != UNCLAIMED_PFN
     }
 
+    /// Physical base address of the frame this page covers.
+    #[inline]
+    pub fn phys_base(&self) -> u64 {
+        key_phys_base(self.pfn)
+    }
+
+    /// Whether the CPU fetched this page through the uncached view.
+    #[inline]
+    pub fn is_uncached_view(&self) -> bool {
+        self.pfn != UNCLAIMED_PFN && self.pfn & UNCACHED_VIEW_PFN != 0
+    }
+
     pub fn claim(&mut self, pfn: Pfn, gen: *const AtomicU64, fr1: bool) {
         debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn == UNCLAIMED_PFN,
             "claim() called on a slot that wasn't clean (pfn={:#x}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
@@ -2307,6 +2356,10 @@ pub struct Jitv2 {
     /// lands on a different PFN than the currently-tracked one) — not on
     /// every fetch. Direct-mapped, not hashed — see [`PfnMap`].
     pfn_to_slot: PfnMap,
+    /// Frames of the machine's memory, the plain keys `pfn_to_slot` holds.
+    frames: usize,
+    /// `pfn_to_slot` also holds uncached-view keys (`enable_uncached_views`).
+    uncached_views: bool,
     /// Pool capacity, fixed at construction (== `pages.len()`). Claiming past
     /// this (i.e. with the free list exhausted) triggers `mega_flush` (the
     /// "ran out of PCPs" resource-exhaustion trigger).
@@ -2414,6 +2467,8 @@ impl Jitv2 {
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
             pfn_to_slot: PfnMap::new(frames),
+            frames,
+            uncached_views: false,
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
@@ -2449,11 +2504,36 @@ impl Jitv2 {
         }
         let slot = self.free_head;
         self.free_head = self.pages[slot as usize].next;
-        let gen = bus.gen_ptr(phys_addr);
+        // The generation counter belongs to the view the page is read
+        // through: `phys_addr` names the frame, the key says which view.
+        let gen_addr = phys_addr | if pfn & UNCACHED_VIEW_PFN != 0 { UNCACHED_VIEW_ADDR } else { 0 };
+        let gen = bus.gen_ptr(gen_addr);
         self.pages[slot as usize].claim(pfn, gen, fr1);
         self.pages[slot as usize].next = NO_SLOT;
         self.pfn_to_slot.insert(pfn, slot);
         Some(slot)
+    }
+
+    /// Whether the pool holds uncached-view pages (`enable_uncached_views`).
+    pub fn uncached_views_enabled(&self) -> bool {
+        self.uncached_views
+    }
+
+    /// Let the pool hold uncached-view pages ([`UNCACHED_VIEW_PFN`]): the map
+    /// grows from `frames` entries to the view bit plus `frames`, so each
+    /// view's keys index it directly, as plain frames do. Call before any
+    /// page is claimed and before an executor captures the lookup pointers
+    /// (`jitv2_bind_fast_lookup`); the map is reallocated, to 16 MiB plus
+    /// four bytes a frame.
+    pub fn enable_uncached_views(&mut self) {
+        if self.uncached_views {
+            return;
+        }
+        assert_eq!(self.pages_used(), 0, "uncached code views must be enabled before any page is claimed");
+        assert!(self.frames <= UNCACHED_VIEW_PFN as usize,
+            "memory reaches past the page table's largest window ({} frames)", self.frames);
+        self.pfn_to_slot = PfnMap::new(UNCACHED_VIEW_PFN as usize + self.frames);
+        self.uncached_views = true;
     }
 
     /// Pointers for lock-free `pfn -> *mut PhysicalCodePage` fast lookup.
@@ -5165,6 +5245,52 @@ mod tests {
         let indy = frames_for(&crate::ip22_bus::memory_map(false));
         assert_eq!(pfn_of(0x2FFF_F000, indy), Some(0x2FFFF));
         assert_eq!(pfn_of(0x3000_0000, indy), None);
+    }
+
+    /// A machine that never sets the view bit keeps its frames' true
+    /// addresses, including frames at or above 4 GiB (bit 20 of a frame
+    /// number), as an Octane with 8 GB has.
+    #[test]
+    fn frames_above_4_gib_keep_their_address_without_the_view() {
+        let octane = frames_for(&crate::ip30::memory_map(&[2048, 2048, 2048, 2048]));
+        for addr in [0x1_0000_1000u64, 0x1_ffff_f000, 0x2_1fff_f000] {
+            let key = code_key(addr, octane, false).unwrap();
+            assert_eq!(key, (addr / PAGE_SIZE as u64) as Pfn);
+            assert_eq!(key & UNCACHED_VIEW_PFN, 0, "{addr:#x}");
+            assert_eq!(key_phys_base(key), addr & !(PAGE_SIZE as u64 - 1), "{addr:#x}");
+            assert_eq!(key_bus_addr(key, 8), (addr & !(PAGE_SIZE as u64 - 1)) + 8, "{addr:#x} has no view address bit");
+        }
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::with_frames(4, octane as usize);
+        let slot = jit.page_for(0x100001, 0x1_0000_1000, &dev, false).unwrap();
+        let page = unsafe { &*jit.page_ptr(slot) };
+        assert_eq!(page.phys_base(), 0x1_0000_1000);
+        assert!(!page.is_uncached_view());
+        assert_eq!(key_bus_addr(page.pfn, 0), 0x1_0000_1000);
+    }
+
+    /// An uncached-view key still names its frame and view when the frame is
+    /// above 4 GiB, and the view bit stays clear of the largest frame.
+    #[test]
+    fn the_uncached_view_survives_frames_above_4_gib() {
+        let frames = PFN_MAP_ENTRIES as u64;
+        assert_eq!(UNCACHED_VIEW_PFN as u64, frames);
+        for addr in [0x1fc0_0000u64, 0x1_0000_1000, 0x3_ffff_f000] {
+            let key = code_key(addr, frames, true).unwrap();
+            assert_ne!(key & UNCACHED_VIEW_PFN, 0);
+            assert_eq!(key_phys_base(key), addr & !(PAGE_SIZE as u64 - 1), "{addr:#x}");
+            assert_eq!(key_bus_addr(key, 0), (addr & !(PAGE_SIZE as u64 - 1)) | UNCACHED_VIEW_ADDR, "{addr:#x}");
+        }
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::with_frames(4, 0xd0000);
+        jit.enable_uncached_views();
+        let key = code_key(0x1fc0_0000, 0xd0000, true).unwrap();
+        let slot = jit.page_for(key, 0x1fc0_0000, &dev, false).unwrap();
+        let page = unsafe { &*jit.page_ptr(slot) };
+        assert!(page.is_uncached_view());
+        assert_eq!(page.phys_base(), 0x1fc0_0000);
+        let plain = jit.page_for(0x1fc00, 0x1fc0_0000, &dev, false).unwrap();
+        assert_ne!(plain, slot, "the two views of a frame are two pages");
     }
 
     #[test]
