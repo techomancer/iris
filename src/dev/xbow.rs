@@ -36,12 +36,30 @@
 //! error. These follow hw/misc/sgi-xbridge-xbow.c in
 //! jamesbraid/qemu-sgi-origami, not a published specification.
 //!
+//! # Behind a PIC
+//!
+//! The chip can also carry a part number and manufacturer, report a
+//! revision other than the one whose behaviour it has, and name a source
+//! widget in its status reads: what [`Pxbow`](super::pxbow::Pxbow) needs
+//! behind a PIC.
+//!
+//! With a clock ([`Xbow::with_clock`]) a link reset is the two-core-cycle
+//! pulse the QEMU model has: the link is down for 20 ns of the clock, and
+//! the chip ends the pulse the next time anything reads its registers or
+//! asks [`Xbow::carries_timed`], so what the guest sees follows the clock and not
+//! host scheduling. Without one the pulse is over at once. [`Xbow::warm_reset`]
+//! takes a warm reset from a link through the revision-5 fences. No board in
+//! this tree sends one yet: the Hub's link control is the only sender the
+//! QEMU model names.
+//!
 //! Ported from hw/misc/sgi-xbow.c in jamesbraid/qemu-sgi-origami.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
+
+use super::heart::Clock;
 
 use crate::irq::InterruptController;
 use crate::snapshot::{field_bool, field_u32, field_u32s, field_u8, StateTable};
@@ -85,6 +103,15 @@ const FENCE_MASK: u32 = 0xff;
 /// The first revision code with fences and the lock (Crossbow 2.0 in the
 /// software tables; an Octane2's code-5 part shows as 1.4 in its inventory).
 const REVISION_FENCES: u32 = 5;
+const CORE_CYCLE_NS: u64 = 10;
+/// How long a link reset holds the link down: two core cycles.
+const LINK_RESET_NS: u64 = 2 * CORE_CYCLE_NS;
+/// A warm reset arriving this many cycles after another is ignored.
+const WARM_RESET_QUIET_CYCLES: u64 = 1024;
+/// Where a status read carries the widget that asked, when the chip is told
+/// to.
+const STATUS_SOURCE_SHIFT: u32 = 6;
+const STATUS_SOURCE_MASK: u32 = 0xf << STATUS_SOURCE_SHIFT;
 const LINK_BASE: u32 = 0x100;
 const LINK_STRIDE: u32 = 0x40;
 const LINK_END: u32 = LINK_BASE + LINK_STRIDE * LINKS as u32;
@@ -166,6 +193,12 @@ struct Regs {
     fences: [u32; FENCES],
     /// The resource lock's byte.
     lock: u32,
+    /// When each link's reset pulse ends, in clock ns; 0 when none runs.
+    reset_due: [u64; LINKS],
+    /// Links that were alive when their pulse began and return alive.
+    reset_restore: u8,
+    /// A warm reset before this time is ignored.
+    warm_quiet_until: u64,
 }
 
 /// Which crossbar a [`Xbow`] is: see the module documentation.
@@ -217,6 +250,9 @@ impl Regs {
             initializing: 0,
             eight_bit: 0,
             interrupt_asserted: false,
+            reset_due: [0; LINKS],
+            reset_restore: 0,
+            warm_quiet_until: 0,
         }
     }
 }
@@ -226,14 +262,27 @@ impl Regs {
 struct Out {
     /// Widget 0's interrupt packets to the host: (address, vector, set).
     packets: Vec<(u64, u8, bool)>,
-    /// A link reset's far-end widget.
-    link_reset: Option<u8>,
+    /// Link resets' far-end widgets.
+    link_resets: Vec<u8>,
 }
 
 pub struct Xbow {
     regs: Mutex<Regs>,
     revision: u32,
     part: Part,
+    /// Revision field of the identification word when it differs from the
+    /// revision that selects behaviour.
+    reported_revision: Option<u32>,
+    /// Part number and manufacturer in a Crossbow's identification word.
+    identity: (u32, u32),
+    /// The widget a status read reports as its source, if the chip does.
+    status_source: Option<u8>,
+    clock: Option<Clock>,
+    /// The earliest running pulse's end, or `u64::MAX`. Written under `regs`.
+    reset_due: AtomicU64,
+    /// A write to an error address register completes; see
+    /// [`Xbow::with_posted_error_address_writes`].
+    posted_error_address_writes: bool,
     /// Links with something attached, bit n for widget 8 + n.
     present: AtomicU8,
     /// Links passing traffic, as `present`. Written under `regs`.
@@ -279,6 +328,12 @@ impl Xbow {
             regs: Mutex::new(Regs::reset(part, present)),
             revision,
             part,
+            reported_revision: None,
+            identity: (0, 0),
+            status_source: None,
+            clock: None,
+            reset_due: AtomicU64::new(u64::MAX),
+            posted_error_address_writes: false,
             present: AtomicU8::new(present),
             alive: AtomicU8::new(present),
             irq_order: Mutex::new(()),
@@ -288,6 +343,47 @@ impl Xbow {
             unsupported: Mutex::new(Vec::new()),
             unsupported_full: AtomicBool::new(false),
         }
+    }
+
+    /// Complete a write to either error address register instead of
+    /// refusing it. The registers are read-only and the write still changes
+    /// nothing, sets the register-access error and is listed in
+    /// [`Xbow::unsupported`]: the specification makes a write to a read-only
+    /// register an error condition that widget 0's status reports. What the
+    /// processor sees is the other half: an uncached store is a write
+    /// request with no completion response (NEC U10278EJ4V0UM p.104, table
+    /// 6-1), so no error can come back to it. A stock IP35 PROM writes the
+    /// lower register on purpose in its crossbar check. QEMU's
+    /// `complete-posted-error-address-writes` property.
+    pub fn with_posted_error_address_writes(mut self) -> Self {
+        self.posted_error_address_writes = true;
+        self
+    }
+
+    /// Answer to `part` and `manufacturer` in the identification word
+    /// instead of the Crossbow's zeros.
+    pub fn with_identity(mut self, part: u32, manufacturer: u32) -> Self {
+        self.identity = (part, manufacturer);
+        self
+    }
+
+    /// Report `revision` in the identification word while behaviour stays
+    /// that of the revision given to [`Xbow::new`].
+    pub fn with_reported_revision(mut self, revision: u32) -> Self {
+        self.reported_revision = Some(revision);
+        self
+    }
+
+    /// Time link resets and warm resets by `clock`, in nanoseconds.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Report `widget` in bits 9:6 of every status read.
+    pub fn with_status_source(mut self, widget: u8) -> Self {
+        self.status_source = Some(widget);
+        self
     }
 
     /// Where widget 0's interrupt packets go: the host chip addressed as
@@ -322,7 +418,14 @@ impl Xbow {
         let order = self.irq_order.lock();
         let before = self.alive.load(Ordering::Acquire);
         let mut out = Out::default();
-        let ret = f(&mut self.regs.lock(), &mut out);
+        let ret = {
+            let mut r = self.regs.lock();
+            self.end_pulses(&mut r, &mut out);
+            let ret = f(&mut r, &mut out);
+            let due = r.reset_due.iter().copied().filter(|&d| d != 0).min().unwrap_or(u64::MAX);
+            self.reset_due.store(due, Ordering::Release);
+            ret
+        };
         if let Some((_, h)) = self.host.get() {
             for (address, vector, set) in out.packets {
                 h.packet(0, address, vector as u32, set);
@@ -335,8 +438,10 @@ impl Xbow {
                 cb(FIRST_WIDGET + link, self.alive.load(Ordering::Acquire) >> link & 1 != 0);
             }
         }
-        if let (Some(w), Some(cb)) = (out.link_reset, self.on_link_reset.get()) {
-            cb(w);
+        if let Some(cb) = self.on_link_reset.get() {
+            for w in out.link_resets {
+                cb(w);
+            }
         }
         ret
     }
@@ -352,9 +457,22 @@ impl Xbow {
         }
     }
 
-    /// Whether the switch passes traffic to and from `widget`. Lock-free.
+    /// Whether the switch passes traffic to and from `widget`. A link reset
+    /// pulse ends here only on a register access; a chip with a clock asks
+    /// [`Self::carries_timed`].
     pub fn carries(&self, widget: u8) -> bool {
         link_bit(widget).is_some_and(|b| self.alive.load(Ordering::Acquire) & b != 0)
+    }
+
+    /// [`Self::carries`] on a chip with a clock: a link reset pulse that is
+    /// over by the clock ends first. Lock-free unless one is.
+    pub fn carries_timed(&self, widget: u8) -> bool {
+        if let Some(clock) = &self.clock {
+            if clock() >= self.reset_due.load(Ordering::Acquire) {
+                self.locked(|_, _| {});
+            }
+        }
+        self.carries(widget)
     }
 
     pub fn unsupported(&self) -> Vec<(u32, u8, bool)> {
@@ -363,17 +481,22 @@ impl Xbow {
 
     fn identification(&self) -> u32 {
         match self.part {
-            // Part number and manufacturer are zero on Crossbow.
-            Part::Crossbow => (self.revision << 28) | 1,
+            // Part number and manufacturer are zero on Crossbow unless the
+            // board names others.
+            Part::Crossbow => {
+                let (part, manufacturer) = self.identity;
+                (self.reported_revision.unwrap_or(self.revision) << 28) | (part << 12) | (manufacturer << 1) | 1
+            }
             Part::XBridge => XBRIDGE_ID,
         }
     }
 
     /// The status register as the host reads it: on the XBridge, with the
-    /// host's port as the requester.
+    /// host's port as the requester; on a chip told its source, with that.
     fn status(&self, r: &Regs) -> u32 {
-        match (self.part, self.host.get()) {
-            (Part::XBridge, Some((host, _))) => r.status | u32::from(host.widget) << XBRIDGE_REQUESTER_SHIFT,
+        match (self.part, self.host.get(), self.status_source) {
+            (Part::XBridge, Some((host, _)), _) => r.status | u32::from(host.widget) << XBRIDGE_REQUESTER_SHIFT,
+            (Part::Crossbow, _, Some(widget)) => (r.status & !STATUS_SOURCE_MASK) | (u32::from(widget) << STATUS_SOURCE_SHIFT),
             _ => r.status,
         }
     }
@@ -571,7 +694,14 @@ impl Xbow {
     pub fn write(&self, off: u32, size: usize, val: u64) -> bool {
         let xbridge = self.part == Part::XBridge;
         self.locked(|r, out| {
-            let Some(slot) = self.decode(r, out, off, size, true) else { return xbridge };
+            let Some(slot) = self.decode(r, out, off, size, true) else {
+                // Refused and recorded either way; a posted error address
+                // write completes all the same.
+                return xbridge
+                    || (self.posted_error_address_writes
+                        && size == 4
+                        && matches!(off.wrapping_sub(4), ERR_UPPER | ERR_LOWER));
+            };
             let val = val as u32;
             match slot {
                 CONTROL => {
@@ -620,7 +750,7 @@ impl Xbow {
                             self.link_reset(r, link, out);
                             // After the lock: the widget's reset may ask
                             // the switch about its links.
-                            out.link_reset = Some(FIRST_WIDGET + link as u8);
+                            out.link_resets.push(FIRST_WIDGET + link as u8);
                         }
                         _ => unreachable!(),
                     }
@@ -630,13 +760,17 @@ impl Xbow {
         })
     }
 
-    /// A link reset. The pulse is two core cycles, over before the
+    /// A link reset. Without a clock the pulse is over before the
     /// processor can look again, so it is not kept. A fitted link that was
     /// alive comes back alive with an alive event, as the Octane's
     /// restore-alive policy has it; one that was down stays down, still
     /// initializing; an empty port fails initialization.
     fn link_reset(&self, r: &mut Regs, link: usize, out: &mut Out) {
         let bit = 1u8 << link;
+        if let Some(clock) = &self.clock {
+            self.begin_pulse(r, link, clock(), out);
+            return;
+        }
         let was_alive = self.alive.load(Ordering::Acquire) & bit != 0;
         r.eight_bit &= !bit;
         if self.present.load(Ordering::Acquire) & bit != 0 {
@@ -656,6 +790,95 @@ impl Xbow {
             r.came_up &= !bit;
         }
         self.update_interrupt(r, out);
+    }
+
+    /// A link reset with a clock: the link drops now and the pulse ends
+    /// two core cycles on. A fitted link that was alive comes back alive
+    /// then, with an alive event; one that was down comes out of
+    /// initialization still down; an empty port fails initialization and
+    /// stays failed.
+    fn begin_pulse(&self, r: &mut Regs, link: usize, now: u64, out: &mut Out) {
+        let bit = 1u8 << link;
+        let present = self.present.load(Ordering::Acquire) & bit != 0;
+        if present && self.alive.load(Ordering::Acquire) & bit != 0 {
+            r.reset_restore |= bit;
+        } else {
+            r.reset_restore &= !bit;
+        }
+        self.alive.fetch_and(!bit, Ordering::AcqRel);
+        r.eight_bit &= !bit;
+        if present {
+            r.initializing |= bit;
+        } else {
+            r.initializing &= !bit;
+            r.came_up &= !bit;
+        }
+        r.reset_due[link] = now + LINK_RESET_NS;
+        self.update_interrupt(r, out);
+    }
+
+    /// End every pulse the clock says is over.
+    fn end_pulses(&self, r: &mut Regs, out: &mut Out) {
+        let Some(clock) = &self.clock else { return };
+        if r.reset_due.iter().all(|&d| d == 0) {
+            return;
+        }
+        let now = clock();
+        for link in 0..LINKS {
+            let bit = 1u8 << link;
+            if r.reset_due[link] == 0 || r.reset_due[link] > now {
+                continue;
+            }
+            r.reset_due[link] = 0;
+            if self.present.load(Ordering::Acquire) & bit == 0 {
+                continue;
+            }
+            r.initializing &= !bit;
+            if r.reset_restore & bit != 0 {
+                self.alive.fetch_or(bit, Ordering::AcqRel);
+                r.came_up |= bit;
+                r.link_event[link] |= LINK_ALIVE;
+                if r.link_control[link] & LINK_EIGHT_BIT_FORCE != 0 {
+                    r.eight_bit |= bit;
+                }
+            }
+            r.reset_restore &= !bit;
+            self.update_interrupt(r, out);
+        }
+    }
+
+    /// A warm reset arriving on the link of `source` widget, at `now` ns.
+    /// The first in 1024 core cycles is taken and later ones are ignored.
+    /// On revision 5 and later each destination has a fence naming the
+    /// sources it admits: the core resets only if its fence admits the
+    /// source, and each link whose fence does gets a reset pulse out to
+    /// its far end ([`Self::on_link_reset`]). Fences keep their programmed
+    /// value; the lock clears with the core. Earlier revisions admit every
+    /// source.
+    pub fn warm_reset(&self, source: u8, now: u64) {
+        let Some(port) = link_bit(source).map(|b| b.trailing_zeros() as usize) else { return };
+        let fenced = self.revision >= REVISION_FENCES || self.part == Part::XBridge;
+        self.locked(|r, out| {
+            if now < r.warm_quiet_until {
+                crate::dlog!(crate::devlog::LogModule::Bedrock, "xbow: warm reset from widget {source} inside the quiet window; ignored");
+                return;
+            }
+            let fences = r.fences;
+            let admits = |fence: u32| !fenced || fence >> port & 1 != 0;
+            if admits(fences[0]) {
+                let present = self.present.load(Ordering::Acquire);
+                *r = Regs::reset(self.part, present);
+                self.alive.store(present, Ordering::Release);
+                r.fences = fences;
+                self.update_interrupt(r, out);
+            }
+            r.warm_quiet_until = now + WARM_RESET_QUIET_CYCLES * CORE_CYCLE_NS;
+            for (link, &fence) in fences[1..].iter().enumerate() {
+                if admits(fence) {
+                    out.link_resets.push(FIRST_WIDGET + link as u8);
+                }
+            }
+        });
     }
 }
 
@@ -841,8 +1064,15 @@ impl Saveable for Xbow {
             interrupt_asserted: field_bool(v, "interrupt_asserted")?,
             fences: field_u32s(v, "fences")?,
             lock: field_u32(v, "lock")?,
+            // A link reset lasts two core cycles and the warm-reset quiet
+            // time is counted on the board clock; a snapshot carries
+            // neither, so a restored crossbow has none in progress.
+            reset_due: [0; LINKS],
+            reset_restore: 0,
+            warm_quiet_until: 0,
         };
         *self.regs.lock() = n;
+        self.reset_due.store(u64::MAX, Ordering::Release);
         self.alive.store(field_u8(v, "alive")?, Ordering::Release);
         Ok(())
     }
@@ -1105,6 +1335,166 @@ mod tests {
         assert_eq!(x.write32(0x1000_0000 + IDENTIFICATION as u64 + 4, 0), BUS_ERR);
     }
 
+    /// A write to a read-only error address register is an access error and
+    /// changes nothing. With posted error
+    /// address writes the store still completes, as QEMU's crossbar does with
+    /// `complete-posted-error-address-writes` (hw/misc/sgi-xbow.c, asserted
+    /// set on the Origin 2000 by sn0-origin2000-test's xio-owner case); other
+    /// read-only registers are refused as before.
+    #[test]
+    fn a_posted_error_address_write_completes_and_still_records_the_access_error() {
+        let refusing = octane();
+        assert_eq!(refusing.write32(ERR_LOWER as u64 + 4, 0xdead_beef), BUS_ERR);
+        let x = octane().with_posted_error_address_writes();
+        assert_eq!(x.write32(ERR_LOWER as u64 + 4, 0xdead_beef), BUS_OK);
+        assert_eq!(x.read(ERR_LOWER + 4, 4), Some(0), "the register keeps its value");
+        assert_eq!(x.read(STATUS + 4, 4).unwrap() as u32 & STATUS_ACCESS_ERROR, STATUS_ACCESS_ERROR);
+        assert_eq!(x.write32(ERR_UPPER as u64 + 4, 0), BUS_OK);
+        assert_eq!(x.read(STATUS + 4, 4).unwrap() as u32 & STATUS_MULTIPLE_ERROR, STATUS_MULTIPLE_ERROR);
+        assert_eq!(x.unsupported(), vec![(ERR_LOWER + 4, 4, true), (ERR_UPPER + 4, 4, true)]);
+        assert_eq!(x.write32(IDENTIFICATION as u64 + 4, 0), BUS_ERR, "only the error address registers");
+        assert_eq!(x.write64(ERR_LOWER as u64, 0), BUS_ERR, "nor an eight-byte write");
+    }
+
+    /// A Crossbow built without the posted-write option, as the Octane and
+    /// any other standalone one is, refuses both error address registers and
+    /// still records the access error; only the PXBOW completes them.
+    #[test]
+    fn a_standalone_crossbow_refuses_both_error_address_writes() {
+        for revision in [4, 5] {
+            let x = Xbow::new(revision, 0x8400);
+            assert_eq!(x.write32(ERR_LOWER as u64 + 4, 0xdead_beef), BUS_ERR, "revision {revision}");
+            assert_eq!(x.write32(ERR_UPPER as u64 + 4, 0), BUS_ERR, "revision {revision}");
+            assert_eq!(x.read(STATUS + 4, 4).unwrap() as u32 & STATUS_ACCESS_ERROR, STATUS_ACCESS_ERROR);
+        }
+    }
+
+    /// The fences, the lock and a non-zero part number belong to revision 5
+    /// and later; the Octane's revision 4 leaves them reserved.
+    #[test]
+    fn fences_the_lock_and_the_identity_fields_need_the_revision_that_has_them() {
+        let x = octane();
+        for slot in [FENCE_BASE, (FENCE_BASE + 8), LOCK, LOCK_CLEAR] {
+            assert_eq!(x.read(slot + 4, 4), None, "slot {slot:#x} is reserved on revision 4");
+            assert!(!x.write(slot + 4, 4, 1));
+        }
+        assert_eq!(x.read(IDENTIFICATION + 4, 4), Some(0x4000_0001));
+        let y = Xbow::new(5, 0x8400).with_identity(0xd100, 0);
+        assert_eq!(y.read(IDENTIFICATION + 4, 4), Some(0x5d10_0001));
+        assert_eq!(y.read(FENCE_BASE + 4, 4), Some(0xff));
+        assert!(y.write(FENCE_BASE + 4, 4, 0x1ff));
+        assert_eq!(y.read(FENCE_BASE + 4, 4), Some(0xff), "a fence is eight bits");
+    }
+
+    fn timed(revision: u32) -> (Xbow, Arc<AtomicU64>) {
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = now.clone();
+        let x = Xbow::new(revision, 0x8100).with_clock(Arc::new(move || clock.load(Ordering::SeqCst)));
+        (x, now)
+    }
+
+    /// Link reset is a pulse of two core cycles: the link is down and not
+    /// initializing-failed while it lasts, then a fitted live link returns
+    /// with an alive event. (sn0-xbow-test link-reset-pulse)
+    #[test]
+    fn a_link_reset_holds_the_link_down_for_twenty_nanoseconds() {
+        let (x, now) = timed(4);
+        let status = |link| LINK_BASE + LINK_STRIDE * link + LINK_STATUS + 4;
+        now.store(1000, Ordering::SeqCst);
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 3 + LINK_RESET + 4, 4, 0), "widget 11 has nothing fitted");
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
+        assert!(!x.carries_timed(15));
+        assert_eq!(x.read(status(7), 4), Some(0), "initializing shows none of the three bits");
+        assert_eq!(x.read(LINK_BASE + LINK_STRIDE * 7 + LINK_AUX_STATUS + 4, 4), Some(AUX_PRESENT as u64));
+        now.store(1019, Ordering::SeqCst);
+        assert!(!x.carries_timed(15));
+        now.store(1020, Ordering::SeqCst);
+        assert!(x.carries_timed(15), "the pulse is over by the clock without any register access");
+        assert_eq!(x.read(status(7), 4).unwrap() as u32 & LINK_ALIVE, LINK_ALIVE);
+        assert!(!x.carries_timed(11), "an empty port stays down");
+        assert_eq!(x.read(status(3), 4), Some(LINK_MAX_RETRY as u64));
+        assert!(x.carries_timed(8), "other links were not touched");
+    }
+
+    /// A register read ends a finished pulse before it answers.
+    #[test]
+    fn a_register_read_after_the_pulse_sees_the_link_back() {
+        let (x, now) = timed(4);
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
+        now.store(20, Ordering::SeqCst);
+        let aux = x.read(LINK_BASE + LINK_STRIDE * 7 + LINK_AUX_STATUS + 4, 4).unwrap() as u32;
+        assert_eq!(aux & (AUX_PRESENT | AUX_FAILURE_MODE), AUX_PRESENT);
+    }
+
+    fn resets(x: &Xbow) -> Arc<Mutex<Vec<u8>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        x.on_link_reset(Box::new(move |w| s.lock().push(w)));
+        seen
+    }
+
+    /// Fences gate a warm reset per destination, an accepted one leaves
+    /// them as programmed, and a machine reset restores them.
+    /// (sn0-xbow-test fence-persists-across-warm-reset,
+    /// fence-independence-link-outlives-core-rejection)
+    #[test]
+    fn a_warm_reset_obeys_each_destinations_fence_and_keeps_the_fences() {
+        let (x, now) = timed(5);
+        let seen = resets(&x);
+        assert!(x.write(CONTROL + 4, 4, 0x26));
+        assert!(x.write(FENCE_BASE + 4, 4, 0xbf));
+        assert!(x.write((FENCE_BASE + 8) + 8 * 7 + 4, 4, 0x3c));
+        assert!(x.write((FENCE_BASE + 8) + 4, 4, 0xfd));
+        x.warm_reset(15, 0);
+        assert_eq!(x.read(CONTROL + 4, 4), Some(0), "the core admitted widget 15 and reset");
+        assert_eq!(x.read(FENCE_BASE + 4, 4), Some(0xbf));
+        assert_eq!(x.read((FENCE_BASE + 8) + 8 * 7 + 4, 4), Some(0x3c));
+        // Link 7's fence refuses port 15 (bit 7 clear); the rest admit it.
+        assert_eq!(*seen.lock(), (8..15).collect::<Vec<u8>>());
+        // A core that refuses the source is left alone while links still admit.
+        assert!(x.write(CONTROL + 4, 4, 0x26));
+        assert!(x.write(FENCE_BASE + 4, 4, 0xbf & !(1 << 7)));
+        now.store(20_000, Ordering::SeqCst);
+        x.warm_reset(15, 20_000);
+        assert_eq!(x.read(CONTROL + 4, 4), Some(0x26));
+        crate::traits::Resettable::power_on(&x);
+        assert_eq!(x.read(FENCE_BASE + 4, 4), Some(0xff));
+        assert_eq!(x.read((FENCE_BASE + 8) + 8 * 7 + 4, 4), Some(0xff));
+    }
+
+    /// A second warm reset inside 1024 core cycles is the first one's echo.
+    /// The lock clears with the core only. (sn0-xbow-test
+    /// lock-clears-with-core-reset-only)
+    #[test]
+    fn a_warm_reset_inside_the_quiet_window_is_ignored_and_the_lock_follows_the_core() {
+        let (x, _) = timed(5);
+        let seen = resets(&x);
+        assert!(x.write(FENCE_BASE + 4, 4, 0xff & !(1 << 7)));
+        assert!(x.write(LOCK + 4, 4, 0x66));
+        x.warm_reset(15, 100);
+        assert_eq!(x.read(LOCK + 4, 4), Some(0x66), "fenced out: the core is untouched");
+        assert_eq!(seen.lock().len(), 8, "every link admitted the source");
+        assert!(x.write(FENCE_BASE + 4, 4, 0xff));
+        x.warm_reset(15, 100 + 10_239);
+        assert_eq!(x.read(LOCK + 4, 4), Some(0x66), "still inside the window");
+        assert_eq!(seen.lock().len(), 8);
+        x.warm_reset(15, 100 + 10_240);
+        assert_eq!(x.read(LOCK + 4, 4), Some(0));
+        assert_eq!(seen.lock().len(), 16);
+    }
+
+    /// Revision 4 has no fences, so a warm reset always reaches the core and
+    /// every link. (sn0-xbow-test warm-reset-revision-4-unaffected-by-fence)
+    #[test]
+    fn revision_four_admits_every_warm_reset() {
+        let (x, _) = timed(4);
+        let seen = resets(&x);
+        assert!(x.write(CONTROL + 4, 4, 0x26));
+        assert!(!x.write(FENCE_BASE + 4, 4, 0), "reserved on this revision");
+        x.warm_reset(15, 0);
+        assert_eq!(x.read(CONTROL + 4, 4), Some(0));
+        assert_eq!(seen.lock().len(), 8);
+    }
     #[test]
     fn link_changes_reach_the_callback_outside_the_lock() {
         let x = Arc::new(octane());
