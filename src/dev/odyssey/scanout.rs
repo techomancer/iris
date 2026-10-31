@@ -121,6 +121,10 @@ pub struct DirtyStats {
     pub wait_max_ns: u64,
     pub copy_ns: u64,
     pub copy_max_ns: u64,
+    /// Frames that let the board lock go to wait for a slice, and those
+    /// that gave up and waited with it held.
+    pub retries: u64,
+    pub fallbacks: u64,
 }
 
 impl DirtyStats {
@@ -147,11 +151,13 @@ impl DirtyStats {
         writeln!(w, "frames {} busy {} rows {} max {} swaps {}", self.frames, self.busy_frames, self.rows, self.max_rows, self.swaps)?;
         writeln!(
             w,
-            "planes wait_us {} max {} copy_us {} max {}",
+            "planes wait_us {} max {} copy_us {} max {} retries {} fallbacks {}",
             self.wait_ns / 1000,
             self.wait_max_ns / 1000,
             self.copy_ns / 1000,
-            self.copy_max_ns / 1000
+            self.copy_max_ns / 1000,
+            self.retries,
+            self.fallbacks
         )?;
         for (site, c) in DirtySite::ALL.iter().zip(&self.sites) {
             if c[0] != 0 {

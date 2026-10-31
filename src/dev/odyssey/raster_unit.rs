@@ -546,6 +546,18 @@ impl RasterQueue {
         PlanesHeld { _ctx: ctx }
     }
 
+    /// The planes for the display if no slice is running now.
+    pub fn try_planes(&self) -> Option<PlanesHeld<'_>> {
+        let ctx = self.ctx.try_lock()?;
+        PLANES_HELD.with(|h| h.set(true));
+        Some(PlanesHeld { _ctx: ctx })
+    }
+
+    /// Wait out the slice in flight, holding nothing.
+    pub fn wait_slice(&self) {
+        drop(self.ctx.lock());
+    }
+
     /// Tests: finished draw jobs waiting to be filled again.
     #[cfg(test)]
     pub fn spare_draws(&self) -> usize {

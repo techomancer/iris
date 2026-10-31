@@ -4,6 +4,7 @@
 use super::*;
 use crate::dev::odyssey::raster_bench::Bench;
 use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
@@ -931,4 +932,35 @@ fn stop_releases_a_waiting_front_end() {
     });
     assert_eq!(*ran.lock(), vec![0, 1]);
     assert_eq!(h.raster.queued(), 0);
+}
+
+/// A display frame that finds a raster slice running does not hold the
+/// board lock while it waits for the slice to end: the front end and the
+/// processor's accesses take the board meanwhile. Once the slice ends the
+/// frame takes the planes and resolves the dirty lines.
+#[test]
+fn a_frame_waiting_for_a_slice_leaves_the_board_free() {
+    let (h, st) = slow_raster(400);
+    let display = Arc::new(Display::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))));
+
+    red_triangle(&mut h.board.lock(), &st);
+    eventually("the raster unit began its slice", || h.raster.in_slice());
+    let frame = {
+        let (h, display) = (h.clone(), display.clone());
+        std::thread::spawn(move || Odyssey::frame(&h, &display))
+    };
+    std::thread::sleep(Duration::from_millis(60));
+
+    let t = Instant::now();
+    drop(h.board.lock());
+    assert!(t.elapsed() < Duration::from_millis(150), "the frame held the board for the slice: {:?}", t.elapsed());
+    assert!(h.raster.in_slice(), "the slice was still running");
+
+    frame.join().unwrap();
+    let s = h.board.lock();
+    assert!(s.scanout.stats.retries >= 1, "the frame let the board go to wait");
+    assert_eq!(s.scanout.stats.fallbacks, 0);
+    assert_eq!(s.scanout.stats.frames, 1, "and then staged its lines");
+    drop(s);
+    h.raster.stop();
 }
