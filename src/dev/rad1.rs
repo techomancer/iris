@@ -37,6 +37,10 @@
 //! * The sample clock, UST and status schedule run on host wall time, less
 //!   the time the machine was stopped; they are not tied to the emulated
 //!   CPU's progress.
+//! * The relay (0x88 = 2) and DAC (0x8c = 3) mute words silence the host
+//!   output while the transfer runs on. That they mute is inferred from
+//!   when the PROM, IRIX and Linux write them; the power-on state is
+//!   unknown and taken as not muted.
 //! * A BAR0 access the model does not recognise is logged and reads zero.
 //!   The model fails the bus access instead, which the PCI bus layer here
 //!   cannot express.
@@ -124,6 +128,14 @@ const DESC_RAM_LAST: u32 = DMA_BANK_FIRST + DESC_RAM_ENTRIES * DESC_RAM_ENTRY_BY
 /// "bit 28 + n" pattern is inferred from those two; other bits are unknown.
 const OUT_SELECT_GEN1: u32 = 1 << 29;
 const OUT_SELECT_GEN2: u32 = 1 << 30;
+/// The relay (0x88) and DAC (0x8c) mute words: the values the Octane PROM
+/// and IRIX write. Other values change no mute state.
+const REG_RELAY: u32 = 0x88;
+const REG_DAC_MUTE: u32 = 0x8c;
+const RELAY_RELEASE: u32 = 3;
+const RELAY_MUTE: u32 = 2;
+const DAC_MUTE: u32 = 3;
+const DAC_UNMUTE: u32 = 2;
 const CTRL_LEN_SHIFT: u32 = 7;
 const CTRL_LEN_MASK: u32 = 0x1ff_ffff;
 const DMA_UNIT_BYTES: u64 = 128;
@@ -276,18 +288,26 @@ struct Sink {
 }
 
 impl Sink {
-    /// Play stereo frames the card produced at `rate` Hz.
-    fn play(&mut self, pcm: &[i16], rate: u32) {
+    /// Play stereo frames the card produced at `rate` Hz. A muted output
+    /// still moves the ring; the host and the WAV get silence.
+    fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) {
+        let silence;
+        let host_pcm = if muted {
+            silence = vec![0i16; pcm.len()];
+            &silence[..]
+        } else {
+            pcm
+        };
         if let Some((out, rs)) = self.host.as_mut() {
             if rs.in_rate != rate {
                 *rs = Resampler::new(rate, out.stream_rate);
             }
-            for p in pcm.chunks_exact(PCM_CHANNELS) {
+            for p in host_pcm.chunks_exact(PCM_CHANNELS) {
                 rs.push(p[0], p[1], &mut out.producer);
             }
         }
         if let Some(w) = self.wav.as_mut() {
-            w.play(pcm, rate);
+            w.play(host_pcm, rate);
         }
         if let Some(t) = self.tap.as_ref() {
             t.lock().extend_from_slice(pcm);
@@ -461,6 +481,10 @@ struct State {
     /// Each generator's last control and remainder words; the master select
     /// (0xa8..0xb4) can arrive after the load.
     cg_loaded: [Option<(u32, u32)>; NUM_CG],
+    /// The relay (0x88) and DAC (0x8c) mutes once written. The power-on
+    /// state is unknown, so before that the output is not muted.
+    relay_muted: Option<bool>,
+    dac_muted: Option<bool>,
     status_dma_ctrl: u32,
     status_running: bool,
     chan: [Chan; NUM_CH],
@@ -495,6 +519,8 @@ impl State {
             analog_out_en: 0,
             out_cg: OUT_DEFAULT_CG,
             cg_loaded: [None; NUM_CG],
+            relay_muted: None,
+            dac_muted: None,
             status_dma_ctrl: 0,
             status_running: false,
             chan: [Chan::default(); NUM_CH],
@@ -535,6 +561,11 @@ impl State {
     /// The clock generator pacing a channel; 0x58 chooses the output's.
     fn cg_of(&self, idx: usize) -> Option<usize> {
         if idx == CH_OUT { Some(self.out_cg) } else { CHAN_INFO[idx].clockgen }
+    }
+
+    /// Whether the guest has muted the analog output's relay or DAC.
+    fn muted(&self) -> bool {
+        self.relay_muted == Some(true) || self.dac_muted == Some(true)
     }
 
     fn pos(&mut self, reg: u32) -> &mut u32 {
@@ -1076,6 +1107,16 @@ impl Inner {
                         let cg = NUM_CG - 1 - ((off - REG_CLOCKGEN_MUX_FIRST) / 4) as usize;
                         self.clockgen_reselect(s, cg, now);
                     }
+                    REG_RELAY => match val {
+                        RELAY_RELEASE => s.relay_muted = Some(false),
+                        RELAY_MUTE => s.relay_muted = Some(true),
+                        _ => {}
+                    },
+                    REG_DAC_MUTE => match val {
+                        DAC_MUTE => s.dac_muted = Some(true),
+                        DAC_UNMUTE => s.dac_muted = Some(false),
+                        _ => {}
+                    },
                     _ => {}
                 }
                 return Some(());
@@ -1456,7 +1497,7 @@ impl Inner {
                 let samples = &mut pcm[..n as usize * PCM_CHANNELS];
                 frames_to_pcm(buf, samples, ANALOG_WORDS);
                 if let Some(sink) = self.sink.lock().as_mut() {
-                    sink.play(samples, s.rate(idx).rounded_hz());
+                    sink.play(samples, s.rate(idx).rounded_hz(), s.muted());
                 }
             }
             let c = &mut s.chan[idx];

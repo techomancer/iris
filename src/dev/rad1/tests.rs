@@ -543,8 +543,8 @@ fn the_wav_capture_stays_at_44100_whatever_the_card_rate() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("o.wav");
     let mut sink = Sink { host: None, wav: Wav::create(path.as_os_str()), tap: None };
-    sink.play(&[0i16; 2 * 2205], 22050);
-    sink.play(&[0i16; 2 * 4410], 44100);
+    sink.play(&[0i16; 2 * 2205], 22050, false);
+    sink.play(&[0i16; 2 * 4410], 44100, false);
     let b = std::fs::read(&path).unwrap();
     assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 44100);
     let frames = u32::from_le_bytes(b[40..44].try_into().unwrap()) / 4;
@@ -1115,4 +1115,32 @@ fn a_link_loads_the_descriptor_ram_entry_it_names() {
         assert_eq!(tap.lock().len(), (512 + 256) * 2, "entry {entry}");
         assert!(!r.state.lock().chan[CH_OUT].stalled);
     }
+}
+
+#[test]
+fn the_relay_and_dac_mute_words_silence_the_output_but_not_the_transfer() {
+    let path = std::env::temp_dir().join(format!("rad1-mute-{}.wav", std::process::id()));
+    // The relay (0x88) and the DAC (0x8c): the word that mutes, the word that releases.
+    for (reg, mute, release) in [(0x88, 2, 3), (0x8c, 3, 2)] {
+        let (r, ram, tap) = tune_card();
+        ram.0.lock().unwrap()[0x10_0000..0x10_1000].fill(0x55);
+        r.sink.lock().as_mut().unwrap().wav = Wav::create(path.as_os_str());
+        program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+        wr(&r, 0x58, 0x2000_0001);
+        let wav_at = |ms: i64| {
+            at(&r, ms * SEC / 1000);
+            rd(&r, 0x58);
+            std::fs::read(&path).unwrap()
+        };
+        let a = wav_at(10);
+        assert!(a[44..].iter().any(|&b| b != 0), "not muted at power-on");
+        wr(&r, reg, mute);
+        let b = wav_at(20);
+        assert!(b.len() > a.len() && b[a.len()..].iter().all(|&x| x == 0), "{reg:#x} silences");
+        wr(&r, reg, release);
+        let c = wav_at(30);
+        assert!(c[b.len()..].iter().any(|&x| x != 0), "{reg:#x} releases");
+        assert!(r.state.lock().chan[CH_OUT].running && tap.lock().len() > 2 * 441 * 2);
+    }
+    let _ = std::fs::remove_file(&path);
 }
