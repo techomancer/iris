@@ -1810,6 +1810,180 @@ mod tests {
         assert_eq!(step(marked, seen(&md)), [jit, 2 * jit, 0], "returning a page advances it");
     }
 
+    /// A read-only 4 MiB window standing for the reset PROM, whose first
+    /// word reads 0x0f1e2d3c4b5a6978.
+    struct Prom;
+    impl BusDevice for Prom {
+        fn read64(&self, a: u64) -> BusRead64 {
+            if a == 0 { BusRead64::ok(0x0f1e_2d3c_4b5a_6978) } else { BusRead64::ok(0) }
+        }
+        fn write64(&self, _: u64, _: u64) -> u32 { BUS_ERR }
+    }
+
+    /// The Tezro's memory wired as the board wires it: the processor bus with
+    /// uncached RAM views, the cached view, and the reset PROM mapped over the
+    /// cached plane where the bank leaves room.
+    fn board(md: &Arc<BedrockMd>) -> (crate::ip35::Ip35Bus, Arc<dyn BusDevice>) {
+        let mut bus = crate::ip35::Ip35Bus::new(md.physical().clone());
+        #[cfg(feature = "jitv2")]
+        bus.set_ram_generations(md.dma_view());
+        md.rebuild_memory();
+        bus.map(3, 0, 1 << 33, md.uncached_view());
+        bus.map(0, 0, 0x1000_0000, md.uncached_view());
+        bus.map(0, 0x1fc0_0000, 0x40_0000, Arc::new(Prom));
+        crate::ip35::map_device(md.physical(), 0x1fc0_0000, 0x40_0000, Arc::new(Prom), "test reset PROM");
+        let cached = bus.cached_view(md.dma_view(), md.ram_extent());
+        (bus, cached)
+    }
+
+    /// The Tezro's default population, wired and configured as the board does.
+    fn default_tezro() -> (Arc<BedrockMd>, crate::ip35::Ip35Bus, Arc<dyn BusDevice>) {
+        let md = BedrockMd::new(&super::super::bedrock_mem::MemoryPopulation::default().banks_mib()).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        let (bus, cached) = board(&md);
+        (md, bus, cached)
+    }
+    /// Asserts a code page's counter moved, in builds that keep counters.
+    fn assert_advanced(what: &str, before: u64, after: u64) {
+        if cfg!(feature = "jitv2") {
+            assert!(after > before, "{what}: {before} -> {after}");
+        }
+    }
+
+    /// A processor store to banks 4 and 5, above the 4 GiB the direct window
+    /// reaches, goes through the board's cached view or an uncached one into
+    /// the bank behind the slot and advances that slot's logical counter,
+    /// and no other slot's. The JIT page lookup and the cache's own bump read
+    /// the same counter.
+    #[test]
+    fn processor_stores_to_banks_4_and_5_advance_their_slot_counters() {
+        let (md, bus, cached) = default_tezro();
+        let uncached = |address: u64| (3u64 << 57) | address;
+        for (slot, other) in [(4u64, 5u64), (5, 4)] {
+            let at = slot * BANK_SPAN + 0x2000;
+            let elsewhere = counter(&md, other * BANK_SPAN + 0x2000);
+            #[cfg(feature = "jitv2")]
+            {
+                assert_eq!(bus.gen_ptr(at), md.memory.gen_ptr(at));
+                assert_eq!(cached.gen_ptr(at), md.memory.gen_ptr(at));
+                assert_eq!(bus.gen_ptr(uncached(at)), md.memory.gen_ptr(at));
+            }
+            let mut last = counter(&md, at);
+            let mut stored = |what: &str, status: u32| {
+                assert_eq!(status, BUS_OK, "{what}");
+                let now = counter(&md, at);
+                assert_advanced(what, last, now);
+                last = now;
+            };
+            stored("cached store", cached.write64(at, 0x1111));
+            stored("cached block store", cached.write_block(at + 8, &[0x2222, 0x3333]));
+            stored("cached masked store", cached.write64_masked(at + 0x20, 0x4444, 0xff00));
+            stored("cached halfword store", cached.write16(at + 0x30, 0x5555));
+            stored("uncached store", bus.write64(uncached(at + 0x40), 0x6666));
+            stored("uncached byte store", bus.write8(uncached(at + 0x48), 0x77));
+            let bank = &md.physical().banks()[slot as usize];
+            let word = |offset: u64| bank.read64(0x2000 + offset).data;
+            assert_eq!([word(0), word(8), word(0x10), word(0x20), word(0x40)],
+                [0x1111, 0x2222, 0x3333, 0x4400, 0x6666], "slot {slot}");
+            assert_eq!(counter(&md, other * BANK_SPAN + 0x2000), elsewhere, "slot {other} untouched");
+        }
+    }
+
+    /// A checked page above 4 GiB keeps its logical counter honest: marking
+    /// it advances the counter, a store through the page's slow route does
+    /// too, and so does the store once the page is back on its bank.
+    #[test]
+    fn a_checked_page_above_4_gib_advances_its_counter() {
+        let (md, _bus, cached) = default_tezro();
+        let (page, address) = (4 * BANK_SPAN + 0x6000, 4 * BANK_SPAN + 0x6008);
+        let untouched = counter(&md, 4 * BANK_SPAN + 0x8000);
+        let start = counter(&md, page);
+        mark(&md, page);
+        let marked = counter(&md, page);
+        assert_advanced("mark", start, marked);
+        assert!(crate::ppmem::devmap::entry_eq(md.physical().entry_at(address), md.physical().entry_at(page)));
+        assert!(!crate::ppmem::devmap::entry_eq(md.physical().entry_at(page), md.physical().entry_at(page + 0x2000)));
+        assert_eq!(cached.write64(address, 0xaa), BUS_OK);
+        let stored = counter(&md, page);
+        assert_advanced("store to the checked page", marked, stored);
+        lift(&md, page);
+        md.retire_lifted_marks();
+        let retired = counter(&md, page);
+        assert_advanced("retirement", stored, retired);
+        assert_eq!(cached.write64(address, 0xbb), BUS_OK);
+        assert_advanced("store after retirement", retired, counter(&md, page));
+        assert_eq!(md.physical().banks()[4].read64(0x6008).data, 0xbb);
+        assert_eq!(counter(&md, 4 * BANK_SPAN + 0x8000), untouched, "a neighbouring page keeps its counter");
+    }
+
+    /// After a bank swap the slot's counter, which does not move, is the one
+    /// a store advances, whichever bank now sits behind the slot, and the
+    /// slot the bank left is not touched.
+    #[test]
+    fn a_store_after_a_bank_swap_advances_the_counter_of_the_slot_it_reached() {
+        let (md, bus, cached) = default_tezro();
+        let (four, five) = (4 * BANK_SPAN + 0x2000, 5 * BANK_SPAN + 0x2000);
+        #[cfg(feature = "jitv2")]
+        let pointers = (md.memory.gen_ptr(four), md.memory.gen_ptr(five));
+        // Bit 32 swaps the banks of a pair: slot 4 now reaches bank 5.
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        #[cfg(feature = "jitv2")]
+        assert_eq!((md.memory.gen_ptr(four), md.memory.gen_ptr(five)), pointers);
+        let (before_four, before_five) = (counter(&md, four), counter(&md, five));
+        assert_eq!(cached.write64(four, 0x44), BUS_OK);
+        assert_eq!(md.physical().banks()[5].read64(0x2000).data, 0x44, "slot 4 reaches bank 5");
+        assert_eq!(md.physical().banks()[4].read64(0x2000).data, 0);
+        let after_four = counter(&md, four);
+        assert_advanced("cached store to slot 4", before_four, after_four);
+        assert_eq!(counter(&md, five), before_five);
+        assert_eq!(bus.write64((3u64 << 57) | five, 0x55), BUS_OK);
+        assert_eq!(md.physical().banks()[4].read64(0x2000).data, 0x55, "slot 5 reaches bank 4");
+        assert_advanced("uncached store to slot 5", before_five, counter(&md, five));
+        assert_eq!(counter(&md, four), after_four);
+    }
+
+    /// With bank 0 at 1 GiB the RAM extent covers the cached PROM window at
+    /// 0x1fc0_0000, which a Fuel's 256 MiB banks leave to the PROM. Once
+    /// bank 0 is enabled the cached plane, the uncached RAM view and DMA all
+    /// see RAM there, and a cached store lands in it; the PROM answers
+    /// through Hub-special space only. Before bank 0 is enabled nothing is
+    /// RAM, the cached plane shows the PROM and a store is refused.
+    ///
+    /// The QEMU model agrees for those views and differs for one: its reset
+    /// window is routed by cache attribute, and a noncoherent cached access
+    /// (what the stock PROM runs with) keeps seeing the PROM after RAM is
+    /// enabled (hw/mips/sgi/sn1-node.c, sn1_reset_attrs_to_index and
+    /// sn1_node_map_reset, "Compatibility policy"). The cache here passes
+    /// no attribute to the bus, so a noncoherent cached access sees RAM.
+    #[test]
+    fn a_1_gib_bank_0_covers_the_cached_prom_window_with_ram() {
+        let md = BedrockMd::new(&TEZRO_BANKS).unwrap();
+        let (bus, cached) = board(&md);
+        let at = 0x1fc0_0000;
+        let prom = 0x0f1e_2d3c_4b5a_6978;
+        let uncached = (3u64 << 57) | at;
+        assert_eq!(cached.read64(at).data, prom, "before RAM is enabled");
+        assert_eq!(cached.write64(at, 0x55), BUS_ERR);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        assert_eq!(bus.read64(at).data, prom, "Hub-special space still shows the PROM");
+        for (what, value) in [("cached", cached.read64(at).data), ("uncached RAM", bus.read64(uncached).data),
+            ("DMA", md.dma_view().read64(at).data)] {
+            assert_eq!(value, 0, "{what} sees RAM");
+        }
+        assert!(md.physical().mem_ptr(at).is_some(), "the cache fills from RAM too");
+        let before = counter(&md, at);
+        assert_eq!(cached.write64(at, 0x55), BUS_OK);
+        assert_eq!(md.physical().banks()[0].read64(at).data, 0x55);
+        assert_advanced("cached store", before, counter(&md, at));
+        assert_eq!(bus.read64(at).data, prom, "the PROM is not written");
+        // The Fuel's 256 MiB banks never reach it.
+        let fuel = BedrockMd::new(&FUEL_BANKS).unwrap();
+        let (_bus, cached) = board(&fuel);
+        assert_eq!(fuel.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        assert_eq!(cached.read64(at).data, prom);
+        assert_eq!(cached.write64(at, 0x55), BUS_ERR);
+    }
+
     /// Guest density settings remap fitted RAM, and reset restores the default map.
     #[test]
     fn bank_configuration_remaps_memory_and_reset_restores_defaults() {
