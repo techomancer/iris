@@ -726,6 +726,10 @@ fill_rows! {
     TrilinearModulateRgbaLequal = (true, TRILINEAR, true, MODULATE, RGBA, 1, LEQUAL, 1, D, OFF, 0, D, D);
     TrilinearModulateRgbLequal = (true, TRILINEAR, true, MODULATE, RGB, 1, LEQUAL, 1, D, OFF, 0, D, D);
 
+    // Textured, wrapped on one axis and clamped to the edge on the other:
+    // perfly's trilinear RGB truck, which the repeated entries above do not
+    // take. The wrap is tested per tap.
+    TrilinearModulateRgbLequalEdge = (true, TRILINEAR, false, MODULATE, RGB, 1, LEQUAL, 1, D, OFF, 0, D, D);
 
     // Blended alpha-over and depth tested: Smoke & Mirrors' bilinear RGB
     // glass, depth LESS and written, and perfly's trilinear RGBA sky,
@@ -768,6 +772,17 @@ pub const SOFT_TEXTURE_SPANS: [[[[FillRow; 2]; 2]; 3]; 2] = {
             ],
         ],
     ]
+};
+
+/// The specialisations for a wrap other than REPEAT on both axes, indexed as
+/// SOFT_TEXTURE_SPANS; None where only the loop that tests every state per
+/// pixel (FillRow::TextureAny) takes the draw.
+pub const SOFT_TEXTURE_SPANS_EDGE: [[[[Option<FillRow>; 2]; 2]; 3]; 2] = {
+    use FillRow::*;
+    let mut t = [[[[None; 2]; 2]; 3]; 2];
+
+    t[1][2][1][1] = Some(TrilinearModulateRgbLequalEdge);
+    t
 };
 
 /// Untextured specialisations by depth (none, LESS, LEQUAL), shading (flat,
@@ -842,7 +857,8 @@ impl SoftDraw<'_> {
     /// None for the general loop: under SGI_RASTER_TEXTURE_SPANS, for state
     /// SoftDraw::fill_admits() takes (the fixed-point sampler already
     /// excludes the rest). A loop of its own for the common states
-    /// SOFT_TEXTURE_SPANS and the two blended entries name; the others take
+    /// SOFT_TEXTURE_SPANS, SOFT_TEXTURE_SPANS_EDGE and the two blended
+    /// entries name; the others take
     /// the loop that tests the state per pixel.
     pub fn fixed_span_select(&self, f: &SoftFixedTex) -> Option<FillRow> {
         let st: &GlDrawState = self.st;
@@ -900,10 +916,14 @@ impl SoftDraw<'_> {
             }
             return Some(FillRow::TextureAny);
         }
-        if !repeat || format < 0 || func < 0 || st.depth_mask == 0 {
+        if format < 0 || func < 0 || st.depth_mask == 0 {
             return Some(FillRow::TextureAny);
         }
-        Some(SOFT_TEXTURE_SPANS[func as usize][kernel as usize][env as usize][format as usize])
+        let (func, kernel, env, format) = (func as usize, kernel as usize, env as usize, format as usize);
+        if !repeat {
+            return Some(SOFT_TEXTURE_SPANS_EDGE[func][kernel][env][format].unwrap_or(FillRow::TextureAny));
+        }
+        Some(SOFT_TEXTURE_SPANS[func][kernel][env][format])
     }
 }
 
@@ -1346,8 +1366,70 @@ mod tests {
                 }
             }
         }
-        // 24 unblended, 2 blended and the fallback.
-        assert_eq!(seen.len(), 27, "{seen:?}");
+        // 24 unblended, the clamped one, 2 blended and the fallback.
+        assert_eq!(seen.len(), 28, "{seen:?}");
+    }
+
+    // Perfly's trilinear RGB truck wraps S clamped to the edge and T
+    // repeated: it takes the loop of its own, any other wrap pairing the
+    // fixed sampler takes still takes the fallback, and an all-repeat draw
+    // keeps its repeated loop.
+    #[test]
+    fn clamped_texture_selects_its_loop() {
+        let mut b = Bench::empty();
+        b.st.depth_test = 1;
+        b.st.depth_func = SGI_GL_LEQUAL;
+        b.st.depth_mask = 1;
+        b.st.texture_env_mode = SGI_GL_MODULATE;
+        let t = b.board.gl_target();
+        let reports = SoftReports::default();
+        let mut r = SoftDraw::new(&b.rules, &t, &b.st, &reports);
+        r.ntargets = 1;
+        assert!(r.setup_ops());
+        let f = |min, mag, format, wrap_s, wrap_t| SoftFixedTex { min, mag, lod: min != mag, format, wrap_s, wrap_t, ..Default::default() };
+        let tri = |format, wrap_s, wrap_t| f(SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, format, wrap_s, wrap_t);
+        let (rep, edge) = (SGI_GL_REPEAT, SGI_GL_CLAMP_TO_EDGE);
+
+        assert_eq!(r.fixed_span_select(&tri(SGI_GL_RGB, edge, rep)), Some(FillRow::TrilinearModulateRgbLequalEdge));
+        assert_eq!(r.fixed_span_select(&tri(SGI_GL_RGB, rep, edge)), Some(FillRow::TrilinearModulateRgbLequalEdge));
+        assert_eq!(r.fixed_span_select(&tri(SGI_GL_RGB, edge, edge)), Some(FillRow::TrilinearModulateRgbLequalEdge));
+        assert_eq!(r.fixed_span_select(&tri(SGI_GL_RGB, rep, rep)), Some(FillRow::TrilinearModulateRgbLequal));
+        // Other tuples have no clamped loop yet.
+        assert_eq!(r.fixed_span_select(&tri(SGI_GL_RGBA, edge, rep)), Some(FillRow::TextureAny));
+        assert_eq!(r.fixed_span_select(&f(SGI_GL_LINEAR, SGI_GL_LINEAR, SGI_GL_RGB, edge, rep)), Some(FillRow::TextureAny));
+    }
+
+    // That loop draws what the fallback and the general path draw, with
+    // texture coordinates that run off both edges.
+    #[test]
+    fn clamped_texture_rows_match_the_general_path() {
+        let mut changed = 0;
+        for seed in 600..=620u64 {
+            let make = |wrap_s| {
+                let mut b = case(seed, true);
+                b.st.depth_test = 1;
+                b.st.depth_func = SGI_GL_LEQUAL;
+                b.st.depth_mask = 1;
+                b.st.blend = 0;
+                b.st.fog = 0;
+                b.st.texture_env_mode = SGI_GL_MODULATE;
+                let mut tex = BenchTexture::new(32, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGB);
+
+                tex.wrap_s = wrap_s;
+                b.tex = Some(tex);
+                b
+            };
+            let want = draw_bench(make(SGI_GL_CLAMP_TO_EDGE), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_FIXED);
+            let fallback = draw_bench(make(SGI_GL_CLAMP_TO_EDGE), SGI_RASTER_FILL_DYNAMIC, SGI_RASTER_TEXTURE_SPANS);
+            let table = draw_bench(make(SGI_GL_CLAMP_TO_EDGE), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_SPANS);
+            let repeated = draw_bench(make(SGI_GL_REPEAT), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_SPANS);
+
+            compare(seed, "fallback loop", &want, &fallback);
+            compare(seed, "clamped loop", &want, &table);
+            changed += want.0.iter().zip(&repeated.0).filter(|(a, b)| a != b).count();
+        }
+        // The clamp shows: the same draws repeated differ.
+        assert!(changed > 1000, "the cases did not reach the clamp: {changed}");
     }
 
     // The board's own pixel tests: an id test that passes some pixels of a
