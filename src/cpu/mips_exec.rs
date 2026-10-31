@@ -596,6 +596,11 @@ const fn model_entryhi_mask<C: CpuModel>() -> u64 {
     0xC000_0000_0000_00FF | crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS)
 }
 
+/// Whether the `n`th refused store is reported: the first four, then each power of two.
+pub(crate) fn report_refused_store(n: u64) -> bool {
+    n <= 4 || n.is_power_of_two()
+}
+
 /// Per-access-class tally of how far a guest load/store would get through the
 /// Per-access-class tally of how far a guest load/store would get through the
 /// checks the JIT's inline memory path emits, before falling back to Rust.
@@ -859,6 +864,9 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub decoded_count: Arc<AtomicU64>,
     /// Count of instructions fetched from uncached address space.
     pub uncached_fetch_count: Arc<AtomicU64>,
+    /// Refused uncached stores so far (see `CpuModel::POSTS_UNCACHED_STORES`);
+    /// sets how often `post_refused_store` reports.
+    refused_stores: u64,
     /// Hot-path translation function pointer, updated whenever CP0 Status changes.
     /// Always the non-debug variant; selects the correct 32/64-bit × privilege specialisation.
     pub translate_fn: fn(&mut Self, u64, AccessType) -> TranslateResult,
@@ -2199,6 +2207,22 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.sysad.describe_fault(phys_addr, size).map_or_else(String::new, |why| format!(" [{why}]"))
     }
 
+    /// An uncached store the system refused, on a model that posts stores
+    /// (`CpuModel::POSTS_UNCACHED_STORES`): say so and let the store complete.
+    /// The caller returns `BUS_OK`. Always built, so a missing device or a
+    /// guest bug stays visible in every build. A probe loop would flood
+    /// stderr, so it reports the first four and then every power of two, with
+    /// the running count.
+    #[cold]
+    fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
+        self.refused_stores += 1;
+        let n = self.refused_stores;
+        if report_refused_store(n) {
+            eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{} [store {n}]",
+                size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
+        }
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -2396,6 +2420,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             ins: DecodedInstr::default(), // scratch slot for uncached fetches
             decoded_count: Arc::new(AtomicU64::new(0)),
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
+            refused_stores: 0,
             // Placeholder — overwritten immediately by update_translate_fn below.
             translate_fn: translate_32_kernel::<T, C>,
             // Placeholder — overwritten immediately by update_fpr_mode below.
@@ -5092,9 +5117,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.sysad.write64(phys_addr, val)
             };
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, SIZE, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         };
         // jitv2_lockstep's load/store verification (see MipsCore's
         // lockstep_mem field doc comment, and read_data_impl's matching
@@ -5148,9 +5180,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             let ws = self.sysad.write64_masked(phys_addr, val, mask);
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, mask.count_ones() as usize / 8, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         }
     }
 

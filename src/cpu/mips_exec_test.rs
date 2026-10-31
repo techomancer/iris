@@ -6561,4 +6561,51 @@ mod tests {
             check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
         });
     }
+
+    /// A bus where nothing answers: every read and write is refused (the
+    /// trait's defaults).
+    struct RefusingBus;
+    impl BusDevice for RefusingBus {}
+
+    /// R10000: a store the system refuses leaves the processor as a write
+    /// request, which has no response, so it completes (R10000 UM pp. 104,
+    /// 316). An uncached SC succeeding is a model choice. A load keeps its
+    /// Data Bus Error, and so does every access on the R5000. SWL goes through
+    /// the masked-store path, a separate site.
+    #[test]
+    fn refused_uncached_store_completes_only_on_the_r10000() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (u32, u64) {
+            let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.cache.set_llbit(true);
+            exec.core.write_gpr(4, 0xFFFF_FFFF_A100_0000); // kseg1: uncached
+            exec.core.write_gpr(6, 0x1234_5678);
+            let st = exec.exec(make_i(op, 4, 6, 4));
+            if st == EXEC_COMPLETE {
+                assert_eq!(exec.core.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "no exception taken");
+                assert_eq!(exec.exec(make_i(OP_ADDIU, 0, 5, 7)), EXEC_COMPLETE);
+                assert_eq!(exec.core.read_gpr(5), 7, "the next instruction runs");
+            }
+            (st, exec.core.read_gpr(6))
+        }
+        use crate::traits::BUS_ERR;
+        type R10K = crate::cpu::mips_cache_v2::R10000Cache;
+        type R10KShadow = crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        type R5K = crate::cpu::mips_cache_shadow::R5000ShadowCache;
+        for (op, name) in [(OP_SW, "SW"), (OP_SWL, "SWL")] {
+            assert_eq!(run::<R10K>(op).0, EXEC_COMPLETE, "R10000 {name}");
+            assert_eq!(run::<R10KShadow>(op).0, EXEC_COMPLETE, "R10000 shadow {name}");
+            assert_eq!(run::<R5K>(op).0, BUS_ERR, "R5000 {name}");
+        }
+        assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
+        assert_eq!(run::<R5K>(OP_SC).0, BUS_ERR, "R5000 SC");
+        assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
+    }
+
+    #[test]
+    fn refused_store_reports_are_sparse() {
+        let shown: Vec<u64> = (1..=40).filter(|&n| crate::cpu::mips_exec::report_refused_store(n)).collect();
+        assert_eq!(shown, [1, 2, 3, 4, 8, 16, 32]);
+    }
 }

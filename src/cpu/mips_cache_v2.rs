@@ -571,6 +571,14 @@ pub trait CpuModel: MipsCache {
     /// list of changes from the R10000 has no TLB or CP0 change. The R14000 and
     /// R16000 are a model choice that gives them the same TLB.
     const R10K_FAMILY: bool = false;
+    /// An uncached store the system refuses completes instead of raising a
+    /// Data Bus Error. The R10000 sends it as a write request, which gets no
+    /// response, and Bus Error comes only from an error response to a read or
+    /// upgrade request or from uncorrectable read data (R10000 UM pp. 104, 316).
+    /// The R12000 manual documents the same path and the later parts are taken
+    /// to match. An uncached SC succeeding is a model choice. Loads and fetches
+    /// still fault.
+    const POSTS_UNCACHED_STORES: bool = false;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -3603,6 +3611,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    const POSTS_UNCACHED_STORES: bool = Self::R10K_CACHE_OPS;
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.
     const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
