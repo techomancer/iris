@@ -692,3 +692,59 @@ fn stopping_finishes_the_waiting_work_and_a_reset_abandons_it() {
     assert!(!s.work_pending());
     assert_eq!(ram.half(HOST_WRITE_BASE + 8), 0);
 }
+
+/// Two processors storing to the command FIFO at once (`[machine] cpus = 2`)
+/// each find their stores come out in the order they made them, and none is
+/// lost or run twice. The producers share no lock but the ring's own, so
+/// one can find the ring's lock taken and have its store refused; it tries
+/// again, as the bus's retry does.
+#[test]
+fn two_processors_storing_to_the_fifo_lose_nothing_and_keep_each_ones_order() {
+    const PER: u64 = 30_000;
+    let (s, _) = board("v12");
+    let h = Arc::new(BoardLocks::new(s));
+    let done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let producers: Vec<_> = (0..2u64)
+        .map(|id| {
+            let (h, done) = (h.clone(), done.clone());
+            std::thread::spawn(move || {
+                // A panic in a push must end the test, not hang the consumer.
+                let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for seq in 0..PER {
+                        let size = if seq % 3 == 0 { 8 } else { 4 };
+                        while !h.fifo.push(&h.front, ODSY_CMD_FIFO, id << 32 | seq, size, false) {
+                            std::thread::yield_now();
+                        }
+                    }
+                }));
+                done.fetch_add(1, SeqCst);
+                pushed.is_ok()
+            })
+        })
+        .collect();
+
+    let mut next = [0u64; 2];
+    let mut run = Run::new();
+    loop {
+        h.fifo.take_run(&mut run);
+        let n = run.stores().len();
+        if n == 0 {
+            if done.load(SeqCst) == 2 && h.fifo.stores() == 0 {
+                break;
+            }
+            std::thread::yield_now();
+            continue;
+        }
+        for q in run.stores() {
+            let id = (q.value >> 32) as usize;
+            assert_eq!(q.value & 0xffff_ffff, next[id], "processor {id}'s stores arrive in order");
+            next[id] += 1;
+        }
+        h.fifo.retire(&h.front, &run, n);
+    }
+    for p in producers {
+        assert!(p.join().unwrap(), "a push panicked");
+    }
+    assert_eq!(next, [PER, PER]);
+    assert_eq!((h.fifo.stores(), h.fifo.level()), (0, 0));
+}

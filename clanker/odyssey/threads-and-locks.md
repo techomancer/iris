@@ -129,8 +129,14 @@ guest's 10 ms clock tick. A slice always runs at least one store.
 The PROM's and IRIX's textports send hundreds of thousands of FIFO words per
 scrolled line, so a store must cost little. Stores go into iris's shared
 `GFifo` (`src/gfifo.rs`, 64K entries; `fifo.rs` wraps it). The processor
-pushes without the front lock and wakes the worker only when it sleeps. The
-consumer, whoever holds the board lock (worker or a draining access), looks
+pushes without the front lock and wakes the worker only when it sleeps. With
+two processors (`[machine] cpus = 2`) a second producer pushes the same way:
+the ring's own lock orders them, with no lock of ours above it. A push that
+loses that lock to the other processor, or finds the last place taken between
+the room check and the push, is refused, and its store takes the board lock
+instead (`BoardLocks::write_command`), which runs what waits and then the
+store. The ring is deeper than the board's FIFO, so a second producer's
+overshoot of the level by a store is absorbed. The consumer, whoever holds the board lock (worker or a draining access), looks
 at up to 32 stores, runs them, and takes the ones it ran out together
 (`CommandFifo::take_run`, `retire`): the level, the store count and the
 credits move once a run, not once a store, because each store costs the

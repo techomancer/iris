@@ -325,21 +325,32 @@ impl BoardLocks {
     /// makes room, as a full FIFO holds the store back on the board. The
     /// processor interface's mark stays untaken until the store goes in.
     pub fn bus_write(&self, addr: u64, value: u64, size: u32) -> bool {
-        if command_store(addr, size) && self.fifo.full_for(size) {
-            self.fifo.hurry();
-            return false;
+        // Classified once: a command store goes straight to the FIFO.
+        if command_store(addr, size) {
+            if self.fifo.full_for(size) {
+                self.fifo.hurry();
+                return false;
+            }
+            self.write_command(addr, value, size);
+            return true;
         }
         // A store that waits for the work, as a waiting read does.
-        if !command_store(addr, size)
-            && access_waits(addr, size, true)
-            && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst)
-            && self.fifo.pending()
-        {
+        if access_waits(addr, size, true) && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) && self.fifo.pending() {
             self.fifo.hurry();
             return false;
         }
         self.write(addr, value, size);
         true
+    }
+
+    /// A command store the caller has classified: it joins the FIFO for the
+    /// board's thread, else takes the board lock.
+    fn write_command(&self, addr: u64, value: u64, size: u32) {
+        let counted = store_counted(&self.front);
+        let queued = self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) && self.fifo.push(&self.front, addr, value, size, counted);
+        if !queued {
+            self.board.lock().mmio_write_counted(addr, value, size, counted);
+        }
     }
 
     /// A processor's store: through the front alone when it can, else under the
