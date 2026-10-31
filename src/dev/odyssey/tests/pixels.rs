@@ -838,3 +838,103 @@ fn a_16_bit_luminance_texture_upload_lands_in_its_object() {
         assert_eq!(s.object_load(obj, x as u32, 0), l << 24 | l << 16 | l << 8 | 0xff, "texel {x}");
     }
 }
+
+/// A row whose data does not fill its last word leaves pad in that word,
+/// and the next row starts on a fresh word. Replayed from guest traces of
+/// the GL test suite's draws (box 40,206 to 53,201, the y range
+/// decreasing, so rows run from y 205 down). The pad is 0x5a; the row
+/// that follows used to start with it.
+#[test]
+fn a_row_that_ends_inside_a_word_drops_the_rest_of_the_word() {
+    let (mut s, _) = window();
+    let tag = ODSY_IMAGE_FMT_RGBA16;
+
+    // RGB/UNSIGNED_SHORT (0x69): 13 pixels are 39 halves, so the 20th word
+    // of the row carries one pad half.
+    burst_image_groups(
+        &mut s,
+        (40, 206, 53, 204),
+        &[
+            (
+                0x0f00_1069,
+                &[(
+                    tag,
+                    &[
+                        0x1111_6c6c, 0xc7c7_4646, 0xa1a1_fcfc, 0x7b7b_d6d6, 0x3131_b0b0, 0x0b0b_6666, 0xe5e5_4040, 0x9b9b_1a1a, 0x7575_d0d0, 0x4f4f_aaaa, 0x0505_8484,
+                        0xdfdf_3a3a,
+                    ],
+                )],
+            ),
+            (
+                0x0fa5_1069,
+                &[
+                    (tag, &[0xb9b9_1414, 0x6f6f_eeee, 0x4949_a4a4, 0x2323_7e7e, 0xd9d9_5858, 0xb3b3_0e0e, 0x8d8d_e8e8, 0x4343_5a5a]),
+                    (
+                        tag,
+                        &[
+                            0x2e2e_8989, 0xe4e4_6a6a, 0xc5c5_2020, 0xa6a6_0101, 0x5c5c_e2e2, 0x3d3d_9898, 0x1e1e_7979, 0xd4d4_5a5a, 0xb5b5_1010, 0x9696_f1f1, 0x4c4c_d2d2,
+                            0x2d2d_8888,
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    );
+    assert_eq!(pixel(&s, 0, 40, 205), 0x116c_c7ff);
+    assert_eq!(pixel(&s, 0, 52, 205), 0x8de8_43ff);
+    assert_eq!(pixel(&s, 0, 40, 204), 0x2e89_e4ff);
+    assert_eq!(pixel(&s, 0, 41, 204), 0x6ac5_20ff);
+
+    // RED/UNSIGNED_SHORT (0x64): 13 halves, one pad half.
+    burst_image_groups(
+        &mut s,
+        (40, 216, 53, 214),
+        &[
+            (0x0f00_1064, &[(tag, &[0x1111_4646, 0x7b7b_b0b0, 0xe5e5_1a1a, 0x4f4f_8484])]),
+            (
+                0x0fa5_1064,
+                &[(tag, &[0xb9b9_eeee, 0x2323_5858, 0x8d8d_5a5a]), (tag, &[0x2e2e_6a6a, 0xa6a6_e2e2, 0x1e1e_5a5a, 0x9696_d2d2])],
+            ),
+        ],
+    );
+    assert_eq!(pixel(&s, 0, 52, 215), 0x8d00_00ff);
+    assert_eq!(pixel(&s, 0, 40, 214), 0x2e00_00ff);
+    assert_eq!(pixel(&s, 0, 41, 214), 0x6a00_00ff);
+
+    // RGB/UNSIGNED_BYTE (0x49), 93 pixels a row: 279 bytes, one pad byte,
+    // the row sent as five 12-word bursts and a 10-word one.
+    let full: &[(u32, &[u32])] = &[
+        (
+            ODSY_IMAGE_FMT_RGB,
+            &[0x116c_c746, 0xa1fc_7bd6, 0x31b0_0b66, 0xe540_9b1a, 0x75d0_4faa, 0x0584_df3a, 0xb914_6fee, 0x49a4_237e, 0xd958_b30e, 0x8de8_43c2, 0x1d78_f752, 0xad2c_87e2],
+        ),
+        (
+            ODSY_IMAGE_FMT_RGB,
+            &[0x61bc_1796, 0xf14c_cb26, 0x8100_5bb6, 0x3590_eb6a, 0xc520_9ffa, 0x55d4_2f8a, 0x0964_bf3e, 0x99f4_73ce, 0x29a8_035e, 0xdd38_9312, 0x6dc8_47a2, 0xfd7c_d732],
+        ),
+        (
+            ODSY_IMAGE_FMT_RGB,
+            &[0xb10c_67e6, 0x419c_1b76, 0xd150_ab06, 0x85e0_3bba, 0x1570_ef4a, 0xa524_7fda, 0x59b4_0f8e, 0xe944_c31e, 0x79f8_53ae, 0x2d88_e362, 0xbd18_97f2, 0x4dcc_2782],
+        ),
+        (
+            ODSY_IMAGE_FMT_RGB,
+            &[0x015c_b736, 0x91ec_6bc6, 0x21a0_fb56, 0xd530_8b0a, 0x65c0_3f9a, 0xf574_cf2a, 0xa904_5fde, 0x3994_136e, 0xc948_a3fe, 0x7dd8_33b2, 0x0d68_e742, 0x9d1c_77d2],
+        ),
+        (
+            ODSY_IMAGE_FMT_RGB,
+            &[0x51ac_0786, 0xe13c_bb16, 0x71f0_4ba6, 0x2580_db5a, 0xb510_8fea, 0x45c4_1f7a, 0xf954_af2e, 0x89e4_63be, 0x1998_f34e, 0xcd28_8302, 0x5db8_3792, 0xed6c_c722],
+        ),
+    ];
+    let tail: &[(u32, &[u32])] = &[
+        (ODSY_IMAGE_FMT_RGB, &[0xa1fc_57d6, 0x318c_0b66, 0xc140_9bf6, 0x75d0_2baa, 0x0560_df3a, 0x9514_6fca, 0x49a4_ff7e, 0xd934_b30e, 0x69e8_439e, 0x1d78_d35a]),
+        (
+            ODSY_IMAGE_FMT_RGB,
+            &[0x2e89_e46a, 0xc520_a601, 0x5ce2_3d98, 0x1e79_d45a, 0xb510_96f1, 0x4cd2_2d88, 0x0e69_c44a, 0xa500_86e1, 0x3cc2_1d78, 0xfe59_b43a, 0x95f0_76d1, 0x2cb2_0d68],
+        ),
+    ];
+    burst_image_groups(&mut s, (40, 226, 133, 224), &[(0x0f00_1049, full), (0x0fd3_1049, tail)]);
+    assert_eq!(pixel(&s, 0, 40, 225), 0x116c_c7ff);
+    assert_eq!(pixel(&s, 0, 132, 225), 0x1d78_d3ff);
+    assert_eq!(pixel(&s, 0, 40, 224), 0x2e89_e4ff);
+    assert_eq!(pixel(&s, 0, 41, 224), 0x6ac5_20ff);
+}

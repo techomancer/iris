@@ -1060,8 +1060,15 @@ impl Board {
                 for (pair, half) in px.as_chunks_mut::<2>().0.iter_mut().zip(&halves[..comps]) {
                     pair.copy_from_slice(&half.to_be_bytes());
                 }
+                let row = self.image_cur_y;
+
                 self.image_put(decode_texel12(code, &px, true), false, true);
                 held = 0;
+                if h == 0 && self.image_cur_y != row {
+                    // The row ended in the word's first half: the second
+                    // is pad, and the next row starts on the next word.
+                    break;
+                }
             }
             self.image_bytes = if held > 1 {
                 ((halves[0] as u32) << 16) | halves[1] as u32
@@ -1104,7 +1111,7 @@ impl Board {
         if let Some(f) = &form {
             // The write table's pixels: any number of bytes up to a pixel of
             // four 32-bit components, in arrival order.
-            for &byte in &b[..4] {
+            for (i, &byte) in b[..4].iter().enumerate() {
                 self.image_pixel[self.image_nbytes as usize] = byte;
                 self.image_nbytes += 1;
                 if self.image_nbytes < f.bytes {
@@ -1112,12 +1119,23 @@ impl Board {
                 }
                 self.image_nbytes = 0;
                 let px = self.image_pixel;
+                let row = self.image_cur_y;
 
                 self.image_texel_form(f, &px);
+                if i < 3 && self.image_cur_y != row {
+                    // The row ended inside the word: the rest is pad.
+                    break;
+                }
             }
             return;
         }
-        for &byte in &b[..4] {
+        // OBSERVED (guest traces of GL draws): each row of 16- and 24-bit
+        // pixels ends on a word, padded with 0x5a, and the next row starts
+        // on the next word. Eight-bit pixels (the X server's index images)
+        // are left as they were: no trace shows their rows padded.
+        let padded_rows = (n == 2 || n == 3) && code != ODSY_IMAGE_CODE_CI16;
+
+        for (i, &byte) in b[..4].iter().enumerate() {
             let mut px = [0u8; 4];
             let mut rgba = 0u32;
 
@@ -1130,7 +1148,12 @@ impl Board {
             // The pixel's bytes, first byte highest, at the start of px[].
             px[..4].copy_from_slice(&(self.image_bytes << (8 * (4 - n))).to_be_bytes());
             self.decode_pixel(code, &px, &mut rgba);
+            let row = self.image_cur_y;
+
             self.image_texel(rgba, code);
+            if padded_rows && i < 3 && self.image_cur_y != row {
+                break;
+            }
         }
     }
 }
