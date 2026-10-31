@@ -6,6 +6,7 @@
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use crate::dev::ioc3_kbc::{ctrl, RX_OVERFLOW};
 use std::sync::Mutex;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
@@ -537,7 +538,7 @@ fn type_keys(r: &Rig) {
 #[test]
 fn the_ps2_receive_holds_three_behind_the_clamp() {
     let r = Rig::new();
-    r.w32(CTRL, KBC_K_CLAMP_3 | KBC_M_CLAMP_3);
+    r.w32(CTRL, ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3);
     r.w32(K_TX, 0xf4); // enable scanning
     let _ = r.r32(K_RX);
     r.w32(reg::INT_STATUS, int::KEYBOARD);
@@ -545,11 +546,85 @@ fn the_ps2_receive_holds_three_behind_the_clamp() {
     assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
     let first = r.r32(K_RX);
     assert_eq!(first & (VALID[0] | VALID[1] | VALID[2]), VALID[0] | VALID[1] | VALID[2]);
-    assert_eq!(first & KBC_RX_OVERFLOW, 0, "nothing lost");
+    assert_eq!(first & RX_OVERFLOW, 0, "nothing lost");
     // The read released the clamp; the stopped keyboard resumed.
     let second = r.r32(K_RX);
     assert_ne!(second & VALID[2], 0, "the rest were held back, not dropped");
     assert_ne!((second >> 16) & 0xff, (first >> 16) & 0xff, "and are not a replay");
+}
+
+/// Five key presses behind clamp-after-three, with the keyboard scanning
+/// and its acknowledge read away.
+fn five_keys_behind_the_clamp(r: &Rig) {
+    use winit::keyboard::KeyCode::{KeyA, KeyB, KeyC, KeyD, KeyE};
+    r.w32(CTRL, ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3);
+    r.w32(K_TX, 0xf4);
+    let _ = r.r32(K_RX);
+    r.w32(reg::INT_STATUS, int::KEYBOARD);
+    for k in [KeyA, KeyB, KeyC, KeyD, KeyE] {
+        r.c.ps2().push_kb(k, true);
+    }
+    assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+}
+
+/// Ports sn0/ioc3/ps2-backlog-survives-an-early-acknowledge: Linux
+/// acknowledges before its handler reads. A guest that acknowledges and
+/// reads nothing is not handed the same interrupt again, the read that
+/// follows still finds all three characters, and the backlog behind the
+/// clamp raises the source a second time.
+#[test]
+fn the_ps2_backlog_survives_an_early_acknowledge() {
+    let r = Rig::new();
+    five_keys_behind_the_clamp(&r);
+    for _ in 0..4 {
+        r.w32(reg::INT_STATUS, int::KEYBOARD);
+        assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+    }
+    let all = VALID[0] | VALID[1] | VALID[2];
+    assert_eq!(r.r32(K_RX) & all, all);
+    assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "the resumed keyboard raises it again");
+    r.w32(reg::INT_STATUS, int::KEYBOARD);
+    assert_eq!(r.r32(K_RX) & all, VALID[2] | VALID[1]);
+    assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "nothing left, nothing asserts it");
+}
+
+/// Ports sn0/ioc3/ps2-drain-then-acknowledge-takes-one: OpenBSD reads until
+/// the register comes back empty and acknowledges afterwards, so a whole
+/// backlog drains in one pass and one acknowledge ends it.
+#[test]
+fn the_ps2_drain_then_one_acknowledge_ends_the_backlog() {
+    let r = Rig::new();
+    five_keys_behind_the_clamp(&r);
+    let (mut reads, mut valid) = (0, 0);
+    loop {
+        let v = r.r32(K_RX);
+        valid += VALID.iter().filter(|&&f| v & f != 0).count();
+        reads += 1;
+        assert!(reads <= 4);
+        assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "pending until the guest answers it");
+        if v == 0 {
+            break;
+        }
+    }
+    assert_eq!((valid, reads), (5, 3), "3, 2, then empty");
+    r.w32(reg::INT_STATUS, int::KEYBOARD);
+    assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+    assert_eq!(r.r32(K_RX), 0);
+    assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+}
+
+/// Ports sn0/ioc3/ps2-clamp-after-one-splits-a-reply: clamping after one
+/// character splits a reset reply, the acknowledge first and the self-test
+/// byte next, each alone in the oldest slot.
+#[test]
+fn clamp_after_one_splits_a_reset_reply() {
+    let r = Rig::new();
+    r.w32(CTRL, ctrl::K_CLAMP_1);
+    r.w32(K_TX, 0xff);
+    assert_eq!(r.r32(K_RX), 0x80fa_0000);
+    assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+    assert_eq!(r.r32(K_RX), 0x80aa_0000);
+    assert_eq!(r.r32(K_RX), 0);
 }
 
 #[test]
@@ -559,7 +634,7 @@ fn the_ps2_receive_overflows_without_a_clamp() {
     let _ = r.r32(K_RX);
     type_keys(&r);
     let v = r.r32(K_RX);
-    assert_ne!(v & KBC_RX_OVERFLOW, 0, "a fourth character was lost");
+    assert_ne!(v & RX_OVERFLOW, 0, "a fourth character was lost");
 }
 
 #[test]
@@ -576,7 +651,7 @@ fn the_ps2_control_masks_writes() {
     r.w32(CTRL, 0xffff_ffff);
     assert_eq!(
         r.r32(CTRL),
-        0x0000_ffff | K_TO_EN | M_TO_EN | KBC_K_CLAMP_1 | KBC_M_CLAMP_1 | KBC_K_CLAMP_3 | KBC_M_CLAMP_3
+        0x0000_ffff | K_TO_EN | M_TO_EN | ctrl::K_CLAMP_1 | ctrl::M_CLAMP_1 | ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3
     );
     r.c.reset();
     assert_eq!(r.r32(CTRL), 0);
