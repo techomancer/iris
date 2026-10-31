@@ -66,6 +66,9 @@ impl Pxbow {
         let xbow = Xbow::new(REVISION, (1 << host) | (1 << pic))
             .with_identity(PART, MANUFACTURER)
             .with_status_source(host)
+            // PROM 6.210's crossbar check writes the read-only lower error
+            // address on purpose.
+            .with_posted_error_address_writes()
             .with_clock(clock);
         Ok(Arc::new(Self {
             xbow: Arc::new(xbow),

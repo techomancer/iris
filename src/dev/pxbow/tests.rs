@@ -93,6 +93,22 @@ fn status_reads_carry_the_hosts_widget_as_their_source() {
     assert_eq!((other.widget_zero().read32(STATUS).data >> 6) & 0xf, 11);
 }
 
+/// PROM 6.210's crossbar check on the Tezro writes 0xdeadbeef to the
+/// read-only lower error address and 0 to the upper one. The store
+/// completes, the registers keep their value, and widget 0's status reports
+/// the access error (NEC U10278EJ4V0UM p.104).
+#[test]
+fn the_proms_error_address_writes_complete_and_are_reported() {
+    let p = Pxbow::new(10, 15, clock().0).unwrap();
+    let w = p.widget_zero();
+    assert_eq!(w.write32(0x1c, 0xdead_beef), BUS_OK);
+    assert_eq!(w.write32(0x14, 0), BUS_OK);
+    assert_eq!(w.read32(0x1c).data, 0);
+    assert_ne!(w.read32(STATUS).data & (1 << 5), 0, "the access error shows");
+    assert!(p.xbow().unsupported().contains(&(0x1c, 4, true)), "the write stays observable");
+    assert_ne!(w.write32(0x04, 0), BUS_OK, "the identification register still refuses");
+}
+
 /// Revision 5 decodes the fences and the lock; the lock takes a write only
 /// while it reads zero and any write to its clear alias releases it.
 #[test]

@@ -264,6 +264,9 @@ pub struct Xbow {
     unsupported: Mutex<Vec<(u32, u8, bool)>>,
     /// `unsupported` holds 64: a further access costs one relaxed load.
     unsupported_full: AtomicBool,
+    /// A write to an error address register completes; see
+    /// [`Xbow::with_posted_error_address_writes`].
+    posted_error_address_writes: bool,
 }
 
 fn link_bit(widget: u8) -> Option<u8> {
@@ -292,7 +295,22 @@ impl Xbow {
             on_link_reset: OnceLock::new(),
             unsupported: Mutex::new(Vec::new()),
             unsupported_full: AtomicBool::new(false),
+            posted_error_address_writes: false,
         }
+    }
+
+    /// Complete a write to either error address register instead of
+    /// refusing it. The registers are read-only and the write still changes
+    /// nothing, sets the register-access error and is listed in
+    /// [`Xbow::unsupported`]: the specification makes a write to a read-only
+    /// register an error condition that widget 0's status reports. What the processor sees is the other half: an
+    /// uncached store is a write request with no completion response (NEC
+    /// U10278EJ4V0UM p.104, table 6-1), so no error can come back to it.
+    /// A stock IP35 PROM writes the lower register on purpose in its crossbar
+    /// check. QEMU's `complete-posted-error-address-writes` property.
+    pub fn with_posted_error_address_writes(mut self) -> Self {
+        self.posted_error_address_writes = true;
+        self
     }
 
     /// Answer to `part` and `manufacturer` in the identification word
@@ -626,7 +644,13 @@ impl Xbow {
     /// A processor write; false is a bus error.
     pub fn write(&self, off: u32, size: usize, val: u64) -> bool {
         self.locked(|r, out| {
-            let Some(slot) = self.decode(r, out, off, size, true) else { return false };
+            let Some(slot) = self.decode(r, out, off, size, true) else {
+                // Refused and recorded either way; a posted error address
+                // write completes all the same.
+                return self.posted_error_address_writes
+                    && size == 4
+                    && matches!(off.wrapping_sub(4), ERR_UPPER | ERR_LOWER);
+            };
             let val = val as u32;
             match slot {
                 CONTROL => {
@@ -1045,6 +1069,27 @@ mod tests {
         assert_eq!(x.write32(0x1000_0000 + INT_LOWER as u64 + 4, 0x55), BUS_OK);
         assert_eq!(x.read32(0x1000_0000 + INT_LOWER as u64 + 4).data, 0x55);
         assert_eq!(x.write32(0x1000_0000 + IDENTIFICATION as u64 + 4, 0), BUS_ERR);
+    }
+
+    /// A write to a read-only error address register is an access error and
+    /// changes nothing. With posted error
+    /// address writes the store still completes, as QEMU's crossbar does with
+    /// `complete-posted-error-address-writes` (hw/misc/sgi-xbow.c, asserted
+    /// set on the Origin 2000 by sn0-origin2000-test's xio-owner case); other
+    /// read-only registers are refused as before.
+    #[test]
+    fn a_posted_error_address_write_completes_and_still_records_the_access_error() {
+        let refusing = octane();
+        assert_eq!(refusing.write32(ERR_LOWER as u64 + 4, 0xdead_beef), BUS_ERR);
+        let x = octane().with_posted_error_address_writes();
+        assert_eq!(x.write32(ERR_LOWER as u64 + 4, 0xdead_beef), BUS_OK);
+        assert_eq!(x.read(ERR_LOWER + 4, 4), Some(0), "the register keeps its value");
+        assert_eq!(x.read(STATUS + 4, 4).unwrap() as u32 & STATUS_ACCESS_ERROR, STATUS_ACCESS_ERROR);
+        assert_eq!(x.write32(ERR_UPPER as u64 + 4, 0), BUS_OK);
+        assert_eq!(x.read(STATUS + 4, 4).unwrap() as u32 & STATUS_MULTIPLE_ERROR, STATUS_MULTIPLE_ERROR);
+        assert_eq!(x.unsupported(), vec![(ERR_LOWER + 4, 4, true), (ERR_UPPER + 4, 4, true)]);
+        assert_eq!(x.write32(IDENTIFICATION as u64 + 4, 0), BUS_ERR, "only the error address registers");
+        assert_eq!(x.write64(ERR_LOWER as u64, 0), BUS_ERR, "nor an eight-byte write");
     }
 
     /// The fences, the lock and a non-zero part number belong to revision 5
