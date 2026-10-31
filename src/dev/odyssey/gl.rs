@@ -343,6 +343,123 @@ impl GlPlaneRow<'_> {
     fn allowed(&self, i: usize) -> bool {
         self.did.is_empty() || ((self.did[i] ^ self.id_value) & self.id_mask) == 0
     }
+
+    /// Whether the id test passes the pixels x0 to x1 of the row.
+    fn all_allowed(&self, x0: i32, x1: i32) -> bool {
+        (x0..=x1).all(|x| self.allowed((x - self.x0) as usize))
+    }
+
+    /// store_depth() of one value at the row's pixels x0 to x1: a slice fill
+    /// where the id test passes them all, else a pixel at a time.
+    pub fn fill_depth(&self, x0: i32, x1: i32, depth: u32) {
+        if !self.store {
+            return;
+        }
+        if self.all_allowed(x0, x1) {
+            let (i0, i1) = ((x0 - self.x0) as usize, (x1 - self.x0) as usize);
+
+            words_fill(&self.depth[4 * i0..4 * (i1 + 1)], self.depth_le, depth & ODSY_DEPTH24_MAX);
+        } else {
+            for x in x0..=x1 {
+                self.store_depth(x, 0, depth);
+            }
+        }
+    }
+
+    /// store_rgba() of one colour at the row's pixels x0 to x1, as
+    /// fill_depth() does.
+    pub fn fill_rgba(&self, target: ColourTarget, x0: i32, x1: i32, colour: &RasterColour) {
+        if target >= ODSY_BUFFERS || !self.store {
+            return;
+        }
+        if self.all_allowed(x0, x1) {
+            let (i0, i1) = ((x0 - self.x0) as usize, (x1 - self.x0) as usize);
+            let c = &colour.component;
+
+            words_fill(
+                &self.colour[target as usize][4 * i0..4 * (i1 + 1)],
+                self.colour_le[target as usize],
+                (c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3],
+            );
+        } else {
+            for x in x0..=x1 {
+                self.store_rgba(target, x, 0, colour);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod plane_row_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const N: usize = 24;
+
+    fn noise(seed: u8) -> Vec<Cell<u8>> {
+        (0..4 * N).map(|i| Cell::new((i as u8).wrapping_mul(37).wrapping_add(seed))).collect()
+    }
+
+    fn bytes(v: &[Cell<u8>]) -> Vec<u8> {
+        v.iter().map(Cell::get).collect()
+    }
+
+    // A run fill stores what the pixel stores do, in either byte order, with
+    // the id test passing all, some or none of the row's pixels, a draw to
+    // the id plane, a target past the buffers, and runs that start and end inside the row.
+    #[test]
+    fn run_fills_match_the_pixel_stores() {
+        let pass = [0u8; N];
+        let mut some = [0u8; N];
+        let none = [0xffu8; N];
+        let mut one_in_range = [0u8; N];
+
+        for i in (0..N).step_by(5) {
+            some[i] = 0xff;
+        }
+        one_in_range[9] = 0xff;
+        let colour = RasterColour { component: [0x12, 0x34, 0x56, 0x78] };
+
+        for le in [false, true] {
+            for did in [&[][..], &pass[..], &some[..], &none[..], &one_in_range[..]] {
+                for store in [true, false] {
+                    for (x0, x1) in [(0, N as i32 - 1), (0, 0), (3, 3), (4, 20), (N as i32 - 1, N as i32 - 1), (5, 8)] {
+                        let (fd, sd) = (noise(1), noise(1));
+                        let (fc, sc) = ([noise(2), noise(4)], [noise(2), noise(4)]);
+                        let stencil = noise(3);
+                        let row = |depth, colour0, colour1| GlPlaneRow {
+                            x0: 100,
+                            depth,
+                            depth_le: le,
+                            colour: [colour0, colour1],
+                            colour_le: [le, !le],
+                            stencil: &stencil,
+                            store,
+                            did,
+                            id_value: 0,
+                            id_mask: 0xff,
+                        };
+                        let fast = row(&fd, &fc[0], &fc[1]);
+                        let slow = row(&sd, &sc[0], &sc[1]);
+
+                        fast.fill_depth(100 + x0, 100 + x1, 0xabcdef);
+                        for target in 0..3 {
+                            fast.fill_rgba(target, 100 + x0, 100 + x1, &colour);
+                        }
+                        for x in x0..=x1 {
+                            slow.store_depth(100 + x, 0, 0xabcdef);
+                            for target in 0..3 {
+                                slow.store_rgba(target, 100 + x, 0, &colour);
+                            }
+                        }
+                        assert_eq!(bytes(&fd), bytes(&sd), "depth, le {le}, did {did:?}, store {store}, {x0}..={x1}");
+                        assert_eq!(bytes(&fc[0]), bytes(&sc[0]), "colour 0, le {le}, did {did:?}, store {store}, {x0}..={x1}");
+                        assert_eq!(bytes(&fc[1]), bytes(&sc[1]), "colour 1, le {le}, did {did:?}, store {store}, {x0}..={x1}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Planes for GlPlaneRow<'_> {

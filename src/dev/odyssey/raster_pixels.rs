@@ -203,17 +203,20 @@ fn clear_lent_row<const DEPTH: bool, const STENCIL: bool, const COLOUR: bool>(c:
     let op = c.op;
     let smask = op.stencil_mask & c.smax;
 
-    for x in op.x0..=op.x1 {
-        if DEPTH {
-            px.store_depth(x, y, c.depth_value);
-        }
-        if STENCIL {
+    // The planes are independent, so each is stored across the row in turn:
+    // depth and colour as runs, which fill a slice where the row's id test
+    // passes every pixel, and stencil, which reads, a pixel at a time.
+    if DEPTH {
+        px.fill_depth(op.x0, op.x1, c.depth_value);
+    }
+    if STENCIL {
+        for x in op.x0..=op.x1 {
             px.store_stencil(x, y, (px.load_stencil(x, y) & !smask & c.smax) | (op.clear_stencil & smask));
         }
-        if COLOUR {
-            for &target in &op.targets[..c.ntargets as usize] {
-                px.store_rgba(target, x, y, &c.clear);
-            }
+    }
+    if COLOUR {
+        for &target in &op.targets[..c.ntargets as usize] {
+            px.fill_rgba(target, op.x0, op.x1, &c.clear);
         }
     }
 }

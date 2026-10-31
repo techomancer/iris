@@ -432,6 +432,19 @@ pub fn word_store(bytes: &[Cell<u8>], i: usize, le: bool, word: u32) {
     }
 }
 
+/// Store word into every word of a 4-byte plane's bytes (a whole number of
+/// words), as word_store() does each.
+#[inline]
+pub fn words_fill(bytes: &[Cell<u8>], le: bool, word: u32) {
+    let b = if le { word.to_le_bytes() } else { word.to_be_bytes() };
+
+    for c in bytes.chunks_exact(4) {
+        for k in 0..4 {
+            c[k].set(b[k]);
+        }
+    }
+}
+
 impl BoardMemory {
     /// Plane p's rows, which start at its base.
     pub fn rows(&mut self, p: &Plane) -> RowsMut<'_, u8> {
