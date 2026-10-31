@@ -77,21 +77,33 @@ pub(crate) fn connect_cpu(
     let weak_cpu = Arc::downgrade(cpu);
     l1.set_event_handler(Arc::new(move |event| {
         match event {
-            L1Event::Power(false) | L1Event::Shutdown => {
-                let _ = tx.send(MachineEvent::PowerOff);
-            }
-            L1Event::Power(true) | L1Event::Reset => {
-                let _ = tx.send(MachineEvent::HardReset);
-            }
             L1Event::SoftReset => {
                 if let Some(cpu) = weak_cpu.upgrade() {
                     cpu.as_device().signal(Signal::Reset(true));
                 }
             }
             L1Event::Nmi => dlog!(LogModule::L1, "{name}: NMI entry is not implemented by the CPU"),
+            _ => {
+                if let Some(action) = machine_action(event) {
+                    let _ = tx.send(action);
+                }
+            }
         }
     }));
     rx
+}
+
+/// What the machine does for an L1 power or reset event. A power change
+/// alone does nothing: the shutdown or restart that the L1 reports with it
+/// carries the action. So a power cycle, which the PROM asks for to retry
+/// a processor, restarts the node rather than powering the machine off, as
+/// in the QEMU L1, where only a shutdown stops the machine.
+fn machine_action(event: L1Event) -> Option<MachineEvent> {
+    match event {
+        L1Event::Shutdown => Some(MachineEvent::PowerOff),
+        L1Event::Reset => Some(MachineEvent::HardReset),
+        L1Event::Power(_) | L1Event::SoftReset | L1Event::Nmi => None,
+    }
 }
 
 /// One of a board's serial connections: what it is called, the TCP port and
@@ -543,5 +555,25 @@ impl InterruptController for UartIrq {
         for pi in &self.0 {
             pi.set_uart_irq(level);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The L1 reports a power cycle as power down, power up and a restart,
+    /// and a shutdown as power down and a shutdown: one restart for the
+    /// first and one power-off for the second, never a power-off on the way
+    /// through a cycle.
+    #[test]
+    fn a_power_cycle_restarts_and_only_a_shutdown_powers_off() {
+        let actions = |events: &[L1Event]| {
+            format!("{:?}", events.iter().filter_map(|&e| machine_action(e)).collect::<Vec<_>>())
+        };
+        assert_eq!(actions(&[L1Event::Power(false), L1Event::Power(true), L1Event::Reset]), "[HardReset]");
+        assert_eq!(actions(&[L1Event::Power(false), L1Event::Shutdown]), "[PowerOff]");
+        assert_eq!(actions(&[L1Event::Power(true), L1Event::Reset]), "[HardReset]");
+        assert_eq!(actions(&[L1Event::Reset]), "[HardReset]");
     }
 }
