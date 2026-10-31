@@ -168,7 +168,6 @@ pub struct Seeq8003 {
     irq: Option<IrqLine>,
     rx_dma:   Option<Arc<dyn DmaClient>>,
     tx_dma:   Option<Arc<dyn DmaClient>>,
-    sys_mem:  Mutex<Option<Arc<dyn BusDevice>>>,
     in_reset: Arc<AtomicBool>, // CH_RESET edge — lock-free check in pump thread
     config:   GatewayConfig,
     running:  Arc<AtomicBool>,
@@ -206,7 +205,7 @@ macro_rules! lock_state {
 /// Result of a TX pump: applied under SeeqState lock.
 enum TxPumpResult {
     Nothing,
-    Sent { dma_irq: bool, writeback: Option<(u32, u16)> },
+    Sent { dma_irq: bool },
 }
 
 /// Result of an RX pump: applied under SeeqState lock.
@@ -214,7 +213,7 @@ enum RxPumpResult {
     Nothing,
     Filtered, // frame rejected by address_filter (not for the guest) and discarded
     Refused,
-    Delivered { dma_irq: bool, writeback: Option<(u32, u16)>, frame_len: usize },
+    Delivered { dma_irq: bool, frame_len: usize },
 }
 
 // ── Seeq8003 ─────────────────────────────────────────────────────────────────
@@ -251,7 +250,6 @@ impl Seeq8003 {
                 ts:           0,
             })),
             irq, rx_dma, tx_dma,
-            sys_mem: Mutex::new(None),
             in_reset: Arc::new(AtomicBool::new(false)),
             config,
             running:  Arc::new(AtomicBool::new(false)),
@@ -356,11 +354,9 @@ impl Seeq8003 {
         let mut frame = Vec::with_capacity(1518);
         let mut got_eop = false;
         let mut dma_st = DmaStatus::ok();
-        let mut writeback: Option<(u32, u16)> = None;
-        while let Some((b, dst, wb)) = tx_dma.read() {
+        while let Some((b, dst)) = tx_dma.read() {
             frame.push(b as u8);
             dma_st = dst;
-            if let Some(w) = wb { writeback = Some(w); }
             if dst.eop() { got_eop = true; break; }
         }
         if frame.is_empty() || !got_eop { return TxPumpResult::Nothing; }
@@ -371,7 +367,7 @@ impl Seeq8003 {
         let _ = tx_prod.push(frame);
         tx_wake.notify();
 
-        TxPumpResult::Sent { dma_irq: dma_st.irq(), writeback }
+        TxPumpResult::Sent { dma_irq: dma_st.irq() }
     }
 
     /// Inject one pending RX frame into guest RAM via HPC3 RX DMA.
@@ -402,7 +398,7 @@ impl Seeq8003 {
 
         dlog_dev!(LogModule::Seeq, "SEEQ RX {} → guest DMA", eth_summary(frame));
 
-        let (dst, _) = rx_dma.write(0, false); // pad[0]
+        let dst = rx_dma.write(0, false); // pad[0]
         if dst.refused() {
             dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: DMA not ready ({:#x}), will retry: {}", dst.0, eth_summary(frame));
             crate::pf_instant!(crate::perfetto::events::ENET_RX_REFUSED);
@@ -416,13 +412,13 @@ impl Seeq8003 {
             let _ = rx_dma.write(*b as u32, false);
         }
         // Status byte — eop=true so DmaStatus::EOP is set; also catches EOX/IRQ if chain ended.
-        // This write triggers the RX writeback (crbdp+6) inside advance(), returned as writeback.
-        let (dma_st, writeback) = rx_dma.write(RX_STATUS_GOOD as u32, true);
+        // HPC3 hands the descriptor back to the host as this write completes.
+        let dma_st = rx_dma.write(RX_STATUS_GOOD as u32, true);
 
-        dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: frame delivered ({} bytes to DMA) dma_st={:#x} irq={} wb={:?}",
-                  2 + frame.len() + 1, dma_st.0, dma_st.irq(), writeback);
+        dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: frame delivered ({} bytes to DMA) dma_st={:#x} irq={}",
+                  2 + frame.len() + 1, dma_st.0, dma_st.irq());
 
-        RxPumpResult::Delivered { dma_irq: dma_st.irq(), writeback, frame_len: frame.len() }
+        RxPumpResult::Delivered { dma_irq: dma_st.irq(), frame_len: frame.len() }
     }
 
     /// Return current RX status byte without side-effects (no OLD-marking).
@@ -435,12 +431,6 @@ impl Seeq8003 {
     /// Used by HPC3 to mirror SEEQ status into tx_ctrl[7:0].
     pub fn get_tx_status(&self) -> u8 {
         lock_state!(self.state).tx_stat
-    }
-
-    /// Set the system memory bus device for descriptor writebacks.
-    /// Must be called before start(). Called from Hpc3::set_phys().
-    pub fn set_phys(&self, mem: Arc<dyn BusDevice>) {
-        *self.sys_mem.lock() = Some(mem);
     }
 
     /// Wake the enet thread immediately to drain pending TX data.
@@ -568,7 +558,6 @@ impl Seeq8003 {
     pub fn register_locks(self: &Arc<Self>) {
         use crate::locks::register_lock_fn;
         let me = self.clone(); register_lock_fn("seeq::state",             move || me.state.is_locked());
-        let me = self.clone(); register_lock_fn("seeq::sys_mem",           move || me.sys_mem.is_locked());
         let me = self.clone(); register_lock_fn("seeq::net",               move || me.net.is_locked());
         let me = self.clone(); register_lock_fn("seeq::nat_ctl::snapshot", move || me.net.try_lock().map_or(false, |n| n.nat.snapshot.is_locked()));
     }
@@ -616,7 +605,6 @@ impl Device for Seeq8003 {
         let in_reset_enet = self.in_reset.clone();
         let tx_dma        = self.tx_dma.clone();
         let rx_dma        = self.rx_dma.clone();
-        let sys_mem_enet: Option<Arc<dyn BusDevice>> = self.sys_mem.lock().clone();
         let state_enet    = self.state.clone();
         let irq      = self.irq.clone();
         let heartbeat_enet = self.heartbeat.clone();
@@ -690,15 +678,9 @@ impl Device for Seeq8003 {
                 let tx_activity = !matches!(tx_result, TxPumpResult::Nothing);
                 let tx_moved = matches!(tx_result, TxPumpResult::Sent { .. });
                 match tx_result {
-                    TxPumpResult::Sent { dma_irq: irq, writeback } => {
+                    TxPumpResult::Sent { dma_irq: irq } => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ TX complete dma_irq={}", st.ts, irq);
                         st.tx_stat = tx_stat::SUCCESS;
-                        if let Some((addr, val)) = writeback {
-                            if let Some(ref mem) = sys_mem_enet {
-                                dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ TX writeback {:08x}+6 ← {:04x}", st.ts, addr - 6, val);
-                                mem.write16(addr as u64, val);
-                            }
-                        }
                         dma_irq |= irq;
                     }
                     TxPumpResult::Nothing => {}
@@ -707,16 +689,10 @@ impl Device for Seeq8003 {
                 let rx_activity = !matches!(rx_result, RxPumpResult::Nothing);
                 let rx_moved = matches!(rx_result, RxPumpResult::Delivered { .. });
                 match rx_result {
-                    RxPumpResult::Delivered { dma_irq: irq, writeback, frame_len } => {
+                    RxPumpResult::Delivered { dma_irq: irq, frame_len } => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX delivered {} bytes dma_irq={}", st.ts, frame_len, irq);
                         st.rx_delivered += 1;
                         st.rx_stat = rx_stat::GOOD | rx_stat::END;
-                        if let Some((addr, val)) = writeback {
-                            if let Some(ref mem) = sys_mem_enet {
-                                dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX writeback {:08x}+6 ← {:04x}", st.ts, addr - 6, val);
-                                mem.write16(addr as u64, val);
-                            }
-                        }
                         dma_irq |= irq;
                     }
                     RxPumpResult::Refused => {
@@ -950,10 +926,10 @@ mod tests {
     struct Ring { filled: Mutex<usize> }
 
     impl DmaClient for Ring {
-        fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> { None }
-        fn write(&self, _val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+        fn read(&self) -> Option<(u32, DmaStatus)> { None }
+        fn write(&self, _val: u32, eop: bool) -> DmaStatus {
             if eop { *self.filled.lock() += 1; }
-            (DmaStatus::ok(), None)
+            DmaStatus::ok()
         }
     }
 

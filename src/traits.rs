@@ -271,14 +271,10 @@ impl std::ops::BitOrAssign for DmaStatus {
 }
 
 pub trait DmaClient: Send + Sync {
-    /// Returns (value, status, writeback).
-    /// writeback is an optional (addr, val16) memory write to be executed by the caller
-    /// under its own lock (e.g. SeeqState) for atomicity with state updates.
-    fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)>;
-    /// Write a value to the DMA channel.
-    /// Returns (status, writeback) where writeback is an optional (addr, val16) memory write
-    /// to be executed by the caller under its own lock (e.g. SeeqState) for atomicity.
-    fn write(&self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>);
+    /// Read the next value from the DMA channel, with the channel's status.
+    fn read(&self) -> Option<(u32, DmaStatus)>;
+    /// Write a value to the DMA channel. Returns the channel's status.
+    fn write(&self, val: u32, eop: bool) -> DmaStatus;
     /// How far the device may read ahead of the guest: `Some(n)` when the
     /// guest is polling this channel's position and the device has read `n`
     /// words beyond the position the guest last saw (see HAL2's codec A).

@@ -641,6 +641,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Networking
 
+- **The Indy's HPC3 hands a filled Ethernet descriptor back before its channel
+  stops.** It stopped first and wrote the descriptor back a moment later, so a
+  driver that saw it stopped could restart it on the descriptor it had just
+  filled, and the next frame would overwrite that one. Transmit had the same
+  order and could send a packet twice.
 - **The NAT stack was rebuilt, and is faster and no longer stalls.** Through
   a port forward, host → guest TCP went from about 1 to 6 MB/s and guest →
   host from 2.7 to 7 MB/s; FTP to a LAN server from 1 to 7 MB/s; a large

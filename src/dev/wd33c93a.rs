@@ -1817,7 +1817,7 @@ impl Wd33c93aState {
             let mut i = offset;
             while i < total {
                 let is_last = i == last_idx;
-                let (mut st, _) = dma_dev.write(data[i] as u32, is_last);
+                let mut st = dma_dev.write(data[i] as u32, is_last);
                 if i == 0 && st.not_active() {
                     // Driver calls wdsc_dmago *after* writing TRANSFER_INFO, so the channel
                     // may not be active yet. Wait up to 100ms for the CPU thread to arm it.
@@ -1828,7 +1828,7 @@ impl Wd33c93aState {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                     while st.not_active() && std::time::Instant::now() < deadline {
                         std::thread::sleep(std::time::Duration::from_micros(100));
-                        (st, _) = dma_dev.write(data[i] as u32, is_last);
+                        st = dma_dev.write(data[i] as u32, is_last);
                     }
                     if st.not_active() {
                         dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — pausing", self.id);
@@ -1876,7 +1876,7 @@ impl Wd33c93aState {
         if let Some(dma_dev) = dma {
             while data.len() < total {
                 match dma_dev.read() {
-                    Some((val, st, _)) => {
+                    Some((val, st)) => {
                         // Byte accepted — decrement transfer count register to mirror real HW.
                         data.push(val as u8);
                         self.decrement_transfer_count();
@@ -1907,7 +1907,7 @@ impl Wd33c93aState {
                                 let mut got = false;
                                 while std::time::Instant::now() < deadline {
                                     std::thread::sleep(std::time::Duration::from_micros(100));
-                                    if let Some((val, st, _)) = dma_dev.read() {
+                                    if let Some((val, st)) = dma_dev.read() {
                                         data.push(val as u8);
                                         self.decrement_transfer_count();
                                         let pause = st.eox() && data.len() < total;
@@ -1984,7 +1984,7 @@ impl Wd33c93aState {
         if self.use_dma() {
             if let Some(dma_dev) = dma {
                 for i in 0..len {
-                    if let Some((val, _, _)) = dma_dev.read() {
+                    if let Some((val, _)) = dma_dev.read() {
                         data[i] = val as u8;
                     }
                 }
@@ -2120,11 +2120,11 @@ mod data_out_phase_tests {
         }
     }
     impl DmaClient for FedDma {
-        fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
-            self.0.lock().pop_front().map(|b| (b as u32, DmaStatus::ok(), None))
+        fn read(&self) -> Option<(u32, DmaStatus)> {
+            self.0.lock().pop_front().map(|b| (b as u32, DmaStatus::ok()))
         }
-        fn write(&self, _val: u32, _eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
-            (DmaStatus::ok(), None)
+        fn write(&self, _val: u32, _eop: bool) -> DmaStatus {
+            DmaStatus::ok()
         }
     }
 

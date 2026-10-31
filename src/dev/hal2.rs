@@ -627,7 +627,7 @@ impl Hal2 {
 
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
             for _ in 0..pacer.due() {
-                if let Some((val, st, _)) = dma_client.read() {
+                if let Some((val, st)) = dma_client.read() {
                     if !st.refused() {
                         ar_state.lock().loopback.push_back(val);
                     }
@@ -1032,14 +1032,14 @@ impl Hal2 {
 
 fn read_frame_from(client: &Arc<dyn DmaClient>, mode: usize) -> Option<(i16, i16)> {
     if mode == MODE_MONO {
-        let (v, st, _) = client.read()?;
+        let (v, st) = client.read()?;
         if st.refused() { return None; }
         let s = v as i16;
         Some((s, s))
     } else {
-        let (lv, lst, _) = client.read()?;
+        let (lv, lst) = client.read()?;
         if lst.refused() { return None; }
-        let (rv, rst, _) = match client.read() {
+        let (rv, rst) = match client.read() {
             Some(r) => r,
             None => return Some((lv as i16, lv as i16)),
         };

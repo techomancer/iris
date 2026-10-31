@@ -554,7 +554,7 @@ fn start_transaction(&mut self) {
         }
     }
 
-    fn dma_read(&mut self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
+    fn dma_read(&mut self) -> Option<(u32, DmaStatus)> {
         if !self.is_active() { return None; }
         self.dev_reads += 1;
 
@@ -580,8 +580,8 @@ fn start_transaction(&mut self) {
             };
 
             self.handle_dump(addr, &mem_val.to_be_bytes(), true);
-            let (st, wb) = self.advance(4, false);
-            return Some((val, st, wb));
+            let st = self.advance(4, false);
+            return Some((val, st));
         }
 
         let addr = self.cbp;
@@ -608,18 +608,18 @@ fn start_transaction(&mut self) {
         };
 
         if let Some(v) = val {
-            let (st, wb) = self.advance(step, false);
-            Some((v, st, wb))
+            let st = self.advance(step, false);
+            Some((v, st))
         } else {
             None
         }
     }
 
-    fn dma_write(&mut self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+    fn dma_write(&mut self, val: u32, eop: bool) -> DmaStatus {
         self.dev_writes += 1;
         if !self.is_active() {
             dlog_dev!(LogModule::Pdma, "PDMA[{}]: dma_write refused — channel not active (CBP={:08x} BC={:08x})", self.id, self.cbp, self.bc);
-            return (DmaStatus(DmaStatus::NOT_ACTIVE), None);
+            return DmaStatus(DmaStatus::NOT_ACTIVE);
         }
         // RX channel (id=10): respect ROWN — only write if HPC3 owns the descriptor
         if self.id == 10 && !self.rown {
@@ -639,7 +639,7 @@ fn start_transaction(&mut self) {
                 if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: receive chain exhausted at EOX — stopping channel", self.id); }
                 self.set_active(false);
             }
-            return (DmaStatus(DmaStatus::ROWN), None);
+            return DmaStatus(DmaStatus::ROWN);
         }
 
         // PBUS DMA (Channels 0-7) always operates on 32-bit words
@@ -679,10 +679,9 @@ fn start_transaction(&mut self) {
         self.advance(step, eop)
     }
 
-    /// Returns (status, writeback).
-    /// writeback: Some((addr, val16)) is a deferred memory write to be applied by the caller
-    /// under a higher-level lock (e.g. SeeqState) for atomicity. Only set for enet channels.
-    fn advance(&mut self, step: u32, caller_eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+    /// Move past `step` bytes; at the end of a descriptor, write it back
+    /// (Ethernet), then stop at EOX or fetch the next one.
+    fn advance(&mut self, step: u32, caller_eop: bool) -> DmaStatus {
         self.cbp = self.cbp.wrapping_add(step);
         self.bytes_transferred += step as usize;
         let count = self.bc & 0x3FFF;
@@ -695,19 +694,31 @@ fn start_transaction(&mut self) {
         let mut status = if caller_eop { DmaStatus(DmaStatus::EOP) } else { DmaStatus::ok() };
 
         let mut bc_done = (self.bc & 0x3FFF) == 0;
-        let mut writeback: Option<(u32, u16)> = None;
 
         // xie fires on every descriptor completion: either caller signals EOP, or bc hits zero.
         // These are orthogonal to EOX.
         let irq = self.xie && (caller_eop || bc_done);
 
-        // RX (ch10) writeback: return remaining bc and crbdp+6 address to caller.
-        // Caller (Seeq8003) will write this under SeeqState lock for atomicity.
+        // RX (ch10): the frame is in; hand the descriptor back to the host by
+        // writing the remaining count with ROWN clear. This has to land before
+        // the channel stops at EOX or moves on below. A driver that finds the
+        // channel stopped restarts it at the first descriptor it still sees as
+        // the HPC's (sgiseeq's rx_maybe_restart, sq_rxintr). Stopped with the
+        // write still pending, that is the descriptor just filled, and the next
+        // frame lands on top of this one.
+        //
+        // There is no HPC3 datasheet for this. The order is inferred from what
+        // those two drivers assume, not from documented hardware behaviour.
+        // The descriptor now goes back a little before the SEEQ thread updates
+        // rx_stat; the drivers read the status from the frame buffer and wait
+        // on the interrupt, so nothing depends on the two landing together.
         if self.id == 10 && caller_eop {
             if self.crbdp != 0 {
                 let rem = (self.bc & 0x3FFF) as u16;
-                if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[10]: RX writeback deferred crbdp={:08x}+6 ← rem_bc={:04x}", self.crbdp, rem); }
-                writeback = Some((self.crbdp + 6, rem));
+                if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[10]: RX writeback crbdp={:08x}+6 ← rem_bc={:04x}", self.crbdp, rem); }
+                if let Some(mem) = &self.sys_mem {
+                    mem.write16((self.crbdp + 6) as u64, rem);
+                }
             }
             bc_done = true;
         }
@@ -726,11 +737,17 @@ fn start_transaction(&mut self) {
                 status |= DmaStatus(DmaStatus::EOP);
                 if self.id == 11 { self.tx_new_packet = true; }
             }
-            // TX (ch11) writeback: return cpfxbdp+6 address to caller.
-            // Caller (Seeq8003) will write ENET_BC_TXD under SeeqState lock for atomicity.
+            // TX (ch11): mark the packet sent before the channel stops, for the
+            // same reason as RX above (and inferred in the same way): a driver
+            // restarts a stopped channel at the first descriptor without TXD
+            // (sgiseeq's kick_tx, sq_txring_hpc3), which would send this
+            // packet again. sq_txring_hpc3 reads the descriptor status before
+            // the channel's ACTIVE bit, which only works if the mark lands first.
             if self.id == 11 && self.eop && self.cpfxbdp != 0 {
-                if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[11]: TX writeback deferred cpfxbdp={:08x}+6 ← TXD", self.cpfxbdp); }
-                writeback = Some((self.cpfxbdp + 6, ENET_BC_TXD));
+                if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[11]: TX writeback cpfxbdp={:08x}+6 ← TXD", self.cpfxbdp); }
+                if let Some(mem) = &self.sys_mem {
+                    mem.write16((self.cpfxbdp + 6) as u64, ENET_BC_TXD);
+                }
             }
             if self.eox {
                 status |= DmaStatus(DmaStatus::EOX);
@@ -753,7 +770,7 @@ fn start_transaction(&mut self) {
             }
             if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: Interrupting (xie caller_eop={} bc_done={})", self.id, caller_eop, bc_done); }
         }
-        (status, writeback)
+        status
     }
 }
 
@@ -762,7 +779,7 @@ struct PdmaClientImpl {
 }
 
 impl DmaClient for PdmaClientImpl {
-    fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
+    fn read(&self) -> Option<(u32, DmaStatus)> {
         self.channel.lock().dma_read()
     }
     fn read_ahead_of_poll(&self) -> Option<u64> {
@@ -774,7 +791,7 @@ impl DmaClient for PdmaClientImpl {
             _ => None,
         }
     }
-    fn write(&self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+    fn write(&self, val: u32, eop: bool) -> DmaStatus {
         self.channel.lock().dma_write(val, eop)
     }
 }
@@ -1255,7 +1272,6 @@ impl Hpc3 {
         for chan in &self.pdma_channels {
             chan.lock().sys_mem = Some(mem.clone());
         }
-        self.seeq.set_phys(mem);
     }
 
     /// Pick controller 0 or 1's chip. `controller == 1` on guinness (Indy,
@@ -2422,7 +2438,7 @@ mod tests {
             assert_eq!(hpc.pdma_channels[1].lock().is_active(), lane == 3);
         }
         assert_eq!(hpc.read8(ch1(PBUS_DMA_CTRL + 3)).data & 2, 2);
-        let (sample, status, _) = hpc.pdma_channels[1].lock().dma_read().expect("audio DMA sample");
+        let (sample, status) = hpc.pdma_channels[1].lock().dma_read().expect("audio DMA sample");
         assert_eq!(sample, 0x1234);
         assert!(!status.refused());
         assert_eq!(hpc.read8(ch1(PBUS_DMA_CTRL + 3)).data & 2, 0);
@@ -2579,7 +2595,7 @@ mod enet_rx_chain_tests {
         let hpc3 = hpc3_for_test();
         rx_channel_on_an_exhausted_chain(&hpc3);
 
-        let (status, _) = hpc3.pdma_channels[10].lock().dma_write(0x42, false);
+        let status = hpc3.pdma_channels[10].lock().dma_write(0x42, false);
         assert!(status.refused(), "a host-owned descriptor cannot take the frame");
 
         let c = hpc3.pdma_channels[10].lock();
@@ -2588,6 +2604,86 @@ mod enet_rx_chain_tests {
             "the channel refused the frame but still reports ACTIVE, so \
              sq_rxintr's restart path never runs and receive never resumes",
         );
+    }
+
+    /// Guest memory for descriptor tests, big-endian like the guest's.
+    struct Ram(Mutex<Vec<u8>>);
+    impl BusDevice for Ram {
+        fn read8(&self, a: u64) -> BusRead8 { BusRead8::ok(self.0.lock()[a as usize]) }
+        fn write8(&self, a: u64, v: u8) -> u32 { self.0.lock()[a as usize] = v; BUS_OK }
+        fn read32(&self, a: u64) -> BusRead32 {
+            let m = self.0.lock();
+            BusRead32::ok(u32::from_be_bytes(m[a as usize..a as usize + 4].try_into().unwrap()))
+        }
+        fn write16(&self, a: u64, v: u16) -> u32 {
+            self.0.lock()[a as usize..a as usize + 2].copy_from_slice(&v.to_be_bytes());
+            BUS_OK
+        }
+        fn write32(&self, a: u64, v: u32) -> u32 {
+            self.0.lock()[a as usize..a as usize + 4].copy_from_slice(&v.to_be_bytes());
+            BUS_OK
+        }
+    }
+
+    /// One descriptor at 0x100 with its buffer at 0x1000 and the chain's end
+    /// flag, so the channel stops after it.
+    fn one_descriptor(flags: u32) -> (Hpc3, Arc<Ram>) {
+        let hpc3 = hpc3_for_test();
+        let ram = Arc::new(Ram(Mutex::new(vec![0; 0x2000])));
+        hpc3.set_phys(ram.clone());
+        ram.write32(0x100, 0x1000);
+        ram.write32(0x104, PDMA_DESC_EOX | PDMA_DESC_EOP | PDMA_DESC_XIE | flags | 0x600);
+        ram.write32(0x108, 0x100);
+        (hpc3, ram)
+    }
+
+    fn reg(off: u32) -> u64 { (HPC3_BASE + off) as u64 }
+
+    /// A driver that finds the receive channel stopped restarts it at the
+    /// first descriptor it still sees as the HPC's (sgiseeq's
+    /// rx_maybe_restart, sq_rxintr). The descriptor store has to be part of
+    /// the same channel operation as the stop, so that by the time the
+    /// channel reads as stopped the filled descriptor is the host's, with the
+    /// remaining count written back. The channel lock hides the order inside
+    /// that operation from a reader; this pins that the store is part of it.
+    #[test]
+    fn a_stopped_receive_channel_has_handed_its_frame_back() {
+        let (hpc3, ram) = one_descriptor(PDMA_DESC_ROWN);
+        hpc3.write32(reg(ENET_RX_BASE + ENET_RX_NBDP), 0x100);
+        hpc3.write32(reg(ENET_RX_BASE + ENET_RX_CTRL), ENET_RX_CTRL_ACTIVE);
+
+        // What the SEEQ sends: two pad bytes, a 60-byte frame, the status byte.
+        let rx = PdmaClientImpl { channel: hpc3.pdma_channels[10].clone() };
+        for _ in 0..62 {
+            assert!(!rx.write(0, false).refused());
+        }
+        rx.write(0x20, true);
+
+        assert_eq!(hpc3.read32(reg(ENET_RX_BASE + ENET_RX_CTRL)).data & ENET_RX_CTRL_ACTIVE, 0);
+        let bc = ram.read32(0x104).data;
+        assert_eq!(bc & PDMA_DESC_ROWN, 0, "the channel stopped, but the descriptor it filled still reads as the HPC's");
+        assert_eq!(bc & 0x3fff, 0x600 - 63);
+    }
+
+    /// The same for transmit: a driver restarts a stopped transmit channel at
+    /// the first descriptor not yet marked sent (sgiseeq's kick_tx,
+    /// sq_txring_hpc3), so a packet whose mark is still pending would go twice.
+    #[test]
+    fn a_stopped_transmit_channel_has_marked_its_packet_sent() {
+        let (hpc3, ram) = one_descriptor(0);
+        hpc3.write32(reg(ENET_TX_BASE + ENET_TX_NBDP), 0x100);
+        hpc3.write32(reg(ENET_TX_BASE + ENET_TX_CTRL), ENET_TX_CTRL_ACTIVE);
+
+        let tx = PdmaClientImpl { channel: hpc3.pdma_channels[11].clone() };
+        let mut sent = 0;
+        while let Some((_, st)) = tx.read() {
+            sent += 1;
+            if st.eop() { break; }
+        }
+
+        assert_eq!(sent, 0x600);
+        assert_eq!(hpc3.read32(reg(ENET_TX_BASE + ENET_TX_CTRL)).data & ENET_TX_CTRL_ACTIVE, 0);
+        assert_ne!(ram.read32(0x104).data & ENET_BC_TXD as u32, 0, "the channel stopped before marking the packet sent");
     }
 
     /// A target for controller 1 on an Indy, which has one, is an error that
