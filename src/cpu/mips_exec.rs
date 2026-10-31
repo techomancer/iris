@@ -2178,6 +2178,14 @@ macro_rules! step_preamble {
 }
 
 impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
+    /// The suffix a bus-error line carries when the device behind `phys_addr`
+    /// can say why the access failed. Asked only after a failure, so a good
+    /// access never pays; it changes nothing the guest sees.
+    #[cold]
+    fn fault_note(&self, phys_addr: u64, size: usize) -> String {
+        self.sysad.describe_fault(phys_addr, size).map_or_else(String::new, |why| format!(" [{why}]"))
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -4758,7 +4766,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             } else {
                 // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
                 if r.status != BUS_BUSY {
-                    eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}", virt_addr, phys_addr, r.status);
+                    eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}{}", virt_addr, phys_addr, r.status, self.fault_note(phys_addr, 4));
                 }
                 FetchInstrResult::exception(r.status)
             }
@@ -4886,7 +4894,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                                     };
                                     #[cfg(not(feature = "developer"))]
                                     let jitcheck_pass = "";
-                                    eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, r.status, jitcheck_pass);
+                                    eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, r.status, jitcheck_pass, self.fault_note(phys_addr, SIZE));
                                     self.core.cp0_badvaddr = virt_addr;
                                 }
                             }
@@ -5043,7 +5051,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.sysad.write64(phys_addr, val)
             };
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws);
+                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
             }
             ws
         };
@@ -5099,7 +5107,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             let ws = self.sysad.write64_masked(phys_addr, val, mask);
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}", self.core.pc, virt_addr, phys_addr, val, mask, ws);
+                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
             }
             ws
         }

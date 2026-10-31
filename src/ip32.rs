@@ -753,6 +753,7 @@ impl BusDevice for Ip32Bus {
     fn write16(&self, addr: u64, val: u16) -> u32 { self.phys.write16(addr, val) }
     fn write32(&self, addr: u64, val: u32) -> u32 { self.phys.write32(addr, val) }
     fn write64(&self, addr: u64, val: u64) -> u32 { self.phys.write64(addr, val) }
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> { self.phys.describe_fault(addr, size) }
     fn mem_ptr(&self, addr: u64) -> Option<*const u64> { self.phys.mem_ptr(addr) }
     fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 { self.phys.read_block(addr, buf) }
     fn write_block(&self, addr: u64, buf: &[u64]) -> u32 { self.phys.write_block(addr, buf) }

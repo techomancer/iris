@@ -373,6 +373,10 @@ impl BusDevice for CachedFlashLines {
     cached_access!(read32, write32, BusRead32, u32, 4);
     cached_access!(read64, write64, BusRead64, u64, 8);
 
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
+        self.bus.describe_fault(addr, size)
+    }
+
     fn mem_ptr(&self, addr: u64) -> Option<*const u64> {
         if BOOT_FLASH.contains(&addr) {
             return None;
