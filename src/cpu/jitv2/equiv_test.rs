@@ -4530,6 +4530,70 @@ mod tests {
         assert!(!exec.pcp.is_null(), "the page is back on the JIT");
     }
 
+    /// The same for a line staged in the primary instruction cache with
+    /// Index Store Tag (I) and 16 Index Store Data (I), on way 1: compiled
+    /// code for the page is dropped, the staged words run, and an Index
+    /// Invalidate (I) puts the page back on memory and the JIT.
+    #[test]
+    fn a_staged_primary_instruction_line_is_fetched_instead_of_the_compiled_page() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_isa::{OP_ADDIU, OP_CACHE};
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let ra = 0xFFFF_FFFF_8000_2000u64;
+        let addiu = |imm: u32| make_i(OP_ADDIU, 0, 2, imm as u16);
+        let jr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
+        let mem = Arc::new(MockMemory::new());
+        for (i, w) in [addiu(0x11), jr, 0].into_iter().enumerate() {
+            mem.set_word(0x1000 + 4 * i as u64, w);
+        }
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec = Box::new(MipsExecutor::<PassthroughTlb, R10000ShadowCache>::new(
+            bus, PassthroughTlb::default(), &MipsCpuConfig::for_model::<R10000ShadowCache>(Arc::new(crate::ip22_bus::memory_map(false)))));
+        exec.core.cp0_config = (exec.core.cp0_config & !7) | 3;
+        exec.cache.set_staged_l1i(true);
+        exec.install_jit_hooks();
+        exec.jitv2_inline_compile = true;
+        exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        let run = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| -> u64 {
+            exec.core.pc = pc;
+            exec.core.gpr[31] = ra;
+            exec.core.gpr[2] = 0;
+            for _ in 0..16 {
+                if exec.core.pc == ra { break; }
+                exec.step_jit();
+            }
+            assert_eq!(exec.core.pc, ra, "the code returns");
+            exec.core.gpr[2]
+        };
+        let cache_op = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>, op: u32, off: u64, lo: u32, hi: u32| {
+            exec.core.gpr[4] = pc + off;
+            exec.core.cp0_taglo = lo as u64;
+            exec.core.cp0_taghi = hi;
+            assert_eq!(exec.exec(make_i(OP_CACHE, 4, op, 0)), crate::cpu::mips_exec::EXEC_COMPLETE);
+        };
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x11);
+        }
+        assert!(unsafe { (*exec.pcp).is_published(0) }, "compiled");
+        // Block at PA 0x1000: tag PA[35:12] = 1 in TagLo[31:8], valid in bit 6.
+        cache_op(&mut exec, 0x08, 1, (1 << 8) | (1 << 6), 0);
+        assert!(exec.pcp.is_null(), "staging dropped the page from the JIT");
+        let words = [addiu(0x22), jr];
+        for w in 0..16u64 {
+            cache_op(&mut exec, 0x1c, 4 * w + 1, words.get(w as usize).copied().unwrap_or(0), 0);
+        }
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x22, "the staged words run, not the compiled page");
+        }
+        cache_op(&mut exec, 0x00, 1, 0, 0); // Index Invalidate (I), way 1
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x11);
+        }
+        assert!(!exec.pcp.is_null(), "back on the JIT");
+    }
+
     /// The data side: compiled loads reach RAM through the micro-TLB and
     /// ppmem's window, never the cache. Warm the micro-TLB on a page, stage a
     /// secondary line in it, and the compiled load returns the staged word;

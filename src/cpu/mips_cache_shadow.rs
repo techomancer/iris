@@ -31,7 +31,9 @@
 //! that costs a normal access one predicted branch: on the R10000 family, a
 //! secondary line the guest *staged* — a valid tag written by Index Store Tag
 //! and data by Index Store Data — is a real hit for later cached loads, stores
-//! and fetches, served from the shadow without a bus access. See [`Staged`].
+//! and fetches, served from the shadow without a bus access. A line staged
+//! in the primary instruction cache the same way serves fetches, before the
+//! secondary cache. See [`Staged`].
 //! Nothing else about the shadow reaches the data path: a line the guest never
 //! staged is memory, as before, and ordinary misses never fill or evict. So a
 //! staged line lives until an explicit index or hit operation, an Index Store
@@ -44,7 +46,7 @@ use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
-    C_HINV, C_HWBINV, C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
+    C_HINV, C_HWBINV, C_IINV, C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
@@ -116,6 +118,17 @@ const L2_TAG_PA_MASK: u64 = 0xf_ffff_c000;
 /// 0 Invalid, 1 Shared, 2 CleanExclusive, 3 DirtyExclusive.
 const L2_STATE_SHIFT: u32 = 10;
 const L2_STATE_DIRTY_EXCLUSIVE: u64 = 3;
+
+/// The primary instruction-cache tag, from the register pair (NEC
+/// U10278EJ4V0UM pp.267-270): TagLo[31:8] is PA[35:12], TagLo[6] the state (1 valid), and
+/// TagHi[3:0] PA[39:36], kept at bits 35:32 of the assembled tag.
+const L1I_TAG_PA_MASK: u64 = 0xf_ffff_ff00;
+const L1I_VALID: u64 = 1 << 6;
+
+#[inline(always)]
+fn l1i_tag_of(pa: u64) -> u64 {
+    (((pa >> 12) & 0xff_ffff) << 8) | (((pa >> 36) & 0xf) << 32)
+}
 
 /// Does the secondary tag hold a valid line? Every state but Invalid does.
 #[inline(always)]
@@ -242,6 +255,10 @@ pub struct ShadowCache<
     /// The translated address of the CACHE operand about to arrive in
     /// `cache_op`: the R10000's secondary index and way come from it.
     op_pa: UnsafeCell<Option<u64>>,
+    /// Serve fetches from staged primary I lines. Off unless `IRIS_STAGED_L1I`
+    /// is set (or `set_staged_l1i`), because the predecoded form is unknown:
+    /// see "Model choices" in the staged primary instruction-cache section.
+    l1i_served: UnsafeCell<bool>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -301,6 +318,7 @@ impl<
             pd_tag_hook: UnsafeCell::new(None),
             staged: UnsafeCell::new(Staged { valid: 0, pages: HashMap::new(), changed: false }),
             op_pa: UnsafeCell::new(None),
+            l1i_served: UnsafeCell::new(Self::R10K_FAMILY && std::env::var_os("IRIS_STAGED_L1I").is_some()),
         }
     }
 
@@ -439,9 +457,10 @@ impl<
     // doubleword of it reads as zero rather than as memory.
     //
     // Not modelled, and loudly absent rather than guessed:
-    // - the primary caches. A primary line the guest staged with the primary
-    //   index operations is not consulted, so where one overlaps a staged
-    //   secondary line the secondary data win, not the primary's;
+    // - the primary data cache. A line staged there with the primary index
+    //   operations is not consulted by loads. (A staged primary instruction
+    //   line is: see "Staged primary instruction-cache lines".) A valid
+    //   primary instruction line is served before the secondary cache;
     // - replacement. An ordinary cached miss never fills, so never evicts:
     //   a staged line lives until an index or hit operation, or an Index
     //   Store Tag, ends it (`clanker/cpu/staged-secondary-cache-lines.md`);
@@ -528,22 +547,14 @@ impl<
         true
     }
 
-    /// Store a secondary tag, keeping the staged-line index in step. The
-    /// first line in a page and the last one leaving it change which reads of
-    /// that page the decode cache may serve from the window.
-    fn set_l2_tag(&self, idx: usize, new: u64) {
-        let l2 = unsafe { &mut *self.l2.get() };
-        let old = l2.tags[idx];
-        l2.tags[idx] = new;
-        let (was, now) = (l2_tag_valid(old), l2_tag_valid(new));
-        if !(was || now) {
-            return;
-        }
-        let page = |tag: u64| (self.l2_line_pa(tag, idx / WAYS)) >> 12;
+    /// A staged line moved from page `old` to page `new` (`None`: it was not,
+    /// or is no longer, valid). The first line in a page and the last one
+    /// leaving it change which reads of that page the decode cache may serve
+    /// from the window, and which translations may be cached.
+    fn page_move(&self, old: Option<u64>, new: Option<u64>) {
         let st = unsafe { &mut *self.staged.get() };
         let decode = unsafe { &mut *self.decode.get() };
-        if was {
-            let pfn = page(old);
+        if let Some(pfn) = old {
             st.valid -= 1;
             if let Some(n) = st.pages.get_mut(&pfn) {
                 *n -= 1;
@@ -554,8 +565,7 @@ impl<
                 }
             }
         }
-        if now {
-            let pfn = page(new);
+        if let Some(pfn) = new {
             st.valid += 1;
             let n = st.pages.entry(pfn).or_insert(0);
             *n += 1;
@@ -563,6 +573,111 @@ impl<
                 st.changed = true;
                 decode.set_bus_only(pfn, true);
             }
+        }
+    }
+
+    /// Store a secondary tag, keeping the staged-line index in step.
+    fn set_l2_tag(&self, idx: usize, new: u64) {
+        let l2 = unsafe { &mut *self.l2.get() };
+        let old = l2.tags[idx];
+        l2.tags[idx] = new;
+        let page = |tag: u64| l2_tag_valid(tag).then(|| self.l2_line_pa(tag, idx / WAYS) >> 12);
+        if l2_tag_valid(old) || l2_tag_valid(new) {
+            self.page_move(page(old), page(new));
+        }
+    }
+
+    // ---- Staged primary instruction-cache lines -------------------------
+    //
+    // Index Store Tag (I) and Index Store Data (I) make a primary I line
+    // exactly as the secondary pair does, and a cached fetch that finds one
+    // takes its word from it before the secondary cache is consulted (NEC
+    // U10278EJ4V0UM pp.87-88). The primary index is the virtual address:
+    // VA[13:6] picks the set, VA[0] the way, VA[13:2] the word. The tag
+    // compares the fetch's physical address. Index Store Data (I) writes one
+    // word per operation, so a block takes 16.
+    //
+    // Model choices, each labelled by how well the sources settle it:
+    // - a fetch compares both ways at VA[13:6] against the fetch's translated
+    //   PA[39:12]. Stated for Hit Invalidate (I), inferred for a fetch;
+    // - a fetch hit does not update LRU. Unstated, and no replacement is
+    //   modelled;
+    // - the instruction is TagLo[31:0] and TagHi[3:0] is ignored. The
+    //   predecoded form is unknown (neither manual defines it). This is the
+    //   plain-instruction assumption, and it is WRONG for a guest that stages
+    //   words it took from Index Load Data of hardware-predecoded lines: the
+    //   Fuel PROM stages such words (36-bit values that are not an
+    //   instruction in TagLo, with extra bits inside the word) for its own
+    //   code, and executing TagLo from them crashes it while it copies its
+    //   image. This model refills and predecodes nothing, so it cannot
+    //   reproduce those words. Hence the switch below: serving is off unless
+    //   asked for.
+    //
+    // The primary data cache is not served: its tag and data layouts are
+    // known, but a dirty line writes back to the secondary cache and the
+    // modifier field has no model here.
+
+    /// Physical address of the line a primary I `tag` at `set` names.
+    fn l1i_line_pa(&self, tag: u64, set: usize) -> u64 {
+        (((tag >> 8) & 0xff_ffff) << 12)
+            | (((tag >> 32) & 0xf) << 36)
+            | ((set as u64 * IC_LINE as u64) & 0xfff)
+    }
+
+    /// Serve fetches from staged primary I lines, from now on. Set before any
+    /// line is staged.
+    pub fn set_staged_l1i(&self, on: bool) {
+        unsafe { *self.l1i_served.get() = on };
+    }
+
+    /// Store a primary I tag, keeping the staged-line index in step.
+    fn set_l1i_tag(&self, idx: usize, new: u64) {
+        let ic = unsafe { &mut *self.ic.get() };
+        let old = ic.tags[idx];
+        ic.tags[idx] = new;
+        if !unsafe { *self.l1i_served.get() } {
+            return;
+        }
+        let page = |tag: u64| (tag & L1I_VALID != 0).then(|| self.l1i_line_pa(tag, idx / WAYS) >> 12);
+        if old & L1I_VALID != 0 || new & L1I_VALID != 0 {
+            self.page_move(page(old), page(new));
+        }
+    }
+
+    /// The tag slot of the valid primary I line holding `pa` at the set `va`
+    /// indexes, if any.
+    fn staged_l1i_line(&self, va: u64, pa: u64) -> Option<usize> {
+        let ic = unsafe { &*self.ic.get() };
+        if ic.data.is_empty() {
+            return None;
+        }
+        let set = (va as usize / IC_LINE) % (Self::IC_LINES / WAYS).max(1);
+        let want = l1i_tag_of(pa);
+        (0..WAYS)
+            .map(|way| set * WAYS + way)
+            .find(|&idx| ic.tags[idx] & L1I_VALID != 0 && (ic.tags[idx] ^ want) & L1I_TAG_PA_MASK == 0)
+    }
+
+    /// The instruction word a fetch at `va`/`pa` finds in a staged primary I
+    /// line, then (primary before secondary) in a staged secondary line.
+    #[inline(never)]
+    fn staged_fetch_word(&self, va: u64, pa: u64) -> Option<u32> {
+        if let Some(idx) = self.staged_l1i_line(va, pa).filter(|_| unsafe { *self.l1i_served.get() }) {
+            let ic = unsafe { &*self.ic.get() };
+            let way = idx % WAYS;
+            let slot = (((va as usize) >> 2) % (ic.data.len() / WAYS)) * WAYS + way;
+            return Some(ic.data[slot] as u32);
+        }
+        self.staged_read::<4>(pa).map(|w| w as u32)
+    }
+
+    /// Clear the valid bit of the primary I line at `idx`.
+    fn l1i_invalidate(&self, idx: usize) {
+        let tag = unsafe { (*self.ic.get()).tags[idx] };
+        // With serving off the primary tags are the diagnostic round-trip
+        // store they always were, and an invalidate leaves them alone.
+        if unsafe { *self.l1i_served.get() } && tag & L1I_VALID != 0 {
+            self.set_l1i_tag(idx, tag & !L1I_VALID);
         }
     }
 
@@ -749,15 +864,18 @@ impl<
     }
 
     #[inline(always)]
-    fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
+    fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         // Decoded instructions by physical page — see `decode_cache`.
         let dc = unsafe { &mut *self.decode.get() };
         // Only a page the decode cache reads word by word (`set_bus_only`)
         // comes here when a line is staged, so this costs a RAM page nothing.
         let word = |a: u64| {
             if self.staged_any() {
-                if let Some(w) = self.staged_read::<4>(a) {
-                    return Ok(w as u32);
+                // The word being read is at `a`; its virtual address is the
+                // fetch's, moved by the same distance.
+                let va = virt_addr.wrapping_add(a.wrapping_sub(phys_addr));
+                if let Some(w) = self.staged_fetch_word(va, a) {
+                    return Ok(w);
                 }
             }
             let r = self.downstream.read32(a);
@@ -953,6 +1071,8 @@ impl<
                     let tag = phys_addr & mask & !MRU_BIT;
                     if Self::R10K_FAMILY && sel == CACH_SD {
                         self.set_l2_tag(idx, tag);
+                    } else if Self::R10K_FAMILY && sel == CACH_PI {
+                        self.set_l1i_tag(idx, tag);
                     } else {
                         s.tags[idx] = tag;
                     }
@@ -1014,6 +1134,20 @@ impl<
                 self.l2_invalidate(idx, true);
                 0
             }
+            // Index Invalidate (I) clears the valid bit of the way named, Hit
+            // Invalidate (I) of whichever way holds the address (NEC
+            // U12754EJ1V0UMJ1 pp.18, 27).
+            C_IINV if Self::R10K_FAMILY && sel == CACH_PI => {
+                let idx = self.tag_slot(sel, virt_addr);
+                self.l1i_invalidate(idx);
+                0
+            }
+            C_HINV if Self::R10K_FAMILY && sel == CACH_PI => {
+                if let Some(idx) = self.staged_l1i_line(virt_addr, phys_addr) {
+                    self.l1i_invalidate(idx);
+                }
+                0
+            }
             C_HINV if Self::R10K_FAMILY && sel == CACH_SD => {
                 self.l2_hit_invalidate(phys_addr, false);
                 0
@@ -1073,6 +1207,19 @@ impl<
             lines.push(toml::Value::Table(e));
         }
         t.insert("staged_l2".into(), toml::Value::Array(lines));
+        let ic = unsafe { &*self.ic.get() };
+        let per_way = (ic.data.len() / WAYS).max(1);
+        let mut ilines = Vec::new();
+        for (idx, &tag) in ic.tags.iter().enumerate().filter(|(_, &t)| t & L1I_VALID != 0) {
+            let (set, way) = (idx / WAYS, idx % WAYS);
+            let words = (0..IC_LINE / 4).map(|i| toml::Value::Integer(ic.data[((set * IC_LINE / 4 + i) % per_way) * WAYS + way] as i64));
+            let mut e = toml::value::Table::new();
+            e.insert("idx".into(), toml::Value::Integer(idx as i64));
+            e.insert("tag".into(), u(tag));
+            e.insert("words".into(), toml::Value::Array(words.collect()));
+            ilines.push(toml::Value::Table(e));
+        }
+        t.insert("staged_l1i".into(), toml::Value::Array(ilines));
         toml::Value::Table(t)
     }
 
@@ -1085,6 +1232,12 @@ impl<
                 if l2_tag_valid(l2.tags[idx]) {
                     self.set_l2_tag(idx, l2.tags[idx] & !(3 << L2_STATE_SHIFT));
                 }
+            }
+        }
+        let ic = unsafe { &mut *self.ic.get() };
+        if Self::R10K_FAMILY {
+            for idx in 0..ic.tags.len() {
+                self.l1i_invalidate(idx);
             }
         }
         let lines = v.get("staged_l2").and_then(|l| l.as_array());
@@ -1112,6 +1265,19 @@ impl<
             }
             l2.mru[set.min(l2.mru.len() - 1)] = e.get("mru").and_then(|m| m.as_bool()).unwrap_or(false);
             self.set_l2_tag(idx, u(e.get("tag").ok_or("staged line: no tag")?)?);
+        }
+        for e in v.get("staged_l1i").and_then(|l| l.as_array()).into_iter().flatten().filter(|_| Self::R10K_FAMILY) {
+            let idx = e.get("idx").and_then(|i| i.as_integer()).ok_or("staged line: no index")? as usize;
+            let words = e.get("words").and_then(|d| d.as_array()).ok_or("staged line: no words")?;
+            if idx >= ic.tags.len() || words.len() != IC_LINE / 4 || ic.data.is_empty() {
+                return Err("staged primary line does not fit this cache".into());
+            }
+            let (set, way) = (idx / WAYS, idx % WAYS);
+            let per_way = ic.data.len() / WAYS;
+            for (i, w) in words.iter().enumerate() {
+                ic.data[((set * IC_LINE / 4 + i) % per_way) * WAYS + way] = w.as_integer().ok_or("staged line: bad word")? as u64;
+            }
+            self.set_l1i_tag(idx, u(e.get("tag").ok_or("staged line: no tag")?)?);
         }
         unsafe { (*self.decode.get()).flush() };
         Ok(())
@@ -1691,7 +1857,9 @@ mod tests {
     /// An R10000 secondary cache (1 MiB, 128-byte lines, 4096 sets) over `Bus`.
     fn staged_cache() -> (R10000ShadowCache, Arc<Bus>) {
         let bus = Arc::new(Bus::default());
-        (R10000ShadowCache::from(bus.clone() as Arc<dyn BusDevice>), bus)
+        let c = R10000ShadowCache::from(bus.clone() as Arc<dyn BusDevice>);
+        c.set_staged_l1i(true);
+        (c, bus)
     }
 
     /// A line in set 0x20 (PA[18:7]), tag PA[35:18] = 4.
@@ -2164,6 +2332,123 @@ mod tests {
         check::<R10000ShadowCache>("128-byte lines");
         check::<R10000O2ShadowCache>("64-byte lines");
         check::<R14000FuelShadowCache>("2 MiB, 128-byte lines");
+    }
+
+    // ---- Staged primary instruction-cache lines -------------------------
+
+    /// Index Store Tag (I) on `pa`'s block at the set `va` indexes, `way`.
+    fn stage_i_tag(c: &R10000ShadowCache, va: u64, pa: u64, way: u64, valid: bool) {
+        let tag = l1i_tag_of(pa) | if valid { L1I_VALID } else { 0 };
+        c.cache_op(C_IST | CACH_PI, (va & !63) | way, tag);
+    }
+
+    /// Index Store Data (I): the word at `va`, in `way`, is `w`.
+    fn stage_i_word(c: &R10000ShadowCache, va: u64, way: u64, w: u32) {
+        c.cache_op(C_R10K_ISD | CACH_PI, (va & !3) | way, w as u64);
+    }
+
+    fn fetch_raw(c: &R10000ShadowCache, va: u64, pa: u64) -> u32 {
+        unsafe { (*c.fetch(va, pa).instr).raw }
+    }
+
+    /// Stage whole primary I blocks on way 1 of several sets (16 words each)
+    /// and fetch through them: the staged words, with no bus read.
+    #[test]
+    fn a_staged_primary_instruction_line_serves_fetches() {
+        let (c, bus) = staged_cache();
+        let base = 0x0030_0000u64;
+        for set in 0..4u64 {
+            let (va, pa) = (0xffff_ffff_8000_0000 | (base + set * 64), base + set * 64);
+            stage_i_tag(&c, va, pa, 1, true);
+            for w in 0..16u64 {
+                stage_i_word(&c, va + 4 * w, 1, 0x3c00_0000 | (set << 8) as u32 | w as u32);
+            }
+        }
+        for set in 0..4u64 {
+            for w in 0..16u64 {
+                let (va, pa) = (0xffff_ffff_8000_0000 | (base + set * 64 + 4 * w), base + set * 64 + 4 * w);
+                assert_eq!(fetch_raw(&c, va, pa), 0x3c00_0000 | (set << 8) as u32 | w as u32, "set {set} word {w}");
+            }
+        }
+        assert_eq!(bus.reads.load(Ordering::Relaxed), 0);
+        // The index is virtual: the same physical block through a VA with
+        // other VA[13:6] misses. The tag is physical: another frame misses.
+        assert_eq!(fetch_raw(&c, 0xffff_ffff_8000_0000 | (base + 0x400), base), 0xeeee_eeee);
+        assert_eq!(fetch_raw(&c, 0xffff_ffff_8000_0000 | base, base + (1 << 20)), 0xeeee_eeee);
+        // Loads are not served by an instruction line.
+        assert_eq!(load::<4>(&c, base), 0xeeee_eeee);
+    }
+
+    /// A secondary staged line served fetches first; ending it leaves the
+    /// primary I lines hitting. With both valid the primary wins.
+    #[test]
+    fn primary_instruction_lines_outlive_the_secondary_line_and_win_over_it() {
+        let (c, bus) = staged_cache();
+        let (pa, va) = (0x0030_0000u64, 0xffff_ffff_8030_0000u64);
+        stage_tag(&c, pa, 0, 2);
+        for q in 0..8 {
+            stage_data(&c, pa + 16 * q, 0, 0x5555_0000_6666_0000 | q);
+        }
+        assert_eq!(fetch_raw(&c, va, pa), 0x6666_0000, "the secondary line");
+        stage_i_tag(&c, va, pa, 1, true);
+        for w in 0..16 {
+            stage_i_word(&c, va + 4 * w, 1, 0x7000 + w as u32);
+        }
+        assert_eq!(fetch_raw(&c, va, pa), 0x7000, "primary before secondary");
+        stage_tag(&c, pa, 0, 0); // the secondary line ends
+        assert_eq!(fetch_raw(&c, va, pa), 0x7000);
+        assert_eq!(fetch_raw(&c, va + 8, pa + 8), 0x7002);
+        assert_eq!(bus.reads.load(Ordering::Relaxed), 0);
+    }
+
+    /// Ending a primary I line: Index Store Tag with an invalid state, Index
+    /// Invalidate (the way named), Hit Invalidate (by address), power-on. A
+    /// fetch served before must not be served again. Another way, another
+    /// set, and an Index Invalidate of the other way leave the line.
+    #[test]
+    fn primary_instruction_lines_end() {
+        let (pa, va) = (0x0030_0040u64, 0xffff_ffff_8030_0040u64);
+        let ends: [(&str, Box<dyn Fn(&R10000ShadowCache)>); 4] = [
+            ("Index Store Tag, invalid", Box::new(move |c| stage_i_tag(c, va, pa, 1, false))),
+            ("Index Invalidate", Box::new(move |c| { c.cache_op(C_IINV | CACH_PI, va | 1, 0); })),
+            ("Hit Invalidate", Box::new(move |c| { c.cache_op(C_HINV | CACH_PI, va, pa); })),
+            ("power-on", Box::new(|c| c.power_on())),
+        ];
+        for (name, end) in ends {
+            let (c, _) = staged_cache();
+            stage_i_tag(&c, va, pa, 1, true);
+            stage_i_word(&c, va, 1, 0x1234);
+            assert_eq!(fetch_raw(&c, va, pa), 0x1234, "{name}: before");
+            assert!(c.page_staged(pa));
+            end(&c);
+            assert_eq!(fetch_raw(&c, va, pa), 0xeeee_eeee, "{name}: after");
+            assert!(!c.page_staged(pa), "{name}");
+        }
+        let (c, _) = staged_cache();
+        stage_i_tag(&c, va, pa, 1, true);
+        stage_i_word(&c, va, 1, 0x1234);
+        c.cache_op(C_IINV | CACH_PI, va, 0); // the other way
+        c.cache_op(C_IINV | CACH_PI, va + 64, 0); // the next set
+        c.cache_op(C_HINV | CACH_PI, va, pa + (1 << 20)); // misses
+        assert_eq!(fetch_raw(&c, va, pa), 0x1234);
+    }
+
+    /// Staged primary I lines survive a snapshot round trip.
+    #[test]
+    fn staged_primary_instruction_lines_are_saved() {
+        let (c, _) = staged_cache();
+        let (pa, va) = (0x0030_0000u64, 0xffff_ffff_8030_0000u64);
+        stage_i_tag(&c, va, pa, 1, true);
+        for w in 0..16 {
+            stage_i_word(&c, va + 4 * w, 1, 0x7000 + w as u32);
+        }
+        let saved = c.save_cache_state();
+        let (d, _) = staged_cache();
+        d.load_cache_state(&saved).unwrap();
+        assert_eq!(fetch_raw(&d, va + 12, pa + 12), 0x7003);
+        assert!(d.page_staged(pa));
+        d.load_cache_state(&toml::Value::Table(Default::default())).unwrap();
+        assert_eq!(fetch_raw(&d, va + 12, pa + 12), 0xeeee_eeee);
     }
 
     // ---- Mapped operands ------------------------------------------------
