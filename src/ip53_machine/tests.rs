@@ -768,3 +768,46 @@ fn a_jitv2_build_takes_memory_only_below_4_gib() {
         drop(build_cpu::<R16000ShadowCache>(&board));
     }).unwrap().join().unwrap();
 }
+
+/// A guest power-off exits the process without dropping the board, so the
+/// flush is what carries an overlay's writes to the next run, on either
+/// ISP12160 channel. A second board reads the disk while the first is still
+/// alive, so nothing the first board's drop does can be what it sees; both
+/// are then dropped, so no board is leaked.
+#[test]
+fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
+    use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
+    for channel in 0..2 {
+        let path = std::env::temp_dir().join(format!("iris-tezro-flush-{}-{channel}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 4 * 512]).unwrap();
+        let attach = |board: &TezroBoard| {
+            let bus = board.scsi.bus_for_channel(channel).unwrap();
+            bus.attach_device(1, path.to_str().unwrap(), false, Vec::new(), true, None, true).unwrap();
+        };
+        let board = TezroBoard::new(1).unwrap();
+        attach(&board);
+        let write = ScsiRequest {
+            cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+            data_len: ScsiDataLength::Unlimited,
+            data_in: Some(vec![0x5A; 512]),
+        };
+        board.scsi.bus_for_channel(channel).unwrap().request(1, &write).unwrap().unwrap();
+        board.flush_disks().unwrap();
+        let writer = board;
+
+        let board = TezroBoard::new(1).unwrap();
+        attach(&board);
+        let read = ScsiRequest {
+            cdb: vec![scsi_cmd::READ_10, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+            data_len: ScsiDataLength::Unlimited,
+            data_in: None,
+        };
+        let got = board.scsi.bus_for_channel(channel).unwrap().request(1, &read).unwrap().unwrap();
+        assert_eq!(got.data, vec![0x5A; 512], "channel {channel}");
+        drop(board);
+        drop(writer);
+        let _ = std::fs::remove_file(format!("{}.overlay", path.display()));
+        let _ = std::fs::remove_file(format!("{}.overlay.dirty", path.display()));
+        let _ = std::fs::remove_file(&path);
+    }
+}
