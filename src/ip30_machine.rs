@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::config::{CpuModel, MachineConfig};
+use crate::config::{CpuModel, MachineConfig, MachineProfile};
 use crate::cpu::mips_cache_shadow::R10000ShadowCache;
 use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
@@ -160,9 +160,7 @@ pub struct OctaneMachine {
 
 impl OctaneMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
-        if cfg.machine.cpu != CpuModel::R10000 {
-            return Err("an Octane has an R10000 ([machine] cpu = \"r10000\")".into());
-        }
+        MachineProfile::OctaneIp30.accepts_cpu(cfg.machine.cpu)?;
         // `prom`, or IRIX's file name when `prom` is the shared default and
         // that file is not there: there is no embedded Octane PROM.
         let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
@@ -176,9 +174,7 @@ impl OctaneMachine {
             return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
         }
         let cpu_count = cfg.machine.cpus;
-        if !(1..=2).contains(&cpu_count) {
-            return Err(format!("[machine] cpus = {cpu_count}: IRIX runs an Octane with 1 or 2"));
-        }
+        MachineProfile::OctaneIp30.accepts_cpus(cpu_count)?;
         let banks = heart_banks(cfg);
         let kind = cfg.graphics_board();
         let board = match kind {
