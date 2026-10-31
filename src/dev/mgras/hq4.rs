@@ -713,8 +713,8 @@ impl ImpactXio {
             board.ge_revision as u32,
         );
         mgras.set_phys(mem);
-        // The Octane X server arms a pixel read with XFRCONTROL 8 and kicks
-        // the DMA last, which starts the read.
+        // The Octane X server arms a pixel read with XFRCONTROL 8, kicks the
+        // DMA, which starts the read, and then writes XFRCONTROL 9.
         mgras.start_reads_at_kick();
         // The HQ4 microcode keeps its GE state at other addresses, and the
         // IP30 kernel's idle waits are shorter than the model's long lists.
