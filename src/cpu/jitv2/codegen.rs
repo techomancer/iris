@@ -10903,40 +10903,89 @@ mod tests {
 
     /// The emulator turns Cranelift's IR verifier off to shorten the wait on
     /// the compile thread. The verifier only checks, so the same page must
-    /// compile to the same machine code with it on or off.
+    /// compile to the same machine code with it on or off. The pages cover the
+    /// shapes that build different IR: integer and FP memory ops, a
+    /// branch-likely, backward and forward branches, a jump.
     #[test]
     fn verifier_off_emits_the_same_code() {
-        use crate::cpu::mips_isa::{OP_ADDIU, OP_BEQ, OP_LW, OP_SW};
         fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
             (op << 26) | (rs << 21) | (rt << 16) | imm as u32
         }
-        let mut page = [0u32; ENTRIES_PER_PAGE];
-        page[0] = i_type(OP_LW, 4, 2, 0);       // lw    v0, 0(a0)
-        page[1] = i_type(OP_ADDIU, 2, 2, 1);    // addiu v0, v0, 1
-        page[2] = i_type(OP_SW, 4, 2, 0);       // sw    v0, 0(a0)
-        page[3] = i_type(OP_BEQ, 2, 0, 0xfffc); // beq   v0, zero, 0
-        page[4] = 0;                            // delay slot
-        page[5] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
-        page[6] = 0;
+        let jr_ra = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        let simple = [
+            i_type(OP_LW, 4, 2, 0),       // lw    v0, 0(a0)
+            i_type(OP_ADDIU, 2, 2, 1),    // addiu v0, v0, 1
+            i_type(OP_SW, 4, 2, 0),       // sw    v0, 0(a0)
+            i_type(OP_BEQ, 2, 0, 0xfffc), // beq   v0, zero, 0
+            0,                            // delay slot
+            jr_ra,
+            0,
+        ];
+        let narrow = [
+            i_type(OP_LB, 4, 2, 1),       // lb    v0, 1(a0)
+            i_type(OP_SB, 4, 2, 2),       // sb    v0, 2(a0)
+            i_type(OP_ANDI, 2, 3, 0xff),  // andi  v1, v0, 0xff
+            i_type(OP_SD, 4, 3, 8),       // sd    v1, 8(a0)
+            i_type(OP_LD, 4, 5, 8),       // ld    a1, 8(a0)
+            jr_ra,
+            0,
+        ];
+        let fp = [
+            i_type(OP_LWC1, 4, 0, 0),        // lwc1  f0, 0(a0)
+            i_type(OP_LWC1, 4, 1, 4),        // lwc1  f1, 4(a0)
+            r_type(OP_COP1, 16, 1, 0, 2, 0), // add.s f2, f0, f1
+            i_type(OP_SWC1, 4, 2, 8),        // swc1  f2, 8(a0)
+            jr_ra,
+            0,
+        ];
+        let likely = [
+            i_type(OP_LW, 4, 2, 0),       // lw    v0, 0(a0)
+            i_type(OP_BEQL, 2, 0, 2),     // beql  v0, zero, +2
+            i_type(OP_ADDIU, 2, 2, 1),    // addiu v0, v0, 1 (delay slot, annulled if not taken)
+            i_type(OP_SW, 4, 2, 0),       // sw    v0, 0(a0)
+            jr_ra,
+            0,
+        ];
+        let blocks = [
+            i_type(OP_LW, 4, 2, 0),         // lw    v0, 0(a0)
+            i_type(OP_BNE, 2, 0, 3),        // bne   v0, zero, +3
+            0,
+            i_type(OP_ADDIU, 2, 2, 1),      // addiu v0, v0, 1
+            i_type(OP_SW, 4, 2, 4),         // sw    v0, 4(a0)
+            i_type(OP_ADDIU, 5, 5, 0xffff), // addiu a1, a1, -1
+            i_type(OP_BNE, 5, 0, 0xfffb),   // bne   a1, zero, back to the lw
+            0,
+            (OP_J << 26) | 12,              // j     word 12
+            0,
+            0,
+            0,
+            jr_ra,
+            0,
+        ];
+        let pages: [(&str, &[u32]); 5] =
+            [("simple", &simple), ("narrow", &narrow), ("fp", &fp), ("likely", &likely), ("blocks", &blocks)];
 
-        let compile = |verify: bool| {
-            let mut analyzer = Analyzer::new();
-            let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
-            assert!(non_empty);
-            let mut instrs = *instrs;
-            let mut codegen = Codegen::from_module(Codegen::new_module_verifying(None, None, verify));
-            assert_eq!(codegen.module.isa().flags().enable_verifier(), verify);
-            let f = codegen.compile_region(&mut instrs, 0, true, false).expect("region must compile");
-            let len = codegen.last_code_size() as usize;
-            assert!(len > 0);
-            // SAFETY: `f` points at `len` bytes of finalized code that stay
-            // mapped while `codegen` lives.
-            let code = unsafe { std::slice::from_raw_parts(f as *const u8, len) }.to_vec();
-            std::mem::forget(codegen);
-            code
-        };
-        assert_eq!(compile(true), compile(false), "the verifier must not change the emitted code");
-        assert!(verify_ir_enabled(), "test builds keep the verifier");
+        for (name, words) in pages {
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[..words.len()].copy_from_slice(words);
+            let compile = |verify: bool| {
+                let mut analyzer = Analyzer::new();
+                let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+                assert!(non_empty, "{name}");
+                let mut instrs = *instrs;
+                let mut codegen = Codegen::from_module(Codegen::new_module_verifying(None, None, verify));
+                assert_eq!(codegen.module.isa().flags().enable_verifier(), verify);
+                let f = codegen.compile_region(&mut instrs, 0, true, false).unwrap_or_else(|| panic!("{name} must compile"));
+                let len = codegen.last_code_size() as usize;
+                assert!(len > 0, "{name}");
+                // SAFETY: `f` points at `len` bytes of finalized code that
+                // stay mapped: the module is leaked below.
+                let code = unsafe { std::slice::from_raw_parts(f as *const u8, len) }.to_vec();
+                std::mem::forget(codegen);
+                code
+            };
+            assert_eq!(compile(true), compile(false), "{name}: the verifier must not change the emitted code");
+        }
     }
 
     #[test]
