@@ -230,6 +230,25 @@ pub struct GlPixels<'a> {
     pub depth: RowsMut<'a, u8>,
     pub stencil: RowsMut<'a, u8>,
     pub overlay: RowsMut<'a, u8>,
+    /// The rows the draw stored colour to (see `GlPlanes`), for the raster
+    /// unit to hand the display.
+    pub touched: TouchedRows,
+    /// The colour buffers a lent row's stores may reach, bit b for buffer
+    /// b: what the draw's targets name. A lent row marks them all.
+    pub row_targets: u32,
+}
+
+impl GlPixels<'_> {
+    /// Hand the rows the draw wrote to the raster unit's record, for the
+    /// display to resolve (RasterCtx::drawn).
+    pub fn record(&self, ctx: &mut RasterCtx) {
+        ctx.drawn.add(&self.touched, self.state.id_compare);
+    }
+
+    /// The buffers a list of colour targets names, as `row_targets` has them.
+    pub fn target_bits(targets: &[ColourTarget]) -> u32 {
+        targets.iter().filter(|&&t| t < ODSY_BUFFERS).fold(0, |bits, &t| bits | 1 << t)
+    }
 }
 
 impl PlaneStore for GlPixels<'_> {
@@ -242,6 +261,8 @@ impl PlaneStore for GlPixels<'_> {
             depth: self.depth.view(),
             stencil: self.stencil.view(),
             overlay: self.overlay.view(),
+            touched: &self.touched,
+            row_targets: self.row_targets,
         })
     }
 }
@@ -256,6 +277,10 @@ pub struct GlPlanes<'a> {
     depth: Rows<'a, u8>,
     stencil: Rows<'a, u8>,
     overlay: Rows<'a, u8>,
+    /// Each row a colour store (or a lent row, for the draw's
+    /// `row_targets`) reached, by buffer: what the display resolves again.
+    touched: &'a TouchedRows,
+    row_targets: u32,
 }
 
 /// One row of GlPlanes as a row loop reaches it (Planes::row()): the depth
@@ -369,6 +394,12 @@ impl Planes for GlPlanes<'_> {
         if !s.clip_rect[..s.clip_kept as usize].iter().any(|r| y >= r.y0 && y <= r.y1 && x0 >= r.x0 && x1 <= r.x1) {
             return None;
         }
+        // The row's stores reach the buffers the draw targets.
+        if !s.to_aux {
+            for b in (0..ODSY_BUFFERS as usize).filter(|b| self.row_targets >> b & 1 != 0) {
+                touch_row(self.touched, b, y);
+            }
+        }
         let did = if s.id_compare & ODSY_ID_COMPARE_ENABLE != 0 {
             let at = y as usize * SGI_ODYSSEY_WIDTH as usize + x0 as usize;
             s.did.get(at..at + n)?
@@ -408,10 +439,12 @@ impl Planes for GlPlanes<'_> {
             if target == ODSY_AUX_OVERLAY_BUFFER {
                 if let Some(px) = self.overlay.get(y as usize, x as usize, 1) {
                     px[0].set((colour & 0xff) as u8);
+                    touch_row(self.touched, TOUCHED_OVERLAY, y);
                 }
             }
             return;
         }
+        touch_row(self.touched, target as usize, y);
         self.colour[target as usize].plane_store(&s.colour[target as usize], x, y, colour & ODSY_INDEX_MASK);
     }
 
@@ -423,6 +456,7 @@ impl Planes for GlPlanes<'_> {
         if target < ODSY_BUFFERS && s.pixel_allowed(x as i64, y as i64) && !s.to_aux {
             let word = (c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3];
 
+            touch_row(self.touched, target as usize, y);
             self.colour[target as usize].plane_store(&s.colour[target as usize], x, y, word);
         }
     }
@@ -525,6 +559,8 @@ impl GlPixelJob {
                 depth: RowsMut::new(s.depth.bytes(), st.depth.stride as usize),
                 stencil: RowsMut::new(s.stencil.bytes(), st.stencil.stride as usize),
                 overlay: RowsMut::new(s.overlay.bytes(), SGI_ODYSSEY_WIDTH as usize),
+                touched: Default::default(),
+                row_targets: 3,
             }
         }
     }
@@ -685,12 +721,16 @@ impl GlDrawJob {
         // SAFETY: the raster unit owns the planes while the job runs
         // (PlaneSpans).
         let mut pixels = unsafe { self.pixels.pixels() };
+        let mut targets = [0; SGI_GL_MAX_TARGETS as usize];
+        let n = self.state.draw_targets(&mut targets) as usize;
+        pixels.row_targets = GlPixels::target_bits(&targets[..n]);
         let texels = chain.map(|chain| unsafe { self.tables.texels(chain, self.pixels.spans.obj) });
         let texels: &dyn Texels = match &texels {
             Some(texels) => texels,
             None => &NoTexels,
         };
         let result = self.rules.draw(&t, &mut pixels, texels, &mut d);
+        pixels.record(ctx);
         if let Some(phase) = d.line_phase {
             ctx.line_phase = phase;
         }
@@ -740,6 +780,8 @@ impl Board {
             depth: self.depth_mem.rows(&state.depth),
             stencil: self.stencil_mem.rows(&state.stencil),
             overlay: RowsMut::new(&mut self.overlay, SGI_ODYSSEY_WIDTH as usize),
+            touched: Default::default(),
+            row_targets: 3,
         };
         (pixels, texels)
     }
@@ -1988,7 +2030,6 @@ impl Board {
                 pixels,
             }),
         };
-        self.scanout.invalidate_all();
         if !self.raster.threaded() {
             let (result, phase) = self.raster.run_now(|ctx| job.run(ctx));
             d.line_phase = phase;
@@ -2021,14 +2062,15 @@ impl Board {
         if let Some(op) = ops.first() {
             self.gl_report_refusals(op.kind != SGI_RASTER_CLEAR || (op.clear_buffers & SGI_GL_COLOR_BUFFER_BIT) != 0);
         }
-        self.scanout.invalidate_all();
-        self.raster.submit(move |_| {
+        self.raster.submit(move |ctx| {
             // SAFETY: the job runs before the front end next touches the
             // planes (PlaneSpans).
             let mut planes = unsafe { pixels.pixels() };
+            planes.row_targets = ops.iter().fold(0, |bits, op| bits | GlPixels::target_bits(&op.targets[..op.ntargets.min(SGI_GL_MAX_TARGETS) as usize]));
             for op in &ops {
                 rules.raster(&t, &mut planes, op);
             }
+            planes.record(ctx);
         });
     }
 

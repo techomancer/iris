@@ -219,14 +219,13 @@ impl Odyssey {
         s.scanout_poll(monotonic_ns());
         let (w, h) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
         // The planes are the raster unit's: wait out its slice in flight and
-        // hold off the next while the frame's lines are copied aside. What
-        // it drew since the last frame is drawn again. The raster unit draws
-        // on while the copy is resolved.
-        let planes = state.raster.planes();
+        // hold off the next while the frame's lines are copied aside. The
+        // colour rows it wrote since the last frame are resolved again.
+        // The raster unit draws on while the copy is resolved.
+        let mut planes = state.raster.planes();
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
-        if state.raster.take_drawn() {
-            s.scanout.invalidate_all();
-        }
+        let displayed = s.front.lock().displayed_buffer;
+        planes.take_rows(displayed, |y| s.scanout.invalidate(y as i32, 1));
         s.scanout_stage();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         drop(planes);

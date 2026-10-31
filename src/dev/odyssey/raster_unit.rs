@@ -63,12 +63,112 @@ pub const RASTER_SLICE: Duration = Duration::from_millis(1);
 /// phase to 0 at glBegin and glEnd, which replaces this marker.
 pub const LINE_PHASE_ON_RASTER: u32 = u32::MAX;
 
+/// Words of a row set: one bit a plane row.
+pub const ROW_WORDS: usize = (SGI_ODYSSEY_HEIGHT as usize).div_ceil(64);
+
+/// The rows a draw wrote, a bit each, by where it wrote: colour buffer 0,
+/// colour buffer 1 and the overlay byte.
+pub type TouchedRows = [[Cell<u64>; ROW_WORDS]; ODSY_BUFFERS as usize + 1];
+
+/// Slot of the overlay byte in `TouchedRows`.
+pub const TOUCHED_OVERLAY: usize = ODSY_BUFFERS as usize;
+
+/// Note that a draw wrote row y of `slot`.
+#[inline(always)]
+pub fn touch_row(rows: &TouchedRows, slot: usize, y: i32) {
+    if (y as u32) < SGI_ODYSSEY_HEIGHT {
+        let w = &rows[slot][y as usize >> 6];
+        w.set(w.get() | 1 << (y & 63));
+    }
+}
+
+/// The colour rows the raster unit has written since the display last
+/// looked, for the display to resolve those and no others. A row's pixels
+/// show a colour buffer by the window their id plane names and that
+/// window's displayed-buffer bit, so a row written to a buffer is kept by
+/// the windows the draw's id test lets it reach. The overlay shows
+/// whatever the windows do.
+pub struct DrawnRows {
+    by_id: Box<[[[u64; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]; ODSY_BUFFERS as usize]>,
+    overlay: [u64; ROW_WORDS],
+}
+
+impl Default for DrawnRows {
+    fn default() -> Self {
+        DrawnRows { by_id: Box::new([[[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]; ODSY_BUFFERS as usize]), overlay: [0; ROW_WORDS] }
+    }
+}
+
+impl DrawnRows {
+    /// Keep what a draw wrote, which passed the id test `id_compare` (the
+    /// board's 0x840 word) at each pixel it stored.
+    pub fn add(&mut self, touched: &TouchedRows, id_compare: u32) {
+        let value = id_compare as u8;
+        let mask = (id_compare >> ODSY_ID_COMPARE_MASK_SHIFT) as u8;
+
+        for (slot, rows) in touched.iter().enumerate() {
+            if rows.iter().all(|w| w.get() == 0) {
+                continue;
+            }
+            if slot == TOUCHED_OVERLAY {
+                for (o, w) in self.overlay.iter_mut().zip(rows) {
+                    *o |= w.get();
+                }
+                continue;
+            }
+            for id in 0..ODSY_DISPMODE_COUNT {
+                // The main drawable is the id byte's bits 7:3.
+                if id_compare & ODSY_ID_COMPARE_ENABLE != 0 && (((id << ODSY_DID_MAIN_SHIFT) as u8 ^ value) & mask) >> ODSY_DID_MAIN_SHIFT != 0 {
+                    continue;
+                }
+                for (o, w) in self.by_id[slot][id as usize].iter_mut().zip(rows) {
+                    *o |= w.get();
+                }
+            }
+        }
+    }
+
+    /// Hand over the rows that show a change under the displayed-buffer
+    /// bits `displayed`, and forget every row. A row written to a buffer no
+    /// window shows is forgotten too: the window shows it only after a flip
+    /// of its displayed buffer, and that repaints the whole frame.
+    pub fn take(&mut self, displayed: u32, mut row: impl FnMut(u32)) {
+        let mut shown = self.overlay;
+
+        for (b, ids) in self.by_id.iter().enumerate() {
+            for (id, rows) in ids.iter().enumerate() {
+                if (displayed >> id) & 1 == b as u32 {
+                    for (s, w) in shown.iter_mut().zip(rows) {
+                        *s |= w;
+                    }
+                }
+            }
+        }
+        for (i, mut w) in shown.into_iter().enumerate() {
+            while w != 0 {
+                row(i as u32 * 64 + w.trailing_zeros());
+                w &= w - 1;
+            }
+        }
+        for ids in self.by_id.iter_mut() {
+            for rows in ids.iter_mut() {
+                *rows = [0; ROW_WORDS];
+            }
+        }
+        self.overlay = [0; ROW_WORDS];
+    }
+}
+
 /// The raster unit's own state.
 #[derive(Default)]
 pub struct RasterCtx {
     /// The standalone line stipple's phase after the last draw that
     /// carried one.
     pub line_phase: u32,
+    /// The colour rows drawn since the display last looked. A job that
+    /// writes the colour planes records its rows here, or the display never
+    /// resolves them.
+    pub drawn: DrawnRows,
 }
 
 /// One unit of raster work.
@@ -93,6 +193,14 @@ thread_local! {
 /// The planes as the display holds them: no raster job runs meanwhile.
 pub struct PlanesHeld<'a> {
     _ctx: MutexGuard<'a, RasterCtx>,
+}
+
+impl PlanesHeld<'_> {
+    /// The colour rows the raster unit wrote since the last call that show
+    /// a change under the displayed-buffer bits (DrawnRows::take()).
+    pub fn take_rows(&mut self, displayed: u32, row: impl FnMut(u32)) {
+        self._ctx.drawn.take(displayed, row);
+    }
 }
 
 impl Drop for PlanesHeld<'_> {
@@ -128,8 +236,6 @@ pub struct RasterQueue<const HEADS: usize = 1> {
     kick: Condvar,
     idle: Mutex<()>,
     idle_kick: Condvar,
-    /// The raster unit drew since the display last looked.
-    drawn: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Tests: each slice first holds the context lock this long, as a long
     /// draw would.
@@ -163,7 +269,6 @@ impl<const HEADS: usize> Default for RasterQueue<HEADS> {
             kick: Condvar::new(),
             idle: Mutex::new(()),
             idle_kick: Condvar::new(),
-            drawn: AtomicBool::new(false),
             thread: Mutex::new(None),
             #[cfg(test)]
             test_slice_sleep_ms: AtomicU32::new(0),
@@ -214,13 +319,13 @@ impl RasterQueue {
     }
 
     /// Hand a job to the raster unit, behind every job before it. With no
-    /// raster thread it runs now. The caller is the front end, under the
-    /// board lock.
+    /// raster thread it runs now. A job that writes the colour planes
+    /// records the rows it wrote in the context (RasterCtx::drawn). The
+    /// caller is the front end, under the board lock.
     pub fn submit(&self, job: impl FnOnce(&mut RasterCtx) + Send + 'static) {
         if !self.threaded() {
             let mut ctx = self.ctx.lock();
             job(&mut ctx);
-            self.drawn.store(true, SeqCst);
             return;
         }
         let entry = Box::into_raw(Box::new(Box::new(job) as RasterJob)) as u64;
@@ -279,9 +384,7 @@ impl RasterQueue {
     pub fn run_now<R>(&self, job: impl FnOnce(&mut RasterCtx) -> R) -> R {
         self.wait_idle();
         let mut ctx = self.ctx.lock();
-        let r = job(&mut ctx);
-        self.drawn.store(true, SeqCst);
-        r
+        job(&mut ctx)
     }
 
     /// Wait until every job submitted has finished. The display thread,
@@ -316,11 +419,6 @@ impl RasterQueue {
     #[cfg(test)]
     pub fn in_slice(&self) -> bool {
         self.ctx.is_locked()
-    }
-
-    /// Whether the raster unit drew since the last call.
-    pub fn take_drawn(&self) -> bool {
-        self.drawn.swap(false, SeqCst)
     }
 
     /// Start the raster thread.
@@ -395,7 +493,6 @@ impl RasterQueue {
                     let job = unsafe { Box::from_raw(value as *mut RasterJob) };
                     job(&mut ctx);
                 }
-                self.drawn.store(true, SeqCst);
                 if self.pending.fetch_sub(1, SeqCst) == 1 {
                     let _g = self.idle.lock();
                     self.idle_kick.notify_all();
