@@ -98,9 +98,8 @@ const fn cache_op_facts(r10k: bool, cache_op: u32) -> u32 {
     let op = cache_op & 0x1C;
     let sel = cache_op & 3;
     // The R10000 index operations that name a cache entry rather than an
-    // address: they are not translated. The primary Index Load/Store Data
-    // operations select by virtual address, but a mapped one still takes TLB
-    // Refill and Invalid (VR10000 Instruction Set UM p. 15), so they are.
+    // address. They still translate their operand (NEC U12754EJ1V0UMJ1
+    // pp.70, 72), except a Cache Barrier, which names no line.
     let primary_data = r10k
         && (op == C_R10K_ILD || op == C_R10K_ISD)
         && (sel == CACH_PI || sel == CACH_PD);
@@ -110,7 +109,8 @@ const fn cache_op_facts(r10k: bool, cache_op: u32) -> u32 {
             || (op == C_R10K_ISD && (sel == CACH_SI || sel == CACH_SD)));
     let hit_op = op == C_CDX || op == C_HINV || op == C_HWBINV || op == C_HWB || op == C_HSV;
     let mut facts = 0;
-    if primary_data || (!index_op && hit_op) {
+    let cache_barrier = op == C_R10K_CBARRIER && sel == CACH_PI;
+    if if r10k { !cache_barrier } else { hit_op } {
         facts |= FACT_TRANSLATES;
     }
     if op == C_IST || ((index_op || primary_data) && op == C_R10K_ISD) {
@@ -842,6 +842,12 @@ pub trait MipsCache: Send + Sync {
     /// takes them from this register and `Index_Load_Data` returns them
     /// there. Models that do not keep them ignore both of these.
     fn set_cache_ecc(&self, _v: u32) {}
+    /// The translated physical address of the CACHE operand about to be
+    /// passed to `cache_op`. The R10000's secondary index and way come from it
+    /// rather than from the virtual address (NEC U12754EJ1V0UMJ1 pp.14-15).
+    /// Taken by the next `cache_op`, which falls back to the virtual address
+    /// if none was set. Models that index by the virtual address ignore it.
+    fn set_cache_op_pa(&self, _pa: u64) {}
     /// The Status bits that govern cache error checking: CE (store the ECC
     /// register as check bits instead of computing them) and whether errors
     /// are detected at all (neither DE nor ERL set). Pushed by the executor on
@@ -7305,8 +7311,11 @@ mod cache_op_mask_tests {
                         C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
                         _ => false,
                     };
-                let translates = primary_data_op
-                    || (!r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV));
+                let translates = if r10k {
+                    !(op == C_R10K_CBARRIER && sel == CACH_PI)
+                } else {
+                    matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV)
+                };
                 let stores_tag = op == C_IST || ((r10k_index_op || primary_data_op) && op == C_R10K_ISD);
                 let loads_tag = op == C_ILT || (r10k_index_op && op == C_R10K_ILD);
                 let loads_ecc = (r10k && op == C_R10K_ILD)

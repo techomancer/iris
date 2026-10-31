@@ -44,10 +44,11 @@ Dropping any of the first three fails `a_compiled_load_hits_a_staged_line_not_th
   (`STAGED_TAGLO_AT_LOWER_ADDRESS`). Inferred from software, not measured.
 - A store to a staged line makes it DirtyExclusive. NEC U10278EJ4V0UM p.246
   counts such requests; the manual does not state the transition.
+- Every CACHE operand is translated first (exceptions: TLB Refill/Invalid, privilege Address Error, never TLB Modified). The secondary set, way and quadword come from the operand's physical address (`set_cache_op_pa`), the primaries' from its virtual address. An operand on an uncached page is undefined on the R10000 and goes ahead as if cached.
 - Only the R10000 is documented. The R12000, R14000 and R16000 use the same
   tag layout here, which is an inference.
 - Not modelled: predecode, primary-cache staged hits, ECC and check bits, the
-  virtual-index purge, translation of mapped index operands, Status.CH, the
+  virtual-index purge, the BadVAddr/Context/EntryHi values after a CACHE-raised TLB exception, Status.CH, the
   tag rewrite on invalidate (only the state clears), coherence with other CPUs
   and DMA.
 - Staged lines are saved in snapshots (`save_cache_state`). The rest of the
