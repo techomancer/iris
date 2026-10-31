@@ -416,15 +416,29 @@ impl Machine {
         let ci_serial = ci_enabled.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
         let label = format!("{tag} serial channel B");
         let (console, _) = crate::dev::serial_host::serial_line(
-            &crate::dev::serial_host::SerialLine { label: &label, tcp_port: Some(port_b), tcp_setting: "serial_port_b" },
+            &crate::dev::serial_host::SerialLine {
+                label: &label,
+                tcp_port: Some(port_b),
+                tcp_setting: "serial_port_b",
+                socket: cfg.serial_socket_b.as_deref(),
+                socket_setting: "serial_socket_b",
+            },
             serial_log.clone(),
             ci_serial.as_ref(),
         );
         ioc.scc().set_backend_b(console);
         let label = format!("{tag} serial channel A");
+        let log_a = crate::dev::serial_host::open_log_at(
+            &cfg, cfg.serial_log_a.as_deref(), &label, crate::dev::serial_host::LogMode::Append);
         let (channel_a, _) = crate::dev::serial_host::serial_line(
-            &crate::dev::serial_host::SerialLine { label: &label, tcp_port: (!ci_enabled).then_some(port_a), tcp_setting: "serial_port_a" },
-            None,
+            &crate::dev::serial_host::SerialLine {
+                label: &label,
+                tcp_port: (!ci_enabled).then_some(port_a),
+                tcp_setting: "serial_port_a",
+                socket: cfg.serial_socket_a.as_deref(),
+                socket_setting: "serial_socket_a",
+            },
+            log_a,
             None,
         );
         ioc.scc().set_backend_a(channel_a);

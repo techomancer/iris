@@ -1,7 +1,7 @@
 //! The host end of a serial line: where a guest UART's bytes go and where
 //! its input comes from.
 //!
-//! A [`SerialBackend`] is a TCP console, the in-process CI backend, a file
+//! A [`SerialBackend`] is a TCP console, a Unix-socket console, the in-process CI backend, a file
 //! tee, or nothing. Every machine's UARTs (the Indy's Z85C30, the O2's MACE
 //! 16550s, the Octane's IOC3) take one, and [`console_backends`] picks them
 //! for the machines whose consoles are configured the same way.
@@ -62,22 +62,46 @@ impl SerialBackend for TeeBackend {
     }
 }
 
+/// A serial line on a Unix socket at `path`: raw bytes, no telnet, one client
+/// at a time (the next waits in the listen queue until the first hangs up).
+/// What a script wants from a console: it can connect without a free TCP
+/// port, and the socket's directory permissions say who may.
 #[cfg(unix)]
-struct UnixSocketBackend {
+pub(crate) struct UnixSocketBackend {
+    path: std::path::PathBuf,
     listener: UnixListener,
     stream: Mutex<Option<UnixStream>>,
 }
 
 #[cfg(unix)]
 impl UnixSocketBackend {
-    fn new<P: AsRef<Path>>(path: P) -> Self {
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(path).expect("Failed to bind serial socket");
-        listener.set_nonblocking(true).expect("Failed to set nonblocking");
-        Self {
-            listener,
-            stream: Mutex::new(None),
+    /// Bind `path`. A socket file left by an earlier iris is replaced; one
+    /// that something still answers on, or any other kind of file, is an
+    /// error and left alone.
+    pub(crate) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        use std::os::unix::fs::FileTypeExt;
+        let path = path.as_ref().to_path_buf();
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_socket() => {
+                if UnixStream::connect(&path).is_ok() {
+                    return Err(io::Error::new(io::ErrorKind::AddrInUse, "another process is listening on it"));
+                }
+                std::fs::remove_file(&path)?;
+            }
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists and is not a socket")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self { path, listener, stream: Mutex::new(None) })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketBackend {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -96,7 +120,7 @@ impl SerialBackend for UnixSocketBackend {
 
     fn recv_byte(&self) -> io::Result<u8> {
         let mut guard = self.stream.lock();
-        
+
         if guard.is_none() {
             match self.listener.accept() {
                 Ok((socket, _)) => {
@@ -127,6 +151,27 @@ impl SerialBackend for UnixSocketBackend {
         } else {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"))
         }
+    }
+}
+
+/// Several host ends of one serial line (a TCP port and a Unix socket):
+/// the guest's output goes to all of them and its input comes from
+/// whichever has some.
+struct FanoutBackend(Vec<Arc<dyn SerialBackend>>);
+
+impl SerialBackend for FanoutBackend {
+    fn send_byte(&self, byte: u8) {
+        for b in &self.0 {
+            b.send_byte(byte);
+        }
+    }
+    fn recv_byte(&self) -> io::Result<u8> {
+        for b in &self.0 {
+            if let Ok(byte) = b.recv_byte() {
+                return Ok(byte);
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock"))
     }
 }
 
@@ -423,6 +468,29 @@ pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str, mode: Log
     }
 }
 
+/// A serial console on a Unix socket at `path`; see [`UnixSocketBackend`].
+/// Returns `None` when the socket cannot be made, with the reason on stderr,
+/// as a TCP port that is taken does.
+#[cfg(unix)]
+pub fn unix_serial_backend(path: &str, label: &str, setting: &str) -> Option<Arc<dyn SerialBackend>> {
+    match UnixSocketBackend::new(path) {
+        Ok(b) => {
+            eprintln!("iris: {label} on socket {path}");
+            Some(Arc::new(b))
+        }
+        Err(e) => {
+            eprintln!("iris: {label}: socket {path}: {e} ({setting})");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn unix_serial_backend(path: &str, label: &str, setting: &str) -> Option<Arc<dyn SerialBackend>> {
+    eprintln!("iris: {label}: socket {path}: Unix sockets need a Unix host ({setting})");
+    None
+}
+
 /// Where one serial line is served on the host.
 pub struct SerialLine<'a> {
     /// Names the line in messages, e.g. "Octane serial port 1".
@@ -431,31 +499,39 @@ pub struct SerialLine<'a> {
     pub tcp_port: Option<u16>,
     /// The setting that chose `tcp_port`, for the message when it is taken.
     pub tcp_setting: &'a str,
+    /// A Unix socket to serve the line on as well, from the `socket_setting`
+    /// key.
+    pub socket: Option<&'a str>,
+    pub socket_setting: &'a str,
 }
 
-/// Wire one serial line: TCP on `tcp_port`, teed to `log`. The line that
-/// carries the CI control socket's console (`ci`) is not served on TCP (so
-/// several `--ci` instances coexist). Returns the backend, and whether a
-/// host end could be made; without one the backend only logs.
+/// Wire one serial line: TCP on `tcp_port` plus the Unix socket when one is
+/// set, teed to `log`. The line that carries the CI control socket's console
+/// (`ci`) is not served on TCP (so several `--ci` instances coexist); with a
+/// socket, its output goes to both the control socket's buffer and the
+/// socket, and either may type. Returns the backend, and whether a host end
+/// could be made; without one the backend only logs.
 pub fn serial_line(
     line: &SerialLine,
     log: Option<Arc<SerialLog>>,
     ci: Option<&Arc<CiSerialBackend>>,
 ) -> (Arc<dyn SerialBackend>, bool) {
+    let socket = line.socket.and_then(|path| unix_serial_backend(path, line.label, line.socket_setting));
     if let Some(ci) = ci {
         if let Some(log) = log {
             ci.set_log(log);
         }
-        return (ci.clone(), true);
+        return match socket {
+            Some(socket) => (Arc::new(FanoutBackend(vec![ci.clone(), socket])), true),
+            None => (ci.clone(), true),
+        };
     }
-    let mut backend = null_serial_backend();
-    let mut served = false;
+    let mut ends: Vec<Arc<dyn SerialBackend>> = Vec::new();
     if let Some(port) = line.tcp_port {
         match tcp_serial_backend(port) {
             Some((b, p)) => {
                 eprintln!("iris: {} on 127.0.0.1:{p}", line.label);
-                backend = b;
-                served = true;
+                ends.push(b);
             }
             None => eprintln!(
                 "iris: {}: port {port} unavailable; is another iris using it? ({})",
@@ -463,6 +539,13 @@ pub fn serial_line(
             ),
         }
     }
+    ends.extend(socket);
+    let served = !ends.is_empty();
+    let backend: Arc<dyn SerialBackend> = match ends.len() {
+        0 => null_serial_backend(),
+        1 => ends.remove(0),
+        _ => Arc::new(FanoutBackend(ends)),
+    };
     match log {
         Some(log) => (Arc::new(TeeBackend::new(backend, log)), served),
         None => (backend, served),
@@ -473,8 +556,10 @@ pub fn serial_line(
 ///
 /// The console is the CI backend in CI mode, otherwise TCP on
 /// `serial_port_a` (nothing, if the port is taken), either teed to
-/// `serial_log`. The second port serves TCP on `serial_port_b`, or is `None`
-/// when that port is taken, so the caller leaves it unwired.
+/// `serial_log`. The second port serves TCP on `serial_port_b`, teed to
+/// `serial_log_b`, or is `None` when nothing could serve it, so the caller
+/// leaves it unwired. Each also takes a Unix socket, `serial_socket_a` and
+/// `serial_socket_b`.
 pub fn console_backends(
     cfg: &MachineConfig,
     tag: &str,
@@ -484,14 +569,27 @@ pub fn console_backends(
     let log = open_log(cfg, tag, LogMode::Fresh);
     let label = format!("{tag} serial port 1");
     let (console, _) = serial_line(
-        &SerialLine { label: &label, tcp_port: Some(port_a), tcp_setting: "serial_port_a" },
+        &SerialLine {
+            label: &label,
+            tcp_port: Some(port_a),
+            tcp_setting: "serial_port_a",
+            socket: cfg.serial_socket_a.as_deref(),
+            socket_setting: "serial_socket_a",
+        },
         log,
         ci,
     );
     let label = format!("{tag} serial port 2");
+    let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label, LogMode::Fresh);
     let (second, served) = serial_line(
-        &SerialLine { label: &label, tcp_port: Some(port_b), tcp_setting: "serial_port_b" },
-        None,
+        &SerialLine {
+            label: &label,
+            tcp_port: Some(port_b),
+            tcp_setting: "serial_port_b",
+            socket: cfg.serial_socket_b.as_deref(),
+            socket_setting: "serial_socket_b",
+        },
+        log,
         None,
     );
     (console, served.then_some(second))
@@ -537,7 +635,7 @@ mod tests {
         let log_path = dir.join("tcp.log");
         let log = SerialLog::create(&log_path, Default::default()).unwrap();
         let (backend, served) = serial_line(
-            &SerialLine { label: "Test", tcp_port: Some(0), tcp_setting: "port" },
+            &SerialLine { label: "Test", tcp_port: Some(0), tcp_setting: "port", socket: None, socket_setting: "socket" },
             Some(log),
             None,
         );
@@ -548,7 +646,7 @@ mod tests {
         let log_path = dir.join("none.log");
         let log = SerialLog::create(&log_path, Default::default()).unwrap();
         let (backend, served) = serial_line(
-            &SerialLine { label: "Test", tcp_port: None, tcp_setting: "port" },
+            &SerialLine { label: "Test", tcp_port: None, tcp_setting: "port", socket: None, socket_setting: "socket" },
             Some(log),
             None,
         );
@@ -556,6 +654,158 @@ mod tests {
         backend.send_byte(b'n');
         assert_eq!(std::fs::read(&log_path).unwrap(), b"n");
         assert!(backend.recv_byte().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("iris-serial-host-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Read from a socket until `want` has arrived, a second at most.
+    #[cfg(unix)]
+    fn read_until(stream: &mut UnixStream, want: &[u8]) -> Vec<u8> {
+        stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut got = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !got.windows(want.len()).any(|w| w == want) && Instant::now() < deadline {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = stream.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+        }
+        got
+    }
+
+    /// A console on a Unix socket sends the guest's bytes to the client and
+    /// takes the client's, alongside its TCP port, and both go to the log.
+    #[cfg(unix)]
+    #[test]
+    fn a_console_is_served_on_a_unix_socket_beside_its_tcp_port() {
+        let dir = temp_dir("socket");
+        let sock = dir.join("console.sock");
+        let log_path = dir.join("console.log");
+        let log = SerialLog::create(&log_path, Default::default()).unwrap();
+        let path = sock.to_string_lossy().into_owned();
+        let (backend, served) = serial_line(
+            &SerialLine { label: "Test", tcp_port: Some(0), tcp_setting: "port", socket: Some(&path), socket_setting: "socket" },
+            Some(log),
+            None,
+        );
+        assert!(served);
+
+        let mut client = UnixStream::connect(&sock).unwrap();
+        // The socket accepts on the guest's receive poll.
+        let _ = backend.recv_byte();
+        client.write_all(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let typed = loop {
+            match backend.recv_byte() {
+                Ok(b) => break b,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("no input from the socket: {e}"),
+            }
+        };
+        assert_eq!(typed, b'x');
+
+        for b in b"login: " {
+            backend.send_byte(*b);
+        }
+        assert_eq!(read_until(&mut client, b"login: "), b"login: ");
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"login: ");
+
+        drop(backend);
+        assert!(!sock.exists(), "the socket file goes with the backend");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A socket file an earlier run left is replaced; a live one, and a file
+    /// that is not a socket, are refused and left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_serial_socket_replaces_a_stale_one_and_spares_other_files() {
+        let dir = temp_dir("stale");
+        let sock = dir.join("s.sock");
+        let stale = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(stale);
+        assert!(sock.exists(), "a dead listener leaves its file");
+        let live = UnixSocketBackend::new(&sock).expect("a stale socket is replaced");
+        assert_eq!(UnixSocketBackend::new(&sock).err().map(|e| e.kind()), Some(io::ErrorKind::AddrInUse));
+        drop(live);
+
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "keep").unwrap();
+        assert_eq!(UnixSocketBackend::new(&plain).err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(&plain).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the control socket and a console socket both in play, the guest's
+    /// output reaches the socket, the log and the control socket's buffer,
+    /// and typing works from either.
+    #[cfg(unix)]
+    #[test]
+    fn a_ci_console_on_a_socket_still_feeds_the_control_buffer() {
+        let dir = temp_dir("ci");
+        let sock = dir.join("console.sock");
+        let log_path = dir.join("console.log");
+        let mut cfg = MachineConfig::default();
+        cfg.serial_log = Some(log_path.to_string_lossy().into_owned());
+        cfg.serial_port_a = Some(0);
+        cfg.serial_port_b = Some(0);
+        cfg.serial_socket_a = Some(sock.to_string_lossy().into_owned());
+
+        let ci = Arc::new(CiSerialBackend::new());
+        let (console, _) = console_backends(&cfg, "Test", Some(&ci));
+        let mut client = UnixStream::connect(&sock).unwrap();
+        let _ = console.recv_byte();
+        console.send_byte(b'k');
+        assert_eq!(read_until(&mut client, b"k"), b"k");
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"k");
+        assert_eq!(ci.drain_guest(), b"k");
+
+        ci.push_host(b"c");
+        assert_eq!(console.recv_byte().unwrap(), b'c');
+        client.write_all(b"s").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let typed = loop {
+            match console.recv_byte() {
+                Ok(b) => break b,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("no input from the socket: {e}"),
+            }
+        };
+        assert_eq!(typed, b's');
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second port has its own log and socket; with neither TCP nor a
+    /// socket to serve it, it is left unwired.
+    #[cfg(unix)]
+    #[test]
+    fn the_second_port_has_its_own_socket_and_log() {
+        let dir = temp_dir("second");
+        let sock = dir.join("b.sock");
+        let log_path = dir.join("b.log");
+        let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut cfg = MachineConfig::default();
+        cfg.serial_port_a = Some(0);
+        cfg.serial_port_b = Some(busy.local_addr().unwrap().port());
+        let (_, second) = console_backends(&cfg, "Test", None);
+        assert!(second.is_none(), "a taken port with no socket leaves the port unwired");
+
+        cfg.serial_socket_b = Some(sock.to_string_lossy().into_owned());
+        cfg.serial_log_b = Some(log_path.to_string_lossy().into_owned());
+        let (_, second) = console_backends(&cfg, "Test", None);
+        let second = second.expect("the socket serves the port");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        let _ = second.recv_byte();
+        second.send_byte(b'b');
+        assert_eq!(read_until(&mut client, b"b"), b"b");
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"b");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

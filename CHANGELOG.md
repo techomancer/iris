@@ -27,6 +27,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
 
+### Serial consoles on Unix sockets
+
+- **`serial_socket_a` and `serial_socket_b`** serve a serial line on a Unix
+  socket as well as its TCP port, on the Indy, Indigo2, Octane and O2;
+  `--serial-socket-a` and `--serial-socket-b` set them. A script can connect
+  without a free TCP port. With `ci` the control socket's `serial-read` and
+  `wait-serial` keep working. `serial_log_a` and `serial_log_b`
+  (`--serial-log-a`, `--serial-log-b`) log the line that is not the console.
+  See [HELP.md](HELP.md#serial-ports).
+- The Indy and Indigo2 serial lines are installed by the machine like the
+  others'. A busy port now prints "iris: Indy serial channel B: port 8881
+  unavailable; is another iris using it? (serial_port_b)", each channel
+  prints where it listens, and an Indigo2 is named as such.
+
 ### Debugging on two CPUs is unsupported
 
 - Stepping one CPU of two cannot keep the guest healthy, whichever way the other
