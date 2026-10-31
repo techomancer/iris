@@ -563,6 +563,34 @@ fn a_gl_copy_moves_pixels_between_an_object_and_the_drawables() {
     assert_eq!(s.object_load(obj, 5, 1), 0x0a0b_0c0d);
 }
 
+/// A copy from the window into an object lists the rectangle's rows
+/// bottom first. glReadPixels and glCopyTexImage copy the window into an
+/// object (block 0x2031 with the source at the rectangle's top row,
+/// operands replayed from a guest trace) and then read the object top row
+/// first, with no bottom-up bit, yet expect the lowest row of the
+/// rectangle first. Before this the host got the top row where it wanted
+/// the bottom one.
+#[test]
+fn a_copy_from_the_window_into_an_object_lists_the_rows_bottom_first() {
+    let (mut s, _) = window();
+    let base = 0x16b000;
+    let obj = s.object_select(base, 16);
+    assert!(obj >= 0);
+    // A 2x3 rectangle at (20, 221) down: row n holds n in its low byte.
+    for y in 0..3 {
+        for x in 0..2 {
+            pixel_write(&mut s, 20 + x, 221 + y, (x as u32) << 8 | y as u32);
+        }
+    }
+    s.draw_mask = 4;
+    copy_block(&mut s, [0x3000_0019, 221 << 16 | 20, 0x8020_0050, 3 << 16 | 2, 0x9263_3042, base, 0, 0x3802_204b]);
+    for y in 0..3u32 {
+        for x in 0..2u32 {
+            assert_eq!(s.object_load(obj, x, y), x << 8 | (2 - y), "object ({x}, {y})");
+        }
+    }
+}
+
 /// The read buffer register (0x609) names the drawable a read comes from.
 fn bind_read_drawable(s: &mut Board, word: u32) {
     cmd(s, select(ODSY_SWAP_SYNC_B));

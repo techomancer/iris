@@ -369,6 +369,15 @@ impl Board {
     /// rectangle copy (Board::copy_rect()). False when an operand names an
     /// object that is not there or does not fit, so the block is reported.
     ///
+    /// A copy from the window into an object lists the rectangle's rows
+    /// bottom first: the library reads such an object top row first, with no
+    /// bottom-up bit, and expects the lowest row of the rectangle first (the
+    /// way a window read asks for it). OBSERVED in guest traces of
+    /// glReadPixels of 16-bit types and glCopyTexImage, where the host got
+    /// the rectangle's top row. INFERRED to be the board's copy rule: no
+    /// header bit the datasheet records selects it. The other directions
+    /// keep the rows in the order they are held.
+    ///
     /// The source is staged first, so an overlapping copy needs no direction.
     /// Words move as the planes hold them: a colour pixel keeps its alpha and
     /// an index copies as the raw index. The read header's class, code and
@@ -398,7 +407,9 @@ impl Board {
         for y in 0..h {
             for x in 0..w {
                 words.push(if from_window {
-                    let (px, py) = ((c.src.0 + x) as i64 + self.read_origin[0] as i64, (c.src.1 + y) as i64 + self.read_origin[1] as i64);
+                    // Into an object the window's rows go bottom first.
+                    let row = if dest >= 0 { h - 1 - y } else { y };
+                    let (px, py) = ((c.src.0 + x) as i64 + self.read_origin[0] as i64, (c.src.1 + row) as i64 + self.read_origin[1] as i64);
 
                     if px < 0 || py < 0 || px >= SGI_ODYSSEY_WIDTH as i64 || py >= SGI_ODYSSEY_HEIGHT as i64 {
                         0
