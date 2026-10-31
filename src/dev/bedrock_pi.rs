@@ -193,6 +193,9 @@ pub trait NodeHooks: Send + Sync {
         false
     }
     fn gfx_reset(&self) {}
+    /// Software cleared graphics interrupt bit 1 + `slot` of bank 0 through
+    /// the pending-modify register: the processor took it.
+    fn gfx_interrupt_taken(&self, _slot: usize) {}
 }
 struct State {
     w: [u64; 160],
@@ -593,6 +596,7 @@ impl BedrockPi {
         let now = (self.clock)();
         let mut s = self.state.lock();
         s.sync(now);
+        let mut taken = None;
         let mut alias = None;
         let mut compare = None;
         let mut enable = None;
@@ -633,6 +637,10 @@ impl BedrockPi {
             reg::PENDING_MODIFY | reg::PENDING_MODIFY_B => {
                 let now = s.time(now);
                 s.modify(value, true, now);
+                // A clear (bit 8) of bank 0 (bit 6) of a graphics bit.
+                if value & 0x140 == 0 && matches!(value & 0x3f, 1 | 2) {
+                    taken = Some((value & 0x3f) as usize - 1);
+                }
             }
             reg::REQUEST_A | reg::REQUEST_B => s.w[off as usize / 8] |= 1 << self.cfg.request_region,
             reg::PENDING_A_CLEAR | reg::PENDING_B_CLEAR => s.w[(off - reg::OFFSET_0010) as usize / 8] &= !value,
@@ -712,6 +720,9 @@ impl BedrockPi {
             }
             if let Some(slot) = nmi {
                 h.nmi(self.cfg.interface, slot);
+            }
+            if let Some(slot) = taken {
+                h.gfx_interrupt_taken(slot);
             }
         }
         self.drive();

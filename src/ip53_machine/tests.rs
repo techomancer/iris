@@ -548,3 +548,83 @@ fn the_board_settles_the_v12s_owed_credits_on_a_map_write() {
     link.repay_credits(12, 2);
     assert_eq!(pi.read64(0x308).data, 110);
 }
+
+fn stalled_gfx(credits: u64, bias: u64) -> (BedrockGfx, Arc<std::sync::atomic::AtomicU64>) {
+    use crate::dev::odyssey::{PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_PAGE, PI_GFX_PAGE_ENABLE};
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let mut g = BedrockGfx::new(Arc::new(move || clock.load(Ordering::SeqCst)));
+    g.write(PI_GFX_PAGE, PI_GFX_PAGE_ENABLE | GFX_PAGE);
+    g.write(PI_GFX_CREDIT, credits);
+    g.write(PI_GFX_BIAS, bias);
+    (g, now)
+}
+
+const GFX_PAGE: u64 = 0x0140_0000;
+
+/// Follows sn1/pi-gfx/stall-below-bias: below the bias the slot stops and
+/// its next counted store waits, uncounted, until credits lift the counter
+/// above the bias or the processor takes the interrupt; each counted store
+/// below the bias asks for the interrupt again. Stores outside the page
+/// and the other slot go on.
+#[test]
+fn a_slot_below_its_bias_holds_its_next_store() {
+    use crate::dev::odyssey::{PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_INT_COUNT};
+    let (mut g, _) = stalled_gfx(6, 5);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: false }, "at the bias");
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held);
+    assert_eq!(g.read(PI_GFX_CREDIT), 4, "a held store is not counted");
+    assert_eq!(g.store(0, 0x0142_0158), Store::Uncounted);
+    assert_eq!(g.store(1, GFX_PAGE), Store::Uncounted);
+    g.add_credits(0, 1);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held, "5 is not above the bias");
+    g.add_credits(0, 1);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: false });
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    g.taken(0);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true }, "taken: goes at once");
+    g.write(PI_GFX_INT_COUNT, 0);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true }, "the handler's counter write");
+    g.write(PI_GFX_BIAS, 0);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: false }, "a lower bias");
+}
+
+/// The hold is bounded, as QEMU's is, so a slot nobody releases cannot
+/// stop its processor for good.
+#[test]
+fn a_held_store_goes_after_the_limit() {
+    use crate::dev::odyssey::PI_GFX_CREDIT;
+    let (mut g, now) = stalled_gfx(3, 5);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    now.store(10, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held);
+    now.store(10 + STALL_LIMIT_NS - 1, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held);
+    now.store(10 + STALL_LIMIT_NS, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    assert_eq!(g.read(PI_GFX_CREDIT), 1);
+    now.store(20 + STALL_LIMIT_NS, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held, "and stops again");
+}
+
+/// On the board a held store is answered busy without reaching the V12,
+/// and the PI's pending-modify clear of the slot's graphics bit, which the
+/// processor's interrupt handler makes, lets the next one go.
+#[test]
+fn the_board_holds_pi0s_store_below_the_bias_until_the_interrupt_is_taken() {
+    use crate::dev::odyssey::{PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE};
+    let board = board_with_v12(4);
+    let (pi, bus) = (&board.node.pi[0], &board.node.bus);
+    let page = widget(12, ODSY_CMD_FIFO) & PI_GFX_PAGE_ADDRESS;
+    assert_eq!(pi.write64(0x300, PI_GFX_PAGE_ENABLE | page), BUS_OK);
+    assert_eq!(pi.write64(0x308, 1000), BUS_OK);
+    assert_eq!(pi.write64(0x310, 1000), BUS_OK, "slot A's bias");
+    let io_view = 1u64 << 57;
+    let store = || bus.write64(io_view | widget(12, ODSY_CMD_FIFO), 0x0001_0046);
+    assert_eq!(store(), BUS_OK, "999 is below the bias: the slot stops");
+    assert_eq!(store(), crate::traits::BUS_BUSY);
+    assert_eq!(pi.read64(0x308).data, 999, "held, not counted; no map entry returns credits");
+    assert_eq!(pi.write64(0x90, 1), BUS_OK, "pending-modify: clear bit 1");
+    assert_eq!(store(), BUS_OK);
+}

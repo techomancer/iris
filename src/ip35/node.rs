@@ -540,11 +540,23 @@ impl BusDevice for WidgetDma {
     widget_dma_access!(read64, write64, u64, BusRead64, 8);
 }
 
+/// What the processor interface does with a processor's uncached store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Store {
+    /// Outside the slot's enabled graphics page.
+    Uncounted,
+    /// Counted; `below_bias` asks for the slot's graphics interrupt.
+    Counted { below_bias: bool },
+    /// The slot is stopped: the store waits, uncounted.
+    Held,
+}
+
 /// The processor interface's count of uncached I/O stores against a
 /// graphics page (see [`crate::dev::odyssey::PiGfx`]).
 pub(crate) trait StoreCounter: Send + Sync {
-    /// Whether the store at node I/O offset `address` is counted.
-    fn count(&self, address: u64) -> bool;
+    /// The store at node I/O offset `address`: uncounted, counted, or held
+    /// and answered busy without being forwarded.
+    fn count(&self, address: u64) -> Store;
     /// A counted store the bus answered busy did not happen: the processor
     /// will make it again, and pays for it then.
     fn refund(&self, address: u64);
@@ -567,7 +579,11 @@ macro_rules! pio_access {
         }
         fn $w(&self, a: u64, v: $ty) -> u32 {
             let counter = self.counter.get();
-            let counted = counter.is_some_and(|c| c.count(a));
+            let counted = match counter.map_or(Store::Uncounted, |c| c.count(a)) {
+                Store::Held => return BUS_BUSY,
+                Store::Counted { .. } => true,
+                Store::Uncounted => false,
+            };
             let previous = pi_gfx_mark_store(counted);
             let status = self.io.pio_write(a, $size, v as u64);
             pi_gfx_unmark_store(previous);

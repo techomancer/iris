@@ -79,7 +79,10 @@ use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::L1Config;
-use crate::dev::odyssey::{Odyssey, PacketSender, PiGfx, PiGfxLink, PI_GFX_CREDIT_MASK, PI_GFX_REGS};
+use crate::dev::odyssey::{
+    Odyssey, PacketSender, PiGfx, PiGfxLink, PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_CREDIT_MASK, PI_GFX_INT_COUNT,
+    PI_GFX_REGS, PI_GFX_SLOTS, PI_GFX_SLOT_REGS,
+};
 use crate::dev::pic::{Function, Pic, PicPeer, Refused};
 use crate::dev::pxbow::Pxbow;
 use crate::dev::prom_image;
@@ -90,7 +93,7 @@ use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
 use crate::ip35::CPU_PHYS_MASK;
-use crate::ip35::node::{connect_cpu, connect_serial_ports, Node, NodeConfig, SerialPort, StoreCounter, WidgetDma};
+use crate::ip35::node::{connect_cpu, connect_serial_ports, Node, NodeConfig, SerialPort, Store, StoreCounter, WidgetDma};
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
@@ -567,7 +570,7 @@ pub(crate) struct TezroBoard {
     /// The VPro V12, when the board has one.
     pub v12: Option<Arc<Odyssey>>,
     /// Each PI's graphics flow-control registers.
-    pub gfx: [Arc<Mutex<PiGfx>>; 2],
+    pub gfx: [Arc<Mutex<BedrockGfx>>; 2],
     /// The status bar's activity bits and the CPU's Compare matches, which
     /// the graphics board shows.
     pub heartbeat: Arc<AtomicU64>,
@@ -635,7 +638,7 @@ impl TezroBoard {
         let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
         node.io.connect_widget(0, pxbow.widget_zero());
         node.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
-        let gfx: [Arc<Mutex<PiGfx>>; 2] = std::array::from_fn(|_| Arc::new(Mutex::new(PiGfx::default())));
+        let gfx: [Arc<Mutex<BedrockGfx>>; 2] = std::array::from_fn(|_| Arc::new(Mutex::new(BedrockGfx::new(clock.clone()))));
         for (pi, gfx) in node.pi.iter().zip(&gfx) {
             pi.set_node_hooks(Arc::new(GfxHooks(gfx.clone())));
         }
@@ -725,7 +728,7 @@ impl TezroBoard {
             pic.power_on();
         }
         for gfx in &self.gfx {
-            *gfx.lock() = PiGfx::default();
+            gfx.lock().reset();
         }
         if let Some(v12) = &self.v12 {
             v12.power_on();
@@ -796,8 +799,119 @@ impl Drop for TezroBoard {
 /// behind the same PXBOW is inferred, not established.
 const V12_WIDGET: u8 = 12;
 
+/// The longest a stopped slot holds a store before letting it go.
+const STALL_LIMIT_NS: u64 = 1_000_000_000;
+
+/// One Bedrock PI's graphics flow control: the register block, and the
+/// Bedrock's stop below the bias. A counted store that leaves the counter
+/// below the bias raises the slot's graphics interrupt and stops the slot:
+/// its next counted store waits until the processor has taken the
+/// interrupt, software has written the counter, the bias or the interrupt
+/// count, or returned credits have lifted the counter above the bias (the
+/// SN1 header's credit-counter comment, as QEMU's Bedrock models it). A
+/// waiting store is answered busy, so the processor makes it again; it is
+/// counted once, when it goes.
+///
+/// Approximations: whether the edge is below the bias or at it is unknown;
+/// below, QEMU's reading. How long the chip holds a store is unknown: after
+/// STALL_LIMIT_NS of host time the hold ends and is logged, QEMU's bound. A
+/// held processor here retries the store and can take an interrupt between
+/// attempts, where the chip holds the store itself.
+pub(crate) struct BedrockGfx {
+    regs: PiGfx,
+    /// When each slot's waiting store was first held.
+    held_since: [Option<u64>; PI_GFX_SLOTS],
+    clock: Clock,
+}
+
+impl BedrockGfx {
+    fn new(clock: Clock) -> Self {
+        Self { regs: PiGfx::default(), held_since: [None; PI_GFX_SLOTS], clock }
+    }
+
+    fn reset(&mut self) {
+        self.regs = PiGfx::default();
+        self.held_since = [None; PI_GFX_SLOTS];
+    }
+
+    fn read(&self, n: u32) -> u64 {
+        self.regs.read(n)
+    }
+
+    fn write(&mut self, n: u32, value: u64) {
+        self.regs.write(n, value);
+        let slot = (n / PI_GFX_SLOT_REGS) as usize;
+        match n % PI_GFX_SLOT_REGS {
+            PI_GFX_CREDIT | PI_GFX_BIAS => self.release_if_above(slot),
+            // IRIX's graphics interrupt handler zeroes it.
+            PI_GFX_INT_COUNT => self.release(slot),
+            _ => {}
+        }
+    }
+
+    /// A store `slot`'s processor makes at I/O offset `address`.
+    fn store(&mut self, slot: usize, address: u64) -> Store {
+        if !self.regs.covers(slot, address) {
+            return Store::Uncounted;
+        }
+        if self.regs.stopped[slot] {
+            let now = (self.clock)();
+            let since = *self.held_since[slot].get_or_insert(now);
+            if now.saturating_sub(since) < STALL_LIMIT_NS {
+                return Store::Held;
+            }
+            dlog!(
+                LogModule::Bedrock,
+                "PI graphics slot {} held for {} ms with the counter at {:#x} and the interrupt not taken; letting the store go",
+                slot_name(slot),
+                STALL_LIMIT_NS / 1_000_000,
+                self.regs.credit[slot]
+            );
+            self.release(slot);
+        }
+        self.regs.count_store(slot, address, "Tezro PI");
+        let below_bias = self.regs.credit[slot] < self.regs.bias[slot];
+        if below_bias {
+            self.regs.stopped[slot] = true;
+        }
+        Store::Counted { below_bias }
+    }
+
+    /// The processor took the slot's graphics interrupt.
+    fn taken(&mut self, slot: usize) {
+        self.release(slot);
+    }
+
+    /// Put back exactly the credit a count took. Unlike a returned credit
+    /// this never wraps the counter up, since it only undoes a count.
+    fn refund(&mut self, slot: usize) {
+        self.regs.credit[slot] = (self.regs.credit[slot] + 1) & PI_GFX_CREDIT_MASK;
+        self.release_if_above(slot);
+    }
+
+    fn add_credits(&mut self, slot: usize, credits: u32) {
+        self.regs.add_credits(slot, credits, "Tezro PI");
+        self.release_if_above(slot);
+    }
+
+    fn release(&mut self, slot: usize) {
+        self.regs.stopped[slot] = false;
+        self.held_since[slot] = None;
+    }
+
+    fn release_if_above(&mut self, slot: usize) {
+        if self.regs.credit[slot] > self.regs.bias[slot] {
+            self.release(slot);
+        }
+    }
+}
+
+fn slot_name(slot: usize) -> char {
+    (b'A' + slot as u8) as char
+}
+
 /// A PI's graphics flow-control registers, served from its block.
-struct GfxHooks(Arc<Mutex<PiGfx>>);
+struct GfxHooks(Arc<Mutex<BedrockGfx>>);
 impl NodeHooks for GfxHooks {
     fn gfx_read(&self, index: usize) -> Option<u64> {
         (index < PI_GFX_REGS as usize).then(|| self.0.lock().read(index as u32))
@@ -810,7 +924,10 @@ impl NodeHooks for GfxHooks {
         true
     }
     fn gfx_reset(&self) {
-        *self.0.lock() = PiGfx::default();
+        self.0.lock().reset();
+    }
+    fn gfx_interrupt_taken(&self, slot: usize) {
+        self.0.lock().taken(slot);
     }
 }
 
@@ -828,14 +945,14 @@ impl NodeHooks for GfxHooks {
 /// slower than the real one, not a known property of the I/O interface.
 struct NodeCredits {
     io: Weak<BedrockIo>,
-    gfx: [Arc<Mutex<PiGfx>>; 2],
+    gfx: [Arc<Mutex<BedrockGfx>>; 2],
     owed: Mutex<OwedCredits>,
 }
 impl NodeCredits {
     /// Credits from `widget`, to the slot `map` names.
     fn route(&self, map: [u64; 2], widget: u8, n: u32) {
         match gfx_route(map, widget) {
-            Some(r) if r.node == 0 => self.gfx[r.interface].lock().add_credits(r.slot, n, "Tezro PI"),
+            Some(r) if r.node == 0 => self.gfx[r.interface].lock().add_credits(r.slot, n),
             other => dlog!(LogModule::Bedrock, "Tezro: {n} V12 credits for widget {widget} have no local route ({other:?})"),
         }
     }
@@ -911,7 +1028,7 @@ impl OwedCredits {
 fn fit_v12(
     node: &Node,
     pxbow: &Arc<Pxbow>,
-    gfx: &[Arc<Mutex<PiGfx>>; 2],
+    gfx: &[Arc<Mutex<BedrockGfx>>; 2],
     status: &Arc<crate::disp::StatusSource>,
     graphics_pool: (usize, u32),
 ) -> Result<Arc<Odyssey>, String> {
@@ -954,29 +1071,19 @@ fn fit_v12(
 /// processor that runs.
 struct Cpu0Stores {
     pi: Arc<BedrockPi>,
-    gfx: Arc<Mutex<PiGfx>>,
+    gfx: Arc<Mutex<BedrockGfx>>,
 }
 impl StoreCounter for Cpu0Stores {
-    fn count(&self, address: u64) -> bool {
-        let (counted, starved) = {
-            let mut g = self.gfx.lock();
-            let counted = g.count_store(0, address, "Tezro PI0");
-            (counted, counted && g.take_starved(0, "Tezro PI0"))
-        };
-        if starved {
+    fn count(&self, address: u64) -> Store {
+        let store = self.gfx.lock().store(0, address);
+        if store == (Store::Counted { below_bias: true }) {
             // The slot's graphics interrupt: bit 1 + slot of bank 0.
             self.pi.set_pending(0, 1);
         }
-        counted
+        store
     }
-    /// Put back exactly the credit the count took. Unlike a returned credit
-    /// this never wraps the counter up, since it only undoes a count.
     fn refund(&self, _address: u64) {
-        let mut g = self.gfx.lock();
-        g.credit[0] = (g.credit[0] + 1) & PI_GFX_CREDIT_MASK;
-        if g.credit[0] > g.bias[0] {
-            g.starved[0] = false;
-        }
+        self.gfx.lock().refund(0);
     }
 }
 
