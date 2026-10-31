@@ -375,12 +375,18 @@ pub struct BlockSkeleton {
 /// generated code `speed` produces.
 static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(feature = "developer"));
 
-/// Whether Cranelift runs its IR verifier on every compile. Cranelift turns
-/// it on unless told otherwise. It only checks this codegen's own IR and
-/// never changes the emitted code, but it is a large share of compile time,
-/// and the guest interprets every page still waiting for the compile thread.
-/// Tests and `developer` builds keep it.
-const CODEGEN_VERIFY_IR: bool = cfg!(any(test, feature = "developer"));
+/// Whether Cranelift runs its IR verifier on every compile. It only checks
+/// this codegen's own IR and never changes the emitted code, but it is a large
+/// share of compile time, and the guest interprets every page still waiting
+/// for the compile thread. On in unit tests and `developer` builds; elsewhere
+/// (including integration tests and bins such as `jitv2-verify`) set
+/// `IRIS_JIT_VERIFY=1` to get a panic at compile time instead of a miscompile.
+fn verify_ir_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(any(test, feature = "developer")) || matches!(std::env::var("IRIS_JIT_VERIFY").as_deref(), Ok("1") | Ok("on"))
+    })
+}
 
 /// How many consecutive head instructions may share ONE pending-interrupt
 /// check (`emit_pending_interrupt_preamble`) instead of each paying its own.
@@ -546,7 +552,7 @@ impl Codegen {
         std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
         crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
     ) {
-        Self::new_module_verifying(shared, state, CODEGEN_VERIFY_IR)
+        Self::new_module_verifying(shared, state, verify_ir_enabled())
     }
 
     fn new_module_verifying(
@@ -10930,7 +10936,7 @@ mod tests {
             code
         };
         assert_eq!(compile(true), compile(false), "the verifier must not change the emitted code");
-        const { assert!(CODEGEN_VERIFY_IR, "test builds keep the verifier") };
+        assert!(verify_ir_enabled(), "test builds keep the verifier");
     }
 
     #[test]
