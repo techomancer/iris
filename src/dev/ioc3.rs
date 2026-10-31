@@ -2856,23 +2856,23 @@ impl PciFunction for Ioc3 {
 // was waiting out. Deadlines are encoded as nanoseconds left plus one,
 // zero for none.
 
-fn until(due: Option<Instant>, now: Instant) -> u64 {
+pub(crate) fn until(due: Option<Instant>, now: Instant) -> u64 {
     due.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
 }
 
-fn due(left: u64, now: Instant) -> Option<Instant> {
+pub(crate) fn due(left: u64, now: Instant) -> Option<Instant> {
     (left != 0).then(|| now + Duration::from_nanos(left - 1))
 }
 
-fn span(d: Option<Duration>) -> u64 {
+pub(crate) fn span(d: Option<Duration>) -> u64 {
     d.map_or(0, |d| d.as_nanos() as u64 + 1)
 }
 
-fn unspan(n: u64) -> Option<Duration> {
+pub(crate) fn unspan(n: u64) -> Option<Duration> {
     (n != 0).then(|| Duration::from_nanos(n - 1))
 }
 
-fn usize_field(v: &toml::Value, key: &str, limit: usize) -> Result<usize, String> {
+pub(crate) fn usize_field(v: &toml::Value, key: &str, limit: usize) -> Result<usize, String> {
     let n = field_u64(v, key)? as usize;
     if n > limit {
         return Err(format!("{key}: {n} is more than {limit}"));

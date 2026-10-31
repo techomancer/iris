@@ -117,6 +117,8 @@ pub mod com_reg {
     /// LSR: a received character is waiting.
     pub const LSR_DR: u8 = 0x01;
     pub const LSR_OE: u8 = 0x02;
+    pub const LSR_PE: u8 = 0x04;
+    pub const LSR_FE: u8 = 0x08;
     pub const LSR_BI: u8 = 0x10;
     /// LSR: transmit holding register empty.
     pub const LSR_THRE: u8 = 0x20;
@@ -259,6 +261,19 @@ impl Ns16550 {
 
     pub fn dlab(&self) -> bool {
         self.lcr & LCR_DLAB != 0
+    }
+
+    /// How long a character takes on the line at the programmed rate and
+    /// frame. Nothing here waits for it; a DMA engine in front of the port
+    /// may.
+    pub fn char_time(&self) -> Duration {
+        self.char_transmit_time
+    }
+
+    /// The holding register is empty, so a DMA engine may write a byte.
+    /// Transmit is instant, so it always is once the write returns.
+    pub fn tx_ready(&self) -> bool {
+        self.lsr & LSR_THRE != 0
     }
 
     pub fn loopback(&self) -> bool {
