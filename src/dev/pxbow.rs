@@ -15,11 +15,13 @@
 //! the machine attaches it with [`Pxbow::attach_endpoint`]; until then its
 //! link is absent and an access to it is a bus error. Each processor access
 //! to a widget through [`Pxbow::route`] needs both the host's link and the
-//! target's to be alive.
+//! target's to be alive, so a link reset takes the PIC out of reach for the
+//! 20 ns of its pulse.
 //!
 //! Ported from hw/pci-host/sgi-pic.c and hw/misc/sgi-xbow.c in
 //! jamesbraid/qemu-sgi-origami.
 
+use super::heart::Clock;
 use super::xbow::{PacketSink, Xbow};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR};
 use parking_lot::RwLock;
@@ -50,8 +52,9 @@ pub struct Pxbow {
 
 impl Pxbow {
     /// A PXBOW reached from `host` (the widget Bedrock IO answers as) with
-    /// its PIC at `pic`. Both links are present and alive.
-    pub fn new(host: u8, pic: u8) -> Result<Arc<Self>, AttachError> {
+    /// its PIC at `pic`. Both links are present and alive. `clock` is the
+    /// machine's virtual time in nanoseconds, which times link resets.
+    pub fn new(host: u8, pic: u8, clock: Clock) -> Result<Arc<Self>, AttachError> {
         for widget in [host, pic] {
             if !(8..16).contains(&widget) {
                 return Err(AttachError::NotALink(widget));
@@ -62,7 +65,8 @@ impl Pxbow {
         }
         let xbow = Xbow::new(REVISION, (1 << host) | (1 << pic))
             .with_identity(PART, MANUFACTURER)
-            .with_status_source(host);
+            .with_status_source(host)
+            .with_clock(clock);
         Ok(Arc::new(Self {
             xbow: Arc::new(xbow),
             host,
