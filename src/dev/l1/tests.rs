@@ -1,5 +1,6 @@
 // Cases follow tests/qtest/sn1-l1-test.c in jamesbraid/qemu-sgi-origami:
-// uart, frames, identity, eeprom, errors and reset.
+// uart, frames, identity, eeprom, errors and reset, plus the port-speed and
+// router brick-reply cases (test_port_speed, test_irouter_*).
 
 use super::*;
 
@@ -378,4 +379,224 @@ fn concurrent_l1_outputs_and_actions_are_delivered_in_order() {
     entered.unwrap();
     assert_eq!(*backend.output.lock(), b"ABCD");
     assert_eq!(*actions.lock(), [L1Event::Reset, L1Event::Nmi]);
+}
+
+/// Request 0xa returns two integers; the first is a PROM display selector.
+/// Ported from test_port_speed in tests/qtest/sn1-l1-test.c.
+#[test]
+fn the_port_speed_reply_carries_the_configured_first_integer() {
+    let l1 = L1::new(Default::default()).unwrap();
+    assert_eq!(request(&l1, 0xa, &[], 0), integer_reply(&[0, 0]));
+    let l1 = L1::new(L1Config { port_speed_first: 1, ..Default::default() }).unwrap();
+    assert_eq!(request(&l1, 0xa, &[], 0), integer_reply(&[1, 0]));
+    l1.power_on();
+    drain(&l1);
+    assert_eq!(request(&l1, 0xa, &[], 0), integer_reply(&[1, 0]));
+    assert!(L1::new(L1Config { port_speed_first: 2, ..Default::default() }).is_err());
+}
+
+const BRICK: [u8; 53] = [
+    0x10, 0, 0, 0, 0, 0x30, 1, 1, 0, 0x2b, 0, 0x2b, 2, 0, 0, 0x81, 0, 0, 0x0f, 0xff, 0xf0, 3, 0x2f,
+    0xff, 0xf0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a, 1, 0, 7, 0, 0, 0, 0x34, b'b', b'r',
+    b'i', b'c', b'k', b' ', 0,
+];
+
+fn router_l1(type_code: u32, rack: u32, bay: u32, partition: u32, serial: Option<&str>) -> L1 {
+    let l1 = L1::new(L1Config {
+        router: true,
+        type_code,
+        rack,
+        bay,
+        brick_serial: serial.map(str::to_string),
+        ..Default::default()
+    })
+    .unwrap();
+    if partition != 0 {
+        request(&l1, 0x1006, &model::ints(&[partition]), 1);
+    }
+    l1
+}
+
+fn chunk(channel: u8, command: u16, count: u8, length: u16, data: &[u8]) -> Vec<u8> {
+    let mut p = vec![channel, 0, 0, 0, 0, (command >> 8) as u8, command as u8, count];
+    p.extend_from_slice(&length.to_be_bytes());
+    p.extend_from_slice(data);
+    p
+}
+
+fn send_packet(l1: &L1, packet: &[u8]) {
+    send(l1, &encode(packet));
+}
+
+/// Collect one reply message from its chunks: the channel, and the inner bytes.
+fn router_receive(l1: &L1) -> (u8, Vec<u8>) {
+    let wire = drain(l1);
+    let mut frames = wire.split(|b| *b == 0x7e).filter(|f| !f.is_empty());
+    let mut decode = || -> Vec<u8> {
+        let raw = frames.next().expect("a reply frame");
+        let mut out = Vec::new();
+        let mut it = raw.iter();
+        while let Some(&b) = it.next() {
+            out.push(if b == 0x7d { it.next().unwrap() ^ 0x20 } else { b });
+        }
+        out.truncate(out.len() - 2);
+        out
+    };
+    let first = decode();
+    assert_eq!(first[1..5], [0; 4]);
+    assert_eq!(first[5..8], [0x30, 1, 1]);
+    let channel = first[0];
+    let mut inner = first[10..].to_vec();
+    while inner.len() < usize::from(u16::from_be_bytes([inner[0], inner[1]])) {
+        let next = decode();
+        assert_eq!(next[0], channel);
+        assert_eq!(next[5..10], [0x30, 3, 0, 0, 0]);
+        inner.extend_from_slice(&next[10..]);
+    }
+    assert!(frames.next().is_none());
+    (channel, inner)
+}
+
+fn expect_brick(l1: &L1, channel: u8, destination: u32, source: u32, text: &str) {
+    let (got, inner) = router_receive(l1);
+    assert_eq!(got, channel);
+    assert_eq!(usize::from(u16::from_be_bytes([inner[0], inner[1]])), inner.len());
+    assert_eq!(u32::from_be_bytes(inner[8..12].try_into().unwrap()), destination);
+    assert_eq!(u32::from_be_bytes(inner[12..16].try_into().unwrap()), source);
+    assert_eq!(&inner[36..], [text.as_bytes(), &[0]].concat());
+}
+
+const DEFAULT_TEXT: &str = "rack: 001, slot: 04, partition: none, type: Chimera Server \
+    [?MB flash], serial:(null), source: OTHER\n\n";
+
+/// Ported from test_irouter_brick_exact in tests/qtest/sn1-l1-test.c.
+#[test]
+fn the_router_brick_reply_matches_the_captured_layout() {
+    let l1 = router_l1(0x37, 1, 4, 0, None);
+    send_packet(&l1, &BRICK);
+    let mut inner = vec![
+        0, 0x8b, 2, 0, 0, 0x81, 1, 0, 0, 0x04, 0x42, 0x15, 0, 0x04, 0x40, 3, 2, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0x0a, 1, 0, 0x67, 0, 0, 0, 0x34,
+    ];
+    inner.extend_from_slice(DEFAULT_TEXT.as_bytes());
+    inner.push(0);
+    assert_eq!(inner.len(), 139);
+    let mut first = vec![0x30, 0, 0, 0, 0, 0x30, 1, 1, 0, 139];
+    first.extend_from_slice(&inner[..113]);
+    let mut rest = vec![0x30, 0, 0, 0, 0, 0x30, 3, 0, 0, 0];
+    rest.extend_from_slice(&inner[113..]);
+    let mut expected = encode(&first);
+    expected.extend(encode(&rest));
+    assert_eq!(drain(&l1), expected);
+}
+
+/// Subchannels are answered in place, and a request split across chunks
+/// completes on the last continuation. Ported from
+/// test_irouter_fragment_channel_transport (the single-transport part).
+#[test]
+fn the_router_reassembles_chunks_and_answers_on_the_request_subchannel() {
+    let l1 = router_l1(0x37, 1, 4, 0, None);
+    let rest = &BRICK[10..];
+    send_packet(&l1, &chunk(0x10, 0x3001, 1, 43, &rest[..12]));
+    assert!(drain(&l1).is_empty());
+    let mut other = BRICK;
+    other[0] = 0x11;
+    send_packet(&l1, &other);
+    expect_brick(&l1, 0x31, 0x0004_4235, 0x0004_4003, DEFAULT_TEXT);
+    send_packet(&l1, &chunk(0x10, 0x3003, 0, 0, &rest[12..]));
+    expect_brick(&l1, 0x30, 0x0004_4215, 0x0004_4003, DEFAULT_TEXT);
+}
+
+/// Ported from test_irouter_reset_and_negative.
+#[test]
+fn a_reset_drops_a_pending_router_message_and_unsupported_types_stay_silent() {
+    let l1 = router_l1(0x37, 1, 4, 0, None);
+    let rest = &BRICK[10..];
+    send_packet(&l1, &chunk(0x10, 0x3001, 1, 43, &rest[..12]));
+    l1.power_on();
+    drain(&l1);
+    send_packet(&l1, &chunk(0x10, 0x3003, 0, 0, &rest[12..]));
+    assert!(drain(&l1).is_empty());
+    send_packet(&l1, &BRICK);
+    expect_brick(&l1, 0x30, 0x0004_4215, 0x0004_4003, DEFAULT_TEXT);
+
+    let off = L1::new(Default::default()).unwrap();
+    send_packet(&off, &BRICK);
+    assert_eq!(drain(&off), encode(&[0x30, 255, 255, 255, 255, 0, 0, 0, 8]));
+
+    let l1 = router_l1(0x37, 1, 4, 0, None);
+    send_packet(&l1, &BRICK[..7]);
+    assert!(drain(&l1).is_empty());
+    send_packet(&l1, &chunk(0x10, 0x3001, 1, 43, &rest[..12]));
+    send_packet(&l1, &BRICK);
+    expect_brick(&l1, 0x30, 0x0004_4215, 0x0004_4003, DEFAULT_TEXT);
+
+    let l1 = router_l1(0x34, 1, 4, 0, None);
+    send_packet(&l1, &BRICK);
+    send_packet(&l1, &chunk(0x10, 0x3003, 0, 0, rest));
+    assert!(drain(&l1).is_empty());
+
+    let l1 = router_l1(0x37, 1, 4, 0, None);
+    let mut reset = BRICK;
+    reset[46..52].copy_from_slice(b"reset\0");
+    send_packet(&l1, &reset);
+    assert!(drain(&l1).is_empty());
+}
+
+/// A new start replaces a pending message. Ported from
+/// test_irouter_replace_pending.
+#[test]
+fn a_new_router_start_replaces_the_pending_message() {
+    let l1 = router_l1(0x37, 1, 4, 0, None);
+    let mut old = BRICK;
+    old[14] = 0x12;
+    old[27] = 0x34;
+    send_packet(&l1, &chunk(0x10, 0x3001, 1, 43, &old[10..22]));
+    send_packet(&l1, &BRICK);
+    expect_brick(&l1, 0x30, 0x0004_4215, 0x0004_4003, DEFAULT_TEXT);
+    send_packet(&l1, &chunk(0x10, 0x3003, 0, 0, &old[22..]));
+    assert!(drain(&l1).is_empty());
+}
+
+/// Messages of more than one fragment have no known descriptor layout.
+/// Ported from test_irouter_multifragment_refusal.
+#[test]
+fn a_multi_fragment_router_message_is_refused_and_later_requests_work() {
+    let l1 = router_l1(0x37, 1, 4, 0, None);
+    let mut request = BRICK;
+    request[15] = 0x82;
+    send_packet(&l1, &chunk(0x10, 0x3001, 2, 43, &request[10..]));
+    assert!(drain(&l1).is_empty());
+    send_packet(&l1, &chunk(0x10, 0x3002, 0, 4, &[0xde, 0xad, 0xbe, 0xef]));
+    assert!(drain(&l1).is_empty());
+    request[0] = 0x11;
+    request[15] = 0x81;
+    send_packet(&l1, &request);
+    expect_brick(&l1, 0x31, 0x0004_4235, 0x0004_4003, DEFAULT_TEXT);
+}
+
+/// Ported from test_irouter_identity_overrides; the type 0x39 case is the
+/// Tezro identity.
+#[test]
+fn the_router_reply_reports_rack_slot_partition_type_and_serial() {
+    let l1 = router_l1(0x39, 2, 5, 3, Some("SERIAL-X"));
+    send_packet(&l1, &BRICK);
+    expect_brick(
+        &l1,
+        0x30,
+        0x0008_5215,
+        0x0008_5003,
+        "rack: 002, slot: 05, partition: 3, type: Chimera WS [?MB flash], \
+         serial:SERIAL-X, source: OTHER\n\n",
+    );
+    let l1 = router_l1(0x51, 3, 2, 255, Some(""));
+    send_packet(&l1, &BRICK);
+    expect_brick(
+        &l1,
+        0x30,
+        0x000c_2215,
+        0x000c_2003,
+        "rack: 003, slot: 02, partition: ?, type: Rackmount WS [?MB flash], \
+         serial:, source: OTHER\n\n",
+    );
 }
