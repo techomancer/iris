@@ -72,7 +72,7 @@ pub mod bte_reg {
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::ThreadId;
 const ID: u64 = (2 << 28) | (0xc110 << 12) | (0x36 << 1);
 const ADDR_MASK: u64 = 0xffffffff80;
@@ -133,7 +133,12 @@ pub struct BedrockIo {
     widgets: Mutex<[Option<Arc<dyn BusDevice>>; 16]>,
     memory: Mutex<Option<Arc<dyn BusDevice>>>,
     hub: Mutex<Option<Arc<dyn BusDevice>>>,
+    gfx_map_written: OnceLock<GfxMapHook>,
 }
+/// Told of a store to graphics map entry `entry`: its old value, then the
+/// new one. Runs before the new value takes effect, without the register
+/// lock, so it may read the map as it stood.
+pub type GfxMapHook = Box<dyn Fn(usize, u64, u64) + Send + Sync>;
 impl Default for BedrockIo {
     fn default() -> Self {
         Self::new()
@@ -149,7 +154,13 @@ impl BedrockIo {
             widgets: Mutex::new(std::array::from_fn(|_| None)),
             memory: Mutex::new(None),
             hub: Mutex::new(None),
+            gfx_map_written: OnceLock::new(),
         }
+    }
+    /// Watch stores to the graphics map, as a board whose head owes credits
+    /// must (see [`crate::ip53_machine::OwedCredits`]). Once.
+    pub fn on_gfx_map_write(&self, hook: GfxMapHook) {
+        assert!(self.gfx_map_written.set(hook).is_ok(), "graphics map hook already set");
     }
     pub fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
         assert!(widget < 16);
@@ -515,6 +526,10 @@ impl BusDevice for BedrockIo {
     fn write64(&self, a: u64, v: u64) -> u32 {
         if a & 7 != 0 {
             return BUS_ERR;
+        }
+        if let (Some(hook), true) = (self.gfx_map_written.get(), a == reg::GFX_MAP_BASE || a == reg::GFX_MAP_BASE + 8) {
+            let entry = ((a - reg::GFX_MAP_BASE) / 8) as usize;
+            hook(entry, self.gfx_map(entry), v);
         }
         let mut r = self.regs.lock();
         if let Some((n, offset)) = Self::bte_at(a) {

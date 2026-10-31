@@ -817,17 +817,90 @@ impl NodeHooks for GfxHooks {
 /// The node's end of the V12's credit return: a widget's credits go to the
 /// interface and slot the node's graphics map names. Only node 0's own
 /// interfaces are reachable.
+///
+/// A head reports a counted store it cannot take into its FIFO yet as owed,
+/// and the node keeps a ledger of what each widget owes. A write to a map
+/// entry first settles the debt of the widget the entry names, under the
+/// entry as it stood, and drops the head's later repayments of it. IRIX's
+/// detach zeroes the processor's entry and then saves the counter for the
+/// next attach, so a credit arriving after the detach would be lost to every
+/// later attach of that flow. This is the QEMU model's choice for a board
+/// slower than the real one, not a known property of the I/O interface.
 struct NodeCredits {
     io: Weak<BedrockIo>,
     gfx: [Arc<Mutex<PiGfx>>; 2],
+    owed: Mutex<OwedCredits>,
 }
-impl PiGfxLink for NodeCredits {
-    fn return_credits(&self, widget: u32, n: u32) {
-        let Some(io) = self.io.upgrade() else { return };
-        match gfx_route([io.gfx_map(0), io.gfx_map(1)], widget as u8) {
+impl NodeCredits {
+    /// Credits from `widget`, to the slot `map` names.
+    fn route(&self, map: [u64; 2], widget: u8, n: u32) {
+        match gfx_route(map, widget) {
             Some(r) if r.node == 0 => self.gfx[r.interface].lock().add_credits(r.slot, n, "Tezro PI"),
             other => dlog!(LogModule::Bedrock, "Tezro: {n} V12 credits for widget {widget} have no local route ({other:?})"),
         }
+    }
+
+    fn route_now(&self, widget: u8, n: u32) {
+        if let Some(io) = self.io.upgrade() {
+            self.route([io.gfx_map(0), io.gfx_map(1)], widget, n);
+        }
+    }
+
+    /// A store replacing graphics map entry `entry`'s value `old` with `new`.
+    fn map_written(&self, entry: usize, old: u64, new: u64) {
+        let Some(io) = self.io.upgrade() else { return };
+        if let Some((widget, credits)) = self.owed.lock().settle(old, new) {
+            let mut map = [io.gfx_map(0), io.gfx_map(1)];
+            map[entry] = old;
+            self.route(map, widget, credits);
+        }
+    }
+}
+impl PiGfxLink for NodeCredits {
+    fn return_credits(&self, widget: u32, n: u32) {
+        self.route_now(widget as u8, n);
+    }
+    fn owe_credits(&self, widget: u32, n: i32) {
+        self.owed.lock().owe(widget as u8, n);
+    }
+    fn repay_credits(&self, widget: u32, n: u32) {
+        let due = self.owed.lock().repay(widget as u8, n);
+        if due != 0 {
+            self.route_now(widget as u8, due);
+        }
+    }
+}
+
+/// The credits each of a node's sixteen widgets owes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwedCredits([u32; 16]);
+
+impl OwedCredits {
+    /// `n` more credits owed by `widget`; a negative count cancels owed
+    /// credits a head reset threw away, never below zero.
+    pub fn owe(&mut self, widget: u8, n: i32) {
+        let owed = &mut self.0[usize::from(widget & 0xf)];
+        *owed = if n >= 0 { owed.saturating_add(n as u32) } else { owed.saturating_sub(n.unsigned_abs()) };
+    }
+
+    /// `n` owed credits repaid: what is still owed of them, to route now. A
+    /// repayment of credits already settled routes nothing.
+    pub fn repay(&mut self, widget: u8, n: u32) -> u32 {
+        let owed = &mut self.0[usize::from(widget & 0xf)];
+        let repaid = n.min(*owed);
+        *owed -= repaid;
+        repaid
+    }
+
+    /// A store replacing graphics map entry `old` with `new`: the widget
+    /// `old` names and the credits it owed, to route under `old` before the
+    /// new value takes effect. Rewriting the same value settles nothing.
+    pub fn settle(&mut self, old: u64, new: u64) -> Option<(u8, u32)> {
+        let widget = (old & 0xf) as u8;
+        if old == new || self.0[usize::from(widget)] == 0 {
+            return None;
+        }
+        Some((widget, std::mem::take(&mut self.0[usize::from(widget)])))
     }
 }
 
@@ -861,7 +934,14 @@ fn fit_v12(
         status.clone(),
         graphics_pool,
     )?;
-    v12.set_pi_link(Arc::new(NodeCredits { io: Arc::downgrade(&node.io), gfx: gfx.clone() }));
+    let credits = Arc::new(NodeCredits { io: Arc::downgrade(&node.io), gfx: gfx.clone(), owed: Mutex::default() });
+    v12.set_pi_link(credits.clone());
+    let settle = Arc::downgrade(&credits);
+    node.io.on_gfx_map_write(Box::new(move |entry, old, new| {
+        if let Some(credits) = settle.upgrade() {
+            credits.map_written(entry, old, new);
+        }
+    }));
     pxbow
         .attach_endpoint(V12_WIDGET, v12.clone() as Arc<dyn BusDevice>)
         .map_err(|e| format!("Tezro V12: {e:?}"))?;

@@ -503,3 +503,48 @@ fn a_counted_store_refused_busy_is_refunded() {
     assert_eq!(bus.write64(io_view | widget(9, 0), 0), crate::traits::BUS_BUSY);
     assert_eq!(pi.read64(0x308).data, 0, "back across the wrap");
 }
+
+/// Follows sn1/pi-gfx/map-rewrite-settles-owed-credits: owed credits are
+/// delivered when the entry naming the widget is rewritten, a write of the
+/// value already there settles nothing, a repayment of settled credits is
+/// dropped, one still owed is routed, and a reset's abandonment cancels
+/// what it threw away.
+#[test]
+fn a_map_rewrite_settles_owed_credits() {
+    let mut l = OwedCredits::default();
+    let entry = 0xc;
+    l.owe(0xc, 5);
+    assert_eq!(l.settle(entry, entry), None, "same value");
+    assert_eq!(l.settle(entry, 0), Some((0xc, 5)));
+    assert_eq!(l.repay(0xc, 5), 0, "already settled");
+    assert_eq!(l.settle(0, entry), None, "widget 0 owes nothing");
+    l.owe(0xc, 3);
+    assert_eq!(l.repay(0xc, 2), 2);
+    l.owe(0xc, -1);
+    assert_eq!(l.settle(entry, 0), None, "nothing left owed");
+    l.owe(0xb, -1);
+    assert_eq!(l, OwedCredits::default(), "never below zero");
+}
+
+/// On the board, credits the V12 owes reach PI0's slot A when the map
+/// entry naming widget 12 is rewritten, under the entry as it stood, and
+/// the V12's later repayment of them is dropped.
+#[test]
+fn the_board_settles_the_v12s_owed_credits_on_a_map_write() {
+    use crate::dev::bedrock_io::reg::GFX_MAP_BASE;
+    let board = board_with_v12(4);
+    let (pi, io) = (&board.node.pi[0], &board.node.io);
+    let link = board.v12.as_ref().unwrap().pi_link().unwrap();
+    assert_eq!(pi.write64(0x308, 100), BUS_OK);
+    assert_eq!(io.write64(GFX_MAP_BASE, 12), BUS_OK);
+    link.owe_credits(12, 8);
+    assert_eq!(pi.read64(0x308).data, 100, "owed, not yet returned");
+    assert_eq!(io.write64(GFX_MAP_BASE, 0), BUS_OK, "the detach");
+    assert_eq!(pi.read64(0x308).data, 108);
+    assert_eq!(io.write64(GFX_MAP_BASE, 12), BUS_OK);
+    link.repay_credits(12, 8);
+    assert_eq!(pi.read64(0x308).data, 108, "settled credits are not paid twice");
+    link.owe_credits(12, 2);
+    link.repay_credits(12, 2);
+    assert_eq!(pi.read64(0x308).data, 110);
+}
