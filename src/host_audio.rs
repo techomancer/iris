@@ -26,8 +26,23 @@ pub struct HostOut {
     // the codec is disarmed/reset. Gates underrun counting so idle silence
     // (stream open, nothing enabled yet) isn't reported as an underrun.
     pub playing: Arc<AtomicBool>,
-    // Keep stream alive; dropped with the HostOut.
-    _stream: cpal::Stream,
+    // Keep stream alive; dropped with the HostOut. None for a detached one.
+    _stream: Option<cpal::Stream>,
+}
+
+impl HostOut {
+    /// An output with no host stream behind it: whoever holds the ring's
+    /// consumer plays it. For tests of the devices that feed one.
+    #[cfg(test)]
+    pub fn detached(stream_rate: u32, producer: Producer<i16>) -> Self {
+        Self {
+            stream_rate,
+            producer,
+            underruns: Arc::new(AtomicU64::new(0)),
+            playing: Arc::new(AtomicBool::new(true)),
+            _stream: None,
+        }
+    }
 }
 
 // cpal::Stream is !Send/!Sync on some platforms (ALSA uses raw pointers internally),
@@ -251,7 +266,7 @@ pub fn open_output(
                 producer,
                 underruns,
                 playing,
-                _stream: stream,
+                _stream: Some(stream),
             });
         }
 
