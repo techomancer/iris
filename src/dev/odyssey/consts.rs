@@ -985,6 +985,11 @@ pub const ODSY_DMA_PIECE_PAGES: usize = (ODSY_DMA_PTE_LEN_MASK as u64 + ODSY_DMA
 
 // The raster-position query.
 pub const ODSY_QUERY_KIND_RASTER: u32 = 3;
+/// The last of the four zero-operand blocks (0x3cf8 to 0x3cfb) that end a
+/// glRasterPos stream. INFERRED as the point where the board latches the
+/// raster index, colour and texture coordinate (odyssey datasheet,
+/// "Raster-position query and glyph colour").
+pub const ODSY_RASTER_POS_LATCH_WORD: u32 = 0x3cfb;
 pub const ODSY_QUERY_RASTER_INDEX: u32 = 0x928;
 pub const ODSY_QUERY_RASTER_COLOUR: u32 = 0x93c;
 

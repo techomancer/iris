@@ -1247,10 +1247,19 @@ impl Board {
 // + 0x928 (colour-index context), and the record at + 0x950 into the raster
 // texture coordinate.
 //
-// APPROXIMATION: the board's raster colour is the current colour after
-// lighting; this model answers with the current colour and index records
-// unlit, and the current texture coordinate untransformed, beside the kind-0
-// records. Lit raster colours and kinds 1 and 2 are not modeled.
+// The raster index, colour and texture coordinate are a latch, taken when
+// the last block (0x3cfb) of glRasterPos's position stream arrives, and
+// kind 3 answers from the latch, not from the colour current when the
+// query is processed: the library defers the query past later glColor
+// calls (datasheet, "Raster-position query and glyph colour"). That the
+// board latches, and at 0x3cfb, is INFERRED; the library's reliance on it
+// is ESTABLISHED. Before any latch the records hold the GL initial values
+// (colour white, index 1). Kind 0 answers the live records.
+//
+// APPROXIMATION: the lit case is UNKNOWN. The library computes a lit raster
+// position on the host and sends the board nothing to light, so the latch
+// takes the current colour unlit, and the texture coordinate untransformed.
+// Kinds 1 and 2 are not modeled.
 
 pub static QUERY_OFFSET: [u32; 5] = [0x900, 0x914, 0x928, 0x950, 0x978];
 
@@ -1267,6 +1276,18 @@ impl Board {
     pub fn query_records_reset(&mut self) {
         self.query_current = QUERY_DEFAULTS;
         self.query_current_valid = 0x1f;
+        self.query_latched = QUERY_DEFAULTS;
+        self.query_latched_valid = 0x1f;
+    }
+
+    /// The raster position's stream has arrived: keep the current index,
+    /// colour and texture coordinate for the kind-3 query.
+    pub fn query_raster_latch(&mut self) {
+        for rec in [ODSY_QUERY_INDEX, ODSY_QUERY_COLOUR, ODSY_QUERY_TEXCOORD] {
+            self.query_latched[rec as usize] = self.query_current[rec as usize];
+            let bit = 1u32 << rec;
+            self.query_latched_valid = (self.query_latched_valid & !bit) | (self.query_current_valid & bit);
+        }
     }
 
     pub fn query_cancel(&mut self) {
@@ -1423,17 +1444,32 @@ impl Board {
     /// the front end up for most of a frame's drawing once a frame.
     pub fn query_finish(&mut self, sequence: u32) {
         let sync_offset: u64 = 2 * (self.query_sync_index & ODSY_DMA_FENCE_SLOT_MASK) as u64;
+        let raster = self.query_kind == ODSY_QUERY_KIND_RASTER;
+        // Kind 3 reads the raster records and the texture coordinate from the
+        // latch; the rest of the page is the live snapshot.
+        let mut page = self.query_captured;
+        let mut page_valid = self.query_captured_valid;
 
         self.query_stage = 0;
+        if raster {
+            let tex = ODSY_QUERY_TEXCOORD as usize;
+
+            page[tex] = self.query_latched[tex];
+            page_valid = (page_valid & !(1u32 << tex)) | (self.query_latched_valid & (1u32 << tex));
+        }
         for i in 0..QUERY_OFFSET.len() {
-            if self.query_captured_valid & (1u32 << i) == 0 {
+            if page_valid & (1u32 << i) == 0 {
                 crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported current-query record {} in snapshot", i);
             }
+        }
+        if raster && self.query_latched_valid & 0b1011 != 0b1011 {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported raster-position latch");
+            return;
         }
         if self.query_base == 0
             || self.query_base > u64::MAX - 0x980
             || self.query_captured_epoch != self.query_epoch
-            || self.query_captured_valid != 0x1f
+            || page_valid != 0x1f
         {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported current-query snapshot");
             return;
@@ -1441,16 +1477,16 @@ impl Board {
         // Each word in publication order, with what a failed write reports.
         let mut words: Vec<(u64, u32, &'static str)> = Vec::new();
         for i in 0..QUERY_OFFSET.len() {
-            let n = 1 + cmd_arity(self.query_captured[i][0]) as usize;
+            let n = 1 + cmd_arity(page[i][0]) as usize;
 
             for j in 0..n {
                 let addr = self.query_base + QUERY_OFFSET[i] as u64 + 4 * j as u64;
-                words.push((addr, self.query_captured[i][j], "sgi-odyssey: current-query payload failed"));
+                words.push((addr, page[i][j], "sgi-odyssey: current-query payload failed"));
             }
         }
         let mut i = 0;
         while self.query_kind == ODSY_QUERY_KIND_RASTER && i < 2 {
-            let rec = self.query_captured[if i != 0 { ODSY_QUERY_COLOUR } else { ODSY_QUERY_INDEX } as usize];
+            let rec = self.query_latched[if i != 0 { ODSY_QUERY_COLOUR } else { ODSY_QUERY_INDEX } as usize];
             let at = self.query_base + (if i != 0 { ODSY_QUERY_RASTER_COLOUR } else { ODSY_QUERY_RASTER_INDEX }) as u64;
 
             for (j, &word) in rec.iter().enumerate().take(1 + cmd_arity(rec[0]) as usize) {

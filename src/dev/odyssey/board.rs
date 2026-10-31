@@ -218,7 +218,11 @@ pub struct Board {
     // The command-FIFO interpreter (0x110000).
     pub query_current: [[u32; 5]; 5],
     pub query_captured: [[u32; 5]; 5],
+    /// The index, colour and texture-coordinate records the raster position
+    /// latched (indexed like `query_current`; the others are unused).
+    pub query_latched: [[u32; 5]; 5],
     pub query_current_valid: u32,
+    pub query_latched_valid: u32,
     pub query_captured_valid: u32,
     pub query_stage: u32,
     /// The open query's kind (word 0x4c0 + kind).
@@ -549,7 +553,9 @@ impl Default for Board {
             aux_image_reported: false,
             query_current: [[0; 5]; 5],
             query_captured: [[0; 5]; 5],
+            query_latched: [[0; 5]; 5],
             query_current_valid: 0,
+            query_latched_valid: 0,
             query_captured_valid: 0,
             query_stage: 0,
             query_kind: 0,

@@ -1001,6 +1001,9 @@ impl Board {
             self.query_kind = word - 0x4c0;
             return;
         }
+        if word == ODSY_RASTER_POS_LATCH_WORD {
+            self.query_raster_latch();
+        }
         if word == 0x2f00c02e || word == 0x3000c02e {
             self.cmd_start(word, 0);
             return;
