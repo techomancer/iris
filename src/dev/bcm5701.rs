@@ -26,9 +26,11 @@
 //!
 //! # What is approximated
 //!
-//! - Timing is wall-clock: the PHY's autonegotiation settle (100 ms) and the
-//!   buffer manager's startup (8 ms) are deadlines the register access path
-//!   evaluates lazily.
+//! - Iris has no virtual clock, so timing is wall-clock. Deadlines (the PHY's
+//!   100 ms settle, the buffer manager's 8 ms startup, the coalescing budgets
+//!   and the arrival latency) are evaluated when the device is touched and by
+//!   the receive thread, each at its own expiry and earliest first, as the
+//!   model's virtual clock would fire them.
 //! - EEPROM transfers complete synchronously; the delay register only reads
 //!   back, and the 10 ms write spacing is not enforced. Direct serial-pin
 //!   control is refused and counted.
