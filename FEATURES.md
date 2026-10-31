@@ -536,6 +536,8 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `MGRAS_REPLAY_OUT` | Optional IMPACT replay image output path. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_REPLAY_TRACE` | IMPACT replay tracing selector (`gputrace` builds). | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_SIZE_PROBE` | Input for the opt-in IMPACT size/probe test. | [src/dev/mgras/mgras_tests.rs](src/dev/mgras/mgras_tests.rs) |
+| `VPRO_GOLDEN` | `tolerance` lets a VPro golden frame whose hash changed pass inside its stored limits. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
+| `VPRO_REPLAY` | Replay input path for one VPro recording; `VPRO_REPLAY_DIR` picks the directory that is replayed otherwise. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
 
 `RUST_LOG` configures the host Rust logger; `IRIS_DEBUG_LOG` configures device
 logging. Standard host variables (`HOME`, `XDG_CACHE_HOME`, `LOCALAPPDATA`,
