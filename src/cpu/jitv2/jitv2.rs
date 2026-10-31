@@ -62,17 +62,22 @@ unsafe impl Send for CompileRequest {}
 // See each constant's doc comment for the reasoning behind its specific value.
 // ============================================================================
 
-/// Number of 4 KiB physical frames in the largest ppmem window — the exact
-/// entry count of `PfnMap` below. Translation yields up to 40 bits; [`pfn_of`]
-/// keeps frames above this out of the JIT.
+/// Number of 4 KiB physical frames in the largest ppmem window: the `PfnMap`
+/// of a `Jitv2` built with no machine to size it from.
 pub const PFN_MAP_ENTRIES: usize = crate::ppmem::LARGE_WINDOW_SIZE as usize / PAGE_SIZE as usize;
 
-/// The JIT frame for a physical address, or `None` above the space `PfnMap`
-/// covers. Code up there is not compiled; it runs in the interpreter.
+/// How many frames a machine's `PfnMap` needs: up to the end of its memory.
+pub fn frames_for(memory: &crate::memory_map::MemoryMap) -> u64 {
+    memory.end().div_ceil(PAGE_SIZE as u64)
+}
+
+/// The JIT frame for a physical address, or `None` above the `frames` that
+/// `PfnMap` covers. Translation yields up to 40 bits. Code up there is not
+/// compiled; it runs in the interpreter.
 #[inline(always)]
-pub fn pfn_of(phys_addr: u64) -> Option<Pfn> {
+pub fn pfn_of(phys_addr: u64, frames: u64) -> Option<Pfn> {
     let pfn = phys_addr / PAGE_SIZE as u64;
-    (pfn < PFN_MAP_ENTRIES as u64).then_some(pfn as Pfn)
+    (pfn < frames).then_some(pfn as Pfn)
 }
 
 /// Direct-mapped `pfn -> PageSlot` lookup, replacing the `HashMap<Pfn,
@@ -101,8 +106,8 @@ pub const PFN_MAP_EMPTY: u32 = u32::MAX;
 
 impl PfnMap {
     /// One allocation, every frame empty.
-    pub fn new() -> Self {
-        PfnMap((0..PFN_MAP_ENTRIES).map(|_| AtomicU32::new(PFN_MAP_EMPTY)).collect())
+    pub fn new(frames: usize) -> Self {
+        PfnMap((0..frames).map(|_| AtomicU32::new(PFN_MAP_EMPTY)).collect())
     }
 
     /// The slot for `pfn`, or `None` when unmapped.
@@ -142,7 +147,7 @@ impl PfnMap {
 
 
 impl Default for PfnMap {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self { Self::new(PFN_MAP_ENTRIES) }
 }
 
 /// Upfront reservation for the shared `Codegen`'s Cranelift `ArenaMemoryProvider`
@@ -2379,6 +2384,15 @@ impl Jitv2 {
     /// means an earlier flush, not a correctness problem. Does not start the
     /// compile thread — call `compile_queue.start()`.
     pub fn new(capacity: usize) -> Self {
+        Self::with_frames(capacity, PFN_MAP_ENTRIES)
+    }
+
+    /// [`Self::new`] with a page table that covers a machine's memory.
+    pub fn for_memory(capacity: usize, memory: &crate::memory_map::MemoryMap) -> Self {
+        Self::with_frames(capacity, frames_for(memory) as usize)
+    }
+
+    fn with_frames(capacity: usize, frames: usize) -> Self {
         let mut pages: Box<[PhysicalCodePage]> = (0..capacity).map(|_| PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null())).collect();
         // Thread every slot onto the free list up front, index order —
         // `page_for`'s claim path only ever pops from the head, so initial
@@ -2390,7 +2404,7 @@ impl Jitv2 {
         Self {
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
-            pfn_to_slot: PfnMap::new(),
+            pfn_to_slot: PfnMap::new(frames),
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
@@ -5124,11 +5138,15 @@ mod tests {
 
     #[test]
     fn pfn_of_stops_at_the_pfn_map() {
-        assert_eq!(pfn_of(0x1fc0_0004), Some(0x1fc00));
-        assert_eq!(pfn_of(0xFFFF_F000), Some(0xFFFFF));
-        assert_eq!(pfn_of(0x2_1FFF_F000), Some(0x21FFFF));
-        assert_eq!(pfn_of(0x4_0000_0000), None);
-        assert_eq!(pfn_of(0xFF_FFFF_F000), None);
+        let octane = frames_for(&crate::ip30::memory_map(&[2048, 2048, 2048, 2048]));
+        assert_eq!(pfn_of(0x1fc0_0004, octane), Some(0x1fc00));
+        assert_eq!(pfn_of(0xFFFF_F000, octane), Some(0xFFFFF));
+        assert_eq!(pfn_of(0x2_1FFF_F000, octane), Some(0x21FFFF));
+        assert_eq!(pfn_of(0x2_2000_0000, octane), None);
+        assert_eq!(pfn_of(0xFF_FFFF_F000, octane), None);
+        let indy = frames_for(&crate::ip22_bus::memory_map(false));
+        assert_eq!(pfn_of(0x2FFF_F000, indy), Some(0x2FFFF));
+        assert_eq!(pfn_of(0x3000_0000, indy), None);
     }
 
     #[test]

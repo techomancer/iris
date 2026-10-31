@@ -228,6 +228,23 @@ aligned 32- and 64-bit host accesses are atomic (though unordered), and the
 hardware synchronisation points (descriptor ownership bits, interrupts) are
 kept where the real hardware has them.
 
+### The memory map
+
+The decode table says what answers at an address, but not whether that is
+memory. Each machine therefore also builds a `MemoryMap` (`src/memory_map.rs`)
+when it is constructed: a list of named ranges, each one RAM, an alias of RAM,
+or ROM. The Indy and Indigo2 take theirs from `ip22_bus::memory_map`, the O2
+from `ip32::memory_map`, and the Octane from `ip30::memory_map`, which sizes RAM
+from `banks`. The machine keeps it and passes it to the CPU in `MipsCpuConfig`.
+
+Code that needs to tell memory from everything else asks the map, not a
+machine's constants: the undo buffer records stores to RAM, the JIT sizes its
+page table to the map's end, and the `j2` monitor commands check addresses and
+lay out their report by range. A range says where the memory controller can
+answer, so an address in one may have nothing behind it until the firmware has
+programmed the controller. `lomem` and `himem` belong to the Indy and Indigo2
+devices and should not appear outside them.
+
 ### Interrupts
 
 A device holds an `IrqLine` (`src/irq.rs`): a reference to the controller it

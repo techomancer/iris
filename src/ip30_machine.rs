@@ -77,6 +77,8 @@ fn record_bus(barcode: &str, part: &str, revision: &str, name: &str, serial: u64
 }
 
 pub struct OctaneMachine {
+    /// Where this machine has memory.
+    pub memory: Arc<crate::memory_map::MemoryMap>,
     pub phys: Arc<Ip30Bus>,
     pub heart: Arc<Heart>,
     pub ram: Arc<HeartRam>,
@@ -279,8 +281,9 @@ impl OctaneMachine {
         // CPU 0 keeps the counter the graphics board already reads.
         let mut ticks = vec![fasttick];
         ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
+        let memory = Arc::new(crate::ip30::memory_map(&cfg.banks[..4]));
         let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
-            .map(|id| Self::build_cpu(id, cpu_count, phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .map(|id| Self::build_cpu(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
             .collect();
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
@@ -412,6 +415,7 @@ impl OctaneMachine {
             eth.attach(link);
         }
         Ok(Self {
+            memory,
             phys,
             heart,
             ram,
@@ -476,13 +480,14 @@ impl OctaneMachine {
     fn build_cpu(
         id: u8,
         cpu_count: u8,
+        memory: Arc<crate::memory_map::MemoryMap>,
         sysad: Arc<dyn BusDevice>,
         cached: Arc<CachedFlashLines>,
         tm: &Arc<TimerManager>,
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
     ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>();
+        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>(memory);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.

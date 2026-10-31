@@ -27,6 +27,24 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
 
+### Memory ranges come from the machine
+
+- Each machine now describes its RAM, RAM aliases and ROM in a `MemoryMap`,
+  built when the machine is constructed and passed to the CPU. Generic code no
+  longer uses the Indy's `lomem` and `himem` addresses.
+- `j2 clear` and `j2 deny` accept any address in the machine's memory, including
+  an Octane's above 4 GB, and list the ranges when given one outside it.
+  `j2 analyze` no longer cuts its address to 32 bits.
+- `j2 html` has one section per memory range of the machine.
+- `undo` records stores to all of a machine's RAM. It used to miss the O2's and
+  most of an Octane's, and could take a high Octane address for a low one. It now
+  also covers the low-memory aliases, such as the exception vectors on an Indy.
+- `l1d`, `l1i` and `l2` `check` read an address in an Octane's RAM above 4 GB
+  as physical.
+- The JIT's page table is sized to the machine's memory instead of 16 MiB on
+  every machine. It takes under 1 MiB on an Indy. Code above the end of a
+  machine's memory now runs in the interpreter.
+
 ### Octane memory up to 8 GB
 
 - An Octane bank now takes 1024 and 2048 MB as well, so `banks` reaches

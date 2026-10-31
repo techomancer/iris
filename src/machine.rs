@@ -103,6 +103,8 @@ pub fn emulator_name() -> String {
 
 pub struct Machine {
     cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice>,
+    /// Where this machine has memory.
+    memory: Arc<crate::memory_map::MemoryMap>,
     /// The physical bus and the Indy's or Indigo2's devices on it.
     board: Arc<Ip22Bus>,
     mc: MemoryController,
@@ -676,8 +678,9 @@ impl Machine {
         // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
+        let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::for_model::<$cache>();
+        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone());
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
@@ -903,7 +906,7 @@ impl Machine {
         crate::thread_affinity::init(perf);
 
         Self {
-            cpu,
+            memory,            cpu,
             board,
             mc,
             hpc3,
@@ -1037,6 +1040,10 @@ impl Machine {
 
     /// The address this Machine's own monitor is serving on, or None when it
     /// couldn't bind its port (another iris holding it) or has not started.
+    pub fn memory_map(&self) -> &Arc<crate::memory_map::MemoryMap> {
+        &self.memory
+    }
+
     pub fn monitor_addr(&self) -> Option<std::net::SocketAddr> {
         self.monitor.bound_addr()
     }

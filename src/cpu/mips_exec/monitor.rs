@@ -77,6 +77,14 @@ pub(super) fn load_range<T: Tlb, C: CpuModel>(
     Ok(())
 }
 
+/// A physical address typed at the monitor. `parse_cpu_arg` sign-extends a
+/// 32-bit value, as it should for a virtual address, which would put a physical
+/// address from 2 GB to 4 GB out of reach.
+#[cfg(feature = "jitv2")]
+fn monitor_phys(arg: u64) -> u64 {
+    if arg >> 32 == 0xFFFF_FFFF { arg & 0xFFFF_FFFF } else { arg }
+}
+
 /// Unmapped physical addresses are backed by `UnmappedRam`, which accepts every
 /// write and reads back zero — so a write into the void is completely silent.
 /// Probe with a non-zero pattern before committing an image.
@@ -1006,7 +1014,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             drop(symbols);
 
             // Perform translation first if needed, as it requires mutable access to exec
-            let (virt_addr, phys_addr) = if (op == "check" || op == "probe") && val >= 0x8000_0000 {
+            let (virt_addr, phys_addr) = if (op == "check" || op == "probe") && val >= 0x8000_0000 && !exec.memory.contains(val) {
                 let tr = exec.debug_translate(val);
                 if !tr.is_exception() {
                     let pa = tr.phys;
@@ -2456,21 +2464,21 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         }
                         let symbols_arc = exec.symbols.clone();
                         let symbols = symbols_arc.lock();
-                        let phys_addr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))? as u32;
+                        let phys_addr = monitor_phys(parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?);
                         let entry_word = ((phys_addr & 0xFFF) >> 2) as u16;
-                        let page_base_phys = phys_addr & !0xFFFu32;
+                        let page_base_phys = phys_addr & !0xFFF;
 
                         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
                         for (i, w) in words.iter_mut().enumerate() {
-                            let a = page_base_phys + (i as u32) * 4;
-                            let r = exec.sysad.read32(a as u64);
+                            let a = page_base_phys + (i as u64) * 4;
+                            let r = exec.sysad.read32(a);
                             if !r.is_ok() {
                                 return Err(format!("failed to read word at phys {:#010x} (offset {:#x} into page)", a, i * 4));
                             }
                             *w = r.data;
                         }
 
-                        let (walked, non_empty) = exec.jitv2_inline_analyzer.walk_bounded(&words, entry_word, page_base_phys, usize::MAX);
+                        let (walked, non_empty) = exec.jitv2_inline_analyzer.walk_bounded(&words, entry_word, page_base_phys as u32, usize::MAX);
                         writeln!(writer, "analyze phys={:#010x}: page_base_phys={:#010x} entry_page_off={:#05x}", phys_addr, page_base_phys, entry_word * 4).unwrap();
                         if !non_empty {
                             writeln!(writer, "  region is EMPTY — entry word itself is Excluded with no emitter and fallback is off, or otherwise undispatchable").unwrap();
@@ -2478,8 +2486,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             let visited: Vec<_> = crate::cpu::jitv2::analyzer::instrs_linear(walked).collect();
                             writeln!(writer, "  {} instructions visited:", visited.len()).unwrap();
                             for instr in &visited {
-                                let paddr = page_base_phys + (instr.word as u32) * 4;
-                                let dis = mips_dis::disassemble(instr.raw, paddr as u64, Some(&symbols));
+                                let paddr = page_base_phys + (instr.word as u64) * 4;
+                                let dis = mips_dis::disassemble(instr.raw, paddr, Some(&symbols));
                                 let mut tags = Vec::new();
                                 if instr.word == entry_word { tags.push("ENTRY"); }
                                 if instr.is_fallback { tags.push("fallback"); }
@@ -2531,7 +2539,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             if result.is_exception() {
                                 return Err(format!("{:#018x} doesn't translate", pc));
                             }
-                            let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(result.phys) else {
+                            let Some(pfn) = exec.jitv2_frame(result.phys) else {
                                 return Err(format!("phys {:#x} is above the JIT's physical range", result.phys));
                             };
                             let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
@@ -2673,7 +2681,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} doesn't translate.", pc).unwrap();
                                 return Ok(());
                             }
-                            let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(result.phys) else {
+                            let Some(pfn) = exec.jitv2_frame(result.phys) else {
                                 writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} is at phys {:#x}, above the JIT's physical range.", pc, result.phys).unwrap();
                                 return Ok(());
                             };
@@ -2836,14 +2844,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         if actual_args.len() < 2 { return Err("Usage: j2 clear <paddr>".to_string()); }
                         let symbols_arc = exec.symbols.clone();
                         let symbols = symbols_arc.lock();
-                        let paddr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?;
+                        let paddr = monitor_phys(parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?);
                         drop(symbols);
-                        if paddr > 0xFFFF_FFFF || (paddr as u32) >= HIMEM_END {
-                            return Err(format!(
-                                "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
-                                paddr, HIMEM_END));
-                        }
-                        let pfn = (paddr as u32) / crate::cpu::jitv2::PAGE_SIZE;
+                        let pfn = exec.jitv2_monitor_pfn(paddr)?;
                         let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
                         let sysad = exec.sysad.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
@@ -2888,16 +2891,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         if actual_args.len() < 2 { return Err("Usage: j2 deny <paddr>".to_string()); }
                         let symbols_arc = exec.symbols.clone();
                         let symbols = symbols_arc.lock();
-                        let paddr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?;
+                        let paddr = monitor_phys(parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?);
                         drop(symbols);
-                        if paddr > 0xFFFF_FFFF || (paddr as u32) >= HIMEM_END {
-                            return Err(format!(
-                                "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
-                                paddr, HIMEM_END));
-                        }
-                        let pfn = (paddr as u32) / crate::cpu::jitv2::PAGE_SIZE;
+                        let pfn = exec.jitv2_monitor_pfn(paddr)?;
                         let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                        let offset = ((paddr as u32) & 0xFFF) as usize >> 2;
+                        let offset = (paddr & 0xFFF) as usize >> 2;
                         let sysad = exec.sysad.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
@@ -3000,7 +2998,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let jitv2_arc = exec.jitv2.clone();
                         let bus = exec.sysad.clone();
                         crate::cpu::jitv2_html_j2wp::write_jitv2_html(
-                            &jitv2_arc, &bus, &mut exec.jitv2_inline_analyzer, path, &mut *writer,
+                            &jitv2_arc, &bus, &exec.memory.clone(), &mut exec.jitv2_inline_analyzer, path, &mut *writer,
                         )?;
                     }
                     "stats" | "status" => {

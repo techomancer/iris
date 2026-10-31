@@ -333,8 +333,8 @@ impl From<L1DTag> for u32 {
 /// Convert a tag word from before `dc_tag_format`, which put `PTag` at `[31:8]`
 /// so that `W` overlapped its bit 19, physical address bit 31. A v0 word is
 /// ambiguous there, `phys_bit31 | dirty`, and this resolves it in favour of
-/// dirty: no cacheable mapping exists at or above `0x8000_0000`, since the
-/// highest range in `device_map` is `HIMEM_END` at `0x3000_0000`.
+/// dirty: the format predates every machine with memory at or above
+/// `0x8000_0000`, so no v0 tag can mean an address up there.
 pub fn migrate_l1d_tag_word_v0(word: u32) -> u32 {
     let raw_ptag = (word >> 8) & L1_PTAG_MASK & !(1 << 19);
     let cs = (word >> 6) & 0x3;

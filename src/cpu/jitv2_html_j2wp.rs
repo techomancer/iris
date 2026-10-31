@@ -15,8 +15,12 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::cpu::jitv2::Jitv2;
-use crate::ip22_bus::HIMEM_BASE;
+use crate::memory_map::MemoryMap;
 use crate::traits::BusDevice;
+
+/// The region of a page that is in none of the machine's memory ranges, such
+/// as code running from a device.
+const OTHER_REGION: &str = "other";
 
 pub mod jitv2_html {
     use serde::Serialize;
@@ -49,10 +53,10 @@ pub mod jitv2_html {
     pub struct PageDump {
         pub pfn: u32,
         pub phys_addr: u64,
-        /// "low" (0x08000000 RAM window), "high" (0x20000000 RAM window), or
-        /// "prom" (0x1FC00000, 1MB boot ROM) — purely a label for the
-        /// region-overview grid; jitv2 itself tracks pages by bare pfn,
-        /// agnostic to which bus window/device they fall in.
+        /// The name of the machine's memory range this page is in, or
+        /// [`super::OTHER_REGION`] — purely a label for the region-overview
+        /// grid; jitv2 itself tracks pages by bare pfn, agnostic to which bus
+        /// window/device they fall in.
         pub window: &'static str,
         pub gen: u64,
         pub func: String,
@@ -82,8 +86,18 @@ pub mod jitv2_html {
         pub rows: Vec<WordRow>,
     }
 
+    /// One section of the region overview.
+    #[derive(Serialize)]
+    pub struct Region {
+        pub name: &'static str,
+        pub title: String,
+        pub base: u64,
+        pub page_count: u64,
+    }
+
     #[derive(Serialize)]
     pub struct Snapshot {
+        pub regions: Vec<Region>,
         pub pages: Vec<PageDump>,
     }
 }
@@ -94,8 +108,8 @@ pub mod jitv2_html {
 /// works fine opened directly from `file://`).
 ///
 /// Two-level structure per the design this command was built for: a region
-/// overview (one CSS-grid cell per claimed page, grouped by which 256MB
-/// physical window it falls in) that's clickable through to a per-page
+/// overview (one CSS-grid cell per claimed page, grouped by which of the
+/// machine's memory ranges it falls in) that's clickable through to a per-page
 /// detail overlay (all 1024 words, one coverage column per entry, colored by
 /// the analyzer's instruction classification).
 #[cfg(feature = "jitv2")]
@@ -257,17 +271,7 @@ pub fn render_jitv2_html(snapshot: &jitv2_html::Snapshot) -> String {
 <h1>jitv2 dump</h1>
 <div class="summary" id="summary"></div>
 
-<h2>0x08000000 window (low RAM, 256MB)</h2>
-<div class="region-label">128 pages/row &middot; 4KB/page &middot; click a page to open it</div>
-<div class="region" id="region-low"></div>
-
-<h2>0x20000000 window (high RAM, 256MB)</h2>
-<div class="region-label">128 pages/row &middot; 4KB/page &middot; click a page to open it</div>
-<div class="region" id="region-high"></div>
-
-<h2>0x1FC00000 window (PROM, 1MB)</h2>
-<div class="region-label">128 pages/row &middot; 4KB/page &middot; click a page to open it</div>
-<div class="region" id="region-prom"></div>
+<div id="regions"></div>
 
 <div class="heat-scale"><span>entry density:</span><span class="bar"></span><span>0 &rarr; most-populated page</span></div>
 
@@ -284,9 +288,7 @@ pub fn render_jitv2_html(snapshot: &jitv2_html::Snapshot) -> String {
 <script id="data" type="application/json">{data_json}</script>
 <script>
 const DATA = JSON.parse(document.getElementById('data').textContent);
-const LOMEM_BASE = 0x08000000, HIMEM_BASE = 0x20000000, PROM_BASE = 0x1FC00000, PROM_SIZE = 1024*1024, PAGE_SIZE = 4096;
-const RAM_PAGES_PER_WINDOW = (0x08000000 / PAGE_SIZE); // 256MB / 4KB
-const PROM_PAGES = PROM_SIZE / PAGE_SIZE;
+const PAGE_SIZE = 4096;
 const COLS = 128;
 
 function fmtHex(n, digits) {{ return '0x' + n.toString(16).padStart(digits, '0'); }}
@@ -297,9 +299,7 @@ function fmtBytes(n) {{
 }}
 
 const byPfn = new Map(DATA.pages.map(p => [p.pfn, p]));
-const low = DATA.pages.filter(p => p.window === 'low');
-const high = DATA.pages.filter(p => p.window === 'high');
-const prom = DATA.pages.filter(p => p.window === 'prom');
+const pagesIn = r => DATA.pages.filter(p => p.window === r.name);
 
 let totalEntries = 0, totalCodeSize = 0, totalCompiles = 0;
 for (const p of DATA.pages) {{
@@ -308,7 +308,7 @@ for (const p of DATA.pages) {{
   totalCompiles += (p.compile_count || 0);
 }}
 document.getElementById('summary').textContent =
-  `${{DATA.pages.length}} claimed pages (${{low.length}} low / ${{high.length}} high / ${{prom.length}} prom) ` +
+  `${{DATA.pages.length}} claimed pages (${{DATA.regions.map(r => `${{pagesIn(r).length}} ${{r.name}}`).join(' / ')}}) ` +
   `· ${{totalEntries}} published entries · ${{fmtBytes(totalCodeSize)}} compiled code · ${{totalCompiles}} total compiles`;
 
 // Entry-density heat color: hottest page (most published entries) anchors
@@ -324,13 +324,22 @@ function densityColor(count) {{
   return `hsl(${{hue}} 70% ${{light}}%)`;
 }}
 
-function buildRegion(containerId, pages, base, pageCount) {{
-  const el = document.getElementById(containerId);
+function buildRegion(region) {{
+  const pages = pagesIn(region), base = region.base, pageCount = region.page_count;
+  const section = document.getElementById('regions');
+  const heading = document.createElement('h2');
+  heading.textContent = region.title;
+  const label = document.createElement('div');
+  label.className = 'region-label';
+  label.textContent = '128 pages/row \u00b7 4KB/page \u00b7 click a page to open it';
+  const el = document.createElement('div');
+  el.className = 'region';
+  section.append(heading, label, el);
   const rows = Math.ceil(pageCount / COLS);
   const claimed = new Map(pages.map(p => [Math.floor((p.phys_addr - base) / PAGE_SIZE), p]));
   const frag = document.createDocumentFragment();
   // Sparse: only render rows that actually contain a claimed page — a full
-  // grid of every possible page in a 256MB window would be enormous DOM for
+  // grid of every possible page in a memory range would be enormous DOM for
   // what's almost always a mostly-empty window.
   const usedRows = new Set([...claimed.keys()].map(i => Math.floor(i / COLS)));
   const sortedRows = [...usedRows].sort((a,b) => a-b);
@@ -356,9 +365,7 @@ function buildRegion(containerId, pages, base, pageCount) {{
     el.after(note);
   }}
 }}
-buildRegion('region-low', low, LOMEM_BASE, RAM_PAGES_PER_WINDOW);
-buildRegion('region-high', high, HIMEM_BASE, RAM_PAGES_PER_WINDOW);
-buildRegion('region-prom', prom, PROM_BASE, PROM_PAGES);
+DATA.regions.forEach(buildRegion);
 
 const KIND_LEGEND = ['Sequential','Branch','Jump','RegJump','Excluded','RegionBoundary'];
 
@@ -455,6 +462,7 @@ document.addEventListener('keydown', (e) => {{
 pub fn write_jitv2_html(
     jitv2: &Arc<Mutex<Jitv2>>,
     bus: &Arc<dyn BusDevice>,
+    memory: &MemoryMap,
     analyzer: &mut crate::cpu::jitv2::analyzer::Analyzer,
     path: &str,
     writer: &mut dyn Write,
@@ -470,21 +478,7 @@ pub fn write_jitv2_html(
     // not a hot path.
     for page in jit.claimed_pages() {
         let phys_addr = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-        // PROM_BASE/PROM_SIZE mirror the private constants in
-        // `prom.rs`/`physical.rs` (0x1FC00000, 1MB) — jitv2 can and does
-        // compile boot-time PROM code (physical alias of
-        // 0xFFFFFFFF_BFC00000), a third window distinct from both RAM
-        // banks, easy to forget when eyeballing only the two documented
-        // 256MB RAM windows.
-        const PROM_BASE: u64 = 0x1FC00000;
-        const PROM_END: u64 = 0x1FD00000;
-        let window = if (PROM_BASE..PROM_END).contains(&phys_addr) {
-            "prom"
-        } else if phys_addr >= HIMEM_BASE as u64 {
-            "high"
-        } else {
-            "low"
-        };
+        let window = memory.find(phys_addr).map_or(OTHER_REGION, |r| r.name);
         let page_gen = page.current_gen();
 
         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
@@ -572,7 +566,21 @@ pub fn write_jitv2_html(
     }
     drop(jit);
 
-    let snapshot = jitv2_html::Snapshot { pages };
+    let mut regions: Vec<jitv2_html::Region> = memory.ranges().iter().map(|r| jitv2_html::Region {
+        name: r.name,
+        title: format!("{} ({:#x}..{:#x})", r.name, r.base, r.end()),
+        base: r.base,
+        page_count: r.size / crate::cpu::jitv2::PAGE_SIZE as u64,
+    }).collect();
+    if pages.iter().any(|p| p.window == OTHER_REGION) {
+        regions.push(jitv2_html::Region {
+            name: OTHER_REGION,
+            title: "outside the machine's memory ranges".to_string(),
+            base: 0,
+            page_count: u32::MAX as u64,
+        });
+    }
+    let snapshot = jitv2_html::Snapshot { regions, pages };
     let html = render_jitv2_html(&snapshot);
     match std::fs::File::create(path) {
         Ok(f) => {

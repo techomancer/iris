@@ -16,8 +16,9 @@ Where the shift lives: the shadow cache and decode cache hold it
 (`set_tcache_shift`, before the CPU runs); the JIT bakes it from
 `JitDcGeometry::window_shift`, which is in the persistent cache's fingerprint.
 
-`PfnMap` covers `LARGE_WINDOW_SIZE` on every machine: 16 MiB, was 4 MiB. Frames
-above that get no page and run in the interpreter (`pfn_of`). `Pfn` stays u32: a
+`PfnMap` is sized per machine from its `MemoryMap` (`frames_for`): about 8.5 MiB
+at 8 GB, 768 KiB on an Indy. Frames above the map's end get no page and run in
+the interpreter (`pfn_of`). `Pfn` stays u32: a
 40-bit address has a 28-bit frame. `page_base`/`phys_base` are u64; the analyzer
 still takes u32 because it only uses the offset in the page.
 

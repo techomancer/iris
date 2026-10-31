@@ -455,9 +455,10 @@ fn tlb_size_follows_the_cpu_model() {
     use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
     use crate::cpu::mips_exec::MipsCpuConfig;
 
-    assert_eq!(MipsCpuConfig::for_model::<R4400Cache>().tlb_entries, 48);
-    assert_eq!(MipsCpuConfig::for_model::<R5000Cache>().tlb_entries, 48);
-    assert_eq!(MipsCpuConfig::for_model::<R10000ShadowCache>().tlb_entries, 64);
+    let memory = MipsCpuConfig::indy().memory;
+    assert_eq!(MipsCpuConfig::for_model::<R4400Cache>(memory.clone()).tlb_entries, 48);
+    assert_eq!(MipsCpuConfig::for_model::<R5000Cache>(memory.clone()).tlb_entries, 48);
+    assert_eq!(MipsCpuConfig::for_model::<R10000ShadowCache>(memory).tlb_entries, 64);
 }
 
 /// An index past the live count is dropped; one inside it is kept.
