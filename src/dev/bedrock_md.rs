@@ -13,7 +13,7 @@
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
-use super::bedrock_mem::{BedrockMemory, BANK_SPAN, FITTED_BANK};
+use super::bedrock_mem::{BedrockMemory, RamExtent, BANK_SPAN};
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -170,15 +170,17 @@ struct MdBus {
 }
 
 impl BedrockMd {
-    pub fn new() -> Arc<Self> {
-        Self::build(None)
+    /// A controller with `banks` fitted, in MiB from locational bank 0; see
+    /// [`BedrockMemory::new`] for what a board may fit.
+    pub fn new(banks: &[u32]) -> Result<Arc<Self>, String> {
+        Self::build(banks, None)
     }
-    pub fn with_clock(clock: crate::dev::heart::Clock) -> Arc<Self> {
-        Self::build(Some(clock))
+    pub fn with_clock(banks: &[u32], clock: crate::dev::heart::Clock) -> Result<Arc<Self>, String> {
+        Self::build(banks, Some(clock))
     }
-    fn build(clock: Option<crate::dev::heart::Clock>) -> Arc<Self> {
+    fn build(banks: &[u32], clock: Option<crate::dev::heart::Clock>) -> Result<Arc<Self>, String> {
         let md = Arc::new(Self {
-            memory: BedrockMemory::new(),
+            memory: BedrockMemory::new(banks)?,
             clock,
             state: Mutex::new(State::default()),
             remapping: Mutex::new(()),
@@ -187,7 +189,11 @@ impl BedrockMd {
         });
         md.memory.set_slow_view(md.view(View::Memory));
         md.rebuild_memory();
-        md
+        Ok(md)
+    }
+    /// Where fitted RAM can answer, for the processor bus's cached view.
+    pub fn ram_extent(&self) -> RamExtent {
+        self.memory.extent()
     }
     pub fn register_locks(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
@@ -464,12 +470,13 @@ impl BedrockMd {
         let software = at / (BANK_SPAN / 8);
         let bank = software ^ ((s.config >> 32) & 3);
         if at & 0x7c8 == 0x408 {
-            if bank >= 2 {
+            let fitted = self.memory.fitted(bank);
+            if fitted == 0 {
                 return Some(0);
             }
             let within =
-                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % FITTED_BANK;
-            let key = ((bank * FITTED_BANK + within) >> 14) * 4 + ((within >> 7) & 3);
+                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % fitted;
+            let key = ((self.memory.dense_base(bank) + within) >> 14) * 4 + ((within >> 7) & 3);
             let old = *s.protection.get(&key).unwrap_or(&0);
             if let Some(v) = write {
                 s.protection.insert(key, v);
@@ -492,7 +499,8 @@ impl BedrockMd {
         };
         let table;
         let key;
-        if bank >= 2 || within >= FITTED_BANK {
+        let fitted = self.memory.fitted(bank);
+        if within >= fitted {
             if !s.compat.contains_key(&at) && s.compat.len() >= 74 {
                 return self.refuse("directory", at);
             }
@@ -500,7 +508,7 @@ impl BedrockMd {
             table = &mut s.compat;
             key = at;
         } else {
-            key = (bank * FITTED_BANK + within) / 128;
+            key = (self.memory.dense_base(bank) + within) / 128;
             table = if at & 8 != 0 {
                 &mut s.counters
             } else {
@@ -515,7 +523,7 @@ impl BedrockMd {
                 value
             };
             table.insert(key, value & mask);
-            if bank < 2 && within < FITTED_BANK && at & 8 == 0 {
+            if within < fitted && at & 8 == 0 {
                 if directory_syndrome(value, s.directory_config & 1 != 0) != 0 {
                     s.marked_directory.insert(key);
                 } else {
@@ -537,7 +545,7 @@ impl BedrockMd {
         if s.ecc_config & 1 != 0 || s.ecc.is_empty() {
             return data;
         }
-        let key = (bank as u64 * FITTED_BANK + at) / 8;
+        let key = (self.memory.dense_base(bank as u64) + at) / 8;
         if let Some(&check) = s.ecc.get(&key) {
             let syndrome = check ^ ecc_compute(data);
             if syndrome != 0 {
@@ -583,11 +591,11 @@ impl BedrockMd {
         if let Some(page) = self.memory.startup_device(address, bytes) {
             return Some(startup_access(page, address, bytes, write));
         }
-        let Some((bank, offset)) = BedrockMemory::decode(s.config, address, bytes) else {
+        let Some((bank, offset)) = self.memory.decode(s.config, address, bytes) else {
             return self.refuse("ram", address);
         };
         if !s.marked_directory.is_empty() {
-            let line = (bank as u64 * FITTED_BANK + offset) / 128;
+            let line = (self.memory.dense_base(bank as u64) + offset) / 128;
             if s.marked_directory.contains(&line) {
                 let premium = s.directory_config & 1 != 0;
                 let word = *s.directory.get(&line).unwrap_or(&0);
@@ -636,7 +644,7 @@ impl BedrockMd {
                 (old & !(mask << shift)) | ((value & mask) << shift),
             );
             if !s.ecc.is_empty() {
-                s.ecc.remove(&((bank as u64 * FITTED_BANK + at) / 8));
+                s.ecc.remove(&((self.memory.dense_base(bank as u64) + at) / 8));
             }
             Some(0)
         } else {
@@ -698,17 +706,16 @@ impl BedrockMd {
         } else {
             0
         };
-        let fits = selected < 2
-            && field & (1 << (configured & 1)) != 0
+        let fits = field & (1 << (configured & 1)) != 0
             && size != 0
-            && size <= FITTED_BANK;
+            && size <= self.memory.fitted(selected);
         s.selftest_result = fits;
         s.selftest_status = 0;
         s.selftest_error = 0;
         s.selftest_deadline = Some(s.clock_ns.saturating_add(1000));
         if fits && s.storage.get(&0x20038).copied().unwrap_or(0) == 0x80 {
             self.memory.zero(selected as usize, size);
-            let start = selected * FITTED_BANK;
+            let start = self.memory.dense_base(selected);
             s.ecc
                 .retain(|key, _| !(*key >= start / 8 && *key < (start + size) / 8));
             let lines: Vec<u64> = s
@@ -743,11 +750,11 @@ impl BedrockMd {
         let software = at / (BANK_SPAN / 8);
         let within = at % (BANK_SPAN / 8);
         let address = software * BANK_SPAN + within * 8;
-        let Some((bank, offset)) = BedrockMemory::decode(s.config, address, 8) else {
+        let Some((bank, offset)) = self.memory.decode(s.config, address, 8) else {
             return self.refuse("scrub", at);
         };
         for i in 0..8 {
-            if BedrockMemory::decode(s.config, address + i * 8, 8).is_some() {
+            if self.memory.decode(s.config, address + i * 8, 8).is_some() {
                 self.checked_word(s, bank, offset + i * 8, address + i * 8, event);
             }
         }
@@ -760,7 +767,7 @@ impl BedrockMd {
         let software = at / (BANK_SPAN / 8);
         let within = (at % (BANK_SPAN / 8)) ^ if bytes == 1 { 7 } else { 6 };
         let address = software * BANK_SPAN + within * 8;
-        let Some((bank, offset)) = BedrockMemory::decode(s.config, address, bytes * 8) else {
+        let Some((bank, offset)) = self.memory.decode(s.config, address, bytes * 8) else {
             if bytes == 2 && [0x04000006, 0x08000006].contains(&at) {
                 let i = usize::from(at == 0x08000006);
                 let old = s.admitted[i];
@@ -774,7 +781,7 @@ impl BedrockMd {
         let mut old = 0;
         for i in 0..bytes {
             let raw = offset + i * 8;
-            let key = (bank as u64 * FITTED_BANK + raw) / 8;
+            let key = (self.memory.dense_base(bank as u64) + raw) / 8;
             let computed = ecc_compute(self.memory.raw_read(bank, raw));
             old |= (s.ecc.get(&key).copied().unwrap_or(computed) as u64) << (i * 8);
             if let Some(value) = write {
@@ -809,7 +816,7 @@ impl DmaView {
         if let Some(page) = self.0.memory.startup_device(address, bytes) {
             return Some(page);
         }
-        BedrockMemory::decode(self.0.memory.config(), address, bytes)?;
+        self.0.memory.decode(self.0.memory.config(), address, bytes)?;
         let phys = self.0.physical();
         let entry = phys.entry_at(address);
         if crate::ppmem::devmap::entry_eq(entry, phys.default_entry()) {
@@ -997,8 +1004,13 @@ mod tests {
     // writable-masks, selftest-phases, fetchop-operations, ecc-carrier and
     // directory-storage.
     use super::*;
+    const FUEL_BANKS: [u32; 2] = [256, 256];
+    const FITTED_BANK: u64 = 256 << 20;
+    fn fuel() -> Arc<BedrockMd> {
+        BedrockMd::new(&FUEL_BANKS).unwrap()
+    }
     fn configured() -> Arc<BedrockMd> {
-        let md = BedrockMd::new();
+        let md = fuel();
         assert_eq!(md.md_bus().write64(8, 0x33), BUS_OK);
         md
     }
@@ -1013,7 +1025,7 @@ mod tests {
     /// and leaves memory as it was.
     #[test]
     fn a_valid_tag_for_the_window_starts_a_page_every_path_answers() {
-        let md = BedrockMd::new();
+        let md = fuel();
         let phys = md.physical();
         let (dma, uncached) = (md.dma_view(), md.uncached_view());
         let at = 0x10_0008 + 0x7000;
@@ -1039,7 +1051,7 @@ mod tests {
     /// leave the decode alone; only the window's valid tags start the page.
     #[test]
     fn other_tags_leave_the_window_to_memory() {
-        let md = BedrockMd::new();
+        let md = fuel();
         for tag in [0xffff_ffcf, 0xaaaa_aa8a, 0x5555_5545, 0, 0x108c0, 0xff00c0, 0x1000c0 >> 4] {
             md.startup_tag_store(tag);
             assert!(!md.memory.startup_live(), "{tag:#x}");
@@ -1055,7 +1067,7 @@ mod tests {
     /// first invalid tag of the final sweep.
     #[test]
     fn the_proms_tag_sequence_starts_and_ends_the_page_once() {
-        let md = BedrockMd::new();
+        let md = fuel();
         let phys = md.physical();
         for tag in [0xffff_ffcf, 0xaaaa_aa8a, 0x5555_5545, 0] {
             md.startup_tag_store(tag);
@@ -1263,6 +1275,169 @@ mod tests {
         assert_eq!(dma.gen_ptr(0), pointer, "a disabled bank keeps its logical counter alive");
     }
 
+    /// The Tezro's banks, in MiB from locational bank 0.
+    const TEZRO_BANKS: [u32; 6] = [1024, 1024, 512, 512, 512, 512];
+    /// Banks 0 and 1 at size code 5 (1 GiB), the other four at code 4 (512 MiB).
+    const TEZRO_CONFIG: u64 = 0x53 | (0x43 << 8) | (0x43 << 16);
+    fn tezro() -> Arc<BedrockMd> {
+        let md = BedrockMd::new(&TEZRO_BANKS).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        md
+    }
+
+    /// Each Tezro bank answers in its own 1 GiB slot at its own size: a
+    /// 1 GiB bank fills its slot, a 512 MiB bank stops halfway, and the
+    /// slots above bank 5 answer nothing. Banks 4 and 5 sit above 4 GiB,
+    /// where the CPU's direct window does not reach, and still answer
+    /// through the bus. Follows the qtest memory-banks and
+    /// memory-size-boundaries cases in tests/qtest/sn1-bedrock-md-test.c.
+    #[test]
+    fn every_tezro_bank_answers_at_its_own_size_including_above_4_gib() {
+        use crate::ppmem::MappedMemory;
+        let md = tezro();
+        let bus = md.physical();
+        let sizes = [1024u64, 1024, 512, 512, 512, 512];
+        for (slot, mib) in sizes.iter().enumerate() {
+            let base = slot as u64 * BANK_SPAN;
+            let size = mib << 20;
+            assert_eq!(bus.write64(base, 0x1111 * (slot as u64 + 1)), BUS_OK, "slot {slot}");
+            assert_eq!(bus.write64(base + size - 8, 0xe0 + slot as u64), BUS_OK, "slot {slot} top");
+            if size < BANK_SPAN {
+                assert_eq!(bus.read64(base + size).status, BUS_ERR, "slot {slot} past its bank");
+            }
+        }
+        for slot in 0..6u64 {
+            assert_eq!(bus.read64(slot * BANK_SPAN).data, 0x1111 * (slot + 1), "slot {slot}");
+            let top = (sizes[slot as usize] << 20) - 8;
+            assert_eq!(bus.read64(slot * BANK_SPAN + top).data, 0xe0 + slot, "slot {slot} top");
+        }
+        for slot in [6, 7] {
+            assert_eq!(bus.read64(slot * BANK_SPAN).status, BUS_ERR, "slot {slot} holds no bank");
+        }
+        assert_eq!(bus.banks()[4].read64(0).data, 0x1111 * 5, "bank 4 holds what slot 4 wrote");
+        assert_eq!(bus.banks()[5].read64(0).data, 0x1111 * 6);
+
+        // The window covers the first 4 GiB: 1 GiB, 1 GiB, 512 MiB, 512 MiB.
+        let space = bus.ppmem_space().expect("a window");
+        assert_eq!(space.mapped_bitmap(), 0xffff | (0xffff << 16) | (0xff << 32) | (0xff << 48));
+        assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 4 * BANK_SPAN));
+        assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 5 * BANK_SPAN));
+        assert_eq!(md.dma_view().read64(5 * BANK_SPAN).data, 0x1111 * 6, "DMA reaches it too");
+    }
+
+    /// Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5
+    /// trade places above 4 GiB. Follows memory-selector-high-bank.
+    #[test]
+    fn the_bank_select_swaps_banks_above_4_gib() {
+        let md = tezro();
+        let bus = md.physical();
+        assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
+        // Banks 0 and 1 swap too: the 1 GiB banks have different sizes only
+        // if the board says so, so give bank 1 a distinct value.
+        assert_eq!(bus.write64(0, 0xaa), BUS_OK);
+        assert_eq!(bus.write64(BANK_SPAN, 0xbb), BUS_OK);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        assert_eq!(bus.read64(0).data, 0xbb);
+        assert_eq!(bus.read64(BANK_SPAN).data, 0xaa);
+    }
+
+    /// Directory and ECC state is keyed per bank, so banks of different sizes
+    /// never share an entry. Follows directory-bank-translation.
+    #[test]
+    fn directory_entries_of_different_sized_banks_stay_apart() {
+        let md = tezro();
+        md.md_bus().write64(reg::DIRECTORY_CONFIG, 2);
+        let dir = md.directory_bus();
+        // Software bank n's carriers start at n * 128 MiB.
+        let at = |bank: u64, offset: u64| bank * (BANK_SPAN / 8) + offset;
+        for bank in 0..6 {
+            assert_eq!(dir.write64(at(bank, 0x20), 0x1000 + bank), BUS_OK, "bank {bank}");
+        }
+        for bank in 0..6 {
+            assert_eq!(dir.read64(at(bank, 0x20)).data, 0x1000 + bank, "bank {bank}");
+        }
+        // A 512 MiB bank's directory ends at its size code's reach.
+        assert_eq!(dir.read64(at(2, 0x20) + (BANK_SPAN / 16)).status, BUS_ERR);
+        assert_eq!(dir.read64(at(6, 0x20)).status, BUS_ERR, "no bank 6");
+    }
+
+    /// A fitting that covers the bank under test zero-fills it, whichever slot
+    /// the bank is in; a bank that is not fitted fails. Follows the
+    /// selftest-bank-remap and origin300-selftest-fill cases.
+    #[test]
+    fn selftest_fills_a_tezro_bank_above_4_gib_and_fails_a_missing_bank() {
+        let md = BedrockMd::new(&TEZRO_BANKS).unwrap();
+        // Every pair at size code 1 (64 MiB): small enough to fill in a test.
+        let regs = md.md_bus();
+        regs.write64(reg::CONFIG, 0x13 | (0x13 << 8) | (0x13 << 16) | (0x13 << 24));
+        let bus = md.physical();
+        bus.write64(4 * BANK_SPAN + 0x40, 0x5555);
+        regs.write64(0x20038, 0x80);
+        regs.write64(0x20030, (4 << 4) | 1);
+        md.advance_ns(1000);
+        assert_eq!(regs.read64(0x20048).data, 3, "bank 4 is fitted");
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x40).data, 0, "and zeroed");
+        regs.write64(0x20030, (6 << 4) | 1);
+        md.advance_ns(1000);
+        assert_eq!(regs.read64(0x20048).data, 2, "bank 6 is not fitted");
+    }
+
+    /// The board names what it fits; nothing else is accepted. A bank is a
+    /// whole number of direct-window regions and at most the largest size
+    /// code names.
+    #[test]
+    fn a_board_may_only_fit_banks_the_controller_can_decode() {
+        assert!(BedrockMd::new(&FUEL_BANKS).is_ok());
+        assert!(BedrockMd::new(&TEZRO_BANKS).is_ok());
+        for banks in [&[][..], &[0, 256], &[2048], &[100], &[64; 9]] {
+            assert!(BedrockMd::new(banks).is_err(), "{banks:?}");
+        }
+    }
+
+    /// Where RAM can be, for a board's cached view: the swizzle permutes slots
+    /// within groups of four, so a slot reaches as far as the largest bank of
+    /// its group.
+    #[test]
+    fn the_ram_extent_reaches_as_far_as_the_largest_bank_of_a_slot_group() {
+        let fuel = RamExtent::new(&FUEL_BANKS);
+        for slot in 0..4 {
+            assert!(fuel.contains(slot * BANK_SPAN + FITTED_BANK - 8), "slot {slot}");
+            assert!(!fuel.contains(slot * BANK_SPAN + FITTED_BANK), "slot {slot}");
+        }
+        assert!(!fuel.contains(4 * BANK_SPAN));
+        let tezro = RamExtent::new(&TEZRO_BANKS);
+        assert!(tezro.contains(3 * BANK_SPAN + BANK_SPAN - 8), "slot 3 may hold a 1 GiB bank");
+        assert!(tezro.contains(5 * BANK_SPAN + (512 << 20) - 8));
+        assert!(!tezro.contains(5 * BANK_SPAN + (512 << 20)));
+        assert!(!tezro.contains(8 * BANK_SPAN));
+        assert_eq!(tezro, BedrockMd::new(&TEZRO_BANKS).unwrap().ram_extent());
+    }
+
+    /// Code pages above 4 GiB have stable logical generation counters like
+    /// the rest, and a write bumps them.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn code_pages_above_4_gib_keep_a_logical_generation() {
+        let md = tezro();
+        let bus = md.physical();
+        let above = 4 * BANK_SPAN + 0x2000;
+        let pointer = md.dma_view().gen_ptr(above);
+        assert!(!pointer.is_null());
+        assert_ne!(pointer, md.dma_view().gen_ptr(5 * BANK_SPAN + 0x2000));
+        assert!(md.dma_view().gen_ptr(8 * BANK_SPAN).is_null(), "past the node's 8 GiB");
+        assert!(md.dma_view().gen_ptr(4 * BANK_SPAN + (512 << 20)).is_null(), "past the largest bank there");
+        let before = unsafe { (*pointer).load(Ordering::Relaxed) };
+        assert_eq!(md.dma_view().write64(above, 1), BUS_OK);
+        assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
+        md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32));
+        assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
+        let _ = bus;
+    }
+
     /// Guest density settings remap fitted RAM, and reset restores the default map.
     #[test]
     fn bank_configuration_remaps_memory_and_reset_restores_defaults() {
@@ -1450,7 +1625,7 @@ mod tests {
         {
             let now = Arc::new(AtomicU64::new(100));
             let time = now.clone();
-            let md = BedrockMd::with_clock(Arc::new(move || time.load(Ordering::Relaxed)));
+            let md = BedrockMd::with_clock(&FUEL_BANKS, Arc::new(move || time.load(Ordering::Relaxed))).unwrap();
             let regs = md.md_bus();
             regs.write64(8, 0x33);
             md.start_clock();

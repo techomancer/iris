@@ -520,7 +520,7 @@ fn code_generations_use_the_cached_plane_and_stable_ram_endpoint() {
     bus.set_ram_generations(stable_ram.clone());
     bus.map(3, 0, 0x1000, stable_ram.clone());
     bus.map(3, 0x3000, 8, stable_ram.clone());
-    let cached = bus.cached_view(stable_ram.clone());
+    let cached = bus.cached_view(stable_ram.clone(), crate::dev::bedrock_mem::RamExtent::new(&[256, 256]));
     assert_eq!(bus.gen_ptr(0x40), &stable_ram.generation as *const AtomicU64);
     assert_eq!(cached.gen_ptr(0x40), &stable_ram.generation as *const AtomicU64);
     assert_eq!(bus.gen_ptr(0x1fc00000), &rom.generation as *const AtomicU64);
@@ -682,10 +682,10 @@ fn uncached_fetch_compiles_the_uncached_view_body() {
     bus.set_ram_generations(ram.clone());
     bus.map(0, reset_vector, 0x1000, rom.clone());
     let bus = Arc::new(bus);
-    let code_bus = bus.code_view(bus.cached_view(ram.clone()));
+    let code_bus = bus.code_view(bus.cached_view(ram.clone(), crate::dev::bedrock_mem::RamExtent::new(&[512])));
     // The two views really disagree here.
     assert_eq!(bus.read32(reset_vector).data, addiu_r1);
-    assert_eq!(bus.cached_view(ram.clone()).read32(reset_vector).data, JIT_REGION_BOUNDARY_SENTINEL);
+    assert_eq!(bus.cached_view(ram.clone(), crate::dev::bedrock_mem::RamExtent::new(&[512])).read32(reset_vector).data, JIT_REGION_BOUNDARY_SENTINEL);
 
     let mut cpu = crate::ip35_machine::build_cpu(bus.clone());
     cpu.enable_jitv2_uncached_views(code_bus.clone());
@@ -772,7 +772,7 @@ mod code_views {
         let bus = Arc::new(bus);
         let mut cpu = crate::ip35_machine::build_cpu(bus.clone());
         if opted_in {
-            let cached = bus.cached_view(ram);
+            let cached = bus.cached_view(ram, crate::dev::bedrock_mem::RamExtent::new(&[512]));
             cpu.enable_jitv2_uncached_views(bus.code_view(cached));
         }
         (bus, cpu)
@@ -979,4 +979,25 @@ fn processor_interface_graphics_registers_keep_their_writes() {
     assert_eq!(board.pi[1].read64(0x308).data, 0);
     board.pi[0].power_on();
     assert_eq!(board.pi[0].read64(0x308).data, 0);
+}
+
+/// The memory map lists each slot that can hold RAM and the reset PROM. The
+/// Fuel's 256 MiB slots stop below the PROM; the Tezro's 1 GiB slot 0 reaches
+/// past it, and its RAM is listed on either side of the PROM's range.
+#[test]
+fn the_memory_map_lists_the_ram_slots_around_the_reset_prom() {
+    use crate::dev::bedrock_mem::RamExtent;
+    use crate::memory_map::MemKind;
+    let fuel = memory_map(&RamExtent::new(&[256, 256]));
+    let ram: Vec<_> = fuel.ranges().iter().filter(|r| r.kind == MemKind::Ram).map(|r| (r.base, r.end())).collect();
+    assert_eq!(ram, (0..4u64).map(|slot| (slot << 30, (slot << 30) + (256 << 20))).collect::<Vec<_>>());
+    assert_eq!(fuel.find(0x1fc0_0000).map(|r| r.kind), Some(MemKind::Rom));
+
+    let tezro = memory_map(&RamExtent::new(&[1024, 1024, 512, 512, 512, 512]));
+    assert_eq!(tezro.find(0x1fbf_fff8).map(|r| r.kind), Some(MemKind::Ram));
+    assert_eq!(tezro.find(0x1fc0_0000).map(|r| r.kind), Some(MemKind::Rom));
+    assert_eq!(tezro.find(0x2000_0000).map(|r| r.kind), Some(MemKind::Ram));
+    assert_eq!(tezro.find(0x3fff_fff8).map(|r| r.kind), Some(MemKind::Ram));
+    assert!(tezro.is_ram(5 << 30), "slot 5, above 4 GiB");
+    assert_eq!(tezro.end(), (7 << 30) + (512 << 20));
 }

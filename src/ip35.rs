@@ -13,7 +13,7 @@
 //!
 //! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
-use crate::dev::bedrock_mem::{BANK_SPAN, FITTED_BANK};
+use crate::dev::bedrock_mem::RamExtent;
 use crate::physical::Physical;
 use crate::traits::*;
 #[cfg(feature = "jitv2")]
@@ -25,18 +25,36 @@ use std::sync::Arc;
 pub(crate) const CPU_PHYS_MASK: u64 = ((1u64 << 40) - 1) | (3u64 << 57);
 const PA_MASK: u64 = (1u64 << 40) - 1;
 
-/// Where the Fuel has memory: four 1 GiB slots Bedrock's memory controller
-/// can place its two 256 MiB banks in, depending on how the PROM programs
-/// it, and the reset PROM between the first two. Uncached fetches of the
-/// PROM's own code land in its range.
-pub fn memory_map() -> crate::memory_map::MemoryMap {
+/// Where a Bedrock node has memory: each 1 GiB software slot `extent` says
+/// can hold RAM, as far as its largest bank reaches, and the reset PROM.
+/// Which bank lands in which slot of a group of four depends on how the PROM
+/// programs the memory controller; the Fuel's two 256 MiB banks can be in any
+/// of the first four. Uncached fetches of the PROM's own code land in its
+/// range. A slot 0 larger than 508 MiB reaches the PROM's range, which the
+/// node maps over it, so its RAM is listed on either side.
+pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
+    use crate::dev::bedrock_mem::{BANK_SPAN, SLOTS};
     use crate::memory_map::{MemKind, MemRange, MemoryMap};
-    const NAMES: [&str; 4] = ["ram slot 0", "ram slot 1", "ram slot 2", "ram slot 3"];
-    let mut ranges: Vec<MemRange> = NAMES.iter().enumerate().map(|(slot, &name)| {
-        let base = slot as u64 * BANK_SPAN;
-        MemRange::new(name, MemKind::Ram, base, base + FITTED_BANK)
-    }).collect();
-    ranges.push(MemRange::new("prom", MemKind::Rom, 0x1fc0_0000, 0x2000_0000));
+    const NAMES: [&str; SLOTS] = [
+        "ram slot 0", "ram slot 1", "ram slot 2", "ram slot 3",
+        "ram slot 4", "ram slot 5", "ram slot 6", "ram slot 7",
+    ];
+    const PROM: (u64, u64) = (0x1fc0_0000, 0x2000_0000);
+    let mut ranges = vec![MemRange::new("prom", MemKind::Rom, PROM.0, PROM.1)];
+    for (slot, &name) in NAMES.iter().enumerate() {
+        let (base, end) = (slot as u64 * BANK_SPAN, slot as u64 * BANK_SPAN + extent.prefix(slot));
+        if base == end {
+            continue;
+        }
+        if base < PROM.1 && end > PROM.0 {
+            ranges.push(MemRange::new(name, MemKind::Ram, base, PROM.0));
+            if end > PROM.1 {
+                ranges.push(MemRange::new("ram slot 0 above the prom", MemKind::Ram, PROM.1, end));
+            }
+        } else {
+            ranges.push(MemRange::new(name, MemKind::Ram, base, end));
+        }
+    }
     MemoryMap::new(ranges)
 }
 
@@ -247,10 +265,13 @@ impl Ip35Bus {
     pub fn code_view(self: &Arc<Self>, cached: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         Arc::new(CodeViews { cached, uncached: self.clone() })
     }
-    pub fn cached_view(&self, plain_memory: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+    /// Cached RAM, with `plain_memory` answering wherever `extent` says
+    /// fitted RAM can be.
+    pub fn cached_view(&self, plain_memory: Arc<dyn BusDevice>, extent: RamExtent) -> Arc<dyn BusDevice> {
         Arc::new(CachedPhysical {
             phys: self.phys.clone(),
             plain_memory,
+            extent,
         })
     }
 }
@@ -283,6 +304,7 @@ impl BusDevice for CodeViews {
 struct CachedPhysical {
     phys: Arc<Physical>,
     plain_memory: Arc<dyn BusDevice>,
+    extent: RamExtent,
 }
 impl CachedPhysical {
     fn memory_target(&self, a: u64, n: u64) -> Option<(&dyn BusDevice, u64)> {
@@ -290,7 +312,7 @@ impl CachedPhysical {
             // MD owns every guest write to a possible fitted-RAM prefix, so
             // all paths update its stable logical generation counters. PROM
             // and other devices retain the cached Physical connection.
-            let memory: &dyn BusDevice = if pa / BANK_SPAN < 4 && pa % BANK_SPAN < FITTED_BANK {
+            let memory: &dyn BusDevice = if self.extent.contains(pa) {
                 self.plain_memory.as_ref()
             } else { physical };
             (memory, pa)
