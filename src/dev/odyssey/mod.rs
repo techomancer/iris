@@ -123,7 +123,7 @@ pub use registers::*;
 pub use scanout::*;
 pub use worker::*;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -227,13 +227,16 @@ impl Odyssey {
         // hold off the next while the frame's lines are copied aside. The
         // colour rows it wrote since the last frame are resolved again.
         // The raster unit draws on while the copy is resolved.
+        let asked = std::time::Instant::now();
         let mut planes = state.raster.planes();
+        let held = std::time::Instant::now();
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let displayed = s.front.lock().displayed_buffer;
         planes.take_rows(displayed, &mut s.scanout);
         s.scanout_stage();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         drop(planes);
+        s.scanout.stats.locked(held - asked, held.elapsed());
         // The copy resolves with no lock held, so neither the front end
         // nor the raster unit waits for it.
         let mut job = s.scanout_take();
@@ -312,6 +315,29 @@ const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_micros(16_66
 
 impl Device for Odyssey {
     fn step(&self, _cycles: u64) {}
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("vpro".to_string(), "VPro counters: vpro refusals [reset] (bus refusals by reason and register), vpro dirty [reset] (display)".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "vpro" {
+            return Err(format!("unknown command: {cmd}"));
+        }
+        match args {
+            ["refusals"] => self.state.refusals.report(&mut *w).map_err(|e| e.to_string()),
+            ["refusals", "reset"] => {
+                self.state.refusals.reset();
+                Ok(())
+            }
+            ["dirty"] => self.state.board.lock().scanout.stats.report(&mut *w).map_err(|e| e.to_string()),
+            ["dirty", "reset"] => {
+                self.state.board.lock().scanout.stats = DirtyStats::default();
+                Ok(())
+            }
+            _ => Err("Usage: vpro refusals [reset] | vpro dirty [reset]".to_string()),
+        }
+    }
 
     fn start(&self) {
         let mut t = self.thread.lock();

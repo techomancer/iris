@@ -331,7 +331,7 @@ impl Board {
             }
         }
         self.object_flush(&mut staged);
-        self.scanout.invalidate_all();
+        self.scanout.invalidate_all_for(DirtySite::Dma);
     }
 }
 

@@ -519,6 +519,9 @@ impl Board {
             f.displayed_buffer ^= flips;
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: swap latch: arm {:#x} displayed {:#x}", flips, f.displayed_buffer);
         }
+        if flips != 0 {
+            self.scanout.stats.swaps += 1;
+        }
         crate::pf_instant!(crate::perfetto::events::ODSY_RETRACE, f.displayed_buffer);
         if f.routed() {
             f.deliver_routed(ODSY_ROUTE_VECTOR_RETRACE_SHIFT, "retrace", true);
@@ -591,6 +594,7 @@ impl Board {
                 self.scanout.dirty[y] = false;
             }
         }
+        self.scanout.stats.staged(stage.lines.len());
         self.scanout_stage = stage;
     }
 
@@ -610,7 +614,7 @@ impl Board {
     /// differ. A row where they are equal shows the same pixels either way.
     fn flip_rows(&mut self, flipped: u32) {
         if self.scanout.mode.height > SGI_ODYSSEY_HEIGHT {
-            return self.scanout.repaint_all();
+            return self.scanout.repaint_all_for(DirtySite::Flip);
         }
         if self.scanout.unnamed.iter().any(|&w| w != 0) {
             self.measure_differ();
@@ -625,7 +629,7 @@ impl Board {
         }
         for (i, mut w) in rows.into_iter().enumerate() {
             while w != 0 {
-                self.scanout.repaint((i as u32 * 64 + w.trailing_zeros()) as i32, 1);
+                self.scanout.repaint_for(DirtySite::Flip, (i as u32 * 64 + w.trailing_zeros()) as i32, 1);
                 w &= w - 1;
             }
         }
@@ -714,7 +718,7 @@ impl Board {
         let mut span: Option<(usize, usize)> = None;
         job.committed = false;
         if job.w == 0 || job.frame != (self.scanout.frame_width, self.scanout.frame_height) || job.w != self.scanout.mode.width as usize {
-            self.scanout.invalidate_all();
+            self.scanout.invalidate_all_for(DirtySite::Reshape);
             return None;
         }
         let w = job.w;

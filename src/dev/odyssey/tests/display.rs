@@ -743,3 +743,25 @@ fn a_reset_leaves_the_cursor_off_and_empty() {
     cursor_entry(&mut s, ODSY_CURSOR_CONTROL, 1);
     assert_eq!(shown(&mut s, 2, 3), 0);
 }
+
+/// The dirty-line counters name each mark's site and the lines a frame
+/// resolved, which `vpro dirty` reports.
+#[test]
+fn the_dirty_counters_name_the_site_and_the_frame_rows() {
+    let (mut s, _) = board("v12");
+    display_identity(&mut s, 0);
+    s.scanout_update();
+    s.scanout.stats = DirtyStats::default();
+
+    s.scanout.invalidate_for(DirtySite::Pixel, 7, 3);
+    s.scanout.repaint_for(DirtySite::Cursor, 1000, 100);
+    s.scanout_update();
+
+    let h = s.scanout.mode.height as u64;
+    let st = &s.scanout.stats;
+    assert_eq!(st.sites[DirtySite::Pixel as usize], [1, 3]);
+    assert_eq!(st.sites[DirtySite::Cursor as usize], [1, h - 1000], "clipped to the frame");
+    assert_eq!((st.frames, st.busy_frames, st.rows, st.max_rows), (1, 1, 3 + h - 1000, 3 + h - 1000));
+    s.scanout_update();
+    assert_eq!((s.scanout.stats.frames, s.scanout.stats.busy_frames), (2, 1), "an idle frame counts, with no rows");
+}

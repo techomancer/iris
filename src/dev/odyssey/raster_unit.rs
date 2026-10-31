@@ -179,7 +179,7 @@ impl DrawnRows {
         self.overlay = [0; ROW_WORDS];
         for (i, mut w) in shown.into_iter().enumerate() {
             while w != 0 {
-                scanout.repaint((i as u32 * 64 + w.trailing_zeros()) as i32, 1);
+                scanout.repaint_for(DirtySite::Raster, (i as u32 * 64 + w.trailing_zeros()) as i32, 1);
                 w &= w - 1;
             }
         }

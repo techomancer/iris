@@ -267,12 +267,100 @@ pub struct BoardLocks {
     pub front: Arc<Mutex<HostInterface>>,
     pub fifo: Arc<CommandFifo>,
     pub raster: Arc<RasterQueue>,
+    pub refusals: Arc<RefusalStats>,
+}
+
+/// Why the bus answered busy.
+#[derive(Clone, Copy)]
+pub enum Refusal {
+    /// A read behind command stores still in the FIFO.
+    ReadFifo,
+    /// A read behind raster work still queued.
+    ReadRaster,
+    /// A command store with the host ring full.
+    StoreFull,
+    /// A store that waits for the FIFO to drain.
+    StoreWaits,
+}
+
+impl Refusal {
+    const NAMES: [&'static str; 4] = ["read-fifo-pending", "read-raster-pending", "store-ring-full", "store-waits-fifo"];
+}
+
+const REFUSAL_SLOTS: usize = 512;
+
+/// Standing counters of the accesses the bus answered busy, by reason and
+/// by the aperture offset and width: lock-free, so the processor's threads
+/// count without waiting. Read by the monitor's `vpro refusals`. The table
+/// is open addressed; a key that finds it full is counted in `lost`.
+pub struct RefusalStats {
+    keys: [AtomicU64; REFUSAL_SLOTS],
+    counts: [AtomicU64; REFUSAL_SLOTS],
+    lost: AtomicU64,
+}
+
+impl RefusalStats {
+    pub fn new() -> Self {
+        Self { keys: std::array::from_fn(|_| AtomicU64::new(0)), counts: std::array::from_fn(|_| AtomicU64::new(0)), lost: AtomicU64::new(0) }
+    }
+
+    /// Count one refusal. The key is the reason, width and offset, plus one
+    /// so that zero means an empty slot.
+    pub fn note(&self, why: Refusal, addr: u64, size: u32) {
+        let key = (((why as u64) << 56) | ((size as u64) << 48) | addr) + 1;
+        let mut i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize % REFUSAL_SLOTS;
+        for _ in 0..REFUSAL_SLOTS {
+            let k = self.keys[i].load(Ordering::Relaxed);
+            if k == key || (k == 0 && self.keys[i].compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed).map_or_else(|c| c == key, |_| true)) {
+                self.counts[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            i = (i + 1) % REFUSAL_SLOTS;
+        }
+        self.lost.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reset(&self) {
+        for i in 0..REFUSAL_SLOTS {
+            self.counts[i].store(0, Ordering::Relaxed);
+        }
+        self.lost.store(0, Ordering::Relaxed);
+    }
+
+    /// Totals by reason, then each offset by count, largest first.
+    pub fn report(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let mut rows: Vec<(u64, u64)> = (0..REFUSAL_SLOTS)
+            .filter_map(|i| {
+                let (k, c) = (self.keys[i].load(Ordering::Relaxed), self.counts[i].load(Ordering::Relaxed));
+                (k != 0 && c != 0).then(|| (k - 1, c))
+            })
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut totals = [0u64; Refusal::NAMES.len()];
+        for (k, c) in &rows {
+            totals[(k >> 56) as usize] += c;
+        }
+        for (name, t) in Refusal::NAMES.iter().zip(totals) {
+            writeln!(w, "reason {name} {t}")?;
+        }
+        writeln!(w, "lost {}", self.lost.load(Ordering::Relaxed))?;
+        for (k, c) in rows {
+            writeln!(w, "{} offset {:#x} size {} count {}", Refusal::NAMES[(k >> 56) as usize], k & 0xffff_ffff_ffff, (k >> 48) & 0xff, c)?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for RefusalStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BoardLocks {
     pub fn new(s: Box<Board>) -> Self {
         let (front, fifo, raster) = (s.front.clone(), s.fifo.clone(), s.raster.clone());
-        BoardLocks { board: Arc::new(Mutex::new(s)), front, fifo, raster }
+        BoardLocks { board: Arc::new(Mutex::new(s)), front, fifo, raster, refusals: Arc::new(RefusalStats::new()) }
     }
 
     /// A processor's read: through the front alone when it can, else under the
@@ -299,9 +387,11 @@ impl BoardLocks {
         if access_waits(addr, size, false) && !level_word(addr, size) && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) {
             if self.fifo.pending() {
                 self.fifo.hurry();
+                self.refusals.note(Refusal::ReadFifo, addr, size);
                 return None;
             }
             if self.raster.pending() != 0 {
+                self.refusals.note(Refusal::ReadRaster, addr, size);
                 return None;
             }
         }
@@ -320,6 +410,7 @@ impl BoardLocks {
         if command_store(addr, size) {
             if self.fifo.full_for(size) {
                 self.fifo.hurry();
+                self.refusals.note(Refusal::StoreFull, addr, size);
                 return false;
             }
             self.write_command(addr, value, size);
@@ -328,6 +419,7 @@ impl BoardLocks {
         // A store that waits for the work, as a waiting read does.
         if access_waits(addr, size, true) && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) && self.fifo.pending() {
             self.fifo.hurry();
+            self.refusals.note(Refusal::StoreWaits, addr, size);
             return false;
         }
         self.write(addr, value, size);

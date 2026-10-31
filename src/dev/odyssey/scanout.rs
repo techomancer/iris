@@ -24,6 +24,148 @@ pub struct ScanoutMode {
     pub clock_hz: u32,     // the clock they count; 0: no retrace
 }
 
+/// What marked display lines dirty, for [`DirtyStats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirtySite {
+    /// A caller that does not say.
+    Other,
+    /// A new mode or a reset: the whole frame.
+    Mode,
+    /// A raster job's rows (DrawnRows::take()).
+    Raster,
+    /// A swap: the rows the window's buffers differ in (Board::flip_rows()).
+    Flip,
+    /// A frame whose shape changed while it was resolved (Board::scanout_commit()).
+    Reshape,
+    /// The lookup RAM, a display mode or an overlay mode.
+    Lut,
+    /// The cursor's old and new place.
+    Cursor,
+    /// A pixel store from the front end (Board::paint_pixel()).
+    Pixel,
+    /// An image transfer's row.
+    Image,
+    /// A solid rectangle fill (Board::fill_rect()).
+    FillRect,
+    /// A write to the id or overlay planes (Board::clear_planes()).
+    ClearPlanes,
+    /// A screen-to-screen blit (Board::copy_rect()).
+    CopyRect,
+    /// A pattern quad (Board::pattern_fill()).
+    PatternFill,
+    /// A DMA into the colour buffer (Board::dma_to_buffer()).
+    Dma,
+    /// The end of an integer primitive (Board::gl_end()).
+    GlEnd,
+    /// An integer pixel that goes through a logic operation or to the id planes.
+    Integer,
+}
+
+impl DirtySite {
+    pub const ALL: [DirtySite; 16] = [
+        DirtySite::Other,
+        DirtySite::Mode,
+        DirtySite::Raster,
+        DirtySite::Flip,
+        DirtySite::Reshape,
+        DirtySite::Lut,
+        DirtySite::Cursor,
+        DirtySite::Pixel,
+        DirtySite::Image,
+        DirtySite::FillRect,
+        DirtySite::ClearPlanes,
+        DirtySite::CopyRect,
+        DirtySite::PatternFill,
+        DirtySite::Dma,
+        DirtySite::GlEnd,
+        DirtySite::Integer,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DirtySite::Other => "other",
+            DirtySite::Mode => "mode",
+            DirtySite::Raster => "raster",
+            DirtySite::Flip => "flip",
+            DirtySite::Reshape => "reshape",
+            DirtySite::Lut => "lut",
+            DirtySite::Cursor => "cursor",
+            DirtySite::Pixel => "pixel",
+            DirtySite::Image => "image",
+            DirtySite::FillRect => "fill_rect",
+            DirtySite::ClearPlanes => "clear_planes",
+            DirtySite::CopyRect => "copy_rect",
+            DirtySite::PatternFill => "pattern_fill",
+            DirtySite::Dma => "dma",
+            DirtySite::GlEnd => "gl_end",
+            DirtySite::Integer => "integer",
+        }
+    }
+}
+
+/// Standing counters of the display's dirty lines, read by the monitor's
+/// `vpro dirty`: per site the marks made and the lines they named, and per
+/// display frame the lines resolved. Plain integers under the board lock.
+#[derive(Clone, Default, Debug)]
+pub struct DirtyStats {
+    /// By DirtySite: [marks, lines named].
+    pub sites: [[u64; 2]; DirtySite::ALL.len()],
+    /// Display frames that staged their lines, and those with any line.
+    pub frames: u64,
+    pub busy_frames: u64,
+    /// Lines resolved in all frames, and in the widest one.
+    pub rows: u64,
+    pub max_rows: u64,
+    /// Swaps latched at a retrace.
+    pub swaps: u64,
+    /// The frame's wait for the raster unit's context while it held the
+    /// board lock, and its hold of both for the plane copy: totals and
+    /// longest, in nanoseconds.
+    pub wait_ns: u64,
+    pub wait_max_ns: u64,
+    pub copy_ns: u64,
+    pub copy_max_ns: u64,
+}
+
+impl DirtyStats {
+    pub fn staged(&mut self, rows: usize) {
+        self.frames += 1;
+        if rows != 0 {
+            self.busy_frames += 1;
+            self.rows += rows as u64;
+            self.max_rows = self.max_rows.max(rows as u64);
+        }
+    }
+
+    /// Time one frame took waiting for the planes and copying them.
+    pub fn locked(&mut self, wait: std::time::Duration, copy: std::time::Duration) {
+        let (wait, copy) = (wait.as_nanos() as u64, copy.as_nanos() as u64);
+
+        self.wait_ns += wait;
+        self.wait_max_ns = self.wait_max_ns.max(wait);
+        self.copy_ns += copy;
+        self.copy_max_ns = self.copy_max_ns.max(copy);
+    }
+
+    pub fn report(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(w, "frames {} busy {} rows {} max {} swaps {}", self.frames, self.busy_frames, self.rows, self.max_rows, self.swaps)?;
+        writeln!(
+            w,
+            "planes wait_us {} max {} copy_us {} max {}",
+            self.wait_ns / 1000,
+            self.wait_max_ns / 1000,
+            self.copy_ns / 1000,
+            self.copy_max_ns / 1000
+        )?;
+        for (site, c) in DirtySite::ALL.iter().zip(&self.sites) {
+            if c[0] != 0 {
+                writeln!(w, "site {} marks {} rows {}", site.name(), c[0], c[1])?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct Scanout {
     pub mode: ScanoutMode,
@@ -43,6 +185,8 @@ pub struct Scanout {
     /// The displayed-buffer bits the frame was last staged from.
     pub staged_displayed: u32,
 
+    pub stats: DirtyStats,
+
     pub retrace_deadline: i64, // virtual ns of the next retrace; -1 disarmed
     pub epoch: i64,            // virtual time of retrace 0
     pub frames: u64,           // retraces since the epoch
@@ -59,6 +203,7 @@ impl Default for Scanout {
             differ: Box::new([[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]),
             unnamed: [0; ROW_WORDS],
             staged_displayed: 0,
+            stats: DirtyStats::default(),
             retrace_deadline: -1,
             epoch: 0,
             frames: 0,
@@ -73,12 +218,12 @@ impl Scanout {
         self.mode.sanitize();
         crate::dlog!(LogModule::Odyssey, "sgi-odyssey: scanout mode: {}x{} frame {} clocks at {} Hz", self.mode.width, self.mode.height, self.mode.frame_clocks, self.mode.clock_hz);
         self.alloc();
-        self.invalidate_all();
+        self.invalidate_all_for(DirtySite::Mode);
         self.restart();
     }
     /// Repaint and restart the retrace phase.
     pub fn reset(&mut self) {
-        self.invalidate_all();
+        self.invalidate_all_for(DirtySite::Mode);
         self.restart();
     }
 
@@ -114,6 +259,9 @@ impl Scanout {
     /// Resolve lines again because something other than the colour planes
     /// changed (the lookup RAM, a display mode, the cursor, a swap).
     pub fn repaint(&mut self, first: i32, count: i32) {
+        self.repaint_for(DirtySite::Other, first, count);
+    }
+    pub fn repaint_for(&mut self, site: DirtySite, first: i32, count: i32) {
         let h: i32 = if !self.frame.is_empty() { self.mode.height as i32 } else { 0 };
         let last = first.wrapping_add(count).wrapping_sub(1);
 
@@ -122,25 +270,37 @@ impl Scanout {
         if first > last {
             return;
         }
+        let c = &mut self.stats.sites[site as usize];
+        c[0] += 1;
+        c[1] += (last - first + 1) as u64;
         for d in &mut self.dirty[first as usize..=last as usize] {
             *d = true;
         }
     }
     pub fn repaint_all(&mut self) {
-        self.repaint(0, self.mode.height as i32);
+        self.repaint_all_for(DirtySite::Other);
+    }
+    pub fn repaint_all_for(&mut self, site: DirtySite) {
+        self.repaint_for(site, 0, self.mode.height as i32);
     }
 
     /// Resolve lines again because the planes may have changed, in either
     /// colour buffer: the lines, and the next swap measures the buffers.
     pub fn invalidate(&mut self, first: i32, count: i32) {
-        self.repaint(first, count);
+        self.invalidate_for(DirtySite::Other, first, count);
+    }
+    pub fn invalidate_for(&mut self, site: DirtySite, first: i32, count: i32) {
+        self.repaint_for(site, first, count);
         let last = first.wrapping_add(count).wrapping_sub(1).min(ROW_WORDS as i32 * 64 - 1);
         for y in first.max(0)..=last {
             self.unnamed[y as usize >> 6] |= 1 << (y & 63);
         }
     }
     pub fn invalidate_all(&mut self) {
-        self.invalidate(0, self.mode.height as i32);
+        self.invalidate_all_for(DirtySite::Other);
+    }
+    pub fn invalidate_all_for(&mut self, site: DirtySite) {
+        self.invalidate_for(site, 0, self.mode.height as i32);
     }
 }
 

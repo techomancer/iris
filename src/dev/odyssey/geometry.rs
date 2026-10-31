@@ -1410,6 +1410,6 @@ impl Board {
                 return;
             }
         }
-        self.scanout.invalidate_all();
+        self.scanout.invalidate_all_for(DirtySite::GlEnd);
     }
 }

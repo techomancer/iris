@@ -817,7 +817,7 @@ fn the_bus_is_busy_only_when_the_ring_is_full_and_the_shallow_mode_stalls_at_the
 
 /// The flow-control target word is stored, not routed, so a store to it
 /// goes in at once while the FIFO holds queued work: the bus answers
-/// ready and the word reads back from the front.
+/// ready, no refusal is counted, and the word reads back from the front.
 #[test]
 fn a_flow_control_target_store_does_not_wait_for_the_fifo() {
     let (h, _rec) = threaded_board();
@@ -833,6 +833,11 @@ fn a_flow_control_target_store_does_not_wait_for_the_fifo() {
     assert_eq!(h.bus_read(ODSY_FLCTL_TARGET, 4), Some(word));
     assert!(h.fifo.pending(), "it did not drain the FIFO");
 
+    let mut report = Vec::new();
+    h.refusals.report(&mut report).unwrap();
+    let report = String::from_utf8(report).unwrap();
+    assert!(report.contains("reason store-waits-fifo 0"), "{report}");
+    assert!(!report.contains("offset 0x1074"), "{report}");
     h.work_stop();
 }
 

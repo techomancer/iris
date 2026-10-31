@@ -467,6 +467,7 @@ impl OctaneMachine {
             for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
                 v.add_cpu_stats(c.cycles_ptr(), tick.clone());
             }
+            monitor.register_device(v.clone());
         }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));

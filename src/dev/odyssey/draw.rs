@@ -257,7 +257,7 @@ impl Board {
         }
         // A store from the front end, not a raster job: the display line is
         // marked here, since no job records the row (see RasterQueue::submit()).
-        self.scanout.invalidate(y as i32, 1);
+        self.scanout.invalidate_for(DirtySite::Pixel, y as i32, 1);
     }
 }
 
@@ -439,7 +439,7 @@ impl Board {
             let runs = self.row_runs(y as i64 + row as i64);
             self.paint_integer_span(&runs, y as i64 + row as i64, x as i64, x as i64 + w as i64, is_index, value);
         }
-        self.scanout.invalidate_all();
+        self.scanout.invalidate_all_for(DirtySite::FillRect);
     }
 
     /// Board::clear_planes(): the X server's write to the id-plane destination.
@@ -465,7 +465,7 @@ impl Board {
             }
         }
         // A pixel's drawable picks its colour at scanout.
-        self.scanout.invalidate_all();
+        self.scanout.invalidate_all_for(DirtySite::ClearPlanes);
     }
 
     /// The screen-to-screen blit (Board::copy_rect()), the console-scroll primitive.
@@ -577,7 +577,7 @@ impl Board {
             self.cmd_unimplemented(ODSY_CMD_COPY_RECT_TRIGGER);
             return;
         }
-        self.scanout.invalidate_all();
+        self.scanout.invalidate_all_for(DirtySite::CopyRect);
     }
 
     /// Pattern mode is on when the 0x0404 mode's bits 3,4 are set and a shape is
@@ -677,7 +677,7 @@ impl Board {
                 }
             }
         }
-        self.scanout.invalidate_all();
+        self.scanout.invalidate_all_for(DirtySite::PatternFill);
     }
 }
 
@@ -735,7 +735,7 @@ impl Board {
                     rgba,
                     SGI_LOGIC_COPY as u8,
                 );
-                self.scanout.invalidate(self.image_cur_y as i32 + self.win_origin[1], 1);
+                self.scanout.invalidate_for(DirtySite::Image, self.image_cur_y as i32 + self.win_origin[1], 1);
             } else if !self.aux_image_reported {
                 self.aux_image_reported = true;
                 crate::dlog!(LogModule::Odyssey, "sgi-odyssey: an RGB image to the id-plane destination is not modeled; dropped");
