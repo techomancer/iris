@@ -565,9 +565,9 @@ impl BedrockMemory {
             // Withdraw the direct window before publishing the checked page.
             if m.windowed.remove(&region) {
                 if let Some(space) = space {
-                    #[cfg(test)]
-                    Cost::add(&self.cost.window_ops, 1);
-                    space.unmap_range(region << BITMAP_SHIFT, region_size);
+                    // Off the direct path, host pages left mapped: another
+                    // processor that read the old bitmap still reaches the bank.
+                    space.withdraw_range(region << BITMAP_SHIFT, region_size);
                 }
                 self.bump_pages(region << BITMAP_SHIFT, run.bank,
                     offset & !(region_size - 1), region_size >> SLOT_SHIFT);
@@ -643,12 +643,19 @@ impl BedrockMemory {
             let startup = self.startup_live() && region == 0;
             let in_window = (region + 1) << BITMAP_SHIFT <= WINDOW_SIZE;
             if let (Some(space), true, false) = (space, in_window, startup) {
+                let base = region << BITMAP_SHIFT;
+                // A region withdrawn from the path is still mapped; one the
+                // last rebuild left out because it held a page was never.
+                if space.restore_range(base, region_size) {
+                    m.windowed.insert(region);
+                    continue;
+                }
                 #[cfg(test)]
                 Cost::add(&self.cost.window_ops, 1);
-                match space.map_range(run.bank, offset, region << BITMAP_SHIFT, region_size) {
+                match space.map_range(run.bank, offset, base, region_size) {
                     Ok(()) => { m.windowed.insert(region); }
                     Err(error) => crate::dlog!(crate::devlog::LogModule::Bedrock,
-                        "Bedrock RAM window at {:#x}: {error}", region << BITMAP_SHIFT),
+                        "Bedrock RAM window at {:#x}: {error}", base),
                 }
             }
         }

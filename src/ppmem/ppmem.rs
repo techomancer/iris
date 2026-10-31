@@ -700,6 +700,9 @@ struct SpaceState {
     /// The window's size in bytes. Never changes.
     window: u64,
     mappings: Vec<Mapping>,
+    /// Ranges still mapped on the host but off the direct path; see
+    /// [`PpMemSpace::withdraw_range`].
+    withdrawn: Vec<Mapping>,
     /// Where the bitmap is published. Points at `own_bitmap` until a consumer
     /// hands over its own inline field, so it is never null and publication is
     /// an unconditional store.
@@ -765,6 +768,7 @@ impl PpMemSpace {
             state: UnsafeCell::new(SpaceState {
                 window,
                 mappings: Vec::new(),
+                withdrawn: Vec::new(),
                 sink,
                 sink2,
                 more_sinks: Vec::new(),
@@ -852,12 +856,16 @@ impl PpMemSpace {
         }
     }
 
-    /// Withdraw `offset..offset + size` from the window, leaving whatever
-    /// else was mapped. A mapping that only partly overlaps keeps the rest,
-    /// but a bitmap bit stays set only for a region still wholly mapped, so
-    /// withdrawing part of a region takes the whole region off the direct
-    /// path.
-    pub fn unmap_range(&self, offset: u64, size: u64) {
+    /// Take `offset..offset + size` off the direct path without unmapping
+    /// it. The bitmap is republished to every sink with the regions this
+    /// leaves partly covered clear; the host mapping and its counters stay,
+    /// so a processor that read the old bitmap an instant ago still reaches
+    /// the bank's bytes rather than a scrubbed page, and needs no other
+    /// processor stopped. A mapping that only partly overlaps keeps the rest
+    /// on the path, but a bit is set only for a region still wholly mapped,
+    /// so withdrawing part of a region takes the whole region off.
+    /// [`Self::restore_range`] puts it back. CPU thread only, as the rest.
+    pub fn withdraw_range(&self, offset: u64, size: u64) {
         assert!(offset + size <= self.window_size(), "ppmem: [{offset:#x}, +{size:#x}) escapes the window");
         let st = unsafe { &mut *self.state.get() };
         let end = offset + size;
@@ -867,7 +875,8 @@ impl PpMemSpace {
                 kept.push(m);
                 continue;
             }
-            self.scrub_range(m.at.max(offset), (m.at + m.len).min(end) - m.at.max(offset));
+            let (from, to) = (m.at.max(offset), (m.at + m.len).min(end));
+            st.withdrawn.push(Mapping { at: from, len: to - from });
             if m.at < offset {
                 kept.push(Mapping { at: m.at, len: offset - m.at });
             }
@@ -877,6 +886,23 @@ impl PpMemSpace {
         }
         st.mappings = kept;
         Self::recompute_bitmap(st);
+    }
+
+    /// Put what [`Self::withdraw_range`] took off the direct path in
+    /// `offset..offset + size` back on it, republishing the bitmap. Returns
+    /// whether anything was withdrawn there; if not, nothing was mapped
+    /// and the caller maps the range with [`Self::map_range`].
+    pub fn restore_range(&self, offset: u64, size: u64) -> bool {
+        let st = unsafe { &mut *self.state.get() };
+        let end = offset + size;
+        let (back, still): (Vec<_>, Vec<_>) = std::mem::take(&mut st.withdrawn)
+            .into_iter()
+            .partition(|m| m.at >= offset && m.at + m.len <= end);
+        st.withdrawn = still;
+        let any = !back.is_empty();
+        st.mappings.extend(back);
+        Self::recompute_bitmap(st);
+        any
     }
 
     /// Recompute the bitmap from the live mapping list.
@@ -926,6 +952,9 @@ impl PpMemSpace {
         state
             .mappings
             .retain(|m| !(m.at >= at && m.at + m.len <= at + len));
+        state
+            .withdrawn
+            .retain(|m| !(m.at >= at && m.at + m.len <= at + len));
         state.mappings.push(Mapping { at, len });
         Self::recompute_bitmap(state);
     }
@@ -946,7 +975,7 @@ impl PpMemSpace {
 impl MappedMemory for PpMemSpace {
     fn clear_mappings(&self) {
         let st = unsafe { &mut *self.state.get() };
-        for m in std::mem::take(&mut st.mappings) {
+        for m in std::mem::take(&mut st.mappings).into_iter().chain(std::mem::take(&mut st.withdrawn)) {
             self.scrub_range(m.at, m.len);
         }
         unsafe {
@@ -1527,27 +1556,39 @@ mod tests {
         assert_eq!(space.mapped_bitmap(), 0, "bitmap not cleared");
     }
 
-    /// Withdrawing one region takes only its bit and leaves the regions
-    /// either side mapped; mapping it again brings the bit back with the
-    /// bank's bytes behind it.
+    /// Withdrawing one region clears only its bit in every sink and leaves
+    /// the host mapping, so the bank's bytes stay reachable; restoring it sets
+    /// the bit again without mapping anything. Clearing the mappings scrubs
+    /// withdrawn ranges too.
     #[test]
-    fn unmap_range_withdraws_one_region_and_remap_restores_it() {
-        let (space, banks) = PpMemSpace::with_bank_sizes(&[192]).unwrap();
+    fn withdraw_range_clears_one_region_in_every_sink_and_keeps_the_mapping() {
+        let (space, banks) = PpMemSpace::with_bank_sizes(&[256]).unwrap();
+        let (mut second, mut third) = (0u64, 0u64);
+        unsafe {
+            space.set_bitmap_sink(&mut second);
+            space.set_bitmap_sink2(&mut third);
+        }
         let region = 64 * MB as u64;
         for i in 0..3 {
             space.map_range(0, i * region, i * region, region).unwrap();
         }
-        assert_eq!(space.mapped_bitmap(), 0b111);
-        banks[0].write64(region, 0x1234);
-        space.unmap_range(region, region);
-        assert_eq!(space.mapped_bitmap(), 0b101);
+        assert_eq!((space.mapped_bitmap(), third), (0b111, 0b111));
+        space.withdraw_range(region, region);
+        assert_eq!((space.mapped_bitmap(), third), (0b101, 0b101));
         assert_eq!(space.mapping_count(), 2);
-        space.map_range(0, region, region, region).unwrap();
-        assert_eq!(space.mapped_bitmap(), 0b111);
-        assert_eq!(banks[0].read64(region).data, 0x1234, "the bank keeps its bytes");
+        // The host mapping is still there: a store through the window lands in the bank.
+        unsafe { *(space.window_base().add(region as usize + 0x100) as *mut u32) = 0x0BAD_C0DE };
+        assert_eq!(banks[0].read32(region + 0x100).data, 0x0BAD_C0DE);
+        assert!(space.restore_range(region, region));
+        assert_eq!((space.mapped_bitmap(), third), (0b111, 0b111));
+        assert!(!space.restore_range(region, region), "nothing left to restore");
         // Part of a region leaves the whole region off the direct path.
-        space.unmap_range(region + 0x1000, 0x1000);
-        assert_eq!(space.mapped_bitmap(), 0b101);
+        space.withdraw_range(region + 0x1000, 0x1000);
+        assert_eq!((space.mapped_bitmap(), third), (0b101, 0b101));
+        space.clear_mappings();
+        assert!(!space.restore_range(0, 3 * region), "a clear scrubs what was withdrawn");
+        assert_eq!((space.mapped_bitmap(), third), (0, 0));
+        let _ = second;
     }
 
     /// The low-512KB alias: bank 0's first 512KB visible at physical 0, the

@@ -18,7 +18,7 @@ use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 
 pub mod reg {
@@ -84,6 +84,9 @@ pub enum MemoryError {
     Uncorrectable,
 }
 type ErrorCallback = Arc<dyn Fn(MemoryError) + Send + Sync>;
+/// Runs the closure it is given with every other processor parked, as the
+/// board's `World::stop_others` does. See [`BedrockMd::set_remap_guard`].
+pub type RemapGuard = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
 
 struct State {
     cell: u64,
@@ -209,6 +212,7 @@ pub struct BedrockMd {
     remapping: Mutex<()>,
     callback: Mutex<Option<ErrorCallback>>,
     unsupported: AtomicU64,
+    guard: OnceLock<RemapGuard>,
 }
 #[derive(Clone, Copy)]
 enum View {
@@ -247,10 +251,30 @@ impl BedrockMd {
             remapping: Mutex::new(()),
             callback: Mutex::new(None),
             unsupported: AtomicU64::new(0),
+            guard: OnceLock::new(),
         });
         md.memory.set_slow_view(md.view(View::Memory));
         md.rebuild_memory();
         Ok(md)
+    }
+    /// Have every rebuild of the whole memory map run inside `guard`. A
+    /// rebuild scrubs and remaps host pages that another processor may be
+    /// running from, so on a multiprocessor board it must run with the others
+    /// parked. Placing and retiring one checked page only takes a region off
+    /// the direct path and swaps table entries, and needs no guard. The guard
+    /// is entered before any lock of this controller is taken, so a processor
+    /// that is waiting for one cannot keep it from stopping the others.
+    /// The configuration register write, [`Self::rebuild_memory`],
+    /// [`Self::soft_reset`], a startup-window change and
+    /// [`Resettable::power_on`] enter it. Set once, before the processors run.
+    pub fn set_remap_guard(&self, guard: RemapGuard) {
+        assert!(self.guard.set(guard).is_ok(), "Bedrock MD remap guard already set");
+    }
+    fn stopped<R>(&self, work: impl FnOnce() -> R) -> R {
+        let Some(guard) = self.guard.get() else { return work() };
+        let (mut work, mut done) = (Some(work), None);
+        guard(&mut || done = work.take().map(|work| work()));
+        done.expect("the remap guard ran its work")
     }
     /// Where fitted RAM can answer, for the processor bus's cached view.
     pub fn ram_extent(&self) -> RamExtent {
@@ -313,9 +337,11 @@ impl BedrockMd {
     /// Ordinary CPU config/diagnostic writes rebuild their changed mappings
     /// automatically. This also releases pages whose metadata DMA consumed.
     pub fn rebuild_memory(&self) {
-        let _remapping = self.remapping.lock();
-        let (config, pages) = Self::mapping(&self.state.lock());
-        self.memory.remap(config, pages, true);
+        self.stopped(|| {
+            let _remapping = self.remapping.lock();
+            let (config, pages) = Self::mapping(&self.state.lock());
+            self.memory.remap(config, pages, true);
+        })
     }
     /// The guest stored `tag` in a primary data cache tag: the PROM building
     /// its stack in cache lines, or ending that. While they stand the window
@@ -324,11 +350,13 @@ impl BedrockMd {
     /// thread, outside the cache's locks.
     pub fn startup_tag_store(&self, tag: u32) {
         let Some(live) = self.memory.startup_tag(tag) else { return };
-        let _remapping = self.remapping.lock();
-        if self.memory.set_startup(live) {
-            let (config, pages) = Self::mapping(&self.state.lock());
-            self.memory.remap(config, pages, true);
-        }
+        self.stopped(|| {
+            let _remapping = self.remapping.lock();
+            if self.memory.set_startup(live) {
+                let (config, pages) = Self::mapping(&self.state.lock());
+                self.memory.remap(config, pages, true);
+            }
+        })
     }
     /// Zero every bank, as a power-on does. Physical's own `reset_memory`
     /// advances only the banks' counters; code pages follow the logical ones,
@@ -418,6 +446,9 @@ impl BedrockMd {
     }
     /// Called on the CPU thread or with the CPU stopped.
     pub fn soft_reset(&self) {
+        self.stopped(|| self.soft_reset_stopped())
+    }
+    fn soft_reset_stopped(&self) {
         let _remapping = self.remapping.lock();
         let mut s = self.state.lock();
         s.cell = u64::MAX;
@@ -438,6 +469,12 @@ impl BedrockMd {
         if ![1, 2, 4, 8].contains(&bytes) || addr % bytes != 0 {
             return self.refuse("access", addr);
         }
+        if write.is_some() && matches!(view, View::Registers) && addr == reg::CONFIG {
+            return self.stopped(|| self.access_unguarded(view, addr, bytes, write));
+        }
+        self.access_unguarded(view, addr, bytes, write)
+    }
+    fn access_unguarded(&self, view: View, addr: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
         // Only CPU register/configuration and diagnostic writes can add
         // metadata. Keep their remap off DMA threads: ordinary RAM, scrub
         // and fetch operations only remove entries, leaving safe slow pages
@@ -921,11 +958,13 @@ impl BedrockMd {
 impl Resettable for BedrockMd {
     fn power_on(&self) {
         // Reset is called on the CPU thread or with it stopped.
-        let _remapping = self.remapping.lock();
-        *self.state.lock() = State::default();
-        let was_live = self.memory.startup_live();
-        self.memory.clear_startup();
-        self.memory.remap(0, BTreeSet::new(), was_live);
+        self.stopped(|| {
+            let _remapping = self.remapping.lock();
+            *self.state.lock() = State::default();
+            let was_live = self.memory.startup_live();
+            self.memory.clear_startup();
+            self.memory.remap(0, BTreeSet::new(), was_live);
+        })
     }
 }
 /// Resolve each DMA access through the atomic Physical table, as HEART
@@ -1617,7 +1656,9 @@ mod tests {
     }
 
     /// What marking and lifting checked pages costs in host mappings,
-    /// decode-table rewrites and generation counters. The PROM's memory test
+    /// decode-table rewrites and generation counters. Taking a region off the
+    /// direct path and putting it back maps nothing: the pages stay mapped
+    /// and only the bitmap changes. The PROM's memory test
     /// marks and lifts the same few hundred doublewords thousands of times
     /// (the QEMU model counted 6630 of each for 310 doublewords, and
     /// rebuilding the map each time took the test from ten seconds to
@@ -1641,7 +1682,7 @@ mod tests {
             // in that region is one more table entry. Above the window there
             // is no region to take.
             let cost = spent(md, || mark(md, first));
-            assert_eq!(cost, if windowed { [1, 1, REGION_BUMPS] } else { [0, 1, PAGE_BUMPS] }, "first page at {base:#x}");
+            assert_eq!(cost, if windowed { [0, 1, REGION_BUMPS] } else { [0, 1, PAGE_BUMPS] }, "first page at {base:#x}");
             assert_eq!(spent(md, || mark(md, second)), [0, 1, PAGE_BUMPS], "second page at {base:#x}");
             // Lifting costs nothing: both pages stay on the MD endpoint.
             assert_eq!(spent(md, || { lift(md, first); lift(md, second) }), [0, 0, 0], "lifts at {base:#x}");
@@ -1651,8 +1692,9 @@ mod tests {
             // leaves the marked page where it is.
             assert_eq!(spent(md, || md.retire_lifted_marks()), [0, 1, PAGE_BUMPS], "retire at {base:#x}");
             lift(md, first);
-            let window = u64::from(windowed);
-            assert_eq!(spent(md, || md.retire_lifted_marks()), [window, 1, PAGE_BUMPS], "last retire at {base:#x}");
+            // The region comes back to the direct path with no host mapping:
+            // withdrawing it left the pages mapped.
+            assert_eq!(spent(md, || md.retire_lifted_marks()), [0, 1, PAGE_BUMPS], "last retire at {base:#x}");
         }
     }
 
@@ -1774,7 +1816,7 @@ mod tests {
             }
         });
         let regions = regions.len() as u64;
-        assert_eq!(cost, [regions, 300, regions * REGION_BUMPS + (300 - regions) * PAGE_BUMPS]);
+        assert_eq!(cost, [0, 300, regions * REGION_BUMPS + (300 - regions) * PAGE_BUMPS]);
     }
 
     /// Lifted pages pile up only so far: the first mark after
@@ -1788,7 +1830,7 @@ mod tests {
         // One more page, in another region, makes the 1024 lifted pages due.
         let cost = spent(&md, || mark(&md, 0x400_0000 + 0x1000));
         let retired = RETIRED_LIMIT as u64;
-        assert_eq!(cost, [1 + 1, 1 + retired, REGION_BUMPS + PAGE_BUMPS * retired]);
+        assert_eq!(cost, [0, 1 + retired, REGION_BUMPS + PAGE_BUMPS * retired]);
         assert!(crate::ppmem::devmap::entry_eq(md.physical().entry_at(0x5000), md.physical().entry_at(0x20_0000)));
     }
 
@@ -1807,6 +1849,34 @@ mod tests {
         assert!(crate::ppmem::devmap::entry_eq(md.physical().entry_at(0x5000), md.physical().entry_at(0x20_0000)));
     }
 
+    /// A guard sees only the rebuilds of the whole map: the configuration
+    /// write, a rebuild, resets and a startup-window change. Placing and
+    /// retiring a page, which map and scrub nothing, run without it.
+    #[test]
+    fn only_whole_map_rebuilds_enter_the_remap_guard() {
+        let md = BedrockMd::new(&FUEL_BANKS).unwrap();
+        let entered = Arc::new(AtomicU64::new(0));
+        let seen = entered.clone();
+        md.set_remap_guard(Arc::new(move |work: &mut dyn FnMut()| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            work();
+        }));
+        let entries = || entered.load(Ordering::SeqCst);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        assert_eq!(entries(), 1);
+        mark(&md, 0x5000);
+        lift(&md, 0x5000);
+        md.retire_lifted_marks();
+        assert_eq!(entries(), 1, "marks and retirements are not rebuilds");
+        md.rebuild_memory();
+        md.soft_reset();
+        md.startup_tag_store(WINDOW_TAGS[0]);
+        md.power_on();
+        assert_eq!(entries(), 5);
+        md.startup_tag_store(0xffff_ffcf);
+        assert_eq!(entries(), 5, "a tag that changes nothing stops nobody");
+    }
+
     /// A page that is marked, or its region's direct path, drops the code
     /// compiled from it; a page elsewhere keeps its counter, and lifting
     /// changes nothing until the page is returned.
@@ -1816,11 +1886,21 @@ mod tests {
         let (page, neighbour, elsewhere) = (0x5000, 0x9000, 0x400_0000 + 0x5000);
         let seen = |md: &Arc<BedrockMd>| [page, neighbour, elsewhere].map(|a| counter(md, a));
         let start = seen(&md);
+        #[cfg(feature = "jitv2")]
+        let bank = |offset: u64| unsafe { (*md.physical().banks()[0].gen_ptr(offset)).load(Ordering::Relaxed) };
+        #[cfg(feature = "jitv2")]
+        let banks = [page, neighbour, elsewhere].map(bank);
         mark(&md, page);
         let marked = seen(&md);
         let step = |a: [u64; 3], b: [u64; 3]| [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
         let jit = u64::from(cfg!(feature = "jitv2"));
         assert_eq!(step(start, marked), [jit, jit, 0], "the page and its region");
+        #[cfg(feature = "jitv2")]
+        {
+            // The bank's own counters follow, as a full remap would bump them.
+            let now = [page, neighbour, elsewhere].map(bank);
+            assert!(now[0] > banks[0] && now[1] > banks[1] && now[2] == banks[2]);
+        }
         mark(&md, neighbour);
         assert_eq!(step(marked, seen(&md)), [0, jit, 0], "only the second page");
         lift(&md, page);
