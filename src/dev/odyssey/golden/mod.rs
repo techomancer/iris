@@ -15,6 +15,9 @@
 //! pixels that differ by more than the scene's per-channel delta. That is the
 //! check for a change that moves numerics on purpose (the vertex side moving
 //! to 32-bit floats); a change that must not move a pixel uses the default.
+//!
+//! `scripts/vpro-goldens.sh` wraps the commands, and
+//! `src/dev/odyssey/testdata/README.md` says how to re-take the goldens.
 
 use super::raster_bench;
 use super::board::Board;
