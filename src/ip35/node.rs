@@ -26,6 +26,7 @@ use crate::dev::bedrock_pi::{BedrockPi, BedrockPiConfig, Population, SIZE as PI_
 use crate::dev::bedrock_xb::{BedrockXb, SIZE as XB_SIZE};
 use crate::dev::heart::Clock;
 use crate::dev::l1::{L1, L1Config, L1Event};
+use crate::dev::odyssey::{pi_gfx_mark_store, pi_gfx_unmark_store};
 use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend, CiSerialBackend, LogMode, SerialBackend, TeeBackend};
 use crate::devlog::LogModule;
 use crate::irq::{InterruptController, IrqLine};
@@ -34,7 +35,7 @@ use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Machin
 use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -218,11 +219,19 @@ pub(crate) struct Node {
     pub io: Arc<BedrockIo>,
     pub ni: Arc<BedrockNi>,
     pub xb: Arc<BedrockXb>,
+    /// Set once by a board that counts graphics stores.
+    io_store_counter: Arc<OnceLock<StoreCounter>>,
     #[cfg(test)]
     pub irq: Arc<PendingIrq>,
 }
 
 impl Node {
+    /// Count the processor's uncached I/O stores with `counter`, as a board
+    /// with graphics credits does. Once, before the processor runs.
+    pub fn count_io_stores(&self, counter: StoreCounter) {
+        assert!(self.io_store_counter.set(counter).is_ok(), "node I/O store counter already set");
+    }
+
     pub fn build(config: NodeConfig<'_>) -> Result<Self, String> {
         let NodeConfig { name, payload, clock, flash_path, banks_mib, population, firmware, board_id, l1 } = config;
         let md = BedrockMd::with_clock(banks_mib, clock.clone())?;
@@ -329,7 +338,8 @@ impl Node {
         #[cfg(feature = "jitv2")]
         bus.set_ram_generations(md.dma_view());
         md.rebuild_memory();
-        bus.set_fallback(1, 1 << 32, Arc::new(IoPio(io.clone())));
+        let io_store_counter = Arc::new(OnceLock::new());
+        bus.set_fallback(1, 1 << 32, Arc::new(IoPio { io: io.clone(), counter: io_store_counter.clone() }));
         // The two XIO register forms select the requester's PI0 interface.
         let permission_md = Arc::downgrade(&md);
         let permission: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
@@ -385,6 +395,7 @@ impl Node {
         bus.map(2, 0, 1 << 33, md.fetchop_bus());
         Ok(Self {
             bus: Arc::new(bus),
+            io_store_counter,
             pi,
             md,
             l1,
@@ -504,18 +515,31 @@ impl BusDevice for Leds {
     }
 }
 
-struct IoPio(Arc<BedrockIo>);
+/// Whether a processor's uncached I/O store at a node I/O offset is counted
+/// against a graphics page (see [`crate::dev::odyssey::PiGfx`]).
+pub(crate) type StoreCounter = Box<dyn Fn(u64) -> bool + Send + Sync>;
+
+/// The processor's uncached I/O view of the node. A board with graphics
+/// counts its stores; the store is forwarded marked as counted or not.
+struct IoPio {
+    io: Arc<BedrockIo>,
+    counter: Arc<OnceLock<StoreCounter>>,
+}
 macro_rules! pio_access {
     ($r:ident,$w:ident,$ty:ty,$result:ident,$size:expr) => {
         fn $r(&self, a: u64) -> $result {
-            let r = self.0.pio_read(a, $size);
+            let r = self.io.pio_read(a, $size);
             $result {
                 data: r.data as $ty,
                 status: r.status,
             }
         }
         fn $w(&self, a: u64, v: $ty) -> u32 {
-            self.0.pio_write(a, $size, v as u64)
+            let counted = self.counter.get().is_some_and(|count| count(a));
+            let previous = pi_gfx_mark_store(counted);
+            let status = self.io.pio_write(a, $size, v as u64);
+            pi_gfx_unmark_store(previous);
+            status
         }
     };
 }
