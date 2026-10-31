@@ -4460,6 +4460,155 @@ mod tests {
         check::<R5000ShadowCache>(false);
     }
 
+    /// A secondary line staged with Index Store Tag and Index Store Data is
+    /// fetched as code, not the page the JIT compiled from memory: staging it
+    /// drops the page from the JIT (the micro-TLB flush in `exec_cache`, then
+    /// `jitv2_track_pcp` declining the page), and invalidating the line puts
+    /// the page back on memory and the JIT. Production dispatch, inline
+    /// compile, an R10000-family shadow cache.
+    #[test]
+    #[cfg(not(feature = "lightning"))]
+    fn a_staged_line_is_fetched_as_code_instead_of_the_compiled_page() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_isa::{OP_ADDIU, OP_CACHE};
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let ra = 0xFFFF_FFFF_8000_2000u64;
+        let addiu = |imm: u32| make_i(OP_ADDIU, 0, 2, imm as u16);
+        let jr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
+        let mem = Arc::new(MockMemory::new());
+        for (i, w) in [addiu(0x11), jr, 0].into_iter().enumerate() {
+            mem.set_word(0x1000 + 4 * i as u64, w);
+        }
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec = Box::new(MipsExecutor::<PassthroughTlb, R10000ShadowCache>::new(
+            bus, PassthroughTlb::default(), &MipsCpuConfig::for_model::<R10000ShadowCache>(Arc::new(crate::ip22_bus::memory_map(false)))));
+        exec.core.cp0_config = (exec.core.cp0_config & !7) | 3; // KSEG0 cacheable
+        exec.install_jit_hooks();
+        exec.jitv2_inline_compile = true;
+        exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        let run = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| -> u64 {
+            exec.core.pc = pc;
+            exec.core.gpr[31] = ra;
+            exec.core.gpr[2] = 0;
+            for _ in 0..16 {
+                if exec.core.pc == ra { break; }
+                exec.step_jit();
+            }
+            assert_eq!(exec.core.pc, ra, "the code returns");
+            exec.core.gpr[2]
+        };
+        let cache_op = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>, op: u32, lo: u32, hi: u32| {
+            exec.core.gpr[4] = pc;
+            exec.core.cp0_taglo = lo as u64;
+            exec.core.cp0_taghi = hi;
+            assert_eq!(exec.exec(make_i(OP_CACHE, 4, op, 0)), crate::cpu::mips_exec::EXEC_COMPLETE);
+        };
+
+        // From memory, until the page is compiled and entered.
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x11);
+        }
+        assert!(!exec.pcp.is_null(), "the page is on the JIT");
+        assert!(unsafe { (*exec.pcp).is_published(0) }, "and compiled");
+
+        // Stage the line at PA 0x1000: valid CleanExclusive, tag PA[39:18] = 0.
+        cache_op(&mut exec, 0x0b, 2 << 10, 0);
+        assert!(exec.pcp.is_null(), "staging dropped the page from the JIT");
+        // TagLo is the word at the lower address (the inferred refill order).
+        cache_op(&mut exec, 0x1f, addiu(0x22), jr);
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x22, "the staged word runs, not the compiled page");
+        }
+        assert!(exec.pcp.is_null(), "and the page stays off it");
+
+        // Invalidate the line (Index Writeback Invalidate): memory and the JIT again.
+        cache_op(&mut exec, 0x03, 0, 0);
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x11);
+        }
+        assert!(!exec.pcp.is_null(), "the page is back on the JIT");
+    }
+
+    /// The data side: compiled loads reach RAM through the micro-TLB and
+    /// ppmem's window, never the cache. Warm the micro-TLB on a page, stage a
+    /// secondary line in it, and the compiled load returns the staged word;
+    /// invalidating the line sends it back to the window.
+    #[test]
+    #[cfg(not(feature = "lightning"))]
+    fn a_compiled_load_hits_a_staged_line_not_the_window() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_cache_v2::MipsCache;
+        use crate::cpu::mips_isa::{OP_CACHE, OP_LW};
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let ra = 0xFFFF_FFFF_8000_8000u64;
+        let data_va = 0xFFFF_FFFF_8000_2000u64; // PA 0x2000
+        let lw = make_i(OP_LW, 4, 2, 0);
+        let jr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
+        let mem = Arc::new(MockMemory::new());
+        for (i, w) in [lw, jr, 0].into_iter().enumerate() {
+            mem.set_word(0x1000 + 4 * i as u64, w);
+        }
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec = Box::new(MipsExecutor::<PassthroughTlb, R10000ShadowCache>::new(
+            bus, PassthroughTlb::default(), &MipsCpuConfig::for_model::<R10000ShadowCache>(Arc::new(crate::ip22_bus::memory_map(false)))));
+        exec.core.cp0_config = (exec.core.cp0_config & !7) | 3; // KSEG0 cacheable
+        // Out of reset ERL is set and the micro-TLB declines to fill; this test
+        // is about what it holds.
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+        exec.resync_privilege_state();
+        // A window over the first 64 KiB of RAM, region 0 mapped, as ppmem
+        // publishes them: u32 words in native order.
+        let mut window = vec![0u8; 0x10000];
+        unsafe { *(window.as_mut_ptr().add(0x2000) as *mut u32) = 0x0a0a_0a0a };
+        let mut gens: Vec<AtomicU64> = (0..16).map(|_| AtomicU64::new(0)).collect();
+        unsafe {
+            exec.set_tcache_window(window.as_mut_ptr());
+            exec.set_tcache_gen_window(gens.as_mut_ptr());
+            *exec.tcache_bitmap_ptr() = 1;
+        }
+        exec.core.ppmem_bitmap = 1;
+        exec.install_jit_hooks();
+        assert!(exec.cache.jit_dc_geometry().supported, "the inline path is on");
+        exec.jitv2_inline_compile = true;
+        exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        let run = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| -> u64 {
+            exec.core.pc = pc;
+            exec.core.gpr[31] = ra;
+            exec.core.gpr[4] = data_va;
+            exec.core.gpr[2] = 0;
+            for _ in 0..16 {
+                if exec.core.pc == ra { break; }
+                exec.step_jit();
+            }
+            assert_eq!(exec.core.pc, ra, "the code returns");
+            exec.core.gpr[2]
+        };
+        let cache_op = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>, op: u32, lo: u32, hi: u32| {
+            exec.core.gpr[5] = data_va;
+            exec.core.cp0_taglo = lo as u64;
+            exec.core.cp0_taghi = hi;
+            assert_eq!(exec.exec(make_i(OP_CACHE, 5, op, 0)), crate::cpu::mips_exec::EXEC_COMPLETE);
+        };
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x0a0a_0a0a, "from the window");
+        }
+        // PA 0x2000: valid CleanExclusive, tag PA[39:18] = 0. TagLo is the
+        // word at the lower address (the inferred refill order).
+        cache_op(&mut exec, 0x0b, 2 << 10, 0);
+        cache_op(&mut exec, 0x1f, 0x5a5a_5a5a, 0x1111_1111);
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x5a5a_5a5a, "from the staged line");
+        }
+        cache_op(&mut exec, 0x03, 0, 0);
+        for _ in 0..4 {
+            assert_eq!(run(&mut exec), 0x0a0a_0a0a, "from the window again");
+        }
+    }
+
     #[test]
     fn lwl_lwr_combine_to_a_full_unaligned_word_load_matches_interpreter() {
         // The canonical compiler-generated idiom for an unaligned word
