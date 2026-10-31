@@ -4467,7 +4467,6 @@ mod tests {
     /// the page back on memory and the JIT. Production dispatch, inline
     /// compile, an R10000-family shadow cache.
     #[test]
-    #[cfg(not(feature = "lightning"))]
     fn a_staged_line_is_fetched_as_code_instead_of_the_compiled_page() {
         use crate::cpu::mips_cache_shadow::R10000ShadowCache;
         use crate::cpu::mips_isa::{OP_ADDIU, OP_CACHE};
@@ -4536,7 +4535,6 @@ mod tests {
     /// secondary line in it, and the compiled load returns the staged word;
     /// invalidating the line sends it back to the window.
     #[test]
-    #[cfg(not(feature = "lightning"))]
     fn a_compiled_load_hits_a_staged_line_not_the_window() {
         use crate::cpu::mips_cache_shadow::R10000ShadowCache;
         use crate::cpu::mips_cache_v2::MipsCache;
@@ -4607,6 +4605,81 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(run(&mut exec), 0x0a0a_0a0a, "from the window again");
         }
+    }
+
+    /// The store side: a compiled store through a warm write micro-TLB entry
+    /// goes inline into ppmem's window. Once the page holds a staged line the
+    /// store lands in the line instead: the window and memory do not change,
+    /// a cached load sees the value, and invalidating the line (it is
+    /// DirtyExclusive after the store) writes the value back to memory.
+    #[test]
+    fn a_compiled_store_to_a_staged_line_stays_in_the_line() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_cache_v2::MipsCache;
+        use crate::cpu::mips_isa::{OP_CACHE, OP_SW};
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let ra = 0xFFFF_FFFF_8000_8000u64;
+        let data_va = 0xFFFF_FFFF_8000_2000u64; // PA 0x2000
+        let sw = make_i(OP_SW, 4, 5, 0);
+        let jr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
+        let mem = Arc::new(MockMemory::new());
+        for (i, w) in [sw, jr, 0].into_iter().enumerate() {
+            mem.set_word(0x1000 + 4 * i as u64, w);
+        }
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec = Box::new(MipsExecutor::<PassthroughTlb, R10000ShadowCache>::new(
+            bus, PassthroughTlb::default(), &MipsCpuConfig::for_model::<R10000ShadowCache>(Arc::new(crate::ip22_bus::memory_map(false)))));
+        exec.core.cp0_config = (exec.core.cp0_config & !7) | 3; // KSEG0 cacheable
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+        exec.resync_privilege_state();
+        let mut window = vec![0u8; 0x10000];
+        let mut gens: Vec<AtomicU64> = (0..16).map(|_| AtomicU64::new(0)).collect();
+        unsafe {
+            exec.set_tcache_window(window.as_mut_ptr());
+            exec.set_tcache_gen_window(gens.as_mut_ptr());
+            *exec.tcache_bitmap_ptr() = 1;
+        }
+        exec.core.ppmem_bitmap = 1;
+        exec.install_jit_hooks();
+        assert!(exec.cache.jit_dc_geometry().supported, "the inline path is on");
+        exec.jitv2_inline_compile = true;
+        exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        let win = |window: &Vec<u8>| unsafe { *(window.as_ptr().add(0x2000) as *const u32) };
+        let run = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>, v: u64| {
+            exec.core.pc = pc;
+            exec.core.gpr[31] = ra;
+            exec.core.gpr[4] = data_va;
+            exec.core.gpr[5] = v;
+            for _ in 0..16 {
+                if exec.core.pc == ra { break; }
+                exec.step_jit();
+            }
+            assert_eq!(exec.core.pc, ra, "the code returns");
+        };
+        let cache_op = |exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>, op: u32, lo: u32, hi: u32| {
+            exec.core.gpr[6] = data_va;
+            exec.core.cp0_taglo = lo as u64;
+            exec.core.cp0_taghi = hi;
+            assert_eq!(exec.exec(make_i(OP_CACHE, 6, op, 0)), crate::cpu::mips_exec::EXEC_COMPLETE);
+        };
+        for v in 1..=4u64 {
+            run(&mut exec, v);
+            assert_eq!(win(&window), v as u32, "into the window");
+        }
+        cache_op(&mut exec, 0x0b, 2 << 10, 0);
+        cache_op(&mut exec, 0x1f, 0, 0);
+        for v in 0x10..0x14u64 {
+            run(&mut exec, v);
+            assert_eq!(win(&window), 4, "the window is left alone");
+            assert_eq!(exec.cache.read::<4>(data_va, 0x2000).data, v, "the line has it");
+        }
+        assert_eq!(mem.get_word(0x2000), 0, "and memory");
+        cache_op(&mut exec, 0x03, 0, 0);
+        assert_eq!(mem.get_word(0x2000), 0x13, "written back when the line goes");
+        run(&mut exec, 0x20);
+        assert_eq!(win(&window), 0x20, "back to the window");
     }
 
     #[test]
