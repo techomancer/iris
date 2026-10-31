@@ -515,6 +515,31 @@ impl BusDevice for Leds {
     }
 }
 
+/// A widget's DMA as Bedrock's inbound path takes it: crosstalk addresses,
+/// with the widget's inbound permissions applied.
+pub(crate) struct WidgetDma {
+    pub io: std::sync::Weak<BedrockIo>,
+    pub widget: u8,
+}
+macro_rules! widget_dma_access {
+    ($r:ident,$w:ident,$ty:ty,$result:ident,$size:expr) => {
+        fn $r(&self, a: u64) -> $result {
+            let Some(io) = self.io.upgrade() else { return $result::err() };
+            let r = io.inbound_read(self.widget, None, a, $size);
+            $result { data: r.data as $ty, status: r.status }
+        }
+        fn $w(&self, a: u64, v: $ty) -> u32 {
+            self.io.upgrade().map_or(BUS_ERR, |io| io.inbound_write(self.widget, None, a, $size, v as u64))
+        }
+    };
+}
+impl BusDevice for WidgetDma {
+    widget_dma_access!(read8, write8, u8, BusRead8, 1);
+    widget_dma_access!(read16, write16, u16, BusRead16, 2);
+    widget_dma_access!(read32, write32, u32, BusRead32, 4);
+    widget_dma_access!(read64, write64, u64, BusRead64, 8);
+}
+
 /// Whether a processor's uncached I/O store at a node I/O offset is counted
 /// against a graphics page (see [`crate::dev::odyssey::PiGfx`]).
 pub(crate) type StoreCounter = Box<dyn Fn(u64) -> bool + Send + Sync>;
