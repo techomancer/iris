@@ -82,6 +82,7 @@ pub mod hub_pi;
 pub mod dp83840;
 pub mod bedrock;
 pub mod bedrock_flash;
+pub mod bcm5701;
 pub mod dp83843;
 pub mod ics1890;
 pub mod isp12160;
