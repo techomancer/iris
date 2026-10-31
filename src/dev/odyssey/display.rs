@@ -238,7 +238,7 @@ struct IdShow {
 
 /// Everything a row's resolve reads outside the planes, gathered once. The
 /// board lock is held across an update, so none of it can change meanwhile.
-struct ResolveCtx {
+pub(super) struct ResolveCtx {
     ids: [IdShow; ODSY_DISPMODE_COUNT as usize],
     /// Per overlay id: whether it is enabled, and its entry base.
     overlay: [(bool, u32); ODSY_OVERLAY_IDS as usize],
@@ -306,7 +306,7 @@ impl Board {
         self.cursor_row(y, dst, width);
     }
 
-    fn resolve_ctx(&mut self) -> ResolveCtx {
+    pub(super) fn resolve_ctx(&mut self) -> ResolveCtx {
         let displayed = self.front.lock().displayed_buffer;
         let mut ids = [IdShow::default(); ODSY_DISPMODE_COUNT as usize];
         let mut overlay = [(false, 0u32); ODSY_OVERLAY_IDS as usize];
@@ -382,7 +382,7 @@ impl Board {
     /// The plane bytes a row's resolve reads, when the row takes
     /// resolve_line(): both colour buffers in one byte order, the id
     /// bytes and the overlay bytes, each `width` pixels.
-    fn scanout_line(&self, y: u32, w: usize) -> Option<ScanoutLine<'_>> {
+    pub(super) fn scanout_line(&self, y: u32, w: usize) -> Option<ScanoutLine<'_>> {
         let at = y as usize * SGI_ODYSSEY_WIDTH as usize;
         let (l0, be0) = self.colour_line(0, y, w)?;
         let (l1, be1) = self.colour_line(1, y, w)?;
@@ -403,8 +403,28 @@ impl Board {
     }
 }
 
+/// A run of RGB pixels through the gamma table: `src` is their plane words
+/// (`BE`: big-endian), `FOLD`: the mode has narrow channels to fold first.
+#[inline(always)]
+fn gamma_run<const BE: bool, const FOLD: bool>(ctx: &ResolveCtx, show: &IdShow, src: &[u8], out: &mut [u32]) {
+    let [red, green, blue] = &*ctx.gamma;
+
+    for (out, c) in out.iter_mut().zip(src.chunks_exact(4)) {
+        let raw = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let word = if BE { raw.swap_bytes() } else { raw };
+        let (mut r, mut g, mut b) = (word >> 24, (word >> 16) & 0xff, (word >> 8) & 0xff);
+
+        if FOLD {
+            r = (r & show.keep) | (r >> show.down);
+            g = (g & show.keep) | (g >> show.down);
+            b = (b & show.keep) | (b >> show.down);
+        }
+        *out = red[r as usize & 0xff] | green[g as usize & 0xff] | blue[b as usize & 0xff];
+    }
+}
+
 /// One row's plane bytes, as resolve_line() reads them.
-struct ScanoutLine<'a> {
+pub(super) struct ScanoutLine<'a> {
     colour: [&'a [u8]; 2],
     /// The colour words are big-endian.
     be: bool,
@@ -416,7 +436,7 @@ struct ScanoutLine<'a> {
 /// per-pixel decisions that depend only on a pixel's drawable id made once
 /// per update (ResolveCtx) and the planes read as lines of words. Whether a
 /// pixel showed through colour map group 25.
-fn resolve_line(ctx: &ResolveCtx, line: ScanoutLine<'_>, dst: &mut [u32]) -> bool {
+pub(super) fn resolve_line(ctx: &ResolveCtx, line: ScanoutLine<'_>, dst: &mut [u32]) -> bool {
     let ScanoutLine { colour: lines, be: be0, did, overlay: ovl } = line;
     let w = did.len();
     let mut saw_unverified = false;
@@ -430,22 +450,20 @@ fn resolve_line(ctx: &ResolveCtx, line: ScanoutLine<'_>, dst: &mut [u32]) -> boo
         let (enabled, obase) = ctx.overlay[(d as u32 & ODSY_DID_OVERLAY_MASK) as usize];
         let show = &ctx.ids[(d >> ODSY_DID_MAIN_SHIFT) as usize & (ODSY_DISPMODE_COUNT as usize - 1)];
         let out = &mut dst[x..end];
-        let src = lines[show.buf][x * 4..end * 4].chunks_exact(4).map(|c| {
-            let raw = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            if be0 { raw.swap_bytes() } else { raw }
-        });
+        let src = &lines[show.buf][x * 4..end * 4];
         let ov = &ovl[x..end];
 
         if show.rgb {
-            for (out, word) in out.iter_mut().zip(src) {
-                let r = ((word >> 24) & show.keep) | ((word >> 24) >> show.down);
-                let g = (((word >> 16) & 0xff) & show.keep) | (((word >> 16) & 0xff) >> show.down);
-                let b = (((word >> 8) & 0xff) & show.keep) | (((word >> 8) & 0xff) >> show.down);
-
-                *out = ctx.gamma[0][r as usize & 0xff] | ctx.gamma[1][g as usize & 0xff] | ctx.gamma[2][b as usize & 0xff];
+            match (be0, show.keep != 0xff) {
+                (true, true) => gamma_run::<true, true>(ctx, show, src, out),
+                (false, true) => gamma_run::<false, true>(ctx, show, src, out),
+                (true, false) => gamma_run::<true, false>(ctx, show, src, out),
+                (false, false) => gamma_run::<false, false>(ctx, show, src, out),
             }
         } else {
-            for (out, word) in out.iter_mut().zip(src) {
+            for (out, c) in out.iter_mut().zip(src.chunks_exact(4)) {
+                let raw = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let word = if be0 { raw.swap_bytes() } else { raw };
                 *out = ctx.rgb[(show.base + (word & show.mask)) as usize & (ODSY_LUT_SIZE as usize - 1)];
             }
             // Reported only if a pixel of the run is shown through it.

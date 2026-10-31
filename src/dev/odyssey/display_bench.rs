@@ -240,6 +240,21 @@ fn resolve_and_present_timings() {
         });
         println!("resolve {name:10} {}x{}: {ms:.3} ms per full resolve (best run)", s.scanout.mode.width, s.scanout.mode.height);
     }
+    for (scene, name) in SCENES {
+        let mut s = scene_board(scene);
+        let ctx = s.resolve_ctx();
+        let (w, h) = (s.scanout.mode.width as usize, s.scanout.mode.height);
+        let width = s.scanout.mode.width.min(SGI_ODYSSEY_WIDTH) as usize;
+        let mut dst = vec![0u32; w];
+        let ms = bench(|| {
+            for y in 0..h {
+                if let Some(line) = s.scanout_line(y, width) {
+                    std::hint::black_box(resolve_line(&ctx, line, &mut dst));
+                }
+            }
+        });
+        println!("lines  {name:10} {w}x{h}: {ms:.3} ms to resolve the planes' lines alone");
+    }
     for (rows, name) in [(480, "a 480-row window"), (1024, "every row")] {
         let mut s = swap_board(rows);
         s.scanout_update();
