@@ -6616,4 +6616,71 @@ mod tests {
             assert_eq!(entry::<R4400ShadowCache>(0xFFFF_C000), (0, 0x0300_4000, (lo & 0x3FFF_FFFF) | 0xC0));
         });
     }
+
+    /// A bus where nothing answers: every read and write is refused.
+    struct RefusingBus;
+    impl BusDevice for RefusingBus {}
+
+    /// A store the system refuses completes on the R10000, which sends it as a
+    /// write request that gets no response (R10000 UM pp. 104, 316); the R5000
+    /// and a load keep the Data Bus Error. SWL takes the masked-store path.
+    /// Fix: refused uncached stores.
+    #[test]
+    fn refused_uncached_store_completes_only_on_the_r10000() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (u32, u64) {
+            let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.cache.set_llbit(true);
+            exec.core.write_gpr(4, 0xFFFF_FFFF_A100_0000); // kseg1: uncached
+            exec.core.write_gpr(6, 0x1234_5678);
+            (exec.exec(make_i(op, 4, 6, 4)), exec.core.read_gpr(6))
+        }
+        use crate::traits::BUS_ERR;
+        type R10K = crate::cpu::mips_cache_v2::R10000Cache;
+        type R5K = crate::cpu::mips_cache_shadow::R5000ShadowCache;
+        for op in [OP_SW, OP_SWL] {
+            assert_eq!((run::<R10K>(op).0, run::<R5K>(op).0), (EXEC_COMPLETE, BUS_ERR), "op {op:#x}");
+        }
+        assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
+        assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
+    }
+
+    /// The O2's RAM alias at 0x8000_0000 is matched on the 32 bits the board
+    /// decodes, so a PTE software bit above the PFN (PA 0x1_8000_0000) cannot
+    /// send a mapped page to the PCI window. Fix: O2 memory alias.
+    #[test]
+    fn phys_alias_is_matched_after_the_physical_mask() {
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(Arc::new(MockMemory::new()));
+            exec.phys_mask = u32::MAX as u64;
+            exec.phys_alias = Some((0x8000_0000, 0x1000_0000, 0));
+            let lo0 = (0x18_0000 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            tlb_op(&mut exec, &[(0, 0), (5, 0), (10, 0x4000_0000), (2, lo0), (3, 0)], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_0000).phys, 0);
+        });
+    }
+
+    /// Compiled LWR reads `core.lwr_upper_below` rather than decoding Status, so
+    /// it must follow the mode through ERET, which changes it without a Status
+    /// write. Fix: partial LWR.
+    #[test]
+    fn lwr_upper_below_follows_the_mode_through_status_writes_and_eret() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_KX, STATUS_UX};
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(
+                Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.set_cp0_status(STATUS_KX);
+            assert_eq!(exec.core.lwr_upper_below, if keeps_upper { 3 } else { 0 }, "{} kernel KX", C::NAME);
+            exec.set_cp0_status((2 << 3) | STATUS_UX | STATUS_EXL); // EXL forces kernel mode, KX clear
+            assert_eq!(exec.core.lwr_upper_below, 0);
+            exec.core.cp0_epc = 0x1000;
+            assert_eq!(exec.exec(0x4200_0018), EXEC_COMPLETE, "ERET");
+            assert_eq!(exec.core.lwr_upper_below, if keeps_upper { 3 } else { 0 }, "{} ERET to user, UX set", C::NAME);
+        }
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+    }
 }

@@ -868,6 +868,10 @@ impl Codegen {
         for v in isa.isa_flags() {
             let _ = write!(s, " {v}");
         }
+        // Only when set, so machines without the behaviour keep their warm cache.
+        if self.jit_consts.lwr_keeps_upper {
+            s.push_str(" lwr_upper=1");
+        }
         s.push_str(" ops=");
         s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
         Some(blake3::hash(s.as_bytes()).as_bytes()[..16].try_into().unwrap())
@@ -4403,6 +4407,11 @@ pub struct JitConsts {
     /// to loading from memory, exactly as before, so an un-stamped `Codegen`
     /// stays correct (just no faster).
     pub core: Option<core::num::NonZeroUsize>,
+    /// A partial LWR keeps bits 63:32 of the destination, as the R10000
+    /// does (`CpuModel::PARTIAL_LWR_KEEPS_UPPER`). A model fact rather than a
+    /// core one, published beside the core address because both reach a worker's
+    /// `Codegen` the same way. The code-cache fingerprint carries it when set.
+    pub lwr_keeps_upper: bool,
 }
 
 impl JitConsts {
@@ -10077,6 +10086,31 @@ fn emit_lwl_ldl(ctx: &mut EmitCtx, size: MemSize) {
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
+/// LWR on a model whose partial LWR keeps rt[63:32] (`lwr_keeps_upper`),
+/// mirroring `MipsExecutor::exec_lwr`: offsets 0 to 2 keep the upper word while
+/// 64-bit operations are on, anything else sign-extends the merged low half.
+/// `core.lwr_upper_below` makes that one compare. `loaded` is the aligned word.
+fn emit_lwr_keeping_upper(ctx: &mut EmitCtx, loaded: Value, byte_offset: Value) {
+    let i64t = ir::types::I64;
+    // Bytes of the word the register keeps: 8 * (3 - offset).
+    let inverted = ctx.builder.ins().bxor_imm_s(byte_offset, 3);
+    let shift = ctx.builder.ins().ishl_imm_s(inverted, 3);
+    let ones = ctx.builder.ins().iconst(i64t, 0xFFFF_FFFF);
+    let mask = ctx.builder.ins().ushr(ones, shift);
+    let shifted_mem = ctx.builder.ins().ushr(loaded, shift);
+    let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let not_mask = ctx.builder.ins().bnot(mask);
+    let preserved = ctx.builder.ins().band(rt_val, not_mask);
+    let merged = ctx.builder.ins().bor(shifted_mem, preserved);
+    let low = ctx.builder.ins().ireduce(ir::types::I32, merged);
+    let sign_extended = ctx.builder.ins().sextend(i64t, low);
+    let below_off = ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, lwr_upper_below) as i32);
+    let below = ctx.builder.ins().uload8(i64t, MemFlagsData::trusted(), ctx.core_ptr, below_off);
+    let keep = ctx.builder.ins().icmp(IntCC::UnsignedLessThan, byte_offset, below);
+    let result = ctx.builder.ins().select(keep, merged, sign_extended);
+    emit_write_gpr(ctx, field_rt(ctx.raw), result);
+}
+
 /// LWR rt, imm(rs) / LDR rt, imm(rs): load the "right" (low-address-end)
 /// portion — the mirror-image shift direction of [`emit_lwl_ldl`], see that
 /// function's doc comment for the shared shape. Mirrors
@@ -10093,6 +10127,11 @@ fn emit_lwr_ldr(ctx: &mut EmitCtx, size: MemSize) {
     let byte_offset = ctx.builder.ins().band_imm_s(vaddr, align_mask);
 
     let loaded = emit_mem_read(ctx, aligned_addr, size);
+
+    if size == MemSize::B4 && ctx.jit_consts.lwr_keeps_upper {
+        emit_lwr_keeping_upper(ctx, loaded, byte_offset);
+        return;
+    }
 
     let ity = size.ir_type();
     let mem_val = if size == MemSize::B8 { loaded } else { ctx.builder.ins().ireduce(ity, loaded) };
