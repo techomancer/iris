@@ -17,7 +17,7 @@
 //! Everything the chip reports ORs into the PCI interrupt pin: the serial
 //! status word (eight bits a port) and the other word (ATA, DMA errors,
 //! keyboard), each behind its own enable. UART pass-through, transmit-ring-
-//! empty and receive-high-water follow their source's level and ignore a
+//! empty, receive-ring-full and receive-high-water follow their source's level and ignore a
 //! write-one-to-clear; the rest latch until acknowledged.
 //!
 //! # Byte order
@@ -36,7 +36,7 @@
 //!   choices.
 //! * The serial ring engine is the one the IOC3 uses (`ioc_serial_dma.rs`) and
 //!   carries its approximations: timers run on host time and receive-ring-full
-//!   latches on each refused post. After a failed ring transfer the port
+//!   is a level that follows a held entry. After a failed ring transfer the port
 //!   halts until a channel reset.
 //! * Register 0x20 reads the DMA-idle bit set; transfers complete inside the
 //!   access that starts them, so the engine is never busy when software looks.

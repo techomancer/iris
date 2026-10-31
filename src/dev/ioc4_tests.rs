@@ -1034,3 +1034,112 @@ fn a_backend_that_opens_releases_the_walk() {
     assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 24);
     assert_eq!(*gate.out.lock().unwrap(), b"ABC");
 }
+
+// ---------------------------------------------------------------------------
+// A receive ring with no room
+// ---------------------------------------------------------------------------
+
+const RX_FULL: u32 = int::serial(0, 1);
+
+/// Ports test_dma_rx_full_and_staged_recovery: a character the full ring
+/// cannot take waits, receive-ring-full is a level that stays while an
+/// entry waits for room and ignores an acknowledge, and the entries post as
+/// the consumer makes room. Filled exactly with nothing waiting, it stays
+/// down.
+#[test]
+fn receive_ring_full_is_a_level_while_an_entry_waits() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x400);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    for i in 0..127u32 {
+        r.type_in(0, &[0x31, 0x32, 0x33, 0x34]);
+        r.until("the entry", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == ((i + 1) * 8) & 0x3f8);
+    }
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE), 0x3f8);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & RX_FULL, 0, "full, but nothing waits for room");
+
+    r.sw(0, sdma_off::RX_TIMER, 1);
+    r.sw(0, sdma_off::RX_CONSUME, ARM);
+    r.type_in(0, &[0xa1, 0xa2, 0xa3, 0xa4, 0xb5]);
+    r.until("the source", |r| r.r32(reg::SERIAL_PENDING) & RX_FULL != 0);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE), 0x3f8);
+    r.w32(reg::SERIAL_PENDING, RX_FULL);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & RX_FULL, RX_FULL, "a level ignores the acknowledge");
+
+    r.sw(0, sdma_off::RX_CONSUME, 16 | ARM);
+    r.until("room", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 0);
+    let entry = r.get(r.ring(0, 1, 0x400) + 0x3f8, 8);
+    assert_eq!((&entry[..4], entry[4], entry[7]), (&[0xa1, 0xa2, 0xa3, 0xa4][..], RX_FROM_LINE, RX_FROM_LINE));
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & RX_FULL, 0, "it fell once the consumer made room");
+
+    r.until("the last character", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 8);
+    let entry = r.get(r.ring(0, 1, 0x400), 8);
+    assert_eq!((entry[0], entry[1], entry[4], entry[5]), (0xb5, 0, RX_FROM_LINE, 0));
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & RX_FULL, 0, "full again, but nothing waits for room");
+}
+
+/// Ports test_dma_loopback_full_ring_recovery: a full receive ring does not
+/// stall the transmit walk in loopback. Both entries go out and the eight
+/// characters wait in the packer and the 16550's FIFO, then land as the
+/// consumer frees the ring.
+#[test]
+fn a_full_ring_does_not_stall_a_loopback_walk() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x400);
+    r.fast_line(0);
+    r.uw(0, 2, 0x01);
+    r.uw(0, 4, 0x13);
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD);
+    let expected = fill_loopback_ring(&r);
+    r.until("the transmit ring", |r| r.sr(0, sdma_off::TX_CONSUME) & 0x3f8 == 0x3f8);
+    r.until("the receive ring", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 0x3f8);
+    assert_eq!(r.get(r.ring(0, 1, 0x400), 0x3f8), expected);
+
+    let looped = |c: [u8; 4]| [c[0], c[1], c[2], c[3], RX_LOOPBACK, RX_LOOPBACK, RX_LOOPBACK, RX_LOOPBACK];
+    r.tx_entry(0, 0x400, 0x3f8, [0xa1, 0xa2, 0xa3, 0xa4], [TX_VALID; 4]);
+    r.tx_entry(0, 0x400, 0, [0xb1, 0xb2, 0xb3, 0xb4], [TX_VALID; 4]);
+    r.sw(0, sdma_off::TX_PRODUCE, 8);
+    r.until("both entries sent", |r| r.sr(0, sdma_off::TX_CONSUME) & 0x3f8 == 8);
+    r.until("the source", |r| r.r32(reg::SERIAL_PENDING) & RX_FULL != 0);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE), 0x3f8);
+
+    r.sw(0, sdma_off::RX_CONSUME, 8);
+    r.until("the first", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 0);
+    assert_eq!(r.get(r.ring(0, 1, 0x400) + 0x3f8, 8), looped([0xa1, 0xa2, 0xa3, 0xa4]));
+    r.sw(0, sdma_off::RX_CONSUME, 16);
+    r.until("the second", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 8);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & RX_FULL, 0, "filled exactly with nothing waiting");
+    assert_eq!(r.get(r.ring(0, 1, 0x400), 8), looped([0xb1, 0xb2, 0xb3, 0xb4]));
+    assert!(r.sent(0).is_empty());
+}
+
+/// Ports test_dma_loopback_overrun_reaches_status: with the receive ring
+/// out of room the characters that do not fit are lost to the 16550's
+/// overrun, which shows in the status byte of the next character read.
+#[test]
+fn a_loopback_overrun_reaches_the_status_byte() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x400);
+    r.fast_line(0);
+    r.uw(0, 2, 0x01);
+    r.uw(0, 4, 0x13);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    // Room for one entry before the ring is full.
+    r.sw(0, sdma_off::RX_CONSUME, 16);
+    for i in 0..8usize {
+        r.tx_entry(0, 0x400, 8 * i, std::array::from_fn(|j| (4 * i + j) as u8), [TX_VALID; 4]);
+    }
+    r.sw(0, sdma_off::TX_PRODUCE, 64);
+    r.until("the walk", |r| r.sr(0, sdma_off::TX_CONSUME) & 0x3f8 == 64);
+    r.settle(5);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8, 8);
+
+    r.sw(0, sdma_off::RX_CONSUME, 8);
+    r.sw(0, sdma_off::CONTROL, ENABLE | DRAIN);
+    r.until("the drain", |r| r.sr(0, sdma_off::CONTROL) & DRAIN == 0);
+    let posted = (r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8) / 8;
+    assert!(posted > 1);
+    let overrun = (1..posted as usize).any(|i| r.get(r.ring(0, 1, 0x400) + 8 * i + 4, 4).iter().any(|s| s & 1 != 0));
+    assert!(overrun, "the loss is marked on a later character");
+    assert!(posted * 4 < 32, "and not everything came back");
+}
