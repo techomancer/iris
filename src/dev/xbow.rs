@@ -237,6 +237,9 @@ pub type PacketSink = Box<dyn Fn(u8, u64, u8, bool) -> bool + Send + Sync>;
 pub struct Xbow {
     regs: Mutex<Regs>,
     revision: u32,
+    /// Revision field of the identification word when it differs from the
+    /// revision that selects behaviour.
+    reported_revision: Option<u32>,
     part: u32,
     manufacturer: u32,
     /// The widget a status read reports as its source, if the chip does.
@@ -281,6 +284,7 @@ impl Xbow {
         Self {
             regs: Mutex::new(Regs::reset(present)),
             revision,
+            reported_revision: None,
             part: 0,
             manufacturer: 0,
             status_source: None,
@@ -318,6 +322,13 @@ impl Xbow {
     pub fn with_identity(mut self, part: u32, manufacturer: u32) -> Self {
         self.part = part;
         self.manufacturer = manufacturer;
+        self
+    }
+
+    /// Report `revision` in the identification word while behaviour stays
+    /// that of the revision given to [`Xbow::new`].
+    pub fn with_reported_revision(mut self, revision: u32) -> Self {
+        self.reported_revision = Some(revision);
         self
     }
 
@@ -439,7 +450,7 @@ impl Xbow {
     }
 
     fn identification(&self) -> u32 {
-        (self.revision << 28) | (self.part << 12) | (self.manufacturer << 1) | 1
+        (self.reported_revision.unwrap_or(self.revision) << 28) | (self.part << 12) | (self.manufacturer << 1) | 1
     }
 
     /// A status word as a read reports it: with the asking widget in the

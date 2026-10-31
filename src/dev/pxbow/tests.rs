@@ -62,11 +62,11 @@ fn widget_zero_identifies_as_pxbow_with_the_host_and_pic_links_up() {
     let p = Pxbow::new(10, 15, clock().0).unwrap();
     let w = p.widget_zero();
     let id = w.read32(4).data;
-    assert_eq!((id >> 28) & 0xf, 5);
+    assert_eq!(id, 0x3d10_0001);
+    assert_eq!((id >> 28) & 0xf, 3);
     assert_eq!((id >> 12) & 0xffff, 0xd100);
     assert_eq!((id >> 1) & 0x7ff, 0);
     assert_eq!(id & 1, 1);
-    assert_ne!(id >> 28, 3, "not the PIC's revision");
     for widget in [10, 15] {
         assert_ne!(w.read32(link(widget, 0x10)).data & LINK_STATUS_ALIVE, 0, "widget {widget} alive");
         assert_ne!(w.read32(link(widget, 0x38)).data & AUX_PRESENT, 0);

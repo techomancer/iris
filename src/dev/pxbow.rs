@@ -1,8 +1,9 @@
 //! PXBOW, the crossbar-like widget 0 that sits behind the PIC on Tezro and
 //! the Origin 350, and the forwarding of processor accesses through it.
 //!
-//! The model reuses the Crossbow ([`Xbow`]) at revision 5 with PXBOW's
-//! identity, part `0xd100` and manufacturer 0, and a source field in its
+//! The model reuses the Crossbow ([`Xbow`]) at revision 5 behaviour with
+//! PXBOW's identity word `0x3d100001` (revision 3, part `0xd100`,
+//! manufacturer 0), and a source field in its
 //! status reads. That is a software choice, not a claim that the part is a
 //! Crossbow 2.0 or that the processor's route to widget 0 passes a real
 //! switch: its physical route, fitted revision and register set beyond the
@@ -28,8 +29,13 @@ use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ER
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-/// The Crossbow revision the PIC's PXBOW selects.
+/// The Crossbow revision the PIC's PXBOW selects for behaviour.
 pub const REVISION: u32 = 5;
+/// The revision its identification word reports. Established from real
+/// Tezro, Origin 350 and Onyx 4 PROM inventories (revision 3).
+pub const REPORTED_REVISION: u32 = 3;
+// Part and manufacturer are INFERRED; a 2009 OpenBSD dmesg names the part
+// Bedrock, a conflict that stays open.
 pub const PART: u32 = 0xd100;
 pub const MANUFACTURER: u32 = 0;
 
@@ -66,6 +72,7 @@ impl Pxbow {
         }
         let xbow = Xbow::new(REVISION, (1 << host) | (1 << pic))
             .with_identity(PART, MANUFACTURER)
+            .with_reported_revision(REPORTED_REVISION)
             .with_status_source(host)
             // PROM 6.210's crossbar check writes the read-only lower error
             // address on purpose.
