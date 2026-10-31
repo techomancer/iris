@@ -1238,3 +1238,212 @@ fn replacing_the_backend_keeps_the_engine_working() {
     assert_eq!(r.sr(0, sdma_off::RX_PRODUCE) & 0xff8, 8, "and its input arrives");
     assert_eq!(r.get(r.ring(0, 1, 0x1000), 1), [0x7a]);
 }
+
+// ---------------------------------------------------------------------------
+// The rest of the ring engine's register cases
+// ---------------------------------------------------------------------------
+
+const TIMER_EXPIRED: u32 = int::serial(0, 3);
+const TX_COMPLETION: u32 = int::serial(0, 7);
+
+/// Ports test_dma_tx_wrap_4k.
+#[test]
+fn tx_ring_wraps_at_four_kilobytes() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::TX_PRODUCE, 0xff8);
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 0xff8);
+    r.tx_entry(0, 0x1000, 0xff8, [0x6e, 0, 0, 0], [TX_VALID, 0, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 0);
+    assert_eq!(r.sent(0), [0x6e]);
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 0);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & int::serial(0, 0), int::serial(0, 0));
+}
+
+/// Ports test_dma_control_stores_its_bits: the control register keeps every
+/// writable bit as written, including ones the model does not act on.
+#[test]
+fn control_stores_the_bits_it_does_not_act_on() {
+    let r = Rig::new();
+    let written = (1 << 17) | (1 << 20) | 0x1ff;
+    r.sw(0, sdma_off::CONTROL, written);
+    assert_eq!(r.sr(0, sdma_off::CONTROL), written);
+}
+
+/// Ports test_dma_engine_indices_take_writes and
+/// test_dma_host_index_masks_its_pointer: the two indices the engine moves
+/// still take a write, and every index keeps only its pointer field.
+#[test]
+fn indices_keep_their_pointer_field() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::TX_CONSUME, u32::MAX);
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 0xff8);
+    r.sw(0, sdma_off::RX_PRODUCE, 0x18);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE), 0x18);
+    r.sw(0, sdma_off::TX_PRODUCE, 0x10014);
+    assert_eq!(r.sr(0, sdma_off::TX_PRODUCE), 0x10);
+    r.sw(0, sdma_off::RX_CONSUME, 0x2c);
+    assert_eq!(r.sr(0, sdma_off::RX_CONSUME) & 0xff8, 0x28);
+}
+
+/// Ports test_dma_empty_slot_ends_the_entry: an empty slot ends its entry
+/// wherever it sits, so the slots behind it are not sent.
+#[test]
+fn an_empty_slot_ends_the_entry() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.tx_entry(0, 0x1000, 0, *b"abcd", [TX_VALID, 0, TX_VALID, TX_VALID]);
+    r.tx_entry(0, 0x1000, 8, [b'e', 0, 0, 0], [TX_VALID, 0, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 16);
+    assert_eq!(r.sent(0), b"ae");
+}
+
+/// Ports test_dma_tx_control_decodes_type_and_bit5: a control byte is
+/// decoded by its type field and bit 5, undefined low bits do not stop the
+/// port, and a slot of type none raises nothing even with bit 5 set.
+#[test]
+fn a_control_byte_is_decoded_by_type_and_bit_five() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.tx_entry(0, 0x1000, 0, [b'a', b'b', b'c', 0], [TX_VALID | 0x10, TX_EXPLICIT, TX_VALID, 0]);
+    r.tx_entry(0, 0x1000, 8, [b'd', 0, 0, 0], [TX_VALID, 0, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 16);
+    assert_eq!(r.sent(0), b"ad");
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 16);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & TX_COMPLETION, 0);
+}
+
+/// Ports test_dma_tx_delay_sets_the_busy_bit: control bit 16 reads set while
+/// a delay entry runs and clear once it has ended.
+#[test]
+fn a_delay_entry_sets_the_busy_bit() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.tx_entry(0, 0x1000, 0, [3, 0, 0, 0], [TX_DELAY, 0, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 8);
+    assert_eq!(r.sr(0, sdma_off::CONTROL) & (1 << 16), 1 << 16);
+    r.settle(10);
+    assert_eq!(r.sr(0, sdma_off::CONTROL) & (1 << 16), 0);
+}
+
+/// Ports test_dma_rx_timer_due_before_access: an expiry already due
+/// happens before a register access, with no timer thread to run it.
+#[test]
+fn a_due_receive_timer_expires_before_an_access() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::RX_TIMER, 2);
+    r.sw(0, sdma_off::RX_CONSUME, ARM);
+    r.type_in(0, &[0x64]);
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED, TIMER_EXPIRED);
+}
+
+/// Ports test_dma_rx_timer_count_reads_back: a reload write loads the live
+/// count too and an idle timer holds it; a running one counts down.
+#[test]
+fn the_receive_timer_count_reads_back() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::RX_TIMER, 0xfff);
+    assert_eq!(r.sr(0, sdma_off::RX_TIMER) & 0x0fff_0fff, 0x0fff_0fff);
+    std::thread::sleep(Duration::from_millis(2));
+    assert_eq!(r.sr(0, sdma_off::RX_TIMER) & 0x0fff_0fff, 0x0fff_0fff, "idle, it holds");
+    r.sw(0, sdma_off::RX_TIMER, 0x140);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::RX_CONSUME, ARM);
+    r.type_in(0, &[0x63]);
+    let count = r.sr(0, sdma_off::RX_TIMER) >> 16 & 0xfff;
+    assert!((1..=0x140).contains(&count), "running: {count:#x} of 0x140 left");
+}
+
+/// Ports test_dma_consume_without_arm_keeps_it: a consume write with bit 31
+/// clear leaves the arm, which reads back and still starts the timer.
+#[test]
+fn a_consume_write_without_the_arm_keeps_it() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::RX_TIMER, 2);
+    r.sw(0, sdma_off::RX_CONSUME, ARM);
+    r.sw(0, sdma_off::RX_CONSUME, 0);
+    assert_eq!(r.sr(0, sdma_off::RX_CONSUME), ARM);
+    r.type_in(0, &[0x6b]);
+    r.until("the expiry", |r| r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED != 0);
+    assert_eq!(r.sr(0, sdma_off::RX_CONSUME), 0, "and the expiry spent it");
+}
+
+/// Ports test_dma_zero_reload_expires_at_once.
+#[test]
+fn a_zero_reload_expires_at_once() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::RX_TIMER, 0);
+    r.sw(0, sdma_off::RX_CONSUME, ARM);
+    r.type_in(0, &[0x7a]);
+    r.until("the expiry", |r| r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED != 0);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE), 8);
+}
+
+/// Ports test_dma_rx_status_carries_modem_state: a character from the line
+/// carries the live CTS and DCD levels, as the UART's modem status shows.
+#[test]
+fn a_received_character_carries_the_modem_state() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.type_in(0, &[0x6e]);
+    r.sw(0, sdma_off::CONTROL, ENABLE | DRAIN);
+    let entry = r.get(r.ring(0, 1, 0x1000), 8);
+    assert_eq!((entry[0], entry[4]), (0x6e, RX_FROM_LINE));
+    assert_eq!(r.ur(0, 6) & 0xb0, 0xb0);
+}
+
+/// Ports test_dma_rx_timer_expiry_after_full_entry: a full entry posts at
+/// once, the timer still raises its source when it runs out, and once
+/// acknowledged it does not come back without another arm.
+#[test]
+fn the_timer_still_expires_after_a_full_entry() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::RX_TIMER, 2);
+    r.sw(0, sdma_off::RX_CONSUME, ARM);
+    r.type_in(0, &[0x31, 0x32, 0x33, 0x34]);
+    r.until("the entry", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0xff8 == 8);
+    let entry = r.get(r.ring(0, 1, 0x1000), 8);
+    assert_eq!((&entry[..4], entry[4], entry[7]), (&[0x31, 0x32, 0x33, 0x34][..], RX_FROM_LINE, RX_FROM_LINE));
+    r.until("the expiry", |r| r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED != 0);
+    r.w32(reg::SERIAL_PENDING, TIMER_EXPIRED);
+    r.settle(5);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED, 0);
+}
+
+/// Ports test_dma_rx_disable_stops_timer_keeps_arm: clearing the enable stops
+/// a running receive timer and discards its time, and the arm stays so the
+/// first character after re-enabling starts it afresh.
+#[test]
+fn disabling_the_ring_stops_the_timer_and_keeps_the_arm() {
+    let r = Rig::new();
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::RX_TIMER, 0x100);
+    r.sw(0, sdma_off::RX_CONSUME, ARM);
+    r.type_in(0, &[0x31]);
+    assert!(r.c.sh.st.lock().sdma.rx_deadline(0).is_some(), "running");
+    r.sw(0, sdma_off::CONTROL, 0);
+    assert!(r.c.sh.st.lock().sdma.rx_deadline(0).is_none(), "stopped");
+    r.settle(20);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED, 0);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    assert_eq!(r.sr(0, sdma_off::RX_CONSUME) & ARM, ARM, "the arm stays");
+    r.type_in(0, &[0x32]);
+    assert!(r.c.sh.st.lock().sdma.rx_deadline(0).is_some(), "the next character starts it afresh");
+}
