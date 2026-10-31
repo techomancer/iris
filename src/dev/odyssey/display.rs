@@ -37,6 +37,11 @@ pub struct Display {
     heartbeat: Arc<AtomicU64>,
     /// The CPU's Compare matches, for the status bar's timer rate.
     fasttick: Arc<AtomicU64>,
+    /// A frame runs with no board lock and no hold on the raster unit's
+    /// planes (reader.rs). `IRIS_VPRO_DISPLAY=lockless` turns it on; the
+    /// default is the locked frame, which runs the same code with the
+    /// locks held around it.
+    lockless: AtomicBool,
 }
 
 struct Local {
@@ -70,7 +75,16 @@ impl Display {
             shown: Mutex::new((0, 0)),
             heartbeat,
             fasttick,
+            lockless: AtomicBool::new(matches!(std::env::var("IRIS_VPRO_DISPLAY").as_deref(), Ok("lockless"))),
         }
+    }
+
+    pub fn lockless(&self) -> bool {
+        self.lockless.load(Ordering::Relaxed)
+    }
+
+    pub fn set_lockless(&self, on: bool) {
+        self.lockless.store(on, Ordering::Relaxed);
     }
 
     pub(super) fn shown(&self) -> (usize, usize) {

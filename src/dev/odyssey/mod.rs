@@ -224,6 +224,20 @@ impl Odyssey {
         let mut reader = display.reader.lock();
         reader.attach(&state.shared);
         reader.recycle_last();
+        if display.lockless() {
+            // No lock: the writers mark rows after their stores and the
+            // reader takes the marks before it reads (reader.rs).
+            reader.poll(monotonic_ns());
+            reader.stage();
+            let mut job = reader.take();
+            if let Some(job) = &mut job {
+                job.resolve();
+            }
+            let span = job.as_mut().and_then(|job| reader.commit(job));
+            return Self::present_frame(state, display, reader, job, span);
+        }
+        // Locked mode runs the same code with the locks held around it.
+        //
         // The planes are the raster unit's: wait out its slice in flight and
         // hold off the next while the frame's lines are copied aside. The
         // colour rows it wrote since the last frame are resolved again.
@@ -271,6 +285,11 @@ impl Odyssey {
         let s = state.board.lock();
         let span = job.as_mut().and_then(|job| reader.commit(job));
         drop(s);
+        Self::present_frame(state, display, reader, job, span);
+    }
+
+    /// The end of a frame: hand the committed lines to the window.
+    fn present_frame(state: &BoardLocks, display: &Display, mut reader: parking_lot::MutexGuard<'_, ScanoutReader>, job: Option<ScanoutJob>, span: Option<(usize, usize)>) {
         let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
         if w == 0 || h == 0 || reader.frame.len() < w * h {
             reader.keep(job);
