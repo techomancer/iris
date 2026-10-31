@@ -870,7 +870,9 @@ impl ImpactXio {
             o if is_plain(o) => s.plain.get(&o).copied().unwrap_or(0),
             _ => {
                 drop(s);
-                self.shared.note(format!("read of {off:#08x}"));
+                // The CPU's PC at its last batch boundary: the caller, to within a batch.
+                let pc = crate::ip30::LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
+                self.shared.note(format!("read of {off:#08x} at pc {pc:#x}"));
                 0
             }
         };
@@ -1038,7 +1040,8 @@ impl ImpactXio {
             true
         });
         if !known {
-            self.shared.note(format!("write of {v:#x} to {off:#08x}"));
+            let pc = crate::ip30::LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
+            self.shared.note(format!("write of {v:#x} to {off:#08x} at pc {pc:#x}"));
             return BUS_OK;
         }
         for (o, v) in board {
