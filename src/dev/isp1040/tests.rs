@@ -78,8 +78,7 @@ impl Rig {
     /// Take the adapter's clock off the host's and set it to `ns`; the
     /// ring thread has seen the new time when this returns.
     fn clock(&self, ns: i64) {
-        self.isp.fake_ns.store(ns, Ordering::Relaxed);
-        self.isp.wake.notify_all();
+        self.isp.set_test_clock(ns);
         self.isp.wait_idle();
     }
 
@@ -703,6 +702,40 @@ fn a_reset_cancels_a_selection_in_progress() {
 fn queue_absent(r: &Rig, slot: u32, handle: u32) {
     r.put_entry(slot, &request(handle, 3, &[0, 0, 0, 0, 0, 0], &[]));
     r.doorbell(slot as u16 + 1);
+}
+
+/// Each move of the test clock reaches a thread waiting out a selection.
+/// A move that lands while the thread holds the state, between reading the
+/// clock and waiting, must not be lost: the thread would sleep through the
+/// move that ends its selection, and the test would wait for it forever.
+/// Many closely spaced moves give that window plenty of chances.
+#[test]
+fn every_move_of_the_test_clock_reaches_a_waiting_selection() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = hold_rig("clock-race");
+        let due = DEFAULT_SELECTION_TIMEOUT as i64 * MS;
+        let mut t = 0;
+        for i in 0..2000u32 {
+            let slot = i % 8;
+            queue_absent(&r, slot, 0x1000 + i);
+            r.clock(t + due - 1);
+            // The thread is waking from that move; land the next one at a
+            // spread of points in its wake-up.
+            let spin = std::time::Instant::now();
+            while spin.elapsed() < Duration::from_nanos(u64::from(i % 64) * 500) { std::hint::spin_loop(); }
+            r.clock(t + due);
+            assert_eq!(g32(&r.status(slot), 4), 0x1000 + i, "cycle {i}");
+            r.w(reg::RESPONSE_QUEUE, ((slot + 1) % 8) as u16);
+            t += due;
+        }
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("a clock move was lost: the selection never ended"),
+        Err(e) => panic!("the clock loop failed: {e}"),
+    }
 }
 
 /// A programmed zero is no wait. A model choice: the datasheet says nothing
@@ -2033,8 +2066,7 @@ fn a_full_response_ring_does_not_spin_the_thread_on_a_released_command() {
     bus_reset(&r, 1, 0);
     for i in 0..3 { r.put_entry(i, &tur1(0x60 + i)); }
     r.doorbell(3);
-    r.isp.fake_ns.store(S, Ordering::Relaxed);
-    r.isp.wake.notify_all();
+    r.isp.set_test_clock(S);
     let isp = r.isp.core.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || { isp.wait_idle(); let _ = tx.send(()); });

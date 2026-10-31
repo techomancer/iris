@@ -766,6 +766,18 @@ impl Core {
         }
     }
 
+    /// Take the clock off the host's and set it to `ns` (tests). The
+    /// thread reads the clock with `st` held and then waits on `wake`
+    /// with no timeout, so the move is made with `st` held too: made
+    /// outside it, the move and its wake-up can fall between that read and
+    /// that wait, and the thread sleeps through the time it waits for.
+    #[cfg(test)]
+    fn set_test_clock(&self, ns: i64) {
+        let _st = self.st.lock();
+        self.fake_ns.store(ns, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
     /// The buses in their post-reset hold-off now, as a bit mask.
     fn held_mask(&self, st: &State) -> u8 {
         let now = self.now_ns(st);
