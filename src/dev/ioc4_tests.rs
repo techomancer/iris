@@ -12,7 +12,9 @@
 //! of the main loop.
 
 use super::*;
+use crate::dev::ds1744::{self, Ds1744, YearBase};
 use crate::irq::LevelProbe;
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use crate::pci::PciDmaStatus;
 use std::collections::VecDeque;
 
@@ -728,4 +730,102 @@ fn a_fault_halts_only_its_own_port() {
     r.sw(1, sdma_off::TX_PRODUCE, 8);
     assert_eq!(r.sr(1, sdma_off::TX_CONSUME), 8, "the reset port runs");
     assert_eq!(r.sr(1, sdma_off::SHADOW) & SHADOW_OUTPUTS, 0x1500_0000);
+}
+
+// ---------------------------------------------------------------------------
+// The clock on byte-bus select 0
+// ---------------------------------------------------------------------------
+
+const CLOCK_CONTROL: u32 = reg::CLOCK + ds1744::CONTROL as u32;
+
+/// A chip with a clock on a stepped nanosecond counter, seeded on
+/// 2024-01-01.
+fn with_clock() -> (Rig, Arc<AtomicI64>) {
+    let r = Rig::new();
+    let ns = Arc::new(AtomicI64::new(0));
+    let n = ns.clone();
+    let seed = 19_723 * 86_400; // 2024-01-01
+    let clock = Ds1744::with_clock(seed, YearBase::Gregorian, Arc::new(move || n.load(AtomicOrdering::SeqCst)));
+    r.c.attach_clock(Arc::new(clock.unwrap()));
+    (r, ns)
+}
+
+/// Set the calendar through the write bit: seconds, minutes, hours, date,
+/// month and year, then the century that commits it.
+fn set_time(r: &Rig, [sec, min, hour, date, month, year]: [u8; 6], century: u8) {
+    r.w8(CLOCK_CONTROL, 0x80);
+    for (i, v) in [sec, min, hour, 0x02, date, month, year].into_iter().enumerate() {
+        r.w8(CLOCK_CONTROL + 1 + i as u32, v);
+    }
+    r.w8(CLOCK_CONTROL, century);
+}
+
+/// Ports test_rtc_absent: with no clock fitted the window reads zero and
+/// drops a write.
+#[test]
+fn an_unfitted_clock_reads_zero() {
+    let r = Rig::new();
+    assert_eq!(r.r8(CLOCK_CONTROL), 0);
+    r.w8(CLOCK_CONTROL, 0x55);
+    assert_eq!(r.r8(CLOCK_CONTROL), 0);
+    for a in [reg::CLOCK + 0x7ff7, reg::CLOCK + 0x8000, reg::CLOCK] {
+        assert_eq!(r.r8(a), 0);
+    }
+}
+
+/// Ports test_rtc_alias and test_nvram_window: the SRAM fills the BAR from
+/// 0x80000 to the calendar at 0x87ff8, the frozen calendar reads through it,
+/// and neither side of the window answers.
+#[test]
+fn the_clock_window_holds_ram_and_the_calendar() {
+    let (r, ns) = with_clock();
+    let frozen = [0x60u8, 0x59, 0x59, 0x23, 0x82, 0x31, 0x12, 0x24];
+    r.w8(reg::CLOCK, 0xa5);
+    r.w8(reg::CLOCK + 0x7ff7, 0x5a);
+    for (i, a) in [0x0000e, 0x004bc, 0x07fcb, 0x07fd0].into_iter().enumerate() {
+        r.w8(reg::CLOCK + a, 0x31 + i as u8);
+    }
+    assert_eq!((r.r8(reg::CLOCK), r.r8(reg::CLOCK + 0x7ff7)), (0xa5, 0x5a));
+    for (i, a) in [0x0000e, 0x004bc, 0x07fcb, 0x07fd0].into_iter().enumerate() {
+        assert_eq!(r.r8(reg::CLOCK + a), 0x31 + i as u8);
+    }
+
+    set_time(&r, [0x59, 0x59, 0x23, 0x31, 0x12, 0x24], 0x20);
+    r.w8(CLOCK_CONTROL, 0x40);
+    ns.fetch_add(2_000_000_000, AtomicOrdering::SeqCst);
+    for (i, want) in frozen.into_iter().enumerate() {
+        assert_eq!(r.r8(CLOCK_CONTROL + i as u32), want, "calendar byte {i}");
+    }
+    assert!(!r.pin.level());
+    r.w8(CLOCK_CONTROL, 0);
+    assert_eq!((r.r8(CLOCK_CONTROL + 1), r.r8(CLOCK_CONTROL + 5), r.r8(CLOCK_CONTROL + 6), r.r8(CLOCK_CONTROL + 7)), (1, 1, 1, 0x25));
+
+    // Past the part on either side nothing answers.
+    assert_eq!(r.r8(reg::CLOCK + 0x8000), 0);
+    assert_eq!(r.r8(reg::CLOCK + 0x8008), 0);
+    assert_eq!(r.r8(reg::CLOCK - 1), 0);
+
+    // A chip reset leaves the SRAM and the calendar alone.
+    r.w8(CLOCK_CONTROL, 0x40);
+    r.c.reset();
+    assert_eq!((r.r8(reg::CLOCK), r.r8(reg::CLOCK + 0x7ff7)), (0xa5, 0x5a));
+    assert_eq!(r.r8(CLOCK_CONTROL), 0x60, "even a read in progress");
+}
+
+/// Ports test_rtc_rejects_wide_access: a halfword or word to the clock is
+/// refused whole and reaches no register.
+#[test]
+fn the_clock_takes_bytes_only() {
+    let (r, _) = with_clock();
+    set_time(&r, [0x12, 0x34, 0x05, 0x15, 0x01, 0x24], 0x20);
+    r.w8(CLOCK_CONTROL, 0x80);
+    r.w8(CLOCK_CONTROL + 1, 0x11);
+    r.w8(CLOCK_CONTROL + 2, 0x22);
+    r.c.bar_write(0, CLOCK_CONTROL + 2, 0x4433, 2);
+    r.c.bar_write(0, CLOCK_CONTROL, 0x2000_0000, 4);
+    assert_eq!(r.c.bar_read(0, CLOCK_CONTROL + 2, 2), 0);
+    assert_eq!(r.c.bar_read(0, CLOCK_CONTROL, 4), 0);
+    assert_eq!((r.r8(CLOCK_CONTROL + 2), r.r8(CLOCK_CONTROL + 3)), (0x22, 0x05));
+    r.w8(CLOCK_CONTROL, 0x20);
+    assert_eq!((r.r8(CLOCK_CONTROL + 2), r.r8(CLOCK_CONTROL + 3)), (0x22, 0x05));
 }

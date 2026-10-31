@@ -3,10 +3,11 @@
 //! One PCI function with a 1 MiB memory BAR. Behind it: four 16550-compatible
 //! serial ports with a ring-DMA engine each, a local interrupt controller for
 //! them, the registers that capture a failed ring transfer, the UART clock
-//! select, and the ATA channel's DMA readback word the PROM's diagnostic
-//! probes. The ATA channel, the keyboard and mouse controller, the GPIO pins
-//! and the other byte-bus selects are not modelled; an access to them reads
-//! zero or is dropped, and is logged.
+//! select, the ATA channel's DMA readback word the PROM's diagnostic probes,
+//! and the timekeeping SRAM on byte-bus select 0 when the board fits one
+//! ([`Ds1744`]). The ATA channel, the keyboard and mouse controller, the GPIO
+//! pins and the other byte-bus selects are not modelled; an access to them
+//! reads zero or is dropped, and is logged.
 //!
 //! Behaviour follows the public Linux and OpenBSD drivers; where the model
 //! approximates, the comment says so.
@@ -25,7 +26,7 @@
 //! value as software wrote them, so a byte access to UART register `r` of
 //! port `n` arrives at `0x380 + 8n + r`, and a 32-bit access is the register
 //! value, with no lane swap on either side. Control registers take 32-bit
-//! accesses only; a UART window takes bytes only. Anything else is refused
+//! accesses only; a UART window or the clock takes bytes only. Anything else is refused
 //! (reads zero, writes dropped). Which widths the silicon accepts is not
 //! known.
 //!
@@ -54,13 +55,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use crate::dev::ds1744::Ds1744;
 use crate::dev::ioc_sdma::{off as sdma_off, EngineUart, Host, Params, Sdma, Source};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciBusDevice, PciConfig, PciConfigPolicy, PciDma, PCI_INTA};
-use crate::traits::{Device, Resettable};
+use crate::traits::{BusDevice, Device, Resettable};
 
 pub const VENDOR_ID: u16 = 0x10a9;
 pub const DEVICE_ID: u16 = 0x100a;
@@ -94,6 +96,10 @@ pub mod reg {
     /// The first 16550 window; eight bytes a port.
     pub const UART: u32 = 0x380;
     pub const UART_STRIDE: u32 = 8;
+    /// Byte-bus select 0: the timekeeping SRAM, whose last eight bytes are
+    /// the clock (at 0x87ff8).
+    pub const CLOCK: u32 = 0x80000;
+    pub const CLOCK_SIZE: u32 = crate::dev::ds1744::SIZE as u32;
 }
 
 /// Bits of the serial status word, eight to a port.
@@ -196,6 +202,10 @@ fn sdma_decode(a: u32) -> Option<SdmaReg> {
 fn uart_decode(a: u32) -> Option<(usize, u32)> {
     let end = reg::UART + PORTS as u32 * reg::UART_STRIDE;
     (reg::UART..end).contains(&a).then(|| (((a - reg::UART) / reg::UART_STRIDE) as usize, (a - reg::UART) % reg::UART_STRIDE))
+}
+
+fn in_clock(a: u32) -> bool {
+    (reg::CLOCK..reg::CLOCK + reg::CLOCK_SIZE).contains(&a)
 }
 
 struct St {
@@ -581,6 +591,8 @@ impl Shared {
 /// The IOC4 PCI function.
 pub struct Ioc4 {
     sh: Arc<Shared>,
+    /// The DS1744 on byte-bus select 0, when the board fits one.
+    clock: OnceLock<Arc<Ds1744>>,
     /// The serial receive threads, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -608,7 +620,14 @@ impl Ioc4 {
                 armed: Mutex::new([None; KINDS]),
             }
         });
-        Ioc4 { sh, threads: Mutex::new(Vec::new()) }
+        Ioc4 { sh, clock: OnceLock::new(), threads: Mutex::new(Vec::new()) }
+    }
+
+    /// Fit the timekeeping SRAM on byte-bus select 0. Its 32 KiB fill the
+    /// BAR from 0x80000 and its calendar sits in the last eight bytes. The
+    /// chip's reset does not touch it: it is memory with a battery.
+    pub fn attach_clock(&self, clock: Arc<Ds1744>) {
+        assert!(self.clock.set(clock).is_ok(), "IOC4 clock attached more than once");
     }
 
     /// The timer manager for device deadlines. Set it before start.
@@ -739,6 +758,13 @@ impl PciBusDevice for Ioc4 {
             }
             return u32::from(self.sh.with_st(|st| st.uart_read(p, r)));
         }
+        if let Some(clock) = self.clock.get().filter(|_| in_clock(off)) {
+            if width != 1 {
+                Ioc4::refuse("clock read", width, off);
+                return 0;
+            }
+            return u32::from(clock.read8(u64::from(off - reg::CLOCK)).data);
+        }
         if width != 4 || off & 3 != 0 {
             Ioc4::refuse("read", width, off);
             return 0;
@@ -756,6 +782,14 @@ impl PciBusDevice for Ioc4 {
                 return;
             }
             self.sh.with_st(|st| st.uart_write(p, r, val as u8));
+            return;
+        }
+        if let Some(clock) = self.clock.get().filter(|_| in_clock(off)) {
+            if width != 1 {
+                Ioc4::refuse("clock write", width, off);
+                return;
+            }
+            clock.write8(u64::from(off - reg::CLOCK), val as u8);
             return;
         }
         if width != 4 || off & 3 != 0 {
