@@ -17,7 +17,7 @@ pub mod ds1744;
 pub mod heart;
 pub mod heart_mem;
 pub mod ioc3;
-pub mod ioc_sdma;
+pub mod ioc_serial_dma;
 pub mod ioc3_eth;
 pub mod ioc3_port;
 pub mod ioc4;

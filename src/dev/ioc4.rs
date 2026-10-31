@@ -34,7 +34,7 @@
 //!
 //! * The reset values, the BAR size and the PCI class are the emulator's
 //!   choices.
-//! * The serial ring engine is the one the IOC3 uses (`ioc_sdma.rs`) and
+//! * The serial ring engine is the one the IOC3 uses (`ioc_serial_dma.rs`) and
 //!   carries its approximations: a loopback character arrives inside the
 //!   write that sent it, timers run on host time, and receive-ring-full
 //!   latches on each refused post. After a failed ring transfer the port
@@ -47,6 +47,10 @@
 //!   boards that ask for it: a value taken from another revision of the chip,
 //!   not measured on this one.
 //!
+//! Names follow QEMU's: `sgi-ioc4.c` has the same registers under the same
+//! names, its `sgi_ioc4_sdma_*` callbacks are the chip's `SerialDmaHost`, and
+//! the ring engine is `ioc_serial_dma.rs` (QEMU's `sgi-ioc-serial-dma.c`).
+//!
 //! Ported from hw/misc/sgi-ioc4.c in jamesbraid/qemu-sgi-origami.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,7 +60,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::dev::ds1744::Ds1744;
-use crate::dev::ioc_sdma::{off as sdma_off, EngineUart, Host, Params, Sdma, Source};
+use crate::dev::ioc_serial_dma::{off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -132,7 +136,7 @@ const SERIAL_CONTROL_IDLE: u32 = 0x80;
 
 /// IOC4's engine halts a port on a failed transfer and does not define the
 /// packer's held count.
-const SDMA_PARAMS: Params = Params { held_counts: false, halt_on_dma_error: true };
+const IOC4_SDMA_PARAMS: SerialDmaParams = SerialDmaParams { held_counts: false, halt_on_dma_error: true };
 
 /// The UART input clock the board feeds the chip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,7 +224,7 @@ struct St {
     error_high: u32,
     ata_readback: u32,
     uart: [Ns16550; PORTS],
-    sdma: Sdma,
+    sdma: SerialDma,
     dma: Option<Arc<dyn PciDma>>,
 }
 
@@ -237,7 +241,7 @@ impl St {
             error_high: 0,
             ata_readback: 0,
             uart: std::array::from_fn(|_| Ns16550::new(cfg.clock.hz() / 16)),
-            sdma: Sdma::new(PORTS, SDMA_PARAMS),
+            sdma: SerialDma::new(PORTS, IOC4_SDMA_PARAMS),
             dma: None,
         }
     }
@@ -273,8 +277,8 @@ impl St {
         d
     }
 
-    fn sdma_split(&mut self) -> (&mut Sdma, Ioc4Host<'_>) {
-        let host = Ioc4Host {
+    fn sdma_engine_split(&mut self) -> (&mut SerialDma, Ioc4SerialDmaHost<'_>) {
+        let host = Ioc4SerialDmaHost {
             uart: &mut self.uart,
             serial_pending: &mut self.serial_pending,
             level: &mut self.level,
@@ -287,12 +291,12 @@ impl St {
     }
 
     fn sdma_run(&mut self, p: usize) {
-        let (sdma, mut host) = self.sdma_split();
+        let (sdma, mut host) = self.sdma_engine_split();
         sdma.run(p, &mut host);
     }
 
     fn sdma_catch_up(&mut self, now: Instant) {
-        let (sdma, mut host) = self.sdma_split();
+        let (sdma, mut host) = self.sdma_engine_split();
         sdma.catch_up(now, &mut host);
     }
 
@@ -323,7 +327,7 @@ impl St {
     fn read32(&mut self, a: u32) -> u32 {
         self.sdma_catch_up(Instant::now());
         if let Some(r) = sdma_decode(a) {
-            let (sdma, mut host) = self.sdma_split();
+            let (sdma, mut host) = self.sdma_engine_split();
             return match r {
                 SdmaReg::Base { pair, high } => sdma.base_read(pair, high),
                 SdmaReg::Port { port, off } => sdma.port_read(port, off, &mut host),
@@ -352,7 +356,7 @@ impl St {
             match r {
                 SdmaReg::Base { pair, high } => self.sdma.base_write(pair, high, v),
                 SdmaReg::Port { port, off } => {
-                    let (sdma, mut host) = self.sdma_split();
+                    let (sdma, mut host) = self.sdma_engine_split();
                     sdma.port_write(port, off, v, &mut host);
                 }
             }
@@ -385,7 +389,7 @@ fn set_level_bit(word: &mut u32, mask: u32, level: bool) {
 
 /// IOC4 as the ring engine sees it: four 16550s, the serial status word,
 /// the error capture registers and the bus master.
-struct Ioc4Host<'a> {
+struct Ioc4SerialDmaHost<'a> {
     uart: &'a mut [Ns16550; PORTS],
     serial_pending: &'a mut u32,
     level: &'a mut u32,
@@ -395,16 +399,16 @@ struct Ioc4Host<'a> {
     dma: Option<&'a dyn PciDma>,
 }
 
-impl Host for Ioc4Host<'_> {
-    fn uart(&mut self, port: usize) -> &mut dyn EngineUart {
+impl SerialDmaHost for Ioc4SerialDmaHost<'_> {
+    fn uart(&mut self, port: usize) -> &mut dyn SerialDmaUart {
         &mut self.uart[port]
     }
 
-    fn raise(&mut self, port: usize, src: Source) {
+    fn raise(&mut self, port: usize, src: SerialDmaSource) {
         *self.serial_pending |= int::serial(port, src as u32);
     }
 
-    fn set_level(&mut self, port: usize, src: Source, level: bool) {
+    fn set_level(&mut self, port: usize, src: SerialDmaSource, level: bool) {
         set_level_bit(self.level, int::serial(port, src as u32), level);
     }
 

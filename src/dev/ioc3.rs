@@ -2,7 +2,7 @@
 //!
 //! One PCI function with one 1 MiB memory BAR. Behind it: two 16550 serial
 //! ports with a ring-DMA engine each (the engine is shared with the IOC4, in
-//! `ioc_sdma.rs`), a PS/2 keyboard and mouse controller,
+//! `ioc_serial_dma.rs`), a PS/2 keyboard and mouse controller,
 //! a parallel port, a MicroLAN (one-wire) master, the GPIO pins, a DS1685
 //! clock on the Octane byte bus or Fuel's flat system Timekeeper, the
 //! Ethernet buffer RAM and, in the register range at 0xf0,
@@ -43,6 +43,10 @@
 //!   has no alarm or periodic interrupts. Its RAM, including the 128-byte
 //!   extended RAM, persists in a 512-byte file.
 //!
+//! Names follow QEMU's: `sgi-ioc3.c` has the same registers under the same
+//! names, its `sgi_ioc3_sdma_*` callbacks are the chip's `SerialDmaHost`, and
+//! the ring engine is `ioc_serial_dma.rs` (QEMU's `sgi-ioc-serial-dma.c`).
+//!
 //! Ported from hw/misc/sgi-ioc3.c and its serial, parallel and keyboard siblings
 //! in jamesbraid/qemu-sgi-origami.
 
@@ -59,9 +63,9 @@ use crate::dev::ioc3_port::Ioc3EthPort;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{self, BoardRecord};
-use crate::dev::ioc_sdma::{off as sdma_off, EngineUart, Host, Params, Sdma, Source};
+use crate::dev::ioc_serial_dma::{off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
 #[cfg(test)]
-use crate::dev::ioc_sdma::{ctl as sdma_ctl, ARM_RX_TIMER, HELD_SHIFT, TIMER_TICK_NS, TX_DELAY, TX_INTERRUPT};
+use crate::dev::ioc_serial_dma::{ctl as sdma_ctl, ARM_RX_TIMER, HELD_SHIFT, TIMER_TICK_NS, TX_DELAY, TX_INTERRUPT};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::irq::{InterruptController, IrqLine};
@@ -264,7 +268,7 @@ impl Uart {
     }
 }
 
-impl EngineUart for Uart {
+impl SerialDmaUart for Uart {
     fn loopback(&self) -> bool {
         self.core.loopback()
     }
@@ -296,7 +300,7 @@ impl EngineUart for Uart {
 
 /// What IOC3's engine does that IOC4's does not: it reports the packer's held
 /// count, and a failed transfer does not stop the port.
-const SDMA_PARAMS: Params = Params { held_counts: true, halt_on_dma_error: false };
+const IOC3_SDMA_PARAMS: SerialDmaParams = SerialDmaParams { held_counts: true, halt_on_dma_error: false };
 
 /// Chip control: where each engine finds its 16550 (byte offset / 8).
 const CHIP_CTRL_MASK: u32 = 0x0007_ffff;
@@ -787,7 +791,7 @@ struct St {
     pin_control: u32,
     pin_data: u32,
     uart: [Uart; 2],
-    sdma: Sdma,
+    sdma: SerialDma,
     kbc: Kbc,
     par: Parallel,
     rtc: Rtc,
@@ -837,7 +841,7 @@ impl St {
             pin_control: 0,
             pin_data: 0,
             uart: [Uart::new(), Uart::new()],
-            sdma: Sdma::new(2, SDMA_PARAMS),
+            sdma: SerialDma::new(2, IOC3_SDMA_PARAMS),
             kbc: Kbc::default(),
             par: Parallel::default(),
             rtc: Rtc::new(),
@@ -931,8 +935,8 @@ impl St {
 
     /// The engine and the chip around it, borrowed apart so the engine can
     /// drive the 16550s, the interrupt status and the bus master.
-    fn sdma_split(&mut self) -> (&mut Sdma, SdmaHost<'_>) {
-        let host = SdmaHost {
+    fn sdma_engine_split(&mut self) -> (&mut SerialDma, Ioc3SerialDmaHost<'_>) {
+        let host = Ioc3SerialDmaHost {
             uart: &mut self.uart,
             int_status: &mut self.int_status,
             chip_control: self.chip_control,
@@ -943,30 +947,30 @@ impl St {
     }
 
     fn sdma_run(&mut self, p: usize) {
-        let (sdma, mut host) = self.sdma_split();
+        let (sdma, mut host) = self.sdma_engine_split();
         sdma.run(p, &mut host);
     }
 
     /// Expiries already due happen before an access.
     fn sdma_catch_up(&mut self, now: Instant) {
-        let (sdma, mut host) = self.sdma_split();
+        let (sdma, mut host) = self.sdma_engine_split();
         sdma.catch_up(now, &mut host);
     }
 
     fn sdma_port_read(&mut self, p: usize, off: u32) -> u32 {
-        let (sdma, mut host) = self.sdma_split();
+        let (sdma, mut host) = self.sdma_engine_split();
         sdma.port_read(p, off, &mut host)
     }
 
     fn sdma_port_write(&mut self, p: usize, off: u32, val: u32) {
-        let (sdma, mut host) = self.sdma_split();
+        let (sdma, mut host) = self.sdma_engine_split();
         sdma.port_write(p, off, val, &mut host);
     }
 }
 
 /// IOC3 as the ring engine sees it: two 16550s, the SuperIO status word, and
 /// the bus master.
-struct SdmaHost<'a> {
+struct Ioc3SerialDmaHost<'a> {
     uart: &'a mut [Uart; 2],
     int_status: &'a mut u32,
     chip_control: u32,
@@ -974,7 +978,7 @@ struct SdmaHost<'a> {
     dma: Option<&'a Ioc3Dma>,
 }
 
-impl SdmaHost<'_> {
+impl Ioc3SerialDmaHost<'_> {
     fn set_bit(&mut self, mask: u32, level: bool) {
         if level {
             *self.int_status |= mask;
@@ -984,16 +988,16 @@ impl SdmaHost<'_> {
     }
 }
 
-impl Host for SdmaHost<'_> {
-    fn uart(&mut self, port: usize) -> &mut dyn EngineUart {
+impl SerialDmaHost for Ioc3SerialDmaHost<'_> {
+    fn uart(&mut self, port: usize) -> &mut dyn SerialDmaUart {
         &mut self.uart[port]
     }
 
-    fn raise(&mut self, port: usize, src: Source) {
+    fn raise(&mut self, port: usize, src: SerialDmaSource) {
         *self.int_status |= int::serial(port, src as u32);
     }
 
-    fn set_level(&mut self, port: usize, src: Source, level: bool) {
+    fn set_level(&mut self, port: usize, src: SerialDmaSource, level: bool) {
         self.set_bit(int::serial(port, src as u32), level);
     }
 
