@@ -638,6 +638,35 @@ impl MachineProfile {
         }
     }
 
+    /// The processors fitted at most: two on the Octane, one elsewhere.
+    pub fn max_cpus(self) -> u8 {
+        if self == Self::OctaneIp30 { 2 } else { 1 }
+    }
+
+    /// Whether this profile can have `cpus` processors, and why not if it
+    /// cannot.
+    pub fn accepts_cpus(self, cpus: u8) -> Result<(), String> {
+        if cpus != 1 && self.max_cpus() == 1 {
+            Err(format!("[machine] cpus = {cpus}: only the Octane has more than one processor"))
+        } else if !(1..=self.max_cpus()).contains(&cpus) {
+            Err(format!("[machine] cpus = {cpus}: IRIX runs an Octane with 1 or 2"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether this profile can have `cpu`, and why not if it cannot. The
+    /// Octane builds only the part below; the O2 constructor still refuses
+    /// its own, after `validate()`.
+    pub fn accepts_cpu(self, cpu: CpuModel) -> Result<(), String> {
+        match self {
+            Self::OctaneIp30 if cpu != CpuModel::R10000 => {
+                Err("an Octane has an R10000 ([machine] cpu = \"r10000\")".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::IndyIp24 => "SGI Indy (IP24)",
@@ -2189,9 +2218,8 @@ impl MachineConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         self.validate_virtio_serial()?;
-        if self.machine.cpus != 1 && self.machine.profile != MachineProfile::OctaneIp30 {
-            return Err(format!("[machine] cpus = {}: only the Octane has more than one processor", self.machine.cpus));
-        }
+        self.machine.profile.accepts_cpu(self.machine.cpu)?;
+        self.machine.profile.accepts_cpus(self.machine.cpus)?;
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
             return Err(format!(
                 "graphics.heads {} is invalid (valid: 1, 2)",
@@ -3230,6 +3258,50 @@ mod export_tests {
         let mut indy = MachineConfig::default();
         indy.network.mode = NetMode::Off;
         assert!(indy.validate().unwrap_err().contains("only available on the O2"));
+    }
+
+    /// A profile says which processors and counts it accepts, and `validate()`
+    /// and the Octane constructor refuse a bad processor with the same words.
+    #[test]
+    fn a_profile_says_which_processors_it_accepts() {
+        let accepted = |p: MachineProfile| CpuModel::ALL.into_iter().filter(|&c| p.accepts_cpu(c).is_ok()).collect::<Vec<_>>();
+        assert_eq!(accepted(MachineProfile::OctaneIp30), [CpuModel::R10000]);
+        assert_eq!(accepted(MachineProfile::IndyIp24), [CpuModel::R4400, CpuModel::R5000, CpuModel::R10000]);
+
+        // The counts are what the checks in validate() and the Octane
+        // constructor allowed before they moved here: one on every machine
+        // but the Octane, one or two on the Octane.
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+            for cpus in 0..=4u8 {
+                let old_ok = if p == MachineProfile::OctaneIp30 { (1..=2).contains(&cpus) } else { cpus == 1 };
+                assert_eq!(p.accepts_cpus(cpus).is_ok(), old_ok, "{p:?} with {cpus}");
+            }
+            if p != MachineProfile::OctaneIp30 {
+                assert_eq!(
+                    p.accepts_cpus(2).unwrap_err(),
+                    "[machine] cpus = 2: only the Octane has more than one processor"
+                );
+            }
+        }
+
+        let mut octane = MachineConfig::default();
+        octane.machine.profile = MachineProfile::OctaneIp30;
+        octane.machine.cpu = CpuModel::R10000;
+        octane.banks = banks_from4([128, 0, 0, 0]);
+        octane.machine.cpus = 2;
+        octane.validate().expect("two processors");
+        octane.machine.cpus = 3;
+        assert!(octane.validate().unwrap_err().contains("1 or 2"));
+        octane.machine.cpus = 1;
+        octane.machine.cpu = CpuModel::R4400;
+        assert!(octane.validate().unwrap_err().contains("an Octane has an R10000"));
+
+        // The constructor refuses a processor with the words validate() does.
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::OctaneIp30;
+        cfg.machine.cpu = CpuModel::R4400;
+        let from_validate = cfg.validate().unwrap_err();
+        assert_eq!(crate::ip30_machine::OctaneMachine::new(&cfg).err(), Some(from_validate));
     }
 
     /// The serial sockets come from the file and the command line, must

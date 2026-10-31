@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::config::{CpuModel, MachineConfig};
+use crate::config::{CpuModel, MachineConfig, MachineProfile};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R5000ShadowCache};
