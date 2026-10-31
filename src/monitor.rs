@@ -188,6 +188,10 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         let _ = write!(writer, "> ");
         let _ = writer.flush();
     }
+    // Hang up. Closing our handles is not enough: the log sink above holds
+    // another handle to the socket, which keeps the connection open, and the
+    // console client waits for it to close before it exits.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 #[cfg(test)]
@@ -226,6 +230,23 @@ mod tests {
         let monitor = Arc::new(Monitor::new());
         monitor.clone().start_server(addr.to_string());
         assert_eq!(monitor.bound_addr(), None);
+    }
+
+    /// `quit` ends the connection even though the machine's log sink keeps a
+    /// handle on the socket, so the terminal console sees the end and exits.
+    #[test]
+    fn quit_hangs_up_despite_the_log_sink() {
+        use std::io::{Read, Write};
+        crate::devlog::init_devlog();
+        let monitor = Arc::new(Monitor::new());
+        monitor.clone().start_server("127.0.0.1:0".to_string());
+        let addr = wait_for("bind", || monitor.bound_addr());
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"quit\n").unwrap();
+        let mut sink = Vec::new();
+        s.read_to_end(&mut sink).expect("the monitor closed the connection");
+        monitor.shutdown();
     }
 
     #[test]
