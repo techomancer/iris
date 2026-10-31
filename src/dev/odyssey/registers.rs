@@ -423,7 +423,14 @@ impl Board {
                 // initialisation preamble; zero before.
                 value = if self.cfifo_selftest_ready { ODSY_CFIFO_SELFTEST_OK as u64 } else { 0 };
             }
-            ODSY_MEMORY_CONFIG => value = self.memory_config as u64,
+            ODSY_MEMORY_CONFIG => {
+                // Bits 15:7 count the command stream's pending doublewords
+                // (established unit); the model's pending words round up.
+                // It reads 0 once the board has run the queue, which the
+                // start-up and flow-reset drain waits need.
+                let doublewords = self.fifo.level().div_ceil(2).min(0x1ff);
+                value = (self.memory_config | (doublewords << 7)) as u64;
+            }
             ODSY_FLCTL_CONFIG => value = self.flctl_config as u64,
             ODSY_FLCTL_TARGET => value = self.flctl_target as u64,
             ODSY_BUZZ_1 => value = self.buzz[0] as u64,

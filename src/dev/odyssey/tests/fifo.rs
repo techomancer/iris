@@ -500,9 +500,48 @@ fn a_read_of_a_register_the_work_may_change_finishes_the_work_first() {
     assert_eq!(reg_read(&mut s, ODSY_SW_TOKEN), 1);
     assert!(s.work_pending(), "the token is answered without waiting");
 
-    reg_read(&mut s, MEMORY_CONFIG);
+    reg_read(&mut s, ODSY_BUZZ_1);
     assert!(!s.work_pending());
     assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0xa5a5);
+}
+
+/// The level word is a plain load: with words queued it answers at once
+/// with their count in bits 15:7, in doublewords, and runs nothing.
+///
+/// QEMU: command-work-level-word-reads-live.
+#[test]
+fn the_level_word_reports_the_queue_without_draining_it() {
+    let (mut s, _, ram) = queued_board();
+    push_fences(&mut s);
+    let (words, stores) = (s.fifo.level(), s.fifo.stores());
+    assert!(words > 0);
+
+    let level = (reg_read(&mut s, MEMORY_CONFIG) >> 7) & 0x1ff;
+    assert_eq!(level, words.div_ceil(2));
+    assert_ne!(level, 0);
+    assert_eq!((s.fifo.level(), s.fifo.stores()), (words, stores), "the read left the queue alone");
+    assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0, "nothing ran");
+    assert_eq!(reg_read(&mut s, MEMORY_CONFIG) & 0xff00_0000, 0xa100_0000, "the straps are still there");
+}
+
+/// The drain waits poll bits 15:7 until they read 0, so the level falls to
+/// 0 as the board empties the queue.
+///
+/// QEMU: command-work-level-word-falls-to-zero.
+#[test]
+fn the_level_word_reads_zero_once_the_board_has_run_the_queue() {
+    let (mut s, _, _) = queued_board();
+    push_fences(&mut s);
+    let mut last = (reg_read(&mut s, MEMORY_CONFIG) >> 7) & 0x1ff;
+    assert_ne!(last, 0);
+    while s.work_pending() {
+        step(&mut s);
+        let now = (reg_read(&mut s, MEMORY_CONFIG) >> 7) & 0x1ff;
+        assert!(now <= last, "the level never rises while the board drains");
+        last = now;
+    }
+    assert_eq!(last, 0);
+    assert_eq!(reg_read(&mut s, MEMORY_CONFIG) & 0xff80, 0);
 }
 
 /// While stores wait the FIFO is neither empty nor below low water in the

@@ -150,6 +150,15 @@ pub fn command_store(addr: u64, size: u32) -> bool {
         || reg(addr, size) == ODSY_CTX_SHADOW_ADDR_LOWER as i64
 }
 
+/// A read of the level word `0x106c`, which never waits: it is a plain load
+/// of live levels (Odyssey datasheet, "Flags, status and flow control", the
+/// level word). The make-current and detach readers discard it, and the
+/// drain waits poll bits 15:7 until they read 0, which the live level
+/// does once the board has run the queue.
+pub fn level_word(addr: u64, size: u32) -> bool {
+    reg(addr, size) == ODSY_MEMORY_CONFIG as i64
+}
+
 /// Accesses that need not wait for the queued stores, and act on the board
 /// as it stands. Inferred from what a driver does while the board works,
 /// not measured on a board; every other access waits.
@@ -199,39 +208,15 @@ pub fn access_waits(addr: u64, size: u32, write: bool) -> bool {
     )
 }
 
-/// Whether a read that waits for the queued stores also waits for the
-/// raster work they handed on.
-///
-/// Every field of the memory word `0x106c` is a level or a strap, never a
-/// drawing result (Odyssey datasheet, "Board and kernel", "Back-end
-/// records" and "Flags, status and flow control"): the straps in bits
-/// 31:24, the back-end FIFO's fill in bits 6:0, which the model's back-end
-/// writes leave at 0 once the stores before them have run, and the command
-/// FIFO's level in bits 15:7, 0 once the stores have run. The datasheet's
-/// completion points keep command-FIFO space and data drain apart from
-/// raster work reaching memory. So the word waits for the front end and
-/// not for the raster unit. The kernel reads it at every flow-control
-/// attach, which a GL client's make-current runs, so a raster wait there
-/// stalls the processor for the drawing of each frame.
-///
-/// Every other waiting read keeps both waits: the datasheet does not
-/// settle what they need.
-pub fn read_waits_for_raster(addr: u64, size: u32) -> bool {
-    reg(addr, size) != ODSY_MEMORY_CONFIG as i64
-}
-
 impl Board {
     /// A read with the board lock held.
     pub fn mmio_read(&mut self, addr: u64, size: u32) -> u64 {
-        if access_waits(addr, size, false) {
-            // The stores before it, and, unless the register holds only
-            // levels and straps, the raster work they handed on.
+        if access_waits(addr, size, false) && !level_word(addr, size) {
+            // The stores before it and the raster work they handed on.
             if self.work_pending() {
                 self.work_drain(addr);
             }
-            if read_waits_for_raster(addr, size) {
-                self.raster_wait();
-            }
+            self.raster_wait();
         }
         self.read(addr, size)
     }
@@ -310,8 +295,8 @@ impl BoardLocks {
 
     /// A processor's read as the bus takes it. None, for the bus to answer
     /// busy, while the work the read must see is still queued on the
-    /// board's threads: the command stores before it, and, unless it is the
-    /// memory word, the raster work they handed on. The processor retries
+    /// board's threads: the command stores before it and the raster work
+    /// they handed on. The level word never waits. The processor retries
     /// the load, taking its interrupts meanwhile, while the board's threads
     /// run that work, as IMPACT's waiting reads do; the read then finds
     /// nothing to drain. Without the board's thread the read drains the
@@ -320,12 +305,12 @@ impl BoardLocks {
         if let Some(v) = front_mmio_read(&self.front, addr, size) {
             return Some(v);
         }
-        if access_waits(addr, size, false) && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) {
+        if access_waits(addr, size, false) && !level_word(addr, size) && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) {
             if self.fifo.pending() {
                 self.fifo.hurry();
                 return None;
             }
-            if read_waits_for_raster(addr, size) && self.raster.pending() != 0 {
+            if self.raster.pending() != 0 {
                 return None;
             }
         }
