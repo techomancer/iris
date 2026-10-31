@@ -25,6 +25,11 @@ pub const SGI_TIE_TOP_LEFT_BOTTOM_ORIGIN: TieRule = 1;
 
 pub type LineRule = u32;
 pub const SGI_LINE_COVERAGE_DOUBLE: LineRule = 1;
+/// One pixel per major-axis column (or row) whose centre lies between the
+/// ends, the start's side included: the minor-axis pixel holding the segment
+/// at that centre, a crossing exactly on a pixel edge taking the lower
+/// pixel. Width and smoothing as SGI_LINE_COVERAGE_DOUBLE.
+pub const SGI_LINE_CENTRE_SAMPLED: LineRule = 2;
 
 pub type Dither = u32;
 pub const SGI_DITHER_NONE: Dither = 0;
@@ -630,7 +635,7 @@ impl RasterRules {
             (self.rounding as u32) <= SGI_ROUND_HALF_AWAY &&
             (self.tie_rule as u32) == SGI_TIE_TOP_LEFT_BOTTOM_ORIGIN &&
             (self.arith as u32) == SGI_ARITH_DOUBLE &&
-            (self.line_rule as u32) == SGI_LINE_COVERAGE_DOUBLE &&
+            ((self.line_rule as u32) == SGI_LINE_COVERAGE_DOUBLE || (self.line_rule as u32) == SGI_LINE_CENTRE_SAMPLED) &&
             (self.dither as u32) <= SGI_DITHER_BAYER4_TOP_ROWS &&
             (self.smooth_rule as u32) <= SGI_SMOOTH_TWO_PIXEL_FILTER &&
             (self.dither as u32 == SGI_DITHER_NONE ||

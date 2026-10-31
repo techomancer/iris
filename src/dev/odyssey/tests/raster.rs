@@ -384,3 +384,59 @@ fn a_clear_asks_the_display_for_its_rows() {
     let rows = drawn_rows(&h, 0);
     assert_eq!(rows, (200..300).collect::<Vec<_>>());
 }
+
+/// The pixels a one-pixel line lights under line rule `rule`, in the
+/// rectangle of the board's first 80 columns and 64 rows, as (x, y) pairs.
+fn line_pixels(rule: LineRule, a: (f32, f32), b: (f32, f32)) -> Vec<(i32, i32)> {
+    let mut bench = Bench::empty();
+    bench.board.gl_write_mask |= ODSY_WRITE_COLOUR_MASK << ODSY_WRITE_COLOUR_SHIFT;
+    bench.st.shade_model = SGI_GL_FLAT;
+    bench.st.dither = 0;
+    bench.rules.line_rule = rule as u8;
+    bench.mode = SGI_GL_LINES;
+    bench.prims = vec![vertices(&[a, b], RED)];
+    bench.run();
+    (0..64).flat_map(|y| (0..80).map(move |x| (x, y))).filter(|&(x, y)| pixel(&bench.board, 0, x, y) != 0).collect()
+}
+
+/// A one-pixel line takes the centre-sampled rule: a pixel per major-axis
+/// column whose centre lies between the ends, the end not included. A line
+/// that ends past a column centre but inside that pixel's diamond lights the
+/// column, where the diamond-exit rule leaves it; a crossing exactly on a
+/// pixel edge goes to the lower pixel whichever way the line slopes, where
+/// the diamond rule's perturbation follows the slope. Reversed, the end
+/// inside a diamond is the start, and both rules agree. A vertical line
+/// exactly on a column edge takes the column to its left under both. Cases
+/// and expectations from the QEMU sgi-origami branch's line tests
+/// (ab9b3f98f25f, c5417243927d).
+#[test]
+fn a_line_takes_the_centre_sampled_rule() {
+    let cases: [((f32, f32), (f32, f32), bool, Vec<(i32, i32)>); 4] = [
+        ((1.0, 3.5), (5.75, 3.5), true, vec![(1, 3), (2, 3), (3, 3), (4, 3), (5, 3)]),
+        ((5.75, 3.5), (1.0, 3.5), false, vec![(1, 3), (2, 3), (3, 3), (4, 3), (5, 3)]),
+        ((1.5, 2.0), (5.5, 4.0), true, vec![(1, 1), (2, 2), (3, 2), (4, 3)]),
+        ((4.0, 1.0), (4.0, 5.0), false, vec![(3, 1), (3, 2), (3, 3), (3, 4)]),
+    ];
+
+    for (a, b, diamond_differs, want) in cases {
+        let centre = line_pixels(SGI_LINE_CENTRE_SAMPLED, a, b);
+        let diamond = line_pixels(SGI_LINE_COVERAGE_DOUBLE, a, b);
+
+        assert_eq!(centre, want, "centre-sampled {a:?} to {b:?}");
+        assert_eq!(diamond != want, diamond_differs, "diamond-exit {a:?} to {b:?}: {diamond:?}");
+    }
+}
+
+/// Centre-sampled lines at the board's line-test geometry: a horizontal
+/// line from x 60.0 to 70.75 lights columns 60 to 70, eleven pixels, the one
+/// past the last column centre included; a line rising at slope one half
+/// crosses a row edge exactly at every other column centre, and each of those
+/// columns takes the lower row, sharing it with the column after.
+#[test]
+fn centre_sampled_lines_light_the_pixels_the_rule_names() {
+    let horizontal = line_pixels(SGI_LINE_CENTRE_SAMPLED, (60.0, 10.5), (70.75, 10.5));
+    assert_eq!(horizontal, (60..=70).map(|x| (x, 10)).collect::<Vec<_>>());
+
+    let rising = line_pixels(SGI_LINE_CENTRE_SAMPLED, (60.0, 9.75), (68.0, 13.75));
+    assert_eq!(rising, [(60, 9), (61, 10), (62, 10), (63, 11), (64, 11), (65, 12), (66, 12), (67, 13)]);
+}

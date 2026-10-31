@@ -1,4 +1,5 @@
-//! Lines and points: projection, the diamond-exit rule for aliased lines,
+//! Lines and points: projection, the diamond-exit and centre-sampled rules
+//! for aliased lines,
 //! antialiased line and point coverage, wide lines and line stipple.
 //!
 //! Ported from hw/display/sgi/rasterizer.c in jamesbraid/qemu-sgi-origami.
@@ -112,6 +113,50 @@ impl SoftVertex {
                 dx,
                 half.wrapping_mul(dy.wrapping_abs()),
             )
+    }
+}
+
+impl SoftVertex {
+    /// SGI_LINE_CENTRE_SAMPLED: pixel (px, py) is on the segment to b if its
+    /// column (row, for a y-major segment) has its centre between the ends,
+    /// the start included and the end not, and it is the minor-axis pixel
+    /// holding the segment at that centre, an exact crossing on a pixel edge
+    /// going to the lower pixel, ceil(v) - 1. Exact on the snapped grid:
+    /// with the minor coordinate at the centre v = n + t / den, the pixel is
+    /// ceil(v / 2^sub) - 1. Coordinate differences are at most 2^29, so t
+    /// fits, and the minor base shifted by the width stays below 2^43.
+    ///
+    /// Ported from sgi_soft_line_centre_covers() in QEMU sgi-origami
+    /// ab9b3f98f25f.
+    pub fn line_centre_covers(&self, b: &SoftVertex, px: i64, py: i64, sub: i32) -> bool {
+        let one = 1i64 << sub;
+        let half = one >> 1;
+        let x_major = b.x.wrapping_sub(self.x).wrapping_abs() >= b.y.wrapping_sub(self.y).wrapping_abs();
+        let (la, lb, na, nb) = if x_major { (self.x, b.x, self.y, b.y) } else { (self.y, b.y, self.x, b.x) };
+        let c = (if x_major { px } else { py }).wrapping_mul(one).wrapping_add(half);
+        let mut den = lb.wrapping_sub(la);
+
+        if if den > 0 { c < la || c >= lb } else { c > la || c <= lb } {
+            return false;
+        }
+        let mut t = nb.wrapping_sub(na).wrapping_mul(c.wrapping_sub(la));
+        if den < 0 {
+            t = t.wrapping_neg();
+            den = den.wrapping_neg();
+        }
+        // v = na + floor(t / den) plus a fraction that is zero or not.
+        let v = na.wrapping_add(t.div_euclid(den));
+        let minor = if t % den != 0 { v.div_euclid(one) } else { v.wrapping_neg().div_euclid(one).wrapping_neg().wrapping_sub(1) };
+        (if x_major { py } else { px }) == minor
+    }
+
+    /// Whether the segment to b covers pixel (px, py) under the line rule.
+    pub fn line_covered(&self, rule: u8, b: &SoftVertex, px: i64, py: i64, sub: i32) -> bool {
+        if rule as u32 == SGI_LINE_CENTRE_SAMPLED {
+            self.line_centre_covers(b, px, py, sub)
+        } else {
+            self.line_covers(b, px, py, sub)
+        }
     }
 }
 
@@ -540,7 +585,7 @@ impl SoftDraw<'_> {
                         base_x as i32,
                         base_y as i32,
                     )
-                } else if shifted_a.line_covers(&shifted_b, base_x, base_y, sub) {
+                } else if shifted_a.line_covered(self.rules.line_rule, &shifted_b, base_x, base_y, sub) {
                     1.0
                 } else {
                     0.0

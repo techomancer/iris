@@ -991,6 +991,12 @@ pub fn image_burst_fmt(reg: u32, fmt: &mut u32) -> bool {
 /// interpolated-colour depth are unmeasured. The depth word is the board's
 /// 24-bit float (depth_word.rs). (A function, not a static: the struct is not const
 /// constructible.)
+///
+/// One-pixel lines take the centre-sampled rule (SGI_LINE_CENTRE_SAMPLED), as
+/// the QEMU sgi-origami branch's board model does (ab9b3f98f25f,
+/// c5417243927d). The branch's record is the authority for where that rule
+/// is established and where it is a model choice: the x-major tie and the
+/// end rule are model choices.
 pub fn gl_rules() -> RasterRules {
     RasterRules {
         subpixel_bits: 8,
@@ -1000,7 +1006,7 @@ pub fn gl_rules() -> RasterRules {
         rounding: SGI_ROUND_HALF_AWAY as u8,
         tie_rule: SGI_TIE_TOP_LEFT_BOTTOM_ORIGIN as u8,
         arith: SGI_ARITH_DOUBLE as u8,
-        line_rule: SGI_LINE_COVERAGE_DOUBLE as u8,
+        line_rule: SGI_LINE_CENTRE_SAMPLED as u8,
         alpha_test_bits: 12,
         smooth_primitives: true,
         // The board's depth word; Board::gl_load_combined().
