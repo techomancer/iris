@@ -1,0 +1,41 @@
+# SGI Tezro (IP53 board, IP35 software platform), serial-only setup.
+# Copy to tezro.toml and run from the repository root: iris --config tezro.toml
+# Create ignore/tezro/ and supply your decoded raw IP35 PROM 6.210 payload
+# and an IRIX disk installed on a Tezro: a disk installed on another machine
+# carries that machine's device numbering.
+# No PROM or disk images are included. Convert QCOW2 disks to raw first.
+
+prom = "ignore/tezro/ip35prom.payload.bin"
+nvram = "ignore/tezro/nvram.bin"
+# banks left unset: 4 GiB as 1024, 1024 and four 512 MiB banks.
+headless = true
+no_audio = true
+monitor_port = 18888
+serial_port_a = 18880
+serial_port_b = 18881
+
+[machine]
+profile = "tezro_ip53"
+# Optional; left out, or as the family "r16000", it is the 700 MHz R16000,
+# "r16000_700". "r16000_800", "r16000_900" and "r16000_1000" are the others (four
+# processors only); other values are refused.
+cpu = "r16000_700"
+
+[graphics]
+board = "none"
+
+[tezro]
+flash = "ignore/tezro/flash.bin"
+console = "l1"
+l1_port = 18882
+
+[network]
+# Disconnected cable. For NAT, use mode = "nat".
+mode = "off"
+
+[scsi.1]
+path = "ignore/tezro/irix.raw"
+cdrom = false
+# Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
+overlay = true
+# write_cache = false  # default true. false stores every write before it completes, like SGI's drives (slower); true can lose ~5 s of writes in a host crash. See STORAGE.md

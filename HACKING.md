@@ -17,10 +17,12 @@ Other documents:
 ## 1. What IRIS is
 
 IRIS emulates the Indy (IP24), Indigo2 (IP22), Indigo2 IMPACT (IP28), O2
-(IP32), Octane (IP30) and Fuel (IP34 board, IP35 software platform). The CPU
-is an R4400, R5000, R10000, R12000 or R14000, chosen at runtime (the
-IP28 takes the R10000; the Octane the R10000, R12000 or R14000; the O2 the
-R5000, R10000 or R12000; the Fuel its 500 MHz R14000). Graphics is Newport
+(IP32), Octane (IP30), Fuel (IP34 board, IP35 software platform) and Tezro
+(IP53 board, IP35 software platform). The CPU is an R4400, R5000, R10000,
+R12000, R14000 or R16000, chosen at runtime (the IP28 takes the R10000; the
+Octane the R10000, R12000 or R14000; the O2 the R5000, R10000 or R12000; the
+Fuel its 500 MHz R14000; the Tezro its R16000 at 700, 800, 900 or 1000 MHz).
+Graphics is Newport
 (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and Indigo2, GBE on the O2, and
 Solid IMPACT on the Octane. Fuel has no graphics board and runs headless on
 its serial console. It does have a PS/2 keyboard and mouse on its IOC3, fed
@@ -323,7 +325,9 @@ Every device that has real work to do runs on its own thread:
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `ISP12160-0` | Fuel SCSI request ring for both ISP12160 channels |
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane and Fuel IOC3 serial input and NVRAM writer (IOC3's other deadlines are `hptimer` one-shots) |
-| `l1-serial` | Fuel L1 console UART worker. Its other serial ports are IOC3 A and B |
+| `l1-serial` | Fuel and Tezro L1 console UART worker. The Fuel's other serial ports are IOC3 A and B |
+| `IOC4-RX-0` to `IOC4-RX-3` | Tezro IOC4 serial input |
+| `bcm5701-rx`, `bcm5701-net` | Tezro BCM5701 receive pump and network backend |
 | `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
 | `odyssey-work`, `odyssey-raster`, `odyssey-pool-N`, `odyssey-display` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue); the raster unit sets each draw up and walks its primitives into 2x2 quads; a pool of workers (`[graphics] threads`, default 2) walks, shades and stores filled triangles and stores every other fragment, one screen tile at a time; and the display composes each whole frame from board memory (64-bit words, as main memory is: a field is a bit range of its word, read by shift and mask with no byte order, `vram.rs`) as the scan-out registers describe it, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, the display FIFO (PB&J's register file) has its own lock and never waits for the drawing (`display_fifo.rs`), and the display reads board memory while it is drawn, as the board's own scan-out does; nobody tracks which rows changed. The raster thread sets primitives up and writes each as one command in a ring of 64-byte slots (`pipe/ring.rs`): a triangle's record and bounding box, a quad it shaded itself (lines, points), or a clear's rectangle; the slot's index goes on the queue of every screen tile (`[graphics] tile`, default 32 pixels) it touches. A worker takes a ready tile and owns it until its queue is empty, walking each triangle within the tile and shading and storing quad by quad, so every pixel sees its fragments in command order with no other ordering, and the depth pre-test reads depth its own tile stored. A slot is retired once all its tiles have run it. The raster thread drains the ring before any other work on board memory (a texture upload waits for the shader alone). A completion (a fence's token, a query's words) does not drain: it rides the ring and runs once the ring retires past the quads queued before it. A quad's four pixels are lanes: the walk's depth, the texture unit's positions and the colour weights run on the host's SIMD unit (`fearless_simd`, `pipe/lanes.rs`, the level detected at start-up), bit for bit the scalar arithmetic. When its queue runs dry the raster thread does not drain: it keeps one count of the raster unit's pending jobs for the quads still in flight, and a front-end wait or a refused processor read asks it to store them. `IRIS_ODSY_SHADER=inline` makes the raster thread shade every quad itself, and `IRIS_ODSY_BACKEND=inline` stores on the raster thread with no pool. The texture registers a draw reads live in an array of draw state slots (`pipe/slot.rs`): the front end writes the current slot, a draw latches it and holds it until its job is given back, and a write while a queued draw holds the current slot first copies it to a free one, so the stages read their draw's registers with no lock |
 | `ioc3-eth-rx`, `ioc3-eth-net` | Fuel IOC3 Ethernet receive pump and network backend |
@@ -636,6 +640,12 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   widget 13; its packets and DMA go through the XBridge and Bedrock's inbound
   path, and the PI graphics registers are stored but count no credits.
   Snapshots are unsupported. See the [Fuel guide](docs/fuel-ip34.md).
+- **IP53 board, IP35 software platform (Tezro)**: its own board
+  (`src/ip53_machine.rs`) on the Bedrock node it shares with the Fuel
+  (`ip35::node`): 700 MHz R16000s, of which only CPU 0 runs, memory from 512
+  and 1024 MiB banks (4 GiB by default), and a PIC whose PXBOW is widget 0,
+  carrying the IO9's IOC4, ISP12160 and BCM5701. It runs headless on the L1
+  or an IOC4 serial console. See the [Tezro guide](docs/tezro-ip53.md).
 
 The Indy and Indigo2 profiles each have an embedded PROM fallback;
 `src/platform.rs` and `src/machine.rs` wire their differences, and
