@@ -1235,8 +1235,6 @@ fn swap_atomicity(lockless: bool) {
         s.buffer1_mem.bytes.fill(0);
         s.scanout.invalidate_all();
     }
-    // A slice runs the draw and its completion together, so only the
-    // completion's own publish puts the draw's rows out before the token.
     h.raster.test_slice_limit_ms.store(10_000, SeqCst);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let colours = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
@@ -1348,4 +1346,33 @@ fn a_lockless_frame_waits_for_no_slice_and_takes_no_lock() {
     assert_eq!((reader.stats.retries, reader.stats.fallbacks), (0, 0));
     drop(reader);
     h.raster.stop();
+}
+
+/// A lookup store that lands after the display took its marks and before it
+/// copied the registers is in the frame it is making, and its repaint mark
+/// is kept for the next: the frame ends up showing the new table. With the
+/// registers copied first the store would be marked, taken and resolved
+/// with the old table, and the picture would stay wrong.
+#[test]
+fn a_lookup_store_between_taking_the_marks_and_copying_the_registers_is_not_lost() {
+    let (s, _) = gl_board();
+    let h = BoardLocks::new(s);
+    let display = Display::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    display.set_lockless(true);
+    Odyssey::frame(&h, &display);
+    {
+        let shared = h.shared.clone();
+        display.reader.lock().test_between = Some(Box::new(move || {
+            shared.regs.edit().lut[0] = 0x0123_4567 & ODSY_LUT_ENTRY_MASK;
+            shared.marks.repaint(DirtySite::Lut, 0, SGI_ODYSSEY_HEIGHT as i32);
+        }));
+    }
+    h.shared.marks.repaint(DirtySite::Other, 0, SGI_ODYSSEY_HEIGHT as i32);
+    Odyssey::frame(&h, &display);
+    display.reader.lock().test_between = None;
+    Odyssey::frame(&h, &display);
+    Odyssey::frame(&h, &display);
+    let want = h.shared.regs.read().lut_rgb(0);
+    assert_ne!(want, 0);
+    assert_eq!(display.reader.lock().frame[10 * SGI_ODYSSEY_WIDTH as usize + 10], want, "the picture shows the old table");
 }

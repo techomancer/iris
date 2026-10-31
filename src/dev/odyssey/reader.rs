@@ -483,6 +483,10 @@ pub struct ScanoutReader {
     /// of the next.
     last: Option<ScanoutJob>,
     scratch: [Vec<u8>; 3],
+    /// Tests: run between the display taking the marks and copying the
+    /// registers, where a front-end store can land.
+    #[cfg(test)]
+    pub test_between: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl ScanoutReader {
@@ -608,6 +612,10 @@ impl ScanoutReader {
             if std::mem::take(&mut self.reshaped) {
                 dirty.clear();
                 dirty.extend(0..h as u32);
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.test_between.as_mut() {
+                hook();
             }
             self.snapshot(&shared);
             let view = shared.planes.get();

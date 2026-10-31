@@ -288,6 +288,9 @@ pub struct RowMarks {
     height: AtomicU32,
     /// By DirtySite: [marks, lines named].
     sites: [[AtomicU64; 2]; DirtySite::ALL.len()],
+    /// Tests: run between invalidate()'s two marks.
+    #[cfg(test)]
+    pub test_between: parking_lot::Mutex<Option<Box<dyn Fn(&RowMarks) + Send + Sync>>>,
 }
 
 impl Default for RowMarks {
@@ -297,6 +300,8 @@ impl Default for RowMarks {
             unnamed: std::array::from_fn(|_| AtomicU64::new(0)),
             height: AtomicU32::new(0),
             sites: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            #[cfg(test)]
+            test_between: Default::default(),
         }
     }
 }
@@ -345,6 +350,10 @@ impl RowMarks {
     /// differ, for good.
     pub fn invalidate(&self, site: DirtySite, first: i32, count: i32) {
         self.name_unnamed(first, count);
+        #[cfg(test)]
+        if let Some(hook) = self.test_between.lock().as_ref() {
+            hook(self);
+        }
         self.repaint(site, first, count);
     }
 

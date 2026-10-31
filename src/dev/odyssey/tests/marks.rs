@@ -256,3 +256,21 @@ fn marks_are_bounded_by_the_frame() {
     marks.take_dirty(50, &mut rows);
     assert!(rows.is_empty());
 }
+
+/// invalidate() itself names the lines unnamed before it marks them dirty:
+/// at the point between its two marks the unnamed one is there and the
+/// dirty one is not.
+#[test]
+fn invalidate_names_the_lines_before_it_marks_them_dirty() {
+    let marks = std::sync::Arc::new(RowMarks::default());
+    marks.set_height(8);
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let s = seen.clone();
+    *marks.test_between.lock() = Some(Box::new(move |m: &RowMarks| {
+        assert!(m.unnamed_pending(), "the line is not named unnamed yet");
+        assert!(m.dirty_rows().is_empty(), "the line is already dirty");
+        s.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    marks.invalidate(DirtySite::Pixel, 3, 1);
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
