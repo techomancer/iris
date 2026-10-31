@@ -1172,7 +1172,10 @@ impl St {
             }
             // The set alias reads back the live mask; the clear one does not.
             reg::INT_ENABLE_SET => self.int_enable,
-            reg::CHIP_CONTROL => self.chip_control | CHIP_CTRL_ARB_IDLE,
+            // Bit 22, arbiter idle, polled by the kernel's console setup. It
+            // reads busy only while the ring engine is inside a transfer, the
+            // rule IOC4's serial idle bit follows too.
+            reg::CHIP_CONTROL => self.chip_control | if self.sdma.idle() { CHIP_CTRL_ARB_IDLE } else { 0 },
             reg::INT_OUTPUT => {
                 self.io_catch_up(Instant::now());
                 self.int_out.reg | if self.int_out.state { IO_STATE } else { 0 }

@@ -1143,3 +1143,43 @@ fn a_loopback_overrun_reaches_the_status_byte() {
     assert!(overrun, "the loss is marked on a later character");
     assert!(posted * 4 < 32, "and not everything came back");
 }
+
+/// Ports test_serial_idle_status: the serial control word reads the idle bit
+/// set after a write, a pause, a reset, PIO and a ring run, and the writes to
+/// it and to the unsupported ATA window disturb no interrupt word.
+#[test]
+fn serial_idle_status_survives_writes_and_ring_runs() {
+    let r = Rig::new();
+    assert_eq!(r.r32(reg::SERIAL_CONTROL), 0x80);
+    r.w32(reg::SERIAL_CONTROL, 0x80);
+    r.c.bar_read(0, reg::SERIAL_CONTROL, 1);
+    r.c.bar_write(0, reg::SERIAL_CONTROL, 0x80, 1);
+    assert_eq!(r.r32(reg::SERIAL_CONTROL), 0x80);
+    assert_eq!(r.r32(0x100), 0);
+    r.w32(0x100, u32::MAX);
+    assert_eq!(r.r32(reg::SERIAL_CONTROL), 0x80);
+
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE | (1 << 29));
+    r.tx_entry(0, 0x1000, 0, [0x5a, 0, 0, 0], [TX_VALID, 0, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 8);
+    assert_ne!(r.sr(0, sdma_off::CONTROL) & (1 << 30), 0, "paused");
+    assert_eq!(r.r32(reg::SERIAL_CONTROL), 0x80);
+
+    r.c.reset();
+    r.uw(0, 0, 0x5a);
+    assert_eq!(r.sent(0), [0x5a]);
+    assert_eq!(r.r32(reg::SERIAL_CONTROL), 0x80);
+
+    r.pair_base(0, RINGS, 0x1000);
+    r.tx_entry(1, 0x1000, 0, [0x15, 0, 0, 0], [TX_MCR | TX_EXPLICIT, 0, 0, 0]);
+    r.sw(1, sdma_off::CONTROL, ENABLE);
+    r.sw(1, sdma_off::TX_PRODUCE, 8);
+    assert_eq!(r.sr(1, sdma_off::TX_CONSUME), 8);
+    let (serial, other) = (r.r32(reg::SERIAL_PENDING), r.r32(reg::OTHER_PENDING));
+    assert_ne!(serial, 0);
+    r.w32(reg::SERIAL_CONTROL, 0x80);
+    r.w32(0x100, u32::MAX);
+    assert_eq!((r.r32(reg::SERIAL_PENDING), r.r32(reg::OTHER_PENDING)), (serial, other));
+    assert_eq!(r.r32(reg::SERIAL_CONTROL), 0x80);
+}

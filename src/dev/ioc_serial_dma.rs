@@ -210,6 +210,10 @@ pub struct SerialDma {
     params: SerialDmaParams,
     base_hi: [u32; MAX_PORTS / PAIR],
     base_lo: [u32; MAX_PORTS / PAIR],
+    /// Transfers under way, for the chip's idle status. Nonzero only inside
+    /// a call: a chip cannot read its own status mid-walk, so software sees
+    /// idle unless a bus master it reaches re-enters the chip.
+    in_flight: u32,
     pub port: Vec<SerialDmaPort>,
 }
 
@@ -220,6 +224,7 @@ impl SerialDma {
             params,
             base_hi: [0; MAX_PORTS / PAIR],
             base_lo: [0; MAX_PORTS / PAIR],
+            in_flight: 0,
             port: (0..ports).map(|_| SerialDmaPort::default()).collect(),
         }
     }
@@ -260,6 +265,27 @@ impl SerialDma {
     pub fn tx_delay_deadline(&self, p: usize) -> Option<Instant> {
         let port = &self.port[p];
         if port.paused { None } else { port.tx_delay_deadline }
+    }
+
+    /// No transfer is under way: what a chip's DMA idle status reports.
+    pub fn idle(&self) -> bool {
+        self.in_flight == 0
+    }
+
+    /// A ring read, counted as in flight while the bus master has it.
+    fn dma_read(&mut self, host: &mut dyn SerialDmaHost, addr: u64, buf: &mut [u8]) -> bool {
+        self.in_flight += 1;
+        let ok = host.dma_read(addr, buf);
+        self.in_flight -= 1;
+        ok
+    }
+
+    /// A ring write, counted as in flight while the bus master has it.
+    fn dma_write(&mut self, host: &mut dyn SerialDmaHost, addr: u64, data: &[u8]) -> bool {
+        self.in_flight += 1;
+        let ok = host.dma_write(addr, data);
+        self.in_flight -= 1;
+        ok
     }
 
     /// When a looped-back character reaches the receiver, if one is on the
@@ -356,7 +382,7 @@ impl SerialDma {
             return false;
         }
         let at = ring.saturating_add(u64::from(produce & mask));
-        if !host.dma_write(at, &packer) {
+        if !self.dma_write(host, at, &packer) {
             self.dma_failed(p, true, at, host);
             return false;
         }
@@ -508,7 +534,7 @@ impl SerialDma {
             if !self.port[p].tx_fetched {
                 let mut entry = [0u8; ENTRY];
                 let at = ring.saturating_add(u64::from(consume & mask));
-                if !host.dma_read(at, &mut entry) {
+                if !self.dma_read(host, at, &mut entry) {
                     self.dma_failed(p, false, at, host);
                     break;
                 }
@@ -957,6 +983,21 @@ mod tests {
             assert_eq!(produce >> HELD_SHIFT & 7, if shown { 2 } else { 0 });
         }
     }
+
+    #[test]
+    fn the_engine_is_idle_between_calls_whether_a_transfer_worked_or_not() {
+        let mut sdma = SerialDma::new(4, FOUR);
+        let mut chip = Chip::new();
+        assert!(sdma.idle());
+        sdma.base_write(0, false, 0x1000);
+        enable(&mut sdma, &mut chip, 0);
+        queue_char(&mut sdma, &mut chip, 0, b'a');
+        assert!(sdma.idle(), "after a good transfer");
+        chip.refuse_below = 0x2000;
+        queue_char(&mut sdma, &mut chip, 0, b'b');
+        assert!(sdma.halted(0));
+        assert!(sdma.idle(), "after a failed one");
+    }
 }
 
 // The engine's state for a snapshot of the chip that carries it. Each timer
@@ -1029,6 +1070,7 @@ impl SerialDma {
         let port = (0..self.port.len())
             .map(|i| SerialDmaPort::load_state(field(v, &format!("port{i}"))?, now))
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(SerialDma { params: self.params, base_hi: field_u32s(v, "base_hi")?, base_lo: field_u32s(v, "base_lo")?, port })
+        // Transfers are under way only inside a call, never at a save.
+        Ok(SerialDma { params: self.params, base_hi: field_u32s(v, "base_hi")?, base_lo: field_u32s(v, "base_lo")?, in_flight: 0, port })
     }
 }

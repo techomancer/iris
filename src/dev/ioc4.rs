@@ -38,8 +38,9 @@
 //!   carries its approximations: timers run on host time and receive-ring-full
 //!   is a level that follows a held entry. After a failed ring transfer the port
 //!   halts until a channel reset.
-//! * Register 0x20 reads the DMA-idle bit set; transfers complete inside the
-//!   access that starts them, so the engine is never busy when software looks.
+//! * Register 0x20 reads the DMA-idle bit unless a transfer is under way.
+//!   Transfers complete inside the access that starts them, so software
+//!   always finds the engine idle.
 //! * The ATA readback word at 0x148 is a plain 32-bit latch with no ATA
 //!   behind it. Only boards that ask for it have it.
 //! * The PCI status register reads 0x0220 (66 MHz capable, medium DEVSEL) on
@@ -351,7 +352,7 @@ impl St {
             reg::OTHER_PENDING => self.other_pending,
             reg::SERIAL_ENABLE_SET => self.serial_enable,
             reg::OTHER_ENABLE_SET => self.other_enable,
-            reg::SERIAL_CONTROL => SERIAL_CONTROL_IDLE,
+            reg::SERIAL_CONTROL => if self.sdma.idle() { SERIAL_CONTROL_IDLE } else { 0 },
             reg::MISC_CONTROL => u32::from(self.cfg.clock == Ioc4Clock::Mhz66),
             reg::ATA_READBACK if self.cfg.ata_readback => self.ata_readback,
             _ => {
