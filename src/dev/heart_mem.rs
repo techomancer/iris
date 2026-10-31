@@ -12,7 +12,8 @@
 //! answers there (`Physical::bank_view`), so the CPU and every bus master
 //! reach memory through the decode table with no lock, and the ppmem window
 //! the CPU's cache and the JIT read is laid out from the same placement.
-//! Memory a descriptor puts above 4 GiB is reachable through the bus only.
+//! Memory that runs past 4 GiB gets a 16 GiB window; a descriptor placing
+//! memory beyond the window leaves it reachable through the bus only.
 //!
 //! The first 16 KiB of SDRAM are the processor's physical 0..0x4000, and it
 //! reaches them only there: its access to 0x2000_0000..+16 KiB is a bus
@@ -36,7 +37,7 @@ use parking_lot::Mutex;
 
 use crate::physical::{Physical, RamBank};
 use crate::ppmem::devmap::{entry_eq, Entry, SLOT_SHIFT};
-use crate::ppmem::{MappedMemory, WINDOW_SIZE};
+use crate::ppmem::{MappedMemory, LARGE_WINDOW_SIZE, WINDOW_SIZE};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
 
 /// Where SDRAM space starts. Descriptors count from here in [`UNIT`]s.
@@ -184,22 +185,17 @@ impl HeartRam {
         Self::try_new(banks_mb).unwrap_or_else(|e| panic!("{e}"))
     }
 
-    /// Each bank 0 or a power of two from 64 MiB to 2 GiB, 2 GiB in all.
+    /// Each bank 0 or a power of two from 64 MiB to 2 GiB.
     /// Builds the machine's physical bus over the fitted banks, with a bus
     /// error as its default until the machine sets its own.
     pub fn try_new(banks_mb: [u32; 4]) -> Result<Self, String> {
         let mut size = [0u64; BANKS];
         let mut index = [None; BANKS];
         let mut banks = Vec::new();
-        let mut total = 0u64;
         for (i, &mb) in banks_mb.iter().enumerate() {
             let s = (mb as u64) << 20;
             if s != 0 && (!(64 << 20..=2 << 30).contains(&s) || !s.is_power_of_two()) {
                 return Err(format!("HEART bank {i} capacity must be 0, 64M, 128M, 256M, 512M, 1G or 2G"));
-            }
-            total += s;
-            if total > 2 << 30 {
-                return Err(format!("HEART banks hold more than 2048 MiB, the most an Octane takes"));
             }
             if s != 0 {
                 let bank = RamBank::try_new(mb as usize).map_err(|e| format!("ppmem: {e}"))?;
@@ -208,7 +204,9 @@ impl HeartRam {
             }
             size[i] = s;
         }
-        let phys = Physical::new(banks);
+        // Back to back from RAM_BASE is where the PROM leaves them.
+        let window = if RAM_BASE + size.iter().sum::<u64>() > WINDOW_SIZE { LARGE_WINDOW_SIZE } else { WINDOW_SIZE };
+        let phys = Physical::with_window(banks, window);
         phys.set_default(Arc::new(NoMemory), "bus error");
         let m = Self { phys, size, index, desc: Placement::default(), placed: Mutex::new(Vec::new()) };
         m.rebuild();
@@ -288,7 +286,7 @@ impl HeartRam {
             phys.fill_slots(at >> SLOT_SHIFT, UNIT >> SLOT_SHIFT, entry);
             placed.push(at);
             if let (Some(sp), Some((i, src))) = (sp, run) {
-                if at + UNIT <= WINDOW_SIZE {
+                if at + UNIT <= sp.window_size() {
                     if let Err(e) = sp.map_range(i, src, at, UNIT) {
                         eprintln!("ip30: HEART unit at {at:#x}: window map failed: {e}");
                     }
@@ -682,11 +680,56 @@ mod tests {
         assert_eq!(dma.read8(0x100).status, BUS_ERR, "low memory is the processor's");
     }
 
+    /// A store-conditional's compare-and-swap reaches memory the window does not.
+    #[test]
+    fn compare_and_swap_works_above_the_window() {
+        let m = ram(64);
+        let high = (WINDOW_SIZE - RAM_BASE) / UNIT;
+        bank0(&m, DESC_VALID | (1 << 16) | high as u32);
+        let at = WINDOW_SIZE + 0x8000;
+        let p = m.phys();
+        assert_eq!(p.write64(at, 0x0102_0304_0506_0708), BUS_OK);
+        assert_eq!(p.cas64(at, 1, 2), Some(false));
+        assert_eq!(p.read64(at).data, 0x0102_0304_0506_0708, "a failed swap stores nothing");
+        assert_eq!(p.cas64(at, 0x0102_0304_0506_0708, 0x1112_1314_1516_1718), Some(true));
+        assert_eq!(p.read64(at).data, 0x1112_1314_1516_1718);
+        assert_eq!(p.cas32(at, 0x2222_2222, 3), Some(false));
+        assert_eq!(p.cas32(at, 0x1112_1314, 0xa1a2_a3a4), Some(true));
+        assert_eq!(p.read64(at).data, 0xa1a2_a3a4_1516_1718, "the same word a 32-bit store writes");
+        assert_eq!(p.cas32(WINDOW_SIZE * 2, 0, 1), None, "not memory: the caller stores as usual");
+    }
+
+    /// All eight DIMMs: the window reaches the top of memory.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn eight_gigabytes_are_all_in_the_window() {
+        let m = HeartRam::new([2048; 4]);
+        const TWO_G: u32 = 0x3f << 16;
+        m.set_memcfg([0, 0x40, 0x80, 0xc0].map(|base| DESC_VALID | TWO_G | base));
+        let sp = m.phys().ppmem_space().expect("a window");
+        assert_eq!(sp.window_size(), LARGE_WINDOW_SIZE);
+        let top = RAM_BASE + (8u64 << 30);
+        for (at, mapped) in [(RAM_BASE, true), (WINDOW_SIZE, true), (top - 8, true), (top, false), (RAM_BASE - 8, false)] {
+            let bits = sp.mapped_bitmap();
+            assert_eq!(crate::ppmem::bitmap_maps_at(bits, crate::ppmem::window_shift(LARGE_WINDOW_SIZE), at), mapped, "{at:#x}");
+        }
+        let at = top - 0x1000;
+        w(&m, at, 0x0123_4567_89ab_cdef);
+        let p = unsafe { sp.window_base().add(at as usize) } as *const u32;
+        assert_eq!(unsafe { p.read_unaligned() }, 0x0123_4567, "the window holds the bus's words");
+        let g = m.phys().gen_ptr(at);
+        let before = unsafe { (*g).load(Ordering::Relaxed) };
+        w(&m, at, 1);
+        assert_eq!(unsafe { (*g).load(Ordering::Relaxed) }, before + 1);
+        let gen = unsafe { sp.gen_window_base().add((at >> 12) as usize) };
+        assert_eq!(unsafe { (*gen).load(Ordering::Relaxed) }, before + 1, "the generation window follows");
+    }
+
     #[test]
     fn invalid_bank_sizes_are_refused() {
         assert!(HeartRam::try_new([96, 0, 0, 0]).is_err());
         assert!(HeartRam::try_new([32, 0, 0, 0]).is_err());
-        assert!(HeartRam::try_new([2048, 64, 0, 0]).is_err());
+        assert!(HeartRam::try_new([4096, 0, 0, 0]).is_err());
     }
 
     #[test]

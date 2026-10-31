@@ -5,7 +5,7 @@ const RAM_PRESETS: &[u32] = &[32, 64, 96, 128, 192, 256, 384, 512];
 
 const IP28_RAM_PRESETS: &[u32] = &[32, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
 
-const OCTANE_RAM_PRESETS: &[u32] = &[64, 128, 192, 256, 384, 512, 768, 1024, 2048];
+const OCTANE_RAM_PRESETS: &[u32] = &[64, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096, 8192];
 
 pub fn ram_presets(profile: iris::config::MachineProfile) -> &'static [u32] {
     use iris::config::MachineProfile as P;

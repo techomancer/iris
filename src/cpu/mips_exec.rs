@@ -2505,6 +2505,11 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         unsafe { self.cache.set_tcache_window(base) };
     }
 
+    /// tcache: the window's `ppmem::window_shift`, when it is not 4GB's.
+    pub fn set_tcache_shift(&self, shift: u32) {
+        self.cache.set_tcache_shift(shift);
+    }
+
     /// tcache: pointer to the cache's inline bitmap field.
     pub fn tcache_bitmap_ptr(&self) -> *mut u64 {
         self.cache.tcache_bitmap_ptr()
@@ -3087,8 +3092,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // on the page-crossing path (not every fetch) to keep the common
         // same-page case free of this cost even when the toggle is on.
         if jitv2_pagewb_enabled() {
-            let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
-            self.cache.writeback(None, page_base as u64, crate::cpu::jitv2::PAGE_SIZE as u64);
+            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+            self.cache.writeback(None, page_base, crate::cpu::jitv2::PAGE_SIZE as u64);
         }
         // A page crossing landing exactly on word 0 (the exception/TLB-refill
         // vector case included — `deliver_exception` in mips_core.rs writes
@@ -3123,7 +3128,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return;
         }
 
-        let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
+        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
         // §13: live FR mode at first-arrival time, pinned into the page for
         // its whole lifetime (PhysicalCodePage::fr1's own doc comment) —
         // ignored by page_for on a lookup hit (an already-claimed page keeps
@@ -8852,10 +8857,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
-            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base as u64);
+            self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
         }
         let mut codegen = self.jitv2.lock().codegen.lock().take();
@@ -8888,10 +8893,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
-            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base as u64);
+            self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
         }
         // Re-check is_runnable: handle_request can decline this exact
@@ -10111,6 +10116,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         unsafe { self.executor.lock().set_tcache_window(base) };
     }
 
+    /// tcache: see `MipsExecutor::set_tcache_shift`.
+    pub fn set_tcache_shift(&self, shift: u32) {
+        self.executor.lock().set_tcache_shift(shift);
+    }
+
     /// tcache: pointer to the cache's inline bitmap field.
     pub fn tcache_bitmap_ptr(&self) -> *mut u64 {
         self.executor.lock().tcache_bitmap_ptr()
@@ -10824,6 +10834,8 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_window`.
     unsafe fn set_tcache_window(&self, base: *mut u8);
+    /// tcache: see `MipsExecutor::set_tcache_shift`.
+    fn set_tcache_shift(&self, shift: u32);
     /// tcache: pointer to the cache's inline mapped-region bitmap.
     fn tcache_bitmap_ptr(&self) -> *mut u64;
     /// tcache + jitv2: hand the cache ppmem's generation-window base.
@@ -10880,6 +10892,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
     fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }
+    fn set_tcache_shift(&self, shift: u32) { MipsCpu::set_tcache_shift(self, shift) }
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { MipsCpu::set_tcache_window(self, base) }
     }

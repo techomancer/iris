@@ -233,6 +233,9 @@ pub struct JitDcGeometry {
     /// are active, and a plain add landing after theirs would move the counter
     /// backwards and let stale code publish.
     pub atomic_gen: bool,
+    /// The ppmem window's `window_shift`: its bitmap's region size, baked
+    /// into the mapped test on every guest load and store.
+    pub window_shift: u32,
 }
 
 impl JitDcGeometry {
@@ -241,6 +244,7 @@ impl JitDcGeometry {
             supported: false, line_shift: 0, num_lines_mask: 0, data_mask: 0,
             has_l2: false, l2_line_shift: 0, l2_num_lines_mask: 0,
             ways: 1, num_lines_shift: 0, tagless: false, atomic_gen: false,
+            window_shift: crate::ppmem::BITMAP_SHIFT,
         }
     }
 }
@@ -582,6 +586,8 @@ pub trait MipsCache: Send + Sync {
     /// `base` must be ppmem's window base and `bitmap` a live `u64` that
     /// outlives this cache.
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
+    /// The ppmem window's `window_shift`, when it is not the 4GB window's.
+    fn set_tcache_shift(&self, _shift: u32) {}
 
     /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
     /// tag change, no exception. Then a caller that does not need the
@@ -3692,6 +3698,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             num_lines_shift: Self::DC_NUM_LINES_SHIFT as u32,
             atomic_gen: false,
             tagless: false,
+            window_shift: crate::ppmem::BITMAP_SHIFT,
         }
     }
 

@@ -77,6 +77,8 @@ pub struct DecodeCache {
     pages: Box<[Page]>,
     /// The ppmem region bitmap the pages were filled under.
     bitmap: u64,
+    /// The bitmap's region size, as `ppmem::window_shift`.
+    window_shift: u32,
 }
 
 impl Default for DecodeCache {
@@ -84,8 +86,13 @@ impl Default for DecodeCache {
 }
 
 impl DecodeCache {
+    /// The window is larger than 4GB. Set before anything is fetched.
+    pub fn set_window_shift(&mut self, shift: u32) {
+        self.window_shift = shift;
+    }
+
     pub fn new() -> Self {
-        Self { pages: (0..PAGES).map(|_| Page::new()).collect(), bitmap: 0 }
+        Self { pages: (0..PAGES).map(|_| Page::new()).collect(), bitmap: 0, window_shift: crate::ppmem::BITMAP_SHIFT }
     }
 
     /// Forget everything: memory may have changed without any counter moving.
@@ -149,10 +156,11 @@ impl DecodeCache {
         let pfn = phys >> 12;
         let k = (phys as usize >> 2) & (SLOTS - 1);
         let (w, bit) = (k >> 6, 1u64 << (k & 63));
+        let window_shift = self.window_shift;
         let page = &mut self.pages[index(pfn)];
         let _ = ic_line;
         let host_for = || -> *const u32 {
-            if !window.is_null() && crate::ppmem::bitmap_maps(bitmap, phys) {
+            if !window.is_null() && crate::ppmem::bitmap_maps_at(bitmap, window_shift, phys) {
                 unsafe { window.add((pfn << 12) as usize) as *const u32 }
             } else {
                 std::ptr::null()

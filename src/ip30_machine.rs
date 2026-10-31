@@ -312,6 +312,7 @@ impl OctaneMachine {
             unsafe {
                 sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
                 cpu.set_tcache_window(sp.window_base());
+                cpu.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
                 let bitmap = cpu.tcache_bitmap_ptr();
                 if !bitmap.is_null() {
                     sp.set_bitmap_sink2(bitmap);
@@ -321,6 +322,7 @@ impl OctaneMachine {
                 for c in cpus.iter().skip(1) {
                     sp.add_bitmap_sink(c.ppmem_bitmap_ptr());
                     c.set_tcache_window(sp.window_base());
+                    c.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
                     let bitmap = c.tcache_bitmap_ptr();
                     if !bitmap.is_null() {
                         sp.add_bitmap_sink(bitmap);

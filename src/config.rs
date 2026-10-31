@@ -2,8 +2,12 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
-/// Memory bank sizes in MB; validation restricts 256/512 MB banks to IP28 and the Octane.
-pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
+/// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
+/// which of them a machine takes.
+pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+/// Bank sizes in MB up to the IP28's and O2's largest; validation restricts
+/// 256/512 MB banks to those machines.
+const MC_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
 /// `kind = "cdrom"`; either works and they mean the same thing.
@@ -501,12 +505,12 @@ impl MachineProfile {
     pub const ALL: [Self; 4] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::OctaneIp30];
 
     /// The bank sizes in MB (0 is an empty bank) that `validate()` accepts
-    /// for this profile. The Octane's banks are matched DIMM pairs of 64 to
-    /// 512 MB; the IP22/IP24 MC stops at 128 MB.
+    /// for this profile. The Octane's banks are matched DIMM pairs of 64 MB
+    /// to 2 GB; the IP22/IP24 MC stops at 128 MB.
     pub fn bank_sizes(self) -> &'static [u32] {
         match self {
-            Self::OctaneIp30 => &[0, 64, 128, 256, 512],
-            Self::Indigo2Ip28 | Self::O2Ip32 => VALID_BANK_SIZES,
+            Self::OctaneIp30 => &[0, 64, 128, 256, 512, 1024, 2048],
+            Self::Indigo2Ip28 | Self::O2Ip32 => MC_BANK_SIZES,
             _ => &[0, 8, 16, 32, 64, 128],
         }
     }
@@ -1970,9 +1974,14 @@ impl MachineConfig {
         let bank_count = self.machine.profile.memory_banks();
         for (i, &sz) in self.banks.iter().enumerate().skip(bank_count) {
             if sz != 0 {
+                let hint = if self.machine.profile == MachineProfile::OctaneIp30 {
+                    " (an entry is a bank of two DIMMs: eight 1 GB DIMMs are [2048, 2048, 2048, 2048])"
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "bank{} size {} MB: {:?} has {} memory banks, so banks beyond the {}th must be 0",
-                    i, sz, self.machine.profile, bank_count, bank_count
+                    "bank{} size {} MB: {:?} has {} memory banks, so banks beyond the {}th must be 0{}",
+                    i, sz, self.machine.profile, bank_count, bank_count, hint
                 ));
             }
         }
@@ -1985,8 +1994,8 @@ impl MachineConfig {
             }
             crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
-            // A HEART bank is a matched DIMM pair: 64 to 512 MB, filled from
-            // bank 0 without a gap, 2 GB at most (the Octane owner's guide).
+            // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
+            // bank 0 without a gap, 8 GB at most (SGI's memory upgrade guide).
             let banks = &self.banks[..bank_count];
             if banks[0] == 0 {
                 return Err("banks: an Octane needs memory in bank 0".into());
@@ -1997,8 +2006,8 @@ impl MachineConfig {
                 }
             }
             for (i, &sz) in banks.iter().enumerate() {
-                if sz != 0 && ![64, 128, 256, 512].contains(&sz) {
-                    return Err(format!("bank{i} size {sz} MB is invalid for an Octane (valid: 64, 128, 256, 512)"));
+                if !MachineProfile::OctaneIp30.bank_sizes().contains(&sz) {
+                    return Err(format!("bank{i} size {sz} MB is invalid for an Octane (valid: 64, 128, 256, 512, 1024, 2048)"));
                 }
             }
             if let Some(old) = &self.octane.graphics {
@@ -2012,10 +2021,10 @@ impl MachineConfig {
             }
         } else {
             for (i, &sz) in self.banks.iter().enumerate().take(bank_count) {
-                if !VALID_BANK_SIZES.contains(&sz) {
+                if !MC_BANK_SIZES.contains(&sz) {
                     return Err(format!(
                         "bank{} size {} MB is invalid (valid: {:?})",
-                        i, sz, VALID_BANK_SIZES
+                        i, sz, MC_BANK_SIZES
                     ));
                 }
                 // The IP22/IP24 MC cannot express banks larger than 128 MB at its base

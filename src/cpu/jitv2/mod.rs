@@ -111,6 +111,7 @@ mod zz_corpus {
             ways: 1,
             num_lines_shift: 0,
             tagless: false,
+            window_shift: crate::ppmem::BITMAP_SHIFT,
         };
         let mut total: u64 = 0;
         let mut n_ok = 0u64;

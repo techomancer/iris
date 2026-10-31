@@ -17,4 +17,4 @@ pub mod ppmem;
 
 pub use map::{align_up, granularity, is_aligned, AddrSpace, Prot, SharedMem};
 pub use devmap::SparseDeviceMap;
-pub use ppmem::{bitmap_maps, MappedMemory, PpMemSpace, PpMemory, BITMAP_SHIFT, WINDOW_SIZE};
+pub use ppmem::{bitmap_maps, bitmap_maps_at, window_shift, MappedMemory, PpMemSpace, PpMemory, BITMAP_SHIFT, LARGE_WINDOW_SIZE, WINDOW_SIZE};

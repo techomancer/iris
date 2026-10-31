@@ -1,5 +1,10 @@
 # ppmem — host-MMU-backed physical paged memory
 
+A machine whose memory runs past 4GB (the Octane, up to `0x2_2000_0000`) asks
+for a 16GB window instead, with `PpMemSpace::over_window`. The bitmap stays one
+`u64`, so its regions are 256MB there. The text below describes the 4GB window
+every other machine has; the larger one differs only in those two numbers.
+
 Status: **implemented and always on** (August 2026, `src/ppmem/`, with Unix
 and Windows mapping backends; the `ppmem` feature was retired in October 2026).
 RAM banks are `PpMemory`; `Memory` (`Vec<u32>`) survives only as a test/bus

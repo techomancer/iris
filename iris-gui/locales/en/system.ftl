@@ -63,4 +63,4 @@ ram-summary = { $total } MB ({ $banks ->
     [one] 1 bank
    *[other] { $banks } banks
 })
-ram-bank-octane-sizes = An Octane bank is 64, 128, 256 or 512 MB.
+ram-bank-octane-sizes = An Octane bank is 64, 128, 256, 512, 1024 or 2048 MB.

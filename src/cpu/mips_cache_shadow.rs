@@ -155,6 +155,8 @@ pub struct ShadowCache<
     /// tcache path can serve this model too (`jit_dc_geometry`).
     tc_base: UnsafeCell<*mut u8>,
     tc_bitmap: UnsafeCell<u64>,
+    /// The window's `ppmem::window_shift`, set before the CPU runs.
+    tc_shift: UnsafeCell<u32>,
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
     /// Decoded instructions, by physical page. Never touches the shadow
@@ -210,6 +212,7 @@ impl<
             l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             tc_bitmap: UnsafeCell::new(0),
+            tc_shift: UnsafeCell::new(crate::ppmem::BITMAP_SHIFT),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
@@ -223,7 +226,7 @@ impl<
     /// set bit also means the base is valid.
     #[inline(always)]
     fn ram(&self, phys: u64) -> Option<*mut u8> {
-        if crate::ppmem::bitmap_maps(unsafe { *self.tc_bitmap.get() }, phys) {
+        if crate::ppmem::bitmap_maps_at(unsafe { *self.tc_bitmap.get() }, unsafe { *self.tc_shift.get() }, phys) {
             Some(unsafe { *self.tc_base.get() })
         } else {
             None
@@ -369,6 +372,13 @@ impl<
         unsafe { *self.tc_base.get() = base };
     }
 
+    fn set_tcache_shift(&self, shift: u32) {
+        unsafe {
+            *self.tc_shift.get() = shift;
+            (*self.decode.get()).set_window_shift(shift);
+        }
+    }
+
     fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.get() }
 
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
@@ -399,6 +409,7 @@ impl<
             return crate::cpu::mips_cache_v2::JitDcGeometry {
                 supported: true,
                 tagless: true,
+                window_shift: unsafe { *self.tc_shift.get() },
                 ..crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()
             };
         }
@@ -670,7 +681,10 @@ impl<
 
     fn cas_ram32(&self, phys: u64, old: u32, new: u32) -> Option<bool> {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let base = self.ram(phys)?;
+        // Memory beyond the window (the Octane's above 4 GB) is on the bus.
+        let Some(base) = self.ram(phys) else {
+            return self.downstream.cas32(phys, old, new);
+        };
         let word = unsafe { AtomicU32::from_ptr(base.add(phys as usize) as *mut u32) };
         let ok = word.compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed).is_ok();
         if ok {
@@ -681,7 +695,9 @@ impl<
 
     fn cas_ram64(&self, phys: u64, old: u64, new: u64) -> Option<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
-        let base = self.ram(phys)?;
+        let Some(base) = self.ram(phys) else {
+            return self.downstream.cas64(phys, old, new);
+        };
         let word = unsafe { AtomicU64::from_ptr(base.add(phys as usize) as *mut u64) };
         let ok = word.compare_exchange(old.rotate_left(32), new.rotate_left(32), Ordering::AcqRel, Ordering::Relaxed).is_ok();
         if ok {

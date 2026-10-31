@@ -200,6 +200,13 @@ pub trait BusDevice: Send + Sync {
         BUS_OK
     }
 
+    /// Atomically replace the aligned word at `addr` if it holds `old`: whether
+    /// it did, or `None` when this is not RAM and the caller stores as usual.
+    /// What a store-conditional does on a machine with several CPUs.
+    fn cas32(&self, _addr: u64, _old: u32, _new: u32) -> Option<bool> { None }
+    /// The doubleword form of [`Self::cas32`].
+    fn cas64(&self, _addr: u64, _old: u64, _new: u64) -> Option<bool> { None }
+
     /// Masked 64-bit write: only bytes where the corresponding mask byte is 0xFF are written.
     /// `addr` must be 8-byte aligned; `val` and `mask` are in big-endian (MIPS) byte order.
     /// Default: decompose into individual write8 calls for set bytes.

@@ -141,7 +141,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2, which has no embedded PROM, tries `ip32prom.rev4.18.bin`. |
 | `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy; the PROM's environment on the O2 (its flash) and the Octane. GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
-| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is 64, 128, 256 or 512, filled from bank 0, 2048 in all. See profile constraints below. |
+| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
 | `headless` | `false` | Disable the standalone window and graphics; the O2 then boots on its serial console. Audio is independent. |
 | `no_audio` | `false` | Disable audio emulation (HAL2, MACE or RAD). |
@@ -330,8 +330,8 @@ the file is loaded, with a note, and never written back.
 Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu =
 "r10000"`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
 not embedded; `IP30prom.bin` is tried when it is left unset), `nvram` (the
-DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256
-or 512, filled from bank 0 with no gap, 2048 in all), `serial_port_a` and
+DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256,
+512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
 `headless`, `[clock] fixed_mhz` (CP0 Count; 97.5 for the 195 MHz R10000),
 `[network]`, `[[port_forward]]`, `nat_subnet`, `[scsi.N]` (`controller` 0
@@ -346,7 +346,7 @@ is the internal bus, 1 the external) and `[graphics] board`. See [the Octane gui
 On the Indy and Indigo2 bank values are 0, 8, 16, 32, 64, or 128 MB, and only
 IP28 accepts 256/512 MB. On the O2 a bank is a DIMM pair's kit, 32, 64, 128 or
 256 MB, fitted from pair A largest first; on the Octane it is a matched DIMM
-pair, 64, 128, 256 or 512 MB, filled from bank 0. `banks` has eight entries;
+pair, 64 MB to 2 GB, filled from bank 0. `banks` has eight entries;
 every machine today uses the first four and the rest must be 0.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require

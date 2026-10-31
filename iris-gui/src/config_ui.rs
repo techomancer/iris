@@ -629,7 +629,7 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
 }
 
 /// What switching a machine to the Octane changes so it passes `validate()`:
-/// the R10000, a valid bank layout (bank 0 filled, 64 to 512 MB, no gaps)
+/// the R10000, a valid bank layout (bank 0 filled, 64 MB to 2 GB, no gaps)
 /// and a graphics board it models.
 fn octane_defaults(cfg: &mut MachineConfig) {
     cfg.machine.cpu = CpuModel::R10000;
@@ -639,7 +639,7 @@ fn octane_defaults(cfg: &mut MachineConfig) {
     let valid = filled > 0 && banks[filled..].iter().all(|&b| b == 0) && banks.iter().all(|b| sizes.contains(b));
     if !valid {
         let total: u32 = banks.iter().sum();
-        cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 2048), MachineProfile::OctaneIp30);
+        cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 8192), MachineProfile::OctaneIp30);
     }
     if !cfg.graphics_board().supports(MachineProfile::OctaneIp30) {
         cfg.graphics.board = None;

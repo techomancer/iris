@@ -133,12 +133,12 @@ impl PcpDump {
     /// a live SMC race are an acceptable, clearly-labeled-by-context
     /// possibility for a debugging dump, not a correctness-critical path).
     /// Returns `Err` with the failing physical address if any word read fails.
-    pub fn capture(page: &PhysicalCodePage, bus: &dyn BusDevice) -> Result<Self, u32> {
-        let phys_base = page.pfn * PAGE_SIZE;
+    pub fn capture(page: &PhysicalCodePage, bus: &dyn BusDevice) -> Result<Self, u64> {
+        let phys_base = page.pfn as u64 * PAGE_SIZE as u64;
         let mut words = [0u32; ENTRIES_PER_PAGE];
         for (i, w) in words.iter_mut().enumerate() {
-            let addr = phys_base + (i as u32) * 4;
-            let r = bus.read32(addr as u64);
+            let addr = phys_base + i as u64 * 4;
+            let r = bus.read32(addr);
             if !r.is_ok() {
                 return Err(addr);
             }

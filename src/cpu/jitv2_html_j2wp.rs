@@ -48,7 +48,7 @@ pub mod jitv2_html {
     #[derive(Serialize)]
     pub struct PageDump {
         pub pfn: u32,
-        pub phys_addr: u32,
+        pub phys_addr: u64,
         /// "low" (0x08000000 RAM window), "high" (0x20000000 RAM window), or
         /// "prom" (0x1FC00000, 1MB boot ROM) — purely a label for the
         /// region-overview grid; jitv2 itself tracks pages by bare pfn,
@@ -469,18 +469,18 @@ pub fn write_jitv2_html(
     // (Jitv2::code_bytes_used doc comment) — fine for an on-demand dump,
     // not a hot path.
     for page in jit.claimed_pages() {
-        let phys_addr = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
+        let phys_addr = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
         // PROM_BASE/PROM_SIZE mirror the private constants in
         // `prom.rs`/`physical.rs` (0x1FC00000, 1MB) — jitv2 can and does
         // compile boot-time PROM code (physical alias of
         // 0xFFFFFFFF_BFC00000), a third window distinct from both RAM
         // banks, easy to forget when eyeballing only the two documented
         // 256MB RAM windows.
-        const PROM_BASE: u32 = 0x1FC00000;
-        const PROM_END: u32 = 0x1FD00000;
+        const PROM_BASE: u64 = 0x1FC00000;
+        const PROM_END: u64 = 0x1FD00000;
         let window = if (PROM_BASE..PROM_END).contains(&phys_addr) {
             "prom"
-        } else if phys_addr >= HIMEM_BASE {
+        } else if phys_addr >= HIMEM_BASE as u64 {
             "high"
         } else {
             "low"
@@ -489,7 +489,7 @@ pub fn write_jitv2_html(
 
         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
         for (i, w) in words.iter_mut().enumerate() {
-            *w = bus.read32((phys_addr + (i as u32) * 4) as u64).data;
+            *w = bus.read32(phys_addr + i as u64 * 4).data;
         }
 
         // §13: one function/gen/instr_count/code_size/call_count/
@@ -521,10 +521,10 @@ pub fn write_jitv2_html(
         if !entry_words.is_empty() {
             // Read before the walk: `walked` borrows the analyzer.
             let mips4 = analyzer.mips4();
-            let walked = analyzer.walk_multi_entry(&words, &entry_words, phys_addr, usize::MAX);
+            let walked = analyzer.walk_multi_entry(&words, &entry_words, phys_addr as u32, usize::MAX);
             rows = crate::cpu::jitv2::analyzer::instrs_linear(walked)
                 .map(|instr| {
-                    let kind = match crate::cpu::jitv2::analyzer::classify(instr.raw, instr.word, phys_addr, mips4) {
+                    let kind = match crate::cpu::jitv2::analyzer::classify(instr.raw, instr.word, phys_addr as u32, mips4) {
                         crate::cpu::jitv2::analyzer::Classify::Sequential => "Sequential",
                         crate::cpu::jitv2::analyzer::Classify::Branch { .. } => "Branch",
                         crate::cpu::jitv2::analyzer::Classify::Jump { .. } => "Jump",
@@ -532,7 +532,7 @@ pub fn write_jitv2_html(
                         crate::cpu::jitv2::analyzer::Classify::Excluded => "Excluded",
                         crate::cpu::jitv2::analyzer::Classify::RegionBoundary => "RegionBoundary",
                     };
-                    let paddr = phys_addr + (instr.word as u32) * 4;
+                    let paddr = phys_addr + instr.word as u64 * 4;
                     jitv2_html::WordRow {
                         word: instr.word as u32,
                         raw: instr.raw,

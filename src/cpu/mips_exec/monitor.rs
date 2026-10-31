@@ -2534,7 +2534,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(result.phys) else {
                                 return Err(format!("phys {:#x} is above the JIT's physical range", result.phys));
                             };
-                            let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
+                            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
                             let sysad = exec.sysad.clone();
                             let mut jit = exec.jitv2.lock();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
@@ -2677,7 +2677,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} is at phys {:#x}, above the JIT's physical range.", pc, result.phys).unwrap();
                                 return Ok(());
                             };
-                            let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
+                            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
                             let sysad = exec.sysad.clone();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             let mut jit = exec.jitv2.lock();
@@ -2844,7 +2844,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 paddr, HIMEM_END));
                         }
                         let pfn = (paddr as u32) / crate::cpu::jitv2::PAGE_SIZE;
-                        let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
+                        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
                         let sysad = exec.sysad.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
@@ -2896,7 +2896,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 paddr, HIMEM_END));
                         }
                         let pfn = (paddr as u32) / crate::cpu::jitv2::PAGE_SIZE;
-                        let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
+                        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
                         let offset = ((paddr as u32) & 0xFFF) as usize >> 2;
                         let sysad = exec.sysad.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
@@ -2962,7 +2962,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                         // signal, not a crash risk.
                                         let page = unsafe { &*page_ptr };
                                         writeln!(writer, "    page: pfn={:#010x} phys_base={:#010x}",
-                                            page.pfn, page.pfn * crate::cpu::jitv2::PAGE_SIZE).unwrap();
+                                            page.pfn, page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64).unwrap();
                                     }
                                 };
                                 match jit.compile_queue.seal_queue_entries() {

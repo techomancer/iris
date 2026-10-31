@@ -27,6 +27,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
 
+### Octane memory up to 8 GB
+
+- An Octane bank now takes 1024 and 2048 MB as well, so `banks` reaches
+  `[2048, 2048, 2048, 2048]`. Each entry is a pair of DIMMs in one of the four
+  banks, not one of the eight DIMM slots.
+- Memory past 4 GB is as fast as the rest: such a machine gets a 16 GB direct
+  window, and the JIT compiles code anywhere in it.
+- A store-conditional on memory outside the window is now atomic with two CPUs.
+
 ### VNC, and screen and pointer commands
 
 - **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the

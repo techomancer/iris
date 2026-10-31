@@ -4114,10 +4114,10 @@ fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
     //
     // Cranelift's `ishl` masks the shift count to 6 bits, as x86 and aarch64
     // do, so a page at or above 4GB (the Octane's memory reaches past it)
-    // would wrap onto region `phys >> 26 & 63`: bound it, as `bitmap_maps`
+    // would wrap onto region `phys >> shift & 63`: bound it, as `bitmap_maps`
     // does. That keeps such pages in the nutlb, where the interpreter wants
     // them, at the cost of one compare here.
-    let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
+    let region = ctx.builder.ins().ushr_imm_s(phys, ctx.dc_geometry.window_shift as i64);
     let one = ctx.builder.ins().iconst(i64t, 1);
     let bit = ctx.builder.ins().ishl(one, region);
     let hit = ctx.builder.ins().band(bits, bit);

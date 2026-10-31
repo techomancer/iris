@@ -67,7 +67,10 @@ the IP22/IP24 extended layouts.
 
 `banks` has room for eight entries; every machine today uses four, and the
 rest must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
-256 MB), largest first: `[256, 256, 256, 256]` is 1 GB.
+256 MB), largest first: `[256, 256, 256, 256]` is 1 GB. On the Octane each
+entry is a bank of two matched DIMMs (64, 128, 256, 512, 1024 or 2048 MB), so
+its eight DIMM slots are four entries: `[2048, 2048, 2048, 2048]` is the
+largest machine, 8 GB of 1 GB DIMMs.
 
 `banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
 Changing RAM while IRIX is running updates the config but not the live guest —

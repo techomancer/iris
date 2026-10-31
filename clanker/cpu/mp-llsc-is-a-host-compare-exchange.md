@@ -2,8 +2,11 @@
 
 Status: implemented 2026-10-30, for machines with `MipsCore::smp` set
 (`exec_sc`/`exec_scd`, `MipsCache::cas_ram32`/`cas_ram64`). One CPU still tests
-the LLbit and stores. An SC to a word other than the LL's, or to memory outside
-the ppmem window, stores the ordinary way. `write64_masked` became a CAS loop.
+the LLbit and stores. An SC to a word other than the LL's stores the ordinary
+way. Memory outside the ppmem window takes the CAS through the bus
+(`BusDevice::cas32`/`cas64`); until 2026-10-31 it stored the ordinary way, which
+did no harm while an Octane stopped at 2 GB and lost counts as soon as it had
+8 GB. `write64_masked` became a CAS loop.
 
 ## The decision
 

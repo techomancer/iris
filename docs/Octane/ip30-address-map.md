@@ -459,6 +459,11 @@ noted with the PC for `ip30 unmapped`.
 | 0x2000_0000 up | `dev/heart_mem.rs`: SDRAM as MEMCFG places it, each 32 MB unit a view of one run of a bank, its first 16 KB a bus error to uncached processor accesses; `remap_banks` redraws the table and the ppmem window when a descriptor is written |
 | widgets 9, 10, 12, 13, 14 | bus error |
 
+An Octane whose memory runs past 4 GB gets a 16 GB ppmem window in place of the
+usual 4 GB one, so all of it is reached directly and the JIT compiles code
+anywhere in it. Its bitmap regions are 256 MB rather than 64 MB, so a bank
+smaller than that at the top of memory is reached through the bus.
+
 The bus is 40 bits wide end to end, so memory beyond 4 GB and the 64 GB
 windows at `w << 36` (§2's huge windows, which `src/ip30.rs` calls large)
 are in the table; a widget is attached with or without that window (the

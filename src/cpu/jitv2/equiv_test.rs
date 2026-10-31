@@ -311,7 +311,7 @@ mod tests {
             let phys_base = (pc as u32) & 0x1FFF_FFFF & !(PAGE_SIZE as u32 - 1);
             let pfn = phys_base / PAGE_SIZE;
             let mut jit = exec.jitv2.lock();
-            let slot = jit.page_for(pfn, phys_base, exec.sysad.as_ref(), false)
+            let slot = jit.page_for(pfn, phys_base as u64, exec.sysad.as_ref(), false)
                 .expect("fresh Jitv2 pool must have room for one page");
             unsafe { (*jit.page_ptr(slot)).denylist_all(); }
             drop(jit);

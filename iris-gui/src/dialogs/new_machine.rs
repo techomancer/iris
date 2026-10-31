@@ -402,7 +402,8 @@ mod ram_tests {
         let octane = MachineProfile::OctaneIp30;
         assert_eq!(distribute_ram(128, octane), iris::config::banks_from4([128, 0, 0, 0]));
         assert_eq!(distribute_ram(192, octane), iris::config::banks_from4([128, 64, 0, 0]));
-        assert_eq!(distribute_ram(2048, octane), iris::config::banks_from4([512, 512, 512, 512]));
+        assert_eq!(distribute_ram(2048, octane), iris::config::banks_from4([2048, 0, 0, 0]));
+        assert_eq!(distribute_ram(8192, octane), iris::config::banks_from4([2048, 2048, 2048, 2048]));
         for &total in crate::ram::ram_presets(octane) {
             let mut cfg = iris::config::MachineConfig::default();
             cfg.machine.profile = octane;
