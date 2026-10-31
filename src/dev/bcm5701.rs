@@ -37,9 +37,6 @@
 //! - The management interface ignores the PHY address field; one PHY answers.
 //! - A write to a register with no modelled behaviour is stored and reads
 //!   back, and is recorded in [`Bcm5701::refused`].
-//! - A narrow configuration read of an indirect-window register returns the
-//!   byte of the window value; the model it is ported from returns the raw
-//!   header byte.
 //! - The BCM5704 dual-port variants are not modelled.
 //! - Frames reach the host through the shared network link; the chip's
 //!   virtio-net offload path has no counterpart, so a large TCP buffer is
@@ -187,6 +184,13 @@ impl Bcm5701 {
                     initial: pcistate::BUSMODE_PCI | pcistate::BUS_32BIT | pcistate::INTR_NOT_ACTIVE,
                     writable_mask: 0,
                 },
+                // The indirect windows live in the chip, reached by whole
+                // dwords through the hook. The header bytes behind them are
+                // what a narrower access sees, and nothing writes them.
+                PciRegisterPolicy { reg_dword: cfg::REG_BASEADDR, initial: 0, writable_mask: 0 },
+                PciRegisterPolicy { reg_dword: cfg::MEMWIN_BASEADDR, initial: 0, writable_mask: 0 },
+                PciRegisterPolicy { reg_dword: cfg::REG_DATA, initial: 0, writable_mask: 0 },
+                PciRegisterPolicy { reg_dword: cfg::MEMWIN_DATA, initial: 0, writable_mask: 0 },
             ],
             ..Default::default()
         };

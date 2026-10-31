@@ -738,7 +738,7 @@ impl Head {
                 self.note_mappings();
                 0
             }
-            None => ((function.config().read(register / 4) >> shift) & mask) as u64,
+            None => function.config().read_sized(register, size) as u64,
         }
     }
 

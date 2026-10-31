@@ -683,7 +683,7 @@ impl XBridgeHead {
                 self.publish_bars();
                 0
             } else {
-                ((dev.config().read(reg / 4) >> shift) & mask) as u64
+                dev.config().read_sized(reg, size) as u64
             }
         } else {
             if value.is_none() {

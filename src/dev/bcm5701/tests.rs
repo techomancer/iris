@@ -256,6 +256,32 @@ fn the_indirect_register_window_aliases_the_register_file() {
     assert_eq!(rig.cfg_read(0x78 / 4), 0x0410);
 }
 
+/// Only whole dwords reach the windows. A narrower configuration read sees
+/// the header's own bytes, which stay zero because nothing writes them, as
+/// in the model this is ported from, where the window state sits outside
+/// the header and the header bytes are read-only.
+#[test]
+fn narrow_configuration_accesses_bypass_the_indirect_windows() {
+    let rig = Rig::new();
+    rig.ind_reg_write(0x0410, 0x1234_5678);
+    rig.ind_mem_write(0x0c14, 0xdead_beef);
+    let config = rig.dev.config();
+    for offset in 0x78..0x88 {
+        assert_eq!(config.read_sized(offset, 1), 0, "byte at {offset:#x}");
+    }
+    for offset in (0x78..0x88).step_by(2) {
+        assert_eq!(config.read_sized(offset, 2), 0, "halfword at {offset:#x}");
+    }
+    config.write_masked(0x80 / 4, 0xff, 0xff);
+    config.write_masked(0x7c / 4, 0xffff_0000, 0xffff_0000);
+    assert_eq!(config.read_sized(0x80, 1), 0);
+    assert_eq!(config.read_sized(0x7e, 2), 0);
+    assert_eq!(config.read_sized(0x78, 4), 0x0410);
+    assert_eq!(config.read_sized(0x80, 4), 0x1234_5678);
+    assert_eq!(config.read_sized(0x7c, 4), 0x0c14);
+    assert_eq!(config.read_sized(0x84, 4), 0xdead_beef);
+}
+
 /// Ported from test_indirect_memory_window: SRAM through config and through
 /// the BAR window at 0x8000.
 #[test]

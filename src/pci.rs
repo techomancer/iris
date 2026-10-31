@@ -236,6 +236,19 @@ impl PciConfig {
         if let Some(value) = self.hook.get().and_then(|h| h.read(reg)) {
             return value;
         }
+        self.read_header(reg)
+    }
+
+    /// A configuration read of `width` bytes (1, 2 or 4) at byte `offset`,
+    /// as a bridge's cycle makes it. Only a full dword reaches the function's
+    /// hook; a narrower read takes the header's own bytes, as a narrower
+    /// write does.
+    pub fn read_sized(&self, offset: usize, width: usize) -> u32 {
+        let dword = if width == 4 { self.read(offset / 4) } else { self.read_header(offset / 4) };
+        (dword >> ((offset & 3) * 8)) & (u32::MAX >> (32 - width * 8))
+    }
+
+    fn read_header(&self, reg: usize) -> u32 {
         let r = self.regs.lock().unwrap();
         match reg {
             // A function with a capability list also sets status bit 4.
