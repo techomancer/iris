@@ -312,6 +312,16 @@ impl St {
         self.sdma_run(p);
     }
 
+    /// Move host input into the port, retry a byte the host end refused and
+    /// let the receive timeout run out. Returns whether anything changed.
+    fn uart_pump(&mut self, p: usize) -> bool {
+        let now = Instant::now();
+        let u = &mut self.uart[p];
+        let moved = u.pump();
+        let sent = u.poll_tx(now);
+        u.check_timeout(now) || moved || sent
+    }
+
     fn uart_read(&mut self, p: usize, r: u32) -> u8 {
         let v = self.uart[p].read(r);
         self.uart_changed(p);
@@ -541,8 +551,7 @@ impl Shared {
                     return;
                 }
                 sh.with_st(|st| {
-                    let moved = st.uart[port].pump();
-                    if st.uart[port].check_timeout(Instant::now()) || moved {
+                    if st.uart_pump(port) {
                         st.uart_changed(port);
                     }
                 });
@@ -556,7 +565,7 @@ impl Shared {
     fn service(&self) {
         self.with_st(|st| {
             for p in 0..PORTS {
-                st.uart[p].pump();
+                st.uart_pump(p);
                 st.uart_changed(p);
             }
             st.sdma_catch_up(Instant::now());

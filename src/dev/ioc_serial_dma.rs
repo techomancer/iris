@@ -147,6 +147,9 @@ pub struct SerialDmaParams {
 /// A 16550 as the engine drives it.
 pub trait SerialDmaUart {
     fn loopback(&self) -> bool;
+    /// The port can take a character from the engine. The walk waits while
+    /// it cannot, and goes on when the chip next runs the engine.
+    fn tx_ready(&self) -> bool;
     /// A read with the chip's side effects left out: the 16550 proper.
     fn read_core(&mut self, reg: u32) -> u8;
     fn write(&mut self, reg: u32, val: u8);
@@ -497,6 +500,9 @@ impl SerialDma {
                 }
                 match ty {
                     TX_CHARACTER => {
+                        if !host.uart(p).tx_ready() {
+                            return;
+                        }
                         let looped = host.uart(p).loopback();
                         // What has already arrived goes ahead of this one.
                         if looped {
@@ -711,6 +717,10 @@ impl SerialDmaUart for Ns16550 {
         Ns16550::loopback(self)
     }
 
+    fn tx_ready(&self) -> bool {
+        Ns16550::tx_ready(self)
+    }
+
     fn read_core(&mut self, r: u32) -> u8 {
         self.read(r)
     }
@@ -749,6 +759,9 @@ mod tests {
     impl SerialDmaUart for FakeUart {
         fn loopback(&self) -> bool {
             false
+        }
+        fn tx_ready(&self) -> bool {
+            true
         }
         fn read_core(&mut self, reg: u32) -> u8 {
             match reg {

@@ -223,11 +223,14 @@ impl Uart {
         self.core.irq()
     }
 
-    /// Move whatever the host end has typed into the receive FIFO and let
-    /// the receive timeout run out. Returns whether anything changed.
+    /// Move whatever the host end has typed into the receive FIFO, retry a
+    /// byte the host end refused and let the receive timeout run out.
+    /// Returns whether anything changed.
     fn pump(&mut self) -> bool {
+        let now = Instant::now();
         let moved = self.core.pump();
-        self.core.check_timeout(Instant::now()) || moved
+        let sent = self.core.poll_tx(now);
+        self.core.check_timeout(now) || moved || sent
     }
 
     /// A guest's byte-wide read, with the chip's additions: the auto-flow
@@ -272,6 +275,10 @@ impl Uart {
 impl SerialDmaUart for Uart {
     fn loopback(&self) -> bool {
         self.core.loopback()
+    }
+
+    fn tx_ready(&self) -> bool {
+        self.core.tx_ready()
     }
 
     fn read_core(&mut self, r: u32) -> u8 {
