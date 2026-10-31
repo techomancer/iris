@@ -1,0 +1,512 @@
+//! The chip's register file, on-chip SRAM, interrupt line and the engines
+//! that run inside register writes. The PCI side and the threads are in the
+//! parent module.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use super::eeprom::{self, Eeprom};
+use super::phy::{self, Phy};
+use crate::pci::PciConfig;
+
+pub const REG_FILE_SIZE: u32 = 0x8000;
+pub const SRAM_SIZE: u32 = 0x8000;
+const REG_WORDS: usize = (REG_FILE_SIZE / 4) as usize;
+const SRAM_WORDS: usize = (SRAM_SIZE / 4) as usize;
+
+/// Dword indices of the PCI configuration registers the chip owns.
+pub mod cfg {
+    pub const MISC_CTL: usize = 0x68 / 4;
+    pub const PCISTATE: usize = 0x70 / 4;
+    pub const REG_BASEADDR: usize = 0x78 / 4;
+    pub const MEMWIN_BASEADDR: usize = 0x7c / 4;
+    pub const REG_DATA: usize = 0x80 / 4;
+    pub const MEMWIN_DATA: usize = 0x84 / 4;
+}
+
+pub mod misc_ctl {
+    pub const CLEAR_INTA: u32 = 0x1;
+    pub const MASK_PCI_INTR: u32 = 0x2;
+    pub const ENDIAN_BYTESWAP: u32 = 0x4;
+    pub const ENDIAN_WORDSWAP: u32 = 0x8;
+    /// The chip id, bits 31:16, is read-only; the low half is writable.
+    pub const WRITABLE: u32 = 0xffff;
+}
+
+pub mod pcistate {
+    pub const INTR_NOT_ACTIVE: u32 = 0x2;
+    pub const BUSMODE_PCI: u32 = 0x4;
+    /// The chip did not see REQ64# at the end of reset.
+    pub const BUS_32BIT: u32 = 0x10;
+}
+
+/// The chip id MISC_CTL[31:16] presents; the driver reads the part from it.
+pub const CHIPID_BCM5701: u32 = 0x0105;
+
+/// Register-file offsets with modelled behaviour.
+pub mod reg {
+    pub const MAC_MODE: u32 = 0x0400;
+    pub const MAC_STATUS: u32 = 0x0404;
+    pub const MAC_ADDR_0_HIGH: u32 = 0x0410;
+    pub const MAC_ADDR_0_LOW: u32 = 0x0414;
+    pub const MAC_ADDR_STRIDE: u32 = 8;
+    pub const MI_COMM: u32 = 0x044c;
+    pub const MI_STS: u32 = 0x0450;
+    pub const RX_MODE: u32 = 0x0468;
+    pub const HCC_MODE: u32 = 0x3c00;
+    pub const BUFMGR_MODE: u32 = 0x4400;
+    pub const BUFMGR_STATUS: u32 = 0x4404;
+    pub const FW_PROGRESS: u32 = 0x5034;
+    pub const MODE_CTL: u32 = 0x6800;
+    pub const MISC_CFG: u32 = 0x6804;
+    pub const EEPROM_ADDR: u32 = 0x6838;
+    pub const EEPROM_DATA: u32 = 0x683c;
+    pub const EEPROM_PIN: u32 = 0x6840;
+    pub const EEPROM_DELAY: u32 = 0x6848;
+    pub const MBX_IRQ0_LO: u32 = 0x0204;
+}
+
+/// Bit 0 of a mode register is a self-clearing reset; bit 0 of MISC_CFG
+/// resets the whole chip.
+const MODE_RESET: u32 = 1;
+const MISCCFG_RESET_CORE_CLOCKS: u32 = 1;
+
+const BUFMGR_MODE_ENABLE: u32 = 2;
+/// The buffer manager's enable reads back only after its startup; a
+/// functional approximation inside the driver's 10 ms polling budget.
+const BUFMGR_START: Duration = Duration::from_millis(8);
+
+mod eeprom_cmd {
+    pub const READ: u32 = 1 << 31;
+    pub const COMPLETE: u32 = 1 << 30;
+    pub const RESET: u32 = 1 << 29;
+    pub const DEVICE_ID: u32 = 7 << 26;
+    pub const START: u32 = 1 << 25;
+    pub const WORD_ADDR: u32 = 0x3fff << 2;
+}
+
+/// The firmware-ready handshake. The driver writes the magic to SRAM 0x0b50
+/// and polls for its complement, the on-chip bootcode's ready signal. The
+/// mailbox returns the complement of the last value written, so the magic
+/// reads back as ready whether the driver writes it before the reset or after.
+pub const SRAM_FW_MBOX: u32 = 0x0b50;
+pub const FW_MAGIC: u32 = 0x4b65_7654;
+/// The firmware-progress register holds the all-ones "no progress yet"
+/// sentinel, so a driver polling it sees "unchanged" and keeps polling the
+/// mailbox.
+const FW_PROGRESS_INIT: u32 = 0xffff_ffff;
+
+/// The station address the on-chip bootcode leaves where a driver looks for
+/// it: SRAM 0x0c14 tagged 0x484b in its high half, and MAC address filter
+/// slot 0.
+const SRAM_MAC_HI: u32 = 0x0c14;
+const SRAM_MAC_LO: u32 = 0x0c18;
+const MAC_TAG: u32 = 0x484b;
+
+mod mi {
+    pub const DATA: u32 = 0x0000_ffff;
+    pub const REG: u32 = 0x001f_0000;
+    pub const REG_SHIFT: u32 = 16;
+    /// Command and address fields, kept across a read.
+    pub const READ_FIELDS: u32 = 0x0fff_0000;
+    pub const WRITE: u32 = 0x0400_0000;
+    pub const READ: u32 = 0x0800_0000;
+    pub const BUSY: u32 = 0x2000_0000;
+    pub const LINK: u32 = 1;
+}
+
+/// What the model could not carry out, counted and logged on first sight so
+/// an unexpected access is never silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Refused {
+    /// A write to a register with no modelled behaviour; the value is stored
+    /// and reads back.
+    UnmodelledWrite(u32),
+    /// A write to the read-only buffer-manager status.
+    BufmgrStatusWrite,
+    /// Direct EEPROM serial-pin control.
+    EepromPins,
+    EepromFault(eeprom::Fault),
+    /// An MI_COMM opcode other than read and write.
+    MiOpcode(u32),
+    /// A BAR access of a width or alignment the chip does not accept.
+    BarAccess { offset: u32, width: u8, write: bool },
+    Phy(phy::Refusal),
+}
+
+pub(super) struct State {
+    pub cfg: Arc<PciConfig>,
+    pub mac: [u8; 6],
+    regfile: Box<[u32; REG_WORDS]>,
+    sram: Box<[u32; SRAM_WORDS]>,
+    /// The two indirect-window base registers (config 0x78 and 0x7c).
+    pub reg_win_base: u32,
+    pub mem_win_base: u32,
+    eeprom: Option<Eeprom>,
+    bufmgr_start: Option<Instant>,
+    /// The mask set through the 0x0204 mailbox, and the latch a status-block
+    /// update sets and the driver clears. The line is the latch with
+    /// neither mask (this or MISC_CTL's) set.
+    irq_masked: bool,
+    irq_pending: bool,
+    irq_level: bool,
+    pub irq_events: Vec<bool>,
+    pub phy: Phy,
+    pub now: Instant,
+    refused: BTreeMap<Refused, u64>,
+}
+
+impl State {
+    pub fn new(cfg: Arc<PciConfig>, mac: [u8; 6], eeprom: Option<Eeprom>, now: Instant) -> Self {
+        let mut st = Self {
+            cfg,
+            mac,
+            regfile: Box::new([0; REG_WORDS]),
+            sram: Box::new([0; SRAM_WORDS]),
+            reg_win_base: 0,
+            mem_win_base: 0,
+            eeprom,
+            bufmgr_start: None,
+            irq_masked: true,
+            irq_pending: false,
+            irq_level: false,
+            irq_events: Vec::new(),
+            phy: Phy::new(now),
+            now,
+            refused: BTreeMap::new(),
+        };
+        st.reset();
+        st
+    }
+
+    /// Enter at `now`: run whatever came due since the last entry.
+    pub fn enter(&mut self, now: Instant) {
+        if now > self.now {
+            self.now = now;
+        }
+        self.run_timers();
+    }
+
+    fn run_timers(&mut self) {
+        let now = self.now;
+        self.phy.sync(now);
+        if self.bufmgr_start.is_some_and(|d| d <= now) {
+            self.bufmgr_start = None;
+            let mode = self.rf(reg::BUFMGR_MODE);
+            self.set_rf(reg::BUFMGR_MODE, mode | BUFMGR_MODE_ENABLE);
+        }
+    }
+
+    /// The earliest moment something here needs attention.
+    pub fn deadline(&self) -> Option<Instant> {
+        [self.phy.deadline(), self.bufmgr_start].into_iter().flatten().min()
+    }
+
+    pub fn refused(&self) -> Vec<(Refused, u64)> {
+        self.refused.iter().map(|(what, count)| (*what, *count)).collect()
+    }
+
+    pub fn eeprom_bytes(&self) -> Option<Vec<u8>> {
+        self.eeprom.as_ref().map(|e| e.bytes().to_vec())
+    }
+
+    pub fn refuse(&mut self, what: Refused) {
+        let count = self.refused.entry(what).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            crate::dlog!(crate::devlog::LogModule::Net, "bcm5701: unsupported or unexpected: {what:?}");
+        }
+    }
+
+    fn drain_phy_refusals(&mut self) {
+        for what in std::mem::take(&mut self.phy.refused) {
+            self.refuse(Refused::Phy(what));
+        }
+    }
+
+    // ---- storage ----
+
+    fn rf(&self, off: u32) -> u32 {
+        self.regfile[((off & (REG_FILE_SIZE - 1)) >> 2) as usize]
+    }
+
+    fn set_rf(&mut self, off: u32, val: u32) {
+        self.regfile[((off & (REG_FILE_SIZE - 1)) >> 2) as usize] = val;
+    }
+
+    pub fn sram_read(&self, off: u32) -> u32 {
+        self.sram[((off & (SRAM_SIZE - 1)) >> 2) as usize]
+    }
+
+    pub fn sram_write(&mut self, off: u32, val: u32) {
+        let off = off & (SRAM_SIZE - 1);
+        let val = if off == SRAM_FW_MBOX { !val } else { val };
+        self.sram[(off >> 2) as usize] = val;
+    }
+
+    // ---- resets ----
+
+    /// The station address, as the on-chip bootcode owns it: every reset
+    /// puts it back.
+    fn load_station_address(&mut self) {
+        let m = self.mac;
+        let hi = u32::from(m[0]) << 8 | u32::from(m[1]);
+        let lo = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+        self.sram_write(SRAM_MAC_HI, MAC_TAG << 16 | hi);
+        self.sram_write(SRAM_MAC_LO, lo);
+        self.set_rf(reg::MAC_ADDR_0_HIGH, hi);
+        self.set_rf(reg::MAC_ADDR_0_LOW, lo);
+    }
+
+    /// The driver's write of MISC_CFG.RESET_CORE_CLOCKS, by either access
+    /// path: the register file and SRAM return to their reset values, the
+    /// handshake mailbox re-arms to the firmware-ready complement and the
+    /// bootcode's station address comes back. PCI configuration, the chip id
+    /// in MISC_CTL among it, and the indirect-window bases are untouched.
+    fn global_reset(&mut self) {
+        self.bufmgr_start = None;
+        self.regfile.fill(0);
+        self.sram.fill(0);
+        self.irq_masked = true;
+        self.irq_pending = false;
+        self.sram_write(SRAM_FW_MBOX, FW_MAGIC);
+        self.load_station_address();
+        self.update_irq(false);
+    }
+
+    /// A cold reset: as a global reset, plus the window bases, the PHY, and
+    /// no firmware-ready complement (only the driver-triggered reset arranges
+    /// that, because it is the one the driver writes the magic for).
+    pub fn reset(&mut self) {
+        self.bufmgr_start = None;
+        self.regfile.fill(0);
+        self.sram.fill(0);
+        self.reg_win_base = 0;
+        self.mem_win_base = 0;
+        self.irq_masked = true;
+        self.irq_pending = false;
+        self.phy.reset(self.now);
+        self.load_station_address();
+        self.update_irq(true);
+    }
+
+    // ---- interrupt ----
+
+    fn misc_ctl(&self) -> u32 {
+        self.cfg.read(cfg::MISC_CTL)
+    }
+
+    /// The interrupt is a level: INTA asserts while a status-block update
+    /// awaits the driver and neither the mailbox nor MISC_CTL.MASK_PCI_INTR
+    /// masks it. PCISTATE.INTR_NOT_ACTIVE mirrors the inverse, so the
+    /// driver's shared-interrupt check reads true exactly when the line is
+    /// down. `force` delivers the level even if unchanged.
+    pub fn update_irq(&mut self, force: bool) {
+        let active = self.irq_pending && !self.irq_masked && self.misc_ctl() & misc_ctl::MASK_PCI_INTR == 0;
+        self.cfg.update(cfg::PCISTATE, |v| {
+            if active {
+                v & !pcistate::INTR_NOT_ACTIVE
+            } else {
+                v | pcistate::INTR_NOT_ACTIVE
+            }
+        });
+        if force || active != self.irq_level {
+            self.irq_level = active;
+            self.irq_events.push(active);
+        }
+    }
+
+    pub fn irq_level(&self) -> bool {
+        self.irq_level
+    }
+
+    /// A write to MISC_CTL acknowledges if CLEAR_INTA was set, then re-derives
+    /// the line. This is how the driver's "set CLEAR_INTA, clear
+    /// MASK_PCI_INTR" enables the interrupt.
+    pub fn misc_ctl_written(&mut self) {
+        if self.misc_ctl() & misc_ctl::CLEAR_INTA != 0 {
+            self.irq_pending = false;
+            self.cfg.update(cfg::MISC_CTL, |v| v & !misc_ctl::CLEAR_INTA);
+        }
+        self.update_irq(false);
+    }
+
+    // ---- EEPROM ----
+
+    fn eeprom_access(&mut self, command: u32) -> bool {
+        let device = ((command & eeprom_cmd::DEVICE_ID) >> 26) as u8;
+        let word = (command & eeprom_cmd::WORD_ADDR) >> 2;
+        let result = match self.eeprom.as_mut() {
+            None => {
+                self.refuse(Refused::EepromFault(eeprom::Fault::WrongDevice(device)));
+                return false;
+            }
+            Some(e) if command & eeprom_cmd::READ != 0 => e.read_word(device, word).map(Some),
+            Some(e) => {
+                let value = self.regfile[(reg::EEPROM_DATA >> 2) as usize];
+                e.write_word(device, word, value).map(|()| None)
+            }
+        };
+        match result {
+            Ok(Some(value)) => {
+                self.set_rf(reg::EEPROM_DATA, value);
+                true
+            }
+            Ok(None) => true,
+            Err(fault) => {
+                self.refuse(Refused::EepromFault(fault));
+                false
+            }
+        }
+    }
+
+    fn eeprom_command_write(&mut self, val: u32) {
+        let old = self.rf(reg::EEPROM_ADDR);
+        let mut command = val & !(eeprom_cmd::START | eeprom_cmd::COMPLETE | eeprom_cmd::RESET | 3);
+        let acknowledge = val & eeprom_cmd::COMPLETE != 0;
+        if val & eeprom_cmd::RESET != 0 {
+            self.set_rf(reg::EEPROM_ADDR, eeprom_cmd::RESET);
+            self.set_rf(reg::EEPROM_DATA, 0);
+            return;
+        }
+        if !acknowledge {
+            command |= old & eeprom_cmd::COMPLETE;
+        }
+        self.set_rf(reg::EEPROM_ADDR, command);
+        // A pending Complete blocks the next transfer until it is
+        // acknowledged; acknowledging and starting in one write is allowed.
+        if val & eeprom_cmd::START == 0 || (old & eeprom_cmd::COMPLETE != 0 && !acknowledge) {
+            return;
+        }
+        if self.eeprom_access(command) {
+            self.set_rf(reg::EEPROM_ADDR, command | eeprom_cmd::COMPLETE);
+        }
+    }
+
+    // ---- register file ----
+
+    /// Register-file writes, reached identically from the BAR and from the
+    /// indirect register window, so a side effect fires whichever path the
+    /// driver uses. The 5700/5701 issue the global reset through the window.
+    pub fn reg_write(&mut self, off: u32, val: u32) {
+        let off = off & (REG_FILE_SIZE - 1);
+        let mut val = val;
+        match off {
+            reg::MISC_CFG => {
+                if val & MISCCFG_RESET_CORE_CLOCKS != 0 {
+                    self.global_reset();
+                    return;
+                }
+            }
+            reg::EEPROM_ADDR => {
+                self.eeprom_command_write(val);
+                return;
+            }
+            reg::EEPROM_DATA | reg::EEPROM_DELAY => {}
+            reg::EEPROM_PIN => {
+                self.refuse(Refused::EepromPins);
+                self.set_rf(off, val);
+                return;
+            }
+            // The reset bit self-clears; the rest of the write persists.
+            reg::MAC_MODE => val &= !MODE_RESET,
+            reg::RX_MODE => {
+                // A halt takes effect at once. The chip finishes the frame in
+                // flight first and reads back ENABLE until it has, which a
+                // model that takes one frame at a time never needs.
+                val &= !MODE_RESET;
+                self.set_rf(off, val);
+                return;
+            }
+            // Write one to clear: the bits written are the ones acknowledged.
+            reg::MAC_STATUS => {
+                let old = self.rf(off);
+                self.set_rf(off, old & !val);
+                return;
+            }
+            reg::HCC_MODE => {
+                val &= !MODE_RESET;
+                self.set_rf(off, val);
+                return;
+            }
+            reg::BUFMGR_MODE => {
+                if val & MODE_RESET != 0 {
+                    self.bufmgr_start = None;
+                    self.set_rf(off, 0);
+                }
+                val &= !MODE_RESET;
+                if val & BUFMGR_MODE_ENABLE == 0 {
+                    self.bufmgr_start = None;
+                } else if self.rf(off) & BUFMGR_MODE_ENABLE == 0 {
+                    if self.bufmgr_start.is_none() {
+                        self.bufmgr_start = Some(self.now + BUFMGR_START);
+                    }
+                    val &= !BUFMGR_MODE_ENABLE;
+                }
+            }
+            reg::BUFMGR_STATUS => {
+                self.refuse(Refused::BufmgrStatusWrite);
+                return;
+            }
+            reg::MBX_IRQ0_LO => {
+                // Every write clears the pending update; a nonzero value
+                // masks the line and zero re-enables it.
+                self.irq_pending = false;
+                self.irq_masked = val != 0;
+                self.set_rf(off, val);
+                self.update_irq(false);
+                return;
+            }
+            reg::MI_COMM => {
+                self.mi_comm_write(val);
+                return;
+            }
+            _ => {
+                self.refuse(Refused::UnmodelledWrite(off));
+                self.set_rf(off, val);
+                return;
+            }
+        }
+        self.set_rf(off, val);
+    }
+
+    fn mi_comm_write(&mut self, command: u32) {
+        let register = ((command & mi::REG) >> mi::REG_SHIFT) as u8;
+        if command & mi::BUSY == 0 {
+            self.set_rf(reg::MI_COMM, command);
+            return;
+        }
+        let now = self.now;
+        let opcode = command & (mi::READ | mi::WRITE);
+        let val = if opcode == mi::READ {
+            (command & mi::READ_FIELDS) | u32::from(self.phy.read(register, now))
+        } else if opcode == mi::WRITE {
+            self.phy.write(register, (command & mi::DATA) as u16, now);
+            command & !mi::BUSY
+        } else {
+            self.refuse(Refused::MiOpcode(opcode >> 26));
+            command & !mi::BUSY
+        };
+        self.set_rf(reg::MI_COMM, val);
+        self.drain_phy_refusals();
+    }
+
+    /// Register-file reads, reached identically from the BAR and the window.
+    /// Most read back their stored value; MI_STS is the PHY's live link so
+    /// the driver's auto-poll path sees the carrier.
+    pub fn reg_read(&mut self, off: u32) -> u32 {
+        match off & (REG_FILE_SIZE - 1) {
+            reg::MI_STS => {
+                self.phy.sync(self.now);
+                if self.phy.link_up() {
+                    mi::LINK
+                } else {
+                    0
+                }
+            }
+            reg::FW_PROGRESS => FW_PROGRESS_INIT,
+            _ => self.rf(off),
+        }
+    }
+}
