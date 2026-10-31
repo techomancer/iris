@@ -651,3 +651,91 @@ fn the_board_holds_pi0s_store_below_the_bias_until_the_interrupt_is_taken() {
     assert_eq!(pi.write64(0x90, 1), BUS_OK, "pending-modify: clear bit 1");
     assert_eq!(store(), BUS_OK);
 }
+
+/// A hub register as the processor reaches it through the two register
+/// windows of uncached space 1: the local form at 0x0100_0000 and the
+/// remote form at 0x0180_0000, both onto this node's registers.
+fn hub_registers(board: &TezroBoard, window: u64, offset: u64) -> crate::traits::BusRead64 {
+    board.node.bus.read64((1 << 57) | window | offset)
+}
+const HUB_WINDOWS: [u64; 2] = [0x0100_0000, 0x0180_0000];
+
+/// The PROM writes the hub's widget control (0x400020) with destination
+/// credits 4 in bits 15:13 for the integrated crossbar, and keeps the
+/// widget number in bits 3:0.
+#[test]
+fn the_hub_keeps_the_proms_destination_credits_of_four() {
+    for window in HUB_WINDOWS {
+        let board = TezroBoard::new(1).unwrap();
+        let control = hub_registers(&board, window, 0x40_0020).data;
+        assert_eq!(control & 0xf, 10, "the hub's own widget number");
+        let value = (control & !(7 << 13)) | (4 << 13);
+        assert_eq!(board.node.bus.write64((1 << 57) | window | 0x40_0020, value), BUS_OK);
+        let back = hub_registers(&board, window, 0x40_0020).data;
+        assert_eq!((back >> 13) & 7, 4, "window {window:#x}");
+        assert_eq!(back & 0xf, 10);
+    }
+}
+
+/// A one-node boot reads the network interface as an uncabled port: status
+/// 1, reset enable 0, error status 0 and the error-clear register 0 however
+/// often it is read, and neither network error bit (39, 40) is up in the
+/// processor interface's second pending register. Through both windows.
+#[test]
+fn a_one_node_boot_reads_the_network_interface_quiet() {
+    for cpus in [1, 4] {
+        let board = TezroBoard::new(cpus).unwrap();
+        for window in HUB_WINDOWS {
+            for (offset, expected) in [(0x68_0000, 1), (0x68_0010, 0), (0x68_0100, 0), (0x68_0120, 0)] {
+                for count in 0..4 {
+                    let r = hub_registers(&board, window, offset);
+                    assert_eq!((r.status, r.data), (BUS_OK, expected), "{cpus} CPUs, {window:#x} + {offset:#x}, read {count}");
+                }
+            }
+        }
+        for (interface, pi) in board.node.pi.iter().enumerate() {
+            let pending = pi.read64(crate::dev::bedrock_pi::reg::PENDING_STATUS_B).data;
+            assert_eq!(pending & (1 << 39 | 1 << 40), 0, "{cpus} CPUs, PI{interface}");
+        }
+    }
+}
+
+/// PROM 6.210's crossbar check on the Tezro: it writes the read-only lower
+/// error address, wants the register-access error with the hub's widget in
+/// the status source, then enables that condition, writes the upper error
+/// address, and wants the error again and vector 0x10 at the PI. The stores
+/// complete, and the arbitration lock of link 15 (bit 1) holds its value.
+#[test]
+fn the_proms_crossbar_check_passes_on_the_tezro_board() {
+    let board = TezroBoard::new(1).unwrap();
+    let io = &board.node.io;
+    let status_clear = widget(0, 0x54);
+    let (err_upper, err_lower, control) = (widget(0, 0x14), widget(0, 0x1c), widget(0, 0x24));
+    let pending_0 = || board.node.pi[0].read64(crate::dev::bedrock_pi::reg::PENDING_STATUS_A).data;
+    // Vector 0x10 to the hub, at PI 0x90 of its register space (address
+    // bit 47 selects the registers).
+    assert_eq!(io.pio_write(widget(0, 0x34), 4, (0x10 << 24) | (10 << 16) | 0x8000), BUS_OK);
+    assert_eq!(io.pio_write(widget(0, 0x3c), 4, 0x0180_0090), BUS_OK);
+
+    assert_eq!(io.pio_write(err_lower, 4, 0xdead_beef), BUS_OK, "no bus error");
+    let status = read_word(&board, status_clear);
+    assert_ne!(status & (1 << 5), 0, "register-access error");
+    assert_eq!((status >> 6) & 0xf, 10, "the hub's widget is the source");
+    assert_eq!(read_word(&board, status_clear) & (1 << 5), 0, "the alias cleared it");
+    assert_eq!(pending_0() & (1 << 16), 0, "nothing was enabled yet");
+
+    assert_eq!(io.pio_write(control, 4, 0x20), BUS_OK);
+    assert_eq!(io.pio_write(err_upper, 4, 0), BUS_OK, "no bus error");
+    let status = read_word(&board, widget(0, 0x0c));
+    assert_ne!(status & (1 << 5), 0, "register-access error again");
+    assert_eq!((status >> 6) & 0xf, 10);
+    assert_ne!(pending_0() & (1 << 16), 0, "vector 0x10 reached the PI");
+    // Acknowledging the error lowers the vector again.
+    assert_ne!(read_word(&board, status_clear) & (1 << 5), 0);
+    assert_eq!(pending_0() & (1 << 16), 0);
+
+    // The PROM's lock: bit 1 of link 15's arbitration-upper register.
+    let lock = link_word(15, LINK_ARB_UPPER);
+    assert_eq!(io.pio_write(lock, 4, 2), BUS_OK);
+    assert_eq!(read_word(&board, lock) & 2, 2);
+}
