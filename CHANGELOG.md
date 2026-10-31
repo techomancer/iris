@@ -27,6 +27,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
 
+### Debugging on two CPUs is unsupported
+
+- Stepping one CPU of two cannot keep the guest healthy, whichever way the other
+  CPU is treated, so `debug.md` now calls it unsupported. The commands still run.
+
 ### Memory ranges come from the machine
 
 - Each machine now describes its RAM, RAM aliases and ROM in a `MemoryMap`,

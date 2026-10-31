@@ -157,7 +157,13 @@ Without a number, `start`, `stop` and the breakpoint commands (`bp`, `b`, `bd`,
 `be`, `bb`) apply to every CPU, `status` answers for each, and everything else
 goes to the selected CPU. A number always means that CPU alone, even for `stop`.
 
-To step one CPU while the other holds still:
+**Debugging a running guest on two CPUs is not supported.** The commands run,
+but there is no way to step one CPU that keeps the guest healthy. If the other
+CPU stays stopped, the stepped one will eventually wait on a lock or a reply
+from it for good. If the other CPU runs, it finds that the stepped one has
+stopped responding, and IRIX panics. Reading registers and memory while every
+CPU is stopped is fine, and so is a short step to look at something, as long as
+you expect to reboot afterwards:
 
 ```
 stop
@@ -167,8 +173,9 @@ start
 ```
 
 HEART's counter keeps running through a monitor stop, and the guest's
-timeouts count on it, so a long stop can make IRIX report that a CPU missed its
-clock. A breakpoint stops the CPU that hit it; the other keeps running until
+timeouts count on it, so even a long stop with no stepping can make IRIX report
+that a CPU missed its clock. To debug code rather than the two-CPU behaviour,
+boot with `cpus = 1`. A breakpoint stops the CPU that hit it; the other keeps running until
 `stop`. `heart status` shows each CPU's mask, interrupt outputs and why it is
 held. `j2 inline` and `j2 clear` are refused with several CPUs. The GDB stub
 sees CPU 0.

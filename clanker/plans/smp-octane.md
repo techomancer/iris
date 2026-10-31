@@ -401,6 +401,10 @@ first and alone so the diff is reviewable and every machine still works.
   hot-path check does not change. Stop notes record the CPU.
 - `run`/`step`/`next`/`finish` act on the selected CPU with the others held
   (scheduler locking); `start`/`stop` act on all.
+  **Unsupported, decided 2026-10-31:** no scheme keeps the guest alive. Others
+  held: the stepped CPU eventually waits on them forever. Others running: they
+  see the stepped CPU stop responding and IRIX panics. Not being pursued until
+  someone has an idea; debug.md says so. Use `cpus = 1` to debug code.
 - GDB: `MultiThreadBase`, tid = cpu+1, `get_cpu_debug` returns the set.
 - `debug.md` and `clanker/iris_mcp.py` updated in the same change.
 
