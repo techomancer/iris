@@ -228,7 +228,9 @@ impl Odyssey {
             // No lock: the writers mark rows after their stores and the
             // reader takes the marks before it reads (reader.rs).
             reader.poll(monotonic_ns());
+            let copy = std::time::Instant::now();
             reader.stage();
+            reader.stats.locked(std::time::Duration::ZERO, copy.elapsed());
             let mut job = reader.take();
             if let Some(job) = &mut job {
                 job.resolve();
