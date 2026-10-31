@@ -74,6 +74,7 @@ const REG_CLOCKGEN_CTRL: u32 = 0xa0;
 const REG_CLOCKGEN_REM: u32 = 0xa4;
 /// Four master-clock selects, one per clock generator, generator 3 first.
 const REG_CLOCKGEN_MUX_FIRST: u32 = 0xa8;
+const REG_CLOCKGEN_MUX_LAST: u32 = 0xb4;
 
 const POS_FIRST: u32 = 0x04;
 const POS_LAST: u32 = 0x2c;
@@ -104,6 +105,11 @@ const SUBCODE_LAST: u32 = 0x1218;
 const SUBCODE_WORDS: usize = ((SUBCODE_LAST - SUBCODE_FIRST) / 8 + 1) as usize;
 
 const ENABLE_BIT: u32 = 1;
+/// The analog output's enable register: bit 0 starts the channel, bit 29 or
+/// 30 picks generator 1 or 2 (mediaio-rad1-audio, output channel). The
+/// "bit 28 + n" pattern is inferred from those two; other bits are unknown.
+const OUT_SELECT_GEN1: u32 = 1 << 29;
+const OUT_SELECT_GEN2: u32 = 1 << 30;
 const SUBCODE_ENABLE_BIT: u32 = 4;
 const CTRL_TAG_SHIFT: u32 = 3;
 const CTRL_TAG_MASK: u32 = 0xf;
@@ -353,6 +359,8 @@ const CH_IN: usize = 0;
 const CH_OUT: usize = 1;
 const CH_AES_SUB: usize = 2;
 const NUM_CH: usize = 3;
+/// The generator the analog output uses until 0x58 names one.
+const OUT_DEFAULT_CG: usize = 1;
 
 struct ChanInfo {
     name: &'static str,
@@ -417,6 +425,11 @@ struct State {
     dma_bank: [u32; DMA_BANK_WORDS],
     sample_pos: [u32; POS_WORDS],
     analog_out_en: u32,
+    /// The clock generator the analog output runs from (0x58 selects it).
+    out_cg: usize,
+    /// Each generator's last control and remainder words; the master select
+    /// (0xa8..0xb4) can arrive after the load.
+    cg_loaded: [Option<(u32, u32)>; NUM_CG],
     status_dma_ctrl: u32,
     status_running: bool,
     chan: [Chan; NUM_CH],
@@ -449,6 +462,8 @@ impl State {
             dma_bank: [0; DMA_BANK_WORDS],
             sample_pos: [0; POS_WORDS],
             analog_out_en: 0,
+            out_cg: OUT_DEFAULT_CG,
+            cg_loaded: [None; NUM_CG],
             status_dma_ctrl: 0,
             status_running: false,
             chan: [Chan::default(); NUM_CH],
@@ -480,10 +495,15 @@ impl State {
 
     /// A channel's sample rate.
     fn rate(&self, idx: usize) -> Rate {
-        match CHAN_INFO[idx].clockgen {
+        match self.cg_of(idx) {
             Some(cg) => self.clock[cg],
             None => Rate::hz(CHAN_INFO[idx].freq),
         }
+    }
+
+    /// The clock generator pacing a channel; 0x58 chooses the output's.
+    fn cg_of(&self, idx: usize) -> Option<usize> {
+        if idx == CH_OUT { Some(self.out_cg) } else { CHAN_INFO[idx].clockgen }
     }
 
     fn pos(&mut self, reg: u32) -> &mut u32 {
@@ -938,8 +958,13 @@ impl Inner {
                     self.enable_write(s, CH_AES_SUB, val, now);
                 }
                 s.startup[i] = val;
-                if off == REG_CLOCKGEN_CTRL {
-                    self.clockgen_write(s, val, now);
+                match off {
+                    REG_CLOCKGEN_CTRL => self.clockgen_write(s, val, now),
+                    REG_CLOCKGEN_MUX_FIRST..=REG_CLOCKGEN_MUX_LAST => {
+                        let cg = NUM_CG - 1 - ((off - REG_CLOCKGEN_MUX_FIRST) / 4) as usize;
+                        self.clockgen_reselect(s, cg, now);
+                    }
+                    _ => {}
                 }
                 return Some(());
             }
@@ -956,12 +981,8 @@ impl Inner {
                     s.dma_bank[((off - DMA_BANK_FIRST) / 4) as usize] = val;
                     return Some(());
                 }
-            } else if off == REG_ANALOG_OUT_EN && (val == 0x2000_0000 || val == 0x2000_0001) {
-                if val == 0x2000_0000 || s.ring_valid(&RING_OUTPUT, false, 0xffff_f008) {
-                    self.enable_write(s, CH_OUT, val, now);
-                    s.analog_out_en = val;
-                    return Some(());
-                }
+            } else if off == REG_ANALOG_OUT_EN {
+                return self.analog_out_write(s, val, now);
             } else if off == REG_STATUS_DMA_CTRL {
                 self.status_ctrl_write(s, val, now)?;
                 s.status_dma_ctrl = val;
@@ -996,26 +1017,72 @@ impl Inner {
     }
 
     /// A clock generator control word: each generator it selects takes the
-    /// rate the remainder and master-select words describe. A channel that
-    /// runs from one is brought up to `now` at the old rate first, and counts
-    /// on from there at the new one.
+    /// rate the remainder and master-select words describe.
     fn clockgen_write(&self, s: &mut State, ctrl: u32, now: i64) {
         let rem = s.startup[Self::startup_index(REG_CLOCKGEN_REM).unwrap()];
         for cg in (0..NUM_CG).filter(|cg| ctrl & (1 << (CG_SELECT_SHIFT + *cg as u32)) != 0) {
-            let mux_reg = REG_CLOCKGEN_MUX_FIRST + 4 * (NUM_CG - 1 - cg) as u32;
-            let mux = s.startup[Self::startup_index(mux_reg).unwrap()];
-            let rate = Rate::from_clockgen(ctrl, rem, mux);
-            for idx in (0..NUM_CH).filter(|&i| CHAN_INFO[i].clockgen == Some(cg)) {
-                self.sync_chan(s, idx, now);
-                let c = &mut s.chan[idx];
-                if c.running {
-                    c.start_ns = now;
-                    c.frames = 0;
-                }
-            }
-            crate::dlog!(LogModule::Rad1, "rad1: clock generator {cg} at {:.3} Hz", rate.num as f64 / rate.den as f64);
-            s.clock[cg] = rate;
+            s.cg_loaded[cg] = Some((ctrl, rem));
+            self.clockgen_apply(s, cg, ctrl, rem, now);
         }
+    }
+
+    /// A master-clock select written after its generator was loaded (the
+    /// Octane PROM's order) re-evaluates it with the words it was loaded with.
+    fn clockgen_reselect(&self, s: &mut State, cg: usize, now: i64) {
+        if let Some((ctrl, rem)) = s.cg_loaded[cg] {
+            self.clockgen_apply(s, cg, ctrl, rem, now);
+        }
+    }
+
+    /// Set generator `cg`'s rate from its words. A channel that runs from
+    /// it is brought up to `now` at the old rate first, and counts on from
+    /// there at the new one.
+    fn clockgen_apply(&self, s: &mut State, cg: usize, ctrl: u32, rem: u32, now: i64) {
+        let mux_reg = REG_CLOCKGEN_MUX_FIRST + 4 * (NUM_CG - 1 - cg) as u32;
+        let mux = s.startup[Self::startup_index(mux_reg).unwrap()];
+        let rate = Rate::from_clockgen(ctrl, rem, mux);
+        if rate == s.clock[cg] {
+            return;
+        }
+        for idx in 0..NUM_CH {
+            if s.cg_of(idx) != Some(cg) {
+                continue;
+            }
+            self.sync_chan(s, idx, now);
+            let c = &mut s.chan[idx];
+            if c.running {
+                c.start_ns = now;
+                c.frames = 0;
+            }
+        }
+        crate::dlog!(LogModule::Rad1, "rad1: clock generator {cg} at {:.3} Hz", rate.num as f64 / rate.den as f64);
+        s.clock[cg] = rate;
+    }
+
+    /// A write to the analog output's enable register: bit 0 runs the
+    /// channel, one select bit names its clock generator. Other values are
+    /// unsupported and leave the register as it was.
+    fn analog_out_write(&self, s: &mut State, val: u32, now: i64) -> Option<()> {
+        let cg = match val & !ENABLE_BIT {
+            OUT_SELECT_GEN1 => 1,
+            OUT_SELECT_GEN2 => 2,
+            _ => return None,
+        };
+        if val & ENABLE_BIT != 0 && !s.chan[CH_OUT].running && !s.ring_valid(&RING_OUTPUT, false, 0xffff_f008) {
+            return None;
+        }
+        if cg != s.out_cg {
+            self.sync_chan(s, CH_OUT, now);
+            s.out_cg = cg;
+            let c = &mut s.chan[CH_OUT];
+            if c.running {
+                c.start_ns = now;
+                c.frames = 0;
+            }
+        }
+        self.enable_write(s, CH_OUT, val, now);
+        s.analog_out_en = val;
+        Some(())
     }
 
     /// The status-DMA control word: stop, one-shot start, or ring start.
