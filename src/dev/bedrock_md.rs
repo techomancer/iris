@@ -13,12 +13,12 @@
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
-use super::bedrock_mem::{BedrockMemory, BANK_SPAN, FITTED_BANK};
+use super::bedrock_mem::{BedrockMemory, RamExtent, BANK_SPAN};
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 
 pub mod reg {
@@ -84,6 +84,9 @@ pub enum MemoryError {
     Uncorrectable,
 }
 type ErrorCallback = Arc<dyn Fn(MemoryError) + Send + Sync>;
+/// Runs the closure it is given with every other processor parked, as the
+/// board's `World::stop_others` does. See [`BedrockMd::set_remap_guard`].
+pub type RemapGuard = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
 
 struct State {
     cell: u64,
@@ -101,6 +104,15 @@ struct State {
     memory_error: u64,
     directory_error: u64,
     marked_directory: HashSet<u64>,
+    /// Marks in each 4 KiB page of the dense walk: injected check bytes and
+    /// marked directory lines. A page is checked while it has any.
+    marked_pages: HashMap<u64, u32>,
+    /// Pages that gained their first mark since the CPU side last placed
+    /// them, and how many have, so an access can tell whether it added one.
+    newly_marked: Vec<u64>,
+    marks_added: u64,
+    /// A self-test cleared whole banks of marks.
+    retire_now: bool,
     clock_ns: u64,
     clock_anchor: Option<u64>,
     selftest_deadline: Option<u64>,
@@ -126,6 +138,10 @@ impl Default for State {
             memory_error: 0,
             directory_error: 0,
             marked_directory: HashSet::new(),
+            marked_pages: HashMap::new(),
+            newly_marked: Vec::new(),
+            marks_added: 0,
+            retire_now: false,
             clock_ns: 0,
             clock_anchor: None,
             selftest_deadline: None,
@@ -133,6 +149,54 @@ impl Default for State {
             selftest_status: 0,
             selftest_error: 0,
         }
+    }
+}
+
+impl State {
+    fn page_marked(&mut self, page: u64) {
+        let marks = self.marked_pages.entry(page).or_insert(0);
+        *marks += 1;
+        if *marks == 1 {
+            self.newly_marked.push(page);
+            self.marks_added += 1;
+        }
+    }
+    fn page_cleared(&mut self, page: u64) {
+        if let Some(marks) = self.marked_pages.get_mut(&page) {
+            *marks -= 1;
+            if *marks == 0 {
+                self.marked_pages.remove(&page);
+            }
+        }
+    }
+    /// Inject check byte `code` over the doubleword `key` of the dense walk.
+    fn ecc_mark(&mut self, key: u64, code: u8) {
+        if self.ecc.insert(key, code).is_none() {
+            self.page_marked(key / (4096 / 8));
+        }
+    }
+    fn ecc_lift(&mut self, key: u64) {
+        if self.ecc.remove(&key).is_some() {
+            self.page_cleared(key / (4096 / 8));
+        }
+    }
+    /// Mark directory line `line` of the dense walk as holding a bad entry.
+    fn directory_mark(&mut self, line: u64) {
+        if self.marked_directory.insert(line) {
+            self.page_marked(line / (4096 / 128));
+        }
+    }
+    fn directory_lift(&mut self, line: u64) {
+        if self.marked_directory.remove(&line) {
+            self.page_cleared(line / (4096 / 128));
+        }
+    }
+    /// Drop every mark, as a reset does.
+    fn lift_all(&mut self) {
+        self.ecc.clear();
+        self.marked_directory.clear();
+        self.marked_pages.clear();
+        self.newly_marked.clear();
     }
 }
 
@@ -148,6 +212,7 @@ pub struct BedrockMd {
     remapping: Mutex<()>,
     callback: Mutex<Option<ErrorCallback>>,
     unsupported: AtomicU64,
+    guard: OnceLock<RemapGuard>,
 }
 #[derive(Clone, Copy)]
 enum View {
@@ -170,24 +235,50 @@ struct MdBus {
 }
 
 impl BedrockMd {
-    pub fn new() -> Arc<Self> {
-        Self::build(None)
+    /// A controller with `banks` fitted, in MiB from locational bank 0; see
+    /// [`BedrockMemory::new`] for what a board may fit.
+    pub fn new(banks: &[u32]) -> Result<Arc<Self>, String> {
+        Self::build(banks, None)
     }
-    pub fn with_clock(clock: crate::dev::heart::Clock) -> Arc<Self> {
-        Self::build(Some(clock))
+    pub fn with_clock(banks: &[u32], clock: crate::dev::heart::Clock) -> Result<Arc<Self>, String> {
+        Self::build(banks, Some(clock))
     }
-    fn build(clock: Option<crate::dev::heart::Clock>) -> Arc<Self> {
+    fn build(banks: &[u32], clock: Option<crate::dev::heart::Clock>) -> Result<Arc<Self>, String> {
         let md = Arc::new(Self {
-            memory: BedrockMemory::new(),
+            memory: BedrockMemory::new(banks)?,
             clock,
             state: Mutex::new(State::default()),
             remapping: Mutex::new(()),
             callback: Mutex::new(None),
             unsupported: AtomicU64::new(0),
+            guard: OnceLock::new(),
         });
         md.memory.set_slow_view(md.view(View::Memory));
         md.rebuild_memory();
-        md
+        Ok(md)
+    }
+    /// Have every rebuild of the whole memory map run inside `guard`. A
+    /// rebuild scrubs and remaps host pages that another processor may be
+    /// running from, so on a multiprocessor board it must run with the others
+    /// parked. Placing and retiring one checked page only takes a region off
+    /// the direct path and swaps table entries, and needs no guard. The guard
+    /// is entered before any lock of this controller is taken, so a processor
+    /// that is waiting for one cannot keep it from stopping the others.
+    /// The configuration register write, [`Self::rebuild_memory`],
+    /// [`Self::soft_reset`], a startup-window change and
+    /// [`Resettable::power_on`] enter it. Set once, before the processors run.
+    pub fn set_remap_guard(&self, guard: RemapGuard) {
+        assert!(self.guard.set(guard).is_ok(), "Bedrock MD remap guard already set");
+    }
+    fn stopped<R>(&self, work: impl FnOnce() -> R) -> R {
+        let Some(guard) = self.guard.get() else { return work() };
+        let (mut work, mut done) = (Some(work), None);
+        guard(&mut || done = work.take().map(|work| work()));
+        done.expect("the remap guard ran its work")
+    }
+    /// Where fitted RAM can answer, for the processor bus's cached view.
+    pub fn ram_extent(&self) -> RamExtent {
+        self.memory.extent()
     }
     pub fn register_locks(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
@@ -238,10 +329,7 @@ impl BedrockMd {
     }
 
     fn mapping(s: &State) -> (u64, BTreeSet<u64>) {
-        let pages = s.ecc.keys().map(|key| key / (4096 / 8))
-            .chain(s.marked_directory.iter().map(|key| key / (4096 / 128)))
-            .collect();
-        (s.config, pages)
+        (s.config, s.marked_pages.keys().copied().collect())
     }
 
     /// Reinstall RAM after the board sets Physical's default. Call on the
@@ -249,9 +337,11 @@ impl BedrockMd {
     /// Ordinary CPU config/diagnostic writes rebuild their changed mappings
     /// automatically. This also releases pages whose metadata DMA consumed.
     pub fn rebuild_memory(&self) {
-        let _remapping = self.remapping.lock();
-        let (config, pages) = Self::mapping(&self.state.lock());
-        self.memory.remap(config, pages, true);
+        self.stopped(|| {
+            let _remapping = self.remapping.lock();
+            let (config, pages) = Self::mapping(&self.state.lock());
+            self.memory.remap(config, pages, true);
+        })
     }
     /// The guest stored `tag` in a primary data cache tag: the PROM building
     /// its stack in cache lines, or ending that. While they stand the window
@@ -259,12 +349,36 @@ impl BedrockMd {
     /// direct window. See [`BedrockMemory::startup_tag`]. Called on the CPU
     /// thread, outside the cache's locks.
     pub fn startup_tag_store(&self, tag: u32) {
-        let Some(live) = self.memory.startup_tag(tag) else { return };
-        let _remapping = self.remapping.lock();
-        if self.memory.set_startup(live) {
-            let (config, pages) = Self::mapping(&self.state.lock());
-            self.memory.remap(config, pages, true);
-        }
+        let cpu = crate::cpu::smp::current_cpu();
+        let Some(live) = self.memory.startup_tag(cpu, tag) else { return };
+        crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock MD: CPU {cpu}'s startup window {}", if live { "starts" } else { "ends" });
+        self.stopped(|| {
+            let _remapping = self.remapping.lock();
+            if self.memory.set_startup(cpu, live) {
+                let (config, pages) = Self::mapping(&self.state.lock());
+                self.memory.remap(config, pages, true);
+            }
+        })
+    }
+    /// Zero every bank, as a power-on does. Physical's own `reset_memory`
+    /// advances only the banks' counters; code pages follow the logical ones,
+    /// so a board resets the banks through here.
+    pub fn reset_memory(&self) {
+        self.memory.physical().reset_memory();
+        self.memory.changed_decode();
+    }
+    /// Load bank `bank` from a file of `Physical::save_bank`'s format, and
+    /// advance the logical counters the bytes changed under.
+    pub fn load_bank(&self, bank: usize, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let loaded = self.memory.physical().load_bank(bank, path);
+        self.memory.changed_decode();
+        loaded
+    }
+    /// Restore bank `bank` from words `Physical::snapshot_bank_inmem` took,
+    /// and advance the logical counters the bytes changed under.
+    pub fn restore_bank(&self, bank: usize, words: &[u32]) {
+        self.memory.physical().restore_bank_inmem(bank, words);
+        self.memory.changed_decode();
     }
     /// The stable logical-physical counters used by both compiled stores
     /// and SysAd page claims. Their storage outlives the CPU via its bus.
@@ -334,6 +448,9 @@ impl BedrockMd {
     }
     /// Called on the CPU thread or with the CPU stopped.
     pub fn soft_reset(&self) {
+        self.stopped(|| self.soft_reset_stopped())
+    }
+    fn soft_reset_stopped(&self) {
         let _remapping = self.remapping.lock();
         let mut s = self.state.lock();
         s.cell = u64::MAX;
@@ -341,8 +458,7 @@ impl BedrockMd {
         s.ecc_config = 0;
         s.memory_error = 0;
         s.directory_error = 0;
-        s.ecc.clear();
-        s.marked_directory.clear();
+        s.lift_all();
         s.selftest_deadline = None;
         s.selftest_status = 0;
         s.selftest_error = 0;
@@ -355,17 +471,20 @@ impl BedrockMd {
         if ![1, 2, 4, 8].contains(&bytes) || addr % bytes != 0 {
             return self.refuse("access", addr);
         }
+        if write.is_some() && matches!(view, View::Registers) && addr == reg::CONFIG {
+            return self.stopped(|| self.access_unguarded(view, addr, bytes, write));
+        }
+        self.access_unguarded(view, addr, bytes, write)
+    }
+    fn access_unguarded(&self, view: View, addr: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
         // Only CPU register/configuration and diagnostic writes can add
         // metadata. Keep their remap off DMA threads: ordinary RAM, scrub
         // and fetch operations only remove entries, leaving safe slow pages
-        // behind until a CPU-side rebuild. These write views, like HEART's
+        // behind until a CPU-side retirement. These write views, like HEART's
         // MEMCFG, are CPU-thread-only while the machine runs.
-        let publish = write.is_some() && match view {
-            View::Registers => matches!(addr, reg::CONFIG | reg::SELFTEST_COMMAND),
-            View::Directory | View::Ecc => true,
-            _ => false,
-        };
-        let remapping = publish.then(|| self.remapping.lock());
+        let reconfigure = write.is_some() && matches!(view, View::Registers) && addr == reg::CONFIG;
+        let marking = write.is_some() && matches!(view, View::Directory | View::Ecc | View::Registers);
+        let remapping = reconfigure.then(|| self.remapping.lock());
         let mut event = Vec::new();
         // Sample outside state: even an injected clock must not call out under
         // the memory lock. Only register observations need the self-test timer.
@@ -374,11 +493,12 @@ impl BedrockMd {
         } else {
             None
         };
-        let (result, snapshot) = {
+        let (result, snapshot, placing) = {
             let mut s = self.state.lock();
             if let Some(now) = now {
                 Self::catch_up(&mut s, now);
             }
+            let marks_added = s.marks_added;
             let result = match view {
                 View::Registers => self.register(&mut s, addr, bytes, write),
                 View::Directory => self.directory(&mut s, addr, bytes, write),
@@ -395,12 +515,16 @@ impl BedrockMd {
                 View::Fetchop => self.fetchop(&mut s, addr, bytes, write, &mut event),
                 View::Memory => self.ram(&mut s, addr, bytes, write, &mut event),
             };
-            (result, publish.then(|| Self::mapping(&s)))
+            let placing = marking && (s.marks_added != marks_added || s.retire_now);
+            (result, reconfigure.then(|| Self::mapping(&s)), placing)
         };
         if let Some((config, pages)) = snapshot {
-            self.memory.remap(config, pages, false);
+            self.memory.reconfigure(config, || pages);
         }
         drop(remapping);
+        if placing {
+            self.place_marks();
+        }
         if !event.is_empty() {
             let callback = self.callback.lock().clone();
             if let Some(callback) = callback {
@@ -410,6 +534,40 @@ impl BedrockMd {
             }
         }
         result
+    }
+    /// Route the pages that gained a mark through the MD endpoint, and
+    /// retire the pages whose marks were lifted when enough have piled up or
+    /// have idled long enough. Only a mark can make a page checked, so this
+    /// runs after the writes that add one, on the CPU thread.
+    fn place_marks(&self) {
+        let _remapping = self.remapping.lock();
+        let now = self.clock.as_ref().map(|clock| clock());
+        let (added, active, retire_now) = {
+            let mut s = self.state.lock();
+            let added = std::mem::take(&mut s.newly_marked);
+            (added, s.marked_pages.len(), std::mem::take(&mut s.retire_now))
+        };
+        self.memory.place(&added);
+        if retire_now || self.memory.retirement_due(active, now) {
+            self.retire_lifted();
+        }
+    }
+    /// Return the pages whose marks are lifted to their banks, in one change.
+    /// Call on the CPU thread, holding `remapping`.
+    fn retire_lifted(&self) {
+        let lifted = {
+            let s = self.state.lock();
+            self.memory.lifted(|page| s.marked_pages.contains_key(&page))
+        };
+        self.memory.retire(&lifted);
+    }
+    /// Return the pages whose ECC or directory marks were lifted to the
+    /// direct window now, without waiting for the batch to fill or idle. For
+    /// the board to call from the CPU thread, or with the CPU stopped, when
+    /// it has a quiet moment.
+    pub fn retire_lifted_marks(&self) {
+        let _remapping = self.remapping.lock();
+        self.retire_lifted();
     }
     fn register(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
         if bytes != 8 {
@@ -464,12 +622,13 @@ impl BedrockMd {
         let software = at / (BANK_SPAN / 8);
         let bank = software ^ ((s.config >> 32) & 3);
         if at & 0x7c8 == 0x408 {
-            if bank >= 2 {
+            let fitted = self.memory.fitted(bank);
+            if fitted == 0 {
                 return Some(0);
             }
             let within =
-                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % FITTED_BANK;
-            let key = ((bank * FITTED_BANK + within) >> 14) * 4 + ((within >> 7) & 3);
+                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % fitted;
+            let key = ((self.memory.dense_base(bank) + within) >> 14) * 4 + ((within >> 7) & 3);
             let old = *s.protection.get(&key).unwrap_or(&0);
             if let Some(v) = write {
                 s.protection.insert(key, v);
@@ -492,7 +651,8 @@ impl BedrockMd {
         };
         let table;
         let key;
-        if bank >= 2 || within >= FITTED_BANK {
+        let fitted = self.memory.fitted(bank);
+        if within >= fitted {
             if !s.compat.contains_key(&at) && s.compat.len() >= 74 {
                 return self.refuse("directory", at);
             }
@@ -500,7 +660,7 @@ impl BedrockMd {
             table = &mut s.compat;
             key = at;
         } else {
-            key = (bank * FITTED_BANK + within) / 128;
+            key = (self.memory.dense_base(bank) + within) / 128;
             table = if at & 8 != 0 {
                 &mut s.counters
             } else {
@@ -515,11 +675,11 @@ impl BedrockMd {
                 value
             };
             table.insert(key, value & mask);
-            if bank < 2 && within < FITTED_BANK && at & 8 == 0 {
+            if within < fitted && at & 8 == 0 {
                 if directory_syndrome(value, s.directory_config & 1 != 0) != 0 {
-                    s.marked_directory.insert(key);
+                    s.directory_mark(key);
                 } else {
-                    s.marked_directory.remove(&key);
+                    s.directory_lift(key);
                 }
             }
         }
@@ -537,7 +697,7 @@ impl BedrockMd {
         if s.ecc_config & 1 != 0 || s.ecc.is_empty() {
             return data;
         }
-        let key = (bank as u64 * FITTED_BANK + at) / 8;
+        let key = (self.memory.dense_base(bank as u64) + at) / 8;
         if let Some(&check) = s.ecc.get(&key) {
             let syndrome = check ^ ecc_compute(data);
             if syndrome != 0 {
@@ -563,7 +723,7 @@ impl BedrockMd {
                         data ^= 1 << bit;
                         self.memory.raw_write(bank, at, data);
                     }
-                    s.ecc.remove(&key);
+                    s.ecc_lift(key);
                     event.push(MemoryError::Correctable);
                 } else {
                     event.push(MemoryError::Uncorrectable);
@@ -583,17 +743,17 @@ impl BedrockMd {
         if let Some(page) = self.memory.startup_device(address, bytes) {
             return Some(startup_access(page, address, bytes, write));
         }
-        let Some((bank, offset)) = BedrockMemory::decode(s.config, address, bytes) else {
+        let Some((bank, offset)) = self.memory.decode(s.config, address, bytes) else {
             return self.refuse("ram", address);
         };
         if !s.marked_directory.is_empty() {
-            let line = (bank as u64 * FITTED_BANK + offset) / 128;
+            let line = (self.memory.dense_base(bank as u64) + offset) / 128;
             if s.marked_directory.contains(&line) {
                 let premium = s.directory_config & 1 != 0;
                 let word = *s.directory.get(&line).unwrap_or(&0);
                 if write.is_some() {
                     s.directory.insert(line, directory_encode(word, premium));
-                    s.marked_directory.remove(&line);
+                    s.directory_lift(line);
                 } else if s.directory_config & 2 == 0 {
                     let syndrome = directory_syndrome(word, premium);
                     if syndrome != 0 {
@@ -615,7 +775,7 @@ impl BedrockMd {
                         s.directory_error |= valid;
                         if let Some(bit) = bit {
                             s.directory.insert(line, word ^ (1 << bit));
-                            s.marked_directory.remove(&line);
+                            s.directory_lift(line);
                             event.push(MemoryError::Correctable);
                         } else {
                             event.push(MemoryError::Uncorrectable);
@@ -636,7 +796,7 @@ impl BedrockMd {
                 (old & !(mask << shift)) | ((value & mask) << shift),
             );
             if !s.ecc.is_empty() {
-                s.ecc.remove(&((bank as u64 * FITTED_BANK + at) / 8));
+                s.ecc_lift((self.memory.dense_base(bank as u64) + at) / 8);
             }
             Some(0)
         } else {
@@ -698,19 +858,27 @@ impl BedrockMd {
         } else {
             0
         };
-        let fits = selected < 2
-            && field & (1 << (configured & 1)) != 0
+        let fits = field & (1 << (configured & 1)) != 0
             && size != 0
-            && size <= FITTED_BANK;
+            && size <= self.memory.fitted(selected);
         s.selftest_result = fits;
         s.selftest_status = 0;
         s.selftest_error = 0;
         s.selftest_deadline = Some(s.clock_ns.saturating_add(1000));
         if fits && s.storage.get(&0x20038).copied().unwrap_or(0) == 0x80 {
             self.memory.zero(selected as usize, size);
-            let start = selected * FITTED_BANK;
-            s.ecc
-                .retain(|key, _| !(*key >= start / 8 && *key < (start + size) / 8));
+            let start = self.memory.dense_base(selected);
+            let words: Vec<u64> = s
+                .ecc
+                .keys()
+                .copied()
+                .filter(|&key| key >= start / 8 && key < (start + size) / 8)
+                .collect();
+            for key in words {
+                s.ecc_lift(key);
+            }
+            // The pages those marks held can go back to the window now.
+            s.retire_now = true;
             let lines: Vec<u64> = s
                 .marked_directory
                 .iter()
@@ -721,7 +889,7 @@ impl BedrockMd {
                 let word = *s.directory.get(&line).unwrap_or(&0);
                 s.directory
                     .insert(line, directory_encode(word, s.directory_config & 1 != 0));
-                s.marked_directory.remove(&line);
+                s.directory_lift(line);
             }
         }
         Some(0)
@@ -743,11 +911,11 @@ impl BedrockMd {
         let software = at / (BANK_SPAN / 8);
         let within = at % (BANK_SPAN / 8);
         let address = software * BANK_SPAN + within * 8;
-        let Some((bank, offset)) = BedrockMemory::decode(s.config, address, 8) else {
+        let Some((bank, offset)) = self.memory.decode(s.config, address, 8) else {
             return self.refuse("scrub", at);
         };
         for i in 0..8 {
-            if BedrockMemory::decode(s.config, address + i * 8, 8).is_some() {
+            if self.memory.decode(s.config, address + i * 8, 8).is_some() {
                 self.checked_word(s, bank, offset + i * 8, address + i * 8, event);
             }
         }
@@ -760,7 +928,7 @@ impl BedrockMd {
         let software = at / (BANK_SPAN / 8);
         let within = (at % (BANK_SPAN / 8)) ^ if bytes == 1 { 7 } else { 6 };
         let address = software * BANK_SPAN + within * 8;
-        let Some((bank, offset)) = BedrockMemory::decode(s.config, address, bytes * 8) else {
+        let Some((bank, offset)) = self.memory.decode(s.config, address, bytes * 8) else {
             if bytes == 2 && [0x04000006, 0x08000006].contains(&at) {
                 let i = usize::from(at == 0x08000006);
                 let old = s.admitted[i];
@@ -774,15 +942,15 @@ impl BedrockMd {
         let mut old = 0;
         for i in 0..bytes {
             let raw = offset + i * 8;
-            let key = (bank as u64 * FITTED_BANK + raw) / 8;
+            let key = (self.memory.dense_base(bank as u64) + raw) / 8;
             let computed = ecc_compute(self.memory.raw_read(bank, raw));
             old |= (s.ecc.get(&key).copied().unwrap_or(computed) as u64) << (i * 8);
             if let Some(value) = write {
                 let code = (value >> (i * 8)) as u8;
                 if code == computed {
-                    s.ecc.remove(&key);
+                    s.ecc_lift(key);
                 } else {
-                    s.ecc.insert(key, code);
+                    s.ecc_mark(key, code);
                 }
             }
         }
@@ -792,11 +960,13 @@ impl BedrockMd {
 impl Resettable for BedrockMd {
     fn power_on(&self) {
         // Reset is called on the CPU thread or with it stopped.
-        let _remapping = self.remapping.lock();
-        *self.state.lock() = State::default();
-        let was_live = self.memory.startup_live();
-        self.memory.clear_startup();
-        self.memory.remap(0, BTreeSet::new(), was_live);
+        self.stopped(|| {
+            let _remapping = self.remapping.lock();
+            *self.state.lock() = State::default();
+            let was_live = self.memory.startup_live();
+            self.memory.clear_startup();
+            self.memory.remap(0, BTreeSet::new(), was_live);
+        })
     }
 }
 /// Resolve each DMA access through the atomic Physical table, as HEART
@@ -809,7 +979,7 @@ impl DmaView {
         if let Some(page) = self.0.memory.startup_device(address, bytes) {
             return Some(page);
         }
-        BedrockMemory::decode(self.0.memory.config(), address, bytes)?;
+        self.0.memory.decode(self.0.memory.config(), address, bytes)?;
         let phys = self.0.physical();
         let entry = phys.entry_at(address);
         if crate::ppmem::devmap::entry_eq(entry, phys.default_entry()) {
@@ -841,6 +1011,16 @@ impl BusDevice for DmaView {
     dma_rw!(read16, write16, BusRead16, u16);
     dma_rw!(read32, write32, BusRead32, u32);
     dma_rw!(read64, write64, BusRead64, u64);
+    fn cas32(&self, address: u64, old: u32, new: u32) -> Option<bool> {
+        let swapped = self.at(address, 4)?.cas32(address, old, new)?;
+        if swapped { self.0.memory.written(address); }
+        Some(swapped)
+    }
+    fn cas64(&self, address: u64, old: u64, new: u64) -> Option<bool> {
+        let swapped = self.at(address, 8)?.cas64(address, old, new)?;
+        if swapped { self.0.memory.written(address); }
+        Some(swapped)
+    }
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
         self.0.memory.gen_ptr(address)
@@ -997,8 +1177,14 @@ mod tests {
     // writable-masks, selftest-phases, fetchop-operations, ecc-carrier and
     // directory-storage.
     use super::*;
+    use super::super::bedrock_mem::{RETIRED_IDLE_NS, RETIRED_LIMIT};
+    const FUEL_BANKS: [u32; 2] = [256, 256];
+    const FITTED_BANK: u64 = 256 << 20;
+    fn fuel() -> Arc<BedrockMd> {
+        BedrockMd::new(&FUEL_BANKS).unwrap()
+    }
     fn configured() -> Arc<BedrockMd> {
-        let md = BedrockMd::new();
+        let md = fuel();
         assert_eq!(md.md_bus().write64(8, 0x33), BUS_OK);
         md
     }
@@ -1013,7 +1199,7 @@ mod tests {
     /// and leaves memory as it was.
     #[test]
     fn a_valid_tag_for_the_window_starts_a_page_every_path_answers() {
-        let md = BedrockMd::new();
+        let md = fuel();
         let phys = md.physical();
         let (dma, uncached) = (md.dma_view(), md.uncached_view());
         let at = 0x10_0008 + 0x7000;
@@ -1035,11 +1221,48 @@ mod tests {
         assert_eq!(phys.banks()[0].read64(at).data, 0);
     }
 
+    /// Two processors in their cache-as-memory phase at once each keep their
+    /// own stack in the window: a store by one is not seen by the other, as
+    /// each cache holds its own lines (QEMU's per-processor window, a model
+    /// policy). When one ends its window it reaches memory there while the
+    /// other still has its page. A window shared between the processors
+    /// fails the first check; a window ended for both by one processor's
+    /// sweep fails the last.
+    #[test]
+    fn each_processor_keeps_its_own_startup_window() {
+        let md = fuel();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        let at = 0x10_0040;
+        let on = |cpu: u8, work: Box<dyn FnOnce(&BedrockMd) -> u64 + Send>| {
+            let md = md.clone();
+            std::thread::spawn(move || {
+                crate::cpu::smp::set_current_cpu(cpu);
+                work(&md)
+            })
+            .join()
+            .unwrap()
+        };
+        on(0, Box::new(move |md| { md.startup_tag_store(WINDOW_TAGS[0]); md.physical().write64(at, 0xa0); 0 }));
+        on(1, Box::new(move |md| { md.startup_tag_store(WINDOW_TAGS[0]); md.physical().write64(at, 0xb1); 0 }));
+        assert_eq!(on(0, Box::new(move |md| md.physical().read64(at).data)), 0xa0);
+        assert_eq!(on(1, Box::new(move |md| md.physical().read64(at).data)), 0xb1);
+        assert_eq!(md.physical().banks()[0].read64(at).data, 0, "memory is neither page");
+        // CPU 0's final sweep ends its window alone.
+        on(0, Box::new(|md| { md.startup_tag_store(0); 0 }));
+        assert!(md.memory.startup_live(), "CPU 1's still stands");
+        assert_eq!(on(0, Box::new(move |md| { md.physical().write64(at, 0xc0); md.physical().read64(at).data })), 0xc0);
+        assert_eq!(md.physical().banks()[0].read64(at).data, 0xc0, "CPU 0 wrote memory");
+        assert_eq!(on(1, Box::new(move |md| md.physical().read64(at).data)), 0xb1);
+        on(1, Box::new(|md| { md.startup_tag_store(0); 0 }));
+        assert!(!md.memory.startup_live());
+        assert_eq!(on(1, Box::new(move |md| md.physical().read64(at).data)), 0xc0);
+    }
+
     /// Test patterns, a tag outside the window, and a kernel's invalid tags
     /// leave the decode alone; only the window's valid tags start the page.
     #[test]
     fn other_tags_leave_the_window_to_memory() {
-        let md = BedrockMd::new();
+        let md = fuel();
         for tag in [0xffff_ffcf, 0xaaaa_aa8a, 0x5555_5545, 0, 0x108c0, 0xff00c0, 0x1000c0 >> 4] {
             md.startup_tag_store(tag);
             assert!(!md.memory.startup_live(), "{tag:#x}");
@@ -1055,7 +1278,7 @@ mod tests {
     /// first invalid tag of the final sweep.
     #[test]
     fn the_proms_tag_sequence_starts_and_ends_the_page_once() {
-        let md = BedrockMd::new();
+        let md = fuel();
         let phys = md.physical();
         for tag in [0xffff_ffcf, 0xaaaa_aa8a, 0x5555_5545, 0] {
             md.startup_tag_store(tag);
@@ -1263,6 +1486,704 @@ mod tests {
         assert_eq!(dma.gen_ptr(0), pointer, "a disabled bank keeps its logical counter alive");
     }
 
+    /// The Tezro's banks, in MiB from locational bank 0.
+    const TEZRO_BANKS: [u32; 6] = [1024, 1024, 512, 512, 512, 512];
+    /// Banks 0 and 1 at size code 5 (1 GiB), the other four at code 4 (512 MiB).
+    const TEZRO_CONFIG: u64 = 0x53 | (0x43 << 8) | (0x43 << 16);
+    fn tezro() -> Arc<BedrockMd> {
+        let md = BedrockMd::new(&TEZRO_BANKS).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        md
+    }
+
+    /// Each Tezro bank answers in its own 1 GiB slot at its own size: a
+    /// 1 GiB bank fills its slot, a 512 MiB bank stops halfway, and the
+    /// slots above bank 5 answer nothing. Banks 4 and 5 sit above 4 GiB,
+    /// where the CPU's direct window does not reach, and still answer
+    /// through the bus. Follows the qtest memory-banks and
+    /// memory-size-boundaries cases in tests/qtest/sn1-bedrock-md-test.c.
+    #[test]
+    fn every_tezro_bank_answers_at_its_own_size_including_above_4_gib() {
+        use crate::ppmem::MappedMemory;
+        let md = tezro();
+        let bus = md.physical();
+        let sizes = [1024u64, 1024, 512, 512, 512, 512];
+        for (slot, mib) in sizes.iter().enumerate() {
+            let base = slot as u64 * BANK_SPAN;
+            let size = mib << 20;
+            assert_eq!(bus.write64(base, 0x1111 * (slot as u64 + 1)), BUS_OK, "slot {slot}");
+            assert_eq!(bus.write64(base + size - 8, 0xe0 + slot as u64), BUS_OK, "slot {slot} top");
+            if size < BANK_SPAN {
+                assert_eq!(bus.read64(base + size).status, BUS_ERR, "slot {slot} past its bank");
+            }
+        }
+        for slot in 0..6u64 {
+            assert_eq!(bus.read64(slot * BANK_SPAN).data, 0x1111 * (slot + 1), "slot {slot}");
+            let top = (sizes[slot as usize] << 20) - 8;
+            assert_eq!(bus.read64(slot * BANK_SPAN + top).data, 0xe0 + slot, "slot {slot} top");
+        }
+        for slot in [6, 7] {
+            assert_eq!(bus.read64(slot * BANK_SPAN).status, BUS_ERR, "slot {slot} holds no bank");
+        }
+        assert_eq!(bus.banks()[4].read64(0).data, 0x1111 * 5, "bank 4 holds what slot 4 wrote");
+        assert_eq!(bus.banks()[5].read64(0).data, 0x1111 * 6);
+
+        // The window covers the first 4 GiB: 1 GiB, 1 GiB, 512 MiB, 512 MiB.
+        let space = bus.ppmem_space().expect("a window");
+        assert_eq!(space.mapped_bitmap(), 0xffff | (0xffff << 16) | (0xff << 32) | (0xff << 48));
+        assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 4 * BANK_SPAN));
+        assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 5 * BANK_SPAN));
+        assert_eq!(md.dma_view().read64(5 * BANK_SPAN).data, 0x1111 * 6, "DMA reaches it too");
+    }
+
+    /// A processor's SC to a bank above 4 GiB, outside its direct window,
+    /// swaps through the DMA view in one step and leaves a failed compare
+    /// alone; a successful one advances the page's logical counter.
+    #[test]
+    fn a_compare_and_swap_above_4_gib_is_one_step() {
+        let md = tezro();
+        let view = md.dma_view();
+        let at = 5 * BANK_SPAN + 0x40;
+        assert_eq!(view.write64(at, 7), BUS_OK);
+        #[cfg(feature = "jitv2")]
+        let before = unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) };
+        assert_eq!(view.cas64(at, 6, 9), Some(false));
+        assert_eq!(view.read64(at).data, 7);
+        assert_eq!(view.cas64(at, 7, 9), Some(true));
+        assert_eq!(view.read64(at).data, 9);
+        assert_eq!(view.cas32(at + 4, 9, 3), Some(true));
+        assert_eq!(view.read64(at).data, 3);
+        #[cfg(feature = "jitv2")]
+        assert!(unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) } > before);
+        assert_eq!(view.cas64(7 * BANK_SPAN, 0, 1), None, "no bank there");
+    }
+
+    /// Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5
+    /// trade places above 4 GiB. Follows memory-selector-high-bank.
+    #[test]
+    fn the_bank_select_swaps_banks_above_4_gib() {
+        let md = tezro();
+        let bus = md.physical();
+        assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
+        // Banks 0 and 1 swap too: the 1 GiB banks have different sizes only
+        // if the board says so, so give bank 1 a distinct value.
+        assert_eq!(bus.write64(0, 0xaa), BUS_OK);
+        assert_eq!(bus.write64(BANK_SPAN, 0xbb), BUS_OK);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        assert_eq!(bus.read64(0).data, 0xbb);
+        assert_eq!(bus.read64(BANK_SPAN).data, 0xaa);
+    }
+
+    /// A 1 GiB population is wholly inside ppmem's direct window: all 16 of its
+    /// 64 MiB regions are mapped, with none left to the decode table. The 4 GiB
+    /// default maps only what is below 4 GiB, and its banks 4 and 5 answer
+    /// through the table.
+    #[test]
+    fn a_1_gib_population_is_directly_mapped_and_the_default_4_gib_one_is_not_wholly() {
+        use super::super::bedrock_mem::MemoryPopulation;
+        use crate::ppmem::MappedMemory;
+        let md = BedrockMd::new(&MemoryPopulation::one_gib().banks_mib()).unwrap();
+        md.md_bus().write64(reg::CONFIG, 0x43 | (0x43 << 8));
+        let bus = md.physical();
+        let space = bus.ppmem_space().expect("a window");
+        assert_eq!(space.mapped_bitmap(), 0xff | (0xff << 16));
+        assert_eq!(bus.write64(BANK_SPAN + (512 << 20) - 8, 7), BUS_OK);
+        assert_eq!(bus.read64(BANK_SPAN + (512 << 20) - 8).data, 7);
+        assert_eq!(bus.read64(512 << 20).status, BUS_ERR, "bank 0 ends at 512 MiB");
+
+        let md = BedrockMd::new(&MemoryPopulation::default().banks_mib()).unwrap();
+        assert_eq!(MemoryPopulation::default(), MemoryPopulation::four_gib());
+        md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG);
+        let space = md.physical().ppmem_space().expect("a window");
+        assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 4 * BANK_SPAN));
+        assert_eq!(md.physical().write64(4 * BANK_SPAN, 9), BUS_OK, "still reachable");
+    }
+
+    /// Directory and ECC state is keyed per bank, so banks of different sizes
+    /// never share an entry. Follows directory-bank-translation.
+    #[test]
+    fn directory_entries_of_different_sized_banks_stay_apart() {
+        let md = tezro();
+        md.md_bus().write64(reg::DIRECTORY_CONFIG, 2);
+        let dir = md.directory_bus();
+        // Software bank n's carriers start at n * 128 MiB.
+        let at = |bank: u64, offset: u64| bank * (BANK_SPAN / 8) + offset;
+        for bank in 0..6 {
+            assert_eq!(dir.write64(at(bank, 0x20), 0x1000 + bank), BUS_OK, "bank {bank}");
+        }
+        for bank in 0..6 {
+            assert_eq!(dir.read64(at(bank, 0x20)).data, 0x1000 + bank, "bank {bank}");
+        }
+        // A 512 MiB bank's directory ends at its size code's reach.
+        assert_eq!(dir.read64(at(2, 0x20) + (BANK_SPAN / 16)).status, BUS_ERR);
+        assert_eq!(dir.read64(at(6, 0x20)).status, BUS_ERR, "no bank 6");
+    }
+
+    /// A fitting that covers the bank under test zero-fills it, whichever slot
+    /// the bank is in; a bank that is not fitted fails. Follows the
+    /// selftest-bank-remap and origin300-selftest-fill cases.
+    #[test]
+    fn selftest_fills_a_tezro_bank_above_4_gib_and_fails_a_missing_bank() {
+        let md = BedrockMd::new(&TEZRO_BANKS).unwrap();
+        // Every pair at size code 1 (64 MiB): small enough to fill in a test.
+        let regs = md.md_bus();
+        regs.write64(reg::CONFIG, 0x13 | (0x13 << 8) | (0x13 << 16) | (0x13 << 24));
+        let bus = md.physical();
+        bus.write64(4 * BANK_SPAN + 0x40, 0x5555);
+        regs.write64(0x20038, 0x80);
+        regs.write64(0x20030, (4 << 4) | 1);
+        md.advance_ns(1000);
+        assert_eq!(regs.read64(0x20048).data, 3, "bank 4 is fitted");
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x40).data, 0, "and zeroed");
+        regs.write64(0x20030, (6 << 4) | 1);
+        md.advance_ns(1000);
+        assert_eq!(regs.read64(0x20048).data, 2, "bank 6 is not fitted");
+    }
+
+    /// The board names what it fits; nothing else is accepted. A bank is a
+    /// whole number of direct-window regions and at most the largest size
+    /// code names.
+    #[test]
+    fn a_board_may_only_fit_banks_the_controller_can_decode() {
+        assert!(BedrockMd::new(&FUEL_BANKS).is_ok());
+        assert!(BedrockMd::new(&TEZRO_BANKS).is_ok());
+        for banks in [&[][..], &[0, 256], &[2048], &[100], &[64; 9]] {
+            assert!(BedrockMd::new(banks).is_err(), "{banks:?}");
+        }
+    }
+
+    /// Where RAM can be, for a board's cached view: the swizzle permutes slots
+    /// within groups of four, so a slot reaches as far as the largest bank of
+    /// its group.
+    #[test]
+    fn the_ram_extent_reaches_as_far_as_the_largest_bank_of_a_slot_group() {
+        let fuel = RamExtent::new(&FUEL_BANKS);
+        for slot in 0..4 {
+            assert!(fuel.contains(slot * BANK_SPAN + FITTED_BANK - 8), "slot {slot}");
+            assert!(!fuel.contains(slot * BANK_SPAN + FITTED_BANK), "slot {slot}");
+        }
+        assert!(!fuel.contains(4 * BANK_SPAN));
+        let tezro = RamExtent::new(&TEZRO_BANKS);
+        assert!(tezro.contains(3 * BANK_SPAN + BANK_SPAN - 8), "slot 3 may hold a 1 GiB bank");
+        assert!(tezro.contains(5 * BANK_SPAN + (512 << 20) - 8));
+        assert!(!tezro.contains(5 * BANK_SPAN + (512 << 20)));
+        assert!(!tezro.contains(8 * BANK_SPAN));
+        assert_eq!(tezro, BedrockMd::new(&TEZRO_BANKS).unwrap().ram_extent());
+    }
+
+    /// Code pages above 4 GiB have stable logical generation counters like
+    /// the rest, and a write bumps them.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn code_pages_above_4_gib_keep_a_logical_generation() {
+        let md = tezro();
+        let bus = md.physical();
+        let above = 4 * BANK_SPAN + 0x2000;
+        let pointer = md.dma_view().gen_ptr(above);
+        assert!(!pointer.is_null());
+        assert_ne!(pointer, md.dma_view().gen_ptr(5 * BANK_SPAN + 0x2000));
+        assert!(md.dma_view().gen_ptr(8 * BANK_SPAN).is_null(), "past the node's 8 GiB");
+        assert!(md.dma_view().gen_ptr(4 * BANK_SPAN + (512 << 20)).is_null(), "past the largest bank there");
+        let before = unsafe { (*pointer).load(Ordering::Relaxed) };
+        assert_eq!(md.dma_view().write64(above, 1), BUS_OK);
+        assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
+        md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32));
+        assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
+        let _ = bus;
+    }
+
+    /// The ECC carrier byte for the doubleword at `address`, as the guest
+    /// addresses it.
+    fn ecc_carrier(address: u64) -> u64 {
+        address / BANK_SPAN * (BANK_SPAN / 8) + ((address % BANK_SPAN) / 8 ^ 7)
+    }
+
+    /// The cost counters now: host mappings, decode-table rewrites and
+    /// generation counters.
+    fn counted(md: &Arc<BedrockMd>) -> [u64; 3] {
+        md.memory.cost.snapshot()
+    }
+    /// The counters one bumped 4 KiB page, and one whole 64 MiB region, cost:
+    /// the logical counter and the bank's, which only a jitv2 build keeps.
+    const PAGE_BUMPS: u64 = if cfg!(feature = "jitv2") { 2 } else { 0 };
+    const REGION_BUMPS: u64 = PAGE_BUMPS * (64 << 20) / 4096;
+    fn mark(md: &Arc<BedrockMd>, address: u64) {
+        assert_eq!(md.ecc_bus().write8(ecc_carrier(address), 0x13), BUS_OK);
+    }
+    /// A doubleword of zero has a check byte of zero, so writing that lifts
+    /// a mark, and writing 0x13 puts one there.
+    fn lift(md: &Arc<BedrockMd>, address: u64) {
+        assert_eq!(md.ecc_bus().write8(ecc_carrier(address), 0), BUS_OK);
+    }
+    fn spent(md: &Arc<BedrockMd>, work: impl FnOnce()) -> [u64; 3] {
+        let before = counted(md);
+        work();
+        let after = counted(md);
+        [after[0] - before[0], after[1] - before[1], after[2] - before[2]]
+    }
+
+    /// What marking and lifting checked pages costs in host mappings,
+    /// decode-table rewrites and generation counters. Taking a region off the
+    /// direct path and putting it back maps nothing: the pages stay mapped
+    /// and only the bitmap changes. The PROM's memory test
+    /// marks and lifts the same few hundred doublewords thousands of times
+    /// (the QEMU model counted 6630 of each for 310 doublewords, and
+    /// rebuilding the map each time took the test from ten seconds to
+    /// minutes), so what one costs is what the test costs. Counts, not
+    /// seconds, so the test can pin them. Before this was incremental each of
+    /// these was a full rebuild: 15 mappings, 3 or 2 table rewrites and
+    /// 393,216 counters on the Fuel; 95, 7 or 6 and 2,621,440 on the Tezro.
+    ///
+    /// Follows the qtest ecc-lifted-mark-keeps-overlay case in
+    /// tests/qtest/sn1-bedrock-md-test.c (QEMU commit 4f0f6072dc0b), which
+    /// pins the same thing in the flat view: a lifted mark's overlay stays,
+    /// a second mark there is not a map change, and the idle ones go
+    /// together.
+    #[test]
+    fn a_checked_page_costs_a_page_not_a_rebuild() {
+        let (fuel, tezro) = (configured(), tezro());
+        for (md, base, windowed) in [(&fuel, 0, true), (&tezro, 0, true), (&tezro, 4 * BANK_SPAN, false)] {
+            let (first, second) = (base + 0x5000, base + 0x6000);
+            // The first page in a region takes the region off the direct
+            // window and drops code compiled from any of it; the next page
+            // in that region is one more table entry. Above the window there
+            // is no region to take.
+            let cost = spent(md, || mark(md, first));
+            assert_eq!(cost, if windowed { [0, 1, REGION_BUMPS] } else { [0, 1, PAGE_BUMPS] }, "first page at {base:#x}");
+            assert_eq!(spent(md, || mark(md, second)), [0, 1, PAGE_BUMPS], "second page at {base:#x}");
+            // Lifting costs nothing: both pages stay on the MD endpoint.
+            assert_eq!(spent(md, || { lift(md, first); lift(md, second) }), [0, 0, 0], "lifts at {base:#x}");
+            // Marking a lifted page again is not a map change either.
+            assert_eq!(spent(md, || mark(md, first)), [0, 0, 0], "re-mark at {base:#x}");
+            // The retirement returns what is lifted, in one batch, and
+            // leaves the marked page where it is.
+            assert_eq!(spent(md, || md.retire_lifted_marks()), [0, 1, PAGE_BUMPS], "retire at {base:#x}");
+            lift(md, first);
+            // The region comes back to the direct path with no host mapping:
+            // withdrawing it left the pages mapped.
+            assert_eq!(spent(md, || md.retire_lifted_marks()), [0, 1, PAGE_BUMPS], "last retire at {base:#x}");
+        }
+    }
+
+    fn counter(md: &Arc<BedrockMd>, address: u64) -> u64 {
+        #[cfg(feature = "jitv2")]
+        return unsafe { (*md.memory.gen_ptr(address)).load(Ordering::Relaxed) };
+        #[cfg(not(feature = "jitv2"))]
+        { let _ = (md, address); 0 }
+    }
+
+    /// With the controller's clock under the test's hand.
+    fn clocked() -> (Arc<BedrockMd>, Arc<AtomicU64>) {
+        let now = Arc::new(AtomicU64::new(1));
+        let hand = now.clone();
+        let md = BedrockMd::with_clock(&FUEL_BANKS, Arc::new(move || hand.load(Ordering::SeqCst))).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        (md, now)
+    }
+
+    /// Lifting a mark keeps its page on the MD endpoint, which answers as
+    /// the bank would: the lifted doubleword reads and writes plainly, a
+    /// second mark there is checked again, and the page goes back to the bank
+    /// together with the other idle ones, a second after the first was seen
+    /// idle, or at once on reset. Follows the qtest
+    /// ecc-lifted-mark-keeps-overlay case in
+    /// tests/qtest/sn1-bedrock-md-test.c (QEMU commit 4f0f6072dc0b).
+    #[test]
+    fn a_lifted_mark_keeps_its_page_on_the_md_endpoint_until_it_idles() {
+        use crate::ppmem::MappedMemory;
+        let (md, now) = clocked();
+        let (phys, bus) = (md.physical(), md.ecc_bus());
+        let space = phys.ppmem_space().expect("a window");
+        let (address, data) = (0x5000, 0x0123_4567_89ab_cdef);
+        let on_bank = |md: &Arc<BedrockMd>, address| {
+            crate::ppmem::devmap::entry_eq(md.physical().entry_at(address), md.physical().entry_at(0x20_0000))
+        };
+        assert_eq!(phys.write64(address, data), BUS_OK);
+        assert!(on_bank(&md, address));
+        assert_eq!(bus.write8(ecc_carrier(address), ecc_compute(data) ^ ECC_COLUMNS[5]), BUS_OK);
+        assert!(!on_bank(&md, address) && space.mapped_bitmap() & 1 == 0);
+
+        // A write lifts the mark; the page stays on the endpoint and reads as memory.
+        assert_eq!(phys.write64(address, data), BUS_OK);
+        assert!(!on_bank(&md, address) && space.mapped_bitmap() & 1 == 0);
+        assert_eq!(phys.read64(address).data, data);
+        assert_eq!(phys.read32(address + 4).data, data as u32);
+        assert_eq!(phys.write32(address, 0x7654_3210), BUS_OK);
+        assert_eq!(phys.read64(address).data, 0x7654_3210_89ab_cdef);
+        assert_eq!(phys.write64(address, data), BUS_OK);
+        assert_eq!(bus.read8(ecc_carrier(address)).data, ecc_compute(data));
+        assert_eq!(md.md_bus().read64(reg::MEMORY_ERROR).data, 0);
+
+        // Marked again, the same doubleword is checked again.
+        assert_eq!(bus.write8(ecc_carrier(address), ecc_compute(data) ^ ECC_COLUMNS[6]), BUS_OK);
+        assert_eq!(phys.read64(address).data, data ^ (1 << 6));
+        assert_ne!(md.md_bus().read64(reg::MEMORY_ERROR).data & (1 << 52), 0);
+        assert!(md.state.lock().ecc.is_empty(), "the correcting read lifted it");
+
+        // Idling a second retires it, on the next publication after that.
+        let other = |n: u64| 0x1_0000 + n * 0x1000;
+        assert_eq!(phys.write64(other(0), 0), BUS_OK);
+        mark(&md, other(0));
+        now.store(1 + RETIRED_IDLE_NS - 1, Ordering::SeqCst);
+        mark(&md, other(1));
+        assert!(!on_bank(&md, address), "not yet a second");
+        now.store(1 + RETIRED_IDLE_NS, Ordering::SeqCst);
+        mark(&md, other(2));
+        assert!(on_bank(&md, address), "a second");
+        assert_eq!(phys.read64(address).data, data ^ (1 << 6));
+        assert!(!on_bank(&md, other(0)) && !on_bank(&md, other(2)), "the marked pages stay checked");
+
+        // Reset takes a kept page back without waiting.
+        lift(&md, other(0));
+        assert_eq!(phys.write64(other(0), 0), BUS_OK);
+        assert!(!on_bank(&md, other(0)));
+        md.soft_reset();
+        assert!(on_bank(&md, other(0)) && on_bank(&md, other(2)));
+        assert_eq!(space.mapped_bitmap() & 1, 1);
+    }
+
+    /// A page kept after its mark is lifted still checks and rewrites a
+    /// marked directory line in it, as the line's own placement would.
+    /// Follows the qtest ecc-lifted-mark-over-marked-line case in
+    /// tests/qtest/sn1-bedrock-md-test.c (QEMU commit 4f0f6072dc0b).
+    #[test]
+    fn a_kept_page_checks_a_directory_line_marked_after_the_lift() {
+        let md = configured();
+        let phys = md.physical();
+        mark(&md, 0x48);
+        lift(&md, 0x48);
+        md.md_bus().write64(reg::DIRECTORY_CONFIG, 2);
+        let cost = spent(&md, || { md.directory_bus().write64(0, 0x001e0001); });
+        assert_eq!(cost, [0, 0, 0], "the page is already on the endpoint");
+        md.md_bus().write64(reg::DIRECTORY_CONFIG, 0);
+        assert_eq!(phys.read64(0x48).status, BUS_OK);
+        assert_ne!(md.md_bus().read64(reg::DIRECTORY_ERROR).data & (1 << 61), 0, "the read checked the line");
+        // Marked again, a write through the kept page rewrites the entry.
+        md.md_bus().write64(reg::DIRECTORY_CONFIG, 2);
+        md.directory_bus().write64(0, 0x001e0001);
+        assert!(!md.state.lock().marked_directory.is_empty());
+        assert_eq!(phys.write64(0x48, 0x22), BUS_OK);
+        assert!(md.state.lock().marked_directory.is_empty());
+        assert_eq!(phys.read64(0x48).data, 0x22);
+    }
+
+    /// The PROM's memory test marks and lifts the same few hundred
+    /// doublewords over and over; each page is placed once however often.
+    /// The QEMU model counted 6630 placements for 310 doublewords before it
+    /// kept lifted overlays.
+    #[test]
+    fn marking_the_same_pages_over_and_over_places_each_once() {
+        let md = configured();
+        let pages: Vec<u64> = (0..300).map(|i| i * 0x9_0000 + 0x1000).collect();
+        let regions: HashSet<u64> = pages.iter().map(|page| page >> 26).collect();
+        let cost = spent(&md, || {
+            for _ in 0..20 {
+                pages.iter().for_each(|&page| mark(&md, page));
+                pages.iter().for_each(|&page| lift(&md, page));
+            }
+        });
+        let regions = regions.len() as u64;
+        assert_eq!(cost, [0, 300, regions * REGION_BUMPS + (300 - regions) * PAGE_BUMPS]);
+    }
+
+    /// Lifted pages pile up only so far: the first mark after
+    /// `RETIRED_LIMIT` have been lifted returns them all in one batch.
+    #[test]
+    fn many_lifted_pages_are_retired_in_one_batch() {
+        let md = configured();
+        let pages: Vec<u64> = (0..RETIRED_LIMIT as u64).map(|i| 0x1000 * i).collect();
+        pages.iter().for_each(|&page| mark(&md, page));
+        pages.iter().for_each(|&page| lift(&md, page));
+        // One more page, in another region, makes the 1024 lifted pages due.
+        let cost = spent(&md, || mark(&md, 0x400_0000 + 0x1000));
+        let retired = RETIRED_LIMIT as u64;
+        assert_eq!(cost, [0, 1 + retired, REGION_BUMPS + PAGE_BUMPS * retired]);
+        assert!(crate::ppmem::devmap::entry_eq(md.physical().entry_at(0x5000), md.physical().entry_at(0x20_0000)));
+    }
+
+    /// A zero self-test of a bank clears its marks, and so returns the pages
+    /// they held.
+    #[test]
+    fn a_zero_self_test_returns_the_banks_lifted_pages() {
+        use crate::ppmem::MappedMemory;
+        let md = configured();
+        let space = md.physical().ppmem_space().expect("a window");
+        mark(&md, 0x5000);
+        assert_eq!(space.mapped_bitmap() & 1, 0);
+        md.md_bus().write64(0x20038, 0x80);
+        md.md_bus().write64(reg::SELFTEST_COMMAND, 1);
+        assert_eq!(space.mapped_bitmap() & 1, 1);
+        assert!(crate::ppmem::devmap::entry_eq(md.physical().entry_at(0x5000), md.physical().entry_at(0x20_0000)));
+    }
+
+    /// A guard sees only the rebuilds of the whole map: the configuration
+    /// write, a rebuild, resets and a startup-window change. Placing and
+    /// retiring a page, which map and scrub nothing, run without it.
+    #[test]
+    fn only_whole_map_rebuilds_enter_the_remap_guard() {
+        let md = BedrockMd::new(&FUEL_BANKS).unwrap();
+        let entered = Arc::new(AtomicU64::new(0));
+        let seen = entered.clone();
+        md.set_remap_guard(Arc::new(move |work: &mut dyn FnMut()| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            work();
+        }));
+        let entries = || entered.load(Ordering::SeqCst);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        assert_eq!(entries(), 1);
+        mark(&md, 0x5000);
+        lift(&md, 0x5000);
+        md.retire_lifted_marks();
+        assert_eq!(entries(), 1, "marks and retirements are not rebuilds");
+        md.rebuild_memory();
+        md.soft_reset();
+        md.startup_tag_store(WINDOW_TAGS[0]);
+        md.power_on();
+        assert_eq!(entries(), 5);
+        md.startup_tag_store(0xffff_ffcf);
+        assert_eq!(entries(), 5, "a tag that changes nothing stops nobody");
+    }
+
+    /// A page that is marked, or its region's direct path, drops the code
+    /// compiled from it; a page elsewhere keeps its counter, and lifting
+    /// changes nothing until the page is returned.
+    #[test]
+    fn marking_a_page_advances_the_counters_of_what_left_the_direct_path() {
+        let md = configured();
+        let (page, neighbour, elsewhere) = (0x5000, 0x9000, 0x400_0000 + 0x5000);
+        let seen = |md: &Arc<BedrockMd>| [page, neighbour, elsewhere].map(|a| counter(md, a));
+        let start = seen(&md);
+        #[cfg(feature = "jitv2")]
+        let bank = |offset: u64| unsafe { (*md.physical().banks()[0].gen_ptr(offset)).load(Ordering::Relaxed) };
+        #[cfg(feature = "jitv2")]
+        let banks = [page, neighbour, elsewhere].map(bank);
+        mark(&md, page);
+        let marked = seen(&md);
+        let step = |a: [u64; 3], b: [u64; 3]| [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let jit = u64::from(cfg!(feature = "jitv2"));
+        assert_eq!(step(start, marked), [jit, jit, 0], "the page and its region");
+        #[cfg(feature = "jitv2")]
+        {
+            // The bank's own counters follow, as a full remap would bump them.
+            let now = [page, neighbour, elsewhere].map(bank);
+            assert!(now[0] > banks[0] && now[1] > banks[1] && now[2] == banks[2]);
+        }
+        mark(&md, neighbour);
+        assert_eq!(step(marked, seen(&md)), [0, jit, 0], "only the second page");
+        lift(&md, page);
+        lift(&md, neighbour);
+        assert_eq!(step(marked, seen(&md)), [0, jit, 0], "lifting changes nothing");
+        md.retire_lifted_marks();
+        assert_eq!(step(marked, seen(&md)), [jit, 2 * jit, 0], "returning a page advances it");
+    }
+
+    /// A read-only 4 MiB window standing for the reset PROM, whose first
+    /// word reads 0x0f1e2d3c4b5a6978.
+    struct Prom;
+    impl BusDevice for Prom {
+        fn read64(&self, a: u64) -> BusRead64 {
+            if a == 0 { BusRead64::ok(0x0f1e_2d3c_4b5a_6978) } else { BusRead64::ok(0) }
+        }
+        fn write64(&self, _: u64, _: u64) -> u32 { BUS_ERR }
+    }
+
+    /// The Tezro's memory wired as the board wires it: the processor bus with
+    /// uncached RAM views, the cached view, and the reset PROM mapped over the
+    /// cached plane where the bank leaves room.
+    fn board(md: &Arc<BedrockMd>) -> (crate::ip35::Ip35Bus, Arc<dyn BusDevice>) {
+        let mut bus = crate::ip35::Ip35Bus::new(md.physical().clone());
+        #[cfg(feature = "jitv2")]
+        bus.set_ram_generations(md.dma_view());
+        md.rebuild_memory();
+        bus.map(3, 0, 1 << 33, md.uncached_view());
+        bus.map(0, 0, 0x1000_0000, md.uncached_view());
+        bus.map(0, 0x1fc0_0000, 0x40_0000, Arc::new(Prom));
+        crate::ip35::map_device(md.physical(), 0x1fc0_0000, 0x40_0000, Arc::new(Prom), "test reset PROM");
+        let cached = bus.cached_view(md.dma_view(), md.ram_extent());
+        (bus, cached)
+    }
+
+    /// The Tezro's default population, wired and configured as the board does.
+    fn default_tezro() -> (Arc<BedrockMd>, crate::ip35::Ip35Bus, Arc<dyn BusDevice>) {
+        let md = BedrockMd::new(&super::super::bedrock_mem::MemoryPopulation::default().banks_mib()).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        let (bus, cached) = board(&md);
+        (md, bus, cached)
+    }
+    /// Asserts a code page's counter moved, in builds that keep counters.
+    fn assert_advanced(what: &str, before: u64, after: u64) {
+        if cfg!(feature = "jitv2") {
+            assert!(after > before, "{what}: {before} -> {after}");
+        }
+    }
+
+    /// A processor store to banks 4 and 5, above the 4 GiB the direct window
+    /// reaches, goes through the board's cached view or an uncached one into
+    /// the bank behind the slot and advances that slot's logical counter,
+    /// and no other slot's. The JIT page lookup and the cache's own bump read
+    /// the same counter.
+    #[test]
+    fn processor_stores_to_banks_4_and_5_advance_their_slot_counters() {
+        let (md, bus, cached) = default_tezro();
+        let uncached = |address: u64| (3u64 << 57) | address;
+        for (slot, other) in [(4u64, 5u64), (5, 4)] {
+            let at = slot * BANK_SPAN + 0x2000;
+            let elsewhere = counter(&md, other * BANK_SPAN + 0x2000);
+            #[cfg(feature = "jitv2")]
+            {
+                assert_eq!(bus.gen_ptr(at), md.memory.gen_ptr(at));
+                assert_eq!(cached.gen_ptr(at), md.memory.gen_ptr(at));
+                assert_eq!(bus.gen_ptr(uncached(at)), md.memory.gen_ptr(at));
+            }
+            let mut last = counter(&md, at);
+            let mut stored = |what: &str, status: u32| {
+                assert_eq!(status, BUS_OK, "{what}");
+                let now = counter(&md, at);
+                assert_advanced(what, last, now);
+                last = now;
+            };
+            stored("cached store", cached.write64(at, 0x1111));
+            stored("cached block store", cached.write_block(at + 8, &[0x2222, 0x3333]));
+            stored("cached masked store", cached.write64_masked(at + 0x20, 0x4444, 0xff00));
+            stored("cached halfword store", cached.write16(at + 0x30, 0x5555));
+            stored("uncached store", bus.write64(uncached(at + 0x40), 0x6666));
+            stored("uncached byte store", bus.write8(uncached(at + 0x48), 0x77));
+            let bank = &md.physical().banks()[slot as usize];
+            let word = |offset: u64| bank.read64(0x2000 + offset).data;
+            assert_eq!([word(0), word(8), word(0x10), word(0x20), word(0x40)],
+                [0x1111, 0x2222, 0x3333, 0x4400, 0x6666], "slot {slot}");
+            assert_eq!(counter(&md, other * BANK_SPAN + 0x2000), elsewhere, "slot {other} untouched");
+        }
+    }
+
+    /// A checked page above 4 GiB keeps its logical counter honest: marking
+    /// it advances the counter, a store through the page's slow route does
+    /// too, and so does the store once the page is back on its bank.
+    #[test]
+    fn a_checked_page_above_4_gib_advances_its_counter() {
+        let (md, _bus, cached) = default_tezro();
+        let (page, address) = (4 * BANK_SPAN + 0x6000, 4 * BANK_SPAN + 0x6008);
+        let untouched = counter(&md, 4 * BANK_SPAN + 0x8000);
+        let start = counter(&md, page);
+        mark(&md, page);
+        let marked = counter(&md, page);
+        assert_advanced("mark", start, marked);
+        assert!(crate::ppmem::devmap::entry_eq(md.physical().entry_at(address), md.physical().entry_at(page)));
+        assert!(!crate::ppmem::devmap::entry_eq(md.physical().entry_at(page), md.physical().entry_at(page + 0x2000)));
+        assert_eq!(cached.write64(address, 0xaa), BUS_OK);
+        let stored = counter(&md, page);
+        assert_advanced("store to the checked page", marked, stored);
+        lift(&md, page);
+        md.retire_lifted_marks();
+        let retired = counter(&md, page);
+        assert_advanced("retirement", stored, retired);
+        assert_eq!(cached.write64(address, 0xbb), BUS_OK);
+        assert_advanced("store after retirement", retired, counter(&md, page));
+        assert_eq!(md.physical().banks()[4].read64(0x6008).data, 0xbb);
+        assert_eq!(counter(&md, 4 * BANK_SPAN + 0x8000), untouched, "a neighbouring page keeps its counter");
+    }
+
+    /// After a bank swap the slot's counter, which does not move, is the one
+    /// a store advances, whichever bank now sits behind the slot, and the
+    /// slot the bank left is not touched.
+    #[test]
+    fn a_store_after_a_bank_swap_advances_the_counter_of_the_slot_it_reached() {
+        let (md, bus, cached) = default_tezro();
+        let (four, five) = (4 * BANK_SPAN + 0x2000, 5 * BANK_SPAN + 0x2000);
+        #[cfg(feature = "jitv2")]
+        let pointers = (md.memory.gen_ptr(four), md.memory.gen_ptr(five));
+        // Bit 32 swaps the banks of a pair: slot 4 now reaches bank 5.
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        #[cfg(feature = "jitv2")]
+        assert_eq!((md.memory.gen_ptr(four), md.memory.gen_ptr(five)), pointers);
+        let (before_four, before_five) = (counter(&md, four), counter(&md, five));
+        assert_eq!(cached.write64(four, 0x44), BUS_OK);
+        assert_eq!(md.physical().banks()[5].read64(0x2000).data, 0x44, "slot 4 reaches bank 5");
+        assert_eq!(md.physical().banks()[4].read64(0x2000).data, 0);
+        let after_four = counter(&md, four);
+        assert_advanced("cached store to slot 4", before_four, after_four);
+        assert_eq!(counter(&md, five), before_five);
+        assert_eq!(bus.write64((3u64 << 57) | five, 0x55), BUS_OK);
+        assert_eq!(md.physical().banks()[4].read64(0x2000).data, 0x55, "slot 5 reaches bank 4");
+        assert_advanced("uncached store to slot 5", before_five, counter(&md, five));
+        assert_eq!(counter(&md, four), after_four);
+    }
+
+    /// With bank 0 at 1 GiB the RAM extent covers the cached PROM window at
+    /// 0x1fc0_0000, which a Fuel's 256 MiB banks leave to the PROM. Once
+    /// bank 0 is enabled the cached plane, the uncached RAM view and DMA all
+    /// see RAM there, and a cached store lands in it; the PROM answers
+    /// through Hub-special space only. Before bank 0 is enabled nothing is
+    /// RAM, the cached plane shows the PROM and a store is refused.
+    ///
+    /// The QEMU model agrees for those views and differs for one: its reset
+    /// window is routed by cache attribute, and a noncoherent cached access
+    /// (what the stock PROM runs with) keeps seeing the PROM after RAM is
+    /// enabled (hw/mips/sgi/sn1-node.c, sn1_reset_attrs_to_index and
+    /// sn1_node_map_reset, "Compatibility policy"). The cache here passes
+    /// no attribute to the bus, so a noncoherent cached access sees RAM.
+    #[test]
+    fn a_1_gib_bank_0_covers_the_cached_prom_window_with_ram() {
+        let md = BedrockMd::new(&TEZRO_BANKS).unwrap();
+        let (bus, cached) = board(&md);
+        let at = 0x1fc0_0000;
+        let prom = 0x0f1e_2d3c_4b5a_6978;
+        let uncached = (3u64 << 57) | at;
+        assert_eq!(cached.read64(at).data, prom, "before RAM is enabled");
+        assert_eq!(cached.write64(at, 0x55), BUS_ERR);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        assert_eq!(bus.read64(at).data, prom, "Hub-special space still shows the PROM");
+        for (what, value) in [("cached", cached.read64(at).data), ("uncached RAM", bus.read64(uncached).data),
+            ("DMA", md.dma_view().read64(at).data)] {
+            assert_eq!(value, 0, "{what} sees RAM");
+        }
+        assert!(md.physical().mem_ptr(at).is_some(), "the cache fills from RAM too");
+        let before = counter(&md, at);
+        assert_eq!(cached.write64(at, 0x55), BUS_OK);
+        assert_eq!(md.physical().banks()[0].read64(at).data, 0x55);
+        assert_advanced("cached store", before, counter(&md, at));
+        assert_eq!(bus.read64(at).data, prom, "the PROM is not written");
+        // The Fuel's 256 MiB banks never reach it.
+        let fuel = BedrockMd::new(&FUEL_BANKS).unwrap();
+        let (_bus, cached) = board(&fuel);
+        assert_eq!(fuel.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        assert_eq!(cached.read64(at).data, prom);
+        assert_eq!(cached.write64(at, 0x55), BUS_ERR);
+    }
+
+    /// Physical's bulk writers, on a bank directly, advance only that bank's
+    /// counters, which nothing that follows code pages reads on this board.
+    /// The controller's own routes advance the logical ones as well.
+    #[test]
+    fn bulk_memory_writes_through_the_controller_advance_the_logical_counters() {
+        let md = BedrockMd::new(&[64]).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x11), BUS_OK);
+        let phys = md.physical();
+        let at = 0x5000;
+        let logical = counter(&md, at);
+        phys.reset_memory();
+        phys.restore_bank_inmem(0, &[1, 2]);
+        assert_eq!(counter(&md, at), logical, "Physical alone leaves the logical counter");
+        md.reset_memory();
+        let reset = counter(&md, at);
+        assert_advanced("reset", logical, reset);
+        md.restore_bank(0, &[0x0102_0304, 0x0506_0708]);
+        let restored = counter(&md, at);
+        assert_advanced("restore", reset, restored);
+        assert_eq!(phys.read64(0).data, 0x0102_0304_0506_0708);
+        let path = std::env::temp_dir().join(format!("iris-bedrock-load-{}", std::process::id()));
+        std::fs::write(&path, [0, 0, 0, 9, 0, 0, 0, 8]).unwrap();
+        let loaded = md.load_bank(0, &path);
+        std::fs::remove_file(&path).unwrap();
+        loaded.unwrap();
+        assert_advanced("load", restored, counter(&md, at));
+        assert_eq!(phys.read64(0).data, 0x0000_0009_0000_0008);
+    }
+
     /// Guest density settings remap fitted RAM, and reset restores the default map.
     #[test]
     fn bank_configuration_remaps_memory_and_reset_restores_defaults() {
@@ -1450,7 +2371,7 @@ mod tests {
         {
             let now = Arc::new(AtomicU64::new(100));
             let time = now.clone();
-            let md = BedrockMd::with_clock(Arc::new(move || time.load(Ordering::Relaxed)));
+            let md = BedrockMd::with_clock(&FUEL_BANKS, Arc::new(move || time.load(Ordering::Relaxed))).unwrap();
             let regs = md.md_bus();
             regs.write64(8, 0x33);
             md.start_clock();
