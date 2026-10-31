@@ -33,7 +33,10 @@
 //! and data by Index Store Data — is a real hit for later cached loads, stores
 //! and fetches, served from the shadow without a bus access. See [`Staged`].
 //! Nothing else about the shadow reaches the data path: a line the guest never
-//! staged is memory, as before, and ordinary misses never fill or evict.
+//! staged is memory, as before, and ordinary misses never fill or evict. So a
+//! staged line lives until an explicit index or hit operation, an Index Store
+//! Tag or power-on ends it; a guest that reuses the memory without
+//! invalidating reads the stale line, where hardware would have evicted it.
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -437,7 +440,7 @@ impl<
     //   secondary line the secondary data win, not the primary's;
     // - replacement. An ordinary cached miss never fills, so never evicts:
     //   a staged line lives until an index or hit operation, or an Index
-    //   Store Tag, ends it;
+    //   Store Tag, ends it (`clanker/cpu/staged-secondary-cache-lines.md`);
     // - tag ECC and data check bits. Nothing is checked when a line hits, so
     //   a line staged with bad check bits hits without a Cache Error;
     // - the virtual-index field, TagLo[8:7]. A mismatch with the access's
@@ -447,9 +450,14 @@ impl<
     //   operand address as given rather than translating it, as before, so
     //   staging through a mapped address whose virtual and physical index
     //   bits differ lands at the virtual one;
-    // - a store to a staged line does not move its state to DirtyExclusive,
-    //   so a line staged CleanExclusive and then stored to drops the store
-    //   when it is invalidated.
+    // - coherence. Another CPU's or a DMA device's write to memory a CPU
+    //   holds in a staged line does not reach the line, and the line's data
+    //   are not visible to them;
+    // - the part. Only the R10000 is documented. The R12000, R14000 and
+    //   R16000 use the same tag layout and rules here, which is an inference;
+    //   every part keeps only the bits of `R10K_L2_TAG_MASK`;
+    // - undefined encodings. Operations with op[1:0] = 10 (`CACH_SI`) are
+    //   undefined on the R10000 and do nothing.
 
     /// Are there any staged lines? The test every cached access makes.
     #[inline(always)]
@@ -457,10 +465,10 @@ impl<
         Self::R10K_FAMILY && unsafe { (*self.staged.get()).valid } != 0
     }
 
-    /// The data-shadow slot of the doubleword at `pa` in whichever way holds
-    /// it as a valid line, if one does. Same layout as `data_slot`: a way's
+    /// The tag index and data-shadow slot of the doubleword at `pa` in
+    /// whichever way holds it as a valid line, if one does. Same layout as `data_slot`: a way's
     /// doublewords are every `WAYS`-th slot, indexed by `PA[N-2:3]`.
-    fn staged_slot(&self, pa: u64) -> Option<usize> {
+    fn staged_line(&self, pa: u64) -> Option<(usize, usize)> {
         let l2 = unsafe { &*self.l2.get() };
         if l2.data.is_empty() {
             return None;
@@ -470,8 +478,13 @@ impl<
         (0..WAYS).find_map(|way| {
             let tag = l2.tags[set * WAYS + way];
             (l2_tag_valid(tag) && (tag ^ want) & L2_TAG_PA_MASK == 0)
-                .then(|| (((pa as usize) >> 3) % (l2.data.len() / WAYS)) * WAYS + way)
+                .then(|| (set * WAYS + way, (((pa as usize) >> 3) % (l2.data.len() / WAYS)) * WAYS + way))
         })
+    }
+
+    /// The data-shadow slot of the doubleword at `pa`, if a staged line holds it.
+    fn staged_slot(&self, pa: u64) -> Option<usize> {
+        self.staged_line(pa).map(|(_, slot)| slot)
     }
 
     /// A cached load of `SIZE` bytes at `pa` from a staged line, as the
@@ -497,10 +510,17 @@ impl<
     /// `staged_write` for bytes selected by `mask` of the doubleword at `pa`,
     /// `val` already in memory-doubleword position.
     fn staged_write_masked(&self, pa: u64, val: u64, mask: u64) -> bool {
-        let Some(slot) = self.staged_slot(pa) else { return false };
-        let data = unsafe { &mut (*self.l2.get()).data[slot] };
-        let m = (staged_to_memory(*data) & !mask) | (val & mask);
-        *data = staged_to_memory(m);
+        let Some((idx, slot)) = self.staged_line(pa) else { return false };
+        let l2 = unsafe { &mut *self.l2.get() };
+        let m = (staged_to_memory(l2.data[slot]) & !mask) | (val & mask);
+        l2.data[slot] = staged_to_memory(m);
+        // **Inferred.** A store to a CleanExclusive or Shared secondary block
+        // asks the secondary cache to make it DirtyExclusive (NEC
+        // U10278EJ4V0UM p.246, performance counter events 14 and 15). The
+        // manual does not state the transition, so this takes it as
+        // immediate. A later writeback invalidate then sends the stored bytes
+        // to memory instead of dropping them.
+        l2.tags[idx] |= L2_STATE_DIRTY_EXCLUSIVE << L2_STATE_SHIFT;
         true
     }
 
@@ -521,12 +541,13 @@ impl<
         if was {
             let pfn = page(old);
             st.valid -= 1;
-            let n = st.pages.get_mut(&pfn).expect("a valid line's page is indexed");
-            *n -= 1;
-            if *n == 0 {
-                st.pages.remove(&pfn);
-                st.changed = true;
-                decode.set_bus_only(pfn, false);
+            if let Some(n) = st.pages.get_mut(&pfn) {
+                *n -= 1;
+                if *n == 0 {
+                    st.pages.remove(&pfn);
+                    st.changed = true;
+                    decode.set_bus_only(pfn, false);
+                }
             }
         }
         if now {
@@ -561,18 +582,27 @@ impl<
         if !l2_tag_valid(tag) {
             return;
         }
-        if writeback && (tag >> L2_STATE_SHIFT) & 3 == L2_STATE_DIRTY_EXCLUSIVE && !l2.data.is_empty() {
-            let (set, way) = (idx / WAYS, idx % WAYS);
-            let base = self.l2_line_pa(tag, set);
-            let per_way = l2.data.len() / WAYS;
-            for i in 0..(L2_LINE / 8) {
-                let slot = ((set * L2_LINE / 8 + i) % per_way) * WAYS + way;
-                // A bus error on the way out has nowhere to go: the line is
-                // leaving the cache either way.
-                let _ = self.downstream.write64(base + 8 * i as u64, staged_to_memory(l2.data[slot]));
-            }
+        if writeback && (tag >> L2_STATE_SHIFT) & 3 == L2_STATE_DIRTY_EXCLUSIVE {
+            self.l2_write_line_back(idx);
         }
         self.set_l2_tag(idx, tag & !(3 << L2_STATE_SHIFT));
+    }
+
+    /// Send the block at tag slot `idx` to the system interface, doubleword by
+    /// doubleword in memory order, at the address its tag names.
+    fn l2_write_line_back(&self, idx: usize) {
+        let l2 = unsafe { &*self.l2.get() };
+        if l2.data.is_empty() {
+            return;
+        }
+        let (set, way) = (idx / WAYS, idx % WAYS);
+        let base = self.l2_line_pa(l2.tags[idx], set);
+        let per_way = l2.data.len() / WAYS;
+        for i in 0..(L2_LINE / 8) {
+            let slot = ((set * L2_LINE / 8 + i) % per_way) * WAYS + way;
+            // A bus error on the way out has nowhere to go.
+            let _ = self.downstream.write64(base + 8 * i as u64, staged_to_memory(l2.data[slot]));
+        }
     }
 
     /// Hit Invalidate / Hit Writeback Invalidate (S): act on whichever way
@@ -861,6 +891,12 @@ impl<
                 cache_op_name(cache_op));
         }
 
+        // op[1:0] = 10 is not defined for the R10000 (NEC U12754EJ1V0UMJ1
+        // p.16). Do nothing, so it cannot stage or end a line.
+        if Self::R10K_FAMILY && sel == CACH_SI {
+            return 0;
+        }
+
         // R4400/R5000: a tag keeps only its fields, and reads back with
         // generated check bits — exactly what the full model returns.
         if !Self::R10K && matches!(op, C_IST | C_ILT) {
@@ -902,7 +938,7 @@ impl<
                     let set = (idx / WAYS).min(s.mru.len() - 1);
                     s.mru[set] = phys_addr & MRU_BIT != 0;
                     let tag = phys_addr & mask & !MRU_BIT;
-                    if Self::R10K_FAMILY && matches!(sel, CACH_SI | CACH_SD) {
+                    if Self::R10K_FAMILY && sel == CACH_SD {
                         self.set_l2_tag(idx, tag);
                     } else {
                         s.tags[idx] = tag;
@@ -960,16 +996,16 @@ impl<
             // The secondary operations that end a staged line. The other
             // primary ones, and every other cache's, fall through: they move data
             // between a cache and memory, and here those never disagree.
-            C_IWBINV if Self::R10K_FAMILY && matches!(sel, CACH_SI | CACH_SD) => {
+            C_IWBINV if Self::R10K_FAMILY && sel == CACH_SD => {
                 let idx = self.tag_slot(sel, virt_addr);
                 self.l2_invalidate(idx, true);
                 0
             }
-            C_HINV if Self::R10K_FAMILY && matches!(sel, CACH_SI | CACH_SD) => {
+            C_HINV if Self::R10K_FAMILY && sel == CACH_SD => {
                 self.l2_hit_invalidate(phys_addr, false);
                 0
             }
-            C_HWBINV if Self::R10K_FAMILY && matches!(sel, CACH_SI | CACH_SD) => {
+            C_HWBINV if Self::R10K_FAMILY && sel == CACH_SD => {
                 self.l2_hit_invalidate(phys_addr, true);
                 0
             }
@@ -996,11 +1032,95 @@ impl<
         unsafe { (*self.decode.get()).flush() };
     }
 
-    /// A restore replaces RAM wholesale; drop every decoded instruction. The
-    /// shadow arrays are not snapshotted (nothing reads them but diagnostics).
-    fn load_cache_state(&self, _v: &toml::Value) -> Result<(), String> {
+    /// The staged secondary lines, which cached accesses read: tag, MRU bit,
+    /// and the line's doublewords with their check bits. The rest of the shadow
+    /// arrays is for diagnostics, which nothing reads back after a restore, and
+    /// is not saved. Empty when nothing is staged.
+    fn save_cache_state(&self) -> toml::Value {
+        let mut t = toml::value::Table::new();
+        if !self.staged_any() {
+            return toml::Value::Table(t);
+        }
+        let l2 = unsafe { &*self.l2.get() };
+        let per_way = l2.data.len() / WAYS;
+        let u = |v: u64| toml::Value::Array(vec![toml::Value::Integer((v & 0xffff_ffff) as i64), toml::Value::Integer((v >> 32) as i64)]);
+        let mut lines = Vec::new();
+        for (idx, &tag) in l2.tags.iter().enumerate() {
+            if !l2_tag_valid(tag) {
+                continue;
+            }
+            let (set, way) = (idx / WAYS, idx % WAYS);
+            let slots = (0..L2_LINE / 8).map(|i| ((set * L2_LINE / 8 + i) % per_way) * WAYS + way);
+            let mut e = toml::value::Table::new();
+            e.insert("idx".into(), toml::Value::Integer(idx as i64));
+            e.insert("tag".into(), u(tag));
+            e.insert("mru".into(), toml::Value::Boolean(l2.mru[set.min(l2.mru.len() - 1)]));
+            e.insert("data".into(), toml::Value::Array(slots.clone().map(|s| u(l2.data[s])).collect()));
+            e.insert("ecc".into(), toml::Value::Array(slots.map(|s| toml::Value::Integer(l2.ecc[s] as i64)).collect()));
+            lines.push(toml::Value::Table(e));
+        }
+        t.insert("staged_l2".into(), toml::Value::Array(lines));
+        toml::Value::Table(t)
+    }
+
+    /// A restore replaces RAM wholesale: drop every decoded instruction, end
+    /// every staged line and bring back the saved ones.
+    fn load_cache_state(&self, v: &toml::Value) -> Result<(), String> {
+        let l2 = unsafe { &mut *self.l2.get() };
+        if Self::R10K_FAMILY {
+            for idx in 0..l2.tags.len() {
+                if l2_tag_valid(l2.tags[idx]) {
+                    self.set_l2_tag(idx, l2.tags[idx] & !(3 << L2_STATE_SHIFT));
+                }
+            }
+        }
+        let lines = v.get("staged_l2").and_then(|l| l.as_array());
+        let u = |v: &toml::Value| -> Result<u64, String> {
+            let a = v.as_array().filter(|a| a.len() == 2).ok_or("staged line: bad doubleword")?;
+            let w = |x: &toml::Value| x.as_integer().map(|i| i as u64 & 0xffff_ffff).ok_or("staged line: bad word");
+            Ok(w(&a[0])? | w(&a[1])? << 32)
+        };
+        for e in lines.into_iter().flatten().filter(|_| Self::R10K_FAMILY) {
+            let idx = e.get("idx").and_then(|i| i.as_integer()).ok_or("staged line: no index")? as usize;
+            if idx >= l2.tags.len() || l2.data.is_empty() {
+                return Err(format!("staged line index {idx} outside the secondary cache"));
+            }
+            let (set, way) = (idx / WAYS, idx % WAYS);
+            let per_way = l2.data.len() / WAYS;
+            let data = e.get("data").and_then(|d| d.as_array()).ok_or("staged line: no data")?;
+            let ecc = e.get("ecc").and_then(|d| d.as_array()).ok_or("staged line: no check bits")?;
+            if data.len() != L2_LINE / 8 || ecc.len() != data.len() {
+                return Err("staged line: wrong size for this cache".into());
+            }
+            for (i, (d, c)) in data.iter().zip(ecc).enumerate() {
+                let slot = ((set * L2_LINE / 8 + i) % per_way) * WAYS + way;
+                l2.data[slot] = u(d)?;
+                l2.ecc[slot] = c.as_integer().ok_or("staged line: bad check bits")? as u32;
+            }
+            l2.mru[set.min(l2.mru.len() - 1)] = e.get("mru").and_then(|m| m.as_bool()).unwrap_or(false);
+            self.set_l2_tag(idx, u(e.get("tag").ok_or("staged line: no tag")?)?);
+        }
         unsafe { (*self.decode.get()).flush() };
         Ok(())
+    }
+
+    /// Dirty staged lines go to memory, and stay staged.
+    fn writeback_all(&self) {
+        if !self.staged_any() {
+            return;
+        }
+        let l2 = unsafe { &*self.l2.get() };
+        for idx in 0..l2.tags.len() {
+            if l2_tag_valid(l2.tags[idx]) && (l2.tags[idx] >> L2_STATE_SHIFT) & 3 == L2_STATE_DIRTY_EXCLUSIVE {
+                self.l2_write_line_back(idx);
+            }
+        }
+    }
+
+    /// `l2 probe` in the monitor: how many secondary lines are staged.
+    fn debug_probe(&self, _cache_name: &str, _virt_addr: u64, _phys_addr: u64) -> String {
+        let st = unsafe { &*self.staged.get() };
+        format!("staged secondary lines: {} in {} page(s)", st.valid, st.pages.len())
     }
 
     fn get_config(&self, cache_target: u32) -> (usize, usize) {
@@ -1829,6 +1949,146 @@ mod tests {
         assert!(bus.writes.lock().unwrap().is_empty());
         c.write::<4>(operand(PA, 0) + 0x1000, PA + 0x1000, 5);
         assert_eq!(bus.writes.lock().unwrap().len(), 1);
+    }
+
+    /// **Inferred** (NEC U10278EJ4V0UM p.246: a store to a CleanExclusive or
+    /// Shared block requests DirtyExclusive). A store moves the line to
+    /// DirtyExclusive, so invalidating with writeback sends the stored bytes
+    /// to memory instead of dropping them. Hit Invalidate still drops them.
+    #[test]
+    fn a_store_makes_the_line_dirty_and_the_writeback_carries_it() {
+        for state in [1, 2, 3] {
+            let (c, bus) = staged_cache();
+            stage_tag(&c, PA, 0, state);
+            stage_data(&c, PA, 0, 0);
+            c.write::<4>(operand(PA, 0), PA, 0x0123_4567);
+            assert_eq!((c.cache_op(C_ILT | CACH_SD, operand(PA, 0), 0) >> L2_STATE_SHIFT) & 3, 3, "state {state}");
+            c.cache_op(C_IWBINV | CACH_SD, operand(PA, 0), 0);
+            let w = bus.writes.lock().unwrap().clone();
+            assert_eq!(w.len(), 16, "state {state}");
+            assert_eq!(w[0], (PA & !127, 0x0123_4567_0000_0000), "state {state}: the stored word, at the lower address");
+        }
+        let (c, bus) = staged_cache();
+        stage_tag(&c, PA, 0, 2);
+        stage_data(&c, PA, 0, 0);
+        c.write::<4>(operand(PA, 0), PA, 1);
+        c.cache_op(C_HINV | CACH_SD, operand(PA, 0), PA);
+        assert!(bus.writes.lock().unwrap().is_empty(), "Hit Invalidate does not write back");
+        // A load does not dirty a line.
+        let (c, bus) = staged_cache();
+        stage_tag(&c, PA, 0, 2);
+        stage_data(&c, PA, 0, 5);
+        load::<4>(&c, PA);
+        c.cache_op(C_IWBINV | CACH_SD, operand(PA, 0), 0);
+        assert!(bus.writes.lock().unwrap().is_empty());
+    }
+
+    /// op[1:0] = 10 is undefined on the R10000: it neither stages nor ends a line.
+    #[test]
+    fn the_undefined_secondary_instruction_encoding_does_nothing() {
+        let (c, bus) = staged_cache();
+        c.cache_op(C_IST | CACH_SI, operand(PA & !127, 0), l2_tag_of(PA) | 2 << L2_STATE_SHIFT);
+        assert!(!c.page_staged(PA));
+        assert_eq!(load::<8>(&c, PA), MEM);
+        stage_tag(&c, PA, 0, 2);
+        stage_data(&c, PA, 0, 7);
+        c.cache_op(C_IWBINV | CACH_SI, operand(PA, 0), 0);
+        c.cache_op(C_HINV | CACH_SI, operand(PA, 0), PA);
+        c.cache_op(C_HWBINV | CACH_SI, operand(PA, 0), PA);
+        assert_ne!(load::<8>(&c, PA), MEM, "still staged");
+        assert_eq!(bus.reads.load(Ordering::Relaxed), 1);
+    }
+
+    /// The load's VA[13:12] may differ from TagLo[8:7].
+    /// The lookup is physical, so the line hits whatever virtual address is used.
+    #[test]
+    fn a_different_virtual_index_still_hits() {
+        let (c, bus) = staged_cache();
+        c.cache_op(C_IST | CACH_SD, operand(PA & !127, 0), l2_tag_of(PA) | 2 << L2_STATE_SHIFT | 3 << 7);
+        stage_data(&c, PA, 0, 0x1111_2222_3333_4444);
+        for va_bits in [0u64, 0x1000, 0x2000, 0x3000] {
+            let r = c.read::<8>(0xffff_ffff_8000_0000 | (PA & 0xfff) | va_bits, PA);
+            assert_eq!(r.data, 0x3333_4444_1111_2222, "VA[13:12] = {}", va_bits >> 12);
+        }
+        assert_eq!(bus.reads.load(Ordering::Relaxed), 0);
+    }
+
+    /// The same rules at every geometry the family ships: 2 MiB with 128-byte
+    /// lines (Octane, Fuel), 1 MiB with 64-byte lines (O2), 4 MiB (R16000).
+    /// Two lines of one set differ by a way's worth of address.
+    #[test]
+    fn staging_works_at_every_cache_geometry() {
+        use crate::cpu::mips_cache_v2::MipsCache as _;
+        fn check<C: MipsCache + CpuModel + From<Arc<dyn BusDevice>>>(name: &str) {
+            let bus = Arc::new(Bus::default());
+            let c = C::from(bus.clone() as Arc<dyn BusDevice>);
+            let line = C::L2_LINE as u64;
+            let way_bytes = (C::L2_SIZE / 2) as u64;
+            let (a, b) = (0x0020_3000u64 + line, 0x0020_3000u64 + line + way_bytes);
+            let op = |pa: u64, way: u64| 0xffff_ffff_8000_0000 | (pa & 0x1fff_fff8) | way;
+            let tag = |pa: u64, way: u64, state: u64| {
+                c.cache_op(C_IST | CACH_SD, op(pa & !(line - 1), way), l2_tag_of(pa) | state << L2_STATE_SHIFT);
+            };
+            let data = |pa: u64, way: u64, d: u64| { c.cache_op(C_R10K_ISD | CACH_SD, op(pa & !7, way), d); };
+            let load = |pa: u64| c.read::<8>(op(pa, 0), pa).data;
+            tag(a, 0, 2); data(a, 0, 0x0a0a_0a0a_0b0b_0b0b);
+            tag(b, 1, 2); data(b, 1, 0x0c0c_0c0c_0d0d_0d0d);
+            assert_eq!(load(a), 0x0b0b_0b0b_0a0a_0a0a, "{name}: way 0");
+            assert_eq!(load(b), 0x0d0d_0d0d_0c0c_0c0c, "{name}: way 1");
+            assert_eq!(load(a + 8), 0, "{name}: the line's unstaged doubleword");
+            assert_eq!(bus.reads.load(Ordering::Relaxed), 0, "{name}");
+            // Flip each tag address bit above the index. The first one is
+            // the other line's, which is staged in way 1.
+            assert_eq!(load(b), 0x0d0d_0d0d_0c0c_0c0c, "{name}: the other way's line");
+            let index_top = (C::L2_SIZE / 2).trailing_zeros();
+            for bit in (index_top + 1)..36 {
+                assert_eq!(load(a ^ (1 << bit)), MEM, "{name}: PA bit {bit}");
+            }
+            // Dirty write back covers the whole line, at this cache's line size.
+            tag(a, 0, 3);
+            c.cache_op(C_IWBINV | CACH_SD, op(a, 0), 0);
+            let w = bus.writes.lock().unwrap().clone();
+            assert_eq!(w.len() as u64, line / 8, "{name}");
+            assert_eq!(w[0].0, a & !(line - 1), "{name}");
+            assert_eq!(load(a), MEM, "{name}: ended");
+            assert_ne!(load(b), MEM, "{name}: the other way stays");
+        }
+        check::<R10000ShadowCache>("R10000 1 MiB/128");
+        check::<R10000O2ShadowCache>("R10000 O2 1 MiB/64");
+        check::<R12000ShadowCache>("R12000 2 MiB/128");
+        check::<R14000FuelShadowCache>("R14000 2 MiB/128");
+        check::<R16000ShadowCache>("R16000 4 MiB/128");
+    }
+
+    /// A snapshot carries the staged lines, and a restore ends any that were
+    /// staged before it. Dirty lines also reach memory on `writeback_all`.
+    #[test]
+    fn staged_lines_survive_a_snapshot_round_trip() {
+        let (c, _) = staged_cache();
+        assert!(c.save_cache_state().as_table().unwrap().is_empty(), "nothing staged, nothing saved");
+        stage_tag(&c, PA, 1, 3);
+        stage_data(&c, PA + 8, 1, 0x8000_0000_0000_0001);
+        c.cache_op(C_R10K_ISD | CACH_SD, operand(PA + 8, 1), 0x8000_0000_0000_0001);
+        let saved = c.save_cache_state();
+
+        let (d, bus) = staged_cache();
+        stage_tag(&d, PA + 0x4000, 0, 2); // staged before the restore: must go
+        d.load_cache_state(&saved).unwrap();
+        assert_eq!(load::<8>(&d, PA + 8), 0x0000_0001_8000_0000);
+        assert_eq!(load::<8>(&d, PA + 0x4000), MEM);
+        assert!(d.page_staged(PA) && !d.page_staged(PA + 0x4000));
+        assert_eq!(bus.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(d.cache_op(C_ILT | CACH_SD, operand(PA, 1), 0), l2_tag_of(PA) | 3 << L2_STATE_SHIFT);
+
+        d.writeback_all();
+        let w = bus.writes.lock().unwrap().clone();
+        assert_eq!(w.len(), 16);
+        assert_eq!(w[1], (PA & !127 | 8, 0x0000_0001_8000_0000));
+        assert_ne!(load::<8>(&d, PA + 8), MEM, "writeback_all keeps the line");
+
+        let empty = toml::Value::Table(Default::default());
+        d.load_cache_state(&empty).unwrap();
+        assert_eq!(load::<8>(&d, PA + 8), MEM, "restoring a snapshot with no staged lines ends them");
     }
 
     /// Which pages the page-granular fast paths must leave to the cache:
