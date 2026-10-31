@@ -150,6 +150,9 @@ impl TezroPart {
         u64::from(self.firmware().cpu_clock_hz) / 2
     }
 }
+/// How often the poll returns lifted checked pages to the direct window, in
+/// board nanoseconds.
+const RETIRE_INTERVAL_NS: u64 = 100_000_000;
 /// The serial connections: the L1, then IOC4 ports 0 to 3.
 const SERIAL_PORTS: usize = 5;
 
@@ -538,6 +541,8 @@ pub(crate) struct TezroBoard {
     pub part: TezroPart,
     clock: Clock,
     last_clock: AtomicU64,
+    /// When the poll last returned lifted checked pages to the direct window.
+    last_retire: AtomicU64,
     running: AtomicBool,
 }
 
@@ -631,6 +636,7 @@ impl TezroBoard {
             serial,
             part,
             last_clock: AtomicU64::new(clock()),
+            last_retire: AtomicU64::new(clock()),
             clock,
             running: AtomicBool::new(false),
         })
@@ -683,6 +689,13 @@ impl TezroBoard {
             self.node.flash.advance_ns(now.saturating_sub(previous));
             for pi in &self.node.pi {
                 pi.poll();
+            }
+            // Pages whose checked marks were lifted below MD's batch limit
+            // keep their region off the direct window until returned.
+            let retired = self.last_retire.load(Ordering::Acquire);
+            if now.saturating_sub(retired) >= RETIRE_INTERVAL_NS {
+                self.last_retire.store(now, Ordering::Release);
+                self.node.md.retire_lifted_marks();
             }
         }
     }

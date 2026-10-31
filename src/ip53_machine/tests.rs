@@ -179,3 +179,31 @@ fn each_r16000_part_resets_with_its_own_identity_and_clock() {
         }
     }).unwrap().join().unwrap();
 }
+
+/// The poll returns lifted checked pages to the direct window once every
+/// interval of board time while the board runs, not on every batch.
+#[test]
+fn the_poll_retires_lifted_pages_once_an_interval() {
+    use std::sync::atomic::AtomicU64;
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let board = TezroBoard::with_config(TezroBoardConfig {
+        payload: &[],
+        clock: Arc::new(move || clock.load(Ordering::SeqCst)),
+        flash_path: None,
+        station_mac: L1Config::default().mac,
+        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+        memory: &MemoryPopulation::default(),
+        cpus: 1,
+        part: TezroPart::Mhz700,
+    })
+    .unwrap();
+    board.running.store(true, Ordering::SeqCst);
+    now.store(RETIRE_INTERVAL_NS - 1, Ordering::SeqCst);
+    board.poll();
+    assert_eq!(board.last_retire.load(Ordering::SeqCst), 0);
+    now.store(RETIRE_INTERVAL_NS, Ordering::SeqCst);
+    board.poll();
+    assert_eq!(board.last_retire.load(Ordering::SeqCst), RETIRE_INTERVAL_NS);
+    board.running.store(false, Ordering::SeqCst);
+}
