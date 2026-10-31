@@ -27,7 +27,7 @@ pub struct Material {
     pub spec: [f32; SPEC_N],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Light {
     pub ambient: [f32; 3],
@@ -51,7 +51,7 @@ pub struct Light {
 }
 
 /// Lighting and fog state. Plain data, valid when zeroed (see `init`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Lighting {
     pub on: u32,
@@ -79,6 +79,23 @@ pub struct Lighting {
     pub fog_a: f32,
     pub fog_b: f32,
     pub fog_color: [f32; 3],
+}
+
+// All zero, as Lighting's are: `spec` is longer than Default's arrays.
+impl Default for Material {
+    fn default() -> Self {
+        Material {
+            emission: [0.0; 3],
+            ambient: [0.0; 3],
+            diffuse: [0.0; 4],
+            specular: [0.0; 3],
+            shininess: 0.0,
+            spec_table: 0,
+            spec_scale: 0.0,
+            spec_start: 0.0,
+            spec: [0.0; SPEC_N],
+        }
+    }
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {

@@ -1,6 +1,6 @@
 # Odyssey (VPro) public references: two console-level drivers, no GL stream
 
-Status: survey, 2026-10-25. Nothing in IRIS emulates Odyssey yet. This note
+Status: survey, 2026-10-25 (before the model landed; see bringup.md). This note
 records what public code exists for the board so the Octane/Tezro work does
 not re-search it. Verify the repositories before relying on details; the
 T2 pages and patch trees move.

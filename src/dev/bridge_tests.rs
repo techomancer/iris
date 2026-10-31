@@ -272,6 +272,26 @@ fn power_up_registers() {
     assert_eq!(r.get(reg::LINK_CONFIG), LINK_CONFIG_RESET);
 }
 
+/// The identification word's top nibble is the chip's silicon revision. The
+/// 175 MHz Octane reads 3 (an OpenBSD boot prints "Bridge revision 3"); a
+/// measured Octane2's PROM monitor read the word as 0x4c00206d, revision 4.
+/// A reset keeps the board's revision.
+///
+/// QEMU: octane/bridge-identity.
+#[test]
+fn identification_carries_the_boards_revision() {
+    let r = Rig::new();
+    r.bridge.set_revision(3);
+    assert_eq!(r.get(reg::IDENTIFICATION), 0x3c00_206d);
+    r.reset();
+    assert_eq!(r.get(reg::IDENTIFICATION), 0x3c00_206d);
+
+    r.bridge.set_revision(4);
+    assert_eq!(r.get(reg::IDENTIFICATION), 0x4c00_206d);
+    r.reset();
+    assert_eq!(r.get(reg::IDENTIFICATION), 0x4c00_206d);
+}
+
 #[test]
 fn control_strobes_read_zero_and_read_only_registers_ignore_writes() {
     let r = Rig::new();

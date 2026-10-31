@@ -27,6 +27,7 @@ use crate::dev::ioc3::Ioc3;
 use crate::dev::ioc3_eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::mgras::hq4::ImpactXio;
+use crate::dev::odyssey::Odyssey;
 use crate::dev::rad1::Rad1;
 use crate::dev::sflash::{CfiFlash, FLASH_SIZE};
 use crate::dev::w1;
@@ -49,8 +50,40 @@ pub const OCTANE_COUNT_HZ: u64 = 97_500_000;
 /// R10000 revision 2.7, as an Octane's hinv reports it; the raw PRId is
 /// inferred from the R10000 manual's encoding.
 pub const OCTANE_PRID: u32 = 0x0927;
-/// The Crossbow on the Octane reports revision 4.
+/// The Crossbow on the Octane reports revision code 4.
 const XBOW_REVISION: u32 = 4;
+/// The Octane2's Crossbow: revision code 5, which IRIX's inventory names
+/// Crossbow 1.4 (a PROM-monitor read of 0x50000001 beside an inventory of
+/// 1.4 on an Octane2, recorded in jamesbraid/qemu-sgi-origami's
+/// docs/system/mips/sgi/ip30.rst). SGI's VPro upgrade kit (007-4210-003)
+/// requires Crossbow 1.4 for the V10 and V12, so a machine with one of
+/// those presents it.
+const XBOW_REVISION_OCTANE2: u32 = 5;
+/// The Bridge's silicon revision: 3 on the 175 MHz Octane (an OpenBSD boot
+/// there prints "Bridge revision 3"), 4 on the reference Octane2, whose PROM
+/// monitor read the identification word as 0x4c00206d.
+const BRIDGE_REVISION: u32 = 3;
+const BRIDGE_REVISION_OCTANE2: u32 = 4;
+
+/// The PROM revision a VPro board needs (007-4210-003): 4.0 for the V6 and
+/// V8, 4.5 for the V10 and V12.
+fn vpro_prom_needed(board: crate::config::GraphicsBoard) -> (u32, u32) {
+    match board {
+        crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12 => (4, 5),
+        _ => (4, 0),
+    }
+}
+
+/// The PROM's own revision, from its banner ("SGI Version 6.5 Rev 4.9
+/// IP30 ..."), if the image carries one.
+fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
+    let text = String::from_utf8_lossy(prom);
+    let at = text.find(" Rev ")?;
+    let rest = &text[at + 5..];
+    let end = rest.find(" IP30")?;
+    let (major, minor) = rest[..end].split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
@@ -96,8 +129,10 @@ pub struct OctaneMachine {
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
     flash: Arc<CfiFlash>,
-    /// The IMPACT board, unless `[octane] graphics = "none"`.
+    /// The IMPACT board, when `[graphics] board` names one.
     pub gfx: Option<Arc<ImpactXio>>,
+    /// The VPro board, with `[graphics] board = "v6"`, `"v8"`, `"v10"` or `"v12"`.
+    pub vpro: Option<Arc<Odyssey>>,
     nat: Option<(Arc<crate::net::NatControl>, (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr))>,
     /// Guest frames the network backend has processed.
     frames: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -130,11 +165,33 @@ impl OctaneMachine {
             return Err(format!("[machine] cpus = {cpu_count}: IRIX runs an Octane with 1 or 2"));
         }
         let banks = heart_banks(cfg);
-        let board = match cfg.graphics_board() {
+        let kind = cfg.graphics_board();
+        let board = match kind {
             crate::config::GraphicsBoard::None => None,
+            b if b.is_vpro() => None,
             b if b.is_impact() => Some(b),
-            b => return Err(format!("graphics.board \"{}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)", b.as_str())),
+            b => return Err(format!("graphics.board \"{}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)", b.as_str())),
         };
+        let has_vpro = kind.is_vpro();
+        if has_vpro {
+            let needed = vpro_prom_needed(kind);
+            if let Some(found) = prom_revision(&prom) {
+                if found < needed {
+                    eprintln!(
+                        "iris: the {} needs PROM {}.{} or later; {prom_path} is {}.{}",
+                        kind.label(),
+                        needed.0,
+                        needed.1,
+                        found.0,
+                        found.1
+                    );
+                }
+            }
+        }
+        // The Octane2 is the machine that takes a V10 or V12, as the VPro
+        // upgrade kit requires its Crossbow revision.
+        let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12);
+        let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(4);
         let timer_manager = Arc::new(TimerManager::new());
 
@@ -148,14 +205,15 @@ impl OctaneMachine {
         let module = if cpu_count > 1 { "PM20" } else { "PM10" };
         heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", module, 0x5145_4d55_5500));
 
-        let gfx_link = if board.is_some() { 1 << WIDGET_GFX } else { 0 };
-        let xbow = Arc::new(Xbow::new(XBOW_REVISION, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
+        let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
+        let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
         xbow.connect_heart(heart.clone());
 
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
         let bridge = Bridge::new(mem.clone(), heart.clone());
+        bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
         let flash = Arc::new(match &cfg.octane.flash {
@@ -210,7 +268,12 @@ impl OctaneMachine {
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
-        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), heartbeat, fasttick.clone()));
+        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), heartbeat.clone(), fasttick.clone()));
+        let vpro = if has_vpro {
+            Some(Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone(), heartbeat.clone(), fasttick.clone())?)
+        } else {
+            None
+        };
 
         // The bus over them, then the table.
         let phys = Ip30Bus::new(ram.clone());
@@ -222,6 +285,9 @@ impl OctaneMachine {
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);
+        }
+        if let Some(v) = &vpro {
+            phys.attach_widget(WIDGET_GFX, v.clone(), true);
         }
         let phys = Arc::new(phys);
         phys.init();
@@ -266,7 +332,7 @@ impl OctaneMachine {
             "iris: Octane with {} MB ({}), {}",
             banks.iter().sum::<u64>() >> 20,
             banks.iter().filter(|&&b| b != 0).map(|b| format!("{}", b >> 20)).collect::<Vec<_>>().join("+"),
-            board.map_or("no graphics", |b| b.label())
+            if has_vpro { kind.label() } else { board.map_or("no graphics", |b| b.label()) }
         );
 
         let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
@@ -396,6 +462,13 @@ impl OctaneMachine {
             monitor.register_device(g.mgras().clone());
             g.register_locks();
         }
+        if let Some(v) = &vpro {
+            v.set_cpu_cycles(cpu.cycles_ptr());
+            for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
+                v.add_cpu_stats(c.cycles_ptr(), tick.clone());
+            }
+            monitor.register_device(v.clone());
+        }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
         Self::connect_serial(cfg, &ioc3, ci_serial.as_ref());
@@ -427,6 +500,7 @@ impl OctaneMachine {
             rad,
             flash,
             gfx,
+            vpro,
             nat,
             frames,
             scratch_path,
@@ -518,6 +592,9 @@ impl OctaneMachine {
         if let Some(g) = &self.gfx {
             d.push(g.clone());
         }
+        if let Some(v) = &self.vpro {
+            d.push(v.clone());
+        }
         d
     }
 
@@ -574,6 +651,9 @@ impl OctaneMachine {
         self.flash.reset();
         if let Some(g) = &self.gfx {
             g.power_on();
+        }
+        if let Some(v) = &self.vpro {
+            v.power_on();
         }
         Self::sync_links(&self.phys, &self.xbow);
         self.restart_peripherals();
@@ -660,7 +740,10 @@ impl Workstation for OctaneMachine {
         self.lifecycle = state;
     }
     fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        self.gfx.as_ref().map(|g| g.display())
+        match &self.vpro {
+            Some(v) => Some(v.display()),
+            None => self.gfx.as_ref().map(|g| g.display()),
+        }
     }
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
@@ -817,5 +900,21 @@ impl Device for Ip30Monitor {
         }
         let text = self.text(args.first().copied().unwrap_or("unmapped"))?;
         w.write_all(text.as_bytes()).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The VPro fitment check reads the PROM's revision from its banner;
+    /// a board that needs a newer PROM than the image warns.
+    #[test]
+    fn the_prom_banner_gives_its_revision() {
+        let banner = b"\0\0SGI Version 6.5 Rev 4.9 IP30 Jan 20, 2004\0";
+        assert_eq!(prom_revision(banner), Some((4, 9)));
+        assert_eq!(prom_revision(b"no banner here"), None);
+        assert!((4, 3) < vpro_prom_needed(crate::config::GraphicsBoard::V12));
+        assert!((4, 3) >= vpro_prom_needed(crate::config::GraphicsBoard::V6));
     }
 }

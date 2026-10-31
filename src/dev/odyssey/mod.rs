@@ -1,0 +1,447 @@
+//! The SGI VPro (Odyssey) graphics board in the Octane's graphics port.
+//!
+//! The board is a crosstalk widget. The processor stores commands into a
+//! command FIFO; the board decodes them, draws integer and GL primitives
+//! into its own memory, moves pixels to and from guest memory by DMA, and
+//! scans the colour planes out to the display. Four threads reach the
+//! board: the processor's widget accesses; the board's own thread
+//! (worker.rs), BUZZ's front end, which runs the queued command-FIFO stores;
+//! BUZZ's raster unit (raster_unit.rs), which draws what the front end sets
+//! up; and the display thread, the back end, which counts the retrace and
+//! copies the scanout's frame to the window 60 times a second.
+//! interface.rs describes the two locks the first two share.
+//! Interrupt packets go to HEART, the only interrupt target on the Octane:
+//! a packet to widget 8 sets or clears the HEART pending bit of its vector.
+//!
+//! - `board`: the board's state, construction and reset.
+//! - `interface`: the host interface: the registers that do not wait for
+//!   drawing, interrupts and the queue of command stores.
+//! - `mmio`: register accesses, and which of them wait for the drawing.
+//! - `fifo`: the command FIFO between the processor and the board's thread.
+//! - `worker`: the board's thread, which runs the queued stores.
+//! - `raster_unit`: the raster unit's thread and the queue that feeds it.
+//! - `registers`: identity, the board NIC, the cursor and the back end's
+//!   register file.
+//! - `command`: the command-FIFO interpreter.
+//! - `context`: graphics context save and switch.
+//! - `draw`: buffers, integer drawing and the image path.
+//! - `objects`: off-screen objects in board memory.
+//! - `dma`: pixel DMA, queries and fences.
+//! - `pixel_write`: the library's image-write codes and their pixels.
+//! - `gl`, `geometry`: GL fragment state and texturing; the geometry
+//!   program, lighting and the GL primitives.
+//! - `gl_context`: the GL state machine the command stream drives.
+//! - `raster`: the scalar rasteriser's rules, fragment path and draw entry;
+//!   `raster_triangle`, `raster_line`, `raster_pixels`: triangles and
+//!   polygons, lines and points, pixel rectangles, bitmaps, clears and
+//!   raster ops; `raster_texture`: texture sampling; `raster_fixed_texture`:
+//!   the fixed-point fast path for textured triangles; `raster_fill`: the row
+//!   loops filled triangles take, specialised by draw state and planes;
+//!   `raster_bench`: a fill-rate benchmark (tests only).
+//! - `memory`, `scanout`, `reader`, `display`: board memory and planes; the
+//!   marks writers make and the display thread's own reader, with the scanned
+//!   frame and retrace; what reaches the window.
+//! - `pixel_dma`, `pi_gfx`: DMA between guest memory and planes, and graphics
+//!   credits for machines whose processor interface counts them.
+//! - `depth_word`: the board's 24-bit float depth word and its offset.
+//! - `consts`: register, command and field constants.
+//!
+//! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code
+//! (hw/display/sgi/) in jamesbraid/qemu-sgi-origami.
+
+// The rasteriser writes its range tests as !(x > 0.0) and the like so that
+// a NaN fails them.
+#![allow(clippy::neg_cmp_op_on_partial_ord, reason = "a NaN must fail these tests")]
+
+use crate::devlog::LogModule;
+
+pub mod bits;
+pub mod board;
+pub mod command;
+pub mod consts;
+pub mod context;
+pub mod depth_word;
+pub mod display;
+#[cfg(test)]
+mod display_bench;
+pub mod dma;
+pub mod draw;
+pub mod fifo;
+pub mod geometry;
+pub mod gl;
+pub mod gl_context;
+pub mod interface;
+pub mod memory;
+pub mod mmio;
+pub mod objects;
+pub mod pi_gfx;
+pub mod pixel_dma;
+pub mod pixel_write;
+pub mod raster;
+#[cfg(test)]
+pub mod raster_bench;
+pub mod raster_fill;
+pub mod raster_fixed_texture;
+pub mod raster_line;
+pub mod raster_pixels;
+pub mod raster_texture;
+pub mod raster_triangle;
+pub mod raster_unit;
+pub mod reader;
+pub mod registers;
+pub mod scanout;
+pub mod worker;
+#[cfg(test)]
+mod tests;
+
+pub use bits::*;
+pub use board::*;
+pub use command::*;
+pub use consts::*;
+pub use context::*;
+pub use display::*;
+pub use dma::*;
+pub use draw::*;
+pub use fifo::*;
+pub use geometry::*;
+pub use gl::*;
+pub use gl_context::*;
+pub use interface::*;
+pub use memory::*;
+pub use mmio::*;
+pub use objects::*;
+pub use pi_gfx::*;
+pub use pixel_dma::*;
+pub use pixel_write::*;
+pub use raster::*;
+pub use raster_fill::*;
+pub use raster_fixed_texture::*;
+pub use raster_line::*;
+pub use raster_pixels::*;
+pub use raster_texture::*;
+pub use raster_triangle::*;
+pub use raster_unit::*;
+pub use reader::*;
+pub use registers::*;
+pub use scanout::*;
+pub use worker::*;
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use parking_lot::Mutex;
+
+use crate::cpu::mips_core::CyclesPtr;
+use crate::dev::ng1::rex3::Renderer;
+use crate::disp::{Rex3Screen, FB_STRIDE};
+use crate::ip30::{widget_large_base, widget_small_base};
+use crate::irq::InterruptController;
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK};
+
+/// The VPro board on widget `slot`: a `BusDevice` for the widget's
+/// windows.
+pub struct Odyssey {
+    small: u64,
+    large: u64,
+    pub state: BoardLocks,
+    pub display: Arc<Display>,
+    running: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Odyssey {
+    /// A board of `product` (v12, v10, v8, v6) at `widget`: its interrupt
+    /// packets reach `irq` (HEART), its DMA reaches `mem`.
+    pub fn new(
+        widget: u8,
+        product: &str,
+        irq: Arc<dyn InterruptController>,
+        mem: Arc<dyn BusDevice>,
+        heartbeat: Arc<std::sync::atomic::AtomicU64>,
+        fasttick: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Arc<Self>, String> {
+        let mut s = Board::new(product, widget as u32)?;
+        s.guest = Some(mem);
+        s.front.lock().irq = Some(irq);
+        Ok(Arc::new(Self {
+            small: widget_small_base(widget),
+            large: widget_large_base(widget),
+            state: BoardLocks::new(s),
+            display: Arc::new(Display::new(heartbeat, fasttick)),
+            running: Arc::new(AtomicBool::new(false)),
+            thread: Mutex::new(None),
+        }))
+    }
+
+    pub fn display(&self) -> Arc<dyn crate::gfx_display::GfxDisplay> {
+        self.display.clone()
+    }
+
+    pub fn set_cpu_cycles(&self, cycles: CyclesPtr) {
+        *self.display.cycles.lock() = cycles;
+    }
+
+    /// One more CPU for the status bar.
+    pub fn add_cpu_stats(&self, cycles: CyclesPtr, fasttick: Arc<std::sync::atomic::AtomicU64>) {
+        self.display.more_cpus.lock().push((cycles, fasttick));
+    }
+
+    /// The aperture offset of `addr`, in either window.
+    fn offset(&self, addr: u64) -> Option<u64> {
+        let off = if addr >= self.large { addr - self.large } else { addr.wrapping_sub(self.small) };
+        (off < ODSY_APERTURE).then_some(off)
+    }
+
+    fn read(&self, addr: u64, size: u32) -> (u32, u64) {
+        match self.offset(addr) {
+            Some(off) => match self.state.bus_read(off, size) {
+                Some(v) => (BUS_OK, v),
+                None => (BUS_BUSY, 0),
+            },
+            None => (BUS_ERR, 0),
+        }
+    }
+
+    fn write(&self, addr: u64, size: u32, val: u64) -> u32 {
+        match self.offset(addr) {
+            Some(off) => {
+                if self.state.bus_write(off, val, size) {
+                    BUS_OK
+                } else {
+                    BUS_BUSY
+                }
+            }
+            None => BUS_ERR,
+        }
+    }
+
+    /// One display frame: the retrace if it is due, then the dirty lines
+    /// resolved and, if any changed (or a refresh is due), presented. The
+    /// retrace fires either way.
+    fn frame(state: &BoardLocks, display: &Display) {
+        crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
+        let mut reader = display.reader.lock();
+        reader.attach(&state.shared);
+        reader.recycle_last();
+        if display.lockless() {
+            // No lock: the writers mark rows after their stores and the
+            // reader takes the marks before it reads (reader.rs).
+            reader.poll(monotonic_ns());
+            let copy = std::time::Instant::now();
+            reader.stage();
+            reader.stats.locked(std::time::Duration::ZERO, copy.elapsed());
+            let mut job = reader.take();
+            if let Some(job) = &mut job {
+                job.resolve();
+            }
+            let span = job.as_mut().and_then(|job| reader.commit(job));
+            return Self::present_frame(state, display, reader, job, span);
+        }
+        // Locked mode runs the same code with the locks held around it.
+        //
+        // The planes are the raster unit's: wait out its slice in flight and
+        // hold off the next while the frame's lines are copied aside. The
+        // colour rows it wrote since the last frame are resolved again.
+        // The raster unit draws on while the copy is resolved.
+        //
+        // A slice runs up to a millisecond or one long draw, and the front
+        // end and the processor's accesses need the board lock the whole
+        // wait. So a frame that finds a slice running lets the board go,
+        // waits for the slice to end with nothing held, and asks again. Lock
+        // order stays board, then raster context. A raster unit that keeps
+        // starting slices could starve the retries: after FRAME_TRIES a
+        // frame waits for the planes with the board held, as it always did.
+        // Nothing is taken from the board or the planes until both are held,
+        // so no dirty row or swap is lost between tries.
+        let mut tries = 0;
+        let (s, planes, asked, held) = loop {
+            let s = state.board.lock();
+            reader.poll(monotonic_ns());
+            let asked = std::time::Instant::now();
+            if let Some(planes) = state.raster.try_planes() {
+                break (s, planes, asked, std::time::Instant::now());
+            }
+            if tries == FRAME_TRIES {
+                reader.stats.fallbacks += 1;
+                let planes = state.raster.planes();
+                break (s, planes, asked, std::time::Instant::now());
+            }
+            tries += 1;
+            reader.stats.retries += 1;
+            drop(s);
+            state.raster.wait_slice();
+        };
+        crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
+        reader.stage();
+        crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
+        drop(planes);
+        reader.stats.locked(held - asked, held.elapsed());
+        // The copy resolves with no lock held, so neither the front end
+        // nor the raster unit waits for it.
+        let mut job = reader.take();
+        drop(s);
+        if let Some(job) = &mut job {
+            job.resolve();
+        }
+        let s = state.board.lock();
+        let span = job.as_mut().and_then(|job| reader.commit(job));
+        drop(s);
+        Self::present_frame(state, display, reader, job, span);
+    }
+
+    /// The end of a frame: hand the committed lines to the window.
+    fn present_frame(state: &BoardLocks, display: &Display, mut reader: parking_lot::MutexGuard<'_, ScanoutReader>, job: Option<ScanoutJob>, span: Option<(usize, usize)>) {
+        let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
+        if w == 0 || h == 0 || reader.frame.len() < w * h {
+            reader.keep(job);
+            crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
+            return;
+        }
+        // A new size has nothing valid on the screen yet: take every line.
+        let new_size = display.shown() != (w, h);
+        if !display.due(new_size || span.is_some()) {
+            reader.keep(job);
+            crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
+            return;
+        }
+        // Only a new size copies the frame whole; otherwise the committed
+        // lines are converted from the update's own rows.
+        let whole = new_size.then(|| reader.frame[..w * h].to_vec());
+        set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
+        crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
+        crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
+        match (&whole, &job) {
+            (Some(rows), _) => display.present(rows, w, h, 0),
+            (None, Some(job)) => display.present_lines(job.lines(), w, h),
+            (None, None) => display.present(&[], w, h, 0),
+        }
+        crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
+        reader.keep(job);
+    }
+}
+
+impl BusDevice for Odyssey {
+    fn read8(&self, addr: u64) -> BusRead8 {
+        let (status, data) = self.read(addr, 1);
+        BusRead8 { status, data: data as u8 }
+    }
+    fn read16(&self, addr: u64) -> BusRead16 {
+        let (status, data) = self.read(addr, 2);
+        BusRead16 { status, data: data as u16 }
+    }
+    fn read32(&self, addr: u64) -> BusRead32 {
+        let (status, data) = self.read(addr, 4);
+        BusRead32 { status, data: data as u32 }
+    }
+    fn read64(&self, addr: u64) -> BusRead64 {
+        let (status, data) = self.read(addr, 8);
+        BusRead64 { status, data }
+    }
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        self.write(addr, 1, val as u64)
+    }
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        self.write(addr, 2, val as u64)
+    }
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        self.write(addr, 4, val as u64)
+    }
+    fn write64(&self, addr: u64, val: u64) -> u32 {
+        self.write(addr, 8, val)
+    }
+}
+
+/// How many times a frame lets the board lock go to wait for a raster slice
+/// before it waits with the lock held.
+const FRAME_TRIES: u32 = 3;
+
+/// The display thread's frame period: the modelled mode's 60 Hz.
+const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_micros(16_667);
+
+impl Device for Odyssey {
+    fn step(&self, _cycles: u64) {}
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("vpro".to_string(), "VPro counters: vpro refusals [reset] (bus refusals by reason and register), vpro dirty [reset] (display)".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "vpro" {
+            return Err(format!("unknown command: {cmd}"));
+        }
+        match args {
+            ["refusals"] => self.state.refusals.report(&mut *w).map_err(|e| e.to_string()),
+            ["refusals", "reset"] => {
+                self.state.refusals.reset();
+                Ok(())
+            }
+            ["dirty"] => self.display.reader.lock().stats.report(&self.state.shared.marks, &mut *w).map_err(|e| e.to_string()),
+            ["dirty", "reset"] => {
+                self.display.reader.lock().stats = DirtyStats::default();
+                self.state.shared.marks.reset_sites();
+                Ok(())
+            }
+            _ => Err("Usage: vpro refusals [reset] | vpro dirty [reset]".to_string()),
+        }
+    }
+
+    fn start(&self) {
+        let mut t = self.thread.lock();
+        if t.is_some() {
+            return;
+        }
+        self.state.work_start();
+        self.running.store(true, Ordering::Release);
+        let (state, display, running) = (self.state.clone(), self.display.clone(), self.running.clone());
+        *t = Some(
+            std::thread::Builder::new()
+                .name("odyssey-display".into())
+                .spawn(move || {
+                    let mut next = std::time::Instant::now();
+                    while running.load(Ordering::Acquire) {
+                        Odyssey::frame(&state, &display);
+                        next += FRAME_PERIOD;
+                        let now = std::time::Instant::now();
+                        if next > now {
+                            std::thread::sleep(next - now);
+                        } else {
+                            next = now;
+                        }
+                    }
+                    display.stop();
+                })
+                .expect("odyssey display thread"),
+        );
+    }
+
+    fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(t) = self.thread.lock().take() {
+            let _ = t.join();
+        }
+        self.state.work_stop();
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    fn get_clock(&self) -> u64 {
+        0
+    }
+}
+
+impl Drop for Odyssey {
+    fn drop(&mut self) {
+        // The work thread holds a clone of the state's handles; stop it
+        // so the state can go.
+        Device::stop(self);
+    }
+}
+
+impl Resettable for Odyssey {
+    fn power_on(&self) {
+        self.state.board.lock().reset();
+    }
+}

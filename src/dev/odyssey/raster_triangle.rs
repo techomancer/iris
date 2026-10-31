@@ -1,0 +1,1582 @@
+//! Triangles and polygons: clipping against the view volume and the user
+//! clip planes, the texture-coordinate planes across a triangle, edge
+//! walking and spans, antialiased polygon coverage, and polygon modes.
+//!
+//! Ported from hw/display/sgi/rasterizer.c in jamesbraid/qemu-sgi-origami.
+
+use super::*;
+
+/// The six planes of the view volume (OpenGL 1.2.1, 2.11), -w <= x, y,
+/// z <= w, as each one's value at a point, which is >= 0 inside it.
+pub const SGI_VOLUME_PLANES: i32 = 6;
+
+impl VolumeVertex {
+    pub fn plane(&self, plane: i32) -> f64 {
+        let c = self.clip[(plane / 2) as usize];
+
+        if plane & 1 != 0 { self.clip[3] - c } else { self.clip[3] + c }
+    }
+
+    pub fn contains(&self) -> bool {
+        for i in 0..SGI_VOLUME_PLANES {
+            if !(self.plane(i) >= 0.0) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The point at t along from in to out, in clip and eye coordinates and
+    /// every float attribute (2.13.8); the material index and edge flag are
+    /// bit patterns and stay in's.
+    pub fn lerp(&self, out: &VolumeVertex, t: f64, r: &mut VolumeVertex) {
+        for k in 0..4usize {
+            r.clip[k] = self.clip[k] + t * (out.clip[k] - self.clip[k]);
+            r.eye[k] = self.eye[k] + t * (out.eye[k] - self.eye[k]);
+        }
+        for k in 0..SGI_GL_VERTEX_FLOATS {
+            r.attr[k] = if k == SGI_GL_V_MATERIAL || k == SGI_GL_V_EDGE {
+                self.attr[k]
+            } else {
+                (self.attr[k] as f64 + t * (out.attr[k] - self.attr[k]) as f64) as f32
+            };
+        }
+    }
+
+    /// Where the edge from in, inside a plane with value din, to out, outside
+    /// it with value dout, meets the plane. It is always found from the inside
+    /// end, so that two primitives sharing the edge make the same vertex.
+    pub fn cut(&self, din: f64, out: &VolumeVertex, dout: f64, r: &mut VolumeVertex) {
+        self.lerp(out, din / (din - dout), r);
+    }
+}
+
+/// Sutherland and Hodgman's clipping, one plane at a time: each edge
+/// keeps its inside end and adds the point where it crosses the plane.
+/// A value that is not a number is outside.
+pub fn volume_clip_triangle(in_: &[VolumeVertex; 3], out: &mut [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX]) -> u32 {
+    out[..3].clone_from_slice(in_);
+    if in_[0].contains() && in_[1].contains() && in_[2].contains() {
+        return 3;
+    }
+    // Only a triangle that crosses a plane needs the working polygons.
+    let mut src: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = std::array::from_fn(|_| VolumeVertex::default());
+    let mut dst: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = std::array::from_fn(|_| VolumeVertex::default());
+    let mut n: usize = 3;
+
+    src[..3].clone_from_slice(in_);
+    for p in 0..SGI_VOLUME_PLANES {
+        let mut m: usize = 0;
+
+        for i in 0..n {
+            let a = &src[i];
+            let b = &src[(i + 1) % n];
+            let da = a.plane(p);
+            let db = b.plane(p);
+
+            if da >= 0.0 {
+                dst[m] = a.clone();
+                m += 1;
+                if !(db >= 0.0) {
+                    let mut c = VolumeVertex::default();
+                    a.cut(da, b, db, &mut c);
+                    dst[m] = c;
+                    m += 1;
+                }
+            } else if db >= 0.0 {
+                let mut c = VolumeVertex::default();
+                b.cut(db, a, da, &mut c);
+                dst[m] = c;
+                m += 1;
+            }
+        }
+        n = m;
+        std::mem::swap(&mut src, &mut dst);
+        if n < 3 {
+            return 0;
+        }
+    }
+    out[..n].clone_from_slice(&src[..n]);
+    n as u32
+}
+
+impl VolumeVertex {
+    /// Liang and Barsky's clipping: the segment keeps the part every plane
+    /// allows. Each end that a plane bounds moves to where the segment meets
+    /// that plane, found from the other end, inside it, as a triangle's cut
+    /// is: a fraction sa of the way from b to a, and tb from a to b.
+    pub fn clip_segment(&mut self, b: &mut VolumeVertex) -> bool {
+        let mut na = self.clone();
+        let mut nb = b.clone();
+        let mut sa = 1.0f64;
+        let mut tb = 1.0f64;
+
+        for p in 0..SGI_VOLUME_PLANES {
+            let da = self.plane(p);
+            let db = b.plane(p);
+
+            if da >= 0.0 && db >= 0.0 {
+                continue;
+            }
+            if !(da >= 0.0) && !(db >= 0.0) {
+                return false;
+            }
+            if da >= 0.0 {
+                tb = fmin(tb, da / (da - db));
+            } else {
+                sa = fmin(sa, db / (db - da));
+            }
+        }
+        if !(sa + tb >= 1.0) {
+            return false;
+        }
+        if sa < 1.0 {
+            b.lerp(self, sa, &mut na);
+        }
+        if tb < 1.0 {
+            self.lerp(b, tb, &mut nb);
+        }
+        *self = na;
+        *b = nb;
+        true
+    }
+}
+
+impl GlDrawState {
+    /// One vertex to clip coordinates (OpenGL 1.2.1, 2.10): object to eye by
+    /// the modelview and eye to clip by the projection, or by the window
+    /// matrix as GlDrawState::eye_to_clip() takes it.
+    pub fn volume_from_draw_vertex(&self, v: &[f32], out: &mut VolumeVertex) {
+        for row in 0..4usize {
+            out.eye[row] = 0.0;
+            for k in 0..4usize {
+                out.eye[row] += self.modelview[k * 4 + row] as f64 * v[SGI_GL_V_POSITION + k] as f64;
+            }
+        }
+        self.eye_to_clip(&out.eye, &mut out.clip);
+        out.attr.copy_from_slice(&v[..SGI_GL_VERTEX_FLOATS]);
+    }
+}
+
+impl SoftVertex {
+    pub fn texture_values(&self, volume: bool, one_dimensional: bool, value: &mut [f64; 4]) {
+        value[0] = self.texcoord[0] * self.inv_w;
+        value[1] = if one_dimensional { 0.0 } else { self.texcoord[1] * self.inv_w };
+        value[2] = self.texcoord[3] * self.inv_w;
+        value[3] = if volume { self.texcoord[2] * self.inv_w } else { 0.0 };
+    }
+}
+
+pub fn soft_texture_plane(v: &[SoftVertex], sub: u32, volume: bool, one_dimensional: bool, g: &mut SoftTexPlane) -> bool {
+    let scale = (1i32 << sub) as f64;
+    let x1 = (v[1].x - v[0].x) as f64 / scale;
+    let y1 = (v[1].y - v[0].y) as f64 / scale;
+    let x2 = (v[2].x - v[0].x) as f64 / scale;
+    let y2 = (v[2].y - v[0].y) as f64 / scale;
+    let area = x1 * y2 - x2 * y1;
+    let mut values = [[0.0f64; 4]; 3];
+
+    *g = SoftTexPlane { x: v[0].x as f64 / scale, y: v[0].y as f64 / scale, ..Default::default() };
+    if area == 0.0 {
+        return true;
+    }
+    if !area.is_finite() {
+        return false;
+    }
+    for i in 0..3 {
+        v[i].texture_values(volume, one_dimensional, &mut values[i]);
+    }
+    for k in 0..4 {
+        let a = values[1][k] - values[0][k];
+        let b = values[2][k] - values[0][k];
+
+        g.value[k] = values[0][k];
+        g.dx[k] = (a * y2 - b * y1) / area;
+        g.dy[k] = (b * x1 - a * x2) / area;
+        if !g.value[k].is_finite() || !g.dx[k].is_finite() || !g.dy[k].is_finite() {
+            return false;
+        }
+    }
+    true
+}
+
+impl SoftDraw<'_> {
+    pub fn texture_coefficients(&self, v: &[SoftVertex]) -> bool {
+        let mut g = SoftTexPlane::default();
+
+        if self.texture_base.is_none()
+            || soft_texture_plane(v, self.rules.subpixel_bits as u32, self.image().volume, self.image().one_dimensional, &mut g)
+        {
+            return true;
+        }
+        self.texture_report(16, "invalid primitive coefficients, primitive dropped");
+        false
+    }
+
+    /// Map and rasterize one triangle of a clipped polygon, given its three
+    /// vertices in the view volume and, for flat shading, the provoking vertex
+    /// of the triangle it was clipped from.
+    pub fn clipped_triangle(&self, va: &VolumeVertex, vb: &VolumeVertex, vc: &VolumeVertex, provoking: &[f32]) {
+        let st = self.st;
+        let verts: [&VolumeVertex; 3] = [va, vb, vc];
+        let mut flat = &provoking[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4];
+        let mut flat_index = provoking[SGI_GL_V_INDEX];
+        let mut flat_frag = SoftFrag::default();
+        let mut v: [SoftVertex; 3] = Default::default();
+        let mut gradient = SoftTexPlane::default();
+        // The footprint's per-axis scales, and its value where Q/W is flat.
+        let mut tex_ns = 0.0f64;
+        let mut tex_nt = 0.0f64;
+        let mut tex_nr = 0.0f64;
+        let mut flat_rho = f64::NAN;
+        let mut flat_q = false;
+        let mut flat_ok = false;
+        // Fragments sample in fixed point, and their lambda where it is flat.
+        let mut fixed_flat: Option<i32> = None;
+        // The row loop for textured fragments, and its inputs.
+        let mut span: Option<(FillRow, SoftTexSpan)> = None;
+        let mut area: i64;
+        let smooth = st.shade_model != SGI_GL_FLAT;
+        let sub = self.rules.subpixel_bits as i32;
+
+        for i in 0..3 {
+            let Some(p) = self.project(verts[i]) else {
+                return;
+            };
+            v[i] = p;
+        }
+
+        area = v[0].edge(&v[1], v[2].x, v[2].y);
+        if area == 0 {
+            return;
+        }
+        if self.texture_base.is_some()
+            && !soft_texture_plane(&v, sub as u32, self.image().volume, self.image().one_dimensional, &mut gradient)
+        {
+            self.texture_report(16, "invalid primitive coefficients, primitive dropped");
+            return;
+        }
+        // An image with no pyramid has no planes to fail: it samples in double.
+        let fixed: bool = self.fixed.is_some()
+            && (self.texture_base.is_some() || soft_texture_plane(&v, sub as u32, false, false, &mut gradient));
+        if self.texture_base.is_some() {
+            tex_ns = self.base_level().width as f64 * soft_texture_lod_scale(self.image().lod_scale_s);
+            tex_nt = if self.image().one_dimensional {
+                0.0
+            } else {
+                self.base_level().height as f64 * soft_texture_lod_scale(self.image().lod_scale_t)
+            };
+            tex_nr = if self.image().volume {
+                self.base_level().depth as f64 * soft_texture_lod_scale(self.image().lod_scale_r)
+            } else {
+                0.0
+            };
+            // With Q/W the same at every vertex the footprint is one number:
+            // the same for every quad under the diagonal rule
+            // (soft_quad_flat_rho()), and for every fragment of a volume.
+            flat_q = gradient.dx[2] == 0.0 && gradient.dy[2] == 0.0;
+            if flat_q && !self.image().volume {
+                (flat_ok, flat_rho) = match soft_quad_flat_rho(&gradient, tex_ns, tex_nt) {
+                    Some(rho) => (true, rho),
+                    None => (false, f64::NAN),
+                };
+            } else if flat_q {
+                let value = [0.0, 0.0, gradient.value[2], 0.0];
+                let mut out = [0.0f64; 5];
+
+                flat_ok = soft_texture_derivatives(&value, &gradient.dx, &gradient.dy, tex_ns, tex_nt, tex_nr, &mut out);
+                flat_rho = out[4];
+            }
+        }
+        if fixed && self.fixed_tex().lod && flat_q && flat_ok {
+            // Every quad's lambda is this one, which SoftFixedTex::quad_lambda()
+            // would take from each quad's footprint.
+            fixed_flat = self.fixed_tex().quad_lambda(flat_rho);
+        }
+        let ccw: bool = if st.window_matrix_given != 0 && st.window_rows_down != 0 { area < 0 } else { area > 0 };
+        let front: bool = if st.front_face == SGI_GL_CW { !ccw } else { ccw };
+        if st.cull_face != 0
+            && (st.cull_face_mode == SGI_GL_FRONT_AND_BACK
+                || st.cull_face_mode == (if front { SGI_GL_FRONT } else { SGI_GL_BACK }))
+        {
+            return;
+        }
+        if !front && self.back_colors {
+            flat = &provoking[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4];
+            flat_index = provoking[SGI_GL_V_BACK_INDEX];
+            for i in 0..3 {
+                let back = &verts[i].attr[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4];
+
+                for k in 0..4 {
+                    // max then min, not clamp: a NaN colour becomes 0.
+                    #[allow(clippy::manual_clamp, reason = "clamp would keep a NaN")]
+                    let c = back[k].max(0.0).min(1.0);
+                    v[i].rgba[k] = c as f64;
+                }
+                v[i].index = verts[i].attr[SGI_GL_V_BACK_INDEX] as f64;
+            }
+        }
+        for k in 0..4 {
+            flat_frag.rgba[k] = flat[k] as f64;
+        }
+        flat_frag.index = flat_index as f64;
+        flat_frag.fixed = false;
+        let offset: f64 = self.offset(&v);
+        if area < 0 {
+            // Rasterize either winding the same way from here.
+            v.swap(1, 2);
+            area = -area;
+        }
+
+        let min_x = v[0].x.min(v[1].x.min(v[2].x)) >> sub;
+        let max_x = v[0].x.max(v[1].x.max(v[2].x)) >> sub;
+        let min_y = v[0].y.min(v[1].y.min(v[2].y)) >> sub;
+        let max_y = v[0].y.max(v[1].y.max(v[2].y)) >> sub;
+
+        // Window pixels, bounded by the viewport and the owned rectangle.
+        let Some((mut px0, mut py0, mut px1, mut py1)) = self.bounds() else {
+            return;
+        };
+        px0 = (min_x as i32).max(px0);
+        px1 = (max_x as i32).min(px1);
+        py0 = (min_y as i32).max(py0);
+        py1 = (max_y as i32).min(py1);
+
+        // Each edge function is linear in x, so across a row it steps by an
+        // exact integer; solving for the ends of each edge's run of owned
+        // centres visits only the pixels a test of every centre would keep.
+        let step0: i64 = -(v[2].y - v[1].y) * (1i64 << sub);
+        let step1: i64 = -(v[0].y - v[2].y) * (1i64 << sub);
+        let step2: i64 = -(v[1].y - v[0].y) * (1i64 << sub);
+        // The row loop: the fixed sampler's for a textured triangle,
+        // SoftDraw::fill_select()'s for an untextured one.
+        let row_loop = if fixed {
+            self.fixed.and_then(|f| f.span)
+        } else if self.texture.is_none() {
+            self.fill
+        } else {
+            None
+        };
+        if let Some(row_loop) = row_loop {
+            let mut sp = SoftTexSpan {
+                v: &v,
+                g: &gradient,
+                flat_lambda: fixed_flat,
+                flat: &flat_frag,
+                offset,
+                area,
+                step1,
+                step2,
+                smooth,
+                constant: 0,
+            };
+            for k in 0..4 {
+                let c = v[0].rgba[k];
+
+                if (c == 0.0 || c == 1.0) && v[1].rgba[k] == c && v[2].rgba[k] == c {
+                    sp.constant |= 1u8 << k;
+                }
+            }
+            span = Some((row_loop, sp));
+        }
+        // The quad's footprint under the diagonal rule, for a 1D or 2D
+        // texture whose Q/W varies (soft_quad_rho()); a flat Q/W has one for
+        // every quad, and a volume's fragments take their own.
+        let quad_lod = self.texture_base.is_some() && !self.image().volume && !flat_q;
+        let quad_rho = |qx: i32, qy: i32| -> Option<f64> {
+            if quad_lod { soft_quad_rho(&gradient, tex_ns, tex_nt, qx, qy) } else { None }
+        };
+        // One fragment through the general path, with its quad's footprint
+        // rho: every fragment a quad loop does not draw, and every fragment
+        // of a triangle with none.
+        let general = |px: i32, py: i32, e1: i64, e2: i64, rho: Option<f64>| {
+            let mut background = false;
+            let mut tex_row = [0.0f64; 4];
+
+            // Window phase precedes plane translation and fragment work.
+            if !self.stipple_pass(px, py, &mut background) {
+                return;
+            }
+            if self.texture_base.is_some() || fixed {
+                for k in 0..4 {
+                    tex_row[k] = (py as f64 + 0.5 - gradient.y) * gradient.dy[k];
+                }
+            }
+            let mut frag = flat_frag;
+            let b1 = e1 as f64 / area as f64;
+            let b2 = e2 as f64 / area as f64;
+            let z = v[0].z + b1 * (v[1].z - v[0].z) + b2 * (v[2].z - v[0].z);
+            let w0 = (1.0 - b1 - b2) * v[0].inv_w;
+            let w1 = b1 * v[1].inv_w;
+            let w2 = b2 * v[2].inv_w;
+            let sum = w0 + w1 + w2;
+            let depth_w = (1.0 - b1 - b2) * v[0].depth_w + b1 * v[1].depth_w + b2 * v[2].depth_w;
+            if fixed && span.is_none() {
+                let lambda = if !self.fixed_tex().lod {
+                    None
+                } else if fixed_flat.is_some() {
+                    fixed_flat
+                } else {
+                    rho.and_then(|rho| self.fixed_tex().quad_lambda(rho))
+                };
+                frag.fixed = self
+                    .fixed_tex()
+                    .fixed_coords(&gradient, &tex_row, px, lambda)
+                    .is_some_and(|(s, t, lambda)| {
+                        SoftDraw::fixed_sample::<SGI_SOFT_FIXED_ANY, false>(self, s, t, lambda, &mut frag.texel)
+                    });
+            }
+            // Only texturing reads the coordinates, only fog the distance.
+            if self.texture.is_some() && !frag.fixed {
+                for k in 0..4 {
+                    frag.texcoord[k] = (w0 * v[0].texcoord[k] + w1 * v[1].texcoord[k] + w2 * v[2].texcoord[k]) / sum;
+                }
+            }
+            if st.fog != 0 {
+                frag.fog = (w0 * v[0].fog + w1 * v[1].fog + w2 * v[2].fog) / sum;
+            }
+            if st.clip_planes != 0 {
+                let mut d = [0.0f64; SGI_GL_CLIP_PLANES as usize];
+
+                for i in 0..SGI_GL_CLIP_PLANES as usize {
+                    d[i] = (w0 * v[0].clip[i] + w1 * v[1].clip[i] + w2 * v[2].clip[i]) / sum;
+                }
+                if st.clipped(&d) {
+                    return;
+                }
+            }
+            if smooth {
+                for k in 0..4 {
+                    frag.rgba[k] = (w0 * v[0].rgba[k] + w1 * v[1].rgba[k] + w2 * v[2].rgba[k]) / sum;
+                }
+                // An index is taken as a difference from the first vertex's,
+                // so a constant one stays exact before its integer part is taken.
+                frag.index = v[0].index + (w1 * (v[1].index - v[0].index) + w2 * (v[2].index - v[0].index)) / sum;
+            }
+            if self.texture_base.is_some() && !frag.fixed {
+                let mut value = [0.0f64; 4];
+                let mut out = [0.0f64; 5];
+
+                for k in 0..4 {
+                    value[k] = gradient.value[k] + (px as f64 + 0.5 - gradient.x) * gradient.dx[k] + tex_row[k];
+                }
+                if flat_q {
+                    let d = value[2];
+
+                    frag.texture_rho = if flat_ok
+                        && (value[0] / d).is_finite()
+                        && (value[1] / d).is_finite()
+                        && (tex_nr == 0.0 || (value[3] / d).is_finite())
+                    {
+                        flat_rho
+                    } else {
+                        f64::NAN
+                    };
+                } else if let Some(rho) = rho {
+                    frag.texture_rho = rho;
+                } else {
+                    frag.texture_rho = if soft_texture_derivatives(&value, &gradient.dx, &gradient.dy, tex_ns, tex_nt, tex_nr, &mut out) {
+                        out[4]
+                    } else {
+                        f64::NAN
+                    };
+                }
+            }
+            if background {
+                self.stipple_background(&mut frag);
+            }
+            self.fragment(px, py, z, offset, depth_w, &frag);
+        };
+        let quad_general = QuadGeneral {
+            scales: quad_lod.then_some((tex_ns, tex_nt)),
+            fragment: &|px, py, e1, e2| general(px, py, e1, e2, quad_rho(px & !1, py & !1)),
+        };
+        // Two rows at a time, from an even one: the rows of a line of quads.
+        let mut qy = py0 & !1;
+        while qy <= py1 {
+            let mut rows: [Option<QuadRow>; 2] = [None, None];
+
+            for (r, row) in rows.iter_mut().enumerate() {
+                let py = qy + r as i32;
+
+                if py < py0 || py > py1 {
+                    continue;
+                }
+                let cy: i64 = (py as i64 * (1i64 << sub)) + (1i64 << (sub - 1));
+                let cx: i64 = (px0 as i64 * (1i64 << sub)) + (1i64 << (sub - 1));
+                let e0 = v[1].edge(&v[2], cx, cy);
+                let e1 = v[2].edge(&v[0], cx, cy);
+                let e2 = v[0].edge(&v[1], cx, cy);
+                let mut lo: i64 = 0;
+                let mut hi: i64 = px1 as i64 - px0 as i64;
+                (lo, hi) = v[1].owned_run(&v[2], e0, step0, (lo, hi));
+                (lo, hi) = v[2].owned_run(&v[0], e1, step1, (lo, hi));
+                (lo, hi) = v[0].owned_run(&v[1], e2, step2, (lo, hi));
+                if lo <= hi {
+                    *row = Some(QuadRow { px0: px0 + lo as i32, px1: px0 + hi as i32, e1: e1 + lo * step1, e2: e2 + lo * step2 });
+                }
+            }
+            let quad_y = qy;
+            qy += 2;
+            if rows == [None, None] {
+                continue;
+            }
+            if let Some((row_loop, sp)) = &span {
+                self.px.fill_quads(self, *row_loop, sp, quad_y, &rows, &quad_general);
+                continue;
+            }
+            let (x_lo, x_hi) = match rows {
+                [Some(a), Some(b)] => (a.px0.min(b.px0), a.px1.max(b.px1)),
+                [Some(a), None] | [None, Some(a)] => (a.px0, a.px1),
+                [None, None] => continue,
+            };
+            let mut qx = x_lo & !1;
+            while qx <= x_hi {
+                let rho = quad_rho(qx, quad_y);
+
+                for (r, row) in rows.iter().enumerate() {
+                    let Some(q) = row else {
+                        continue;
+                    };
+                    for px in qx..qx + 2 {
+                        if px >= q.px0 && px <= q.px1 {
+                            let k = (px - q.px0) as i64;
+
+                            general(px, quad_y + r as i32, q.e1 + k * step1, q.e2 + k * step2, rho);
+                        }
+                    }
+                }
+                qx += 2;
+            }
+        }
+    }
+
+    /// Transform, clip and rasterize one triangle. Clipped to the view volume
+    /// in clip coordinates, what is left is drawn as a fan from its first
+    /// vertex, each flat shaded from the triangle's provoking vertex.
+    pub fn clip_triangle(&self, va: &[f32], vb: &[f32], vc: &[f32], poly: &mut [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX], n: &mut u32) -> bool {
+        let verts: [&[f32]; 3] = [va, vb, vc];
+        let mut in_: [VolumeVertex; 3] = Default::default();
+
+        for (v, cv) in verts.iter().zip(in_.iter_mut()) {
+            self.st.volume_from_draw_vertex(v, cv);
+        }
+        *n = volume_clip_triangle(&in_, poly);
+        if !poly[..*n as usize].iter().all(|v| self.texture_vertex_valid(v)) {
+            return false;
+        }
+        if self.texture_base.is_some() {
+            let mut i = 1usize;
+            while i + 1 < *n as usize {
+                let vertices: [&VolumeVertex; 3] = [&poly[0], &poly[i], &poly[i + 1]];
+                let mut projected: [SoftVertex; 3] = Default::default();
+
+                for j in 0..3 {
+                    let Some(p) = self.project(vertices[j]) else {
+                        return false;
+                    };
+                    projected[j] = p;
+                }
+                if !self.texture_coefficients(&projected) {
+                    return false;
+                }
+                i += 1;
+            }
+        }
+        true
+    }
+
+    /// A quad or polygon validates all its clipped pieces before any are drawn.
+    pub fn texture_triangle_valid(&self, a: &[f32], b: &[f32], c: &[f32]) -> bool {
+        let mut poly: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = Default::default();
+        let mut n = 0u32;
+
+        self.clip_triangle(a, b, c, &mut poly, &mut n)
+    }
+
+    pub fn triangle(&self, va: &[f32], vb: &[f32], vc: &[f32], provoking: &[f32]) {
+        let mut poly: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = Default::default();
+        let mut n = 0u32;
+
+        if self.bounds().is_none() || !self.clip_triangle(va, vb, vc, &mut poly, &mut n) {
+            return;
+        }
+        self.clipped_fan(&poly, n, provoking);
+    }
+
+    /// Rasterize what clipping left of a triangle, n vertices of poly, as a
+    /// fan from its first vertex, each flat shaded from provoking.
+    pub fn clipped_fan(&self, poly: &[VolumeVertex; SGI_VOLUME_TRIANGLE_MAX], n: u32, provoking: &[f32]) {
+        let mut i = 1usize;
+        while i + 1 < n as usize {
+            self.clipped_triangle(&poly[0], &poly[i], &poly[i + 1], provoking);
+            i += 1;
+        }
+    }
+
+    /// A textured quad's two triangles, a b c and a c d, each flat shaded
+    /// from provoking: both are validated before either is drawn
+    /// (SoftDraw::texture_triangle_valid()), and drawn from the clipping
+    /// that validated them.
+    pub fn texture_quad(&self, a: &[f32], b: &[f32], c: &[f32], d: &[f32], provoking: [&[f32]; 2]) {
+        let mut first: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = Default::default();
+        let mut second: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = Default::default();
+        let (mut n1, mut n2) = (0u32, 0u32);
+
+        if !self.clip_triangle(a, b, c, &mut first, &mut n1) || !self.clip_triangle(a, c, d, &mut second, &mut n2) {
+            return;
+        }
+        if self.bounds().is_none() {
+            return;
+        }
+        self.clipped_fan(&first, n1, provoking[0]);
+        self.clipped_fan(&second, n2, provoking[1]);
+    }
+}
+
+impl VolumeVertex {
+    pub fn soft_boundary_edge(&self) -> bool {
+        self.attr[SGI_GL_V_EDGE].to_bits() != 0
+    }
+
+    pub fn soft_boundary_set_edge(&mut self, enabled: bool) {
+        self.attr[SGI_GL_V_EDGE] = f32::from_bits(enabled as u32);
+    }
+}
+
+impl SoftDraw<'_> {
+    pub fn boundary_plane(&self, v: &VolumeVertex, p: u32) -> f64 {
+        if p < SGI_VOLUME_PLANES as u32 {
+            v.plane(p as _)
+        } else {
+            let plane = &self.st.clip_plane[(p - SGI_VOLUME_PLANES as u32) as usize];
+
+            plane[0] as f64 * v.eye[0] + plane[1] as f64 * v.eye[1] + plane[2] as f64 * v.eye[2] + plane[3] as f64 * v.eye[3]
+        }
+    }
+
+    /// Carry outgoing flags through complete polygon clipping (2.11). Original
+    /// retained edges keep their flags; the newly connecting cut edges are
+    /// true. The two workspaces swap each pass; the result is left in `poly` by
+    /// swapping the vectors at the end.
+    pub fn boundary_clip(&self, poly: &mut Vec<VolumeVertex>, other: &mut Vec<VolumeVertex>, count: &mut usize, capacity: usize) -> bool {
+        let mut src_is_poly = true;
+        let mut n = *count;
+
+        for p in 0..(SGI_VOLUME_PLANES as u32 + SGI_GL_CLIP_PLANES) {
+            let mut m = 0usize;
+
+            if p >= SGI_VOLUME_PLANES as u32 && (self.st.clip_planes & (1u32 << (p - SGI_VOLUME_PLANES as u32))) == 0 {
+                continue;
+            }
+            let (src, dst): (&Vec<VolumeVertex>, &mut Vec<VolumeVertex>) =
+                if src_is_poly { (&*poly, &mut *other) } else { (&*other, &mut *poly) };
+            for i in 0..n {
+                let a = &src[i];
+                let b = &src[(i + 1) % n];
+                let da = self.boundary_plane(a, p);
+                let db = self.boundary_plane(b, p);
+
+                if da >= 0.0 {
+                    if m == capacity {
+                        return false;
+                    }
+                    dst[m] = a.clone();
+                    m += 1;
+                    if !(db >= 0.0) {
+                        if da == 0.0 {
+                            dst[m - 1].soft_boundary_set_edge(true);
+                        } else {
+                            if m == capacity {
+                                return false;
+                            }
+                            a.cut(da, b, db, &mut dst[m]);
+                            dst[m].soft_boundary_set_edge(true);
+                            m += 1;
+                        }
+                    }
+                } else if db > 0.0 {
+                    if m == capacity {
+                        return false;
+                    }
+                    b.cut(db, a, da, &mut dst[m]);
+                    let edge = a.soft_boundary_edge();
+                    dst[m].soft_boundary_set_edge(edge);
+                    m += 1;
+                }
+            }
+            n = m;
+            src_is_poly = !src_is_poly;
+            if n == 0 {
+                break;
+            }
+        }
+        if !src_is_poly {
+            std::mem::swap(poly, other);
+        }
+        *count = n;
+        true
+    }
+}
+
+impl<'a> GlDraw<'a> {
+    pub fn soft_polygon_vertex(&self, indices: Option<&[u32]>, i: usize) -> &'a [f32] {
+        let index = match indices {
+            Some(ix) => ix[i] as usize,
+            None => i,
+        };
+
+        &self.vertices[index * SGI_GL_VERTEX_FLOATS..][..SGI_GL_VERTEX_FLOATS]
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SoftAaPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+pub type SoftAaEdge = u32;
+
+pub const SGI_AA_LEFT: SoftAaEdge = 0;
+
+pub const SGI_AA_RIGHT: SoftAaEdge = 1;
+
+pub const SGI_AA_BOTTOM: SoftAaEdge = 2;
+
+pub const SGI_AA_TOP: SoftAaEdge = 3;
+
+impl SoftAaPoint {
+    pub fn aa_inside(&self, edge: SoftAaEdge, value: f64) -> bool {
+        match edge {
+            SGI_AA_LEFT => self.x >= value,
+            SGI_AA_RIGHT => self.x <= value,
+            SGI_AA_BOTTOM => self.y >= value,
+            SGI_AA_TOP => self.y <= value,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn aa_intersection(&self, b: &SoftAaPoint, edge: SoftAaEdge, value: f64) -> SoftAaPoint {
+        let t = if edge <= SGI_AA_RIGHT { (value - self.x) / (b.x - self.x) } else { (value - self.y) / (b.y - self.y) };
+
+        SoftAaPoint { x: self.x + t * (b.x - self.x), y: self.y + t * (b.y - self.y) }
+    }
+}
+
+/// Clip a convex window-space polygon to one side of a pixel square.
+pub fn soft_aa_clip(
+    src: &[SoftAaPoint],
+    n: usize,
+    dst: &mut [SoftAaPoint],
+    capacity: usize,
+    edge: SoftAaEdge,
+    value: f64,
+    out_n: &mut usize,
+) -> bool {
+    let mut m = 0usize;
+
+    if n == 0 {
+        *out_n = 0;
+        return true;
+    }
+    let mut a = &src[n - 1];
+    for b in &src[..n] {
+        let ai = a.aa_inside(edge, value);
+        let bi = b.aa_inside(edge, value);
+
+        if ai != bi {
+            if m == capacity {
+                return false;
+            }
+            dst[m] = a.aa_intersection(b, edge, value);
+            m += 1;
+        }
+        if bi {
+            if m == capacity {
+                return false;
+            }
+            dst[m] = *b;
+            m += 1;
+        }
+        a = b;
+    }
+    *out_n = m;
+    true
+}
+
+impl SoftVertex {
+    pub fn aa_edge(&self, b: &SoftVertex, x: f64, y: f64) -> f64 {
+        (b.x.wrapping_sub(self.x)) as f64 * (y - self.y as f64) - (b.y.wrapping_sub(self.y)) as f64 * (x - self.x as f64)
+    }
+}
+
+/// A convex polygon contains the square when it contains all four corners.
+pub fn soft_aa_contains_pixel(v: &[SoftVertex], n: usize, px: i32, py: i32, scale: f64, ccw: bool) -> bool {
+    for i in 0..n {
+        let a = &v[i];
+        let b = &v[(i + 1) % n];
+        let x = px as f64 * scale;
+        let y = py as f64 * scale;
+
+        if ccw {
+            if a.aa_edge(b, x, y) < 0.0
+                || a.aa_edge(b, x + scale, y) < 0.0
+                || a.aa_edge(b, x, y + scale) < 0.0
+                || a.aa_edge(b, x + scale, y + scale) < 0.0
+            {
+                return false;
+            }
+        } else if a.aa_edge(b, x, y) > 0.0
+            || a.aa_edge(b, x + scale, y) > 0.0
+            || a.aa_edge(b, x, y + scale) > 0.0
+            || a.aa_edge(b, x + scale, y + scale) > 0.0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+thread_local! {
+    /// Visit every pixel of an antialiased polygon's bounding box, not just
+    /// the span of each row it can reach (tests and the benchmark).
+    pub static SOFT_AA_WHOLE_BOX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Select the whole bounding box for antialiased polygons drawn on this
+/// thread. Per thread, so that tests running at once cannot change each
+/// other's path.
+pub fn raster_set_aa_whole_box(whole: bool) {
+    SOFT_AA_WHOLE_BOX.with(|c| c.set(whole));
+}
+
+/// The pixels of row py that the convex polygon v (n vertices, in subpixels
+/// of scale to the pixel) can overlap, a pixel wider on each side: from the
+/// polygon's extent along the row's strip, py to py + 1. None where the
+/// strip holds none of the polygon. The clipping of a pixel's square
+/// against the polygon finds nothing beyond this (soft_aa_clip()).
+pub fn soft_aa_row_span(v: &[SoftVertex], n: usize, scale: f64, py: i32) -> Option<(i32, i32)> {
+    let (y0, y1) = (py as f64, py as f64 + 1.0);
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+
+    for i in 0..n {
+        let (ax, ay) = (v[i].x as f64 / scale, v[i].y as f64 / scale);
+        let (bx, by) = (v[(i + 1) % n].x as f64 / scale, v[(i + 1) % n].y as f64 / scale);
+
+        if ay >= y0 && ay <= y1 {
+            lo = lo.min(ax);
+            hi = hi.max(ax);
+        }
+        // Where the edge crosses either side of the strip.
+        for y in [y0, y1] {
+            if (ay < y) != (by < y) {
+                let x = ax + (y - ay) * (bx - ax) / (by - ay);
+
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+    }
+    if !(lo <= hi) {
+        return None;
+    }
+    Some(((lo.floor() as i32).saturating_sub(1), (hi.floor() as i32).saturating_add(1)))
+}
+
+impl SoftDraw<'_> {
+    /// Rasterize one clipped convex polygon once. Pixel-square clipping
+    /// computes geometric coverage; centroid sampling is exact for affine
+    /// datums and an approximation for perspective-correct varyings.
+    pub fn polygon_coverage(&self, v: &[SoftVertex], n: usize, flat_color: &[f32], flat_index: f64, offset: f64) {
+        let mut flat = SoftFrag::default();
+        let sub = self.rules.subpixel_bits as i32;
+        let scale = (1i32 << sub) as f64;
+        let mut polygon_area = 0.0f64;
+
+        let bounds = if (3..=usize::MAX - 8).contains(&n) { self.bounds() } else { None };
+        let Some((mut px0, mut py0, mut px1, mut py1)) = bounds else {
+            return;
+        };
+        let capacity = n + 8;
+        let mut a = vec![SoftAaPoint::default(); capacity];
+        let mut b = vec![SoftAaPoint::default(); capacity];
+        let mut min_x = v[0].x;
+        let mut max_x = v[0].x;
+        let mut min_y = v[0].y;
+        let mut max_y = v[0].y;
+        for i in 0..n {
+            let next = &v[(i + 1) % n];
+
+            min_x = min_x.min(v[i].x);
+            max_x = max_x.max(v[i].x);
+            min_y = min_y.min(v[i].y);
+            max_y = max_y.max(v[i].y);
+            polygon_area += v[i].x.wrapping_mul(next.y).wrapping_sub(next.x.wrapping_mul(v[i].y)) as f64;
+        }
+        if !(polygon_area.abs() > 0.0) {
+            return;
+        }
+        px0 = px0.max((min_x >> sub) as i32);
+        px1 = px1.min((max_x >> sub) as i32);
+        py0 = py0.max((min_y >> sub) as i32);
+        py1 = py1.min((max_y >> sub) as i32);
+        for k in 0..4 {
+            flat.rgba[k] = flat_color[k] as f64;
+        }
+        flat.index = flat_index;
+
+        let whole_box = SOFT_AA_WHOLE_BOX.with(|c| c.get());
+        for py in py0..=py1 {
+            let (mut x0, mut x1) = (px0, px1);
+
+            if !whole_box {
+                // Pixels beyond the polygon's extent in this row are left
+                // with no overlap by the clipping below.
+                match soft_aa_row_span(v, n, scale, py) {
+                    Some((lo, hi)) => {
+                        x0 = x0.max(lo);
+                        x1 = x1.min(hi);
+                    }
+                    None => continue,
+                }
+            }
+            for px in x0..=x1 {
+                let coverage: f64;
+                let x: f64;
+                let y: f64;
+                let z: f64;
+                let mut bary = [0.0f64; 3];
+                let mut w = [0.0f64; 3];
+                let mut fan_i = 0usize;
+                let mut frag = flat;
+                let mut found = false;
+                let mut background = false;
+
+                if !self.stipple_pass(px, py, &mut background) {
+                    continue;
+                }
+                if soft_aa_contains_pixel(v, n, px, py, scale, polygon_area > 0.0) {
+                    coverage = 1.0;
+                    x = px as f64 + 0.5;
+                    y = py as f64 + 0.5;
+                } else {
+                    let mut count = n;
+                    let mut twice_area = 0.0f64;
+                    let mut cx = 0.0f64;
+                    let mut cy = 0.0f64;
+                    let mut src_is_a = true;
+
+                    // Restore the polygon before clipping this pixel.
+                    for i in 0..n {
+                        a[i] = SoftAaPoint { x: v[i].x as f64 / scale, y: v[i].y as f64 / scale };
+                    }
+                    for e in SGI_AA_LEFT..=SGI_AA_TOP {
+                        let bound = if e == SGI_AA_LEFT {
+                            px as f64
+                        } else if e == SGI_AA_RIGHT {
+                            (px + 1) as f64
+                        } else if e == SGI_AA_BOTTOM {
+                            py as f64
+                        } else {
+                            (py + 1) as f64
+                        };
+                        let ok = if src_is_a {
+                            soft_aa_clip(&a, count, &mut b, capacity, e, bound, &mut count)
+                        } else {
+                            soft_aa_clip(&b, count, &mut a, capacity, e, bound, &mut count)
+                        };
+
+                        if !ok {
+                            crate::dlog!(LogModule::Odyssey, "sgi-gl: polygon coverage clip exceeded its bound");
+                            return;
+                        }
+                        src_is_a = !src_is_a;
+                        if count < 3 {
+                            break;
+                        }
+                    }
+                    if count < 3 {
+                        continue;
+                    }
+                    let src = if src_is_a { &a } else { &b };
+                    for i in 0..count {
+                        let p = &src[i];
+                        let q = &src[(i + 1) % count];
+                        let pxp = p.x - px as f64;
+                        let pyp = p.y - py as f64;
+                        let qxp = q.x - px as f64;
+                        let qyp = q.y - py as f64;
+                        let cross = pxp * qyp - qxp * pyp;
+
+                        twice_area += cross;
+                        cx += (pxp + qxp) * cross;
+                        cy += (pyp + qyp) * cross;
+                    }
+                    if !(twice_area.abs() > 0.0) {
+                        continue;
+                    }
+                    coverage = r2_min(1.0, twice_area.abs() * 0.5);
+                    x = px as f64 + cx / (3.0 * twice_area);
+                    y = py as f64 + cy / (3.0 * twice_area);
+                }
+
+                // Find the fan triangle containing the overlap centroid.
+                let mut i = 1usize;
+                while i + 1 < n {
+                    let den = v[0].aa_edge(&v[i], v[i + 1].x as f64, v[i + 1].y as f64);
+
+                    if den == 0.0 {
+                        i += 1;
+                        continue;
+                    }
+                    bary[0] = v[i].aa_edge(&v[i + 1], x * scale, y * scale) / den;
+                    bary[1] = v[i + 1].aa_edge(&v[0], x * scale, y * scale) / den;
+                    bary[2] = 1.0 - bary[0] - bary[1];
+                    if bary[0] >= -0.000000001 && bary[1] >= -0.000000001 && bary[2] >= -0.000000001 {
+                        found = true;
+                        fan_i = i;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !found {
+                    continue;
+                }
+                {
+                    let i = fan_i;
+
+                    w[0] = bary[0] * v[0].inv_w;
+                    w[1] = bary[1] * v[i].inv_w;
+                    w[2] = bary[2] * v[i + 1].inv_w;
+                    let sum = w[0] + w[1] + w[2];
+                    let depth_w = bary[0] * v[0].depth_w + bary[1] * v[i].depth_w + bary[2] * v[i + 1].depth_w;
+
+                    if !(sum > 0.0) || !sum.is_finite() {
+                        continue;
+                    }
+                    let fan = [v[0], v[i], v[i + 1]];
+
+                    z = bary[0] * v[0].z + bary[1] * v[i].z + bary[2] * v[i + 1].z;
+                    for k in 0..4 {
+                        frag.texcoord[k] =
+                            (w[0] * v[0].texcoord[k] + w[1] * v[i].texcoord[k] + w[2] * v[i + 1].texcoord[k]) / sum;
+                        if self.st.shade_model != SGI_GL_FLAT {
+                            frag.rgba[k] = (w[0] * v[0].rgba[k] + w[1] * v[i].rgba[k] + w[2] * v[i + 1].rgba[k]) / sum;
+                        }
+                    }
+                    frag.fog = (w[0] * v[0].fog + w[1] * v[i].fog + w[2] * v[i + 1].fog) / sum;
+                    if self.st.shade_model != SGI_GL_FLAT {
+                        frag.index = v[0].index
+                            + (w[1] * (v[i].index - v[0].index) + w[2] * (v[i + 1].index - v[0].index)) / sum;
+                    }
+                    if self.st.clip_planes != 0 {
+                        let mut d = [0.0f64; SGI_GL_CLIP_PLANES as usize];
+
+                        for k in 0..SGI_GL_CLIP_PLANES as usize {
+                            d[k] = (w[0] * fan[0].clip[k] + w[1] * fan[1].clip[k] + w[2] * fan[2].clip[k]) / sum;
+                        }
+                        if self.st.clipped(&d) {
+                            continue;
+                        }
+                    }
+                    if self.texture_base.is_some() {
+                        let mut gradient = SoftTexPlane::default();
+                        let mut value = [0.0f64; 4];
+                        let mut out = [0.0f64; 5];
+
+                        if !soft_texture_plane(&fan, sub as u32, self.image().volume, self.image().one_dimensional, &mut gradient) {
+                            continue;
+                        }
+                        for k in 0..4 {
+                            value[k] = gradient.value[k]
+                                + (px as f64 + 0.5 - gradient.x) * gradient.dx[k]
+                                + (py as f64 + 0.5 - gradient.y) * gradient.dy[k];
+                        }
+                        frag.texture_rho = if soft_texture_derivatives(
+                            &value,
+                            &gradient.dx,
+                            &gradient.dy,
+                            self.base_level().width as f64 * soft_texture_lod_scale(self.image().lod_scale_s),
+                            if self.image().one_dimensional {
+                                0.0
+                            } else {
+                                self.base_level().height as f64 * soft_texture_lod_scale(self.image().lod_scale_t)
+                            },
+                            if self.image().volume {
+                                self.base_level().depth as f64 * soft_texture_lod_scale(self.image().lod_scale_r)
+                            } else {
+                                0.0
+                            },
+                            &mut out,
+                        ) {
+                            out[4]
+                        } else {
+                            f64::NAN
+                        };
+                    }
+                    if background {
+                        self.stipple_background(&mut frag);
+                    }
+                    self.fragment_coverage(px, py, z, offset, depth_w, &frag, coverage, true);
+                }
+            }
+        }
+    }
+
+    pub fn polygon_smooth(&self, poly: &[VolumeVertex], n: usize, provoking: &[f32], front: bool, slope: f64) {
+        let mut v: Vec<SoftVertex> = vec![SoftVertex::default(); n];
+        let mut offset = 0.0f64;
+        let mut flat_color = &provoking[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4];
+        let mut flat_index = provoking[SGI_GL_V_INDEX];
+
+        if !front && self.back_colors {
+            flat_color = &provoking[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4];
+            flat_index = provoking[SGI_GL_V_BACK_INDEX];
+        }
+        for i in 0..n {
+            let Some(p) = self.project(&poly[i]) else {
+                return;
+            };
+            v[i] = p;
+            if !front && self.back_colors {
+                let back = &poly[i].attr[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4];
+
+                for k in 0..4 {
+                    v[i].rgba[k] = r2_min(r2_max(back[k], 0.0f32), 1.0f32) as f64;
+                }
+                v[i].index = poly[i].attr[SGI_GL_V_BACK_INDEX] as f64;
+            }
+        }
+        if self.texture_base.is_some() {
+            let mut i = 1usize;
+            while i + 1 < n {
+                let fan = [v[0], v[i], v[i + 1]];
+
+                if !self.texture_coefficients(&fan) {
+                    return;
+                }
+                i += 1;
+            }
+        }
+        if self.st.polygon_offset & SGI_GL_OFFSET_FILL != 0 {
+            offset = self.rules.offset_amount(&self.st, slope);
+        }
+        self.polygon_coverage(&v, n, flat_color, flat_index as f64, offset);
+    }
+
+    /// Replay the original fan, including its validation and fragment ordering.
+    pub fn polygon_fill(&self, d: &GlDraw, indices: Option<&[u32]>, n: usize, provoking: &[f32]) {
+        let v0 = d.soft_polygon_vertex(indices, 0);
+        let prevalidate = self.texture.is_some() && !(d.mode == SGI_GL_POLYGON && d.fill_by_triangle);
+
+        if prevalidate {
+            let mut i = 1usize;
+            while i + 1 < n {
+                if !self.texture_triangle_valid(
+                    v0,
+                    d.soft_polygon_vertex(indices, i),
+                    d.soft_polygon_vertex(indices, i + 1),
+                ) {
+                    return;
+                }
+                i += 1;
+            }
+        }
+        let mut i = 1usize;
+        while i + 1 < n {
+            self.triangle(
+                v0,
+                d.soft_polygon_vertex(indices, i),
+                d.soft_polygon_vertex(indices, i + 1),
+                provoking,
+            );
+            i += 1;
+        }
+    }
+
+    /// Workspace bounds are internal representations, not hardware maxima.
+    pub fn polygon(&self, d: &GlDraw, indices: Option<&[u32]>, count: usize, provoking: &[f32], force_edges: bool) -> GlDrawResult {
+        let mut positions = *self;
+        let mut coverage = *self;
+        let mut fan: [SoftVertex; 3] = Default::default();
+        let mut previous: SoftVertex;
+        let mut current: SoftVertex;
+        let mut stipple = SoftLineStipple {
+            enabled: d.line_stipple_enabled,
+            repeat: r2_max(1, r2_min(d.line_stipple_repeat, 256)),
+            pattern: d.line_stipple_pattern,
+            ..Default::default()
+        };
+        let mut flat = [0.0f32; SGI_GL_VERTEX_FLOATS];
+        let mut n = count;
+        let mut area = 0.0f64;
+        let mut slope = 0.0f64;
+        let mut offset = 0.0f64;
+
+        if count < 3 {
+            return SGI_GL_DRAW_OK;
+        }
+        if count > usize::MAX - SGI_VOLUME_PLANES as usize - SGI_GL_CLIP_PLANES as usize {
+            return SGI_GL_DRAW_OUT_OF_MEMORY;
+        }
+        let capacity = count + SGI_VOLUME_PLANES as usize + SGI_GL_CLIP_PLANES as usize;
+        let mut poly: Vec<VolumeVertex> = vec![VolumeVertex::default(); capacity];
+        let mut other: Vec<VolumeVertex> = vec![VolumeVertex::default(); capacity];
+        // Facing must not prevalidate texture Q and erase a valid FILL prefix.
+        positions.texture = None;
+        for (i, v) in poly.iter_mut().enumerate().take(count) {
+            self.st.volume_from_draw_vertex(d.soft_polygon_vertex(indices, i), v);
+            if !v.clip.iter().chain(&v.eye).all(|c| c.is_finite()) {
+                crate::dlog!(LogModule::Odyssey, "sgi-gl: invalid polygon position dropped");
+                return SGI_GL_DRAW_OK;
+            }
+            if force_edges {
+                v.soft_boundary_set_edge(true);
+            }
+        }
+        if !self.boundary_clip(&mut poly, &mut other, &mut n, capacity) {
+            crate::dlog!(LogModule::Odyssey, "sgi-gl: polygon exceeds convex clipping bound");
+            return SGI_GL_DRAW_OK;
+        }
+        let projected = if n == 0 { None } else { positions.project(&poly[0]) };
+        let Some(first) = projected else {
+            return SGI_GL_DRAW_OK;
+        };
+        previous = first;
+        fan[0] = first;
+        for (i, v) in poly.iter().enumerate().take(n).skip(1) {
+            let Some(p) = positions.project(v) else {
+                return SGI_GL_DRAW_OK;
+            };
+            current = p;
+            if i >= 2 {
+                area += first.edge(&previous, current.x, current.y) as f64;
+                fan[1] = previous;
+                fan[2] = current;
+                slope = r2_max(slope, self.slope(&fan));
+            }
+            previous = current;
+        }
+        if self.st.window_matrix_given != 0 && self.st.window_rows_down != 0 {
+            area = -area;
+        }
+        if self.st.front_face == SGI_GL_CW {
+            area = -area;
+        }
+        let front: bool = area > 0.0; // Zero remains back-facing through both reversals.
+        if self.st.cull_face != 0
+            && (self.st.cull_face_mode == SGI_GL_FRONT_AND_BACK
+                || self.st.cull_face_mode == (if front { SGI_GL_FRONT } else { SGI_GL_BACK }))
+        {
+            return SGI_GL_DRAW_OK;
+        }
+        let mode: u32 = d.polygon_modes.map_or(SGI_GL_FILL, |m| m[if front { 0 } else { 1 }]);
+        if mode == SGI_GL_FILL {
+            if self.polygon_smooth {
+                self.polygon_smooth(&poly, n, provoking, front, slope);
+                return SGI_GL_DRAW_OK;
+            }
+            self.polygon_fill(d, indices, count, provoking);
+            return SGI_GL_DRAW_OK;
+        }
+        if mode != SGI_GL_LINE && mode != SGI_GL_POINT {
+            crate::dlog!(LogModule::Odyssey, "sgi-gl: invalid polygon mode {:#x} ignored", mode);
+            return SGI_GL_DRAW_OK;
+        }
+        if mode == SGI_GL_LINE {
+            let Some(width) = soft_dimension(d.line_width) else {
+                return SGI_GL_DRAW_OK;
+            };
+            coverage.line_width = width;
+        } else if mode == SGI_GL_POINT {
+            let Some(size) = soft_dimension(d.point_size) else {
+                return SGI_GL_DRAW_OK;
+            };
+            coverage.point_size = size;
+        }
+        flat.copy_from_slice(&provoking[..SGI_GL_VERTEX_FLOATS]);
+        if !front && self.back_colors {
+            flat[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4].copy_from_slice(&provoking[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4]);
+            for v in &mut poly[..n] {
+                v.attr.copy_within(SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4, SGI_GL_V_COLOR);
+            }
+        }
+        // Validate the entire boundary before any LINE/POINT fragment or sample.
+        for i in 0..n {
+            let Some(p) = self.project(&poly[i]) else {
+                return SGI_GL_DRAW_OK;
+            };
+            current = p;
+            if self.texture_base.is_some()
+                && mode == SGI_GL_LINE
+                && !self.project(&poly[(i + 1) % n]).is_some_and(|next| {
+                    current
+                        .texture_line_gradient(
+                            &next,
+                            self.rules.subpixel_bits as u32,
+                            self.image().volume,
+                            self.image().one_dimensional,
+                        )
+                        .is_some()
+                })
+            {
+                self.texture_report(16, "invalid primitive coefficients, primitive dropped");
+                return SGI_GL_DRAW_OK;
+            }
+        }
+        let offset_enable = if mode == SGI_GL_LINE { SGI_GL_OFFSET_LINE } else { SGI_GL_OFFSET_POINT };
+        if self.st.polygon_offset & offset_enable != 0 {
+            offset = self.rules.offset_amount(&self.st, slope);
+        }
+        for i in 0..n {
+            if !poly[i].soft_boundary_edge() {
+                continue;
+            }
+            // Validated in full above, so every projection here succeeds.
+            let current = self.project(&poly[i]).unwrap_or_default();
+            if mode == SGI_GL_POINT {
+                coverage.point_projected(&current, Some(&flat), offset);
+            } else {
+                let next = self.project(&poly[(i + 1) % n]).unwrap_or_default();
+                coverage.line_projected(&current, &next, &flat, offset, Some(&mut stipple), false);
+            }
+        }
+        SGI_GL_DRAW_OK
+    }
+
+    /// Dispatch each independently assembled polygon, preserving provoking rules.
+    pub fn polygon_modes(&self, d: &GlDraw) -> GlDrawResult {
+        let mut indices = [0u32; 4];
+        let n = d.count;
+
+        if d.polygon_modes.is_none() {
+            let mut fill = *d;
+
+            fill.polygon_modes = Some([SGI_GL_FILL, SGI_GL_FILL]);
+            return self.polygon_modes(&fill);
+        }
+
+        if d.mode == SGI_GL_POLYGON {
+            return self.polygon(d, None, n as usize, d.soft_polygon_vertex(None, 0), false);
+        }
+        let stride: u32 = if d.mode == SGI_GL_TRIANGLES {
+            3
+        } else if d.mode == SGI_GL_QUADS {
+            4
+        } else if d.mode == SGI_GL_QUAD_STRIP {
+            2
+        } else {
+            1
+        };
+        let mut i = 0u32;
+        while i < n {
+            let count: u32 = if d.mode == SGI_GL_QUADS || d.mode == SGI_GL_QUAD_STRIP { 4 } else { 3 };
+            let provoking = i + count - 1;
+            let force = stride < 3;
+
+            if n - i < count {
+                break;
+            }
+            for k in 0..count {
+                indices[k as usize] = i + k;
+            }
+            if d.mode == SGI_GL_TRIANGLE_STRIP && (i & 1) != 0 {
+                indices[0] = i + 1;
+                indices[1] = i;
+            } else if d.mode == SGI_GL_TRIANGLE_FAN {
+                indices[0] = 0;
+            } else if d.mode == SGI_GL_QUAD_STRIP {
+                indices[2] = i + 3;
+                indices[3] = i + 2;
+            }
+            let result = self.polygon(
+                d,
+                Some(&indices[..count as usize]),
+                count as usize,
+                d.soft_polygon_vertex(None, provoking as usize),
+                force,
+            );
+            if result != SGI_GL_DRAW_OK {
+                return result;
+            }
+            i += stride;
+        }
+        SGI_GL_DRAW_OK
+    }
+
+    /// The filled primitives of a draw, from SGI_GL_TRIANGLES on, in order.
+    pub fn draw_triangles(&self, d: &GlDraw) {
+        let n = d.count as usize;
+        let v = |i: usize| -> &[f32] { d.soft_polygon_vertex(None, i) };
+
+        match d.mode {
+            SGI_GL_TRIANGLES => {
+                let mut i = 0usize;
+                while i + 2 < n {
+                    self.triangle(v(i), v(i + 1), v(i + 2), v(i + 2));
+                    i += 3;
+                }
+            }
+            SGI_GL_TRIANGLE_STRIP => {
+                let mut i = 0usize;
+                while i + 2 < n {
+                    if i & 1 != 0 {
+                        self.triangle(v(i + 1), v(i), v(i + 2), v(i + 2));
+                    } else {
+                        self.triangle(v(i), v(i + 1), v(i + 2), v(i + 2));
+                    }
+                    i += 1;
+                }
+            }
+            SGI_GL_TRIANGLE_FAN | SGI_GL_POLYGON => {
+                if self.texture.is_some() && d.mode == SGI_GL_POLYGON && !d.fill_by_triangle {
+                    let mut i = 0usize;
+                    while i + 2 < n {
+                        if !self.texture_triangle_valid(v(0), v(i + 1), v(i + 2)) {
+                            return;
+                        }
+                        i += 1;
+                    }
+                }
+                let mut i = 0usize;
+                while i + 2 < n {
+                    self.triangle(v(0), v(i + 1), v(i + 2), if d.mode == SGI_GL_POLYGON { v(0) } else { v(i + 2) });
+                    i += 1;
+                }
+            }
+            SGI_GL_QUADS => {
+                let mut i = 0usize;
+                while i + 3 < n {
+                    if self.texture.is_some() {
+                        self.texture_quad(v(i), v(i + 1), v(i + 2), v(i + 3), [v(i + 3), v(i + 3)]);
+                        i += 4;
+                        continue;
+                    }
+                    self.triangle(v(i), v(i + 1), v(i + 2), v(i + 3));
+                    self.triangle(v(i), v(i + 2), v(i + 3), v(i + 3));
+                    i += 4;
+                }
+            }
+            SGI_GL_QUAD_STRIP => {
+                // Vertices 2i - 1, 2i, 2i + 2 and 2i + 1 in order (2.6.1).
+                let mut i = 0usize;
+                while i + 3 < n {
+                    if self.texture.is_some() {
+                        self.texture_quad(v(i), v(i + 1), v(i + 3), v(i + 2), [v(i + 3), v(i + 3)]);
+                        i += 2;
+                        continue;
+                    }
+                    self.triangle(v(i), v(i + 1), v(i + 3), v(i + 3));
+                    self.triangle(v(i), v(i + 3), v(i + 2), v(i + 3));
+                    i += 2;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Whether every vertex of a draw has the texture coordinates its image
+    /// uses: a draw with one that has not drops that primitive unread, so it
+    /// reads its texels as it reaches them rather than all of them first.
+    pub fn fixed_coordinates_valid(&self, d: &GlDraw) -> bool {
+        for i in 0..d.count as usize {
+            let mut v = VolumeVertex::default();
+
+            self.st.volume_from_draw_vertex(d.soft_polygon_vertex(None, i), &mut v);
+            if !self.image().soft_texcoord_valid(self.texture_base, &v) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::odyssey::raster_bench::*;
+
+    const SIDE: i32 = 160;
+
+    /// A vertex at window pixel (x, y) with w, depth d, colour c and
+    /// texture coordinates s and t.
+    fn vertex(x: f32, y: f32, w: f32, d: f32, c: [f32; 4], s: f32, t: f32) -> [f32; SGI_GL_VERTEX_FLOATS] {
+        let mut o = [0.0f32; SGI_GL_VERTEX_FLOATS];
+
+        o[SGI_GL_V_POSITION..SGI_GL_V_POSITION + 4]
+            .copy_from_slice(&[(x / BENCH_W as f32 * 2.0 - 1.0) * w, (y / BENCH_H as f32 * 2.0 - 1.0) * w, 2.0 * d - w, w]);
+        o[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4].copy_from_slice(&c);
+        o[SGI_GL_V_TEXCOORD..SGI_GL_V_TEXCOORD + 4].copy_from_slice(&[s * w, t * w, 0.0, w]);
+        o
+    }
+
+    /// Smooth-shaded, depth-tested, trilinear modulated draws of mode, one
+    /// draw for each of prims, and the colour and depth planes after.
+    fn draw(mode: u32, prims: Vec<Vec<f32>>) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut b = Bench::empty();
+
+        b.st.depth_test = 1;
+        b.st.texture_2d = 1;
+        b.st.texture_env_mode = SGI_GL_MODULATE;
+        b.tex = Some(BenchTexture::new(32, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA));
+        b.mode = mode;
+        b.prims = prims;
+        b.prepare();
+        b.run();
+        b.snapshot(SIDE)
+    }
+
+    /// n random vertices in perspective inside the square, some crossing
+    /// the near or far plane.
+    fn vertices(rng: &mut Lcg, n: usize) -> Vec<[f32; SGI_GL_VERTEX_FLOATS]> {
+        (0..n)
+            .map(|_| {
+                let c = [rng.range(0.0, 1.0), rng.range(0.0, 1.0), rng.range(0.0, 1.0), 1.0];
+                vertex(rng.range(0.0, SIDE as f32), rng.range(0.0, SIDE as f32), rng.range(0.5, 3.0), rng.range(-0.2, 1.2), c, rng.range(-1.0, 2.0), rng.range(-1.0, 2.0))
+            })
+            .collect()
+    }
+
+    // A textured quad, or a quad strip's quad, draws its two triangles,
+    // each clipped as a triangle of its own would be.
+    #[test]
+    fn textured_quads_draw_their_two_triangles() {
+        let mut rng = Lcg(77);
+        let mut drawn = 0;
+        for _ in 0..30 {
+            let v = vertices(&mut rng, 4);
+            let quad: Vec<f32> = v.iter().flatten().copied().collect();
+            let tris = |order: [usize; 6]| -> Vec<Vec<f32>> { vec![order.iter().flat_map(|&i| v[i]).collect()] };
+
+            let want = draw(SGI_GL_TRIANGLES, tris([0, 1, 2, 0, 2, 3]));
+            assert!(draw(SGI_GL_QUADS, vec![quad.clone()]) == want, "quads");
+            // Strip vertices 0 1 3 2 make the quad 0 1 2 3.
+            let strip: Vec<f32> = [0, 1, 3, 2].iter().flat_map(|&i| v[i]).collect();
+            assert!(draw(SGI_GL_QUAD_STRIP, vec![strip]) == want, "quad strip");
+            drawn += want.0.iter().filter(|&&c| c != 0).count();
+        }
+        assert!(drawn > 20000, "the quads drew too little: {drawn}");
+    }
+
+    // A textured quad one of whose triangles has no valid texture planes is
+    // dropped whole, the valid triangle too.
+    #[test]
+    fn a_textured_quad_with_an_invalid_triangle_draws_nothing() {
+        let white = [1.0; 4];
+        let mut v = [
+            vertex(10.0, 10.0, 1.0, 0.5, white, 0.0, 0.0),
+            vertex(150.0, 10.0, 1.0, 0.5, white, 1.0, 0.0),
+            vertex(150.0, 150.0, 1.0, 0.5, white, 1.0, 1.0),
+            vertex(10.0, 150.0, 1.0, 0.5, white, 0.0, 1.0),
+        ];
+        let first: Vec<f32> = v[..3].iter().flatten().copied().collect();
+        assert!(draw(SGI_GL_TRIANGLES, vec![first]).0.iter().any(|&c| c != 0), "the valid triangle draws alone");
+        v[3][SGI_GL_V_TEXCOORD] = f32::NAN;
+        let quad: Vec<f32> = v.iter().flatten().copied().collect();
+        assert!(draw(SGI_GL_QUADS, vec![quad]).0.iter().all(|&c| c == 0), "quads");
+        let strip: Vec<f32> = [0, 1, 3, 2].iter().flat_map(|&i| v[i]).collect();
+        assert!(draw(SGI_GL_QUAD_STRIP, vec![strip]).0.iter().all(|&c| c == 0), "quad strip");
+    }
+}

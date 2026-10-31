@@ -115,7 +115,7 @@ static const struct { const char *name; const char *why; int gr2_only; } xfails[
       "libGLcore EXPRESS's stencil Fetch masks the depth word with 0xF; z20 s4 keeps the stencil above Z (bits 23:20; inferred from its depth reads)", 1 },
 };
 
-static int gr2;
+static int gr2, vpro;
 
 static const char *xfail_why(const char *name)
 {
@@ -613,9 +613,29 @@ static double fb_comp(const unsigned char *px, int comp)
     return 0;
 }
 
+/* VPro: the library's host conversion steps the rows of an unpacked read by
+   its own stride, ceil(w * bpp / m) * m with bpp the pixel's size and
+   m = max(alignment, bpp), where GL pads the row to the alignment. They differ
+   only when bpp does not divide the alignment and the width makes w * bpp
+   miss a multiple of it: 3 shorts (bpp 6) at width 13 give 78-byte rows
+   against GL's 80. The board's data is right; the library lays it out so
+   (origami #3070, VPro RGB short read-back). Returns 0 where GL's layout
+   holds. Only the default pack state is covered. */
+static int vpro_read_stride(const Fmt *f, const Type *t, const Store *s, int w)
+{
+    int bpp, m;
+    if (!vpro || t->npacked || f->n != 3 || t->size != 2 || s->alignment != 4 || s->row_length ||
+        s->skip_pixels || s->skip_rows)
+        return 0;
+    bpp = f->n * t->size;
+    m = bpp > s->alignment ? bpp : s->alignment;
+    return m * ((w * bpp + m - 1) / m);
+}
+
 static void read_case(const Fmt *f, const Type *t, const Store *s, int w, int h, const char *tag)
 {
     int epg = t->npacked ? 1 : f->n;
+    int lib_stride = vpro_read_stride(f, t, s, w);
     int nb = image_bytes(s, w, h, epg, t->size), i, j, k;
     unsigned char *buf, *fb;
     if (!begin("read/%s/%s%s", f->name, t->name, tag))
@@ -641,7 +661,8 @@ static void read_case(const Fmt *f, const Type *t, const Store *s, int w, int h,
     /* Pixel values. */
     for (j = 0; j < h && !cur_bad; j++)
         for (i = 0; i < w && !cur_bad; i++) {
-            unsigned char *p = buf + px_offset(s, w, i, j, epg, t->size);
+            unsigned char *p = buf + (lib_stride ? j * lib_stride + i * epg * t->size
+                                                 : px_offset(s, w, i, j, epg, t->size));
             const unsigned char *px = fb + (j * w + i) * 4;
             if (t->npacked) {
                 unsigned int v = (unsigned int)get_elem(p, t, s->swap);
@@ -668,7 +689,8 @@ static void read_case(const Fmt *f, const Type *t, const Store *s, int w, int h,
         unsigned char *mark = calloc(nb, 1);
         for (j = 0; j < h; j++)
             for (i = 0; i < w; i++)
-                memset(mark + px_offset(s, w, i, j, epg, t->size), 1, epg * t->size);
+                memset(mark + (lib_stride ? j * lib_stride + i * epg * t->size
+                                          : px_offset(s, w, i, j, epg, t->size)), 1, epg * t->size);
         for (i = 0; i < nb; i++)
             if (!mark[i] && buf[i] != 0xcd) {
                 note("byte %d outside the pixels written (0x%02x)", i, buf[i]);
@@ -1337,6 +1359,30 @@ static void t_depth_colour(void)
     }
 }
 
+/* VPro: the value a depth takes through the library's host path. The word
+   holds 2S * z with 2S = 2^33 - 2^15 (the depth range's far value), so the
+   library multiplies by 2S, keeps the single's exponent and top 18 mantissa
+   bits (truncating the rest), then on readback refills the low five mantissa
+   bits from the top five and divides by 2S (origami datasheet odyssey.md,
+   "Depth word, established as the library's reading"). 2S is a hair under a
+   power of two, so the product's mantissa sits about one 18-bit step below
+   z's and the truncation lands one word lower than truncating z itself.
+   Other boards expect the value unchanged. */
+static float depth_expect(float z)
+{
+    union { float f; unsigned int u; } v;
+    const float two_s = 8589901824.0f;
+    if (!vpro)
+        return z;
+    v.f = z * two_s;
+    v.u &= ~0x1fu;
+    v.u |= (v.u >> 18) & 0x1f;
+    /* A depth read is a window depth, which GL keeps within [0, 1]; the far
+       plane's word, 2S, decodes a few steps over 2S and reads back as 1. */
+    v.f /= two_s;
+    return v.f > 1.0f ? 1.0f : v.f;
+}
+
 static void t_depth_stencil(void)
 {
     int w = 13, h = 5, i, j;
@@ -1360,8 +1406,8 @@ static void t_depth_stencil(void)
             for (i = 0; i < w * h + 8; i++) zout[i] = -7.0f;
             glReadPixels(40, 50, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, zout);
             for (i = 0; i < w * h; i++)
-                if (fabs(zout[i] - zin[i]) > 1.0 / (1 << 20))
-                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], zin[i]);
+                if (fabs(zout[i] - depth_expect(zin[i])) > 1.0 / (1 << 20))
+                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], depth_expect(zin[i]));
             if (zout[w * h] != -7.0f)
                 note("wrote past the image");
             check_border(40, 50, w, h, 2);
@@ -1388,8 +1434,8 @@ static void t_depth_stencil(void)
             ztol = dbits > 0 && dbits <= 20 ? 2.0 / (1 << dbits) : 1.0 / (1 << 20);
             for (i = 0; i < w * h; i++) {
                 double got = zu[i] / 4294967295.0;
-                if (fabs(got - zin[i]) > ztol)
-                    note("(%d,%d) depth %08x = %.7f want %.7f", i % w, i / w, zu[i], got, zin[i]);
+                if (fabs(got - depth_expect(zin[i])) > ztol)
+                    note("(%d,%d) depth %08x = %.7f want %.7f", i % w, i / w, zu[i], got, depth_expect(zin[i]));
             }
             end();
         }
@@ -1410,8 +1456,8 @@ static void t_depth_stencil(void)
             reset_state();
             glReadPixels(40, 50, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, zout);
             for (i = 0; i < w * h; i++)
-                if (fabs(zout[i] - (zin[i] * 0.5 + 0.25)) > 1.0 / (1 << 20))
-                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], zin[i] * 0.5 + 0.25);
+                if (fabs(zout[i] - depth_expect(zin[i] * 0.5f + 0.25f)) > 1.0 / (1 << 20))
+                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], depth_expect(zin[i] * 0.5f + 0.25f));
             end();
         }
     }
@@ -1431,8 +1477,8 @@ static void t_depth_stencil(void)
             glDisable(GL_DEPTH_TEST);
             glReadPixels(100, 60, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, zout);
             for (i = 0; i < w * h; i++)
-                if (fabs(zout[i] - zin[i]) > 1.0 / (1 << 20))
-                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], zin[i]);
+                if (fabs(zout[i] - depth_expect(zin[i])) > 1.0 / (1 << 20))
+                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], depth_expect(zin[i]));
             end();
         }
     }
@@ -1485,6 +1531,19 @@ static void t_depth_stencil(void)
             glReadPixels(40, 50, w, h, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, sout);
             for (i = 0; i < w * h; i++) {
                 int want = (((sin[i] << 1) + 3) & 0x0f) & smask;
+                if (vpro) {
+                    /* VPro: the library does shift and offset on the host and
+                       runs a stencil download under its default block, whose
+                       write mask is all ones, so glStencilMask(0x0f) never
+                       reaches it (origami datasheet odyssey.md, "The stencil
+                       word and the write paths", established). The index is
+                       stored whole: 219 for 108. The board gets value << 16
+                       and what it does with bits above 8 is unknown there, so
+                       such pixels are not checked. */
+                    want = (sin[i] << 1) + 3;
+                    if (want > 0xff)
+                        continue;
+                }
                 if (sout[i] != want)
                     note("(%d,%d) stencil %d want %d", i % w, i / w, sout[i], want);
             }
@@ -2728,6 +2787,7 @@ int main(int argc, char **argv)
     {
         const char *rn = (const char *)glGetString(GL_RENDERER);
         gr2 = rn && (!strncmp(rn, "GR", 2) || !strncmp(rn, "GU", 2));
+        vpro = rn && !strncmp(rn, "VPRO", 4);
     }
     ext = (const char *)glGetString(GL_EXTENSIONS);
     ext_abgr = ext && strstr(ext, "GL_EXT_abgr") != 0;

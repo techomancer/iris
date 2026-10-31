@@ -46,7 +46,7 @@ cpu = "r10000"
 flash = "flash-ip30.bin"      # keep the PROM's flash records between runs
 
 [graphics]
-# board = "maximpact"         # "solidimpact" (default), "highimpact", "maximpact" or "none"
+# board = "maximpact"         # "solidimpact" (default), "highimpact", "maximpact", "v6", "v8", "v10", "v12" or "none"
 
 [[port_forward]]
 proto = "tcp"
@@ -130,11 +130,29 @@ the board, as on the other machines:
 | `solidimpact` (default) | SI | 1 / 1 | none |
 | `highimpact` | SI with texture option | 1 / 1 | 4 TRAMs |
 | `maximpact` | MXI | 2 / 2 | 4 TRAMs per RE |
+| `v6` (also `vpro:v6`) | V6 | (VPro, BUZZ A) | in its 32 MB board memory |
+| `v8` (also `vpro:v8`) | V8 | (VPro, BUZZ A) | in its 128 MB board memory |
+| `v10` (also `vpro:v10`) | V10 | (VPro, BUZZ B) | in its 32 MB board memory |
+| `v12` (also `vpro:v12`) | V12 | (VPro, BUZZ B) | in its 128 MB board memory |
 
 The two textured boards are new and less tested than the SI. Its screen is the iris window
 and what iris-ci screenshots show; the keyboard and mouse are IOC3's PS/2
 ports. `board = "none"` leaves the port empty, and the machine
 then runs on its serial console with no window.
+
+`v6`, `v8`, `v10` and `v12` are the four Octane VPro boards on the same
+port: a port of the VPro (Odyssey) model in jamesbraid/qemu-sgi-origami
+(`src/dev/odyssey`), with the X server and OpenGL drawn by the model's
+scalar rasteriser on the board's own thread. Each answers its board's
+widget revision, memory size and banks and the identity record on its
+NIC (`ODY32`, `ODY128`, `ODY32VERSIONB`, `ODY128VERSIONB`). The PROM draws
+its startup screen on any of them, but IRIX needs an install with the
+VPro kernel driver and X server module: a disk installed with an IMPACT
+board finds no screen on a VPro. SGI's upgrade kit (007-4210-003) asks
+for PROM 4.0 and IRIX 6.5.10 for the V6 and V8, and PROM 4.5, IRIX 6.5.10
+and Crossbow 1.4 for the V10 and V12; with a V10 or V12 the machine
+presents the Octane2's Crossbow (revision code 5, 1.4 in hinv), and iris
+warns at start-up when the PROM image is older than the board needs.
 
 ## Networking
 
