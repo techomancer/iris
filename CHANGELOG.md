@@ -167,6 +167,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
 ### SGI Octane (IP30)
 
+- **Octane compile workers start after the memory windows are published.** A
+  worker that started first could compile every load and store without the
+  inline path for the whole run. Two test boots of the old order did not hit
+  it.
 - **Octane audio plays at the rate the guest asks for.** RAD audio ran at
   44.1 kHz whatever IRIX programmed, so games and other non-44.1 kHz sounds
   played at the wrong speed. `test/audiotest` sweeps rates and formats.

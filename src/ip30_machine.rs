@@ -262,22 +262,6 @@ impl OctaneMachine {
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(g.mgras().clone())));
         }
 
-        #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                let stats = g.stats.clone();
-                g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
-            }
-            std::mem::forget(cpu_device);
-        }
-
         // The shadow cache and the JIT read RAM straight from the ppmem
         // window; descriptor writes lay it out again on the CPU thread.
         if let Some(sp) = phys.phys.ppmem_space() {
@@ -296,6 +280,25 @@ impl OctaneMachine {
         }
         // Publish the descriptors as they stand into the sinks just set.
         ram.set_memcfg(heart.memcfg());
+
+        // After the windows above: each compile worker takes the cache's
+        // geometry once, as it starts, and without the windows that geometry
+        // has no inline load or store path.
+        #[cfg(feature = "jitv2")]
+        {
+            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
+            let jit = cpu.jitv2();
+            let mut g = jit.lock();
+            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
+            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
+            g.compile_queue.set_owner(Arc::downgrade(&jit));
+            #[cfg(not(feature = "jitv2_lockstep"))]
+            {
+                let stats = g.stats.clone();
+                g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
+            }
+            std::mem::forget(cpu_device);
+        }
 
         // HEART's levels 0 to 4 are the CPU's IP2 to IP6.
         heart.set_interrupts(cpu.interrupts_ptr());
