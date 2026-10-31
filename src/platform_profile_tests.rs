@@ -130,10 +130,10 @@ mod tests {
     #[test]
     fn ioc_sys_id_matches_profile() {
         let sys = (IOC_BASE + IOC_SYS_ID) as u64;
-        let indy = Ioc::new_ci(true);
+        let indy = Ioc::new(true);
         assert_eq!(indy.read32(sys).data, 0x26, "Indy guinness sys_id");
 
-        let fullhouse = Ioc::new_ci(false);
+        let fullhouse = Ioc::new(false);
         assert_eq!(
             fullhouse.read32(sys).data,
             0x11,
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn fullhouse_vblank_routes_sg_retrace_to_l1() {
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VerticalRetrace, true);
         let l1 = ioc.read32((IOC_BASE + IOC_INT3_L1_STAT) as u64).data as u8;
         assert_ne!(l1 & l1_regs::VERTICAL_RETRACE, 0, "SG retrace should assert L1 vblank");
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn ioc_fullhouse_gc_select_read_write() {
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         let gc = (IOC_BASE + crate::dev::ioc::IOC_GC_SELECT) as u64;
         assert_eq!(ioc.write32(gc, 0x0F), crate::traits::BUS_OK);
         assert_eq!(ioc.read32(gc).data, 0x0F, "fullhouse gc_select round-trip");

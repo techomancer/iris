@@ -15,7 +15,7 @@ use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::devlog::LogModule;
-use crate::dev::serial_host::{NullBackend, SerialBackend, TcpSocketBackend};
+use crate::dev::serial_host::{NullBackend, SerialBackend};
 
 pub mod scc_regs {
     pub const WR0: u8 = 0; // Command/Pointer
@@ -379,46 +379,18 @@ const CONSOLE_TAP_CAP: usize = 64 * 1024;
 pub const DEFAULT_PORTS: [u16; 2] = [8880, 8881];
 
 impl Z85c30 {
-    /// Default constructor: binds TCP serial backends on 127.0.0.1:8880
-    /// (channel A / tty2) and 127.0.0.1:8881 (channel B / tty1).
+    /// A controller whose channels are wired to nothing: the machine installs
+    /// each channel's host end with `set_backend_a` / `set_backend_b` before
+    /// the first `start()`.
     pub fn new(irq: Option<IrqLine>) -> Self {
-        Self::new_with_ports(irq, DEFAULT_PORTS)
+        Self::new_inner(irq)
     }
 
-    /// As `new`, with the TCP ports of channels A and B on 127.0.0.1.
-    pub fn new_with_ports(irq: Option<IrqLine>, ports: [u16; 2]) -> Self {
-        Self::new_inner(irq, Some(ports))
-    }
-
-    /// CI-mode constructor: uses null backends instead of binding TCP. The
-    /// caller is expected to install real backends via `set_backend_a` /
-    /// `set_backend_b` before the first `start()`. Avoids port conflicts
-    /// when multiple `--ci` instances run in parallel.
-    pub fn new_null(irq: Option<IrqLine>) -> Self {
-        Self::new_inner(irq, None)
-    }
-
-    fn new_inner(irq: Option<IrqLine>, ports: Option<[u16; 2]>) -> Self {
+    fn new_inner(irq: Option<IrqLine>) -> Self {
         let ip_a = Arc::new(AtomicU8::new(0));
         let ip_b = Arc::new(AtomicU8::new(0));
-
-        let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) = if let Some([a, b]) = ports {
-            let tcp_or_null = |port: u16, setting: &str| -> Arc<dyn SerialBackend> {
-                match TcpSocketBackend::new(("127.0.0.1", port)) {
-                    Some(b) => Arc::new(b),
-                    None => {
-                        eprintln!("iris: serial port {port} unavailable; is another iris using it? Set {setting} to run both.");
-                        Arc::new(NullBackend)
-                    }
-                }
-            };
-            (
-                tcp_or_null(a, "serial_port_a (--serial-port-a)"),
-                tcp_or_null(b, "serial_port_b (--serial-port-b)"),
-            )
-        } else {
-            (Arc::new(NullBackend), Arc::new(NullBackend))
-        };
+        let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) =
+            (Arc::new(NullBackend), Arc::new(NullBackend));
 
         Self {
             channel_a: Arc::new((Mutex::new(Channel::new("A", ip_a.clone(), ip_b.clone(), irq.clone())), Condvar::new())),
@@ -896,7 +868,7 @@ impl Saveable for Z85c30 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev::serial_host::CiSerialBackend;
+    use crate::dev::serial_host::{CiSerialBackend, TcpSocketBackend};
 
     /// Two clients on one TCP serial console: both see every byte the guest
     /// sends, and what either types arrives, with telnet's own commands
@@ -954,7 +926,7 @@ mod tests {
     }
 
     /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
-    /// re-serialize byte-identically. Use new_null so the test doesn't bind any
+    /// re-serialize byte-identically. Use new so the test doesn't bind any
     /// TCP ports.
     ///
     /// The `status` fixtures below are already normalized against empty FIFOs
@@ -962,7 +934,7 @@ mod tests {
     /// deliberately not an identity on that field; do not "fix" them back.
     #[test]
     fn save_load_round_trip() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_a.0.lock();
             ch.regs[0]  = 0x44;
@@ -982,7 +954,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&v1).expect("load_state");
         let v2 = dst.save_state();
 
@@ -1003,7 +975,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        let scc = Z85c30::new_null(None);
+        let scc = Z85c30::new(None);
         let backend = Arc::new(CiSerialBackend::new());
         scc.set_backend_a(backend.clone());
 
@@ -1046,11 +1018,11 @@ mod tests {
 
     #[test]
     fn restore_clears_rx_char_available() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().status |= rr0::RX_CHAR_AVAILABLE;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert_eq!(dst.channel_a.0.lock().status & rr0::RX_CHAR_AVAILABLE, 0,
@@ -1060,11 +1032,11 @@ mod tests {
 
     #[test]
     fn restore_forces_tx_buffer_empty() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().status &= !rr0::TX_BUFFER_EMPTY;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert_ne!(dst.channel_a.0.lock().status & rr0::TX_BUFFER_EMPTY, 0,
@@ -1074,7 +1046,7 @@ mod tests {
 
     #[test]
     fn restore_rearms_tx_int_pending() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_a.0.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
@@ -1082,7 +1054,7 @@ mod tests {
         }
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert!(dst.channel_a.0.lock().tx_int_pending,
@@ -1095,11 +1067,11 @@ mod tests {
     /// stays green even with the WR1 conjunct deleted from `channel_from_toml`.
     #[test]
     fn restore_leaves_latch_disarmed_when_tx_int_disabled() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert!(!dst.channel_a.0.lock().tx_int_pending,
@@ -1110,11 +1082,11 @@ mod tests {
     /// through RR3 and has to assert the latch itself.
     #[test]
     fn restore_leaves_latch_disarmed_when_transmitter_disabled() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert!(!dst.channel_a.0.lock().tx_int_pending,
@@ -1126,7 +1098,7 @@ mod tests {
     /// publishes. `machine.rs` puts the CI console on B.
     #[test]
     fn restore_channel_b_tx_int_reaches_rr3_via_a() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_b.0.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
@@ -1134,7 +1106,7 @@ mod tests {
         }
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         dst.channel_a.0.lock().reg_ptr = scc_regs::RR3;
@@ -1144,7 +1116,7 @@ mod tests {
 
     #[test]
     fn restore_redrives_irq_line() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_a.0.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
@@ -1153,7 +1125,7 @@ mod tests {
         let saved = src.save_state();
 
         let (probe, line) = crate::irq::LevelProbe::line();
-        let dst = Z85c30::new_null(Some(line));
+        let dst = Z85c30::new(Some(line));
         dst.load_state(&saved).expect("load_state");
 
         assert!(probe.level(),

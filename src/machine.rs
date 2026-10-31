@@ -396,36 +396,38 @@ impl Machine {
         let l1i_fetch_count      = Arc::new(AtomicU64::new(0)); // L1-I fetch counter
         let uncached_fetch_count = Arc::new(AtomicU64::new(0)); // uncached instruction fetches
 
-        // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
-        // bindings so multiple `--ci` instances can coexist.
-        let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
+        // HPC3 (512KB at 0x1FB80000). The SCC's channels start wired to
+        // nothing; each gets its host end below.
+        let ioc = Ioc::new_for_profile(guinness, cfg.machine.profile.ip28());
         ioc.ps2().set_layout(cfg.keyboard);
 
         // One sink for both serial paths, so the CI and TCP logs are the same
         // bytes (timestamps included). Opened once, before any peripheral
         // `start()` clones the current backend Arc into the RX/TX threads.
-        let serial_log = crate::dev::serial_host::open_log(&cfg, "Indy", crate::dev::serial_host::LogMode::Append);
+        let tag = if guinness { "Indy" } else { "Indigo2" };
+        let serial_log = crate::dev::serial_host::open_log(&cfg, tag, crate::dev::serial_host::LogMode::Append);
 
-        // CI mode replaces the default TCP backend on channel B (tty1, the
-        // SGI serial console) with an in-process backend the control socket
-        // drives directly. Channel A (tty2) keeps its default TCP backend.
-        let ci_serial = if ci_enabled {
-            let b = Arc::new(crate::dev::serial_host::CiSerialBackend::new());
-            if let Some(log) = &serial_log {
-                b.set_log(log.clone());
-            }
-            ioc.scc().set_backend_b(b.clone());
-            Some(b)
-        } else {
-            // Non-CI mode: channel B already has its TCP listener on
-            // 127.0.0.1:8881 (or `serial_port_b`). Wrap it in a TeeBackend so
-            // guest-emitted bytes also reach the file.
-            if let Some(log) = &serial_log {
-                let inner = ioc.scc().backend_b();
-                ioc.scc().set_backend_b(Arc::new(crate::dev::serial_host::TeeBackend::new(inner, log.clone())));
-            }
-            None
-        };
+        // Channel B (tty1) is the SGI serial console: in CI mode the
+        // in-process backend the control socket drives directly, otherwise
+        // TCP on `serial_port_b`, either teed to `serial_log`. Channel A
+        // (tty2) serves TCP on `serial_port_a` outside CI mode, so several
+        // `--ci` instances can run side by side.
+        let [port_a, port_b] = cfg.serial_ports();
+        let ci_serial = ci_enabled.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
+        let label = format!("{tag} serial channel B");
+        let (console, _) = crate::dev::serial_host::serial_line(
+            &crate::dev::serial_host::SerialLine { label: &label, tcp_port: Some(port_b), tcp_setting: "serial_port_b" },
+            serial_log.clone(),
+            ci_serial.as_ref(),
+        );
+        ioc.scc().set_backend_b(console);
+        let label = format!("{tag} serial channel A");
+        let (channel_a, _) = crate::dev::serial_host::serial_line(
+            &crate::dev::serial_host::SerialLine { label: &label, tcp_port: (!ci_enabled).then_some(port_a), tcp_setting: "serial_port_a" },
+            None,
+            None,
+        );
+        ioc.scc().set_backend_a(channel_a);
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());

@@ -2355,7 +2355,7 @@ mod tests {
         let nveeprom = dir.join("nveeprom.bin").to_str().unwrap().to_owned();
         let ee = Arc::new(Mutex::new(Eeprom93c56::with_path(LogModule::Nveeprom, nveeprom.clone())));
         let hpc = Hpc3::with_net(
-            ee.clone(), Ioc::new_ci(true), false, Arc::new(AtomicU64::new(0)),
+            ee.clone(), Ioc::new(true), false, Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(), true, AudioConfig::default(), nvram.clone(),
             RtcOffset::default(), true, Hpc3::new_scsi_buses(false),
         );
@@ -2379,7 +2379,7 @@ mod tests {
     fn hpc3_for_test() -> Hpc3 {
         Hpc3::with_net(
             Arc::new(Mutex::new(Eeprom93c56::new())),
-            Ioc::new_ci(true),
+            Ioc::new(true),
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),
@@ -2554,7 +2554,7 @@ mod enet_rx_chain_tests {
     fn hpc3_for_test() -> Hpc3 {
         Hpc3::with_net(
             Arc::new(Mutex::new(Eeprom93c56::new())),
-            Ioc::new_ci(true),
+            Ioc::new(true),
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),

@@ -524,29 +524,14 @@ pub struct Ioc {
 
 impl Ioc {
     pub fn new(guinness: bool) -> Self {
-        Self::new_inner(guinness, false)
+        Self::new_for_profile(guinness, false)
     }
 
-    /// CI-mode constructor: skips TCP serial backend binding on SCC channels
-    /// so multiple instances can run in parallel without port conflicts.
-    /// Caller must install backends via `scc().set_backend_{a,b}` before the
-    /// first `start()`.
-    pub fn new_ci(guinness: bool) -> Self {
-        Self::new_inner(guinness, true)
-    }
-
-    /// As `new`/`new_ci`, with the machine profile's IP28 flag: an IP28
-    /// baseboard must report a high enough HPC3 board revision.
-    /// `serial_ports` are the SCC's TCP ports (channels A and B) outside CI mode.
-    pub fn new_for_profile(guinness: bool, ci_mode: bool, ip28: bool, serial_ports: [u16; 2]) -> Self {
-        Self::new_inner_profile(guinness, ci_mode, ip28, serial_ports)
-    }
-
-    fn new_inner(guinness: bool, ci_mode: bool) -> Self {
-        Self::new_inner_profile(guinness, ci_mode, false, crate::dev::z85c30::DEFAULT_PORTS)
-    }
-
-    fn new_inner_profile(guinness: bool, ci_mode: bool, ip28: bool, serial_ports: [u16; 2]) -> Self {
+    /// As `new`, with the machine profile's IP28 flag: an IP28 baseboard
+    /// must report a high enough HPC3 board revision. The SCC's channels are
+    /// wired to nothing; the machine installs their host ends through
+    /// `scc().set_backend_{a,b}` before the first `start()`.
+    pub fn new_for_profile(guinness: bool, ip28: bool) -> Self {
         // HPC3 SYS_ID: [7:5] chip rev, [4:1] board rev, [0] 1 = fullhouse.
         // The PROM looks at bit 0 to tell fullhouse from guinness. IRIX reads
         // the board revision to tell an IP28 baseboard from an IP26 one and
@@ -602,11 +587,7 @@ impl Ioc {
 
         let ps2_irq = IrqLine::new(Arc::new(IocInputs(state.clone())), IocInterrupt::KbMouse.line());
 
-        let scc = if ci_mode {
-            Z85c30::new_null(Some(serial_irq))
-        } else {
-            Z85c30::new_with_ports(Some(serial_irq), serial_ports)
-        };
+        let scc = Z85c30::new(Some(serial_irq));
 
         Self {
             state,
@@ -1391,7 +1372,7 @@ mod tests {
         }
         assert_eq!(IocInterrupt::from_line(IocInterrupt::ALL.len() as u32), None);
 
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         let serial = ioc.irq_line(IocInterrupt::Serial);
         serial.set(true);
         assert_ne!(ioc.state.lock().map_stat & map_regs::SERIAL, 0);
@@ -1408,7 +1389,7 @@ mod tests {
     /// on a clear bit is not.
     #[test]
     fn timer_ticks_count_fast_clock_and_acknowledgements() {
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         let hz = Arc::new(AtomicU64::new(0));
         ioc.set_clock_ticks(hz.clone());
         let cb = |source| IocTimerCallback { state: ioc.state.clone(), source, ticks: ioc.clock_ticks.clone() };
@@ -1439,7 +1420,7 @@ mod tests {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().extend_from_slice(b); Ok(b.len()) }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         {
             let mut s = ioc.state.lock();
             s.ticks[1].fire();
@@ -1466,7 +1447,7 @@ mod tests {
             (CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6) as u64,
             "the IOC drives IP2..IP6; IP7 and bit 63 belong to the CPU");
 
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         let word = AtomicU64::new(u64::MAX); // every line pending, including the CPU's
         ioc.set_interrupts(&word);
         ioc.power_on();
@@ -1482,7 +1463,7 @@ mod tests {
     fn save_load_round_trip() {
         // new_ci uses null serial backends — avoids TCP port binding under
         // concurrent test runs.
-        let src = Ioc::new_ci(true);
+        let src = Ioc::new(true);
         {
             let mut s = src.state.lock();
             s.l0_stat   = 0x12; s.l0_mask  = 0x34;
@@ -1501,7 +1482,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Ioc::new_ci(true);
+        let dst = Ioc::new(true);
         dst.load_state(&v1).expect("load_state");
         let v2 = dst.save_state();
 
