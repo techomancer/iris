@@ -110,11 +110,13 @@ impl Rig {
         Rig { c, mem, wire, pin }
     }
 
+    /// A 32-bit register as the processor sees it through the self-ordered
+    /// slot: the BAR value is the address-order bytes read little-endian.
     fn r32(&self, a: u32) -> u32 {
-        self.c.bar_read(0, a, 4)
+        self.c.bar_read(0, a, 4).swap_bytes()
     }
     fn w32(&self, a: u32, v: u32) {
-        self.c.bar_write(0, a, v, 4)
+        self.c.bar_write(0, a, v.swap_bytes(), 4)
     }
     fn r8(&self, a: u32) -> u8 {
         self.c.bar_read(0, a, 1) as u8

@@ -23,10 +23,13 @@
 //!
 //! # Byte order
 //!
-//! IOC4 orders its own bytes. The bridge hands it the register's address and
-//! value as software wrote them, so a byte access to UART register `r` of
-//! port `n` arrives at `0x380 + 8n + r`, and a 32-bit access is the register
-//! value, with no lane swap on either side. Control registers and the
+//! IOC4 orders its own bytes. Its slot is self-ordered: the bridge carries the
+//! processor's bytes in address order and leaves the address alone, so a
+//! byte access to UART register `r` of port `n` arrives at `0x380 + 8n + r`.
+//! A PCI function's BAR value is its bytes read little-endian, and IOC4 reads
+//! them big-endian, so the chip takes a 32-bit value byte-reversed: the
+//! processor's value is the register's value, as QEMU's big-endian IOC4
+//! region reads it. Control registers and the
 //! keyboard block take 32-bit accesses only; a UART window or the clock takes
 //! bytes only. Anything else is refused (reads zero, writes dropped). Which widths the silicon accepts is not
 //! known.
@@ -944,13 +947,13 @@ impl PciBusDevice for Ioc4 {
                 Ioc4::refuse("KBC read", width, off);
                 return 0;
             }
-            return self.sh.with_st(|st| st.kbc_read(off - reg::KBC));
+            return self.sh.with_st(|st| st.kbc_read(off - reg::KBC)).swap_bytes();
         }
         if width != 4 || off & 3 != 0 {
             Ioc4::refuse("read", width, off);
             return 0;
         }
-        self.sh.with_st(|st| st.read32(off))
+        self.sh.with_st(|st| st.read32(off)).swap_bytes()
     }
 
     fn bar_write(&self, bar: usize, off: u32, val: u32, width: usize) {
@@ -978,14 +981,14 @@ impl PciBusDevice for Ioc4 {
                 Ioc4::refuse("KBC write", width, off);
                 return;
             }
-            self.sh.with_st(|st| st.kbc_write(off - reg::KBC, val));
+            self.sh.with_st(|st| st.kbc_write(off - reg::KBC, val.swap_bytes()));
             return;
         }
         if width != 4 || off & 3 != 0 {
             Ioc4::refuse("write", width, off);
             return;
         }
-        self.sh.with_st(|st| st.write32(off, val));
+        self.sh.with_st(|st| st.write32(off, val.swap_bytes()));
     }
 
     /// The PCI interrupt pin: any enabled source.
