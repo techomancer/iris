@@ -639,7 +639,7 @@ impl Board {
                 self.tex_coord_q = ODSY_F32_ONE;
             }
             ODSY_GL_TEX_RECT => {
-                if !self.texture_build_level() && !self.tex_rect_reported {
+                if !self.texture_build_level() && !self.texture_zoom_rect() && !self.tex_rect_reported {
                     self.tex_rect_reported = true;
                     crate::dlog!(
                         LogModule::Odyssey,

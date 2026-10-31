@@ -1705,4 +1705,56 @@ impl Board {
         }
         true
     }
+
+    /// One rectangle of the library's texture move drawn as a pixel zoom:
+    /// fourteen floats, a constant colour (0, 0, 0, 1), the destination
+    /// corners (x0, ya, z) and (x1, yb, z), then the source corners (s0, t0)
+    /// and (s1, t1). The mip-level builder (texture_build_level()) sends
+    /// the same word with an alpha of 0, so a word that is not one of those
+    /// builds is a zoom rectangle when the colour is exactly (0, 0, 0, 1).
+    ///
+    /// Datasheet, "Pixel zoom: the texture move and its rectangle". The
+    /// library sends the move as BEGIN of type 7 (quads), one such word per
+    /// source row (per whole destination row under a y zoom), and END, after
+    /// it has set the sampler, the level-60 descriptor and a stored raster
+    /// state, all of which arrive as ordinary commands. ESTABLISHED: the word
+    /// layout and the begin and end around it. INFERRED: the first four
+    /// floats are a constant colour and the repeated z gives both corners'
+    /// depth. UNKNOWN: the count-14 word's fields, and the magnification
+    /// filter, since the move sends no filter word.
+    ///
+    /// The rectangle goes down the ordinary textured vertex path as four
+    /// float vertices of a quad, so it takes the sampler, raster state and
+    /// clip the guest sent. Returns whether the word was taken as a zoom
+    /// rectangle. The colour words are not applied: with a replacing texture
+    /// environment they do not reach the pixel, and the environment is the
+    /// stored raster state's to say.
+    pub fn texture_zoom_rect(&mut self) -> bool {
+        let p = self.cmd_operand;
+
+        if p[..3] != [0; 3] || p[3] != ODSY_F32_ONE || self.gl_primitive != ODSY_GL_QUADS || !self.gl_begin_open {
+            return false;
+        }
+        let (tag, operands) = (self.cmd_tag, self.cmd_operand);
+        let (x0, ya, z, x1, yb) = (p[4], p[5], p[6], p[7], p[8]);
+        let (s0, t0, s1, t1) = (p[10], p[11], p[12], p[13]);
+
+        // The corners are window pixels, so the combined matrix is the
+        // identity for the rectangle and the guest's comes back after.
+        let identity = [1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+
+        self.gl_load_combined(&identity);
+        self.tex_coord_r = 0;
+        self.tex_coord_q = ODSY_F32_ONE;
+        for (x, y, s, t) in [(x0, ya, s0, t0), (x1, ya, s1, t0), (x1, yb, s1, t1), (x0, yb, s0, t1)] {
+            self.tex_coord = [s, t];
+            self.cmd_operand[..4].copy_from_slice(&[x, y, z, 0]);
+            self.cmd_tag = ODSY_GL_VERTEX_3F;
+            self.cmd_dispatch(ODSY_GL_VERTEX_3F);
+        }
+        self.gl_reload_combined();
+        self.cmd_tag = tag;
+        self.cmd_operand = operands;
+        true
+    }
 }
