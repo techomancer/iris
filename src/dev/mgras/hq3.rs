@@ -679,6 +679,8 @@ impl Hq3Engine {
                 ifr[..0x80].copy_from_slice(&self.dma_regs);
                 ifr[0x80..IF_WORDS].copy_from_slice(&self.raster_if_regs);
             }
+            // The first switch has no outgoing slot, so there is nothing to save.
+            None if self.slot.is_none() => {}
             None => sink.note(format!("context switch from slot {:x?}: nowhere to save", self.slot)),
         }
         self.context_words = host::CONTEXT_SWITCH_WORDS;

@@ -274,6 +274,25 @@ fn context_switch_swallows_the_incoming_context() {
     m.stop_engines();
 }
 
+/// The first switch has no outgoing slot: it saves nothing and reports nothing.
+#[test]
+fn first_context_switch_reports_nothing_to_save() {
+    let m = live_board();
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    assert!(!m.noted("nowhere to save"), "no slot to save on the first switch");
+    m.stop_engines();
+}
+
+/// A slot outside ERAM is a real missing save target and is still reported.
+#[test]
+fn switch_away_from_a_slot_outside_eram_is_reported() {
+    let m = live_board();
+    switch_to_gl_context(&m, 0xFFFF_0000, 0, 0, 100, 100);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    assert!(m.noted("nowhere to save"), "the outside-ERAM slot has no record to save into");
+    m.stop_engines();
+}
+
 #[test]
 fn ge11_microcode_reads_back_as_the_driver_verifies_it() {
     let m = live_board();
