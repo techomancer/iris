@@ -138,8 +138,11 @@ impl FuelMachine {
         // After the windows above: each compile worker takes the cache's
         // geometry and the CPU model's policies once, as it starts, and
         // without the windows the geometry has no inline load or store path.
-        // Workers read plain physical code addresses, which the cached plane
-        // serves; the uncached views would decode them as Hub registers.
+        // Workers read plain physical code addresses through the view the CPU
+        // fetched each page by: the cached plane for cached pages, the
+        // uncached attribute-0 view for the reset PROM's uncached fetches.
+        // Decoding plain addresses in the uncached views for cached pages
+        // would reach Hub registers.
         #[cfg(feature = "jitv2")]
         {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -154,7 +157,7 @@ impl FuelMachine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(board.cached_bus(), stats);
+                g.compile_queue.start(board.code_bus(), stats);
             }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
@@ -834,6 +837,9 @@ impl FuelBoard {
         }
         // Reset execution always sees stored bytes, independently of commands.
         bus.map(0, 0x1fc0_0000, 0x40_0000, prom.clone());
+        // The same PROM where an uncached instruction fetch of that window is
+        // presented (`MipsExecutor::uncached_fetch_alias`).
+        bus.map(0, crate::ip35::RESET_WINDOW_FETCH, crate::ip35::RESET_WINDOW_SIZE, prom.clone());
         if !payload.is_empty() {
             map_device(
                 &phys,
@@ -891,9 +897,25 @@ impl FuelBoard {
         self.bus.cached_view(self.md.dma_view())
     }
 
+    /// The bus the JIT compiles code through; see [`Ip35Bus::code_view`].
+    #[cfg(feature = "jitv2")]
+    pub fn code_bus(&self) -> Arc<dyn BusDevice> {
+        self.bus.code_view(self.cached_bus())
+    }
+
     pub fn build_cpu(&self) -> Box<FuelCpu> {
         let mut cpu = build_cpu(self.bus.clone());
         cpu.cache = R12000ShadowCache::new(self.cached_bus());
+        // The PROM fetches its own code uncached; with memory over its window
+        // the cached plane answers RAM there, so the fetch is presented at the
+        // PROM's own address and compiled from the view that holds it.
+        cpu.set_uncached_fetch_alias(
+            crate::ip35::RESET_WINDOW,
+            crate::ip35::RESET_WINDOW_SIZE,
+            crate::ip35::RESET_WINDOW_FETCH,
+        );
+        #[cfg(feature = "jitv2")]
+        cpu.set_jitv2_code_bus(self.code_bus());
         // The PROM keeps its stack in cache lines it tags for a window with no
         // memory behind it yet; the controller answers that window while they stand.
         let memory = self.md.clone();

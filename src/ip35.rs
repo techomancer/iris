@@ -23,6 +23,25 @@ use std::sync::Arc;
 pub(crate) const CPU_PHYS_MASK: u64 = ((1u64 << 40) - 1) | (3u64 << 57);
 const PA_MASK: u64 = (1u64 << 40) - 1;
 
+/// The reset PROM's compatibility window: the processor's reset vector and
+/// the PROM's own code are at 0x1fc00000, fetched uncached.
+pub(crate) const RESET_WINDOW: u64 = 0x1fc0_0000;
+pub(crate) const RESET_WINDOW_SIZE: u64 = 0x40_0000;
+/// Where an uncached instruction fetch of the reset window is presented to
+/// the bus (`MipsExecutor::uncached_fetch_alias`): the same PROM at an
+/// address of its own, above every RAM slot and below the 16 GiB the JIT's
+/// frame map covers.
+///
+/// The split is inferred. The hardware selects a space by the processor's
+/// uncached attribute (established: ip35-address-map.md, "Processor-side
+/// address spaces"), so an uncached attribute-0 access and a cached one are
+/// different requests to Bedrock. What attribute 0 returns at 0x1fc00000 is
+/// not established: no public source says how the reset request reaches flash
+/// (ip35-address-map.md, reset vector), and the cached side is likewise open.
+/// The reset PROM answering uncached fetches while cached accesses reach RAM
+/// is what PROM 6.210's memory test needs, and that is all this decode rests on.
+pub(crate) const RESET_WINDOW_FETCH: u64 = 0x2_0000_0000;
+
 /// Where the Fuel has memory: four 1 GiB slots Bedrock's memory controller
 /// can place its two 256 MiB banks in, depending on how the PROM programs
 /// it, and the reset PROM between the first two. Uncached fetches of the
@@ -34,7 +53,8 @@ pub fn memory_map() -> crate::memory_map::MemoryMap {
         let base = slot as u64 * BANK_SPAN;
         MemRange::new(name, MemKind::Ram, base, base + FITTED_BANK)
     }).collect();
-    ranges.push(MemRange::new("prom", MemKind::Rom, 0x1fc0_0000, 0x2000_0000));
+    ranges.push(MemRange::new("prom", MemKind::Rom, RESET_WINDOW, 0x2000_0000));
+    ranges.push(MemRange::new("prom (uncached fetch)", MemKind::Rom, RESET_WINDOW_FETCH, RESET_WINDOW_FETCH + RESET_WINDOW_SIZE));
     MemoryMap::new(ranges)
 }
 
@@ -237,6 +257,13 @@ impl Ip35Bus {
         let pa = plain_address(a, n)?;
         Some((&self.views[(a >> 57) as usize], pa))
     }
+    /// The bus the JIT compiles code through: the cached view, except the
+    /// reset PROM's uncached-fetch window ([`RESET_WINDOW_FETCH`]), which only
+    /// the uncached view holds.
+    #[cfg(feature = "jitv2")]
+    pub fn code_view(self: &Arc<Self>, cached: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+        Arc::new(CodeViews { cached, uncached: self.clone() })
+    }
     pub fn cached_view(&self, plain_memory: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         Arc::new(CachedPhysical {
             phys: self.phys.clone(),
@@ -250,6 +277,29 @@ fn plain_address(a: u64, n: u64) -> Option<u64> {
     }
     let pa = a & PA_MASK;
     (pa.checked_add(n)? <= PA_MASK + 1).then_some(pa)
+}
+/// Whether `a` is in the reset PROM's uncached-fetch window.
+fn in_fetch_window(a: u64) -> bool {
+    a.wrapping_sub(RESET_WINDOW_FETCH) < RESET_WINDOW_SIZE
+}
+/// See [`Ip35Bus::code_view`]. Compiles read instruction words only.
+#[cfg(feature = "jitv2")]
+struct CodeViews {
+    cached: Arc<dyn BusDevice>,
+    uncached: Arc<Ip35Bus>,
+}
+#[cfg(feature = "jitv2")]
+impl BusDevice for CodeViews {
+    fn read32(&self, a: u64) -> BusRead32 {
+        if in_fetch_window(a) {
+            self.uncached.read32(a)
+        } else {
+            self.cached.read32(a)
+        }
+    }
+    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
+        if in_fetch_window(a) { self.uncached.gen_ptr(a) } else { self.cached.gen_ptr(a) }
+    }
 }
 struct CachedPhysical {
     phys: Arc<Physical>,
@@ -295,6 +345,13 @@ macro_rules! processor_access {
 impl BusDevice for Ip35Bus {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
+        if in_fetch_window(address) {
+            // The reset PROM's page: its generation is the PROM device's, so
+            // a flash command invalidates it and a store to RAM never does.
+            // The counter covers the whole flash, so any flash write
+            // invalidates every PROM page (over-invalidation, safe).
+            return self.views[0].gen_ptr(address);
+        }
         if address & !PA_MASK == 0 {
             // JIT page lookup passes plain physical code addresses, without
             // a cache attribute. Raw UC0 therefore cannot select the MMIO map

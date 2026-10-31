@@ -1006,6 +1006,10 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// short loop).
     #[cfg(feature = "jitv2")]
     pub jitv2_inline_compile: bool,
+    /// The bus compiles read code through, when it is not `sysad` itself
+    /// (see [`Self::set_jitv2_code_bus`]).
+    #[cfg(feature = "jitv2")]
+    jitv2_code_bus: Option<Arc<dyn BusDevice>>,
     /// Scratch analyzer for `jitv2_inline_compile`'s synchronous path — same
     /// `comp::handle_request` compile sequence the real async compile-thread
     /// runs, just called directly on the CPU thread. Kept alive across calls
@@ -1052,6 +1056,15 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// reach EntryLo and come out as physical address bits 32 and up. All
     /// ones (no fold) by default; each machine sets its own.
     pub phys_mask: u64,
+    /// A window of physical addresses the board decodes differently for an
+    /// uncached instruction fetch, `(base, size, target)`: the fetch is
+    /// presented to the bus at `target` plus the offset into the window. The
+    /// Fuel's reset PROM answers uncached fetches at 0x1fc00000 whatever the
+    /// cached view holds there, and gives that device an address of its own,
+    /// so the code page for it is keyed, read and invalidated by address like
+    /// any other. None on the other machines, whose uncached and cached
+    /// instruction fetches reach the same bytes.
+    uncached_fetch_alias: Option<Box<FetchAlias<T, C>>>,
     /// Where the machine has memory, from [`MipsCpuConfig::memory`].
     pub memory: Arc<crate::memory_map::MemoryMap>,
     /// Frames the JIT's page table has, the end of `memory` in pages. Kept
@@ -1173,6 +1186,31 @@ fn translate_64_supervisor<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u
 }
 fn translate_64_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_64bit_impl::<false, {crate::cpu::mips_core::PRIV_USER}>(va, at)
+}
+
+/// A window whose uncached instruction fetch the board decodes apart, and the
+/// translation it wraps (`MipsExecutor::set_uncached_fetch_alias`).
+struct FetchAlias<T: Tlb, C: CpuModel> {
+    base: u64,
+    size: u64,
+    target: u64,
+    inner: fn(&mut MipsExecutor<T, C>, u64, AccessType) -> TranslateResult,
+}
+
+/// The translation wrappers above for a board that decodes an uncached
+/// instruction fetch apart. Only a fetch that comes out uncached is changed.
+fn translate_fetch_aliased<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+    let inner = e.uncached_fetch_alias.as_ref().map_or(translate_32_kernel::<T, C> as fn(&mut MipsExecutor<T, C>, u64, AccessType) -> TranslateResult, |a| a.inner);
+    let mut result = inner(e, va, at);
+    if at == AccessType::Fetch && !result.is_exception() && !result.is_cached() {
+        if let Some(alias) = e.uncached_fetch_alias.as_ref() {
+            let offset = result.phys.wrapping_sub(alias.base);
+            if offset < alias.size {
+                result.phys = alias.target + offset;
+            }
+        }
+    }
+    result
 }
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
@@ -2499,6 +2537,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2_inline_compile: cfg!(feature = "jitv2_lockstep"),
             #[cfg(feature = "jitv2")]
+            jitv2_code_bus: None,
+            #[cfg(feature = "jitv2")]
             jitv2_inline_analyzer: crate::cpu::jitv2::analyzer::Analyzer::with_isa(C::MIPS4),
             // IRIS_JIT_DISPATCH=off starts with the JIT dispatch gate shut: the
             // same binary as an interpreter-only reference, for comparing
@@ -2509,6 +2549,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             batch_hook: None,
             phys_alias: None,
             phys_mask: u64::MAX,
+            uncached_fetch_alias: None,
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
             jitv2_frames: crate::cpu::jitv2::jitv2::frames_for(&cfg.memory),
@@ -3073,7 +3114,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[cfg(feature = "jitv2")]
     pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
         crate::pf_scope!(crate::perfetto::events::JIT_CPU_FLUSH);
-        let bus = self.sysad.clone();
+        let bus = self.jitv2_compile_bus();
         let jit = self.jitv2.clone();
         let flush = || {
             let mut j = jit.lock();
@@ -3100,6 +3141,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.memory.contains(paddr).then(|| self.jitv2_frame(paddr)).flatten().ok_or_else(|| format!(
             "{:#x} is not in this machine's memory ({}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
             paddr, self.memory))
+    }
+
+    /// Tell the JIT which bus compiles read code through, when it is not the
+    /// CPU's own: the Fuel reads cached pages through its cached plane, and
+    /// its reset PROM's page through the uncached view that holds it
+    /// (`uncached_fetch_alias`). Call while the executor is being built,
+    /// before it is shared or run.
+    #[cfg(feature = "jitv2")]
+    pub fn set_jitv2_code_bus(&mut self, code_bus: Arc<dyn BusDevice>) {
+        self.jitv2_code_bus = Some(code_bus);
+    }
+
+    /// The code page the last fetch landed on, or null.
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_current_page(&self) -> *mut crate::cpu::jitv2::PhysicalCodePage {
+        self.pcp
+    }
+
+    /// The bus compile workers and the inline compile read code through.
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_compile_bus(&self) -> Arc<dyn BusDevice> {
+        self.jitv2_code_bus.clone().unwrap_or_else(|| self.sysad.clone())
     }
 
     #[cfg(feature = "jitv2")]
@@ -3148,7 +3211,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline(always)]
     fn jitv2_track_pcp(&mut self, phys_addr: u64) {
         // Code above the JIT's pfn map gets no page and runs in the
-        // interpreter (`step_jit` checks for the null page).
+        // interpreter (`step_jit` checks for the null page). That includes
+        // uncached attributes 1 to 3: their bits 58:57 sit in `phys_addr`,
+        // so the frame range check rejects them.
         let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr, self.jitv2_frames) else {
             self.clear_pcp();
             return;
@@ -3277,7 +3342,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let is_64bit = self.core.is_64bit_mode();
         self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER && is_64bit { 3 } else { 0 };
         let privilege = self.core.get_privilege_mode();
-        self.translate_fn = match (is_64bit, privilege) {
+        let translate_fn = match (is_64bit, privilege) {
             (false, PrivilegeMode::Kernel)     => translate_32_kernel::<T, C>,
             (false, PrivilegeMode::Supervisor) => translate_32_supervisor::<T, C>,
             (false, PrivilegeMode::User)       => translate_32_user::<T, C>,
@@ -3285,6 +3350,37 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             (true,  PrivilegeMode::Supervisor) => translate_64_supervisor::<T, C>,
             (true,  PrivilegeMode::User)       => translate_64_user::<T, C>,
         };
+        self.translate_fn = translate_fn;
+        // A board that decodes an uncached instruction fetch apart wraps the
+        // translation itself, so the fetch paths of the other machines stay
+        // as they are.
+        if self.uncached_fetch_alias.is_some() {
+            self.wrap_translate_fn(translate_fn);
+        }
+    }
+
+    /// `update_translate_fn`'s choice, wrapped for `uncached_fetch_alias`.
+    /// Out of line so the update itself stays as small as it was; the wrapper
+    /// reaches the choice through a pointer so that the translation bodies keep
+    /// the one caller they inline into.
+    #[cold]
+    #[inline(never)]
+    fn wrap_translate_fn(&mut self, inner: fn(&mut Self, u64, AccessType) -> TranslateResult) {
+        if let Some(alias) = self.uncached_fetch_alias.as_mut() {
+            alias.inner = inner;
+        }
+        self.translate_fn = translate_fetch_aliased::<T, C>;
+    }
+
+    /// Present an uncached instruction fetch of the window `base..base+size`
+    /// to the bus at `target` plus the offset (see [`Self::uncached_fetch_alias`]).
+    pub fn set_uncached_fetch_alias(&mut self, base: u64, size: u64, target: u64) {
+        // Never called: `update_translate_fn` replaces it below.
+        fn placeholder<T: Tlb, C: CpuModel>(_: &mut MipsExecutor<T, C>, _: u64, _: AccessType) -> TranslateResult {
+            unreachable!("the translation wrapper is installed before it is used")
+        }
+        self.uncached_fetch_alias = Some(Box::new(FetchAlias { base, size, target, inner: placeholder::<T, C> }));
+        self.update_translate_fn();
     }
 
     /// Re-derive `fpr_read_d/write_d/read_l/write_l` from STATUS_FR.
@@ -9001,7 +9097,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.jitv2_compile_bus()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
@@ -9012,6 +9108,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             "jitv2_lockstep: inline compile found no Codegen (async compile queue stole it?) — \
              verification would silently be OFF. The queue must not run under lockstep.");
         let mut ran_out_of_memory = false;
+        let compile_bus = self.jitv2_compile_bus();
         if let Some(codegen) = codegen.as_mut() {
             // Stamp the L1-D geometry the inline load/store fast path needs.
             // Done on every take rather than once at startup so a cache
@@ -9023,10 +9120,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
-                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &compile_bus, &mut self.jitv2_inline_analyzer, codegen, &stats);
             }
             #[cfg(not(feature = "developer"))]
-            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
+            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &compile_bus, &mut self.jitv2_inline_analyzer, codegen); }
         }
         *self.jitv2.lock().codegen.lock() = codegen;
         {
@@ -9037,7 +9134,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.jitv2_compile_bus()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
