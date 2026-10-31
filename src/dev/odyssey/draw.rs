@@ -748,6 +748,11 @@ impl Board {
                 if is_index || preserve_alpha { rgba } else { (rgba & !0xffu32) | 0xff },
             );
         }
+        self.image_advance(x_decreasing, y_decreasing);
+    }
+
+    /// Step the raster cursor to the next pixel of the open image.
+    fn image_advance(&mut self, x_decreasing: bool, y_decreasing: bool) {
         if (x_decreasing && self.image_cur_x == self.image_x2) || (!x_decreasing && self.image_cur_x == self.image_x2.wrapping_sub(1)) {
             self.image_cur_x = if x_decreasing { self.image_x1.wrapping_sub(1) } else { self.image_x1 };
             if y_decreasing {
@@ -932,6 +937,66 @@ impl Board {
             || (pixel_bytes(self.image_code) == 0 && texel12_components(self.image_code) == 0 && write_form(self.image_write_code).is_some())
     }
 
+    /// One word of a format-0, type-4 burst: a pixel of the depth and
+    /// stencil word, four bytes.
+    ///
+    /// Datasheet, "Depth and stencil by pixel burst". ESTABLISHED: the
+    /// burst's operand carries no size field and no field codes, so the
+    /// header does not say which plane; the library selects the plane by
+    /// the write-mask block (0x052) it sends just before the burst. Its depth
+    /// download clears the stencil mask (bits 19:12) and keeps the depth-write
+    /// bit (24) as the application has it; its stencil download clears bit 24
+    /// and leaves the stencil mask. INFERRED: the enables decide which part of
+    /// the stored pixel changes, so the model writes the depth plane's word
+    /// (bits 23:0) when bit 24 is set, and the stencil plane's bits 19:12 of
+    /// block 0x052 select as `(data & mask) | (old & !mask)`. ESTABLISHED
+    /// (datasheet, "The stencil word and the write paths"): the library packs
+    /// the stencil index at bits 23:16 with no mask (index 0x11 is
+    /// 0x0011_0000) and the burst copies the word, so that byte is the data;
+    /// the 8-bit mask in bits 19:12 of block 0x052 applies to it, not to the
+    /// word as sent. UNKNOWN: how the board aligns the two, and where it
+    /// keeps the index inside a stored pixel. UNKNOWN: whether
+    /// the board runs the burst through the depth and stencil tests, and the
+    /// effect of their enables on it; the model applies neither. The same
+    /// clip-rectangle and window-ID tests as a GL fragment apply (model
+    /// choice, as for the DMA write).
+    pub fn image_depth_stencil_word(&mut self, word: u32) {
+        let x_decreasing = self.image_x2 < self.image_x1;
+        let y_decreasing = self.image_y2 < self.image_y1;
+        let y_finished = if y_decreasing {
+            self.image_cur_y == u32::MAX || self.image_cur_y < self.image_y2
+        } else {
+            self.image_cur_y >= self.image_y2
+        };
+
+        if (self.image_group_len != 0 && self.image_group_painted >= self.image_group_len)
+            || self.image_x2 == self.image_x1
+            || self.image_y2 == self.image_y1
+            || y_finished
+        {
+            return;
+        }
+        self.image_group_painted += 1;
+        let x = self.image_cur_x as i64 + self.win_origin[0] as i64;
+        let y = self.image_cur_y as i64 + self.win_origin[1] as i64;
+
+        // An off-screen object and the id planes hold no depth or stencil.
+        if self.image_object() < 0 && !self.dest_is_id_planes() && self.pixel_allowed(x, y) {
+            let mask = (self.gl_write_mask >> ODSY_WRITE_STENCIL_SHIFT) & ODSY_WRITE_STENCIL_MASK;
+
+            if self.gl_write_mask & ODSY_WRITE_DEPTH != 0 {
+                self.depth_store(x, y, word & ODSY_DEPTH24_MAX);
+            }
+            if mask != 0 {
+                let old = self.stencil_load(x, y);
+                let data = (word >> ODSY_BURST_STENCIL_SHIFT) & ODSY_WRITE_STENCIL_MASK;
+
+                self.stencil_store(x, y, ((data & mask) | (old & !mask)) as u8);
+            }
+        }
+        self.image_advance(x_decreasing, y_decreasing);
+    }
+
     /// One data word of a pixel burst, laid out by the transfer header's format
     /// code: its bytes join a stream that yields a pixel every
     /// pixel_bytes() bytes, so a three-byte pixel may span two words. A
@@ -948,14 +1013,7 @@ impl Board {
             return;
         }
         if code == ODSY_IMAGE_CODE_DEPTH_STENCIL {
-            // The library's depth and stencil images are both format 0, type
-            // 4; the DMA header's size field tells them apart (dma.rs) and a
-            // burst header has none. Which plane a burst names is unknown,
-            // so it paints nothing, not the colour planes.
-            if !self.image_code_reported {
-                self.image_code_reported = true;
-                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: a depth or stencil image by burst is not modeled; the header does not say which");
-            }
+            self.image_depth_stencil_word(word);
             return;
         }
         if self.image_fmt == ODSY_IMAGE_FMT_RGBA16 && texel12_components(code) != 0 {

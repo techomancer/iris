@@ -333,14 +333,53 @@ fn a_depth_or_stencil_image_by_dma_writes_its_own_plane() {
     assert_eq!(pixel(&s, 0, 30, 40), READ_PIXEL, "and colour");
 }
 
-/// The same code by pixel burst names no plane: nothing says depth or
-/// stencil, so it paints neither, and does not land in the colour planes as
-/// RGB.
+/// The burst carries no size field, so the plane comes from the write-mask
+/// block (0x052) sent just before it. A burst writes depth when bit 24 is
+/// set; stencil goes through bits 19:12 as `(data & mask) | (old & !mask)`.
+/// Neither lands in the colour planes. The library's depth download clears
+/// the stencil mask and its stencil download clears bit 24, so each leaves
+/// the other plane alone.
+///
+/// Datasheet: "Depth and stencil by pixel burst" (ESTABLISHED: the burst has
+/// no plane selector and the library sets block 0x052 as above; INFERRED:
+/// the enables pick the part that changes; UNKNOWN: depth and stencil tests
+/// on the burst, which the model does not apply).
 #[test]
-fn a_depth_or_stencil_image_by_burst_paints_nothing() {
+fn a_depth_or_stencil_burst_writes_the_plane_the_write_mask_names() {
     let (mut s, _) = window();
+    let write_mask = |s: &mut Board, v: u32| {
+        cmd(s, select(ODSY_REG_WRITE_MASK));
+        cmd(s, v);
+    };
+    // Depth download: bit 24 set, stencil mask clear.
+    write_mask(&mut s, ODSY_WRITE_DEPTH);
+    burst_image(&mut s, (40, 10, 42, 11), 0x0021_1080, ODSY_IMAGE_FMT_RGB, &[0xff12_3456, 0x00ab_cdef]);
+    assert_eq!(s.depth_load(40, 10), 0x0012_3456, "bits 31:24 are not depth");
+    assert_eq!(s.depth_load(41, 10), 0x00ab_cdef);
+    assert_eq!(stencil_at(&s, 40, 10), 0, "a depth download leaves stencil");
 
-    burst_image(&mut s, (40, 10, 42, 11), 0x0021_1080, ODSY_IMAGE_FMT_RGB, &[0x0012_3456, 0x00ab_cdef]);
+    // Stencil download: bit 24 clear, mask 0xf0 in bits 19:12.
+    s.stencil_store(40, 10, 0x0f);
+    s.stencil_store(41, 10, 0x0f);
+    write_mask(&mut s, 0xf0 << 12);
+    burst_image(&mut s, (40, 10, 42, 11), 0x0021_1080, ODSY_IMAGE_FMT_RGB, &[0x00a5_0000, 0x005a_0000]);
+    assert_eq!(stencil_at(&s, 40, 10), 0xaf, "the masked bits change, the rest keep");
+    assert_eq!(stencil_at(&s, 41, 10), 0x5f);
+    assert_eq!(s.depth_load(40, 10), 0x0012_3456, "a stencil download leaves depth");
+
+    // The mask applies to the index in bits 23:16, not to the word as sent:
+    // data in bits 19:12 (where the mask sits) is not the index.
+    s.stencil_store(42, 10, 0x3c);
+    write_mask(&mut s, 0xff << 12);
+    burst_image(&mut s, (42, 10, 44, 11), 0x0021_1080, ODSY_IMAGE_FMT_RGB, &[0x0000_f000, 0x0081_f0ff]);
+    assert_eq!(stencil_at(&s, 42, 10), 0x00, "bits 19:12 alone are index 0");
+    assert_eq!(stencil_at(&s, 43, 10), 0x81, "the index is bits 23:16");
+
+    // A zero stencil mask and no depth bit: nothing is written.
+    write_mask(&mut s, 0);
+    burst_image(&mut s, (40, 10, 41, 11), 0x0011_1080, ODSY_IMAGE_FMT_RGB, &[0x0099_0000]);
+    assert_eq!(s.depth_load(40, 10), 0x0012_3456);
+    assert_eq!(stencil_at(&s, 40, 10), 0xaf);
     for buffer in 0..2 {
         assert_eq!(pixel(&s, buffer, 40, 10), 0);
         assert_eq!(pixel(&s, buffer, 41, 10), 0);

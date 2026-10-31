@@ -752,6 +752,8 @@ pub const ODSY_STENCIL_OP_ZPASS_SHIFT: u32 = 16;
 pub const ODSY_STENCIL_OP_MASK: u32 = 0x7;
 pub const ODSY_WRITE_STENCIL_SHIFT: u32 = 12;
 pub const ODSY_WRITE_STENCIL_MASK: u32 = 0xff;
+/// Where a depth or stencil burst's word holds the stencil index.
+pub const ODSY_BURST_STENCIL_SHIFT: u32 = 16;
 pub const ODSY_STENCIL_MAX: u32 = 0xff;
 
 // 0x452 bits 11:0 are glIndexMask ANDed with the drawable's index-plane mask
