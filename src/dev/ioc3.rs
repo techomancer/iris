@@ -60,6 +60,7 @@ use std::time::{Duration, Instant};
 
 use crate::dev::ds1687::MaceRtc;
 use crate::dev::ioc3_port::Ioc3EthPort;
+use crate::dev::ioc3_kbc::{Ioc3Kbc, KbcLine, KbcOwner};
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{self, BoardRecord};
@@ -380,38 +381,6 @@ impl PciDma for Ioc3Dma {
         }
         self.raw.dma_write(start, &tmp)
     }
-}
-
-// ---------------------------------------------------------------------------
-// PS/2 controller
-// ---------------------------------------------------------------------------
-
-const KBC_CONTROL: u32 = 0x9c;
-const KBC_KBD_RECEIVE: u32 = 0xa0;
-const KBC_AUX_RECEIVE: u32 = 0xa4;
-const KBC_KBD_TRANSMIT: u32 = 0xa8;
-const KBC_AUX_TRANSMIT: u32 = 0xac;
-const KBC_RX_SLOTS: usize = 3;
-/// Bits 16 and 17 (timeouts) read clear: no stalled line is simulated.
-const KBC_CONTROL_MASK: u32 = 0x00fc_ffff;
-const KBC_K_CLAMP_1: u32 = 0x0010_0000;
-const KBC_M_CLAMP_1: u32 = 0x0020_0000;
-const KBC_K_CLAMP_3: u32 = 0x0040_0000;
-const KBC_M_CLAMP_3: u32 = 0x0080_0000;
-const KBC_RX_SOURCE_AUX: u32 = 1 << 27;
-const KBC_RX_OVERFLOW: u32 = 1 << 28;
-
-#[derive(Default, Clone, Copy)]
-struct KbcPort {
-    data: [u8; KBC_RX_SLOTS],
-    count: usize,
-    overflow: bool,
-}
-
-#[derive(Default)]
-struct Kbc {
-    control: u32,
-    port: [KbcPort; 2],
 }
 
 // ---------------------------------------------------------------------------
@@ -804,7 +773,7 @@ struct St {
     pin_data: u32,
     uart: [Uart; 2],
     sdma: SerialDma,
-    kbc: Kbc,
+    kbc: Ioc3Kbc,
     par: Parallel,
     rtc: Rtc,
     ssram: Vec<u32>,
@@ -843,6 +812,7 @@ struct Ctx<'a> {
 
 impl St {
     fn new(cfg: Ioc3Config) -> St {
+        let kbc = Ioc3Kbc::new(cfg.keyboard_mouse);
         St {
             cfg,
             int_status: 0,
@@ -854,7 +824,7 @@ impl St {
             pin_data: 0,
             uart: [Uart::new(), Uart::new()],
             sdma: SerialDma::new(2, IOC3_SDMA_PARAMS),
-            kbc: Kbc::default(),
+            kbc,
             par: Parallel::default(),
             rtc: Rtc::new(),
             ssram: vec![0; (reg::SSRAM_SIZE / 4) as usize],
@@ -877,7 +847,7 @@ impl St {
         self.pin_data = 0;
         self.chip_control = 0;
         self.int_out = IntOut::default();
-        self.kbc = Kbc::default();
+        self.kbc.reset();
         let backend = self.par.backend.take();
         self.par = Parallel::default();
         self.par.backend = backend;
@@ -1185,7 +1155,7 @@ impl St {
             reg::PIN_CONTROL_SET | reg::PIN_CONTROL_CLR => self.pin_control,
             reg::PIN_DATA => self.pin_data_now(),
             0x80..=0x98 => self.par_dma_read(a),
-            0x9c | 0xa0 | 0xa4 => self.kbc_read(a, c.ps2),
+            reg::KBC_BASE | 0xa0 | 0xa4 => self.kbc_read(a, c.ps2),
             0xb0 => self.sdma.base_read(0, true),
             0xb4 => self.sdma.base_read(0, false),
             0xb8..=0xef => {
@@ -1257,7 +1227,7 @@ impl St {
             reg::PIN_CONTROL_CLR => self.pin_control &= !val,
             reg::PIN_DATA => self.pin_data = val,
             0x80..=0x98 => self.par_dma_write(a, val),
-            0x9c | 0xa8 | 0xac => self.kbc_write(a, val, c.ps2),
+            reg::KBC_BASE | 0xa8 | 0xac => self.kbc_write(a, val, c.ps2),
             0xb0 => self.sdma.base_write(0, true, val),
             0xb4 => self.sdma.base_write(0, false, val),
             0xb8..=0xef => {
@@ -1272,97 +1242,25 @@ impl St {
 
     // ----- PS/2 -----
 
-    fn kbc_clamp(&self, port: usize) -> usize {
-        let (one, three) = if port == 1 { (KBC_M_CLAMP_1, KBC_M_CLAMP_3) } else { (KBC_K_CLAMP_1, KBC_K_CLAMP_3) };
-        if self.kbc.control & one != 0 {
-            1
-        } else if self.kbc.control & three != 0 {
-            KBC_RX_SLOTS
-        } else {
-            0
-        }
-    }
-
-    /// Move what the device has sent into this port's holding, up to what
-    /// the clamp allows. A clamped port stops with its clock held low and
-    /// the rest still in the device; an unclamped one loses the surplus and
-    /// says so through the overflow flag. Every character that arrives
-    /// latches the keyboard interrupt (a model choice: per character rather
-    /// than a level over the holding).
-    fn kbc_fill(&mut self, port: usize, ps2: &Ps2Controller) {
-        if !self.cfg.keyboard_mouse {
-            return;
-        }
-        let clamp = self.kbc_clamp(port);
-        let mut arrived = false;
-        loop {
-            if clamp != 0 && self.kbc.port[port].count >= clamp {
-                break;
-            }
-            let Some(byte) = ps2.pop_from(port == 1) else { break };
-            let p = &mut self.kbc.port[port];
-            if p.count >= KBC_RX_SLOTS {
-                p.overflow = true;
-                continue;
-            }
-            p.data[p.count] = byte;
-            p.count += 1;
-            arrived = true;
-        }
-        if arrived {
+    /// Move what the host's PS/2 model has sent into the holdings, and latch
+    /// the keyboard source if a character arrived.
+    fn kbc_fill(&mut self, ps2: &Ps2Controller) {
+        if self.kbc.fill_all(ps2) {
             self.int_status |= int::KEYBOARD;
         }
     }
 
-    /// Report what the port holds, oldest character in the highest slot, and
-    /// empty the holding; the clamp releases with it.
-    fn kbc_receive(&mut self, port: usize, ps2: &Ps2Controller) -> u32 {
-        let p = self.kbc.port[port];
-        let mut val = 0u32;
-        for (i, &b) in p.data.iter().enumerate().take(p.count) {
-            let slot = (KBC_RX_SLOTS - 1) - i;
-            val |= (b as u32) << (8 * slot);
-            val |= 1 << (29 + slot);
+    fn kbc_read(&mut self, a: u32, ps2: &Ps2Controller) -> u32 {
+        let (val, arrived) = self.kbc.read(a - reg::KBC_BASE, ps2);
+        if arrived {
+            self.int_status |= int::KEYBOARD;
         }
-        if p.count != 0 && port == 1 {
-            val |= KBC_RX_SOURCE_AUX;
-        }
-        if p.overflow {
-            val |= KBC_RX_OVERFLOW;
-        }
-        self.kbc.port[port] = KbcPort::default();
-        // The stopped device resumes inside this read; the part takes a
-        // character time (an approximation).
-        self.kbc_fill(port, ps2);
         val
     }
 
-    fn kbc_read(&mut self, a: u32, ps2: &Ps2Controller) -> u32 {
-        match a {
-            KBC_CONTROL => self.kbc.control,
-            KBC_KBD_RECEIVE => self.kbc_receive(0, ps2),
-            KBC_AUX_RECEIVE => self.kbc_receive(1, ps2),
-            _ => 0,
-        }
-    }
-
     fn kbc_write(&mut self, a: u32, val: u32, ps2: &Ps2Controller) {
-        match a {
-            KBC_CONTROL => {
-                self.kbc.control = val & KBC_CONTROL_MASK;
-                // Releasing a clamp lets a stopped device send again.
-                self.kbc_fill(0, ps2);
-                self.kbc_fill(1, ps2);
-            }
-            KBC_KBD_TRANSMIT | KBC_AUX_TRANSMIT => {
-                if !self.cfg.keyboard_mouse {
-                    return;
-                }
-                ps2.write_to(val as u8, a == KBC_AUX_TRANSMIT);
-                self.kbc_fill(0, ps2);
-                self.kbc_fill(1, ps2);
-            }
-            _ => {}
+        if self.kbc.write(a - reg::KBC_BASE, val, ps2) {
+            self.int_status |= int::KEYBOARD;
         }
     }
 
@@ -1675,18 +1573,6 @@ impl St {
 // The device
 // ---------------------------------------------------------------------------
 
-/// A PS/2 device model's "data waiting" line, which tells the chip a
-/// character has arrived.
-struct KbcSink(Weak<Shared>);
-
-impl InterruptController for KbcSink {
-    fn set_line(&self, _line: u32, _level: bool) {
-        if let Some(sh) = self.0.upgrade() {
-            sh.kbc_poke();
-        }
-    }
-}
-
 /// How long a serial receive thread sleeps when its backend has nothing:
 /// `SerialBackend` has no blocking read to wait on.
 const RX_IDLE: Duration = Duration::from_millis(2);
@@ -1751,6 +1637,12 @@ struct Shared {
     nvram_ready: Condvar,
 }
 
+impl KbcOwner for Shared {
+    fn kbc_poke(&self) {
+        self.kbc_poke_impl();
+    }
+}
+
 impl Shared {
     /// Put the SuperIO line at the level the chip's state gives, then pick up
     /// any PS/2 character that arrived while the chip was held (a poke sets
@@ -1762,9 +1654,7 @@ impl Shared {
             if !self.kbc_dirty.swap(false, Ordering::SeqCst) {
                 break;
             }
-            let mut st = self.st.lock();
-            st.kbc_fill(0, &self.ps2);
-            st.kbc_fill(1, &self.ps2);
+            self.st.lock().kbc_fill(&self.ps2);
         }
     }
 
@@ -1919,12 +1809,11 @@ impl Shared {
     /// very thread, from inside a transmit), that access picks the character
     /// up when it finishes: the flag is set before the lock is tried, so
     /// either this thread gets the lock or the holder sees the flag.
-    fn kbc_poke(&self) {
+    fn kbc_poke_impl(&self) {
         self.kbc_dirty.store(true, Ordering::SeqCst);
         if let Some(mut st) = self.st.try_lock() {
             if self.kbc_dirty.swap(false, Ordering::SeqCst) {
-                st.kbc_fill(0, &self.ps2);
-                st.kbc_fill(1, &self.ps2);
+                st.kbc_fill(&self.ps2);
             }
             drop(st);
             self.sync_superio();
@@ -2003,7 +1892,7 @@ impl Ioc3 {
         let subsystem = cfg.subsystem_id;
         let pci_policy = cfg.pci_policy;
         let sh = Arc::new_cyclic(|weak: &Weak<Shared>| {
-            let line = IrqLine::new(Arc::new(KbcSink(weak.clone())), 0);
+            let line = IrqLine::new(Arc::new(KbcLine(weak.clone())), 0);
             let ps2 = Arc::new(Ps2Controller::new(Some(line)));
             // Host key and mouse events are accepted from the start (this
             // only sets a flag); `stop` and `start` follow the chip's.
@@ -2441,29 +2330,8 @@ impl Uart {
     }
 }
 
-impl KbcPort {
-    fn save_state(&self) -> toml::Value {
-        StateTable::new()
-            .u8s("data", &self.data)
-            .u64("count", self.count as u64)
-            .bool("overflow", self.overflow)
-            .build()
-    }
-    fn load_state(v: &toml::Value) -> Result<Self, String> {
-        Ok(Self {
-            data: field_u8s(v, "data")?,
-            count: usize_field(v, "count", KBC_RX_SLOTS)?,
-            overflow: field_bool(v, "overflow")?,
-        })
-    }
-}
-
 impl St {
     fn save_state(&self, now: Instant) -> toml::Value {
-        let mut kbc = StateTable::new();
-        kbc.u32("control", self.kbc.control)
-            .value("port0", self.kbc.port[0].save_state())
-            .value("port1", self.kbc.port[1].save_state());
         let p = &self.par;
         let fifo: Vec<u8> = p.fifo.iter().copied().collect();
         let mut par = StateTable::new();
@@ -2503,7 +2371,7 @@ impl St {
             .value("uart0", self.uart[0].save_state())
             .value("uart1", self.uart[1].save_state())
             .value("sdma", self.sdma.save_state(now))
-            .value("kbc", kbc.build())
+            .value("kbc", self.kbc.save_state())
             .value("parallel", par.build())
             .value("rtc", rtc.build())
             .u32s("ssram", &self.ssram)
@@ -2520,11 +2388,7 @@ impl St {
         let ssram: Vec<u32> = ssram.iter().map(crate::snapshot::toml_u32).collect::<Option<_>>()
             .ok_or("ssram: an entry is not a word")?;
         let sdma = self.sdma.loaded(field(v, "sdma")?, now)?;
-        let kbc = field(v, "kbc")?;
-        let kbc = Kbc {
-            control: field_u32(kbc, "control")?,
-            port: [KbcPort::load_state(field(kbc, "port0")?)?, KbcPort::load_state(field(kbc, "port1")?)?],
-        };
+        let kbc = self.kbc.loaded(field(v, "kbc")?)?;
         let o = field(v, "int_out")?;
         let int_out = IntOut {
             reg: field_u32(o, "reg")?,
