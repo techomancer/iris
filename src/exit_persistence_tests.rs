@@ -20,9 +20,15 @@
 //! | 5  | scratch volume                                    |
 //!
 //! The process is not really ended: `IRIS_NO_EXIT_ON_POWEROFF` turns the final
-//! `process::exit` into a return, after the flush has run, and the test leaks
-//! the machine with `mem::forget` so nothing is dropped either. The exits
-//! that end in a drop are tested as drops.
+//! `process::exit` into a return, after the flush has run. A real exit then
+//! drops nothing, which a test cannot copy by leaking the machine (a leaked
+//! machine keeps its device tables, and a test process has 64), so the test
+//! copies every file the disks live in at the moment the exit returns, drops
+//! the machine, puts the copies back, and boots from those. The exits that end
+//! in a drop are tested as drops.
+//!
+//! The tests run one at a time: they share the environment variable, the exit
+//! counter and, in CI mode, overlay files named for the process.
 //!
 //! The bus is driven at the SCSI command level (WRITE(10) to the target);
 //! the controllers' register-level DMA is not exercised, since the disk side
@@ -31,6 +37,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiRequest};
@@ -65,6 +72,55 @@ fn base_byte(kind: Kind) -> u8 {
     }
 }
 
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Hold this for the whole test.
+fn serial() -> MutexGuard<'static, ()> {
+    // The environment variable is the same for every test.
+    std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Where `--ci` keeps its overlays, which are named for the process.
+fn ci_overlays() -> Vec<PathBuf> {
+    let prefix = format!("iris-ci-{}-scsi", std::process::id());
+    std::fs::read_dir("/tmp")
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every file the disks live in, as it was when taken.
+struct Snapshot(Vec<(PathBuf, Vec<u8>)>);
+
+impl Snapshot {
+    fn take(dir: &Dir) -> Snapshot {
+        let mut files = Vec::new();
+        for e in std::fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.path()).chain(ci_overlays()) {
+            if e.is_file() {
+                files.push((e.clone(), std::fs::read(&e).unwrap()));
+            }
+        }
+        Snapshot(files)
+    }
+
+    /// Put the files back as they were, and remove any made since.
+    fn restore(self, dir: &Dir) {
+        for e in std::fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.path()).chain(ci_overlays()) {
+            if e.is_file() {
+                std::fs::remove_file(e).unwrap();
+            }
+        }
+        for (path, bytes) in self.0 {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
 /// A scratch directory under the container's temp dir, removed when dropped.
 struct Dir(PathBuf);
 
@@ -73,6 +129,9 @@ impl Dir {
         let p = std::env::temp_dir().join(format!("iris-persist-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
+        for f in ci_overlays() {
+            let _ = std::fs::remove_file(f);
+        }
         Dir(p)
     }
     fn file(&self, name: &str) -> PathBuf {
@@ -83,14 +142,8 @@ impl Dir {
 impl Drop for Dir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-        // `--ci` keeps its overlays under /tmp, named for the process.
-        if let Ok(rd) = std::fs::read_dir("/tmp") {
-            let prefix = format!("iris-ci-{}-scsi", std::process::id());
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().starts_with(&prefix) {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
+        for f in ci_overlays() {
+            let _ = std::fs::remove_file(f);
         }
     }
 }
@@ -296,6 +349,10 @@ impl Expect {
                 put(m, 0, fill(0x22, 1));
                 put(m, 9, vec![0u8; BLOCK]);
                 put(m, BLOCKS - 1, fill(0x33, 1));
+            } else if wave >= 3 {
+                // Later sessions write ground no earlier one has, so a
+                // sector record that was not saved shows.
+                put(m, 44 + (wave as usize - 3) * 4, fill(0x88, 2));
             } else {
                 // Rewrite part of the first wave's span, and add more.
                 put(m, 6, fill(0x44, 2));
@@ -380,23 +437,28 @@ fn ci_send(path: &Path, line: &str) -> String {
     reply
 }
 
-/// End the session `exit`'s way, with the machine left as the process would
-/// leave it: not dropped, except by `Exit::Drop`.
+/// End the session `exit`'s way, and leave the files as that exit leaves them:
+/// the machine is dropped, but what a process that ended there would have left
+/// on disk is put back (see the module comment). `Exit::Drop` leaves what the
+/// drop writes.
 fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
     let before = workstation::EXIT_REQUESTS.load(Ordering::SeqCst);
-    match exit {
+    let at_exit = match exit {
         Exit::PowerOff => {
             guest_power_off(&mut *m);
             wait_for_exit_request(before);
-            std::mem::forget(m);
+            Snapshot::take(dir)
         }
         Exit::CiQuit => {
             let sock = dir.file("ci.sock");
             let _server = crate::ci::start_server(&mut *m, sock.to_str().unwrap()).unwrap();
             let reply = ci_send(&sock, r#"{"cmd":"quit"}"#);
             assert!(reply.contains("\"ok\":true"), "quit refused: {reply}");
+            // The reply promises the disks are already safe, before the
+            // process goes: take them now.
+            let at_reply = Snapshot::take(dir);
             wait_for_exit_request(before);
-            std::mem::forget(m);
+            at_reply
         }
         Exit::ConsoleQuit => {
             use std::io::Write;
@@ -405,90 +467,132 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             let mut s = std::net::TcpStream::connect(addr).unwrap();
             let relay = crate::machine::Machine::relay_monitor_output(s.try_clone().unwrap(), workstation::console_quit(slot));
             s.write_all(b"quit\n").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !relay.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "the monitor never hung up");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             relay.join().unwrap();
-            std::mem::forget(m);
+            Snapshot::take(dir)
         }
         Exit::MainReturn => {
-            workstation::stop_and_flush(&mut *m, "exit");
-            std::mem::forget(m);
+            let _ = workstation::stop_and_flush(&mut *m, "exit");
+            Snapshot::take(dir)
         }
-        Exit::Drop => drop(m),
-    }
+        Exit::Drop => {
+            drop(m);
+            return;
+        }
+    };
+    drop(m);
+    at_exit.restore(dir);
 }
 
-/// One session, one exit, and the next boot.
-fn round_trip(machine: Machine, exit: Exit, reset_between: bool, ci: bool) {
-    // A power-off, quit or console quit would end this process.
-    std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
-    let tag = format!("{machine:?}-{exit:?}-{reset_between}-{ci}");
+/// Sessions in turn over the same files, each ended by the next of `exits`
+/// (with a guest reset before it when `reset_between`), each followed by a
+/// check that everything written so far reads back on the next boot.
+fn round_trip(machine: Machine, exits: &[Exit], reset_between: bool, ci: bool) {
+    let _serial = serial();
+    let exits = exits.to_vec();
+    let tag = format!("{machine:?}-{exits:?}-{reset_between}-{ci}");
     on_big_stack(move || {
         let dir = Dir::new(&tag);
         make_images(&dir);
         let cfg = config(machine, &dir, ci);
-
-        let mut m = build(cfg.clone());
-        m.register_system_controller();
-        if ci {
-            m.start();
-        }
         let mut expect = Expect::new();
-        expect.write_wave(&mut *m, 1);
-        expect.check(&mut *m, "same session, before exit");
-        if reset_between {
-            // A guest reboot: the hardware goes back to power-on and the
-            // disks stay.
-            m.reset();
-            expect.check(&mut *m, "after the reset");
+        for (n, exit) in exits.iter().enumerate() {
+            let mut m = build(cfg.clone());
+            expect.check(&mut *m, &format!("boot {n}, after {:?}", exits.get(n.wrapping_sub(1))));
+            m.register_system_controller();
+            if ci {
+                m.start();
+            }
+            expect.write_wave(&mut *m, n as u8 * 2 + 1);
+            expect.check(&mut *m, "same session, before exit");
+            if reset_between {
+                // A guest reboot: the hardware goes back to power-on and the
+                // disks stay.
+                m.reset();
+                expect.check(&mut *m, "after the reset");
+            }
+            expect.write_wave(&mut *m, n as u8 * 2 + 2);
+            end_session(m, *exit, &dir);
         }
-        expect.write_wave(&mut *m, 2);
-        end_session(m, exit, &dir);
-
-        // The next boot, over the same files.
-        let mut next = build(cfg);
-        expect.check(&mut *next, &format!("next boot after {exit:?}"));
-        std::mem::forget(next);
+        let mut last = build(cfg);
+        expect.check(&mut *last, &format!("last boot, after {:?}", exits.last()));
     });
 }
 
-/// `--ci` tests start the machine (CPU parked) and so can use the control
-/// socket, the monitor and, on the O2, the service loop. The `plain` ones
-/// leave the machine unstarted and keep the overlays beside their images, as
-/// an interactive run does.
-macro_rules! round_trips {
-    ($($name:ident: $machine:expr, $o2:expr;)*) => {$(
-        mod $name {
-            use super::*;
-            #[test] fn power_off() { round_trip($machine, Exit::PowerOff, false, true) }
-            #[test] fn ci_quit() { round_trip($machine, Exit::CiQuit, false, true) }
-            #[test] fn console_quit() { round_trip($machine, Exit::ConsoleQuit, false, true) }
-            #[test] fn main_return() { round_trip($machine, Exit::MainReturn, false, true) }
-            #[test] fn drop() { round_trip($machine, Exit::Drop, false, true) }
-            #[test] fn reset_then_power_off() { round_trip($machine, Exit::PowerOff, true, true) }
-            #[test] fn reset_then_ci_quit() { round_trip($machine, Exit::CiQuit, true, true) }
-            #[test] fn reset_then_drop() { round_trip($machine, Exit::Drop, true, true) }
-            #[test] fn plain_main_return() { round_trip($machine, Exit::MainReturn, false, false) }
-            #[test] fn plain_drop() { round_trip($machine, Exit::Drop, false, false) }
-            #[test] fn plain_reset_then_drop() { round_trip($machine, Exit::Drop, true, false) }
-            // The O2 switches itself off from its service loop, which only
-            // runs on a started machine.
-            #[test] fn plain_power_off() { if !$o2 { round_trip($machine, Exit::PowerOff, false, false) } }
+/// Every machine: the ways out that reach its own `flush_disks` and `Drop`.
+/// The power-off is the guest's, down that machine's device path.
+macro_rules! machines {
+    ($($name:ident: $machine:expr;)*) => {$(
+        #[test]
+        fn $name() {
+            round_trip($machine, &[Exit::PowerOff, Exit::Drop], false, true)
         }
     )*};
 }
 
-round_trips! {
-    indy: Machine::Indy, false;
-    indigo2: Machine::Indigo2, false;
-    indigo2_ip28: Machine::Indigo2Ip28, false;
-    o2: Machine::O2, true;
-    octane: Machine::Octane, false;
+machines! {
+    indy_power_off_then_drop: Machine::Indy;
+    indigo2_power_off_then_drop: Machine::Indigo2;
+    indigo2_ip28_power_off_then_drop: Machine::Indigo2Ip28;
+    o2_power_off_then_drop: Machine::O2;
+    octane_power_off_then_drop: Machine::Octane;
+}
+
+// The other ways out are the same code on every machine; the Indy runs them.
+
+#[test]
+fn ci_quit() {
+    round_trip(Machine::Indy, &[Exit::CiQuit], false, true)
+}
+
+#[test]
+fn console_quit() {
+    round_trip(Machine::Indy, &[Exit::ConsoleQuit], false, true)
+}
+
+/// `main` returning, and a drop, on a machine that was never started and
+/// keeps its overlays beside the images, as an interactive run does.
+#[test]
+fn plain_main_return_then_drop() {
+    round_trip(Machine::Indy, &[Exit::MainReturn, Exit::Drop], false, false)
+}
+
+/// A guest reboot first changes what the exit has to cover.
+#[test]
+fn reset_then_power_off() {
+    round_trip(Machine::Indy, &[Exit::PowerOff], true, true)
+}
+
+/// The O2's own `stop` leaves its disks durable, not only the exits that call
+/// `stop_and_flush`.
+#[test]
+fn o2_stop_flushes_its_disks() {
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("o2-stop");
+        make_images(&dir);
+        let cfg = config(Machine::O2, &dir, true);
+        let mut m = build(cfg.clone());
+        let mut expect = Expect::new();
+        expect.write_wave(&mut *m, 1);
+        m.stop();
+        let at_stop = Snapshot::take(&dir);
+        drop(m);
+        at_stop.restore(&dir);
+        let mut next = build(cfg);
+        expect.check(&mut *next, "next boot after the O2's stop");
+    });
 }
 
 /// The O2 has a second way to switch off, for a machine nothing is
 /// listening to: its service loop flushes the buses and exits itself.
 #[test]
 fn o2_service_loop_power_off_without_a_controller() {
-    std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
+    let _serial = serial();
     on_big_stack(|| {
         let dir = Dir::new("o2-fallback");
         make_images(&dir);
@@ -501,11 +605,12 @@ fn o2_service_loop_power_off_without_a_controller() {
         let before = workstation::EXIT_REQUESTS.load(Ordering::SeqCst);
         guest_power_off(&mut *m);
         wait_for_exit_request(before);
-        std::mem::forget(m);
+        let at_exit = Snapshot::take(&dir);
+        drop(m);
+        at_exit.restore(&dir);
 
         let mut next = build(cfg);
         expect.check(&mut *next, "next boot after the O2 service loop's own power-off");
-        std::mem::forget(next);
     });
 }
 
@@ -524,9 +629,8 @@ fn no_process_exit_bypasses_the_flush() {
         // Machine::new's two startup failures, before a guest has run.
         ("machine.rs", 2, "bad SCSI configuration at start-up"),
         // The bare-metal test device ends the run with the guest's exit code.
-        ("dev/testdev.rs", 1, "bare-metal test device, no disks"),
+        ("dev/testdev.rs", 1, "bare-metal test device, a harness only"),
         // Command-line and configuration front ends: nothing is running yet.
-        // (main.rs is skipped: its exits are start-up failures too.)
         ("config.rs", 5, "command-line and configuration errors"),
         ("iris_ci_main.rs", 1, "the iris-ci client"),
         ("crash_diag.rs", 1, "fatal-signal handler: the process is already dying"),
@@ -559,6 +663,14 @@ fn no_process_exit_bypasses_the_flush() {
         }
     }
     walk(&root, &root, &mut found);
+    // main: its exits before the machine starts are configuration errors. The
+    // two after it (the CI and VNC servers failing to come up) leave a machine
+    // that has not run a guest.
+    let main = std::fs::read_to_string(root.join("main.rs")).unwrap();
+    let started = &main[main.find("machine.start();").expect("main starts the machine")..];
+    let started = &started[..started.find("fn start_perfetto").unwrap()];
+    let after_start = started.lines().filter(|l| !l.trim_start().starts_with("//") && l.contains("process::exit(")).count();
+    assert_eq!(after_start, 2, "main.rs exits after the machine starts; each must flush through exit_process");
     for (file, n) in &found {
         if file == "main.rs" {
             continue;
@@ -579,50 +691,14 @@ fn no_process_exit_bypasses_the_flush() {
     }
 }
 
-/// Every call of `exit_process` hands it the stop-and-flush work, rather than
-/// an empty closure.
-#[test]
-fn every_exit_process_call_flushes() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut calls = 0;
-    fn walk(dir: &Path, calls: &mut usize) {
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            if p.is_dir() {
-                walk(&p, calls);
-                continue;
-            }
-            if !p.extension().is_some_and(|x| x == "rs") || p.ends_with("exit_persistence_tests.rs") {
-                continue;
-            }
-            let lines: Vec<String> = std::fs::read_to_string(&p).unwrap().lines().map(str::to_string).collect();
-            for (i, l) in lines.iter().enumerate() {
-                let t = l.trim_start();
-                if t.starts_with("//") || t.starts_with("pub fn exit_process") || !l.contains("exit_process(") {
-                    continue;
-                }
-                *calls += 1;
-                let window = lines[i..lines.len().min(i + 6)].join("\n");
-                assert!(
-                    window.contains("flush"),
-                    "{}:{}: exit_process call that does not flush the disks:\n{window}",
-                    p.display(),
-                    i + 1
-                );
-            }
-        }
-    }
-    walk(&root, &mut calls);
-    assert!(calls >= 4, "found only {calls} exit_process calls; has the helper been renamed?");
-}
-
 /// `main` ends with the stop-and-flush after the window closes. The binary
 /// cannot be run here, so look for the call after the event loop returns.
 #[test]
 fn main_flushes_after_the_window_closes() {
     let main = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
-    let run = main.find("ui.run(event_loop)").expect("main runs the window");
-    let tail = &main[run..];
+    let code: String = main.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    let run = code.find("ui.run(event_loop)").expect("main runs the window");
+    let tail = &code[run..];
     assert!(
         tail.contains("stop_and_flush(&mut *machine"),
         "main must stop and flush the machine after the window closes"

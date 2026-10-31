@@ -187,7 +187,7 @@ fn main() {
         ui.run(event_loop);
     }
 
-    iris::workstation::stop_and_flush(&mut *machine, "exit");
+    let _ = iris::workstation::stop_and_flush(&mut *machine, "exit");
     #[cfg(feature = "perfetto")]
     iris::perfetto::shutdown();
 }

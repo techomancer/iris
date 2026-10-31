@@ -513,9 +513,7 @@ impl O2Machine {
                 }
                 running.store(false, Ordering::SeqCst);
                 crate::workstation::exit_process("power-off", 0, || {
-                    if let Err(e) = bus.flush_disks() {
-                        eprintln!("iris: disk flush at power-off failed: {e} (guest writes may be lost)");
-                    }
+                    crate::workstation::flushed(bus.flush_disks(), "power-off")
                 });
             }
             std::thread::sleep(poll);
@@ -541,6 +539,11 @@ impl O2Machine {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
         self.bus.save_flash();
+        // Not through the display: this stop leaves the guest's writes durable
+        // whatever follows it.
+        if let Err(e) = self.bus.flush_disks() {
+            eprintln!("iris: disk flush at stop failed: {e} (guest writes may be lost)");
+        }
         // A machine that was never started has nothing to halt.
         if self.lifecycle != crate::machine_state::GuestState::Idle {
             self.lifecycle = crate::machine_state::GuestState::Halted;

@@ -410,7 +410,7 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
     // would otherwise be written out. Stop first, so the guest writes nothing
     // after the flush, and flush before replying, so a client that sees the
     // reply can already read the disks.
-    crate::workstation::stop_and_flush_slot(&server.machine, "quit");
+    let _ = crate::workstation::stop_and_flush_slot(&server.machine, "quit");
     // Schedule process exit after a brief delay so the response flushes.
     let machine = server.machine.clone();
     thread::spawn(move || {
@@ -423,7 +423,8 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
         // stopped and flushed; this flush is a no-op unless something wrote
         // since.
         crate::workstation::exit_process("quit", 0, || {
-            let _ = crate::workstation::with_machine_slot(&machine, |m| m.flush_disks());
+            let r = crate::workstation::with_machine_slot(&machine, |m| m.flush_disks());
+            crate::workstation::flushed(r.unwrap_or(Ok(())), "quit")
         });
     });
     Response::data(serde_json::json!({ "synced": synced }))

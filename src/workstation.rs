@@ -369,11 +369,59 @@ pub type MachineSlot = Arc<Mutex<MachineRef>>;
 /// Stop `machine` and flush its disks: what every path that ends the process
 /// without dropping the machine does first. A failed flush is reported, not
 /// fatal, since the process is going away either way.
-pub fn stop_and_flush(machine: &mut dyn Workstation, at: &str) {
-    machine.stop();
-    if let Err(e) = machine.flush_disks() {
+pub fn stop_and_flush(machine: &mut dyn Workstation, at: &str) -> Flushed {
+    stop_flushing(machine, |m| m.stop(), |m| m.flush_disks(), at);
+    Flushed(())
+}
+
+/// Proof that the disks were flushed, for [`exit_process`]. Only the functions
+/// here make one, so an exit cannot be handed work that does not flush.
+#[must_use]
+pub struct Flushed(());
+
+/// Report a flush's failure and vouch for it, for code that flushes a bus
+/// itself (see [`exit_process`]).
+pub fn flushed(result: std::io::Result<()>, at: &str) -> Flushed {
+    if let Err(e) = result {
         eprintln!("iris: disk flush at {at} failed: {e} (guest writes may be lost)");
     }
+    Flushed(())
+}
+
+/// [`stop_and_flush`]'s order: flush, stop, flush. The first flush is for a
+/// stop that hangs in some device: the process is then killed, and the writes
+/// made before the stop are already safe. It costs nothing when there is
+/// nothing new.
+fn stop_flushing<M: ?Sized>(
+    machine: &mut M,
+    stop: impl FnOnce(&mut M),
+    flush: impl Fn(&M) -> std::io::Result<()>,
+    at: &str,
+) {
+    let report = |r: std::io::Result<()>| {
+        if let Err(e) = r {
+            eprintln!("iris: disk flush at {at} failed: {e} (guest writes may be lost)");
+        }
+    };
+    report(flush(machine));
+    stop(machine);
+    report(flush(machine));
+}
+
+#[cfg(test)]
+#[test]
+fn stop_and_flush_flushes_before_the_stop_and_after() {
+    let log = std::cell::RefCell::new(Vec::new());
+    stop_flushing(
+        &mut (),
+        |_| log.borrow_mut().push("stop"),
+        |_| {
+            log.borrow_mut().push("flush");
+            Ok(())
+        },
+        "test",
+    );
+    assert_eq!(*log.borrow(), ["flush", "stop", "flush"]);
 }
 
 /// Flush a machine's disks as it is dropped. The disks hold on to their
@@ -387,10 +435,11 @@ pub(crate) fn flush_on_drop(machine: &dyn Workstation) {
 }
 
 /// [`stop_and_flush`] for the machine behind `slot`, if it is still there.
-pub fn stop_and_flush_slot(slot: &MachineSlot, at: &str) {
+pub fn stop_and_flush_slot(slot: &MachineSlot, at: &str) -> Flushed {
     if let Err(e) = with_machine_slot(slot, |m| stop_and_flush(m, at)) {
         eprintln!("iris: could not stop the machine to flush its disks at {at}: {e}");
     }
+    Flushed(())
 }
 
 /// What the terminal console runs when the monitor hangs up (`quit`): stop and
@@ -408,12 +457,14 @@ pub(crate) static EXIT_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::ato
 /// `std::process::exit`: it skips every Drop, which is where a copy-on-write
 /// overlay would otherwise write its sector record, so the caller has to hand
 /// in `stop_and_flush`, the work that makes the guest's writes durable
-/// (`stop_and_flush`, `stop_and_flush_slot`, or a bus's `flush_disks`). It runs
-/// first, then the process exits unless `IRIS_NO_EXIT_ON_POWEROFF` is set, the
-/// escape hatch for hosts that embed iris and for tests. A guard test fails on any
-/// other `process::exit` in the library.
-pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce()) {
-    stop_and_flush();
+/// (`stop_and_flush`, `stop_and_flush_slot`, or `flushed` around a bus's
+/// `flush_disks`), whose [`Flushed`] result the type requires. It runs first,
+/// then the process exits unless `IRIS_NO_EXIT_ON_POWEROFF` is set, the escape
+/// hatch for hosts that embed iris and for tests. That variable suppresses
+/// every exit through here, the terminal console's `quit` too. A guard test
+/// fails on any other `process::exit` in the library.
+pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce() -> Flushed) {
+    let Flushed(()) = stop_and_flush();
     if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
         eprintln!("iris: exit at {at} suppressed (IRIS_NO_EXIT_ON_POWEROFF)");
         #[cfg(test)]
@@ -481,7 +532,7 @@ pub(crate) fn register_system_controller(
                         #[cfg(not(feature = "developer"))]
                         exit_process("power-off", 0, flush);
                         #[cfg(feature = "developer")]
-                        flush();
+                        let _ = flush();
                     }
                 }
             }

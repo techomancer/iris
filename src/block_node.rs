@@ -598,6 +598,21 @@ pub struct ChdNode {
     /// Written since the CHD was last closed and opened again (see
     /// [`BlockNode::flush`] below).
     unflushed: bool,
+    /// Capacity in bytes, so it can be answered while the handle is closed.
+    bytes: u64,
+    /// What a flush that closed the handle but could not open it again left
+    /// behind. Every operation that needs the CHD tries again first, so a
+    /// transient failure is an I/O error for that command, not a dead node.
+    closed: Option<ClosedChd>,
+}
+
+/// What [`ChdNode`] keeps of a CHD it has closed and not yet reopened.
+struct ClosedChd {
+    base: String,
+    cow: bool,
+    overlay: Option<(PathBuf, PathBuf)>,
+    pending: Option<(PathBuf, PathBuf)>,
+    dirty: bool,
 }
 
 impl ChdNode {
@@ -606,7 +621,17 @@ impl ChdNode {
     pub fn open(path: &str, cow: bool) -> io::Result<Self> {
         let hd = ChdHd::open(path, cow)?;
         let sector_size = u64::from(hd.sector_size());
-        Ok(Self { hd: Some(hd), sector_size, unflushed: false })
+        let bytes = hd.size();
+        Ok(Self { hd: Some(hd), sector_size, unflushed: false, bytes, closed: None })
+    }
+
+    /// Open the CHD again if a flush closed it and could not.
+    fn ensure_open(&mut self) -> io::Result<()> {
+        if let Some(c) = &self.closed {
+            self.hd = Some(ChdHd::open(&c.base, c.cow)?);
+            self.closed = None;
+        }
+        Ok(())
     }
 
     fn hd(&self) -> &ChdHd {
@@ -620,10 +645,11 @@ impl ChdNode {
 
 impl BlockNode for ChdNode {
     fn size(&self) -> u64 {
-        self.hd().size()
+        self.bytes
     }
 
     fn read(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.ensure_open()?;
         let ss = self.sector_size;
         if offset % ss != 0 || (buf.len() as u64) % ss != 0 {
             return Err(invalid("CHD reads must be sector-aligned"));
@@ -635,6 +661,7 @@ impl BlockNode for ChdNode {
     }
 
     fn write(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.ensure_open()?;
         let ss = self.sector_size;
         if offset % ss != 0 || (buf.len() as u64) % ss != 0 {
             return Err(invalid("CHD writes must be sector-aligned"));
@@ -651,26 +678,33 @@ impl BlockNode for ChdNode {
     /// make them durable. It costs a reopen only when something was written
     /// since the last flush.
     fn flush(&mut self) -> io::Result<()> {
+        self.ensure_open()?;
         if !self.unflushed {
             return Ok(());
         }
         let hd = self.hd.take().expect("CHD handle present outside commit/rollback");
         let base = hd.base_path().to_str().ok_or_else(|| invalid("non-UTF-8 CHD path"))?.to_string();
-        let cow = hd.is_cow();
+        self.closed = Some(ClosedChd {
+            base: base.clone(),
+            cow: hd.is_cow(),
+            overlay: hd.overlay_paths(),
+            pending: hd.pending_sync(),
+            dirty: hd.diff_dirty(),
+        });
         drop(hd); // closes the file, writing out what libchdman held back
-        self.hd = Some(ChdHd::open(&base, cow)?);
+        // Closed and written out: the writes are durable even if this fails.
         self.unflushed = false;
-        Ok(())
+        self.ensure_open()
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
-        check_range(self.hd().size(), offset, len)?;
+        check_range(self.bytes, offset, len)?;
         let zeros = vec![0u8; len as usize];
         self.write(offset, &zeros)
     }
 
     fn block_status(&self, offset: u64, len: u64) -> io::Result<BlockStatus> {
-        check_range(self.hd().size(), offset, len)?;
+        check_range(self.bytes, offset, len)?;
         Ok(BlockStatus::data(len))
     }
 
@@ -679,19 +713,31 @@ impl BlockNode for ChdNode {
     }
 
     fn dirty_count(&self) -> usize {
-        usize::from(self.hd().diff_dirty())
+        usize::from(match (&self.hd, &self.closed) {
+            (Some(hd), _) => hd.diff_dirty(),
+            (None, Some(c)) => c.dirty,
+            (None, None) => false,
+        })
     }
 
     fn is_cow(&self) -> bool {
-        self.hd().overlay_paths().is_some()
+        self.overlay_paths().is_some()
     }
 
     fn overlay_paths(&self) -> Option<(PathBuf, PathBuf)> {
-        self.hd().overlay_paths()
+        match (&self.hd, &self.closed) {
+            (Some(hd), _) => hd.overlay_paths(),
+            (None, Some(c)) => c.overlay.clone(),
+            (None, None) => None,
+        }
     }
 
     fn pending_sync(&self) -> Option<(PathBuf, PathBuf)> {
-        self.hd().pending_sync()
+        match (&self.hd, &self.closed) {
+            (Some(hd), _) => hd.pending_sync(),
+            (None, Some(c)) => c.pending.clone(),
+            (None, None) => None,
+        }
     }
 
     /// Rebuild the base from the merged parent+diff view and reopen a fresh
@@ -700,6 +746,7 @@ impl BlockNode for ChdNode {
     /// a flatten error the base and diff are left intact and the diff is
     /// reattached.
     fn commit(&mut self) -> io::Result<usize> {
+        self.ensure_open()?;
         if !self.hd().diff_dirty() {
             return Ok(0);
         }
@@ -726,6 +773,7 @@ impl BlockNode for ChdNode {
     /// Discard the diff (every uncommitted write) and reopen a fresh overlay
     /// over the untouched base. A CHD with no diff has nothing to roll back.
     fn rollback(&mut self) -> io::Result<()> {
+        self.ensure_open()?;
         let Some((base, diff)) = self.hd().overlay_paths() else {
             return Ok(());
         };
@@ -1131,6 +1179,27 @@ mod tests {
                 let _ = std::fs::remove_file(base);
             }
         }
+    }
+
+    /// A flush whose reopen fails reports it and leaves a node that works
+    /// again once the file is back, not one that panics on its next command.
+    #[test]
+    fn chd_flush_that_cannot_reopen_leaves_a_usable_node() {
+        let base = compressed_chd(0xAB);
+        let away = base.with_extension("away");
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
+        std::fs::rename(&base, &away).unwrap();
+        assert!(node.flush().is_err(), "the base is missing, so the reopen fails");
+        assert_eq!(node.size(), 256 * 1024);
+        assert!(node.is_cow(), "the diff is still known");
+        std::fs::rename(&away, &base).unwrap();
+        let mut got = [0u8; SECTOR_BYTES];
+        node.read(9 * SECTOR_SIZE, &mut got).unwrap();
+        assert_eq!(got, [0x5A; SECTOR_BYTES], "the write made it to the diff");
+        drop(node);
+        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
+        let _ = std::fs::remove_file(base);
     }
 
     #[test]
