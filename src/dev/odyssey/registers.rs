@@ -432,7 +432,6 @@ impl Board {
                 value = (self.memory_config | (doublewords << 7)) as u64;
             }
             ODSY_FLCTL_CONFIG => value = self.flctl_config as u64,
-            ODSY_FLCTL_TARGET => value = self.flctl_target as u64,
             ODSY_BUZZ_1 => value = self.buzz[0] as u64,
             ODSY_BUZZ_2 => value = self.buzz[1] as u64,
             ODSY_BUZZ_3 => value = self.buzz[2] as u64,

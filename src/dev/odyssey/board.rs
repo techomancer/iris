@@ -91,14 +91,12 @@ pub struct Board {
     /// The memory controller's configuration word (+0x1004), as written.
     pub memory_control: u32,
     pub memory_control_reported: bool,
-    pub flctl_target: u32,
     /// The FIFO set-up registers 0x6b0-0x6b3 and 0x7b5, as last written.
     pub fifo_setup: [u32; 5],
     /// The hardware-sync timeout (0x7f0) as last written, and whether a
     /// nonzero one has been reported as unable to expire.
     pub sync_timeout: u32,
     pub sync_timeout_reported: bool,
-    pub flctl_target_reported: bool,
 
     // The DMA-sync command's host-write base (48-bit guest physical address).
     pub host_write_addr_upper: u32,
@@ -470,11 +468,9 @@ impl Default for Board {
             flctl_config: 0,
             memory_control: 0,
             memory_control_reported: false,
-            flctl_target: 0,
             fifo_setup: [0; 5],
             sync_timeout: 0,
             sync_timeout_reported: false,
-            flctl_target_reported: false,
             host_write_addr_upper: 0,
             host_write_addr_lower: 0,
             stats_addr_upper: 0,
@@ -818,6 +814,8 @@ impl Board {
         // below, so no clearing packet has anywhere to go.
         f.interrupt_asserted = false;
         f.sw_token = 0;
+        f.flctl_target = 0;
+        f.flctl_target_reported = false;
         f.route_dest_upper = 0;
         f.route_dest_lower = 0;
         f.route_vectors = 0;
@@ -832,7 +830,6 @@ impl Board {
         drop(f);
         self.flctl_config = ODSY_FLCTL_CONFIG_RESET;
         self.memory_control = 0;
-        self.flctl_target = 0;
         self.fifo_setup = [0; 5];
         self.sync_timeout = 0;
         self.host_write_addr_upper = 0;

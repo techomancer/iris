@@ -10,12 +10,31 @@
 //! its command FIFO in its own memory, 32,768 words as the kernel sets it
 //! up (`ODSY_CFIFO_WORDS`). The level STATUS0 reports is the 32-bit words
 //! of the stores pushed and not yet taken out, a doubleword store counting
-//! two; the high-water bit compares it against the mark the kernel sends
-//! in `0x6b2`, and the low-water bit against the model's 16-word mark. The
-//! ring under it holds `ODSY_WORK_QUEUE_MAX` entries, more than the board's
-//! FIFO can, so it never fills: a processor store that would overfill the
-//! board's FIFO is refused with the bus busy, and the processor retries it
-//! while the board's thread makes room (`BoardLocks::bus_write`).
+//! two, clamped to that 32,768 (`level`); the high-water bit compares it
+//! against the mark the kernel sends in `0x6b2`, and the low-water bit
+//! against the model's 16-word mark. Level 0 is the FIFO empty and every
+//! store run.
+//!
+//! Where a store is refused is a model choice, not a recorded hardware
+//! fact. The datasheet establishes the FIFO's size and marks; it does not
+//! say what a full FIFO does to the processor, and it gives the FIFO no
+//! wrap protection of its own, the kernel's flow control keeping it from
+//! filling. On the Octane that flow control (the node's counted graphics
+//! credits and the kernel's high-water path) is not modelled, so the old
+//! stall at 32,768 words stood in for it. IMPACT and GR2 do not stall
+//! there. Their host ring is deep, a store is refused with the bus busy
+//! only when the ring is full, and the guest-visible level is the board's,
+//! clamped to what the real FIFO can hold. The VPro follows them by
+//! default (`FifoDepth::Deep`): the ring holds `ODSY_WORK_QUEUE_MAX`
+//! entries, a store is one entry whatever its width, so it takes at least
+//! twice the board's FIFO in words, and the processor runs ahead of the
+//! board by that much. Everything the guest can read comes from the
+//! clamped level, so it never sees a value the board cannot produce: past
+//! the brim it reads a full, high-water FIFO while its stores still
+//! succeed. `IRIS_VPRO_FIFO=shallow` restores the old stall: a store that
+//! would overfill the board's 32,768 words is refused, and the processor
+//! retries it while the board's thread makes room (`BoardLocks::bus_write`).
+//! The ring is 64K entries as IMPACT's and GR2's are.
 //!
 //! The processor's stores are the producer; whoever runs the queue (the
 //! board's thread, or an access that drains it) holds the board lock and is
@@ -109,6 +128,29 @@ impl Run {
     }
 }
 
+/// Where a command store is refused with the bus busy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FifoDepth {
+    /// Only when the host ring is full, as IMPACT and GR2 do.
+    Deep,
+    /// When the board's 32,768-word FIFO would overfill: the old stall.
+    Shallow,
+}
+
+impl FifoDepth {
+    /// `IRIS_VPRO_FIFO`: `shallow` or `32768` for the old stall, anything
+    /// else, or unset, for the deep ring.
+    pub fn from_env() -> Self {
+        match std::env::var("IRIS_VPRO_FIFO").as_deref() {
+            Ok("shallow") | Ok("32768") => FifoDepth::Shallow,
+            _ => FifoDepth::Deep,
+        }
+    }
+}
+
+/// The stores the host ring holds: it keeps one slot empty.
+pub const RING_STORES: u32 = ODSY_WORK_QUEUE_MAX - 1;
+
 /// The counts the processor's pushes raise and the board's thread's
 /// retirements lower.
 struct Levels {
@@ -132,6 +174,9 @@ pub struct CommandFifo {
     /// and `running` are read on every store and written rarely, so each has
     /// a line no counter shares.
     high_mark: CachePadded<AtomicU32>,
+    /// Where a store is refused (`FifoDepth`); read on every store, set at
+    /// construction.
+    deep: CachePadded<AtomicBool>,
     /// The board's thread runs, so command stores queue.
     pub running: CachePadded<AtomicBool>,
     /// The board's thread is parked (`wait_for_work`): a producer unparks it
@@ -162,6 +207,7 @@ impl Default for CommandFifo {
             pop: Mutex::new(()),
             levels: CachePadded::new(Levels { words: AtomicU32::new(0), stores: AtomicU32::new(0), counted: AtomicU32::new(0) }),
             high_mark: CachePadded::new(AtomicU32::new(0)),
+            deep: CachePadded::new(AtomicBool::new(FifoDepth::from_env() == FifoDepth::Deep)),
             running: CachePadded::new(AtomicBool::new(false)),
             asleep: CachePadded::new(AtomicBool::new(false)),
             hurry: CachePadded::new(AtomicBool::new(false)),
@@ -177,9 +223,30 @@ impl Default for CommandFifo {
 }
 
 impl CommandFifo {
-    /// The FIFO words waiting: the level STATUS0 reports.
+    /// The FIFO words waiting, as the guest sees them: the board's FIFO
+    /// holds no more than `ODSY_CFIFO_WORDS`, so a deeper backlog in the
+    /// host ring reads as a full FIFO. Zero only when nothing waits.
     pub fn level(&self) -> u32 {
+        self.queued_words().min(ODSY_CFIFO_WORDS)
+    }
+
+    /// The FIFO words waiting in the host ring, unclamped.
+    pub fn queued_words(&self) -> u32 {
         self.levels.words.load(SeqCst)
+    }
+
+    /// Choose where a store is refused (`FifoDepth`).
+    pub fn set_depth(&self, depth: FifoDepth) {
+        self.deep.store(depth == FifoDepth::Deep, SeqCst);
+    }
+
+    /// Whether the FIFO has room for a store of `words` words.
+    fn has_room(&self, words: u32) -> bool {
+        if self.deep.load(Relaxed) {
+            self.stores() < RING_STORES
+        } else {
+            self.queued_words() + words <= ODSY_CFIFO_WORDS
+        }
     }
 
     /// The stores waiting.
@@ -207,7 +274,7 @@ impl CommandFifo {
     /// processors the room it sees can go to the other one's store first;
     /// `push` then refuses, and the store is not lost.
     pub fn full_for(&self, size: u32) -> bool {
-        self.running.load(SeqCst) && self.level() + store_words(size) > ODSY_CFIFO_WORDS
+        self.running.load(SeqCst) && !self.has_room(store_words(size))
     }
 
     /// The processor waits for the board's thread to run what is queued.
@@ -249,21 +316,22 @@ impl CommandFifo {
     /// board's FIFO has no room for it.
     pub fn push(&self, front: &Mutex<HostInterface>, addr: u64, value: u64, size: u32, counted: bool) -> bool {
         let words = store_words(size);
-        let before = self.level();
-        if before + words > ODSY_CFIFO_WORDS {
+        if !self.has_room(words) {
             return false;
         }
+        let before = self.queued_words();
         let mut q = QueuedStore { value, addr: addr as u32, size: size as u8, counted, owed: false };
         // A counted store's place is settled against the consumer's pops.
         let _c = counted.then(|| self.pop.lock());
         let credited = counted && self.stores() < ODSY_CFIFO_DEPTH;
         q.owed = counted && !credited;
         if !self.ring.try_push(q.entry(), q.value) {
-            // With one processor this cannot happen: the ring is deeper than
-            // the board's FIFO and nothing else pushes. With two, the other
-            // processor's store can hold the ring's lock. Refused, the store
-            // goes the board-lock way (`write_command`), which runs what
-            // waits and then the store.
+            // With one processor this cannot happen: has_room counted the
+            // ring's stores and nothing else pushes. With two, the other
+            // processor's store can hold the ring's lock, or take the last
+            // place between has_room and here. Refused, the store goes the
+            // board-lock way (`write_command`), which runs what waits and
+            // then the store.
             return false;
         }
         if counted {

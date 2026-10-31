@@ -128,6 +128,7 @@ fn a_read_that_waits_sees_every_earlier_store() {
 #[test]
 fn a_full_fifo_holds_the_store_back_until_the_board_makes_room() {
     let (h, _rec) = threaded_board();
+    h.fifo.set_depth(FifoDepth::Shallow);
     let words = preamble_twice();
 
     start_long_slice(&h, &words, 2000);
@@ -580,6 +581,7 @@ fn the_status_shows_waiting_stores_until_they_have_run() {
 #[test]
 fn the_level_counts_words_against_the_board_fifo_and_its_high_mark() {
     let (mut s, _, _) = queued_board();
+    s.fifo.set_depth(FifoDepth::Shallow);
     let (high, flag) = (ODSY_STATUS0_FIFO_HIGH_WATER, ODSY_INTR_FIFO_HIGH_WATER);
 
     s.mmio_write(ODSY_CMD_FIFO, 0, 8);
@@ -747,4 +749,154 @@ fn two_processors_storing_to_the_fifo_lose_nothing_and_keep_each_ones_order() {
     }
     assert_eq!(next, [PER, PER]);
     assert_eq!((h.fifo.stores(), h.fifo.level()), (0, 0));
+}
+
+/// The deep ring takes stores past the board's 32,768 words, and the guest
+/// still reads the board's own FIFO: the level clamped at the brim, so
+/// STATUS0 and the `0x106c` doubleword count read a full FIFO and the
+/// high-water flag is up, never a count the board cannot hold. Level 0
+/// returns only once the backlog has run.
+#[test]
+fn the_deep_ring_accepts_past_the_brim_and_the_guest_reads_a_full_fifo() {
+    let (mut s, _, _) = queued_board();
+    s.fifo.set_depth(FifoDepth::Deep);
+    cmd64(&mut s, 0x6b2, 32192);
+    finish(&mut s);
+    reg_write(&mut s, ODSY_INTR_CLEAR, ODSY_INTR_FIFO_HIGH_WATER);
+    assert_eq!(s.fifo.level(), 0);
+    assert_ne!(reg_read(&mut s, ODSY_STATUS0) & ODSY_STATUS0_FIFO_EMPTY, 0, "idle reads empty");
+
+    for _ in 0..ODSY_CFIFO_WORDS / 2 + 5000 {
+        s.mmio_write(ODSY_CMD_FIFO, 0, 8);
+    }
+    assert!(s.fifo.queued_words() > ODSY_CFIFO_WORDS, "the ring took more than the board's FIFO");
+    assert_eq!(s.fifo.level(), ODSY_CFIFO_WORDS);
+    let status = reg_read(&mut s, ODSY_STATUS0);
+    assert_ne!(status & ODSY_STATUS0_FIFO_HIGH_WATER, 0);
+    assert_eq!(status & (ODSY_STATUS0_FIFO_EMPTY | ODSY_STATUS0_FIFO_LOW_WATER), 0);
+    assert_ne!(reg_read(&mut s, ODSY_INTR_FLAGS) & ODSY_INTR_FIFO_HIGH_WATER, 0);
+    assert_eq!((reg_read(&mut s, MEMORY_CONFIG) >> 7) & 0x1ff, 0x1ff, "the doubleword count is at its field's top");
+
+    // Draining the backlog keeps the guest's view pinned at the brim until
+    // the ring is under it, and level 0 only when everything has run.
+    s.work_step(&mut Budget::stores(1000));
+    assert_eq!(s.fifo.level(), ODSY_CFIFO_WORDS);
+    finish(&mut s);
+    assert_eq!(s.fifo.level(), 0);
+    let status = reg_read(&mut s, ODSY_STATUS0);
+    assert_eq!(status & ODSY_STATUS0_FIFO_HIGH_WATER, 0);
+    assert_ne!(status & ODSY_STATUS0_FIFO_EMPTY, 0);
+    assert_eq!((reg_read(&mut s, MEMORY_CONFIG) >> 7) & 0x1ff, 0);
+}
+
+/// With the deep ring a store is refused with the bus busy only when the
+/// host ring is full, not at the board's 32,768 words; the shallow mode
+/// still refuses there, and neither lets the guest read past the brim.
+#[test]
+fn the_bus_is_busy_only_when_the_ring_is_full_and_the_shallow_mode_stalls_at_the_brim() {
+    for depth in [FifoDepth::Deep, FifoDepth::Shallow] {
+        let (h, _rec) = threaded_board();
+        h.fifo.set_depth(depth);
+        let words = preamble_twice();
+        start_long_slice(&h, &words, 3000);
+        let limit = if depth == FifoDepth::Deep { RING_STORES } else { ODSY_CFIFO_WORDS };
+        // The slice's own first word may have left the ring: count what waits.
+        while h.fifo.stores() < limit {
+            assert!(h.bus_write(ODSY_CMD_FIFO, 0, 4), "{depth:?}: refused at {} stores, {} words", h.fifo.stores(), h.fifo.queued_words());
+            assert!(h.fifo.level() <= ODSY_CFIFO_WORDS);
+        }
+        assert_eq!(h.fifo.stores(), limit);
+        assert!(!h.bus_write(ODSY_CMD_FIFO, 0, 4), "{depth:?}: full refuses");
+        assert_eq!(h.fifo.stores(), limit);
+        assert_eq!(h.fifo.level(), ODSY_CFIFO_WORDS);
+        h.fifo.test_words.store(0, SeqCst);
+        h.work_stop();
+        assert_eq!(h.fifo.level(), 0, "{depth:?}: idle reads zero");
+    }
+}
+
+/// The flow-control target word is stored, not routed, so a store to it
+/// goes in at once while the FIFO holds queued work: the bus answers
+/// ready and the word reads back from the front.
+#[test]
+fn a_flow_control_target_store_does_not_wait_for_the_fifo() {
+    let (h, _rec) = threaded_board();
+    let words = preamble_twice();
+
+    start_long_slice(&h, &words, 2000);
+    assert!(h.bus_write(ODSY_CMD_FIFO, 0, 4));
+    assert!(h.fifo.pending(), "work is queued behind the slice in flight");
+
+    let word = 1 << 17 | 0x1b << 12 | 0xc8;
+    assert!(h.bus_write(ODSY_FLCTL_TARGET, word, 4), "the store is accepted at once");
+    assert_eq!(h.front.lock().flctl_target as u64, word);
+    assert_eq!(h.bus_read(ODSY_FLCTL_TARGET, 4), Some(word));
+    assert!(h.fifo.pending(), "it did not drain the FIFO");
+
+    h.work_stop();
+}
+
+/// Both processors can find room for one more store in a ring that has
+/// room for one. The check and the push are not one step, so the second
+/// push meets a full ring: exactly one store goes in, the other is
+/// refused rather than lost or overrunning the ring, and the levels count
+/// what is in it.
+#[test]
+fn two_processors_racing_for_the_last_place_in_the_ring_leave_one_store_in() {
+    const ROUNDS: u32 = 24;
+    let (s, _) = board("v12");
+    let h = Arc::new(BoardLocks::new(s));
+    h.fifo.set_depth(FifoDepth::Deep);
+    // The ring has room for one more store when it holds RING_STORES - 1.
+    let fill = |h: &BoardLocks| {
+        for _ in 0..RING_STORES - 1 {
+            assert!(h.fifo.push(&h.front, ODSY_CMD_FIFO, 0, 4, false));
+        }
+    };
+    fill(&h);
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let end = Arc::new(std::sync::Barrier::new(3));
+    let accepted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let racers: Vec<_> = (0..2)
+        .map(|_| {
+            let (h, start, end, accepted) = (h.clone(), start.clone(), end.clone(), accepted.clone());
+            std::thread::spawn(move || {
+                let mut panics = 0;
+                for _ in 0..ROUNDS {
+                    start.wait();
+                    // A panic in a push must fail the round, not leave the others waiting.
+                    let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.fifo.push(&h.front, ODSY_CMD_FIFO, 0, 4, false)));
+                    match pushed {
+                        Ok(true) => {
+                            accepted.fetch_add(1, SeqCst);
+                        }
+                        Ok(false) => {}
+                        Err(_) => panics += 1,
+                    }
+                    end.wait();
+                }
+                panics
+            })
+        })
+        .collect();
+
+    let mut run = Run::new();
+    for round in 0..ROUNDS {
+        accepted.store(0, SeqCst);
+        start.wait();
+        end.wait();
+        assert_eq!(accepted.load(SeqCst), 1, "round {round}: one place, one store");
+        assert_eq!((h.fifo.stores(), h.fifo.queued_words()), (RING_STORES, RING_STORES));
+        // Empty the ring, which also publishes the consumer's head to the
+        // producers, and fill it again.
+        while h.fifo.stores() != 0 {
+            h.fifo.take_run(&mut run);
+            let n = run.stores().len();
+            h.fifo.retire(&h.front, &run, n);
+        }
+        fill(&h);
+    }
+    for r in racers {
+        assert_eq!(r.join().unwrap(), 0, "a push panicked");
+    }
 }

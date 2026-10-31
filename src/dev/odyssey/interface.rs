@@ -47,6 +47,11 @@ pub struct HostInterface {
     /// The flag source's transition state, for the packet edge.
     pub interrupt_asserted: bool,
     pub sw_token: u32,
+    /// The flow-control target word (+0x1074), as last written. Stored, not
+    /// routed: nothing consumes it, so it is a front register that neither
+    /// waits for the command FIFO nor takes the board lock.
+    pub flctl_target: u32,
+    pub flctl_target_reported: bool,
     pub route_dest_upper: u32,
     pub route_dest_lower: u32,
     pub route_vectors: u32,
@@ -88,6 +93,8 @@ impl Default for HostInterface {
             intr_enable: 0,
             interrupt_asserted: false,
             sw_token: 0,
+            flctl_target: 0,
+            flctl_target_reported: false,
             route_dest_upper: 0,
             route_dest_lower: 0,
             route_vectors: 0,
@@ -243,6 +250,7 @@ impl HostInterface {
                     | if level < ODSY_CFIFO_LOW_WATER { ODSY_STATUS0_FIFO_LOW_WATER } else { 0 }) as u64;
             }
             ODSY_SW_TOKEN => value = self.sw_token as u64,
+            ODSY_FLCTL_TARGET => value = self.flctl_target as u64,
             ODSY_SWAP_ARM => value = self.swap_arm as u64,
             ODSY_SWAP_PENDING => value = self.swap_pending as u64,
             ODSY_SWAP_CONTROL => value = self.swap_control as u64,
@@ -293,6 +301,18 @@ impl HostInterface {
                 self.update_irq();
             }
             ODSY_SW_TOKEN => self.sw_token = value as u32,
+            ODSY_FLCTL_TARGET => {
+                self.flctl_target = value as u32;
+                if !self.flctl_target_reported {
+                    self.flctl_target_reported = true;
+                    crate::dlog!(
+                        LogModule::Odyssey,
+                        "sgi-odyssey: flow-control interrupt target {} and credit target {} stored; credits still return through the node interface",
+                        (value as u32) >> ODSY_FLCTL_INTR_TARGET_SHIFT,
+                        ((value >> ODSY_FLCTL_TARGET_SHIFT) as u32) & ODSY_FLCTL_TARGET_MASK
+                    );
+                }
+            }
             ODSY_SWAP_ARM => {
                 // Queue flips for the next retrace. Writes accumulate: the
                 // driver can issue several windows or swap groups between two

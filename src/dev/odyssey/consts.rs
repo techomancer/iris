@@ -1000,8 +1000,9 @@ pub const ODSY_F32_SCALE_8: u32 = 0x3b808081;
 pub const ODSY_F32_SCALE_16: u32 = 0x37800080;
 pub const ODSY_F32_SCALE_32: u32 = 0x2f800005;
 
-// The host ring under the command FIFO, in entries (fifo.rs). Deeper than
-// the board's FIFO, so it never fills.
+// The host ring under the command FIFO, in entries (fifo.rs). A store is one
+// entry whatever its width, so it holds at least twice the board's FIFO in
+// words; a store is refused only when it is full.
 pub const ODSY_WORK_QUEUE_MAX: u32 = 65536;
 
 // The board's command FIFO, in 32-bit words: sixteen 8 KB tiles of board

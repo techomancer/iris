@@ -50,18 +50,6 @@ impl Board {
             }
             ODSY_MEMORY_CONTROL => self.memory_control(value as u32),
             ODSY_FLCTL_CONFIG => self.flctl_config = value as u32,
-            ODSY_FLCTL_TARGET => {
-                self.flctl_target = value as u32;
-                if !self.flctl_target_reported {
-                    self.flctl_target_reported = true;
-                    crate::dlog!(
-                        LogModule::Odyssey,
-                        "sgi-odyssey: flow-control interrupt target {} and credit target {} stored; credits still return through the node interface",
-                        (value as u32) >> ODSY_FLCTL_INTR_TARGET_SHIFT,
-                        ((value >> ODSY_FLCTL_TARGET_SHIFT) as u32) & ODSY_FLCTL_TARGET_MASK
-                    );
-                }
-            }
             ODSY_BUZZ_1 => self.buzz[0] = value as u32,
             ODSY_BUZZ_2 => self.buzz[1] = value as u32,
             ODSY_BUZZ_3 => self.buzz[2] = value as u32,
@@ -200,6 +188,9 @@ pub fn access_waits(addr: u64, size: u32, write: bool) -> bool {
             | ODSY_ROUTE_DEST_LOWER
             | ODSY_ROUTE_VECTORS
             | ODSY_SW_TOKEN
+            // The datasheet records the word as stored, not routed, with
+            // no wait; making the processor wait on it modelled nothing.
+            | ODSY_FLCTL_TARGET
             | ODSY_SWAP_ARM
             | ODSY_SWAP_PENDING
             | ODSY_SWAP_CONTROL
