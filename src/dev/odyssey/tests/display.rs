@@ -759,8 +759,8 @@ fn the_dirty_counters_name_the_site_and_the_frame_rows() {
 
     let h = s.scanout.mode.height as u64;
     let st = &s.scanout.stats;
-    assert_eq!(st.sites[DirtySite::Pixel as usize], [1, 3]);
-    assert_eq!(st.sites[DirtySite::Cursor as usize], [1, h - 1000], "clipped to the frame");
+    assert_eq!(s.scanout.marks.site(DirtySite::Pixel), [1, 3]);
+    assert_eq!(s.scanout.marks.site(DirtySite::Cursor), [1, h - 1000], "clipped to the frame");
     assert_eq!((st.frames, st.busy_frames, st.rows, st.max_rows), (1, 1, 3 + h - 1000, 3 + h - 1000));
     s.scanout_update();
     assert_eq!((s.scanout.stats.frames, s.scanout.stats.busy_frames), (2, 1), "an idle frame counts, with no rows");
@@ -768,7 +768,7 @@ fn the_dirty_counters_name_the_site_and_the_frame_rows() {
 
 /// The display lines a draw marked to resolve again.
 fn dirty_rows(s: &Board) -> Vec<usize> {
-    (0..s.scanout.dirty.len()).filter(|&y| s.scanout.dirty[y]).collect()
+    s.scanout.marks.dirty_rows()
 }
 
 /// A 2D draw marks only the lines it wrote, not the whole frame: the

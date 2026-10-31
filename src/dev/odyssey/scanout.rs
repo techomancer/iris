@@ -3,14 +3,18 @@
 //!
 //! `frame` holds the presented frame (0x00RRGGBB, `frame_width` by
 //! `frame_height`), which the board's display thread copies to the window;
-//! `dirty` marks the lines the board resolves again
-//! (Board::scanout_update()). The retrace is counted on the host's
+//! `marks` holds the lines the board resolves again
+//! (Board::scanout_update()), which any thread that writes a plane sets and
+//! the display consumes. The retrace is counted on the host's
 //! monotonic clock: `retrace_deadline` (-1 when disarmed) is when the next
 //! one is due, and [`Scanout::next_retrace`] reports each as it comes due.
 //!
 //! Ported from include/hw/display/sgi/scanout.h and the shared SGI graphics
 //! code in jamesbraid/qemu-sgi-origami.
 use super::*;
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub const SGI_SCANOUT_MAX_DIM: u32 = 16384;
 /// 1 kHz: well above any SGI display's field rate.
@@ -100,12 +104,11 @@ impl DirtySite {
 }
 
 /// Standing counters of the display's dirty lines, read by the monitor's
-/// `vpro dirty`: per site the marks made and the lines they named, and per
-/// display frame the lines resolved. Plain integers under the board lock.
+/// `vpro dirty`: per display frame the lines resolved, and the waits for
+/// the planes. Plain integers under the board lock; the per-site marks the
+/// writers make are atomics in [`RowMarks`].
 #[derive(Clone, Default, Debug)]
 pub struct DirtyStats {
-    /// By DirtySite: [marks, lines named].
-    pub sites: [[u64; 2]; DirtySite::ALL.len()],
     /// Display frames that staged their lines, and those with any line.
     pub frames: u64,
     pub busy_frames: u64,
@@ -147,7 +150,7 @@ impl DirtyStats {
         self.copy_max_ns = self.copy_max_ns.max(copy);
     }
 
-    pub fn report(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    pub fn report(&self, marks: &RowMarks, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         writeln!(w, "frames {} busy {} rows {} max {} swaps {}", self.frames, self.busy_frames, self.rows, self.max_rows, self.swaps)?;
         writeln!(
             w,
@@ -159,7 +162,8 @@ impl DirtyStats {
             self.retries,
             self.fallbacks
         )?;
-        for (site, c) in DirtySite::ALL.iter().zip(&self.sites) {
+        for site in DirtySite::ALL {
+            let c = marks.site(site);
             if c[0] != 0 {
                 writeln!(w, "site {} marks {} rows {}", site.name(), c[0], c[1])?;
             }
@@ -171,8 +175,10 @@ impl DirtyStats {
 #[derive(Clone)]
 pub struct Scanout {
     pub mode: ScanoutMode,
-    pub frame: Vec<u32>,  // frame_width x frame_height of 0x00RRGGBB; empty: none
-    pub dirty: Vec<bool>, // one flag per display line
+    pub frame: Vec<u32>, // frame_width x frame_height of 0x00RRGGBB; empty: none
+    /// The lines to resolve again, and the lines a writer touched without
+    /// naming a buffer: shared with every thread that writes a plane.
+    pub marks: Arc<RowMarks>,
     pub frame_width: u32,
     pub frame_height: u32, // what frame was allocated for
 
@@ -181,9 +187,9 @@ pub struct Scanout {
     /// only those rows can change (Board::flip_rows()). Writers that name
     /// their rows keep it (DrawnRows::take()). One that names a display
     /// line, but not the buffer or the drawable, sets the line in
-    /// `unnamed`, and the next swap measures the buffers in those lines.
+    /// `RowMarks::unnamed`, and the next swap measures the buffers in those
+    /// lines.
     pub differ: Box<[[u64; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]>,
-    pub unnamed: [u64; ROW_WORDS],
     /// The displayed-buffer bits the frame was last staged from.
     pub staged_displayed: u32,
 
@@ -199,11 +205,10 @@ impl Default for Scanout {
         Scanout {
             mode: ScanoutMode::default(),
             frame: Vec::new(),
-            dirty: Vec::new(),
+            marks: Arc::new(RowMarks::default()),
             frame_width: 0,
             frame_height: 0,
             differ: Box::new([[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]),
-            unnamed: [0; ROW_WORDS],
             staged_displayed: 0,
             stats: DirtyStats::default(),
             retrace_deadline: -1,
@@ -264,20 +269,7 @@ impl Scanout {
         self.repaint_for(DirtySite::Other, first, count);
     }
     pub fn repaint_for(&mut self, site: DirtySite, first: i32, count: i32) {
-        let h: i32 = if !self.frame.is_empty() { self.mode.height as i32 } else { 0 };
-        let last = first.wrapping_add(count).wrapping_sub(1);
-
-        let first = first.max(0);
-        let last = last.min(h - 1);
-        if first > last {
-            return;
-        }
-        let c = &mut self.stats.sites[site as usize];
-        c[0] += 1;
-        c[1] += (last - first + 1) as u64;
-        for d in &mut self.dirty[first as usize..=last as usize] {
-            *d = true;
-        }
+        self.marks.repaint(site, first, count);
     }
     pub fn repaint_all(&mut self) {
         self.repaint_all_for(DirtySite::Other);
@@ -292,11 +284,7 @@ impl Scanout {
         self.invalidate_for(DirtySite::Other, first, count);
     }
     pub fn invalidate_for(&mut self, site: DirtySite, first: i32, count: i32) {
-        self.repaint_for(site, first, count);
-        let last = first.wrapping_add(count).wrapping_sub(1).min(ROW_WORDS as i32 * 64 - 1);
-        for y in first.max(0)..=last {
-            self.unnamed[y as usize >> 6] |= 1 << (y & 63);
-        }
+        self.marks.invalidate(site, first, count);
     }
     /// invalidate_for() the lines [y, y + h) of a rectangle, which a caller
     /// has not clipped to the frame.
@@ -311,6 +299,167 @@ impl Scanout {
     }
     pub fn invalidate_all_for(&mut self, site: DirtySite) {
         self.invalidate_for(site, 0, self.mode.height as i32);
+    }
+}
+
+/// Words of the dirty-line bitset: a bit a display line of the largest mode.
+pub const DIRTY_WORDS: usize = (SGI_SCANOUT_MAX_DIM as usize).div_ceil(64);
+
+/// The display lines that must be resolved again, and the lines a writer
+/// touched without naming a colour buffer, as bitsets any thread may set.
+///
+/// A writer stores its pixels first and marks them second, with Release; the
+/// display takes the marks with `swap(0, Acquire)` and only then reads the
+/// planes. A row the display copied while a writer was still storing is
+/// therefore marked again after the writer's last store, and the next frame
+/// copies it whole. A mark published before its pixels would let the display
+/// consume it, copy the old pixels and never hear of the new ones.
+///
+/// The display takes marks and must put back any it does not apply
+/// ([`RowMarks::repaint`]).
+pub struct RowMarks {
+    dirty: Box<[AtomicU64; DIRTY_WORDS]>,
+    unnamed: [AtomicU64; ROW_WORDS],
+    /// Lines of the frame the marks are for; 0 with no frame. A mark past it
+    /// is dropped.
+    height: AtomicU32,
+    /// By DirtySite: [marks, lines named].
+    sites: [[AtomicU64; 2]; DirtySite::ALL.len()],
+}
+
+impl Default for RowMarks {
+    fn default() -> Self {
+        RowMarks {
+            dirty: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            unnamed: std::array::from_fn(|_| AtomicU64::new(0)),
+            height: AtomicU32::new(0),
+            sites: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+        }
+    }
+}
+
+impl RowMarks {
+    /// The frame is `height` lines tall: marks past it are dropped, and a
+    /// new height forgets the lines marked for the old one (the caller marks
+    /// the new frame whole).
+    pub fn set_height(&self, height: u32) {
+        if self.height.swap(height, Ordering::AcqRel) != height {
+            for w in self.dirty.iter() {
+                w.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    /// The lines of the frame, 0 with none.
+    pub fn height(&self) -> u32 {
+        self.height.load(Ordering::Acquire)
+    }
+
+    /// Mark lines [first, first + count) to be resolved again, for a change
+    /// that is not in the colour planes (the lookup RAM, the cursor, a
+    /// swap) or that the caller has already named in `unnamed`.
+    pub fn repaint(&self, site: DirtySite, first: i32, count: i32) {
+        let h = self.height() as i32;
+        let last = first.wrapping_add(count).wrapping_sub(1);
+
+        let first = first.max(0);
+        let last = last.min(h - 1);
+        if first > last {
+            return;
+        }
+        let c = &self.sites[site as usize];
+        c[0].fetch_add(1, Ordering::Relaxed);
+        c[1].fetch_add((last - first + 1) as u64, Ordering::Relaxed);
+        set_range(&self.dirty[..], first as usize, last as usize);
+    }
+
+    /// Mark lines [first, first + count) after a store to the planes, in
+    /// either colour buffer: the lines, and the next swap measures the
+    /// buffers there. The caller has stored its pixels already. The lines
+    /// are named in `unnamed` before they are marked dirty: the other order
+    /// would let a frame take the dirty mark and a swap latch before the
+    /// unnamed mark, and the swap would not repaint a line whose buffers
+    /// differ, for good.
+    pub fn invalidate(&self, site: DirtySite, first: i32, count: i32) {
+        self.name_unnamed(first, count);
+        self.repaint(site, first, count);
+    }
+
+    /// The first half of invalidate(): lines whose buffer the writer did not
+    /// name.
+    pub fn name_unnamed(&self, first: i32, count: i32) {
+        let last = first.wrapping_add(count).wrapping_sub(1).min(ROW_WORDS as i32 * 64 - 1);
+
+        if first.max(0) <= last {
+            set_range(&self.unnamed[..], first.max(0) as usize, last as usize);
+        }
+    }
+
+    /// Take every dirty line below `height`, in order, and clear the marks.
+    /// Read the planes only after this.
+    pub fn take_dirty(&self, height: usize, rows: &mut Vec<u32>) {
+        for (i, word) in self.dirty.iter().enumerate() {
+            let mut w = word.swap(0, Ordering::Acquire);
+
+            while w != 0 {
+                let y = i * 64 + w.trailing_zeros() as usize;
+                w &= w - 1;
+                if y < height {
+                    rows.push(y as u32);
+                }
+            }
+        }
+    }
+
+    /// Whether any line was touched without naming its buffer and not yet
+    /// measured.
+    pub fn unnamed_pending(&self) -> bool {
+        self.unnamed.iter().any(|w| w.load(Ordering::Acquire) != 0)
+    }
+
+    /// Take the lines touched without naming a buffer, and clear them. A
+    /// write that lands after this sets its line again, and the next swap
+    /// measures it.
+    pub fn take_unnamed(&self) -> [u64; ROW_WORDS] {
+        std::array::from_fn(|i| self.unnamed[i].swap(0, Ordering::Acquire))
+    }
+
+    /// [marks, lines named] by `site`.
+    pub fn site(&self, site: DirtySite) -> [u64; 2] {
+        let c = &self.sites[site as usize];
+        [c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed)]
+    }
+
+    pub fn reset_sites(&self) {
+        for c in &self.sites {
+            c[0].store(0, Ordering::Relaxed);
+            c[1].store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Tests: the lines marked dirty now, not taken.
+    #[cfg(test)]
+    pub fn dirty_rows(&self) -> Vec<usize> {
+        (0..DIRTY_WORDS * 64).filter(|&y| self.dirty[y >> 6].load(Ordering::Acquire) >> (y & 63) & 1 != 0).collect()
+    }
+
+    /// Tests: forget every dirty line.
+    #[cfg(test)]
+    pub fn clear_dirty(&self) {
+        for w in self.dirty.iter() {
+            w.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Set bits first..=last of a bitset, a word at a time, with Release.
+fn set_range(words: &[AtomicU64], first: usize, last: usize) {
+    for i in first >> 6..=last >> 6 {
+        let lo = if i == first >> 6 { first & 63 } else { 0 };
+        let hi = if i == last >> 6 { last & 63 } else { 63 };
+        let mask = (u64::MAX >> (63 - (hi - lo))) << lo;
+
+        words[i].fetch_or(mask, Ordering::Release);
     }
 }
 
@@ -392,13 +541,14 @@ impl Scanout {
             return;
         }
         self.frame = Vec::new();
-        self.dirty = Vec::new();
         self.frame_width = 0;
         self.frame_height = 0;
+        self.marks.set_height(0);
         if w != 0 && h != 0 {
             self.frame = vec![0u32; w as usize * h as usize];
-            self.dirty = vec![false; h as usize];
             self.frame_width = w;
             self.frame_height = h;
+            self.marks.set_height(h);
         }
-    }}
+    }
+}

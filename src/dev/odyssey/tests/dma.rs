@@ -463,7 +463,7 @@ fn a_context_switch_with_no_shadow_address_writes_nothing() {
 #[test]
 fn a_dma_transfer_dirties_only_the_rows_it_wrote() {
     let (mut s, _, ram) = board_with_ram();
-    let lines = |s: &Board| (0..s.scanout.dirty.len()).filter(|&y| s.scanout.dirty[y]).collect::<Vec<_>>();
+    let lines = |s: &Board| s.scanout.marks.dirty_rows();
     colour_destination(&mut s);
     ram.put(PAGE_A, &[0x10; 24]);
     s.scanout_update();

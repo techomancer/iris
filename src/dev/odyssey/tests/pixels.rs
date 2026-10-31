@@ -713,7 +713,7 @@ fn a_pixel_buffers_front_is_the_buffer_a_front_draw_mask_writes() {
 
 /// The display lines still waiting to be resolved again.
 fn dirty_lines(s: &Board) -> Vec<usize> {
-    s.scanout.dirty.iter().enumerate().filter(|(_, d)| **d).map(|(y, _)| y).collect()
+    s.scanout.marks.dirty_rows()
 }
 
 /// A GL image write, by burst or by DMA, and a pixel copy write colour
@@ -844,7 +844,7 @@ fn zoom_2x2_sized(word4: u32, size_bits: u32) -> Box<Board> {
 #[test]
 fn an_integer_pixel_through_a_logic_op_or_to_the_id_planes_dirties_its_row() {
     let (mut s, _) = window();
-    let lines = |s: &Board| (0..s.scanout.dirty.len()).filter(|&y| s.scanout.dirty[y]).collect::<Vec<_>>();
+    let lines = |s: &Board| s.scanout.marks.dirty_rows();
     s.scanout_update();
 
     s.pattern_mode |= ODSY_MODE_COLOR_LOGIC_OP;

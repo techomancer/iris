@@ -357,9 +357,14 @@ impl Device for Odyssey {
                 self.state.refusals.reset();
                 Ok(())
             }
-            ["dirty"] => self.state.board.lock().scanout.stats.report(&mut *w).map_err(|e| e.to_string()),
+            ["dirty"] => {
+                let s = self.state.board.lock();
+                s.scanout.stats.report(&s.scanout.marks, &mut *w).map_err(|e| e.to_string())
+            }
             ["dirty", "reset"] => {
-                self.state.board.lock().scanout.stats = DirtyStats::default();
+                let mut s = self.state.board.lock();
+                s.scanout.stats = DirtyStats::default();
+                s.scanout.marks.reset_sites();
                 Ok(())
             }
             _ => Err("Usage: vpro refusals [reset] | vpro dirty [reset]".to_string()),

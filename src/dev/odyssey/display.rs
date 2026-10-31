@@ -574,10 +574,11 @@ impl Board {
             let w = self.scanout.mode.width as usize;
             let width = (self.scanout.mode.width.min(SGI_ODYSSEY_WIDTH)) as usize;
             let mut row = Vec::new();
-            for y in 0..h {
-                if !self.scanout.dirty[y] {
-                    continue;
-                }
+            // Take the marks before the planes are read, so a store that
+            // lands during the copy marks its line again.
+            let mut dirty = Vec::new();
+            self.scanout.marks.take_dirty(h, &mut dirty);
+            for y in dirty.into_iter().map(|y| y as usize) {
                 let staged = match self.scanout_line(y as u32, width) {
                     Some(line) => {
                         stage.push(line);
@@ -591,7 +592,6 @@ impl Board {
                     }
                 };
                 stage.lines.push((y as u32, staged));
-                self.scanout.dirty[y] = false;
             }
         }
         self.scanout.stats.staged(stage.lines.len());
@@ -616,7 +616,7 @@ impl Board {
         if self.scanout.mode.height > SGI_ODYSSEY_HEIGHT {
             return self.scanout.repaint_all_for(DirtySite::Flip);
         }
-        if self.scanout.unnamed.iter().any(|&w| w != 0) {
+        if self.scanout.marks.unnamed_pending() {
             self.measure_differ();
         }
         let mut rows = [0u64; ROW_WORDS];
@@ -641,7 +641,9 @@ impl Board {
     /// whole differs for every id.
     fn measure_differ(&mut self) {
         let width = self.scanout.mode.width.min(SGI_ODYSSEY_WIDTH) as usize;
-        let unnamed = std::mem::replace(&mut self.scanout.unnamed, [0; ROW_WORDS]);
+        // Clear, then measure, then set: a write that lands after the clear
+        // marks its line again for the next swap.
+        let unnamed = self.scanout.marks.take_unnamed();
 
         for (i, mut word) in unnamed.into_iter().enumerate() {
             while word != 0 {

@@ -125,7 +125,7 @@ fn a_fence_behind_a_queued_draw_lands_after_the_draw() {
 fn fresh_scanout() -> Scanout {
     let mut scanout = Scanout::default();
     scanout.set_mode(&ScanoutMode { width: SGI_ODYSSEY_WIDTH, height: SGI_ODYSSEY_HEIGHT, frame_clocks: 0, clock_hz: 0 });
-    scanout.dirty.fill(false);
+    scanout.marks.clear_dirty();
     scanout
 }
 
@@ -142,7 +142,7 @@ fn the_display_waits_out_a_raster_slice_in_flight() {
     assert_ne!(pixel(&s, 0, 10, 10), 0, "the frame saw the whole draw");
     let mut scanout = fresh_scanout();
     planes.take_rows(0, &mut scanout);
-    let rows: Vec<u32> = (0..SGI_ODYSSEY_HEIGHT).filter(|&y| scanout.dirty[y as usize]).collect();
+    let rows: Vec<u32> = scanout.marks.dirty_rows().into_iter().map(|y| y as u32).collect();
     assert!(rows.contains(&10), "and the display hears which rows the raster unit drew: {rows:?}");
     drop(planes);
     drop(s);
@@ -297,7 +297,7 @@ fn a_waiting_bus_read_is_busy_until_the_raster_unit_has_drawn() {
 fn drawn_rows(h: &BoardLocks, displayed: u32) -> Vec<u32> {
     let mut scanout = fresh_scanout();
     h.raster.planes().take_rows(displayed, &mut scanout);
-    (0..SGI_ODYSSEY_HEIGHT).filter(|&y| scanout.dirty[y as usize]).collect()
+    scanout.marks.dirty_rows().into_iter().map(|y| y as u32).collect()
 }
 
 /// Which rows of colour buffer b differ between two snapshots.
@@ -490,7 +490,7 @@ fn a_swap_resolves_the_rows_drawn_into_the_other_buffer_and_no_others() {
     s.scanout_update();
     swap_every_window(&mut s);
     s.scanout_update();
-    assert!(s.scanout.unnamed.iter().all(|&w| w == 0));
+    assert!(!s.scanout.marks.unnamed_pending());
 
     let before = snapshot(&s, 1);
     small_triangle(&mut s, &st, 100.0, RED);
@@ -553,7 +553,7 @@ fn a_swap_measures_only_the_lines_an_unnamed_write_marked() {
     assert_eq!(resolved_rows(&mut s, &h), vec![700, 800], "the written lines repaint");
     swap_every_window(&mut s);
     assert_eq!(resolved_rows(&mut s, &h), want, "the swap shows the drawn rows and the line that differs, not the one that does not");
-    assert!(s.scanout.unnamed.iter().all(|&w| w == 0), "the swap measured the marked lines");
+    assert!(!s.scanout.marks.unnamed_pending(), "the swap measured the marked lines");
 }
 
 /// Whatever the draws, unnamed writes, swaps and lookup changes, the frame
