@@ -63,6 +63,7 @@ use crate::dev::ioc3_port::Ioc3EthPort;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{self, BoardRecord};
+use crate::dev::deadline_timers::DeadlineTimers;
 use crate::dev::ioc_serial_dma::{off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
 #[cfg(test)]
 use crate::dev::ioc_serial_dma::{ctl as sdma_ctl, ARM_RX_TIMER, HELD_SHIFT, TIMER_TICK_NS, TX_DELAY, TX_INTERRUPT};
@@ -1687,6 +1688,11 @@ const K_NVRAM: usize = 5;
 const KINDS: usize = 6;
 type Deadlines = [Option<Instant>; KINDS];
 
+/// The least delay for a kind's timer; see [`IO_REARM_MIN`].
+fn timer_floor(kind: usize) -> Duration {
+    if kind == K_INT_OUT { IO_REARM_MIN } else { Duration::ZERO }
+}
+
 /// A rewrite of the NVRAM file waiting for the writer thread.
 type NvramJob = (std::path::PathBuf, Vec<u8>);
 
@@ -1718,14 +1724,12 @@ struct Shared {
     /// A PS/2 character arrived while an access held the chip.
     kbc_dirty: AtomicBool,
     me: Weak<Shared>,
-    timers: OnceLock<Arc<TimerManager>>,
+    timers: DeadlineTimers<KINDS>,
     events: OnceLock<SyncSender<MachineEvent>>,
     /// Between `start` and `stop`.
     running: AtomicBool,
     /// Held by a timer callback while it runs, so `stop` can wait one out.
     gate: Mutex<()>,
-    /// The timer pending for each deadline kind, and the deadline it serves.
-    armed: Mutex<[Option<(TimerId, Instant)>; KINDS]>,
     /// The NVRAM image the writer thread has yet to put in the file.
     nvram_job: Mutex<Option<NvramJob>>,
     nvram_ready: Condvar,
@@ -1820,32 +1824,9 @@ impl Shared {
         }
     }
 
-    /// Make the pending timers match `want`: one one-shot per deadline. A
-    /// timer whose deadline moved is replaced; with none set or the chip not
-    /// running, deadlines are only evaluated lazily, by the next access.
+    /// Arm a timer for each deadline the chip holds.
     fn arm(&self, want: Deadlines) {
-        let Some(tm) = self.timers.get() else { return };
-        let mut armed = self.armed.lock();
-        // Checked under the lock `stop` clears the slots with: a pass that
-        // sees `running` set has its timers removed by that stop.
-        if !self.running.load(Ordering::SeqCst) {
-            return;
-        }
-        for (k, w) in want.iter().enumerate() {
-            if armed[k].map(|(_, d)| d) == *w {
-                continue;
-            }
-            if let Some((id, _)) = armed[k].take() {
-                tm.remove(id);
-            }
-            let Some(due) = *w else { continue };
-            let mut delay = due.saturating_duration_since(Instant::now());
-            if k == K_INT_OUT {
-                delay = delay.max(IO_REARM_MIN);
-            }
-            let id = tm.add_one_shot(delay, self.me.clone(), move |me| Shared::fire(me, k, due));
-            armed[k] = Some((id, due));
-        }
+        self.timers.arm(&want, &self.running, &self.me, timer_floor, Shared::fire);
     }
 
     /// A deadline passed with no guest access to notice it. Runs on the timer
@@ -1857,12 +1838,7 @@ impl Shared {
         if !sh.running.load(Ordering::SeqCst) {
             return TimerReturn::Delete;
         }
-        {
-            let mut armed = sh.armed.lock();
-            if armed[kind].map(|(_, d)| d) == Some(due) {
-                armed[kind] = None;
-            }
-        }
+        sh.timers.fired(kind, due);
         if kind == K_NVRAM {
             // The file is written by its own thread, not here.
             if let Some(job) = sh.st.lock().rtc.take_dirty(NVRAM_QUIET) {
@@ -2044,11 +2020,10 @@ impl Ioc3 {
                 line_order: Mutex::new(()),
                 kbc_dirty: AtomicBool::new(false),
                 me: weak.clone(),
-                timers: OnceLock::new(),
+                timers: DeadlineTimers::new(),
                 events: OnceLock::new(),
                 running: AtomicBool::new(false),
                 gate: Mutex::new(()),
-                armed: Mutex::new([None; KINDS]),
                 nvram_job: Mutex::new(None),
                 nvram_ready: Condvar::new(),
             }
@@ -2070,7 +2045,7 @@ impl Ioc3 {
 
     /// The timer manager for device deadlines. Set it before start.
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.sh.timers.set(tm);
+        self.sh.timers.set_manager(tm);
     }
 
     /// Where the DS1685's power-off goes: one `PowerOff` event when the guest
@@ -2248,14 +2223,7 @@ impl Device for Ioc3 {
         if !self.sh.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        {
-            let mut armed = self.sh.armed.lock();
-            for slot in armed.iter_mut() {
-                if let (Some((id, _)), Some(tm)) = (slot.take(), self.sh.timers.get()) {
-                    tm.remove(id);
-                }
-            }
-        }
+        self.sh.timers.cancel_all();
         drop(self.sh.gate.lock());
         // The writer waits on the job slot's lock: take it so the wake-up
         // cannot fall between its check of `running` and its wait.

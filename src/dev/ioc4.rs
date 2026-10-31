@@ -63,7 +63,8 @@ use crate::dev::ds1744::Ds1744;
 use crate::dev::ioc_serial_dma::{off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::dev::deadline_timers::DeadlineTimers;
+use crate::hptimer::{TimerManager, TimerReturn};
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciBusDevice, PciConfig, PciConfigPolicy, PciDma, PCI_INTA};
 use crate::traits::{BusDevice, Device, Resettable};
@@ -478,13 +479,11 @@ struct Shared {
     /// Serialises driving the line; see [`Shared::sync_line`].
     line_order: Mutex<()>,
     me: Weak<Shared>,
-    timers: OnceLock<Arc<TimerManager>>,
+    timers: DeadlineTimers<KINDS>,
     /// Between `start` and `stop`.
     running: AtomicBool,
     /// Held by a timer callback while it runs, so `stop` can wait one out.
     gate: Mutex<()>,
-    /// The timer pending for each deadline kind, and the deadline it serves.
-    armed: Mutex<[Option<(TimerId, Instant)>; KINDS]>,
 }
 
 impl Shared {
@@ -514,28 +513,9 @@ impl Shared {
         r
     }
 
-    /// Make the pending timers match `want`: one one-shot per deadline. A
-    /// timer whose deadline moved is replaced; with none set or the chip not
-    /// running, deadlines are only evaluated lazily, by the next access.
+    /// Arm a timer for each deadline the chip holds.
     fn arm(&self, want: Deadlines) {
-        let Some(tm) = self.timers.get() else { return };
-        let mut armed = self.armed.lock();
-        // Checked under the lock `stop` clears the slots with.
-        if !self.running.load(Ordering::SeqCst) {
-            return;
-        }
-        for (k, w) in want.iter().enumerate() {
-            if armed[k].map(|(_, d)| d) == *w {
-                continue;
-            }
-            if let Some((id, _)) = armed[k].take() {
-                tm.remove(id);
-            }
-            let Some(due) = *w else { continue };
-            let delay = due.saturating_duration_since(Instant::now());
-            let id = tm.add_one_shot(delay, self.me.clone(), move |me| Shared::fire(me, k, due));
-            armed[k] = Some((id, due));
-        }
+        self.timers.arm(&want, &self.running, &self.me, |_| Duration::ZERO, Shared::fire);
     }
 
     /// A deadline passed with no guest access to notice it. Runs on the timer
@@ -546,12 +526,7 @@ impl Shared {
         if !sh.running.load(Ordering::SeqCst) {
             return TimerReturn::Delete;
         }
-        {
-            let mut armed = sh.armed.lock();
-            if armed[kind].map(|(_, d)| d) == Some(due) {
-                armed[kind] = None;
-            }
-        }
+        sh.timers.fired(kind, due);
         sh.with_st(|st| st.sdma_catch_up(Instant::now()));
         TimerReturn::Delete
     }
@@ -618,10 +593,9 @@ impl Ioc4 {
                 line_level: AtomicBool::new(false),
                 line_order: Mutex::new(()),
                 me: weak.clone(),
-                timers: OnceLock::new(),
+                timers: DeadlineTimers::new(),
                 running: AtomicBool::new(false),
                 gate: Mutex::new(()),
-                armed: Mutex::new([None; KINDS]),
             }
         });
         Ioc4 { sh, clock: OnceLock::new(), threads: Mutex::new(Vec::new()) }
@@ -636,7 +610,7 @@ impl Ioc4 {
 
     /// The timer manager for device deadlines. Set it before start.
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.sh.timers.set(tm);
+        self.sh.timers.set_manager(tm);
     }
 
     /// Wire the host end of serial port `port` (0 is the console): a TCP
@@ -707,14 +681,7 @@ impl Device for Ioc4 {
         if !self.sh.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        {
-            let mut armed = self.sh.armed.lock();
-            for slot in armed.iter_mut() {
-                if let (Some((id, _)), Some(tm)) = (slot.take(), self.sh.timers.get()) {
-                    tm.remove(id);
-                }
-            }
-        }
+        self.sh.timers.cancel_all();
         drop(self.sh.gate.lock());
         let mut threads = self.threads.lock();
         for t in threads.iter() {

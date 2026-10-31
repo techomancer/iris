@@ -1375,7 +1375,7 @@ fn running_rig() -> (Rig, Arc<TimerManager>) {
 /// deadline briefly shows none; the callback holds `gate` throughout.
 fn timer_pending(r: &Rig, kind: usize) -> bool {
     let _idle = r.c.sh.gate.lock();
-    r.c.sh.armed.lock()[kind].is_some()
+    r.c.sh.timers.is_armed(kind)
 }
 
 /// Poll `cond` for up to two seconds.
@@ -1507,7 +1507,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     r.c.stop();
     assert!(!r.c.is_running());
     assert!(r.c.threads.lock().is_empty());
-    assert!(r.c.sh.armed.lock().iter().all(|a| a.is_none()));
+    assert!(r.c.sh.timers.none_armed());
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
     std::thread::sleep(Duration::from_millis(20));
