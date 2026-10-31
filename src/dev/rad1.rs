@@ -105,14 +105,25 @@ const SUBCODE_LAST: u32 = 0x1218;
 const SUBCODE_WORDS: usize = ((SUBCODE_LAST - SUBCODE_FIRST) / 8 + 1) as usize;
 
 const ENABLE_BIT: u32 = 1;
+const SUBCODE_ENABLE_BIT: u32 = 4;
+/// Control word bits 6:3: the index of the next descriptor in the descriptor
+/// RAM (mediaio-rad1-audio, output channel). The old channel-type tags are
+/// those indices.
+const CTRL_NEXT_SHIFT: u32 = 3;
+const CTRL_NEXT_MASK: u32 = 0xf;
+/// Control word bit 2: end of descriptor; the transfer stops after it.
+const CTRL_EOD: u32 = 4;
+/// The descriptor RAM: 16 entries of three words from 0x400, all stored. A
+/// link to an entry still all zero is in no source and stops the output (see
+/// [`State::descriptor_end`]).
+const DESC_RAM_ENTRY_BYTES: u32 = 12;
+const DESC_RAM_ENTRIES: u32 = 16;
+const DESC_RAM_LAST: u32 = DMA_BANK_FIRST + DESC_RAM_ENTRIES * DESC_RAM_ENTRY_BYTES - 4;
 /// The analog output's enable register: bit 0 starts the channel, bit 29 or
 /// 30 picks generator 1 or 2 (mediaio-rad1-audio, output channel). The
 /// "bit 28 + n" pattern is inferred from those two; other bits are unknown.
 const OUT_SELECT_GEN1: u32 = 1 << 29;
 const OUT_SELECT_GEN2: u32 = 1 << 30;
-const SUBCODE_ENABLE_BIT: u32 = 4;
-const CTRL_TAG_SHIFT: u32 = 3;
-const CTRL_TAG_MASK: u32 = 0xf;
 const CTRL_LEN_SHIFT: u32 = 7;
 const CTRL_LEN_MASK: u32 = 0x1ff_ffff;
 const DMA_UNIT_BYTES: u64 = 128;
@@ -365,6 +376,7 @@ const OUT_DEFAULT_CG: usize = 1;
 struct ChanInfo {
     name: &'static str,
     ring: RingRegs,
+    /// The next-descriptor index IRIX writes for this channel type.
     tag: u32,
     /// Bytes in one frame of the ring.
     frame_bytes: u64,
@@ -411,12 +423,31 @@ const CHAN_INFO: [ChanInfo; NUM_CH] = [
 #[derive(Default, Clone, Copy)]
 struct Chan {
     running: bool,
-    /// Ring latched from set A at the enable edge.
+    /// Ring latched from the working registers at the enable edge.
     base: u64,
     len: u64,
     offset: u64,
     start_ns: i64,
     frames: u64,
+    /// End of descriptor: the transfer ends with this descriptor.
+    eod: bool,
+    /// The next-descriptor index, used when `eod` is clear.
+    next: u32,
+    /// The entry `next` names holds this very descriptor: loop on it.
+    looping: bool,
+    /// A link led to a never-programmed descriptor. What the chip does then
+    /// is in no source: the channel moves nothing more.
+    stalled: bool,
+}
+
+/// One decoded descriptor.
+#[derive(Clone, Copy)]
+struct Desc {
+    base: u64,
+    len: u64,
+    eod: bool,
+    next: u32,
+    looping: bool,
 }
 
 struct State {
@@ -576,36 +607,115 @@ impl State {
         }
     }
 
-    /// The enable edge: latch set A and start. A ring that is not
-    /// programmed, or not a whole number of frames, starts nothing.
-    fn chan_start(&mut self, idx: usize, now: i64) {
+    /// The words of descriptor RAM entry `index`.
+    fn desc_entry(&self, index: u32) -> (u32, u32, u32) {
+        let at = DMA_BANK_FIRST + index * DESC_RAM_ENTRY_BYTES;
+        (self.bank(at), self.bank(at + 4), self.bank(at + 8))
+    }
+
+    /// Whether the analog output's working registers hold a transfer: an
+    /// address and a length.
+    fn out_programmed(&self) -> bool {
+        let ring = &RING_OUTPUT;
+        (self.bank(ring[0]) != 0 || self.bank(ring[1]) != 0)
+            && (self.bank(ring[2]) >> CTRL_LEN_SHIFT) & CTRL_LEN_MASK != 0
+    }
+
+    /// Decode a descriptor for channel `idx`, or say why it cannot run. A
+    /// partial frame is refused: what hardware does with one is unknown.
+    fn decode_desc(&self, idx: usize, words: (u32, u32, u32)) -> Option<Desc> {
         let info = &CHAN_INFO[idx];
-        let lo = self.bank(info.ring[0]);
-        let hi = self.bank(info.ring[1]);
-        let ctrl = self.bank(info.ring[2]);
+        let (lo, hi, ctrl) = words;
         let base = (u64::from(hi) << 32) | u64::from(lo);
         let neg = (ctrl >> CTRL_LEN_SHIFT) & CTRL_LEN_MASK;
         let units = 0u32.wrapping_sub(neg) & CTRL_LEN_MASK;
         let mut len = u64::from(units) * DMA_UNIT_BYTES;
-        let tag = (ctrl >> CTRL_TAG_SHIFT) & CTRL_TAG_MASK;
+        let next = (ctrl >> CTRL_NEXT_SHIFT) & CTRL_NEXT_MASK;
+        // Only the analog output's end-of-descriptor form is established.
+        let eod = info.output && ctrl & CTRL_EOD != 0;
 
         if base == 0 || len == 0 {
             crate::dlog!(LogModule::Rad1, "rad1: {} enabled with no ring programmed (address {base:#x}, control {ctrl:#x})", info.name);
-            return;
+            return None;
         }
         if len > DMA_MAX_BYTES {
             crate::dlog!(LogModule::Rad1, "rad1: {} ring length {len:#x} exceeds the modelled cap; clamping", info.name);
             len = DMA_MAX_BYTES;
         }
-        // What hardware does with a partial frame is unknown; start nothing.
         if !len.is_multiple_of(info.frame_bytes) {
             crate::dlog!(LogModule::Rad1, "rad1: {} ring length {len:#x} is not a whole number of frames", info.name);
-            return;
+            return None;
         }
-        if tag != info.tag {
-            crate::dlog!(LogModule::Rad1, "rad1: {} control word {ctrl:#x} carries tag {tag}, not the channel type {}", info.name, info.tag);
+        if !eod && !info.output && next != info.tag {
+            crate::dlog!(LogModule::Rad1, "rad1: {} control word {ctrl:#x} carries tag {next}, not the channel type {}", info.name, info.tag);
         }
-        self.chan[idx] = Chan { running: true, base, len, offset: 0, start_ns: now, frames: 0 };
+        let looping = info.output && !eod && self.desc_entry(next) == words;
+        Some(Desc { base, len, eod, next, looping })
+    }
+
+    /// The enable edge: latch the working descriptor and start. A ring that
+    /// is not programmed, or not a whole number of frames, starts nothing.
+    fn chan_start(&mut self, idx: usize, now: i64) {
+        let info = &CHAN_INFO[idx];
+        let words = (self.bank(info.ring[0]), self.bank(info.ring[1]), self.bank(info.ring[2]));
+        let Some(d) = self.decode_desc(idx, words) else { return };
+        self.chan[idx] = Chan {
+            running: true,
+            base: d.base,
+            len: d.len,
+            offset: 0,
+            start_ns: now,
+            frames: 0,
+            eod: d.eod,
+            next: d.next,
+            looping: d.looping,
+            stalled: false,
+        };
+    }
+
+    /// The channel has played its descriptor to the end; returns whether it
+    /// goes on. End of descriptor stops it and clears the enable bit;
+    /// otherwise the entry the index names is loaded, and a never-programmed
+    /// one is reported and left standing.
+    fn descriptor_end(&mut self, idx: usize) -> bool {
+        let c = self.chan[idx];
+        if c.eod {
+            self.chan[idx].running = false;
+            if idx == CH_OUT {
+                self.analog_out_en &= !ENABLE_BIT;
+            }
+            return false;
+        }
+        if c.looping || idx != CH_OUT {
+            self.chan[idx].offset = 0;
+            return true;
+        }
+        let words = self.desc_entry(c.next);
+        let linked = if words == (0, 0, 0) { None } else { self.decode_desc(idx, words) };
+        match linked {
+            Some(d) => {
+                self.chan[idx] = Chan {
+                    base: d.base,
+                    len: d.len,
+                    offset: 0,
+                    eod: d.eod,
+                    next: d.next,
+                    looping: d.looping,
+                    ..c
+                };
+                true
+            }
+            None => {
+                crate::dlog!(
+                    LogModule::Rad1,
+                    "rad1: {} links to descriptor {} which was never programmed (unsupported); output stopped",
+                    CHAN_INFO[idx].name,
+                    c.next
+                );
+                self.chan[idx].stalled = true;
+                false
+            }
+        }
     }
 }
 
@@ -866,7 +976,7 @@ impl Inner {
     }
 
     fn is_descriptor(off: u32) -> bool {
-        RINGS.iter().any(|r| r.contains(&off))
+        RINGS.iter().any(|r| r.contains(&off)) || (DMA_BANK_FIRST..=DESC_RAM_LAST).contains(&off)
     }
 
     fn subcode_access(off: u32, width: usize) -> bool {
@@ -900,6 +1010,8 @@ impl Inner {
                 return s.sample_pos[((off - POS_FIRST) / 4) as usize];
             }
             if off == REG_ANALOG_OUT_EN {
+                // The enable bit clears when a one-shot transfer ends.
+                self.sync_chan(&mut s, CH_OUT, now);
                 return s.analog_out_en;
             }
             if off == REG_STATUS_DMA_CTRL {
@@ -981,6 +1093,11 @@ impl Inner {
                     s.dma_bank[((off - DMA_BANK_FIRST) / 4) as usize] = val;
                     return Some(());
                 }
+            } else if (DMA_BANK_FIRST..=DESC_RAM_LAST).contains(&off) {
+                // A descriptor RAM entry no supported ring's registers
+                // cover: stored for a link to load.
+                s.dma_bank[((off - DMA_BANK_FIRST) / 4) as usize] = val;
+                return Some(());
             } else if off == REG_ANALOG_OUT_EN {
                 return self.analog_out_write(s, val, now);
             } else if off == REG_STATUS_DMA_CTRL {
@@ -1068,7 +1185,7 @@ impl Inner {
             OUT_SELECT_GEN2 => 2,
             _ => return None,
         };
-        if val & ENABLE_BIT != 0 && !s.chan[CH_OUT].running && !s.ring_valid(&RING_OUTPUT, false, 0xffff_f008) {
+        if val & ENABLE_BIT != 0 && !s.chan[CH_OUT].running && !s.out_programmed() {
             return None;
         }
         if cg != s.out_cg {
@@ -1298,7 +1415,8 @@ impl Inner {
         // anything. The position fields are 14 bits, so the count's
         // truncation to 32 bits loses nothing.
         let ring_frames = s.chan[idx].len / info.frame_bytes;
-        if ring_frames != 0 && frames >= 2 * ring_frames {
+        let repeats = idx != CH_OUT || s.chan[idx].looping;
+        if repeats && ring_frames != 0 && frames >= 2 * ring_frames {
             let skip = (frames / ring_frames - 1) * ring_frames;
             s.chan[idx].frames += skip;
             s.advance_pos(idx, skip as u32);
@@ -1308,6 +1426,9 @@ impl Inner {
         let mut pcm = [0i16; CHUNK_BYTES as usize / 4];
         while frames != 0 {
             let c = s.chan[idx];
+            if !c.running || c.stalled {
+                break;
+            }
             let bytes = (frames * info.frame_bytes).min(c.len - c.offset);
             let chunk = bytes.min(CHUNK_BYTES);
             let n = chunk / info.frame_bytes;
@@ -1341,11 +1462,12 @@ impl Inner {
             let c = &mut s.chan[idx];
             c.offset += chunk;
             c.frames += n;
-            if c.offset >= c.len {
-                c.offset = 0;
-            }
+            let done = c.offset >= c.len;
             s.advance_pos(idx, n as u32);
             frames -= n;
+            if done && !s.descriptor_end(idx) {
+                break;
+            }
         }
         true
     }

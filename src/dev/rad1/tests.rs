@@ -147,11 +147,17 @@ fn descriptor_bank_storage() {
         wr(&r, off, v);
         assert_eq!(rd(&r, off), v);
     }
-    // Words in the bank that belong to no supported ring are refused.
-    wr(&r, 0x420, 7);
-    assert_eq!(rd(&r, 0x420), 0);
+    // Every descriptor RAM entry (0x400 + 12 i, 16 of them) is stored; past
+    // them, words that belong to no supported ring are refused.
+    for i in 0..16u32 {
+        wr(&r, 0x408 + 12 * i, 0x100 + i);
+        assert_eq!(rd(&r, 0x408 + 12 * i), 0x100 + i, "entry {i}");
+    }
+    wr(&r, 0x4c4, 7);
+    assert_eq!(rd(&r, 0x4c4), 0);
     r.reset();
     assert_eq!(rd(&r, 0x500), 0);
+    assert_eq!(rd(&r, 0x420), 0);
 }
 
 #[test]
@@ -1035,4 +1041,78 @@ fn analog_output_enable_takes_only_the_two_known_selects() {
     }
     wr(&r, 0x58, 0x4000_0001);
     assert_eq!(rd(&r, 0x58), 0x4000_0000, "no ring programmed");
+}
+
+// The Octane PROM's boot tune: one end-of-descriptor buffer on generator 2.
+
+const TUNE_BUF: u64 = 0x10_0000;
+/// 4504 units of 128 bytes (72,064 frames), end of descriptor set.
+const TUNE_CTRL: u32 = 0xfff7_3404;
+const TUNE_FRAMES: usize = 72_064;
+
+/// A card with a tap on what it plays.
+fn tune_card() -> (Rad1, Arc<Ram>, Arc<parking_lot::Mutex<Vec<i16>>>) {
+    let (r, ram) = dma_card();
+    let tap = tapped(&r);
+    (r, ram, tap)
+}
+
+/// The PROM's writes that matter: load generator 2, select the master after
+/// the load, program the buffer and start.
+fn prom_tune(r: &Rad1, ctrl: u32) {
+    wr(r, 0xa4, 0x0000_ffff);
+    wr(r, 0x58, 0x4000_0000);
+    wr(r, 0xa0, 0x4000_0405);
+    wr(r, 0xac, 1);
+    wr(r, 0x4c, 0x0300_0000);
+    wr(r, 0x524, 0);
+    wr(r, 0x4f8, TUNE_BUF as u32);
+    wr(r, 0x4fc, ctrl);
+    wr(r, 0x58, 0x4000_0001);
+}
+
+#[test]
+fn the_prom_tune_plays_once_at_32khz_and_clears_the_enable_bit() {
+    let (r, _ram, tap) = tune_card();
+    prom_tune(&r, TUNE_CTRL);
+    at(&r, SEC);
+    assert_eq!(rd(&r, 0x58), 0x4000_0001, "still busy");
+    assert_eq!(tap.lock().len(), 32_000 * 2);
+    // One pass is 2.252 s.
+    at(&r, 2_240 * SEC / 1000);
+    assert_eq!(rd(&r, 0x58) & 1, 1);
+    at(&r, 2_260 * SEC / 1000);
+    assert_eq!(rd(&r, 0x58), 0x4000_0000, "the channel cleared the bit itself");
+    at(&r, 10 * SEC);
+    rd(&r, 0x58);
+    assert_eq!(tap.lock().len(), TUNE_FRAMES * 2, "exactly one pass");
+}
+
+#[test]
+fn a_link_to_an_unprogrammed_descriptor_plays_one_lap_and_stops() {
+    let (r, _ram, tap) = tune_card();
+    // Bit 2 clear, next index 0, and descriptor RAM entry 0 never written.
+    prom_tune(&r, 0xfff7_3400);
+    at(&r, 10 * SEC);
+    rd(&r, 0x58);
+    assert_eq!(tap.lock().len(), TUNE_FRAMES * 2, "the first lap only");
+    assert_eq!(rd(&r, 0x58) & 1, 1, "nothing is reported as finished");
+    assert!(r.state.lock().chan[CH_OUT].stalled);
+}
+
+#[test]
+fn a_link_loads_the_descriptor_ram_entry_it_names() {
+    for entry in [1u32, 3, 7] {
+        let (r, _ram, tap) = tune_card();
+        // The first 512 frames link to `entry`, which holds 256 frames
+        // elsewhere with end of descriptor.
+        for (i, v) in [0x20_0000, 0, 0xffff_f804].into_iter().enumerate() {
+            wr(&r, 0x400 + 12 * entry + 4 * i as u32, v);
+        }
+        prom_tune(&r, 0xffff_f000 | entry << 3);
+        at(&r, SEC);
+        assert_eq!(rd(&r, 0x58), 0x4000_0000, "entry {entry} ended the transfer");
+        assert_eq!(tap.lock().len(), (512 + 256) * 2, "entry {entry}");
+        assert!(!r.state.lock().chan[CH_OUT].stalled);
+    }
 }
