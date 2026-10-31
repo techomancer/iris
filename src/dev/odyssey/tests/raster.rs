@@ -121,6 +121,96 @@ fn a_fence_behind_a_queued_draw_lands_after_the_draw() {
     h.raster.stop();
 }
 
+/// The rows the raster unit has published, as the display would take them,
+/// found without waiting for a slice in flight.
+fn published_rows(h: &BoardLocks) -> Vec<u32> {
+    let mut scanout = fresh_scanout();
+    h.raster.take_published(0, &mut scanout);
+    scanout.marks.dirty_rows().into_iter().map(|y| y as u32).collect()
+}
+
+/// A job that holds the raster unit for `ms`, as a long draw would.
+fn busy(h: &BoardLocks, ms: u64) {
+    h.raster.submit(move |_| std::thread::sleep(Duration::from_millis(ms)));
+}
+
+/// The rows a draw wrote are published before the fence behind it writes
+/// its token: a guest that sees the token and arms a swap has all of its
+/// rows known to the display. A job queued behind the fence keeps the
+/// queue from draining and the slice from ending meanwhile.
+#[test]
+fn a_fence_publishes_the_rows_drawn_before_it() {
+    // The first slice waits while everything is queued, and then runs it all.
+    let (h, st) = slow_raster(50);
+    h.raster.test_slice_limit_ms.store(10_000, SeqCst);
+    let ram = Ram::new(1 << 20);
+    {
+        let mut s = h.board.lock();
+        s.guest = Some(ram.clone());
+        s.host_write_addr_lower = 0x1000;
+        small_triangle(&mut s, &st, 100.0, RED);
+        s.fence(0x5a5a << ODSY_DMA_FENCE_TOKEN_SHIFT | 3);
+        busy(&h, 300);
+    }
+    eventually("the fence did not land", || ram.half(0x1006) == 0x5a5a);
+    assert!(published_rows(&h).contains(&110), "the token was visible before the draw's rows were");
+    h.raster.stop();
+}
+
+/// A query's answer is a completion too.
+#[test]
+fn a_query_publishes_the_rows_drawn_before_it() {
+    let (h, st) = slow_raster(50);
+    h.raster.test_slice_limit_ms.store(10_000, SeqCst);
+    let ram = Ram::new(1 << 20);
+    {
+        let mut s = h.board.lock();
+        s.guest = Some(ram.clone());
+        s.ctx_shadow_addr_lower = 0x2000;
+        s.host_write_addr_lower = 0x1000;
+        small_triangle(&mut s, &st, 100.0, RED);
+        for word in [0x4c0, 7, 0x10a5a, 3, 0x5a5a] {
+            cmd(&mut s, word);
+        }
+        busy(&h, 300);
+    }
+    eventually("the query did not sync", || ram.half(0x1006) == 0x5a5a);
+    assert!(published_rows(&h).contains(&110), "the sync word was visible before the draw's rows were published");
+    h.raster.stop();
+}
+
+/// The queue publishes when it drains, before a caller that waited for it
+/// looks at the planes.
+#[test]
+fn a_drained_queue_has_published_its_rows() {
+    let (h, st) = slow_raster(50);
+    h.raster.test_slice_limit_ms.store(10_000, SeqCst);
+    h.raster.test_slice_end_ms.store(400, SeqCst);
+    small_triangle(&mut h.board.lock(), &st, 100.0, RED);
+    h.raster.wait_idle();
+    assert!(published_rows(&h).contains(&110), "the queue was idle but its rows were not out");
+    h.raster.test_slice_end_ms.store(0, SeqCst);
+    h.raster.stop();
+}
+
+/// A slice that ends with work still queued publishes what it drew, so the
+/// display never goes a long job without the rows of the short ones.
+#[test]
+fn a_slice_end_publishes_the_rows_drawn_in_it() {
+    let (h, st) = slow_raster(50);
+    {
+        let mut s = h.board.lock();
+        small_triangle(&mut s, &st, 100.0, RED);
+        busy(&h, 5);
+        busy(&h, 400);
+    }
+    eventually("the first jobs did not finish", || h.raster.pending() == 1);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(h.raster.pending(), 1, "the long job is still running");
+    assert!(published_rows(&h).contains(&110), "the slice ended without its rows");
+    h.raster.stop();
+}
+
 /// A scanout with the whole frame resolved.
 fn fresh_scanout() -> Scanout {
     let mut scanout = Scanout::default();

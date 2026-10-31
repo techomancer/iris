@@ -33,6 +33,14 @@
 //!   each slice of jobs, so a frame waits out a slice in flight and never
 //!   reads a half-drawn primitive.
 //!
+//! The rows a job wrote are the display's business too. The raster thread
+//! keeps them in its context while it draws and publishes them to a cell
+//! the display takes from (`RasterCtx::publish`): before it runs a job
+//! that tells the guest something (`RasterQueue::submit_completion`), when
+//! the queue drains, and when a slice ends. A guest that waits for a
+//! fence or a query before it arms a swap therefore has all of its rows
+//! published before the swap can latch.
+//!
 //! The front end waits when the queued work, estimated in pixels per job,
 //! passes `RASTER_WORK_BUDGET`, so the drawing stays close behind the commands.
 //!
@@ -42,6 +50,7 @@
 use super::*;
 
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -119,11 +128,13 @@ pub fn touch_row(rows: &TouchedRows, slot: usize, y: i32) {
 pub struct DrawnRows {
     by_id: Box<[[[u64; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]; ODSY_BUFFERS as usize]>,
     overlay: [u64; ROW_WORDS],
+    /// Some row is held.
+    any: bool,
 }
 
 impl Default for DrawnRows {
     fn default() -> Self {
-        DrawnRows { by_id: Box::new([[[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]; ODSY_BUFFERS as usize]), overlay: [0; ROW_WORDS] }
+        DrawnRows { by_id: Box::new([[[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]; ODSY_BUFFERS as usize]), overlay: [0; ROW_WORDS], any: false }
     }
 }
 
@@ -131,6 +142,7 @@ impl DrawnRows {
     /// Keep what a draw wrote, which passed the id test `id_compare` (the
     /// board's 0x840 word) at each pixel it stored.
     pub fn add(&mut self, touched: &TouchedRows, id_compare: u32) {
+        self.any = true;
         let value = id_compare as u8;
         let mask = (id_compare >> ODSY_ID_COMPARE_MASK_SHIFT) as u8;
 
@@ -156,12 +168,34 @@ impl DrawnRows {
         }
     }
 
+    /// Move every row `from` holds into this set, leaving `from` empty.
+    pub fn absorb(&mut self, from: &mut DrawnRows) {
+        if !std::mem::take(&mut from.any) {
+            return;
+        }
+        self.any = true;
+        for (o, f) in self.overlay.iter_mut().zip(from.overlay.iter_mut()) {
+            *o |= std::mem::take(f);
+        }
+        for (ids, from_ids) in self.by_id.iter_mut().zip(from.by_id.iter_mut()) {
+            for (rows, from_rows) in ids.iter_mut().zip(from_ids.iter_mut()) {
+                for (o, f) in rows.iter_mut().zip(from_rows.iter_mut()) {
+                    *o |= std::mem::take(f);
+                }
+            }
+        }
+        from.overlay = [0; ROW_WORDS];
+    }
+
     /// Hand the display the rows the draws so far changed, and forget
     /// them. A row shows a change when a buffer a window shows was written
     /// there: the scanout repaints it. A row written to either buffer
     /// joins the rows where the window's buffers may differ
     /// (Scanout::differ), which a swap of that window repaints.
     pub fn take(&mut self, displayed: u32, scanout: &mut Scanout) {
+        if !std::mem::take(&mut self.any) {
+            return;
+        }
         let mut shown = self.overlay;
 
         for (b, ids) in self.by_id.iter_mut().enumerate() {
@@ -186,16 +220,38 @@ impl DrawnRows {
     }
 }
 
+/// The cell the raster unit publishes its drawn rows to and the display takes
+/// them from.
+pub type PublishedRows = Arc<Mutex<DrawnRows>>;
+
 /// The raster unit's own state.
 #[derive(Default)]
 pub struct RasterCtx {
     /// The standalone line stipple's phase after the last draw that
     /// carried one.
     pub line_phase: u32,
-    /// The colour rows drawn since the display last looked. A job that
-    /// writes the colour planes records its rows here, or the display never
-    /// resolves them.
+    /// The colour rows drawn since the last publish. A job that writes the
+    /// colour planes records its rows here, or the display never resolves
+    /// them.
     pub drawn: DrawnRows,
+    /// Where `publish` puts them.
+    published: PublishedRows,
+}
+
+impl RasterCtx {
+    fn new(published: PublishedRows) -> Self {
+        RasterCtx { line_phase: 0, drawn: DrawnRows::default(), published }
+    }
+
+    /// Hand the rows drawn so far to the display. Called before anything the
+    /// guest can see that follows the drawing, when the queue drains and
+    /// when a slice ends; the cell's lock is held for a copy of at most the
+    /// rows' bitsets and never across a draw.
+    pub fn publish(&mut self) {
+        if self.drawn.any {
+            self.published.lock().absorb(&mut self.drawn);
+        }
+    }
 }
 
 /// One unit of raster work.
@@ -273,13 +329,14 @@ thread_local! {
 /// The planes as the display holds them: no raster job runs meanwhile.
 pub struct PlanesHeld<'a> {
     _ctx: MutexGuard<'a, RasterCtx>,
+    published: &'a Mutex<DrawnRows>,
 }
 
 impl PlanesHeld<'_> {
-    /// The colour rows the raster unit wrote since the last call, to the
-    /// scanout (DrawnRows::take()).
+    /// The colour rows the raster unit published since the last call, to
+    /// the scanout (DrawnRows::take()).
     pub fn take_rows(&mut self, displayed: u32, scanout: &mut Scanout) {
-        self._ctx.drawn.take(displayed, scanout);
+        self.published.lock().take(displayed, scanout);
     }
 }
 
@@ -302,6 +359,9 @@ pub struct RasterQueue<const HEADS: usize = 1> {
     /// Held by the raster thread for a slice of jobs, by a job run inside
     /// the submit, and by the display while it reads the planes.
     ctx: Mutex<RasterCtx>,
+    /// The rows the raster unit has published and the display has not yet
+    /// taken (RasterCtx::publish()).
+    published: PublishedRows,
     /// Jobs submitted and not yet finished.
     pending: AtomicU32,
     /// The estimated work of those jobs, in pixels (`RASTER_WORK_BUDGET`).
@@ -332,6 +392,14 @@ pub struct RasterQueue<const HEADS: usize = 1> {
     /// draw would.
     #[cfg(test)]
     pub test_slice_sleep_ms: AtomicU32,
+    /// Tests: each slice sleeps this long between its last job and its
+    /// publish, so a test can look at the cell in between.
+    #[cfg(test)]
+    pub test_slice_end_ms: AtomicU32,
+    /// Tests: the longest a slice runs, in milliseconds, in place of
+    /// `RASTER_SLICE`; 0 keeps it.
+    #[cfg(test)]
+    pub test_slice_limit_ms: AtomicU32,
 }
 
 // SAFETY: the jobs in the ring are Send; the ring itself is shared as GFifo
@@ -343,13 +411,15 @@ unsafe impl<const HEADS: usize> Sync for RasterQueue<HEADS> {}
 impl<const HEADS: usize> Default for RasterQueue<HEADS> {
     fn default() -> Self {
         const { assert!(HEADS == 1, "the board has one raster unit") };
+        let published = PublishedRows::default();
         RasterQueue {
             // SAFETY: a zeroed GFifo is an empty one (GFifo::new); built in
             // place because the ring is too big for the stack.
             ring: unsafe { Box::new_zeroed().assume_init() },
             // SAFETY: as the ring.
             spare: unsafe { Box::new_zeroed().assume_init() },
-            ctx: Mutex::new(RasterCtx::default()),
+            ctx: Mutex::new(RasterCtx::new(published.clone())),
+            published,
             pending: AtomicU32::new(0),
             queued: AtomicU64::new(0),
             budget: AtomicU64::new(RASTER_WORK_BUDGET),
@@ -369,6 +439,10 @@ impl<const HEADS: usize> Default for RasterQueue<HEADS> {
             thread: Mutex::new(None),
             #[cfg(test)]
             test_slice_sleep_ms: AtomicU32::new(0),
+            #[cfg(test)]
+            test_slice_end_ms: AtomicU32::new(0),
+            #[cfg(test)]
+            test_slice_limit_ms: AtomicU32::new(0),
         }
     }
 }
@@ -435,10 +509,23 @@ impl RasterQueue {
         if !self.threaded() {
             let mut ctx = self.ctx.lock();
             job(&mut ctx);
+            ctx.publish();
             return;
         }
         let entry = Box::into_raw(Box::new(Box::new(job) as RasterJob)) as u64;
         self.push(ENTRY_JOB, entry, cost);
+    }
+
+    /// Hand the raster unit a job whose effect the guest can see, a fence's
+    /// token or a query's answer, behind every job before it. The rows those
+    /// jobs drew are published before it runs: a guest that sees the
+    /// completion then arms a swap, and the swap's repaint must already
+    /// know which rows differ.
+    pub fn submit_completion(&self, job: impl FnOnce(&mut RasterCtx) + Send + 'static) {
+        self.submit_work(RASTER_JOB_OVERHEAD, move |ctx| {
+            ctx.publish();
+            job(ctx);
+        });
     }
 
     /// Hand a GL draw to the raster unit, behind every job before it. The
@@ -521,7 +608,9 @@ impl RasterQueue {
     pub fn run_now<R>(&self, job: impl FnOnce(&mut RasterCtx) -> R) -> R {
         self.wait_idle();
         let mut ctx = self.ctx.lock();
-        job(&mut ctx)
+        let result = job(&mut ctx);
+        ctx.publish();
+        result
     }
 
     /// Wait until every job submitted has finished. The display thread,
@@ -543,14 +632,14 @@ impl RasterQueue {
     pub fn planes(&self) -> PlanesHeld<'_> {
         let ctx = self.ctx.lock();
         PLANES_HELD.with(|h| h.set(true));
-        PlanesHeld { _ctx: ctx }
+        PlanesHeld { _ctx: ctx, published: &self.published }
     }
 
     /// The planes for the display if no slice is running now.
     pub fn try_planes(&self) -> Option<PlanesHeld<'_>> {
         let ctx = self.ctx.try_lock()?;
         PLANES_HELD.with(|h| h.set(true));
-        Some(PlanesHeld { _ctx: ctx })
+        Some(PlanesHeld { _ctx: ctx, published: &self.published })
     }
 
     /// Wait out the slice in flight, holding nothing.
@@ -562,6 +651,13 @@ impl RasterQueue {
     #[cfg(test)]
     pub fn spare_draws(&self) -> usize {
         self.spare.len()
+    }
+
+    /// Tests: the rows published and not yet taken, as the display would
+    /// find them, without waiting for a slice in flight.
+    #[cfg(test)]
+    pub fn take_published(&self, displayed: u32, scanout: &mut Scanout) {
+        self.published.lock().take(displayed, scanout);
     }
 
     /// Tests: a slice holds the raster unit's context.
@@ -635,7 +731,14 @@ impl RasterQueue {
                     std::thread::sleep(Duration::from_millis(ms as u64));
                 }
             }
-            let deadline = Instant::now() + RASTER_SLICE;
+            #[cfg(test)]
+            let slice = match self.test_slice_limit_ms.load(SeqCst) {
+                0 => RASTER_SLICE,
+                ms => Duration::from_millis(ms as u64),
+            };
+            #[cfg(not(test))]
+            let slice = RASTER_SLICE;
+            let deadline = Instant::now() + slice;
             crate::pf_begin!(crate::perfetto::events::ODSY_RASTER_SLICE, self.pending());
             while let Some((kind, value)) = self.ring.peek() {
                 self.ring.consume();
@@ -653,6 +756,12 @@ impl RasterQueue {
                     job(&mut ctx);
                 }
                 let left = self.queued.fetch_sub(cost, SeqCst) - cost;
+                if self.pending.load(SeqCst) == 1 {
+                    // The last job: whoever sees the queue empty then looks
+                    // at the planes, so the rows are out before the count
+                    // says so.
+                    ctx.publish();
+                }
                 if self.pending.fetch_sub(1, SeqCst) == 1 {
                     let _g = self.idle.lock();
                     self.idle_kick.notify_all();
@@ -665,6 +774,16 @@ impl RasterQueue {
                     break;
                 }
             }
+            #[cfg(test)]
+            {
+                let ms = self.test_slice_end_ms.load(SeqCst);
+                if ms != 0 {
+                    std::thread::sleep(Duration::from_millis(ms as u64));
+                }
+            }
+            // A slice's rows are out by its end, bounding how long the
+            // display can go without them.
+            ctx.publish();
             crate::pf_end!(crate::perfetto::events::ODSY_RASTER_SLICE);
             // A display frame waiting for the planes gets them next.
             MutexGuard::unlock_fair(ctx);

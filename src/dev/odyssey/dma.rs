@@ -1511,7 +1511,7 @@ impl Board {
         };
         let front = self.front.clone();
 
-        self.raster.submit(move |_| {
+        self.raster.submit_completion(move |_| {
             for (addr, word, failed) in words {
                 if bus.publish_be32(addr, word).is_err() {
                     crate::dlog!(LogModule::Odyssey, "{}", failed);
