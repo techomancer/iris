@@ -616,6 +616,7 @@ impl<
     const CACHE_KIND: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = Self::R10K;
     const CVT_L_51_BITS: bool = MODEL == model::R10000;
+    const FETCH_ALIAS: bool = MODEL == model::R16000;
 }
 
 impl<

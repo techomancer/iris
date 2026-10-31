@@ -776,6 +776,17 @@ code into host code with Cranelift. The concepts:
   pfn map publishes a slot after its claim, and inline stores bump generations
   atomically. Compiled code is freed only by a full flush, and every flush parks
   all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
+- **Uncached fetches the board decodes apart.** A page is keyed by the
+  physical address of the fetch. The IP35 reset PROM answers an uncached fetch
+  at 0x1fc00000 whatever RAM sits behind the cached view there, so a board whose
+  banks reach that window presents the fetch at an address of its own
+  (`uncached_fetch_alias`, which only the R16000 model takes) and the JIT sees
+  two different frames. Compiles read
+  that frame through the executor's cached bus (`set_cached_bus`, given
+  `Ip35Bus::code_view`), and its generation counter is the PROM device's, so a
+  flash command invalidates it and a store to RAM never does. The alias wraps the
+  translation (`update_translate_fn` installs the wrapper when one is set), so
+  the other machines' fetch paths are the ones they always had.
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 

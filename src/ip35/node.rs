@@ -51,6 +51,10 @@ pub(crate) struct Node {
     /// Cacheable memory at plain physical addresses: what a cache fills
     /// from, and the one bus the JIT and its compile pool read code through.
     pub cached: Arc<dyn BusDevice>,
+    /// What the JIT compiles code through: `cached`, plus the reset PROM's
+    /// uncached-fetch window ([`Ip35Bus::code_view`]).
+    #[cfg(feature = "jitv2")]
+    pub code: Arc<dyn BusDevice>,
     /// The node's resets and power events, for the system controller.
     pub events: Sender<MachineEvent>,
     pub receiver: Receiver<MachineEvent>,
@@ -94,6 +98,9 @@ impl Node {
         }
         // Reset execution always sees stored bytes, independently of commands.
         bus.map(0, 0x1fc0_0000, 0x40_0000, prom.clone());
+        // The same PROM where an uncached instruction fetch of that window is
+        // presented (`MipsExecutor::uncached_fetch_alias`).
+        bus.map(0, super::RESET_WINDOW_FETCH, super::RESET_WINDOW_SIZE, prom.clone());
         if !payload.is_empty() {
             map_device(&phys, 0x1fc0_0000, payload.len() as u64, prom.clone(), &format!("{name} cached reset PROM"));
         }
@@ -118,8 +125,21 @@ impl Node {
         bus.map(2, 0, 1 << 33, bedrock.fetchop_bus());
         let bus = Arc::new(bus);
         let cached = bus.cached_view(bedrock.dma_view(), bedrock.ram_extent());
-        Ok(Self { bus, bedrock, l1, flash, cached, events, receiver })
+        #[cfg(feature = "jitv2")]
+        let code = bus.code_view(cached.clone());
+        Ok(Self {
+            bus,
+            bedrock,
+            l1,
+            flash,
+            cached,
+            #[cfg(feature = "jitv2")]
+            code,
+            events,
+            receiver,
+        })
     }
+
 }
 
 /// Give a node's memory and interrupts to its processors, CPU 0 first: a

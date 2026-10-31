@@ -131,9 +131,9 @@ impl FuelMachine {
         // After the windows above: each compile worker takes the cache's
         // geometry and the CPU model's policies once, as it starts, and
         // without the windows the geometry has no inline load or store path.
-        // Workers read plain physical code addresses through the CPU's cached
-        // bus, which serves them; the uncached views would decode them as Hub
-        // registers.
+        // Workers read plain physical code addresses through the CPU's code
+        // bus: the cached bus, plus the reset PROM's uncached-fetch window.
+        // The uncached views would decode plain addresses as Hub registers.
         #[cfg(feature = "jitv2")]
         {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -148,7 +148,7 @@ impl FuelMachine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(board.cached_bus(), stats);
+                g.compile_queue.start(board.code_bus(), stats);
             }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
@@ -519,6 +519,10 @@ pub(crate) struct FuelBoard {
     /// Cacheable memory at plain physical addresses: what the cache fills
     /// from, and the one bus the JIT and its compile pool read code through.
     cached: Arc<dyn BusDevice>,
+    /// What the JIT compiles code through: `cached`, and the reset PROM's
+    /// uncached-fetch window ([`Ip35Bus::code_view`]).
+    #[cfg(feature = "jitv2")]
+    code: Arc<dyn BusDevice>,
     pub bedrock: Arc<Bedrock>,
     pub l1: Arc<L1>,
     pub flash: Arc<Flash>,
@@ -612,7 +616,17 @@ impl FuelBoard {
             board_id: FUEL_BOARD_ID,
             l1: l1_config,
         })?;
-        let Node { bus, bedrock, l1, flash, cached, events, receiver } = node;
+        let Node {
+            bus,
+            bedrock,
+            l1,
+            flash,
+            cached,
+            #[cfg(feature = "jitv2")]
+            code,
+            events,
+            receiver,
+        } = node;
         #[cfg(test)]
         let irq = Arc::new(PendingIrq::default());
         #[cfg(test)]
@@ -693,6 +707,8 @@ impl FuelBoard {
         Ok(Self {
             bus,
             cached,
+            #[cfg(feature = "jitv2")]
+            code,
             bedrock,
             l1,
             flash,
@@ -720,9 +736,18 @@ impl FuelBoard {
         self.cached.clone()
     }
 
+    /// The bus the JIT compiles code through; see [`Ip35Bus::code_view`].
+    #[cfg(feature = "jitv2")]
+    pub fn code_bus(&self) -> Arc<dyn BusDevice> {
+        self.code.clone()
+    }
+
     pub fn build_cpu(&self, part: &Part) -> Box<FuelCpu> {
         let mut cpu = build_cpu(self.bus.clone(), part);
         cpu.cache = R12000ShadowCache::new(self.cached_bus());
+        #[cfg(feature = "jitv2")]
+        cpu.set_cached_bus(self.code_bus());
+        #[cfg(not(feature = "jitv2"))]
         cpu.set_cached_bus(self.cached_bus());
         cpu
     }

@@ -686,6 +686,11 @@ pub trait CpuModel: MipsCache {
     /// to match. An uncached SC succeeding is a model choice. Loads and fetches
     /// still fault.
     const POSTS_UNCACHED_STORES: bool = Self::R10K_FAMILY;
+    /// Whether a board may present an uncached instruction fetch of a window at
+    /// another address (`MipsExecutor::set_uncached_fetch_alias`). Off except
+    /// for the parts of the boards that need it, so the translation paths of
+    /// every other model carry no check for it.
+    const FETCH_ALIAS: bool = false;
     /// Bits `Index_Store_Tag` keeps for the secondary cache: all of them, except
     /// on the R10000 family, whose reserved tag bits read as zero (R10000 UM
     /// p. 270, figure 11-31). Kept are MRU (bit 63), the physical tag (TagHi 3:0
