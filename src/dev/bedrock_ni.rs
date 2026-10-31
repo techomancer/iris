@@ -14,8 +14,18 @@
 /// Length of the block-relative register aperture.
 pub const SIZE: u64 = 0x2008;
 
+/// Port status bits 1:0 of a node with no cable: bit 1 (link up) clear, bit 0
+/// set. INFERRED, not measured. Bit 1 follows a real Tezro PROM reporting its
+/// NUMAlink as down; bit 0 follows a real one-node Fuel taking a PIO bus
+/// error with no link message (a 2003 installation kernel). The IRIX 6.5.30
+/// bus-error handler prints a link-reset NOTICE when bits 1:0 read 0 with
+/// reset enable 0. A PROM-monitor read of this register on an uncabled node
+/// would settle it.
+const PORT_STATUS_UNCABLED: u64 = 1;
+
 pub mod reg {
-    pub const NODE_ID: u64 = 0x0;
+    /// Port status, hub-relative `0x680000` (the first word of the block).
+    pub const PORT_STATUS: u64 = 0x0;
     pub const LOCAL_RESET: u64 = 0x8;
     pub const CONTROL_0: u64 = 0x10;
     pub const CONTROL_1: u64 = 0x18;
@@ -143,7 +153,7 @@ impl BusDevice for BedrockNi {
             r.routes[(a as usize - 0x1000) / 8]
         } else {
             match a {
-                reg::NODE_ID => 0,
+                reg::PORT_STATUS => PORT_STATUS_UNCABLED,
                 reg::ERROR_STATUS => r.errors,
                 reg::ERROR_STATUS_UPPER | reg::ERROR_STATUS_LOWER => 0,
                 reg::SIDE_BAND => r.sideband,
@@ -331,5 +341,19 @@ mod tests {
         for a in offsets {
             assert_eq!(d.read64(a).data, 0, "register {a:#x}");
         }
+    }
+
+    /// An uncabled one-node port reads status bits 1:0 = 1: link down, bit 0
+    /// set. Reading 0 there makes the guest's bus-error handler print a
+    /// link-reset notice. Bit 18 stays clear (a one-node machine) and a
+    /// write does not change the value.
+    #[test]
+    fn uncabled_port_status_reads_one_and_ignores_writes() {
+        let d = BedrockNi::new();
+        assert_eq!(d.read64(reg::PORT_STATUS).data, 1);
+        d.write64(reg::PORT_STATUS, !0);
+        assert_eq!(d.read64(reg::PORT_STATUS).data, 1);
+        d.power_on();
+        assert_eq!(d.read64(reg::PORT_STATUS).data, 1);
     }
 }
