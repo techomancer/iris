@@ -66,7 +66,7 @@ static const struct { const char *name; const char *why; int gr2_only; } xfails[
     { "fb/INDEX_CLEAR_VALUE", "libGLcore EXPRESS drops glClearIndex in RGBA mode", 1 },
 };
 
-static int gr2;
+static int gr2, vpro;
 
 static const char *xfail_why(const char *name)
 {
@@ -475,7 +475,11 @@ static void t_current(void)
         glTranslatef(0.0f, 0.0f, -0.5f);
         glRasterPos3f(0.0f, 0.0f, 0.0f);
         glPopMatrix();
-        want_f(GL_CURRENT_RASTER_DISTANCE, 1, 0.5);
+        /* VPro: the library answers from host state and never asks the board;
+           the value is the raster vertex's eye-space z, unnegated, so -0.5 in
+           front of the eye (origami datasheet odyssey.md, "Raster distance",
+           established). */
+        want_f(GL_CURRENT_RASTER_DISTANCE, 1, vpro ? -0.5 : 0.5);
         end();
     }
     (void)m;
@@ -1362,6 +1366,7 @@ int main(int argc, char **argv)
     {
         const char *rn = (const char *)glGetString(GL_RENDERER);
         gr2 = rn && (!strncmp(rn, "GR", 2) || !strncmp(rn, "GU", 2));
+        vpro = rn && !strncmp(rn, "VPRO", 4);
     }
     printf("glstate: %s %s %s (visual 0x%x)\n", glGetString(GL_VENDOR), glGetString(GL_RENDERER),
            glGetString(GL_VERSION), (unsigned)vi->visualid);

@@ -115,7 +115,7 @@ static const struct { const char *name; const char *why; int gr2_only; } xfails[
       "libGLcore EXPRESS's stencil Fetch masks the depth word with 0xF; z20 s4 keeps the stencil above Z (bits 23:20; inferred from its depth reads)", 1 },
 };
 
-static int gr2;
+static int gr2, vpro;
 
 static const char *xfail_why(const char *name)
 {
@@ -1337,6 +1337,22 @@ static void t_depth_colour(void)
     }
 }
 
+/* VPro: the value a depth takes through the library's host codec, which
+   keeps the single's exponent and top 18 mantissa bits, truncating the rest,
+   and decodes by refilling the low five mantissa bits from the top five
+   (origami datasheet odyssey.md, "Depth word, established as the library's
+   reading"). Other boards expect the value unchanged. */
+static float depth_expect(float z)
+{
+    union { float f; unsigned int u; } v;
+    if (!vpro)
+        return z;
+    v.f = z;
+    v.u &= ~0x1fu;
+    v.u |= (v.u >> 18) & 0x1f;
+    return v.f;
+}
+
 static void t_depth_stencil(void)
 {
     int w = 13, h = 5, i, j;
@@ -1360,8 +1376,8 @@ static void t_depth_stencil(void)
             for (i = 0; i < w * h + 8; i++) zout[i] = -7.0f;
             glReadPixels(40, 50, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, zout);
             for (i = 0; i < w * h; i++)
-                if (fabs(zout[i] - zin[i]) > 1.0 / (1 << 20))
-                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], zin[i]);
+                if (fabs(zout[i] - depth_expect(zin[i])) > 1.0 / (1 << 20))
+                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], depth_expect(zin[i]));
             if (zout[w * h] != -7.0f)
                 note("wrote past the image");
             check_border(40, 50, w, h, 2);
@@ -1388,8 +1404,8 @@ static void t_depth_stencil(void)
             ztol = dbits > 0 && dbits <= 20 ? 2.0 / (1 << dbits) : 1.0 / (1 << 20);
             for (i = 0; i < w * h; i++) {
                 double got = zu[i] / 4294967295.0;
-                if (fabs(got - zin[i]) > ztol)
-                    note("(%d,%d) depth %08x = %.7f want %.7f", i % w, i / w, zu[i], got, zin[i]);
+                if (fabs(got - depth_expect(zin[i])) > ztol)
+                    note("(%d,%d) depth %08x = %.7f want %.7f", i % w, i / w, zu[i], got, depth_expect(zin[i]));
             }
             end();
         }
@@ -1410,8 +1426,8 @@ static void t_depth_stencil(void)
             reset_state();
             glReadPixels(40, 50, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, zout);
             for (i = 0; i < w * h; i++)
-                if (fabs(zout[i] - (zin[i] * 0.5 + 0.25)) > 1.0 / (1 << 20))
-                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], zin[i] * 0.5 + 0.25);
+                if (fabs(zout[i] - depth_expect(zin[i] * 0.5f + 0.25f)) > 1.0 / (1 << 20))
+                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], depth_expect(zin[i] * 0.5f + 0.25f));
             end();
         }
     }
@@ -1431,8 +1447,8 @@ static void t_depth_stencil(void)
             glDisable(GL_DEPTH_TEST);
             glReadPixels(100, 60, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, zout);
             for (i = 0; i < w * h; i++)
-                if (fabs(zout[i] - zin[i]) > 1.0 / (1 << 20))
-                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], zin[i]);
+                if (fabs(zout[i] - depth_expect(zin[i])) > 1.0 / (1 << 20))
+                    note("(%d,%d) depth %.7f want %.7f", i % w, i / w, zout[i], depth_expect(zin[i]));
             end();
         }
     }
@@ -1485,6 +1501,19 @@ static void t_depth_stencil(void)
             glReadPixels(40, 50, w, h, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, sout);
             for (i = 0; i < w * h; i++) {
                 int want = (((sin[i] << 1) + 3) & 0x0f) & smask;
+                if (vpro) {
+                    /* VPro: the library does shift and offset on the host and
+                       runs a stencil download under its default block, whose
+                       write mask is all ones, so glStencilMask(0x0f) never
+                       reaches it (origami datasheet odyssey.md, "The stencil
+                       word and the write paths", established). The index is
+                       stored whole: 219 for 108. The board gets value << 16
+                       and what it does with bits above 8 is unknown there, so
+                       such pixels are not checked. */
+                    want = (sin[i] << 1) + 3;
+                    if (want > 0xff)
+                        continue;
+                }
                 if (sout[i] != want)
                     note("(%d,%d) stencil %d want %d", i % w, i / w, sout[i], want);
             }
@@ -2728,6 +2757,7 @@ int main(int argc, char **argv)
     {
         const char *rn = (const char *)glGetString(GL_RENDERER);
         gr2 = rn && (!strncmp(rn, "GR", 2) || !strncmp(rn, "GU", 2));
+        vpro = rn && !strncmp(rn, "VPRO", 4);
     }
     ext = (const char *)glGetString(GL_EXTENSIONS);
     ext_abgr = ext && strstr(ext, "GL_EXT_abgr") != 0;
