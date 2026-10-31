@@ -12,6 +12,7 @@
 
 use super::sflash::amd::{AmdCore, Effect, SECTOR_SIZE};
 use super::sflash::storage::FlashBacking;
+use crate::cpu::mips_cache_shadow::R16000_800_CONFIG0;
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK,
 };
@@ -77,13 +78,27 @@ impl FirmwareRecord {
         header: Header::Refreshed,
     };
     /// The Tezro's 700 MHz R16000 with a 4 MiB secondary cache, as the
-    /// Tezro flash profile for PROM 6.210 records it.
+    /// Tezro flash profile for PROM 6.210 records it: the stock IP35 PROM's
+    /// word for 700 MHz and 4 MiB with cache tap 0xc, and the check
+    /// adjustment that profile writes.
     pub const TEZRO: Self = Self {
-        cpu_mode_word: 0x549b_ad85,
+        cpu_mode_word: 0x589b_ad85,
         reset_mode: 0x009b_ad85,
         cpu_clock_hz: 700_000_000,
         machine_type: 0,
-        header: Header::Authored { checksum_adjustment: 0xde },
+        header: Header::Authored { checksum_adjustment: 0xda },
+    };
+    /// The Tezro's 800 MHz R16000 with a 4 MiB secondary cache: the QEMU
+    /// Tezro offering's word for this part (cache tap 0xa), whose low 25
+    /// bits are the part's Config reset word in the CPU models. No flash
+    /// profile writes this block; it is the 700 MHz one with this word and
+    /// the clock, and a check adjustment chosen to keep its byte sum.
+    pub const TEZRO_800: Self = Self {
+        cpu_mode_word: 0x549b_af85,
+        reset_mode: R16000_800_CONFIG0,
+        cpu_clock_hz: 800_000_000,
+        machine_type: 0,
+        header: Header::Authored { checksum_adjustment: 0xff },
     };
     /// CP0 Config at reset: the fixed 32 KiB primary cache sizes (fields 3
     /// in bits 31:29 and 28:26) with the board's mode bits.
@@ -546,10 +561,10 @@ mod tests {
     #[test]
     fn the_tezro_seed_writes_its_authored_block() {
         const AUTHORED_BLOCK: &str = concat!(
-            "00000015549bad8569703237636f6e66",
+            "00000015589bad8569703237636f6e66",
             "0000000029b92700000000000bebc200",
             "00000000001312d00000000100000010",
-            "00000000000000de0000000100000010",
+            "00000000000000da0000000100000010",
             "00000006000000d20000000000000000",
         );
         let expected: Vec<u8> = (0..AUTHORED_BLOCK.len())
@@ -570,7 +585,7 @@ mod tests {
     #[test]
     fn the_tezro_record_carries_its_700_mhz_mode_and_the_config_it_implies() {
         let bytes = Flash::new(&factory_block(), FirmwareRecord::TEZRO).unwrap().contents();
-        assert_eq!(&bytes[0x64..0x68], &0x549bad85u32.to_be_bytes());
+        assert_eq!(&bytes[0x64..0x68], &0x589bad85u32.to_be_bytes());
         assert_eq!(&bytes[0x70..0x78], &700_000_000u64.to_be_bytes());
         assert_eq!(&bytes[0x90..0x94], &0u32.to_be_bytes(), "machine type 0");
         assert_eq!(FirmwareRecord::TEZRO.reset_config0(), 0x6c9b_ad85);
@@ -579,6 +594,25 @@ mod tests {
         // against the Fuel's 2 for 2 MiB.
         assert_eq!((FirmwareRecord::TEZRO.reset_config0() >> 16) & 7, 3);
         assert_eq!((FirmwareRecord::FUEL.reset_config0() >> 16) & 7, 2);
+    }
+
+    /// The 800 MHz record differs from the 700 MHz one in the mode bits the
+    /// CPU models give the part and in its clock, and keeps the authored
+    /// block's byte sum. Each record's reset Config is its part's.
+    #[test]
+    fn the_tezro_800_mhz_record_takes_the_parts_config_and_keeps_the_byte_sum() {
+        use crate::cpu::mips_cache_shadow::{CONFIG0_RESET_MASK, R16000_MHZ700_CONFIG0};
+        assert_eq!(FirmwareRecord::TEZRO.reset_mode, R16000_MHZ700_CONFIG0);
+        assert_eq!(FirmwareRecord::TEZRO_800.reset_mode, R16000_800_CONFIG0);
+        assert_eq!(FirmwareRecord::TEZRO_800.cpu_mode_word & CONFIG0_RESET_MASK, R16000_800_CONFIG0);
+        assert_eq!(FirmwareRecord::TEZRO_800.reset_config0(), 0x6c9b_af85);
+        let slow = Flash::new(&factory_block(), FirmwareRecord::TEZRO).unwrap().contents();
+        let fast = Flash::new(&factory_block(), FirmwareRecord::TEZRO_800).unwrap().contents();
+        assert_eq!(&fast[0x64..0x68], &0x549b_af85u32.to_be_bytes());
+        assert_eq!(&fast[0x70..0x78], &800_000_000u64.to_be_bytes());
+        assert_eq!(sum(&fast[0x60..0xb0]), sum(&slow[0x60..0xb0]));
+        let differ: Vec<usize> = (0x60..0xb0).filter(|&i| fast[i] != slow[i]).collect();
+        assert_eq!(differ, [0x64, 0x66, 0x74, 0x75, 0x76, 0x97], "mode word, clock and check adjustment only");
     }
 
     /// Reopening a store reapplies a refreshed record, so a Fuel follows the

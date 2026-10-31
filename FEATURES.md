@@ -171,7 +171,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), fuel_ip34 (see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)). |
-| `machine.cpu` | `r4400` | r4400, r5000, r10000, r12000 (Octane, O2), r14000 (Octane, Fuel), r16000 (no machine yet). CPU/ISA choice is independent of build features. A Fuel always runs its one R14000: set `r14000` (`r10000`, the family, is also accepted); any other value is refused. A Tezro always runs its R16000, and the key must be `r10000`; any other value is refused. |
+| `machine.cpu` | `r4400`; a Fuel with no `cpu` runs `r14000` and a Tezro `r16000_700` | r4400, r5000, r10000, r12000 (Octane, O2), r14000 (Octane, Fuel), r16000 (800 MHz, Tezro), r16000_700 (700 MHz, Tezro). CPU/ISA choice is independent of build features. A Fuel always runs its one R14000: set `r14000` (`r10000`, the family, is also accepted); any other value is refused. A Tezro runs an R16000 with a 4 MB secondary cache: `r16000_700` (the 700 MHz part, the default) or `r16000` (the 800 MHz part, four processors only); `r10000`, the family, takes the 700 MHz part. Any other value is refused, and so is the 800 MHz part with an 8 MB secondary cache (QEMU's `r16000-800mhz-8mb-rev22`), which has no model. The Tezro's clock follows the part. |
 | `machine.cpus` | `1` | Processors fitted. 2 only on the Octane; see [its guide](docs/Octane/multiprocessor.md). A Tezro sets its fitted processors in `[tezro] cpus` and runs one. |
 
 ### [fuel]
@@ -206,7 +206,8 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 | `l1_log` | unset | Optional serial log path for L1 output when an IOC4 port is selected as console. |
 | `serial_port_c`, `serial_port_d` | `8883`, `8884` | Host TCP ports of IOC4 ports 2 and 3; ports 0 and 1 use `serial_port_a` and `serial_port_b`. |
 
-The machine runs the 700 MHz R16000 with a 4 MiB secondary cache. `banks`
+The machine runs the 700 MHz R16000 (`r16000_700`, the default) or the 800 MHz
+one (`r16000`), each with a 4 MiB secondary cache. `banks`
 takes 512 or 1024 MiB banks from bank 0; left unset, it is the 4 GiB layout of
 1024, 1024 and four 512 MiB banks. A `[tezro]` table is written to a saved
 config only when one of these keys is set. See the

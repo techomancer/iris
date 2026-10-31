@@ -100,3 +100,46 @@ fn the_board_refuses_a_population_it_cannot_fit() {
     assert!(TezroBoard::new(3).is_err());
     assert!(TezroBoard::new(0).is_err());
 }
+
+/// Each R16000 part resets with the PRId and Config word the CPU models give
+/// it, and the board's flash and count rate follow its clock. `r10000` takes
+/// the default 700 MHz part; other parts are refused.
+#[test]
+fn each_r16000_part_resets_with_its_own_identity_and_clock() {
+    // Building a processor takes more stack than a debug build's test thread has.
+    std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+        use crate::config::CpuModel;
+        use crate::cpu::mips_cache_shadow::{CONFIG0_RESET_MASK, R16000_800_CONFIG0, R16000_MHZ700_CONFIG0};
+        assert_eq!(TezroPart::of(CpuModel::R16000Mhz700), Ok(TezroPart::Mhz700));
+        assert_eq!(TezroPart::of(CpuModel::R10000), Ok(TezroPart::Mhz700));
+        assert_eq!(TezroPart::of(CpuModel::R16000), Ok(TezroPart::Mhz800));
+        for cpu in [CpuModel::R4400, CpuModel::R5000, CpuModel::R12000, CpuModel::R14000] {
+            assert!(TezroPart::of(cpu).is_err(), "{cpu:?}");
+        }
+        for (part, prid, config0, mhz) in [
+            (TezroPart::Mhz700, R16000_MHZ700_PRID, R16000_MHZ700_CONFIG0, 700),
+            (TezroPart::Mhz800, 0x0f42, R16000_800_CONFIG0, 800),
+        ] {
+            // One GiB keeps the memory below 4 GiB, which a jitv2 build's
+            // uncached code views need.
+            let board = TezroBoard::with_config(TezroBoardConfig {
+                payload: &[],
+                clock: Arc::new(|| 0),
+                flash_path: None,
+                station_mac: L1Config::default().mac,
+                timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+                memory: &MemoryPopulation::one_gib(),
+                cpus: 1,
+                part,
+            })
+            .unwrap();
+            let cpu = build_cpu::<R16000ShadowCache>(&board);
+            assert_eq!((cpu.core.cp0_prid, cpu.core.reset_prid), (prid, prid), "{part:?}");
+            assert_eq!(cpu.core.cp0_config & CONFIG0_RESET_MASK, config0, "{part:?}");
+            assert_eq!(cpu.core.cp0_config >> 26, 0b011_011, "{part:?}: 32 KB primary caches");
+            assert_eq!(part.mhz(), mhz);
+            assert_eq!(part.count_hz(), u64::from(mhz) * 500_000, "{part:?}: Count at half the clock");
+            assert_eq!(board.part.firmware().cpu_clock_hz, mhz * 1_000_000);
+        }
+    }).unwrap().join().unwrap();
+}

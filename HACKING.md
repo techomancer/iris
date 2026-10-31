@@ -21,7 +21,7 @@ IRIS emulates the Indy (IP24), Indigo2 (IP22), Indigo2 IMPACT (IP28), O2
 (IP53 board, IP35 software platform). The CPU is an R4400, R5000, R10000,
 R12000, R14000 or R16000 (two parts), chosen at runtime (the IP28 takes the
 R10000; the Octane the R10000, R12000 or R14000; the O2 the R5000, R10000 or
-R12000; the Fuel its 500 MHz R14000; the Tezro its 700 MHz R16000). Graphics is Newport
+R12000; the Fuel its 500 MHz R14000; the Tezro its 700 or 800 MHz R16000). Graphics is Newport
 (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and Indigo2, GBE on the O2, and
 Solid IMPACT on the Octane. Fuel has no graphics board and runs headless on
 its serial console. It does have a PS/2 keyboard and mouse on its IOC3, fed

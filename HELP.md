@@ -622,7 +622,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 
 [machine]
 profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
-cpu     = "r4400"           # "r5000", "r10000", "r12000", "r14000", "r16000" or "r16000_700" (--cpu); IP28: r10000, Octane: r10000/r12000/r14000, O2: r5000/r10000/r12000
+cpu     = "r4400"           # "r5000", "r10000", "r12000", "r14000", "r16000" or "r16000_700" (--cpu); IP28: r10000, Octane: r10000/r12000/r14000, O2: r5000/r10000/r12000, Tezro: r16000_700 (default)/r16000/r10000
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]

@@ -2,8 +2,8 @@
 
 The Tezro is the IP53 board running the IP35 software platform, the same
 Bedrock node as the [Fuel](fuel-ip34.md) with a different interface board.
-The emulated configuration has 700 MHz R16000 processors with 4 MiB
-secondary caches, a Bedrock node with 4 GiB of RAM by default, and an IO9
+The emulated configuration has 700 MHz R16000 processors (or the 800 MHz
+part) with 4 MiB secondary caches, a Bedrock node with 4 GiB of RAM by default, and an IO9
 board behind a PIC PCI host bridge: an IOC4 with four serial ports, a
 DS1744-compatible clock and a PS/2 keyboard and mouse, an ISP12160 with two
 SCSI channels, and a BCM5701 gigabit Ethernet controller. The machine runs
@@ -14,8 +14,18 @@ headless on its L1 or IOC4 serial console.
 Copy [`tezro.toml.example`](../tezro.toml.example) to `tezro.toml`, provide
 the PROM and disk files named there, then run `iris --config tezro.toml` from
 the repository root. The sample selects `machine.profile = "tezro_ip53"` and
-`machine.cpu = "r10000"`. The machine always runs the R16000; `cpu` must name
-the R10000 family, and any other value is refused.
+`machine.cpu = "r16000_700"`, the 700 MHz R16000 (revision 2.1), which is
+also what the machine runs with no `cpu` line. `cpu = "r16000"` selects the
+800 MHz part (revision 2.2), which a Tezro fits only as four processors, as
+QEMU offers it (inferred from the assemblies sheet). Both have a 4 MB
+secondary cache. The 800 MHz part with an 8 MB secondary cache (QEMU's
+`r16000-800mhz-8mb-rev22`) has no model, since the cache size is fixed when a
+CPU model is compiled, and is refused, as is every other processor. `r10000`,
+the family, takes the 700 MHz part. The processor clock in the flash record
+and the count rate (half the clock) follow the part; `[clock] fixed_mhz`
+still sets the count rate. The secondary cache clock and the cache tap
+(0xc for the 700 MHz part, 0xa for the 800 MHz one) are not modelled; the tap
+appears only as part of the flash record's mode word.
 
 `[tezro] cpus` is the number of processors fitted. The one-processor board
 has one PIC at XIO widget 15 carrying the IO9.
@@ -39,11 +49,21 @@ reference is kept beside it with a `.clock` suffix.
 The PROM is the IP35 PROM 6.210 payload, given raw or in a supported
 version-six, single-segment container, as for the Fuel. A fresh flash is
 formatted with the payload in the first 8 MiB position and its configuration
-block replaced by the Tezro's own (mode word `0x549bad85`, 700 MHz, machine type 0, check
-adjustment `0xde`), and the volume label in the second position. A flash
+block replaced by the Tezro's own (mode word `0x589bad85`, 700 MHz, machine type 0, check
+adjustment `0xda`), and the volume label in the second position. A flash
 store that already exists keeps the configuration block it holds, so a block
 the PROM rewrote survives the next start. The processor resets with the
 matching Config `0x6c9bad85`.
+
+The mode word is a different field from the processor's Config: its low 25
+bits are the Config reset bits, and the bits above carry, among others, the
+cache tap. With `cpu = "r16000"` the block carries the 800 MHz part instead:
+the QEMU Tezro offering's mode word for it, `0x549baf85`, 800 MHz and check
+adjustment `0xff`, and the processor resets with Config `0x6c9baf85`. No
+flash profile writes this block; the adjustment keeps the 700 MHz block's
+byte sum. A flash store keeps
+the block it was formatted with, and the PROM checks its mode word against
+the processor's, so give the other part a fresh `[tezro] flash` file.
 
 ## Limits
 

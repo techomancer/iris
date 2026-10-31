@@ -815,8 +815,9 @@ pub type R12000O2ShadowCache =
 pub type R14000FuelShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0f23, 0x0000_0900, 64, { model::R12000 }>;
 
-/// R16000 2.2, the 800 MHz part, with a 4 MB secondary cache. Only
-/// `iris-bench` builds it for now.
+/// R16000 2.2, the 800 MHz part, with a 4 MB secondary cache. The Tezro
+/// builds it for both its parts, setting the 700 MHz part's PRId and Config
+/// word below on it.
 ///
 /// Values and where they come from:
 /// - PRId 0x0f42: the low 16 bits are printed in hinv listings (revision 2.2

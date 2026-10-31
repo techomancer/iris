@@ -19,8 +19,8 @@
 //! - The IOC4 carries the DS1744-compatible clock and NVRAM in its BAR and
 //!   the PS/2 keyboard and mouse; its four ports are serial streams beside
 //!   the L1's, and the L1 is the console by default.
-//! - Bedrock board word 0x2001, the Tezro firmware record (700 MHz, an
-//!   authored configuration block), and an L1 that reports
+//! - Bedrock board word 0x2001, the Tezro firmware record (the part's clock,
+//!   an authored configuration block), and an L1 that reports
 //!   brick type 0x39, revision 1.48.1, the first port-speed integer 1 and
 //!   the router `brick` reply.
 //!
@@ -42,9 +42,9 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
-use crate::config::{scsi_label, MachineConfig, TezroConsole};
-use crate::cpu::mips_cache_shadow::R16000ShadowCache;
-use crate::cpu::mips_cache_v2::MipsCache;
+use crate::config::{scsi_label, CpuModel, MachineConfig, TezroConsole};
+use crate::cpu::mips_cache_shadow::{R16000ShadowCache, R16000_MHZ700_PRID};
+use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::cpu_monitor::CpuMonitor;
 use crate::cpu::mips_tlb::MipsTlb;
@@ -82,10 +82,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Weak};
 
-/// The processor model, chosen here and nowhere else.
-pub(crate) type TezroCache = R16000ShadowCache;
-pub(crate) type TezroCpu = MipsExecutor<MipsTlb, TezroCache>;
-
 /// The Bedrock board word the QEMU Tezro profiles select.
 const BOARD_ID: u64 = 0x2001;
 /// The IO9's PIC, and the widget Bedrock IO answers as.
@@ -95,8 +91,54 @@ const HOST_WIDGET: u8 = 10;
 const IOC4_DEVICE: u8 = 1;
 const SCSI_DEVICE: u8 = 3;
 const ETH_DEVICE: u8 = 4;
-/// The count register runs at half the processor's 700 MHz.
-const DEFAULT_COUNT_HZ: u64 = 350_000_000;
+/// The R16000 part a Tezro runs, from `[machine] cpu`. Both are the CPU
+/// models' R16000 with a 4 MB secondary cache; they differ in PRId, the
+/// Config reset word and the clock the firmware record gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TezroPart {
+    /// Revision 2.1 at 700 MHz (`r16000_700`), the default.
+    Mhz700,
+    /// Revision 2.2 at 800 MHz (`r16000`).
+    Mhz800,
+}
+
+impl TezroPart {
+    /// The part `cpu` names. `r10000` names the family, as on the Fuel, and
+    /// takes the default part.
+    pub(crate) fn of(cpu: CpuModel) -> Result<Self, String> {
+        match cpu {
+            CpuModel::R16000Mhz700 | CpuModel::R10000 => Ok(Self::Mhz700),
+            CpuModel::R16000 => Ok(Self::Mhz800),
+            other => Err(format!("a Tezro has R16000s, not the {}", other.label())),
+        }
+    }
+
+    /// The flash record the PROM checks this part against.
+    pub(crate) fn firmware(self) -> FirmwareRecord {
+        match self {
+            Self::Mhz700 => FirmwareRecord::TEZRO,
+            Self::Mhz800 => FirmwareRecord::TEZRO_800,
+        }
+    }
+
+    /// The part's PRId, from the CPU models.
+    pub(crate) fn prid(self) -> u32 {
+        match self {
+            Self::Mhz700 => R16000_MHZ700_PRID,
+            Self::Mhz800 => <R16000ShadowCache as CacheCpuModel>::PRID,
+        }
+    }
+
+    /// The processor clock in MHz.
+    pub(crate) fn mhz(self) -> u32 {
+        self.firmware().cpu_clock_hz / 1_000_000
+    }
+
+    /// The count register runs at half the processor clock.
+    pub(crate) fn count_hz(self) -> u64 {
+        u64::from(self.firmware().cpu_clock_hz) / 2
+    }
+}
 /// The serial connections: the L1, then IOC4 ports 0 to 3.
 const SERIAL_PORTS: usize = 5;
 
@@ -126,6 +168,7 @@ impl TezroMachine {
         let clock = Arc::new(Ds1744::new(YearBase::From(1968))?);
         clock.set_nvram_file(Path::new(&cfg.nvram))?;
         let memory = cfg.tezro_memory()?;
+        let part = TezroPart::of(cfg.machine.cpu)?;
         let board = Arc::new(TezroBoard::with_config(TezroBoardConfig {
             payload: &prom,
             clock: host_clock(),
@@ -134,10 +177,11 @@ impl TezroMachine {
             timekeeper: clock,
             memory: &memory,
             cpus: usize::from(cfg.tezro.cpus),
+            part,
         })?);
         let timers = Arc::new(TimerManager::new());
         board.ioc4.set_timer_manager(timers.clone());
-        let count_hz = cfg.clock.fixed_mhz.map_or(DEFAULT_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64).max(1);
+        let count_hz = cfg.clock.fixed_mhz.map_or(part.count_hz(), |mhz| (mhz * 1_000_000.0) as u64).max(1);
         let cpus = build_cpus(&board, &timers, count_hz);
         let cpu = cpus[0].clone();
         let node = &board.node;
@@ -199,8 +243,9 @@ impl TezroMachine {
             board.eth.attach(link);
         }
         eprintln!(
-            "iris: Tezro IP53, {} R16000 700 MHz fitted, CPU 0 running, {} MiB, serial console {:?}",
+            "iris: Tezro IP53, {} R16000 {} MHz fitted, CPU 0 running, {} MiB, serial console {:?}",
             cfg.tezro.cpus,
+            part.mhz(),
             memory.total_mib(),
             cfg.tezro.console
         );
@@ -408,22 +453,32 @@ impl Drop for TezroMachine {
     }
 }
 
-/// The processors the machine runs, CPU 0 first. The board fits more, but
-/// only CPU 0 is built: starting the others is not modelled, and the PIs
-/// refuse and log what would reach them.
+/// The processors the machine runs, CPU 0 first, of the board's part. The
+/// board fits more, but only CPU 0 is built: starting the others is not
+/// modelled, and the PIs refuse and log what would reach them.
 fn build_cpus(board: &Arc<TezroBoard>, timers: &Arc<TimerManager>, count_hz: u64) -> Vec<Arc<dyn CpuDevice>> {
-    let mut exec = build_cpu(board);
+    vec![start_cpu::<R16000ShadowCache>(board, timers, count_hz)]
+}
+
+/// CPU 0 of type `C`, with its timers and the board's poll.
+fn start_cpu<C>(board: &Arc<TezroBoard>, timers: &Arc<TimerManager>, count_hz: u64) -> Arc<dyn CpuDevice>
+where
+    C: CacheCpuModel + From<Arc<dyn BusDevice>> + 'static,
+    MipsCpu<MipsTlb, C>: CpuDevice,
+{
+    let mut exec = build_cpu::<C>(board);
     exec.core.set_timer_manager(timers.clone());
     exec.core.set_count_hz(count_hz);
     exec.core.count_write_samples = true;
     let poll_board = board.clone();
     exec.batch_hook = Some(Box::new(move |_| poll_board.poll()));
-    vec![Arc::new(MipsCpu::<_, TezroCache>::new(*exec))]
+    Arc::new(MipsCpu::new(*exec))
 }
 
-/// The R16000 with the Tezro's reset-mode inputs, on the board's bus.
-fn build_cpu(board: &TezroBoard) -> Box<TezroCpu> {
-    let cfg = MipsCpuConfig::for_model::<TezroCache>(Arc::new(crate::ip35::memory_map(&board.node.md.ram_extent())));
+/// A processor of type `C` with the board part's PRId and reset-mode
+/// inputs, on the board's bus.
+fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(board: &TezroBoard) -> Box<MipsExecutor<MipsTlb, C>> {
+    let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip35::memory_map(&board.node.md.ram_extent())));
     let mut cpu = Box::new(MipsExecutor::new(
         board.node.bus.clone() as Arc<dyn BusDevice>,
         MipsTlb::new(cfg.tlb_entries),
@@ -432,8 +487,10 @@ fn build_cpu(board: &TezroBoard) -> Box<TezroCpu> {
     cpu.phys_mask = CPU_PHYS_MASK;
     // The flash record's mode word and the processor's reset mode must
     // agree, or the PROM enters its error routine before GP is set.
-    cpu.core.cp0_config = FirmwareRecord::TEZRO.reset_config0();
-    cpu.cache = TezroCache::new(board.cached_bus());
+    cpu.core.cp0_config = board.part.firmware().reset_config0();
+    cpu.core.reset_prid = board.part.prid();
+    cpu.core.cp0_prid = board.part.prid();
+    cpu.cache = C::from(board.cached_bus());
     // The PROM keeps its stack in cache lines it tags for a window with no
     // memory behind it yet; the controller answers that window while they stand.
     let memory = board.node.md.clone();
@@ -451,6 +508,8 @@ pub(crate) struct TezroBoardConfig<'a> {
     pub memory: &'a MemoryPopulation,
     /// Processors fitted.
     pub cpus: usize,
+    /// The R16000 part fitted.
+    pub part: TezroPart,
 }
 
 /// The Tezro's devices around its Bedrock node.
@@ -463,6 +522,8 @@ pub(crate) struct TezroBoard {
     pub eth: Arc<Bcm5701>,
     pub timekeeper: Arc<Ds1744>,
     pub serial: [Arc<CiSerialBackend>; SERIAL_PORTS],
+    /// The R16000 part fitted, whose record the flash holds.
+    pub part: TezroPart,
     clock: Clock,
     last_clock: AtomicU64,
     running: AtomicBool,
@@ -484,11 +545,12 @@ impl TezroBoard {
             timekeeper: Arc::new(Ds1744::new(YearBase::From(1968))?),
             memory: &MemoryPopulation::default(),
             cpus,
+            part: TezroPart::Mhz700,
         })
     }
 
     pub fn with_config(config: TezroBoardConfig<'_>) -> Result<Self, String> {
-        let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus } = config;
+        let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus, part } = config;
         if cpus != 1 {
             return Err(format!("{cpus} processors; this Tezro board fits one"));
         }
@@ -500,7 +562,7 @@ impl TezroBoard {
             flash_path,
             banks_mib: &memory.banks_mib(),
             population: Population::fitted_cpus(cpus)?,
-            firmware: FirmwareRecord::TEZRO,
+            firmware: part.firmware(),
             board_id: BOARD_ID,
             l1: L1Config {
                 type_code: 0x39,
@@ -549,6 +611,7 @@ impl TezroBoard {
             eth,
             timekeeper,
             serial,
+            part,
             last_clock: AtomicU64::new(clock()),
             clock,
             running: AtomicBool::new(false),
