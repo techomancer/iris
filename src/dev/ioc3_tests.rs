@@ -9,6 +9,7 @@ use super::*;
 use std::sync::Mutex;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
+use crate::pci::PciBusDevice;
 
 const MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 
@@ -1582,4 +1583,56 @@ fn the_uarts_are_in_the_superio_block() {
     assert_eq!(r.r8(reg::SERIAL_A + 7), 0x5a);
     assert_eq!(r.r8(reg::SERIAL_B + 7), 0);
     assert_eq!(r.r32(reg::PIN_DATA) >> 2 & 1, 1, "an original Octane");
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
+
+#[test]
+fn save_load_round_trip() {
+    for build in [|| Ioc3::octane(MAC, false), || Ioc3::octane(MAC, true)] {
+        let src = Rig::with(build());
+        src.w8(reg::SERIAL_A + 3, 0x80);
+        src.w8(reg::SERIAL_A + 7, 6);
+        src.w8(reg::SERIAL_A + 3, 0x03);
+        src.w32(reg::SSRAM + 0x100, 0x1234);
+        src.w32(reg::INT_ENABLE_SET, 0x40);
+        let v1 = src.c.save_state();
+
+        let dst = Rig::with(build());
+        dst.c.load_state(&v1).expect("load_state");
+        assert_eq!(v1, dst.c.save_state());
+        let st = dst.c.sh.st.lock();
+        assert_eq!(st.uart[0].predivider, 6);
+        assert_eq!(st.ssram[0x40] & SSRAM_DATA, 0x1234);
+    }
+}
+
+/// A periodic interrupt output keeps the time its next pulse had left,
+/// counted from the load rather than from the save.
+#[test]
+fn a_pending_output_keeps_its_time_left() {
+    let src = Ioc3::octane(MAC, false);
+    src.bar_write(0, reg::INT_OUTPUT, IO_PERIODIC | 100, 4);
+    let at_save = Instant::now();
+    let left = Duration::from_micros(20);
+    let v = {
+        let mut st = src.sh.st.lock();
+        st.int_out.next = Some(at_save + left);
+        st.save_state(at_save)
+    };
+    let dst = Ioc3::octane(MAC, false);
+    let at_load = at_save + Duration::from_millis(5);
+    dst.sh.st.lock().load_state(&v, at_load).unwrap();
+    assert_eq!(dst.sh.st.lock().int_out.next, Some(at_load + left));
+}
+
+#[test]
+fn a_short_buffer_ram_is_refused() {
+    let c = Ioc3::octane(MAC, false);
+    let mut v = c.save_state();
+    let chip = v.as_table_mut().unwrap().get_mut("chip").unwrap().as_table_mut().unwrap();
+    chip.insert("ssram".into(), toml::Value::Array(Vec::new()));
+    assert!(c.load_state(&v).unwrap_err().contains("ssram"));
 }
