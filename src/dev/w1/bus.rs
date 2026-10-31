@@ -4,6 +4,8 @@
 //!
 //! Ported from hw/1wire/core.c in jamesbraid/qemu-sgi-origami.
 
+use crate::snapshot::{field, field_bytes, field_u32, field_u64s, field_u8, toml_u8, StateTable};
+
 /// A part on the bus.
 pub trait Part: Send {
     /// The 64-bit registration number: family code, 48-bit serial (least
@@ -202,5 +204,79 @@ impl Bus {
                 level
             }
         }
+    }
+}
+
+// A 1-Wire bus's transaction state for a snapshot: the phase, the bits
+// collected so far and which parts are still selected. The parts are the
+// board's ROMs and stay as built; their ROM numbers are saved only to
+// refuse a load onto a bus with other parts.
+impl Phase {
+    fn to_words(&self) -> [u64; 3] {
+        match *self {
+            Phase::Rom => [0, 0, 0],
+            Phase::ReadRom(i) => [1, i as u64, 0],
+            Phase::Match(i) => [2, i as u64, 0],
+            Phase::Search { bit, step } => [3, bit as u64, u64::from(step)],
+            Phase::Func => [4, 0, 0],
+            Phase::Addr => [5, 0, 0],
+            Phase::Stream(i) => [6, i as u64, 0],
+            Phase::Dead => [7, 0, 0],
+        }
+    }
+    fn from_words([tag, a, b]: [u64; 3]) -> Result<Self, String> {
+        // The ROM phases index a part's 64-bit ROM by bit.
+        if matches!(tag, 1..=3) && a >= 64 {
+            return Err(format!("1-Wire phase {tag}: ROM bit {a}, past the 64"));
+        }
+        Ok(match tag {
+            0 => Phase::Rom,
+            1 => Phase::ReadRom(a as usize),
+            2 => Phase::Match(a as usize),
+            3 => Phase::Search { bit: a as usize, step: b as u8 },
+            4 => Phase::Func,
+            5 => Phase::Addr,
+            6 => Phase::Stream(a as usize),
+            7 => Phase::Dead,
+            _ => return Err(format!("1-Wire phase {tag} is not a bus phase")),
+        })
+    }
+}
+
+impl Bus {
+    pub fn save_state(&self) -> toml::Value {
+        let roms: Vec<u8> = self.roms().concat();
+        let sel: Vec<u8> = self.sel.iter().map(|&s| u8::from(s)).collect();
+        let replies = self.replies.iter().map(|r| crate::snapshot::u8_slice_to_toml(r)).collect();
+        StateTable::new()
+            .u8s("roms", &roms)
+            .u8s("selected", &sel)
+            .value("replies", toml::Value::Array(replies))
+            .u64s("phase", &self.phase.to_words())
+            .u32("acc", self.acc)
+            .u32("nbits", self.nbits)
+            .u8("cmd", self.cmd)
+            .build()
+    }
+
+    pub fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
+        if field_bytes(v, "roms")? != self.roms().concat() {
+            return Err("the saved 1-Wire bus has other parts".into());
+        }
+        let sel = field_bytes(v, "selected")?;
+        if sel.len() != self.parts.len() {
+            return Err("selected: not one entry per part".into());
+        }
+        let replies = field(v, "replies")?.as_array().ok_or("replies: not a list")?;
+        let replies = replies.iter()
+            .map(|r| r.as_array()?.iter().map(toml_u8).collect::<Option<Vec<u8>>>())
+            .collect::<Option<Vec<_>>>().ok_or("replies: an entry is not a byte list")?;
+        self.phase = Phase::from_words(field_u64s(v, "phase")?)?;
+        self.sel = sel.into_iter().map(|s| s != 0).collect();
+        self.replies = replies;
+        self.acc = field_u32(v, "acc")?;
+        self.nbits = field_u32(v, "nbits")?;
+        self.cmd = field_u8(v, "cmd")?;
+        Ok(())
     }
 }
