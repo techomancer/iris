@@ -1,5 +1,6 @@
 use super::*;
 use crate::traits::{BUS_ERR, BUS_OK};
+use std::sync::atomic::AtomicU64;
 
 /// A PIO offset in Bedrock IO's small window: widget in bits 27:24.
 fn widget(widget: u64, offset: u64) -> u64 {
@@ -113,6 +114,191 @@ fn two_or_four_processors_bring_the_second_pic_at_widget_11() {
     }
 }
 
+// Widget 0's crossbar as PROM 6.210 and the IP35 kernel walk it, from how the PROM finds
+// widgets 0xb and 0xf.
+// QEMU's sn/builder/tezro-two-four-processor-board in
+// tests/qtest/sn-builder-test.c still expects link 11 absent; this board
+// follows the PROM's walk instead.
+
+/// Link `n`'s register block in widget 0, as the 32-bit word address the
+/// PROM issues: the low word of each doubleword.
+fn link_word(n: u64, register: u64) -> u64 {
+    widget(0, 0x100 + (n - 8) * 0x40 + register + 4)
+}
+const LINK_CONTROL: u64 = 0x08;
+const LINK_STATUS: u64 = 0x10;
+const LINK_ARB_UPPER: u64 = 0x18;
+const LINK_ARB_LOWER: u64 = 0x20;
+const LINK_STATUS_CLEAR: u64 = 0x28;
+const LINK_RESET: u64 = 0x30;
+const LINK_AUX: u64 = 0x38;
+const ALIVE: u64 = 1 << 31;
+const PRESENT: u64 = 1 << 5;
+const FAILURE_MODE: u64 = 1 << 6;
+
+fn read_word(board: &TezroBoard, address: u64) -> u64 {
+    let r = board.node.io.pio_read(address, 4);
+    assert_eq!(r.status, BUS_OK, "{address:#x}");
+    r.data
+}
+
+/// Widget 0's part and manufacturer, from its identity word.
+fn widget_zero_part(board: &TezroBoard) -> (u64, u64) {
+    let id = read_word(board, widget(0, 4));
+    ((id >> 12) & 0xffff, (id >> 1) & 0x7ff)
+}
+
+fn alive_and_present(board: &TezroBoard, n: u64) -> (bool, bool) {
+    (read_word(board, link_word(n, LINK_STATUS)) & ALIVE != 0, read_word(board, link_word(n, LINK_AUX)) & PRESENT != 0)
+}
+
+/// The PROM's per-link test: alive and present, except that link 15 is
+/// taken regardless when widget 0 is part 0xd100.
+fn prom_uses(board: &TezroBoard, n: u64) -> bool {
+    let (alive, present) = alive_and_present(board, n);
+    (alive && present) || (n == 15 && widget_zero_part(board).0 == 0xd100)
+}
+
+/// The kernel's: alive, and present unless widget 0 is part 0xd100 with
+/// manufacturer 0 and the link is 15.
+fn kernel_uses(board: &TezroBoard, n: u64) -> bool {
+    let (alive, present) = alive_and_present(board, n);
+    alive && (present || (n == 15 && widget_zero_part(board) == (0xd100, 0)))
+}
+
+/// Links 8 to 15 that pass both tests on their own bits, without either
+/// guest's link-15 exception, as a widget mask.
+fn live_links(board: &TezroBoard) -> u16 {
+    (8..16).filter(|&n| alive_and_present(board, n) == (true, true)).fold(0, |m, n| m | 1 << n)
+}
+
+/// A board whose clock the test advances.
+fn board_with_clock(cpus: usize) -> (TezroBoard, Arc<AtomicU64>) {
+    let now = Arc::new(AtomicU64::new(0));
+    let clock = now.clone();
+    let board = TezroBoard::with_config(TezroBoardConfig {
+        payload: &[],
+        clock: Arc::new(move || clock.load(Ordering::SeqCst)),
+        flash_path: None,
+        station_mac: L1Config::default().mac,
+        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+        memory: &MemoryPopulation::default(),
+        cpus,
+        chip: &CHIPS[0],
+        v12: false,
+        graphics_pool: (2, 32),
+    })
+    .unwrap();
+    (board, now)
+}
+
+/// On the two- and four-processor board widget 0's crossbar shows the
+/// hub's link 10 and both PICs' links 11 and 15 alive and present, with no
+/// failure mode and arbitration bits 0 and 2 clear, so the PROM and the
+/// kernel both take 11 and 15 without leaning on the link-15 exception.
+/// Every other link reads empty. A power-on keeps the same picture.
+#[test]
+fn widget_0_shows_both_pic_links_live_on_the_larger_board() {
+    for cpus in [2, 4] {
+        let board = TezroBoard::new(cpus).unwrap();
+        for pass in ["built", "after power-on"] {
+            assert_eq!(widget_zero_part(&board), (0xd100, 0), "{cpus} CPUs, {pass}");
+            assert_eq!(read_word(&board, widget(0, 4)) & 1, 1);
+            assert_eq!(live_links(&board), 1 << 10 | 1 << 11 | 1 << 15, "{cpus} CPUs, {pass}");
+            for n in [11, 15] {
+                assert!(prom_uses(&board, n) && kernel_uses(&board, n), "link {n}, {cpus} CPUs, {pass}");
+                assert_eq!(read_word(&board, link_word(n, LINK_AUX)) & FAILURE_MODE, 0, "link {n}");
+                assert_eq!(read_word(&board, link_word(n, LINK_ARB_UPPER)) & 0b101, 0, "link {n}: unclaimed");
+            }
+            for n in [8, 9, 12, 13, 14] {
+                assert_eq!(alive_and_present(&board, n), (false, false), "link {n}, {cpus} CPUs, {pass}");
+                assert!(!prom_uses(&board, n) && !kernel_uses(&board, n));
+            }
+            board.power_on();
+        }
+    }
+}
+
+/// The one-processor board has no second PIC: link 11 reads empty and
+/// widget 11 does not answer, while link 15 stays usable.
+#[test]
+fn the_one_processor_board_shows_no_link_11() {
+    let board = TezroBoard::new(1).unwrap();
+    assert_eq!(live_links(&board), 1 << 10 | 1 << 15);
+    assert_eq!(alive_and_present(&board, 11), (false, false));
+    assert!(!prom_uses(&board, 11) && !kernel_uses(&board, 11));
+    assert!(prom_uses(&board, 15) && kernel_uses(&board, 15));
+    assert_eq!(board.node.io.pio_read(widget(11, 4), 4).status, BUS_ERR);
+}
+
+/// Widget 11 answers as a bridge-class PIC with both heads, the identity
+/// the PROM's "Found PIC" path needs (manufacturer 0x24, bit 0 set, part
+/// 0xd102 on head 0), and takes the PROM's control-word writes on both
+/// heads. Widget 15 keeps its own.
+#[test]
+fn widget_11_answers_as_a_pic_with_both_heads() {
+    use crate::dev::pic::HEAD_OFFSET;
+    let board = TezroBoard::new(4).unwrap();
+    let io = &board.node.io;
+    for (head, part) in [(0, 0xd102), (HEAD_OFFSET, 0xd112)] {
+        let id = read_word(&board, widget(11, head + 4));
+        assert_eq!((id & 1, (id >> 1) & 0x7ff, (id >> 12) & 0xffff), (1, 0x24, part), "head at {head:#x}");
+        // Widget control, as the PROM's table-driven field writes it.
+        let control = widget(11, head + 0x24);
+        let before = read_word(&board, control);
+        assert_eq!(io.pio_write(control, 4, (before & !0xf000) | 0x4000), BUS_OK);
+        assert_eq!(read_word(&board, control) & 0xf000, 0x4000, "head at {head:#x}");
+    }
+    assert_eq!(read_word(&board, widget(15, 4)) >> 12 & 0xffff, 0xd102);
+}
+
+/// The PROM's bring-up of link 11 (read the status clear, write credit 2,
+/// clear both arbitration registers, then the 0xd102 credit 3) leaves the
+/// link alive and present and the credit field reading back.
+#[test]
+fn the_proms_link_bring_up_keeps_link_11_alive() {
+    let board = TezroBoard::new(4).unwrap();
+    let io = &board.node.io;
+    read_word(&board, link_word(11, LINK_STATUS_CLEAR));
+    assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, 0x0008_0000), BUS_OK);
+    assert_eq!(io.pio_write(link_word(11, LINK_ARB_UPPER), 4, 0), BUS_OK);
+    assert_eq!(io.pio_write(link_word(11, LINK_ARB_LOWER), 4, 0), BUS_OK);
+    assert_eq!(alive_and_present(&board, 11), (true, true));
+    let control = read_word(&board, link_word(11, LINK_CONTROL));
+    assert_eq!((control >> 18) & 0x1f, 2);
+    assert_eq!(io.pio_write(link_word(11, LINK_CONTROL), 4, (control & !(0x1f << 18)) | 3 << 18), BUS_OK);
+    assert_eq!((read_word(&board, link_word(11, LINK_CONTROL)) >> 18) & 0x1f, 3);
+    assert_eq!(alive_and_present(&board, 11), (true, true));
+    assert_eq!(io.pio_read(widget(11, 4), 4).status, BUS_OK);
+}
+
+/// The processor reaches widget 11 through the crossbar, not around it: a
+/// reset of link 11 or of the hub's link 10 takes widget 11 out of reach
+/// for the pulse, and it answers again, registers kept, once it ends. A
+/// reset of link 15 leaves widget 11 alone.
+#[test]
+fn widget_11_is_routed_through_widget_0s_crossbar() {
+    let (board, now) = board_with_clock(4);
+    let io = &board.node.io;
+    let route = widget(11, 0x130);
+    assert_eq!(io.pio_write(route, 8, 0x1122_3344_5566_7788), BUS_OK);
+    for link in [11, 10] {
+        now.fetch_add(100, Ordering::SeqCst);
+        assert_eq!(io.pio_write(link_word(link, LINK_RESET), 4, 0), BUS_OK);
+        assert_eq!(io.pio_read(route, 8).status, BUS_ERR, "down during link {link}'s pulse");
+        now.fetch_add(20, Ordering::SeqCst);
+        let r = io.pio_read(route, 8);
+        assert_eq!((r.status, r.data), (BUS_OK, 0x1122_3344_5566_7788), "after link {link}'s pulse");
+        assert_eq!(alive_and_present(&board, 11), (true, true));
+    }
+    now.fetch_add(100, Ordering::SeqCst);
+    assert_eq!(io.pio_write(link_word(15, LINK_RESET), 4, 0), BUS_OK);
+    assert_eq!(io.pio_read(route, 8).status, BUS_OK, "link 15's pulse");
+    assert_eq!(io.pio_read(widget(15, 4), 4).status, BUS_ERR);
+    assert_eq!(board.pics[1].pxbow().unwrap().endpoint_widgets(), 1 << 11 | 1 << 15);
+    assert!(board.pics[0].pxbow().is_none(), "the second PIC has no crossbar of its own");
+}
+
 /// Every fitted processor slot reads present, in the board's order (CPU 1
 /// in PI1/A, CPUs 2 and 3 in the B slots), and only CPU 0 is enabled.
 #[test]
@@ -149,6 +335,8 @@ fn board_with(chip: CpuModel) -> TezroBoard {
         memory: &MemoryPopulation::one_gib(),
         cpus: 1,
         chip: self::chip(chip),
+        v12: false,
+        graphics_pool: (2, 32),
     })
     .unwrap()
 }
@@ -292,7 +480,6 @@ fn the_family_name_builds_the_700_mhz_chip_and_a_chip_name_its_own() {
 /// interval of board time while the board runs, not on every batch.
 #[test]
 fn the_poll_retires_lifted_pages_once_an_interval() {
-    use std::sync::atomic::AtomicU64;
     let now = Arc::new(AtomicU64::new(0));
     let clock = now.clone();
     let board = TezroBoard::with_config(TezroBoardConfig {
@@ -304,6 +491,8 @@ fn the_poll_retires_lifted_pages_once_an_interval() {
         memory: &MemoryPopulation::default(),
         cpus: 1,
         chip: &CHIPS[0],
+        v12: false,
+        graphics_pool: (2, 32),
     })
     .unwrap();
     board.running.store(true, Ordering::SeqCst);
@@ -333,4 +522,217 @@ fn the_processor_reads_and_writes_ioc4_registers_in_its_own_byte_order() {
     assert_eq!(io.pio_read(reg(0x24), 4).data, 1, "MISC: the 66 MHz clock");
     assert_eq!(io.pio_write(reg(0x314), 4, 0x3f8), BUS_OK);
     assert_eq!(io.pio_read(reg(0x314), 4).data, 0x3f8, "port 0 TX producer");
+}
+
+// VPro host-interface registers the tests below touch, as byte offsets in
+// the board's widget space. The board's own constants are private to it.
+const ODSY_IDENTITY: u64 = 0x00;
+const ODSY_CMD_FIFO: u64 = 0x11_0000;
+
+fn board_with_v12(cpus: usize) -> TezroBoard {
+    TezroBoard::with_config(TezroBoardConfig {
+        payload: &[],
+        clock: Arc::new(|| 0),
+        flash_path: None,
+        station_mac: L1Config::default().mac,
+        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+        memory: &MemoryPopulation::default(),
+        cpus,
+        chip: &CHIPS[0],
+        v12: true,
+        graphics_pool: (2, 32),
+    })
+    .unwrap()
+}
+
+/// The V12 answers as widget 12 behind the PXBOW on either board, and
+/// widget 12 stays empty without one. (On the one-processor board the
+/// placement is inferred; see V12_WIDGET.)
+#[test]
+fn the_v12_answers_at_widget_12_on_both_boards() {
+    for cpus in [1, 4] {
+        let board = board_with_v12(cpus);
+        let id = board.node.io.pio_read(widget(12, ODSY_IDENTITY), 4);
+        let direct = board.v12.as_ref().unwrap().read32(ODSY_IDENTITY);
+        assert_eq!((id.status, id.data), (BUS_OK, u64::from(direct.data)), "{cpus} CPUs");
+        assert_eq!(board.pics[board.pics.len() - 1].pxbow().unwrap().endpoint_widgets() & (1 << 12), 1 << 12);
+    }
+    assert_eq!(TezroBoard::new(1).unwrap().node.io.pio_read(widget(12, ODSY_IDENTITY), 4).status, BUS_ERR);
+}
+
+/// A CPU 0 store into its enabled graphics page is counted against PI0's
+/// slot A credits, and the credit comes back along the node's graphics map
+/// as the V12 takes the store. A store outside the page costs nothing.
+/// Follows sn1/pi-gfx/ip53-odyssey-credit-return and
+/// uncovered-stores-not-counted in tests/qtest/sn1-pi-gfx-test.c.
+#[test]
+fn a_counted_store_to_the_v12_returns_its_credit() {
+    use crate::dev::bedrock_io::reg::GFX_MAP_BASE;
+    use crate::dev::odyssey::{PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE};
+    let board = board_with_v12(4);
+    let (pi, io, bus) = (&board.node.pi[0], &board.node.io, &board.node.bus);
+    let credit = || pi.read64(0x308).data;
+    // The page holding the V12's command FIFO, enabled, with 1000 credits.
+    let page = widget(12, ODSY_CMD_FIFO) & PI_GFX_PAGE_ADDRESS;
+    assert_eq!(pi.write64(0x300, PI_GFX_PAGE_ENABLE | page), BUS_OK);
+    assert_eq!(pi.write64(0x308, 1000), BUS_OK);
+    // Widget 12's credits go to node 0, PI0, slot A.
+    assert_eq!(io.write64(GFX_MAP_BASE, 12), BUS_OK);
+    let io_view = 1u64 << 57;
+    assert_eq!(bus.write64(io_view | widget(12, ODSY_CMD_FIFO), 0x0001_0046), BUS_OK);
+    assert_eq!(credit(), 1000, "one store, one credit, back");
+    // Outside the page: neither counted nor returned.
+    let _ = bus.write64(io_view | widget(11, 0x100), 0);
+    assert_eq!(credit(), 1000);
+}
+
+/// A counted store the bus answers busy is made again by the processor and
+/// counted again, so the refused attempt must cost nothing: the node puts
+/// the credit back. A refund also undoes a count across the wrap.
+#[test]
+fn a_counted_store_refused_busy_is_refunded() {
+    use crate::dev::odyssey::{PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE};
+    struct Busy;
+    impl BusDevice for Busy {
+        fn write64(&self, _addr: u64, _val: u64) -> u32 {
+            crate::traits::BUS_BUSY
+        }
+    }
+    let board = board_with_v12(1);
+    let (pi, bus) = (&board.node.pi[0], &board.node.bus);
+    board.node.io.connect_widget(9, Arc::new(Busy));
+    let page = widget(9, 0) & PI_GFX_PAGE_ADDRESS;
+    assert_eq!(pi.write64(0x300, PI_GFX_PAGE_ENABLE | page), BUS_OK);
+    assert_eq!(pi.write64(0x308, 5), BUS_OK);
+    let io_view = 1u64 << 57;
+    assert_eq!(bus.write64(io_view | widget(9, 0), 0), crate::traits::BUS_BUSY);
+    assert_eq!(pi.read64(0x308).data, 5, "refunded");
+    assert_eq!(pi.write64(0x308, 0), BUS_OK);
+    assert_eq!(bus.write64(io_view | widget(9, 0), 0), crate::traits::BUS_BUSY);
+    assert_eq!(pi.read64(0x308).data, 0, "back across the wrap");
+}
+
+/// Follows sn1/pi-gfx/map-rewrite-settles-owed-credits: owed credits are
+/// delivered when the entry naming the widget is rewritten, a write of the
+/// value already there settles nothing, a repayment of settled credits is
+/// dropped, one still owed is routed, and a reset's abandonment cancels
+/// what it threw away.
+#[test]
+fn a_map_rewrite_settles_owed_credits() {
+    let mut l = OwedCredits::default();
+    let entry = 0xc;
+    l.owe(0xc, 5);
+    assert_eq!(l.settle(entry, entry), None, "same value");
+    assert_eq!(l.settle(entry, 0), Some((0xc, 5)));
+    assert_eq!(l.repay(0xc, 5), 0, "already settled");
+    assert_eq!(l.settle(0, entry), None, "widget 0 owes nothing");
+    l.owe(0xc, 3);
+    assert_eq!(l.repay(0xc, 2), 2);
+    l.owe(0xc, -1);
+    assert_eq!(l.settle(entry, 0), None, "nothing left owed");
+    l.owe(0xb, -1);
+    assert_eq!(l, OwedCredits::default(), "never below zero");
+}
+
+/// On the board, credits the V12 owes reach PI0's slot A when the map
+/// entry naming widget 12 is rewritten, under the entry as it stood, and
+/// the V12's later repayment of them is dropped.
+#[test]
+fn the_board_settles_the_v12s_owed_credits_on_a_map_write() {
+    use crate::dev::bedrock_io::reg::GFX_MAP_BASE;
+    let board = board_with_v12(4);
+    let (pi, io) = (&board.node.pi[0], &board.node.io);
+    let link = board.v12.as_ref().unwrap().pi_link().unwrap();
+    assert_eq!(pi.write64(0x308, 100), BUS_OK);
+    assert_eq!(io.write64(GFX_MAP_BASE, 12), BUS_OK);
+    link.owe_credits(12, 8);
+    assert_eq!(pi.read64(0x308).data, 100, "owed, not yet returned");
+    assert_eq!(io.write64(GFX_MAP_BASE, 0), BUS_OK, "the detach");
+    assert_eq!(pi.read64(0x308).data, 108);
+    assert_eq!(io.write64(GFX_MAP_BASE, 12), BUS_OK);
+    link.repay_credits(12, 8);
+    assert_eq!(pi.read64(0x308).data, 108, "settled credits are not paid twice");
+    link.owe_credits(12, 2);
+    link.repay_credits(12, 2);
+    assert_eq!(pi.read64(0x308).data, 110);
+}
+
+fn stalled_gfx(credits: u64, bias: u64) -> (BedrockGfx, Arc<std::sync::atomic::AtomicU64>) {
+    use crate::dev::odyssey::{PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_PAGE, PI_GFX_PAGE_ENABLE};
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = now.clone();
+    let mut g = BedrockGfx::new(Arc::new(move || clock.load(Ordering::SeqCst)));
+    g.write(PI_GFX_PAGE, PI_GFX_PAGE_ENABLE | GFX_PAGE);
+    g.write(PI_GFX_CREDIT, credits);
+    g.write(PI_GFX_BIAS, bias);
+    (g, now)
+}
+
+const GFX_PAGE: u64 = 0x0140_0000;
+
+/// Follows sn1/pi-gfx/stall-below-bias: below the bias the slot stops and
+/// its next counted store waits, uncounted, until credits lift the counter
+/// above the bias or the processor takes the interrupt; each counted store
+/// below the bias asks for the interrupt again. Stores outside the page
+/// and the other slot go on.
+#[test]
+fn a_slot_below_its_bias_holds_its_next_store() {
+    use crate::dev::odyssey::{PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_INT_COUNT};
+    let (mut g, _) = stalled_gfx(6, 5);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: false }, "at the bias");
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held);
+    assert_eq!(g.read(PI_GFX_CREDIT), 4, "a held store is not counted");
+    assert_eq!(g.store(0, 0x0142_0158), Store::Uncounted);
+    assert_eq!(g.store(1, GFX_PAGE), Store::Uncounted);
+    g.add_credits(0, 1);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held, "5 is not above the bias");
+    g.add_credits(0, 1);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: false });
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    g.taken(0);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true }, "taken: goes at once");
+    g.write(PI_GFX_INT_COUNT, 0);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true }, "the handler's counter write");
+    g.write(PI_GFX_BIAS, 0);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: false }, "a lower bias");
+}
+
+/// The hold is bounded, as QEMU's is, so a slot nobody releases cannot
+/// stop its processor for good.
+#[test]
+fn a_held_store_goes_after_the_limit() {
+    use crate::dev::odyssey::PI_GFX_CREDIT;
+    let (mut g, now) = stalled_gfx(3, 5);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    now.store(10, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held);
+    now.store(10 + STALL_LIMIT_NS - 1, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held);
+    now.store(10 + STALL_LIMIT_NS, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Counted { below_bias: true });
+    assert_eq!(g.read(PI_GFX_CREDIT), 1);
+    now.store(20 + STALL_LIMIT_NS, Ordering::SeqCst);
+    assert_eq!(g.store(0, GFX_PAGE), Store::Held, "and stops again");
+}
+
+/// On the board a held store is answered busy without reaching the V12,
+/// and the PI's pending-modify clear of the slot's graphics bit, which the
+/// processor's interrupt handler makes, lets the next one go.
+#[test]
+fn the_board_holds_pi0s_store_below_the_bias_until_the_interrupt_is_taken() {
+    use crate::dev::odyssey::{PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE};
+    let board = board_with_v12(4);
+    let (pi, bus) = (&board.node.pi[0], &board.node.bus);
+    let page = widget(12, ODSY_CMD_FIFO) & PI_GFX_PAGE_ADDRESS;
+    assert_eq!(pi.write64(0x300, PI_GFX_PAGE_ENABLE | page), BUS_OK);
+    assert_eq!(pi.write64(0x308, 1000), BUS_OK);
+    assert_eq!(pi.write64(0x310, 1000), BUS_OK, "slot A's bias");
+    let io_view = 1u64 << 57;
+    let store = || bus.write64(io_view | widget(12, ODSY_CMD_FIFO), 0x0001_0046);
+    assert_eq!(store(), BUS_OK, "999 is below the bias: the slot stops");
+    assert_eq!(store(), crate::traits::BUS_BUSY);
+    assert_eq!(pi.read64(0x308).data, 999, "held, not counted; no map entry returns credits");
+    assert_eq!(pi.write64(0x90, 1), BUS_OK, "pending-modify: clear bit 1");
+    assert_eq!(store(), BUS_OK);
 }

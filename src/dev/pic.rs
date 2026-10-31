@@ -13,7 +13,8 @@
 //! are the board's choice, made by the machine.
 //!
 //! Widget 0 of the board is the PXBOW of the PIC that carries IO9
-//! ([`Pic::enable_pxbow`]); the other PIC has none.
+//! ([`Pic::enable_pxbow`]); the other PIC has none of its own and is
+//! attached behind that one ([`Pxbow::attach_endpoint`]).
 //!
 //! The register names are the ones the Bridge family shares
 //! ([`xbridge::reg`](super::xbridge::reg)); the PIC leaves out the ATE, the

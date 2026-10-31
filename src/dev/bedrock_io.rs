@@ -72,7 +72,7 @@ pub mod bte_reg {
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::ThreadId;
 const ID: u64 = (2 << 28) | (0xc110 << 12) | (0x36 << 1);
 const ADDR_MASK: u64 = 0xffffffff80;
@@ -133,7 +133,12 @@ pub struct BedrockIo {
     widgets: Mutex<[Option<Arc<dyn BusDevice>>; 16]>,
     memory: Mutex<Option<Arc<dyn BusDevice>>>,
     hub: Mutex<Option<Arc<dyn BusDevice>>>,
+    gfx_map_written: OnceLock<GfxMapHook>,
 }
+/// Told of a store to graphics map entry `entry`: its old value, then the
+/// new one. Runs before the new value takes effect, without the register
+/// lock, so it may read the map as it stood.
+pub type GfxMapHook = Box<dyn Fn(usize, u64, u64) + Send + Sync>;
 impl Default for BedrockIo {
     fn default() -> Self {
         Self::new()
@@ -149,7 +154,13 @@ impl BedrockIo {
             widgets: Mutex::new(std::array::from_fn(|_| None)),
             memory: Mutex::new(None),
             hub: Mutex::new(None),
+            gfx_map_written: OnceLock::new(),
         }
+    }
+    /// Watch stores to the graphics map, as a board whose head owes credits
+    /// must (see [`crate::ip53_machine::OwedCredits`]). Once.
+    pub fn on_gfx_map_write(&self, hook: GfxMapHook) {
+        assert!(self.gfx_map_written.set(hook).is_ok(), "graphics map hook already set");
     }
     pub fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
         assert!(widget < 16);
@@ -516,6 +527,10 @@ impl BusDevice for BedrockIo {
         if a & 7 != 0 {
             return BUS_ERR;
         }
+        if let (Some(hook), true) = (self.gfx_map_written.get(), a == reg::GFX_MAP_BASE || a == reg::GFX_MAP_BASE + 8) {
+            let entry = ((a - reg::GFX_MAP_BASE) / 8) as usize;
+            hook(entry, self.gfx_map(entry), v);
+        }
         let mut r = self.regs.lock();
         if let Some((n, offset)) = Self::bte_at(a) {
             let b = &mut r.bte[n];
@@ -581,6 +596,26 @@ impl BusDevice for BedrockIo {
         }
         BUS_OK
     }
+}
+
+/// Where a widget's graphics credits go, as a graphics map entry names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GfxRoute {
+    pub node: u8,
+    pub interface: usize,
+    pub slot: usize,
+}
+
+/// The graphics map's route for `widget`: widget in bits 3:0, interface in
+/// bit 4, node in bits 12:5 and slot in bit 16 (Linux sn1/hubio_next.h,
+/// IIO_IGFX_INIT). There is no valid bit; the first entry naming the widget
+/// wins.
+pub fn gfx_route(map: [u64; 2], widget: u8) -> Option<GfxRoute> {
+    map.into_iter().find(|entry| entry & 0xf == u64::from(widget)).map(|entry| GfxRoute {
+        node: ((entry >> 5) & 0xff) as u8,
+        interface: ((entry >> 4) & 1) as usize,
+        slot: ((entry >> 16) & 1) as usize,
+    })
 }
 
 #[cfg(test)]
@@ -807,5 +842,14 @@ mod tests {
             *memory.words.lock(),
             BTreeMap::from([(0x1000, 0x1234), (0x2000, 0x5678)])
         );
+    }
+
+    #[test]
+    fn the_graphics_map_names_node_interface_and_slot_and_the_first_match_wins() {
+        let entry = |node: u64, pi: u64, slot: u64, widget: u64| (slot << 16) | (node << 5) | (pi << 4) | widget;
+        let map = [entry(3, 1, 1, 0xc), entry(0, 0, 0, 0xc)];
+        assert_eq!(gfx_route(map, 0xc), Some(GfxRoute { node: 3, interface: 1, slot: 1 }));
+        assert_eq!(gfx_route(map, 0xb), None);
+        assert_eq!(gfx_route([0, 0], 0), Some(GfxRoute { node: 0, interface: 0, slot: 0 }), "no valid bit");
     }
 }

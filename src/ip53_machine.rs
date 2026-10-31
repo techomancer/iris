@@ -6,7 +6,8 @@
 //! NVRAM, memory and SCSI devices; `[tezro]` selects the processor
 //! population, the serial console and writable flash. The node itself is
 //! the one the Fuel uses ([`Node`]); this board adds its widgets and its
-//! inputs. Graphics is not attached.
+//! inputs. With `[graphics] board = "v12"` a VPro V12 sits at widget 12
+//! behind the PXBOW; otherwise there is no graphics.
 //!
 //! The board follows the QEMU Tezro compositions:
 //!
@@ -14,11 +15,13 @@
 //!   four-processor board adds a second at widget 11, with nothing on its
 //!   buses, and a V12 slot at widget 12 that is left empty. The PIC at
 //!   widget 15 is the IO9's: its PXBOW answers as widget 0 and forwards
-//!   the processor's accesses to widget 15. Its head 0 carries the IO9 PCI
-//!   bus: the IOC4 at device 1 (input 0), the ISP12160 at device 3 (input 2)
-//!   and the BCM5701 at device 4 (input 3), with REQ64# wired on the
-//!   BCM5701's slot. The PIC's interrupts and DMA go to Bedrock IO, the
-//!   host widget 10.
+//!   the processor's accesses to widget 15. On the larger board it carries
+//!   widget 11 too, and shows that link present and alive (unlike QEMU's
+//!   composition, below). Its head 0 carries the IO9 PCI bus: the IOC4 at
+//!   device 1 (input 0), the ISP12160 at device 3 (input 2) and the
+//!   BCM5701 at device 4 (input 3), with REQ64# wired on the BCM5701's
+//!   slot. The PIC's interrupts and DMA go to Bedrock IO, the host widget
+//!   10.
 //! - The IOC4 carries the DS1744-compatible clock and NVRAM in its BAR and
 //!   the PS/2 keyboard and mouse; its four ports are serial streams beside
 //!   the L1's, and the L1 is the console by default.
@@ -39,8 +42,17 @@
 //! - Only CPU 0 runs. The other fitted processors read present and stay
 //!   disabled; what would start or reach them is refused and logged by the
 //!   Bedrock PI.
-//! - The second PIC is reached directly. QEMU gives it a PXBOW too, whose
-//!   widget 0 nothing maps, so only its link-reset timing differs.
+//! - The second PIC is a port of the IO9 PIC's PXBOW, beside the host's
+//!   and the IO9 PIC's links: the PROM and IRIX learn which widgets exist
+//!   only from widget 0's link status and auxiliary status, so one
+//!   crossbar per node carries both PICs. That is a modelling consequence
+//!   of the discovery path, not a known route: whether the second PIC has
+//!   a crossbar of its own in front of it, and its part (0xd102 or 0xd112)
+//!   and link reset values beyond alive and present, are unknown. QEMU's
+//!   composition still gives the second PIC its own PXBOW, whose widget 0
+//!   nothing maps, and leaves link 11 absent on the IO9 PIC's. The second
+//!   PIC's interrupts and DMA reach Bedrock IO directly, as the IO9 PIC's
+//!   do, rather than through the crossbar.
 //! - PIC DMA aimed at a widget other than Bedrock IO is refused and logged,
 //!   as the Fuel's XBridge path refuses it.
 //! - No EEPROM image is fitted for the IO9, the node board or the BCM5701:
@@ -50,7 +62,7 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
-use crate::config::{scsi_label, CpuModel, MachineConfig, TezroConsole};
+use crate::config::{scsi_label, CpuModel, GraphicsBoard, MachineConfig, TezroConsole};
 use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::cpu_monitor::CpuMonitor;
@@ -58,15 +70,20 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::smp::World;
 use crate::dev::bcm5701::{Bcm5701, Bcm5701Config};
 use crate::dev::bedrock_flash::FirmwareRecord;
-use crate::dev::bedrock_io::BedrockIo;
+use crate::dev::bedrock_io::{gfx_route, BedrockIo};
 use crate::dev::bedrock_mem::MemoryPopulation;
-use crate::dev::bedrock_pi::Population;
+use crate::dev::bedrock_pi::{BedrockPi, NodeHooks, Population};
 use crate::dev::ds1744::{Ds1744, YearBase};
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::L1Config;
+use crate::dev::odyssey::{
+    Odyssey, PacketSender, PiGfx, PiGfxLink, PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_CREDIT_MASK, PI_GFX_INT_COUNT,
+    PI_GFX_REGS, PI_GFX_SLOTS, PI_GFX_SLOT_REGS,
+};
 use crate::dev::pic::{Function, Pic, PicPeer, Refused};
+use crate::dev::pxbow::Pxbow;
 use crate::dev::prom_image;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::serial_host::CiSerialBackend;
@@ -75,7 +92,7 @@ use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
 use crate::ip35::CPU_PHYS_MASK;
-use crate::ip35::node::{connect_cpu, connect_serial_ports, Node, NodeConfig, SerialPort};
+use crate::ip35::node::{connect_cpu, connect_serial_ports, Node, NodeConfig, SerialPort, Store, StoreCounter, WidgetDma};
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
@@ -254,12 +271,16 @@ impl TezroMachine {
             memory: &memory,
             cpus: usize::from(cfg.machine.cpus()),
             chip,
+            v12: cfg.graphics_board() == GraphicsBoard::V12,
+            graphics_pool: (cfg.graphics.threads, cfg.graphics.tile),
         })?);
         let timers = Arc::new(TimerManager::new());
         board.ioc4.set_timer_manager(timers.clone());
         let count_hz = cfg.clock.fixed_mhz.map_or(chip.chip.count_hz(), |mhz| (mhz * 1_000_000.0) as u64).max(1);
         let cpus = build_cpus(&board, &timers, count_hz);
         let cpu = cpus[0].clone();
+        board.status.set_cpu_cycles(cpu.cycles_ptr());
+        board.status.set_count_hz(cpu.count_hz_atomic());
         let node = &board.node;
         // A rebuild of the whole memory map runs with the other processors
         // parked; with one running there is nobody to park.
@@ -319,10 +340,11 @@ impl TezroMachine {
             board.eth.attach(link);
         }
         eprintln!(
-            "iris: Tezro IP53, {} R16000 {} MHz fitted, CPU 0 running, {} MiB, serial console {:?}",
+            "iris: Tezro IP53, {} R16000 {} MHz fitted, CPU 0 running, {} MiB, {}, serial console {:?}",
             cfg.machine.cpus(),
             chip.chip.mhz(),
             memory.total_mib(),
+            if board.v12.is_some() { cfg.graphics_board().label() } else { "no graphics" },
             cfg.tezro.console
         );
         Ok(Self {
@@ -444,7 +466,7 @@ impl Workstation for TezroMachine {
         self.lifecycle = state;
     }
     fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        None
+        self.board.v12.as_ref().map(|v12| v12.display())
     }
     fn register_monitor_device(&self, device: Arc<dyn Device>) {
         self.monitor.register_device(device);
@@ -544,6 +566,8 @@ where
     MipsCpu<MipsTlb, C>: CpuDevice,
 {
     let mut exec = build_cpu::<C>(board);
+    // The CPU's Compare matches blink the graphics status bar's LED.
+    exec.core.fasttick_count = board.fasttick.clone();
     exec.core.set_timer_manager(timers.clone());
     exec.core.set_count_hz(count_hz);
     exec.core.count_write_samples = true;
@@ -592,6 +616,10 @@ pub(crate) struct TezroBoardConfig<'a> {
     pub cpus: usize,
     /// The R16000 chip fitted.
     pub chip: &'static TezroChip,
+    /// A VPro V12 at widget 12.
+    pub v12: bool,
+    /// Rendering threads and tile size for the V12.
+    pub graphics_pool: (usize, u32),
 }
 
 /// The Tezro's devices around its Bedrock node.
@@ -607,6 +635,17 @@ pub(crate) struct TezroBoard {
     pub serial: [Arc<CiSerialBackend>; SERIAL_PORTS],
     /// The R16000 chip fitted, whose flash record the node holds.
     pub chip: &'static TezroChip,
+    /// The VPro V12, when the board has one.
+    pub v12: Option<Arc<Odyssey>>,
+    /// Each PI's graphics flow-control registers.
+    pub gfx: [Arc<Mutex<BedrockGfx>>; 2],
+    /// The status bar's activity bits and the CPU's Compare matches, which
+    /// the graphics board shows.
+    pub heartbeat: Arc<AtomicU64>,
+    pub fasttick: Arc<AtomicU64>,
+    /// What the graphics board's status bar shows: the activity bits, the
+    /// Compare matches and the CPU's cycle count and Count rate.
+    pub status: Arc<crate::disp::StatusSource>,
     clock: Clock,
     last_clock: AtomicU64,
     /// When the poll last returned lifted checked pages to the direct window.
@@ -631,11 +670,13 @@ impl TezroBoard {
             memory: &MemoryPopulation::default(),
             cpus,
             chip: &CHIPS[0],
+            v12: false,
+            graphics_pool: (2, 32),
         })
     }
 
     pub fn with_config(config: TezroBoardConfig<'_>) -> Result<Self, String> {
-        let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus, chip } = config;
+        let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus, chip, v12, graphics_pool } = config;
         if ![1, 2, 4].contains(&cpus) {
             return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
         }
@@ -666,11 +707,24 @@ impl TezroBoard {
         let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
         node.io.connect_widget(0, pxbow.widget_zero());
         node.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
+        let gfx: [Arc<Mutex<BedrockGfx>>; 2] = std::array::from_fn(|_| Arc::new(Mutex::new(BedrockGfx::new(clock.clone()))));
+        for (pi, gfx) in node.pi.iter().zip(&gfx) {
+            pi.set_node_hooks(Arc::new(GfxHooks(gfx.clone())));
+        }
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let fasttick = Arc::new(AtomicU64::new(0));
+        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+        let v12 = v12.then(|| fit_v12(&node, &pxbow, &gfx, &status, graphics_pool)).transpose()?;
         let pics = if cpus == 1 {
             vec![io9.clone()]
         } else {
+            // The PROM finds widget 11 only as a live link of widget 0's
+            // crossbar, so the second PIC is a port of the same switch.
             let second = Pic::new(SECOND_PIC_WIDGET);
-            node.io.connect_widget(SECOND_PIC_WIDGET, second.widget());
+            pxbow
+                .attach_endpoint(SECOND_PIC_WIDGET, second.widget())
+                .map_err(|e| format!("Tezro: second PIC on the PXBOW: {e:?}"))?;
+            node.io.connect_widget(SECOND_PIC_WIDGET, pxbow.route(SECOND_PIC_WIDGET));
             vec![second, io9.clone()]
         };
         for (index, pic) in pics.iter().enumerate() {
@@ -688,6 +742,7 @@ impl TezroBoard {
             ioc4.set_serial_backend(port, backend.clone());
         }
         let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+        scsi.set_heartbeat(heartbeat.clone());
         let eth = Bcm5701::new(Bcm5701Config::new(node.l1.station_mac()))?;
         io9.attach(0, IOC4_DEVICE, ioc4.clone(), Function { self_ordered_pio: true, req64: false });
         io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
@@ -704,6 +759,11 @@ impl TezroBoard {
             timekeeper,
             serial,
             chip,
+            v12,
+            gfx,
+            heartbeat,
+            fasttick,
+            status,
             last_clock: AtomicU64::new(clock()),
             last_retire: AtomicU64::new(clock()),
             clock,
@@ -736,9 +796,18 @@ impl TezroBoard {
         for pic in &self.pics {
             pic.power_on();
         }
+        for gfx in &self.gfx {
+            gfx.lock().reset();
+        }
+        if let Some(v12) = &self.v12 {
+            v12.power_on();
+        }
     }
 
     pub fn start(&self) {
+        if let Some(v12) = &self.v12 {
+            v12.start();
+        }
         self.last_clock.store((self.clock)(), Ordering::Release);
         self.node.md.start_clock();
         self.running.store(true, Ordering::Release);
@@ -771,6 +840,9 @@ impl TezroBoard {
 
     pub fn stop(&self) {
         self.poll();
+        if let Some(v12) = &self.v12 {
+            v12.stop();
+        }
         self.running.store(false, Ordering::Release);
         self.node.md.stop_clock();
         self.scsi.stop();
@@ -786,6 +858,301 @@ impl TezroBoard {
 impl Drop for TezroBoard {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Where the V12 sits: widget 12 of the crossbar behind the PIC that owns
+/// widget 0. On the two- and four-processor board this is QEMU's graphics
+/// slot. On the one-processor board the tower guide gives one XIO connector
+/// for a VPro board but names neither its widget nor its route; widget 12
+/// behind the same PXBOW is inferred, not established.
+const V12_WIDGET: u8 = 12;
+
+/// The longest a stopped slot holds a store before letting it go.
+const STALL_LIMIT_NS: u64 = 1_000_000_000;
+
+/// One Bedrock PI's graphics flow control: the register block, and the
+/// Bedrock's stop below the bias. A counted store that leaves the counter
+/// below the bias raises the slot's graphics interrupt and stops the slot:
+/// its next counted store waits until the processor has taken the
+/// interrupt, software has written the counter, the bias or the interrupt
+/// count, or returned credits have lifted the counter above the bias (the
+/// SN1 header's credit-counter comment, as QEMU's Bedrock models it). A
+/// waiting store is answered busy, so the processor makes it again; it is
+/// counted once, when it goes.
+///
+/// Approximations: whether the edge is below the bias or at it is unknown;
+/// below, QEMU's reading. How long the chip holds a store is unknown: after
+/// STALL_LIMIT_NS of host time the hold ends and is logged, QEMU's bound. A
+/// held processor here retries the store and can take an interrupt between
+/// attempts, where the chip holds the store itself.
+pub(crate) struct BedrockGfx {
+    regs: PiGfx,
+    /// When each slot's waiting store was first held.
+    held_since: [Option<u64>; PI_GFX_SLOTS],
+    clock: Clock,
+}
+
+impl BedrockGfx {
+    fn new(clock: Clock) -> Self {
+        Self { regs: PiGfx::default(), held_since: [None; PI_GFX_SLOTS], clock }
+    }
+
+    fn reset(&mut self) {
+        self.regs = PiGfx::default();
+        self.held_since = [None; PI_GFX_SLOTS];
+    }
+
+    fn read(&self, n: u32) -> u64 {
+        self.regs.read(n)
+    }
+
+    fn write(&mut self, n: u32, value: u64) {
+        self.regs.write(n, value);
+        let slot = (n / PI_GFX_SLOT_REGS) as usize;
+        match n % PI_GFX_SLOT_REGS {
+            PI_GFX_CREDIT | PI_GFX_BIAS => self.release_if_above(slot),
+            // IRIX's graphics interrupt handler zeroes it.
+            PI_GFX_INT_COUNT => self.release(slot),
+            _ => {}
+        }
+    }
+
+    /// A store `slot`'s processor makes at I/O offset `address`.
+    fn store(&mut self, slot: usize, address: u64) -> Store {
+        if !self.regs.covers(slot, address) {
+            return Store::Uncounted;
+        }
+        if self.regs.stopped[slot] {
+            let now = (self.clock)();
+            let since = *self.held_since[slot].get_or_insert(now);
+            if now.saturating_sub(since) < STALL_LIMIT_NS {
+                return Store::Held;
+            }
+            dlog!(
+                LogModule::Bedrock,
+                "PI graphics slot {} held for {} ms with the counter at {:#x} and the interrupt not taken; letting the store go",
+                slot_name(slot),
+                STALL_LIMIT_NS / 1_000_000,
+                self.regs.credit[slot]
+            );
+            self.release(slot);
+        }
+        self.regs.count_store(slot, address, "Tezro PI");
+        let below_bias = self.regs.credit[slot] < self.regs.bias[slot];
+        if below_bias {
+            self.regs.stopped[slot] = true;
+        }
+        Store::Counted { below_bias }
+    }
+
+    /// The processor took the slot's graphics interrupt.
+    fn taken(&mut self, slot: usize) {
+        self.release(slot);
+    }
+
+    /// Put back exactly the credit a count took. Unlike a returned credit
+    /// this never wraps the counter up, since it only undoes a count.
+    fn refund(&mut self, slot: usize) {
+        self.regs.credit[slot] = (self.regs.credit[slot] + 1) & PI_GFX_CREDIT_MASK;
+        self.release_if_above(slot);
+    }
+
+    fn add_credits(&mut self, slot: usize, credits: u32) {
+        self.regs.add_credits(slot, credits, "Tezro PI");
+        self.release_if_above(slot);
+    }
+
+    fn release(&mut self, slot: usize) {
+        self.regs.stopped[slot] = false;
+        self.held_since[slot] = None;
+    }
+
+    fn release_if_above(&mut self, slot: usize) {
+        if self.regs.credit[slot] > self.regs.bias[slot] {
+            self.release(slot);
+        }
+    }
+}
+
+fn slot_name(slot: usize) -> char {
+    (b'A' + slot as u8) as char
+}
+
+/// A PI's graphics flow-control registers, served from its block.
+struct GfxHooks(Arc<Mutex<BedrockGfx>>);
+impl NodeHooks for GfxHooks {
+    fn gfx_read(&self, index: usize) -> Option<u64> {
+        (index < PI_GFX_REGS as usize).then(|| self.0.lock().read(index as u32))
+    }
+    fn gfx_write(&self, index: usize, value: u64) -> bool {
+        if index >= PI_GFX_REGS as usize {
+            return false;
+        }
+        self.0.lock().write(index as u32, value);
+        true
+    }
+    fn gfx_reset(&self) {
+        self.0.lock().reset();
+    }
+    fn gfx_interrupt_taken(&self, slot: usize) {
+        self.0.lock().taken(slot);
+    }
+}
+
+/// The node's end of the V12's credit return: a widget's credits go to the
+/// interface and slot the node's graphics map names. Only node 0's own
+/// interfaces are reachable.
+///
+/// A head reports a counted store it cannot take into its FIFO yet as owed,
+/// and the node keeps a ledger of what each widget owes. A write to a map
+/// entry first settles the debt of the widget the entry names, under the
+/// entry as it stood, and drops the head's later repayments of it. IRIX's
+/// detach zeroes the processor's entry and then saves the counter for the
+/// next attach, so a credit arriving after the detach would be lost to every
+/// later attach of that flow. This is the QEMU model's choice for a board
+/// slower than the real one, not a known property of the I/O interface.
+struct NodeCredits {
+    io: Weak<BedrockIo>,
+    gfx: [Arc<Mutex<BedrockGfx>>; 2],
+    owed: Mutex<OwedCredits>,
+}
+impl NodeCredits {
+    /// Credits from `widget`, to the slot `map` names.
+    fn route(&self, map: [u64; 2], widget: u8, n: u32) {
+        match gfx_route(map, widget) {
+            Some(r) if r.node == 0 => self.gfx[r.interface].lock().add_credits(r.slot, n),
+            other => dlog!(LogModule::Bedrock, "Tezro: {n} V12 credits for widget {widget} have no local route ({other:?})"),
+        }
+    }
+
+    fn route_now(&self, widget: u8, n: u32) {
+        if let Some(io) = self.io.upgrade() {
+            self.route([io.gfx_map(0), io.gfx_map(1)], widget, n);
+        }
+    }
+
+    /// A store replacing graphics map entry `entry`'s value `old` with `new`.
+    fn map_written(&self, entry: usize, old: u64, new: u64) {
+        let Some(io) = self.io.upgrade() else { return };
+        if let Some((widget, credits)) = self.owed.lock().settle(old, new) {
+            let mut map = [io.gfx_map(0), io.gfx_map(1)];
+            map[entry] = old;
+            self.route(map, widget, credits);
+        }
+    }
+}
+impl PiGfxLink for NodeCredits {
+    fn return_credits(&self, widget: u32, n: u32) {
+        self.route_now(widget as u8, n);
+    }
+    fn owe_credits(&self, widget: u32, n: i32) {
+        self.owed.lock().owe(widget as u8, n);
+    }
+    fn repay_credits(&self, widget: u32, n: u32) {
+        let due = self.owed.lock().repay(widget as u8, n);
+        if due != 0 {
+            self.route_now(widget as u8, due);
+        }
+    }
+}
+
+/// The credits each of a node's sixteen widgets owes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwedCredits([u32; 16]);
+
+impl OwedCredits {
+    /// `n` more credits owed by `widget`; a negative count cancels owed
+    /// credits a head reset threw away, never below zero.
+    pub fn owe(&mut self, widget: u8, n: i32) {
+        let owed = &mut self.0[usize::from(widget & 0xf)];
+        *owed = if n >= 0 { owed.saturating_add(n as u32) } else { owed.saturating_sub(n.unsigned_abs()) };
+    }
+
+    /// `n` owed credits repaid: what is still owed of them, to route now. A
+    /// repayment of credits already settled routes nothing.
+    pub fn repay(&mut self, widget: u8, n: u32) -> u32 {
+        let owed = &mut self.0[usize::from(widget & 0xf)];
+        let repaid = n.min(*owed);
+        *owed -= repaid;
+        repaid
+    }
+
+    /// A store replacing graphics map entry `old` with `new`: the widget
+    /// `old` names and the credits it owed, to route under `old` before the
+    /// new value takes effect. Rewriting the same value settles nothing.
+    pub fn settle(&mut self, old: u64, new: u64) -> Option<(u8, u32)> {
+        let widget = (old & 0xf) as u8;
+        if old == new || self.0[usize::from(widget)] == 0 {
+            return None;
+        }
+        Some((widget, std::mem::take(&mut self.0[usize::from(widget)])))
+    }
+}
+
+/// Fit the V12 behind the PXBOW: CPU 0's (PI0 slot A) stores into its
+/// graphics page are counted, the board's returned credits go where the
+/// node's graphics map sends them, its interrupt packets and DMA reach
+/// Bedrock IO as the PIC's do.
+fn fit_v12(
+    node: &Node,
+    pxbow: &Arc<Pxbow>,
+    gfx: &[Arc<Mutex<BedrockGfx>>; 2],
+    status: &Arc<crate::disp::StatusSource>,
+    graphics_pool: (usize, u32),
+) -> Result<Arc<Odyssey>, String> {
+    let io = Arc::downgrade(&node.io);
+    let packets: PacketSender = Arc::new(move |widget, address, vector, set| {
+        if widget != HOST_WIDGET {
+            dlog!(LogModule::Bedrock, "Tezro: V12 interrupt to widget {widget} refused; only Bedrock IO is reachable");
+            return false;
+        }
+        let Some(io) = io.upgrade() else { return false };
+        let payload = u64::from(vector) | if set { 1 << 8 } else { 0 };
+        io.inbound_write(V12_WIDGET, Some(INBOUND_DEVICE), address, 8, payload) == BUS_OK
+    });
+    let dma = Arc::new(WidgetDma { io: Arc::downgrade(&node.io), widget: V12_WIDGET });
+    let v12 = Odyssey::new_widget_relative(
+        V12_WIDGET,
+        GraphicsBoard::V12.as_str(),
+        packets,
+        dma,
+        status.clone(),
+        graphics_pool,
+    )?;
+    let credits = Arc::new(NodeCredits { io: Arc::downgrade(&node.io), gfx: gfx.clone(), owed: Mutex::default() });
+    v12.set_pi_link(credits.clone());
+    let settle = Arc::downgrade(&credits);
+    node.io.on_gfx_map_write(Box::new(move |entry, old, new| {
+        if let Some(credits) = settle.upgrade() {
+            credits.map_written(entry, old, new);
+        }
+    }));
+    pxbow
+        .attach_endpoint(V12_WIDGET, v12.clone() as Arc<dyn BusDevice>)
+        .map_err(|e| format!("Tezro V12: {e:?}"))?;
+    node.io.connect_widget(V12_WIDGET, pxbow.route(V12_WIDGET));
+    node.count_io_stores(Box::new(Cpu0Stores { pi: node.pi[0].clone(), gfx: gfx[0].clone() }));
+    Ok(v12)
+}
+
+/// CPU 0's uncached I/O stores, counted against PI0 slot A, the only
+/// processor that runs.
+struct Cpu0Stores {
+    pi: Arc<BedrockPi>,
+    gfx: Arc<Mutex<BedrockGfx>>,
+}
+impl StoreCounter for Cpu0Stores {
+    fn count(&self, address: u64) -> Store {
+        let store = self.gfx.lock().store(0, address);
+        if store == (Store::Counted { below_bias: true }) {
+            // The slot's graphics interrupt: bit 1 + slot of bank 0.
+            self.pi.set_pending(0, 1);
+        }
+        store
+    }
+    fn refund(&self, _address: u64) {
+        self.gfx.lock().refund(0);
     }
 }
 
