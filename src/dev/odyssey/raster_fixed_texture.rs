@@ -299,12 +299,11 @@ impl<'a> SoftDraw<'a> {
             let size = (f.level[i].width as usize) * (f.level[i].height as usize);
 
             if store.size < size {
-                store.cell = Vec::new();
-                store.tag = Vec::new();
+                store.cells = Vec::new();
                 store.size = 0;
-                match (soft_fixed_alloc(size), soft_fixed_alloc(size)) {
-                    (Some(cell), Some(tag)) => (store.cell, store.tag) = (cell, tag),
-                    _ => return false,
+                match soft_fixed_alloc(size) {
+                    Some(cells) => store.cells = cells,
+                    None => return false,
                 }
                 store.size = size;
             }
@@ -327,12 +326,13 @@ impl<'a> SoftDraw<'a> {
     pub fn fixed_fill(&self, store: &mut SoftFixedStore, index: usize, i: u32, x: u32, y: u32, tag: u32) -> Option<u64> {
         match self.fixed_read(self.fixed_tex(), i, x, y) {
             Some(texel) => {
-                store.tag[index] = tag;
-                store.cell[index] = soft_fixed_lanes(texel);
-                Some(store.cell[index])
+                let lanes = soft_fixed_lanes(texel);
+
+                store.cells[index] = SoftFixedCell { lanes, tag };
+                Some(lanes)
             }
             None => {
-                store.tag[index] = tag | SGI_SOFT_FIXED_FAILED;
+                store.cells[index].tag = tag | SGI_SOFT_FIXED_FAILED;
                 None
             }
         }
@@ -422,13 +422,13 @@ impl<'a> SoftDraw<'a> {
         };
         let tag = cache.tag;
         let store = &mut cache.fixed[i as usize];
-        let cell = store.tag[index];
+        let cell = store.cells[index];
 
-        if cell == tag {
-            *lanes = store.cell[index];
+        if cell.tag == tag {
+            *lanes = cell.lanes;
             return true;
         }
-        if cell == (tag | SGI_SOFT_FIXED_FAILED) {
+        if cell.tag == (tag | SGI_SOFT_FIXED_FAILED) {
             return false;
         }
         match self.fixed_fill(store, index, i, x, y, tag) {
@@ -633,6 +633,17 @@ impl SoftFixedTex {
         } else {
             -SGI_SOFT_FIXED_LAMBDA_MAX
         }
+    }
+
+    /// A fragment's s, t and lambda from its quad's coordinates c
+    /// (soft_quad_coords()) at pixel i of the quad, for the quad's lambda:
+    /// the same as SoftFixedTex::fixed_coords() with that lambda, which
+    /// computes them from the planes again.
+    #[inline(always)]
+    pub fn quad_coords(c: &SoftQuadCoords, i: usize, lambda: i32) -> Option<(f64, f64, i32)> {
+        let (s, t) = (c.s[i], c.t[i]);
+
+        (c.pos[i] && s.abs() < 1073741824.0 && t.abs() < 1073741824.0).then_some((s, t, lambda))
     }
 
     /// A fragment's s, t and lambda from the triangle's planes g at pixel
@@ -918,6 +929,56 @@ mod tests {
         rules.draw(&target, &mut fb, &Hashed, &mut d);
         raster_set_texture_path(SGI_RASTER_TEXTURE_SPANS);
         (colour, depth)
+    }
+
+    // A quad's four fragments take the coordinates its footprint was made
+    // from (soft_quad_coords()), and they are the ones each would compute
+    // from the planes: over positive, zero, negative and overflowing Q/W.
+    #[test]
+    fn a_quads_coordinates_are_its_fragments_own() {
+        let f = SoftFixedTex::default();
+        let mut seed = raster_bench::Lcg(7);
+        let mut taken = 0;
+        let mut dropped = 0;
+
+        for n in 0..2000 {
+            let mut g = SoftTexPlane { x: seed.range(-8.0, 8.0) as f64, y: seed.range(-8.0, 8.0) as f64, ..Default::default() };
+
+            for k in 0..4 {
+                // s alone, t alone and both overflow the sampler's range.
+                let scale = if (k == 0 && n % 7 == 0) || (k == 1 && n % 11 == 0) { 1e9 } else { 1.0 };
+
+                g.value[k] = seed.range(-2.0, 2.0) as f64 * scale;
+                g.dx[k] = seed.range(-1.0, 1.0) as f64 * scale;
+                g.dy[k] = seed.range(-1.0, 1.0) as f64 * scale;
+            }
+            if n % 5 == 0 {
+                g.value[2] = 0.0;
+            }
+            let (qx, qy) = (2 * (seed.next_u32() % 40) as i32, 2 * (seed.next_u32() % 40) as i32);
+            let c = soft_quad_coords(&g, qx, qy);
+
+            for i in 0..4 {
+                let col = qx + (i & 1) as i32;
+                let mut row = [0.0f64; 4];
+
+                for k in 0..4 {
+                    row[k] = ((qy + (i >> 1) as i32) as f64 + 0.5 - g.y) * g.dy[k];
+                }
+                let own = f.fixed_coords(&g, &row, col, Some(77));
+                let quad = SoftFixedTex::quad_coords(&c, i, 77);
+
+                match (own, quad) {
+                    (None, None) => dropped += 1,
+                    (Some(a), Some(b)) => {
+                        assert_eq!((a.0.to_bits(), a.1.to_bits(), a.2), (b.0.to_bits(), b.1.to_bits(), b.2), "quad {n} pixel {i}");
+                        taken += 1;
+                    }
+                    _ => panic!("quad {n} pixel {i}: planes give {own:?}, quad gives {quad:?}"),
+                }
+            }
+        }
+        assert!(taken > 1000 && dropped > 1000, "{taken} taken, {dropped} dropped");
     }
 
     // Coverage, depth and the pixels written are the double path's under

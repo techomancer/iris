@@ -219,7 +219,7 @@ impl SoftDraw<'_> {
         let max = (1u32 << rules.color_bits) - 1;
         let alpha_max = rules.alpha_max();
         let alpha_q = rules.alpha(frag.rgba[3]);
-        let alpha = alpha_q as f64 / alpha_max as f64;
+        let alpha = soft_unit(alpha_q, alpha_max);
         let blend = M::blend(self);
         let rgb = if blend { rules.rgb(&frag.rgba) } else { self.store_rgb(x, y, &frag.rgba) };
 
@@ -239,12 +239,12 @@ impl SoftDraw<'_> {
             let mut blended = [0.0f64; 4];
 
             for k in 0..3usize {
-                src[k] = out.component[k] as f64 / max as f64;
-                dst[k] = dest.component[k] as f64 / max as f64;
+                src[k] = soft_unit(out.component[k], max);
+                dst[k] = soft_unit(dest.component[k], max);
             }
             src[3] = alpha;
             dst[3] = if rules.alpha_bits != 0 {
-                dest.component[3] as f64 / ((1u32 << rules.alpha_bits) - 1) as f64
+                soft_unit(dest.component[3], (1u32 << rules.alpha_bits) - 1)
             } else {
                 1.0
             };
@@ -419,12 +419,19 @@ impl SoftDraw<'_> {
                 depth_w[i] = (1.0 - b1[i] - b2[i]) * v[0].depth_w + b1[i] * v[1].depth_w + b2[i] * v[2].depth_w;
             }
             // The quad's level of detail, where it has one.
+            // Its pixels' coordinates come with the footprint, where that is
+            // taken from them.
+            let mut coords: Option<SoftQuadCoords> = None;
             let lambda = if !lod {
                 None
             } else if sp.flat_lambda.is_some() {
                 sp.flat_lambda
+            } else if let Some((ns, nt)) = general.scales {
+                let c = coords.insert(soft_quad_coords(g, quad_x, qy));
+
+                soft_quad_rho_of(c, ns, nt).and_then(|rho| self.fixed_tex().quad_lambda(rho))
             } else {
-                (general.rho)(quad_x, qy).and_then(|rho| self.fixed_tex().quad_lambda(rho))
+                None
             };
             for i in 0..4 {
                 if !drawn[i] {
@@ -487,7 +494,11 @@ impl SoftDraw<'_> {
                     continue;
                 }
                 if M::TEX {
-                    match self.fixed_tex().fixed_coords(g, &tex_row[r], col, lambda) {
+                    let at = match (&coords, lambda) {
+                        (Some(c), Some(l)) => SoftFixedTex::quad_coords(c, i, l),
+                        _ => self.fixed_tex().fixed_coords(g, &tex_row[r], col, lambda),
+                    };
+                    match at {
                         Some((s, tc, l)) if M::sample(self, s, tc, l, &mut frag.texel) => {}
                         _ => {
                             (general.fragment)(col, py, e1[i], e2[i]);
@@ -558,14 +569,14 @@ impl SoftDraw<'_> {
     }
 }
 
-/// What a quad loop leaves to the triangle's general path: rho, the
-/// footprint of the quad at window pixel (qx, qy) under the diagonal rule
-/// (soft_quad_rho()), or None where its fragments take their own; and
-/// fragment, which draws the fragment at window pixel (px, py) whose edge
+/// What a quad loop leaves to the triangle's general path: scales, the
+/// per-axis scales (ns, nt) of the footprint of a quad under the diagonal
+/// rule (soft_quad_rho_of()), or None where its fragments take their own;
+/// and fragment, which draws the fragment at window pixel (px, py) whose edge
 /// values for v[2]-v[0] and v[0]-v[1] are e1 and e2 through the general
 /// path, its quad's footprint included.
 pub struct QuadGeneral<'g> {
-    pub rho: &'g dyn Fn(i32, i32) -> Option<f64>,
+    pub scales: Option<(f64, f64)>,
     pub fragment: &'g dyn Fn(i32, i32, i64, i64),
 }
 
@@ -1097,6 +1108,50 @@ mod tests {
             compare(seed, "dynamic loop", &want, &dynamic);
             compare(seed, "specialised loop", &want, &table);
             drawn += want.0.iter().filter(|&&c| c != 0).count();
+        }
+        assert!(drawn > 10000, "the cases drew too little to compare: {drawn}");
+    }
+
+    // Antialiased polygons visit the pixels of each row they can reach, not
+    // their whole bounding box, and draw the same: random states, and
+    // triangles with edges on pixel boundaries and corners at pixel corners.
+    #[test]
+    fn antialiased_polygons_match_the_whole_box() {
+        let mut drawn = 0;
+        for seed in 300..=340u64 {
+            for textured in [false, true] {
+                let scene = || {
+                    let mut b = case(seed, textured);
+                    let aligned = [
+                        [(10.0f32, 10.0f32), (50.0, 10.0), (10.0, 50.0)],
+                        [(20.0, 20.0), (21.0, 20.0), (20.0, 21.0)],
+                        [(30.0, 5.0), (30.5, 90.0), (31.0, 5.0)],
+                        [(5.0, 60.0), (100.0, 60.25), (50.0, 61.0)],
+                        [(60.0, 60.0), (90.0, 60.0), (60.0, 60.0)],
+                    ];
+
+                    b.polygon_smooth = true;
+                    for pts in aligned {
+                        let mut v = b.prims[0].clone();
+
+                        for (i, &(x, y)) in pts.iter().enumerate() {
+                            let o = &mut v[i * SGI_GL_VERTEX_FLOATS + SGI_GL_V_POSITION..];
+
+                            o[..4].copy_from_slice(&[x / BENCH_W as f32 * 2.0 - 1.0, y / BENCH_H as f32 * 2.0 - 1.0, 0.0, 1.0]);
+                        }
+                        b.prims.push(v);
+                    }
+                    b
+                };
+
+                raster_set_aa_whole_box(true);
+                let want = draw_bench(scene(), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_SPANS);
+                raster_set_aa_whole_box(false);
+                let got = draw_bench(scene(), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_SPANS);
+
+                compare(seed, "antialiased rows", &want, &got);
+                drawn += want.0.iter().filter(|&&c| c != 0).count();
+            }
         }
         assert!(drawn > 10000, "the cases drew too little to compare: {drawn}");
     }

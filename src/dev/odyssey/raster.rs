@@ -787,9 +787,15 @@ impl RasterRules {
         if m == 0 {
             return 0;
         }
-        self.alpha(value)
-            .wrapping_mul((1u32.wrapping_shl(self.alpha_bits as u32)).wrapping_sub(1))
-            / m
+        let a = self.alpha(value);
+        let stored = (1u32.wrapping_shl(self.alpha_bits as u32)).wrapping_sub(1);
+
+        // Scaling by the same number twice over leaves a, unless the product
+        // wraps.
+        if stored == m && m <= 0xffff {
+            return a;
+        }
+        a.wrapping_mul(stored) / m
     }
 
     #[inline]
@@ -844,9 +850,43 @@ impl RasterRules {
     /// A colour, each component clamped and rounded to the rules' bits.
     #[inline]
     pub fn rgb(&self, c: &[f64]) -> u32 {
-        (self.channel(c[0]).wrapping_shl(2 * self.color_bits as u32)) |
-            (self.channel(c[1]).wrapping_shl(self.color_bits as u32)) |
-            self.channel(c[2])
+        let bits = self.color_bits as u32;
+        let max = (1u32.wrapping_shl(bits)).wrapping_sub(1);
+        let maxf = max as f64;
+        // channel() with its largest value taken once.
+        let channel = |c: f64| -> u32 {
+            if !(c > 0.0) {
+                0
+            } else if c >= 1.0 {
+                max
+            } else {
+                (c * maxf + 0.5) as u32
+            }
+        };
+
+        (channel(c[0]).wrapping_shl(2 * bits)) | (channel(c[1]).wrapping_shl(bits)) | channel(c[2])
+    }
+}
+
+/// c / 255 for a component c of eight bits, exactly as the division gives it.
+pub static SOFT_UNIT8: [f64; 256] = {
+    let mut t = [0.0f64; 256];
+    let mut i = 0;
+
+    while i < 256 {
+        t[i] = i as f64 / 255.0;
+        i += 1;
+    }
+    t
+};
+
+/// c as a fraction of max, the largest value of its bits: c / max, from
+/// SOFT_UNIT8 for eight bits, whose table is that division done once.
+#[inline(always)]
+pub fn soft_unit(c: u32, max: u32) -> f64 {
+    match SOFT_UNIT8.get(c as usize) {
+        Some(&u) if max == 255 => u,
+        _ => c as f64 / max as f64,
     }
 }
 
@@ -879,16 +919,24 @@ impl SoftDraw<'_> {
         };
         let b = SOFT_BAYER4[(row & 3) as usize][(x & 3) as usize] as f64 / 16.0;
         for (k, &ck) in c.iter().enumerate().take(3) {
-            let v: u32 = if !(ck > 0.0) {
-                0
-            } else if ck >= 1.0 {
-                max
-            } else {
-                (ck * max as f64 + b).floor() as u32
-            };
-            out |= v.wrapping_shl((2 - k as u32) * bits);
+            out |= soft_dither_channel(ck, max, b).wrapping_shl((2 - k as u32) * bits);
         }
         out
+    }
+}
+
+/// A colour component ck as a value of at most max, offset by the dither
+/// threshold b (in [0, 1)) before it is truncated. A clamped component of 0
+/// or 1 is exact either way.
+#[inline(always)]
+pub fn soft_dither_channel(ck: f64, max: u32, b: f64) -> u32 {
+    if !(ck > 0.0) {
+        0
+    } else if ck >= 1.0 {
+        max
+    } else {
+        // Positive, so truncating is the floor.
+        (ck * max as f64 + b) as u32
     }
 }
 
@@ -1259,14 +1307,22 @@ impl SoftDraw<'_> {
 pub const SGI_SOFT_FIXED_LEVELS: usize = 14;
 pub const SGI_SOFT_FIXED_FAILED: u32 = 0x80000000;
 
+/// One texel of the fixed-point sampler's store: the packed RGBA8 texel,
+/// components expanded, in lanes (soft_fixed_lanes()), and the tag of the
+/// draw that read it (SoftDraw::fixed_texel()). Side by side, since a tap
+/// reads the tag and then the lanes, and a bilinear tap's two texels in a
+/// row share a cache line.
+#[derive(Clone, Copy, Default)]
+pub struct SoftFixedCell {
+    pub lanes: u64,
+    pub tag: u32,
+}
+
 /// The fixed-point sampler's texels of one level for one draw, by interior
-/// index: each the packed RGBA8 texel, components expanded, in lanes
-/// (soft_fixed_lanes()), and the tag of the draw that read it
-/// (SoftDraw::fixed_texel()).
+/// index.
 #[derive(Clone, Default)]
 pub struct SoftFixedStore {
-    pub cell: Vec<u64>,
-    pub tag: Vec<u32>,
+    pub cells: Vec<SoftFixedCell>,
     pub size: usize,
     pub plain: Vec<u64>,
 }
@@ -1948,6 +2004,101 @@ impl<'a> SoftDraw<'a> {
             _ => {
                 crate::dlog!(LogModule::Odyssey, "sgi-gl: draw of mode {} ignored", d.mode);
                 SGI_GL_DRAW_OK
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod colour_tests {
+    use super::*;
+
+    fn rules(color_bits: u8, alpha_bits: u8) -> RasterRules {
+        RasterRules { color_bits, alpha_bits, ..Default::default() }
+    }
+
+    /// Components on and around every step of an n-bit channel, and the
+    /// values that clamp.
+    fn components(bits: u32) -> Vec<f64> {
+        let max = ((1u32 << bits) - 1) as f64;
+        let mut v = vec![-1.0, -0.0, 0.0, f64::NAN, 1.0, 1.5, f64::INFINITY, f64::MIN_POSITIVE];
+        for i in 0..=(1u32 << bits) * 4 {
+            let c = (i as f64 / 4.0) / max;
+
+            v.push(c);
+            v.push(f64::from_bits(c.to_bits().wrapping_add(1)));
+            v.push(f64::from_bits(c.to_bits().wrapping_sub(1)));
+        }
+        v
+    }
+
+    // rgb() takes each channel as channel() does.
+    #[test]
+    fn rgb_is_its_channels() {
+        for bits in [1u8, 5, 8, 10, 12] {
+            let r = rules(bits, 8);
+            let cs = components(bits as u32);
+
+            for (i, &c) in cs.iter().enumerate() {
+                let (d, e) = (cs[(i * 7 + 3) % cs.len()], cs[(i * 13 + 5) % cs.len()]);
+                let want = (r.channel(c).wrapping_shl(2 * bits as u32)) | (r.channel(d).wrapping_shl(bits as u32)) | r.channel(e);
+
+                assert_eq!(r.rgb(&[c, d, e]), want, "{bits} bits, {c} {d} {e}");
+            }
+        }
+    }
+
+    // The dither threshold floors what it adds to: a component of 0.5 + b
+    // steps down to the step below.
+    #[test]
+    fn dither_truncates_as_floor_does() {
+        for bits in [1u32, 5, 8, 12] {
+            let max = (1u32 << bits) - 1;
+
+            for &c in &components(bits) {
+                for t in 0..16 {
+                    let b = t as f64 / 16.0;
+                    let want = if !(c > 0.0) {
+                        0
+                    } else if c >= 1.0 {
+                        max
+                    } else {
+                        (c * max as f64 + b).floor() as u32
+                    };
+
+                    assert_eq!(soft_dither_channel(c, max, b), want, "{bits} bits, {c} + {b}");
+                }
+            }
+        }
+    }
+
+    // c / max, from the table at eight bits.
+    #[test]
+    fn unit_components_are_the_division() {
+        for max in [1u32, 3, 15, 31, 255, 1023, 4095] {
+            for c in 0..=max.min(1023) + 3 {
+                assert_eq!(soft_unit(c, max).to_bits(), (c as f64 / max as f64).to_bits(), "{c} / {max}");
+            }
+        }
+        // An eight bit divisor with a component beyond the table.
+        assert_eq!(soft_unit(300, 255).to_bits(), (300.0f64 / 255.0).to_bits());
+    }
+
+    // A stored alpha scales the incoming alpha's step to the stored bits.
+    #[test]
+    fn stored_alpha_scales_by_the_bits() {
+        for (cb, ab) in [(8u8, 8u8), (8, 4), (8, 0), (4, 8), (10, 10), (12, 12), (8, 1), (1, 1), (12, 16)] {
+            let r = rules(cb, ab);
+            let m = r.alpha_max();
+
+            for &v in &components(8) {
+                let want = if m == 0 {
+                    0
+                } else {
+                    r.alpha(v).wrapping_mul((1u32.wrapping_shl(ab as u32)).wrapping_sub(1)) / m
+                };
+
+                assert_eq!(r.stored_alpha(v), want, "{cb}/{ab} bits, {v}");
             }
         }
     }

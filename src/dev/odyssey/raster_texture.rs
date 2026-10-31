@@ -473,7 +473,7 @@ impl SoftTexelCache {
         if self.tag == 0 {
             // Tags have come round: cells from 2^31 draws ago would match.
             for store in self.fixed.iter_mut() {
-                store.tag.fill(0);
+                store.cells.fill(SoftFixedCell::default());
             }
             self.serial += 1;
             self.tag = (self.serial & !(SGI_SOFT_FIXED_FAILED as u64)) as u32;
@@ -833,37 +833,58 @@ pub fn soft_texture_derivatives(
 //    has no level of detail of its own, so each of its fragments takes its
 //    own footprint, as before the rule was modelled.
 
-/// The footprint, in texels, of the quad whose first pixel is window pixel
-/// (qx, qy) under the diagonal rule above, from a triangle's texture planes
-/// g: the largest absolute difference along the diagonals of s scaled by ns
-/// and of t scaled by nt (the base level's size times the axis's bias, as
-/// soft_texture_derivatives() scales them). None where neither diagonal has
-/// coordinates at both ends.
-pub fn soft_quad_rho(g: &SoftTexPlane, ns: f64, nt: f64, qx: i32, qy: i32) -> Option<f64> {
-    let mut s = [0.0f64; 4];
-    let mut t = [0.0f64; 4];
-    let mut ok = [false; 4];
+/// The texture coordinates of the four pixels of the quad whose first pixel
+/// is window pixel (qx, qy), from a triangle's texture planes g: pixels 1
+/// and 2 on the quad's first row, 3 and 4 on its second. s and t are
+/// meaningful where pos is set (Q/W positive). A quad loop takes the
+/// footprint (soft_quad_rho_of()) and each fragment's coordinates from one
+/// of these, not from a division each.
+#[derive(Clone, Copy)]
+pub struct SoftQuadCoords {
+    pub s: [f64; 4],
+    pub t: [f64; 4],
+    pub pos: [bool; 4],
+}
 
-    // Pixels 1 and 2 on the quad's first row, 3 and 4 on its second.
+pub fn soft_quad_coords(g: &SoftTexPlane, qx: i32, qy: i32) -> SoftQuadCoords {
+    let mut c = SoftQuadCoords { s: [0.0; 4], t: [0.0; 4], pos: [false; 4] };
+
     for i in 0..4 {
         let x = (qx as f64 + (i & 1) as f64) + 0.5 - g.x;
         let y = (qy as f64 + (i >> 1) as f64) + 0.5 - g.y;
         let q = g.value[2] + x * g.dx[2] + y * g.dy[2];
         let iq = 1.0 / q;
 
-        s[i] = (g.value[0] + x * g.dx[0] + y * g.dy[0]) * iq;
-        t[i] = (g.value[1] + x * g.dx[1] + y * g.dy[1]) * iq;
-        ok[i] = q > 0.0 && s[i].is_finite() && t[i].is_finite();
+        c.s[i] = (g.value[0] + x * g.dx[0] + y * g.dy[0]) * iq;
+        c.t[i] = (g.value[1] + x * g.dx[1] + y * g.dy[1]) * iq;
+        c.pos[i] = q > 0.0;
     }
+    c
+}
+
+/// The footprint, in texels, of the quad whose coordinates are c under the
+/// diagonal rule above: the largest absolute difference along the diagonals
+/// of s scaled by ns and of t scaled by nt (the base level's size times the
+/// axis's bias, as soft_texture_derivatives() scales them). None where
+/// neither diagonal has coordinates at both ends.
+pub fn soft_quad_rho_of(c: &SoftQuadCoords, ns: f64, nt: f64) -> Option<f64> {
+    let ok = |i: usize| c.pos[i] && c.s[i].is_finite() && c.t[i].is_finite();
     let mut rho = f64::NAN;
+
     for (a, b) in [(0, 3), (1, 2)] {
-        if ok[a] && ok[b] {
-            let d = fmax((ns * (s[b] - s[a])).abs(), (nt * (t[b] - t[a])).abs());
+        if ok(a) && ok(b) {
+            let d = fmax((ns * (c.s[b] - c.s[a])).abs(), (nt * (c.t[b] - c.t[a])).abs());
 
             rho = if rho.is_nan() { d } else { fmax(rho, d) };
         }
     }
     rho.is_finite().then_some(rho)
+}
+
+/// The footprint of the quad whose first pixel is window pixel (qx, qy), from
+/// a triangle's texture planes g (soft_quad_coords(), soft_quad_rho_of()).
+pub fn soft_quad_rho(g: &SoftTexPlane, ns: f64, nt: f64, qx: i32, qy: i32) -> Option<f64> {
+    soft_quad_rho_of(&soft_quad_coords(g, qx, qy), ns, nt)
 }
 
 /// soft_quad_rho() for planes g whose Q/W is the same everywhere, where it

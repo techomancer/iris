@@ -213,164 +213,6 @@ impl SoftDraw<'_> {
         false
     }
 
-    /// Whether a triangle's fragments can take SoftDraw::simple_row() instead of
-    /// the full per-fragment path.
-    pub fn simple_fragments(&self) -> bool {
-        let st = self.st;
-        let t = self.t;
-
-        if self.texture.is_some()
-            || st.fog != 0
-            || st.clip_planes != 0
-            || self.polygon_stipple.is_some()
-            || st.index_bits != 0
-            || self.blend
-            || self.logic_op
-            || st.alpha_test != 0
-            || st.stencil_test != 0
-        {
-            return false;
-        }
-        // RasterRules::depth_stencil() drops every fragment of such a draw.
-        if t.store_rgba {
-            return !self.rgba_read;
-        }
-        self.colour_mask == 0 || self.colour_mask == self.rules.colour_bits()
-    }
-
-    /// One row of a triangle under SoftDraw::simple_fragments(): pixels px0 to
-    /// px1 of row py, whose edge values for v[2]-v[0] and v[0]-v[1] at px0 are
-    /// e1 and e2.
-    #[allow(clippy::too_many_arguments, reason = "the row loops take the triangle's per-row edge state as scalars")]
-    pub fn simple_row(&self, v: &[SoftVertex], py: i32, mut px0: i32, mut px1: i32, mut e1: i64, mut e2: i64, step1: i64, step2: i64, area: i64, offset: f64, flat: &SoftFrag, smooth: bool, rgba: bool, depth_row: bool) {
-        let rules = self.rules;
-        let st = self.st;
-        let t = self.t;
-        let y = self.win.oy + py;
-        // A flat colour is the same at every pixel unless dithered.
-        let fixed = !smooth && !self.dither;
-        let store = if rgba { self.rgba_mask != 0 && self.ntargets != 0 } else { self.colour_mask != 0 };
-        let clipped = self.win.clip.n > 1;
-        let mut fixed_rgba = RasterColour::default();
-        let mut fixed_colour = 0u32;
-
-        if st.scissor_test != 0 && !clipped {
-            // SoftDraw::owned_at()'s scissor test, decided for the whole row.
-            let sx0 = st.scissor[0] as i64;
-            let sx1 = st.scissor[0] as i64 + st.scissor[2] as i64 - 1;
-
-            if !(py >= st.scissor[1] && (py as i64) < st.scissor[1] as i64 + st.scissor[3] as i64) {
-                return;
-            }
-            if sx0 > px0 as i64 {
-                if sx0 > px1 as i64 {
-                    return;
-                }
-                e1 += (sx0 - px0 as i64) * step1;
-                e2 += (sx0 - px0 as i64) * step2;
-                px0 = sx0 as i32;
-            }
-            px1 = (px1 as i64).min(sx1) as i32;
-        }
-        if fixed && store {
-            if rgba {
-                let alpha = rules.alpha(flat.rgba[3]) as f64 / rules.alpha_max() as f64;
-
-                fixed_rgba = rules.rgba_value(rules.rgb(&flat.rgba), alpha);
-            } else {
-                fixed_colour = rules.rgb(&flat.rgba);
-            }
-        }
-        let mut px = px0;
-        while px <= px1 {
-            let x = self.win.ox + px;
-            let b1 = e1 as f64 / area as f64;
-            let b2 = e2 as f64 / area as f64;
-            let mut z = v[0].z + b1 * (v[1].z - v[0].z) + b2 * (v[2].z - v[0].z);
-            let (mut off, steps) = rules.split_offset(offset);
-            let mut zw = 0.0f64;
-            let mut colour = [0.0f64; 4];
-
-            'pixel: {
-                if depth_row {
-                    let depth_w = (1.0 - b1 - b2) * v[0].depth_w + b1 * v[1].depth_w + b2 * v[2].depth_w;
-                    let slack = rules.depth_slack;
-
-                    z = (z + off) / depth_w;
-                    off = 0.0;
-                    if z < 0.0 && z >= -slack {
-                        z = 0.0;
-                    } else if z > 1.0 && z <= 1.0 + slack {
-                        z = 1.0;
-                    }
-                }
-                if !st.window_depth(z, off, &mut zw) || !(0.0..=1.0).contains(&zw) {
-                    break 'pixel;
-                }
-                if clipped && !self.owned_at(px, py) {
-                    break 'pixel;
-                }
-                if st.depth_test != 0 || store {
-                    let zq = rules.depth_code_offset(zw, steps);
-
-                    if st.depth_test != 0 {
-                        if !soft_compare(st.depth_func, zq, self.px.load_depth(x, y)) {
-                            break 'pixel;
-                        }
-                        if st.depth_mask != 0 {
-                            self.px.store_depth(x, y, zq);
-                        }
-                    }
-                }
-                if !store {
-                    break 'pixel;
-                }
-                if smooth {
-                    let w0 = (1.0 - b1 - b2) * v[0].inv_w;
-                    let w1 = b1 * v[1].inv_w;
-                    let w2 = b2 * v[2].inv_w;
-                    let sum = w0 + w1 + w2;
-
-                    for k in 0..4 {
-                        colour[k] = (w0 * v[0].rgba[k] + w1 * v[1].rgba[k] + w2 * v[2].rgba[k]) / sum;
-                    }
-                } else {
-                    colour = flat.rgba;
-                }
-                if rgba {
-                    let mut out = fixed_rgba;
-
-                    if !fixed {
-                        let alpha = rules.alpha(colour[3]) as f64 / rules.alpha_max() as f64;
-
-                        out = rules.rgba_value(self.store_rgb(x, y, &colour), alpha);
-                    }
-                    for i in 0..self.ntargets as usize {
-                        self.px.store_rgba(self.targets[i], x, y, &out);
-                    }
-                } else {
-                    let out = if fixed { fixed_colour } else { self.store_rgb(x, y, &colour) };
-
-                    for i in 0..self.ntargets as usize {
-                        self.px.store_colour(self.targets[i], x, y, out);
-                    }
-                }
-            }
-            px += 1;
-            e1 += step1;
-            e2 += step2;
-        }
-    }
-
-    /// Out of line, once a row.
-    #[allow(clippy::too_many_arguments, reason = "the row loops take the triangle's per-row edge state as scalars")]
-    pub fn simple_span(&self, v: &[SoftVertex], py: i32, px0: i32, px1: i32, e1: i64, e2: i64, step1: i64, step2: i64, area: i64, offset: f64, flat: &SoftFrag, smooth: bool) {
-        let rgba = self.t.store_rgba;
-        let depth_row = self.rules.depth_row_given;
-
-        self.simple_row(v, py, px0, px1, e1, e2, step1, step2, area, offset, flat, smooth, rgba, depth_row);
-    }
-
     /// Map and rasterize one triangle of a clipped polygon, given its three
     /// vertices in the view volume and, for flat shading, the provoking vertex
     /// of the triangle it was clipped from.
@@ -395,7 +237,6 @@ impl SoftDraw<'_> {
         let mut span: Option<(FillRow, SoftTexSpan)> = None;
         let mut area: i64;
         let smooth = st.shade_model != SGI_GL_FLAT;
-        let simple = self.simple_fragments();
         let sub = self.rules.subpixel_bits as i32;
 
         for i in 0..3 {
@@ -647,7 +488,7 @@ impl SoftDraw<'_> {
             self.fragment(px, py, z, offset, depth_w, &frag);
         };
         let quad_general = QuadGeneral {
-            rho: &quad_rho,
+            scales: quad_lod.then_some((tex_ns, tex_nt)),
             fragment: &|px, py, e1, e2| general(px, py, e1, e2, quad_rho(px & !1, py & !1)),
         };
         // Two rows at a time, from an even one: the rows of a line of quads.
@@ -677,15 +518,6 @@ impl SoftDraw<'_> {
             }
             let quad_y = qy;
             qy += 2;
-            if simple && span.is_none() {
-                // Untextured: no quad shares anything, so a row at a time.
-                for (r, row) in rows.iter().enumerate() {
-                    if let Some(q) = row {
-                        self.simple_span(&v, quad_y + r as i32, q.px0, q.px1, q.e1, q.e2, step1, step2, area, offset, &flat_frag, smooth);
-                    }
-                }
-                continue;
-            }
             if rows == [None, None] {
                 continue;
             }
@@ -1006,6 +838,53 @@ pub fn soft_aa_contains_pixel(v: &[SoftVertex], n: usize, px: i32, py: i32, scal
     true
 }
 
+thread_local! {
+    /// Visit every pixel of an antialiased polygon's bounding box, not just
+    /// the span of each row it can reach (tests and the benchmark).
+    pub static SOFT_AA_WHOLE_BOX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Select the whole bounding box for antialiased polygons drawn on this
+/// thread. Per thread, so that tests running at once cannot change each
+/// other's path.
+pub fn raster_set_aa_whole_box(whole: bool) {
+    SOFT_AA_WHOLE_BOX.with(|c| c.set(whole));
+}
+
+/// The pixels of row py that the convex polygon v (n vertices, in subpixels
+/// of scale to the pixel) can overlap, a pixel wider on each side: from the
+/// polygon's extent along the row's strip, py to py + 1. None where the
+/// strip holds none of the polygon. The clipping of a pixel's square
+/// against the polygon finds nothing beyond this (soft_aa_clip()).
+pub fn soft_aa_row_span(v: &[SoftVertex], n: usize, scale: f64, py: i32) -> Option<(i32, i32)> {
+    let (y0, y1) = (py as f64, py as f64 + 1.0);
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+
+    for i in 0..n {
+        let (ax, ay) = (v[i].x as f64 / scale, v[i].y as f64 / scale);
+        let (bx, by) = (v[(i + 1) % n].x as f64 / scale, v[(i + 1) % n].y as f64 / scale);
+
+        if ay >= y0 && ay <= y1 {
+            lo = lo.min(ax);
+            hi = hi.max(ax);
+        }
+        // Where the edge crosses either side of the strip.
+        for y in [y0, y1] {
+            if (ay < y) != (by < y) {
+                let x = ax + (y - ay) * (bx - ax) / (by - ay);
+
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+    }
+    if !(lo <= hi) {
+        return None;
+    }
+    Some(((lo.floor() as i32).saturating_sub(1), (hi.floor() as i32).saturating_add(1)))
+}
+
 impl SoftDraw<'_> {
     /// Rasterize one clipped convex polygon once. Pixel-square clipping
     /// computes geometric coverage; centroid sampling is exact for affine
@@ -1048,8 +927,22 @@ impl SoftDraw<'_> {
         }
         flat.index = flat_index;
 
+        let whole_box = SOFT_AA_WHOLE_BOX.with(|c| c.get());
         for py in py0..=py1 {
-            for px in px0..=px1 {
+            let (mut x0, mut x1) = (px0, px1);
+
+            if !whole_box {
+                // Pixels beyond the polygon's extent in this row are left
+                // with no overlap by the clipping below.
+                match soft_aa_row_span(v, n, scale, py) {
+                    Some((lo, hi)) => {
+                        x0 = x0.max(lo);
+                        x1 = x1.min(hi);
+                    }
+                    None => continue,
+                }
+            }
+            for px in x0..=x1 {
                 let coverage: f64;
                 let x: f64;
                 let y: f64;
