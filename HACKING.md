@@ -264,7 +264,7 @@ Every device that has real work to do runs on its own thread:
 
 | Thread(s) | Work |
 |---|---|
-| `MIPS-CPU` | the interpreter or jitv2 dispatch loop |
+| `MIPS-CPU`, `MIPS-CPU1` | the interpreter or jitv2 dispatch loop, one thread per processor |
 | jitv2 compile pool | Cranelift compiles of requested pages (`[jitv2] threads`) |
 | `WD33C93A` | SCSI command execution and DMA |
 | `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
@@ -352,6 +352,28 @@ consumer thread never takes `rec`.
 - With `opcodefusion` (implied by `lightning`), the interpreter executes
   common pairs (branch + NOP, LUI + ORI/ADDIU, address + load/store) as one
   dispatch.
+
+### Several CPUs
+
+An Octane can have two ([docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md)).
+Each is its own `MipsCpu` with its own core, TLB, cache model and thread, over
+one `Physical`. `src/cpu/smp.rs` holds what they share:
+
+- **Which CPU this is.** `set_current_cpu` marks a CPU thread and `current_cpu()`
+  reads it. `BusDevice` carries no initiator; only HEART asks, for `PRID` and
+  `IMSR`. Any other thread reads as CPU 0.
+- **Holding a CPU still.** `ParkSlot::hold` sets `HOST_PARK_BIT` in the CPU's
+  interrupt word. Every preamble bails on any set bit, so the CPU leaves compiled
+  code at once and parks at its next batch boundary, with its executor unlocked
+  and its jitv2 page pointer cleared. HEART's disable bits use this.
+- **Getting the machine to yourself.** `World::stop_others` parks every other
+  CPU and runs a closure. Call it holding no lock another CPU could be waiting
+  on. Two callers take turns, and the one waiting counts as parked. Remapping
+  memory and flushing jitv2 go through it.
+
+The monitor reaches CPUs through `CpuMonitor` (`src/cpu/cpu_monitor.rs`), on
+every machine: it routes each command and the commands themselves live in
+`src/cpu/mips_exec/monitor.rs`.
 
 ### ExecStatus
 
@@ -493,6 +515,11 @@ code into host code with Cranelift. The concepts:
   an emitter end the compiled region or call the interpreter's handler. The
   equivalence tests, the cpu-tests matrix, `jitcheck` and the
   `jitv2_lockstep` feature compare the JIT against the interpreter.
+- **Several CPUs share one pool.** Compiled code reaches CPU state only through
+  its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
+  pfn map publishes a slot after its claim, and inline stores bump generations
+  atomically. Compiled code is freed only by a full flush, and every flush parks
+  all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 

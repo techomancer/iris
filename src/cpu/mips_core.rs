@@ -866,6 +866,15 @@ pub struct MipsCore {
 
     /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
     pub fasttick_count: Arc<AtomicU64>,
+    /// Which processor this is: what HEART's PRID answers it.
+    pub cpu_id: u8,
+    /// More than one CPU shares this memory, so SC must be a host
+    /// compare-exchange (`exec_sc`).
+    pub smp: bool,
+    /// What the last LL/LLD loaded and from where: the compare-exchange's
+    /// expected value, and whether an SC is to the same word.
+    pub ll_value: u64,
+    pub ll_phys: u64,
 
     // Execution state
     pub running: bool,
@@ -1386,6 +1395,10 @@ impl MipsCore {
             reset_fir: 0x0000_0500,
             cp0_random_cycle: 0,
             fasttick_count: Arc::new(AtomicU64::new(0)),
+            cpu_id: 0,
+            smp: false,
+            ll_value: 0,
+            ll_phys: 0,
             running: false,
             halted: false,
             count_hz_atomic: Arc::new(AtomicU64::new(DEFAULT_COUNT_HZ)),
@@ -1496,7 +1509,8 @@ impl MipsCore {
     /// Reset the CPU to initial state
     pub fn reset(&mut self, soft: bool) {
         self.reset_registers(soft);
-        self.hot.interrupts.store(0, Ordering::SeqCst);
+        // A reset does not release a CPU another thread is holding.
+        self.hot.interrupts.fetch_and(crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
     }
 
     /// Read a GPR by index. gpr[0] is always kept at zero.

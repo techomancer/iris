@@ -6127,7 +6127,7 @@ mod tests {
     fn mon(cpu: &crate::cpu::mips_exec::MipsCpu<PassthroughTlb, PassthroughCache>, line: &str) -> (Result<(), String>, String) {
         let words: Vec<&str> = line.split_whitespace().collect();
         let cap = Capture::default();
-        let r = crate::traits::Device::execute_command(cpu, words[0], &words[1..], Box::new(cap.clone()));
+        let r = crate::cpu::mips_exec::CpuDevice::monitor_execute(cpu, words[0], &words[1..], Box::new(cap.clone()));
         let out = String::from_utf8_lossy(&cap.0.lock()).into_owned();
         (r, out)
     }

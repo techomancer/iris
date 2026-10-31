@@ -828,11 +828,18 @@ pub struct MachineSection {
     pub cpu: CpuModel,
     #[serde(default)]
     pub cache: CacheModel,
+    /// Processors fitted. More than one only on the Octane.
+    #[serde(default = "default_cpus")]
+    pub cpus: u8,
+}
+
+fn default_cpus() -> u8 {
+    1
 }
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default() }
+        Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default(), cpus: default_cpus() }
     }
 }
 
@@ -1891,6 +1898,9 @@ impl MachineConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.machine.cpus != 1 && self.machine.profile != MachineProfile::OctaneIp30 {
+            return Err(format!("[machine] cpus = {}: only the Octane has more than one processor", self.machine.cpus));
+        }
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
             return Err(format!(
                 "graphics.heads {} is invalid (valid: 1, 2)",

@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::cpu::smp::{current_cpu, ParkSlot, HOLD_HEART, MAX_CPUS};
 use crate::dev::w1;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
 
@@ -50,6 +51,11 @@ const CAUSE_SHIFT: u32 = 10;
 
 /// Mode register bits the model looks at.
 const MODE_INTERRUPT_ENABLE: u64 = 1 << 13;
+/// Software reset, of the whole machine.
+const MODE_SOFT_RESET: u64 = 1 << 22;
+/// Processor n stops being served while bit `60 + n` is set, and continues
+/// where it stopped when it clears.
+const MODE_PROC_DISABLE_SHIFT: u32 = 60;
 const MODE_ECC_GENERATE: u64 = 1 << 19;
 const MODE_ECC_DOUBLE: u64 = 1 << 20;
 const MODE_ECC_FORCE_WRITE: u64 = 1 << 21;
@@ -90,8 +96,8 @@ struct Regs {
     onewire_deadline_ns: u64,
     onewire_level: bool,
     onewire_busy: bool,
-    /// The levels last driven onto IP2..IP6.
-    out: u8,
+    /// The levels last driven onto each processor's IP2..IP6.
+    out: [u8; MAX_CPUS],
 }
 
 impl Regs {
@@ -120,7 +126,7 @@ impl Regs {
             onewire_deadline_ns: 0,
             onewire_level: false,
             onewire_busy: false,
-            out: 0,
+            out: [0; MAX_CPUS],
         }
     }
 
@@ -129,10 +135,11 @@ impl Regs {
         (self.saved_count + now.saturating_sub(self.epoch_ns) / COUNT_NS) & COUNT_MASK
     }
 
-    /// What IP2..IP6 should be: CPU 0's mask over the pending bits, one
-    /// output per level.
-    fn levels(&self) -> u8 {
-        let mut enabled = self.pending & self.mask[0];
+    /// What processor `cpu`'s IP2..IP6 should be: its mask over the pending
+    /// bits, one output per level. An inter-processor interrupt needs nothing
+    /// more: the sender sets the destination's bit, which only its mask has.
+    fn levels(&self, cpu: usize) -> u8 {
+        let mut enabled = self.pending & self.mask[cpu];
         let mut out = 0u8;
         for (i, m) in LEVEL_MASKS.iter().enumerate().take(4) {
             if enabled & m != 0 {
@@ -163,12 +170,15 @@ pub struct HeartConfig {
     /// The whole identification word, when the machine pins it; 0 builds it
     /// from the revision.
     pub widget_id_64: u64,
+    /// Processors fitted, from 0 up: the status register's active bits, and
+    /// the outputs driven.
+    pub cpus: u8,
 }
 
 impl HeartConfig {
     /// The Octane: HEART revision D (4) and its identification word.
     pub fn octane(banks: [u64; BANKS]) -> Self {
-        Self { banks, widget_revision: 4, widget_id_64: 0x4c00_106d }
+        Self { banks, widget_revision: 4, widget_id_64: 0x4c00_106d, cpus: 1 }
     }
 }
 
@@ -185,8 +195,12 @@ pub struct Heart {
     regs: Mutex<Regs>,
     cfg: HeartConfig,
     clock: Clock,
-    /// The CPU's interrupt word (`MipsCore`'s), once the machine has a CPU.
-    cpu_irq: AtomicPtr<AtomicU64>,
+    /// Each CPU's interrupt word (`MipsCore`'s), once the machine has it.
+    cpu_irq: [AtomicPtr<AtomicU64>; MAX_CPUS],
+    /// Where the MODE register's disable bits hold each CPU.
+    cpu_park: Mutex<[Option<Arc<ParkSlot>>; MAX_CPUS]>,
+    /// The guest asked for a software reset.
+    reset_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Where descriptor writes go: the machine points it at
     /// `Ip30Bus::remap_banks`.
     memcfg_hook: Mutex<Option<Box<dyn Fn([u32; BANKS]) + Send + Sync>>>,
@@ -208,7 +222,9 @@ impl Heart {
             regs: Mutex::new(Regs::new(now)),
             cfg,
             clock,
-            cpu_irq: AtomicPtr::new(std::ptr::null_mut()),
+            cpu_irq: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
+            cpu_park: Mutex::new(Default::default()),
+            reset_hook: Mutex::new(None),
             memcfg_hook: Mutex::new(None),
             mlan: Mutex::new(w1::Bus::new()),
             unsupported: Mutex::new(Vec::new()),
@@ -226,10 +242,52 @@ impl Heart {
     /// are the CPU's IP2 to IP6 (Cause bits 10 to 14); HEART touches no
     /// other bit. The word must outlive this HEART.
     pub fn set_interrupts(&self, word: *const AtomicU64) {
+        self.set_cpu_interrupts(0, word);
+    }
+
+    /// [`Self::set_interrupts`] for processor `cpu`.
+    pub fn set_cpu_interrupts(&self, cpu: usize, word: *const AtomicU64) {
         let r = self.regs.lock();
-        self.cpu_irq.store(word as *mut AtomicU64, Ordering::Release);
+        self.cpu_irq[cpu].store(word as *mut AtomicU64, Ordering::Release);
         // Publish the levels as they stand into the new word.
-        self.drive(0x1f, r.out);
+        self.drive(cpu, 0x1f, r.out[cpu]);
+    }
+
+    /// Where the MODE register's disable bits hold processor `cpu`.
+    pub fn set_cpu_park(&self, cpu: usize, slot: Arc<ParkSlot>) {
+        self.cpu_park.lock()[cpu] = Some(slot);
+    }
+
+    /// Call `f` when the guest sets the software-reset bit. On the writing
+    /// CPU's thread, outside HEART's lock.
+    pub fn on_soft_reset(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.reset_hook.lock() = Some(f);
+    }
+
+    /// Hold or release the CPUs whose disable bits changed from `old` to `new`.
+    /// Under the register lock: the slots are leaves.
+    fn apply_disables(&self, old: u64, new: u64) {
+        let changed = (old ^ new) >> MODE_PROC_DISABLE_SHIFT;
+        if changed == 0 {
+            return;
+        }
+        let park = self.cpu_park.lock();
+        for (cpu, slot) in park.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            if changed & (1 << cpu) != 0 {
+                if new >> (MODE_PROC_DISABLE_SHIFT + cpu as u32) & 1 != 0 {
+                    slot.hold(HOLD_HEART);
+                } else {
+                    slot.release(HOLD_HEART);
+                }
+            }
+        }
+    }
+
+    /// The status register: which processors are fitted, and HEART's widget id.
+    fn status(&self) -> u64 {
+        let active = (1u64 << self.cfg.cpus) - 1;
+        (active << 4) | 8
     }
 
     /// Call `f` with the four bank descriptors whenever the guest (or a
@@ -282,8 +340,8 @@ impl Heart {
 
     /// Set the outputs in `changed` to `levels` in the CPU's word, as the
     /// IOC does on the Indy. Under the register lock: the word is a leaf.
-    fn drive(&self, changed: u8, levels: u8) {
-        let p = self.cpu_irq.load(Ordering::Acquire);
+    fn drive(&self, cpu: usize, changed: u8, levels: u8) {
+        let p = self.cpu_irq[cpu].load(Ordering::Acquire);
         if p.is_null() || changed == 0 {
             return;
         }
@@ -303,19 +361,20 @@ impl Heart {
 
     /// Drive the CPU's pins to what the registers now say.
     fn update_irq(&self, r: &mut Regs) {
-        let new = r.levels();
-        if new == r.out {
-            return;
+        for cpu in 0..self.cfg.cpus as usize {
+            let new = r.levels(cpu);
+            if new != r.out[cpu] {
+                let changed = new ^ r.out[cpu];
+                r.out[cpu] = new;
+                self.drive(cpu, changed, new);
+            }
         }
-        let changed = new ^ r.out;
-        r.out = new;
-        self.drive(changed, new);
     }
 
     /// The level IPn (n = 2..6) is at, for tests and the monitor.
     pub fn pin(&self, n: u32) -> bool {
         assert!((2..=6).contains(&n), "HEART drives IP2 to IP6, not IP{n}");
-        self.regs.lock().out & (1 << (n - 2)) != 0
+        self.regs.lock().out[0] & (1 << (n - 2)) != 0
     }
 
     pub fn pending(&self) -> u64 {
@@ -375,18 +434,19 @@ impl Heart {
                 0x18 => Some(r.mem_req_arb),
                 0x50 => Some(r.flow_cell[0]),
                 0x58 => Some(r.flow_cell[1]),
-                // Processor status: CPU 0 present, and this is CPU 0.
-                0x80 => Some(0x18),
+                0x80 => Some(self.status()),
                 0x98 => Some(r.ecc_address),
                 0xa0 => Some(r.ecc_data),
                 0xb0 => Some(r.clock_divider),
                 0x10000 | 0x10008 | 0x10010 | 0x10018 => Some(r.mask[((off - 0x10000) / 8) as usize]),
                 0x10030 => Some(r.pending),
-                0x10038 => Some(r.pending & r.mask[0]),
+                // The reader's own mask: a CPU services what it enabled.
+                0x10038 => Some(r.pending & r.mask[current_cpu()]),
                 0x10040 => Some(r.ecc_cause),
                 0x20000 => Some(r.counter((self.clock)())),
                 0x30000 => Some(r.compare as u64),
-                0x50000 => Some(0),
+                // Who is asking.
+                0x50000 => Some(current_cpu() as u64),
                 _ => None,
             };
             if let Some(v) = v {
@@ -438,8 +498,15 @@ impl Heart {
                         self.note(off, size, true);
                         r = self.regs.lock();
                     }
-                    r.mode = val;
+                    let old = std::mem::replace(&mut r.mode, val);
+                    self.apply_disables(old, val);
                     self.update_irq(&mut r);
+                    if val & !old & MODE_SOFT_RESET != 0 {
+                        drop(r);
+                        if let Some(f) = self.reset_hook.lock().as_ref() {
+                            f();
+                        }
+                    }
                     return true;
                 }
                 0x08 => r.sdram_mode = val,
@@ -667,9 +734,12 @@ impl crate::traits::Resettable for Heart {
         // A reset with the machine stopped leaves the counter held at zero.
         let paused_at = r.paused_at.map(|_| now);
         let out = r.out;
+        let old_mode = r.mode;
         *r = Regs::new(now);
         r.paused_at = paused_at;
         r.out = out;
+        // Every processor is served again.
+        self.apply_disables(old_mode, 0);
         self.update_irq(&mut r);
         let banks = r.banks();
         drop(r);
@@ -715,10 +785,26 @@ impl crate::traits::Device for Heart {
                     r.mode,
                     r.pending,
                     r.mask[0],
-                    r.out,
+                    r.out[0],
                     r.counter((self.clock)()),
                     self.packets.load(Ordering::Relaxed)
                 );
+                let park = self.cpu_park.lock();
+                for cpu in 1..self.cfg.cpus as usize {
+                    s.push_str(&format!("cpu {cpu}: mask {:#018x} out IP2-6 {:05b}\n", r.mask[cpu], r.out[cpu]));
+                }
+                if self.cfg.cpus > 1 {
+                    for (cpu, slot) in park.iter().enumerate().take(self.cfg.cpus as usize) {
+                        if let Some(slot) = slot {
+                            let disabled = r.mode >> (MODE_PROC_DISABLE_SHIFT + cpu as u32) & 1 != 0;
+                            s.push_str(&format!("cpu {cpu}: {} holds {:#x}{}\n",
+                                if slot.is_parked() { "parked" } else { "running" },
+                                slot.holds(),
+                                if disabled { " (disabled in MODE)" } else { "" }));
+                        }
+                    }
+                }
+                drop(park);
                 for (i, d) in r.descriptor[..BANKS].iter().enumerate() {
                     s.push_str(&format!("bank {i}: descriptor {d:#010x}, {} MiB fitted\n", self.cfg.banks[i] >> 20));
                 }
@@ -766,6 +852,112 @@ mod tests {
 
     fn rq(h: &Heart, off: u32) -> u64 {
         h.piu_read(off, 8).unwrap()
+    }
+
+    /// HEART holds raw pointers to `words`, so they stay together: taking a
+    /// test's HEART out alone would leave it writing into freed memory.
+    struct TwoCpus {
+        h: Heart,
+        words: Box<[AtomicU64; 2]>,
+        slots: [Arc<ParkSlot>; 2],
+    }
+
+    fn two_cpu_heart() -> TwoCpus {
+        let mut cfg = HeartConfig::octane([128 << 20, 0, 0, 0]);
+        cfg.cpus = 2;
+        let h = Heart::new(cfg, Arc::new(|| 0));
+        let words = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let slots = [Arc::new(ParkSlot::new(&words[0])), Arc::new(ParkSlot::new(&words[1]))];
+        for cpu in 0..2 {
+            h.set_cpu_interrupts(cpu, &words[cpu]);
+            h.set_cpu_park(cpu, slots[cpu].clone());
+        }
+        TwoCpus { h, words, slots }
+    }
+
+    /// Runs `f` on a thread that is CPU `cpu`, as HEART sees it.
+    fn as_cpu<R: Send>(cpu: u8, f: impl FnOnce() -> R + Send) -> R {
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                crate::cpu::smp::set_current_cpu(cpu);
+                f()
+            })
+            .join()
+            .unwrap()
+        })
+    }
+
+    const LEVEL2_IP4_CAUSE: u64 = 1 << 12;
+
+    #[test]
+    fn each_cpu_reads_its_own_number_and_all_see_the_fitted_ones() {
+        let TwoCpus { h, .. } = &two_cpu_heart();
+        assert_eq!(as_cpu(0, || rq(&h, 0x50000)), 0);
+        assert_eq!(as_cpu(1, || rq(&h, 0x50000)), 1);
+        assert_eq!(as_cpu(1, || rq(&h, 0x80)), 0x38);
+    }
+
+    #[test]
+    fn one_fitted_cpu_reads_as_it_always_did() {
+        let f = heart();
+        assert_eq!(rq(&f.heart, 0x80), 0x18);
+        assert_eq!(rq(&f.heart, 0x50000), 0);
+    }
+
+    #[test]
+    fn an_ipi_interrupts_only_its_destination() {
+        let TwoCpus { h, words, .. } = &two_cpu_heart();
+        let ipi = |cpu: u32| 1u64 << (46 + cpu);
+        wq(&h, 0x10000, ipi(0));
+        wq(&h, 0x10008, ipi(1));
+        as_cpu(0, || wq(&h, 0x10020, ipi(1)));
+        assert_eq!(words[0].load(Ordering::SeqCst) & LEVEL2_IP4_CAUSE, 0);
+        assert_ne!(words[1].load(Ordering::SeqCst) & LEVEL2_IP4_CAUSE, 0);
+        as_cpu(1, || wq(&h, 0x10028, ipi(1)));
+        assert_eq!(words[1].load(Ordering::SeqCst) & LEVEL2_IP4_CAUSE, 0);
+    }
+
+    #[test]
+    fn imsr_is_masked_by_the_reader() {
+        let TwoCpus { h, .. } = &two_cpu_heart();
+        wq(&h, 0x10000, 0b01);
+        wq(&h, 0x10008, 0b10);
+        wq(&h, 0x10020, 0b11);
+        assert_eq!(as_cpu(0, || rq(&h, 0x10038)), 0b01);
+        assert_eq!(as_cpu(1, || rq(&h, 0x10038)), 0b10);
+    }
+
+    #[test]
+    fn a_disable_bit_holds_its_cpu_and_clearing_it_lets_go() {
+        let TwoCpus { h, words, slots } = &two_cpu_heart();
+        let park = crate::cpu::smp::HOST_PARK_BIT;
+        wq(&h, 0, 1 << 61);
+        assert_ne!(words[1].load(Ordering::SeqCst) & park, 0);
+        assert_eq!(words[0].load(Ordering::SeqCst) & park, 0);
+        assert_eq!(slots[1].holds(), HOLD_HEART);
+        wq(&h, 0, 0);
+        assert_eq!(words[1].load(Ordering::SeqCst) & park, 0);
+    }
+
+    #[test]
+    fn a_reset_serves_every_processor_again() {
+        let TwoCpus { h, words, .. } = &two_cpu_heart();
+        wq(&h, 0, 1 << 61);
+        h.power_on();
+        assert_eq!(words[1].load(Ordering::SeqCst) & crate::cpu::smp::HOST_PARK_BIT, 0);
+    }
+
+    #[test]
+    fn the_software_reset_bit_asks_once_per_edge() {
+        let TwoCpus { h, .. } = &two_cpu_heart();
+        let asked = Arc::new(AtomicU64::new(0));
+        let a = asked.clone();
+        h.on_soft_reset(Box::new(move || {
+            a.fetch_add(1, Ordering::SeqCst);
+        }));
+        wq(&h, 0, MODE_SOFT_RESET);
+        wq(&h, 0, MODE_SOFT_RESET);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
     }
 
     #[test]

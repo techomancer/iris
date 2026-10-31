@@ -374,6 +374,8 @@ pub struct Mgras {
     heartbeat: Arc<AtomicU64>,
     fasttick: Arc<AtomicU64>,
     cycles: SpinLock<crate::cpu::mips_core::CyclesPtr>,
+    /// The other CPUs, for the status bar.
+    more_cpus: SpinLock<Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)>>,
     /// Annotated trace (`mgras trace`); `trace_mask` gates the hot paths.
     trace: SpinLock<debug::MgrasTrace>,
     trace_mask: AtomicU32,
@@ -539,6 +541,7 @@ impl Mgras {
             addr_of_mut!((*p).heartbeat).write(heartbeat);
             addr_of_mut!((*p).fasttick).write(fasttick);
             addr_of_mut!((*p).cycles).write(SpinLock::new(crate::cpu::mips_core::CyclesPtr::dangling()));
+            addr_of_mut!((*p).more_cpus).write(SpinLock::new(Vec::new()));
             addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new()));
             a.assume_init()
         };
@@ -972,6 +975,16 @@ impl Mgras {
     /// Wire up the CPU cycle counter for the status bar's MIPS figure.
     pub fn set_cpu_cycles(&self, ptr: crate::cpu::mips_core::CyclesPtr) {
         *self.cycles.lock() = ptr;
+    }
+
+    /// One more CPU for the status bar.
+    pub fn add_cpu_stats(&self, cycles: crate::cpu::mips_core::CyclesPtr, fasttick: Arc<AtomicU64>) {
+        self.more_cpus.lock().push((cycles, fasttick));
+    }
+
+    fn more_cpu_stats(&self) -> [Option<(u64, u64)>; crate::disp::MORE_CPUS] {
+        let more = self.more_cpus.lock();
+        std::array::from_fn(|i| more.get(i).map(|(c, f)| (c.get(), f.load(Ordering::Relaxed))))
     }
 
     fn offset(&self, addr: u64) -> Option<u32> {

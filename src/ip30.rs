@@ -58,7 +58,7 @@ pub const BOOT_FLASH: std::ops::Range<u64> = 0x1fc0_0000..0x2000_0000;
 
 /// Where the CPU was at the end of its last batch, for the unmapped log.
 /// The machine's batch hook stores it.
-pub static LAST_PC: AtomicU64 = AtomicU64::new(0);
+pub static LAST_PC: [AtomicU64; crate::cpu::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::smp::MAX_CPUS];
 
 /// What answers an address nothing claims: a bus error, noted with the PC
 /// for the monitor's `ip30 unmapped`.
@@ -77,7 +77,7 @@ impl Unmapped {
         if self.full.load(Ordering::Relaxed) {
             return;
         }
-        let pc = LAST_PC.load(Ordering::Relaxed);
+        let pc = LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
         let mut u = self.misses.lock();
         if !u.iter().any(|&(a, w, _)| a == addr && w == write) {
             if std::env::var_os("IRIS_IP30_TRACE").is_some() {
@@ -265,14 +265,41 @@ const CACHE_LINE: u64 = 128;
 /// always reach the flash. Reset empties it. What the hardware does if such
 /// a line is ever written back is not modelled. Outside the flash window
 /// every access, the fast paths included, goes straight to the bus.
+///
+/// With several CPUs each has its own, as each has its own cache (the PROM runs
+/// non-coherent, `Config.K0` = 3), and cached reads hold their lines too,
+/// filled from the flash's array: while one CPU has the part in status mode
+/// another keeps executing from flash, and on the hardware that CPU hits its
+/// instruction cache. Reading through instead hands it the status byte as an
+/// instruction.
 pub struct CachedFlashLines {
     bus: Arc<dyn BusDevice>,
     lines: Mutex<std::collections::HashMap<u64, [u8; CACHE_LINE as usize]>>,
+    hold_reads: bool,
 }
 
 impl CachedFlashLines {
     pub fn new(bus: Arc<dyn BusDevice>) -> Self {
-        Self { bus, lines: Mutex::new(std::collections::HashMap::new()) }
+        Self { bus, lines: Mutex::new(std::collections::HashMap::new()), hold_reads: false }
+    }
+
+    /// One CPU of several: see the type's doc.
+    pub fn for_one_of_several_cpus(bus: Arc<dyn BusDevice>) -> Self {
+        Self { hold_reads: true, ..Self::new(bus) }
+    }
+
+    /// The line at `base` as the flash's array holds it.
+    fn fill(&self, base: u64) -> Result<[u8; CACHE_LINE as usize], u32> {
+        let mut words = [0u64; (CACHE_LINE / 8) as usize];
+        let r = crate::dev::sflash::reading_the_array(|| self.bus.read_block(base, &mut words));
+        if r != BUS_OK {
+            return Err(r);
+        }
+        let mut line = [0u8; CACHE_LINE as usize];
+        for (chunk, w) in line.chunks_mut(8).zip(words) {
+            chunk.copy_from_slice(&w.to_be_bytes());
+        }
+        Ok(line)
     }
 
     /// Forget every line, as a reset loses the cache's contents.
@@ -286,8 +313,13 @@ impl CachedFlashLines {
         if !BOOT_FLASH.contains(&addr) {
             return None;
         }
-        let lines = self.lines.lock();
-        let line = lines.get(&(addr & !(CACHE_LINE - 1)))?;
+        let base = addr & !(CACHE_LINE - 1);
+        let mut lines = self.lines.lock();
+        if self.hold_reads && !lines.contains_key(&base) {
+            // A failed fill goes on to the bus, which reports it.
+            lines.insert(base, self.fill(base).ok()?);
+        }
+        let line = lines.get(&base)?;
         let at = (addr & (CACHE_LINE - 1)) as usize;
         Some(line[at..at + n].iter().fold(0, |v, &b| v << 8 | b as u64))
     }
@@ -303,15 +335,10 @@ impl CachedFlashLines {
         let line = match lines.entry(base) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                let mut words = [0u64; (CACHE_LINE / 8) as usize];
-                let r = self.bus.read_block(base, &mut words);
-                if r != BUS_OK {
-                    return Some(r);
-                }
-                let mut line = [0u8; CACHE_LINE as usize];
-                for (chunk, w) in line.chunks_mut(8).zip(words) {
-                    chunk.copy_from_slice(&w.to_be_bytes());
-                }
+                let line = match self.fill(base) {
+                    Ok(line) => line,
+                    Err(r) => return Some(r),
+                };
                 e.insert(line)
             }
         };

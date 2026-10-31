@@ -594,6 +594,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 [machine]
 profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
 cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
+# cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
 board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact) or "none"

@@ -4661,10 +4661,15 @@ fn emit_mem_write_split(
         let page = ctx.builder.ins().ushr_imm_s(path.fast_phys, 12);
         let off = ctx.builder.ins().imul_imm_s(page, 8);
         let gp = ctx.builder.ins().iadd(gen_base, off);
-        let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
-            ir::immediates::Offset32::new(0));
-        let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
-        ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+        if ctx.dc_geometry.atomic_gen {
+            let one = ctx.builder.ins().iconst(ir::types::I64, 1);
+            ctx.builder.ins().atomic_rmw(ir::types::I64, mem, ir::AtomicRmwOp::Add, gp, one);
+        } else {
+            let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
+                ir::immediates::Offset32::new(0));
+            let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
+            ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+        }
 
         // tc_invalidate_l2_code: writing the line makes L2's decoded
         // instruction slots for it stale, so clear `has_code` if this line is

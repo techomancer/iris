@@ -554,10 +554,13 @@ impl BusDevice for PpMemory {
         unsafe {
             let p = (self.base as *mut u64).add(self.off(addr) >> 3);
             // Storage keeps qwords rotate_left(32); rotate val/mask to match.
-            let old = *p;
             let v = val.rotate_left(32);
             let m = mask.rotate_left(32);
-            *p = (old & !m) | (v & m);
+            // Compare-exchange: another CPU or a DMA engine may store to the
+            // rest of this doubleword meanwhile.
+            let _ = AtomicU64::from_ptr(p).fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+                Some((old & !m) | (v & m))
+            });
         }
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
@@ -662,6 +665,8 @@ struct SpaceState {
     /// path is one load instead of two — hence one sink per consumer rather
     /// than a shared indirection. Points at `own_bitmap` until claimed.
     sink2: *mut u64,
+    /// Further CPUs' inline copies (`PpMemSpace::add_bitmap_sink`).
+    more_sinks: Vec<*mut u64>,
 }
 
 /// The bitmap `PpMemSpace` publishes into before a CPU claims it.
@@ -678,7 +683,8 @@ struct OwnBitmap(Box<u64>);
 //   * Every mutating entry point — `map_bank`, `map_alias`, `clear_mappings`,
 //     `set_bitmap_sink` — is reached only from `Physical::remap_banks`, which
 //     the MC invokes synchronously inside the CPU's store to MEMCFG. That is
-//     always the CPU thread.
+//     always a CPU thread, and with several CPUs the others are parked for it
+//     (`smp::World::stop_others`, wired where HEART's descriptors reach memory).
 //   * Device threads (MC-DMA, seeq, VINO) reach RAM through `BusDevice` on the
 //     individual `PpMemory` banks. They never touch `PpMemSpace`.
 //   * `mapped_bitmap()` reads the sink and is likewise CPU-thread-only; the
@@ -711,6 +717,7 @@ impl PpMemSpace {
                 mappings: Vec::new(),
                 sink,
                 sink2,
+                more_sinks: Vec::new(),
             }),
         })
     }
@@ -803,6 +810,9 @@ impl PpMemSpace {
         unsafe {
             *state.sink = bits;
             *state.sink2 = bits;
+            for &s in &state.more_sinks {
+                *s = bits;
+            }
         }
     }
 
@@ -813,6 +823,18 @@ impl PpMemSpace {
             .retain(|m| !(m.at >= at && m.at + m.len <= at + len));
         state.mappings.push(Mapping { at, len });
         Self::recompute_bitmap(state);
+    }
+}
+
+impl PpMemSpace {
+    /// Publish the bitmap to one more `u64` as well: a second CPU's inline
+    /// copies. Same contract as [`MappedMemory::set_bitmap_sink`]. The value
+    /// arrives with the next remap.
+    ///
+    /// # Safety
+    /// `ptr` must stay valid for as long as this space exists.
+    pub unsafe fn add_bitmap_sink(&self, ptr: *mut u64) {
+        unsafe { (*self.state.get()).more_sinks.push(ptr) };
     }
 }
 
@@ -839,6 +861,9 @@ impl MappedMemory for PpMemSpace {
         unsafe {
             *st.sink = 0;
             *st.sink2 = 0;
+            for &s in &st.more_sinks {
+                *s = 0;
+            }
         }
     }
 
@@ -1003,6 +1028,29 @@ impl MappedMemory for PpMemSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two CPUs storing to different bytes of one doubleword, as SWL/SWR do:
+    /// neither may lose the other's. A read and a store here loses them within
+    /// a few thousand rounds on any multicore host.
+    #[test]
+    fn masked_stores_to_one_doubleword_keep_each_others_bytes() {
+        let m = std::sync::Arc::new(PpMemory::try_new(8).unwrap());
+        const ROUNDS: u64 = 200_000;
+        let store = |mask: u64, shift: u32| {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                for i in 1..=ROUNDS {
+                    m.write64_masked(0x1000, i << shift, mask);
+                    let seen = (m.read64(0x1000).data & mask) >> shift;
+                    assert_eq!(seen, i, "this CPU's own bytes were overwritten");
+                }
+            })
+        };
+        let (a, b) = (store(0xffff_ffff_0000_0000, 32), store(0x0000_0000_ffff_ffff, 0));
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(m.read64(0x1000).data, ROUNDS << 32 | ROUNDS);
+    }
 
     const MB: usize = 1024 * 1024;
 

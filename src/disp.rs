@@ -493,11 +493,28 @@ impl StatusBarTexture {
     }
 }
 
+/// CPUs the status bar shows beyond the first.
+pub const MORE_CPUS: usize = crate::cpu::smp::MAX_CPUS - 1;
+
+/// The bar's MIPS and Hz figures: one per CPU, the first as it always was
+/// ("95.1|94.8", " 100|100").
+fn rate_figures(mips: f64, hz: f64, more: &[Option<(f64, f64)>]) -> (String, String) {
+    let mut m = format!("{mips:5.1}");
+    let mut h = format!("{hz:4.0}");
+    for (cpu_mips, cpu_hz) in more.iter().flatten() {
+        m.push_str(&format!("|{cpu_mips:.1}"));
+        h.push_str(&format!("|{cpu_hz:.0}"));
+    }
+    (m, h)
+}
+
 /// Snapshot of CPU counters and wall-clock time captured once per refresh loop iteration.
 pub struct BarStats {
     pub now:            std::time::Instant,
     pub cycles:         u64,
     pub fasttick:       u64,
+    /// The other CPUs' `cycles` and `fasttick`, if the machine has any.
+    pub more_cpus:      [Option<(u64, u64)>; MORE_CPUS],
     pub decoded_delta:  u64,
     pub l1i_hits:       u64,
     pub l1i_fetches:    u64,
@@ -546,6 +563,9 @@ pub struct StatusBar {
     led_green: bool,
     prev_cycles: u64,
     prev_fasttick: u64,
+    prev_more: [(u64, u64); MORE_CPUS],
+    /// The other CPUs' MIPS and Hz, as `mips` and `fasthz` are for the first.
+    more_rates: [Option<(f64, f64)>; MORE_CPUS],
     prev_time: std::time::Instant,
     mips: f64,
     fasthz: f64,
@@ -586,6 +606,8 @@ impl StatusBar {
             led_green: false,
             prev_cycles: 0,
             prev_fasttick: 0,
+            prev_more: [(0, 0); MORE_CPUS],
+            more_rates: [None; MORE_CPUS],
             prev_time: std::time::Instant::now(),
             mips: 0.0,
             fasthz: 0.0,
@@ -648,16 +670,24 @@ impl StatusBar {
             self.fasthz = (df as f64 / dt).round();
             self.prev_cycles   = stats.cycles;
             self.prev_fasttick = stats.fasttick;
+            for (i, more) in stats.more_cpus.iter().enumerate() {
+                self.more_rates[i] = more.map(|(c, f)| {
+                    let (pc, pf) = self.prev_more[i];
+                    self.prev_more[i] = (c, f);
+                    ((c.wrapping_sub(pc) as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0, (f.wrapping_sub(pf) as f64 / dt).round())
+                });
+            }
             self.prev_time     = stats.now;
         }
 
         let tx_color = if self.enet_tx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
         let rx_color = if self.enet_rx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
 
+        let (mips, hz) = rate_figures(self.mips, self.fasthz, &self.more_rates);
         #[cfg(feature = "developer")]
-        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cnt:{:5.1}MHz g{:04X} NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_hz as f64 / 1e6, stats.gfifo_pending);
+        let line = format!(" {mips} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {hz}Hz cnt:{:5.1}MHz g{:04X} NET:", self.decode_pct, self.l1i_hit_pct, self.uncached_pct, stats.count_hz as f64 / 1e6, stats.gfifo_pending);
         #[cfg(not(feature = "developer"))]
-        let line = format!(" {:5.1} MIPS {:4.0}Hz NET:", self.mips, self.fasthz);
+        let line = format!(" {mips} MIPS {hz}Hz NET:");
 
         let row_stride = 2048;
         for row in 0..STATUS_BAR_HEIGHT {
@@ -869,4 +899,19 @@ pub fn save_screenshot(path: &str, rgba: &[u32], width: usize, height: usize) ->
         }
     }
     writer.write_image_data(&rows).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod rate_figure_tests {
+    use super::rate_figures;
+
+    #[test]
+    fn one_cpu_reads_as_it_always_did() {
+        assert_eq!(rate_figures(95.1, 100.0, &[None, None, None]), (" 95.1".to_string(), " 100".to_string()));
+    }
+
+    #[test]
+    fn each_further_cpu_adds_a_figure() {
+        assert_eq!(rate_figures(95.1, 100.0, &[Some((94.8, 99.0)), None, None]), (" 95.1|94.8".to_string(), " 100|99".to_string()));
+    }
 }

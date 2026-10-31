@@ -311,7 +311,7 @@ impl O2Machine {
         // commands (registers, breakpoints, memory) and the O2's devices'.
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
-        monitor.register_device(cpu.clone().as_device());
+        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
         monitor.register_device(bus.clone());
         // `phys`: the physical bus's decode table, memory and traces.
         monitor.register_device(bus.phys.clone());
@@ -913,6 +913,7 @@ impl O2Display {
                 screen.status_bar_only = false;
                 let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
                 let stats = crate::disp::BarStats {
+                    more_cpus: Default::default(),
                     now: start,
                     hb: self.bus.mace.id.heartbeat.fetch_and(crate::dev::ng1::rex3::Rex3::HB_PERSISTENT, Ordering::Relaxed),
                     cycles: self.cycles.get(),

@@ -91,7 +91,7 @@ pub fn pfn_of(phys_addr: u64) -> Option<Pfn> {
 ///
 /// Boxed rather than inline so `Jitv2` itself stays small enough to move
 /// cheaply (it is constructed into an `Arc<Mutex<..>>`).
-pub struct PfnMap(Box<[u32]>);
+pub struct PfnMap(Box<[AtomicU32]>);
 
 /// `PfnMap`'s own "no slot here" sentinel. Numerically identical to each
 /// impl module's private `NO_SLOT` (both `u32::MAX`), spelled separately
@@ -102,35 +102,40 @@ pub const PFN_MAP_EMPTY: u32 = u32::MAX;
 impl PfnMap {
     /// One allocation, every frame empty.
     pub fn new() -> Self {
-        PfnMap(vec![PFN_MAP_EMPTY; PFN_MAP_ENTRIES].into_boxed_slice())
+        PfnMap((0..PFN_MAP_ENTRIES).map(|_| AtomicU32::new(PFN_MAP_EMPTY)).collect())
     }
 
     /// The slot for `pfn`, or `None` when unmapped.
     #[inline(always)]
     pub fn get(&self, pfn: u32) -> Option<u32> {
-        let slot = self.0[pfn as usize];
+        let slot = self.0[pfn as usize].load(Ordering::Acquire);
         if slot == PFN_MAP_EMPTY { None } else { Some(slot) }
     }
 
+    /// After the slot is claimed: another CPU's lock-free lookup that sees this
+    /// sees the claim too. A claimed page's `pfn` and `gen` change only in a
+    /// flush, which every CPU sits out, so they need no atomics of their own.
     #[inline(always)]
     pub fn insert(&mut self, pfn: u32, slot: u32) {
-        self.0[pfn as usize] = slot;
+        self.0[pfn as usize].store(slot, Ordering::Release);
     }
 
     #[inline(always)]
     pub fn remove(&mut self, pfn: u32) {
-        self.0[pfn as usize] = PFN_MAP_EMPTY;
+        self.0[pfn as usize].store(PFN_MAP_EMPTY, Ordering::Release);
     }
 
     /// Drop every mapping (`mega_flush`). A 4 MiB memset — flushes are rare
     /// and already far more expensive than this, so no generation-tag
     /// indirection is worth paying for on every lookup to avoid it.
     pub fn clear(&mut self) {
-        self.0.fill(PFN_MAP_EMPTY);
+        for e in self.0.iter() {
+            e.store(PFN_MAP_EMPTY, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
-    pub fn as_ptr(&self) -> *const u32 {
+    pub fn as_ptr(&self) -> *const AtomicU32 {
         self.0.as_ptr()
     }
 }
@@ -163,6 +168,18 @@ pub const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
 /// exhaustion match arm) stays as a belt-and-suspenders backstop, not the
 /// primary trigger.
 pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = ARENA_RESERVE_SIZE as u64 - 16 * 1024 * 1024;
+
+/// [`CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`], or `IRIS_JIT_ARENA_FLUSH_MB`: a low
+/// value makes the compile workers' own flush happen often enough to test.
+fn arena_flush_threshold() -> u64 {
+    static T: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("IRIS_JIT_ARENA_FLUSH_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES, |mb| (mb << 20).min(CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES))
+    })
+}
 
 /// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
 /// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
@@ -2417,7 +2434,7 @@ impl Jitv2 {
     }
 
     /// Pointers for lock-free `pfn -> *mut PhysicalCodePage` fast lookup.
-    pub fn fast_lookup_ptrs(&mut self) -> (*const u32, *mut PhysicalCodePage) {
+    pub fn fast_lookup_ptrs(&mut self) -> (*const AtomicU32, *mut PhysicalCodePage) {
         (self.pfn_to_slot.as_ptr(), self.pages.as_mut_ptr())
     }
 
@@ -2613,6 +2630,12 @@ impl Jitv2 {
         }
     }
 
+    /// No page is left to claim. A CPU that waited its turn to flush checks,
+    /// because the CPU ahead of it may have just done it.
+    pub fn pool_exhausted(&self) -> bool {
+        self.free_head == NO_SLOT
+    }
+
     /// Mirror image of [`Self::flush_from_cpu_thread`], called FROM the
     /// compile thread.
     pub unsafe fn flush_from_jit_thread(&mut self, function_count: u32) {
@@ -2763,6 +2786,10 @@ pub struct CompileQueue {
     /// mid-teardown and there's nothing to stop/start anymore, which is fine
     /// to skip.
     cpu: Mutex<Option<Weak<dyn Device>>>,
+    /// With several CPUs sharing this pool, how a flush stops them all. `cpu`
+    /// is not used then: stopping and restarting one CPU's thread leaves the
+    /// others running, and would restart a CPU the monitor has stopped.
+    world: Mutex<Option<Arc<crate::cpu::smp::World>>>,
     /// Weak handle back to the owning `Jitv2` (behind whatever `Arc<Mutex<..>>`
     /// the caller shares it in) — the worker needs this to clear the page
     /// pool during its own flush (`worker_loop`'s doc comment explains why
@@ -2821,6 +2848,7 @@ impl CompileQueue {
             running: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
             cpu: Mutex::new(None),
+            world: Mutex::new(None),
             jitv2: Mutex::new(None),
             function_counts: Vec::new(),
             thread_count: 1,
@@ -2925,6 +2953,11 @@ impl CompileQueue {
     /// for a not-yet-started queue.
     pub fn set_cpu(&self, cpu: Weak<dyn Device>) {
         *self.cpu.lock() = Some(cpu);
+    }
+
+    /// Several CPUs share this pool: see the `world` field.
+    pub fn set_world(&self, world: Arc<crate::cpu::smp::World>) {
+        *self.world.lock() = Some(world);
     }
 
     /// Inject the weak handle back to the owning `Jitv2` — see the `jitv2`
@@ -3095,6 +3128,7 @@ impl CompileQueue {
             let running = self.running.clone();
             let bus = bus.clone();
             let cpu = self.cpu.lock().clone();
+            let world = self.world.lock().clone();
             let jitv2 = self.jitv2.lock().clone();
             let function_count = self.function_counts[i].clone();
             let stats = stats.clone();
@@ -3104,7 +3138,7 @@ impl CompileQueue {
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
+                    .spawn(move || Self::worker_loop(queue, running, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, quiesce_in_progress, thread_count, worker_mips4))
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3280,6 +3314,7 @@ impl CompileQueue {
         bus: Arc<dyn BusDevice>,
         mut codegen: crate::cpu::jitv2::codegen::Codegen,
         cpu: Option<Weak<dyn Device>>,
+        world: Option<Arc<crate::cpu::smp::World>>,
         jitv2: Option<Weak<Mutex<Jitv2>>>,
         function_count: Arc<AtomicU32>,
         stats: Arc<JitStats>,
@@ -3428,7 +3463,26 @@ impl CompileQueue {
                 // if taken here first. Lock only for the actual flush
                 // (flush_from_jit_thread's own doc comment), release before
                 // cpu.start().
-                cpu.stop();
+                //
+                // Several CPUs: park them all instead, without blocking on a
+                // CPU that leads a flush of its own. That CPU joins this
+                // thread, so give way once the pool is stopping.
+                let world_hold = match &world {
+                    Some(w) => loop {
+                        if let Some(hold) = w.try_lead() {
+                            break Some(hold);
+                        }
+                        if !running.load(Ordering::Relaxed) {
+                            abandon_quiesce(pending);
+                            return;
+                        }
+                        std::thread::sleep(BARRIER_FOLLOWER_POLL_INTERVAL);
+                    },
+                    None => {
+                        cpu.stop();
+                        None
+                    }
+                };
                 // Every request still sitting in the shared queue right now
                 // points into the pool flush_from_jit_thread is about to
                 // clear — drain them before the flush, not after, or the
@@ -3468,7 +3522,10 @@ impl CompileQueue {
                     cv.notify_all();
                 }
                 quiesce_in_progress.store(false, Ordering::Release);
-                cpu.start();
+                if world_hold.is_none() {
+                    cpu.start();
+                }
+                drop(world_hold);
                 // flush_from_jit_thread reset codegen back to 0.
                 function_count.store(0, Ordering::Relaxed);
             }
@@ -3618,7 +3675,7 @@ impl CompileQueue {
                         // be retried on this offset's next real arrival —
                         // same as any other "retry later" outcome.
                         try_flush(&mut codegen, &function_count, &mut pending);
-                    } else if reserved_bytes > CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES {
+                    } else if reserved_bytes > arena_flush_threshold() {
                         // Real bytes reserved in the arena (not a
                         // function-count proxy — see
                         // CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES's own doc
@@ -5118,7 +5175,7 @@ mod tests {
         let slot = jit.page_for(7, 7 * PAGE_SIZE, &dev, false).unwrap();
         let (pfn_map_ptr, pages_base) = jit.fast_lookup_ptrs();
         unsafe {
-            let mapped_slot = *pfn_map_ptr.add(7);
+            let mapped_slot = (*pfn_map_ptr.add(7)).load(Ordering::Acquire);
             assert_eq!(mapped_slot, slot);
             let page = &*pages_base.add(mapped_slot as usize);
             assert_eq!(page.pfn, 7);

@@ -229,6 +229,10 @@ pub struct JitDcGeometry {
     /// probe, no LRU and no dirty bit (the R10000's shadow cache). The other
     /// fields are then unused.
     pub tagless: bool,
+    /// Inline stores bump the page generation with an atomic add: other writers
+    /// are active, and a plain add landing after theirs would move the counter
+    /// backwards and let stale code publish.
+    pub atomic_gen: bool,
 }
 
 impl JitDcGeometry {
@@ -236,7 +240,7 @@ impl JitDcGeometry {
         Self {
             supported: false, line_shift: 0, num_lines_mask: 0, data_mask: 0,
             has_l2: false, l2_line_shift: 0, l2_num_lines_mask: 0,
-            ways: 1, num_lines_shift: 0, tagless: false,
+            ways: 1, num_lines_shift: 0, tagless: false, atomic_gen: false,
         }
     }
 }
@@ -777,6 +781,14 @@ pub trait MipsCache: Send + Sync {
 
     /// Set Load-Linked bit state
     fn set_llbit(&self, val: bool);
+
+    /// Atomically store `new` to the RAM word at `phys` if it still holds
+    /// `old`. `None`: this model cannot, or `phys` is not RAM it can reach
+    /// directly, and the caller stores the ordinary way. Only models that keep
+    /// no data of their own can serve several CPUs.
+    fn cas_ram32(&self, _phys: u64, _old: u32, _new: u32) -> Option<bool> { None }
+    /// The doubleword form of [`Self::cas_ram32`].
+    fn cas_ram64(&self, _phys: u64, _old: u64, _new: u64) -> Option<bool> { None }
 
     /// Get Load-Linked address
     fn get_lladdr(&self) -> u64;
@@ -3678,6 +3690,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             l2_num_lines_mask: if HAS_L2 { (L2_CACHE_SIZE / L2_LINE - 1) as u64 } else { 0 },
             ways: DC_WAYS as u32,
             num_lines_shift: Self::DC_NUM_LINES_SHIFT as u32,
+            atomic_gen: false,
             tagless: false,
         }
     }

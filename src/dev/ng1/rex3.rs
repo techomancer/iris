@@ -2982,6 +2982,7 @@ impl Rex3 {
 
             // Poll and clear activity bits; preserve persistent LED bits.
             let bar_stats = crate::disp::BarStats {
+                more_cpus: Default::default(),
                 now:          start,
                 hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
                 cycles:       self.cycles.get().get(),

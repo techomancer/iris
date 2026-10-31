@@ -29,6 +29,7 @@
 //!
 //! [`Bridge::attach_flash`]: crate::dev::bridge::Bridge::attach_flash
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -88,6 +89,21 @@ pub struct CfiFlash {
 
 /// The name this part had when it was only a PROM store.
 pub type Flash = CfiFlash;
+
+thread_local! {
+    static FILLING_A_CACHE_LINE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f`, whose flash reads see the array whatever command the part is in.
+/// For a CPU's cached view of the flash, which on the hardware holds lines
+/// from before the command: a second CPU keeps running out of its cache while
+/// the first has the part in status mode.
+pub fn reading_the_array<R>(f: impl FnOnce() -> R) -> R {
+    FILLING_A_CACHE_LINE.with(|c| c.set(true));
+    let r = f();
+    FILLING_A_CACHE_LINE.with(|c| c.set(false));
+    r
+}
 
 impl CfiFlash {
     /// A part of `size` bytes (a multiple of the block size, a power of two)
@@ -167,6 +183,9 @@ impl State {
     }
 
     fn read(&self, off: usize) -> u16 {
+        if self.mode != Mode::Array && FILLING_A_CACHE_LINE.with(Cell::get) {
+            return self.word(off);
+        }
         match self.mode {
             Mode::Array => self.word(off),
             Mode::Id => match off {
@@ -381,6 +400,8 @@ mod tests {
         wr(&f, 0, 0x7070);
         wr(&f, 0, 0x7171);
         assert_eq!(rd(&f, 0), 0x8080); // still in status mode
+        // A CPU's cached view is not fooled by it.
+        assert_ne!(reading_the_array(|| rd(&f, 0)), 0x8080);
     }
 
     #[test]

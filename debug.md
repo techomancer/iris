@@ -139,6 +139,40 @@ returns immediately, the stepping commands wait for completion. Starting a
 debug command stops threaded mode first. The GDB stub uses the same debug
 loop, so monitor and GDB breakpoints coexist.
 
+### Several CPUs
+
+The monitor talks to the machine's CPUs through one object, so with a single
+CPU every command behaves as described elsewhere here. An Octane with
+`[machine] cpus = 2` adds a choice of which CPU a command means.
+
+| Command | Description |
+|---|---|
+| `cpus` | List the CPUs, whether each runs, and which is selected (`*`) |
+| `cpu <n>` | Select CPU n for the commands that follow |
+| `cpu <n> <command>` | Run one command on CPU n alone (`cpu 1 dis pc 8`, `cpu 1 bp add 0x80000180`) |
+| `r<n>` | Registers of CPU n: `cpu <n> regs` |
+| `s<n>` [count] | Step CPU n: `cpu <n> step` |
+
+Without a number, `start`, `stop` and the breakpoint commands (`bp`, `b`, `bd`,
+`be`, `bb`) apply to every CPU, `status` answers for each, and everything else
+goes to the selected CPU. A number always means that CPU alone, even for `stop`.
+
+To step one CPU while the other holds still:
+
+```
+stop
+s1
+s1 20
+start
+```
+
+HEART's counter keeps running through a monitor stop, and the guest's
+timeouts count on it, so a long stop can make IRIX report that a CPU missed its
+clock. A breakpoint stops the CPU that hit it; the other keeps running until
+`stop`. `heart status` shows each CPU's mask, interrupt outputs and why it is
+held. `j2 inline` and `j2 clear` are refused with several CPUs. The GDB stub
+sees CPU 0.
+
 ### Registers
 
 | Command | Description |

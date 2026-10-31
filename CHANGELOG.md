@@ -13,6 +13,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Two processors on the Octane
+
+- **`[machine] cpus = 2`** runs an Octane with two R10000s on two host threads.
+  The real PROM and IRIX bring the second up through HEART, which now answers per
+  processor; IRIX 6.5 schedules across both. Both share one body of jitv2 compiled
+  code. See [docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md).
+- **Monitor.** CPU commands moved out of `mips_exec.rs` behind one `CpuMonitor`.
+  With one CPU nothing changes. With two there are `cpus`, `cpu <n>`,
+  `cpu <n> <command>`, `r<n>` and `s<n>`, and the status bar shows MIPS and Hz per
+  CPU. See [debug.md](debug.md#several-cpus).
+- **HEART's software reset** (`MODE` bit 22) now resets the machine.
+- **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
+  DMA engine or another CPU storing beside them is not lost.
+
 ### VNC, and screen and pointer commands
 
 - **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the

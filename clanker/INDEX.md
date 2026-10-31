@@ -23,6 +23,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 
 | Note | Kind | Title |
 |---|---|---|
+| [cached-flash-is-a-cache-with-two-cpus.md](cpu/cached-flash-is-a-cache-with-two-cpus.md) | rule | With two CPUs, cached flash reads must hold their lines: a fetch through to a chip in status mode executes `0x80808080` |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
 | [cache-tag-index-and-check-bits.md](cpu/cache-tag-index-and-check-bits.md) | rule | Cache tags: index ops index by address; check bits are generated, not stored |
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
@@ -112,6 +113,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |
 | [ip30-octane-bringup.md](devices/ip30-octane-bringup.md) | rule | What the Octane's PROM insists on (memory sizing, the Bridge status bit, empty slots, IOC3 bits, the one-wire parts' formats, its device tree) and what booting it through to IRIX added (cached flash lines, low-memory JIT counters, the ISP stall, HQ4 before a context switch) |
+| [ip30-module-name-must-match-active-cpus.md](devices/ip30-module-name-must-match-active-cpus.md) | rule | Octane: the module record must say PM10 for one CPU and PM20 for two, or the PROM fails its NIC diagnostic |
 | [ip30-low-memory-aliases-sdram.md](devices/ip30-low-memory-aliases-sdram.md) | rule | Octane: the 16 KiB at physical 0 is the first 16 KiB of SDRAM, which the processor reaches only there (0x2000_0000..+16 KiB bus-errors, as the stock IDE memory diagnostics expect); shares its JIT page generations; the guard holds on the table path only (the ppmem window maps whole units); DMA reach unknown |
 | [ip30-prom-stores-into-flash-stay-in-cache.md](devices/ip30-prom-stores-into-flash-stay-in-cache.md) | rule | Octane: the PROM's cached stores into its own flash never reach the Bridge; `CachedFlashLines` holds them (approximation: no write-back) |
 | [ip30-device-timing-on-hptimer.md](devices/ip30-device-timing-on-hptimer.md) | design | Octane: IOC3, RAD1 and ISP1040 pace themselves on `hptimer` one-shots, with threads only where something blocks (the ISP1040 ring, serial receive, NVRAM writer) |
@@ -340,6 +342,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 
 | Note | Kind | Title |
 |---|---|---|
+| [cpu-tests-make-dry-run-is-a-fork-bomb.md](testing/cpu-tests-make-dry-run-is-a-fork-bomb.md) | rule | `make -n` in cpu-tests recurses without end: 11k processes and an OOM |
 | [arcs-console-from-bare-metal.md](testing/arcs-console-from-bare-metal.md) | howto | Calling ARCS firmware from the bare-metal harness |
 | [bare-metal-harness-platform-assumptions.md](testing/bare-metal-harness-platform-assumptions.md) | howto | What the bare-metal suites assume about the machine |
 | [benchmark-suite-gotchas.md](testing/benchmark-suite-gotchas.md) | howto | Writing benchmark kernels for `bench/` — things that bit |
@@ -401,4 +404,5 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
+| [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |

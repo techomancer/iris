@@ -98,6 +98,7 @@ mod zz_corpus {
         // with 32-byte lines, 1 MiB L2 with 128-byte lines. The production
         // R4400 has 16-byte L1-D lines; this fixture measures emitted size.
         let geom = crate::cpu::mips_cache_v2::JitDcGeometry {
+            atomic_gen: false,
             supported: true,
             line_shift: 5,
             num_lines_mask: (16 * 1024 / 32) - 1,

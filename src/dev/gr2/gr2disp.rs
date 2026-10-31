@@ -39,6 +39,7 @@ impl Gr2 {
             if dirty || shot || frames_since_render >= IDLE_HEARTBEAT_FRAMES {
                 frames_since_render = 0;
                 let stats = crate::disp::BarStats {
+                    more_cpus: Default::default(),
                     now: start,
                     hb: self.stats.heartbeat.fetch_and(HB_PERSISTENT, Ordering::Relaxed),
                     cycles: self.cycles.get().get(),

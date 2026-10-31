@@ -489,11 +489,15 @@ impl<
 
     fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
         if let Some(base) = self.ram(phys_addr) {
+            // Compare-exchange, not a read and a store: another CPU's store
+            // to the rest of this doubleword must not be lost. No lock would
+            // do, because plain stores would not take it.
             let p = unsafe { base.add((phys_addr & !7) as usize) as *mut u64 };
-            unsafe {
-                let cur = (*p).rotate_left(32);
-                *p = ((cur & !mask) | (val & mask)).rotate_left(32);
-            }
+            let (v, m) = (val.rotate_left(32), mask.rotate_left(32));
+            let word = unsafe { std::sync::atomic::AtomicU64::from_ptr(p) };
+            let _ = word.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed, |cur| {
+                Some((cur & !m) | (v & m))
+            });
             self.bump_gen(phys_addr);
             return BUS_OK;
         }
@@ -662,6 +666,28 @@ impl<
 
     fn downstream(&self) -> Arc<dyn BusDevice> {
         self.downstream.clone()
+    }
+
+    fn cas_ram32(&self, phys: u64, old: u32, new: u32) -> Option<bool> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let base = self.ram(phys)?;
+        let word = unsafe { AtomicU32::from_ptr(base.add(phys as usize) as *mut u32) };
+        let ok = word.compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed).is_ok();
+        if ok {
+            self.bump_gen(phys);
+        }
+        Some(ok)
+    }
+
+    fn cas_ram64(&self, phys: u64, old: u64, new: u64) -> Option<bool> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let base = self.ram(phys)?;
+        let word = unsafe { AtomicU64::from_ptr(base.add(phys as usize) as *mut u64) };
+        let ok = word.compare_exchange(old.rotate_left(32), new.rotate_left(32), Ordering::AcqRel, Ordering::Relaxed).is_ok();
+        if ok {
+            self.bump_gen(phys);
+        }
+        Some(ok)
     }
 
     fn check_and_clear_llbit(&self, _phys_addr: u64) {
