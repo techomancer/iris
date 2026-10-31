@@ -1311,6 +1311,15 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// reach EntryLo and come out as physical address bits 32 and up. All
     /// ones (no fold) by default; each machine sets its own.
     pub phys_mask: u64,
+    /// A window of physical addresses the board decodes differently for an
+    /// uncached instruction fetch, `(base, size, target)`: the fetch is
+    /// presented to the bus at `target` plus the offset into the window. The
+    /// Fuel's reset PROM answers uncached fetches at 0x1fc00000 whatever the
+    /// cached view holds there, and gives that device an address of its own,
+    /// so the code page for it is keyed, read and invalidated by address like
+    /// any other. None on the other machines, whose uncached and cached
+    /// instruction fetches reach the same bytes.
+    uncached_fetch_alias: Option<Box<FetchAlias<T, C>>>,
     /// Where the machine has memory, from [`MipsCpuConfig::memory`].
     pub memory: Arc<crate::memory_map::MemoryMap>,
     /// Frames the JIT's page table has, the end of `memory` in pages. Kept
@@ -1432,6 +1441,31 @@ fn translate_64_supervisor<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u
 }
 fn translate_64_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_64bit_impl::<false, {crate::cpu::mips_core::PRIV_USER}>(va, at)
+}
+
+/// A window whose uncached instruction fetch the board decodes apart, and the
+/// translation it wraps (`MipsExecutor::set_uncached_fetch_alias`).
+struct FetchAlias<T: Tlb, C: CpuModel> {
+    base: u64,
+    size: u64,
+    target: u64,
+    inner: fn(&mut MipsExecutor<T, C>, u64, AccessType) -> TranslateResult,
+}
+
+/// The translation wrappers above for a board that decodes an uncached
+/// instruction fetch apart. Only a fetch that comes out uncached is changed.
+fn translate_fetch_aliased<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+    let inner = e.uncached_fetch_alias.as_ref().map_or(translate_32_kernel::<T, C> as fn(&mut MipsExecutor<T, C>, u64, AccessType) -> TranslateResult, |a| a.inner);
+    let mut result = inner(e, va, at);
+    if at == AccessType::Fetch && !result.is_exception() && !result.is_cached() {
+        if let Some(alias) = e.uncached_fetch_alias.as_ref() {
+            let offset = result.phys.wrapping_sub(alias.base);
+            if offset < alias.size {
+                result.phys = alias.target + offset;
+            }
+        }
+    }
+    result
 }
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
@@ -2936,6 +2970,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             batch_hook: None,
             phys_alias: None,
             phys_mask: u64::MAX,
+            uncached_fetch_alias: None,
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
             jitv2_frames: crate::cpu::jitv2::jitv2::frames_for(&cfg.memory),
@@ -3540,6 +3575,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             paddr, self.memory))
     }
 
+    /// The code page the last fetch landed on, or null. For tests.
+    #[cfg(all(test, feature = "jitv2"))]
+    pub fn jitv2_current_page(&self) -> *mut crate::cpu::jitv2::PhysicalCodePage {
+        self.pcp
+    }
+
     #[cfg(feature = "jitv2")]
     fn jitv2_share(&mut self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>) {
         {
@@ -3587,7 +3628,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline(always)]
     fn jitv2_track_pcp(&mut self, phys_addr: u64) {
         // Code above the JIT's pfn map gets no page and runs in the
-        // interpreter (`step_jit` checks for the null page).
+        // interpreter (`step_jit` checks for the null page). That includes
+        // uncached attributes 1 to 3: their bits 58:57 sit in `phys_addr`,
+        // so the frame range check rejects them.
         let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr, self.jitv2_frames) else {
             self.clear_pcp();
             return;
@@ -3730,6 +3773,37 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // A partial LWR keeps the upper word below this offset: 3 in 64-bit mode
         // on the R10000 family, else 0.
         self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER { wide } else { 0 };
+        // A board that decodes an uncached instruction fetch apart wraps the
+        // translation itself, so the fetch paths of the other machines stay
+        // as they are.
+        if C::FETCH_ALIAS && self.uncached_fetch_alias.is_some() {
+            self.wrap_translate_fn(translate_fn);
+        }
+    }
+
+    /// `update_translate_fn`'s choice, wrapped for `uncached_fetch_alias`.
+    /// Out of line so the update itself stays as small as it was; the wrapper
+    /// reaches the choice through a pointer so that the translation bodies keep
+    /// the one caller they inline into.
+    #[cold]
+    #[inline(never)]
+    fn wrap_translate_fn(&mut self, inner: fn(&mut Self, u64, AccessType) -> TranslateResult) {
+        if let Some(alias) = self.uncached_fetch_alias.as_mut() {
+            alias.inner = inner;
+        }
+        self.translate_fn = translate_fetch_aliased::<T, C>;
+    }
+
+    /// Present an uncached instruction fetch of the window `base..base+size`
+    /// to the bus at `target` plus the offset (see [`Self::uncached_fetch_alias`]).
+    pub fn set_uncached_fetch_alias(&mut self, base: u64, size: u64, target: u64) {
+        assert!(C::FETCH_ALIAS, "{} has no uncached fetch alias", C::NAME);
+        // Never called: `update_translate_fn` replaces it below.
+        fn placeholder<T: Tlb, C: CpuModel>(_: &mut MipsExecutor<T, C>, _: u64, _: AccessType) -> TranslateResult {
+            unreachable!("the translation wrapper is installed before it is used")
+        }
+        self.uncached_fetch_alias = Some(Box::new(FetchAlias { base, size, target, inner: placeholder::<T, C> }));
+        self.update_translate_fn();
     }
 
     /// Re-derive `fpr_read_d/write_d/read_l/write_l` from STATUS_FR.
