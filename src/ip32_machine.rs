@@ -162,11 +162,7 @@ impl O2Machine {
         let o2 = &cfg.o2;
         // `prom`, or the last release's file when `prom` is the shared default
         // and that file is not there: there is no embedded O2 PROM.
-        let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
-            cfg.prom.clone()
-        } else {
-            O2_PROM_FILE.to_string()
-        };
+        let prom_path = MachineProfile::O2Ip32.prom_path(&cfg.prom);
         let prom = std::fs::read(&prom_path)
             .map_err(|e| format!("O2 PROM {prom_path}: {e} (set `prom` to the O2 PROM image; 4.18 is the last release)"))?;
         // `banks`: the kit in each DIMM pair from A (validate checked them).
