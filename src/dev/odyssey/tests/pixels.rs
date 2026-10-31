@@ -18,7 +18,14 @@ fn window() -> (Box<Board>, Arc<Ram>) {
 /// glDrawPixels: BEGIN with the image primitive, the raster box from
 /// (x1, y1) to (x2, y2), the transfer header, then the data words under
 /// the burst register for `fmt`, at most 16 a burst.
-fn burst_image(s: &mut Board, (x1, y1, x2, y2): (u32, u32, u32, u32), header: u32, fmt: u32, words: &[u32]) {
+fn burst_image(s: &mut Board, bounds: (u32, u32, u32, u32), header: u32, fmt: u32, words: &[u32]) {
+    burst_image_groups(s, bounds, &[(header, &[(fmt, words)])]);
+}
+
+/// The same for an image the library sends as several transfer headers,
+/// each followed by its bursts (a tag and its words): the shape of a draw
+/// wider than one burst, where a header finishes the previous row.
+fn burst_image_groups(s: &mut Board, (x1, y1, x2, y2): (u32, u32, u32, u32), groups: &[(u32, &[(u32, &[u32])])]) {
     cmd(s, select(ODSY_REG_GL_BEGIN));
     cmd(s, ODSY_GL_PRIMITIVE_IMAGE);
     cmd(s, ODSY_CMD_IMAGE_BOX);
@@ -32,13 +39,17 @@ fn burst_image(s: &mut Board, (x1, y1, x2, y2): (u32, u32, u32, u32), header: u3
         };
         cmd(s, (v as f32).to_bits());
     }
-    cmd(s, ODSY_CMD_IMAGE_HEADER);
-    cmd(s, header);
-    for chunk in words.chunks(16) {
-        let n = if chunk.len() == 16 { ODSY_CMD_ARITY_MASK } else { chunk.len() as u32 };
-        cmd(s, select(ODSY_IMAGE_BURST_BASE | n << ODSY_CMD_ARITY_SHIFT | fmt));
-        for &w in chunk {
-            cmd(s, w);
+    for &(header, bursts) in groups {
+        cmd(s, ODSY_CMD_IMAGE_HEADER);
+        cmd(s, header);
+        for &(fmt, words) in bursts {
+            for chunk in words.chunks(16) {
+                let n = if chunk.len() == 16 { ODSY_CMD_ARITY_MASK } else { chunk.len() as u32 };
+                cmd(s, select(ODSY_IMAGE_BURST_BASE | n << ODSY_CMD_ARITY_SHIFT | fmt));
+                for &w in chunk {
+                    cmd(s, w);
+                }
+            }
         }
     }
     cmd(s, select(ODSY_REG_GL_END));
@@ -752,4 +763,78 @@ fn an_integer_pixel_through_a_logic_op_or_to_the_id_planes_dirties_its_row() {
     s.dest_buffer_word = ODSY_DEST_ID_PLANES;
     s.paint_integer(40, 130, true, 0x10);
     assert_eq!(lines(&s), vec![130], "an id-plane pixel");
+}
+
+/// Luminance sources reach the board under tags the byte-stream tables did
+/// not pair with them. Replayed from guest traces of the GL test suite's
+/// 13x5 draws (box 40,206 to 53,201, the y range decreasing): 16-bit
+/// luminance (0x62) arrives as two 16-bit values a word under tag 0x12,
+/// 16-bit luminance-alpha (0x68) as a luminance and an alpha half a pixel,
+/// and 8-bit luminance-alpha (0x48) as byte pairs under tag 0x11.
+#[test]
+fn luminance_images_land_under_the_tags_the_library_sends_them_with() {
+    let (mut s, _) = window();
+
+    // LUMINANCE/UNSIGNED_SHORT: eight pixels, then the five that finish the row.
+    burst_image_groups(
+        &mut s,
+        (40, 206, 53, 205),
+        &[
+            (0x0f00_1262, &[(ODSY_IMAGE_FMT_RGBA16, &[0x1111_4646, 0x7b7b_b0b0, 0xe5e5_1a1a, 0x4f4f_8484])]),
+            (0x0fa5_1262, &[(ODSY_IMAGE_FMT_RGBA16, &[0xb9b9_eeee, 0x2323_5858, 0x8d8d_5a5a])]),
+        ],
+    );
+    for (x, l) in [0x11, 0x46, 0x7b, 0xb0, 0xe5, 0x1a, 0x4f, 0x84, 0xb9, 0xee, 0x23, 0x58, 0x8d].into_iter().enumerate() {
+        assert_eq!(pixel(&s, 0, 40 + x as i32, 205), l << 24 | l << 16 | l << 8 | 0xff, "pixel {x}");
+    }
+
+    // LUMINANCE_ALPHA/UNSIGNED_SHORT: a luminance half then an alpha half.
+    burst_image_groups(&mut s, (40, 210, 43, 211), &[(0x0f00_1268, &[(ODSY_IMAGE_FMT_RGBA16, &[0x1111_6c6c, 0x4646_a1a1])])]);
+    assert_eq!(pixel(&s, 0, 40, 210), 0x1111_116c);
+    assert_eq!(pixel(&s, 0, 41, 210), 0x4646_46a1);
+
+    // LUMINANCE_ALPHA/UNSIGNED_BYTE: a luminance and an alpha byte a pixel,
+    // under the RGB tag; the last word of a 13-pixel row carries two pad bytes.
+    burst_image_groups(
+        &mut s,
+        (40, 212, 53, 213),
+        &[(0x0fd5_1248, &[(ODSY_IMAGE_FMT_RGB, &[0x116c_46a1, 0x7bd6_b00b, 0xe540_1a75, 0x4faa_84df, 0xb914_ee49, 0x237e_58b3, 0x8de8_5a5a])])],
+    );
+    assert_eq!(pixel(&s, 0, 40, 212), 0x1111_116c);
+    assert_eq!(pixel(&s, 0, 41, 212), 0x4646_46a1);
+    assert_eq!(pixel(&s, 0, 52, 212), 0x8d8d_8de8);
+}
+
+/// A 16-bit luminance texture upload: the library writes the level into a
+/// scratch object (box 0,0 to 16,8, destination base 0x100800 on the V6, the
+/// first row's eight words in two four-word bursts under tag 0x12, replayed
+/// from the guest trace of the GL test suite's tex/RGBA8/LUMINANCE/
+/// UNSIGNED_SHORT case). The bursts used to be refused, which left the level
+/// holding whatever the object held before and the case failing on a board
+/// whose object memory started out different.
+#[test]
+fn a_16_bit_luminance_texture_upload_lands_in_its_object() {
+    let (mut s, _) = window();
+    let base = 0x10_0800;
+    let obj = s.object_select(base, 16);
+    assert!(obj >= 0);
+    for x in 0..16 {
+        s.object_store(obj, x, 0, 0xffff_ffff);
+    }
+    s.dest_base = base;
+    burst_image_groups(
+        &mut s,
+        (0, 0, 16, 8),
+        &[(
+            0x0f00_1262,
+            &[
+                (ODSY_IMAGE_FMT_RGBA16, &[0x1111_4646, 0x7b7b_b0b0, 0xe5e5_1a1a, 0x4f4f_8484]),
+                (ODSY_IMAGE_FMT_RGBA16, &[0xb9b9_eeee, 0x2323_5858, 0x8d8d_c2c2, 0xf7f7_2c2c]),
+            ],
+        )],
+    );
+    let row = [0x11, 0x46, 0x7b, 0xb0, 0xe5, 0x1a, 0x4f, 0x84, 0xb9, 0xee, 0x23, 0x58, 0x8d, 0xc2, 0xf7, 0x2c];
+    for (x, l) in row.into_iter().enumerate() {
+        assert_eq!(s.object_load(obj, x as u32, 0), l << 24 | l << 16 | l << 8 | 0xff, "texel {x}");
+    }
 }

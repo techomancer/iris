@@ -931,8 +931,16 @@ pub fn image_pairing_supported(code: u32, fmt: u32) -> bool {
     if code == ODSY_IMAGE_CODE_RGB12 || code == ODSY_IMAGE_CODE_ABGR12 {
         return fmt == ODSY_IMAGE_FMT_RGBA16;
     }
+    // The library sends 8-bit luminance-alpha under the colour-index or the
+    // RGB tag, and its 16-bit luminance and luminance-alpha as 16-bit
+    // components under the RGBA16 tag as well as the other two (datasheet,
+    // "Texture source codes for 12-bit textures"; observed on 13x5 draws of
+    // the GL test suite).
     if code == ODSY_IMAGE_CODE_LUM_ALPHA {
-        return fmt == ODSY_IMAGE_FMT_CI;
+        return fmt != ODSY_IMAGE_FMT_RGBA16;
+    }
+    if code == ODSY_IMAGE_CODE_LUM12 || code == ODSY_IMAGE_CODE_LUM_ALPHA12 {
+        return true;
     }
     fmt != ODSY_IMAGE_FMT_RGBA16
 }
