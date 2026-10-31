@@ -15,6 +15,9 @@
 //! (input 3) are the board's choice, made by the machine; device `d`'s INTA
 //! reaches input `d - 1`.
 //!
+//! Widget 0 of the board is the PXBOW of the PIC that carries IO9
+//! ([`Pic::enable_pxbow`]); the other PIC has none.
+//!
 //! The register offsets are the ones the Bridge family shares ([`reg`]);
 //! the PIC leaves out the ATE, the alias windows and the second and third
 //! write-request banks' meaning.
@@ -68,6 +71,8 @@
 //!
 //! Ported from hw/pci-host/sgi-pic.c in jamesbraid/qemu-sgi-origami.
 
+use super::heart::Clock;
+use super::pxbow::{AttachError, Pxbow};
 use crate::devlog::LogModule;
 use crate::irq::IrqLine;
 use crate::pci::{
@@ -187,6 +192,22 @@ impl PioDecode {
         let i = runs.partition_point(|run| run.start <= address).checked_sub(1)?;
         let run = &runs[i];
         (address.checked_add(size as u64)? <= run.end).then(|| run.dev.clone())
+    }
+}
+
+/// Widget 0's interrupt packets, which go to the peer as the PIC's do.
+struct PxbowPackets(Arc<Wiring>);
+impl crate::irq::InterruptController for PxbowPackets {
+    fn set_line(&self, line: u32, level: bool) {
+        self.packet(0, 0, line, level);
+    }
+    fn packet(&self, _source: u8, address: u64, line: u32, level: bool) -> bool {
+        let payload = u64::from(line) | if level { SET } else { 0 };
+        let taken = self.0.peer.get().is_some_and(|peer| peer.interrupt(0, address, payload).is_ok());
+        if !taken {
+            crate::dlog!(LogModule::Bedrock, "pic: PXBOW interrupt packet to {address:#x} refused");
+        }
+        taken
     }
 }
 
@@ -1253,6 +1274,7 @@ pub struct Pic {
     widget: u8,
     wiring: Arc<Wiring>,
     heads: [Arc<Head>; 2],
+    pxbow: OnceLock<Arc<Pxbow>>,
 }
 
 impl Pic {
@@ -1265,6 +1287,7 @@ impl Pic {
             widget,
             heads: [Head::new(0, wiring.clone()), Head::new(1, wiring.clone())],
             wiring,
+            pxbow: OnceLock::new(),
         })
     }
 
@@ -1276,6 +1299,24 @@ impl Pic {
     /// device-I/O windows and the PCI memory windows. Bedrock IO takes this.
     pub fn widget(self: &Arc<Self>) -> Arc<dyn BusDevice> {
         Arc::new(CpuWidget { heads: self.heads.clone() })
+    }
+
+    /// Give the chip its PXBOW, the widget-0 face of the board that owns
+    /// it, reached from `host_widget`. On Tezro the PIC that carries IO9
+    /// supplies widget 0; a second PIC gets none. The PIC's own widget is
+    /// attached behind it, and widget 0's interrupt goes to the peer when it
+    /// targets the host. Once, before the machine runs.
+    pub fn enable_pxbow(self: &Arc<Self>, host_widget: u8, clock: Clock) -> Result<Arc<Pxbow>, AttachError> {
+        let pxbow = Pxbow::new(host_widget, self.widget, clock)?;
+        pxbow.attach_endpoint(self.widget, self.widget())?;
+        pxbow.connect_host(Arc::new(PxbowPackets(self.wiring.clone())));
+        self.pxbow.set(pxbow.clone()).map_err(|_| AttachError::Occupied(self.widget))?;
+        Ok(pxbow)
+    }
+
+    /// The chip's PXBOW, if it has one.
+    pub fn pxbow(&self) -> Option<&Arc<Pxbow>> {
+        self.pxbow.get()
     }
 
     /// Where interrupts and DMA this chip originates go. Once, before the
@@ -1334,11 +1375,17 @@ impl Pic {
                 });
             }
         }
+        if let Some(pxbow) = self.pxbow.get() {
+            pxbow.xbow().register_locks();
+        }
     }
 }
 
 impl Resettable for Pic {
     fn power_on(&self) {
+        if let Some(pxbow) = self.pxbow.get() {
+            pxbow.xbow().power_on();
+        }
         for head in &self.heads {
             head.reset();
         }
