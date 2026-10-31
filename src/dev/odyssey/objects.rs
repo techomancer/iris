@@ -378,6 +378,19 @@ impl Board {
     /// header bit the datasheet records selects it. The other directions
     /// keep the rows in the order they are held.
     ///
+    /// The opposite copy, from an object to the window, lists the rows
+    /// bottom first as well: the burst that filled the object put the
+    /// image's first row (GL's lowest) first, and a window row grows
+    /// downwards, so the object's first row lands on the rectangle's last.
+    /// OBSERVED in a glDrawPixels of the signed types, whose raw burst goes
+    /// to an object and then to the window: the host read back the rows in
+    /// reverse (row 4's bytes where row 0's belonged, which differs from
+    /// row 0's by 4 * 29 = 0x74 in the test pattern). INFERRED to be the
+    /// board's copy rule, as above.
+    ///
+    /// The programmed post-filter (0x203b) is applied to the copied words
+    /// (see copy_post_filter()); the identity leaves them alone.
+    ///
     /// The source is staged first, so an overlapping copy needs no direction.
     /// Words move as the planes hold them: a colour pixel keeps its alpha and
     /// an index copies as the raw index. The read header's class, code and
@@ -423,9 +436,14 @@ impl Board {
                 });
             }
         }
+        self.copy_post_filter(&mut words, Self::copy_reads_signed(from_window));
+        // From an object to the window the rows go bottom first.
+        let flip = !from_window && to_window;
+
         for y in 0..h {
             for x in 0..w {
                 let word = words[(y * w + x) as usize];
+                let y = if flip { h - 1 - y } else { y };
 
                 if to_window {
                     self.paint_pixel(
@@ -439,6 +457,63 @@ impl Board {
             }
         }
         true
+    }
+}
+
+impl Board {
+    /// Whether the board reads the bytes of a copy's source as signed values
+    /// when it filters them. INFERRED, and nothing board-visible establishes
+    /// it: the library sends a signed type's burst and write code as the
+    /// unsigned type's, and programs the final pass as ordinary scale and
+    /// bias words (datasheet, "Pixel transfer headers from the OpenGL
+    /// library"). The pass the library builds for a signed type is 2x + 1/4096
+    /// from an object the burst filled, which gives GL's result only if the
+    /// bits are read as signed. So the model reads an object's bytes as signed
+    /// and a window's as unsigned. This is the one place the choice is made.
+    fn copy_reads_signed(from_window: bool) -> bool {
+        !from_window
+    }
+
+    /// Apply the post-filter words (block 0x203b) to a copy's words, lane by
+    /// lane in R, G, B, A order: the byte b of a lane becomes
+    /// clamp(x * scale + bias, 0, 1) as a byte, with x = b / 255 (or, for a
+    /// signed source, the byte as a signed value over 255), scale and bias
+    /// signed 3.12 fixed point (ESTABLISHED as the layout of the words). The
+    /// bias is used as programmed: the library halves the application's bias
+    /// before it programs the step (ESTABLISHED, "Pixel transfer headers"), so
+    /// the board does not halve again. That the filter governs a copy at all
+    /// is INFERRED from the library's use of the block; the identity (scale
+    /// 1.0, bias 0) leaves every word unchanged, as does a lane that is
+    /// the identity.
+    ///
+    /// An alpha lane whose bias is full scale (0x1000) is the library's
+    /// opaque overwrite for a source without alpha (ESTABLISHED): it stores
+    /// 1.0, since the object's stored alpha is the model's 255, not source
+    /// bits.
+    pub fn copy_post_filter(&self, words: &mut [u32], signed: bool) {
+        let sb = &self.tex_scale_bias;
+        let lane = |c: usize| {
+            (sextract32(sb[c * 2], 0, ODSY_TEX_SCALE_BIAS_BITS) as f64 / ODSY_TEX_SCALE_BIAS_ONE as f64,
+             sextract32(sb[c * 2 + 1], 0, ODSY_TEX_SCALE_BIAS_BITS) as f64 / ODSY_TEX_SCALE_BIAS_ONE as f64)
+        };
+
+        if self.texture_scale_bias_identity() {
+            return;
+        }
+        for word in words.iter_mut() {
+            let mut out = *word;
+
+            for c in 0..4usize {
+                let (scale, bias) = lane(c);
+                let shift = 24 - 8 * c as u32;
+                let byte = (*word >> shift) as u8;
+                let x = if signed { byte as i8 as f64 } else { byte as f64 } / 255.0;
+                let v = if c == 3 && bias >= 1.0 { 1.0 } else { (x * scale + bias).clamp(0.0, 1.0) };
+
+                out = (out & !(0xff << shift)) | (((v * 255.0 + 0.5).floor() as u32) << shift);
+            }
+            *word = out;
+        }
     }
 }
 

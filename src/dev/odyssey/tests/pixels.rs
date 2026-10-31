@@ -591,6 +591,71 @@ fn a_copy_from_the_window_into_an_object_lists_the_rows_bottom_first() {
     }
 }
 
+/// The copy that ends a signed-type glDrawPixels, replayed from a guest trace
+/// (signed BYTE, RGBA, 1 pixel wide, 2 rows). The raw bursts reach an object
+/// as the unsigned type's would: row 0 holds the bytes 0x91 0xec 0x47 0xa2
+/// (signed -111, -20, 71, -94), row 1 0x05 0x60 0xbb 0x16. The library then
+/// programs block 0x203b with 0x2000, 0x0001 in each of R, G, B and A and
+/// copies the object to the window (operands as traced).
+///
+/// Two things must happen. The rows land bottom first (row 1 above row 0),
+/// and the pass reads the bytes as signed: 2c + 1 of GL's conversion, clamped.
+/// Before this the window held the raw bytes with the rows the wrong way up,
+/// which a test pattern with 29 per row reads as raw + 0x74 for a 4-row image.
+///
+/// The expected bytes are INFERRED from the 3.12 words (2 * c / 255 + 1/4096,
+/// rounded), one below GL's 2c + 1 where that is positive.
+#[test]
+fn a_signed_type_copy_lists_rows_bottom_first_and_applies_the_signed_pass() {
+    let (mut s, _) = window();
+    let base = 0x16b000;
+    let obj = s.object_select(base, 16);
+    assert!(obj >= 0);
+    s.object_store(obj, 0, 0, 0x91ec_47a2);
+    s.object_store(obj, 0, 1, 0x0560_bb16);
+    s.draw_mask = 1;
+
+    // Identity filter first: raw bytes, only the rows move.
+    copy_block(&mut s, [base, 0, 0x0050_2020, 2 << 16 | 1, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
+    assert_eq!(pixel(&s, 0, 50, 20), 0x0560_bb16, "row 1 is the rectangle's top row");
+    assert_eq!(pixel(&s, 0, 50, 21), 0x91ec_47a2);
+
+    for c in 0..4 {
+        s.tex_scale_bias[c * 2] = 0x2000;
+        s.tex_scale_bias[c * 2 + 1] = 0x0001;
+    }
+    // A source without alpha programs the alpha bias 0x1000: alpha reads 1.0.
+    s.tex_scale_bias[7] = 0x1000;
+    copy_block(&mut s, [base, 0, 0x0050_2020, 2 << 16 | 1, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
+    assert_eq!(pixel(&s, 0, 50, 21) & 0xff, 0xff, "alpha lane");
+    s.tex_scale_bias[7] = 1;
+    copy_block(&mut s, [base, 0, 0x0050_2020, 2 << 16 | 1, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
+    assert_eq!(pixel(&s, 0, 50, 20), 0x0a_c0_00_2c, "5, 96, -69, 22");
+    assert_eq!(pixel(&s, 0, 50, 21), 0x00_00_8e_00, "-111, -20, 71, -94");
+}
+
+/// A copy from the window through a non-identity scale and bias reads its
+/// bytes as unsigned: scale 0.5 and bias 0.25 (3.12 words 0x0800, 0x0400)
+/// give b / 2 + 63.75 per lane, rounded, and a lane the filter does not change
+/// (scale 1.0, bias 0) keeps its byte. INFERRED arithmetic: the 3.12 words
+/// are the only datasheet-established part.
+#[test]
+fn a_copy_from_the_window_applies_the_programmed_scale_and_bias_unsigned() {
+    let (mut s, _) = window();
+    let base = 0x16b000;
+    let obj = s.object_select(base, 16);
+    assert!(obj >= 0);
+    pixel_write(&mut s, 70, 21, 0x00ff_8010);
+    s.draw_mask = 4;
+    for c in [0, 1, 2] {
+        s.tex_scale_bias[c * 2] = 0x0800;
+        s.tex_scale_bias[c * 2 + 1] = 0x0400;
+    }
+    copy_block(&mut s, [0x3000_0019, 21 << 16 | 70, 0x8020_0050, 1 << 16 | 1, 0x9263_3042, base, 0, 0x3802_204b]);
+    // 0x00 -> 64, 0xff -> 191, 0x80 -> 128, alpha lane untouched (0x10).
+    assert_eq!(s.object_load(obj, 0, 0), 0x40bf_8010);
+}
+
 /// The read buffer register (0x609) names the drawable a read comes from.
 fn bind_read_drawable(s: &mut Board, word: u32) {
     cmd(s, select(ODSY_SWAP_SYNC_B));
