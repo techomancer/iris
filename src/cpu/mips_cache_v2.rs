@@ -571,6 +571,18 @@ pub trait CpuModel: MipsCache {
     /// list of changes from the R10000 has no TLB or CP0 change. The R14000 and
     /// R16000 are a model choice that gives them the same TLB.
     const R10K_FAMILY: bool = false;
+    /// A partial LWR keeps bits 63:32 of the destination. Observed on the
+    /// R10000; whether the later parts do the same is not established, so they
+    /// keep the sign extension for now.
+    const PARTIAL_LWR_KEEPS_UPPER: bool = Self::R10K_FAMILY;
+    /// An uncached store the system refuses completes instead of raising a
+    /// Data Bus Error. The R10000 sends it as a write request, which gets no
+    /// response, and Bus Error comes only from an error response to a read or
+    /// upgrade request or from uncorrectable read data (R10000 UM pp. 104, 316).
+    /// The R12000 manual documents the same path and the later parts are taken
+    /// to match. An uncached SC succeeding is a model choice. Loads and fetches
+    /// still fault.
+    const POSTS_UNCACHED_STORES: bool = Self::R10K_FAMILY;
 }
 
 pub trait MipsCache: Send + Sync {

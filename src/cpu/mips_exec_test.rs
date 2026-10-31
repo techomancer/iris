@@ -6809,4 +6809,144 @@ mod tests {
             check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
         });
     }
+
+    /// A bus where nothing answers: every read and write is refused (the
+    /// trait's defaults).
+    struct RefusingBus;
+    impl BusDevice for RefusingBus {}
+
+    /// R10000: a store the system refuses leaves the processor as a write
+    /// request, which has no response, so it completes (R10000 UM pp. 104,
+    /// 316). An uncached SC succeeding is a model choice. A load keeps its
+    /// Data Bus Error, and so does every access on the R5000. SWL goes through
+    /// the masked-store path, a separate site.
+    #[test]
+    fn refused_uncached_store_completes_only_on_the_r10000() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (u32, u64) {
+            let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.cache.set_llbit(true);
+            exec.core.write_gpr(4, 0xFFFF_FFFF_A100_0000); // kseg1: uncached
+            exec.core.write_gpr(6, 0x1234_5678);
+            let st = exec.exec(make_i(op, 4, 6, 4));
+            if st == EXEC_COMPLETE {
+                assert_eq!(exec.core.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "no exception taken");
+                assert_eq!(exec.exec(make_i(OP_ADDIU, 0, 5, 7)), EXEC_COMPLETE);
+                assert_eq!(exec.core.read_gpr(5), 7, "the next instruction runs");
+            }
+            (st, exec.core.read_gpr(6))
+        }
+        use crate::traits::BUS_ERR;
+        type R10K = crate::cpu::mips_cache_v2::R10000Cache;
+        type R10KShadow = crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        type R5K = crate::cpu::mips_cache_shadow::R5000ShadowCache;
+        for (op, name) in [(OP_SW, "SW"), (OP_SWL, "SWL")] {
+            assert_eq!(run::<R10K>(op).0, EXEC_COMPLETE, "R10000 {name}");
+            assert_eq!(run::<R10KShadow>(op).0, EXEC_COMPLETE, "R10000 shadow {name}");
+            assert_eq!(run::<R5K>(op).0, BUS_ERR, "R5000 {name}");
+        }
+        assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
+        assert_eq!(run::<R5K>(OP_SC).0, BUS_ERR, "R5000 SC");
+        assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
+    }
+
+    /// The O2's no-ECC alias of RAM at 0x8000_0000 is matched on the address the
+    /// board decodes (32 bits), so a PTE software bit above the PFN cannot make
+    /// a mapped page miss the alias window.
+    #[test]
+    fn phys_alias_is_matched_after_the_physical_mask() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_tlb::MipsTlb;
+                let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
+                exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+                exec.phys_mask = u32::MAX as u64;
+                exec.phys_alias = Some((0x8000_0000, 0x1000_0000, 0));
+                // PA 0x1_8000_0000: bit 32 is above what the board decodes.
+                exec.core.cp0_index = 0;
+                exec.core.cp0_pagemask = 0;
+                exec.core.cp0_entryhi = 0x4000_0000;
+                exec.core.cp0_entrylo0 = (0x18_0000 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                exec.core.cp0_entrylo1 = 0;
+                assert_eq!(exec.exec((OP_COP0 << 26) | (0x10 << 21) | 0x02), EXEC_COMPLETE);
+                assert_eq!(exec.debug_translate(0x4000_0000).phys, 0);
+            })
+            .unwrap().join().unwrap();
+    }
+
+    /// A partial LWR keeps bits 63:32 of the destination on the R10000 while
+    /// 64-bit operations are enabled for the current mode, and sign-extends on
+    /// the R4400 and R5000 and on the R10000 when they are off (a 32-bit user
+    /// process, UX=0); a complete word sign-extends on all.
+    /// Compiled LWR reads `core.lwr_upper_below` rather than decoding Status,
+    /// so it must follow `is_64bit_mode()` through a Status write and through
+    /// ERET, which changes the mode without writing Status, and stay 0 on a
+    /// model that does not keep the upper word.
+    #[test]
+    fn lwr_upper_below_follows_the_mode_through_status_writes_and_eret() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_UX};
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(
+                Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            let expect = |exec: &MipsExecutor<PassthroughTlb, C>| {
+                if keeps_upper && exec.core.is_64bit_mode() { 3 } else { 0 }
+            };
+            for status in 0..=0xffu32 {
+                exec.set_cp0_status(status);
+                assert_eq!(exec.core.lwr_upper_below, expect(&exec), "{} Status {status:#x}", C::NAME);
+            }
+            exec.set_cp0_status((2 << 3) | STATUS_UX | STATUS_EXL);
+            assert_eq!(exec.core.lwr_upper_below, 0, "EXL forces kernel mode, where KX is clear");
+            exec.core.cp0_epc = 0x1000;
+            assert_eq!(exec.exec(0x4200_0018), EXEC_COMPLETE, "ERET");
+            assert_eq!(exec.core.lwr_upper_below, if keeps_upper { 3 } else { 0 }, "ERET returns to user mode with UX set");
+        }
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+    }
+
+    #[test]
+    fn partial_lwr_keeps_the_upper_word_only_on_the_r10000() {
+        use crate::cpu::mips_core::{STATUS_KX, STATUS_SX, STATUS_UX};
+        const USER: u32 = 2 << 3;
+        const SUPER: u32 = 1 << 3;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(model_keeps_upper: bool) {
+            let mem = Arc::new(MockMemory::new());
+            mem.set_word(0x2000, 0x89ab_cdef);
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, 0x2000);
+            let old = 0x8123_4567_a1b2_c3d4u64;
+            // (Status, 64-bit operations on): each mode's own bit decides,
+            // whatever the other two hold.
+            for (status, ops64, mode) in [
+                (STATUS_KX, true, "kernel KX=1"),
+                (0, false, "kernel KX=0"),
+                (USER | STATUS_UX, true, "user UX=1"),
+                (USER | STATUS_KX | STATUS_SX, false, "user UX=0"),
+                (SUPER | STATUS_SX, true, "supervisor SX=1"),
+                (SUPER | STATUS_KX | STATUS_UX, false, "supervisor SX=0"),
+            ] {
+                exec.set_cp0_status(status);
+                for (offset, word) in [0xa1b2_c389u32, 0xa1b2_89ab, 0xa189_abcd, 0x89ab_cdef].into_iter().enumerate() {
+                    exec.core.write_gpr(2, old);
+                    assert_eq!(exec.exec(make_i(OP_LWR, 1, 2, offset as u16)), EXEC_COMPLETE);
+                    let expected = if model_keeps_upper && ops64 && offset != 3 {
+                        (old & 0xffff_ffff_0000_0000) | word as u64
+                    } else {
+                        word as i32 as i64 as u64
+                    };
+                    assert_eq!(exec.core.read_gpr(2), expected, "{} LWR offset {offset}, {mode}", C::NAME);
+                }
+            }
+        }
+        check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+    }
 }

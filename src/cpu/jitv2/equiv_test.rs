@@ -4383,6 +4383,109 @@ mod tests {
         }
     }
 
+    /// Run `words` from `pc` once through the interpreter and once as a
+    /// compiled region, both on CPU model `C` over a fresh `bus()` and seeded
+    /// with `gpr` and CP0 Status `status`. The JIT learns the model's choices from `install_jit_hooks`,
+    /// as in production.
+    fn interpreter_and_jit<C>(bus: impl Fn() -> Arc<dyn BusDevice>, pc: u64, gpr: [u64; 32], status: u32, words: &[u32])
+        -> (CoreSnapshot, CoreSnapshot)
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>,
+    {
+        let build = || {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(bus(), PassthroughTlb::default(), &cfg));
+            exec.core.gpr = gpr;
+            exec.core.pc = pc;
+            exec.set_cp0_status(status);
+            exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "fetchverify")]
+            { exec.core.fetch_verify_on = false; }
+            exec
+        };
+        let mut interp = build();
+        interp.jitv2_dispatch_enabled = false;
+        for (i, &word) in words.iter().enumerate() {
+            if interp.core.pc != pc + 4 * i as u64 {
+                break; // an exception redirected the PC
+            }
+            interp.exec(word);
+        }
+
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[..words.len()].copy_from_slice(words);
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page, 0, page_base, words.len());
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        codegen.jit_consts.lwr_keeps_upper = C::PARTIAL_LWR_KEEPS_UPPER;
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
+            .expect("region must be compilable for this test to be meaningful");
+        let mut jit = build();
+        jit.install_jit_hooks();
+        // The compile pool's workers read the model's choice from here, so a
+        // missing publication would not show if `codegen` were stamped by hand.
+        assert_eq!(jit.jitv2.lock().jit_consts.lock().lwr_keeps_upper, C::PARTIAL_LWR_KEEPS_UPPER);
+        unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
+    }
+
+    /// The R10000 keeps bits 63:32 on a partial LWR while 64-bit operations are
+    /// enabled for the current mode and the R5000 sign-extends; with them off
+    /// (a 32-bit user process, UX=0) the R10000 sign-extends too. The JIT and
+    /// the interpreter must agree at every offset in every mode, and the
+    /// interpreter's result is the one `partial_lwr_keeps_the_upper_word_only_on_the_r10000`
+    /// pins.
+    #[test]
+    fn jit_lwr_matches_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
+        fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>(model_keeps_upper: bool) {
+            use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KX, STATUS_SX, STATUS_UX};
+            const RESERVED: u32 = 3 << 3;
+            const USER: u32 = 2 << 3;
+            const SUPER: u32 = 1 << 3;
+            // (Status, whether 64-bit operations are on): each mode's own
+            // bit decides, whatever the other two hold.
+            for (status, ops64, mode) in [
+                (STATUS_KX, true, "kernel KX=1"),
+                (0, false, "kernel KX=0"),
+                (STATUS_UX | STATUS_SX, false, "kernel KX=0, UX/SX=1"),
+                (USER | STATUS_UX, true, "user UX=1"),
+                (USER | STATUS_KX | STATUS_SX, false, "user UX=0, KX/SX=1"),
+                (SUPER | STATUS_SX, true, "supervisor SX=1"),
+                (SUPER | STATUS_KX | STATUS_UX, false, "supervisor SX=0"),
+                (USER | STATUS_EXL | STATUS_KX, true, "EXL forces kernel, KX=1"),
+                (USER | STATUS_EXL | STATUS_UX, false, "EXL forces kernel, UX=1 KX=0"),
+                (SUPER | STATUS_ERL | STATUS_KX, true, "ERL forces kernel, KX=1"),
+                (SUPER | STATUS_ERL | STATUS_SX, false, "ERL forces kernel, SX=1 KX=0"),
+                (RESERVED | STATUS_KX, true, "reserved KSU counts as kernel, KX=1"),
+                (RESERVED | STATUS_UX | STATUS_SX, false, "reserved KSU counts as kernel, KX=0"),
+            ] {
+                for offset in 0..4u64 {
+                    let mut gpr = [0u64; 32];
+                    gpr[1] = 0x2000 + offset;
+                    gpr[2] = 0x1122_3344_5566_7788;
+                    let bus = || -> Arc<dyn BusDevice> {
+                        let mem = Arc::new(MockMemory::new_not_compilable());
+                        mem.set_word(0x2000, 0xDEAD_BEEF);
+                        mem
+                    };
+                    let lwr = make_i(crate::cpu::mips_isa::OP_LWR, 1, 2, 0);
+                    let (interp, jit) = interpreter_and_jit::<C>(bus, 0x1000, gpr, status, &[lwr]);
+                    assert_eq!(jit, interp, "{} JIT/interpreter LWR offset {offset}, {mode}", C::NAME);
+                    let upper_kept = interp.gpr[2] >> 32 == 0x1122_3344;
+                    assert_eq!(upper_kept, model_keeps_upper && ops64 && offset != 3,
+                        "{} LWR offset {offset}, {mode}", C::NAME);
+                }
+            }
+        }
+        check::<R10000ShadowCache>(true);
+        check::<R5000ShadowCache>(false);
+    }
+
     #[test]
     fn lwl_lwr_combine_to_a_full_unaligned_word_load_matches_interpreter() {
         // The canonical compiler-generated idiom for an unaligned word
@@ -8107,6 +8210,76 @@ mod tests {
             assert_eq!(jit_state, interp_state, "{name}: JIT and interpreter diverged");
             assert_eq!(interp, expected, "{name}: interpreter retired-instruction count");
             assert_eq!(jit, expected, "{name}: JIT retired-instruction count");
+        }
+    }
+
+    /// R10000: a refused uncached store completes in compiled code exactly as
+    /// in the interpreter, through both store sites (SW, and SWL by the
+    /// masked-store helper), and the instructions after it run. The same access
+    /// as a load, and a store on the R5000, still fault in both engines.
+    #[test]
+    fn refused_uncached_store_matches_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_v2::{R10000Cache, R5000Cache, CpuModel};
+        use crate::cpu::mips_core::STATUS_EXL;
+        use crate::cpu::mips_isa::{OP_ADDIU, OP_LW, OP_SW, OP_SWL};
+
+        /// Nothing answers: every read and write is refused (the trait's defaults).
+        struct RefusingBus;
+        impl BusDevice for RefusingBus {}
+
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (CoreSnapshot, CoreSnapshot) {
+            let pc = 0xFFFF_FFFF_8000_0000u64;
+            let mut gpr = [0u64; 32];
+            gpr[16] = 0xFFFF_FFFF_A100_0000; // kseg1: uncached, and nothing answers
+            gpr[6] = 0x1234_5678;
+            let words = [make_i(op, 16, 6, 0), make_i(OP_ADDIU, 0, 7, 2)];
+            let build = || {
+                let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+                let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+                let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &cfg));
+                exec.core.gpr = gpr;
+                exec.core.pc = pc;
+                exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "fetchverify")]
+                { exec.core.fetch_verify_on = false; }
+                exec
+            };
+            let mut interp = build();
+            interp.jitv2_dispatch_enabled = false;
+            for (i, &word) in words.iter().enumerate() {
+                if interp.core.pc != pc + 4 * i as u64 {
+                    break; // an exception redirected the PC
+                }
+                interp.exec(word);
+            }
+
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[..words.len()].copy_from_slice(&words);
+            let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+            let mut analyzer = Analyzer::new();
+            let (walked, non_empty) = analyzer.walk_bounded(&page, 0, page_base, words.len());
+            assert!(non_empty);
+            let mut instrs_owned = *walked;
+            let mut codegen = Codegen::new();
+            let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
+                .expect("region must be compilable for this test to be meaningful");
+            let mut jit = build();
+            jit.install_jit_hooks();
+            unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
+            std::mem::forget(codegen);
+            (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
+        }
+
+        for op in [OP_SW, OP_SWL] {
+            let (interp, jit) = run::<R10000Cache>(op);
+            assert_eq!(jit, interp, "op {op:#x}: JIT and interpreter diverged");
+            assert_eq!(jit.cp0_status & STATUS_EXL, 0, "op {op:#x}: no exception");
+            assert_eq!(jit.gpr[7], 2, "op {op:#x}: the instruction after the store ran");
+        }
+        for (name, (interp, jit)) in [("R10000 load", run::<R10000Cache>(OP_LW)), ("R5000 store", run::<R5000Cache>(OP_SW))] {
+            assert_eq!(jit, interp, "{name}: JIT and interpreter diverged");
+            assert_ne!(jit.cp0_status & STATUS_EXL, 0, "{name}: must take its Data Bus Error");
+            assert_eq!(jit.gpr[7], 0, "{name}: nothing after the fault ran");
         }
     }
 }

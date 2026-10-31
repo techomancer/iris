@@ -1032,12 +1032,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
     /// A window of physical addresses that reaches memory at another address,
     /// `(base, size, target)`, applied to mapped and XKPHYS translations
-    /// before [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
+    /// after [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
     /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
     /// there. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
-    /// XKPHYS and ERL-identity translations after [`Self::phys_alias`]. The
+    /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
     /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
     /// alias the rest away, and IRIX relies on it: its page-table entries keep
     /// software bits (the PFN lock among them) just above the PFN, so they
@@ -2218,6 +2218,16 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.cp0_status |= crate::cpu::mips_core::STATUS_TS & 0u32.wrapping_sub(self.tlb.take_write_conflict() as u32);
     }
 
+    /// An uncached store the system refused, on a model that posts stores
+    /// (`CpuModel::POSTS_UNCACHED_STORES`): say so and let the store complete.
+    /// The caller returns `BUS_OK`. Always built, so a missing device or a
+    /// guest bug stays visible in every build.
+    #[cold]
+    fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
+        eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
+            size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -2652,6 +2662,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 // set) -- the property a persistent code cache needs.
                 // Several CPUs share compiled code, so no one core's address.
                 core: if self.core.smp || std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
+                lwr_keeps_upper: C::PARTIAL_LWR_KEEPS_UPPER,
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -3259,6 +3270,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn update_translate_fn(&mut self) {
         use crate::cpu::mips_core::PrivilegeMode;
         let is_64bit = self.core.is_64bit_mode();
+        self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER && is_64bit { 3 } else { 0 };
         let privilege = self.core.get_privilege_mode();
         self.translate_fn = match (is_64bit, privilege) {
             (false, PrivilegeMode::Kernel)     => translate_32_kernel::<T, C>,
@@ -4654,15 +4666,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
-    /// A CPU physical address as the board decodes it: through
-    /// [`Self::phys_alias`] if it falls in it, then cut to [`Self::phys_mask`].
+    /// A CPU physical address as the board decodes it: cut to
+    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
-        let pa = match self.phys_alias {
-            Some((base, size, target)) if pa.wrapping_sub(base) < size => pa - base + target,
+        // Cut first: the PTE software bits above the PFN are not part of the
+        // address the alias window sees. Window and target lie within the mask.
+        let pa = pa & self.phys_mask;
+        match self.phys_alias {
+            Some((base, size, target)) if pa.wrapping_sub(base) < size => (pa - base + target) & self.phys_mask,
             _ => pa,
-        };
-        pa & self.phys_mask
+        }
     }
 
     /// TLB translation.  When `DEBUG` is true, CP0 side-effect registers are
@@ -5139,9 +5153,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.sysad.write64(phys_addr, val)
             };
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, SIZE, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         };
         // jitv2_lockstep's load/store verification (see MipsCore's
         // lockstep_mem field doc comment, and read_data_impl's matching
@@ -5195,9 +5216,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             let ws = self.sysad.write64_masked(phys_addr, val, mask);
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, mask.count_ones() as usize / 8, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         }
     }
 
@@ -6415,8 +6443,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 let mask = 0xFFFFFFFFu32 >> shift;
                 let result = (mem_word >> shift) | (rt_val & !mask);
 
-                // Sign-extend to 64 bits
-                self.core.write_gpr(rt_reg, result as i32 as i64 as u64);
+                // The manual leaves the upper word of a partial LWR
+                // implementation specific (NEC U12754E pp. 125-126); the R10000
+                // keeps bits 63:32. A full word, or any word with 64-bit
+                // operations off, sign-extends. `lwr_upper_below` folds both.
+                let value = if C::PARTIAL_LWR_KEEPS_UPPER && (byte_offset as u8) < self.core.lwr_upper_below {
+                    (self.core.read_gpr(rt_reg) & 0xffff_ffff_0000_0000) | result as u64
+                } else {
+                    // Sign-extend to 64 bits
+                    result as i32 as i64 as u64
+                };
+                self.core.write_gpr(rt_reg, value);
                 self.handle_exec_complete()
             }
             Err(status) => self.finish_status(status)

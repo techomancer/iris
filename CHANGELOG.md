@@ -220,6 +220,22 @@ hashes are given where a change is easiest to understand by reading the commit.
   refills through 0x000, as the part does, not 0x080. The R4400 and R5000 still
   choose by the current mode.
 
+### Refused uncached stores on the R10000 family
+
+- On the R10000 family (Octane, IP28, O2), an uncached store that nothing answers now
+  completes instead of raising a Data Bus Error, as the processor does. iris prints
+  "Unsupported uncached write ... (posted, completes)" for the first four such
+  stores and then at each power of two. Loads, instruction fetches, the R4400 and
+  the R5000 are unchanged.
+
+### Partial LWR on the R10000
+
+- On the R10000 (Octane, IP28, and an O2 with the R10000), an `LWR` that loads fewer
+  than four bytes now keeps bits 63:32 of the destination instead of sign-extending,
+  as the reference results for the part show. R4400 and R5000 machines are unchanged.
+  The JIT matches the interpreter, and the code-cache key changes only for the
+  machines that have the behaviour.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
@@ -619,6 +635,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2's memory alias holds for pages with high PTE bits set.** A mapped page
+  whose address had a bit set above bit 31 missed the alias of RAM at
+  0x8000_0000 and reached the PCI window instead.
 - **The O2 runs on the shadow cache from reset.** The full cache model, and
   the switch to and from it during POST and reboots, are gone
   (`src/ip32_handover.rs`), and with them a branch on every cached load, store
