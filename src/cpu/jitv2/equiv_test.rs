@@ -4550,7 +4550,6 @@ mod tests {
         let mut exec = Box::new(MipsExecutor::<PassthroughTlb, R10000ShadowCache>::new(
             bus, PassthroughTlb::default(), &MipsCpuConfig::for_model::<R10000ShadowCache>(Arc::new(crate::ip22_bus::memory_map(false)))));
         exec.core.cp0_config = (exec.core.cp0_config & !7) | 3;
-        exec.cache.set_staged_l1i(true);
         exec.install_jit_hooks();
         exec.jitv2_inline_compile = true;
         exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -4582,7 +4581,10 @@ mod tests {
         assert!(exec.pcp.is_null(), "staging dropped the page from the JIT");
         let words = [addiu(0x22), jr];
         for w in 0..16u64 {
-            cache_op(&mut exec, 0x1c, 4 * w + 1, words.get(w as usize).copied().unwrap_or(0), 0);
+            let word = words.get(w as usize).copied().unwrap_or(0);
+            // The model's raw encoding (p[35:32] = 0xf), with even parity.
+            exec.core.cp0_ecc = (0xfu64 << 32 | word as u64).count_ones() & 1;
+            cache_op(&mut exec, 0x1c, 4 * w + 1, word, 0xf);
         }
         for _ in 0..4 {
             assert_eq!(run(&mut exec), 0x22, "the staged words run, not the compiled page");

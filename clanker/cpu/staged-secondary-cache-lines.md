@@ -28,19 +28,30 @@ VA[13:6], way VA[0], one word per Index Store Data at VA[13:2], 16 per block. A
 cached fetch checks both ways at its VA[13:6] against its PA, before the
 secondary cache. Index Invalidate (I), Hit Invalidate (I), an Index Store Tag
 with the valid bit clear, and power-on end the line. Loads are not served by it.
-Model choices: the compare on a fetch is inferred, a hit does not touch LRU, and
-the instruction is TagLo[31:0] with TagHi[3:0] ignored.
+Model choices: the compare on a fetch is inferred and a hit does not touch LRU.
 
-**Serving is off unless `IRIS_STAGED_L1I` is set.** The predecoded form is
-unknown, and the plain-instruction assumption is wrong for the Fuel PROM: it
-stages primary I lines for its own code with words taken from Index Load Data of
-lines the hardware had refilled and predecoded (36-bit values with extra bits
-inside the word, not an instruction in TagLo). With serving on, the Fuel PROM
-executes them and never gets past "Copying PROM code to memory". iris refills and
-predecodes nothing, so it cannot produce those words. Serving needs the
-predecoded form, or a guest that stages plain instructions. The primary data
-cache is not served: its dirty lines write back to the secondary cache and the
-state-modifier field has no model.
+The stored word is the 36-bit predecoded instruction plus even parity, not an
+instruction in TagLo. A fetch hit decodes it with a layout inferred from
+the words a shipped PROM stages, for sampled opcodes only (`l1i_decode`, `L1I_CLASSES`). `addiu $4,$0,2` is `0x3_4420_0004`.
+- A word of a class not in the table is refused: reported once on stderr, and the
+  fetch is treated as a miss and reads the secondary cache or memory. Chosen over
+  a Cache Error because memory holds the instruction a word was built from in all
+  but a few stale entries, so a miss executes the right instruction for nearly
+  every staged word, where an error stops a guest the hardware runs. It can hide
+  a stale entry of an unsampled class, which is why it is reported. The Fuel PROM
+  stages seven unsampled classes (0x00, 0x08, 0x1e, 0x35, 0x3f, 0x41, 0x71) and
+  boots on this fallback; only 0x1a (addiu) is decoded.
+- Parity is checked on a fetch hit: even over the 36 bits and ECC[0]. A bad word
+  posts a Cache Error (CacheErr.ED) unless Status.DE or ERL is set.
+- Index Load Data (I) returns the stored word and parity as stored, so a readback
+  stored back verbatim round-trips and executes. A refill is not modelled: a line
+  the guest never staged reads back as the shadow's contents, not as the
+  predecoded memory word. A word with p[35:32] = 0xf is this model's own encoding
+  of a raw instruction in p[31:0] (`L1I_RAW`), so a word outside the sampled set
+  can round-trip. Model choice; the hardware contents are unknown.
+
+The primary data cache is not served: its dirty lines write back to the secondary
+cache and the state-modifier field has no model.
 
 ## Why the fast paths must be told
 
@@ -69,7 +80,7 @@ Dropping any of the first three fails `a_compiled_load_hits_a_staged_line_not_th
 - Every CACHE operand is translated first (exceptions: TLB Refill/Invalid, privilege Address Error, never TLB Modified). The secondary set, way and quadword come from the operand's physical address (`set_cache_op_pa`), the primaries' from its virtual address. An operand on an uncached page is undefined on the R10000 and goes ahead as if cached.
 - Only the R10000 is documented. The R12000, R14000 and R16000 use the same
   tag layout here, which is an inference.
-- Not modelled: predecode, primary data cache staged hits, ECC and check bits, the
+- Not modelled: the predecode of unsampled classes, refills, primary data cache staged hits, ECC and check bits, the
   virtual-index purge, the BadVAddr/Context/EntryHi values after a CACHE-raised TLB exception, Status.CH, the
   tag rewrite on invalidate (only the state clears), coherence with other CPUs
   and DMA.
