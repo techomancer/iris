@@ -12,6 +12,9 @@
 //! the ISP12160 at device 3 (input 2) and the BCM5701 at device 4 (input 3)
 //! are the board's choice, made by the machine.
 //!
+//! Widget 0 of the board is the PXBOW of the PIC that carries IO9
+//! ([`Pic::enable_pxbow`]); the other PIC has none.
+//!
 //! The register names are the ones the Bridge family shares
 //! ([`xbridge::reg`](super::xbridge::reg)); the PIC leaves out the ATE, the
 //! alias windows and the second and third write-request banks' meaning.
@@ -45,6 +48,8 @@
 //! Ported from hw/pci-host/sgi-pic.c in jamesbraid/qemu-sgi-origami.
 
 use super::bedrock_pi::BedrockPi;
+use super::heart::Clock;
+use super::pxbow::{AttachError, Pxbow};
 use super::xbridge::reg;
 use crate::devlog::LogModule;
 use crate::irq::{InterruptController, IrqLine};
@@ -1106,6 +1111,7 @@ pub struct Pic {
     widget: u8,
     wiring: Arc<Wiring>,
     heads: [Arc<Head>; 2],
+    pxbow: OnceLock<Arc<Pxbow>>,
 }
 
 impl Pic {
@@ -1120,6 +1126,7 @@ impl Pic {
             widget,
             heads: [Head::new(0, wiring.clone()), Head::new(1, wiring.clone())],
             wiring,
+            pxbow: OnceLock::new(),
         })
     }
 
@@ -1131,6 +1138,31 @@ impl Pic {
     /// device-I/O windows and the PCI memory windows. Bedrock IO takes this.
     pub fn widget(self: &Arc<Self>) -> Arc<dyn BusDevice> {
         Arc::new(CpuWidget { heads: self.heads.clone() })
+    }
+
+    /// Give the chip its PXBOW, the widget-0 face of the board that owns
+    /// it, reached from `host_widget`. On Tezro the PIC that carries IO9
+    /// supplies widget 0; a second PIC gets none. The PIC's own widget is
+    /// attached behind it, and widget 0's interrupt goes to the peer when it
+    /// targets the host. Once, before the machine runs.
+    pub fn enable_pxbow(self: &Arc<Self>, host_widget: u8, clock: Clock) -> Result<Arc<Pxbow>, AttachError> {
+        let pxbow = Pxbow::new(host_widget, self.widget, clock)?;
+        pxbow.attach_endpoint(self.widget, self.widget())?;
+        let wiring = self.wiring.clone();
+        pxbow.connect_packets(Box::new(move |widget, address, vector, set| {
+            widget == host_widget
+                && wiring
+                    .peer
+                    .get()
+                    .is_some_and(|peer| peer.interrupt(0, address, vector as u64 | if set { SET } else { 0 }).is_ok())
+        }));
+        self.pxbow.set(pxbow.clone()).map_err(|_| AttachError::Occupied(self.widget))?;
+        Ok(pxbow)
+    }
+
+    /// The chip's PXBOW, if it has one.
+    pub fn pxbow(&self) -> Option<&Arc<Pxbow>> {
+        self.pxbow.get()
     }
 
     /// Where interrupts and DMA this chip originates go. Once, before the
@@ -1206,11 +1238,17 @@ impl Pic {
                 });
             }
         }
+        if let Some(pxbow) = self.pxbow.get() {
+            pxbow.xbow().register_locks();
+        }
     }
 }
 
 impl Resettable for Pic {
     fn power_on(&self) {
+        if let Some(pxbow) = self.pxbow.get() {
+            pxbow.xbow().power_on();
+        }
         for head in &self.heads {
             head.reset();
         }
