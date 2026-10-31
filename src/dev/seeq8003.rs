@@ -139,6 +139,11 @@ pub struct SeeqState {
     rx_delivered: u64,
     rx_refused: u64,
     rx_nothing: u64,
+    /// Frames the address filter dropped, and of those, how many arrived
+    /// while the receiver was off (rx_cmd match mode 0, as during the
+    /// driver's reset of the interface). Nothing else reports either.
+    rx_filtered: u64,
+    rx_disabled: u64,
     /// Monotonic lock counter — incremented on every mutex acquisition.
     /// Prefix all debug messages with this to correlate across threads.
     pub ts:       u32,
@@ -241,6 +246,8 @@ impl Seeq8003 {
                 rx_delivered: 0,
                 rx_refused: 0,
                 rx_nothing: 0,
+                rx_filtered: 0,
+                rx_disabled: 0,
                 ts:           0,
             })),
             irq, rx_dma, tx_dma,
@@ -660,11 +667,12 @@ impl Device for Seeq8003 {
                 // full and starve the guest's own frames, then handle at most one
                 // for-guest frame this iteration (one delivery per interrupt).
                 // Bounded by RX_DRAIN_CAP so TX and interrupt servicing still run.
+                let mut filtered = 0;
                 let rx_result = if let Some(ref dma) = rx_dma {
                     let mut r = RxPumpResult::Nothing;
                     for _ in 0..RX_DRAIN_CAP {
                         match Self::pump_rx(dma, &mut rx_cons, rx_cmd_snap, station_addr_snap, &in_reset_enet) {
-                            RxPumpResult::Filtered => continue,   // chatter discarded; keep draining
+                            RxPumpResult::Filtered => { filtered += 1; continue }   // chatter discarded; keep draining
                             other => { r = other; break; }        // Delivered / Refused / Nothing
                         }
                     }
@@ -674,6 +682,10 @@ impl Device for Seeq8003 {
                 // Now take SeeqState lock once to apply all results atomically.
                 let mut st = lock_state!(state_enet);
                 let mut dma_irq = false;
+                st.rx_filtered += filtered;
+                if rx_cmd_snap & rx_cmd::MATCH_MASK == rx_cmd::MATCH_DISABLE {
+                    st.rx_disabled += filtered;
+                }
 
                 let tx_activity = !matches!(tx_result, TxPumpResult::Nothing);
                 let tx_moved = matches!(tx_result, TxPumpResult::Sent { .. });
@@ -775,6 +787,7 @@ impl Device for Seeq8003 {
                         writeln!(w, "Netmask     : {}", self.config.netmask).ok();
                         writeln!(w, "intpend={} rx_delivered={} rx_refused={} rx_nothing={}",
                                  st.intpend, st.rx_delivered, st.rx_refused, st.rx_nothing).ok();
+                        writeln!(w, "rx_filtered={} (receiver off: {})", st.rx_filtered, st.rx_disabled).ok();
                         writeln!(w, "rx_cmd={:#04x} rx_stat={:#04x} tx_cmd={:#04x} tx_stat={:#04x}",
                                  st.rx_cmd, st.rx_stat, st.tx_cmd, st.tx_stat).ok();
                         writeln!(w, "threads: {}", if self.is_running() { "running" } else { "stopped" }).ok();
@@ -930,5 +943,45 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Seeq8003 save_state mismatch after load_state round-trip");
+    }
+
+    /// A receive channel that takes every frame and counts them.
+    #[derive(Default)]
+    struct Ring { filled: Mutex<usize> }
+
+    impl DmaClient for Ring {
+        fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> { None }
+        fn write(&self, _val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+            if eop { *self.filled.lock() += 1; }
+            (DmaStatus::ok(), None)
+        }
+    }
+
+    fn settle<F: Fn() -> bool>(done: F) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    /// Frames the address filter drops while the receiver is off are
+    /// counted, since nothing else reports them.
+    #[test]
+    fn frames_dropped_with_the_receiver_off_are_counted() {
+        let ring = Arc::new(Ring::default());
+        let seeq = Seeq8003::new(None, Some(ring.clone()), None, Arc::new(AtomicU64::new(0)));
+        let (link, _sent, mut inject) = Link::loopback();
+        let wake = link.rx_wake();
+        seeq.attach(link);
+        for _ in 0..3 {
+            inject.push(vec![0xff; 60]).unwrap();
+        }
+        seeq.start();
+        wake.notify();
+        settle(|| inject.slots() == CHAN_CAPACITY);
+        seeq.stop();
+        let st = seeq.state.lock();
+        assert_eq!((st.rx_filtered, st.rx_disabled, *ring.filled.lock()), (3, 3, 0));
     }
 }

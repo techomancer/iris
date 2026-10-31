@@ -391,6 +391,30 @@ mod tests {
         assert!(lines.load(Ordering::Relaxed) > kernels, "no console lines beyond the rows");
     }
 
+    /// The suite runs with no PROM, so nothing but the harness sets KSEG0's
+    /// cacheability, and the R10000 resets with Config.K0 = 2 (uncached).
+    /// If the harness stops choosing K0 = 3, every R10000 load and store goes
+    /// to the bus and the R10000 cells measure uncached memory, about half the
+    /// R4400's rate on the memory kernels, while still scoring 100%.
+    #[test]
+    #[ignore = "runs the emulator for ~30s; run with --ignored"]
+    fn the_r10000_runs_the_suite_with_kseg0_cached() {
+        let run = run(
+            &BenchOptions {
+                quick: true,
+                label: "test".into(),
+                cpu: CpuModel::R10000,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("the embedded suite must run on the R10000");
+        assert_eq!(run.matched, run.checked, "the R10000 computed a wrong answer");
+        let config = u32::from_str_radix(run.machine.config.trim_start_matches("0x"), 16)
+            .expect("the guest reports Config in hex");
+        assert_eq!(config & 7, 3, "KSEG0 not cacheable: Config {:#x}", config);
+    }
+
     #[test]
     fn the_bench_machine_has_no_disks() {
         let cfg = bench_config(BENCH_BANKS, CpuModel::default());

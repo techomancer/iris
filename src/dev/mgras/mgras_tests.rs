@@ -4,6 +4,7 @@
 //! and replay of text recordings (`testdata/*.txt`).
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -150,11 +151,13 @@ fn pio_read_through_the_bus() {
 struct TestMem {
     words: Mutex<HashMap<u32, u32>>,
     bytes: Mutex<HashMap<u32, u8>>,
+    /// Byte stores by the board, to count how many times a read ran.
+    stores: Mutex<u32>,
 }
 
 impl BusDevice for TestMem {
     fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.bytes.lock().get(&(addr as u32)).copied().unwrap_or(0)) }
-    fn write8(&self, addr: u64, val: u8) -> u32 { self.bytes.lock().insert(addr as u32, val); BUS_OK }
+    fn write8(&self, addr: u64, val: u8) -> u32 { *self.stores.lock() += 1; self.bytes.lock().insert(addr as u32, val); BUS_OK }
     fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.words.lock().get(&(addr as u32)).copied().unwrap_or(0)) }
 }
 
@@ -244,6 +247,94 @@ fn dma_read_to_host_memory() {
     m.stop_engines();
 }
 
+/// A board in the Octane's order (see `Mgras::start_reads_at_kick`), set
+/// before the engines start.
+fn octane_board() -> Arc<Mgras> {
+    let hb = Arc::new(AtomicU64::new(0));
+    let m = Mgras::new(crate::config::GraphicsBoard::HighImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
+    m.start_reads_at_kick();
+    m.start_engines();
+    m
+}
+
+/// The board-to-host read of `dma_read_to_host_memory`, set up but not yet
+/// armed or kicked: six pixels at 20..22 x 30..31 (7 to 12) into the
+/// memory from `dma_setup`.
+fn read_back_setup(m: &Mgras) -> Arc<TestMem> {
+    x_server(m);
+    direct_rss(m, FILLMODE, FILL_FAST, false);
+    for (k, v) in [7u32, 8, 9, 10, 11, 12].into_iter().enumerate() {
+        let (x, y) = (20 + k as u32 % 3, 30 + k as u32 / 3);
+        direct_rss(m, FILL_COLOR_R, v, false);
+        block(m, x, y, x, y);
+    }
+    dma_setup(m)
+}
+
+/// The read's raster side: a block in board-to-host mode, which arms the
+/// transfer.
+fn read_block_armed(m: &Mgras) {
+    direct_rss(m, FILLMODE, 4 << 22, false);
+    direct_rss(m, XFRMODE, 0, false);
+    direct_rss(m, XFRSIZE, 2 << 16 | 3, false);
+    block(m, 20, 30, 22, 31);
+}
+
+/// The Octane X server's order: XFRCONTROL 8 arms the read, the block and
+/// the host kick run it, and the XFRCONTROL 9 after the kick finds it
+/// already run. That start is expected, so nothing is reported, and the
+/// read runs once.
+#[test]
+fn octane_read_runs_at_the_kick_and_the_start_after_it_is_silent() {
+    let m = octane_board();
+    let mem = read_back_setup(&m);
+    fifo_rss(&m, XFRCONTROL, 8, false);
+    read_block_armed(&m);
+    fifo_dma(&m, 0x0B, 0x9); // kick: run, pool 0, board to host
+    fifo_rss(&m, XFRCONTROL, 9, false);
+    m.state_hash();
+    let b = mem.bytes.lock();
+    let got: Vec<u8> = [0x2000, 0x2001, 0x2002, 0x2004, 0x2005, 0x2006].iter().map(|a| b.get(a).copied().unwrap_or(0)).collect();
+    drop(b);
+    assert_eq!(got, [7, 8, 9, 10, 11, 12]);
+    assert_eq!(*mem.stores.lock(), 6, "one read of six bytes");
+    assert!(!m.noted("no host DMA pending"), "the start after the kick is expected");
+    m.stop_engines();
+}
+
+/// A start with no kick behind it is still reported: nothing ran a read.
+#[test]
+fn octane_start_with_no_kick_is_still_reported() {
+    let m = octane_board();
+    let mem = read_back_setup(&m);
+    fifo_rss(&m, XFRCONTROL, 8, false);
+    read_block_armed(&m);
+    fifo_rss(&m, XFRCONTROL, 9, false);
+    m.state_hash();
+    assert!(m.noted("raster DMA read started with no host DMA pending"));
+    assert_eq!(*mem.stores.lock(), 0, "nothing was kicked");
+    m.stop_engines();
+}
+
+/// A kick with no read armed waits until the raster side is armed and
+/// started. The start that follows takes the waiting read, so nothing is
+/// reported.
+#[test]
+fn octane_kick_waits_until_the_read_is_armed() {
+    let m = octane_board();
+    let mem = read_back_setup(&m);
+    fifo_dma(&m, 0x0B, 0x9); // kick: nothing armed, so it waits
+    m.state_hash();
+    assert_eq!(*mem.stores.lock(), 0, "no read armed, so the kick waits");
+    fifo_rss(&m, XFRCONTROL, 8, false);
+    read_block_armed(&m);
+    fifo_rss(&m, XFRCONTROL, 9, false);
+    m.state_hash();
+    assert_eq!(*mem.stores.lock(), 6, "the start ran the waiting read once");
+    assert!(!m.noted("no host DMA pending"));
+    m.stop_engines();
+}
+
 #[test]
 fn set_done_command_raises_the_done_flag() {
     let m = live_board();
@@ -271,6 +362,25 @@ fn context_switch_swallows_the_incoming_context() {
     fifo_rss(&m, FILL_COLOR_R, 0x2A, false);
     block(&m, 5, 5, 5, 5);
     assert_eq!(m.fb_pixel(5, 5), 0x2A);
+    m.stop_engines();
+}
+
+/// The first switch has no outgoing slot: it saves nothing and reports nothing.
+#[test]
+fn first_context_switch_reports_nothing_to_save() {
+    let m = live_board();
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    assert!(!m.noted("nowhere to save"), "no slot to save on the first switch");
+    m.stop_engines();
+}
+
+/// A slot outside ERAM is a real missing save target and is still reported.
+#[test]
+fn switch_away_from_a_slot_outside_eram_is_reported() {
+    let m = live_board();
+    switch_to_gl_context(&m, 0xFFFF_0000, 0, 0, 100, 100);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    assert!(m.noted("nowhere to save"), "the outside-ERAM slot has no record to save into");
     m.stop_engines();
 }
 

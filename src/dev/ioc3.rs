@@ -70,6 +70,10 @@ pub const REVISION: u8 = 0x01;
 /// PCI subsystem id of the Octane's system board.
 pub const SUBSYS_IP30_SYSBOARD: u16 = 0xc304;
 pub const BAR_SIZE: u32 = 1 << 20;
+/// The configuration dwords the chip decodes; the rest of the 16 repeat them.
+const CONFIG_DECODED_DWORDS: usize = 8;
+/// PCI status bit 7, fast back-to-back capable.
+const PCI_STATUS_FAST_BACK: u32 = 0x0080;
 
 /// Register offsets within the BAR.
 pub mod reg {
@@ -79,6 +83,8 @@ pub mod reg {
     pub const CHIP_CONTROL: u32 = 0x28;
     pub const INT_OUTPUT: u32 = 0x2c;
     pub const MICROLAN: u32 = 0x30;
+    /// The last dword of the PCI header that shows through the block.
+    pub const HEADER_LAST: u32 = 0x10;
     pub const PIN_CONTROL_SET: u32 = 0x34;
     pub const PIN_CONTROL_CLR: u32 = 0x38;
     pub const PIN_DATA: u32 = 0x3c;
@@ -135,6 +141,8 @@ pub mod int {
         | PARALLEL_SERVICE
         | serial(0, RX_HIGH_WATER)
         | serial(1, RX_HIGH_WATER)
+        | serial(0, RX_RING_FULL)
+        | serial(1, RX_RING_FULL)
         | serial(0, TX_RING_EMPTY)
         | serial(1, TX_RING_EMPTY);
 }
@@ -339,6 +347,9 @@ struct SdmaPort {
     tx_delay_deadline: Option<Instant>,
     tx_delay_frozen: Option<Duration>,
     tx_delay_irq: bool,
+    /// An entry waits that the receive ring had no room for; drives
+    /// receive-ring-full while ring DMA is on.
+    post_refused: bool,
 }
 
 #[derive(Default)]
@@ -464,9 +475,23 @@ const PAR_FIFO_DEPTH: usize = 16;
 /// IRQ7 and DMA3.
 const PAR_CONFIG_A: u8 = 0x1f;
 const PAR_CONFIG_B: u8 = 0x0b;
-/// No peripheral on the cable: nFault high, nothing else asserted. This
-/// value is the model's choice; the register is described as "line-driven".
-const PAR_STATUS_IDLE: u8 = 0x08;
+// The status lines as the external SuperIO part reads them: bit 7 is the
+// inverse of the Busy pin, bits 6 to 3 are nAck, PError, Select and nFault as
+// the pins stand (nAck and nFault are active low). Bit 2, the part's PRINT
+// indicator, is not modelled and reads clear.
+const PAR_STATUS_NFAULT: u8 = 1 << 3;
+const PAR_STATUS_SELECT: u8 = 1 << 4;
+const PAR_STATUS_NACK: u8 = 1 << 6;
+const PAR_STATUS_BUSY: u8 = 1 << 7;
+/// Nothing on the connector: each of the five inputs sits at the level a
+/// pull-up gives it, high, and Busy high reads as a clear bit 7. The pull
+/// direction on the real boards is inferred; nothing measures an unplugged
+/// port.
+const PAR_STATUS_EMPTY: u8 = PAR_STATUS_NFAULT | PAR_STATUS_SELECT | 1 << 5 | PAR_STATUS_NACK;
+/// A ready printer: Busy low (bit 7 set), nAck, Select and nFault high, no
+/// paper error. Every host backend is taken as one that always accepts what
+/// is sent, an approximation: a file or pty never holds Busy.
+const PAR_STATUS_READY: u8 = PAR_STATUS_BUSY | PAR_STATUS_NACK | PAR_STATUS_SELECT | PAR_STATUS_NFAULT;
 
 #[derive(Default)]
 struct Parallel {
@@ -987,14 +1012,24 @@ impl St {
         self.sdma_level(p, int::TX_RING_EMPTY, empty);
     }
 
-    /// The receive high-water mark counts ring entries; a level.
+    /// The receive high-water mark counts ring entries; a level. So is
+    /// receive-ring-full: set while ring DMA is on and an entry waits that
+    /// the ring had no room for, so an acknowledgement does not bring it back
+    /// with every refused retry, and it falls once the consumer makes room,
+    /// posted yet or not. A ring filled exactly, with nothing waiting, does
+    /// not raise it. A model choice; what the part does is not known.
     fn sdma_update_high_water(&mut self, p: usize) {
         let mask = self.sdma_mask();
         let port = &self.sdma.port[p];
         let hw = self.sdma_ctl(p) & sdma_ctl::HIGH_WATER;
         let waiting = port.reg[3].wrapping_sub(port.reg[4]) & mask;
         let level = hw != 0 && waiting / ENTRY as u32 >= hw;
+        if (port.reg[3] + ENTRY as u32) & mask != port.reg[4] & mask {
+            self.sdma.port[p].post_refused = false;
+        }
+        let full = self.sdma_ctl(p) & sdma_ctl::ENABLE != 0 && self.sdma.port[p].post_refused;
         self.sdma_level(p, int::RX_HIGH_WATER, level);
+        self.sdma_level(p, int::RX_RING_FULL, full);
     }
 
     /// Post the packer as one entry. Fails, keeping the characters, when the
@@ -1008,7 +1043,7 @@ impl St {
         };
         let next = (produce + ENTRY as u32) & mask;
         if next == consume & mask {
-            self.sdma_raise(p, int::RX_RING_FULL);
+            self.sdma.port[p].post_refused = true;
             return false;
         }
         if !self.dma_write(ring.saturating_add((produce & mask) as u64), &packer) {
@@ -1017,6 +1052,7 @@ impl St {
         }
         let port = &mut self.sdma.port[p];
         port.reg[3] = next;
+        port.post_refused = false;
         port.packed = 0;
         port.packer = [0; ENTRY];
         true
@@ -1315,6 +1351,7 @@ impl St {
                     port.armed = false;
                     port.drain_pending = false;
                     port.packed = 0;
+                    port.post_refused = false;
                     port.packer = [0; ENTRY];
                     port.tx_slot = 0;
                     port.tx_fetched = false;
@@ -1367,6 +1404,7 @@ impl St {
             _ => {}
         }
         self.sdma_update_tx_empty(p);
+        self.sdma_update_high_water(p);
     }
 }
 
@@ -1505,7 +1543,8 @@ impl St {
                 self.int_out.reg | if self.int_out.state { IO_STATE } else { 0 }
             }
             reg::MICROLAN => self.microlan,
-            reg::PIN_CONTROL_SET => self.pin_control,
+            // Both write aliases read the control word.
+            reg::PIN_CONTROL_SET | reg::PIN_CONTROL_CLR => self.pin_control,
             reg::PIN_DATA => self.pin_data_now(),
             0x80..=0x98 => self.par_dma_read(a),
             0x9c | 0xa0 | 0xa4 => self.kbc_read(a, c.ps2),
@@ -1783,7 +1822,9 @@ impl St {
         let p = &mut self.par;
         match r {
             0 => p.data,
-            1 => PAR_STATUS_IDLE,
+            // The lines follow the cable: a peripheral, or pull-ups on nothing.
+            1 if p.backend.is_some() => PAR_STATUS_READY,
+            1 => PAR_STATUS_EMPTY,
             2 => p.control,
             8 => {
                 if p.mode() == PAR_MODE_CONFIG {
@@ -2620,9 +2661,32 @@ impl Drop for Ioc3 {
     }
 }
 
+impl Ioc3 {
+    /// The header as the chip answers it, for the configuration space and
+    /// the first dwords of the register block alike. The status register
+    /// reads fast back-to-back capable beside the medium decode timing.
+    fn header_dword(&self, index: usize) -> u32 {
+        let v = self.sh.pci.read(index);
+        if index == 1 { v | PCI_STATUS_FAST_BACK << 16 } else { v }
+    }
+}
+
 impl PciBusDevice for Ioc3 {
     fn config(&self) -> &PciConfig {
         &self.sh.pci
+    }
+
+    /// The chip decodes five configuration address bits, so dwords 0x20 to
+    /// 0x3f read as 0x00 to 0x1f: no subsystem dword at 0x2c (the latency
+    /// word shows there) and no interrupt pin at 0x3d. Only the guest's
+    /// view repeats; the bridge still routes INTA from the stored pin, and
+    /// the subsystem id stays the key that picks the board's population.
+    fn config_dword(&self, index: usize) -> u32 {
+        self.header_dword(if (CONFIG_DECODED_DWORDS..2 * CONFIG_DECODED_DWORDS).contains(&index) {
+            index - CONFIG_DECODED_DWORDS
+        } else {
+            index
+        })
     }
 
     /// `off` is where the bridge put the access on the bus; IOC3 undoes the
@@ -2633,6 +2697,9 @@ impl PciBusDevice for Ioc3 {
             return 0;
         }
         let a = off ^ (4 - width.min(4) as u32);
+        if width == 4 && a <= reg::HEADER_LAST && a & 3 == 0 {
+            return self.header_dword((a / 4) as usize);
+        }
         if (reg::ENET_FIRST..=reg::ENET_LAST).contains(&a) {
             // Only 32-bit accesses reach the Ethernet block.
             if width != 4 {

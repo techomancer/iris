@@ -6322,4 +6322,47 @@ mod tests {
                                parked through an interrupt masked only by the spl"),
         }
     }
+
+    /// A bus whose reads fail, recording each time it is asked to explain
+    /// a failure.
+    struct FailingProbe {
+        explains: bool,
+        asked: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl BusDevice for FailingProbe {
+        fn read32(&self, addr: u64) -> BusRead32 {
+            if addr == 0x2000 { BusRead32::ok(0x1234_5678) } else { BusRead32::err() }
+        }
+        fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
+            self.asked.lock().unwrap().push((addr, size));
+            self.explains.then(|| "probe failed".to_string())
+        }
+    }
+
+    /// A described fault is labelled but not different: the same exception
+    /// and BadVAddr, and the bus is asked only after a read has failed.
+    #[test]
+    fn test_described_uncached_read_fault_still_raises_the_bus_error() {
+        let mut outcome = Vec::new();
+        for explains in [false, true] {
+            let bus = Arc::new(FailingProbe { explains, asked: Mutex::new(Vec::new()) });
+            let dev: Arc<dyn BusDevice> = bus.clone();
+            let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> = MipsExecutor::new(dev, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(4, 0xFFFFFFFF_A0000000u64);
+
+            // A good read never asks.
+            let ok = exec.exec(make_i(OP_LW, 4, 8, 0x2000));
+            assert_eq!(ok, EXEC_COMPLETE);
+            assert_eq!(exec.core.read_gpr(8) as u32, 0x1234_5678);
+            assert!(bus.asked.lock().unwrap().is_empty());
+
+            let st = exec.exec(make_i(OP_LW, 4, 9, 0x100));
+            assert_ne!(st, EXEC_COMPLETE, "the read must still fault");
+            assert_eq!(*bus.asked.lock().unwrap(), vec![(0x100, 4)]);
+            outcome.push((st, exec.core.cp0_badvaddr, exec.core.cp0_cause));
+        }
+        assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
+    }
 }

@@ -1342,11 +1342,9 @@ pub struct Rex3 {
     /// True while the REX3-Processor thread is parked on an empty gfifo. The
     /// producer (`gfifo_push`) checks this and unparks the consumer so a fresh
     /// command is picked up immediately instead of after the park timeout.
-    #[cfg(any(feature = "idle-pause", test))]
     processor_parked: AtomicBool,
     /// Handle to the REX3-Processor thread, set once when it starts, used by
     /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
-    #[cfg(any(feature = "idle-pause", test))]
     processor_unparker: std::sync::OnceLock<thread::Thread>,
     /// Set by the gfifo consumer whenever it processes activity that may have
     /// changed the framebuffer. The refresh thread renders only when this (or a
@@ -1559,9 +1557,7 @@ impl Rex3 {
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
             refresh_thread: Mutex::new(None),
-            #[cfg(any(feature = "idle-pause", test))]
             processor_parked: AtomicBool::new(false),
-            #[cfg(any(feature = "idle-pause", test))]
             processor_unparker: std::sync::OnceLock::new(),
             fb_dirty: AtomicBool::new(true),
             screen,
@@ -2464,7 +2460,6 @@ impl Rex3 {
         // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
         // on the hot path: a relaxed-ish load that is false whenever the
         // processor is actively draining.
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2491,7 +2486,6 @@ impl Rex3 {
         if !self.gfifo.try_push(addr, val) {
             return false;
         }
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2523,7 +2517,6 @@ impl Rex3 {
         if !self.gfifo.try_push2(addr0, val0, addr1, val1) {
             return false;
         }
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2545,7 +2538,6 @@ impl Rex3 {
             });
         }
         self.gfifo.push_batch(token, vals.len() as u64, vals);
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2570,7 +2562,6 @@ impl Rex3 {
 
     fn register_processor(&self) {
         // Publish our thread handle so gfifo_push can unpark us when we park.
-        #[cfg(any(feature = "idle-pause", test))]
         let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
@@ -2632,10 +2623,8 @@ impl Rex3 {
                 // (crossbeam's backoff completes), stop burning a host core on
                 // yield_now() and actually park. An idle IRIX desktop leaves this
                 // fifo empty indefinitely, so without parking this thread pins a
-                // CPU at ~100%. Test builds always park: every test leaks its
-                // Rex3, processor thread included, and a few hundred of them
-                // yield-spinning starve a CI runner.
-                #[cfg(any(feature = "idle-pause", test))]
+                // CPU at ~100%. Tests leak their Rex3 and its processor thread,
+                // so spinning ones also starve a CI runner.
                 if backoff.is_completed() {
                     // Set parked BEFORE the final emptiness re-check so a racing
                     // gfifo_push either (a) is seen by the peek below, or (b) sees
@@ -2650,8 +2639,6 @@ impl Rex3 {
                     self.processor_parked.store(false, Ordering::Release);
                     backoff.reset();
                 } else { backoff.snooze(); }
-                #[cfg(not(any(feature = "idle-pause", test)))]
-                backoff.snooze();
             }
         }
     }

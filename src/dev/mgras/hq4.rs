@@ -388,9 +388,11 @@ impl Hq3Board for Hq4Quirks {
     /// That the register field is nine bits is an inference, not a
     /// published width: every raster register name known runs to 0x1FF, and
     /// the direct packets' decode used for the Octane's port takes the bit
-    /// above as part of the packet class. The IP30 PROM sends one such word
-    /// (0x001A6804) before its first context switch; what the board does
-    /// with it is unknown, so it is dropped and reported.
+    /// above as part of the packet class. The IP30 PROM and the IP30 kernel
+    /// both send one such word (0x001A6804, decoded as a write of 0 to
+    /// register 0x268, which no datasheet names); the kernel's copies can
+    /// arrive after a context switch has started. What the board does with
+    /// it is unknown, so it is dropped and reported.
     fn drop_raster_write(&self, cmd: u32) -> Option<String> {
         (cmd & 0x200 != 0).then(|| format!("raster command {cmd:#x} past register 0x1FF dropped"))
     }
@@ -713,8 +715,8 @@ impl ImpactXio {
             board.ge_revision as u32,
         );
         mgras.set_phys(mem);
-        // The Octane X server arms a pixel read with XFRCONTROL 8 and kicks
-        // the DMA last, which starts the read.
+        // The Octane X server arms a pixel read with XFRCONTROL 8, kicks the
+        // DMA, which starts the read, and then writes XFRCONTROL 9.
         mgras.start_reads_at_kick();
         // The HQ4 microcode keeps its GE state at other addresses, and the
         // IP30 kernel's idle waits are shorter than the model's long lists.
@@ -870,7 +872,9 @@ impl ImpactXio {
             o if is_plain(o) => s.plain.get(&o).copied().unwrap_or(0),
             _ => {
                 drop(s);
-                self.shared.note(format!("read of {off:#08x}"));
+                // The CPU's PC at its last batch boundary: the caller, to within a batch.
+                let pc = crate::ip30::LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
+                self.shared.note(format!("read of {off:#08x} at pc {pc:#x}"));
                 0
             }
         };
@@ -1038,7 +1042,8 @@ impl ImpactXio {
             true
         });
         if !known {
-            self.shared.note(format!("write of {v:#x} to {off:#08x}"));
+            let pc = crate::ip30::LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
+            self.shared.note(format!("write of {v:#x} to {off:#08x} at pc {pc:#x}"));
             return BUS_OK;
         }
         for (o, v) in board {
@@ -1578,7 +1583,7 @@ mod tests {
         assert!(!is_whole_packet(0x8000_0004_0000_0000), "pixel data");
     }
 
-    /// The IP30 PROM's pre-switch packet 0x001A6804 names a raster register
+    /// The IP30 PROM's and kernel's packet 0x001A6804 names a raster register
     /// past 0x1FF: it is dropped and reported, and leaves the raster
     /// registers alone.
     #[test]

@@ -102,8 +102,11 @@ impl PciConfig {
     pub fn write(&self, reg: usize, val: u32) {
         let mut r = self.regs.lock().unwrap();
         match reg {
-            // Identity, class and header type are read-only.
-            0 | 2 | 3 => {}
+            // Identity and class are read-only.
+            0 | 2 => {}
+            // Cache line size and latency timer are stored; the header type
+            // and BIST bytes above them are not.
+            3 => r[3] = (r[3] & 0xffff_0000) | (val & 0xffff),
             // Command; status bits are write-one-to-clear and none are set.
             1 => r[1] = val & 0xffff,
             4..=9 => {
@@ -220,6 +223,13 @@ impl crate::traits::Saveable for PciConfig {
 pub trait PciBusDevice: Send + Sync {
     /// The function's configuration header.
     fn config(&self) -> &PciConfig;
+
+    /// What a configuration read of dword `index` returns to the guest. The
+    /// header as stored, unless the chip decodes fewer address lines than
+    /// the bus gives it (IOC3 repeats its first 32 bytes).
+    fn config_dword(&self, index: usize) -> u32 {
+        self.config().read(index)
+    }
 
     /// A read of `width` bytes (1, 2 or 4) at `off` within BAR `bar`.
     fn bar_read(&self, bar: usize, off: u32, width: usize) -> u32;
@@ -474,6 +484,17 @@ mod tests {
         c.reset();
         assert_eq!(c.read(11), 0xc304_10a9);
         assert_eq!(c.read(4), 1);
+    }
+
+    /// Firmware programs the latency timer and cache line size, and reads
+    /// them back; the header type byte above them stays what it is.
+    #[test]
+    fn the_latency_timer_and_cache_line_size_are_stored() {
+        let c = scsi_like();
+        c.write(3, 0x00ff_2810);
+        assert_eq!(c.read(3), 0x0000_2810);
+        c.reset();
+        assert_eq!(c.read(3), 0);
     }
 
     #[test]

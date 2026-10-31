@@ -45,6 +45,13 @@ where
     }
 }
 
+/// How far short of a deadline the worker stops sleeping and starts spinning.
+/// A park overshoots by the kernel's timer slack plus scheduling latency, so
+/// the margin has to exceed that for the deadline to be met.
+const SPIN_MARGIN: Duration = Duration::from_micros(50);
+/// Waits at or under this are spun outright: a sleep would end after them.
+const SPIN_THRESHOLD: Duration = Duration::from_micros(80);
+
 /// A Timer entry in the manager.
 struct TimerEntry {
     next_expiration: Instant,
@@ -383,13 +390,13 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
 
                 let delay = target - sleep_now;
 
-                if delay > Duration::from_micros(500) {
-                    // Park with a safe threshold for long waits.
-                    let park_duration = delay - Duration::from_micros(100);
-                    thread::park_timeout(park_duration);
-                } else if delay > Duration::from_micros(200) {
-                    // Medium wait: short park then spin the remainder.
-                    thread::park_timeout(delay - Duration::from_micros(50));
+                if delay > SPIN_THRESHOLD {
+                    // Sleep to just short of the deadline, then spin the
+                    // rest. The margin covers the kernel's timer slack and
+                    // wake-up latency (tens of microseconds), so the spin is
+                    // bounded by it and a periodic timer at 1 kHz costs a
+                    // few percent of a core rather than all of it.
+                    thread::park_timeout(delay - SPIN_MARGIN);
                 } else {
                     // Audio-scale waits (~23 µs at 44.1 kHz): spin to avoid 50 µs sleep floor.
                     let deadline = Instant::now() + delay;

@@ -536,12 +536,17 @@ pub struct Hq3Engine {
     /// A board-to-host start runs at once when the raster engine already
     /// has a read armed, and an XFRCONTROL with the read bit starts a
     /// waiting one: the Octane's HQ4 order, where the X server arms the
-    /// read with XFRCONTROL 8 and kicks the DMA last. The Indigo2's order
-    /// is the host side first, then XFRCONTROL 9. The armed read stays
-    /// armed until the next block or XFRCONTROL 0, so a later read kick
-    /// meant for something else (a kernel GE context read-out) would take
-    /// those pixels instead; nothing captured shows that order yet.
+    /// read with XFRCONTROL 8, kicks the DMA, and then writes XFRCONTROL 9,
+    /// which finds the read already run. The Indigo2's order is the host
+    /// side first, then XFRCONTROL 9. The armed read stays armed until the
+    /// next block or XFRCONTROL 0, so a later read kick meant for something
+    /// else (a kernel GE context read-out) would take those pixels instead;
+    /// nothing captured shows that order yet.
     pub kick_starts_read: bool,
+    /// Set when a kick ran an armed read. The XFRCONTROL 9 that follows
+    /// finds nothing pending, which is expected here, so it is not
+    /// reported. Any other XFRCONTROL write clears it.
+    kick_read_ran: bool,
     /// Hooks for a board outside the Indigo2.
     pub board: Option<Box<dyn Hq3Board>>,
     /// DMA transfers logged so far (bring-up).
@@ -609,6 +614,7 @@ impl Hq3Engine {
             formatter: 0,
             dma_read_pending: None,
             kick_starts_read: false,
+            kick_read_ran: false,
             board: None,
             dma_logged: 0,
             ge_return: None,
@@ -679,6 +685,8 @@ impl Hq3Engine {
                 ifr[..0x80].copy_from_slice(&self.dma_regs);
                 ifr[0x80..IF_WORDS].copy_from_slice(&self.raster_if_regs);
             }
+            // The first switch has no outgoing slot, so there is nothing to save.
+            None if self.slot.is_none() => {}
             None => sink.note(format!("context switch from slot {:x?}: nowhere to save", self.slot)),
         }
         self.context_words = host::CONTEXT_SWITCH_WORDS;
@@ -974,6 +982,9 @@ impl Hq3Engine {
                 }
             }
             let xfr = data.first().copied().filter(|_| r == RSS_XFRCONTROL);
+            if xfr.is_some_and(|v| v != XFRCONTROL_READ_START) {
+                self.kick_read_ran = false;
+            }
             if xfr == Some(XFRCONTROL_READ_START) {
                 self.start_read_dma(sink);
             } else if self.kick_starts_read && xfr.is_some_and(|v| v & XFRCONTROL_READ != 0) {
@@ -1228,12 +1239,16 @@ impl Hq3Engine {
     fn start_armed_read(&mut self, sink: &mut dyn Hq3Sink) {
         if self.dma_read_pending.is_some() && matches!(sink.transfer(), Some((true, _))) {
             self.start_read_dma(sink);
+            self.kick_read_ran = true;
         }
     }
 
     fn start_read_dma(&mut self, sink: &mut dyn Hq3Sink) {
+        let kicked = std::mem::take(&mut self.kick_read_ran);
         let Some(word) = self.dma_read_pending.take() else {
-            sink.note("raster DMA read started with no host DMA pending".into());
+            if !kicked {
+                sink.note("raster DMA read started with no host DMA pending".into());
+            }
             return;
         };
         match sink.transfer() {

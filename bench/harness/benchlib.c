@@ -334,6 +334,14 @@ void exc_clear(void)
 void bench_init(void)
 {
     cpu_prid   = cp0_prid();
+    /* Run KSEG0 cacheable (Config.K0 = 3). With no PROM in front of the suite
+     * nothing else sets it, so the reset value would decide, and that differs
+     * by CPU: IRIS brings an R4400 or R5000 up with 3 but an R10000 with 2,
+     * uncached. Left alone, every R10000 load and store went to the bus and
+     * the R10000 cells measured uncached memory instead of the CPU. Going
+     * from uncached to cached needs no cache maintenance: nothing has been
+     * cached through KSEG0 yet. */
+    cp0_config_set((cp0_config() & ~CFG_K0_MASK) | 3);
     cpu_config = cp0_config();
     cpu_fir    = fir();
     /* Only two CPUs get their own bit, because only two of them are ever asked

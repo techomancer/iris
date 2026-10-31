@@ -107,6 +107,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   the same lock the CPU thread needed to arm it. It now sleeps 100 µs between
   attempts, which is still far below the timescales a disk command runs at.
   (`src/dev/wd33c93a.rs`)
+- **Newport's REX3 thread sleeps while the screen is idle.** `REX3-Processor`
+  yield-spun at ~100 % of a host core on an idle desktop in every build but
+  `idle-pause`; it now parks when its queue is empty, and the producer wakes
+  it on the next write. (`src/dev/ng1/rex3.rs`)
+- **The timer thread sleeps between deadlines instead of spinning.** On the
+  Indigo2 the `hptimer` thread kept a host core at ~100 %: it spun for every
+  wait under 200 µs, and the machine's tick timers keep the waits that short.
+  It now sleeps to 50 µs short of a deadline and spins the rest, and an Indigo2
+  at the login screen uses a few percent of a core.
+  (`src/hptimer.rs`)
 
 ### Idle parking
 
@@ -126,6 +136,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   counters.
 - The `ci_clock` unit tests that materialise Count now advance it by retired
   cycles, so `--features ci_clock,idle-pause` passes.
+- **A masked pending interrupt no longer freezes a guest that polls with
+  interrupts off.** With interrupts disabled and a masked line pending, the
+  CPU thread slept until a new unmasked interrupt or a monitor command, so a
+  guest polling a device (the console's transmit-ready bit, say) stopped
+  mid-line for minutes. It keeps running now.
 
 ### JIT v2
 
