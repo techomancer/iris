@@ -1,7 +1,7 @@
 # IRIS — SGI workstation emulator
 
 The complete core/GUI feature and configuration inventory is in
-[FEATURES.md](FEATURES.md). For the Fuel, see the [Fuel guide](docs/fuel-ip34.md).
+[FEATURES.md](FEATURES.md). For the Fuel, see the [Fuel guide](docs/fuel-ip34.md); for the Tezro, the [Tezro guide](docs/tezro-ip53.md).
 This guide explains everyday use. The monitor's full command reference is in
 [debug.md](debug.md).
 

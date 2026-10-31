@@ -224,6 +224,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   reports the part's own secondary-cache size, where every part read 1 MB, and
   each R16000 presents its own reset word.
 
+### SGI Tezro (IP53 board, IP35 software platform)
+
+- Added a headless Tezro profile with the 700 MHz R16000, 4 MiB cache, 4 GiB RAM, a PIC with PXBOW, and the IO9's IOC4, ISP12160 and BCM5701; see the [Tezro guide](docs/tezro-ip53.md).
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
