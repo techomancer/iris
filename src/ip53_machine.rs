@@ -199,6 +199,8 @@ impl TezroMachine {
         let clock = Arc::new(Ds1744::new(YearBase::From(1968))?);
         clock.set_nvram_file(Path::new(&cfg.nvram))?;
         let memory = cfg.tezro_memory()?;
+        #[cfg(feature = "jitv2")]
+        check_jitv2_memory(&memory)?;
         let part = TezroPart::of(cfg.machine.cpu)?;
         let board = Arc::new(TezroBoard::with_config(TezroBoardConfig {
             payload: &prom,
@@ -229,8 +231,9 @@ impl TezroMachine {
         let rx = connect_cpu("Tezro", &node.md, &node.pi[0], &node.lb, &node.ni, &node.l1, &cpu);
         // After connect_cpu set the windows: each compile worker takes the
         // cache's geometry and the CPU model's policies once, as it starts.
-        // Workers read plain physical code addresses, which the cached plane
-        // serves; the uncached views would decode them as Hub registers.
+        // Workers read plain physical code addresses through the view the CPU
+        // fetched each page by: the cached plane for cached pages, the
+        // uncached attribute-0 view for the reset PROM's uncached fetches.
         #[cfg(feature = "jitv2")]
         {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -242,7 +245,7 @@ impl TezroMachine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(board.cached_bus(), stats);
+                g.compile_queue.start(board.code_bus(), stats);
             }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
@@ -513,6 +516,24 @@ where
     Arc::new(MipsCpu::new(*exec))
 }
 
+/// A jitv2 build keys the PROM's uncached code pages at frame 1 << 20 and
+/// up, above every frame below 4 GiB (`Jitv2::enable_uncached_views`), so it
+/// takes only memory that ends at or below 4 GiB: banks 0 to 3. The default
+/// layout puts banks 4 and 5 above it. Refused here rather than left to the
+/// JIT's assertion.
+#[cfg(feature = "jitv2")]
+fn check_jitv2_memory(memory: &MemoryPopulation) -> Result<(), String> {
+    if memory.fits_direct_window() {
+        return Ok(());
+    }
+    Err(format!(
+        "a jitv2 build runs a Tezro only with memory below 4 GiB (at most four banks), since it \
+         compiles the PROM's uncached code under page keys above it; banks = {:?} reach past 4 GiB: \
+         set banks = [1024, 1024, 1024, 1024] or fewer, or use a build without jitv2",
+        memory.banks_mib()
+    ))
+}
+
 /// A processor of type `C` with the board part's PRId and reset-mode
 /// inputs, on the board's bus.
 fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(board: &TezroBoard) -> Box<MipsExecutor<MipsTlb, C>> {
@@ -529,6 +550,10 @@ fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(board: &TezroBoard) ->
     cpu.core.reset_prid = board.part.prid();
     cpu.core.cp0_prid = board.part.prid();
     cpu.cache = C::from(board.cached_bus());
+    // The PROM fetches its own code uncached; with memory over its window
+    // the cached and uncached views of it differ.
+    #[cfg(feature = "jitv2")]
+    cpu.enable_jitv2_uncached_views(board.code_bus());
     // The PROM keeps its stack in cache lines it tags for a window with no
     // memory behind it yet; the controller answers that window while they stand.
     let memory = board.node.md.clone();
@@ -708,6 +733,12 @@ impl TezroBoard {
 
     pub fn cached_bus(&self) -> Arc<dyn BusDevice> {
         self.node.bus.cached_view(self.node.md.dma_view(), self.node.md.ram_extent())
+    }
+
+    /// The bus the JIT compiles code through; see [`crate::ip35::Ip35Bus::code_view`].
+    #[cfg(feature = "jitv2")]
+    pub fn code_bus(&self) -> Arc<dyn BusDevice> {
+        self.node.bus.code_view(self.cached_bus())
     }
 
     /// Everything back to its power-on state. The functions reset before

@@ -739,3 +739,32 @@ fn the_proms_crossbar_check_passes_on_the_tezro_board() {
     assert_eq!(io.pio_write(lock, 4, 2), BUS_OK);
     assert_eq!(read_word(&board, lock) & 2, 2);
 }
+
+/// A jitv2 build refuses memory that reaches past 4 GiB, as the default
+/// layout does, with a message naming a layout it takes, and builds the
+/// processor for four 1024 MiB banks, which end at 4 GiB.
+#[cfg(feature = "jitv2")]
+#[test]
+fn a_jitv2_build_takes_memory_only_below_4_gib() {
+    let refused = check_jitv2_memory(&MemoryPopulation::default()).unwrap_err();
+    assert!(refused.contains("banks = [1024, 1024, 1024, 1024]"), "{refused}");
+    let four = MemoryPopulation::from_mib(&[1024; 4]).unwrap();
+    check_jitv2_memory(&four).unwrap();
+    // Building a processor takes more stack than a debug build's test thread has.
+    std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+        let board = TezroBoard::with_config(TezroBoardConfig {
+            payload: &[],
+            clock: Arc::new(|| 0),
+            flash_path: None,
+            station_mac: L1Config::default().mac,
+            timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+            memory: &four,
+            cpus: 1,
+            part: TezroPart::Mhz700,
+            v12: false,
+            graphics_pool: (2, 32),
+        })
+        .unwrap();
+        drop(build_cpu::<R16000ShadowCache>(&board));
+    }).unwrap().join().unwrap();
+}
