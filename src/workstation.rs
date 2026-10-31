@@ -376,6 +376,53 @@ pub fn stop_and_flush(machine: &mut dyn Workstation, at: &str) {
     }
 }
 
+/// Flush a machine's disks as it is dropped. The disks hold on to their
+/// overlays through handles the devices share with threads and tables that can
+/// outlive the machine, so the machine cannot count on its disks' own `Drop`
+/// to write the overlay's sector record.
+pub(crate) fn flush_on_drop(machine: &dyn Workstation) {
+    if let Err(e) = machine.flush_disks() {
+        eprintln!("iris: disk flush at drop failed: {e} (guest writes may be lost)");
+    }
+}
+
+/// [`stop_and_flush`] for the machine behind `slot`, if it is still there.
+pub fn stop_and_flush_slot(slot: &MachineSlot, at: &str) {
+    if let Err(e) = with_machine_slot(slot, |m| stop_and_flush(m, at)) {
+        eprintln!("iris: could not stop the machine to flush its disks at {at}: {e}");
+    }
+}
+
+/// What the terminal console runs when the monitor hangs up (`quit`): stop and
+/// flush the machine behind `slot`, then end the process.
+pub fn console_quit(slot: MachineSlot) -> impl FnOnce() + Send + 'static {
+    move || exit_process("console quit", 0, || stop_and_flush_slot(&slot, "console quit"))
+}
+
+/// How many exits `IRIS_NO_EXIT_ON_POWEROFF` has turned into returns, for the
+/// tests that wait for one.
+#[cfg(test)]
+pub(crate) static EXIT_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// End the process. This is the only place machine and device code may call
+/// `std::process::exit`: it skips every Drop, which is where a copy-on-write
+/// overlay would otherwise write its sector record, so the caller has to hand
+/// in `stop_and_flush`, the work that makes the guest's writes durable
+/// (`stop_and_flush`, `stop_and_flush_slot`, or a bus's `flush_disks`). It runs
+/// first, then the process exits unless `IRIS_NO_EXIT_ON_POWEROFF` is set, the
+/// escape hatch for hosts that embed iris and for tests. A guard test fails on any
+/// other `process::exit` in the library.
+pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce()) {
+    stop_and_flush();
+    if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
+        eprintln!("iris: exit at {at} suppressed (IRIS_NO_EXIT_ON_POWEROFF)");
+        #[cfg(test)]
+        EXIT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    std::process::exit(code);
+}
+
 /// Run `f` against the machine behind `slot`, or fail if it has been dropped.
 pub fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut dyn Workstation) -> R) -> Result<R, String> {
     let guard = slot.lock();
@@ -413,30 +460,30 @@ pub(crate) fn register_system_controller(
     if let Some(rx) = events {
         std::thread::Builder::new().name("machine-events".to_string()).spawn(move || {
             while let Ok(event) = rx.recv() {
-                let _ = ctrl.with_machine(|machine| {
-                    match event {
-                        MachineEvent::HardReset => {
+                match event {
+                    MachineEvent::HardReset => {
+                        let _ = ctrl.with_machine(|machine| {
                             println!("Machine: SIN hard reset");
                             machine.reset();
                             machine.cpu_start();
-                        }
-                        MachineEvent::PowerOff => {
-                            println!("Machine: soft power-off");
-                            // The process may exit below without dropping the
-                            // disks, and an overlay's sector record is only
-                            // written out on a flush.
-                            stop_and_flush(machine, "power-off");
-                            // Hosts that embed iris as a library (e.g. iris-gui)
-                            // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
-                            // does not kill the host process.
-                            #[cfg(not(feature = "developer"))]
-                            if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
-                                std::process::exit(0);
-                            }
-                        }
+                            Ok(())
+                        });
                     }
-                    Ok(())
-                });
+                    MachineEvent::PowerOff => {
+                        println!("Machine: soft power-off");
+                        // The process may exit below without dropping the
+                        // disks, and an overlay's sector record is only
+                        // written out on a flush.
+                        let flush = || stop_and_flush_slot(&ctrl.machine, "power-off");
+                        // Hosts that embed iris as a library (e.g. iris-gui)
+                        // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
+                        // does not kill the host process.
+                        #[cfg(not(feature = "developer"))]
+                        exit_process("power-off", 0, flush);
+                        #[cfg(feature = "developer")]
+                        flush();
+                    }
+                }
             }
         }).unwrap();
     }

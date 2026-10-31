@@ -57,4 +57,18 @@ before adding a kernel.
 `bench/irix/` is the other half: real workloads under a booted IRIX (filesystem,
 buffer cache, IRIX's own tools, X on REX3), driven over `iris-ci`.
 
+## Disk persistence on exit
 
+`src/exit_persistence_tests.rs` builds every machine (Indy, Indigo2, Indigo2
+IMPACT, O2, Octane) with one disk of each kind (raw with an overlay, raw in
+place, compressed CHD, CHD with the copy-on-write flag, scratch volume), writes
+sectors with WRITE(10), ends the session each way iris can end (guest power-off,
+`quit` over the CI socket, `quit` at the terminal console, `main` returning,
+drop), with and without a guest reset first, then builds the machine again over
+the same files and reads every sector back. Another test fails on any
+`process::exit` in the library that does not go through
+`workstation::exit_process`, which makes its caller flush the disks first.
+
+```sh
+cargo nextest run --release --lib exit_persistence_tests
+```

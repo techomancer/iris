@@ -157,11 +157,7 @@ fn main() {
         if let Some(addr) = machine.monitor_addr() {
             let slot = machine.machine_slot();
             std::thread::spawn(move || {
-                Machine::run_console_client(addr, move || {
-                    let _ = iris::workstation::with_machine_slot(&slot, |m| {
-                        iris::workstation::stop_and_flush(m, "console quit")
-                    });
-                });
+                Machine::run_console_client(addr, iris::workstation::console_quit(slot));
             });
         }
     }

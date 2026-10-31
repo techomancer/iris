@@ -406,24 +406,25 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
             Err(e) => return Response::err(format!("chd sync failed: {e}")),
         }
     }
-    // `process::exit` below skips Drop, which is where an overlay's sector
-    // record would otherwise be written out. Stop first, so the guest writes
-    // nothing after the flush.
-    if let Err(e) = server.with_machine(|m| crate::workstation::stop_and_flush(m, "quit")) {
-        eprintln!("iris: could not stop the machine to flush its disks at quit: {e}");
-    }
+    // The exit below skips Drop, which is where an overlay's sector record
+    // would otherwise be written out. Stop first, so the guest writes nothing
+    // after the flush, and flush before replying, so a client that sees the
+    // reply can already read the disks.
+    crate::workstation::stop_and_flush_slot(&server.machine, "quit");
     // Schedule process exit after a brief delay so the response flushes.
-    thread::spawn(|| {
+    let machine = server.machine.clone();
+    thread::spawn(move || {
         thread::sleep(Duration::from_millis(50));
         if let Some(p) = SOCKET_PATH.lock().take() {
             cleanup_socket_path(&p);
         }
-        // Same escape hatch as the PowerOff handler: library hosts set
-        // IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI socket does
-        // not kill the embedder.
-        if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
-            std::process::exit(0);
-        }
+        // Library hosts set IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the
+        // CI socket does not kill the embedder. The machine is already
+        // stopped and flushed; this flush is a no-op unless something wrote
+        // since.
+        crate::workstation::exit_process("quit", 0, || {
+            let _ = crate::workstation::with_machine_slot(&machine, |m| m.flush_disks());
+        });
     });
     Response::data(serde_json::json!({ "synced": synced }))
 }

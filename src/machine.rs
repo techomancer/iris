@@ -1043,9 +1043,10 @@ impl Machine {
 
     /// The terminal console: relays stdin to the monitor at `addr` and the
     /// monitor's output to stdout. When the monitor closes the connection
-    /// (`quit`) the process exits, so `addr` must be this process's own
-    /// monitor (`monitor_addr`): another iris's would take this one down
-    /// with it when it quits.
+    /// (`quit`) `on_eof` ends the process (through
+    /// `workstation::exit_process`, which flushes the disks first), so `addr`
+    /// must be this process's own monitor (`monitor_addr`): another iris's
+    /// would take this one down with it when it quits.
     pub fn run_console_client(addr: std::net::SocketAddr, on_eof: impl FnOnce() + Send + 'static) {
         println!("IRIS: {}", emulator_name());
         println!("Connecting to monitor socket...");
@@ -1060,25 +1061,7 @@ impl Machine {
             }
         };
 
-        let mut socket_reader = stream.try_clone().unwrap();
-        thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            loop {
-                match socket_reader.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        print!("{}", String::from_utf8_lossy(&buf[0..n]));
-                        io::stdout().flush().unwrap();
-                    }
-                    Err(_) => break,
-                }
-            }
-            // The monitor closed the connection (`quit`, or iris going away).
-            // The exit below skips Drop, so the caller stops the machine and
-            // flushes its disks first.
-            on_eof();
-            std::process::exit(0);
-        });
+        Self::relay_monitor_output(stream.try_clone().unwrap(), on_eof);
 
         let stdin = io::stdin();
         let mut line = String::new();
@@ -1093,6 +1076,25 @@ impl Machine {
                 break;
             }
         }
+    }
+
+    /// Print what the monitor sends until it closes the connection (`quit`, or
+    /// iris going away), then run `on_eof`.
+    pub(crate) fn relay_monitor_output(mut monitor: TcpStream, on_eof: impl FnOnce() + Send + 'static) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match monitor.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        print!("{}", String::from_utf8_lossy(&buf[0..n]));
+                        io::stdout().flush().unwrap();
+                    }
+                    Err(_) => break,
+                }
+            }
+            on_eof();
+        })
     }
 
     pub fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
@@ -1230,7 +1232,7 @@ impl Machine {
 
     /// Every SCSI bus on the board: the first controller's, and the second's
     /// on a Fullhouse Indigo2.
-    fn scsi_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
+    pub(crate) fn scsi_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
         use crate::scsi_monitor::ScsiTargets;
         let mut v = vec![self.hpc3.scsi().scsi_bus()];
         v.extend(self.hpc3.scsi1().map(|c| c.scsi_bus()));
@@ -2016,6 +2018,7 @@ impl Drop for Machine {
         // The guest clock points into this Machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
+        crate::workstation::flush_on_drop(self);
         // Release the monitor port and this Machine's device handles, so the next
         // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
         self.monitor.shutdown();

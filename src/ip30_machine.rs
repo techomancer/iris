@@ -618,6 +618,7 @@ impl Drop for OctaneMachine {
         for d in self.devices().iter().rev() {
             d.stop();
         }
+        crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
     }
 }
