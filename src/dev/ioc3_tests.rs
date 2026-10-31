@@ -1368,6 +1368,15 @@ fn running_rig() -> (Rig, Arc<TimerManager>) {
     (r, tm)
 }
 
+/// Whether a timer is pending for deadline `kind`, read while no timer
+/// callback is running. A callback clears its slot on entry and arms the
+/// next deadline before it returns, so between those a chip that holds a
+/// deadline briefly shows none; the callback holds `gate` throughout.
+fn timer_pending(r: &Rig, kind: usize) -> bool {
+    let _idle = r.c.sh.gate.lock();
+    r.c.sh.armed.lock()[kind].is_some()
+}
+
 /// Poll `cond` for up to two seconds.
 fn within_two_seconds(cond: impl Fn() -> bool) -> bool {
     let end = Instant::now() + Duration::from_secs(2);
@@ -1465,7 +1474,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert_eq!(r.c.threads.lock().len(), 3, "two receive threads and the NVRAM writer");
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
-    assert!(r.c.sh.armed.lock()[K_INT_OUT].is_some());
+    assert!(timer_pending(&r, K_INT_OUT));
     r.c.stop();
     r.c.stop();
     assert!(!r.c.is_running());
@@ -1477,7 +1486,21 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert!(r.c.sh.st.lock().uart[0].core.rx_pending() == 0);
     r.c.start();
     assert!(within_two_seconds(|| r.c.sh.st.lock().uart[0].core.rx_pending() != 0));
-    assert!(r.c.sh.armed.lock()[K_INT_OUT].is_some(), "start arms the deadlines the chip holds");
+    assert!(timer_pending(&r, K_INT_OUT), "start arms the deadlines the chip holds");
+    r.c.stop();
+}
+
+/// A repeating output keeps a timer pending whenever no callback is in the
+/// middle of re-arming it, however often the callbacks run.
+#[test]
+fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
+    let (r, _tm) = running_rig();
+    r.c.start();
+    r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
+    r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
+    for _ in 0..20_000 {
+        assert!(timer_pending(&r, K_INT_OUT));
+    }
     r.c.stop();
 }
 
