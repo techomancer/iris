@@ -246,3 +246,60 @@ fn a_backing_file_restores_ram_and_the_calendar() {
     assert!(Rig::new().d.set_nvram_file(&short).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// One step of a register sequence: write, read and expect, or let time pass.
+enum Step {
+    W(usize, u8),
+    R(usize, u8),
+    Advance(i64),
+}
+
+/// The register sequences QEMU's ds1742-test asserts, as one table so the
+/// two models can be held to the same bytes. Offsets are from the 32 KiB
+/// part's calendar (`CONTROL`); the seed is 2024-01-01T00:00:00.
+///
+/// Ports test_calendar, test_invalid_dates and test_stop_and_test_mode
+/// from tests/qtest/ds1742-test.c in jamesbraid/qemu-sgi-origami. The
+/// model's answers come from the QEMU file's assertions, not from running
+/// QEMU here; the end-to-end comparison with a live QEMU is not done.
+#[test]
+fn the_qemu_register_sequences_read_back_the_same() {
+    use Step::{Advance, R, W};
+    const C: usize = CONTROL;
+    let set = |s, mi, h, wd, d, mo, y, cent| {
+        vec![W(C, 0x80), W(C + 1, s), W(C + 2, mi), W(C + 3, h), W(C + 4, wd), W(C + 5, d), W(C + 6, mo), W(C + 7, y), W(C, cent)]
+    };
+    let mut steps = vec![R(C, 0x20), W(C, 0x40), R(C, 0x60), W(C, 0x00), R(C, 0x20), W(C, 0x80), R(C, 0xa0), W(C, 0x20)];
+    // A rollover into 2025.
+    steps.extend(set(0x59, 0x59, 0x23, 0x02, 0x31, 0x12, 0x24, 0x20));
+    steps.extend([R(C + 1, 0x59), R(C + 4, 0x82), Advance(1_000_000_000)]);
+    steps.extend([R(C + 4, 0x83), R(C + 1, 0x00), R(C + 5, 0x01), R(C + 6, 0x01), R(C + 7, 0x25)]);
+    // A century carry.
+    steps.extend(set(0x59, 0x59, 0x23, 0x02, 0x31, 0x12, 0x99, 0x20));
+    steps.extend([Advance(1_000_000_000), R(C, 0x21), R(C + 7, 0x00)]);
+    // An impossible month leaves the calendar and its century alone.
+    steps.extend([W(C, 0x80), W(C + 6, 0x00), W(C, 0x19), R(C, 0x21), R(C + 6, 0x01)]);
+    // The read bit freezes the display; the clock runs on.
+    steps.extend([W(C, 0x40), Advance(2_000_000_000), R(C + 1, 0x00), W(C, 0x00), R(C + 1, 0x02)]);
+    // An impossible date is refused; a leap day is taken.
+    steps.extend(set(0x92, 0x34, 0x05, 0x02, 0x15, 0x01, 0x24, 0x20));
+    steps.extend(set(0x59, 0x59, 0x23, 0x02, 0x30, 0x02, 0x24, 0x20));
+    steps.extend([R(C + 1, 0x92), R(C + 5, 0x15), R(C + 6, 0x01), R(C + 7, 0x24)]);
+    steps.extend(set(0x59, 0x59, 0x23, 0x02, 0x29, 0x02, 0x23, 0x20));
+    steps.extend([R(C + 1, 0x92), R(C + 5, 0x15)]);
+    steps.extend(set(0x59, 0x59, 0x23, 0x02, 0x29, 0x02, 0x24, 0x20));
+    steps.extend([Advance(1_000_000_000), R(C + 1, 0x00), R(C + 5, 0x01), R(C + 6, 0x03), R(C + 7, 0x24)]);
+    // The stop bit holds the seconds; test mode makes the low bit run.
+    steps.extend(set(0x80 | 0x12, 0x34, 0x05, 0x02, 0x06, 0x07, 0x26, 0x20));
+    steps.extend([Advance(3_000_000_000), R(C + 1, 0x92)]);
+    steps.extend([W(C, 0x80), W(C + 1, 0x12), W(C + 4, 0xc2), W(C, 0x20), R(C + 4, 0xc2)]);
+
+    let r = Rig::new();
+    for (i, step) in steps.iter().enumerate() {
+        match *step {
+            W(a, v) => r.wr(a, v),
+            R(a, want) => assert_eq!(r.rd(a), want, "step {i}: read of {a:#x}"),
+            Advance(ns) => r.step(ns),
+        }
+    }
+}
