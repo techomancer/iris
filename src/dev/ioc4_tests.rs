@@ -1183,3 +1183,58 @@ fn serial_idle_status_survives_writes_and_ring_runs() {
     assert_eq!((r.r32(reg::SERIAL_PENDING), r.r32(reg::OTHER_PENDING)), (serial, other));
     assert_eq!(r.r32(reg::SERIAL_CONTROL), 0x80);
 }
+
+// ---------------------------------------------------------------------------
+// The host end of a port
+// ---------------------------------------------------------------------------
+
+/// Ports test_dma_loopback_discards_external_input: in loopback the UART's
+/// serial input is disconnected, as on a PC16550D. Input from outside is
+/// discarded on arrival, not kept for later, and new input arrives as usual
+/// once the loopback is off.
+#[test]
+fn loopback_discards_input_from_outside() {
+    let r = Rig::new();
+    let input = [0xa1, 0xa2, 0xa3, 0xa4];
+    r.pair_base(0, RINGS, 0x400);
+    r.uw(0, 4, 0x10);
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD);
+    r.type_in(0, &input);
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD | DRAIN);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE), 0);
+
+    // Out of loopback nothing comes back: it was discarded, not held.
+    r.uw(0, 4, 0);
+    r.c.service();
+    r.sw(0, sdma_off::CONTROL, ENABLE | THRESHOLD | DRAIN);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE), 0);
+
+    r.type_in(0, &input);
+    r.until("the entry", |r| r.sr(0, sdma_off::RX_PRODUCE) == 8);
+    assert_eq!(&r.get(r.ring(0, 1, 0x400), 4), &input);
+}
+
+/// Ports test_dma_chardev_reconnect: a port's backend can be replaced while
+/// the machine runs, and both PIO and the ring engine then use the new one.
+#[test]
+fn replacing_the_backend_keeps_the_engine_working() {
+    let r = Rig::new();
+    let new = Arc::new(Wire::default());
+    r.c.set_serial_backend(0, new.clone());
+    r.c.set_serial_backend(0, new.clone());
+    r.uw(0, 0, b'p');
+    assert_eq!(*new.out.lock().unwrap(), b"p");
+    assert!(r.sent(0).is_empty(), "the old backend saw nothing");
+
+    r.pair_base(0, RINGS, 0x1000);
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.tx_entry(0, 0x1000, 0, [0x61, 0x62, 0, 0], [TX_VALID, TX_VALID, 0, 0]);
+    r.sw(0, sdma_off::TX_PRODUCE, 8);
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 8);
+    assert_eq!(*new.out.lock().unwrap(), b"pab");
+    new.inp.lock().unwrap().push_back(0x7a);
+    r.c.service();
+    r.sw(0, sdma_off::CONTROL, ENABLE | DRAIN);
+    assert_eq!(r.sr(0, sdma_off::RX_PRODUCE) & 0xff8, 8, "and its input arrives");
+    assert_eq!(r.get(r.ring(0, 1, 0x1000), 1), [0x7a]);
+}
