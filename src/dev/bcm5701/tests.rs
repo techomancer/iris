@@ -708,7 +708,7 @@ fn an_eeprom_command_with_no_backing_does_not_complete() {
     rig.writel(reg::EEPROM_ADDR, EEPROM_READ | EEPROM_START);
     assert_eq!(rig.readl(reg::EEPROM_DATA), 0x7654_3210);
     assert_eq!(rig.readl(reg::EEPROM_ADDR) & (EEPROM_COMPLETE | EEPROM_START), 0);
-    assert_eq!(rig.refusals(Refused::EepromFault(Fault::WrongDevice(0))), 1);
+    assert_eq!(rig.refusals(Refused::EepromFault(Fault::NoBacking)), 1);
 }
 
 /// Ported from test_eeprom_read_only_backing.
@@ -1836,3 +1836,31 @@ fn the_receive_thread_delivers_and_publishes_on_its_own() {
     assert_eq!(rig.mem_read(RX_BUF, 64), frame);
     assert!(rig.line_up());
 }
+
+/// A frame queued before a reset must not reach the rings brought up after
+/// it, by chip reset or machine reset. Ported from test_receive_queue_reset.
+#[test]
+fn a_reset_discards_frames_the_backend_was_holding() {
+    for machine_reset in [false, true] {
+        let mut rig = Rig::new();
+        let stale = broadcast(64, 0x51);
+        let fresh = broadcast(64, 0xa7);
+        // Nothing is posted yet, so the stale frame waits at the head.
+        rig.rx_open(RX_RING_LEN, 1, 0);
+        rig.deliver(&stale);
+        assert_eq!(rig.waiting(), 1);
+        if machine_reset {
+            rig.dev.reset();
+        } else {
+            rig.writel(reg::MISC_CFG, MISC_CFG_RESET);
+        }
+        assert_eq!(rig.waiting(), 0);
+        rig.rx_open(RX_RING_LEN, 1, 0);
+        rig.rx_post_std(1);
+        rig.deliver(&fresh);
+        rig.step(ARRIVAL);
+        assert_eq!(rig.status_rx_prod(), 1);
+        assert_eq!(rig.mem_read(RX_BUF, 64), fresh);
+    }
+}
+

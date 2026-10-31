@@ -109,6 +109,7 @@ pub enum DmaWhat {
 /// The timers the engines keep, ordered by when they fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Timer {
+    PhySettle,
     BufferManager,
     RxCoalescing,
     TxCoalescing,
@@ -336,6 +337,7 @@ impl State {
         self.rx_latency.clear();
         self.wire.clear();
         self.wake_rx = true;
+        self.purge_rx = true;
     }
 
     /// Whatever made the chip ready again, a posted buffer or a consumer

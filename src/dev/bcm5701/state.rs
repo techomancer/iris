@@ -220,6 +220,8 @@ pub(super) struct State {
     pub wire: Vec<Vec<u8>>,
     /// Set when something the guest did can unblock a waiting frame.
     pub wake_rx: bool,
+    /// A reset discards the frames the backend still holds for the guest.
+    pub purge_rx: bool,
 }
 
 impl State {
@@ -266,6 +268,7 @@ impl State {
             rx_floor,
             wire: Vec::new(),
             wake_rx: false,
+            purge_rx: false,
         };
         st.reset();
         st
@@ -279,13 +282,16 @@ impl State {
         self.run_timers();
     }
 
-    /// Run whatever came due, earliest first, so a timer that arms another
-    /// sees the order the hardware would.
+    /// Run whatever came due, earliest first, each at its own deadline: the
+    /// virtual clock the model is ported from reaches a timer's expiry before
+    /// it fires, so a timer that arms another counts from there, not from
+    /// whenever this entry happened.
     fn run_timers(&mut self) {
-        let now = self.now;
-        self.phy.sync(now);
-        while let Some((_, timer)) = self.timers().into_iter().filter(|(d, _)| *d <= now).min() {
+        let target = self.now;
+        while let Some((deadline, timer)) = self.timers().into_iter().filter(|(d, _)| *d <= target).min() {
+            self.now = deadline;
             match timer {
+                Timer::PhySettle => self.phy.sync(deadline),
                 Timer::BufferManager => {
                     self.bufmgr_start = None;
                     let mode = self.rf(reg::BUFMGR_MODE);
@@ -296,10 +302,12 @@ impl State {
                 Timer::RxArrival => self.rx_arrival_due(),
             }
         }
+        self.now = target;
     }
 
     fn timers(&self) -> Vec<(Instant, Timer)> {
         [
+            self.phy.deadline().map(|d| (d, Timer::PhySettle)),
             self.bufmgr_start.map(|d| (d, Timer::BufferManager)),
             self.rx_coal_timer.map(|d| (d, Timer::RxCoalescing)),
             self.tx_coal_timer.map(|d| (d, Timer::TxCoalescing)),
@@ -312,7 +320,7 @@ impl State {
 
     /// The earliest moment something here needs attention.
     pub fn deadline(&self) -> Option<Instant> {
-        self.timers().into_iter().map(|(d, _)| d).chain(self.phy.deadline()).min()
+        self.timers().into_iter().map(|(d, _)| d).min()
     }
 
     pub fn refused(&self) -> Vec<(Refused, u64)> {
@@ -453,7 +461,7 @@ impl State {
         let word = (command & eeprom_cmd::WORD_ADDR) >> 2;
         let result = match self.eeprom.as_mut() {
             None => {
-                self.refuse(Refused::EepromFault(eeprom::Fault::WrongDevice(device)));
+                self.refuse(Refused::EepromFault(eeprom::Fault::NoBacking));
                 return false;
             }
             Some(e) if command & eeprom_cmd::READ != 0 => e.read_word(device, word).map(Some),

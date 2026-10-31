@@ -230,12 +230,24 @@ impl Bcm5701 {
     /// interrupt level it changed, frames to send, and a wake-up for the
     /// receive thread if the guest made room.
     fn enter<R>(&self, now: Instant, f: impl FnOnce(&mut State) -> R) -> R {
-        let (result, wire, wake) = {
+        let (result, wire, wake, purge) = {
             let mut st = self.st.lock();
             st.enter(now);
             let result = f(&mut st);
-            (result, std::mem::take(&mut st.wire), std::mem::take(&mut st.wake_rx))
+            (
+                result,
+                std::mem::take(&mut st.wire),
+                std::mem::take(&mut st.wake_rx),
+                std::mem::take(&mut st.purge_rx),
+            )
         };
+        if purge {
+            // A reset drops what the backend was holding for the guest, so a
+            // frame from before it cannot reach the new rings.
+            if let Some(link) = self.link.lock().as_mut() {
+                while link.from_net.pop().is_ok() {}
+            }
+        }
         self.irq_flush();
         self.send(wire);
         if wake {

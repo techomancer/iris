@@ -19,6 +19,8 @@ pub const MAX_SIZE: usize = 65536;
 /// the data register unchanged; the caller counts and logs the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Fault {
+    /// No backing is configured, whatever the device ID.
+    NoBacking,
     /// A different device ID than the one configured.
     WrongDevice(u8),
     /// The word lies beyond the backing.
