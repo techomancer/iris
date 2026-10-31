@@ -35,6 +35,16 @@
 //! ([`Pic::unsupported`]). The packet face a peer could read the heads
 //! through has no user and is not modeled. All transfers are synchronous.
 //!
+//! A configuration read that no function claims is a PCI master timeout:
+//! the processor gets a bus error back through Bedrock, the error view
+//! records bit 11 whatever the enable, and interrupt status records it only
+//! while enable bit 11 is set (the gating is inferred). Status clears one
+//! bit at a time; any reset-register write clears the view. Device 0, which
+//! the PIC keeps for itself, reads as unclaimed: an approximation, since
+//! what the chip answers there is unknown. Which bit a bus in PCI-X mode
+//! sets (11 or 34) is unknown; the model sets 11. An unclaimed
+//! configuration write goes nowhere and records nothing.
+//!
 //! Ported from hw/pci-host/sgi-pic.c in jamesbraid/qemu-sgi-origami.
 
 use super::bedrock_pi::BedrockPi;
@@ -96,6 +106,12 @@ const DEVICE_STREAM: u64 = 1 << 13;
 const DEVICE_WIDE: u64 = 1 << 22;
 const DEVICE_MEMORY: u64 = 1 << 12;
 const INVALID_ADDRESS: u64 = 1 << 24;
+/// PCI master timeout: a cycle no device claimed. The same bit in the
+/// interrupt status, enable and error view registers.
+const MASTER_TIMEOUT: u64 = 1 << 11;
+/// The error view: the error bits, whether or not they are enabled.
+/// Read-only; any write to the reset register clears it.
+const ERROR_VIEW: usize = reg::INTERRUPT_MULTIPLE;
 const SET: u64 = 0x100;
 const LEVELS: std::ops::RangeInclusive<u64> = 7..=127;
 
@@ -104,6 +120,10 @@ const LEVELS: std::ops::RangeInclusive<u64> = 7..=127;
 pub const fn identity(head: usize) -> u32 {
     (REVISION << 28) | (PARTS[head] << 12) | (MANUFACTURER << 1) | 1
 }
+
+/// A configuration cycle no device claimed: a PCI master timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Unclaimed;
 
 /// What the machine's side of the XIO link refused: no target, a permission
 /// check, or an address with nothing behind it.
@@ -246,6 +266,7 @@ fn defined(off: usize) -> bool {
             | reg::INTERRUPT_DEVICE
             | reg::INTERRUPT_ERROR_HOST
             | reg::INTERRUPT_HOST_BASE..=reg::INTERRUPT_HOST_LAST
+            | ERROR_VIEW
             | reg::DEVICE_BASE..=0x218
     )
 }
@@ -474,9 +495,35 @@ impl Head {
             st.set(reg::INTERRUPT_STATUS, status);
             st.r(reg::INTERRUPT_ENABLE) & INVALID_ADDRESS != 0
         };
-        if !enabled {
-            return;
+        if enabled {
+            self.error_interrupt();
         }
+    }
+
+    /// An unclaimed configuration read: the error view always records the
+    /// master timeout, and interrupt status only while it is enabled, when
+    /// it also sends the error interrupt.
+    fn master_timeout(&self) {
+        let _order = self.order.lock();
+        let enabled = {
+            let mut st = self.st.lock();
+            let view = st.r(ERROR_VIEW) | MASTER_TIMEOUT;
+            st.set(ERROR_VIEW, view);
+            let enabled = st.r(reg::INTERRUPT_ENABLE) & MASTER_TIMEOUT != 0;
+            if enabled {
+                let status = st.r(reg::INTERRUPT_STATUS) | MASTER_TIMEOUT;
+                st.set(reg::INTERRUPT_STATUS, status);
+            }
+            enabled
+        };
+        if enabled {
+            self.error_interrupt();
+        }
+    }
+
+    /// One set packet for the error interrupt, to the widget destination.
+    /// With `order` held.
+    fn error_interrupt(&self) {
         let number = self.st.lock().r(reg::INTERRUPT_ERROR_HOST);
         if number > 0x7f {
             crate::dlog!(LogModule::Bedrock, "pic: head {} refused error interrupt number {number:#x}", self.index);
@@ -525,29 +572,31 @@ impl Head {
         identity(self.index) as u64
     }
 
-    fn read(&self, addr: u64, size: usize) -> u64 {
+    /// `None` is a read the processor gets back as a bus error: only an
+    /// unclaimed configuration read fails that way.
+    fn read(&self, addr: u64, size: usize) -> Option<u64> {
         if short_window(addr).is_some() {
-            return self.short(addr, size, None).unwrap_or(0);
+            return Some(self.short(addr, size, None).unwrap_or(0));
         }
         if (CONFIG_BASE..CONFIG_END).contains(&addr) && size <= 4 {
-            return self.config(addr, size, None);
+            return self.config(addr, size, None).ok();
         }
         let off = addr as usize;
         if size == 4 && off % 8 == 4 {
-            return self.word_read(off);
+            return Some(self.word_read(off));
         }
         if size == 8 && off == 0 {
-            return self.identity();
+            return Some(self.identity());
         }
         if size == 8 && off % 8 == 0 && defined(off) {
-            return self.st.lock().r(off);
+            return Some(self.st.lock().r(off));
         }
         if size == 8 && off % 8 == 0 && (REQUEST_BASE..REQUEST_END).contains(&off) {
             let (bank, index) = request_slot(off);
-            return self.st.lock().request[bank][index];
+            return Some(self.st.lock().request[bank][index]);
         }
         self.note_unsupported(addr, size, false, 0);
-        0
+        Some(0)
     }
 
     fn write(&self, addr: u64, size: usize, value: u64) {
@@ -560,7 +609,7 @@ impl Head {
             return;
         }
         if (CONFIG_BASE..CONFIG_END).contains(&addr) && size <= 4 {
-            self.config(addr, size, Some(value));
+            let _ = self.config(addr, size, Some(value));
             return;
         }
         let off = addr as usize;
@@ -601,7 +650,7 @@ impl Head {
 
     fn word_write(&self, off: usize, value: u32) {
         let slot = match Self::word_slot(off) {
-            Some(slot) if !matches!(slot, reg::IDENTIFICATION | FLUSH | reg::INTERRUPT_STATUS | reg::INTERRUPT_DEVICE) => slot,
+            Some(slot) if !matches!(slot, reg::IDENTIFICATION | FLUSH | reg::INTERRUPT_STATUS | reg::INTERRUPT_DEVICE | ERROR_VIEW) => slot,
             _ => {
                 self.note_unsupported(off as u64, 4, true, value as u64);
                 return;
@@ -634,7 +683,9 @@ impl Head {
             return;
         }
         match off {
-            reg::IDENTIFICATION | FLUSH | reg::INTERRUPT_STATUS => self.note_unsupported(off as u64, size, true, value),
+            reg::IDENTIFICATION | FLUSH | reg::INTERRUPT_STATUS | ERROR_VIEW => {
+                self.note_unsupported(off as u64, size, true, value)
+            }
             reg::CONTROL => {
                 if value & !CONTROL_MASK != 0 {
                     self.note_unsupported(off as u64, size, true, value);
@@ -668,8 +719,11 @@ impl Head {
                 let _order = self.order.lock();
                 let (pins, enable) = {
                     let mut st = self.st.lock();
+                    // Each error bit clears on its own one; any write
+                    // clears the view.
                     let status = (st.r(reg::INTERRUPT_STATUS) & !value) | st.pins as u64;
                     st.set(reg::INTERRUPT_STATUS, status);
+                    st.set(ERROR_VIEW, 0);
                     (st.pins as u64, st.r(reg::INTERRUPT_ENABLE))
                 };
                 for pin in 0..PINS {
@@ -708,8 +762,10 @@ impl Head {
 
     /// A processor configuration cycle. Bus 0 devices sit at `0x1000`
     /// strides from `0x20000`; the type-1 window addresses the bus and
-    /// device `PCI_TYPE1_CONFIG` names. A miss reads all ones.
-    fn config(&self, addr: u64, size: usize, value: Option<u64>) -> u64 {
+    /// device `PCI_TYPE1_CONFIG` names. A read no function claims, device 0
+    /// (the bridge's own) and every function but 0 included, is a master
+    /// timeout and fails; a write nobody claims goes nowhere.
+    fn config(&self, addr: u64, size: usize, value: Option<u64>) -> Result<u64, Unclaimed> {
         let mask = u32::MAX >> (32 - size * 8);
         let function = (addr >> 8) & 7;
         let (bus, device) = if addr < CONFIG_TYPE1 {
@@ -729,16 +785,20 @@ impl Head {
                 self.index,
                 if value.is_some() { "write" } else { "read" }
             );
-            return mask as u64;
+            if value.is_some() {
+                return Ok(0);
+            }
+            self.master_timeout();
+            return Err(Unclaimed);
         };
         let shift = (register & 3) * 8;
         match value {
             Some(value) => {
                 function.config().write_masked(register / 4, (value as u32 & mask) << shift, mask << shift);
                 self.note_mappings();
-                0
+                Ok(0)
             }
-            None => function.config().read_sized(register, size) as u64,
+            None => Ok(function.config().read_sized(register, size) as u64),
         }
     }
 
@@ -1201,9 +1261,10 @@ struct CpuWidget {
 }
 
 impl CpuWidget {
-    /// `None` is a bus error. Accesses the PIC cannot make sense of that are
-    /// not malformed (unsupported registers, misses, refused windows) read
-    /// zero and write nowhere without one.
+    /// `None` is a bus error: a malformed access or an unclaimed
+    /// configuration read. Accesses the PIC cannot make sense of that are
+    /// not malformed (unsupported registers, refused windows) read zero and
+    /// write nowhere without one.
     fn access(&self, addr: u64, size: usize, value: Option<u64>) -> Option<u64> {
         let write = value.is_some();
         let short = addr < 2 * HEAD_OFFSET && short_window(addr % HEAD_OFFSET).is_some();
@@ -1225,7 +1286,7 @@ impl CpuWidget {
                 head.write(rel, size, v);
                 Some(0)
             }
-            None => Some(head.read(rel, size)),
+            None => head.read(rel, size),
         }
     }
 }

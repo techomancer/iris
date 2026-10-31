@@ -40,7 +40,7 @@ fn the_io9_bus_holds_the_ioc4_the_isp12160_and_the_bcm5701() {
         assert_eq!(io.pio_read(config_id(device), 4).data, id, "device {device}");
         assert_eq!(io.pio_read(config_id(device) + 8, 4).data & 0xff, revision, "device {device}");
     }
-    assert_eq!(io.pio_read(config_id(2), 4).data, 0xffff_ffff);
+    assert_eq!(io.pio_read(config_id(2), 4).status, BUS_ERR, "device 2 is empty");
 }
 
 /// The BCM5701's slot drives REQ64#, so the chip reports a 64-bit bus,
@@ -107,7 +107,7 @@ fn two_or_four_processors_bring_the_second_pic_at_widget_11() {
         assert_eq!(io.pio_read(widget(12, 0), 8).status, BUS_ERR, "no V12");
         assert_eq!((io.pio_read(widget(0, 4), 4).data >> 12) & 0xffff, u64::from(crate::dev::pxbow::PART));
         for device in 1..=4 {
-            assert_eq!(io.pio_read(widget(11, 0x2_0000 + (device << 12)), 4).data, 0xffff_ffff, "widget 11 device {device}");
+            assert_eq!(io.pio_read(widget(11, 0x2_0000 + (device << 12)), 4).status, BUS_ERR, "widget 11 device {device}");
         }
         assert_eq!(io.pio_read(config_id(1), 4).data, 0x100a_10a9);
     }

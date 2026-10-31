@@ -352,9 +352,9 @@ fn configuration_cycles_reach_the_function_one_window_above_its_device() {
     r.pic.attach(0, 3, b.clone(), Function::default());
     assert_eq!(r.r32(config(0, 1)), 0x5001_1234);
     assert_eq!(r.r32(config(0, 3)), 0x5002_1234);
-    assert_eq!(r.r32(config(1, 1)), u32::MAX, "head 1 has its own bus");
+    assert!(!r.bus.read32(config(1, 1)).is_ok(), "head 1 has its own bus");
     for device in [0, 2, 4, 5, 7] {
-        assert_eq!(r.r32(config(0, device)), u32::MAX, "device {device}");
+        assert!(!r.bus.read32(config(0, device)).is_ok(), "device {device}");
         r.w32(config(0, device) + 4, 7);
     }
     // Bytes and halfwords of the big-endian processor land on the right
@@ -364,7 +364,7 @@ fn configuration_cycles_reach_the_function_one_window_above_its_device() {
     assert_eq!(r.bus.read8(config(0, 1)).data, 0x50);
     assert_eq!(r.bus.read8(config(0, 1) + 3).data, 0x34);
     // Only function 0 answers.
-    assert_eq!(r.r32(config(0, 1) + 0x100), u32::MAX);
+    assert!(!r.bus.read32(config(0, 1) + 0x100).is_ok());
     r.w32(config(0, 1) + 4, MEMORY_AND_MASTER);
     assert_eq!(r.r32(config(0, 1) + 4) & 0xffff, MEMORY_AND_MASTER);
     r.w32(config(0, 1) + 0x10, BAR_BASE);
@@ -380,9 +380,9 @@ fn type_one_configuration_selects_the_bus_and_device_through_the_register() {
     r.w64(0xc8, 2 << 11);
     assert_eq!(r.r32(CONFIG_TYPE1), 0x5001_1234);
     r.w64(0xc8, (1 << 16) | (2 << 11));
-    assert_eq!(r.r32(CONFIG_TYPE1), u32::MAX, "a subordinate bus has nothing");
+    assert!(!r.bus.read32(CONFIG_TYPE1).is_ok(), "a subordinate bus has nothing");
     r.w64(0xc8, 3 << 11);
-    assert_eq!(r.r32(CONFIG_TYPE1), u32::MAX);
+    assert!(!r.bus.read32(CONFIG_TYPE1).is_ok());
     r.w64(0xc8, 2 << 11);
     assert_eq!(r.r32(CONFIG_TYPE1 + 8), 0x0280_0001, "class and revision");
 }
@@ -907,7 +907,106 @@ fn two_pics_are_independent_devices() {
     assert!(peer_b.interrupts.lock().is_empty());
     let card = Card::new(1);
     a.attach(0, 1, card.clone(), Function::default());
-    assert_eq!(bus_b.read32(config(0, 1)).data, u32::MAX);
+    assert!(!bus_b.read32(config(0, 1)).is_ok(), "the other chip's slot stays empty");
+}
+
+// An empty slot's configuration read fails as a master timeout. QEMU's
+// sgi-pic.c returns all ones with no fault and has no counterpart case.
+
+const MASTER_TIMEOUT_BIT: u64 = 1 << 11;
+const STATUS: u64 = 0x100;
+const ENABLE: u64 = 0x108;
+const RESET: u64 = 0x110;
+const VIEW: u64 = 0x170;
+
+/// With every enable clear, as the PROM probes: an empty device fails on
+/// either head, function 0 or 1, for every width the processor uses.
+/// Error view bit 11 records it and status bit 11 stays clear.
+#[test]
+fn an_empty_slot_read_faults_and_only_the_error_view_records_it() {
+    let r = rig();
+    for head in [0, 1] {
+        let base = head_base(head);
+        for (device, function) in [(2u64, 0u64), (2, 1), (0, 0), (5, 1)] {
+            let at = config(head, device) + function * 0x100;
+            assert!(!r.bus.read32(at).is_ok(), "head {head} device {device}.{function}");
+            assert!(!r.bus.read16(at + 2).is_ok());
+            assert!(!r.bus.read8(at + 3).is_ok());
+            assert_eq!(r.r64(base + VIEW) & MASTER_TIMEOUT_BIT, MASTER_TIMEOUT_BIT, "head {head}");
+            assert_eq!(r.r32(base + VIEW + 4) as u64 & MASTER_TIMEOUT_BIT, MASTER_TIMEOUT_BIT, "low-word view");
+            assert_eq!(r.r64(base + STATUS) & MASTER_TIMEOUT_BIT, 0, "status needs the enable");
+            assert_eq!(r.r32(base + STATUS + 4) as u64 & MASTER_TIMEOUT_BIT, 0);
+            // The PROM's low-word write of 0x41 clears the view.
+            r.w32(base + RESET + 4, 0x41);
+            assert_eq!(r.r64(base + VIEW), 0);
+        }
+        // The other head's view is its own.
+        assert!(!r.bus.read32(config(head, 2)).is_ok());
+        assert_eq!(r.r64(head_base(1 - head) + VIEW), 0);
+        r.w64(base + RESET, 0x41);
+        assert_eq!(r.r64(base + VIEW), 0, "an aligned write clears it too");
+    }
+    // The view is read-only and an unclaimed write records nothing.
+    r.w64(VIEW, MASTER_TIMEOUT_BIT);
+    r.w32(config(0, 2) + 4, 7);
+    assert_eq!(r.r64(VIEW), 0);
+    assert!(r.pic.unsupported().iter().any(|&(_, write, off, _)| write && off == VIEW));
+    assert!(r.peer.interrupts.lock().is_empty());
+}
+
+/// With enable bit 11 set, status bit 11 sets too and the error interrupt
+/// goes out. Status clears one bit at a time: the PROM's 0x41 leaves it set,
+/// a one at bit 11 clears it.
+#[test]
+fn an_enabled_master_timeout_sets_status_until_bit_11_is_written() {
+    let r = rig();
+    r.w64(0x38, 0x1800090);
+    r.w64(0x128, 9);
+    r.w64(ENABLE, MASTER_TIMEOUT_BIT);
+    assert!(!r.bus.read32(config(0, 2)).is_ok());
+    assert_eq!(r.r64(STATUS) & MASTER_TIMEOUT_BIT, MASTER_TIMEOUT_BIT);
+    assert_eq!(r.r64(VIEW) & MASTER_TIMEOUT_BIT, MASTER_TIMEOUT_BIT);
+    assert_eq!(r.peer.interrupts.lock().len(), 1, "one error interrupt");
+    r.w32(RESET + 4, 0x41);
+    assert_eq!(r.r64(STATUS) & MASTER_TIMEOUT_BIT, MASTER_TIMEOUT_BIT, "0x41 leaves status bit 11");
+    assert_eq!(r.r64(VIEW), 0, "but clears the view");
+    r.w64(RESET, MASTER_TIMEOUT_BIT);
+    assert_eq!(r.r64(STATUS) & MASTER_TIMEOUT_BIT, 0);
+    assert_eq!(r.r64(HEAD1 + STATUS) & MASTER_TIMEOUT_BIT, 0, "head 1 untouched");
+}
+
+/// A populated device after an empty one still reads present once the
+/// PROM's 0x41 has been written, as widget 15's second head lists device 3
+/// after an empty device 2 on a real Tezro. A present single-function card
+/// has header-type bit 7 clear, so the PROM never asks for its function 1,
+/// which would fault.
+#[test]
+fn a_device_after_an_empty_one_is_still_found() {
+    let r = rig();
+    let card = Card::new(0x5003);
+    r.pic.attach(1, 3, card, Function::default());
+    let probe = |device: u64| {
+        r.w32(HEAD1 + RESET + 4, 0x41);
+        let read = r.bus.read32(config(1, device));
+        let absent = !read.is_ok() || r.r32(HEAD1 + STATUS + 4) as u64 & MASTER_TIMEOUT_BIT != 0;
+        (!absent).then_some(read.data)
+    };
+    assert_eq!(probe(1), None);
+    assert_eq!(probe(2), None);
+    assert_eq!(probe(3), Some(0x5003_1234));
+    assert_eq!(probe(4), None);
+    assert_eq!(r.r32(config(1, 3) + 0xc) >> 16 & 0x80, 0, "not multifunction");
+    assert!(!r.bus.read32(config(1, 3) + 0x100).is_ok(), "its function 1 is unclaimed");
+}
+
+/// A reset clears the view with the rest of the head.
+#[test]
+fn reset_clears_the_error_view() {
+    let r = rig();
+    assert!(!r.bus.read32(config(0, 2)).is_ok());
+    assert_ne!(r.r64(VIEW), 0);
+    r.pic.power_on();
+    assert_eq!(r.r64(VIEW), 0);
 }
 
 /// Two functions that decode the same range: the window mapped last answers,
