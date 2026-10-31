@@ -181,10 +181,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   M2 Max, where the guest interprets every page still waiting in the compile
   queue. It only checks the IR, so the emitted code is unchanged. Unit tests
   and `--features developer` builds keep it; `IRIS_JIT_VERIFY=1` turns it back
-  on in any build, including the integration tests and bins. On x86, a VPro
-  Fuel went from "The system is coming up" to the login prompt in 50 s
-  instead of 58-59 s (thin-LTO build) and 55-63 s instead of 69-74 s (no
-  LTO). (`src/cpu/jitv2/codegen.rs`)
+  on in any build, including the integration tests and bins. Fuel's boot to
+  the login prompt went from 118-124 s to 103-114 s in the loop profile and
+  from 105 s to 98 s in the fast profile. (`src/cpu/jitv2/codegen.rs`)
 - **Pages above 4 GB keep their nutlb entries.** The inline memory path's
   window test now bounds the region number itself, so translations of
   physical addresses past the 4 GB window are cached for the interpreter
