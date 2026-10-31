@@ -64,24 +64,35 @@ impl Resampler {
 
     pub fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
 
-    /// Push one input stereo pair; emits the output pairs it completes.
+    /// Push one input stereo pair; emits the output pairs it completes. A
+    /// pair the ring has no room for is dropped whole, or the channels of
+    /// every later pair would swap.
     pub fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) {
         if self.passthrough() {
-            let _ = prod.push(l);
-            let _ = prod.push(r);
+            push_pair(prod, l, r);
             return;
         }
         self.h = [self.h[1], self.h[2], self.h[3], [l as f32, r as f32]];
         let out = self.out_rate as u64;
         while self.acc < out {
             let t = self.acc as f32 / out as f32;
-            for c in 0..2 {
+            let [l, r] = [0, 1].map(|c| {
                 let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
-                let _ = prod.push(v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
-            }
+                v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+            });
+            push_pair(prod, l, r);
             self.acc += self.in_rate as u64;
         }
         self.acc -= out;
+    }
+}
+
+/// Push a stereo pair only if both samples fit; the consumer pops single
+/// samples, so the free room can be odd.
+fn push_pair(prod: &mut Producer<i16>, l: i16, r: i16) {
+    if prod.slots() >= 2 {
+        let _ = prod.push(l);
+        let _ = prod.push(r);
     }
 }
 
@@ -253,4 +264,28 @@ pub fn open_output(
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn drain(c: &mut rtrb::Consumer<i16>) -> Vec<i16> {
+        std::iter::from_fn(|| c.pop().ok()).collect()
+    }
+
+    #[test]
+    fn a_full_ring_drops_whole_pairs_and_keeps_the_channels() {
+        for (in_rate, out_rate) in [(44100, 44100), (22050, 44100)] {
+            // Odd capacity: the ring fills with one slot left over.
+            let (mut p, mut c) = RingBuffer::<i16>::new(5);
+            let mut rs = Resampler::new(in_rate, out_rate);
+            for _ in 0..2 {
+                for _ in 0..8 {
+                    rs.push(1, -1, &mut p);
+                }
+                let got = drain(&mut c);
+                assert!(got.len() >= 2 && got.len() % 2 == 0, "{in_rate}: whole pairs only, got {got:?}");
+                assert!(got.chunks(2).all(|q| q == [0, 0] || q[0] > 0 && q[1] < 0), "{in_rate}: channels swapped in {got:?}");
+            }
+        }
+    }
+}
