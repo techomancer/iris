@@ -238,6 +238,8 @@ pub use perfetto_macros::{PfBits, PfLevel, PfValue};
 pub mod perfetto;
 
 #[cfg(test)]
+mod display_stop_tests;
+#[cfg(test)]
 mod platform_profile_tests;
 #[cfg(test)]
 mod exit_persistence_tests;

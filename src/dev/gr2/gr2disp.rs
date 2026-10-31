@@ -116,8 +116,6 @@ impl Gr2 {
             }
         }
 
-        if let Some(r) = self.renderer.lock().as_mut() {
-            r.stop();
-        }
+        self.display_stop.finish(&self.renderer);
     }
 }

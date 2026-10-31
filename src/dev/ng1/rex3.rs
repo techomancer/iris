@@ -1388,6 +1388,7 @@ pub struct Rex3 {
     pub diag: AtomicU64,
     debug_state: Mutex<DebugState>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     /// Compiled shaders, keyed by `(dm0, dm1_normalized, clipmode_key)`.
     ///
     /// Always present, not gated on `rex-jit`: the LLVM-compiled shaders in
@@ -1582,6 +1583,7 @@ impl Rex3 {
             debug_state: Mutex::new(DebugState::default()),
             diag: AtomicU64::new(0),
             renderer: Mutex::new(None),
+            display_stop: Default::default(),
             // IRIS_NO_JIT (set by the sandboxed Mac App Store GUI build) forces
             // the interpreter: Cranelift's mmap+mprotect executable pages aren't
             // MAP_JIT, so the App Sandbox kills the process with SIGKILL/
@@ -3241,9 +3243,7 @@ impl Rex3 {
             }
         }
 
-        if let Some(renderer) = self.renderer.lock().as_mut() {
-            renderer.stop();
-        }
+        self.display_stop.finish(&self.renderer);
     }
 
     /// Returns `true` if the register offset was recognized and updated state.
@@ -3623,6 +3623,7 @@ impl Device for Rex3 {
         if let Some(s) = self.stop_trace() {
             eprintln!("REX3: trace closed: {s}");
         }
+        self.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
 
         // Send exit command to ensure processor thread wakes up and terminates.
@@ -4920,6 +4921,7 @@ impl BusDevice for Rex3 {
 
 impl crate::gfx_display::GfxDisplay for Rex3 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn screenshot_pending(&self) -> bool { self.screenshot_pending.load(Ordering::Relaxed) }

@@ -782,6 +782,7 @@ impl Drop for O2Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = MachineRef::null();
         }
+        self.display.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();
@@ -871,6 +872,7 @@ impl Workstation for O2Machine {
 pub struct O2Display {
     bus: Arc<Ip32Bus>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     screen: Mutex<Rex3Screen>,
     screenshot_pending: AtomicBool,
     cycles: CyclesPtr,
@@ -885,6 +887,7 @@ impl O2Display {
         Self {
             bus,
             renderer: Mutex::new(None),
+            display_stop: Default::default(),
             screen: Mutex::new(Rex3Screen::new()),
             screenshot_pending: AtomicBool::new(false),
             cycles,
@@ -962,15 +965,16 @@ impl O2Display {
                 std::thread::sleep(frame_time - spent);
             }
         }
-        if let Some(r) = self.renderer.lock().as_mut() {
-            r.stop();
-        }
+        self.display_stop.finish(&self.renderer);
     }
 }
 
 impl crate::gfx_display::GfxDisplay for O2Display {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> {
         &self.renderer
+    }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop {
+        &self.display_stop
     }
     fn screen(&self) -> &Mutex<Rex3Screen> {
         &self.screen

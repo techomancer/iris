@@ -234,6 +234,7 @@ pub struct Gr2 {
 
     pub screen: Mutex<Rex3Screen>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     pub screenshot_pending: AtomicBool,
     screenshot_counter: AtomicU32,
     retrace_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
@@ -273,6 +274,7 @@ impl Gr2 {
             addr_of_mut!((*p).re3_thread).write(Mutex::new(None));
             addr_of_mut!((*p).screen).write(Mutex::new(Rex3Screen::new()));
             addr_of_mut!((*p).renderer).write(Mutex::new(None));
+            addr_of_mut!((*p).display_stop).write(Default::default());
             addr_of_mut!((*p).screenshot_pending).write(AtomicBool::new(false));
             addr_of_mut!((*p).screenshot_counter).write(AtomicU32::new(0));
             addr_of_mut!((*p).retrace_cb).write(Mutex::new(None));
@@ -989,6 +991,7 @@ impl Gr2 {
 
 impl crate::gfx_display::GfxDisplay for Gr2 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn cycles(&self) -> CyclesPtr { self.cycles.get() }
@@ -1122,6 +1125,7 @@ impl Device for Gr2 {
     }
 
     fn stop(&self) {
+        self.display_stop.request();
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }

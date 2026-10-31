@@ -367,6 +367,7 @@ pub struct Mgras {
     running: AtomicBool,
     refresh: SpinLock<Option<thread::JoinHandle<()>>>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     /// The finished frame, handed to the renderer as a prebuilt picture
     /// (`Rex3Screen::prebuilt`), as GR2 does.
     screen: Mutex<crate::disp::Rex3Screen>,
@@ -537,6 +538,7 @@ impl Mgras {
             addr_of_mut!((*p).dirty).write(AtomicBool::new(true));
             addr_of_mut!((*p).refresh).write(SpinLock::new(None));
             addr_of_mut!((*p).renderer).write(Mutex::new(None));
+            addr_of_mut!((*p).display_stop).write(Default::default());
             addr_of_mut!((*p).screen).write(Mutex::new(crate::disp::Rex3Screen::new()));
             addr_of_mut!((*p).heartbeat).write(heartbeat);
             addr_of_mut!((*p).fasttick).write(fasttick);
@@ -1598,6 +1600,7 @@ impl Mgras {
 
 impl crate::gfx_display::GfxDisplay for Mgras {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
     fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { *self.cycles.lock() }

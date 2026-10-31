@@ -342,9 +342,7 @@ impl Mgras {
         }
         // The renderer's GL state belongs to this thread (its context is
         // current here), so it is torn down here and nowhere else.
-        if let Some(r) = self.renderer.lock().as_mut() {
-            r.stop();
-        }
+        self.display_stop.finish(&self.renderer);
     }
 
     /// Start the engines and the display refresh thread.
@@ -363,6 +361,7 @@ impl Mgras {
     }
 
     pub fn stop_display(&self) {
+        self.display_stop.request();
         self.running.store(false, Ordering::Release);
         if let Some(h) = self.refresh.lock().take() {
             let _ = h.join();
