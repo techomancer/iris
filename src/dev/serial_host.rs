@@ -23,6 +23,14 @@ use crate::dev::serial_log::SerialLog;
 
 pub trait SerialBackend: Send + Sync {
     fn send_byte(&self, byte: u8);
+
+    /// Send a byte if the host end can take it now. A backend that can be
+    /// full (a socket nobody reads) says so here and the 16550 holds the byte
+    /// and retries; the default takes every byte, as the others always did.
+    fn try_send_byte(&self, byte: u8) -> bool {
+        self.send_byte(byte);
+        true
+    }
     fn recv_byte(&self) -> io::Result<u8>;
 }
 
