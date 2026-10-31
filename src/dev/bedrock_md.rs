@@ -330,6 +330,26 @@ impl BedrockMd {
             self.memory.remap(config, pages, true);
         }
     }
+    /// Zero every bank, as a power-on does. Physical's own `reset_memory`
+    /// advances only the banks' counters; code pages follow the logical ones,
+    /// so a board resets the banks through here.
+    pub fn reset_memory(&self) {
+        self.memory.physical().reset_memory();
+        self.memory.changed_decode();
+    }
+    /// Load bank `bank` from a file of `Physical::save_bank`'s format, and
+    /// advance the logical counters the bytes changed under.
+    pub fn load_bank(&self, bank: usize, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let loaded = self.memory.physical().load_bank(bank, path);
+        self.memory.changed_decode();
+        loaded
+    }
+    /// Restore bank `bank` from words `Physical::snapshot_bank_inmem` took,
+    /// and advance the logical counters the bytes changed under.
+    pub fn restore_bank(&self, bank: usize, words: &[u32]) {
+        self.memory.physical().restore_bank_inmem(bank, words);
+        self.memory.changed_decode();
+    }
     /// The stable logical-physical counters used by both compiled stores
     /// and SysAd page claims. Their storage outlives the CPU via its bus.
     #[cfg(feature = "jitv2")]
@@ -1982,6 +2002,35 @@ mod tests {
         assert_eq!(fuel.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
         assert_eq!(cached.read64(at).data, prom);
         assert_eq!(cached.write64(at, 0x55), BUS_ERR);
+    }
+
+    /// Physical's bulk writers, on a bank directly, advance only that bank's
+    /// counters, which nothing that follows code pages reads on this board.
+    /// The controller's own routes advance the logical ones as well.
+    #[test]
+    fn bulk_memory_writes_through_the_controller_advance_the_logical_counters() {
+        let md = BedrockMd::new(&[64]).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x11), BUS_OK);
+        let phys = md.physical();
+        let at = 0x5000;
+        let logical = counter(&md, at);
+        phys.reset_memory();
+        phys.restore_bank_inmem(0, &[1, 2]);
+        assert_eq!(counter(&md, at), logical, "Physical alone leaves the logical counter");
+        md.reset_memory();
+        let reset = counter(&md, at);
+        assert_advanced("reset", logical, reset);
+        md.restore_bank(0, &[0x0102_0304, 0x0506_0708]);
+        let restored = counter(&md, at);
+        assert_advanced("restore", reset, restored);
+        assert_eq!(phys.read64(0).data, 0x0102_0304_0506_0708);
+        let path = std::env::temp_dir().join(format!("iris-bedrock-load-{}", std::process::id()));
+        std::fs::write(&path, [0, 0, 0, 9, 0, 0, 0, 8]).unwrap();
+        let loaded = md.load_bank(0, &path);
+        std::fs::remove_file(&path).unwrap();
+        loaded.unwrap();
+        assert_advanced("load", restored, counter(&md, at));
+        assert_eq!(phys.read64(0).data, 0x0000_0009_0000_0008);
     }
 
     /// Guest density settings remap fitted RAM, and reset restores the default map.
