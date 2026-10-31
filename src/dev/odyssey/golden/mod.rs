@@ -19,6 +19,7 @@
 use super::raster_bench;
 use super::board::Board;
 use super::draw::gl_rules;
+pub mod replay;
 pub mod scenes;
 pub mod vertices;
 
