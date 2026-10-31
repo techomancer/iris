@@ -2096,28 +2096,37 @@ impl MachineConfig {
     /// emulator would quietly auto-pick a different interface and run with NAT
     /// instead of the settings the user wrote.
     pub fn load_toml(path: &str) -> Self {
+        Self::try_load(path).unwrap_or_else(|e| {
+            eprintln!("Configuration error: {e}");
+            std::process::exit(1);
+        })
+    }
+
+    /// [`MachineConfig::load_toml`] returning the parse error instead of
+    /// exiting. A file that is not there is the defaults.
+    pub fn try_load(path: &str) -> Result<Self, String> {
         let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
+            return Ok(Self::default());
         };
         match toml::from_str::<Self>(&text) {
             Ok(mut cfg) => {
                 cfg.fold_deprecated();
-                cfg
+                Ok(cfg)
             }
             Err(e) => {
-                eprintln!("Configuration error: failed to parse {}:\n{}", path, e);
+                let mut msg = format!("failed to parse {path}:\n{e}");
                 // Common footgun: backslashes in a double-quoted string (Windows
                 // pcap device names look like \Device\NPF_{GUID}).
                 if text.contains("\\Device\\NPF") || e.to_string().contains("escape") {
-                    eprintln!(
-                        "\nhint: backslashes are escape characters inside a \"double-quoted\" TOML string.\n\
+                    msg.push_str(
+                        "\n\nhint: backslashes are escape characters inside a \"double-quoted\" TOML string.\n\
                          For a Windows pcap interface, either use the numeric index from\n\
                          `iris --list-net-interfaces` (e.g. pcap_interface = \"1\") or a TOML\n\
                          'single-quoted' literal string:\n\
-                         \n    pcap_interface = '\\Device\\NPF_{{...}}'\n"
+                         \n    pcap_interface = '\\Device\\NPF_{...}'\n"
                     );
                 }
-                std::process::exit(1);
+                Err(msg)
             }
         }
     }
@@ -3258,6 +3267,25 @@ mod export_tests {
         let mut indy = MachineConfig::default();
         indy.network.mode = NetMode::Off;
         assert!(indy.validate().unwrap_err().contains("only available on the O2"));
+    }
+
+    /// `try_load` returns a parse error, with the Windows backslash hint where
+    /// it applies, instead of exiting; a file that is not there is the
+    /// defaults.
+    #[test]
+    fn try_load_reports_parse_errors_and_tolerates_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("iris-try-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "pcap_interface = \"\\Device\\NPF_{X}\"\n").unwrap();
+        let e = MachineConfig::try_load(path.to_str().unwrap()).unwrap_err();
+        assert!(e.starts_with("failed to parse ") && e.contains("hint: backslashes"), "{e}");
+        std::fs::write(&path, "scale =\n").unwrap();
+        assert!(!MachineConfig::try_load(path.to_str().unwrap()).unwrap_err().contains("hint"));
+        std::fs::write(&path, "scale = 2\n").unwrap();
+        assert_eq!(MachineConfig::try_load(path.to_str().unwrap()).unwrap().scale, 2);
+        assert_eq!(MachineConfig::try_load(dir.join("absent.toml").to_str().unwrap()).unwrap().scale, MachineConfig::default().scale);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A profile says which processors and counts it accepts, and `validate()`
