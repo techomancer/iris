@@ -163,11 +163,7 @@ impl OctaneMachine {
         MachineProfile::OctaneIp30.accepts_cpu(cfg.machine.cpu)?;
         // `prom`, or IRIX's file name when `prom` is the shared default and
         // that file is not there: there is no embedded Octane PROM.
-        let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
-            cfg.prom.clone()
-        } else {
-            OCTANE_PROM_FILE.to_string()
-        };
+        let prom_path = MachineProfile::OctaneIp30.prom_path(&cfg.prom);
         let prom = std::fs::read(&prom_path)
             .map_err(|e| format!("Octane PROM {prom_path}: {e} (set `prom` to an IP30 PROM image, the 1 MB flash contents)"))?;
         if prom.len() > FLASH_SIZE {
