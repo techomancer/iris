@@ -53,6 +53,9 @@ struct Ps2State {
     held_keys: [bool; 256],
 }
 
+/// The most a mouse packet carries an axis.
+const MOUSE_MAX: i32 = 127;
+
 /// Combined PS/2 Keyboard and Mouse Controller
 pub struct Ps2Controller {
     state: Mutex<Ps2State>,
@@ -968,21 +971,34 @@ impl Ps2Controller {
         let mut state = self.state.lock();
         if !state.mouse_enabled || state.config & 0x20 != 0 { return; }
 
-        let ps2_dy = -dy; // PS/2 Y is up-positive
-        let sx = dx.clamp(-256, 255);
-        let sy = ps2_dy.clamp(-256, 255);
+        // A mouse reports at most 127 counts an axis in a packet: a larger
+        // move leaves as several, the wheel with the first. IRIX 6.5.30
+        // stops following the pointer after a 128-count packet (QEMU's
+        // ps2.c caps packets the same way).
+        let (mut dx, mut dy, mut dz) = (dx, -dy, dz); // PS/2 Y is up-positive
+        loop {
+            let (sx, sy) = (dx.clamp(-MOUSE_MAX, MOUSE_MAX), dy.clamp(-MOUSE_MAX, MOUSE_MAX));
+            Self::queue_mouse_packet(&mut state, buttons, sx, sy, dz);
+            (dx, dy, dz) = (dx - sx, dy - sy, 0);
+            if dx == 0 && dy == 0 {
+                break;
+            }
+        }
+        drop(state);
+        self.update_interrupt();
+    }
 
+    /// Queue one packet of at most [`MOUSE_MAX`] counts an axis (`sy` up).
+    fn queue_mouse_packet(state: &mut Ps2State, buttons: u8, sx: i32, sy: i32, dz: i32) {
         let mut b0 = 0x08u8 | (buttons & 0x07);
         if sx < 0 { b0 |= 0x10; }
         if sy < 0 { b0 |= 0x20; }
-        if dx < -256 || dx > 255 { b0 |= 0x40; }
-        if ps2_dy < -256 || ps2_dy > 255 { b0 |= 0x80; }
 
         let mouse_id = state.mouse_id;
         let packet_size = if mouse_id >= 3 { 4 } else { 3 };
 
-        // Coalesce into tail packet when queue is congested (≥8 pending packets)
-        // and the tail has the same button state.
+        // Coalesce into tail packet when queue is congested (≥8 pending packets),
+        // the tail has the same button state and the sum still fits a packet.
         let mouse_packets = state.mouse_queue_bytes / packet_size;
         let coalesced = if mouse_packets >= 8 {
             let len = state.rx_queue.len();
@@ -990,26 +1006,14 @@ impl Ps2Controller {
             let tail_ok = len >= packet_size
                 && (0..packet_size).all(|j| matches!(state.rx_queue[tail + j], (_, Ps2Source::Mouse)))
                 && (state.rx_queue[tail].0 & 0x07) == (b0 & 0x07);
-            if tail_ok {
-                let old_dx = if state.rx_queue[tail].0 & 0x10 != 0 {
-                    state.rx_queue[tail + 1].0 as i32 - 256
-                } else {
-                    state.rx_queue[tail + 1].0 as i32
-                };
-                let old_dy = if state.rx_queue[tail].0 & 0x20 != 0 {
-                    state.rx_queue[tail + 2].0 as i32 - 256
-                } else {
-                    state.rx_queue[tail + 2].0 as i32
-                };
-                let raw_dx = old_dx + sx;
-                let raw_dy = old_dy + sy;
-                let new_dx = raw_dx.clamp(-256, 255);
-                let new_dy = raw_dy.clamp(-256, 255);
+            let old = |i: usize, sign: u8| {
+                state.rx_queue[tail + i].0 as i32 - if state.rx_queue[tail].0 & sign != 0 { 256 } else { 0 }
+            };
+            let (new_dx, new_dy) = if tail_ok { (old(1, 0x10) + sx, old(2, 0x20) + sy) } else { (0, 0) };
+            if tail_ok && new_dx.abs() <= MOUSE_MAX && new_dy.abs() <= MOUSE_MAX {
                 let mut new_b0 = 0x08u8 | (b0 & 0x07);
                 if new_dx < 0 { new_b0 |= 0x10; }
                 if new_dy < 0 { new_b0 |= 0x20; }
-                if raw_dx != new_dx { new_b0 |= 0x40; }
-                if raw_dy != new_dy { new_b0 |= 0x80; }
                 state.rx_queue[tail].0     = new_b0;
                 state.rx_queue[tail + 1].0 = new_dx as u8;
                 state.rx_queue[tail + 2].0 = new_dy as u8;
@@ -1052,8 +1056,6 @@ impl Ps2Controller {
             }
             state.mouse_queue_bytes += packet_size;
         }
-        drop(state);
-        self.update_interrupt();
     }
 
     pub fn is_state_locked(&self) -> bool {
@@ -1540,6 +1542,47 @@ mod tests {
         ps2.write_command(0xAE);
         ps2.write_command(0x20);
         assert_eq!(ps2.read_data() & 0x10, 0, "CTR bit 4 must clear after 0xAE (KBD enable)");
+    }
+
+    /// The mouse's queued packets as (dx, dy), PS/2 Y up, read through the
+    /// sign bits of the first byte.
+    fn mouse_packets(ps2: &Ps2Controller) -> Vec<(i32, i32)> {
+        let bytes: Vec<u8> = std::iter::from_fn(|| ps2.pop_from(true)).collect();
+        bytes.chunks(3).map(|p| {
+            let d = |byte: u8, negative: bool| byte as i32 - if negative { 256 } else { 0 };
+            (d(p[1], p[0] & 0x10 != 0), d(p[2], p[0] & 0x20 != 0))
+        }).collect()
+    }
+
+    /// A move larger than a mouse reports at once leaves as several packets,
+    /// none past 127 counts an axis, adding up to the move. IRIX 6.5.30 stops
+    /// following the pointer after one 128-count packet: later small moves
+    /// are lost until a large move the other way.
+    #[test]
+    fn a_large_move_is_sent_as_packets_of_at_most_127() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        { ps2.state.lock().mouse_enabled = true; }
+        ps2.push_mouse_input(0, 200, -300, 0);
+        let packets = mouse_packets(&ps2);
+        assert!(packets.iter().all(|&(x, y)| x.abs() <= 127 && y.abs() <= 127), "{packets:?}");
+        let total = packets.iter().fold((0, 0), |(a, b), &(x, y)| (a + x, b + y));
+        assert_eq!(total, (200, 300), "{packets:?}");
+    }
+
+    /// Merging a move into a backed-up queue's last packet stays within 127
+    /// counts an axis too, and loses none of the move.
+    #[test]
+    fn a_merged_move_stays_within_127() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        { ps2.state.lock().mouse_enabled = true; }
+        for _ in 0..12 {
+            ps2.push_mouse_input(0, 100, 0, 0);
+        }
+        let packets = mouse_packets(&ps2);
+        assert!(packets.iter().all(|&(x, y)| x.abs() <= 127 && y.abs() <= 127), "{packets:?}");
+        assert_eq!(packets.iter().map(|p| p.0).sum::<i32>(), 1200, "{packets:?}");
     }
 
     /// A disabled AUX port must actually stop motion packets from reaching
