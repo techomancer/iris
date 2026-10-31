@@ -7,7 +7,9 @@
 //! as unknown, with a log line. Power requests take effect at once: power
 //! down (0x2005) turns the node off, and a power cycle (0x2006) turns it off
 //! and on again, which restarts it. Remote routing and controller
-//! diagnostics are absent.
+//! diagnostics are absent. A configured router interpreter answers
+//! the single-fragment `brick` request for the Chimera brick types; other
+//! interpreter commands and multi-fragment messages are refused and logged.
 //!
 //! Ported from hw/misc/sgi-l1.c in jamesbraid/qemu-sgi-origami.
 
@@ -132,6 +134,9 @@ impl L1 {
     pub fn new(config: L1Config) -> Result<Self, String> {
         if config.rack > 0x3ff || config.bay > 0x3f || config.node_position > 3 {
             return Err("L1 rack, bay or node position out of range".into());
+        }
+        if config.port_speed_first > 1 {
+            return Err("L1 first port-speed value must be zero or one".into());
         }
         if config.mac == [0; 6] || config.mac[0] & 1 != 0 {
             return Err("L1 MAC must be nonzero unicast".into());
