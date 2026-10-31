@@ -422,6 +422,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--nat-subnet` | NAT subnet in CIDR notation (e.g. 192.168.5.0/24). Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24. |
 | `--net-mode` | Networking backend: "nat" (default, software gateway) or "pcap" (bridge onto a real host interface; requires --features pcap). |
 | `--pcap-interface` | Host interface to bridge onto in PCAP mode (e.g. eth0, en0). Implies --net-mode pcap. List candidates with --list-net-interfaces. |
+| `--validate` | Check the configuration (parse, settings, files, directories, ports) without starting the machine; exit 0 or 1. See [HELP.md](HELP.md#checking-a-configuration). |
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
 | `--cpu` | Emulated CPU: `r4400` (default), `r5000`, or `r10000`. Overrides `[machine] cpu`.  |

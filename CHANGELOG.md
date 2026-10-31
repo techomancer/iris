@@ -135,6 +135,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
 
+### Checking a configuration
+
+- **`iris --validate --config FILE`** parses and validates a configuration and
+  checks that its PROM, disk and CD images, directories and serial socket and log
+  directories exist and that its TCP ports differ, then exits 0 or 1 without
+  starting the machine or opening graphics or audio. See
+  [HELP.md](HELP.md#checking-a-configuration).
+
 ### Serial consoles on Unix sockets
 
 - **`serial_socket_a` and `serial_socket_b`** serve a serial line on a Unix

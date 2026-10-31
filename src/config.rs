@@ -2136,7 +2136,9 @@ impl MachineConfig {
     }
 
     /// [`MachineConfig::load_toml`] returning the parse error instead of
-    /// exiting. A file that is not there is the defaults.
+    /// exiting. A file that is not there is the defaults; a caller that was
+    /// given the path on the command line checks that it exists first, as
+    /// `load_config` does.
     pub fn try_load(path: &str) -> Result<Self, String> {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Ok(Self::default());
@@ -2660,6 +2662,13 @@ pub struct Cli {
     #[arg(long = "pcap-interface", value_name = "IFACE")]
     pub pcap_interface: Option<String>,
 
+    /// Check the configuration (`--config`, with any other options applied)
+    /// without starting the machine: that it parses, that its settings agree,
+    /// that its files and directories exist and its ports differ. Exits 0 if
+    /// it would run, 1 with each problem on stderr if not.
+    #[arg(long = "validate", default_value_t = false)]
+    pub validate: bool,
+
     /// Print the host network interfaces libpcap can bridge onto, then exit.
     /// Requires a build with --features pcap.
     #[arg(long = "list-net-interfaces", default_value_t = false)]
@@ -2943,6 +2952,15 @@ pub fn load_config() -> (MachineConfig, u32) {
     if cli.config != DEFAULT_CONFIG && !std::path::Path::new(&cli.config).exists() {
         eprintln!("Configuration error: --config {} does not exist", cli.config);
         std::process::exit(1);
+    }
+
+    if cli.validate {
+        let toml_cfg = MachineConfig::try_load(&cli.config).unwrap_or_else(|e| {
+            eprintln!("Configuration error: {e}");
+            std::process::exit(1);
+        });
+        let cfg = cli.apply(toml_cfg);
+        std::process::exit(crate::validate_config::report(&cli.config, &cfg));
     }
 
     let toml_cfg = MachineConfig::load_toml(&cli.config);
