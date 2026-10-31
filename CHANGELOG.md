@@ -335,6 +335,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Memory past 4 GB is as fast as the rest: such a machine gets a 16 GB direct
   window, and the JIT compiles code anywhere in it.
 - A store-conditional on memory outside the window is now atomic with two CPUs.
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- **jitv2 compiles the reset PROM from the PROM.** The PROM runs from the reset
+  window uncached; once memory covers that window the cached view returns RAM
+  there, and the compile pool used to compile RAM's bytes in place of the
+  PROM's. The board now presents an uncached instruction fetch of that window at
+  an address of the PROM's own (`MipsExecutor::uncached_fetch_alias`), so its
+  code page is keyed, compiled and invalidated by address like any other. The
+  other machines are unchanged.
+
 ### PCI configuration
 
 - A PCI function can describe its own writable header fields and
