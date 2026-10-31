@@ -794,7 +794,7 @@ impl MachineProfile {
             Self::OctaneIp30 => crate::ip30_machine::CPUS,
             Self::O2Ip32 => crate::ip32_machine::CPUS,
             Self::Indigo2Ip28 => crate::machine::IP28_CPUS,
-            Self::FuelIp34 => crate::ip35_machine::CPUS,
+            Self::FuelIp34 => crate::ip34_machine::CPUS,
             Self::IndyIp24 | Self::Indigo2Ip22 => crate::machine::CPUS,
         }
     }

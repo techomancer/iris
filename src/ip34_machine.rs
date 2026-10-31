@@ -14,12 +14,7 @@
 //! Fuel cache adapter until a successful cached fetch leaves the PROM homes.
 //! This retirement rule is an approximation, not an established hardware event.
 //!
-//! # What is approximated here
-//!
-//! The two Hub-special head windows return zero on reads and acknowledge
-//! writes without side effects. PROM 6.210 writes the 64-bit value 0x2000
-//! at relative offsets 0 and 0x40 before DRAM discovery. Their hardware
-//! meaning is unknown; Bedrock logging records accesses to these windows.
+//! The Bedrock node itself, and its approximations, are in `ip35::node`.
 //!
 //! The processor interfaces' graphics flow-control registers store what
 //! IRIX writes, which is what its VPro driver checks, but count no stores:
@@ -38,7 +33,7 @@ use crate::dev::bedrock_io::{BedrockIo, SIZE as IO_SIZE};
 use crate::dev::bedrock_lb::{BedrockLb, SIZE as LB_SIZE};
 use crate::dev::bedrock_md::{BedrockMd, MemoryError};
 use crate::dev::bedrock_ni::{BedrockNi, SIZE as NI_SIZE};
-use crate::dev::bedrock_pi::{reg as pi_reg, BedrockPi, BedrockPiConfig, SIZE as PI_SIZE};
+use crate::dev::bedrock_pi::{BedrockPi, BedrockPiConfig, Population, SIZE as PI_SIZE};
 use crate::dev::bedrock_xb::{BedrockXb, SIZE as XB_SIZE};
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc3::{Ioc3, Ioc3Config};
@@ -60,7 +55,10 @@ use crate::hptimer::TimerManager;
 use crate::cpu::mips_cache_shadow::R12000ShadowCache;
 use crate::config::{CpuModel, MachineProfile};
 use crate::cpu::mips_cache_v2::MipsCache;
-use crate::ip35::{map_device, Ip35Bus, SparseWindowMap, Window, CPU_PHYS_MASK};
+use crate::ip35::node::{connect_cpu, connect_serial_ports, Node, NodeConfig, SerialPort, WidgetDma};
+#[cfg(test)]
+pub(crate) use crate::ip35::node::PendingIrq;
+use crate::ip35::{Ip35Bus, CPU_PHYS_MASK};
 use crate::irq::{InterruptController, IrqLine};
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
@@ -138,19 +136,7 @@ impl FuelMachine {
         let cpu: Arc<dyn CpuDevice> = Arc::new(MipsCpu::<_, R12000ShadowCache>::new(*exec));
         board.status.set_cpu_cycles(cpu.cycles_ptr());
         board.status.set_count_hz(cpu.count_hz_atomic());
-        if let Some(space) = board.md.physical().ppmem_space() {
-            use crate::ppmem::MappedMemory;
-            unsafe {
-                space.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-                cpu.set_tcache_window(space.window_base());
-                let bitmap = cpu.tcache_bitmap_ptr();
-                if !bitmap.is_null() { space.set_bitmap_sink2(bitmap); }
-                #[cfg(feature = "jitv2")]
-                cpu.set_tcache_gen_window(board.md.generation_base());
-            }
-            board.md.physical().resync_ppmem_bitmap();
-            board.md.rebuild_memory();
-        }
+        let rx = connect_cpu("Fuel", &board.md, &board.pi[0], &board.lb, &board.ni, &board.l1, &cpu);
         // After the windows above: each compile worker takes the cache's
         // geometry and the CPU model's policies once, as it starts, and
         // without the windows the geometry has no inline load or store path.
@@ -178,33 +164,6 @@ impl FuelMachine {
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
         }
-        board.pi[0].set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
-        let (tx, rx) = channel();
-        let reset_tx = tx.clone();
-        board.lb.connect_soft_reset(Arc::new(move || {
-            let _ = reset_tx.send(MachineEvent::HardReset);
-        }));
-        let reset_tx = tx.clone();
-        board.ni.connect_local_reset(Arc::new(move || {
-            let _ = reset_tx.send(MachineEvent::HardReset);
-        }));
-        let weak_cpu = Arc::downgrade(&cpu);
-        board.l1.set_event_handler(Arc::new(move |event| {
-            match event {
-                L1Event::Power(false) | L1Event::Shutdown => {
-                    let _ = tx.send(MachineEvent::PowerOff);
-                }
-                L1Event::Power(true) | L1Event::Reset => {
-                    let _ = tx.send(MachineEvent::HardReset);
-                }
-                L1Event::SoftReset => {
-                    if let Some(cpu) = weak_cpu.upgrade() {
-                        cpu.as_device().signal(Signal::Reset(true));
-                    }
-                }
-                L1Event::Nmi => dlog!(LogModule::L1, "Fuel: NMI entry is not implemented by the CPU"),
-            }
-        }));
         let scratch = Self::attach_scsi(cfg, &board)?;
         let console = match cfg.fuel.console {
             FuelConsole::L1 => 0,
@@ -281,52 +240,33 @@ impl FuelMachine {
         console: usize,
     ) -> Result<(), String> {
         let [a, b] = cfg.serial_ports();
-        let ports = [cfg.fuel.l1_port.unwrap_or(8882), a, b];
-        if ports[0] == ports[1] || ports[0] == ports[2] || ports[1] == ports[2] {
-            return Err("Fuel L1 and IOC3 serial ports must be distinct".into());
-        }
-        let labels = ["L1", "IOC3 A", "IOC3 B"];
-        let settings = ["fuel.l1_port", "serial_port_a", "serial_port_b"];
-        let mut log_config = cfg.clone();
-        for (index, port) in ports.into_iter().enumerate() {
-            log_config.serial_log = if index == console {
-                cfg.serial_log.clone()
-            } else if index == 0 {
-                cfg.fuel.l1_log.clone()
-            } else {
-                None
-            };
-            let tag = format!("Fuel {}", labels[index]);
-            let log = open_log(&log_config, &tag, LogMode::Fresh);
-            let backend: Arc<dyn SerialBackend> = if cfg.ci && index == console {
-                if let Some(log) = log {
-                    board.serial[index].set_log(log);
-                }
-                board.serial[index].clone()
-            } else {
-                let mut backend = null_serial_backend();
-                match tcp_serial_backend(port) {
-                    Some((socket, actual_port)) => {
-                        eprintln!("iris: {tag} on 127.0.0.1:{actual_port}");
-                        backend = socket;
-                    }
-                    None => eprintln!(
-                        "iris: {tag}: port {port} unavailable; is another iris using it? ({})",
-                        settings[index]
-                    ),
-                }
-                match log {
-                    Some(log) => Arc::new(TeeBackend::new(backend, log)),
-                    None => backend,
-                }
-            };
-            if index == 0 {
-                board.l1.set_serial_backend(backend);
-            } else {
-                board.ioc3.set_serial_backend(index - 1, backend);
-            }
-        }
-        Ok(())
+        let ports = [
+            SerialPort {
+                label: "L1",
+                port: cfg.fuel.l1_port.unwrap_or(8882),
+                setting: "fuel.l1_port",
+                ci: &board.serial[0],
+                log: cfg.fuel.l1_log.clone(),
+                connect: Box::new(|backend| board.l1.set_serial_backend(backend)),
+            },
+            SerialPort {
+                label: "IOC3 A",
+                port: a,
+                setting: "serial_port_a",
+                ci: &board.serial[1],
+                log: None,
+                connect: Box::new(|backend| board.ioc3.set_serial_backend(0, backend)),
+            },
+            SerialPort {
+                label: "IOC3 B",
+                port: b,
+                setting: "serial_port_b",
+                ci: &board.serial[2],
+                log: None,
+                connect: Box::new(|backend| board.ioc3.set_serial_backend(1, backend)),
+            },
+        ];
+        connect_serial_ports(cfg, "Fuel", &ports, console)
     }
 
     #[cfg(test)]
@@ -335,18 +275,6 @@ impl FuelMachine {
     }
 
 }
-
-struct CpuIrq(std::sync::Weak<dyn CpuDevice>);
-impl InterruptController for CpuIrq {
-    fn set_line(&self, line: u32, level: bool) {
-        if line < 5 {
-            if let Some(cpu) = self.0.upgrade() {
-                cpu.as_device().signal(Signal::Interrupt(line + 2, level));
-            }
-        }
-    }
-}
-
 impl Workstation for FuelMachine {
     fn start(&mut self) {
         self.lifecycle = GuestState::Starting;
@@ -511,18 +439,6 @@ const FUEL_BOARD_ID: u64 = 0x4004;
 /// Two 256 MiB banks, locational banks 0 and 1.
 const FUEL_BANKS_MIB: [u32; 2] = [256, 256];
 
-/// The local node register blocks projected into the processor's I/O view.
-pub mod reg {
-    pub const PI1_BASE: u64 = 0x20_0000;
-    pub const IO_BASE: u64 = 0x40_0000;
-    pub const LB_BASE: u64 = 0x60_0000;
-    pub const NI_BASE: u64 = 0x68_0000;
-    pub const XB_BASE: u64 = 0x70_0000;
-    pub const MD_BASE: u64 = 0x78_0000;
-    pub const MD_SIZE: u64 = 0x8_0000;
-}
-
-
 /// Build the Fuel's processor and set the PROM boot-mode inputs.
 pub(crate) fn build_cpu(bus: Arc<Ip35Bus>) -> Box<FuelCpu> {
     let cfg = MipsCpuConfig::for_model::<R12000ShadowCache>(Arc::new(crate::ip35::memory_map(&crate::dev::bedrock_mem::RamExtent::new(&FUEL_BANKS_MIB))));
@@ -623,19 +539,6 @@ impl FuelBoard {
 
     pub fn with_config(config: FuelBoardConfig<'_>) -> Result<Self, String> {
         let FuelBoardConfig { payload, clock, flash_path, station_mac, timekeeper, ps2_input, usb_input, l1: l1_identity, graphics, graphics_pool } = config;
-        let md = BedrockMd::with_clock(&FUEL_BANKS_MIB, clock.clone())?;
-        let phys = md.physical().clone();
-        let pi: [Arc<BedrockPi>; 2] = std::array::from_fn(|interface| {
-            BedrockPi::new(
-                BedrockPiConfig {
-                    interface: interface as u8,
-                    request_region: 0,
-                },
-                clock.clone(),
-            )
-        });
-        // Only CPU A is fitted on the single-processor board.
-        pi[0].write64(pi_reg::CPU_A_ENABLE, 1);
         let mut l1_config = L1Config { mac: station_mac, ..Default::default() };
         if let Some(revision) = l1_identity.revision {
             l1_config.revision = Some(revision);
@@ -643,101 +546,25 @@ impl FuelBoard {
         if let Some(serial) = l1_identity.brick_serial {
             l1_config.brick_serial = Some(serial);
         }
-        let l1 = Arc::new(L1::new(l1_config)?);
-        let flash = Arc::new(match flash_path {
-            Some(path) => Flash::with_file(payload, path, FirmwareRecord::FUEL),
-            None => Flash::new(payload, FirmwareRecord::FUEL),
-        }.map_err(|e| e.to_string())?);
-        let lb = Arc::new(BedrockLb::new(clock.clone()));
-        let io = Arc::new(BedrockIo::new());
-        let ni = Arc::new(BedrockNi::new());
-        let xb = Arc::new(BedrockXb::new());
-        let mut registers = SparseWindowMap::default();
-        registers.map(
-            0,
-            PI_SIZE,
-            pi[0].clone(),
-        );
-        registers.map(
-            reg::PI1_BASE,
-            PI_SIZE,
-            pi[1].clone(),
-        );
-        registers.map(
-            reg::IO_BASE,
-            IO_SIZE,
-            io.clone(),
-        );
-        registers.map(
-            reg::LB_BASE,
-            LB_SIZE,
-            lb.clone(),
-        );
-        registers.map(
-            reg::NI_BASE,
-            NI_SIZE,
-            ni.clone(),
-        );
-        registers.map(
-            reg::XB_BASE,
-            XB_SIZE,
-            xb.clone(),
-        );
-        registers.map(
-            reg::MD_BASE,
-            reg::MD_SIZE,
-            md.md_bus(),
-        );
-        let registers = Arc::new(registers);
-        io.connect_hub(Arc::new(IoHub(pi.clone())));
-        io.connect_memory(md.dma_view());
-        let p = pi.clone();
-        lb.connect_error(Arc::new(move |level| {
-            for pi in &p {
-                pi.set_lb_error(level);
-            }
-        }));
-        let p = pi.clone();
-        ni.connect_error(Arc::new(move |level| {
-            for pi in &p {
-                pi.set_ni_error(level);
-            }
-        }));
-        let p = pi.clone();
-        xb.connect_error(Arc::new(move |level| {
-            for pi in &p {
-                pi.set_xb_error(level);
-            }
-        }));
-        let io_node = Arc::downgrade(&io);
-        lb.connect_node_changed(Arc::new(move |node| {
-            if let Some(io) = io_node.upgrade() {
-                io.set_node_number(node);
-            }
-        }));
-        let p = pi.clone();
-        md.on_error(Arc::new(move |kind| {
-            for pi in &p {
-                match kind {
-                    MemoryError::Correctable => pi.set_pending(1, 61),
-                    MemoryError::Uncorrectable => {
-                        pi.set_memory_uncorrectable();
-                    }
-                }
-            }
-        }));
-        #[cfg(test)]
-        let irq = Arc::new(PendingIrq::default());
-        #[cfg(test)]
-        pi[0].set_interrupt_controller(irq.clone());
-        l1.set_irq(IrqLine::new(Arc::new(UartIrq(pi.clone())), 0));
+        let node = Node::build(NodeConfig {
+            name: "Fuel",
+            payload,
+            clock: clock.clone(),
+            flash_path,
+            banks_mib: &FUEL_BANKS_MIB,
+            population: Population::SINGLE,
+            firmware: FirmwareRecord::FUEL,
+            board_id: FUEL_BOARD_ID,
+            l1: l1_config,
+        })?;
+        let (md, io) = (&node.md, &node.io);
         let serial = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
-        l1.set_serial_backend(serial[0].clone());
+        node.l1.set_serial_backend(serial[0].clone());
         let xbridge = XBridge::new(md.dma_view());
         for widget in [0, 10, 14, 15] {
             io.connect_widget(widget, xbridge.widget(widget).unwrap());
         }
-        let weak_io = Arc::downgrade(&io);
+        let weak_io = Arc::downgrade(io);
         xbridge.set_interrupt_sender(Arc::new(move |packet| {
             if packet.widget != 10 {
                 return false;
@@ -752,7 +579,7 @@ impl FuelBoard {
                 ) == BUS_OK
             })
         }));
-        let weak_io = Arc::downgrade(&io);
+        let weak_io = Arc::downgrade(io);
         xbridge.set_dma_sender(Arc::new(move |packet, bytes| {
             if packet.widget != 10 || packet.half_read_requested || packet.half_write_requested {
                 dlog!(LogModule::Bedrock,
@@ -802,7 +629,7 @@ impl FuelBoard {
             }
             true
         }));
-        let mac = l1.station_mac();
+        let mac = node.l1.station_mac();
         let mut ioc3_config = Ioc3Config::fuel(mac);
         ioc3_config.keyboard_mouse = ps2_input;
         let ioc3 = Arc::new(Ioc3::new(ioc3_config));
@@ -845,7 +672,7 @@ impl FuelBoard {
             Some(board)
         };
         // Each processor interface keeps its own graphics registers.
-        for pi in &pi {
+        for pi in &node.pi {
             pi.set_node_hooks(Arc::new(PiGraphics::default()));
         }
         xbridge.attach(15, 1, scsi.clone());
@@ -887,77 +714,16 @@ impl FuelBoard {
                 }
             }
         }));
-        let mut bus = Ip35Bus::new(phys.clone());
-        #[cfg(feature = "jitv2")]
-        bus.set_ram_generations(md.dma_view());
-        md.rebuild_memory();
-        bus.set_fallback(1, 1 << 32, Arc::new(IoPio(io.clone())));
-        // The two XIO register forms select the requester's PI0 interface.
-        let permission_md = Arc::downgrade(&md);
-        let permission: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-            permission_md.upgrade().is_some_and(|md| md.current_cell() & 1 != 0)
-        });
-        let protected_regs = Arc::new(Window::new(0, 0x80_0000, registers.clone()).permitted(permission.clone()));
-        for base in [0x0100_0000, 0x0180_0000] {
-            bus.map(1, base, 0x80_0000, protected_regs.clone());
-        }
-        // Cached RAM uses MD's direct bank mappings; diagnostic views stay separate.
-        bus.map(3, 0, 1 << 33, md.uncached_view());
-        // Hub-special low memory: its first 256 MiB is the node memory view.
-        bus.map(0, 0, 0x1000_0000, md.uncached_view());
-        let prom = Arc::new(
-            flash
-                .array_view(0, PART_SIZE)
-                .map_err(|e| e.to_string())?,
-        );
-        let boot = Arc::new(flash.boot_view());
-        for base in [0x1800_0000, 0x3800_0000] {
-            bus.map(0, base, 0x800_0000, boot.clone());
-        }
-        // Reset execution always sees stored bytes, independently of commands.
-        bus.map(0, 0x1fc0_0000, 0x40_0000, prom.clone());
-        // The same PROM where an uncached instruction fetch of that window is
-        // presented (`MipsExecutor::uncached_fetch_alias`).
-        bus.map(0, crate::ip35::RESET_WINDOW_FETCH, crate::ip35::RESET_WINDOW_SIZE, prom.clone());
-        if !payload.is_empty() {
-            map_device(
-                &phys,
-                0x1fc0_0000,
-                payload.len() as u64,
-                prom.clone(),
-                "Fuel cached reset PROM",
-            );
-        }
-        let leds = Arc::new(Leds {
-            md: md.clone(),
-            values: Mutex::new([0; 4]),
-        });
-        // The three windows occupy the same processor register page.
-        let special = Arc::new(HubSpecialPage {
-            windows: [
-                Window::new(0, 0x80, Arc::new(HubHead)).permitted(permission.clone()),
-                Window::new(0x80, 0x40, l1.clone()).permitted(permission.clone()),
-                Window::new(0xc0, 0x20, leds).permitted(permission.clone()),
-            ],
-        });
-        for base in [0x1000_0000, 0x3000_0000] {
-            bus.map(0, base, 1 << SLOT_SHIFT, special.clone());
-            bus.map(0, base + 0x400_0000, 8, Arc::new(BoardId(md.clone())));
-        }
-        bus.map(0, 0x1_c000_0000, 1 << 30, md.directory_bus());
-        bus.map(0, 0x1_4000_0000, 1 << 30, md.ecc_bus());
-        bus.map(0, 0x1_0000_0000, 1 << 30, md.ecc_scrub_bus());
-        bus.map(2, 0, 1 << 33, md.fetchop_bus());
         Ok(Self {
-            bus: Arc::new(bus),
-            pi,
-            md,
-            l1,
-            flash,
-            lb,
-            io,
-            ni,
-            xb,
+            bus: node.bus,
+            pi: node.pi,
+            md: node.md,
+            l1: node.l1,
+            flash: node.flash,
+            lb: node.lb,
+            io: node.io,
+            ni: node.ni,
+            xb: node.xb,
             xbridge,
             ioc3,
             eth,
@@ -969,7 +735,7 @@ impl FuelBoard {
             status,
             serial,
             #[cfg(test)]
-            irq,
+            irq: node.irq,
             last_clock: AtomicU64::new(clock()),
             clock,
             running: AtomicBool::new(false),
@@ -1080,186 +846,8 @@ impl crate::dev::bedrock_pi::NodeHooks for PiGraphics {
     }
 }
 
-/// A widget's DMA as Bedrock's inbound path takes it: crosstalk addresses,
-/// with the widget's inbound permissions applied.
-struct WidgetDma {
-    io: std::sync::Weak<BedrockIo>,
-    widget: u8,
-}
-macro_rules! widget_dma_access {
-    ($r:ident,$w:ident,$ty:ty,$result:ident,$size:expr) => {
-        fn $r(&self, a: u64) -> $result {
-            let Some(io) = self.io.upgrade() else { return $result::err() };
-            let r = io.inbound_read(self.widget, None, a, $size);
-            $result { data: r.data as $ty, status: r.status }
-        }
-        fn $w(&self, a: u64, v: $ty) -> u32 {
-            self.io.upgrade().map_or(BUS_ERR, |io| io.inbound_write(self.widget, None, a, $size, v as u64))
-        }
-    };
-}
-impl BusDevice for WidgetDma {
-    widget_dma_access!(read8, write8, u8, BusRead8, 1);
-    widget_dma_access!(read16, write16, u16, BusRead16, 2);
-    widget_dma_access!(read32, write32, u32, BusRead32, 4);
-    widget_dma_access!(read64, write64, u64, BusRead64, 8);
-}
-
-// XIO register packets reach only the two PI interrupt-modify registers.
-// The processor's register projection has a separate, wider interface.
-struct IoHub([Arc<BedrockPi>; 2]);
-impl BusDevice for IoHub {
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        if matches!(a, 0x90 | 0x20_0090) && self.0[(a >> 21) as usize].io_modify(v, 0) {
-            BUS_OK
-        } else {
-            BUS_ERR
-        }
-    }
-}
-
-struct HubSpecialPage {
-    windows: [Window; 3],
-}
-impl HubSpecialPage {
-    fn target(&self, a: u64, n: u64) -> Option<&Window> {
-        self.windows.iter().find(|window| window.contains(a, n))
-    }
-}
-macro_rules! hub_page_access {
-    ($r:ident,$w:ident,$t:ty,$out:ident,$n:expr) => {
-        fn $r(&self, a: u64) -> $out {
-            self.target(a, $n).map(|window| window.$r(a)).unwrap_or_else($out::err)
-        }
-        fn $w(&self, a: u64, value: $t) -> u32 {
-            self.target(a, $n).map(|window| window.$w(a, value)).unwrap_or(BUS_ERR)
-        }
-    };
-}
-impl BusDevice for HubSpecialPage {
-    hub_page_access!(read8, write8, u8, BusRead8, 1);
-    hub_page_access!(read16, write16, u16, BusRead16, 2);
-    hub_page_access!(read32, write32, u32, BusRead32, 4);
-    hub_page_access!(read64, write64, u64, BusRead64, 8);
-}
-
-struct BoardId(Arc<BedrockMd>);
-impl BusDevice for BoardId {
-    fn read64(&self, a: u64) -> BusRead64 {
-        if a == 0 && self.0.current_cell() & 1 != 0 {
-            BusRead64::ok(FUEL_BOARD_ID)
-        } else {
-            BusRead64::err()
-        }
-    }
-}
-// Compatibility head windows: their register contract is not established.
-// PROM 6.210 writes 0x2000 at offsets 0 and 0x40 before DRAM discovery.
-// Retain the existing zero-read/acknowledged-write model, with accesses
-// observable through the Bedrock log, until the register behavior is known.
-struct HubHead;
-macro_rules! head_access {
-    ($r:ident,$w:ident,$ty:ty,$result:ident) => {
-        fn $r(&self, a: u64) -> $result {
-            dlog!(LogModule::Bedrock,
-                "Fuel: unidentified Hub-special read {} bytes at {a:#x}",
-                std::mem::size_of::<$ty>()
-            );
-            $result::ok(0)
-        }
-        fn $w(&self, a: u64, v: $ty) -> u32 {
-            dlog!(LogModule::Bedrock,
-                "Fuel: unidentified Hub-special write {} bytes at {a:#x} value {v:#x}",
-                std::mem::size_of::<$ty>()
-            );
-            BUS_OK
-        }
-    };
-}
-impl BusDevice for HubHead {
-    head_access!(read8, write8, u8, BusRead8);
-    head_access!(read16, write16, u16, BusRead16);
-    head_access!(read32, write32, u32, BusRead32);
-    head_access!(read64, write64, u64, BusRead64);
-}
-struct Leds {
-    md: Arc<BedrockMd>,
-    values: Mutex<[u8; 4]>,
-}
-impl BusDevice for Leds {
-    fn read64(&self, a: u64) -> BusRead64 {
-        if a < 32 && a & 7 == 0 && self.md.current_cell() & 1 != 0 {
-            BusRead64::ok(self.values.lock()[a as usize / 8] as u64)
-        } else {
-            BusRead64::err()
-        }
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        if a < 32 && a & 7 == 0 && self.md.current_cell() & 1 != 0 {
-            self.values.lock()[a as usize / 8] = v as u8;
-            BUS_OK
-        } else {
-            BUS_ERR
-        }
-    }
-}
-
-struct IoPio(Arc<BedrockIo>);
-macro_rules! pio_access {
-    ($r:ident,$w:ident,$ty:ty,$result:ident,$size:expr) => {
-        fn $r(&self, a: u64) -> $result {
-            let r = self.0.pio_read(a, $size);
-            $result {
-                data: r.data as $ty,
-                status: r.status,
-            }
-        }
-        fn $w(&self, a: u64, v: $ty) -> u32 {
-            self.0.pio_write(a, $size, v as u64)
-        }
-    };
-}
-impl BusDevice for IoPio {
-    pio_access!(read8, write8, u8, BusRead8, 1);
-    pio_access!(read16, write16, u16, BusRead16, 2);
-    pio_access!(read32, write32, u32, BusRead32, 4);
-    pio_access!(read64, write64, u64, BusRead64, 8);
-}
 impl Drop for FuelBoard {
     fn drop(&mut self) {
         self.stop();
-    }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct PendingIrq(AtomicU64);
-#[cfg(test)]
-impl PendingIrq {
-    pub fn bits(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
-    }
-}
-#[cfg(test)]
-impl InterruptController for PendingIrq {
-    fn set_line(&self, line: u32, level: bool) {
-        if line >= 5 {
-            return;
-        }
-        let mask = 1 << (10 + line);
-        if level {
-            self.0.fetch_or(mask, Ordering::Release);
-        } else {
-            self.0
-                .fetch_and(!mask, Ordering::Release);
-        }
-    }
-}
-struct UartIrq([Arc<BedrockPi>; 2]);
-impl InterruptController for UartIrq {
-    fn set_line(&self, _: u32, level: bool) {
-        for pi in &self.0 {
-            pi.set_uart_irq(level);
-        }
     }
 }
