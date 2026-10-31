@@ -19,6 +19,7 @@ pub mod ioc3;
 pub mod ioc_sdma;
 pub mod ioc3_eth;
 pub mod ioc3_port;
+pub mod ioc4;
 pub mod isp1040;
 pub mod mace_id;
 pub mod mace_pci;
