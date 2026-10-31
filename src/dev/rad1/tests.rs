@@ -605,7 +605,9 @@ fn status_schedule_restarts_when_far_behind() {
     wr(&r, 0x5c, 0x40003 | (3300 << 2));
     let gen = r.state.lock().status_gen;
     at(&r, 1_000_000_000);
-    assert_eq!(r.status_tick(gen), Some(1_000_100_000));
+    // A second late is a hold-up; 200 ms of it is held back and the rest
+    // credited, so the schedule restarts from there.
+    assert_eq!(r.status_tick(gen), Some(1_000_000_000 - 200_000_000 + 100_000));
 }
 
 #[test]
@@ -1143,4 +1145,58 @@ fn the_relay_and_dac_mute_words_silence_the_output_but_not_the_transfer() {
         assert!(r.state.lock().chan[CH_OUT].running && tap.lock().len() > 2 * 441 * 2);
     }
     let _ = std::fs::remove_file(&path);
+}
+
+/// Completion `k` of IRIX's continuous status schedule (interval 8251 at
+/// 33 MHz, 250 us) is due at this time.
+fn irix_due(k: i64) -> i64 {
+    k * 8251 * 1_000_000_000 / 33_000_000
+}
+
+/// The time held back from the card's clock for timer hold-ups.
+fn held(r: &Rad1) -> i64 {
+    r.stalled_ns.load(Ordering::SeqCst)
+}
+
+/// Output running on a 512-frame ring with that status schedule started at
+/// time 0; returns the schedule's generation.
+fn running_with_status(r: &Rad1) -> u64 {
+    start_ust(r);
+    program(r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(r, 0x58, 0x2000_0001);
+    wr(r, 0x500, 0x30_0000);
+    wr(r, 0x504, 0xffff_c078);
+    wr(r, 0x4b4, 0x30_0000);
+    wr(r, 0x4bc, 0xffff_c078);
+    wr(r, 0x5c, 0x480ef);
+    r.state.lock().status_gen
+}
+
+/// IRIX writes only 36 to 90 frames ahead of the pointer, so a completion
+/// the host held up must not carry the output through the hold-up.
+#[test]
+fn a_late_status_completion_does_not_carry_the_output_through_the_hold_up() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1) + 5_000_000);
+    assert_eq!(r.status_tick(gen), Some(irix_due(2)), "the schedule carries on from the card's clock");
+    assert!(r.state.lock().chan[CH_OUT].frames <= 12, "moved over the hold-up");
+    assert_eq!(r.now(), irix_due(1), "the clock is back at the due time");
+    assert_eq!(held(&r), 5_000_000);
+    // An on-time completion wins back 1/32 of an interval.
+    at(&r, irix_due(2) + 5_000_000);
+    assert_eq!(r.status_tick(gen), Some(irix_due(3)));
+    assert_eq!(held(&r), 5_000_000 - irix_due(1) / 32);
+}
+
+#[test]
+fn a_hold_up_is_more_than_one_interval_late_and_at_most_200ms_is_held_back() {
+    let interval = irix_due(1);
+    for (late, held_back) in [(interval, 0), (interval + 1_000, interval + 1_000), (SEC, 200_000_000)] {
+        let (r, _ram) = dma_card();
+        let gen = running_with_status(&r);
+        at(&r, irix_due(1) + late);
+        r.status_tick(gen).unwrap();
+        assert_eq!(held(&r), held_back, "{late} ns late");
+    }
 }

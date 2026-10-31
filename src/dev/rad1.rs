@@ -37,6 +37,15 @@
 //! * The sample clock, UST and status schedule run on host wall time, less
 //!   the time the machine was stopped; they are not tied to the emulated
 //!   CPU's progress.
+//! * Hold-up approximation, an emulator policy with no hardware
+//!   counterpart: while continuous status runs, a completion more than one
+//!   interval late means the host held up the timer thread that also
+//!   delivers the clock interrupt IRIX refills the ring from, so the card's
+//!   clock is set back to the completion's due time (see
+//!   [`Inner::absorb_stall`]). The clock, output rate and UST fall behind
+//!   wall time by the hold-ups; on-time completions win 1/32 of an interval
+//!   back each, and at most 200 ms is held back. Time the guest has read is
+//!   never taken back.
 //! * The relay (0x88 = 2) and DAC (0x8c = 3) mute words silence the host
 //!   output while the transfer runs on. That they mute is inferred from
 //!   when the PROM, IRIX and Linux write them; the power-on state is
@@ -147,6 +156,10 @@ const STATUS_ONESHOT_START: u32 = 0x40001;
 const STATUS_STOP: u32 = 0x1fffc;
 
 const UST_NS_PER_TICK: i64 = 960;
+/// Most of the card's clock held back for hold-ups, and the share of an
+/// interval won back per on-time completion (see [`Inner::absorb_stall`]).
+const STALL_MAX_NS: i64 = 200_000_000;
+const STALL_REPAY_DIV: i64 = 32;
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// The rate of a clock generator no guest has programmed.
@@ -801,6 +814,10 @@ pub struct Inner {
     /// them.
     stopped_ns: AtomicI64,
     stopped_at: Mutex<Option<Instant>>,
+    /// Nanoseconds taken off the card's clock for timer hold-ups (see
+    /// [`Inner::absorb_stall`]), and the latest time it has handed out.
+    stalled_ns: AtomicI64,
+    seen_ns: AtomicI64,
     /// Held across each timer callback's work, so a stop can wait one out.
     tick_pass: Mutex<()>,
     timers: OnceLock<Arc<TimerManager>>,
@@ -831,6 +848,8 @@ impl Inner {
             start: Instant::now(),
             fake_ns: AtomicI64::new(i64::MIN),
             stopped_ns: AtomicI64::new(0),
+            stalled_ns: AtomicI64::new(0),
+            seen_ns: AtomicI64::new(i64::MIN),
             stopped_at: Mutex::new(None),
             tick_pass: Mutex::new(()),
             timers: OnceLock::new(),
@@ -893,9 +912,13 @@ impl Inner {
         if self.stopped() {
             return TimerReturn::Continue;
         }
-        let now = self.now();
+        // Status completions move the output while they run; a pump read
+        // inside a hold-up would keep the late completion from absorbing it.
+        let now = (!self.state.lock().status_running).then(|| self.now());
         let mut s = self.state.lock();
-        self.sync_chan(&mut s, CH_OUT, now);
+        if let Some(now) = now {
+            self.sync_chan(&mut s, CH_OUT, now);
+        }
         if s.chan[CH_OUT].running {
             TimerReturn::Continue
         } else {
@@ -934,13 +957,47 @@ impl Inner {
     }
 
     fn now(&self) -> i64 {
-        match self.fake_ns.load(Ordering::Relaxed) {
+        let at = self.stopped_at.lock();
+        let t = self.clock_locked(&at);
+        self.seen_ns.fetch_max(t, Ordering::SeqCst);
+        t
+    }
+
+    /// The card's clock, with `stopped_at` held; not recorded as seen.
+    fn clock_locked(&self, at: &Option<Instant>) -> i64 {
+        let t = match self.fake_ns.load(Ordering::Relaxed) {
             i64::MIN => {
-                let at = self.stopped_at.lock().unwrap_or_else(Instant::now);
+                let at = at.unwrap_or_else(Instant::now);
                 at.duration_since(self.start).as_nanos() as i64 - self.stopped_ns.load(Ordering::SeqCst)
             }
             t => t,
-        }
+        };
+        t - self.stalled_ns.load(Ordering::SeqCst)
+    }
+
+    /// The card's clock as a status completion due at `due` sees it. One
+    /// more than `interval` late means the host held up the timer thread and
+    /// the guest's clock interrupt with it; crediting that would carry the
+    /// pointer past IRIX's write point (36 to 90 frames ahead) and replay a
+    /// stale lap. So the clock goes back to `due`, at most [`STALL_MAX_NS`]
+    /// in all and never behind a time already handed out. An on-time one
+    /// wins back `interval / STALL_REPAY_DIV` of what is held back.
+    /// Emulator approximation; see the module notes.
+    fn absorb_stall(&self, due: i64, interval: i64) -> i64 {
+        let at = self.stopped_at.lock();
+        let t = self.clock_locked(&at);
+        let held = self.stalled_ns.load(Ordering::SeqCst);
+        let late = t - due;
+        let shift = if late > interval {
+            let floor = self.seen_ns.load(Ordering::SeqCst);
+            -late.min(STALL_MAX_NS - held).min(t.saturating_sub(floor)).max(0)
+        } else {
+            held.min(interval / STALL_REPAY_DIV)
+        };
+        self.stalled_ns.fetch_sub(shift, Ordering::SeqCst);
+        let t = t + shift;
+        self.seen_ns.fetch_max(t, Ordering::SeqCst);
+        t
     }
 
     /// Stop the card's clock and hold the timers off guest memory while the
@@ -1355,7 +1412,14 @@ impl Inner {
     /// with wrap, so the driver's servicer, which consumes consecutive done
     /// slots, keeps finding fresh ones.
     fn status_tick(&self, gen: u64) -> Option<i64> {
-        let now = self.now();
+        let (due, interval) = {
+            let s = self.state.lock();
+            if s.status_gen != gen || !s.status_running {
+                return None;
+            }
+            (Self::status_deadline(&s, s.status_done + 1), Self::status_deadline(&s, 1) - s.status_start_ns)
+        };
+        let now = self.absorb_stall(due, interval);
         let mut s = self.state.lock();
         if s.status_gen != gen || !s.status_running {
             return None;
