@@ -20,6 +20,7 @@ pub mod heart_mem;
 pub mod ioc3;
 pub mod ioc_serial_dma;
 pub mod ioc3_eth;
+pub mod ioc3_kbc;
 pub mod ioc3_port;
 pub mod isp1040;
 pub mod mace_id;
