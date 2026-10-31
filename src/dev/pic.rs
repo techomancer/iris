@@ -1022,6 +1022,7 @@ impl Head {
                 device as u32 * 4 + pin as u32 - 1,
             ));
         }
+        function.req64_sampled(options.req64);
     }
 
     fn reset(&self) {
@@ -1038,6 +1039,7 @@ impl Head {
         }
         for slot in self.slots.read().iter().flatten() {
             slot.function.config().reset();
+            slot.function.req64_sampled(slot.options.req64);
         }
         self.mappings.lock().table.clear();
         self.unsupported.lock().clear();

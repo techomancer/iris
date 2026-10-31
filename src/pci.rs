@@ -446,6 +446,11 @@ pub trait PciBusDevice: Send + Sync {
 
     /// The bridge gives a function that masters the bus its way to memory.
     fn connect_dma(&self, _dma: std::sync::Arc<dyn PciDma>) {}
+
+    /// The bridge's REQ64# as reset ends: whether the function's slot drives
+    /// it. A 64-bit agent samples it to learn its bus width; a 32-bit one
+    /// ignores it.
+    fn req64_sampled(&self, _asserted: bool) {}
 }
 
 /// How a bus master's access ended.

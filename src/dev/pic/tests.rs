@@ -34,6 +34,8 @@ struct Card {
     bar: Mutex<[u8; 0x1000]>,
     dma: OnceLock<Arc<dyn PciDma>>,
     line: OnceLock<IrqLine>,
+    /// Each REQ64# level the bridge reported, in order.
+    req64: Mutex<Vec<bool>>,
 }
 
 impl Card {
@@ -44,6 +46,7 @@ impl Card {
             bar: Mutex::new([0; 0x1000]),
             dma: OnceLock::new(),
             line: OnceLock::new(),
+            req64: Mutex::new(Vec::new()),
         })
     }
 
@@ -67,6 +70,10 @@ impl PciBusDevice for Card {
 
     fn bar_write(&self, _bar: usize, off: u32, val: u32, width: usize) {
         self.bar.lock()[off as usize..off as usize + width].copy_from_slice(&val.to_le_bytes()[..width]);
+    }
+
+    fn req64_sampled(&self, asserted: bool) {
+        self.req64.lock().push(asserted);
     }
 
     fn connect_interrupt(&self, line: IrqLine) {
@@ -568,6 +575,23 @@ fn direct64_dma_keeps_a_stream_and_swaps_the_words_of_a_swap_clear_request() {
         assert!(narrow.dma().dma_write(direct64(0xa, bits | (1 << 55), 0x7000), &data).is_ok());
     }
     assert!(r.peer.dma.lock().iter().all(|p| p.widget == 0xa));
+}
+
+/// A function samples REQ64# when it is fitted and again as each reset of
+/// its head ends, high only in a slot the board wires for it, as the QEMU
+/// head's reset exit reports its req64-slots mask to the bus.
+#[test]
+fn each_function_samples_its_slots_req64_at_attach_and_after_reset() {
+    let r = rig();
+    let narrow = Card::new(0x7111);
+    let wide = Card::new(0x7112);
+    r.fit(0, 1, &narrow, Function::default());
+    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    assert_eq!(*narrow.req64.lock(), [false]);
+    assert_eq!(*wide.req64.lock(), [true]);
+    r.pic.power_on();
+    assert_eq!(*narrow.req64.lock(), [false, false]);
+    assert_eq!(*wide.req64.lock(), [true, true]);
 }
 
 #[test]

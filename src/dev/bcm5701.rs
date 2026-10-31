@@ -283,18 +283,6 @@ impl Bcm5701 {
         self.enter(self.now(), State::reset);
     }
 
-    /// The bridge reports whether it saw REQ64# at the end of reset; the chip
-    /// reflects it in PCISTATE.
-    pub fn req64_sampled(&self, asserted: bool) {
-        self.config.update(cfg::PCISTATE, |v| {
-            if asserted {
-                v & !pcistate::BUS_32BIT
-            } else {
-                v | pcistate::BUS_32BIT
-            }
-        });
-    }
-
     /// The backend's cable state; the PHY reports it as link.
     pub fn set_backend_link(&self, up: bool) {
         self.enter(self.now(), |st| st.phy.set_link_down(!up));
@@ -484,6 +472,18 @@ impl PciBusDevice for Bcm5701 {
                 st.reg_write(off, val);
             } else {
                 st.sram_write((st.mem_win_base & !(state::SRAM_SIZE - 1)) + (off - state::REG_FILE_SIZE), val);
+            }
+        });
+    }
+
+    /// The chip reflects in PCISTATE whether it saw REQ64# at the end of
+    /// reset.
+    fn req64_sampled(&self, asserted: bool) {
+        self.config.update(cfg::PCISTATE, |v| {
+            if asserted {
+                v & !pcistate::BUS_32BIT
+            } else {
+                v | pcistate::BUS_32BIT
             }
         });
     }
