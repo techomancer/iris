@@ -399,7 +399,13 @@ pub enum LogMode {
 /// (timestamps included). A file that cannot be opened is reported and the
 /// machine boots without a log. `tag` names the machine in the messages.
 pub fn open_log(cfg: &MachineConfig, tag: &str, mode: LogMode) -> Option<Arc<SerialLog>> {
-    let path = cfg.serial_log.as_deref()?;
+    open_log_at(cfg, cfg.serial_log.as_deref(), tag, mode)
+}
+
+/// As [`open_log`] for the transcript at `path` (a line's own log, when it
+/// is not the console's), with `cfg`'s timestamp setting.
+pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str, mode: LogMode) -> Option<Arc<SerialLog>> {
+    let path = path?;
     let p = Path::new(path);
     let opened = match mode {
         LogMode::Fresh => SerialLog::create(p, cfg.serial_log_timestamps),
@@ -417,6 +423,52 @@ pub fn open_log(cfg: &MachineConfig, tag: &str, mode: LogMode) -> Option<Arc<Ser
     }
 }
 
+/// Where one serial line is served on the host.
+pub struct SerialLine<'a> {
+    /// Names the line in messages, e.g. "Octane serial port 1".
+    pub label: &'a str,
+    /// The TCP port, or `None` for a line with no listener.
+    pub tcp_port: Option<u16>,
+    /// The setting that chose `tcp_port`, for the message when it is taken.
+    pub tcp_setting: &'a str,
+}
+
+/// Wire one serial line: TCP on `tcp_port`, teed to `log`. The line that
+/// carries the CI control socket's console (`ci`) is not served on TCP (so
+/// several `--ci` instances coexist). Returns the backend, and whether a
+/// host end could be made; without one the backend only logs.
+pub fn serial_line(
+    line: &SerialLine,
+    log: Option<Arc<SerialLog>>,
+    ci: Option<&Arc<CiSerialBackend>>,
+) -> (Arc<dyn SerialBackend>, bool) {
+    if let Some(ci) = ci {
+        if let Some(log) = log {
+            ci.set_log(log);
+        }
+        return (ci.clone(), true);
+    }
+    let mut backend = null_serial_backend();
+    let mut served = false;
+    if let Some(port) = line.tcp_port {
+        match tcp_serial_backend(port) {
+            Some((b, p)) => {
+                eprintln!("iris: {} on 127.0.0.1:{p}", line.label);
+                backend = b;
+                served = true;
+            }
+            None => eprintln!(
+                "iris: {}: port {port} unavailable; is another iris using it? ({})",
+                line.label, line.tcp_setting
+            ),
+        }
+    }
+    match log {
+        Some(log) => (Arc::new(TeeBackend::new(backend, log)), served),
+        None => (backend, served),
+    }
+}
+
 /// The host ends of a machine's two serial ports: `(console, second)`.
 ///
 /// The console is the CI backend in CI mode, otherwise TCP on
@@ -430,36 +482,19 @@ pub fn console_backends(
 ) -> (Arc<dyn SerialBackend>, Option<Arc<dyn SerialBackend>>) {
     let [port_a, port_b] = cfg.serial_ports();
     let log = open_log(cfg, tag, LogMode::Fresh);
-    let console: Arc<dyn SerialBackend> = if let Some(ci) = ci {
-        if let Some(log) = log {
-            ci.set_log(log);
-        }
-        ci.clone()
-    } else {
-        let mut backend = null_serial_backend();
-        match tcp_serial_backend(port_a) {
-            Some((b, p)) => {
-                eprintln!("iris: {tag} serial port 1 on 127.0.0.1:{p}");
-                backend = b;
-            }
-            None => eprintln!("iris: {tag} serial port 1: port {port_a} unavailable; is another iris using it? (serial_port_a)"),
-        }
-        match log {
-            Some(log) => Arc::new(TeeBackend::new(backend, log)),
-            None => backend,
-        }
-    };
-    let second = match tcp_serial_backend(port_b) {
-        Some((b, p)) => {
-            eprintln!("iris: {tag} serial port 2 on 127.0.0.1:{p}");
-            Some(b)
-        }
-        None => {
-            eprintln!("iris: {tag} serial port 2: port {port_b} unavailable; is another iris using it? (serial_port_b)");
-            None
-        }
-    };
-    (console, second)
+    let label = format!("{tag} serial port 1");
+    let (console, _) = serial_line(
+        &SerialLine { label: &label, tcp_port: Some(port_a), tcp_setting: "serial_port_a" },
+        log,
+        ci,
+    );
+    let label = format!("{tag} serial port 2");
+    let (second, served) = serial_line(
+        &SerialLine { label: &label, tcp_port: Some(port_b), tcp_setting: "serial_port_b" },
+        None,
+        None,
+    );
+    (console, served.then_some(second))
 }
 
 #[cfg(test)]
@@ -489,6 +524,38 @@ mod tests {
         let (console, _) = console_backends(&cfg, "Test", None);
         console.send_byte(b't');
         assert_eq!(std::fs::read(&log).unwrap(), b"t");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TCP line carries the guest's output to a client and into the log;
+    /// a line with no listener only logs.
+    #[test]
+    fn a_tcp_line_is_teed_to_its_log_and_a_line_without_ends_only_logs() {
+        let dir = std::env::temp_dir().join(format!("iris-serial-host-line-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("tcp.log");
+        let log = SerialLog::create(&log_path, Default::default()).unwrap();
+        let (backend, served) = serial_line(
+            &SerialLine { label: "Test", tcp_port: Some(0), tcp_setting: "port" },
+            Some(log),
+            None,
+        );
+        assert!(served);
+        backend.send_byte(b't');
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"t");
+
+        let log_path = dir.join("none.log");
+        let log = SerialLog::create(&log_path, Default::default()).unwrap();
+        let (backend, served) = serial_line(
+            &SerialLine { label: "Test", tcp_port: None, tcp_setting: "port" },
+            Some(log),
+            None,
+        );
+        assert!(!served);
+        backend.send_byte(b'n');
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"n");
+        assert!(backend.recv_byte().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
