@@ -700,8 +700,8 @@ fn a_modem_control_slot_leads_a_looped_back_run() {
         } else {
             (std::array::from_fn(|j| (i * 4 + j - 1) as u8), [TX_VALID; 4])
         };
-        for j in usize::from(i == 0)..4 {
-            expected[count / 4 * 8 + count % 4] = data[j];
+        for &byte in &data[usize::from(i == 0)..] {
+            expected[count / 4 * 8 + count % 4] = byte;
             expected[count / 4 * 8 + 4 + count % 4] = RX_LOOPBACK;
             count += 1;
         }
@@ -1446,4 +1446,207 @@ fn disabling_the_ring_stops_the_timer_and_keeps_the_arm() {
     assert_eq!(r.sr(0, sdma_off::RX_CONSUME) & ARM, ARM, "the arm stays");
     r.type_in(0, &[0x32]);
     assert!(r.c.sh.st.lock().sdma.rx_deadline(0).is_some(), "the next character starts it afresh");
+}
+
+// ---------------------------------------------------------------------------
+// The PS/2 keyboard and mouse controller
+// ---------------------------------------------------------------------------
+
+const KBC_CONTROL: u32 = reg::KBC;
+const KBC_KBD_RECEIVE: u32 = reg::KBC + 0x04;
+const KBC_AUX_RECEIVE: u32 = reg::KBC + 0x08;
+const KBC_KBD_TRANSMIT: u32 = reg::KBC + 0x0c;
+const KBC_AUX_TRANSMIT: u32 = reg::KBC + 0x10;
+const KBC_IRQ: u32 = 0x40;
+const KBC_WRITE_PENDING: u32 = 0x03;
+
+fn key(r: &Rig, code: winit::keyboard::KeyCode, down: bool) {
+    r.c.ps2().push_kb(code, down);
+}
+
+/// Ports test_ps2_adapter (QEMU with the read-only status
+/// bits): the five registers through the adapter, reply bytes in BE32
+/// presentation, write-pending never set, the keyboard source in the other
+/// word with its own enable and acknowledge, isolation from the serial
+/// words, a mouse report, and reset.
+#[test]
+fn the_ps2_adapter_presents_the_controller() {
+    use winit::keyboard::KeyCode::KeyA;
+    let r = Rig::new();
+    assert_eq!((r.r32(KBC_CONTROL), r.r32(KBC_KBD_RECEIVE), r.r32(KBC_AUX_RECEIVE)), (0, 0, 0));
+    r.w32(KBC_CONTROL, u32::MAX);
+    assert_eq!(r.r32(KBC_CONTROL), 0x00fc_3cc0, "the status bits read clear and drop the write");
+    r.w32(KBC_CONTROL, 0);
+    r.c.bar_read(0, KBC_CONTROL, 1);
+    r.c.bar_write(0, KBC_KBD_TRANSMIT, 0xff, 2);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0, "a narrow write reached nothing");
+
+    // 0xff000000 is a zero byte to the keyboard: it only acknowledges.
+    r.w32(KBC_KBD_TRANSMIT, 0xff00_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x80fa_0000);
+    r.w32(KBC_KBD_TRANSMIT, 0xff);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0xc0fa_aa00);
+    assert_eq!(r.r32(KBC_CONTROL) & KBC_WRITE_PENDING, 0);
+    // QEMU's keyboard scans again after the reset command; this core waits
+    // for the driver's enable, as the O2's and Octane's PROMs give it.
+    r.w32(KBC_KBD_TRANSMIT, 0xf4);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x80fa_0000);
+    r.w32(reg::OTHER_PENDING, KBC_IRQ);
+
+    key(&r, KeyA, true);
+    assert_eq!(r.r32(reg::OTHER_PENDING) & KBC_IRQ, KBC_IRQ);
+    assert!(!r.pin.level(), "pending but not enabled");
+    r.w32(reg::OTHER_ENABLE_SET, KBC_IRQ);
+    assert!(r.pin.level());
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x801c_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE) & 0x1f00_0000, 0);
+    assert_eq!(r.r32(reg::OTHER_PENDING) & KBC_IRQ, KBC_IRQ, "a drain does not acknowledge");
+
+    // A serial source holds the pin up when the keyboard's goes.
+    r.uw(0, 3, 0x80);
+    r.uw(0, 0, 0x34);
+    r.uw(0, 1, 0x12);
+    r.uw(0, 3, 0x03);
+    r.uw(0, 2, 0x01);
+    r.uw(0, 1, 0x02);
+    r.w32(reg::SERIAL_ENABLE_SET, int::pass(0));
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & int::pass(0), int::pass(0));
+    assert!(r.pin.level());
+    r.w32(reg::OTHER_ENABLE_CLR, KBC_IRQ);
+    assert!(r.pin.level());
+    r.w32(reg::OTHER_ENABLE_SET, KBC_IRQ);
+    r.w32(reg::OTHER_PENDING, KBC_IRQ);
+    assert_eq!(r.r32(reg::OTHER_PENDING) & KBC_IRQ, 0);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & int::pass(0), int::pass(0), "the serial source is another word");
+    assert!(r.pin.level());
+    r.uw(0, 1, 0);
+    assert!(!r.pin.level());
+
+    r.w32(KBC_AUX_TRANSMIT, 0xff);
+    assert_eq!(r.r32(KBC_AUX_RECEIVE), 0xe0fa_aa00);
+    assert_eq!(r.r32(KBC_CONTROL) & KBC_WRITE_PENDING, 0);
+    r.w32(reg::OTHER_PENDING, KBC_IRQ);
+    r.w32(KBC_AUX_TRANSMIT, 0xf4);
+    assert_eq!(r.r32(KBC_AUX_RECEIVE), 0x80fa_0000);
+    r.w32(reg::OTHER_PENDING, KBC_IRQ);
+    r.c.ps2().push_mouse_input(1, 4, 0, 0);
+    assert_eq!(r.r32(KBC_AUX_RECEIVE), 0xe009_0400);
+
+    r.c.reset();
+    assert_eq!((r.r32(KBC_CONTROL), r.r32(KBC_KBD_RECEIVE), r.r32(KBC_AUX_RECEIVE)), (0, 0, 0));
+    assert_eq!((r.r32(reg::OTHER_PENDING) & KBC_IRQ, r.r32(reg::OTHER_ENABLE_SET) & KBC_IRQ), (0, 0));
+    r.w32(KBC_KBD_TRANSMIT, 0xff);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0xc0fa_aa00);
+}
+
+/// Ports test_ps2_ports_present: every IOC4 has both ports; there is no
+/// switch to leave them unplugged.
+#[test]
+fn both_ps2_ports_are_always_fitted() {
+    let r = Rig::with(Ioc4Config::bare(Ioc4Clock::Mhz33));
+    r.w32(KBC_KBD_TRANSMIT, 0xff);
+    r.w32(KBC_AUX_TRANSMIT, 0xff);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0xc0fa_aa00);
+    assert_eq!(r.r32(KBC_AUX_RECEIVE), 0xe0fa_aa00);
+}
+
+/// Ports test_ps2_driver_sequence, the attach and interrupt sequence of
+/// OpenBSD's public IOC4 keyboard driver: read-modify-write the control
+/// register to clamp after one character, transmit after the write-pending
+/// poll, then on each interrupt mask the source, read each receive register
+/// until no valid flag is left, acknowledge and unmask. Also the
+/// clamp-after-three delivery, and an unclamped port losing a fourth
+/// character without showing the IOC3-only overflow flag.
+#[test]
+fn the_ps2_driver_sequence() {
+    use winit::keyboard::KeyCode::{KeyA, KeyB, KeyC, KeyD};
+    let r = Rig::new();
+    let mut csr = r.r32(KBC_CONTROL);
+    csr &= !0x00c0_0ccc;
+    csr |= 0x0030_0000;
+    r.w32(KBC_CONTROL, csr);
+    assert_eq!(r.r32(KBC_CONTROL), 0x0030_0000);
+    // Status bits are not storage: a write to them is dropped and logged.
+    r.w32(KBC_CONTROL, 0x0030_0000 | 0xc33f);
+    assert_eq!(r.r32(KBC_CONTROL), 0x0030_0000);
+    r.w32(KBC_CONTROL, 0x0030_0000 | 0x3cc0);
+    assert_eq!(r.r32(KBC_CONTROL), 0x0030_3cc0, "the writable bits among them stick");
+    r.w32(KBC_CONTROL, 0x0030_0000);
+    r.w32(reg::OTHER_ENABLE_SET, KBC_IRQ);
+
+    // A reset reply is two characters, so the clamp holds the second back.
+    assert_eq!(r.r32(KBC_CONTROL) & KBC_WRITE_PENDING, 0);
+    r.w32(KBC_KBD_TRANSMIT, 0xff);
+    assert!(r.pin.level());
+    assert_eq!(r.r32(reg::OTHER_PENDING) & KBC_IRQ, KBC_IRQ);
+    r.w32(reg::OTHER_ENABLE_CLR, KBC_IRQ);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x80fa_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x80aa_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0);
+    assert_eq!(r.r32(KBC_AUX_RECEIVE), 0);
+    // As in the adapter test: this keyboard model needs the driver's enable.
+    r.w32(KBC_KBD_TRANSMIT, 0xf4);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x80fa_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0);
+    r.w32(reg::OTHER_PENDING, KBC_IRQ);
+    r.w32(reg::OTHER_ENABLE_SET, KBC_IRQ);
+    assert!(!r.pin.level());
+
+    // Press and release: three characters, one per read under the clamp.
+    key(&r, KeyA, true);
+    key(&r, KeyA, false);
+    assert!(r.pin.level());
+    r.w32(reg::OTHER_ENABLE_CLR, KBC_IRQ);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x801c_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x80f0_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0x801c_0000);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0);
+    r.w32(reg::OTHER_PENDING, KBC_IRQ);
+    r.w32(reg::OTHER_ENABLE_SET, KBC_IRQ);
+    assert!(!r.pin.level());
+
+    // Clamp after three: the same press and release arrive in one read.
+    r.w32(KBC_CONTROL, 0x0040_0000);
+    key(&r, KeyA, true);
+    key(&r, KeyA, false);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0xe01c_f01c);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0);
+
+    // No clamp: a fourth character is lost and the flag is not reported.
+    r.w32(KBC_CONTROL, 0);
+    for k in [KeyA, KeyB, KeyC, KeyD] {
+        key(&r, k, true);
+    }
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0xe01c_3221);
+    assert_eq!(r.r32(KBC_KBD_RECEIVE), 0);
+}
+
+/// Ports the width rule of test_ps2_adapter: the keyboard block takes
+/// aligned 32-bit accesses only, and a refused one reaches no register.
+#[test]
+fn the_ps2_block_takes_aligned_words_only() {
+    let r = Rig::new();
+    r.w32(KBC_CONTROL, 0x0030_0000);
+    assert_eq!(r.c.bar_read(0, KBC_CONTROL, 1), 0);
+    assert_eq!(r.c.bar_read(0, KBC_CONTROL, 2), 0);
+    r.c.bar_write(0, KBC_CONTROL, 0, 2);
+    r.c.bar_write(0, KBC_CONTROL + 1, 0, 1);
+    assert_eq!(r.r32(KBC_CONTROL), 0x0030_0000);
+    assert_eq!(r.c.bar_read(0, KBC_CONTROL + 2, 4), 0, "unaligned");
+    // Beyond the five registers is not the controller.
+    assert_eq!(r.r32(reg::KBC + 0x14), 0);
+}
+
+/// A key pressed on the host reaches the pin with no guest access, from the
+/// host's thread, as the IOC3's does.
+#[test]
+fn a_host_key_raises_the_pin_without_a_guest_access() {
+    let r = Rig::new();
+    r.w32(reg::OTHER_ENABLE_SET, KBC_IRQ);
+    r.w32(KBC_KBD_TRANSMIT, 0xf4);
+    let _ = r.r32(KBC_KBD_RECEIVE);
+    r.w32(reg::OTHER_PENDING, KBC_IRQ);
+    assert!(!r.pin.level());
+    key(&r, winit::keyboard::KeyCode::KeyA, true);
+    assert!(r.pin.level());
 }

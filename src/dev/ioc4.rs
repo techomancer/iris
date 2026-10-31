@@ -5,9 +5,10 @@
 //! them, the registers that capture a failed ring transfer, the UART clock
 //! select, the ATA channel's DMA readback word the PROM's diagnostic probes,
 //! and the timekeeping SRAM on byte-bus select 0 when the board fits one
-//! ([`Ds1744`]). The ATA channel, the keyboard and mouse controller, the GPIO
-//! pins and the other byte-bus selects are not modelled; an access to them
-//! reads zero or is dropped, and is logged.
+//! ([`Ds1744`]), and the PS/2 keyboard and mouse controller the IO9 always
+//! carries ([`Ioc3Kbc`], the block the IOC3 has too). The ATA channel, the
+//! GPIO pins and the other byte-bus selects are not modelled; an access to
+//! them reads zero or is dropped, and is logged.
 //!
 //! Behaviour follows the public Linux and OpenBSD drivers; where the model
 //! approximates, the comment says so.
@@ -25,9 +26,9 @@
 //! IOC4 orders its own bytes. The bridge hands it the register's address and
 //! value as software wrote them, so a byte access to UART register `r` of
 //! port `n` arrives at `0x380 + 8n + r`, and a 32-bit access is the register
-//! value, with no lane swap on either side. Control registers take 32-bit
-//! accesses only; a UART window or the clock takes bytes only. Anything else is refused
-//! (reads zero, writes dropped). Which widths the silicon accepts is not
+//! value, with no lane swap on either side. Control registers and the
+//! keyboard block take 32-bit accesses only; a UART window or the clock takes
+//! bytes only. Anything else is refused (reads zero, writes dropped). Which widths the silicon accepts is not
 //! known.
 //!
 //! # What is approximated here
@@ -41,6 +42,14 @@
 //! * Register 0x20 reads the DMA-idle bit unless a transfer is under way.
 //!   Transfers complete inside the access that starts them, so software
 //!   always finds the engine idle.
+//! * The keyboard block's status bits (write-pending, line control, line
+//!   levels and idle flags, mask `0xc33f`) read clear and drop writes, as the
+//!   QEMU adapter does. Its port order, write-pending timing, and whether
+//!   the interrupt is a pulse per character or a level are not established,
+//!   and the model follows QEMU: a latch per arriving character, which an
+//!   acknowledge racing an arrival can lose. The IOC3-only receive flags are
+//!   masked out of the receive registers. The ports are always fitted, as the
+//!   IO9's are in QEMU.
 //! * The ATA readback word at 0x148 is a plain 32-bit latch with no ATA
 //!   behind it. Only boards that ask for it have it.
 //! * The PCI status register reads 0x0220 (66 MHz capable, medium DEVSEL) on
@@ -60,6 +69,8 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::dev::ds1744::Ds1744;
+use crate::dev::ioc3_kbc::{self, Ioc3Kbc, KbcLine, KbcOwner};
+use crate::dev::ps2::Ps2Controller;
 use crate::dev::ioc_serial_dma::{off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
@@ -105,6 +116,8 @@ pub mod reg {
     /// the clock (at 0x87ff8).
     pub const CLOCK: u32 = 0x80000;
     pub const CLOCK_SIZE: u32 = crate::dev::ds1744::SIZE as u32;
+    /// The PS/2 controller's five registers.
+    pub const KBC: u32 = 0x200;
 }
 
 /// Bits of the serial status word, eight to a port.
@@ -131,6 +144,18 @@ mod err {
     /// The low six address bits are not captured.
     pub const ADDRESS_MASK: u64 = 0xffff_ffc0;
 }
+
+/// Other word bit 6: a keyboard or mouse character arrived.
+const OTHER_KEYBOARD: u32 = 0x40;
+/// Keyboard control bits that report state on the controller: write-pending
+/// (0, 1), the last write's line-control bit (2, 3), the data and clock line
+/// levels (4, 5, 8, 9) and the state machines' idle flags (14, 15). The model
+/// does not simulate the lines, so they all read clear and a write to them is
+/// dropped.
+const KBC_STATUS: u32 = 0x0000_c33f;
+/// The receive registers carry no IOC3-only flags: bits 24 to 28 (per-slot
+/// errors, source and overflow) read clear.
+const KBC_RX_MASK: u32 = 0xe0ff_ffff;
 
 /// Register 0x20: the DMA engines are idle.
 const SERIAL_CONTROL_IDLE: u32 = 0x80;
@@ -209,6 +234,10 @@ fn uart_decode(a: u32) -> Option<(usize, u32)> {
     (reg::UART..end).contains(&a).then(|| (((a - reg::UART) / reg::UART_STRIDE) as usize, (a - reg::UART) % reg::UART_STRIDE))
 }
 
+fn in_kbc(a: u32) -> bool {
+    (reg::KBC..reg::KBC + ioc3_kbc::reg::MMIO_SIZE).contains(&a)
+}
+
 fn in_clock(a: u32) -> bool {
     (reg::CLOCK..reg::CLOCK + reg::CLOCK_SIZE).contains(&a)
 }
@@ -226,11 +255,13 @@ struct St {
     ata_readback: u32,
     uart: [Ns16550; PORTS],
     sdma: SerialDma,
+    kbc: Ioc3Kbc,
+    ps2: Arc<Ps2Controller>,
     dma: Option<Arc<dyn PciDma>>,
 }
 
 impl St {
-    fn new(cfg: Ioc4Config) -> St {
+    fn new(cfg: Ioc4Config, ps2: Arc<Ps2Controller>) -> St {
         St {
             cfg,
             serial_pending: 0,
@@ -243,6 +274,9 @@ impl St {
             ata_readback: 0,
             uart: std::array::from_fn(|_| Ns16550::new(cfg.clock.hz() / 16)),
             sdma: SerialDma::new(PORTS, IOC4_SDMA_PARAMS),
+            // Every IO9 brings the keyboard and mouse out.
+            kbc: Ioc3Kbc::new(true),
+            ps2,
             dma: None,
         }
     }
@@ -261,6 +295,45 @@ impl St {
             u.reset();
         }
         self.sdma.reset();
+        self.kbc.reset();
+        self.ps2.power_on();
+    }
+
+    /// Move what the host's PS/2 model has sent into the holdings, and latch
+    /// the keyboard source if a character arrived.
+    fn kbc_fill(&mut self) {
+        let ps2 = self.ps2.clone();
+        if self.kbc.fill_all(&ps2) {
+            self.other_pending |= OTHER_KEYBOARD;
+        }
+    }
+
+    /// A 32-bit read of the keyboard block at `off` in its window, as the
+    /// adapter presents it: no write-pending or other status, and none of
+    /// the IOC3-only receive flags.
+    fn kbc_read(&mut self, off: u32) -> u32 {
+        let ps2 = self.ps2.clone();
+        let (raw, arrived) = self.kbc.read(off, &ps2);
+        if arrived {
+            self.other_pending |= OTHER_KEYBOARD;
+        }
+        if off == ioc3_kbc::reg::CONTROL { raw & !KBC_STATUS } else { raw & KBC_RX_MASK }
+    }
+
+    fn kbc_write(&mut self, off: u32, val: u32) {
+        let mut val = val;
+        if off == ioc3_kbc::reg::CONTROL {
+            // The status bits read clear; a write that differs is a guest
+            // error and is dropped.
+            if val & KBC_STATUS != 0 {
+                crate::dlog!(crate::devlog::LogModule::Ioc, "IOC4 write to read-only KBC status bits {:#x} ignored", val & KBC_STATUS);
+            }
+            val &= !KBC_STATUS;
+        }
+        let ps2 = self.ps2.clone();
+        if self.kbc.write(off, val, &ps2) {
+            self.other_pending |= OTHER_KEYBOARD;
+        }
     }
 
     /// The PCI interrupt pin: any enabled source.
@@ -492,17 +565,50 @@ struct Shared {
     line_order: Mutex<()>,
     me: Weak<Shared>,
     timers: DeadlineTimers<KINDS>,
+    /// A PS/2 character arrived while an access held the chip.
+    kbc_dirty: AtomicBool,
     /// Between `start` and `stop`.
     running: AtomicBool,
     /// Held by a timer callback while it runs, so `stop` can wait one out.
     gate: Mutex<()>,
 }
 
+impl KbcOwner for Shared {
+    /// A device raised its line. If an access holds the chip (possibly this
+    /// very thread, from inside a transmit), that access picks the character
+    /// up when it finishes: the flag is set before the lock is tried, so
+    /// either this thread gets the lock or the holder sees the flag.
+    fn kbc_poke(&self) {
+        self.kbc_dirty.store(true, Ordering::SeqCst);
+        if let Some(mut st) = self.st.try_lock() {
+            if self.kbc_dirty.swap(false, Ordering::SeqCst) {
+                st.kbc_fill();
+            }
+            drop(st);
+            self.sync_line();
+        }
+    }
+}
+
 impl Shared {
-    /// Put the interrupt line at the level the chip's state gives. The level
-    /// is read after taking `line_order`, so whichever thread drives last has
-    /// seen the latest state. `st` is never held when this is called.
+    /// Put the interrupt line at the level the chip's state gives, then pick
+    /// up any PS/2 character that arrived while the chip was held (a poke
+    /// sets the flag before it tries the lock, so whoever holds the lock sees
+    /// it here, after releasing).
     fn sync_line(&self) {
+        loop {
+            self.drive_line();
+            if !self.kbc_dirty.swap(false, Ordering::SeqCst) {
+                break;
+            }
+            self.st.lock().kbc_fill();
+        }
+    }
+
+    /// The level is read after taking `line_order`, so whichever thread
+    /// drives last has seen the latest state. `st` is never held when this
+    /// is called.
+    fn drive_line(&self) {
         let _order = self.line_order.lock();
         let level = self.st.lock().line_level();
         if self.line_level.swap(level, Ordering::SeqCst) != level {
@@ -590,6 +696,11 @@ pub struct Ioc4 {
 impl Ioc4 {
     pub fn new(cfg: Ioc4Config) -> Ioc4 {
         let sh = Arc::new_cyclic(|weak: &Weak<Shared>| {
+            let line = IrqLine::new(Arc::new(KbcLine(weak.clone())), 0);
+            let ps2 = Arc::new(Ps2Controller::new(Some(line)));
+            // Host key and mouse events are accepted from the start (this
+            // only sets a flag); `stop` and `start` follow the chip's.
+            Device::start(&*ps2);
             let bars = [Bar::Mem(BAR_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
             let policy = PciConfigPolicy {
                 status: if cfg.pci_status_compat { PCI_STATUS_COMPAT } else { 0 },
@@ -599,10 +710,11 @@ impl Ioc4 {
             };
             Shared {
                 pci: PciConfig::new_with_policy(VENDOR_ID, DEVICE_ID, PCI_CLASS, REVISION, bars, PCI_INTA, policy),
-                st: Mutex::new(St::new(cfg)),
+                st: Mutex::new(St::new(cfg, ps2)),
                 line: Mutex::new(None),
                 line_level: AtomicBool::new(false),
                 line_order: Mutex::new(()),
+                kbc_dirty: AtomicBool::new(false),
                 me: weak.clone(),
                 timers: DeadlineTimers::new(),
                 running: AtomicBool::new(false),
@@ -628,6 +740,12 @@ impl Ioc4 {
     /// listener, a log tee, or nothing.
     pub fn set_serial_backend(&self, port: usize, backend: Arc<dyn SerialBackend>) {
         self.sh.st.lock().uart[port].set_backend(backend);
+    }
+
+    /// The PS/2 keyboard and mouse model, for the host side to push keys and
+    /// pointer motion into.
+    pub fn ps2(&self) -> Arc<Ps2Controller> {
+        self.sh.st.lock().ps2.clone()
     }
 
     /// A PCI reset of the chip.
@@ -671,6 +789,7 @@ impl Device for Ioc4 {
         if self.sh.running.swap(true, Ordering::SeqCst) {
             return;
         }
+        Device::start(&*self.sh.st.lock().ps2);
         let mut threads = self.threads.lock();
         for p in 0..PORTS {
             let me = self.sh.me.clone();
@@ -701,6 +820,8 @@ impl Device for Ioc4 {
         for t in threads.drain(..) {
             let _ = t.join();
         }
+        drop(threads);
+        Device::stop(&*self.sh.st.lock().ps2);
     }
 
     fn is_running(&self) -> bool {
@@ -747,6 +868,13 @@ impl PciBusDevice for Ioc4 {
             }
             return u32::from(clock.read8(u64::from(off - reg::CLOCK)).data);
         }
+        if in_kbc(off) {
+            if width != 4 || off & 3 != 0 {
+                Ioc4::refuse("KBC read", width, off);
+                return 0;
+            }
+            return self.sh.with_st(|st| st.kbc_read(off - reg::KBC));
+        }
         if width != 4 || off & 3 != 0 {
             Ioc4::refuse("read", width, off);
             return 0;
@@ -772,6 +900,14 @@ impl PciBusDevice for Ioc4 {
                 return;
             }
             clock.write8(u64::from(off - reg::CLOCK), val as u8);
+            return;
+        }
+        if in_kbc(off) {
+            if width != 4 || off & 3 != 0 {
+                Ioc4::refuse("KBC write", width, off);
+                return;
+            }
+            self.sh.with_st(|st| st.kbc_write(off - reg::KBC, val));
             return;
         }
         if width != 4 || off & 3 != 0 {
