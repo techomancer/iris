@@ -190,7 +190,7 @@ impl TezroMachine {
             station_mac: cfg.network().mac,
             timekeeper: clock,
             memory: &memory,
-            cpus: usize::from(cfg.tezro.cpus),
+            cpus: usize::from(cfg.machine.cpus()),
             part,
         })?);
         let timers = Arc::new(TimerManager::new());
@@ -258,7 +258,7 @@ impl TezroMachine {
         }
         eprintln!(
             "iris: Tezro IP53, {} R16000 {} MHz fitted, CPU 0 running, {} MiB, serial console {:?}",
-            cfg.tezro.cpus,
+            cfg.machine.cpus(),
             part.mhz(),
             memory.total_mib(),
             cfg.tezro.console

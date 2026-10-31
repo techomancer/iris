@@ -27,7 +27,7 @@ still sets the count rate. The secondary cache clock and the cache tap
 (0xc for the 700 MHz part, 0xa for the 800 MHz one) are not modelled; the tap
 appears only as part of the flash record's mode word.
 
-`[tezro] cpus` is the number of processors fitted: 1, 2 or 4, with 4 the
+`[machine] cpus` is the number of processors fitted: 1, 2 or 4, with 4 the
 default, as in the Tezros whose inventories have been seen. The count selects
 the interface board. The one-processor board has one PIC at XIO widget 15
 carrying the IO9. The two- and four-processor board adds a second PIC at

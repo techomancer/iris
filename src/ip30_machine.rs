@@ -190,7 +190,7 @@ impl OctaneMachine {
         if prom.len() > FLASH_SIZE {
             return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
         }
-        let cpu_count = cfg.machine.cpus;
+        let cpu_count = cfg.machine.cpus();
         MachineProfile::OctaneIp30.accepts_cpus(cpu_count)?;
         let banks = heart_banks(cfg);
         let kind = cfg.graphics_board();
