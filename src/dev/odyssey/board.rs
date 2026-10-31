@@ -378,6 +378,9 @@ pub struct Board {
     /// The colour buffer's base: the first operand of the last colour 0x1017
     /// block (0x2000 for the screen).
     pub dma_colour_base: u32,
+    /// The first colour buffer the X server selected: the screen's. A pixel
+    /// buffer's select can look the same, and moves dma_colour_base.
+    pub screen_base: u32,
 
     // The screen-to-screen copy command's fixed literal template's three runtime slots.
     pub copy_src: u32,
@@ -669,6 +672,7 @@ impl Default for Board {
             dest_buffer_word: 0,
             plane_write_mask: 0,
             dma_colour_base: 0,
+            screen_base: 0,
             copy_src: 0,
             copy_size: 0,
             copy_dst: 0,
@@ -896,6 +900,7 @@ impl Board {
         self.dest_buffer_word = 0;
         self.plane_write_mask = 0;
         self.dma_colour_base = 0;
+        self.screen_base = 0;
         self.dest_base = 0;
         self.obj_count = 0;
         self.obj_used = 0;

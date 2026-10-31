@@ -2,7 +2,7 @@
 //! copy block, against the headers the datasheet's "Pixel transfer
 //! headers from the OpenGL library" section records.
 
-use super::dma::{PAGE_A, TABLE, descriptor, pte, put_table};
+use super::dma::{PAGE_A, TABLE, colour_destination, descriptor, pte, put_table};
 use super::*;
 
 /// A board with guest RAM whose one clip rectangle covers the screen, so
@@ -431,4 +431,167 @@ fn a_write_code_without_a_pixel_form_is_refused() {
     assert_eq!(write_form(0x0eb).map(|f| f.bytes), Some(2));
     assert_eq!(write_form(0x16c).map(|f| f.bytes), Some(4));
     assert_eq!(write_form(0x06b).map(|f| f.bytes), Some(8));
+}
+
+/// One pixel copy, block 0x2031 with its eight operands.
+fn copy_block(s: &mut Board, ops: [u32; 8]) {
+    cmd(s, ODSY_CMD_COPY_RECT_TRIGGER);
+    for w in ops {
+        cmd(s, w);
+    }
+}
+
+/// The operands as the library sends a glCopyPixels, taken from a run.
+///
+/// Datasheet: "Copy words" (established).
+#[test]
+fn the_copy_operands_decode_into_source_size_destination_and_headers() {
+    let c = CopyOperands::decode(&[0x3000_0019, 0x00bb_003c, 0x0050_2050, 0x0009_0015, 0x1263_3042, 0x3000_0010, 0x00a2_0064, 0x3863_204b]);
+
+    assert_eq!(c.src_base, ODSY_DMA_SENTINEL_READ);
+    assert_eq!(c.src, (0x3c, 0xbb));
+    assert_eq!(c.size, (0x15, 9));
+    assert_eq!(c.dest_base, ODSY_DMA_SENTINEL_DRAW);
+    assert_eq!(c.dest, (0x64, 0xa2));
+    assert_eq!((c.dest_front, c.dest_drawable, c.dest_field, c.src_drawable), (false, 0x050, 2, 0x050));
+    assert!(!c.read_front());
+    assert_eq!(c.overlap(), (false, false));
+    assert_eq!(c.write_header, 0x3863_204b);
+
+    // The overlap bits are the write header's top two.
+    let c = CopyOperands::decode(&[0, 0, 0x8000_0000, 0, 0x9263_3042, 0, 0, 0xf802_204b]);
+    assert!(c.dest_front && c.read_front());
+    assert_eq!(c.overlap(), (true, true));
+}
+
+/// A glCopyPixels from the read drawable to the draw drawable, front to
+/// back by the draw mask, lands the rectangle at the destination, and a copy
+/// onto itself, shifted, reads its source as it was before the copy.
+///
+/// Datasheet: "Copy words". The model stages the source, so the overlap
+/// bits (inferred) need no direction of their own.
+#[test]
+fn a_gl_copy_between_the_drawables_moves_the_rectangle() {
+    let (mut s, _) = window();
+    for (i, w) in [0x1100_00ffu32, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff].into_iter().enumerate() {
+        pixel_write(&mut s, 30 + i as i32, 40, w);
+    }
+    // Front read (bit 31 of word 4), drawing mask: buffer 1.
+    s.draw_mask = 4;
+    copy_block(&mut s, [0x3000_0019, 40 << 16 | 30, 0x0050_2050, 1 << 16 | 4, 0x9263_3042, 0x3000_0010, 70 << 16 | 60, 0x3863_204b]);
+    for (i, w) in [0x1100_00ffu32, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff].into_iter().enumerate() {
+        assert_eq!(pixel(&s, 1, 60 + i as i32, 70), w);
+    }
+    assert_eq!(pixel(&s, 0, 60, 70), 0, "buffer 0 is not drawn");
+
+    s.draw_mask = 1;
+    copy_block(&mut s, [0x3000_0019, 40 << 16 | 30, 0x0050_2050, 1 << 16 | 4, 0x9263_3042, 0x3000_0010, 40 << 16 | 32, 0xf863_204b]);
+    let got: Vec<u32> = (30..36).map(|x| pixel(&s, 0, x, 40)).collect();
+    assert_eq!(got, [0x1100_00ff, 0x2200_00ff, 0x1100_00ff, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff]);
+}
+
+/// An object copies to the draw drawable and back: the scratch-object path
+/// the library takes for the signed types, and for readback conversions.
+#[test]
+fn a_gl_copy_moves_pixels_between_an_object_and_the_drawables() {
+    let (mut s, _) = window();
+    let base = 0x16a800;
+    let obj = s.object_select(base, 16);
+    assert!(obj >= 0);
+    for x in 0..3 {
+        s.object_store(obj, x, 0, 0x8000_0000 | x << 8 | 0xff);
+    }
+    s.draw_mask = 1;
+    copy_block(&mut s, [base, 0, 0x0050_2020, 1 << 16 | 3, 0x8002_500b, 0x3000_0010, 20 << 16 | 50, 0x3863_204b]);
+    for x in 0..3 {
+        assert_eq!(pixel(&s, 0, 50 + x, 20), 0x8000_0000 | (x as u32) << 8 | 0xff);
+    }
+
+    // And from the window into the object, at an offset within it.
+    pixel_write(&mut s, 70, 21, 0x0a0b_0c0d);
+    copy_block(&mut s, [0x3000_0019, 21 << 16 | 70, 0x8020_0050, 1 << 16 | 1, 0x9263_3042, base, 1 << 16 | 5, 0x3802_204b]);
+    assert_eq!(s.object_load(obj, 5, 1), 0x0a0b_0c0d);
+}
+
+/// The read buffer register (0x609) names the drawable a read comes from.
+fn bind_read_drawable(s: &mut Board, word: u32) {
+    cmd(s, select(ODSY_SWAP_SYNC_B));
+    cmd(s, word);
+}
+
+/// A window's logical front is the buffer its id displays. A pixel buffer
+/// has no id on screen, so its front is the buffer a front draw mask writes:
+/// bit 31 of the read buffer register (0x609) set means the drawable's swap
+/// state is zero and the mask is unexchanged, so front is buffer 0; clear
+/// means front and back are exchanged, so front is buffer 1. The read
+/// drawable is the off-screen object when 0x609 names one and not the
+/// screen's colour buffer. A DMA read and a copy follow the same rule.
+///
+/// Datasheet: "Front and back of a pixel buffer" (ESTABLISHED: the kernel
+/// alone writes bit 31 of 0x609, from the drawable's swap halfword, and a
+/// pixel buffer's pane swaps like a window's; INFERRED: a read's front is
+/// the buffer a front draw mask writes).
+#[test]
+fn a_pixel_buffers_front_is_the_buffer_a_front_draw_mask_writes() {
+    let (mut s, ram) = read_window();
+    colour_destination(&mut s);
+    let p = s.buffer1_mem.plane(s.buffer1_plane).expect("the second colour plane");
+    s.buffer1_mem.plane_store(&p, 30, 40, 0x0102_0304);
+    let front = read_word4(2, 8);
+    let back = front & !ODSY_DMA_FMT_FRONT;
+    let in_buffer_0 = READ_PIXEL.to_be_bytes();
+    let in_buffer_1 = 0x0102_0304u32.to_be_bytes();
+
+    // The window's id displays buffer 1: its front is buffer 1.
+    s.front.lock().displayed_buffer = 1;
+    bind_read_drawable(&mut s, 0x8000_2000);
+    assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), front, 4)[..4], in_buffer_1, "window front: displayed");
+    assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), back, 4)[..4], in_buffer_0, "window back");
+
+    // A pixel buffer, whichever buffer the ids under it display.
+    for displayed in [0, 1] {
+        s.front.lock().displayed_buffer = displayed;
+
+        bind_read_drawable(&mut s, 0x8016_a800);
+        assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), front, 4)[..4], in_buffer_0, "unswapped front: buffer 0");
+        assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), back, 4)[..4], in_buffer_1, "unswapped back: buffer 1");
+
+        bind_read_drawable(&mut s, 0x0016_a800);
+        assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), front, 4)[..4], in_buffer_1, "swapped front: buffer 1");
+        assert_eq!(dma_read(&mut s, &ram, (30, 40, 1), back, 4)[..4], in_buffer_0, "swapped back: buffer 0");
+    }
+
+    // The copy into a scratch object takes the same buffer.
+    let base = 0x16b000;
+    let obj = s.object_select(base, 16);
+    copy_block(&mut s, [0x3000_0019, 40 << 16 | 30, 0x8020_0050, 1 << 16 | 1, front, base, 0, 0x3802_204b]);
+    assert_eq!(s.object_load(obj, 0, 0), 0x0102_0304, "swapped front");
+}
+
+/// The display lines still waiting to be resolved again.
+fn dirty_lines(s: &Board) -> Vec<usize> {
+    s.scanout.dirty.iter().enumerate().filter(|(_, d)| **d).map(|(y, _)| y).collect()
+}
+
+/// A GL image write, by burst or by DMA, and a pixel copy write colour
+/// planes from the front end and not as a raster job, so nothing else
+/// records their rows: each marks the display lines it wrote, those and no
+/// others, or the display would not show the pixels (or would resolve the
+/// whole frame for one).
+#[test]
+fn a_gl_pixel_write_marks_the_display_lines_it_wrote() {
+    let (mut s, ram) = window();
+    s.scanout_update();
+    assert_eq!(dirty_lines(&s), Vec::<usize>::new(), "a settled display has nothing to resolve");
+
+    burst_image(&mut s, (40, 10, 42, 12), 0x0001_104b, ODSY_IMAGE_FMT_RGB, &[0x1100_00ff, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff]);
+    assert_eq!(dirty_lines(&s), [10, 11], "a burst image");
+    s.scanout_update();
+
+    dma_write(&mut s, &ram, (50, 20, 2), 0x1000, 0x04b, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(dirty_lines(&s), [20], "a DMA image");
+    s.scanout_update();
+
+    copy_block(&mut s, [0x3000_0019, 10 << 16 | 40, 0x0050_2050, 2 << 16 | 2, 0x9263_3042, 0x3000_0010, 30 << 16 | 60, 0x3863_204b]);
+    assert_eq!(dirty_lines(&s), [30, 31], "a pixel copy");
 }

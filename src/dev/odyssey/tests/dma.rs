@@ -56,7 +56,7 @@ fn object_word(s: &mut Board, i: u32) -> u32 {
 }
 
 /// The colour destination select the X server sends, naming buffer 0x2000.
-fn colour_destination(s: &mut Board) {
+pub(super) fn colour_destination(s: &mut Board) {
     for w in [select(ODSY_REG_DEST_SELECT), 0x2000, 0x50, 0x2000_6950, 0] {
         s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
     }

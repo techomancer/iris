@@ -363,46 +363,130 @@ impl Board {
         u32::from_be_bytes(self.obj_mem.bytes[((self.obj_offset[iu] as u64 + y as u64 * self.obj_width[iu] as u64 + x as u64) * 4) as usize..][..4].try_into().unwrap())
     }
 
-    /// Copy a recognised GL read-drawable rectangle into its scratch object.
-    pub fn copy_rect_to_object(&mut self) -> bool {
-        let w = self.copy_size & 0xffff;
-        let h = self.copy_size >> 16;
-        let dx = self.copy_dst & 0xffff;
-        let dy = self.copy_dst >> 16;
-        let sx = (self.copy_src & 0xffff) as i64 + self.read_origin[0] as i64;
-        let sy = (self.copy_src >> 16) as i64 + self.read_origin[1] as i64;
-        let fmt = self.cmd_operand[4];
-        let tail = self.cmd_operand[7];
-        let rgba8 = fmt == 0x92233002 && tail == 0x3801210b;
-        let rgba16 = (fmt & !ODSY_DMA_FMT_FRONT) == 0x12633042 && (tail == 0x3802204b || tail == 0xf802204b);
-        let obj = self.object_find(self.cmd_operand[5]);
+    /// A GL pixel copy (block 0x2031), decoded as the datasheet's "Copy
+    /// words" gives its eight operands: from the read drawable or an object,
+    /// to the draw drawable or an object. Any other block is the X server's
+    /// rectangle copy (Board::copy_rect()). False when an operand names an
+    /// object that is not there or does not fit, so the block is reported.
+    ///
+    /// The source is staged first, so an overlapping copy needs no direction.
+    /// Words move as the planes hold them: a colour pixel keeps its alpha and
+    /// an index copies as the raw index. The read header's class, code and
+    /// fields and the write header's format and overlap bits say how the board
+    /// converts and in which order it walks; the model's planes need neither.
+    /// A window source takes the buffer the header's front bit names (see
+    /// dma_read_pixel()), and a window destination the buffers the drawing
+    /// mask selects, through the window's clip rectangles and id test.
+    pub fn copy_rect_gl(&mut self, c: &CopyOperands) -> bool {
+        let from_window = c.src_base == ODSY_DMA_SENTINEL_READ;
+        let to_window = c.dest_base == ODSY_DMA_SENTINEL_DRAW;
+        let (w, h) = c.size;
+        let src = if from_window { -1 } else { self.object_find(c.src_base) };
+        let dest = if to_window { -1 } else { self.object_find(c.dest_base) };
 
-        if self.cmd_operand[0] != ODSY_DMA_SENTINEL_READ
-            || self.cmd_operand[2] != 0x80200050
-            || (!rgba8 && !rgba16)
-            || self.cmd_operand[5] != self.dest_base
-            || obj < 0
-            || w == 0
-            || h == 0
-            || dx as u64 + w as u64 > self.obj_width[obj as usize] as u64
-            || sx < 0
-            || sy < 0
-            || sx + w as i64 > SGI_ODYSSEY_WIDTH as i64
-            || sy + h as i64 > SGI_ODYSSEY_HEIGHT as i64
-            || !self.object_rows(obj, dy.wrapping_add(h))
-        {
+        if (!from_window && src < 0) || (!to_window && dest < 0) {
             return false;
         }
-        let displayed = self.front.lock().displayed_buffer;
+        if dest >= 0 && (c.dest.0 as u64 + w as u64 > self.obj_width[dest as usize] as u64 || !self.object_rows(dest, c.dest.1.wrapping_add(h))) {
+            return false;
+        }
+        if w == 0 || h == 0 {
+            return true;
+        }
+        let mut words = Vec::with_capacity(w as usize * h as usize);
+
         for y in 0..h {
             for x in 0..w {
-                let shown = (displayed >> self.main_id((sx + x as i64) as u32, (sy + y as i64) as u32)) & 1;
-                let source = if fmt & ODSY_DMA_FMT_FRONT != 0 { shown } else { shown ^ 1 };
-                let px = self.buffer_load(source, sx + x as i64, sy + y as i64);
+                words.push(if from_window {
+                    let (px, py) = ((c.src.0 + x) as i64 + self.read_origin[0] as i64, (c.src.1 + y) as i64 + self.read_origin[1] as i64);
 
-                self.object_store(obj, dx + x, dy + y, px);
+                    if px < 0 || py < 0 || px >= SGI_ODYSSEY_WIDTH as i64 || py >= SGI_ODYSSEY_HEIGHT as i64 {
+                        0
+                    } else {
+                        let buffer = self.read_buffer(c.read_front(), px, py);
+
+                        self.buffer_load(buffer, px, py)
+                    }
+                } else {
+                    self.object_load(src, c.src.0 + x, c.src.1 + y)
+                });
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let word = words[(y * w + x) as usize];
+
+                if to_window {
+                    self.paint_pixel(
+                        (c.dest.0 + x) as i64 + self.win_origin[0] as i64,
+                        (c.dest.1 + y) as i64 + self.win_origin[1] as i64,
+                        word,
+                    );
+                } else {
+                    self.object_store(dest, c.dest.0 + x, c.dest.1 + y, word);
+                }
             }
         }
         true
+    }
+}
+
+/// The eight operands of the GL pixel copy, block 0x2031.
+///
+/// Datasheet: "Pixel transfer headers from the OpenGL library", "Copy
+/// words" (established as what the library sends; what the board does with
+/// the overlap bits is inferred).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyOperands {
+    /// Word 0: 0x30000019 for the read drawable, else an object's address.
+    pub src_base: u32,
+    /// Word 1: source x and y.
+    pub src: (u32, u32),
+    /// Word 2 bit 31: the destination is the front buffer.
+    pub dest_front: bool,
+    /// Word 2 bits 27:16 and 11:0: the destination's and the source's
+    /// 12-bit drawable words.
+    pub dest_drawable: u32,
+    pub src_drawable: u32,
+    /// Word 2 bits 15:12: the destination's second field code.
+    pub dest_field: u32,
+    /// Word 3: width and height.
+    pub size: (u32, u32),
+    /// Word 4: the read header's word 4 (class, code, fields, front).
+    pub read_header: u32,
+    /// Word 5: 0x30000010 for the draw drawable, else an object's address.
+    pub dest_base: u32,
+    /// Word 6: destination x and y.
+    pub dest: (u32, u32),
+    /// Word 7: the write header's word 7: format and type, expand, size.
+    pub write_header: u32,
+}
+
+impl CopyOperands {
+    pub fn decode(op: &[u32]) -> Self {
+        CopyOperands {
+            src_base: op[0],
+            src: (op[1] & 0xffff, op[1] >> 16),
+            dest_front: op[2] & (1 << 31) != 0,
+            dest_drawable: (op[2] >> 16) & 0xfff,
+            src_drawable: op[2] & 0xfff,
+            dest_field: (op[2] >> 12) & 0xf,
+            size: (op[3] & 0xffff, op[3] >> 16),
+            read_header: op[4],
+            dest_base: op[5],
+            dest: (op[6] & 0xffff, op[6] >> 16),
+            write_header: op[7],
+        }
+    }
+
+    /// The read header's front bit: logical front of the read buffer.
+    pub fn read_front(&self) -> bool {
+        self.read_header & ODSY_DMA_FMT_FRONT != 0
+    }
+
+    /// Write header bit 31: the destination x lies inside the source's x
+    /// range; bit 30 the same for y. INFERRED to pick the copy direction.
+    pub fn overlap(&self) -> (bool, bool) {
+        (self.write_header & (1 << 31) != 0, self.write_header & (1 << 30) != 0)
     }
 }

@@ -151,6 +151,9 @@ impl Board {
                     || self.dest_base == self.dma_colour_base
                 {
                     self.dma_colour_base = self.dest_base;
+                    if self.screen_base == 0 {
+                        self.screen_base = self.dest_base;
+                    }
                 } else {
                     // An off-screen object: create it, or update its row length.
                     let width = self.cmd_operand[ODSY_DEST_WIDTH_INDEX].wrapping_mul(ODSY_DEST_WIDTH_UNIT);
