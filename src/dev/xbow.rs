@@ -1103,6 +1103,19 @@ mod tests {
         assert_eq!(x.write64(ERR_LOWER as u64, 0), BUS_ERR, "nor an eight-byte write");
     }
 
+    /// A Crossbow built without the posted-write option, as the Octane and
+    /// any other standalone one is, refuses both error address registers and
+    /// still records the access error; only the PXBOW completes them.
+    #[test]
+    fn a_standalone_crossbow_refuses_both_error_address_writes() {
+        for revision in [4, 5] {
+            let x = Xbow::new(revision, 0x8400);
+            assert_eq!(x.write32(ERR_LOWER as u64 + 4, 0xdead_beef), BUS_ERR, "revision {revision}");
+            assert_eq!(x.write32(ERR_UPPER as u64 + 4, 0), BUS_ERR, "revision {revision}");
+            assert_eq!(x.read(STATUS + 4, 4).unwrap() as u32 & STATUS_ACCESS_ERROR, STATUS_ACCESS_ERROR);
+        }
+    }
+
     /// The fences, the lock and a non-zero part number belong to revision 5
     /// and later; the Octane's revision 4 leaves them reserved.
     #[test]
