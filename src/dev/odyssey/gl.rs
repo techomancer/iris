@@ -2015,6 +2015,22 @@ impl Board {
     }
 }
 
+/// A draw's estimated raster work in pixels, from its vertices' window
+/// positions (`primitive_cost`).
+fn gl_draw_cost(d: &GlDraw) -> u32 {
+    let points = d.vertices.chunks_exact(SGI_GL_VERTEX_FLOATS).take(d.count as usize).map(|v| {
+        let clip = [v[SGI_GL_V_POSITION] as f64, v[SGI_GL_V_POSITION + 1] as f64, v[SGI_GL_V_POSITION + 2] as f64, v[SGI_GL_V_POSITION + 3] as f64];
+        let mut win = [0.0f64; 3];
+
+        if !(clip[3] > 0.0) {
+            return None;
+        }
+        d.state.clip_to_window(&clip, &mut win);
+        Some((win[0], win[1]))
+    });
+    primitive_cost(d.mode, points, d.point_size, d.line_width)
+}
+
 impl Board {
     /// The context emits one assembled primitive here; rasterize it into the
     /// planes. The context requires the checked result once per-face polygon
@@ -2097,6 +2113,7 @@ impl Board {
                 pixels,
             }),
         };
+        let cost = gl_draw_cost(d);
         if !self.raster.threaded() {
             let (result, phase) = self.raster.run_now(|ctx| job.run(ctx));
             d.line_phase = phase;
@@ -2107,7 +2124,7 @@ impl Board {
         // every result but out-of-memory is only reported, and that one
         // needs a polygon of more vertices than the host can address. The
         // raster unit keeps the line-stipple phase the draw advances.
-        self.raster.submit_draw(job);
+        self.raster.submit_draw(job, cost);
         if d.line_phase.is_some() {
             d.line_phase = Some(LINE_PHASE_ON_RASTER);
         }
@@ -2129,7 +2146,8 @@ impl Board {
         if let Some(op) = ops.first() {
             self.gl_report_refusals(op.kind != SGI_RASTER_CLEAR || (op.clear_buffers & SGI_GL_COLOR_BUFFER_BIT) != 0);
         }
-        self.raster.submit(move |ctx| {
+        let cost = ops.iter().fold(0u32, |c, op| c.saturating_add(rect_cost(op.x0, op.y0, op.x1, op.y1, op.kind == SGI_RASTER_CLEAR)));
+        self.raster.submit_work(cost, move |ctx| {
             // SAFETY: the job runs before the front end next touches the
             // planes (PlaneSpans).
             let mut planes = unsafe { pixels.pixels() };

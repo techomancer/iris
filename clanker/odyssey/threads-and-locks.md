@@ -60,12 +60,19 @@ apply to BUZZ). Nothing models more than one raster unit.
 
 Both rings are the shared `GFifo`, 64K entries. The IMPACT model's raster
 FIFO has a head per raster engine with scanline interleave; the VPro's has
-one head, as the board has one raster unit. The raster queue is not
-bounded below the ring: Smoke & Mirrors runs up to about 11,700 jobs
-ahead of the raster unit. Bounding it at 256, 1,024 or 4,096 jobs made
-the front end, and through the full command FIFO the processor, wait
-for the raster unit, and cut mirrors from about 4 to 3.0, 3.2 and 3.6
-swaps a second; perfly did not change.
+one head, as the board has one raster unit.
+
+The front end is bounded by estimated work, not jobs. Each job carries a
+cost in pixels (a draw's area from its vertices' window positions, a
+clear's or block fill's pixels at an eighth, plus a small fixed overhead),
+and the raster queue keeps their running total. A front end that finds
+more than `RASTER_WORK_BUDGET` (2^17 pixels, a few milliseconds of shaded
+fill) queued waits on a condition variable until the raster unit has
+worked it down to half, and a stop wakes it. Smoke & Mirrors queues up to
+about 11,700 small triangles, so a bound of 256, 1,024 or 4,096 jobs made
+the front end, and through the full command FIFO the processor, wait for
+the raster unit, and cut mirrors from about 4 to 3.0, 3.2 and 3.6 swaps a
+second; perfly did not change.
 
 ## Locks
 

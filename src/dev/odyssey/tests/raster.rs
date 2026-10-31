@@ -243,7 +243,8 @@ fn a_reused_draw_job_draws_only_its_new_primitive() {
     assert_eq!(threaded, inline);
 }
 
-/// A current-state query behind a queued draw: the front end goes on at
+/// A current-state query behind a queued draw (a small one: a draw of a
+/// screenful makes the front end wait for room): the front end goes on at
 /// once, and the query's sync word, like a fence, lands only after the
 /// draw is in the planes, its snapshot already in place.
 #[test]
@@ -256,7 +257,7 @@ fn a_query_behind_a_queued_draw_syncs_after_the_draw_without_holding_the_front_e
         s.guest = Some(ram.clone());
         s.ctx_shadow_addr_lower = 0x2000;
         s.host_write_addr_lower = 0x1000;
-        red_triangle(&mut s, &st);
+        tiny_triangle(&mut s, &st);
         for word in [0x4c0, 7, 0x10a5a, 3, 0x5a5a] {
             cmd(&mut s, word);
         }
@@ -808,4 +809,126 @@ fn a_reused_lighting_state_lights_a_vertex_as_a_fresh_one_does() {
     // The cases differ, so the comparisons above could have failed.
     assert_ne!(seen[0], seen[1]);
     assert_ne!(seen[1], seen[3]);
+}
+
+/// A triangle a few pixels across.
+fn tiny_triangle(s: &mut Board, st: &GlDrawState) {
+    let v = vertices(&[(10.0, 10.0), (14.0, 10.0), (10.0, 14.0)], RED);
+    let stipple = [0u32; 32];
+    let mut d = GlDraw::new(SGI_GL_TRIANGLES, 3, &v, st, &stipple);
+    assert_eq!(s.gl_draw(&mut d), SGI_GL_DRAW_OK);
+}
+
+/// A draw's cost follows its area; a clear's pixels count for less.
+#[test]
+fn a_job_costs_its_pixels() {
+    let p = |mode, pts: &[(f64, f64)]| primitive_cost(mode, pts.iter().map(|&p| Some(p)), 1.0, 1.0);
+
+    assert_eq!(p(SGI_GL_TRIANGLES, &[(0.0, 0.0), (100.0, 0.0), (0.0, 100.0)]), RASTER_JOB_OVERHEAD + 5000);
+    assert_eq!(p(SGI_GL_QUADS, &[(0.0, 0.0), (100.0, 0.0), (100.0, 10.0), (0.0, 10.0)]), RASTER_JOB_OVERHEAD + 1000);
+    assert_eq!(p(SGI_GL_LINES, &[(0.0, 0.0), (99.0, 3.0)]), RASTER_JOB_OVERHEAD + 100);
+    // Off the screen counts for nothing; a vertex behind the eye, for all of it.
+    assert_eq!(p(SGI_GL_QUADS, &[(-500.0, -500.0), (-400.0, -500.0), (-400.0, -400.0), (-500.0, -400.0)]), RASTER_JOB_OVERHEAD);
+    assert_eq!(primitive_cost(SGI_GL_TRIANGLES, [Some((0.0, 0.0)), None, Some((1.0, 1.0))].into_iter(), 1.0, 1.0), RASTER_JOB_OVERHEAD + SGI_ODYSSEY_WIDTH * SGI_ODYSSEY_HEIGHT);
+    assert_eq!(rect_cost(0, 0, 80, 80, true), RASTER_JOB_OVERHEAD + 80 * 80 / RASTER_CLEAR_DIVISOR);
+    assert_eq!(rect_cost(0, 0, 80, 80, false), RASTER_JOB_OVERHEAD + 80 * 80);
+}
+
+/// Many small primitives queue behind a busy raster unit without the front
+/// end waiting, however many there are in a frame; the queue's work is the
+/// sum of theirs.
+#[test]
+fn many_small_jobs_queue_without_the_front_end_waiting() {
+    let (h, st) = slow_raster(300);
+    let start = Instant::now();
+    let mut s = h.board.lock();
+
+    for _ in 0..1000 {
+        tiny_triangle(&mut s, &st);
+    }
+    assert!(start.elapsed() < Duration::from_millis(250), "the slice still holds the raster unit");
+    assert_eq!(h.raster.pending(), 1000, "no small job waited for room");
+    assert!(h.raster.queued() < RASTER_WORK_BUDGET, "{} queued", h.raster.queued());
+    assert!(h.raster.queued() >= 1000 * RASTER_JOB_OVERHEAD as u64);
+    drop(s);
+    eventually("the queue did not drain", || h.raster.pending() == 0);
+    assert_eq!(h.raster.queued(), 0);
+    h.raster.stop();
+}
+
+/// One primitive that is a whole screen of work makes the next job wait
+/// until the raster unit has drawn it.
+#[test]
+fn one_big_job_makes_the_front_end_wait() {
+    let (h, st) = slow_raster(300);
+    let start = Instant::now();
+    {
+        let mut s = h.board.lock();
+        red_triangle(&mut s, &st);
+        assert!(h.raster.queued() >= RASTER_WORK_BUDGET, "{} queued", h.raster.queued());
+        assert!(start.elapsed() < Duration::from_millis(250), "the first job does not wait");
+        tiny_triangle(&mut s, &st);
+        assert!(start.elapsed() >= Duration::from_millis(250), "the second waited for the slice to draw");
+        assert!(h.raster.queued() <= RASTER_WORK_BUDGET / 2, "{} queued", h.raster.queued());
+    }
+    eventually("the queue did not drain", || h.raster.pending() == 0);
+    assert_ne!(pixel(&h.board.lock(), 0, 10, 10), 0);
+    h.raster.stop();
+}
+
+/// The wait ends once the raster unit has worked the queue down to half the
+/// budget, not at the first job it finishes and not at the last; every job
+/// runs, in order.
+#[test]
+fn the_bound_releases_as_the_raster_unit_works() {
+    let (h, _st) = slow_raster(200);
+    let ran = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let job = |i: u32| {
+        let ran = ran.clone();
+        move |_: &mut RasterCtx| ran.lock().push(i)
+    };
+
+    h.raster.set_budget(1000);
+    h.raster.submit_work(400, job(0));
+    h.raster.submit_work(400, job(1));
+    h.raster.submit_work(400, job(2));
+    assert_eq!(h.raster.queued(), 1200, "under the budget, a job does not wait; at it, the next does");
+    let start = Instant::now();
+    h.raster.submit_work(400, job(3));
+    assert!(start.elapsed() >= Duration::from_millis(150), "the fourth waited for the slice");
+    assert!(h.raster.queued() <= 500 + 400, "{} queued", h.raster.queued());
+    assert!(ran.lock().len() >= 2, "released after the queue fell to half the budget");
+    eventually("the queue did not drain", || h.raster.pending() == 0);
+    assert_eq!(*ran.lock(), vec![0, 1, 2, 3]);
+    h.raster.stop();
+}
+
+/// A stop sets a waiting front end going at once, without waiting for the
+/// raster unit's slice; the stop still finishes every job, in order.
+#[test]
+fn stop_releases_a_waiting_front_end() {
+    let (h, _st) = slow_raster(1500);
+    let ran = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let job = |i: u32| {
+        let ran = ran.clone();
+        move |_: &mut RasterCtx| ran.lock().push(i)
+    };
+
+    h.raster.set_budget(1000);
+    h.raster.submit_work(2000, job(0));
+    let start = Instant::now();
+    std::thread::scope(|sc| {
+        let waiter = sc.spawn(|| {
+            h.raster.submit_work(1, job(1));
+            start.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiter.is_finished(), "the front end waits for room");
+        let stopper = sc.spawn(|| h.raster.stop());
+        let waited = waiter.join().unwrap();
+        assert!(waited < Duration::from_millis(1000), "released by the stop after {waited:?}, not by the slice");
+        stopper.join().unwrap();
+    });
+    assert_eq!(*ran.lock(), vec![0, 1]);
+    assert_eq!(h.raster.queued(), 0);
 }

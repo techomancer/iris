@@ -33,6 +33,9 @@
 //!   each slice of jobs, so a frame waits out a slice in flight and never
 //!   reads a half-drawn primitive.
 //!
+//! The front end waits when the queued work, estimated in pixels per job,
+//! passes `RASTER_WORK_BUDGET`, so the drawing stays close behind the commands.
+//!
 //! The ring takes the shared `GFifo`. With no raster thread running (unit
 //! tests, a stopped machine) a job runs inside the submit.
 
@@ -52,6 +55,31 @@ pub const ODYSSEY_RASTER_THREAD: &str = "odyssey-raster";
 
 /// Jobs the queue holds.
 pub const ODSY_RASTER_QUEUE_MAX: usize = 65536;
+
+/// Work, in pixels, the front end may have queued for the raster unit
+/// before it waits for the raster unit to catch up, as the board's front
+/// end waits on a full output FIFO between transform and rasteriser
+/// (US 6,417,858; the depth on BUZZ is unknown). It keeps the drawing
+/// close behind the commands, so the display does not show a frame the
+/// processor sent long ago. Measured in work, not jobs: Smoke & Mirrors
+/// queues thousands of tiny triangles, which a job-count bound stalled
+/// the processor behind. The model rasterises 5 to 30 Mpixel/s a
+/// textured or blended fill (`raster_bench`, release build), so 2^17 pixels
+/// is a few milliseconds to a few tens of milliseconds of raster time, and
+/// well past any one frame's small primitives.
+pub const RASTER_WORK_BUDGET: u64 = 1 << 17;
+
+/// What a job costs before its pixels: setup, dispatch and the state it
+/// carries, in pixels of fill. A queue of tiny primitives still adds up.
+pub const RASTER_JOB_OVERHEAD: u32 = 64;
+
+/// Clears and block fills run about this many times faster per pixel than
+/// a shaded fill (`raster_bench`: 200 against 5 to 30 Mpixel/s), so their
+/// pixels count for this fraction.
+pub const RASTER_CLEAR_DIVISOR: u32 = 8;
+
+/// The cost a ring entry's word can hold.
+const COST_MAX: u64 = (1 << 30) - 1;
 
 /// The longest the raster thread holds its context lock before letting a
 /// waiting display frame in, checked between jobs.
@@ -178,6 +206,59 @@ const ENTRY_JOB: u32 = 1;
 /// The value is a boxed `GlDrawJob`, which goes back to the front end
 /// when drawn.
 const ENTRY_DRAW: u32 = 2;
+/// The entry's address word is its kind in the low bits and its cost
+/// (`RasterQueue::push`) above them.
+const ENTRY_KIND_MASK: u32 = 3;
+const ENTRY_COST_SHIFT: u32 = 2;
+
+/// The cost of a rectangle of pixels clipped to the screen, a clear's or a
+/// block fill's counted at `RASTER_CLEAR_DIVISOR`, plus the job's overhead.
+pub fn rect_cost(x0: i32, y0: i32, x1: i32, y1: i32, fast: bool) -> u32 {
+    let w = (x1.min(SGI_ODYSSEY_WIDTH as i32) - x0.max(0)).max(0) as u64;
+    let h = (y1.min(SGI_ODYSSEY_HEIGHT as i32) - y0.max(0)).max(0) as u64;
+    let px = w * h / if fast { RASTER_CLEAR_DIVISOR as u64 } else { 1 };
+
+    RASTER_JOB_OVERHEAD.saturating_add(px.min(COST_MAX) as u32)
+}
+
+/// The cost of a primitive from its vertices' window positions, None for a
+/// vertex with no position (behind the eye, where clipping will cut the
+/// primitive and what is left may be any size, so the whole screen counts).
+/// Points cost their square, lines their length times their width, a
+/// triangle its area and any other polygon its bounding box, each within
+/// the screen. An estimate, from the corners alone.
+pub fn primitive_cost(mode: u32, points: impl Iterator<Item = Option<(f64, f64)>>, point_size: f32, line_width: f32) -> u32 {
+    let (w, h) = (SGI_ODYSSEY_WIDTH as f64, SGI_ODYSSEY_HEIGHT as f64);
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    let mut first = [(0.0f64, 0.0f64); 3];
+    let mut n = 0;
+
+    for p in points {
+        let Some((x, y)) = p else { return RASTER_JOB_OVERHEAD.saturating_add((w * h) as u32) };
+        if n < 3 {
+            first[n] = (x, y);
+        }
+        n += 1;
+        lo = [lo[0].min(x), lo[1].min(y)];
+        hi = [hi[0].max(x), hi[1].max(y)];
+    }
+    if n == 0 {
+        return RASTER_JOB_OVERHEAD;
+    }
+    // A NaN position is no extent; the clamp then yields zero.
+    let (bw, bh) = ((hi[0].min(w) - lo[0].max(0.0)).max(0.0), (hi[1].min(h) - lo[1].max(0.0)).max(0.0));
+    let boxed = bw * bh;
+    let px = match mode {
+        SGI_GL_POINTS => (point_size.max(1.0) as f64).powi(2) * n as f64,
+        SGI_GL_LINES | SGI_GL_LINE_LOOP | SGI_GL_LINE_STRIP => (bw.max(bh) + 1.0) * (line_width.max(1.0) as f64),
+        SGI_GL_TRIANGLES if n == 3 => {
+            let (a, b, c) = (first[0], first[1], first[2]);
+            (((b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1)).abs() / 2.0).min(boxed)
+        }
+        _ => boxed,
+    };
+    RASTER_JOB_OVERHEAD.saturating_add(px.min(COST_MAX as f64) as u32)
+}
 
 /// Finished GL draw jobs kept for the front end to fill again. A draw
 /// that finds none allocates; one finished while this many wait is freed.
@@ -223,6 +304,17 @@ pub struct RasterQueue<const HEADS: usize = 1> {
     ctx: Mutex<RasterCtx>,
     /// Jobs submitted and not yet finished.
     pending: AtomicU32,
+    /// The estimated work of those jobs, in pixels (`RASTER_WORK_BUDGET`).
+    queued: AtomicU64,
+    /// The work the front end waits under (`RASTER_WORK_BUDGET`; tests
+    /// set their own).
+    budget: AtomicU64,
+    /// The front end waits for the raster unit to bring `queued` down; the
+    /// raster unit wakes it at half the budget, and a stop wakes it.
+    room_waiting: AtomicBool,
+    closing: AtomicBool,
+    room: Mutex<()>,
+    room_kick: Condvar,
     /// Jobs pushed onto the ring, and taken off it by the raster thread,
     /// for its wake-up. Both run on across a stop and a start.
     pushed: AtomicU64,
@@ -259,6 +351,12 @@ impl<const HEADS: usize> Default for RasterQueue<HEADS> {
             spare: unsafe { Box::new_zeroed().assume_init() },
             ctx: Mutex::new(RasterCtx::default()),
             pending: AtomicU32::new(0),
+            queued: AtomicU64::new(0),
+            budget: AtomicU64::new(RASTER_WORK_BUDGET),
+            room_waiting: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            room: Mutex::new(()),
+            room_kick: Condvar::new(),
             pushed: AtomicU64::new(0),
             taken: AtomicU64::new(0),
             running: AtomicBool::new(false),
@@ -282,7 +380,7 @@ impl<const HEADS: usize> Drop for RasterQueue<HEADS> {
             self.ring.consume();
             // SAFETY: every entry holds a job from submit() or
             // submit_draw(), taken once.
-            unsafe { drop_entry(kind, value) };
+            unsafe { drop_entry(kind & ENTRY_KIND_MASK, value) };
         }
         while let Some((_, value)) = self.spare.peek() {
             self.spare.consume();
@@ -317,30 +415,70 @@ impl RasterQueue {
         self.pending.load(SeqCst)
     }
 
-    /// Hand a job to the raster unit, behind every job before it. With no
-    /// raster thread it runs now. A job that writes the colour planes
+    /// The estimated work of the jobs submitted and not yet finished.
+    pub fn queued(&self) -> u64 {
+        self.queued.load(SeqCst)
+    }
+
+    /// Hand a job to the raster unit, behind every job before it, at the
+    /// cost of a job with no pixels of its own (`submit_work`).
+    pub fn submit(&self, job: impl FnOnce(&mut RasterCtx) + Send + 'static) {
+        self.submit_work(RASTER_JOB_OVERHEAD, job);
+    }
+
+    /// Hand a job to the raster unit, behind every job before it, with an
+    /// estimate of its work in pixels (`rect_cost`, `primitive_cost`). With
+    /// no raster thread it runs now. A job that writes the colour planes
     /// records the rows it wrote in the context (RasterCtx::drawn). The
     /// caller is the front end, under the board lock.
-    pub fn submit(&self, job: impl FnOnce(&mut RasterCtx) + Send + 'static) {
+    pub fn submit_work(&self, cost: u32, job: impl FnOnce(&mut RasterCtx) + Send + 'static) {
         if !self.threaded() {
             let mut ctx = self.ctx.lock();
             job(&mut ctx);
             return;
         }
         let entry = Box::into_raw(Box::new(Box::new(job) as RasterJob)) as u64;
-        self.push(ENTRY_JOB, entry);
+        self.push(ENTRY_JOB, entry, cost);
     }
 
     /// Hand a GL draw to the raster unit, behind every job before it. The
     /// raster thread gives the job back when drawn (`take_draw`). The
     /// caller is the front end, under the board lock, with the raster
     /// thread running.
-    pub fn submit_draw(&self, job: Box<GlDrawJob>) {
+    pub fn submit_draw(&self, job: Box<GlDrawJob>, cost: u32) {
         debug_assert!(self.threaded());
-        self.push(ENTRY_DRAW, Box::into_raw(job) as u64);
+        self.push(ENTRY_DRAW, Box::into_raw(job) as u64, cost);
     }
 
-    fn push(&self, kind: u32, entry: u64) {
+    /// Tests: bound the queued work to `pixels`.
+    #[cfg(test)]
+    pub fn set_budget(&self, pixels: u64) {
+        self.budget.store(pixels, SeqCst);
+    }
+
+    /// Wait while the raster unit holds more work than the budget, down to
+    /// half of it. The caller is the front end, under the board lock; the
+    /// raster thread needs neither that nor anything the front end holds. A
+    /// stop, or no raster thread, ends the wait.
+    fn wait_room(&self) {
+        let mut g = self.room.lock();
+        // Raised before the level is looked at, so a raster unit that
+        // drains past half after the look sees it and wakes this.
+        self.room_waiting.store(true, SeqCst);
+        while self.threaded() && !self.closing.load(SeqCst) && self.queued() > self.budget.load(SeqCst) / 2 {
+            self.room_kick.wait(&mut g);
+        }
+        self.room_waiting.store(false, SeqCst);
+    }
+
+    fn push(&self, kind: u32, entry: u64, cost: u32) {
+        let cost = (cost as u64).min(COST_MAX);
+        let kind = kind | (cost as u32) << ENTRY_COST_SHIFT;
+
+        if self.queued() >= self.budget.load(SeqCst) {
+            self.wait_room();
+        }
+        self.queued.fetch_add(cost, SeqCst);
         self.pending.fetch_add(1, SeqCst);
         // The ring is deep; it fills only when the raster unit is far behind,
         // and then the front end waits for it, as the board's would.
@@ -427,6 +565,7 @@ impl RasterQueue {
             return;
         }
         self.exit.store(false, SeqCst);
+        self.closing.store(false, SeqCst);
         self.running.store(true, SeqCst);
         let queue = self.clone();
         *thread = Some(
@@ -442,6 +581,13 @@ impl RasterQueue {
     pub fn stop(&self) {
         let thread = self.thread.lock().take();
         if let Some(t) = thread {
+            // A front end waiting for room goes on and queues behind the
+            // rest, which the wait below finishes.
+            self.closing.store(true, SeqCst);
+            {
+                let _g = self.room.lock();
+                self.room_kick.notify_all();
+            }
             self.wait_idle();
             self.running.store(false, SeqCst);
             self.exit.store(true, SeqCst);
@@ -482,6 +628,8 @@ impl RasterQueue {
             while let Some((kind, value)) = self.ring.peek() {
                 self.ring.consume();
                 self.taken.fetch_add(1, SeqCst);
+                let cost = (kind >> ENTRY_COST_SHIFT) as u64;
+                let kind = kind & ENTRY_KIND_MASK;
                 if kind == ENTRY_DRAW {
                     // SAFETY: submit_draw() put it there, and it is taken once.
                     let job = unsafe { Box::from_raw(value as *mut GlDrawJob) };
@@ -492,9 +640,14 @@ impl RasterQueue {
                     let job = unsafe { Box::from_raw(value as *mut RasterJob) };
                     job(&mut ctx);
                 }
+                let left = self.queued.fetch_sub(cost, SeqCst) - cost;
                 if self.pending.fetch_sub(1, SeqCst) == 1 {
                     let _g = self.idle.lock();
                     self.idle_kick.notify_all();
+                }
+                if left <= self.budget.load(SeqCst) / 2 && self.room_waiting.load(SeqCst) {
+                    let _g = self.room.lock();
+                    self.room_kick.notify_all();
                 }
                 if Instant::now() >= deadline {
                     break;

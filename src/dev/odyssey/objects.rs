@@ -339,7 +339,7 @@ impl Board {
         }
         let words = std::mem::take(staged);
         let spans = self.plane_spans();
-        self.raster.submit(move |_| {
+        self.raster.submit_work(RASTER_JOB_OVERHEAD.saturating_add(words.len() as u32), move |_| {
             // SAFETY: the store outlives the job, and the front end waits
             // for the raster unit before it touches the store (PlaneSpans).
             // The whole PlaneSpans moves in, which is Send; its pointer alone
