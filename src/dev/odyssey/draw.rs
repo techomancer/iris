@@ -441,7 +441,7 @@ impl Board {
             let runs = self.row_runs(y as i64 + row as i64);
             self.paint_integer_span(&runs, y as i64 + row as i64, x as i64, x as i64 + w as i64, is_index, value);
         }
-        self.scanout.invalidate_all_for(DirtySite::FillRect);
+        self.scanout.invalidate_rows_for(DirtySite::FillRect, y, h);
     }
 
     /// Board::clear_planes(): the X server's write to the id-plane destination.
@@ -467,7 +467,7 @@ impl Board {
             }
         }
         // A pixel's drawable picks its colour at scanout.
-        self.scanout.invalidate_all_for(DirtySite::ClearPlanes);
+        self.scanout.invalidate_rows_for(DirtySite::ClearPlanes, y, h);
     }
 
     /// The screen-to-screen blit (Board::copy_rect()), the console-scroll primitive.
@@ -488,9 +488,8 @@ impl Board {
         let w = self.copy_size & 0xffff;
         let h = (self.copy_size >> 16) & 0xffff;
         let dx = self.copy_dst & 0xffff;
-        let dy = (self.copy_dst >> 16) & 0xffff;
+        let (dy, h_clip) = self.copy_dest_rows();
         let w_clip = if dx < SGI_ODYSSEY_WIDTH { w.min(SGI_ODYSSEY_WIDTH - dx) } else { 0 };
-        let h_clip = if dy < SGI_ODYSSEY_HEIGHT { h.min(SGI_ODYSSEY_HEIGHT - dy) } else { 0 };
         let reverse_rows = dy > sy;
         let reverse_cols = dx > sx;
 
@@ -539,6 +538,14 @@ impl Board {
         }
     }
 
+    /// The first row and count of the rows a copy writes, clipped to the plane.
+    fn copy_dest_rows(&self) -> (u32, u32) {
+        let h = (self.copy_size >> 16) & 0xffff;
+        let dy = (self.copy_dst >> 16) & 0xffff;
+
+        (dy, if dy < SGI_ODYSSEY_HEIGHT { h.min(SGI_ODYSSEY_HEIGHT - dy) } else { 0 })
+    }
+
     pub fn copy_rect(&mut self) {
         let source = (self.cmd_operand[2] >> ODSY_COPY_RECT_SOURCE_SHIFT) & 0xf;
         let dest = (self.cmd_operand[7] >> ODSY_COPY_RECT_DEST_SHIFT) & 0xf;
@@ -579,7 +586,8 @@ impl Board {
             self.cmd_unimplemented(ODSY_CMD_COPY_RECT_TRIGGER);
             return;
         }
-        self.scanout.invalidate_all_for(DirtySite::CopyRect);
+        let (dy, rows) = self.copy_dest_rows();
+        self.scanout.invalidate_rows_for(DirtySite::CopyRect, dy, rows);
     }
 
     /// Pattern mode is on when the 0x0404 mode's bits 3,4 are set and a shape is
@@ -679,7 +687,7 @@ impl Board {
                 }
             }
         }
-        self.scanout.invalidate_all_for(DirtySite::PatternFill);
+        self.scanout.invalidate_rows_for(DirtySite::PatternFill, y, h);
     }
 }
 

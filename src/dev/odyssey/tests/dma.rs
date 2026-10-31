@@ -456,3 +456,24 @@ fn a_context_switch_with_no_shadow_address_writes_nothing() {
 
     assert_eq!(ram.get(0, 0x2000), before);
 }
+
+/// A transfer into the colour buffer marks the rows it covers to resolve
+/// again, and a transfer into an off-screen object marks none: the display
+/// does not scan an object.
+#[test]
+fn a_dma_transfer_dirties_only_the_rows_it_wrote() {
+    let (mut s, _, ram) = board_with_ram();
+    let lines = |s: &Board| (0..s.scanout.dirty.len()).filter(|&y| s.scanout.dirty[y]).collect::<Vec<_>>();
+    colour_destination(&mut s);
+    ram.put(PAGE_A, &[0x10; 24]);
+    s.scanout_update();
+
+    put_table(&ram, TABLE, [0x2000, 300 << 16 | 200, 0x50, 2 << 16 | 3, 0x8223_305a, 4, 12, 0x3201_0000], &[pte(PAGE_A, 24)]);
+    descriptor(&mut s, TABLE);
+    assert_eq!(lines(&s), vec![300, 301]);
+    s.scanout_update();
+
+    put_table(&ram, TABLE, [0x16a000, 0, 0x10, 1 << 16 | 3, 0x8002_5000, 0, 12, 0x3201_0000], &[pte(PAGE_A, 12)]);
+    descriptor(&mut s, TABLE);
+    assert!(lines(&s).is_empty(), "an object is not on the screen");
+}

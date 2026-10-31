@@ -331,7 +331,10 @@ impl Board {
             }
         }
         self.object_flush(&mut staged);
-        self.scanout.invalidate_all_for(DirtySite::Dma);
+        // An object is board memory the raster unit samples, not a line the display scans.
+        if obj < 0 {
+            self.scanout.invalidate_rows_for(DirtySite::Dma, y, h);
+        }
     }
 }
 

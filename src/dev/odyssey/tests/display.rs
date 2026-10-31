@@ -765,3 +765,43 @@ fn the_dirty_counters_name_the_site_and_the_frame_rows() {
     s.scanout_update();
     assert_eq!((s.scanout.stats.frames, s.scanout.stats.busy_frames), (2, 1), "an idle frame counts, with no rows");
 }
+
+/// The display lines a draw marked to resolve again.
+fn dirty_rows(s: &Board) -> Vec<usize> {
+    (0..s.scanout.dirty.len()).filter(|&y| s.scanout.dirty[y]).collect()
+}
+
+/// A 2D draw marks only the lines it wrote, not the whole frame: the
+/// display resolves those and the idle rest of the frame stays as it was.
+#[test]
+fn a_2d_draw_dirties_only_its_rows() {
+    let (mut s, _) = board("v12");
+    display_identity(&mut s, 0);
+    s.scanout_update();
+    assert!(dirty_rows(&s).is_empty());
+
+    rgb_fill(&mut s, 0xff, 0, 0, 20, 200, 60, 204);
+    assert_eq!(dirty_rows(&s), vec![200, 201, 202, 203], "a solid fill");
+    s.scanout_update();
+
+    s.pattern_fill(10, 300, 16, 3, 0, 0, false, 0xff_0000);
+    assert_eq!(dirty_rows(&s), vec![300, 301, 302], "a pattern fill");
+    s.scanout_update();
+
+    s.clear_planes(0, 400, 8, 2, 0x10, 0xff);
+    assert_eq!(dirty_rows(&s), vec![400, 401], "an id-plane write");
+    s.scanout_update();
+
+    s.copy_src = 5 << 16 | 20;
+    s.copy_dst = 600 << 16 | 20;
+    s.copy_size = 7 << 16 | 40;
+    s.copy_rect();
+    assert_eq!(dirty_rows(&s), (600..607).collect::<Vec<_>>(), "a screen-to-screen copy marks its destination");
+    s.scanout_update();
+
+    s.copy_dst = (SGI_ODYSSEY_HEIGHT - 2) << 16;
+    s.copy_size = 50 << 16 | 8;
+    s.copy_rect();
+    let h = SGI_ODYSSEY_HEIGHT as usize;
+    assert_eq!(dirty_rows(&s), vec![h - 2, h - 1], "a copy past the bottom is clipped to the plane");
+}

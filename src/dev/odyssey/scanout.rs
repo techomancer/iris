@@ -292,6 +292,14 @@ impl Scanout {
             self.unnamed[y as usize >> 6] |= 1 << (y & 63);
         }
     }
+    /// invalidate_for() the lines [y, y + h) of a rectangle, which a caller
+    /// has not clipped to the frame.
+    pub fn invalidate_rows_for(&mut self, site: DirtySite, y: u32, h: u32) {
+        let first = y.min(i32::MAX as u32);
+        let end = (y as u64 + h as u64).min(i32::MAX as u64) as u32;
+
+        self.invalidate_for(site, first as i32, (end - first) as i32);
+    }
     pub fn invalidate_all(&mut self) {
         self.invalidate_all_for(DirtySite::Other);
     }
