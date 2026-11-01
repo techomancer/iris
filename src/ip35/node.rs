@@ -199,6 +199,8 @@ pub(crate) struct NodeConfig<'a> {
     pub banks_mib: &'a [u32],
     /// The processor slots the board fits.
     pub population: Population,
+    /// The fitted slots whose processor runs.
+    pub running: Population,
     pub firmware: FirmwareRecord,
     /// The word the board reads back at the Hub-special board-id window.
     pub board_id: u64,
@@ -233,7 +235,7 @@ impl Node {
     }
 
     pub fn build(config: NodeConfig<'_>) -> Result<Self, String> {
-        let NodeConfig { name, payload, clock, flash_path, banks_mib, population, firmware, board_id, l1 } = config;
+        let NodeConfig { name, payload, clock, flash_path, banks_mib, population, running, firmware, board_id, l1 } = config;
         let md = BedrockMd::with_clock(banks_mib, clock.clone())?;
         let phys = md.physical().clone();
         let pi: [Arc<BedrockPi>; 2] = std::array::from_fn(|interface| {
@@ -242,6 +244,7 @@ impl Node {
                     interface: interface as u8,
                     request_region: 0,
                     population,
+                    running,
                 },
                 clock.clone(),
             )

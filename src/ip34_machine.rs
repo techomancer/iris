@@ -553,6 +553,7 @@ impl FuelBoard {
             flash_path,
             banks_mib: &FUEL_BANKS_MIB,
             population: Population::SINGLE,
+            running: Population::SINGLE,
             firmware: FirmwareRecord::FUEL,
             board_id: FUEL_BOARD_ID,
             l1: l1_config,
