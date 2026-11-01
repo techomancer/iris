@@ -134,6 +134,7 @@ pub struct BedrockIo {
     memory: Mutex<Option<Arc<dyn BusDevice>>>,
     hub: Mutex<Option<Arc<dyn BusDevice>>>,
     gfx_map_written: OnceLock<GfxMapHook>,
+    scratch0_written: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 /// Told of a store to graphics map entry `entry`: its old value, then the
 /// new one. Runs before the new value takes effect, without the register
@@ -155,7 +156,13 @@ impl BedrockIo {
             memory: Mutex::new(None),
             hub: Mutex::new(None),
             gfx_map_written: OnceLock::new(),
+            scratch0_written: OnceLock::new(),
         }
+    }
+    /// Called after each store to scratch 0 (0x150) has landed, with no IO
+    /// lock held. Once.
+    pub fn on_scratch0_write(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        assert!(self.scratch0_written.set(hook).is_ok(), "scratch 0 hook already set");
     }
     /// Watch stores to the graphics map, as a board whose head owes credits
     /// must (see [`crate::ip53_machine::OwedCredits`]). Once.
@@ -531,6 +538,9 @@ impl BusDevice for BedrockIo {
             let entry = ((a - reg::GFX_MAP_BASE) / 8) as usize;
             hook(entry, self.gfx_map(entry), v);
         }
+        // Declared before the lock, so it runs once the store has landed and
+        // the lock is dropped.
+        let _published = (a == reg::REGISTER_0150).then(|| self.scratch0_written.get()).flatten().map(|hook| ScratchNotice(hook.as_ref()));
         let mut r = self.regs.lock();
         if let Some((n, offset)) = Self::bte_at(a) {
             let b = &mut r.bte[n];
@@ -618,12 +628,36 @@ pub fn gfx_route(map: [u64; 2], widget: u8) -> Option<GfxRoute> {
     })
 }
 
+/// Calls a scratch 0 hook when dropped.
+struct ScratchNotice<'a>(&'a (dyn Fn() + Send + Sync));
+impl Drop for ScratchNotice<'_> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Cases follow tests/qtest/sn1-bedrock-io-test.c in
     // jamesbraid/qemu-sgi-origami: inbound-protection, bte and
     // bte-error-termination.
     use super::*;
+    /// A node watching scratch 0 sees each store to it once it has landed,
+    /// and no other store.
+    #[test]
+    fn a_scratch_0_store_is_reported_after_it_lands() {
+        let io = Arc::new(BedrockIo::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (watch, record) = (Arc::downgrade(&io), seen.clone());
+        io.on_scratch0_write(Box::new(move || {
+            let value = watch.upgrade().unwrap().read64(reg::REGISTER_0150).data;
+            record.lock().push(value);
+        }));
+        io.write64(reg::REGISTER_0150, 0x30);
+        io.write64(reg::REGISTER_0158, 0x40);
+        io.write64(reg::REGISTER_0150, 0xf0);
+        assert_eq!(*seen.lock(), [0x30, 0xf0]);
+    }
     #[derive(Default)]
     struct Memory {
         words: Mutex<BTreeMap<u64, u64>>,

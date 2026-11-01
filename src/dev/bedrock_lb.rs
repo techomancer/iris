@@ -58,6 +58,16 @@ use std::sync::Arc;
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 type Level = Arc<dyn Fn(bool) + Send + Sync>;
 const ID: u64 = (0x36 << 1) | (0x3012 << 12) | (2 << 28);
+/// Scratch 1 and 3 in the plain scratch window.
+const SCRATCH1: u64 = reg::PIO_WINDOW + 8;
+const SCRATCH3: u64 = reg::PIO_WINDOW + 24;
+/// Runs its function when dropped.
+struct OnDrop<F: FnMut()>(F);
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
 const VECTOR_MASK: u64 = 3 | (0x1fffff << 3) | (0xff << 32) | (0x7ff << 40);
 struct Regs {
     words: BTreeMap<u64, u64>,
@@ -82,8 +92,20 @@ impl Default for Regs {
         }
     }
 }
+/// What a node does around the processors' scratch registers, called with
+/// no LB lock held. With hooks connected, a store to scratch 1 is the
+/// hooks' to make, through [`BedrockLb::set_scratch1`].
+pub trait ScratchHooks: Send + Sync {
+    /// A store of `value` to scratch 1.
+    fn scratch1_write(&self, value: u64);
+    /// A read of scratch 1, before it is answered.
+    fn scratch1_read(&self);
+    /// A store left scratch 3 clear: the node's hub lock was released.
+    fn scratch3_released(&self);
+}
 pub struct BedrockLb {
     regs: Arc<Mutex<Regs>>,
+    scratch_hooks: std::sync::OnceLock<Arc<dyn ScratchHooks>>,
     clock: Clock,
     error: Mutex<Option<Level>>,
     delivery: ReentrantMutex<()>,
@@ -98,6 +120,7 @@ impl BedrockLb {
         crate::locks::register_mutex("bedrock-lb", &regs);
         Self {
             regs,
+            scratch_hooks: std::sync::OnceLock::new(),
             clock,
             error: Mutex::new(None),
             delivery: ReentrantMutex::new(()),
@@ -112,6 +135,14 @@ impl BedrockLb {
         *self.error.lock() = Some(cb);
         *self.driven.lock() = None;
         self.update_irq();
+    }
+    /// Connect the node's scratch hooks, once.
+    pub fn connect_scratch_hooks(&self, hooks: Arc<dyn ScratchHooks>) {
+        assert!(self.scratch_hooks.set(hooks).is_ok(), "LB scratch hooks connected twice");
+    }
+    /// Store scratch 1, for the hooks that took a store to it.
+    pub fn set_scratch1(&self, value: u64) {
+        self.regs.lock().scratch[1] = value;
     }
     /// Attach the node's 1-wire bus to the local-block MicroLAN master.
     pub fn set_microlan(&self, bus: w1::Bus) {
@@ -201,6 +232,11 @@ impl BusDevice for BedrockLb {
         if a & 7 != 0 {
             return BusRead64::err();
         }
+        if a == SCRATCH1 {
+            if let Some(hooks) = self.scratch_hooks.get() {
+                hooks.scratch1_read();
+            }
+        }
         let now = (self.clock)();
         let mut r = self.regs.lock();
         Self::complete(&mut r, now);
@@ -227,6 +263,13 @@ impl BusDevice for BedrockLb {
         if a & 7 != 0 {
             return BUS_ERR;
         }
+        let hooks = self.scratch_hooks.get();
+        if let (SCRATCH1, Some(hooks)) = (a, hooks) {
+            hooks.scratch1_write(v);
+            return BUS_OK;
+        }
+        // Declared before the lock, so it runs once the lock is dropped.
+        let _released = (a == SCRATCH3 && v & 1 == 0).then_some(()).and(hooks).map(|h| OnDrop(|| h.scratch3_released()));
         let now = (self.clock)();
         let mut r = self.regs.lock();
         Self::complete(&mut r, now);
@@ -324,6 +367,38 @@ mod tests {
     // jamesbraid/qemu-sgi-origami: identity-permissions, scratch-reset and
     // microlan-slot.
     use super::*;
+    /// With hooks connected, scratch 1's stores are theirs to make and its
+    /// reads are reported first; a store that leaves scratch 3 clear, and
+    /// only that, reports the hub lock released, with the LB unlocked.
+    #[test]
+    fn scratch_hooks_see_scratch_1_and_the_hub_lock_release() {
+        type OnceLockLb = std::sync::OnceLock<std::sync::Weak<BedrockLb>>;
+        #[derive(Default)]
+        struct Seen(Mutex<Vec<String>>, OnceLockLb);
+        impl ScratchHooks for Seen {
+            fn scratch1_write(&self, value: u64) {
+                self.0.lock().push(format!("w{value:#x}"));
+                self.1.get().unwrap().upgrade().unwrap().set_scratch1(value + 1);
+            }
+            fn scratch1_read(&self) {
+                self.0.lock().push("r".into());
+            }
+            fn scratch3_released(&self) {
+                // The LB is unlocked: reading it does not deadlock.
+                let lb = self.1.get().unwrap().upgrade().unwrap();
+                self.0.lock().push(format!("released {:#x}", lb.read64(SCRATCH3).data));
+            }
+        }
+        let lb = Arc::new(BedrockLb::new(Arc::new(|| 0)));
+        let seen = Arc::new(Seen::default());
+        seen.1.set(Arc::downgrade(&lb)).unwrap();
+        lb.connect_scratch_hooks(seen.clone());
+        lb.write64(SCRATCH1, 0x10);
+        assert_eq!(lb.read64(SCRATCH1).data, 0x11);
+        lb.write64(SCRATCH3, 1);
+        lb.write64(SCRATCH3, 0);
+        assert_eq!(*seen.0.lock(), ["w0x10", "r", "released 0x0"]);
+    }
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
     /// Hold an IRQ packet's assertion callback while a CPU clears the register.
     pub(super) fn check_order(
