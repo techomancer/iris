@@ -157,7 +157,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `cheritest_dump_hook` | `false` | CP0 register 26 dump convention; needs test_device, unsafe for normal PROM boot. |
 | `nat_subnet` | `192.168.0.0/24 when unset` | CIDR; NAT gateway network+1 and guest network+2. |
 | `ci` | `false` | CI server/serial backend; hides host window unless ci_display, keeps offscreen graphics. |
-| `ci_socket` | `/tmp/iris.sock on Unix; 127.0.0.1:19851 on Windows` | Unix path, host:port, or tcp:host:port. |
+| `ci_socket` | `iris.sock` in `$TMPDIR` (else `/tmp`) on Unix; `127.0.0.1:19851` on Windows | Unix path, host:port, or tcp:host:port. |
 | `ci_display` | `false` | Keep host graphics window visible in CI mode. |
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
@@ -424,7 +424,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--perfetto FILE` | Record a Perfetto trace from startup (`perfetto` builds). `--perfetto-cats LIST` (default `all`) and `--perfetto-clock host\|guest` (default `host`) select what and on which timeline. See [docs/perfetto.md](docs/perfetto.md). |
 | `--load-elf` | Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the CPU starts and set PC to its entry point, instead of booting the PROM. For bare-metal test binaries; see also the monitor's `loadelf`. |
 | `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active unless --headless is explicitly set. |
-| `--ci-socket` | Override the default control-socket path (/tmp/iris.sock). |
+| `--ci-socket` | Override the default control-socket path (`iris.sock` in `$TMPDIR`, else `/tmp`; `iris-ci` finds it there only under the same `TMPDIR`). |
 | `--ci-display` | With --ci, keep the Newport window visible for interactive test development (deferred rendering at 10–15 fps). |
 | `--serial-log` | With --ci, append every byte the guest emits on ttyd1 (IRIX serial console) to this file. Useful for live tailing during an install. |
 | `--clock-fixed-mhz` | Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |

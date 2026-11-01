@@ -603,7 +603,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # serial_port_b = 8881          # serial channel B (ttyd1, the console); likewise
 # keyboard = "ansi"             # host keyboard shape: "ansi", "iso" or "jis" (see Keyboard)
 # ci = false                    # CI control socket (see README)
-# ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
+# ci_socket = "/tmp/iris.sock"  # default: iris.sock in $TMPDIR, else /tmp; Windows: "127.0.0.1:19851"
 # ci_display = false
 # serial_log = "ttyd1.log"
 
@@ -785,7 +785,8 @@ Networking
 
 Automation and debugging
   --ci                        Enable the CI socket; hide the window unless --ci-display
-  --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
+  --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
+                              iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
   --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line

@@ -101,7 +101,7 @@ Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `hal2 stat
 
 A GUI machine's TOML includes `[perf]` and `[machine]` sections (plus `[jitv2]` if built with the `jitv2` feature). See [clanker/perf/phase3-platform.md](../clanker/perf/phase3-platform.md).
 
-Windows CI default socket: `127.0.0.1:19851` (TCP). Unix: `/tmp/iris.sock`.
+Windows CI default socket: `127.0.0.1:19851` (TCP). Unix: `iris.sock` in the temporary directory (`$TMPDIR`, else `/tmp`).
 
 **A/B recording script:** `wsl\premiere-ab-checklist.ps1` — Take A (slow) vs Take B (premiere CLI) commands.
 
@@ -284,7 +284,7 @@ $env:IRIS_DEBUG_LOG = "all"
 
 The CI server and `iris-ci` support both Unix-domain and loopback TCP sockets.
 Native Windows uses `127.0.0.1:19851` by default; Linux/macOS use
-`/tmp/iris.sock`. For example, with the native Windows emulator running in CI
+`iris.sock` in the temporary directory (`$TMPDIR`, else `/tmp`). For example, with the native Windows emulator running in CI
 mode:
 
 ```powershell
