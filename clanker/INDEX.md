@@ -314,7 +314,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 
 | Note | Kind | Title |
 |---|---|---|
-| [ci-mode-overlay-is-in-the-temporary-directory.md](snapshot/ci-mode-overlay-is-in-the-temporary-directory.md) | howto | CI mode overlay path is $TMPDIR/iris-ci-PID-scsiID.overlay |
+| [ci-mode-overlay-is-in-the-temporary-directory.md](snapshot/ci-mode-overlay-is-in-the-temporary-directory.md) | howto | CI mode overlay path is $TMPDIR/iris-ci-PID-START-scsiID.overlay |
 | [iris-ci-is-the-canonical-ci-socket-interface.md](snapshot/iris-ci-is-the-canonical-ci-socket-interface.md) | howto | iris-ci is the canonical CI socket interface |
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |

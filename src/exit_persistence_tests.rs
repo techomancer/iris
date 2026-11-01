@@ -82,9 +82,10 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Where `--ci` keeps its overlays, which are named for the process.
+/// Where `--ci` keeps its overlays, which are named for the process and the
+/// run.
 fn ci_overlays() -> Vec<PathBuf> {
-    let prefix = format!("iris-ci-{}-scsi", std::process::id());
+    let prefix = format!("iris-ci-{}-", std::process::id());
     std::fs::read_dir(std::env::temp_dir())
         .map(|rd| {
             rd.flatten()
@@ -578,6 +579,28 @@ fn signal() {
 #[test]
 fn plain_main_return_then_drop() {
     round_trip(Machine::Indy, &[Exit::MainReturn, Exit::Drop], false, false)
+}
+
+/// A `--ci` run boots its disks from the images, not from an overlay an
+/// earlier run of the same process ID left in the temporary directory.
+#[test]
+fn a_ci_run_ignores_an_earlier_runs_overlay() {
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("earlier-run");
+        make_images(&dir);
+        let earlier = std::env::temp_dir().join(format!("iris-ci-{}-0-scsi1.overlay", std::process::id()));
+        std::fs::write(&earlier, vec![0xeeu8; BLOCKS * BLOCK]).unwrap();
+        let mut record = (BLOCKS as u64).to_le_bytes().to_vec();
+        for lba in 0..BLOCKS as u64 {
+            record.extend_from_slice(&lba.to_le_bytes());
+        }
+        std::fs::write(crate::cow_disk::sidecar_path_for(&earlier), record).unwrap();
+        let mut m = build(config(Machine::Indy, &dir, true));
+        Expect::new().check(&mut *m, "a fresh --ci run");
+        drop(m);
+        assert!(earlier.exists(), "the earlier run's overlay is left alone");
+    });
 }
 
 /// A guest reboot first changes what the exit has to cover.

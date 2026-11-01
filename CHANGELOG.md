@@ -355,6 +355,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   move under `/var/folders`. Pointing `TMPDIR` at the filesystem that holds
   `saves/` lets a snapshot reflink an overlay instead of copying it. An attach
   that cannot create its overlay now names the file.
+- **Each `--ci` run's overlays are named for the run**, as
+  `iris-ci-<pid>-<start>-scsi<id>.overlay`, where `<start>` is when the run
+  began. A run that got an earlier run's process ID used to open that run's
+  overlay and its dirty-sector record and boot on its writes; every run in a
+  container has the same process ID.
 - **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
   instance installs no front-end renderer, so nothing filled the readback
   buffer and every screenshot came out black. The command now waits for the
