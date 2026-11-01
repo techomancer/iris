@@ -393,15 +393,13 @@ impl IdleParkState {
     /// progress. Under `ci_clock` the compare deadline is a cycles threshold
     /// instead, so the park also stops once it is crossed.
     pub fn park(&mut self, core: &mut MipsCore, running: &AtomicBool) {
-        // Only park once the guest has actually armed a Compare deadline.
-        // Before that (PROM), Compare use is ad-hoc and there may be nothing
-        // armed to wake us. cp0_compare is zero out of reset and the guest
-        // must write it to schedule anything, so a non-zero value is the
-        // signal that parking is safe.
-        if core.cp0_compare == 0 {
-            return;
-        }
-
+        // No check that the guest armed CP0 Compare. IRIX on IP22 does, but the
+        // IP28 kernel keeps time with the IOC 8254 timers and leaves Compare at
+        // zero for good, which used to turn every park into a no-op (the idle
+        // loop was found and never slept). Nothing here can wait forever
+        // without it: each sleep is a bounded slice, an interrupt from any
+        // device thread (the 8254 timers included) ends it at once, and the
+        // 60 s warm-up keeps the PROM and boot at full speed.
         PARK_COUNT.fetch_add(1, Ordering::Relaxed);
         PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
         loop {
@@ -893,7 +891,7 @@ mod wake_tests {
         let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        core.cp0_compare = 1; // park returns immediately while this is zero
+        core.cp0_compare = 1;
         let ptr = InterruptsPtr(&core.hot.interrupts as *const AtomicU64);
         let running = Arc::new(AtomicBool::new(true));
         let raised = Arc::new(parking_lot::Mutex::new(None::<Instant>));
@@ -922,6 +920,40 @@ mod wake_tests {
             .map(|i| delivery_latency(Duration::from_micros(2_100 + i * 200)))
             .max()
             .unwrap()
+    }
+
+    /// IRIX on IP28 never arms CP0 Compare (it uses the 8254 timers), so a
+    /// park must work, and end on a device interrupt, with Compare at zero.
+    #[test]
+    fn parks_and_wakes_with_compare_unarmed() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 3));
+        assert_eq!(core.cp0_compare, 0, "Compare is zero out of reset and stays so");
+        let ptr = InterruptsPtr(&core.hot.interrupts as *const AtomicU64);
+        let running = Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let before = PARK_COUNT.load(Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let raiser = std::thread::spawn(move || {
+            let p = ptr;
+            let t0 = Instant::now();
+            while !parked() && t0.elapsed() < Duration::from_secs(2) {
+                std::thread::yield_now();
+            }
+            unsafe { &*p.0 }.fetch_or(crate::cpu::mips_core::CAUSE_IP4 as u64, Ordering::SeqCst);
+            wake();
+            if rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                stop.store(false, Ordering::SeqCst);
+                wake();
+                return false;
+            }
+            true
+        });
+        IdleParkState::default().park(&mut core, &running);
+        let _ = tx.send(());
+        assert!(raiser.join().unwrap(), "the park never saw the interrupt");
+        assert!(PARK_COUNT.load(Ordering::Relaxed) > before, "park returned without parking");
     }
 
     #[test]
@@ -1037,7 +1069,7 @@ mod wake_tests {
         let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        core.cp0_compare = 1; // park's guard requires a non-zero Compare
+        core.cp0_compare = 1;
         core.count_fire_cycle = core.hot.cycles + 300_000; // 3 ms at 10 ns/cycle
         let running = AtomicBool::new(true);
 
