@@ -452,9 +452,13 @@ pub fn open_log(cfg: &MachineConfig, tag: &str, mode: LogMode) -> Option<Arc<Ser
 pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str, mode: LogMode) -> Option<Arc<SerialLog>> {
     let path = path?;
     let p = Path::new(path);
-    let opened = match mode {
-        LogMode::Fresh => SerialLog::create(p, cfg.serial_log_timestamps),
-        LogMode::Append => SerialLog::open(p, cfg.serial_log_timestamps),
+    let opened = if path == "-" {
+        Ok(SerialLog::stdout(cfg.serial_log_timestamps))
+    } else {
+        match mode {
+            LogMode::Fresh => SerialLog::create(p, cfg.serial_log_timestamps),
+            LogMode::Append => SerialLog::open(p, cfg.serial_log_timestamps),
+        }
     };
     match opened {
         Ok(log) => {
