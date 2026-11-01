@@ -1723,6 +1723,36 @@ impl crate::pci::PciBusDevice for Aic7880 {
 mod tests {
     use super::*;
 
+    /// A per-process disk image path. The suite runs in several processes at
+    /// once (parallel cargo runs, nextest), all sharing one temp directory, so
+    /// a name fixed per test lets another process rewrite the image under it.
+    fn image_path(name: &str) -> TempImage {
+        TempImage(std::env::temp_dir().join(format!("iris-aic7880-{name}-{}.img", std::process::id())))
+    }
+
+    /// A disk image path that is removed when the test is done with it. The
+    /// bus keeps its own open handle, so the file can go while the chip lives.
+    struct TempImage(std::path::PathBuf);
+
+    impl std::ops::Deref for TempImage {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempImage {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempImage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     fn chip() -> Arc<Aic7880> {
         on(std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20)))
     }
@@ -1837,7 +1867,7 @@ mod tests {
 
         // A controller with nothing attached answers nothing, so the test
         // needs a disk as much as the machine does.
-        let img = std::env::temp_dir().join("iris-aic7880-test.img");
+        let img = image_path("test");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
         c.bus().attach_image(1, &img, false).expect("attach");
 
@@ -1893,7 +1923,7 @@ mod tests {
     fn a_write_reaches_the_disk_and_reads_back() {
         let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
-        let img = std::env::temp_dir().join("iris-aic7880-write.img");
+        let img = image_path("write");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
         c.bus().attach_image(1, &img, false).expect("attach");
 
@@ -1946,7 +1976,7 @@ mod tests {
     fn a_long_scatter_gather_list_is_followed_to_the_end() {
         let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(4 << 20));
         let c = on(ram.clone());
-        let img = std::env::temp_dir().join("iris-aic7880-sg.img");
+        let img = image_path("sg");
         let pattern: Vec<u8> = (0..264 * BLOCK_SIZE).map(|i| (i % 253) as u8).collect();
         std::fs::write(&img, &pattern).expect("test image");
         c.bus().attach_image(1, &img, false).expect("attach");
@@ -1992,7 +2022,7 @@ mod tests {
     /// Writing past the end is an error, not a bigger disk.
     #[test]
     fn a_write_past_the_end_fails_rather_than_growing_the_image() {
-        let img = std::env::temp_dir().join("iris-aic7880-grow.img");
+        let img = image_path("grow");
         std::fs::write(&img, vec![0u8; 8 * BLOCK_SIZE]).expect("test image");
         let c = chip();
         c.bus().attach_image(1, &img, false).expect("attach");
@@ -2056,7 +2086,7 @@ mod tests {
     fn him_rig(name: &str) -> (Arc<Aic7880>, Ram) {
         let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
-        let img = std::env::temp_dir().join(format!("iris-aic7880-{name}.img"));
+        let img = image_path(name);
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
         c.bus().attach_image(1, &img, false).expect("attach");
         let base = crate::ip32::RAM_BASE;
@@ -2149,7 +2179,7 @@ mod tests {
     fn the_netbsd_doorbell_still_runs_commands() {
         let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
-        let img = std::env::temp_dir().join("iris-aic7880-nb.img");
+        let img = image_path("nb");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
         c.bus().attach_image(1, &img, false).expect("attach");
         let (hscbs, shared) = (0x2000u32, 0x4000u32);
@@ -2182,7 +2212,7 @@ mod tests {
         // One file per call: these tests run in parallel in one process.
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let img = std::env::temp_dir().join(format!("iris-aic7880-nb-{}-{n}.img", std::process::id()));
+        let img = TempImage(std::env::temp_dir().join(format!("iris-aic7880-nb-{}-{n}.img", std::process::id())));
         std::fs::write(&img, img_blocks).expect("test image");
         c.bus().attach_image(1, &img, false).expect("attach");
         let (hscbs, shared, tag) = (0x2000u32, 0x4000u32, 3u8);
@@ -2395,7 +2425,7 @@ mod tests {
     #[test]
     fn failed_writes_carry_sense() {
         let c = chip();
-        let img = std::env::temp_dir().join("iris-aic7880-wsense.img");
+        let img = image_path("wsense");
         std::fs::write(&img, vec![0u8; 8 * BLOCK_SIZE]).expect("test image");
         c.bus().attach_image(1, &img, false).expect("attach");
         c.bus().attach_image(4, &img, true).expect("attach CD");
@@ -2502,7 +2532,7 @@ mod tests {
     /// attached later through the same bus.
     #[test]
     fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
-        let img = std::env::temp_dir().join(format!("iris-aic7880-filled-{}.img", std::process::id()));
+        let img = TempImage(std::env::temp_dir().join(format!("iris-aic7880-filled-{}.img", std::process::id())));
         std::fs::write(&img, vec![0u8; 64 * 512]).unwrap();
         let bus = Aic7880::new_bus();
         bus.attach_image(3, &img, false).unwrap();
@@ -2519,6 +2549,5 @@ mod tests {
         assert_eq!(&r.data[16..32], b"IRIS EMUL DISK  ");
         c.bus().attach_image(4, &img, false).unwrap();
         assert!(c.bus().has_target(4), "a target attached after boot goes on the same bus");
-        let _ = std::fs::remove_file(img);
     }
 }
