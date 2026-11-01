@@ -55,6 +55,11 @@ pub trait ScsiTarget: Send {
     /// leaves, with a CD-ROM at 512 bytes if `cdrom_512`.
     fn reset_block_size(&mut self, _cdrom_512: bool) {}
 
+    /// Put the mode parameters a guest can change back to what the target
+    /// powers up with, as a bus reset does. Every controller that resets its
+    /// targets calls this.
+    fn reset_mode_parameters(&mut self) {}
+
     /// Make what the target has accepted so far survive the process: for a
     /// copy-on-write disk, the overlay and the record of which sectors it
     /// holds. Nothing to do for a target with no storage.
@@ -198,6 +203,49 @@ impl ScsiBus {
     #[cfg(test)]
     pub fn attach_image(&self, id: u8, path: &std::path::Path, cdrom: bool) -> io::Result<u64> {
         self.attach_device(id, path.to_str().unwrap(), cdrom, Vec::new(), false, None)
+    }
+
+    /// A raw image as a disk that powers up with a write cache, for the
+    /// controllers' tests.
+    #[cfg(test)]
+    pub fn attach_cached_image(&self, id: u8, path: &std::path::Path) -> io::Result<()> {
+        let node = open_image(path.to_str().unwrap(), ImageKind::Disk, false, None)?;
+        let dev = ScsiDevice::new(node, false, path.display().to_string(), Vec::new(), self.identities.disk);
+        self.attach(id, Box::new(dev.with_write_cache(true)))
+    }
+
+    /// The caching page's WCE bit as MODE SENSE(6) reports it for the disk at
+    /// `id`, for the controllers' tests.
+    #[cfg(test)]
+    pub fn write_cache_reported(&self, id: u8) -> bool {
+        let sense = ScsiRequest {
+            cdb: vec![super::scsi_cmd::MODE_SENSE_6, 0x08, 0x08, 0, 255, 0],
+            data_len: super::ScsiDataLength::Unlimited,
+            data_in: None,
+        };
+        let r = self.request(id, &sense).unwrap().unwrap();
+        assert_eq!(r.data[4], 0x08, "caching page");
+        r.data[6] & 0x04 != 0
+    }
+
+    /// A guest's MODE SELECT(6) of the caching page with WCE `on`, for the
+    /// controllers' tests.
+    #[cfg(test)]
+    pub fn select_write_cache(&self, id: u8, on: bool) {
+        let sense = ScsiRequest {
+            cdb: vec![super::scsi_cmd::MODE_SENSE_6, 0x08, 0x08, 0, 255, 0],
+            data_len: super::ScsiDataLength::Unlimited,
+            data_in: None,
+        };
+        let mut list = vec![0u8; 4];
+        list.extend_from_slice(&self.request(id, &sense).unwrap().unwrap().data[4..]);
+        list[4 + 2] = if on { 0x04 } else { 0x00 };
+        let select = ScsiRequest {
+            cdb: vec![super::scsi_cmd::MODE_SELECT_6, 0x10, 0, 0, list.len() as u8, 0],
+            data_len: super::ScsiDataLength::Unlimited,
+            data_in: Some(list),
+        };
+        assert_eq!(self.request(id, &select).unwrap().unwrap().status, 0x00);
     }
 
     /// Whether something answers at `id`.

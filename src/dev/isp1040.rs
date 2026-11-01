@@ -22,8 +22,10 @@
 //! * A completion with no room in the response ring is held and posted when
 //!   the driver acknowledges a slot; the request ring is not consumed while
 //!   any completion is held.
-//! * The target model has no bus reset, so a bus reset or soft reset does not
-//!   arm a unit attention on the disk as QEMU's SCSI devices do. A bus reset
+//! * The target model's bus reset does one thing: a disk's mode parameters
+//!   (its write cache bit) go back to power-up before the next command. A bus
+//!   reset or soft reset arms no unit attention on the disk as QEMU's SCSI
+//!   devices do. A bus reset
 //!   retires a selection still waiting on an absent target at once, with the
 //!   reset completion the public drivers handle for a command the reset
 //!   destroyed. Inferred: the drivers establish only that they handle that
@@ -71,7 +73,7 @@
 //! Ported from hw/scsi/qlogic-isp.c in jamesbraid/qemu-sgi-origami.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -560,6 +562,11 @@ pub struct Core {
     line_order: Mutex<()>,
     /// The targets on the bus, by SCSI id.
     bus: ScsiBus,
+    /// A bus reset the targets have not yet seen. `st` and `bus` are never
+    /// held together, so the reset (taken under `st`) is passed on by the
+    /// next command to take `bus`, before it runs: no command can see the
+    /// targets as they were. See [`Core::scsi`].
+    targets_reset: AtomicBool,
     dma: OnceLock<Arc<dyn PciDma>>,
     irq: OnceLock<IrqLine>,
     /// Which of the Octane's two controllers this is (0 internal, 1
@@ -665,6 +672,7 @@ impl Core {
             wake: Condvar::new(),
             line_order: Mutex::new(()),
             bus,
+            targets_reset: AtomicBool::new(false),
             dma: OnceLock::new(),
             irq: OnceLock::new(),
             index,
@@ -1220,6 +1228,7 @@ impl Core {
                             st.pending.push_back(Pending { handle: p.handle, completion: IOCB_RESET, ..Default::default() });
                         }
                     }
+                    self.targets_reset.store(true, Ordering::Release);
                     let delay = BUS_RESET_DELAY_UNIT * u32::from(st.mailbox[1]);
                     st.quiet_until[bus] = (!delay.is_zero()).then(|| now.saturating_add(delay.as_nanos() as i64));
                     self.kick(st);
@@ -1433,6 +1442,11 @@ impl Core {
     /// when a reset cancelled the command while it waited for the target.
     fn scsi(&self, gen: u64, target: u8, cdb: &[u8], data: Option<Vec<u8>>) -> Option<(Vec<u8>, u8)> {
         let mut targets = self.bus.lock();
+        if self.targets_reset.swap(false, Ordering::AcqRel) {
+            // The bus reset puts each target's mode parameters back; see
+            // [`ScsiTarget::reset_mode_parameters`].
+            targets.iter_mut().flatten().for_each(|t| t.reset_mode_parameters());
+        }
         if self.gen.load(Ordering::Acquire) != gen {
             return None;
         }

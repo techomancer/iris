@@ -2027,6 +2027,21 @@ mod tests {
         Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)))
     }
 
+    /// The chip's reset reaches its disks and puts the write cache bit back
+    /// to what a disk powers up with.
+    #[test]
+    fn a_reset_puts_a_disks_write_cache_back() {
+        let wd = make_scsi();
+        let img = std::env::temp_dir().join(format!("iris-wd33c93a-wce-{}", std::process::id()));
+        std::fs::write(&img, vec![0u8; 64 * 512]).unwrap();
+        wd.bus().attach_cached_image(1, &img).expect("attach");
+        std::fs::remove_file(&img).unwrap(); // the open handle keeps it
+        wd.bus().select_write_cache(1, false);
+        assert!(!wd.bus().write_cache_reported(1), "the guest cleared it");
+        Resettable::power_on(&wd);
+        assert!(wd.bus().write_cache_reported(1), "WCE is back");
+    }
+
     /// Phase 1.7 round-trip: a fresh SCSI controller loaded from a captured
     /// save_state must re-serialize byte-identically. Mutates regs and the
     /// scalar shadow fields (ar, asr, target_id, pending_*).
