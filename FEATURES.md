@@ -396,7 +396,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 |---|---|
 | `--config` | Path to iris.toml config file [default: iris.toml] |
 | `--prom` | Path to PROM image |
-| `--ip22` | Emulate an SGI Indigo2 (IP22) instead of the default Indy (IP24). Overrides `[machine].profile` in the config file. |
+| `--machine NAME` | The machine to emulate, by `[machine] profile` name (`octane_ip30`); overrides the config file. `--machine help` lists the names and exits. |
+| `--ip22` | Same as `--machine indigo2_ip22`. |
 | `--nvram` | Path to NVRAM file (default: nvram.bin in cwd) |
 | `--nveeprom` | Path to Indigo2 motherboard EEPROM file (default: nveeprom.bin in cwd) |
 | `--bank0` | RAM bank 0 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
