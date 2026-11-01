@@ -40,6 +40,28 @@ hashes are given where a change is easiest to understand by reading the commit.
   bus's devices; and a `Jitv2` joins its workers before it frees the pages
   they read. The Indy, Indigo2 and O2 still leak their tables.
 
+### Disk write cache
+
+- A disk now has a `write_cache` setting in its `[scsi.N]` table (and a
+  `--no-write-cache` flag for every disk), the caching mode page's WCE bit.
+  `true`, the default, reports a write cache: a write completes once the host
+  has it, SYNCHRONIZE CACHE or FUA stores what came before, and a background
+  sync follows about every 5 s. Speed is as before and the disk is no less
+  safe, since nothing synced before. A host crash or power loss can lose up
+  to about 5 s of writes, which IRIX cannot prevent because it never asks for
+  a cache sync. `false` reports the cache off and stores every write on the
+  host's disk before it completes, as the drives SGI shipped do; it is
+  slower, as each write waits for the host's disk. STORAGE.md has the table
+  of what survives a crash.
+- MODE SELECT takes the caching page's WCE bit in either mode (with PF set),
+  and MODE SENSE returns it. A caching page that is malformed is refused with
+  CHECK CONDITION; nothing else about a MODE SELECT is. A guest that clears
+  WCE has what it wrote stored at once. A bus reset (the AIC-7880 and the
+  ISP1040) or a reset of the WD33C93A puts the bit back to the configured
+  value.
+- SYNCHRONIZE CACHE(16) is implemented, WRITE(10) honours FUA, and
+  `log scsi on` logs each command a disk receives.
+
 ## October 2026
 
 ### Octane snapshots

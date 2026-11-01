@@ -183,6 +183,7 @@ impl ScsiBus {
         discs: Vec<String>,
         overlay: bool,
         overlay_path: Option<&str>,
+        write_cache: bool,
     ) -> io::Result<u64> {
         let identity = if cdrom { self.identities.cdrom } else { self.identities.disk };
         let dev = if cdrom && path.is_empty() {
@@ -192,7 +193,7 @@ impl ScsiBus {
         } else {
             let kind = if cdrom { ImageKind::Cdrom } else { ImageKind::Disk };
             let node = open_image(path, kind, overlay, overlay_path)?;
-            ScsiDevice::new(node, cdrom, path.to_string(), discs, identity)
+            ScsiDevice::new(node, cdrom, path.to_string(), discs, identity).with_write_cache(write_cache)
         };
         let blocks = dev.size() / 512;
         self.attach(id, Box::new(dev))?;
@@ -202,16 +203,14 @@ impl ScsiBus {
     /// A raw image as a disk or CD-ROM, for the controllers' tests.
     #[cfg(test)]
     pub fn attach_image(&self, id: u8, path: &std::path::Path, cdrom: bool) -> io::Result<u64> {
-        self.attach_device(id, path.to_str().unwrap(), cdrom, Vec::new(), false, None)
+        self.attach_device(id, path.to_str().unwrap(), cdrom, Vec::new(), false, None, false)
     }
 
     /// A raw image as a disk that powers up with a write cache, for the
     /// controllers' tests.
     #[cfg(test)]
     pub fn attach_cached_image(&self, id: u8, path: &std::path::Path) -> io::Result<()> {
-        let node = open_image(path.to_str().unwrap(), ImageKind::Disk, false, None)?;
-        let dev = ScsiDevice::new(node, false, path.display().to_string(), Vec::new(), self.identities.disk);
-        self.attach(id, Box::new(dev.with_write_cache(true)))
+        self.attach_device(id, path.to_str().unwrap(), false, Vec::new(), false, None, true).map(|_| ())
     }
 
     /// The caching page's WCE bit as MODE SENSE(6) reports it for the disk at
@@ -366,7 +365,7 @@ mod tests {
     }
 
     fn attach(b: &ScsiBus, id: u8, p: &std::path::Path, overlay: bool) -> io::Result<u64> {
-        b.attach_device(id, p.to_str().unwrap(), false, Vec::new(), overlay, None)
+        b.attach_device(id, p.to_str().unwrap(), false, Vec::new(), overlay, None, false)
     }
 
     fn image(tag: &str, blocks: usize) -> std::path::PathBuf {
@@ -403,6 +402,19 @@ mod tests {
         let e = attach(&b, 8, &p, false).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         assert!(attach(&bus(16), 8, &p, false).is_ok(), "a wide bus has id 8");
+        std::fs::remove_file(p).unwrap();
+    }
+
+    /// A disk's write_cache setting reaches the disk: it decides the WCE
+    /// bit the guest sees.
+    #[test]
+    fn attach_device_gives_the_disk_its_configured_write_cache() {
+        let b = bus(8);
+        let p = image("wce", 8);
+        for (id, on) in [(1, false), (2, true)] {
+            b.attach_device(id, p.to_str().unwrap(), false, Vec::new(), false, None, on).unwrap();
+            assert_eq!(b.write_cache_reported(id), on, "write_cache = {on}");
+        }
         std::fs::remove_file(p).unwrap();
     }
 

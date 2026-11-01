@@ -99,7 +99,7 @@ pub fn attach_from_config<'a>(
         // interactive iris holding one and any number of CI runs can share
         // the image.
         let ci_overlay = (cfg.ci && dev.overlay && !cdrom).then(|| ScsiDeviceConfig::ci_overlay_path(key));
-        match bus.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref()) {
+        match bus.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref(), dev.write_cache) {
             Ok(blocks) => {
                 if let Some(prefix) = log_prefix {
                     if path.is_empty() {

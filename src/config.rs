@@ -67,6 +67,18 @@ pub struct ScsiDeviceConfig {
     /// Gateway gets host .1, the guest gets host .2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subnet: Option<String>,
+    /// Hard disks only: the disk's write cache, as the caching mode page's WCE
+    /// bit. `true` (the default) reports it on: a plain write is complete once
+    /// the host has it, SYNCHRONIZE CACHE and FUA store what came before them,
+    /// and a background sync follows about 5 s after a write. A host crash or
+    /// power loss can lose that much, and a killed iris can lose it too when
+    /// the disk is a CHD. IRIX never sends SYNCHRONIZE CACHE or FUA, so it
+    /// cannot force a write out. `false` reports it off and stores every write
+    /// on the host's disk before the command completes, like the drives SGI
+    /// shipped; it is slower. A guest can change the bit with MODE SELECT.
+    /// STORAGE.md says what each setting loses.
+    #[serde(default = "default_write_cache")]
+    pub write_cache: bool,
     /// Enable copy-on-write overlay. Base image is never modified; writes go to
     /// `{path}.overlay`. Delete the overlay file to reset to clean state.
     #[serde(default)]
@@ -105,6 +117,11 @@ pub fn scsi_label(controller: u8, id: u8) -> String {
     if controller == 0 { format!("SCSI ID {id}") } else { format!("SCSI {controller}:{id}") }
 }
 
+/// A disk's write cache is on unless the configuration says otherwise.
+fn default_write_cache() -> bool {
+    true
+}
+
 impl Default for ScsiDeviceConfig {
     fn default() -> Self {
         Self {
@@ -114,6 +131,7 @@ impl Default for ScsiDeviceConfig {
             kind_field: ScsiKind::Disk,
             mac: None,
             subnet: None,
+            write_cache: true,
             overlay: false,
             scratch: false,
             size_mb: None,
@@ -2389,6 +2407,14 @@ pub struct Cli {
     #[arg(long)]
     pub scsi7: Option<String>,
 
+    /// Report every hard disk's write cache off (`write_cache = false` in each
+    /// `[scsi.N]`): every write is stored on the host's disk before the guest
+    /// is told it is done, as on the drives SGI shipped. Slower. The default
+    /// is a write cache, which can lose about 5 s of writes in a host crash
+    /// (see STORAGE.md)
+    #[arg(long, default_value_t = false)]
+    pub no_write_cache: bool,
+
     /// Additional ISO images for CD-ROM ID 4 (can be specified multiple times)
     #[arg(long = "cdrom4-extra", value_name = "ISO")]
     pub cdrom4_extra: Vec<String>,
@@ -2622,6 +2648,12 @@ impl Cli {
         if let Some(p) = self.cdrom6.clone() { apply_scsi(&mut cfg.scsi, 6, p, true, self.cdrom6_extra.clone()); }
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
+        if self.no_write_cache {
+            for dev in cfg.scsi.values_mut().filter(|d| !d.cdrom && d.kind() == ScsiKind::Disk) {
+                dev.write_cache = false;
+            }
+        }
+
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
@@ -2837,6 +2869,37 @@ mod export_tests {
         let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
         assert_eq!(back.audio.host, AudioHost::Pulseaudio);
         assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
+    }
+
+    #[test]
+    fn write_cache_defaults_on_and_round_trips() {
+        let cfg: MachineConfig = toml::from_str(r#"
+            [scsi.1]
+            path = "a.raw"
+            [scsi.2]
+            path = "b.raw"
+            write_cache = false
+        "#).expect("parse");
+        assert!(cfg.scsi[&1].write_cache, "the default");
+        assert!(!cfg.scsi[&2].write_cache);
+        assert!(ScsiDeviceConfig::default().write_cache, "the default in code");
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert!(back.scsi[&1].write_cache && !back.scsi[&2].write_cache, "survives export:\n{s}");
+        assert!(toml::from_str::<MachineConfig>("[scsi.1]\nwrite_cache = \"fast\"\n").is_err());
+    }
+
+    /// `--no-write-cache` turns the cache off for every disk, whatever the file says.
+    #[test]
+    fn no_write_cache_flag_turns_the_cache_off_for_every_disk() {
+        use clap::Parser;
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.insert(1, ScsiDeviceConfig { path: "a.raw".into(), ..Default::default() });
+        cfg.scsi.insert(2, ScsiDeviceConfig { path: "b.raw".into(), write_cache: true, ..Default::default() });
+        let on = Cli::parse_from(["iris"]).apply(cfg.clone());
+        assert!(on.scsi[&1].write_cache && on.scsi[&2].write_cache, "no flag, no change");
+        let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
+        assert!(!off.scsi[&1].write_cache && !off.scsi[&2].write_cache);
     }
 
     #[test]
