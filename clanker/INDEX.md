@@ -106,7 +106,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [decode-table-is-host-mapped.md](devices/decode-table-is-host-mapped.md) | rule | The physical decode table is a sparse host mapping over 40 bits: change it only through `fill`, set the default first, compare entries with `entry_eq` |
 | [mc-decodes-32-physical-bits.md](devices/mc-decodes-32-physical-bits.md) | rule | Indy/Indigo2/O2 decode 32 physical bits; IRIX PTE software bits reach PA[35:32]; fold with `MipsExecutor::phys_mask`, never decode them |
 | [extended-ram-memcfg.md](devices/extended-ram-memcfg.md) | rule | Extended RAM — MEMCFG synthesis for himem banks |
-| [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | rule | A receive channel that refuses while reporting itself active |
+| [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | history | A receive channel that refuses while reporting itself active |
 | [indigo2-eeprom-byte-lane-gap.md](devices/indigo2-eeprom-byte-lane-gap.md) | rule | Indigo2 motherboard EEPROM: PROM writes via byte access, HPC3 only handled 32-bit |
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |

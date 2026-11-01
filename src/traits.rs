@@ -250,7 +250,6 @@ impl DmaStatus {
     pub const EOX:        u32 = 0x02; // end-of-chain: descriptor chain exhausted, channel deactivated
     pub const IRQ:        u32 = 0x04; // DMA interrupt raised (xie was set on EOX)
     pub const NOT_ACTIVE: u32 = 0x08; // transfer refused — channel not active
-    pub const ROWN:       u32 = 0x10; // write refused — ROWN=0, host owns descriptor
     pub const OVERFLOW:   u32 = 0x20; // byte count exhausted mid-transfer
 
     pub fn ok()          -> Self { Self(Self::OK) }
@@ -259,7 +258,7 @@ impl DmaStatus {
     pub fn eox(self)     -> bool { self.0 & Self::EOX        != 0 }
     pub fn irq(self)     -> bool { self.0 & Self::IRQ        != 0 }
     pub fn not_active(self) -> bool { self.0 & Self::NOT_ACTIVE != 0 }
-    pub fn refused(self) -> bool { self.0 & (Self::NOT_ACTIVE | Self::ROWN | Self::OVERFLOW) != 0 }
+    pub fn refused(self) -> bool { self.0 & (Self::NOT_ACTIVE | Self::OVERFLOW) != 0 }
 }
 
 impl std::ops::BitOr for DmaStatus {
@@ -280,6 +279,10 @@ pub trait DmaClient: Send + Sync {
     /// words beyond the position the guest last saw (see HAL2's codec A).
     /// `None` when it is not being polled.
     fn read_ahead_of_poll(&self) -> Option<u64> { None }
+    /// The peripheral overran its side of the transfer (the SEEQ's receive
+    /// FIFO filled before the channel drained it). A channel that stops on
+    /// that condition stops here.
+    fn overflow(&self) {}
 }
 
 /// Asynchronous system-level events sent from devices to the machine event loop.

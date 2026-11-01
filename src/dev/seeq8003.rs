@@ -133,17 +133,21 @@ pub struct SeeqState {
     /// Interrupt pending — set when an unacknowledged interrupt is outstanding.
     pub intpend:  bool,
     /// Diagnostic tallies for the receive pump, printed by `seeq status`.
-    /// Which of these stops moving at a stall says whether we are refusing
-    /// frames, have none to give, or are delivering into a guest that has
-    /// stopped reaping them.
+    /// Which of these stops moving at a stall says whether frames are being
+    /// lost to a stopped channel, there are none to give, or we are
+    /// delivering into a guest that has stopped reaping them.
     rx_delivered: u64,
-    rx_refused: u64,
+    rx_lost: u64,
+    /// Frames cut short by the receive buffer (HPC3's RBO).
+    rx_truncated: u64,
     rx_nothing: u64,
     /// Frames the address filter dropped, and of those, how many arrived
     /// while the receiver was off (rx_cmd match mode 0, as during the
     /// driver's reset of the interface). Nothing else reports either.
     rx_filtered: u64,
     rx_disabled: u64,
+    /// Receive FIFO overflows: frames cut off because the channel stopped.
+    rx_overflows: u64,
     /// Monotonic lock counter — incremented on every mutex acquisition.
     /// Prefix all debug messages with this to correlate across threads.
     pub ts:       u32,
@@ -212,8 +216,15 @@ enum TxPumpResult {
 enum RxPumpResult {
     Nothing,
     Filtered, // frame rejected by address_filter (not for the guest) and discarded
-    Refused,
+    /// Reached the chip while it could not take it, and was lost.
+    Lost,
     Delivered { dma_irq: bool, frame_len: usize },
+    /// Longer than its receive buffer: HPC3 stopped the channel (RBO) and
+    /// the frame went in cut short. Not a good frame.
+    Truncated { dma_irq: bool },
+    /// The channel stopped part way through the frame for no reason of its
+    /// own (no buffer overflow): the SEEQ's receive FIFO was not drained.
+    Overflowed,
 }
 
 // ── Seeq8003 ─────────────────────────────────────────────────────────────────
@@ -243,10 +254,12 @@ impl Seeq8003 {
                 ctl:          0,
                 intpend:      false,
                 rx_delivered: 0,
-                rx_refused: 0,
+                rx_lost: 0,
+                rx_truncated: 0,
                 rx_nothing: 0,
                 rx_filtered: 0,
                 rx_disabled: 0,
+                rx_overflows: 0,
                 ts:           0,
             })),
             irq, rx_dma, tx_dma,
@@ -282,13 +295,15 @@ impl Seeq8003 {
             enabled & status != 0
         };
         // dma_irq: DMA channel raised its own IRQ (xie), independent of SEEQ status.
-        let level = tx_irq || rx_irq || dma_irq;
-        if level && !state.intpend {
+        //
+        // HPC3 holds its Ethernet interrupt until the driver writes CLRINT
+        // (inferred from the HPC3 specification: a status bit readable until
+        // written, which every driver clears and then scans its rings). So
+        // this only raises; `reset_interrupt` lowers it. A PIO read of a SEEQ
+        // status register clears the SEEQ's own INT pin, not HPC3's output.
+        if (tx_irq || rx_irq || dma_irq) && !state.intpend {
             state.intpend = true;
             if let Some(irq) = irq { irq.set(true); }
-        } else if !level && state.intpend {
-            state.intpend = false;
-            if let Some(irq) = irq { irq.set(false); }
         }
     }
 
@@ -318,6 +333,13 @@ impl Seeq8003 {
         st.intpend = false;
         dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=reset_interrupt(CLRINT) rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
         if let Some(ref irq) = self.irq { irq.set(false); }
+    }
+
+    /// Raise the interrupt for a condition HPC3 signals itself (a receive
+    /// buffer overflow that CLRINT does not clear).
+    pub fn raise_dma_interrupt(&self) {
+        let mut st = lock_state!(self.state);
+        Self::raise_interrupt(&mut st, true, &self.irq);
     }
 
     /// Returns true if an unacknowledged interrupt is pending.
@@ -378,10 +400,6 @@ impl Seeq8003 {
                rx_cmd_snap: u8,
                station_addr_snap: [u8; 6],
                in_reset: &Arc<AtomicBool>) -> RxPumpResult {
-        if in_reset.load(Ordering::Relaxed) {
-            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: in reset, dropping frame");
-            return RxPumpResult::Nothing;
-        }
         let frame = match rx_cons.peek() {
             Ok(f) => f,
             Err(_) => return RxPumpResult::Nothing,
@@ -398,27 +416,71 @@ impl Seeq8003 {
 
         dlog_dev!(LogModule::Seeq, "SEEQ RX {} → guest DMA", eth_summary(frame));
 
+        // The frame is on the wire now: whatever happens next, it has left
+        // the ring. A frame that reaches a chip in reset or a stopped receive
+        // channel is lost (inferred, strong: neither the SEEQ's 16-byte FIFO
+        // nor HPC3, which resets its FIFO pointers when the channel starts,
+        // can hold a frame across a stop). Whether the loss also loads
+        // overflow status and interrupts is unknown, so it does neither.
+        let frame = rx_cons.pop().expect("peek succeeded so pop must succeed");
+        if in_reset.load(Ordering::Relaxed) {
+            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: in reset, frame lost: {}", eth_summary(&frame));
+            crate::pf_instant!(crate::perfetto::events::ENET_RX_LOST);
+            return RxPumpResult::Lost;
+        }
         let dst = rx_dma.write(0, false); // pad[0]
         if dst.refused() {
-            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: DMA not ready ({:#x}), will retry: {}", dst.0, eth_summary(frame));
-            crate::pf_instant!(crate::perfetto::events::ENET_RX_REFUSED);
-            return RxPumpResult::Refused; // frame stays in rx_cons for next iteration
+            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: receive channel stopped ({:#x}), frame lost: {}", dst.0, eth_summary(&frame));
+            crate::pf_instant!(crate::perfetto::events::ENET_RX_LOST);
+            return RxPumpResult::Lost;
         }
-        // DMA is committed (pad[0] written); pop the frame now and finish writing it.
-        let frame = rx_cons.pop().expect("peek succeeded so pop must succeed");
         crate::pf_instant!(crate::perfetto::events::ENET_RX, frame.len());
-        let _ = rx_dma.write(0, false); // pad[1]
+        // Any write can end the frame's DMA with an interrupt (a frame longer
+        // than its buffer stops the channel mid-frame), so keep every status.
+        let mut dma_st = dst | rx_dma.write(0, false); // pad[1]
         for b in &frame {
-            let _ = rx_dma.write(*b as u32, false);
+            dma_st |= rx_dma.write(*b as u32, false);
         }
         // Status byte — eop=true so DmaStatus::EOP is set; also catches EOX/IRQ if chain ended.
         // HPC3 hands the descriptor back to the host as this write completes.
-        let dma_st = rx_dma.write(RX_STATUS_GOOD as u32, true);
+        dma_st |= rx_dma.write(RX_STATUS_GOOD as u32, true);
 
         dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: frame delivered ({} bytes to DMA) dma_st={:#x} irq={}",
                   2 + frame.len() + 1, dma_st.0, dma_st.irq());
+        // Inferred: once a frame has started, a channel that stops taking its
+        // bytes leaves them in the SEEQ's 16-byte FIFO, which must be read
+        // every 800 ns, so the frame overflows. A frame longer than its buffer
+        // is HPC3's own receive buffer overflow instead.
+        if dma_st.0 & DmaStatus::OVERFLOW != 0 {
+            return RxPumpResult::Truncated { dma_irq: dma_st.irq() };
+        }
+        if dma_st.not_active() {
+            return RxPumpResult::Overflowed;
+        }
 
         RxPumpResult::Delivered { dma_irq: dma_st.irq(), frame_len: frame.len() }
+    }
+
+    /// The SEEQ's receive FIFO overflowed: load overflow status, which also
+    /// stops HPC3's receive channel, and interrupt if overflow interrupts are
+    /// enabled (receive command bit 0).
+    pub fn rx_overflow(&self) {
+        if let Some(dma) = &self.rx_dma { dma.overflow(); }
+        let mut st = lock_state!(self.state);
+        Self::load_rx_overflow(&mut st);
+        Self::raise_interrupt(&mut st, false, &self.irq);
+    }
+
+    /// Load overflow status. The chip loads receive status for an overflow
+    /// only when receive command bit 0 is set (established, SEEQ 8003 data
+    /// sheet); otherwise the frame is discarded without trace. The data
+    /// sheet's old/new write protection is not modelled for any receive
+    /// status, so it is not applied here either.
+    fn load_rx_overflow(st: &mut SeeqState) {
+        st.rx_overflows += 1;
+        if st.rx_cmd & rx_cmd::INTOVERFLOW != 0 {
+            st.rx_stat = rx_stat::OVERFLOW;
+        }
     }
 
     /// Return current RX status byte without side-effects (no OLD-marking).
@@ -661,11 +723,17 @@ impl Device for Seeq8003 {
                     for _ in 0..RX_DRAIN_CAP {
                         match Self::pump_rx(dma, &mut rx_cons, rx_cmd_snap, station_addr_snap, &in_reset_enet) {
                             RxPumpResult::Filtered => { filtered += 1; continue }   // chatter discarded; keep draining
-                            other => { r = other; break; }        // Delivered / Refused / Nothing
+                            other => { r = other; break; }        // Delivered / Lost / Held / Nothing
                         }
                     }
                     r
                 } else { RxPumpResult::Nothing };
+
+                // The overflow stops the channel, which takes the channel lock:
+                // do it before SeeqState is taken (see the lock order above).
+                if matches!(rx_result, RxPumpResult::Overflowed) {
+                    if let Some(ref dma) = rx_dma { dma.overflow(); }
+                }
 
                 // Now take SeeqState lock once to apply all results atomically.
                 let mut st = lock_state!(state_enet);
@@ -687,7 +755,7 @@ impl Device for Seeq8003 {
                 }
 
                 let rx_activity = !matches!(rx_result, RxPumpResult::Nothing);
-                let rx_moved = matches!(rx_result, RxPumpResult::Delivered { .. });
+                let rx_moved = matches!(rx_result, RxPumpResult::Delivered { .. } | RxPumpResult::Truncated { .. } | RxPumpResult::Lost);
                 match rx_result {
                     RxPumpResult::Delivered { dma_irq: irq, frame_len } => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX delivered {} bytes dma_irq={}", st.ts, frame_len, irq);
@@ -695,9 +763,17 @@ impl Device for Seeq8003 {
                         st.rx_stat = rx_stat::GOOD | rx_stat::END;
                         dma_irq |= irq;
                     }
-                    RxPumpResult::Refused => {
-                        dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX DMA refused, retrying next tick", st.ts);
-                        st.rx_refused += 1;
+                    RxPumpResult::Truncated { dma_irq: irq } => {
+                        dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX frame cut short by the receive buffer", st.ts);
+                        st.rx_truncated += 1;
+                        dma_irq |= irq;
+                    }
+                    RxPumpResult::Overflowed => {
+                        dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX FIFO overflow: the channel stopped mid-frame", st.ts);
+                        Self::load_rx_overflow(&mut st);
+                    }
+                    RxPumpResult::Lost => {
+                        st.rx_lost += 1;
                     }
                     // Filtered never reaches here (the drain loop consumes it), but
                     // keep the match exhaustive over RxPumpResult.
@@ -761,9 +837,9 @@ impl Device for Seeq8003 {
                         writeln!(w, "Gateway IP  : {}", self.config.gateway_ip).ok();
                         writeln!(w, "Client IP   : {}", self.config.client_ip).ok();
                         writeln!(w, "Netmask     : {}", self.config.netmask).ok();
-                        writeln!(w, "intpend={} rx_delivered={} rx_refused={} rx_nothing={}",
-                                 st.intpend, st.rx_delivered, st.rx_refused, st.rx_nothing).ok();
-                        writeln!(w, "rx_filtered={} (receiver off: {})", st.rx_filtered, st.rx_disabled).ok();
+                        writeln!(w, "intpend={} rx_delivered={} rx_lost={} rx_truncated={} rx_nothing={}",
+                                 st.intpend, st.rx_delivered, st.rx_lost, st.rx_truncated, st.rx_nothing).ok();
+                        writeln!(w, "rx_filtered={} (receiver off: {}) rx_overflows={}", st.rx_filtered, st.rx_disabled, st.rx_overflows).ok();
                         writeln!(w, "rx_cmd={:#04x} rx_stat={:#04x} tx_cmd={:#04x} tx_stat={:#04x}",
                                  st.rx_cmd, st.rx_stat, st.tx_cmd, st.tx_stat).ok();
                         writeln!(w, "threads: {}", if self.is_running() { "running" } else { "stopped" }).ok();
@@ -866,6 +942,11 @@ impl Resettable for Seeq8003 {
     fn power_on(&self) {
         // Clear/reset the hardware registers via the existing reset() method.
         self.reset();
+        {
+            let mut st = lock_state!(self.state);
+            st.intpend = false;
+            if let Some(ref irq) = self.irq { irq.set(false); }
+        }
         // Signal the NAT thread to flush all TCP/UDP/ICMP tables on its next loop.
         self.nat_control().reset_nat.store(true, Ordering::Release);
     }
@@ -921,24 +1002,77 @@ mod tests {
         assert_eq!(v1, v2, "Seeq8003 save_state mismatch after load_state round-trip");
     }
 
-    /// A receive channel that takes every frame and counts them.
+    /// HPC3's Ethernet interrupt stays up until CLRINT: reading a SEEQ status
+    /// register or writing a command does not drop it.
+    #[test]
+    fn only_clrint_lowers_the_interrupt() {
+        use crate::irq::LevelProbe;
+        let (probe, line) = LevelProbe::line();
+        let seeq = Seeq8003::new(Some(line), None, None, Arc::new(AtomicU64::new(0)));
+        seeq.write(SEEQ_RX_REG, 0xbf);
+        seeq.raise_dma_interrupt();
+        seeq.read(SEEQ_RX_REG);
+        seeq.read(SEEQ_TX_REG);
+        seeq.write(SEEQ_RX_REG, 0xbf);
+        assert!(probe.level() && seeq.is_interrupt_pending(), "the interrupt dropped without CLRINT");
+        seeq.reset_interrupt();
+        assert!(!probe.level() && !seeq.is_interrupt_pending());
+    }
+
+    /// A receive channel that takes every frame and counts them, unless
+    /// stopped. It can also be told to fail part way through a frame, and
+    /// `chan` stands in for the real channel's lock.
     #[derive(Default)]
-    struct Ring { filled: Mutex<usize> }
+    struct Ring {
+        filled: Mutex<usize>,
+        stopped: Mutex<bool>,
+        /// After this many writes, the first write returns `.1` and every
+        /// later one `.2`.
+        fault: Mutex<Option<(usize, u32, u32)>>,
+        writes: Mutex<usize>,
+        overflows: Mutex<usize>,
+        chan: Mutex<()>,
+    }
 
     impl DmaClient for Ring {
         fn read(&self) -> Option<(u32, DmaStatus)> { None }
         fn write(&self, _val: u32, eop: bool) -> DmaStatus {
+            if *self.stopped.lock() { return DmaStatus(DmaStatus::NOT_ACTIVE); }
+            let n = { let mut w = self.writes.lock(); *w += 1; *w };
+            if let Some((after, first, rest)) = *self.fault.lock() {
+                if n == after + 1 { return DmaStatus(first); }
+                if n > after + 1 { return DmaStatus(rest); }
+            }
             if eop { *self.filled.lock() += 1; }
             DmaStatus::ok()
         }
+        fn overflow(&self) {
+            let _chan = self.chan.lock();
+            *self.overflows.lock() += 1;
+            *self.stopped.lock() = true;
+        }
     }
 
-    fn settle<F: Fn() -> bool>(done: F) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !done() && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
+    /// Wait for a condition another thread brings about. Fails the test
+    /// rather than hanging if it never does.
+    fn wait_for<F: Fn() -> bool>(what: &str, done: F) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            thread::yield_now();
         }
-        thread::sleep(Duration::from_millis(50));
+    }
+
+    /// A SEEQ on a loopback link with `ring` as its receive channel, running,
+    /// and the end that injects frames.
+    fn running(ring: &Arc<Ring>, rx_cmd: u8) -> (Arc<Seeq8003>, rtrb::Producer<Vec<u8>>, Arc<crate::net::Wake>) {
+        let seeq = Arc::new(Seeq8003::new(None, Some(ring.clone()), None, Arc::new(AtomicU64::new(0))));
+        seeq.write(SEEQ_RX_REG, rx_cmd);
+        let (link, _sent, inject) = Link::loopback();
+        let wake = link.rx_wake();
+        seeq.attach(link);
+        seeq.start();
+        (seeq, inject, wake)
     }
 
     /// Frames the address filter drops while the receiver is off are
@@ -946,18 +1080,92 @@ mod tests {
     #[test]
     fn frames_dropped_with_the_receiver_off_are_counted() {
         let ring = Arc::new(Ring::default());
-        let seeq = Seeq8003::new(None, Some(ring.clone()), None, Arc::new(AtomicU64::new(0)));
-        let (link, _sent, mut inject) = Link::loopback();
-        let wake = link.rx_wake();
-        seeq.attach(link);
+        let (seeq, mut inject, wake) = running(&ring, 0);
         for _ in 0..3 {
             inject.push(vec![0xff; 60]).unwrap();
         }
-        seeq.start();
         wake.notify();
-        settle(|| inject.slots() == CHAN_CAPACITY);
+        wait_for("the frames to be filtered", || seeq.state.lock().rx_filtered == 3);
         seeq.stop();
         let st = seeq.state.lock();
         assert_eq!((st.rx_filtered, st.rx_disabled, *ring.filled.lock()), (3, 3, 0));
+    }
+
+    /// Frames that reach a stopped receive channel are lost, not queued: three
+    /// frames sent while it is stopped never arrive, and the next one after it
+    /// restarts does.
+    #[test]
+    fn frames_reaching_a_stopped_channel_are_lost() {
+        let ring = Arc::new(Ring::default());
+        *ring.stopped.lock() = true;
+        let (seeq, mut inject, wake) = running(&ring, rx_cmd::MATCH_STA_BCAST);
+        for _ in 0..3 {
+            inject.push(vec![0xff; 60]).unwrap();
+        }
+        wake.notify();
+        wait_for("the frames to be lost", || seeq.state.lock().rx_lost == 3);
+        *ring.stopped.lock() = false;
+        inject.push(vec![0xff; 60]).unwrap();
+        wake.notify();
+        wait_for("the next frame", || *ring.filled.lock() == 1);
+        seeq.stop();
+        assert_eq!((seeq.state.lock().rx_lost, *ring.filled.lock()), (3, 1));
+    }
+
+    /// An overflow found by the enet thread stops the channel and loads
+    /// overflow status, while another thread does what a control register
+    /// read does: take the channel's lock, then the SEEQ's state. The enet
+    /// thread must not hold the state when it takes the channel's lock.
+    #[test]
+    fn an_overflow_found_by_the_enet_thread_does_not_deadlock() {
+        let ring = Arc::new(Ring::default());
+        *ring.fault.lock() = Some((3, DmaStatus::NOT_ACTIVE, DmaStatus::NOT_ACTIVE));
+        let (seeq, mut inject, wake) = running(&ring, rx_cmd::MATCH_STA_BCAST | rx_cmd::INTOVERFLOW);
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (seeq, ring, done) = (seeq.clone(), ring.clone(), done.clone());
+            thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let _chan = ring.chan.lock();
+                    seeq.get_rx_status();
+                }
+            })
+        };
+        inject.push(vec![0xff; 60]).unwrap();
+        wake.notify();
+        wait_for("the overflow", || seeq.state.lock().rx_overflows == 1);
+        done.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        seeq.stop();
+        let st = seeq.state.lock();
+        assert_eq!((*ring.overflows.lock(), st.rx_delivered, st.rx_stat), (1, 0, rx_stat::OVERFLOW));
+    }
+
+    /// A frame the receive buffer cut short (HPC3 stopped the channel with
+    /// its own overflow) is not a good frame: no good status, counted apart.
+    #[test]
+    fn a_frame_cut_short_by_the_buffer_is_not_delivered() {
+        let ring = Arc::new(Ring::default());
+        *ring.fault.lock() = Some((10, DmaStatus::OVERFLOW | DmaStatus::IRQ, DmaStatus::NOT_ACTIVE));
+        let (seeq, mut inject, wake) = running(&ring, rx_cmd::MATCH_STA_BCAST);
+        inject.push(vec![0xff; 60]).unwrap();
+        wake.notify();
+        wait_for("the frame", || seeq.state.lock().rx_truncated == 1);
+        seeq.stop();
+        let st = seeq.state.lock();
+        assert_eq!((st.rx_delivered, st.rx_overflows, st.rx_stat), (0, 0, rx_stat::OLD));
+    }
+
+    /// Overflow status is loaded only when the driver set receive command
+    /// bit 0; without it the chip discards the frame and leaves no status.
+    #[test]
+    fn overflow_status_needs_the_overflow_enable() {
+        let seeq = Seeq8003::new(None, None, None, Arc::new(AtomicU64::new(0)));
+        seeq.write(SEEQ_RX_REG, rx_cmd::MATCH_STA_BCAST);
+        seeq.rx_overflow();
+        assert_eq!(seeq.get_rx_status(), rx_stat::OLD);
+        seeq.write(SEEQ_RX_REG, rx_cmd::MATCH_STA_BCAST | rx_cmd::INTOVERFLOW);
+        seeq.rx_overflow();
+        assert_eq!(seeq.get_rx_status(), rx_stat::OVERFLOW);
     }
 }

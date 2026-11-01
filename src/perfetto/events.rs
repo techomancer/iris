@@ -109,8 +109,8 @@ pub static SCSI_INT: EventDef = EventDef::new("chip int", cat::SCSI).with_arg("s
 
 pub static ENET_TX: EventDef = EventDef::new("tx frame", cat::NET).with_arg("len");
 pub static ENET_RX: EventDef = EventDef::new("rx frame", cat::NET).with_arg("len");
-/// A frame waits: the guest has no receive buffer for it.
-pub static ENET_RX_REFUSED: EventDef = EventDef::new("rx no buffer", cat::NET);
+/// A frame reached the SEEQ with the guest unable to take it, and was lost.
+pub static ENET_RX_LOST: EventDef = EventDef::new("rx lost", cat::NET);
 pub static ENET_RX_FILTERED: EventDef = EventDef::new("rx filtered", cat::NET);
 
 // ── Audio (HAL2) ─────────────────────────────────────────────────────────────
