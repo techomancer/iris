@@ -120,6 +120,26 @@ pub struct Status {
     pub pcap_status: iris::net::PcapStatus,
 }
 
+impl Status {
+    /// Take the fields the worker's status tick measures from `s`. The worker
+    /// only knows these; `running`, `power_off_seen` and `in_prom` are driven
+    /// by lifecycle events, so merge rather than replace to avoid clobbering
+    /// them.
+    fn take_worker_fields(&mut self, s: &Status) {
+        self.mips = s.mips;
+        self.kernel_hz = s.kernel_hz;
+        self.dirty_cow = s.dirty_cow;
+        self.cpu_halted = s.cpu_halted;
+        self.cpu_stopped = s.cpu_stopped;
+        self.chd_sync_pending = s.chd_sync_pending;
+        self.net_frames = s.net_frames;
+        self.net_guest_ip = s.net_guest_ip;
+        self.net_guest_gateway = s.net_guest_gateway;
+        self.net_nat_gateway = s.net_nat_gateway;
+        self.pcap_status = s.pcap_status;
+    }
+}
+
 /// State of the internal-network ("NET") indicator shown next to MIPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetState {
@@ -215,25 +235,13 @@ impl EmulatorHandle {
         let mut out = Vec::new();
         while let Ok(evt) = self.evt_rx.try_recv() {
             if let Evt::Status(s) = &evt {
-                // The worker only knows the perf-derived fields; `running`,
-                // `power_off_seen` and `in_prom` are driven by lifecycle
-                // events, so merge rather than replace to avoid clobbering them.
-                self.status.mips = s.mips;
-                self.status.dirty_cow = s.dirty_cow;
-                self.status.cpu_halted = s.cpu_halted;
-                self.status.cpu_stopped = s.cpu_stopped;
-                self.status.chd_sync_pending = s.chd_sync_pending;
+                self.status.take_worker_fields(s);
                 // Latch the NET light: once NAT IP traffic has flowed this run
                 // the guest's networking is up, so keep it green through idle
                 // lulls (it resets to red on the next Start).
                 if s.net_frames > self.net_seen_frames {
                     self.net_seen_frames = s.net_frames;
                 }
-                self.status.net_frames = s.net_frames;
-                self.status.net_guest_ip = s.net_guest_ip;
-                self.status.net_guest_gateway = s.net_guest_gateway;
-                self.status.net_nat_gateway = s.net_nat_gateway;
-                self.status.pcap_status = s.pcap_status;
             }
             match &evt {
                 Evt::Started => {
@@ -307,6 +315,17 @@ impl Drop for EmulatorHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_tick_carries_the_kernel_hz() {
+        let mut shown = Status::default();
+        let tick = Status { mips: 90.0, kernel_hz: 100.0, ..Status::default() };
+        shown.running = true;
+        shown.take_worker_fields(&tick);
+        assert_eq!(shown.kernel_hz, 100.0);
+        assert_eq!(shown.mips, 90.0);
+        assert!(shown.running, "lifecycle fields are not the worker's to set");
+    }
 
     #[test]
     fn net_indicator_states() {
