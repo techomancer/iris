@@ -349,6 +349,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### CI and automation
 
+- **A `--ci` run's disk overlays go to the host's temporary directory**,
+  `$TMPDIR` when it is set and `/tmp` otherwise, instead of always `/tmp`. With
+  `TMPDIR` unset nothing moves; macOS always sets it, so there the overlays
+  move under `/var/folders`. Pointing `TMPDIR` at the filesystem that holds
+  `saves/` lets a snapshot reflink an overlay instead of copying it. An attach
+  that cannot create its overlay now names the file.
 - **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
   instance installs no front-end renderer, so nothing filled the readback
   buffer and every screenshot came out black. The command now waits for the

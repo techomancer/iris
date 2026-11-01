@@ -183,11 +183,14 @@ impl ScsiDeviceConfig {
     }
 
     /// Where a `--ci` run keeps the copy-on-write overlay of the disk at
-    /// `id`: under /tmp and named for the process, so an interactive iris
-    /// holding `PATH.overlay` can coexist with any number of CI runs. The
-    /// files are kept for post-mortem inspection.
+    /// `id`: in the host's temporary directory (`$TMPDIR`, or `/tmp` when it
+    /// is unset) and named for the process, so an interactive iris holding
+    /// `PATH.overlay` can coexist with any number of CI runs. The path is
+    /// absolute, so a later change of directory still finds it. The files
+    /// are kept for post-mortem inspection.
     pub fn ci_overlay_path(id: u8) -> String {
-        format!("/tmp/iris-ci-{}-scsi{}.overlay", std::process::id(), id)
+        let path = std::env::temp_dir().join(format!("iris-ci-{}-scsi{}.overlay", std::process::id(), id));
+        std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned()
     }
 
     /// For `scratch = true`: make sure the volume exists, creating it with a
