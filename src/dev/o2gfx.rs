@@ -1069,12 +1069,29 @@ const RE_STATUS_IB_LEVEL_SHIFT: u32 = 18;
 ///
 /// A guest polls the status word in a loop timed in its own microseconds
 /// (`us_delay`), and the engine runs on its own host thread. Without a pause
-/// the guest's clock races ahead of the engine: IRIX's `crmFifoWait` gives up
-/// after about 4096 polls, which a CPU that is not drawing anything gets
-/// through long before the engine drains a startup queue, and the kernel
-/// then panics in early console setup. A poll is the guest waiting for the
-/// engine anyway, so spending that wait on the engine costs no overlap.
+/// the guest's clock races ahead of the engine: IRIX's early console setup
+/// waits for the interface buffer to empty for about 4096 polls, which a CPU
+/// that is not drawing anything gets through long before the engine drains a
+/// startup queue, and the kernel then panics (a read TLB miss at
+/// 0xff800000). A poll is the guest waiting for the engine anyway, so
+/// spending that wait on the engine costs no overlap.
+///
+/// The first read after a write waits this long: software that only checks
+/// for room in the buffer goes on drawing while the engine works.
 const RE_STATUS_POLL_WAIT: std::time::Duration = std::time::Duration::from_micros(100);
+/// How long a status read waits when the read before it also found the
+/// engine busy and nothing was written since: the guest is in a loop waiting
+/// for the engine.
+///
+/// The first wait alone gave a waiting loop 4096 x 100 us, about 0.4 s of
+/// host time. That covered the engine on an idle host, but not one whose
+/// thread was kept off a processor: on a loaded host IRIX panicked in early
+/// console setup on a 400 MHz R12000 O2 in five boots of eleven, and holding
+/// the engine for 2 to 3 s while the kernel waited brought the same panic
+/// with either R12000 revision. A wait that ends when the engine goes idle
+/// costs nothing on an idle host; the bound only keeps a wedged engine from
+/// holding the CPU for good.
+const RE_STATUS_LOOP_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 mod draw {
     pub const GL: u32 = 1 << 22;
@@ -1136,6 +1153,10 @@ pub struct CrimeRe {
     ib: Box<IntfBuf>,
     /// The engine is carrying out a write it has taken from `ib`.
     busy: std::sync::atomic::AtomicBool,
+    /// The last status read found the engine busy, and the CPU has written
+    /// nothing since: a further status read is a guest waiting in a loop.
+    /// Host pacing only, not CRIME state, so a snapshot does not keep it.
+    polled_busy: std::sync::atomic::AtomicBool,
     asleep: std::sync::atomic::AtomicBool,
     started: std::sync::atomic::AtomicBool,
     engine: std::sync::OnceLock<std::thread::Thread>,
@@ -1227,6 +1248,7 @@ impl CrimeRe {
             // SAFETY: a zeroed GFifo is what `GFifo::new` returns.
             ib: unsafe { Box::<IntfBuf>::new_zeroed().assume_init() },
             busy: std::sync::atomic::AtomicBool::new(false),
+            polled_busy: std::sync::atomic::AtomicBool::new(false),
             asleep: std::sync::atomic::AtomicBool::new(false),
             started: std::sync::atomic::AtomicBool::new(false),
             engine: std::sync::OnceLock::new(),
@@ -1315,6 +1337,16 @@ impl CrimeRe {
         self.asleep.store(false, Relaxed);
     }
 
+    /// How long a status read may wait for a busy engine: see
+    /// [`RE_STATUS_POLL_WAIT`] and [`RE_STATUS_LOOP_WAIT`].
+    fn status_wait(&self) -> std::time::Duration {
+        if self.polled_busy.load(std::sync::atomic::Ordering::Relaxed) {
+            RE_STATUS_LOOP_WAIT
+        } else {
+            RE_STATUS_POLL_WAIT
+        }
+    }
+
     /// After a write: unpark the engine's thread if it is asleep.
     fn wake(&self) {
         use std::sync::atomic::Ordering::*;
@@ -1362,6 +1394,7 @@ impl CrimeRe {
         if !self.ib.try_push(if width == 64 { off | WIDE } else { off }, val) {
             return BUS_BUSY;
         }
+        self.polled_busy.store(false, std::sync::atomic::Ordering::Relaxed);
         self.record(off, val, width);
         self.wake();
         BUS_OK
@@ -1414,9 +1447,11 @@ impl CrimeRe {
             // queued while that fits, one entry past it, so software that
             // waits for room (the kernel's MTE copies wait for 64 - level)
             // always finds some and the CPU runs ahead of the engine.
-            STATUS | 0x4004 => Some(if self.idle() || self.drain(RE_STATUS_POLL_WAIT) {
+            STATUS | 0x4004 => Some(if self.idle() || self.drain(self.status_wait()) {
+                self.polled_busy.store(false, std::sync::atomic::Ordering::Relaxed);
                 RE_STATUS_IDLE
             } else {
+                self.polled_busy.store(true, std::sync::atomic::Ordering::Relaxed);
                 let n = self.ib.len();
                 let shown = if n < IB_HW_DEPTH { n } else { 1 };
                 (shown as u32) << RE_STATUS_IB_LEVEL_SHIFT
@@ -3684,6 +3719,38 @@ mod tests {
         }
         assert_eq!(re.read32((0x1500_0000 + FG) as u64).data, 0x1020_3000 | 199, "a read when idle sees the last write");
         assert_eq!(ram.bytes(0x0100_0000, 0x1000), one_ram.bytes(0x0100_0000, 0x1000));
+    }
+
+    /// A guest that polls STATUS waiting for idle, a fixed number of times
+    /// as the kernel's early console setup does, sees the engine finish
+    /// even when the engine's thread is kept from running for far longer
+    /// than one poll's wait. The first read after a write still answers
+    /// busy without waiting long, so a driver that only checks for room
+    /// keeps drawing while the engine works.
+    #[test]
+    fn a_status_wait_loop_outlasts_an_engine_held_off_the_processor() {
+        let re = Arc::new(CrimeRe::new(Arc::new(O2Memory::single(32 << 20))));
+        let status = |re: &CrimeRe| re.read32((0x1500_0000 + STATUS) as u64).data;
+        for i in 0..1000u32 {
+            assert_eq!(re.write32((0x1500_0000 + FG) as u64, i), BUS_OK);
+        }
+        assert_eq!(re.status_wait(), RE_STATUS_POLL_WAIT, "the first poll after a write waits briefly");
+        assert_ne!(status(&re), RE_STATUS_IDLE, "nothing has run yet");
+        assert_eq!(re.status_wait(), RE_STATUS_LOOP_WAIT, "a second poll is a waiting loop");
+        assert_eq!(re.write32((0x1500_0000 + FG) as u64, 1000), BUS_OK);
+        assert_eq!(re.status_wait(), RE_STATUS_POLL_WAIT, "a write ends the loop");
+        assert_ne!(status(&re), RE_STATUS_IDLE);
+        // The engine's thread starts 200 ms from now. 256 polls of the
+        // first wait alone give up after about 26 ms.
+        let late = re.clone();
+        let starter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            late.start(late.clone(), |r| r);
+        });
+        let idle = (0..256).any(|_| status(&re) == RE_STATUS_IDLE);
+        starter.join().unwrap();
+        assert!(idle, "the waiting loop ran out before the engine finished");
+        assert_eq!(re.read32((0x1500_0000 + FG) as u64).data, 1000);
     }
 
     /// A full interface buffer holds the CPU's write back (BUS_BUSY) with

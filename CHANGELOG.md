@@ -412,6 +412,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   now gives a busy engine up to 100 us of host time before it answers.
   Tested to login with 32, 64, 128, 256, 224 (128+64+32), 384, 512 MB and
   1 GB, and headless.
+- **The same early panic on a loaded host.** That wait gave the kernel's
+  whole loop about 0.4 s of host time, which a busy host can keep the
+  engine's thread from getting: a 400 MHz R12000 O2 panicked in early
+  console setup in five boots of eleven, and holding the engine's thread for
+  a few seconds brought the same panic with either R12000 revision. A status read that follows
+  another busy one with no write between now waits up to 20 ms, ending as
+  soon as the engine is idle; the first read after a write still waits only
+  100 us, so drawing overlaps the engine as before.
 - **O2 SCSI commands run on their own thread.** Each AIC-7880 now has a
   worker (`AIC-7880-0`, `AIC-7880-1`) that fetches the command, moves the
   data and does the disk I/O; the CPU's register write only queues the tag.

@@ -41,9 +41,20 @@ and finished them in host time, after the guest's 4 ms of guest time were
 gone. Console type and memory size only change how much is queued then.
 
 **Fix.** A status read on a busy engine first gives it up to 100 us of host
-time (`RE_STATUS_POLL_WAIT`, `src/dev/o2gfx.rs`). A guest polling status is
+time (`RE_STATUS_POLL_WAIT`, `src/dev/o2gfx.rs`); see below for the loop. A guest polling status is
 waiting for the engine anyway. Boots to login with 32 MB up to 1 GB and
 headless.
+
+**Again on a loaded host (2026-11-01).** The 100 us wait gave the kernel's
+whole loop about 0.4 s of host time. With the host's load average at 120 to
+300, graphics-console boots of a 400 MHz R12000 O2 hit the same panic (EPC
+0x803050ac, BadVAddr 0xff800000, Cause TLBL) in five of eleven tries.
+Holding the engine's thread for 2 to 3 s while the kernel polled brought it
+on PRId 0x0e23 and 0x0e35 alike, so the processor revision plays no part. A
+status read that follows another busy one, with no write between, now waits
+up to 20 ms (`RE_STATUS_LOOP_WAIT`), ending as soon as the engine is idle.
+The first read after a write keeps the 100 us bound so a driver checking for
+room still overlaps the engine.
 
 **Rule.** A guest loop that polls a device on its own clock (`us_delay`,
 Count) can outrun a device modelled on a host thread. Make the poll itself
