@@ -667,14 +667,22 @@ fn the_clock_stands_still_while_paused() {
     r.fake_ns.store(i64::MIN, Ordering::Relaxed);
     start_ust(&r);
     r.pause();
+    let before = std::time::Instant::now();
     let ust = rd(&r, 0x30);
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(rd(&r, 0x30), ust, "no UST ticks while paused");
     r.resume();
-    std::thread::sleep(Duration::from_millis(2));
-    let ticks = rd(&r, 0x30).wrapping_sub(ust);
-    // About 2 ms of 960 ns ticks, short of the 22 ms slept in all.
-    assert!(ticks > 0 && ticks < 20_000, "{ticks} ticks");
+    let mut ticks = 0;
+    assert!(eventually(|| {
+        ticks = rd(&r, 0x30).wrapping_sub(ust);
+        ticks > 0
+    }), "the clock runs again after the resume");
+    // The card's time since the first read cannot include the 20 ms slept
+    // stopped, however long the host took to get here: the host's own span
+    // less that sleep bounds it. (A bound on the wall clock alone fails
+    // whenever a loaded host oversleeps.)
+    let host_ns = before.elapsed().as_nanos() as u64 - 20_000_000;
+    assert!(u64::from(ticks) * 960 <= host_ns + 960, "{ticks} ticks in {host_ns} ns of running time");
 }
 
 /// A card on the real clock with the machine's timers, started, and a
@@ -692,15 +700,24 @@ fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
     (r, ram, tm)
 }
 
+/// Poll `done` until it holds, giving up after a minute. Timer callbacks run
+/// on another thread and the suite runs many cards at once, so a wait counted
+/// in sleeps or milliseconds gives up on a busy host before the callback has
+/// had a core; the deadline only has to catch a callback that never comes.
+fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    while !done() {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 /// Poll the schedule's own counter, which no guest register read touches.
 fn wait_done(r: &Rad1, n: u64) -> bool {
-    for _ in 0..500 {
-        if r.state.lock().status_done >= n {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    false
+    eventually(|| r.state.lock().status_done >= n)
 }
 
 /// A started status schedule delivers completions from the timer with no
@@ -758,8 +775,7 @@ fn the_output_pump_runs_only_while_the_channel_does() {
     wr(&r, 0x58, 0x2000_0001);
     assert!(r.state.lock().audio_timer.is_some());
     // The pump moves frames the guest never asked about.
-    std::thread::sleep(Duration::from_millis(40));
-    assert!(r.state.lock().chan[CH_OUT].frames > 0);
+    assert!(eventually(|| r.state.lock().chan[CH_OUT].frames > 0), "the pump never ran");
     Device::stop(&r);
     assert!(r.state.lock().audio_timer.is_none(), "stop removes it");
     Device::start(&r);
