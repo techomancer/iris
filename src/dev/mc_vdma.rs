@@ -1198,8 +1198,13 @@ impl MemoryController {
 
         let mut state = lock.lock();
         while self.dma_running() {
-            // Wait for run signal
-            cvar.wait(&mut state);
+            // Wait for run signal. A trigger sets `run_real` under the lock
+            // before it notifies, so test it before sleeping: one that lands
+            // before the worker first waits (right after `start`) would
+            // otherwise be lost, and the guest would poll RUNNING forever.
+            while !state.run_real && self.dma_running() {
+                cvar.wait(&mut state);
+            }
 
             if !self.dma_running() { break; }
 
@@ -2389,10 +2394,25 @@ mod gio32_tests {
     /// DMA_RUN even though the completion interrupt is disabled.
     #[test]
     fn polled_vdma_reports_complete_without_interrupt_enable() {
+        polled_vdma(false);
+    }
+
+    /// The trigger lands before the worker thread exists, so the worker has
+    /// nobody to notify it: it must see the pending run flag on its own
+    /// instead of sleeping until a second trigger that never comes.
+    #[test]
+    fn a_trigger_written_before_the_worker_starts_still_runs() {
+        polled_vdma(true);
+    }
+
+    /// Program one 8-byte transfer and poll DMA_RUN until it finishes. With
+    /// `start_late` the worker is started after the trigger write.
+    fn polled_vdma(start_late: bool) {
         use crate::traits::Device;
         let (bus, mc) = setup();
-        mc.start();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        if !start_late {
+            mc.start();
+        }
         let reg = |r: u32, v: u32| { mc.write32((crate::dev::mc::MC_BASE + r) as u64, v); };
         for i in 0..8u32 {
             bus.mem.write8(0x2000 + i as u64, i as u8);
@@ -2404,13 +2424,19 @@ mod gio32_tests {
         reg(REG_DMA_STRIDE, 1 << 16);
         reg(REG_DMA_COUNT, (1 << 16) | 8);
         reg(REG_DMA_GIO_ADRS, PORT); // starts the transfer
+        if start_late {
+            mc.start();
+        }
         let t = std::time::Instant::now();
         let run = loop {
             let r = mc.read32((crate::dev::mc::MC_BASE + REG_DMA_RUN) as u64).data;
             if r & 0x40 == 0 {
                 break r;
             }
-            assert!(t.elapsed() < std::time::Duration::from_secs(2), "DMA never finished");
+            // A hang detector, not a speed bound: the worker is a thread, and
+            // on a loaded host it can wait a long time for a core.
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "DMA never finished");
+            std::thread::yield_now();
         };
         assert_ne!(run & 0x08, 0, "VDMA_R_COMPLETE missing: DMA_RUN = {run:#x}");
         assert_eq!(*bus.writes.lock(), vec![0x0001_0203, 0x0405_0607]);
