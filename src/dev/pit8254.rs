@@ -30,8 +30,11 @@ struct Channel {
     period_start: Option<Instant>,
     period_duration: Option<Duration>,
     input_freq: u32,
-    // Active hptimer ID, if armed
+    // Active hptimer ID, if armed. A channel with no interrupt callback has no
+    // hptimer (see `arm_channel`): it is armed but timer-less.
     timer_id: Option<TimerId>,
+    // The channel is counting (OUT high), with or without an hptimer.
+    armed: bool,
 }
 
 impl Channel {
@@ -49,6 +52,7 @@ impl Channel {
             period_duration: None,
             input_freq: 0,
             timer_id: None,
+            armed: false,
         }
     }
 }
@@ -100,6 +104,18 @@ impl Pit8254 {
             period = Duration::from_nanos(chan.reload as u64 * ns);
             chan.period_start = Some(Instant::now());
             chan.period_duration = Some(period);
+            chan.armed = true;
+        }
+
+        // A channel with no interrupt callback needs no hptimer: its only job
+        // would be to restart `period_start` every period so `current_count`
+        // can interpolate, and `current_count` can take the phase instead.
+        // Channel 2 is such a channel: the guest programs it as the clock
+        // divider for channels 0 and 1, at 5 kHz for IRIX. An hptimer at that
+        // rate sits in the spin branch of the timer thread and burns a host
+        // core for nothing.
+        if self.callbacks[idx].is_none() {
+            return;
         }
 
         let chan_arc = self.channels[idx].clone();
@@ -136,6 +152,7 @@ impl Pit8254 {
         let mut chan = self.channels[idx].lock();
         chan.period_start = None;
         chan.period_duration = None;
+        chan.armed = false;
     }
 
     /// The counter's value right now: a pending latch wins, otherwise the
@@ -146,7 +163,13 @@ impl Pit8254 {
         }
         if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
             if chan.input_freq > 0 {
-                let elapsed = start.elapsed();
+                let mut elapsed = start.elapsed();
+                if chan.timer_id.is_none() && !duration.is_zero() {
+                    // No hptimer restarts the period: the counter free-runs,
+                    // so the count is where in the period we are now.
+                    let phase = elapsed.as_nanos() % duration.as_nanos();
+                    elapsed = Duration::from_nanos(phase as u64);
+                }
                 if elapsed < duration {
                     let remaining = duration - elapsed;
                     let ns_per_tick = 1_000_000_000 / chan.input_freq as u128;
@@ -163,7 +186,7 @@ impl Pit8254 {
     /// OUT is high while a channel is armed. Null count is not modelled: this
     /// PIT always has a value to read, so that bit stays clear.
     fn status_byte(chan: &Channel) -> u8 {
-        let out = if chan.timer_id.is_some() { 0x80 } else { 0 };
+        let out = if chan.armed { 0x80 } else { 0 };
         out | ((chan.rw_mode & 0x3) << 4) | ((chan.mode & 0x7) << 1) | chan.bcd as u8
     }
 
@@ -443,6 +466,7 @@ impl Resettable for Pit8254 {
             chan.period_start = None;
             chan.period_duration = None;
             chan.timer_id = None;
+            chan.armed = false;
             // Channel 2 is driven by base frequency; channels 0,1 start with 0 until chaining fires.
             chan.input_freq = if i == 2 { self.base_frequency } else { 0 };
         }
@@ -474,6 +498,7 @@ fn chan_from_toml(v: &toml::Value, chan: &mut Channel) {
     chan.period_start = None;
     chan.period_duration = None;
     chan.timer_id = None;
+    chan.armed = false;
 }
 
 #[cfg(test)]
@@ -547,6 +572,38 @@ mod tests {
         program_mode2(&pit, 2, reload);
         thread::sleep(Duration::from_millis(2));
         pit
+    }
+
+    /// A channel with no interrupt callback (channel 2 in the IOC, the clock
+    /// divider for channels 0 and 1) must not cost an hptimer: at the 5 kHz
+    /// IRIX programs it keeps the timer thread spinning on a host core. It
+    /// still reports OUT high and a count that free-runs through its period.
+    #[test]
+    fn channel_without_callback_has_no_timer_but_still_counts() {
+        let _lock = SERIAL.lock().unwrap();
+        let pit = make_pit(1_000_000);
+        pit.start();
+        program_mode2(&pit, 2, 200); // 200 us period: 5 kHz
+        {
+            let chan = pit.channels[2].lock();
+            assert!(chan.timer_id.is_none(), "no hptimer for a callback-less channel");
+            assert!(chan.armed, "the channel is still counting");
+        }
+        // Status read-back: OUT (bit 7) is high while armed.
+        pit.write(3, 0xC0 | (1 << 3) | (1 << 5)); // read-back: status only, channel 2
+        assert_eq!(pit.read(2).data & 0x80, 0x80, "OUT high while armed");
+        // The count stays inside the period however long ago the channel was
+        // armed; with no timer renewing the period start it is the phase.
+        thread::sleep(Duration::from_millis(3)); // 15 periods
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let c = latch_read16(&pit, 2);
+            assert!(c <= 200, "count {} within the 200-tick period", c);
+            seen.insert(c);
+            thread::sleep(Duration::from_micros(37));
+        }
+        assert!(seen.len() > 1, "the count moves: {:?}", seen);
+        pit.stop();
     }
 
     /// The read-back command (control word `11`) latches the selected counter's
