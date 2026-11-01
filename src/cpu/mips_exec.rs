@@ -10727,11 +10727,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 idle_state.sample(&guard.core);
                                 match status {
                                     EXEC_BREAKPOINT => {
-                                        running.store(false, Ordering::SeqCst);
                                         // Reported through the stop note (`status`, `wait`),
                                         // not printed: the terminal is a monitor console.
+                                        // Note first, then clear `running`: whoever sees the
+                                        // CPU stopped (`wait` polls it) must find the note.
                                         let why = guard.breakpoint_hit_reason();
                                         stop_note.lock().record(guard.core.pc, why);
+                                        running.store(false, Ordering::SeqCst);
                                         break;
                                     }
                                     _ => {}

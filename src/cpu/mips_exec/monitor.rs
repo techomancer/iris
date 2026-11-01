@@ -1070,18 +1070,28 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             }
             "stop" => {
                 let was_running = self.is_running();
+                // Note first, as the breakpoint path does: `stop` clears
+                // `running`, and a client that sees that must find the note.
+                // The pc is only readable once the core is stopped, so it is
+                // filled in after.
+                if was_running {
+                    self.stop_note.lock().record(0, "stopped by `stop`".to_string());
+                }
                 self.stop();
                 if was_running {
                     let pc = self.executor.lock().core.pc;
-                    self.stop_note.lock().record(pc, "stopped by `stop`".to_string());
+                    self.stop_note.lock().pc = pc;
                 }
                 writeln!(writer, "CPU stopped").unwrap();
                 Ok(())
             }
             "status" => {
                 // Never blocks: while running, the core is not touched.
+                // Read the flag before the note: a stop records its note
+                // first, so a CPU seen stopped has its note.
+                let running = self.is_running();
                 let note = self.stop_note.lock().clone();
-                if self.is_running() {
+                if running {
                     writeln!(writer, "running").unwrap();
                     if note.seq > 0 {
                         writeln!(writer, "  last stop #{}: {} at {:016x}", note.seq, note.reason, note.pc).unwrap();
