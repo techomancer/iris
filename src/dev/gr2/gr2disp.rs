@@ -42,7 +42,7 @@ impl Gr2 {
                     more_cpus: Default::default(),
                     now: start,
                     hb: self.stats.heartbeat.fetch_and(HB_PERSISTENT, Ordering::Relaxed),
-                    cycles: self.cycles.get().get(),
+                    cycles: self.cycles.get().retired(),
                     fasttick: self.stats.fasttick.load(Ordering::Relaxed),
                     decoded_delta: 0,
                     l1i_hits: 0,

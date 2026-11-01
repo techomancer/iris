@@ -235,7 +235,7 @@ impl Mgras {
             let stats = crate::disp::BarStats {
                 now: start,
                 hb: self.heartbeat.fetch_and(PERSISTENT, Ordering::Relaxed),
-                cycles: self.cycles.lock().get(),
+                cycles: self.cycles.lock().retired(),
                 fasttick: self.fasttick.load(Ordering::Relaxed),
                 more_cpus: self.more_cpu_stats(),
                 decoded_delta: 0,

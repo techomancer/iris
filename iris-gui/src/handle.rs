@@ -363,7 +363,7 @@ fn worker_loop(
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(prev_tick).as_secs_f64();
                     if dt >= 0.1 {
-                        let cur = c.get();
+                        let cur = c.retired();
                         let dc = cur.wrapping_sub(prev_cycles);
                         let mips = (dc as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
                         prev_cycles = cur;
@@ -456,7 +456,7 @@ fn worker_loop(
                         *ps2_slot.lock() = Some(m.get_ps2());
                         // Latch REX3's cycle counter for the live MIPS estimate.
                         cycles = m.get_display().map(|d| d.cycles());
-                        prev_cycles = cycles.map(|c| c.get()).unwrap_or(0);
+                        prev_cycles = cycles.map(|c| c.retired()).unwrap_or(0);
                         let ft = m.fasttick_count();
                         prev_fasttick = ft.load(std::sync::atomic::Ordering::Relaxed);
                         fasttick = Some(ft);

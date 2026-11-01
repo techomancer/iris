@@ -986,7 +986,7 @@ impl Mgras {
 
     fn more_cpu_stats(&self) -> [Option<(u64, u64)>; crate::disp::MORE_CPUS] {
         let more = self.more_cpus.lock();
-        std::array::from_fn(|i| more.get(i).map(|(c, f)| (c.get(), f.load(Ordering::Relaxed))))
+        std::array::from_fn(|i| more.get(i).map(|(c, f)| (c.retired(), f.load(Ordering::Relaxed))))
     }
 
     fn offset(&self, addr: u64) -> Option<u32> {

@@ -511,6 +511,8 @@ fn rate_figures(mips: f64, hz: f64, more: &[Option<(f64, f64)>]) -> (String, Str
 /// Snapshot of CPU counters and wall-clock time captured once per refresh loop iteration.
 pub struct BarStats {
     pub now:            std::time::Instant,
+    /// Cycles that retired instructions (`CyclesPtr::retired`): a parked
+    /// CPU adds none, so an idle guest reads near 0 MIPS.
     pub cycles:         u64,
     pub fasttick:       u64,
     /// The other CPUs' `cycles` and `fasttick`, if the machine has any.

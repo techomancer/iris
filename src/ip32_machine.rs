@@ -934,7 +934,7 @@ impl O2Display {
                     more_cpus: Default::default(),
                     now: start,
                     hb: self.bus.mace.id.heartbeat.fetch_and(crate::dev::ng1::rex3::Rex3::HB_PERSISTENT, Ordering::Relaxed),
-                    cycles: self.cycles.get(),
+                    cycles: self.cycles.retired(),
                     fasttick: self.ticks.load(Ordering::Relaxed),
                     decoded_delta: 0,
                     l1i_hits: 0,

@@ -2560,7 +2560,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// comments. Same "call once at final address, valid for the rest of the
     /// process" contract as `interrupts_ptr` above.
     pub fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr {
-        crate::cpu::mips_core::CyclesPtr::new(&self.core.hot.cycles as *const u64)
+        crate::cpu::mips_core::CyclesPtr::with_parked(&self.core.hot.cycles as *const u64, &self.core.hot.parked_cycles as *const u64)
     }
 
     /// Install the CP0 Status change callback pointing at this executor.

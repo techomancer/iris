@@ -3538,3 +3538,17 @@ fn gl_select_mode_keeps_a_name_stack_and_records_hits() {
     assert_eq!(ret(0xC60, 1), 0, "read out and emptied");
     m.stop_engines();
 }
+
+/// The bar's per-CPU figures count retired cycles, so a parked CPU adds
+/// nothing to its MIPS.
+#[test]
+fn bar_stats_for_further_cpus_leave_out_parked_cycles() {
+    use crate::cpu::mips_core::CyclesPtr;
+    let hb = Arc::new(AtomicU64::new(0));
+    let m = Mgras::new(crate::config::GraphicsBoard::HighImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
+    let (cycles, parked) = (Box::new(900u64), Box::new(100u64));
+    m.add_cpu_stats(CyclesPtr::with_parked(&*cycles, &*parked), Arc::new(AtomicU64::new(7)));
+    let more = m.more_cpu_stats();
+    assert_eq!(more[0], Some((800, 7)));
+    assert_eq!(more[1], None);
+}

@@ -2974,7 +2974,7 @@ impl Rex3 {
                 more_cpus: Default::default(),
                 now:          start,
                 hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
-                cycles:       self.cycles.get().get(),
+                cycles:       self.cycles.get().retired(),
                 fasttick:     self.fasttick_count.load(Ordering::Relaxed),
                 #[cfg(feature = "developer")]
                 decoded_delta: self.decoded_count.swap(0, Ordering::Relaxed),
