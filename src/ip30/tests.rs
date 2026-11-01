@@ -397,8 +397,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
         WIDGET_GFX,
         heart.clone(),
         ram.dma_view(),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
+        crate::disp::StatusSource::detached(),
     );
     let id = widget_small_base(WIDGET_GFX) + 4;
     for (links, alive) in [(0x8100u16, false), (0x8100 | 1 << WIDGET_GFX, true)] {

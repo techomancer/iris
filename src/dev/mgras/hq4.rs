@@ -670,24 +670,22 @@ impl ImpactXio {
         widget: u8,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        heartbeat: Arc<AtomicU64>,
-        fasttick: Arc<AtomicU64>,
+        status: Arc<crate::disp::StatusSource>,
     ) -> Arc<Self> {
-        Self::with_board(widget, GraphicsBoard::SolidImpact, irq, mem, heartbeat, fasttick)
+        Self::with_board(widget, GraphicsBoard::SolidImpact, irq, mem, status)
     }
 
     /// An IMPACT board of kind `kind` (Solid, High for SI with texture,
     /// Maximum for MXI) at `widget` (one of the four graphics ports):
     /// its interrupts are vectors on `irq` (HEART), its DMA reaches `mem`
-    /// (the bus masters' view of memory). `heartbeat` and `fasttick` feed
-    /// the status bar, as for the Indigo2 board. `Device::start` starts it.
+    /// (the bus masters' view of memory). `status` feeds the status bar, as
+    /// for the Indigo2 board. `Device::start` starts it.
     pub fn with_board(
         widget: u8,
         kind: GraphicsBoard,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        heartbeat: Arc<AtomicU64>,
-        fasttick: Arc<AtomicU64>,
+        status: Arc<crate::disp::StatusSource>,
     ) -> Arc<Self> {
         let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
         let shared = Arc::new(Shared {
@@ -702,8 +700,7 @@ impl ImpactXio {
         let mgras = Mgras::new(
             kind,
             [IrqLine::new(lines.clone(), 0), IrqLine::new(lines.clone(), 1), IrqLine::new(lines, 2)],
-            heartbeat,
-            fasttick,
+            status,
         );
         // CMAP 0's revision register carries the monitor ID in bits 7:4;
         // CMAP 1's RA revision in 6:4 and, in bit 7, that there is no video
@@ -1322,8 +1319,7 @@ mod tests {
     fn rig() -> Rig {
         let heart = Arc::new(Heart::default());
         let ram = Arc::new(Ram(Mutex::new(vec![0; 1 << 20])));
-        let hb = Arc::new(AtomicU64::new(0));
-        let b = ImpactXio::new(11, heart.clone(), ram.clone(), hb.clone(), hb);
+        let b = ImpactXio::new(11, heart.clone(), ram.clone(), crate::disp::StatusSource::detached());
         b.mgras().start_engines();
         Rig { b, heart, ram }
     }
@@ -1892,8 +1888,7 @@ mod tests {
         // No engine thread, so nothing drains the command FIFO.
         let heart = Arc::new(Heart::default());
         let ram = Arc::new(Ram(Mutex::new(vec![0; 1 << 20])));
-        let hb = Arc::new(AtomicU64::new(0));
-        let r = Rig { b: ImpactXio::new(11, heart.clone(), ram.clone(), hb.clone(), hb), heart, ram };
+        let r = Rig { b: ImpactXio::new(11, heart.clone(), ram.clone(), crate::disp::StatusSource::detached()), heart, ram };
         let mut accepted = 0u32;
         let st = loop {
             let st = r.b.write(SH + hq4::RE_STATUS as u64, 32, 0);

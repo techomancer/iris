@@ -228,25 +228,12 @@ impl Mgras {
         let mut frames = 0u32;
         let mut last_rec_flush = std::time::Instant::now();
         let mut snap = plain::boxed_zeroed::<Frame>();
-        const PERSISTENT: u64 = crate::dev::ng1::rex3::Rex3::HB_LED_RED | crate::dev::ng1::rex3::Rex3::HB_LED_GREEN;
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
-            let stats = crate::disp::BarStats {
-                now: start,
-                hb: self.heartbeat.fetch_and(PERSISTENT, Ordering::Relaxed),
-                cycles: self.cycles.lock().retired(),
-                fasttick: self.fasttick.load(Ordering::Relaxed),
-                more_cpus: self.more_cpu_stats(),
-                decoded_delta: 0,
-                l1i_hits: 0,
-                l1i_fetches: 0,
-                uncached: 0,
-                count_hz: 0,
-                // Both queues: the HQ3's usually drains at once, and the
-                // backlog waits in front of the raster engines.
-                gfifo_pending: self.hq_fifo.len() + self.rss_fifo.len(),
-            };
+            // Both queues: the HQ3's usually drains at once, and the backlog
+            // waits in front of the raster engines.
+            let stats = self.status.snapshot(start, self.hq_fifo.len() + self.rss_fifo.len());
             if last_rec_flush.elapsed() >= std::time::Duration::from_millis(500) {
                 if let Some(rec) = self.mem_rec.lock().clone() {
                     rec.lock().flush();

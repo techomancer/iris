@@ -391,10 +391,10 @@ impl Machine {
         // after the executor/CPU exist — see Hot::cycles's doc comment.)
         let heartbeat     = Arc::new(AtomicU64::new(0)); // activity bits: see Rex3::HB_*
         let fasttick_count = Arc::new(AtomicU64::new(0)); // CP0 Compare match counter
-        let decoded_count = Arc::new(AtomicU64::new(0)); // pre-decoded instruction count
-        let l1i_hit_count        = Arc::new(AtomicU64::new(0)); // L1-I hit counter
-        let l1i_fetch_count      = Arc::new(AtomicU64::new(0)); // L1-I fetch counter
-        let uncached_fetch_count = Arc::new(AtomicU64::new(0)); // uncached instruction fetches
+        // What every graphics board's status bar reads; the CPU feeds its
+        // fetch counters and the cycle counter is wired in below.
+        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick_count.clone());
+        let [decoded_count, l1i_hit_count, l1i_fetch_count, uncached_fetch_count] = status.fetch_counters();
 
         // HPC3 (512KB at 0x1FB80000). The SCC's channels start wired to
         // nothing; each gets its host end below.
@@ -513,7 +513,7 @@ impl Machine {
         let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
             None
         } else {
-            let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let r = Arc::new(Rex3::new(status.clone()));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
             r.set_vblank_irq(ioc.irq_line(wiring.retrace));
             r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
@@ -523,7 +523,7 @@ impl Machine {
         let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.heads < 2 {
             None
         } else {
-            let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let r = Arc::new(Rex3::new(status.clone()));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
             r.set_vblank_irq(ioc.irq_line(wiring.retrace));
             r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
@@ -534,9 +534,9 @@ impl Machine {
         // selecting the board is explicit, and the PROM needs it to probe.
         let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
             crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Extreme => {
-                use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant};
+                use crate::dev::gr2::{Gr2, Gr2Variant};
                 let variant = if cfg.graphics_board() == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
-                let g = Gr2::new(variant, Gr2Stats { heartbeat: heartbeat.clone(), fasttick: fasttick_count.clone() });
+                let g = Gr2::new(variant, status.clone());
                 // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
                 // latch the guest clears (see Ioc::write8/int2_write8), so only
@@ -565,7 +565,7 @@ impl Machine {
                 Some(crate::dev::mgras::Mgras::new(cfg.graphics_board(), {
                     use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
                     [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
-                }, heartbeat.clone(), fasttick_count.clone()))
+                }, status.clone()))
             }
             _ => None,
         };
@@ -756,9 +756,8 @@ impl Machine {
             crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
         };
 
-        // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
-        #[cfg(feature = "developer")]
-        if let Some(rex3) = &board.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
+        // The developer status bar shows the CPU's Count rate.
+        status.set_count_hz(cpu.count_hz_atomic());
 
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -801,14 +800,11 @@ impl Machine {
         }
 
         // Wire up the CPU cycle counter for every device that reads it —
-        // Rex3::new/Wd33c93a::new run before the CPU exists, so this can't
-        // be a constructor parameter (see Hot::cycles's doc comment). Must
-        // happen before hpc3.scsi().start() (called later, from
+        // the boards and Wd33c93a::new run before the CPU exists, so this
+        // can't be a constructor parameter (see Hot::cycles's doc comment).
+        // Must happen before hpc3.scsi().start() (called later, from
         // Machine::start) actually spawns the worker thread that reads it.
-        if let Some(rex3) = &board.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(mgras) = &board.mgras { mgras.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(rex3) = &board.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(gr2) = &board.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
+        status.set_cpu_cycles(cpu.cycles_ptr());
         if let Some(td) = &board.testdev { td.attach_core(cpu.core_ptr()); }
         if cheritest_hook {
             if board.testdev.is_none() {

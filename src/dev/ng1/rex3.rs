@@ -1429,26 +1429,9 @@ pub struct Rex3 {
     /// the same as the previous GO.  Only accessed from the GFIFO consumer thread — no sync needed.
     #[cfg(feature = "rex-jit")]
     pub jit_last: std::cell::Cell<(u32, u32, u32, Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>)>,
-    /// Shared activity heartbeat — set by all devices, polled+cleared by the refresh thread.
-    /// bit 0 = enet TX, bit 1 = enet RX, bits 2-3 = red/green LED (persistent), bits 8-13 = SCSI IDs 0-5
-    pub heartbeat: Arc<AtomicU64>,
-    /// Pointer into the CPU's `MipsCore.hot.cycles` word (see
-    /// `CyclesPtr`/`Hot::cycles`'s doc comments). Set exactly once, from
-    /// `set_cpu_cycles`, during single-threaded `Machine::new` setup — after
-    /// the CPU exists (`Rex3::new` runs before it does, so this can't be a
-    /// constructor parameter; see `MipsCpu::cycles_ptr`) but strictly before
-    /// any device thread (including this struct's own refresh thread) is
-    /// spawned, so a plain `Cell` is
-    /// enough — no atomicity needed for the pointer variable itself.
-    /// `CyclesPtr::dangling()` until `set_cpu_cycles` runs; its own `get()`
-    /// treats that as "not wired up yet" and reports 0.
-    pub cycles: std::cell::Cell<crate::cpu::mips_core::CyclesPtr>,
-    /// CP0 Count==Compare match counter — incremented every fastick interrupt.
-    pub fasttick_count: Arc<AtomicU64>,
-    pub decoded_count: Arc<AtomicU64>,
-    pub l1i_hit_count: Arc<AtomicU64>,
-    pub l1i_fetch_count: Arc<AtomicU64>,
-    pub uncached_fetch_count: Arc<AtomicU64>,
+    /// The machine's status-bar inputs (heartbeat, cycle counter, ...), shared
+    /// with every other board on it.
+    pub status: Arc<crate::disp::StatusSource>,
     /// Optional log file for block/span draws (set when block_debug is enabled).
     #[cfg(feature = "developer")]
     block_log: Mutex<Option<std::fs::File>>,
@@ -1478,10 +1461,6 @@ pub struct Rex3 {
     /// Frame consumers (VNC) that want `screen.rgba` kept current; while
     /// non-zero every full frame is read back and the compositor is software.
     capture_users: AtomicUsize,
-    /// Atomic shadow of MipsCore::count_hz — updated by CPU thread, read by refresh thread.
-    /// Wrapped in Mutex so machine.rs can swap in the real Arc from MipsCore after construction.
-    #[cfg(feature = "developer")]
-    pub count_hz_atomic: Mutex<Arc<AtomicU64>>,
 }
 
 unsafe impl Sync for Rex3 {}
@@ -1501,7 +1480,7 @@ pub struct ShaderRow {
 }
 
 impl Rex3 {
-    pub fn new(heartbeat: Arc<AtomicU64>, fasttick_count: Arc<AtomicU64>, decoded_count: Arc<AtomicU64>, l1i_hit_count: Arc<AtomicU64>, l1i_fetch_count: Arc<AtomicU64>, uncached_fetch_count: Arc<AtomicU64>) -> Self {
+    pub fn new(status: Arc<crate::disp::StatusSource>) -> Self {
         // The dispatch map, shared with the Cranelift compiler thread so both
         // shader sources publish into one place.
         //
@@ -1618,13 +1597,7 @@ impl Rex3 {
             seen_shapes: Mutex::new(crate::dev::ng1::rex3_shape::ShapeSet::default()),
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
-            heartbeat,
-            cycles: std::cell::Cell::new(crate::cpu::mips_core::CyclesPtr::dangling()),
-            fasttick_count,
-            decoded_count,
-            l1i_hit_count,
-            l1i_fetch_count,
-            uncached_fetch_count,
+            status,
             #[cfg(feature = "developer")]
             block_log: Mutex::new(None),
             #[cfg(feature = "gputrace")]
@@ -1639,8 +1612,6 @@ impl Rex3 {
             screenshot_counter: AtomicU32::new(0),
             frame_request: AtomicBool::new(false),
             capture_users: AtomicUsize::new(0),
-            #[cfg(feature = "developer")]
-            count_hz_atomic: Mutex::new(Arc::new(AtomicU64::new(crate::cpu::mips_core::DEFAULT_COUNT_HZ))),
         }
     }
 
@@ -1745,19 +1716,6 @@ impl Rex3 {
         if let Some(irq) = self.fifo_full_cb.lock().clone() {
             irq.set(crossed);
         }
-    }
-
-    #[cfg(feature = "developer")]
-    pub fn set_count_hz_atomic(&self, arc: Arc<AtomicU64>) {
-        *self.count_hz_atomic.lock() = arc;
-    }
-
-    /// Wire up the CPU cycle counter — called from `Machine::new` once
-    /// `MipsCpu` exists (`Rex3::new` runs before it does, so this can't be a
-    /// constructor parameter; see `Hot::cycles`'s doc comment for why it's a
-    /// raw pointer at all, not a shared `Arc<AtomicU64>`).
-    pub fn set_cpu_cycles(&self, ptr: crate::cpu::mips_core::CyclesPtr) {
-        self.cycles.set(ptr);
     }
 
     fn setup(&self, ctx: &mut Rex3Context) {
@@ -2970,34 +2928,7 @@ impl Rex3 {
             self.trace_flush(false);
 
             // Poll and clear activity bits; preserve persistent LED bits.
-            let bar_stats = crate::disp::BarStats {
-                more_cpus: Default::default(),
-                now:          start,
-                hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
-                cycles:       self.cycles.get().retired(),
-                fasttick:     self.fasttick_count.load(Ordering::Relaxed),
-                #[cfg(feature = "developer")]
-                decoded_delta: self.decoded_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                decoded_delta: 0,
-                #[cfg(feature = "developer")]
-                l1i_hits:     self.l1i_hit_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                l1i_hits:     0,
-                #[cfg(feature = "developer")]
-                l1i_fetches:  self.l1i_fetch_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                l1i_fetches:  0,
-                #[cfg(feature = "developer")]
-                uncached:     self.uncached_fetch_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                uncached:     0,
-                #[cfg(feature = "developer")]
-                count_hz:     self.count_hz_atomic.lock().load(Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                count_hz:     0,
-                gfifo_pending: self.gfifo.len(),
-            };
+            let bar_stats = self.status.snapshot(start, self.gfifo.len());
 
             // Fence-based sync: wait until the GFIFO consumer has processed every
             // GFIFO_DISP_SYNC pushed since the last frame.  Each XMAP mode table
@@ -4925,7 +4856,7 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn screenshot_pending(&self) -> bool { self.screenshot_pending.load(Ordering::Relaxed) }
-    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.cycles.get() }
+    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.status.cycles() }
     fn request_frame(&self) { self.frame_request.store(true, Ordering::Relaxed); }
     fn frame_pending(&self) -> bool { self.frame_request.load(Ordering::Relaxed) }
     fn set_capture(&self, on: bool) {

@@ -372,11 +372,7 @@ pub struct Mgras {
     /// (`Rex3Screen::prebuilt`), as GR2 does.
     screen: Mutex<crate::disp::Rex3Screen>,
     screenshot_pending: AtomicBool,
-    heartbeat: Arc<AtomicU64>,
-    fasttick: Arc<AtomicU64>,
-    cycles: SpinLock<crate::cpu::mips_core::CyclesPtr>,
-    /// The other CPUs, for the status bar.
-    more_cpus: SpinLock<Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)>>,
+    status: Arc<crate::disp::StatusSource>,
     /// Annotated trace (`mgras trace`); `trace_mask` gates the hot paths.
     trace: SpinLock<debug::MgrasTrace>,
     trace_mask: AtomicU32,
@@ -497,7 +493,7 @@ impl Mgras {
     /// are not valid zeroed are written.
     /// `irqs` are the FIFO, general and retrace interrupts, as the slot
     /// wires them.
-    pub fn new(board: GraphicsBoard, irqs: [crate::irq::IrqLine; 3], heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Arc<Self> {
+    pub fn new(board: GraphicsBoard, irqs: [crate::irq::IrqLine; 3], status: Arc<crate::disp::StatusSource>) -> Arc<Self> {
         let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
         let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
         // SAFETY: `p` points at zeroed, exclusively owned memory. Every field
@@ -540,10 +536,7 @@ impl Mgras {
             addr_of_mut!((*p).renderer).write(Mutex::new(None));
             addr_of_mut!((*p).display_stop).write(Default::default());
             addr_of_mut!((*p).screen).write(Mutex::new(crate::disp::Rex3Screen::new()));
-            addr_of_mut!((*p).heartbeat).write(heartbeat);
-            addr_of_mut!((*p).fasttick).write(fasttick);
-            addr_of_mut!((*p).cycles).write(SpinLock::new(crate::cpu::mips_core::CyclesPtr::dangling()));
-            addr_of_mut!((*p).more_cpus).write(SpinLock::new(Vec::new()));
+            addr_of_mut!((*p).status).write(status);
             addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new()));
             a.assume_init()
         };
@@ -585,7 +578,6 @@ impl Mgras {
             }
         }
         register_spin("mgras::refresh", self, |m| &m.refresh);
-        register_spin("mgras::cycles", self, |m| &m.cycles);
         register_spin("mgras::trace", self, |m| &m.trace);
         register_mutex_fn("mgras::renderer", self, |m| m.renderer.is_locked());
         register_mutex_fn("mgras::screen", self, |m| m.screen.is_locked());
@@ -972,21 +964,6 @@ impl Mgras {
         };
         crate::pf_instant!(crate::perfetto::events::MGRAS_IRQ_LINE, n << 1 | active as usize);
         self.irqs[n].set(active);
-    }
-
-    /// Wire up the CPU cycle counter for the status bar's MIPS figure.
-    pub fn set_cpu_cycles(&self, ptr: crate::cpu::mips_core::CyclesPtr) {
-        *self.cycles.lock() = ptr;
-    }
-
-    /// One more CPU for the status bar.
-    pub fn add_cpu_stats(&self, cycles: crate::cpu::mips_core::CyclesPtr, fasttick: Arc<AtomicU64>) {
-        self.more_cpus.lock().push((cycles, fasttick));
-    }
-
-    fn more_cpu_stats(&self) -> [Option<(u64, u64)>; crate::disp::MORE_CPUS] {
-        let more = self.more_cpus.lock();
-        std::array::from_fn(|i| more.get(i).map(|(c, f)| (c.retired(), f.load(Ordering::Relaxed))))
     }
 
     fn offset(&self, addr: u64) -> Option<u32> {
@@ -1603,7 +1580,7 @@ impl crate::gfx_display::GfxDisplay for Mgras {
     fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
     fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
-    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { *self.cycles.lock() }
+    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.status.cycles() }
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         // A racy read of the VC3, as the display thread's snapshot does.
         let vc3 = &self.front_view().dcb.vc3;

@@ -299,7 +299,10 @@ impl O2Machine {
         // its interface buffer.
         bus.crime.re.start(bus.clone(), |b: &Ip32Bus| &b.crime.re);
         let running = Arc::new(AtomicBool::new(false));
-        let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), cpu.fasttick_count(), running.clone()));
+        let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
+        status.set_cpu_cycles(cpu.cycles_ptr());
+        status.set_count_hz(cpu.count_hz_atomic());
+        let display = Arc::new(O2Display::new(bus.clone(), status, running.clone()));
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
@@ -875,23 +878,22 @@ pub struct O2Display {
     display_stop: crate::gfx_display::DisplayStop,
     screen: Mutex<Rex3Screen>,
     screenshot_pending: AtomicBool,
-    cycles: CyclesPtr,
-    /// The CPU's Compare-match count: IRIX's clock tick on the O2, which has
-    /// no 8254. The status bar's Hz.
-    ticks: Arc<std::sync::atomic::AtomicU64>,
+    /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
+    /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
+    /// which has no 8254).
+    status: Arc<crate::disp::StatusSource>,
     running: Arc<AtomicBool>,
 }
 
 impl O2Display {
-    fn new(bus: Arc<Ip32Bus>, cycles: CyclesPtr, ticks: Arc<std::sync::atomic::AtomicU64>, running: Arc<AtomicBool>) -> Self {
+    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, running: Arc<AtomicBool>) -> Self {
         Self {
             bus,
             renderer: Mutex::new(None),
             display_stop: Default::default(),
             screen: Mutex::new(Rex3Screen::new()),
             screenshot_pending: AtomicBool::new(false),
-            cycles,
-            ticks,
+            status,
             running,
         }
     }
@@ -930,19 +932,7 @@ impl O2Display {
                 screen.height = h;
                 screen.status_bar_only = false;
                 let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-                let stats = crate::disp::BarStats {
-                    more_cpus: Default::default(),
-                    now: start,
-                    hb: self.bus.mace.id.heartbeat.fetch_and(crate::dev::ng1::rex3::Rex3::HB_PERSISTENT, Ordering::Relaxed),
-                    cycles: self.cycles.retired(),
-                    fasttick: self.ticks.load(Ordering::Relaxed),
-                    decoded_delta: 0,
-                    l1i_hits: 0,
-                    l1i_fetches: 0,
-                    uncached: 0,
-                    count_hz: 0,
-                    gfifo_pending: 0,
-                };
+                let stats = self.status.snapshot(start, 0);
                 if let Some(r) = self.renderer.lock().as_mut() {
                     if (w, h) != size {
                         r.resize(w, h);
@@ -983,7 +973,7 @@ impl crate::gfx_display::GfxDisplay for O2Display {
         self.screenshot_pending.store(true, Ordering::Relaxed);
     }
     fn cycles(&self) -> CyclesPtr {
-        self.cycles.clone()
+        self.status.cycles()
     }
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         let (x, y, mask) = self.bus.gbe.cursor()?;

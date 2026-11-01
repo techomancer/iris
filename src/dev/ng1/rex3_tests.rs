@@ -45,14 +45,7 @@ fn make_rex3_unstarted() -> TestBoard<Rex3> {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
-            let rex = Box::new(Rex3::new(
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
-            ));
+            let rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
             unsafe {
                 (*rex.fb_rgb.get()).fill(0);
                 (*rex.fb_aux.get()).fill(0);
@@ -2550,14 +2543,7 @@ mod jit_tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
-                let mut rex = Box::new(Rex3::new(
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)),
-                ));
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);

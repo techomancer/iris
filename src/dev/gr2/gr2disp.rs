@@ -19,8 +19,6 @@ use super::Gr2;
 const VBLANK: Duration = Duration::from_micros(700);
 /// Minimum refresh rate while idle, so the status bar keeps moving.
 const IDLE_HEARTBEAT_FRAMES: u32 = 6;
-/// Heartbeat bits that persist across frames (front-panel LEDs); same as REX3.
-const HB_PERSISTENT: u64 = crate::dev::ng1::rex3::Rex3::HB_PERSISTENT;
 
 impl Gr2 {
     pub(super) fn display_loop(&self) {
@@ -38,19 +36,7 @@ impl Gr2 {
             let shot = self.screenshot_pending.load(Ordering::Relaxed);
             if dirty || shot || frames_since_render >= IDLE_HEARTBEAT_FRAMES {
                 frames_since_render = 0;
-                let stats = crate::disp::BarStats {
-                    more_cpus: Default::default(),
-                    now: start,
-                    hb: self.stats.heartbeat.fetch_and(HB_PERSISTENT, Ordering::Relaxed),
-                    cycles: self.cycles.get().retired(),
-                    fasttick: self.stats.fasttick.load(Ordering::Relaxed),
-                    decoded_delta: 0,
-                    l1i_hits: 0,
-                    l1i_fetches: 0,
-                    uncached: 0,
-                    count_hz: 0,
-                    gfifo_pending: self.hq_fifo.len(),
-                };
+                let stats = self.status.snapshot(start, self.hq_fifo.len());
 
                 let mut screen = self.screen.lock();
                 if dirty || !sized {

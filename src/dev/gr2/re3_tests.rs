@@ -177,10 +177,7 @@ fn writebuf_then_readbuf_stream() {
 /// A started board, stopped and freed when the test ends. Bind it with
 /// `let g = &live_gr2(..);` so helpers taking `&Gr2` coerce.
 pub(super) fn live_gr2(variant: Gr2Variant) -> crate::test_board::TestBoard<Gr2> {
-    let g = Gr2::new(variant, Gr2Stats {
-        heartbeat: Arc::new(AtomicU64::new(0)),
-        fasttick: Arc::new(AtomicU64::new(0)),
-    });
+    let g = Gr2::new(variant, crate::disp::StatusSource::detached());
     let g = crate::test_board::TestBoard::new(g);
     g.start();
     g

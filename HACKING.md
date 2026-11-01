@@ -484,6 +484,19 @@ without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
 thread that owns it.
 
+The status bar under the frame is fed by `StatusSource` (`src/disp.rs`),
+which the machine builds once and hands to every graphics board: the
+heartbeat word (front-panel LEDs and SCSI/network activity bits), the CPU
+cycle counter, the Compare-match count and, in developer builds, the fetch
+counters. A display thread calls `status.snapshot(now, gfifo_pending)` once
+per presented frame and passes the result to `Renderer::present`; the call
+clears the activity bits and keeps the LEDs. Only the board's own queue depth
+is supplied by the board. A new board takes the `Arc<StatusSource>` in its
+constructor, answers `GfxDisplay::cycles` from it, and does not build a
+`BarStats` itself. The machine wires the cycle counter in with one
+`set_cpu_cycles` once the CPU exists, and each further CPU with
+`add_cpu_stats`.
+
 ### The composed frame and the hardware cursor
 
 `GfxDisplay` (`src/gfx_display.rs`) is what the window, the CI socket, the

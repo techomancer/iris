@@ -528,8 +528,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::dev::ng1::rex3::{REX3_BASE, REX3_SIZE};
     use crate::traits::{BusDevice, Device, BUS_BUSY};
-    use std::sync::atomic::AtomicU64;
-    use std::sync::Arc;
 
     /// A REX3 with `state` loaded (power-on otherwise) and its threads
     /// running. Built on a big stack (see rex3_tests' `make_rex3`) and
@@ -539,8 +537,7 @@ pub(crate) mod tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                let z = || Arc::new(AtomicU64::new(0));
-                let rex: &'static Rex3 = Box::leak(Box::new(Rex3::new(z(), z(), z(), z(), z(), z())));
+                let rex: &'static Rex3 = Box::leak(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);

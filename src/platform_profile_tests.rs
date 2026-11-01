@@ -17,7 +17,7 @@ mod tests {
     use crate::dev::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
     use crate::dev::mgras::{Mgras, GIO_ID, MGRAS_SLOT_GFX_BASE};
     use crate::traits::{BusDevice, Saveable};
-    use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant, GR2_BASE};
+    use crate::dev::gr2::{Gr2, Gr2Variant, GR2_BASE};
 
     fn minimal_cfg() -> MachineConfig {
         let mut cfg = MachineConfig::default();
@@ -161,10 +161,7 @@ mod tests {
     }
 
     fn gr2(variant: Gr2Variant) -> Arc<Gr2> {
-        Gr2::new(variant, Gr2Stats {
-            heartbeat: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            fasttick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        })
+        Gr2::new(variant, crate::disp::StatusSource::detached())
     }
 
     /// What PROM Gr2Probe / Gr2InitInfo read (GR2.h probe section).
@@ -216,8 +213,7 @@ mod tests {
 
     #[test]
     fn mgras_answers_the_gio_id_probe() {
-        let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let m = Mgras::new(GraphicsBoard::SolidImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
+        let m = Mgras::new(GraphicsBoard::SolidImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached());
         assert_eq!(m.read32(MGRAS_SLOT_GFX_BASE as u64).data, GIO_ID);
     }
 

@@ -304,8 +304,7 @@ pub(super) mod tests {
 
     /// A board of kind `kind` with its engine threads running (no display).
     pub fn live_board_of(kind: GraphicsBoard) -> Arc<Mgras> {
-        let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let m = Mgras::new(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
+        let m = Mgras::new(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached());
         m.start_engines();
         m
     }
