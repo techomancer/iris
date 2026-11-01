@@ -337,10 +337,12 @@ nokhwa = { version = "0.10", features = ["input-msmf"] }
 # SetUnhandledExceptionFilter, RtlCaptureStackBackTrace, EXCEPTION_POINTERS) and
 # resolves stack frames to module+offset (Win32_System_LibraryLoader:
 # GetModuleHandleExW / GetModuleFileNameW).
+# cow_disk.rs marks a copied overlay sparse with DeviceIoControl
+# (Win32_System_IO) and FSCTL_SET_SPARSE (Win32_System_Ioctl).
 # host_dns.rs reads the host's DNS servers with GetAdaptersAddresses
 # (Win32_NetworkManagement_IpHelper); IP_ADAPTER_ADDRESSES_LH is gated behind
 # Win32_NetworkManagement_Ndis and Win32_Networking_WinSock.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
