@@ -60,12 +60,12 @@ fn emulator_profile() -> Option<MachineProfile> {
 /// model-neutral words remain.
 fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static str] {
     match profile {
-        Some(MachineProfile::IndyIp24) => &["IRIX", "Iris", "Indy", "IP24"],
-        Some(MachineProfile::Indigo2Ip22) => &["IRIX", "Iris", "Indigo2", "IP22"],
-        Some(MachineProfile::Indigo2Ip28) => &["IRIX", "Iris", "Indigo2", "IP28"],
-        Some(MachineProfile::O2Ip32) => &["IRIX", "Iris", "IP32"],
-        Some(MachineProfile::OctaneIp30) => &["IRIX", "Iris", "IP30"],
-        None => &["IRIX", "Iris"],
+        Some(MachineProfile::IndyIp24) => &["IRIX", "Iris", "IPsomething", "Indy", "IP24"],
+        Some(MachineProfile::Indigo2Ip22) => &["IRIX", "Iris", "IPsomething", "Indigo2", "IP22"],
+        Some(MachineProfile::Indigo2Ip28) => &["IRIX", "Iris", "IPsomething", "Indigo2", "IP28"],
+        Some(MachineProfile::O2Ip32) => &["IRIX", "Iris", "IPsomething", "IP32"],
+        Some(MachineProfile::OctaneIp30) => &["IRIX", "Iris", "IPsomething", "IP30"],
+        None => &["IRIX", "Iris", "IPsomething"],
     }
 }
 
