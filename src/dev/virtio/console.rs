@@ -157,15 +157,19 @@ impl Console {
     }
 
     /// Move whatever the backend has into the staging queue. True if any.
+    /// This runs on the pump thread and in `poll`, so the lock is held across
+    /// the read and the append: chunks stay in order, and a backend that has
+    /// reported the end of its input has nothing left on the way to the queue.
     fn pump_port(io: &PortIo) -> bool {
         let mut got = false;
         let mut buf = [0u8; 4096];
-        while io.staged.lock().len() < STAGE_CAP {
+        let mut staged = io.staged.lock();
+        while staged.len() < STAGE_CAP {
             let n = io.backend.read(&mut buf);
             if n == 0 {
                 break;
             }
-            io.staged.lock().extend(buf[..n].iter().copied());
+            staged.extend(buf[..n].iter().copied());
             got = true;
         }
         got
@@ -330,30 +334,36 @@ impl VirtioDevice for Console {
             let io = self.ports[p].io.clone();
             Self::pump_port(&io);
 
-            // Tell the guest when the host end appeared or went away.
-            if self.multiport && self.ports[p].ready {
-                let c = io.backend.connected();
-                if c != self.ports[p].host_open_sent {
-                    self.ports[p].host_open_sent = c;
-                    self.ctrl_out.push_back(ctrl(p as u32, EV_PORT_OPEN, c as u16));
-                }
+            // Tell the guest when the host end appeared: before its input, or
+            // the guest reads that input and then finds no host there.
+            let connected = io.backend.connected();
+            let report = self.multiport && self.ports[p].ready && connected != self.ports[p].host_open_sent;
+            if report && connected {
+                self.ports[p].host_open_sent = true;
+                self.ctrl_out.push_back(ctrl(p as u32, EV_PORT_OPEN, 1));
             }
 
             // Host input into the guest's receive buffers.
-            if !self.ports[p].guest_open {
-                continue;
+            if self.ports[p].guest_open {
+                let q = Self::rx_queue(p);
+                while !io.staged.lock().is_empty() {
+                    let Some(chain) = cx.queues[q].pop(cx.mem) else { break };
+                    let take = chain.writable_len();
+                    let data: Vec<u8> = {
+                        let mut s = io.staged.lock();
+                        let n = take.min(s.len());
+                        s.drain(..n).collect()
+                    };
+                    let written = chain.write_all(cx.mem, &data).unwrap_or(0);
+                    cx.used(q, chain.head, written as u32);
+                }
             }
-            let q = Self::rx_queue(p);
-            while !io.staged.lock().is_empty() {
-                let Some(chain) = cx.queues[q].pop(cx.mem) else { break };
-                let take = chain.writable_len();
-                let data: Vec<u8> = {
-                    let mut s = io.staged.lock();
-                    let n = take.min(s.len());
-                    s.drain(..n).collect()
-                };
-                let written = chain.write_all(cx.mem, &data).unwrap_or(0);
-                cx.used(q, chain.head, written as u32);
+
+            // Tell the guest when the host end went away, once the guest has
+            // everything it sent: a guest reads end of file on hearing this.
+            if report && !connected && io.staged.lock().is_empty() {
+                self.ports[p].host_open_sent = false;
+                self.ctrl_out.push_back(ctrl(p as u32, EV_PORT_OPEN, 0));
             }
         }
 
@@ -610,6 +620,48 @@ mod tests {
         r.kick(5);
         assert_eq!(r.ports[1].take_tx(), b"reply");
         assert!(r.ports[0].take_tx().is_empty());
+    }
+
+    #[test]
+    fn host_going_away_waits_for_its_input() {
+        let mut r = Rig::new(&[(None, true), (Some("agent"), false)], F_MULTIPORT);
+        let c: Vec<u64> = (0..4).map(|_| r.give(2, None, 64)).collect();
+        r.kick(2);
+        r.give(3, Some(&ctrl(1, EV_PORT_READY, 1)), 0);
+        r.kick(3);
+        r.give(3, Some(&ctrl(1, EV_PORT_OPEN, 1)), 0);
+        r.kick(3);
+        assert_eq!(r.used(2).len(), 2, "the port's name and the host end");
+        assert_eq!(r.read(c[1], 8), ctrl(1, EV_PORT_OPEN, 1));
+
+        // The host sends and hangs up, with no receive buffer waiting.
+        r.ports[1].push_rx(b"last words");
+        r.ports[1].set_connected(false);
+        r.kick(4);
+        assert!(r.used(2).is_empty(), "the guest has none of the input");
+
+        let a = r.give(4, None, 4);
+        r.kick(4);
+        assert_eq!(r.used(4), vec![(0, 4)]);
+        assert!(r.used(2).is_empty(), "the guest has some of the input");
+
+        let b = r.give(4, None, 32);
+        r.kick(4);
+        assert_eq!(r.used(4), vec![(1, 6)]);
+        assert_eq!(r.read(a, 4), b"last");
+        assert_eq!(r.read(b, 6), b" words");
+        assert_eq!(r.used(2).len(), 1, "now the guest hears");
+        assert_eq!(r.read(c[2], 8), ctrl(1, EV_PORT_OPEN, 0));
+
+        // A host that comes back is reported before its input.
+        r.ports[1].set_connected(true);
+        r.ports[1].push_rx(b"hi");
+        let d = r.give(4, None, 32);
+        r.kick(4);
+        assert_eq!(r.used(2).len(), 1);
+        assert_eq!(r.read(c[3], 8), ctrl(1, EV_PORT_OPEN, 1));
+        assert_eq!(r.used(4), vec![(2, 2)]);
+        assert_eq!(r.read(d, 2), b"hi");
     }
 
     #[test]

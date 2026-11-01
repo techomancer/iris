@@ -57,7 +57,9 @@ nothing: its output is dropped and no input arrives. At most 31 ports.
 A host end is a listening socket that serves one client at a time. Bytes are
 passed through untouched (unlike the UART consoles, there is no telnet
 negotiation). Guest output with no client connected is dropped; input is held
-(up to 64 KB per port) until the guest has a receive buffer.
+(up to 64 KB per port) until the guest has a receive buffer. A client may send
+and hang up at once: the guest gets everything it sent before it hears that the
+host end has gone.
 
 ## What the guest sees
 
@@ -83,7 +85,10 @@ Control protocol (multiport): the driver sends `DEVICE_READY`; the device
 replies `DEVICE_ADD` per port; the driver answers `PORT_READY`; the device
 sends `CONSOLE_PORT` (for a console), `PORT_NAME` (for a named port) and
 `PORT_OPEN` when the host end is connected. The driver sends `PORT_OPEN` when
-the guest program opens the port, and host input is held until then.
+the guest program opens the port, and host input is held until then. `PORT_OPEN
+0` comes only when the guest has been given all of the host's input, so a driver
+can take it as end of file. Until then a port whose guest program never reads
+still shows a host there.
 
 ### virtio-mmio (Indy, Indigo2)
 
