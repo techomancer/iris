@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,7 @@ impl PortBackend for NullPort {
 pub struct MemPort {
     tx: Mutex<Vec<u8>>,
     rx: Mutex<VecDeque<u8>>,
+    closed: AtomicBool,
 }
 
 impl MemPort {
@@ -58,6 +60,10 @@ impl MemPort {
     pub fn take_tx(&self) -> Vec<u8> {
         std::mem::take(&mut *self.tx.lock())
     }
+    /// Say whether a host is attached. A new port has one.
+    pub fn set_connected(&self, connected: bool) {
+        self.closed.store(!connected, Ordering::Release);
+    }
 }
 
 impl PortBackend for MemPort {
@@ -71,6 +77,9 @@ impl PortBackend for MemPort {
             *b = rx.pop_front().unwrap();
         }
         n
+    }
+    fn connected(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -98,14 +107,16 @@ impl SocketPort {
 }
 
 impl PortBackend for SocketPort {
+    /// A client that cannot be written to is not dropped here: it may have
+    /// sent input and hung up, and that input is still in the socket for
+    /// `read`, which finds the end of it.
     fn write(&self, data: &[u8]) {
-        let mut gone = false;
         self.with_client(|c| {
             let deadline = Instant::now() + Duration::from_millis(500);
             let mut rest = data;
             while !rest.is_empty() {
                 match c.write(rest) {
-                    Ok(0) => { gone = true; break }
+                    Ok(0) => break,
                     Ok(n) => rest = &rest[n..],
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         // A slow reader: wait briefly, then drop the rest
@@ -114,13 +125,10 @@ impl PortBackend for SocketPort {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => { gone = true; break }
+                    Err(_) => break,
                 }
             }
         });
-        if gone {
-            *self.client.lock() = None;
-        }
     }
 
     fn read(&self, buf: &mut [u8]) -> usize {
@@ -129,7 +137,8 @@ impl PortBackend for SocketPort {
             .with_client(|c| match c.read(buf) {
                 Ok(0) => { gone = true; 0 }
                 Ok(n) => n,
-                Err(_) => 0,
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => 0,
+                Err(_) => { gone = true; 0 }
             })
             .unwrap_or(0);
         if gone {
@@ -233,5 +242,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(back, bytes);
+    }
+
+    /// The agent's reply to a host that has gone must not cost the rest of
+    /// what that host sent.
+    #[cfg(unix)]
+    #[test]
+    fn input_survives_a_write_to_a_client_that_hung_up() {
+        let path = std::env::temp_dir().join(format!("iris-virtio-test-{}.sock", std::process::id()));
+        let path = path.to_str().unwrap();
+        let p = unix_port(path).unwrap();
+        let mut c = std::os::unix::net::UnixStream::connect(path).unwrap();
+        assert!(p.connected());
+        c.write_all(b"last words").unwrap();
+        drop(c);
+        p.write(b"nobody is listening");
+        assert!(p.connected(), "the input has not been read yet");
+        let mut buf = [0u8; 32];
+        assert_eq!(p.read(&mut buf), 10);
+        assert_eq!(&buf[..10], b"last words");
+        assert_eq!(p.read(&mut buf), 0);
+        assert!(!p.connected());
+        std::fs::remove_file(path).unwrap();
     }
 }
