@@ -946,3 +946,10 @@ A snapshot refuses to load onto a different CPU model or host architecture. See
 [snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
 See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
+
+The Indy, Indigo2, O2 and Octane have snapshots. An Octane snapshot is
+refused with two processors or with an IMPACT or VPro board fitted: the stop
+does not yet bring both processors to one recorded instruction boundary, and
+neither board saves its state. Loading an Octane snapshot writes its boot flash and
+NVRAM over the configured flash and NVRAM files, so a PROM flashed since the
+save is replaced by the one the snapshot holds.

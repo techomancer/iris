@@ -46,8 +46,9 @@ use toml::Value;
 /// A v4 reader would find none of it in a v5 snapshot and restore a console
 /// with every UART register at zero under a running kernel; a v5 reader does
 /// the same with a v4 O2 snapshot, so the O2 refuses those. Nothing else
-/// changed shape: the serial DMA, the Indy's SCC and the rest are as before,
-/// and the Octane has no snapshots.
+/// changed shape: the serial DMA, the Indy's SCC and the rest are as before.
+/// Octane snapshots start at v5, and an Octane reads only snapshots of the
+/// schema it was built with, so the next bump refuses every older one.
 pub const SCHEMA_VERSION: u32 = 5;
 
 const MANIFEST_FILE: &str = "snapshot.toml";

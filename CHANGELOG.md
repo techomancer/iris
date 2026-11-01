@@ -13,6 +13,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Octane snapshots
+
+- **The Octane saves and restores snapshots**: the monitor's `save` and `load`,
+  and iris-ci's `save`, `restore` and `rollback`. A snapshot holds the CPU, every
+  device, all RAM, the boot flash and each SCSI controller's copy-on-write
+  overlays, in the O2's format. Restoring also rewrites the configured flash and
+  NVRAM files, and the guest's clocks resume from the time they showed at the save.
+- A two-processor Octane, or one with an IMPACT or VPro board, refuses a save or
+  load and says why.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
