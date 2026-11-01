@@ -165,7 +165,14 @@ cdrom = false
 overlay = true
 ```
 
-Writes go to `scsi1.raw.overlay`. Monitor commands:
+Writes go to `scsi1.raw.overlay`. One emulator can use an overlay at a time: a
+second is refused at start-up, with `... is in use by another iris`, because two
+writers ruin the filesystem in it. The lock is on `scsi1.raw.overlay.lock`, an
+empty file that stays behind and can be ignored; the lock itself goes with the
+process, however it ends. A `--ci` run has its own overlay under `/tmp`, so any
+number can run beside an interactive iris.
+
+Monitor commands:
 - `cow status` - show dirty sector count
 - `cow commit [id]` - merge overlay into base image (permanent)
 - `cow reset [id]` - discard all overlay writes

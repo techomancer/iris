@@ -97,6 +97,13 @@ fn ci_overlays() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// An overlay's lock file is held for as long as the machine lives, and
+/// holds no disk contents: Windows refuses to read a locked file, and the
+/// restore must not remove it from under the machine.
+fn is_overlay_lock(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "lock")
+}
+
 /// Every file the disks live in, as it was when taken.
 struct Snapshot(Vec<(PathBuf, Vec<u8>)>);
 
@@ -104,7 +111,7 @@ impl Snapshot {
     fn take(dir: &Dir) -> Snapshot {
         let mut files = Vec::new();
         for e in std::fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.path()).chain(ci_overlays()) {
-            if e.is_file() {
+            if e.is_file() && !is_overlay_lock(&e) {
                 files.push((e.clone(), std::fs::read(&e).unwrap()));
             }
         }
@@ -114,7 +121,7 @@ impl Snapshot {
     /// Put the files back as they were, and remove any made since.
     fn restore(self, dir: &Dir) {
         for e in std::fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.path()).chain(ci_overlays()) {
-            if e.is_file() {
+            if e.is_file() && !is_overlay_lock(&e) {
                 std::fs::remove_file(e).unwrap();
             }
         }

@@ -618,6 +618,7 @@ impl BlockNode for RawNode {
 /// write that takes a new sector against 20 us without it, and overwrites
 /// would still reach the disk out of order.
 pub struct CowNode {
+    _lock: Option<crate::cow_disk::OverlayLock>,
     backing: Option<Box<dyn BlockNode>>,
     /// Base image path, so [`CowNode::commit`] can merge the overlay back into
     /// it. Derived from a `.overlay` suffix unless set explicitly.
@@ -670,6 +671,7 @@ impl CowNode {
         size: u64,
     ) -> io::Result<Self> {
         let overlay_path = overlay_path.as_ref().to_path_buf();
+        let lock = crate::cow_disk::lock_overlay(&overlay_path)?;
         let overlay = OpenOptions::new()
             .read(true)
             .write(true)
@@ -702,7 +704,7 @@ impl CowNode {
             sidecar.display()
         );
         let bg = Background::for_file(&overlay);
-        let mut node = Self { backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, bg, size };
+        let mut node = Self { _lock: lock, backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, bg, size };
         // Compact what a killed run appended, and drop an append it cut short,
         // so new entries start on an entry boundary.
         if sidecar.exists() {
@@ -2623,6 +2625,30 @@ mod tests {
         assert_eq!(got, [0xAAu8; SECTOR_BYTES], "reset falls back to the base");
 
         node.flush().unwrap();
+    }
+
+    /// A second emulator is refused before it can touch the overlay, and the
+    /// message says why, since it ends the run.
+    #[test]
+    fn cow_refuses_an_overlay_another_process_holds() {
+        let dir = TempPath::dir("blocknode-locked");
+        let (backing, backing_path) = raw_filled(&dir, 0xAA, SECTOR_BYTES);
+        let overlay_path = dir.join("overlay");
+        let theirs = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(format!("{}.lock", overlay_path.display()))
+            .unwrap();
+        theirs.try_lock().unwrap();
+
+        let e = CowNode::new(Some(Box::new(backing)), &overlay_path, SECTOR_SIZE).err().expect("refused");
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        assert!(!overlay_path.exists(), "a refused open leaves the overlay alone");
+
+        drop(theirs);
+        let backing = RawNode::open_readonly(&backing_path).unwrap();
+        drop(CowNode::new(Some(Box::new(backing)), &overlay_path, SECTOR_SIZE).unwrap());
     }
 
     #[test]
