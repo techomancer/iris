@@ -67,7 +67,8 @@ use crate::config::AudioConfig;
 use crate::devlog::LogModule;
 use crate::host_audio::{HostOut, Resampler};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
-use crate::traits::Device;
+use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
+use crate::traits::{Device, Saveable};
 use crate::pci::{Bar, PciBusDevice, PciConfig, PciDma};
 
 pub const PCI_VENDOR_SGI: u16 = 0x10a9;
@@ -1676,6 +1677,215 @@ impl PciBusDevice for Rad1 {
     /// raises no interrupt, so there is no `connect_interrupt`.
     fn connect_dma(&self, dma: Arc<dyn PciDma>) {
         let _ = self.inner.dma.set(dma);
+    }
+}
+
+impl State {
+    /// Refuse a loaded state the card would divide by, index with or count
+    /// down from out of range.
+    fn check(&self) -> Result<(), String> {
+        for (g, r) in self.clock.iter().enumerate() {
+            if r.num == 0 || r.den == 0 {
+                return Err(format!("clock: generator {g} has rate {}/{}", r.num, r.den));
+            }
+        }
+        for (info, c) in CHAN_INFO.iter().zip(&self.chan) {
+            if c.offset > c.len {
+                return Err(format!("chan: {} is {:#x} into a {:#x}-byte ring", info.name, c.offset, c.len));
+            }
+            if c.next >= DESC_RAM_ENTRIES {
+                return Err(format!("chan: {} links to descriptor {}, the card has {DESC_RAM_ENTRIES}", info.name, c.next));
+            }
+        }
+        if u64::from(self.status_slots) > SLOT_MAX {
+            return Err(format!("status_slots: {}, at most {SLOT_MAX}", self.status_slots));
+        }
+        if self.status_cursor >= self.status_slots.max(1) {
+            return Err(format!("status_cursor: slot {} of {}", self.status_cursor, self.status_slots));
+        }
+        Ok(())
+    }
+}
+
+/// A mute word as saved: 0 not yet written, 1 released, 2 muted.
+fn mute_word(m: Option<bool>) -> u8 {
+    match m {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+fn mute_from_word(w: u8) -> Result<Option<bool>, String> {
+    match w {
+        0 => Ok(None),
+        1 => Ok(Some(false)),
+        2 => Ok(Some(true)),
+        _ => Err(format!("mute word {w}: not 0, 1 or 2")),
+    }
+}
+
+// The card's state for a snapshot: its registers and RAMs, each channel's
+// ring position and descriptor link, the clock generators' rates and loads,
+// the output's generator, the mutes, UST and the status schedule. The card
+// keeps time on its own clock, host time less the time it was stopped and
+// the time held back for timer hold-ups; the save records that clock and
+// the time held back, and the load sets the stopped time so the clock
+// resumes at the saved instant, as the machine's other clocks do. The
+// timers are armed again when the card starts. The host audio stream is
+// this process's own and is not saved.
+impl Saveable for Rad1 {
+    fn save_state(&self) -> toml::Value {
+        let i = &self.inner;
+        let now = i.now();
+        let s = i.state.lock();
+        let chans = s.chan.iter().map(|c| {
+            StateTable::new()
+                .bool("running", c.running)
+                .u64("base", c.base)
+                .u64("len", c.len)
+                .u64("offset", c.offset)
+                .u64("start_ns", c.start_ns as u64)
+                .u64("frames", c.frames)
+                .bool("eod", c.eod)
+                .u32("next", c.next)
+                .bool("looping", c.looping)
+                .bool("stalled", c.stalled)
+                .build()
+        }).collect();
+        let rates: Vec<u64> = s.clock.iter().flat_map(|r| [r.num, r.den]).collect();
+        // Each generator's last load as (loaded, control, remainder).
+        let cg_loaded: Vec<u64> = s.cg_loaded.iter()
+            .flat_map(|l| l.map_or([0, 0, 0], |(c, r)| [1, u64::from(c), u64::from(r)]))
+            .collect();
+        StateTable::new()
+            .u64("clock_ns", now as u64)
+            .u64("stalled_ns", i.stalled_ns.load(Ordering::SeqCst) as u64)
+            .u32s("startup", &s.startup)
+            .u64s("subcode", &s.subcode)
+            .u32s("dma_bank", &s.dma_bank)
+            .u32s("sample_pos", &s.sample_pos)
+            .u32("analog_out_en", s.analog_out_en)
+            .u64("out_cg", s.out_cg as u64)
+            .u64s("cg_loaded", &cg_loaded)
+            .u8("relay_muted", mute_word(s.relay_muted))
+            .u8("dac_muted", mute_word(s.dac_muted))
+            .u32("status_dma_ctrl", s.status_dma_ctrl)
+            .bool("status_running", s.status_running)
+            .value("chan", toml::Value::Array(chans))
+            .u64s("clock", &rates)
+            .u32("ust_count", s.ust_count)
+            .u64("ust_phase", s.ust_phase as u64)
+            .bool("ust_enabled", s.ust_enabled)
+            .bool("ust_armed", s.ust_armed)
+            .u64("ust_last_ns", s.ust_last_ns as u64)
+            .u64("status_gen", s.status_gen)
+            .u32("status_interval", s.status_interval)
+            .u64("status_start_ns", s.status_start_ns as u64)
+            .u64("status_done", s.status_done)
+            .u32("status_cursor", s.status_cursor)
+            .u32("status_slots", s.status_slots)
+            .build()
+    }
+
+    /// Called with the card stopped.
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let i = &self.inner;
+        let chans = field(v, "chan")?.as_array().ok_or("chan: not a list")?;
+        let rates = field_u64_vec(v, "clock")?;
+        if rates.len() != NUM_CG * 2 {
+            return Err("clock: not one rate for each generator".into());
+        }
+        let subcode = field_u64_vec(v, "subcode")?;
+        if subcode.len() != SUBCODE_WORDS {
+            return Err(format!("subcode: {} words, expected {SUBCODE_WORDS}", subcode.len()));
+        }
+        let saved_now = field_u64(v, "clock_ns")? as i64;
+        let saved_stalled = field_u64(v, "stalled_ns")? as i64;
+        let out_cg = field_u64(v, "out_cg")? as usize;
+        if out_cg >= NUM_CG {
+            return Err(format!("out_cg: generator {out_cg}, the card has {NUM_CG}"));
+        }
+        let loads: [u64; NUM_CG * 3] = field_u64s(v, "cg_loaded")?;
+        let mut cg_loaded = [None; NUM_CG];
+        for (slot, &[loaded, ctrl, rem]) in cg_loaded.iter_mut().zip(loads.as_chunks::<3>().0) {
+            *slot = match loaded {
+                0 => None,
+                1 => Some((ctrl as u32, rem as u32)),
+                _ => return Err("cg_loaded: not a generator load".into()),
+            };
+        }
+        // Whole structs, so a field added to the card's state cannot be
+        // left out of the load without the compiler saying so.
+        let mut chan = Vec::with_capacity(NUM_CH);
+        for saved in chans {
+            chan.push(Chan {
+                running: field_bool(saved, "running")?,
+                base: field_u64(saved, "base")?,
+                len: field_u64(saved, "len")?,
+                offset: field_u64(saved, "offset")?,
+                start_ns: field_u64(saved, "start_ns")? as i64,
+                frames: field_u64(saved, "frames")?,
+                eod: field_bool(saved, "eod")?,
+                next: field_u32(saved, "next")?,
+                looping: field_bool(saved, "looping")?,
+                stalled: field_bool(saved, "stalled")?,
+            });
+        }
+        let chan: [Chan; NUM_CH] = chan.try_into().map_err(|_| "chan: not one entry for each channel")?;
+        let mut subcode_words = [0u64; SUBCODE_WORDS];
+        subcode_words.copy_from_slice(&subcode);
+        let loaded = State {
+            startup: field_u32s(v, "startup")?,
+            subcode: subcode_words,
+            dma_bank: field_u32s(v, "dma_bank")?,
+            sample_pos: field_u32s(v, "sample_pos")?,
+            analog_out_en: field_u32(v, "analog_out_en")?,
+            out_cg,
+            cg_loaded,
+            relay_muted: mute_from_word(field_u8(v, "relay_muted")?)?,
+            dac_muted: mute_from_word(field_u8(v, "dac_muted")?)?,
+            status_dma_ctrl: field_u32(v, "status_dma_ctrl")?,
+            status_running: field_bool(v, "status_running")?,
+            chan,
+            clock: std::array::from_fn(|g| Rate { num: rates[2 * g], den: rates[2 * g + 1] }),
+            ust_count: field_u32(v, "ust_count")?,
+            ust_phase: field_u64(v, "ust_phase")? as i64,
+            ust_enabled: field_bool(v, "ust_enabled")?,
+            ust_armed: field_bool(v, "ust_armed")?,
+            ust_last_ns: field_u64(v, "ust_last_ns")? as i64,
+            status_gen: field_u64(v, "status_gen")?,
+            status_interval: field_u32(v, "status_interval")?,
+            status_start_ns: field_u64(v, "status_start_ns")? as i64,
+            status_done: field_u64(v, "status_done")?,
+            status_cursor: field_u32(v, "status_cursor")?,
+            status_slots: field_u32(v, "status_slots")?,
+            // The card is stopped: its timers were removed, and come back
+            // when it starts.
+            audio_timer: None,
+            status_timer: None,
+        };
+        loaded.check()?;
+        {
+            let mut s = i.state.lock();
+            if s.audio_timer.is_some() || s.status_timer.is_some() {
+                return Err("RAD1 loaded while its timers run".into());
+            }
+            *s = loaded;
+        }
+        // The clock reads `saved_now` again, with the same time held back
+        // for timer hold-ups, which later on-time completions repay; and
+        // nothing later than the saved time has been handed out.
+        i.stalled_ns.store(saved_stalled, Ordering::SeqCst);
+        if i.fake_ns.load(Ordering::Relaxed) != i64::MIN {
+            i.fake_ns.store(saved_now + saved_stalled, Ordering::Relaxed);
+        } else {
+            let at = i.stopped_at.lock().unwrap_or_else(Instant::now);
+            let since_start = at.duration_since(i.start).as_nanos() as i64;
+            i.stopped_ns.store(since_start - saved_now - saved_stalled, Ordering::SeqCst);
+        }
+        i.seen_ns.store(saved_now, Ordering::SeqCst);
+        Ok(())
     }
 }
 

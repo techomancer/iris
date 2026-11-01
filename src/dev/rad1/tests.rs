@@ -1262,6 +1262,29 @@ fn a_late_status_completion_does_not_carry_the_output_through_the_hold_up() {
     assert_eq!(held(&r), 5_000_000 - irix_due(1) / 32);
 }
 
+/// Through late and on-time completions alike, the clock never reads behind
+/// a time it has handed out, so the latest time handed out is the clock's
+/// reading when the card is saved: a save need not keep the larger of the two.
+#[test]
+fn the_clock_never_reads_behind_a_time_it_handed_out() {
+    use crate::traits::Saveable;
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    let mut host = 0;
+    for (k, late) in [5_000_000, 0, 300_000, 40_000_000, 0, 0, 250_000_000, 10_000, 0, 7_000_000].iter().enumerate() {
+        host = host.max(irix_due(k as i64 + 1) + late);
+        at(&r, host);
+        // A guest read hands out the time before the completion runs.
+        r.now();
+        r.status_tick(gen);
+        let seen = r.seen_ns.load(Ordering::SeqCst);
+        assert!(r.clock_locked(&None) >= seen, "completion {k}: clock behind {seen}");
+    }
+    let seen = r.seen_ns.load(Ordering::SeqCst);
+    let v = r.save_state();
+    assert_eq!(crate::snapshot::field_u64(&v, "clock_ns").unwrap() as i64, seen.max(r.now()));
+}
+
 #[test]
 fn a_hold_up_is_more_than_one_interval_late_and_at_most_200ms_is_held_back() {
     let interval = irix_due(1);
@@ -1271,5 +1294,147 @@ fn a_hold_up_is_more_than_one_interval_late_and_at_most_200ms_is_held_back() {
         at(&r, irix_due(1) + late);
         r.status_tick(gen).unwrap();
         assert_eq!(held(&r), held_back, "{late} ns late");
+    }
+}
+
+/// A saved card loads into a fresh one: its registers come back, and its
+/// clock reads what it read at the save rather than the restoring card's.
+#[test]
+fn save_load_round_trip_keeps_the_cards_clock() {
+    use crate::traits::Saveable;
+    let src = card();
+    wr(&src, 0x80, 0xffe3cffe);
+    wr(&src, 0xa8, 0x13579bdf);
+    {
+        let mut s = src.state.lock();
+        s.chan[CH_OUT].eod = true;
+        s.chan[CH_OUT].next = 5;
+        s.chan[CH_OUT].looping = true;
+        s.chan[CH_OUT].stalled = true;
+        s.out_cg = 2;
+        s.cg_loaded[1] = Some((0x4000_0405, 0xffff));
+        s.relay_muted = Some(true);
+        s.dac_muted = Some(false);
+    }
+    src.stalled_ns.store(3_000_000, Ordering::SeqCst);
+    src.fake_ns.store(8_000_000, Ordering::Relaxed);
+    let v = src.save_state();
+    let dst = card();
+    dst.fake_ns.store(9_000_000_000, Ordering::Relaxed);
+    dst.now();
+    dst.load_state(&v).expect("load_state");
+    assert_eq!(dst.seen_ns.load(Ordering::SeqCst), 5_000_000, "nothing later handed out than the saved time");
+    assert_eq!(v, dst.save_state());
+    assert_eq!(rd(&dst, 0x80), rd(&src, 0x80));
+    assert_eq!(rd(&dst, 0xa8), 0x13579bdf);
+    assert_eq!(dst.now(), 5_000_000, "the clock less the time held back");
+    assert_eq!(held(&dst), 3_000_000);
+    let s = dst.state.lock();
+    let c = s.chan[CH_OUT];
+    assert_eq!((c.eod, c.next, c.looping, c.stalled), (true, 5, true, true));
+    assert_eq!((s.out_cg, s.cg_loaded[1], s.relay_muted, s.dac_muted), (2, Some((0x4000_0405, 0xffff)), Some(true), Some(false)));
+}
+
+/// A transfer saved partway through its first descriptor, with a link to
+/// follow, the mutes written and time held back for a hold-up, carries on
+/// in a fresh card exactly as in the card it came from.
+#[test]
+fn a_transfer_saved_partway_carries_on_the_same_in_a_fresh_card() {
+    use crate::traits::Saveable;
+    let entry = 3u32;
+    let (src, _src_ram, src_tap) = tune_card();
+    // 512 frames link to `entry`, which holds 256 frames with end of descriptor.
+    for (i, v) in [0x20_0000, 0, 0xffff_f804].into_iter().enumerate() {
+        wr(&src, 0x400 + 12 * entry + 4 * i as u32, v);
+    }
+    prom_tune(&src, 0xffff_f000 | entry << 3);
+    wr(&src, 0x88, 3);
+    wr(&src, 0x8c, 2);
+    at(&src, 10 * SEC / 1000);
+    rd(&src, 0x58);
+    src.stalled_ns.store(1_000_000, Ordering::SeqCst);
+    {
+        let s = src.state.lock();
+        let c = s.chan[CH_OUT];
+        assert!(c.running && !c.eod && c.next == entry && c.frames > 0 && c.frames < 512, "partway");
+        assert_eq!((s.relay_muted, s.dac_muted), (Some(false), Some(false)));
+    }
+    let played_before = src_tap.lock().len();
+    let v = src.save_state();
+
+    let (dst, _dst_ram, dst_tap) = tune_card();
+    dst.load_state(&v).expect("load_state");
+    assert_eq!(v, dst.save_state());
+    for ms in [12, 16, 20, 30, 1000] {
+        at(&src, ms * SEC / 1000);
+        at(&dst, ms * SEC / 1000);
+        assert_eq!(rd(&dst, 0x58), rd(&src, 0x58), "{ms} ms");
+        assert_eq!(dst.now(), src.now(), "{ms} ms");
+    }
+    assert_eq!(rd(&dst, 0x58), 0x4000_0000, "the linked descriptor ended the transfer");
+    assert_eq!(src_tap.lock()[played_before..], dst_tap.lock()[..], "the same frames after the save");
+    assert_eq!(played_before + dst_tap.lock().len(), (512 + 256) * 2);
+}
+
+/// On the host clock too: a stopped card restored later reads the time it
+/// stopped at, not the time the snapshot sat on disk.
+#[test]
+fn a_stopped_cards_host_clock_resumes_where_it_stopped() {
+    use crate::traits::Saveable;
+    let src = card();
+    src.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    Device::stop(&src);
+    src.stalled_ns.store(2_000_000, Ordering::SeqCst);
+    let at_save = src.now();
+    let v = src.save_state();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let dst = card();
+    dst.fake_ns.store(i64::MIN, Ordering::Relaxed);
+    Device::stop(&dst);
+    dst.load_state(&v).expect("load_state");
+    assert_eq!(dst.now(), at_save);
+    assert_eq!(held(&dst), 2_000_000);
+}
+
+/// A save holding a value the card cannot take is refused, naming the
+/// field, rather than loaded to panic or misbehave later.
+#[test]
+fn a_corrupt_save_is_refused_naming_the_field() {
+    use crate::snapshot::{hex_u32, hex_u64, hex_u8};
+    use crate::traits::Saveable;
+    type Edit = Box<dyn Fn(&mut toml::value::Table)>;
+    fn list<'a>(t: &'a mut toml::value::Table, key: &str) -> &'a mut Vec<toml::Value> {
+        t.get_mut(key).unwrap().as_array_mut().unwrap()
+    }
+    fn chan(t: &mut toml::value::Table, n: usize) -> &mut toml::value::Table {
+        list(t, "chan")[n].as_table_mut().unwrap()
+    }
+    let cases: Vec<(&str, Edit)> = vec![
+        ("mute word 3", Box::new(|t| { t.insert("relay_muted".into(), hex_u8(3)); })),
+        ("out_cg", Box::new(|t| { t.insert("out_cg".into(), hex_u64(NUM_CG as u64)); })),
+        ("cg_loaded: not a generator load", Box::new(|t| list(t, "cg_loaded")[0] = hex_u64(2))),
+        ("cg_loaded", Box::new(|t| { list(t, "cg_loaded").pop(); })),
+        ("chan:", Box::new(|t| { list(t, "chan").pop(); })),
+        ("clock:", Box::new(|t| { list(t, "clock").pop(); })),
+        ("subcode:", Box::new(|t| { list(t, "subcode").pop(); })),
+        ("clock: generator 0", Box::new(|t| list(t, "clock")[0] = hex_u64(0))),
+        ("clock: generator 1", Box::new(|t| list(t, "clock")[3] = hex_u64(0))),
+        ("into a", Box::new(|t| { chan(t, CH_OUT).insert("offset".into(), hex_u64(1)); })),
+        ("links to descriptor 16", Box::new(|t| { chan(t, CH_OUT).insert("next".into(), hex_u32(16)); })),
+        ("status_slots", Box::new(|t| { t.insert("status_slots".into(), hex_u32(0x81)); })),
+        ("status_cursor: slot 1 of 0", Box::new(|t| { t.insert("status_cursor".into(), hex_u32(1)); })),
+        ("status_cursor: slot 4 of 4", Box::new(|t| {
+            t.insert("status_slots".into(), hex_u32(4));
+            t.insert("status_cursor".into(), hex_u32(4));
+        })),
+    ];
+    let saved = card().save_state();
+    card().load_state(&saved).expect("the unedited save loads");
+    for (want, edit) in cases {
+        let mut v = saved.clone();
+        edit(v.as_table_mut().unwrap());
+        let e = card().load_state(&v).expect_err(want);
+        assert!(e.contains(want), "{want}: got {e}");
     }
 }
