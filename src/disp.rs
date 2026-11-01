@@ -509,6 +509,14 @@ fn rate_figures(mips: f64, hz: f64, more: &[Option<(f64, f64)>]) -> (String, Str
     (m, h)
 }
 
+/// How far a cycle counter moved between two samples. A counter that went
+/// backwards was set to 0 by a CPU reset inside the window, so it moved by
+/// its new value; a wrapping difference would show a reset as about 18
+/// trillion MIPS.
+pub fn cycles_moved(prev: u64, cur: u64) -> u64 {
+    if cur >= prev { cur - prev } else { cur }
+}
+
 /// Snapshot of CPU counters and wall-clock time captured once per refresh loop iteration.
 pub struct BarStats {
     pub now:            std::time::Instant,
@@ -776,7 +784,7 @@ impl StatusBar {
     pub fn render(&mut self, rgba: &mut Vec<u32>, width: usize, bar_y: usize, stats: &BarStats) {
         let dt = stats.now.duration_since(self.prev_time).as_secs_f64();
         if dt >= 0.1 {
-            let dc = stats.cycles.wrapping_sub(self.prev_cycles);
+            let dc = cycles_moved(self.prev_cycles, stats.cycles);
             let df = stats.fasttick.wrapping_sub(self.prev_fasttick);
             self.mips   = (dc as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0;
             #[cfg(feature = "developer")] {
@@ -792,7 +800,7 @@ impl StatusBar {
                 self.more_rates[i] = more.map(|(c, f)| {
                     let (pc, pf) = self.prev_more[i];
                     self.prev_more[i] = (c, f);
-                    ((c.wrapping_sub(pc) as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0, (f.wrapping_sub(pf) as f64 / dt).round())
+                    ((cycles_moved(pc, c) as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0, (f.wrapping_sub(pf) as f64 / dt).round())
                 });
             }
             self.prev_time     = stats.now;
@@ -1031,6 +1039,25 @@ mod rate_figure_tests {
     #[test]
     fn each_further_cpu_adds_a_figure() {
         assert_eq!(rate_figures(95.1, 100.0, &[Some((94.8, 99.0)), None, None]), (" 95.1|94.8".to_string(), " 100|99".to_string()));
+    }
+
+    /// A CPU reset sets the cycle counter back to 0 mid-window. The bar shows
+    /// what ran since, not a wrapped difference, for the first CPU and the
+    /// others alike.
+    #[test]
+    fn a_reset_in_the_window_counts_from_zero() {
+        let mut bar = super::StatusBar::new();
+        let t0 = bar.prev_time;
+        let stats = |now, cycles: u64| super::BarStats {
+            now, cycles, fasttick: 0,
+            more_cpus: std::array::from_fn(|i| (i == 0).then_some((cycles, 0))),
+            decoded_delta: 0, l1i_hits: 0, l1i_fetches: 0, uncached: 0, hb: 0, count_hz: 0, gfifo_pending: 0,
+        };
+        let mut rgba = vec![0u32; 2048 * super::STATUS_BAR_HEIGHT];
+        bar.render(&mut rgba, 640, 0, &stats(t0 + std::time::Duration::from_secs(1), 900_000_000));
+        bar.render(&mut rgba, 640, 0, &stats(t0 + std::time::Duration::from_secs(2), 40_000_000));
+        assert_eq!(bar.mips, 40.0);
+        assert_eq!(bar.more_rates[0], Some((40.0, 0.0)));
     }
 }
 

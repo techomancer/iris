@@ -181,7 +181,7 @@ impl RateMeter {
 /// rate: every CPU takes its own clock interrupt at the kernel's rate, so
 /// adding them would show twice the Hz on two CPUs.
 fn window_rates(prev: &[(u64, u64)], cur: &[(u64, u64)], dt: f64) -> (f32, f32) {
-    let retired: u64 = prev.iter().zip(cur).map(|(p, c)| c.0.wrapping_sub(p.0)).sum();
+    let retired: u64 = prev.iter().zip(cur).map(|(p, c)| iris::disp::cycles_moved(p.0, c.0)).sum();
     let mips = (retired as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
     let hz = match (prev.first(), cur.first()) {
         (Some(p), Some(c)) => (c.1.wrapping_sub(p.1) as f64 / dt).round() as f32,
@@ -385,6 +385,13 @@ mod tests {
         assert_eq!(window_rates(&prev, &cur, 1.0), (101.0, 10.0));
         // Over half a second the same deltas are twice the rate.
         assert_eq!(window_rates(&prev, &cur, 0.5), (202.0, 20.0));
+    }
+
+    /// A CPU reset in the window set its counter back to 0: count what ran
+    /// since rather than a wrapped difference.
+    #[test]
+    fn a_reset_in_the_window_counts_from_zero() {
+        assert_eq!(window_rates(&[(900_000_000, 10)], &[(40_000_000, 110)], 1.0), (40.0, 100.0));
     }
 
     #[test]
