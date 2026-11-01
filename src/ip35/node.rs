@@ -66,6 +66,13 @@ pub(crate) fn connect_cpu(
         md.rebuild_memory();
     }
     pi0.set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(cpu))));
+    node_events(name, lb, ni, l1, vec![Arc::downgrade(cpu)])
+}
+
+/// The resets and power events a node's local bus, network block and L1
+/// raise, on the receiver the system controller takes. An L1 soft reset
+/// reaches each of `cpus`.
+fn node_events(name: &'static str, lb: &BedrockLb, ni: &BedrockNi, l1: &L1, cpus: Vec<std::sync::Weak<dyn CpuDevice>>) -> Receiver<MachineEvent> {
     let (tx, rx) = channel();
     let reset_tx = tx.clone();
     lb.connect_soft_reset(Arc::new(move || {
@@ -75,11 +82,10 @@ pub(crate) fn connect_cpu(
     ni.connect_local_reset(Arc::new(move || {
         let _ = reset_tx.send(MachineEvent::HardReset);
     }));
-    let weak_cpu = Arc::downgrade(cpu);
     l1.set_event_handler(Arc::new(move |event| {
         match event {
             L1Event::SoftReset => {
-                if let Some(cpu) = weak_cpu.upgrade() {
+                for cpu in cpus.iter().filter_map(|cpu| cpu.upgrade()) {
                     cpu.as_device().signal(Signal::Reset(true));
                 }
             }
@@ -258,6 +264,15 @@ impl Node {
         let io = Arc::new(BedrockIo::new());
         let ni = Arc::new(BedrockNi::new());
         let xb = Arc::new(BedrockXb::new());
+        // A processor on PI1 finds its own interface at the local form's
+        // offset 0, as QEMU's node overlays it there (OpenBSD expects the
+        // local form to select the requester's interface). That the chip
+        // answers PI1 there is an approximation pending a hardware read.
+        let local_pi: Arc<dyn BusDevice> = if (0..2).any(|slot| running.fitted(1, slot)) {
+            Arc::new(LocalPi { pi: pi.clone(), running })
+        } else {
+            pi[0].clone()
+        };
         let mut registers = SparseWindowMap::default();
         registers.map(
             0,
@@ -294,7 +309,16 @@ impl Node {
             reg::MD_SIZE,
             md.md_bus(),
         );
+        let mut local = SparseWindowMap::default();
+        local.map(0, PI_SIZE, local_pi);
+        local.map(reg::PI1_BASE, PI_SIZE, pi[1].clone());
+        local.map(reg::IO_BASE, IO_SIZE, io.clone());
+        local.map(reg::LB_BASE, LB_SIZE, lb.clone());
+        local.map(reg::NI_BASE, NI_SIZE, ni.clone());
+        local.map(reg::XB_BASE, XB_SIZE, xb.clone());
+        local.map(reg::MD_BASE, reg::MD_SIZE, md.md_bus());
         let registers = Arc::new(registers);
+        let local = Arc::new(local);
         io.connect_hub(Arc::new(IoHub(pi.clone())));
         io.connect_memory(md.dma_view());
         let p = pi.clone();
@@ -349,9 +373,9 @@ impl Node {
             permission_md.upgrade().is_some_and(|md| md.current_cell() & 1 != 0)
         });
         let protected_regs = Arc::new(Window::new(0, 0x80_0000, registers.clone()).permitted(permission.clone()));
-        for base in [0x0100_0000, 0x0180_0000] {
-            bus.map(1, base, 0x80_0000, protected_regs.clone());
-        }
+        let protected_local = Arc::new(Window::new(0, 0x80_0000, local.clone()).permitted(permission.clone()));
+        bus.map(1, 0x0100_0000, 0x80_0000, protected_local);
+        bus.map(1, 0x0180_0000, 0x80_0000, protected_regs.clone());
         // Cached RAM uses MD's direct bank mappings; diagnostic views stay separate.
         bus.map(3, 0, 1 << 33, md.uncached_view());
         // Hub-special low memory: its first 256 MiB is the node memory view.
@@ -410,6 +434,30 @@ impl Node {
             #[cfg(test)]
             irq,
         })
+    }
+}
+
+/// The local register form's PI: the requester's own interface. A reader
+/// that is no processor reaches PI0.
+struct LocalPi {
+    pi: [Arc<BedrockPi>; 2],
+    running: Population,
+}
+impl LocalPi {
+    fn own(&self) -> &BedrockPi {
+        let interface = crate::cpu::smp::on_cpu_thread().and_then(|cpu| self.running.slot_of(cpu)).map_or(0, |(i, _)| i);
+        &self.pi[usize::from(interface)]
+    }
+}
+impl BusDevice for LocalPi {
+    fn read64(&self, a: u64) -> BusRead64 {
+        self.own().read64(a)
+    }
+    fn read32(&self, a: u64) -> BusRead32 {
+        self.own().read32(a)
+    }
+    fn write64(&self, a: u64, v: u64) -> u32 {
+        self.own().write64(a, v)
     }
 }
 
@@ -639,6 +687,58 @@ impl InterruptController for UartIrq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test node with four processors fitted and `running` of them run.
+    fn node(running: usize) -> Node {
+        let population = Population::fitted_cpus(4).unwrap();
+        Node::build(NodeConfig {
+            name: "test",
+            payload: &[],
+            clock: Arc::new(|| 0),
+            flash_path: None,
+            banks_mib: &[512],
+            population,
+            running: Population::fitted_cpus(running).unwrap(),
+            firmware: FirmwareRecord::TEZRO,
+            board_id: 0,
+            l1: L1Config::default(),
+        })
+        .unwrap()
+    }
+
+    /// The CPU-number register as processor `cpu` reads it through the XIO
+    /// register form at `window`.
+    fn cpu_number(node: &Arc<Node>, cpu: Option<u8>, window: u64) -> u64 {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            if let Some(cpu) = cpu {
+                crate::cpu::smp::set_current_cpu(cpu);
+            }
+            node.bus.read64((1 << 57) | window | 0x20).data
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// Through the local form a processor reaches its own interface at
+    /// offset 0, so every processor of four reads its own slice there; the
+    /// node form keeps PI0 at 0 for everyone, and a reader that is no
+    /// processor reaches PI0. Follows sn1-cpu-identity-test
+    /// four-processors-know-their-slots, which reads the local form.
+    #[test]
+    fn the_local_form_answers_the_requesters_own_interface() {
+        let node = Arc::new(node(4));
+        let local: Vec<u64> = (0..4).map(|cpu| cpu_number(&node, Some(cpu), 0x0100_0000)).collect();
+        assert_eq!(local, [0, 2, 1, 3]);
+        let node_form: Vec<u64> = (0..4).map(|cpu| cpu_number(&node, Some(cpu), 0x0180_0000)).collect();
+        assert_eq!(node_form, [0, 0, 1, 0], "PI0's register: only PI0's processors read their slot");
+        assert_eq!(cpu_number(&node, None, 0x0100_0000), 0);
+        // PI1 stays at its own offset in both forms.
+        let pi1 = node.bus.read64((1 << 57) | 0x0100_0000 | reg::PI1_BASE | 0x20).data;
+        assert_eq!(pi1, 2);
+        // With PI0/A alone running, as on the Fuel, the local form is PI0.
+        assert_eq!(cpu_number(&Arc::new(self::node(1)), Some(0), 0x0100_0000), 0);
+    }
 
     /// The L1 reports a power cycle as power down, power up and a restart,
     /// and a shutdown as power down and a shutdown: one restart for the
