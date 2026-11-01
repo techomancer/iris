@@ -131,6 +131,11 @@ pub struct Codegen {
     /// `finalize_batch_nonforced` so a stale `true` can never leak into a
     /// later, unrelated call.
     last_finalize_failed: bool,
+    /// The `JitFn` the most recent successful `finalize_batch_nonforced` resolved
+    /// for its own function, so the caller can tell whether the entries that
+    /// call returned as sealed include its own or only other ranges that its
+    /// seal attempt happened to release.
+    last_finalized_fn: Option<crate::cpu::jitv2::JitFn>,
     /// Shared with the `PagedArenaMemoryProvider` this `Codegen`'s `module`
     /// was built with — see `PagedArenaState`'s own doc comment for why this
     /// indirection exists. Polled via `provider_crossed_page`/`packing_stats`
@@ -649,6 +654,7 @@ impl Codegen {
             #[cfg(feature = "developer")]
             last_decline_was_verifier_error: false,
             last_finalize_failed: false,
+            last_finalized_fn: None,
             paged_state,
             seal_handle,
             func_ranges: std::collections::HashMap::new(),
@@ -921,6 +927,15 @@ impl Codegen {
     /// empty return, before assuming "just gap-blocked, safe to wait."
     pub fn last_finalize_failed(&self) -> bool {
         self.last_finalize_failed
+    }
+
+    /// Whether `sealed`, as returned by the latest `finalize_batch_nonforced`,
+    /// contains that call's own function. A seal attempt also releases other
+    /// ranges (an earlier page this allocation vacated, another worker's
+    /// entries), so a non-empty result does not mean this compile published.
+    pub fn finalized_fn_is_among(&self, sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) -> bool {
+        let Some(own) = self.last_finalized_fn else { return false };
+        sealed.iter().any(|e| e.jit_fn.is_some_and(|f| f as usize == own as usize))
     }
 
     /// Whether the most recent `compile_region` call's `None` return came
@@ -2549,6 +2564,7 @@ impl Codegen {
     /// case will ever resolve on its own.
     pub fn finalize_batch_nonforced(&mut self, id: cranelift_module::FuncId, publish: crate::cpu::jitv2::paged_memory::PublishInfo) -> Vec<crate::cpu::jitv2::paged_memory::PublishInfo> {
         self.last_finalize_failed = false;
+        self.last_finalized_fn = None;
         let (start, end) = *self.func_ranges.get(&id).expect("finalize_batch_nonforced: id has no reserved seal-queue range — compile_region_uncommitted must run first");
         if self.module.finalize_definitions().is_err() {
             self.last_finalize_failed = true;
@@ -2557,8 +2573,10 @@ impl Codegen {
         }
         self.func_ranges.remove(&id);
         let code_ptr = self.module.get_finalized_function(id);
+        let jit_fn = unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) };
+        self.last_finalized_fn = Some(jit_fn);
         let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
-            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) }),
+            jit_fn: Some(jit_fn),
             ..publish
         };
         self.seal_handle.patch_pending_publish(start, end, publish, false)

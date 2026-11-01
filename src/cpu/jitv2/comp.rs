@@ -743,16 +743,18 @@ pub fn handle_request_deferred(
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);
-            if sealed.is_empty() {
-                if codegen.last_finalize_failed() {
-                    page.mark_finalize_failed();
-                } else {
-                    page.mark_seal_gap_blocked();
-                    *pending += 1;
-                }
-            } else {
-                publish_all(&sealed);
+            if codegen.last_finalize_failed() {
+                page.mark_finalize_failed();
+            } else if !codegen.finalized_fn_is_among(&sealed) {
+                // Own range still unsealed. `sealed` may be non-empty all the
+                // same (this allocation vacated the previous host page and
+                // released what waited there), so test for our own function,
+                // not for emptiness: an uncounted range leaves `pending` at 0
+                // and the idle sweep never runs for it.
+                page.mark_seal_gap_blocked();
+                *pending += 1;
             }
+            publish_all(&sealed);
             #[cfg(feature = "developer")]
             {
                 // Count fallback words/regions and the successful-compile
@@ -1173,5 +1175,45 @@ mod tests {
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
         assert!(page.try_schedule_page(), "scheduled bit must be cleared even though publish itself is deferred");
+    }
+
+    #[test]
+    fn handle_request_deferred_counts_a_compile_the_seal_attempt_did_not_publish() {
+        // A seal attempt can return entries and still leave the caller's own
+        // compile behind: when this compile's allocation moved the bump
+        // cursor into a new host page, the call seals the previous (now
+        // vacated) page and publishes what was waiting in it, while this
+        // compile's own range sits in the page that is still open. The
+        // caller must count that range as pending, or nothing will ever
+        // force its page closed once the worker idles, and the entry stays
+        // unpublished for good. One request per call with a fresh counter,
+        // so a count left over from an earlier request cannot hide it.
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        const N: usize = 64;
+        let counters: Vec<AtomicU64> = (0..N).map(|_| AtomicU64::new(0)).collect();
+        let mut pages: Vec<PhysicalCodePage> = counters.iter().enumerate()
+            .map(|(i, c)| PhysicalCodePage::new(i as u32, c as *const AtomicU64))
+            .collect();
+        let mut analyzer = Analyzer::new();
+        let mut codegen = Codegen::new();
+        let mut released_others = false;
+        for i in 0..N {
+            let before = pages.iter().filter(|p| p.is_runnable(4)).count();
+            pages[i].mark_requested(4);
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let mut pending: PendingCount = 0;
+            handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
+            let own_published = pages[i].is_runnable(4);
+            let after = pages.iter().filter(|p| p.is_runnable(4)).count();
+            if !own_published {
+                assert_eq!(pending, 1, "request {i} was not published and must be counted so the idle sweep finds it");
+                released_others |= after > before;
+            }
+        }
+        assert!(released_others, "setup: some request must have released earlier pages while leaving itself queued, or the page-crossing case was never reached");
+        let mut pending: PendingCount = 1;
+        force_publish_pending(&mut codegen, &mut pending);
+        assert!(pages.iter().all(|p| p.is_runnable(4)), "the forced sweep must leave every page published");
     }
 }
