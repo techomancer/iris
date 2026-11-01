@@ -286,6 +286,28 @@ impl BlockNode for RawNode {
 
 /// A copy-on-write overlay: writes are redirected to a sparse overlay file and
 /// unheld ranges read through to the backing node.
+///
+/// The `.dirty` sidecar says which sectors the overlay holds, and it must
+/// never lag the overlay. Each write changes the overlay file in place, so a
+/// record written only at a flush would, after the process is killed, pair
+/// the later contents of sectors it lists with the base's stale contents of
+/// sectors first written since: a mix of two moments that no guest ever saw,
+/// which a filesystem cannot recover from. So a write appends its new sectors
+/// to the record as soon as their data is in the overlay, and every change
+/// that takes sectors away (discard, commit, rollback, import) rewrites it at
+/// once. A flush compacts the record and makes both files durable on the
+/// host. A record that exists but cannot be read stops the open, since
+/// compacting it would erase it.
+///
+/// That makes ending the process at any point safe: what the kernel has
+/// accepted outlives it. A host crash or power loss is another matter. The
+/// disk tells the guest it has a write-back cache, and only a flush (the
+/// guest's SYNCHRONIZE CACHE, or iris stopping) promises that what came
+/// before it is on the host's disk. Writes since then may be lost, in any
+/// order, and a listed sector whose data had not reached the disk reads as
+/// zeroes. Syncing the overlay before each append would close only that last
+/// gap, at about a millisecond per write that takes a new sector against
+/// 20 us without it, and overwrites would still reach the disk out of order.
 pub struct CowNode {
     backing: Option<Box<dyn BlockNode>>,
     /// Base image path, so [`CowNode::commit`] can merge the overlay back into
@@ -294,6 +316,8 @@ pub struct CowNode {
     overlay: File,
     overlay_path: PathBuf,
     dirty: HashSet<u64>,
+    /// The sidecar, open for appending once it exists.
+    record: Option<File>,
     /// Set by anything that changes the overlay or its sector set, cleared by
     /// a flush, so a flush with nothing new to write costs nothing.
     unflushed: bool,
@@ -323,11 +347,13 @@ impl CowNode {
             .write(true)
             .create(true)
             .open(&overlay_path)?;
-        // Recover the dirty set persisted by a previous run. The sidecar is the
-        // load-bearing record of which sectors the host finished writing —
-        // sparse bytes in the overlay alone cannot be trusted.
+        // Recover the dirty set a previous run recorded. The sidecar is the
+        // record of which sectors the host finished writing; sparse bytes in
+        // the overlay alone cannot be trusted.
         let sidecar = crate::cow_disk::sidecar_path_for(&overlay_path);
-        let dirty = crate::cow_disk::load_dirty_sidecar(&sidecar).unwrap_or_default();
+        // A record that exists but cannot be read stops the open: carrying on
+        // with an empty set would compact it away, and with it every write.
+        let dirty = crate::cow_disk::load_dirty_sidecar(&sidecar)?;
         let base_path = derive_base_path(&overlay_path);
         let base_label = base_path
             .as_deref()
@@ -347,7 +373,13 @@ impl CowNode {
             overlay_path.display(),
             sidecar.display()
         );
-        Ok(Self { backing, base_path, overlay, overlay_path, dirty, unflushed: false, size })
+        let mut node = Self { backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, size };
+        // Compact what a killed run appended, and drop an append it cut short,
+        // so new entries start on an entry boundary.
+        if sidecar.exists() {
+            node.rewrite_record()?;
+        }
+        Ok(node)
     }
 
     /// Record the base image path explicitly. `add_device` knows it; `new`
@@ -364,6 +396,46 @@ impl CowNode {
 
     fn sidecar_path(&self) -> PathBuf {
         crate::cow_disk::sidecar_path_for(&self.overlay_path)
+    }
+
+    /// Write the whole sector set to the sidecar, replacing it atomically, and
+    /// open the new file for appending.
+    fn rewrite_record(&mut self) -> io::Result<()> {
+        // Until this succeeds there is no handle to append to, so the next
+        // new sector starts with a full rewrite rather than an append onto a
+        // file that may end in a torn entry.
+        self.record = None;
+        let path = self.sidecar_path();
+        crate::cow_disk::save_dirty_sidecar(&path, &self.dirty)?;
+        self.record = Some(OpenOptions::new().append(true).open(&path)?);
+        Ok(())
+    }
+
+    /// Add sectors the overlay has just taken on, and whose data it already
+    /// holds, to the set and to the record. The first creates the sidecar,
+    /// which then already lists them. They join the set only once the record
+    /// has them, so a guest's retry of a write that failed here appends them
+    /// again; a failure leaves no append handle, so the retry rewrites the
+    /// whole record and replaces whatever torn tail the failure left.
+    fn record_new(&mut self, lbas: &[u64]) -> io::Result<()> {
+        match self.record.as_mut() {
+            Some(f) => {
+                if let Err(e) = crate::cow_disk::append_dirty_sidecar(f, lbas) {
+                    self.record = None;
+                    return Err(e);
+                }
+                self.dirty.extend(lbas);
+                Ok(())
+            }
+            None => {
+                self.dirty.extend(lbas);
+                self.rewrite_record().inspect_err(|_| {
+                    for l in lbas {
+                        self.dirty.remove(l);
+                    }
+                })
+            }
+        }
     }
 
     /// Read one whole sector: the overlay if it holds it, else the backing, else
@@ -434,25 +506,35 @@ impl BlockNode for CowNode {
             return Ok(());
         }
         let (first, last) = sectors_for(offset, buf.len() as u64);
-        for lba in first..last {
-            // Copy-on-write does read-modify-write: pull the current sector up
-            // through the chain so the untouched bytes survive, then hand the
-            // whole sector to the overlay.
-            let mut sector = self.read_sector(lba)?;
-            let s_off = lba * SECTOR_SIZE;
-            let start = offset.max(s_off);
-            let stop = (offset + buf.len() as u64).min(s_off + SECTOR_SIZE);
-            let src = (start - offset) as usize;
-            let dst = (start - s_off) as usize;
-            let n = (stop - start) as usize;
-            sector[dst..dst + n].copy_from_slice(&buf[src..src + n]);
+        let mut new = Vec::new();
+        let written = (|| {
+            for lba in first..last {
+                // Copy-on-write does read-modify-write: pull the current sector up
+                // through the chain so the untouched bytes survive, then hand the
+                // whole sector to the overlay.
+                let mut sector = self.read_sector(lba)?;
+                let s_off = lba * SECTOR_SIZE;
+                let start = offset.max(s_off);
+                let stop = (offset + buf.len() as u64).min(s_off + SECTOR_SIZE);
+                let src = (start - offset) as usize;
+                let dst = (start - s_off) as usize;
+                let n = (stop - start) as usize;
+                sector[dst..dst + n].copy_from_slice(&buf[src..src + n]);
 
-            self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
-            self.overlay.write_all(&sector)?;
-            self.dirty.insert(lba);
-            self.unflushed = true;
-        }
-        Ok(())
+                self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
+                self.overlay.write_all(&sector)?;
+                if !self.dirty.contains(&lba) {
+                    new.push(lba);
+                }
+                self.unflushed = true;
+            }
+            Ok(())
+        })();
+        // After the data, so a listed sector always has its data in the
+        // overlay. Also when a later sector failed: the earlier ones are held
+        // and must not be left out of the record.
+        let recorded = if new.is_empty() { Ok(()) } else { self.record_new(&new) };
+        written.and(recorded)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -460,7 +542,7 @@ impl BlockNode for CowNode {
             return Ok(());
         }
         self.overlay.sync_all()?;
-        crate::cow_disk::save_dirty_sidecar(&self.sidecar_path(), &self.dirty)?;
+        self.rewrite_record()?;
         // The backing is never written through this node, so it has nothing
         // of ours to flush.
         self.unflushed = false;
@@ -473,9 +555,14 @@ impl BlockNode for CowNode {
             return Ok(());
         }
         let (first, last) = sectors_for(offset, len);
+        let mut removed = false;
         for lba in first..last {
-            self.dirty.remove(&lba);
+            removed |= self.dirty.remove(&lba);
             self.unflushed = true;
+        }
+        // An appended record cannot take a sector out.
+        if removed {
+            self.rewrite_record()?;
         }
         Ok(())
     }
@@ -541,6 +628,9 @@ impl BlockNode for CowNode {
         base_rw.sync_all()?;
         self.dirty.clear();
         self.unflushed = true;
+        // Empty the record before the overlay, so no listed sector is ever
+        // missing from it; the base already holds them all.
+        self.rewrite_record()?;
         self.overlay.set_len(0)?;
         eprintln!("iris: COW committed {} sectors to {}", committed, base_path.display());
         Ok(committed)
@@ -551,9 +641,10 @@ impl BlockNode for CowNode {
     fn rollback(&mut self) -> io::Result<()> {
         self.dirty.clear();
         self.unflushed = true;
+        self.record = None;
+        let _ = std::fs::remove_file(self.sidecar_path());
         self.overlay.set_len(0)?;
         self.overlay.seek(SeekFrom::Start(0))?;
-        let _ = std::fs::remove_file(self.sidecar_path());
         Ok(())
     }
 
@@ -569,20 +660,34 @@ impl BlockNode for CowNode {
 
     /// Replace the overlay contents with `source` and adopt `dirty`. Mirrors
     /// [`crate::cow_disk::CowDisk::import_overlay`].
+    ///
+    /// The record is emptied (and synced) before the overlay is touched, and
+    /// the new set written once the overlay holds the new contents. Between
+    /// the two the record would otherwise describe a file that is no longer
+    /// there, and its sectors would read as zeroes or fail. Ending the process
+    /// in the middle therefore reads the base image: a disk the guest really
+    /// had, though neither the one before the import nor the one imported.
+    /// A copy that fails (no space) leaves the same thing.
     fn import_overlay(&mut self, source: &Path, dirty: Vec<u64>) -> io::Result<()> {
-        if source.exists() {
-            crate::cow_disk::reflink_or_copy(source, &self.overlay_path)?;
+        self.dirty.clear();
+        self.unflushed = true;
+        self.rewrite_record()?;
+        let copied = if source.exists() {
+            crate::cow_disk::reflink_or_copy(source, &self.overlay_path)
         } else {
-            std::fs::File::create(&self.overlay_path)?;
-        }
+            std::fs::File::create(&self.overlay_path).map(|_| ())
+        };
+        // Reopen even after a failed copy: the old handle is on a file that
+        // has been unlinked, and later writes would go there.
         self.overlay = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&self.overlay_path)?;
+        copied?;
         self.dirty = dirty.into_iter().collect();
         self.unflushed = true;
-        Ok(())
+        self.rewrite_record()
     }
 }
 
@@ -1376,6 +1481,245 @@ mod tests {
         assert!(sidecar.exists(), "a discard is a change the record must carry");
 
         drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// Reopen `overlay_path` over a fresh handle on `backing_path`, as the next
+    /// run does after a process that skipped every Drop (`mem::forget` stands
+    /// in for SIGKILL or Ctrl-C).
+    fn reopen_after_kill(backing_path: &Path, overlay_path: &Path, size: u64) -> CowNode {
+        let backing = RawNode::open_readonly(backing_path).unwrap();
+        CowNode::new(Some(Box::new(backing)), overlay_path, size).unwrap()
+    }
+
+    fn sector(node: &mut CowNode, lba: u64) -> [u8; SECTOR_BYTES] {
+        let mut got = [0u8; SECTOR_BYTES];
+        node.read(lba * SECTOR_SIZE, &mut got).unwrap();
+        got
+    }
+
+    /// A process killed before any flush keeps every write it completed.
+    #[test]
+    fn cow_writes_survive_a_kill_without_a_flush() {
+        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-kill");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(SECTOR_SIZE, &[0x11u8; SECTOR_BYTES]).unwrap();
+        node.write(3 * SECTOR_SIZE, &[0x33u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 2);
+        assert_eq!(sector(&mut node, 1), [0x11u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 3), [0x33u8; SECTOR_BYTES]);
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// After a flush, a sector the record already lists is rewritten in place
+    /// and a new one is written. A kill must keep both writes or neither:
+    /// keeping the first and losing the second hands the guest a disk from no
+    /// single moment. An XFS root on an overlay restarted this way stopped
+    /// mounting: its allocation group headers were listed and came back new,
+    /// while hundreds of metadata sectors written after them came back from
+    /// the base.
+    #[test]
+    fn cow_kill_after_a_flush_keeps_later_writes_together() {
+        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-tear");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
+        node.flush().unwrap();
+        node.write(0, &[0x02u8; SECTOR_BYTES]).unwrap();
+        node.write(2 * SECTOR_SIZE, &[0x02u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(sector(&mut node, 0), [0x02u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 2), [0x02u8; SECTOR_BYTES], "the new sector came back from the base");
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// A kill in the middle of an append leaves a short last entry. The next
+    /// run ignores it, and its own appends still land on entry boundaries.
+    #[test]
+    fn cow_record_cut_short_by_a_kill_is_ignored() {
+        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-short");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+        let sidecar = crate::cow_disk::sidecar_path_for(&overlay_path);
+        let mut f = OpenOptions::new().append(true).open(&sidecar).unwrap();
+        f.write_all(&[0x03, 0, 0]).unwrap();
+        drop(f);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 1);
+        node.write(SECTOR_SIZE, &[0x02u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 2);
+        assert_eq!(sector(&mut node, 0), [0x01u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 1), [0x02u8; SECTOR_BYTES]);
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// A commit empties the overlay; a kill before the next flush must not
+    /// leave the record listing sectors the overlay no longer has.
+    #[test]
+    fn cow_kill_after_a_commit_reads_the_base() {
+        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-commit-kill");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size)
+            .unwrap()
+            .with_base_path(&backing_path);
+        node.write(SECTOR_SIZE, &[0x55u8; SECTOR_BYTES]).unwrap();
+        node.flush().unwrap();
+        node.commit().unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 0);
+        assert_eq!(sector(&mut node, 1), [0x55u8; SECTOR_BYTES]);
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// A discard takes a sector out of the record at once, so a kill does not
+    /// bring it back.
+    #[test]
+    fn cow_kill_after_a_discard_keeps_it_discarded() {
+        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-discard-kill");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x11u8; SECTOR_BYTES]).unwrap();
+        node.flush().unwrap();
+        node.discard(0, SECTOR_SIZE).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 0);
+        assert_eq!(sector(&mut node, 0), [0xAAu8; SECTOR_BYTES]);
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// An import that fails after taking the live overlay away (here the
+    /// source is a directory, as a full disk would also fail the copy) must
+    /// not leave the old record over the emptied overlay: its sectors would
+    /// read as zeroes or fail. A kill at the same point reads the same way.
+    #[test]
+    fn cow_failed_import_reads_the_base() {
+        let (backing, backing_path) = raw_filled(0xAA, 8 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-import-fail");
+        let size = 8 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
+        node.flush().unwrap();
+        node.write(5 * SECTOR_SIZE, &[0x05u8; 2 * SECTOR_BYTES]).unwrap();
+
+        let unreadable = tmp_path("cow-import-dir");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(node.import_overlay(&unreadable, vec![1, 2]).is_err());
+        std::fs::remove_dir(&unreadable).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 0);
+        for lba in 0..8 {
+            assert_eq!(sector(&mut node, lba), [0xAAu8; SECTOR_BYTES], "sector {lba}");
+        }
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// A write that fails to record its new sector is an error to the guest,
+    /// and the guest's retry must record it: acknowledged writes survive a
+    /// kill. The record's handle is swapped for a read-only one so that the
+    /// append fails.
+    #[test]
+    fn cow_retried_write_after_a_failed_record_survives_a_kill() {
+        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-append-fail");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
+        node.flush().unwrap();
+        let sidecar = crate::cow_disk::sidecar_path_for(&overlay_path);
+        node.record = Some(File::open(&sidecar).unwrap());
+
+        assert!(node.write(SECTOR_SIZE, &[0x02u8; SECTOR_BYTES]).is_err());
+        node.write(SECTOR_SIZE, &[0x02u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 2);
+        assert_eq!(sector(&mut node, 0), [0x01u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 1), [0x02u8; SECTOR_BYTES]);
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(backing_path);
+    }
+
+    /// A record that cannot be read, or has no whole header, stops the open
+    /// and is left as it was, rather than being compacted into an empty one.
+    #[test]
+    fn cow_unreadable_record_stops_the_open_and_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-bad-record");
+        let size = 4 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(0, &[0x01u8; SECTOR_BYTES]).unwrap();
+        std::mem::forget(node);
+        let sidecar = crate::cow_disk::sidecar_path_for(&overlay_path);
+        let record = std::fs::read(&sidecar).unwrap();
+
+        // A header cut short.
+        std::fs::write(&sidecar, &record[..3]).unwrap();
+        let open = || {
+            let backing = RawNode::open_readonly(&backing_path).unwrap();
+            CowNode::new(Some(Box::new(backing)), &overlay_path, size)
+        };
+        assert!(open().is_err());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), &record[..3]);
+
+        // A record the process may not read (not testable as root).
+        std::fs::write(&sidecar, &record).unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0)).unwrap();
+        if File::open(&sidecar).is_err() {
+            assert!(open().is_err());
+        }
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&sidecar).unwrap(), record);
+
+        // Missing is a fresh overlay, not an error.
+        std::fs::remove_file(&sidecar).unwrap();
+        assert!(open().is_ok());
+
         cleanup(&overlay_path);
         let _ = std::fs::remove_file(backing_path);
     }

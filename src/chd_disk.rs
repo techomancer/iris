@@ -291,8 +291,10 @@ fn fsync_path(p: &Path) -> io::Result<()> {
     std::fs::OpenOptions::new().read(true).write(true).open(p)?.sync_all()
 }
 
-fn fsync_dir(dir: Option<&Path>) -> io::Result<()> {
+pub(crate) fn fsync_dir(dir: Option<&Path>) -> io::Result<()> {
     if let Some(d) = dir {
+        // A bare file name has the parent "", which means the current directory.
+        let d = if d.as_os_str().is_empty() { Path::new(".") } else { d };
         std::fs::File::open(d)?.sync_all()?;
     }
     Ok(())

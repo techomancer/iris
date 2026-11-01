@@ -1,7 +1,8 @@
 //! Guest disk writes must outlive every way the process can end.
 //!
-//! A copy-on-write overlay keeps which sectors it holds in a record that is
-//! written only when the disk is flushed or dropped, and most ways out of
+//! A CHD keeps what it has accepted complete on disk only once it is
+//! flushed or dropped (a copy-on-write overlay now records its sectors as they
+//! are written, but compacts that record on a flush), and most ways out of
 //! iris (a guest power-off, `quit`, a window close) end the process without
 //! dropping anything. Each test here builds a whole machine, writes sectors
 //! through the SCSI bus with WRITE(10), ends the session by one of those ways,

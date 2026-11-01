@@ -2199,7 +2199,8 @@ mod controller_lifetime_tests {
     /// A guest power-off ends the process without dropping the machine (and so
     /// without the disks' Drop), so the power-off path has to flush the disks
     /// itself. Drives the event the IOC sends and looks for the overlay's
-    /// sector record on disk.
+    /// sector record to be compacted: writes append to it, and only a flush
+    /// rewrites its count.
     #[test]
     fn guest_power_off_flushes_overlay_disks() {
         use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
@@ -2219,24 +2220,33 @@ mod controller_lifetime_tests {
             .unwrap()
             .join()
             .unwrap();
-        let write = ScsiRequest {
-            cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 3, 0, 0, 1, 0],
-            data_len: ScsiDataLength::Unlimited,
-            data_in: Some(vec![0xA5; 512]),
+        for lba in [3, 4] {
+            let write = ScsiRequest {
+                cdb: vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, lba, 0, 0, 1, 0],
+                data_len: ScsiDataLength::Unlimited,
+                data_in: Some(vec![0xA5; 512]),
+            };
+            machine.scsi_buses()[0].request(1, &write).unwrap().unwrap();
+        }
+        // The record's count, which a flush rewrites.
+        let counted = || {
+            std::fs::read(&sidecar)
+                .ok()
+                .and_then(|b| b.get(..8).map(|c| u64::from_le_bytes(c.try_into().unwrap())))
         };
-        machine.scsi_buses()[0].request(1, &write).unwrap().unwrap();
-        assert!(!std::path::Path::new(&sidecar).exists(), "nothing has flushed yet");
+        assert_eq!(counted(), Some(1), "nothing has flushed yet: the second sector is only appended");
 
         // The handler would otherwise exit this test process.
         std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
         machine.register_system_controller();
         machine.event_tx.send(crate::traits::MachineEvent::PowerOff).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !std::path::Path::new(&sidecar).exists() && std::time::Instant::now() < deadline {
+        while counted() != Some(2) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        assert_eq!(counted(), Some(2), "power-off did not flush the overlay's record");
         let held = crate::cow_disk::load_dirty_sidecar(std::path::Path::new(&sidecar)).unwrap_or_default();
-        assert!(held.contains(&3), "power-off left no record of the written sector");
+        assert!(held.contains(&3) && held.contains(&4), "power-off left no record of the written sectors");
 
         // Leak the machine as the process exit would.
         std::mem::forget(machine);

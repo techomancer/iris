@@ -24,8 +24,23 @@ NVRAM/MAC address setup, disk image prep, and more.
 ## Copy-on-write disk overlay
 
 Protects disk images from corruption during development and testing. The base
-`.raw` file is opened read-only and writes go to a sparse overlay file. Kill
-the emulator whenever you want. Delete the overlay to reset to the clean base.
+`.raw` file is opened read-only and writes go to a sparse overlay file, with a
+`.overlay.dirty` record beside it of which sectors the overlay holds. Delete
+both to reset to the clean base.
+
+The record grows as each write lands, so ending iris any way at all (Ctrl-C,
+`kill`, `kill -9`, a crash of iris itself) keeps every write the guest had
+made. To the guest that is a power cut: its filesystem recovers as it would on
+real hardware, from its log. A crash or power loss of the host itself can lose
+the writes made since the last flush, and so can tear the guest's filesystem.
+The disk reports a write-back cache, and only a flush puts what came before it
+on the host's disk: iris stopping, `cow commit`, or the guest's SYNCHRONIZE
+CACHE, which IRIX does not send. Stop iris cleanly before you expect the host
+to go down.
+
+An older iris reads only what the last flush recorded, so after a kill it
+sees the disk as it was before the appended writes, torn as before. Open an
+overlay that a newer iris left that way with a newer iris first.
 
 Enable in `iris.toml`:
 ```toml

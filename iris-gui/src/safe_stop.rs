@@ -30,7 +30,12 @@ impl UnsafeReasons {
 ///
 /// - **CD-ROM** — read-only.
 /// - **COW overlay** (`overlay = true`) — writes go to a `{path}.overlay`
-///   sidecar; the base image is never modified (delete the overlay to reset).
+///   file and the base image is never modified (delete the overlay and its
+///   `.dirty` record to reset). The overlay records each sector as it is
+///   written, so a force stop, or the process being killed, keeps every
+///   write: the guest sees a power cut and recovers from its log as it would
+///   on a real disk, and a guest that does not can still be reset. Only a
+///   host crash or power loss can lose what came since the last flush.
 /// - **Scratch volume** (`scratch = true`) — a transient host-side file, not a
 ///   guest filesystem we need to protect.
 /// - **CHD** (`*.chd`) — writes go to a `.diff.chd` sidecar; the base CHD is

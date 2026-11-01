@@ -58,9 +58,16 @@ fn try_reflink(_src: &Path, _dst: &Path) -> io::Result<()> {
 }
 
 /// Sidecar file holding the dirty sector list. Written next to the overlay
-/// (e.g. `foo.overlay.dirty`). Format: binary, `u64` little-endian count
-/// followed by that many `u64` sector LBAs, also LE. Compact enough that
-/// flushing it on shutdown or on a periodic schedule is cheap.
+/// (e.g. `foo.overlay.dirty`). Format: binary, a `u64` little-endian count
+/// followed by `u64` sector LBAs, also LE. The count is the number of LBAs
+/// the file was last rewritten with; [`crate::block_node::CowNode`] appends
+/// LBAs after those as the overlay takes on new sectors, so a reader takes
+/// every whole LBA up to the end of the file. An older reader stops at the
+/// count and so sees what a flush recorded, as it always did. After a newer
+/// iris was killed that is the disk as it was before the appends were made:
+/// the torn disk this record exists to prevent. Open such a disk with a newer
+/// iris first; the older one's flush would drop the appended sectors from the
+/// record for good.
 fn dirty_sidecar_path(overlay_path: &str) -> PathBuf {
     PathBuf::from(format!("{}.dirty", overlay_path))
 }
@@ -72,19 +79,45 @@ pub(crate) fn sidecar_path_for(overlay_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.dirty", overlay_path.display()))
 }
 
+/// Read the sector set a sidecar records. No sidecar is an empty set. A
+/// sidecar that cannot be read, or that has no whole header, is an error: the
+/// caller must not treat it as empty, or the next rewrite would replace a
+/// record it could not read with nothing.
 pub(crate) fn load_dirty_sidecar(path: &Path) -> io::Result<HashSet<u64>> {
-    if !path.exists() { return Ok(HashSet::new()); }
-    let mut f = File::open(path)?;
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(e),
+    };
     let mut count_buf = [0u8; 8];
-    if f.read_exact(&mut count_buf).is_err() { return Ok(HashSet::new()); }
+    f.read_exact(&mut count_buf).map_err(|e| {
+        io::Error::new(e.kind(), format!("{}: no whole header: {e}", path.display()))
+    })?;
     let count = u64::from_le_bytes(count_buf) as usize;
-    let mut set = HashSet::with_capacity(count);
+    let mut set = HashSet::with_capacity(count.min(1 << 24));
     let mut buf = [0u8; 8];
-    for _ in 0..count {
-        if f.read_exact(&mut buf).is_err() { break; }
-        set.insert(u64::from_le_bytes(buf));
+    // The counted LBAs and then any appended since. A short last entry is
+    // an append cut off by the process dying, and was never acknowledged;
+    // that alone is the end of the record. Any other read error is not.
+    loop {
+        match f.read_exact(&mut buf) {
+            Ok(()) => {
+                set.insert(u64::from_le_bytes(buf));
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
     }
     Ok(set)
+}
+
+/// Add `lbas` to the end of a sidecar opened for appending (see
+/// [`dirty_sidecar_path`] for the format). One write, so a process killed
+/// after it returns has recorded every one of them: what the kernel has
+/// accepted outlives the process. Surviving a host crash still takes a flush.
+pub(crate) fn append_dirty_sidecar(f: &mut File, lbas: &[u64]) -> io::Result<()> {
+    let bytes: Vec<u8> = lbas.iter().flat_map(|l| l.to_le_bytes()).collect();
+    f.write_all(&bytes)
 }
 
 pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
@@ -92,15 +125,17 @@ pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Resul
     let tmp = path.with_extension("dirty.tmp");
     {
         let mut f = File::create(&tmp)?;
-        let count = dirty.len() as u64;
-        f.write_all(&count.to_le_bytes())?;
+        let mut bytes = Vec::with_capacity(8 * (dirty.len() + 1));
+        bytes.extend_from_slice(&(dirty.len() as u64).to_le_bytes());
         for &s in dirty {
-            f.write_all(&s.to_le_bytes())?;
+            bytes.extend_from_slice(&s.to_le_bytes());
         }
+        f.write_all(&bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    Ok(())
+    // The rename is not on the host's disk until its directory is.
+    crate::chd_disk::fsync_dir(path.parent())
 }
 
 pub struct CowDisk {
@@ -133,7 +168,7 @@ impl CowDisk {
         // file has some bytes here" (sparse allocation can contain partial
         // writes from an interrupted run, which can't be trusted).
         let sidecar = dirty_sidecar_path(overlay_path);
-        let dirty = load_dirty_sidecar(&sidecar).unwrap_or_default();
+        let dirty = load_dirty_sidecar(&sidecar)?;
 
         eprintln!("iris: COW overlay active (base: {}, overlay: {}, dirty sectors: {})",
                   base_path, overlay_path, dirty.len());
