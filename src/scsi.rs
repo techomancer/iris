@@ -170,6 +170,12 @@ pub struct ScsiDevice {
     logical_block_size: u64,
     /// What INQUIRY reports (the attaching controller's choice).
     identity: ScsiIdentity,
+    /// The caching page's WCE bit: the disk may acknowledge a write before it
+    /// is stored. Starts as `power_on_write_cache`; a MODE SELECT can change it.
+    write_cache: bool,
+    /// What WCE the disk powers up with, and returns to on a bus or
+    /// controller reset. Off unless [`ScsiDevice::with_write_cache`] says so.
+    power_on_write_cache: bool,
 }
 
 /// A CD-ROM's physical sector (Yellow Book).
@@ -196,6 +202,8 @@ impl ScsiDevice {
             // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
             logical_block_size: if is_cdrom { 2048 } else { 512 },
             identity,
+            write_cache: false,
+            power_on_write_cache: false,
         }
     }
 
@@ -211,7 +219,17 @@ impl ScsiDevice {
             phys_block_size: CDROM_SECTOR,
             logical_block_size: 2048,
             identity,
+            write_cache: false,
+            power_on_write_cache: false,
         }
+    }
+
+    /// Give the disk a write cache (WCE=1) or not, as it powers up. Without
+    /// one (the default) every write is stored before it completes.
+    pub fn with_write_cache(mut self, on: bool) -> Self {
+        self.power_on_write_cache = on;
+        self.write_cache = on;
+        self
     }
 
     /// Whether physical media is loaded. For HDDs always true; for CD-ROMs
@@ -401,16 +419,17 @@ impl ScsiDevice {
     fn exec_write_6(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
         let lba = (((cdb[1] & 0x1F) as u64) << 16) | ((cdb[2] as u64) << 8) | (cdb[3] as u64);
         let count = if cdb[4] == 0 { 256 } else { cdb[4] as usize };
-        self.perform_write(lba, count, data_in)
+        self.perform_write(lba, count, data_in, false)
     }
 
     fn exec_write_10(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
         let lba = ((cdb[2] as u64) << 24) | ((cdb[3] as u64) << 16) | ((cdb[4] as u64) << 8) | (cdb[5] as u64);
         let count = ((cdb[7] as usize) << 8) | (cdb[8] as usize);
-        self.perform_write(lba, count, data_in)
+        // Byte 1 bit 3 is FUA: the data must be stored before GOOD.
+        self.perform_write(lba, count, data_in, cdb[1] & 0x08 != 0)
     }
 
-    fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+    fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>, fua: bool) -> Result<ScsiResponse, std::io::Error> {
         // A failed write says why, so the REQUEST SENSE after it does not
         // report "no sense".
         if self.is_cdrom() {
@@ -442,6 +461,11 @@ impl ScsiDevice {
         }
         if self.media.node_mut().write(lba * 512, data).is_err() {
             return Ok(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+        }
+        // The backend has the data, but only a sync puts it on the host's disk.
+        // The guest asks for that with FUA, or for every write by clearing WCE.
+        if (fua || !self.write_cache) && self.media.node_mut().flush_data().is_err() {
+            return Ok(self.check_condition(0x03, 0x0c, 0x00));
         }
 
         Ok(ScsiResponse {
@@ -594,24 +618,93 @@ impl ScsiDevice {
             // Page 0x08: Caching Parameters (SBC-2 / SCSI-2). Without this, sd.c logs
             // "No Caching mode page found" / "Assuming drive cache: write through".
             if want_page(0x08) {
-                pages.extend_from_slice(&[
-                    0x08, 0x12, // page code, length (18 bytes follow)
-                    0x04,       // WCE=1 (write-back), RCD=0 (read cache enabled)
-                    0x00,       // demand read/write retention priority
-                    0x00, 0x00, // disable pre-fetch transfer length
-                    0x00, 0x00, // minimum pre-fetch
-                    0xff, 0xff, // maximum pre-fetch
-                    0xff, 0xff, // maximum pre-fetch ceiling
-                    0x00,       // FSW/LBCSS/DRA
-                    0x00,       // number of cache segments
-                    0x00, 0x00, // cache segment size
-                    0x00,       // reserved
-                    0x00, 0x00, 0x00, // non-cache segment size
-                ]);
+                pages.extend_from_slice(&self.caching_page());
             }
         }
 
         Ok((block_desc, pages))
+    }
+
+    /// The caching page (08h) as MODE SENSE reports it: the write cache bit
+    /// as the disk was configured and the guest's MODE SELECT left it, the
+    /// read cache on (RCD=0).
+    ///
+    /// WCE=1 says a plain WRITE may be acknowledged before it is stored: a
+    /// write reaches the host's file but is made durable only by SYNCHRONIZE
+    /// CACHE, FUA or the background sync. WCE=0 says every write is stored
+    /// before GOOD, which `perform_write` does for a disk without a cache.
+    /// Which a disk starts as is a model choice, not a measurement. IRIX
+    /// 6.5.30 kernels (established for the IP27/IP35 ones; only "reported"
+    /// for IP30 and IP32) never read this page, set FUA or send SYNCHRONIZE
+    /// CACHE, so they rely on the stored-before-GOOD behaviour; that SGI
+    /// shipped its drives with the write cache off is inferred.
+    fn caching_page(&self) -> [u8; 20] {
+        let mut page = [0u8; 20];
+        page[0] = 0x08; // page code
+        page[1] = 0x12; // 18 bytes follow
+        page[2] = if self.write_cache { 0x04 } else { 0x00 }; // WCE; RCD=0, MF=0
+        // Bytes 3..5: retention priorities and disable-prefetch length, all 0.
+        // Minimum 0, then maximum pre-fetch and ceiling.
+        page[8..12].copy_from_slice(&[0xff; 4]);
+        page
+    }
+
+    /// Check the mode pages of a MODE SELECT parameter list and apply them:
+    /// all or none. `list` is the whole parameter list and `at` where its
+    /// pages start, after the header and block descriptors.
+    ///
+    /// The caching page may differ from what MODE SENSE reports only in WCE,
+    /// the one field the disk lets the guest change. One that runs past the
+    /// list is a parameter list length error; one that is not 18 bytes long,
+    /// is in the long (SPF) format or changes a field that is not changeable
+    /// is an invalid field. The disk used to accept every list unread, so
+    /// nothing else is refused: other pages, a page it cannot walk past and
+    /// padding after the last page are ignored.
+    fn select_mode_pages(&mut self, list: &[u8], mut at: usize) -> Result<(), ScsiResponse> {
+        let length_error = |dev: &mut Self| dev.check_condition(0x05, 0x1a, 0x00);
+        let invalid_field = |dev: &mut Self| dev.check_condition(0x05, 0x26, 0x00);
+        let mut write_cache = self.write_cache;
+        // Under two bytes left cannot hold a page: padding.
+        while list.len().saturating_sub(at) >= 2 {
+            let (head, len) = (list[at], list[at + 1] as usize);
+            let caching = head & 0x3f == 0x08;
+            // PS (bit 7) is reserved in MODE SELECT, but a page copied from
+            // MODE SENSE carries it. SPF (bit 6) pages have a longer header
+            // that this does not walk: only the caching page is refused.
+            if head & 0x40 != 0 {
+                if caching {
+                    return Err(invalid_field(self));
+                }
+                break;
+            }
+            if list.len() - at - 2 < len {
+                if caching {
+                    return Err(length_error(self));
+                }
+                break;
+            }
+            let page = &list[at..at + 2 + len];
+            at += 2 + len;
+            if !caching {
+                continue;
+            }
+            let current = self.caching_page();
+            if page.len() != current.len() {
+                return Err(invalid_field(self));
+            }
+            // Everything but WCE (byte 2 bit 2) must be as reported.
+            if page[2] & !0x04 != current[2] & !0x04 || page[3..] != current[3..] {
+                return Err(invalid_field(self));
+            }
+            write_cache = page[2] & 0x04 != 0;
+        }
+        let cleared = self.write_cache && !write_cache;
+        self.write_cache = write_cache;
+        // A guest that clears WCE believes what it wrote so far is stored.
+        if cleared && self.media.node_mut().flush_data().is_err() {
+            return Err(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+        }
+        Ok(())
     }
 
     fn exec_mode_sense_6(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
@@ -680,6 +773,9 @@ impl ScsiDevice {
         }
 
         // Header: byte 0 = mode data length (ignored on SELECT), byte 3 = block descriptor length
+        if let Err(response) = self.select_pages_after(&data[..param_len], 4, data[3] as usize, cdb[1] & 0x10 != 0) {
+            return Ok(response);
+        }
         self.select_block_descriptor(data, 4, data[3] as usize);
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
@@ -689,9 +785,24 @@ impl ScsiDevice {
     fn exec_mode_select_10(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
         let param_len = ((cdb[7] as usize) << 8) | cdb[8] as usize;
         if let Some(data) = data_in.filter(|d| d.len() >= param_len && param_len >= 8) {
-            self.select_block_descriptor(data, 8, ((data[6] as usize) << 8) | data[7] as usize);
+            let bd_len = ((data[6] as usize) << 8) | data[7] as usize;
+            if let Err(response) = self.select_pages_after(&data[..param_len], 8, bd_len, cdb[1] & 0x10 != 0) {
+                return Ok(response);
+            }
+            self.select_block_descriptor(data, 8, bd_len);
         }
         Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    /// The pages of a disk's MODE SELECT parameter list `list`, which has a
+    /// `header`-byte header and `bd_len` bytes of block descriptors. With PF
+    /// clear (`pf`) what follows the descriptors is vendor-specific and not
+    /// read. A CD-ROM has no pages to change.
+    fn select_pages_after(&mut self, list: &[u8], header: usize, bd_len: usize, pf: bool) -> Result<(), ScsiResponse> {
+        if !pf || self.is_cdrom() {
+            return Ok(());
+        }
+        self.select_mode_pages(list, header + bd_len)
     }
 
     /// A MODE SELECT block descriptor at `at`, `len` bytes: its block length
@@ -1135,6 +1246,15 @@ impl ScsiTarget for ScsiDevice {
         } else {
             self.power_on_block_size();
         }
+        self.reset_mode_parameters();
+    }
+
+    fn reset_mode_parameters(&mut self) {
+        self.write_cache = self.power_on_write_cache;
+    }
+
+    fn power_on(&mut self) {
+        self.reset_mode_parameters();
     }
 
     fn cow_dirty(&self) -> Option<usize> { self.is_cow().then(|| self.cow_dirty_count()) }
@@ -1265,18 +1385,148 @@ mod tests {
         dev.request(&ScsiRequest { cdb: cdb.to_vec(), data_len: ScsiDataLength::Unlimited, data_in: None }).expect("request")
     }
 
+    /// A raw 64-sector disk target.
+    fn disk() -> ScsiDevice {
+        let path = tmp("disk");
+        std::fs::write(&path, vec![0u8; 64 * 512]).expect("test image");
+        let node = crate::block_node::RawNode::open(&path).expect("open");
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        let _ = std::fs::remove_file(&path); // the open handle keeps it
+        ScsiDevice::new(Box::new(node), false, "test".into(), Vec::new(), identity).with_write_cache(true)
+    }
+
+    /// Byte 2 of the caching page MODE SENSE(6) reports (WCE is bit 2).
+    fn caching_flags(dev: &mut ScsiDevice) -> u8 {
+        // DBD set, so the page follows the 4-byte header.
+        let r = run(dev, &[0x1a, 0x08, 0x08, 0, 255, 0]);
+        assert_eq!(r.status, 0x00);
+        assert_eq!(r.data[4], 0x08, "page code");
+        assert_eq!(r.data[5], 0x12, "page length");
+        r.data[6]
+    }
+
+    /// MODE SELECT(6), no block descriptor, with `pages` as the list.
+    fn mode_select(dev: &mut ScsiDevice, pages: &[u8]) -> ScsiResponse {
+        let mut list = vec![0u8, 0, 0, 0];
+        list.extend_from_slice(pages);
+        dev.request(&request(&[0x15, 0x10, 0, 0, list.len() as u8, 0], Some(list))).expect("request")
+    }
+
+    /// The caching page as the disk reports it, with byte 2 replaced.
+    fn caching_select(dev: &mut ScsiDevice, flags: u8) -> Vec<u8> {
+        let r = run(dev, &[0x1a, 0x08, 0x08, 0, 255, 0]);
+        let mut page = r.data[4..].to_vec();
+        page[2] = flags;
+        page
+    }
+
+    fn sense_key_asc(dev: &mut ScsiDevice) -> (u8, u8) {
+        let r = run(dev, &[0x03, 0, 0, 0, 18, 0]);
+        (r.data[2] & 0x0f, r.data[12])
+    }
+
+    /// A disk with a write cache says so, with the read cache on.
+    #[test]
+    fn a_disk_reports_a_write_cache_with_the_read_cache_on() {
+        let mut dev = disk();
+        assert_eq!(caching_flags(&mut dev), 0x04, "WCE=1, RCD=0");
+        // MODE SENSE(10) says the same.
+        let r = run(&mut dev, &[0x5a, 0x08, 0x08, 0, 0, 0, 0, 0, 255, 0]);
+        assert_eq!(r.data[8 + 2], 0x04);
+    }
+
+    #[test]
+    fn mode_select_round_trips_the_write_cache_bit() {
+        let mut dev = disk();
+        let page = caching_select(&mut dev, 0x00);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x00, "WCE cleared by the guest");
+        let page = caching_select(&mut dev, 0x04);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x04, "and set again");
+    }
+
+    #[test]
+    fn mode_select_10_clears_the_write_cache_bit_after_a_block_descriptor() {
+        let mut dev = disk();
+        let page = caching_select(&mut dev, 0x00);
+        let mut list = vec![0u8; 8];
+        list[7] = 8; // one block descriptor
+        list.extend_from_slice(&[0, 0, 0, 64, 0, 0, 2, 0]);
+        list.extend_from_slice(&page);
+        let cdb = [0x55, 0x10, 0, 0, 0, 0, 0, 0, list.len() as u8, 0];
+        assert_eq!(dev.request(&request(&cdb, Some(list))).unwrap().status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x00);
+    }
+
+    #[test]
+    fn mode_select_rejects_a_malformed_caching_page_and_changes_nothing() {
+        let mut dev = disk();
+        let good = caching_select(&mut dev, 0x00);
+
+        // Too short a page.
+        let mut short = good.clone();
+        short[1] = 0x10;
+        short.truncate(18);
+        // A page that claims more than the list holds.
+        let mut cut = good.clone();
+        cut.truncate(10);
+        // The read cache disabled: RCD is not changeable.
+        let rcd = caching_select(&mut dev, 0x05);
+        // Another field changed.
+        let mut other = good.clone();
+        other[8] = 0x00;
+        // The long (sub-page) format.
+        let mut spf = good.clone();
+        spf[0] |= 0x40;
+
+        for (what, page, key_asc) in [
+            ("short page", short, (0x05, 0x26)),
+            ("page past the list", cut, (0x05, 0x1a)),
+            ("RCD", rcd, (0x05, 0x26)),
+            ("other field", other, (0x05, 0x26)),
+            ("SPF", spf, (0x05, 0x26)),
+        ] {
+            let r = mode_select(&mut dev, &page);
+            assert_eq!(r.status, 0x02, "{what}: CHECK CONDITION");
+            assert_eq!(sense_key_asc(&mut dev), key_asc, "{what}");
+            assert_eq!(caching_flags(&mut dev), 0x04, "{what}: WCE untouched");
+        }
+        // A later valid page after a bad one is not half-applied.
+        let mut two = good.clone();
+        two.extend_from_slice(&[0x08, 0x12]);
+        assert_eq!(mode_select(&mut dev, &two).status, 0x02);
+        assert_eq!(caching_flags(&mut dev), 0x04);
+    }
+
+    /// Pages the disk does not model are accepted and ignored.
+    #[test]
+    fn mode_select_ignores_a_well_formed_page_it_does_not_model() {
+        let mut dev = disk();
+        let pages = [0x01, 0x0a, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0];
+        assert_eq!(mode_select(&mut dev, &pages).status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x04);
+    }
+
     /// A disk in memory that counts the flushes it is asked for.
     struct CountingNode {
         data: Vec<u8>,
-        flushes: std::sync::Arc<AtomicU64>,
+        counts: std::sync::Arc<Counts>,
+    }
+
+    /// What a [`CountingNode`] was asked to make durable.
+    #[derive(Default)]
+    struct Counts {
+        flushes: AtomicU64,
+        data_syncs: AtomicU64,
     }
 
     impl CountingNode {
-        fn device(blocks: usize) -> (ScsiDevice, std::sync::Arc<AtomicU64>) {
-            let flushes = std::sync::Arc::new(AtomicU64::new(0));
-            let node = CountingNode { data: vec![0u8; blocks * 512], flushes: flushes.clone() };
+        fn device(blocks: usize) -> (ScsiDevice, std::sync::Arc<Counts>) {
+            let counts = std::sync::Arc::new(Counts::default());
+            let node = CountingNode { data: vec![0u8; blocks * 512], counts: counts.clone() };
             let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
-            (ScsiDevice::new(Box::new(node), false, "mock".into(), Vec::new(), identity), flushes)
+            (ScsiDevice::new(Box::new(node), false, "mock".into(), Vec::new(), identity).with_write_cache(true), counts)
         }
     }
 
@@ -1291,7 +1541,11 @@ mod tests {
             Ok(())
         }
         fn flush(&mut self) -> io::Result<()> {
-            self.flushes.fetch_add(1, Ordering::SeqCst);
+            self.counts.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn flush_data(&mut self) -> io::Result<()> {
+            self.counts.data_syncs.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn discard(&mut self, _offset: u64, _len: u64) -> io::Result<()> { Ok(()) }
@@ -1313,13 +1567,200 @@ mod tests {
     /// return GOOD. (16) used to be an unknown command.
     #[test]
     fn synchronize_cache_flushes_in_both_cdb_sizes() {
-        let (mut dev, flushes) = CountingNode::device(8);
+        let (mut dev, counts) = CountingNode::device(8);
         assert_eq!(run(&mut dev, &[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]).status, 0x00);
-        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.flushes.load(Ordering::SeqCst), 1);
         let mut cdb = [0u8; 16];
         cdb[0] = 0x91;
         assert_eq!(run(&mut dev, &cdb).status, 0x00, "SYNCHRONIZE CACHE(16)");
-        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.flushes.load(Ordering::SeqCst), 2);
+    }
+
+    /// The default disk is a drive without a write cache: WCE=0 and every
+    /// write stored before GOOD. The guest can turn the cache on, and a bus
+    /// or controller reset puts back what the disk was given at power-up.
+    #[test]
+    fn a_disk_without_a_write_cache_stores_every_write_before_good() {
+        let counts = std::sync::Arc::new(Counts::default());
+        let node = CountingNode { data: vec![0u8; 8 * 512], counts: counts.clone() };
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        let mut dev = ScsiDevice::new(Box::new(node), false, "mock".into(), Vec::new(), identity);
+        assert_eq!(caching_flags(&mut dev), 0x00, "WCE=0 by default");
+        let write = |dev: &mut ScsiDevice| dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![1; 512]))).unwrap();
+        assert_eq!(write(&mut dev).status, 0x00);
+        assert_eq!(write(&mut dev).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 2, "each write synced");
+        // The guest turns the cache on.
+        let page = caching_select(&mut dev, 0x04);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x04);
+        assert_eq!(write(&mut dev).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 2, "no sync with WCE=1");
+        // A bus reset restores what the disk powers up with.
+        dev.reset_block_size(false);
+        assert_eq!(caching_flags(&mut dev), 0x00);
+        // A disk given a cache powers up with it on, and returns to it, on a
+        // bus reset or a controller's power-on.
+        let mut dev = disk();
+        let page = caching_select(&mut dev, 0x00);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        dev.reset_block_size(false);
+        assert_eq!(caching_flags(&mut dev), 0x04);
+        let page = caching_select(&mut dev, 0x00);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        dev.power_on();
+        assert_eq!(caching_flags(&mut dev), 0x04);
+    }
+
+    /// A guest that clears WCE believes what it wrote is stored: it is, at
+    /// once, not at the next write.
+    #[test]
+    fn clearing_wce_stores_what_was_written_before() {
+        let (mut dev, counts) = CountingNode::device(8);
+        assert_eq!(dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![1; 512]))).unwrap().status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 0);
+        let page = caching_select(&mut dev, 0x00);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 1, "synced by the MODE SELECT");
+        // Setting it, or clearing it again, stores nothing more.
+        let page = caching_select(&mut dev, 0x04);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        let page = caching_select(&mut dev, 0x04);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 1);
+    }
+
+    /// With PF clear the bytes after the block descriptors are
+    /// vendor-specific: not read, so a caching page there changes nothing and
+    /// nothing in them is refused.
+    #[test]
+    fn mode_select_with_pf_clear_reads_no_pages() {
+        let mut dev = disk();
+        let page = caching_select(&mut dev, 0x00);
+        let mut list = vec![0u8, 0, 0, 0];
+        list.extend_from_slice(&page);
+        let select_6 = |dev: &mut ScsiDevice, list: Vec<u8>| {
+            dev.request(&request(&[0x15, 0x00, 0, 0, list.len() as u8, 0], Some(list))).unwrap()
+        };
+        assert_eq!(select_6(&mut dev, list).status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x04, "not taken as a page");
+        // Vendor bytes that would be a malformed page with PF set.
+        assert_eq!(select_6(&mut dev, vec![0, 0, 0, 0, 0x88, 0x40, 1]).status, 0x00);
+        // MODE SELECT(10), a block descriptor, PF clear and junk after it.
+        let mut list = vec![0u8; 8];
+        list[7] = 8;
+        list.extend_from_slice(&[0, 0, 0, 64, 0, 0, 2, 0, 0xff, 0xff, 0xff]);
+        let cdb = [0x55, 0x00, 0, 0, 0, 0, 0, 0, list.len() as u8, 0];
+        assert_eq!(dev.request(&request(&cdb, Some(list))).unwrap().status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x04);
+    }
+
+    /// Lists the disk accepted before it read pages are still accepted if
+    /// they are padded, run short of their block descriptors or carry a page
+    /// it does not model badly: only a bad caching page is refused.
+    #[test]
+    fn mode_select_with_pf_set_accepts_padding_and_what_it_does_not_model() {
+        let mut dev = disk();
+        let page = caching_select(&mut dev, 0x00);
+        // The caching page followed by one and by two bytes of padding.
+        for pad in [1, 2, 5] {
+            let mut pages = page.clone();
+            pages.extend(std::iter::repeat(0u8).take(pad));
+            assert_eq!(mode_select(&mut dev, &pages).status, 0x00, "{pad} bytes of padding");
+            assert_eq!(caching_flags(&mut dev), 0x00, "{pad}: the page is still taken");
+            let on = caching_select(&mut dev, 0x04);
+            assert_eq!(mode_select(&mut dev, &on).status, 0x00);
+        }
+        // Another page that runs past the list, or is in the SPF format.
+        assert_eq!(mode_select(&mut dev, &[0x01, 0x0a, 0, 1]).status, 0x00);
+        assert_eq!(mode_select(&mut dev, &[0x41, 0x00, 0x00, 0x04, 0, 0, 0, 0]).status, 0x00);
+        // A block descriptor length past the end of the list: no pages.
+        let mut list = vec![0u8, 0, 0, 24];
+        list.extend_from_slice(&[0, 0, 0, 64, 0, 0, 2, 0]);
+        assert_eq!(dev.request(&request(&[0x15, 0x10, 0, 0, list.len() as u8, 0], Some(list))).unwrap().status, 0x00);
+        assert_eq!(caching_flags(&mut dev), 0x04);
+    }
+
+    /// With WCE cleared by the guest every write is stored before GOOD, as
+    /// with FUA; with WCE=1 a plain write is not.
+    #[test]
+    fn clearing_wce_makes_every_write_durable_before_good() {
+        let (mut dev, counts) = CountingNode::device(8);
+        let write = |dev: &mut ScsiDevice, cdb: &[u8]| dev.request(&request(cdb, Some(vec![0x5a; 512]))).unwrap();
+        assert_eq!(write(&mut dev, &[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0]).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 0, "WCE=1: cached");
+        let page = caching_select(&mut dev, 0x00);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 1, "the MODE SELECT stored the first");
+        assert_eq!(write(&mut dev, &[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0]).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 2, "WCE=0: WRITE(10) synced");
+        assert_eq!(write(&mut dev, &[0x0a, 0, 0, 1, 1, 0]).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 3, "WCE=0: WRITE(6) synced");
+        let page = caching_select(&mut dev, 0x04);
+        assert_eq!(mode_select(&mut dev, &page).status, 0x00);
+        assert_eq!(write(&mut dev, &[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0]).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 3, "WCE=1 again: cached");
+    }
+
+    /// A WRITE(10) with FUA is stored before it returns GOOD; one without
+    /// is not made to wait. The sync is of that write's data, not a flush
+    /// of the whole disk.
+    #[test]
+    fn write_10_with_fua_syncs_before_good() {
+        let (mut dev, counts) = CountingNode::device(8);
+        let write = |dev: &mut ScsiDevice, flags: u8| {
+            dev.request(&request(&[0x2a, flags, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x5a; 512]))).unwrap()
+        };
+        assert_eq!(write(&mut dev, 0x00).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 0, "no FUA, no sync");
+        // DPO (bit 4) alone is only a hint.
+        assert_eq!(write(&mut dev, 0x10).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 0);
+        assert_eq!(write(&mut dev, 0x08).status, 0x00);
+        assert_eq!(counts.data_syncs.load(Ordering::SeqCst), 1, "FUA syncs");
+        assert_eq!(counts.flushes.load(Ordering::SeqCst), 0, "not a full flush");
+    }
+
+    /// A sync that fails is a write that failed.
+    #[test]
+    fn write_10_with_fua_reports_a_failed_sync() {
+        struct Failing(CountingNode);
+        impl crate::block_node::BlockNode for Failing {
+            fn size(&self) -> u64 { self.0.size() }
+            fn read(&mut self, o: u64, b: &mut [u8]) -> io::Result<()> { self.0.read(o, b) }
+            fn write(&mut self, o: u64, b: &[u8]) -> io::Result<()> { self.0.write(o, b) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush_data(&mut self) -> io::Result<()> { Err(io::Error::other("disk full")) }
+            fn discard(&mut self, o: u64, l: u64) -> io::Result<()> { self.0.discard(o, l) }
+            fn block_status(&self, o: u64, l: u64) -> io::Result<crate::block_node::BlockStatus> { self.0.block_status(o, l) }
+            fn backing(&self) -> Option<&dyn crate::block_node::BlockNode> { None }
+        }
+        let inner = CountingNode { data: vec![0u8; 8 * 512], counts: Default::default() };
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        let mut dev = ScsiDevice::new(Box::new(Failing(inner)), false, "mock".into(), Vec::new(), identity).with_write_cache(true);
+        let r = dev.request(&request(&[0x2a, 0x08, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x5a; 512]))).unwrap();
+        assert_eq!(r.status, 0x02);
+        assert_eq!(sense_key_asc(&mut dev), (0x03, 0x0c));
+    }
+
+    /// The raw and overlay backends take FUA without error.
+    #[test]
+    fn write_10_with_fua_on_the_real_backends() {
+        let base = tmp("fua-base");
+        std::fs::write(&base, vec![0u8; 8 * 512]).unwrap();
+        let overlay = tmp("fua-overlay");
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        let raw = crate::block_node::RawNode::open(&base).unwrap();
+        let backing = crate::block_node::RawNode::open_readonly(&base).unwrap();
+        let cow = crate::block_node::CowNode::new(Some(Box::new(backing)), &overlay, 8 * 512).unwrap();
+        for node in [Box::new(raw) as Box<dyn BlockNode>, Box::new(cow)] {
+            let mut dev = ScsiDevice::new(node, false, "t".into(), Vec::new(), identity);
+            let r = dev.request(&request(&[0x2a, 0x08, 0, 0, 0, 2, 0, 0, 1, 0], Some(vec![0x77; 512]))).unwrap();
+            assert_eq!(r.status, 0x00);
+        }
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&overlay);
+        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
     }
 
     /// NetBSD's cd driver reads the TOC asking for 12 bytes: header and

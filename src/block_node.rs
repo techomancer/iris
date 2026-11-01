@@ -125,6 +125,14 @@ pub trait BlockNode: Send {
     /// Push buffered writes out to durable storage.
     fn flush(&mut self) -> io::Result<()>;
 
+    /// Make the writes this node has accepted durable on the host, as a
+    /// write with FUA needs before it is acknowledged. It may leave undone
+    /// what only a later [`BlockNode::flush`] needs, such as compacting a
+    /// copy-on-write record, so it is cheaper. The default is a full flush.
+    fn flush_data(&mut self) -> io::Result<()> {
+        self.flush()
+    }
+
     /// Discard `len` bytes at `offset`, releasing the layer's claim on them.
     /// A later read falls through to the backing node (or zeroes, if none).
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()>;
@@ -264,6 +272,10 @@ impl BlockNode for RawNode {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
+    }
+
+    fn flush_data(&mut self) -> io::Result<()> {
+        self.file.sync_data()
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
@@ -546,6 +558,17 @@ impl BlockNode for CowNode {
         // The backing is never written through this node, so it has nothing
         // of ours to flush.
         self.unflushed = false;
+        Ok(())
+    }
+
+    /// The overlay's data, and the record that lists its sectors: a sector
+    /// is only found again if both are on the disk. The record is not
+    /// compacted and `unflushed` stays set for the flush that does that.
+    fn flush_data(&mut self) -> io::Result<()> {
+        self.overlay.sync_data()?;
+        if let Some(record) = &self.record {
+            record.sync_data()?;
+        }
         Ok(())
     }
 

@@ -1633,6 +1633,24 @@ fn bus_reset(r: &Rig, secs: u16, bus: u16) {
     assert_eq!(r.cmd(&[mbox::BUS_RESET, secs, bus]), mbox::COMPLETE);
 }
 
+/// A bus reset puts a disk's write cache bit back to the value it powers up
+/// with, before the next command: a guest that cleared WCE finds it set again.
+#[test]
+fn a_bus_reset_puts_a_disks_write_cache_back() {
+    let r = Rig::bare();
+    r.isp.bus().attach_cached_image(1, &image("wce-reset", 64)).expect("attach");
+    r.init_rings(4, 4);
+    r.isp.bus().select_write_cache(1, false);
+    assert!(!r.isp.bus().write_cache_reported(1), "the guest cleared it");
+    bus_reset(&r, 0, 0);
+    // MODE SENSE(6) of the caching page, through the ring.
+    r.put_entry(0, &request(0x31, 1, &[0x1a, 0x08, 0x08, 0, 24, 0], &[(BUF, 24)]));
+    r.doorbell(1);
+    assert_eq!(g16(&r.status(0), 10), IOCB_COMPLETE);
+    assert_eq!(r.mem.get(BUF + 4, 1)[0], 0x08, "caching page");
+    assert_eq!(r.mem.get(BUF + 6, 1)[0] & 0x04, 0x04, "WCE is back");
+}
+
 /// A TUR for the disk at target 1.
 fn tur1(handle: u32) -> [u8; ENTRY_SIZE] {
     request(handle, 1, &[0, 0, 0, 0, 0, 0], &[])
