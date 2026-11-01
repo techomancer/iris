@@ -40,6 +40,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 - A two-processor Octane, or one with an IMPACT or VPro board, refuses a save or
   load and says why.
 
+### Snapshots of a disk overlay stay small without reflinks
+
+- Saving or restoring a snapshot copies each copy-on-write overlay. Where the
+  filesystem cannot reflink it (NFS, ext4, NTFS, or a copy between two
+  filesystems), the fallback used `std::fs::copy`, which writes the overlay's holes
+  out as zeros: an 8 GB overlay holding 100 MB of guest writes took 29 s to save and
+  82 s to restore, and each copy occupied 7.6 GB. The fallback now copies only the
+  sectors in the overlay's dirty record and leaves the rest sparse, on every OS, so
+  the cost follows what the guest wrote. Reflinking is unchanged. On Windows the
+  copy is marked sparse first.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never

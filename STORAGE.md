@@ -107,7 +107,10 @@ Two restore tiers:
   the same starting state.
 
 Reflinks are used on APFS / btrfs / xfs so capturing a snapshot of a 4 GB disk
-image takes <10 ms and uses ~18 MB of actual disk.
+image takes <10 ms and uses ~18 MB of actual disk. Where the filesystem cannot
+reflink (NFS, ext4, NTFS, or a copy between two filesystems), a snapshot copies
+only the sectors the guest wrote and leaves the rest of the overlay sparse, so
+its cost follows the written size, not the disk size.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full feature set, and `clanker/snapshot/`
 for the format and its gotchas.

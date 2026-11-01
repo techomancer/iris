@@ -652,9 +652,9 @@ impl BlockNode for CowNode {
     /// (sorted). Mirrors [`crate::cow_disk::CowDisk::export_overlay`].
     fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.overlay.sync_all()?;
-        crate::cow_disk::reflink_or_copy(&self.overlay_path, dest)?;
         let mut dirty: Vec<u64> = self.dirty.iter().copied().collect();
         dirty.sort_unstable();
+        crate::cow_disk::reflink_or_copy(&self.overlay_path, dest, &dirty)?;
         Ok(dirty)
     }
 
@@ -668,12 +668,13 @@ impl BlockNode for CowNode {
     /// in the middle therefore reads the base image: a disk the guest really
     /// had, though neither the one before the import nor the one imported.
     /// A copy that fails (no space) leaves the same thing.
-    fn import_overlay(&mut self, source: &Path, dirty: Vec<u64>) -> io::Result<()> {
+    fn import_overlay(&mut self, source: &Path, mut dirty: Vec<u64>) -> io::Result<()> {
+        dirty.sort_unstable();
         self.dirty.clear();
         self.unflushed = true;
         self.rewrite_record()?;
         let copied = if source.exists() {
-            crate::cow_disk::reflink_or_copy(source, &self.overlay_path)
+            crate::cow_disk::reflink_or_copy(source, &self.overlay_path, &dirty)
         } else {
             std::fs::File::create(&self.overlay_path).map(|_| ())
         };
@@ -1625,7 +1626,7 @@ mod tests {
     }
 
     /// An import that fails after taking the live overlay away (here the
-    /// source is a directory, as a full disk would also fail the copy) must
+    /// source cannot be opened, as a full disk would also fail the copy) must
     /// not leave the old record over the emptied overlay: its sectors would
     /// read as zeroes or fail. A kill at the same point reads the same way.
     #[test]
@@ -1638,9 +1639,25 @@ mod tests {
         node.flush().unwrap();
         node.write(5 * SECTOR_SIZE, &[0x05u8; 2 * SECTOR_BYTES]).unwrap();
 
-        let unreadable = tmp_path("cow-import-dir");
-        std::fs::create_dir(&unreadable).unwrap();
+        // A file that cannot be opened. (A directory will not do: the sparse
+        // copy clamps to its reported length, which can be tiny, and copies
+        // nothing without failing.)
+        let unreadable = tmp_path("cow-import-unreadable");
+        std::fs::write(&unreadable, [0u8; 4 * SECTOR_BYTES]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(&unreadable).unwrap();
+            std::fs::create_dir(&unreadable).unwrap();
+        }
         assert!(node.import_overlay(&unreadable, vec![1, 2]).is_err());
+        #[cfg(unix)]
+        std::fs::remove_file(&unreadable).unwrap();
+        #[cfg(not(unix))]
         std::fs::remove_dir(&unreadable).unwrap();
         std::mem::forget(node);
 
@@ -2015,6 +2032,38 @@ mod tests {
 
         let _ = std::fs::remove_file(&backing_path);
         cleanup(&overlay_path);
+        let _ = std::fs::remove_file(&export_path);
+    }
+
+    /// An import of an unsorted dirty list, then a kill: the record the next
+    /// run reads lists exactly the imported sectors and the overlay holds
+    /// their data, which the sparse fallback copies by the (sorted) list.
+    #[test]
+    fn cow_import_survives_a_kill_with_the_imported_sectors() {
+        let (backing, backing_path) = raw_filled(0xAA, 8 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-import-kill");
+        let export_path = tmp_path("cow-import-kill-src");
+        let size = 8 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(SECTOR_SIZE, &[0x11u8; SECTOR_BYTES]).unwrap();
+        node.write(6 * SECTOR_SIZE, &[0x66u8; SECTOR_BYTES]).unwrap();
+        let dirty = node.export_overlay(&export_path).unwrap();
+        node.rollback().unwrap();
+
+        let mut shuffled = dirty.clone();
+        shuffled.reverse();
+        node.import_overlay(&export_path, shuffled).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 2);
+        assert_eq!(sector(&mut node, 1), [0x11u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 6), [0x66u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 3), [0xAAu8; SECTOR_BYTES]);
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(&backing_path);
         let _ = std::fs::remove_file(&export_path);
     }
 

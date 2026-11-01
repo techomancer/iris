@@ -12,16 +12,98 @@ use std::path::{Path, PathBuf};
 const SECTOR_SIZE: u64 = 512;
 
 /// Clone `src` to `dst` via filesystem-level CoW (APFS clonefile, Linux
-/// FICLONE) when supported; fall back to a regular byte copy otherwise. On a
-/// reflink-capable filesystem this is metadata-only — sub-millisecond for any
-/// size — which makes per-snapshot overlay capture essentially free.
-pub(crate) fn reflink_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+/// FICLONE) when supported; otherwise copy just the `dirty` sectors (see
+/// [`copy_dirty_sectors`]). On a reflink-capable filesystem this is
+/// metadata-only — sub-millisecond for any size — which makes per-snapshot
+/// overlay capture essentially free.
+pub(crate) fn reflink_or_copy(src: &Path, dst: &Path, dirty: &[u64]) -> io::Result<()> {
     let _ = std::fs::remove_file(dst);
     if try_reflink(src, dst).is_ok() {
         return Ok(());
     }
-    std::fs::copy(src, dst).map(|_| ())
+    copy_dirty_sectors(src, dst, dirty)
 }
+
+/// Copy the overlay `src` to `dst`: a file of the same length that holds the
+/// `dirty` sectors (ascending) and nothing else, leaving the rest a hole.
+/// `std::fs::copy` writes a sparse file's holes out as zeros whenever the
+/// kernel cannot copy in-filesystem (between filesystems, on NFS), so an 8 GB
+/// overlay holding 100 MB became an 8 GB snapshot. This reads and writes in
+/// proportion to what the guest wrote, on any filesystem and OS.
+fn copy_dirty_sectors(src: &Path, dst: &Path, dirty: &[u64]) -> io::Result<()> {
+    let mut from = File::open(src)?;
+    let len = from.metadata()?.len();
+    let mut to = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
+    mark_sparse(&to);
+    to.set_len(len)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut i = 0;
+    while i < dirty.len() {
+        // A run of adjacent sectors is one seek and a few large transfers.
+        let first = dirty[i];
+        let mut last = first;
+        i += 1;
+        while i < dirty.len() && last.checked_add(1) == Some(dirty[i]) {
+            last = dirty[i];
+            i += 1;
+        }
+        // A sector number comes from a saved file, so it may be nonsense;
+        // one that overflows or lies past the end of the source holds nothing
+        // to copy.
+        let Some(start) = first.checked_mul(SECTOR_SIZE) else {
+            continue;
+        };
+        let end = last.saturating_add(1).saturating_mul(SECTOR_SIZE).min(len);
+        let mut pos = start;
+        if pos >= end {
+            continue;
+        }
+        from.seek(SeekFrom::Start(pos))?;
+        to.seek(SeekFrom::Start(pos))?;
+        while pos < end {
+            let want = ((end - pos) as usize).min(buf.len());
+            from.read_exact(&mut buf[..want])?;
+            to.write_all(&buf[..want])?;
+            pos += want as u64;
+        }
+    }
+    Ok(())
+}
+
+/// NTFS zero-fills the gap when a write lands past the end of a file that is
+/// not marked sparse. Other filesystems need no mark; a failure here (FAT,
+/// some network shares) only means the holes get written as zeros.
+#[cfg(windows)]
+fn mark_sparse(f: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::{Ioctl::FSCTL_SET_SPARSE, IO::DeviceIoControl};
+    let mut returned = 0u32;
+    // SAFETY: the handle is open for as long as `f` is borrowed. FSCTL_SET_SPARSE
+    // takes no input or output buffer, so null with length 0 is correct, and the
+    // handle was opened without FILE_FLAG_OVERLAPPED, so a null OVERLAPPED is
+    // valid and the call completes before it returns.
+    let ok = unsafe {
+        DeviceIoControl(
+            f.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        eprintln!(
+            "iris: cannot mark the snapshot overlay sparse ({}); it will be written at full size",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_f: &File) {}
 
 #[cfg(target_os = "macos")]
 fn try_reflink(src: &Path, dst: &Path) -> io::Result<()> {
@@ -311,9 +393,9 @@ impl CowDisk {
     /// state — base + overlay — is captured consistently with RAM.
     pub fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.overlay.sync_all()?;
-        reflink_or_copy(Path::new(&self.overlay_path), dest)?;
         let mut dirty: Vec<u64> = self.dirty.iter().copied().collect();
         dirty.sort_unstable();
+        reflink_or_copy(Path::new(&self.overlay_path), dest, &dirty)?;
         Ok(dirty)
     }
 
@@ -321,9 +403,10 @@ impl CowDisk {
     /// dirty sector set. Used by snapshot load. If `source` doesn't exist
     /// the overlay is truncated instead (matches `reset_overlay` behavior —
     /// handles old snapshots without overlay data).
-    pub fn import_overlay(&mut self, source: &Path, dirty: Vec<u64>) -> io::Result<()> {
+    pub fn import_overlay(&mut self, source: &Path, mut dirty: Vec<u64>) -> io::Result<()> {
+        dirty.sort_unstable();
         if source.exists() {
-            reflink_or_copy(source, Path::new(&self.overlay_path))?;
+            reflink_or_copy(source, Path::new(&self.overlay_path), &dirty)?;
         } else {
             // Clear the overlay: nothing saved for this device.
             std::fs::File::create(&self.overlay_path)?;
@@ -362,6 +445,87 @@ mod tests {
         std::env::temp_dir().join(format!("iris-cow-{}-{}.{}", tag, nanos, ext))
     }
 
+    /// The fallback copies the dirty sectors and nothing else: a 64 MiB
+    /// overlay with three runs of written sectors copies to the same bytes,
+    /// and a sector the dirty list leaves out reads as zeros even though the
+    /// source holds junk there. That junk check holds on every filesystem; a
+    /// whole-file copy carries the junk over. The allocation check below needs
+    /// a temporary directory that supports sparse files.
+    #[test]
+    fn a_copied_overlay_stays_sparse() {
+        let (src, dst) = (unique_tmp("sparse-src", "bin"), unique_tmp("sparse-dst", "bin"));
+        let runs: [(u64, u64); 3] = [(0, 8), (80_000, 1), (131_071, 1)];
+        let mut dirty = Vec::new();
+        {
+            let mut f = File::create(&src).unwrap();
+            f.set_len(64 << 20).unwrap();
+            for (n, &(lba, count)) in runs.iter().enumerate() {
+                f.seek(SeekFrom::Start(lba * SECTOR_SIZE)).unwrap();
+                f.write_all(&vec![0xa0 + n as u8; (count * SECTOR_SIZE) as usize]).unwrap();
+                dirty.extend(lba..lba + count);
+            }
+            // Written by the guest, then discarded: the bytes stay in the file
+            // but the sector is not in the dirty list.
+            f.seek(SeekFrom::Start(1000 * SECTOR_SIZE)).unwrap();
+            f.write_all(&[0xee; SECTOR_SIZE as usize]).unwrap();
+        }
+        copy_dirty_sectors(&src, &dst, &dirty).unwrap();
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 64 << 20);
+        let mut copy = File::open(&dst).unwrap();
+        for (n, &(lba, count)) in runs.iter().enumerate() {
+            let mut got = vec![0u8; (count * SECTOR_SIZE) as usize];
+            copy.seek(SeekFrom::Start(lba * SECTOR_SIZE)).unwrap();
+            copy.read_exact(&mut got).unwrap();
+            assert!(got.iter().all(|&b| b == 0xa0 + n as u8), "run {n} differs");
+        }
+        let mut hole = vec![0xffu8; 4096];
+        copy.seek(SeekFrom::Start(20 << 20)).unwrap();
+        copy.read_exact(&mut hole).unwrap();
+        assert!(hole.iter().all(|&b| b == 0), "a hole reads as zeros");
+        let mut skipped = vec![0xffu8; SECTOR_SIZE as usize];
+        copy.seek(SeekFrom::Start(1000 * SECTOR_SIZE)).unwrap();
+        copy.read_exact(&mut skipped).unwrap();
+        assert!(skipped.iter().all(|&b| b == 0), "a sector outside the dirty list is not copied");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let used = std::fs::metadata(&dst).unwrap().blocks() * 512;
+            assert!(used <= 1 << 20, "{used} bytes allocated for 10 written sectors");
+        }
+        // An overlay exported before any write holds no data at all.
+        copy_dirty_sectors(&src, &dst, &[]).unwrap();
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 64 << 20);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&dst).unwrap().blocks(), 0);
+        }
+        for p in [&src, &dst] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Sector numbers past the end of the source (a truncated save, a
+    /// `cow.toml` from a differently sized disk) or large enough to overflow
+    /// are skipped; the copy keeps the source's length and the in-range
+    /// sectors, and the run that straddles the end is cut at the end.
+    #[test]
+    fn dirty_sectors_beyond_the_source_are_clamped() {
+        let (src, dst) = (unique_tmp("clamp-src", "bin"), unique_tmp("clamp-dst", "bin"));
+        std::fs::write(&src, vec![0x5au8; 3 * SECTOR_SIZE as usize]).unwrap();
+        // Sectors 2 and 3 are one run; sector 3 lies past the end. 1<<60
+        // overflows when multiplied by the sector size, u64::MAX when
+        // incremented.
+        copy_dirty_sectors(&src, &dst, &[2, 3, 1 << 60, u64::MAX]).unwrap();
+        let got = std::fs::read(&dst).unwrap();
+        assert_eq!(got.len(), 3 * SECTOR_SIZE as usize);
+        assert!(got[..2 * SECTOR_SIZE as usize].iter().all(|&b| b == 0));
+        assert!(got[2 * SECTOR_SIZE as usize..].iter().all(|&b| b == 0x5a));
+        for p in [&src, &dst] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     #[test]
     fn reflink_or_copy_preserves_bytes() {
         let src = unique_tmp("reflink-src", "bin");
@@ -372,7 +536,7 @@ mod tests {
             f.write_all(&payload).unwrap();
             f.sync_all().unwrap();
         }
-        reflink_or_copy(&src, &dst).expect("reflink_or_copy");
+        reflink_or_copy(&src, &dst, &(0..=128).collect::<Vec<u64>>()).expect("reflink_or_copy");
         let read_back = std::fs::read(&dst).unwrap();
         assert_eq!(read_back, payload);
         let _ = std::fs::remove_file(&src);
@@ -385,7 +549,7 @@ mod tests {
         let dst = unique_tmp("reflink-dst2", "bin");
         std::fs::write(&src, b"new content").unwrap();
         std::fs::write(&dst, b"old content that is longer than the new one").unwrap();
-        reflink_or_copy(&src, &dst).expect("overwrite");
+        reflink_or_copy(&src, &dst, &[0]).expect("overwrite");
         assert_eq!(std::fs::read(&dst).unwrap(), b"new content");
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&dst);
