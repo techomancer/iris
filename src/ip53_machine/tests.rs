@@ -315,29 +315,6 @@ fn fitted_processors_read_present_and_only_cpu_0_is_enabled() {
     }
 }
 
-/// What the PIs ask of CPU 0 that the board cannot do is counted, not
-/// dropped: an NMI, and a write that clears its enable bit. Setting the bit,
-/// and NMIs or enables for the other slots, which the PI records, are not.
-#[test]
-fn an_nmi_for_cpu_0_and_a_write_that_stops_it_are_refused() {
-    use crate::dev::bedrock_pi::reg::{CPU_A_ENABLE, CPU_B_ENABLE, NMI_SLOT_A, NMI_SLOT_B};
-    let board = TezroBoard::new(4).unwrap();
-    let count = || (board.cpu0_refused.nmi.load(Ordering::Relaxed), board.cpu0_refused.stop.load(Ordering::Relaxed));
-    let [pi0, pi1] = [&board.node.pi[0], &board.node.pi[1]];
-    pi0.write64(CPU_A_ENABLE, 1);
-    pi0.write64(NMI_SLOT_B, 1);
-    pi0.write64(CPU_B_ENABLE, 0);
-    pi1.write64(NMI_SLOT_A, 1);
-    pi1.write64(CPU_A_ENABLE, 0);
-    assert_eq!(count(), (0, 0), "not CPU 0's, or not a refusal");
-    pi0.write64(NMI_SLOT_A, 1);
-    pi0.write64(NMI_SLOT_A, 1);
-    pi0.write64(CPU_A_ENABLE, 0);
-    assert_eq!(count(), (2, 1));
-    use crate::dev::bedrock_pi::Refused as PiRefused;
-    assert_eq!(pi0.refused(), [(PiRefused::Nmi { interface: 0, slot: 1 }, 1)], "the PI leaves CPU 0's to the board");
-}
-
 /// Only the counts a board fits are accepted.
 #[test]
 fn the_board_refuses_a_population_it_cannot_fit() {

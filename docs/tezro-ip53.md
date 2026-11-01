@@ -81,9 +81,8 @@ or an interrupt aimed at one, and per-processor timers are refused and logged
 by the Bedrock PI, not carried out. On the two- and four-processor board the
 PROM therefore disables every processor but CPU 0 as having failed early
 initialisation, records that in its flash log, and IRIX reports the system
-as degraded. An NMI for CPU 0, and a write that clears its enable bit, are
-refused and logged by the board: the CPU has no NMI entry, and CPU 0 keeps
-running.
+as degraded. An NMI, and a write that clears a running processor's enable
+bit, are refused and logged by the Bedrock PI: the CPU has no NMI entry.
 
 On this Fuel base the PROM stops after printing `Copying PROM code to
 memory` and never reaches its menu. Bank 0 covers the reset PROM window at

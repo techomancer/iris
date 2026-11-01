@@ -34,6 +34,7 @@ fn the_pi_reports_interface_state_and_retains_registers_across_reset() {
                 interface: 1,
                 request_region: 0,
                 population: Population::SINGLE,
+                running: Population::SINGLE,
             },
             Arc::new(|| 0),
         );
@@ -282,7 +283,7 @@ fn node(count: usize) -> [Arc<BedrockPi>; 2] {
     let population = Population::fitted_cpus(count).unwrap();
     std::array::from_fn(|interface| {
         BedrockPi::new(
-            BedrockPiConfig { interface: interface as u8, request_region: 0, population },
+            BedrockPiConfig { interface: interface as u8, request_region: 0, population, running: Population::SINGLE },
             Arc::new(|| 0),
         )
     })
@@ -374,8 +375,9 @@ fn enabling_another_cpu_is_stored_and_recorded_but_never_started() {
 fn an_nmi_no_running_cpu_can_take_is_recorded() {
     struct Nmis(std::sync::Mutex<Vec<(u8, usize)>>);
     impl NodeHooks for Nmis {
-        fn nmi(&self, interface: u8, slot: usize) {
+        fn nmi(&self, interface: u8, slot: usize) -> bool {
             self.0.lock().unwrap().push((interface, slot));
+            true
         }
     }
     let pis = node(4);
@@ -429,4 +431,91 @@ fn timers_for_other_slots_are_recorded_when_enabled() {
     pis[1].write64(reg::RT_ENABLE_A, 1);
     assert_eq!(pis[0].refused(), [(Refused::Timer { interface: 0, slot: 1 }, 2)]);
     assert_eq!(pis[1].refused(), [(Refused::Timer { interface: 1, slot: 0 }, 1)]);
+}
+
+/// A node whose `count` fitted processors all run.
+fn running_node(count: usize) -> [Arc<BedrockPi>; 2] {
+    let population = Population::fitted_cpus(count).unwrap();
+    std::array::from_fn(|interface| {
+        BedrockPi::new(
+            BedrockPiConfig { interface: interface as u8, request_region: 0, population, running: population },
+            Arc::new(|| 0),
+        )
+    })
+}
+
+/// The board puts CPU n in the nth slot of its order: A, C, B, D.
+#[test]
+fn each_cpu_has_the_slot_the_boards_order_gives_it() {
+    let four = Population::fitted_cpus(4).unwrap();
+    assert_eq!((0..4).map(|cpu| four.slot_of(cpu).unwrap()).collect::<Vec<_>>(), [(0, 0), (1, 0), (0, 1), (1, 1)]);
+    assert_eq!(four.slot_of(4), None);
+    assert_eq!(four.cpu_in(0, 1), Some(2));
+    let two = Population::fitted_cpus(2).unwrap();
+    assert_eq!((two.slot_of(1), two.cpu_in(0, 1)), (Some((1, 0)), None));
+}
+
+/// Each processor reads its own slice from the CPU-number register of its
+/// interface, and a reader that is no processor reads slot A. Follows
+/// four-processors-know-their-slots in tests/qtest/sn1-cpu-identity-test.c
+/// and cpu-number-fallback.
+#[test]
+fn four_processors_know_their_slots() {
+    let pis = Arc::new(running_node(4));
+    assert_eq!((r(&pis[0], reg::INTERFACE_ID), r(&pis[1], reg::INTERFACE_ID)), (0, 2), "no issuing processor");
+    let slices: Vec<u64> = (0..4u8)
+        .map(|cpu| {
+            let pis = pis.clone();
+            std::thread::spawn(move || {
+                crate::cpu::smp::set_current_cpu(cpu);
+                let (interface, _) = Population::fitted_cpus(4).unwrap().slot_of(cpu as usize).unwrap();
+                r(&pis[interface as usize], reg::INTERFACE_ID)
+            })
+            .join()
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(slices, [0, 2, 1, 3], "slices A, C, B, D");
+}
+
+/// Every running slot starts granted. A write is stored either way and
+/// starts or stops nothing; clearing a running processor's bit is recorded.
+/// Follows cpu-enable-lines and the identity test's enable writes.
+#[test]
+fn running_slots_start_enabled_and_a_clear_stops_nothing() {
+    let pis = running_node(4);
+    let enables = |pis: &[Arc<BedrockPi>; 2]| {
+        [r(&pis[0], reg::CPU_A_ENABLE), r(&pis[0], reg::CPU_B_ENABLE),
+         r(&pis[1], reg::CPU_A_ENABLE), r(&pis[1], reg::CPU_B_ENABLE)]
+    };
+    assert_eq!(enables(&pis), [1, 1, 1, 1]);
+    pis[1].write64(reg::CPU_A_ENABLE, 0);
+    assert_eq!(enables(&pis), [1, 1, 0, 1]);
+    assert_eq!(pis[1].refused(), [(Refused::Stop { interface: 1, slot: 0 }, 1)]);
+    pis[1].write64(reg::CPU_A_ENABLE, 1);
+    assert_eq!(pis[1].refused().len(), 1, "re-enabling a running slot is no refusal");
+    assert_eq!(enables(&running_node(2)), [1, 0, 1, 0]);
+}
+
+/// The other processors' interrupt outputs and timers are theirs to take:
+/// nothing about them is refused once their slots run.
+#[test]
+fn a_running_slots_interrupts_and_timers_are_not_refused() {
+    let pis = running_node(4);
+    pis[1].write64(reg::PENDING_MODIFY, 0x107);
+    pis[1].write64(reg::OFFSET_00A8, 1 << 7);
+    pis[0].write64(reg::OFFSET_00B8, 1 << 7);
+    pis[0].write64(reg::PENDING_MODIFY, 0x107);
+    pis[0].write64(reg::RT_ENABLE_B, 1);
+    pis[1].write64(reg::PROFILE_ENABLE_A, 1);
+    assert!(pis[0].refused().is_empty() && pis[1].refused().is_empty());
+}
+
+/// An NMI to a running processor that the node cannot take is recorded:
+/// the processor has no NMI entry. Follows nmi.
+#[test]
+fn an_nmi_to_a_running_processor_is_recorded() {
+    let pis = running_node(2);
+    pis[1].write64(reg::NMI_SLOT_A, 1);
+    assert_eq!(pis[1].refused(), [(Refused::Nmi { interface: 1, slot: 0 }, 1)]);
 }
