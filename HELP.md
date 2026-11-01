@@ -50,8 +50,10 @@ source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
 100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
 needs it), so the figure reads 1000 while the fast clock runs. IRIX on the
 Octane runs both clocks on CP0 Compare, which fires for whichever is due
-next, so there the figure reads about 1100: every Compare match is one
-interrupt, and the two clocks cannot be told apart from outside the guest.
+next, so there the figure counts every Compare match as one interrupt and the
+two clocks cannot be told apart from outside the guest. At an idle desktop it
+reads about 107 (the 100 Hz tick plus a few extra Compare writes); during boot
+it reads about 1000 while IRIX calibrates the clock.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
