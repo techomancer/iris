@@ -2443,6 +2443,27 @@ mod gio32_tests {
         mc.stop();
     }
 
+    /// `stop` must clear the running flag under the state lock, the lock the
+    /// worker holds between testing the flag and waiting on the condition
+    /// variable. Without it a stop landing in that gap notifies nobody and
+    /// `join` hangs. Hold the lock here, as the worker does in the gap, and
+    /// check `stop` cannot get past it.
+    #[test]
+    fn stop_waits_for_the_state_lock_before_clearing_the_running_flag() {
+        use crate::traits::Device;
+        let (_bus, mc) = setup();
+        mc.start();
+        std::thread::scope(|s| {
+            let held = mc.giodma().state.lock();
+            let stopper = s.spawn(|| mc.stop());
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(mc.dma_running(), "stop cleared the flag without taking the state lock");
+            drop(held);
+            stopper.join().unwrap();
+        });
+        assert!(!mc.dma_running());
+    }
+
     #[test]
     fn gio32_to_mem_unpacks_msb_first() {
         let (bus, mc) = setup();

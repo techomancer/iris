@@ -1039,7 +1039,13 @@ impl Device for MemoryController {
     }
 
     fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
+        // Store under the state lock: the worker tests `dma_running` and
+        // then waits while holding it, so a store between the two with no
+        // lock would notify before the wait and `join` below would hang.
+        {
+            let _state = self.giodma.state.lock();
+            self.running.store(false, Ordering::SeqCst);
+        }
         self.giodma.cond.notify_all();
         let mut threads = self.threads.lock();
         for t in threads.drain(..) {
