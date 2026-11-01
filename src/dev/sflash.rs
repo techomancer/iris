@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-use crate::traits::{BusDevice, BusRead16, BUS_ERR, BUS_OK};
+use crate::snapshot::{field_u8, StateTable};
+use crate::traits::{BusDevice, BusRead16, Saveable, BUS_ERR, BUS_OK};
 
 /// The Octane's part: 1 MiB.
 pub const FLASH_SIZE: usize = 1 << 20;
@@ -263,6 +264,44 @@ impl BusDevice for CfiFlash {
     }
 }
 
+// The part for a snapshot. Its command state is device state; the array's
+// bytes are the machine's to store as a file of their own, through
+// [`CfiFlash::contents`], and come back through
+// [`CfiFlash::restore_contents`], which also rewrites the backing file:
+// after a restore the file holds what the guest's flash holds.
+const MODES: [Mode; 5] = [Mode::Array, Mode::Id, Mode::Status, Mode::ProgramData, Mode::EraseConfirm];
+
+impl CfiFlash {
+    pub fn restore_contents(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut st = self.st.lock();
+        if bytes.len() != st.data.len() {
+            return Err(format!("saved flash is {} bytes, the part holds {}", bytes.len(), st.data.len()));
+        }
+        st.data.copy_from_slice(bytes);
+        let len = st.data.len();
+        st.sync(0, len);
+        self.gen.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Saveable for CfiFlash {
+    fn save_state(&self) -> toml::Value {
+        let st = self.st.lock();
+        let mode = MODES.iter().position(|&m| m == st.mode).unwrap() as u8;
+        StateTable::new().u8("mode", mode).u8("status", st.status).build()
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let mode = field_u8(v, "mode")?;
+        let mut st = self.st.lock();
+        st.mode = *MODES.get(usize::from(mode)).ok_or_else(|| format!("mode {mode} is not a command state"))?;
+        st.status = field_u8(v, "status")?;
+        self.gen.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +481,27 @@ mod tests {
         assert_eq!(rd(&h, 0), 0xccdd);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), SIZE as u64);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The command state and the array come back, and a restore rewrites
+    /// the backing file.
+    #[test]
+    fn save_load_round_trip_rewrites_the_backing_file() {
+        let dir = std::env::temp_dir().join(format!("iris-cfi-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flash.bin");
+        let _ = std::fs::remove_file(&path);
+        let src = CfiFlash::new(&[0x11; 64], 1 << 20);
+        src.write16(0, 0x90); // read identifier
+        let v = src.save_state();
+        let mut bytes = src.contents();
+        bytes[100] = 0x5a;
+        let dst = CfiFlash::with_file(&[], 1 << 20, &path).unwrap();
+        dst.restore_contents(&bytes).unwrap();
+        dst.load_state(&v).unwrap();
+        assert_eq!(v, dst.save_state());
+        assert_eq!(std::fs::read(&path).unwrap()[100], 0x5a);
+        assert!(dst.restore_contents(&bytes[1..]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
