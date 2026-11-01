@@ -300,19 +300,44 @@ fn widget_11_is_routed_through_widget_0s_crossbar() {
 }
 
 /// Every fitted processor slot reads present, in the board's order (CPU 1
-/// in PI1/A, CPUs 2 and 3 in the B slots), and only CPU 0 is enabled.
+/// in PI1/A, CPUs 2 and 3 in the B slots), and every fitted processor runs
+/// from reset with its enable set, as QEMU's node grants them.
 #[test]
-fn fitted_processors_read_present_and_only_cpu_0_is_enabled() {
+fn fitted_processors_read_present_and_start_enabled() {
     use crate::dev::bedrock_pi::reg::{CPU_A_ENABLE, CPU_B_ENABLE, INTERFACE_SLOT_A, INTERFACE_SLOT_B};
     for (cpus, present) in [(1, [[1, 0], [0, 0]]), (2, [[1, 0], [1, 0]]), (4, [[1, 1], [1, 1]])] {
         let board = TezroBoard::new(cpus).unwrap();
+        assert_eq!(board.processors.count(), cpus);
         for (interface, pi) in board.node.pi.iter().enumerate() {
             let slots = [pi.read64(INTERFACE_SLOT_A).data, pi.read64(INTERFACE_SLOT_B).data];
             assert_eq!(slots, present[interface], "{cpus} CPUs, PI{interface}");
             let enabled = [pi.read64(CPU_A_ENABLE).data & 1, pi.read64(CPU_B_ENABLE).data & 1];
-            assert_eq!(enabled, [u64::from(interface == 0), 0], "{cpus} CPUs, PI{interface}");
+            assert_eq!(enabled, present[interface], "{cpus} CPUs, PI{interface}");
         }
     }
+}
+
+/// A store a processor makes into its graphics page is counted against its
+/// own slot, and its interrupt raised on its own interface: CPU 1 sits in
+/// PI1 slot A, CPU 2 in PI0 slot B.
+#[test]
+fn each_processors_graphics_stores_count_against_its_own_slot() {
+    let board = Arc::new(board_with_v12(4));
+    let stores = SlotStores { pi: board.node.pi.clone(), gfx: board.gfx.clone(), running: board.processors };
+    let stores = Arc::new(stores);
+    for (cpu, interface, slot) in [(1u8, 1usize, 0usize), (2, 0, 1)] {
+        let (stores, board) = (stores.clone(), board.clone());
+        std::thread::spawn(move || {
+            crate::cpu::smp::set_current_cpu(cpu);
+            assert_eq!(stores.slot(), (interface, slot), "CPU {cpu}");
+            // No page enabled: uncounted, and no slot's credit moves.
+            assert_eq!(stores.count(0x1000), Store::Uncounted);
+            let _ = &board;
+        })
+        .join()
+        .unwrap();
+    }
+    assert_eq!(stores.slot(), (0, 0), "a thread that runs no processor counts as CPU 0");
 }
 
 /// Only the counts a board fits are accepted.

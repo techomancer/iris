@@ -75,14 +75,13 @@ the processor's, so give the other part a fresh `[tezro] flash` file.
 
 ## Limits
 
-Only CPU 0 runs. The fitted processors read present to the PROM, and only CPU
-0 is enabled at power-on; a write that would start another processor, an NMI
-or an interrupt aimed at one, and per-processor timers are refused and logged
-by the Bedrock PI, not carried out. On the two- and four-processor board the
-PROM therefore disables every processor but CPU 0 as having failed early
-initialisation, records that in its flash log, and IRIX reports the system
-as degraded. An NMI, and a write that clears a running processor's enable
-bit, are refused and logged by the Bedrock PI: the CPU has no NMI entry.
+Every fitted processor runs, each on its own host thread. The IP35 PROM
+assumes its processors left reset together and run at hardware speed
+through four early handshakes; at each the model holds the processor that
+arrived early until the ones it waits for catch up, or until they have
+retired 2,000,000,000 cycles without doing so (`src/ip35/rendezvous.rs`). An
+NMI, and a write that clears a running processor's enable bit, are refused
+and logged by the Bedrock PI: the CPU has no NMI entry.
 
 On this Fuel base the PROM stops after printing `Copying PROM code to
 memory` and never reaches its menu. Bank 0 covers the reset PROM window at

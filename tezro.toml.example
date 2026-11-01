@@ -20,7 +20,7 @@ profile = "tezro_ip53"
 # 800 MHz part; both have a 4 MiB secondary cache. "r10000" names the family
 # and takes the 700 MHz part; other values are refused.
 cpu = "r16000_700"
-# Processors fitted: 1, 2 or 4 (the default). Only CPU 0 runs.
+# Processors fitted: 1, 2 or 4 (the default). Each runs on its own host thread.
 cpus = 4
 
 [graphics]
