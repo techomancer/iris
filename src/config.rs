@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
@@ -2536,7 +2536,7 @@ impl MachineConfig {
 pub const DEFAULT_CONFIG: &str = "iris.toml";
 
 #[derive(Parser, Debug)]
-#[command(name = "iris", about = "SGI Indy (MIPS R4400) emulator")]
+#[command(name = "iris")]
 pub struct Cli {
     /// Path to iris.toml config file [default: iris.toml]
     #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -2923,10 +2923,19 @@ impl Cli {
     }
 }
 
+/// What `Cli::parse()` does, with `--help` headed by the emulator's name, the
+/// way the banner, the monitor and the window title are. The name is not known
+/// to clap's derive, which wants a constant, so it is set on the command here.
+/// No machine is configured yet, so only the model-neutral words can appear.
+fn parse_cli() -> Cli {
+    let mut matches = Cli::command().about(crate::machine::emulator_name()).get_matches();
+    Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|e| e.format(&mut Cli::command()).exit())
+}
+
 /// Parse CLI, load TOML, merge, and validate. Exits on error.
 /// Returns (machine_config, window_scale) where window_scale is 1 or 2.
 pub fn load_config() -> (MachineConfig, u32) {
-    let cli = Cli::parse();
+    let cli = parse_cli();
 
     // --list-net-interfaces: print candidate PCAP interfaces and exit. Handled
     // here (before machine construction) since it only needs the parsed CLI.
@@ -3392,6 +3401,18 @@ mod export_tests {
         cfg.machine.cpu = CpuModel::R4400;
         let from_validate = cfg.validate().unwrap_err();
         assert_eq!(crate::ip30_machine::OctaneMachine::new(&cfg).err(), Some(from_validate));
+    }
+
+    /// `--help` is headed by an expansion of IRIS, as the banner is, and not
+    /// by a fixed description of one machine.
+    #[test]
+    fn help_is_headed_by_the_emulators_name() {
+        let help = Cli::command().about(crate::machine::emulator_name()).render_help().to_string();
+        let words: Vec<&str> = help.lines().next().unwrap().split_whitespace().collect();
+        assert_eq!(words.len(), 4, "{help}");
+        assert!(words[0].starts_with('I') && words[2].starts_with('I') && words[3].starts_with('S'), "{words:?}");
+        assert_eq!(words[1], "Rust");
+        assert!(!help.contains("SGI Indy"));
     }
 
     /// The serial sockets come from the file and the command line, must
