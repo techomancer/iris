@@ -1237,46 +1237,43 @@ fn tftp_blocks_are_not_paced_by_the_poll_tick() {
     let mut net = TestNet::new(GatewayConfig { tftp_dir: Some(root.clone()), ..GatewayConfig::default() });
     let gw = net.gw_ip;
 
-    // DATA for `block`, in order, run the way the engine thread runs.
-    let next_data = |net: &mut TestNet, block: u16| -> Vec<u8> {
-        let deadline = Instant::now() + PATIENCE;
-        loop {
-            let hit = net.inbox.iter().position(|f| {
-                let Some(u) = Ether::parse(f).and_then(|e| e.ipv4()).and_then(|i| i.udp()) else { return false };
-                u.dport() == 4270 && u.payload().get(..4) == Some(&[0, 3, (block >> 8) as u8, block as u8][..])
-            });
-            if let Some(i) = hit {
-                let f = net.inbox.remove(i).unwrap();
-                let u = Ether::parse(&f).unwrap().ipv4().unwrap().udp().unwrap().payload().to_vec();
-                return u;
-            }
-            assert!(Instant::now() < deadline, "timed out waiting for DATA {}", block);
-            net.run_pass();
-        }
+    // DATA for `block` if it is already in the inbox.
+    let take_data = |net: &mut TestNet, block: u16| -> Option<Vec<u8>> {
+        let i = net.inbox.iter().position(|f| {
+            let Some(u) = Ether::parse(f).and_then(|e| e.ipv4()).and_then(|i| i.udp()) else { return false };
+            u.dport() == 4270 && u.payload().get(..4) == Some(&[0, 3, (block >> 8) as u8, block as u8][..])
+        })?;
+        let f = net.inbox.remove(i).unwrap();
+        Some(Ether::parse(&f).unwrap().ipv4().unwrap().udp().unwrap().payload().to_vec())
     };
 
     let id = net.next_id();
     let f = net.route_to(gw).udp(id, 4270, 69, b"\x00\x01big\x00octet\x00");
     net.send_via_nic(f);
-    let mut got = next_data(&mut net, 1)[4..].to_vec();
+    // The first DATA answers the request; wait for it the way the engine
+    // thread runs, bounded by a deadline rather than a pass count.
+    let deadline = Instant::now() + PATIENCE;
+    let first = loop {
+        if let Some(d) = take_data(&mut net, 1) { break d; }
+        assert!(Instant::now() < deadline, "timed out waiting for DATA 1");
+        net.run_pass();
+    };
+    let mut got = first[4..].to_vec();
 
-    let start = Instant::now();
+    // Count engine passes, not milliseconds: a reply held to the poll tick
+    // would still arrive, only late, and the wall clock under host load says
+    // nothing about which.
     for block in 1..=BLOCKS as u16 {
         let id = net.next_id();
         let f = net.route_to(gw).udp(id, 4270, 69, &[0, 4, (block >> 8) as u8, block as u8]);
         net.send_via_nic(f);
-        if block == 1 {
-            // One pass reads the ACK and puts the next DATA on the ring.
-            net.run_pass();
-            assert_eq!(net.inbox.len(), 1, "the reply to an ACK waited for a later pass");
-        }
-        got.extend_from_slice(&next_data(&mut net, block + 1)[4..]);
+        // The pass that reads the ACK also puts the next DATA on the ring.
+        net.run_pass();
+        let data = take_data(&mut net, block + 1)
+            .unwrap_or_else(|| panic!("block {}: DATA {} waited for a later pass", block, block + 1));
+        got.extend_from_slice(&data[4..]);
     }
-    let elapsed = start.elapsed();
     assert_eq!(got, data);
-    // The old 1 ms tick made this at least BLOCKS ms by construction.
-    assert!(elapsed < Duration::from_millis(BLOCKS as u64),
-            "{} blocks took {:?}: replies are waiting for the poll tick", BLOCKS, elapsed);
     let _ = std::fs::remove_dir_all(&root);
 }
 
