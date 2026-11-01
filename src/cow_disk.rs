@@ -233,8 +233,8 @@ impl CowDisk {
     /// If the overlay file exists, its dirty sectors are reconstructed from its sparse extent.
     /// If it doesn't exist, a new empty overlay is created.
     pub fn new(base_path: &str, overlay_path: &str) -> io::Result<Self> {
-        let base = File::open(base_path)?;
-        let base_size = base.metadata()?.len();
+        let mut base = File::open(base_path)?;
+        let base_size = crate::block_node::file_capacity(&mut base)?;
 
         let overlay = OpenOptions::new()
             .read(true)

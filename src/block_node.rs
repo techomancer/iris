@@ -460,6 +460,18 @@ fn sectors_for(offset: u64, len: u64) -> (u64, u64) {
     (first, last)
 }
 
+/// Capacity of an open file or block device. A regular file reports it through
+/// its metadata; a Linux block device reports 0 there, so seek to the end.
+pub fn file_capacity(file: &mut File) -> io::Result<u64> {
+    let len = file.metadata()?.len();
+    if len != 0 {
+        return Ok(len);
+    }
+    let end = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(end)
+}
+
 /// A plain raw image file: every byte is real data held by this layer.
 pub struct RawNode {
     file: File,
@@ -471,8 +483,8 @@ pub struct RawNode {
 impl RawNode {
     /// Open `path` read-write and use its current length as the capacity.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let size = file.metadata()?.len();
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file_capacity(&mut file)?;
         Ok(Self::from_file(file, size))
     }
 
@@ -480,8 +492,8 @@ impl RawNode {
     /// and for a copy-on-write base, whose contents the overlay never mutates
     /// through this node.
     pub fn open_readonly(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        let size = file.metadata()?.len();
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let size = file_capacity(&mut file)?;
         Ok(Self { file, size, bg: None })
     }
 
