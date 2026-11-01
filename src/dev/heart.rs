@@ -25,7 +25,8 @@ use parking_lot::Mutex;
 
 use crate::cpu::smp::{current_cpu, ParkSlot, HOLD_HEART, MAX_CPUS};
 use crate::dev::w1;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
+use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64s, StateTable};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
 
 /// HEART's processor-interface registers.
 pub const PIU_BASE: u64 = 0x0ff0_0000;
@@ -821,6 +822,83 @@ impl crate::traits::Device for Heart {
     }
 }
 
+// HEART's state for a snapshot: its registers, the counter and the
+// MicroLAN. The counter runs on the host clock: it is saved as its value
+// and how far into its tick it was, and resumes from there at the load, as
+// the CPU's Count does, so the guest sees no jump. A MicroLAN slot in
+// progress keeps the time it had left. After a load HEART drives every
+// processor's pins from the loaded registers, holds or releases the
+// processors its mode disables, and has memory placed from the loaded
+// descriptors.
+impl Saveable for Heart {
+    fn save_state(&self) -> toml::Value {
+        let now = (self.clock)();
+        let r = self.regs.lock();
+        let at = r.paused_at.unwrap_or(now);
+        let elapsed = at.saturating_sub(r.epoch_ns);
+        StateTable::new()
+            .u64s("words", &[
+                r.mode, r.sdram_mode, r.mem_refresh, r.mem_req_arb, r.clock_divider, r.pending,
+                r.ecc_cause, r.ecc_address, r.ecc_data, r.onewire_control,
+            ])
+            .u64s("flow_cell", &r.flow_cell)
+            .u32("compare", r.compare)
+            .u32s("descriptor", &r.descriptor)
+            .u64s("mask", &r.mask)
+            .u64("count", r.counter(at))
+            .u64("phase", elapsed % COUNT_NS)
+            .u32s("widget", &[r.widget_control, r.widget_request_timeout, r.widget_error_mask])
+            .u64("onewire_left", if r.onewire_busy { r.onewire_deadline_ns.saturating_sub(at) } else { 0 })
+            .bool("onewire_level", r.onewire_level)
+            .bool("onewire_busy", r.onewire_busy)
+            .value("microlan", self.mlan.lock().save_state())
+            .build()
+    }
+
+    /// Called with the machine stopped and HEART powered on.
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let [mode, sdram_mode, mem_refresh, mem_req_arb, clock_divider, pending, ecc_cause,
+            ecc_address, ecc_data, onewire_control] = field_u64s::<10>(v, "words")?;
+        let [widget_control, widget_request_timeout, widget_error_mask] = field_u32s::<3>(v, "widget")?;
+        let phase = field_u64(v, "phase")?;
+        self.mlan.lock().load_state(field(v, "microlan")?).map_err(|e| format!("MicroLAN: {e}"))?;
+        let now = (self.clock)();
+        let mut r = self.regs.lock();
+        let at = r.paused_at.unwrap_or(now);
+        let old_mode = r.mode;
+        let paused_at = r.paused_at;
+        let out = r.out;
+        *r = Regs {
+            mode, sdram_mode, mem_refresh, mem_req_arb, clock_divider, pending, ecc_cause,
+            ecc_address, ecc_data, onewire_control,
+            flow_cell: field_u64s(v, "flow_cell")?,
+            compare: field_u32(v, "compare")?,
+            descriptor: field_u32s(v, "descriptor")?,
+            mask: field_u64s(v, "mask")?,
+            saved_count: field_u64(v, "count")?,
+            // A clock still inside its first tick cannot carry the phase.
+            epoch_ns: at.checked_sub(phase).unwrap_or(at),
+            paused_at,
+            widget_control, widget_request_timeout, widget_error_mask,
+            onewire_deadline_ns: at.saturating_add(field_u64(v, "onewire_left")?),
+            onewire_level: field_bool(v, "onewire_level")?,
+            onewire_busy: field_bool(v, "onewire_busy")?,
+            out,
+        };
+        // Clear what HEART drove before the load, then drive the loaded levels.
+        let driven = std::mem::replace(&mut r.out, [0; MAX_CPUS]);
+        for (cpu, &levels) in driven.iter().enumerate().take(self.cfg.cpus as usize) {
+            self.drive(cpu, levels, 0);
+        }
+        self.apply_disables(old_mode, r.mode);
+        self.update_irq(&mut r);
+        let banks = r.banks();
+        drop(r);
+        self.memcfg_changed(banks);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,5 +1313,28 @@ mod tests {
         assert_eq!(h.piu_read(0xbc, 4).unwrap() & 2, 0, "9 us still to go");
         f.step_us(9);
         assert_eq!(h.piu_read(0xbc, 4).unwrap() & 2, 2);
+    }
+
+    /// A saved HEART loads into a fresh one: its registers come back, and
+    /// its counter resumes at the value it stopped at on a clock far later
+    /// than the save's.
+    #[test]
+    fn save_load_round_trip_keeps_the_counter() {
+        let src = heart();
+        wq(&src.heart, 0x10000, 0b101);
+        src.step_us(1000);
+        src.heart.pause();
+        let count = src.heart.counter();
+        let v = src.heart.save_state();
+        let dst = heart();
+        dst.step_us(5_000_000);
+        dst.heart.pause();
+        dst.heart.load_state(&v).expect("load_state");
+        assert_eq!(v, dst.heart.save_state());
+        assert_eq!(dst.heart.counter(), count);
+        assert_eq!(rq(&dst.heart, 0x10000), 0b101);
+        dst.heart.resume();
+        dst.step_us(8);
+        assert_eq!(dst.heart.counter(), count + 100, "it runs on from there, one tick each 80 ns");
     }
 }
