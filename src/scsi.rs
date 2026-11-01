@@ -6,7 +6,7 @@ mod bus;
 pub use attach::{attach_failed, attach_from_config, Attached, DaynaportRef, TableRef};
 pub use bus::{ScsiBus, ScsiIdentities, ScsiTarget, Targets};
 
-use crate::block_node::{ChangerNode, Removable, BlockNode};
+use crate::block_node::{Background, ChangerNode, Removable, BlockNode};
 
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
@@ -176,6 +176,17 @@ pub struct ScsiDevice {
     /// What WCE the disk powers up with, and returns to on a bus or
     /// controller reset. Off unless [`ScsiDevice::with_write_cache`] says so.
     power_on_write_cache: bool,
+    /// The disk's background sync, whose thread runs until this is dropped.
+    /// A read-only or CHD image has none.
+    background: Option<std::sync::Arc<Background>>,
+}
+
+impl Drop for ScsiDevice {
+    fn drop(&mut self) {
+        if let Some(bg) = &self.background {
+            bg.finish();
+        }
+    }
 }
 
 /// A CD-ROM's physical sector (Yellow Book).
@@ -192,6 +203,20 @@ impl ScsiDevice {
         } else {
             Media::Fixed(node, path)
         };
+        // A disk's writes reach the host's file as they come; a thread of its
+        // own syncs that file about 5 s after the first write that follows a
+        // sync, so a host crash loses at most that much (see STORAGE.md). It
+        // takes no lock a command holds.
+        let background = match (&media, is_cdrom) {
+            (Media::Fixed(node, _), false) => node.background().filter(|bg| match bg.spawn() {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("iris: no background disk sync: {e}");
+                    false
+                }
+            }),
+            _ => None,
+        };
         Self {
             media,
             kind: if is_cdrom { DeviceKind::Cdrom } else { DeviceKind::Disk },
@@ -204,6 +229,7 @@ impl ScsiDevice {
             identity,
             write_cache: false,
             power_on_write_cache: false,
+            background,
         }
     }
 
@@ -221,6 +247,7 @@ impl ScsiDevice {
             identity,
             write_cache: false,
             power_on_write_cache: false,
+            background: None,
         }
     }
 
@@ -1761,6 +1788,34 @@ mod tests {
         let _ = std::fs::remove_file(&base);
         let _ = std::fs::remove_file(&overlay);
         let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
+    }
+
+    /// A WRITE to a disk is synced in the background within about 5 s,
+    /// and a disk nobody writes to is never synced.
+    #[test]
+    fn a_disk_write_is_synced_in_the_background_and_an_idle_disk_is_not() {
+        let path = tmp("bgsync");
+        std::fs::write(&path, vec![0u8; 8 * 512]).unwrap();
+        let node = crate::block_node::RawNode::open(&path).unwrap();
+        let bg = node.background().expect("a writable image has one");
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        let mut dev = ScsiDevice::new(Box::new(node), false, "t".into(), Vec::new(), identity).with_write_cache(true);
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(bg.syncs(), 0, "no writes, no sync");
+        let r = dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x33; 512]))).unwrap();
+        assert_eq!(r.status, 0x00);
+        assert_eq!(bg.syncs(), 0, "a write does not wait for the sync");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while bg.syncs() == 0 && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(bg.syncs(), 1, "synced within the interval");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(bg.syncs(), 1, "idle again");
+        // Dropping the disk ends the thread.
+        drop(dev);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// NetBSD's cd driver reads the TOC asking for 12 bytes: header and

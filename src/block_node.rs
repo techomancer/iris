@@ -46,6 +46,10 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::Thread;
+use std::time::{Duration, Instant};
 
 use crate::chd_disk::{ChdCd, ChdHd};
 
@@ -104,6 +108,164 @@ impl BlockStatus {
     }
 }
 
+/// How long writes may wait on the host before the background flush makes
+/// them durable (see [`BlockNode::background`]).
+pub const BACKGROUND_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What a node shares with the thread that makes its writes durable in the
+/// background, so that thread never takes the lock a command runs under.
+///
+/// A write calls [`Background::mark`] once its data has reached the host's
+/// file; that costs one relaxed load while the flag is already set and wakes
+/// the thread only on the change from idle. The thread waits for
+/// [`BACKGROUND_FLUSH_INTERVAL`] after it is woken, so a burst of writes costs
+/// one sync. The sync is of duplicated handles of the node's files, which
+/// is all the node's own `flush` does for a raw image; a copy-on-write
+/// overlay's record is made durable but not compacted (that stays with an
+/// explicit flush).
+pub struct Background {
+    interval: Duration,
+    pending: AtomicBool,
+    stop: AtomicBool,
+    syncs: AtomicU64,
+    waker: OnceLock<Thread>,
+    files: Mutex<BackgroundFiles>,
+}
+
+#[derive(Default)]
+struct BackgroundFiles {
+    data: Option<File>,
+    record: Option<File>,
+}
+
+impl Background {
+    /// A background flush of `data`, `interval` after the first write.
+    fn with_interval(data: &File, interval: Duration) -> Arc<Self> {
+        let bg = Arc::new(Self {
+            interval,
+            pending: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            syncs: AtomicU64::new(0),
+            waker: OnceLock::new(),
+            files: Mutex::new(BackgroundFiles::default()),
+        });
+        bg.set_data(Some(data));
+        bg
+    }
+
+    fn for_file(data: &File) -> Arc<Self> {
+        Self::with_interval(data, BACKGROUND_FLUSH_INTERVAL)
+    }
+
+    /// Run `sync`, which makes everything the node has written durable, and
+    /// leave nothing for the thread: the flag is cleared before, so a write
+    /// that lands during the sync marks itself again. A sync that fails
+    /// leaves the writes waiting, so the thread retries them.
+    fn syncing<T>(&self, sync: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        self.pending.store(false, Ordering::Relaxed);
+        let result = sync();
+        if result.is_err() {
+            self.mark();
+        }
+        result
+    }
+
+    /// Follow the node to another data file, or to none.
+    fn set_data(&self, file: Option<&File>) {
+        self.files.lock().unwrap().data = file.and_then(|f| f.try_clone().ok());
+    }
+
+    /// Follow the node to another record file, or to none.
+    fn set_record(&self, file: Option<&File>) {
+        self.files.lock().unwrap().record = file.and_then(|f| f.try_clone().ok());
+    }
+
+    /// Writes have reached the host's files and are not yet synced.
+    pub fn mark(&self) {
+        if !self.pending.load(Ordering::Relaxed) && !self.pending.swap(true, Ordering::Relaxed) {
+            // Pairs with the fence in `spawn`: either the waker is seen here or
+            // the flag is seen there.
+            fence(Ordering::SeqCst);
+            if let Some(t) = self.waker.get() {
+                t.unpark();
+            }
+        }
+    }
+
+    /// Whether writes wait for a sync.
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Sync the files if writes are waiting. Returns whether it synced.
+    pub fn sync_pending(&self) -> io::Result<bool> {
+        if !self.pending.swap(false, Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let (data, record) = {
+            let f = self.files.lock().unwrap();
+            (f.data.as_ref().and_then(|f| f.try_clone().ok()), f.record.as_ref().and_then(|f| f.try_clone().ok()))
+        };
+        let synced = data.map_or(Ok(()), |f| f.sync_all()).and(record.map_or(Ok(()), |f| f.sync_all()));
+        if synced.is_err() {
+            self.pending.store(true, Ordering::Relaxed);
+        }
+        if synced.is_ok() {
+            self.syncs.fetch_add(1, Ordering::Relaxed);
+        }
+        synced.map(|()| true)
+    }
+
+    /// How many times the pending writes have been synced.
+    pub fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
+
+    /// Run the flush thread: sleep while idle, and once woken by a write wait
+    /// out the interval and sync. Ends after [`Background::finish`].
+    pub fn spawn(self: &Arc<Self>) -> io::Result<()> {
+        let bg = self.clone();
+        let thread = std::thread::Builder::new().name("scsi-flush".into()).spawn(move || {
+            while !bg.stop.load(Ordering::Acquire) {
+                if !bg.is_pending() {
+                    std::thread::park();
+                    continue;
+                }
+                let due = Instant::now() + bg.interval;
+                while !bg.stop.load(Ordering::Acquire) {
+                    let now = Instant::now();
+                    if now >= due {
+                        break;
+                    }
+                    std::thread::park_timeout(due - now);
+                }
+                if let Err(e) = bg.sync_pending() {
+                    eprintln!("iris: background disk sync failed: {e}");
+                    // Do not spin on a disk that keeps failing.
+                    std::thread::sleep(bg.interval);
+                }
+            }
+        })?;
+        let _ = self.waker.set(thread.thread().clone());
+        // A write that landed before the waker was set found nobody to wake,
+        // and the flag it set keeps later writes from trying.
+        fence(Ordering::SeqCst);
+        if self.is_pending() {
+            thread.thread().unpark();
+        }
+        Ok(())
+    }
+
+    /// Stop the flush thread. It ends at once, with one last sync if writes
+    /// are waiting.
+    pub fn finish(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.waker.get() {
+            t.unpark();
+        }
+    }
+}
+
 /// A byte-addressed node in a layered block graph.
 ///
 /// Implementations are the raw image, the copy-on-write overlay, the hard-disk
@@ -131,6 +293,14 @@ pub trait BlockNode: Send {
     /// copy-on-write record, so it is cheaper. The default is a full flush.
     fn flush_data(&mut self) -> io::Result<()> {
         self.flush()
+    }
+
+    /// What a thread needs to make this node's writes durable without
+    /// running a command: `None` for a node that has none (read-only media,
+    /// and a CHD, which only a close and reopen makes durable and so stays
+    /// flushed by an explicit flush, a power-off or a stop).
+    fn background(&self) -> Option<Arc<Background>> {
+        None
     }
 
     /// Discard `len` bytes at `offset`, releasing the layer's claim on them.
@@ -227,6 +397,8 @@ fn sectors_for(offset: u64, len: u64) -> (u64, u64) {
 pub struct RawNode {
     file: File,
     size: u64,
+    /// `None` for read-only media.
+    bg: Option<Arc<Background>>,
 }
 
 impl RawNode {
@@ -234,7 +406,7 @@ impl RawNode {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
-        Ok(Self { file, size })
+        Ok(Self::from_file(file, size))
     }
 
     /// Open `path` read-only. Used for removable read-only media (CD-ROM ISOs)
@@ -243,13 +415,14 @@ impl RawNode {
     pub fn open_readonly(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
         let size = file.metadata()?.len();
-        Ok(Self { file, size })
+        Ok(Self { file, size, bg: None })
     }
 
     /// Wrap an already-open file handle. `size` is the node's capacity; the
     /// caller has the file positioned/opened as it wants.
     pub fn from_file(file: File, size: u64) -> Self {
-        Self { file, size }
+        let bg = Some(Background::for_file(&file));
+        Self { file, size, bg }
     }
 }
 
@@ -267,15 +440,30 @@ impl BlockNode for RawNode {
     fn write(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
         check_range(self.size, offset, buf.len() as u64)?;
         self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(buf)
+        self.file.write_all(buf)?;
+        if let Some(bg) = &self.bg {
+            bg.mark();
+        }
+        Ok(())
+    }
+
+    fn background(&self) -> Option<Arc<Background>> {
+        self.bg.clone()
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        match &self.bg {
+            Some(bg) => bg.syncing(|| self.file.sync_all()),
+            None => self.file.sync_all(),
+        }
     }
 
     fn flush_data(&mut self) -> io::Result<()> {
-        self.file.sync_data()
+        match &self.bg {
+            // The write's data is all the thread would sync for a raw image.
+            Some(bg) => bg.syncing(|| self.file.sync_data()),
+            None => self.file.sync_data(),
+        }
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
@@ -312,14 +500,15 @@ impl BlockNode for RawNode {
 /// compacting it would erase it.
 ///
 /// That makes ending the process at any point safe: what the kernel has
-/// accepted outlives it. A host crash or power loss is another matter. The
-/// disk tells the guest it has a write-back cache, and only a flush (the
-/// guest's SYNCHRONIZE CACHE, or iris stopping) promises that what came
-/// before it is on the host's disk. Writes since then may be lost, in any
-/// order, and a listed sector whose data had not reached the disk reads as
-/// zeroes. Syncing the overlay before each append would close only that last
-/// gap, at about a millisecond per write that takes a new sector against
-/// 20 us without it, and overwrites would still reach the disk out of order.
+/// accepted outlives it. A host crash or power loss is another matter. A
+/// thread syncs the overlay and the record about 5 s after the first write that follows a sync
+/// ([`Background`]), and a flush (the guest's SYNCHRONIZE CACHE, or iris
+/// stopping) compacts the record and syncs both at once. So a host crash
+/// loses up to about 5 s of writes, in any order, and a listed sector whose
+/// data had not reached the disk reads as zeroes. Syncing the overlay before
+/// each append would close only that last gap, at about a millisecond per
+/// write that takes a new sector against 20 us without it, and overwrites
+/// would still reach the disk out of order.
 pub struct CowNode {
     backing: Option<Box<dyn BlockNode>>,
     /// Base image path, so [`CowNode::commit`] can merge the overlay back into
@@ -333,6 +522,8 @@ pub struct CowNode {
     /// Set by anything that changes the overlay or its sector set, cleared by
     /// a flush, so a flush with nothing new to write costs nothing.
     unflushed: bool,
+    /// Shared with the thread that syncs the overlay in the background.
+    bg: Arc<Background>,
     size: u64,
 }
 
@@ -385,7 +576,8 @@ impl CowNode {
             overlay_path.display(),
             sidecar.display()
         );
-        let mut node = Self { backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, size };
+        let bg = Background::for_file(&overlay);
+        let mut node = Self { backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, bg, size };
         // Compact what a killed run appended, and drop an append it cut short,
         // so new entries start on an entry boundary.
         if sidecar.exists() {
@@ -419,7 +611,9 @@ impl CowNode {
         self.record = None;
         let path = self.sidecar_path();
         crate::cow_disk::save_dirty_sidecar(&path, &self.dirty)?;
-        self.record = Some(OpenOptions::new().append(true).open(&path)?);
+        let record = OpenOptions::new().append(true).open(&path)?;
+        self.bg.set_record(Some(&record));
+        self.record = Some(record);
         Ok(())
     }
 
@@ -546,15 +740,23 @@ impl BlockNode for CowNode {
         // overlay. Also when a later sector failed: the earlier ones are held
         // and must not be left out of the record.
         let recorded = if new.is_empty() { Ok(()) } else { self.record_new(&new) };
+        self.bg.mark();
         written.and(recorded)
+    }
+
+    fn background(&self) -> Option<Arc<Background>> {
+        Some(self.bg.clone())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         if !self.unflushed {
             return Ok(());
         }
-        self.overlay.sync_all()?;
-        self.rewrite_record()?;
+        let bg = self.bg.clone();
+        bg.syncing(|| {
+            self.overlay.sync_all()?;
+            self.rewrite_record()
+        })?;
         // The backing is never written through this node, so it has nothing
         // of ours to flush.
         self.unflushed = false;
@@ -565,11 +767,14 @@ impl BlockNode for CowNode {
     /// is only found again if both are on the disk. The record is not
     /// compacted and `unflushed` stays set for the flush that does that.
     fn flush_data(&mut self) -> io::Result<()> {
-        self.overlay.sync_data()?;
-        if let Some(record) = &self.record {
-            record.sync_data()?;
-        }
-        Ok(())
+        let bg = self.bg.clone();
+        bg.syncing(|| {
+            self.overlay.sync_data()?;
+            if let Some(record) = &self.record {
+                record.sync_data()?;
+            }
+            Ok(())
+        })
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
@@ -665,6 +870,7 @@ impl BlockNode for CowNode {
         self.dirty.clear();
         self.unflushed = true;
         self.record = None;
+        self.bg.set_record(None);
         let _ = std::fs::remove_file(self.sidecar_path());
         self.overlay.set_len(0)?;
         self.overlay.seek(SeekFrom::Start(0))?;
@@ -708,6 +914,7 @@ impl BlockNode for CowNode {
             .write(true)
             .create(true)
             .open(&self.overlay_path)?;
+        self.bg.set_data(Some(&self.overlay));
         copied?;
         self.dirty = dirty.into_iter().collect();
         self.unflushed = true;
@@ -2264,5 +2471,143 @@ mod tests {
         let b = iso("queue-b", 2, 4);
         c.add(b.clone()).unwrap();
         assert_eq!(c.discs(), [a, b], "a queued disc follows the active one, unopened");
+    }
+
+    fn bg_file(tag: &str) -> (PathBuf, File) {
+        let path = tmp_path(tag);
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        (path, file)
+    }
+
+    /// Wait for `cond`, up to 5 s.
+    fn wait_for(cond: impl Fn() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// The thread syncs once for a write and then not at all while nothing
+    /// is written: it parks. A later write wakes it again.
+    #[test]
+    fn background_sync_runs_only_with_unflushed_writes() {
+        let (path, file) = bg_file("bg-idle");
+        let bg = Background::with_interval(&file, Duration::from_millis(20));
+        bg.spawn().unwrap();
+        let syncs = || bg.syncs();
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(syncs(), 0, "idle: nothing to sync");
+
+        bg.mark();
+        assert!(wait_for(|| syncs() == 1), "a write is synced");
+        assert!(!bg.is_pending());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(syncs(), 1, "and then it is idle again");
+
+        bg.mark();
+        bg.mark();
+        assert!(wait_for(|| syncs() == 2), "a later write wakes it");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(syncs(), 2, "a burst is one sync");
+        bg.finish();
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A write marked before the thread exists is synced once it does.
+    #[test]
+    fn a_write_marked_before_the_thread_starts_is_synced() {
+        let (path, file) = bg_file("bg-early");
+        let bg = Background::with_interval(&file, Duration::from_millis(20));
+        bg.mark();
+        bg.spawn().unwrap();
+        assert!(wait_for(|| bg.syncs() == 1), "synced without another write");
+        bg.finish();
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A node's own sync clears the flag before it runs and sets it again if
+    /// it fails, so the thread retries what the node could not make durable.
+    #[test]
+    fn a_failed_explicit_sync_leaves_the_writes_for_the_thread() {
+        let (path, file) = bg_file("bg-retry");
+        let bg = Background::with_interval(&file, Duration::from_secs(60));
+        bg.mark();
+        assert!(bg.syncing(|| Ok(())).is_ok());
+        assert!(!bg.is_pending(), "a sync that worked leaves nothing");
+        bg.mark();
+        let failed: io::Result<()> = bg.syncing(|| Err(io::Error::other("disk full")));
+        assert!(failed.is_err());
+        assert!(bg.is_pending(), "a sync that failed leaves the writes waiting");
+        // A write during the sync is not lost to it.
+        let _ = bg.syncing(|| {
+            bg.mark();
+            Ok(())
+        });
+        assert!(bg.is_pending());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A node's own flush leaves nothing for the thread to do.
+    #[test]
+    fn an_explicit_flush_clears_the_background_sync() {
+        let path = tmp_path("bg-flush");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut node = RawNode::open(&path).unwrap();
+        node.write(0, &[1u8; 512]).unwrap();
+        let bg = node.background().expect("a writable image has one");
+        assert!(bg.is_pending());
+        node.flush().unwrap();
+        assert!(!bg.is_pending());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// So does a sync of the data alone, as a write with FUA makes: the
+    /// thread has nothing left to sync for a raw image or an overlay.
+    #[test]
+    fn syncing_a_nodes_data_clears_the_background_sync() {
+        let path = tmp_path("bg-data");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut raw = RawNode::open(&path).unwrap();
+        raw.write(0, &[1u8; 512]).unwrap();
+        let bg = raw.background().unwrap();
+        assert!(bg.is_pending());
+        raw.flush_data().unwrap();
+        assert!(!bg.is_pending());
+        let _ = std::fs::remove_file(&path);
+
+        let overlay = tmp_path("bg-data-cow");
+        let mut cow = CowNode::new(None, &overlay, 8 * 512).unwrap();
+        cow.write(0, &[1u8; 512]).unwrap();
+        let bg = cow.background().unwrap();
+        assert!(bg.is_pending());
+        cow.flush_data().unwrap();
+        assert!(!bg.is_pending());
+    }
+
+    /// The overlay's thread syncs the files the overlay has now, after the
+    /// record is replaced and after an import replaces the overlay file.
+    #[test]
+    fn a_cow_overlay_marks_writes_for_the_background_sync() {
+        let overlay = tmp_path("bg-cow");
+        let mut node = CowNode::new(None, &overlay, 8 * 512).unwrap();
+        let bg = node.background().expect("an overlay has one");
+        assert!(!bg.is_pending());
+        node.write(0, &[1u8; 512]).unwrap();
+        assert!(bg.is_pending());
+        assert!(bg.sync_pending().unwrap());
+        assert!(!bg.sync_pending().unwrap(), "nothing more to sync");
+        node.flush().unwrap();
+        node.write(512, &[2u8; 512]).unwrap();
+        assert!(bg.is_pending(), "a write after a flush marks again");
+        assert!(RawNode::open_readonly(&overlay).unwrap().background().is_none());
+        drop(node);
+        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
+        let _ = std::fs::remove_file(overlay);
     }
 }
