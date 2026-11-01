@@ -161,9 +161,9 @@ the first `[section]`, because TOML tables continue until the next header.
 | `ci_display` | `false` | Keep host graphics window visible in CI mode. |
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
-| `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. |
+| `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
 | `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's). Truncated at start on the Octane and O2, appended to on the Indy and Indigo2, like `serial_log`. |
-| `serial_log_timestamps` | `off` | `off` (raw transcript) or `wall`: prefix each completed serial-log line with a UTC ISO-8601 stamp. A partial line is held until its newline and written on stop. |
+| `serial_log_timestamps` | `off` | `off` (raw transcript), `wall` (prefix each completed line with a UTC ISO-8601 stamp) or `ecs` (one Elastic Common Schema JSON document per non-empty line, logger `irix.guest`, control characters dropped). A partial line is held until its newline and written on stop. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
 ### [machine]

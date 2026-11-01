@@ -6,6 +6,11 @@
 //! harness can tell a slow boot from a missing line. A partial line is held
 //! until its newline (a stamp must belong to the line it starts) and written
 //! by `flush`/`Drop` when the machine stops.
+//!
+//! ECS mode (`timestamps = ecs`) turns each completed, non-empty line into one
+//! Elastic Common Schema JSON document with logger `irix.guest`, for a log
+//! collector. Control characters are dropped and a trailing CR is trimmed. The
+//! path `-` writes to standard output instead of a file.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -23,10 +28,12 @@ pub enum SerialLogTimestamps {
     Off,
     /// `[YYYY-MM-DDTHH:MM:SS.ffffffZ] ` before each completed line.
     Wall,
+    /// One ECS JSON line per completed, non-empty line (logger `irix.guest`).
+    Ecs,
 }
 
 struct Inner {
-    file: File,
+    file: Box<dyn Write + Send>,
     /// Bytes of a completed-line's prefix not yet written (wall mode only).
     pending: Vec<u8>,
 }
@@ -42,13 +49,22 @@ impl SerialLog {
     /// Open for append: an existing transcript is preserved.
     pub fn open(path: &Path, timestamps: SerialLogTimestamps) -> io::Result<std::sync::Arc<Self>> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(std::sync::Arc::new(Self { timestamps, inner: Mutex::new(Inner { file, pending: Vec::new() }) }))
+        Ok(Self::with_writer(Box::new(file), timestamps))
     }
 
     /// Create or truncate: one boot's transcript, for callers that tail it.
     pub fn create(path: &Path, timestamps: SerialLogTimestamps) -> io::Result<std::sync::Arc<Self>> {
         let file = File::create(path)?;
-        Ok(std::sync::Arc::new(Self { timestamps, inner: Mutex::new(Inner { file, pending: Vec::new() }) }))
+        Ok(Self::with_writer(Box::new(file), timestamps))
+    }
+
+    /// Standard output, for a container whose log collector reads it.
+    pub fn stdout(timestamps: SerialLogTimestamps) -> std::sync::Arc<Self> {
+        Self::with_writer(Box::new(io::stdout()), timestamps)
+    }
+
+    fn with_writer(file: Box<dyn Write + Send>, timestamps: SerialLogTimestamps) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { timestamps, inner: Mutex::new(Inner { file, pending: Vec::new() }) })
     }
 
     pub fn timestamps(&self) -> SerialLogTimestamps {
@@ -59,6 +75,21 @@ impl SerialLog {
         let mut guard = match self.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         let Inner { file, pending } = &mut *guard;
         match self.timestamps {
+            SerialLogTimestamps::Ecs => {
+                pending.extend_from_slice(bytes);
+                let mut start = 0;
+                while let Some(pos) = pending[start..].iter().position(|&b| b == b'\n') {
+                    let end = start + pos + 1;
+                    if let Some(line) = ecs_line(&pending[start..end]) {
+                        let _ = file.write_all(line.as_bytes());
+                    }
+                    start = end;
+                }
+                if start > 0 {
+                    pending.drain(..start);
+                }
+                let _ = file.flush();
+            }
             SerialLogTimestamps::Off => {
                 let _ = file.write_all(bytes);
                 let _ = file.flush();
@@ -90,6 +121,11 @@ impl SerialLog {
             let _ = file.write_all(stamp.as_bytes());
             let bytes = std::mem::take(pending);
             let _ = file.write_all(&bytes);
+        } else if self.timestamps == SerialLogTimestamps::Ecs && !pending.is_empty() {
+            let bytes = std::mem::take(pending);
+            if let Some(line) = ecs_line(&bytes) {
+                let _ = file.write_all(line.as_bytes());
+            }
         }
         let _ = file.flush();
     }
@@ -101,13 +137,43 @@ impl Drop for SerialLog {
     }
 }
 
+/// One ECS JSON document (with its newline) for a line of guest output, or
+/// `None` if nothing printable is left once control characters are dropped.
+fn ecs_line(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let msg: String = text.chars().filter(|c| *c == '\t' || !c.is_control()).collect();
+    let msg = msg.trim();
+    if msg.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(msg.len() + 128);
+    out.push_str("{\"@timestamp\":\"");
+    out.push_str(&iso_wall());
+    out.push_str("\",\"log.level\":\"info\",\"message\":\"");
+    for c in msg.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push_str("\",\"log.logger\":\"irix.guest\",\"event.dataset\":\"irix.guest\",\"ecs.version\":\"1.6.0\"}\n");
+    Some(out)
+}
+
 /// `[YYYY-MM-DDTHH:MM:SS.ffffffZ] ` for the current UTC time.
 pub fn format_wall() -> String {
+    format!("[{}] ", iso_wall())
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ` for the current UTC time.
+fn iso_wall() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs() as i64;
     let micros = now.subsec_micros();
     let (y, mo, d, h, mi, s) = civil_from_unix(secs);
-    format!("[{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{micros:06}Z] ")
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{micros:06}Z")
 }
 
 /// Days-to-civil conversion (Howard Hinnant's algorithm), with the Unix epoch
@@ -189,6 +255,29 @@ mod tests {
         assert!(lines[0].ends_with("first"));
         assert!(lines[1].ends_with("second"));
         assert!(lines[2].ends_with("last, no newline"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ECS mode: one JSON document per non-empty line, control characters
+    /// dropped, quotes escaped, logger `irix.guest`.
+    #[test]
+    fn ecs_mode_emits_json_lines() {
+        let path = temp_path("ecs");
+        let log = SerialLog::open(&path, SerialLogTimestamps::Ecs).unwrap();
+        log.write(b"\x1b[2Jkernel \"up\"\r\n\r\nsec");
+        log.write(b"ond\n");
+        log.write(b"tail, no newline");
+        log.flush();
+        drop(log);
+        let text = read_all(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text:?}");
+        assert!(lines[0].contains(r#""message":"[2Jkernel \"up\"""#), "{}", lines[0]);
+        assert!(lines[1].contains(r#""message":"second""#));
+        assert!(lines[2].contains(r#""message":"tail, no newline""#));
+        for l in &lines {
+            assert!(l.starts_with(r#"{"@timestamp":""#) && l.contains(r#""log.logger":"irix.guest""#), "{l}");
+        }
         let _ = std::fs::remove_file(path);
     }
 
