@@ -1441,6 +1441,38 @@ fn a_transmit_delay_ends_with_no_guest_access() {
     r.c.stop();
 }
 
+/// Poll `done` until it holds, giving up after a minute. The timer and the
+/// NVRAM writer run on other threads and the suite runs many tests at once, so
+/// a bound counted in milliseconds gives up on a busy host before either has
+/// had a core; the deadline only has to catch a write that never comes.
+fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    true
+}
+
+/// A guest write to the clock's RAM leaves the file alone: it only marks the
+/// RAM changed, for the debounce to save later. The chip is not started, so
+/// no timer or writer exists that could save it behind the test's back; with
+/// them running, a read of the file "before the debounce" would race the
+/// debounce itself on a slow host.
+#[test]
+fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
+    let path = std::env::temp_dir().join(format!("ioc3-nvram-perbyte-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (r, _tm) = running_rig();
+    r.c.set_nvram_file(&path).unwrap();
+    rtc_w(&r, 0x45, 0x66);
+    assert_eq!(std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5], 0, "not written per byte");
+    assert!(r.c.sh.st.lock().rtc.dirty_since.is_some(), "the RAM counts as unsaved");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The file catches up once the guest's NVRAM writes have paused, written by
 /// the chip's own writer with nobody calling a flush.
 #[test]
@@ -1452,12 +1484,7 @@ fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
     r.c.start();
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).map(|f| f[NVRAM_OFF_NV + 5]).unwrap_or(0);
-    assert_eq!(in_file(), 0, "not written per byte");
-    let end = Instant::now() + Duration::from_secs(5);
-    while in_file() == 0 && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(in_file(), 0x66);
+    assert!(eventually(|| in_file() == 0x66), "the writer saved the RAM");
     r.c.stop();
     let _ = std::fs::remove_file(&path);
 }
