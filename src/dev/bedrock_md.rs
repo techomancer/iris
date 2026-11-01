@@ -349,10 +349,11 @@ impl BedrockMd {
     /// direct window. See [`BedrockMemory::startup_tag`]. Called on the CPU
     /// thread, outside the cache's locks.
     pub fn startup_tag_store(&self, tag: u32) {
-        let Some(live) = self.memory.startup_tag(tag) else { return };
+        let cpu = crate::cpu::smp::current_cpu();
+        let Some(live) = self.memory.startup_tag(cpu, tag) else { return };
         self.stopped(|| {
             let _remapping = self.remapping.lock();
-            if self.memory.set_startup(live) {
+            if self.memory.set_startup(cpu, live) {
                 let (config, pages) = Self::mapping(&self.state.lock());
                 self.memory.remap(config, pages, true);
             }
@@ -1217,6 +1218,43 @@ mod tests {
         md.startup_tag_store(0);
         assert_eq!(phys.read64(at).data, 0, "the window is memory again");
         assert_eq!(phys.banks()[0].read64(at).data, 0);
+    }
+
+    /// Two processors in their cache-as-memory phase at once each keep their
+    /// own stack in the window: a store by one is not seen by the other, as
+    /// each cache holds its own lines (QEMU's per-processor window, a model
+    /// policy). When one ends its window it reaches memory there while the
+    /// other still has its page. A window shared between the processors
+    /// fails the first check; a window ended for both by one processor's
+    /// sweep fails the last.
+    #[test]
+    fn each_processor_keeps_its_own_startup_window() {
+        let md = fuel();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        let at = 0x10_0040;
+        let on = |cpu: u8, work: Box<dyn FnOnce(&BedrockMd) -> u64 + Send>| {
+            let md = md.clone();
+            std::thread::spawn(move || {
+                crate::cpu::smp::set_current_cpu(cpu);
+                work(&md)
+            })
+            .join()
+            .unwrap()
+        };
+        on(0, Box::new(move |md| { md.startup_tag_store(WINDOW_TAGS[0]); md.physical().write64(at, 0xa0); 0 }));
+        on(1, Box::new(move |md| { md.startup_tag_store(WINDOW_TAGS[0]); md.physical().write64(at, 0xb1); 0 }));
+        assert_eq!(on(0, Box::new(move |md| md.physical().read64(at).data)), 0xa0);
+        assert_eq!(on(1, Box::new(move |md| md.physical().read64(at).data)), 0xb1);
+        assert_eq!(md.physical().banks()[0].read64(at).data, 0, "memory is neither page");
+        // CPU 0's final sweep ends its window alone.
+        on(0, Box::new(|md| { md.startup_tag_store(0); 0 }));
+        assert!(md.memory.startup_live(), "CPU 1's still stands");
+        assert_eq!(on(0, Box::new(move |md| { md.physical().write64(at, 0xc0); md.physical().read64(at).data })), 0xc0);
+        assert_eq!(md.physical().banks()[0].read64(at).data, 0xc0, "CPU 0 wrote memory");
+        assert_eq!(on(1, Box::new(move |md| md.physical().read64(at).data)), 0xb1);
+        on(1, Box::new(|md| { md.startup_tag_store(0); 0 }));
+        assert!(!md.memory.startup_live());
+        assert_eq!(on(1, Box::new(move |md| md.physical().read64(at).data)), 0xc0);
     }
 
     /// Test patterns, a tag outside the window, and a kernel's invalid tags

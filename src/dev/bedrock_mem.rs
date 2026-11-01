@@ -33,10 +33,11 @@ use crate::physical::{Physical, RamBank};
 use crate::traits::*;
 use crate::ppmem::devmap::SLOT_SHIFT;
 use crate::ppmem::{MappedMemory, BITMAP_SHIFT, WINDOW_SIZE};
+use crate::cpu::smp::{current_cpu, MAX_CPUS};
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub const BANK_SPAN: u64 = 1 << 30;
 /// Software slots of [`BANK_SPAN`] in the node's 8 GiB.
@@ -180,6 +181,94 @@ const TAG_STATE: u32 = 0xc0;
 const TAG_PAGE_SHIFT: u32 = 8;
 const TAG_NODE_PAGES: u32 = 1 << 21;
 
+/// The startup window as each processor sees it: the processor's own page
+/// while its PROM lines stand, its RAM otherwise. Each processor's cache
+/// holds its own lines, so each stack is private, QEMU's per-processor
+/// cache-as-RAM window. That private storage is a model policy; when a
+/// window starts and ends is approximated from the tag stores (see
+/// [`BedrockMemory::startup_tag`]). Physical's table holds it over the
+/// window while any processor's stands; a processor whose window has ended
+/// reaches memory through MD's checked path, as a checked page does.
+struct StartupWindow {
+    /// The window's bytes for each processor. Zero at power-on: the PROM makes
+    /// the lines valid without a fill.
+    pages: [RamBank; MAX_CPUS],
+    /// Bit `cpu` set while that processor's window stands.
+    live: AtomicU8,
+    /// The node's memory view, set once when the controller is built.
+    slow: OnceLock<Arc<dyn BusDevice>>,
+}
+impl StartupWindow {
+    fn new() -> Self {
+        Self {
+            pages: std::array::from_fn(|_| {
+                let page = RamBank::new(1);
+                page.set_addr_mask(STARTUP_SIZE as u32 - 1);
+                page
+            }),
+            live: AtomicU8::new(0),
+            slow: OnceLock::new(),
+        }
+    }
+    fn live(&self, cpu: usize) -> bool {
+        cpu < MAX_CPUS && self.live.load(Ordering::Acquire) & (1 << cpu) != 0
+    }
+    fn any(&self) -> bool {
+        self.live.load(Ordering::Acquire) != 0
+    }
+    fn set(&self, cpu: usize, live: bool) {
+        if cpu < MAX_CPUS {
+            if live { self.live.fetch_or(1 << cpu, Ordering::AcqRel) } else { self.live.fetch_and(!(1 << cpu), Ordering::AcqRel) };
+        }
+    }
+    fn clear(&self) {
+        self.live.store(0, Ordering::Release);
+        for page in &self.pages {
+            for at in (0..STARTUP_SIZE).step_by(8) {
+                page.write64(at, 0);
+            }
+        }
+    }
+    /// The accessing processor's page, while its window stands.
+    fn own(&self) -> Option<&RamBank> {
+        let cpu = current_cpu();
+        self.live(cpu).then(|| &self.pages[cpu])
+    }
+    /// Where an access that is not to the processor's own page goes.
+    fn memory(&self) -> Option<&Arc<dyn BusDevice>> {
+        self.slow.get()
+    }
+}
+macro_rules! startup_access {
+    ($r:ident, $w:ident, $t:ty, $out:ident) => {
+        fn $r(&self, a: u64) -> $out {
+            match self.own() {
+                Some(page) => page.$r(a),
+                None => self.memory().map_or_else($out::err, |m| m.$r(a)),
+            }
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            match self.own() {
+                Some(page) => page.$w(a, v),
+                None => self.memory().map_or(BUS_ERR, |m| m.$w(a, v)),
+            }
+        }
+    };
+}
+impl BusDevice for StartupWindow {
+    startup_access!(read8, write8, u8, BusRead8);
+    startup_access!(read16, write16, u16, BusRead16);
+    startup_access!(read32, write32, u32, BusRead32);
+    startup_access!(read64, write64, u64, BusRead64);
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
+        match self.own() {
+            Some(page) => page.gen_ptr(a),
+            None => self.memory().map_or(std::ptr::null(), |m| m.gen_ptr(a)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Run {
     bank: usize,
@@ -275,10 +364,8 @@ pub struct BedrockMemory {
     fitted: Vec<u64>,
     config: AtomicU64,
     mapping: Mutex<Mapping>,
-    /// The window's bytes while the PROM's cache lines stand. Zero at power-on:
-    /// the PROM makes the lines valid without a fill.
-    startup_page: Box<RamBank>,
-    startup_live: AtomicBool,
+    /// Each processor's window while its PROM cache lines stand.
+    startup: Box<StartupWindow>,
     extent: RamExtent,
     #[cfg(feature = "jitv2")]
     generations: Arc<Generations>,
@@ -301,11 +388,9 @@ impl BedrockMemory {
         }
         let physical = Physical::new(banks.iter().map(|&mib| RamBank::new(mib as usize)).collect());
         physical.set_default(Arc::new(NoMemory), "Bedrock unconfigured memory");
-        let startup_page = Box::new(RamBank::new(1));
-        startup_page.set_addr_mask(STARTUP_SIZE as u32 - 1);
         Ok(Self { physical, fitted: banks.iter().map(|&mib| u64::from(mib) << 20).collect(),
             config: AtomicU64::new(0), mapping: Mutex::new(Mapping::default()),
-            startup_page, startup_live: AtomicBool::new(false),
+            startup: Box::new(StartupWindow::new()),
             #[cfg(feature = "jitv2")]
             generations: Arc::new(Generations::new(&RamExtent::new(banks))),
             extent: RamExtent::new(banks),
@@ -345,8 +430,11 @@ impl BedrockMemory {
     /// heavily up to that first store. Holding it to the sweep's end would
     /// change nothing the PROM sees.
     /// `Some(live)` is the state to move to, `None` leaves it alone.
-    pub(crate) fn startup_tag(&self, tag: u32) -> Option<bool> {
-        let live = self.startup_live.load(Ordering::Relaxed);
+    ///
+    /// Each processor stands its own lines, so its tag stores move its own
+    /// window, `cpu`'s.
+    pub(crate) fn startup_tag(&self, cpu: usize, tag: u32) -> Option<bool> {
+        let live = self.startup.live(cpu);
         if tag & TAG_STATE == 0 {
             return live.then_some(false);
         }
@@ -354,27 +442,31 @@ impl BedrockMemory {
         let in_window = (STARTUP_BASE >> 12..(STARTUP_BASE + STARTUP_SIZE) >> 12).contains(&(page as u64));
         (in_window && !live).then_some(true)
     }
-    /// Move to `live`; whether that changed anything, and so needs a remap.
-    pub(crate) fn set_startup(&self, live: bool) -> bool {
-        self.startup_live.swap(live, Ordering::Relaxed) != live
+    /// Move `cpu`'s window to `live`; whether that changed whether any
+    /// window stands, and so needs a remap.
+    pub(crate) fn set_startup(&self, cpu: usize, live: bool) -> bool {
+        let was = self.startup_live();
+        self.startup.set(cpu, live);
+        was != self.startup_live()
     }
+    /// Whether any processor's window stands.
     pub(crate) fn startup_live(&self) -> bool {
-        self.startup_live.load(Ordering::Relaxed)
+        self.startup.any()
     }
-    /// Power-on: no cache lines stand, and the page holds zero.
+    /// Power-on: no cache lines stand, and every page holds zero.
     pub(crate) fn clear_startup(&self) {
-        self.startup_live.store(false, Ordering::Relaxed);
-        for at in (0..STARTUP_SIZE).step_by(8) {
-            self.startup_page.write64(at, 0);
-        }
+        self.startup.clear();
     }
-    /// The page, for an access it answers: the window, while live. The bus
-    /// decode, the CPU's cached path and DMA all reach it through here or
-    /// through Physical's table, since nothing else is behind the window.
+    /// The page, for an access it answers: the window, while the accessing
+    /// processor's stands. The bus decode, the CPU's cached path and DMA all
+    /// reach it through here or through Physical's table. A thread that runs
+    /// no processor reaches CPU 0's, the one a single-processor board has.
     pub(crate) fn startup_device(&self, address: u64, bytes: u64) -> Option<&dyn BusDevice> {
         let offset = address.checked_sub(STARTUP_BASE)?;
-        (self.startup_live() && offset + bytes <= STARTUP_SIZE)
-            .then(|| &*self.startup_page as &dyn BusDevice)
+        if offset + bytes > STARTUP_SIZE {
+            return None;
+        }
+        self.startup.own().map(|page| page as &dyn BusDevice)
     }
     #[cfg(feature = "jitv2")]
     pub(crate) fn generations(&self) -> Arc<Generations> { self.generations.clone() }
@@ -393,6 +485,7 @@ impl BedrockMemory {
 
     /// The endpoint is weak back to MD: Physical owns it without a cycle.
     pub(crate) fn set_slow_view(&self, slow: Arc<dyn BusDevice>) {
+        assert!(self.startup.slow.set(slow.clone()).is_ok(), "the slow view is set once");
         self.mapping.lock().slow = Some(slow);
     }
 
@@ -501,9 +594,9 @@ impl BedrockMemory {
         if live {
             #[cfg(test)]
             Cost::add(&self.cost.table_ops, 1);
-            let page: *const RamBank = &*self.startup_page;
+            let window: *const StartupWindow = &*self.startup;
             phys.fill_slots(STARTUP_BASE >> SLOT_SHIFT, STARTUP_SIZE >> SLOT_SHIFT,
-                page as crate::ppmem::devmap::Entry);
+                window as crate::ppmem::devmap::Entry);
         }
         old.startup_placed = live;
         self.config.store(config, Ordering::Release);
