@@ -5,7 +5,7 @@
 
 # iris-ci — the right way to drive the CI socket
 
-Built alongside `iris` from `src/iris_ci_main.rs`. Talks to `/tmp/iris.sock` with typed clap subcommands. Use this, not raw `nc` + JSON, for any new automation, runbook, or test scenario.
+Built alongside `iris` from `src/iris_ci_main.rs`. Talks to iris's control socket (by default `iris.sock` in the temporary directory (`$TMPDIR`, else `/tmp`)) with typed clap subcommands. Use this, not raw `nc` + JSON, for any new automation, runbook, or test scenario.
 
 ## Common workflows
 

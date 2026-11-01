@@ -1696,12 +1696,34 @@ pub struct MachineConfig {
 
 fn default_scsi_deferred_int() -> bool { true }
 
-#[cfg(unix)]
-fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+/// The CI control socket when none is configured, for iris and iris-ci
+/// alike: `iris.sock` in the host's temporary directory (`$TMPDIR`, or
+/// `/tmp` when it is unset). On Windows, which takes a TCP address here,
+/// a loopback port.
+#[cfg(not(windows))]
+pub fn default_ci_socket() -> String {
+    ci_socket_in(&std::env::temp_dir())
+}
 #[cfg(windows)]
-fn default_ci_socket() -> String { "127.0.0.1:19851".to_string() }
-#[cfg(not(any(unix, windows)))]
-fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+pub fn default_ci_socket() -> String { "127.0.0.1:19851".to_string() }
+
+/// The default socket for the temporary directory `dir`.
+#[cfg(not(windows))]
+fn ci_socket_in(dir: &std::path::Path) -> String {
+    // `ci_socket` is a String, so a TMPDIR that is not UTF-8 gives a path
+    // with replacement characters; iris and iris-ci still agree on it.
+    dir.join("iris.sock").to_string_lossy().into_owned()
+}
+
+/// What to add when a connect to `path` fails: when `path` is the default
+/// Unix socket, that the default follows `TMPDIR`, so an iris started with
+/// another `TMPDIR` listens somewhere else. Nothing for a TCP address (the
+/// Windows default) or a path someone named.
+pub fn default_ci_socket_hint(path: &str) -> Option<&'static str> {
+    (path == default_ci_socket() && !ci_socket_is_tcp(path)).then_some(
+        "that is the default socket, in $TMPDIR (else /tmp); iris must run with the same \
+         TMPDIR, or give both the path (--ci-socket to iris, --socket or $IRIS_SOCKET here)")
+}
 
 /// True when `ci_socket` is a TCP `host:port` address (Windows CI default).
 pub fn ci_socket_is_tcp(path: &str) -> bool {
@@ -2508,7 +2530,7 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub ci: bool,
 
-    /// Override the default control-socket path (/tmp/iris.sock).
+    /// Override the default control-socket path (iris.sock in $TMPDIR, else /tmp).
     #[arg(long = "ci-socket", value_name = "PATH")]
     pub ci_socket: Option<String>,
 
@@ -3219,6 +3241,70 @@ mod rtc_offset_tests {
         cfg.rtc_offset = RtcOffset { years: -3, seconds: 27, ..Default::default() };
         let text = toml::to_string_pretty(&cfg).unwrap();
         assert_eq!(toml::from_str::<MachineConfig>(&text).unwrap().rtc_offset, cfg.rtc_offset);
+    }
+}
+
+#[cfg(test)]
+mod ci_socket_tests {
+    use super::*;
+
+    /// The default socket is `iris.sock` in the temporary directory, and a
+    /// configuration that names none gets it. iris-ci takes its default from
+    /// the same function, so the two meet whenever they share `TMPDIR`.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_default_socket_is_in_the_temporary_directory() {
+        let want = std::env::temp_dir().join("iris.sock");
+        assert_eq!(std::path::Path::new(&default_ci_socket()), want);
+        assert_eq!(MachineConfig::default().ci_socket, default_ci_socket());
+        let parsed: MachineConfig = toml::from_str("").expect("parse");
+        assert_eq!(parsed.ci_socket, default_ci_socket());
+        assert!(!ci_socket_is_tcp(&default_ci_socket()));
+    }
+
+    /// Another temporary directory moves the socket into it.
+    #[cfg(not(windows))]
+    #[test]
+    fn another_temporary_directory_moves_the_socket() {
+        let dir = std::path::Path::new("/run/user/1000/iris-tmp");
+        assert_eq!(ci_socket_in(dir), "/run/user/1000/iris-tmp/iris.sock");
+        assert!(!ci_socket_is_tcp(&ci_socket_in(dir)));
+    }
+
+    /// A `TMPDIR` in the environment moves the default iris and iris-ci both
+    /// use. `TMPDIR` is process-wide, so this test runs itself again as a
+    /// child with it set, and the child prints what it resolves.
+    #[cfg(unix)]
+    #[test]
+    fn a_tmpdir_in_the_environment_moves_the_default_socket() {
+        const NAME: &str = "config::ci_socket_tests::a_tmpdir_in_the_environment_moves_the_default_socket";
+        if std::env::var_os("IRIS_TEST_PRINT_CI_SOCKET").is_some() {
+            println!("SOCKET={}", default_ci_socket());
+            return;
+        }
+        let dir = "/run/iris-test-tmpdir";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env("TMPDIR", dir)
+            .env("IRIS_TEST_PRINT_CI_SOCKET", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // The test harness prints its own words on the same line.
+        let got = stdout.split("SOCKET=").nth(1).and_then(|r| r.split_whitespace().next())
+            .unwrap_or_else(|| panic!("child said {stdout}"));
+        assert_eq!(got, "/run/iris-test-tmpdir/iris.sock");
+    }
+
+    /// The TMPDIR hint follows a failed connect to the default Unix socket
+    /// only: not a path someone named, and not a TCP address such as the
+    /// Windows default.
+    #[test]
+    fn the_tmpdir_hint_is_only_for_the_default_unix_socket() {
+        let default = default_ci_socket();
+        assert_eq!(default_ci_socket_hint(&default).is_some(), !ci_socket_is_tcp(&default));
+        assert_eq!(default_ci_socket_hint("/elsewhere/iris.sock"), None);
+        assert_eq!(default_ci_socket_hint("127.0.0.1:19851"), None);
     }
 }
 

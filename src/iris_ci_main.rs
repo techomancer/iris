@@ -1,6 +1,6 @@
 //! `iris-ci` — ergonomic wrapper around the iris CI control socket.
 //!
-//! Replaces the raw `printf '...' | nc -U /tmp/iris.sock` pattern that's
+//! Replaces the raw `printf '...' | nc -U $TMPDIR/iris.sock` pattern that's
 //! awkward to type, brittle to quote, and tedious to compose. Every
 //! socket-level operation gets a typed clap subcommand, plus macros for
 //! the recurring multi-step rituals (boot, login, run, put/get).
@@ -27,12 +27,10 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
-#[cfg(unix)]
-const DEFAULT_SOCKET: &str = "/tmp/iris.sock";
-#[cfg(windows)]
-const DEFAULT_SOCKET: &str = "127.0.0.1:19851";
-#[cfg(not(any(unix, windows)))]
-const DEFAULT_SOCKET: &str = "/tmp/iris.sock";
+/// The socket iris listens on when neither names one.
+fn default_socket() -> PathBuf {
+    PathBuf::from(iris::config::default_ci_socket())
+}
 const PROMPT_RE: &str = "IRIS"; // Match "IRIS N# " — N is a counter that increments
 const RC_MARKER: &str = "IRIS-CI-RC=";
 
@@ -44,6 +42,7 @@ const RC_MARKER: &str = "IRIS-CI-RC=";
 )]
 struct Cli {
     /// CI Unix socket path or host:port for TCP. Override with $IRIS_SOCKET.
+    /// Defaults to iris's own: iris.sock in $TMPDIR, else /tmp.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
@@ -238,7 +237,7 @@ fn main() {
         .socket
         .clone()
         .or_else(|| std::env::var_os("IRIS_SOCKET").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
+        .unwrap_or_else(default_socket);
     let opts = Opts {
         socket,
         json: cli.json,
@@ -260,8 +259,12 @@ fn main() {
                 | std::io::ErrorKind::TimedOut => eprintln!(
                     "iris-ci: timed out waiting for {} to answer: {}",
                     opts.socket.display(), e),
-                _ => eprintln!(
-                    "iris-ci: connect {}: {}", opts.socket.display(), e),
+                _ => {
+                    eprintln!("iris-ci: connect {}: {}", opts.socket.display(), e);
+                    if let Some(hint) = iris::config::default_ci_socket_hint(&opts.socket.to_string_lossy()) {
+                        eprintln!("iris-ci: {hint}");
+                    }
+                }
             }
             1
         }
@@ -416,7 +419,7 @@ fn send_until(opts: &Opts, cmd: &str, args: Value, read_timeout: Duration) -> Re
         {
             Err(Error::Iris(format!(
                 "CI socket {} is not TCP; on this platform use host:port (default {})",
-                addr, DEFAULT_SOCKET
+                addr, default_socket().display()
             )))
         }
     }

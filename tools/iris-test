@@ -18,7 +18,8 @@ Usage:
     tools/iris-test path/to/test.yaml
 
 Optional flags:
-    --socket PATH     Unix socket path (default: /tmp/iris.sock)
+    --socket PATH     Unix socket path (default: iris.sock in $TMPDIR, else
+                      /tmp, as iris and iris-ci use)
     --verbose         Dump every RPC and raw serial output
     --no-restore      Skip the restore step (useful when driving a
                       pre-booted emulator manually)
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import time
@@ -97,6 +99,12 @@ def _mini_yaml(text: str) -> dict[str, Any]:
     return root
 
 
+def host_temp(name: str) -> str:
+    """A file in the host's temporary directory, chosen as iris chooses it
+    on Unix (Rust's std::env::temp_dir: $TMPDIR when set, else /tmp)."""
+    return os.path.join(os.environ.get("TMPDIR", "/tmp"), name)
+
+
 # ----------------------------------------------------------------------------
 # Control-socket client.
 # ----------------------------------------------------------------------------
@@ -110,6 +118,8 @@ class CiClient:
         except (FileNotFoundError, ConnectionRefusedError) as e:
             raise SystemExit(
                 f"iris-test: no iris --ci listener at {path} ({e}).\n"
+                f"  The default socket is in $TMPDIR (else /tmp); iris and this\n"
+                f"  tool must see the same TMPDIR, or both pass the socket path.\n"
                 f"  Start one first, e.g. in another terminal:\n"
                 f"    ./target/release/iris --ci --ci-socket {path}"
             )
@@ -179,7 +189,7 @@ def run_sleep(_client: CiClient, step: dict[str, Any]) -> StepResult:
 
 def run_screenshot(client: CiClient, step: dict[str, Any]) -> StepResult:
     start = time.monotonic()
-    path = step.get("path", "/tmp/iris-ci-screenshot.png")
+    path = step.get("path", host_temp("iris-ci-screenshot.png"))
     min_bytes = int(step.get("min_bytes", 1024))  # sanity lower bound
 
     resp = client.rpc("screenshot", path=path)
@@ -257,7 +267,7 @@ def run_test(spec: dict[str, Any], socket_path: str, verbose: bool, no_restore: 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run an IRIS --ci test spec")
     ap.add_argument("spec", type=Path)
-    ap.add_argument("--socket", default="/tmp/iris.sock")
+    ap.add_argument("--socket", default=host_temp("iris.sock"))
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--no-restore", action="store_true")
     args = ap.parse_args()

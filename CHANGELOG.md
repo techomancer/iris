@@ -280,6 +280,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   the guest screen from the display caches when no renderer is present. With
   a GUI renderer attached it still returns the readback that renderer
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
+- **The default CI socket is `iris.sock` in the host's temporary directory**,
+  `$TMPDIR` when it is set and `/tmp` otherwise, for both `iris` and `iris-ci`.
+  With `TMPDIR` unset nothing moves. macOS sets `TMPDIR` for every login, so
+  there the default is now under `/var/folders/.../T/`. The two meet through
+  the default only when both run with the same `TMPDIR` (the old literal met
+  whatever the environment); otherwise pass the path to both, `--ci-socket`
+  and `--socket`. A failed connect to the default now says so. A script that
+  names `/tmp/iris.sock` itself should pass `--ci-socket` to iris as well.
+  `tools/iris-test` takes the same default, and puts its default screenshot in
+  the same directory. Windows keeps `127.0.0.1:19851`.
 ### SGI Octane (IP30)
 
 - **Octane compile workers start after the memory windows are published.** A

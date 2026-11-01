@@ -8,7 +8,7 @@ sections. CLI applies `cfg.debug.apply_env()` at startup; iris-gui syncs Debug t
 
 ## Windows CI
 
-Default `ci_socket = "127.0.0.1:19851"` (TCP). Unix builds keep `/tmp/iris.sock`.
+Default `ci_socket = "127.0.0.1:19851"` (TCP). Unix builds use `iris.sock` in the temporary directory (`$TMPDIR`, else `/tmp`).
 `iris-ci` connects to either form. Launch headless CI with `wsl/run-iris-ci.bat`.
 
 ## HAL2

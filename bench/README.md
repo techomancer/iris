@@ -355,7 +355,7 @@ and the X server driving REX3:
 
 ```sh
 # with an emulator already running --ci and IRIX sitting at a shell prompt
-iris-bench irix --socket /tmp/iris.sock
+iris-bench irix
 ```
 
 Steps live in `bench/irix/steps.toml` and are ordinary shell one-liners: `dd`

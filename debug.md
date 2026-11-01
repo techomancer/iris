@@ -103,7 +103,7 @@ instead. Either retry the monitor TCP connect until it answers, or use the CI
 socket, which iris creates only after the monitor has bound:
 
 ```sh
-iris-ci --socket /tmp/iris.sock status --wait-ready 60
+iris-ci status --wait-ready 60
 tools/mon.py "machine-start"
 ```
 
