@@ -6144,24 +6144,41 @@ mod tests {
     #[cfg(not(feature = "lightning"))]
     #[test]
     fn breakpoints_can_be_set_while_running_and_report_their_hit() {
-        let cpu = nop_cpu();
+        // The guest spins on one instruction, so it is running for as long as
+        // the test needs and cannot reach the breakpoint on its own schedule:
+        // the breakpoint's condition is false until the test makes it true.
+        // (A sled that ran into the breakpoint raced the checks below, which
+        // need a running CPU, whenever the host was busy.)
+        let (mut exec, mem) = create_executor();
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.write_gpr(4, 1); // a0 != 0
+        let cpu = crate::cpu::mips_exec::MipsCpu::new(exec);
         crate::traits::Device::start(&cpu);
         assert!(cpu.is_running());
         // Adding a breakpoint pauses the core and resumes it.
-        let (r, out) = mon(&cpu, "bp add 0x80040000 pc if a0 == 0");
+        let (r, out) = mon(&cpu, "bp add 0x80001000 pc if a0 == 0");
         assert!(r.is_ok(), "{:?}", r);
         assert!(out.contains("Breakpoint added: 1:") && out.contains("if a0 == 0"), "{}", out);
+        assert!(cpu.is_running(), "the core resumes after the breakpoint is added");
         // Run control is refused while running, with one clear message.
         let (r, _) = mon(&cpu, "step");
         assert!(r.unwrap_err().contains("CPU is running"));
         // Status never blocks.
         let (r, out) = mon(&cpu, "status");
         assert!(r.is_ok());
-        assert!(out.starts_with("running") || out.starts_with("stopped"), "{}", out);
-        // The NOP sled reaches the breakpoint; wait says which one stopped it.
+        assert!(out.starts_with("running"), "{}", out);
+        // The condition is false, so the spin passes the breakpoint untouched.
+        let (r, out) = mon(&cpu, "wait 50");
+        assert!(r.is_ok());
+        assert!(out.contains("still running after 50 ms"), "{}", out);
+        // Make the condition true; the breakpoint stops the core, and wait says which one.
+        let (r, _) = mon(&cpu, "setreg a0 0");
+        assert!(r.is_ok());
         let (r, out) = mon(&cpu, "wait 10000");
         assert!(r.is_ok());
-        assert!(out.contains("stopped pc=ffffffff80040000"), "{}", out);
+        assert!(out.contains("stopped pc=ffffffff80001000"), "{}", out);
         assert!(out.contains("breakpoint 1:") && out.contains("hit 1 time"), "{}", out);
         assert!(!cpu.is_running());
         let (_, out) = mon(&cpu, "bp list");
