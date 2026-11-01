@@ -126,6 +126,42 @@ pub fn enabled_features() -> Vec<String> {
     f
 }
 
+/// Check that a snapshot fits this build, CPU and disks: the same build
+/// features, CPU model and cache model, and every disk it recorded configured
+/// at the same size. `IRIS_SNAPSHOT_SKIP_CHECK=1` makes a mismatch a warning.
+pub fn check_provenance(m: &Manifest, cpu_model: &str, cache_kind: &str, disks: &[DiskRef]) -> Result<(), String> {
+    let mut fatal = Vec::new();
+    let features: Vec<String> = m.features.iter()
+        .filter(|f| !RETIRED_FEATURES.contains(&f.as_str())).cloned().collect();
+    if features != enabled_features() {
+        fatal.push(format!("build features differ: snapshot [{}] vs current [{}]",
+            m.features.join(","), enabled_features().join(",")));
+    }
+    if let Some(e) = cpu_model_mismatch(m.cpu_model.as_deref(), cpu_model) {
+        fatal.push(e);
+    }
+    if let Some(e) = cache_model_mismatch(m.cpu_cache.as_deref(), m.cpu_model.as_deref(), cache_kind) {
+        fatal.push(e);
+    }
+    for d in &m.disks {
+        match disks.iter().find(|c| c.id == d.id) {
+            None => fatal.push(format!("snapshot disk {}:{} ('{}') is not configured in this run", d.id / 16, d.id % 16, d.path)),
+            Some(c) if c.size_bytes != d.size_bytes => fatal.push(format!(
+                "disk {}:{} ('{}') size differs: snapshot {} bytes vs current {}", d.id / 16, d.id % 16, d.path, d.size_bytes, c.size_bytes)),
+            Some(_) => {}
+        }
+    }
+    if !fatal.is_empty() {
+        let msg = format!("snapshot provenance mismatch:\n  - {}", fatal.join("\n  - "));
+        if std::env::var("IRIS_SNAPSHOT_SKIP_CHECK").is_ok_and(|v| !v.is_empty() && v != "0") {
+            eprintln!("load_snapshot: {msg} [IRIS_SNAPSHOT_SKIP_CHECK set; continuing]");
+        } else {
+            return Err(format!("{msg}\n(set IRIS_SNAPSHOT_SKIP_CHECK=1 to override)"));
+        }
+    }
+    Ok(())
+}
+
 /// Top-level snapshot manifest. Lives at `saves/<name>/snapshot.toml`. Written
 /// first on save and read first on load so the rest of the pipeline can fail
 /// fast with a clear error before reading half a snapshot.

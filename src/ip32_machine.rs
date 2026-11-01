@@ -664,37 +664,8 @@ impl O2Machine {
                 m.schema_version
             ));
         }
-        // As the Indy: build, CPU and disks must match;
-        // IRIS_SNAPSHOT_SKIP_CHECK=1 makes those warnings.
-        let mut fatal = Vec::new();
-        let features: Vec<String> = m.features.iter()
-            .filter(|f| !crate::snapshot::RETIRED_FEATURES.contains(&f.as_str())).cloned().collect();
-        if features != crate::snapshot::enabled_features() {
-            fatal.push(format!("build features differ: snapshot [{}] vs current [{}]",
-                m.features.join(","), crate::snapshot::enabled_features().join(",")));
-        }
-        if let Some(e) = crate::snapshot::cpu_model_mismatch(m.cpu_model.as_deref(), self.cpu.model_name()) {
-            fatal.push(e);
-        }
-        if let Some(e) = crate::snapshot::cache_model_mismatch(m.cpu_cache.as_deref(), m.cpu_model.as_deref(), self.cpu.cache_kind()) {
-            fatal.push(e);
-        }
-        for d in &m.disks {
-            match self.disks.iter().find(|c| c.id == d.id) {
-                None => fatal.push(format!("snapshot disk {}:{} ('{}') is not configured in this run", d.id / 16, d.id % 16, d.path)),
-                Some(c) if c.size_bytes != d.size_bytes => fatal.push(format!(
-                    "disk {}:{} ('{}') size differs: snapshot {} bytes vs current {}", d.id / 16, d.id % 16, d.path, d.size_bytes, c.size_bytes)),
-                Some(_) => {}
-            }
-        }
-        if !fatal.is_empty() {
-            let msg = format!("snapshot provenance mismatch:\n  - {}", fatal.join("\n  - "));
-            if std::env::var("IRIS_SNAPSHOT_SKIP_CHECK").is_ok_and(|v| !v.is_empty() && v != "0") {
-                eprintln!("load_snapshot: {msg} [IRIS_SNAPSHOT_SKIP_CHECK set; continuing]");
-            } else {
-                return Err(format!("{msg}\n(set IRIS_SNAPSHOT_SKIP_CHECK=1 to override)"));
-            }
-        }
+        // As the Indy: build, CPU and disks must match.
+        crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
         let state = |base: &str| snap.read_state(base, sv).map_err(|e| format!("{base}: {e}"));
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
