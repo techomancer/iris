@@ -9,21 +9,21 @@
 use crate::devlog::LogModule;
 use std::cell::Cell;
 
-pub(super) const PI_GFX_SLOTS: usize = 2;
+pub(crate) const PI_GFX_SLOTS: usize = 2;
 pub const PI_GFX_REGS: u32 = 10;
 
 /// The five registers of one slot, in address order.
-pub(super) const PI_GFX_PAGE: u32 = 0;
-pub(super) const PI_GFX_CREDIT: u32 = 1;
-pub(super) const PI_GFX_BIAS: u32 = 2;
-pub(super) const PI_GFX_INT_COUNT: u32 = 3;
-pub(super) const PI_GFX_SLOT_REGS: u32 = 5;
+pub(crate) const PI_GFX_PAGE: u32 = 0;
+pub(crate) const PI_GFX_CREDIT: u32 = 1;
+pub(crate) const PI_GFX_BIAS: u32 = 2;
+pub(crate) const PI_GFX_INT_COUNT: u32 = 3;
+pub(crate) const PI_GFX_SLOT_REGS: u32 = 5;
 
 /// Page: bit 40 enables it, bits 39:17 name it; the rest is reserved.
-pub(super) const PI_GFX_PAGE_ENABLE: u64 = 1 << 40;
-pub(super) const PI_GFX_PAGE_ADDRESS: u64 = 0xfffffe0000;
+pub(crate) const PI_GFX_PAGE_ENABLE: u64 = 1 << 40;
+pub(crate) const PI_GFX_PAGE_ADDRESS: u64 = 0xfffffe0000;
 pub(super) const PI_GFX_PAGE_MASK: u64 = PI_GFX_PAGE_ENABLE | PI_GFX_PAGE_ADDRESS;
-pub(super) const PI_GFX_CREDIT_MASK: u32 = 0xfff;
+pub(crate) const PI_GFX_CREDIT_MASK: u32 = 0xfff;
 pub(super) const PI_GFX_BIAS_MASK: u32 = 0xfff;
 pub(super) const PI_GFX_INT_MASK: u32 = 0x3ffffff;
 
@@ -52,7 +52,7 @@ pub struct PiGfx {
 /// The interface a node device implements for the graphics heads behind it
 /// (return_credits, owe_credits and repay_credits). `widget` is the head's crosstalk widget number, the
 /// value the driver writes into the node-widget map.
-pub(super) trait PiGfxLink: Send + Sync {
+pub(crate) trait PiGfxLink: Send + Sync {
     /// A graphics head took `n` counted stores off its port.
     fn return_credits(&self, widget: u32, n: u32);
     /// Credits a head owes for counted stores it has not yet taken off its
@@ -182,11 +182,11 @@ thread_local! {
 
 /// A processor interface marks each store it forwards down its I/O path;
 /// returns the previous mark, to be restored with pi_gfx_unmark_store.
-pub(super) fn pi_gfx_mark_store(counted: bool) -> bool {
+pub(crate) fn pi_gfx_mark_store(counted: bool) -> bool {
     PI_GFX_FORWARDING_COUNTED.with(|m| m.replace(counted))
 }
 
-pub(super) fn pi_gfx_unmark_store(previous: bool) {
+pub(crate) fn pi_gfx_unmark_store(previous: bool) {
     PI_GFX_FORWARDING_COUNTED.with(|m| m.set(previous));
 }
 

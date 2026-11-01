@@ -83,6 +83,10 @@ mod logic;
 mod mmio;
 mod pi_gfx;
 pub use pi_gfx::{PiGfx, PI_GFX_REGS};
+pub(crate) use pi_gfx::{
+    pi_gfx_mark_store, pi_gfx_unmark_store, PiGfxLink, PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_CREDIT_MASK,
+    PI_GFX_INT_COUNT, PI_GFX_PAGE, PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE, PI_GFX_SLOTS, PI_GFX_SLOT_REGS,
+};
 mod pixel_dma;
 mod pipe;
 mod pixel_write;
@@ -218,6 +222,18 @@ impl Odyssey {
         // The host's cursor query reads the registers the display reads.
         self.display.attach_registers(self.state.shared.clone());
         self.display.clone()
+    }
+
+    /// Link the board to the node whose processor interfaces count its
+    /// graphics credits, as a Bedrock node does. With none linked, as on
+    /// the Octane and the Fuel, every credit call is a no-op.
+    pub(crate) fn set_pi_link(&self, link: Arc<dyn PiGfxLink>) {
+        self.state.front.lock().pi = Some(link);
+    }
+
+    /// The node link [`Self::set_pi_link`] set, if any.
+    pub(crate) fn pi_link(&self) -> Option<Arc<dyn PiGfxLink>> {
+        self.state.front.lock().pi.clone()
     }
 
     /// The aperture offset of `addr`, in either window.
