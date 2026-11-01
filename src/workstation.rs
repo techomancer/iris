@@ -164,6 +164,12 @@ pub trait Workstation: Send {
     /// The kernel's clock-tick counter: its rate over wall time is the guest's
     /// Hz in the status bars.
     fn fasttick_count(&self) -> Arc<AtomicU64>;
+    /// Every CPU's retired-cycle counter and clock-tick counter, CPU 0 first,
+    /// for the front-end's MIPS and Hz. A machine with one CPU needs no more
+    /// than the default.
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.get_display().map(|d| (d.cycles(), self.fasttick_count())).into_iter().collect()
+    }
 
     /// The in-process serial console backend installed in CI mode.
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>>;

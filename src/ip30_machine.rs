@@ -691,6 +691,9 @@ impl Workstation for OctaneMachine {
     fn fasttick_count(&self) -> Arc<AtomicU64> {
         self.cpus[0].fasttick_count()
     }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.cpus.iter().map(|c| (c.cycles_ptr(), c.fasttick_count())).collect()
+    }
     fn get_ci_serial(&self) -> Option<Arc<crate::dev::serial_host::CiSerialBackend>> {
         self.ci_serial.clone()
     }
