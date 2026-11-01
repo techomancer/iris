@@ -84,6 +84,27 @@ pub fn instr_enabled(kind: InstrKind) -> bool {
     enabled_table()[kind as usize].load(Ordering::Relaxed)
 }
 
+/// Test lock for the enable table. The table is a process global and the
+/// harness runs tests in parallel, so a test that flips an instruction off
+/// changes what every concurrently compiling test sees: an ADDIU page whose
+/// kind was disabled for a moment is excluded, sticky-denylisted, and never
+/// published. Tests that toggle take [`table_exclusive`]; tests that compile
+/// and expect the default table take [`table_stable`].
+#[cfg(test)]
+static TABLE_TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Hold while changing the enable table. Excludes every [`table_stable`] holder.
+#[cfg(test)]
+pub(crate) fn table_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    TABLE_TEST_LOCK.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Hold while compiling code that needs the default enable table.
+#[cfg(test)]
+pub(crate) fn table_stable() -> std::sync::RwLockReadGuard<'static, ()> {
+    TABLE_TEST_LOCK.read().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The whole enable table, one bool per `InstrKind` in discriminant order —
 /// part of the persistent cache's codegen fingerprint.
 pub fn enabled_snapshot() -> Vec<bool> {
@@ -248,16 +269,19 @@ mod tests {
 
     #[test]
     fn plain_addu_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU), true));
     }
 
     #[test]
     fn addiu_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(i_type(OP_ADDIU, 1, 2, 5), true));
     }
 
     #[test]
     fn movz_emitter_follows_the_isa_level() {
+        let _stable = table_stable();
         let raw = r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ);
         assert!(has_emitter(raw, true), "MIPS IV compiles MOVZ");
         assert!(!has_emitter(raw, false), "MIPS III must leave MOVZ to the interpreter");
@@ -265,16 +289,19 @@ mod tests {
 
     #[test]
     fn teq_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 0, 0, FUNCT_TEQ), true));
     }
 
     #[test]
     fn tgei_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(i_type(OP_REGIMM, 1, RT_TGEI, 5), true));
     }
 
     #[test]
     fn prefx_emitter_follows_the_isa_level() {
+        let _stable = table_stable();
         // PREFX is COP1X-encoded and, unlike plain PREF, exec_prefx checks
         // STATUS_CU1 and raises cpu_unusable if it's clear. That is not a
         // reason to keep it out of jitv2: it is routed through
@@ -290,26 +317,31 @@ mod tests {
 
     #[test]
     fn daddi_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(i_type(OP_DADDI, 1, 2, 5), true));
     }
 
     #[test]
     fn daddiu_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(i_type(OP_DADDIU, 1, 2, 5), true));
     }
 
     #[test]
     fn lwl_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(i_type(OP_LWL, 1, 2, 0), true));
     }
 
     #[test]
     fn swl_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(i_type(OP_SWL, 1, 2, 0), true));
     }
 
     #[test]
     fn cop1x_madd_emitter_follows_the_isa_level() {
+        let _stable = table_stable();
         let raw = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S);
         assert!(has_emitter(raw, true), "MIPS IV compiles MADD.S");
         assert!(!has_emitter(raw, false), "MIPS III must leave MADD.S to the interpreter");
@@ -317,6 +349,7 @@ mod tests {
 
     #[test]
     fn cop1x_paired_single_has_no_emitter_in_any_build() {
+        let _stable = table_stable();
         // The *_PS forms have no interpreter handler either — no MIPS IV
         // part SGI shipped implements paired-single — so they must keep
         // falling back even when mips4 is on.
@@ -326,11 +359,13 @@ mod tests {
 
     #[test]
     fn cp1_add_s_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FADD), true));
     }
 
     #[test]
     fn cp1_movz_fmt_emitter_follows_the_isa_level() {
+        let _stable = table_stable();
         let raw = r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FMOVZ);
         assert!(has_emitter(raw, true), "MIPS IV compiles MOVZ.S");
         assert!(!has_emitter(raw, false), "MIPS III must leave MOVZ.S to the interpreter");
@@ -338,11 +373,13 @@ mod tests {
 
     #[test]
     fn mfc1_has_emitter() {
+        let _stable = table_stable();
         assert!(has_emitter(r_type(OP_COP1, RS_MFC1, 2, 3, 0, 0), true));
     }
 
     #[test]
     fn cop0_has_no_emitter() {
+        let _stable = table_stable();
         // OP_COP0 is excluded at the analyzer level entirely (not routed
         // through has_emitter at all in practice), but has_emitter must
         // still correctly say "no" for it — nothing in either lookup table
@@ -352,6 +389,7 @@ mod tests {
 
     #[test]
     fn branch_and_regjump_report_false_here_by_design() {
+        let _stable = table_stable();
         // BEQ/JR are handled by analyzer::classify's own Branch/RegJump
         // dispatch before has_emitter would ever be consulted for them —
         // has_emitter only answers the Sequential-vs-Excluded question for
@@ -362,14 +400,23 @@ mod tests {
         assert!(!has_emitter(r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_JR), true));
     }
 
-    // The tests below mutate the process-global ENABLED table, so they must not run
-    // concurrently with each other (or with anything else touching it) — same
-    // one-mutex-per-module discipline as analyzer::FALLBACK_TEST_LOCK.
-    static TOGGLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The tests below mutate the process-global ENABLED table, so they hold
+    // `table_exclusive`: not concurrently with each other, and not while any
+    // test that compiles holds `table_stable`.
+
+    #[test]
+    fn toggling_and_compiling_tests_exclude_each_other() {
+        let exclusive = table_exclusive();
+        assert!(TABLE_TEST_LOCK.try_read().is_err(), "a compiling test must not start while the table is being toggled");
+        drop(exclusive);
+        let stable = table_stable();
+        assert!(TABLE_TEST_LOCK.try_write().is_err(), "a toggling test must wait for compiling tests to finish");
+        drop(stable);
+    }
 
     #[test]
     fn category_toggle_bulk_sets_and_clears() {
-        let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = table_exclusive();
         // Note: category_enabled(ALU) is *not* true by default — Nop/Syscall/Break
         // are ALU-category but exception-only (never dispatched through codegen at
         // all), so "fully on" was never the starting state for this category. Check
@@ -391,7 +438,7 @@ mod tests {
 
     #[test]
     fn single_instruction_override_composes_with_category_toggle() {
-        let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = table_exclusive();
         set_category_enabled(InstrCategory::ALU, false);
         assert!(!instr_enabled(InstrKind::Addu));
 
@@ -408,7 +455,7 @@ mod tests {
 
     #[test]
     fn disabled_instruction_makes_has_emitter_false() {
-        let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = table_exclusive();
         let raw = r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU);
         assert!(has_emitter(raw, true));
         set_instr_enabled(InstrKind::Addu, false);
@@ -422,7 +469,7 @@ mod tests {
         // Branch/Jump/RegJump never call has_emitter (analyzer::classify resolves
         // them by construction) — this is the toggle's other half, exercised through
         // analyzer::classify directly, confirming the branch_category_gate wiring.
-        let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = table_exclusive();
         let beq = i_type(OP_BEQ, 1, 2, 0);
         let jr = r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_JR);
         let j = i_type(OP_J, 0, 0, 0);
@@ -442,7 +489,7 @@ mod tests {
 
     #[test]
     fn write_status_summarizes_fully_on_and_expands_mixed() {
-        let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = table_exclusive();
         set_category_enabled(InstrCategory::ALU, true);
         set_category_enabled(InstrCategory::BRANCH, true);
 
@@ -470,7 +517,7 @@ mod tests {
 
     #[test]
     fn write_status_filter_always_expands() {
-        let _lock = TOGGLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = table_exclusive();
         set_category_enabled(InstrCategory::FPU, true);
         // FPU is fully on, but an explicit filter should still expand it.
         let mut out = Vec::new();

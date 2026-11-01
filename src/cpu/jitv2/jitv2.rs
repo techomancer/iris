@@ -5349,6 +5349,7 @@ mod tests {
         // real risk of firing under heavy system load, which isolated/
         // single-test runs never reproduce — hence why this wasn't caught
         // immediately).
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         q.start(dev, std::sync::Arc::new(JitStats::default()));
@@ -5409,6 +5410,7 @@ mod tests {
         // production) so this reasoning stays true regardless of future
         // default changes.
         let _max_instrs_guard = MaxInstrsGuard::set(usize::MAX);
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         q.start(dev, std::sync::Arc::new(JitStats::default()));
@@ -5471,6 +5473,7 @@ mod tests {
         // real leader-election/barrier contention among genuinely live
         // worker threads, not the single-worker degenerate case every other
         // test in this file exercises.
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
         let mut q = CompileQueue::new();
         q.set_thread_count(4);

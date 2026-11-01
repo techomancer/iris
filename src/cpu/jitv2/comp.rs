@@ -938,6 +938,7 @@ mod tests {
 
     #[test]
     fn handle_request_publishes_a_compilable_instruction() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -964,6 +965,7 @@ mod tests {
         // (confirmed live via a boot traceback: `[jit:entry]` immediately
         // followed by the interpreter silently re-executing the same
         // instruction, on every single hit of an older entry).
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -989,6 +991,7 @@ mod tests {
 
     #[test]
     fn handle_request_skips_already_valid_entry() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -1047,6 +1050,7 @@ mod tests {
 
         // Outcome 1: publishes successfully.
         {
+            let _stable = crate::cpu::jitv2::opcode_support::table_stable();
             let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
             let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
             page.mark_requested(4);
@@ -1116,6 +1120,7 @@ mod tests {
         // force-seal machinery (force_publish_pending) expects to find it —
         // this isn't "gap-blocked behind another worker," just "not yet a
         // whole page's worth."
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -1154,6 +1159,7 @@ mod tests {
 
     #[test]
     fn handle_request_deferred_clears_scheduled_bit() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
