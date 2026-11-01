@@ -83,29 +83,29 @@ give a different chip a fresh `[tezro] flash` file.
 
 ## Limits
 
-Only CPU 0 runs. The fitted processors read present to the PROM, and only CPU
-0 is enabled at power-on; a write that would start another processor, an NMI
-or an interrupt aimed at one, and per-processor timers are refused and logged
-by the Bedrock PI, not carried out. On the two- and four-processor board the
-PROM therefore disables every processor but CPU 0 as having failed early
-initialisation, records that in its flash log, and IRIX reports the system
-as degraded. An NMI, and a write that clears a running processor's enable
-bit, are refused and logged by the Bedrock PI: the CPU has no NMI entry.
+Every fitted processor runs, each on its own host thread. The IP35 PROM
+assumes its processors left reset together and run at hardware speed
+through four early handshakes; at each the model holds the processor that
+arrived early until the ones it waits for catch up, or until they have
+retired 2,000,000,000 cycles without doing so (`src/ip35/rendezvous.rs`). An
+NMI, and a write that clears a running processor's enable bit, are refused
+and logged by the Bedrock PI: the CPU has no NMI entry.
 
 On this Fuel base the PROM stops after printing `Copying PROM code to
 memory` and never reaches its menu. Bank 0 covers the reset PROM window at
 physical `0x1fc00000` in every Tezro layout, since the smallest bank is
 512 MiB, and the PROM runs that stage from cache lines it stages with the
 R10000 Index Store Tag and Index Store Data operations. Iris serves such
-staged lines only with the R10000 cache index operations, which this base
-does not carry. With them on top, the Origin 300 disk boots to the IRIX
-login under the interpreter and under jitv2.
+staged lines with the R10000 cache index operations (see the
+[staged-line notes](../clanker/cpu/staged-secondary-cache-lines.md)); with them
+the Origin 300 disk boots to the IRIX login under the interpreter and under
+jitv2.
 
 The R16000 model leaves out three R16000-specific choices that QEMU's model
 makes: the CP0 diagnostic register's mask and reset value, a trap on a
 subnormal operand while FCSR.FS is clear, and the limit on CVT.L results.
 Those cases follow the behaviour the rest of the R10000 family has in Iris.
-No R16000 FIR was found in the retained evidence for either part; the model
+No R16000 FIR was found in the retained evidence for any chip; the model
 reports `0x0900`, the one R14000 value on record, as a model choice.
 
 Every board identity the machine reports is a software choice of the QEMU

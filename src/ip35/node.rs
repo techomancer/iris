@@ -52,21 +52,56 @@ pub(crate) fn connect_cpu(
     l1: &L1,
     cpu: &Arc<dyn CpuDevice>,
 ) -> Receiver<MachineEvent> {
+    connect(name, md, &[pi0], lb, ni, l1, Population::SINGLE, std::slice::from_ref(cpu))
+}
+
+/// Give a node's memory and devices to the processors the board runs, CPU 0
+/// first, each in the slot `running` gives it: the direct-access window and
+/// its page bitmaps for every one, each PI's interrupt outputs to the
+/// processors in its slots, and the node's resets and power events, an L1
+/// reset reaching every processor.
+pub(crate) fn connect_cpus(name: &'static str, node: &Node, running: Population, cpus: &[Arc<dyn CpuDevice>]) -> Receiver<MachineEvent> {
+    connect(name, &node.md, &[node.pi[0].as_ref(), node.pi[1].as_ref()], &node.lb, &node.ni, &node.l1, running, cpus)
+}
+
+/// [`connect_cpus`] over the PIs given, PI0 first.
+#[allow(clippy::too_many_arguments)]
+fn connect(
+    name: &'static str,
+    md: &Arc<BedrockMd>,
+    pis: &[&BedrockPi],
+    lb: &BedrockLb,
+    ni: &BedrockNi,
+    l1: &L1,
+    running: Population,
+    cpus: &[Arc<dyn CpuDevice>],
+) -> Receiver<MachineEvent> {
     if let Some(space) = md.physical().ppmem_space() {
         use crate::ppmem::MappedMemory;
         unsafe {
-            space.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-            cpu.set_tcache_window(space.window_base());
-            let bitmap = cpu.tcache_bitmap_ptr();
-            if !bitmap.is_null() { space.set_bitmap_sink2(bitmap); }
-            #[cfg(feature = "jitv2")]
-            cpu.set_tcache_gen_window(md.generation_base());
+            for (id, cpu) in cpus.iter().enumerate() {
+                if id == 0 {
+                    space.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
+                } else {
+                    space.add_bitmap_sink(cpu.ppmem_bitmap_ptr());
+                }
+                cpu.set_tcache_window(space.window_base());
+                let bitmap = cpu.tcache_bitmap_ptr();
+                if !bitmap.is_null() {
+                    if id == 0 { space.set_bitmap_sink2(bitmap) } else { space.add_bitmap_sink(bitmap) }
+                }
+                #[cfg(feature = "jitv2")]
+                cpu.set_tcache_gen_window(md.generation_base());
+            }
         }
         md.physical().resync_ppmem_bitmap();
         md.rebuild_memory();
     }
-    pi0.set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(cpu))));
-    node_events(name, lb, ni, l1, vec![Arc::downgrade(cpu)])
+    for (interface, pi) in pis.iter().enumerate() {
+        let slot = |slot| running.cpu_in(interface as u8, slot).and_then(|cpu| cpus.get(cpu)).map(Arc::downgrade);
+        pi.set_interrupt_controller(Arc::new(SlotIrq([slot(0), slot(1)])));
+    }
+    node_events(name, lb, ni, l1, cpus.iter().map(Arc::downgrade).collect())
 }
 
 /// The resets and power events a node's local bus, network block and L1
@@ -175,17 +210,6 @@ pub(crate) fn connect_serial_ports(
     Ok(())
 }
 
-struct CpuIrq(std::sync::Weak<dyn CpuDevice>);
-impl InterruptController for CpuIrq {
-    fn set_line(&self, line: u32, level: bool) {
-        if line < 5 {
-            if let Some(cpu) = self.0.upgrade() {
-                cpu.as_device().signal(Signal::Interrupt(line + 2, level));
-            }
-        }
-    }
-}
-
 /// The local node register blocks projected into the processor's I/O view.
 pub mod reg {
     pub const PI1_BASE: u64 = 0x20_0000;
@@ -211,6 +235,8 @@ pub(crate) struct NodeConfig<'a> {
     /// The fitted slots whose processor runs.
     pub running: Population,
     pub firmware: FirmwareRecord,
+    /// Environment records a fresh boot flash starts with, at their offsets.
+    pub flash_records: Vec<(usize, Vec<u8>)>,
     /// The word the board reads back at the Hub-special board-id window.
     pub board_id: u64,
     pub l1: L1Config,
@@ -244,7 +270,7 @@ impl Node {
     }
 
     pub fn build(config: NodeConfig<'_>) -> Result<Self, String> {
-        let NodeConfig { name, payload, clock, flash_path, banks_mib, population, running, firmware, board_id, l1 } = config;
+        let NodeConfig { name, payload, clock, flash_path, banks_mib, population, running, firmware, flash_records, board_id, l1 } = config;
         let md = BedrockMd::with_clock(banks_mib, clock.clone())?;
         let phys = md.physical().clone();
         let pi: [Arc<BedrockPi>; 2] = std::array::from_fn(|interface| {
@@ -260,8 +286,8 @@ impl Node {
         });
         let l1 = Arc::new(L1::new(l1)?);
         let flash = Arc::new(match flash_path {
-            Some(path) => Flash::with_file(payload, path, firmware),
-            None => Flash::new(payload, firmware),
+            Some(path) => Flash::with_file_seeded(payload, path, firmware, &flash_records),
+            None => Flash::seeded(payload, firmware, &flash_records),
         }.map_err(|e| e.to_string())?);
         let lb = Arc::new(BedrockLb::new(clock.clone()));
         let io = Arc::new(BedrockIo::new());
@@ -464,6 +490,18 @@ impl BusDevice for LocalPi {
     }
     fn write64(&self, a: u64, v: u64) -> u32 {
         self.own().write64(a, v)
+    }
+}
+
+/// A PI's interrupt outputs to the processors in its two slots: lines 0..4
+/// are slot A's IP2..IP6, lines 5..9 slot B's, each to the processor the
+/// board put there.
+pub(crate) struct SlotIrq(pub [Option<std::sync::Weak<dyn CpuDevice>>; 2]);
+impl InterruptController for SlotIrq {
+    fn set_line(&self, line: u32, level: bool) {
+        if let Some(cpu) = self.0.get(line as usize / 5).and_then(|c| c.as_ref()).and_then(|c| c.upgrade()) {
+            cpu.as_device().signal(Signal::Interrupt(line % 5 + 2, level));
+        }
     }
 }
 
@@ -706,6 +744,7 @@ mod tests {
             population,
             running: Population::fitted_cpus(running).unwrap(),
             firmware: FirmwareRecord::TEZRO,
+            flash_records: Vec::new(),
             board_id: 0,
             l1: L1Config::default(),
         })
