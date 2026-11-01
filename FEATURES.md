@@ -307,6 +307,22 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `ultra64.enabled` | `false` | Enable the GIO N64 development board; requires an external gopher64 peer. |
 
+### [virtio_serial]
+
+virtio-console / virtio-serial for guests that carry a driver; see
+[docs/virtio-serial.md](docs/virtio-serial.md). Each `[[virtio_serial.port]]`
+table adds a port, in order.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge. Refused on the O2. |
+| `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device` and Ultra64) or `"exp1"` (`0x1F600000`, shared with the second Newport head). Indy and Indigo2 only. |
+| `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
+| `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); unique. |
+| `port.console` | `false` | Tell the guest this port is its console. |
+| `port.tcp_port` | none | Serve the port as raw TCP on 127.0.0.1 (no telnet). Exclusive with `socket`. |
+| `port.socket` | none | Serve the port on a raw Unix socket at this path. |
+
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared

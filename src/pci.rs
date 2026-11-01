@@ -58,6 +58,9 @@ pub struct PciConfig {
     bars: [Bar; 6],
     /// The registers as the function powers up, for [`PciConfig::reset`].
     power_on: [u32; 64],
+    /// Dwords `16..caps_end` hold a capability list, which firmware cannot
+    /// overwrite. 0 when the function has none.
+    caps_end: usize,
 }
 
 impl PciConfig {
@@ -74,7 +77,24 @@ impl PciConfig {
                 r[4 + i] = 1;
             }
         }
-        Self { regs: Mutex::new(r), bars, power_on: r }
+        Self { regs: Mutex::new(r), bars, power_on: r, caps_end: 0 }
+    }
+
+    /// Give the function a capability list: `caps` are the raw dwords of the
+    /// list, which starts at dword `first` (at least 16, the end of the
+    /// header). They are read-only and survive a reset. The header's
+    /// capability pointer and status bit are set to match.
+    pub fn with_capabilities(mut self, first: usize, caps: &[u32]) -> Self {
+        assert!(first >= 16 && first + caps.len() <= 64, "capabilities must fit in the 256-byte header");
+        let r = self.regs.get_mut().unwrap();
+        for (i, &d) in caps.iter().enumerate() {
+            r[first + i] = d;
+        }
+        // Capabilities pointer (byte offset) in the low byte of dword 13.
+        r[13] = (first * 4) as u32;
+        self.power_on = *r;
+        self.caps_end = first + caps.len();
+        self
     }
 
     /// RST#: back to the power-up header. The command register clears, so
@@ -94,7 +114,8 @@ impl PciConfig {
         let r = self.regs.lock().unwrap();
         match reg {
             // Status: a medium-speed device with no errors to report.
-            1 => (r[1] & 0xffff) | 0x0200_0000,
+            // A function with a capability list also sets status bit 4.
+            1 => (r[1] & 0xffff) | 0x0200_0000 | if r[13] != 0 { 0x0010_0000 } else { 0 },
             _ => r[reg],
         }
     }
@@ -120,6 +141,8 @@ impl PciConfig {
                     Bar::Mem(n) => val & !(n - 1),
                 };
             }
+            // The capability list is read-only.
+            16.. if reg < self.caps_end => {}
             // Interrupt pin is read-only; the line is firmware's scratch.
             15 => r[15] = (r[15] & 0xff00) | (val & !0xff00),
             _ => r[reg] = val,
