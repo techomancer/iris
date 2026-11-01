@@ -811,3 +811,18 @@ fn flushed_overlay_writes_survive_a_power_off_that_skips_drop() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// The cached view the processors' caches sit on swaps RAM above 4 GiB, so
+/// SC stays atomic where the direct window does not reach.
+#[test]
+fn the_cached_view_swaps_ram_above_4_gib() {
+    let board = TezroBoard::new(4).unwrap();
+    // Banks 0 to 5: two 1 GiB banks and four of 512 MiB, as MD's tests set them.
+    assert_eq!(board.node.md.md_bus().write64(8, 0x53 | (0x43 << 8) | (0x43 << 16)), BUS_OK);
+    let cached = board.cached_bus();
+    let at = (5u64 << 30) + 0x80;
+    assert_eq!(cached.write64(at, 1), BUS_OK);
+    assert_eq!(cached.cas64(at, 1, 2), Some(true));
+    assert_eq!(cached.cas64(at, 1, 3), Some(false));
+    assert_eq!(cached.read64(at).data, 2);
+}

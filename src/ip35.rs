@@ -410,6 +410,14 @@ impl BusDevice for CachedPhysical {
         self.memory_target(a, 8)
             .map(|(view, pa)| view.write_block(pa, data)).unwrap_or(BUS_ERR)
     }
+    // A processor's SC to RAM the shadow cache cannot reach directly, such
+    // as banks above the direct window: the swap the store makes atomic.
+    fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> {
+        self.memory_target(a, 4).and_then(|(view, pa)| view.cas32(pa, old, new))
+    }
+    fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
+        self.memory_target(a, 8).and_then(|(view, pa)| view.cas64(pa, old, new))
+    }
     processor_access!(read8, write8, u8, BusRead8, 1, memory_target);
     processor_access!(read16, write16, u16, BusRead16, 2, memory_target);
     processor_access!(read32, write32, u32, BusRead32, 4, memory_target);

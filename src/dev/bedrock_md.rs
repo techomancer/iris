@@ -1009,6 +1009,16 @@ impl BusDevice for DmaView {
     dma_rw!(read16, write16, BusRead16, u16);
     dma_rw!(read32, write32, BusRead32, u32);
     dma_rw!(read64, write64, BusRead64, u64);
+    fn cas32(&self, address: u64, old: u32, new: u32) -> Option<bool> {
+        let swapped = self.at(address, 4)?.cas32(address, old, new)?;
+        if swapped { self.0.memory.written(address); }
+        Some(swapped)
+    }
+    fn cas64(&self, address: u64, old: u64, new: u64) -> Option<bool> {
+        let swapped = self.at(address, 8)?.cas64(address, old, new)?;
+        if swapped { self.0.memory.written(address); }
+        Some(swapped)
+    }
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
         self.0.memory.gen_ptr(address)
@@ -1485,6 +1495,28 @@ mod tests {
         assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 4 * BANK_SPAN));
         assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 5 * BANK_SPAN));
         assert_eq!(md.dma_view().read64(5 * BANK_SPAN).data, 0x1111 * 6, "DMA reaches it too");
+    }
+
+    /// A processor's SC to a bank above 4 GiB, outside its direct window,
+    /// swaps through the DMA view in one step and leaves a failed compare
+    /// alone; a successful one advances the page's logical counter.
+    #[test]
+    fn a_compare_and_swap_above_4_gib_is_one_step() {
+        let md = tezro();
+        let view = md.dma_view();
+        let at = 5 * BANK_SPAN + 0x40;
+        assert_eq!(view.write64(at, 7), BUS_OK);
+        #[cfg(feature = "jitv2")]
+        let before = unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) };
+        assert_eq!(view.cas64(at, 6, 9), Some(false));
+        assert_eq!(view.read64(at).data, 7);
+        assert_eq!(view.cas64(at, 7, 9), Some(true));
+        assert_eq!(view.read64(at).data, 9);
+        assert_eq!(view.cas32(at + 4, 9, 3), Some(true));
+        assert_eq!(view.read64(at).data, 3);
+        #[cfg(feature = "jitv2")]
+        assert!(unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) } > before);
+        assert_eq!(view.cas64(7 * BANK_SPAN, 0, 1), None, "no bank there");
     }
 
     /// Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5
