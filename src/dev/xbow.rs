@@ -30,7 +30,8 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 use crate::irq::InterruptController;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
+use crate::snapshot::{field_bool, field_u32, field_u32s, field_u8, StateTable};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK, Saveable};
 
 /// A widget ID register: JTAG IDCODE layout, bit 0 set.
 pub const fn widget_id(rev: u32, part: u32, mfgr: u32) -> u32 {
@@ -632,6 +633,67 @@ impl BusDevice for Xbow {
     }
 }
 
+// The crossbow's state for a snapshot: its registers and each link's
+// state. Which links are fitted is the board's, and a load onto other
+// links is refused. The interrupt the crossbow drives into HEART is
+// HEART's own saved state.
+impl Saveable for Xbow {
+    fn save_state(&self) -> toml::Value {
+        let r = self.regs.lock();
+        StateTable::new()
+            .u32s("words", &[
+                r.status, r.err_upper, r.err_lower, r.control, r.packet_timeout, r.int_upper,
+                r.int_lower, r.err_cmd, r.llp_control, r.arb_reload, r.perf_a, r.perf_b, r.nic,
+            ])
+            .u32s("link_control", &r.link_control)
+            .u32s("link_status", &r.link_status)
+            .u32s("link_arb_upper", &r.link_arb_upper)
+            .u32s("link_arb_lower", &r.link_arb_lower)
+            .u32s("link_aux_status", &r.link_aux_status)
+            .u32s("link_event", &r.link_event)
+            .u8("came_up", r.came_up)
+            .u8("initializing", r.initializing)
+            .u8("eight_bit", r.eight_bit)
+            .bool("interrupt_asserted", r.interrupt_asserted)
+            .u32s("fences", &r.fences)
+            .u32("lock", r.lock)
+            .u32("revision", self.revision)
+            .u8("present", self.present.load(Ordering::Acquire))
+            .u8("alive", self.alive.load(Ordering::Acquire))
+            .build()
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        if field_u8(v, "present")? != self.present.load(Ordering::Acquire) {
+            return Err("the saved crossbow has other links fitted".into());
+        }
+        if field_u32(v, "revision")? != self.revision {
+            return Err("the saved crossbow is another revision".into());
+        }
+        let [status, err_upper, err_lower, control, packet_timeout, int_upper, int_lower, err_cmd,
+            llp_control, arb_reload, perf_a, perf_b, nic] = field_u32s::<13>(v, "words")?;
+        let n = Regs {
+            status, err_upper, err_lower, control, packet_timeout, int_upper, int_lower, err_cmd,
+            llp_control, arb_reload, perf_a, perf_b, nic,
+            link_control: field_u32s(v, "link_control")?,
+            link_status: field_u32s(v, "link_status")?,
+            link_arb_upper: field_u32s(v, "link_arb_upper")?,
+            link_arb_lower: field_u32s(v, "link_arb_lower")?,
+            link_aux_status: field_u32s(v, "link_aux_status")?,
+            link_event: field_u32s(v, "link_event")?,
+            came_up: field_u8(v, "came_up")?,
+            initializing: field_u8(v, "initializing")?,
+            eight_bit: field_u8(v, "eight_bit")?,
+            interrupt_asserted: field_bool(v, "interrupt_asserted")?,
+            fences: field_u32s(v, "fences")?,
+            lock: field_u32(v, "lock")?,
+        };
+        *self.regs.lock() = n;
+        self.alive.store(field_u8(v, "alive")?, Ordering::Release);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +860,23 @@ mod tests {
         let old = octane();
         assert_eq!(old.read(FENCE_BASE + 4, 4), None);
         assert_ne!(old.read(STATUS + 4, 4).unwrap() as u32 & STATUS_ACCESS_ERROR, 0);
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = Xbow::new(5, 0x8100);
+        src.regs.lock().control = 0x55;
+        src.regs.lock().link_event[2] = 7;
+        assert!(src.write(FENCE_BASE + 8 * 3 + 4, 4, 0x3c));
+        assert!(src.write(LOCK + 4, 4, 9));
+        let v = src.save_state();
+        let dst = Xbow::new(5, 0x8100);
+        dst.load_state(&v).expect("load_state");
+        assert_eq!(v, dst.save_state());
+        assert_eq!(dst.regs.lock().link_event[2], 7);
+        assert_eq!(dst.read(FENCE_BASE + 8 * 3 + 4, 4), Some(0x3c));
+        assert_eq!(dst.read(LOCK + 4, 4), Some(9));
+        assert!(Xbow::new(5, 0x8400).load_state(&v).is_err(), "other links fitted");
+        assert!(Xbow::new(4, 0x8100).load_state(&v).is_err(), "another revision");
     }
 }
