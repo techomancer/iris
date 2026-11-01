@@ -71,9 +71,11 @@ fn reclaim_previous(pid: i32) {
     log::warn!("terminating previous iris-gui instance (pid {pid}) to reclaim its ports");
     let _ = Command::new("kill").arg(pid.to_string()).status(); // SIGTERM
 
-    // Wait up to ~2s for it to exit (and release its ports) before escalating.
+    // Wait for it to exit (and release its ports) before escalating. SIGTERM
+    // makes it stop its machine and flush the disks, which the worker bounds
+    // at 5 s (`stop_machine_timed`); allow that and some margin.
     let mut alive = true;
-    for _ in 0..20 {
+    for _ in 0..80 {
         std::thread::sleep(Duration::from_millis(100));
         let still = Command::new("kill").args(["-0", &pid.to_string()]).status();
         if matches!(still, Ok(s) if !s.success()) {

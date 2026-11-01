@@ -122,6 +122,11 @@ fn main() {
 
     machine.start();
 
+    // Ctrl-C, a kill or a closed terminal ends the process; flush the disks
+    // first, as `quit` does.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    iris::workstation::exit_on_signal(machine.machine_slot());
+
     // CI control socket: started after the machine so a successful connection
     // means the monitor has already bound its port. That makes "the CI socket
     // answers" a reliable readiness signal for a harness — no fixed sleep —

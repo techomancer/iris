@@ -456,6 +456,184 @@ pub fn console_quit(slot: MachineSlot) -> impl FnOnce() + Send + 'static {
     move || exit_process("console quit", 0, || stop_and_flush_slot(&slot, "console quit"))
 }
 
+/// End the process on SIGINT (Ctrl-C at the terminal), SIGTERM or SIGHUP the
+/// way `quit` does: stop and flush the machine behind `slot`, then exit with
+/// 128 plus the signal number. Without this the signal's default action ends
+/// the process with nothing flushed: a CHD loses what it took since its last
+/// flush, and an overlay's sector record is left uncompacted.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn exit_on_signal(slot: MachineSlot) {
+    on_exit_signal(move |sig| {
+        // Not eprintln!: on a terminal that has hung up it panics, and a panic
+        // aborts the process before anything is flushed.
+        let _ = writeln!(std::io::stderr(), "iris: signal {sig}: stopping the machine and flushing its disks before exit");
+        exit_process("signal", 128 + sig, || stop_and_flush_slot(&slot, "signal"));
+    });
+}
+
+/// Run `on_signal` once, on a thread of its own, when SIGINT, SIGTERM or
+/// SIGHUP arrives, in place of the default action that ends the process at
+/// once. It is handed the signal number and is expected to end the process
+/// after stopping its machines, as [`exit_on_signal`] does.
+///
+/// A signal the process inherited as ignored stays ignored: `nohup` ignores
+/// SIGHUP, and a shell ignores SIGINT for a background job, so that the
+/// process outlives the terminal.
+///
+/// The handler only writes the signal number to a pipe; the thread reads it
+/// and does the work, since a handler can do almost nothing safely. The
+/// thread puts the default actions back first, so a second Ctrl-C ends a
+/// stop that hangs. A process has one of these: a second call is refused.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn on_exit_signal(on_signal: impl FnOnce(libc::c_int) + Send + 'static) {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    static PIPE: AtomicI32 = AtomicI32::new(-1);
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        eprintln!("iris: the exit-signal handler is already installed; not installing another");
+        return;
+    }
+    let signals = exit_signals_to_catch();
+
+    extern "C" fn handler(sig: libc::c_int) {
+        let byte = sig as u8;
+        // SAFETY: write(2) is async-signal-safe; errno is put back for the
+        // code the signal interrupted.
+        unsafe {
+            let errno = *errno_location();
+            libc::write(PIPE.load(Ordering::Relaxed), &byte as *const u8 as *const libc::c_void, 1);
+            *errno_location() = errno;
+        }
+    }
+
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` is two ints, as pipe(2) needs. Close-on-exec, so no
+    // program iris starts holds the pipe.
+    if unsafe {
+        libc::pipe(fds.as_mut_ptr()) != 0
+            || libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) != 0
+            || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) != 0
+    } {
+        eprintln!("iris: no pipe for the signal handler ({}); a signal will not flush the disks",
+                  std::io::Error::last_os_error());
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    PIPE.store(write_fd, Ordering::Relaxed);
+    let thread_signals = signals.clone();
+    let thread = std::thread::Builder::new().name("iris-signals".into()).spawn(move || {
+        let signals = thread_signals;
+        let mut byte = 0u8;
+        loop {
+            // SAFETY: reads one byte into `byte`.
+            let n = unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+            if n == 1 {
+                break;
+            }
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        for &sig in &signals {
+            // SAFETY: restores a default action.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+        // A hangup means the terminal is gone and its descriptors fail with
+        // EIO, which makes any print from any thread panic, and so abort the
+        // process, part way through the flush. Point them at /dev/null.
+        if libc::c_int::from(byte) == libc::SIGHUP {
+            silence_output(&[1, 2]);
+        }
+        on_signal(libc::c_int::from(byte));
+    });
+    if let Err(e) = thread {
+        eprintln!("iris: no thread for the signal handler ({e}); a signal will not flush the disks");
+        return;
+    }
+    for &sig in &signals {
+        // SAFETY: installs a handler that only calls write(2).
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as *const () as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Point each of `fds` at /dev/null, so writing to it succeeds whatever became
+/// of what it was.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn silence_output(fds: &[libc::c_int]) {
+    // SAFETY: opens /dev/null, duplicates it over each descriptor and closes it.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if null < 0 {
+            return;
+        }
+        for &fd in fds {
+            libc::dup2(null, fd);
+        }
+        libc::close(null);
+    }
+}
+
+/// SIGINT, SIGTERM and SIGHUP, less any this process inherited as ignored.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exit_signals_to_catch() -> Vec<libc::c_int> {
+    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+        .into_iter()
+        .filter(|&sig| {
+            // SAFETY: a null new action only reads the current one.
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
+            old.sa_sigaction != libc::SIG_IGN
+        })
+        .collect()
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn an_inherited_ignored_signal_stays_ignored() {
+    // SAFETY: sets and reads back dispositions; SIGHUP is put back as found.
+    let before = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let caught = exit_signals_to_catch();
+    unsafe { libc::signal(libc::SIGHUP, before) };
+    assert!(!caught.contains(&libc::SIGHUP), "nohup's ignored SIGHUP would end the process");
+    assert!(caught.contains(&libc::SIGTERM));
+}
+
+/// The terminal hangs up: its slave side fails with EIO once the master is
+/// closed, as a stderr that eprintln! would panic on. After `silence_output`
+/// the same descriptor takes writes.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn a_hung_up_terminals_output_is_silenced() {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty fills two descriptors; the rest is plain fd handling.
+    unsafe {
+        assert_eq!(libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), 0);
+        libc::close(master);
+        let put = |fd: libc::c_int| libc::write(fd, b"x".as_ptr().cast(), 1);
+        assert_eq!(put(slave), -1, "a pty with no master should fail the write");
+        silence_output(&[slave]);
+        assert_eq!(put(slave), 1, "the silenced descriptor should take the write");
+        libc::close(slave);
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
 /// How many exits `IRIS_NO_EXIT_ON_POWEROFF` has turned into returns, for the
 /// tests that wait for one.
 #[cfg(test)]

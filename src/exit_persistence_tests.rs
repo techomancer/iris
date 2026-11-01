@@ -3,8 +3,8 @@
 //! A CHD keeps what it has accepted complete on disk only once it is
 //! flushed or dropped (a copy-on-write overlay now records its sectors as they
 //! are written, but compacts that record on a flush), and most ways out of
-//! iris (a guest power-off, `quit`, a window close) end the process without
-//! dropping anything. Each test here builds a whole machine, writes sectors
+//! iris (a guest power-off, `quit`, a window close, a signal) end the process
+//! without dropping anything. Each test here builds a whole machine, writes sectors
 //! through the SCSI bus with WRITE(10), ends the session by one of those ways,
 //! builds the machine again over the same images as the next boot would, and
 //! reads every sector back.
@@ -387,6 +387,9 @@ enum Exit {
     CiQuit,
     /// `quit` typed at the terminal console: the monitor hangs up.
     ConsoleQuit,
+    /// SIGTERM, which is what Ctrl-C at the terminal (SIGINT) or a `kill`
+    /// comes to once `main` has installed its handler.
+    Signal,
     /// `main` returning, which is what closing the window comes to.
     MainReturn,
     /// The machine dropped.
@@ -476,6 +479,13 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             relay.join().unwrap();
             Snapshot::take(dir)
         }
+        Exit::Signal => {
+            workstation::exit_on_signal(m.machine_slot());
+            // SAFETY: raise(3) sends the signal to this process.
+            unsafe { libc::raise(libc::SIGTERM) };
+            wait_for_exit_request(before);
+            Snapshot::take(dir)
+        }
         Exit::MainReturn => {
             let _ = workstation::stop_and_flush(&mut *m, "exit");
             Snapshot::take(dir)
@@ -553,6 +563,13 @@ fn ci_quit() {
 #[test]
 fn console_quit() {
     round_trip(Machine::Indy, &[Exit::ConsoleQuit], false, true)
+}
+
+/// Ctrl-C or `kill` at the terminal. The handler stays installed for the rest
+/// of the test process; nextest gives each test its own.
+#[test]
+fn signal() {
+    round_trip(Machine::Indy, &[Exit::Signal], false, true)
 }
 
 /// `main` returning, and a drop, on a machine that was never started and
@@ -738,6 +755,19 @@ fn no_process_exit_bypasses_the_flush() {
         let n = found.iter().find(|(file, _)| file == f).map_or(0, |(_, n)| *n);
         assert_eq!(n, *max, "{f} ({why}) now has {n} exits, the list says {max}");
     }
+}
+
+/// `main` hands Ctrl-C and `kill` to the handler that flushes, once the
+/// machine is running. The binary cannot be run here, so look for the call.
+#[test]
+fn main_flushes_on_a_signal() {
+    let main = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
+    let code: String = main.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    let started = code.find("machine.start();").expect("main starts the machine");
+    assert!(
+        code[started..].contains("exit_on_signal(machine.machine_slot())"),
+        "main must install the signal handler that flushes the disks"
+    );
 }
 
 /// `main` ends with the stop-and-flush after the window closes. The binary

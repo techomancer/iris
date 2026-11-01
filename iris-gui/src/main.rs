@@ -159,6 +159,9 @@ fn fb_draw_rect(outer: egui::Rect, px: egui::Vec2, ppp: f32, max_scale: f32) -> 
     (egui::Rect::from_min_size(min, egui::vec2(snap(size.x), snap(size.y))), nearest)
 }
 
+/// Set when a signal asked the window to close: see `main`.
+static CLOSE_ON_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() -> eframe::Result<()> {
     env_logger::init();
     // Prevent the iris lib from calling process::exit on guest soft-power-off
@@ -211,6 +214,21 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             cc.egui_ctx.set_zoom_factor(prefs.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX));
+            // A newer iris-gui sends SIGTERM to reclaim its ports (see
+            // single_instance), and Ctrl-C or a closed terminal sends the
+            // others. Close the window as File > Quit does, so `on_exit` stops
+            // the machine and its disks are flushed, instead of dying at once.
+            // The close skips the CHD fold, which can outlast the newer
+            // instance's patience; the diff is folded on a later quit.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let ctx = cc.egui_ctx.clone();
+                iris::workstation::on_exit_signal(move |_| {
+                    CLOSE_ON_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    ctx.request_repaint();
+                });
+            }
             Ok(Box::new(App::new(prefs)))
         }),
     )
@@ -3219,7 +3237,8 @@ impl eframe::App for App {
         // Evt::SyncDone. `sync_then_close` latches so we don't re-intercept the
         // final close (by then the machine is gone and chd_sync_pending is stale).
         if ctx.input(|i| i.viewport().close_requested()) {
-            if !self.sync_then_close && self.emu.has_pending_chd_sync() {
+            let on_signal = CLOSE_ON_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+            if !on_signal && !self.sync_then_close && self.emu.has_pending_chd_sync() {
                 self.sync_then_close = true;
                 self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
                 self.emu.send(Cmd::SyncDisks);
