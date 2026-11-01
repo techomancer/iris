@@ -721,7 +721,7 @@ fn no_process_exit_bypasses_the_flush() {
         // The bare-metal test device ends the run with the guest's exit code.
         ("dev/testdev.rs", 1, "bare-metal test device, a harness only"),
         // Command-line and configuration front ends: nothing is running yet.
-        ("config.rs", 7, "command-line and configuration errors, and the --validate result"),
+        ("config.rs", 9, "command-line and configuration errors, the --validate result and --machine"),
         ("iris_ci_main.rs", 1, "the iris-ci client"),
         ("crash_diag.rs", 1, "fatal-signal handler: the process is already dying"),
     ];

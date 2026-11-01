@@ -135,6 +135,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
 
+### Choosing the machine on the command line
+
+- **`iris --machine NAME`** picks the machine to emulate by its `[machine] profile`
+  name and overrides the config file; `--machine help` lists the names and what
+  each is. `--ip22` is now another way to write `--machine indigo2_ip22`.
+  `--validate` judges the machine chosen.
+
 ### Checking a configuration
 
 - **`iris --validate --config FILE`** parses and validates a configuration and

@@ -655,6 +655,40 @@ impl MachineProfile {
         }
     }
 
+    /// Every profile, in the order `workstation::build` lists them. `ALL` is
+    /// only the ones the GUI offers.
+    pub const EVERY: [Self; 5] = [
+        Self::IndyIp24,
+        Self::Indigo2Ip22,
+        Self::Indigo2Ip28,
+        Self::O2Ip32,
+        Self::OctaneIp30,
+    ];
+
+    /// The name `[machine] profile` and `--machine` give this profile.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::IndyIp24 => "indy_ip24",
+            Self::Indigo2Ip22 => "indigo2_ip22",
+            Self::Indigo2Ip28 => "indigo2_ip28",
+            Self::O2Ip32 => "o2_ip32",
+            Self::OctaneIp30 => "octane_ip30",
+        }
+    }
+
+    /// The profile `name` names, or an error that lists the valid names.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        Self::EVERY.into_iter().find(|p| p.name() == name).ok_or_else(|| {
+            let valid: Vec<_> = Self::EVERY.iter().map(|p| p.name()).collect();
+            format!("unknown machine \"{name}\" (valid: {})", valid.join(", "))
+        })
+    }
+
+    /// What `--machine help` prints: a line per profile, its name and what it is.
+    pub fn list() -> String {
+        Self::EVERY.iter().map(|p| format!("{:<14}{}\n", p.name(), p.label())).collect()
+    }
+
     /// The processors fitted at most: two on the Octane, one elsewhere.
     pub fn max_cpus(self) -> u8 {
         if self == Self::OctaneIp30 { 2 } else { 1 }
@@ -2546,9 +2580,13 @@ pub struct Cli {
     #[arg(long)]
     pub prom: Option<String>,
 
-    /// Emulate an SGI Indigo2 (IP22) instead of the default Indy (IP24).
-    /// Overrides `[machine].profile` in the config file.
-    #[arg(long, default_value_t = false)]
+    /// The machine to emulate: a `[machine] profile` name such as
+    /// `octane_ip30`. Overrides the config file. `--machine help` lists them.
+    #[arg(long, value_name = "NAME")]
+    pub machine: Option<String>,
+
+    /// Same as `--machine indigo2_ip22`.
+    #[arg(long, default_value_t = false, hide = true, conflicts_with = "machine")]
     pub ip22: bool,
 
     /// Path to NVRAM file (default: nvram.bin in cwd)
@@ -2823,8 +2861,15 @@ pub struct Cli {
 impl Cli {
     /// Merge CLI overrides into a base `MachineConfig`.
     pub fn apply(&self, mut cfg: MachineConfig) -> MachineConfig {
-        if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
+        // First, so the options after it and `--validate` see the machine chosen.
+        if let Some(name) = &self.machine {
+            cfg.machine.profile = MachineProfile::from_name(name).unwrap_or_else(|e| {
+                eprintln!("iris: --machine: {e}");
+                std::process::exit(1);
+            });
+        }
         if self.ip22 { cfg.machine.profile = MachineProfile::Indigo2Ip22; }
+        if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
         if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
         if let Some(p) = &self.nveeprom { cfg.nveeprom = p.clone(); }
         if let Some(v) = self.bank0    { cfg.banks[0] = v; }
@@ -2961,6 +3006,11 @@ pub fn load_config() -> (MachineConfig, u32) {
     if cli.config != DEFAULT_CONFIG && !std::path::Path::new(&cli.config).exists() {
         eprintln!("Configuration error: --config {} does not exist", cli.config);
         std::process::exit(1);
+    }
+
+    if cli.machine.as_deref() == Some("help") {
+        print!("{}", MachineProfile::list());
+        std::process::exit(0);
     }
 
     if cli.validate {
@@ -3357,6 +3407,39 @@ mod export_tests {
         assert_eq!(prom_file_if("custom.bin", "rel.bin", |_| false), "custom.bin");
         assert_eq!(MachineProfile::OctaneIp30.prom_path("custom.bin"), "custom.bin");
         assert_eq!(MachineProfile::IndyIp24.prom_path(DEFAULT_PROM), DEFAULT_PROM);
+    }
+
+    /// `--machine` picks the profile, ahead of the config file's and of the
+    /// options after it; `--ip22` is the same as `--machine indigo2_ip22`; a
+    /// name that is not a profile lists the valid ones; `help` lists them with
+    /// what each is.
+    #[test]
+    fn machine_picks_the_profile() {
+        let apply = |args: &[&str]| {
+            let mut a = vec!["iris"];
+            a.extend_from_slice(args);
+            Cli::parse_from(a).apply(toml::from_str("[machine]\nprofile = \"o2_ip32\"\ncpu = \"r10000\"").unwrap())
+        };
+        assert_eq!(apply(&[]).machine.profile, MachineProfile::O2Ip32);
+        assert_eq!(apply(&["--machine", "octane_ip30"]).machine.profile, MachineProfile::OctaneIp30);
+        assert_eq!(apply(&["--ip22"]).machine.profile, MachineProfile::Indigo2Ip22);
+        assert!(Cli::try_parse_from(["iris", "--ip22", "--machine", "o2_ip32"]).is_err());
+        let e = MachineProfile::from_name("vax").unwrap_err();
+        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30)");
+        let list = MachineProfile::list();
+        assert_eq!(list.lines().count(), MachineProfile::EVERY.len());
+        assert!(list.starts_with("indy_ip24     SGI Indy (IP24)\n"), "{list}");
+        // Every name is what a config file calls the profile, and every
+        // variant is listed (a new one breaks the match).
+        for p in MachineProfile::EVERY {
+            match p {
+                MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28
+                | MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 => {}
+            }
+            let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"{}\"", p.name())).unwrap();
+            assert_eq!(cfg.machine.profile, p);
+            assert_eq!(MachineProfile::from_name(p.name()), Ok(p));
+        }
     }
 
     /// A profile says which processors and counts it accepts, and `validate()`
