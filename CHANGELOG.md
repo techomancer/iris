@@ -720,6 +720,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Networking
 
+- **Bulk receive on the Indy no longer resets the interface.** The emulated
+  network can deliver frames far faster than IRIX re-arms its receive ring.
+  When the ring ran out in the middle of IRIX's interrupt handler, IRIX reset
+  the Ethernet and every frame in the ring was lost. Frames for the guest now
+  wait in iris while the next one would end a ring the driver has not finished
+  reaping, and flow as soon as it re-arms it (`[network] rx_hold`, on by
+  default). Frames that reach a receive channel that has stopped are lost, as
+  on the wire, and are not delivered after a restart.
 - **The Indy's HPC3 hands a filled Ethernet descriptor back before its channel
   stops.** It stopped first and wrote the descriptor back a moment later, so a
   driver that saw it stopped could restart it on the descriptor it had just

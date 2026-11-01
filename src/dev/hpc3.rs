@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::fs::File;
 use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
-use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, RxRoom, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
 use crate::config::{AudioConfig, NetworkConfig, RtcOffset};
 use crate::dev::eeprom_93c56::Eeprom93c56;
@@ -373,6 +373,9 @@ struct PdmaChannel {
     // On fetch: if true, promote cpfxbdp→ppfxbdp and set cpfxbdp=nbdp, then clear.
     // Set back to true when an EOXP descriptor's transfer completes.
     tx_new_packet: bool,
+    /// RX: descriptors the channel has written back, oldest first, until the
+    /// driver re-arms them (see `rx_room`). Bounded by the largest ring.
+    rx_filled: std::collections::VecDeque<u32>,
     // RX: last value returned from ENET_RX_CTRL read — suppress repeated debug prints
     last_rx_ctrl:  u32,
 }
@@ -404,7 +407,7 @@ impl PdmaChannel {
             reads_at_poll: 0,
             last_poll: None,
             width_16: false,
-            crbdp: 0, cpfxbdp: 0, ppfxbdp: 0, tx_new_packet: true, last_rx_ctrl: 0xFFFFFFFF,
+            crbdp: 0, cpfxbdp: 0, ppfxbdp: 0, tx_new_packet: true, rx_filled: std::collections::VecDeque::new(), last_rx_ctrl: 0xFFFFFFFF,
         }
     }
 
@@ -507,6 +510,24 @@ fn start_transaction(&mut self) {
                 break; // No memory attached
             }
         }
+    }
+
+    /// RX: what the channel can take now, for the SEEQ's host-side hold.
+    ///
+    /// A frame that would fill the descriptor carrying EOX (read from memory)
+    /// stops the channel. If the driver still has filled descriptors to reap,
+    /// it is about to re-arm them and move EOX on, and a stop now can land in
+    /// the middle of its interrupt pass, where IRIX takes a stop for one it
+    /// did not expect and resets the interface. A descriptor counts as reaped
+    /// once its bit 14 is set again, which is how every driver re-arms one.
+    fn rx_room(&mut self) -> RxRoom {
+        if !self.is_active() { return RxRoom::Stopped; }
+        let Some(mem) = self.sys_mem.as_ref() else { return RxRoom::Room };
+        let word1 = |d: u32| mem.read32((d + PDMA_DESC_BC_OFFSET) as u64).data;
+        if word1(self.crbdp) & PDMA_DESC_EOX == 0 { return RxRoom::Room; }
+        let current = self.crbdp;
+        self.rx_filled.retain(|&d| d != current && word1(d) & PDMA_DESC_ROWN == 0);
+        if self.rx_filled.is_empty() { RxRoom::Room } else { RxRoom::Last }
     }
 
     fn get_name(&self) -> String {
@@ -729,6 +750,8 @@ fn start_transaction(&mut self) {
                 if let Some(mem) = &self.sys_mem {
                     mem.write16((self.crbdp + 6) as u64, rem);
                 }
+                if self.rx_filled.len() == RX_FILLED_MAX { self.rx_filled.pop_front(); }
+                self.rx_filled.push_back(self.crbdp);
             }
             bc_done = true;
         }
@@ -807,6 +830,10 @@ impl DmaClient for PdmaClientImpl {
     }
     fn write(&self, val: u32, eop: bool) -> DmaStatus {
         self.channel.lock().dma_write(val, eop)
+    }
+    fn rx_room(&self) -> RxRoom {
+        let mut c = self.channel.lock();
+        if c.id == HPC3_PDMA_CHAN_ENET_RX as usize { c.rx_room() } else { RxRoom::Room }
     }
     fn overflow(&self) {
         let mut c = self.channel.lock();
@@ -976,6 +1003,10 @@ impl PdmaChannelOps for ScsiDmaOps {
 
 // TX descriptor done flag (BC_TXD): written to cpfxbdp+6 on successful TX
 const ENET_BC_TXD: u16 = 0x8000;
+// RX: the most descriptors `rx_filled` remembers. The drivers' rings are at
+// most 64 long. It is not saved in snapshots: after a load it only makes the
+// first `Last` answer lax.
+const RX_FILLED_MAX: usize = 64;
 // BC register bit 28: HPC3 has sampled EOX from the current descriptor
 const ENET_BC_EOX_SAMPLED: u32 = 0x10000000;
 
@@ -999,6 +1030,9 @@ impl PdmaChannelOps for EnetRxDmaOps {
                 // and no driver clears it explicitly, so only the read keeps a
                 // driver from seeing it, and its interrupt, forever.
                 chan.ctrl &= !ENET_RX_CTRL_RBO;
+                // Drivers read this after re-arming their ring: a frame the
+                // SEEQ holds for room may now fit.
+                if let Some(s) = self.seeq.get() { s.kick_if_holding(); }
                 if val != chan.last_rx_ctrl {
                     dlog_dev!(LogModule::Hpc3, "PDMA[{}]: ENET_RX_CTRL read → {:08x} (ctrl={:08x} active={} seeq_st={:02x})",
                         chan.id, val, chan.ctrl, chan.is_active(), seeq_st);
@@ -2243,6 +2277,7 @@ impl Resettable for Hpc3 {
             chan.cpfxbdp = 0;
             chan.ppfxbdp = 0;
             chan.tx_new_packet = true;
+            chan.rx_filled.clear();
             chan.last_rx_ctrl = 0xFFFFFFFF;
             chan.transaction_id = 0;
             chan.bytes_transferred = 0;
@@ -2772,6 +2807,60 @@ mod enet_rx_chain_tests {
         assert_eq!(hpc3.read32(reg(ENET_RX_BASE + ENET_RX_CTRL)).data & ENET_RX_CTRL_OFLOW, ENET_RX_CTRL_OFLOW);
         assert_eq!(word1(&ram, 2), ARMED);
         assert_eq!(word1(&ram, 3), ARMED | PDMA_DESC_EOX);
+    }
+
+    /// The receive hold's view of the ring: room while the next descriptor
+    /// does not end the chain; the last descriptor withheld while the driver
+    /// still has filled descriptors to reap; room again once it has re-armed
+    /// them (bit 14 set), even if it left EOX where it was.
+    #[test]
+    fn rx_room_withholds_the_last_descriptor_until_the_driver_catches_up() {
+        let (hpc3, ram) = ring(4, 2);
+        let rx = PdmaClientImpl { channel: hpc3.pdma_channels[10].clone() };
+        assert_eq!(rx.rx_room(), RxRoom::Room);
+        deliver(&hpc3, 60, 1);
+        deliver(&hpc3, 60, 2);
+        assert_eq!(rx.rx_room(), RxRoom::Last);
+        ram.write32((desc(0) + 4) as u64, ARMED);
+        assert_eq!(rx.rx_room(), RxRoom::Last, "one filled descriptor is still to be reaped");
+        ram.write32((desc(1) + 4) as u64, ARMED);
+        assert_eq!(rx.rx_room(), RxRoom::Room);
+        deliver(&hpc3, 60, 3);
+        assert_eq!(rx.rx_room(), RxRoom::Stopped);
+    }
+
+    /// A ring of one descriptor always has room for its one frame: nothing
+    /// else is there for the driver to reap first. After the frame the channel
+    /// is stopped. The driver restarts it on the same descriptor without
+    /// re-arming it (bit 14 still clear): that descriptor is the one the next
+    /// frame fills, not one left to reap, so there is room, not `Last`.
+    #[test]
+    fn rx_room_on_a_one_descriptor_ring() {
+        let (hpc3, _ram) = ring(1, 0);
+        let rx = PdmaClientImpl { channel: hpc3.pdma_channels[10].clone() };
+        assert_eq!(rx.rx_room(), RxRoom::Room);
+        deliver(&hpc3, 60, 1);
+        assert_eq!(rx.rx_room(), RxRoom::Stopped);
+        hpc3.write32(reg(ENET_RX_BASE + ENET_RX_NBDP), desc(0));
+        hpc3.write32(reg(ENET_RX_BASE + ENET_RX_CTRL), ENET_RX_CTRL_ACTIVE);
+        assert_eq!(rx.rx_room(), RxRoom::Room);
+    }
+
+    /// A driver's read of the receive control register, which it does after
+    /// re-arming, wakes a SEEQ that is holding a frame for room, and only
+    /// then.
+    #[test]
+    fn a_receive_control_read_wakes_a_holding_seeq() {
+        let (hpc3, _ram) = ring(2, 1);
+        let (link, _sent, _inject) = crate::net::Link::loopback();
+        let wake = link.rx_wake();
+        hpc3.seeq().attach(link);
+        let ctrl = reg(ENET_RX_BASE + ENET_RX_CTRL);
+        hpc3.read32(ctrl);
+        assert!(!wake.consume(), "woke a SEEQ that was not holding");
+        hpc3.seeq().hold_for_test();
+        hpc3.read32(ctrl);
+        assert!(wake.consume(), "the read did not wake the holding SEEQ");
     }
 
     /// Bit 14 of word 1 is the drivers' ownership flag, not the channel's:

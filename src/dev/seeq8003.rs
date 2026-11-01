@@ -21,7 +21,7 @@ use std::time::Duration;
 
 
 use crate::net::{eth_summary, mac_str, GatewayConfig, Link, NatControl, Rings};
-use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, RxRoom, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 
 // ── Register offsets (A2:A0) ──────────────────────────────────────────────────
@@ -148,6 +148,10 @@ pub struct SeeqState {
     rx_disabled: u64,
     /// Receive FIFO overflows: frames cut off because the channel stopped.
     rx_overflows: u64,
+    /// Receive hold (see `RX_HOLD_LAST_MAX`): how often a frame was held for
+    /// room, and how often a hold ran out.
+    rx_holds: u64,
+    rx_hold_timeouts: u64,
     /// Monotonic lock counter — incremented on every mutex acquisition.
     /// Prefix all debug messages with this to correlate across threads.
     pub ts:       u32,
@@ -164,6 +168,27 @@ const CHAN_CAPACITY: usize = 256;
 // guest's own frames. Bounded so TX and interrupt servicing still run.
 const RX_DRAIN_CAP: usize = 256;
 
+// ── Receive hold (host side; a model choice, not hardware behaviour) ─────────
+//
+// On the wire, a frame that reaches the SEEQ while HPC3's receive channel is
+// stopped is lost (inferred, strong, from the HPC3 and SEEQ documents: nothing
+// can hold a frame across a stopped channel). The emulated network's far end
+// has no wire rate, so it can deliver a burst far faster than a guest re-arms
+// its ring, and IRIX answers a ring the channel overran in the middle of its
+// interrupt pass by resetting the interface and losing every frame in it.
+//
+// So, unless `[network] rx_hold = false`, frames for the guest wait in the
+// link's ring, off the virtual wire, while the next frame would fill the
+// descriptor that ends the chain although the driver still has frames to reap
+// and is about to move the end on. Nothing is paced: frames flow as fast as
+// descriptors free up. A frame that reaches a channel that is already stopped
+// is not held: the hardware loses it, and a held one would reach the guest
+// after a restart or reinit. A hold gives up after this long, for a driver
+// that has reaped everything it will but left the end where it is (no
+// buffers): the frame then fills it and the channel stops where the driver
+// expects. A driver that stays out of buffers pays this once per restart.
+const RX_HOLD_LAST_MAX: Duration = Duration::from_millis(100);
+
 // ── Main device struct ────────────────────────────────────────────────────────
 pub struct Seeq8003 {
     state:    Arc<Mutex<SeeqState>>,
@@ -173,6 +198,11 @@ pub struct Seeq8003 {
     rx_dma:   Option<Arc<dyn DmaClient>>,
     tx_dma:   Option<Arc<dyn DmaClient>>,
     in_reset: Arc<AtomicBool>, // CH_RESET edge — lock-free check in pump thread
+    /// The enet thread is holding a frame for room (see `RX_HOLD_LAST_MAX`).
+    rx_holding: Arc<AtomicBool>,
+    /// How long a hold lasts before the frame goes in (`RX_HOLD_LAST_MAX`;
+    /// tests shorten it).
+    hold_last_max: Duration,
     config:   GatewayConfig,
     running:  Arc<AtomicBool>,
     /// The network backend: see [`Net`].
@@ -225,6 +255,8 @@ enum RxPumpResult {
     /// The channel stopped part way through the frame for no reason of its
     /// own (no buffer overflow): the SEEQ's receive FIFO was not drained.
     Overflowed,
+    /// Held off the wire for room (host side): the frame stays in the ring.
+    Held,
 }
 
 // ── Seeq8003 ─────────────────────────────────────────────────────────────────
@@ -260,10 +292,14 @@ impl Seeq8003 {
                 rx_filtered: 0,
                 rx_disabled: 0,
                 rx_overflows: 0,
+                rx_holds: 0,
+                rx_hold_timeouts: 0,
                 ts:           0,
             })),
             irq, rx_dma, tx_dma,
             in_reset: Arc::new(AtomicBool::new(false)),
+            rx_holding: Arc::new(AtomicBool::new(false)),
+            hold_last_max: RX_HOLD_LAST_MAX,
             config,
             running:  Arc::new(AtomicBool::new(false)),
             net:      Mutex::new(Net { next: None, live: None, rx_wake: None, frames: None, nat: NatControl::new() }),
@@ -399,7 +435,9 @@ impl Seeq8003 {
                rx_cons: &mut rtrb::Consumer<Vec<u8>>,
                rx_cmd_snap: u8,
                station_addr_snap: [u8; 6],
-               in_reset: &Arc<AtomicBool>) -> RxPumpResult {
+               in_reset: &Arc<AtomicBool>,
+               hold: bool,
+               hold_last: bool) -> RxPumpResult {
         let frame = match rx_cons.peek() {
             Ok(f) => f,
             Err(_) => return RxPumpResult::Nothing,
@@ -412,6 +450,12 @@ impl Seeq8003 {
             let _ = rx_cons.pop(); // discard filtered frame
             crate::pf_instant!(crate::perfetto::events::ENET_RX_FILTERED);
             return RxPumpResult::Filtered;
+        }
+
+        // Only the last descriptor is worth waiting for. A stopped channel
+        // loses the frame, as the hardware does.
+        if hold && hold_last && rx_dma.rx_room() == RxRoom::Last {
+            return RxPumpResult::Held;
         }
 
         dlog_dev!(LogModule::Seeq, "SEEQ RX {} → guest DMA", eth_summary(frame));
@@ -505,6 +549,21 @@ impl Seeq8003 {
     /// Call this when the RX DMA channel is activated so queued frames aren't lost.
     pub fn kick_rx(&self) {
         self.kick_enet();
+    }
+
+    /// Wake the enet thread if it is holding a frame for room: the guest has
+    /// done something (read the receive control register, as drivers do after
+    /// re-arming) that may have made some.
+    pub fn kick_if_holding(&self) {
+        if self.rx_holding.load(Ordering::Relaxed) {
+            self.kick_enet();
+        }
+    }
+
+    /// Pretend the enet thread is holding a frame, for tests of what wakes it.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) {
+        self.rx_holding.store(true, Ordering::Relaxed);
     }
 
     fn kick_enet(&self) {
@@ -670,6 +729,9 @@ impl Device for Seeq8003 {
         let state_enet    = self.state.clone();
         let irq      = self.irq.clone();
         let heartbeat_enet = self.heartbeat.clone();
+        let rx_holding    = self.rx_holding.clone();
+        let hold          = self.config.rx_hold;
+        let hold_last_max = self.hold_last_max;
         thread::Builder::new().name("seeq-enet".into()).spawn(move || {
             let mut tx_prod = tx_prod;
             let mut rx_cons = rx_cons;
@@ -689,6 +751,8 @@ impl Device for Seeq8003 {
             // to 1ms, so bursts still drain at speed.
             const ENET_POLL_MAX: Duration = Duration::from_millis(50);
             let mut poll = Duration::from_millis(1);
+            // When the frame now held on the last descriptor was first held.
+            let mut held_last_since: Option<std::time::Instant> = None;
             while running_enet.load(Ordering::Relaxed) {
                 let mut notified = false;
                 // Wait for an RX frame from NAT (or a TX kick), or the poll
@@ -721,7 +785,8 @@ impl Device for Seeq8003 {
                 let rx_result = if let Some(ref dma) = rx_dma {
                     let mut r = RxPumpResult::Nothing;
                     for _ in 0..RX_DRAIN_CAP {
-                        match Self::pump_rx(dma, &mut rx_cons, rx_cmd_snap, station_addr_snap, &in_reset_enet) {
+                        let hold_last = held_last_since.map_or(true, |t| t.elapsed() < hold_last_max);
+                        match Self::pump_rx(dma, &mut rx_cons, rx_cmd_snap, station_addr_snap, &in_reset_enet, hold, hold_last) {
                             RxPumpResult::Filtered => { filtered += 1; continue }   // chatter discarded; keep draining
                             other => { r = other; break; }        // Delivered / Lost / Held / Nothing
                         }
@@ -754,7 +819,18 @@ impl Device for Seeq8003 {
                     TxPumpResult::Nothing => {}
                 }
 
-                let rx_activity = !matches!(rx_result, RxPumpResult::Nothing);
+                let held = matches!(rx_result, RxPumpResult::Held);
+                if !held {
+                    if let Some(t) = held_last_since.take() {
+                        st.rx_hold_timeouts += (t.elapsed() >= hold_last_max) as u64;
+                    }
+                }
+                if held && !rx_holding.swap(true, Ordering::Relaxed) {
+                    st.rx_holds += 1;
+                } else if !held {
+                    rx_holding.store(false, Ordering::Relaxed);
+                }
+                let rx_activity = !matches!(rx_result, RxPumpResult::Nothing | RxPumpResult::Held);
                 let rx_moved = matches!(rx_result, RxPumpResult::Delivered { .. } | RxPumpResult::Truncated { .. } | RxPumpResult::Lost);
                 match rx_result {
                     RxPumpResult::Delivered { dma_irq: irq, frame_len } => {
@@ -771,6 +847,9 @@ impl Device for Seeq8003 {
                     RxPumpResult::Overflowed => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX FIFO overflow: the channel stopped mid-frame", st.ts);
                         Self::load_rx_overflow(&mut st);
+                    }
+                    RxPumpResult::Held => {
+                        held_last_since.get_or_insert_with(std::time::Instant::now);
                     }
                     RxPumpResult::Lost => {
                         st.rx_lost += 1;
@@ -791,7 +870,9 @@ impl Device for Seeq8003 {
                 busy = tx_moved || rx_moved;
                 // Idle-poll backoff (see the wait above): reset while the
                 // guest or the network is active, grow while idle.
-                if notified || did_something {
+                // While holding, poll at the floor: the guest makes room by
+                // writing descriptors in memory, which wakes nobody.
+                if notified || did_something || held {
                     poll = Duration::from_millis(1);
                 } else if poll < ENET_POLL_MAX {
                     poll = (poll * 2).min(ENET_POLL_MAX);
@@ -840,6 +921,7 @@ impl Device for Seeq8003 {
                         writeln!(w, "intpend={} rx_delivered={} rx_lost={} rx_truncated={} rx_nothing={}",
                                  st.intpend, st.rx_delivered, st.rx_lost, st.rx_truncated, st.rx_nothing).ok();
                         writeln!(w, "rx_filtered={} (receiver off: {}) rx_overflows={}", st.rx_filtered, st.rx_disabled, st.rx_overflows).ok();
+                        writeln!(w, "rx_hold={} rx_holds={} rx_hold_timeouts={}", self.config.rx_hold, st.rx_holds, st.rx_hold_timeouts).ok();
                         writeln!(w, "rx_cmd={:#04x} rx_stat={:#04x} tx_cmd={:#04x} tx_stat={:#04x}",
                                  st.rx_cmd, st.rx_stat, st.tx_cmd, st.tx_stat).ok();
                         writeln!(w, "threads: {}", if self.is_running() { "running" } else { "stopped" }).ok();
@@ -1022,16 +1104,26 @@ mod tests {
     /// A receive channel that takes every frame and counts them, unless
     /// stopped. It can also be told to fail part way through a frame, and
     /// `chan` stands in for the real channel's lock.
-    #[derive(Default)]
     struct Ring {
         filled: Mutex<usize>,
         stopped: Mutex<bool>,
+        /// What `rx_room` says while not stopped.
+        room: Mutex<RxRoom>,
         /// After this many writes, the first write returns `.1` and every
         /// later one `.2`.
         fault: Mutex<Option<(usize, u32, u32)>>,
         writes: Mutex<usize>,
         overflows: Mutex<usize>,
         chan: Mutex<()>,
+    }
+
+    impl Default for Ring {
+        fn default() -> Self {
+            Self {
+                filled: Mutex::new(0), stopped: Mutex::new(false), room: Mutex::new(RxRoom::Room),
+                fault: Mutex::new(None), writes: Mutex::new(0), overflows: Mutex::new(0), chan: Mutex::new(()),
+            }
+        }
     }
 
     impl DmaClient for Ring {
@@ -1045,6 +1137,9 @@ mod tests {
             }
             if eop { *self.filled.lock() += 1; }
             DmaStatus::ok()
+        }
+        fn rx_room(&self) -> RxRoom {
+            if *self.stopped.lock() { RxRoom::Stopped } else { *self.room.lock() }
         }
         fn overflow(&self) {
             let _chan = self.chan.lock();
@@ -1091,9 +1186,44 @@ mod tests {
         assert_eq!((st.rx_filtered, st.rx_disabled, *ring.filled.lock()), (3, 3, 0));
     }
 
+    /// Frames wait off the wire while the next one would end the ring, and
+    /// all arrive once it has room. The enet thread is woken by a control
+    /// register read (`kick_if_holding`), not by a poll.
+    #[test]
+    fn frames_wait_off_the_wire_while_the_ring_is_about_to_end() {
+        let ring = Arc::new(Ring::default());
+        *ring.room.lock() = RxRoom::Last;
+        let (seeq, mut inject, wake) = running(&ring, rx_cmd::MATCH_STA_BCAST);
+        for _ in 0..3 {
+            inject.push(vec![0xff; 60]).unwrap();
+        }
+        wake.notify();
+        wait_for("the hold", || seeq.state.lock().rx_holds > 0);
+        assert_eq!((inject.slots(), *ring.filled.lock()), (CHAN_CAPACITY - 3, 0), "frames left the ring while held");
+        *ring.room.lock() = RxRoom::Room;
+        seeq.kick_if_holding();
+        wait_for("the frames", || *ring.filled.lock() == 3);
+        seeq.stop();
+        assert_eq!(seeq.state.lock().rx_hold_timeouts, 0);
+    }
+
+    /// A frame that reaches a stopped channel is lost, not held across a
+    /// restart, whether or not the hold is on.
+    #[test]
+    fn a_stopped_channel_is_not_waited_for() {
+        let ring = Arc::new(Ring::default());
+        *ring.stopped.lock() = true;
+        let (seeq, mut inject, wake) = running(&ring, rx_cmd::MATCH_STA_BCAST);
+        inject.push(vec![0xff; 60]).unwrap();
+        wake.notify();
+        wait_for("the frame to be lost", || seeq.state.lock().rx_lost == 1);
+        seeq.stop();
+        assert_eq!(seeq.state.lock().rx_holds, 0);
+    }
+
     /// Frames that reach a stopped receive channel are lost, not queued: three
-    /// frames sent while it is stopped never arrive, and the next one after it
-    /// restarts does.
+    /// frames sent while it is stopped never arrive, and
+    /// the next one after it restarts does.
     #[test]
     fn frames_reaching_a_stopped_channel_are_lost() {
         let ring = Arc::new(Ring::default());
@@ -1167,5 +1297,27 @@ mod tests {
         seeq.write(SEEQ_RX_REG, rx_cmd::MATCH_STA_BCAST | rx_cmd::INTOVERFLOW);
         seeq.rx_overflow();
         assert_eq!(seeq.get_rx_status(), rx_stat::OVERFLOW);
+    }
+
+    /// A hold gives up after `hold_last_max`, so a driver that leaves the
+    /// end of its ring in place still gets the frame.
+    #[test]
+    fn a_hold_on_the_last_descriptor_gives_up() {
+        let ring = Arc::new(Ring::default());
+        *ring.room.lock() = RxRoom::Last;
+        let mut seeq = Seeq8003::new(None, Some(ring.clone()), None, Arc::new(AtomicU64::new(0)));
+        seeq.hold_last_max = Duration::ZERO;
+        let seeq = Arc::new(seeq);
+        seeq.write(SEEQ_RX_REG, rx_cmd::MATCH_STA_BCAST);
+        let (link, _sent, mut inject) = Link::loopback();
+        let wake = link.rx_wake();
+        seeq.attach(link);
+        inject.push(vec![0xff; 60]).unwrap();
+        seeq.start();
+        wake.notify();
+        wait_for("the held frame to go", || *ring.filled.lock() == 1);
+        wait_for("the timeout to be counted", || seeq.state.lock().rx_hold_timeouts == 1);
+        seeq.stop();
+        assert_eq!(seeq.state.lock().rx_holds, 1);
     }
 }

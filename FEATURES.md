@@ -215,6 +215,7 @@ An explicit non-disk kind takes precedence over the legacy cdrom flag.
 | `network.mac` | `08:00:69:12:34:56 when unset` | ec0 MAC; injected only into blank PROM battery-backed MAC slots. |
 | `network.tftp_dir` | `unset` | Read-only TFTP root at the NAT gateway for PROM network boot. |
 | `network.rsh_dir` | `unset` | Root for the built-in rsh server at the NAT gateway (TCP 514): `rsh <gateway> cat\|dd\|ls\|echo\|pwd`, read-only, nothing runs on the host. |
+| `network.rx_hold` | `true` | Indy: frames for the guest wait in iris, off the virtual wire, while the next one would fill the last descriptor of its receive ring before the driver has reaped the filled ones, and for at most 100 ms. A frame that reaches a stopped receive channel is lost either way, as on the wire. `false` never waits. |
 
 ### [nfs]
 

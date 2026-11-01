@@ -362,6 +362,8 @@ pub struct NetworkConfig {
     /// Directory served read-only by the gateway's built-in rsh server (TCP
     /// 514). None (the default) disables it.
     pub rsh_dir: Option<std::path::PathBuf>,
+    /// Hold frames for the guest while its receive ring is about to end (Indy).
+    pub rx_hold: bool,
 }
 
 impl Default for NetworkConfig {
@@ -375,6 +377,7 @@ impl Default for NetworkConfig {
             nfs_pcap_ip: None,
             tftp_dir: None,
             rsh_dir: None,
+            rx_hold: true,
             mac: DEFAULT_MAC,
         }
     }
@@ -418,6 +421,12 @@ pub struct NetworkSection {
     /// executed on the host. Unset disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rsh_dir: Option<String>,
+    /// Indy: hold frames for the guest in the emulator while the next one
+    /// would end its receive ring before the driver has reaped the filled
+    /// descriptors, instead of letting the channel stop in the middle of the
+    /// driver's interrupt pass. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_hold: Option<bool>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -2212,6 +2221,7 @@ impl MachineConfig {
             mac,
             tftp_dir:     self.network.tftp_dir.as_ref().map(std::path::PathBuf::from),
             rsh_dir:      self.network.rsh_dir.as_ref().map(std::path::PathBuf::from),
+            rx_hold:      self.network.rx_hold.unwrap_or(true),
         }
     }
 

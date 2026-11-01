@@ -283,6 +283,23 @@ pub trait DmaClient: Send + Sync {
     /// FIFO filled before the channel drained it). A channel that stops on
     /// that condition stops here.
     fn overflow(&self) {}
+    /// Whether a receive channel can take a frame now; see [`RxRoom`].
+    fn rx_room(&self) -> RxRoom { RxRoom::Room }
+}
+
+/// What a receive channel can take now. The emulator's host side uses it to
+/// hold frames off the virtual wire rather than lose them, which is a choice
+/// of the model, not hardware behaviour (see the SEEQ's receive hold).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RxRoom {
+    /// A frame now lands in a descriptor and the channel carries on.
+    Room,
+    /// The channel is stopped: a frame now is lost, as on the wire. The hold
+    /// does not wait for it.
+    Stopped,
+    /// A frame now fills the descriptor that ends the chain, stopping the
+    /// channel, while the driver still has filled descriptors to reap.
+    Last,
 }
 
 /// Asynchronous system-level events sent from devices to the machine event loop.
