@@ -22,3 +22,4 @@ flash    = "octane-flash.bin"  # keep the PROM's flash records between runs (opt
 [scsi.1]                       # id 1 on the internal bus, where IRIX expects its disk
 path    = "irix6530.raw"
 overlay = true
+# write_cache = false             # default true. false stores every write before it completes, like SGI's drives (slower); true can lose ~5 s of writes in a host crash. See STORAGE.md

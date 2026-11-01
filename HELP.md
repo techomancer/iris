@@ -643,6 +643,8 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 path    = "scsi1.raw"       # raw or .chd image
 cdrom   = false
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
+# write_cache = true        # the disk's write cache (default true). true: a write completes once the host has it and a sync follows within ~5 s, so a host crash or
+                            # power cut can lose the last ~5 s of writes. false: every write is stored on the host's disk before it completes, as on SGI's drives (slower). See STORAGE.md.
 # controller = 0            # Indigo2 and O2 have two: 0 or 1 (the O2's 1 is its external bus); or write [scsi.17]
 
 # A CD-ROM. path may be empty to start with an empty tray.
@@ -766,6 +768,7 @@ Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
   --cdrom4/5/6 <FILE>         CD-ROM primary disc at that SCSI ID
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
+  --no-write-cache            Turn every hard disk's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 
 Display and audio
