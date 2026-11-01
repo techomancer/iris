@@ -1198,3 +1198,30 @@ fn long_and_short_transfers_place_every_byte_by_the_swap_rule() {
         }
     }
 }
+
+/// A saved Bridge loads into a fresh one with its registers, its table and
+/// its functions' headers, and the BAR windows reach the function again; a
+/// bus with no function in the slot refuses the load.
+#[test]
+fn save_load_round_trip_keeps_the_function_reachable() {
+    use crate::traits::Saveable;
+    let src = Rig::new();
+    let _c = src.card(1, PCI_INTA);
+    let v1 = src.bridge.save_state();
+    let dst = Rig::new();
+    let c = dst.card(1, PCI_INTA);
+    // Unmapped before the load: the load must bring the window back.
+    dst.set(reg::device(1), 0);
+    dst.cfg_write(1, 0x04, 2, 0);
+    dst.bridge.load_state(&v1).expect("load_state");
+    assert_eq!(v1, dst.bridge.save_state());
+    assert_eq!(dst.get(reg::device(1)), src.get(reg::device(1)));
+    let w = Rig::win(1);
+    assert_eq!(dst.bridge.write32(u64::from(w + SCRATCH), 0x1234_5678), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0x1234_5678);
+    assert!(Rig::new().bridge.load_state(&v1).is_err());
+    let other = Rig::new();
+    let _c = other.card(1, PCI_INTA);
+    other.bridge.set_revision(4);
+    assert!(other.bridge.load_state(&v1).unwrap_err().contains("revision"));
+}

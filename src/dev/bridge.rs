@@ -55,7 +55,8 @@ use parking_lot::{Mutex, RwLock};
 use crate::dev::w1;
 use crate::irq::{InterruptController, IrqLine};
 use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
+use crate::snapshot::{field, field_u32, field_u32s, field_u64, field_u64_vec, field_u8, field_u8s, StateTable};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
 
 /// The widgets this chip addresses by number on the Crossbow: HEART takes
 /// its interrupt packets and memory transfers, widget 15 is its own port.
@@ -1593,6 +1594,82 @@ impl BusDevice for RawFlash {
     fn write16(&self, _addr: u64, _val: u16) -> u32 {
         self.dropped.fetch_add(1, Ordering::Relaxed);
         BUS_OK
+    }
+}
+
+// The Bridge's state for a snapshot: its registers, address translation
+// entries, interrupt pins and latched errors, its MicroLAN bus, and the
+// configuration header of every function on its bus (reached through the
+// Bridge, and not in the functions' own saved state). Loading puts the
+// headers back first and then publishes the BAR pages from them, so the
+// native PIO decode is derived, not stored. The flash parts behind its
+// chip selects save themselves.
+impl Saveable for Bridge {
+    fn save_state(&self) -> toml::Value {
+        let microlan = self.microlan.lock().as_ref().map_or(toml::Value::Boolean(false), |bus| bus.save_state());
+        let configs: Vec<toml::Value> = self.slots.read().iter()
+            .map(|f| f.as_ref().map_or(toml::Value::Boolean(false), |f| f.config().save_state()))
+            .collect();
+        let st = self.st.lock();
+        let lines: Vec<u8> = st.pci_lines.iter().map(|&l| u8::from(l)).collect();
+        StateTable::new()
+            .u32s("reg", &st.reg)
+            .u64s("ate", &st.ate)
+            .u32("int_error", st.int_error)
+            .u8s("pins", &[st.pin_level, st.pci_pin_level, st.gpio_pin_level, st.dma_64bit])
+            .u8s("pci_lines", &lines)
+            .u64("dma_pci_address", st.dma_pci_address)
+            .u32("dma_device", st.dma_device)
+            .value("functions", toml::Value::Array(configs))
+            .value("microlan", microlan)
+            .u32("revision", self.revision.load(Ordering::Acquire))
+            .build()
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        // The silicon revision is the board's, like the functions fitted.
+        if field_u32(v, "revision")? != self.revision.load(Ordering::Acquire) {
+            return Err("the saved Bridge is another revision".into());
+        }
+        let ate = field_u64_vec(v, "ate")?;
+        if ate.len() != ATE_ENTRIES {
+            return Err(format!("ate: {} entries, expected {ATE_ENTRIES}", ate.len()));
+        }
+        let lines = field_u8s::<{ DEVICES * 4 }>(v, "pci_lines")?;
+        let configs = field(v, "functions")?.as_array().ok_or("functions: not a list")?;
+        let slots = self.slots.read().clone();
+        if configs.len() != slots.len() {
+            return Err(format!("functions: {} slots, expected {}", configs.len(), slots.len()));
+        }
+        for (slot, (f, saved)) in slots.iter().zip(configs).enumerate() {
+            match (f, saved.as_bool()) {
+                (Some(f), None) => f.config().load_state(saved).map_err(|e| format!("slot {slot}: {e}"))?,
+                (None, Some(false)) => {}
+                _ => return Err(format!("slot {slot}: the saved bus has a different function there")),
+            }
+        }
+        let saved = field(v, "microlan")?;
+        match (self.microlan.lock().as_mut(), saved.as_bool()) {
+            (Some(bus), None) => bus.load_state(saved).map_err(|e| format!("MicroLAN: {e}"))?,
+            (None, Some(false)) => {}
+            _ => return Err("the saved Bridge has a different MicroLAN bus".into()),
+        }
+        {
+            let [pin_level, pci_pin_level, gpio_pin_level, dma_64bit] = field_u8s::<4>(v, "pins")?;
+            let mut st = self.st.lock();
+            st.reg = field_u32s(v, "reg")?;
+            st.ate.copy_from_slice(&ate);
+            st.int_error = field_u32(v, "int_error")?;
+            st.pin_level = pin_level;
+            st.pci_pin_level = pci_pin_level;
+            st.gpio_pin_level = gpio_pin_level;
+            st.dma_64bit = dma_64bit;
+            st.pci_lines = lines.map(|l| l != 0);
+            st.dma_pci_address = field_u64(v, "dma_pci_address")?;
+            st.dma_device = field_u32(v, "dma_device")?;
+        }
+        self.publish_bars();
+        Ok(())
     }
 }
 
