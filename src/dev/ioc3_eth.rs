@@ -49,7 +49,8 @@ use std::time::{Duration, Instant};
 
 use crate::dev::ioc3_port::Ioc3EthPort;
 use crate::pci::{PciDma, PciDmaStatus};
-use crate::traits::{Device, Resettable};
+use crate::snapshot::{field, field_bool, field_u16, field_u32, field_u32s, field_u64, field_u8, StateTable};
+use crate::traits::{Device, Resettable, Saveable};
 
 #[cfg(test)]
 mod tests;
@@ -1373,5 +1374,104 @@ impl Ioc3EthPort for Ioc3Eth {
         *self.dma.lock() = Some(dma);
         *self.irq.lock() = Some(irq);
         self.irq_flush();
+    }
+}
+
+// The transceiver's registers and auto-negotiation progress for a
+// snapshot. Its one deadline is saved as the time it had left.
+impl Ics1890 {
+    pub(crate) fn save_state(&self, now: Instant) -> toml::Value {
+        StateTable::new()
+            .u8("addr", self.addr)
+            .u16("bmcr", self.bmcr)
+            .u16("bmsr_caps", self.bmsr_caps)
+            .u16("id1", self.id1)
+            .u16("id2", self.id2)
+            .u16("anar", self.anar)
+            .u16("partner", self.partner)
+            .u16("exp", self.exp)
+            .u16("ext_ctl", self.ext_ctl)
+            .u16("tenbt", self.tenbt)
+            .u16("ext2", self.ext2)
+            .bool("override_armed", self.override_armed)
+            .bool("page_received", self.page_received)
+            .bool("link_low_latch", self.link_low_latch)
+            .bool("last_link", self.last_link)
+            .bool("backend_up", self.backend_up)
+            .bool("nego_done", self.nego_done)
+            // Nanoseconds left plus one; zero for none.
+            .u64("deadline", self.deadline.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1))
+            .u64("delay", self.delay.as_nanos() as u64)
+            .u32("unimplemented_accesses", self.unimplemented_accesses)
+            .build()
+    }
+
+    pub(crate) fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
+        let deadline = field_u64(v, "deadline")?;
+        *self = Self {
+            addr: field_u8(v, "addr")?,
+            bmcr: field_u16(v, "bmcr")?,
+            bmsr_caps: field_u16(v, "bmsr_caps")?,
+            id1: field_u16(v, "id1")?,
+            id2: field_u16(v, "id2")?,
+            anar: field_u16(v, "anar")?,
+            partner: field_u16(v, "partner")?,
+            exp: field_u16(v, "exp")?,
+            ext_ctl: field_u16(v, "ext_ctl")?,
+            tenbt: field_u16(v, "tenbt")?,
+            ext2: field_u16(v, "ext2")?,
+            override_armed: field_bool(v, "override_armed")?,
+            page_received: field_bool(v, "page_received")?,
+            link_low_latch: field_bool(v, "link_low_latch")?,
+            last_link: field_bool(v, "last_link")?,
+            backend_up: field_bool(v, "backend_up")?,
+            nego_done: field_bool(v, "nego_done")?,
+            deadline: (deadline != 0).then(|| now + Duration::from_nanos(deadline - 1)),
+            delay: Duration::from_nanos(field_u64(v, "delay")?),
+            unimplemented_accesses: field_u32(v, "unimplemented_accesses")?,
+        };
+        Ok(())
+    }
+}
+
+// The Ethernet block's state for a snapshot: the MAC's registers, the
+// MII port and the transceiver. Frames in flight between the receive
+// thread and the host network are not state: with the threads stopped
+// there are none in the chip, and the host side's queues belong to this
+// process only.
+impl Saveable for Ioc3Eth {
+    fn save_state(&self) -> toml::Value {
+        let st = self.st.lock();
+        StateTable::new()
+            .u32s("regs", &st.regs)
+            .u32("int_deferred", st.int_deferred)
+            .u16("mii_data", st.mii_data)
+            .u16("mii_data_w", st.mii_data_w)
+            .bool("rx_timer_armed", st.rx_timer_armed)
+            .value("phy", st.phy.save_state(Instant::now()))
+            .bool("irq_asserted", st.irq_asserted)
+            .u64("tx_frames", st.tx_frames)
+            .u64("rx_frames", st.rx_frames)
+            .build()
+    }
+
+    /// Called with the block stopped.
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        {
+            let mut st = self.st.lock();
+            st.phy.load_state(field(v, "phy")?, Instant::now()).map_err(|e| format!("phy: {e}"))?;
+            st.regs = field_u32s(v, "regs")?;
+            st.int_deferred = field_u32(v, "int_deferred")?;
+            st.mii_data = field_u16(v, "mii_data")?;
+            st.mii_data_w = field_u16(v, "mii_data_w")?;
+            st.rx_timer_armed = field_bool(v, "rx_timer_armed")?;
+            st.tx_frames = field_u64(v, "tx_frames")?;
+            st.rx_frames = field_u64(v, "rx_frames")?;
+            // Publish the loaded level whatever the line was left at.
+            st.irq_asserted = field_bool(v, "irq_asserted")?;
+            st.irq_events = vec![st.irq_asserted];
+        }
+        self.irq_flush();
+        Ok(())
     }
 }

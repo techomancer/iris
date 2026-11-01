@@ -898,3 +898,46 @@ fn a_tftp_read_through_the_ioc3_and_gateway_returns_the_file() {
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(got, data);
 }
+
+#[test]
+fn save_load_round_trip() {
+    use crate::traits::Saveable;
+    let mac = [8, 0, 0x69, 1, 2, 3];
+    let src = Ioc3Eth::new(mac);
+    {
+        let mut st = src.st.lock();
+        st.set(RX_RING_LO, 0x1000);
+        st.set(INT_ENABLE, bits::INT_TX_EMPTY);
+        st.set(INT_STATUS, bits::INT_TX_EMPTY);
+        st.update_irq();
+        st.irq_events.clear();
+        st.tx_frames = 9;
+        // Let the power-on negotiation finish, so the save holds no
+        // deadline for the two saves to differ by.
+        st.phy.sync(Instant::now() + Duration::from_secs(10));
+    }
+    let v1 = src.save_state();
+    let dst = Ioc3Eth::new(mac);
+    let level = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = level.clone();
+    *dst.irq.lock() = Some(Box::new(move |l| seen.store(l, std::sync::atomic::Ordering::SeqCst)));
+    dst.load_state(&v1).expect("load_state");
+    assert_eq!(v1, dst.save_state());
+    assert!(level.load(std::sync::atomic::Ordering::SeqCst), "the loaded interrupt level is published");
+    assert_eq!(dst.st.lock().get(RX_RING_LO), 0x1000);
+}
+
+/// The transceiver keeps its registers and the time left on an
+/// auto-negotiation across a save and load.
+#[test]
+fn the_transceiver_round_trips_with_negotiation_in_progress() {
+    let now = Instant::now();
+    let mut src = Ics1890::new(1, Duration::from_millis(50));
+    src.set_backend_link(true, now);
+    src.write(0, 0x1200, now); // restart auto-negotiation
+    let v = src.save_state(now);
+    let mut dst = Ics1890::new(1, Duration::from_millis(50));
+    dst.load_state(&v, now).unwrap();
+    assert_eq!(v, dst.save_state(now));
+    assert_eq!(src.deadline().is_some(), dst.deadline().is_some());
+}
