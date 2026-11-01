@@ -417,6 +417,36 @@ impl BusDevice for DmaView {
     }
 }
 
+// The memory's contents for a snapshot. Where the banks answer is HEART's
+// to restore, from its descriptors; these are the bytes.
+impl HeartRam {
+    /// Each fitted bank's words in bank order, as the host keeps them.
+    /// Read with the CPU and every DMA master stopped.
+    pub fn bank_words(&self) -> Vec<&[u32]> {
+        self.phys.banks().iter().map(|bank| {
+            // SAFETY: the bank's mapping is `size()` bytes, page-aligned, and
+            // lives as long as `self`.
+            unsafe { std::slice::from_raw_parts(bank.host_ptr() as *const u32, bank.size() / 4) }
+        }).collect()
+    }
+
+    /// Put back what [`Self::bank_words`] gave, concatenated. Each bank's
+    /// compiled code is retired: the bytes under it changed.
+    pub fn restore_bank_words(&self, words: &[u32]) -> Result<(), String> {
+        let total: usize = self.phys.banks().iter().map(|b| b.size() / 4).sum();
+        if words.len() != total {
+            return Err(format!("saved memory is {} MiB, this Octane has {} MiB", words.len() >> 18, total >> 18));
+        }
+        let mut at = 0;
+        for bank in self.phys.banks() {
+            let n = bank.size() / 4;
+            bank.restore_words(&words[at..at + n]);
+            at += n;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +826,16 @@ mod tests {
         assert_eq!(dma.write64(RAM_BASE + 0x180, 1), BUS_OK);
         assert_ne!(gen(l0), v, "and so does a bus master's at its SDRAM address");
         assert!(p.gen_ptr(0x4000).is_null());
+    }
+
+    #[test]
+    fn bank_words_round_trip_into_another_memory() {
+        let src = HeartRam::new([64, 0, 0, 0]);
+        src.phys().banks()[0].write32(0x1000, 0xdead_beef);
+        let words: Vec<u32> = src.bank_words().concat();
+        let dst = HeartRam::new([64, 0, 0, 0]);
+        dst.restore_bank_words(&words).unwrap();
+        assert_eq!(dst.phys().banks()[0].read32(0x1000).data, 0xdead_beef);
+        assert!(dst.restore_bank_words(&words[1..]).is_err());
     }
 }
