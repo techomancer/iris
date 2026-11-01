@@ -1,8 +1,9 @@
 //! Putting the `[scsi.N]` config tables on a machine's buses.
 //!
 //! Every machine walks the same list: place each table on a controller and
-//! id, make a scratch volume, send a CI run's overlay under /tmp, attach the
-//! target, and decide what a target that will not attach means. Only two
+//! id, make a scratch volume, send a CI run's overlay to the temporary
+//! directory, attach the target, and decide what a target that will not
+//! attach means. Only two
 //! things are the machine's: which bus a controller number names, and, on
 //! the machines that have one, how a DaynaPort is built.
 
@@ -95,9 +96,9 @@ pub fn attach_from_config<'a>(
         let bus = route(controller).map_err(|e| format!("{at}: {e}"))?;
         let (path, discs) = dev.media();
         let cdrom = dev.is_cdrom();
-        // CI mode isolates each copy-on-write overlay under /tmp, so an
-        // interactive iris holding one and any number of CI runs can share
-        // the image.
+        // CI mode isolates each copy-on-write overlay in the temporary
+        // directory, so an interactive iris holding one and any number of CI
+        // runs can share the image.
         let ci_overlay = (cfg.ci && dev.overlay && !cdrom).then(|| ScsiDeviceConfig::ci_overlay_path(key));
         match bus.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref(), dev.write_cache) {
             Ok(blocks) => {
@@ -109,7 +110,13 @@ pub fn attach_from_config<'a>(
                     }
                 }
             }
-            Err(e) => attach_failed(format!("could not attach {path} to {at}: {e}"), &at)?,
+            Err(e) => {
+                let msg = match &ci_overlay {
+                    Some(ov) => format!("could not attach {path} to {at} with its --ci overlay {ov}: {e}"),
+                    None => format!("could not attach {path} to {at}: {e}"),
+                };
+                attach_failed(msg, &at)?
+            }
         }
     }
     out.tables.sort_by_key(|t| t.slot);

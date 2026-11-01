@@ -85,7 +85,7 @@ fn serial() -> MutexGuard<'static, ()> {
 /// Where `--ci` keeps its overlays, which are named for the process.
 fn ci_overlays() -> Vec<PathBuf> {
     let prefix = format!("iris-ci-{}-scsi", std::process::id());
-    std::fs::read_dir("/tmp")
+    std::fs::read_dir(std::env::temp_dir())
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
@@ -234,8 +234,9 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
     cfg.nvram = dir.file("nvram").display().to_string();
     cfg.nveeprom = dir.file("nveeprom").display().to_string();
     // CI mode keeps the CPU parked, gives the machine a serial backend for the
-    // control socket and moves the overlays to /tmp. Without it the machine is
-    // never started, so nothing runs. Port 0: the monitor takes any free port.
+    // control socket and moves the overlays to the temporary directory.
+    // Without it the machine is never started, so nothing runs. Port 0: the
+    // monitor takes any free port.
     cfg.ci = ci;
     cfg.monitor_port = Some(0);
     cfg.scsi.clear();
