@@ -323,6 +323,28 @@ impl CachedFlashLines {
         self.lines.lock().clear();
     }
 
+    /// The lines held, for a snapshot: the PROM's data as this CPU last
+    /// read it from the flash, which the flash may no longer show.
+    pub fn save_state(&self) -> toml::Value {
+        let lines = self.lines.lock();
+        let mut bases: Vec<u64> = lines.keys().copied().collect();
+        bases.sort_unstable();
+        toml::Value::Array(bases.into_iter().map(|b| {
+            crate::snapshot::StateTable::new().u64("base", b).u8s("bytes", &lines[&b]).build()
+        }).collect())
+    }
+
+    pub fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let saved = v.as_array().ok_or("flash lines: not a list")?;
+        let mut lines = std::collections::HashMap::new();
+        for line in saved {
+            let base = crate::snapshot::field_u64(line, "base")?;
+            lines.insert(base, crate::snapshot::field_u8s::<{ CACHE_LINE as usize }>(line, "bytes")?);
+        }
+        *self.lines.lock() = lines;
+        Ok(())
+    }
+
     /// Bytes `addr..addr + n` of a held line, big-endian, or `None` if the
     /// line is not held.
     fn load(&self, addr: u64, n: usize) -> Option<u64> {

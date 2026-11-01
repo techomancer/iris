@@ -38,7 +38,9 @@ use crate::ip30::{
     widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
     WIDGET_XBOW,
 };
-use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
+use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
+use crate::snapshot::{field, ChunksManifest, Manifest, Snapshot, StateTable, SCHEMA_VERSION};
+use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
 /// The PROM image tried when `prom` is left at the shared default, named
@@ -142,6 +144,14 @@ pub struct OctaneMachine {
     event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
     controller_slot: Option<MachineSlot>,
     lifecycle: crate::machine_state::GuestState,
+    /// The disks as a snapshot records them, to refuse one taken on others.
+    disks: Vec<crate::snapshot::DiskRef>,
+    /// The snapshot the CI socket last restored, for `rollback`.
+    last_restore: Option<String>,
+    /// Where snapshots go: `saves` under the current directory, as on the
+    /// Indy and the O2. A field rather than the literal so the tests, which
+    /// share one process and so one current directory, can each use their own.
+    saves: std::path::PathBuf,
 }
 
 impl OctaneMachine {
@@ -237,7 +247,7 @@ impl OctaneMachine {
         let mac = cfg.network().mac;
         // The buses are filled from `[scsi.N]` before the controllers exist.
         let [bus_a, bus_b] = [Isp1040::new_bus(), Isp1040::new_bus()];
-        let scratch_path = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
+        let (scratch_path, disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
         let scsi = [Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
@@ -513,6 +523,9 @@ impl OctaneMachine {
             event_rx: Some(event_rx),
             controller_slot: None,
             lifecycle: crate::machine_state::GuestState::Idle,
+            disks,
+            last_restore: None,
+            saves: std::path::PathBuf::from("saves"),
         })
     }
 
@@ -525,8 +538,9 @@ impl OctaneMachine {
     }
 
     /// The `[scsi.N]` devices: `controller` 0 is the internal bus, 1 the
-    /// external one. Returns the `scratch = true` volume, if any.
-    fn attach_scsi(cfg: &MachineConfig, buses: [&crate::scsi::ScsiBus; 2]) -> Result<Option<std::path::PathBuf>, String> {
+    /// external one. Returns the `scratch = true` volume, if any, and the
+    /// disks as a snapshot records them.
+    fn attach_scsi(cfg: &MachineConfig, buses: [&crate::scsi::ScsiBus; 2]) -> Result<(Option<std::path::PathBuf>, Vec<crate::snapshot::DiskRef>), String> {
         let attached = crate::scsi::attach_from_config(cfg, Some("ip30"), &|c| {
             buses.get(c as usize)
                 .copied()
@@ -535,7 +549,11 @@ impl OctaneMachine {
         if let Some(d) = attached.daynaports.first() {
             return Err(format!("{}: kind = \"daynaport\" is not available on the Octane", crate::config::scsi_label(d.controller, d.id)));
         }
-        Ok(attached.scratch)
+        let disks = attached.tables.iter()
+            .filter(|t| !t.is_cdrom)
+            .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
+            .collect();
+        Ok((attached.scratch, disks))
     }
 
     /// IOC3's first port is the console: the CI socket's backend in CI
@@ -648,6 +666,12 @@ impl OctaneMachine {
     /// PCI function's header returns to power-up (RST#).
     pub fn reset(&mut self) {
         self.stop();
+        self.power_on_all();
+        self.restart_peripherals();
+    }
+
+    /// Every device as at power-on, with the machine stopped.
+    fn power_on_all(&self) {
         for c in &self.cpus {
             Resettable::power_on(&**c);
         }
@@ -672,7 +696,6 @@ impl OctaneMachine {
             v.power_on();
         }
         Self::sync_links(&self.phys, &self.xbow);
-        self.restart_peripherals();
     }
 
     /// Start what `stop` stopped, short of the CPU: HEART's counter, the
@@ -702,6 +725,240 @@ impl OctaneMachine {
         let slot = self.controller_slot.get_or_insert_with(|| Arc::new(parking_lot::Mutex::new(MachineRef(ptr))));
         debug_assert!(std::ptr::addr_eq(slot.lock().0, ptr), "OctaneMachine moved after its slot was handed out");
         slot.clone()
+    }
+}
+
+// Snapshots of the Octane, in the O2's format: a manifest naming the
+// machine, the CPU and the board's devices as postcard tables, all RAM as
+// one chunk list in the shared store, the boot flash's bytes, and each SCSI
+// controller's copy-on-write overlays. Written to `saves/<name>/` under the
+// current directory, like the other machines' snapshots.
+//
+// The snapshot point is the machine's stop: the CPU threads have exited,
+// and the devices' threads are joined and their timers removed. Host-clock
+// state in the devices is saved relative to the stop, so the guest's clocks
+// resume where they stopped.
+//
+// Not supported, and refused with the reason: an IMPACT or a VPro board
+// (neither has saved state yet) and two processors (the stop
+// does not yet bring both to a common instruction boundary that a snapshot
+// can record). In a jitv2 build, putting memory back bumps every page's
+// generation, so code compiled from the memory before the load is not run.
+
+/// Why an Octane with an IMPACT board, a VPro board or `cpus` processors
+/// cannot be saved, when it cannot.
+fn snapshot_refusal_for(impact: bool, vpro: bool, cpus: usize) -> Option<String> {
+    if impact {
+        return Some("snapshots of an Octane with an IMPACT board are not supported yet: \
+            its engines and display threads have no saved state".into());
+    }
+    if vpro {
+        return Some("snapshots of an Octane with a VPro board are not supported yet: \
+            the board has no saved state".into());
+    }
+    if cpus > 1 {
+        return Some("snapshots of a two-processor Octane are not supported yet: \
+            the stop does not bring both processors to one recorded instruction boundary".into());
+    }
+    None
+}
+
+/// The `machine` an Octane snapshot's manifest names.
+pub(crate) const SNAPSHOT_MACHINE: &str = "octane_ip30";
+
+/// One SCSI controller's copy-on-write sets: each target's dirty sectors.
+type OverlaySets = Vec<(usize, Vec<u64>)>;
+
+/// A snapshot read and checked, ready to put into the machine.
+struct OctaneSnapshot {
+    cpu: toml::Value,
+    board: toml::Value,
+    flash: Vec<u8>,
+    memory: Vec<u32>,
+    overlays: [Option<OverlaySets>; 2],
+    dir: std::path::PathBuf,
+}
+
+impl OctaneMachine {
+    /// Why this machine cannot be saved, when it cannot.
+    fn snapshot_refusal(&self) -> Option<String> {
+        snapshot_refusal_for(self.gfx.is_some(), self.vpro.is_some(), self.cpus.len())
+    }
+
+    /// Every device's state but the CPU's. Called with the machine stopped.
+    fn save_board(&self) -> toml::Value {
+        let lines = self.flash_lines.iter().map(|f| f.save_state()).collect();
+        StateTable::new()
+            .value("ioc3", self.ioc3.save_state())
+            .value("eth", self.eth.save_state())
+            .value("scsi0", self.scsi[0].save_state())
+            .value("scsi1", self.scsi[1].save_state())
+            .value("rad", self.rad.save_state())
+            .value("flash", self.flash.save_state())
+            .value("flash_lines", toml::Value::Array(lines))
+            .value("bridge", self.bridge.save_state())
+            .value("xbow", self.xbow.save_state())
+            .value("heart", self.heart.save_state())
+            .build()
+    }
+
+    /// Put back what [`Self::save_board`] gave, into a machine stopped and
+    /// reset: leaf devices first and HEART last, so the pins it drives into
+    /// the CPU, already loaded, come from its loaded registers, and memory
+    /// is placed from its loaded descriptors.
+    fn load_board(&self, v: &toml::Value) -> Result<(), String> {
+        let load = |key: &str, dev: &dyn Saveable| dev.load_state(field(v, key)?).map_err(|e| format!("{key}: {e}"));
+        load("ioc3", &*self.ioc3)?;
+        load("eth", &*self.eth)?;
+        load("scsi0", &*self.scsi[0])?;
+        load("scsi1", &*self.scsi[1])?;
+        load("rad", &*self.rad)?;
+        load("flash", &*self.flash)?;
+        let lines = field(v, "flash_lines")?.as_array().filter(|l| l.len() == self.flash_lines.len())
+            .ok_or("flash_lines: not one entry per processor")?;
+        for (f, saved) in self.flash_lines.iter().zip(lines) {
+            f.load_state(saved)?;
+        }
+        load("bridge", &*self.bridge)?;
+        load("xbow", &*self.xbow)?;
+        Self::sync_links(&self.phys, &self.xbow);
+        load("heart", &*self.heart)?;
+        Ok(())
+    }
+
+    pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        if let Some(why) = self.snapshot_refusal() {
+            return Err(why);
+        }
+        let lifecycle = self.lifecycle;
+        let was_running = self.cpus[0].clone().as_device().is_running();
+        self.stop();
+        let saved = self.write_snapshot(name);
+        if lifecycle != crate::machine_state::GuestState::Idle {
+            self.restart_peripherals();
+        }
+        if was_running {
+            self.start_cpus();
+        }
+        self.lifecycle = lifecycle;
+        saved?;
+        println!("Snapshot saved to {}/{name}", self.saves.display());
+        Ok(())
+    }
+
+    fn write_snapshot(&self, name: &str) -> Result<(), String> {
+        let cpu = &self.cpus[0];
+        let snap = Snapshot::new(self.saves.join(name));
+        snap.ensure_dir().map_err(|e| e.to_string())?;
+        let mut manifest = Manifest::for_current_save();
+        manifest.machine = Some(SNAPSHOT_MACHINE.into());
+        manifest.parent = self.last_restore.clone();
+        manifest.disks = self.disks.clone();
+        manifest.nvram = Some(self.nvram_path.clone());
+        manifest.cpu_model = Some(cpu.model_name().to_string());
+        manifest.cpu_cache = Some(cpu.cache_kind().to_string());
+        snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
+        let sv = manifest.schema_version;
+        let io = |e: std::io::Error| e.to_string();
+        snap.write_state("cpu", &cpu.save_state(), sv).map_err(io)?;
+        snap.write_state("octane", &self.save_board(), sv).map_err(io)?;
+        snap.write_bin("flash.bin", &self.flash.contents()).map_err(io)?;
+        let store = ChunkStore::new(&self.saves);
+        let mut chunks = ChunksManifest::default();
+        for words in self.ram.bank_words() {
+            chunks.bank_chunks[0].extend(put_words_as_chunks(&store, words).map_err(|e| format!("CAS memory put: {e}"))?);
+        }
+        snap.write_chunks_manifest(&chunks).map_err(io)?;
+        for (i, ctl) in self.scsi.iter().enumerate() {
+            let dir = snap.dir.join(format!("ctrl{i}"));
+            std::fs::create_dir_all(&dir).map_err(io)?;
+            let overlays = ctl.bus().export_overlays(&dir)
+                .map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
+            snap.write_toml(&format!("cow{i}.toml"), &crate::machine::build_cow_table(overlays)).map_err(io)?;
+        }
+        Ok(())
+    }
+
+    /// Restore from `saves/<name>/` and run. The snapshot is read and its
+    /// machine, build, CPU, disks and memory size checked before the machine
+    /// is touched; a mismatch found while the devices load (another function
+    /// in a Bridge slot, other crossbow links, another MicroLAN part) leaves
+    /// the machine reset and stopped.
+    pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+        if let Some(why) = self.snapshot_refusal() {
+            return Err(why);
+        }
+        let snap = self.read_snapshot(name)?;
+        self.stop();
+        let applied = self.apply_snapshot(snap);
+        self.restart_peripherals();
+        applied?;
+        self.start_cpus();
+        self.lifecycle = crate::machine_state::GuestState::Running;
+        println!("Snapshot loaded from {}/{name}", self.saves.display());
+        Ok(())
+    }
+
+    fn read_snapshot(&self, name: &str) -> Result<OctaneSnapshot, String> {
+        let cpu = &self.cpus[0];
+        let snap = Snapshot::new(self.saves.join(name));
+        let m = snap.read_manifest()?.ok_or_else(|| format!("{}/{name}: no snapshot.toml", self.saves.display()))?;
+        if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
+            return Err(format!("snapshot {name} is not of an Octane"));
+        }
+        if m.host_arch != std::env::consts::ARCH {
+            return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
+        }
+        if m.schema_version != SCHEMA_VERSION {
+            return Err(format!("snapshot {name} is schema {}; this build reads Octane snapshots of schema {SCHEMA_VERSION}", m.schema_version));
+        }
+        // As the Indy and the O2: build, CPU and disks must match.
+        crate::snapshot::check_provenance(&m, cpu.model_name(), cpu.cache_kind(), &self.disks)?;
+        let sv = m.schema_version;
+        let state = |base: &str| snap.read_state(base, sv).map_err(|e| format!("{base}: {e}"));
+        let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
+        let memory = get_chunks_as_words(&ChunkStore::new(&self.saves), &chunks.bank_chunks[0])
+            .map_err(|e| format!("CAS memory get: {e}"))?;
+        let fitted: usize = self.ram.bank_words().iter().map(|b| b.len()).sum();
+        if memory.len() != fitted {
+            return Err(format!("snapshot memory is {} MiB, this Octane has {} MiB", memory.len() >> 18, fitted >> 18));
+        }
+        let overlays = std::array::from_fn(|i| {
+            snap.read_toml(&format!("cow{i}.toml")).ok().map(|t| crate::machine::parse_cow_table(&t))
+        });
+        // Checked here, before the machine is touched, rather than when the
+        // part is loaded.
+        let flash = snap.read_bin("flash.bin").map_err(|e| format!("flash.bin: {e}"))?;
+        if flash.len() != self.flash.size() {
+            return Err(format!("saved flash is {} bytes, this Octane's holds {}", flash.len(), self.flash.size()));
+        }
+        Ok(OctaneSnapshot {
+            cpu: state("cpu")?,
+            board: state("octane")?,
+            flash,
+            memory,
+            overlays,
+            dir: snap.dir,
+        })
+    }
+
+    /// Put a read snapshot into the stopped machine: the hardware as at
+    /// power-on first, so nothing the snapshot does not hold is left over.
+    fn apply_snapshot(&mut self, s: OctaneSnapshot) -> Result<(), String> {
+        self.power_on_all();
+        self.cpus[0].load_state(&s.cpu).map_err(|e| format!("cpu: {e}"))?;
+        self.flash.restore_contents(&s.flash)?;
+        self.ram.restore_bank_words(&s.memory)?;
+        // The overlays first: an import can take minutes, and the devices
+        // count their deadlines from their load, so they load last, just
+        // before the machine starts.
+        for (i, ctl) in self.scsi.iter().enumerate() {
+            if let Some(sets) = &s.overlays[i] {
+                ctl.bus().import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
+                    .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
+            }
+        }
+        self.load_board(&s.board)
     }
 }
 
@@ -786,6 +1043,30 @@ impl Workstation for OctaneMachine {
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+    fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        OctaneMachine::save_snapshot(self, name)
+    }
+    fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
+        OctaneMachine::load_snapshot(self, name)
+    }
+    fn ci_restore(&mut self, name: &str) -> Result<(), String> {
+        // Clear what the guest printed before, so the next command does
+        // not see stale output; the Indy does the same.
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+        OctaneMachine::load_snapshot(self, name)?;
+        self.last_restore = Some(name.to_string());
+        Ok(())
+    }
+    /// Back to the last restored snapshot, read again from disk.
+    fn ci_rollback(&mut self) -> Result<(), String> {
+        let name = self.last_restore.clone().ok_or("rollback: nothing has been restored")?;
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+        OctaneMachine::load_snapshot(self, &name)
     }
     /// The DS1685's RAM, which holds the PROM's environment, written out
     /// now. The flash writes itself through to its file.
@@ -937,5 +1218,218 @@ mod tests {
         assert_eq!(prom_revision(b"no banner here"), None);
         assert!((4, 3) < vpro_prom_needed(crate::config::GraphicsBoard::V12));
         assert!((4, 3) >= vpro_prom_needed(crate::config::GraphicsBoard::V6));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::cpu::mips_exec::CpuStateDigest;
+
+    /// The stock PROM is not in the repository; without it the test that
+    /// runs it says so and passes.
+    fn prom() -> Option<String> {
+        let path = std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "/inputs/IP30prom.bin".into());
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skipped: no stock PROM at {path}");
+            return None;
+        }
+        Some(path)
+    }
+
+    /// A test's own directory, removed when the test ends, failed or not.
+    struct Scratch(std::path::PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("iris-octane-snap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+
+    /// A one-processor Octane with 256 MiB, no graphics, no network and a
+    /// small overlay disk.
+    fn machine(prom: &str, dir: &std::path::Path) -> OctaneMachine {
+        machine_with(prom, dir, |_| {})
+    }
+
+    fn machine_with(prom: &str, dir: &std::path::Path, edit: impl FnOnce(&mut MachineConfig)) -> OctaneMachine {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = crate::config::MachineProfile::OctaneIp30;
+        cfg.machine.cpu = CpuModel::R10000;
+        cfg.banks = [256, 0, 0, 0, 0, 0, 0, 0];
+        cfg.prom = prom.into();
+        cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
+        cfg.headless = true;
+        cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+        // Not CI mode: its overlays share one path per process, and the
+        // tests run in parallel; this way each sits beside its own disk.
+        cfg.network.mode = crate::config::NetMode::Off;
+        let held: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
+        let port = |i: usize| Some(held[i].local_addr().unwrap().port());
+        cfg.monitor_port = port(0);
+        cfg.serial_port_a = port(1);
+        cfg.serial_port_b = port(2);
+        let disk = dir.join("disk.raw");
+        if !disk.exists() {
+            std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
+        }
+        cfg.scsi.clear();
+        cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
+        edit(&mut cfg);
+        let mut m = OctaneMachine::new(&cfg).expect("an Octane");
+        m.saves = dir.join("saves");
+        m
+    }
+
+    fn digest(m: &OctaneMachine) -> (CpuStateDigest, blake3::Hash) {
+        let mut h = blake3::Hasher::new();
+        for words in m.ram.bank_words() {
+            // SAFETY: a byte view of the same words.
+            h.update(unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) });
+        }
+        (m.cpus[0].state_digest().unwrap(), h.finalize())
+    }
+
+    /// Run the PROM some way, save, restore into a fresh machine: the CPU
+    /// and memory come back exactly, and both machines agree a million
+    /// instructions on.
+    #[test]
+    fn a_restored_octane_continues_from_the_saved_state() {
+        let Some(prom) = prom() else { return };
+        std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+            let dir = scratch("continue");
+            let mut a = machine(&prom, &dir);
+            a.cpus[0].step_n_inline(2_000_000).unwrap();
+            a.save_snapshot("at-n").unwrap();
+            let saved = digest(&a);
+            let mut b = machine(&prom, &dir);
+            let snap = b.read_snapshot("at-n").unwrap();
+            b.apply_snapshot(snap).unwrap();
+            assert_eq!(digest(&b), saved, "the restore puts back the CPU and memory");
+            assert_eq!(a.cpus[0].save_state(), b.cpus[0].save_state());
+            a.cpus[0].step_n_inline(1_000_000).unwrap();
+            b.cpus[0].step_n_inline(1_000_000).unwrap();
+            assert_eq!(digest(&a), digest(&b));
+        }).unwrap().join().unwrap();
+    }
+
+    /// An empty PROM in place of the stock one, so these run anywhere.
+    fn empty_prom(dir: &std::path::Path) -> String {
+        let path = dir.join("prom.bin");
+        std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Without the stock PROM: a machine that has moved on takes back the
+    /// CPU, memory and every device's state a save wrote, after the CPU had
+    /// run and RAM had been written. (The same machine rather than a second
+    /// one: every Octane a test builds holds one of the process's 64
+    /// device-map tables until the process ends.)
+    #[test]
+    fn an_octane_on_an_empty_prom_takes_back_its_state() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("empty-prom");
+            let prom = empty_prom(&dir);
+            let mut a = machine(&prom, &dir);
+            let pattern = |a: &OctaneMachine, salt: u32| {
+                let mut words: Vec<u32> = a.ram.bank_words().concat();
+                for (i, w) in words.iter_mut().enumerate().step_by(4099) {
+                    *w = salt | i as u32;
+                }
+                a.ram.restore_bank_words(&words).unwrap();
+            };
+            // Move the CPU off reset (the empty PROM runs as no-ops) and put
+            // a pattern in RAM, so a load that missed either shows.
+            a.cpus[0].step_n_inline(1000).unwrap();
+            pattern(&a, 0x5a5a_0000);
+            a.save_snapshot("bare").unwrap();
+            let (at_save, cpu_at_save) = (digest(&a), a.cpus[0].save_state());
+            let saved = a.read_snapshot("bare").unwrap();
+            let board = saved.board.clone();
+            // Move on, then load what was saved.
+            a.cpus[0].step_n_inline(1000).unwrap();
+            pattern(&a, 0xa5a5_0000);
+            assert_ne!(digest(&a), at_save);
+            a.stop();
+            a.apply_snapshot(saved).unwrap();
+            assert_eq!(digest(&a), at_save);
+            assert_eq!(a.cpus[0].save_state(), cpu_at_save);
+            // Two clocks run in host time while the machine is stopped: the
+            // PHY's negotiation countdown, whose time left can only have
+            // shrunk since the load, and the RTC, which keeps the host's time
+            // of day as on every machine. Everything else comes back as saved.
+            let (mut board, mut got) = (board, a.save_board());
+            let left = |t: &toml::Value| crate::snapshot::field_u64(&t["eth"]["phy"], "deadline").unwrap();
+            assert!(left(&got) <= left(&board));
+            for t in [&mut board, &mut got] {
+                t["eth"]["phy"].as_table_mut().unwrap().remove("deadline");
+                t["ioc3"]["chip"].as_table_mut().unwrap().remove("rtc");
+            }
+            assert_eq!(got, board);
+        }).unwrap().join().unwrap();
+    }
+
+    /// Each case a save or load refuses gives its reason. (Decided without
+    /// building a machine for each: every Octane a test builds holds one of
+    /// the process's 64 device-map tables until the process ends.)
+    #[test]
+    fn each_refused_case_gives_its_reason() {
+        assert_eq!(snapshot_refusal_for(false, false, 1), None);
+        assert!(snapshot_refusal_for(true, false, 1).unwrap().contains("IMPACT"));
+        assert!(snapshot_refusal_for(false, true, 1).unwrap().contains("VPro"));
+        assert!(snapshot_refusal_for(false, false, 2).unwrap().contains("two-processor"));
+    }
+
+    /// A machine applies the refusal to both save and load.
+    #[test]
+    fn an_impact_board_is_refused_with_the_reason() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("impact");
+            let prom = empty_prom(&dir);
+            let mut m = machine_with(&prom, &dir, |cfg| cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact));
+            let e = m.save_snapshot("x").unwrap_err();
+            assert!(e.contains("IMPACT"), "{e}");
+            let e = m.load_snapshot("x").unwrap_err();
+            assert!(e.contains("IMPACT"), "{e}");
+        }).unwrap().join().unwrap();
+    }
+
+    /// A snapshot of another machine, or with a boot flash of another size,
+    /// is refused before the machine is touched: it carries on as it was.
+    /// (One machine for both: every Octane a test builds holds one of the
+    /// process's 64 device-map tables until the process ends.)
+    #[test]
+    fn a_snapshot_that_does_not_fit_is_refused_before_the_machine_is_touched() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("refuse");
+            let prom = empty_prom(&dir);
+            let mut a = machine(&prom, &dir);
+            a.save_snapshot("other").unwrap();
+            a.save_snapshot("flash").unwrap();
+            let path = dir.join("saves/other/snapshot.toml");
+            let manifest = std::fs::read_to_string(&path).unwrap().replace("octane_ip30", "o2_ip32");
+            std::fs::write(&path, manifest).unwrap();
+            std::fs::write(dir.join("saves/flash/flash.bin"), vec![0u8; 4096]).unwrap();
+            a.cpus[0].step_n_inline(100).unwrap();
+            let before = digest(&a);
+            assert!(a.load_snapshot("other").unwrap_err().contains("not of an Octane"));
+            let e = a.load_snapshot("flash").unwrap_err();
+            assert!(e.contains("flash"), "{e}");
+            assert_eq!(digest(&a), before, "the machine is as it was");
+        }).unwrap().join().unwrap();
     }
 }

@@ -76,6 +76,11 @@ adds **zero bytes** to disk for any RAM region that didn't change — same
 storage model as Docker layers. A snapshot records which CPU it was taken on
 (R4400/R5000/R10000) and refuses to restore onto a different CPU model.
 
+The O2 and the Octane save in this format too. An Octane snapshot covers one
+processor and no graphics board: with two processors or an IMPACT or VPro board
+fitted, a save or load is refused with the reason. Neither board's state is
+saved.
+
 From the interactive monitor (`telnet 127.0.0.1 8888`):
 ```
 save base/desktop          # writes saves/base/desktop/
