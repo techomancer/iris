@@ -184,13 +184,34 @@ impl ScsiDeviceConfig {
 
     /// Where a `--ci` run keeps the copy-on-write overlay of the disk at
     /// `id`: in the host's temporary directory (`$TMPDIR`, or `/tmp` when it
-    /// is unset) and named for the process, so an interactive iris holding
-    /// `PATH.overlay` can coexist with any number of CI runs. The path is
-    /// absolute, so a later change of directory still finds it. The files
-    /// are kept for post-mortem inspection.
+    /// is unset), as an absolute path, so a later change of directory still
+    /// finds it.
+    ///
+    /// The name carries [`ci_run_tag`](Self::ci_run_tag), so an interactive
+    /// iris holding `PATH.overlay`, any number of CI runs, and a later run
+    /// that gets the same process ID never open each other's overlay. A
+    /// machine rebuilt in the same process reopens its own. The files are
+    /// kept after the run for inspection.
     pub fn ci_overlay_path(id: u8) -> String {
-        let path = std::env::temp_dir().join(format!("iris-ci-{}-scsi{}.overlay", std::process::id(), id));
+        static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let run = RUN.get_or_init(|| {
+            let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_err(|before| before.duration());
+            Self::ci_run_tag(std::process::id(), started)
+        });
+        let path = std::env::temp_dir().join(format!("iris-ci-{run}-scsi{id}.overlay"));
         std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned()
+    }
+
+    /// One run's part of its overlay names: the process ID and the time the
+    /// run first named an overlay, in nanoseconds since the epoch, or with a
+    /// `b` before it when the host clock is set before the epoch, so such a
+    /// clock still gives each run its own name.
+    fn ci_run_tag(pid: u32, started: Result<std::time::Duration, std::time::Duration>) -> String {
+        match started {
+            Ok(after) => format!("{pid}-{:x}", after.as_nanos()),
+            Err(before) => format!("{pid}-b{:x}", before.as_nanos()),
+        }
     }
 
     /// For `scratch = true`: make sure the volume exists, creating it with a
@@ -3450,5 +3471,43 @@ mod apply_env_tests {
         std::env::remove_var(OURS);
         set_or_remove_env(OURS, "");
         assert!(std::env::var_os(OURS).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ci_overlay_tests {
+    use super::ScsiDeviceConfig;
+    use std::time::Duration;
+
+    /// Process IDs come round again, and a container gives iris the same one
+    /// every time, so a later run must not take an earlier run's name and
+    /// adopt its overlay.
+    #[test]
+    fn a_later_run_with_the_same_process_id_gets_its_own_overlay() {
+        let first = ScsiDeviceConfig::ci_run_tag(2, Ok(Duration::from_nanos(1_000)));
+        let later = ScsiDeviceConfig::ci_run_tag(2, Ok(Duration::from_nanos(2_000)));
+        assert_ne!(first, later);
+    }
+
+    /// A host clock set before the epoch still names each run apart, and
+    /// never as a run the same distance after it.
+    #[test]
+    fn a_clock_before_the_epoch_still_names_runs_apart() {
+        let tag = |t| ScsiDeviceConfig::ci_run_tag(2, t);
+        let (a, b) = (tag(Err(Duration::from_nanos(5_000))), tag(Err(Duration::from_nanos(4_000))));
+        assert_ne!(a, b);
+        assert_ne!(a, tag(Ok(Duration::from_nanos(5_000))));
+        assert_ne!(tag(Err(Duration::ZERO)), tag(Ok(Duration::ZERO)));
+    }
+
+    #[test]
+    fn one_run_keeps_one_name_per_disk_in_the_temporary_directory() {
+        let a = ScsiDeviceConfig::ci_overlay_path(1);
+        let path = std::path::Path::new(&a);
+        assert!(path.is_absolute(), "{a}");
+        assert_eq!(path.parent(), std::path::absolute(std::env::temp_dir()).ok().as_deref());
+        assert_eq!(a, ScsiDeviceConfig::ci_overlay_path(1));
+        assert_ne!(a, ScsiDeviceConfig::ci_overlay_path(2));
+        assert!(a.contains(&format!("iris-ci-{}-", std::process::id())), "{a}");
     }
 }
