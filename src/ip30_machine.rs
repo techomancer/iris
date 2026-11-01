@@ -91,6 +91,8 @@ pub const WIDGET_GFX: u8 = 11;
 /// The Bridge input IOC3's SuperIO block (serial, keyboard, clock) is
 /// wired to; the Ethernet uses IOC3's PCI pin.
 const SUPERIO_PIN: u8 = 4;
+/// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
+const VIRTIO_SLOT: u8 = 4;
 /// The blank part on the Bridge's second flash select: reads all ones and
 /// keeps no writes, an approximation from one word read on a real Octane2.
 /// The PROM looks for a part there too.
@@ -131,6 +133,8 @@ pub struct OctaneMachine {
     pub scsi: [Arc<Isp1040>; 2],
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
+    /// virtio-serial (`[virtio_serial]`), the next free Bridge slot.
+    virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     flash: Arc<CfiFlash>,
     /// The IMPACT board, when `[graphics] board` names one.
     pub gfx: Option<Arc<ImpactXio>>,
@@ -277,6 +281,14 @@ impl OctaneMachine {
             rad.enable_output(cfg.audio.clone());
         }
         bridge.attach(3, rad.clone());
+        let virtio = cfg.virtio_serial.enabled.then(|| {
+            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
+                crate::dev::virtio::console::from_config(&cfg.virtio_serial),
+            ));
+            bridge.attach(VIRTIO_SLOT, dev.clone());
+            eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
+            dev
+        });
 
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
@@ -516,6 +528,7 @@ impl OctaneMachine {
             scsi,
             eth,
             rad,
+            virtio,
             flash,
             gfx,
             vpro,
@@ -616,6 +629,9 @@ impl OctaneMachine {
             self.scsi[1].clone(),
             self.rad.clone(),
         ];
+        if let Some(v) = &self.virtio {
+            d.push(v.clone());
+        }
         if let Some(g) = &self.gfx {
             d.push(g.clone());
         }
@@ -691,6 +707,9 @@ impl OctaneMachine {
             c.reset();
         }
         self.rad.reset();
+        if let Some(v) = &self.virtio {
+            Resettable::power_on(&**v);
+        }
         self.flash.reset();
         if let Some(g) = &self.gfx {
             g.power_on();

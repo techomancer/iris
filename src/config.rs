@@ -505,6 +505,60 @@ pub struct Ultra64Config {
     pub enabled: bool,
 }
 
+/// Which GIO expansion slot a virtio device sits in (machines without PCI).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtioGioSlot {
+    /// 0x1F400000; shared with `--test-device` and the Ultra64 board.
+    Exp0,
+    /// 0x1F600000; shared with the second Newport head (`graphics.heads = 2`).
+    #[default]
+    Exp1,
+}
+
+/// One virtio-serial port and the host end it is connected to.
+///
+/// With neither `tcp_port` nor `socket` the port is wired to nothing: output
+/// is dropped and no input arrives.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct VirtioSerialPort {
+    /// Name the guest sees (`/dev/virtio-ports/<name>` on Linux). Unnamed
+    /// ports are found by number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The guest should treat this port as its console.
+    #[serde(default)]
+    pub console: bool,
+    /// Serve the port as a raw (not telnet) TCP socket on 127.0.0.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_port: Option<u16>,
+    /// Serve the port on a raw Unix socket at this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+}
+
+/// virtio-serial (virtio-console) device for the guest, `[virtio_serial]`.
+/// See `src/dev/virtio` and `docs/virtio-serial.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct VirtioSerialConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// GIO expansion slot, on the Indy and Indigo2 (IP24/IP22/IP28). The
+    /// machines with PCI (O2, Octane) put it on the PCI bus and ignore this.
+    #[serde(default)]
+    pub slot: VirtioGioSlot,
+    /// The ports, in order; port 0 is the first. Empty means one console
+    /// port on TCP 127.0.0.1:8890.
+    #[serde(default, rename = "port", skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<VirtioSerialPort>,
+}
+
+impl VirtioSerialConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Emulated SGI machine profile (hardware layout scaffold).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1721,6 +1775,10 @@ pub struct MachineConfig {
     /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
     #[serde(default)]
     pub ultra64: Ultra64Config,
+
+    /// virtio-serial guest device (`[virtio_serial]`, `[[virtio_serial.port]]`).
+    #[serde(default, skip_serializing_if = "VirtioSerialConfig::is_default")]
+    pub virtio_serial: VirtioSerialConfig,
 }
 
 fn default_scsi_deferred_int() -> bool { true }
@@ -1917,6 +1975,7 @@ impl Default for MachineConfig {
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
             ultra64: Ultra64Config::default(),
+            virtio_serial: VirtioSerialConfig::default(),
         }
     }
 }
@@ -1925,6 +1984,50 @@ impl Default for MachineConfig {
 fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::default() }
 
 impl MachineConfig {
+    /// `[virtio_serial]`: the ports it lists, and whether this machine has
+    /// somewhere to put it.
+    fn validate_virtio_serial(&self) -> Result<(), String> {
+        let v = &self.virtio_serial;
+        if !v.enabled {
+            return Ok(());
+        }
+        // Two queues per port and the control pair, in a 64-bit notify mask.
+        if v.ports.len() > 31 {
+            return Err(format!("[virtio_serial] has {} ports (at most 31)", v.ports.len()));
+        }
+        for (i, p) in v.ports.iter().enumerate() {
+            if p.tcp_port.is_some() && p.socket.is_some() {
+                return Err(format!("[virtio_serial] port {i}: tcp_port and socket are exclusive"));
+            }
+            if p.name.as_deref().is_some_and(|n| n.is_empty() || n.len() > 200) {
+                return Err(format!("[virtio_serial] port {i}: name must be 1 to 200 bytes"));
+            }
+            if v.ports[..i].iter().any(|q| q.name.is_some() && q.name == p.name) {
+                return Err(format!("[virtio_serial] port {i}: name {:?} is used twice", p.name.as_deref().unwrap_or("")));
+            }
+        }
+        match self.machine.profile {
+            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
+                match v.slot {
+                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device => Err(
+                        "[virtio_serial] slot = \"exp0\" is taken by the ultra64 board or test_device; use \"exp1\"".into(),
+                    ),
+                    VirtioGioSlot::Exp1 if self.graphics.heads == 2 && !self.headless => Err(
+                        "[virtio_serial] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"".into(),
+                    ),
+                    _ => Ok(()),
+                }
+            }
+            // The Octane has a PCI bridge with a free slot.
+            MachineProfile::OctaneIp30 => Ok(()),
+            MachineProfile::O2Ip32 => Err(
+                "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
+                 MACE PCI bridge has no interrupt route for a third slot (see docs/virtio-serial.md)"
+                    .into(),
+            ),
+        }
+    }
+
     /// The serial channels' TCP ports (A, B), defaults filled in.
     pub fn serial_ports(&self) -> [u16; 2] {
         let [a, b] = crate::dev::z85c30::DEFAULT_PORTS;
@@ -2061,6 +2164,7 @@ impl MachineConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_virtio_serial()?;
         if self.machine.cpus != 1 && self.machine.profile != MachineProfile::OctaneIp30 {
             return Err(format!("[machine] cpus = {}: only the Octane has more than one processor", self.machine.cpus));
         }

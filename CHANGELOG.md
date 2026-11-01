@@ -71,6 +71,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   completes, also with `write_cache = true`, so killing iris loses nothing
   on a CHD either.
 
+### virtio-serial guest device
+
+- New `[virtio_serial]` section: a virtio 1.x console / virtio-serial device
+  with named multiport channels, host ends on raw TCP or Unix sockets. It is a
+  transport-neutral core (`src/dev/virtio/`) with two transports: virtio-mmio
+  in a GIO expansion slot for the Indy, Indigo2 (IP22) and Indigo2 IMPACT
+  (IP28), which have no PCI bus, and virtio-pci for the Octane's Bridge. The
+  O2 has the transport but no interrupt route yet, and refuses the section.
+  It needs a guest driver and is off by default. See
+  [docs/virtio-serial.md](docs/virtio-serial.md).
+- `PciConfig` can carry a read-only capability list (`with_capabilities`).
+
 ## October 2026
 
 ### Octane snapshots

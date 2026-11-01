@@ -17,3 +17,11 @@ resolution = "guest"
 path    = "ip28/blank.raw"
 cdrom   = false
 overlay = true
+
+# Optional: a virtio-serial port for a guest that has a driver for it
+# (see docs/virtio-serial.md). GIO expansion slot 1 by default.
+# [virtio_serial]
+# enabled = true
+# [[virtio_serial.port]]
+# console  = true
+# tcp_port = 8890
