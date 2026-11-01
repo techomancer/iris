@@ -1109,6 +1109,7 @@ impl ScsiTarget for ScsiDevice {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Illegal Request: Invalid command
         }
 
+        crate::dlog!(crate::devlog::LogModule::Scsi, "SCSI target cmd {:02x} cdb={:02x?}", req.cdb[0], &req.cdb);
         let lun = (req.cdb[1] >> 5) & 0x7;
 
         // For most commands, only LUN 0 is valid
