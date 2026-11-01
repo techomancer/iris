@@ -1485,6 +1485,35 @@ mod tests {
         assert!(exec.core.hot.cycles >= before);
     }
 
+    /// The stall moves the cycle counter at the pacing rate so cycle readers
+    /// see time pass, but it retires nothing: the MIPS figure must not count
+    /// it, or an idle guest sitting in WAIT reads about 100 MIPS.
+    #[test]
+    fn test_wait_stall_is_not_retired() {
+        let (mut exec, _) = create_executor();
+        exec.core.pc = 0xFFFF_FFFF_8000_1000;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::CAUSE_IP2;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        let cycles = exec.cycles_ptr();
+        let before = cycles.retired();
+
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let raiser = std::thread::spawn(move || {
+            let irq = irq;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: the executor outlives this thread, which is joined below.
+            unsafe { &*irq.0 }.fetch_or(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::SeqCst);
+        });
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        raiser.join().unwrap();
+
+        assert!(cycles.get() >= before + 1_000_000, "20 ms of stall is 2M cycles at 10 ns each");
+        assert_eq!(cycles.retired(), before, "a stall retires nothing");
+    }
+
     /// A soft reset must escape the stall even when interrupts are enabled but
     /// nothing is pending — otherwise a reset could not break into an idle
     /// guest.

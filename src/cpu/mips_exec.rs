@@ -7358,6 +7358,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     let p = &mut self.core.hot.cycles as *mut u64;
                     std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(delta));
                 }
+                // Paced time, not instructions: the status bars' MIPS
+                // (`CyclesPtr::retired`) leaves it out.
+                self.core.hot.parked_cycles = self.core.hot.parked_cycles.wrapping_add(delta);
             }
             std::hint::spin_loop();
         }

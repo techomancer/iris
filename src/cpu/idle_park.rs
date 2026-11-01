@@ -1124,6 +1124,21 @@ mod retired_tests {
         assert_eq!(p.retired(), 7);
     }
 
+    /// A hard reset starts the cycle counter again from 0; the parked part
+    /// must go with it, or the bars read 0 MIPS after a reboot for as long
+    /// as the previous run spent parked.
+    #[test]
+    fn a_reset_starts_the_retired_count_again() {
+        let mut core = MipsCore::default();
+        core.hot.cycles = 1_000;
+        advance_parked(&mut core, 1_000_000);
+        let p = ptr(&core);
+        core.reset(false);
+        assert_eq!(p.get(), 0);
+        core.hot.cycles += 50;
+        assert_eq!(p.retired(), 50);
+    }
+
     #[test]
     fn plain_pointer_has_no_parked_time() {
         let mut core = MipsCore::default();

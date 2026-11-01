@@ -1481,6 +1481,9 @@ impl MipsCore {
             self.cp0_entryhi = 0;
             self.cp0_compare = 0;
             self.hot.cycles = 0;
+            // Parked time is part of `cycles`; keep it so, or `retired()`
+            // reads 0 until the new run's cycles pass the old run's parks.
+            self.hot.parked_cycles = 0;
             self.count_read_cycle = 0;
             self.count_anchor_instant = std::time::Instant::now();
             #[cfg(feature = "ci_clock")]
