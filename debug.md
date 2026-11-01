@@ -258,7 +258,7 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 
 | Command | Description |
 |---|---|
-| `dt [n]` / `dt file <path> [n]` | Disassemble the traceback: the last `n` instructions executed (the history holds 1,048,576) |
+| `dt [n]` / `dt file [<path> [n]]` | Disassemble the traceback: the last `n` instructions executed (the history holds 1,048,576); `dt file` with no path writes `iris_trace.txt` in `$TMPDIR` (else `/tmp`), and a count needs a path before it |
 | `undo on` / `undo off` | Enable / disable the undo buffer, which records stores to the machine's RAM **[DEV]** |
 | `undo [n]` / `u` | Step back `n` instructions, reversing register and memory changes **[DEV]** |
 | `undo clear` / `undo resize <n>` | Clear / resize the undo history **[DEV]** |

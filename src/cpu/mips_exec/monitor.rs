@@ -85,6 +85,12 @@ fn monitor_phys(arg: u64) -> u64 {
     if arg >> 32 == 0xFFFF_FFFF { arg & 0xFFFF_FFFF } else { arg }
 }
 
+/// Where `dt file` writes when given no path: `iris_trace.txt` in the host's
+/// temporary directory (`$TMPDIR`, or `/tmp` when it is unset).
+fn default_trace_file() -> String {
+    std::env::temp_dir().join("iris_trace.txt").to_string_lossy().into_owned()
+}
+
 /// Unmapped physical addresses are backed by `UnmappedRam`, which accepts every
 /// write and reads back zero — so a write into the void is completely silent.
 /// Probe with a non-zero pattern before committing an image.
@@ -573,7 +579,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             ("debug".to_string(), "CPU instruction trace: debug <on|off|file <path>> [DEV]".to_string()),
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear|resize <n>> [DEV]".to_string()),
-            ("dt".to_string(), "Disassemble traceback: dt [count] | dt file <path> [count]".to_string()),
+            ("dt".to_string(), "Disassemble traceback: dt [count] | dt file [<path> [count]]".to_string()),
             ("idleprof".to_string(), "Locate idle/spin loops: idleprof <on|off|report [count]|stats>".to_string()),
             #[cfg(feature = "idle-pause")]
             ("idle".to_string(), "Idle parking: idle <on|off|status>".to_string()),
@@ -3292,11 +3298,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             }
             "dt" | "traceback" => {
                 // dt [N]              — dump last N instructions to console (default 10)
-                // dt file <path> [N] — dump to file (default: entire buffer)
+                // dt file [<path> [N]] — dump to file (default: entire buffer);
+                //                       a count needs a path before it
                 let (file_path, count) = if actual_args.first().copied() == Some("file") {
-                    let path = actual_args.get(1).copied().unwrap_or("/tmp/iris_trace.txt");
+                    let path = actual_args.get(1).map(|p| p.to_string()).unwrap_or_else(default_trace_file);
                     let n = actual_args.get(2).and_then(|s| s.parse().ok()).unwrap_or(TRACEBACK_SIZE);
-                    (Some(path.to_string()), n)
+                    (Some(path), n)
                 } else {
                     let n = actual_args.first().and_then(|s| s.parse().ok()).unwrap_or(10);
                     (None, n)
@@ -3656,5 +3663,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             }
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod trace_file_tests {
+    #[test]
+    fn dt_file_defaults_to_the_temporary_directory() {
+        assert_eq!(std::path::Path::new(&super::default_trace_file()), std::env::temp_dir().join("iris_trace.txt"));
     }
 }
