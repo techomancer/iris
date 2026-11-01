@@ -273,6 +273,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   names `/tmp/iris.sock` itself should pass `--ci-socket` to iris as well.
   `tools/iris-test` takes the same default, and puts its default screenshot in
   the same directory. Windows keeps `127.0.0.1:19851`.
+- **The monitor's `dt file` without a path** writes `iris_trace.txt` in the
+  same temporary directory, instead of always `/tmp/iris_trace.txt`.
 ### SGI Octane (IP30)
 
 - **Octane compile workers start after the memory windows are published.** A
