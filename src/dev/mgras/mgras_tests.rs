@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::record::tests::{live_board, read, replay_recs, write};
+use super::record::tests::{live_board, poll_until, read, replay_recs, write};
 use super::record::load_text;
 use super::Mgras;
 use crate::traits::{BusDevice, BusRead32, BusRead8, BUS_OK};
@@ -77,14 +77,7 @@ fn block(m: &Mgras, x0: u32, y0: u32, x1: u32, y1: u32) {
 
 /// Flags, polled until `bit` is set (the HQ3 raises them asynchronously).
 fn wait_flag(m: &Mgras, bit: u32) -> u32 {
-    for _ in 0..1_000_000 {
-        let f = read(m, 32, FLAGS) as u32;
-        if f & bit != 0 {
-            return f;
-        }
-        std::thread::yield_now();
-    }
-    panic!("flag {bit:#x} never set");
+    poll_until(|| Some(read(m, 32, FLAGS) as u32).filter(|f| f & bit != 0)).unwrap_or_else(|| panic!("flag {bit:#x} never set"))
 }
 
 #[test]

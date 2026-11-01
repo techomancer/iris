@@ -310,6 +310,27 @@ pub(super) mod tests {
         m
     }
 
+    /// Poll `f` until it returns `Some`, giving up after `POLL_LIMIT`. The
+    /// engine threads run asynchronously and the test binary runs many
+    /// boards at once, so a thread can wait hundreds of milliseconds for
+    /// a core; a poll counted in iterations gave up after about 200 ms of
+    /// that. Time bounds the wait on the thing being awaited, not on how
+    /// fast the polling loop spins.
+    pub fn poll_until<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        let end = std::time::Instant::now() + POLL_LIMIT;
+        loop {
+            if let Some(v) = f() {
+                return Some(v);
+            }
+            if std::time::Instant::now() >= end {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Store, retrying on bus back-pressure like the CPU does.
     pub fn write(m: &Mgras, bits: u8, off: u32, val: u64) {
         let a = (MGRAS_SLOT_GFX_BASE + off) as u64;

@@ -1206,6 +1206,7 @@ impl Resettable for ImpactXio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::record::tests::poll_until;
     use crate::traits::BUS_BUSY;
 
     fn gl() -> Box<Gl> {
@@ -1673,14 +1674,7 @@ mod tests {
         for _ in 0..2 {
             r.w32(COMMAND, 0x37 << 8); // SCHEDULE_SWAP
             // The HQ thread raises the source, then sends the packet.
-            let mut got = Vec::new();
-            for _ in 0..1_000_000 {
-                got = r.packets();
-                if !got.is_empty() {
-                    break;
-                }
-                std::thread::yield_now();
-            }
+            let got = poll_until(|| Some(r.packets()).filter(|g| !g.is_empty())).expect("swap packet never arrived");
             assert_eq!(got, [(18, true)]);
             assert_eq!(r.r32(0x011020) & 0x400, 0x400);
             assert_eq!(r.r32(0x020010) & 0x400, 0);
@@ -1772,14 +1766,7 @@ mod tests {
             r.w32(0x011070, 18 << 8);
             r.w32(0x011040, 0x400);
             r.w32(COMMAND, 0x37 << 8); // SCHEDULE_SWAP
-            let mut got = Vec::new();
-            for _ in 0..1_000_000 {
-                got = r.packets();
-                if !got.is_empty() {
-                    break;
-                }
-                std::thread::yield_now();
-            }
+            let got = poll_until(|| Some(r.packets()).filter(|g| !g.is_empty())).expect("swap packet never arrived");
             assert_eq!(got, [(18, true)], "round {round}");
             // Not acknowledged: the board is reset instead.
             r.b.reset();
