@@ -177,7 +177,7 @@ pub struct ScsiDevice {
     /// controller reset. Off unless [`ScsiDevice::with_write_cache`] says so.
     power_on_write_cache: bool,
     /// The disk's background sync, whose thread runs until this is dropped.
-    /// A read-only or CHD image has none.
+    /// A read-only image has none.
     background: Option<std::sync::Arc<Background>>,
 }
 

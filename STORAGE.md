@@ -44,11 +44,10 @@ write_cache = false   # default true
 
 **The risk of `true`:** a host crash or power loss can lose up to about 5 s of
 the writes the guest was told were done, in any order, and that can damage the
-guest's filesystem. Nothing synced
-a disk before this setting existed except SYNCHRONIZE CACHE and a clean stop,
-so the default is no less safe than what it replaced. Set `write_cache =
-false` for a disk you cannot rebuild, or an installed system you keep. Stop
-iris cleanly before shutting the host down.
+guest's filesystem. Nothing synced a disk before this setting existed except
+SYNCHRONIZE CACHE and a clean stop, so the default is no less safe than what
+it replaced. Set `write_cache = false` for a disk you cannot rebuild, or an
+installed system you keep. Stop iris cleanly before shutting the host down.
 
 ### What survives
 
@@ -62,8 +61,11 @@ SYNCHRONIZE CACHE lose nothing in any mode. These cases differ:
 
 A guest's `sync` or `fsync` does not change this: IRIX sends nothing the disk
 acts on. A thread syncs a disk about 5 s after the first write that follows a
-sync, so treat 5 s as typical, not as a bound. A real host crash has not been
-tried; the window follows from how the sync works.
+sync, so treat 5 s as typical, not as a bound. Measured on an Octane with
+IRIX 6.5.30 on CHD disks: four kills, each during a loop that copied a file
+and ran `sync`, lost none of the 58 files the loop had finished, and the root
+filesystem stayed sound. A real host crash has not been tried; its window
+follows from how the sync works.
 
 A guest can switch the bit with MODE SELECT (clearing it stores what was
 written so far at once). A bus reset puts it back to the configured value: on
@@ -81,6 +83,19 @@ disagree. `write_cache = false` is the faithful mode: GOOD means stored, which
 is what IRIX assumes. NetBSD and Linux send SYNCHRONIZE CACHE to a disk that
 reports a cache, so `true` is safer for them.
 
+### CHD disks
+
+A write to a hunk the CHD already holds is stored in place. A write to a new
+hunk appends it to the file, and the hunk's map entry waits in memory until a
+sync has stored the data, so after a host crash the map only points at data
+that reached the disk. In either mode the write then syncs the data, writes
+the entry and syncs again, before the guest is told it is done. Left to
+the background sync, the entry would be lost to a kill while later writes to
+hunks already held were kept, and a filesystem cannot recover from losing an
+earlier write but keeping a later one. Writes to a hunk the CHD already holds
+cost one sync with `write_cache = false` and none with `true`, as on a raw
+image, so the extra cost falls on a fresh `.diff.chd` filling up.
+
 ### For developers
 
 - The interval is `BACKGROUND_FLUSH_INTERVAL` (5 s) in `src/block_node.rs`.
@@ -95,26 +110,30 @@ reports a cache, so `true` is safer for them.
 What a `BlockNode` promises (the `block_node.rs` module docs say the same):
 
 - `write` has put the data where a killed iris leaves it, the host's file,
-  before it returns. Data held only in memory dies with `kill -9`, so a backend
-  that does that must say so in the table above.
+  before it returns. Data held only in memory dies with `kill -9`, so a
+  backend that holds part of a write back (the CHD's map entry for a new
+  hunk) syncs before `write` returns.
 - `flush_data` returns only when every write accepted so far is on the host's
   disk and the file would open after a crash and read back as the guest wrote
   it. An on-disk index must never point at data that is not there. It may
   skip work only a clean stop needs, such as compacting an overlay's record.
   `write_cache = false` and FUA depend on it.
 - `flush` is `flush_data` plus that housekeeping.
-- `background` returns the node's `Background`, whose thread syncs the node's
-  files holding no node or SCSI lock. A failed sync leaves the writes pending,
-  so the thread retries.
+- `background` returns the node's `Background`. A backend whose syncs must go
+  in an order supplies a `Durable`; its `sync_data` does what `flush_data`
+  does, and the thread calls it holding no node or SCSI lock. A failed sync
+  leaves the writes pending, so the thread retries.
 
 A new backend, a qcow2 image for instance, has to: write guest data to the
 host's file before `write` returns; make `flush_data` sync data clusters
-before the tables that point at them, then the tables; let the thread sync in
-that order; call `mark` after every write; and say so in the
-table above if it holds accepted writes in memory. Tests to copy, in
+before the tables that point at them, then the tables; have the thread sync in
+that order through `Durable`; call `mark` after every write; and add a column
+to the table above if it holds accepted writes in memory. Tests to copy, in
 `src/scsi.rs`: `a_disk_without_a_write_cache_stores_every_write_before_good`,
 `write_10_with_fua_syncs_before_good` and
-`synchronize_cache_flushes_in_both_cdb_sizes`.
+`synchronize_cache_flushes_in_both_cdb_sizes`. For a kill test, see the
+ignored `kill_mid_write_leaves_a_chd_that_opens` in
+`src/block_node_sync_bench.rs`.
 
 ## Copy-on-write disk overlay
 

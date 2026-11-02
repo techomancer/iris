@@ -7,12 +7,14 @@
 //!   * [`ChdCd`] — single-track MODE1 CD CHD exposed as a 2048-byte/sector
 //!     read-only stream via libchdman-rs's `CdCookedReader`.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use libchdman_rs::cd::CdCookedReader;
 use libchdman_rs::hd::HdImage;
+use libchdman_rs::metadata::tags::HARD_DISK_METADATA_TAG;
 use libchdman_rs::Chd;
 
 fn map_err<E: std::fmt::Debug>(e: E) -> io::Error {
@@ -21,7 +23,14 @@ fn map_err<E: std::fmt::Debug>(e: E) -> io::Error {
 
 /// Writable hard-disk CHD backend.
 pub struct ChdHd {
-    img: HdImage,
+    // Dropped in declaration order: MAME's child holds a non-owning pointer
+    // to its parent, so `chd` must go before `parent`.
+    chd: Chd,
+    /// The read-only parent of a diff. Never written.
+    #[allow(dead_code)]
+    parent: Option<Chd>,
+    /// The file `chd` writes through.
+    file: Arc<ChdFile>,
     sector_size: u32,
     total_bytes: u64,
     /// The base CHD path (the file the user configured).
@@ -59,20 +68,31 @@ impl ChdHd {
         //    never written in-session (protect + rollback).
         //  - no diff, base opens writable in place (uncompressed, COW off) → no diff.
         //  - no diff, base won't open writable (compressed) → create a fresh diff.
-        let (img, diff_path, dirty) = if diff.exists() {
-            (HdImage::reopen_diff(p, &diff).map_err(map_err)?, Some(diff), true)
+        let (chd, parent, file, diff_path, dirty) = if diff.exists() {
+            let (chd, parent, file) = open_diff(p, &diff)?;
+            (chd, Some(parent), file, Some(diff), true)
         } else if cow {
-            (HdImage::open_with_diff(p, &diff).map_err(map_err)?, Some(diff), false)
+            let (chd, parent, file) = create_diff(p, &diff)?;
+            (chd, Some(parent), file, Some(diff), false)
         } else {
-            match HdImage::open(p) {
-                Ok(img) => (img, None, false),
-                Err(_) => (HdImage::open_with_diff(p, &diff).map_err(map_err)?, Some(diff), false),
+            match open_writable(p, None) {
+                Ok((chd, file)) => (chd, None, file, None, false),
+                Err(_) => {
+                    let (chd, parent, file) = create_diff(p, &diff)?;
+                    (chd, Some(parent), file, Some(diff), false)
+                }
             }
         };
 
-        let sector_size = img.sector_size();
-        let total_bytes = img.sector_count() * u64::from(sector_size);
-        Ok(Self { img, sector_size, total_bytes, base_path: p.to_path_buf(), diff_path, dirty, cow })
+        let sector_size = sector_bytes(&chd)?;
+        let total_bytes = chd.logical_bytes() / u64::from(sector_size) * u64::from(sector_size);
+        Ok(Self { chd, parent, file, sector_size, total_bytes, base_path: p.to_path_buf(), diff_path, dirty, cow })
+    }
+
+    /// The file this disk's writes go to, for a thread that makes them
+    /// durable (see [`ChdFile::sync`]).
+    pub fn file(&self) -> Arc<ChdFile> {
+        self.file.clone()
     }
 
     /// `(base, diff)` paths if a clean exit should **auto-fold** this disk's diff
@@ -124,12 +144,7 @@ impl ChdHd {
             ));
         }
         let mut buf = vec![0u8; count * ss as usize];
-        for i in 0..count {
-            let off = i * ss as usize;
-            self.img
-                .read_sector(lba + i as u64, &mut buf[off..off + ss as usize])
-                .map_err(map_err)?;
-        }
+        self.chd.read_bytes(lba * ss, &mut buf).map_err(map_err)?;
         Ok(buf)
     }
 
@@ -141,13 +156,7 @@ impl ChdHd {
                 format!("CHD HD write length {} not a multiple of sector {}", data.len(), ss),
             ));
         }
-        let count = data.len() / ss;
-        for i in 0..count {
-            let off = i * ss;
-            self.img
-                .write_sector(lba + i as u64, &data[off..off + ss])
-                .map_err(map_err)?;
-        }
+        self.chd.write_bytes(lba * ss as u64, data).map_err(map_err)?;
         // Writing to a diff means the sidecar now diverges from the base, so a
         // clean shutdown should fold it back. (No-op for an in-place base.)
         if self.diff_path.is_some() {
@@ -155,6 +164,314 @@ impl ChdHd {
         }
         Ok(())
     }
+}
+
+/// The sector size in a hard-disk CHD's geometry record.
+///
+/// This does not use libchdman-rs's `hd::read_geometry`: that first sizes the
+/// record by having MAME read it into a null buffer of length 0, and on a CHD
+/// opened with `Chd::open_custom` the crate's read callback turns that null
+/// pointer into a slice, which is undefined behaviour (debug builds abort).
+/// `metadata_iter` has MAME read each record into a buffer it allocates.
+fn sector_bytes(chd: &Chd) -> io::Result<u32> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "CHD has no valid hard-disk geometry");
+    for entry in chd.metadata_iter() {
+        let entry = entry.map_err(map_err)?;
+        if entry.tag != HARD_DISK_METADATA_TAG {
+            continue;
+        }
+        // "CYLS:%d,HEADS:%d,SECS:%d,BPS:%d", NUL-terminated.
+        let s = std::str::from_utf8(&entry.data).map_err(|_| bad())?.trim_end_matches('\0');
+        return s.split(',').find_map(|f| f.strip_prefix("BPS:")).and_then(|v| v.parse().ok()).ok_or_else(bad);
+    }
+    Err(bad())
+}
+
+/// Open `path`, an uncompressed v5 CHD, for writing through a [`ChdFile`].
+/// A compressed CHD cannot be written in place, and is refused.
+fn open_writable(path: &Path, parent: Option<&Chd>) -> io::Result<(Chd, Arc<ChdFile>)> {
+    let file = Arc::new(ChdFile::open(path)?);
+    let io = ChdFileIo { file: file.clone(), pos: 0 };
+    let chd = Chd::open_custom(io, true, parent).map_err(map_err)?;
+    Ok((chd, file))
+}
+
+/// Open an existing diff and its parent.
+fn open_diff(parent_path: &Path, diff_path: &Path) -> io::Result<(Chd, Chd, Arc<ChdFile>)> {
+    let parent = Chd::open(parent_path.to_str().ok_or_else(non_utf8)?, false, None).map_err(map_err)?;
+    let (chd, file) = open_writable(diff_path, Some(&parent))?;
+    Ok((chd, parent, file))
+}
+
+/// Create an empty uncompressed diff over `parent_path` and open it. The diff
+/// is built under another name and renamed into place once it is on the
+/// disk, so a crash never leaves a half-made diff where the next start would
+/// reattach it.
+fn create_diff(parent_path: &Path, diff_path: &Path) -> io::Result<(Chd, Chd, Arc<ChdFile>)> {
+    let tmp = {
+        let mut s = diff_path.as_os_str().to_owned();
+        s.push(".new");
+        PathBuf::from(s)
+    };
+    let built = (|| {
+        let parent = Chd::open(parent_path.to_str().ok_or_else(non_utf8)?, false, None).map_err(map_err)?;
+        let mut diff = Chd::create_with_parent(
+            tmp.to_str().ok_or_else(non_utf8)?,
+            parent.logical_bytes(),
+            parent.hunk_bytes(),
+            [0; 4],
+            &parent,
+        )
+        .map_err(map_err)?;
+        // MAME's create does not copy the parent's metadata (the geometry
+        // among it) into the child; chdman does it by hand, and so do we.
+        diff.clone_all_metadata(&parent).map_err(map_err)?;
+        Ok::<_, io::Error>(())
+    })();
+    let placed = built.and_then(|()| {
+        fsync_path(&tmp)?;
+        std::fs::rename(&tmp, diff_path)?;
+        // Best effort, as in flatten_diff: Windows cannot open a directory
+        // to sync it.
+        let _ = fsync_dir(diff_path.parent());
+        Ok(())
+    });
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    open_diff(parent_path, diff_path)
+}
+
+fn non_utf8() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path")
+}
+
+/// The file under a writable hard-disk CHD, written by MAME's CHD code
+/// through a [`ChdFileIo`].
+///
+/// MAME stores a write to a hunk the image already holds in place. A write
+/// to a hunk it does not hold yet is appended at the end of the file, and
+/// the hunk's 4-byte entry in the map then points at it. If the host went
+/// down with that entry on the disk but not the data, the hunk would read as
+/// whatever the end of the file held, not as the parent or as zeroes. So the
+/// map entries are held here and written only by [`ChdFile::sync`], after a
+/// sync has put the data they point at on the disk: whatever the host
+/// loses, the map on the disk only points at data that is there.
+pub struct ChdFile {
+    file: File,
+    /// Where the map is in the file: a v5 uncompressed CHD's map is one
+    /// 4-byte entry per hunk, at the offset its header gives.
+    map: std::ops::Range<u64>,
+    /// Writes to the map that are not in the file yet.
+    held: Mutex<Held>,
+    /// Taken for a whole sync, so that syncs run one at a time while a write
+    /// takes only `held`, and only for as long as it adds an entry.
+    syncing: Mutex<()>,
+}
+
+/// The map writes a [`ChdFile`] holds, oldest first.
+#[derive(Default)]
+struct Held {
+    /// Being written by the sync in progress. Reads still see them, until
+    /// the sync has put them on the disk.
+    taken: Vec<(u64, Vec<u8>)>,
+    /// Made since that sync took its entries.
+    new: Vec<(u64, Vec<u8>)>,
+}
+
+impl Held {
+    fn is_empty(&self) -> bool {
+        self.taken.is_empty() && self.new.is_empty()
+    }
+}
+
+impl ChdFile {
+    /// Open `path` read-write, and find its map. Only an uncompressed v5
+    /// CHD can be written, so anything else is refused.
+    fn open(path: &Path) -> io::Result<Self> {
+        const V5_HEADER: usize = 124;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut h = [0u8; V5_HEADER];
+        read_exact_at(&file, &mut h, 0)?;
+        let be32 = |o: usize| u32::from_be_bytes(h[o..o + 4].try_into().unwrap());
+        let be64 = |o: usize| u64::from_be_bytes(h[o..o + 8].try_into().unwrap());
+        if &h[0..8] != b"MComprHD" || be32(8) as usize != V5_HEADER || be32(12) != 5 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a writable (v5) CHD"));
+        }
+        if (16..32).step_by(4).any(|o| be32(o) != 0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a compressed CHD is not written in place"));
+        }
+        let (logical, map, hunk) = (be64(32), be64(40), u64::from(be32(56)));
+        if hunk == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "CHD with no hunk size"));
+        }
+        let hunks = logical.div_ceil(hunk);
+        Ok(Self { file, map: map..map + hunks * 4, held: Mutex::default(), syncing: Mutex::new(()) })
+    }
+
+    /// Make every write so far durable: the data, then the map entries that
+    /// point at it. `all` also syncs the file's other metadata, as a full
+    /// flush does.
+    ///
+    /// Syncs run one at a time, so one that returns has put every map entry
+    /// held before it on the disk, even when another thread's sync had
+    /// already taken them. A write that holds a new entry meanwhile only
+    /// waits for the entries to be taken: its data went to the file before
+    /// the entry did, so the next sync's first sync of the data covers it.
+    pub fn sync(&self, all: bool) -> io::Result<()> {
+        let _one = self.syncing.lock().unwrap();
+        let entries = {
+            let mut held = self.held.lock().unwrap();
+            let new = std::mem::take(&mut held.new);
+            held.taken = new;
+            held.taken.clone()
+        };
+        let stored = (|| {
+            self.file.sync_data()?;
+            if !entries.is_empty() {
+                for (offset, bytes) in &entries {
+                    write_all_at(&self.file, bytes, *offset)?;
+                }
+                self.file.sync_data()?;
+            }
+            Ok(())
+        })();
+        let mut held = self.held.lock().unwrap();
+        if stored.is_err() {
+            // Keep them for the next sync, ahead of the newer ones.
+            let mut taken = std::mem::take(&mut held.taken);
+            taken.append(&mut held.new);
+            held.new = taken;
+            return stored;
+        }
+        held.taken.clear();
+        drop(held);
+        if all {
+            self.file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Whether map entries wait for a sync.
+    pub fn holds_map_entries(&self) -> bool {
+        !self.held.lock().unwrap().is_empty()
+    }
+
+    fn overlaps_map(&self, offset: u64, len: usize) -> bool {
+        offset < self.map.end && offset + len as u64 > self.map.start
+    }
+}
+
+/// How MAME reads and writes a [`ChdFile`]: data goes to the file at once,
+/// and writes to the map are held for [`ChdFile::sync`].
+struct ChdFileIo {
+    file: Arc<ChdFile>,
+    pos: u64,
+}
+
+impl Read for ChdFileIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.file.overlaps_map(self.pos, buf.len()) {
+            let n = read_at(&self.file.file, buf, self.pos)?;
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        // MAME reads the map once, when it opens the file; lay any held
+        // entries over a later read all the same. The lock is taken before
+        // the file is read: a sync drops an entry only once it is in the
+        // file, so the read sees each entry in one place or the other.
+        let held = self.file.held.lock().unwrap();
+        let n = read_at(&self.file.file, buf, self.pos)?;
+        for (offset, bytes) in held.taken.iter().chain(&held.new) {
+            for (i, b) in bytes.iter().enumerate() {
+                let at = offset + i as u64;
+                if at >= self.pos && at < self.pos + n as u64 {
+                    buf[(at - self.pos) as usize] = *b;
+                }
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Write for ChdFileIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.file.overlaps_map(self.pos, buf.len()) {
+            self.file.held.lock().unwrap().new.push((self.pos, buf.to_vec()));
+        } else {
+            write_all_at(&self.file.file, buf, self.pos)?;
+        }
+        self.pos += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for ChdFileIo {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.file.file.metadata()?.len().checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos = pos.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before the start"))?;
+        Ok(self.pos)
+    }
+}
+
+impl Drop for ChdFileIo {
+    /// MAME closes the CHD: put the held map entries in the file, in the
+    /// same order a sync would.
+    fn drop(&mut self) {
+        if !self.file.held.lock().unwrap().is_empty() {
+            if let Err(e) = self.file.sync(false) {
+                eprintln!("iris: CHD map not written at close: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(f, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(f, buf, offset)
+}
+
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match read_at(f, buf, offset)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::write_at(f, buf, offset)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_write(f, buf, offset)?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
 }
 
 /// A sequential `Read` over the merged (parent + diff) sectors of an [`HdImage`],
@@ -488,6 +805,49 @@ mod tests {
 
         let _ = std::fs::remove_file(&base);
         let _ = std::fs::remove_file(diff_path_for(&base));
+    }
+
+    /// A sync in progress does not hold up a write that adds a map entry:
+    /// the write waits only for the entries to be taken, not for the disk.
+    /// The sync is stood in for by holding its lock.
+    #[test]
+    fn a_write_to_a_new_hunk_does_not_wait_for_a_sync() {
+        let base = unique_base();
+        create_from_reader(
+            Cursor::new(vec![0xABu8; 128 * 1024]),
+            &base,
+            HdCreateOptions {
+                logical_size: 128 * 1024,
+                hunk_size: 4096,
+                unit_size: 512,
+                codecs: [CHD_CODEC_ZLIB, 0, 0, 0],
+                geometry: None,
+                ident: None,
+            },
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let mut hd = ChdHd::open(base.to_str().unwrap(), false).unwrap();
+        let file = hd.file();
+        let syncing = file.syncing.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let r = hd.write_sectors(9, &[0x5Au8; 512]);
+            tx.send(r.is_ok()).unwrap();
+            hd
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(30));
+        drop(syncing);
+        assert_eq!(done, Ok(true), "the write finished while the sync held its lock");
+        let mut hd = writer.join().unwrap();
+        assert!(!file.held.lock().unwrap().is_empty(), "its map entry is held");
+        file.sync(false).unwrap();
+        assert!(file.held.lock().unwrap().is_empty());
+        assert_eq!(hd.read_blocks(9, 1, 512).unwrap(), vec![0x5A; 512]);
+        drop(hd);
+        let _ = std::fs::remove_file(diff_path_for(&base));
+        let _ = std::fs::remove_file(&base);
     }
 
     /// A cancelled flatten leaves the base and diff intact.
