@@ -32,7 +32,7 @@ fn default_socket() -> PathBuf {
     PathBuf::from(iris::config::default_ci_socket())
 }
 const PROMPT_RE: &str = "IRIS"; // Match "IRIS N# " — N is a counter that increments
-const RC_MARKER: &str = "IRIS-CI-RC=";
+const RC_PREFIX: &str = "IRIS-CI-RC";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -730,12 +730,19 @@ fn run_capture(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Resu
     };
     // Drain anything stale before sending.
     let _ = send(opts, "serial-read", json!({}))?;
-    let line = format!("{}; echo {}{}\r", command, RC_MARKER, rc_var);
+    // The marker goes on its own line. csh aborts the whole line on errors
+    // such as "Undefined variable", so a marker appended with `;` would never
+    // run and the wait would hit its full timeout.
+    //
+    // The marker carries a per-run nonce, so the command's own echo can't
+    // spell it even if the command text contains `IRIS-CI-RC=`. The typed
+    // marker line also splits it with an empty quote pair, which the shell
+    // removes, so the tty echo of that line can't match either; only the
+    // printed marker does.
+    let marker = run_marker();
+    let line = format!("{}\r{}\r", command, marker_command(rc_var, &marker));
     send(opts, "serial-send", json!({"data": line}))?;
-    // Single wait: pattern `\nIRIS-CI-RC=` only matches at the start of the
-    // output line (the typed-input echo line has `IRIS-CI-RC=$status` inline,
-    // so it has no preceding newline immediately before the marker).
-    let pat = format!("\n{}", RC_MARKER);
+    let pat = marker.clone();
     let captured = send_until(
         opts,
         "wait-serial",
@@ -747,8 +754,8 @@ fn run_capture(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Resu
     std::thread::sleep(Duration::from_millis(150));
     let trailing = send(opts, "serial-read", json!({}))?;
     let trailing_s = trailing.as_str().unwrap_or("");
-    let rc = parse_rc(&format!("{}{}", RC_MARKER, trailing_s)).unwrap_or(-1);
-    let stdout = extract_run_stdout(&raw);
+    let rc = parse_rc(&format!("{}{}", marker, trailing_s), &marker).unwrap_or(-1);
+    let stdout = extract_run_stdout(&raw, &marker);
     Ok((stdout, rc))
 }
 
@@ -787,7 +794,7 @@ fn devnull_redirect(shell: &str) -> &'static str {
 }
 
 /// Send a command, wait for a sentinel, print stdout, fail on non-zero exit.
-/// csh: appends `; echo IRIS-CI-RC=$status`. sh: appends `; echo IRIS-CI-RC=$?`.
+/// csh: sends a following `echo IRIS-CI-RC=$status` line. sh: uses `$?`.
 fn cmd_run(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Result<()> {
     let (stdout, rc) = run_capture(opts, command, shell, timeout_ms)?;
     if !stdout.is_empty() {
@@ -799,34 +806,104 @@ fn cmd_run(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Result<(
     Ok(())
 }
 
-/// `wait-serial` for `\nIRIS-CI-RC=` returns bytes shaped like:
+/// `wait-serial` for the run marker returns bytes shaped like:
 ///
 ///   <typed-echo-line>\r\n<stdout>\r?\n<pattern>
 ///
 /// Skip the first newline (end of the typed echo), strip the trailing
-/// pattern + its leading newline, normalise CRLF, return.
-fn extract_run_stdout(buf: &str) -> String {
+/// pattern, normalise CRLF, and drop the prompt that precedes the marker.
+fn extract_run_stdout(buf: &str, marker: &str) -> String {
+    let buf = &strip_marker_echo(buf, marker);
     // Drop the typed-echo-line (everything up through and including its
     // first \n).
     let after_echo = match buf.find('\n') {
         Some(i) => &buf[i + 1..],
         None => buf,
     };
-    // Drop the trailing `\nIRIS-CI-RC=` (we waited for `\nIRIS-CI-RC=`).
-    let trimmed = match after_echo.rfind(RC_MARKER) {
+    // Drop the printed marker (we waited for it).
+    let trimmed = match after_echo.rfind(marker) {
         Some(p) => &after_echo[..p],
         None => after_echo,
     };
-    trimmed
+    let text = trimmed
         .trim_end_matches(['\r', '\n'])
         .replace("\r\n", "\n")
-        .replace('\r', "\n")
+        .replace('\r', "\n");
+    // The prompt printed just before the marker is left on the end, glued to
+    // the output when that has no trailing newline.
+    match text.rsplit_once('\n') {
+        Some((head, last)) => {
+            let last = strip_prompt_suffix(last);
+            if last.is_empty() { head.to_string() } else { format!("{}\n{}", head, last) }
+        }
+        None => strip_prompt_suffix(&text).to_string(),
+    }
+}
+
+/// A fresh marker for one run: `IRIS-CI-RC` + nonce + `=`.
+fn run_marker() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}{:x}{:x}=", RC_PREFIX, nanos, std::process::id())
+}
+
+/// The marker command as typed. `''` splits the marker so the tty echo of the
+/// typed line differs from the printed output.
+fn marker_command(rc_var: &str, marker: &str) -> String {
+    let (head, tail) = marker.split_at(marker.len() - 1);
+    format!("echo {}''{}{}", head, tail, rc_var)
+}
+
+/// Remove the guest's echo of the typed marker line, which can land anywhere
+/// in the output when the line discipline echoes it ahead of the command.
+/// Only the prompt and the typed marker are cut; output sharing the line stays.
+fn strip_marker_echo(buf: &str, marker: &str) -> String {
+    let typed = marker_command("", marker);
+    let mut out = String::new();
+    for line in buf.split_inclusive('\n') {
+        let Some(pos) = line.find(&typed) else {
+            out.push_str(line);
+            continue;
+        };
+        let before = strip_prompt_suffix(&line[..pos]);
+        let mut after = &line[pos + typed.len()..];
+        for var in ["$status", "$?"] {
+            if let Some(a) = after.strip_prefix(var) {
+                after = a;
+                break;
+            }
+        }
+        let kept = format!("{}{}", before, after);
+        if !kept.trim().is_empty() {
+            out.push_str(&kept);
+            if !kept.ends_with('\n') && line.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Cut a trailing `IRIS <n># ` prompt from the end of `s`.
+fn strip_prompt_suffix(s: &str) -> &str {
+    let Some(body) = s.trim_end().strip_suffix('#') else {
+        return s;
+    };
+    match body.rfind("IRIS ") {
+        Some(i) if {
+            let n = &body[i + 5..];
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        } => &s[..i],
+        _ => s,
+    }
 }
 
 /// Pull the digits after IRIS-CI-RC= out of a buffer.
-fn parse_rc(buf: &str) -> Option<i32> {
-    let pos = buf.rfind(RC_MARKER)?;
-    let tail = &buf[pos + RC_MARKER.len()..];
+fn parse_rc(buf: &str, marker: &str) -> Option<i32> {
+    let pos = buf.rfind(marker)?;
+    let tail = &buf[pos + marker.len()..];
     let digits: String = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
     digits.parse().ok()
 }
@@ -1155,4 +1232,61 @@ fn cmd_script(opts: &Opts, path: &std::path::Path) -> Result<()> {
 /// Truncate long script lines for display.
 fn format_step(line: &str) -> String {
     if line.len() <= 72 { line.to_string() } else { format!("{}…", &line[..71]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const M: &str = "IRIS-CI-RC=";
+
+    #[test]
+    fn csh_aborted_line_still_yields_marker() {
+        // csh rejects the loop and the aborted line prints nothing more; the
+        // marker line runs on its own and prints 1.
+        let buf = "i=0; while [ $i -lt 20 ]; do i=`expr $i + 1`; done; echo spun $i\r\n\
+                   echo IRIS-CI-RC''=$status\r\n\
+                   i=0 - Command not found\r\n\
+                   i - Undefined variable\r\n\
+                   IRIS 7# IRIS-CI-RC=";
+        assert_eq!(
+            extract_run_stdout(buf, M),
+            "i=0 - Command not found\ni - Undefined variable"
+        );
+        assert_eq!(parse_rc("IRIS-CI-RC=1\r\nIRIS 8# ", M), Some(1));
+    }
+
+    #[test]
+    fn typed_marker_echo_does_not_match_marker() {
+        assert!(!marker_command("$status", M).contains(M));
+        assert!(!marker_command("$?", M).contains(M));
+    }
+
+    #[test]
+    fn sh_success_output_is_kept() {
+        let buf = "ls\r\necho IRIS-CI-RC''=$?\r\na\r\nb\r\nIRIS 3# IRIS-CI-RC=";
+        assert_eq!(extract_run_stdout(buf, M), "a\nb");
+    }
+
+    #[test]
+    fn unterminated_output_loses_the_prompt() {
+        assert_eq!(extract_run_stdout("printf abc\r\nabcIRIS 7# IRIS-CI-RC=", M), "abc");
+    }
+
+    #[test]
+    fn echo_sharing_a_line_with_output_keeps_the_output() {
+        let buf = "printf abc\r\nabcIRIS 7# echo IRIS-CI-RC''=$?\r\nIRIS 7# IRIS-CI-RC=";
+        assert_eq!(extract_run_stdout(buf, M), "abc");
+    }
+
+    #[test]
+    fn command_text_containing_the_marker_cannot_match_the_wait() {
+        let marker = run_marker();
+        assert_ne!(marker, run_marker());
+        assert!(marker.starts_with(RC_PREFIX) && marker.ends_with('='));
+        let typed = format!("echo IRIS-CI-RC=7\r{}\r", marker_command("$?", &marker));
+        assert!(!typed.contains(&marker));
+        let buf = format!("echo IRIS-CI-RC=7\r\nIRIS-CI-RC=7\r\nIRIS 3# {}", marker);
+        assert_eq!(extract_run_stdout(&buf, &marker), "IRIS-CI-RC=7");
+    }
 }
