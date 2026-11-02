@@ -2211,6 +2211,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.sysad.describe_fault(phys_addr, size).map_or_else(String::new, |why| format!(" [{why}]"))
     }
 
+    /// Status.TS follows a TLB write that left two entries matching. Branchless:
+    /// a refill handler writes often and the flag is almost always clear.
+    #[inline(always)]
+    fn note_tlb_write_conflict(&mut self) {
+        self.core.cp0_status |= crate::cpu::mips_core::STATUS_TS & 0u32.wrapping_sub(self.tlb.take_write_conflict() as u32);
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -2222,6 +2229,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // and xkphys do.
         tlb.set_va_bits(C::VA_BITS);
         tlb.set_cache_attrs(Self::cache_attr_table());
+        tlb.set_conflict_invalidation(C::R10K_FAMILY);
         core.entryhi_mask = model_entryhi_mask::<C>();
         if C::R10K_FAMILY {
             core.framemask_mask = 0xFFFF;
@@ -7256,6 +7264,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let entry = self.create_tlb_entry_from_cp0();
         self.ip28_trace_tlb_write("tlbwi", index, &entry);
         self.tlb.write(index, entry);
+        self.note_tlb_write_conflict();
         // Flushes the nutlb too — the TLB it caches just changed.
         self.nanotlb_invalidate();
 
@@ -7285,6 +7294,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let entry = self.create_tlb_entry_from_cp0();
         self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);
+        self.note_tlb_write_conflict();
         self.nanotlb_invalidate();
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBWR: Write Random Index {}\n{}", index, self.tlb.format_entry(index)); }

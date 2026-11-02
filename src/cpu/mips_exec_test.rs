@@ -1227,6 +1227,64 @@ mod tests {
                     0xAAAAAAAA means a stale nanotlb slot survived the switch");
     }
 
+    /// Two writes that would match together: on the R10000 family the second
+    /// removes the first and sets Status.TS, for TLBWI and TLBWR alike; on the
+    /// R4400 and R5000 both entries stay and TS stays clear. The compiled-code
+    /// path has nothing to add: jitv2 never admits TLBWI or TLBWR into a
+    /// region (see the `tlb_ops_are_never_admitted_but_eret_is` test), so
+    /// they always run this interpreter code.
+    fn overlapping_tlb_writes<C>(r10k: bool)
+    where C: CpuModel + From<Arc<dyn BusDevice>> {
+        use crate::cpu::mips_tlb::{MipsTlb, Tlb};
+        use crate::cpu::mips_core::STATUS_TS;
+        let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+        let mut exec = MipsExecutor::<MipsTlb, C>::new(mem, MipsTlb::default(), &MipsCpuConfig::indy());
+        disable_jitv2(&mut exec);
+        let tlbwi = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+        let tlbwr = (OP_COP0 << 26) | (0x10 << 21) | 0x06;
+        let write = |exec: &mut MipsExecutor<MipsTlb, C>, instr: u32, index: u32, pfn: u64| {
+            exec.core.cp0_index = index;
+            exec.core.cp0_pagemask = 0;
+            exec.core.cp0_entryhi = (0x100 << 13) | 10;
+            exec.core.cp0_entrylo0 = (pfn << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            exec.core.cp0_entrylo1 = ((pfn + 1) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            assert_eq!(exec.exec(instr), EXEC_COMPLETE);
+        };
+        let first_survives = |exec: &MipsExecutor<MipsTlb, C>| exec.tlb.read(5).entry_hi == (0x100 << 13) | 10;
+
+        write(&mut exec, tlbwi, 5, 0x50);
+        assert_eq!(exec.core.cp0_status & STATUS_TS, 0, "a write that overlaps nothing leaves TS clear");
+
+        write(&mut exec, tlbwi, 6, 0x60);
+        assert_eq!(exec.core.cp0_status & STATUS_TS != 0, r10k, "TLBWI TS");
+        assert_eq!(!first_survives(&exec), r10k, "TLBWI removes the overlapped entry");
+        if r10k {
+            assert_eq!(exec.tlb.read(5).page_mask, 0, "PageMask kept");
+        }
+
+        // Software clears TS by writing Status; the next overlap sets it again.
+        exec.core.cp0_status &= !STATUS_TS;
+        write(&mut exec, tlbwi, 5, 0x50);
+        exec.core.cp0_status &= !STATUS_TS;
+        exec.core.cp0_wired = 7; // Random stays out of 0..7, so it cannot pick entries 5 or 6
+        write(&mut exec, tlbwr, 0, 0x70);
+        assert_eq!(exec.core.cp0_status & STATUS_TS != 0, r10k, "TLBWR TS");
+        assert_eq!(!first_survives(&exec), r10k, "TLBWR removes the overlapped entry");
+    }
+
+    #[test]
+    fn overlapping_tlb_writes_follow_the_cpu_family() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                overlapping_tlb_writes::<crate::cpu::mips_cache_v2::R10000Cache>(true);
+                overlapping_tlb_writes::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+                overlapping_tlb_writes::<R4400Cache>(false);
+                overlapping_tlb_writes::<crate::cpu::mips_cache_v2::R5000Cache>(false);
+            })
+            .unwrap().join().unwrap();
+    }
+
     #[cfg(feature = "tlbcheck")]
     #[test]
     fn test_tlbwi_breaks_on_duplicate_entry() {

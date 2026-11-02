@@ -358,6 +358,17 @@ pub trait Tlb {
     fn set_cache_attrs(&mut self, _table: [CacheAttr; 8]) {}
     /// Set the implemented VPN width before installing entries.
     fn set_va_bits(&mut self, _bits: u32) {}
+    /// Make a TLB write invalidate every other entry it would match together
+    /// with, as the R10000 and R12000 do (NEC U10278EJ4V0UM, Status register
+    /// TS bit, p.223, and "Avoiding TLB Conflict", p.300): they do not shut
+    /// down on a multiple match. The R14000 and R16000 are given the same
+    /// rule as a model choice, matching QEMU's r10k_invalidate_conflicts();
+    /// no manual for them was read. Off for the R4400 and R5000, whose
+    /// behaviour on a multiple match is not modelled.
+    fn set_conflict_invalidation(&mut self, _on: bool) {}
+    /// Whether a write since the last call invalidated another entry. The
+    /// executor reports it in Status.TS.
+    fn take_write_conflict(&mut self) -> bool { false }
     fn save_state(&self) -> toml::Value { toml::Value::Table(Default::default()) }
     fn load_state(&mut self, _v: &toml::Value) -> Result<(), String> { Ok(()) }
 
@@ -560,9 +571,76 @@ pub struct MipsTlb {
     vmap_touched: std::collections::HashSet<usize>,
     #[cfg(feature = "tlbstats")]
     pub stats: TlbStats,
+    /// R10000 family: a write invalidates the entries it overlaps. See
+    /// [`Tlb::set_conflict_invalidation`].
+    invalidate_on_write: bool,
+    /// Entries written since power-on; a never-written slot cannot conflict.
+    written: u64,
+    /// A write invalidated another entry since `take_write_conflict`.
+    write_conflict: bool,
+    /// Some entry written since power-on has a PageMask that is not a run of
+    /// ones from bit 13 (software can write any of bits 24:13). The map
+    /// ranges of such an entry are not exact, so `invalidate_overlapped` then
+    /// scans instead of asking the map.
+    irregular_mask: bool,
 }
 
 impl MipsTlb {
+    /// The R10000 family never lets a write create a multiple match: every
+    /// other entry the incoming one could match together with, wired or not,
+    /// is invalidated first and Status.TS records it (see
+    /// [`Tlb::set_conflict_invalidation`]). Write path only.
+    fn invalidate_overlapped(&mut self, index: usize, new: &TlbEntry) {
+        // An entry that overlaps the new one covers a lookup-map slot the new
+        // one covers (the map is keyed on VA[31:13], and agreeing on more bits
+        // agrees on these), and a slot covered by two entries is tagged
+        // VMAP_MULTI or names the other one. So when every slot of the new
+        // entry's range is empty or names only `index` (the entry being
+        // replaced), nothing overlaps and the scan can be skipped.
+        if !self.irregular_mask {
+            let (start, count) = Self::vmap_range(new);
+            let tag = index as u8;
+            // A 4 KiB page, the refill case, covers one slot.
+            let clear = if count == 1 {
+                let v = self.vmap[start];
+                v == VMAP_MISS || v == tag
+            } else {
+                self.vmap[start..start + count].iter().all(|&v| v == VMAP_MISS || v == tag)
+            };
+            if clear {
+                return;
+            }
+        }
+        let mut live = self.written & !(1u64 << index);
+        while live != 0 {
+            let i = live.trailing_zeros() as usize;
+            live &= live - 1;
+            if i >= self.num_entries {
+                continue;
+            }
+            let other = &self.entries[i];
+            if !(new.is_global() || other.is_global() || new.asid() == other.asid()) {
+                continue;
+            }
+            let both = new.page_mask | other.page_mask | 0x1FFF;
+            if (new.entry_hi ^ other.entry_hi) & !both & self.vpn_mask64 != 0 {
+                continue;
+            }
+            let old_range = Self::vmap_range(other);
+            // TLBR of the entry reads zeros for EntryHi and EntryLo but still
+            // loads PageMask: software that sets PageMask once and relies on a
+            // read-back restoring it would otherwise write its next entry
+            // with a 4 KiB mask.
+            let mut gone = TlbEntry::new();
+            gone.page_mask = other.page_mask;
+            self.entries[i] = gone;
+            self.shadow[i] = ShadowEntry::invalid();
+            self.written &= !(1u64 << i);
+            self.vmap_vacate(i, old_range);
+            self.write_conflict = true;
+        }
+    }
+
     pub fn new(num_entries: usize) -> Self {
         assert!(num_entries > 1 && num_entries <= TLB_MAX_ENTRIES,
             "MipsTlb supports 2..={} entries, got {}", TLB_MAX_ENTRIES, num_entries);
@@ -579,6 +657,10 @@ impl MipsTlb {
             vmap_touched: std::collections::HashSet::new(),
             #[cfg(feature = "tlbstats")]
             stats: TlbStats::default(),
+            invalidate_on_write: false,
+            written: 0,
+            write_conflict: false,
+            irregular_mask: false,
         };
         for list in 0..MRU_LISTS {
             tlb.mru_head[list] = 0;
@@ -678,7 +760,26 @@ impl MipsTlb {
     ///      step 3 that it now also aliases.
     #[inline]
     fn vmap_replace(&mut self, index: usize, old_range: (usize, usize)) {
+        self.vmap_vacate(index, old_range);
+        let (new_start, new_count) = Self::vmap_range(&self.entries[index]);
+        self.vmap_fill_range(index, new_start, new_count);
+    }
+
+    /// Steps 1 to 3 of [`Self::vmap_replace`]: take `index` out of the map
+    /// and let the other entries reclaim what it covered.
+    #[inline]
+    fn vmap_vacate(&mut self, index: usize, old_range: (usize, usize)) {
         let (old_start, old_count) = old_range;
+        // One slot that only `index` covers (named by it, no VMAP_MULTI):
+        // no other entry covers it, so none has anything to reclaim and the
+        // walk below would find nothing. A refill replaces an entry this way.
+        // Slot 0 is left to the walk: the zeroed entries of a TLB that was
+        // never written, and the entries an overlapping write cleared, all
+        // read as covering it.
+        if old_count == 1 && old_start != 0 && self.vmap[old_start] == index as u8 {
+            self.vmap_clear(old_start, 1);
+            return;
+        }
         self.vmap_clear(old_start, old_count);
         let old_end = old_start + old_count;
         for i in 0..self.num_entries {
@@ -694,8 +795,6 @@ impl MipsTlb {
                 self.vmap_fill_range(i, lo, hi - lo);
             }
         }
-        let (new_start, new_count) = Self::vmap_range(&self.entries[index]);
-        self.vmap_fill_range(index, new_start, new_count);
     }
 
     /// Full internal consistency check (feature = "tlbcheck").
@@ -1082,6 +1181,11 @@ impl Tlb for MipsTlb {
                 (entry.entry_lo[0] << 6) & pfn_mask,
                 (entry.entry_lo[1] << 6) & pfn_mask,
             ];
+            self.irregular_mask |= mask & (mask + 1) != 0;
+            if self.invalidate_on_write {
+                self.invalidate_overlapped(index, &entry);
+            }
+            self.written |= 1 << index;
             let old_range = Self::vmap_range(&self.entries[index]);
             self.entries[index] = entry;
             self.shadow[index] = ShadowEntry::from_entry(&entry, &self.c_attr);
@@ -1203,6 +1307,14 @@ impl Tlb for MipsTlb {
         output
     }
 
+    fn set_conflict_invalidation(&mut self, on: bool) {
+        self.invalidate_on_write = on;
+    }
+
+    fn take_write_conflict(&mut self) -> bool {
+        std::mem::take(&mut self.write_conflict)
+    }
+
     fn set_va_bits(&mut self, bits: u32) {
         self.vpn_mask64 = 0xC000_0000_0000_0000 | vpn2_mask(bits);
     }
@@ -1225,6 +1337,9 @@ impl Tlb for MipsTlb {
             self.mru_next[list][self.num_entries - 1] = MRU_NONE;
         }
         self.vmap.fill(VMAP_MISS);
+        self.written = 0;
+        self.write_conflict = false;
+        self.irregular_mask = false;
         #[cfg(feature = "tlbcheck")]
         { self.vmap_touched.clear(); }
     }
@@ -1281,6 +1396,11 @@ impl Tlb for MipsTlb {
             self.mru_next[list][self.num_entries - 1] = MRU_NONE;
         }
         self.vmap.fill(VMAP_MISS);
+        self.written = !0u64 >> (64 - self.num_entries);
+        self.irregular_mask = self.entries[..self.num_entries].iter().any(|e| {
+            let mask = e.page_mask | 0x1FFF;
+            mask & (mask + 1) != 0
+        });
         for i in 0..self.num_entries {
             let (start, count) = Self::vmap_range(&self.entries[i]);
             self.vmap_fill_range(i, start, count);
