@@ -4663,7 +4663,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             TlbResult::Miss { .. } => {
                 if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                 // Miss: XTLB vector (0x080) for 64-bit extended addresses, UTLB vector (0x000) otherwise
-                TranslateResult::exc(if XTLB != 0 { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
+                let xrefill = if C::R10K_FAMILY { self.r10k_xtlb_refill::<XTLB>(virt_addr) } else { XTLB != 0 };
+                TranslateResult::exc(if xrefill { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
             }
             TlbResult::Invalid { .. } => {
                 if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
@@ -4675,6 +4676,26 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 TranslateResult::exc(exec_exception(EXC_MOD))
             }
         }
+    }
+
+    /// Whether a refill miss on `virt_addr` takes the XTLB vector on the
+    /// R10000 family. The R10000 chooses by the space the address lies in,
+    /// not the mode it was referenced from: a user address follows UX, xsseg
+    /// SX, and kseg3, sseg/ksseg and xkseg follow KX (R10000 UM v2.0 pp.
+    /// 333-334, 342). The R4400 chooses by the current mode, which is what
+    /// `XTLB` encodes. So a 64-bit kernel (KX=1, UX=0) touching kuseg takes
+    /// the 32-bit refill vector here. In 32-bit mode only the low word of the
+    /// address counts, so it is sign-extended before the region is read.
+    #[cold]
+    fn r10k_xtlb_refill<const XTLB: u8>(&self, virt_addr: u64) -> bool {
+        use crate::cpu::mips_core::{STATUS_KX, STATUS_SX, STATUS_UX};
+        let va = if XTLB != 0 { virt_addr } else { virt_addr as u32 as i32 as i64 as u64 };
+        let x = match va >> 62 {
+            0 => STATUS_UX,
+            1 => STATUS_SX,
+            _ => STATUS_KX,
+        };
+        self.core.cp0_status & x != 0
     }
 
     /// Debug helper to translate address without side effects
