@@ -5396,7 +5396,7 @@ fn emit_check_snan_operand(ctx: &mut EmitCtx, bits: Value, is_d: bool, write_res
 }
 
 /// `bits` is a signalling NaN: exponent all-1s, mantissa nonzero, mantissa
-/// MSB (the "is quiet" bit) clear. Mirrors `mips_exec.rs`'s `is_snan_s`/`_d`.
+/// MSB set (the original MIPS NaN encoding). Mirrors `mips_exec.rs`'s `is_snan_s`/`_d`.
 fn emit_is_snan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
     let b = &mut ctx.builder;
     let exp_is_max = b.ins().band_imm_s(bits, 0x7F80_0000);
@@ -5404,9 +5404,9 @@ fn emit_is_snan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
     let mantissa_nonzero = b.ins().band_imm_s(bits, 0x007F_FFFF);
     let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
-    let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
-    b.ins().band(is_nan, quiet_bit_clear)
+    let snan_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+    let snan_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0);
+    b.ins().band(is_nan, snan_bit_set)
 }
 fn emit_is_snan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
     let b = &mut ctx.builder;
@@ -5415,9 +5415,9 @@ fn emit_is_snan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
     let mantissa_nonzero = b.ins().band_imm_s(bits, 0x000F_FFFF_FFFF_FFFFu64 as i64);
     let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
-    let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
-    b.ins().band(is_nan, quiet_bit_clear)
+    let snan_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+    let snan_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0);
+    b.ins().band(is_nan, snan_bit_set)
 }
 
 /// `bits` is a quiet NaN (any NaN that is not a signalling NaN) — mirrors
@@ -5500,9 +5500,9 @@ fn emit_is_subnormal_or_qnan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
 
     let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp, 0x7F80_0000);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
-    let quiet_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, quiet_bit, 0);
-    let is_qnan = b.ins().band(is_nan, quiet_bit_set);
+    let snan_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+    let snan_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, snan_bit, 0);
+    let is_qnan = b.ins().band(is_nan, snan_bit_clear);
 
     b.ins().bor(is_subnormal, is_qnan)
 }
@@ -5516,9 +5516,9 @@ fn emit_is_subnormal_or_qnan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
 
     let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp, 0x7FF0_0000_0000_0000u64 as i64);
     let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
-    let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
-    let quiet_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, quiet_bit, 0);
-    let is_qnan = b.ins().band(is_nan, quiet_bit_set);
+    let snan_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+    let snan_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, snan_bit, 0);
+    let is_qnan = b.ins().band(is_nan, snan_bit_clear);
 
     b.ins().bor(is_subnormal, is_qnan)
 }
@@ -5653,7 +5653,7 @@ fn emit_fpu_update_fcsr_arith(
 /// RSQRT and the multiply-add family, on a result already known to be an
 /// infinity or a NaN (`emit_commit_finite_first` sends only those here): a NaN
 /// result is Invalid when `flags` already has V (a signalling NaN operand) or
-/// when none of `ops` is a NaN, and then V is added and the default NaN
+/// when none of `ops` is a NaN, and then V is added and the MIPS default NaN
 /// replaces the host's. Straight-line selects, no branches, since it runs in
 /// a cold block. Returns the flags and result bits to use.
 fn emit_fix_invalid(ctx: &mut EmitCtx, is_d: bool, flags: Value, result_bits: Value, ops: &[Value]) -> (Value, Value) {
@@ -5680,9 +5680,9 @@ fn emit_fix_invalid(ctx: &mut EmitCtx, is_d: bool, flags: Value, result_bits: Va
     let flags_v = ctx.builder.ins().bor_imm_s(flags, FCSR_FV_I64);
     let new_flags = ctx.builder.ins().select(fix, flags_v, flags);
     let default_nan = if is_d {
-        ctx.builder.ins().iconst(ir::types::I64, 0x7FF8_0000_0000_0000u64 as i64)
+        ctx.builder.ins().iconst(ir::types::I64, 0x7FF7_FFFF_FFFF_FFFFu64 as i64)
     } else {
-        ctx.builder.ins().iconst(ir::types::I32, 0x7FC0_0000)
+        ctx.builder.ins().iconst(ir::types::I32, 0x7FBF_FFFF)
     };
     let new_bits = ctx.builder.ins().select(fix, default_nan, result_bits);
     (new_flags, new_bits)
@@ -9100,7 +9100,7 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
     // signalling predicates (funct bit 3) whenever either operand is any
     // NaN — mirrors `exec_fcc_s`/`exec_fcc_d`'s `invalid` computation
     // exactly. `is_snan`: exponent all-1s, mantissa nonzero, mantissa MSB
-    // (the "is quiet" bit) clear.
+    // set (the original MIPS NaN encoding).
     let is_snan = |b: &mut cranelift_frontend::FunctionBuilder, bits: ir::Value, is_d: bool| -> ir::Value {
         if is_d {
             let exp_mantissa_nonzero = {
@@ -9111,20 +9111,20 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
                 let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
                 b.ins().band(exp_is_max, mantissa_nonzero)
             };
-            let quiet_bit_clear = {
-                let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
-                b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0)
+            let snan_bit_set = {
+                let snan_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+                b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0)
             };
-            b.ins().band(exp_mantissa_nonzero, quiet_bit_clear)
+            b.ins().band(exp_mantissa_nonzero, snan_bit_set)
         } else {
             let exp_is_max = b.ins().band_imm_s(bits, 0x7F80_0000);
             let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp_is_max, 0x7F80_0000);
             let mantissa_nonzero = b.ins().band_imm_s(bits, 0x007F_FFFF);
             let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
             let exp_mantissa_nonzero = b.ins().band(exp_is_max, mantissa_nonzero);
-            let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
-            let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
-            b.ins().band(exp_mantissa_nonzero, quiet_bit_clear)
+            let snan_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+            let snan_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, snan_bit, 0);
+            b.ins().band(exp_mantissa_nonzero, snan_bit_set)
         }
     };
     let a_snan = is_snan(ctx.builder, a_bits, is_d);

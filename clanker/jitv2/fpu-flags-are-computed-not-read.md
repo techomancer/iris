@@ -30,8 +30,8 @@ particular:
   the denormal-result test on the same path, sends zero, denormals, ±MAX,
   ±infinity and NaN to a cold side. There `fpu_binop_top_flags_s/d`
   (`mips_exec.rs`) classifies the top of the range: a NaN from non-NaN
-  operands is Invalid (inf-inf, 0*inf, 0/0, inf/inf) and delivers the
-  default NaN 0x7FC00000 / 0x7FF80000_00000000; an infinity, or a ±MAX whose
+  operands is Invalid (inf-inf, 0*inf, 0/0, inf/inf) and delivers the MIPS
+  default NaN 0x7FBFFFFF / 0x7FF7FFFF_FFFFFFFF; an infinity, or a ±MAX whose
   exact value reaches 2^(emax+1), from finite operands is Overflow+Inexact.
   The JIT reaches the same function through `fpu_binop_commit_fn`, one
   call that also does the operand checks and the denormal-result rule for
@@ -45,12 +45,12 @@ particular:
   an overflowing result from any of them is delivered as the host rounds
   it, with FCSR untouched. CVT.S.D has its own overflow check but no
   Inexact-with-Overflow.
-- **Invalid results of the operations above deliver the default NaN.**
-  The host's NaN for an invalid result (x86: 0xFFC00000) has the sign bit
-  set; hardware delivers the positive default NaN, so a program that stores
-  and compares the result sees the same bits.
+- **Invalid results of the operations above deliver the MIPS default NaN.**
+  The host's NaN for an invalid result (x86: 0xFFC00000) has the quiet bit
+  set, which is a *signalling* NaN under the MIPS encoding, so an
+  instruction that read it would raise V where hardware takes E.
   `fpu_fix_invalid_s/d` (interpreter) and `emit_fix_invalid` (JIT) replace
-  a NaN result with 0x7FC00000 / 0x7FF80000_00000000 and add V when an
+  a NaN result with 0x7FBFFFFF / 0x7FF7FFFF_FFFFFFFF and add V when an
   operand was a signalling NaN or no operand was a NaN (infinity times
   zero, infinity minus infinity, the square root of a negative number). A
   quiet NaN operand propagates unchanged. Both engines gate it on one
@@ -63,6 +63,13 @@ particular:
   `emit_commit_finite_first` as an emitter). CVT.S.D, which runs in `cvt_d_to_s_and_commit` for both engines,
   does the same for a signalling NaN source.
 
+  Known limit: RECIP, RSQRT and the MADD family have no operand check, so a
+  quiet-NaN operand (quiet bit clear, the MIPS encoding) propagates with the
+  host's quieting, which sets the fraction MSB. The result, for example
+  0x7FE00000, then reads as a *signalling* NaN to the next operation, which
+  raises V where hardware probably takes E. SQRT traps a quiet-NaN operand
+  with E before this point. What an R10000 does with a quiet-NaN operand to
+  these operations is not stated in the manuals we have, so it is left.
   A quiet-NaN source to CVT.S.D has a related quirk: it is never equal to
   its widened result, so it leaves the exact path and sets Cause and Flag I.
 
