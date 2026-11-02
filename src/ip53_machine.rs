@@ -571,6 +571,8 @@ pub(crate) struct TezroBoard {
     pub v12: Option<Arc<Odyssey>>,
     /// Each PI's graphics flow-control registers.
     pub gfx: [Arc<Mutex<BedrockGfx>>; 2],
+    /// What the PIs asked of CPU 0 that the board cannot carry out.
+    pub cpu0_refused: Arc<Cpu0Refusals>,
     /// The status bar's activity bits and the CPU's Compare matches, which
     /// the graphics board shows.
     pub heartbeat: Arc<AtomicU64>,
@@ -639,8 +641,9 @@ impl TezroBoard {
         node.io.connect_widget(0, pxbow.widget_zero());
         node.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
         let gfx: [Arc<Mutex<BedrockGfx>>; 2] = std::array::from_fn(|_| Arc::new(Mutex::new(BedrockGfx::new(clock.clone()))));
+        let cpu0_refused = Arc::new(Cpu0Refusals::default());
         for (pi, gfx) in node.pi.iter().zip(&gfx) {
-            pi.set_node_hooks(Arc::new(GfxHooks(gfx.clone())));
+            pi.set_node_hooks(Arc::new(PiHooks { gfx: gfx.clone(), cpu0: cpu0_refused.clone() }));
         }
         let heartbeat = Arc::new(AtomicU64::new(0));
         let fasttick = Arc::new(AtomicU64::new(0));
@@ -692,6 +695,7 @@ impl TezroBoard {
             part,
             v12,
             gfx,
+            cpu0_refused,
             heartbeat,
             fasttick,
             status,
@@ -910,24 +914,59 @@ fn slot_name(slot: usize) -> char {
     (b'A' + slot as u8) as char
 }
 
-/// A PI's graphics flow-control registers, served from its block.
-struct GfxHooks(Arc<Mutex<BedrockGfx>>);
-impl NodeHooks for GfxHooks {
+/// What a PI asked of CPU 0 that the board cannot carry out, counted, each
+/// kind logged the first time. The Bedrock PI records what reaches the other
+/// slots, where no processor runs; CPU 0 runs, so what reaches it comes here.
+#[derive(Debug, Default)]
+pub(crate) struct Cpu0Refusals {
+    /// NMIs for CPU 0: the processor model has no NMI entry.
+    pub nmi: AtomicU64,
+    /// Writes that cleared CPU 0's enable bit: the board cannot stop it.
+    pub stop: AtomicU64,
+}
+
+impl Cpu0Refusals {
+    fn refuse(count: &AtomicU64, what: &str) {
+        if count.fetch_add(1, Ordering::Relaxed) == 0 {
+            dlog!(LogModule::Bedrock, "Tezro: unsupported, not carried out: {what}");
+        }
+    }
+}
+
+/// A PI's node hooks: its graphics flow-control registers, served from its
+/// block, and what it asks of CPU 0.
+struct PiHooks {
+    gfx: Arc<Mutex<BedrockGfx>>,
+    cpu0: Arc<Cpu0Refusals>,
+}
+impl NodeHooks for PiHooks {
+    /// CPU 0 runs from power-on and keeps running; clearing its enable bit
+    /// is refused. The other slots are the PI's to record.
+    fn cpu_enable(&self, interface: u8, slot: usize, enabled: bool) {
+        if (interface, slot) == (0, 0) && !enabled {
+            Cpu0Refusals::refuse(&self.cpu0.stop, "CPU 0's enable bit was cleared; it keeps running");
+        }
+    }
+    fn nmi(&self, interface: u8, slot: usize) {
+        if (interface, slot) == (0, 0) {
+            Cpu0Refusals::refuse(&self.cpu0.nmi, "NMI for CPU 0; the CPU has no NMI entry");
+        }
+    }
     fn gfx_read(&self, index: usize) -> Option<u64> {
-        (index < PI_GFX_REGS as usize).then(|| self.0.lock().read(index as u32))
+        (index < PI_GFX_REGS as usize).then(|| self.gfx.lock().read(index as u32))
     }
     fn gfx_write(&self, index: usize, value: u64) -> bool {
         if index >= PI_GFX_REGS as usize {
             return false;
         }
-        self.0.lock().write(index as u32, value);
+        self.gfx.lock().write(index as u32, value);
         true
     }
     fn gfx_reset(&self) {
-        self.0.lock().reset();
+        self.gfx.lock().reset();
     }
     fn gfx_interrupt_taken(&self, slot: usize) {
-        self.0.lock().taken(slot);
+        self.gfx.lock().taken(slot);
     }
 }
 

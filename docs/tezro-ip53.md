@@ -75,7 +75,9 @@ the processor's, so give the other part a fresh `[tezro] flash` file.
 Only CPU 0 runs. The fitted processors read present to the PROM, and only CPU
 0 is enabled at power-on; a write that would start another processor, an NMI
 or an interrupt aimed at one, and per-processor timers are refused and logged
-by the Bedrock PI, not carried out.
+by the Bedrock PI, not carried out. An NMI for CPU 0, and a write that clears
+its enable bit, are refused and logged by the board: the CPU has no NMI entry,
+and CPU 0 keeps running.
 
 Every board identity the machine reports is a software choice of the QEMU
 Tezro profiles, not a value measured on a Tezro: Bedrock board word `0x2001`,
