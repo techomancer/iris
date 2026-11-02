@@ -5844,6 +5844,57 @@ mod tests {
         assert_ne!(st & EXEC_IS_XTLB_REFILL, 0, "true xkseg is unchanged: XTLB");
     }
 
+    /// The R10000 picks the refill vector by the address space a missing
+    /// address lies in and that space's Status bit: user addresses follow
+    /// UX, xsseg SX, kernel and compat supervisor addresses KX (R10000 UM
+    /// v2.0 pp. 333-334). The R4400 picks by the current mode. A 64-bit
+    /// kernel (KX=1, UX=0) missing on kuseg therefore takes the 32-bit refill
+    /// vector on the R10000 and XTLB on the R4400; the PROM's utlb
+    /// diagnostic waits at the 32-bit vector for exactly that miss.
+    #[test]
+    fn r10000_refill_vector_follows_the_address_space() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_SX, STATUS_UX};
+        use crate::cpu::mips_exec::EXEC_IS_XTLB_REFILL;
+        // Kernel mode with `xbits` set in Status, empty TLB; is a read of
+        // `va` a refill miss through XTLB?
+        fn xrefill<C: CpuModel + From<Arc<dyn BusDevice>>>(xbits: u32, va: u64) -> bool {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<crate::cpu::mips_tlb::MipsTlb, C>::new(
+                Arc::new(MockMemory::new()), crate::cpu::mips_tlb::MipsTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.install_status_cb();
+            let status = (exec.core.cp0_status & !(STATUS_ERL | STATUS_EXL | STATUS_KX | STATUS_SX | STATUS_UX | 0x18)) | xbits;
+            exec.core.write_gpr(1, status as u64);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (12 << 11)), EXEC_COMPLETE);
+            let st = exec.read_data::<4>(va).expect_err("empty TLB must miss");
+            assert_ne!(st & EXEC_IS_TLB_REFILL, 0, "{va:#x} should be a refill miss");
+            st & EXEC_IS_XTLB_REFILL != 0
+        }
+        const KUSEG: u64 = 0;
+        const XSSEG: u64 = 0x4000_0000_0000_0000;
+        const CKSSEG: u64 = 0xFFFF_FFFF_C000_0000;
+        const XKSEG: u64 = 0xC000_0000_0000_0000;
+        on_big_stack(|| {
+            type R10k = R10000ShadowCache;
+            // 64-bit kernel, 32-bit user space: kuseg refills through 0x000.
+            assert!(!xrefill::<R10k>(STATUS_KX, KUSEG));
+            assert!(xrefill::<R4400Cache>(STATUS_KX, KUSEG), "R4400 follows the mode");
+            assert!(xrefill::<R10k>(STATUS_KX | STATUS_UX, KUSEG));
+            // xsseg follows SX, compat ksseg and xkseg follow KX.
+            assert!(!xrefill::<R10k>(STATUS_KX, XSSEG));
+            assert!(xrefill::<R10k>(STATUS_KX | STATUS_SX, XSSEG));
+            assert!(xrefill::<R10k>(STATUS_KX, CKSSEG));
+            assert!(xrefill::<R10k>(STATUS_KX, XKSEG));
+            // 32-bit kernel: kseg3-side addresses use 0x000, kuseg follows UX.
+            assert!(!xrefill::<R10k>(0, CKSSEG));
+            assert!(!xrefill::<R10k>(STATUS_UX, CKSSEG));
+            assert!(!xrefill::<R10k>(0, KUSEG));
+            assert!(xrefill::<R10k>(STATUS_UX, KUSEG));
+            assert!(!xrefill::<R4400Cache>(STATUS_UX, KUSEG), "R4400 follows the mode");
+        });
+    }
+
     #[test]
     fn test_xtlb_compare_width_disambiguates_region_field() {
         std::thread::Builder::new()
