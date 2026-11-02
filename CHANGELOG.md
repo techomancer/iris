@@ -126,6 +126,26 @@ hashes are given where a change is easiest to understand by reading the commit.
   bus's devices; and a `Jitv2` joins its workers before it frees the pages
   they read. The Indy, Indigo2 and O2 still leak their tables.
 
+### cpu: FPU Invalid and Overflow
+
+- **Invalid operations raise Invalid.** Infinity minus infinity, zero times
+  infinity, 0/0 and infinity/infinity set Cause and Flag V and, untrapped,
+  deliver the default quiet NaN (0x7FC00000, 0x7FF80000_00000000) instead of
+  the host's NaN. 0/0 raises Invalid rather than divide-by-zero, and
+  infinity/0 raises nothing.
+- **Overflow raises Overflow and Inexact** in ADD, SUB, MUL and DIV. The result
+  was already rounded for the FCSR rounding mode (an infinity, or the largest
+  finite number when the mode rounds toward zero); only the flags were
+  missing. With Overflow enabled it now traps.
+- SQRT, RECIP, RSQRT, MADD, MSUB, NMADD, NMSUB and CVT.S.D deliver the default
+  NaN for an Invalid Operation (the square root of a negative number,
+  infinity times zero, a signalling NaN operand) and raise V where they raised
+  nothing. They still compute no Overflow or Inexact.
+- Applies to every CPU model. An ordinary result costs no more host
+  instructions than before in either engine: one range compare on the result
+  replaces the denormal test, and the multiply-add family, RECIP and RSQRT now
+  classify their operands only when the result is an infinity or a NaN.
+
 ### Disk write cache
 
 - A disk now has a `write_cache` setting in its `[scsi.N]` table (and a
