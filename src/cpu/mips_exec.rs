@@ -2210,6 +2210,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // and xkphys do.
         tlb.set_va_bits(C::VA_BITS);
         tlb.set_cache_attrs(Self::cache_attr_table());
+        tlb.set_conflict_invalidation(C::R10K_FAMILY);
         core.entryhi_mask = model_entryhi_mask::<C>();
         if C::R10K_FAMILY {
             core.framemask_mask = 0xFFFF;
@@ -7241,6 +7242,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let entry = self.create_tlb_entry_from_cp0();
         self.ip28_trace_tlb_write("tlbwi", index, &entry);
         self.tlb.write(index, entry);
+        // Status.TS follows a conflict without a branch: a TLB write is
+        // frequent in a refill handler and the flag is almost always clear.
+        self.core.cp0_status |= crate::cpu::mips_core::STATUS_TS & 0u32.wrapping_sub(self.tlb.take_write_conflict() as u32);
         // Flushes the nutlb too — the TLB it caches just changed.
         self.nanotlb_invalidate();
 
@@ -7265,6 +7269,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let entry = self.create_tlb_entry_from_cp0();
         self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);
+        // Status.TS follows a conflict without a branch: a TLB write is
+        // frequent in a refill handler and the flag is almost always clear.
+        self.core.cp0_status |= crate::cpu::mips_core::STATUS_TS & 0u32.wrapping_sub(self.tlb.take_write_conflict() as u32);
         self.nanotlb_invalidate();
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBWR: Write Random Index {}\n{}", index, self.tlb.format_entry(index)); }
