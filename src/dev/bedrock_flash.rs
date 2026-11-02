@@ -26,6 +26,31 @@ use std::sync::{
 
 pub const PART_SIZE: usize = 8 << 20;
 pub const FLASH_SIZE: usize = 2 * PART_SIZE;
+
+/// The environment records that mark the empty processor positions of a
+/// two-processor IP35 board, slots B and D, disabled, with their offsets
+/// in the store: the records the stock PROM writes itself after its
+/// failed-start recovery has given up on each empty position. Seeding a
+/// fresh store with them spares the PROM three power cycles per position.
+/// That the board ships in this state is a model policy, not a recovered
+/// factory image.
+///
+/// Ported from tests/functional/mips64/lib_origin300.py in
+/// jamesbraid/qemu-sgi-origami.
+pub fn two_processor_environment() -> Vec<(usize, Vec<u8>)> {
+    const VALUE: &[u8] = b"32: CPU failed early init.";
+    let record = |slot: u8| {
+        let mut bytes = vec![0x10];
+        bytes.extend_from_slice(b"Disable");
+        bytes.push(slot);
+        bytes.extend_from_slice(&[0; 7]);
+        bytes.extend_from_slice(VALUE);
+        bytes.extend_from_slice(&[0; 22]);
+        bytes
+    };
+    let records = PART_SIZE + 0x1e0100;
+    vec![(records, record(b'B')), (records + 0x40, record(b'D'))]
+}
 pub const SECOND_POSITION: u64 = 32 << 20;
 
 fn sum(bytes: &[u8]) -> u8 {
@@ -243,6 +268,12 @@ impl Flash {
     /// Format a fresh two-position store from a decoded payload, with the
     /// board's firmware record.
     pub fn new(payload: &[u8], record: FirmwareRecord) -> io::Result<Self> {
+        Self::seeded(payload, record, &[])
+    }
+
+    /// [`Self::new`], with environment `records` written into the volume
+    /// after its label, each at its own offset into the store.
+    pub fn seeded(payload: &[u8], record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
         if payload.len() > PART_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -256,6 +287,9 @@ impl Flash {
         data[label + 0x14..label + 0x18].copy_from_slice(&1u32.to_be_bytes());
         data[label + 0x18..label + 0x1c].copy_from_slice(&1u32.to_be_bytes());
         format_header(&mut data, &record);
+        for (offset, bytes) in records {
+            data[*offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
         Ok(Self {
             st: Mutex::new(State::new(data)),
             gen: AtomicU64::new(0),
@@ -267,7 +301,13 @@ impl Flash {
     /// and leaves an authored one as the store holds it.
     /// Completed guest programming and erasure write through to this file.
     pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
-        let mut data = Self::new(payload, record)?.st.into_inner().data;
+        Self::with_file_seeded(payload, path, record, &[])
+    }
+
+    /// [`Self::with_file`], seeding a missing or empty store with `records`
+    /// as [`Self::seeded`] does. A store that exists keeps what it holds.
+    pub fn with_file_seeded(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
+        let mut data = Self::seeded(payload, record, records)?.st.into_inner().data;
         let mut backing = FlashBacking::open(path, &mut data).map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 io::Error::new(
@@ -508,6 +548,24 @@ mod tests {
         assert_eq!(v.write64(part + 8 * 0x555, 0x80), BUS_OK);
         unlock(v, part);
         assert_eq!(v.write64(part + 4 * offset, 0x30), BUS_OK);
+    }
+
+    /// The two-processor seed holds DisableB and DisableD after the volume
+    /// label, byte for byte as the QEMU Origin 300 boot tests seed them,
+    /// and an existing store keeps what it holds.
+    #[test]
+    fn the_two_processor_seed_disables_slots_b_and_d() {
+        let records = two_processor_environment();
+        let f = Flash::seeded(&[], FirmwareRecord::TEZRO, &records).unwrap();
+        let bytes = f.contents();
+        let mut expected = vec![0x10];
+        expected.extend_from_slice(b"DisableB\0\0\0\0\0\0\032: CPU failed early init.");
+        expected.extend_from_slice(&[0; 22]);
+        assert_eq!(&bytes[0x9e0100..0x9e0140], expected.as_slice());
+        expected[8] = b'D';
+        assert_eq!(&bytes[0x9e0140..0x9e0180], expected.as_slice());
+        assert!(bytes[0x9e0180..0x9e0200].iter().all(|&b| b == 0xff));
+        assert_eq!(Flash::new(&[], FirmwareRecord::TEZRO).unwrap().contents()[0x9e0100], 0xff);
     }
 
     /// The PROM reads CPU configuration and the volume label from its boot flash.
