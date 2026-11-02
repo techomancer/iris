@@ -1500,9 +1500,16 @@ mod tests {
         struct Irq(*const std::sync::atomic::AtomicU64);
         unsafe impl Send for Irq {}
         let irq = Irq(exec.interrupts_ptr());
+        // Raise the interrupt only once the stall has run for the cycles the
+        // assertion needs, as seen from here. A fixed sleep started before
+        // the WAIT can end before the stall has run that long.
+        let seen = cycles;
         let raiser = std::thread::spawn(move || {
             let irq = irq;
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while seen.get() < before + 1_000_000 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             // SAFETY: the executor outlives this thread, which is joined below.
             unsafe { &*irq.0 }.fetch_or(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::SeqCst);
         });
@@ -1510,7 +1517,7 @@ mod tests {
         assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
         raiser.join().unwrap();
 
-        assert!(cycles.get() >= before + 1_000_000, "20 ms of stall is 2M cycles at 10 ns each");
+        assert!(cycles.get() >= before + 1_000_000, "the stall advances the clock 1M cycles (10 ms) before the interrupt");
         assert_eq!(cycles.retired(), before, "a stall retires nothing");
     }
 
