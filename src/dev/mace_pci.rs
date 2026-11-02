@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::irq::{InterruptController, IrqLine};
 use crate::dev::crime_mem::O2Memory;
-use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
+use crate::pci::{bar_runs, plug, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
 use crate::snapshot::{get_field, hex_u32, load_u32_slice, toml_u32, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_OK};
 use crate::ip32::*;
@@ -296,11 +296,7 @@ impl MacePci {
     /// Put a function in a slot on bus 0, wire its interrupt pin to the
     /// bridge, which routes it on, and give it host memory to master.
     pub fn attach(&self, slot: u8, name: &'static str, dev: Arc<dyn PciBusDevice>) {
-        dev.connect_dma(self.dma.clone());
-        let pin = dev.config().interrupt_pin();
-        if (1..=4).contains(&pin) {
-            dev.connect_interrupt(IrqLine::new(self.irq.clone(), PciIrqRouter::line(slot, pin)));
-        }
+        plug(&*dev, self.dma.clone(), |pin| IrqLine::new(self.irq.clone(), PciIrqRouter::line(slot, pin)));
         assert!(self.funcs[slot as usize].set(dev.clone()).is_ok(), "pci: slot {slot} is taken");
         let mut slots = self.slots.lock().unwrap();
         slots.insert(slot, Arc::new(Slot { name, dev, touched: Mutex::new(Vec::new()) }));

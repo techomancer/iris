@@ -300,6 +300,21 @@ pub trait PciDma: Send + Sync {
     fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus;
 }
 
+/// Seat a function on a bus: give it its way to memory and, when its header
+/// names an interrupt pin (INTA..INTD), the line for that pin.
+///
+/// Every host bridge does this by hand when a function is attached. They
+/// differ only in the DMA object they hand out and in what a pin is wired
+/// to, which is what the two arguments are. A function with no pin is
+/// left unconnected.
+pub fn plug(dev: &dyn PciBusDevice, dma: Arc<dyn PciDma>, irq_for_pin: impl FnOnce(u8) -> IrqLine) {
+    dev.connect_dma(dma);
+    let pin = dev.config().interrupt_pin();
+    if (1..=4).contains(&pin) {
+        dev.connect_interrupt(irq_for_pin(pin));
+    }
+}
+
 // ---- BARs on the physical bus ----
 
 /// What a host bridge does to a CPU access on its way to a function: which
@@ -564,6 +579,59 @@ mod tests {
         b.config().write(5, 0x8000_1000);
         assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x8000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "two BARs on one page");
         assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x9000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "outside the window");
+    }
+
+    /// A function that records what the bridge connected.
+    struct Wired {
+        cfg: PciConfig,
+        dma: Mutex<bool>,
+        irq: Mutex<Option<IrqLine>>,
+    }
+
+    impl Wired {
+        fn new(pin: u8) -> Arc<Self> {
+            Arc::new(Self { cfg: PciConfig::new(0x1234, 0x5678, 0, 0, [Bar::Unused; 6], pin), dma: Mutex::new(false), irq: Mutex::new(None) })
+        }
+    }
+
+    impl PciBusDevice for Wired {
+        fn config(&self) -> &PciConfig { &self.cfg }
+        fn bar_read(&self, _: usize, _: u32, _: usize) -> u32 { 0 }
+        fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
+        fn connect_interrupt(&self, line: IrqLine) { *self.irq.lock().unwrap() = Some(line); }
+        fn connect_dma(&self, _: Arc<dyn PciDma>) { *self.dma.lock().unwrap() = true; }
+    }
+
+    struct NoMemory;
+    impl PciDma for NoMemory {
+        fn dma_read(&self, _: u64, _: &mut [u8]) -> PciDmaStatus { PciDmaStatus::MasterAbort }
+        fn dma_write(&self, _: u64, _: &[u8]) -> PciDmaStatus { PciDmaStatus::MasterAbort }
+    }
+
+    use crate::irq::InterruptController;
+    struct Inputs(Mutex<Vec<(u32, bool)>>);
+    impl InterruptController for Inputs {
+        fn set_line(&self, line: u32, level: bool) { self.0.lock().unwrap().push((line, level)); }
+    }
+
+    /// Memory always; a line only for a pin INTA..INTD, and the line is the
+    /// one the bridge builds for that pin.
+    #[test]
+    fn plug_gives_memory_and_a_line_for_a_real_pin() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        for pin in 0..=5u8 {
+            let f = Wired::new(pin);
+            let mut asked = Vec::new();
+            plug(&*f, Arc::new(NoMemory), |p| { asked.push(p); IrqLine::new(inputs.clone(), p as u32) });
+            assert!(*f.dma.lock().unwrap(), "pin {pin} still masters the bus");
+            let wired = f.irq.lock().unwrap().is_some();
+            assert_eq!(wired, (1..=4).contains(&pin), "pin {pin}");
+            assert_eq!(asked, if wired { vec![pin] } else { vec![] }, "pin {pin}: the bridge is asked only for a real pin");
+        }
+        let f = Wired::new(PCI_INTA + 2);
+        plug(&*f, Arc::new(NoMemory), |p| IrqLine::new(inputs.clone(), 40 + p as u32));
+        f.irq.lock().unwrap().as_ref().unwrap().set(true);
+        assert_eq!(*inputs.0.lock().unwrap(), vec![(43, true)]);
     }
 
 }
