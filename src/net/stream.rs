@@ -498,6 +498,13 @@ mod tests {
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         r.exchange(&mut peer, 0xaa, 0x55);
+        // The backend counts a frame once its write returns, which can be
+        // after the peer has read it and answered; wait for the count.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while r.status.stats.to_peer.load(Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "the frame sent to the peer is never counted");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let mut text = Vec::new();
         r.status.report(&mut text).unwrap();
         let text = String::from_utf8(text).unwrap();
