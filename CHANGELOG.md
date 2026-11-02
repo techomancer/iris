@@ -260,7 +260,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - Added a headless Tezro profile with the 700 MHz R16000 (`r16000_700`, the default; `cpu = "r16000"` takes it too), 4 MiB cache, 4 GiB RAM, a PIC with PXBOW, and the IO9's IOC4, ISP12160 and BCM5701. The 800, 900 and 1000 MHz chips (`r16000_800`, `r16000_900`, `r16000_1000`) are listed and take four processors; see the [Tezro guide](docs/tezro-ip53.md).
 - A Tezro can fit a VPro V12 at widget 12 with `[graphics] board = "v12"`, on the VPro model the Octane and the Fuel use.
-- A Tezro fits one, two or four processors, four by default, and two or four bring the second PIC at widget 11; only CPU 0 runs.
+- A Tezro fits one, two or four processors, four by default, and two or four bring a second PIC at widget 11 on the PXBOW's link 11; only CPU 0 runs, and the PROM disables the others.
+- The Tezro's PIC fails a configuration read of an empty slot as a master timeout, so the PROM no longer records two phantom devices per empty slot.
+- The Tezro returns the V12's graphics credits to PI0 along the node's graphics map, settles owed credits on a map write, and stops PI0's graphics slot below its bias as the Bedrock does.
+- The Tezro's PROM stops while copying itself to memory unless the R10000 cache index operations are present; see the [Tezro guide](docs/tezro-ip53.md).
 
 ### `IRIS_GUI_GL` works in iris-gui
 

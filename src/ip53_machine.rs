@@ -291,8 +291,9 @@ impl TezroMachine {
         let rx = connect_cpu("Tezro", &node.md, &node.pi[0], &node.lb, &node.ni, &node.l1, &cpu);
         // After connect_cpu set the windows: each compile worker takes the
         // cache's geometry and the CPU model's policies once, as it starts.
-        // Workers read plain physical code addresses, which the cached plane
-        // serves; the uncached views would decode them as Hub registers.
+        // Workers read plain physical code addresses through the view the CPU
+        // fetched each page by: the cached plane for cached pages, the
+        // uncached attribute-0 view for the reset PROM's uncached fetches.
         #[cfg(feature = "jitv2")]
         {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -304,7 +305,7 @@ impl TezroMachine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(board.cached_bus(), stats);
+                g.compile_queue.start(board.code_bus(), stats);
             }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
@@ -597,6 +598,16 @@ fn build_cpu<C: CacheCpuModel + From<Arc<dyn BusDevice>>>(board: &TezroBoard) ->
     }
     cpu.core.cp0_config = (cpu.core.cp0_config & !CONFIG0_MODE_MASK) | board.chip.firmware.reset_mode;
     cpu.cache = C::from(board.cached_bus());
+    // The PROM fetches its own code uncached; with memory over its window the
+    // cached plane answers RAM there, so the fetch is presented at the PROM's
+    // own address and compiled from the view that holds it.
+    cpu.set_uncached_fetch_alias(
+        crate::ip35::RESET_WINDOW,
+        crate::ip35::RESET_WINDOW_SIZE,
+        crate::ip35::RESET_WINDOW_FETCH,
+    );
+    #[cfg(feature = "jitv2")]
+    cpu.set_jitv2_code_bus(board.code_bus());
     // The PROM keeps its stack in cache lines it tags for a window with no
     // memory behind it yet; the controller answers that window while they stand.
     let memory = board.node.md.clone();
@@ -709,7 +720,7 @@ impl TezroBoard {
         node.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
         let gfx: [Arc<Mutex<BedrockGfx>>; 2] = std::array::from_fn(|_| Arc::new(Mutex::new(BedrockGfx::new(clock.clone()))));
         for (pi, gfx) in node.pi.iter().zip(&gfx) {
-            pi.set_node_hooks(Arc::new(GfxHooks(gfx.clone())));
+            pi.set_node_hooks(Arc::new(PiHooks { gfx: gfx.clone() }));
         }
         let heartbeat = Arc::new(AtomicU64::new(0));
         let fasttick = Arc::new(AtomicU64::new(0));
@@ -773,6 +784,12 @@ impl TezroBoard {
 
     pub fn cached_bus(&self) -> Arc<dyn BusDevice> {
         self.node.bus.cached_view(self.node.md.dma_view(), self.node.md.ram_extent())
+    }
+
+    /// The bus the JIT compiles code through; see [`crate::ip35::Ip35Bus::code_view`].
+    #[cfg(feature = "jitv2")]
+    pub fn code_bus(&self) -> Arc<dyn BusDevice> {
+        self.node.bus.code_view(self.cached_bus())
     }
 
     /// Everything back to its power-on state. The functions reset before
@@ -979,24 +996,27 @@ fn slot_name(slot: usize) -> char {
     (b'A' + slot as u8) as char
 }
 
-/// A PI's graphics flow-control registers, served from its block.
-struct GfxHooks(Arc<Mutex<BedrockGfx>>);
-impl NodeHooks for GfxHooks {
+/// A PI's node hooks: its graphics flow-control registers, served from its
+/// block.
+struct PiHooks {
+    gfx: Arc<Mutex<BedrockGfx>>,
+}
+impl NodeHooks for PiHooks {
     fn gfx_read(&self, index: usize) -> Option<u64> {
-        (index < PI_GFX_REGS as usize).then(|| self.0.lock().read(index as u32))
+        (index < PI_GFX_REGS as usize).then(|| self.gfx.lock().read(index as u32))
     }
     fn gfx_write(&self, index: usize, value: u64) -> bool {
         if index >= PI_GFX_REGS as usize {
             return false;
         }
-        self.0.lock().write(index as u32, value);
+        self.gfx.lock().write(index as u32, value);
         true
     }
     fn gfx_reset(&self) {
-        self.0.lock().reset();
+        self.gfx.lock().reset();
     }
     fn gfx_interrupt_taken(&self, slot: usize) {
-        self.0.lock().taken(slot);
+        self.gfx.lock().taken(slot);
     }
 }
 

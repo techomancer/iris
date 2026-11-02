@@ -214,7 +214,7 @@ secondary caches; those take four processors). `banks`
 takes 512 or 1024 MiB banks from bank 0; left unset, it is the 4 GiB layout of
 1024, 1024 and four 512 MiB banks. A `[tezro]` table is written to a saved
 config only when one of these keys is set. See the
-[Tezro guide](docs/tezro-ip53.md).
+[Tezro guide](docs/tezro-ip53.md), which lists its limits.
 
 ### [graphics]
 
