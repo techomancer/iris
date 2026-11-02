@@ -5602,7 +5602,9 @@ fn emit_fpu_update_fcsr_arith(
     let fs_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fs_set, 0);
     let ui_enabled = ctx.builder.ins().band_imm_s(fcsr, FCSR_UM_IM);
     let ui_enabled = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ui_enabled, 0);
-    let fs_clear = ctx.builder.ins().bnot(fs_set);
+    // Not `bnot(fs_set)`: an icmp result is 0 or 1, and bnot(1) = 0xFE is
+    // still true, which made every denormal result trap even with FS set.
+    let fs_clear = ctx.builder.ins().icmp_imm_s(IntCC::Equal, fs_set, 0);
     let must_trap = ctx.builder.ins().bor(fs_clear, ui_enabled);
 
     let trap_block = ctx.builder.create_block();
@@ -5610,10 +5612,12 @@ fn emit_fpu_update_fcsr_arith(
     ctx.builder.ins().brif(must_trap, trap_block, &[], flush_block, &[]);
 
     ctx.builder.switch_to_block(trap_block);
+    ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
     emit_fpu_unimplemented(ctx);
 
     ctx.builder.switch_to_block(flush_block);
+    ctx.builder.set_cold_block(flush_block);
     ctx.builder.seal_block(flush_block);
     let fcsr_cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
     let fcsr_with_cause = ctx.builder.ins().bor_imm_s(fcsr_cleared, FCSR_CU_CI);
