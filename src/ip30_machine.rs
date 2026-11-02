@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::{CpuModel, MachineConfig};
-use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::mips_cache_v2::MipsCache;
+use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache, R14000_PRID};
 use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
@@ -27,6 +28,7 @@ use crate::dev::ioc3::Ioc3;
 use crate::dev::ioc3_eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::mgras::hq4::ImpactXio;
+use crate::dev::odyssey::Odyssey;
 use crate::dev::rad1::Rad1;
 use crate::dev::sflash::{CfiFlash, FLASH_SIZE};
 use crate::dev::w1;
@@ -46,11 +48,62 @@ pub const OCTANE_PROM_FILE: &str = "IP30prom.bin";
 /// The 195 MHz R10000 of SGI's standard 128 MB Octane configurations (the
 /// OCTANE Technical Report): Count at half that.
 pub const OCTANE_COUNT_HZ: u64 = 97_500_000;
+/// Count for the 360 MHz R12000 (revision 3.5, 2 MB) that SGI sold in the
+/// Octane: half the pipeline clock.
+pub const OCTANE_R12000_COUNT_HZ: u64 = 180_000_000;
+/// Count for the 600 MHz R14000 (revision 2.4, 2 MB) that SGI sold in the
+/// Octane: half the pipeline clock.
+pub const OCTANE_R14000_COUNT_HZ: u64 = 300_000_000;
+
 /// R10000 revision 2.7, as an Octane's hinv reports it; the raw PRId is
 /// inferred from the R10000 manual's encoding.
 pub const OCTANE_PRID: u32 = 0x0927;
-/// The Crossbow on the Octane reports revision 4.
+
+/// CP0 Count for a part when `[clock] fixed_mhz` is unset: half the clock of
+/// one speed that part shipped at in an Octane, so a plain `cpu = "r12000"`
+/// or `"r14000"` reports a clock its tuple had. The PROM measures Count
+/// against the HEART timer, so `hinv` prints twice this.
+fn octane_default_count_hz(cpu: CpuModel) -> u64 {
+    match cpu {
+        CpuModel::R12000 => OCTANE_R12000_COUNT_HZ,
+        CpuModel::R14000 => OCTANE_R14000_COUNT_HZ,
+        _ => OCTANE_COUNT_HZ,
+    }
+}
+
+/// The Crossbow on the Octane reports revision code 4.
 const XBOW_REVISION: u32 = 4;
+/// The Octane2's Crossbow: revision code 5, which IRIX's inventory names
+/// Crossbow 1.4 (a PROM-monitor read of 0x50000001 beside an inventory of
+/// 1.4 on an Octane2). SGI's VPro upgrade kit (007-4210-003)
+/// requires Crossbow 1.4 for the V10 and V12, so a machine with one of
+/// those presents it.
+const XBOW_REVISION_OCTANE2: u32 = 5;
+/// The Bridge's silicon revision: 3 on the 175 MHz Octane (an OpenBSD boot
+/// there prints "Bridge revision 3"), 4 on the reference Octane2, whose PROM
+/// monitor read the identification word as 0x4c00206d.
+const BRIDGE_REVISION: u32 = 3;
+const BRIDGE_REVISION_OCTANE2: u32 = 4;
+
+/// The PROM revision a VPro board needs (007-4210-003): 4.0 for the V6 and
+/// V8, 4.5 for the V10 and V12.
+fn vpro_prom_needed(board: crate::config::GraphicsBoard) -> (u32, u32) {
+    match board {
+        crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12 => (4, 5),
+        _ => (4, 0),
+    }
+}
+
+/// The PROM's own revision, from its banner ("SGI Version 6.5 Rev 4.9
+/// IP30 ..."), if the image carries one.
+fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
+    let text = String::from_utf8_lossy(prom);
+    let at = text.find(" Rev ")?;
+    let rest = &text[at + 5..];
+    let end = rest.find(" IP30")?;
+    let (major, minor) = rest[..end].split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
@@ -98,8 +151,10 @@ pub struct OctaneMachine {
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
     flash: Arc<CfiFlash>,
-    /// The IMPACT board, unless `[octane] graphics = "none"`.
+    /// The IMPACT board, when `[graphics] board` names one.
     pub gfx: Option<Arc<ImpactXio>>,
+    /// The VPro board, with `[graphics] board = "v6"`, `"v8"`, `"v10"` or `"v12"`.
+    pub vpro: Option<Arc<Odyssey>>,
     nat: Option<(Arc<crate::net::NatControl>, (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr))>,
     /// Guest frames the network backend has processed.
     frames: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -112,8 +167,8 @@ pub struct OctaneMachine {
 
 impl OctaneMachine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
-        if cfg.machine.cpu != CpuModel::R10000 {
-            return Err("an Octane has an R10000 ([machine] cpu = \"r10000\")".into());
+        if !matches!(cfg.machine.cpu, CpuModel::R10000 | CpuModel::R12000 | CpuModel::R14000) {
+            return Err("an Octane has an R10000, R12000 or R14000 ([machine] cpu = \"r10000\", \"r12000\" or \"r14000\")".into());
         }
         // `prom`, or IRIX's file name when `prom` is the shared default and
         // that file is not there: there is no embedded Octane PROM.
@@ -132,11 +187,35 @@ impl OctaneMachine {
             return Err(format!("[machine] cpus = {cpu_count}: IRIX runs an Octane with 1 or 2"));
         }
         let banks = heart_banks(cfg);
-        let board = match cfg.graphics_board() {
+        let kind = cfg.graphics_board();
+        let board = match kind {
             crate::config::GraphicsBoard::None => None,
+            b if b.is_vpro() => None,
             b if b.is_impact() => Some(b),
-            b => return Err(format!("graphics.board \"{}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)", b.as_str())),
+            b => return Err(format!("graphics.board \"{}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)", b.as_str())),
         };
+        let has_vpro = kind.is_vpro();
+        if has_vpro {
+            let needed = vpro_prom_needed(kind);
+            if let Some(found) = prom_revision(&prom) {
+                if found < needed {
+                    eprintln!(
+                        "iris: the {} needs PROM {}.{} or later; {prom_path} is {}.{}",
+                        kind.label(),
+                        needed.0,
+                        needed.1,
+                        found.0,
+                        found.1
+                    );
+                }
+            }
+        }
+        // The V10 and V12 shipped only in the Octane2, and SGI's upgrade kit
+        // (007-4210-003) requires Crossbow 1.4 for them. Choosing one gives
+        // the machine the Octane2's Crossbow (revision 5) and Bridge
+        // (revision 4); there is no separate option for the machine.
+        let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12);
+        let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(4);
         let timer_manager = Arc::new(TimerManager::new());
 
@@ -150,14 +229,15 @@ impl OctaneMachine {
         let module = if cpu_count > 1 { "PM20" } else { "PM10" };
         heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", module, 0x5145_4d55_5500));
 
-        let gfx_link = if board.is_some() { 1 << WIDGET_GFX } else { 0 };
-        let xbow = Arc::new(Xbow::new(XBOW_REVISION, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
+        let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
+        let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
         xbow.connect_heart(heart.clone());
 
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
         let bridge = Bridge::new(mem.clone(), heart.clone());
+        bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
         let flash = Arc::new(match &cfg.octane.flash {
@@ -214,6 +294,11 @@ impl OctaneMachine {
         let fasttick = Arc::new(AtomicU64::new(0));
         let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
         let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone()));
+        let vpro = if has_vpro {
+            Some(Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone(), status.clone())?)
+        } else {
+            None
+        };
 
         // The bus over them, then the table.
         let phys = Ip30Bus::new(ram.clone());
@@ -225,6 +310,9 @@ impl OctaneMachine {
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);
+        }
+        if let Some(v) = &vpro {
+            phys.attach_widget(WIDGET_GFX, v.clone(), true);
         }
         let phys = Arc::new(phys);
         phys.init();
@@ -269,10 +357,10 @@ impl OctaneMachine {
             "iris: Octane with {} MB ({}), {}",
             banks.iter().sum::<u64>() >> 20,
             banks.iter().filter(|&&b| b != 0).map(|b| format!("{}", b >> 20)).collect::<Vec<_>>().join("+"),
-            board.map_or("no graphics", |b| b.label())
+            if has_vpro { kind.label() } else { board.map_or("no graphics", |b| b.label()) }
         );
 
-        let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
+        let count_hz = cfg.clock.fixed_mhz.map_or(octane_default_count_hz(cfg.machine.cpu), |mhz| (mhz * 1_000_000.0) as u64);
         let flash_lines: Vec<_> = (0..cpu_count)
             .map(|_| {
                 let bus: Arc<dyn BusDevice> = phys.phys.clone();
@@ -284,7 +372,7 @@ impl OctaneMachine {
         ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
         let memory = Arc::new(crate::ip30::memory_map(&cfg.banks[..4]));
         let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
-            .map(|id| Self::build_cpu(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .map(|id| Self::build_cpu_for(cfg.machine.cpu, id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
             .collect();
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
@@ -403,6 +491,9 @@ impl OctaneMachine {
             monitor.register_device(g.mgras().clone());
             g.register_locks();
         }
+        if let Some(v) = &vpro {
+            monitor.register_device(v.clone());
+        }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
         Self::connect_serial(cfg, &ioc3, ci_serial.as_ref());
@@ -435,6 +526,7 @@ impl OctaneMachine {
             rad,
             flash,
             gfx,
+            vpro,
             nat,
             frames,
             scratch_path,
@@ -478,8 +570,12 @@ impl OctaneMachine {
         }
     }
 
+    /// The configured part, as an executor over its cache model. The R10000
+    /// takes the Octane's own revision (`OCTANE_PRID`) and the R14000 is the
+    /// R12000's 2 MB model with its PRId; the R12000 keeps its model's.
     #[allow(clippy::too_many_arguments)]
-    fn build_cpu(
+    fn build_cpu_for(
+        model: CpuModel,
         id: u8,
         cpu_count: u8,
         memory: Arc<crate::memory_map::MemoryMap>,
@@ -489,25 +585,56 @@ impl OctaneMachine {
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
     ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>(memory);
+        macro_rules! build {
+            ($c:ty, $prid:expr) => {
+                Self::build_cpu::<$c>(id, cpu_count, memory, sysad, cached, tm, count_hz, fasttick, $prid)
+            };
+        }
+        match model {
+            CpuModel::R12000 => build!(R12000ShadowCache, None),
+            CpuModel::R14000 => build!(R12000ShadowCache, Some(R14000_PRID)),
+            _ => build!(R10000ShadowCache, Some(OCTANE_PRID)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_cpu<C>(
+        id: u8,
+        cpu_count: u8,
+        memory: Arc<crate::memory_map::MemoryMap>,
+        sysad: Arc<dyn BusDevice>,
+        cached: Arc<CachedFlashLines>,
+        tm: &Arc<TimerManager>,
+        count_hz: u64,
+        fasttick: Arc<AtomicU64>,
+        prid: Option<u32>,
+    ) -> Arc<dyn CpuDevice>
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
+        MipsCpu<MipsTlb, C>: CpuDevice,
+    {
+        let cfg = MipsCpuConfig::for_model::<C>(memory);
         let tlb = MipsTlb::new(cfg.tlb_entries);
-        let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.
-        exec.cache = R10000ShadowCache::from(cached as Arc<dyn BusDevice>);
+        exec.cache = C::from(cached as Arc<dyn BusDevice>);
         exec.core.set_timer_manager(tm.clone());
         exec.core.set_count_hz(count_hz);
         exec.core.fasttick_count = fasttick;
-        exec.core.reset_prid = OCTANE_PRID;
-        exec.core.cp0_prid = OCTANE_PRID;
+        if let Some(prid) = prid {
+            exec.core.reset_prid = prid;
+            exec.core.cp0_prid = prid;
+        }
         // IRIX zeroes Count and arms Compare a few instructions later; see
         // `MipsCore::count_write_samples`.
         exec.core.count_write_samples = true;
-        // The R10000 drives 40 physical address bits; HEART decodes them
-        // all, and the attribute bits above fold away.
+        // The R10000 drives 40 physical address bits; HEART decodes them all.
+        // EntryLo bits 33:32 are physical 39:38; a guest that keeps software
+        // flags there clears them with FrameMask, so no narrowing is needed.
         exec.phys_mask = (1 << 40) - 1;
         exec.core.cpu_id = id;
         exec.core.smp = cpu_count > 1;
-        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, R10000ShadowCache>| {
+        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             LAST_PC[id as usize].store(exec.core.pc, Ordering::Relaxed);
         }));
         Arc::new(MipsCpu::new(exec))
@@ -526,6 +653,9 @@ impl OctaneMachine {
         ];
         if let Some(g) = &self.gfx {
             d.push(g.clone());
+        }
+        if let Some(v) = &self.vpro {
+            d.push(v.clone());
         }
         d
     }
@@ -593,6 +723,9 @@ impl OctaneMachine {
         self.flash.reset();
         if let Some(g) = &self.gfx {
             g.power_on();
+        }
+        if let Some(v) = &self.vpro {
+            v.power_on();
         }
         Self::sync_links(&self.phys, &self.xbow);
         self.restart_peripherals();
@@ -678,7 +811,10 @@ impl Workstation for OctaneMachine {
         self.lifecycle = state;
     }
     fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        self.gfx.as_ref().map(|g| g.display())
+        match &self.vpro {
+            Some(v) => Some(v.display()),
+            None => self.gfx.as_ref().map(|g| g.display()),
+        }
     }
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
@@ -841,5 +977,36 @@ impl Device for Ip30Monitor {
         }
         let text = self.text(args.first().copied().unwrap_or("unmapped"))?;
         w.write_all(text.as_bytes()).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The VPro fitment check reads the PROM's revision from its banner;
+    /// a board that needs a newer PROM than the image warns.
+    #[test]
+    fn the_prom_banner_gives_its_revision() {
+        let banner = b"\0\0SGI Version 6.5 Rev 4.9 IP30 Jan 20, 2004\0";
+        assert_eq!(prom_revision(banner), Some((4, 9)));
+        assert_eq!(prom_revision(b"no banner here"), None);
+        assert!((4, 3) < vpro_prom_needed(crate::config::GraphicsBoard::V12));
+        assert!((4, 3) >= vpro_prom_needed(crate::config::GraphicsBoard::V6));
+    }
+}
+
+#[cfg(test)]
+mod cpu_clock_tests {
+    use super::*;
+
+    /// A plain `cpu = ...` reports a clock that part shipped at in an Octane:
+    /// 195 MHz for the R10000, 360 MHz for the R12000 (revision 3.5) and
+    /// 600 MHz for the R14000 (revision 2.4). Count runs at half the clock.
+    #[test]
+    fn each_octane_part_defaults_to_a_shipped_clock() {
+        for (cpu, mhz) in [(CpuModel::R10000, 195), (CpuModel::R12000, 360), (CpuModel::R14000, 600)] {
+            assert_eq!(octane_default_count_hz(cpu) * 2, mhz * 1_000_000, "{cpu:?}");
+        }
     }
 }

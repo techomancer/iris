@@ -1,0 +1,568 @@
+//! Register-level behaviour: identity, cursor, channel and back-end registers,
+//! and the reports made for offsets and commands the board does not implement.
+//!
+//! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code in jamesbraid/qemu-sgi-origami.
+
+
+use crate::devlog::LogModule;
+use std::sync::atomic::Ordering;
+use super::board::{Board, ODSY_HEIGHT, ODSY_UNIMP_REPORTS, ODSY_WIDTH};
+use super::consts::{
+    backend, cfifo, config, ctx, cursor, dispmode, flctl, host, i2c, intr, lut, mem, nic, overlay,
+    route, stats, swap, ODSY_BLOCK_END, ODSY_BUZZ_1, ODSY_BUZZ_2, ODSY_BUZZ_3, ODSY_BUZZ_4,
+    ODSY_BUZZ_5, ODSY_BUZZ_6, ODSY_CHANNEL_HEIGHT, ODSY_CHANNEL_WIDTH, ODSY_DISPLAYED_BUFFER,
+    ODSY_F32_ONE, ODSY_F32_POINT_EIGHT, ODSY_F32_POINT_TWO, ODSY_FRAME_CLOCKS, ODSY_MANUFACTURER,
+    ODSY_PART, ODSY_PIXEL_CLOCK_HZ, ODSY_RESET_CONTROL, ODSY_STATUS0, ODSY_SW_TOKEN,
+    ODSY_UNIMP_WRITE,
+};
+use super::interface::front_register;
+use super::reader::SharedRegs;
+use super::scanout::{DirtySite, ScanoutMode};
+impl Board {
+    pub fn identity(&mut self) -> u32 {
+        (self.widget.revision << 28) | (ODSY_PART << 12) | (ODSY_MANUFACTURER << 1) | 1
+    }
+
+    pub fn unimplemented(&self, addr: u64, size: u32, write: bool) {
+        let token = (addr as u32) | if write { ODSY_UNIMP_WRITE } else { 0 };
+
+        // A processor's access to an unmodelled offset reaches this while the
+        // board's thread may be running a store of its own, so the report
+        // table is atomic and the count bounded on every use; a race can only
+        // log an offset twice.
+        let len = self.diag.reported_addr.len();
+        let seen = (self.diag.reported_addr_count.load(Ordering::Relaxed) as usize).min(len);
+        if self.diag.reported_addr[..seen].iter().any(|a| a.load(Ordering::Relaxed) == token) || seen == len {
+            return;
+        }
+        let slot = self.diag.reported_addr_count.fetch_add(1, Ordering::Relaxed) as usize;
+        if slot >= len {
+            return;
+        }
+        self.diag.reported_addr[slot].store(token, Ordering::Relaxed);
+        crate::dlog!(
+            LogModule::Odyssey,
+            "sgi-odyssey: {}-byte {} at {:#x} is not modeled{}",
+            size,
+            if write { "write" } else { "read" },
+            addr,
+            if slot + 1 == len { "; further offsets stay silent" } else { "" }
+        );
+    }
+
+    /// Report an unmodeled command word once. note follows the message: the
+    /// parser's framing decision for a word it does not know, or "".
+    pub fn cmd_report(&mut self, word: u32, note: &str) {
+        if self.diag.reported_cmd[..self.diag.reported_cmd_count as usize].contains(&word) {
+            return;
+        }
+        if self.diag.reported_cmd_count == ODSY_UNIMP_REPORTS {
+            return;
+        }
+        self.diag.reported_cmd[self.diag.reported_cmd_count as usize] = word;
+        self.diag.reported_cmd_count += 1;
+        crate::dlog!(
+            LogModule::Odyssey,
+            "sgi-odyssey: command FIFO word {:#010x} is not modeled{}{}",
+            word,
+            note,
+            if self.diag.reported_cmd_count == ODSY_UNIMP_REPORTS { "; further words stay silent" } else { "" }
+        );
+    }
+
+    pub fn cmd_unimplemented(&mut self, word: u32) {
+        self.cmd_report(word, "");
+    }
+}
+
+/// The modeled register an access names, or None. A configuration-block
+/// register answers its 64-bit address and the 32-bit spelling of either
+/// half identically (a live V12 board reads the same value at a register's
+/// base and at base+4 across the block). Every other register has only been
+/// seen as a 32-bit access. Other widths, alignments and offsets are
+/// unmodeled rather than an error.
+pub(super) fn reg(addr: u64, size: u32) -> Option<u64> {
+    if addr < ODSY_BLOCK_END {
+        if (size == 8 || size == 4) && (addr & 7) == 0 {
+            return Some(addr);
+        }
+        if size == 4 && (addr & 7) == 4 {
+            return Some(addr & !7);
+        }
+        return None;
+    }
+    if size != 4 {
+        return None;
+    }
+    match addr {
+        intr::FLAGS
+        | intr::CLEAR
+        | intr::ENABLE_SET
+        | intr::ENABLE_CLEAR
+        | route::DEST_UPPER
+        | route::DEST_LOWER
+        | route::VECTORS
+        | ODSY_STATUS0
+        | cfifo::SELFTEST
+        | mem::CONFIG
+        | flctl::CONFIG
+        | flctl::TARGET
+        | ODSY_SW_TOKEN
+        | nic::PROM
+        | nic::KERNEL
+        | ODSY_BUZZ_1
+        | ODSY_BUZZ_2
+        | ODSY_BUZZ_3
+        | ODSY_BUZZ_4
+        | ODSY_BUZZ_5
+        | ODSY_BUZZ_6
+        | swap::ARM
+        | swap::PENDING
+        | swap::CONTROL
+        | swap::CONTROL_COMPANION
+        | ODSY_DISPLAYED_BUFFER
+        | i2c::MAIN_CMD_READ
+        | i2c::MAIN_STATUS_READ
+        | i2c::OPT_CMD_READ
+        | i2c::OPT_STATUS_READ
+        | host::WRITE_ADDR_UPPER
+        | host::WRITE_ADDR_LOWER
+        | stats::ADDR_UPPER
+        | stats::ADDR_LOWER
+        | stats::CONTROL
+        | ctx::SHADOW_ADDR_UPPER
+        | ctx::SHADOW_ADDR_LOWER
+        | ODSY_RESET_CONTROL
+        | mem::CONTROL
+        | backend::VERSION => Some(addr),
+        _ => None,
+    }
+}
+
+impl Board {
+    /// One bit slot, reported finished inside the write the guest polls after.
+    pub fn nic_slot(&mut self, value: u32) {
+        let pulse = (value & nic::PULSE_MASK) >> nic::PULSE_SHIFT;
+        let sample = (value & nic::SAMPLE_MASK) >> nic::SAMPLE_SHIFT;
+        let level = match self.nic_bus.as_mut() {
+            Some(bus) => crate::dev::w1::slot::slot(bus, pulse, sample),
+            None => false,
+        };
+
+        self.widget.nic = (value & !(nic::LEVEL | nic::DONE)) | nic::DONE | if level { nic::LEVEL } else { 0 };
+    }
+
+    // The display back end's 32 by 32 hardware cursor, drawn over the resolved picture: after the lookup RAM
+    // and the gamma table, over the main and overlay planes alike. Entries:
+    //   0x2500  128 words  glyph: 32 rows of four words, eight 4-bit pixels a
+    //                      word, the leftmost pixel in bits 3:0
+    //   0x2580             position: x in 31:16, y in 15:0
+    //   0x2581             control
+    //   0x2590  15 words   colours, ten bits a channel, as in the lookup RAM
+    //   0x25c0  64 words   plane: 32 rows of two words, sixteen 2-bit pixels a
+    //                      word, the leftmost pixel in bits 1:0
+    // The layouts are established; what the board makes of the values is
+    // inferred. APPROXIMATION: under plane 3 a glyph value k shows colour word k
+    // and glyph 0 shows word 0; under plane 0 the pixel is transparent. Glyph
+    // value 15 and plane values 1 and 2 have no known meaning: reported once and
+    // drawn transparent. A channel shows the top eight bits of its ten. Reset
+    // values are unknown; the model resets every entry to zero, cursor off.
+
+    pub fn cursor_report(&mut self, bit: u32, what: &str, index: u32, data: u32) {
+        if self.diag.cursor_reported & bit != 0 {
+            return;
+        }
+        self.diag.cursor_reported |= bit;
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: cursor entry {:#x} word {:#010x}: {}", cursor::BASE + index, data, what);
+    }
+
+    /// The registers the display resolves through (DisplayRegs).
+    pub fn regs(&self) -> &SharedRegs {
+        &self.scanout.shared.regs
+    }
+
+    /// The first and last display line the cursor covers as it stands, or
+    /// None when it covers none.
+    pub fn cursor_span(&mut self) -> Option<(i32, i32)> {
+        self.regs().cursor_span(self.scanout.mode.height as i32 - 1)
+    }
+
+    /// Repaint the lines of a span from cursor_span(); a span past the
+    /// bottom of the raster is empty.
+    pub fn cursor_invalidate(&mut self, span: Option<(i32, i32)>) {
+        if let Some((first, last)) = span.filter(|&(first, last)| first <= last) {
+            self.scanout.repaint_for(DirtySite::Cursor, first, last - first + 1);
+        }
+    }
+}
+
+/// A colour word, ten bits a channel, as 0x00RRGGBB from the top eight.
+pub(super) fn cursor_rgb(word: u32) -> u32 {
+    (((word >> lut::RED_SHIFT) & 0xff) << 16) | (((word >> lut::GREEN_SHIFT) & 0xff) << 8) | ((word >> lut::BLUE_SHIFT) & 0xff)
+}
+
+impl Board {
+    /// Report the values a stored word carries that have no known meaning.
+    pub fn cursor_check(&mut self, index: u32, data: u32) {
+        if index < cursor::POSITION {
+            let mut i = 0;
+            while i < 32 {
+                if (data >> i) & 0xf == 0xf {
+                    self.cursor_report(
+                        cursor::REPORT_GLYPH15,
+                        "glyph value 15 has no colour word; drawn transparent",
+                        index,
+                        data,
+                    );
+                    break;
+                }
+                i += 4;
+            }
+        } else if index >= cursor::PLANE {
+            let mut i = 0;
+            while i < 32 {
+                let v = (data >> i) & 3;
+
+                if v == 1 || v == 2 {
+                    self.cursor_report(
+                        cursor::REPORT_PLANE,
+                        "plane values 1 and 2 are not modeled; drawn transparent",
+                        index,
+                        data,
+                    );
+                    break;
+                }
+                i += 2;
+            }
+        } else if index == cursor::CONTROL {
+            if (data & cursor::CTL_ENABLE) != 0 && (data & cursor::CTL_CROSSHAIR) != 0 {
+                self.cursor_report(
+                    cursor::REPORT_CROSSHAIR,
+                    "crosshair drawn as full-raster lines in colour word 1, an approximation",
+                    index,
+                    data,
+                );
+            }
+            if data & cursor::CTL_CHANNEL1 != 0 {
+                self.cursor_report(
+                    cursor::REPORT_CHANNEL1,
+                    "second display channel is not modeled; nothing drawn",
+                    index,
+                    data,
+                );
+            }
+            if data & !cursor::CTL_KNOWN != 0 {
+                self.cursor_report(
+                    cursor::REPORT_CONTROL,
+                    "control bits outside 0-5 and 31:30 have no known meaning",
+                    index,
+                    data,
+                );
+            }
+        } else if index != cursor::POSITION && !(cursor::COLOURS..cursor::COLOURS + cursor::COLOUR_COUNT).contains(&index) {
+            self.cursor_report(cursor::REPORT_ENTRY, "no known function; stored", index, data);
+        }
+    }
+
+    /// One backend data word for a cursor entry: store it, report what it
+    /// carries that has no known meaning, and repaint the lines the cursor
+    /// covered before and covers now.
+    pub fn cursor_write(&mut self, index: u32, data: u32) {
+        let old = self.cursor_span();
+
+        self.regs().set_cursor(index as usize, data);
+        self.cursor_check(index, data);
+        let new = self.cursor_span();
+        self.cursor_invalidate(old);
+        self.cursor_invalidate(new);
+    }
+
+    /// A backend read-window offset that names a cursor entry: its stored word.
+    pub fn cursor_read(&mut self, addr: u64, size: u32, value: &mut u64) -> bool {
+        let first = backend::READ_BASE + ((cursor::BASE as u64) << 3);
+
+        if size != 4 || addr < first || (addr & 7) != 0 || addr >= first + ((cursor::ENTRIES as u64) << 3) {
+            return false;
+        }
+        *value = self.regs().cursor(((addr - first) >> 3) as usize) as u64;
+        true
+    }
+}
+
+// Back-end entries 0x2000-0x2fff: the line and frame tables, timing, cursor,
+// DAC, clock, I2C, genlock, scanout and display-mode entries. Every word
+// written there is kept, and a 32-bit load at offset 4 of the entry's 8-byte
+// slot in the read window returns it (established by the kernel's
+// read-modify-writes of 0x26c0, 0x2482, 0x2483 and 0x2700; that the board
+// returns the last word written is inferred). Entries the board itself
+// updates answer from their own models. Reset values are unknown; the model
+// resets them to zero.
+//
+// The line table (0x2000-0x23ff) and frame table (0x2400-0x247f) are only
+// stored. APPROXIMATION: the retrace period stays the 1280x1024 60 Hz one
+// (ODSY_FRAME_CLOCKS) rather than following the frame table.
+//
+// The scanout entries 0x2800 and 0x2801, 0x2807 and 0x2809 are stored and
+// not used: APPROXIMATION, the model scans out its own colour buffers
+// (resolve_row()) rather than locating the displayed buffer in board
+// memory by these entries. The 16 x 16-pixel tiling of board memory is not
+// modeled.
+
+/// The entries the kernel writes.
+pub(super) fn backend_ctl_known(index: u32) -> bool {
+    (0x2000..=0x247f).contains(&index)
+        || (0x2481..=0x2483).contains(&index)
+        || index == 0x2600
+        || index == 0x2680
+        || index == 0x26c0
+        || index == 0x2700
+        || index == 0x2741
+        || index == 0x2781
+        || (0x27c0..=0x27cd).contains(&index)
+        || (0x2800..=0x2809).contains(&index)
+        || (0x2929..=0x292c).contains(&index)
+        || index == 0x2b00
+}
+
+impl Board {
+    pub fn backend_ctl_read(&mut self, addr: u64, size: u32, value: &mut u64) -> bool {
+        let first = backend::READ_BASE + ((backend::CTL_BASE as u64) << 3);
+
+        if size != 4 || addr < first || (addr & 7) != 4 || addr >= first + ((backend::CTL_ENTRIES as u64) << 3) {
+            return false;
+        }
+        *value = self.widget.backend_ctl[((addr - first) >> 3) as usize] as u64;
+        true
+    }
+
+    /// +0x1004 (mem::CONTROL): kept, and checked against the strap.
+    pub fn memory_control(&mut self, value: u32) {
+        let strap = self.widget.memory_config;
+        let size = (value >> mem::CONTROL_SIZE_SHIFT) & mem::CONTROL_SIZE_MASK;
+        // The kernel programs strap code 3 like 128 MB, code 2.
+        let strap_size = (strap >> config::SIZE_SHIFT).min(2);
+
+        self.widget.memory_control = value;
+        if !self.diag.memory_control_reported {
+            self.diag.memory_control_reported = true;
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: memory controller configuration {:#x} stored; the controller is not modeled", value);
+        }
+        // The master id goes in first, with the strap fields still zero.
+        if value & !(0xfu32 << 19) == 0 {
+            return;
+        }
+        // MODEL CHOICE: a mismatch is reported; see mem::CONTROL.
+        if size != strap_size
+            || ((value & mem::CONTROL_FOUR_BANKS) != 0) != ((strap & config::FOUR_BANKS) != 0)
+            || ((value & mem::CONTROL_LATENCY_2) != 0) != ((strap & config::LATENCY_2) != 0)
+        {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: memory controller configuration {:#x} disagrees with the strap word {:#x}", value, strap);
+        }
+    }
+}
+
+pub(super) fn i2c_status(command: u32) -> u32 {
+    i2c::STATUS_READY | if command != 0 { i2c::STATUS_DONE } else { 0 }
+}
+
+impl Board {
+    pub fn read(&mut self, addr: u64, size: u32) -> u64 {
+        // Registers that do not wait for the board's work live in the front
+        // (interface.rs).
+        if front_register(addr, size, false) {
+            return self.front.lock().read(addr, size);
+        }
+        let mut value: u64 = 0;
+        let sequence = self.trace_sequence.fetch_add(1, Ordering::Relaxed);
+
+        match reg(addr, size) {
+            Some(cfifo::SELFTEST) => {
+                // Answers OK only after the kernel driver's command-FIFO
+                // initialisation preamble; zero before.
+                value = if self.widget.cfifo_selftest_ready { cfifo::SELFTEST_OK as u64 } else { 0 };
+            }
+            Some(mem::CONFIG) => {
+                // Bits 15:7: the field and the drain waits are ESTABLISHED,
+                // its unit UNKNOWN, and a count of unreturned credits
+                // INFERRED. MODEL CHOICE: pending doublewords, the model's
+                // pending words rounded up. Only reading 0 once the board has
+                // run the queue is needed, by the start-up and flow-reset
+                // drain waits.
+                let doublewords = self.fifo.level().div_ceil(2).min(0x1ff);
+                value = (self.widget.memory_config | (doublewords << 7)) as u64;
+            }
+            Some(flctl::CONFIG) => value = self.widget.flctl_config as u64,
+            Some(ODSY_BUZZ_1) => value = self.widget.buzz[0] as u64,
+            Some(ODSY_BUZZ_2) => value = self.widget.buzz[1] as u64,
+            Some(ODSY_BUZZ_3) => value = self.widget.buzz[2] as u64,
+            Some(ODSY_BUZZ_4) => value = self.widget.buzz[3] as u64,
+            Some(ODSY_BUZZ_5) => value = self.widget.buzz[4] as u64,
+            Some(ODSY_BUZZ_6) => value = self.widget.buzz[5] as u64,
+            Some(nic::PROM | nic::KERNEL) => value = self.widget.nic as u64,
+            Some(i2c::MAIN_CMD_READ) => value = self.widget.i2c_main_cmd as u64,
+            Some(i2c::MAIN_STATUS_READ) => value = i2c_status(self.widget.i2c_main_cmd) as u64,
+            Some(i2c::OPT_CMD_READ) => value = self.widget.i2c_opt_cmd as u64,
+            Some(i2c::OPT_STATUS_READ) => value = i2c_status(self.widget.i2c_opt_cmd) as u64,
+            Some(backend::VERSION) => value = (self.widget.backend_version & 7) as u64,
+            Some(host::WRITE_ADDR_UPPER
+            | host::WRITE_ADDR_LOWER
+            | stats::ADDR_UPPER
+            | stats::ADDR_LOWER
+            | stats::CONTROL
+            | ctx::SHADOW_ADDR_UPPER
+            | ctx::SHADOW_ADDR_LOWER
+            | ODSY_RESET_CONTROL
+            | mem::CONTROL) => {
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: read of the write-only register at {:#x}", addr);
+            }
+            _ => {
+                if self.cursor_read(addr, size, &mut value) || self.backend_ctl_read(addr, size, &mut value) {
+                    crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: MMIO read seq {} offset {:#x} size {} value {:#x}", sequence, addr, size, value);
+                    return value;
+                }
+                self.unimplemented(addr, size, false);
+            }
+        }
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: MMIO read seq {} offset {:#x} size {} value {:#x}", sequence, addr, size, value);
+        value
+    }
+
+    /// Present the plane's top-left width x height at the 1280x1024 rate.
+    pub fn set_scanout_size(&mut self, width: u32, height: u32) {
+        self.scanout.set_mode(
+            &ScanoutMode { width, height, frame_clocks: ODSY_FRAME_CLOCKS as u64, clock_hz: ODSY_PIXEL_CLOCK_HZ },
+        );
+    }
+
+    /// One of the display channel's two size entries. A zero is the guest
+    /// blanking the channel while it changes format and leaves the picture as it
+    /// was. A size past the modeled planes is reported and kept to them.
+    pub fn channel_size(&mut self, index: u32, data: u32) {
+        let mut width = self.scanout.mode.width;
+        let mut height = self.scanout.mode.height;
+
+        if data == 0 {
+            return;
+        }
+        if index == ODSY_CHANNEL_WIDTH {
+            width = data;
+        } else {
+            height = data;
+        }
+        if width > ODSY_WIDTH || height > ODSY_HEIGHT {
+            crate::dlog!(
+                LogModule::Odyssey,
+                "sgi-odyssey: display channel {}x{} is larger than the modeled {}x{} planes",
+                width,
+                height,
+                ODSY_WIDTH,
+                ODSY_HEIGHT
+            );
+            width = width.min(ODSY_WIDTH);
+            height = height.min(ODSY_HEIGHT);
+        }
+        if width != self.scanout.mode.width || height != self.scanout.mode.height {
+            self.set_scanout_size(width, height);
+        }
+    }
+
+    /// One data word of a backend record, delivered to the entry the record's
+    /// header selected. The colour lookup RAM and the per-drawable display-mode
+    /// registers take their words here; the two I2C command indices keep their
+    /// existing dispatch. Entries 0x2000-0x2fff are also kept for the read
+    /// window (Board::backend_ctl_read()); one the kernel is not known to write
+    /// is still reported.
+    pub fn backend_data(&mut self, index: u32, data: u32) {
+        if (backend::CTL_BASE..backend::CTL_BASE + backend::CTL_ENTRIES).contains(&index) {
+            self.widget.backend_ctl[(index - backend::CTL_BASE) as usize] = data;
+        }
+        // Scanout resolves through both, so either change repaints.
+        if index < lut::SIZE {
+            self.regs().set_lut(index as usize, data & lut::ENTRY_MASK);
+            self.scanout.repaint_all_for(DirtySite::Lut);
+            return;
+        }
+        if (dispmode::BASE..dispmode::BASE + dispmode::COUNT).contains(&index) {
+            self.regs().set_dispmode((index - dispmode::BASE) as usize, data);
+            self.scanout.repaint_all_for(DirtySite::Lut);
+            return;
+        }
+        if (cursor::BASE..cursor::BASE + cursor::ENTRIES).contains(&index) {
+            self.cursor_write(index - cursor::BASE, data);
+            return;
+        }
+        if (overlay::MODE_BASE..overlay::MODE_BASE + overlay::IDS).contains(&index) {
+            self.regs().set_overlay_mode((index - overlay::MODE_BASE) as usize, data);
+            if (data & !overlay::MODE_KNOWN) != 0 && !self.diag.overlay_mode_reported {
+                self.diag.overlay_mode_reported = true;
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: overlay mode {:#x} has bits this model does not decode", data);
+            }
+            self.scanout.repaint_all_for(DirtySite::Lut);
+            return;
+        }
+        match index {
+            ODSY_CHANNEL_WIDTH | ODSY_CHANNEL_HEIGHT => self.channel_size(index, data),
+            i2c::MAIN_CMD_INDEX => self.widget.i2c_main_cmd = data,
+            i2c::OPT_CMD_INDEX => self.widget.i2c_opt_cmd = data,
+            _ => {
+                if !backend_ctl_known(index) {
+                    self.unimplemented(backend::SELECT, 8, true);
+                }
+            }
+        }
+    }
+
+    /// One 32-bit word of the backend word stream. While no record is open the
+    /// word is a header: its 0b11 tag opens a record of `count` data words
+    /// starting at `index` (a zero count is a pad). Any word without the tag at a
+    /// header position has no established meaning and is reported rather than
+    /// guessed. While a record is open the word is a data word for the running
+    /// index, which then advances (see Board::backend_data).
+    pub fn backend_word(&mut self, word: u32) {
+        if self.widget.backend_count == 0 {
+            if ((word >> backend::TAG_SHIFT) & backend::TAG_MASK) != backend::TAG_HEADER {
+                self.unimplemented(backend::SELECT, 8, true);
+                return;
+            }
+            self.widget.backend_index = (word >> backend::SELECTOR_INDEX_SHIFT) & backend::SELECTOR_INDEX_MASK;
+            self.widget.backend_count = word & backend::COUNT_MASK;
+            return;
+        }
+        self.backend_data(self.widget.backend_index, word);
+        self.widget.backend_index = (self.widget.backend_index + 1) & backend::SELECTOR_INDEX_MASK;
+        self.widget.backend_count -= 1;
+    }
+
+    /// The indexed register file's write port: an 8-byte store is two words,
+    /// upper half first, a 4-byte store is one word (see backend::SELECT).
+    pub fn backend_write(&mut self, value: u64, size: u32) {
+        if size == 8 {
+            self.backend_word((value >> 32) as u32);
+            self.backend_word(value as u32);
+        } else {
+            self.backend_word(value as u32);
+        }
+    }
+}
+
+/// Deterministic model defaults; physical back-material reset is unknown.
+/// (The query:: constants and the hardware shadow-page constants are in
+/// draw.rs and consts.rs.)
+pub(super) const BACK_MATERIAL_DEFAULTS: [u32; 16] = [
+    ODSY_F32_POINT_TWO,
+    ODSY_F32_POINT_TWO,
+    ODSY_F32_POINT_TWO,
+    ODSY_F32_ONE,
+    ODSY_F32_POINT_EIGHT,
+    ODSY_F32_POINT_EIGHT,
+    ODSY_F32_POINT_EIGHT,
+    ODSY_F32_ONE,
+    0,
+    0,
+    0,
+    ODSY_F32_ONE,
+    0,
+    0,
+    0,
+    ODSY_F32_ONE,
+];

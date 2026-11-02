@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 use crate::config::{CpuModel, MachineConfig};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
-use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R5000ShadowCache};
+use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R12000O2ShadowCache, R5000ShadowCache};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
@@ -157,8 +157,23 @@ pub const O2_PROM_FILE: &str = "ip32prom.rev4.18.bin";
 /// CP0 Count when `[clock] fixed_mhz` is unset: half of a 180 MHz CPU.
 pub const O2_COUNT_MHZ: f64 = 90.0;
 
+/// CP0 Count for the O2's R12000 when `[clock] fixed_mhz` is unset: half of
+/// 400 MHz, the speed O2 listings show for revision 3.5.
+pub const O2_R12000_COUNT_MHZ: f64 = 200.0;
+
+/// CP0 Count for a part when `[clock] fixed_mhz` is unset.
+fn o2_default_count_mhz(cpu: CpuModel) -> f64 {
+    match cpu {
+        CpuModel::R12000 => O2_R12000_COUNT_MHZ,
+        _ => O2_COUNT_MHZ,
+    }
+}
+
 impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
+        if !matches!(cfg.machine.cpu, CpuModel::R5000 | CpuModel::R10000 | CpuModel::R12000) {
+            return Err("an O2 has an R5000, R10000 or R12000 ([machine] cpu = \"r5000\", \"r10000\" or \"r12000\")".into());
+        }
         let o2 = &cfg.o2;
         // `prom`, or the last release's file when `prom` is the shared default
         // and that file is not there: there is no embedded O2 PROM.
@@ -235,14 +250,15 @@ impl O2Machine {
         let arcs_fpu = o2.arcs_fpu;
         // `[clock] fixed_mhz` is CP0 Count; the CPU clock the PROM measures
         // and reports is twice it.
-        let count_mhz = cfg.clock.fixed_mhz.unwrap_or(O2_COUNT_MHZ);
+        let count_mhz = cfg.clock.fixed_mhz.unwrap_or(o2_default_count_mhz(cfg.machine.cpu));
         let cpu_mhz = (count_mhz * 2.0).round().max(1.0) as u32;
         let boot = Arc::new(BootState::new());
         let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
             CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
             CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
+            CpuModel::R12000 => Self::build_cpu::<R12000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
+            CpuModel::R4400 | CpuModel::R14000 | CpuModel::R16000 | CpuModel::R16000Mhz700 => unreachable!("refused at the top of `new`"),
         };
 
         // ppmem: the CPU's cache and the JIT reach RAM through the memory's
@@ -1221,3 +1237,19 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
     }
 }
 
+
+#[cfg(test)]
+mod cpu_clock_tests {
+    use super::*;
+
+    /// A plain `cpu = "r12000"` reports the 400 MHz the revision 3.5 part
+    /// shipped at; the others keep the 180 MHz default. Count runs at half
+    /// the clock.
+    #[test]
+    fn the_o2_r12000_defaults_to_400_mhz() {
+        assert_eq!(o2_default_count_mhz(CpuModel::R12000) * 2.0, 400.0);
+        for cpu in [CpuModel::R5000, CpuModel::R10000] {
+            assert_eq!(o2_default_count_mhz(cpu) * 2.0, 180.0, "{cpu:?}");
+        }
+    }
+}

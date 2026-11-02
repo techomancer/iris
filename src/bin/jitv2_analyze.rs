@@ -108,8 +108,8 @@ fn main() {
         };
 
         let entry_word = entry.offset / 4;
-        let page_base = entry.pfn.wrapping_mul(iris::cpu::jitv2::PAGE_SIZE);
-        let (result, non_empty) = analyzer.walk(&page, entry_word, page_base);
+        let page_base = iris::cpu::jitv2::jitv2::key_phys_base(entry.pfn);
+        let (result, non_empty) = analyzer.walk(&page, entry_word, page_base as u32);
 
         stats.files_walked += 1;
         if entry_word == 1 {

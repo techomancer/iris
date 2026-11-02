@@ -27,7 +27,10 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
 use crate::cpu::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
-use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
+use crate::cpu::mips_cache_shadow::{
+    CONFIG0_RESET_MASK, R10000ShadowCache, R12000ShadowCache, R14000_PRID, R16000ShadowCache, R16000_MHZ700_CONFIG0,
+    R16000_MHZ700_PRID, R4400ShadowCache, R5000ShadowCache,
+};
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -50,7 +53,7 @@ pub fn set_emulator_profile(profile: MachineProfile) {
 
 fn emulator_profile() -> Option<MachineProfile> {
     let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
-    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30]
+    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::FuelIp34]
         .into_iter().find(|p| *p as u8 == raw)
 }
 
@@ -65,6 +68,7 @@ fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static s
         Some(MachineProfile::Indigo2Ip28) => &["IRIX", "Iris", "Indigo2", "IP28"],
         Some(MachineProfile::O2Ip32) => &["IRIX", "Iris", "IP32"],
         Some(MachineProfile::OctaneIp30) => &["IRIX", "Iris", "IP30"],
+        Some(MachineProfile::FuelIp34) => &["IRIX", "Iris", "IP34"],
         None => &["IRIX", "Iris"],
     }
 }
@@ -338,6 +342,11 @@ impl Machine {
             crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
             crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
             crate::config::CpuModel::R10000 => <R10000ShadowCache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R12000 => <R12000ShadowCache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R14000 => <R12000ShadowCache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R16000 | crate::config::CpuModel::R16000Mhz700 => {
+                <R16000ShadowCache as MipsCache>::L2_SIZE > 0
+            }
         };
         if !model_has_l2 {
             eeprom_mc.lock().set_cachsz(0);
@@ -695,12 +704,22 @@ impl Machine {
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
-        macro_rules! build_cpu { ($cache:ty) => {{
+        macro_rules! build_cpu { ($cache:ty $(, $prid:expr $(, $config0:expr)?)?) => {{
         let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone());
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
         executor.phys_mask = u32::MAX as u64;
+        // A part that shares another's model differs in PRId and, where its
+        // Config reset word differs, in that word's low 25 bits.
+        $(
+            executor.core.reset_prid = $prid;
+            executor.core.cp0_prid = $prid;
+            $(
+                executor.core.cp0_config =
+                    (executor.core.cp0_config & !CONFIG0_RESET_MASK) | $config0;
+            )?
+        )?
 
         // Load default symbol maps if they exist
         {
@@ -754,6 +773,12 @@ impl Machine {
             // tag and data arrays that exist only to answer CACHE ops and the
             // PROM's diagnostics. See mips_cache_shadow.rs.
             crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
+            crate::config::CpuModel::R12000 => build_cpu!(R12000ShadowCache),
+            crate::config::CpuModel::R14000 => build_cpu!(R12000ShadowCache, R14000_PRID),
+            crate::config::CpuModel::R16000 => build_cpu!(R16000ShadowCache),
+            crate::config::CpuModel::R16000Mhz700 => {
+                build_cpu!(R16000ShadowCache, R16000_MHZ700_PRID, R16000_MHZ700_CONFIG0)
+            }
         };
 
         // The developer status bar shows the CPU's Count rate.
@@ -2126,11 +2151,12 @@ mod emulator_name_tests {
                 Some(MachineProfile::Indigo2Ip28) => &["Indy", "IP24", "IP22", "IP32", "O2"],
                 Some(MachineProfile::O2Ip32) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "O2"],
                 Some(MachineProfile::OctaneIp30) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP32", "O2"],
+                Some(MachineProfile::FuelIp34) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
                 None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
             }
         };
         for p in [None, Some(MachineProfile::IndyIp24), Some(MachineProfile::Indigo2Ip22),
-                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30)] {
+                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30), Some(MachineProfile::FuelIp34)] {
             let thirds = emulator_name_thirds(p);
             assert!(!thirds.is_empty());
             for w in thirds {
@@ -2142,7 +2168,7 @@ mod emulator_name_tests {
 
     #[test]
     fn profile_round_trips_through_the_global() {
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::FuelIp34] {
             set_emulator_profile(p);
             assert_eq!(emulator_profile(), Some(p));
         }

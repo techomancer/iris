@@ -13,6 +13,54 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### R10000 TLB widths
+
+- **Full 44-bit user addresses.** On the R10000 (Octane, IP28, and an O2 set to
+  `r10000`) EntryHi, the TLB match and the user-segment check keep VA bits 43:40;
+  they stopped at bit 39 before, so an address above 1 TiB took an Address Error.
+  The R4400 and R5000 are unchanged.
+- **FrameMask (CP0 register 21)** on the R10000 clears the EntryLo bits it
+  names, 33:18, on every TLB write, so a kernel that keeps software flags there
+  gets the physical address it meant. The register read as zero and ignored
+  writes before. The R4400 and R5000 have none.
+- **EntryLo** on the R10000 keeps its 28-bit PFN (bits 33:6, a 40-bit physical
+  address) and the uncached attribute in 63:62; it kept 30 bits before. The
+  attribute is stored and read back, not sent to the bus.
+
+### Refused uncached stores on the R10000 family
+
+- On the R10000 family (Octane, IP28, O2), an uncached store that nothing answers now
+  completes instead of raising a Data Bus Error, as the processor does. iris prints
+  "Unsupported uncached write ... (posted, completes)" for the first four such
+  stores and then at each power of two. Loads, instruction fetches, the R4400 and
+  the R5000 are unchanged.
+
+### Partial LWR on the R10000
+
+- On the R10000 (Octane, IP28, and an O2 with the R10000), an `LWR` that loads fewer
+  than four bytes now keeps bits 63:32 of the destination instead of sign-extending,
+  as the reference results for the part show. R4400 and R5000 machines are unchanged.
+  The JIT matches the interpreter, and the code-cache key changes only for the
+  machines that have the behaviour.
+
+### R10000 cache operations
+
+- **Index Load Data and Index Store Data** on the R10000's primary caches keep their
+  data (they read back zero before). The secondary cache's data slot is the address
+  shifted right by 3 instead of 4: one slot per doubleword.
+- **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
+  TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
+
+### R12000, R14000 and R16000
+
+- `[machine] cpu` and `--cpu` take `r12000`, `r14000`, `r16000` (revision 2.2,
+  the 800 MHz part) and `r16000_700` (revision 2.1, the 700 MHz part). The Octane
+  takes the R10000, R12000 and R14000 (defaulting to 195, 360 and 600 MHz), the
+  O2 the R5000, R10000 and R12000 (400 MHz for the R12000), the IP28 the R10000.
+  The R16000 has no machine yet; `iris-bench` is its only user. CP0 Config now
+  reports the part's own secondary-cache size, where every part read 1 MB, and
+  each R16000 presents its own reset word.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
@@ -87,6 +135,30 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Memory past 4 GB is as fast as the rest: such a machine gets a 16 GB direct
   window, and the JIT compiles code anywhere in it.
 - A store-conditional on memory outside the window is now atomic with two CPUs.
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- **The Fuel takes a VPro board**: `[graphics] board = "v12"` or `"v10"`
+  fits the Octane's VPro model at crossbar widget 13. IRIX 6.5.30 with the
+  VPro driver brings the X login screen up on it.
+
+- Added a headless Fuel profile with the 500 MHz R14000, 512 MiB RAM,
+  Bedrock, dual-head XBridge, IOC3 networking and two-channel ISP12160 SCSI.
+  The normal interpreter boot reaches the IRIX 6.5.30 root shell with PROM
+  6.210. See the [Fuel guide](docs/fuel-ip34.md).
+- **jitv2 compiles uncached code from the uncached view.** The PROM runs from the
+  reset window uncached; once memory covers that window the cached view returns
+  RAM there, and the compile pool used to compile RAM's bytes in place of the
+  PROM's. An uncached fetch now keys a code page of its own and is compiled and
+  invalidated through the view the CPU fetched it by. Other machines are
+  unchanged.
+
+### PCI configuration
+
+- A PCI function can describe its own writable header fields and
+  write-one-to-clear status bits. Byte and halfword configuration writes
+  through a Bridge carry their byte enables, so such a function keeps the
+  status events a narrow write did not select. No Octane function has
+  write-one-to-clear status bits, so the Octane behaves as before.
 
 ### VNC, and screen and pointer commands
 
@@ -304,6 +376,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   flags, window-ID modes and VC3 tables, the draw bank, the interrupt lines
   and, on the Octane, the HEART packets and acknowledgements
   (docs/perfetto.md).
+- **The Octane takes the VPro boards**: `[graphics] board = "v6"`,
+  `"v8"`, `"v10"` or `"v12"` puts a port of QEMU's VPro (Odyssey) model
+  on the graphics port; IRIX needs an install with the VPro driver, and
+  the V10 and V12 bring the Octane2's Crossbow 1.4 with them. The board's front end and raster unit each
+  run on a thread of their own and the display on a third, so long GL
+  streams no longer hold up the processor.
+  (`src/dev/odyssey`)
 - **The Octane takes the textured IMPACT boards.** `[graphics] board =
   "highimpact"` is the SI with texture option and `"maximpact"` the MXI
   (two GEs, two REs), with the board version bytes the IP30 kernel decodes;
@@ -367,6 +446,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2's memory alias holds for pages with high PTE bits set.** A mapped page
+  whose address had a bit set above bit 31 missed the alias of RAM at
+  0x8000_0000 and reached the PCI window instead.
 - **The O2 runs on the shadow cache from reset.** The full cache model, and
   the switch to and from it during POST and reboots, are gone
   (`src/ip32_handover.rs`), and with them a branch on every cached load, store

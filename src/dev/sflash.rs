@@ -30,14 +30,17 @@
 //! [`Bridge::attach_flash`]: crate::dev::bridge::Bridge::attach_flash
 
 use std::cell::Cell;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::traits::{BusDevice, BusRead16, BUS_ERR, BUS_OK};
+
+pub(crate) mod storage;
+pub(crate) mod amd;
+use self::storage::FlashBacking;
 
 /// The Octane's part: 1 MiB.
 pub const FLASH_SIZE: usize = 1 << 20;
@@ -77,7 +80,7 @@ struct State {
     data: Vec<u8>,
     mode: Mode,
     status: u8,
-    file: Option<File>,
+    backing: Option<FlashBacking>,
 }
 
 pub struct CfiFlash {
@@ -113,7 +116,7 @@ impl CfiFlash {
         assert!(image.len() <= size, "image must fit the part");
         let mut data = vec![0xff; size];
         data[..image.len()].copy_from_slice(image);
-        Self { st: Mutex::new(State { data, mode: Mode::Array, status: SR_READY, file: None }), gen: AtomicU64::new(0) }
+        Self { st: Mutex::new(State { data, mode: Mode::Array, status: SR_READY, backing: None }), gen: AtomicU64::new(0) }
     }
 
     /// A reset: back to read-array mode with the status clear. The array
@@ -131,23 +134,10 @@ impl CfiFlash {
     /// untouched, since it is probably some other file.
     pub fn with_file(image: &[u8], size: usize, path: impl AsRef<Path>) -> io::Result<Self> {
         let flash = Self::new(image, size);
-        let path = path.as_ref();
-        let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
-        {
-            let mut st = flash.st.lock();
-            let len = file.metadata()?.len();
-            if len == size as u64 {
-                file.read_exact(&mut st.data)?;
-            } else if len == 0 {
-                file.write_all(&st.data)?;
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("flash file {} is {len} bytes, expected {size} (or empty); not overwriting it", path.display()),
-                ));
-            }
-            st.file = Some(file);
-        }
+        let mut st = flash.st.lock();
+        let backing = FlashBacking::open(path, &mut st.data)?;
+        st.backing = Some(backing);
+        drop(st);
         Ok(flash)
     }
 
@@ -167,10 +157,9 @@ impl CfiFlash {
 }
 
 impl State {
-    fn sync(&self, off: usize, len: usize) {
-        if let Some(mut f) = self.file.as_ref() {
-            // `&File` seeks and writes without needing `&mut self`.
-            let res = f.seek(SeekFrom::Start(off as u64)).and_then(|_| f.write_all(&self.data[off..off + len]));
+    fn sync(&mut self, off: usize, len: usize) {
+        if let Some(backing) = self.backing.as_mut() {
+            let res = backing.write_range(off, &self.data[off..off + len]);
             if let Err(e) = res {
                 // The guest sees a completed cycle; the file is only the backing store.
                 log::warn!("flash: backing file write at {off:#x} failed: {e}");

@@ -577,17 +577,28 @@ pub const TR_GLOBAL: u32 = 1 << 4;
 /// the privilege epoch that filled it. The only thing rejected here is a VA
 /// shape that is not a valid address in the first place.
 #[inline]
-fn nutlb_cacheable_segment(va: u64, is_64bit: bool) -> bool {
+fn nutlb_cacheable_segment<C: CpuModel>(va: u64, is_64bit: bool) -> bool {
     if !is_64bit {
         // Every 32-bit segment (kuseg/kseg0/kseg1/ksseg/kseg3) is a real
         // address whose finished translation is worth caching.
         return true;
     }
-    // xuseg: bits 63:40 must be zero to be a valid user address. Every other
-    // 64-bit segment (xsseg, xkphys, xkseg and the 0xFFFFFFFF_* compat
-    // windows) is fine — translate_64bit_impl raises before returning ok for
-    // the illegal xkphys sub-ranges, so nothing invalid reaches a fill.
-    (va >> 62) != 0 || (va >> 40) == 0
+    // xuseg: bits 63:`C::VA_BITS` must be zero to be a valid user address.
+    // Every other 64-bit segment (xsseg, xkphys, xkseg and the 0xFFFFFFFF_*
+    // compat windows) is fine — translate_64bit_impl raises before returning ok
+    // for the illegal xkphys sub-ranges, so nothing invalid reaches a fill.
+    (va >> 62) != 0 || (va >> C::VA_BITS) == 0
+}
+
+/// The EntryHi bits this model keeps: region, VPN2 up to `C::VA_BITS` and ASID.
+#[inline(always)]
+const fn model_entryhi_mask<C: CpuModel>() -> u64 {
+    0xC000_0000_0000_00FF | crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS)
+}
+
+/// Whether the `n`th refused store is reported: the first four, then each power of two.
+pub(crate) fn report_refused_store(n: u64) -> bool {
+    n <= 4 || n.is_power_of_two()
 }
 
 /// Per-access-class tally of how far a guest load/store would get through the
@@ -853,6 +864,9 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub decoded_count: Arc<AtomicU64>,
     /// Count of instructions fetched from uncached address space.
     pub uncached_fetch_count: Arc<AtomicU64>,
+    /// Refused uncached stores so far (see `CpuModel::POSTS_UNCACHED_STORES`);
+    /// sets how often `post_refused_store` reports.
+    refused_stores: u64,
     /// Hot-path translation function pointer, updated whenever CP0 Status changes.
     /// Always the non-debug variant; selects the correct 32/64-bit × privilege specialisation.
     pub translate_fn: fn(&mut Self, u64, AccessType) -> TranslateResult,
@@ -989,6 +1003,16 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// short loop).
     #[cfg(feature = "jitv2")]
     pub jitv2_inline_compile: bool,
+    /// The machine's uncached bus view decodes code differently from its
+    /// cached one (IP35), so an uncached fetch keys its own code page and
+    /// is compiled from what the uncached view returns. Set by
+    /// [`Self::enable_jitv2_uncached_views`]; off on every other machine.
+    #[cfg(feature = "jitv2")]
+    pub(crate) jitv2_uncached_views: bool,
+    /// The bus compiles read code through, when it is not `sysad` itself
+    /// (see [`Self::enable_jitv2_uncached_views`]).
+    #[cfg(feature = "jitv2")]
+    jitv2_code_bus: Option<Arc<dyn BusDevice>>,
     /// Scratch analyzer for `jitv2_inline_compile`'s synchronous path — same
     /// `comp::handle_request` compile sequence the real async compile-thread
     /// runs, just called directly on the CPU thread. Kept alive across calls
@@ -1023,12 +1047,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
     /// A window of physical addresses that reaches memory at another address,
     /// `(base, size, target)`, applied to mapped and XKPHYS translations
-    /// before [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
+    /// after [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
     /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
     /// there. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
-    /// XKPHYS and ERL-identity translations after [`Self::phys_alias`]. The
+    /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
     /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
     /// alias the rest away, and IRIX relies on it: its page-table entries keep
     /// software bits (the PFN lock among them) just above the PFN, so they
@@ -1350,20 +1374,21 @@ unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    let val = val as u8; // mask to the real width ourselves — see write8_fn's doc comment on why the FFI parameter is u64
+    // The whole register, as the interpreter's SB passes it: `write_data`
+    // narrows it where it stores, and an uncached store hands it to the bus
+    // (`BusDevice::write_narrow_from`).
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_write::<1>(va, val as u64); }
+    { return exec.lockstep_jit_write::<1>(va, val); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    exec.write_data::<1>(va, val as u64)
+    exec.write_data::<1>(va, val)
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    let val = val as u16; // mask to the real width ourselves — see write16_fn's doc comment
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_write::<2>(va, val as u64); }
+    { return exec.lockstep_jit_write::<2>(va, val); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    exec.write_data::<2>(va, val as u64)
+    exec.write_data::<2>(va, val)
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
@@ -2193,6 +2218,22 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.sysad.describe_fault(phys_addr, size).map_or_else(String::new, |why| format!(" [{why}]"))
     }
 
+    /// An uncached store the system refused, on a model that posts stores
+    /// (`CpuModel::POSTS_UNCACHED_STORES`): say so and let the store complete.
+    /// The caller returns `BUS_OK`. Always built, so a missing device or a
+    /// guest bug stays visible in every build. A probe loop would flood
+    /// stderr, so it reports the first four and then every power of two, with
+    /// the running count.
+    #[cold]
+    fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
+        self.refused_stores += 1;
+        let n = self.refused_stores;
+        if report_refused_store(n) {
+            eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{} [store {n}]",
+                size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
+        }
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -2202,7 +2243,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let mut core = MipsCore::new();
         // Mapped pages decode their C field with this model's table, as KSEG0
         // and xkphys do.
+        tlb.set_va_bits(C::VA_BITS);
         tlb.set_cache_attrs(Self::cache_attr_table());
+        core.entryhi_mask = model_entryhi_mask::<C>();
+        if C::R10K_FAMILY {
+            core.framemask_mask = 0xFFFF;
+            // PFN in bits 33:6 and the uncached attribute in 63:62 (R10000 UM
+            // p. 214); 61:34 are reserved.
+            core.entrylo_mask = 0xC000_0003_FFFF_FFFF;
+        }
 
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
@@ -2283,16 +2332,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             c |= log2(32768) << 26;          // 32 KB L1D
             c |= 1 << 15;                    // big endian
             if C::L2_LINE == 128 { c |= 1 << 13; }
-            // Secondary cache size. The encoding is not in anything to hand,
-            // so it was swept against the PROM rather than guessed.
-            //
-            // 1 is the value to keep: IRIX reports "Secondary unified
-            // instruction/data cache size: 1 Mbyte", which agrees with this
-            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
-            // and IRIX boots with it. 4 also passes POST but has IRIX report
-            // 8 MB, contradicting the model.
-            c |= 1 << 16;
+            // SS is log2(secondary cache size / 512 KB): 0 is 512 KB, 1 is 1 MB,
+            // 2 is 2 MB, up to 5 for 16 MB (NEC U10278EJ4V0UM p.230). It follows
+            // the model's own `L2_SIZE`. EC, SC, DN, PM, DSD and SK stay zero.
+            c |= (C::L2_SIZE / (512 << 10)).trailing_zeros() << 16;
             c |= 2;                          // K0 = uncached at reset
+            // A part with a known reset word presents it over the low 25 bits.
+            if C::CONFIG0_RESET != 0 {
+                c = (c & !crate::cpu::mips_cache_shadow::CONFIG0_RESET_MASK) | C::CONFIG0_RESET;
+            }
             config = c;
         }
 
@@ -2382,6 +2430,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             ins: DecodedInstr::default(), // scratch slot for uncached fetches
             decoded_count: Arc::new(AtomicU64::new(0)),
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
+            refused_stores: 0,
             // Placeholder — overwritten immediately by update_translate_fn below.
             translate_fn: translate_32_kernel::<T, C>,
             // Placeholder — overwritten immediately by update_fpr_mode below.
@@ -2449,6 +2498,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // refusal) so this can never be flipped back to `false` live either.
             #[cfg(feature = "jitv2")]
             jitv2_inline_compile: cfg!(feature = "jitv2_lockstep"),
+            #[cfg(feature = "jitv2")]
+            jitv2_uncached_views: false,
+            #[cfg(feature = "jitv2")]
+            jitv2_code_bus: None,
             #[cfg(feature = "jitv2")]
             jitv2_inline_analyzer: crate::cpu::jitv2::analyzer::Analyzer::with_isa(C::MIPS4),
             // IRIS_JIT_DISPATCH=off starts with the JIT dispatch gate shut: the
@@ -2618,6 +2671,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 // set) -- the property a persistent code cache needs.
                 // Several CPUs share compiled code, so no one core's address.
                 core: if self.core.smp || std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
+                lwr_keeps_upper: C::PARTIAL_LWR_KEEPS_UPPER,
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -2747,7 +2801,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             self.core.nanotlb[AT as usize].fill_raw(va_page, result.phys, result.status & 0x7);
             #[cfg(feature = "jitv2")]
             if AT == AccessType::Fetch as u8 {
-                self.jitv2_track_pcp(result.phys);
+                self.jitv2_track_pcp(result.phys, !result.is_cached());
             }
         }
         result
@@ -2873,7 +2927,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // user address. Everything else is cacheable regardless of which
         // mode filled it, because privilege is enforced by flushing on
         // transition rather than by the tag.
-        if !nutlb_cacheable_segment(va, self.core.is_64bit_mode()) {
+        if !nutlb_cacheable_segment::<C>(va, self.core.is_64bit_mode()) {
             return;
         }
 
@@ -2961,7 +3015,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         if !self.smc_seen.insert(key) {
             return;
         }
-        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+        let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
         let word = ((phys_addr - page_base) / 4) as usize;
         eprintln!(
             "jitv2 SMC: write to the page being executed — pc={:#018x} wrote {} byte(s) \
@@ -2978,12 +3032,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// [`Self::smc_check_report`].
     ///
     /// `cur_code_pfn == u32::MAX` (no page tracked) can never match a real
-    /// frame, so the "nothing tracked" case needs no separate test.
+    /// frame, so the "nothing tracked" case needs no separate test. The
+    /// comparison masks the view bit off `cur_code_pfn`, which leaves the
+    /// sentinel as 0xFFEFFFFF: still beyond any frame the page table holds.
     #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
     #[inline(always)]
     fn smc_check_write(&mut self, virt_addr: u64, phys_addr: u64, size: usize) {
         let pfn = self.core.cur_code_pfn;
-        if (phys_addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32 == pfn {
+        if (phys_addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32
+            == pfn & !crate::cpu::jitv2::jitv2::UNCACHED_VIEW_PFN
+        {
             self.smc_check_report(virt_addr, phys_addr, size, pfn);
         }
     }
@@ -3022,7 +3080,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// may have made the flush unnecessary.
     #[cfg(feature = "jitv2")]
     pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
-        let bus = self.sysad.clone();
+        let bus = self.jitv2_compile_bus();
         let jit = self.jitv2.clone();
         let flush = || {
             let mut j = jit.lock();
@@ -3049,6 +3107,40 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.memory.contains(paddr).then(|| self.jitv2_frame(paddr)).flatten().ok_or_else(|| format!(
             "{:#x} is not in this machine's memory ({}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
             paddr, self.memory))
+    }
+
+    /// The page key for a fetch at `phys_addr`: its frame, in the uncached
+    /// view's key space when `uncached` and this machine keeps one
+    /// (`jitv2::code_key`). `None` above the page table.
+    #[cfg(feature = "jitv2")]
+    pub(crate) fn jitv2_code_key(&self, phys_addr: u64, uncached: bool) -> Option<crate::cpu::jitv2::jitv2::Pfn> {
+        crate::cpu::jitv2::jitv2::code_key(phys_addr, self.jitv2_frames, uncached && self.jitv2_uncached_views)
+    }
+
+    /// Tell the JIT this machine's uncached bus view decodes code differently
+    /// from its cached view, so uncached fetches get their own code pages and
+    /// are compiled from `code_bus`, which must serve a page's bytes through
+    /// the view its key names (see `jitv2::key_bus_addr`). Call while the
+    /// executor is being built, before it is shared or run. Machines without
+    /// such views never call this and keep one page per frame.
+    #[cfg(feature = "jitv2")]
+    pub fn enable_jitv2_uncached_views(&mut self, code_bus: Arc<dyn BusDevice>) {
+        self.jitv2.lock().enable_uncached_views();
+        self.jitv2_uncached_views = true;
+        self.jitv2_code_bus = Some(code_bus);
+        self.jitv2_bind_fast_lookup();
+    }
+
+    /// The code page the last fetch landed on, or null.
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_current_page(&self) -> *mut crate::cpu::jitv2::PhysicalCodePage {
+        self.pcp
+    }
+
+    /// The bus compile workers and the inline compile read code through.
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_compile_bus(&self) -> Arc<dyn BusDevice> {
+        self.jitv2_code_bus.clone().unwrap_or_else(|| self.sysad.clone())
     }
 
     #[cfg(feature = "jitv2")]
@@ -3095,10 +3187,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// nanotlb hit path above and a single PFN comparison here.
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn jitv2_track_pcp(&mut self, phys_addr: u64) {
+    fn jitv2_track_pcp(&mut self, phys_addr: u64, uncached: bool) {
         // Code above the JIT's pfn map gets no page and runs in the
-        // interpreter (`step_jit` checks for the null page).
-        let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr, self.jitv2_frames) else {
+        // interpreter (`step_jit` checks for the null page). That includes
+        // uncached attributes 1 to 3: their bits 58:57 sit in `phys_addr`,
+        // so the frame range check rejects them. Where the uncached bus view
+        // differs from the cached one, an uncached fetch keys a page of its
+        // own (`code_key`).
+        let Some(pfn) = crate::cpu::jitv2::jitv2::code_key(phys_addr, self.jitv2_frames, uncached && self.jitv2_uncached_views) else {
             self.clear_pcp();
             return;
         };
@@ -3117,7 +3213,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // on the page-crossing path (not every fetch) to keep the common
         // same-page case free of this cost even when the toggle is on.
         if jitv2_pagewb_enabled() {
-            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+            let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
             self.cache.writeback(None, page_base, crate::cpu::jitv2::PAGE_SIZE as u64);
         }
         // A page crossing landing exactly on word 0 (the exception/TLB-refill
@@ -3153,7 +3249,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return;
         }
 
-        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+        let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
         // §13: live FR mode at first-arrival time, pinned into the page for
         // its whole lifetime (PhysicalCodePage::fr1's own doc comment) —
         // ignored by page_for on a lookup hit (an already-claimed page keeps
@@ -3322,7 +3418,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// cost to the interpreter's per-instruction hot loop.
     pub fn exec(&mut self, instr: u32) -> ExecStatus {
         #[cfg(feature = "jitv2")]
-        self.jitv2_track_pcp(self.core.pc & 0xFFFF_FFFF);
+        self.jitv2_track_pcp(self.core.pc & 0xFFFF_FFFF, false);
         self.ins.raw = instr;
         self.ins.flags = FLAG_NOT_DECODED;
         decode_into::<T, C>(&mut self.ins);
@@ -4518,11 +4614,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let top_bits = virt_addr >> 62;
 
         match top_bits {
-            // xuseg: 0x0000_0000_0000_0000 - 0x0000_00FF_FFFF_FFFF (user mapped)
-            // Accessible from all privilege levels
+            // xuseg is user-mapped below 2^C::VA_BITS (0x0000_00FF_FFFF_FFFF
+            // for the 40-bit models) and accessible from every privilege level.
             0 => {
-                if (virt_addr >> 40) != 0 {
-                    // Bits 63:40 must be zero for valid user address
+                if (virt_addr >> C::VA_BITS) != 0 {
+                    // Bits above the model's implemented user VA must be zero
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     return TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }));
                 }
@@ -4608,15 +4704,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
-    /// A CPU physical address as the board decodes it: through
-    /// [`Self::phys_alias`] if it falls in it, then cut to [`Self::phys_mask`].
+    /// A CPU physical address as the board decodes it: cut to
+    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
-        let pa = match self.phys_alias {
-            Some((base, size, target)) if pa.wrapping_sub(base) < size => pa - base + target,
+        // Cut first: the PTE software bits above the PFN are not part of the
+        // address the alias window sees. Window and target lie within the mask.
+        let pa = pa & self.phys_mask;
+        match self.phys_alias {
+            Some((base, size, target)) if pa.wrapping_sub(base) < size => (pa - base + target) & self.phys_mask,
             _ => pa,
-        };
-        pa & self.phys_mask
+        }
     }
 
     /// TLB translation.  When `DEBUG` is true, CP0 side-effect registers are
@@ -4673,8 +4771,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn update_tlb_exception_registers<const XTLB: u8>(&mut self, virt_addr: u64) {
         const EH_VPN2_32: u64 = 0x0000_0000_FFFF_E000;
-        const EH_VPN2_64: u64 = 0x0000_00FF_FFFF_E000;
         const EH_REGION:  u64 = 0xC000_0000_0000_0000;
+        // VPN2 is bits 43:13 on the R10000 family (R10000 UM pp. 219, 288) and
+        // 39:13 on the R4x00 and R5000. The R12000 is inferred to match (its
+        // manual lists no TLB change); the R14000 and R16000 are a model choice
+        // that follows the same width.
+        let eh_vpn2_64 = crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS);
 
         self.core.cp0_badvaddr = virt_addr;
 
@@ -4697,9 +4799,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         //
         // This is MAME r4000's `EH_WM` (0xC000_00FF_FFFF_E0FF) less the ASID
         // bits, which are carried separately below.
-        const EH_VPN_MASK: u64 = EH_REGION | EH_VPN2_64; // 0xC000_00FF_FFFF_E000
+        let eh_vpn_mask = EH_REGION | eh_vpn2_64;
         let asid = self.core.cp0_entryhi & 0xFF;
-        self.core.cp0_entryhi = (virt_addr & EH_VPN_MASK) | asid;
+        self.core.cp0_entryhi = (virt_addr & eh_vpn_mask) | asid;
 
         // Context: PTEBase[63:23] preserved, BadVPN2 = virt_addr[31:13] in bits [22:4].
         // Always 32-bit VPN — Context is used by the 32-bit UTLB handler.
@@ -4720,10 +4822,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // the address it computes lands outside the page table it wired, the
         // nested miss is unrecoverable, and IRIX panics with "Entered tlbmiss
         // with invalid vaddr".
-        //
-        // EntryHi keeps the 40-bit VPN2 field on every model: a 64-bit kernel
-        // zero-fills those upper bits itself when it builds an EntryHi value,
-        // and widening the mask here breaks it.
         self.core.cp0_xcontext =
             xcontext_on_miss(C::VA_BITS, self.core.cp0_xcontext, virt_addr);
     }
@@ -5068,7 +5166,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             if !DEBUG && mips_log(MIPS_LOG_MEM) {
                 dlog_dev!(LogModule::Mips, "Uncached Write{}: PC={:016x} VA={:016x} PA={:016x} Val={:016x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val);
             }
-            let ws = if SIZE == 1 {
+            let ws = if !DEBUG && SIZE <= 2 {
+                // The bus sees the whole source register: Fuel PROM 6.210's
+                // Walking Address test reads its check words back from
+                // Bedrock's ECC view, and the word sits elsewhere in the
+                // register than the addressed lanes. Ordinary devices take
+                // the architectural low bits. Debug writes carry just the
+                // value they name, so they keep the ordinary-width path.
+                self.sysad.write_narrow_from(phys_addr, SIZE, val)
+            } else if SIZE == 1 {
                 self.sysad.write8(phys_addr, val as u8)
             } else if SIZE == 2 {
                 self.sysad.write16(phys_addr, val as u16)
@@ -5078,9 +5184,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.sysad.write64(phys_addr, val)
             };
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, SIZE, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         };
         // jitv2_lockstep's load/store verification (see MipsCore's
         // lockstep_mem field doc comment, and read_data_impl's matching
@@ -5134,9 +5247,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             let ws = self.sysad.write64_masked(phys_addr, val, mask);
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, mask.count_ones() as usize / 8, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         }
     }
 
@@ -6354,8 +6474,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 let mask = 0xFFFFFFFFu32 >> shift;
                 let result = (mem_word >> shift) | (rt_val & !mask);
 
-                // Sign-extend to 64 bits
-                self.core.write_gpr(rt_reg, result as i32 as i64 as u64);
+                // The manual leaves the upper word of a partial LWR implementation
+                // specific (NEC U12754E pp. 125-126). The R10000 keeps
+                // bits 63:32, as observed reference results show; the later
+                // parts are not established. A full word
+                // still sign-extends.
+                let value = if C::PARTIAL_LWR_KEEPS_UPPER && byte_offset != 3 {
+                    (self.core.read_gpr(rt_reg) & 0xffff_ffff_0000_0000) | result as u64
+                } else {
+                    // Sign-extend to 64 bits
+                    result as i32 as i64 as u64
+                };
+                self.core.write_gpr(rt_reg, value);
                 self.handle_exec_complete()
             }
             Err(status) => self.finish_status(status)
@@ -6541,6 +6671,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // R4000 hit operations — translating them would fault on an index that
         // is not a valid virtual address. See C_R10K_ISD in mips_cache_v2.
         let sel = cache_op & 3;
+        let primary_data_op = C::R10K_CACHE_OPS
+            && matches!(sel, CACH_PI | CACH_PD)
+            && matches!(op, C_R10K_ILD | C_R10K_ISD);
         let r10k_index_op = C::R10K_CACHE_OPS
             && match op {
                 C_R10K_CBARRIER => sel == CACH_PI,
@@ -6548,8 +6681,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
                 _ => false,
             };
-        let needs_translation =
-            !r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
+        // A primary Index Load/Store Data selects by VA, but a mapped one still
+        // takes TLB Refill and Invalid (VR10000 Instruction Set UM p. 15). The other index
+        // operations keep not translating their operand.
+        let needs_translation = primary_data_op
+            || (!r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV));
 
         let phys_addr = if needs_translation {
             // Hit operations need address translation
@@ -6569,7 +6705,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // that reads only TagLo sees a different tag from the one written.
         // Harmless for R4400/R5000, whose tags fit in 32 bits and who leave
         // TagHi zero: the shift-in contributes nothing there.
-        let stores_taglo = op == C_IST || (r10k_index_op && op == C_R10K_ISD);
+        let stores_taglo = op == C_IST || ((r10k_index_op || primary_data_op) && op == C_R10K_ISD);
         let phys_addr_or_taglo = if stores_taglo {
             ((self.core.cp0_taghi as u64) << 32) | (self.core.cp0_taglo as u32 as u64)
         } else {
@@ -6642,6 +6778,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // Split back the way it arrived. Zeroing TagHi unconditionally
             // threw away the top of every tag wider than 32 bits.
             self.core.cp0_taglo = result & 0xFFFF_FFFF;
+            // A primary data cache access leaves TagHi zero (a model choice).
             self.core.cp0_taghi = (result >> 32) as u32;
         }
 
@@ -7129,13 +7266,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let g1 = (self.core.cp0_entrylo1 & 1) != 0;
         let g_combined = if g0 && g1 { 1u64 << 12 } else { 0 };
 
-        // EH_WM = 0xC000_00FF_FFFF_E0FF — same mask MAME applies on TLBWI (clears reserved bits).
-        // Then clear bit 12 (G bit from EntryHi) and set combined G from Lo0&Lo1.
-        const EH_WM: u64 = 0xC000_00FF_FFFF_E0FF;
+        // EntryHi's writable mask (0xC000_00FF_FFFF_E0FF on a 40-bit model, MAME's
+        // `EH_WM`) clears reserved bits, as on TLBWI. Then clear bit 12 (G bit
+        // from EntryHi) and set combined G from Lo0&Lo1.
         TlbEntry {
             page_mask: self.core.cp0_pagemask,
-            entry_hi: (self.core.cp0_entryhi & EH_WM & !0x1000) | g_combined,
-            entry_lo: [self.core.cp0_entrylo0, self.core.cp0_entrylo1],
+            entry_hi: (self.core.cp0_entryhi & self.core.entryhi_mask & !0x1000) | g_combined,
+            entry_lo: [
+                self.core.framemask_entrylo(self.core.cp0_entrylo0),
+                self.core.framemask_entrylo(self.core.cp0_entrylo1),
+            ],
             selector_bit_shift: 0, // all derived fields overwritten by MipsTlb::write()
             vcmp32: 0, vpn_hi32: 0, vcmp64: 0, vpn_hi64: 0,
             offset_mask: 0, pfn_base: [0; 2],
@@ -8882,10 +9022,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
-            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            let phys_page_base = page.phys_base();
+            let uncached = page.is_uncached_view();
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.jitv2_compile_bus()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base);
+            self.jitv2_track_pcp(phys_page_base, uncached);
             return EXEC_RETRY;
         }
         let mut codegen = self.jitv2.lock().codegen.lock().take();
@@ -8894,6 +9035,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             "jitv2_lockstep: inline compile found no Codegen (async compile queue stole it?) — \
              verification would silently be OFF. The queue must not run under lockstep.");
         let mut ran_out_of_memory = false;
+        let compile_bus = self.jitv2_compile_bus();
         if let Some(codegen) = codegen.as_mut() {
             // Stamp the L1-D geometry the inline load/store fast path needs.
             // Done on every take rather than once at startup so a cache
@@ -8905,10 +9047,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
-                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &compile_bus, &mut self.jitv2_inline_analyzer, codegen, &stats);
             }
             #[cfg(not(feature = "developer"))]
-            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
+            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &compile_bus, &mut self.jitv2_inline_analyzer, codegen); }
         }
         *self.jitv2.lock().codegen.lock() = codegen;
         {
@@ -8918,10 +9060,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
-            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            let phys_page_base = page.phys_base();
+            let uncached = page.is_uncached_view();
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.jitv2_compile_bus()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base);
+            self.jitv2_track_pcp(phys_page_base, uncached);
             return EXEC_RETRY;
         }
         // Re-check is_runnable: handle_request can decline this exact
@@ -11020,7 +11163,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
         cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
         cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
-        cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
+        cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext); cp0u32!(cp0_framemask);
         tbl.insert("cp0".into(), toml::Value::Table(cp0));
 
         // FPU
@@ -11085,7 +11228,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
-            ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
+            ld64!(cp0_xcontext); ld32!(cp0_framemask); ld64!(cp0_epc); ld64!(cp0_errorepc);
             // Restart the virtual count from the restored value and re-arm
             // the compare timer — Instants from the previous run are
             // meaningless here — with a live ticket for the restored deadline.

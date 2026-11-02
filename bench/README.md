@@ -328,6 +328,11 @@ for each cell, because a cell's features live in its binary.
 | `r5000-jitv2` | `jitv2` | `r5000` |
 | `r4400-lightning` | `lightning` | `r4400` |
 | `r4400-jitv2-lightning` | `jitv2,lightning` | `r4400` |
+| `r10000-interp`, `r12000-interp`, `r14000-interp`, `r16000-interp`, `r16000-700-interp` | (default) | `r10000`, `r12000`, `r14000`, `r16000`, `r16000_700` |
+
+The R10000 family always runs the shadow caches, so these share the default
+build. No shipped machine takes the R16000 yet; the Indy and Indigo2
+(non-IP28) profiles build any part, and the cell relies on that.
 
 Each build is copied to `bench/build/iris-<features>` before the next one starts —
 the next `cargo build` overwrites `target/release/iris`, and a matrix that races
@@ -397,7 +402,7 @@ device on real hardware, so results come back over serial with CP0 Count as the
 time base; the header says so.
 
 **On which SGI machines?** The suite identifies any MIPS CPU by name from PRId
-— R4000, R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, RM5200,
+— R4000, R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, R16000, RM5200,
 RM7000 — and an implementation it has no name for prints as `MIPS-imp-0xNN`
 rather than refusing. That is safe to do because **nothing here is
 CPU-specific**: the kernels are ordinary compiled MIPS III, and `golden.h` is

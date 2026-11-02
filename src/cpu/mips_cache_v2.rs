@@ -565,6 +565,30 @@ pub trait CpuModel: MipsCache {
     /// and `Index_Load_Data` returns into it, neither of which is true of the
     /// R4000 hit operations that share those encodings.
     const R10K_CACHE_OPS: bool = false;
+    /// The part is in the R10000 family, which shares one programming model:
+    /// FrameMask, and 44 virtual and 40 physical address bits.
+    /// Established for the R10000. The R12000 is inferred to match: its manual's
+    /// list of changes from the R10000 has no TLB or CP0 change. The R14000 and
+    /// R16000 are a model choice that gives them the same TLB.
+    const R10K_FAMILY: bool = false;
+    /// A partial LWR keeps bits 63:32 of the destination. Observed on the
+    /// R10000; whether the later parts do the same is not established, so they
+    /// keep the sign extension for now.
+    const PARTIAL_LWR_KEEPS_UPPER: bool = false;
+    /// An uncached store the system refuses completes instead of raising a
+    /// Data Bus Error. The R10000 sends it as a write request, which gets no
+    /// response, and Bus Error comes only from an error response to a read or
+    /// upgrade request or from uncorrectable read data (R10000 UM pp. 104, 316).
+    /// The R12000 manual documents the same path and the later parts are taken
+    /// to match. An uncached SC succeeding is a model choice. Loads and fetches
+    /// still fault.
+    const POSTS_UNCACHED_STORES: bool = false;
+    /// Bits `Index_Store_Tag` keeps for the secondary cache: all of them, except
+    /// on the R10000 family, whose reserved tag bits read as zero (R10000 UM p. 270).
+    const SECONDARY_TAG_MASK: u64 = u64::MAX;
+    /// The low 25 bits of Config at reset, where the part's own word is known
+    /// and differs from the R10000 family's generic one. Zero keeps the generic.
+    const CONFIG0_RESET: u32 = 0;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -1385,6 +1409,14 @@ pub mod model {
     pub const R4400: u8 = 0;
     pub const R5000: u8 = 1;
     pub const R10000: u8 = 2;
+    pub const R12000: u8 = 3;
+    pub const R16000: u8 = 4;
+
+    /// The R10000 family: the R10000 and the parts that follow it, which share
+    /// one programming model.
+    pub const fn r10k_family(model: u8) -> bool {
+        matches!(model, R10000 | R12000 | R16000)
+    }
 }
 
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.
@@ -3595,7 +3627,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
+    const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
+    const PARTIAL_LWR_KEEPS_UPPER: bool = MODEL == model::R10000;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    const POSTS_UNCACHED_STORES: bool = Self::R10K_CACHE_OPS;
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.
     const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };

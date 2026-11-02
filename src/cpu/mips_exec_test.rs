@@ -13,12 +13,18 @@ mod tests {
     // Mock Memory Interface
     pub struct MockMemory {
         pub data: Mutex<HashMap<u64, u8>>,
+        /// `write8`/`write16` calls as (width, address, value).
+        pub narrow_writes: Mutex<Vec<(usize, u64, u64)>>,
+        /// `write_narrow_from` calls as (width, address, source register).
+        pub narrow_from_writes: Mutex<Vec<(usize, u64, u64)>>,
     }
 
     impl MockMemory {
         pub fn new() -> Self {
             Self {
                 data: Mutex::new(HashMap::new()),
+                narrow_writes: Mutex::new(Vec::new()),
+                narrow_from_writes: Mutex::new(Vec::new()),
             }
         }
 
@@ -67,6 +73,7 @@ mod tests {
         }
 
         fn write8(&self, addr: u64, val: u8) -> u32 {
+            self.narrow_writes.lock().unwrap().push((1, addr, val as u64));
             self.set_byte(addr as u64, val);
             BUS_OK
         }
@@ -82,6 +89,7 @@ mod tests {
 
         fn write16(&self, addr: u64, val: u16) -> u32 {
             let aligned_addr = (addr & !1) as u64;
+            self.narrow_writes.lock().unwrap().push((2, aligned_addr, val as u64));
             let bytes = val.to_be_bytes();
             for i in 0..2 {
                 self.set_byte(aligned_addr + i as u64, bytes[i]);
@@ -109,6 +117,12 @@ mod tests {
             let aligned_addr = (addr & !7) as u64;
             self.set_double(aligned_addr, val);
             BUS_OK
+        }
+
+        fn write_narrow_from(&self, addr: u64, size: usize, gpr: u64) -> u32 {
+            self.narrow_from_writes.lock().unwrap().push((size, addr, gpr));
+            // Same architectural bytes as the default.
+            if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
         }
 
         // This whole file predates jitv2 and no test here calls
@@ -573,6 +587,132 @@ mod tests {
         assert_eq!(exec.exec(instr), EXEC_COMPLETE);
         assert_eq!(mem.get_byte(0x100A), 0xBE);
         assert_eq!(mem.get_byte(0x100B), 0xEF);
+    }
+
+    /// Fuel PROM memory diagnostics need the whole source register on the ECC
+    /// view, so every CPU hands an uncached SB or SH to
+    /// `BusDevice::write_narrow_from` with it. The default of that call stores
+    /// the architectural byte or halfword, which is all an ordinary device
+    /// sees, and the addressed lanes hold it either way.
+    #[test]
+    fn uncached_sb_sh_carry_the_whole_source_register() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let mem = Arc::new(MockMemory::new());
+            let bus: Arc<dyn BusDevice> = mem.clone();
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                bus,
+                PassthroughTlb::default(),
+                &cfg,
+            );
+            disable_jitv2(&mut exec);
+
+            let base = 0x2000u64;
+            let source = 0xFEDC_BA98_7654_3210u64;
+            let original = 0xAABB_CCDD_EEFF_0011u64;
+            exec.core.write_gpr(2, base);
+            exec.core.write_gpr(1, source);
+
+            for (size, op, offsets) in [(1usize, OP_SB, vec![0u64, 1, 2, 3, 4, 5, 6, 7]),
+                                        (2usize, OP_SH, vec![0u64, 2, 4, 6])] {
+                for offset in offsets {
+                    mem.set_double(base, original);
+                    mem.narrow_writes.lock().unwrap().clear();
+                    mem.narrow_from_writes.lock().unwrap().clear();
+                    let instr = make_i(op, 2, 1, offset as u16);
+                    assert_eq!(exec.exec(instr), EXEC_COMPLETE);
+
+                    let addr = base + offset;
+                    assert_eq!(
+                        *mem.narrow_from_writes.lock().unwrap(),
+                        vec![(size, addr, source)],
+                        "SB/SH source register at byte offset {offset}",
+                    );
+
+                    let first = if size == 1 { source as u8 } else { (source as u16 >> 8) as u8 };
+                    let last = if size == 1 { first } else { source as u8 };
+                    assert_eq!(mem.get_byte(addr), first, "stored leading byte at offset {offset}");
+                    if size == 2 {
+                        assert_eq!(mem.get_byte(addr + 1), last, "stored trailing byte at offset {offset}");
+                    }
+                    let original_bytes = original.to_be_bytes();
+                    for lane in 0..8u64 {
+                        if lane < offset || lane >= offset + size as u64 {
+                            assert_eq!(mem.get_byte(base + lane), original_bytes[lane as usize],
+                                "inactive byte lane {lane} at subword offset {offset}");
+                        }
+                    }
+                }
+            }
+
+            // A zero source register still takes the same path and clears
+            // only the addressed lanes.
+            exec.core.write_gpr(0, u64::MAX);
+            mem.set_double(base, original);
+            mem.narrow_from_writes.lock().unwrap().clear();
+            exec.core.write_gpr(2, base + 7);
+            assert_eq!(exec.exec(make_i(OP_SB, 2, 0, 0)), EXEC_COMPLETE);
+            assert_eq!(mem.get_byte(base + 7), 0);
+            assert_eq!(mem.narrow_from_writes.lock().unwrap().len(), 1);
+
+            mem.set_double(base, original);
+            exec.core.write_gpr(2, base + 6);
+            assert_eq!(exec.exec(make_i(OP_SH, 2, 0, 0)), EXEC_COMPLETE);
+            assert_eq!(mem.get_byte(base + 6), 0);
+            assert_eq!(mem.get_byte(base + 7), 0);
+            assert_eq!(mem.narrow_from_writes.lock().unwrap().len(), 2);
+
+            mem.narrow_writes.lock().unwrap().clear();
+            mem.narrow_from_writes.lock().unwrap().clear();
+            assert_eq!(exec.debug_write(base + 1, source, 1, u64::MAX), EXEC_COMPLETE);
+            assert_eq!(*mem.narrow_writes.lock().unwrap(), vec![(1, base + 1, source as u8 as u64)]);
+            assert!(mem.narrow_from_writes.lock().unwrap().is_empty(), "debug writes keep the ordinary-width path");
+        }
+
+        check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>();
+    }
+
+    /// JIT store callouts carry the same source register as the interpreter.
+    #[test]
+    #[cfg(feature = "jitv2")]
+    fn jit_subword_hooks_carry_the_source_register() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let mem = Arc::new(MockMemory::new());
+            let bus: Arc<dyn BusDevice> = mem.clone();
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                bus,
+                PassthroughTlb::default(),
+                &cfg,
+            );
+            disable_jitv2(&mut exec);
+            exec.install_jit_hooks();
+
+            let base = 0x2000u64;
+            let source = 0xFEDC_BA98_7654_3210u64;
+            let write8 = exec.core.write8_fn;
+            let write16 = exec.core.write16_fn;
+            let core = &mut exec.core as *mut crate::cpu::mips_core::MipsCore;
+            // JIT callouts receive the core pointer biased by the shared
+            // ABI constant; core_from_arg removes this before recovery.
+            let ctx = core.cast::<u8>()
+                .wrapping_add(crate::cpu::jitv2::codegen::CALLOUT_CORE_BIAS as usize)
+                .cast();
+            unsafe {
+                write8(ctx, base, source);
+                write16(ctx, base + 2, source);
+            }
+            assert_eq!(
+                *mem.narrow_from_writes.lock().unwrap(),
+                vec![(1, base, source), (2, base + 2, source)],
+            );
+        }
+
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
     }
 
     #[test]
@@ -3737,6 +3877,148 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(0xF_FFFF_FFFF);
     }
 
+    /// FrameMask bits 15:0 clear EntryLo bits 33:18 as a TLB write takes them,
+    /// on the R10000 only (R10000 UM p. 234). Physical bit 24 is EntryLo bit 18,
+    /// mask bit 0; the R4400 has no such register.
+    #[test]
+    fn framemask_clears_entrylo_bits_on_a_tlb_write() {
+        fn phys<C: CpuModel + From<Arc<dyn BusDevice>>>(framemask: u64) -> (u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_masked::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, framemask);
+            (exec.core.read_cp0(21), exec.debug_translate(VA).phys)
+        }
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        on_big_stack(|| {
+            // Mask bit 0 is written with bits above 15, which are ignored.
+            let all = 0xFFFF_0001;
+            assert_eq!(phys::<R10000ShadowCache>(0), (0, 0x0300_5000));
+            assert_eq!(phys::<R10000ShadowCache>(all), (1, 0x0200_5000));
+            assert_eq!(phys::<R4400Cache>(all), (0, 0x0300_5000));
+        });
+    }
+
+    /// TLBWR masks as TLBWI does, and TLBR returns what the TLB holds: the
+    /// masked EntryLo, not the value that was written.
+    #[test]
+    fn framemask_applies_to_tlbwr_and_tlbr_reads_back_the_masked_entry() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        // Write with `funct`, find the entry with TLBP, clear EntryLo0, TLBR,
+        // and return (physical address of the page, EntryLo0 after TLBR).
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(funct: u32) -> (u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_with::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, 0xFFFF_0001, funct);
+            let phys = exec.debug_translate(VA).phys;
+            for (rd, value) in [(10, VA), (2, 0)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (phys, exec.core.read_cp0(2))
+        }
+        on_big_stack(|| {
+            // FrameMask bit 0 clears EntryLo bit 18, physical bit 24.
+            let unmasked = ((0x0300_5000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            let masked = unmasked & !(1 << 18);
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                assert_eq!(entry::<R10000ShadowCache>(funct), (0x0200_5000, masked), "R10000 {funct:#x}");
+                assert_eq!(entry::<R4400Cache>(funct), (0x0300_5000, unmasked), "R4400 {funct:#x}");
+            }
+        });
+    }
+
+    /// On the R10000 family EntryLo holds a 28-bit PFN (33:6) and the uncached
+    /// attribute in 63:62 (R10000 UM p. 214); the R4400 and R5000 keep a
+    /// 24-bit PFN and nothing above it. The TLB carries the whole PFN.
+    #[test]
+    fn entrylo_covers_the_pfn_and_attribute_bits_of_the_r10000_family() {
+        fn readback<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            let bus: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, u64::MAX);
+            // DMTC0 $1, EntryLo0 and EntryLo1; both read back the same field.
+            for reg in [2u32, 3] {
+                assert_eq!(exec.exec((0x10 << 26) | (5 << 21) | (1 << 16) | (reg << 11)), EXEC_COMPLETE);
+            }
+            let (lo0, lo1) = (exec.core.read_cp0(2), exec.core.read_cp0(3));
+            assert_eq!(lo0, lo1);
+            lo0
+        }
+        assert_eq!(readback::<R4400Cache>(), 0x3FFF_FFFF);
+        // Bits 61:34 are not PFN: they read back as zero, so only 33:32 reach physical 39:38.
+        assert_eq!(readback::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(), 0xC000_0003_FFFF_FFFF);
+
+        // The TLB carries the whole PFN: bits 33:32 are physical 39:38, and FrameMask
+        // is what keeps software flags there out of the address.
+        on_big_stack(|| {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000);
+            assert_eq!(exec.debug_translate(VA).phys, 0xC0_2054_C000);
+            // FrameMask 0xC000 is EntryLo 33:32: the page lands where its PFN says.
+            let mut exec = map_page_masked::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000, 0xC000);
+            assert_eq!(exec.debug_translate(VA).phys, 0x2054_C000);
+        });
+    }
+
+    /// A mapped uncached page's attribute (EntryLo 63:62, carried to physical
+    /// bits 58:57) reaches the bus on a board that decodes them, and is folded
+    /// away on the Octane (40 bits), Indigo2 and O2 (32), which is what keeps
+    /// those machines unchanged.
+    #[test]
+    fn mapped_uncached_attribute_is_folded_by_the_boards_physical_mask() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_tlb::MipsTlb;
+                const VA: u64 = 0x4000_0000;
+
+                fn translate<C: CpuModel + From<Arc<dyn BusDevice>>>(
+                    phys_mask: u64, alias: Option<(u64, u64, u64)>, pfn: u64,
+                ) -> u64 {
+                    let bus: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+                    let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+                    let mut exec = Box::new(MipsExecutor::<MipsTlb, C>::new(
+                        bus, MipsTlb::default(), &cfg));
+                    disable_jitv2(&mut exec);
+                    exec.install_status_cb();
+                    let dmtc0 = |exec: &mut Box<MipsExecutor<MipsTlb, C>>, rd: u32, value: u64| {
+                        exec.core.write_gpr(1, value);
+                        let op = (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11);
+                        assert_eq!(exec.exec(op), EXEC_COMPLETE);
+                    };
+                    let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+                    dmtc0(&mut exec, 12, status as u64);
+                    dmtc0(&mut exec, 10, VA);
+                    dmtc0(&mut exec, 0, 0);
+                    dmtc0(&mut exec, 5, 0);
+                    // C=2 (uncached), valid, dirty, attribute 1 in bits 63:62.
+                    dmtc0(&mut exec, 2, (1 << 62) | (pfn << 6) | (2 << 3) | (1 << 2) | (1 << 1));
+                    dmtc0(&mut exec, 3, 0);
+                    assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWI), EXEC_COMPLETE);
+                    exec.phys_mask = phys_mask;
+                    exec.phys_alias = alias;
+                    exec.debug_translate(VA).phys
+                }
+
+                type R10K = crate::cpu::mips_cache_shadow::R10000ShadowCache;
+                type R14K = crate::cpu::mips_cache_shadow::R12000ShadowCache;
+                const PA: u64 = 0x0d10_0000;
+                assert_eq!(translate::<R14K>(u64::MAX, None, PA >> 12), (1 << 57) | PA,
+                    "no mask: the attribute reaches the bus");
+                for (name, mask) in [("Octane", (1u64 << 40) - 1), ("Indigo2/O2", u32::MAX as u64)] {
+                    assert_eq!(translate::<R10K>(mask, None, PA >> 12), PA, "{name} folds it away");
+                }
+                assert_eq!(translate::<crate::cpu::mips_cache_v2::R4400Cache>(u64::MAX, None, PA >> 12), PA,
+                    "a model without the attribute never stores it");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
     /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
@@ -6410,5 +6692,266 @@ mod tests {
             outcome.push((st, exec.core.cp0_badvaddr, exec.core.cp0_cause));
         }
         assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
+    }
+
+    /// Run `f` on a thread with room for a `MipsTlb`, which is large.
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// A 64-bit kernel executor with one TLB entry, written through CP0 and
+    /// TLBWI, that maps the page at `va` to `phys` (cached, valid, dirty).
+    fn map_page<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        map_page_masked::<C>(bus, va, phys, 0)
+    }
+
+    /// `map_page` with CP0 FrameMask (register 21) written before the TLB write.
+    fn map_page_masked<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64, framemask: u64,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        map_page_with::<C>(bus, va, phys, framemask, FUNCT_TLBWI)
+    }
+
+    /// `map_page_masked`, writing the entry with `funct` (TLBWI or TLBWR).
+    fn map_page_with<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64, framemask: u64, funct: u32,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+        let mut exec = Box::new(MipsExecutor::new(bus, crate::cpu::mips_tlb::MipsTlb::default(), &cfg));
+        disable_jitv2(&mut exec);
+        // MTC0 must refresh the boxed executor's translation/accessor state.
+        exec.install_status_cb();
+        let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+        let entrylo = ((phys >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        for (rd, value) in [(12, status as u64), (10, va), (0, 0), (5, 0), (21, framemask), (2, entrylo), (3, 0)] {
+            exec.core.write_gpr(1, value);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+        }
+        assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | funct), EXEC_COMPLETE);
+        exec
+    }
+
+    /// EntryHi and the TLB keep every implemented VPN2 bit: 44 virtual-address
+    /// bits on the R10000, 40 on the R4400. An IRIX n64 stack can sit
+    /// above the 40-bit limit.
+    #[test]
+    fn cp0_entryhi_and_tlb_match_full_xuseg_va() {
+        on_big_stack(|| {
+            const VA: u64 = 0x0000_0123_4000_0000;
+            fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(full_va: bool) {
+                let mem = Arc::new(MockMemory::new());
+                mem.set_word(0x5_0000, 0xdead_beef);
+                let mut exec = map_page::<C>(mem, VA, 0x5_0000);
+                let result = exec.read_data::<4>(VA);
+                if full_va {
+                    assert_eq!(exec.core.cp0_entryhi, VA);
+                    assert_eq!(result, Ok(0xdead_beef));
+                } else {
+                    assert_eq!(exec.core.cp0_entryhi, VA & 0xC000_00FF_FFFF_E0FF);
+                    assert_eq!((result.unwrap_err() >> 2) & 0x1f, EXC_ADEL);
+                }
+            }
+            check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        });
+    }
+
+    /// A bus where nothing answers: every read and write is refused (the
+    /// trait's defaults).
+    struct RefusingBus;
+    impl BusDevice for RefusingBus {}
+
+    /// R10000: a store the system refuses leaves the processor as a write
+    /// request, which has no response, so it completes (R10000 UM pp. 104,
+    /// 316). An uncached SC succeeding is a model choice. A load keeps its
+    /// Data Bus Error, and so does every access on the R5000. SWL goes through
+    /// the masked-store path, a separate site.
+    #[test]
+    fn refused_uncached_store_completes_only_on_the_r10000() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(op: u32) -> (u32, u64) {
+            let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.cache.set_llbit(true);
+            exec.core.write_gpr(4, 0xFFFF_FFFF_A100_0000); // kseg1: uncached
+            exec.core.write_gpr(6, 0x1234_5678);
+            let st = exec.exec(make_i(op, 4, 6, 4));
+            if st == EXEC_COMPLETE {
+                assert_eq!(exec.core.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "no exception taken");
+                assert_eq!(exec.exec(make_i(OP_ADDIU, 0, 5, 7)), EXEC_COMPLETE);
+                assert_eq!(exec.core.read_gpr(5), 7, "the next instruction runs");
+            }
+            (st, exec.core.read_gpr(6))
+        }
+        use crate::traits::BUS_ERR;
+        type R10K = crate::cpu::mips_cache_v2::R10000Cache;
+        type R10KShadow = crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        type R5K = crate::cpu::mips_cache_shadow::R5000ShadowCache;
+        for (op, name) in [(OP_SW, "SW"), (OP_SWL, "SWL")] {
+            assert_eq!(run::<R10K>(op).0, EXEC_COMPLETE, "R10000 {name}");
+            assert_eq!(run::<R10KShadow>(op).0, EXEC_COMPLETE, "R10000 shadow {name}");
+            assert_eq!(run::<R5K>(op).0, BUS_ERR, "R5000 {name}");
+        }
+        assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
+        assert_eq!(run::<R5K>(OP_SC).0, BUS_ERR, "R5000 SC");
+        assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
+    }
+
+    #[test]
+    fn refused_store_reports_are_sparse() {
+        let shown: Vec<u64> = (1..=40).filter(|&n| crate::cpu::mips_exec::report_refused_store(n)).collect();
+        assert_eq!(shown, [1, 2, 3, 4, 8, 16, 32]);
+    }
+
+    /// The O2's no-ECC alias of RAM at 0x8000_0000 is matched on the address the
+    /// board decodes (32 bits), so a PTE software bit above the PFN cannot make
+    /// a mapped page miss the alias window.
+    #[test]
+    fn phys_alias_is_matched_after_the_physical_mask() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_tlb::MipsTlb;
+                let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
+                exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+                exec.phys_mask = u32::MAX as u64;
+                exec.phys_alias = Some((0x8000_0000, 0x1000_0000, 0));
+                // PA 0x1_8000_0000: bit 32 is above what the board decodes.
+                exec.core.cp0_index = 0;
+                exec.core.cp0_pagemask = 0;
+                exec.core.cp0_entryhi = 0x4000_0000;
+                exec.core.cp0_entrylo0 = (0x18_0000 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                exec.core.cp0_entrylo1 = 0;
+                assert_eq!(exec.exec((OP_COP0 << 26) | (0x10 << 21) | 0x02), EXEC_COMPLETE);
+                assert_eq!(exec.debug_translate(0x4000_0000).phys, 0);
+            })
+            .unwrap().join().unwrap();
+    }
+
+    /// A partial LWR keeps bits 63:32 of the destination on the R10000 family
+    /// and sign-extends on the R4400 and R5000; a complete word sign-extends on all.
+    #[test]
+    fn partial_lwr_keeps_the_upper_word_on_the_r10000_family() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
+            let mem = Arc::new(MockMemory::new());
+            mem.set_word(0x2000, 0x89ab_cdef);
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, 0x2000);
+            let old = 0x8123_4567_a1b2_c3d4u64;
+            for (offset, word) in [0xa1b2_c389u32, 0xa1b2_89ab, 0xa189_abcd, 0x89ab_cdef].into_iter().enumerate() {
+                exec.core.write_gpr(2, old);
+                assert_eq!(exec.exec(make_i(OP_LWR, 1, 2, offset as u16)), EXEC_COMPLETE);
+                let expected = if keeps_upper && offset != 3 {
+                    (old & 0xffff_ffff_0000_0000) | word as u64
+                } else {
+                    word as i32 as i64 as u64
+                };
+                assert_eq!(exec.core.read_gpr(2), expected, "{} LWR offset {offset}", C::NAME);
+            }
+        }
+        check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true);
+    }
+
+    /// FrameMask and the wide EntryLo belong to the whole R10000 family, not to
+    /// the partial LWR alone. This checks the executor's masks against the
+    /// family constant the gate reads; the R12000 and R16000 are covered below.
+    #[test]
+    fn framemask_and_entrylo_widths_follow_the_family_constant() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            let (framemask, entrylo) = if C::R10K_FAMILY { (0xFFFF, 0xC000_0003_FFFF_FFFF) } else { (0, 0x3FFF_FFFF) };
+            assert_eq!(exec.core.framemask_mask, framemask, "{} FrameMask", C::NAME);
+            assert_eq!(exec.core.entrylo_mask, entrylo, "{} EntryLo", C::NAME);
+        }
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
+        assert!(R10000ShadowCache::R10K_FAMILY);
+        assert!(!R4400ShadowCache::R10K_FAMILY && !R5000ShadowCache::R10K_FAMILY);
+        check::<R4400ShadowCache>();
+        check::<R5000ShadowCache>();
+        check::<R10000ShadowCache>();
+    }
+
+    /// Config reports each part's secondary cache: SS (bits 18:16) is
+    /// log2(secondary size / 512 KB) and SB (bit 13) is set for 128-byte lines
+    /// (NEC U10278EJ4V0UM p.230). The primary caches read 32 KB.
+    #[test]
+    fn config_reports_the_secondary_cache_of_each_family_part() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn config<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(
+                Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.read_cp0(16)
+        }
+        // The executor is large; build it on a thread with room.
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+            for (name, c, ss, sb) in [
+                ("R10000", config::<R10000ShadowCache>(), 1, 1),
+                ("R12000", config::<R12000ShadowCache>(), 2, 1),
+                ("R12000 O2", config::<R12000O2ShadowCache>(), 2, 0),
+            ] {
+                assert_eq!(c >> 26, 0b011_011, "{name}: IC and DC read 32 KB");
+                assert_eq!(c & 0x03FF_FFFF, (ss << 16) | (sb << 13) | 0x8000 | 2, "{name}: Config {c:#x}");
+            }
+            // The R16000 presents its part's whole reset word over the low 25
+            // bits: SS 3 and SB 1 as for the generic family, plus the clock
+            // fields. The 700 MHz part is the same type with its word set at
+            // build time.
+            let c = config::<R16000ShadowCache>();
+            assert_eq!(c >> 26, 0b011_011, "R16000: IC and DC read 32 KB");
+            assert_eq!(c & CONFIG0_RESET_MASK as u64, 0x009b_af85, "R16000: Config {c:#x}");
+            assert_eq!((c >> 16) & 7, 3, "R16000: 4 MB secondary cache");
+            assert_eq!((c >> 13) & 1, 1, "R16000: 128-byte lines");
+            assert_eq!(R16000_MHZ700_CONFIG0 ^ 0x009b_af85, 1 << 9, "the 700 MHz word differs in EC only");
+        }).unwrap().join().unwrap();
+    }
+
+    /// The R12000 and R16000 keep the 16-bit FrameMask, the 64-bit-family
+    /// EntryLo mask and the partial-LWR upper word of the R10000. A TLB write on
+    /// an R12000 with FrameMask set clears EntryLo bit 18, as on the R10000.
+    #[test]
+    fn framemask_and_entrylo_widths_hold_on_the_r12000_and_r16000() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn masks<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u32, u64) {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            (exec.core.framemask_mask, exec.core.entrylo_mask)
+        }
+        // Write the entry with FrameMask set, find it with TLBP, clear EntryLo0
+        // and TLBR it: (FrameMask, EntryLo0 as the TLB holds it, physical page).
+        fn written<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u64, u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_masked::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, 0xFFFF_0001);
+            let phys = exec.debug_translate(VA).phys;
+            for (rd, value) in [(10, VA), (2, 0)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (exec.core.read_cp0(21), exec.core.read_cp0(2), phys)
+        }
+        on_big_stack(|| {
+            const ENTRYLO: u64 = 0xC000_0003_FFFF_FFFF;
+            assert!(R12000ShadowCache::R10K_FAMILY && R12000O2ShadowCache::R10K_FAMILY && R16000ShadowCache::R10K_FAMILY);
+            assert!(R12000ShadowCache::PARTIAL_LWR_KEEPS_UPPER && R12000O2ShadowCache::PARTIAL_LWR_KEEPS_UPPER);
+            assert!(R16000ShadowCache::PARTIAL_LWR_KEEPS_UPPER);
+            assert_eq!(masks::<R12000ShadowCache>(), (0xFFFF, ENTRYLO), "R12000");
+            assert_eq!(masks::<R12000O2ShadowCache>(), (0xFFFF, ENTRYLO), "R12000 O2");
+            assert_eq!(masks::<R16000ShadowCache>(), (0xFFFF, ENTRYLO), "R16000");
+            // Physical bit 24 is EntryLo bit 18, FrameMask bit 0.
+            let masked = (((0x0300_5000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1)) & !(1 << 18);
+            assert_eq!(written::<R12000ShadowCache>(), (1, masked, 0x0200_5000), "R12000");
+        });
     }
 }

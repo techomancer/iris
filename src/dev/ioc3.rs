@@ -1,10 +1,11 @@
-//! SGI IOC3 base I/O controller, as the Octane (IP30) fits it.
+//! SGI IOC3 base I/O controller, with Octane and Fuel board populations.
 //!
 //! One PCI function with one 1 MiB memory BAR. Behind it: two 16550 serial
 //! ports with a ring-DMA engine each, a PS/2 keyboard and mouse controller,
 //! a parallel port, a MicroLAN (one-wire) master, the GPIO pins, a DS1685
-//! clock on the byte bus, the Ethernet buffer RAM and, in the register range
-//! at 0xf0, the Ethernet MAC (which lives in `ioc3_eth.rs` behind
+//! clock on the Octane byte bus or Fuel's flat system Timekeeper, the
+//! Ethernet buffer RAM and, in the register range at 0xf0,
+//! the Ethernet MAC (which lives in `ioc3_eth.rs` behind
 //! [`Ioc3EthPort`]).
 //!
 //! Behaviour follows the public Linux and OpenBSD drivers and measured guest
@@ -60,7 +61,7 @@ use crate::dev::w1::sgi::{self, BoardRecord};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::irq::{InterruptController, IrqLine};
-use crate::pci::{Bar, PciBusDevice, PciConfig, PciDma, PciDmaStatus, PCI_INTA};
+use crate::pci::{Bar, PciBusDevice, PciConfig, PciConfigPolicy, PciDma, PciDmaStatus, PCI_INTA};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
 
@@ -69,6 +70,8 @@ pub const DEVICE_ID: u16 = 0x0003;
 pub const REVISION: u8 = 0x01;
 /// PCI subsystem id of the Octane's system board.
 pub const SUBSYS_IP30_SYSBOARD: u16 = 0xc304;
+/// Fuel system-board population.
+pub const SUBSYS_IP34_SYSBOARD: u16 = 0xc30a;
 pub const BAR_SIZE: u32 = 1 << 20;
 /// The configuration dwords the chip decodes; the rest of the 16 repeat them.
 const CONFIG_DECODED_DWORDS: usize = 8;
@@ -110,6 +113,7 @@ pub mod reg {
     pub const PAR_ECP_BASE: u32 = 0x20150;
     pub const SSRAM: u32 = 0x40000;
     pub const SSRAM_SIZE: u32 = 0x40000;
+    pub const BYTEBUS_DEV0: u32 = 0x80000;
     pub const BYTEBUS_DEV1: u32 = 0xa0000;
     pub const BYTEBUS_DEV2: u32 = 0xc0000;
     pub const BYTEBUS_SIZE: u32 = 0x20000;
@@ -731,6 +735,10 @@ fn int_out_valid(v: u32) -> bool {
 #[derive(Clone, Debug)]
 pub struct Ioc3Config {
     pub subsystem_id: u16,
+    /// Function-specific PCI header write behavior.
+    pub pci_policy: PciConfigPolicy<'static>,
+    /// Reset the PCI header along with the chip on power-on.
+    pub reset_pci_on_power_on: bool,
     /// The board's station address, which the one-wire part holds.
     pub mac: [u8; 6],
     pub serial: [bool; 2],
@@ -760,6 +768,30 @@ impl BoardRecordText {
 }
 
 impl Ioc3Config {
+    /// Fuel's IOC3 fits the keyboard and mouse controller but no indexed Dallas clock.
+    pub fn fuel(mac: [u8; 6]) -> Self {
+        Self {
+            subsystem_id: SUBSYS_IP34_SYSBOARD,
+            pci_policy: PciConfigPolicy {
+                status: 0x0280,
+                status_w1c_mask: 0,
+                command_mask: 0xffff,
+                latency_mask: 0xff,
+                cache_line_mask: 0,
+                ..Default::default()
+            },
+            reset_pci_on_power_on: true,
+            mac,
+            serial: [true, true],
+            parallel: true,
+            keyboard_mouse: true,
+            rtc: false,
+            gpio_input_mask: 0,
+            gpio_input_values: 0,
+            records: Vec::new(),
+        }
+    }
+
     /// The Octane's IOC3 (`octane2` selects the Octane2's board records).
     /// The fictitious barcodes and ROM serials are the
     /// marked-synthetic ones (barcode `EMU...`).
@@ -771,6 +803,8 @@ impl Ioc3Config {
         };
         Self {
             subsystem_id: SUBSYS_IP30_SYSBOARD,
+            pci_policy: PciConfigPolicy::default(),
+            reset_pci_on_power_on: false,
             mac,
             serial: [true, true],
             parallel: true,
@@ -2379,6 +2413,7 @@ impl Shared {
 /// The IOC3 PCI function.
 pub struct Ioc3 {
     sh: Arc<Shared>,
+    timekeeper: OnceLock<Arc<crate::dev::timekeeper::Timekeeper>>,
     /// The serial receive threads and the NVRAM writer, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -2386,22 +2421,26 @@ pub struct Ioc3 {
 impl Ioc3 {
     pub fn new(cfg: Ioc3Config) -> Ioc3 {
         let subsystem = cfg.subsystem_id;
+        let pci_policy = cfg.pci_policy;
         let sh = Arc::new_cyclic(|weak: &Weak<Shared>| {
             let line = IrqLine::new(Arc::new(KbcSink(weak.clone())), 0);
             let ps2 = Arc::new(Ps2Controller::new(Some(line)));
             // Host key and mouse events are accepted from the start (this
             // only sets a flag); `stop` and `start` follow the chip's.
             Device::start(&*ps2);
-            let pci = PciConfig::new(
-                VENDOR_ID,
-                DEVICE_ID,
-                0xff_0000,
-                REVISION,
-                [Bar::Mem(BAR_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused],
-                PCI_INTA,
+            let bars = [
+                Bar::Mem(BAR_SIZE),
+                Bar::Unused,
+                Bar::Unused,
+                Bar::Unused,
+                Bar::Unused,
+                Bar::Unused,
+            ];
+            let pci = PciConfig::new_with_policy(
+                VENDOR_ID, DEVICE_ID, 0xff_0000, REVISION, bars, PCI_INTA, pci_policy,
             );
             // The subsystem identity selects what a guest instantiates.
-            pci.write(11, ((subsystem as u32) << 16) | VENDOR_ID as u32);
+            pci.set_subsystem_identity(((subsystem as u32) << 16) | VENDOR_ID as u32);
             Shared {
                 pci,
                 st: Mutex::new(St::new(cfg)),
@@ -2426,7 +2465,7 @@ impl Ioc3 {
                 nvram_ready: Condvar::new(),
             }
         });
-        Ioc3 { sh, threads: Mutex::new(Vec::new()) }
+        Ioc3 { sh, timekeeper: OnceLock::new(), threads: Mutex::new(Vec::new()) }
     }
 
     /// The Octane's (or Octane2's) onboard IOC3: both serial ports, PS/2,
@@ -2435,7 +2474,13 @@ impl Ioc3 {
         Ioc3::new(Ioc3Config::octane(mac, octane2))
     }
 
-    /// The timer manager the deadlines are armed on. Call before `start`.
+    /// Attach Fuel's independently owned flat select-0 system clock.
+    pub fn attach_timekeeper(&self, clock: Arc<crate::dev::timekeeper::Timekeeper>) {
+        assert!(!self.sh.st.lock().cfg.rtc, "indexed Dallas and flat Timekeeper populations conflict");
+        assert!(self.timekeeper.set(clock).is_ok(), "IOC3 timekeeper attached more than once");
+    }
+
+    /// The timer manager for device deadlines. Set it before start.
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
         let _ = self.sh.timers.set(tm);
     }
@@ -2542,6 +2587,9 @@ impl Ioc3 {
     /// Ethernet block is a separate device here and keeps its state: the
     /// machine resets it on its own.
     pub fn reset(&self) {
+        if self.sh.st.lock().cfg.reset_pci_on_power_on {
+            self.sh.pci.reset();
+        }
         self.sh.with_st(false, |st, _| st.reset());
     }
 
@@ -2700,6 +2748,16 @@ impl PciBusDevice for Ioc3 {
         if width == 4 && a <= reg::HEADER_LAST && a & 3 == 0 {
             return self.header_dword((a / 4) as usize);
         }
+        if (reg::BYTEBUS_DEV0..reg::BYTEBUS_DEV0 + crate::dev::timekeeper::SIZE as u32).contains(&a) {
+            if let Some(clock) = self.timekeeper.get() {
+                if width != 1 {
+                    crate::dlog!(crate::devlog::LogModule::Ioc, "IOC3 Timekeeper {width}-byte read refused");
+                    return 0;
+                }
+                return u32::from(clock.read8(u64::from(a - reg::BYTEBUS_DEV0)).data);
+            }
+        }
+
         if (reg::ENET_FIRST..=reg::ENET_LAST).contains(&a) {
             // Only 32-bit accesses reach the Ethernet block.
             if width != 4 {
@@ -2716,6 +2774,17 @@ impl PciBusDevice for Ioc3 {
             return;
         }
         let a = off ^ (4 - width.min(4) as u32);
+        if (reg::BYTEBUS_DEV0..reg::BYTEBUS_DEV0 + crate::dev::timekeeper::SIZE as u32).contains(&a) {
+            if let Some(clock) = self.timekeeper.get() {
+                if width != 1 {
+                    crate::dlog!(crate::devlog::LogModule::Ioc, "IOC3 Timekeeper {width}-byte write refused");
+                    return;
+                }
+                clock.write8(u64::from(a - reg::BYTEBUS_DEV0), val as u8);
+                return;
+            }
+        }
+
         if (reg::ENET_FIRST..=reg::ENET_LAST).contains(&a) {
             if width == 4 && a & 3 == 0 {
                 if let Some(e) = self.sh.eth() {
