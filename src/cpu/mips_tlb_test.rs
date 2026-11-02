@@ -4,6 +4,195 @@ mod tests {
     use crate::cpu::mips_tlb::*;
     use crate::cpu::mips_exec::CacheAttr;
 
+    /// Region 3 base for the overlap tests below; the frame is arbitrary.
+    const BASE: u64 = 0xc000_0000_0000_0000;
+
+    fn entry(mask: u64, hi: u64, lo: [u64; 2]) -> TlbEntry {
+        let mut e = TlbEntry::new();
+        e.page_mask = mask;
+        e.entry_hi = hi;
+        e.entry_lo = lo;
+        e
+    }
+
+    /// CPU 1 of a two-processor Tezro as its TLB looks after the firmware's
+    /// flush (every entry written invalid: region 3, page number 0, ASID 0,
+    /// not global, 2 MiB pages) and the kernel's write of the valid global
+    /// 16 MiB entry at index 1 over the same page number. The firmware
+    /// entries that overlap it are true duplicates: every compared bit agrees.
+    fn flushed_then_kernel_mapped(invalidate: bool) -> MipsTlb {
+        let mut tlb = MipsTlb::new(64);
+        tlb.set_conflict_invalidation(invalidate);
+        for index in (0..64).rev() {
+            tlb.write(index, entry(0x1fe000, BASE, [0; 2]));
+        }
+        // PFN 0x40, cacheable, dirty, valid, global, both halves.
+        tlb.write(1, entry(0x1ffe000, BASE | 0x1000, [(0x40 << 6) | (5 << 3) | 0x7; 2]));
+        tlb
+    }
+
+    /// An entry elsewhere, as the kernel writes at index 0 next (wired).
+    fn write_wired_elsewhere(tlb: &mut MipsTlb) {
+        tlb.write(0, entry(0x6000, 0xc000_0fff_ffff_9000, [1, 0x2e42f]));
+    }
+
+    /// Writing the valid entry takes the overlapped firmware entries out of
+    /// matching, as the R10000 family does, so the fetch the kernel makes
+    /// next is answered by the valid entry however the lookup map was
+    /// rebuilt in between. Without the rule the highest-numbered firmware
+    /// entry answers, as invalid.
+    #[test]
+    fn a_write_invalidates_the_entries_it_overlaps() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let va = BASE + 0x1234;
+            let mut off = flushed_then_kernel_mapped(false);
+            write_wired_elsewhere(&mut off);
+            assert!(matches!(off.translate::<1>(va, 0, AccessType::Fetch), TlbResult::Invalid { .. }),
+                "without the rule, the duplicate answers");
+            assert!(!off.take_write_conflict());
+            assert_eq!(off.read(2).entry_hi, BASE, "without the rule, the duplicate stays");
+
+            let mut tlb = flushed_then_kernel_mapped(true);
+            assert!(tlb.take_write_conflict(), "the writes overlapped entries");
+            write_wired_elsewhere(&mut tlb);
+            match tlb.translate::<1>(va, 0, AccessType::Fetch) {
+                TlbResult::Hit { phys_addr, .. } => assert_eq!(phys_addr, 0x1234),
+                other => panic!("expected the valid entry to answer, got {other:?}"),
+            }
+            assert_eq!(tlb.read(2).entry_hi, 0);
+            assert_eq!(tlb.read(1).page_mask, 0x1ffe000);
+            // An entry in another region overlaps nothing and removes nothing.
+            tlb.write(5, entry(0x1fe000, 0x8000_0000_0000_0000, [0; 2]));
+            assert!(!tlb.take_write_conflict());
+            assert!(matches!(tlb.translate::<1>(va, 0, AccessType::Fetch), TlbResult::Hit { .. }));
+        }).unwrap().join().unwrap();
+    }
+
+    /// The rule reaches the wired entries (the low indexes the kernel
+    /// reserves): a new entry over a wired one removes the wired one.
+    #[test]
+    fn a_write_invalidates_wired_entries_too() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let va = BASE + 0x2345;
+            let lo = |pfn: u64| [(pfn << 6) | (5 << 3) | 0x7; 2];
+            let run = |on: bool| {
+                let mut tlb = MipsTlb::new(64);
+                tlb.set_conflict_invalidation(on);
+                tlb.write(0, entry(0, BASE | 0x2000, lo(0x10)));
+                tlb.write(40, entry(0, BASE | 0x2000, lo(0x20)));
+                tlb
+            };
+            let on = run(true);
+            assert!(on.read(0).entry_hi == 0 && on.read(0).entry_lo == [0; 2], "wired entry 0 is gone");
+            assert_eq!(on.read(40).entry_hi, BASE | 0x2000);
+            let mut on = on;
+            assert!(on.take_write_conflict());
+            match on.translate::<1>(va, 0, AccessType::Read) {
+                TlbResult::Hit { phys_addr, .. } => assert_eq!(phys_addr, (0x20 << 12) | 0x345),
+                other => panic!("expected the new entry to answer, got {other:?}"),
+            }
+            let off = run(false);
+            assert_eq!(off.read(0).entry_hi, BASE | 0x2000, "without the rule the wired entry stays");
+        }).unwrap().join().unwrap();
+    }
+
+    /// TLBR of an invalidated entry still loads its PageMask. The kernel
+    /// reads a wired sentinel back and reuses PageMask for its next write; a
+    /// zeroed mask makes that write 4 KiB.
+    #[test]
+    fn an_invalidated_entry_keeps_its_page_mask() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let mut tlb = MipsTlb::new(64);
+            tlb.set_conflict_invalidation(true);
+            tlb.write(3, entry(0x1fe000, BASE, [0x7; 2]));
+            tlb.write(9, entry(0x1ffe000, BASE, [0x7; 2]));
+            let gone = tlb.read(3);
+            assert_eq!(gone.page_mask, 0x1fe000);
+            assert_eq!(gone.entry_hi, 0);
+            assert_eq!(gone.entry_lo, [0; 2]);
+            assert_eq!(tlb.read(9).page_mask, 0x1ffe000);
+        }).unwrap().join().unwrap();
+    }
+
+    /// Entries that cannot match together are left alone: a different ASID
+    /// when neither is global, and a page number that differs above the
+    /// wider mask.
+    #[test]
+    fn entries_that_cannot_match_together_are_kept() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let mut tlb = MipsTlb::new(64);
+            tlb.set_conflict_invalidation(true);
+            tlb.write(3, entry(0, BASE | 0x4000 | 1, [0x6; 2])); // ASID 1, not global
+            tlb.write(4, entry(0, BASE | 0x4000 | 2, [0x6; 2])); // ASID 2
+            tlb.write(5, entry(0, BASE | 0x8000 | 1, [0x6; 2])); // other page
+            assert!(!tlb.take_write_conflict());
+            for i in [3, 4, 5] {
+                assert_ne!(tlb.read(i).entry_hi, 0, "entry {i} stays");
+            }
+            // A global entry over that page does match both ASIDs.
+            tlb.write(6, entry(0, BASE | 0x4000 | 0x1000, [0x7; 2])); // global
+            assert!(tlb.take_write_conflict());
+            assert_eq!(tlb.read(3).entry_hi, 0);
+            assert_eq!(tlb.read(4).entry_hi, 0);
+            assert_ne!(tlb.read(5).entry_hi, 0);
+        }).unwrap().join().unwrap();
+    }
+
+    /// The overlap rule written out directly: what a write must remove.
+    fn overlaps(new: &TlbEntry, other: &TlbEntry) -> bool {
+        if !(new.is_global() || other.is_global() || new.asid() == other.asid()) {
+            return false;
+        }
+        let both = new.page_mask | other.page_mask | 0x1FFF;
+        (new.entry_hi ^ other.entry_hi) & !both & 0xC000_00FF_FFFF_E000 == 0
+    }
+
+    /// Random writes against a plain list that applies the rule by comparing
+    /// every pair. The lookup map is how a write finds out it overlaps
+    /// nothing, so the TLB must agree with the list after every write, with
+    /// regular page masks and with masks that are not a run of ones.
+    #[test]
+    fn writes_remove_exactly_the_overlapped_entries() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            for masks in [&[0u64, 0x6000, 0x1e000, 0x7e000, 0x1fe000, 0x7fe000, 0x1ffe000][..],
+                          &[0u64, 0x6000, 0x2000, 0xa000, 0x1fe000, 0x1ffe000][..]] {
+                let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+                let mut next = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+                let mut tlb = MipsTlb::new(64);
+                tlb.set_conflict_invalidation(true);
+                let mut model: Vec<Option<TlbEntry>> = vec![None; 64];
+                for _ in 0..4000 {
+                    let index = (next() % 64) as usize;
+                    let mask = masks[(next() % masks.len() as u64) as usize];
+                    let region = if next() % 4 == 0 { 0x8000_0000_0000_0000 } else { BASE };
+                    // Few page numbers, so that writes collide often.
+                    let page = (next() % 24) << 13;
+                    let asid = next() % 3;
+                    let global = if next() % 3 == 0 { 0x1000 } else { 0 };
+                    let new = entry(mask, region | page | global | asid, [(next() % 8) << 1; 2]);
+                    let mut expect_conflict = false;
+                    for (i, slot) in model.iter_mut().enumerate() {
+                        if i != index && slot.as_ref().is_some_and(|o| overlaps(&new, o)) {
+                            let mut gone = TlbEntry::new();
+                            gone.page_mask = slot.as_ref().unwrap().page_mask;
+                            *slot = Some(gone);
+                            expect_conflict = true;
+                        }
+                    }
+                    model[index] = Some(new);
+                    tlb.write(index, new);
+                    assert_eq!(tlb.take_write_conflict(), expect_conflict);
+                    for (i, slot) in model.iter().enumerate() {
+                        let got = tlb.read(i);
+                        let want = slot.unwrap_or_else(TlbEntry::new);
+                        assert_eq!((got.entry_hi, got.entry_lo, got.page_mask),
+                                   (want.entry_hi, want.entry_lo, want.page_mask), "entry {i}");
+                    }
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
     #[test]
     fn test_tlb_entry_flags() {
         let mut entry = TlbEntry::new();

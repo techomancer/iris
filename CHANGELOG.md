@@ -214,6 +214,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   failed 320 compares on this. The manual documents it for the R10000; the
   R12000, R14000 and R16000 do the same as a model choice. The R4400 and
   R5000 still keep the whole PFN.
+- **TLB refill vector on the R10000** follows the address space that missed:
+  a user address takes the XTLB vector only with UX set, xsseg with SX, and
+  kernel addresses with KX. A 64-bit kernel touching a 32-bit user address now
+  refills through 0x000, as the part does, not 0x080. The R4400 and R5000 still
+  choose by the current mode.
 
 ### `IRIS_GUI_GL` works in iris-gui
 
