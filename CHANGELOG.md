@@ -11,6 +11,23 @@ history; author dates can differ after rebases or cherry-picks. Historical
 feature names describe the build at the time, not flags to use today. Commit
 hashes are given where a change is easiest to understand by reading the commit.
 
+## November 2026
+
+### O2 graphics tracing
+
+- `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,
+  or `IRIS_O2_TRACE` from power-on; `gputrace` builds) writes one annotated
+  trace for the rendering engine, GBE and CRIME, in the format of the other
+  boards, each primitive decoded with the registers it runs with.
+- `re rec FILE` records the engine's writes for the offline replay test.
+- Perfetto shows engine busy, interface buffer level and stalls, primitives,
+  GBE timing interrupts and shadow latches.
+
+### O2 dithering
+
+- GL lines, points and rectangles into 16-bit double-buffered windows now
+  dither as triangles do. `re dither on|off` compares renderings.
+
 ## October 2026
 
 ### `IRIS_GUI_GL` works in iris-gui

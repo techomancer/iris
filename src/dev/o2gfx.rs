@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::dev::crime_mem::{Draw, O2Memory, RamWindow};
+use crate::dev::o2gfx_trace::{self as trc, Block, O2Trace};
 use crate::snapshot::{get_field, hex_u64, load_u32_slice, toml_u32, toml_u64, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_BUSY, BUS_OK};
 
@@ -123,6 +124,8 @@ pub struct Gbe {
     /// The four vertical-timing interrupts, into CRIME's latched inputs
     /// 16..19 ([`Self::connect_irq`]).
     irq: std::sync::OnceLock<[crate::irq::IrqLine; 4]>,
+    /// The annotated trace, shared with CRIME and its rendering engine.
+    pub tr: Arc<O2Trace>,
 }
 
 impl Gbe {
@@ -135,10 +138,15 @@ impl Gbe {
     /// last call. The beam runs on guest time, so the machine's service
     /// thread calls this as its clock.
     pub fn service(&self) {
+        self.tr.flush(false);
         let Some(lines) = self.irq.get() else { return };
         let crossed = self.vt_crossings();
         for (n, line) in lines.iter().enumerate() {
             if crossed & (1 << n) != 0 {
+                crate::pf_instant!(crate::perfetto::events::GBE_VT_INTR, n);
+                if self.tr.on(trc::TRACE_GBE) {
+                    self.tr.event("GBE", format_args!("timing interrupt {n}"));
+                }
                 line.set(true);
             }
         }
@@ -149,7 +157,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new() }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new(), tr: Arc::new(O2Trace::default()) }
     }
 
     /// Run the beam on the CPU's instruction count at `mhz` rather than on
@@ -228,6 +236,10 @@ impl Gbe {
         let pending = std::mem::take(&mut s.pending);
         for (live, val, at) in pending {
             if now.is_none_or(|f| f > at) {
+                crate::pf_instant!(crate::perfetto::events::GBE_LATCH, val);
+                if self.tr.on(trc::TRACE_GBE) {
+                    self.tr.event("GBE", format_args!("latched {} = {val:#010x}", trc::gbe_reg_name(live)));
+                }
                 s.r[(live / 4) as usize] = val;
             } else {
                 s.pending.push((live, val, at));
@@ -279,7 +291,7 @@ impl Gbe {
         }
         let mut s = self.s.lock().unwrap();
         self.latch(&mut s);
-        match off {
+        let v = match off {
             CTRLSTAT => {
                 let v = Self::get(&s.r, CTRLSTAT);
                 // Chip id 1, monitor sense 0, and board revision 1 on the
@@ -295,10 +307,17 @@ impl Gbe {
             // An idle rev-1 colour-map FIFO, the one value every poller takes.
             CM_FIFO => 0,
             _ => Self::get(&s.r, off),
+        };
+        if self.tr.on(trc::TRACE_GBE) {
+            self.tr.access(Block::Gbe, false, 32, off, v as u64, trc::gbe_is_poll(off), false);
         }
+        v
     }
 
     fn write_reg(&self, off: u32, val: u32) {
+        if self.tr.on(trc::TRACE_GBE) {
+            self.tr.access(Block::Gbe, true, 32, off, val as u64, false, trc::gbe_is_table(off));
+        }
         let mut s = self.s.lock().unwrap();
         let i = (off / 4) as usize;
         if i >= s.r.len() {
@@ -953,7 +972,7 @@ impl Texture {
 /// spec). IRIX's GL writes floats biased by 2^17, whose mantissa holds
 /// exactly that; perfly's panel text writes the fixed-point value itself
 /// (0x00844140 for 4357.0), which read as a float is a denormal.
-fn gl_coord(w: u32) -> f64 {
+pub(crate) fn gl_coord(w: u32) -> f64 {
     (w & 0x7f_ffff) as f64 / 64.0
 }
 
@@ -961,6 +980,9 @@ fn gl_coord(w: u32) -> f64 {
 /// start colour belongs to (3: the traversal's start point, the default).
 /// The replay test can try others (RE_GOURAUD).
 static GOURAUD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(12 << 8 | 3);
+
+/// `re dither off` turns dithering off for comparing renderings; on by default.
+static DITHER_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 fn gouraud_model() -> (u32, usize) {
     let v = GOURAUD.load(std::sync::atomic::Ordering::Relaxed);
@@ -1160,6 +1182,14 @@ pub struct CrimeRe {
     asleep: std::sync::atomic::AtomicBool,
     started: std::sync::atomic::AtomicBool,
     engine: std::sync::OnceLock<std::thread::Thread>,
+    /// The annotated trace, shared with CRIME and GBE.
+    pub tr: Arc<O2Trace>,
+    /// `re rec`: interface buffer entries as text the replay test reads.
+    rec: Mutex<Option<crate::trace_writer::TraceWriter>>,
+    rec_on: std::sync::atomic::AtomicBool,
+    pf_busy: crate::PfLevel,
+    pf_full: crate::PfLevel,
+    pf_level: crate::PfValue,
 }
 
 /// A buffer the RE draws through: which TLB, and bytes per pixel word.
@@ -1252,6 +1282,12 @@ impl CrimeRe {
             asleep: std::sync::atomic::AtomicBool::new(false),
             started: std::sync::atomic::AtomicBool::new(false),
             engine: std::sync::OnceLock::new(),
+            tr: Arc::new(O2Trace::default()),
+            rec: Mutex::new(None),
+            rec_on: std::sync::atomic::AtomicBool::new(false),
+            pf_busy: crate::PfLevel::new(),
+            pf_full: crate::PfLevel::new(),
+            pf_level: crate::PfValue::new(),
             hot: Mutex::new(BTreeMap::new()),
             win: Mutex::new(ram.window()),
             unhandled: Mutex::new(BTreeMap::new()),
@@ -1296,6 +1332,7 @@ impl CrimeRe {
                 if busy {
                     busy = false;
                     self.busy.store(false, Release);
+                    crate::pf_level!(self.pf_busy, crate::perfetto::events::RE_BUSY, false);
                 }
                 // Stays set across sleeps, so an idle engine wakes only for
                 // the park backstop and goes straight back to sleep.
@@ -1312,7 +1349,9 @@ impl CrimeRe {
             if !busy {
                 busy = true;
                 self.busy.store(true, Release);
+                crate::pf_level!(self.pf_busy, crate::perfetto::events::RE_BUSY, true);
             }
+            self.tap(a, val);
             if a & WIDE != 0 {
                 self.apply64(a & !WIDE, val);
             } else {
@@ -1389,11 +1428,86 @@ impl CrimeRe {
         }
     }
 
+    /// The trace and the recording see each entry as the engine takes it,
+    /// with the registers it runs with: the entry's own value included,
+    /// which a primitive's start needs decoded with it.
+    #[inline(always)]
+    fn tap(&self, a: u32, val: u64) {
+        if !cfg!(feature = "gputrace") {
+            return;
+        }
+        if self.rec_on.load(std::sync::atomic::Ordering::Relaxed) {
+            self.rec_entry(a, val);
+        }
+        if self.tr.on(trc::TRACE_RE) {
+            let (off, wide) = (a & !WIDE, a & WIDE != 0);
+            let start = (off & 0xf000 == 0x2000 || off & 0xf000 == 0x3000) && off & 0x800 != 0;
+            let base = if start { off & !0x800 } else { off };
+            let mut r = self.regs.lock().unwrap().clone();
+            let i = (base / 4) as usize;
+            if i + 1 < r.len() {
+                if wide {
+                    r[i] = (val >> 32) as u32;
+                    r[i + 1] = val as u32;
+                } else {
+                    r[i] = val as u32;
+                }
+            }
+            self.tr.re_entry(off, val, wide, &r);
+        }
+    }
+
+    fn rec_entry(&self, a: u32, val: u64) {
+        if let Some(f) = self.rec.lock().unwrap().as_mut() {
+            if a & WIDE != 0 {
+                f.line(format_args!("w64 {:05x} {val:016x}", a & !WIDE));
+            } else {
+                f.line(format_args!("w32 {a:05x} {:08x}", val as u32));
+            }
+        }
+    }
+
+    /// `re rec FILE`: stream the engine's writes in the form RE_REPLAY reads,
+    /// starting with every register as it stands so a replay begins from the
+    /// same state. What the CPU keeps in memory (textures, pixmaps) is not in
+    /// it: RE_REPLAY_PRELOAD and `o2 peek` are for that.
+    fn start_rec(&self, path: &str) -> Result<(), String> {
+        if !cfg!(feature = "gputrace") {
+            return Err("re rec needs a build with the gputrace feature (on with developer)".into());
+        }
+        let mut f = crate::trace_writer::TraceWriter::create(path).map_err(|e| format!("re rec {path}: {e}"))?;
+        self.drain(std::time::Duration::from_secs(1));
+        {
+            let r = self.regs.lock().unwrap();
+            for (i, &v) in r.iter().enumerate() {
+                if v != 0 {
+                    f.line(format_args!("w32 {:05x} {v:08x}", i * 4));
+                }
+            }
+        }
+        *self.rec.lock().unwrap() = Some(f);
+        self.rec_on.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stop_rec(&self) -> Option<String> {
+        self.rec_on.store(false, std::sync::atomic::Ordering::SeqCst);
+        let f = self.rec.lock().unwrap().take()?;
+        let path = f.path.clone();
+        Some(match f.finish() {
+            Ok(bytes) => format!("{path} ({bytes} bytes)"),
+            Err(e) => format!("{path}: write failed: {e}"),
+        })
+    }
+
     /// A CPU write, into the interface buffer: `BUS_BUSY` while it is full.
     fn cpu_write(&self, off: u32, val: u64, width: u8) -> u32 {
-        if !self.ib.try_push(if width == 64 { off | WIDE } else { off }, val) {
+        let pushed = self.ib.try_push(if width == 64 { off | WIDE } else { off }, val);
+        crate::pf_level!(self.pf_full, crate::perfetto::events::RE_IB_FULL, !pushed);
+        if !pushed {
             return BUS_BUSY;
         }
+        crate::pf_value!(self.pf_level, crate::perfetto::events::RE_IB_LEVEL, self.ib.len());
         self.polled_busy.store(false, std::sync::atomic::Ordering::Relaxed);
         self.record(off, val, width);
         self.wake();
@@ -1441,6 +1555,16 @@ impl CrimeRe {
         if crate::ip32::hot_counters() {
             *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
         }
+        let v = self.read_reg_now(off);
+        if self.tr.on(trc::TRACE_CPU) {
+            if let Some(v) = v {
+                self.tr.access(Block::Cpu, false, 32, off & !3, v as u64, off & !7 == STATUS, false);
+            }
+        }
+        v
+    }
+
+    fn read_reg_now(&self, off: u32) -> Option<u32> {
         match off & !3 {
             // Busy: the four idle bits clear, and the interface buffer's
             // level as CRIME's own 64 entries would show it: what is
@@ -1819,6 +1943,7 @@ impl CrimeRe {
     }
 
     fn pixel_pipe(&self) {
+        crate::pf_scope!(crate::perfetto::events::RE_PRIM, self.drawn.load(std::sync::atomic::Ordering::Relaxed));
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The registers stay locked for the primitive: copying all 24 KB of
         // them per primitive was a tenth of the engine's time under X.
@@ -1889,9 +2014,16 @@ impl CrimeRe {
         let dmode = g(BUFMODE_DST);
         let half = dmode & 2 != 0 && (dmode >> 2) & 3 == 1 && dst.bd == 4;
         let half_off = if dmode & 1 == 0 { 2 } else { 0 };
-        let paint = |mem: &mut RamWindow, o: usize, c: u32| {
+        // Dithered like any other fragment: IRIX's GL falls back to a dithered
+        // rectangle when a clear colour is off the dither grid.
+        let dither_half = half && Self::dithers(dm);
+        let paint = |mem: &mut RamWindow, o: usize, x: i32, y: i32, c: u32| {
             if half {
-                let v = (((c & 0xff) >= 0x80) as u32) << 15 | ((c >> 27) & 31) << 10 | ((c >> 19) & 31) << 5 | ((c >> 11) & 31);
+                let ch = |sh: u32| {
+                    let v = (c >> sh) & 0xff;
+                    if dither_half { Self::dither5(v, x, y) } else { v >> 3 }
+                };
+                let v = (((c & 0xff) >= 0x80) as u32) << 15 | ch(24) << 10 | ch(16) << 5 | ch(8);
                 Self::put(&r, mem, o + half_off, 2, v);
             } else {
                 Self::put(&r, mem, o, dst.bd, Self::lane(Self::convert(c, 0x20, dmode, dst.bd), o, dst.bd));
@@ -1913,7 +2045,7 @@ impl CrimeRe {
                     return;
                 }
                 if let Some(o) = Self::locate(&r, mem, dst, x0.max(0) as u32, y0.max(0) as u32) {
-                    paint(mem, o, fg);
+                    paint(mem, o, x0, y0, fg);
                 }
             }
             // Line, Bresenham, the end pixel unless told to skip it.
@@ -1932,7 +2064,7 @@ impl CrimeRe {
                     if !(last && skip_last) && x >= 0 && y >= 0 && clip.ok(x, y) {
                         if let Some(o) = Self::locate(&r, mem, dst, x as u32, y as u32) {
                             if let Some(v) = colour_at(mem, o, k, stippled) {
-                                paint(mem, o, v);
+                                paint(mem, o, x, y, v);
                             }
                         }
                     }
@@ -2000,7 +2132,7 @@ impl CrimeRe {
                             }
                             if let Some(o) = Self::locate(&r, mem, dst, x, y) {
                                 if let Some(v) = colour_at(mem, o, k as u32, stippled) {
-                                    paint(mem, o, v);
+                                    paint(mem, o, x as i32, y as i32, v);
                                 }
                             }
                         }
@@ -2078,7 +2210,7 @@ impl CrimeRe {
                 // Dithering into the 5-bit channels of a double-pix window
                 // (Quake 2's): without it a lightmapped wall falls into a few
                 // flat steps of 8 levels each.
-                let dither = dm & draw::DITHER != 0 && half;
+                let dither = Self::dithers(dm) && half;
                 let pack_at = |x: i32, y: i32, cr: u32, cg: u32, cb: u32, ca: u32| -> u32 {
                     let d = |c: u32| Self::dither5(c, x, y);
                     (u32::from(ca >= 0x80) << 15) | (d(cr) << 10) | (d(cg) << 5) | d(cb)
@@ -2408,10 +2540,17 @@ impl CrimeRe {
         })
     }
 
+    /// Whether fragments of draw mode `dm` are dithered.
+    fn dithers(dm: u32) -> bool {
+        dm & draw::DITHER != 0 && DITHER_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// An 8-bit channel reduced to 5 bits with a 4 x 4 ordered dither at
     /// pixel (x, y): the threshold spreads the 8 levels each 5-bit step
-    /// drops over the cell. The spec does not give CRIME's matrix; this is
-    /// the standard Bayer one.
+    /// drops over the cell. The spec leaves dithering "TBD". The matrix is
+    /// the one IRIX's GL uses for its software spans, and adding before
+    /// truncating is what its clear path assumes: only multiples of the step
+    /// (and 255, which saturates) count as on the grid and undithered.
     fn dither5(c: u32, x: i32, y: i32) -> u32 {
         const BAYER: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
         ((c + BAYER[(y & 3) as usize][(x & 3) as usize] / 2) >> 3).min(31)
@@ -2499,7 +2638,8 @@ impl CrimeRe {
                 let e = |v: u32| (v << 3) | (v >> 2);
                 let dc = [e((d >> 10) & 0x1f), e((d >> 5) & 0x1f), e(d & 0x1f), if d & 0x8000 != 0 { 255 } else { 0 }];
                 let [r8, g8, b8, _] = if blend { Self::blend(func, konst, [cr, cg, cb, sa], dc) } else { [cr, cg, cb, ca] };
-                let v = (d & 0x8000) | ((r8 >> 3) << 10) | ((g8 >> 3) << 5) | (b8 >> 3);
+                let c5 = |c: u32| if Self::dithers(dm) { Self::dither5(c, x, y) } else { c >> 3 };
+                let v = (d & 0x8000) | (c5(r8) << 10) | (c5(g8) << 5) | c5(b8);
                 Self::put(r, mem, o, 2, v);
             } else {
                 // The destination is read only to blend, which needs 32-bit
@@ -2626,6 +2766,7 @@ impl CrimeRe {
     }
 
     fn mte(&self) {
+        crate::pf_scope!(crate::perfetto::events::RE_MTE, self.drawn.load(std::sync::atomic::Ordering::Relaxed));
         self.drawn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The registers stay locked for the primitive: copying all 24 KB of
         // them per primitive was a tenth of the engine's time under X.
@@ -2881,7 +3022,7 @@ impl crate::traits::Device for Gbe {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("gbe".to_string(), "GBE display engine: gbe status".to_string())]
+        vec![("gbe".to_string(), "GBE display engine: gbe status | gbe trace <file> [re,cpu,gbe,crime,irq|all] | gbe trace off|flush".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -2894,7 +3035,8 @@ impl crate::traits::Device for Gbe {
                 writeln!(w, "GBE: {}", self.summary()).ok();
                 Ok(())
             }
-            _ => Err("Usage: gbe status".to_string()),
+            "trace" => self.tr.command(&args[1..], &mut w),
+            _ => Err("Usage: gbe status | trace <file> [re,cpu,gbe,crime,irq|all] | trace off|flush".to_string()),
         }
     }
 }
@@ -2907,7 +3049,7 @@ impl crate::traits::Device for CrimeRe {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("re".to_string(), "CRIME rendering engine: re status | re notes".to_string())]
+        vec![("re".to_string(), "CRIME rendering engine: re status | re notes | re dither [on|off] | re trace <file> [re,cpu,gbe,crime,irq|all] | re trace off|flush | re rec <file>|off".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -2929,7 +3071,29 @@ impl crate::traits::Device for CrimeRe {
                     writeln!(w, "  {n:8}  {what}").ok();
                 }
             }
-            _ => return Err("Usage: re status | notes".to_string()),
+            "trace" => return self.tr.command(&args[1..], &mut w),
+            "dither" => {
+                match args.get(1).copied() {
+                    Some("on") => DITHER_ENABLED.store(true, Relaxed),
+                    Some("off") => DITHER_ENABLED.store(false, Relaxed),
+                    None => {}
+                    _ => return Err("Usage: re dither [on|off]".to_string()),
+                }
+                writeln!(w, "dithering {}", if DITHER_ENABLED.load(Relaxed) { "on" } else { "off" }).ok();
+            }
+            "rec" => match args.get(1).copied() {
+                Some("off") | None => {
+                    match self.stop_rec() {
+                        Some(s) => writeln!(w, "recording stopped: {s}").ok(),
+                        None => writeln!(w, "no recording running").ok(),
+                    };
+                }
+                Some(path) => {
+                    self.start_rec(path)?;
+                    writeln!(w, "recording to {path}").ok();
+                }
+            },
+            _ => return Err("Usage: re status | notes | dither [on|off] | trace <file> [re,cpu,gbe,crime,irq|all] | trace off|flush | rec <file>|off".to_string()),
         }
         Ok(())
     }
@@ -3438,6 +3602,68 @@ mod tests {
         // RGB and RGBA: A1R5G5B5.
         assert_eq!(texel16(2, 0xfc00), [255.0, 0.0, 0.0, 255.0]);
         assert_eq!(texel16(1, 0x001f), [0.0, 0.0, 255.0, 0.0]);
+    }
+
+    /// The registers a double-pix GL window draws with: the low half of each
+    /// word, dithering on, tile 0x100 through entry 0 of TLB A.
+    fn doublepix_window(re: &TestRe, dm: u32) -> u32 {
+        let base = 0x1500_0000;
+        re.write64(base + TLB_A, 0x8100u64 << 48);
+        re.write32(base + BUFMODE_DST, 0x226);
+        re.write32(base + DRAWMODE, dm);
+        base
+    }
+
+    /// Every fragment is dithered, not only a triangle's: a flat rectangle of
+    /// an off-grid colour comes out mixed, and an on-grid one stays flat.
+    #[test]
+    fn dithering_reaches_rectangles_and_lines() {
+        let ram = Arc::new(O2Memory::single(32 << 20));
+        let re = TestRe::new(ram.clone());
+        let base = doublepix_window(&re, 0x0040_0178);
+        let gl = |c: u32| 0x4800_0000 | (c * 64);
+        let rect = |fg: u32| {
+            re.write32(base + PRIMITIVE, 0x0302_0000);
+            re.write32(base + FG, fg);
+            re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(0) as u64);
+            re.write64(base + (TRI_V0 + 8) + 0x800, (gl(3) as u64) << 32 | gl(3) as u64);
+        };
+        let reds = |n: usize| -> Vec<u32> {
+            (0..n).map(|i| {
+                let p = ram.bytes(0x0100_0000 + i * 512 + 2, 16);
+                (0..4).map(|k| ((p[4 * k] as u32) >> 2) & 31).collect::<Vec<_>>()
+            }).flatten().collect()
+        };
+        rect(0x5400_00ff); // 84: half a step above 80
+        let cell = reds(4);
+        assert_eq!(cell.iter().filter(|&&c| c == 11).count(), 8, "{cell:?}");
+        assert_eq!(cell.iter().filter(|&&c| c == 10).count(), 8, "{cell:?}");
+        rect(0x5000_00ff); // 80: on the grid
+        assert_eq!(reds(4), vec![10; 16]);
+        // A flat GL line of an off-grid colour through the same window.
+        re.write32(base + DRAWMODE, 0x0040_0178);
+        re.write32(base + FG, 0x5400_00ff);
+        re.write32(base + PRIMITIVE, 0x0100_0000);
+        re.write64(base + TRI_V0, (gl(0) as u64) << 32 | gl(8) as u64);
+        re.write64(base + (TRI_V0 + 8) + 0x800, (gl(3) as u64) << 32 | gl(8) as u64);
+        let row: Vec<u32> = (0..4).map(|k| (ram.bytes(0x0100_0000 + 8 * 512 + 2 + 4 * k, 1)[0] as u32 >> 2) & 31).collect();
+        assert_eq!(row, [10, 11, 10, 11]);
+    }
+
+    #[test]
+    fn trace_decodes_a_primitive_with_the_registers_it_runs_with() {
+        let mut r = vec![0u32; RE_WORDS];
+        let set = |r: &mut Vec<u32>, off: u32, v: u32| r[(off / 4) as usize] = v;
+        set(&mut r, DRAWMODE, 0x0041_0578);
+        set(&mut r, BUFMODE_DST, 0x226);
+        set(&mut r, PRIMITIVE, 0x0203_0000);
+        set(&mut r, SHADE_R, 0x0005_1ffa);
+        set(&mut r, TRI_V0, 0x4804_1620);
+        let t = crate::dev::o2gfx_trace::decode_prim(&r);
+        assert!(t.starts_with("TRI edge 3 (4184.500, "), "{t}");
+        assert!(t.contains("[GL SHADE BLEND DITHER LANES=f]"), "{t}");
+        assert!(t.contains("dst [tlbA 4B RGBA 16 doublepix lo]"), "{t}");
+        assert!(t.contains("shade 81.999"), "{t}");
     }
 
     #[test]

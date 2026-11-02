@@ -467,12 +467,15 @@ impl Ip32Bus {
             vice: Stub::new("vice"),
             gbe: {
                 let ust = ust.clone();
-                crate::dev::o2gfx::Gbe::new(Arc::new(move || ust.now()))
+                let mut gbe = crate::dev::o2gfx::Gbe::new(Arc::new(move || ust.now()));
+                gbe.tr = crime.tr.clone();
+                gbe
             },
             mace: Mace::new(ram.clone(), crime, ust),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
         };
+        bus.gbe.tr.start_from_env();
         if let Some(mac) = opts.mac {
             bus.mace.id = crate::dev::mace_id::MaceId::new(mac);
         }

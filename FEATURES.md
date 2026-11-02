@@ -18,7 +18,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 |---|---|---|
 | `debug_cache` | Track a selected cache line through cache operations. | — |
 | `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | `gputrace` |
-| `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [clanker/rex3/trace-and-recording.md](clanker/rex3/trace-and-recording.md). GR2 and IMPACT annotated traces (`gr2 trace`, `mgras trace`). Off: no per-access check at all. Lightning-compatible. | — |
+| `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [clanker/rex3/trace-and-recording.md](clanker/rex3/trace-and-recording.md). GR2, IMPACT and O2 annotated traces (`gr2 trace`, `mgras trace`, `re trace`); O2 engine recording (`re rec`). Off: no per-access check at all. Lightning-compatible. | — |
 | `developer_ip7` | CP0 Compare/timer calibration statistics and debug prints. | — |
 | `developerx` | Extended exception diagnostics; break on IBE/DBE/ADEL/ADES/TLB errors. | — |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible. | — |
@@ -510,6 +510,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_JIT_PIC` | Any presence disables core-address constants for JIT code. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
+| `IRIS_O2_TRACE` | Trace the O2's rendering engine, GBE and CRIME from power-on to this path (`gputrace` builds). | [src/dev/o2gfx_trace.rs](src/dev/o2gfx_trace.rs) |
 | `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_O2_AUDIO_CAPTURE` | O2 host audio capture output path (what the host plays). | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_O2_AUDIO_DUMP` | File to record the O2's audio output at the guest's rate, before resampling. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
@@ -582,7 +583,7 @@ both the interpreter and jitv2.
 | `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
 | `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
-| `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2 and IMPACT annotated traces (`gr2 trace`, `mgras trace`). On with `developer`; opt in for plain and `lightning` builds |
+| `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2, IMPACT and O2 annotated traces (`gr2 trace`, `mgras trace`, `re trace`); O2 engine recording (`re rec`). On with `developer`; opt in for plain and `lightning` builds |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
 | `perfetto` | Record Perfetto traces for ui.perfetto.dev: per-thread event rings, a writer thread, host or guest timeline. See [docs/perfetto.md](docs/perfetto.md) |
 | `fetchverify` | Check every executed instruction word against memory (stale-code detector); lightning-compatible |

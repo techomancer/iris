@@ -4,6 +4,7 @@
 pub mod aic7880;
 pub mod crime_mem;
 pub mod o2gfx;
+pub mod o2gfx_trace;
 pub mod gl;
 pub mod gr2;
 pub mod mec;

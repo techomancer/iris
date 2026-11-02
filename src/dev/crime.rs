@@ -123,6 +123,8 @@ pub struct Crime {
     /// Software asked for a cold reset (CONTROL bit 11); the machine takes
     /// it ([`Crime::take_reset_request`]).
     reset_request: std::sync::atomic::AtomicBool,
+    /// The annotated trace (`crime trace`), shared with the RE and GBE.
+    pub tr: std::sync::Arc<crate::dev::o2gfx_trace::O2Trace>,
 }
 
 /// CRIME's counter runs at 66.67 MHz. The PROM's own delay routine computes
@@ -144,6 +146,7 @@ impl Crime {
             time_base: AtomicU64::new(0),
             out: std::sync::OnceLock::new(),
             reset_request: std::sync::atomic::AtomicBool::new(false),
+            tr: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -273,9 +276,20 @@ impl Crime {
         self.irqlog.lock().unwrap().iter().map(|&(w, off, v)| format!("{} {:#04x} {:#018x}\n", if w { 'W' } else { 'R' }, off, v)).collect()
     }
 
+    fn trace_category(off: u32) -> u32 {
+        use crate::dev::o2gfx_trace::{TRACE_CRIME, TRACE_IRQ};
+        match off {
+            crime_reg::INTSTAT | crime_reg::INTMASK | crime_reg::SOFTINT | crime_reg::HARDINT => TRACE_IRQ,
+            _ => TRACE_CRIME,
+        }
+    }
+
     pub(crate) fn load(&self, off: u32) -> u64 {
         let v = self.load_inner(off);
         self.log_irq(false, off, v);
+        if self.tr.on(Self::trace_category(off)) {
+            self.tr.access(crate::dev::o2gfx_trace::Block::Crime, false, 64, off, v, off == crime_reg::TIME, false);
+        }
         v
     }
 
@@ -305,6 +319,9 @@ impl Crime {
 
     fn store(&self, off: u32, val: u64) {
         self.log_irq(true, off, val);
+        if self.tr.on(Self::trace_category(off)) {
+            self.tr.access(crate::dev::o2gfx_trace::Block::Crime, true, 64, off, val, false, false);
+        }
         self.store_inner(off, val);
     }
 
@@ -365,7 +382,7 @@ impl Device for Crime {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [on|off|n] | crime touched".to_string())]
+        vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [on|off|n] | crime touched | crime trace <file> [re,cpu,gbe,crime,irq|all] | crime trace off|flush".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -413,7 +430,8 @@ impl Device for Crime {
                     writeln!(w, "  {off:#06x} {}", if write { "W" } else { "R" }).ok();
                 }
             }
-            _ => return Err("Usage: crime status | regs | irqlog [on|off|n] | touched".to_string()),
+            "trace" => return self.tr.command(&args[1..], &mut w),
+            _ => return Err("Usage: crime status | regs | irqlog [on|off|n] | touched | trace <file> [re,cpu,gbe,crime,irq|all] | trace off|flush".to_string()),
         }
         Ok(())
     }
@@ -513,7 +531,9 @@ pub struct CrimeSpace {
 
 impl CrimeSpace {
     pub fn new(regs: std::sync::Arc<Crime>, ram: std::sync::Arc<crate::dev::crime_mem::O2Memory>) -> Self {
-        Self { re: crate::dev::o2gfx::CrimeRe::new(ram.clone()), regs, ram }
+        let mut re = crate::dev::o2gfx::CrimeRe::new(ram.clone());
+        re.tr = regs.tr.clone();
+        Self { re, regs, ram }
     }
 
     /// Whether CRIME answers `addr`.
