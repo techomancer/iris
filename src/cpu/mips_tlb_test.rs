@@ -4,6 +4,48 @@ mod tests {
     use crate::cpu::mips_tlb::*;
     use crate::cpu::mips_exec::CacheAttr;
 
+    /// Region 3 base for the overlap test below.
+    const BASE: u64 = 0xc000_0000_0000_0000;
+
+    fn entry(mask: u64, hi: u64, lo: [u64; 2]) -> TlbEntry {
+        let mut e = TlbEntry::new();
+        (e.page_mask, e.entry_hi, e.entry_lo) = (mask, hi, lo);
+        e
+    }
+
+    /// CPU 1 of a two-processor Tezro: the firmware flushes the TLB with 64
+    /// invalid entries on the kernel's page number, then the kernel writes the
+    /// valid global 16 MiB entry over them. With the rule the valid entry
+    /// answers; without it an invalid duplicate does. A removed entry reads back
+    /// as unwritten with its PageMask.
+    /// Fix: overlapping writes.
+    #[test]
+    fn a_write_invalidates_the_entries_it_overlaps() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let va = BASE + 0x1234;
+            let build = |on: bool| {
+                let mut tlb = MipsTlb::new(64);
+                tlb.set_conflict_invalidation(on);
+                for index in (2..64).rev() {
+                    tlb.write(index, entry(0x1fe000, BASE, [0; 2]));
+                }
+                tlb.write(1, entry(0x1ffe000, BASE | 0x1000, [(0x40 << 6) | (5 << 3) | 0x7; 2]));
+                // A later write elsewhere; unfixed, it left an invalid duplicate answering.
+                tlb.write(0, entry(0x6000, 0xc000_0fff_ffff_9000, [1, 0x2e42f]));
+                tlb
+            };
+            assert!(matches!(build(false).translate::<1>(va, 0, AccessType::Fetch), TlbResult::Invalid { .. }));
+            let mut tlb = build(true);
+            assert!(tlb.take_write_conflict());
+            match tlb.translate::<1>(va, 0, AccessType::Fetch) {
+                TlbResult::Hit { phys_addr, .. } => assert_eq!(phys_addr, 0x1234),
+                other => panic!("expected the valid entry to answer, got {other:?}"),
+            }
+            let gone = tlb.read(2);
+            assert_eq!((gone.entry_hi, gone.entry_lo, gone.page_mask), (0, [0; 2], 0x1fe000));
+        }).unwrap().join().unwrap();
+    }
+
     #[test]
     fn test_tlb_entry_flags() {
         let mut entry = TlbEntry::new();
