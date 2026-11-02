@@ -111,10 +111,12 @@ fn node_events(name: &'static str, lb: &BedrockLb, ni: &BedrockNi, l1: &L1, cpus
     let (tx, rx) = channel();
     let reset_tx = tx.clone();
     lb.connect_soft_reset(Arc::new(move || {
+        dlog!(LogModule::Bedrock, "{name}: LB soft reset from CPU {:?}; restarting the node", crate::cpu::smp::on_cpu_thread());
         let _ = reset_tx.send(MachineEvent::HardReset);
     }));
     let reset_tx = tx.clone();
     ni.connect_local_reset(Arc::new(move || {
+        dlog!(LogModule::Bedrock, "{name}: NI local reset from CPU {:?}; restarting the node", crate::cpu::smp::on_cpu_thread());
         let _ = reset_tx.send(MachineEvent::HardReset);
     }));
     l1.set_event_handler(Arc::new(move |event| {
@@ -126,6 +128,7 @@ fn node_events(name: &'static str, lb: &BedrockLb, ni: &BedrockNi, l1: &L1, cpus
             }
             L1Event::Nmi => dlog!(LogModule::L1, "{name}: NMI entry is not implemented by the CPU"),
             _ => {
+                dlog!(LogModule::L1, "{name}: L1 event {event:?}");
                 if let Some(action) = machine_action(event) {
                     let _ = tx.send(action);
                 }

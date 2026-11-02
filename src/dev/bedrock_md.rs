@@ -351,6 +351,7 @@ impl BedrockMd {
     pub fn startup_tag_store(&self, tag: u32) {
         let cpu = crate::cpu::smp::current_cpu();
         let Some(live) = self.memory.startup_tag(cpu, tag) else { return };
+        crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock MD: CPU {cpu}'s startup window {}", if live { "starts" } else { "ends" });
         self.stopped(|| {
             let _remapping = self.remapping.lock();
             if self.memory.set_startup(cpu, live) {
