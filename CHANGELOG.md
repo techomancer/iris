@@ -61,6 +61,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   value.
 - SYNCHRONIZE CACHE(16) is implemented, WRITE(10) honours FUA, and
   `log scsi on` logs each command a disk receives.
+- A CHD disk writes its file directly and a sync of the file stores its
+  writes, where it used to close and reopen the image (and never synced it).
+  A write the guest needs stored now costs what it does on a raw image; on a
+  2 GiB compressed CHD it took 27 ms and now takes 1 to 4 ms. A CHD disk gets
+  the background sync, and a hunk's map entry reaches the file only after
+  its data, so a host crash cannot leave the map pointing at data that is
+  not there. A write that gives a hunk its first data syncs before it
+  completes, also with `write_cache = true`, so killing iris loses nothing
+  on a CHD either.
 
 ## October 2026
 
