@@ -27,7 +27,6 @@ pub struct ChdHd {
     // to its parent, so `chd` must go before `parent`.
     chd: Chd,
     /// The read-only parent of a diff. Never written.
-    #[allow(dead_code)]
     parent: Option<Chd>,
     /// The file `chd` writes through.
     file: Arc<ChdFile>,
@@ -156,11 +155,55 @@ impl ChdHd {
                 format!("CHD HD write length {} not a multiple of sector {}", data.len(), ss),
             ));
         }
-        self.chd.write_bytes(lba * ss as u64, data).map_err(map_err)?;
+        let offset = lba * ss as u64;
+        if self.parent.is_some() {
+            self.claim_zeroed_hunks(offset, data)?;
+        }
+        self.chd.write_bytes(offset, data).map_err(map_err)?;
         // Writing to a diff means the sidecar now diverges from the base, so a
         // clean shutdown should fold it back. (No-op for an in-place base.)
         if self.diff_path.is_some() {
             self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Copy into the diff each hunk this write would leave all zero, while
+    /// the diff does not hold it and the parent's copy is not zero.
+    ///
+    /// MAME's `write_hunk` stores nothing for an all-zero hunk the CHD does
+    /// not hold yet, because such a hunk reads as zeroes anyway. In a diff it
+    /// reads from the parent instead, so the zeroes would be lost. An
+    /// uncompressed v5 map entry has no value that means zero, so the only
+    /// way to keep them is to hold the hunk: once it is copied, the write
+    /// overwrites it in place.
+    fn claim_zeroed_hunks(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        let hunk_bytes = self.chd.hunk_bytes() as usize;
+        let end = offset + data.len() as u64;
+        let mut buf = Vec::new();
+        for hunk in offset / hunk_bytes as u64..end.div_ceil(hunk_bytes as u64) {
+            let start = hunk * hunk_bytes as u64;
+            let lo = (offset.max(start) - start) as usize;
+            let hi = (end.min(start + hunk_bytes as u64) - start) as usize;
+            let part = &data[(start + lo as u64 - offset) as usize..][..hi - lo];
+            if part.iter().any(|&b| b != 0) {
+                continue;
+            }
+            let hunk = u32::try_from(hunk).map_err(map_err)?;
+            // A hunk the diff holds has stored bytes; one it leaves to the
+            // parent has none.
+            if self.chd.hunk_info(hunk).map_err(map_err)?.compbytes != 0 {
+                continue;
+            }
+            buf.resize(hunk_bytes, 0);
+            self.chd.read_hunk(hunk, &mut buf).map_err(map_err)?;
+            let zero = |b: &[u8]| b.iter().all(|&x| x == 0);
+            // Bytes the write keeps from the parent that are not zero make
+            // MAME store the hunk itself.
+            if zero(&buf[lo..hi]) || !zero(&buf[..lo]) || !zero(&buf[hi..]) {
+                continue;
+            }
+            self.chd.write_hunk(hunk, &buf).map_err(map_err)?;
         }
         Ok(())
     }

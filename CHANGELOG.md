@@ -83,6 +83,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   [docs/virtio-serial.md](docs/virtio-serial.md).
 - `PciConfig` can carry a read-only capability list (`with_capabilities`).
 
+### CHD disks
+
+- Zeroes written to a CHD's `.diff.chd` now read back as zeroes. MAME skips
+  storing a hunk that is all zero and not yet in the diff, so such a hunk
+  went on reading the base CHD's old data: a guest that zeroed fresh blocks
+  (`mkfs`, `dd if=/dev/zero`) got the old contents back. A discard on a CHD,
+  which writes zeroes, had the same fault.
+
 ## October 2026
 
 ### Octane snapshots
