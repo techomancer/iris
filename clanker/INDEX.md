@@ -383,6 +383,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | [irix-install.md](irix/irix-install.md) | howto | Installing IRIX on iris (from scratch) |
 | [keyboard-issues.md](irix/keyboard-issues.md) | open | IRIX Keyboard Issues |
 | [networking.md](irix/networking.md) | howto | IRIX 6.5 Networking Configuration |
+| [octane-halt-request-outlives-a-quit.md](irix/octane-halt-request-outlives-a-quit.md) | rule | Octane: quitting during the PROM's halt leaves the next boot at "Okay to power off" |
 
 ## build/
 
