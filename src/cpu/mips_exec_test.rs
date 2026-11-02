@@ -1227,6 +1227,29 @@ mod tests {
                     0xAAAAAAAA means a stale nanotlb slot survived the switch");
     }
 
+    /// A second write that would match the first removes it and sets Status.TS on
+    /// the R10000, for TLBWI and TLBWR; the R4400 keeps both. Fix: overlapping
+    /// writes (jitv2 never compiles them, so the interpreter is the only path).
+    #[test]
+    fn overlapping_tlb_writes_follow_the_cpu_family() {
+        use crate::cpu::mips_core::STATUS_TS;
+        use crate::cpu::mips_tlb::Tlb;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(r10k: bool, funct: u32) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            let lo0 = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            tlb_op(&mut exec, &[(0, 5), (6, 7), (10, (0x100 << 13) | 10), (2, lo0)], FUNCT_TLBWI);
+            tlb_op(&mut exec, &[(0, 6)], funct);
+            assert_eq!(exec.core.cp0_status & STATUS_TS != 0, r10k, "funct {funct:#x}");
+            assert_eq!(exec.tlb.read(5).entry_hi == 0, r10k, "funct {funct:#x}");
+        }
+        on_big_stack(|| {
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true, funct);
+                run::<R4400Cache>(false, funct);
+            }
+        });
+    }
+
     #[cfg(feature = "tlbcheck")]
     #[test]
     fn test_tlbwi_breaks_on_duplicate_entry() {
@@ -5698,6 +5721,32 @@ mod tests {
         let st = exec.read_data::<4>(0xC000_0000_0000_0000u64)
             .expect_err("empty TLB must miss");
         assert_ne!(st & EXEC_IS_XTLB_REFILL, 0, "true xkseg is unchanged: XTLB");
+    }
+
+    /// The R10000 picks the refill vector by the missing address's Status bit
+    /// (UX, SX or KX; R10000 UM v2.0 pp. 333-334), the R4400 by the current
+    /// mode: a 64-bit kernel missing on kuseg takes the 32-bit vector on the
+    /// R10000 only. Fix: refill vector.
+    #[test]
+    fn r10000_refill_vector_follows_the_address_space() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache as R10k;
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_SX, STATUS_UX};
+        use crate::cpu::mips_exec::EXEC_IS_XTLB_REFILL;
+        // A kernel-mode read of `va` with `xbits` in Status and an empty TLB:
+        // does it miss through the XTLB vector?
+        fn xrefill<C: CpuModel + From<Arc<dyn BusDevice>>>(xbits: u32, va: u64) -> bool {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status((exec.core.cp0_status & !(STATUS_ERL | STATUS_EXL | STATUS_KX | 0x18)) | xbits);
+            let st = exec.read_data::<4>(va).expect_err("empty TLB must miss");
+            assert_ne!(st & EXEC_IS_TLB_REFILL, 0);
+            st & EXEC_IS_XTLB_REFILL != 0
+        }
+        on_big_stack(|| {
+            assert!(!xrefill::<R10k>(STATUS_KX, 0), "kuseg follows UX");
+            assert!(xrefill::<R10k>(STATUS_UX, 0));
+            assert!(xrefill::<R4400Cache>(STATUS_KX, 0), "R4400 follows the mode");
+            assert!(!xrefill::<R10k>(STATUS_KX, 1 << 62) && xrefill::<R10k>(STATUS_KX | STATUS_SX, 1 << 62), "xsseg follows SX");
+        });
     }
 
     #[test]
