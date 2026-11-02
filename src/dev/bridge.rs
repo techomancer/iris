@@ -521,13 +521,10 @@ impl Bridge {
     }
 
     pub fn register_locks(self: &Arc<Self>) {
-        use crate::locks::register_lock_fn;
-        let me = self.clone();
-        register_lock_fn("bridge::state", move || me.st.is_locked());
-        let me = self.clone();
-        register_lock_fn("bridge::irq_order", move || me.irq_order.is_locked());
-        let me = self.clone();
-        register_lock_fn("bridge::microlan", move || me.microlan.is_locked());
+        use crate::locks::register_mutex_fn;
+        register_mutex_fn("bridge::state", self, |b| b.st.is_locked());
+        register_mutex_fn("bridge::irq_order", self, |b| b.irq_order.is_locked());
+        register_mutex_fn("bridge::microlan", self, |b| b.microlan.is_locked());
     }
 
     /// Run `f` on the state, then send the packets it decided on. The
