@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::irq::IrqLine;
+use crate::irq::{InterruptController, IrqLine};
 use crate::snapshot::{get_field, load_u32_slice, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_OK};
 
@@ -315,6 +315,67 @@ pub fn plug(dev: &dyn PciBusDevice, dma: Arc<dyn PciDma>, irq_for_pin: impl FnOn
     }
 }
 
+/// A host bridge's PCI interrupt pins and where they go.
+///
+/// Each device number's INTA..INTD is a line ([`IntxTable::line`]). The
+/// table keeps every pin's level and drives each system input it routes to
+/// with the OR of the pins routed there, so on a shared input one function
+/// cannot clear another's interrupt. A pin with no route is dropped.
+///
+/// The routes are data, set when the bus is wired ([`IntxTable::route`]),
+/// so wiring a function at another device number takes a call, not a new
+/// bridge.
+pub struct IntxTable {
+    /// Where the system inputs are.
+    intc: Arc<dyn InterruptController>,
+    st: Mutex<IntxState>,
+}
+
+struct IntxState {
+    levels: Box<[bool]>,
+    input: Box<[Option<u32>]>,
+}
+
+impl IntxTable {
+    /// A table for device numbers `0..devices`, every pin unrouted.
+    pub fn new(intc: Arc<dyn InterruptController>, devices: usize) -> Self {
+        let st = IntxState { levels: vec![false; devices * 4].into(), input: vec![None; devices * 4].into() };
+        Self { intc, st: Mutex::new(st) }
+    }
+
+    /// The line of `device`'s pin (1 = INTA).
+    pub fn line(device: u8, pin: u8) -> u32 {
+        device as u32 * 4 + (pin as u32 - 1)
+    }
+
+    /// Wire `device`'s pin (1 = INTA) to system input `input`, or to none.
+    pub fn route(&self, device: u8, pin: u8, input: Option<u32>) {
+        self.st.lock().unwrap().input[Self::line(device, pin) as usize] = input;
+    }
+
+    /// The system input `device`'s pin drives.
+    pub fn input(&self, device: u8, pin: u8) -> Option<u32> {
+        self.st.lock().unwrap().input.get(Self::line(device, pin) as usize).copied().flatten()
+    }
+
+    /// Every pin's level, by line, for a snapshot.
+    pub fn levels(&self) -> Vec<bool> {
+        self.st.lock().unwrap().levels.to_vec()
+    }
+}
+
+impl InterruptController for IntxTable {
+    fn set_line(&self, line: u32, level: bool) {
+        // The lock is held while the system input is driven, so two pins
+        // sharing an input cannot reach it out of order.
+        let mut st = self.st.lock().unwrap();
+        let Some(&Some(input)) = st.input.get(line as usize) else { return };
+        st.levels[line as usize] = level;
+        let any = st.levels.iter().zip(st.input.iter()).any(|(&l, &i)| l && i == Some(input));
+        self.intc.set_line(input, any);
+    }
+}
+
 // ---- BARs on the physical bus ----
 
 /// What a host bridge does to a CPU access on its way to a function: which
@@ -608,7 +669,6 @@ mod tests {
         fn dma_write(&self, _: u64, _: &[u8]) -> PciDmaStatus { PciDmaStatus::MasterAbort }
     }
 
-    use crate::irq::InterruptController;
     struct Inputs(Mutex<Vec<(u32, bool)>>);
     impl InterruptController for Inputs {
         fn set_line(&self, line: u32, level: bool) { self.0.lock().unwrap().push((line, level)); }
@@ -632,6 +692,53 @@ mod tests {
         plug(&*f, Arc::new(NoMemory), |p| IrqLine::new(inputs.clone(), 40 + p as u32));
         f.irq.lock().unwrap().as_ref().unwrap().set(true);
         assert_eq!(*inputs.0.lock().unwrap(), vec![(43, true)]);
+    }
+
+    #[test]
+    fn a_pin_drives_the_input_it_is_routed_to() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        let t = IntxTable::new(inputs.clone(), 8);
+        t.route(3, 1, Some(10));
+        assert_eq!(t.input(3, 1), Some(10));
+        assert_eq!(t.input(3, 2), None);
+        t.set_line(IntxTable::line(3, 1), true);
+        t.set_line(IntxTable::line(3, 1), false);
+        assert_eq!(*inputs.0.lock().unwrap(), vec![(10, true), (10, false)]);
+        assert_eq!(IntxTable::line(3, 4), 15);
+    }
+
+    /// A pin with no route, or beyond the table, is dropped: no input is
+    /// driven and its level is not kept.
+    #[test]
+    fn an_unrouted_pin_goes_nowhere() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        let t = IntxTable::new(inputs.clone(), 8);
+        t.set_line(IntxTable::line(2, 1), true);
+        t.set_line(8 * 4, true);
+        assert!(inputs.0.lock().unwrap().is_empty());
+        assert!(t.levels().iter().all(|&l| !l));
+    }
+
+    /// Two pins on one input: it stays up until both have dropped, and a
+    /// pin on another input does not hold it.
+    #[test]
+    fn a_shared_input_stays_up_until_every_pin_drops() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        let t = IntxTable::new(inputs.clone(), 8);
+        t.route(3, 1, Some(12));
+        t.route(4, 2, Some(12));
+        t.route(5, 1, Some(13));
+        t.set_line(IntxTable::line(3, 1), true);
+        t.set_line(IntxTable::line(4, 2), true);
+        t.set_line(IntxTable::line(5, 1), true);
+        t.set_line(IntxTable::line(3, 1), false);
+        t.set_line(IntxTable::line(4, 2), false);
+        assert_eq!(*inputs.0.lock().unwrap(),
+            vec![(12, true), (12, true), (13, true), (12, true), (12, false)],
+            "input 12 drops only with its last pin");
+        let mut levels = vec![false; 32];
+        levels[IntxTable::line(5, 1) as usize] = true;
+        assert_eq!(t.levels(), levels, "slot 5's pin is still up");
     }
 
 }

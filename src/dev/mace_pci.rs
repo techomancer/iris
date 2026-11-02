@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::irq::{InterruptController, IrqLine};
 use crate::dev::crime_mem::O2Memory;
-use crate::pci::{bar_runs, plug, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
+use crate::pci::{bar_runs, plug, BarAt, BarRun, IntxTable, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
 use crate::snapshot::{get_field, hex_u32, load_u32_slice, toml_u32, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_OK};
 use crate::ip32::*;
@@ -48,48 +48,8 @@ fn crime_input(slot: u8, pin: u8) -> Option<u32> {
 }
 
 /// Bus 0 has 32 device numbers, each with four interrupt pins.
-const PCI_PINS: usize = 32 * 4;
-
-/// The bridge's interrupt router. Each slot's INTA..INTD is a line
-/// (`slot * 4 + pin - 1`); the router keeps every pin's level and drives
-/// each system input it routes to with the OR of the pins routed there, so
-/// on a shared input one function cannot clear another's interrupt.
-struct PciIrqRouter {
-    /// Where the system inputs are: CRIME.
-    intc: Arc<dyn InterruptController>,
-    /// Slot and pin (1 = INTA) to system input.
-    route: fn(u8, u8) -> Option<u32>,
-    levels: Mutex<[bool; PCI_PINS]>,
-}
-
-impl PciIrqRouter {
-    fn line(slot: u8, pin: u8) -> u32 {
-        slot as u32 * 4 + (pin as u32 - 1)
-    }
-
-    fn slot_pin(line: u32) -> (u8, u8) {
-        ((line / 4) as u8, (line % 4) as u8 + 1)
-    }
-}
-
-impl InterruptController for PciIrqRouter {
-    fn set_line(&self, line: u32, level: bool) {
-        if line as usize >= PCI_PINS {
-            return;
-        }
-        let (slot, pin) = Self::slot_pin(line);
-        let Some(input) = (self.route)(slot, pin) else { return };
-        // The lock is held while CRIME is driven, so two pins sharing an
-        // input cannot reach it out of order.
-        let mut levels = self.levels.lock().unwrap();
-        levels[line as usize] = level;
-        let any = (0..PCI_PINS as u32).any(|l| {
-            let (s, p) = Self::slot_pin(l);
-            levels[l as usize] && (self.route)(s, p) == Some(input)
-        });
-        self.intc.set_line(input, any);
-    }
-}
+const PCI_SLOTS: usize = 32;
+const PCI_PINS: usize = PCI_SLOTS * 4;
 
 /// The CPU-side window onto PCI memory, and the PCI address it starts at.
 ///
@@ -261,7 +221,7 @@ pub struct MacePci {
     windows: [AtomicU64; MAX_WINDOWS],
     nwindows: AtomicUsize,
     /// The slots' interrupt pins, routed to CRIME.
-    irq: Arc<PciIrqRouter>,
+    irq: Arc<IntxTable>,
     /// Host memory, for the functions that master the bus.
     dma: Arc<HostMemory>,
     /// Where the runs of the windows a BAR decodes whole go (the machine
@@ -278,6 +238,12 @@ impl MacePci {
     /// A bridge with its own routing of slot pins (1 = INTA) to `intc`'s
     /// inputs.
     fn with_routing(intc: Arc<dyn InterruptController>, route: fn(u8, u8) -> Option<u32>, ram: Arc<O2Memory>) -> Self {
+        let irq = IntxTable::new(intc, PCI_SLOTS);
+        for slot in 0..PCI_SLOTS as u8 {
+            for pin in 1..=4 {
+                irq.route(slot, pin, route(slot, pin));
+            }
+        }
         Self {
             config_addr: Mutex::new(0),
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
@@ -286,7 +252,7 @@ impl MacePci {
             funcs: std::array::from_fn(|_| OnceLock::new()),
             windows: std::array::from_fn(|_| AtomicU64::new(0)),
             nwindows: AtomicUsize::new(0),
-            irq: Arc::new(PciIrqRouter { intc, route, levels: Mutex::new([false; PCI_PINS]) }),
+            irq: Arc::new(irq),
             dma: Arc::new(HostMemory::new(ram)),
             bar_sink: RwLock::new(None),
             bar_entries: Mutex::new(Default::default()),
@@ -296,7 +262,7 @@ impl MacePci {
     /// Put a function in a slot on bus 0, wire its interrupt pin to the
     /// bridge, which routes it on, and give it host memory to master.
     pub fn attach(&self, slot: u8, name: &'static str, dev: Arc<dyn PciBusDevice>) {
-        plug(&*dev, self.dma.clone(), |pin| IrqLine::new(self.irq.clone(), PciIrqRouter::line(slot, pin)));
+        plug(&*dev, self.dma.clone(), |pin| IrqLine::new(self.irq.clone(), IntxTable::line(slot, pin)));
         assert!(self.funcs[slot as usize].set(dev.clone()).is_ok(), "pci: slot {slot} is taken");
         let mut slots = self.slots.lock().unwrap();
         slots.insert(slot, Arc::new(Slot { name, dev, touched: Mutex::new(Vec::new()) }));
@@ -575,7 +541,7 @@ impl Saveable for MacePci {
         let mut t = toml::map::Map::new();
         t.insert("config_addr".into(), hex_u32(*self.config_addr.lock().unwrap()));
         t.insert("regs".into(), u32_slice_to_toml(&*self.regs.lock().unwrap()));
-        let levels = *self.irq.levels.lock().unwrap();
+        let levels = self.irq.levels();
         t.insert("pins".into(), toml::Value::Array(levels.iter().map(|&b| toml::Value::Boolean(b)).collect()));
         let mut slots = toml::map::Map::new();
         for (n, s) in self.slots.lock().unwrap().iter() {
@@ -637,7 +603,7 @@ impl crate::traits::Device for MacePci {
                     let bars: Vec<String> = (0..6).map(|i| c.bar_base(i)).filter(|&b| b != 0).map(|b| format!("{b:#x}")).collect();
                     let irq = match c.interrupt_pin() {
                         0 => "no interrupt".to_string(),
-                        p => match (self.irq.route)(*slot, p) {
+                        p => match self.irq.input(*slot, p) {
                             Some(l) => format!("INT{} to CRIME {l}", (b'A' + p - 1) as char),
                             None => format!("INT{} unrouted", (b'A' + p - 1) as char),
                         },
@@ -855,5 +821,26 @@ mod tests {
         assert_eq!(last(), (12, true), "slot 4's INTB still holds it");
         lb.set(false);
         assert_eq!(last(), (12, false));
+    }
+
+    /// Both onboard SCSI controllers' INTA reach their own CRIME inputs, 8
+    /// and 9, and nothing else does.
+    #[test]
+    fn the_onboard_scsi_pins_reach_crime_8_and_9() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime.clone(), test_ram());
+        let fake = |pin| Arc::new(Fake {
+            cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1, [Bar::Unused; 6], pin),
+            last: Mutex::new(None),
+            irq: std::sync::OnceLock::new(),
+        });
+        let (a, b, c) = (fake(PCI_INTA), fake(PCI_INTA), fake(PCI_INTA + 1));
+        pci.attach(IP32_SCSI_SLOT, "a", a.clone());
+        pci.attach(IP32_SCSI_SLOT_B, "b", b.clone());
+        pci.attach(3, "c", c.clone());
+        a.irq.get().unwrap().set(true);
+        b.irq.get().unwrap().set(true);
+        c.irq.get().unwrap().set(true);
+        assert_eq!(*crime.0.lock().unwrap(), vec![(IP32_SCSI_CRIME_INT, true), (IP32_SCSI_CRIME_INT_B, true)]);
     }
 }
