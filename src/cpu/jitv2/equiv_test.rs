@@ -5542,6 +5542,53 @@ mod tests {
         }
     }
 
+    /// Quiet and signalling NaNs use the original MIPS encoding: the fraction
+    /// MSB set means signalling. The default NaN the FPU delivers (0x7FBFFFFF,
+    /// 0x7FF7FFFF_FFFFFFFF) is therefore quiet and takes the Unimplemented
+    /// path as an operand, while 0x7FC00000 / 0x7FF80000_00000000 is an
+    /// Invalid Operation. Compiled code must classify like the interpreter on
+    /// ADD, MUL, DIV, SQRT and the compare predicates.
+    #[test]
+    fn nan_operand_encoding_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FC_EQ, FUNCT_FC_LT, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSQRT, OP_COP1, RS_D, RS_S};
+        for (fmt, quiet, signalling) in [
+            (RS_S, 0x7FBF_FFFFu64, 0x7FC0_0000u64),
+            (RS_D, 0x7FF7_FFFF_FFFF_FFFF, 0x7FF8_0000_0000_0000),
+        ] {
+            let one = if fmt == RS_S { 0x3F80_0000u64 } else { 0x3FF0_0000_0000_0000 };
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV, FUNCT_FSQRT, FUNCT_FC_EQ, FUNCT_FC_LT] {
+                for fcsr in [0u32, 0x0800] {
+                    for (nan, other) in [(quiet, one), (one, quiet), (signalling, one), (one, signalling)] {
+                        // SQRT reads fs only.
+                        if funct == FUNCT_FSQRT && nan == one {
+                            continue;
+                        }
+                        let mut fpr = [0u64; 32];
+                        fpr[1] = nan;
+                        fpr[2] = other;
+                        fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                        let jit = assert_fpu_matches_interpreter_fcsr(
+                            make_r(OP_COP1, fmt, 2, 1, 3, funct), [0u64; 32], fpr, true, Some(fcsr));
+                        let sig = nan == signalling || other == signalling;
+                        let cause = jit.fpu_fcsr & 0x0003_F000;
+                        let what = format!("fmt={fmt} funct={funct:#x} fcsr={fcsr:#x} nan={nan:#x} other={other:#x}");
+                        if funct == FUNCT_FC_EQ || funct == FUNCT_FC_LT {
+                            // Compare never takes Unimplemented. A signalling
+                            // NaN is Invalid on every predicate; a quiet one
+                            // only on the signalling predicates, such as LT.
+                            let invalid = sig || funct == FUNCT_FC_LT;
+                            assert_eq!(cause, if invalid { 0x0001_0000 } else { 0 }, "{what}");
+                        } else if sig {
+                            assert_eq!(cause, 0x0001_0000, "{what}: Invalid alone");
+                        } else {
+                            assert_eq!(cause, 0x0002_0000, "{what}: Unimplemented alone");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// ADD/SUB/MUL/DIV on operands whose results reach the top of the
     /// range (±MAX, ±infinity, NaN), in every rounding mode, trapped and
     /// untrapped: the JIT's cold classifier call must agree with the
@@ -5707,9 +5754,9 @@ mod tests {
         const FS: u32 = 0x0100_0000;
         // zero, -zero, denormal, quiet NaN, signalling NaN, one, -one,
         // smallest normal, half
-        let s = [0u64, 0x8000_0000, 1, 0x7FC0_0000, 0x7FA0_0000, 0x3F80_0000, 0xBF80_0000, 0x0080_0000, 0x3F00_0000];
+        let s = [0u64, 0x8000_0000, 1, 0x7FA0_0000, 0x7FC0_0000, 0x3F80_0000, 0xBF80_0000, 0x0080_0000, 0x3F00_0000];
         let d = [
-            0u64, 1 << 63, 1, 0x7FF8_0000_0000_0000, 0x7FF4_0000_0000_0000, 0x3FF0_0000_0000_0000,
+            0u64, 1 << 63, 1, 0x7FF4_0000_0000_0000, 0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000,
             0xBFF0_0000_0000_0000, 0x0010_0000_0000_0000, 0x3FE0_0000_0000_0000,
         ];
         let mut cases: Vec<(u32, u32, u64, u64, u32)> = Vec::new();
@@ -5847,10 +5894,11 @@ mod tests {
     }
 
     /// SQRT, RSQRT, the multiply-add family and CVT.S.D leave an Invalid
-    /// Operation's result as the default NaN, not the host's
-    /// (0xFFC00000 on x86, which has the sign set). The next instruction
-    /// must then see a quiet NaN and take Unimplemented (E) rather than
-    /// Invalid (V). Both engines, both formats.
+    /// Operation's result as the MIPS default NaN, not the host's
+    /// (0xFFC00000 on x86, which is a signalling NaN under the MIPS
+    /// encoding). The next instruction must then see a quiet NaN and take
+    /// Unimplemented (E) rather than Invalid (V). Both engines, both
+    /// formats.
     #[test]
     fn invalid_result_is_the_default_nan_and_reads_as_quiet() {
         use crate::cpu::mips_isa::{
@@ -5858,17 +5906,17 @@ mod tests {
             FUNCT_MADD_S, FUNCT_MSUB_D, FUNCT_MSUB_S, FUNCT_NMADD_D, FUNCT_NMADD_S, FUNCT_NMSUB_D,
             FUNCT_NMSUB_S, OP_COP1, OP_COP1X, RS_D, RS_S,
         };
-        const NAN_S: u64 = 0x7FC0_0000;
-        const NAN_D: u64 = 0x7FF8_0000_0000_0000;
+        const NAN_S: u64 = 0x7FBF_FFFF;
+        const NAN_D: u64 = 0x7FF7_FFFF_FFFF_FFFF;
         // f1 = -1, f2 = infinity, f4 = zero, f6 = 1.0, f7 = a signalling
-        // NaN (quiet bit clear), by format.
+        // NaN (quiet bit set, the MIPS encoding), by format.
         let single = |f: &mut [u64; 32]| {
             f[1] = 0xBF80_0000; f[2] = 0x7F80_0000; f[4] = 0; f[6] = 0x3F80_0000;
-            f[7] = 0x7FA0_0000;
+            f[7] = 0x7FC0_0000;
         };
         let double = |f: &mut [u64; 32]| {
             f[1] = 0xBFF0_0000_0000_0000; f[2] = 0x7FF0_0000_0000_0000; f[4] = 0;
-            f[6] = 0x3FF0_0000_0000_0000; f[7] = 0x7FF4_0000_0000_0000;
+            f[6] = 0x3FF0_0000_0000_0000; f[7] = 0x7FF8_0000_0000_0000;
         };
         // (producer, double result, FPRs); every producer writes f3.
         let mut cases: Vec<(u32, bool, [u64; 32])> = Vec::new();

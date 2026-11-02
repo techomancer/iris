@@ -2744,14 +2744,15 @@ mod tests {
     }
 
     /// Same rule for a quiet NaN operand — the surprising half of the table:
-    /// an R4400/R5000 does not propagate NaN through ADD in hardware.
+    /// an R4400/R5000 does not propagate NaN through ADD in hardware. The
+    /// MIPS encoding has a quiet NaN with the fraction MSB clear.
     #[test]
     fn test_fpu_qnan_operand_is_unimplemented() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
-        exec.core.write_fpr_w(1, 0x7FC0_0000); // quiet NaN
+        exec.core.write_fpr_w(1, 0x7FA0_0000); // quiet NaN
         exec.core.write_fpr_s(2, 1.0);
         exec.core.write_fpr_w(0, 0x5a5a5a5a);
 
@@ -2760,6 +2761,87 @@ mod tests {
         assert!(s & EXEC_IS_EXCEPTION != 0, "qNaN operand must trap");
         assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
         assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
+    }
+
+    /// The default NaN an untrapped Invalid Operation delivers (0x7FBFFFFF,
+    /// 0x7FF7FFFF_FFFFFFFF) is a quiet NaN in the MIPS encoding, so used as an
+    /// operand it is not an Invalid Operation. It takes the quiet-NaN path
+    /// (Unimplemented Operation), the same as any other quiet NaN. Under
+    /// IEEE 754-2008 the fraction MSB set means quiet, which would make this
+    /// pattern signalling.
+    #[test]
+    fn test_fpu_default_nan_operand_is_not_invalid() {
+        for (is_d, nan) in [(false, 0x7FBF_FFFFu64), (true, 0x7FF7_FFFF_FFFF_FFFFu64)] {
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV] {
+                let (mut exec, _) = create_executor();
+                exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+                exec.update_fpr_mode();
+
+                let fmt = if is_d { RS_D } else { RS_S };
+                if is_d {
+                    exec.core.write_fpr_d(1, f64::from_bits(nan));
+                    exec.core.write_fpr_d(2, 1.0);
+                    exec.core.write_fpr_d(0, f64::from_bits(0x5a5a_5a5a_5a5a_5a5a));
+                } else {
+                    exec.core.write_fpr_w(1, nan as u32);
+                    exec.core.write_fpr_s(2, 1.0);
+                    exec.core.write_fpr_w(0, 0x5a5a_5a5a);
+                }
+                let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                let fcsr = exec.core.read_fpu_control(31);
+                let what = format!("is_d={is_d} funct={funct:#x}");
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{what}: quiet NaN operand traps");
+                assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{what}");
+                assert_eq!(fcsr & 0x0002_0000, 0x0002_0000, "{what}: Cause.E");
+                assert_eq!(fcsr & 0x0001_0000, 0, "{what}: no Cause.V");
+                assert_eq!(fcsr & 0x40, 0, "{what}: no Flag.V");
+            }
+        }
+    }
+
+    /// A signalling NaN (fraction MSB set, MIPS encoding) operand is an
+    /// Invalid Operation, not Unimplemented: untrapped it sets Cause.V and
+    /// Flag.V and completes. cpu-tests `fpu/qnan_operand` measures this on an
+    /// R4400 with 0x7FC00000.
+    #[test]
+    fn test_fpu_snan_operand_is_invalid() {
+        for (is_d, nan) in [(false, 0x7FC0_0000u64), (true, 0x7FF8_0000_0000_0000u64),
+                            (false, 0x7FFF_FFFFu64), (true, 0xFFF8_0000_0000_0001u64)] {
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV] {
+                let (mut exec, _) = create_executor();
+                exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+                exec.update_fpr_mode();
+
+                let fmt = if is_d { RS_D } else { RS_S };
+                if is_d {
+                    exec.core.write_fpr_d(1, f64::from_bits(nan));
+                    exec.core.write_fpr_d(2, 1.0);
+                } else {
+                    exec.core.write_fpr_w(1, nan as u32);
+                    exec.core.write_fpr_s(2, 1.0);
+                }
+                let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                let fcsr = exec.core.read_fpu_control(31);
+                let what = format!("is_d={is_d} nan={nan:#x} funct={funct:#x}");
+                assert!(s & EXEC_IS_EXCEPTION == 0, "{what}: untrapped Invalid completes");
+                assert_eq!(fcsr & 0x0001_f000, 0x0001_0000, "{what}: Cause is V alone");
+                assert_eq!(fcsr & 0x7c, 0x40, "{what}: Flag is V alone");
+            }
+        }
+
+        // With the Invalid enable set it traps, Cause.V, destination untouched.
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        exec.core.fpu_fcsr = 0x0000_0800;
+        exec.core.write_fpr_w(1, 0x7FC0_0000);
+        exec.core.write_fpr_s(2, 1.0);
+        exec.core.write_fpr_w(0, 0x5a5a_5a5a);
+        let s = exec.exec(make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FADD));
+        assert!(s & EXEC_IS_EXCEPTION != 0, "enabled Invalid traps");
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+        assert_eq!(exec.core.read_fpu_control(31) & 0x0001_f000, 0x0001_0000, "Cause is V alone");
+        assert_eq!(exec.core.read_fpr_w(0), 0x5a5a_5a5a, "destination untouched on trap");
     }
 
     /// Denormalized result, FS clear: Unimplemented Operation, destination
@@ -3001,8 +3083,8 @@ mod tests {
     /// Invalid operations: infinity minus infinity, zero times infinity,
     /// 0/0 and infinity/infinity (VR5000 manual U11761EJ6V0UM, 9.4.2, the
     /// MIPS IV list). Untrapped, Cause.V and Flag.V are set and the result
-    /// is the default quiet NaN, 0x7FC00000 / 0x7FF80000_00000000 (MIPS64
-    /// Volume I, Table 6.3, IEEE 754-2008 column). 0/0 is not a divide by
+    /// is the default quiet NaN, 0x7FBFFFFF / 0x7FF7FFFF_FFFFFFFF (MIPS64
+    /// Volume I, Table 6.3, original NaN encoding). 0/0 is not a divide by
     /// zero: Z needs a finite nonzero dividend (9.4.3).
     #[test]
     fn test_fpu_invalid_operation_untrapped() {
@@ -3026,7 +3108,7 @@ mod tests {
         for (fmt, funct, a, b) in cases {
             let (s, r, fcsr) = fpu_top_case(fmt, funct, a, b, 0);
             assert_eq!(s, EXEC_COMPLETE, "fmt={fmt} funct={funct}");
-            let want = if fmt == RS_S { 0x7FC0_0000 } else { 0x7FF8_0000_0000_0000 };
+            let want = if fmt == RS_S { 0x7FBF_FFFF } else { 0x7FF7_FFFF_FFFF_FFFF };
             assert_eq!(r, want, "default NaN, fmt={fmt} funct={funct}");
             assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "fmt={fmt} funct={funct}");
         }
@@ -3045,12 +3127,12 @@ mod tests {
     #[test]
     fn test_fpu_default_nan_result_reused_as_operand() {
         for (fmt, snan, one) in [
-            (RS_S, 0x7FA0_0000u64, 1.0f32.to_bits() as u64),
-            (RS_D, 0x7FF4_0000_0000_0000, 1.0f64.to_bits()),
+            (RS_S, 0x7FC0_0000u64, 1.0f32.to_bits() as u64),
+            (RS_D, 0x7FF8_0000_0000_0000, 1.0f64.to_bits()),
         ] {
             let (s, default_nan, fcsr) = fpu_top_case(fmt, FUNCT_FADD, snan, one, 0);
             assert_eq!(s, EXEC_COMPLETE, "fmt={fmt}");
-            let want = if fmt == RS_S { 0x7FC0_0000 } else { 0x7FF8_0000_0000_0000 };
+            let want = if fmt == RS_S { 0x7FBF_FFFF } else { 0x7FF7_FFFF_FFFF_FFFF };
             assert_eq!(default_nan, want, "sNaN operand delivers the default NaN, fmt={fmt}");
             assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "fmt={fmt}");
 
@@ -3196,8 +3278,8 @@ mod tests {
 
     /// Instructions whose invalid result does not come through the plain
     /// arithmetic path: SQRT and RSQRT of -1, every multiply-add on
-    /// infinity times zero, and CVT.S.D of a signalling NaN (quiet bit
-    /// clear). Each entry is (instruction, source is double,
+    /// infinity times zero, and CVT.S.D of a signalling NaN (quiet bit set,
+    /// the MIPS encoding). Each entry is (instruction, source is double,
     /// f1, f2, f4, result is double); f2 is zero, f4 is 1.0.
     fn fpu_invalid_producers() -> Vec<(u32, bool, u64, u64, u64, bool)> {
         let mut v = Vec::new();
@@ -3219,20 +3301,20 @@ mod tests {
                 v.push((make_cop1x(4, 2, 1, 0, funct), d, inf, zero, one, d));
             }
         }
-        v.push((make_cop1_compute(RS_D, 0, 1, 0, FUNCT_FCVT_S), true, 0x7FF4_0000_0000_0000, 0, 0, false));
+        v.push((make_cop1_compute(RS_D, 0, 1, 0, FUNCT_FCVT_S), true, 0x7FF8_0000_0000_0000, 0, 0, false));
         v
     }
 
     /// SQRT, RSQRT, the multiply-add family and CVT.S.D give the default
     /// quiet NaN with Cause.V and Flag.V for an invalid operation (VR5000
     /// manual U11761EJ6V0UM, 9.4.2; MIPS64 Volume I, Table 6.3), not the
-    /// host's NaN (0xFFC00000 on x86, a quiet NaN with the sign set).
+    /// host's NaN, which is a signalling NaN under the MIPS encoding.
     #[test]
     fn test_fpu_invalid_unary_and_madd_untrapped() {
         for (instr, dbl, a, b, c, dbl_result) in fpu_invalid_producers() {
             let (s, r, fcsr) = fpu_instr_case(instr, dbl, a, b, c, 0, dbl_result);
             assert_eq!(s, EXEC_COMPLETE, "instr={instr:#010x}");
-            let want = if dbl_result { 0x7FF8_0000_0000_0000u64 } else { 0x7FC0_0000 };
+            let want = if dbl_result { 0x7FF7_FFFF_FFFF_FFFFu64 } else { 0x7FBF_FFFF };
             assert_eq!(r, want, "default NaN, instr={instr:#010x}");
             assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "instr={instr:#010x}");
         }

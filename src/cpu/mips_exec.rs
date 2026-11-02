@@ -132,11 +132,16 @@ const FCSR_IM: u32 = 0x00000080;  // Enable: inexact
 const FCSR_FS: u32 = 0x01000000;  // Flush denormalized results to zero
 
 /// True if `bits` (an IEEE-754 single-precision pattern) is a signalling NaN:
-/// exponent all-1s, mantissa nonzero, and the mantissa's MSB (the "is quiet"
-/// bit) clear. A quiet NaN has that bit set.
+/// exponent all-1s, mantissa nonzero, and the mantissa's MSB set. This is the
+/// original MIPS NaN encoding that the R4400, R5000 and R10000 use (MIPS64
+/// Volume I, Table 6.2), the reverse of IEEE 754-2008: a quiet NaN has that bit
+/// clear, which is why the default NaN is 0x7FBFFFFF and not 0x7FC00000. The
+/// R4400's behaviour is pinned by cpu-tests `fpu/qnan_operand`.
 #[inline]
 fn is_snan_s(bits: u32) -> bool {
-    (bits & 0x7F80_0000) == 0x7F80_0000 && (bits & 0x007F_FFFF) != 0 && (bits & 0x0040_0000) == 0
+    // Exponent all ones and the fraction MSB set; the MSB makes the fraction
+    // nonzero, so that is the whole test.
+    (bits & 0x7FC0_0000) == 0x7FC0_0000
 }
 
 /// Negate by flipping the sign bit, which is what IEEE-754 negation *is*.
@@ -176,9 +181,7 @@ fn fneg_d_exact(v: f64) -> f64 {
 /// Same as `is_snan_s`, for IEEE-754 double-precision bit patterns.
 #[inline]
 fn is_snan_d(bits: u64) -> bool {
-    (bits & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000
-        && (bits & 0x000F_FFFF_FFFF_FFFF) != 0
-        && (bits & 0x0008_0000_0000_0000) == 0
+    (bits & 0x7FF8_0000_0000_0000) == 0x7FF8_0000_0000_0000
 }
 
 /// True if `bits` is a quiet NaN (any NaN that is not a signalling NaN).
@@ -193,10 +196,11 @@ fn is_qnan_d(bits: u64) -> bool {
     f64::from_bits(bits).is_nan() && !is_snan_d(bits)
 }
 
-/// The quiet NaN delivered for an untrapped Invalid Operation: the IEEE
-/// 754-2008 default NaN, quiet bit set and nothing else.
-const FPU_DEFAULT_NAN_S: u32 = 0x7FC0_0000;
-const FPU_DEFAULT_NAN_D: u64 = 0x7FF8_0000_0000_0000;
+/// The quiet NaN an R10000 delivers for an untrapped Invalid Operation:
+/// MIPS64 Volume I, Table 6.3 ("Value Supplied When a New Quiet NaN Is
+/// Created"), the column for the original MIPS NaN encoding the R10000 uses.
+const FPU_DEFAULT_NAN_S: u32 = 0x7FBF_FFFF;
+const FPU_DEFAULT_NAN_D: u64 = 0x7FF7_FFFF_FFFF_FFFF;
 
 /// SQRT, RECIP, RSQRT and the multiply-add family have no top-of-range
 /// classifier like ADD/SUB/MUL/DIV, but the host NaN they produce for an
@@ -2319,7 +2323,7 @@ fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
     }
     // A NaN source never takes the path above (it is not equal to itself),
     // so the signalling test costs an ordinary conversion nothing. A
-    // signalling NaN is an Invalid Operation: V, and the default NaN
+    // signalling NaN is an Invalid Operation: V, and the MIPS default NaN
     // rather than the host's. A quiet NaN converts as before.
     if is_snan_d(src.to_bits()) {
         core.fpu_fcsr |= FCSR_CV;
@@ -7971,11 +7975,20 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// itself must end the instruction, `None` to proceed to computation.
     #[inline]
     fn fpu_check_denorm_operand_s(&mut self, bits: u32) -> Option<ExecStatus> {
+        // One exponent test settles an ordinary number, the common case.
+        let e = bits & 0x7F80_0000;
+        if e != 0 && e != 0x7F80_0000 {
+            return None;
+        }
         let v = f32::from_bits(bits);
         (v.is_subnormal() || is_qnan_s(bits)).then(|| self.fpu_unimplemented())
     }
     #[inline]
     fn fpu_check_denorm_operand_d(&mut self, bits: u64) -> Option<ExecStatus> {
+        let e = bits & 0x7FF0_0000_0000_0000;
+        if e != 0 && e != 0x7FF0_0000_0000_0000 {
+            return None;
+        }
         let v = f64::from_bits(bits);
         (v.is_subnormal() || is_qnan_d(bits)).then(|| self.fpu_unimplemented())
     }
