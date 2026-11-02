@@ -11,6 +11,7 @@
 //! meanwhile lives in the host interface.
 
 
+use crate::devlog::LogModule;
 use super::board::Board;
 use super::fifo::Run;
 use super::mmio::BoardLocks;
