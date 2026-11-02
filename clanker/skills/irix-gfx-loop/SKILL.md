@@ -29,6 +29,7 @@ shutdown), `debug.md` (every monitor command) and the board's notes in
 | Newport (REX3) | `[graphics] board = "newport"` (Indy, Indigo2 IP22) | `rex`, plus `vc2`, `xmap`, `cmap`, `bt445`, `disp` | register-level REX3 (`src/dev/ng1/`), optional `rex-jit` |
 | GR2 XZ / Extreme | `board = "xz"` or `"extreme"` (Extreme on IP22 only) | `gr2`, `re3` | HQ2 command HLE + RE3 raster (`src/dev/gr2/`), optional `gr2-jit` |
 | IMPACT (MGRAS) | `board = "solidimpact"`, `"highimpact"`, `"maximpact"` (IP28) | `mgras`, `rss` | HQ3/GE HLE + RSS raster (`src/dev/mgras/`), optional `gr4-jit` |
+| O2 (CRIME RE, GBE) | `[machine] profile = "o2_ip32"` (the board is built in) | `re`, `gbe`, `crime`, `o2` | register-level engine on its own thread, memory through the tile TLBs (`src/dev/o2gfx.rs`) |
 
 On IMPACT, `[machine] profile = "indigo2_ip28"` and `cpu = "r10000"` (see
 `docs/indigo2-ip28.md`). GR2 and IMPACT need one head and
@@ -139,6 +140,12 @@ images (see `draw_scene` in glprim.c).
 - **GR2**: `HQ exec` lines are the HLE's view: `VERTEX (...) -> window
   (...)`, `GL triangle ...`, `GL_CLEAR ... rect`. Unknown tokens show as
   `tokNNN` / `(N words, not implemented)` with their modifier bits decoded.
+- **O2**: `re trace FILE [re,cpu,gbe,crime,irq|all]` shares one file between
+  the engine, GBE and CRIME. `RE` lines are interface buffer entries; a start
+  decodes the whole primitive (vertices, offset, draw mode, buffer mode, colour).
+  `o2 pixel X Y` decodes a pixel on screen (raw word, DID, WID, type, gamma).
+  Headless boots take the serial console (no keyboard), so X never starts: run
+  with a window or VNC for desktop work.
 - **IMPACT**: `mgras trace FILE hq,rss,cpu,tex`; `rss regs` decodes the IR
   and shows each raster engine's backlog; `mgras stats` counts commands and
   DMAs; `locks` shows who holds what if the board seems stuck.
@@ -153,6 +160,7 @@ emulator behaviour and gotchas go in `clanker/<board>/`.
 |---|---|---|
 | REX3 | `rex rec FILE` ... `rex rec off` (`rex rec mark` adds a checkpoint) | `REX3_REPLAY=FILE cargo test --release rex3_replay_file -- --nocapture` (`REX3_REPLAY_ENGINE=interp\|jit`, `REX3_REPLAY_NOCHECK`) |
 | GR2 | `gr2 trace` of the case, cut to the HQ2 FIFO writes from the window setup (`0x1e5`) to the `GL_FINISH` after the draw | `GR2_REPLAY=FILE cargo test --release --lib gr2_replay_file -- --ignored` (`GR2_REPLAY_OUT`); pinned cases use `replay_trace()` in `src/dev/gr2/hq2_tests.rs` |
+| O2 | `re rec FILE` ... `re rec off` (registers and engine writes; textures and pixmaps come from `o2 peek` and `RE_REPLAY_PRELOAD`) | `RE_REPLAY=FILE RE_REPLAY_PNG=out.png cargo test --release --lib replay_a_recorded_trace -- --ignored --nocapture` (`RE_REPLAY_HALF=lo\|hi` for a double-pix window; the replay has 256 MB, so tiles above that in a larger guest draw nothing) |
 | IMPACT | `mgras rec FILE` ... `mgras rec off` | `MGRAS_REPLAY=FILE cargo test --release --lib --features gr4-jit mgras_replay_file -- --nocapture` (`MGRAS_REPLAY_BOARD=high\|max`, `MGRAS_REPLAY_NOCHECK=1`) |
 
 `tools/rex3-rec.py` and `tools/mgras-rec.py` inspect and slice recordings.

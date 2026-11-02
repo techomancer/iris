@@ -1815,7 +1815,8 @@ gets (BufMode 0x226/0x227: A1R5G5B5 halves): Quake 2 lightmaps every wall
 by multiplying the frame buffer (blend 0x2), and at 5 bits a channel the
 result fell into flat bands. Triangles into those windows now dither with
 a 4 x 4 ordered (Bayer) matrix (`CrimeRe::dither5`); CRIME's own matrix is
-not in the spec.
+not in the spec. See `o2-icon-backdrop-crosshatch.md` for what this does to
+the desktop's icons.
 
 ## Blending and the alpha test (2026-10-19)
 

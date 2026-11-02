@@ -149,6 +149,23 @@ pub static GR2_WAIT: EventDef = EventDef::new("guest read stalled", cat::GFX).on
 pub static GR2_FIFO_FULL: EventDef = EventDef::new("fifo full", cat::GFX).on_track("GR2 fifo full").in_group(GFX_GROUP);
 pub static GR2_VBLANK: EventDef = EventDef::new("vblank", cat::GFX).on_track("GR2 display").in_group(GFX_GROUP);
 
+// ── O2 (CRIME RE, GBE) ──────────────────────────────────────────────────────
+
+/// A pixel pipe primitive on the engine's thread (arg: primitives so far).
+pub static RE_PRIM: EventDef = EventDef::new("RE primitive", cat::PRIM).with_arg("n");
+/// A memory transfer on the engine's thread (arg: primitives so far).
+pub static RE_MTE: EventDef = EventDef::new("RE MTE", cat::PRIM).with_arg("n");
+/// The engine has work (from first entry to empty interface buffer).
+pub static RE_BUSY: EventDef = EventDef::new("CRIME RE busy", cat::GFX);
+/// The CPU found the interface buffer full.
+pub static RE_IB_FULL: EventDef = EventDef::new("interface buffer full", cat::GFX).on_track("RE ib full").in_group(GFX_GROUP);
+/// Interface buffer entries queued, as seen after each CPU write.
+pub static RE_IB_LEVEL: EventDef = EventDef::new("RE ib level", cat::GFX).in_group(GFX_GROUP);
+/// A vertical-timing interrupt (arg: which of the four).
+pub static GBE_VT_INTR: EventDef = EventDef::new("timing interrupt", cat::GFX).on_track("GBE display").in_group(GFX_GROUP).with_arg("n");
+/// A DMA control shadow copied into its live register at blanking.
+pub static GBE_LATCH: EventDef = EventDef::new("shadow latched", cat::GFX).on_track("GBE display").in_group(GFX_GROUP).with_arg("val");
+
 // ── IMPACT (MGRAS) ───────────────────────────────────────────────────────────
 
 /// A read that needs the board idle is being retried.
