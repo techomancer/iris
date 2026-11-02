@@ -437,7 +437,6 @@ impl OctaneMachine {
                 let stats = g.stats.clone();
                 g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
             }
-            std::mem::forget(cpu_device);
         }
 
         // HEART's levels 0 to 4 are each CPU's IP2 to IP6.
@@ -975,6 +974,9 @@ impl Drop for OctaneMachine {
         self.stop_devices();
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
+        // The bus holds the devices, and the Bridge and IMPACT hold its
+        // memory, which owns the bus: let go, or none of it is freed.
+        self.phys.phys.release_devices();
     }
 }
 
@@ -1222,6 +1224,24 @@ mod tests {
         assert_eq!(prom_revision(b"no banner here"), None);
         assert!((4, 3) < vpro_prom_needed(crate::config::GraphicsBoard::V12));
         assert!((4, 3) >= vpro_prom_needed(crate::config::GraphicsBoard::V6));
+    }
+
+    /// A dropped Octane frees its bus and with it the decode table: a
+    /// process may have only a few dozen tables, and a test binary builds
+    /// many machines.
+    #[test]
+    fn a_dropped_octane_frees_its_decode_table() {
+        use crate::config::{GraphicsBoard, MachineProfile};
+        use crate::display_stop_tests::{big_stack, config, scratch};
+        let dir = scratch("octane-drop");
+        for board in [GraphicsBoard::None, GraphicsBoard::SolidImpact] {
+            let cfg = config(&dir, MachineProfile::OctaneIp30, board);
+            let machine = big_stack(move || OctaneMachine::new(&cfg).expect("Octane"));
+            let phys = Arc::downgrade(&machine.phys.phys);
+            drop(machine);
+            assert_eq!(phys.strong_count(), 0, "{board:?}: the bus outlives its machine");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

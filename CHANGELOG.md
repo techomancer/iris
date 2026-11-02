@@ -28,6 +28,18 @@ hashes are given where a change is easiest to understand by reading the commit.
 - GL lines, points and rectangles into 16-bit double-buffered windows now
   dither as triangles do. `re dither on|off` compares renderings.
 
+### A dropped Octane frees its device table
+
+- A GUI Stop then Start on an Octane leaked the machine's physical bus and its
+  decode table, and a process may have 64 tables: a test binary building
+  Octanes one after another aborted at the 65th with "devmap: more than 64
+  tables alive". Three things held the bus: the lock registry, the Bridge and
+  IMPACT through HEART's DMA view, and, under `jitv2`, the compile workers.
+  The registry now holds a lock's owner weakly, so the `locks` monitor command
+  lists a dropped machine's entries as free; the machine's drop lets go of the
+  bus's devices; and a `Jitv2` joins its workers before it frees the pages
+  they read. The Indy, Indigo2 and O2 still leak their tables.
+
 ## October 2026
 
 ### Octane snapshots

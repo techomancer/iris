@@ -29,7 +29,7 @@ use crate::exp::eval_const_expr;
 use crate::cpu::mips_dis;
 use crate::dev::mem::{BlackHoleRegion, UnmappedRam};
 use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
-use crate::ppmem::devmap::{entry_eq, Entry, SparseDeviceMap, PHYS_MASK, SLOT_SHIFT};
+use crate::ppmem::devmap::{entry_eq, Entry, SparseDeviceMap, PHYS_MASK, SLOTS, SLOT_SHIFT};
 
 /// The RAM bank implementation: `PpMemory`, host-MMU-backed (see
 /// `docs/ppmem-design.md`). It is still a `BusDevice`, so DMA and every other
@@ -435,6 +435,21 @@ impl Physical {
             }
         }
         self.fill_range(base, end, dev);
+    }
+
+    /// Let go of the devices the bus keeps alive, for a machine's drop. A
+    /// device that does DMA holds the bus, or the memory the bus belongs
+    /// to, and the bus holds the device: without this neither is freed, nor
+    /// is the decode table, of which a process can have only a few dozen.
+    /// An access that still arrives gets a bus error, not a freed device.
+    pub fn release_devices(&self) {
+        let err: Entry = &self.error_bus;
+        *self.default.lock().unwrap() = Some(err);
+        self.devmap.set_default(err)
+            .unwrap_or_else(|e| panic!("physical: setting the default device: {e}"));
+        self.devmap.fill(0, SLOTS, err)
+            .unwrap_or_else(|e| panic!("physical: clearing the decode table: {e}"));
+        self.devices.lock().unwrap().clear();
     }
 
     /// `base..end` answers as this bus does at the address plus `offset`
