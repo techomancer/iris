@@ -71,7 +71,7 @@ use crate::cpu::cpu_monitor::CpuMonitor;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::smp::World;
 use crate::dev::bcm5701::{Bcm5701, Bcm5701Config};
-use crate::dev::bedrock_flash::FirmwareRecord;
+use crate::dev::bedrock_flash::{two_processor_environment, FirmwareRecord};
 use crate::dev::bedrock_io::{gfx_route, BedrockIo};
 use crate::dev::bedrock_mem::MemoryPopulation;
 use crate::dev::bedrock_pi::{BedrockPi, NodeHooks, Population};
@@ -693,6 +693,10 @@ impl TezroBoard {
             population: running,
             running,
             firmware: part.firmware(),
+            // The two-processor board's empty B and D positions start
+            // disabled, as the QEMU boot tests seed them; one and four
+            // processors leave no empty position the PROM recovers.
+            flash_records: if cpus == 2 { two_processor_environment() } else { Vec::new() },
             board_id: BOARD_ID,
             l1: L1Config {
                 type_code: 0x39,

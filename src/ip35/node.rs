@@ -232,6 +232,8 @@ pub(crate) struct NodeConfig<'a> {
     /// The fitted slots whose processor runs.
     pub running: Population,
     pub firmware: FirmwareRecord,
+    /// Environment records a fresh boot flash starts with, at their offsets.
+    pub flash_records: Vec<(usize, Vec<u8>)>,
     /// The word the board reads back at the Hub-special board-id window.
     pub board_id: u64,
     pub l1: L1Config,
@@ -265,7 +267,7 @@ impl Node {
     }
 
     pub fn build(config: NodeConfig<'_>) -> Result<Self, String> {
-        let NodeConfig { name, payload, clock, flash_path, banks_mib, population, running, firmware, board_id, l1 } = config;
+        let NodeConfig { name, payload, clock, flash_path, banks_mib, population, running, firmware, flash_records, board_id, l1 } = config;
         let md = BedrockMd::with_clock(banks_mib, clock.clone())?;
         let phys = md.physical().clone();
         let pi: [Arc<BedrockPi>; 2] = std::array::from_fn(|interface| {
@@ -281,8 +283,8 @@ impl Node {
         });
         let l1 = Arc::new(L1::new(l1)?);
         let flash = Arc::new(match flash_path {
-            Some(path) => Flash::with_file(payload, path, firmware),
-            None => Flash::new(payload, firmware),
+            Some(path) => Flash::with_file_seeded(payload, path, firmware, &flash_records),
+            None => Flash::seeded(payload, firmware, &flash_records),
         }.map_err(|e| e.to_string())?);
         let lb = Arc::new(BedrockLb::new(clock.clone()));
         let io = Arc::new(BedrockIo::new());
@@ -736,6 +738,7 @@ mod tests {
             population,
             running: Population::fitted_cpus(running).unwrap(),
             firmware: FirmwareRecord::TEZRO,
+            flash_records: Vec::new(),
             board_id: 0,
             l1: L1Config::default(),
         })

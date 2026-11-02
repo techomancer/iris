@@ -542,6 +542,7 @@ impl FuelBoard {
             population: Population::SINGLE,
             running: Population::SINGLE,
             firmware: FirmwareRecord::FUEL,
+            flash_records: Vec::new(),
             board_id: FUEL_BOARD_ID,
             l1: l1_config,
         })?;

@@ -828,3 +828,14 @@ fn the_cached_view_swaps_ram_above_4_gib() {
     assert_eq!(cached.cas64(at, 1, 3), Some(false));
     assert_eq!(cached.read64(at).data, 2);
 }
+
+/// Only the two-processor board's fresh flash marks its empty B and D
+/// positions disabled.
+#[test]
+fn only_the_two_processor_flash_starts_with_b_and_d_disabled() {
+    for (cpus, disabled) in [(1, false), (2, true), (4, false)] {
+        let bytes = TezroBoard::new(cpus).unwrap().node.flash.contents();
+        assert_eq!(&bytes[0x9e0101..0x9e0109] == b"DisableB", disabled, "{cpus} CPUs");
+        assert_eq!(&bytes[0x9e0141..0x9e0149] == b"DisableD", disabled, "{cpus} CPUs");
+    }
+}
