@@ -3657,6 +3657,8 @@ fn core_offset_of_fpu_cvt_to_int_fn() -> i32 { std::mem::offset_of!(MipsCore, fp
 fn core_offset_of_fpu_cvt_int_to_float_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_int_to_float_fn) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_fpu_cvt_d_to_s_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_d_to_s_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_binop_commit_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_binop_commit_fn) as i32 }
 fn core_offset_of_fpu_fir() -> i32 { std::mem::offset_of!(MipsCore, fpu_fir) as i32 }
 fn core_offset_of_fpu_fexr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fexr) as i32 }
 fn core_offset_of_fpu_fenr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fenr) as i32 }
@@ -5634,6 +5636,119 @@ fn emit_fpu_update_fcsr_arith(
     ctx.builder.seal_block(continue_block);
 }
 
+/// The NaN fix-up of `fpu_fix_invalid_s/d` (`mips_exec.rs`), for SQRT, RECIP,
+/// RSQRT and the multiply-add family, on a result already known to be an
+/// infinity or a NaN (`emit_commit_finite_first` sends only those here): a NaN
+/// result is Invalid when `flags` already has V (a signalling NaN operand) or
+/// when none of `ops` is a NaN, and then V is added and the default NaN
+/// replaces the host's. Straight-line selects, no branches, since it runs in
+/// a cold block. Returns the flags and result bits to use.
+fn emit_fix_invalid(ctx: &mut EmitCtx, is_d: bool, flags: Value, result_bits: Value, ops: &[Value]) -> (Value, Value) {
+    let (abs_mask, inf): (i64, i64) = if is_d {
+        (0x7FFF_FFFF_FFFF_FFFFu64 as i64, 0x7FF0_0000_0000_0000u64 as i64)
+    } else {
+        (0x7FFF_FFFF, 0x7F80_0000)
+    };
+    let is_nan = |ctx: &mut EmitCtx, v: Value| {
+        let abs = ctx.builder.ins().band_imm_s(v, abs_mask);
+        ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, abs, inf)
+    };
+    let result_is_nan = is_nan(ctx, result_bits);
+    let mut any_operand_nan = ctx.builder.ins().iconst(ir::types::I8, 0);
+    for &op in ops {
+        let n = is_nan(ctx, op);
+        any_operand_nan = ctx.builder.ins().bor(any_operand_nan, n);
+    }
+    let has_v = ctx.builder.ins().band_imm_s(flags, FCSR_FV_I64);
+    let has_v = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, has_v, 0);
+    let no_operand_nan = ctx.builder.ins().icmp_imm_s(IntCC::Equal, any_operand_nan, 0);
+    let invalid = ctx.builder.ins().bor(has_v, no_operand_nan);
+    let fix = ctx.builder.ins().band(result_is_nan, invalid);
+    let flags_v = ctx.builder.ins().bor_imm_s(flags, FCSR_FV_I64);
+    let new_flags = ctx.builder.ins().select(fix, flags_v, flags);
+    let default_nan = if is_d {
+        ctx.builder.ins().iconst(ir::types::I64, 0x7FF8_0000_0000_0000u64 as i64)
+    } else {
+        ctx.builder.ins().iconst(ir::types::I32, 0x7FC0_0000)
+    };
+    let new_bits = ctx.builder.ins().select(fix, default_nan, result_bits);
+    (new_flags, new_bits)
+}
+
+/// Commit the result of RECIP, RSQRT and the multiply-add family, mirroring `fpu_fix_invalid_s/d`: one
+/// compare of the result's magnitude (the high word for double, so no 64-bit
+/// immediate) tells a finite result from the rest, because a finite result
+/// means no operand was a NaN, no divisor was zero and no square-rooted
+/// operand was negative: nothing to flag, and the operand classification is
+/// not emitted on that path at all. A finite result with Cause already clear
+/// (the steady state, see `emit_fpu_update_fcsr_no_flags`) is a plain write
+/// behind one conditional branch, the one these operations already had for
+/// Cause: the two tests are combined without branching, so the finite check
+/// adds no branch to the ordinary path. Cold, an infinity or NaN evaluates
+/// `flags_fn`, applies `emit_fix_invalid` and does the full FCSR update, and
+/// a finite result with Cause set only clears it.
+fn emit_commit_finite_first(
+    ctx: &mut EmitCtx,
+    is_d: bool,
+    result_bits: Value,
+    ops: &[Value],
+    flags_fn: impl FnOnce(&mut EmitCtx) -> Value,
+    write_result: impl Fn(&mut EmitCtx, Value),
+) {
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    const FCSR_CM: i64 = 0x0001_f000;
+    let non_finite = if is_d {
+        let hi = ctx.builder.ins().ushr_imm_s(result_bits, 32);
+        let hi = ctx.builder.ins().ireduce(i32t, hi);
+        let hi = ctx.builder.ins().band_imm_s(hi, 0x7FFF_FFFF);
+        ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, hi, 0x7FF0_0000)
+    } else {
+        let abs = ctx.builder.ins().band_imm_s(result_bits, 0x7FFF_FFFF);
+        ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, abs, 0x7F80_0000)
+    };
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let cause = ctx.builder.ins().band_imm_s(fcsr, FCSR_CM);
+    let cause_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cause, 0);
+    let off_path = ctx.builder.ins().bor(non_finite, cause_set);
+    let fast_block = ctx.builder.create_block();
+    let cold_block = ctx.builder.create_block();
+    let full_block = ctx.builder.create_block();
+    let clear_block = ctx.builder.create_block();
+    let done_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(off_path, cold_block, &[], fast_block, &[]);
+
+    ctx.builder.switch_to_block(cold_block);
+    ctx.builder.set_cold_block(cold_block);
+    ctx.builder.seal_block(cold_block);
+    ctx.builder.ins().brif(non_finite, full_block, &[], clear_block, &[]);
+    ctx.builder.seal_block(full_block);
+    ctx.builder.seal_block(clear_block);
+
+    ctx.builder.switch_to_block(full_block);
+    ctx.builder.set_cold_block(full_block);
+    let flags = flags_fn(ctx);
+    let (flags, bits) = emit_fix_invalid(ctx, is_d, flags, result_bits, ops);
+    emit_fpu_update_fcsr(ctx, flags, |ctx| write_result(ctx, bits));
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(clear_block);
+    ctx.builder.set_cold_block(clear_block);
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    ctx.builder.ins().store(mem, cleared, ctx.core_ptr, fcsr_off);
+    write_result(ctx, result_bits);
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    write_result(ctx, result_bits);
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(done_block);
+    ctx.builder.seal_block(done_block);
+}
+
 /// IR counterparts of `mips_exec.rs`'s `fpu_arith_flags_*` free functions —
 /// same bit-pattern checks, no host FPU status read, feeding `flags` into
 /// `emit_fpu_update_fcsr`/`emit_fpu_update_fcsr_arith`. See
@@ -5710,14 +5825,23 @@ fn emit_fpu_arith_flags_snan_only3_d(ctx: &mut EmitCtx, fr_bits: Value, ft_bits:
 
 /// DIV (S or D), and RECIP/RSQRT, which pass a constant `1.0` as the
 /// dividend — mirrors `fpu_arith_flags_div_s/d`. Invalid takes priority over
-/// divide-by-zero, else Z when the divisor is zero.
+/// divide-by-zero, else Z when the divisor is zero and the dividend is a
+/// finite nonzero number.
 fn emit_fpu_arith_flags_div_s(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: Value) -> Value {
     let snan = emit_fpu_arith_flags_snan_only_s(ctx, fs_bits, ft_bits);
     let ft_zero = {
         let masked = ctx.builder.ins().band_imm_s(ft_bits, 0x7FFF_FFFF);
         ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
     };
-    let z_flag = ctx.builder.ins().uextend(ir::types::I32, ft_zero);
+    // Z needs a finite nonzero dividend: 0/0 is Invalid (found from its
+    // NaN result) and infinity/0 is an exact infinity.
+    let z = {
+        let dividend = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFF);
+        let minus_one = ctx.builder.ins().iadd_imm_s(dividend, -1);
+        let finite_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, minus_one, 0x7F80_0000 - 1);
+        ctx.builder.ins().band(ft_zero, finite_nonzero)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, z);
     let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
     let snan_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, snan, 0);
     ctx.builder.ins().select(snan_is_zero, z_flag, snan)
@@ -5728,7 +5852,15 @@ fn emit_fpu_arith_flags_div_d(ctx: &mut EmitCtx, fs_bits: Value, ft_bits: Value)
         let masked = ctx.builder.ins().band_imm_s(ft_bits, 0x7FFF_FFFF_FFFF_FFFFu64 as i64);
         ctx.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0)
     };
-    let z_flag = ctx.builder.ins().uextend(ir::types::I32, ft_zero);
+    // Z needs a finite nonzero dividend: 0/0 is Invalid (found from its
+    // NaN result) and infinity/0 is an exact infinity.
+    let z = {
+        let dividend = ctx.builder.ins().band_imm_s(fs_bits, 0x7FFF_FFFF_FFFF_FFFFu64 as i64);
+        let minus_one = ctx.builder.ins().iadd_imm_s(dividend, -1);
+        let finite_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, minus_one, (0x7FF0_0000_0000_0000u64 as i64) - 1);
+        ctx.builder.ins().band(ft_zero, finite_nonzero)
+    };
+    let z_flag = ctx.builder.ins().uextend(ir::types::I32, z);
     let z_flag = ctx.builder.ins().ishl_imm_s(z_flag, FCSR_FZ_I64.trailing_zeros() as i64);
     let snan_is_zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, snan, 0);
     ctx.builder.ins().select(snan_is_zero, z_flag, snan)
@@ -7686,38 +7818,30 @@ type SemanticsEmitter = fn(&mut EmitCtx);
 // bindings for readability.
 type Cp1Emitter = fn(&mut EmitCtx, fr_mode: FrMode);
 
-/// Result of a binary FP arithmetic op, in the current block: the raw result
-/// bits plus the two properties `emit_fpu_update_fcsr_arith` needs (whether
-/// the result is a denormalized nonzero, and whether its sign bit is set).
-/// Shared by both arms of `emit_fbinop_s`/`_d`'s operand split, so the
-/// arithmetic and its result checks cannot drift between them.
+/// Result bits of a binary FP arithmetic op, in the current block. Shared by
+/// the inline and the call-out arms of `emit_fbinop`, so the arithmetic
+/// cannot drift between them.
 fn emit_fbinop_result_s(
     ctx: &mut EmitCtx,
     op: fn(&mut FunctionBuilder, Value, Value) -> Value,
     fs_bits: Value,
     ft_bits: Value,
-) -> (Value, Value, Value) {
+) -> Value {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
     let result = op(ctx.builder, fs_val, ft_val);
-    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    let is_denorm = emit_is_subnormal_s(ctx, result_bits);
-    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
-    (result_bits, is_denorm, is_negative)
+    ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result)
 }
 fn emit_fbinop_result_d(
     ctx: &mut EmitCtx,
     op: fn(&mut FunctionBuilder, Value, Value) -> Value,
     fs_bits: Value,
     ft_bits: Value,
-) -> (Value, Value, Value) {
+) -> Value {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
     let result = op(ctx.builder, fs_val, ft_val);
-    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    let is_denorm = emit_is_subnormal_d(ctx, result_bits);
-    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
-    (result_bits, is_denorm, is_negative)
+    ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result)
 }
 
 /// Write the signed zero the Table 9-1/7-1 underflow-flush path delivers:
@@ -7738,137 +7862,169 @@ fn emit_write_signed_zero_d(ctx: &mut EmitCtx, fd: u32, negative: Value, fr_mode
     emit_write_fpr_l(ctx, fd, signed_zero, fr_mode)
 }
 
-/// Binary FP arithmetic op shape shared by ADD/SUB/MUL/DIV, S or D format:
-/// read fs/ft, apply `op`, write fd, then `emit_fpu_update_fcsr`. Mirrors
-/// `exec_fadd_s`/`exec_fsub_d`/etc.'s common structure exactly — CU1 is
-/// already handled by the region-wide entry guard, not repeated per
-/// instruction. `flags_fn` computes the [6:2] flags `Value` from the raw
-/// operand bits (`emit_fpu_arith_flags_snan_only_s/d` for ADD/SUB/MUL,
-/// `emit_fpu_arith_flags_div_s/d` for DIV) — never read from the host FPU.
+/// ADD/SUB/MUL/DIV, S or D (`is_d`): read fs/ft, apply `op`, write fd and
+/// update FCSR. Mirrors `exec_fadd_s`/`exec_fsub_d`/etc. — CU1 is already
+/// handled by the region-wide entry guard, not repeated per instruction.
 ///
-/// The operands are classified once, before anything else: if both are
-/// ordinary finite numbers (`emit_is_normal_s`/`_d`), no operand check can
-/// trap, no signalling NaN can be present and the divisor cannot be zero, so
-/// this instruction provably raises no flag and the fast arm only has to
-/// clear Cause (and even that store is skipped when Cause is already clear —
-/// see `emit_fpu_update_fcsr_no_flags`). Everything else — zero, denormal,
-/// infinity, NaN — takes the cold arm, which is the full previous body
-/// verbatim: per-operand Unimplemented checks, the by-value flags, the
-/// result-denormal rule and the full FCSR update. The result-denormal check
-/// stays on both arms because an underflowing result is reachable from
-/// ordinary finite operands.
-fn emit_fbinop_s(
+/// The host computes first; one branch then keeps the ordinary case inline:
+/// both operands have a nonzero exponent and the result is a normal number
+/// below the top of the range. Such an instruction provably raises no flag
+/// (no operand check can trap, no signalling NaN is present); it only clears
+/// Cause (and even that store is skipped when Cause is already clear, see
+/// `emit_fpu_update_fcsr_no_flags`) and writes fd. A NaN or infinite operand
+/// needs no test of its own: it always gives a NaN, an infinity or a zero,
+/// and the result's range test sends those away.
+///
+/// Everything else is cold. Operands that are ordinary numbers or zeros with
+/// a zero or ordinary result (cleared arrays, sparse data, x - x) still raise
+/// no flag and are written there. A denormal, infinite or NaN operand, or a
+/// denormal or top-of-range result, goes to one call into
+/// `fpu_binop_commit_fn` with the host's result, which does what the
+/// interpreter does from the operand checks on. The cold side ends in
+/// `done_block` only, so nothing rejoins the inline path midway.
+fn emit_fbinop(
     ctx: &mut EmitCtx,
     fr_mode: FrMode,
+    is_d: bool,
     op: fn(&mut FunctionBuilder, Value, Value) -> Value,
-    flags_fn: fn(&mut EmitCtx, Value, Value) -> Value,
 ) {
+    let i32t = ir::types::I32;
+    let i64t = ir::types::I64;
     let raw = ctx.raw;
     let fs = field_rd(raw);
     let ft = field_rt(raw);
     let fd = field_sa(raw);
 
-    let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
-    let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+    let (fs_bits, ft_bits) = if is_d {
+        (emit_read_fpr_l(ctx, fs, fr_mode), emit_read_fpr_l(ctx, ft, fr_mode))
+    } else {
+        (emit_read_fpr_w(ctx, fs, fr_mode), emit_read_fpr_w(ctx, ft, fr_mode))
+    };
+    let result_bits = if is_d {
+        emit_fbinop_result_d(ctx, op, fs_bits, ft_bits)
+    } else {
+        emit_fbinop_result_s(ctx, op, fs_bits, ft_bits)
+    };
+    let write = move |ctx: &mut EmitCtx, bits: Value| {
+        if is_d { emit_write_fpr_l(ctx, fd, bits, fr_mode) } else { emit_write_fpr_w(ctx, fd, bits, fr_mode) }
+    };
+    let (mantissa_bits, exp_max): (i64, i64) = if is_d { (52, 0x7FF) } else { (23, 0xFF) };
+    // Bounds of an ordinary result's magnitude, min_normal <= abs < top,
+    // on the high word for double precision, exactly as
+    // `fpu_result_at_top_d` classifies.
+    let (min_normal, top) = if is_d { (0x0010_0000i64, 0x7FEF_FFFFi64) } else { (0x0080_0000, 0x7F7F_FFFF) };
 
-    let fs_normal = emit_is_normal_s(ctx, fs_bits);
-    let ft_normal = emit_is_normal_s(ctx, ft_bits);
-    let operands_normal = ctx.builder.ins().band(fs_normal, ft_normal);
-    let fast_block = ctx.builder.create_block();
-    let slow_block = ctx.builder.create_block();
+    let word = if is_d {
+        let hi = ctx.builder.ins().rotr_imm_s(result_bits, 32);
+        ctx.builder.ins().ireduce(i32t, hi)
+    } else {
+        result_bits
+    };
+    let abs = ctx.builder.ins().band_imm_s(word, 0x7FFF_FFFF);
+    let biased = ctx.builder.ins().iadd_imm_s(abs, -min_normal);
+    let ordinary = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, biased, top - min_normal);
+    let exp_mask = exp_max << mantissa_bits;
+    let fs_exp = ctx.builder.ins().band_imm_s(fs_bits, exp_mask);
+    let fs_exp = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fs_exp, 0);
+    let ft_exp = ctx.builder.ins().band_imm_s(ft_bits, exp_mask);
+    let ft_exp = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ft_exp, 0);
+    let operands_exp = ctx.builder.ins().band(fs_exp, ft_exp);
+    let inline = ctx.builder.ins().band(operands_exp, ordinary);
+    let plain_block = ctx.builder.create_block();
+    let cold_block = ctx.builder.create_block();
+    let quiet_block = ctx.builder.create_block();
+    let call_block = ctx.builder.create_block();
     let done_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(operands_normal, fast_block, &[], slow_block, &[]);
+    let call_result = ctx.builder.append_block_param(call_block, i64t);
+    ctx.builder.ins().brif(inline, plain_block, &[], cold_block, &[]);
 
-    ctx.builder.switch_to_block(slow_block);
-    ctx.builder.set_cold_block(slow_block);
-    ctx.builder.seal_block(slow_block);
-    emit_check_denorm_operand(ctx, fs_bits, false);
-    emit_check_denorm_operand(ctx, ft_bits, false);
-    let flags = flags_fn(ctx, fs_bits, ft_bits);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_s(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, Some(flags), is_denorm, is_negative,
-        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
-    );
+    ctx.builder.switch_to_block(plain_block);
+    ctx.builder.seal_block(plain_block);
+    emit_fpu_update_fcsr_no_flags(ctx, |ctx| write(ctx, result_bits));
     ctx.builder.ins().jump(done_block, &[]);
 
-    ctx.builder.switch_to_block(fast_block);
-    ctx.builder.seal_block(fast_block);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_s(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, None, is_denorm, is_negative,
-        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
-    );
+    // Cold: operands that are ordinary numbers or zeros with a result that
+    // is ordinary or zero raise no flag; anything else goes to the call.
+    ctx.builder.switch_to_block(cold_block);
+    ctx.builder.set_cold_block(cold_block);
+    ctx.builder.seal_block(cold_block);
+    let is_zero = |ctx: &mut EmitCtx, v: Value| {
+        let abs = ctx.builder.ins().band_imm_s(v, if is_d { 0x7FFF_FFFF_FFFF_FFFFu64 as i64 } else { 0x7FFF_FFFF });
+        ctx.builder.ins().icmp_imm_s(IntCC::Equal, abs, 0)
+    };
+    let operand_ok = |ctx: &mut EmitCtx, v: Value| {
+        let normal = if is_d { emit_is_normal_d(ctx, v) } else { emit_is_normal_s(ctx, v) };
+        let zero = is_zero(ctx, v);
+        ctx.builder.ins().bor(normal, zero)
+    };
+    let fs_ok = operand_ok(ctx, fs_bits);
+    let ft_ok = operand_ok(ctx, ft_bits);
+    let operands_ok = ctx.builder.ins().band(fs_ok, ft_ok);
+    let result_zero = is_zero(ctx, result_bits);
+    let result_ok = ctx.builder.ins().bor(ordinary, result_zero);
+    let no_flags = ctx.builder.ins().band(operands_ok, result_ok);
+    let wide = if is_d { result_bits } else { ctx.builder.ins().uextend(i64t, result_bits) };
+    ctx.builder.ins().brif(no_flags, quiet_block, &[], call_block, &[ir::BlockArg::Value(wide)]);
+    ctx.builder.seal_block(quiet_block);
+    ctx.builder.seal_block(call_block);
+
+    // Cold, no flags: clear Cause and write fd.
+    ctx.builder.switch_to_block(quiet_block);
+    ctx.builder.set_cold_block(quiet_block);
+    let mem = MemFlagsData::trusted();
+    const FCSR_CM: i64 = 0x0001_f000;
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    ctx.builder.ins().store(mem, cleared, ctx.core_ptr, fcsr_off);
+    write(ctx, result_bits);
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(call_block);
+    ctx.builder.set_cold_block(call_block);
+    let packed = (ctx.raw & 0x3F)
+        | if is_d { 0x100 } else { 0 }
+        | if matches!(fr_mode, FrMode::Fr1) { 0x200 } else { 0 }
+        | (fd << 10)
+        | (fs << 15)
+        | (ft << 20);
+    let op_word = ctx.builder.ins().iconst(i32t, packed as i64);
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let callee = emit_hook_callee(ctx, core_offset_of_fpu_binop_commit_fn());
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i64t));
+    sig.returns.push(AbiParam::new(i32t));
+    let sig_ref = ctx.builder.import_signature(sig);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, op_word, call_result]);
+    let trapped = ctx.builder.inst_results(call)[0];
+    emit_trap_if_nonzero(ctx, trapped);
+    // The trap check's fall-through is still the cold side.
+    let after_call = ctx.builder.current_block().expect("in a block");
+    ctx.builder.set_cold_block(after_call);
     ctx.builder.ins().jump(done_block, &[]);
 
     ctx.builder.switch_to_block(done_block);
     ctx.builder.seal_block(done_block);
 }
-fn emit_fbinop_d(
-    ctx: &mut EmitCtx,
-    fr_mode: FrMode,
-    op: fn(&mut FunctionBuilder, Value, Value) -> Value,
-    flags_fn: fn(&mut EmitCtx, Value, Value) -> Value,
-) {
-    let raw = ctx.raw;
-    let fs = field_rd(raw);
-    let ft = field_rt(raw);
-    let fd = field_sa(raw);
-
-    let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
-    let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
-
-    let fs_normal = emit_is_normal_d(ctx, fs_bits);
-    let ft_normal = emit_is_normal_d(ctx, ft_bits);
-    let operands_normal = ctx.builder.ins().band(fs_normal, ft_normal);
-    let fast_block = ctx.builder.create_block();
-    let slow_block = ctx.builder.create_block();
-    let done_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(operands_normal, fast_block, &[], slow_block, &[]);
-
-    ctx.builder.switch_to_block(slow_block);
-    ctx.builder.set_cold_block(slow_block);
-    ctx.builder.seal_block(slow_block);
-    emit_check_denorm_operand(ctx, fs_bits, true);
-    emit_check_denorm_operand(ctx, ft_bits, true);
-    let flags = flags_fn(ctx, fs_bits, ft_bits);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_d(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, Some(flags), is_denorm, is_negative,
-        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
-    );
-    ctx.builder.ins().jump(done_block, &[]);
-
-    ctx.builder.switch_to_block(fast_block);
-    ctx.builder.seal_block(fast_block);
-    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_d(ctx, op, fs_bits, ft_bits);
-    emit_fpu_update_fcsr_arith(
-        ctx, None, is_denorm, is_negative,
-        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
-    );
-    ctx.builder.ins().jump(done_block, &[]);
-
-    ctx.builder.switch_to_block(done_block);
-    ctx.builder.seal_block(done_block);
-}
+fn emit_fbinop_s(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder, Value, Value) -> Value) { emit_fbinop(ctx, fr_mode, false, op) }
+fn emit_fbinop_d(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder, Value, Value) -> Value) { emit_fbinop(ctx, fr_mode, true, op) }
 
 fn fop_add(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fadd(a, b) }
 fn fop_sub(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fsub(a, b) }
 fn fop_mul(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fmul(a, b) }
 fn fop_div(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fdiv(a, b) }
 
-fn emit_fadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_add, emit_fpu_arith_flags_snan_only_s); }
-fn emit_fadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_add, emit_fpu_arith_flags_snan_only_d); }
-fn emit_fsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_sub, emit_fpu_arith_flags_snan_only_s); }
-fn emit_fsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_sub, emit_fpu_arith_flags_snan_only_d); }
-fn emit_fmul_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_mul, emit_fpu_arith_flags_snan_only_s); }
-fn emit_fmul_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_mul, emit_fpu_arith_flags_snan_only_d); }
-fn emit_fdiv_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_div, emit_fpu_arith_flags_div_s); }
-fn emit_fdiv_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_div, emit_fpu_arith_flags_div_d); }
+fn emit_fadd_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_add); }
+fn emit_fadd_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_add); }
+fn emit_fsub_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_sub); }
+fn emit_fsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_sub); }
+fn emit_fmul_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_mul); }
+fn emit_fmul_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_mul); }
+fn emit_fdiv_s(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_s(ctx, fr_mode, fop_div); }
+fn emit_fdiv_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode, fop_div); }
 
 /// SQRT.S/D fd, fs: fd = sqrt(fs). Unlike the binary ops, only one operand
 /// (`fs`; `ft`/`d.rt` is unused/ignored, matching the interpreter). Still
@@ -7899,6 +8055,7 @@ fn emit_fsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().sqrt(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    let (flags, result_bits) = emit_fix_invalid(ctx, false, flags, result_bits, &[fs_bits]);
     let is_denorm = emit_is_subnormal_s(ctx, result_bits);
     let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
     emit_fpu_update_fcsr_arith(
@@ -7946,6 +8103,7 @@ fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().sqrt(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    let (flags, result_bits) = emit_fix_invalid(ctx, true, flags, result_bits, &[fs_bits]);
     let is_denorm = emit_is_subnormal_d(ctx, result_bits);
     let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
     emit_fpu_update_fcsr_arith(
@@ -10453,7 +10611,6 @@ fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     let fr_bits = emit_read_fpr_w(ctx, fr, fr_mode);
     let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
-    let flags = emit_fpu_arith_flags_snan_only3_s(ctx, fr_bits, ft_bits, fs_bits);
 
     let fr_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fr_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
@@ -10467,8 +10624,11 @@ fn emit_fternop_s(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     };
     let result = if negate_result { ctx.builder.ins().fneg(sum) } else { sum };
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, false, result_bits, &[fr_bits, ft_bits, fs_bits],
+        |ctx| emit_fpu_arith_flags_snan_only3_s(ctx, fr_bits, ft_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_w(ctx, fd, bits, fr_mode),
+    );
 }
 
 fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_result: bool) {
@@ -10481,7 +10641,6 @@ fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     let fr_bits = emit_read_fpr_l(ctx, fr, fr_mode);
     let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
-    let flags = emit_fpu_arith_flags_snan_only3_d(ctx, fr_bits, ft_bits, fs_bits);
 
     let fr_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fr_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
@@ -10495,8 +10654,11 @@ fn emit_fternop_d(ctx: &mut EmitCtx, fr_mode: FrMode, negate_fr: bool, negate_re
     };
     let result = if negate_result { ctx.builder.ins().fneg(sum) } else { sum };
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, true, result_bits, &[fr_bits, ft_bits, fs_bits],
+        |ctx| emit_fpu_arith_flags_snan_only3_d(ctx, fr_bits, ft_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_l(ctx, fd, bits, fr_mode),
+    );
 }
 
 // fd = fs*ft + fr
@@ -10530,11 +10692,14 @@ fn emit_frecip_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f32const(1.0);
     let one_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), one);
-    let flags = emit_fpu_arith_flags_div_s(ctx, one_bits, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fdiv(one, fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, false, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_div_s(ctx, one_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_w(ctx, fd, bits, fr_mode),
+    );
 }
 fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
@@ -10542,35 +10707,44 @@ fn emit_frecip_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f64const(1.0);
     let one_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), one);
-    let flags = emit_fpu_arith_flags_div_d(ctx, one_bits, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fdiv(one, fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, true, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_div_d(ctx, one_bits, fs_bits),
+        move |ctx, bits| emit_write_fpr_l(ctx, fd, bits, fr_mode),
+    );
 }
 fn emit_frsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f32const(1.0);
-    let flags = emit_fpu_arith_flags_rsqrt_s(ctx, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let root = ctx.builder.ins().sqrt(fs_val);
     let result = ctx.builder.ins().fdiv(one, root);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, false, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_rsqrt_s(ctx, fs_bits),
+        move |ctx, bits| emit_write_fpr_w(ctx, fd, bits, fr_mode),
+    );
 }
 fn emit_frsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
     let one = ctx.builder.ins().f64const(1.0);
-    let flags = emit_fpu_arith_flags_rsqrt_d(ctx, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let root = ctx.builder.ins().sqrt(fs_val);
     let result = ctx.builder.ins().fdiv(one, root);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_fpu_update_fcsr(ctx, flags, move |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    emit_commit_finite_first(
+        ctx, true, result_bits, &[fs_bits],
+        |ctx| emit_fpu_arith_flags_rsqrt_d(ctx, fs_bits),
+        move |ctx, bits| emit_write_fpr_l(ctx, fd, bits, fr_mode),
+    );
 }
 
 /// PREFX — indexed prefetch. A prefetch is architecturally a hint with no
