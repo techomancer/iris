@@ -1043,6 +1043,31 @@ fn an_acknowledgement_does_not_erase_a_later_completion() {
 }
 
 #[test]
+fn clearing_the_interrupt_keeps_a_completion_the_driver_was_not_shown() {
+    let r = Rig::with_disk("unseen", 0, 64);
+    let (probe, line) = LevelProbe::line();
+    r.isp.connect_interrupt(line);
+    r.init_rings(8, 8);
+    r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+    r.put_entry(0, &tur_entry(0x5001));
+    r.doorbell(1);
+    assert_eq!(r.r(reg::RESPONSE_QUEUE), 1, "the driver reads the producer count");
+    // The next completion lands after that read and before the driver
+    // clears the interrupt: a model with no bus latency does this at once.
+    r.put_entry(1, &tur_entry(0x5002));
+    r.doorbell(2);
+    r.w(reg::RESPONSE_QUEUE, 1);
+    r.ack();
+    assert!(probe.level(), "the clear must not swallow a completion nobody has been shown");
+    assert_eq!(r.r(reg::BUS_STATUS), STATUS_INT_REQ | STATUS_RISC_INT_REQ);
+    assert_eq!(r.r(reg::RESPONSE_QUEUE), 2);
+    r.w(reg::RESPONSE_QUEUE, 2);
+    r.ack();
+    assert!(!probe.level(), "once the driver has read it, the clear drops the line");
+    assert_eq!(r.r(reg::BUS_STATUS), 0);
+}
+
+#[test]
 fn a_held_completion_posts_and_resignals_when_the_driver_frees_room() {
     let r = Rig::with_disk("held", 0, 64);
     r.init_rings(8, 4);
