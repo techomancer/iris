@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use winit::keyboard::KeyCode;
 
+use super::auth;
 use super::encode::{self, PixelFormat, Rect};
 use super::{Frame, Shared, TILE};
 use crate::hostinput::{BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
@@ -45,7 +46,7 @@ pub(crate) fn serve(s: &Arc<Shared>, mut stream: TcpStream) -> Result<(), String
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let io = |e: std::io::Error| e.to_string();
 
-    // Version, security (None), ClientInit.
+    // Version, security (None, or VNC Authentication with a password), ClientInit.
     stream.write_all(b"RFB 003.008\n").map_err(io)?;
     let mut ver = [0u8; 12];
     stream.read_exact(&mut ver).map_err(io)?;
@@ -55,18 +56,22 @@ pub(crate) fn serve(s: &Arc<Shared>, mut stream: TcpStream) -> Result<(), String
         v if v.starts_with(b"RFB 003.") => 8,
         _ => return Err(format!("not an RFB viewer ({:?})", String::from_utf8_lossy(&ver))),
     };
+    let sec = if s.password.is_some() { auth::SEC_VNC_AUTH } else { 1 };
     if minor == 3 {
-        stream.write_all(&1u32.to_be_bytes()).map_err(io)?;
+        stream.write_all(&u32::from(sec).to_be_bytes()).map_err(io)?;
     } else {
-        stream.write_all(&[1, 1]).map_err(io)?;
+        stream.write_all(&[1, sec]).map_err(io)?;
         let mut choice = [0u8];
         stream.read_exact(&mut choice).map_err(io)?;
-        if choice[0] != 1 {
+        if choice[0] != sec {
             return Err(format!("viewer chose security type {}", choice[0]));
         }
-        if minor >= 8 {
-            stream.write_all(&0u32.to_be_bytes()).map_err(io)?;
-        }
+    }
+    match &s.password {
+        // The challenge ends in a SecurityResult in every version.
+        Some(pw) => auth::exchange(pw, &mut stream, minor)?,
+        None if minor >= 8 => stream.write_all(&0u32.to_be_bytes()).map_err(io)?,
+        None => {}
     }
     let mut shared_flag = [0u8];
     stream.read_exact(&mut shared_flag).map_err(io)?;

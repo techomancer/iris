@@ -166,7 +166,10 @@ fn main() {
     // hands on the guest.
     let host_input = iris::hostinput::HostInput::attach(&*machine);
     let _vnc_server = vnc.listen.as_deref().map(|listen| {
-        iris::vnc::VncServer::start(host_input.clone(), listen, vnc.max_fps, "IRIS")
+        iris::vnc::auth::load_password(vnc.password_file.as_deref())
+            .and_then(|password| {
+                iris::vnc::VncServer::start_with_password(host_input.clone(), listen, vnc.max_fps, "IRIS", password)
+            })
             .unwrap_or_else(|e| {
                 eprintln!("iris: {e}");
                 std::process::exit(1);
