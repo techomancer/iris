@@ -1676,6 +1676,57 @@ mod tests {
         remove_chd(&base);
     }
 
+    /// The background thread alone, with no explicit flush, makes writes
+    /// durable, map entries included: a copy of the files as the host has
+    /// them, taken while the node is still open and never closed, stands in
+    /// for a SIGKILL. Reads and writes go on meanwhile, as a busy guest's
+    /// do. The node's thread runs on a short interval so the test waits for
+    /// the sync, not for the production five seconds.
+    #[test]
+    fn chd_background_sync_covers_a_busy_disk_at_a_kill() {
+        let base = compressed_chd(0xAB);
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        let fast = Background::idle(Duration::from_millis(100));
+        let file: Arc<dyn Durable> = node.hd().file();
+        fast.set_durable(Some(file));
+        node.bg = fast.clone();
+        fast.spawn().unwrap();
+        let hunks = 60u64;
+        for round in 0..3u8 {
+            for h in 0..hunks {
+                let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                node.write(at, &[0x10 + round; SECTOR_BYTES]).unwrap();
+                let mut got = [0u8; SECTOR_BYTES];
+                node.read(at, &mut got).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Whether every write is on the host's disk yet: reopen a copy of
+        // the files and read them all back.
+        let copy = tmp_path("chd-kill").with_extension("chd");
+        let durable = || {
+            let ok = std::fs::copy(&base, &copy).is_ok()
+                && std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).is_ok()
+                && match ChdNode::open(copy.to_str().unwrap(), false) {
+                    Ok(mut again) => (0..3u8).all(|round| {
+                        (0..hunks).all(|h| {
+                            let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                            let mut got = [0u8; SECTOR_BYTES];
+                            again.read(at, &mut got).is_ok() && got == [0x10 + round; SECTOR_BYTES]
+                        })
+                    }),
+                    Err(_) => false,
+                };
+            remove_chd(&copy);
+            ok
+        };
+        assert!(wait_for(durable), "the background sync alone made the writes durable");
+        fast.finish();
+        drop(node);
+        remove_chd(&base);
+    }
+
     /// A kill leaves the CHD as the host's files have it. Whatever it loses,
     /// it must not keep a write and lose one the guest made before it: a
     /// filesystem's log recovery assumes it sees a prefix of its writes. A
