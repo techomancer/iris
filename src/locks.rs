@@ -210,9 +210,11 @@ impl<T: ?Sized> Drop for SpinGuard<'_, T> {
 }
 
 /// Register any lock inside an `Arc`ed parent by a "held?" probe on it.
+/// The registry outlives every machine, so it holds the parent weakly: a
+/// dropped machine's lock reads as free.
 pub fn register_mutex_fn<P: Send + Sync + 'static>(name: impl Into<String>, parent: &Arc<P>, probe: fn(&P) -> bool) {
-    let p = parent.clone();
-    register_lock(name, move || probe(&p));
+    let p = Arc::downgrade(parent);
+    register_lock(name, move || p.upgrade().is_some_and(|p| probe(&p)));
 }
 
 /// Register a `SpinLock` that lives inside an `Arc`ed parent: `get` maps the
@@ -222,11 +224,11 @@ pub fn register_spin<P: Send + Sync + 'static, T: ?Sized + 'static>(
     parent: &Arc<P>,
     get: fn(&P) -> &SpinLock<T>,
 ) {
-    let (a, b) = (parent.clone(), parent.clone());
+    let (a, b) = (Arc::downgrade(parent), Arc::downgrade(parent));
     registry().lock().push(LockEntry {
         name: name.into(),
-        is_locked: Box::new(move || get(&a).is_locked()),
-        holder: Some(Box::new(move || get(&b).holder())),
+        is_locked: Box::new(move || a.upgrade().is_some_and(|p| get(&p).is_locked())),
+        holder: Some(Box::new(move || get(&*b.upgrade()?).holder())),
     });
 }
 
@@ -238,7 +240,8 @@ fn registry() -> &'static PLMutex<Vec<LockEntry>> {
 }
 
 /// Register a named lock. `is_locked` should call `.is_locked()` on the
-/// underlying parking_lot Mutex/RwLock. Call this once per lock at init time.
+/// underlying parking_lot Mutex/RwLock. Call this once per lock at init time,
+/// and capture the lock's owner by `Weak`: the registry is never emptied.
 pub fn register_lock(name: impl Into<String>, is_locked: impl Fn() -> bool + Send + Sync + 'static) {
     registry().lock().push(LockEntry {
         name: name.into(),
@@ -249,14 +252,13 @@ pub fn register_lock(name: impl Into<String>, is_locked: impl Fn() -> bool + Sen
 
 // ── Convenience helpers ───────────────────────────────────────────────────────
 
-/// Register a parking_lot Mutex by cloning its Arc.
+/// Register a parking_lot Mutex by a weak handle on its Arc.
 pub fn register_mutex<T: Send + 'static>(name: impl Into<String>, m: &Arc<PLMutex<T>>) {
-    let m = m.clone();
-    register_lock(name, move || m.is_locked());
+    register_mutex_fn(name, m, |m| m.is_locked());
 }
 
 /// Register a parking_lot Mutex that is not Arc-wrapped but lives in an Arc
-/// of its parent struct — use a closure that captures whatever you need.
+/// of its parent struct — use a closure that captures a `Weak` of it.
 pub fn register_lock_fn(name: impl Into<String>, f: impl Fn() -> bool + Send + Sync + 'static) {
     register_lock(name, f);
 }
