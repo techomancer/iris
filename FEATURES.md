@@ -352,6 +352,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `vnc.listen` | `unset` (no server) | `host:port`, or a port on 127.0.0.1, to serve the screen, keyboard and mouse over VNC (RFB 3.8; Raw and ZRLE; no password). Every board, with a window or `ci`; not `headless`. Standalone `iris` and iris-gui. See [HELP.md](HELP.md#vnc) and [iris-gui-README.md](iris-gui-README.md#vnc). |
 | `vnc.max_fps` | `30` | Most updates a second sent to a viewer (1–120). |
+| `vnc.password_file` | `unset` | File holding the VNC password (RFB VNC Authentication: first 8 bytes). Unset: `IRIS_VNC_PASSWORD_FILE`, then `IRIS_VNC_PASSWORD` (the password itself) from the environment, then no password. Standalone `iris` only; see [HELP.md](HELP.md#vnc). |
 
 ### [audio]
 
@@ -591,6 +592,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--renderer` | What draws the window: `gl` (default) or `wgpu` (`renderer`; needs a build with the `wgpu` feature). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |
+| `--vnc-password-file FILE` | Ask VNC viewers for the password in FILE. Sets `vnc.password_file`. |
 | `--vnc [ADDR]` | Serve the screen, keyboard and mouse over VNC on ADDR (`host:port` or a port; default 127.0.0.1:5900). Sets `vnc.listen`. |
 | `--serial-port-a` | Serial channel A (tty2) port on 127.0.0.1 (default 8880). |
 | `--serial-port-b` | Serial channel B (tty1, the console) port on 127.0.0.1 (default 8881). |

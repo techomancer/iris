@@ -1966,6 +1966,11 @@ pub struct VncConfig {
     /// Most frames a second sent to a viewer (default 30).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fps: Option<u32>,
+    /// File holding the VNC password (first 8 bytes; a trailing newline is
+    /// dropped). Without it the `IRIS_VNC_PASSWORD_FILE` and
+    /// `IRIS_VNC_PASSWORD` environment variables are tried, then no password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_file: Option<String>,
 }
 
 /// VINO video-in configuration.
@@ -3941,6 +3946,12 @@ pub struct Cli {
     #[arg(long = "vnc", value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:5900")]
     pub vnc: Option<String>,
 
+    /// Ask VNC viewers for the password in FILE (first 8 bytes). Without it,
+    /// IRIS_VNC_PASSWORD_FILE or IRIS_VNC_PASSWORD (the password itself) in
+    /// the environment is used. Sets `vnc.password_file`.
+    #[arg(long = "vnc-password-file", value_name = "FILE")]
+    pub vnc_password_file: Option<String>,
+
     /// Serial channel A (tty2) port on 127.0.0.1 (default 8880).
     #[arg(long = "serial-port-a", value_name = "PORT")]
     pub serial_port_a: Option<u16>,
@@ -4146,6 +4157,7 @@ impl Cli {
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
         if let Some(p) = self.monitor_port { cfg.monitor_port = Some(p); }
         if let Some(a) = &self.vnc { cfg.vnc.listen = Some(a.clone()); }
+        if let Some(f) = &self.vnc_password_file { cfg.vnc.password_file = Some(f.clone()); }
         if let Some(p) = self.serial_port_a { cfg.serial_port_a = Some(p); }
         if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
         if let Some(p) = &self.serial_socket_a { cfg.serial_socket_a = Some(p.clone()); }

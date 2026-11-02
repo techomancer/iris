@@ -306,6 +306,9 @@ blake3 = "1"
 png = "0.18"
 # The VNC server's ZRLE encoding (zlib).
 flate2 = "1"
+# The VNC server's password check (RFB "VNC Authentication": DES, random challenge).
+des = "0.8"
+getrandom = "0.3"
 parking_lot = "0.12"
 spin = "0.9"
 # The VPro fragment pipeline's four-pixel lanes (src/dev/odyssey/pipe/lanes.rs).

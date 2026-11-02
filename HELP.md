@@ -540,6 +540,7 @@ clicks into it:
 iris --vnc                    # 127.0.0.1:5900
 iris --ci --vnc               # no window at all: VNC is the screen
 iris --vnc 0.0.0.0:5901       # reachable from other machines (no password!)
+IRIS_VNC_PASSWORD=hunter2 iris --vnc 0.0.0.0:5901   # ... with one
 vncviewer localhost:5900
 ```
 
@@ -549,7 +550,17 @@ or in `iris.toml`:
 [vnc]
 listen  = "127.0.0.1:5900"   # absent: no VNC server
 max_fps = 30                 # most updates a second per viewer
+password_file = "/run/secrets/vnc"   # optional: ask viewers for this password
 ```
+
+**Password.** Without one, anyone who can reach the port controls the guest.
+The password comes from a file (`password_file`, `--vnc-password-file FILE`, or
+the `IRIS_VNC_PASSWORD_FILE` environment variable) or from the
+`IRIS_VNC_PASSWORD` environment variable, tried in that order. A file's
+trailing newline is dropped; an empty password is an error. This is RFB's "VNC
+Authentication", so only the first 8 bytes count and nothing after the
+handshake is encrypted: for a network you do not trust, tunnel the port (SSH,
+WireGuard) instead of relying on it.
 
 It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
 the O2), with the normal window open or under `--ci` with no window. Not with
