@@ -295,17 +295,17 @@ fn check_testdev_slot_free(ultra64_present: bool) {
     }
 }
 
-/// virtio-serial's GIO slot must not be one another device decodes: the
+/// A virtio device's GIO slot must not be one another device decodes: the
 /// Ultra64 board and `--test-device` take slot 0, the second Newport head
 /// slot 1. Panics for the same reason `check_testdev_slot_free` does.
-fn check_virtio_slot_free(slot: crate::dev::ioc::GioSlot, ultra64: bool, testdev: bool, head1: bool) {
+fn check_virtio_slot_free(section: &str, slot: crate::dev::ioc::GioSlot, ultra64: bool, testdev: bool, head1: bool) {
     use crate::dev::ioc::GioSlot;
     match slot {
         GioSlot::Exp0 if ultra64 || testdev => {
-            panic!("[virtio_serial] slot = \"exp0\" is taken by the ultra64 board or --test-device; use \"exp1\"")
+            panic!("[{section}] slot = \"exp0\" is taken by the ultra64 board or --test-device; use \"exp1\"")
         }
         GioSlot::Exp1 if head1 => {
-            panic!("[virtio_serial] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"")
+            panic!("[{section}] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"")
         }
         _ => {}
     }
@@ -646,33 +646,47 @@ impl Machine {
 
         let phys = Physical::new(banks.into());
 
-        // virtio-serial (`[virtio_serial]`): GIO expansion slot 0 or 1, on the
-        // line the IOC gives that slot (the Indy's two direct pins, or the
-        // Indigo2's EXT_IO fan-out). It masters the bus through `phys`.
-        let virtio = if cfg.virtio_serial.enabled {
+        // virtio devices: GIO expansion slot 0 or 1, on the line the IOC gives
+        // that slot (the Indy's two direct pins, or the Indigo2's EXT_IO
+        // fan-out). They master the bus through `phys`.
+        let virtio_mmio = |section: &str, name: &str, slot: crate::config::VirtioGioSlot, core| {
             use crate::config::VirtioGioSlot;
             use crate::dev::ioc::{GioSlot, IocInterrupt, GIO_SLOT_BASES, GIO_SLOT_MAP, profile_idx};
-            let slot = match cfg.virtio_serial.slot {
+            let slot = match slot {
                 VirtioGioSlot::Exp0 => GioSlot::Exp0,
                 VirtioGioSlot::Exp1 => GioSlot::Exp1,
             };
-            check_virtio_slot_free(slot, ultra64.is_some(), testdev.is_some(), rex3_head1.is_some());
+            check_virtio_slot_free(section, slot, ultra64.is_some(), testdev.is_some(), rex3_head1.is_some());
             let source = match (guinness, slot) {
                 (true, GioSlot::Exp0) => IocInterrupt::GioExp0,
                 (true, _) => IocInterrupt::GioExp1,
                 (false, s) => GIO_SLOT_MAP[profile_idx(false)][s as usize].retrace,
             };
             let base = GIO_SLOT_BASES[slot as usize];
-            eprintln!("iris: virtio-serial at {base:#010x}");
+            eprintln!("iris: {name} at {base:#010x}");
             let dev = crate::dev::virtio::mmio::VirtioMmio::new(
-                crate::dev::virtio::console::from_config(&cfg.virtio_serial),
+                core,
                 ioc.irq_line(source),
                 Arc::new(crate::dev::virtio::BusMemory(phys.clone())),
             );
-            Some((Arc::new(dev), base))
-        } else {
-            None
+            (Arc::new(dev), base)
         };
+        let virtio = cfg.virtio_serial.enabled.then(|| {
+            virtio_mmio(
+                "virtio_serial",
+                "virtio-serial",
+                cfg.virtio_serial.slot,
+                crate::dev::virtio::console::from_config(&cfg.virtio_serial),
+            )
+        });
+        let virtio_9p = cfg.virtio_9p.enabled.then(|| {
+            virtio_mmio(
+                "virtio_9p",
+                "virtio-9p",
+                cfg.virtio_9p.slot,
+                crate::dev::virtio::p9::from_config(&cfg.virtio_9p),
+            )
+        });
 
         let board = Arc::new(Ip22Bus::new(phys.clone(), Ip22Devices {
             rex3: rex3.clone(),
@@ -682,6 +696,7 @@ impl Machine {
             ultra64,
             testdev,
             virtio,
+            virtio_9p,
             vino,
             mc: mc.clone(),
             hpc3: hpc3.clone(),
@@ -916,6 +931,7 @@ impl Machine {
         if let Some(mgras) = &board.mgras { monitor.register_device(mgras.clone()); }
         if let Some(u64) = &board.ultra64 { monitor.register_device(u64.clone()); }
         if let Some(v) = &board.virtio { monitor.register_device(v.clone()); }
+        if let Some(v) = &board.virtio_9p { monitor.register_device(v.clone()); }
         monitor.register_device(Arc::new(board.vino.clone()));
         #[cfg(feature = "perfetto")]
         {
@@ -1036,6 +1052,7 @@ impl Machine {
         if let Some(gr2) = &self.board.gr2 { gr2.start(); }
         if let Some(u64) = &self.board.ultra64 { u64.start(); }
         if let Some(v) = &self.board.virtio { v.start(); }
+        if let Some(v) = &self.board.virtio_9p { v.start(); }
 
         // Monitor server on localhost (port 8888 unless `monitor_port` says
         // otherwise) — always start, even in CI mode, so debug helpers
@@ -1090,6 +1107,7 @@ impl Machine {
         self.mc.stop();
         if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         if let Some(v) = &self.board.virtio { v.stop(); }
+        if let Some(v) = &self.board.virtio_9p { v.stop(); }
         if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
         if let Some(mgras) = &self.board.mgras { mgras.stop_display(); }
         if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
@@ -1666,6 +1684,7 @@ impl Machine {
         if let Some(gr2) = &self.board.gr2 { gr2.start(); }
         if let Some(u64) = &self.board.ultra64 { u64.start(); }
         if let Some(v) = &self.board.virtio { v.start(); }
+        if let Some(v) = &self.board.virtio_9p { v.start(); }
     }
 
     /// Helper to power-on reset all devices.
@@ -1698,6 +1717,7 @@ impl Machine {
         if let Some(gr2) = &self.board.gr2 { gr2.power_on(); }
         if let Some(td) = &self.board.testdev { td.power_on(); }
         if let Some(v) = &self.board.virtio { v.power_on(); }
+        if let Some(v) = &self.board.virtio_9p { v.power_on(); }
         self.apply_host_display_resolution();
     }
 
@@ -2549,5 +2569,46 @@ mod virtio_tests {
     #[test]
     fn ip28_slot_exp1() {
         probe(MachineProfile::Indigo2Ip28, VirtioGioSlot::Exp1, 0x1F60_0000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ip28_has_both_devices_in_their_slots() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut cfg = MachineConfig::default();
+                cfg.scsi.clear();
+                cfg.headless = true;
+                cfg.machine.profile = MachineProfile::Indigo2Ip28;
+                cfg.machine.cpu = Some("r10000".into());
+                cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
+                cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact);
+                cfg.virtio_serial.enabled = true;
+                cfg.virtio_serial.slot = VirtioGioSlot::Exp1;
+                cfg.virtio_serial.ports = vec![Default::default()];
+                cfg.virtio_9p.enabled = true;
+                cfg.virtio_9p.slot = VirtioGioSlot::Exp0;
+                cfg.virtio_9p.path = std::env::temp_dir().display().to_string();
+                assert_eq!(cfg.validate(), Ok(()));
+                let m = Machine::new(cfg);
+                let phys = &m.board.phys;
+                assert_eq!(phys.read32(0x1F40_0000 + REG_DEVICE_ID).data, 9);
+                assert_eq!(phys.read32(0x1F60_0000 + REG_DEVICE_ID).data, 3);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_slot_holds_one_device() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::Indigo2Ip28;
+        cfg.virtio_serial.enabled = true;
+        cfg.virtio_9p.enabled = true;
+        cfg.virtio_9p.path = "/tmp".into();
+        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("a GIO slot holds one device"));
     }
 }

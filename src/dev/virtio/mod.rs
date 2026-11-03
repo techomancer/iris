@@ -27,6 +27,15 @@
 pub mod backend;
 pub mod console;
 pub mod mmio;
+#[cfg(unix)]
+pub mod p9;
+/// Windows has no `openat`, and config validation refuses `[virtio_9p]` there.
+#[cfg(not(unix))]
+pub mod p9 {
+    pub fn from_config(_cfg: &crate::config::Virtio9pConfig) -> super::VirtioCore {
+        unreachable!("[virtio_9p] is refused on this host");
+    }
+}
 pub mod pci;
 pub mod queue;
 

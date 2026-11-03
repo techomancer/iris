@@ -93,6 +93,8 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 pub const WIDGET_GFX: u8 = 11;
 /// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
 const VIRTIO_SLOT: u8 = 4;
+/// Bridge slot of the virtio-9p device.
+const VIRTIO_9P_SLOT: u8 = 5;
 /// The blank part on the Bridge's second flash select: reads all ones and
 /// keeps no writes, an approximation from one word read on a real Octane2.
 /// The PROM looks for a part there too.
@@ -260,6 +262,8 @@ pub struct OctaneMachine {
     /// The Fibre Channel adapter (`[fibre_channel]`), in a slot of an option
     /// board, with its loop of disks.
     fibre: Option<Arc<crate::dev::isp2200::Isp2200>>,
+    /// virtio-9p (`[virtio_9p]`), the slot after it.
+    virtio_9p: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     flash: Arc<CfiFlash>,
     /// The IMPACT board, when `[graphics] board` names one.
     pub gfx: Option<Arc<ImpactXio>>,
@@ -437,6 +441,14 @@ impl OctaneMachine {
             ));
             pci.attach(slot(VIRTIO_SLOT), dev.clone());
             eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
+            dev
+        });
+        let virtio_9p = cfg.virtio_9p.enabled.then(|| {
+            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
+                crate::dev::virtio::p9::from_config(&cfg.virtio_9p),
+            ));
+            pci.attach(slot(VIRTIO_9P_SLOT), dev.clone());
+            eprintln!("iris: virtio-9p on Bridge slot {VIRTIO_9P_SLOT}");
             dev
         });
 
@@ -705,6 +717,7 @@ impl OctaneMachine {
             virtio,
             nvme,
             fibre,
+            virtio_9p,
             flash,
             gfx,
             vpro,
@@ -817,6 +830,9 @@ impl OctaneMachine {
         if let Some(f) = &self.fibre {
             d.push(f.clone());
         }
+        if let Some(v) = &self.virtio_9p {
+            d.push(v.clone());
+        }
         if let Some(g) = &self.gfx {
             d.push(g.clone());
         }
@@ -896,6 +912,9 @@ impl OctaneMachine {
         }
         self.rad.reset();
         if let Some(v) = &self.virtio {
+            Resettable::power_on(&**v);
+        }
+        if let Some(v) = &self.virtio_9p {
             Resettable::power_on(&**v);
         }
         self.flash.reset();

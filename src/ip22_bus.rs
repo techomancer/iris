@@ -289,6 +289,8 @@ pub struct Ip22Bus {
     pub testdev: Option<Arc<crate::dev::testdev::TestDevice>>,
     /// virtio-serial (`[virtio_serial]`) in a GIO expansion slot.
     pub virtio: Option<Arc<crate::dev::virtio::mmio::VirtioMmio>>,
+    /// virtio-9p (`[virtio_9p]`) in a GIO expansion slot.
+    pub virtio_9p: Option<Arc<crate::dev::virtio::mmio::VirtioMmio>>,
     pub vino: Vino,
     /// Where the 512 KB alias at physical 0 points — see `alias_offset_for`.
     alias_offset: u32,
@@ -309,6 +311,7 @@ pub struct Ip22Devices {
     pub testdev: Option<Arc<crate::dev::testdev::TestDevice>>,
     /// A virtio device and the physical base of the GIO expansion slot it sits in.
     pub virtio: Option<(Arc<crate::dev::virtio::mmio::VirtioMmio>, u32)>,
+    pub virtio_9p: Option<(Arc<crate::dev::virtio::mmio::VirtioMmio>, u32)>,
     pub vino: Vino,
     pub mc: MemoryController,
     pub hpc3: Hpc3,
@@ -399,6 +402,9 @@ impl Ip22Bus {
         if let Some((v, base)) = &d.virtio {
             set(*base, *base + crate::dev::virtio::mmio::WINDOW as u32, v.clone(), "virtio-serial");
         }
+        if let Some((v, base)) = &d.virtio_9p {
+            set(*base, *base + crate::dev::virtio::mmio::WINDOW as u32, v.clone(), "virtio-9p");
+        }
 
         // Map MC registers (128KB at 0x1FA00000)
         set(MC_BASE, MC_END, Arc::new(d.mc.clone()), "mc");
@@ -434,6 +440,7 @@ impl Ip22Bus {
             ultra64: d.ultra64,
             testdev: d.testdev,
             virtio: d.virtio.map(|(v, _)| v),
+            virtio_9p: d.virtio_9p.map(|(v, _)| v),
             vino: d.vino,
             alias_offset,
             is_ip28: ip28,

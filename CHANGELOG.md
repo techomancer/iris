@@ -539,6 +539,13 @@ where they differed:
   5 s. `[nvme] write_cache = false` or `--no-write-cache` stores each write
   first, and the guest can switch it with Set Features.
 
+### virtio-9p shared directory
+
+- New `[virtio_9p]` section: a host directory the guest mounts, as 9P2000.L over a
+  virtio device (ID 9), on the same transports as virtio-serial. Guest paths are
+  walked a component at a time with no symlink followed, so a share cannot be left
+  through one. See `docs/dev/virtio-9p.md`.
+
 ### virtio-serial guest device
 
 - New `[virtio_serial]` section: a virtio 1.x console / virtio-serial device
