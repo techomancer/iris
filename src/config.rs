@@ -2,6 +2,8 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
+use crate::pci_addin::PciEntry;
+
 /// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
 /// which of them a machine takes.
 pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
@@ -1819,6 +1821,13 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_forward: Vec<PortForwardConfig>,
 
+    /// PCI add-in cards, one `[[pci]]` table per card: `slot` (a PCI device
+    /// number or the chassis label), `card`, `bus` where the machine has
+    /// several, and the card's own options. Only a real add-in slot can be
+    /// named; the onboard devices are not configurable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pci: Vec<PciEntry>,
+
     /// VINO video-in configuration (IndyCam emulation source).
     #[serde(default)]
     pub vino: VinoConfig,
@@ -2054,6 +2063,7 @@ impl Default for MachineConfig {
             scale: default_scale(),
             nfs: None,
             port_forward: vec![],
+            pci: vec![],
             headless: false,
             no_audio: false,
             gdb_port: None,
@@ -2326,13 +2336,18 @@ impl MachineConfig {
                 return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
             }
         }
+        // The cards' SCSI buses come after the machine's own controllers.
+        let cards = crate::pci_addin::validate_pci(self.machine.profile, &self.pci)?;
+        let own = self.machine.profile.scsi_controllers();
+        let controllers = cards.iter().fold(own, |n, c| n.saturating_add(c.card.scsi_controllers));
         let mut placed: std::collections::HashMap<(u8, u8), u8> = std::collections::HashMap::new();
         let mut keys: Vec<u8> = self.scsi.keys().copied().collect();
         keys.sort();
         for key in keys {
             let dev = &self.scsi[&key];
             let (controller, id) = dev.placement(key);
-            let max_id = self.machine.profile.max_scsi_id();
+            // A card's buses are wide, whatever the machine's own are.
+            let max_id = if controller >= own.max(2) { 15 } else { self.machine.profile.max_scsi_id() };
             if id == 0 || id > max_id {
                 return Err(format!("scsi.{}: SCSI ID {} is out of range (1–{}; the controller itself is 0)", key, id, max_id));
             }
@@ -2342,8 +2357,9 @@ impl MachineConfig {
                     key, controller, dev.controller
                 ));
             }
-            if controller > 1 {
-                return Err(format!("scsi.{}: controller {} is invalid (valid: 0, 1)", key, controller));
+            if controller >= controllers.max(2) {
+                let valid = if controllers <= 2 { "0, 1".to_string() } else { format!("0 to {}", controllers - 1) };
+                return Err(format!("scsi.{}: controller {} is invalid (valid: {valid})", key, controller));
             }
             if controller != 0 && self.machine.profile.scsi_controllers() < 2 {
                 return Err(format!(
@@ -2730,6 +2746,13 @@ pub struct Cli {
     #[arg(long = "cache", value_name = "MODEL")]
     pub cache: Option<CacheModel>,
 
+    /// Fit a PCI add-in card: `[BUS:]SLOT=CARD[,KEY=VALUE]...`, for example
+    /// `--pci 3=aic7880` on the O2. SLOT is a PCI device number (a chassis
+    /// label works in the configuration file only). Repeat it for more cards; it replaces a `[[pci]]` entry for the
+    /// same slot. The monitor's `pci slots` lists a machine's slots.
+    #[arg(long = "pci", value_name = "[BUS:]SLOT=CARD[,K=V]...", value_parser = PciEntry::parse_cli)]
+    pub pci: Vec<PciEntry>,
+
     /// Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`).
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
     pub graphics: Option<GraphicsBoard>,
@@ -2909,6 +2932,7 @@ impl Cli {
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
+        crate::pci_addin::merge_cli(cfg.machine.profile, &mut cfg.pci, &self.pci);
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }
@@ -3880,4 +3904,78 @@ mod ci_overlay_tests {
         assert_ne!(a, ScsiDeviceConfig::ci_overlay_path(2));
         assert!(a.contains(&format!("iris-ci-{}-", std::process::id())), "{a}");
     }
+}
+
+#[cfg(test)]
+mod pci_tests {
+    use super::*;
+
+    /// `[[pci]]` reads and writes back inline, the card's own keys beside
+    /// `slot` and `card`, and a chassis label is as good as a device number.
+    #[test]
+    fn pci_entries_round_trip_through_toml() {
+        let text = "[machine]\nprofile = \"o2_ip32\"\ncpu = \"r10000\"\n\n[[pci]]\nslot = 3\ncard = \"isp12160\"\n";
+        let cfg: MachineConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.pci.len(), 1);
+        assert_eq!((cfg.pci[0].slot.clone(), cfg.pci[0].card.as_str()), (crate::pci_addin::SlotRef::Device(3), "isp12160"));
+        cfg.validate().expect("the O2's slot takes the card");
+        let back: MachineConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.pci, cfg.pci);
+        let labelled: MachineConfig = toml::from_str("[[pci]]\nslot = \"left\"\ncard = \"isp12160\"\nbus = \"pci\"\nspeed = 2\n").unwrap();
+        assert_eq!(labelled.pci[0].slot, crate::pci_addin::SlotRef::Label("left".into()));
+        assert_eq!(labelled.pci[0].options["speed"], toml::Value::Integer(2), "other keys are the card's options");
+        assert_eq!(MachineConfig::default().pci.len(), 0);
+        assert!(!toml::to_string(&MachineConfig::default()).unwrap().contains("pci"), "an empty list is not written");
+    }
+
+    /// A bad card entry stops `validate` with the entry's own message, and
+    /// a machine with no PCI refuses any.
+    #[test]
+    fn validate_reports_a_bad_pci_entry() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::O2Ip32;
+        cfg.machine.cpu = CpuModel::R10000;
+        cfg.pci.push(PciEntry::parse_cli("2=isp12160").unwrap());
+        assert!(cfg.validate().unwrap_err().contains("is the onboard external SCSI controller"), "slot 2 is the second AIC-7880");
+        cfg.pci[0] = PciEntry::parse_cli("3=isp12160").unwrap();
+        cfg.validate().unwrap();
+        cfg.machine.profile = MachineProfile::IndyIp24;
+        cfg.machine.cpu = CpuModel::default();
+        assert_eq!(cfg.validate().unwrap_err(), "pci[0]: the Indy has no PCI bus.");
+    }
+
+    /// The card's two SCSI buses are controllers 2 and 3, and their targets
+    /// may use the wide bus's ids.
+    #[test]
+    fn a_card_adds_scsi_controllers_to_the_machines_own() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::O2Ip32;
+        cfg.machine.cpu = CpuModel::R10000;
+        cfg.scsi.insert(2 * 16 + 9, ScsiDeviceConfig { path: "card.raw".into(), ..Default::default() });
+        assert!(cfg.validate().unwrap_err().contains("controller 2 is invalid (valid: 0, 1)"), "no card, no controller 2");
+        cfg.pci.push(PciEntry::parse_cli("3=isp12160").unwrap());
+        cfg.validate().expect("controller 2, id 9: the card's first bus");
+        cfg.scsi.insert(3 * 16 + 1, ScsiDeviceConfig { path: "card2.raw".into(), ..Default::default() });
+        cfg.validate().expect("controller 3: the card's second bus");
+        cfg.scsi.insert(4 * 16 + 1, ScsiDeviceConfig { path: "x.raw".into(), ..Default::default() });
+        assert!(cfg.validate().unwrap_err().contains("controller 4 is invalid (valid: 0 to 3)"));
+        cfg.scsi.remove(&(4 * 16 + 1));
+        cfg.scsi.insert(1, ScsiDeviceConfig { path: "onboard.raw".into(), ..Default::default() });
+        cfg.scsi.insert(8, ScsiDeviceConfig { path: "onboard8.raw".into(), ..Default::default() });
+        assert!(cfg.validate().unwrap_err().contains("SCSI ID 8 is out of range (1–7"), "the O2's own buses stay narrow");
+    }
+
+    #[test]
+    fn the_pci_option_parses_and_replaces_a_config_entry() {
+        let cli = Cli::try_parse_from(["iris", "--pci", "pci:3=isp12160", "--pci", "4=isp12160"]).unwrap();
+        assert_eq!(cli.pci.len(), 2);
+        assert!(Cli::try_parse_from(["iris", "--pci", "nonsense"]).is_err());
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::O2Ip32;
+        cfg.pci.push(PciEntry::parse_cli("3=isp12160").unwrap());
+        let cfg = cli.apply(cfg);
+        assert_eq!(cfg.pci.len(), 2, "slot 3 replaced, 4 appended");
+        assert_eq!(cfg.pci[0].bus.as_deref(), Some("pci"));
+    }
+
 }
