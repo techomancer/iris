@@ -1021,3 +1021,11 @@ fn a_card_changes_the_saved_state_and_a_machine_without_it_refuses_it() {
     let err = with.load_state(&without.save_state()).unwrap_err();
     assert!(err.contains("0 PCI cards, this machine 1"), "{err}");
 }
+
+#[test]
+fn an_aic7880_card_is_the_onboard_chip_in_the_add_in_slot_with_the_next_controller_number() {
+    let bus = o2_with_cards(&["3=aic7880"]);
+    assert_eq!(pci_config_read(&bus, 3, 0), 0x8078_9004, "Adaptec AIC-7880 at device 3");
+    let onboard = bus.scsi.lock().unwrap().clone();
+    assert_eq!(bus.scsi_buses(&onboard).iter().map(|&(n, _)| n).collect::<Vec<_>>(), vec![2], "no onboard controllers here, one card bus");
+}

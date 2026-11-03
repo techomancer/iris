@@ -469,7 +469,7 @@ mod tests {
             o2(&["1=isp12160"]).err().unwrap(),
             "pci[0]: device 1 on the O2's PCI bus is the onboard internal SCSI controller (AIC-7880), not an add-in slot. Add-in slots: 3."
         );
-        assert_eq!(o2(&["3=rad9"]).err().unwrap(), "pci[0]: unknown card \"rad9\" (cards: isp12160).");
+        assert_eq!(o2(&["3=rad9"]).err().unwrap(), "pci[0]: unknown card \"rad9\" (cards: isp12160, aic7880).");
         assert_eq!(
             o2(&["3=isp12160,volume=3"]).err().unwrap(),
             "pci[0] card \"isp12160\": unknown option \"volume\" (this card takes no options)."

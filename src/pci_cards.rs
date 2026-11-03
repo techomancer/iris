@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use crate::dev::aic7880::Aic7880;
 use crate::dev::isp12160::Isp12160;
 use crate::pci::PciBusDevice;
 use crate::scsi::ScsiBus;
@@ -71,7 +72,14 @@ pub static CARDS: &[CardDef] = &[CardDef {
     options: &[],
     scsi_controllers: 2,
     build: |_, _| Ok(Box::new(IspCard(Arc::new(Isp12160::default())))),
-}];
+}, CardDef {
+    name: "aic7880",
+    summary: "Adaptec AIC-7880, one Ultra SCSI bus on a PCI card",
+    options: &[],
+    scsi_controllers: 1,
+    build: |_, controller| Ok(Box::new(AhcCard(Aic7880::new_at(controller, Aic7880::new_bus())))),
+},
+];
 
 pub fn card_def(name: &str) -> Option<&'static CardDef> {
     CARDS.iter().find(|c| c.name == name)
@@ -80,6 +88,44 @@ pub fn card_def(name: &str) -> Option<&'static CardDef> {
 /// The card names, for an error message.
 pub fn card_names() -> String {
     CARDS.iter().map(|c| c.name).collect::<Vec<_>>().join(", ")
+}
+
+/// The same chip as the O2's onboard controllers, on a card: the Adaptec
+/// 2940UW and its kin carry it, and IRIX's driver for it binds by PCI id.
+struct AhcCard(Arc<Aic7880>);
+
+impl PciCard for AhcCard {
+    fn name(&self) -> &'static str {
+        "aic7880"
+    }
+
+    fn function(&self) -> Arc<dyn PciBusDevice> {
+        self.0.clone()
+    }
+
+    fn scsi_buses(&self) -> Vec<&ScsiBus> {
+        vec![self.0.bus()]
+    }
+
+    fn set_heartbeat(&self, heartbeat: Arc<AtomicU64>) {
+        self.0.set_heartbeat(heartbeat);
+    }
+
+    fn start(&self) {
+        Device::start(&*self.0);
+    }
+
+    fn stop(&self) {
+        Device::stop(&*self.0);
+    }
+
+    fn save_state(&self) -> toml::Value {
+        Saveable::save_state(&*self.0)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        Saveable::load_state(&*self.0, v)
+    }
 }
 
 struct IspCard(Arc<Isp12160>);
@@ -138,6 +184,15 @@ mod tests {
         let id = card.function().config().read(0);
         assert_eq!((id & 0xffff, id >> 16), (0x1077, 0x1216), "QLogic ISP12160");
         assert!(card_def("rad9").is_none());
+    }
+
+    #[test]
+    fn the_aic7880_brings_one_bus_and_an_adaptec_function() {
+        let def = card_def("aic7880").expect("registered");
+        let card = (def.build)(&Options::new(), 2).unwrap();
+        assert_eq!(card.scsi_buses().len(), def.scsi_controllers as usize);
+        let id = card.function().config().read(0);
+        assert_eq!((id & 0xffff, id >> 16), (0x9004, 0x8078), "Adaptec AIC-7880");
     }
 
     #[test]
