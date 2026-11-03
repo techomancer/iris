@@ -774,6 +774,8 @@ impl Server {
         let dir = self.dir(&f.path)?;
         let host = self.host_flags(flags | L_O_CREAT)? | libc::O_CREAT;
         let fd = openat(&dir, &name, host, mode & 0o7777)?;
+        // SAFETY: `fd` is open.
+        let _ = unsafe { libc::fchown(fd.as_raw_fd(), self.uid as libc::uid_t, self.gid as libc::gid_t) };
         let st = fstat(&fd)?;
         let f = self.fids.get_mut(&fid).unwrap();
         f.path.push(OsStr::from_bytes(name.as_bytes()).to_owned());
@@ -788,15 +790,27 @@ impl Server {
         let dir = self.dir(&self.fid(fid)?.path)?;
         // SAFETY: both strings are NUL-terminated and `dir` is open.
         check(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) })?;
+        self.own(&dir, &name);
         Ok(qid_of(&lstatat(&dir, &name)?))
     }
 
+    /// Hand a directory or symlink the guest just made to the configured `uid` and
+    /// `gid` (a file is handed over where it is made). It works while IRIS may
+    /// chown, as root with CAP_CHOWN does; otherwise the entry stays the host
+    /// user's, as before, and nothing is reported.
+    fn own(&self, dir: &OwnedFd, name: &CStr) {
+        // SAFETY: `name` is NUL-terminated and `dir` is open.
+        let _ = unsafe {
+            libc::fchownat(dir.as_raw_fd(), name.as_ptr(), self.uid as libc::uid_t, self.gid as libc::gid_t, libc::AT_SYMLINK_NOFOLLOW)
+        };
+    }
     fn mkdir(&mut self, fid: u32, name: &[u8], mode: u32) -> io::Result<Qid> {
         self.writable()?;
         let name = entry_name(name)?;
         let dir = self.dir(&self.fid(fid)?.path)?;
         // SAFETY: `name` is NUL-terminated and `dir` is open.
         check(unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), (mode & 0o7777) as libc::mode_t) })?;
+        self.own(&dir, &name);
         Ok(qid_of(&lstatat(&dir, &name)?))
     }
 
