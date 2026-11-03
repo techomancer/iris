@@ -77,6 +77,8 @@ const QTFILE: u8 = 0;
 const GETATTR_BASIC: u64 = 0x7ff;
 
 const SETATTR_MODE: u32 = 0x001;
+const SETATTR_UID: u32 = 0x002;
+const SETATTR_GID: u32 = 0x004;
 const SETATTR_SIZE: u32 = 0x008;
 const SETATTR_ATIME: u32 = 0x010;
 const SETATTR_MTIME: u32 = 0x020;
@@ -293,6 +295,45 @@ struct Fid {
     open: Open,
 }
 
+/// Guest ids to host ids, as `"guest:host[:count],..."`. An empty map is the
+/// identity; a non-empty one maps only what it lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdMap(Vec<(u32, u32, u32)>);
+
+impl IdMap {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let mut v = Vec::new();
+        for item in s.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+            let n: Vec<&str> = item.split(':').collect();
+            if n.len() < 2 || n.len() > 3 {
+                return Err(format!("\"{item}\" is not guest:host or guest:host:count"));
+            }
+            let num = |t: &str| t.parse::<u32>().map_err(|_| format!("\"{t}\" in \"{item}\" is not an id"));
+            let (g, h) = (num(n[0])?, num(n[1])?);
+            let c = if n.len() == 3 { num(n[2])? } else { 1 };
+            if c == 0 || g.checked_add(c).is_none() || h.checked_add(c).is_none() {
+                return Err(format!("\"{item}\" has a bad count"));
+            }
+            v.push((g, h, c));
+        }
+        Ok(Self(v))
+    }
+
+    pub fn to_host(&self, guest: u32) -> Option<u32> {
+        if self.0.is_empty() {
+            return Some(guest);
+        }
+        self.0.iter().find(|&&(g, _, c)| guest >= g && guest - g < c).map(|&(g, h, _)| h + (guest - g))
+    }
+
+    pub fn to_guest(&self, host: u32) -> Option<u32> {
+        if self.0.is_empty() {
+            return Some(host);
+        }
+        self.0.iter().find(|&&(_, h, c)| host >= h && host - h < c).map(|&(g, h, _)| g + (host - h))
+    }
+}
+
 /// A share as configured.
 #[derive(Clone, Debug)]
 pub struct ShareConfig {
@@ -309,6 +350,10 @@ pub struct Server {
     readonly: bool,
     uid: u32,
     gid: u32,
+    /// `owners = "passthrough"`: the host's owners are shown and chown is made.
+    passthrough: bool,
+    uid_map: IdMap,
+    gid_map: IdMap,
     msize: u32,
     fids: HashMap<u32, Fid>,
 }
@@ -341,14 +386,35 @@ impl Server {
             readonly,
             uid,
             gid,
+            passthrough: false,
+            uid_map: IdMap::default(),
+            gid_map: IdMap::default(),
             msize: MAX_MSIZE,
             fids: HashMap::new(),
         })
     }
 
+    /// Show the host's owners (through the maps) and make a guest's chown.
+    pub fn with_passthrough(mut self, uid_map: IdMap, gid_map: IdMap) -> Self {
+        self.passthrough = true;
+        self.uid_map = uid_map;
+        self.gid_map = gid_map;
+        self
+    }
+
     /// A server whose share could not be opened: every attach fails.
     fn absent(readonly: bool, uid: u32, gid: u32) -> Self {
-        Self { root: None, readonly, uid, gid, msize: MAX_MSIZE, fids: HashMap::new() }
+        Self {
+            root: None,
+            readonly,
+            uid,
+            gid,
+            passthrough: false,
+            uid_map: IdMap::default(),
+            gid_map: IdMap::default(),
+            msize: MAX_MSIZE,
+            fids: HashMap::new(),
+        }
     }
 
     /// Drop every fid, as a driver reset or a new Tversion does.
@@ -517,16 +583,16 @@ impl Server {
                 let name = get!(r.string());
                 let flags = get!(r.u32());
                 let mode = get!(r.u32());
-                get!(r.u32()); // gid
-                w.qid(self.lcreate(fid, name, flags, mode)?);
+                let gid = get!(r.u32());
+                w.qid(self.lcreate(fid, name, flags, mode, gid)?);
                 w.u32(self.msize - 24);
             }
             TSYMLINK => {
                 let fid = get!(r.u32());
                 let name = get!(r.string());
                 let target = get!(r.string());
-                get!(r.u32()); // gid
-                w.qid(self.symlink(fid, name, target)?);
+                let gid = get!(r.u32());
+                w.qid(self.symlink(fid, name, target, gid)?);
             }
             TMKNOD => {
                 // Regular files come through Tlcreate; the host user may not
@@ -537,8 +603,8 @@ impl Server {
                 let fid = get!(r.u32());
                 let name = get!(r.string());
                 let mode = get!(r.u32());
-                get!(r.u32()); // gid
-                w.qid(self.mkdir(fid, name, mode)?);
+                let gid = get!(r.u32());
+                w.qid(self.mkdir(fid, name, mode, gid)?);
             }
             TRENAME => {
                 let fid = get!(r.u32());
@@ -609,12 +675,12 @@ impl Server {
                 let fid = get!(r.u32());
                 let valid = get!(r.u32());
                 let mode = get!(r.u32());
-                get!(r.u32()); // uid
-                get!(r.u32()); // gid
+                let uid = get!(r.u32());
+                let gid = get!(r.u32());
                 let size = get!(r.u64());
                 let atime = (get!(r.u64()), get!(r.u64()));
                 let mtime = (get!(r.u64()), get!(r.u64()));
-                self.setattr(fid, valid, mode, size, atime, mtime)?;
+                self.setattr(fid, valid, mode, (uid, gid), size, atime, mtime)?;
             }
             TXATTRWALK | TXATTRCREATE | TLOCK | TGETLOCK => return Err(err(libc::ENOTSUP)),
             TREADDIR => {
@@ -764,7 +830,7 @@ impl Server {
         Ok(qid)
     }
 
-    fn lcreate(&mut self, fid: u32, name: &[u8], flags: u32, mode: u32) -> io::Result<Qid> {
+    fn lcreate(&mut self, fid: u32, name: &[u8], flags: u32, mode: u32, gid: u32) -> io::Result<Qid> {
         self.writable()?;
         let name = entry_name(name)?;
         let f = self.fid(fid)?;
@@ -775,7 +841,8 @@ impl Server {
         let host = self.host_flags(flags | L_O_CREAT)? | libc::O_CREAT;
         let fd = openat(&dir, &name, host, mode & 0o7777)?;
         // SAFETY: `fd` is open.
-        let _ = unsafe { libc::fchown(fd.as_raw_fd(), self.uid as libc::uid_t, self.gid as libc::gid_t) };
+        let (uid, gid) = self.new_owner(gid);
+        let _ = unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) };
         let st = fstat(&fd)?;
         let f = self.fids.get_mut(&fid).unwrap();
         f.path.push(OsStr::from_bytes(name.as_bytes()).to_owned());
@@ -783,14 +850,14 @@ impl Server {
         Ok(qid_of(&st))
     }
 
-    fn symlink(&mut self, fid: u32, name: &[u8], target: &[u8]) -> io::Result<Qid> {
+    fn symlink(&mut self, fid: u32, name: &[u8], target: &[u8], gid: u32) -> io::Result<Qid> {
         self.writable()?;
         let name = entry_name(name)?;
         let target = CString::new(target).map_err(|_| err(libc::EINVAL))?;
         let dir = self.dir(&self.fid(fid)?.path)?;
         // SAFETY: both strings are NUL-terminated and `dir` is open.
         check(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) })?;
-        self.own(&dir, &name);
+        self.own(&dir, &name, gid);
         Ok(qid_of(&lstatat(&dir, &name)?))
     }
 
@@ -798,19 +865,27 @@ impl Server {
     /// `gid` (a file is handed over where it is made). It works while IRIS may
     /// chown, as root with CAP_CHOWN does; otherwise the entry stays the host
     /// user's, as before, and nothing is reported.
-    fn own(&self, dir: &OwnedFd, name: &CStr) {
+    fn own(&self, dir: &OwnedFd, name: &CStr, gid: u32) {
+        let (uid, gid) = self.new_owner(gid);
         // SAFETY: `name` is NUL-terminated and `dir` is open.
-        let _ = unsafe {
-            libc::fchownat(dir.as_raw_fd(), name.as_ptr(), self.uid as libc::uid_t, self.gid as libc::gid_t, libc::AT_SYMLINK_NOFOLLOW)
-        };
+        let _ = unsafe { libc::fchownat(dir.as_raw_fd(), name.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) };
     }
-    fn mkdir(&mut self, fid: u32, name: &[u8], mode: u32) -> io::Result<Qid> {
+
+    /// The host owner for a new entry the guest made with group `gid`: the
+    /// configured uid, and the configured gid, or in passthrough the guest's
+    /// group mapped to the host's. The driver's chown after the create gives the
+    /// creator's uid.
+    fn new_owner(&self, gid: u32) -> (libc::uid_t, libc::gid_t) {
+        let g = if self.passthrough { self.gid_map.to_host(gid).unwrap_or(self.gid) } else { self.gid };
+        (self.uid as libc::uid_t, g as libc::gid_t)
+    }
+    fn mkdir(&mut self, fid: u32, name: &[u8], mode: u32, gid: u32) -> io::Result<Qid> {
         self.writable()?;
         let name = entry_name(name)?;
         let dir = self.dir(&self.fid(fid)?.path)?;
         // SAFETY: `name` is NUL-terminated and `dir` is open.
         check(unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), (mode & 0o7777) as libc::mode_t) })?;
-        self.own(&dir, &name);
+        self.own(&dir, &name, gid);
         Ok(qid_of(&lstatat(&dir, &name)?))
     }
 
@@ -841,8 +916,14 @@ impl Server {
         w.u64(GETATTR_BASIC);
         w.qid(qid_of(st));
         w.u32(st.st_mode as u32);
-        w.u32(self.uid);
-        w.u32(self.gid);
+        if self.passthrough {
+            // The host's owner as the guest knows it; one the maps lack shows as the configured one.
+            w.u32(self.uid_map.to_guest(st.st_uid).unwrap_or(self.uid));
+            w.u32(self.gid_map.to_guest(st.st_gid).unwrap_or(self.gid));
+        } else {
+            w.u32(self.uid);
+            w.u32(self.gid);
+        }
         w.u64(st.st_nlink as u64);
         w.u64(st.st_rdev as u64);
         w.u64(st.st_size as u64);
@@ -855,7 +936,8 @@ impl Server {
         w.u64(0).u64(0).u64(0).u64(0);
     }
 
-    fn setattr(&mut self, fid: u32, valid: u32, mode: u32, size: u64, atime: (u64, u64), mtime: (u64, u64)) -> io::Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(&mut self, fid: u32, valid: u32, mode: u32, owner: (u32, u32), size: u64, atime: (u64, u64), mtime: (u64, u64)) -> io::Result<()> {
         self.writable()?;
         let f = self.fid(fid)?;
         let (dir, name) = self.parent(&f.path)?;
@@ -872,6 +954,13 @@ impl Server {
                     check(unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, 0) })?;
                 }
             }
+        }
+        if self.passthrough && valid & (SETATTR_UID | SETATTR_GID) != 0 {
+            // An id the maps do not know cannot be made on the host.
+            let uid = if valid & SETATTR_UID != 0 { self.uid_map.to_host(owner.0).ok_or_else(|| err(libc::EPERM))? } else { u32::MAX };
+            let gid = if valid & SETATTR_GID != 0 { self.gid_map.to_host(owner.1).ok_or_else(|| err(libc::EPERM))? } else { u32::MAX };
+            // SAFETY: `name` is NUL-terminated and `dir` is open; u32::MAX is "leave it".
+            check(unsafe { libc::fchownat(dir.as_raw_fd(), name.as_ptr(), uid as libc::uid_t, gid as libc::gid_t, libc::AT_SYMLINK_NOFOLLOW) })?;
         }
         if valid & SETATTR_SIZE != 0 {
             if fmt != libc::S_IFREG as u32 {
@@ -1055,7 +1144,13 @@ impl VirtioDevice for P9 {
 /// Build the device for `[virtio_9p]`.
 pub fn from_config(cfg: &crate::config::Virtio9pConfig) -> VirtioCore {
     let server = match Server::new(Path::new(&cfg.path), cfg.readonly, cfg.uid, cfg.gid) {
-        Ok(s) => {
+        Ok(mut s) => {
+            if cfg.owners == crate::config::Virtio9pOwners::Passthrough {
+                // validate() has parsed both maps already.
+                let map = |m: &str| IdMap::parse(m).unwrap_or_default();
+                s = s.with_passthrough(map(&cfg.uid_map), map(&cfg.gid_map));
+                eprintln!("iris: virtio-9p owners are passed through to the host");
+            }
             eprintln!(
                 "iris: virtio-9p share {:?} is {}{}",
                 cfg.tag,
@@ -1164,6 +1259,57 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn id_maps_translate_both_ways() {
+        let m = IdMap::parse("0:1000, 100:2000:5").unwrap();
+        assert_eq!(m.to_host(0), Some(1000));
+        assert_eq!(m.to_host(1), None);
+        assert_eq!(m.to_host(102), Some(2002));
+        assert_eq!(m.to_host(105), None);
+        assert_eq!(m.to_guest(1000), Some(0));
+        assert_eq!(m.to_guest(2004), Some(104));
+        assert_eq!(m.to_guest(2005), None);
+        assert_eq!(IdMap::parse("").unwrap().to_host(77), Some(77), "empty is the identity");
+        for bad in ["1", "a:2", "1:2:0", "1:2:3:4", "4294967295:1:2"] {
+            assert!(IdMap::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Passthrough shows the host's owner through the maps and makes a chown
+    /// the guest asks for; an id with no mapping is refused. (The host user
+    /// owns the file here, so the chown to its own id works unprivileged.)
+    #[test]
+    fn passthrough_reports_and_sets_owners_through_the_maps() {
+        // SAFETY: plain getters.
+        let (me, mygid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let mut r = Rig::new("owners");
+        r.s = Server::new(&r.share(), false, 7, 8)
+            .unwrap()
+            .with_passthrough(IdMap::parse(&format!("5:{me}")).unwrap(), IdMap::parse(&format!("6:{mygid}")).unwrap());
+        r.attach(1);
+        assert_eq!(r.walk(1, 2, &[]), 0);
+        r.ok(TLCREATE, |w| {
+            w.u32(2).string(b"f").u32(L_O_RDWR).u32(0o640).u32(6);
+        });
+        let owner = |r: &mut Rig| {
+            let b = r.ok(TGETATTR, |w| {
+                w.u32(2).u64(GETATTR_BASIC);
+            });
+            let mut g = Reader { buf: &b, at: 8 + 13 + 4 };
+            (g.u32().unwrap(), g.u32().unwrap())
+        };
+        assert_eq!(owner(&mut r), (5, 6), "the host's owner, as the guest knows it");
+        // chown to the guest's 5:6, which is this user's own id: fine.
+        r.ok(TSETATTR, |w| {
+            w.u32(2).u32(SETATTR_UID | SETATTR_GID).u32(0).u32(5).u32(6).u64(0).u64(0).u64(0).u64(0).u64(0);
+        });
+        // An id the maps lack cannot be made on the host.
+        let (rt, _) = r.rpc(TSETATTR, |w| {
+            w.u32(2).u32(SETATTR_UID).u32(0).u32(9).u32(6).u64(0).u64(0).u64(0).u64(0).u64(0);
+        });
+        assert_eq!(rt, RLERROR);
     }
 
     #[test]

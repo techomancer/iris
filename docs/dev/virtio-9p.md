@@ -21,6 +21,9 @@ tag      = "share"             # the name the guest mounts it by
 readonly = false
 uid      = 0                   # owner every file reports to the guest
 gid      = 0
+#owners   = "passthrough"       # the host's owners instead; see below
+#uid_map  = "0:1000"            # guest uid 0 is host uid 1000 (guest:host[:count],...)
+#gid_map  = "0:0"
 ```
 
 `path` is required and the machine still starts if it cannot be opened: the
@@ -85,6 +88,27 @@ user on the host: set `uid`/`gid` to theirs. Modes and times are the host file's
 them. The device checks nothing on the guest's behalf; everything it does, it
 does as the host user, and the host's own permissions apply to that user. The
 guest's kernel makes its own checks from the attributes it is given.
+
+#### `owners = "passthrough"`
+
+With the default, `owners = "squash"`, the guest sees one owner and the host sees the user
+running IRIS (or `uid`/`gid`, see above). `passthrough` carries the guest's ids to the host and
+back, as QEMU's passthrough security model does:
+
+- `getattr` reports the host file's owner, translated host-to-guest by `uid_map`/`gid_map`
+  (`"guest:host[:count],..."`; empty maps an id to itself, a non-empty map knows only what it
+  lists). An owner the map lacks shows as `uid`/`gid`.
+- `Tsetattr` with a uid or gid is made on the host with `fchownat`, guest-to-host through the
+  maps; an id the maps lack is refused with `EPERM`. The host user must be allowed to chown
+  (root, or CAP_CHOWN) for anything but its own ids.
+- What the guest creates starts as `uid` and the host group its `Tlcreate`/`Tmkdir`/`Tsymlink`
+  gid maps to. 9P2000.L's create carries a gid but no uid, so the driver follows with a
+  `Tsetattr` for the creator's uid (p9fs does, with its `owners` mount option); a driver that
+  does not leaves the entry with `uid`.
+
+The device trusts what the guest says: a guest user that can chown can give a file to any host
+uid in the map, and root in the guest is whatever its map entry says on the host. Map only ids
+the guest should be able to act as.
 
 ## Limits
 
