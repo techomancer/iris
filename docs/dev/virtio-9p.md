@@ -78,7 +78,10 @@ same rules: `..` is refused.
 
 The host's files all belong to one host user, the one running IRIS. So every file
 reports the configured `uid` and `gid`, and a guest's chown succeeds without
-effect. Modes and times are the host file's, and a guest's chmod and utime change
+effect. A file, directory or symlink the guest creates is handed to that `uid` and `gid` on
+the host when IRIS may chown (it runs as root, or has CAP_CHOWN); otherwise it belongs to the
+host user. That is how a share can be written by the guest and deleted by an unprivileged
+user on the host: set `uid`/`gid` to theirs. Modes and times are the host file's, and a guest's chmod and utime change
 them. The device checks nothing on the guest's behalf; everything it does, it
 does as the host user, and the host's own permissions apply to that user. The
 guest's kernel makes its own checks from the attributes it is given.
