@@ -53,6 +53,7 @@ pub trait PciCard: Send + Sync {
 pub type BuildCard = fn(&Options, u8) -> Result<Box<dyn PciCard>, String>;
 
 /// One kind of card.
+#[derive(Debug)]
 pub struct CardDef {
     /// The name a `[[pci]]` entry gives as `card`.
     pub name: &'static str,
