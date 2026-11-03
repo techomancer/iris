@@ -656,6 +656,15 @@ path  = "cdrom4.iso"
 cdrom = true
 # discs = ["irix65.iso", "extras.iso", "patches.iso"]   # changer; "scsi eject 4" cycles
 
+# PCI add-in cards. The O2 has one slot, PCI device 3. An "aic7880" card adds one SCSI
+# bus, controller 2: [scsi.33] is id 1 on it. An "isp12160" adds two (controllers 2 and 3;
+# IRIX on the O2 has no driver for it). The monitor's `pci slots` lists the slots.
+# [[pci]]
+# slot = 3
+# card = "aic7880"
+# [scsi.33]
+# path = "card-disk.raw"
+
 # Scratch volume for file injection without networking (see README).
 # [scsi.2]
 # path    = "scratch.raw"
@@ -786,6 +795,7 @@ Configuration
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --machine <NAME>            Machine to emulate (a [machine] profile name); `help` lists them
   --ip22                      Same as --machine indigo2_ip22
+  --pci <[BUS:]SLOT=CARD[,K=V]...>  Fit a PCI add-in card, e.g. 3=aic7880 on the O2 (repeatable)
   --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
   --cpu <MODEL>               r4400 (default), r5000, or r10000
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
