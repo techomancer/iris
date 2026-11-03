@@ -209,6 +209,8 @@ pub struct Fitted {
     pub device: u8,
     /// The controller number of the card's first SCSI bus.
     pub scsi_base: u8,
+    /// The entry's options as `key=value,...`, sorted, for a snapshot.
+    pub options: String,
     pub card: Box<dyn PciCard>,
 }
 
@@ -218,12 +220,18 @@ pub fn build_cards(placements: Vec<Placement>) -> Result<Vec<Fitted>, String> {
         .into_iter()
         .map(|p| {
             let card = (p.card.build)(&p.options, p.scsi_base).map_err(|e| format!("card \"{}\" in {} slot {}: {e}", p.card.name, p.bus.id, p.slot.device))?;
-            Ok(Fitted { bus: p.bus.id, device: p.slot.device, scsi_base: p.scsi_base, card })
+            let options = p.options.iter().map(|(k, v)| format!("{k}={}", v.as_str().map_or_else(|| v.to_string(), String::from))).collect::<Vec<_>>().join(",");
+            Ok(Fitted { bus: p.bus.id, device: p.slot.device, scsi_base: p.scsi_base, options, card })
         })
         .collect()
 }
 
 impl Fitted {
+    /// Where the card is and what it is, as a snapshot records it.
+    pub fn pci_ref(&self) -> crate::snapshot::PciRef {
+        crate::snapshot::PciRef { bus: self.bus.into(), slot: self.device, card: self.card.name().into(), options: self.options.clone() }
+    }
+
     /// The card's buses with their controller numbers.
     pub fn buses(&self) -> impl Iterator<Item = (u8, &ScsiBus)> {
         self.card.scsi_buses().into_iter().enumerate().map(|(i, b)| (self.scsi_base + i as u8, b))

@@ -621,6 +621,7 @@ impl O2Machine {
         manifest.nvram = self.flash_path.clone();
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
         manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
+        manifest.pci = self.bus.cards.iter().map(|f| f.pci_ref()).collect();
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
         snap.write_state("cpu", &self.cpu.save_state(), sv).map_err(|e| e.to_string())?;
@@ -659,9 +660,13 @@ impl O2Machine {
     }
 
     fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
+        self.read_snapshot_in(crate::snapshot::Snapshot::new(std::path::PathBuf::from("saves").join(name)), name)
+    }
+
+    /// [`Self::read_snapshot`] for the snapshot in `snap`'s directory.
+    pub(crate) fn read_snapshot_in(&self, snap: crate::snapshot::Snapshot, name: &str) -> Result<O2Snapshot, String> {
         use crate::chunk_store::{get_chunks_as_words, ChunkStore};
-        use crate::snapshot::{Snapshot, SCHEMA_VERSION};
-        let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
+        use crate::snapshot::SCHEMA_VERSION;
         let m = snap.read_manifest()?.ok_or_else(|| format!("saves/{name}: no snapshot.toml"))?;
         if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
             return Err(format!("snapshot {name} is not of an O2"));
@@ -678,6 +683,10 @@ impl O2Machine {
                 m.schema_version
             ));
         }
+        // Before anything else is compared: a snapshot of a machine with
+        // other cards is a different machine.
+        let fitted: Vec<_> = self.bus.cards.iter().map(|f| f.pci_ref()).collect();
+        crate::snapshot::check_pci(&m.pci, &fitted)?;
         // As the Indy: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
@@ -754,7 +763,7 @@ impl O2Machine {
 }
 
 /// A snapshot read and checked, ready to put into the machine.
-struct O2Snapshot {
+pub(crate) struct O2Snapshot {
     cpu: toml::Value,
     bus: toml::Value,
     boot: toml::Value,

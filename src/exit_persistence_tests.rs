@@ -678,6 +678,38 @@ fn o2_stop_flushes_its_disks() {
     });
 }
 
+/// A snapshot taken with other PCI cards is refused before anything else is
+/// read. The manifest is the only file written, so any other refusal would
+/// name something else.
+#[test]
+fn o2_restore_refuses_a_snapshot_taken_with_other_cards() {
+    use crate::snapshot::{Manifest, PciRef, Snapshot};
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("o2-cards");
+        make_images(&dir);
+        let mut cfg = config(Machine::O2, &dir, false);
+        cfg.pci.push(crate::pci_addin::PciEntry::parse_cli("3=isp12160").unwrap());
+        let mut m = build(cfg);
+        let o2 = m.as_any_mut().downcast_mut::<crate::ip32_machine::O2Machine>().unwrap();
+        let snap = Snapshot::new(dir.file("snap"));
+        snap.ensure_dir().unwrap();
+        let mut manifest = Manifest::for_current_save();
+        manifest.machine = Some("o2_ip32".into());
+        snap.write_manifest(&manifest).unwrap();
+        let err = o2.read_snapshot_in(Snapshot::new(dir.file("snap")), "snap").err().expect("refused");
+        assert!(err.contains("snapshot PCI cards differ"), "{err}");
+        assert!(err.contains("this config has pci bus \"pci\" slot 3 = isp12160, the snapshot has no card there"), "{err}");
+
+        // The same card in the same slot passes this check; the restore then
+        // stops at the first file this test did not write.
+        manifest.pci = vec![PciRef { bus: "pci".into(), slot: 3, card: "isp12160".into(), options: String::new() }];
+        snap.write_manifest(&manifest).unwrap();
+        let err = o2.read_snapshot_in(Snapshot::new(dir.file("snap")), "snap").err().expect("no state files");
+        assert!(!err.contains("PCI cards"), "{err}");
+    });
+}
+
 /// The O2 has a second way to switch off, for a machine nothing is
 /// listening to: its service loop flushes the buses and exits itself.
 #[test]
