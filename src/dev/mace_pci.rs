@@ -33,13 +33,19 @@ pub const MACEPCI_REVISION_VALUE: u32 = 1;
 pub const IP32_SCSI_SLOT: u8 = 1;
 pub const IP32_SCSI_SLOT_B: u8 = 2;
 
-/// The one add-in slot: the PCI board position in the O2's tray. Linux and
-/// OpenBSD both number it device 3 and take its INTA to CRIME input 10.
+/// The one add-in slot: the PCI board position in the O2's tray, device 3
+/// (slot 0 in the MACE specification's tables). Its INTA is CRIME input 10
+/// and INTB to INTD the shared inputs 13 to 15; Linux, OpenBSD and NetBSD
+/// route them the same way.
 pub const IP32_PCI_SLOT: u8 = 3;
 pub const IP32_PCI_CRIME_INT: u32 = 10;
+/// CRIME's inputs for a slot's INTB, INTC and INTD. They are shared: any
+/// device's pin can be routed to one, so each is the OR of its pins.
+pub const IP32_PCI_CRIME_SHARED: u32 = 13;
 
 /// The O2's PCI bus, for the configuration and the `pci slots` command. The
-/// board's INTB to INTD wiring is not known, so those pins are left unrouted.
+/// slot's four pins are routed as the MACE specification has them; what
+/// the board's connector wires INTB to INTD to is not known.
 pub const BUSES: &[BusDesc] = &[BusDesc {
     id: "pci",
     title: "the O2's PCI bus",
@@ -50,7 +56,7 @@ pub const BUSES: &[BusDesc] = &[BusDesc {
             device: IP32_PCI_SLOT,
             label: "",
             evidence: Evidence::Established,
-            source: "Linux arch/mips/pci/fixup-ip32.c (irq_tab_mace); OpenBSD sys/arch/sgi/pci/macepcibridge.c (mace_pcibr_intr_map); O2 Workstation Hardware Reference Guide 007-3275-003, installing a PCI board",
+            source: "MACE specification, PCI interrupt input tables (Tables 85 and 87, pp. 164 and 166; Table 90, p. 179), which put device 3 (slot 0) on CRIME inputs 10, 13, 14 and 15; Linux arch/mips/pci/fixup-ip32.c (irq_tab_mace), OpenBSD macepcibridge.c (mace_pcibr_intr_map) and NetBSD macepci_intr_map agree; the board connector's wiring of INTB to INTD is unknown; O2 Workstation Hardware Reference Guide 007-3275-003, installing a PCI board",
             settled_by: "",
         }),
     ],
@@ -68,6 +74,10 @@ fn crime_input(slot: u8, pin: u8) -> Option<u32> {
     match (slot, pin) {
         (IP32_SCSI_SLOT, 1) => Some(IP32_SCSI_CRIME_INT),
         (IP32_SCSI_SLOT_B, 1) => Some(IP32_SCSI_CRIME_INT_B),
+        (IP32_PCI_SLOT, 1) => Some(IP32_PCI_CRIME_INT),
+        // INTB to INTD, on the shared inputs 13 to 15, where the kernels
+        // look for them. Whether the board's connector wires them is unknown.
+        (IP32_PCI_SLOT, pin @ 2..=4) => Some(IP32_PCI_CRIME_SHARED + pin as u32 - 2),
         _ => None,
     }
 }
@@ -903,7 +913,7 @@ mod tests {
         let (a, b, c) = (fake(PCI_INTA), fake(PCI_INTA), fake(PCI_INTA + 1));
         pci.attach(IP32_SCSI_SLOT, "a", a.clone());
         pci.attach(IP32_SCSI_SLOT_B, "b", b.clone());
-        pci.attach(3, "c", c.clone());
+        pci.attach(7, "c", c.clone());
         a.irq.get().unwrap().set(true);
         b.irq.get().unwrap().set(true);
         c.irq.get().unwrap().set(true);
@@ -930,5 +940,63 @@ mod tests {
         assert_eq!(report.len(), 1 + BUSES[0].slots.len());
         assert!(report[1].contains("device 1: onboard"), "{report:?}");
         assert!(report[3].contains("device 3: add-in slot (established), empty"), "{report:?}");
+    }
+
+    fn pin_fake(pin: u8) -> Arc<Fake> {
+        Arc::new(Fake {
+            cfg: PciConfig::new(0x1077, 0x1216, 0x01_0000, 1, [Bar::Unused; 6], pin),
+            last: Mutex::new(None),
+            irq: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Each pin of a card in the add-in slot reaches its own CRIME input:
+    /// INTA 10, INTB to INTD the shared 13 to 15.
+    #[test]
+    fn each_pin_of_the_add_in_slot_reaches_its_crime_input() {
+        for (pin, input) in [(PCI_INTA, 10), (PCI_INTA + 1, 13), (PCI_INTA + 2, 14), (PCI_INTA + 3, 15)] {
+            let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+            let pci = MacePci::new(crime.clone(), test_ram());
+            let card = pin_fake(pin);
+            pci.attach(IP32_PCI_SLOT, "card", card.clone());
+            card.irq.get().unwrap().set(true);
+            assert_eq!(*crime.0.lock().unwrap(), vec![(input, true)], "pin {pin}");
+            card.irq.get().unwrap().set(false);
+            assert_eq!(crime.0.lock().unwrap().last(), Some(&(input, false)), "pin {pin}");
+        }
+        assert_eq!(IP32_PCI_CRIME_INT, 10);
+        assert_eq!(IP32_PCI_CRIME_SHARED, 13);
+    }
+
+    /// A shared input stays up until every pin routed to it has dropped:
+    /// the slot's INTB and another device's pin on CRIME 13.
+    #[test]
+    fn two_pins_on_a_shared_crime_input_or_together() {
+        fn route(slot: u8, pin: u8) -> Option<u32> {
+            crime_input(slot, pin).or((slot == 5 && pin == 1).then_some(IP32_PCI_CRIME_SHARED))
+        }
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::with_routing(crime.clone(), route, test_ram());
+        let (slot, other) = (pin_fake(PCI_INTA + 1), pin_fake(PCI_INTA));
+        pci.attach(IP32_PCI_SLOT, "slot", slot.clone());
+        pci.attach(5, "other", other.clone());
+        let last = || *crime.0.lock().unwrap().last().unwrap();
+        slot.irq.get().unwrap().set(true);
+        assert_eq!(last(), (13, true));
+        other.irq.get().unwrap().set(true);
+        slot.irq.get().unwrap().set(false);
+        assert_eq!(last(), (13, true), "the other device's pin still holds it");
+        other.irq.get().unwrap().set(false);
+        assert_eq!(last(), (13, false));
+    }
+
+    #[test]
+    fn pci_slots_shows_a_fitted_cards_routing() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime, test_ram());
+        pci.attach(IP32_PCI_SLOT, "card", pin_fake(PCI_INTA));
+        let report = pci.slots_report();
+        assert!(report[3].contains("holds card 1077:1216"), "{report:?}");
+        assert!(report[3].contains("INTA CRIME 10, INTB CRIME 13, INTC CRIME 14, INTD CRIME 15"), "{report:?}");
     }
 }

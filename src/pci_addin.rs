@@ -14,7 +14,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::MachineProfile;
-use crate::pci_cards::{card_def, card_names, CardDef, Options};
+use crate::pci_cards::{card_def, card_names, CardDef, Options, PciCard};
+use crate::scsi::ScsiBus;
 
 /// How well a fact is known, from strongest to weakest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +201,33 @@ pub struct Placement {
     /// The controller number of the card's first SCSI bus: after the
     /// machine's own, and after the cards before it.
     pub scsi_base: u8,
+}
+
+/// A card built for its slot.
+pub struct Fitted {
+    pub bus: &'static str,
+    pub device: u8,
+    /// The controller number of the card's first SCSI bus.
+    pub scsi_base: u8,
+    pub card: Box<dyn PciCard>,
+}
+
+/// Build the card of every placement.
+pub fn build_cards(placements: Vec<Placement>) -> Result<Vec<Fitted>, String> {
+    placements
+        .into_iter()
+        .map(|p| {
+            let card = (p.card.build)(&p.options, p.scsi_base).map_err(|e| format!("card \"{}\" in {} slot {}: {e}", p.card.name, p.bus.id, p.slot.device))?;
+            Ok(Fitted { bus: p.bus.id, device: p.slot.device, scsi_base: p.scsi_base, card })
+        })
+        .collect()
+}
+
+impl Fitted {
+    /// The card's buses with their controller numbers.
+    pub fn buses(&self) -> impl Iterator<Item = (u8, &ScsiBus)> {
+        self.card.scsi_buses().into_iter().enumerate().map(|(i, b)| (self.scsi_base + i as u8, b))
+    }
 }
 
 /// The bus an entry names, or the machine's only one.

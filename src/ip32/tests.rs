@@ -958,3 +958,66 @@ fn every_device_answers_the_monitor_through_the_bus() {
     }
     assert!(bus.execute_command("nonesuch", &[], Box::new(std::io::sink())).is_err());
 }
+
+/// A configuration read of `reg` in `device`'s header on bus 0.
+fn pci_config_read(bus: &Ip32Bus, device: u32, reg: u32) -> u32 {
+    use crate::traits::BusDevice;
+    let pci = &bus.mace.pci;
+    pci.write32((MACEPCI_BASE + macepci_reg::CONFIG_ADDR) as u64, 1 << 31 | device << 11 | reg << 2);
+    pci.read32((MACEPCI_BASE + macepci_reg::CONFIG_DATA) as u64).data
+}
+
+fn o2_with_cards(entries: &[&str]) -> Arc<Ip32Bus> {
+    let entries: Vec<_> = entries.iter().map(|e| crate::pci_addin::PciEntry::parse_cli(e).unwrap()).collect();
+    let placed = crate::pci_addin::validate_pci(crate::config::MachineProfile::O2Ip32, &entries).unwrap();
+    let opts = Ip32Options { cards: crate::pci_addin::build_cards(placed).unwrap(), ..Default::default() };
+    Ip32Bus::with_options(O2Memory::single(1 << 20), vec![0u8; PROM_SIZE as usize], opts)
+}
+
+#[test]
+fn a_card_in_the_add_in_slot_enumerates_at_device_3_and_the_slot_is_empty_without_one() {
+    let empty = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    assert_eq!(pci_config_read(&empty, 3, 0), 0xffff_ffff, "nothing answers in the slot");
+    let bus = o2_with_cards(&["3=isp12160"]);
+    assert_eq!(pci_config_read(&bus, 3, 0), 0x1216_1077, "QLogic ISP12160 at device 3");
+    assert_eq!(pci_config_read(&bus, 0, 0), 0xffff_ffff, "device 0 is still empty");
+    assert_eq!(pci_config_read(&bus, 4, 0), 0xffff_ffff, "and so is device 4");
+    let report = bus.mace.pci.slots_report();
+    assert!(report[3].contains("holds isp12160 1077:1216"), "{report:?}");
+    assert_eq!(bus.scsi_buses(&[]).iter().map(|&(n, _)| n).collect::<Vec<_>>(), vec![2, 3], "after the two onboard controllers");
+}
+
+#[test]
+fn each_pin_of_a_card_sets_its_crime_input_and_no_other() {
+    use crate::pci::{Bar, PciBusDevice, PciConfig, PCI_INTA};
+    struct Pin(PciConfig, std::sync::OnceLock<crate::irq::IrqLine>);
+    impl PciBusDevice for Pin {
+        fn config(&self) -> &PciConfig { &self.0 }
+        fn bar_read(&self, _: usize, _: u32, _: usize) -> u32 { 0 }
+        fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
+        fn connect_interrupt(&self, line: crate::irq::IrqLine) { let _ = self.1.set(line); }
+    }
+    for (pin, input) in [(PCI_INTA, 10), (PCI_INTA + 1, 13), (PCI_INTA + 2, 14), (PCI_INTA + 3, 15)] {
+        let bus = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+        let card = Arc::new(Pin(PciConfig::new(0x1077, 0x1216, 0x01_0000, 1, [Bar::Unused; 6], pin), Default::default()));
+        bus.mace.pci.attach(IP32_PCI_SLOT, "pin", card.clone());
+        let before = bus.crime.regs.intstat();
+        card.1.get().expect("wired at attach").set(true);
+        assert_eq!(bus.crime.regs.intstat() & !before, 1 << input, "pin {pin}: CRIME bit {input}, nothing else");
+        card.1.get().unwrap().set(false);
+        assert_eq!(bus.crime.regs.intstat(), before, "pin {pin}");
+    }
+}
+
+#[test]
+fn a_card_changes_the_saved_state_and_a_machine_without_it_refuses_it() {
+    use crate::traits::Saveable;
+    let with = o2_with_cards(&["3=isp12160"]);
+    let without = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    let saved = with.save_state();
+    with.load_state(&saved).expect("the same machine loads its own state");
+    let err = without.load_state(&saved).unwrap_err();
+    assert!(err.contains("slot 3, which is empty here"), "{err}");
+    let err = with.load_state(&without.save_state()).unwrap_err();
+    assert!(err.contains("0 PCI cards, this machine 1"), "{err}");
+}

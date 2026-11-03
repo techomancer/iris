@@ -180,11 +180,18 @@ impl O2Machine {
         // machines; `controller` is the bus (0 internal, 1 external). The
         // buses are filled before the controllers exist.
         let scsi = [crate::dev::aic7880::Aic7880::new_bus(), crate::dev::aic7880::Aic7880::new_bus()];
+        // Cards in the add-in slot bring buses of their own, numbered after
+        // the two onboard ones.
+        let cards = crate::pci_addin::build_cards(crate::pci_addin::validate_pci(cfg.machine.profile, &cfg.pci)?)?;
         let attached = crate::scsi::attach_from_config(cfg, Some("ip32"), &|c| {
-            scsi.get(c as usize)
-                .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1)"))
+            if let Some(bus) = scsi.get(c as usize) {
+                return Ok(bus);
+            }
+            cards.iter().flat_map(|f| f.buses()).find(|&(n, _)| n == c).map(|(_, b)| b)
+                .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1, and each add-in card its own)"))
         })?;
         let opts = Ip32Options {
+            cards,
             scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
@@ -542,6 +549,9 @@ impl O2Machine {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.stop();
         }
+        for f in &self.bus.cards {
+            f.card.stop();
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
@@ -568,6 +578,9 @@ impl O2Machine {
     fn start_scsi(&self) {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.start();
+        }
+        for f in &self.bus.cards {
+            f.card.start();
         }
     }
 
@@ -619,10 +632,11 @@ impl O2Machine {
         chunks.bank_chunks[0] = put_bank_words(&store, &self.bus.ram)
             .map_err(|e| format!("CAS memory put: {e}"))?;
         snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
-        for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
+        let onboard = self.bus.scsi.lock().unwrap().clone();
+        for (i, bus) in self.bus.scsi_buses(&onboard) {
             let dir = snap.dir.join(format!("ctrl{i}"));
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let overlays = ctl.export_overlays(&dir).map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
+            let overlays = bus.export_overlays(&dir).map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
             snap.write_toml(&format!("cow{i}.toml"), &crate::machine::build_cow_table(overlays))
                 .map_err(|e| e.to_string())?;
         }
@@ -675,7 +689,8 @@ impl O2Machine {
             return Err(format!("snapshot memory is {} MB, this O2 has {} MB",
                 memory.len() >> 18, self.bus.ram.len() >> 20));
         }
-        let ctrls = self.bus.scsi.lock().unwrap().len();
+        let onboard = self.bus.scsi.lock().unwrap().clone();
+        let ctrls = self.bus.scsi_buses(&onboard).iter().map(|&(i, _)| i + 1).max().unwrap_or(0);
         let overlays = (0..ctrls)
             .map(|i| snap.read_toml(&format!("cow{i}.toml")).ok().map(|t| crate::machine::parse_cow_table(&t)))
             .collect();
@@ -701,9 +716,10 @@ impl O2Machine {
         self.boot.load(&s.boot);
         self.bus.set_flash(&s.flash)?;
         self.bus.ram.restore_words(&s.memory)?;
-        for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
+        let onboard = self.bus.scsi.lock().unwrap().clone();
+        for (i, bus) in self.bus.scsi_buses(&onboard) {
             if let Some(Some(sets)) = s.overlays.get(i) {
-                ctl.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
+                bus.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
                     .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
             }
         }
@@ -814,7 +830,8 @@ impl Workstation for O2Machine {
     }
 
     fn pending_chd_sync_count(&self) -> usize {
-        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+        let onboard = self.bus.scsi.lock().unwrap().clone();
+        self.bus.scsi_buses(&onboard).iter().map(|(_, b)| b.pending_chd_sync_count()).sum()
     }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.bus.flush_disks()
@@ -826,7 +843,7 @@ impl Workstation for O2Machine {
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
         let controllers = self.bus.scsi.lock().unwrap().clone();
-        let buses: Vec<_> = controllers.iter().map(|c| c.bus()).collect();
+        let buses: Vec<_> = self.bus.scsi_buses(&controllers).into_iter().map(|(_, b)| b).collect();
         crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
     }
 
