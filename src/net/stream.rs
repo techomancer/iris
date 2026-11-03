@@ -196,6 +196,22 @@ enum Incoming {
     Oversize(usize),
 }
 
+/// The frame without any bytes after its IP packet. A guest's driver can hand
+/// the NIC more than the packet (the length field of IPv4 or IPv6 is the
+/// authority on where it ends); a user-space stack on the other end takes the
+/// extra bytes for payload or refuses the frame, where a real wire's receiver
+/// would never see them. Anything that is not a whole IP packet is left alone.
+pub fn trim_to_ip_packet(frame: &[u8]) -> &[u8] {
+    let end = match frame.get(12..14) {
+        Some([0x08, 0x00]) if frame.len() >= 14 + 20 => 14 + u16::from_be_bytes([frame[16], frame[17]]) as usize,
+        Some([0x86, 0xdd]) if frame.len() >= 14 + 40 => 14 + 40 + u16::from_be_bytes([frame[18], frame[19]]) as usize,
+        _ => return frame,
+    };
+    // A length shorter than the headers is garbage, not a reason to cut.
+    let min = if frame[12] == 0x08 { 14 + 20 } else { 14 + 40 };
+    if end >= min && end < frame.len() { &frame[..end] } else { frame }
+}
+
 /// Read one frame. `Ok(None)` is a clean end of stream between frames. A frame
 /// longer than [`MAX_FRAME`] is an `InvalidData` error.
 pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
@@ -461,7 +477,7 @@ impl StreamBackend {
                 let mut failed = false;
                 while let Ok(frame) = io.tx_cons.pop() {
                     self.frames.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = write_frame_while(&mut wr, &frame, &|| self.live(io)) {
+                    if let Err(e) = write_frame_while(&mut wr, trim_to_ip_packet(&frame), &|| self.live(io)) {
                         eprintln!("iris: network stream write: {e}");
                         failed = true;
                         break;
@@ -513,6 +529,40 @@ impl NetBackend for Arc<StreamBackend> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn bytes_after_the_ip_packet_are_cut_off() {
+        let eth = |ty: [u8; 2], l3: &[u8]| {
+            let mut f = vec![0u8; 12];
+            f.extend_from_slice(&ty);
+            f.extend_from_slice(l3);
+            f
+        };
+        // IPv4: total length 28 (a 20 byte header and 8 of payload), 5 bytes more.
+        let mut ip4 = vec![0x45, 0, 0, 28];
+        ip4.resize(28, 7);
+        ip4.extend_from_slice(&[9; 5]);
+        let f4 = eth([8, 0], &ip4);
+        assert_eq!(trim_to_ip_packet(&f4).len(), 14 + 28);
+        // IPv6: payload length 8, 3 bytes more.
+        let mut ip6 = vec![0x60, 0, 0, 0, 0, 8];
+        ip6.resize(40 + 8, 7);
+        ip6.extend_from_slice(&[9; 3]);
+        let f6 = eth([0x86, 0xdd], &ip6);
+        assert_eq!(trim_to_ip_packet(&f6).len(), 14 + 40 + 8);
+        // Exact, short of the headers, claiming more than there is, ARP: untouched.
+        assert_eq!(trim_to_ip_packet(&f4[..14 + 28]).len(), 14 + 28);
+        let mut short = f4.clone();
+        short[16] = 0;
+        short[17] = 3;
+        assert_eq!(trim_to_ip_packet(&short).len(), f4.len());
+        let mut long = f4.clone();
+        long[17] = 200;
+        assert_eq!(trim_to_ip_packet(&long).len(), f4.len());
+        let arp = eth([8, 6], &[0u8; 46]);
+        assert_eq!(trim_to_ip_packet(&arp).len(), arp.len());
+        assert_eq!(trim_to_ip_packet(&[1, 2, 3]).len(), 3);
+    }
 
     #[test]
     fn a_frame_is_a_big_endian_length_then_its_bytes() {
