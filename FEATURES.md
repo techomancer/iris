@@ -423,6 +423,20 @@ calendar without adding the time since.
 |---|---|---|
 | `ultra64.enabled` | `false` | Enable the GIO N64 development board; requires an external gopher64 peer. |
 
+### [virtio_9p]
+
+A host directory the guest mounts, as 9P2000.L over virtio; see
+[docs/dev/virtio-9p.md](docs/dev/virtio-9p.md). For guests that carry a driver.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `virtio_9p.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge. Refused on the O2. |
+| `virtio_9p.slot` | `"exp1"` | `"exp0"` or `"exp1"`, as for `virtio_serial`, and not the slot that device has. Indy and Indigo2 only. |
+| `virtio_9p.path` | required | The host directory. |
+| `virtio_9p.tag` | `"share"` | The name the guest mounts it by; 1 to 64 bytes. |
+| `virtio_9p.readonly` | `false` | Refuse every write from the guest. |
+| `virtio_9p.uid`, `virtio_9p.gid` | `0` | The owner every file reports to the guest. |
+
 ### [virtio_serial]
 
 virtio-console / virtio-serial for guests that carry a driver; see

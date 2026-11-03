@@ -25,3 +25,11 @@ overlay = true
 # [[virtio_serial.port]]
 # console  = true
 # tcp_port = 8890
+
+# Optional: a host directory the guest mounts (see docs/dev/virtio-9p.md). If
+# virtio-serial is on too, give each its own slot.
+# [virtio_9p]
+# enabled = true
+# slot    = "exp0"
+# path    = "/path/on/the/host"
+# tag     = "share"

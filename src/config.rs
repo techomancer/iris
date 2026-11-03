@@ -675,6 +675,57 @@ pub struct FibreChannelConfig {
     pub slot: Option<u8>,
 }
 
+/// virtio-9p: a host directory the guest mounts, `[virtio_9p]`. See
+/// `src/dev/virtio/p9.rs` and `docs/dev/virtio-9p.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Virtio9pConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// GIO expansion slot, on the Indy and Indigo2 (IP24/IP22/IP28). The
+    /// Octane puts it on the PCI bus and ignores this.
+    #[serde(default)]
+    pub slot: VirtioGioSlot,
+    /// Host directory to share.
+    #[serde(default)]
+    pub path: String,
+    /// The name the guest mounts it by.
+    #[serde(default = "default_9p_tag")]
+    pub tag: String,
+    /// Refuse every write from the guest.
+    #[serde(default)]
+    pub readonly: bool,
+    /// Owner every file reports to the guest; host files have one owner, and
+    /// a guest chown is accepted without effect.
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+}
+
+fn default_9p_tag() -> String {
+    "share".to_owned()
+}
+
+impl Default for Virtio9pConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            slot: VirtioGioSlot::default(),
+            path: String::new(),
+            tag: default_9p_tag(),
+            readonly: false,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
+impl Virtio9pConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Emulated SGI machine profile (hardware layout scaffold).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -2604,6 +2655,9 @@ pub struct MachineConfig {
     /// Fibre Channel adapter and its loop (`[fibre_channel]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fibre_channel: Option<FibreChannelConfig>,
+    /// virtio-9p shared directory (`[virtio_9p]`).
+    #[serde(default, skip_serializing_if = "Virtio9pConfig::is_default")]
+    pub virtio_9p: Virtio9pConfig,
 }
 
 fn default_scsi_deferred_int() -> bool { true }
@@ -2832,6 +2886,7 @@ impl Default for MachineConfig {
             xio_board: Vec::new(),
             nvme: NvmeConfig::default(),
             fibre_channel: None,
+            virtio_9p: Virtio9pConfig::default(),
         }
     }
 }
@@ -3012,6 +3067,62 @@ impl MachineConfig {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_virtio_9p_for_test(&self) -> Result<(), String> {
+        self.validate_virtio_9p()
+    }
+
+    /// `[virtio_9p]`: what it shares, and whether this machine has somewhere
+    /// to put it.
+    fn validate_virtio_9p(&self) -> Result<(), String> {
+        let v = &self.virtio_9p;
+        if !v.enabled {
+            return Ok(());
+        }
+        if cfg!(not(unix)) {
+            return Err("[virtio_9p] needs a Unix host".into());
+        }
+        if v.path.is_empty() {
+            return Err("[virtio_9p] needs a path to share".into());
+        }
+        if v.tag.is_empty() || v.tag.len() > 64 {
+            return Err("[virtio_9p] tag must be 1 to 64 bytes".into());
+        }
+        match self.machine.profile {
+            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
+                if self.virtio_serial.enabled && self.virtio_serial.slot == v.slot {
+                    return Err(format!(
+                        "[virtio_9p] and [virtio_serial] are both in slot {:?}; a GIO slot holds one device",
+                        v.slot
+                    ));
+                }
+                match v.slot {
+                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device => Err(
+                        "[virtio_9p] slot = \"exp0\" is taken by the ultra64 board or test_device; use \"exp1\"".into(),
+                    ),
+                    VirtioGioSlot::Exp1 if self.graphics.heads == 2 && !self.headless => Err(
+                        "[virtio_9p] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"".into(),
+                    ),
+                    _ => Ok(()),
+                }
+            }
+            MachineProfile::OctaneIp30 => Ok(()),
+            MachineProfile::O2Ip32 => Err(
+                "[virtio_9p] is not wired on the O2: the MACE PCI bridge has no interrupt route for a third slot".into(),
+            ),
+            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => Err("[virtio_9p] is not wired on the Origin 3200 or the Onyx 3000".into()),
+            MachineProfile::Origin200Ip29 => Err("[virtio_9p] is not wired on the Origin 200".into()),
+            MachineProfile::Origin2000Ip27 => Err("[virtio_9p] is not wired on the Origin 2000".into()),
+            MachineProfile::Onyx2Ip27 => Err("[virtio_9p] is not wired on the Onyx2".into()),
+            MachineProfile::FuelIp34 => Err(
+                "[virtio_9p] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
+            ),
+            MachineProfile::TezroIp53 => Err(
+                "[virtio_9p] is not wired on the Tezro: its PIC has no virtio-pci attachment".into(),
+            ),
+        }
     }
 
     /// The serial channels' TCP ports (A, B), defaults filled in.
@@ -3300,6 +3411,7 @@ impl MachineConfig {
         self.validate_fibre_channel()?;
         self.cpu_part()?;
         self.machine.profile.accepts_cpus(self.machine.cpus())?;
+        self.validate_virtio_9p()?;
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
             return Err(format!(
                 "graphics.heads {} is invalid (valid: 1, 2)",
