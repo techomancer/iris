@@ -31,6 +31,7 @@ use parking_lot::Mutex;
 
 use crate::dev::heart_mem::HeartRam;
 use crate::pci::BarRun;
+use crate::pci_addin::{BusDesc, BusSlot};
 use crate::physical::Physical;
 use crate::ppmem::devmap::{entry_eq, SLOT_SHIFT};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
@@ -39,6 +40,22 @@ use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ER
 pub const WIDGET_XBOW: u8 = 0x0;
 pub const WIDGET_HEART: u8 = 0x8;
 pub const WIDGET_BRIDGE: u8 = 0xf;
+
+/// The PCI bus on the Bridge, for the configuration. All four devices are
+/// onboard; the Octane's PCI boards sit behind their own Bridge on an XIO
+/// port, which this table does not describe until its port and device
+/// numbers are established.
+pub const BUSES: &[BusDesc] = &[BusDesc {
+    id: "bridge",
+    title: "the Octane's Bridge",
+    slots: &[
+        BusSlot::Onboard { device: 0, name: "internal SCSI controller" },
+        BusSlot::Onboard { device: 1, name: "external SCSI controller" },
+        BusSlot::Onboard { device: 2, name: "IOC3 (Ethernet, serial, real-time clock)" },
+        BusSlot::Onboard { device: 3, name: "RAD1 audio" },
+    ],
+    no_add_in: "the Octane's PCI boards sit on XIO ports behind a Bridge of their own, and their port and device numbers are not established",
+}];
 
 /// Widget `w`'s small window: 16 MiB at `0x1000_0000 + (w << 24)`.
 pub const fn widget_small_base(w: u8) -> u64 {

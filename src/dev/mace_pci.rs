@@ -12,6 +12,7 @@ use crate::pci::{bar_runs, plug, BarAt, BarRun, IntxTable, BarRunSink, PciBar, P
 use crate::snapshot::{get_field, hex_u32, load_u32_slice, toml_u32, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_OK};
 use crate::ip32::*;
+use crate::pci_addin::{BusDesc, BusSlot, Evidence, SlotDesc};
 
 pub mod macepci_reg {
     pub const ERROR_ADDR: u32 = 0x0000;
@@ -31,6 +32,30 @@ pub const MACEPCI_REVISION_VALUE: u32 = 1;
 /// both are expected to be there.
 pub const IP32_SCSI_SLOT: u8 = 1;
 pub const IP32_SCSI_SLOT_B: u8 = 2;
+
+/// The one add-in slot: the PCI board position in the O2's tray. Linux and
+/// OpenBSD both number it device 3 and take its INTA to CRIME input 10.
+pub const IP32_PCI_SLOT: u8 = 3;
+pub const IP32_PCI_CRIME_INT: u32 = 10;
+
+/// The O2's PCI bus, for the configuration and the `pci slots` command. The
+/// board's INTB to INTD wiring is not known, so those pins are left unrouted.
+pub const BUSES: &[BusDesc] = &[BusDesc {
+    id: "pci",
+    title: "the O2's PCI bus",
+    slots: &[
+        BusSlot::Onboard { device: IP32_SCSI_SLOT, name: "internal SCSI controller (AIC-7880)" },
+        BusSlot::Onboard { device: IP32_SCSI_SLOT_B, name: "external SCSI controller (AIC-7880)" },
+        BusSlot::AddIn(SlotDesc {
+            device: IP32_PCI_SLOT,
+            label: "",
+            evidence: Evidence::Established,
+            source: "Linux arch/mips/pci/fixup-ip32.c (irq_tab_mace); OpenBSD sys/arch/sgi/pci/macepcibridge.c (mace_pcibr_intr_map); O2 Workstation Hardware Reference Guide 007-3275-003, installing a PCI board",
+            settled_by: "",
+        }),
+    ],
+    no_add_in: "",
+}];
 
 /// Which of CRIME's interrupt inputs the pin of the function in that slot
 /// drives. NetBSD works this out for itself and prints it: "interrupting at
@@ -325,6 +350,42 @@ impl MacePci {
         Some((s.name, s.dev.clone(), touched))
     }
 
+    /// The bus's slots from [`BUSES`], with what is in each and where its
+    /// interrupt pins go: one line per device number the table knows.
+    pub fn slots_report(&self) -> Vec<String> {
+        let bus = &BUSES[0];
+        let mut out = vec![format!("{}:", bus.title)];
+        for row in bus.slots {
+            let device = row.device();
+            let fitted = self.slot(device).map(|(name, f, _)| {
+                let id = f.config().read(0);
+                format!("{name} {:04x}:{:04x}", id & 0xffff, id >> 16)
+            });
+            let line = match row {
+                BusSlot::Onboard { name, .. } => {
+                    format!("  device {device}: onboard, {name}")
+                }
+                BusSlot::AddIn(s) => {
+                    let pins: Vec<String> = (1..=4u8)
+                        .map(|p| match self.irq.input(device, p) {
+                            Some(i) => format!("INT{} CRIME {i}", (b'A' + p - 1) as char),
+                            None => format!("INT{} unrouted", (b'A' + p - 1) as char),
+                        })
+                        .collect();
+                    let label = if s.label.is_empty() { String::new() } else { format!(" \"{}\"", s.label) };
+                    format!(
+                        "  device {device}{label}: add-in slot ({}), {}; {}",
+                        s.evidence.name(),
+                        fitted.as_deref().map_or("empty".to_string(), |f| format!("holds {f}")),
+                        pins.join(", ")
+                    )
+                }
+            };
+            out.push(line);
+        }
+        out
+    }
+
     /// Whether `addr` is in one of the CPU's windows onto PCI memory.
     pub fn in_window(addr: u32) -> bool {
         (PCI_MEM_BASE..PCI_MEM_BASE + PCI_MEM_SIZE).contains(&addr)
@@ -582,7 +643,7 @@ impl crate::traits::Device for MacePci {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("pci".to_string(), "MACE PCI bridge: pci status | pci config <slot>".to_string())]
+        vec![("pci".to_string(), "MACE PCI bridge: pci status | pci slots | pci config <slot>".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -612,6 +673,11 @@ impl crate::traits::Device for MacePci {
                         s.name, id & 0xffff, id >> 16, c.command(), bars.join(", ")).ok();
                 }
             }
+            "slots" => {
+                for line in self.slots_report() {
+                    writeln!(w, "{line}").ok();
+                }
+            }
             "config" => {
                 let slot: u8 = args.get(1).and_then(|v| v.parse().ok()).ok_or("Usage: pci config <slot>")?;
                 let (_, f, _) = self.slot(slot).ok_or(format!("pci: nothing in slot {slot}"))?;
@@ -620,7 +686,7 @@ impl crate::traits::Device for MacePci {
                     writeln!(w, "  {:02x}: {}", row * 16, v.join(" ")).ok();
                 }
             }
-            _ => return Err("Usage: pci status | config <slot>".to_string()),
+            _ => return Err("Usage: pci status | slots | config <slot>".to_string()),
         }
         Ok(())
     }
@@ -842,5 +908,27 @@ mod tests {
         b.irq.get().unwrap().set(true);
         c.irq.get().unwrap().set(true);
         assert_eq!(*crime.0.lock().unwrap(), vec![(IP32_SCSI_CRIME_INT, true), (IP32_SCSI_CRIME_INT_B, true)]);
+    }
+
+    /// The table's onboard rows are the slots the machine attaches, and its
+    /// one add-in slot is where nothing is attached.
+    #[test]
+    fn the_bus_table_matches_the_onboard_slots() {
+        let onboard: Vec<u8> = BUSES[0].slots.iter()
+            .filter_map(|s| match s { BusSlot::Onboard { device, .. } => Some(*device), _ => None })
+            .collect();
+        assert_eq!(onboard, vec![IP32_SCSI_SLOT, IP32_SCSI_SLOT_B]);
+        let add_in: Vec<u8> = BUSES[0].add_ins().map(|s| s.device).collect();
+        assert_eq!(add_in, vec![IP32_PCI_SLOT]);
+    }
+
+    #[test]
+    fn pci_slots_lists_every_device_the_table_knows() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime, test_ram());
+        let report = pci.slots_report();
+        assert_eq!(report.len(), 1 + BUSES[0].slots.len());
+        assert!(report[1].contains("device 1: onboard"), "{report:?}");
+        assert!(report[3].contains("device 3: add-in slot (established), empty"), "{report:?}");
     }
 }
