@@ -118,6 +118,9 @@ pub mod edlc_flags {
 }
 
 // ── Internal register state ───────────────────────────────────────────────────
+/// The most a partial transmit frame may hold before it is given up on (a jumbo frame is 9 KB).
+const TX_PARTIAL_MAX: usize = 16 * 1024;
+
 pub struct SeeqState {
     pub rx_cmd:   u8,
     pub rx_stat:  u8,
@@ -403,20 +406,32 @@ impl Seeq8003 {
 
     /// Drain TX DMA into a frame and push it to the NAT thread.
     /// Runs WITHOUT SeeqState lock. Returns a TxPumpResult to be applied under SeeqState lock.
+    ///
+    /// `partial` holds the bytes of a frame whose last descriptor has not been
+    /// reached yet. The poll can catch a chain the driver is still extending
+    /// (the channel stops at the end of what is there and is started again),
+    /// and the bytes it read are gone from the channel: kept here, they join
+    /// the rest of the frame; dropped, the rest goes out as a frame of its own,
+    /// starting in the middle of a packet.
     fn pump_tx(tx_dma: &Arc<dyn DmaClient>,
                tx_prod: &mut rtrb::Producer<Vec<u8>>,
                tx_wake: &Arc<crate::net::Wake>,
-               in_reset: &Arc<AtomicBool>) -> TxPumpResult {
-        if in_reset.load(Ordering::Relaxed) { return TxPumpResult::Nothing; }
-        let mut frame = Vec::with_capacity(1518);
+               in_reset: &Arc<AtomicBool>,
+               partial: &mut Vec<u8>) -> TxPumpResult {
+        if in_reset.load(Ordering::Relaxed) { partial.clear(); return TxPumpResult::Nothing; }
+        let mut frame = std::mem::take(partial);
+        if frame.capacity() == 0 { frame.reserve(1518); }
         let mut got_eop = false;
         let mut dma_st = DmaStatus::ok();
         while let Some((b, dst)) = tx_dma.read() {
             frame.push(b as u8);
             dma_st = dst;
             if dst.eop() { got_eop = true; break; }
+            // No frame is this long: the channel is not delivering one.
+            if frame.len() > TX_PARTIAL_MAX { frame.clear(); }
         }
-        if frame.is_empty() || !got_eop { return TxPumpResult::Nothing; }
+        if frame.is_empty() { return TxPumpResult::Nothing; }
+        if !got_eop { *partial = frame; return TxPumpResult::Nothing; }
 
         dlog_dev!(LogModule::Seeq, "SEEQ TX {} dma_st={:#x}", eth_summary(&frame), dma_st.0);
 
@@ -723,6 +738,8 @@ impl Device for Seeq8003 {
         thread::Builder::new().name("seeq-enet".into()).spawn(move || {
             let mut tx_prod = tx_prod;
             let mut rx_cons = rx_cons;
+            // A frame's bytes read so far, its last descriptor not yet in sight (see `pump_tx`).
+            let mut tx_partial: Vec<u8> = Vec::new();
             // Whether the last pass moved a frame. While frames are moving we go
             // straight round again: a wake-up that arrived while we were busy is
             // lost (the condvar has no memory), so waiting here would pace a
@@ -761,7 +778,7 @@ impl Device for Seeq8003 {
                 //   Old: SeeqState → chan lock  (enet thread)
                 //   Old: chan lock → SeeqState  (CPU thread reading CTRL)
                 let tx_result = if let Some(ref dma) = tx_dma {
-                    Self::pump_tx(dma, &mut tx_prod, &tx_wake_enet, &in_reset_enet)
+                    Self::pump_tx(dma, &mut tx_prod, &tx_wake_enet, &in_reset_enet, &mut tx_partial)
                 } else { TxPumpResult::Nothing };
 
                 // Drain the RX ring: discard leading chatter (frames the guest's
@@ -1146,6 +1163,47 @@ mod tests {
         let seeq = Seeq8003::with_config(None, None, None, config.clone(), Arc::new(AtomicU64::new(0)));
         seeq.attach(Link::with_gateway(config).unwrap().unwrap());
         Link::assert_restart_keeps_the_forward(port, &|| seeq.start(), &|| seeq.stop());
+    }
+
+    /// A transmit channel that hands out scripted reads: `Some(eop)` is a byte
+    /// (the frame's last when `eop`), `None` is the channel running dry.
+    struct Script(Mutex<std::collections::VecDeque<Option<bool>>>, Mutex<u8>);
+
+    impl DmaClient for Script {
+        fn read(&self) -> Option<(u32, DmaStatus)> {
+            let step = self.0.lock().pop_front()??;
+            let mut n = self.1.lock();
+            *n += 1;
+            Some((*n as u32, if step { DmaStatus(DmaStatus::EOP) } else { DmaStatus::ok() }))
+        }
+        fn write(&self, _val: u32, _eop: bool) -> DmaStatus { DmaStatus::ok() }
+    }
+
+    /// A poll that catches a chain the driver is still extending reads part of
+    /// a frame and finds the channel dry. Those bytes belong to the frame that
+    /// the next poll completes; dropped, the rest would go out as a frame of
+    /// its own, starting in the middle of a packet.
+    #[test]
+    fn a_frame_the_channel_runs_dry_in_is_kept_for_the_next_poll() {
+        let script = Arc::new(Script(
+            Mutex::new([Some(false), Some(false), Some(false), None, Some(false), Some(true)].into_iter().collect()),
+            Mutex::new(0),
+        ));
+        let dma: Arc<dyn DmaClient> = script;
+        let (mut prod, mut cons) = rtrb::RingBuffer::<Vec<u8>>::new(4);
+        let wake = crate::net::Wake::new();
+        let in_reset = Arc::new(AtomicBool::new(false));
+        let mut partial = Vec::new();
+
+        let r = Seeq8003::pump_tx(&dma, &mut prod, &wake, &in_reset, &mut partial);
+        assert!(matches!(r, TxPumpResult::Nothing));
+        assert!(cons.pop().is_err(), "a cut-off frame was sent");
+        assert_eq!(partial, [1, 2, 3]);
+
+        let r = Seeq8003::pump_tx(&dma, &mut prod, &wake, &in_reset, &mut partial);
+        assert!(matches!(r, TxPumpResult::Sent { .. }));
+        assert_eq!(cons.pop().unwrap(), [1, 2, 3, 4, 5], "the frame is its bytes from both polls");
+        assert!(partial.is_empty());
     }
 
     /// Wait for a condition another thread brings about. Fails the test
