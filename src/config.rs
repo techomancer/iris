@@ -675,6 +675,19 @@ pub struct FibreChannelConfig {
     pub slot: Option<u8>,
 }
 
+/// Whose files the guest sees in a `[virtio_9p]` share.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Virtio9pOwners {
+    /// Every file reports the configured `uid`/`gid`; a guest chown has no effect.
+    #[default]
+    Squash,
+    /// The host file's own owner is reported (through `uid_map`/`gid_map`), and a
+    /// guest chown, or the owner a driver gives what it creates, is made on the
+    /// host. IRIS needs to be allowed to chown (root, or CAP_CHOWN).
+    Passthrough,
+}
+
 /// virtio-9p: a host directory the guest mounts, `[virtio_9p]`. See
 /// `src/dev/virtio/p9.rs` and `docs/dev/virtio-9p.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -700,6 +713,17 @@ pub struct Virtio9pConfig {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
+    /// `squash` (the default) or `passthrough`; see [`Virtio9pOwners`]. With
+    /// `passthrough`, `uid` and `gid` are what an owner without a mapping shows
+    /// as, and what a new entry belongs to until the driver says better.
+    #[serde(default)]
+    pub owners: Virtio9pOwners,
+    /// With `passthrough`: guest ids to host ids, `"guest:host[:count],..."`,
+    /// for example `"0:1000,1000:1001:5"`. Empty maps an id to itself.
+    #[serde(default)]
+    pub uid_map: String,
+    #[serde(default)]
+    pub gid_map: String,
 }
 
 fn default_9p_tag() -> String {
@@ -716,6 +740,9 @@ impl Default for Virtio9pConfig {
             readonly: false,
             uid: 0,
             gid: 0,
+            owners: Virtio9pOwners::Squash,
+            uid_map: String::new(),
+            gid_map: String::new(),
         }
     }
 }
@@ -3089,6 +3116,15 @@ impl MachineConfig {
         }
         if v.tag.is_empty() || v.tag.len() > 64 {
             return Err("[virtio_9p] tag must be 1 to 64 bytes".into());
+        }
+        if v.owners == Virtio9pOwners::Squash && !(v.uid_map.is_empty() && v.gid_map.is_empty()) {
+            return Err("[virtio_9p] uid_map and gid_map need owners = \"passthrough\"".into());
+        }
+        // The id maps are parsed by the Unix-only device; a non-Unix host was refused above.
+        #[cfg(unix)]
+        {
+            crate::dev::virtio::p9::IdMap::parse(&v.uid_map).map_err(|e| format!("[virtio_9p] uid_map: {e}"))?;
+            crate::dev::virtio::p9::IdMap::parse(&v.gid_map).map_err(|e| format!("[virtio_9p] gid_map: {e}"))?;
         }
         match self.machine.profile {
             MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
