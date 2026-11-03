@@ -200,6 +200,7 @@ pub mod irq;
 pub mod host_audio;
 pub mod pci;
 pub mod pci_addin;
+pub mod pci_cards;
 pub mod ui;
 pub mod cpu;
 pub mod dev;
