@@ -175,6 +175,10 @@ pub struct Ip32Options {
     pub keyboard: Option<bool>,
     /// The Ethernet address in the 1-Wire ID chip, if not the default.
     pub mac: Option<[u8; 6]>,
+    /// Cards fitted in the add-in slot, with their disks attached.
+    pub cards: Vec<crate::pci_addin::Fitted>,
+    /// The paravirtual serial device (`[virtio_serial]`), at PCI device 4.
+    pub virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -430,13 +434,27 @@ pub struct Ip32Bus {
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
+    /// The cards in the add-in slot. Fixed at power-on: a card is fitted
+    /// with the machine, not hot-plugged.
+    pub cards: Vec<crate::pci_addin::Fitted>,
+    /// The paravirtual serial device, if configured.
+    pub virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
 }
 
 impl Ip32Bus {
     /// Flush the disks on every SCSI controller.
     pub fn flush_disks(&self) -> std::io::Result<()> {
         let controllers = self.scsi.lock().unwrap().clone();
-        controllers.iter().try_for_each(|c| c.bus().flush())
+        controllers.iter().try_for_each(|c| c.bus().flush())?;
+        self.cards.iter().flat_map(|f| f.buses()).try_for_each(|(_, b)| b.flush())
+    }
+
+    /// Every SCSI bus by controller number: the two onboard controllers'
+    /// first, then each card's.
+    pub fn scsi_buses<'a>(&'a self, onboard: &'a [Arc<crate::dev::aic7880::Aic7880>]) -> Vec<(usize, &'a crate::scsi::ScsiBus)> {
+        let mut all: Vec<_> = onboard.iter().enumerate().map(|(i, c)| (i, c.bus())).collect();
+        all.extend(self.cards.iter().flat_map(|f| f.buses()).map(|(n, b)| (n as usize, b)));
+        all
     }
 
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
@@ -474,6 +492,8 @@ impl Ip32Bus {
             mace: Mace::new(ram.clone(), crime, ust),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
+            cards: opts.cards,
+            virtio: opts.virtio,
         };
         bus.gbe.tr.start_from_env();
         if let Some(mac) = opts.mac {
@@ -503,6 +523,15 @@ impl Ip32Bus {
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
+        }
+        // Cards in the add-in slot, on the same bridge the controllers are.
+        for f in &bus.cards {
+            f.card.set_heartbeat(bus.mace.id.heartbeat.clone());
+            f.card.register_locks();
+            bus.mace.pci.attach(f.device, f.card.name(), f.card.function());
+        }
+        if let Some(v) = &bus.virtio {
+            bus.mace.pci.attach(IP32_VIRTIO_SLOT, "virtio-serial", v.clone());
         }
         // A saved flash carries the guest's environment -- boot paths, console
         // choice, everything the PROM's `setenv` writes -- from one run to
@@ -667,6 +696,12 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
+        if self.virtio.is_some() {
+            t.insert("virtio".into(), toml::Value::Boolean(true));
+        }
+        if !self.cards.is_empty() {
+            t.insert("cards".into(), toml::Value::Array(self.cards.iter().map(|f| f.card.save_state()).collect()));
+        }
         if let Some(words) = self.ram.stack_page_words() {
             t.insert("stack_page".into(), toml::Value::Array(words.into_iter().map(crate::snapshot::hex_u64).collect()));
         }
@@ -696,6 +731,26 @@ impl crate::traits::Saveable for Ip32Bus {
                 c.load_state(s)?;
             }
         }
+        // The paravirtual device keeps no state of its own across a restore,
+        // but a snapshot is for the machine it was taken on.
+        let saved_virtio = get_field(v, "virtio").is_some();
+        if saved_virtio != self.virtio.is_some() {
+            return Err(if saved_virtio {
+                "saved state has virtio-serial, this machine has none".to_string()
+            } else {
+                "saved state has no virtio-serial, this machine has it".to_string()
+            });
+        }
+        let saved_cards = match get_field(v, "cards") {
+            Some(toml::Value::Array(a)) => a.as_slice(),
+            _ => &[],
+        };
+        if saved_cards.len() != self.cards.len() {
+            return Err(format!("saved state has {} PCI cards, this machine {}", saved_cards.len(), self.cards.len()));
+        }
+        for (f, s) in self.cards.iter().zip(saved_cards) {
+            f.card.load_state(s)?;
+        }
         if let Some(toml::Value::Array(a)) = get_field(v, "stack_page") {
             let words: Option<Vec<u64>> = a.iter().map(crate::snapshot::toml_u64).collect();
             self.ram.restore_stack_page(&words.ok_or("stack_page: not a list of dwords")?)?;
@@ -717,6 +772,12 @@ impl Ip32Bus {
             [&*m.ust, &m.rtc, &m.ps2, &m.id, &m.com0, &m.com1, &m.sdma, &*m.isa];
         for d in devices {
             d.power_on();
+        }
+        for f in &self.cards {
+            f.card.power_on();
+        }
+        if let Some(v) = &self.virtio {
+            v.power_on();
         }
     }
 

@@ -553,12 +553,10 @@ impl Bridge {
     pub fn attach(self: &Arc<Self>, slot: u8, dev: Arc<dyn PciBusDevice>) {
         let slot = slot as usize;
         assert!(slot < DEVICES, "Bridge has {DEVICES} slots");
-        dev.connect_dma(Arc::new(SlotDma { bridge: Arc::downgrade(self), slot }));
-        let pin = dev.config().interrupt_pin();
-        if (1..=4).contains(&pin) {
+        crate::pci::plug(&*dev, Arc::new(SlotDma { bridge: Arc::downgrade(self), slot }), |pin| {
             let router = Arc::new(PciPin { bridge: Arc::downgrade(self) });
-            dev.connect_interrupt(IrqLine::new(router, (slot * 4 + pin as usize - 1) as u32));
-        }
+            IrqLine::new(router, (slot * 4 + pin as usize - 1) as u32)
+        });
         self.slots.write()[slot] = Some(dev);
         self.publish_bars();
     }
@@ -1057,7 +1055,7 @@ impl Bridge {
         let i = (reg >> 2) as usize;
         let shift = 8 * (reg & 3);
         let mask = (u64::MAX >> (64 - 8 * size)) << shift;
-        cfg.write(i, ((cfg.read(i) as u64 & !mask) | ((val << shift) & mask)) as u32);
+        cfg.write_masked(i, (val << shift) as u32, mask as u32);
         true
     }
 

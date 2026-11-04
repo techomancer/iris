@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::irq::{InterruptController, IrqLine};
 use crate::dev::crime_mem::O2Memory;
-use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
+use crate::pci::{bar_runs, plug, BarAt, BarRun, IntxTable, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
 use crate::snapshot::{get_field, hex_u32, load_u32_slice, toml_u32, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_OK};
 use crate::ip32::*;
+use crate::pci_addin::{BusDesc, BusSlot, Evidence, SlotDesc};
 
 pub mod macepci_reg {
     pub const ERROR_ADDR: u32 = 0x0000;
@@ -32,6 +33,43 @@ pub const MACEPCI_REVISION_VALUE: u32 = 1;
 pub const IP32_SCSI_SLOT: u8 = 1;
 pub const IP32_SCSI_SLOT_B: u8 = 2;
 
+/// The one add-in slot: the PCI board position in the O2's tray, device 3
+/// (slot 0 in the MACE specification's tables). Its INTA is CRIME input 10
+/// and INTB to INTD the shared inputs 13 to 15; Linux, OpenBSD and NetBSD
+/// route them the same way.
+pub const IP32_PCI_SLOT: u8 = 3;
+pub const IP32_PCI_CRIME_INT: u32 = 10;
+/// CRIME's inputs for a slot's INTB, INTC and INTD. They are shared: any
+/// device's pin can be routed to one, so each is the OR of its pins.
+pub const IP32_PCI_CRIME_SHARED: u32 = 13;
+
+/// Where `[virtio_serial]` puts its paravirtual device: PCI device 4, which
+/// the MACE tables give INTA on CRIME input 11 and which a stock board leaves
+/// empty. It is iris's own device, not a slot: it is not in [`BUSES`] and a
+/// card cannot be configured there.
+pub const IP32_VIRTIO_SLOT: u8 = 4;
+pub const IP32_VIRTIO_CRIME_INT: u32 = 11;
+
+/// The O2's PCI bus, for the configuration and the `pci slots` command. The
+/// slot's four pins are routed as the MACE specification has them; what
+/// the board's connector wires INTB to INTD to is not known.
+pub const BUSES: &[BusDesc] = &[BusDesc {
+    id: "pci",
+    title: "the O2's PCI bus",
+    slots: &[
+        BusSlot::Onboard { device: IP32_SCSI_SLOT, name: "internal SCSI controller (AIC-7880)" },
+        BusSlot::Onboard { device: IP32_SCSI_SLOT_B, name: "external SCSI controller (AIC-7880)" },
+        BusSlot::AddIn(SlotDesc {
+            device: IP32_PCI_SLOT,
+            label: "",
+            evidence: Evidence::Established,
+            source: "MACE specification, PCI interrupt input tables (Tables 85 and 87, pp. 164 and 166; Table 90, p. 179), which put device 3 (slot 0) on CRIME inputs 10, 13, 14 and 15; Linux arch/mips/pci/fixup-ip32.c (irq_tab_mace), OpenBSD macepcibridge.c (mace_pcibr_intr_map) and NetBSD macepci_intr_map agree; the board connector's wiring of INTB to INTD is unknown; O2 Workstation Hardware Reference Guide 007-3275-003, installing a PCI board",
+            settled_by: "",
+        }),
+    ],
+    no_add_in: "",
+}];
+
 /// Which of CRIME's interrupt inputs the pin of the function in that slot
 /// drives. NetBSD works this out for itself and prints it: "interrupting at
 /// crime interrupt 8".
@@ -43,53 +81,19 @@ fn crime_input(slot: u8, pin: u8) -> Option<u32> {
     match (slot, pin) {
         (IP32_SCSI_SLOT, 1) => Some(IP32_SCSI_CRIME_INT),
         (IP32_SCSI_SLOT_B, 1) => Some(IP32_SCSI_CRIME_INT_B),
+        (IP32_PCI_SLOT, 1) => Some(IP32_PCI_CRIME_INT),
+        // The paravirtual device's INTA, which the MACE tables give device 4.
+        (IP32_VIRTIO_SLOT, 1) => Some(IP32_VIRTIO_CRIME_INT),
+        // INTB to INTD, on the shared inputs 13 to 15, where the kernels
+        // look for them. Whether the board's connector wires them is unknown.
+        (IP32_PCI_SLOT, pin @ 2..=4) => Some(IP32_PCI_CRIME_SHARED + pin as u32 - 2),
         _ => None,
     }
 }
 
 /// Bus 0 has 32 device numbers, each with four interrupt pins.
-const PCI_PINS: usize = 32 * 4;
-
-/// The bridge's interrupt router. Each slot's INTA..INTD is a line
-/// (`slot * 4 + pin - 1`); the router keeps every pin's level and drives
-/// each system input it routes to with the OR of the pins routed there, so
-/// on a shared input one function cannot clear another's interrupt.
-struct PciIrqRouter {
-    /// Where the system inputs are: CRIME.
-    intc: Arc<dyn InterruptController>,
-    /// Slot and pin (1 = INTA) to system input.
-    route: fn(u8, u8) -> Option<u32>,
-    levels: Mutex<[bool; PCI_PINS]>,
-}
-
-impl PciIrqRouter {
-    fn line(slot: u8, pin: u8) -> u32 {
-        slot as u32 * 4 + (pin as u32 - 1)
-    }
-
-    fn slot_pin(line: u32) -> (u8, u8) {
-        ((line / 4) as u8, (line % 4) as u8 + 1)
-    }
-}
-
-impl InterruptController for PciIrqRouter {
-    fn set_line(&self, line: u32, level: bool) {
-        if line as usize >= PCI_PINS {
-            return;
-        }
-        let (slot, pin) = Self::slot_pin(line);
-        let Some(input) = (self.route)(slot, pin) else { return };
-        // The lock is held while CRIME is driven, so two pins sharing an
-        // input cannot reach it out of order.
-        let mut levels = self.levels.lock().unwrap();
-        levels[line as usize] = level;
-        let any = (0..PCI_PINS as u32).any(|l| {
-            let (s, p) = Self::slot_pin(l);
-            levels[l as usize] && (self.route)(s, p) == Some(input)
-        });
-        self.intc.set_line(input, any);
-    }
-}
+const PCI_SLOTS: usize = 32;
+const PCI_PINS: usize = PCI_SLOTS * 4;
 
 /// The CPU-side window onto PCI memory, and the PCI address it starts at.
 ///
@@ -261,7 +265,7 @@ pub struct MacePci {
     windows: [AtomicU64; MAX_WINDOWS],
     nwindows: AtomicUsize,
     /// The slots' interrupt pins, routed to CRIME.
-    irq: Arc<PciIrqRouter>,
+    irq: Arc<IntxTable>,
     /// Host memory, for the functions that master the bus.
     dma: Arc<HostMemory>,
     /// Where the runs of the windows a BAR decodes whole go (the machine
@@ -278,6 +282,12 @@ impl MacePci {
     /// A bridge with its own routing of slot pins (1 = INTA) to `intc`'s
     /// inputs.
     fn with_routing(intc: Arc<dyn InterruptController>, route: fn(u8, u8) -> Option<u32>, ram: Arc<O2Memory>) -> Self {
+        let irq = IntxTable::new(intc, PCI_SLOTS);
+        for slot in 0..PCI_SLOTS as u8 {
+            for pin in 1..=4 {
+                irq.route(slot, pin, route(slot, pin));
+            }
+        }
         Self {
             config_addr: Mutex::new(0),
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
@@ -286,7 +296,7 @@ impl MacePci {
             funcs: std::array::from_fn(|_| OnceLock::new()),
             windows: std::array::from_fn(|_| AtomicU64::new(0)),
             nwindows: AtomicUsize::new(0),
-            irq: Arc::new(PciIrqRouter { intc, route, levels: Mutex::new([false; PCI_PINS]) }),
+            irq: Arc::new(irq),
             dma: Arc::new(HostMemory::new(ram)),
             bar_sink: RwLock::new(None),
             bar_entries: Mutex::new(Default::default()),
@@ -296,11 +306,7 @@ impl MacePci {
     /// Put a function in a slot on bus 0, wire its interrupt pin to the
     /// bridge, which routes it on, and give it host memory to master.
     pub fn attach(&self, slot: u8, name: &'static str, dev: Arc<dyn PciBusDevice>) {
-        dev.connect_dma(self.dma.clone());
-        let pin = dev.config().interrupt_pin();
-        if (1..=4).contains(&pin) {
-            dev.connect_interrupt(IrqLine::new(self.irq.clone(), PciIrqRouter::line(slot, pin)));
-        }
+        plug(&*dev, self.dma.clone(), |pin| IrqLine::new(self.irq.clone(), IntxTable::line(slot, pin)));
         assert!(self.funcs[slot as usize].set(dev.clone()).is_ok(), "pci: slot {slot} is taken");
         let mut slots = self.slots.lock().unwrap();
         slots.insert(slot, Arc::new(Slot { name, dev, touched: Mutex::new(Vec::new()) }));
@@ -361,6 +367,42 @@ impl MacePci {
         let s = self.slots.lock().unwrap().get(&slot).cloned()?;
         let touched = s.touched.lock().unwrap().clone();
         Some((s.name, s.dev.clone(), touched))
+    }
+
+    /// The bus's slots from [`BUSES`], with what is in each and where its
+    /// interrupt pins go: one line per device number the table knows.
+    pub fn slots_report(&self) -> Vec<String> {
+        let bus = &BUSES[0];
+        let mut out = vec![format!("{}:", bus.title)];
+        for row in bus.slots {
+            let device = row.device();
+            let fitted = self.slot(device).map(|(name, f, _)| {
+                let id = f.config().read(0);
+                format!("{name} {:04x}:{:04x}", id & 0xffff, id >> 16)
+            });
+            let line = match row {
+                BusSlot::Onboard { name, .. } => {
+                    format!("  device {device}: onboard, {name}")
+                }
+                BusSlot::AddIn(s) => {
+                    let pins: Vec<String> = (1..=4u8)
+                        .map(|p| match self.irq.input(device, p) {
+                            Some(i) => format!("INT{} CRIME {i}", (b'A' + p - 1) as char),
+                            None => format!("INT{} unrouted", (b'A' + p - 1) as char),
+                        })
+                        .collect();
+                    let label = if s.label.is_empty() { String::new() } else { format!(" \"{}\"", s.label) };
+                    format!(
+                        "  device {device}{label}: add-in slot ({}), {}; {}",
+                        s.evidence.name(),
+                        fitted.as_deref().map_or("empty".to_string(), |f| format!("holds {f}")),
+                        pins.join(", ")
+                    )
+                }
+            };
+            out.push(line);
+        }
+        out
     }
 
     /// Whether `addr` is in one of the CPU's windows onto PCI memory.
@@ -579,7 +621,7 @@ impl Saveable for MacePci {
         let mut t = toml::map::Map::new();
         t.insert("config_addr".into(), hex_u32(*self.config_addr.lock().unwrap()));
         t.insert("regs".into(), u32_slice_to_toml(&*self.regs.lock().unwrap()));
-        let levels = *self.irq.levels.lock().unwrap();
+        let levels = self.irq.levels();
         t.insert("pins".into(), toml::Value::Array(levels.iter().map(|&b| toml::Value::Boolean(b)).collect()));
         let mut slots = toml::map::Map::new();
         for (n, s) in self.slots.lock().unwrap().iter() {
@@ -620,7 +662,7 @@ impl crate::traits::Device for MacePci {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("pci".to_string(), "MACE PCI bridge: pci status | pci config <slot>".to_string())]
+        vec![("pci".to_string(), "MACE PCI bridge: pci status | pci slots | pci config <slot>".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -641,13 +683,18 @@ impl crate::traits::Device for MacePci {
                     let bars: Vec<String> = (0..6).map(|i| c.bar_base(i)).filter(|&b| b != 0).map(|b| format!("{b:#x}")).collect();
                     let irq = match c.interrupt_pin() {
                         0 => "no interrupt".to_string(),
-                        p => match (self.irq.route)(*slot, p) {
+                        p => match self.irq.input(*slot, p) {
                             Some(l) => format!("INT{} to CRIME {l}", (b'A' + p - 1) as char),
                             None => format!("INT{} unrouted", (b'A' + p - 1) as char),
                         },
                     };
                     writeln!(w, "  slot {slot}: {} {:04x}:{:04x}, command {:#06x}, BARs [{}], {irq}",
                         s.name, id & 0xffff, id >> 16, c.command(), bars.join(", ")).ok();
+                }
+            }
+            "slots" => {
+                for line in self.slots_report() {
+                    writeln!(w, "{line}").ok();
                 }
             }
             "config" => {
@@ -658,7 +705,7 @@ impl crate::traits::Device for MacePci {
                     writeln!(w, "  {:02x}: {}", row * 16, v.join(" ")).ok();
                 }
             }
-            _ => return Err("Usage: pci status | config <slot>".to_string()),
+            _ => return Err("Usage: pci status | slots | config <slot>".to_string()),
         }
         Ok(())
     }
@@ -859,5 +906,124 @@ mod tests {
         assert_eq!(last(), (12, true), "slot 4's INTB still holds it");
         lb.set(false);
         assert_eq!(last(), (12, false));
+    }
+
+    /// Both onboard SCSI controllers' INTA reach their own CRIME inputs, 8
+    /// and 9, and nothing else does.
+    #[test]
+    fn the_onboard_scsi_pins_reach_crime_8_and_9() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime.clone(), test_ram());
+        let fake = |pin| Arc::new(Fake {
+            cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1, [Bar::Unused; 6], pin),
+            last: Mutex::new(None),
+            irq: std::sync::OnceLock::new(),
+        });
+        let (a, b, c) = (fake(PCI_INTA), fake(PCI_INTA), fake(PCI_INTA + 1));
+        pci.attach(IP32_SCSI_SLOT, "a", a.clone());
+        pci.attach(IP32_SCSI_SLOT_B, "b", b.clone());
+        pci.attach(7, "c", c.clone());
+        a.irq.get().unwrap().set(true);
+        b.irq.get().unwrap().set(true);
+        c.irq.get().unwrap().set(true);
+        assert_eq!(*crime.0.lock().unwrap(), vec![(IP32_SCSI_CRIME_INT, true), (IP32_SCSI_CRIME_INT_B, true)]);
+    }
+
+    /// The table's onboard rows are the slots the machine attaches, and its
+    /// one add-in slot is where nothing is attached.
+    #[test]
+    fn the_bus_table_matches_the_onboard_slots() {
+        let onboard: Vec<u8> = BUSES[0].slots.iter()
+            .filter_map(|s| match s { BusSlot::Onboard { device, .. } => Some(*device), _ => None })
+            .collect();
+        assert_eq!(onboard, vec![IP32_SCSI_SLOT, IP32_SCSI_SLOT_B]);
+        let add_in: Vec<u8> = BUSES[0].add_ins().map(|s| s.device).collect();
+        assert_eq!(add_in, vec![IP32_PCI_SLOT]);
+    }
+
+    #[test]
+    fn pci_slots_lists_every_device_the_table_knows() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime, test_ram());
+        let report = pci.slots_report();
+        assert_eq!(report.len(), 1 + BUSES[0].slots.len());
+        assert!(report[1].contains("device 1: onboard"), "{report:?}");
+        assert!(report[3].contains("device 3: add-in slot (established), empty"), "{report:?}");
+    }
+
+    fn pin_fake(pin: u8) -> Arc<Fake> {
+        Arc::new(Fake {
+            cfg: PciConfig::new(0x1077, 0x1216, 0x01_0000, 1, [Bar::Unused; 6], pin),
+            last: Mutex::new(None),
+            irq: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Each pin of a card in the add-in slot reaches its own CRIME input:
+    /// INTA 10, INTB to INTD the shared 13 to 15.
+    #[test]
+    fn each_pin_of_the_add_in_slot_reaches_its_crime_input() {
+        for (pin, input) in [(PCI_INTA, 10), (PCI_INTA + 1, 13), (PCI_INTA + 2, 14), (PCI_INTA + 3, 15)] {
+            let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+            let pci = MacePci::new(crime.clone(), test_ram());
+            let card = pin_fake(pin);
+            pci.attach(IP32_PCI_SLOT, "card", card.clone());
+            card.irq.get().unwrap().set(true);
+            assert_eq!(*crime.0.lock().unwrap(), vec![(input, true)], "pin {pin}");
+            card.irq.get().unwrap().set(false);
+            assert_eq!(crime.0.lock().unwrap().last(), Some(&(input, false)), "pin {pin}");
+        }
+        assert_eq!(IP32_PCI_CRIME_INT, 10);
+        assert_eq!(IP32_PCI_CRIME_SHARED, 13);
+    }
+
+    /// A shared input stays up until every pin routed to it has dropped:
+    /// the slot's INTB and another device's pin on CRIME 13.
+    #[test]
+    fn two_pins_on_a_shared_crime_input_or_together() {
+        fn route(slot: u8, pin: u8) -> Option<u32> {
+            crime_input(slot, pin).or((slot == 5 && pin == 1).then_some(IP32_PCI_CRIME_SHARED))
+        }
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::with_routing(crime.clone(), route, test_ram());
+        let (slot, other) = (pin_fake(PCI_INTA + 1), pin_fake(PCI_INTA));
+        pci.attach(IP32_PCI_SLOT, "slot", slot.clone());
+        pci.attach(5, "other", other.clone());
+        let last = || *crime.0.lock().unwrap().last().unwrap();
+        slot.irq.get().unwrap().set(true);
+        assert_eq!(last(), (13, true));
+        other.irq.get().unwrap().set(true);
+        slot.irq.get().unwrap().set(false);
+        assert_eq!(last(), (13, true), "the other device's pin still holds it");
+        other.irq.get().unwrap().set(false);
+        assert_eq!(last(), (13, false));
+    }
+
+    #[test]
+    fn pci_slots_shows_a_fitted_cards_routing() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime, test_ram());
+        pci.attach(IP32_PCI_SLOT, "card", pin_fake(PCI_INTA));
+        let report = pci.slots_report();
+        assert!(report[3].contains("holds card 1077:1216"), "{report:?}");
+        assert!(report[3].contains("INTA CRIME 10, INTB CRIME 13, INTC CRIME 14, INTD CRIME 15"), "{report:?}");
+    }
+
+    /// The paravirtual device at device 4 has its INTA on CRIME input 11;
+    /// its other pins, and the slot's, are not disturbed.
+    #[test]
+    fn device_4s_inta_reaches_crime_11() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime.clone(), test_ram());
+        let (virtio, card) = (pin_fake(PCI_INTA), pin_fake(PCI_INTA));
+        pci.attach(IP32_VIRTIO_SLOT, "virtio", virtio.clone());
+        pci.attach(IP32_PCI_SLOT, "card", card.clone());
+        virtio.irq.get().unwrap().set(true);
+        assert_eq!(*crime.0.lock().unwrap(), vec![(IP32_VIRTIO_CRIME_INT, true)]);
+        card.irq.get().unwrap().set(true);
+        virtio.irq.get().unwrap().set(false);
+        assert_eq!(crime.0.lock().unwrap().last(), Some(&(IP32_VIRTIO_CRIME_INT, false)));
+        assert_eq!(crime.0.lock().unwrap()[1], (IP32_PCI_CRIME_INT, true), "the slot's INTA is still CRIME 10");
+        assert_eq!(IP32_VIRTIO_CRIME_INT, 11);
     }
 }

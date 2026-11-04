@@ -60,3 +60,4 @@ pub mod vino;
 pub mod virtio;
 pub mod wd33c93a;
 pub mod z85c30;
+pub mod isp12160;

@@ -52,10 +52,9 @@ mod tests {
 
     #[test]
     fn virtio_serial_validates_where_it_has_a_home() {
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::OctaneIp30] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::OctaneIp30, MachineProfile::O2Ip32] {
             virtio_cfg(p).validate().unwrap_or_else(|e| panic!("{p:?}: {e}"));
         }
-        assert!(virtio_cfg(MachineProfile::O2Ip32).validate().is_err(), "not wired on the O2");
     }
 
     #[test]

@@ -13,6 +13,33 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### O2 virtio-serial
+
+- `[virtio_serial]` now works on the O2: the paravirtual device is PCI device 4
+  on the MACE bus, INTA on CRIME input 11. It is not an add-in slot and does
+  not take the place of a card in device 3. Not yet run under a guest with a
+  driver for it.
+
+### O2 PCI add-in cards
+
+- The O2's one add-in slot (PCI device 3) takes a card from the configuration:
+  `[[pci]]` with `slot`, `card` and the card's options inline, or `--pci
+  [BUS:]SLOT=CARD[,KEY=VALUE]...`. Only a real add-in slot can be named; the
+  onboard AIC-7880s cannot. A mistake stops iris before it starts and the
+  message names the entry. The slot's INTA reaches CRIME input 10 and INTB to INTD
+  the shared inputs 13 to 15, as the BSDs and Linux route them.
+- Two cards: `aic7880` (the onboard Adaptec chip, one SCSI bus) and
+  `isp12160` (QLogic, two). A card's buses are the SCSI controllers after the
+  onboard two, for `[scsi.N]` (key 16×controller+id, ids 1–15). IRIX 6.5.30
+  drives the `aic7880` card and `hinv` lists it with its disk; it finds the
+  `isp12160` but has no driver for it.
+- The monitor's `pci slots` lists the bus's devices, onboard or add-in, with
+  what is fitted and where each interrupt pin goes.
+- Snapshots record the fitted cards and refuse a restore into a machine with
+  others. Snapshots without cards are unchanged.
+- The Octane's Bridge has a slot table with its four onboard devices and no
+  add-in slot: its PCI boards are not modelled.
+
 ### O2 graphics tracing
 
 - `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,
@@ -203,6 +230,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Memory past 4 GB is as fast as the rest: such a machine gets a 16 GB direct
   window, and the JIT compiles code anywhere in it.
 - A store-conditional on memory outside the window is now atomic with two CPUs.
+### PCI configuration
+
+- A PCI function can describe its own writable header fields and
+  write-one-to-clear status bits. Byte and halfword configuration writes
+  through a Bridge carry their byte enables, so such a function keeps the
+  status events a narrow write did not select. No Octane function has
+  write-one-to-clear status bits, so the Octane behaves as before.
 
 ### VNC, and screen and pointer commands
 

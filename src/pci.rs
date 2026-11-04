@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::irq::IrqLine;
+use crate::irq::{InterruptController, IrqLine};
 use crate::snapshot::{get_field, load_u32_slice, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_OK};
 
@@ -46,6 +46,50 @@ pub enum Space {
     Mem,
 }
 
+/// Initial value and writable bits for a function-specific configuration dword.
+#[derive(Clone, Copy, Debug)]
+pub struct PciRegisterPolicy {
+    /// Dword index. Header, BAR, subsystem identity, and interrupt dwords are managed separately.
+    pub reg_dword: usize,
+    /// Value restored by [`PciConfig::reset`].
+    pub initial: u32,
+    /// Bits that configuration writes may change.
+    pub writable_mask: u32,
+}
+
+/// Function-specific write behavior for a type 0 PCI configuration header.
+///
+/// Register policies are copied into the header during construction; the
+/// borrowed slice is not retained.
+#[derive(Clone, Copy, Debug)]
+pub struct PciConfigPolicy<'a> {
+    /// Fixed Status bits that read as one.
+    pub status: u16,
+    /// Device-latched Status bits that writes acknowledge with one.
+    pub status_w1c_mask: u16,
+    /// Writable Command bits.
+    pub command_mask: u16,
+    /// Writable bits in the latency timer byte.
+    pub latency_mask: u8,
+    /// Writable bits in the cache-line-size byte.
+    pub cache_line_mask: u8,
+    /// Initial values and write masks for function-specific dwords.
+    pub registers: &'a [PciRegisterPolicy],
+}
+
+impl<'a> Default for PciConfigPolicy<'a> {
+    fn default() -> Self {
+        Self {
+            status: 0x0200,
+            status_w1c_mask: 0,
+            command_mask: 0xffff,
+            latency_mask: 0xff,
+            cache_line_mask: 0xff,
+            registers: &[],
+        }
+    }
+}
+
 /// One function's type 0 configuration header.
 ///
 /// Enough of it to be discovered and configured: identity, class, command
@@ -61,6 +105,12 @@ pub struct PciConfig {
     /// Dwords `16..caps_end` hold a capability list, which firmware cannot
     /// overwrite. 0 when the function has none.
     caps_end: usize,
+    status: u16,
+    status_w1c_mask: u16,
+    command_mask: u16,
+    latency_mask: u8,
+    cache_line_mask: u8,
+    writable_masks: [u32; 64],
 }
 
 impl PciConfig {
@@ -68,6 +118,27 @@ impl PciConfig {
     /// three bytes of register 0x08. `pin` is 0 for none, or [`PCI_INTA`]
     /// and on; the line register is left for firmware to assign.
     pub fn new(vendor: u16, device: u16, class: u32, revision: u8, bars: [Bar; 6], pin: u8) -> Self {
+        Self::new_with_policy(
+            vendor,
+            device,
+            class,
+            revision,
+            bars,
+            pin,
+            PciConfigPolicy::default(),
+        )
+    }
+
+    /// Construct a type 0 header with function-specific register behavior.
+    pub fn new_with_policy(
+        vendor: u16,
+        device: u16,
+        class: u32,
+        revision: u8,
+        bars: [Bar; 6],
+        pin: u8,
+        policy: PciConfigPolicy<'_>,
+    ) -> Self {
         let mut r = [0u32; 64];
         r[0] = ((device as u32) << 16) | vendor as u32;
         r[2] = (class << 8) | revision as u32;
@@ -77,7 +148,26 @@ impl PciConfig {
                 r[4 + i] = 1;
             }
         }
-        Self { regs: Mutex::new(r), bars, power_on: r, caps_end: 0 }
+        let mut writable_masks = [u32::MAX; 64];
+        for register in policy.registers {
+            assert!(
+                matches!(register.reg_dword, 10 | 12..=14 | 16..=63),
+                "pci: register policy requires a function-specific dword in 0..64");
+            r[register.reg_dword] = register.initial;
+            writable_masks[register.reg_dword] = register.writable_mask;
+        }
+        Self {
+            regs: Mutex::new(r),
+            bars,
+            power_on: r,
+            status: policy.status,
+            status_w1c_mask: policy.status_w1c_mask,
+            command_mask: policy.command_mask,
+            latency_mask: policy.latency_mask,
+            cache_line_mask: policy.cache_line_mask,
+            writable_masks,
+            caps_end: 0,
+        }
     }
 
     /// Give the function a capability list: `caps` are the raw dwords of the
@@ -113,24 +203,40 @@ impl PciConfig {
     pub fn read(&self, reg: usize) -> u32 {
         let r = self.regs.lock().unwrap();
         match reg {
-            // Status: a medium-speed device with no errors to report.
             // A function with a capability list also sets status bit 4.
-            1 => (r[1] & 0xffff) | 0x0200_0000 | if r[13] != 0 { 0x0010_0000 } else { 0 },
+            1 => (r[1] & (0xffff | ((self.status_w1c_mask as u32) << 16)))
+                | ((self.status as u32) << 16)
+                | if r[13] != 0 { 0x0010_0000 } else { 0 },
             _ => r[reg],
         }
     }
 
     pub fn write(&self, reg: usize, val: u32) {
+        self.write_masked(reg, val, u32::MAX);
+    }
+
+    /// Write selected bits of dword `reg`. Both `val` and `mask` use the
+    /// register's bit positions. Unselected Status events are not acknowledged.
+    pub fn write_masked(&self, reg: usize, val: u32, mask: u32) {
+        if mask == 0 {
+            return;
+        }
         let mut r = self.regs.lock().unwrap();
         match reg {
-            // Identity and class are read-only.
+            // Identity, class and header type are read-only.
             0 | 2 => {}
-            // Cache line size and latency timer are stored; the header type
-            // and BIST bytes above them are not.
-            3 => r[3] = (r[3] & 0xffff_0000) | (val & 0xffff),
-            // Command; status bits are write-one-to-clear and none are set.
-            1 => r[1] = val & 0xffff,
+            3 => {
+                let mask = mask & (((self.latency_mask as u32) << 8) | self.cache_line_mask as u32);
+                r[3] = (r[3] & !mask) | (val & mask);
+            }
+            // Command writes replace selected bits; Status events clear on ones.
+            1 => {
+                let clear = val & mask & ((self.status_w1c_mask as u32) << 16);
+                r[1] = (r[1] & !(mask & 0xffff) & !clear)
+                    | (val & mask & self.command_mask as u32);
+            }
             4..=9 => {
+                let val = (r[reg] & !mask) | (val & mask);
                 let bar = self.bars[reg - 4];
                 r[reg] = match bar {
                     Bar::Unused => 0,
@@ -144,9 +250,25 @@ impl PciConfig {
             // The capability list is read-only.
             16.. if reg < self.caps_end => {}
             // Interrupt pin is read-only; the line is firmware's scratch.
-            15 => r[15] = (r[15] & 0xff00) | (val & !0xff00),
-            _ => r[reg] = val,
+            15 => {
+                let mask = mask & !0xff00;
+                r[15] = (r[15] & !mask) | (val & mask);
+            }
+            _ => {
+                let mask = mask & self.writable_masks[reg];
+                r[reg] = (r[reg] & !mask) | (val & mask);
+            }
         }
+    }
+
+    /// Latch selected device Status events without replacing earlier events.
+    pub fn set_status_bits(&self, bits: u16) {
+        self.regs.lock().unwrap()[1] |= ((bits & self.status_w1c_mask) as u32) << 16;
+    }
+
+    /// Set the board-assigned Subsystem ID, which survives function reset.
+    pub fn set_subsystem_identity(&self, value: u32) {
+        self.regs.lock().unwrap()[11] = value;
     }
 
     /// The base address firmware programmed into BAR `i`, type bits masked.
@@ -300,6 +422,82 @@ pub trait PciDma: Send + Sync {
     fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus;
 }
 
+/// Seat a function on a bus: give it its way to memory and, when its header
+/// names an interrupt pin (INTA..INTD), the line for that pin.
+///
+/// Every host bridge does this by hand when a function is attached. They
+/// differ only in the DMA object they hand out and in what a pin is wired
+/// to, which is what the two arguments are. A function with no pin is
+/// left unconnected.
+pub fn plug(dev: &dyn PciBusDevice, dma: Arc<dyn PciDma>, irq_for_pin: impl FnOnce(u8) -> IrqLine) {
+    dev.connect_dma(dma);
+    let pin = dev.config().interrupt_pin();
+    if (1..=4).contains(&pin) {
+        dev.connect_interrupt(irq_for_pin(pin));
+    }
+}
+
+/// A host bridge's PCI interrupt pins and where they go.
+///
+/// Each device number's INTA..INTD is a line ([`IntxTable::line`]). The
+/// table keeps every pin's level and drives each system input it routes to
+/// with the OR of the pins routed there, so on a shared input one function
+/// cannot clear another's interrupt. A pin with no route is dropped.
+///
+/// The routes are data, set when the bus is wired ([`IntxTable::route`]),
+/// so wiring a function at another device number takes a call, not a new
+/// bridge.
+pub struct IntxTable {
+    /// Where the system inputs are.
+    intc: Arc<dyn InterruptController>,
+    st: Mutex<IntxState>,
+}
+
+struct IntxState {
+    levels: Box<[bool]>,
+    input: Box<[Option<u32>]>,
+}
+
+impl IntxTable {
+    /// A table for device numbers `0..devices`, every pin unrouted.
+    pub fn new(intc: Arc<dyn InterruptController>, devices: usize) -> Self {
+        let st = IntxState { levels: vec![false; devices * 4].into(), input: vec![None; devices * 4].into() };
+        Self { intc, st: Mutex::new(st) }
+    }
+
+    /// The line of `device`'s pin (1 = INTA).
+    pub fn line(device: u8, pin: u8) -> u32 {
+        device as u32 * 4 + (pin as u32 - 1)
+    }
+
+    /// Wire `device`'s pin (1 = INTA) to system input `input`, or to none.
+    pub fn route(&self, device: u8, pin: u8, input: Option<u32>) {
+        self.st.lock().unwrap().input[Self::line(device, pin) as usize] = input;
+    }
+
+    /// The system input `device`'s pin drives.
+    pub fn input(&self, device: u8, pin: u8) -> Option<u32> {
+        self.st.lock().unwrap().input.get(Self::line(device, pin) as usize).copied().flatten()
+    }
+
+    /// Every pin's level, by line, for a snapshot.
+    pub fn levels(&self) -> Vec<bool> {
+        self.st.lock().unwrap().levels.to_vec()
+    }
+}
+
+impl InterruptController for IntxTable {
+    fn set_line(&self, line: u32, level: bool) {
+        // The lock is held while the system input is driven, so two pins
+        // sharing an input cannot reach it out of order.
+        let mut st = self.st.lock().unwrap();
+        let Some(&Some(input)) = st.input.get(line as usize) else { return };
+        st.levels[line as usize] = level;
+        let any = st.levels.iter().zip(st.input.iter()).any(|(&l, &i)| l && i == Some(input));
+        self.intc.set_line(input, any);
+    }
+}
+
 // ---- BARs on the physical bus ----
 
 /// What a host bridge does to a CPU access on its way to a function: which
@@ -436,6 +634,14 @@ mod tests {
             [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA)
     }
 
+    fn scsi_like_with_policy(policy: PciConfigPolicy<'_>) -> PciConfig {
+        PciConfig::new_with_policy(
+            0x9004, 0x8078, 0x0100_00, 1,
+            [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA,
+            policy,
+        )
+    }
+
     /// Firmware learns how much space a device wants by writing all ones to
     /// a BAR and reading back which address bits stuck.
     #[test]
@@ -502,7 +708,7 @@ mod tests {
     #[test]
     fn reset_keeps_the_subsystem_identity() {
         let c = scsi_like();
-        c.write(11, 0xc304_10a9);
+        c.set_subsystem_identity(0xc304_10a9);
         c.write(4, 0x0000_1000);
         c.reset();
         assert_eq!(c.read(11), 0xc304_10a9);
@@ -527,6 +733,121 @@ mod tests {
         assert_eq!(c.read(15) & 0xffff, 0x0109, "line 9 assigned, pin A kept");
         c.write(15, 0);
         assert_eq!(c.interrupt_pin(), PCI_INTA);
+    }
+
+    #[test]
+    fn header_policies_mask_writes_and_restore_reset_values() {
+        for (status, command, latency, cache) in [(0x0200, 0xffff, 0, 0), (0x02b0, 0x0156, 0xf0, 0x0f)] {
+            let c = scsi_like_with_policy(PciConfigPolicy {
+                status,
+                status_w1c_mask: 0,
+                command_mask: command,
+                latency_mask: latency,
+                cache_line_mask: cache,
+                registers: &[PciRegisterPolicy {
+                    reg_dword: 18,
+                    initial: 0xaabb_0020,
+                    writable_mask: 0xff00,
+                }],
+            });
+            c.write(1, u32::MAX);
+            c.write(3, u32::MAX);
+            c.write(18, u32::MAX);
+            assert_eq!(c.read(1), (u32::from(status) << 16) | u32::from(command));
+            assert_eq!(c.read(3), (u32::from(latency) << 8) | u32::from(cache));
+            assert_eq!(c.read(18), 0xaabb_ff20);
+            c.reset();
+            assert_eq!(c.read(1), u32::from(status) << 16);
+            assert_eq!(c.read(3), 0);
+            assert_eq!(c.read(18), 0xaabb_0020);
+        }
+    }
+
+    #[test]
+    fn masked_writes_preserve_unselected_fields_and_status_events() {
+        let c = scsi_like_with_policy(PciConfigPolicy {
+            status: 0x0200,
+            status_w1c_mask: 0x8040,
+            command_mask: 0x0157,
+            latency_mask: 0xff,
+            cache_line_mask: 0xff,
+            registers: &[PciRegisterPolicy {
+                reg_dword: 18,
+                initial: 0xaabb_0000,
+                writable_mask: 0xffff,
+            }],
+        });
+        c.set_status_bits(0x8040);
+        c.write(1, 0x0157);
+        c.write(3, 0x1234);
+        c.write(5, 0x1234_5000);
+        c.write(4, 0x1201);
+        for (reg, value, mask, expected) in [
+            (1, 0xffff_0002, 0xff, 0x8240_0102),
+            (1, 0xffff_0000, 0x8000_0000, 0x0240_0102),
+            (1, 0x0040_0000, 0x00ff_0000, 0x0200_0102),
+            (1, u32::MAX, 0, 0x0200_0102),
+            (3, 0xffff_00ab, 0xff, 0x12ab),
+            (5, 0xabcd_ffff, 0xffff_0000, 0xabcd_5000),
+            (4, 0x3400, 0xff00, 0x3401),
+            (15, u32::MAX, 0xff00, 0x0100),
+            (18, u32::MAX, 0xff, 0xaabb_00ff),
+        ] {
+            c.write_masked(reg, value, mask);
+            assert_eq!(c.read(reg), expected, "register {reg}");
+        }
+        c.set_status_bits(u16::MAX);
+        c.reset();
+        assert_eq!(c.read(1), 0x0200_0000);
+        let default = scsi_like();
+        default.set_status_bits(u16::MAX);
+        assert_eq!(default.read(1), 0x0200_0000);
+    }
+
+    #[test]
+    fn snapshots_restore_registers_with_destination_write_policies() {
+        use crate::traits::Saveable;
+        let src = scsi_like_with_policy(PciConfigPolicy {
+            status: 0x02b0,
+            status_w1c_mask: 0xc000,
+            command_mask: 0x0157,
+            latency_mask: 0xff,
+            cache_line_mask: 0xff,
+            registers: &[PciRegisterPolicy {
+                reg_dword: 18,
+                initial: 0,
+                writable_mask: 0x100,
+            }],
+        });
+        src.set_status_bits(0x8000);
+        src.write(3, 0x1234);
+        src.write(18, 0x100);
+        let saved = src.save_state();
+        for (events, command, cache) in [(0, 7, 0x0f), (0xc000, 0x0157, 0xff)] {
+            let dst = scsi_like_with_policy(PciConfigPolicy {
+                status: 0x0200,
+                status_w1c_mask: events,
+                command_mask: command,
+                latency_mask: 0,
+                cache_line_mask: cache,
+                registers: &[PciRegisterPolicy {
+                    reg_dword: 18,
+                    initial: 0x20,
+                    writable_mask: 0x200,
+                }],
+            });
+            dst.load_state(&saved).unwrap();
+            assert_eq!(dst.save_state(), saved);
+            assert_eq!(dst.read(1), 0x0200_0000 | ((0x8000 & u32::from(events)) << 16));
+            dst.write_masked(1, u32::MAX, u32::MAX);
+            dst.write(3, u32::MAX);
+            dst.write(18, u32::MAX);
+            assert_eq!(dst.read(1), 0x0200_0000 | u32::from(command));
+            assert_eq!(dst.read(3), (0x1234 & !u32::from(cache)) | u32::from(cache));
+            assert_eq!(dst.read(18), 0x300);
+            dst.reset();
+            assert_eq!(dst.read(18), 0x20);
+        }
     }
 
     struct Nothing;
@@ -564,6 +885,105 @@ mod tests {
         b.config().write(5, 0x8000_1000);
         assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x8000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "two BARs on one page");
         assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x9000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "outside the window");
+    }
+
+    /// A function that records what the bridge connected.
+    struct Wired {
+        cfg: PciConfig,
+        dma: Mutex<bool>,
+        irq: Mutex<Option<IrqLine>>,
+    }
+
+    impl Wired {
+        fn new(pin: u8) -> Arc<Self> {
+            Arc::new(Self { cfg: PciConfig::new(0x1234, 0x5678, 0, 0, [Bar::Unused; 6], pin), dma: Mutex::new(false), irq: Mutex::new(None) })
+        }
+    }
+
+    impl PciBusDevice for Wired {
+        fn config(&self) -> &PciConfig { &self.cfg }
+        fn bar_read(&self, _: usize, _: u32, _: usize) -> u32 { 0 }
+        fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
+        fn connect_interrupt(&self, line: IrqLine) { *self.irq.lock().unwrap() = Some(line); }
+        fn connect_dma(&self, _: Arc<dyn PciDma>) { *self.dma.lock().unwrap() = true; }
+    }
+
+    struct NoMemory;
+    impl PciDma for NoMemory {
+        fn dma_read(&self, _: u64, _: &mut [u8]) -> PciDmaStatus { PciDmaStatus::MasterAbort }
+        fn dma_write(&self, _: u64, _: &[u8]) -> PciDmaStatus { PciDmaStatus::MasterAbort }
+    }
+
+    struct Inputs(Mutex<Vec<(u32, bool)>>);
+    impl InterruptController for Inputs {
+        fn set_line(&self, line: u32, level: bool) { self.0.lock().unwrap().push((line, level)); }
+    }
+
+    /// Memory always; a line only for a pin INTA..INTD, and the line is the
+    /// one the bridge builds for that pin.
+    #[test]
+    fn plug_gives_memory_and_a_line_for_a_real_pin() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        for pin in 0..=5u8 {
+            let f = Wired::new(pin);
+            let mut asked = Vec::new();
+            plug(&*f, Arc::new(NoMemory), |p| { asked.push(p); IrqLine::new(inputs.clone(), p as u32) });
+            assert!(*f.dma.lock().unwrap(), "pin {pin} still masters the bus");
+            let wired = f.irq.lock().unwrap().is_some();
+            assert_eq!(wired, (1..=4).contains(&pin), "pin {pin}");
+            assert_eq!(asked, if wired { vec![pin] } else { vec![] }, "pin {pin}: the bridge is asked only for a real pin");
+        }
+        let f = Wired::new(PCI_INTA + 2);
+        plug(&*f, Arc::new(NoMemory), |p| IrqLine::new(inputs.clone(), 40 + p as u32));
+        f.irq.lock().unwrap().as_ref().unwrap().set(true);
+        assert_eq!(*inputs.0.lock().unwrap(), vec![(43, true)]);
+    }
+
+    #[test]
+    fn a_pin_drives_the_input_it_is_routed_to() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        let t = IntxTable::new(inputs.clone(), 8);
+        t.route(3, 1, Some(10));
+        assert_eq!(t.input(3, 1), Some(10));
+        assert_eq!(t.input(3, 2), None);
+        t.set_line(IntxTable::line(3, 1), true);
+        t.set_line(IntxTable::line(3, 1), false);
+        assert_eq!(*inputs.0.lock().unwrap(), vec![(10, true), (10, false)]);
+        assert_eq!(IntxTable::line(3, 4), 15);
+    }
+
+    /// A pin with no route, or beyond the table, is dropped: no input is
+    /// driven and its level is not kept.
+    #[test]
+    fn an_unrouted_pin_goes_nowhere() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        let t = IntxTable::new(inputs.clone(), 8);
+        t.set_line(IntxTable::line(2, 1), true);
+        t.set_line(8 * 4, true);
+        assert!(inputs.0.lock().unwrap().is_empty());
+        assert!(t.levels().iter().all(|&l| !l));
+    }
+
+    /// Two pins on one input: it stays up until both have dropped, and a
+    /// pin on another input does not hold it.
+    #[test]
+    fn a_shared_input_stays_up_until_every_pin_drops() {
+        let inputs = Arc::new(Inputs(Mutex::new(Vec::new())));
+        let t = IntxTable::new(inputs.clone(), 8);
+        t.route(3, 1, Some(12));
+        t.route(4, 2, Some(12));
+        t.route(5, 1, Some(13));
+        t.set_line(IntxTable::line(3, 1), true);
+        t.set_line(IntxTable::line(4, 2), true);
+        t.set_line(IntxTable::line(5, 1), true);
+        t.set_line(IntxTable::line(3, 1), false);
+        t.set_line(IntxTable::line(4, 2), false);
+        assert_eq!(*inputs.0.lock().unwrap(),
+            vec![(12, true), (12, true), (13, true), (12, true), (12, false)],
+            "input 12 drops only with its last pin");
+        let mut levels = vec![false; 32];
+        levels[IntxTable::line(5, 1) as usize] = true;
+        assert_eq!(t.levels(), levels, "slot 5's pin is still up");
     }
 
 }

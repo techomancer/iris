@@ -236,6 +236,21 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 | `port_forward[].guest_port` | `required` | Guest destination port. |
 | `port_forward[].bind` | `localhost` | localhost or any; any listens on all interfaces. |
 
+### [[pci]]
+
+PCI add-in cards, one table per card. Only a real add-in slot can be named: the onboard devices are fixed.
+Today that is the O2's one slot (PCI device 3, bus `pci`); the Octane's PCI boards are not modelled.
+The monitor's `pci slots` lists a machine's slots.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `pci[].slot` | `required` | The PCI device number (`3`, a number, not text), or the label printed on the chassis as text (`"left"`) where the slot has one. Labels work in the configuration file only; `--pci` takes device numbers. The O2's slot has no label. |
+| `pci[].card` | `required` | `aic7880`: Adaptec AIC-7880 SCSI, one bus. `isp12160`: dual-channel QLogic ISP12160 SCSI, two buses. A card's buses are the SCSI controllers after the machine's own (2, then 3 on the O2; the next card's follow), for `[scsi.N]` keys 16×controller+id, ids 1–15. IRIX 6.5.30 on the O2 drives the `aic7880` card and lists its disks in `hinv`; it finds the `isp12160` on the bus but has no driver for it. |
+| `pci[].bus` | the machine's only bus | The PCI bus id (`pci` on the O2). Needed only where a machine has several. |
+| `pci[].<other>` | none | The card's own options, inline. `isp12160` takes none. |
+
+Several cards of one kind are allowed where there are slots for them. A mistake (an onboard device, an unknown slot, a slot used twice, an unknown card or option) stops iris before it starts, with a message naming the entry. A snapshot records the fitted cards and loads only into a machine with the same ones.
+
 ### [vino]
 
 | Key | Default | Values and behavior |
@@ -315,7 +330,7 @@ table adds a port, in order.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge. Refused on the O2. |
+| `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge (slot 4); on the O2, at PCI device 4 with INTA on CRIME 11. |
 | `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device` and Ultra64) or `"exp1"` (`0x1F600000`, shared with the second Newport head). Indy and Indigo2 only. |
 | `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
 | `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); unique. |
@@ -427,6 +442,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
 | `--cpu` | Emulated CPU: `r4400` (default), `r5000`, or `r10000`. Overrides `[machine] cpu`.  |
+| `--pci` | Fit a PCI card: `[BUS:]SLOT=CARD[,KEY=VALUE]...`, for example `--pci 3=aic7880` on the O2. Repeatable; replaces a `[[pci]]` entry for the same slot. |
 | `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane only). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |

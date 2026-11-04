@@ -70,6 +70,50 @@ pub struct DiskRef {
     pub size_bytes: u64,
 }
 
+/// A PCI add-in card fitted when a snapshot was taken, by where it was.
+/// `slot` is the PCI device number, never a chassis label, so a snapshot
+/// outlives a relabelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PciRef {
+    pub bus: String,
+    pub slot: u8,
+    pub card: String,
+    /// The card's options as `key=value,...`, sorted.
+    pub options: String,
+}
+
+impl PciRef {
+    fn describe(&self) -> String {
+        let options = if self.options.is_empty() { String::new() } else { format!(" ({})", self.options) };
+        format!("pci bus \"{}\" slot {} = {}{options}", self.bus, self.slot, self.card)
+    }
+}
+
+/// Refuse a restore into a machine whose fitted cards are not the ones the
+/// snapshot was taken with. A card's state restored without the card, or a
+/// card left at power-on under a running kernel, is not a state anything
+/// was ever in. Not overridable: there is nothing to restore it into.
+pub fn check_pci(snapshot: &[PciRef], current: &[PciRef]) -> Result<(), String> {
+    let mut problems = Vec::new();
+    for s in snapshot {
+        match current.iter().find(|c| c.bus == s.bus && c.slot == s.slot) {
+            None => problems.push(format!("snapshot has {}, this config has no card there", s.describe())),
+            Some(c) if c != s => problems.push(format!("snapshot has {}, this config has {}", s.describe(), c.describe())),
+            Some(_) => {}
+        }
+    }
+    for c in current {
+        if !snapshot.iter().any(|s| s.bus == c.bus && s.slot == c.slot) {
+            problems.push(format!("this config has {}, the snapshot has no card there", c.describe()));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("snapshot PCI cards differ:\n  - {}", problems.join("\n  - ")))
+    }
+}
+
 /// Reject a restore whose CPU model differs from the running machine's.
 /// `None` from the snapshot means a legacy manifest — the model was a build
 /// flag then, so there is nothing to compare and the restore is allowed.
@@ -192,6 +236,9 @@ pub struct Manifest {
     /// for the O2. None for the Indy and Indigo2 and every older manifest. A
     /// snapshot loads only into the machine it names.
     pub machine: Option<String>,
+    /// The PCI add-in cards fitted at capture time. Empty when none were,
+    /// and for every manifest written before cards could be fitted.
+    pub pci: Vec<PciRef>,
 }
 
 impl Manifest {
@@ -218,6 +265,7 @@ impl Manifest {
             cpu_model: None,
             cpu_cache: None,
             machine: None,
+            pci: Vec::new(),
         }
     }
 
@@ -266,6 +314,17 @@ impl Manifest {
         if let Some(m) = &self.machine {
             tbl.insert("machine".into(), Value::String(m.clone()));
         }
+        if !self.pci.is_empty() {
+            let cards: Vec<Value> = self.pci.iter().map(|c| {
+                let mut t = toml::map::Map::new();
+                t.insert("bus".into(), Value::String(c.bus.clone()));
+                t.insert("slot".into(), Value::Integer(c.slot as i64));
+                t.insert("card".into(), Value::String(c.card.clone()));
+                t.insert("options".into(), Value::String(c.options.clone()));
+                Value::Table(t)
+            }).collect();
+            tbl.insert("pci".into(), Value::Array(cards));
+        }
         Value::Table(tbl)
     }
 
@@ -310,6 +369,22 @@ impl Manifest {
         let cpu_model = tbl.get("cpu_model").and_then(|x| x.as_str()).map(String::from);
         let cpu_cache = tbl.get("cpu_cache").and_then(|x| x.as_str()).map(String::from);
         let machine = tbl.get("machine").and_then(|x| x.as_str()).map(String::from);
+        // Cards: absent in a manifest from before they existed, which had
+        // none. A card entry that does not parse is an error, not a
+        // card-less snapshot, since the restore would then run without it.
+        let pci = match tbl.get("pci") {
+            None => Vec::new(),
+            Some(v) => v.as_array().ok_or("manifest: pci is not a list")?.iter().map(|x| {
+                let t = x.as_table().ok_or("manifest: a pci entry is not a table")?;
+                let text = |k: &str| t.get(k).and_then(|v| v.as_str()).map(String::from).ok_or(format!("manifest: pci entry has no {k}"));
+                Ok(PciRef {
+                    bus: text("bus")?,
+                    slot: t.get("slot").and_then(|v| v.as_integer()).and_then(|n| u8::try_from(n).ok()).ok_or("manifest: pci entry has no slot")?,
+                    card: text("card")?,
+                    options: t.get("options").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                })
+            }).collect::<Result<Vec<_>, String>>()?,
+        };
         Ok(Self {
             schema_version,
             iris_git_rev,
@@ -324,6 +399,7 @@ impl Manifest {
             cpu_model,
             cpu_cache,
             machine,
+            pci,
         })
     }
 }
@@ -782,6 +858,7 @@ mod tests {
             cpu_model: Some("R5000".into()),
             cpu_cache: Some("shadow".into()),
             machine: Some("o2_ip32".into()),
+            pci: vec![PciRef { bus: "pci".into(), slot: 3, card: "isp12160".into(), options: String::new() }],
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -797,6 +874,7 @@ mod tests {
         assert_eq!(m2.nvram, m.nvram);
         assert_eq!(m2.cpu_model, m.cpu_model);
         assert_eq!(m2.machine, m.machine);
+        assert_eq!(m2.pci, m.pci);
     }
 
     #[test]
@@ -815,6 +893,7 @@ mod tests {
             cpu_model: None,
             cpu_cache: None,
             machine: None,
+            pci: vec![],
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -827,6 +906,43 @@ mod tests {
         assert!(m2.nvram.is_none());
         assert!(m2.cpu_model.is_none(), "legacy manifest has no cpu_model");
         assert!(m2.machine.is_none(), "an Indy/Indigo2 manifest names no machine");
+        assert!(m2.pci.is_empty(), "a manifest without cards names none, and writes no key");
+        assert!(v.get("pci").is_none());
+    }
+
+    fn card(bus: &str, slot: u8, name: &str) -> PciRef {
+        PciRef { bus: bus.into(), slot, card: name.into(), options: String::new() }
+    }
+
+    #[test]
+    fn a_restore_needs_the_same_cards_in_the_same_slots() {
+        let fitted = [card("pci", 3, "isp12160")];
+        check_pci(&fitted, &fitted).expect("same card, same slot");
+        check_pci(&[], &[]).expect("no cards on either side");
+        assert_eq!(
+            check_pci(&fitted, &[]).unwrap_err(),
+            "snapshot PCI cards differ:\n  - snapshot has pci bus \"pci\" slot 3 = isp12160, this config has no card there"
+        );
+        assert_eq!(
+            check_pci(&[], &fitted).unwrap_err(),
+            "snapshot PCI cards differ:\n  - this config has pci bus \"pci\" slot 3 = isp12160, the snapshot has no card there"
+        );
+        let other = [card("pci", 3, "other")];
+        assert!(check_pci(&fitted, &other).unwrap_err().contains("this config has pci bus \"pci\" slot 3 = other"));
+        let tuned = [PciRef { options: "depth=4".into(), ..card("pci", 3, "isp12160") }];
+        assert!(check_pci(&fitted, &tuned).unwrap_err().contains("(depth=4)"), "options are part of the card");
+        let two = [card("pci", 3, "isp12160"), card("pci", 4, "isp12160")];
+        assert!(check_pci(&fitted, &two).unwrap_err().contains("slot 4"));
+    }
+
+    #[test]
+    fn a_manifest_with_a_broken_card_entry_is_an_error() {
+        let mut m = Manifest::for_current_save();
+        m.pci = vec![card("pci", 3, "isp12160")];
+        let mut v = m.to_toml();
+        assert_eq!(Manifest::from_toml(&v).unwrap().pci, m.pci);
+        v.as_table_mut().unwrap().insert("pci".into(), Value::Array(vec![Value::String("x".into())]));
+        assert!(Manifest::from_toml(&v).is_err(), "not a card-less snapshot");
     }
 
     #[test]

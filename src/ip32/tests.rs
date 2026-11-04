@@ -958,3 +958,138 @@ fn every_device_answers_the_monitor_through_the_bus() {
     }
     assert!(bus.execute_command("nonesuch", &[], Box::new(std::io::sink())).is_err());
 }
+
+/// A configuration read of `reg` in `device`'s header on bus 0.
+fn pci_config_read(bus: &Ip32Bus, device: u32, reg: u32) -> u32 {
+    use crate::traits::BusDevice;
+    let pci = &bus.mace.pci;
+    pci.write32((MACEPCI_BASE + macepci_reg::CONFIG_ADDR) as u64, 1 << 31 | device << 11 | reg << 2);
+    pci.read32((MACEPCI_BASE + macepci_reg::CONFIG_DATA) as u64).data
+}
+
+fn o2_with_cards(entries: &[&str]) -> Arc<Ip32Bus> {
+    let entries: Vec<_> = entries.iter().map(|e| crate::pci_addin::PciEntry::parse_cli(e).unwrap()).collect();
+    let placed = crate::pci_addin::validate_pci(crate::config::MachineProfile::O2Ip32, &entries).unwrap();
+    let opts = Ip32Options { cards: crate::pci_addin::build_cards(placed).unwrap(), ..Default::default() };
+    Ip32Bus::with_options(O2Memory::single(1 << 20), vec![0u8; PROM_SIZE as usize], opts)
+}
+
+#[test]
+fn a_card_in_the_add_in_slot_enumerates_at_device_3_and_the_slot_is_empty_without_one() {
+    let empty = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    assert_eq!(pci_config_read(&empty, 3, 0), 0xffff_ffff, "nothing answers in the slot");
+    let bus = o2_with_cards(&["3=isp12160"]);
+    assert_eq!(pci_config_read(&bus, 3, 0), 0x1216_1077, "QLogic ISP12160 at device 3");
+    assert_eq!(pci_config_read(&bus, 0, 0), 0xffff_ffff, "device 0 is still empty");
+    assert_eq!(pci_config_read(&bus, 4, 0), 0xffff_ffff, "and so is device 4");
+    let report = bus.mace.pci.slots_report();
+    assert!(report[3].contains("holds isp12160 1077:1216"), "{report:?}");
+    assert_eq!(bus.scsi_buses(&[]).iter().map(|&(n, _)| n).collect::<Vec<_>>(), vec![2, 3], "after the two onboard controllers");
+}
+
+#[test]
+fn each_pin_of_a_card_sets_its_crime_input_and_no_other() {
+    use crate::pci::{Bar, PciBusDevice, PciConfig, PCI_INTA};
+    struct Pin(PciConfig, std::sync::OnceLock<crate::irq::IrqLine>);
+    impl PciBusDevice for Pin {
+        fn config(&self) -> &PciConfig { &self.0 }
+        fn bar_read(&self, _: usize, _: u32, _: usize) -> u32 { 0 }
+        fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
+        fn connect_interrupt(&self, line: crate::irq::IrqLine) { let _ = self.1.set(line); }
+    }
+    for (pin, input) in [(PCI_INTA, 10), (PCI_INTA + 1, 13), (PCI_INTA + 2, 14), (PCI_INTA + 3, 15)] {
+        let bus = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+        let card = Arc::new(Pin(PciConfig::new(0x1077, 0x1216, 0x01_0000, 1, [Bar::Unused; 6], pin), Default::default()));
+        bus.mace.pci.attach(IP32_PCI_SLOT, "pin", card.clone());
+        let before = bus.crime.regs.intstat();
+        card.1.get().expect("wired at attach").set(true);
+        assert_eq!(bus.crime.regs.intstat() & !before, 1 << input, "pin {pin}: CRIME bit {input}, nothing else");
+        card.1.get().unwrap().set(false);
+        assert_eq!(bus.crime.regs.intstat(), before, "pin {pin}");
+    }
+}
+
+#[test]
+fn a_card_changes_the_saved_state_and_a_machine_without_it_refuses_it() {
+    use crate::traits::Saveable;
+    let with = o2_with_cards(&["3=isp12160"]);
+    let without = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    let saved = with.save_state();
+    with.load_state(&saved).expect("the same machine loads its own state");
+    let err = without.load_state(&saved).unwrap_err();
+    assert!(err.contains("slot 3, which is empty here"), "{err}");
+    let err = with.load_state(&without.save_state()).unwrap_err();
+    assert!(err.contains("0 PCI cards, this machine 1"), "{err}");
+}
+
+#[test]
+fn an_aic7880_card_is_the_onboard_chip_in_the_add_in_slot_with_the_next_controller_number() {
+    let bus = o2_with_cards(&["3=aic7880"]);
+    assert_eq!(pci_config_read(&bus, 3, 0), 0x8078_9004, "Adaptec AIC-7880 at device 3");
+    let onboard = bus.scsi.lock().unwrap().clone();
+    assert_eq!(bus.scsi_buses(&onboard).iter().map(|&(n, _)| n).collect::<Vec<_>>(), vec![2], "no onboard controllers here, one card bus");
+}
+
+/// One port wired to nothing, so tests don't compete for the default TCP port.
+fn unwired_port() -> crate::config::VirtioSerialConfig {
+    crate::config::VirtioSerialConfig { enabled: true, ports: vec![Default::default()], ..Default::default() }
+}
+
+fn o2_with_virtio(entries: &[&str]) -> Arc<Ip32Bus> {
+    let entries: Vec<_> = entries.iter().map(|e| crate::pci_addin::PciEntry::parse_cli(e).unwrap()).collect();
+    let placed = crate::pci_addin::validate_pci(crate::config::MachineProfile::O2Ip32, &entries).unwrap();
+    let virtio = Arc::new(crate::dev::virtio::pci::VirtioPci::new(crate::dev::virtio::console::from_config(&unwired_port())));
+    let opts = Ip32Options { cards: crate::pci_addin::build_cards(placed).unwrap(), virtio: Some(virtio), ..Default::default() };
+    Ip32Bus::with_options(O2Memory::single(1 << 20), vec![0u8; PROM_SIZE as usize], opts)
+}
+
+#[test]
+fn virtio_serial_is_a_pci_function_at_device_4_with_its_inta_on_crime_11() {
+    let bus = o2_with_virtio(&[]);
+    assert_eq!(pci_config_read(&bus, 4, 0), 0x1043_1af4, "virtio console at device 4");
+    assert_eq!(pci_config_read(&bus, 3, 0), 0xffff_ffff, "the add-in slot stays empty");
+    // The function's INTA is routed to CRIME 11, nowhere else.
+    let (_, f, _) = bus.mace.pci.slot(IP32_VIRTIO_SLOT).expect("attached");
+    assert_eq!(f.config().interrupt_pin(), 1);
+    let report = bus.mace.pci.slots_report();
+    assert!(report.iter().all(|l| !l.contains("virtio")), "it is not a slot: {report:?}");
+    assert_eq!(IP32_VIRTIO_CRIME_INT, 11);
+}
+
+#[test]
+fn virtio_serial_and_a_card_in_the_slot_coexist() {
+    let bus = o2_with_virtio(&["3=aic7880"]);
+    assert_eq!(pci_config_read(&bus, 3, 0), 0x8078_9004, "the card");
+    assert_eq!(pci_config_read(&bus, 4, 0), 0x1043_1af4, "and the virtio device");
+    assert_eq!(bus.scsi_buses(&[]).iter().map(|&(n, _)| n).collect::<Vec<_>>(), vec![2]);
+}
+
+#[test]
+fn a_snapshot_with_virtio_serial_is_not_for_a_machine_without_it() {
+    use crate::traits::Saveable;
+    let bus = o2_with_virtio(&[]);
+    // A snapshot of this machine is not for one without the device.
+    let plain = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    let err = plain.load_state(&bus.save_state()).unwrap_err();
+    assert!(err.contains("slot 4, which is empty here"), "the bridge notices first: {err}");
+    let err = bus.load_state(&plain.save_state()).unwrap_err();
+    assert_eq!(err, "saved state has no virtio-serial, this machine has it");
+    bus.load_state(&bus.save_state()).expect("its own state loads");
+}
+
+fn pci_config_write(bus: &Ip32Bus, device: u32, reg: u32, val: u32) {
+    use crate::traits::BusDevice;
+    let pci = &bus.mace.pci;
+    pci.write32((MACEPCI_BASE + macepci_reg::CONFIG_ADDR) as u64, 1 << 31 | device << 11 | reg << 2);
+    pci.write32((MACEPCI_BASE + macepci_reg::CONFIG_DATA) as u64, val);
+}
+
+/// A cold reset puts the virtio device back to power-on, as it does the cards.
+#[test]
+fn a_cold_reset_resets_virtio_serial() {
+    let bus = o2_with_virtio(&[]);
+    pci_config_write(&bus, 4, 1, 0x2);
+    assert_eq!(pci_config_read(&bus, 4, 1) & 0xffff, 0x2, "memory enable set");
+    bus.power_on();
+    assert_eq!(pci_config_read(&bus, 4, 1) & 0xffff, 0, "and cleared by the reset");
+}
