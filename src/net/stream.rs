@@ -593,20 +593,34 @@ mod tests {
     /// interval, not in a tight loop.
     #[test]
     fn a_peer_that_hangs_up_is_redialled_at_the_retry_rate() {
+        const DIALS: u32 = 6;
+        let retry = Duration::from_millis(100);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut r = rig(StreamEndpoint::Tcp(listener.local_addr().unwrap()), Duration::from_millis(100));
-        let (mut accepted, end) = (0, Instant::now() + Duration::from_secs(1));
-        while Instant::now() < end {
+        let mut r = rig(StreamEndpoint::Tcp(listener.local_addr().unwrap()), retry);
+        // Time the redials against the clock the test reads itself, not a
+        // fixed window: a loaded host can stall the backend for part of a
+        // window, but it cannot make the dials come closer together.
+        let (mut first, mut last, mut accepted) = (None::<Instant>, Instant::now(), 0);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while accepted < DIALS {
+            assert!(Instant::now() < deadline, "only {accepted} connections in 30 seconds");
             if listener.accept().is_ok() {
+                last = Instant::now();
+                first.get_or_insert(last);
                 accepted += 1;
             } else {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
         r.stop();
-        // About ten in the second; a spinning client makes thousands.
-        assert!((5..=15).contains(&accepted), "{accepted} connections in one second");
+        // Each dial waits out a full retry after the previous one. We see
+        // them late, never early, so only the first sighting can shrink the
+        // span; allow it one whole interval of lateness. A spinning client
+        // makes all six in a few milliseconds.
+        let span = last - first.unwrap();
+        let least = retry * (DIALS - 2);
+        assert!(span >= least, "{DIALS} connections in {span:?}, expected at least {least:?}");
     }
 
     /// Frames queued while no peer was there are not sent to the one that
