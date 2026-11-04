@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### O2 virtio-serial
+
+- `[virtio_serial]` now works on the O2: the paravirtual device is PCI device 4
+  on the MACE bus, INTA on CRIME input 11. It is not an add-in slot and does
+  not take the place of a card in device 3. Not yet run under a guest with a
+  driver for it.
+
 ### O2 PCI add-in cards
 
 - The O2's one add-in slot (PCI device 3) takes a card from the configuration:

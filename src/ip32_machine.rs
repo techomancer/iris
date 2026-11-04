@@ -190,8 +190,12 @@ impl O2Machine {
             cards.iter().flat_map(|f| f.buses()).find(|&(n, _)| n == c).map(|(_, b)| b)
                 .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1, and each add-in card its own)"))
         })?;
+        let virtio = cfg.virtio_serial.enabled.then(|| {
+            Arc::new(crate::dev::virtio::pci::VirtioPci::new(crate::dev::virtio::console::from_config(&cfg.virtio_serial)))
+        });
         let opts = Ip32Options {
             cards,
+            virtio,
             scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
@@ -552,6 +556,9 @@ impl O2Machine {
         for f in &self.bus.cards {
             f.card.stop();
         }
+        if let Some(v) = &self.bus.virtio {
+            crate::traits::Device::stop(&**v);
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
@@ -581,6 +588,9 @@ impl O2Machine {
         }
         for f in &self.bus.cards {
             f.card.start();
+        }
+        if let Some(v) = &self.bus.virtio {
+            crate::traits::Device::start(&**v);
         }
     }
 

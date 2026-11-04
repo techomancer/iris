@@ -43,6 +43,13 @@ pub const IP32_PCI_CRIME_INT: u32 = 10;
 /// device's pin can be routed to one, so each is the OR of its pins.
 pub const IP32_PCI_CRIME_SHARED: u32 = 13;
 
+/// Where `[virtio_serial]` puts its paravirtual device: PCI device 4, which
+/// the MACE tables give INTA on CRIME input 11 and which a stock board leaves
+/// empty. It is iris's own device, not a slot: it is not in [`BUSES`] and a
+/// card cannot be configured there.
+pub const IP32_VIRTIO_SLOT: u8 = 4;
+pub const IP32_VIRTIO_CRIME_INT: u32 = 11;
+
 /// The O2's PCI bus, for the configuration and the `pci slots` command. The
 /// slot's four pins are routed as the MACE specification has them; what
 /// the board's connector wires INTB to INTD to is not known.
@@ -75,6 +82,8 @@ fn crime_input(slot: u8, pin: u8) -> Option<u32> {
         (IP32_SCSI_SLOT, 1) => Some(IP32_SCSI_CRIME_INT),
         (IP32_SCSI_SLOT_B, 1) => Some(IP32_SCSI_CRIME_INT_B),
         (IP32_PCI_SLOT, 1) => Some(IP32_PCI_CRIME_INT),
+        // The paravirtual device's INTA, which the MACE tables give device 4.
+        (IP32_VIRTIO_SLOT, 1) => Some(IP32_VIRTIO_CRIME_INT),
         // INTB to INTD, on the shared inputs 13 to 15, where the kernels
         // look for them. Whether the board's connector wires them is unknown.
         (IP32_PCI_SLOT, pin @ 2..=4) => Some(IP32_PCI_CRIME_SHARED + pin as u32 - 2),
@@ -998,5 +1007,23 @@ mod tests {
         let report = pci.slots_report();
         assert!(report[3].contains("holds card 1077:1216"), "{report:?}");
         assert!(report[3].contains("INTA CRIME 10, INTB CRIME 13, INTC CRIME 14, INTD CRIME 15"), "{report:?}");
+    }
+
+    /// The paravirtual device at device 4 has its INTA on CRIME input 11;
+    /// its other pins, and the slot's, are not disturbed.
+    #[test]
+    fn device_4s_inta_reaches_crime_11() {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = MacePci::new(crime.clone(), test_ram());
+        let (virtio, card) = (pin_fake(PCI_INTA), pin_fake(PCI_INTA));
+        pci.attach(IP32_VIRTIO_SLOT, "virtio", virtio.clone());
+        pci.attach(IP32_PCI_SLOT, "card", card.clone());
+        virtio.irq.get().unwrap().set(true);
+        assert_eq!(*crime.0.lock().unwrap(), vec![(IP32_VIRTIO_CRIME_INT, true)]);
+        card.irq.get().unwrap().set(true);
+        virtio.irq.get().unwrap().set(false);
+        assert_eq!(crime.0.lock().unwrap().last(), Some(&(IP32_VIRTIO_CRIME_INT, false)));
+        assert_eq!(crime.0.lock().unwrap()[1], (IP32_PCI_CRIME_INT, true), "the slot's INTA is still CRIME 10");
+        assert_eq!(IP32_VIRTIO_CRIME_INT, 11);
     }
 }

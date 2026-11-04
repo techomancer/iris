@@ -2150,11 +2150,8 @@ impl MachineConfig {
             }
             // The Octane has a PCI bridge with a free slot.
             MachineProfile::OctaneIp30 => Ok(()),
-            MachineProfile::O2Ip32 => Err(
-                "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
-                 MACE PCI bridge has no interrupt route for a third slot (see docs/virtio-serial.md)"
-                    .into(),
-            ),
+            // PCI device 4 on the MACE bus, which a stock board leaves empty.
+            MachineProfile::O2Ip32 => Ok(()),
         }
     }
 

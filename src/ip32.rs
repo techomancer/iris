@@ -177,6 +177,8 @@ pub struct Ip32Options {
     pub mac: Option<[u8; 6]>,
     /// Cards fitted in the add-in slot, with their disks attached.
     pub cards: Vec<crate::pci_addin::Fitted>,
+    /// The paravirtual serial device (`[virtio_serial]`), at PCI device 4.
+    pub virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -435,6 +437,8 @@ pub struct Ip32Bus {
     /// The cards in the add-in slot. Fixed at power-on: a card is fitted
     /// with the machine, not hot-plugged.
     pub cards: Vec<crate::pci_addin::Fitted>,
+    /// The paravirtual serial device, if configured.
+    pub virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
 }
 
 impl Ip32Bus {
@@ -489,6 +493,7 @@ impl Ip32Bus {
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
             cards: opts.cards,
+            virtio: opts.virtio,
         };
         bus.gbe.tr.start_from_env();
         if let Some(mac) = opts.mac {
@@ -524,6 +529,9 @@ impl Ip32Bus {
             f.card.set_heartbeat(bus.mace.id.heartbeat.clone());
             f.card.register_locks();
             bus.mace.pci.attach(f.device, f.card.name(), f.card.function());
+        }
+        if let Some(v) = &bus.virtio {
+            bus.mace.pci.attach(IP32_VIRTIO_SLOT, "virtio-serial", v.clone());
         }
         // A saved flash carries the guest's environment -- boot paths, console
         // choice, everything the PROM's `setenv` writes -- from one run to
@@ -688,6 +696,9 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
+        if self.virtio.is_some() {
+            t.insert("virtio".into(), toml::Value::Boolean(true));
+        }
         if !self.cards.is_empty() {
             t.insert("cards".into(), toml::Value::Array(self.cards.iter().map(|f| f.card.save_state()).collect()));
         }
@@ -719,6 +730,16 @@ impl crate::traits::Saveable for Ip32Bus {
             for (c, s) in scsi.iter().zip(a) {
                 c.load_state(s)?;
             }
+        }
+        // The paravirtual device keeps no state of its own across a restore,
+        // but a snapshot is for the machine it was taken on.
+        let saved_virtio = get_field(v, "virtio").is_some();
+        if saved_virtio != self.virtio.is_some() {
+            return Err(if saved_virtio {
+                "saved state has virtio-serial, this machine has none".to_string()
+            } else {
+                "saved state has no virtio-serial, this machine has it".to_string()
+            });
         }
         let saved_cards = match get_field(v, "cards") {
             Some(toml::Value::Array(a)) => a.as_slice(),
@@ -754,6 +775,9 @@ impl Ip32Bus {
         }
         for f in &self.cards {
             f.card.power_on();
+        }
+        if let Some(v) = &self.virtio {
+            v.power_on();
         }
     }
 

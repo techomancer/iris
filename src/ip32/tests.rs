@@ -1029,3 +1029,67 @@ fn an_aic7880_card_is_the_onboard_chip_in_the_add_in_slot_with_the_next_controll
     let onboard = bus.scsi.lock().unwrap().clone();
     assert_eq!(bus.scsi_buses(&onboard).iter().map(|&(n, _)| n).collect::<Vec<_>>(), vec![2], "no onboard controllers here, one card bus");
 }
+
+/// One port wired to nothing, so tests don't compete for the default TCP port.
+fn unwired_port() -> crate::config::VirtioSerialConfig {
+    crate::config::VirtioSerialConfig { enabled: true, ports: vec![Default::default()], ..Default::default() }
+}
+
+fn o2_with_virtio(entries: &[&str]) -> Arc<Ip32Bus> {
+    let entries: Vec<_> = entries.iter().map(|e| crate::pci_addin::PciEntry::parse_cli(e).unwrap()).collect();
+    let placed = crate::pci_addin::validate_pci(crate::config::MachineProfile::O2Ip32, &entries).unwrap();
+    let virtio = Arc::new(crate::dev::virtio::pci::VirtioPci::new(crate::dev::virtio::console::from_config(&unwired_port())));
+    let opts = Ip32Options { cards: crate::pci_addin::build_cards(placed).unwrap(), virtio: Some(virtio), ..Default::default() };
+    Ip32Bus::with_options(O2Memory::single(1 << 20), vec![0u8; PROM_SIZE as usize], opts)
+}
+
+#[test]
+fn virtio_serial_is_a_pci_function_at_device_4_with_its_inta_on_crime_11() {
+    let bus = o2_with_virtio(&[]);
+    assert_eq!(pci_config_read(&bus, 4, 0), 0x1043_1af4, "virtio console at device 4");
+    assert_eq!(pci_config_read(&bus, 3, 0), 0xffff_ffff, "the add-in slot stays empty");
+    // The function's INTA is routed to CRIME 11, nowhere else.
+    let (_, f, _) = bus.mace.pci.slot(IP32_VIRTIO_SLOT).expect("attached");
+    assert_eq!(f.config().interrupt_pin(), 1);
+    let report = bus.mace.pci.slots_report();
+    assert!(report.iter().all(|l| !l.contains("virtio")), "it is not a slot: {report:?}");
+    assert_eq!(IP32_VIRTIO_CRIME_INT, 11);
+}
+
+#[test]
+fn virtio_serial_and_a_card_in_the_slot_coexist() {
+    let bus = o2_with_virtio(&["3=aic7880"]);
+    assert_eq!(pci_config_read(&bus, 3, 0), 0x8078_9004, "the card");
+    assert_eq!(pci_config_read(&bus, 4, 0), 0x1043_1af4, "and the virtio device");
+    assert_eq!(bus.scsi_buses(&[]).iter().map(|&(n, _)| n).collect::<Vec<_>>(), vec![2]);
+}
+
+#[test]
+fn a_snapshot_with_virtio_serial_is_not_for_a_machine_without_it() {
+    use crate::traits::Saveable;
+    let bus = o2_with_virtio(&[]);
+    // A snapshot of this machine is not for one without the device.
+    let plain = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    let err = plain.load_state(&bus.save_state()).unwrap_err();
+    assert!(err.contains("slot 4, which is empty here"), "the bridge notices first: {err}");
+    let err = bus.load_state(&plain.save_state()).unwrap_err();
+    assert_eq!(err, "saved state has no virtio-serial, this machine has it");
+    bus.load_state(&bus.save_state()).expect("its own state loads");
+}
+
+fn pci_config_write(bus: &Ip32Bus, device: u32, reg: u32, val: u32) {
+    use crate::traits::BusDevice;
+    let pci = &bus.mace.pci;
+    pci.write32((MACEPCI_BASE + macepci_reg::CONFIG_ADDR) as u64, 1 << 31 | device << 11 | reg << 2);
+    pci.write32((MACEPCI_BASE + macepci_reg::CONFIG_DATA) as u64, val);
+}
+
+/// A cold reset puts the virtio device back to power-on, as it does the cards.
+#[test]
+fn a_cold_reset_resets_virtio_serial() {
+    let bus = o2_with_virtio(&[]);
+    pci_config_write(&bus, 4, 1, 0x2);
+    assert_eq!(pci_config_read(&bus, 4, 1) & 0xffff, 0x2, "memory enable set");
+    bus.power_on();
+    assert_eq!(pci_config_read(&bus, 4, 1) & 0xffff, 0, "and cleared by the reset");
+}
