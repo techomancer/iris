@@ -746,7 +746,7 @@ impl crate::traits::Device for Aic7880 {
             ]
         } else {
             vec![
-                (format!("scsi{}", self.index), format!("SCSI controller {} (external): same subcommands as `scsi`", self.index)),
+                (format!("scsi{}", self.index), format!("SCSI controller {}: same subcommands as `scsi`", self.index)),
                 (format!("cow{}", self.index), format!("COW overlays on controller {}: same subcommands as `cow`", self.index)),
             ]
         }
@@ -1717,7 +1717,38 @@ impl crate::pci::PciBusDevice for Aic7880 {
     fn connect_dma(&self, dma: std::sync::Arc<dyn crate::pci::PciDma>) {
         let _ = self.dma.set(dma);
     }
+
+    fn connect_heartbeat(&self, beat: Arc<AtomicU64>) {
+        self.set_heartbeat(beat);
+    }
+
+    fn scsi_buses(&self) -> Vec<&ScsiBus> {
+        vec![&self.bus]
+    }
+
+    fn device(self: Arc<Self>) -> Option<Arc<dyn crate::traits::Device>> {
+        Some(self)
+    }
+
+    fn saveable(&self) -> Option<&dyn crate::traits::Saveable> {
+        Some(self)
+    }
 }
+
+/// The AIC-7880 as a card: no options, one bus of ids 0 to 15.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CardOptions {}
+
+pub static CARD: crate::pci::card::CardDesc = crate::pci::card::CardDesc {
+    summary: "Adaptec AIC-7880 Ultra SCSI controller",
+    scsi: crate::pci::card::ScsiSpec { controllers: 1, max_id: 15 },
+    check: |options| crate::pci::card::read_options::<CardOptions>(options).map(|_| ()),
+    build: |b| {
+        crate::pci::card::read_options::<CardOptions>(b.options)?;
+        Ok(Aic7880::new_at(b.first_controller, Aic7880::new_bus()))
+    },
+};
 
 #[cfg(test)]
 mod tests {
@@ -2549,5 +2580,55 @@ mod tests {
         assert_eq!(&r.data[16..32], b"IRIS EMUL DISK  ");
         c.bus().attach_image(4, &img, false).unwrap();
         assert!(c.bus().has_target(4), "a target attached after boot goes on the same bus");
+    }
+
+    fn card_options(text: &str) -> toml::Table {
+        toml::from_str(text).unwrap()
+    }
+
+    fn build_card(first_controller: u8) -> Arc<dyn crate::pci::PciBusDevice> {
+        let options = card_options("");
+        (CARD.build)(&crate::pci::card::CardBuild { options: &options, first_controller }).unwrap()
+    }
+
+    #[test]
+    fn a_built_aic7880_card_exposes_its_abilities() {
+        let f = build_card(2);
+        assert_eq!(f.scsi_buses().len(), 1);
+        assert!(f.saveable().is_some());
+        assert_eq!(f.config().read(0), 0x8078_9004);
+        f.connect_heartbeat(Arc::new(AtomicU64::new(0)));
+        let d = f.clone().device().expect("a device to start and stop");
+        assert_eq!(d.register_commands().len(), 2);
+        assert_eq!((CARD.scsi.controllers, CARD.scsi.max_id), (1, 15));
+        assert_eq!(crate::pci::card::PciCard::Aic7880.desc().summary, CARD.summary);
+    }
+
+    #[test]
+    fn the_card_takes_no_options() {
+        assert!((CARD.check)(&card_options("")).is_ok());
+        let e = (CARD.check)(&card_options("speed = 4")).unwrap_err();
+        assert!(e.contains("speed"), "{e}");
+        assert!((CARD.build)(&crate::pci::card::CardBuild { options: &card_options("speed = 4"), first_controller: 2 }).is_err());
+    }
+
+    #[test]
+    fn the_bus_lists_the_devices_that_want_starting() {
+        use crate::pci::slots::PciAddr;
+        let h = crate::pci::host::TestHost::new();
+        let bus = crate::pci::bus::PciBus::new(&crate::pci::bus::tests::DESC, h);
+        bus.attach(PciAddr::dev(4), build_card(0));
+        bus.attach(PciAddr::dev(3), build_card(1));
+        let names: Vec<_> = bus.devices().iter().map(|d| d.register_commands()[0].0.clone()).collect();
+        assert_eq!(names, ["scsi", "scsi1"], "in placement order, indexed by controller");
+    }
+
+    #[test]
+    fn monitor_commands_of_two_cards_do_not_collide() {
+        let names = |n| -> Vec<String> {
+            build_card(n).device().unwrap().register_commands().into_iter().map(|c| c.0).collect()
+        };
+        assert_eq!(names(2), ["scsi2", "cow2"]);
+        assert_eq!(names(3), ["scsi3", "cow3"]);
     }
 }

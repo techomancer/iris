@@ -8,6 +8,7 @@
 //! [`IrqLine`] for its pin.
 
 pub mod bus;
+pub mod card;
 pub mod host;
 pub mod intx;
 pub mod monitor;
@@ -452,6 +453,30 @@ pub trait PciBusDevice: Send + Sync {
 
     /// The bridge gives a function that masters the bus its way to memory.
     fn connect_dma(&self, _dma: std::sync::Arc<dyn PciDma>) {}
+
+    // Abilities beyond PCI. A machine asks for the ones it wants of
+    // whatever sits on the bus and never for the concrete type; a function
+    // that has none keeps the defaults.
+
+    /// The status bar's activity bits, which the function lights.
+    fn connect_heartbeat(&self, _beat: Arc<std::sync::atomic::AtomicU64>) {}
+
+    /// The SCSI buses the function drives, in controller order: the
+    /// machine binds disks to them.
+    fn scsi_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
+        Vec::new()
+    }
+
+    /// The function as a device the machine starts, stops and lists in the
+    /// monitor.
+    fn device(self: Arc<Self>) -> Option<Arc<dyn crate::traits::Device>> {
+        None
+    }
+
+    /// The state the function saves besides its header.
+    fn saveable(&self) -> Option<&dyn crate::traits::Saveable> {
+        None
+    }
 
     /// The bridge's REQ64# as reset ends: whether the function's slot drives
     /// it. A 64-bit agent samples it to learn its bus width; a 32-bit one

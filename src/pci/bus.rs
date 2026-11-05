@@ -160,6 +160,11 @@ impl PciBus {
         self.order.lock().unwrap().iter().map(|&a| (a, self.function(a).unwrap().clone())).collect()
     }
 
+    /// The functions that are devices to start and stop, in placement order.
+    pub fn devices(&self) -> Vec<Arc<dyn crate::traits::Device>> {
+        self.functions().into_iter().filter_map(|(_, f)| f.device()).collect()
+    }
+
     /// The cards users fitted, in placement order.
     pub fn cards(&self) -> Vec<(PciAddr, CardRef, Arc<dyn PciBusDevice>)> {
         self.order
