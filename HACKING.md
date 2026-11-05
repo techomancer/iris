@@ -483,6 +483,13 @@ three boards have optional JITs (`rex-jit`, `gr2-jit`, `gr4-jit`) that
 compile pixel pipelines with Cranelift; the interpreter remains the
 reference, and each JIT has an equivalence test against it.
 
+The optional `rex-gpu` feature adds a replay-only wgpu path on the
+`REX3-Processor` thread. Explicit GPU replay may batch its supported fills,
+but it reads them back before an unsupported draw falls back to the CPU,
+before the GFIFO becomes idle or exits, and before `GFXBUSY` is released.
+The CPU framebuffer therefore remains canonical at every replay observation
+point. Normal live emulation never enables this path.
+
 Scanout is decoupled from drawing: the display thread reads the framebuffer
 without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
