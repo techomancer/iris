@@ -809,6 +809,7 @@ mod tests {
 
         ctx = context(DRAWMODE0_ADRMODE_BLOCK_SH, (1, 2), (3, 4));
         ctx.xstart |= 1;
+        ctx.xsave = ctx.xstart;
         assert_eq!(unsupported_reason(&ctx), "fractional coordinates");
 
         ctx = context(DRAWMODE0_ADRMODE_BLOCK_SH, (3, 2), (1, 4));
