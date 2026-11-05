@@ -1,0 +1,15 @@
+keep *
+install standard
+keep java2_plugin.sw32.mozilla_freeware
+keep inventor_dev.sw.base
+keep inventor_dev.sw.lib
+install eoe.sw.fonttools
+install eoe.sw.uucp
+install eoe.sw.xlv
+install ftn_eoe
+install eoe.sw.spell
+install inventor_eoe.sw64
+install ifl_eoe.sw64
+install dmedia_eoe.sw64
+install prereqs
+keep incompleteoverlays
