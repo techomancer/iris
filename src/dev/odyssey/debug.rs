@@ -513,6 +513,10 @@ impl Odyssey {
         let _ = writeln!(out, "  classes 0x20-0x35: {:x?}", ge.regs_20_35);
         let nonzero = ge.constants.iter().filter(|&&c| c != 0).count();
         let _ = writeln!(out, "  constants: {nonzero} of {} nonzero", ge.constants.len());
+        // The non-zero entries by index: the program lists the walk reads.
+        for (i, &c) in ge.constants.iter().enumerate().filter(|(_, &c)| c != 0).take(64) {
+            let _ = writeln!(out, "    [{i:#05x}] {c:#06x}");
+        }
         let _ = writeln!(out, "  eye clip planes: {}", (0..ge.clip_eye.len() / 4).map(|i| format!("[{}]", f32s(&ge.clip_eye[i * 4..i * 4 + 4]))).collect::<Vec<_>>().join(" "));
         Ok(out)
     }
