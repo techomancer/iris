@@ -159,8 +159,9 @@ impl Board {
     /// form (dma_draw_sentinel_short()) is window-tested.
     pub fn dma_put(&mut self, to: &Rows, x: i64, y: i64, src: &[u8], code: u32) {
         let pixel = self.decode_pixel(code, src).unwrap_or(0);
-        let word = if code_is_index(code) { pixel } else { (pixel & !0xffu32) | 0xff };
-        to.store_word(x as i32, y as i32, word);
+        let index = code_is_index(code);
+        let word = if index { pixel } else { (pixel & !0xffu32) | 0xff };
+        to.store_word(x as i32, y as i32, self.image_transfer(word, index));
     }
 
     /// The A and B fields of the surface a DMA header names: word 0's

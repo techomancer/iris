@@ -490,6 +490,7 @@ impl Board {
             let rows = self.dest_mem().colour[0];
             rows.store_word(self.image.cur_x as i32, self.image.cur_y as i32, word);
         } else {
+            let word = self.image_transfer(word, is_index);
             self.paint_pixel(
                 self.image.cur_x as i64 + self.win.origin[0] as i64,
                 self.image.cur_y as i64 + self.win.origin[1] as i64,
