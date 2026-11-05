@@ -454,7 +454,7 @@ pub struct Ip32Bus {
     /// The bus everything is mapped on: what the CPU and the DMA masters use.
     pub phys: Arc<Physical>,
     /// The runs of the PCI windows a BAR decodes whole, mapped over MACE
-    /// (`MacePci::on_bar_runs`).
+    /// (`PciBus::on_bar_runs`).
     pci_runs: Mutex<Vec<crate::pci::BarRun>>,
     pub(crate) ram: Arc<O2Memory>,
     pub(crate) flash: O2Flash,
@@ -569,7 +569,7 @@ impl Ip32Bus {
         bus.map();
         // Window pages a PCI BAR decodes whole go straight to the function.
         let weak = Arc::downgrade(&bus);
-        bus.mace.pci.on_bar_runs(Box::new(move |runs| {
+        bus.mace.pci.bus().on_bar_runs(Box::new(move |runs| {
             if let Some(b) = weak.upgrade() {
                 b.set_pci_runs(runs);
             }

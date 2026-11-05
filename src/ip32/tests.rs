@@ -926,13 +926,54 @@ fn nvram_survives_and_decodes_maces_spacing() {
 /// 0x91, 0x93 and 0xbc, which are nothing; with it they are HCNTRL,
 /// CLRINT, SCBPTR and the SCB array, which is exactly right.
 #[test]
-fn the_bridge_swaps_byte_lanes_for_a_little_endian_device() {
-    assert_eq!(MacePci::lane_swizzle(0x84, 1), 0x87, "HCNTRL");
-    assert_eq!(MacePci::lane_swizzle(0x91, 1), 0x92, "CLRINT");
-    assert_eq!(MacePci::lane_swizzle(0x93, 1), 0x90, "SCBPTR");
-    assert_eq!(MacePci::lane_swizzle(0xbc, 1), 0xbf, "last byte of the SCB");
-    assert_eq!(MacePci::lane_swizzle(0x84, 2), 0x86, "16-bit lanes swap in pairs");
-    assert_eq!(MacePci::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
+fn window_accesses_swizzle_byte_lanes_through_the_bus() {
+    use crate::pci::slots::PciAddr;
+    use crate::pci::{Bar, PciBusDevice, PciConfig};
+
+    struct Probe {
+        cfg: PciConfig,
+        last: Mutex<Option<(u32, usize)>>,
+    }
+    impl PciBusDevice for Probe {
+        fn config(&self) -> &PciConfig { &self.cfg }
+        fn bar_read(&self, _: usize, off: u32, width: usize) -> u32 {
+            *self.last.lock().unwrap() = Some((off, width));
+            0
+        }
+        fn bar_write(&self, _: usize, off: u32, _: u32, width: usize) {
+            *self.last.lock().unwrap() = Some((off, width));
+        }
+    }
+
+    let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+    let f = Arc::new(Probe {
+        cfg: PciConfig::new(0x9004, 0x8078, 0x01_0000, 1, [Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0),
+        last: Mutex::new(None),
+    });
+    bus.mace.pci.bus().attach(PciAddr::dev(3), f.clone());
+    // Firmware's way in: MACE's configuration registers.
+    let reg = |off: u32| (MACEPCI_BASE + off) as u64;
+    let cfg_write = |r: u32, v: u32| {
+        bus.mace.pci.write32(reg(macepci_reg::CONFIG_ADDR), (1 << 31) | (3 << 11) | (r << 2));
+        bus.mace.pci.write32(reg(macepci_reg::CONFIG_DATA), v);
+    };
+    cfg_write(4, 0x8000_0000);
+    cfg_write(1, 2);
+
+    let at = |off: u32| PCI_MEM_BASE + off;
+    for (off, width, want) in [
+        (0x84, 1, 0x87), // HCNTRL
+        (0x91, 1, 0x92), // CLRINT
+        (0x93, 1, 0x90), // SCBPTR
+        (0xbc, 1, 0xbf), // last byte of the SCB
+        (0x84, 2, 0x86), // 16-bit lanes swap in pairs
+        (0x84, 4, 0x84), // a whole word needs no swap
+    ] {
+        bus.mace.pci.window_read(at(off), width);
+        assert_eq!(*f.last.lock().unwrap(), Some((want, width)), "read {width} at {off:#x}");
+        bus.mace.pci.window_write(at(off), 0, width);
+        assert_eq!(*f.last.lock().unwrap(), Some((want, width)), "write {width} at {off:#x}");
+    }
 }
 
 /// Every O2 device answers the monitor through the bus: its command is

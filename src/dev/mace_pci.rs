@@ -3,15 +3,14 @@
 //! byte lanes on the way, since PCI is little-endian and the CPU is not), and
 //! wires each slot's interrupt pin to its CRIME input.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use crate::irq::InterruptController;
 use crate::dev::crime_mem::O2Memory;
 use crate::pci::bus::PciBus;
 use crate::pci::host::{CpuWindow, PciHost};
 use crate::pci::slots::{BusDesc, PciAddr};
-use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
+use crate::pci::{PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
 use crate::snapshot::{get_field, hex_u32, load_u32_slice, toml_u32, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Saveable, BUS_OK};
 use crate::ip32::*;
@@ -138,41 +137,6 @@ impl PciDma for HostMemory {
     }
 }
 
-/// The most BAR windows open at once (two AIC-7880s open two each).
-const MAX_WINDOWS: usize = 16;
-
-/// A BAR window as the bridge's decode table holds it, packed into one
-/// word: base (bits 0-31), log2 of the size (32-37), I/O space (38), slot
-/// (40-44), BAR (48-50).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Window {
-    space: Space,
-    slot: u8,
-    bar: usize,
-    base: u32,
-    size: u32,
-}
-
-impl Window {
-    fn pack(self) -> u64 {
-        self.base as u64
-            | (self.size.trailing_zeros() as u64) << 32
-            | ((self.space == Space::Io) as u64) << 38
-            | (self.slot as u64) << 40
-            | (self.bar as u64) << 48
-    }
-
-    fn unpack(w: u64) -> Self {
-        Self {
-            space: if w & (1 << 38) != 0 { Space::Io } else { Space::Mem },
-            slot: ((w >> 40) & 0x1f) as u8,
-            bar: ((w >> 48) & 7) as usize,
-            base: w as u32,
-            size: 1u32 << ((w >> 32) & 0x3f),
-        }
-    }
-}
-
 /// What MACE gives the shared PCI bus: host memory for the masters, CRIME's
 /// inputs for the interrupt outputs, and the CPU's three windows.
 pub struct MaceHost {
@@ -215,17 +179,6 @@ pub struct MacePci {
     regs: Mutex<[u32; (MACEPCI_SIZE / 4) as usize]>,
     /// The functions on bus 0, their interrupt routing and header state.
     bus: PciBus,
-    /// The BAR windows the functions decode, rebuilt from their headers
-    /// after every configuration write. A function's BAR comparators are
-    /// its own registers on the bus, not anything the bridge locks, so
-    /// window accesses read the table without one; configuration writes
-    /// and window accesses both come from the CPU.
-    windows: [AtomicU64; MAX_WINDOWS],
-    nwindows: AtomicUsize,
-    /// Where the runs of the windows a BAR decodes whole go (the machine
-    /// maps them over MACE's windows), and the entries made for them.
-    bar_sink: RwLock<Option<BarRunSink>>,
-    bar_entries: Mutex<std::collections::HashMap<(usize, usize, u64), Arc<dyn BusDevice>>>,
 }
 
 impl MacePci {
@@ -237,68 +190,12 @@ impl MacePci {
             config_addr: Mutex::new(0),
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
             bus: PciBus::new(desc, host),
-            windows: std::array::from_fn(|_| AtomicU64::new(0)),
-            nwindows: AtomicUsize::new(0),
-            bar_sink: RwLock::new(None),
-            bar_entries: Mutex::new(Default::default()),
         }
     }
 
     /// The bus: place functions on it, ask it what is there.
     pub fn bus(&self) -> &PciBus {
         &self.bus
-    }
-
-    /// Rebuild the decode table from the functions' headers, device by
-    /// device and BAR by BAR, the order in which an overlap resolves.
-    fn rebuild_windows(&self) {
-        let mut funcs = self.bus.functions();
-        funcs.sort_by_key(|(at, _)| *at);
-        let mut n = 0;
-        for (at, f) in &funcs {
-            for (space, bar, base, size) in f.config().windows() {
-                if n == MAX_WINDOWS {
-                    log::warn!("pci: more than {MAX_WINDOWS} BAR windows open; {at} BAR {bar} ignored");
-                    continue;
-                }
-                self.windows[n].store(Window { space, slot: at.device, bar, base, size }.pack(), Ordering::Relaxed);
-                n += 1;
-            }
-        }
-        self.nwindows.store(n, Ordering::Release);
-        self.publish_bars();
-    }
-
-    /// Send the runs of the CPU's PCI windows that one BAR decodes whole to
-    /// `sink`, now and after every configuration write. Each run is a
-    /// [`PciBar`] at its CPU address: the machine maps it on the physical
-    /// bus over MACE, so the processor reaches the function with no search
-    /// of the windows. Everything else in a window (I/O BARs smaller than a
-    /// page, unclaimed addresses, which float high) still comes here.
-    pub fn on_bar_runs(&self, sink: BarRunSink) {
-        *self.bar_sink.write().unwrap() = Some(sink);
-        self.publish_bars();
-    }
-
-    fn publish_bars(&self) {
-        let sink = self.bar_sink.read().unwrap();
-        let Some(sink) = sink.as_ref() else { return };
-        let funcs: Vec<(usize, Arc<dyn PciBusDevice>)> =
-            self.bus.functions().into_iter().map(|(at, f)| (at.device as usize, f)).collect();
-        let mut entry = |b: BarAt| {
-            self.bar_entries
-                .lock()
-                .unwrap()
-                .entry((b.slot, b.bar, b.cpu_base))
-                .or_insert_with(|| Arc::new(PciBar::new(Arc::new(Lanes), b.dev.clone(), b.bar, 0xffff_ffff, b.cpu_base)))
-                .clone()
-        };
-        let mut runs: Vec<BarRun> = Vec::new();
-        runs.extend(bar_runs(&funcs, Space::Io, PCI_IO_BASE as u64, 0, PCI_IO_SIZE as u64, &mut entry));
-        runs.extend(bar_runs(&funcs, Space::Mem, PCI_MEM_BASE as u64, PCI_MEM_PCI_BASE, PCI_MEM_SIZE as u64, &mut entry));
-        let hi = (1u64 << 32) - PCI_HI_MEM_BASE as u64;
-        runs.extend(bar_runs(&funcs, Space::Mem, PCI_HI_MEM_BASE as u64, PCI_HI_MEM_BASE, hi, &mut entry));
-        sink(runs);
     }
 
     /// Whether `addr` is in one of the CPU's windows onto PCI memory.
@@ -328,7 +225,7 @@ impl MacePci {
     /// particular. With it they are HCNTRL (chip reset, then pause), CLRINT
     /// (clear every interrupt), SCBPTR walking 0,1,2,... and the last byte of
     /// each SCB being cleared — which is exactly how that chip is brought up.
-    pub fn lane_swizzle(off: u32, width: usize) -> u32 {
+    fn lane_swizzle(off: u32, width: usize) -> u32 {
         match width {
             1 => off ^ 3,
             2 => off ^ 2,
@@ -336,27 +233,13 @@ impl MacePci {
         }
     }
 
-    /// The function decoding a PCI memory address: it, the BAR and the
-    /// offset within it.
-    fn mem_target(&self, space: Space, pci_addr: u32) -> Option<(&Arc<dyn PciBusDevice>, usize, u32)> {
-        let n = self.nwindows.load(Ordering::Acquire);
-        self.windows[..n].iter().find_map(|w| {
-            let w = Window::unpack(w.load(Ordering::Relaxed));
-            let off = pci_addr.wrapping_sub(w.base);
-            if w.space != space || off >= w.size {
-                return None;
-            }
-            Some((self.bus.function(PciAddr::dev(w.slot))?, w.bar, off))
-        })
-    }
-
     /// The function and BAR a CPU address in a window reaches, in whichever
     /// space that window opens onto.
     fn window_target(&self, addr: u32) -> Option<(&Arc<dyn PciBusDevice>, usize, u32)> {
         if Self::in_io_window(addr) {
-            return self.mem_target(Space::Io, addr - PCI_IO_BASE);
+            return self.bus.target(Space::Io, addr - PCI_IO_BASE);
         }
-        self.mem_target(Space::Mem, Self::pci_addr_of(addr))
+        self.bus.target(Space::Mem, Self::pci_addr_of(addr))
     }
 
     fn mem_read(&self, addr: u32, width: usize) -> u32 {
@@ -463,9 +346,7 @@ impl BusDevice for MacePci {
             }
             macepci_reg::CONFIG_DATA => {
                 if let Some((at, reg)) = self.selected() {
-                    if self.bus.config_write(at, reg * 4, 4, val) {
-                        self.rebuild_windows();
-                    }
+                    self.bus.config_write(at, reg * 4, 4, val);
                 }
             }
             _ => self.regs.lock().unwrap()[(off / 4) as usize] = val,
@@ -504,7 +385,6 @@ impl Saveable for MacePci {
             load_u32_slice(r, &mut *self.regs.lock().unwrap());
         }
         self.bus.load_state(get_field(v, "pci").ok_or("pci: saved state has no bus")?)?;
-        self.rebuild_windows();
         self.bus.redrive();
         Ok(())
     }
@@ -570,7 +450,7 @@ impl crate::traits::Device for MacePci {
 mod tests {
     use super::*;
     use crate::irq::IrqLine;
-    use crate::pci::{Bar, PciConfig, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
+    use crate::pci::{Bar, BarRun, PciConfig, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
 
     /// A function that remembers its last BAR access and drives its pin.
     struct Fake {
@@ -737,7 +617,7 @@ mod tests {
         pci.bus().attach(PciAddr::dev(IP32_SCSI_SLOT), f.clone());
         let runs = Arc::new(Mutex::new(Vec::<BarRun>::new()));
         let sink = runs.clone();
-        pci.on_bar_runs(Box::new(move |r| *sink.lock().unwrap() = r));
+        pci.bus().on_bar_runs(Box::new(move |r| *sink.lock().unwrap() = r));
         assert!(runs.lock().unwrap().is_empty());
         let slot1 = (IP32_SCSI_SLOT as u32) << 11;
         pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(slot1, 5));
