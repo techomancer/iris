@@ -400,13 +400,12 @@ impl Board {
         let mut strq: [u32; 4] = [self.tex.coord[0], self.tex.coord[1], self.tex.coord_r, self.tex.coord_q];
         let one_d = (self.tex_regs().path & (tex::MODE_1D | tex::MODE_2D)) == tex::MODE_1D;
         // Captured linear planes already include the eye-space transform.
-        if (self.cmd.tag == gl_cmd::VERTEX_2I
+        let position_word = self.cmd.tag == gl_cmd::VERTEX_2I
             || self.cmd.tag == gl_cmd::VERTEX_2F
             || self.cmd.tag == gl_cmd::VERTEX_3F
             || self.cmd.tag == gl_cmd::VERTEX_3I
-            || self.cmd.tag == gl_cmd::VERTEX_4F)
-            && self.geom.linear_texgen != 0
-        {
+            || self.cmd.tag == gl_cmd::VERTEX_4F;
+        if position_word && (self.geom.linear_texgen != 0 || self.geom.sphere_texgen != 0) {
             let mut vertex = [
                 f64::from(odyssey_f32(self.cmd.operand[0])),
                 f64::from(odyssey_f32(self.cmd.operand[1])),
@@ -420,6 +419,15 @@ impl Board {
             }
             if self.cmd.tag == gl_cmd::VERTEX_3I {
                 vertex[2] = (self.cmd.operand[2] as i32) as f64;
+            }
+            if self.geom.sphere_texgen != 0 {
+                let [ss, tt] = self.sphere_map(&vertex);
+                if self.geom.sphere_texgen & 1 != 0 {
+                    strq[0] = ss.to_bits();
+                }
+                if self.geom.sphere_texgen & 2 != 0 {
+                    strq[1] = tt.to_bits();
+                }
             }
             for axis in 0..4usize {
                 let plane = if axis == 3 {
@@ -450,6 +458,38 @@ impl Board {
         }
         self.assembly.texture = matrix;
         self.assembly.texcoord = strq.map(f32::from_bits);
+    }
+}
+
+impl Board {
+    /// GL_SPHERE_MAP's s and t for a vertex at object position obj: the eye
+    /// direction u to the vertex reflected about the eye-space normal n,
+    /// r = u - 2 (n . u) n, and m = 2 sqrt(rx^2 + ry^2 + (rz + 1)^2), then
+    /// s = rx / m + 1/2, t = ry / m + 1/2 (OpenGL 1.2, 2.10.4). The normal is
+    /// the current normal through the normal matrix, renormalised under
+    /// GL_NORMALIZE, as the lighting takes it.
+    pub fn sphere_map(&self, obj: &[f64; 4]) -> [f32; 2] {
+        let f = |w: u32| f32::from_bits(w) as f64;
+        let mv = &self.geom.modelview;
+        let nm = &self.geom.normal_matrix;
+        let normal = self.geom.normal.map(f);
+        let eye: [f64; 3] = std::array::from_fn(|r| (0..4).map(|k| f(mv[r * 4 + k]) * obj[k]).sum());
+        let mut n: [f64; 3] = std::array::from_fn(|r| (0..3).map(|c| f(nm[r * 4 + c]) * normal[c]).sum());
+        let unit = |v: [f64; 3]| {
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if l > 0.0 { v.map(|c| c / l) } else { v }
+        };
+        if self.geom.normalize {
+            n = unit(n);
+        }
+        let u = unit(eye);
+        let nu = n[0] * u[0] + n[1] * u[1] + n[2] * u[2];
+        let r: [f64; 3] = std::array::from_fn(|k| u[k] - 2.0 * nu * n[k]);
+        let m = 2.0 * (r[0] * r[0] + r[1] * r[1] + (r[2] + 1.0) * (r[2] + 1.0)).sqrt();
+        if m == 0.0 {
+            return [0.5, 0.5];
+        }
+        [(r[0] / m + 0.5) as f32, (r[1] / m + 0.5) as f32]
     }
 }
 
