@@ -42,13 +42,15 @@ pub(crate) struct RasterVertex {
     /// The depth divisor over w.
     pub depth_w: f64,
     pub rgba: [f64; 4],
+    /// The separate specular colour, RGB (zero unless the program keeps it).
+    pub spec: [f64; 3],
     pub tex: [f64; 4],
     pub clip: [f64; 6],
 }
 
 impl Default for RasterVertex {
     fn default() -> Self {
-        RasterVertex { x: 0, y: 0, z: 0.0, inv_w: 0.0, depth_w: 0.0, rgba: [0.0; 4], tex: [0.0; 4], clip: [0.0; 6] }
+        RasterVertex { x: 0, y: 0, z: 0.0, inv_w: 0.0, depth_w: 0.0, rgba: [0.0; 4], spec: [0.0; 3], tex: [0.0; 4], clip: [0.0; 6] }
     }
 }
 
