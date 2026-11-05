@@ -174,6 +174,10 @@ default = ["tlbvmap", "rexdiag"]
 rex-dirty-upload = []
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
+# Replay-only host-GPU prototype for REX3. This is deliberately separate from
+# `gpujit`: it adds a headless wgpu/WGSL engine selected explicitly with
+# REX3_REPLAY_ENGINE=gpu and never changes the live CPU renderer by default.
+rex-gpu = ["gputrace", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
 # Cranelift-based JIT for IMPACT (GR4) raster shaders: RSS/TE1 pixel
 # pipelines monomorphised on a 64-bit key (src/dev/mgras/rss_jit).
 gr4-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
@@ -304,6 +308,9 @@ cranelift-native     = { version = "0.134", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
 region               = { version = "3.0",   optional = true }
 wasmtime-jit-icache-coherence = { version = "=47.0.3", optional = true, package = "wasmtime-internal-jit-icache-coherence" }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "30", optional = true }
 libchdman-rs = { version = "0.289.2", features = ["prebuilt"] }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12" }
@@ -420,6 +427,11 @@ required-features = ["jitv2"]
 name = "jitv2-pcp-dump"
 path = "src/bin/jitv2_pcp_dump.rs"
 required-features = ["jitv2", "j2wp"]
+
+[[example]]
+name = "rex3-gpu-probe"
+path = "examples/rex3_gpu_probe.rs"
+required-features = ["rex-gpu"]
 
 # Mac App Store fix (guideline 2.5.1): eframe's winit (0.30) calls the private
 # SkyLight API `CGSSetWindowBackgroundBlurRadius`, whose symbol Apple's binary

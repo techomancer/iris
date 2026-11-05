@@ -8136,6 +8136,117 @@ fn legacy_gfifo_register_traffic_marks_framebuffer_dirty() {
     assert!(rex.fb_dirty.swap(false, Ordering::Acquire));
 }
 
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn gpu_replay_batches_flat_rgb_fills_and_matches_the_cpu() {
+    fn queue_fill(rex: &Rex3, color: [u32; 3], start: (i32, i32), end: (i32, i32)) {
+        reg(rex, REX3_COLORRED, color[0] << 11);
+        reg(rex, REX3_COLORGRN, color[1] << 11);
+        reg(rex, REX3_COLORBLUE, color[2] << 11);
+        reg(rex, REX3_XYENDI, xy(end.0, end.1));
+        reg(rex, REX3_XYSTARTI, xy(start.0, start.1));
+        w32(rex, go_addr(REX3_DRAWMODE0), DM0_DRAW_BLOCK);
+    }
+
+    fn queue_case(rex: &Rex3) {
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00FF_FFFF);
+        reg(rex, REX3_CLIPMODE, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        queue_fill(rex, [0x11, 0x22, 0x33], (10, 20), (200, 80));
+        queue_fill(rex, [0xA0, 0xB0, 0xC0], (100, 50), (250, 100));
+    }
+
+    let cpu = make_rex3_reset();
+    let gpu = make_rex3_reset();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+    let diagnostics = gpu
+        .enable_gpu_replay(&backend)
+        .expect("initialize the opt-in REX3 GPU replay backend");
+    eprintln!("REX3 GPU test {diagnostics}");
+
+    queue_case(&cpu);
+    queue_case(&gpu);
+    wait(&cpu);
+    wait(&gpu);
+
+    let cpu_rgb = unsafe { &*cpu.fb_rgb.get() };
+    let gpu_rgb = unsafe { &*gpu.fb_rgb.get() };
+    assert_eq!(gpu_rgb.as_ref(), cpu_rgb.as_ref());
+
+    let report = gpu.gpu_replay_report().expect("GPU replay report");
+    assert_eq!(report.handled_draws, 2);
+    assert_eq!(report.fallback_draws, 0);
+    assert_eq!(
+        report.submissions, 1,
+        "both draws should share one GPU batch"
+    );
+    assert_eq!(report.fences, 1);
+    assert_eq!(report.bytes_uploaded, (2048 * 1024 * 4) as u64);
+    assert_eq!(report.bytes_read_back, (2048 * 1024 * 4) as u64);
+    assert_eq!(report.error, None);
+}
+
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn gpu_replay_synchronizes_before_cpu_fallback() {
+    fn queue_fill(
+        rex: &Rex3,
+        drawmode0: u32,
+        color: [u32; 3],
+        start: (i32, i32),
+        end: (i32, i32),
+    ) {
+        reg(rex, REX3_COLORRED, color[0] << 11);
+        reg(rex, REX3_COLORGRN, color[1] << 11);
+        reg(rex, REX3_COLORBLUE, color[2] << 11);
+        reg(rex, REX3_XYENDI, xy(end.0, end.1));
+        reg(rex, REX3_XYSTARTI, xy(start.0, start.1));
+        w32(rex, go_addr(REX3_DRAWMODE0), drawmode0);
+    }
+
+    fn queue_case(rex: &Rex3) {
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00FF_FFFF);
+        reg(rex, REX3_CLIPMODE, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        queue_fill(rex, DM0_DRAW_BLOCK, [0x11, 0x22, 0x33], (10, 20), (80, 60));
+        queue_fill(
+            rex,
+            DM0_DRAW_BLOCK | (1 << 18),
+            [0x44, 0x55, 0x66],
+            (30, 35),
+            (70, 55),
+        );
+        queue_fill(rex, DM0_DRAW_BLOCK, [0xA0, 0xB0, 0xC0], (50, 45), (90, 70));
+    }
+
+    let cpu = make_rex3_reset();
+    let gpu = make_rex3_reset();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+    gpu.enable_gpu_replay(&backend)
+        .expect("initialize the opt-in REX3 GPU replay backend");
+
+    queue_case(&cpu);
+    queue_case(&gpu);
+    wait(&cpu);
+    wait(&gpu);
+
+    let cpu_rgb = unsafe { &*cpu.fb_rgb.get() };
+    let gpu_rgb = unsafe { &*gpu.fb_rgb.get() };
+    assert_eq!(gpu_rgb.as_ref(), cpu_rgb.as_ref());
+
+    let report = gpu.gpu_replay_report().expect("GPU replay report");
+    assert_eq!(report.handled_draws, 2);
+    assert_eq!(report.fallback_draws, 1);
+    assert_eq!(report.fallback_reasons.get("draw mode 0"), Some(&1));
+    assert_eq!(report.submissions, 2);
+    assert_eq!(report.fences, 2);
+    assert_eq!(report.bytes_uploaded, (2 * 2048 * 1024 * 4) as u64);
+    assert_eq!(report.bytes_read_back, (2 * 2048 * 1024 * 4) as u64);
+    assert_eq!(report.error, None);
+}
+
 /// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
 /// 32, and STATUS reports only the last 32 slots of it.
 ///

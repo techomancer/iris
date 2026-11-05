@@ -1336,6 +1336,8 @@ pub struct Rex3 {
     // Each bit of a pixel represents a plane.
     pub fb_rgb: UnsafeCell<Box<[u32]>>,
     pub fb_aux: UnsafeCell<Box<[u32]>>,
+    #[cfg(feature = "rex-gpu")]
+    gpu_replay: Mutex<Option<crate::dev::ng1::rex3_gpu::Rex3Gpu>>,
     pub gfifo: GFifo,
 
     pub vc2: Mutex<Vc2>,
@@ -1536,6 +1538,8 @@ impl Rex3 {
             context: UnsafeCell::new(Rex3Context::power_on_default()),
             fb_rgb: UnsafeCell::new(fb_rgb),
             fb_aux: UnsafeCell::new(fb_aux),
+            #[cfg(feature = "rex-gpu")]
+            gpu_replay: Mutex::new(None),
             gfifo: GFifo::new(),
             vc2: Mutex::new(Vc2::new()),
             xmap0: Mutex::new(Xmap9::new()),
@@ -1626,6 +1630,85 @@ impl Rex3 {
             screenshot_counter: AtomicU32::new(0),
             frame_request: AtomicBool::new(false),
             capture_users: AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    pub(crate) fn enable_gpu_replay(
+        &self,
+        backend: &str,
+    ) -> Result<crate::dev::ng1::rex3_gpu::AdapterDiagnostics, String> {
+        let mut slot = self.gpu_replay.lock();
+        if slot.is_some() {
+            return Err("REX3 GPU replay is already enabled".into());
+        }
+        let gpu = crate::dev::ng1::rex3_gpu::Rex3Gpu::new(backend)?;
+        let diagnostics = gpu.diagnostics().clone();
+        *slot = Some(gpu);
+        Ok(diagnostics)
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    pub(crate) fn gpu_replay_report(&self) -> Option<crate::dev::ng1::rex3_gpu::ReplayReport> {
+        self.gpu_replay.lock().as_ref().map(|gpu| gpu.report())
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    fn flush_gpu_replay(&self) {
+        let mut slot = self.gpu_replay.lock();
+        let Some(gpu) = slot.as_mut() else {
+            return;
+        };
+        let rgb = unsafe { &mut *self.fb_rgb.get() };
+        match gpu.flush(rgb) {
+            Ok(damage) => self.fb_damage.publish(&damage),
+            Err(error) => log::error!("REX3 GPU replay flush failed: {error}"),
+        }
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    fn try_gpu_replay_draw(&self, context: &mut Rex3Context) -> bool {
+        let mut slot = self.gpu_replay.lock();
+        let Some(gpu) = slot.as_mut() else {
+            return false;
+        };
+        loop {
+            let result = {
+                let rgb = unsafe { &*self.fb_rgb.get() };
+                gpu.try_enqueue(context, rgb)
+            };
+            match result {
+                Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Enqueued) => return true,
+                Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::FlushRequired) => {
+                    let rgb = unsafe { &mut *self.fb_rgb.get() };
+                    match gpu.flush(rgb) {
+                        Ok(damage) => self.fb_damage.publish(&damage),
+                        Err(error) => {
+                            log::error!(
+                                "REX3 GPU replay could not flush a full batch: {error}"
+                            );
+                            return false;
+                        }
+                    }
+                }
+                Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Unsupported(reason)) => {
+                    gpu.note_fallback(reason);
+                    let rgb = unsafe { &mut *self.fb_rgb.get() };
+                    match gpu.flush(rgb) {
+                        Ok(damage) => self.fb_damage.publish(&damage),
+                        Err(error) => {
+                            log::error!(
+                                "REX3 GPU replay could not synchronize before CPU fallback: {error}"
+                            );
+                        }
+                    }
+                    return false;
+                }
+                Err(error) => {
+                    log::error!("REX3 GPU replay draw failed: {error}");
+                    return false;
+                }
+            }
         }
     }
 
@@ -2659,6 +2742,8 @@ impl Rex3 {
             if !self.running.load(Ordering::Relaxed) { break; }
             std::hint::spin_loop();
         }
+        #[cfg(feature = "rex-gpu")]
+        self.flush_gpu_replay();
     }
 
     fn register_processor(&self) {
@@ -2706,12 +2791,16 @@ impl Rex3 {
                 //self.update_gfifo_irqs();
 
                 if exit {
+                    #[cfg(feature = "rex-gpu")]
+                    self.flush_gpu_replay();
                     self.gfxbusy.store(false, Ordering::Release);
                     self.gfifo.flush_head();
                     break; 
                 } // GFIFO_EXIT
             } else {
                 if is_busy {
+                    #[cfg(feature = "rex-gpu")]
+                    self.flush_gpu_replay();
                     self.gfxbusy.store(false, Ordering::Release);
                     is_busy = false;
                     //self.update_gfifo_irqs();
@@ -2839,6 +2928,14 @@ impl Rex3 {
 
         #[cfg(feature = "rex-dirty-upload")]
         let damage = Self::go_damage(ctx);
+
+        #[cfg(feature = "rex-gpu")]
+        if self.try_gpu_replay_draw(ctx) {
+            #[cfg(feature = "rexdiag")]
+            self.diag
+                .fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
+            return;
+        }
 
         crate::pf_scope!(crate::perfetto::events::REX3_RASTER, opcode);
 
