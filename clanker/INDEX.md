@@ -143,6 +143,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 | [daynaport-target-gotchas.md](scsi/daynaport-target-gotchas.md) | rule | DaynaPort target: the three things that bite |
 | [linux-lun-scan-and-mode-sense-gaps.md](scsi/linux-lun-scan-and-mode-sense-gaps.md) | rule | Linux SCSI probe noise: phantom LUNs, missing Caching page, no MODE SENSE(10) |
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |
+| [windows-cannot-fsync-a-directory.md](scsi/windows-cannot-fsync-a-directory.md) | rule | Windows cannot fsync a directory: raw COW overlays failed every sidecar rewrite |
 | [openbsd.md](scsi/openbsd.md) | rule | OpenBSD SCSI Boot Crash — Investigation Notes |
 
 ## net/

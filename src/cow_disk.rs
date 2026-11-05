@@ -203,21 +203,26 @@ pub(crate) fn append_dirty_sidecar(f: &mut File, lbas: &[u64]) -> io::Result<()>
 }
 
 pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
+    let ctx = |what: &str, p: &Path| {
+        let what = what.to_string();
+        let p = p.display().to_string();
+        move |e: io::Error| io::Error::new(e.kind(), format!("{what} {p}: {e}"))
+    };
     // Write atomically: write to a temp file then rename.
     let tmp = path.with_extension("dirty.tmp");
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = File::create(&tmp).map_err(ctx("creating", &tmp))?;
         let mut bytes = Vec::with_capacity(8 * (dirty.len() + 1));
         bytes.extend_from_slice(&(dirty.len() as u64).to_le_bytes());
         for &s in dirty {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+        f.write_all(&bytes).map_err(ctx("writing", &tmp))?;
+        f.sync_all().map_err(ctx("syncing", &tmp))?;
     }
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, path).map_err(ctx("replacing", path))?;
     // The rename is not on the host's disk until its directory is.
-    crate::chd_disk::fsync_dir(path.parent())
+    crate::chd_disk::fsync_dir(path.parent()).map_err(ctx("syncing the directory of", path))
 }
 
 pub struct CowDisk {
@@ -524,6 +529,30 @@ mod tests {
         for p in [&src, &dst] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// The sidecar is created, then replaced while an append handle to the old
+    /// one is still open, as `CowNode` does on every flush and reopen. On
+    /// Windows the directory sync after the rename used to fail with access
+    /// denied, which reached the guest as a write error on its root disk.
+    #[test]
+    fn the_dirty_sidecar_can_be_replaced_repeatedly() {
+        let path = unique_tmp("sidecar", "dirty");
+        let mut dirty: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        save_dirty_sidecar(&path, &dirty).expect("create");
+        let mut record = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append_dirty_sidecar(&mut record, &[4]).unwrap();
+        dirty.insert(4);
+        for extra in [10u64, 11] {
+            dirty.insert(extra);
+            save_dirty_sidecar(&path, &dirty).expect("replace");
+            record = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        }
+        append_dirty_sidecar(&mut record, &[12]).unwrap();
+        dirty.insert(12);
+        drop(record);
+        assert_eq!(load_dirty_sidecar(&path).unwrap(), dirty);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
