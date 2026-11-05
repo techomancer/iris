@@ -63,7 +63,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::dev::heart::host_clock()));
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
     xbow.connect_heart(heart.clone());
-    let bridge = Bridge::new(ram.dma_view(), heart.clone());
+    let bridge = Bridge::new(&crate::ip30::PCI_BUS, ram.dma_view(), heart.clone());
     bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
     let phys = Ip30Bus::new(ram);
     phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
@@ -462,19 +462,20 @@ impl Octane {
         ram.set_memcfg([0x8001_0000, 0, 0, 0]);
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
-        let bridge = Bridge::new(mem.clone(), heart.clone());
+        let bridge = Bridge::new(&crate::ip30::PCI_BUS, mem.clone(), heart.clone());
 
         let eth = Ioc3Eth::with_negotiation_delay(MAC, std::time::Duration::ZERO);
         let (link, sent, inject) = crate::net::Link::loopback();
         eth.attach(link);
         let ioc3 = Arc::new(Ioc3::octane(MAC, false));
         ioc3.attach_eth(eth.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN as u8));
+        ioc3.connect_superio_interrupt(bridge.bus().wire("super I/O"));
 
         let isp = [Arc::new(Isp1040::new_at(0, Isp1040::new_bus())), Arc::new(Isp1040::new_at(1, Isp1040::new_bus()))];
-        bridge.attach(SLOT_ISP0 as u8, isp[0].clone());
-        bridge.attach(SLOT_ISP1 as u8, isp[1].clone());
-        bridge.attach(SLOT_IOC3 as u8, ioc3.clone());
+        let at = |d: u32| crate::pci::slots::PciAddr::dev(d as u8);
+        bridge.bus().attach(at(SLOT_ISP0), isp[0].clone());
+        bridge.bus().attach(at(SLOT_ISP1), isp[1].clone());
+        bridge.bus().attach(at(SLOT_IOC3), ioc3.clone());
         Octane { heart, mem, bridge, isp, sent, inject, eth }
     }
 

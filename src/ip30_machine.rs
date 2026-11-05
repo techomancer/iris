@@ -35,9 +35,10 @@ use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::Xbow;
 use crate::hptimer::TimerManager;
 use crate::ip30::{
-    widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
-    WIDGET_XBOW,
+    widget_small_base, CachedFlashLines, Ip30Bus, IP30_PCI_IOC3, IP30_PCI_RAD1, IP30_PCI_SCSI0, IP30_PCI_SCSI1,
+    IP30_PCI_VIRTIO, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE, WIDGET_XBOW,
 };
+use crate::pci::slots::PciAddr;
 use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
 use crate::snapshot::{field, ChunksManifest, Manifest, Snapshot, StateTable, SCHEMA_VERSION};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
@@ -88,11 +89,6 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
-/// The Bridge input IOC3's SuperIO block (serial, keyboard, clock) is
-/// wired to; the Ethernet uses IOC3's PCI pin.
-const SUPERIO_PIN: u8 = 4;
-/// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
-const VIRTIO_SLOT: u8 = 4;
 /// The blank part on the Bridge's second flash select: reads all ones and
 /// keeps no writes, an approximation from one word read on a real Octane2.
 /// The PROM looks for a part there too.
@@ -221,7 +217,7 @@ impl OctaneMachine {
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
-        let bridge = Bridge::new(mem.clone(), heart.clone());
+        let bridge = Bridge::new(&crate::ip30::PCI_BUS, mem.clone(), heart.clone());
         bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
@@ -248,15 +244,15 @@ impl OctaneMachine {
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
         }
-        bridge.attach(0, scsi[0].clone());
-        bridge.attach(1, scsi[1].clone());
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_SCSI0), scsi[0].clone());
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_SCSI1), scsi[1].clone());
         let ioc3 = Arc::new(Ioc3::octane(mac, false));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = Ioc3Eth::new(mac);
         eth.set_heartbeat(heartbeat.clone());
         ioc3.attach_eth(eth.clone());
-        bridge.attach(2, ioc3.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN));
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_IOC3), ioc3.clone());
+        ioc3.connect_superio_interrupt(bridge.bus().wire("super I/O"));
         ioc3.set_timer_manager(timer_manager.clone());
         // The guest switching the machine off through the clock.
         ioc3.set_event_sender(event_tx.clone());
@@ -272,13 +268,13 @@ impl OctaneMachine {
         if !cfg.no_audio {
             rad.enable_output(cfg.audio.clone());
         }
-        bridge.attach(3, rad.clone());
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_RAD1), rad.clone());
         let virtio = cfg.virtio_serial.enabled.then(|| {
             let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
                 crate::dev::virtio::console::from_config(&cfg.virtio_serial),
             ));
-            bridge.attach(VIRTIO_SLOT, dev.clone());
-            eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
+            bridge.bus().attach(PciAddr::dev(IP30_PCI_VIRTIO), dev.clone());
+            eprintln!("iris: virtio-serial on Bridge slot {IP30_PCI_VIRTIO}");
             dev
         });
 

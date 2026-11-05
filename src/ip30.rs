@@ -459,3 +459,47 @@ impl BusDevice for CachedFlashLines {
 /// Cross-device tests: the chips wired as the machine wires them, no CPU.
 #[cfg(test)]
 mod tests;
+
+/// Bridge device numbers of the functions on the Octane's board.
+pub const IP30_PCI_SCSI0: u8 = 0;
+pub const IP30_PCI_SCSI1: u8 = 1;
+pub const IP30_PCI_IOC3: u8 = 2;
+pub const IP30_PCI_RAD1: u8 = 3;
+/// A device number no Octane board uses, kept for the paravirtual serial port.
+pub const IP30_PCI_VIRTIO: u8 = 4;
+
+/// Bridge input the IOC3's SuperIO block (serial, keyboard, clock) is wired
+/// to; the Ethernet uses IOC3's PCI pin.
+pub const IP30_SUPERIO_PIN: u8 = 4;
+
+/// The Bridge's routing of a device's pins: A and C reach the input
+/// numbered as the device, B and D that number with bit two flipped.
+const fn bridge_routes(device: u8) -> [Option<u8>; 4] {
+    [Some(device), Some(device ^ 4), Some(device), Some(device ^ 4)]
+}
+
+/// The Octane's PCI bus: the Bridge's, with its eight inputs as the host
+/// outputs. There are no add-in slots.
+pub static PCI_BUS: crate::pci::slots::BusDesc = {
+    use crate::pci::slots::{BusDesc, Evidence, SlotDesc, SlotKind, WireDesc};
+    const ROUTING: &str = "Bridge interrupt map as iris and QEMU's sgi_bridge_map_irq have it";
+    BusDesc {
+        id: "pci",
+        name: "Octane PCI bus",
+        devices: 8,
+        outputs: 8,
+        slots: &[
+            SlotDesc { device: IP30_PCI_SCSI0, label: "SCSI 0", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: ROUTING, routes: bridge_routes(IP30_PCI_SCSI0) },
+            SlotDesc { device: IP30_PCI_SCSI1, label: "SCSI 1", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: ROUTING, routes: bridge_routes(IP30_PCI_SCSI1) },
+            SlotDesc { device: IP30_PCI_IOC3, label: "IOC3", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: ROUTING, routes: bridge_routes(IP30_PCI_IOC3) },
+            SlotDesc { device: IP30_PCI_RAD1, label: "audio (RAD1)", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: ROUTING, routes: bridge_routes(IP30_PCI_RAD1) },
+            SlotDesc { device: IP30_PCI_VIRTIO, label: "virtio-serial", kind: SlotKind::ParavirtualSpare, evidence: Evidence::Approximation,
+                source: "a device number the Bridge decodes and no Octane board uses", routes: bridge_routes(IP30_PCI_VIRTIO) },
+        ],
+        wires: &[WireDesc { name: "super I/O", output: IP30_SUPERIO_PIN, source: "the IOC3's SuperIO interrupt on a Bridge input" }],
+    }
+};
