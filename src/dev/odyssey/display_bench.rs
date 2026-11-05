@@ -49,8 +49,9 @@ fn scene_board(scene: Scene) -> Box<Board> {
     s.test_screen();
     // The frame buffer and the window-id buffer, from the seed.
     let fb_end = (0x14_2000 + 0x2_8000) * 16;
-    for c in s.vram.bytes_mut()[0x2000 * 16..fb_end].chunks_exact_mut(4) {
-        c.copy_from_slice(&rng.next_u32().to_be_bytes());
+    let mem = s.vram.ptr();
+    for a in (0x2000 * 16..fb_end).step_by(4) {
+        mem.store(a as u64, 4, rng.next_u32() as u64);
     }
     for i in 0..lut::SIZE as usize {
         s.regs().set_lut(i, rng.next_u32() & lut::ENTRY_MASK);
@@ -77,10 +78,10 @@ fn scene_board(scene: Scene) -> Box<Board> {
     for y in 0..1024u32 {
         for x in 0..1280u32 {
             let block = x / 64 + 3 * (y / 48);
-            let at = wid.offset(x, y) as usize;
-            let b = s.vram.bytes_mut();
-            b[at] = if rgb { 0 } else { ((block % 32) << ODSY_DID_MAIN_SHIFT | (block / 3) % 8) as u8 };
-            b[at + 1] = if !rgb && rng.next_u32() % 5 == 0 { rng.next_u32() as u8 } else { 0 };
+            let at = wid.offset(x, y);
+            let mem = s.vram.ptr();
+            mem.store(at, 1, if rgb { 0 } else { ((block % 32) << ODSY_DID_MAIN_SHIFT | (block / 3) % 8) as u64 });
+            mem.store(at + 1, 1, if !rgb && rng.next_u32() % 5 == 0 { rng.next_u32() as u8 as u64 } else { 0 });
         }
     }
     if rgb {
@@ -111,7 +112,7 @@ fn composed(s: &Board) -> Vec<u32> {
     let regs = s.regs().read();
     let frame = Frame::snapshot(&regs, s.front.lock().displayed_buffer).expect("the scan-out is set up");
     let mut out = vec![0u32; frame.width as usize * frame.height as usize];
-    frame.compose(s.vram.bytes(), &regs, &mut out, frame.width as usize, frame.height as usize);
+    frame.compose(s.vram.ptr_shared(), &regs, &mut out, frame.width as usize, frame.height as usize);
     out
 }
 

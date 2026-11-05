@@ -13,13 +13,15 @@
 //! (`ignore/odsy/docs/measured.md` section 8.)
 //!
 //! MODEL CHOICES, which nothing the host can read shows: a 4-byte depth field
-//! is the 24-bit depth word big-endian then the stencil byte; an 8-byte colour
-//! field (the 12-bit visuals) is four 12-bit lanes, R first, in its first 6
-//! bytes; a 2- or 4-byte colour field packs as a texel of that size and
+//! is the 24-bit depth word in its top three bytes and the stencil byte
+//! after; an 8-byte colour field (the 12-bit visuals) is four 12-bit lanes,
+//! R highest, in its first 6 bytes; a 2- or 4-byte colour field packs as a texel of that size and
 //! FIELD_FMT. The overlay and window-id buffer (B format, 2 bytes) is the
 //! window-id byte (front) then the overlay byte (back), the buffer select
 //! choosing between them as the X server's id writes do.
 //!
+//! A field's bytes are a bit range of a memory word (vram.rs), its first
+//! byte highest; the codecs take and give that range's value, never bytes.
 //! Words in and out are the model's currency: 0xRRGGBBAA with 8 bits a
 //! channel, or a colour index in the low bits. Lanes keep any 32-bit word
 //! exactly (each byte becomes the top of its lane); the 12-bit back end
@@ -36,13 +38,13 @@ pub(super) const FIELD_TWO: u8 = 3;
 pub(super) const FIELD_FOUR: u8 = 5;
 pub(super) const FIELD_PACKED: u8 = 6;
 /// The model's FIELD_FMT for a colour-index field (the board's is 0): the
-/// index in the field's low bits, big-endian.
+/// index in the field's low bits.
 pub(super) const FIELD_INDEX: u8 = 0;
 
 /// How a field's bytes hold a word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Codec {
-    /// Four 12-bit lanes in 6 bytes, R first, big-endian bit order.
+    /// Four 12-bit lanes in the field's first 6 bytes, R highest.
     Lanes,
     /// One byte.
     Byte,
@@ -167,158 +169,109 @@ pub(super) fn word_of(lanes: [u16; 4]) -> u32 {
     word4(std::array::from_fn(|k| (lanes[k] as u32 >> 4) & 0xff))
 }
 
+/// 12-bit lanes as the 48-bit value of the 6 bytes they fill, R highest.
 #[inline]
-pub(super) fn lanes_put(b: &mut [u8], l: [u16; 4]) {
-    let v = ((l[0] as u64 & 0xfff) << 36) | ((l[1] as u64 & 0xfff) << 24) | ((l[2] as u64 & 0xfff) << 12) | (l[3] as u64 & 0xfff);
-    b[..6].copy_from_slice(&v.to_be_bytes()[2..]);
+pub(super) fn lanes_value(l: [u16; 4]) -> u64 {
+    ((l[0] as u64 & 0xfff) << 36) | ((l[1] as u64 & 0xfff) << 24) | ((l[2] as u64 & 0xfff) << 12) | (l[3] as u64 & 0xfff)
 }
 
 #[inline]
-pub(super) fn lanes_get(b: &[u8]) -> [u16; 4] {
-    let mut v = [0u8; 8];
-    v[2..].copy_from_slice(&b[..6]);
-    let v = u64::from_be_bytes(v);
+pub(super) fn lanes_from(v: u64) -> [u16; 4] {
     [(v >> 36) as u16 & 0xfff, (v >> 24) as u16 & 0xfff, (v >> 12) as u16 & 0xfff, v as u16 & 0xfff]
 }
 
+/// The bytes a field of `bytes` bytes holds its value in: all of them, but
+/// an 8-byte field's lanes fill its first 6.
+#[inline(always)]
+pub(super) const fn value_len(bytes: u8) -> u32 {
+    if bytes >= 8 { 6 } else { bytes as u32 }
+}
+
 /// A texel word (sampler order: luminance, intensity and alpha in the red
-/// byte for one component, luminance in red and alpha in alpha for two) into
-/// its `bytes` stored bytes, FIELD_FMT `field`.
-pub(super) fn texel_pack(word: u32, bytes: u8, field: u8, out: &mut [u8]) {
+/// byte for one component, luminance in red and alpha in alpha for two) as
+/// the value of its `bytes` stored bytes (value_len() of them), FIELD_FMT
+/// `field`; the field's first byte is the value's top.
+pub(super) fn texel_pack(word: u32, bytes: u8, field: u8) -> u64 {
     let c = |k| chan(word, k);
-    match (bytes, field) {
-        (2, FIELD_INDEX) => out[..2].copy_from_slice(&(word as u16).to_be_bytes()),
-        (4, FIELD_INDEX) => out[..4].copy_from_slice(&word.to_be_bytes()),
-        (2, FIELD_ONE) => out[..2].copy_from_slice(&((c(0) << 8) | c(0)).to_be_bytes()[2..]),
-        (2, FIELD_TWO) => out[..2].copy_from_slice(&[c(0) as u8, c(3) as u8]),
-        (2, FIELD_FOUR) => {
-            let v = (0..4).fold(0, |v, k| (v << 4) | narrow(c(k), 4));
-            out[..2].copy_from_slice(&(v as u16).to_be_bytes());
-        }
-        (2, FIELD_PACKED) => {
-            let v = (narrow(c(0), 5) << 11) | (narrow(c(1), 5) << 6) | (narrow(c(2), 5) << 1) | narrow(c(3), 1);
-            out[..2].copy_from_slice(&(v as u16).to_be_bytes());
-        }
+    (match (bytes, field) {
+        (2, FIELD_INDEX) => word & 0xffff,
+        (4, FIELD_INDEX) => word,
+        (2, FIELD_ONE) => (c(0) << 8) | c(0),
+        (2, FIELD_TWO) => (c(0) << 8) | c(3),
+        (2, FIELD_FOUR) => (0..4).fold(0, |v, k| (v << 4) | narrow(c(k), 4)),
+        (2, FIELD_PACKED) => (narrow(c(0), 5) << 11) | (narrow(c(1), 5) << 6) | (narrow(c(2), 5) << 1) | narrow(c(3), 1),
         (4, FIELD_TWO) => {
             let w = |v: u32| (v << 8) | v;
-            out[..4].copy_from_slice(&((w(c(0)) << 16) | w(c(3))).to_be_bytes());
+            (w(c(0)) << 16) | w(c(3))
         }
         (4, FIELD_PACKED) => {
             let w10 = |v: u32| (v << 2) | (v >> 6);
-            let v = (w10(c(0)) << 22) | (w10(c(1)) << 12) | (w10(c(2)) << 2) | narrow(c(3), 2);
-            out[..4].copy_from_slice(&v.to_be_bytes());
+            (w10(c(0)) << 22) | (w10(c(1)) << 12) | (w10(c(2)) << 2) | narrow(c(3), 2)
         }
         // RGBA12, as an 8-byte window's colour: four 12-bit lanes.
-        (8.., _) => lanes_put(out, lanes_of(word)),
-        _ => out[..4.min(bytes as usize)].copy_from_slice(&word.to_be_bytes()[..4.min(bytes as usize)]),
-    }
+        (8.., _) => return lanes_value(lanes_of(word)),
+        // The word's top bytes.
+        _ => word >> (32 - 8 * bytes.min(4) as u32),
+    }) as u64
 }
 
-/// The inverse of texel_pack(), at the precision the bytes keep.
+/// The inverse of texel_pack(), at the precision the field keeps, from the
+/// field's value.
 #[inline(always)]
-pub(super) fn texel_unpack(b: &[u8], bytes: u8, field: u8) -> u32 {
+pub(super) fn texel_unpack(v: u64, bytes: u8, field: u8) -> u32 {
+    let w = v as u32;
+    let byte = |i: u32| (w >> (8 * (bytes as u32 - 1 - i))) & 0xff;
     match (bytes, field) {
-        (2, FIELD_INDEX) => u16::from_be_bytes([b[0], b[1]]) as u32,
-        (4, FIELD_INDEX) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        (2, FIELD_INDEX) | (4, FIELD_INDEX) => w,
         (2, FIELD_ONE) => {
-            let v = b[0] as u32;
+            let v = byte(0);
             word4([v, v, v, v])
         }
-        (2, FIELD_TWO) => word4([b[0] as u32, b[0] as u32, b[0] as u32, b[1] as u32]),
-        (2, FIELD_FOUR) => {
-            let v = u16::from_be_bytes([b[0], b[1]]) as u32;
-            word4(std::array::from_fn(|k| widen((v >> (12 - 4 * k)) & 0xf, 4)))
-        }
+        (2, FIELD_TWO) => word4([byte(0), byte(0), byte(0), byte(1)]),
+        (2, FIELD_FOUR) => word4(std::array::from_fn(|k| widen((w >> (12 - 4 * k)) & 0xf, 4))),
         (2, FIELD_PACKED) => {
-            let v = u16::from_be_bytes([b[0], b[1]]) as u32;
-            let f = |s: u32| widen((v >> s) & 0x1f, 5);
-            word4([f(11), f(6), f(1), if v & 1 != 0 { 0xff } else { 0 }])
+            let f = |s: u32| widen((w >> s) & 0x1f, 5);
+            word4([f(11), f(6), f(1), if w & 1 != 0 { 0xff } else { 0 }])
         }
-        (4, FIELD_TWO) => word4([b[0] as u32, b[0] as u32, b[0] as u32, b[2] as u32]),
+        (4, FIELD_TWO) => word4([byte(0), byte(0), byte(0), byte(2)]),
         (4, FIELD_PACKED) => {
-            let v = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-            let f = |s: u32| (v >> (s + 2)) & 0xff;
-            word4([f(22), f(12), f(2), widen(v & 3, 2)])
+            let f = |s: u32| (w >> (s + 2)) & 0xff;
+            word4([f(22), f(12), f(2), widen(w & 3, 2)])
         }
-        (8.., _) => word_of(lanes_get(b)),
-        _ => {
-            let mut w = [0u8; 4];
-            let n = 4.min(bytes as usize);
-            w[..n].copy_from_slice(&b[..n]);
-            u32::from_be_bytes(w)
-        }
+        (8.., _) => word_of(lanes_from(v)),
+        // The value as the word's top bytes.
+        _ => w << (32 - 8 * bytes.min(4) as u32),
     }
 }
 
 impl Field {
-    /// The field's word.
-    #[inline]
-    pub fn load(&self, pixel: &[u8]) -> u32 {
-        let b = &pixel[self.at as usize..];
+    /// The bytes the field holds its value in.
+    #[inline(always)]
+    pub fn value_len(&self) -> u32 {
         match self.codec {
-            Codec::Lanes => word_of(lanes_get(b)),
-            Codec::Byte => b[0] as u32,
-            Codec::Texel { bytes, field } => texel_unpack(b, bytes, field),
+            Codec::Lanes => 6,
+            Codec::Byte => 1,
+            Codec::Texel { bytes, .. } => value_len(bytes),
         }
     }
 
+    /// The field's word from its value (value_len() bytes).
     #[inline]
-    pub fn store(&self, pixel: &mut [u8], word: u32) {
-        let b = &mut pixel[self.at as usize..];
+    pub fn load(&self, v: u64) -> u32 {
         match self.codec {
-            Codec::Lanes => lanes_put(b, lanes_of(word)),
-            Codec::Byte => b[0] = word as u8,
-            Codec::Texel { bytes, field } => texel_pack(word, bytes, field, b),
+            Codec::Lanes => word_of(lanes_from(v)),
+            Codec::Byte => v as u32 & 0xff,
+            Codec::Texel { bytes, field } => texel_unpack(v, bytes, field),
         }
     }
 
-    /// 12-bit lanes; a narrower codec keeps the lanes' top bits.
-    #[cfg(test)]
+    /// The value the field stores for word.
     #[inline]
-    pub fn load_lanes(&self, pixel: &[u8]) -> [u16; 4] {
+    pub fn store(&self, word: u32) -> u64 {
         match self.codec {
-            Codec::Lanes => lanes_get(&pixel[self.at as usize..]),
-            _ => lanes_of(self.load(pixel)),
-        }
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub fn store_lanes(&self, pixel: &mut [u8], l: [u16; 4]) {
-        match self.codec {
-            Codec::Lanes => lanes_put(&mut pixel[self.at as usize..], l),
-            _ => self.store(pixel, word_of(l)),
-        }
-    }
-}
-
-#[cfg(test)]
-impl Layout {
-    /// The 24-bit depth word, 0 where the pixel has none.
-    #[inline]
-    pub fn load_depth(&self, pixel: &[u8]) -> u32 {
-        self.depth.map_or(0, |at| {
-            let b = &pixel[at as usize..];
-            u32::from_be_bytes([0, b[0], b[1], b[2]])
-        })
-    }
-
-    #[inline]
-    pub fn store_depth(&self, pixel: &mut [u8], z: u32) {
-        if let Some(at) = self.depth {
-            pixel[at as usize..at as usize + 3].copy_from_slice(&z.to_be_bytes()[1..]);
-        }
-    }
-
-    #[inline]
-    pub fn load_stencil(&self, pixel: &[u8]) -> u32 {
-        self.depth.map_or(0, |at| pixel[at as usize + 3] as u32)
-    }
-
-    #[inline]
-    pub fn store_stencil(&self, pixel: &mut [u8], s: u32) {
-        if let Some(at) = self.depth {
-            pixel[at as usize + 3] = s as u8;
+            Codec::Lanes => lanes_value(lanes_of(word)),
+            Codec::Byte => word as u64 & 0xff,
+            Codec::Texel { bytes, field } => texel_pack(word, bytes, field),
         }
     }
 }
@@ -370,31 +323,19 @@ mod tests {
 
     #[test]
     fn lanes_keep_any_word() {
-        let mut p = [0u8; 16];
-        // A 12-bit double-buffered window in a 16-byte pixel, plus the depth
-        // of a 16-byte window.
-        let l = Layout { depth: Some(12), ..Layout::of(Format { fb_log2: 4, win_log2: 4, pixel_fmt: 1, field_fmt: FIELD_FOUR, ..Default::default() }) };
+        // A 12-bit double-buffered window in a 16-byte pixel.
+        let l = Layout::of(Format { fb_log2: 4, win_log2: 4, pixel_fmt: 1, field_fmt: FIELD_FOUR, ..Default::default() });
         assert_eq!((l.front.at, l.back.at, l.front.codec), (8, 0, Codec::Lanes));
         for w in [0x0000_0000, 0xffff_ffff, 0x1234_5678, 0x0000_0fff, 0x80ff_7f01] {
-            l.back.store(&mut p, w);
-            assert_eq!(l.back.load(&p), w);
+            assert_eq!(l.back.load(l.back.store(w)), w);
         }
-        l.store_depth(&mut p, 0xabcdef);
-        l.store_stencil(&mut p, 0x5a);
-        assert_eq!((l.load_depth(&p), l.load_stencil(&p), l.back.load(&p)), (0xabcdef, 0x5a, 0x80ff_7f01));
-        l.front.store_lanes(&mut p, [0xfff, 0x123, 0, 0x800]);
-        assert_eq!(l.front.load_lanes(&p), [0xfff, 0x123, 0, 0x800]);
-        assert_eq!(l.back.load(&p), 0x80ff_7f01);
+        assert_eq!(lanes_from(lanes_value([0xfff, 0x123, 0, 0x800])), [0xfff, 0x123, 0, 0x800]);
     }
 
     // The V10's read-backs (measured.md section 6).
     #[test]
     fn texels_keep_the_boards_precision() {
-        let rt = |w, bytes, field| {
-            let mut b = [0u8; 8];
-            texel_pack(w, bytes, field, &mut b);
-            texel_unpack(&b, bytes, field)
-        };
+        let rt = |w, bytes, field| texel_unpack(texel_pack(w, bytes, field), bytes, field);
         assert_eq!(rt(0x20a5_5a10, 2, FIELD_FOUR), 0x22aa_5511);
         assert_eq!(rt(0x2000_a5ff, 2, FIELD_PACKED), 0x2100_a5ff);
         assert_eq!(rt(0x2000_a5ff, 4, FIELD_FOUR), 0x2000_a5ff);
@@ -407,10 +348,8 @@ mod tests {
     #[test]
     fn overlay_buffer_is_id_byte_then_overlay_byte() {
         let l = Layout::of(Format::decode(0x20080080));
-        let mut p = [0u8; 2];
-        l.front.store(&mut p, 0x1b);
-        l.back.store(&mut p, 0x42);
-        assert_eq!(p, [0x1b, 0x42]);
+        assert_eq!((l.front.at, l.back.at), (0, 1));
+        assert_eq!((l.front.store(0x1b), l.back.store(0x42)), (0x1b, 0x42));
     }
 
     #[test]

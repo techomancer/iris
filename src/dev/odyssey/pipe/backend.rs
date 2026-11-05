@@ -12,24 +12,32 @@
 //! the board rounds a blend is not shown. The logical operation works on
 //! the stored width.
 //!
-//! Everything branches on the words at run time. Specialisation comes
-//! later.
+//! A draw picks its quad store once (`BackendState::store`, `select`): a
+//! function monomorphised over the depth comparison and write, the colour
+//! operation (replace, blend through a blend function monomorphised over
+//! its factors and equation, or none) and the colour field's format,
+//! addressing memory directly. Stencil, colour-index stores, partial colour
+//! masks, logical operations other than copy and the other field formats
+//! take `fragment_q`, which branches on the words at run time.
 
+use super::ring::BackQuad;
 use super::state::{BackendWords, BlendEquation, BlendFactor, Compare, StencilOp};
 use super::super::consts::{write::INDEX_MASK, ODSY_DEPTH24_MAX, ODSY_DRAW_MASK_BUFFER0, ODSY_DRAW_MASK_BUFFER1};
 use super::super::logic::logic_op;
-use super::super::view::{DestViews, Rows};
+use super::super::field::{Codec, FIELD_PACKED};
+use super::super::view::{DestViews, Kind, Rows};
 use super::super::vram::VramPtr;
 
 /// A clear's work at the back end: what it stores, under which masks, as
-/// its span slots name it (`ring::KIND_SPAN`). The colour is the stored
-/// word (an RGBA colour's bytes, or an index); `colour_mask` names the
-/// word's bits that change.
+/// its rectangles name it (`ring::KIND_RECT`). The colour is the stored
+/// word (an RGBA colour, or an index); `colour_mask` names the word's bits
+/// that change.
 #[repr(C, align(64))]
 pub(crate) struct ClearDraw {
     pub planes: DestMem,
     pub targets: [bool; 2],
-    pub colour: Option<[u8; 4]>,
+    /// The stored word: 0xRRGGBBAA or an index.
+    pub colour: Option<u32>,
     pub colour_mask: u32,
     /// The depth word stored.
     pub depth: Option<u32>,
@@ -53,12 +61,12 @@ impl ClearDraw {
         if self.id_mask == 0 && self.stencil.is_none() && (self.colour.is_none() || full) {
             // Nothing per pixel: whole rows.
             if let Some(z) = self.depth {
-                p.depth.fill4(y, x0, x1, pack_z24(z));
+                p.depth.fill(y, x0, x1, z & ODSY_DEPTH24_MAX);
             }
             if let Some(c) = self.colour {
                 for (b, rows) in p.colour.iter().enumerate() {
                     if self.targets[b] {
-                        rows.fill4(y, x0, x1, c);
+                        rows.fill(y, x0, x1, c);
                     }
                 }
             }
@@ -69,7 +77,7 @@ impl ClearDraw {
                 continue;
             }
             if let Some(z) = self.depth {
-                p.depth.store4(x, y, pack_z24(z));
+                p.depth.store_word(x, y, z & ODSY_DEPTH24_MAX);
             }
             if let Some((v, m)) = self.stencil {
                 if let Some(old) = p.stencil.load1(x, y) {
@@ -87,9 +95,9 @@ impl ClearDraw {
                         let Some(d) = rows.load_word(x, y) else {
                             continue;
                         };
-                        ((u32::from_be_bytes(c) & self.colour_mask) | (d & !self.colour_mask)).to_be_bytes()
+                        (c & self.colour_mask) | (d & !self.colour_mask)
                     };
-                    rows.store4(x, y, out);
+                    rows.store_word(x, y, out);
                 }
             }
         }
@@ -120,33 +128,18 @@ impl DestMem {
     }
 }
 
-// Packers: a plane's pixel from its components, in the bytes the board's
-// planes hold (big-endian words, red in the high byte, as Board::allocate
-// lays them out), and back.
+// Packers: an 8:8:8:8 colour word from its components, red highest, and
+// back.
 
-/// An RGBA8 pixel's bytes from its 8-bit components.
+/// An RGBA8 word from its 8-bit components.
 #[inline(always)]
-pub(crate) fn pack_rgba8(c: [u32; 4]) -> [u8; 4] {
-    [c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8]
+pub(crate) fn pack_rgba8(c: [u32; 4]) -> u32 {
+    (c[0] & 0xff) << 24 | (c[1] & 0xff) << 16 | (c[2] & 0xff) << 8 | (c[3] & 0xff)
 }
 
 #[inline(always)]
-pub(crate) fn unpack_rgba8(b: [u8; 4]) -> [u32; 4] {
-    [b[0] as u32, b[1] as u32, b[2] as u32, b[3] as u32]
-}
-
-/// A 24-bit depth word's bytes in its 32-bit plane word; bits 31:24 are
-/// not depth and are stored as zero.
-#[inline(always)]
-pub(crate) fn pack_z24(z: u32) -> [u8; 4] {
-    let z = z & ODSY_DEPTH24_MAX;
-
-    [0, (z >> 16) as u8, (z >> 8) as u8, z as u8]
-}
-
-#[inline(always)]
-pub(crate) fn unpack_z24(b: [u8; 4]) -> u32 {
-    ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | b[3] as u32
+pub(crate) fn unpack_rgba8(w: u32) -> [u32; 4] {
+    [w >> 24, (w >> 16) & 0xff, (w >> 8) & 0xff, w & 0xff]
 }
 
 /// The colour index a fragment carries: bits 7:0 ride in blue and 11:8
@@ -259,6 +252,10 @@ pub(crate) struct BackendState {
     pub targets: [bool; 2],
     /// Whether a store reads the destination first.
     pub reads: bool,
+    /// The blend, for the draw's factors and equation (`blend_for`).
+    pub blend_fn: BlendFn,
+    /// The draw's quad store (`select`); `store_generic` until chosen.
+    pub store: QuadStore,
 }
 
 impl BackendState {
@@ -300,7 +297,50 @@ impl BackendState {
             rgba,
             targets,
             reads: if rgba { blend || logic.is_some() || colour_mask != 0xf } else { logic.is_some() || w.index_mask() != INDEX_MASK },
+            blend_fn: blend_for(w.blend_src(), w.blend_dst(), w.blend_equation()),
+            store: store_generic,
         }
+    }
+
+    /// The quad store for this state over planes: a monomorphised one where
+    /// the state allows, else `store_generic`.
+    pub fn select(&self, planes: &DestMem) -> QuadStore {
+        let generic: QuadStore = store_generic;
+        let blend_ok = !self.blend || blend_index(self.blend_src).is_some() && blend_index(self.blend_dst).is_some();
+        // The copy logical operation stores the source, as no operation does.
+        let logic_ok = self.logic.is_none_or(|op| op == LOGIC_COPY);
+
+        if self.stencil || !self.rgba || !blend_ok || !logic_ok || (self.colour_mask != 0 && self.colour_mask != 0xf) {
+            return generic;
+        }
+        if self.depth_test && planes.depth.v.kind != Kind::Z24 {
+            return generic;
+        }
+        let op = if self.colour_mask == 0 || !self.targets.iter().any(|&t| t) {
+            OP_NONE
+        } else if self.blend {
+            OP_BLEND
+        } else {
+            OP_REPLACE
+        };
+        // Every target's field has the format the store is made for.
+        let format = |k: Kind| match k {
+            Kind::Rgba8 => Some(C_RGBA8),
+            Kind::Coded(Codec::Lanes) => Some(C_LANES),
+            Kind::Coded(Codec::Texel { bytes: 4, field: FIELD_PACKED }) => Some(C_PACKED10),
+            _ => None,
+        };
+        let mut c = C_RGBA8;
+        if op != OP_NONE {
+            let kinds: Vec<Option<u32>> = (0..2).filter(|&b| self.targets[b]).map(|b| format(planes.colour[b].v.kind)).collect();
+            match kinds[..] {
+                [Some(a)] => c = a,
+                [Some(a), Some(b)] if a == b => c = a,
+                _ => return generic,
+            }
+        }
+        let z = if self.depth_test { 1 + (compare_code(self.depth_func) << 1 | self.depth_write as u32) } else { 0 };
+        STORES[z as usize][op as usize][c as usize]
     }
 
     /// The stencil operation op on the value old, under the write mask.
@@ -389,7 +429,7 @@ impl BackendState {
             }
         }
         if outcome == 2 && self.depth_test {
-            let stored = planes.depth.load4(x, y).map_or(0, unpack_z24);
+            let stored = planes.depth.load_word(x, y).unwrap_or(0);
 
             if !self.depth_func.test(zq, stored) {
                 outcome = 1;
@@ -404,7 +444,7 @@ impl BackendState {
             return;
         }
         if self.depth_write {
-            planes.depth.store4(x, y, pack_z24(zq));
+            planes.depth.store_word(x, y, zq & ODSY_DEPTH24_MAX);
         }
         if self.stencil {
             if let Some(v) = self.stencil_value(self.stencil_ops[2], old_stencil) {
@@ -424,14 +464,14 @@ impl BackendState {
                 continue;
             }
             if !self.reads {
-                rows.store4(x, y, pack_rgba8(src.map(|c| c >> 4)));
+                rows.store_word(x, y, pack_rgba8(src.map(|c| c >> 4)));
                 continue;
             }
-            let Some(dst) = rows.load4(x, y).map(unpack_rgba8) else {
+            let Some(dst) = rows.load_word(x, y).map(unpack_rgba8) else {
                 continue;
             };
 
-            rows.store4(x, y, pack_rgba8(self.colour_result(src, dst)));
+            rows.store_word(x, y, pack_rgba8(self.colour_result(src, dst)));
         }
     }
 
@@ -454,6 +494,215 @@ impl BackendState {
 
             rows.store_word(x, y, (v & self.index_mask) | (old & !self.index_mask));
         }
+    }
+}
+
+/// The copy logical operation (GL_COPY minus 0x1500).
+const LOGIC_COPY: u8 = 3;
+
+/// A quad's store into memory, for one draw's state (`BackendState::select`).
+pub(crate) type QuadStore = fn(&BackendState, &DestMem, &BackQuad);
+
+/// The fragments of q, each through `fragment_q`.
+pub(crate) fn store_generic(st: &BackendState, m: &DestMem, q: &BackQuad) {
+    for i in 0..4usize {
+        if q.cov & (1 << i) != 0 {
+            st.fragment_q(m, q.x + (i & 1) as i32, q.y + (i >> 1) as i32, q.zq[i], q.rgba[i].map(u32::from));
+        }
+    }
+}
+
+/// The colour operations a monomorphised store makes.
+const OP_REPLACE: u32 = 0;
+const OP_BLEND: u32 = 1;
+const OP_NONE: u32 = 2;
+/// The colour field formats it stores: 8:8:8:8 bytes, 12-bit lanes, and
+/// 10:10:10:2 in a 32-bit word, R highest.
+const C_RGBA8: u32 = 0;
+const C_LANES: u32 = 1;
+const C_PACKED10: u32 = 2;
+
+/// A comparison's code (Compare::of() reads it back).
+fn compare_code(c: Compare) -> u32 {
+    match c {
+        Compare::Never => 0,
+        Compare::Less => 1,
+        Compare::Equal => 2,
+        Compare::LessEqual => 3,
+        Compare::Greater => 4,
+        Compare::NotEqual => 5,
+        Compare::GreaterEqual => 6,
+        Compare::Always => 7,
+    }
+}
+
+/// A colour field's components, 8 bits each, at byte address a.
+#[inline(always)]
+fn load_colour<const C: u32>(m: VramPtr, a: u64) -> [u32; 4] {
+    if C == C_RGBA8 {
+        unpack_rgba8(m.load(a, 4) as u32)
+    } else if C == C_PACKED10 {
+        // Each component's top 8 of 10 bits; alpha's 2 bits repeated.
+        let v = m.load(a, 4) as u32;
+        [(v >> 24) & 0xff, (v >> 14) & 0xff, (v >> 4) & 0xff, (v & 3) * 0x55]
+    } else {
+        let v = m.load(a, 6);
+        [36, 24, 12, 0].map(|s| ((v >> s) as u32 & 0xfff) >> 4)
+    }
+}
+
+/// Store 8-bit components c at byte address a: a word of bytes, 10:10:10:2,
+/// or lanes widened by repeating their top bits.
+#[inline(always)]
+fn store_colour<const C: u32>(m: VramPtr, a: u64, c: [u32; 4]) {
+    if C == C_RGBA8 {
+        m.store(a, 4, pack_rgba8(c) as u64);
+    } else if C == C_PACKED10 {
+        // Each component widened to 10 bits by repeating its top bits;
+        // alpha's top 2.
+        let w10 = |v: u32| (v << 2) | (v >> 6);
+        m.store(a, 4, (w10(c[0]) << 22 | w10(c[1]) << 12 | w10(c[2]) << 2 | c[3] >> 6) as u64);
+    } else {
+        let l = c.map(|v| ((v << 4) | (v >> 4)) as u64 & 0xfff);
+        m.store(a, 6, (l[0] << 36) | (l[1] << 24) | (l[2] << 12) | l[3]);
+    }
+}
+
+/// A quad's store: depth Z (0 none, else 1 + the comparison's code times 2
+/// + the write), colour operation OP and colour format C.
+fn store_quad<const Z: u32, const OP: u32, const C: u32>(st: &BackendState, m: &DestMem, q: &BackQuad) {
+    for i in 0..4usize {
+        if q.cov & (1 << i) == 0 {
+            continue;
+        }
+        let (x, y) = (q.x + (i & 1) as i32, q.y + (i >> 1) as i32);
+        if Z != 0 {
+            let (mem, a) = (m.depth.mem(), m.depth.addr(x, y));
+            let zq = q.zq[i];
+            let stored = mem.load(a, 3) as u32;
+            if !Compare::of((Z - 1) >> 1).test(zq, stored) {
+                continue;
+            }
+            if (Z - 1) & 1 != 0 {
+                mem.store(a, 3, (zq & ODSY_DEPTH24_MAX) as u64);
+            }
+        }
+        if OP == OP_NONE {
+            continue;
+        }
+        let src = q.rgba[i].map(u32::from);
+        for b in 0..2 {
+            if !st.targets[b] {
+                continue;
+            }
+            // The target's colour field, of format C (BackendState::select).
+            let (mem, a) = (m.colour[b].mem(), m.colour[b].addr(x, y));
+            let out = if OP == OP_REPLACE {
+                src.map(|c| c >> 4)
+            } else {
+                let d = load_colour::<C>(mem, a).map(widen8);
+                (st.blend_fn)(src, d, &st.const_colour).map(|c| c >> 4)
+            };
+            store_colour::<C>(mem, a, out);
+        }
+    }
+}
+
+macro_rules! store_ops {
+    ($z:expr) => {
+        [
+            [store_quad::<{ $z }, OP_REPLACE, C_RGBA8> as QuadStore, store_quad::<{ $z }, OP_REPLACE, C_LANES>, store_quad::<{ $z }, OP_REPLACE, C_PACKED10>],
+            [store_quad::<{ $z }, OP_BLEND, C_RGBA8>, store_quad::<{ $z }, OP_BLEND, C_LANES>, store_quad::<{ $z }, OP_BLEND, C_PACKED10>],
+            [store_quad::<{ $z }, OP_NONE, C_RGBA8>, store_quad::<{ $z }, OP_NONE, C_LANES>, store_quad::<{ $z }, OP_NONE, C_PACKED10>],
+        ]
+    };
+}
+
+/// The monomorphised stores by depth, colour operation and format.
+static STORES: [[[QuadStore; 3]; 3]; 17] = [
+    store_ops!(0),
+    store_ops!(1), store_ops!(2), store_ops!(3), store_ops!(4), store_ops!(5), store_ops!(6), store_ops!(7), store_ops!(8),
+    store_ops!(9), store_ops!(10), store_ops!(11), store_ops!(12), store_ops!(13), store_ops!(14), store_ops!(15), store_ops!(16),
+];
+
+/// A blend of a fragment's 12-bit components over the destination's, with
+/// the constant colour's.
+pub(crate) type BlendFn = fn([u32; 4], [u32; 4], &[u32; 4]) -> [u32; 4];
+
+/// The blend factors in their table order (blend_index()).
+const FACTORS: [BlendFactor; 13] = [
+    BlendFactor::Zero,
+    BlendFactor::One,
+    BlendFactor::OtherColour,
+    BlendFactor::SrcAlpha,
+    BlendFactor::DstAlpha,
+    BlendFactor::ConstColour,
+    BlendFactor::ConstAlpha,
+    BlendFactor::OneMinusOtherColour,
+    BlendFactor::OneMinusSrcAlpha,
+    BlendFactor::OneMinusDstAlpha,
+    BlendFactor::OneMinusConstColour,
+    BlendFactor::OneMinusConstAlpha,
+    BlendFactor::SrcAlphaSaturate,
+];
+
+/// The blend equations in their table order; the others add, as
+/// BackendState::blend does.
+const EQUATIONS: [BlendEquation; 5] = [BlendEquation::Add, BlendEquation::Min, BlendEquation::Max, BlendEquation::Subtract, BlendEquation::ReverseSubtract];
+
+fn blend_index(f: BlendFactor) -> Option<usize> {
+    FACTORS.iter().position(|&g| g == f)
+}
+
+/// BackendState::blend for factors FACTORS[SF], FACTORS[DF] and equation
+/// EQUATIONS[EQ].
+fn blend<const SF: usize, const DF: usize, const EQ: usize>(s: [u32; 4], d: [u32; 4], c: &[u32; 4]) -> [u32; 4] {
+    std::array::from_fn(|k| {
+        let sf = factor(FACTORS[SF], k, true, &s, &d, c);
+        let df = factor(FACTORS[DF], k, false, &s, &d, c);
+        let (a, b) = (mul12(s[k], sf) as i32, mul12(d[k], df) as i32);
+        let v = match EQUATIONS[EQ] {
+            BlendEquation::Min => s[k].min(d[k]) as i32,
+            BlendEquation::Max => s[k].max(d[k]) as i32,
+            BlendEquation::Subtract => a - b,
+            BlendEquation::ReverseSubtract => b - a,
+            _ => a + b,
+        };
+        v.clamp(0, 4095) as u32
+    })
+}
+
+/// The runtime blend, for a factor the table has no entry for.
+fn blend_any(_s: [u32; 4], _d: [u32; 4], _c: &[u32; 4]) -> [u32; 4] {
+    [0; 4]
+}
+
+macro_rules! blend_eqs {
+    ($s:literal, $d:literal) => {
+        [blend::<$s, $d, 0> as BlendFn, blend::<$s, $d, 1>, blend::<$s, $d, 2>, blend::<$s, $d, 3>, blend::<$s, $d, 4>]
+    };
+}
+macro_rules! blend_dsts {
+    ($s:literal) => {
+        [
+            blend_eqs!($s, 0), blend_eqs!($s, 1), blend_eqs!($s, 2), blend_eqs!($s, 3), blend_eqs!($s, 4), blend_eqs!($s, 5), blend_eqs!($s, 6),
+            blend_eqs!($s, 7), blend_eqs!($s, 8), blend_eqs!($s, 9), blend_eqs!($s, 10), blend_eqs!($s, 11), blend_eqs!($s, 12),
+        ]
+    };
+}
+
+static BLENDS: [[[BlendFn; 5]; 13]; 13] = [
+    blend_dsts!(0), blend_dsts!(1), blend_dsts!(2), blend_dsts!(3), blend_dsts!(4), blend_dsts!(5), blend_dsts!(6),
+    blend_dsts!(7), blend_dsts!(8), blend_dsts!(9), blend_dsts!(10), blend_dsts!(11), blend_dsts!(12),
+];
+
+/// The monomorphised blend for factors src and dst under equation eq;
+/// `blend_any` where a factor has none (select() then stores generically).
+pub(crate) fn blend_for(src: BlendFactor, dst: BlendFactor, eq: BlendEquation) -> BlendFn {
+    let e = EQUATIONS.iter().position(|&q| q == eq).unwrap_or(0);
+    match (blend_index(src), blend_index(dst)) {
+        (Some(s), Some(d)) => BLENDS[s][d][e],
+        _ => blend_any,
     }
 }
 
@@ -482,7 +731,7 @@ mod tests {
             let p = t.planes();
             for y in 0..H as i32 {
                 for x in 0..W as i32 {
-                    p.depth.store4(x, y, pack_z24(ODSY_DEPTH24_MAX));
+                    p.depth.store_word(x, y, ODSY_DEPTH24_MAX);
                 }
             }
             t
@@ -492,12 +741,13 @@ mod tests {
             DestMem::of(self.mem.ptr(), &self.d)
         }
 
+        /// Colour (b) at (x, y) as its 8-bit components.
         fn colour(&mut self, b: usize, x: u32, y: u32) -> [u8; 4] {
-            self.planes().colour[b].load4(x as i32, y as i32).unwrap()
+            unpack_rgba8(self.planes().colour[b].load_word(x as i32, y as i32).unwrap()).map(|c| c as u8)
         }
 
         fn depth(&mut self, x: u32, y: u32) -> u32 {
-            unpack_z24(self.planes().depth.load4(x as i32, y as i32).unwrap())
+            self.planes().depth.load_word(x as i32, y as i32).unwrap()
         }
     }
 
@@ -507,10 +757,8 @@ mod tests {
 
     #[test]
     fn packers_round_trip_and_lay_red_in_the_high_byte() {
-        assert_eq!(pack_rgba8([0x12, 0x34, 0x56, 0x78]), [0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(pack_rgba8([0x12, 0x34, 0x56, 0x78]), 0x1234_5678);
         assert_eq!(unpack_rgba8(pack_rgba8([1, 2, 3, 4])), [1, 2, 3, 4]);
-        assert_eq!(pack_z24(0xff_abcdef), [0, 0xab, 0xcd, 0xef]);
-        assert_eq!(unpack_z24(pack_z24(0x123456)), 0x123456);
         assert_eq!(index_of([0, 0xa0, 0xbc0, 0]), 0xabc);
         assert_eq!(quantise8(0.5), 128);
         assert_eq!(quantise8(1.0), 255);
@@ -604,7 +852,7 @@ mod tests {
         p.stencil.store1(1, 0, 1); // (1, 0): passes; depth fails -> INCR to 2
         p.stencil.store1(2, 0, 1); // (2, 0): passes; depth passes -> REPLACE with 2
         for i in 0..3 {
-            p.depth.store4(i, 0, pack_z24(0x10));
+            p.depth.store_word(i, 0, 0x10);
         }
         s.fragment(&p, 0, 0, 0x20, [1.0; 4]);
         s.fragment(&p, 1, 0, 0x20, [1.0; 4]);

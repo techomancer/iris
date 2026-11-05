@@ -174,7 +174,17 @@ pub fn run(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize) -> (Repor
     let limit = std::env::var("VPRO_REPLAY_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX);
     // VPRO_REPLAY_SHOTS=<dir>: the screen at each mark, as mark-NNN.png.
     let shots = std::env::var("VPRO_REPLAY_SHOTS").ok();
+    // VPRO_REPLAY_EVERY=<n> with VPRO_REPLAY_SHOTS: the screen every n
+    // records too, as rec-NNNNNNNNN.png.
+    let shot_every = std::env::var("VPRO_REPLAY_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0);
     for (i, r) in recs.iter().enumerate().take(limit) {
+        if let (Some(n), Some(dir)) = (shot_every, &shots) {
+            if i % n == 0 && i != 0 {
+                b.raster_wait();
+                let _ = std::fs::create_dir_all(dir);
+                save_screen(&b, &format!("{dir}/rec-{i:09}.png"));
+            }
+        }
         match r {
             Rec::Write { size, off, val } => b.mmio_write(*off as u64, *val, *size as u32),
             Rec::Read { size, off, val } => {
@@ -288,7 +298,7 @@ pub fn replay_file(path: &Path, png: Option<&str>) -> Result<Report, String> {
     }
     if let Ok(dir) = std::env::var("VPRO_REPLAY_DUMP") {
         let dir = Path::new(&dir);
-        dump_memory(board.vram.bytes(), dir).map_err(|e| format!("VPRO_REPLAY_DUMP {}: {e}", dir.display()))?;
+        dump_memory(board.vram.ptr_shared(), dir).map_err(|e| format!("VPRO_REPLAY_DUMP {}: {e}", dir.display()))?;
         eprintln!("{}: board memory dumped to {}", path.display(), dir.display());
     }
     if rep.dma_mismatched != 0 || rep.dma_used != rep.dma_total {
@@ -316,7 +326,7 @@ fn save_screen(b: &Board, path: &str) {
     };
     let (w, h) = (frame.width, frame.height);
     let mut px = vec![0u32; w as usize * h as usize];
-    frame.compose(b.vram.bytes(), &regs, &mut px, w as usize, h as usize);
+    frame.compose(b.vram.ptr_shared(), &regs, &mut px, w as usize, h as usize);
     let mut rgb = Vec::with_capacity(px.len() * 3);
     for p in px {
         rgb.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);

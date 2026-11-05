@@ -28,10 +28,10 @@ fn c12(w: u32) -> [u32; 4] {
 /// slot go.
 fn with_unit<R>(s: &mut Board, f: impl FnOnce(&Unit) -> R) -> R {
     let st = s.issue_state();
-    let mem = s.vram.bytes();
+    let mem = s.vram.ptr();
     // SAFETY: issued above and released below.
     let d = unsafe { &*st };
-    let r = f(&Unit { regs: &d.tex, latch: &d.latch, mem: mem.as_ptr(), mask: mem.len() as u64 - 1 });
+    let r = f(&Unit { regs: &d.tex, latch: &d.latch, mem });
     unsafe { DrawState::release(st) };
     r
 }

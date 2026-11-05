@@ -747,25 +747,6 @@ impl RasterQueue {
     }
 }
 
-/// A byte span of board memory, for a raster job.
-#[derive(Clone, Copy)]
-pub(super) struct Span {
-    ptr: *mut u8,
-    len: usize,
-}
-
-impl Span {
-    pub fn of(bytes: &mut [u8]) -> Self {
-        Span { ptr: bytes.as_mut_ptr(), len: bytes.len() }
-    }
-
-    /// Board memory as the texture unit reads it: its start, and its size
-    /// (a power of two) less one, the mask of an address.
-    pub fn texels(self) -> (*const u8, u64) {
-        (self.ptr, self.len as u64 - 1)
-    }
-}
-
 impl Board {
     /// Wait for the raster unit to finish its queued jobs. The front end
     /// calls it before it touches board memory itself,

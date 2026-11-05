@@ -1247,7 +1247,7 @@ impl Board {
         // the board memory exists; this runs after Board::allocate(). MODEL
         // CHOICE: memory reads zero after a reset (the board's SDRAM holds
         // whatever it held; the PROM and the driver clear what they use).
-        self.vram.bytes_mut().fill(0);
+        self.vram.words_mut().fill(0);
         self.stream.poly_marks.fill(0);
         // Back to the boot size, and restart the phase.
         if self.scanout.mode.width != ODSY_WIDTH || self.scanout.mode.height != ODSY_HEIGHT {

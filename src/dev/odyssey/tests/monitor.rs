@@ -175,7 +175,7 @@ fn peek_prints_board_memory_at_an_address() {
     let v = board();
     let s = v.state.test_board();
     // Past the test screen's frame and window-id buffers.
-    s.vram.bytes_mut()[0x20_0000 * 16..0x20_0000 * 16 + 4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    s.vram.ptr().store(0x20_0000 * 16, 4, 0x1122_3344);
     let text = ok(&v, "peek 0x200000 16");
     assert!(text.contains("0x02000000: 11 22 33 44 00 00 00 00 00 00 00 00 00 00 00 00"), "{text}");
     assert!(vpro(&v, "peek 0x10000000").expect_err("past the end").contains("past the end"));

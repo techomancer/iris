@@ -40,6 +40,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   `vpro fbdump`'s files, to diff against a live board's dump, and `vpro
   fbdump` adds `objects.bin`.
 
+### VPro drawing
+
+- Copies from a window into a texture (`glCopyTexSubImage`) read the
+  window in the format its display mode gives it, so a 10:10:10:2 window
+  converts into an 8:8:8:8 texture instead of moving its bits unchanged.
+  TyrQuake's water and lava, which it renders on screen and copies into
+  their textures, have their colours back.
+- Right Ctrl+Print Screen saves a screenshot on VPro as on the other boards.
+- Board memory is 64-bit words like main memory, and colour, depth and
+  blend stores are specialised per format and blend function: a
+  single-threaded Quake timedemo replay runs about 13% faster.
+
 ### O2 graphics tracing
 
 - `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,

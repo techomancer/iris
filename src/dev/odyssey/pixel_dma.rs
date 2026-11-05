@@ -24,6 +24,24 @@ pub(super) fn read_guest(mem: &GuestMemory, addr: u64, buf: &mut [u8]) -> bool {
     mem.as_deref().is_some_and(|m| crate::physical::read_bytes(m, addr, buf) == BUS_OK)
 }
 
+/// The value a guest load of `b.len()` bytes (at most 8) gives for bytes
+/// staged from guest memory in address order: the first byte highest, as a
+/// load of main memory's words gives it.
+#[inline]
+pub(super) fn guest_value(b: &[u8]) -> u64 {
+    b.iter().take(8).fold(0, |v, &x| (v << 8) | x as u64)
+}
+
+/// The inverse of guest_value(): v as `out.len()` bytes staged for guest
+/// memory, in address order.
+#[inline]
+pub(super) fn put_guest_value(v: u64, out: &mut [u8]) {
+    let n = out.len();
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (v >> (8 * (n - 1 - i))) as u8;
+    }
+}
+
 /// Write `buf` to guest memory at `addr`; false as for [`read_guest`].
 pub(super) fn write_guest(mem: &GuestMemory, addr: u64, buf: &[u8]) -> bool {
     mem.as_deref().is_some_and(|m| crate::physical::write_bytes(m, addr, buf) == BUS_OK)

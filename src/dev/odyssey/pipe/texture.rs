@@ -23,7 +23,8 @@
 use super::fixed;
 use super::super::bits::sextract32;
 use super::super::consts::tex;
-use super::super::field::{texel_storage, texel_unpack, FIELD_FOUR, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
+use super::super::field::{texel_storage, texel_unpack, value_len, FIELD_FOUR, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
+use super::super::vram::VramPtr;
 
 /// Level table entries (0x0e80 .. 0x0ebf).
 pub(crate) const LEVEL_ENTRIES: usize = 64;
@@ -640,8 +641,8 @@ pub(crate) type AddrFn = fn(lv: &Level, lo: i64, n: u32, border: bool, a: &mut A
 /// Decode a window's texels from board memory.
 ///
 /// # Safety
-/// `mem` is board memory and `mask` its size less one, a power of two.
-pub(crate) type GatherFn = unsafe fn(mem: *const u8, mask: u64, base: u64, xs: &Axis, ys: &Axis, zs: &Axis, border: &[u32; 4], out: *mut [u32; 4]);
+/// `out` holds a window (`Win`).
+pub(crate) type GatherFn = unsafe fn(mem: VramPtr, base: u64, xs: &Axis, ys: &Axis, zs: &Axis, border: &[u32; 4], out: *mut [u32; 4]);
 
 /// The address part of indices along one axis, wrapped: a tiled offset is
 /// a column part plus a row part (16-texel tiles of 256 texels, `pitch`
@@ -698,13 +699,12 @@ pub(crate) fn addr_for(wrap: Wrap, axis: u32) -> AddrFn {
     }
 }
 
-/// One texel at p as 12-bit components of the class: the storage's bytes
-/// unpacked, each 8-bit value widened by repeating its top bits. An alpha
-/// texture's one component is its alpha.
+/// The texel at byte address a as 12-bit components of the class: the
+/// storage's value unpacked, each 8-bit value widened by repeating its top
+/// bits. An alpha texture's one component is its alpha.
 #[inline(always)]
-unsafe fn texel<const BYTES: u8, const FIELD: u8, const CLASS: u32>(p: *const u8) -> [u32; 4] {
-    // SAFETY: the caller's address is a texel within board memory.
-    let w = texel_unpack(unsafe { std::slice::from_raw_parts(p, BYTES as usize) }, BYTES, FIELD);
+fn texel<const BYTES: u8, const FIELD: u8, const CLASS: u32>(mem: VramPtr, a: u64) -> [u32; 4] {
+    let w = texel_unpack(mem.load(a, value_len(BYTES)), BYTES, FIELD);
     let c = |s: u32| {
         let v = (w >> s) & 0xff;
         (v << 4) | (v >> 4)
@@ -718,7 +718,7 @@ unsafe fn texel<const BYTES: u8, const FIELD: u8, const CLASS: u32>(p: *const u8
 const CLASSES: [Class; 6] = [Class::Alpha, Class::Luminance, Class::LuminanceAlpha, Class::Intensity, Class::Rgb, Class::Rgba];
 
 /// A window's texels for one storage and class.
-unsafe fn gather<const BYTES: u8, const FIELD: u8, const CLASS: u32>(mem: *const u8, mask: u64, base: u64, xs: &Axis, ys: &Axis, zs: &Axis, border: &[u32; 4], out: *mut [u32; 4]) {
+unsafe fn gather<const BYTES: u8, const FIELD: u8, const CLASS: u32>(mem: VramPtr, base: u64, xs: &Axis, ys: &Axis, zs: &Axis, border: &[u32; 4], out: *mut [u32; 4]) {
     for z in 0..zs.n as usize {
         for y in 0..ys.n as usize {
             let row = base.wrapping_add(zs.off[z]).wrapping_add(ys.off[y]);
@@ -727,9 +727,7 @@ unsafe fn gather<const BYTES: u8, const FIELD: u8, const CLASS: u32>(mem: *const
                 let t = if edge || (xs.outside >> x) & 1 != 0 {
                     *border
                 } else {
-                    // SAFETY: masked into board memory; a texel's address is
-                    // a multiple of its size, so it lies within.
-                    unsafe { texel::<BYTES, FIELD, CLASS>(mem.add((row.wrapping_add(xs.off[x]) & mask) as usize)) }
+                    texel::<BYTES, FIELD, CLASS>(mem, row.wrapping_add(xs.off[x]))
                 };
                 // SAFETY: the window holds WIN x WIN x WIN_SLICES texels.
                 unsafe { out.add((z * WIN + y) * WIN + x).write(t) };
@@ -815,9 +813,7 @@ pub(crate) struct TexQuad {
 pub(crate) struct Unit<'a> {
     pub regs: &'a TexRegs,
     pub latch: &'a Latch,
-    pub mem: *const u8,
-    /// Board memory's size less one.
-    pub mask: u64,
+    pub mem: VramPtr,
 }
 
 /// One pixel's taps on one level: the first tap's index per axis before
@@ -993,8 +989,8 @@ impl Unit<'_> {
                 axes[a].n = 1;
             }
         }
-        // SAFETY: mask is board memory's size less one (Unit).
-        unsafe { (lv.gather)(self.mem, self.mask, lv.addr, &axes[0], &axes[1], &axes[2], &l.border, win) };
+        // SAFETY: win holds a window (the callers' Win).
+        unsafe { (lv.gather)(self.mem, lv.addr, &axes[0], &axes[1], &axes[2], &l.border, win) };
     }
 
     /// The detail image at each covered pixel's position, LINEAR and
@@ -1011,8 +1007,8 @@ impl Unit<'_> {
             repeat[0](lv, x, 2, false, &mut axes[0]);
             repeat[1](lv, y, 2, false, &mut axes[1]);
             axes[2].n = 1;
-            // SAFETY: as gather().
-            unsafe { (lv.gather)(self.mem, self.mask, lv.addr, &axes[0], &axes[1], &axes[2], &self.latch.border, win.as_mut_ptr().cast()) };
+            // SAFETY: win is a window.
+            unsafe { (lv.gather)(self.mem, lv.addr, &axes[0], &axes[1], &axes[2], &self.latch.border, win.as_mut_ptr().cast()) };
             // SAFETY: gather() wrote the 2x2.
             out[i] = unsafe { filter(win.as_ptr().cast(), [0; 3], [a, b, 0], true, false) };
         }

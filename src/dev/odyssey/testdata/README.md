@@ -59,7 +59,9 @@ raster thread with no pool; `VPRO_REPLAY_POOL=<threads>,<tile>` sets the
 pool's workers and tile size, default 2 and 32); `VPRO_REPLAY_LIMIT=<n>` stops after n records;
 `VPRO_REPLAY_OUT=<png>` saves the final colour buffer
 (unmapped: no colour map, window ids or cursor, so it is the planes, not the
-screen). The replay refuses to bless a recording whose DMA reads it cannot
+screen). `VPRO_REPLAY_SHOTS=<dir>` saves the composed screen at each mark as
+`mark-NNN.png`; with `VPRO_REPLAY_EVERY=<n>` it also saves one every n
+records as `rec-NNNNNNNNN.png`, to find where a replay starts to go wrong. The replay refuses to bless a recording whose DMA reads it cannot
 follow. Re-take the checkpoints only for a change that is meant to move board
 state, after the frames above say the change is right.
 
