@@ -659,32 +659,42 @@ fn advance_flat_fill_context(context: &mut Rex3Context) {
 mod tests {
     use super::*;
 
-    fn context(adrmode: u32, start: (i32, i32), end: (i32, i32)) -> Rex3Context {
-        let stop = if adrmode == DRAWMODE0_ADRMODE_BLOCK_SH {
-            (1 << 8) | (1 << 9)
-        } else {
-            1 << 8
-        };
-        let mut context = Rex3Context::power_on_default();
-        context.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_DRAW | adrmode | stop);
-        context.drawmode1 = DrawMode1(
-            DRAWMODE1_PLANES_RGB
-                | (DRAWMODE1_DRAWDEPTH_24 << 3)
-                | DRAWMODE1_COMPARE_DISABLE_SH
-                | (1 << 15)
-                | DRAWMODE1_LOGICOP_SRC_SH,
-        );
-        context.clipmode = 0xF << CLIPMODE_CIDMATCH_SHIFT;
-        context.wrmask = 0x00FF_FFFF;
-        context.colorred = 0x11 << 11;
-        context.colorgrn = 0x22 << 11;
-        context.colorblue = 0x33 << 11;
-        context.xstart = (start.0 + REX3_COORD_BIAS) << 11;
-        context.ystart = (start.1 + REX3_COORD_BIAS) << 11;
-        context.xsave = context.xstart;
-        context.xend = (end.0 + REX3_COORD_BIAS) << 11;
-        context.yend = (end.1 + REX3_COORD_BIAS) << 11;
-        context
+    fn context(adrmode: u32, start: (i32, i32), end: (i32, i32)) -> Box<Rex3Context> {
+        let worker = std::thread::Builder::new()
+            .name("rex3-gpu-test-context".into())
+            .stack_size(PROBE_STACK_BYTES)
+            .spawn(move || {
+                let stop = if adrmode == DRAWMODE0_ADRMODE_BLOCK_SH {
+                    (1 << 8) | (1 << 9)
+                } else {
+                    1 << 8
+                };
+                let mut context = Rex3Context::power_on_default();
+                context.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_DRAW | adrmode | stop);
+                context.drawmode1 = DrawMode1(
+                    DRAWMODE1_PLANES_RGB
+                        | (DRAWMODE1_DRAWDEPTH_24 << 3)
+                        | DRAWMODE1_COMPARE_DISABLE_SH
+                        | (1 << 15)
+                        | DRAWMODE1_LOGICOP_SRC_SH,
+                );
+                context.clipmode = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+                context.wrmask = 0x00FF_FFFF;
+                context.colorred = 0x11 << 11;
+                context.colorgrn = 0x22 << 11;
+                context.colorblue = 0x33 << 11;
+                context.xstart = (start.0 + REX3_COORD_BIAS) << 11;
+                context.ystart = (start.1 + REX3_COORD_BIAS) << 11;
+                context.xsave = context.xstart;
+                context.xend = (end.0 + REX3_COORD_BIAS) << 11;
+                context.yend = (end.1 + REX3_COORD_BIAS) << 11;
+                Box::new(context)
+            })
+            .expect("spawn REX3 GPU test context worker");
+        match worker.join() {
+            Ok(context) => context,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     fn supported_fill(context: &Rex3Context) -> FlatFill {
