@@ -223,6 +223,8 @@ pub struct Ip32Options {
     pub keyboard: Option<bool>,
     /// The Ethernet address in the 1-Wire ID chip, if not the default.
     pub mac: Option<[u8; 6]>,
+    /// Cards fitted in the add-in slot, from `[[pci]]`.
+    pub cards: Vec<crate::pci::place::Fitted>,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -480,11 +482,61 @@ pub struct Ip32Bus {
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
 }
 
+/// One SCSI controller of the machine, on the board or on a fitted card,
+/// with the number the config and the monitor give it.
+pub struct ScsiController {
+    number: usize,
+    owner: ScsiOwner,
+}
+
+enum ScsiOwner {
+    Board(Arc<crate::dev::aic7880::Aic7880>),
+    /// The `n`th SCSI bus of a card.
+    Card(Arc<dyn crate::pci::PciBusDevice>, usize),
+}
+
+impl ScsiController {
+    pub fn number(&self) -> usize {
+        self.number
+    }
+
+    pub fn bus(&self) -> &crate::scsi::ScsiBus {
+        match &self.owner {
+            ScsiOwner::Board(c) => c.bus(),
+            ScsiOwner::Card(f, n) => f.scsi_buses()[*n],
+        }
+    }
+}
+
 impl Ip32Bus {
+    /// The SCSI controllers: the board's two (0 and 1), then those of each
+    /// fitted card, numbered from the card's first controller.
+    pub fn scsi_buses(&self) -> Vec<ScsiController> {
+        let mut out: Vec<ScsiController> = self
+            .scsi
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(number, c)| ScsiController { number, owner: ScsiOwner::Board(c.clone()) })
+            .collect();
+        for (_, card, f) in self.mace.pci.bus().cards() {
+            for n in 0..f.scsi_buses().len() {
+                out.push(ScsiController { number: card.first_controller as usize + n, owner: ScsiOwner::Card(f.clone(), n) });
+            }
+        }
+        out
+    }
+
+    /// The fitted cards that are devices to start, stop and list in the
+    /// monitor, in the order they were fitted.
+    pub fn card_devices(&self) -> Vec<Arc<dyn crate::traits::Device>> {
+        self.mace.pci.bus().cards().into_iter().filter_map(|(_, _, f)| f.device()).collect()
+    }
+
     /// Flush the disks on every SCSI controller.
     pub fn flush_disks(&self) -> std::io::Result<()> {
-        let controllers = self.scsi.lock().unwrap().clone();
-        controllers.iter().try_for_each(|c| c.bus().flush())
+        self.scsi_buses().iter().try_for_each(|c| c.bus().flush())
     }
 
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
@@ -551,6 +603,11 @@ impl Ip32Bus {
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
+        }
+        // Cards the user fitted in the add-in slot.
+        for f in opts.cards {
+            bus.mace.pci.bus().attach_card(f.placement.addr, f.function.clone(), f.placement.card_ref());
+            f.function.connect_heartbeat(bus.mace.id.heartbeat.clone());
         }
         // A saved flash carries the guest's environment -- boot paths, console
         // choice, everything the PROM's `setenv` writes -- from one run to

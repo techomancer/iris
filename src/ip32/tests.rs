@@ -999,3 +999,57 @@ fn every_device_answers_the_monitor_through_the_bus() {
     }
     assert!(bus.execute_command("nonesuch", &[], Box::new(std::io::sink())).is_err());
 }
+
+// ---- cards fitted in the PCI option slot ----
+
+/// The machine as `[[pci]]` would fit it: the board's two controllers and
+/// whatever cards `entries` names, built from the real catalog.
+fn with_cards(entries: &[crate::pci::place::PciEntry]) -> Arc<Ip32Bus> {
+    let profile = crate::config::MachineProfile::O2Ip32;
+    let placements = crate::pci::place::resolve(profile.pci_buses(), entries, profile.scsi_controllers()).unwrap();
+    let opts = Ip32Options {
+        scsi: Some([crate::dev::aic7880::Aic7880::new_bus(), crate::dev::aic7880::Aic7880::new_bus()]),
+        cards: crate::pci::place::build(placements).unwrap(),
+        ..Default::default()
+    };
+    Ip32Bus::with_options(O2Memory::single(16 << 20), vec![0u8; PROM_SIZE as usize], opts)
+}
+
+fn option_slot() -> Vec<crate::pci::place::PciEntry> {
+    vec![crate::pci::place::PciEntry::parse_cli("PCI option=aic7880").unwrap()]
+}
+
+/// A configuration read of register 0 of `device`, through MACE's registers.
+fn config_id(bus: &Ip32Bus, device: u32) -> u32 {
+    let reg = |off: u32| (MACEPCI_BASE + off) as u64;
+    bus.mace.pci.write32(reg(macepci_reg::CONFIG_ADDR), (1 << 31) | (device << 11));
+    bus.mace.pci.read32(reg(macepci_reg::CONFIG_DATA)).data
+}
+
+#[test]
+fn a_fitted_card_answers_config_reads_at_the_option_slot() {
+    let bus = with_cards(&option_slot());
+    assert_eq!(config_id(&bus, 3), 0x8078_9004);
+    assert_eq!(config_id(&bus, 4), 0xffff_ffff, "nothing in the spare slot");
+    assert_eq!(bus.mace.pci.bus().cards().len(), 1);
+}
+
+#[test]
+fn fitted_card_buses_are_numbered_after_the_onboard_ones() {
+    let bus = with_cards(&option_slot());
+    let numbers: Vec<usize> = bus.scsi_buses().iter().map(|c| c.number()).collect();
+    assert_eq!(numbers, [0, 1, 2]);
+    assert_eq!(bus.card_devices().len(), 1);
+    assert!(bus.flush_disks().is_ok());
+}
+
+#[test]
+fn no_cards_means_the_same_bus_as_before() {
+    let bus = with_cards(&[]);
+    let mut at: Vec<u8> = bus.mace.pci.bus().functions().iter().map(|(a, _)| a.device).collect();
+    at.sort();
+    assert_eq!(at, [IP32_SCSI_SLOT, IP32_SCSI_SLOT_B]);
+    assert!(bus.mace.pci.bus().cards().is_empty());
+    assert_eq!(bus.scsi_buses().len(), 2);
+    assert!(bus.card_devices().is_empty());
+}
