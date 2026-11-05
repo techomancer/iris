@@ -128,26 +128,73 @@ pub static HAL2_UNDERRUN: EventDef = EventDef::new("host underrun", cat::AUDIO).
 
 /// One GO on the REX3 processor thread (arg: DRAWMODE0 opcode).
 pub static REX3_GO: EventDef = EventDef::new("GO", cat::PRIM).with_arg("opcode");
+/// CPU interpreter/precompiled/Cranelift raster work (arg: DRAWMODE0 opcode).
+pub static REX3_RASTER: EventDef = EventDef::new("raster", cat::PRIM).with_arg("opcode");
 /// The guest reads STATUS and sees GFXBUSY: it is (most likely) waiting
 /// for the engine.
-pub static REX3_WAIT_IDLE: EventDef = EventDef::new("guest sees busy", cat::GFX).on_track("REX3 busy wait").in_group(GFX_GROUP);
+pub static REX3_WAIT_IDLE: EventDef = EventDef::new("guest sees busy", cat::GFX)
+    .on_track("REX3 busy wait")
+    .in_group(GFX_GROUP);
 /// The command FIFO is full and a CPU store is being retried.
-pub static REX3_FIFO_FULL: EventDef = EventDef::new("gfifo full", cat::GFX).on_track("REX3 gfifo full").in_group(GFX_GROUP);
+pub static REX3_FIFO_FULL: EventDef = EventDef::new("gfifo full", cat::GFX)
+    .on_track("REX3 gfifo full")
+    .in_group(GFX_GROUP);
 /// GFIFO level as STATUS reports it, sampled on each STATUS read.
-pub static REX3_GFIFO_LEVEL: EventDef = EventDef::new("REX3 gfifo level", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_GFIFO_LEVEL: EventDef =
+    EventDef::new("REX3 gfifo level", cat::GFX).in_group(GFX_GROUP);
 /// Vertical blank begins (the refresh thread raised VRINT).
-pub static REX3_VBLANK: EventDef = EventDef::new("vblank", cat::GFX).on_track("REX3 display").in_group(GFX_GROUP);
+pub static REX3_VBLANK: EventDef = EventDef::new("vblank", cat::GFX)
+    .on_track("REX3 display")
+    .in_group(GFX_GROUP);
 /// An XMAP9 mode table entry was written: how IRIX swaps buffers on
 /// Newport (arg: entry << 24 | value).
-pub static REX3_XMAP_MODE: EventDef = EventDef::new("xmap mode write", cat::GFX).on_track("REX3 display").in_group(GFX_GROUP).with_arg("entry<<24|val");
+pub static REX3_XMAP_MODE: EventDef = EventDef::new("xmap mode write", cat::GFX)
+    .on_track("REX3 display")
+    .in_group(GFX_GROUP)
+    .with_arg("entry<<24|val");
 /// Composing and presenting a frame on the refresh thread.
 pub static REX3_PRESENT: EventDef = EventDef::new("present", cat::GFX);
+/// Copying dirty RGB/aux tiles into the presentation cache (arg: bytes).
+pub static REX3_FB_COPY: EventDef = EventDef::new("framebuffer copy", cat::GFX).with_arg("bytes");
+/// Host submission of RGB texture updates (arg: bytes).
+pub static REX3_UPLOAD_RGB: EventDef = EventDef::new("RGB upload", cat::GFX).with_arg("bytes");
+/// Host submission of auxiliary texture updates (arg: bytes).
+pub static REX3_UPLOAD_AUX: EventDef = EventDef::new("aux upload", cat::GFX).with_arg("bytes");
+/// Newport software composition or GL composition draw, excluding source uploads.
+pub static REX3_COMPOSE: EventDef = EventDef::new("compose", cat::GFX);
+/// GL output readback and CPU repacking (arg: bytes).
+pub static REX3_READBACK: EventDef = EventDef::new("readback", cat::GFX).with_arg("bytes");
+
+pub static REX3_DIRTY_RGB_TILES: EventDef =
+    EventDef::new("rex3.dirty.rgb_tiles", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_DIRTY_AUX_TILES: EventDef =
+    EventDef::new("rex3.dirty.aux_tiles", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_COPY_RGB_BYTES: EventDef =
+    EventDef::new("rex3.copy.rgb_bytes", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_COPY_AUX_BYTES: EventDef =
+    EventDef::new("rex3.copy.aux_bytes", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_UPLOAD_RGB_BYTES: EventDef =
+    EventDef::new("rex3.upload.rgb_bytes", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_UPLOAD_AUX_BYTES: EventDef =
+    EventDef::new("rex3.upload.aux_bytes", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_UPLOAD_RGB_RECTS: EventDef =
+    EventDef::new("rex3.upload.rgb_rects", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_UPLOAD_AUX_RECTS: EventDef =
+    EventDef::new("rex3.upload.aux_rects", cat::GFX).in_group(GFX_GROUP);
+pub static REX3_READBACK_BYTES: EventDef =
+    EventDef::new("rex3.readback.bytes", cat::GFX).in_group(GFX_GROUP);
 
 // ── XZ / Extreme (GR2) ───────────────────────────────────────────────────────
 
-pub static GR2_WAIT: EventDef = EventDef::new("guest read stalled", cat::GFX).on_track("GR2 busy wait").in_group(GFX_GROUP);
-pub static GR2_FIFO_FULL: EventDef = EventDef::new("fifo full", cat::GFX).on_track("GR2 fifo full").in_group(GFX_GROUP);
-pub static GR2_VBLANK: EventDef = EventDef::new("vblank", cat::GFX).on_track("GR2 display").in_group(GFX_GROUP);
+pub static GR2_WAIT: EventDef = EventDef::new("guest read stalled", cat::GFX)
+    .on_track("GR2 busy wait")
+    .in_group(GFX_GROUP);
+pub static GR2_FIFO_FULL: EventDef = EventDef::new("fifo full", cat::GFX)
+    .on_track("GR2 fifo full")
+    .in_group(GFX_GROUP);
+pub static GR2_VBLANK: EventDef = EventDef::new("vblank", cat::GFX)
+    .on_track("GR2 display")
+    .in_group(GFX_GROUP);
 
 // ── O2 (CRIME RE, GBE) ──────────────────────────────────────────────────────
 
