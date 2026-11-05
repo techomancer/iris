@@ -498,6 +498,14 @@ impl Board {
         self.trace.fifo(format_args!("{name} {tag:#x} [{}] {}{floats}{kernel}", self.cmd.operand_count, words_hex(ops)));
     }
 
+    /// The operands of a word the model does not know, as the parser passed
+    /// over them (Board::cmd_classify()).
+    pub fn trace_skipped(&self) {
+        let n = (self.cmd.operand_count as usize).min(self.cmd.operand.len());
+        let ops = &self.cmd.operand[..n];
+        self.trace.fifo(format_args!("skipped {:#x} [{}] {}  ({})", self.cmd.tag, self.cmd.operand_count, words_hex(ops), words_f32(ops)));
+    }
+
     /// One of the parser's other completions (copy rect, pattern load, image
     /// box or burst, matrix load, rect, query) or a word it does not know.
     pub fn trace_note(&self, text: std::fmt::Arguments) {
