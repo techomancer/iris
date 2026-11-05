@@ -433,6 +433,7 @@ const MSG_REPLY: u32 = 1;
 const RPC_VERSION: u32 = 2;
 const REPLY_ACCEPTED: u32 = 0;
 const AUTH_NULL: u32 = 0;
+const AUTH_UNIX: u32 = 1;
 
 /// RPC accept-status values (RFC 1057). We allow every host, so auth never
 /// fails; these cover protocol-level outcomes only.
@@ -1373,7 +1374,11 @@ pub fn mount_call(call: &RpcCall, args: &mut Cur) -> Vec<u8> {
             } else {
                 x.u32(0); // mountstat3 = MNT3_OK
                 put_fh(&mut x, ROOT_ID); // v3 fhandle3 (opaque)
-                x.u32(1); // one auth flavor follows
+                // The flavours the client may use. Credentials are not
+                // checked, but IRIX 6.5.30 refuses a server that does not
+                // list AUTH_UNIX.
+                x.u32(2);
+                x.u32(AUTH_UNIX);
                 x.u32(AUTH_NULL);
             }
             x.into_bytes()
@@ -2042,7 +2047,9 @@ mod tests {
         assert_eq!(c.u32(), Some(0)); // MNT3_OK
         let fh = c.opaque().unwrap();
         assert_eq!(u64::from_be_bytes(fh.try_into().unwrap()), ROOT_ID);
-        assert_eq!(c.u32(), Some(1)); // one auth flavor
+        // AUTH_UNIX first: IRIX 6.5.30 refuses a server without it.
+        assert_eq!(c.u32(), Some(2)); // two auth flavors
+        assert_eq!(c.u32(), Some(1)); // AUTH_UNIX
         assert_eq!(c.u32(), Some(0)); // AUTH_NULL
 
         // MOUNT v1 MNT -> fhstatus OK + 32-byte fhandle.

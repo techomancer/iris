@@ -13,6 +13,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Networking
+
+- IRIX 6.5.30 guests mount the NFS share with a plain `mount`: the
+  portmapper no longer offers TCP mappings it cannot serve, and the MOUNT
+  v3 reply lists AUTH_UNIX.
+
 ### VPro introspection
 
 - The Octane's VPro (Odyssey) board has a monitor surface like the other

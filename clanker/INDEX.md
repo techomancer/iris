@@ -154,6 +154,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
+| [nfs-irix-6530-mount.md](net/nfs-irix-6530-mount.md) | rule | IRIX 6.5.30 mounts the share only if portmap has no TCP mappings and the MOUNT v3 reply lists AUTH_UNIX |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
 | [nfs-fileid-1-panics-irix53-imon.md](net/nfs-fileid-1-panics-irix53-imon.md) | rule | NFS fileid 1 panics IRIX 5.3 through imon (fam) |
 | [nfs-readdir-must-respect-count-and-fit-one-datagram.md](net/nfs-readdir-must-respect-count-and-fit-one-datagram.md) | rule | NFS READDIR replies must respect the client's `count` and fit one UDP datagram |
