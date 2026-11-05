@@ -1,8 +1,57 @@
-//! The PCI bus: the part every host bridge shares. A bridge owns one,
-//! built from its machine's [`BusDesc`], and calls into it for what is the
-//! same everywhere: placing functions (giving each its DMA and interrupt
-//! line), configuration cycles, BAR decode and publication, reset and
-//! saved state. The bridge keeps what is its own, as [`PciHost`] says.
+//! The PCI bus: the part every host bridge shares.
+//!
+//! # The model
+//!
+//! A *function* is anything with a configuration header: the
+//! [`PciBusDevice`] trait in the parent module. It sees its header, accesses
+//! to its BARs, a way to memory ([`PciDma`](super::PciDma)) and a line for
+//! each interrupt pin it uses.
+//!
+//! A *bus* is a machine's PCI, as data: a [`BusDesc`] lists the device
+//! numbers, what each is (a chip on the board, a socket for a card, a number
+//! kept for a paravirtual device), which host output each interrupt pin
+//! reaches, and where each of those facts comes from. The O2's is in
+//! `ip32.rs`, the Octane's in `ip30.rs`.
+//!
+//! A *host bridge* (MACE, the Octane's Bridge) owns one [`PciBus`] built from
+//! that description and supplies, as a [`PciHost`], only what is its own: how
+//! a CPU access becomes a configuration cycle and what an absent function
+//! looks like, byte lanes, DMA translation, where an interrupt output goes,
+//! and the CPU windows it opens onto PCI space. The bus does the rest:
+//!
+//! - placing a function ([`PciBus::attach`]) gives it its DMA and, for each
+//!   pin it uses, a line; a pin the description does not route gets a line
+//!   that leads nowhere;
+//! - interrupts are precomputed: every pin and board wire routed to a host
+//!   output is ORed under one lock, so a shared output stays up until every
+//!   source drops;
+//! - configuration reads and writes take the byte offset and width of the
+//!   cycle, and the header applies its own write rules;
+//! - one lock-free table of BAR windows, rebuilt from the headers when one
+//!   may have changed, answers the slow path (first match, lowest device
+//!   and BAR), and the pages a BAR covers whole are published as direct
+//!   runs the machine maps over the host's window, so the CPU reaches the
+//!   function with no search and no lock;
+//! - reset (RST#) and saved state cover every header; a restore must name
+//!   the functions the bus has.
+//!
+//! # Cards
+//!
+//! A user fits a card in an add-in slot with `[[pci]]` or `--pci`, naming the
+//! slot as the machine's manual labels it. [`super::card`] lists the
+//! cards; each card's file describes it and builds it, and offers the
+//! machine what it needs beyond PCI (SCSI buses, a heartbeat, a thread to
+//! start) through default methods on the function trait. [`super::place`]
+//! checks entries against the descriptions before anything is built.
+//!
+//! # What this leaves room for
+//!
+//! A function has an address of device and function number, and the table
+//! indexes by both, so a multi-function card is several functions at one
+//! device number. A PCI-to-PCI bridge is a function that owns a second
+//! [`PciBus`] and implements [`PciHost`] for it, forwarding configuration
+//! cycles and BAR windows downstream. Neither is implemented; nothing here
+//! assumes there is only one bus or one function per device.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::collections::HashMap;

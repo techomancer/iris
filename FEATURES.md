@@ -207,6 +207,19 @@ rejected. If `scsi` is entirely omitted, core defaults attach SCSI #1 as
 default map; missing slots are unattached. `kind = "daynaport"` needs no image.
 An explicit non-disk kind takes precedence over the legacy cdrom flag.
 
+### [[pci]]
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `pci.slot` | required | The slot as the machine labels it (the O2's is `"PCI option"`, matched without regard to case) or its device number. Only add-in slots can be named; the error lists what the machine has. |
+| `pci.card` | required | The card to fit: `aic7880`. |
+| `pci.bus` | the machine's only bus | Which bus, for a machine with more than one. |
+
+A card's own options sit beside these. The AIC-7880 takes none. Its SCSI bus
+is the next controller after the machine's own (2 on the O2): `[scsi.35]` is
+id 3 on it, and ids 1 to 15 are valid there (0 is the controller). `--pci [BUS:]SLOT=CARD[,KEY=VALUE]...`
+adds an entry and replaces one for the same slot.
+
 ### [network]
 
 | Key | Default | Values and behavior |
