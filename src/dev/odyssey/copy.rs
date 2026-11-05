@@ -123,7 +123,7 @@ impl CopyOperands {
 /// the pairs the library's reads name (measured.md section 6), four equal
 /// components otherwise.
 /// Bytes a field of codec c holds.
-fn codec_bytes(c: Codec) -> u8 {
+pub(super) fn codec_bytes(c: Codec) -> u8 {
     match c {
         Codec::Lanes => 8,
         Codec::Byte => 1,

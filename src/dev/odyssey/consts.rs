@@ -533,7 +533,6 @@ pub(super) mod dma {
     pub const REPORT_UPLOAD_SENTINEL: u32 = 1 << 8;
     pub const REPORT_INDEX_OBJECT: u32 = 1 << 9;
     pub const REPORT_COLOUR_OVER_INDEX: u32 = 1 << 10;
-    pub const REPORT_STENCIL_OR_INDEX: u32 = 1 << 13;
     pub const REPORT_UNLISTED_FIELDS: u32 = 1 << 14;
 }
 
@@ -569,6 +568,11 @@ pub(super) mod gl_cmd {
     // Two GL vertex-stream words carry their own tag instead of the register-select shape above (same primary source, section 4).
     pub const COLOR_3UB: u32 = 0xc580cc08; // 3 operands: R, G, B, one byte each
     pub const VERTEX_2I: u32 = 0x8080c800; // 2 operands: X, Y
+
+    // glEdgeFlag: no operands, the flag is in the word (the guest OS GL
+    // library sends the false form for a zero flag).
+    pub const EDGE_FLAG_TRUE: u32 = 0x2f00c02e;
+    pub const EDGE_FLAG_FALSE: u32 = 0x3000c02e;
 
     // The greeter draws in PseudoColor
     pub const COLOR_INDEX: u32 = 0xc580c406; // 1 operand: PseudoColor index

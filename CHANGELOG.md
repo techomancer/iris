@@ -48,6 +48,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   TyrQuake's water and lava, which it renders on screen and copies into
   their textures, have their colours back.
 - Right Ctrl+Print Screen saves a screenshot on VPro as on the other boards.
+- `glReadPixels` from a window reads it in its display mode's format too,
+  so a 10:10:10:2 window no longer reads back with its colours scrambled;
+  a stencil read of an RGB window returns the stencil; glEdgeFlag is
+  honoured in polygon line mode; two-sided lighting lights back faces with
+  the back material. Found by running piglit on IRIX against a real V10:
+  the emulated V10 now passes 145 of the tests to the real board's 146.
 - Board memory is 64-bit words like main memory, and colour, depth and
   blend stores are specialised per format and blend function: a
   single-threaded Quake timedemo replay runs about 13% faster.

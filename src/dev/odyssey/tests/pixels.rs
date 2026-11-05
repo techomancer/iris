@@ -219,9 +219,9 @@ fn with_fields(word4: u32, first: u32, second: u32) -> u32 {
 /// test screen's 16-byte pixels the front colour is at unit 6 and depth at
 /// unit 4, so (6,2) reads the colour and (4,0) the depth word or, under
 /// class 0 code 0, the stencil byte. (0,0) is depth in an 8-byte window and
-/// the stencil-or-index tie, served as an index.
-///
-/// Established that the field codes differ; the tie is unknown and labelled.
+/// the stencil-or-index tie, which the window's display mode breaks: GL
+/// reads indices only from an index window, so on an RGB window it is the
+/// stencil (piglit's hiz-stencil-read-window tests pass on a V10).
 #[test]
 fn field_codes_separate_a_colour_read_from_a_depth_or_stencil_read() {
     let (mut s, ram) = read_window();
@@ -235,10 +235,9 @@ fn field_codes_separate_a_colour_read_from_a_depth_or_stencil_read() {
     let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(0, 0), 4, 0), 1);
     assert_eq!(got[..2], [0x00, 0xa5]);
 
-    // The (0,0) tie is served as an index byte. On a window shown as colour
-    // there is no index to return and the read is refused.
+    // The (0,0) tie on a window shown as colour is its stencil byte.
     let got = dma_read(&mut s, &ram, (30, 40, 1), with_fields(read_word4(0, 0), 0, 0), 1);
-    assert_eq!(got[..2], [0xa5, 0xa5], "refused on an RGB window");
+    assert_eq!(got[..2], [0x00, 0xa5], "the stencil of an RGB window");
 }
 
 /// A colour-index window reads back its index: one byte under class 0 code

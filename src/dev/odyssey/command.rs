@@ -860,10 +860,13 @@ impl Board {
         self.cmd.operand_index = 0;
         if operands == 0 {
             self.query_update(tag);
-            if tag != 0x2f00c02e && tag != 0x3000c02e {
+            if tag == gl_cmd::EDGE_FLAG_TRUE || tag == gl_cmd::EDGE_FLAG_FALSE {
+                self.assembly.edge = (tag == gl_cmd::EDGE_FLAG_TRUE) as u32;
+                if self.trace.on(TRACE_FIFO) {
+                    self.trace_command(tag);
+                }
+            } else {
                 self.cmd_dispatch(tag);
-            } else if self.trace.on(TRACE_FIFO) {
-                self.trace_command(tag);
             }
         } else {
             self.cmd.state = ODSY_CMD_OPERANDS;
@@ -919,7 +922,7 @@ impl Board {
         if word == ODSY_RASTER_POS_LATCH_WORD {
             self.query_raster_latch();
         }
-        if word == 0x2f00c02e || word == 0x3000c02e {
+        if word == gl_cmd::EDGE_FLAG_TRUE || word == gl_cmd::EDGE_FLAG_FALSE {
             self.cmd_start(word, 0);
             return;
         }
