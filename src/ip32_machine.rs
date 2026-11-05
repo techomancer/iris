@@ -82,12 +82,16 @@ impl BootState {
     }
 }
 
-/// The CPU's interrupt pins as a controller: line n is IPn.
-struct CpuIrq(Arc<dyn crate::traits::Device>);
+/// The CPU's interrupt pins as a controller: line n is IPn. It holds the CPU
+/// weakly: the CPU holds the bus, and the bus holds this through CRIME, so a
+/// strong reference would keep both alive after the machine is dropped.
+struct CpuIrq(std::sync::Weak<dyn CpuDevice>);
 
 impl crate::irq::InterruptController for CpuIrq {
     fn set_line(&self, line: u32, level: bool) {
-        self.0.signal(Signal::Interrupt(line, level));
+        if let Some(cpu) = self.0.upgrade() {
+            cpu.as_device().signal(Signal::Interrupt(line, level));
+        }
     }
 }
 
@@ -286,13 +290,11 @@ impl O2Machine {
                 let stats = g.stats.clone();
                 g.compile_queue.start(bus.phys.clone() as Arc<dyn BusDevice>, stats);
             }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
         }
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();
-        bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
+        bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(Arc::downgrade(&cpu))), 2));
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), cpu_mhz);
         // CRIME's rendering engine draws on its own thread, fed through
@@ -763,6 +765,8 @@ impl Drop for O2Machine {
         }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
+        // Its thread holds the bus.
+        self.bus.crime.re.shutdown();
     }
 }
 
@@ -1192,3 +1196,29 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
     }
 }
 
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use crate::config::GraphicsBoard;
+    use crate::display_stop_tests::{big_stack, config, scratch};
+
+    /// A process may have only 64 decode tables, so a dropped O2 must let go
+    /// of its bus and every thing that holds it: the CPU (through its
+    /// interrupt line from CRIME and a handle the JIT's compile pool does not
+    /// need), and the rendering engine's thread.
+    #[test]
+    fn a_dropped_o2_releases_its_bus() {
+        let dir = scratch("o2-drop");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let (bus, phys, cpu) = big_stack(move || {
+            let mut m = O2Machine::new(&cfg).expect("an O2");
+            let held = (Arc::downgrade(&m.bus), Arc::downgrade(&m.bus.phys), Arc::downgrade(&m.cpu));
+            Workstation::stop(&mut m);
+            drop(m);
+            held
+        });
+        assert_eq!(cpu.strong_count(), 0, "the CPU outlives its machine");
+        assert_eq!(bus.strong_count(), 0, "the bus outlives its machine");
+        assert_eq!(phys.strong_count(), 0, "the decode table outlives its machine");
+    }
+}
