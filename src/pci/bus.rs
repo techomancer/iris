@@ -13,7 +13,8 @@ use super::intx::IntxTable;
 use super::slots::{BusDesc, PciAddr};
 use super::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, Space};
 use crate::irq::IrqLine;
-use crate::traits::BusDevice;
+use crate::snapshot::get_field;
+use crate::traits::{BusDevice, Saveable};
 
 /// A card a user fitted, as the bus records it for saved state.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -194,9 +195,74 @@ impl PciBus {
         true
     }
 
+    /// RST#: every header returns to power-up, so no function decodes
+    /// until firmware assigns its BARs again. The functions' own state is
+    /// theirs to reset, and interrupt levels are not touched: the lines
+    /// are held by functions this does not reset.
+    pub fn reset(&self) {
+        for p in self.funcs.iter().filter_map(|p| p.get()) {
+            p.f.config().reset();
+        }
+        self.changed();
+    }
+
+    /// Every header, by `<device>.<function>`, and the interrupt levels.
+    pub fn save_state(&self) -> toml::Value {
+        let mut devices = toml::map::Map::new();
+        for (at, f) in self.functions() {
+            devices.insert(format!("{}.{}", at.device, at.function), f.config().save_state());
+        }
+        let mut t = toml::map::Map::new();
+        t.insert("devices".into(), toml::Value::Table(devices));
+        t.insert("intx".into(), self.intx.save_state());
+        toml::Value::Table(t)
+    }
+
+    /// Restore the headers and interrupt levels. The saved state must name
+    /// exactly the functions this bus has. Nothing is driven into the
+    /// host: it loads its own state, and [`Self::redrive`] follows if it
+    /// needs the outputs put right.
+    pub fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let Some(toml::Value::Table(saved)) = get_field(v, "devices") else {
+            return Err("pci: saved state has no devices".into());
+        };
+        let mut headers = Vec::new();
+        for (key, hdr) in saved {
+            let at = key.split_once('.')
+                .and_then(|(d, f)| Some(PciAddr { device: d.parse().ok()?, function: f.parse().ok()? }))
+                .ok_or_else(|| format!("pci: saved device {key:?} is not <device>.<function>"))?;
+            let f = self.function(at).ok_or_else(|| format!("pci: saved state has {at}, which is empty here"))?;
+            headers.push((at, f, hdr));
+        }
+        for (at, _) in self.functions() {
+            if !headers.iter().any(|h| h.0 == at) {
+                return Err(format!("pci: this bus has {at}, the saved state has none"));
+            }
+        }
+        for (at, f, hdr) in headers {
+            f.config().load_state(hdr).map_err(|e| format!("{at}: {e}"))?;
+        }
+        self.intx.load_state(get_field(v, "intx").ok_or("pci: saved state has no interrupt levels")?)?;
+        self.changed();
+        Ok(())
+    }
+
+    /// Drive every routed host output to the level its sources add up to.
+    pub fn redrive(&self) {
+        self.intx.redrive();
+    }
+
     /// A board wire from the description, by name.
     pub fn wire(&self, name: &str) -> IrqLine {
         self.intx.wire_line(name)
+    }
+
+    /// A function changed its own header, outside a configuration cycle (a
+    /// power-on reset of its own): tell the bus, which rebuilds the decode
+    /// table and republishes. Headers the bus writes or resets itself need no
+    /// call. Until it is made the table still decodes the old BARs.
+    pub fn refresh(&self) {
+        self.changed();
     }
 
     /// What the functions decode may have moved: rebuild the decode table
@@ -591,5 +657,114 @@ pub(crate) mod tests {
         set(&b, at, 1, 2);
         set(&b, at, 5, 0x8000_3000);
         assert_eq!(runs.lock().unwrap()[0].start, 0x1a00_3000, "moved with the BAR");
+    }
+
+    #[test]
+    fn reset_returns_every_header_to_power_up_and_unpublishes_runs() {
+        let (h, b, runs) = windowed();
+        let (x, y) = (Fake::new(PCI_INTA), Fake::new(PCI_INTA));
+        b.attach(PciAddr::dev(3), x.clone());
+        b.attach(PciAddr::dev(4), y.clone());
+        let fresh: Vec<u32> = (0..64).map(|i| x.cfg.read(i)).collect();
+        for (at, base) in [(PciAddr::dev(3), 0x8000_1000), (PciAddr::dev(4), 0x8000_3000)] {
+            set(&b, at, 5, base);
+            set(&b, at, 1, 2);
+        }
+        assert_eq!(runs.lock().unwrap().len(), 4);
+        x.irq.get().unwrap().set(true);
+        b.reset();
+        assert_eq!((0..64).map(|i| x.cfg.read(i)).collect::<Vec<_>>(), fresh);
+        assert!((0..64).all(|i| y.cfg.read(i) == fresh[i]));
+        assert!(runs.lock().unwrap().is_empty());
+        assert!(b.target(Space::Mem, 0x8000_1084).is_none());
+        assert_eq!(h.outputs(), vec![(12, true)], "reset drives no interrupt output");
+        b.redrive();
+        assert_eq!(h.outputs().iter().rev().find(|o| o.0 == 12), Some(&(12, true)), "and the pin is still held");
+    }
+
+    /// A bus with functions at devices 3 and 4, for the saved-state tests.
+    fn pair() -> (Arc<TestHost>, PciBus, Arc<Fake>, Arc<Fake>) {
+        let (h, b) = bus();
+        let (x, y) = (Fake::new(PCI_INTA), Fake::new(PCI_INTA));
+        b.attach(PciAddr::dev(3), x.clone());
+        b.attach(PciAddr::dev(4), y.clone());
+        (h, b, x, y)
+    }
+
+    /// A function that resets its own header leaves the bus's table stale
+    /// until the bus is told.
+    #[test]
+    fn a_function_resetting_its_own_header_is_followed_after_a_refresh() {
+        let (_, b, runs) = windowed();
+        let at = PciAddr::dev(3);
+        let f = Fake::new(PCI_INTA);
+        b.attach(at, f.clone());
+        set(&b, at, 5, 0x8000_1000);
+        set(&b, at, 1, 2);
+        assert!(b.target(Space::Mem, 0x8000_1084).is_some());
+        f.cfg.reset();
+        assert!(b.target(Space::Mem, 0x8000_1084).is_some(), "stale until told");
+        b.refresh();
+        assert!(b.target(Space::Mem, 0x8000_1084).is_none());
+        assert!(runs.lock().unwrap().is_empty(), "and the runs are gone");
+    }
+
+    #[test]
+    fn state_round_trips_headers_and_pin_levels() {
+        let (_, src, x, _) = pair();
+        set(&src, PciAddr::dev(3), 5, 0x8000_1000);
+        set(&src, PciAddr::dev(3), 1, 2);
+        x.irq.get().unwrap().set(true);
+        let saved = src.save_state();
+
+        let (_, dst, ..) = pair();
+        dst.load_state(&saved).expect("load_state");
+        assert_eq!(dst.save_state(), saved);
+        let (_, bar, off) = dst.target(Space::Mem, 0x8000_1084).expect("BAR and memory enable restored");
+        assert_eq!((bar, off), (1, 0x84));
+    }
+
+    #[test]
+    fn load_refuses_a_device_the_bus_does_not_have() {
+        let (_, src, ..) = pair();
+        let saved = src.save_state();
+        let (_, dst) = bus();
+        dst.attach(PciAddr::dev(4), Fake::new(PCI_INTA));
+        assert_eq!(dst.load_state(&saved).unwrap_err(), "pci: saved state has device 3, which is empty here");
+    }
+
+    #[test]
+    fn load_refuses_a_device_the_state_lacks() {
+        let (_, src) = bus();
+        src.attach(PciAddr::dev(4), Fake::new(PCI_INTA));
+        let saved = src.save_state();
+        let (_, dst, ..) = pair();
+        assert_eq!(dst.load_state(&saved).unwrap_err(), "pci: this bus has device 3, the saved state has none");
+    }
+
+    #[test]
+    fn load_refuses_a_header_for_another_kind_of_function() {
+        let (_, src) = bus();
+        src.attach(PciAddr::dev(3), Fake::with_bars([Bar::Unused; 6], PCI_INTA));
+        let mut saved = src.save_state();
+        // Pretend the saved function had another identity.
+        let regs = saved["devices"]["3.0"]["regs"].as_array_mut().unwrap();
+        regs[0] = toml::Value::String("0x12345678".into());
+        let (_, dst) = bus();
+        dst.attach(PciAddr::dev(3), Fake::new(PCI_INTA));
+        let e = dst.load_state(&saved).unwrap_err();
+        assert!(e.starts_with("device 3: pci: saved header is for 0x12345678"), "{e}");
+    }
+
+    #[test]
+    fn load_drives_nothing_and_redrive_drives_every_set_pin() {
+        let (_, src, x, _) = pair();
+        x.irq.get().unwrap().set(true);
+        let saved = src.save_state();
+        let (h, dst, ..) = pair();
+        dst.load_state(&saved).unwrap();
+        assert!(h.outputs().is_empty());
+        dst.redrive();
+        assert_eq!(h.outputs(), vec![(8, false), (12, true), (13, false)], "every routed output, in order");
     }
 }
