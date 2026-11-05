@@ -2697,6 +2697,10 @@ int main(int argc, char **argv)
                         GLX_STENCIL_SIZE, 1, None };
     int attr_noalpha[] = { GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8,
                            GLX_BLUE_SIZE, 8, GLX_DEPTH_SIZE, 16, None };
+    /* VPro with an 8-byte frame buffer (a 32 MB V10): 8,8,8,8 with depth
+       only single buffered. Before attr_sb, which takes 10,10,10,2. */
+    int attr_sb_alpha[] = { GLX_RGBA, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8,
+                            GLX_ALPHA_SIZE, 8, GLX_DEPTH_SIZE, 16, GLX_STENCIL_SIZE, 1, None };
     /* GR2 (XZ / Extreme): 8,8,8 only single buffered (24 planes). */
     int attr_sb[] = { GLX_RGBA, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8,
                       GLX_DEPTH_SIZE, 16, GLX_STENCIL_SIZE, 1, None };
@@ -2787,6 +2791,8 @@ int main(int argc, char **argv)
         vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_full);
         if (!vi)
             vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_noalpha);
+        if (!vi)
+            vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_sb_alpha);
         if (!vi)
             vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_sb);
         if (!vi)
