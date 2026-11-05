@@ -387,7 +387,7 @@ impl CommandFifo {
             debug_assert!(before >= words, "the level counts every store before the ring shows it (push)");
             if before >= cfifo::LOW_WATER && before - words < cfifo::LOW_WATER {
                 f.intr_flags |= intr::FIFO_LOW_WATER;
-                crate::pf_instant!(crate::perfetto::events::cfifo::LOW_WATER, before - words);
+                crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, before - words);
                 f.update_irq();
             }
         } else {

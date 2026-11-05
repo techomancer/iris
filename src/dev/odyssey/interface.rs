@@ -390,7 +390,7 @@ impl HostInterface {
                 // when a flip has not shown after two retraces. Whether the
                 // board ORs or replaces is unknown; ORing loses no flip.
                 self.swap_arm |= value as u32;
-                crate::pf_instant!(crate::perfetto::events::swap::ARM, value);
+                crate::pf_instant!(crate::perfetto::events::ODSY_SWAP_ARM, value);
             }
             Some(swap::PENDING) => self.swap_pending = value as u32,
             Some(swap::CONTROL) => {
