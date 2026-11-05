@@ -19,7 +19,8 @@ use crate::traits::{BusDevice, Saveable};
 /// A card a user fitted, as the bus records it for saved state.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CardRef {
-    pub name: &'static str,
+    /// The card's name, as the config spells it.
+    pub name: String,
     /// The card's options as `k=v,...`, sorted by key.
     pub options: String,
     /// The first SCSI controller number the card took.
@@ -468,7 +469,7 @@ pub(crate) mod tests {
     #[test]
     fn cards_are_listed_apart_from_onboard_functions() {
         let (_, b) = bus();
-        let card = CardRef { name: "fake", options: String::new(), first_controller: 2 };
+        let card = CardRef { name: "fake".into(), options: String::new(), first_controller: 2 };
         b.attach(PciAddr::dev(1), Fake::new(0));
         b.attach_card(PciAddr::dev(3), Fake::new(0), card.clone());
         let cards = b.cards();
