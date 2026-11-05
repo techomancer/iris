@@ -4,12 +4,13 @@
 //! line), configuration cycles, BAR decode and publication, reset and
 //! saved state. The bridge keeps what is its own, as [`PciHost`] says.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::host::PciHost;
 use super::intx::IntxTable;
 use super::slots::{BusDesc, PciAddr};
-use super::PciBusDevice;
+use super::{PciBusDevice, Space};
 use crate::irq::IrqLine;
 
 /// A card a user fitted, as the bus records it for saved state.
@@ -33,6 +34,42 @@ struct Placed {
     origin: Origin,
 }
 
+/// The most BAR windows open at once on a bus. A window is one word of the
+/// decode table; more than this and the extra are ignored with a warning.
+const MAX_WINDOWS: usize = 64;
+
+/// A BAR window as the decode table holds it, packed into one word: base
+/// (bits 0-31), log2 of the size (32-37), I/O space (38), function index
+/// `device * 8 + function` (40-47), BAR (48-50).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Window {
+    space: Space,
+    func: u8,
+    bar: usize,
+    base: u32,
+    size: u32,
+}
+
+impl Window {
+    fn pack(self) -> u64 {
+        self.base as u64
+            | (self.size.trailing_zeros() as u64) << 32
+            | ((self.space == Space::Io) as u64) << 38
+            | (self.func as u64) << 40
+            | (self.bar as u64) << 48
+    }
+
+    fn unpack(w: u64) -> Self {
+        Self {
+            space: if w & (1 << 38) != 0 { Space::Io } else { Space::Mem },
+            func: (w >> 40) as u8,
+            bar: ((w >> 48) & 7) as usize,
+            base: w as u32,
+            size: 1u32 << ((w >> 32) & 0x3f),
+        }
+    }
+}
+
 pub struct PciBus {
     desc: &'static BusDesc,
     host: Arc<dyn PciHost>,
@@ -41,6 +78,14 @@ pub struct PciBus {
     funcs: Box<[OnceLock<Placed>]>,
     /// Addresses in the order functions were placed.
     order: Mutex<Vec<PciAddr>>,
+    /// The BAR windows the functions decode, rebuilt from their headers
+    /// after every change to them. A function's BAR comparators are its own
+    /// registers on the bus, not anything the bus locks, so a lookup reads
+    /// the table without a lock; configuration writes and accesses both
+    /// come from the CPU. Writers take `rebuild`.
+    windows: Box<[AtomicU64]>,
+    nwindows: AtomicUsize,
+    rebuild: Mutex<()>,
 }
 
 impl PciBus {
@@ -52,6 +97,9 @@ impl PciBus {
             intx,
             funcs: (0..desc.devices as usize * 8).map(|_| OnceLock::new()).collect(),
             order: Mutex::new(Vec::new()),
+            windows: (0..MAX_WINDOWS).map(|_| AtomicU64::new(0)).collect(),
+            nwindows: AtomicUsize::new(0),
+            rebuild: Mutex::new(()),
         }
     }
 
@@ -141,7 +189,45 @@ impl PciBus {
 
     /// What the functions decode may have moved: rebuild the decode table
     /// and republish the BAR runs.
-    fn changed(&self) {}
+    fn changed(&self) {
+        self.rebuild();
+    }
+
+    /// Rebuild the decode table from the functions' headers, in device,
+    /// function and BAR order: the order in which an overlap resolves, the
+    /// lowest first.
+    fn rebuild(&self) {
+        let _w = self.rebuild.lock().unwrap();
+        let mut n = 0;
+        for (func, p) in self.funcs.iter().enumerate() {
+            let Some(p) = p.get() else { continue };
+            for (space, bar, base, size) in p.f.config().windows() {
+                if n == MAX_WINDOWS {
+                    log::warn!("pci: more than {MAX_WINDOWS} BAR windows open; {} BAR {bar} ignored",
+                        PciAddr { device: (func / 8) as u8, function: (func % 8) as u8 });
+                    continue;
+                }
+                self.windows[n].store(Window { space, func: func as u8, bar, base, size }.pack(), Ordering::Relaxed);
+                n += 1;
+            }
+        }
+        self.nwindows.store(n, Ordering::Release);
+    }
+
+    /// The function decoding `addr` in `space`, the BAR, and the offset
+    /// within it. The first window in table order that holds the address
+    /// wins.
+    pub fn target(&self, space: Space, addr: u32) -> Option<(&Arc<dyn PciBusDevice>, usize, u32)> {
+        let n = self.nwindows.load(Ordering::Acquire);
+        self.windows[..n].iter().find_map(|w| {
+            let w = Window::unpack(w.load(Ordering::Relaxed));
+            let off = addr.wrapping_sub(w.base);
+            if w.space != space || off >= w.size {
+                return None;
+            }
+            Some((&self.funcs[w.func as usize].get()?.f, w.bar, off))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -178,9 +264,12 @@ pub(crate) mod tests {
 
     impl Fake {
         pub fn new(pin: u8) -> Arc<Self> {
+            Self::with_bars([Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], pin)
+        }
+
+        pub fn with_bars(bars: [Bar; 6], pin: u8) -> Arc<Self> {
             Arc::new(Self {
-                cfg: PciConfig::new(0x9004, 0x8078, 0x01_0000, 1,
-                    [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], pin),
+                cfg: PciConfig::new(0x9004, 0x8078, 0x01_0000, 1, bars, pin),
                 last: Mutex::new(None),
                 irq: OnceLock::new(),
                 dma: OnceLock::new(),
@@ -318,5 +407,69 @@ pub(crate) mod tests {
     fn a_config_write_to_an_absent_function_reports_it() {
         let (_, b) = bus();
         assert!(!b.config_write(PciAddr::dev(3), 4, 4, 2));
+    }
+
+    /// Program register `reg` of the function at `at` through a config cycle.
+    fn set(b: &PciBus, at: PciAddr, reg: usize, val: u32) {
+        assert!(b.config_write(at, reg * 4, 4, val));
+    }
+
+    #[test]
+    fn a_bar_decodes_only_when_its_space_is_enabled_and_assigned() {
+        let (_, b) = bus();
+        let f = Fake::new(PCI_INTA);
+        let at = PciAddr::dev(3);
+        b.attach(at, f.clone());
+        set(&b, at, 5, 0x8000_1000);
+        assert!(b.target(Space::Mem, 0x8000_1084).is_none(), "not before memory is enabled");
+        set(&b, at, 1, 2);
+        let (got, bar, off) = b.target(Space::Mem, 0x8000_1084).expect("decoded");
+        assert!(Arc::ptr_eq(&got.clone(), &(f.clone() as Arc<dyn PciBusDevice>)));
+        assert_eq!((bar, off), (1, 0x84));
+        assert!(b.target(Space::Mem, 0x8000_2000).is_none(), "past the end of the BAR");
+        assert!(b.target(Space::Mem, 0).is_none(), "a BAR left at zero decodes nothing");
+    }
+
+    #[test]
+    fn overlapping_windows_resolve_to_the_lowest_device_then_the_lowest_bar() {
+        let (_, b) = bus();
+        let two_mem = || Fake::with_bars([Bar::Mem(0x1000), Bar::Unused, Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA);
+        let (d3, d4) = (two_mem(), two_mem());
+        // Placed highest device first: the order of placement must not matter.
+        b.attach(PciAddr::dev(4), d4.clone());
+        b.attach(PciAddr::dev(3), d3.clone());
+        for at in [PciAddr::dev(3), PciAddr::dev(4)] {
+            set(&b, at, 4, 0x4000_0000);
+            set(&b, at, 6, 0x4000_0000);
+            set(&b, at, 1, 2);
+        }
+        let (f, bar, _) = b.target(Space::Mem, 0x4000_0010).unwrap();
+        assert!(Arc::ptr_eq(&f.clone(), &(d3.clone() as Arc<dyn PciBusDevice>)), "device 3 before device 4");
+        assert_eq!(bar, 0, "BAR 0 before BAR 2");
+    }
+
+    #[test]
+    fn io_and_memory_are_decoded_separately() {
+        let (_, b) = bus();
+        let at = PciAddr::dev(3);
+        b.attach(at, Fake::new(PCI_INTA));
+        set(&b, at, 4, 0x1000);
+        set(&b, at, 5, 0x1000);
+        set(&b, at, 1, 1);
+        assert_eq!(b.target(Space::Io, 0x1004).map(|t| (t.1, t.2)), Some((0, 4)));
+        assert!(b.target(Space::Mem, 0x1004).is_none(), "memory is not enabled");
+        set(&b, at, 1, 2);
+        assert!(b.target(Space::Io, 0x1004).is_none(), "I/O is not enabled");
+        assert_eq!(b.target(Space::Mem, 0x1004).map(|t| (t.1, t.2)), Some((1, 4)));
+    }
+
+    #[test]
+    fn windows_pack_and_unpack() {
+        for w in [
+            Window { space: Space::Io, func: 255, bar: 5, base: 0xffff_f000, size: 0x1000 },
+            Window { space: Space::Mem, func: 0, bar: 0, base: 0x8000_0000, size: 1 << 31 },
+        ] {
+            assert_eq!(Window::unpack(w.pack()), w);
+        }
     }
 }
