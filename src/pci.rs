@@ -7,6 +7,8 @@
 //! function only sees configuration registers, accesses to its BARs, and an
 //! [`IrqLine`] for its pin.
 
+pub mod slots;
+
 use std::sync::{Arc, Mutex};
 
 use crate::irq::IrqLine;
