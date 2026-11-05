@@ -127,6 +127,11 @@ impl Transform<'_> {
             let c = cv.attr[vtx::COLOR + k].max(0.0).min(1.0);
             out.rgba[k] = c as f64;
         }
+        for k in 0..3 {
+            #[allow(clippy::manual_clamp, reason = "clamp would keep a NaN")]
+            let c = cv.attr[vtx::SPECULAR + k].max(0.0).min(1.0);
+            out.spec[k] = c as f64;
+        }
         for (i, p) in st.clip_plane.iter().enumerate().take(CLIP_PLANES as usize) {
             out.clip[i] = p[0] as f64 * eye[0] + p[1] as f64 * eye[1] + p[2] as f64 * eye[2] + p[3] as f64 * eye[3];
         }
@@ -312,6 +317,9 @@ pub(crate) struct Tri {
     pub live: *const LiveDraw,
     pub rgba12: [[i32; 4]; 3],
     pub flat12: [i32; 4],
+    /// The separate specular colours at the vertices and the provoking one.
+    pub spec12: [[i32; 3]; 3],
+    pub flat_spec12: [i32; 3],
     pub smooth: bool,
     /// The texture values at the vertices.
     pub tex: TriTex,
@@ -355,19 +363,28 @@ impl Draw<'_> {
             return;
         }
         let mut flat = &provoking[vtx::COLOR..vtx::COLOR + 4];
+        let mut flat_spec = &provoking[vtx::SPECULAR..vtx::SPECULAR + 3];
         if !front && self.xf.back_colours {
             flat = &provoking[vtx::BACK_COLOR..vtx::BACK_COLOR + 4];
+            flat_spec = &provoking[vtx::BACK_SPECULAR..vtx::BACK_SPECULAR + 3];
             for i in 0..3 {
                 let back = &verts[i].attr[vtx::BACK_COLOR..vtx::BACK_COLOR + 4];
+                let back_spec = &verts[i].attr[vtx::BACK_SPECULAR..vtx::BACK_SPECULAR + 3];
 
                 for k in 0..4 {
                     #[allow(clippy::manual_clamp, reason = "clamp would keep a NaN")]
                     let c = back[k].max(0.0).min(1.0);
                     v[i].rgba[k] = c as f64;
                 }
+                for k in 0..3 {
+                    #[allow(clippy::manual_clamp, reason = "clamp would keep a NaN")]
+                    let c = back_spec[k].max(0.0).min(1.0);
+                    v[i].spec[k] = c as f64;
+                }
             }
         }
         let flat = [0, 1, 2, 3].map(|k| flat[k] as f64);
+        let flat_spec = [0, 1, 2].map(|k| flat_spec[k] as f64);
         if area < 0 {
             // Walk either winding the same way from here.
             v.swap(1, 2);
@@ -384,6 +401,8 @@ impl Draw<'_> {
             live: std::ptr::null(),
             rgba12: [0, 1, 2].map(|i| v[i].rgba.map(fixed::from_f64)),
             flat12: flat.map(fixed::from_f64),
+            spec12: [0, 1, 2].map(|i| v[i].spec.map(fixed::from_f64)),
+            flat_spec12: flat_spec.map(fixed::from_f64),
             smooth,
             tex,
             inv_w: v.map(|r| r.inv_w),
@@ -459,9 +478,11 @@ impl Draw<'_> {
                 }
             }
             let mut c = t.flat12;
+            let mut s = t.flat_spec12;
 
             if background {
                 c = self.background.expect("an opaque stipple").map(fixed::from_f64);
+                s = [0; 3];
             } else if t.smooth {
                 let Some(w) = interp::weights(q.l1[i], q.l2[i], &iw) else {
                     continue;
@@ -469,8 +490,13 @@ impl Draw<'_> {
                 for (k, ck) in c.iter_mut().enumerate() {
                     *ck = fixed::interpolate(&w, [t.rgba12[0][k], t.rgba12[1][k], t.rgba12[2][k]]);
                 }
+                if p.shader.specular {
+                    for (k, sk) in s.iter_mut().enumerate() {
+                        *sk = fixed::interpolate(&w, [t.spec12[0][k], t.spec12[1][k], t.spec12[2][k]]);
+                    }
+                }
             }
-            if !p.shader.shade12(self.textured, &mut c, &texel[i], zw(i)) {
+            if !p.shader.shade12(self.textured, &mut c, &s, &texel[i], zw(i)) {
                 continue;
             }
             out.cov |= 1 << i;

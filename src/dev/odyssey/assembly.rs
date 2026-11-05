@@ -35,7 +35,7 @@ pub(super) const HELD_VERTICES: u32 = 3;
 
 /// A vertex as assembly hands it on: floats at these offsets.
 pub(super) mod vtx {
-    pub const FLOATS: usize = 22;
+    pub const FLOATS: usize = 28;
     pub const POSITION: usize = 0;
     pub const COLOR: usize = 4;
     /// The vertex's material index (0: the geometry engine lights it first).
@@ -44,6 +44,10 @@ pub(super) mod vtx {
     /// The edge flag's bits.
     pub const EDGE: usize = 17;
     pub const BACK_COLOR: usize = 18;
+    /// The separate specular colour (GL_SEPARATE_SPECULAR_COLOR), RGB, and
+    /// the back face's; zero otherwise.
+    pub const SPECULAR: usize = 22;
+    pub const BACK_SPECULAR: usize = 25;
 }
 
 /// Reports, once per process (a machine has one VPro board), that the w
@@ -194,6 +198,9 @@ pub(super) struct Assembly {
     pub back_colour: [f32; 4],
     /// The vertices carry back colours (Prim::back_colours).
     pub two_sided: bool,
+    /// The separate specular colours, front and back (vtx::SPECULAR).
+    pub specular: [f32; 3],
+    pub back_specular: [f32; 3],
     pub texcoord: [f32; 4],
     pub edge: u32,
     pub polygon: PolygonBuffer,
@@ -219,6 +226,8 @@ impl Default for Assembly {
             colour: [1.0; 4],
             back_colour: [1.0; 4],
             two_sided: false,
+            specular: [0.0; 3],
+            back_specular: [0.0; 3],
             texcoord: [0.0, 0.0, 0.0, 1.0],
             edge: 1,
             polygon: PolygonBuffer::default(),
@@ -257,6 +266,18 @@ impl Assembly {
         out[vtx::TEXCOORD..vtx::TEXCOORD + 4].copy_from_slice(&self.texture_coord());
         out[vtx::EDGE] = f32::from_bits(self.edge);
         out[vtx::BACK_COLOR..vtx::BACK_COLOR + 4].copy_from_slice(&self.back_colour);
+        out[vtx::SPECULAR..vtx::SPECULAR + 3].copy_from_slice(&self.specular);
+        out[vtx::BACK_SPECULAR..vtx::BACK_SPECULAR + 3].copy_from_slice(&self.back_specular);
+        // Points and lines take the colour sum here: only filled triangles
+        // carry the specular apart to the shader.
+        if mode <= LINE_STRIP {
+            for k in 0..3 {
+                out[vtx::COLOR + k] = (out[vtx::COLOR + k] + out[vtx::SPECULAR + k]).min(1.0);
+                out[vtx::BACK_COLOR + k] = (out[vtx::BACK_COLOR + k] + out[vtx::BACK_SPECULAR + k]).min(1.0);
+                out[vtx::SPECULAR + k] = 0.0;
+                out[vtx::BACK_SPECULAR + k] = 0.0;
+            }
+        }
         // A strip's and a fan's inner edges are outline edges under the
         // polygon modes.
         if mode == TRIANGLE_STRIP || mode == TRIANGLE_FAN || mode == QUAD_STRIP {

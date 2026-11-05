@@ -11,7 +11,7 @@ use super::board::{
     ODSY_HEIGHT, ODSY_WIDTH,
 };
 use super::consts::{
-    blend, colour, gl_cmd, light, line, mode, pattern, prog, ucode, write, ODSY_BUFFERS,
+    blend, colour, gl_cmd, light, line, mode, pattern, prog, tex, ucode, write, ODSY_BUFFERS,
     ODSY_CRC64_ECMA_POLY, ODSY_DEPTH_FUNC_MASK, ODSY_ENTRY_29, ODSY_ENTRY_2A, ODSY_ENTRY_2C,
     ODSY_ENTRY_33, ODSY_PLANE_MASK_SHIFT,
 };
@@ -253,10 +253,13 @@ pub(super) struct WindowRecord {
     pub crc: u64,
 }
 
-pub(super) static WINDOW_RECORDS: [WindowRecord; 8] = [
+pub(super) static WINDOW_RECORDS: [WindowRecord; 9] = [
     WindowRecord { record: 13, local_viewer: false, two_sided: true, entry: [0x706, 0x720, 0x73b], entries: 199, crc: 0xde5dd7f66d4e70cf },
     WindowRecord { record: 14, local_viewer: false, two_sided: false, entry: [0x4c5, 0x4c5, 0x4c5], entries: 199, crc: 0x5aa6880e8d77c0b2 },
     WindowRecord { record: 15, local_viewer: false, two_sided: true, entry: [0x4c5, 0x4c5, 0x4c5], entries: 199, crc: 0x9391fc6eed0accdc },
+    // The same body entered at the window's start (traced: piglit's
+    // two-sided-lighting-separate-specular).
+    WindowRecord { record: 15, local_viewer: false, two_sided: true, entry: [0x738, 0x4c5, 0x4c5], entries: 199, crc: 0x9391fc6eed0accdc },
     WindowRecord { record: 16, local_viewer: false, two_sided: false, entry: [0x738, 0x75a, 0x77b], entries: 199, crc: 0xb1da870f5523467f },
     WindowRecord { record: 17, local_viewer: false, two_sided: false, entry: [0x738, 0x75b, 0x77d], entries: 199, crc: 0xc4bf2cd3423da137 },
     WindowRecord { record: 18, local_viewer: true, two_sided: false, entry: [0x738, 0x75b, 0x77d], entries: 199, crc: 0xe15a6186144f9887 },
@@ -418,7 +421,7 @@ impl Board {
                     LogModule::Odyssey,
                     "sgi-odyssey: geometry program {:#x} {:#x} {:#x} from list index {} ({:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}) is not recognised{}; drawn unlit",
                     e29, e2a, e2c, k, c0, c1, c2, c3, c4, c5, c6, c7,
-                    if resident { "" } else { " (uploaded program is unsupported)" }
+                    if resident { String::new() } else { format!(" (uploaded program is unsupported; window body CRC {:#018x} over 199 entries)", self.window_crc(199)) }
                 );
             }
         }
@@ -430,15 +433,14 @@ impl Board {
             self.diag.gl_clip_logged = true;
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: clip planes in geometry program {:#x} are not modeled; geometry is not clipped to them", e29);
         }
-        if p.texture && !self.diag.gl_texture_stage_logged {
-            self.diag.gl_texture_stage_logged = true;
-            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: texture-mode lighting finish in geometry program {:#x} is not modeled", e29);
-        }
         self.geom.linear_texgen = if p.known { p.linear_texgen } else { 0 };
         self.geom.sphere_texgen = if p.known { p.sphere_texgen } else { 0 };
         self.geom.lit = p.lit;
         self.geom.local_viewer = p.local_viewer;
         self.geom.two_sided = p.two_sided;
+        // The texture-mode finish keeps the specular apart for the raster to
+        // add after texturing (TEX_MODE bit 19).
+        self.geom.separate_specular = p.texture;
         self.geom.normalize = p.normalize;
     }
 
@@ -612,6 +614,21 @@ impl Board {
         (front, back)
     }
 
+    /// The lit colours of a vertex at object position obj with the specular
+    /// term apart: primary front and back, specular front and back.
+    pub fn gl_light_separate(&mut self, obj: &[f32; 4]) -> ([f32; 4], [f32; 4], [f32; 3], [f32; 3]) {
+        let mut scratch = self.gl_light_scratch.take().unwrap_or_else(LightScratch::new);
+
+        scratch.restore();
+        let v = self.gl_light_fill(&mut scratch.state, obj);
+        scratch.lit = v.lit;
+        let (mut front, mut back, front_spec, back_spec) = scratch.state.light_vertex_separate(v.eye, v.normal);
+        front[3] = v.alpha;
+        back[3] = if self.geom.two_sided { v.back_alpha } else { v.alpha };
+        self.gl_light_scratch = Some(scratch);
+        (front, back, front_spec, back_spec)
+    }
+
     /// Fill `lt`, whose lights hold their initial state, from the kept
     /// words, and link the lights it sets up as the enabled ones.
     pub fn gl_light_fill(&self, lt: &mut Lighting, obj: &[f32; 4]) -> LitVertex {
@@ -731,10 +748,21 @@ impl Board {
             }
             self.assembly.colour = gl_index_rgba(self.gl_color_index);
             self.geom.colour_overridden = true;
+        } else if self.geom.lit && (self.geom.separate_specular || self.tex_regs().path & tex::MODE_SEPARATE_SPECULAR != 0) {
+            let (front, back, front_spec, back_spec) = self.gl_light_separate(&[xyz[0], xyz[1], xyz[2], 1.0]);
+            self.assembly.colour = front;
+            self.assembly.back_colour = back;
+            self.assembly.specular = front_spec;
+            self.assembly.back_specular = back_spec;
+            self.assembly.two_sided = self.geom.two_sided;
+            self.geom.colour_overridden = true;
+            return;
         } else if self.geom.lit {
             let (front, back) = self.gl_light(&[xyz[0], xyz[1], xyz[2], 1.0]);
             self.assembly.colour = front;
             self.assembly.back_colour = back;
+            self.assembly.specular = [0.0; 3];
+            self.assembly.back_specular = [0.0; 3];
             self.assembly.two_sided = self.geom.two_sided;
             self.geom.colour_overridden = true;
             return;
@@ -743,6 +771,8 @@ impl Board {
             self.geom.colour_overridden = false;
         }
         self.assembly.back_colour = self.assembly.colour;
+        self.assembly.specular = [0.0; 3];
+        self.assembly.back_specular = [0.0; 3];
         self.assembly.two_sided = false;
     }
 

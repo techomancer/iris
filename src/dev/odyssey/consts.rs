@@ -899,6 +899,9 @@ pub(super) mod ucode {
 }
 
 pub(super) mod tex {
+    /// Block 0x005 bit 19: the raster adds the separate specular colour after
+    /// texturing (GL_SEPARATE_SPECULAR_COLOR with lighting, RGBA).
+    pub const MODE_SEPARATE_SPECULAR: u32 = 1 << 19;
     pub const MODE_1D: u32 = 1 << 3;
     pub const MODE_2D: u32 = 1 << 4;
     pub const MODE_3D: u32 = 1 << 5;

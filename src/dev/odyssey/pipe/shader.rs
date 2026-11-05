@@ -37,6 +37,8 @@ pub(crate) struct ShaderState {
     /// The fog and environment colours in 12.12 (`fixed`).
     fog_colour12: [i32; 3],
     env_colour12: [i32; 4],
+    /// The separate specular colour is added after texturing.
+    pub specular: bool,
 }
 
 impl ShaderState {
@@ -56,6 +58,7 @@ impl ShaderState {
             env_colour: ec.map(|c| (c as f32 / 4095.0f32) as f64),
             fog_colour12: [0, 1, 2].map(|k| fixed::field12(fc[k] as u32)),
             env_colour12: ec.map(|c| fixed::field12_full(c as u32)),
+            specular: t.path & super::super::consts::tex::MODE_SEPARATE_SPECULAR != 0,
         }
     }
 
@@ -147,9 +150,15 @@ impl ShaderState {
     /// by the environment, fog and the alpha test. False where the fragment
     /// is dropped.
     #[inline]
-    pub fn shade12(&self, textured: bool, rgba: &mut [i32; 4], texel: &[i32; 4], zw: f64) -> bool {
+    pub fn shade12(&self, textured: bool, rgba: &mut [i32; 4], spec: &[i32; 3], texel: &[i32; 4], zw: f64) -> bool {
         if textured {
             self.apply12(self.class, texel, rgba);
+        }
+        // GL 1.2's colour sum: the separate specular after texturing.
+        if self.specular {
+            for k in 0..3usize {
+                rgba[k] = fixed::clamp(rgba[k] + spec[k]);
+            }
         }
         if self.fog {
             let f = fixed::from_f64(self.fog_factor(zw as f32) as f64);
@@ -224,5 +233,29 @@ mod tests {
         assert!(!f.test(ShaderState::alpha12(0.4999), r));
         assert_eq!(ShaderState::alpha12(1.0), 4095);
         assert!(ShaderState::of(&ShaderWords::default(), &TexRegs::default()).alpha.is_none());
+    }
+
+    /// TEX_MODE bit 19: the separate specular is added after the texture
+    /// environment (here MODULATE by a half-intensity texel), clamped; without
+    /// the bit it is not added at all.
+    #[test]
+    fn the_separate_specular_is_added_after_texturing() {
+        use super::super::super::consts::tex::MODE_SEPARATE_SPECULAR;
+        let half = fixed::ONE / 2;
+        let spec = [fixed::ONE / 4, fixed::MAX, 0];
+        let texel = [half; 4];
+        let regs = TexRegs { path: MODE_SEPARATE_SPECULAR, ..TexRegs::default() };
+        let s = ShaderState::of(&ShaderWords::default(), &regs);
+        assert!(s.specular);
+        let mut c = [fixed::MAX; 4];
+        assert!(s.shade12(true, &mut c, &spec, &texel, 0.0));
+        let mut plain = [fixed::MAX; 4];
+        let off = ShaderState::of(&ShaderWords::default(), &TexRegs::default());
+        assert!(off.shade12(true, &mut plain, &spec, &texel, 0.0));
+        // Red: the texture's product plus a quarter; green clamps; blue as
+        // without the specular.
+        assert_eq!(c[0], plain[0] + fixed::ONE / 4);
+        assert_eq!(c[1], fixed::MAX);
+        assert_eq!(c[2], plain[2]);
     }
 }

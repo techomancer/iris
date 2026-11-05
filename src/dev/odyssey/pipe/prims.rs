@@ -286,6 +286,7 @@ fn vertex_at(a: &RasterVertex, b: &RasterVertex, t: f64) -> RasterVertex {
         inv_w: (1.0 - t) * a.inv_w + t * b.inv_w,
         depth_w: (1.0 - t) * a.depth_w + t * b.depth_w,
         rgba: std::array::from_fn(|k| (wa * a.rgba[k] + wb * b.rgba[k]) / sum),
+        spec: std::array::from_fn(|k| (wa * a.spec[k] + wb * b.spec[k]) / sum),
         tex: std::array::from_fn(|k| (wa * a.tex[k] + wb * b.tex[k]) / sum),
         clip: std::array::from_fn(|k| (wa * a.clip[k] + wb * b.clip[k]) / sum),
     }
@@ -778,16 +779,25 @@ impl Draw<'_> {
         }
         let mode = ps.modes[if front { 0 } else { 1 }];
         let back = !front && self.xf.back_colours;
+        // The fragment paths below take the colour sum before shading: only
+        // filled triangles carry the separate specular to the shader.
+        let (colour_at, spec_at) = if back { (vtx::BACK_COLOR, vtx::BACK_SPECULAR) } else { (vtx::COLOR, vtx::SPECULAR) };
+        let summed = |attr: &[f32]| -> [f64; 4] {
+            [0, 1, 2, 3].map(|k| {
+                let s = if k < 3 { attr[spec_at + k] } else { 0.0 };
+                // max then min, as project's: a NaN colour becomes 0.
+                #[allow(clippy::manual_clamp, reason = "clamp would keep a NaN")]
+                let c = (attr[colour_at + k] + s).max(0.0).min(1.0);
+                c as f64
+            })
+        };
         match mode {
             PolygonMode::Fill if ps.polygon_smooth => {
-                let flat = &provoking[if back { vtx::BACK_COLOR } else { vtx::COLOR }..][..4];
-                if back {
-                    for (r, cv) in v.iter_mut().zip(&poly[..n]) {
-                        r.rgba = [0, 1, 2, 3].map(|k| cv.attr[vtx::BACK_COLOR + k].clamp(0.0, 1.0) as f64);
-                    }
+                for (r, cv) in v.iter_mut().zip(&poly[..n]) {
+                    r.rgba = summed(&cv.attr);
                 }
                 let steps = if ps.offset_fill { ps.offset_steps } else { 0 };
-                self.polygon_coverage(&v, [0, 1, 2, 3].map(|k| flat[k] as f64), steps);
+                self.polygon_coverage(&v, summed(provoking), steps);
             }
             PolygonMode::Fill => {
                 // The fan again, from the draw's own vertices, as filled
@@ -804,11 +814,12 @@ impl Draw<'_> {
                 };
                 let mut flat = [0.0f32; vtx::FLOATS];
                 flat.copy_from_slice(&provoking[..vtx::FLOATS]);
-                if back {
-                    flat.copy_within(vtx::BACK_COLOR..vtx::BACK_COLOR + 4, vtx::COLOR);
-                    for (r, cv) in v.iter_mut().zip(&poly[..n]) {
-                        r.rgba = [0, 1, 2, 3].map(|k| cv.attr[vtx::BACK_COLOR + k].clamp(0.0, 1.0) as f64);
-                    }
+                let sum = summed(provoking);
+                for k in 0..4 {
+                    flat[vtx::COLOR + k] = sum[k] as f32;
+                }
+                for (r, cv) in v.iter_mut().zip(&poly[..n]) {
+                    r.rgba = summed(&cv.attr);
                 }
                 let steps = if (line && ps.offset_line) || (!line && ps.offset_point) { ps.offset_steps } else { 0 };
                 let mut stipple = LineStipple { enabled: ps.stipple, repeat: ps.stipple_repeat.clamp(1, 256), pattern: ps.stipple_pattern, ..Default::default() };
