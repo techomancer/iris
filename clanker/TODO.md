@@ -125,6 +125,15 @@ condition; update the linked guide and changelog when it lands.
 
 ## Graphics
 
+- [ ] **Implementation — VPro quad worker pool.** Balance shading and stores over a pool fed by the rasteriser in batches of ~16 quads, the rasteriser running a quad itself when the pool is dry, in-order completion by atomics per 8x8-grid position. See `clanker/plans/odyssey-quad-pipeline.md`, "Idea: a quad worker pool".
+- [ ] **Implementation — VPro memory access, specialised.** Board-memory
+  access goes through run-time field decoding per pixel (`odyssey/view.rs`).
+  Monomorphise by field kind and pixel size, address quads from one tile
+  base and spans by tile runs, keep the branchy path as the reference.
+  Done when the specialised paths match it bit-exact and the Quake replay
+  time is measured against it. Plan: `clanker/plans/odyssey-board-memory.md`
+  (follow-ups).
+
 - [ ] **Implementation — IMPACT buffer formats and 3D state.** Landed since
   the 2026-10-07 review: DRBpointers' second buffer (`[19:10]`), 12-bit RGB
   double buffering in the halves of one word, colour-index double buffering

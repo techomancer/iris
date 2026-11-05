@@ -48,6 +48,9 @@
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code
 //! (hw/display/sgi/) in jamesbraid/qemu-sgi-origami.
 
+// The crate allows dead code; this board's code does not hide any.
+#![warn(dead_code, unused_imports)]
+
 // The rasteriser writes its range tests as !(x > 0.0) and the like so that
 // a NaN fails them.
 #![allow(clippy::neg_cmp_op_on_partial_ord, reason = "a NaN must fail these tests")]
@@ -57,39 +60,39 @@ mod board;
 mod command;
 mod consts;
 mod context;
+mod copy;
+mod debug;
 mod depth_word;
 mod display;
 #[cfg(test)]
 mod display_bench;
 mod dma;
 mod draw;
+mod field;
 mod fifo;
+mod frame;
 #[cfg(test)]
 mod golden;
 mod geometry;
 mod gl;
-mod gl_context;
+mod assembly;
 mod interface;
-mod memory;
+mod clip;
+mod logic;
 mod mmio;
-mod objects;
 mod pixel_dma;
+mod pipe;
 mod pixel_write;
-mod raster;
 #[cfg(test)]
 mod raster_bench;
-mod raster_fill;
-mod raster_fixed_texture;
-mod raster_line;
-mod raster_pixels;
-mod raster_texture;
-mod raster_triangle;
 mod raster_unit;
 mod record;
 mod reader;
 mod registers;
-mod sampler;
 mod scanout;
+mod trace;
+mod view;
+mod vram;
 mod worker;
 #[cfg(test)]
 mod tests;
@@ -100,7 +103,6 @@ use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
 
-use crate::cpu::mips_core::CyclesPtr;
 use crate::ip30::{widget_large_base, widget_small_base};
 use crate::irq::InterruptController;
 use crate::traits::{
@@ -110,11 +112,10 @@ use crate::traits::{
 
 use board::Board;
 use consts::ODSY_APERTURE;
-use display::{Display, ScanoutJob};
+use display::Display;
 use fifo::set_display_fifo_pending;
 use mmio::BoardLocks;
-use reader::ScanoutReader;
-use scanout::{monotonic_ns, DirtyStats};
+use scanout::monotonic_ns;
 
 /// The VPro board on widget `slot`: a `BusDevice` for the widget's
 /// windows.
@@ -125,8 +126,6 @@ pub struct Odyssey {
     display: Arc<Display>,
     running: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
-    /// `IRIS_ODSY_REC`: the recording of the bus accesses (record.rs).
-    rec: Option<record::RecHandle>,
 }
 
 impl Odyssey {
@@ -138,26 +137,33 @@ impl Odyssey {
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
         status: Arc<crate::disp::StatusSource>,
+        pool: (usize, u32),
     ) -> Result<Arc<Self>, String> {
         let mut s = Board::new(product, widget as u32)?;
-        let rec = match std::env::var("IRIS_ODSY_REC") {
+        // The fragment pipeline's workers and tile size (`[graphics]`).
+        s.raster.set_pool(pool.0, pool.1);
+        // The recorder's slot is there whether or not a recording runs, so
+        // the monitor can start one (`vpro rec`); the DMA path records
+        // through it.
+        let rec = record::RecSlot::new(match std::env::var("IRIS_ODSY_REC") {
             Ok(path) => Some(record::Recorder::create(&path).map_err(|e| format!("IRIS_ODSY_REC {path}: {e}"))?),
             Err(_) => None,
-        };
-        let mem: Arc<dyn BusDevice> = match &rec {
-            Some(r) => Arc::new(record::RecordingMem { inner: mem, rec: r.clone() }),
-            None => mem,
-        };
+        });
+        let mem: Arc<dyn BusDevice> = Arc::new(record::RecordingMem { inner: mem, rec: rec.clone() });
         s.guest = Some(mem);
         s.front.lock().irq = Some(irq);
+        if let Ok(path) = std::env::var("IRIS_ODSY_TRACE") {
+            s.trace.start(&path, trace::TRACE_ALL).map_err(|e| format!("IRIS_ODSY_TRACE {path}: {e}"))?;
+        }
+        let mut state = BoardLocks::new(s);
+        state.rec = rec;
         Ok(Arc::new(Self {
             small: widget_small_base(widget),
             large: widget_large_base(widget),
-            state: BoardLocks::new(s),
+            state,
             display: Arc::new(Display::new(status)),
             running: Arc::new(AtomicBool::new(false)),
             thread: Mutex::new(None),
-            rec,
         }))
     }
 
@@ -176,12 +182,7 @@ impl Odyssey {
     fn read(&self, addr: u64, size: u32) -> (u32, u64) {
         match self.offset(addr) {
             Some(off) => match self.state.bus_read(off, size) {
-                Some(v) => {
-                    if let Some(r) = &self.rec {
-                        r.lock().read(size as u8, off as u32, v);
-                    }
-                    (BUS_OK, v)
-                }
+                Some(v) => (BUS_OK, v),
                 None => (BUS_BUSY, 0),
             },
             None => (BUS_ERR, 0),
@@ -191,13 +192,7 @@ impl Odyssey {
     fn write(&self, addr: u64, size: u32, val: u64) -> u32 {
         match self.offset(addr) {
             Some(off) => {
-                // The recording lock is held across the store and its record,
-                // so records come out in the order the stores were taken.
-                let rec = self.rec.as_ref().map(|r| r.lock());
                 if self.state.bus_write(off, val, size) {
-                    if let Some(mut r) = rec {
-                        r.write(size as u8, off as u32, val);
-                    }
                     BUS_OK
                 } else {
                     BUS_BUSY
@@ -207,61 +202,29 @@ impl Odyssey {
         }
     }
 
-    /// One display frame: the retrace if it is due, then the dirty lines
-    /// resolved and, if any changed (or a refresh is due), presented. The
-    /// retrace fires either way.
+    /// One display frame: the retrace if it is due, then the whole frame
+    /// composed from board memory as the scan-out registers describe it
+    /// (frame.rs), and presented. The display takes no board lock and waits
+    /// for no drawing: it reads memory while the raster unit and the front
+    /// end write it, as the board's own scan-out does.
     fn frame(state: &BoardLocks, display: &Display) {
         crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
+        state.trace.flush(false);
         let mut reader = display.reader.lock();
         reader.attach(&state.shared);
-        reader.recycle_last();
-        // The display takes no board lock and waits for no drawing. It
-        // reads the planes while the raster unit and the front end write
-        // them, as the other graphics boards' displays do: a row copied
-        // half-written is wrong for one frame, then marked again by its
-        // writer and copied whole (reader.rs).
         reader.poll(monotonic_ns());
-        let copy = std::time::Instant::now();
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
-        reader.stage();
+        let composed = reader.update();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
-        reader.stats.copied(copy.elapsed());
-        let mut job = reader.take();
-        if let Some(job) = &mut job {
-            job.resolve();
-        }
-        let span = job.as_mut().and_then(|job| reader.commit(job));
-        Self::present_frame(state, display, reader, job, span);
-    }
-
-    /// The end of a frame: hand the committed lines to the window.
-    fn present_frame(state: &BoardLocks, display: &Display, mut reader: parking_lot::MutexGuard<'_, ScanoutReader>, job: Option<ScanoutJob>, span: Option<(usize, usize)>) {
         let (w, h) = (reader.frame_width as usize, reader.frame_height as usize);
-        if w == 0 || h == 0 || reader.frame.len() < w * h {
-            reader.keep(job);
-            crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-            return;
-        }
-        // A new size has nothing valid on the screen yet: take every line.
-        let new_size = display.shown() != (w, h);
-        if !display.due(new_size || span.is_some()) {
-            reader.keep(job);
-            crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-            return;
-        }
-        // Only a new size copies the frame whole; otherwise the committed
-        // lines are converted from the update's own rows.
-        let whole = new_size.then(|| reader.frame[..w * h].to_vec());
         set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
-        crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
-        match (&whole, &job) {
-            (Some(rows), _) => display.present(rows, w, h, 0),
-            (None, Some(job)) => display.present_lines(job.lines(), w, h),
-            (None, None) => display.present(&[], w, h, 0),
+        if !composed || w == 0 || h == 0 || !display.due(true) {
+            return;
         }
+        crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
+        display.present(&reader.frame[..w * h], w, h, 0);
         crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
-        reader.keep(job);
     }
 }
 
@@ -303,27 +266,17 @@ impl Device for Odyssey {
     fn step(&self, _cycles: u64) {}
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("vpro".to_string(), "VPro counters: vpro refusals [reset] (bus refusals by reason and register), vpro dirty [reset] (display)".to_string())]
+        vec![(
+            "vpro".to_string(),
+            "VPro (Odyssey) graphics: status|regs|fifo|state|geom|tex|win|mem|backend|lut|dispmode|cursor|pix|raw|peek|shot|fbdump|hash|unimp|refusals|trace|rec (vpro help)".to_string(),
+        )]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         if cmd != "vpro" {
             return Err(format!("unknown command: {cmd}"));
         }
-        match args {
-            ["refusals"] => self.state.refusals.report(&mut *w).map_err(|e| e.to_string()),
-            ["refusals", "reset"] => {
-                self.state.refusals.reset();
-                Ok(())
-            }
-            ["dirty"] => self.display.reader.lock().stats.report(&self.state.shared.marks, &mut *w).map_err(|e| e.to_string()),
-            ["dirty", "reset"] => {
-                self.display.reader.lock().stats = DirtyStats::default();
-                self.state.shared.marks.reset_sites();
-                Ok(())
-            }
-            _ => Err("Usage: vpro refusals [reset] | vpro dirty [reset]".to_string()),
-        }
+        self.cmd_vpro(args, &mut *w)
     }
 
     fn start(&self) {
@@ -388,6 +341,13 @@ impl Resettable for Odyssey {
     fn power_on(&self) {
         // SAFETY: power-on comes before the machine starts the board's
         // threads and the processors.
-        unsafe { &mut *self.state.board.get() }.reset();
+        let b = unsafe { &mut *self.state.board.get() };
+        b.reset();
+        // A power-on recording opens with the state the replay starts from.
+        if self.state.rec.active() {
+            if let Some(r) = self.state.rec.lock().as_mut() {
+                r.mark(debug::memory_hash_bytes(b));
+            }
+        }
     }
 }

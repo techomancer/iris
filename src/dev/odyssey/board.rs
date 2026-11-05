@@ -4,18 +4,18 @@
 //! Ported from include/hw/misc/sgi-odyssey.h in jamesbraid/qemu-sgi-origami.
 
 use super::consts::{
-    clip, config, flctl, gl_cmd, intr, nic, tex, write, ODSY_CONTROL_WIDGET_MASK, ODSY_DEPTH24_MAX,
+    clip, config, flctl, gl_cmd, intr, nic, write, ODSY_CONTROL_WIDGET_MASK,
     ODSY_DEPTH_FUNC_RESET, ODSY_DRAW_MASK_RESET, ODSY_F32_ONE, ODSY_F32_POINT_EIGHT,
     ODSY_F32_POINT_TWO, ODSY_XT_REQ_TIMEOUT_RESET,
 };
 use super::fifo::CommandFifo;
 use super::geometry::LightScratch;
-use super::gl_context::{op, vtx, GL_CLIP_PLANES, GL_MODELVIEW, GL_SCISSOR_TEST, GlContext, GlDrawable};
+use super::assembly::{vtx, Assembly, CLIP_PLANES};
 use super::interface::HostInterface;
-use super::memory::{BoardMemory, ClipRect, Packing, Plane, PlaneFormat};
+use super::clip::ClipRect;
 use super::pixel_dma::GuestMemory;
 use super::raster_unit::RasterQueue;
-use super::reader::{DisplayShared, PlaneView};
+use super::reader::DisplayShared;
 use super::scanout::Scanout;
 #[cfg(test)]
 use super::reader::ScanoutReader;
@@ -34,22 +34,20 @@ pub(super) const ODSY_CMD_OPERANDS_MAX: u32 = 16;
 /// The window-clip register's four rectangles, two words each.
 pub(super) const ODSY_CLIP_RECTS: u32 = 4;
 
+/// The polygon-mode word 0x415 out of reset: fill for both faces, the GL
+/// default the library sends at make-current (the board's own reset value
+/// is not established).
+pub(super) const ODSY_POLYGON_MODE_RESET: u32 = 2 << 2 | 2;
+
+/// The line-width and point-size words 0x84a out of reset: 1.0 times 128,
+/// the GL default (the board's own reset value is not established).
+pub(super) const ODSY_LINE_POINT_RESET: u32 = 128;
+
 /// Geometry engine program state: constant-memory entries an 11-bit index
 /// reaches.
 pub(super) const ODSY_GL_CONSTANTS: u32 = 2048;
-/// Off-screen board-memory objects the model keeps (texture levels). A
-/// model budget, not a board limit: TyrQuake holds some 1,500 levels at once
-/// and samples its oldest every frame, which a table of 1024 forgot.
-pub(super) const ODSY_OBJECTS: u32 = 16384;
-/// The slices of one volume texture a draw samples (Board::texture_setup()).
-pub(super) const ODSY_VOLUME_SLICES: u32 = 1024;
-pub(super) const ODSY_OBJ_POOL_BYTES: usize = 128 * 1024 * 1024;
-pub(super) const ODSY_OBJ_POOL_WORDS: usize = ODSY_OBJ_POOL_BYTES / 4;
-pub(super) const ODSY_OBJ_VALID_BYTES: usize = ODSY_OBJ_POOL_WORDS / 8;
 /// The texture level table's entries (0x0e80 .. 0x0ebf).
 pub(super) const ODSY_TEX_LEVELS: u32 = 64;
-pub(super) const ODSY_TEX_COLOUR_TABLE_ENTRIES: u32 = 256;
-pub(super) const ODSY_TEX_DETAIL_FUNCTION_ENTRIES: u32 = 256;
 pub(super) const ODSY_GL_ENTRIES: u32 = 4;
 pub(super) const ODSY_GL_LIGHTS: u32 = 8;
 pub(super) const ODSY_GL_LIGHT_COLOURS: u32 = 25;
@@ -85,6 +83,8 @@ pub(super) struct Reports {
     pub obj_forget_reported: bool,
     pub board_oob_reported: bool,
     pub tex_rect_reported: bool,
+    /// pipe::texture::unimplemented bits reported.
+    pub tex_unimplemented: u32,
     pub gl_aux_reported: bool,
     pub aux_mask_reported: bool,
     /// A rectangle copy with exactly one base at the id-plane base was
@@ -121,45 +121,10 @@ pub(super) struct Reports {
     pub dma_read_reported: u32,
 }
 
-/// The board-memory objects (ODSY_OBJ_POOL_BYTES): off-screen images,
-/// textures and saved state.
-pub(super) struct Objects {
-    // The board-memory objects (ODSY_OBJ_POOL_BYTES).
-    pub mem: BoardMemory,
-    pub count: u32,
-    pub used: u32,
-    pub base: Vec<u32>,
-    /// obj_base inverted, base to index + 1 (Board::object_find()).
-    pub index: std::collections::HashMap<u32, u32>,
-    pub width: Vec<u32>,
-    pub offset: Vec<u32>,
-    pub rows: Vec<u32>,
-    /// When each object was last selected or grown (obj_clock's count).
-    pub stamp: Vec<u64>,
-    pub clock: u64,
-    /// ODSY_OBJ_VALID_BYTES bytes.
-    pub valid: Vec<u8>,
-}
-
-/// The texture state words as last pushed.
+/// The vertex side's texture registers: the current texture coordinate
+/// and the linear texgen planes. The fragment side's are in the draw state
+/// slots (pipe::texture::TexRegs).
 pub(super) struct TexState {
-    // The texture state words as last pushed.
-    pub mode: u32,
-    pub sampler: [u32; 7],
-    pub colour_table: [[u32; ODSY_TEX_COLOUR_TABLE_ENTRIES as usize]; 2],
-    pub colour_table_valid: [u32; 2],
-    pub detail_function: [u32; ODSY_TEX_DETAIL_FUNCTION_ENTRIES as usize],
-    pub detail_function_valid: u32,
-    pub env: [u32; 5],
-    pub levels: [u32; (ODSY_TEX_LEVELS * 3) as usize],
-    pub slice_offset: [u32; (ODSY_VOLUME_SLICES + 2) as usize],
-    pub slice_width: [u32; (ODSY_VOLUME_SLICES + 2) as usize],
-    pub level0: u32,
-    pub lod: [u32; 4],
-    /// The 0x203b post-filter scale and bias words, R, G, B, A.
-    pub scale_bias: [u32; 8],
-    /// The 0x0c3e texture offset words.
-    pub offset: [u32; 3],
     pub coord: [u32; 2],
     pub coord_r: u32,
     pub coord_q: u32,
@@ -323,7 +288,7 @@ pub(super) struct Geometry {
     /// The model-view (slot 0x24), row-major float bits as sent.
     pub modelview: [u32; 16],
     /// The user clip planes in eye coordinates, four floats' bits a plane.
-    pub clip_eye: [u32; (GL_CLIP_PLANES * 4) as usize],
+    pub clip_eye: [u32; (CLIP_PLANES * 4) as usize],
     pub lit: bool,
     pub local_viewer: bool,
     /// The geometry program renormalises transformed normals.
@@ -338,26 +303,6 @@ pub(super) struct Geometry {
     pub program_half: u32,
     /// Derived from the retained program list.
     pub linear_texgen: u32,
-}
-
-/// The board's planes: colour buffers, depth, stencil, drawable id and
-/// overlay. The raster unit owns them while it has jobs (raster_unit.rs).
-pub(super) struct Planes {
-    /// Colour buffer 0's RGBA8 plane over the shared board memory.
-    pub colour: BoardMemory,
-    /// The id BoardMemory::add_plane returned.
-    pub colour_plane: u32,
-    /// The second colour buffer (buffer 1 in the displayed-buffer sense).
-    pub buffer1: BoardMemory,
-    pub buffer1_plane: u32,
-    /// The per-pixel drawable-id plane, one byte per framebuffer pixel.
-    pub did: Vec<u8>,
-    /// The overlay pixel byte beside each id byte; same lifetime as did.
-    pub overlay: Vec<u8>,
-    pub depth: BoardMemory,
-    pub depth_plane: u32,
-    pub stencil: BoardMemory,
-    pub stencil_plane: u32,
 }
 
 /// The 2D stream's GL immediate-mode subset, the X server's and greeter's
@@ -437,26 +382,30 @@ pub(super) struct Board {
     /// Diagnostic bookkeeping, not guest state: what has been reported once.
     pub diag: Reports,
 
-    /// The board's planes: colour buffers, depth, stencil, drawable id
-    /// and overlay. The raster unit owns them while it has jobs
-    /// (raster_unit.rs).
-    pub planes: Planes,
-
     // Buffer selection.
     pub draw_mask: u32,
     pub draw_word: u32,
     pub read_word: u32,
 
-    /// The board-memory objects (ODSY_OBJ_POOL_BYTES): off-screen images,
-    /// textures and saved state.
-    pub objects: Objects,
     pub dest_base: u32,
 
-    /// The texture state words as last pushed.
+    /// The board's memory (vram.rs), the strap's size.
+    pub vram: super::vram::Vram,
+    /// The pixel mode, block 0x017, as last written: origin, stride,
+    /// status, coarse-Z origin. Every drawing's destination.
+    pub pixel_mode: [u32; 4],
+    /// Board::dest_views() for the words it was built from.
+    pub dest_cache: std::cell::Cell<Option<([u32; 6], super::view::DestViews)>>,
+
+    /// The draw state slots: the fragment side's texture registers.
+    pub slots: super::pipe::slot::Slots,
+    /// The vertex side's texture registers.
     pub tex: TexState,
     pub dma_seq: u64,
     /// Monotonic for this device instance.
     pub trace_sequence: std::sync::atomic::AtomicU64,
+    /// The annotated trace (trace.rs), shared with the bus side.
+    pub trace: std::sync::Arc<super::trace::Trace>,
 
     /// Tests: the next slice on the board's thread first sleeps this long.
     #[cfg(test)]
@@ -479,14 +428,10 @@ pub(super) struct Board {
     pub stream: Stream2d,
 
     // The true-colour OpenGL path.
-    /// The GL context. During Board::gl_command() it runs outside the board
-    /// and this holds a stand-in (`gl_spare`), which the draws that command
-    /// emits must not reach.
-    pub gl_ctx: Box<GlContext>,
-    /// The stand-in for `gl_ctx` while a command runs; None during one.
-    pub gl_spare: Option<Box<GlContext>>,
-    /// The drawable Board::gl_bind() last built for the shared context.
-    pub gl_bind_drawable: GlDrawable,
+    /// Primitive assembly and the transform state its pieces are drawn
+    /// under. Board::assemble() takes it out of the board while a piece
+    /// draws.
+    pub assembly: Assembly,
     /// The lighting state Board::gl_light() keeps between vertices; None
     /// until the first lit vertex.
     pub gl_light_scratch: Option<Box<LightScratch>>,
@@ -501,6 +446,16 @@ pub(super) struct Board {
     // Depth.
     pub gl_depth_func: u32,
     pub gl_write_mask: u32,
+    /// The alpha-test word 0x41e, the stencil word 0x41f, the logic-op word
+    /// 0x422, the polygon-mode word 0x415, the polygon-offset word 0x458 and
+    /// the line-width and point-size words 0x84a, as last written: the
+    /// fragment pipeline reads them as they are (pipe/state.rs).
+    pub alpha_word: u32,
+    pub stencil_word: u32,
+    pub logic_op_word: u32,
+    pub polygon_mode_word: u32,
+    pub polygon_offset_word: u32,
+    pub line_point_words: [u32; 2],
     pub gl_combined: [u32; 16],
     pub gl_block16: [u32; 4],
 
@@ -521,18 +476,6 @@ pub(super) struct Board {
 
     pub dest_buffer_word: u32,
     pub plane_write_mask: u32,
-
-    /// The colour buffer's base: the first operand of the last colour 0x1017
-    /// block (0x2000 for the screen).
-    pub dma_colour_base: u32,
-    /// The first colour buffer the X server selected: the screen's. A pixel
-    /// buffer's select can look the same, and moves dma_colour_base.
-    pub screen_base: u32,
-
-    // The screen-to-screen copy command's fixed literal template's three runtime slots.
-    pub copy_src: u32,
-    pub copy_size: u32,
-    pub copy_dst: u32,
 
     /// 0x0c21 operands 1 and 2, the constant colour.
     pub const_colour: [u32; 2],
@@ -556,7 +499,7 @@ impl Default for Board {
         let front: std::sync::Arc<parking_lot::Mutex<HostInterface>> = Default::default();
         let fifo = front.lock().fifo.clone();
         let raster: std::sync::Arc<RasterQueue> = Default::default();
-        let shared = std::sync::Arc::new(DisplayShared::new(Default::default(), front.clone(), raster.clone()));
+        let shared = std::sync::Arc::new(DisplayShared::new(front.clone()));
         let scanout = Scanout::new(shared);
         Board {
             slot: 0,
@@ -610,6 +553,7 @@ impl Default for Board {
                 obj_forget_reported: false,
                 board_oob_reported: false,
                 tex_rect_reported: false,
+                tex_unimplemented: 0,
                 gl_aux_reported: false,
                 aux_mask_reported: false,
                 copy_mixed_base_reported: false,
@@ -642,50 +586,15 @@ impl Default for Board {
                 dma_code_reported: false,
                 dma_read_reported: 0,
             },
-            planes: Planes {
-                colour: Default::default(),
-                colour_plane: 0,
-                buffer1: Default::default(),
-                buffer1_plane: 0,
-                did: Vec::new(),
-                overlay: Vec::new(),
-                depth: Default::default(),
-                depth_plane: 0,
-                stencil: Default::default(),
-                stencil_plane: 0,
-            },
             draw_mask: 0,
             draw_word: 0,
             read_word: 0,
-            objects: Objects {
-                mem: Default::default(),
-                count: 0,
-                used: 0,
-                base: vec![0; ODSY_OBJECTS as usize],
-                index: Default::default(),
-                width: vec![0; ODSY_OBJECTS as usize],
-                offset: vec![0; ODSY_OBJECTS as usize],
-                rows: vec![0; ODSY_OBJECTS as usize],
-                stamp: vec![0; ODSY_OBJECTS as usize],
-                clock: 0,
-                valid: vec![0; ODSY_OBJ_VALID_BYTES],
-            },
             dest_base: 0,
+            vram: Default::default(),
+            pixel_mode: [0; 4],
+            dest_cache: Default::default(),
+            slots: Default::default(),
             tex: TexState {
-                mode: 0,
-                sampler: [0; 7],
-                colour_table: [[0; ODSY_TEX_COLOUR_TABLE_ENTRIES as usize]; 2],
-                colour_table_valid: [0; 2],
-                detail_function: [0; ODSY_TEX_DETAIL_FUNCTION_ENTRIES as usize],
-                detail_function_valid: 0,
-                env: [0; 5],
-                levels: [0; (ODSY_TEX_LEVELS * 3) as usize],
-                slice_offset: [0; (ODSY_VOLUME_SLICES + 2) as usize],
-                slice_width: [0; (ODSY_VOLUME_SLICES + 2) as usize],
-                level0: 0,
-                lod: [0; 4],
-                scale_bias: [0; 8],
-                offset: [0; 3],
                 coord: [0; 2],
                 coord_r: 0,
                 coord_q: 0,
@@ -696,6 +605,7 @@ impl Default for Board {
             },
             dma_seq: 0,
             trace_sequence: std::sync::atomic::AtomicU64::new(0),
+            trace: Default::default(),
             #[cfg(test)]
             test_slice_sleep_ms: 0,
             query: Query {
@@ -752,9 +662,7 @@ impl Default for Board {
                 pattern_mode: 0,
                 pattern_load_offset: 0,
             },
-            gl_ctx: Box::default(),
-            gl_spare: Some(Box::default()),
-            gl_bind_drawable: Default::default(),
+            assembly: Assembly::default(),
             gl_light_scratch: None,
             prim: OpenPrimitive {
                 in_prim: false,
@@ -782,6 +690,12 @@ impl Default for Board {
             gl_rect: [0; 10],
             gl_depth_func: 0,
             gl_write_mask: 0,
+            alpha_word: 0,
+            stencil_word: 0,
+            logic_op_word: 0,
+            polygon_mode_word: ODSY_POLYGON_MODE_RESET,
+            polygon_offset_word: 0,
+            line_point_words: [ODSY_LINE_POINT_RESET; 2],
             gl_combined: [0; 16],
             gl_block16: [0; 4],
             gl_clip_box: [0; 2],
@@ -803,7 +717,7 @@ impl Default for Board {
                 normal_matrix: [0; 16],
                 colour: [0; 4],
                 modelview: [0; 16],
-                clip_eye: [0; (GL_CLIP_PLANES * 4) as usize],
+                clip_eye: [0; (CLIP_PLANES * 4) as usize],
                 lit: false,
                 local_viewer: false,
                 normalize: false,
@@ -819,11 +733,6 @@ impl Default for Board {
             colour_mode: [0; 2],
             dest_buffer_word: 0,
             plane_write_mask: 0,
-            dma_colour_base: 0,
-            screen_base: 0,
-            copy_src: 0,
-            copy_size: 0,
-            copy_dst: 0,
             const_colour: [0; 2],
             blend_word: 0,
             image: ImageRaster {
@@ -1034,42 +943,12 @@ impl Board {
         self.diag.gl_index_lit_reported = false;
         self.dest_buffer_word = 0;
         self.plane_write_mask = 0;
-        self.dma_colour_base = 0;
-        self.screen_base = 0;
         self.dest_base = 0;
-        self.objects.count = 0;
-        self.objects.used = 0;
-        self.objects.base.fill(0);
-        self.objects.index.clear();
-        self.objects.width.fill(0);
-        self.objects.offset.fill(0);
-        self.objects.rows.fill(0);
-        self.objects.stamp.fill(0);
-        self.objects.clock = 0;
-        self.objects.valid.fill(0);
+        self.pixel_mode = [0; 4];
         self.diag.obj_full_reported = false;
         self.diag.obj_forget_reported = false;
         self.diag.board_oob_reported = false;
-        self.tex.mode = 0;
-        self.tex.sampler = [0; 7];
-        for t in self.tex.colour_table.iter_mut() {
-            t.fill(0);
-        }
-        self.tex.colour_table_valid = [0; 2];
-        self.tex.detail_function.fill(0);
-        self.tex.detail_function_valid = 0;
-        self.tex.env = [0; 5];
-        self.tex.levels.fill(0);
-        self.tex.level0 = 0;
-        self.tex.lod[0] = 0;
-        self.tex.lod[1] = 0;
-        self.tex.lod[2] = 0x3100;
-        self.tex.lod[3] = 0x0f00;
-        for c in 0..4usize {
-            self.tex.scale_bias[c * 2] = tex::SCALE_BIAS_ONE;
-            self.tex.scale_bias[c * 2 + 1] = 0;
-        }
-        self.tex.offset = [0; 3];
+        *self.tex_mut() = super::pipe::texture::TexRegs::default();
         self.tex.coord = [0; 2];
         self.tex.coord_r = 0;
         self.tex.coord_q = ODSY_F32_ONE;
@@ -1084,23 +963,10 @@ impl Board {
         self.stream.poly_row_lo = ODSY_HEIGHT;
         self.stream.poly_row_hi = 0;
         self.stream.poly_col_lo = ODSY_WIDTH;
-        // The shared GL context to OpenGL's initial state (identity matrices,
-        // white current colour, depth test off), unbound until the first GL
-        // command binds the drawable. A guest reset can land mid-primitive, with
-        // an open polygon's vertex buffer still allocated; GlContext::reset() frees
-        // it before reinitializing. It is safe here even before Board::allocate
-        // allocates the colour plane. Its viewport starts empty: nothing is
-        // drawn until the client's combined matrix arrives.
-        self.gl().reset(gl_cmd::CONTEXT_HW_ID);
-        {
-            // Opt into the shared context's per-face polygon modes (0x0415) and
-            // line stipple: unset, it silently keeps every face at legacy FILL
-            // no matter what 0x0415 decodes to. GlContext::reset() above has
-            // already cleared in_begin, the one precondition, even when reset
-            // lands mid-primitive.
-            assert!(self.gl().enable_polygon_modes());
-            assert!(self.gl().enable_line_stipple());
-        }
+        // Primitive assembly starts over: identity matrices, white, no
+        // primitive open (a reset can land inside one). Its viewport starts
+        // empty: nothing is drawn until the client's combined matrix arrives.
+        self.assembly.reset(gl_cmd::CONTEXT_HW_ID);
         self.prim.in_prim = false;
         self.prim.begin_open = false;
         self.prim.integer_prim = false;
@@ -1117,22 +983,12 @@ impl Board {
         self.prim.restart_m3 = 0;
         self.prim.restart_m4 = 0;
         self.prim.restart_armed = false;
-        // The clip box and its scissor test: GlContext::init() leaves the shared
-        // context's scissor box and test both at zero, which would clip away
-        // every draw if the test were simply switched on. There is no reset
-        // pattern-mode value that already matches a usable scissor default, so
-        // the full window is set here explicitly before the test is enabled,
-        // once and for good.
+        // The clip box, which is always the scissor: the whole window until
+        // the client sends one.
         self.gl_clip_box[0] = clip::BOX_FIELD_MASK & (ODSY_WIDTH - 1);
         self.gl_clip_box[1] = clip::BOX_FIELD_MASK & (ODSY_HEIGHT - 1);
         self.gl_fog = [0; 6];
-        self.gl_apply_clip_box();
-        {
-            let scissor_test = GL_SCISSOR_TEST;
-
-            self.gl_feed(op::ENABLE as u16, &[scissor_test]);
-        }
-        self.gl_matrix_slot = GL_MODELVIEW;
+        self.gl_matrix_slot = gl_cmd::SLOT_MODELVIEW;
         self.geom.modelview = [0; 16];
         for i in 0..4usize {
             self.geom.modelview[i * 5] = ODSY_F32_ONE;
@@ -1146,6 +1002,14 @@ impl Board {
         self.gl_rect = [0; 10];
         self.gl_depth_func = ODSY_DEPTH_FUNC_RESET;
         self.gl_write_mask = write::MASK_RESET;
+        // The library sends these at make-current; their reset values are not
+        // established, so they start at what encodes GL's defaults.
+        self.alpha_word = 0;
+        self.stencil_word = 0;
+        self.logic_op_word = 0;
+        self.polygon_mode_word = ODSY_POLYGON_MODE_RESET;
+        self.polygon_offset_word = 0;
+        self.line_point_words = [ODSY_LINE_POINT_RESET; 2];
         self.gl_combined = [0; 16];
         // The identity projection's (-0, -0, -0, 1): the depth row unflipped.
         self.gl_block16[0] = 0x80000000;
@@ -1214,10 +1078,6 @@ impl Board {
         self.diag.ctx_open_prim_logged = false;
         self.diag.ctx_shadow_fail_reported = false;
         self.diag.gl_dither_reported = false;
-        self.scanout.shared.group25.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.copy_src = 0;
-        self.copy_size = 0;
-        self.copy_dst = 0;
         self.stream.pattern_buffer = [0; 32];
         self.stream.pattern_shape = 0;
         self.const_colour = [0; 2];
@@ -1276,6 +1136,59 @@ pub(super) static PRODUCTS: [Product; 4] = [
 ];
 
 impl Board {
+    /// The board's memory as the units that draw reach it.
+    pub fn vram_ptr(&self) -> super::vram::VramPtr {
+        self.vram.ptr_shared()
+    }
+
+#[cfg(test)]
+    /// The board as the X server leaves it at depth 24 on a 128 MB board,
+    /// for tests and benchmarks that draw without a guest: the scan-out at
+    /// 1280 x 1024 over a 16-byte frame buffer at 0x2000 and the window-id
+    /// buffer after it, window id 0 a double-buffered 8:8:8:8 window with
+    /// depth, and the pixel mode drawing into it (the words a traced X start
+    /// and GL client sent; measured.md sections 4, 5 and 9).
+    pub fn test_screen(&mut self) {
+        use super::frame::pbj;
+        self.pixel_mode = [0x2000, 0x50, 0x0040_6d50, 0];
+        // The window's draw and read drawable words, as the kernel sends them.
+        self.draw_word = 0x8000_2000;
+        self.read_word = 0x8000_2000;
+        for (i, v) in [(pbj::OVERLAY_BASE, 0x14_2000), (pbj::PIXEL_BASE, 0x2000), (pbj::WIDTH, 1280), (pbj::HEIGHT, 1024), (pbj::STRIDE, 80), (pbj::DEPTH, 3)] {
+            self.widget.backend_ctl[(pbj::BASE - super::consts::backend::CTL_BASE) as usize + i] = v;
+            self.regs().set_pbj(i, v);
+        }
+        self.regs().set_dispmode(0, 0x0096_55a6);
+        // Depth starts far, as a GL client's first clear leaves it.
+        let depth = self.dest_mem().depth;
+        for y in 0..1024 {
+            for x in 0..1280 {
+                depth.store_word(x, y, super::consts::ODSY_DEPTH24_MAX);
+            }
+        }
+    }
+
+    /// Scan-out entry 0x2800 + i (frame::pbj) as the back end last took it.
+    pub fn pbj(&self, i: usize) -> u32 {
+        self.widget.backend_ctl[(super::frame::pbj::BASE - super::consts::backend::CTL_BASE) as usize + i]
+    }
+
+    /// Where drawing lands now (view::DestViews), kept for the register
+    /// words it was built from, so a pixel loop builds it once.
+    pub fn dest_views(&self) -> super::view::DestViews {
+        use super::frame::pbj;
+        let (base, stride) = (self.pbj(pbj::OVERLAY_BASE), self.pbj(pbj::STRIDE));
+        let key = [self.pixel_mode[0], self.pixel_mode[1], self.pixel_mode[2], self.pixel_mode[3], base, stride];
+        if let Some((k, v)) = self.dest_cache.get() {
+            if k == key {
+                return v;
+            }
+        }
+        let v = super::view::DestViews::of(&self.pixel_mode, base, stride);
+        self.dest_cache.set(Some((key, v)));
+        v
+    }
+
     pub fn resolve_product(&mut self) -> Result<(), String> {
         if self.widget.product.is_empty() {
             return Ok(());
@@ -1306,90 +1219,20 @@ impl Board {
     pub fn allocate(&mut self) -> Result<(), String> {
         self.attach_nic()?;
 
-        // The colour framebuffer is two RGBA8 planes, one per colour buffer,
-        // each over device-backed board memory of its own: a model-owned byte
-        // array. It is not page-backed onto guest RAM. add_plane can only fail
-        // on a programming error in these fixed sizes.
+        // The board's memory, at the size the strap reports.
+        self.vram = super::vram::Vram::new((self.widget.memory_size.max(32) as u64) << 20);
+
         let pixels = ODSY_WIDTH as u64 * ODSY_HEIGHT as u64;
-        self.planes.colour.init(pixels * 4);
-        {
-            let plane = Plane {
-                format: PlaneFormat::Rgba8,
-                packing: Packing::BeRedHigh,
-                width: ODSY_WIDTH,
-                height: ODSY_HEIGHT,
-                stride: ODSY_WIDTH * 4,
-                base: 0,
-                len: pixels * 4,
-                bottom_origin: false,
-                ..Default::default()
-            };
-
-            self.planes.colour_plane = self.planes.colour.add_plane(&plane).map_err(|e| format!("sgi-odyssey: colour plane: {e}"))?;
-            // Colour buffer 1, the same shape in its own memory. Two model
-            // planes preserve the visible contract; they do not claim the
-            // board's two-buffer layout.
-            self.planes.buffer1.init(plane.len);
-            self.planes.buffer1_plane = self.planes.buffer1.add_plane(&plane).map_err(|e| format!("sgi-odyssey: colour buffer 1 plane: {e}"))?;
-        }
-
-        // The board-memory object store: device-backed words the objects are
-        // laid in by Board::object_rows(), addressed directly.
-        self.objects.mem.init(ODSY_OBJ_POOL_BYTES as u64);
-
-        self.planes.did = vec![0u8; pixels as usize];
-        self.planes.overlay = vec![0u8; pixels as usize];
         self.stream.poly_marks = vec![0u8; pixels as usize];
 
-        // The depth plane: 24-bit depth in a 32-bit word per frame pixel, in
-        // device-backed memory of its own. Where the board keeps the depth
-        // buffer, and its width and layout, are unknown, so no aperture reaches
-        // this plane. 24 bits matches the Z24 names in the GL library and the depth
-        // word (depth_word.rs).
-        self.planes.depth.init(pixels * 4);
+        // The display reads board memory through a pointer that lives as
+        // long as the board: the memory is never resized or moved.
         {
-            let depth = Plane {
-                format: PlaneFormat::Z24,
-                packing: Packing::BeRedHigh,
-                width: ODSY_WIDTH,
-                height: ODSY_HEIGHT,
-                stride: ODSY_WIDTH * 4,
-                base: 0,
-                len: pixels * 4,
-                bottom_origin: false,
-                ..Default::default()
-            };
-
-            self.planes.depth_plane = self.planes.depth.add_plane(&depth).map_err(|e| format!("sgi-odyssey: depth plane: {e}"))?;
+            let mem = self.vram.ptr();
+            let _ = self.scanout.shared.vram.set(mem);
         }
 
-        // The stencil plane: 8 bits a pixel, in device-backed memory of its own;
-        // like the depth plane, no aperture reaches it.
-        self.planes.stencil.init(pixels);
-        {
-            let stencil = Plane {
-                format: PlaneFormat::S8,
-                packing: Packing::BeRedHigh,
-                width: ODSY_WIDTH,
-                height: ODSY_HEIGHT,
-                stride: ODSY_WIDTH,
-                base: 0,
-                len: pixels,
-                bottom_origin: false,
-                ..Default::default()
-            };
-
-            self.planes.stencil_plane = self.planes.stencil.add_plane(&stencil).map_err(|e| format!("sgi-odyssey: stencil plane: {e}"))?;
-        }
-
-        // The display reads the planes through a view that lives as long as
-        // they do: they are never resized or moved after this.
-        if let Some(view) = PlaneView::of(self) {
-            let _ = self.scanout.shared.planes.set(view);
-        }
-
-        // Setting the mode marks the scanout's frame all dirty and
-        // restarts the retrace at the mode's rate.
+        // Setting the mode restarts the retrace at the mode's rate.
         self.set_scanout_size(ODSY_WIDTH, ODSY_HEIGHT);
         Ok(())
     }
@@ -1401,28 +1244,12 @@ impl Board {
         self.reset_registers();
         self.front.lock().update_irq();
         // Board::configure() also calls Board::reset_registers(), before
-        // the board memory exists; this runs after Board::allocate(), so the
-        // memory exists here. Zero the colour planes' bytes directly; the
-        // planes themselves are fixed at allocation and stay. Redraw because
-        // reset clears them.
-        self.planes.colour.bytes.fill(0);
-        self.planes.buffer1.bytes.fill(0);
-        self.objects.mem.bytes.fill(0);
-        self.planes.stencil.bytes.fill(0);
-        self.planes.did.fill(0);
-        self.planes.overlay.fill(0);
+        // the board memory exists; this runs after Board::allocate(). MODEL
+        // CHOICE: memory reads zero after a reset (the board's SDRAM holds
+        // whatever it held; the PROM and the driver clear what they use).
+        self.vram.bytes_mut().fill(0);
         self.stream.poly_marks.fill(0);
-        // The depth plane starts at all ones (a model choice). The far plane,
-        // 2S, is word 0xfffffe, and every drawn depth is at most that, so all
-        // ones, the largest word, compares as farther than any fragment.
-        let depth = self.planes.depth.plane(self.planes.depth_plane).expect("the depth plane");
-        for y in 0..ODSY_HEIGHT as i32 {
-            for x in 0..ODSY_WIDTH as i32 {
-                self.planes.depth.plane_store(&depth, x, y, ODSY_DEPTH24_MAX);
-            }
-        }
-        // Back to the boot size, then repaint the cleared plane and restart
-        // the phase.
+        // Back to the boot size, and restart the phase.
         if self.scanout.mode.width != ODSY_WIDTH || self.scanout.mode.height != ODSY_HEIGHT {
             self.set_scanout_size(ODSY_WIDTH, ODSY_HEIGHT);
         }
@@ -1443,11 +1270,6 @@ impl Board {
     pub fn new(product: &str, slot: u32) -> Result<Box<Board>, String> {
         let mut s = Box::new(Board::default());
 
-        s.objects.index = Default::default();
-        // The fixed part of the drawable Board::gl_bind() hands over.
-        s.gl_bind_drawable.bound = true;
-        s.gl_bind_drawable.front = 0;
-        s.gl_bind_drawable.back = 1;
         s.widget.revision = 0xa;
         s.widget.memory_size = 128;
         s.widget.memory_banks = 4;
@@ -1459,5 +1281,41 @@ impl Board {
         s.configure()?;
         s.allocate()?;
         Ok(s)
+    }
+}
+
+impl Board {
+    /// The current draw state slot's texture registers.
+    pub fn tex_regs(&self) -> &super::pipe::texture::TexRegs {
+        &self.slots.cur().tex
+    }
+
+    /// The current slot's texture registers to write: copied to a free slot
+    /// first where a queued draw holds it, waiting for the raster unit where
+    /// every slot is held.
+    pub fn tex_mut(&mut self) -> &mut super::pipe::texture::TexRegs {
+        while !self.slots.own() {
+            self.raster_wait();
+        }
+        let s = self.slots.cur_mut();
+        s.dirty = true;
+        &mut s.tex
+    }
+
+    /// The current slot for a draw: latched, held, and what it does not
+    /// decode reported once a reason.
+    pub fn issue_state(&mut self) -> *const super::pipe::slot::DrawState {
+        let s = self.slots.issue();
+        // SAFETY: issued, so held until the draw releases it.
+        let missing = unsafe { (*s).latch.unimplemented } & !self.diag.tex_unimplemented;
+        if missing != 0 {
+            self.diag.tex_unimplemented |= missing;
+            for (i, name) in super::pipe::texture::unimplemented::NAMES.iter().enumerate() {
+                if missing & (1 << i) != 0 {
+                    crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: texture state not modelled: {}", name);
+                }
+            }
+        }
+        s
     }
 }

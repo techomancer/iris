@@ -11,7 +11,6 @@
 //! meanwhile lives in the host interface.
 
 
-use crate::devlog::LogModule;
 use super::board::Board;
 use super::fifo::Run;
 use super::mmio::BoardLocks;
@@ -171,7 +170,7 @@ impl Board {
             }
         }
         if fifo.pending() {
-            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.stores());
+            crate::dlog_dev!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.stores());
         }
     }
 
@@ -190,7 +189,7 @@ impl Board {
         let start = std::time::Instant::now();
         crate::pf_scope!(crate::perfetto::events::ODSY_DRAIN, waiting);
         self.work_step(&mut Budget::stores(waiting));
-        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker: drained offset {:#x} in {:?}", addr, start.elapsed());
+        crate::dlog_dev!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: worker: drained offset {:#x} in {:?}", addr, start.elapsed());
     }
 
     /// Reset clears the FIFO and abandons the waiting stores.

@@ -13,6 +13,33 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### VPro introspection
+
+- The Octane's VPro (Odyssey) board has a monitor surface like the other
+  boards': `vpro status|regs|fifo|gl|geom|tex|win|mem|objects|backend|lut|
+  dispmode|cursor|pix|raw|shot|fbdump|hash|unimp` beside the existing
+  `refusals` and `dirty` counters (see `debug.md`). State commands wait for
+  the board's thread and raster unit to go idle and answer "board busy"
+  rather than read a torn state; pixel, screen and plane dumps read the
+  planes lock-free as the display does. `vpro fbdump` writes every plane
+  and the resolved screen with a `layout.txt` of the memory layout, and
+  `vpro hash` prints the plane hash a replay checkpoint takes, so a live
+  board can be compared with a recording.
+- `vpro trace <file> [fifo,gl,cpu,dma|all]` (also `IRIS_ODSY_TRACE` from
+  power-on; `gputrace` builds) writes an annotated trace of the command
+  words as the parser completes them, the GL commands and draws, the other
+  bus accesses and the DMA descriptors, on the pattern of `mgras trace`.
+- `vpro rec <file>`, `vpro rec mark` and `vpro rec off` start, mark and stop
+  the replayable recording from the monitor; a recording no longer needs
+  `IRIS_ODSY_REC` at power-on. Marks carry the plane hash with the board
+  idle, the replay checks them and uses them as checkpoints, and a recording
+  started mid-session is reported as such rather than failing. A replay of a
+  recording with marks starts from the board's power-on reset, as the
+  machine does (the depth plane at all ones); older recordings without marks
+  replay as before. `VPRO_REPLAY_DUMP=<dir>` writes the replayed planes in
+  `vpro fbdump`'s files, to diff against a live board's dump, and `vpro
+  fbdump` adds `objects.bin`.
+
 ### O2 graphics tracing
 
 - `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,

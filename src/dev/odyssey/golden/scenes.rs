@@ -1,22 +1,23 @@
 //! The scenes, and the context that draws them.
 
+use crate::dev::odyssey::draw::{RasterOp, RASTER_CLEAR};
 use crate::dev::odyssey::board::{Board, ODSY_HEIGHT, ODSY_WIDTH};
-use crate::dev::odyssey::consts::{colour, gl_cmd, light, tex, write};
-use crate::dev::odyssey::draw::gl_rules;
-use crate::dev::odyssey::gl_context::{
-    vtx, GL_ALWAYS, GL_BACK, GL_BLEND, GL_CCW, GL_CLEAR, GL_COLOR_BUFFER_BIT, GL_COLOUR_MASK_ALL,
+use crate::dev::odyssey::consts::{colour, gl_cmd, light, write};
+use crate::dev::odyssey::raster_bench::{load_texture, put_texel, Tex, ALPHA, INTENSITY, LUMINANCE, LUMINANCE_ALPHA, RGB, RGBA};
+use crate::dev::odyssey::pipe::encode::{
+    vtx, GL_ALWAYS, GL_BACK, GL_CCW, GL_CLEAR, GL_COLOR_BUFFER_BIT, GL_COLOUR_MASK_ALL,
     GL_COLOUR_MASK_ALPHA, GL_COLOUR_MASK_RED, GL_CONSTANT_ALPHA, GL_CONSTANT_COLOR, GL_CW,
-    GL_DECAL, GL_DECR, GL_DEPTH_BUFFER_BIT, GL_DRAW_OK, GL_DST_ALPHA, GL_DST_COLOR, GL_EQUAL,
+    GL_DECR, GL_DEPTH_BUFFER_BIT, GL_DST_ALPHA, GL_DST_COLOR, GL_EQUAL,
     GL_FILL, GL_FLAT, GL_FRONT, GL_FUNC_ADD, GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_SUBTRACT, GL_GEQUAL,
     GL_GREATER, GL_INCR, GL_INVERT, GL_KEEP, GL_LEQUAL, GL_LESS, GL_LINE, GL_LINES, GL_MAX, GL_MIN,
-    GL_MODULATE, GL_NOTEQUAL, GL_OFFSET_FILL, GL_ONE_MINUS_CONSTANT_ALPHA,
+    GL_NOTEQUAL, GL_OFFSET_FILL, GL_ONE_MINUS_CONSTANT_ALPHA,
     GL_ONE_MINUS_CONSTANT_COLOR, GL_ONE_MINUS_DST_ALPHA, GL_ONE_MINUS_DST_COLOR,
     GL_ONE_MINUS_SRC_ALPHA, GL_ONE_MINUS_SRC_COLOR, GL_POINT, GL_POINTS, GL_POLYGON, GL_QUADS,
     GL_REPLACE, GL_SMOOTH, GL_SRC_ALPHA, GL_SRC_ALPHA_SATURATE, GL_SRC_COLOR,
-    GL_STENCIL_BUFFER_BIT, GL_TRIANGLES, GlDraw, GlDrawState, RASTER_CLEAR, RasterOp,
+    GL_STENCIL_BUFFER_BIT, GL_TRIANGLES, LibDraw, LibState,
 };
 use crate::dev::odyssey::golden::{Frame, SIDE};
-use crate::dev::odyssey::memory::ClipRect;
+use crate::dev::odyssey::clip::ClipRect;
 use crate::dev::odyssey::raster_bench::Bench;
 use super::raster_bench::Lcg;
 
@@ -38,7 +39,6 @@ pub struct V {
     pub p: [f32; 4],
     pub c: [f32; 4],
     pub t: [f32; 4],
-    pub n: [f32; 3],
     pub back: Option<[f32; 4]>,
 }
 
@@ -48,7 +48,7 @@ fn nd(px: f32) -> f32 {
 
 /// A vertex at window pixel (x, y) and depth z in [-1, 1].
 pub fn v(x: f32, y: f32, z: f32, c: [f32; 4]) -> V {
-    V { p: [nd(x), nd(y), z, 1.0], c, t: [0.0, 0.0, 0.0, 1.0], n: [0.0, 0.0, 1.0], back: None }
+    V { p: [nd(x), nd(y), z, 1.0], c, t: [0.0, 0.0, 0.0, 1.0], back: None }
 }
 
 impl V {
@@ -67,7 +67,6 @@ impl V {
         let mut o = [0.0f32; vtx::FLOATS];
         o[vtx::POSITION..][..4].copy_from_slice(&self.p);
         o[vtx::COLOR..][..4].copy_from_slice(&self.c);
-        o[vtx::NORMAL..][..3].copy_from_slice(&self.n);
         o[vtx::TEXCOORD..][..4].copy_from_slice(&self.t);
         o[vtx::EDGE] = f32::from_bits(1);
         o[vtx::BACK_COLOR..][..4].copy_from_slice(&self.back.unwrap_or(self.c));
@@ -79,7 +78,7 @@ impl V {
 /// per-primitive flags the GL context would add to a draw.
 pub struct Ctx {
     pub board: Box<Board>,
-    pub st: GlDrawState,
+    pub st: LibState,
     pub stipple: [u32; 32],
     pub polygon_stipple_enabled: bool,
     pub polygon_modes: Option<[u32; 2]>,
@@ -106,7 +105,6 @@ impl Ctx {
 
         board.win.clip_rect[0] = rect;
         board.gl_write_mask |= write::COLOUR_MASK << write::COLOUR_SHIFT;
-        st.drawable.clip.r[0] = rect;
         st.viewport = [0, 0, SIDE, SIDE];
         st.shade_model = GL_SMOOTH;
         let mut c = Ctx {
@@ -146,7 +144,6 @@ impl Ctx {
     }
 
     pub fn clear(&mut self, rgba: [f32; 4], depth: u32, stencil: u32) {
-        let t = self.board.gl_target();
         let mut op = RasterOp {
             kind: RASTER_CLEAR,
             ntargets: 1,
@@ -162,15 +159,16 @@ impl Ctx {
         };
         op.clip.n = 1;
         op.clip.r[0] = ClipRect { x0: 0, y0: 0, x1: BENCH_W_MAX, y1: BENCH_H_MAX };
-        gl_rules().raster(&t, &mut self.board.gl_parts(None).0, &op);
+        self.board.gl_raster(&op);
+        self.board.raster_wait();
     }
 
     /// Draw one primitive through the board's own GL draw.
     pub fn draw(&mut self, mode: u32, vs: &[V]) {
         let floats: Vec<f32> = vs.iter().flat_map(|v| v.floats()).collect();
-        let mut d = GlDraw::new(mode, vs.len() as u32, &floats, &self.st, &self.stipple);
+        let mut d = LibDraw::new(mode, vs.len() as u32, &floats, &self.st, &self.stipple);
 
-        d.back_colors = self.back_colors;
+        d.back_colours = self.back_colors;
         d.point_size = self.point_size;
         d.line_width = self.line_width;
         d.point_smooth = self.point_smooth;
@@ -184,7 +182,7 @@ impl Ctx {
             d.line_stipple_pattern = pattern;
             d.line_phase = self.phase;
         }
-        assert_eq!(self.board.gl_draw(&mut d), GL_DRAW_OK);
+        self.board.lib_draw(&mut d);
         if self.line_stipple.is_some() {
             self.phase = d.line_phase;
         }
@@ -239,106 +237,12 @@ impl Ctx {
 const BENCH_W_MAX: i32 = ODSY_WIDTH as i32 - 1;
 const BENCH_H_MAX: i32 = ODSY_HEIGHT as i32 - 1;
 
-// Textures. Each level lives in an object of the board's memory, found from
-// the sampler words the way the library's uploads leave them.
-
-#[derive(Clone, Copy)]
-pub struct Tex {
-    /// The sampler word's component code: 0x01000000 luminance, 0x01800000
-    /// luminance-alpha, 0x00800000 alpha, 0x02000000 intensity, 0x02800000
-    /// RGB, 0x03000000 RGBA.
-    pub components: u32,
-    pub size: u32,
-    /// 0 nearest, 1 linear, 2 to 5 the mipmapped filters in GL's order.
-    pub min: u32,
-    pub mag_linear: bool,
-    /// 0 repeat, 1 clamp to edge.
-    pub wrap: u32,
-    /// 1 replace, 2 modulate, 3 decal, 4 blend.
-    pub env: u32,
-}
-
-pub const LUMINANCE: u32 = 0x0100_0000;
-pub const LUMINANCE_ALPHA: u32 = 0x0180_0000;
-pub const ALPHA: u32 = 0x0080_0000;
-pub const INTENSITY: u32 = 0x0200_0000;
-pub const RGB: u32 = 0x0280_0000;
-pub const RGBA: u32 = 0x0300_0000;
-
-impl Tex {
-    pub fn new(components: u32) -> Tex {
-        Tex { components, size: 16, min: 0, mag_linear: false, wrap: 0, env: 2 }
-    }
-}
-
-/// Texel (x, y) of a level: a gradient and a check, tinted by level so a
-/// wrong level shows.
-fn texel(level: u32, x: u32, y: u32, w: u32, h: u32) -> u32 {
-    let r = x * 255 / w.max(2).saturating_sub(1).max(1);
-    let g = y * 255 / h.max(2).saturating_sub(1).max(1);
-    let b = if (x / 2 + y / 2) & 1 == 0 { 230 } else { 40 };
-    let a = 255 - ((x + y) * 200 / (w + h)).min(200);
-    let tint = [0, 60, 120, 30, 90, 150, 20, 70][level as usize & 7];
-    ((r.min(255) ^ tint) << 24) | (g.min(255) << 16) | (b << 8) | a
-}
-
-/// Level descriptor word 1's size code and format index for a sampler
-/// component code: alpha 8 (index 0), luminance 8 (4), luminance-alpha 8/8
-/// (11), intensity 8 (2), and 8/8/8/8 (17) for RGB and RGBA, which the class
-/// alone tells apart.
-fn texel_format_word(components: u32) -> u32 {
-    match components {
-        ALPHA => 0x0000_0000,
-        LUMINANCE => 0x0040_0000,
-        LUMINANCE_ALPHA => 0x00b0_0000,
-        INTENSITY => 0x0020_0000,
-        _ => 0x4110_0000,
-    }
-}
-
 impl Ctx {
     pub fn texture(&mut self, t: &Tex) {
         if self.off == Some("texture") {
             return;
         }
-        let b = &mut self.board;
-        let levels = if t.min >= 2 { t.size.trailing_zeros() + 1 } else { 1 };
-        let (ws, wt) = (t.wrap, t.wrap);
-
-        for level in 0..levels {
-            let w = (t.size >> level).max(1);
-            let units = (w.div_ceil(16) + 1) & !1;
-            let base = 0x10_0000 + level * 0x1000;
-            let obj = b.object_select(base, units * 16);
-            assert!(b.object_rows(obj, w));
-            for y in 0..w {
-                for x in 0..w {
-                    b.object_store(obj, x, y, texel(level, x, y, w, w));
-                }
-            }
-            b.tex.levels[level as usize * 3..][..3].copy_from_slice(&[base, texel_format_word(t.components) | units, 0]);
-        }
-        let axis = |w: u32, wrap: u32| w | if wrap == 1 { 0x4_0000 } else { 0 };
-        let filter = (t.min << 5) | if t.mag_linear { 2 } else { 0 };
-        b.tex.mode = tex::MODE_2D;
-        b.tex.level0 = 0;
-        b.tex.sampler = [
-            0x0800_0000 | (t.size.trailing_zeros() << 10) | (t.size.trailing_zeros() << 5),
-            axis(t.size, ws),
-            axis(t.size, wt),
-            1,
-            0x1000_0000 | t.components | (ws << 12) | (wt << 10) | filter,
-            0,
-            0,
-        ];
-        b.tex.env = [t.env, 0, 0, 0, 0];
-        if t.env == 4 {
-            // The environment colour: two normalized 12-bit components a word.
-            b.tex.env[1] = 0xc00 << 12 | 0x400;
-            b.tex.env[2] = 0x200 << 12 | 0xfff;
-        }
-        self.st.texture_2d = true;
-        self.st.texture_env_mode = [GL_REPLACE, GL_REPLACE, GL_MODULATE, GL_DECAL, GL_BLEND][t.env as usize];
+        load_texture(&mut self.board, &mut self.st, t);
     }
 }
 
@@ -443,10 +347,7 @@ fn polygon_offset(c: &mut Ctx) {
     c.depth_test(GL_LEQUAL);
     c.rect(10.0, 10.0, 118.0, 118.0, 0.2, BLUE);
     c.st.polygon_offset = GL_OFFSET_FILL;
-    c.st.offset_factor = 1.0;
-    c.st.offset_units = -20000.0;
     c.tri(v(10.0, 10.0, 0.2, RED), v(118.0, 20.0, 0.2, RED), v(40.0, 118.0, 0.2, RED));
-    c.st.offset_units = 20000.0;
     c.tri(v(118.0, 118.0, 0.2, GREEN), v(10.0, 100.0, 0.2, GREEN), v(100.0, 10.0, 0.2, GREEN));
 }
 
@@ -576,7 +477,6 @@ fn stencil_mark_then_masked(c: &mut Ctx) {
     c.st.stencil_value_mask = u32::MAX;
     c.st.stencil_write_mask = u32::MAX;
     c.st.stencil_op = [GL_KEEP, GL_KEEP, GL_INCR];
-    c.st.colour_mask = 0;
     c.board.gl_write_mask &= !(write::COLOUR_MASK << write::COLOUR_SHIFT);
     c.tri(v(10.0, 10.0, 0.0, RED), v(110.0, 30.0, 0.0, RED), v(40.0, 110.0, 0.0, RED));
     c.tri(v(30.0, 30.0, 0.0, RED), v(120.0, 90.0, 0.0, RED), v(20.0, 100.0, 0.0, RED));
@@ -769,69 +669,6 @@ fn clip_user_plane_textured_smooth(c: &mut Ctx) {
     c.tri(v(5.0, 5.0, 0.0, WHITE).tex(0.0, 0.0), v(125.0, 10.0, 0.0, WHITE).tex(1.0, 0.0), v(60.0, 125.0, 0.0, WHITE).tex(0.5, 1.0));
 }
 
-// The window-matrix mode: one eye-to-window transform in place of the
-// projection and the viewport map.
-
-fn window_matrix(c: &mut Ctx, rows_down: bool) {
-    c.st.window_matrix_given = true;
-    c.st.window_depth_scale = 1.0;
-    c.st.window_rows_down = rows_down;
-    // Eye coordinates are window pixels and depth in [0, 1].
-    let mut m = [0.0f32; 16];
-    m[0] = 1.0;
-    m[5] = 1.0;
-    m[10] = 1.0;
-    m[15] = 1.0;
-    m[12] = 0.0;
-    c.st.window_matrix = m;
-    c.depth_row([0.0, 0.0, 1.0, 0.0]);
-    // The window-matrix y is in the draw's own rows.
-    if rows_down {
-        c.st.drawable.height = SIDE as u32;
-    }
-}
-
-fn wv(x: f32, y: f32, z: f32, col: [f32; 4]) -> V {
-    V { p: [x, y, z, 1.0], ..v(0.0, 0.0, 0.0, col) }
-}
-
-fn window_matrix_triangles(c: &mut Ctx) {
-    window_matrix(c, false);
-    c.depth_test(GL_LESS);
-    c.tri(wv(10.0, 10.0, 0.2, RED), wv(110.0, 25.0, 0.4, GREEN), wv(40.0, 115.0, 0.6, BLUE));
-    c.tri(wv(100.0, 100.0, 0.1, YELLOW), wv(20.0, 90.0, 0.7, WHITE), wv(110.0, 20.0, 0.5, RED));
-}
-
-fn window_matrix_rows_down(c: &mut Ctx) {
-    window_matrix(c, true);
-    c.st.cull_face = true;
-    c.st.cull_face_mode = GL_BACK;
-    c.st.front_face = GL_CCW;
-    c.tri(wv(10.0, 10.0, 0.5, RED), wv(60.0, 15.0, 0.5, GREEN), wv(20.0, 60.0, 0.5, BLUE));
-    c.tri(wv(70.0, 10.0, 0.5, YELLOW), wv(80.0, 60.0, 0.5, YELLOW), wv(120.0, 15.0, 0.5, YELLOW));
-}
-
-fn window_matrix_clip_and_lines(c: &mut Ctx) {
-    window_matrix(c, false);
-    c.depth_test(GL_LESS);
-    // Outside the depth range and outside the window.
-    c.tri(wv(-30.0, 10.0, 0.5, RED), wv(60.0, 5.0, 1.4, GREEN), wv(30.0, 90.0, -0.4, BLUE));
-    c.tri(wv(90.0, 60.0, 0.3, YELLOW), wv(200.0, 70.0, 0.3, YELLOW), wv(120.0, 190.0, 0.3, WHITE));
-    c.draw(GL_LINES, &[wv(5.0, 100.5, 0.2, WHITE), wv(125.0, 120.5, 0.8, RED)]);
-    c.point_size = 3.0;
-    c.draw(GL_POINTS, &[wv(64.0, 64.0, 0.3, GREEN)]);
-}
-
-fn window_matrix_scaled(c: &mut Ctx) {
-    // A real transform: scale, rotate and offset, with a depth scale below 1.
-    window_matrix(c, false);
-    c.st.window_depth_scale = 0.5;
-    let (s, k) = (0.6f32, 0.8f32);
-    c.st.window_matrix = [60.0 * k, 60.0 * s, 0.0, 0.0, -60.0 * s, 60.0 * k, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 64.0, 64.0, 0.0, 1.0];
-    c.depth_test(GL_LESS);
-    c.tri(V { p: [-0.8, -0.8, 0.3, 1.0], ..wv(0.0, 0.0, 0.0, RED) }, V { p: [0.9, -0.7, 0.5, 1.0], ..wv(0.0, 0.0, 0.0, GREEN) }, V { p: [0.0, 0.9, 0.2, 1.0], ..wv(0.0, 0.0, 0.0, BLUE) });
-}
-
 // Perspective and the general transform.
 
 fn projection_frustum(c: &mut Ctx) {
@@ -980,23 +817,20 @@ fn tex_detail(c: &mut Ctx, combine: u32) {
     let b = &mut c.board;
     let (size, base) = (16u32, 0x18_0000u32);
     let units = (size.div_ceil(16) + 1) & !1;
-    let obj = b.object_select(base, units * 16);
-    assert!(b.object_rows(obj, size));
     for y in 0..size {
         for x in 0..size {
             let g = if (x / 2 + y) & 1 == 0 { 0xc0 } else { 0x40 } + (x * 3) as u32;
-            b.object_store(obj, x, y, (g << 24) | (g << 16) | (g << 8) | 0xff);
+            put_texel(b, base, 0x00d0_0000 | units, x, y, (g << 24) | (g << 16) | (g << 8) | 0xff);
         }
     }
-    b.tex.levels[60 * 3..][..3].copy_from_slice(&[base, 0x00d0_0000 | units, 0]);
+    b.tex_mut().levels[60 * 3..][..3].copy_from_slice(&[base, 0x00d0_0000 | units, 0]);
     // Detail level 4 in bits 29:25, log2 16 in 24:20 and 19:15.
-    b.tex.sampler[0] = combine | 0x0800_0000 | (4 << 20) | (4 << 15) | (5 << 10) | (5 << 5);
+    b.tex_mut().sampler[0] = combine | 0x0800_0000 | (4 << 20) | (4 << 15) | (5 << 10) | (5 << 5);
     // Minification code 5 and magnification code 4, detail colour.
-    b.tex.sampler[4] = 0x1000_0000 | RGB | (5 << 5) | (4 << 1);
-    for (i, e) in b.tex.detail_function.iter_mut().enumerate() {
+    b.tex_mut().sampler[4] = 0x1000_0000 | RGB | (5 << 5) | (4 << 1);
+    for (i, e) in b.tex_mut().detail.iter_mut().enumerate() {
         *e = ((i as u32 * 32).min(4095)) << 12;
     }
-    b.tex.detail_function_valid = 0xffff;
     c.draw(GL_QUADS, &[v(4.0, 4.0, 0.0, WHITE).tex(0.0, 0.0), v(62.0, 4.0, 0.0, WHITE).tex(1.0, 0.0), v(62.0, 124.0, 0.0, WHITE).tex(1.0, 2.0), v(4.0, 124.0, 0.0, WHITE).tex(0.0, 2.0)]);
     c.draw(GL_QUADS, &[v(66.0, 4.0, 0.0, WHITE).tex(0.0, 0.0), v(124.0, 4.0, 0.0, WHITE).tex(0.125, 0.0), v(124.0, 124.0, 0.0, WHITE).tex(0.125, 0.25), v(66.0, 124.0, 0.0, WHITE).tex(0.0, 0.25)]);
 }
@@ -1126,7 +960,7 @@ fn lit_sphere(c: &mut Ctx, current_colour: [f32; 4]) {
         c.board.geom.normal = n.map(f32::to_bits);
         let obj = [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0];
         let rgba = c.board.gl_light(&obj);
-        V { p: [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0], c: rgba, t: [0.0, 0.0, 0.0, 1.0], n, back: None }
+        V { p: [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0], c: rgba, t: [0.0, 0.0, 0.0, 1.0], back: None }
     };
     for i in 0..nlat {
         for j in 0..nlon {
@@ -1193,7 +1027,7 @@ fn light_lit_blended_textured(c: &mut Ctx) {
         c.board.geom.normal = p.map(f32::to_bits);
         c.board.geom.colour = WHITE.map(f32::to_bits);
         let rgba = c.board.gl_light(&[p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0]);
-        V { p: [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0], c: rgba, t: [j as f32 / nlon as f32 * 2.0, i as f32 / nlat as f32 * 2.0, 0.0, 1.0], n: p, back: None }
+        V { p: [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0], c: rgba, t: [j as f32 / nlon as f32 * 2.0, i as f32 / nlat as f32 * 2.0, 0.0, 1.0], back: None }
     };
     for i in 0..nlat {
         for j in 0..nlon {
@@ -1263,10 +1097,6 @@ scenes! {
     clip_user_plane,
     clip_user_planes_rotated,
     clip_user_plane_textured_smooth,
-    window_matrix_triangles,
-    window_matrix_rows_down,
-    window_matrix_clip_and_lines,
-    window_matrix_scaled,
     projection_frustum,
     projection_ortho_rotated,
     perspective_correct_colour,

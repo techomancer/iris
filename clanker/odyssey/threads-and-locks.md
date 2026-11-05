@@ -1,7 +1,8 @@
 # VPro threads, the lock-free state and the two queues
 
 Status: reference (iris `src/dev/odyssey/{interface,fifo,worker,raster_unit,mod}.rs`,
-2026-10-30).
+2026-10-30; the display and memory parts updated 2026-11-04 for board
+memory: no planes, objects or dirty rows).
 
 **Why it is shaped this way.** The board decodes and draws behind the
 processor: the driver stores more commands and polls registers while a
@@ -51,21 +52,19 @@ apply to BUZZ). Nothing models more than one raster unit.
   address and token; a query's snapshot and sync word. This encoding is
   the model's own: the hardware's is unknown. Capturing state at its place
   in the stream is how raster state reaches the raster unit in order.
-- **The planes** stay where `Board` keeps them. The raster unit owns them
-  while it has jobs and reaches them through raw spans, as the IMPACT
-  model's engines reach their pixel memory (`clanker/mgras/DESIGN.md`). The
-  front end's own plane work (integer and image drawing, pixel DMA, the
-  object store, reset) waits for the raster queue to empty first
-  (`Board::raster_wait`). That wait is the command stream's order, not a
-  lock: the board's pipeline runs a plane access behind the drawing before
-  it. A DMA into an object that already has its rows does not wait: its
-  texels go to the raster unit as a job, behind the draws that may still
-  read the old ones (`Board::object_stage`). A texture upload otherwise
-  drained the whole raster queue, up to 180 ms of drawing in Smoke &
-  Mirrors.
-- **The display** takes nothing from any of them. It reads the planes
-  through raw pointers (`PlaneView`, reader.rs), as the MGRAS, REX3 and GR2
-  displays read theirs. See "The display" below.
+- **Board memory** (`vram.rs`) is one byte array fixed at
+  `Board::allocate`. The raster unit owns it while it has jobs and reaches
+  it through raw pointers (`VramPtr`, `view::Rows`), as the IMPACT model's
+  engines reach their pixel memory (`clanker/mgras/DESIGN.md`). The front
+  end's own memory work (integer and image drawing, pixel DMA, copies,
+  reset) waits for the raster queue to empty first (`Board::raster_wait`).
+  That wait is the command stream's order, not a lock: the board's pipeline
+  runs a memory access behind the drawing before it. (The object store's
+  staged uploads, which spared a texture upload that wait, went with the
+  object store; watch Smoke & Mirrors, where the wait cost up to 180 ms.)
+- **The display** takes nothing from any of them. It composes whole
+  frames from board memory through the same pointer (`DisplayShared::vram`,
+  reader.rs), as the MGRAS display does. See "The display" below.
 
 Both rings are the shared `GFifo`, 64K entries. The IMPACT model's raster
 FIFO has a head per raster engine with scanline interleave; the VPro's has
@@ -138,15 +137,14 @@ wrong frame or a lost register store, not as a model that hides it.
 
 ## The display
 
-The display thread (`Odyssey::frame`) polls the retrace, stages, resolves
-and presents with nothing held against the board. A frame reads:
+The display thread (`Odyssey::frame`) polls the retrace, composes the whole
+frame (`Frame::snapshot`, `Frame::compose`) and presents it, with nothing
+held against the board. A frame reads:
 
 | What | How it is shared | Ordering it relies on |
 | --- | --- | --- |
-| Colour, id and overlay planes | raw pointers (`PlaneView::copy_row`), the one function that reads memory a writer may be storing to | the writer marks a row after its last store; the frame takes the marks before it copies |
-| Dirty and unnamed rows | atomic bitsets (`RowMarks`) | store, then mark; the frame takes the marks first |
-| Rows the raster unit drew | atomic words (`PublishedRows`) | published before a fence, query or sync word the guest can see, when the queue drains and at the end of a slice |
-| Lookup RAM, display modes, overlay modes, cursor | atomic words (`SharedRegs`) and a generation | the store marks every line after it, and the frame copies the registers after it takes the marks; the generation is read before the copy |
+| Board memory: frame buffer, window-id and overlay bytes | a raw pointer (`VramPtr`); `Frame::compose` is the one function that reads memory a writer may be storing to | none: every frame reads all of it, so a pixel read mid-store is right at the next frame |
+| Lookup RAM, display modes, overlay modes, cursor, scan-out geometry (PB&J) | atomic words (`SharedRegs`) and a generation | the generation moves after the store and is read before the copy |
 | Scanout mode, retrace restart | atomic words (`ModeCell`) and two counters | counters move after the fields and are read before them |
 | Swap latch, displayed-buffer bits, retrace interrupt | the host interface, under the front lock | see below |
 
@@ -159,16 +157,15 @@ Sync points kept, each because the hardware has it:
   and arms the swap after its fence never shows a mix of two frames. The
   host-interface lock only serialises the register file the swap bank lives
   in; the display holds it for a few instructions.
-- **Fences, queries and sync words.** The raster unit publishes the rows it
-  drew before it runs a completion job, so a guest that waits for one before
-  it arms a swap has its rows known to the display when the swap latches.
+- **Fences, queries and sync words.** A completion job runs behind the
+  draws queued before it, so a guest that waits for one before it arms a
+  swap has its drawing in memory when the swap latches.
 - **Waiting reads.** A register read that waits drains the command FIFO and
   the raster queue (rule 2 below).
 
-What is not kept, because the hardware has none: a frame can copy a row the
-raster unit is drawing, a lookup entry the front end is storing, or the old
-and new halves of a mode change. The writer marks after it stores, so the
-next frame copies the row or entry again. A guest that arms a swap before
+What is not kept, because the hardware has none: a frame can read a pixel
+the raster unit is drawing, a lookup entry the front end is storing, or the
+old and new halves of a mode change. The next frame reads them again. A guest that arms a swap before
 its drawing is done sees the half-drawn frame for as long as the queue
 takes, as it would on the board.
 

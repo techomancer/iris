@@ -12,8 +12,7 @@
 //! check for a move to 32-bit floats.
 
 use crate::dev::odyssey::consts::colour;
-use crate::dev::odyssey::draw::gl_rules;
-use crate::dev::odyssey::gl_context::{vtx, GlDrawState};
+use crate::dev::odyssey::pipe::encode::{vtx, LibState};
 use crate::dev::odyssey::raster_bench::Bench;
 use super::scenes::{load_lights, Light, MATERIAL};
 use super::*;
@@ -35,15 +34,12 @@ fn rows() -> Vec<Row> {
     let (s, k) = (0.6f32, 0.8f32);
     let rot = [k, s, 0.0, 0.0, -s, k, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.7, -0.4, -6.0, 1.0];
     let tilt = [k, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, k, 0.0, 0.0, 0.3, -9.0, 1.0];
-    let window = [60.0 * k, 60.0 * s, 0.0, 0.0, -60.0 * s, 60.0 * k, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 400.5, 300.25, 0.0, 1.0];
-    // (name, modelview, projection, viewport, window matrix)
-    let setups: [(&str, [f32; 16], [f32; 16], [i32; 4], Option<[f32; 16]>); 6] = [
-        ("identity", ident, ident, [0, 0, 128, 128], None),
-        ("ortho_rot", rot, ortho, [10, 20, 600, 480], None),
-        ("frustum_rot", rot, frustum, [0, 0, 1280, 1024], None),
-        ("frustum_tilt_vp", tilt, frustum, [-30, 15, 333, 257], None),
-        ("window_matrix", ident, ident, [0, 0, 1280, 1024], Some(window)),
-        ("window_matrix_rot", rot, ident, [0, 0, 1280, 1024], Some(window)),
+    // (name, modelview, projection, viewport)
+    let setups: [(&str, [f32; 16], [f32; 16], [i32; 4]); 4] = [
+        ("identity", ident, ident, [0, 0, 128, 128]),
+        ("ortho_rot", rot, ortho, [10, 20, 600, 480]),
+        ("frustum_rot", rot, frustum, [0, 0, 1280, 1024]),
+        ("frustum_tilt_vp", tilt, frustum, [-30, 15, 333, 257]),
     ];
     let mut rng = Lcg(2024);
     let points: Vec<[f32; 4]> = (0..40)
@@ -55,23 +51,17 @@ fn rows() -> Vec<Row> {
             _ => [rng.range(-3.0, 3.0), rng.range(-3.0, 3.0), rng.range(-6.0, 4.0), if i % 5 == 0 { rng.range(0.5, 2.0) } else { 1.0 }],
         })
         .collect();
-    for (name, mv, proj, vp, wm) in setups {
-        let mut st = GlDrawState { modelview: mv, projection: proj, viewport: vp, ..Default::default() };
-        if let Some(w) = wm {
-            st.window_matrix_given = true;
-            st.window_matrix = w;
-            st.window_depth_scale = 0.75;
-            st.window_rows_down = name == "window_matrix_rot";
-        }
+    for (name, mv, proj, vp) in setups {
+        let st = LibState { modelview: mv, projection: proj, viewport: vp, ..Default::default() }.xf();
         for (i, p) in points.iter().enumerate() {
             let mut vertex = [0.0f32; vtx::FLOATS];
             vertex[..4].copy_from_slice(p);
-            let vv = st.volume_from_draw_vertex(&vertex);
+            let vv = crate::dev::odyssey::pipe::setup::Transform { st: &st, depth_row: [0.0; 4], divisor: None, back_colours: false }.vertex(&vertex);
             out.push(Row { name: format!("{name}/{i}"), kind: "eye", vals: vv.eye.iter().map(|&x| f64::from(x)).collect() });
             out.push(Row { name: format!("{name}/{i}"), kind: "clip", vals: vv.clip.iter().map(|&x| f64::from(x)).collect() });
             // A vertex at or behind the eye has no window position.
             if vv.clip[3] > 0.0 {
-                let win = st.clip_to_window(&vv.clip, (1i32 << gl_rules().subpixel_bits) as f32).expect("a window position");
+                let win = st.clip_to_window(&vv.clip, crate::dev::odyssey::pipe::setup::SUB as f32).expect("a window position");
                 out.push(Row { name: format!("{name}/{i}"), kind: "win", vals: win.iter().map(|&c| f64::from(c)).collect() });
             }
         }

@@ -20,7 +20,9 @@ use super::fifo::CommandFifo;
 use super::interface::{front_mmio_read, front_mmio_write, front_register, HostInterface};
 use super::raster_unit::RasterQueue;
 use super::reader::DisplayShared;
+use super::record::{RecHandle, RecSlot, Recorder};
 use super::registers::reg;
+use super::trace::{Trace, TRACE_CPU};
 impl Board {
     pub fn write_dispatch(&mut self, addr: u64, value: u64, size: u32) {
         let sequence = self.trace_sequence.fetch_add(1, Ordering::Relaxed);
@@ -324,6 +326,10 @@ pub(super) struct BoardLocks {
     pub refusals: Arc<RefusalStats>,
     /// What the display thread reads of the board.
     pub shared: Arc<DisplayShared>,
+    /// The recording of the bus accesses (record.rs): taken after `submit`.
+    pub rec: RecHandle,
+    /// The annotated trace (trace.rs).
+    pub trace: Arc<Trace>,
 }
 
 /// Why the bus answered busy.
@@ -426,7 +432,7 @@ impl BoardLocks {
     }
 
     pub fn new(s: Box<Board>) -> Self {
-        let (front, fifo, raster, shared) = (s.front.clone(), s.fifo.clone(), s.raster.clone(), s.scanout.shared.clone());
+        let (front, fifo, raster, shared, trace) = (s.front.clone(), s.fifo.clone(), s.raster.clone(), s.scanout.shared.clone(), s.trace.clone());
         BoardLocks {
             board: Arc::new(BoardCell::new(s)),
             submit: Arc::new(crate::locks::SpinLock::new(())),
@@ -435,9 +441,70 @@ impl BoardLocks {
             raster,
             refusals: Arc::new(RefusalStats::new()),
             shared,
+            rec: RecSlot::new(None),
+            trace,
         }
     }
 
+    /// Record a bus access, if a recording runs. Called with `submit` held
+    /// for the accesses that take it, so the records come out in the order
+    /// the stores were taken (lock order: `submit`, then the recorder).
+    #[inline]
+    fn record(&self, f: impl FnOnce(&mut Recorder)) {
+        if self.rec.active() {
+            if let Some(r) = self.rec.lock().as_mut() {
+                f(r);
+            }
+        }
+    }
+
+    /// A bus access the board took, other than a command store: recorded,
+    /// and traced as a CPU access.
+    fn taken(&self, write: bool, addr: u64, size: u32, val: u64) {
+        self.record(|r| if write { r.write(size as u8, addr as u32, val) } else { r.read(size as u8, addr as u32, val) });
+        if self.trace.on(TRACE_CPU) {
+            self.trace.cpu(write, addr, size, val);
+        }
+    }
+
+    /// The board for the monitor: the processors held off and the board's
+    /// threads idle, the FIFO drained and the raster queue empty, which is
+    /// the state a waiting read sees. Looks for up to `timeout`, releasing
+    /// the processors' lock between looks so their stores go on landing;
+    /// None when the board stays busy that long. With no board thread the
+    /// waiting stores run here, as they do for a waiting access.
+    ///
+    /// The guard holds the processors' lock, so hold it briefly: format
+    /// under it, write to the monitor's socket after it.
+    pub fn quiesce(&self, timeout: std::time::Duration) -> Option<BoardGuard<'_>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let cpu = self.submit.lock();
+            if !self.fifo.running.load(Ordering::SeqCst) {
+                // SAFETY: no board thread runs; the stores waiting run here,
+                // as `write_command` runs them without the thread.
+                let mut g = unsafe { self.board(cpu) };
+                g.work_drain(0);
+                g.raster_wait();
+                return Some(g);
+            }
+            self.raster.request_flush();
+            if !self.fifo.pending() && self.raster.pending() == 0 {
+                // SAFETY: as `bus_read`: the FIFO and the raster queue are
+                // empty, so the board's thread is idle, and no processor
+                // can push a store while `submit` is held.
+                return Some(unsafe { self.board(cpu) });
+            }
+            drop(cpu);
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            self.fifo.hurry();
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
+#[cfg(test)]
     /// A read for a caller other than the bus (tests, the monitor): through the
     /// front alone when it can, else it runs what waits and reads the state.
     /// With the board's thread running, call `bus_read` and retry instead.
@@ -462,6 +529,7 @@ impl BoardLocks {
     /// queue itself.
     pub fn bus_read(&self, addr: u64, size: u32) -> Option<u64> {
         if let Some(v) = front_mmio_read(&self.front, addr, size) {
+            self.taken(false, addr, size, v);
             return Some(v);
         }
         // From the busy check to the end of the access no other processor
@@ -474,13 +542,17 @@ impl BoardLocks {
                 return None;
             }
             if self.raster.pending() != 0 {
+                self.raster.request_flush();
                 self.refusals.note(Refusal::ReadRaster, addr, size);
                 return None;
             }
         }
         // SAFETY: the FIFO and the raster queue are empty, or the access is
         // a whole-word read.
-        Some(unsafe { self.board(cpu) }.mmio_read(addr, size))
+        let mut g = unsafe { self.board(cpu) };
+        let v = g.mmio_read(addr, size);
+        self.taken(false, addr, size, v);
+        Some(v)
     }
 
     /// A processor's store as the bus takes it. False, for the bus to
@@ -498,6 +570,7 @@ impl BoardLocks {
         if front_register(addr, size, true) {
             // The host interface's registers: no board state, no wait.
             self.write(addr, value, size);
+            self.taken(true, addr, size, value);
             return true;
         }
         let cpu = self.submit.lock();
@@ -508,6 +581,7 @@ impl BoardLocks {
                 self.refusals.note(Refusal::StoreFull, addr, size);
                 return false;
             }
+            self.record(|r| r.write(size as u8, addr as u32, value));
             self.write_command(cpu, addr, value, size);
             return true;
         }
@@ -517,6 +591,7 @@ impl BoardLocks {
             self.refusals.note(Refusal::StoreWaits, addr, size);
             return false;
         }
+        self.taken(true, addr, size, value);
         self.write_board(cpu, addr, value, size);
         true
     }

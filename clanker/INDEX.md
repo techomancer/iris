@@ -253,8 +253,19 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 |---|---|---|
 | [bringup.md](odyssey/bringup.md) | howto | VPro on the Octane: board catalogue, Crossbow code 5, PROM/IRIX minimums, disk images |
 | [gotchas.md](odyssey/gotchas.md) | rule | VPro gotchas: IMPACT installs lack the driver, textport FIFO cost, the f64 depth path |
+| [monitor-reads-quiesce-the-board.md](odyssey/monitor-reads-quiesce-the-board.md) | design | `vpro` state commands quiesce the board through `BoardLocks::quiesce` (format under the guard, write after); pixel, screen and memory dumps read board memory lock-free as the display does |
+| [wid-copies-move-the-bytes-the-masks-name.md](odyssey/wid-copies-move-the-bytes-the-masks-name.md) | rule | The X server fills a menu's overlay with whole-pixel copies in the window-id buffer under draw mask 0xc: copy raw only between like fields, write only the bytes the draw and plane masks name |
+| [front-and-back-arrives-as-front.md](odyssey/front-and-back-arrives-as-front.md) | open | pixtest's FRONT_AND_BACK geometry comes with draw mask 1, word for word the front-only draw; no board model can write the back from it; unsettled on the V10 (no double-buffered visual) |
 | [public-references.md](odyssey/public-references.md) | open | Odyssey (VPro) public references: two console-level drivers, no GL stream |
+| [test-encoder-hides-decoder-mistakes.md](odyssey/test-encoder-hides-decoder-mistakes.md) | rule | Golden scenes reach the pipeline's words through a test encoder that mirrors the decoder, so they cannot catch a misread word (bit 23 winding); judge on a real-stream replay |
+| [ring-wakeup-needs-seqcst-head-store.md](odyssey/ring-wakeup-needs-seqcst-head-store.md) | rule | The shader and back-end rings' sleep handshake lost wake-ups: a Release head store let the sleeping-flag load pass it; both sides must be SeqCst |
+| [v10-hardware-limits.md](odyssey/v10-hardware-limits.md) | measure | A real V10's visuals (4444, 5551, 8888, 10:10:10:2; no 12/12/12/12, no multisample), limits (viewport 3840, texture 512, subpixel 3), pbuffers (screen-sized, 2048 refused) and the driver's accumulation and smooth-primitive antialiasing |
+| [v10-vs-emulator-first-comparison.md](odyssey/v10-vs-emulator-first-comparison.md) | measure | Board against emulator: aliased lines, stipples, points, polygon modes identical; smooth lines/points differ; ~45 pixel-path failures (colour index, scale-bias, maps, signed texture uploads, stencil draws) and depth read-back precision; how to run the comparison |
+| [trace-and-recording.md](odyssey/trace-and-recording.md) | design | `vpro trace` (gputrace, four classes, hooks and their cost) and `vpro rec` (the recorder slot, marks, lock order, what a mid-session recording can and cannot show) |
 | [threads-and-locks.md](odyssey/threads-and-locks.md) | design | VPro threads, who owns the board and raster state, the processors' lock, the lock-free display, the command ring and its ordering rules |
+| [texture-unit-registers-only.md](odyssey/texture-unit-registers-only.md) | rule | No struct that is not a register unless it caches expensive decode or holds data in flight; texture registers in draw state slots (copy-on-write), one latch, monomorphised address and gather fns, a per-quad 8x8 tap window, board memory masked, no refusals; repr(C) |
+| [lanes-field-view-is-eight-bytes.md](odyssey/lanes-field-view-is-eight-bytes.md) | rule | Window moves copy 16-byte pixels as two 8-byte halves; a lanes field's view length must be 8, not 6 (ghost text in title bars) |
+| [screen-tiles.md](odyssey/screen-tiles.md) | design | The fragment pipeline on screen tiles: one command per primitive, its index on every tile it touches, one owner per tile walks, shades and stores in order; bit-exact; Quake replay 86 s (three stages) to 18 s (64-pixel tiles, 16 workers) |
 
 ## hostgl/
 
@@ -408,6 +419,9 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [irix7-fork-review.md](plans/irix7-fork-review.md) | plan | The `irix7/iris` fork — change inventory and triage |
 | [jitv2_performance_analysis.md](plans/jitv2_performance_analysis.md) | plan | jitv2 performance — where to spend effort next |
 | [net-stack.md](plans/net-stack.md) | plan | The NAT network stack: analysis and redesign plan |
+| [odyssey-architecture-review.md](plans/odyssey-architecture-review.md) | plan | The VPro (Odyssey) model after the merge: data path, threads, debug tooling vs the other boards, T&L overlap, float vs fixed, texture specialisations, JIT feasibility, quad scanline raster |
+| [odyssey-quad-pipeline.md](plans/odyssey-quad-pipeline.md) | plan | Plan: a three-stage quad pipeline for the VPro rasteriser (rasteriser, shader, back end on threads; quake1 timedemo as the workload) |
+| [odyssey-board-memory.md](plans/odyssey-board-memory.md) | plan | VPro board memory as the hardware has it: one tiled SDRAM pool addressed by base/pitch/format, replacing the fixed planes and the invented object store; measure the tile layout on a real V10 first |
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
 | [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |

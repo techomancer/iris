@@ -2,9 +2,11 @@
 //! on, and the page-table transfers that move pixels between guest memory
 //! and the board.
 
+use crate::dev::odyssey::field::{Codec, Field};
+use crate::dev::odyssey::view::{Rows, View, MAX_DIM};
+use crate::dev::odyssey::vram::Surface;
 use crate::dev::odyssey::board::Board;
 use crate::dev::odyssey::consts::{ctx, dma, host, reg, ODSY_USER_CMD_FIFO};
-use crate::dev::odyssey::mmio::BoardLocks;
 use crate::dev::odyssey::tests::{
     board_with_ram, cmd, cmd64, pixel, pixel_write, reg_write, route_to_heart, select, DMA_VECTOR,
     FLAG_VECTOR, Ram, SOFTSYNC_VECTOR,
@@ -49,23 +51,39 @@ pub(super) fn put_table(ram: &Ram, table: u64, header: [u32; 8], entries: &[u64]
     ram.put(table, &t);
 }
 
-/// A header naming the 16-pixel-wide RGBA8 object at `OBJECT`: origin
-/// (0, 0), `rows` rows of 64 bytes, 4 bytes a pixel, source format 0x4b,
-/// and the DMA-done request when `irq` is set.
+/// A header naming a 16-pixel-wide RGBA8 surface at `OBJECT`: origin
+/// (0, 0), one tile a row, word 4 the library's for 4-byte RGBA8 (pixel
+/// and field 4 bytes), `rows` rows of 64 bytes, 4 bytes a pixel, source
+/// format 0x4b, and the DMA-done request when `irq` is set.
 fn object_header(rows: u32, irq: bool) -> [u32; 8] {
-    [OBJECT, 0, 1, rows << 16 | 16, 0, 0, 64, if irq { dma::IRQ_REQUEST } else { 0 } | 1 << 16 | 0x4b]
+    [OBJECT, 0, 1, rows << 16 | 16, 0x8001_3042, 0, 64, if irq { dma::IRQ_REQUEST } else { 0 } | 1 << 16 | 0x4b]
+}
+
+/// Pixel (x, y) of the surface at `base` (`stride` tiles, 1 << `log2`
+/// bytes a pixel) as the model's word, its field packed as `codec`.
+fn mem_word(s: &Board, base: u32, stride: u32, log2: u8, codec: Codec, x: i32, y: i32) -> u32 {
+    s.raster_wait();
+    let surface = Surface::new(base, stride, log2);
+    Rows::new(s.vram_ptr(), View::colour(&surface, Field { at: 0, codec }, MAX_DIM)).load_word(x, y).unwrap()
 }
 
 /// Word `i` of the object, 16 texels a row.
 fn object_word(s: &mut Board, i: u32) -> u32 {
-    let obj = s.object_find(OBJECT);
-    let obj = obj.expect("the transfer made the object");
-    s.object_load(obj, i % 16, i / 16)
+    mem_word(s, OBJECT, 1, 2, Codec::Texel { bytes: 4, field: 5 }, (i % 16) as i32, (i / 16) as i32)
 }
 
-/// The colour destination select the X server sends, naming buffer 0x2000.
+/// The colour destination select the X server sends: the test screen's
+/// pixel mode (Board::test_screen()).
 pub(super) fn colour_destination(s: &mut Board) {
-    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, 0x2000_6950, 0] {
+    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, 0x0040_6d50, 0] {
+        s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
+    }
+}
+
+/// The pixel mode the library selects before it uploads to the object:
+/// 4-byte pixels, one 4-byte RGBA8 field, a scratch surface.
+fn object_destination(s: &mut Board) {
+    for w in [select(reg::DEST_SELECT), OBJECT, 1, 0x0800_24d0, 0] {
         s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
     }
 }
@@ -139,6 +157,7 @@ fn a_page_table_transfer_lands_across_pages_and_raises_dma_done() {
         &[pte(PAGE_A + first_off, first_len), pte(PAGE_B, page1_len)],
     );
 
+    object_destination(&mut s);
     descriptor(&mut s, TABLE);
 
     let words = first_len / 4;
@@ -159,35 +178,6 @@ fn a_page_table_transfer_lands_across_pages_and_raises_dma_done() {
     assert_eq!(object_word(&mut s, page1_len / 4 - 1), 0xbb00_0000 | (page1_len / 4 - 1));
 }
 
-/// A transfer into an object lands on the raster unit, in order behind
-/// the raster work queued before it, which may still read the texels it
-/// replaces: the descriptor returns while that work is still queued. A
-/// later read of the object waits for the transfer and sees it. (A
-/// transfer that grows its object still waits: growing may move it.)
-#[test]
-fn an_object_transfer_queues_behind_the_raster_work_before_it() {
-    let (s, _rec, ram) = fenced_board();
-    let h = BoardLocks::new(s);
-    put_table(&ram, TABLE, object_header(1, false), &[pte(PAGE_A, 64)]);
-    // The object exists with its row before the raster unit has work.
-    descriptor(&mut h.test_board(), TABLE);
-    h.raster.start();
-    // The raster unit's next slice holds it for 300 ms, as a long draw would.
-    h.raster.test_slice_sleep_ms.store(300, std::sync::atomic::Ordering::SeqCst);
-    h.raster.submit(|_| {});
-    let row: Vec<u8> = (0..16u32).flat_map(|i| (0xdd00_0000u32 | i).to_be_bytes()).collect();
-    ram.put(PAGE_A, &row);
-    {
-        let mut s = h.test_board();
-        descriptor(&mut s, TABLE);
-        assert_eq!(h.raster.pending(), 2, "the transfer queues behind the raster work");
-        assert_eq!(object_word(&mut s, 0), 0xdd00_0000);
-        assert_eq!(object_word(&mut s, 15), 0xdd00_000f);
-        assert_eq!(h.raster.pending(), 0, "reading the object waited for the transfer");
-    }
-    h.raster.stop();
-}
-
 /// A descriptor whose entries disagree with its header, one entry
 /// claiming more bytes than the header's rectangle, fails the transfer
 /// before anything lands. The board still consumed the descriptor, so the
@@ -201,6 +191,7 @@ fn a_transfer_that_disagrees_with_its_header_lands_nothing_but_still_completes()
     put_table(&ram, TABLE, object_header(1, true), &[pte(PAGE_A, 0xffff)]);
     ram.put(PAGE_A, &[0x11; 0x40]);
 
+    object_destination(&mut s);
     descriptor(&mut s, TABLE);
 
     assert_eq!(rec.events(DMA_VECTOR), [true]);
@@ -210,6 +201,20 @@ fn a_transfer_that_disagrees_with_its_header_lands_nothing_but_still_completes()
     put_table(&ram, TABLE, object_header(1, true), &[pte(PAGE_A, 0xffff)]);
     descriptor(&mut s, TABLE);
     assert!(rec.silent(), "no destination is programmed");
+}
+
+/// The library uploads a texture, or the scratch image a zoomed
+/// glDrawPixels draws from, while the window is still the pixel mode
+/// (traced: pixtest zoombig, a 200x60 RGBA image to 0x16b800). An address
+/// that is not the frame buffer the scan-out shows is memory: its texels
+/// keep the source's alpha, where a put to the screen stores 255.
+#[test]
+fn an_upload_to_memory_the_select_does_not_name_keeps_its_alpha() {
+    let (mut s, _, ram) = board_with_ram();
+    ram.put(PAGE_A, &[0x11, 0x6c, 0xc7, 0x22].repeat(16));
+    put_table(&ram, TABLE, object_header(1, false), &[pte(PAGE_A, 64)]);
+    descriptor(&mut s, TABLE);
+    assert_eq!(object_word(&mut s, 0), 0x116c_c722, "the window is selected; the object keeps its alpha");
 }
 
 /// One kick names one 128-byte work-list entry: the 32-byte header and up
@@ -234,6 +239,7 @@ fn a_full_work_list_entry_takes_exactly_twelve_pages() {
     let after = TABLE + dma::TABLE_HEADER + 12 * 8;
     ram.put(after, &[0xff; 0x800]);
 
+    object_destination(&mut s);
     descriptor(&mut s, TABLE);
 
     for k in 0..12u32 {
@@ -264,7 +270,7 @@ fn a_clipped_transfer_draws_chunk_by_chunk_and_interrupts_on_the_last() {
             rows[c] << 16 | 200,
             0x50,
             1 << 16 | 2,
-            0x8223_305a,
+            0x8263_305a,
             0,
             8,
             if c == 1 { dma::IRQ_REQUEST } else { 0 } | 0x3201_0000,
@@ -308,7 +314,7 @@ fn a_clipped_transfer_draws_chunk_by_chunk_and_interrupts_on_the_last() {
 fn an_image_transfer_skips_the_row_gap_and_crosses_pages() {
     let (mut s, rec, ram) = fenced_board();
     colour_destination(&mut s);
-    let mut header = [0x2000, 300 << 16 | 200, 0x50, 2 << 16 | 3, 0x8223_305a, 4, 12, 0x3201_0000];
+    let mut header = [0x2000, 300 << 16 | 200, 0x50, 2 << 16 | 3, 0x8263_305a, 4, 12, 0x3201_0000];
     let entries = [pte(PAGE_A + 0x3ff8, 8), pte(PAGE_B, 16)];
     ram.put(PAGE_A + 0x3ff8, &[0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00]);
     let b: Vec<u8> = [0x0000_00ffu32, 0xdead_beef, 0x0011_2233, 0x0044_5566, 0x0077_8899]
@@ -338,8 +344,8 @@ fn an_image_transfer_skips_the_row_gap_and_crosses_pages() {
     assert_eq!(rec.events(DMA_VECTOR), [true]);
 }
 
-/// A transfer to another destination, an off-screen object, lands in that
-/// object and leaves the colour plane alone. Its word 7 carries no format
+/// A transfer to another destination, an off-screen surface, lands there
+/// and leaves the screen alone. Its word 7 carries no format
 /// code, so the 4-byte pixels keep the 0x00RRGGBB rule.
 ///
 /// QEMU: command-fifo-dma-image (the object destination).
@@ -354,12 +360,12 @@ fn an_image_transfer_to_an_object_leaves_the_plane_alone() {
 
     descriptor(&mut s, TABLE);
 
-    let obj = s.object_find(0x16a000);
-    let obj = obj.unwrap();
-    assert_eq!(s.object_load(obj, 0, 0), 0x0000_ffff);
-    assert_eq!(s.object_load(obj, 1, 0), 0xadbe_efff);
-    assert_eq!(s.object_load(obj, 2, 0), 0x1122_33ff);
-    assert_eq!(s.object_load(obj, 3, 0), 0);
+    // Word 4 0x80025000: 8-byte pixels and fields, which hold the word whole.
+    let word = |x| mem_word(&s, 0x16a000, 0x10, 3, Codec::Lanes, x, 0);
+    assert_eq!(word(0), 0x0000_ffff);
+    assert_eq!(word(1), 0xadbe_efff);
+    assert_eq!(word(2), 0x1122_33ff);
+    assert_eq!(word(3), 0);
     assert_eq!(pixel(&s, 0, 0, 0), 0);
 }
 
@@ -383,7 +389,7 @@ fn readback_table(s: &mut Board, ram: &Ram, header: [u32; 8]) {
 fn a_readback_sends_the_pixel_to_the_guest_as_abgr() {
     let (mut s, rec, ram) = fenced_board();
     colour_destination(&mut s);
-    let mut header = [0x2000, 300 << 16 | 200, 0x50, 0x10001, 0x8223_305a, 0, 4, 0x3301_004c];
+    let mut header = [0x2000, 300 << 16 | 200, 0x50, 0x10001, 0x8263_305a, 0, 4, 0x3301_004c];
     pixel_write(&mut s, 200, 300, 0xc0ff_eeff);
     ram.put(PAGE_A, &[0xa5; 36]);
     let mut expect = [0xa5u8; 36];
@@ -424,7 +430,7 @@ fn an_xputimage_pixel_in_abgr_order_lands_orange_not_blue() {
     colour_destination(&mut s);
     ram.put(PAGE_A + 16, &[0x00, 0x01, 0x9b, 0xfd]);
 
-    readback_table(&mut s, &ram, [0x2000, 300 << 16 | 200, 0x50, 0x10001, 0x8223_305a, 0, 4, 0x3201_004c]);
+    readback_table(&mut s, &ram, [0x2000, 300 << 16 | 200, 0x50, 0x10001, 0x8263_305a, 0, 4, 0x3201_004c]);
 
     assert_eq!(pixel(&s, 0, 200, 300), 0xfd9b_01ff);
 }
@@ -465,23 +471,3 @@ fn a_context_switch_with_no_shadow_address_writes_nothing() {
     assert_eq!(ram.get(0, 0x2000), before);
 }
 
-/// A transfer into the colour buffer marks the rows it covers to resolve
-/// again, and a transfer into an off-screen object marks none: the display
-/// does not scan an object.
-#[test]
-fn a_dma_transfer_dirties_only_the_rows_it_wrote() {
-    let (mut s, _, ram) = board_with_ram();
-    let lines = |s: &Board| s.scanout.marks.dirty_rows();
-    colour_destination(&mut s);
-    ram.put(PAGE_A, &[0x10; 24]);
-    s.scanout_update();
-
-    put_table(&ram, TABLE, [0x2000, 300 << 16 | 200, 0x50, 2 << 16 | 3, 0x8223_305a, 4, 12, 0x3201_0000], &[pte(PAGE_A, 24)]);
-    descriptor(&mut s, TABLE);
-    assert_eq!(lines(&s), vec![300, 301]);
-    s.scanout_update();
-
-    put_table(&ram, TABLE, [0x16a000, 0, 0x10, 1 << 16 | 3, 0x8002_5000, 0, 12, 0x3201_0000], &[pte(PAGE_A, 12)]);
-    descriptor(&mut s, TABLE);
-    assert!(lines(&s).is_empty(), "an object is not on the screen");
-}

@@ -59,6 +59,7 @@ pub(super) struct DmaBus {
     pub mem: GuestMemory,
     /// The MMIO write that started the transfer, which a traced chunk
     /// names (Board::trace_sequence).
+    #[cfg_attr(not(feature = "developer"), allow(dead_code, reason = "read by dlog_dev! with developer"))]
     pub trace_sequence: u64,
 }
 
@@ -75,7 +76,6 @@ pub(super) struct DmaChunk {
     pub host: Vec<u8>, // the chunk's bytes
     pub len: u32,
     pub pos: u64,      // offset within the page-listed buffer
-    pub addr: u64,     // device address, as traced
     pub bus_addr: u64, // bus address the transfer used
     /// The bytes the head wrote, as offsets into the chunk: one run from
     /// the first to the last, empty while written_end is 0.
@@ -182,7 +182,6 @@ impl DmaBus {
                 host: vec![0u8; n as usize],
                 len: n as u32,
                 pos,
-                addr,
                 bus_addr,
                 written_start: 0,
                 written_end: 0,

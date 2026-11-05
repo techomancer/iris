@@ -10,7 +10,7 @@ use crate::dev::odyssey::interface::HostInterface;
 use crate::dev::odyssey::mmio::BoardLocks;
 use crate::dev::odyssey::tests::{
     board, board_with_ram, cmd, cmd64, reg_read, reg_write, route_to_heart, select, FLAG_VECTOR,
-    Ram, VPRO_WIDGET,
+    Ram,
 };
 use crate::dev::odyssey::worker::Budget;
 use parking_lot::Mutex;

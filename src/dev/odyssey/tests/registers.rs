@@ -619,24 +619,24 @@ fn the_restart_select_1ed_is_accepted_and_0741_is_reported() {
 }
 
 /// The alpha reference is a 12-bit field, x4096 with 1.0 sent as 4095 and
-/// 0x800 = 0.5. The board's alpha test (`RasterRules::alpha_test`) compares at
-/// 12 bits: a fragment alpha on the field's step passes GL_GEQUAL and fails
-/// GL_GREATER; one field step below fails both, one above passes both.
+/// 0x800 = 0.5. The shader's alpha test compares at 12 bits: a fragment
+/// alpha on the field's step passes GL_GEQUAL and fails GL_GREATER; one
+/// field step below fails both, one above passes both.
 #[test]
 fn the_alpha_reference_field_is_a_fraction_of_4096() {
-    use crate::dev::odyssey::gl_context::{GL_GEQUAL, GL_GREATER};
+    use crate::dev::odyssey::pipe::encode::{GL_GEQUAL, GL_GREATER};
+    use crate::dev::odyssey::pipe::fixed;
 
     for field in [1u32, 2048, 4094] {
         let (mut s, _) = board("v12");
         for (func, at_passes) in [(GL_GEQUAL, true), (GL_GREATER, false)] {
             cmd(&mut s, select(reg::ALPHA_FUNC));
             cmd(&mut s, func << 12 | field);
-            let r = s.gl_ctx.cur.alpha_ref;
+            let w = s.fragment_words().shader;
             let step = |k: i32| (field as i32 + k) as f64 / 4096.0;
+            let passes = |alpha: f64| w.alpha_func().test(fixed::alpha12(fixed::from_f64(alpha)), w.alpha_ref() as u32);
 
-            assert_eq!(r, field as f32 / 4096.0, "field {field}");
-            let rules = crate::dev::odyssey::draw::gl_rules();
-            let passes = |alpha: f64| rules.alpha_test(func, alpha, r as f64);
+            assert_eq!(w.alpha_ref() as u32, field, "field {field}");
             assert_eq!(passes(step(0)), at_passes, "field {field} at the reference, func {func:#x}");
             assert!(!passes(step(-1)), "field {field} one step below, func {func:#x}");
             assert!(passes(step(1)), "field {field} one step above, func {func:#x}");
@@ -644,9 +644,7 @@ fn the_alpha_reference_field_is_a_fraction_of_4096() {
     }
     let (mut s, _) = board("v12");
     cmd(&mut s, select(reg::ALPHA_FUNC));
-    cmd(&mut s, (crate::dev::odyssey::gl_context::GL_ALWAYS << 12) | 4095);
-    assert_eq!(s.gl_ctx.cur.alpha_ref, 1.0, "the top field is exactly 1.0");
-    cmd(&mut s, select(reg::ALPHA_FUNC));
-    cmd(&mut s, (crate::dev::odyssey::gl_context::GL_ALWAYS << 12) | 0x800);
-    assert_eq!(s.gl_ctx.cur.alpha_ref, 0.5, "0x800 is 0.5");
+    cmd(&mut s, (crate::dev::odyssey::pipe::encode::GL_GEQUAL << 12) | 4095);
+    let w = s.fragment_words().shader;
+    assert!(w.alpha_func().test(fixed::alpha12(fixed::from_f64(1.0)), w.alpha_ref() as u32), "1.0 passes the top field");
 }

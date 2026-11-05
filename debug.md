@@ -31,7 +31,7 @@ What you can inspect depends on how iris was built:
 | plain `--release` | Everything in this document except the **[DEV]** items. Breakpoints and the traceback work. |
 | `lightning` (official releases) | Strips breakpoint checks and the traceback buffer for speed: breakpoints and `dt` do nothing. Inspection commands still work. |
 | `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`debug`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
-| `--features gputrace` | Graphics traces and recordings (`rex/gr2/mgras trace`, `rex/mgras rec`) without the rest of `developer`; works with `lightning`. |
+| `--features gputrace` | Graphics traces and recordings (`rex/gr2/mgras/vpro trace`, `rex/mgras rec`) without the rest of `developer`; works with `lightning`. `vpro rec` needs no feature. |
 | `--features jitv2` | The `j2` commands. `jitv2_lockstep` checks every JIT instruction against the interpreter. |
 | `--features perfetto` | Perfetto timeline traces ([docs/perfetto.md](docs/perfetto.md)). |
 
@@ -441,6 +441,40 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `mgras trace <file> [hq,rss,cpu,tex\|all]` / `mgras trace flush\|off` | Annotated trace (also `IRIS_MGRAS_TRACE=<file>`) |
 | `mgras rec <file>` / `mgras rec mark\|off` | Replayable recording; replay with `MGRAS_REPLAY=<file> cargo test --release --lib mgras_replay_file` |
 | `rss [regs]` / `rss pix <x> <y> [w] [h]` | Raster registers (decoded IR, each engine's backlog) / raw pixels |
+
+**VPro (Odyssey, Octane V6/V8/V10/V12)**
+
+State commands wait up to 500 ms for the board's thread and raster unit to
+go idle, then read a consistent state; a board that stays busy answers
+"board busy" instead of a torn read. Pixel commands (`pix`, `raw`, `shot`,
+`fbdump`, `dispmode`, `lut`, `cursor`) read the planes and the back end's
+registers the way the display thread does, lock-free, and never stall the
+guest. `y = 0` is the top display line throughout.
+
+| Command | Description |
+|---|---|
+| `vpro [status]` | Board summary: identity, interrupts, swap bank, FIFO and raster queue levels, display frames, cursor, product and memory, drawing words and the pixel mode, primitive assembly, unmodelled reports |
+| `vpro regs` | Host interface registers (no wait) and the widget's modelled registers: memory and flow-control config, FIFO set-up words, DMA and statistics addresses, BUZZ words, NIC, i2c, back-end index |
+| `vpro fifo` | Command FIFO levels, raster queue, the command parser's state, the 2D stream, the open GL primitive, the image raster and query records |
+| `vpro state` | The state a draw is made under: primitive assembly (open primitive, held vertices, colour and texture coordinate), the transform (matrices, viewport, depth range, user clip planes), the raster words decoded (cull, polygon modes and offset, line and point sizes, stipples, scissor, window), the shader and back-end state the stages run with, and the board's own drawing words (draw mask, dest, plane mask, colour mode, depth function, write mask, blend word) |
+| `vpro geom` | Geometry engine: lighting enables, program address, modelview and normal matrices, material, light selects, class words, eye clip planes |
+| `vpro tex` | The current draw state slot's texture registers (path, sampler with its fields decoded: size, wraps, filters, class, stored border, colour table, border colour; environment, first level, LOD, scale/bias, offset), the vertex side's texture coordinate and texgen words, the latch the next draw takes (levels with their addresses, rows and sizes, LOD clamps, scales, unimplemented bits; `stale` until a draw latches it), and the level table entries in use |
+| `vpro win` | Window origin, the four clip rectangles and which are kept, the id-plane compare, the committed window |
+| `vpro mem` | Board memory: its size, the pixel mode (block 0x017: origin, stride in tiles, status word decoded) and the fields it gives the destination (A, B, depth, stencil), the buffer select and drawable words, the scan-out registers (PB&J 0x2800-0x2809: window-id and pixel bases, size, stride, depth) and the scanout mode |
+| `vpro backend [start] [n]` | Back-end register file entries (0x2000-0x2fff) that are set, display modes decoded |
+| `vpro lut [start] [n]` | Colour lookup RAM entries: the word, ten-bit channels, the RGB they resolve to |
+| `vpro dispmode` | Display modes per drawable id (group, RGB or index, channel width, which buffer shows, pixels on screen), overlay modes, and every id byte on screen with its pixel count and bounding box |
+| `vpro cursor` | Cursor control bits, position, colours and the glyph as text |
+| `vpro pix <x> <y>` | One screen pixel as the scan-out reads it: the window-id byte (main and overlay id) and overlay byte, the frame-buffer pixel's address and bytes, the display mode with the A and B fields it reads and which one shows, the overlay mode, and the screen colour |
+| `vpro raw <x> <y> [w] [h]` | Frame-buffer pixels' bytes as the scan-out reads them, with each pixel's window-id and overlay bytes |
+| `vpro peek <addr> [bytes]` | Board memory at an address in 16-byte units (the unit every base register uses), as hex bytes |
+| `vpro shot <file.png>` | The screen composed from board memory now, without waiting for the display thread |
+| `vpro fbdump [dir]` | The composed screen as `screen.png`, all of board memory as `board.bin` (offset = address x 16), and `layout.txt` with the pixel mode, the scan-out registers and the display modes (default `vprodump/`) |
+| `vpro hash` | The hash of board memory a replay checkpoint takes (`golden/replay.rs`), to compare a live board with a recording |
+| `vpro unimp` | Offsets and command words the board reported as not modelled |
+| `vpro refusals [reset]` | Bus accesses answered busy, by reason, offset and width |
+| `vpro trace <file> [fifo,draw,cpu,dma\|all]` / `vpro trace flush\|off` / `vpro trace` | Annotated trace (`gputrace` builds; also `IRIS_ODSY_TRACE=<file>` from power-on): `FIFO` lines are command words as the parser completes them, named, with their operands as words and as floats where the word carries floats, plus copy rects, pattern and matrix loads, image boxes and bursts, queries and unknown words; `DRAW` lines each assembled primitive sent to the raster unit (`draw TRIANGLES n=3 ctx=1 textured depth queued cost 96`) and each clear; `CPU` lines every bus access that is not a command store, repeats collapsed; `DMA` lines the page-table descriptors. `flush` writes the buffer out (it is written at most twice a second otherwise); alone, the trace's state |
+| `vpro rec <file>` / `vpro rec mark\|off` / `vpro rec` | Replayable recording (record.rs; also `IRIS_ODSY_REC=<file>` from power-on): every bus store and load and the DMA reads, gzip. A start, a `mark` and `off` wait for the board to go idle and write the memory hash (`vpro hash`) into the file, so a replay can check board memory at those points; a recording started mid-session cannot reproduce the live memory and says so when replayed, but still replays deterministically. Alone, the recording's state. Replay: `VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture` (see `src/dev/odyssey/testdata/README.md`) |
 
 `iris-ci screenshot` captures the composed screen from any board, also
 headless.
