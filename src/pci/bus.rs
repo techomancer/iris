@@ -5,13 +5,15 @@
 //! saved state. The bridge keeps what is its own, as [`PciHost`] says.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::host::PciHost;
 use super::intx::IntxTable;
 use super::slots::{BusDesc, PciAddr};
-use super::{PciBusDevice, Space};
+use super::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, Space};
 use crate::irq::IrqLine;
+use crate::traits::BusDevice;
 
 /// A card a user fitted, as the bus records it for saved state.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -33,6 +35,9 @@ struct Placed {
     f: Arc<dyn PciBusDevice>,
     origin: Origin,
 }
+
+/// Which function, BAR, CPU address, lanes and mask a [`PciBar`] entry serves.
+type EntryKey = (usize, usize, u64, u32, u64);
 
 /// The most BAR windows open at once on a bus. A window is one word of the
 /// decode table; more than this and the extra are ignored with a warning.
@@ -86,6 +91,11 @@ pub struct PciBus {
     windows: Box<[AtomicU64]>,
     nwindows: AtomicUsize,
     rebuild: Mutex<()>,
+    /// Where the runs of the windows a BAR decodes whole go (the machine
+    /// maps them over the host's windows), and the entries made for them,
+    /// one per (function, BAR, CPU address, lanes, mask).
+    sink: RwLock<Option<BarRunSink>>,
+    entries: Mutex<HashMap<EntryKey, Arc<dyn BusDevice>>>,
 }
 
 impl PciBus {
@@ -100,6 +110,8 @@ impl PciBus {
             windows: (0..MAX_WINDOWS).map(|_| AtomicU64::new(0)).collect(),
             nwindows: AtomicUsize::new(0),
             rebuild: Mutex::new(()),
+            sink: RwLock::new(None),
+            entries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -191,6 +203,41 @@ impl PciBus {
     /// and republish the BAR runs.
     fn changed(&self) {
         self.rebuild();
+        self.publish();
+    }
+
+    /// Send the runs of the host's CPU windows that one BAR decodes whole
+    /// to `sink`, now and after every change to what the functions decode.
+    /// Each run is a [`PciBar`] at its CPU address: the machine maps it on
+    /// its physical bus over the host's window, so the processor reaches
+    /// the function with no search of the windows. Everything else in a
+    /// window (BARs smaller than a page, unclaimed addresses) still goes
+    /// to the host.
+    pub fn on_bar_runs(&self, sink: BarRunSink) {
+        *self.sink.write().unwrap() = Some(sink);
+        self.publish();
+    }
+
+    /// Publish the runs again. A host calls this when one of its own
+    /// registers moves a window; the bus does it on every header change.
+    pub fn publish(&self) {
+        let sink = self.sink.read().unwrap();
+        let Some(sink) = sink.as_ref() else { return };
+        let funcs: Vec<(usize, Arc<dyn PciBusDevice>)> =
+            self.funcs.iter().enumerate().filter_map(|(i, p)| Some((i, p.get()?.f.clone()))).collect();
+        let mut runs: Vec<BarRun> = Vec::new();
+        for w in self.host.windows() {
+            let entry = |b: BarAt| {
+                self.entries
+                    .lock()
+                    .unwrap()
+                    .entry((b.slot, b.bar, b.cpu_base, w.lanes_key, w.mask))
+                    .or_insert_with(|| Arc::new(PciBar::new(w.lanes.clone(), b.dev.clone(), b.bar, w.mask, b.cpu_base)))
+                    .clone()
+            };
+            runs.extend(bar_runs(&funcs, w.space, w.cpu, w.pci, w.len, entry));
+        }
+        sink(runs);
     }
 
     /// Rebuild the decode table from the functions' headers, in device,
@@ -471,5 +518,78 @@ pub(crate) mod tests {
         ] {
             assert_eq!(Window::unpack(w.pack()), w);
         }
+    }
+
+    /// A host with the O2's three windows: low I/O, low memory (CPU
+    /// 0x1a00_0000 onto PCI 0x8000_0000) and a one-to-one high memory.
+    fn windowed() -> (Arc<TestHost>, PciBus, Arc<Mutex<Vec<BarRun>>>) {
+        use crate::pci::host::CpuWindow;
+        let (h, b) = bus();
+        let w = |space, cpu, pci, len| CpuWindow { space, cpu, pci, len, mask: 0xffff_ffff, lanes: h.lanes(), lanes_key: 0 };
+        h.set_windows(vec![
+            w(Space::Io, 0x1800_0000, 0, 0x200_0000),
+            w(Space::Mem, 0x1a00_0000, 0x8000_0000, 0x200_0000),
+            w(Space::Mem, 0x8000_0000, 0x8000_0000, 0x8000_0000),
+        ]);
+        let runs = Arc::new(Mutex::new(Vec::<BarRun>::new()));
+        let sink = runs.clone();
+        b.on_bar_runs(Box::new(move |r| *sink.lock().unwrap() = r));
+        (h, b, runs)
+    }
+
+    #[test]
+    fn a_placed_bar_is_published_as_whole_page_runs() {
+        let (_, b, runs) = windowed();
+        let at = PciAddr::dev(3);
+        b.attach(at, Fake::new(PCI_INTA));
+        assert!(runs.lock().unwrap().is_empty());
+        set(&b, at, 5, 0x8000_1000);
+        assert!(runs.lock().unwrap().is_empty(), "not before memory is enabled");
+        set(&b, at, 1, 3);
+        let spans: Vec<_> = runs.lock().unwrap().iter().map(|r| (r.start, r.end)).collect();
+        let low = 0x1a00_1000u64;
+        assert_eq!(spans, vec![(low, low + 0x1000), (0x8000_1000, 0x8000_2000)], "the I/O BAR is under a page");
+    }
+
+    #[test]
+    fn an_access_through_a_run_uses_the_hosts_lanes() {
+        let (h, b, runs) = windowed();
+        let at = PciAddr::dev(3);
+        let f = Fake::new(PCI_INTA);
+        b.attach(at, f.clone());
+        set(&b, at, 5, 0x8000_1000);
+        set(&b, at, 1, 2);
+        let run = runs.lock().unwrap()[0].clone();
+        assert_eq!(run.dev.read32(run.start + 0x84).data, 0x1234_5678);
+        assert_eq!(h.lanes_log(), vec![(1, 0x84, 4)]);
+        assert_eq!(*f.last.lock().unwrap(), Some((1, 0x84, 4)));
+    }
+
+    #[test]
+    fn publishing_twice_reuses_the_table_entry() {
+        let (_, b, runs) = windowed();
+        let at = PciAddr::dev(3);
+        b.attach(at, Fake::new(PCI_INTA));
+        set(&b, at, 5, 0x8000_1000);
+        set(&b, at, 1, 2);
+        let first = runs.lock().unwrap()[0].dev.clone();
+        b.publish();
+        let again = runs.lock().unwrap()[0].dev.clone();
+        assert!(Arc::ptr_eq(&first, &again));
+    }
+
+    #[test]
+    fn a_config_write_republishes() {
+        let (_, b, runs) = windowed();
+        let at = PciAddr::dev(3);
+        b.attach(at, Fake::new(PCI_INTA));
+        set(&b, at, 5, 0x8000_1000);
+        set(&b, at, 1, 2);
+        assert_eq!(runs.lock().unwrap().len(), 2);
+        set(&b, at, 1, 0);
+        assert!(runs.lock().unwrap().is_empty(), "memory decoding off takes the runs away");
+        set(&b, at, 1, 2);
+        set(&b, at, 5, 0x8000_3000);
+        assert_eq!(runs.lock().unwrap()[0].start, 0x1a00_3000, "moved with the BAR");
     }
 }
