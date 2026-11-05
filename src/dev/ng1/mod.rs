@@ -17,6 +17,8 @@
 pub mod rex3;
 pub(crate) mod rex3_dirty;
 pub mod rex3_generic;
+#[cfg(feature = "rex-gpu")]
+pub mod rex3_gpu;
 pub mod rex3_shaders;
 pub mod rex3_shape;
 /// Draw-shape corpus persistence. Deliberately NOT behind `rex-jit`: the corpus
