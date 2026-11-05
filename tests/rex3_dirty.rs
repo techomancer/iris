@@ -1,3 +1,5 @@
+#![cfg(feature = "rex-dirty-upload")]
+
 #[path = "../src/dev/ng1/rex3_dirty.rs"]
 mod rex3_dirty;
 

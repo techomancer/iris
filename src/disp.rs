@@ -3,6 +3,7 @@ use crate::debug_overlay::OverlaySource;
 use crate::dev::ng1::bt445::Bt445;
 use crate::dev::ng1::cmap::Cmap;
 use crate::dev::ng1::rex3::Rex3;
+#[cfg(feature = "rex-dirty-upload")]
 use crate::dev::ng1::rex3_dirty::{copy_u32_rects, DamagePlane, DamageRect, DamageSnapshot};
 use crate::dev::ng1::vc2::{
     Vc2, VC2_CTRL_BLACKOUT, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_CTRL_DID_EN,
@@ -33,9 +34,13 @@ pub struct Rex3Screen {
     // Framebuffer snapshots (copied from Rex3::fb_rgb / fb_aux each frame)
     pub fb_rgb: Vec<u32>,
     pub fb_aux: Vec<u32>,
+    #[cfg(feature = "rex-dirty-upload")]
     fb_rgb_damage: Vec<DamageRect>,
+    #[cfg(feature = "rex-dirty-upload")]
     fb_aux_damage: Vec<DamageRect>,
+    #[cfg(feature = "rex-dirty-upload")]
     fb_rgb_tiles: usize,
+    #[cfg(feature = "rex-dirty-upload")]
     fb_aux_tiles: usize,
 
     // Decoded DID buffer in display coordinates (2048×1024, stride 2048)
@@ -70,6 +75,10 @@ pub struct Rex3Screen {
     /// When true, renderers may skip full compositor work and refresh only the
     /// status bar (heartbeat frames with no FB/palette change).
     pub status_bar_only: bool,
+    /// When true, `fb_rgb`/`fb_aux` snapshots were not copied; use the live
+    /// slices supplied by the refresh loop.
+    #[cfg(not(feature = "rex-dirty-upload"))]
+    pub fb_borrowed: bool,
     /// When true, `fb_rgb` already holds a finished frame (stride 2048,
     /// `0xAABBGGRR` with R in the low byte, the same format `SwCompositor`
     /// produces) built by a
@@ -88,9 +97,13 @@ impl Rex3Screen {
             height:           0,
             fb_rgb:           vec![0u32; FB_STRIDE * FB_MAX_H],
             fb_aux:           vec![0u32; FB_STRIDE * FB_MAX_H],
+            #[cfg(feature = "rex-dirty-upload")]
             fb_rgb_damage: Vec::new(),
+            #[cfg(feature = "rex-dirty-upload")]
             fb_aux_damage: Vec::new(),
+            #[cfg(feature = "rex-dirty-upload")]
             fb_rgb_tiles: 0,
+            #[cfg(feature = "rex-dirty-upload")]
             fb_aux_tiles: 0,
             did:              vec![0u8; FB_STRIDE * FB_MAX_H],
             rgba:             vec![0u32; FB_STRIDE * FB_MAX_H],
@@ -105,6 +118,8 @@ impl Rex3Screen {
             topscan:          0,
             cursor_x_adjust:  0,
             status_bar_only:  false,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_borrowed:      false,
             prebuilt:         false,
             frame_seq:        0,
         }
@@ -182,13 +197,16 @@ impl Rex3Screen {
     /// Copy hardware device state into this cache, decode timings and DID.
     /// Returns `true` if the display resolution changed.
     ///
-    /// Only rectangles named by `fb_damage` are copied into the cached planes.
+    /// With `rex-dirty-upload`, only rectangles named by `fb_damage` are
+    /// copied into the cached planes. Otherwise `copy_fb` preserves the
+    /// original full-copy/borrowed-frame behavior.
     pub(crate) fn refresh(
         &mut self,
-        fb_rgb:   &[u32],
-        fb_aux:   &[u32],
-        fb_damage: &DamageSnapshot,
-        vc2:      &Mutex<Vc2>,
+        fb_rgb: &[u32],
+        fb_aux: &[u32],
+        #[cfg(feature = "rex-dirty-upload")] fb_damage: &DamageSnapshot,
+        #[cfg(not(feature = "rex-dirty-upload"))] copy_fb: bool,
+        vc2: &Mutex<Vc2>,
         xmap:     &Mutex<Xmap9>,
         cmap:     &Mutex<Cmap>,
         bt445:    &Mutex<Bt445>,
@@ -197,36 +215,49 @@ impl Rex3Screen {
         let mut resized = false;
 
         // ── 1. Copy device state snapshots ──────────────────────────────────────
-        fb_damage.rectangles_into(DamagePlane::Rgb, &mut self.fb_rgb_damage);
-        fb_damage.rectangles_into(DamagePlane::Aux, &mut self.fb_aux_damage);
-        self.fb_rgb_tiles = fb_damage.tile_count(DamagePlane::Rgb);
-        self.fb_aux_tiles = fb_damage.tile_count(DamagePlane::Aux);
-        let rgb_bytes = self
-            .fb_rgb_damage
-            .iter()
-            .map(|rect| rect.bytes())
-            .sum::<usize>();
-        let aux_bytes = self
-            .fb_aux_damage
-            .iter()
-            .map(|rect| rect.bytes())
-            .sum::<usize>();
-        crate::pf_counter!(
-            crate::perfetto::events::REX3_DIRTY_RGB_TILES,
-            self.fb_rgb_tiles
-        );
-        crate::pf_counter!(
-            crate::perfetto::events::REX3_DIRTY_AUX_TILES,
-            self.fb_aux_tiles
-        );
-        crate::pf_counter!(crate::perfetto::events::REX3_COPY_RGB_BYTES, rgb_bytes);
-        crate::pf_counter!(crate::perfetto::events::REX3_COPY_AUX_BYTES, aux_bytes);
-        if rgb_bytes != 0 || aux_bytes != 0 {
-            crate::pf_scope!(crate::perfetto::events::REX3_FB_COPY, rgb_bytes + aux_bytes);
+        #[cfg(feature = "rex-dirty-upload")]
+        {
+            fb_damage.rectangles_into(DamagePlane::Rgb, &mut self.fb_rgb_damage);
+            fb_damage.rectangles_into(DamagePlane::Aux, &mut self.fb_aux_damage);
+            self.fb_rgb_tiles = fb_damage.tile_count(DamagePlane::Rgb);
+            self.fb_aux_tiles = fb_damage.tile_count(DamagePlane::Aux);
+            let rgb_bytes = self
+                .fb_rgb_damage
+                .iter()
+                .map(|rect| rect.bytes())
+                .sum::<usize>();
+            let aux_bytes = self
+                .fb_aux_damage
+                .iter()
+                .map(|rect| rect.bytes())
+                .sum::<usize>();
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_DIRTY_RGB_TILES,
+                self.fb_rgb_tiles
+            );
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_DIRTY_AUX_TILES,
+                self.fb_aux_tiles
+            );
+            crate::pf_counter!(crate::perfetto::events::REX3_COPY_RGB_BYTES, rgb_bytes);
+            crate::pf_counter!(crate::perfetto::events::REX3_COPY_AUX_BYTES, aux_bytes);
+            if rgb_bytes != 0 || aux_bytes != 0 {
+                crate::pf_scope!(crate::perfetto::events::REX3_FB_COPY, rgb_bytes + aux_bytes);
+                diag.fetch_or(Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+                copy_u32_rects(&mut self.fb_rgb, fb_rgb, &self.fb_rgb_damage);
+                copy_u32_rects(&mut self.fb_aux, fb_aux, &self.fb_aux_damage);
+                diag.fetch_and(!Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+            }
+        }
+        #[cfg(not(feature = "rex-dirty-upload"))]
+        if copy_fb {
             diag.fetch_or(Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
-            copy_u32_rects(&mut self.fb_rgb, fb_rgb, &self.fb_rgb_damage);
-            copy_u32_rects(&mut self.fb_aux, fb_aux, &self.fb_aux_damage);
+            self.fb_rgb[..fb_rgb.len()].copy_from_slice(fb_rgb);
+            self.fb_aux[..fb_aux.len()].copy_from_slice(fb_aux);
+            self.fb_borrowed = false;
             diag.fetch_and(!Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
+        } else {
+            self.fb_borrowed = true;
         }
 
         diag.fetch_or(
@@ -299,14 +330,36 @@ impl Rex3Screen {
 
     pub fn compositor_source_from<'a>(
         &'a self,
-        _live_rgb: Option<&'a [u32]>,
-        _live_aux: Option<&'a [u32]>,
+        live_rgb: Option<&'a [u32]>,
+        live_aux: Option<&'a [u32]>,
     ) -> CompositorSource<'a> {
+        #[cfg(feature = "rex-dirty-upload")]
+        let _ = (live_rgb, live_aux);
         CompositorSource {
+            #[cfg(feature = "rex-dirty-upload")]
             fb_rgb: &self.fb_rgb,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_rgb: if self.fb_borrowed {
+                live_rgb.unwrap_or(&self.fb_rgb)
+            } else {
+                &self.fb_rgb
+            },
+            #[cfg(feature = "rex-dirty-upload")]
             fb_aux: &self.fb_aux,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_aux: if self.fb_borrowed {
+                live_aux.unwrap_or(&self.fb_aux)
+            } else {
+                &self.fb_aux
+            },
+            #[cfg(feature = "rex-dirty-upload")]
             fb_rgb_damage: &self.fb_rgb_damage,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_rgb_damage: &[],
+            #[cfg(feature = "rex-dirty-upload")]
             fb_aux_damage: &self.fb_aux_damage,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_aux_damage: &[],
             did:              &self.did,
             xmap_mode:        &self.xmap_mode,
             xmap_config:      self.xmap_config,

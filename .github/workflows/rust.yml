@@ -89,6 +89,16 @@ jobs:
         restore-keys: ${{ runner.os }}-features-cargo-
     - name: Build
       run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
+    - name: Build opt-in REX3 dirty uploads
+      run: |
+        cargo build -p iris --features rex-dirty-upload
+        cargo build -p iris-gui --features rex-dirty-upload
+    - name: Test REX3 dirty uploads
+      if: runner.os == 'Linux'
+      run: |
+        cargo test -p iris --test rex3_dirty --features rex-dirty-upload
+        cargo test -p iris --lib --features rex-dirty-upload go_damage_classifies_planes_bounds_and_non_writes
+        cargo test -p iris --lib --features rex-dirty-upload register_traffic_is_clean_and_draws_publish_selected_plane
 
   # The distribution scripts run only in nightly and release builds, so lint
   # them here where a mistake shows up on the pull request.

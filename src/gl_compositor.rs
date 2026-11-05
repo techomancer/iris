@@ -1,4 +1,5 @@
 use crate::compositor::{Compositor, CompositorSource};
+#[cfg(feature = "rex-dirty-upload")]
 use crate::dev::ng1::rex3_dirty::{plan_framebuffer_uploads, DamageRect};
 use crate::dev::ng1::vc2::{
     VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_REG_CURRENT_CURSOR_X, VC2_REG_CURSOR_ENTRY_PTR,
@@ -194,7 +195,9 @@ pub struct GlCompositor {
     last_ramdac_hash: u64,
     last_xmap_hash:   u64,
     last_cursor_hash: u64,
+    #[cfg(feature = "rex-dirty-upload")]
     fb_textures_initialized: bool,
+    #[cfg(feature = "rex-dirty-upload")]
     force_full_upload: bool,
 
     /// Reusable PBO for async readback (iris-gui GL capture path).
@@ -219,7 +222,9 @@ impl GlCompositor {
             last_ramdac_hash: u64::MAX,
             last_xmap_hash:   u64::MAX,
             last_cursor_hash: u64::MAX,
+            #[cfg(feature = "rex-dirty-upload")]
             fb_textures_initialized: false,
+            #[cfg(feature = "rex-dirty-upload")]
             force_full_upload: std::env::var_os("REX3_FORCE_FULL_UPLOAD")
                 .is_some_and(|value| value != "0"),
             readback_pbo: std::cell::RefCell::new(None),
@@ -342,6 +347,7 @@ impl GlCompositor {
         true
     }
 
+    #[cfg(feature = "rex-dirty-upload")]
     fn upload_fb_u32(gl: &glow::Context, tex: glow::Texture, data: &[u32], rect: DamageRect) {
         let start = rect.y * FB_W as usize + rect.x;
         let end = (rect.y + rect.height - 1) * FB_W as usize + rect.x + rect.width;
@@ -362,6 +368,21 @@ impl GlCompositor {
                 rect.height as i32,
                 glow::RED_INTEGER,
                 glow::UNSIGNED_INT,
+                glow::PixelUnpackData::Slice(Some(bytes)),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+        }
+    }
+
+    #[cfg(not(feature = "rex-dirty-upload"))]
+    fn upload_fb_u32(gl: &glow::Context, tex: glow::Texture, data: &[u32], w: i32, h: i32) {
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
+            let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4);
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D, 0, 0, 0, w, h,
+                glow::RED_INTEGER, glow::UNSIGNED_INT,
                 glow::PixelUnpackData::Slice(Some(bytes)),
             );
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
@@ -483,37 +504,45 @@ impl Compositor for GlCompositor {
         let vao        = self.vao.unwrap();
 
         // ── Upload per-frame buffers ─────────────────────────────────────────────
-        let (rgb_damage, aux_damage) = plan_framebuffer_uploads(
-            self.fb_textures_initialized,
-            self.force_full_upload,
-            src.fb_rgb_damage,
-            src.fb_aux_damage,
-        );
-        let rgb_bytes = rgb_damage.iter().map(|rect| rect.bytes()).sum::<usize>();
-        let aux_bytes = aux_damage.iter().map(|rect| rect.bytes()).sum::<usize>();
-        crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_RGB_BYTES, rgb_bytes);
-        crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_AUX_BYTES, aux_bytes);
-        crate::pf_counter!(
-            crate::perfetto::events::REX3_UPLOAD_RGB_RECTS,
-            rgb_damage.len()
-        );
-        crate::pf_counter!(
-            crate::perfetto::events::REX3_UPLOAD_AUX_RECTS,
-            aux_damage.len()
-        );
+        #[cfg(not(feature = "rex-dirty-upload"))]
         {
-            crate::pf_scope!(crate::perfetto::events::REX3_UPLOAD_RGB, rgb_bytes);
-            for &rect in rgb_damage {
-                Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, rect);
-            }
+            Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, FB_W, FB_H);
+            Self::upload_fb_u32(gl, tex_aux, src.fb_aux, FB_W, FB_H);
         }
+        #[cfg(feature = "rex-dirty-upload")]
         {
-            crate::pf_scope!(crate::perfetto::events::REX3_UPLOAD_AUX, aux_bytes);
-            for &rect in aux_damage {
-                Self::upload_fb_u32(gl, tex_aux, src.fb_aux, rect);
+            let (rgb_damage, aux_damage) = plan_framebuffer_uploads(
+                self.fb_textures_initialized,
+                self.force_full_upload,
+                src.fb_rgb_damage,
+                src.fb_aux_damage,
+            );
+            let rgb_bytes = rgb_damage.iter().map(|rect| rect.bytes()).sum::<usize>();
+            let aux_bytes = aux_damage.iter().map(|rect| rect.bytes()).sum::<usize>();
+            crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_RGB_BYTES, rgb_bytes);
+            crate::pf_counter!(crate::perfetto::events::REX3_UPLOAD_AUX_BYTES, aux_bytes);
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_UPLOAD_RGB_RECTS,
+                rgb_damage.len()
+            );
+            crate::pf_counter!(
+                crate::perfetto::events::REX3_UPLOAD_AUX_RECTS,
+                aux_damage.len()
+            );
+            {
+                crate::pf_scope!(crate::perfetto::events::REX3_UPLOAD_RGB, rgb_bytes);
+                for &rect in rgb_damage {
+                    Self::upload_fb_u32(gl, tex_rgb, src.fb_rgb, rect);
+                }
             }
+            {
+                crate::pf_scope!(crate::perfetto::events::REX3_UPLOAD_AUX, aux_bytes);
+                for &rect in aux_damage {
+                    Self::upload_fb_u32(gl, tex_aux, src.fb_aux, rect);
+                }
+            }
+            self.fb_textures_initialized = true;
         }
-        self.fb_textures_initialized = true;
         if !src.status_bar_only {
             // tex_did is indexed by display row `y` directly (not fb_y), so the
             // visible w×h window is all that's ever sampled.
@@ -661,7 +690,10 @@ impl Compositor for GlCompositor {
         self.last_ramdac_hash = u64::MAX;
         self.last_xmap_hash   = u64::MAX;
         self.last_cursor_hash = u64::MAX;
-        self.fb_textures_initialized = false;
+        #[cfg(feature = "rex-dirty-upload")]
+        {
+            self.fb_textures_initialized = false;
+        }
     }
 
     fn read_pixels(&self) -> Option<&[u32]> {

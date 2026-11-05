@@ -169,6 +169,9 @@ cache-ecc = []
 # still pass `--features decode-cache` keep working.
 decode-cache = []
 default = ["tlbvmap", "rexdiag"]
+# Conservative Newport framebuffer damage tracking and partial GL uploads.
+# Off by default so the REX3 processor retains its original hot path.
+rex-dirty-upload = []
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # Cranelift-based JIT for IMPACT (GR4) raster shaders: RSS/TE1 pixel
@@ -433,5 +436,4 @@ winit = { path = "third_party/winit-0.30.13" }
 # nokhwa -> cocoa/metal. The vendored copy makes `Class` opaque-but-inhabited, as
 # its maintained successor block2 does. Drop when nokhwa stops pulling `block`.
 block = { path = "third_party/block-0.1.6" }
-
 

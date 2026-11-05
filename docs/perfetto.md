@@ -95,11 +95,14 @@ host thread's name.
 
 ### Newport framebuffer damage and presentation
 
-Newport tracks RGB and auxiliary-plane damage independently in 64x32 tiles
-over each physical 2048x1024 plane. Writers publish tiles only after their
-stores are visible; the refresh thread atomically takes them before copying.
-Adjacent tiles are coalesced into rectangles for both the CPU snapshot and GL
-texture updates.
+Build with both `--features rex-dirty-upload,perfetto` to trace the opt-in
+Newport partial-presentation path. Newport then tracks RGB and auxiliary-plane
+damage independently in 64x32 tiles over each physical 2048x1024 plane.
+Writers publish tiles only after their stores are visible; the refresh thread
+atomically takes them before copying. Adjacent tiles are coalesced into
+rectangles for both the CPU snapshot and GL texture updates. Without
+`rex-dirty-upload`, Newport retains its original full-copy and full-upload
+presentation behavior.
 
 The following slices separate work that was previously covered only by the
 outer `present` slice:
@@ -127,7 +130,8 @@ A full plane is 8,388,608 bytes. The first frame after GL texture creation
 uploads both full planes. Later palette-, cursor-, topscan-, or heartbeat-only
 frames upload zero framebuffer bytes. Set `REX3_FORCE_FULL_UPLOAD=1` to make
 every Newport GL composition upload both complete planes, matching the legacy
-path for A/B traces.
+path for A/B traces. This environment control applies only when
+`rex-dirty-upload` is enabled.
 
 To list the per-frame values in `trace_processor`:
 
