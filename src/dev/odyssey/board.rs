@@ -304,6 +304,8 @@ pub(super) struct Geometry {
     pub program_half: u32,
     /// Derived from the retained program list.
     pub linear_texgen: u32,
+    /// GL_SPHERE_MAP generation, a bit a coordinate (S 1, T 2).
+    pub sphere_texgen: u32,
 }
 
 /// The 2D stream's GL immediate-mode subset, the X server's and greeter's
@@ -728,6 +730,7 @@ impl Default for Board {
                 regs_20_35: [0; 22],
                 program_half: 0,
                 linear_texgen: 0,
+                sphere_texgen: 0,
             },
             gl_color_index: 0,
             gl_color_is_index: false,
@@ -1069,6 +1072,7 @@ impl Board {
         self.diag.gl_program_logged_count = 0;
         self.diag.gl_texgen_logged = false;
         self.geom.linear_texgen = 0;
+        self.geom.sphere_texgen = 0;
         self.tex.linear_plane = [[0; 4]; 2];
         self.tex.linear_plane_r = [0; 4];
         self.tex.linear_plane_q = [0; 4];

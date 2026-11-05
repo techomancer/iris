@@ -960,3 +960,22 @@ fn a_frame_waits_for_no_slice_and_takes_no_lock() {
     h.raster.stop();
 }
 
+/// GL_SPHERE_MAP: a vertex straight ahead with the normal facing the viewer
+/// reflects straight back and maps to the centre; one to the right at the
+/// same depth reflects to (0.707, 0, 0.707), m = 2 sqrt(0.5 + 1.707^2).
+#[test]
+fn the_sphere_map_reflects_the_eye_vector_about_the_normal() {
+    let (mut s, _) = board("v12");
+    let identity: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+    s.geom.modelview = identity.map(f32::to_bits);
+    s.geom.normal_matrix = identity.map(f32::to_bits);
+    s.geom.normal = [0.0f32, 0.0, 1.0].map(f32::to_bits);
+
+    let [ss, tt] = s.sphere_map(&[0.0, 0.0, -1.0, 1.0]);
+    assert!((ss - 0.5).abs() < 1e-6 && (tt - 0.5).abs() < 1e-6, "{ss} {tt}");
+    let [ss, tt] = s.sphere_map(&[1.0, 0.0, -1.0, 1.0]);
+    let r = std::f64::consts::FRAC_1_SQRT_2;
+    let m = 2.0 * (r * r + (r + 1.0) * (r + 1.0)).sqrt();
+    assert!((ss as f64 - (r / m + 0.5)).abs() < 1e-6, "{ss}");
+    assert!((tt - 0.5).abs() < 1e-6, "{tt}");
+}
