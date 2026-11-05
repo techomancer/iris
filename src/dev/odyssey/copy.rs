@@ -286,6 +286,21 @@ impl Board {
     /// 255), scale and bias signed 3.12 fixed point (ESTABLISHED as the
     /// layout). An alpha lane whose bias is full scale (0x1000) is the
     /// library's opaque overwrite for a source without alpha: 1.0.
+    /// glPixelTransfer's scale and bias on an image pixel drawn into a
+    /// window: the library programs block 0x203b before the image (traced,
+    /// pixtest draw/RGBA/UNSIGNED_BYTE/scale-bias) and the board applies it
+    /// on the way, as for a copy (the V10 passes the case). A colour index
+    /// passes as it is.
+    pub fn image_transfer(&self, word: u32, is_index: bool) -> u32 {
+        let sb = &self.tex_regs().scale_bias;
+        if is_index || (0..4).all(|c| sb[c * 2] == tex::SCALE_BIAS_ONE && sb[c * 2 + 1] == 0) {
+            return word;
+        }
+        let mut w = [word];
+        self.copy_post_filter(&mut w, false);
+        w[0]
+    }
+
     pub fn copy_post_filter(&self, words: &mut [u32], signed: bool) {
         let sb = &self.tex_regs().scale_bias;
         let lane = |c: usize| {
