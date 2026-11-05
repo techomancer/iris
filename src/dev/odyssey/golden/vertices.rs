@@ -88,7 +88,7 @@ fn rows() -> Vec<Row> {
             nrm = nrm.map(|x| x / len);
             board.geom.normal = nrm.map(f32::to_bits);
             let obj = [rng.range(-1.0, 1.0), rng.range(-1.0, 1.0), rng.range(-1.0, 1.0), 1.0];
-            let rgba = board.gl_light(&obj);
+            let (rgba, _) = board.gl_light(&obj);
             out.push(Row { name: format!("light_{name}/{i}"), kind: "rgba", vals: rgba.iter().map(|&c| c as f64).collect() });
         }
     }

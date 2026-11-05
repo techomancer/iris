@@ -190,6 +190,10 @@ pub(super) struct Assembly {
     /// coordinates as it arrives.
     pub texture: [f32; 16],
     pub colour: [f32; 4],
+    /// The back face's colour under two-sided lighting, else the colour.
+    pub back_colour: [f32; 4],
+    /// The vertices carry back colours (Prim::back_colours).
+    pub two_sided: bool,
     pub texcoord: [f32; 4],
     pub edge: u32,
     pub polygon: PolygonBuffer,
@@ -213,6 +217,8 @@ impl Default for Assembly {
             xf: XfState::default(),
             texture: IDENT,
             colour: [1.0; 4],
+            back_colour: [1.0; 4],
+            two_sided: false,
             texcoord: [0.0, 0.0, 0.0, 1.0],
             edge: 1,
             polygon: PolygonBuffer::default(),
@@ -250,7 +256,7 @@ impl Assembly {
         out[vtx::COLOR..vtx::COLOR + 4].copy_from_slice(&self.colour);
         out[vtx::TEXCOORD..vtx::TEXCOORD + 4].copy_from_slice(&self.texture_coord());
         out[vtx::EDGE] = f32::from_bits(self.edge);
-        out[vtx::BACK_COLOR..vtx::BACK_COLOR + 4].copy_from_slice(&self.colour);
+        out[vtx::BACK_COLOR..vtx::BACK_COLOR + 4].copy_from_slice(&self.back_colour);
         // A strip's and a fan's inner edges are outline edges under the
         // polygon modes.
         if mode == TRIANGLE_STRIP || mode == TRIANGLE_FAN || mode == QUAD_STRIP {
@@ -269,6 +275,7 @@ impl Assembly {
         let mut p = Prim::new(mode, v.len() as u32, &verts[..v.len() * vtx::FLOATS], &self.xf);
 
         p.context = self.hw_id;
+        p.back_colours = self.two_sided;
         p.line_phase = (mode == LINES).then_some(self.line_phase);
         p.line_phase_reset = self.begin_mode == LINES;
         sink.draw(&mut p);
@@ -310,6 +317,7 @@ impl Assembly {
                 let mut p = Prim::new(POLYGON, polygon.count, &polygon.vertices, &self.xf);
 
                 p.context = self.hw_id;
+                p.back_colours = self.two_sided;
                 p.whole_polygon = true;
                 sink.draw(&mut p);
             }

@@ -182,9 +182,22 @@ impl Board {
         let mode = Format::decode(self.pixel_mode[2]);
         let layout = super::field::Layout::of(mode);
         let selected = !drawable && addr == self.pixel_mode[0] & ADDR_MASK;
-        let codec = |at: u8| match [layout.front, layout.back].into_iter().find(|f| selected && f.at == at) {
-            Some(f) => f.codec,
-            None => super::copy::source_codec(bytes, fmt & 0xff),
+        // A drawable read holds its colour as its window's display mode
+        // says, as the scan-out reads it (Board::drawable_codec()); the
+        // format byte is the packing the read asks for, as for a copy.
+        let origin = (
+            ((hdr[dma::HDR_ORIGIN] & 0xffff) as i32).wrapping_add(self.win.read_origin[0]),
+            ((hdr[dma::HDR_ORIGIN] >> 16) as i32).wrapping_add(self.win.read_origin[1]),
+        );
+        let codec = |at: u8| {
+            let named = super::copy::source_codec(bytes, fmt & 0xff);
+            if drawable && read {
+                return self.drawable_codec(origin.0, origin.1, at).filter(|c| super::copy::codec_bytes(*c) == bytes).unwrap_or(named);
+            }
+            match [layout.front, layout.back].into_iter().find(|f| selected && f.at == at) {
+                Some(f) => f.codec,
+                None => named,
+            }
         };
         let mem = self.vram_ptr();
         let field = |at: u32| {
@@ -750,19 +763,16 @@ impl Board {
             } else if cls == 0 && fields == (4, 0) {
                 l = Some(&DMA_STENCIL);
             } else if cls == 0 && fields == (0, 0) {
-                // UNKNOWN: this is a stencil read of a storage-2 window or a
-                // colour index read of a storage-0 window, and only the
-                // header's word 2 would separate them. The model keeps no
-                // storage code, so it serves a colour index and says so once.
-                // On an RGB window the index read is refused (dma_read_pack()).
-                if self.dma_report(dma::REPORT_STENCIL_OR_INDEX) {
-                    crate::dlog!(
-                        LogModule::Odyssey,
-                        "sgi-odyssey: DMA read with word 4 {:#x} is a colour index read of a storage-0 window or a stencil read, which the header does not separate; served as colour index",
-                        fmt
-                    );
-                }
-                l = Some(&DMA_GL_INDEX_BYTE);
+                // A stencil read of a storage-2 window or a colour index read
+                // of a storage-0 window; the header alone does not separate
+                // them. GL reads indices only from an index window, so the
+                // display mode of the window at the read's origin does: an
+                // RGB window's read is its stencil (piglit's
+                // hiz-stencil-read-window tests pass on a V10).
+                let x = (hdr[dma::HDR_ORIGIN] & 0xffff) as i32 + self.win.read_origin[0];
+                let y = (hdr[dma::HDR_ORIGIN] >> 16) as i32 + self.win.read_origin[1];
+                let id = self.main_id(x as u32, y as u32);
+                l = Some(if self.display_group(id) < ODSY_GAMMA_GROUP { &DMA_GL_INDEX_BYTE } else { &DMA_STENCIL });
             } else {
                 if !(cls == 2 && matches!(fields, (6, 2) | (2, 2) | (3, 2) | (7, 3) | (2, 0))) && self.dma_report(dma::REPORT_UNLISTED_FIELDS) {
                     crate::dlog!(
@@ -1234,7 +1244,7 @@ pub(super) static QUERY_DEFAULTS: [[u32; 5]; 5] = [
     [gl_cmd::COLOR_3F, ODSY_F32_ONE, ODSY_F32_ONE, ODSY_F32_ONE, 0],
     [gl_cmd::NORMAL_3F, 0, 0, ODSY_F32_ONE, 0],
     [gl_cmd::TEXCOORD_2F, 0, 0, 0, 0],
-    [0x2f00c02e, 0, 0, 0, 0],
+    [gl_cmd::EDGE_FLAG_TRUE, 0, 0, 0, 0],
 ];
 
 impl Board {
@@ -1323,7 +1333,7 @@ impl Board {
             gl_cmd::TEXCOORD_1F | gl_cmd::TEXCOORD_2F | gl_cmd::TEXCOORD_3F | gl_cmd::TEXCOORD_4F => {
                 record = ODSY_QUERY_TEXCOORD;
             }
-            0x2f00c02e | 0x3000c02e => {
+            gl_cmd::EDGE_FLAG_TRUE | gl_cmd::EDGE_FLAG_FALSE => {
                 record = ODSY_QUERY_EDGE;
             }
             // Kept raw like the float forms: the kernel replays the record

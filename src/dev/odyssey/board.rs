@@ -98,7 +98,6 @@ pub(super) struct Reports {
     pub gl_program_logged: [u32; (ODSY_GL_PROGRAM_REPORTS * 3) as usize],
     pub gl_program_logged_count: u32,
     pub gl_program_mem_reported: bool,
-    pub gl_two_sided_logged: bool,
     pub gl_texgen_logged: bool,
     pub gl_clip_logged: bool,
     pub gl_texture_stage_logged: bool,
@@ -290,6 +289,8 @@ pub(super) struct Geometry {
     /// The user clip planes in eye coordinates, four floats' bits a plane.
     pub clip_eye: [u32; (CLIP_PLANES * 4) as usize],
     pub lit: bool,
+    /// The lit program lights back faces with the back material.
+    pub two_sided: bool,
     pub local_viewer: bool,
     /// The geometry program renormalises transformed normals.
     pub normalize: bool,
@@ -565,7 +566,6 @@ impl Default for Board {
                 gl_program_logged: [0; (ODSY_GL_PROGRAM_REPORTS * 3) as usize],
                 gl_program_logged_count: 0,
                 gl_program_mem_reported: false,
-                gl_two_sided_logged: false,
                 gl_texgen_logged: false,
                 gl_clip_logged: false,
                 gl_texture_stage_logged: false,
@@ -719,6 +719,7 @@ impl Default for Board {
                 modelview: [0; 16],
                 clip_eye: [0; (CLIP_PLANES * 4) as usize],
                 lit: false,
+                two_sided: false,
                 local_viewer: false,
                 normalize: false,
                 colour_overridden: false,
@@ -1062,10 +1063,10 @@ impl Board {
         }
         self.geom.lit = false;
         self.geom.local_viewer = false;
+        self.geom.two_sided = false;
         self.geom.normalize = false;
         self.geom.colour_overridden = false;
         self.diag.gl_program_logged_count = 0;
-        self.diag.gl_two_sided_logged = false;
         self.diag.gl_texgen_logged = false;
         self.geom.linear_texgen = 0;
         self.tex.linear_plane = [[0; 4]; 2];

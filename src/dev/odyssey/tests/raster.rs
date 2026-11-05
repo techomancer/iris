@@ -485,7 +485,7 @@ fn a_reused_lighting_state_lights_a_vertex_as_a_fresh_one_does() {
     let obj = [1.0, 2.0, 3.0, 1.0];
     let mut seen = Vec::new();
     let check = |s: &mut Board, what: &str| {
-        let out = s.gl_light(&obj);
+        let (out, _) = s.gl_light(&obj);
         let want = fresh(s, &obj);
         assert_eq!(out.map(f32::to_bits), want.map(f32::to_bits), "{what}");
         want
@@ -514,6 +514,43 @@ fn a_reused_lighting_state_lights_a_vertex_as_a_fresh_one_does() {
     // The cases differ, so the comparisons above could have failed.
     assert_ne!(seen[0], seen[1]);
     assert_ne!(seen[1], seen[3]);
+}
+
+/// A two-sided program lights the back face with the back material and the
+/// reversed normal; one-sided, the back colour is the front's.
+#[test]
+fn a_two_sided_program_lights_the_back_with_the_back_material() {
+    let (mut s, _) = board("v12");
+    let identity: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+    s.geom.modelview = identity.map(f32::to_bits);
+    s.geom.normal_matrix = identity.map(f32::to_bits);
+    s.geom.normal = [0.0f32, 0.0, 1.0].map(f32::to_bits);
+    // A white light along +z from the viewer's side: the front faces it.
+    for k in 0..3 {
+        s.geom.light_colour[4 + k] = 1.0f32.to_bits();
+    }
+    let blk = &mut s.geom.light_vec[..gl_cmd::LIGHT_VEC_FLOATS as usize];
+    blk[light::POS + 2] = 1.0f32.to_bits();
+    blk[light::HALF + 2] = 1.0f32.to_bits();
+    blk[light::SPOT_COS] = 1.0f32.to_bits();
+    for k in 0..4 {
+        s.geom.material[4 + k] = [0.0f32, 1.0, 0.0, 1.0][k].to_bits();
+        s.geom.back_material[4 + k] = [0.0f32, 0.0, 1.0, 1.0][k].to_bits();
+    }
+    let obj = [0.0, 0.0, 0.0, 1.0];
+
+    // Lit green from the front; the scene ambient (0.2) on the default
+    // material ambient (0.2) adds 0.04 to every component.
+    let (front, back) = s.gl_light(&obj);
+    assert_eq!(back, front, "one-sided");
+    assert!(front[1] > 0.9 && front[2] < 0.05, "lit green from the front: {front:?}");
+
+    s.geom.two_sided = true;
+    let (front2, back) = s.gl_light(&obj);
+    assert_eq!(front2, front, "front unchanged");
+    // The back's normal faces away from the light: ambient only.
+    assert!(back[1] < 0.05 && back[2] < 0.05, "back not lit: {back:?}");
+    assert_eq!(back[3], 1.0, "the back diffuse alpha");
 }
 
 /// A triangle a few pixels across.

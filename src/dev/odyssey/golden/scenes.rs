@@ -959,7 +959,7 @@ fn lit_sphere(c: &mut Ctx, current_colour: [f32; 4]) {
         let n = p;
         c.board.geom.normal = n.map(f32::to_bits);
         let obj = [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0];
-        let rgba = c.board.gl_light(&obj);
+        let (rgba, _) = c.board.gl_light(&obj);
         V { p: [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0], c: rgba, t: [0.0, 0.0, 0.0, 1.0], back: None }
     };
     for i in 0..nlat {
@@ -1026,7 +1026,7 @@ fn light_lit_blended_textured(c: &mut Ctx) {
         let p = [th.cos() * ph.sin(), th.sin(), -th.cos() * ph.cos()];
         c.board.geom.normal = p.map(f32::to_bits);
         c.board.geom.colour = WHITE.map(f32::to_bits);
-        let rgba = c.board.gl_light(&[p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0]);
+        let (rgba, _) = c.board.gl_light(&[p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0]);
         V { p: [p[0] * 0.8, p[1] * 0.8, p[2] * 0.8, 1.0], c: rgba, t: [j as f32 / nlon as f32 * 2.0, i as f32 / nlat as f32 * 2.0, 0.0, 1.0], back: None }
     };
     for i in 0..nlat {

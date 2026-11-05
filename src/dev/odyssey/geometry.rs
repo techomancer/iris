@@ -402,10 +402,6 @@ impl Board {
                 );
             }
         }
-        if p.two_sided && !self.diag.gl_two_sided_logged {
-            self.diag.gl_two_sided_logged = true;
-            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: two-sided lighting is not modeled; back faces are lit with the front material");
-        }
         if p.texgen && !self.diag.gl_texgen_logged {
             self.diag.gl_texgen_logged = true;
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: texture-coordinate generation in geometry program {:#x} is not modeled", e29);
@@ -421,6 +417,7 @@ impl Board {
         self.geom.linear_texgen = if p.known { p.linear_texgen } else { 0 };
         self.geom.lit = p.lit;
         self.geom.local_viewer = p.local_viewer;
+        self.geom.two_sided = p.two_sided;
         self.geom.normalize = p.normalize;
     }
 
@@ -517,6 +514,8 @@ pub(super) struct LitVertex {
     pub colour: [f32; 4],
     /// The diffuse alpha.
     pub alpha: f32,
+    /// The back material's diffuse alpha.
+    pub back_alpha: f32,
     /// The lights the fill set up, a bit each.
     pub lit: u8,
 }
@@ -573,7 +572,9 @@ impl Board {
     /// is then read as positional). A light with zero ambient, diffuse and
     /// specular colour, every disabled one as the library sends it, adds
     /// nothing and is left out. Shininess arrives as its square root.
-    pub fn gl_light(&mut self, obj: &[f32; 4]) -> [f32; 4] {
+    /// The lit colours of a vertex at object position obj, front and back
+    /// (the back is the front unless the program is two-sided).
+    pub fn gl_light(&mut self, obj: &[f32; 4]) -> ([f32; 4], [f32; 4]) {
         // The lighting state is kept between vertices (LightScratch): building
         // its 3 KB afresh for every vertex was a visible share of the front
         // end's time in Smoke & Mirrors.
@@ -582,11 +583,12 @@ impl Board {
         scratch.restore();
         let v = self.gl_light_fill(&mut scratch.state, obj);
         scratch.lit = v.lit;
-        let (mut front, _) = scratch.state.light_vertex(v.eye, v.normal, v.colour);
+        let (mut front, mut back) = scratch.state.light_vertex(v.eye, v.normal, v.colour);
         // The board passes the diffuse alpha through unclamped.
         front[3] = v.alpha;
+        back[3] = if self.geom.two_sided { v.back_alpha } else { v.alpha };
         self.gl_light_scratch = Some(scratch);
-        front
+        (front, back)
     }
 
     /// Fill `lt`, whose lights hold their initial state, from the kept
@@ -627,6 +629,25 @@ impl Board {
         m.emission = [me[0], me[1], me[2]];
         let shininess = f(self.geom.shininess_sqrt);
         m.shininess = shininess * shininess;
+        // The back material, for a two-sided program; colour material
+        // tracks both faces.
+        lt.two_sided = self.geom.two_sided as u32;
+        let back = |bit: u32, base: usize| -> [f32; 4] {
+            if cm & bit != 0 { colour } else { std::array::from_fn(|k| f(self.geom.back_material[base + k])) }
+        };
+        let (ba, bd, bs, be) = (
+            back(colour::MATERIAL_AMBIENT, 0),
+            back(colour::MATERIAL_DIFFUSE, 4),
+            back(colour::MATERIAL_SPECULAR, 8),
+            back(colour::MATERIAL_EMISSION, 12),
+        );
+        let b = &mut lt.mat[1];
+        b.ambient = [ba[0], ba[1], ba[2]];
+        b.diffuse = bd;
+        b.specular = [bs[0], bs[1], bs[2]];
+        b.emission = [be[0], be[1], be[2]];
+        let shininess = f(self.geom.back_shininess_sqrt);
+        b.shininess = shininess * shininess;
         let ambient = gl_cmd::LIGHT_MODEL_AMBIENT as usize * 4;
         lt.amb_sum = std::array::from_fn(|k| f(self.geom.light_colour[ambient + k]));
 
@@ -672,7 +693,7 @@ impl Board {
         lt.head = next;
         lt.count = lit.count_ones();
         let normal = self.geom.normal.map(f);
-        LitVertex { eye, normal, colour, alpha: md[3], lit }
+        LitVertex { eye, normal, colour, alpha: md[3], back_alpha: bd[3], lit }
     }
 
     /// The colour a GL vertex takes, set in primitive assembly just before
@@ -690,12 +711,18 @@ impl Board {
             self.assembly.colour = gl_index_rgba(self.gl_color_index);
             self.geom.colour_overridden = true;
         } else if self.geom.lit {
-            self.assembly.colour = self.gl_light(&[xyz[0], xyz[1], xyz[2], 1.0]);
+            let (front, back) = self.gl_light(&[xyz[0], xyz[1], xyz[2], 1.0]);
+            self.assembly.colour = front;
+            self.assembly.back_colour = back;
+            self.assembly.two_sided = self.geom.two_sided;
             self.geom.colour_overridden = true;
+            return;
         } else if self.geom.colour_overridden {
             self.assembly.colour = self.geom.colour.map(f32::from_bits);
             self.geom.colour_overridden = false;
         }
+        self.assembly.back_colour = self.assembly.colour;
+        self.assembly.two_sided = false;
     }
 
     /// The combined matrix (slot 0x00): the client's model-view and projection
