@@ -442,13 +442,13 @@ impl BusDevice for MacePci {
     fn read32(&self, addr: u64) -> BusRead32 {
         let off = (addr as u32) & (MACEPCI_SIZE - 1) & !3;
         match off {
-            macepci_reg::CONFIG_DATA => BusRead32::ok(match self.selected().and_then(|(at, reg)| Some((self.bus.function(at)?, reg))) {
-                Some((f, reg)) => f.config().read(reg),
-                // An absent device: the bus floats high. Zero would read back
-                // as vendor ID 0x0000, which firmware takes for a device that
-                // is present but broken.
-                None => 0xffff_ffff,
-            }),
+            macepci_reg::CONFIG_DATA => BusRead32::ok(
+                self.selected().and_then(|(at, reg)| self.bus.config_read(at, reg * 4, 4))
+                    // An absent device: the bus floats high. Zero would read back
+                    // as vendor ID 0x0000, which firmware takes for a device that
+                    // is present but broken.
+                    .unwrap_or(0xffff_ffff),
+            ),
             macepci_reg::CONFIG_ADDR => BusRead32::ok(*self.config_addr.lock().unwrap()),
             macepci_reg::REVISION => BusRead32::ok(MACEPCI_REVISION_VALUE),
             _ => BusRead32::ok(self.regs.lock().unwrap()[(off / 4) as usize]),
@@ -462,9 +462,10 @@ impl BusDevice for MacePci {
                 *self.config_addr.lock().unwrap() = val;
             }
             macepci_reg::CONFIG_DATA => {
-                if let Some((f, reg)) = self.selected().and_then(|(at, reg)| Some((self.bus.function(at)?, reg))) {
-                    f.config().write(reg, val);
-                    self.rebuild_windows();
+                if let Some((at, reg)) = self.selected() {
+                    if self.bus.config_write(at, reg * 4, 4, val) {
+                        self.rebuild_windows();
+                    }
                 }
             }
             _ => self.regs.lock().unwrap()[(off / 4) as usize] = val,
@@ -675,6 +676,20 @@ mod tests {
     /// The pins of the option slot (device 3) reach CRIME as the MACE
     /// specification routes them: INTA on 10, INTB, INTC and INTD on 13,
     /// 14 and 15.
+    /// Only function 0 of a device answers here, and only on bus 0.
+    #[test]
+    fn a_function_number_other_than_zero_floats_high() {
+        let (pci, _) = o2();
+        pci.bus().attach(PciAddr::dev(IP32_SCSI_SLOT), fake(PCI_INTA));
+        let slot1 = (IP32_SCSI_SLOT as u32) << 11;
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(slot1, 0));
+        assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0x8078_9004);
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(slot1 | (1 << 8), 0));
+        assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0xffff_ffff, "function 1");
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(slot1 | (1 << 16), 0));
+        assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0xffff_ffff, "bus 1");
+    }
+
     #[test]
     fn device_three_pins_reach_the_spec_crime_inputs() {
         for (pin, input) in [(PCI_INTA, 10), (PCI_INTA + 1, 13), (PCI_INTA + 2, 14), (PCI_INTA + 3, 15)] {
