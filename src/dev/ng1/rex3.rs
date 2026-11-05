@@ -12,7 +12,9 @@ use crate::dev::ng1::vc2::Vc2;
 use crate::dev::ng1::xmap9::Xmap9;
 use crate::dev::ng1::cmap::Cmap;
 use crate::dev::ng1::bt445::Bt445;
-use crate::dev::ng1::rex3_dirty::{DamagePlane, DamageRect, DamageTracker};
+use crate::dev::ng1::rex3_dirty::{DamagePlane, DamageRect};
+#[cfg(feature = "rex-dirty-upload")]
+use crate::dev::ng1::rex3_dirty::DamageTracker;
 use bitfield::bitfield;
 use crate::disp::Rex3Screen;
 use std::io::Write;
@@ -1317,6 +1319,7 @@ struct DebugState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "rex-dirty-upload")]
 struct GoDamage {
     plane: DamagePlane,
     rect: DamageRect,
@@ -1353,8 +1356,12 @@ pub struct Rex3 {
     /// Handle to the REX3-Processor thread, set once when it starts, used by
     /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
     processor_unparker: std::sync::OnceLock<thread::Thread>,
-    /// Framebuffer tiles published by writers after their stores complete and
-    /// atomically taken by the refresh thread before it copies them.
+    /// Original coarse dirty flag, retained verbatim when partial uploads are
+    /// not compiled in.
+    #[cfg(not(feature = "rex-dirty-upload"))]
+    fb_dirty: AtomicBool,
+    /// Framebuffer tiles published by writers after their stores complete.
+    #[cfg(feature = "rex-dirty-upload")]
     fb_damage: DamageTracker,
     pub screen: Arc<Mutex<Rex3Screen>>,
     /// Drives the real REX3 `VV_INT_N` pin (vertical retrace / Kaleidoscope).
@@ -1543,6 +1550,9 @@ impl Rex3 {
             refresh_thread: Mutex::new(None),
             processor_parked: AtomicBool::new(false),
             processor_unparker: std::sync::OnceLock::new(),
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            fb_dirty: AtomicBool::new(true),
+            #[cfg(feature = "rex-dirty-upload")]
             fb_damage: DamageTracker::new_full(),
             screen,
             vblank_cb: Mutex::new(None),
@@ -1664,6 +1674,26 @@ impl Rex3 {
         *self.fifo_full_cb.lock() = Some(irq);
     }
 
+    #[cfg(feature = "rex-dirty-upload")]
+    fn mark_framebuffer_rect(&self, plane: DamagePlane, rect: DamageRect) {
+        self.fb_damage.mark_rect(plane, rect);
+    }
+
+    #[cfg(not(feature = "rex-dirty-upload"))]
+    fn mark_framebuffer_rect(&self, _plane: DamagePlane, _rect: DamageRect) {
+        self.fb_dirty.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "rex-dirty-upload")]
+    fn mark_framebuffer_full(&self, plane: DamagePlane) {
+        self.fb_damage.mark_full(plane);
+    }
+
+    #[cfg(not(feature = "rex-dirty-upload"))]
+    fn mark_framebuffer_full(&self, _plane: DamagePlane) {
+        self.fb_dirty.store(true, Ordering::Release);
+    }
+
     /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
     pub fn apply_display_resolution(&self, mode: crate::dev::ng1::vc2_timings::NewportResolution) {
         if mode.is_guest() {
@@ -1687,7 +1717,7 @@ impl Rex3 {
                 }
             }
             if let Some(rect) = DamageRect::clipped(0, 0, w as i64, h as i64) {
-                self.fb_damage.mark_rect(DamagePlane::Rgb, rect);
+                self.mark_framebuffer_rect(DamagePlane::Rgb, rect);
             }
         }
     }
@@ -1762,6 +1792,7 @@ impl Rex3 {
         ctx.bresd = (d as u32) & 0x7FF_FFFF;                     // 27-bit signed
     }
 
+    #[cfg(feature = "rex-dirty-upload")]
     fn go_damage(ctx: &Rex3Context) -> Option<GoDamage> {
         let opcode = ctx.drawmode0.opcode();
         if opcode != DRAWMODE0_OPCODE_DRAW && opcode != DRAWMODE0_OPCODE_SCR2SCR {
@@ -1824,6 +1855,7 @@ impl Rex3 {
         Some(GoDamage { plane, rect })
     }
 
+    #[cfg(feature = "rex-dirty-upload")]
     fn go_damage_rect(
         ctx: &Rex3Context,
         opcode: u32,
@@ -2638,6 +2670,9 @@ impl Rex3 {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
 
+                #[cfg(not(feature = "rex-dirty-upload"))]
+                self.fb_dirty.store(true, Ordering::Relaxed);
+
                 if !is_busy {
                     self.gfxbusy.store(true, Ordering::Relaxed);
                     is_busy = true;
@@ -2802,6 +2837,7 @@ impl Rex3 {
                 ctx.xend as f32 / 2048.0, ctx.yend as f32 / 2048.0);
         }
 
+        #[cfg(feature = "rex-dirty-upload")]
         let damage = Self::go_damage(ctx);
 
         crate::pf_scope!(crate::perfetto::events::REX3_RASTER, opcode);
@@ -2929,8 +2965,9 @@ impl Rex3 {
                         ctx.host_len = 1;
                         ctx.host_cursor = 0;
                     }
+                    #[cfg(feature = "rex-dirty-upload")]
                     if let Some(damage) = damage {
-                        self.fb_damage.mark_rect(damage.plane, damage.rect);
+                        self.mark_framebuffer_rect(damage.plane, damage.rect);
                     }
                     #[cfg(feature = "rexdiag")]
                     self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
@@ -3011,8 +3048,9 @@ impl Rex3 {
         // which is what a PIO read after a transfer expects to see.
         ctx.host_len = 1;
         ctx.host_cursor = 0;
+        #[cfg(feature = "rex-dirty-upload")]
         if let Some(damage) = damage {
-            self.fb_damage.mark_rect(damage.plane, damage.rect);
+            self.mark_framebuffer_rect(damage.plane, damage.rect);
         }
         #[cfg(feature = "rexdiag")]
         self.interp_go_count.fetch_add(1, Ordering::Relaxed);
@@ -3097,7 +3135,10 @@ impl Rex3 {
             let dbg_overlay = self.draw_debug_active()
                 || self.show_cmap.load(Ordering::Relaxed)
                 || self.show_disp_debug.load(Ordering::Relaxed);
+            #[cfg(feature = "rex-dirty-upload")]
             let fb_was_dirty = self.fb_damage.has_damage();
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            let fb_was_dirty = self.fb_dirty.swap(false, Ordering::Acquire);
             let should_render = fb_was_dirty
                 || palette_dirty
                 || dbg_overlay
@@ -3111,7 +3152,9 @@ impl Rex3 {
                 last_topscan = topscan;
                 self.diag.fetch_or(Self::DIAG_LOCK_SCREEN, Ordering::Relaxed);
                 let mut screen = self.screen.lock();
+                #[cfg(feature = "rex-dirty-upload")]
                 let fb_damage = self.fb_damage.take();
+                #[cfg(feature = "rex-dirty-upload")]
                 let fb_was_dirty = !fb_damage.is_empty();
                 screen.topscan = topscan;
                 screen.status_bar_only = full_presents > 0
@@ -3135,10 +3178,22 @@ impl Rex3 {
                 self.diag.fetch_or(Self::DIAG_LOCK_RENDERER, Ordering::Relaxed);
                 let mut renderer = self.renderer.lock();
 
+                #[cfg(feature = "rex-dirty-upload")]
                 let resized = screen.refresh(
                     &**fb_rgb,
                     &**fb_aux,
                     &fb_damage,
+                    &self.vc2,
+                    &self.xmap0,
+                    &self.cmap0,
+                    &self.bt445,
+                    &self.diag,
+                );
+                #[cfg(not(feature = "rex-dirty-upload"))]
+                let resized = screen.refresh(
+                    &**fb_rgb,
+                    &**fb_aux,
+                    fb_was_dirty,
                     &self.vc2,
                     &self.xmap0,
                     &self.cmap0,
@@ -3545,14 +3600,14 @@ impl Rex3 {
         let n = rgb.len().min(dst_rgb.len());
         dst_rgb[..n].copy_from_slice(&rgb[..n]);
         if n != 0 {
-            self.fb_damage.mark_full(DamagePlane::Rgb);
+            self.mark_framebuffer_full(DamagePlane::Rgb);
         }
 
         let dst_aux = unsafe { &mut *self.fb_aux.get() };
         let n = aux.len().min(dst_aux.len());
         dst_aux[..n].copy_from_slice(&aux[..n]);
         if n != 0 {
-            self.fb_damage.mark_full(DamagePlane::Aux);
+            self.mark_framebuffer_full(DamagePlane::Aux);
         }
     }
 
@@ -3613,7 +3668,7 @@ impl Rex3 {
                 rgb[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
             }
             if count != 0 {
-                self.fb_damage.mark_full(DamagePlane::Rgb);
+                self.mark_framebuffer_full(DamagePlane::Rgb);
             }
         }
 
@@ -3628,7 +3683,7 @@ impl Rex3 {
                 aux[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
             }
             if count != 0 {
-                self.fb_damage.mark_full(DamagePlane::Aux);
+                self.mark_framebuffer_full(DamagePlane::Aux);
             }
         }
         Ok(())
@@ -5041,8 +5096,8 @@ impl Resettable for Rex3 {
             (*self.fb_rgb.get()).fill(0);
             (*self.fb_aux.get()).fill(0);
         }
-        self.fb_damage.mark_full(DamagePlane::Rgb);
-        self.fb_damage.mark_full(DamagePlane::Aux);
+        self.mark_framebuffer_full(DamagePlane::Rgb);
+        self.mark_framebuffer_full(DamagePlane::Aux);
         // Reset Vc2, Xmap, Cmap
         *self.vc2.lock() = crate::dev::ng1::vc2::Vc2::new();
         *self.xmap0.lock() = crate::dev::ng1::xmap9::Xmap9::new();

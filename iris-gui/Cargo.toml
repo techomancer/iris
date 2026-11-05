@@ -82,6 +82,8 @@ hostgl = ["hostcall", "iris/hostgl"]
 # gains Start/Stop for a .pftrace to open at ui.perfetto.dev.
 # Build with: cargo build -p iris-gui --features perfetto
 perfetto = ["iris/perfetto"]
+# Opt-in Newport framebuffer damage tracking and partial GL uploads.
+rex-dirty-upload = ["iris/rex-dirty-upload"]
 
 [dependencies]
 # The GUI always enables the graphics JITs (`gpujit`: REX3 draw shaders and

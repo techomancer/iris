@@ -59,6 +59,21 @@ fn make_rex3_unstarted() -> TestBoard<Rex3> {
         .expect("make_rex3_unstarted thread panicked")
 }
 
+#[cfg(not(feature = "rex-dirty-upload"))]
+fn start_rex3_processor_only(rex: &Rex3) {
+    assert!(!rex.running.swap(true, Ordering::SeqCst));
+    let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(rex) };
+    unsafe {
+        (*rex.context.get()).host = rex3 as *const Rex3;
+    }
+    *rex.processor_thread.lock() = Some(
+        std::thread::Builder::new()
+            .name("REX3-Processor-Test".to_string())
+            .spawn(move || rex3.register_processor())
+            .expect("spawn processor"),
+    );
+}
+
 /// Run `f` on a thread with the same 64 MB stack the construction helpers use.
 ///
 /// `Rex3Context` is over a megabyte (the HOSTRW data port alone is 1 MiB) and
@@ -8034,6 +8049,7 @@ fn rgb24_fill_needs_rgbmode_as_well_as_rgb_planes() {
     }
 }
 
+#[cfg(feature = "rex-dirty-upload")]
 #[test]
 fn go_damage_classifies_planes_bounds_and_non_writes() {
     with_big_stack(|| {
@@ -8083,6 +8099,7 @@ fn go_damage_classifies_planes_bounds_and_non_writes() {
     });
 }
 
+#[cfg(feature = "rex-dirty-upload")]
 #[test]
 fn register_traffic_is_clean_and_draws_publish_selected_plane() {
     let rex = &make_rex3_unstarted();
@@ -8106,6 +8123,17 @@ fn register_traffic_is_clean_and_draws_publish_selected_plane() {
     let damage = rex.fb_damage.take();
     assert_eq!(damage.tile_count(DamagePlane::Rgb), 4);
     assert!(damage.plane_is_empty(DamagePlane::Aux));
+}
+
+#[cfg(not(feature = "rex-dirty-upload"))]
+#[test]
+fn legacy_gfifo_register_traffic_marks_framebuffer_dirty() {
+    let rex = &make_rex3_unstarted();
+    start_rex3_processor_only(rex);
+    rex.fb_dirty.store(false, Ordering::Relaxed);
+    reg(rex, REX3_WRMASK, 0x00ff_ffff);
+    wait(rex);
+    assert!(rex.fb_dirty.swap(false, Ordering::Acquire));
 }
 
 /// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's

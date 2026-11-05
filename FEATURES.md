@@ -39,6 +39,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
+| `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
@@ -73,6 +74,7 @@ turn off those dependency defaults.
 | `premiere` | Performance bundle for the embedded core; lightning plus idle parking. | `iris/lightning`, `iris/idle-pause` |
 | `hostcall` | Enable private guest syscall services in the embedded core. | `iris/hostcall` |
 | `hostgl` | Enable hostcall and macOS host OpenGL in the embedded core. | `hostcall`, `iris/hostgl` |
+| `rex-dirty-upload` | Enable opt-in Newport damage tracking and partial uploads in the embedded core. | `iris/rex-dirty-upload` |
 
 Every core feature above is also selectable for the GUI via `iris/<feature>`:
 
@@ -765,18 +767,28 @@ cargo run --release --features rex-jit
 
 ### Newport framebuffer presentation
 
-Newport tracks conservative 64x32 damage tiles independently for its RGB and
-auxiliary planes. The refresh thread copies only dirty rectangles into its
-cached snapshot, and the GL compositor uploads only those rectangles to the
-existing source textures. This is the default behavior and does not require a
-Cargo feature; the CPU framebuffer and the interpreter/precompiled/Cranelift
-raster engines remain authoritative.
+`rex-dirty-upload` is an opt-in feature that tracks conservative 64x32 damage
+tiles independently for Newport's RGB and auxiliary planes. The refresh thread
+copies only dirty rectangles into its cached snapshot, and the GL compositor
+uploads only those rectangles to the existing source textures. The CPU
+framebuffer and the interpreter/precompiled/Cranelift raster engines remain
+authoritative.
+
+The feature is not in the default or release feature bundles. Without it, the
+compiler omits coordinate classification and tile atomics from the REX3 draw
+path and retains the original coarse dirty flag, full snapshot behavior, and
+full-plane GL uploads.
+
+```
+cargo run --release --features rex-dirty-upload
+cargo run -p iris-gui --release --features rex-dirty-upload
+```
 
 The first frame after GL texture creation uploads both complete 2048x1024
 planes. Later palette-, cursor-, topscan-, and heartbeat-only redraws can
 reuse both source textures without uploading framebuffer data. Set
 `REX3_FORCE_FULL_UPLOAD=1` to restore the previous two-full-plane upload
-behavior for comparison or fallback.
+behavior for comparison or fallback in a feature-enabled build.
 
 With `--features perfetto`, the raster, snapshot copy, per-plane upload,
 composition, and readback stages have independent slices and
