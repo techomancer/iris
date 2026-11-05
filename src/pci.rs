@@ -8,6 +8,7 @@
 //! [`IrqLine`] for its pin.
 
 pub mod host;
+pub mod intx;
 pub mod slots;
 
 use std::sync::{Arc, Mutex};
