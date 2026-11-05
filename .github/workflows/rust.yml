@@ -49,6 +49,11 @@ jobs:
     # only thing it links is libasound, which is already installed above.
     - name: Build
       run: cargo build --workspace --verbose
+    - name: Check REX3 GPU replay
+      run: cargo check -p iris --lib --example rex3-gpu-probe --features rex-gpu
+    - name: Test REX3 GPU matcher
+      if: runner.os == 'Linux'
+      run: cargo test -p iris --lib --features rex-gpu rex3_gpu::tests
     # macOS and Windows test results are informational: a failure is reported
     # (red step, annotation on the run) but does not fail the job or the
     # workflow. Shared runners there are slower and noisier, and several tests
