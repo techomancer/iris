@@ -413,31 +413,15 @@ impl crate::traits::Device for MacePci {
                 writeln!(w, "MACE PCI: control {:#010x} revision {:#x} error flags {:#x} at {:#010x}, config address {:#010x}",
                     reg(macepci_reg::CONTROL), reg(macepci_reg::REVISION), reg(macepci_reg::ERROR_FLAGS),
                     reg(macepci_reg::ERROR_ADDR), *self.config_addr.lock().unwrap()).ok();
-                let desc = self.bus.desc();
-                let mut funcs = self.bus.functions();
-                funcs.sort_by_key(|(at, _)| *at);
-                for (at, f) in funcs {
-                    let c = f.config();
-                    let id = c.read(0);
-                    let bars: Vec<String> = (0..6).map(|i| c.bar_base(i)).filter(|&b| b != 0).map(|b| format!("{b:#x}")).collect();
-                    let irq = match c.interrupt_pin() {
-                        0 => "no interrupt".to_string(),
-                        p => match desc.slot(at.device).and_then(|s| s.routes[p as usize - 1]) {
-                            Some(l) => format!("INT{} to CRIME {l}", (b'A' + p - 1) as char),
-                            None => format!("INT{} unrouted", (b'A' + p - 1) as char),
-                        },
-                    };
-                    let name = desc.slot(at.device).map_or("", |s| s.label);
-                    writeln!(w, "  slot {}: {name} {:04x}:{:04x}, command {:#06x}, BARs [{}], {irq}",
-                        at.device, id & 0xffff, id >> 16, c.command(), bars.join(", ")).ok();
+                for line in crate::pci::monitor::report(&self.bus) {
+                    writeln!(w, "  {line}").ok();
                 }
             }
             "config" => {
                 let slot: u8 = args.get(1).and_then(|v| v.parse().ok()).ok_or("Usage: pci config <slot>")?;
-                let f = self.bus.function(PciAddr::dev(slot)).ok_or(format!("pci: nothing in slot {slot}"))?;
-                for row in 0..16 {
-                    let v: Vec<String> = (0..4).map(|k| format!("{:08x}", f.config().read(row * 4 + k))).collect();
-                    writeln!(w, "  {:02x}: {}", row * 16, v.join(" ")).ok();
+                let rows = crate::pci::monitor::config_dump(&self.bus, PciAddr::dev(slot)).ok_or(format!("pci: nothing in slot {slot}"))?;
+                for row in rows {
+                    writeln!(w, "{row}").ok();
                 }
             }
             _ => return Err("Usage: pci status | config <slot>".to_string()),

@@ -62,7 +62,7 @@ pub enum SlotKind {
 }
 
 impl SlotKind {
-    fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             SlotKind::Onboard => "onboard",
             SlotKind::AddIn => "add-in",

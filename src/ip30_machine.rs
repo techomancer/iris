@@ -1134,7 +1134,7 @@ struct Ip30Monitor {
     gfx: Option<Arc<ImpactXio>>,
 }
 
-const IP30_SUBCOMMANDS: &str = "ip30 unmapped | memcfg | bridge | gfx | xbow";
+const IP30_SUBCOMMANDS: &str = "ip30 unmapped | memcfg | bridge | pci [config <device>] | gfx | xbow";
 
 impl Ip30Monitor {
     fn text(&self, sub: &str) -> Result<String, String> {
@@ -1177,6 +1177,7 @@ impl Ip30Monitor {
                 }
                 s
             }
+            "pci" => crate::pci::monitor::report(self.bridge.bus()).iter().map(|l| format!("  {l}\n")).collect(),
             "gfx" => match &self.gfx {
                 Some(g) => format!(
                     "IMPACT on widget {WIDGET_GFX}: link {}, identification {:#010x}\n",
@@ -1214,6 +1215,11 @@ impl Device for Ip30Monitor {
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         if cmd != "ip30" {
             return Err("Command not found".into());
+        }
+        if let ["pci", "config", dev] = args {
+            let at = crate::pci::slots::PciAddr::dev(dev.parse().map_err(|_| format!("Usage: {IP30_SUBCOMMANDS}"))?);
+            let rows = crate::pci::monitor::config_dump(self.bridge.bus(), at).ok_or(format!("pci: nothing at {at}"))?;
+            return w.write_all(rows.join("\n").as_bytes()).and_then(|_| w.write_all(b"\n")).map_err(|e| e.to_string());
         }
         let text = self.text(args.first().copied().unwrap_or("unmapped"))?;
         w.write_all(text.as_bytes()).map_err(|e| e.to_string())

@@ -10,6 +10,7 @@
 pub mod bus;
 pub mod host;
 pub mod intx;
+pub mod monitor;
 pub mod slots;
 
 use std::sync::{Arc, Mutex};
