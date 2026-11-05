@@ -15,6 +15,7 @@
 //!   bt445.rs         Bt445 RAMDAC
 
 pub mod rex3;
+pub(crate) mod rex3_dirty;
 pub mod rex3_generic;
 pub mod rex3_shaders;
 pub mod rex3_shape;

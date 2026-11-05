@@ -8034,6 +8034,80 @@ fn rgb24_fill_needs_rgbmode_as_well_as_rgb_planes() {
     }
 }
 
+#[test]
+fn go_damage_classifies_planes_bounds_and_non_writes() {
+    with_big_stack(|| {
+        let mut ctx = Box::new(Rex3Context::default());
+        ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+        ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+        ctx.wrmask = 0x00ff_ffff;
+        ctx.xstart = (REX3_COORD_BIAS + 10) << 11;
+        ctx.xsave = ctx.xstart;
+        ctx.ystart = (REX3_COORD_BIAS + 20) << 11;
+        ctx.xend = (REX3_COORD_BIAS + 70) << 11;
+        ctx.yend = (REX3_COORD_BIAS + 60) << 11;
+
+        assert_eq!(
+            Rex3::go_damage(&ctx),
+            Some(GoDamage {
+                plane: DamagePlane::Rgb,
+                rect: DamageRect {
+                    x: 10,
+                    y: 20,
+                    width: 61,
+                    height: 41,
+                },
+            })
+        );
+
+        ctx.drawmode1 = DrawMode1(
+            DRAWMODE1_PLANES_CID
+                | (DRAWMODE1_DRAWDEPTH_24 << 3)
+                | DRAWMODE1_COMPARE_DISABLE_SH
+                | DRAWMODE1_LOGICOP_SRC_SH,
+        );
+        assert_eq!(Rex3::go_damage(&ctx).unwrap().plane, DamagePlane::Aux);
+
+        ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH);
+        assert_eq!(Rex3::go_damage(&ctx), None);
+        ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+        ctx.wrmask = 0;
+        assert_eq!(Rex3::go_damage(&ctx), None);
+        ctx.wrmask = u32::MAX;
+        ctx.drawmode1 = DrawMode1(DRAWMODE1_PLANES_NONE);
+        assert_eq!(Rex3::go_damage(&ctx), None);
+
+        ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+        ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_DRAW | (7 << DRAWMODE0_ADRMODE_SHIFT));
+        assert_eq!(Rex3::go_damage(&ctx).unwrap().rect, DamageRect::full());
+    });
+}
+
+#[test]
+fn register_traffic_is_clean_and_draws_publish_selected_plane() {
+    let rex = &make_rex3_unstarted();
+    let _ = rex.fb_damage.take();
+    rex.process_register(REX3_WRMASK, 0x00ff_ffff);
+    assert!(!rex.fb_damage.has_damage());
+
+    let ctx = unsafe { &mut *rex.context.get() };
+    ctx.host = std::ptr::from_ref(&**rex);
+    ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+    ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+    ctx.clipmode = 0xf << CLIPMODE_CIDMATCH_SHIFT;
+    ctx.wrmask = 0x00ff_ffff;
+    ctx.xstart = (REX3_COORD_BIAS + 10) << 11;
+    ctx.xsave = ctx.xstart;
+    ctx.ystart = (REX3_COORD_BIAS + 20) << 11;
+    ctx.xend = (REX3_COORD_BIAS + 70) << 11;
+    ctx.yend = (REX3_COORD_BIAS + 60) << 11;
+    rex.execute_go();
+
+    let damage = rex.fb_damage.take();
+    assert_eq!(damage.tile_count(DamagePlane::Rgb), 4);
+    assert!(damage.plane_is_empty(DamagePlane::Aux));
+}
+
 /// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
 /// 32, and STATUS reports only the last 32 slots of it.
 ///

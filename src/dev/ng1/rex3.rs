@@ -12,6 +12,7 @@ use crate::dev::ng1::vc2::Vc2;
 use crate::dev::ng1::xmap9::Xmap9;
 use crate::dev::ng1::cmap::Cmap;
 use crate::dev::ng1::bt445::Bt445;
+use crate::dev::ng1::rex3_dirty::{DamagePlane, DamageRect, DamageTracker};
 use bitfield::bitfield;
 use crate::disp::Rex3Screen;
 use std::io::Write;
@@ -1315,6 +1316,12 @@ struct DebugState {
     count: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GoDamage {
+    plane: DamagePlane,
+    rect: DamageRect,
+}
+
 pub struct Rex3 {
     pub config: Rex3Config,
     pub dcb: Mutex<Rex3DcbState>,
@@ -1346,12 +1353,9 @@ pub struct Rex3 {
     /// Handle to the REX3-Processor thread, set once when it starts, used by
     /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
     processor_unparker: std::sync::OnceLock<thread::Thread>,
-    /// Set by the gfifo consumer whenever it processes activity that may have
-    /// changed the framebuffer. The refresh thread renders only when this (or a
-    /// palette/cursor/mode change) is seen, rather than re-converting and
-    /// re-uploading the whole framebuffer at 60 Hz on a static screen. Starts
-    /// true so the first frame always renders.
-    fb_dirty: AtomicBool,
+    /// Framebuffer tiles published by writers after their stores complete and
+    /// atomically taken by the refresh thread before it copies them.
+    fb_damage: DamageTracker,
     pub screen: Arc<Mutex<Rex3Screen>>,
     /// Drives the real REX3 `VV_INT_N` pin (vertical retrace / Kaleidoscope).
     pub vblank_cb: Mutex<Option<crate::irq::IrqLine>>,
@@ -1539,7 +1543,7 @@ impl Rex3 {
             refresh_thread: Mutex::new(None),
             processor_parked: AtomicBool::new(false),
             processor_unparker: std::sync::OnceLock::new(),
-            fb_dirty: AtomicBool::new(true),
+            fb_damage: DamageTracker::new_full(),
             screen,
             vblank_cb: Mutex::new(None),
             pf_wait: crate::PfLevel::new(),
@@ -1682,8 +1686,10 @@ impl Rex3 {
                     fb[row..row + w.min(2048)].fill(FILL);
                 }
             }
+            if let Some(rect) = DamageRect::clipped(0, 0, w as i64, h as i64) {
+                self.fb_damage.mark_rect(DamagePlane::Rgb, rect);
+            }
         }
-        self.fb_dirty.store(true, Ordering::Relaxed);
     }
 
     #[inline]
@@ -1754,6 +1760,109 @@ impl Rex3 {
         ctx.bresoctinc1.set_incr1((incr1 as u32) & 0xFFFFF);     // 20-bit, always positive
         ctx.bresrndinc2.set_incr2((incr2 as u32) & 0x1FFFFF);    // 21-bit signed
         ctx.bresd = (d as u32) & 0x7FF_FFFF;                     // 27-bit signed
+    }
+
+    fn go_damage(ctx: &Rex3Context) -> Option<GoDamage> {
+        let opcode = ctx.drawmode0.opcode();
+        if opcode != DRAWMODE0_OPCODE_DRAW && opcode != DRAWMODE0_OPCODE_SCR2SCR {
+            return None;
+        }
+        let planes = ctx.drawmode1.planes();
+        if ctx.wrmask == 0
+            || Self::plane_read_shift_mask(
+                planes,
+                ctx.drawmode1.drawdepth(),
+                ctx.drawmode1.dblsrc(),
+            )
+            .is_none()
+        {
+            return None;
+        }
+        let plane = if Self::plane_is_aux(planes) {
+            DamagePlane::Aux
+        } else {
+            DamagePlane::Rgb
+        };
+
+        let fixed = |value: i32| (value >> 11) as i64;
+        let xstart = fixed(ctx.xstart);
+        let ystart = fixed(ctx.ystart);
+        let xend = fixed(ctx.xend);
+        let yend = fixed(ctx.yend);
+        let rect = match ctx.drawmode0.adrmode() {
+            DRAWMODE0_ADRMODE_SPAN => Self::go_damage_rect(
+                ctx,
+                opcode,
+                xstart.min(xend),
+                ystart,
+                xstart.max(xend),
+                ystart,
+            ),
+            DRAWMODE0_ADRMODE_BLOCK => {
+                let xsave = fixed(ctx.xsave);
+                Self::go_damage_rect(
+                    ctx,
+                    opcode,
+                    xstart.min(xend).min(xsave),
+                    ystart.min(yend),
+                    xstart.max(xend).max(xsave),
+                    ystart.max(yend),
+                )
+            }
+            DRAWMODE0_ADRMODE_I_LINE | DRAWMODE0_ADRMODE_F_LINE | DRAWMODE0_ADRMODE_A_LINE => {
+                Self::go_damage_rect(
+                    ctx,
+                    opcode,
+                    xstart.min(xend) - 1,
+                    ystart.min(yend) - 1,
+                    xstart.max(xend) + 1,
+                    ystart.max(yend) + 1,
+                )
+            }
+            _ => Some(DamageRect::full()),
+        }?;
+        Some(GoDamage { plane, rect })
+    }
+
+    fn go_damage_rect(
+        ctx: &Rex3Context,
+        opcode: u32,
+        min_x: i64,
+        min_y: i64,
+        max_x: i64,
+        max_y: i64,
+    ) -> Option<DamageRect> {
+        let apply_move = opcode == DRAWMODE0_OPCODE_SCR2SCR || ctx.drawmode0.xyoffset();
+        let move_x = if apply_move {
+            (ctx.xymove >> 16) as i16 as i64
+        } else {
+            0
+        };
+        let move_y = if apply_move {
+            ctx.xymove as i16 as i64
+        } else {
+            0
+        };
+        let window_x = (ctx.xywin >> 16) as i16 as i64;
+        let window_y = ctx.xywin as i16 as i64;
+        let x0 = min_x + move_x + window_x - REX3_COORD_BIAS as i64;
+        let x1 = max_x + move_x + window_x - REX3_COORD_BIAS as i64;
+        let absolute_y0 = min_y + move_y + window_y;
+        let absolute_y1 = max_y + move_y + window_y;
+        let (y0, y1) = if ctx.drawmode1.yflip() {
+            (0x23ff - absolute_y1, 0x23ff - absolute_y0)
+        } else {
+            (
+                absolute_y0 - REX3_COORD_BIAS as i64,
+                absolute_y1 - REX3_COORD_BIAS as i64,
+            )
+        };
+        let rect = DamageRect::clipped(x0, y0, x1 + 1, y1 + 1)?;
+        let x_end = (rect.x + rect.width).min(REX3_SCREEN_WIDTH as usize);
+        (rect.x < x_end).then_some(DamageRect {
+            width: x_end - rect.x,
+            ..rect
+        })
     }
 
     /// Whether the draw-debug overlay/ring-buffer tracking is active. Always false
@@ -2528,11 +2637,6 @@ impl Rex3 {
         loop {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
-                // Any consumed entry may have touched the framebuffer or display
-                // state; flag it so the refresh thread re-renders this frame. An
-                // idle screen leaves the fifo empty, so this stays clear and the
-                // refresh thread skips its expensive full-frame work.
-                self.fb_dirty.store(true, Ordering::Relaxed);
 
                 if !is_busy {
                     self.gfxbusy.store(true, Ordering::Relaxed);
@@ -2698,6 +2802,10 @@ impl Rex3 {
                 ctx.xend as f32 / 2048.0, ctx.yend as f32 / 2048.0);
         }
 
+        let damage = Self::go_damage(ctx);
+
+        crate::pf_scope!(crate::perfetto::events::REX3_RASTER, opcode);
+
         // ── Shader dispatch ──────────────────────────────────────────────
         //
         // One map, two producers. LLVM-compiled shaders (rex3_shaders) are built
@@ -2821,6 +2929,9 @@ impl Rex3 {
                         ctx.host_len = 1;
                         ctx.host_cursor = 0;
                     }
+                    if let Some(damage) = damage {
+                        self.fb_damage.mark_rect(damage.plane, damage.rect);
+                    }
                     #[cfg(feature = "rexdiag")]
                     self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
                     return;
@@ -2900,6 +3011,9 @@ impl Rex3 {
         // which is what a PIO read after a transfer expects to see.
         ctx.host_len = 1;
         ctx.host_cursor = 0;
+        if let Some(damage) = damage {
+            self.fb_damage.mark_rect(damage.plane, damage.rect);
+        }
         #[cfg(feature = "rexdiag")]
         self.interp_go_count.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "rexdiag")]
@@ -2961,9 +3075,9 @@ impl Rex3 {
             let fb_aux = unsafe { &*self.fb_aux.get() };
             let topscan = unsafe { (*self.context.get()).topscan as usize };
 
-            // Idle skip: only run the (expensive) full-frame refresh + GL upload
-            // when something visible changed. `fb_dirty` covers all REX3 drawing
-            // (set by the gfifo consumer); the palette/cursor/mode mutexes carry
+            // Idle skip: only run the presentation pipeline when something
+            // visible changed. `fb_damage` covers REX3 drawing; the
+            // palette/cursor/mode mutexes carry
             // their own dirty flags (peeked here, not cleared — refresh() clears
             // them when it runs). A periodic heartbeat keeps the live status bar
             // moving and bounds any missed-dirty staleness. VBLANK is still ticked
@@ -2983,7 +3097,7 @@ impl Rex3 {
             let dbg_overlay = self.draw_debug_active()
                 || self.show_cmap.load(Ordering::Relaxed)
                 || self.show_disp_debug.load(Ordering::Relaxed);
-            let fb_was_dirty = self.fb_dirty.swap(false, Ordering::Acquire);
+            let fb_was_dirty = self.fb_damage.has_damage();
             let should_render = fb_was_dirty
                 || palette_dirty
                 || dbg_overlay
@@ -2997,6 +3111,8 @@ impl Rex3 {
                 last_topscan = topscan;
                 self.diag.fetch_or(Self::DIAG_LOCK_SCREEN, Ordering::Relaxed);
                 let mut screen = self.screen.lock();
+                let fb_damage = self.fb_damage.take();
+                let fb_was_dirty = !fb_damage.is_empty();
                 screen.topscan = topscan;
                 screen.status_bar_only = full_presents > 0
                     && !fb_was_dirty
@@ -3022,7 +3138,7 @@ impl Rex3 {
                 let resized = screen.refresh(
                     &**fb_rgb,
                     &**fb_aux,
-                    fb_was_dirty,
+                    &fb_damage,
                     &self.vc2,
                     &self.xmap0,
                     &self.cmap0,
@@ -3069,7 +3185,6 @@ impl Rex3 {
                     if let Some(ref mut r) = *renderer {
                         crate::pf_scope!(crate::perfetto::events::REX3_PRESENT);
                         self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                        let borrow = screen.fb_borrowed;
                         // Capture reads every frame back: keep it a slice copy
                         // out of the software compositor, never a GL readback.
                         if capture {
@@ -3087,19 +3202,18 @@ impl Rex3 {
                             &mut sbtex,
                             &bar_stats,
                             need_readback,
-                            if borrow { Some(&**fb_rgb) } else { None },
-                            if borrow { Some(&**fb_aux) } else { None },
+                            None,
+                            None,
                         );
                         self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                     } else if need_readback {
                         // No front-end (`--ci`): compose the guest screen here.
                         // No status bar or overlay: this is the guest's screen.
                         let comp = capture_compositor.get_or_insert_with(crate::compositor::SwCompositor::new);
-                        let borrow = screen.fb_borrowed;
-                        comp.compose_pixels(&screen.compositor_source_from(
-                            if borrow { Some(&**fb_rgb) } else { None },
-                            if borrow { Some(&**fb_aux) } else { None },
-                        ));
+                        {
+                            crate::pf_scope!(crate::perfetto::events::REX3_COMPOSE);
+                            comp.compose_pixels(&screen.compositor_source());
+                        }
                         let (w, h) = (screen.width, screen.height);
                         let px = comp.pixels();
                         for y in 0..h {
@@ -3430,10 +3544,16 @@ impl Rex3 {
         let dst_rgb = unsafe { &mut *self.fb_rgb.get() };
         let n = rgb.len().min(dst_rgb.len());
         dst_rgb[..n].copy_from_slice(&rgb[..n]);
+        if n != 0 {
+            self.fb_damage.mark_full(DamagePlane::Rgb);
+        }
 
         let dst_aux = unsafe { &mut *self.fb_aux.get() };
         let n = aux.len().min(dst_aux.len());
         dst_aux[..n].copy_from_slice(&aux[..n]);
+        if n != 0 {
+            self.fb_damage.mark_full(DamagePlane::Aux);
+        }
     }
 
     pub fn load_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
@@ -3492,6 +3612,9 @@ impl Rex3 {
                 let b = &bytes[i * 4..(i + 1) * 4];
                 rgb[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
             }
+            if count != 0 {
+                self.fb_damage.mark_full(DamagePlane::Rgb);
+            }
         }
 
         let path_aux = dir.join(format!("{prefix}_aux.bin"));
@@ -3503,6 +3626,9 @@ impl Rex3 {
             for i in 0..count {
                 let b = &bytes[i * 4..(i + 1) * 4];
                 aux[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+            }
+            if count != 0 {
+                self.fb_damage.mark_full(DamagePlane::Aux);
             }
         }
         Ok(())
@@ -4863,7 +4989,7 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
         if on {
             self.capture_users.fetch_add(1, Ordering::Relaxed);
             // Repaint at once so the new consumer gets a frame.
-            self.fb_dirty.store(true, Ordering::Release);
+            self.frame_request.store(true, Ordering::Release);
         } else {
             let _ = self.capture_users.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
         }
@@ -4915,6 +5041,8 @@ impl Resettable for Rex3 {
             (*self.fb_rgb.get()).fill(0);
             (*self.fb_aux.get()).fill(0);
         }
+        self.fb_damage.mark_full(DamagePlane::Rgb);
+        self.fb_damage.mark_full(DamagePlane::Aux);
         // Reset Vc2, Xmap, Cmap
         *self.vc2.lock() = crate::dev::ng1::vc2::Vc2::new();
         *self.xmap0.lock() = crate::dev::ng1::xmap9::Xmap9::new();

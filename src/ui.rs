@@ -629,7 +629,14 @@ impl Renderer for GlRenderer {
 
             // A prebuilt frame (GR2) is already final in `screen.rgba`; reading
             // the GL framebuffer back would only replace it (it came back black).
-            if need_readback && !screen.prebuilt {
+            let readback_bytes = if need_readback && !screen.prebuilt {
+                width * height * std::mem::size_of::<u32>()
+            } else {
+                0
+            };
+            crate::pf_counter!(crate::perfetto::events::REX3_READBACK_BYTES, readback_bytes);
+            if readback_bytes != 0 {
+                crate::pf_scope!(crate::perfetto::events::REX3_READBACK, readback_bytes);
                 if let Some(pixels) = self.compositor.read_pixels() {
                     // Visible rows only: VNC capture reads every frame back.
                     for y in 0..height {
