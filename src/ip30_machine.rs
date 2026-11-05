@@ -869,6 +869,7 @@ impl OctaneMachine {
         manifest.nvram = Some(self.nvram_path.clone());
         manifest.cpu_model = Some(cpu.model_name().to_string());
         manifest.cpu_cache = Some(cpu.cache_kind().to_string());
+        manifest.pci = crate::pci::place::card_refs(self.bridge.bus());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
         let io = |e: std::io::Error| e.to_string();
@@ -921,9 +922,8 @@ impl OctaneMachine {
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version != SCHEMA_VERSION {
-            return Err(format!("snapshot {name} is schema {}; this build reads Octane snapshots of schema {SCHEMA_VERSION}", m.schema_version));
-        }
+        crate::snapshot::require_schema(&m, name, "Octane")?;
+        crate::snapshot::check_pci(&m.pci, &crate::pci::place::card_refs(self.bridge.bus()))?;
         // As the Indy and the O2: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, cpu.model_name(), cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
@@ -1469,6 +1469,34 @@ mod snapshot_tests {
             let e = a.load_snapshot("flash").unwrap_err();
             assert!(e.contains("flash"), "{e}");
             assert_eq!(digest(&a), before, "the machine is as it was");
+        }).unwrap().join().unwrap();
+    }
+
+    /// A snapshot from before the PCI bus saved its own table, and one taken
+    /// with a card this Octane does not have, are both refused by the
+    /// machine, before anything is read or touched.
+    #[test]
+    fn a_snapshot_of_another_schema_or_with_cards_is_refused_by_the_machine() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("pci-refuse");
+            let prom = empty_prom(&dir);
+            let mut a = machine(&prom, &dir);
+            a.save_snapshot("old").unwrap();
+            a.save_snapshot("card").unwrap();
+            let edit = |name: &str, f: &dyn Fn(String) -> String| {
+                let path = dir.join(format!("saves/{name}/snapshot.toml"));
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(&path, f(text)).unwrap();
+            };
+            edit("old", &|t| {
+                assert!(t.contains("schema_version = 6"), "{t}");
+                t.replace("schema_version = 6", "schema_version = 5")
+            });
+            edit("card", &|t| t + "\n[[pci]]\nbus = \"pci\"\ndevice = 3\ncard = \"aic7880\"\noptions = \"\"\n");
+            let e = a.read_snapshot("old").err().expect("refused");
+            assert_eq!(e, "snapshot old is schema 5; this build reads Octane snapshots of schema 6");
+            let e = a.read_snapshot("card").err().expect("refused");
+            assert!(e.starts_with("snapshot PCI cards differ:") && e.contains("device 3 = aic7880"), "{e}");
         }).unwrap().join().unwrap();
     }
 }

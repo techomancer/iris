@@ -49,7 +49,13 @@ use toml::Value;
 /// changed shape: the serial DMA, the Indy's SCC and the rest are as before.
 /// Octane snapshots start at v5, and an Octane reads only snapshots of the
 /// schema it was built with, so the next bump refuses every older one.
-pub const SCHEMA_VERSION: u32 = 5;
+///
+/// v5 → v6: the PCI headers and pin levels are saved by the shared bus, in
+/// one table per host, and an O2 or Octane snapshot names the cards fitted;
+/// a v5 reader would restore a bus whose layout it does not know. The O2 and
+/// Octane refuse older snapshots; the Indy and Indigo2 did not change and
+/// still load theirs.
+pub const SCHEMA_VERSION: u32 = 6;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 
@@ -163,6 +169,62 @@ pub fn check_provenance(m: &Manifest, cpu_model: &str, cache_kind: &str, disks: 
     Ok(())
 }
 
+/// A PCI add-in card fitted when a snapshot was taken, by where it was.
+/// `device` is the PCI device number, never a chassis label, so a snapshot
+/// outlives a relabelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PciRef {
+    pub bus: String,
+    pub device: u8,
+    pub card: String,
+    /// The card's options as `key=value,...`, sorted.
+    pub options: String,
+}
+
+impl PciRef {
+    fn describe(&self) -> String {
+        let options = if self.options.is_empty() { String::new() } else { format!(" ({})", self.options) };
+        format!("pci bus \"{}\" device {} = {}{options}", self.bus, self.device, self.card)
+    }
+}
+
+/// Refuse a restore into a machine whose fitted cards are not the ones the
+/// snapshot was taken with. A card's state restored without the card, or a
+/// card left at power-on under a running kernel, is not a state anything
+/// was ever in. Not overridable: there is nothing to restore it into.
+pub fn check_pci(snapshot: &[PciRef], current: &[PciRef]) -> Result<(), String> {
+    let mut problems = Vec::new();
+    for s in snapshot {
+        match current.iter().find(|c| c.bus == s.bus && c.device == s.device) {
+            None => problems.push(format!("snapshot has {}, this config has no card there", s.describe())),
+            Some(c) if c != s => problems.push(format!("snapshot has {}, this config has {}", s.describe(), c.describe())),
+            Some(_) => {}
+        }
+    }
+    for c in current {
+        if !snapshot.iter().any(|s| s.bus == c.bus && s.device == c.device) {
+            problems.push(format!("this config has {}, the snapshot has no card there", c.describe()));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("snapshot PCI cards differ:\n  - {}", problems.join("\n  - ")))
+    }
+}
+
+/// The O2 and the Octane read only snapshots of the schema they were built
+/// with. `machine` is how the message names the machine ("O2").
+pub fn require_schema(m: &Manifest, name: &str, machine: &str) -> Result<(), String> {
+    if m.schema_version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(format!(
+        "snapshot {name} is schema {}; this build reads {machine} snapshots of schema {SCHEMA_VERSION}",
+        m.schema_version
+    ))
+}
+
 /// Top-level snapshot manifest. Lives at `saves/<name>/snapshot.toml`. Written
 /// first on save and read first on load so the rest of the pipeline can fail
 /// fast with a clear error before reading half a snapshot.
@@ -192,6 +254,9 @@ pub struct Manifest {
     /// for the O2. None for the Indy and Indigo2 and every older manifest. A
     /// snapshot loads only into the machine it names.
     pub machine: Option<String>,
+    /// The PCI add-in cards fitted at capture time. Empty when none were,
+    /// and for every manifest written before cards could be fitted.
+    pub pci: Vec<PciRef>,
 }
 
 impl Manifest {
@@ -218,6 +283,7 @@ impl Manifest {
             cpu_model: None,
             cpu_cache: None,
             machine: None,
+            pci: Vec::new(),
         }
     }
 
@@ -266,6 +332,17 @@ impl Manifest {
         if let Some(m) = &self.machine {
             tbl.insert("machine".into(), Value::String(m.clone()));
         }
+        if !self.pci.is_empty() {
+            let cards: Vec<Value> = self.pci.iter().map(|c| {
+                let mut t = toml::map::Map::new();
+                t.insert("bus".into(), Value::String(c.bus.clone()));
+                t.insert("device".into(), Value::Integer(c.device as i64));
+                t.insert("card".into(), Value::String(c.card.clone()));
+                t.insert("options".into(), Value::String(c.options.clone()));
+                Value::Table(t)
+            }).collect();
+            tbl.insert("pci".into(), Value::Array(cards));
+        }
         Value::Table(tbl)
     }
 
@@ -310,6 +387,22 @@ impl Manifest {
         let cpu_model = tbl.get("cpu_model").and_then(|x| x.as_str()).map(String::from);
         let cpu_cache = tbl.get("cpu_cache").and_then(|x| x.as_str()).map(String::from);
         let machine = tbl.get("machine").and_then(|x| x.as_str()).map(String::from);
+        // Cards: absent in a manifest from before they existed, which had
+        // none. A card entry that does not parse is an error, not a
+        // card-less snapshot, since the restore would then run without it.
+        let pci = match tbl.get("pci") {
+            None => Vec::new(),
+            Some(v) => v.as_array().ok_or("manifest: pci is not a list")?.iter().map(|x| {
+                let t = x.as_table().ok_or("manifest: a pci entry is not a table")?;
+                let text = |k: &str| t.get(k).and_then(|v| v.as_str()).map(String::from).ok_or(format!("manifest: pci entry has no {k}"));
+                Ok(PciRef {
+                    bus: text("bus")?,
+                    device: t.get("device").and_then(|v| v.as_integer()).and_then(|n| u8::try_from(n).ok()).ok_or("manifest: pci entry has no device")?,
+                    card: text("card")?,
+                    options: t.get("options").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                })
+            }).collect::<Result<Vec<_>, String>>()?,
+        };
         Ok(Self {
             schema_version,
             iris_git_rev,
@@ -324,6 +417,7 @@ impl Manifest {
             cpu_model,
             cpu_cache,
             machine,
+            pci,
         })
     }
 }
@@ -782,6 +876,7 @@ mod tests {
             cpu_model: Some("R5000".into()),
             cpu_cache: Some("shadow".into()),
             machine: Some("o2_ip32".into()),
+            pci: vec![PciRef { bus: "pci".into(), device: 3, card: "aic7880".into(), options: String::new() }],
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -797,6 +892,7 @@ mod tests {
         assert_eq!(m2.nvram, m.nvram);
         assert_eq!(m2.cpu_model, m.cpu_model);
         assert_eq!(m2.machine, m.machine);
+        assert_eq!(m2.pci, m.pci);
     }
 
     #[test]
@@ -815,6 +911,7 @@ mod tests {
             cpu_model: None,
             cpu_cache: None,
             machine: None,
+            pci: vec![],
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -827,6 +924,72 @@ mod tests {
         assert!(m2.nvram.is_none());
         assert!(m2.cpu_model.is_none(), "legacy manifest has no cpu_model");
         assert!(m2.machine.is_none(), "an Indy/Indigo2 manifest names no machine");
+    }
+
+    fn card(bus: &str, device: u8, name: &str) -> PciRef {
+        PciRef { bus: bus.into(), device, card: name.into(), options: String::new() }
+    }
+
+    #[test]
+    fn a_restore_needs_the_same_cards_in_the_same_slots() {
+        let fitted = [card("pci", 3, "aic7880")];
+        check_pci(&fitted, &fitted).expect("same card, same device");
+        check_pci(&[], &[]).expect("no cards on either side");
+        assert_eq!(
+            check_pci(&fitted, &[]).unwrap_err(),
+            "snapshot PCI cards differ:\n  - snapshot has pci bus \"pci\" device 3 = aic7880, this config has no card there"
+        );
+        assert_eq!(
+            check_pci(&[], &fitted).unwrap_err(),
+            "snapshot PCI cards differ:\n  - this config has pci bus \"pci\" device 3 = aic7880, the snapshot has no card there"
+        );
+        let other = [card("pci", 3, "other")];
+        assert!(check_pci(&fitted, &other).unwrap_err().contains("this config has pci bus \"pci\" device 3 = other"));
+        let tuned = [PciRef { options: "depth=4".into(), ..card("pci", 3, "aic7880") }];
+        assert!(check_pci(&fitted, &tuned).unwrap_err().contains("(depth=4)"), "options are part of the card");
+        let two = [card("pci", 3, "aic7880"), card("pci", 4, "aic7880")];
+        assert!(check_pci(&fitted, &two).unwrap_err().contains("device 4"));
+    }
+
+    #[test]
+    fn a_manifest_with_a_broken_card_entry_is_an_error() {
+        let mut m = Manifest::for_current_save();
+        m.pci = vec![card("pci", 3, "aic7880")];
+        let mut v = m.to_toml();
+        assert_eq!(Manifest::from_toml(&v).unwrap().pci, m.pci);
+        v.as_table_mut().unwrap().insert("pci".into(), Value::Array(vec![Value::String("x".into())]));
+        assert!(Manifest::from_toml(&v).is_err(), "not a card-less snapshot");
+        let mut none = Manifest::for_current_save().to_toml();
+        assert!(none.get("pci").is_none(), "no cards writes no key");
+        assert!(Manifest::from_toml(&none).unwrap().pci.is_empty());
+        none.as_table_mut().unwrap().insert("pci".into(), Value::Integer(3));
+        assert!(Manifest::from_toml(&none).is_err());
+    }
+
+    #[test]
+    fn a_v5_manifest_is_refused_with_its_schema_and_the_readers() {
+        let mut m = Manifest::for_current_save();
+        require_schema(&m, "x", "O2").expect("current schema");
+        m.schema_version = 5;
+        assert_eq!(
+            require_schema(&m, "old", "O2").unwrap_err(),
+            "snapshot old is schema 5; this build reads O2 snapshots of schema 6"
+        );
+        assert_eq!(
+            require_schema(&m, "old", "Octane").unwrap_err(),
+            "snapshot old is schema 5; this build reads Octane snapshots of schema 6"
+        );
+        m.schema_version = 7;
+        assert!(require_schema(&m, "new", "O2").is_err(), "newer is refused too");
+    }
+
+    #[test]
+    fn a_v6_manifest_round_trips_with_cards() {
+        let mut m = Manifest::for_current_save();
+        m.machine = Some("o2_ip32".into());
+        m.pci = vec![card("pci", 3, "aic7880")];
+        let again = Manifest::from_toml(&m.to_toml()).unwrap();
+        assert_eq!((again.schema_version, again.pci), (6, m.pci));
     }
 
     #[test]

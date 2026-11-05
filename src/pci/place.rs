@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::bus::CardRef;
+use super::bus::{CardRef, PciBus};
 use super::card::{describe_options, CardBuild, PciCard};
 use super::slots::{BusDesc, PciAddr, SlotDesc, SlotKind};
 use super::PciBusDevice;
@@ -131,6 +131,19 @@ impl Placement {
     pub fn card_ref(&self) -> CardRef {
         CardRef { name: self.card.name(), options: describe_options(&self.options), first_controller: self.first_controller }
     }
+}
+
+/// The cards fitted on `bus`, as a snapshot records them.
+pub fn card_refs(bus: &PciBus) -> Vec<crate::snapshot::PciRef> {
+    bus.cards()
+        .into_iter()
+        .map(|(at, c, _)| crate::snapshot::PciRef {
+            bus: bus.desc().id.to_string(),
+            device: at.device,
+            card: c.name,
+            options: c.options,
+        })
+        .collect()
 }
 
 /// The bus an entry names, or the machine's only bus.

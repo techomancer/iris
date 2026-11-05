@@ -630,6 +630,7 @@ impl O2Machine {
         manifest.nvram = self.flash_path.clone();
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
         manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
+        manifest.pci = crate::pci::place::card_refs(self.bus.mace.pci.bus());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
         snap.write_state("cpu", &self.cpu.save_state(), sv).map_err(|e| e.to_string())?;
@@ -669,7 +670,7 @@ impl O2Machine {
 
     fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
         use crate::chunk_store::{get_chunks_as_words, ChunkStore};
-        use crate::snapshot::{Snapshot, SCHEMA_VERSION};
+        use crate::snapshot::Snapshot;
         let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
         let m = snap.read_manifest()?.ok_or_else(|| format!("saves/{name}: no snapshot.toml"))?;
         if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
@@ -678,15 +679,8 @@ impl O2Machine {
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version > SCHEMA_VERSION {
-            return Err(format!("snapshot schema_version {} is newer than this iris build supports ({SCHEMA_VERSION})", m.schema_version));
-        }
-        if m.schema_version < SCHEMA_VERSION {
-            return Err(format!(
-                "snapshot {name} is schema {}; the O2's UART state changed shape in schema 5, so it cannot be restored",
-                m.schema_version
-            ));
-        }
+        crate::snapshot::require_schema(&m, name, "O2")?;
+        crate::snapshot::check_pci(&m.pci, &crate::pci::place::card_refs(self.bus.mace.pci.bus()))?;
         // As the Indy: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
@@ -1244,3 +1238,46 @@ mod drop_tests {
         assert_eq!(phys.strong_count(), 0, "the decode table outlives its machine");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GraphicsBoard;
+    use crate::display_stop_tests::{big_stack, config, scratch};
+    use crate::snapshot::{Manifest, PciRef, Snapshot, SCHEMA_VERSION};
+
+    /// A snapshot from before the PCI bus saved its own table, and one taken
+    /// with a card this O2 does not have, are both refused by the machine,
+    /// before anything of the snapshot is read.
+    #[test]
+    fn a_snapshot_of_another_schema_or_with_cards_is_refused_by_the_machine() {
+        let dir = scratch("o2-pci-refuse");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        // Snapshots are read from `saves` under the current directory.
+        let name = format!("pci-refusal-{}", std::process::id());
+        let (old, card) = big_stack({
+            let name = name.clone();
+            move || {
+                let mut m = O2Machine::new(&cfg).expect("an O2");
+                let snap = Snapshot::new(std::path::PathBuf::from("saves").join(&name));
+                snap.ensure_dir().unwrap();
+                let mut manifest = Manifest::for_current_save();
+                manifest.machine = Some(SNAPSHOT_MACHINE.into());
+                manifest.schema_version = 5;
+                snap.write_manifest(&manifest).unwrap();
+                let old = m.read_snapshot(&name).err().expect("refused");
+                manifest.schema_version = SCHEMA_VERSION;
+                manifest.pci = vec![PciRef { bus: "pci".into(), device: 3, card: "aic7880".into(), options: String::new() }];
+                snap.write_manifest(&manifest).unwrap();
+                let card = m.read_snapshot(&name).err().expect("refused");
+                let _ = std::fs::remove_dir_all(&snap.dir);
+                let _ = std::fs::remove_dir("saves");
+                Workstation::stop(&mut m);
+                (old, card)
+            }
+        });
+        assert_eq!(old, format!("snapshot {name} is schema 5; this build reads O2 snapshots of schema 6"));
+        assert!(card.starts_with("snapshot PCI cards differ:") && card.contains("device 3 = aic7880"), "{card}");
+    }
+}
+

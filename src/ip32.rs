@@ -772,6 +772,17 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
+        // Each fitted card's own state (its header is in MACE's), in the
+        // order they were fitted.
+        let cards = self
+            .mace
+            .pci
+            .bus()
+            .cards()
+            .iter()
+            .map(|(_, _, f)| f.saveable().map_or(toml::Value::Boolean(false), |s| s.save_state()))
+            .collect();
+        t.insert("cards".into(), toml::Value::Array(cards));
         if let Some(words) = self.ram.stack_page_words() {
             t.insert("stack_page".into(), toml::Value::Array(words.into_iter().map(crate::snapshot::hex_u64).collect()));
         }
@@ -780,6 +791,15 @@ impl crate::traits::Saveable for Ip32Bus {
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         use crate::snapshot::get_field;
+        // Before anything is touched: another set of cards is another machine.
+        let cards = self.mace.pci.bus().cards();
+        let saved_cards = match get_field(v, "cards") {
+            Some(toml::Value::Array(a)) => a.as_slice(),
+            _ => &[],
+        };
+        if saved_cards.len() != cards.len() {
+            return Err(format!("saved state has {} PCI cards, this machine {}", saved_cards.len(), cards.len()));
+        }
         if let Some(m) = get_field(v, "mace") {
             self.mace.load_state(m)?;
         }
@@ -799,6 +819,11 @@ impl crate::traits::Saveable for Ip32Bus {
             }
             for (c, s) in scsi.iter().zip(a) {
                 c.load_state(s)?;
+            }
+        }
+        for ((_, _, f), saved) in cards.iter().zip(saved_cards) {
+            if let Some(s) = f.saveable() {
+                s.load_state(saved)?;
             }
         }
         if let Some(toml::Value::Array(a)) = get_field(v, "stack_page") {

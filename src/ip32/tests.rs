@@ -1053,3 +1053,27 @@ fn no_cards_means_the_same_bus_as_before() {
     assert_eq!(bus.scsi_buses().len(), 2);
     assert!(bus.card_devices().is_empty());
 }
+
+#[test]
+fn an_o2_saved_with_a_card_will_not_load_without_one() {
+    use crate::traits::Saveable;
+    let with = with_cards(&option_slot());
+    let without = with_cards(&[]);
+    let saved = with.save_state();
+    let e = without.load_state(&saved).unwrap_err();
+    assert!(e.contains("saved state has 1 PCI cards, this machine 0"), "{e}");
+    let e = with.load_state(&without.save_state()).unwrap_err();
+    assert!(e.contains("saved state has 0 PCI cards, this machine 1"), "{e}");
+}
+
+#[test]
+fn a_card_fitted_o2_state_round_trips() {
+    use crate::traits::Saveable;
+    let src = with_cards(&option_slot());
+    let saved = src.save_state();
+    let dst = with_cards(&option_slot());
+    dst.load_state(&saved).expect("same cards, same state");
+    assert_eq!(dst.save_state(), saved);
+    let refs = crate::pci::place::card_refs(src.mace.pci.bus());
+    assert_eq!((refs[0].card.as_str(), refs[0].device), ("aic7880", 3));
+}
