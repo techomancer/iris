@@ -1104,6 +1104,7 @@ impl Board {
         if cmd_arity(word) != 0 && ((word >> 24) == 0 || (word & cmd::GL_OPERANDS) != 0) {
             let note = format!("; skipping {} operands", cmd_arity(word));
             self.cmd_report(word, &note);
+            self.cmd.tag = word;
             self.cmd.state = ODSY_CMD_SKIP;
             self.cmd.operand_count = cmd_arity(word);
             self.cmd.operand_index = 0;
@@ -1148,9 +1149,17 @@ impl Board {
         }
         match self.cmd.state {
             ODSY_CMD_SKIP => {
+                // Kept for the trace: what the model passes over is what
+                // the next model of it needs to see.
+                if (self.cmd.operand_index as usize) < self.cmd.operand.len() {
+                    self.cmd.operand[self.cmd.operand_index as usize] = word;
+                }
                 self.cmd.operand_index += 1;
                 if self.cmd.operand_index == self.cmd.operand_count {
                     self.cmd.state = ODSY_CMD_IDLE;
+                    if self.trace.on(TRACE_FIFO) {
+                        self.trace_skipped();
+                    }
                 }
             }
             ODSY_CMD_OPERANDS => {

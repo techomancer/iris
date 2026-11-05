@@ -380,6 +380,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 | [fetchverify-stale-code-detector.md](testing/fetchverify-stale-code-detector.md) | design | `fetchverify`: catching stale code that lockstep cannot see |
 | [installed-probe-test-is-load-flaky.md](testing/installed-probe-test-is-load-flaky.md) | history | `installed_probe_round_trips_to_the_compile_side` is load-flaky |
 | [loading-code-before-post-ram-is-unmapped.md](testing/loading-code-before-post-ram-is-unmapped.md) | rule | Loading code before POST: RAM is unmapped, and the write is silent |
+| [piglit-on-irix.md](testing/piglit-on-irix.md) | howto | piglit's IRIX branch against IRIS: the board lists, moving files in and out of guests and real machines, comparing emulated and real VPro runs |
 | [running-cpu-tests-on-real-hardware.md](testing/running-cpu-tests-on-real-hardware.md) | howto | Running cpu-tests on a real SGI Indy |
 | [scc-serial-output-from-bare-metal-code.md](testing/scc-serial-output-from-bare-metal-code.md) | rule | Getting serial output out of bare-metal guest code |
 | [sgi-volume-directory-layout-verified-on-real-media.md](testing/sgi-volume-directory-layout-verified-on-real-media.md) | rule | SGI volume directory: layout verified against real media |
@@ -391,6 +392,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 
 | Note | Kind | Title |
 |---|---|---|
+| [telnet-lines-are-cut-at-256.md](irix/telnet-lines-are-cut-at-256.md) | rule | A command line sent over telnet is cut at 256 characters (tty canonical mode): keep `irix-sh.py run` commands short or push a script; some images' xdm grabs the server until a console login |
 | [cdrom-changer-eject-no-mediad-remount.md](irix/cdrom-changer-eject-no-mediad-remount.md) | open | CD changer `cdrom-eject` does not trigger a `mediad` remount |
 | [delay-loop-calibrated-cold.md](irix/delay-loop-calibrated-cold.md) | open | IRIX calibrates its microsecond delay loop cold, so JIT runs make every delay short (Octane "RAD UST not incrementing") |
 | [default-visual-24bit.md](irix/default-visual-24bit.md) | rule | The ip28 guest's X server defaults to 24-bit TrueColor |
