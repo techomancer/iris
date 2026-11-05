@@ -19,7 +19,11 @@ fn word(b: &[u8], i: usize) -> Option<u32> {
     Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?))
 }
 
-/// The guest-visible port a GETPORT call asks for, or 0 if unknown.
+/// The protocol number of UDP in a mapping; the servers are UDP only.
+pub(crate) const IPPROTO_UDP: u32 = 17;
+/// The guest-visible port a GETPORT call asks for, or 0 if unknown. A TCP
+/// mapping is unknown: IRIX 6.5.30's mount asks for TCP first and only
+/// falls back to UDP when the answer is 0.
 pub(crate) fn lookup(call: &[u8]) -> u32 {
     let parse = || -> Option<u32> {
         if word(call, 4)? != 0 || word(call, 8)? != 2 || word(call, 12)? != PROG_PORTMAP
@@ -30,6 +34,9 @@ pub(crate) fn lookup(call: &[u8]) -> u32 {
         let verf = 32 + cred_len;
         let args = verf + 8 + word(call, verf + 4)? as usize;
         word(call, args + 12)?; // the whole mapping must be there
+        if word(call, args + 8)? != IPPROTO_UDP {
+            return Some(0);
+        }
         Some(match word(call, args)? {
             PROG_NFS => NFS_PORT as u32,
             PROG_MOUNTD => MOUNTD_PORT as u32,
@@ -71,5 +78,12 @@ mod tests {
             assert_eq!(u32::from_be_bytes(r[24..28].try_into().unwrap()), port);
         }
         assert_eq!(lookup(&getport_call(1, PROG_NFS)[..40]), 0, "truncated call");
+    }
+
+    #[test]
+    fn getport_has_no_tcp_mappings() {
+        let mut call = getport_call(1, PROG_MOUNTD);
+        call[48..52].copy_from_slice(&6u32.to_be_bytes());
+        assert_eq!(lookup(&call), 0);
     }
 }
