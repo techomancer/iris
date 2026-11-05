@@ -17,7 +17,7 @@ use super::consts::{
 };
 use super::interface::front_register;
 use super::reader::SharedRegs;
-use super::scanout::{DirtySite, ScanoutMode};
+use super::scanout::ScanoutMode;
 impl Board {
     pub fn identity(&mut self) -> u32 {
         (self.widget.revision << 28) | (ODSY_PART << 12) | (ODSY_MANUFACTURER << 1) | 1
@@ -53,6 +53,9 @@ impl Board {
     /// Report an unmodeled command word once. note follows the message: the
     /// parser's framing decision for a word it does not know, or "".
     pub fn cmd_report(&mut self, word: u32, note: &str) {
+        if self.trace.on(super::trace::TRACE_FIFO) {
+            self.trace_note(format_args!("unmodelled word {word:#010x}{note}"));
+        }
         if self.diag.reported_cmd[..self.diag.reported_cmd_count as usize].contains(&word) {
             return;
         }
@@ -180,20 +183,6 @@ impl Board {
     pub fn regs(&self) -> &SharedRegs {
         &self.scanout.shared.regs
     }
-
-    /// The first and last display line the cursor covers as it stands, or
-    /// None when it covers none.
-    pub fn cursor_span(&mut self) -> Option<(i32, i32)> {
-        self.regs().cursor_span(self.scanout.mode.height as i32 - 1)
-    }
-
-    /// Repaint the lines of a span from cursor_span(); a span past the
-    /// bottom of the raster is empty.
-    pub fn cursor_invalidate(&mut self, span: Option<(i32, i32)>) {
-        if let Some((first, last)) = span.filter(|&(first, last)| first <= last) {
-            self.scanout.repaint_for(DirtySite::Cursor, first, last - first + 1);
-        }
-    }
 }
 
 /// A colour word, ten bits a channel, as 0x00RRGGBB from the top eight.
@@ -268,13 +257,8 @@ impl Board {
     /// carries that has no known meaning, and repaint the lines the cursor
     /// covered before and covers now.
     pub fn cursor_write(&mut self, index: u32, data: u32) {
-        let old = self.cursor_span();
-
         self.regs().set_cursor(index as usize, data);
         self.cursor_check(index, data);
-        let new = self.cursor_span();
-        self.cursor_invalidate(old);
-        self.cursor_invalidate(new);
     }
 
     /// A backend read-window offset that names a cursor entry: its stored word.
@@ -476,15 +460,15 @@ impl Board {
         if (backend::CTL_BASE..backend::CTL_BASE + backend::CTL_ENTRIES).contains(&index) {
             self.widget.backend_ctl[(index - backend::CTL_BASE) as usize] = data;
         }
-        // Scanout resolves through both, so either change repaints.
+        if (super::frame::pbj::BASE..super::frame::pbj::BASE + 16).contains(&index) {
+            self.regs().set_pbj((index - super::frame::pbj::BASE) as usize, data);
+        }
         if index < lut::SIZE {
             self.regs().set_lut(index as usize, data & lut::ENTRY_MASK);
-            self.scanout.repaint_all_for(DirtySite::Lut);
             return;
         }
         if (dispmode::BASE..dispmode::BASE + dispmode::COUNT).contains(&index) {
             self.regs().set_dispmode((index - dispmode::BASE) as usize, data);
-            self.scanout.repaint_all_for(DirtySite::Lut);
             return;
         }
         if (cursor::BASE..cursor::BASE + cursor::ENTRIES).contains(&index) {
@@ -497,7 +481,6 @@ impl Board {
                 self.diag.overlay_mode_reported = true;
                 crate::dlog!(LogModule::Odyssey, "sgi-odyssey: overlay mode {:#x} has bits this model does not decode", data);
             }
-            self.scanout.repaint_all_for(DirtySite::Lut);
             return;
         }
         match index {

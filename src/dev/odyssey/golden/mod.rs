@@ -1,7 +1,7 @@
 //! Draw-level golden frames for the VPro rasteriser and its vertex side.
 //!
 //! Each scene drives `Board::gl_draw()` the way the GL context does (and the
-//! fill-rate benchmark's scenes do): vertices and a `GlDrawState` into a v12
+//! fill-rate benchmark's scenes do): vertices and a `LibState` into a v12
 //! board's own planes, the board's texture, fog and depth registers set the
 //! way the command stream sets them. No guest runs. A scene's colour, depth
 //! and stencil planes over its 128 x 128 window are hashed, and the hash is
@@ -21,7 +21,6 @@
 
 use super::raster_bench;
 use super::board::Board;
-use super::draw::gl_rules;
 pub mod replay;
 pub mod scenes;
 pub mod vertices;
@@ -46,16 +45,16 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The planes of `b` over the scene window.
+    /// The destination's A colour, depth and stencil fields over the scene
+    /// window (Board::test_screen()).
     pub fn of(b: &Board) -> Frame {
-        let depth = b.planes.depth.plane(b.planes.depth_plane).expect("the depth plane");
-        let stencil = b.planes.stencil.plane(b.planes.stencil_plane).expect("the stencil plane");
+        let m = b.dest_mem();
         let mut f = Frame { colour: vec![], depth: vec![], stencil: vec![] };
         for y in 0..SIDE {
             for x in 0..SIDE {
-                f.colour.push(b.buffer_load(0, x as i64, y as i64));
-                f.depth.push(b.planes.depth.plane_load(&depth, x, y));
-                f.stencil.push(b.planes.stencil.plane_load(&stencil, x, y));
+                f.colour.push(m.colour[0].load_word(x, y).unwrap_or(0));
+                f.depth.push(m.depth.load_word(x, y).unwrap_or(0));
+                f.stencil.push(m.stencil.load1(x, y).unwrap_or(0) as u32);
             }
         }
         f
@@ -240,6 +239,24 @@ pub fn render_counted(name: &str) -> (Frame, usize) {
     (f, n)
 }
 
+/// Every scene draws the same frame with the raster and back-end threads
+/// running as it does inline: the back end's ring keeps each pixel's
+/// fragments in order, and the drains leave the planes to the front end.
+#[test]
+fn every_scene_draws_the_same_on_the_raster_and_back_end_threads() {
+    for name in scenes::NAMES {
+        let inline = render_counted(name).0;
+        let mut c = scenes::Ctx::new();
+
+        c.board.raster.start_threads(true);
+        assert!(scenes::run_scene(name, &mut c));
+        c.board.raster_wait();
+        let threaded = Frame::of(&c.board);
+        c.board.raster.stop();
+        assert_eq!(threaded.hash(), inline.hash(), "scene {name}: {:?}", distance(&threaded, &inline, &Tolerance::default()));
+    }
+}
+
 /// A scene that draws nothing would pin nothing.
 const MIN_DRAWN: usize = 200;
 
@@ -412,8 +429,8 @@ fn scenes_of_one_family_are_told_apart() {
 #[test]
 fn a_small_positive_w_maps_as_the_same_point() {
     let st = scenes::Ctx::new().st;
-    let sub = (1i32 << gl_rules().subpixel_bits) as f32;
-    let at = |w: f32| st.clip_to_window(&[0.5 * w, -0.25 * w, 0.125 * w, w], sub);
+    let sub = crate::dev::odyssey::pipe::setup::SUB as f32;
+    let at = |w: f32| st.xf().clip_to_window(&[0.5 * w, -0.25 * w, 0.125 * w, w], sub);
     let want = at(1.0).expect("a window position");
 
     for w in [1e-6, 5e-7, 1e-7, 1e-12] {

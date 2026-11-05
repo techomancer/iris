@@ -42,7 +42,6 @@
 //! board's thread, or an access that drains it with that thread stopped)
 //! is the consumer.
 
-
 use super::consts::{cfifo, intr, ODSY_WORK_QUEUE_MAX};
 use super::interface::HostInterface;
 use super::worker::GAP;
@@ -156,6 +155,7 @@ pub(super) struct CommandFifo {
     sleeper: Mutex<Option<std::thread::Thread>>,
     pub thread: Mutex<Option<JoinHandle<()>>>,
     /// Edge filter for the traced level; zero-sized without the feature.
+    #[cfg_attr(not(feature = "perfetto"), allow(dead_code, reason = "read by pf_value! with perfetto"))]
     pub pf_level: crate::PfValue,
     /// Tests: queue every command store even with no thread running, and
     /// run this many per slice.

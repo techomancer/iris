@@ -188,7 +188,7 @@ impl Board {
                 count += 1;
             }
         }
-        self.prim.in_prim = self.gl_ctx.resume_primitive(self.prim.restart_type, Some(&self.prim.restart_vertex[..]), n, count);
+        self.prim.in_prim = self.assembly.resume_primitive(self.prim.restart_type, &self.prim.restart_vertex[..], n, count);
         self.prim.restart_armed = false;
     }
 
@@ -250,7 +250,7 @@ impl Board {
 
             self.shadow_ring(base, hw::ATTR_TEXTURE as u32, 0, gl_cmd::TEXCOORD_4F, &coordinate);
         } else {
-            let three = (self.tex.mode & tex::MODE_3D) != 0 || self.tex.coord_r != 0;
+            let three = (self.tex_regs().path & tex::MODE_3D) != 0 || self.tex.coord_r != 0;
             let three_ops = [self.tex.coord[0], self.tex.coord[1], self.tex.coord_r];
             let two_ops = self.tex.coord;
 

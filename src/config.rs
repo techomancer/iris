@@ -965,6 +965,15 @@ pub struct GraphicsSection {
     /// Host-forced Newport video mode at VM start (`guest` = IRIX/setmon controls VC2).
     #[serde(default)]
     pub resolution: crate::dev::ng1::vc2_timings::NewportResolution,
+    /// Worker threads the board's fragment pipeline draws on, at least 1.
+    /// VPro: the screen tiles' owners, besides its front-end and raster
+    /// threads.
+    #[serde(default = "default_graphics_threads")]
+    pub threads: usize,
+    /// VPro: the fragment pipeline's screen tile size in pixels, a power of
+    /// two from 8 to 256.
+    #[serde(default = "default_graphics_tile")]
+    pub tile: u32,
 }
 
 impl GraphicsSection {
@@ -977,6 +986,8 @@ impl GraphicsSection {
 }
 
 fn default_graphics_heads() -> u8 { 1 }
+fn default_graphics_threads() -> usize { 2 }
+fn default_graphics_tile() -> u32 { 32 }
 
 impl Default for GraphicsSection {
     fn default() -> Self {
@@ -984,6 +995,8 @@ impl Default for GraphicsSection {
             board: None,
             heads: default_graphics_heads(),
             resolution: crate::dev::ng1::vc2_timings::NewportResolution::default(),
+            threads: default_graphics_threads(),
+            tile: default_graphics_tile(),
         }
     }
 }
@@ -2495,6 +2508,12 @@ impl MachineConfig {
             if !(mhz > 0.0) || !mhz.is_finite() {
                 return Err(format!("clock.fixed_mhz {} is invalid (must be a positive number)", mhz));
             }
+        }
+        if self.graphics.threads == 0 {
+            return Err("graphics.threads must be at least 1".into());
+        }
+        if !self.graphics.tile.is_power_of_two() || !(8..=256).contains(&self.graphics.tile) {
+            return Err(format!("graphics.tile {} must be a power of two from 8 to 256", self.graphics.tile));
         }
         if self.jitv2.threads == 0 {
             return Err(

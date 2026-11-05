@@ -57,7 +57,7 @@ mod widget {
     fn board() -> (Arc<Heart>, Arc<Odyssey>) {
         let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), host_clock()));
         let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
-        let v = Odyssey::new(WIDGET, "v12", heart.clone(), ram.dma_view(), crate::disp::StatusSource::detached()).expect("board");
+        let v = Odyssey::new(WIDGET, "v12", heart.clone(), ram.dma_view(), crate::disp::StatusSource::detached(), (2, 32)).expect("board");
         (heart, v)
     }
 
@@ -171,11 +171,11 @@ fn every_profile_answers_back_end_version_one_and_ignores_a_write() {
     }
 }
 
-/// A profile's board memory is a reported capacity, not storage: objects
-/// come from one fixed pool. A destination base at or beyond what a 32 MiB
-/// profile reports is a guest bug against the board it was told it has, so
-/// the selection is dropped and noted, and the board keeps answering. The
-/// first value out of range is 0x200000 in 16-byte units.
+/// A profile's board memory is the size it reports. A pixel mode origin at
+/// or beyond what a 32 MiB profile has is a guest bug against the board it
+/// was told it has: the drawing lands nowhere, the select is noted, and the
+/// board keeps answering. The first value out of range is 0x200000 in
+/// 16-byte units.
 ///
 /// QEMU: board-memory-bound-is-a-guest-error.
 #[test]
@@ -186,7 +186,6 @@ fn a_destination_beyond_the_reported_memory_is_dropped() {
         cmd(&mut s, operand);
     }
     assert!(s.diag.board_oob_reported);
-    assert_eq!(s.objects.count, 0, "no object was made for the dropped base");
     assert_eq!(reg_read(&mut s, IDENTITY), IDENTITY_DEFAULT);
 
     // The same base is in range on a 128 MiB board.

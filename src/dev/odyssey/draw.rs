@@ -4,23 +4,23 @@
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code in jamesbraid/qemu-sgi-origami.
 
 
+use super::pipe::backend::DestMem;
+use super::view::{Kind, MAX_DIM};
+use super::field::{Codec, Layout};
+use super::vram::Format;
 use super::bits::{be16, be32};
 use crate::devlog::LogModule;
-use super::board::{Board, ODSY_CLIP_RECTS, ODSY_HEIGHT, ODSY_WIDTH};
+use super::board::{Board, ODSY_CLIP_RECTS};
 use super::consts::{
-    clip, cmd, dest, dma, image, mode, pattern, write, ODSY_AUX_ID_BUFFER, ODSY_AUX_OVERLAY_BUFFER,
-    ODSY_BUFFERS, ODSY_BURST_STENCIL_SHIFT, ODSY_COPY_RECT_DEST_SHIFT,
-    ODSY_COPY_RECT_FORMAT_SOURCE_SHIFT, ODSY_COPY_RECT_SOURCE_SHIFT, ODSY_DEPTH24_MAX,
+    clip, dma, image, mode, pattern, write,
+    ODSY_BUFFERS, ODSY_BURST_STENCIL_SHIFT, ODSY_DEPTH24_MAX,
     ODSY_DRAW_MASK_BUFFER0, ODSY_DRAW_MASK_BUFFER1, ODSY_FENCE_WORD_MASK, ODSY_ID_COMPARE_ENABLE,
     ODSY_ID_COMPARE_MASK_SHIFT, ODSY_INDEX_MASK, ODSY_PLANE_MASK_SHIFT,
 };
-use super::gl_context::GL_CLEAR;
-use super::memory::{logic_op, plane_bpp, plane_bytes_per_pixel, BoardMemory, ClipRect, LOGIC_COPY, Plane};
-use super::objects::CopyOperands;
+use super::clip::ClipRect;
+use super::logic::{logic_op, LOGIC_COPY};
 use super::pixel_dma::write_guest;
 use super::pixel_write::{write_form, WriteForm};
-use super::raster::{LineRule, RasterRules};
-use super::scanout::DirtySite;
 /// The clip-rectangle runs of one row (Board::row_runs).
 #[derive(Clone, Copy)]
 pub(super) struct RowRuns {
@@ -42,57 +42,38 @@ pub(super) fn pack_pixel(r: u32, g: u32, b: u32) -> u32 {
     (r << 24) | (g << 16) | (b << 8) | 0xff
 }
 
-/// The 0x840 ownership test at an in-plane pixel, against id plane `did`
-/// and the 0x840 word `id_compare`.
-pub(super) fn id_compare_passes(did: &[u8], id_compare: u32, x: i64, y: i64) -> bool {
-    let mask = (id_compare >> ODSY_ID_COMPARE_MASK_SHIFT) as u8;
-
-    id_compare & ODSY_ID_COMPARE_ENABLE == 0
-        || ((did[(y * ODSY_WIDTH as i64 + x) as usize] ^ id_compare as u8) & mask) == 0
-}
-
 impl Board {
-    /// Colour buffer b's board memory and plane (set up by Board::allocate()), b being 0 or
-    /// 1 in the displayed-buffer bits' sense (reg::DRAW_MASK).
-    ///
-    /// The planes are the raster unit's: the accessors here and below wait
-    /// for its queued jobs before the front end reads or writes them
-    /// (raster_unit.rs).
-    pub fn buffer_mem(&self, b: u32) -> &BoardMemory {
+    /// The pixel mode's destination in board memory (view::DestViews), for
+    /// the front end's own stores: it waits for the raster unit's queued
+    /// jobs first.
+    pub fn dest_mem(&self) -> DestMem {
         self.raster_wait();
-        if b != 0 { &self.planes.buffer1 } else { &self.planes.colour }
+        DestMem::of(self.vram_ptr(), &self.dest_views())
     }
 
-    pub fn buffer_mem_mut(&mut self, b: u32) -> &mut BoardMemory {
-        self.raster_wait();
-        if b != 0 { &mut self.planes.buffer1 } else { &mut self.planes.colour }
-    }
-
-    pub fn buffer_plane(&self, b: u32) -> Option<Plane> {
-        if b != 0 {
-            self.planes.buffer1.plane(self.planes.buffer1_plane)
-        } else {
-            self.planes.colour.plane(self.planes.colour_plane)
-        }
-    }
-
+    /// Field b of the destination: 0 the A (front) field, 1 the B (back).
     pub fn buffer_load(&self, b: u32, x: i64, y: i64) -> u32 {
-        match self.buffer_plane(b) {
-            Some(p) => self.buffer_mem(b).plane_load(&p, x as i32, y as i32),
-            None => 0,
-        }
+        self.dest_mem().colour[(b & 1) as usize].load_word(x as i32, y as i32).unwrap_or(0)
     }
 
+    /// Store field b of the destination. A byte field (the window-id
+    /// buffer's id and overlay bytes) is stored under the plane mask.
     pub fn buffer_store(&mut self, b: u32, x: i64, y: i64, word: u32) {
-        if let Some(p) = self.buffer_plane(b) {
-            self.buffer_mem_mut(b).plane_store(&p, x as i32, y as i32, word);
+        let rows = self.dest_mem().colour[(b & 1) as usize];
+        if rows.v.kind == Kind::Byte {
+            let mask = (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8;
+            if let Some(old) = rows.load1(x as i32, y as i32) {
+                rows.store1(x as i32, y as i32, (old & !mask) | (word as u8 & mask));
+            }
+            return;
         }
+        rows.store_word(x as i32, y as i32, word);
     }
 
-    /// Whether the last 0x1017 select named the id-plane destination, whatever
-    /// dest::FLAGS it carried.
+    /// Whether the pixel mode lays drawing out as the window-id buffer's
+    /// two bytes, the id and overlay bytes (field.rs, Layout::of).
     pub fn dest_is_id_planes(&self) -> bool {
-        (self.dest_buffer_word & !dest::FLAGS) == (dest::ID_PLANES & !dest::FLAGS)
+        Layout::of(Format::decode(self.pixel_mode[2])).front.codec == Codec::Byte
     }
 
     /// The buffers a colour write lands in, bit b for buffer b, from the last
@@ -159,22 +140,21 @@ impl Board {
         true
     }
 
-    /// The plane bound. The plane itself drops an out-of-plane store, but the
-    /// board checks first so the drawing code never has to guess whose error
-    /// it is. Board::pixel_allowed() adds the window tests for every write except a
-    /// copy destination, which calls this helper directly.
+    /// The destination's bound: its width in tiles, and the largest drawable.
     pub fn pixel_in_bounds(&self, x: i64, y: i64) -> bool {
-        x >= 0 && y >= 0 && x < ODSY_WIDTH as i64 && y < ODSY_HEIGHT as i64
+        x >= 0 && y >= 0 && x < self.dest_views().colour[0].width as i64 && y < MAX_DIM as i64
     }
 
     pub fn id_compare_active(&self) -> bool {
         self.win.id_compare & ODSY_ID_COMPARE_ENABLE != 0
     }
 
-    /// The 0x840 ownership test at an in-plane pixel.
+    /// The 0x840 ownership test: the window-id byte at (x, y) under the
+    /// test's mask.
     pub fn id_compare_passes(&self, x: i64, y: i64) -> bool {
-        self.raster_wait();
-        id_compare_passes(&self.planes.did, self.win.id_compare, x, y)
+        let c = self.win.id_compare;
+        let mask = (c >> ODSY_ID_COMPARE_MASK_SHIFT) as u8;
+        c & ODSY_ID_COMPARE_ENABLE == 0 || self.dest_mem().did.load1(x as i32, y as i32).is_some_and(|id| (id ^ c as u8) & mask == 0)
     }
 
     /// The one pixel test every write but a copy destination passes: the plane
@@ -201,12 +181,13 @@ impl Board {
         let mut n = 0usize;
         let mut kept = 0usize;
 
-        if y < 0 || y >= ODSY_HEIGHT as i64 {
+        let width = self.dest_views().colour[0].width as i64;
+        if y < 0 || y >= MAX_DIM as i64 {
             return runs;
         }
         for &r in &self.win.clip_rect[..self.win.clip_kept as usize] {
             let a = (r.x0 as i64).max(0);
-            let b = (r.x1 as i64 + 1).min(ODSY_WIDTH as i64);
+            let b = (r.x1 as i64 + 1).min(width);
             let mut j = n;
 
             n += 1;
@@ -236,27 +217,6 @@ impl Board {
         runs
     }
 
-    /// Where colour buffer b keeps the n pixels of row y from x, when all of
-    /// them lie in its plane and its memory: the plane, and the byte offset
-    /// and length of the run in Board::buffer_mem(), the same bytes
-    /// BoardMemory::plane_store() and BoardMemory::plane_load() reach one
-    /// pixel at a time. None otherwise, and the caller goes a pixel at a time.
-    pub fn buffer_row(&self, b: u32, x: i64, y: i64, n: i64) -> Option<(Plane, std::ops::Range<usize>)> {
-        let m = self.buffer_mem(b);
-        let p = self.buffer_plane(b)?;
-        let size = plane_bytes_per_pixel(p.format);
-
-        if m.bytes.is_empty() || n <= 0 || x < 0 || y < 0 || x + n > p.width as i64 || y >= p.height as i64 {
-            return None;
-        }
-        let at = p.base.wrapping_add((y as u64).wrapping_mul(p.stride as u64)).wrapping_add((x as u64).wrapping_mul(size as u64));
-        let len = (n as u64).wrapping_mul(size as u64);
-        if at > m.size || len > m.size - at {
-            return None;
-        }
-        Some((p, at as usize..(at + len) as usize))
-    }
-
     /// A colour write, into each buffer the drawing mask selects.
     ///
     /// Marks the pixel's display line to be resolved again.
@@ -271,9 +231,6 @@ impl Board {
                 self.buffer_store(b, x, y, pixel);
             }
         }
-        // A store from the front end, not a raster job: the display line is
-        // marked here, since no job records the row (see RasterQueue::submit()).
-        self.scanout.invalidate_for(DirtySite::Pixel, y as i32, 1);
     }
 }
 
@@ -285,50 +242,20 @@ pub(super) fn fill_pixel(is_index: bool, value: u32) -> u32 {
 }
 
 impl Board {
-    /// One pixel's id-plane write: the bits mask selects of the id byte when the
-    /// drawing mask selects buffer 0, and of the overlay pixel byte when it
-    /// selects buffer 1.
-    pub fn aux_store(&mut self, at: u64, buffers: u32, value: u8, mask: u8) {
-        let at_i = at as usize;
-
-        self.raster_wait();
-
-        if buffers & (1u32 << ODSY_AUX_ID_BUFFER) != 0 {
-            self.planes.did[at_i] = (self.planes.did[at_i] & !mask) | (value & mask);
-        }
-        if buffers & (1u32 << ODSY_AUX_OVERLAY_BUFFER) != 0 {
-            self.planes.overlay[at_i] = (self.planes.overlay[at_i] & !mask) | (value & mask);
-        }
-        if buffers & ((1u32 << ODSY_AUX_ID_BUFFER) | (1u32 << ODSY_AUX_OVERLAY_BUFFER)) == 0 && !self.diag.aux_mask_reported {
-            self.diag.aux_mask_reported = true;
-            crate::dlog!(
-                LogModule::Odyssey,
-                "sgi-odyssey: id-plane write with drawing mask {:#x} selects neither the id nor the overlay byte; dropped",
-                self.draw_mask
-            );
-        }
-    }
-
-    /// One pixel the X server draws at the id-plane destination: the index's low
-    /// byte combined through op with the byte it lands on -- the overlay byte when
-    /// the drawing mask selects buffer 1, else the id byte -- and stored under the
-    /// 0x1023 plane mask.
-    pub fn paint_aux_at(&mut self, at: u64, index: u32, op: u8) {
-        let buffers = self.draw_buffers();
-        let mut byte = index as u8;
-
-        self.raster_wait();
-        if op as u32 != LOGIC_COPY {
-            let dst = if buffers & (1u32 << ODSY_AUX_OVERLAY_BUFFER) != 0 { self.planes.overlay[at as usize] } else { self.planes.did[at as usize] };
-
-            byte = logic_op(op, index, dst as u32) as u8;
-        }
-        self.aux_store(at, buffers, byte, (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8);
-    }
-
+    /// One pixel the X server draws into the window-id buffer: the index's
+    /// low byte combined through op with the byte it lands on, in each
+    /// field the drawing mask selects (A the id byte, B the overlay byte),
+    /// under the plane mask (Board::buffer_store()).
     pub fn paint_aux(&mut self, x: i64, y: i64, index: u32, op: u8) {
-        if self.pixel_allowed(x, y) {
-            self.paint_aux_at(y as u64 * ODSY_WIDTH as u64 + x as u64, index, op);
+        if !self.pixel_allowed(x, y) {
+            return;
+        }
+        let buffers = self.draw_buffers();
+        for b in 0..ODSY_BUFFERS {
+            if buffers & (1u32 << b) != 0 {
+                let byte = if op as u32 == LOGIC_COPY { index } else { logic_op(op, index, self.buffer_load(b, x, y)) };
+                self.buffer_store(b, x, y, byte & 0xff);
+            }
         }
     }
 
@@ -346,14 +273,13 @@ impl Board {
     pub fn paint_integer(&mut self, x: i64, y: i64, is_index: bool, value: u32) {
         let src = fill_pixel(is_index, value);
         let enable = if is_index { mode::INDEX_LOGIC_OP } else { mode::COLOR_LOGIC_OP };
-        let op = self.gl_ref().cur.logic_op_mode.wrapping_sub(GL_CLEAR) as u8;
+        let op = (self.logic_op_word & super::consts::ODSY_LOGIC_OP_MASK) as u8;
         let buffers = self.draw_buffers();
 
         if self.dest_is_id_planes() {
             let use_op = (self.stream.pattern_mode & enable) != 0 && op as u32 != LOGIC_COPY;
 
             self.paint_aux(x, y, src, if use_op { op } else { LOGIC_COPY as u8 });
-            self.scanout.invalidate_for(DirtySite::Integer, y as i32, 1);
             return;
         }
         if (self.stream.pattern_mode & enable) == 0 || op as u32 == LOGIC_COPY {
@@ -370,79 +296,14 @@ impl Board {
                 self.buffer_store(b, x, y, if is_index { out & ODSY_INDEX_MASK } else { out | 0xff });
             }
         }
-        self.scanout.invalidate_for(DirtySite::Integer, y as i32, 1);
     }
 
     /// Board::paint_integer() at each pixel of row y from x0 up to x1, given the
-    /// row's runs, a run of the buffer's bytes at a time. Each pixel is tested,
-    /// combined and stored exactly as the per-pixel path does it. Pixels are
-    /// independent, so going a buffer at a time rather than a pixel at a time
-    /// stores the same bytes.
+    /// row's runs.
     pub fn paint_integer_span(&mut self, runs: &RowRuns, y: i64, x0: i64, x1: i64, is_index: bool, value: u32) {
-        let src = fill_pixel(is_index, value);
-        let enable = if is_index { mode::INDEX_LOGIC_OP } else { mode::COLOR_LOGIC_OP };
-        let op = self.gl_ref().cur.logic_op_mode.wrapping_sub(GL_CLEAR) as u8;
-        let logic = (self.stream.pattern_mode & enable) != 0 && op as u32 != LOGIC_COPY;
-        let id_test = self.id_compare_active();
-        let buffers = self.draw_buffers();
-        let aux = self.dest_is_id_planes();
-
         for r in 0..runs.n as usize {
-            let a = x0.max(runs.start[r]);
-            let e = x1.min(runs.end[r]);
-
-            if a >= e {
-                continue;
-            }
-            if aux {
-                for x in a..e {
-                    if !id_test || self.id_compare_passes(x, y) {
-                        self.paint_aux_at(
-                            y as u64 * ODSY_WIDTH as u64 + x as u64,
-                            src,
-                            if logic { op } else { LOGIC_COPY as u8 },
-                        );
-                    }
-                }
-                continue;
-            }
-            for b in 0..ODSY_BUFFERS {
-                let mut word = [0u8; 4];
-
-                if buffers & (1u32 << b) == 0 {
-                    continue;
-                }
-                let Some((plane, run)) = self.buffer_row(b, a, y, e - a) else {
-                    for x in a..e {
-                        let mut out = src;
-
-                        if id_test && !self.id_compare_passes(x, y) {
-                            continue;
-                        }
-                        if logic {
-                            out = logic_op(op, src, self.buffer_load(b, x, y));
-                            out = if is_index { out & ODSY_INDEX_MASK } else { out | 0xff };
-                        }
-                        self.buffer_store(b, x, y, out);
-                    }
-                    continue;
-                };
-                let bpp = plane_bpp(plane.format) as usize;
-                let (did, id_compare) = (&self.planes.did, self.win.id_compare);
-                let mem = if b != 0 { &mut self.planes.buffer1 } else { &mut self.planes.colour };
-
-                plane.encode(src, &mut word);
-                for (x, px) in (a..e).zip(mem.bytes[run].chunks_exact_mut(bpp)) {
-                    if id_test && !id_compare_passes(did, id_compare, x, y) {
-                        continue;
-                    }
-                    if !logic {
-                        px.copy_from_slice(&word[..bpp]);
-                        continue;
-                    }
-                    let out = logic_op(op, src, plane.decode(px));
-                    plane.encode(if is_index { out & ODSY_INDEX_MASK } else { out | 0xff }, px);
-                }
+            for x in x0.max(runs.start[r])..x1.min(runs.end[r]) {
+                self.paint_integer(x, y, is_index, value);
             }
         }
     }
@@ -457,7 +318,6 @@ impl Board {
             let runs = self.row_runs(y as i64 + row as i64);
             self.paint_integer_span(&runs, y as i64 + row as i64, x as i64, x as i64 + w as i64, is_index, value);
         }
-        self.scanout.invalidate_rows_for(DirtySite::FillRect, y, h);
     }
 
     /// Board::clear_planes(): the X server's write to the id-plane destination.
@@ -477,217 +337,18 @@ impl Board {
 
                 for px in a..e {
                     if !id_test || self.id_compare_passes(px, py) {
-                        self.aux_store(py as u64 * ODSY_WIDTH as u64 + px as u64, buffers, value, mask);
+                        for b in 0..ODSY_BUFFERS {
+                            if buffers & (1u32 << b) != 0 {
+                                let rows = self.dest_mem().colour[b as usize];
+                                if let Some(old) = rows.load1(px as i32, py as i32) {
+                                    rows.store1(px as i32, py as i32, (old & !mask) | (value & mask));
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        // A pixel's drawable picks its colour at scanout.
-        self.scanout.invalidate_rows_for(DirtySite::ClearPlanes, y, h);
-    }
-
-    /// The screen-to-screen blit (Board::copy_rect()), the console-scroll primitive.
-    /// Copies in whichever row/column direction keeps a read ahead of the matching
-    /// write, so an overlapping source and destination in the same framebuffer --
-    /// the case a scroll relies on -- reads the old contents before they are
-    /// overwritten.
-    ///
-    /// Approximation: which buffer the board reads the source from is part of the
-    /// uncleared read selection, so the copy runs within each buffer the drawing
-    /// mask selects, source and destination in the same buffer.
-    ///
-    /// Approximation, inferred: a destination pixel passes Board::pixel_in_bounds()
-    /// only, not the window-clip rectangles Board::pixel_allowed() also tests.
-    pub fn copy_rect_buffer(&mut self, source: u32, dest: u32) {
-        let sx = self.copy_src & 0xffff;
-        let sy = (self.copy_src >> 16) & 0xffff;
-        let w = self.copy_size & 0xffff;
-        let h = (self.copy_size >> 16) & 0xffff;
-        let dx = self.copy_dst & 0xffff;
-        let (dy, h_clip) = self.copy_dest_rows();
-        let w_clip = if dx < ODSY_WIDTH { w.min(ODSY_WIDTH - dx) } else { 0 };
-        let reverse_rows = dy > sy;
-        let reverse_cols = dx > sx;
-
-        for row in 0..h_clip {
-            let sr = if reverse_rows { h_clip - 1 - row } else { row };
-            let src_row = if w_clip != 0 {
-                self.buffer_row(source, sx as i64, sy as i64 + sr as i64, w_clip as i64)
-            } else {
-                None
-            };
-            let dst_row = if src_row.is_some() {
-                self.buffer_row(dest, dx as i64, dy as i64 + sr as i64, w_clip as i64)
-            } else {
-                None
-            };
-
-            // A row wholly inside both planes, in the same encoding, is the byte
-            // copy the pixel loop below makes. The loop runs its columns so that
-            // a read stays ahead of the write it could meet, which is what a
-            // memmove does for the one overlapping case, a row copied along
-            // itself.
-            if let (Some((src_plane, src)), Some((dst_plane, dst))) = (src_row, dst_row) {
-                if src_plane.format == dst_plane.format && src_plane.packing == dst_plane.packing {
-                    if (source != 0) == (dest != 0) {
-                        self.buffer_mem_mut(dest).bytes.copy_within(src, dst.start);
-                    } else {
-                        let (from, to) = if source != 0 {
-                            (&self.planes.buffer1, &mut self.planes.colour)
-                        } else {
-                            (&self.planes.colour, &mut self.planes.buffer1)
-                        };
-                        to.bytes[dst].copy_from_slice(&from.bytes[src]);
-                    }
-                    continue;
-                }
-            }
-            for col in 0..w_clip {
-                let sc = if reverse_cols { w_clip - 1 - col } else { col };
-                // An out-of-plane source reads zero, as the guarded read did.
-                let pixel = self.buffer_load(source, sx.wrapping_add(sc) as i64, sy.wrapping_add(sr) as i64);
-
-                if self.pixel_in_bounds(dx.wrapping_add(sc) as i64, dy.wrapping_add(sr) as i64) {
-                    self.buffer_store(dest, dx.wrapping_add(sc) as i64, dy.wrapping_add(sr) as i64, pixel);
-                }
-            }
-        }
-    }
-
-    /// The rectangle copy whose source and destination are both the id-plane
-    /// base the X server last selected: the id or overlay byte the drawing
-    /// mask names, under the 0x1023 plane mask, as every other write there.
-    /// The server draws a menu's stipple by copying a seed over itself with
-    /// these, so running them through the colour planes smeared whatever the
-    /// menu covered.
-    ///
-    /// INFERRED: that these copies belong to the overlay is read from a trace
-    /// of the words and the menus' appearance; no other source records it.
-    ///
-    /// Each row is read whole before it is written, and the rows run in the
-    /// direction that keeps a source row ahead of the writes, so an overlapping
-    /// copy reads the bytes it had before. Approximation, as for the colour
-    /// copy: a destination byte passes the plane bounds only, and a source
-    /// outside the plane reads as zero (model policy; the hardware behaviour is
-    /// unknown).
-    pub fn copy_rect_id_planes(&mut self) {
-        let (sx, sy) = (self.copy_src & 0xffff, (self.copy_src >> 16) & 0xffff);
-        let dx = self.copy_dst & 0xffff;
-        let (dy, h_clip) = self.copy_dest_rows();
-        let w = self.copy_size & 0xffff;
-        let w_clip = w.min(ODSY_WIDTH.saturating_sub(dx)) as usize;
-        let rows = h_clip;
-        // The source pixels inside the plane on a row; the rest read as zero.
-        let src_w = w_clip.min(ODSY_WIDTH.saturating_sub(sx) as usize);
-        let buffers = self.draw_buffers();
-        let mask = (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8;
-        let mut staged = vec![0u8; w_clip];
-
-        if buffers == 0 && !self.diag.aux_mask_reported {
-            self.diag.aux_mask_reported = true;
-            crate::dlog!(
-                LogModule::Odyssey,
-                "sgi-odyssey: id-plane copy with drawing mask {:#x} selects neither the id nor the overlay byte; dropped",
-                self.draw_mask
-            );
-        }
-        self.raster_wait();
-        for row in 0..rows {
-            let r = if dy > sy { rows - 1 - row } else { row };
-            let from = ((sy + r) * ODSY_WIDTH + sx) as usize;
-            let to = ((dy + r) * ODSY_WIDTH + dx) as usize;
-
-            for b in [ODSY_AUX_ID_BUFFER, ODSY_AUX_OVERLAY_BUFFER] {
-                if buffers & (1u32 << b) == 0 {
-                    continue;
-                }
-                let plane = if b == ODSY_AUX_ID_BUFFER { &mut self.planes.did } else { &mut self.planes.overlay };
-
-                staged.fill(0);
-                if sy + r < ODSY_HEIGHT {
-                    staged[..src_w].copy_from_slice(&plane[from..from + src_w]);
-                }
-                for (d, s) in plane[to..to + w_clip].iter_mut().zip(&staged) {
-                    *d = (*d & !mask) | (*s & mask);
-                }
-            }
-        }
-    }
-
-    /// The first row and count of the rows a copy writes, clipped to the plane.
-    fn copy_dest_rows(&self) -> (u32, u32) {
-        let h = (self.copy_size >> 16) & 0xffff;
-        let dy = (self.copy_dst >> 16) & 0xffff;
-
-        (dy, if dy < ODSY_HEIGHT { h.min(ODSY_HEIGHT - dy) } else { 0 })
-    }
-
-    pub fn copy_rect(&mut self) {
-        let source = (self.cmd.operand[2] >> ODSY_COPY_RECT_SOURCE_SHIFT) & 0xf;
-        let dest = (self.cmd.operand[7] >> ODSY_COPY_RECT_DEST_SHIFT) & 0xf;
-        let format_source = (self.cmd.operand[4] >> ODSY_COPY_RECT_FORMAT_SOURCE_SHIFT) & 0xf;
-        let format_dest = (self.cmd.operand[4] >> ODSY_COPY_RECT_DEST_SHIFT) & 0xf;
-
-        let operands = CopyOperands::decode(&self.cmd.operand);
-
-        if operands.src_base == dma::SENTINEL_READ || operands.dest_base == dma::SENTINEL_DRAW {
-            if !self.copy_rect_gl(&operands) {
-                self.cmd_unimplemented(cmd::COPY_RECT_TRIGGER);
-            }
-            return;
-        }
-
-        if source != format_source || dest != format_dest {
-            self.cmd_unimplemented(cmd::COPY_RECT_TRIGGER);
-            return;
-        }
-
-        // The two observed copy blocks select 0 then 4 in both their source and
-        // destination fields. This is an experimental model policy: the selector
-        // values choose model buffers 0 and 1, but do not identify physical
-        // memory banks. Source and destination choices stay separate so a copy
-        // never changes another colour buffer.
-        // dest_base is 0 until a select names a buffer, and the all-zero GL context
-        // selects leave it 0 while a copy's own base words can be 0 too: without
-        // the test two zero words would read as "both at the id-plane base".
-        let id_base = self.dest_base != 0 && self.dest_is_id_planes();
-        let (src_at_id, dest_at_id) = (operands.src_base == self.dest_base, operands.dest_base == self.dest_base);
-
-        if id_base && src_at_id != dest_at_id {
-            // Not traced: a copy between the overlay and a colour buffer. Running
-            // it through colour buffer 0 is the smear this path exists to avoid.
-            if !self.diag.copy_mixed_base_reported {
-                self.diag.copy_mixed_base_reported = true;
-                crate::dlog!(
-                    LogModule::Odyssey,
-                    "sgi-odyssey: rectangle copy from base {:#x} to base {:#x} with the id-plane base {:#x} selected is not modeled; dropped",
-                    operands.src_base,
-                    operands.dest_base,
-                    self.dest_base
-                );
-            }
-            self.cmd_unimplemented(cmd::COPY_RECT_TRIGGER);
-            return;
-        }
-        if id_base && src_at_id && dest_at_id {
-            self.copy_rect_id_planes();
-        } else if (source == 0 || source == 4) && (dest == 0 || dest == 4) {
-            self.copy_rect_buffer(source >> 2, dest >> 2);
-        } else if source == dest && (source == 2 || source == 3) {
-            // Existing public and modelled templates retain draw-mask behaviour.
-            let buffers = self.draw_buffers();
-
-            for b in 0..ODSY_BUFFERS {
-                if buffers & (1u32 << b) != 0 {
-                    self.copy_rect_buffer(b, b);
-                }
-            }
-        } else {
-            self.cmd_unimplemented(cmd::COPY_RECT_TRIGGER);
-            return;
-        }
-        let (dy, rows) = self.copy_dest_rows();
-        self.scanout.invalidate_rows_for(DirtySite::CopyRect, dy, rows);
     }
 
     /// Pattern mode is on when the 0x0404 mode's bits 3,4 are set and a shape is
@@ -787,7 +448,6 @@ impl Board {
                 }
             }
         }
-        self.scanout.invalidate_rows_for(DirtySite::PatternFill, y, h);
     }
 }
 
@@ -806,20 +466,13 @@ pub(super) fn float_to_u32(bits: u32) -> u32 {
 
 impl Board {
 
-    /// The object an image transfer writes, or None for the screen: the last
-    /// 0x1017 select, when it named a base other than the colour buffer's.
-    pub fn image_object(&mut self) -> Option<usize> {
-        if self.dest_base == 0 || self.dest_base == self.dma_colour_base || self.dest_is_id_planes() {
-            return None;
-        }
-        self.object_find(self.dest_base)
-    }
-
-    /// Lay one image pixel, as 0xRRGGBBAA, at the raster cursor in the selected
-    /// buffer (Board::image_object()) and advance it. Each axis is a directed
+    /// Lay one image pixel, as 0xRRGGBBAA, at the raster cursor in the pixel
+    /// mode's destination and advance it. Each axis is a directed
     /// half-open interval: increasing endpoints visit [first, last), while
     /// decreasing endpoints visit [first - 1, last]. Payload advances along X,
-    /// then along Y.
+    /// then along Y. A scratch destination (SCRATCH_BUFFER) takes box
+    /// coordinates with no window offset or tests; a window's are window
+    /// relative.
     pub fn image_put(&mut self, rgba: u32, is_index: bool, preserve_alpha: bool) {
         let x_decreasing = self.image.x2 < self.image.x1;
         let y_decreasing = self.image.y2 < self.image.y1;
@@ -832,29 +485,15 @@ impl Board {
         if self.image.x2 == self.image.x1 || self.image.y2 == self.image.y1 || y_finished {
             return;
         }
-        if let Some(obj) = self.image_object() {
-            // An off-screen object: box coordinates, no window or id tests.
-            self.object_store(obj, self.image.cur_x, self.image.cur_y, rgba);
-        } else if self.dest_is_id_planes() {
-            // Menu cascade arrows: index images into the overlay.
-            if is_index {
-                self.paint_aux(
-                    self.image.cur_x as i64 + self.win.origin[0] as i64,
-                    self.image.cur_y as i64 + self.win.origin[1] as i64,
-                    rgba,
-                    LOGIC_COPY as u8,
-                );
-                self.scanout.invalidate_for(DirtySite::Image, self.image.cur_y as i32 + self.win.origin[1], 1);
-            } else if !self.diag.aux_image_reported {
-                self.diag.aux_image_reported = true;
-                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: an RGB image to the id-plane destination is not modeled; dropped");
-            }
+        let word = if is_index || preserve_alpha { rgba } else { (rgba & !0xffu32) | 0xff };
+        if self.dest_views().scratch {
+            let rows = self.dest_mem().colour[0];
+            rows.store_word(self.image.cur_x as i32, self.image.cur_y as i32, word);
         } else {
-            // Screen pixels are window-relative; object pixels are not.
             self.paint_pixel(
                 self.image.cur_x as i64 + self.win.origin[0] as i64,
                 self.image.cur_y as i64 + self.win.origin[1] as i64,
-                if is_index || preserve_alpha { rgba } else { (rgba & !0xffu32) | 0xff },
+                word,
             );
         }
         self.image_advance(x_decreasing, y_decreasing);
@@ -1072,8 +711,8 @@ impl Board {
         let x = self.image.cur_x as i64 + self.win.origin[0] as i64;
         let y = self.image.cur_y as i64 + self.win.origin[1] as i64;
 
-        // An off-screen object and the id planes hold no depth or stencil.
-        if self.image_object().is_none() && !self.dest_is_id_planes() && self.pixel_allowed(x, y) {
+        // Only a destination with a depth field takes the burst's depth and stencil.
+        if self.dest_views().depth.kind != Kind::None && !self.dest_views().scratch && self.pixel_allowed(x, y) {
             let mask = (self.gl_write_mask >> write::STENCIL_SHIFT) & write::STENCIL_MASK;
 
             if self.gl_write_mask & write::DEPTH != 0 {
@@ -1245,25 +884,43 @@ pub(super) fn image_burst_fmt(reg: u32) -> Option<u32> {
     }
 }
 
-/// The board's raster rules. Window positions sit on a grid of 8 subpixel
-/// bits, truncated (inferred; the vendor frames accept truncation at 1/16
-/// pixel or finer). The interpolated-colour depth is unmeasured. The depth word is the board's
-/// 24-bit float (depth_word.rs). (A function, not a static: the struct is not const
-/// constructible.)
-///
-/// One-pixel lines take the centre-sampled rule (LineRule::CentreSampled).
-/// The x-major tie and the end rule are model choices.
-pub(super) fn gl_rules() -> RasterRules {
-    RasterRules {
-        subpixel_bits: 8,
-        color_bits: 8,
-        depth_bits: 24,
-        stencil_bits: 8,
-        line_rule: LineRule::CentreSampled,
-        alpha_test_bits: 12,
-        smooth_primitives: true,
-        // The board's depth word; Board::gl_load_combined().
-        depth_float: true,
-        ..Default::default()
-    }
+
+/// The most colour targets a clear writes.
+pub(super) const MAX_TARGETS: u32 = 4;
+
+/// What a clear writes, bits of RasterOp::clear_buffers.
+pub(super) const CLEAR_DEPTH: u32 = 0x0100;
+pub(super) const CLEAR_STENCIL: u32 = 0x0400;
+pub(super) const CLEAR_COLOUR: u32 = 0x4000;
+
+
+/// A raster operation's kind: a clear of a rectangle.
+pub(super) const RASTER_CLEAR: u32 = 1;
+
+/// A clear of a rectangle (the GL rectangle words, Board::gl_rect()), in
+/// plane pixels, the rectangle inclusive.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RasterOp {
+    pub kind: u32,
+    /// The colour buffers written.
+    pub targets: [u32; MAX_TARGETS as usize],
+    pub ntargets: u32,
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+    /// Only pixels inside these are written; at most the rectangle's. An
+    /// empty list is how the board says its window has no visible pixel.
+    pub clip: super::clip::ClipList,
+    /// CLEAR_COLOUR, CLEAR_DEPTH and CLEAR_STENCIL.
+    pub clear_buffers: u32,
+    /// The clear colour in [0, 1]; the back end quantizes it to the plane.
+    pub clear_rgba: [f32; 4],
+    /// The components written: red, green, blue, alpha from bit 0.
+    pub clear_colour_mask: u32,
+    /// In the depth plane's units; the plane keeps its low bits.
+    pub clear_depth24: u32,
+    /// The stencil clear value, written under the stencil write mask.
+    pub clear_stencil: u32,
+    pub stencil_mask: u32,
 }

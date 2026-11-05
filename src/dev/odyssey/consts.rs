@@ -2,7 +2,7 @@
 //!
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code in jamesbraid/qemu-sgi-origami.
 
-use super::board::{ODSY_GL_WINDOW_ENTRIES, ODSY_TEX_DETAIL_FUNCTION_ENTRIES};
+use super::board::ODSY_GL_WINDOW_ENTRIES;
 // The whole aperture a driver maps.
 pub(super) const ODSY_APERTURE: u64 = 0x410000;
 pub(super) const ODSY_PART: u32 = 0xc013;
@@ -387,7 +387,6 @@ pub(super) mod overlay {
 }
 
 // The id-plane destination's drawing-mask buffers
-pub(super) const ODSY_AUX_ID_BUFFER: u32 = 0;
 pub(super) const ODSY_AUX_OVERLAY_BUFFER: u32 = 1;
 
 // 0x608's bit 31, the software buffer state, beside the drawable's base.
@@ -427,9 +426,6 @@ pub(super) mod cmd {
     // The screen-to-screen copy command is a fixed 8-word literal template following a bare trigger, not decomposed through the generic register-select ...
     pub const COPY_RECT_TRIGGER: u32 = 0x00002031;
     pub const COPY_RECT_WORDS: u32 = 8;
-    pub const COPY_RECT_SRC_INDEX: u32 = 1;
-    pub const COPY_RECT_SIZE_INDEX: u32 = 3;
-    pub const COPY_RECT_DST_INDEX: u32 = 6;
 
     // The BEGIN-0xa image raster path
     pub const STATE_WORD: u32 = 0x29008000;
@@ -502,16 +498,13 @@ pub(super) mod dma {
     pub const FMT_CODE_MASK: u32 = 0x1f;
 
     // The GL library's source classes for 8- and 12-bit RGBA visuals.
-    pub const GL_CLASS_RGBA8: u32 = 2;
-    pub const GL_CLASS_RGBA12: u32 = 3;
 
-    // The kernel's board-memory manager pages an object out to its backing store in host memory and back in with raw copies of the object's texels.
+    // The kernel's board-memory manager pages an allocation out to its backing store in host memory and back in with raw copies of its texels.
     pub const FMT_RAW16: u32 = 0x1001;
     pub const FMT_RAW32: u32 = 0x13002;
     pub const FMT_RAW64: u32 = 0x25004;
 
     // Source format code 0x6c
-    pub const ABGR_CONTROL: u32 = 0x4001016c;
     pub const ABGR_CONTROL_IGNORED: u32 = 0x3e000000;
 
     // dmplay's movie frames
@@ -532,19 +525,14 @@ pub(super) mod dma {
     pub const PIECE_PAGES: usize = (PTE_LEN_MASK as u64 + PAGE_SIZE).div_ceil(PAGE_SIZE) as usize;
 
     // Board-to-host and sentinel reports, each made once (dma_read_reported).
-    pub const REPORT_DRAW_SENTINEL: u32 = 1 << 0;
     pub const REPORT_SENTINEL: u32 = 1 << 1;
     pub const REPORT_LAYOUT: u32 = 1 << 2;
-    pub const REPORT_SOURCE: u32 = 1 << 3;
-    pub const REPORT_BOUNDS: u32 = 1 << 4;
     pub const REPORT_INDEX: u32 = 1 << 5;
     pub const REPORT_SHAPE: u32 = 1 << 6;
     pub const REPORT_WRITE: u32 = 1 << 7;
     pub const REPORT_UPLOAD_SENTINEL: u32 = 1 << 8;
     pub const REPORT_INDEX_OBJECT: u32 = 1 << 9;
     pub const REPORT_COLOUR_OVER_INDEX: u32 = 1 << 10;
-    pub const REPORT_RAW64: u32 = 1 << 11;
-    pub const REPORT_SHARED: u32 = 1 << 12;
     pub const REPORT_STENCIL_OR_INDEX: u32 = 1 << 13;
     pub const REPORT_UNLISTED_FIELDS: u32 = 1 << 14;
 }
@@ -555,18 +543,12 @@ pub(super) const ODSY_FENCE_WORD_MASK: u32 = 0xffffffff;
 
 pub(super) mod dest {
     // Off-screen board-memory objects.
-    pub const WIDTH_INDEX: usize = 1; // 0x1017's row length, 16-pixel units
-    pub const WIDTH_UNIT: u32 = 16;
 
     // The select's format word
-    pub const FORMAT_SHIFT: u32 = 28;
-    pub const FORMAT_SCREEN: u32 = 0x2;
+    #[cfg(test)]
     pub const ID_PLANES: u32 = 0x20080080; // 0x1017 third word: write id planes
 
     // Two bits of the 0x1017 third word that the X server changes from one draw to the next for the same buffer, so they do not name the buffer.
-    pub const NO_READ: u32 = 1 << 29;
-    pub const BIT23: u32 = 1 << 23;
-    pub const FLAGS: u32 = NO_READ | BIT23;
     pub const SELECT_VALUE_INDEX: usize = 2; // the third operand
     pub const SELECT_BASE_INDEX: usize = 0; // the buffer's base, 0x2000
 }
@@ -688,11 +670,13 @@ pub(super) mod gl_cmd {
     // The board's depth unit
     pub const DEPTH_S: f64 = 4294950912.0;
 
-    // A GL matrix mode the shared context does not keep (neither modelview nor projection), so GlContext::set_matrix() logs and refuses a load aimed at it.
-    pub const SLOT_NORMAL: u32 = 0x1702;
+    // A block with no home in the model: a load aimed at it is dropped.
+    pub const SLOT_NORMAL: u32 = 0x10005;
 
     // This model's own slots for the combined and texture matrices.
     pub const SLOT_COMBINED: u32 = 0x10000;
+    /// The model-view, which lighting and the user clip planes read.
+    pub const SLOT_MODELVIEW: u32 = 0x10004;
     pub const SLOT_TEXTURE: u32 = 0x10001;
 
     // Half the extent of the fixed viewport the shared context draws through (Board::gl_load_combined())
@@ -919,42 +903,23 @@ pub(super) mod tex {
     pub const TABLE3_BLOCKS: u32 = 16;
     pub const DETAIL_FUNCTION_BLOCKS: u32 = 16;
     pub const DETAIL_FUNCTION_BLOCK_WORDS: u32 = 16;
-    pub const MODE_CLIP_COUNT_MASK: u32 = 0x7;
 
-    // The stock driver's two-point function (-4, 1/4), (0, 1/2) fills entry 0 with 1/2, falls by 1/512 per entry to 1/4 at entry 128 and holds 1/4 through ...
-    pub const DETAIL_FUNCTION_LAST_LOD: f64 = -((super::ODSY_TEX_DETAIL_FUNCTION_ENTRIES as f64) - 1.0) / 32.0;
-
-    // Post-filter scale and bias (0x203b, where texture validation sends a texture's words)
-    pub const SCALE_BIAS_WORDS: u32 = 8;
+    // Post-filter scale and bias (0x203b): signed 3.12 in bits 15:0
     pub const SCALE_BIAS_BITS: u32 = 16;
     pub const SCALE_BIAS_ONE: u32 = 4096;
-
-    // Sampler word 4 bits 7:5 are the minification code (0 nearest, 1 linear, 2 to 5 the four mipmap modes in GL order) and bits 4:1 the magnification code ...
-    pub const MIN_MASK: u32 = 0xe0;
-    pub const MIN_NEAREST_MIPMAP_NEAREST: u32 = 0x40;
-    pub const MIN_LINEAR_MIPMAP_LINEAR: u32 = 0xa0;
-
-    // Sampler word 4 bits 25:23, the texel class
-    pub const COMPONENTS_MASK: u32 = 0x03800000;
 
     // Word 4 bit 17
     pub const SAMPLER_BIT17: u32 = 1 << 17;
 
-    // The four 0x1013 words are 14-bit two's complement with 8 fraction bits
-    pub const LOD_MASK: u32 = 0x3fff;
+    // The 0x1013 words: 14-bit two's complement with 8 fraction bits
     pub const LOD_BITS: u32 = 14;
     pub const LOD_ONE: u32 = 256;
-    pub const LOD_LIMIT: u32 = 15 * LOD_ONE;
 }
 
 pub(super) const ODSY_F32_ONE: u32 = 0x3f800000;
 pub(super) const ODSY_F32_POINT_TWO: u32 = 0x3e4ccccd;
 pub(super) const ODSY_F32_POINT_EIGHT: u32 = 0x3f4ccccd;
 pub(super) const ODSY_DEPTH24_MAX: u32 = 0xffffff;
-
-pub(super) const ODSY_COPY_RECT_SOURCE_SHIFT: u32 = 12;
-pub(super) const ODSY_COPY_RECT_DEST_SHIFT: u32 = 20;
-pub(super) const ODSY_COPY_RECT_FORMAT_SOURCE_SHIFT: u32 = 24;
 
 pub(super) mod pattern {
     pub const WORDS: u32 = 16;
@@ -985,11 +950,6 @@ pub(super) mod alpha {
     pub const FUNC_SHIFT: u32 = 12;
     pub const FUNC_MASK: u32 = 0x7;
     pub const REF_MASK: u32 = 0xfff;
-    /// The field is trunc(x * 4096), with 1.0 sent as 4095 (the clamp) and
-    /// 0x800 = 0.5. INFERRED (graded): the board compares min(4095,
-    /// floor(4096 a)), and the vendor frames rule out field / 4095.
-    pub const REF_SCALE: f32 = 4096.0;
-    pub const REF_ONE: u32 = 0xfff;
 }
 
 pub(super) mod blend {
@@ -998,9 +958,6 @@ pub(super) mod blend {
     pub const SRC_MASK: u32 = 0x7f;
     pub const EQ_SHIFT: u32 = 13;
     pub const EQ_MASK: u32 = 0x7;
-    pub const COLOUR_MASK: u32 = 0xfff;
-    pub const COLOUR_SHIFT: u32 = 12;
-    pub const COLOUR_SCALE: f32 = 4096.0;
 
     // The X server's opaque-span 0x0c21 operand 0
     pub const X_OPAQUE: u32 = 0x200;
@@ -1017,8 +974,6 @@ pub(super) mod stencil {
     pub const OP_FAIL_SHIFT: u32 = 22;
     pub const OP_ZFAIL_SHIFT: u32 = 19;
     pub const OP_ZPASS_SHIFT: u32 = 16;
-    pub const OP_MASK: u32 = 0x7;
-    pub const MAX: u32 = 0xff;
 }
 /// Where a depth or stencil burst's word holds the stencil index.
 pub(super) const ODSY_BURST_STENCIL_SHIFT: u32 = 16;
@@ -1027,12 +982,11 @@ pub(super) mod polygon {
     pub const OFFSET_BITS: u32 = 25;
 
     // The field is a signed count of steps of the encoded 24-bit depth word
-    // (depth_word.rs); the shared context carries it as that count over 2^24, which
-    // RasterRules::split_offset() turns back into steps.
+    // (depth_word.rs); a test's library state carries it over 2^24.
+    #[cfg(test)]
     pub const OFFSET_SCALE: f32 = 1.0f32 / (1u32 << 24) as f32;
     pub const MODE_FRONT_SHIFT: u32 = 2;
     pub const MODE_BACK_SHIFT: u32 = 0;
-    pub const MODE_MASK: u32 = 0x3;
 }
 
 pub(super) mod clip {
@@ -1166,8 +1120,6 @@ pub(super) mod hw {
     pub const ATTR_BACK_SHININESS: usize = 18;
 }
 
-// A volume level's slices sit 64 << word 2 address units apart.
-pub(super) const ODSY_VOLUME_SLICE_SHIFT_MAX: u32 = 20;
 
 pub(super) const ODSY_CRC64_ECMA_POLY: u64 = 0x42f0e1eba9ea3693;
 

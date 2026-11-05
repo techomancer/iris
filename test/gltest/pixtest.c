@@ -2705,6 +2705,10 @@ int main(int argc, char **argv)
     XSetWindowAttributes swa;
     XEvent ev;
     int hold = 0, i, r, g, b, a, z, s;
+    /* --rgba8888: exactly 8,8,8,8, single buffered, the most depth and
+       stencil there is: the visual every board offers, so runs on two
+       boards compare. */
+    int rgba8888 = 0;
     const char *ext;
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--only") && i + 1 < argc)
@@ -2719,8 +2723,10 @@ int main(int argc, char **argv)
             verbose = 1;
         else if (!strcmp(argv[i], "--ci") && i + 1 < argc)
             ci_bits = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rgba8888"))
+            rgba8888 = 1;
         else {
-            fprintf(stderr, "usage: pixtest [--ci 8|12] [--only SUBSTR]... [--skip SUBSTR]... [--list] [--hold MS] [-v]\n");
+            fprintf(stderr, "usage: pixtest [--ci 8|12] [--rgba8888] [--only SUBSTR]... [--skip SUBSTR]... [--list] [--hold MS] [-v]\n");
             return 255;
         }
     }
@@ -2749,6 +2755,34 @@ int main(int argc, char **argv)
             fprintf(stderr, "no %d-bit colour-index visual (got %d)\n", ci_bits, bs);
             return 255;
         }
+    } else if (rgba8888) {
+        XVisualInfo tmpl, *list;
+        int nv = 0, best = -1, bestscore = -1;
+
+        tmpl.screen = DefaultScreen(dpy);
+        list = XGetVisualInfo(dpy, VisualScreenMask, &tmpl, &nv);
+        for (i = 0; i < nv; i++) {
+            int rgba = 0, db = 0, vr, vg, vb, va, vz, vs;
+
+            glXGetConfig(dpy, &list[i], GLX_RGBA, &rgba);
+            glXGetConfig(dpy, &list[i], GLX_DOUBLEBUFFER, &db);
+            glXGetConfig(dpy, &list[i], GLX_RED_SIZE, &vr);
+            glXGetConfig(dpy, &list[i], GLX_GREEN_SIZE, &vg);
+            glXGetConfig(dpy, &list[i], GLX_BLUE_SIZE, &vb);
+            glXGetConfig(dpy, &list[i], GLX_ALPHA_SIZE, &va);
+            glXGetConfig(dpy, &list[i], GLX_DEPTH_SIZE, &vz);
+            glXGetConfig(dpy, &list[i], GLX_STENCIL_SIZE, &vs);
+            if (rgba && !db && vr == 8 && vg == 8 && vb == 8 && va == 8 && vz * 16 + vs > bestscore) {
+                best = i;
+                bestscore = vz * 16 + vs;
+            }
+        }
+        if (best < 0) {
+            fprintf(stderr, "no single-buffered RGBA 8888 visual\n");
+            return 255;
+        }
+        vi = (XVisualInfo *)malloc(sizeof(*vi));
+        *vi = list[best];
     } else {
         vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_full);
         if (!vi)

@@ -2,8 +2,9 @@
 name: irix-gfx-loop
 description: >-
   Debug and test emulated SGI graphics through the real IRIX stack: Newport
-  (REX3, XL/XGE on Indy and Indigo2), GR2 (XZ/Extreme) and IMPACT (MGRAS:
-  Solid/High/Maximum). Boot IRIS, log in to a desktop, build and run the
+  (REX3, XL/XGE on Indy and Indigo2), GR2 (XZ/Extreme), IMPACT (MGRAS:
+  Solid/High/Maximum) and the Octane's VPro (Odyssey V6-V12). Boot IRIS, log
+  in to a desktop, build and run the
   test/gltest programs in the guest, capture board traces and recordings from
   the monitor around each run, check rendered pixels, replay captures
   offline as unit tests, and inject mouse/keyboard input. Use for any
@@ -11,7 +12,7 @@ description: >-
   investigation.
 ---
 
-# Graphics debugging loop (REX3, GR2, IMPACT)
+# Graphics debugging loop (REX3, GR2, IMPACT, VPro)
 
 The loop: put one known drawing through the guest's real graphics stack,
 capture what the board saw, compare the pixels with what the drawing should
@@ -20,7 +21,7 @@ minutes, so capture once and iterate on replays wherever possible.
 
 Read first: the `irix-guest-loop` skill (booting, telnet, NFS, autologin,
 shutdown), `debug.md` (every monitor command) and the board's notes in
-`clanker/rex3/`, `clanker/gr2/` or `clanker/mgras/`.
+`clanker/rex3/`, `clanker/gr2/`, `clanker/mgras/` or `clanker/odyssey/`.
 
 ## 1. Pick the board
 
@@ -30,6 +31,7 @@ shutdown), `debug.md` (every monitor command) and the board's notes in
 | GR2 XZ / Extreme | `board = "xz"` or `"extreme"` (Extreme on IP22 only) | `gr2`, `re3` | HQ2 command HLE + RE3 raster (`src/dev/gr2/`), optional `gr2-jit` |
 | IMPACT (MGRAS) | `board = "solidimpact"`, `"highimpact"`, `"maximpact"` (IP28) | `mgras`, `rss` | HQ3/GE HLE + RSS raster (`src/dev/mgras/`), optional `gr4-jit` |
 | O2 (CRIME RE, GBE) | `[machine] profile = "o2_ip32"` (the board is built in) | `re`, `gbe`, `crime`, `o2` | register-level engine on its own thread, memory through the tile TLBs (`src/dev/o2gfx.rs`) |
+| VPro V6/V8/V10/V12 (Odyssey) | `board = "v12"` and so on (Octane, IRIX 6.5.10+ with the VPro driver) | `vpro` | command-FIFO interpreter + software rasteriser on a front-end and a raster thread (`src/dev/odyssey/`); `vpro pix`, `raw`, `fbdump`, `hash` for pixels, `vpro state|tex|win|mem` for state |
 
 On IMPACT, `[machine] profile = "indigo2_ip28"` and `cpu = "r10000"` (see
 `docs/indigo2-ip28.md`). GR2 and IMPACT need one head and
@@ -84,7 +86,7 @@ directly and works alongside the MCP server.
 ### By hand (any board)
 
 ```
-<board> trace /tmp/case.log all                  # gr2 / mgras / rex (gputrace builds)
+<board> trace /tmp/case.log all                  # gr2 / mgras / rex / vpro (gputrace builds)
 tools/irix-sh.py run 'cd /tmp/gltest && ./glprim <options> --hold 4000'
 <board> pix <x> <y>                              # gr2 / mgras: one display pixel, decoded
 <board> fbdump /tmp/case                         # planes + composed screen as PNG
@@ -149,6 +151,16 @@ images (see `draw_scene` in glprim.c).
 - **IMPACT**: `mgras trace FILE hq,rss,cpu,tex`; `rss regs` decodes the IR
   and shows each raster engine's backlog; `mgras stats` counts commands and
   DMAs; `locks` shows who holds what if the board seems stuck.
+- **VPro**: `vpro trace FILE [fifo,draw,cpu,dma|all]`. `FIFO` lines are the
+  command words as the parser completes them, named (`DEST_SELECT`,
+  `VERTEX_3F`, `PROG class 0x27`, `unmodelled word ...`) with their operands
+  as words and as floats where the word carries floats; `DRAW` lines are the
+  assembled primitives sent to the raster unit (`draw TRIANGLES n=3 ctx=1
+  textured depth queued cost 96`) and the clears; `CPU` lines are the
+  register accesses with polls collapsed (`(x218)`); `DMA` lines the
+  descriptors. `vpro state|tex|win` give the state the lines were applied
+  to; `vpro tex` shows the texture registers and what the next draw latches
+  from them (level addresses, LOD clamps).
 
 New hardware facts for GR2/IMPACT belong in the board headers if you have
 the local, unpublished `ignore/gr2` or `ignore/gr4` trees (ask the user);
@@ -162,6 +174,7 @@ emulator behaviour and gotchas go in `clanker/<board>/`.
 | GR2 | `gr2 trace` of the case, cut to the HQ2 FIFO writes from the window setup (`0x1e5`) to the `GL_FINISH` after the draw | `GR2_REPLAY=FILE cargo test --release --lib gr2_replay_file -- --ignored` (`GR2_REPLAY_OUT`); pinned cases use `replay_trace()` in `src/dev/gr2/hq2_tests.rs` |
 | O2 | `re rec FILE` ... `re rec off` (registers and engine writes; textures and pixmaps come from `o2 peek` and `RE_REPLAY_PRELOAD`) | `RE_REPLAY=FILE RE_REPLAY_PNG=out.png cargo test --release --lib replay_a_recorded_trace -- --ignored --nocapture` (`RE_REPLAY_HALF=lo\|hi` for a double-pix window; the replay has 256 MB, so tiles above that in a larger guest draw nothing) |
 | IMPACT | `mgras rec FILE` ... `mgras rec off` | `MGRAS_REPLAY=FILE cargo test --release --lib --features gr4-jit mgras_replay_file -- --nocapture` (`MGRAS_REPLAY_BOARD=high\|max`, `MGRAS_REPLAY_NOCHECK=1`) |
+| VPro | `vpro rec FILE` ... `vpro rec off` (`vpro rec mark` adds a checkpoint; `IRIS_ODSY_REC=FILE` from power-on for one that reproduces the screen) | `VPRO_REPLAY=FILE cargo test --release --lib odyssey::golden::replay -- --nocapture` (`VPRO_REPLAY_OUT=out.png`; a mid-session recording replays deterministically but its marks are informational, see `src/dev/odyssey/testdata/README.md`) |
 
 `tools/rex3-rec.py` and `tools/mgras-rec.py` inspect and slice recordings.
 Small captures that pin a fix go in the board's `testdata/` as regression

@@ -2,24 +2,23 @@
 //! colour buffers, colour resolved at scanout, the cursor, the channel
 //! size and what a reset clears.
 
-use crate::dev::odyssey::board::{Board, ODSY_HEIGHT, ODSY_WIDTH};
+use crate::dev::odyssey::board::Board;
 use crate::dev::odyssey::consts::{
     backend, cursor, dispmode, gl_cmd, reg, swap, ODSY_CHANNEL_HEIGHT, ODSY_DID_MAIN_SHIFT,
     ODSY_DISPLAYED_BUFFER, ODSY_USER_CMD_FIFO,
 };
-use crate::dev::odyssey::reader::{DisplayRegs, SharedRegs};
-use crate::dev::odyssey::scanout::{DirtySite, DirtyStats};
 use crate::dev::odyssey::tests::{
     board, cmd, cmd64, pixel, pixel_write, reg_read, reg_write, route_to_heart, select,
     RETRACE_VECTOR, SOFTSYNC_VECTOR, VPRO_WIDGET,
 };
 use super::*;
 
-const WIDTH: i32 = ODSY_WIDTH as i32;
-/// The display mode of a drawable showing 24-bit RGB through the gamma
-/// ramp, and of one showing colour map group 17 (the X server's modes).
-const DISPMODE_RGB: u32 = 0x0052_15a6;
-const DISPMODE_GROUP17: u32 = 0x004b_5f10;
+/// The display mode of a window showing 24-bit RGB through the gamma ramp,
+/// and of one showing colour map group 17, both laid out as the test
+/// screen's window (Board::test_screen(): 16-byte pixels, 4-byte colour
+/// fields, A at unit 6, B at unit 2; the X server's 0x4b2 layout).
+const DISPMODE_RGB: u32 = 0x0096_55a6;
+const DISPMODE_GROUP17: u32 = 0x0096_5f10;
 const LUT_RED: u32 = 0x3ff0_0000;
 const LUT_BLUE: u32 = 0x0000_03ff;
 
@@ -55,8 +54,7 @@ fn display_identity(s: &mut Board, did: u32) {
     }
 }
 
-/// The display's pixel at (x, y) as 0x00RRGGBB, after the dirty lines
-/// have been resolved.
+/// The display's pixel at (x, y) as 0x00RRGGBB, the frame composed.
 fn shown(s: &mut Board, x: i32, y: i32) -> u32 {
     s.scanout_update();
     s.reader.frame[(y * s.reader.frame_width as i32 + x) as usize] & 0xff_ffff
@@ -64,12 +62,12 @@ fn shown(s: &mut Board, x: i32, y: i32) -> u32 {
 
 /// Put main drawable `id` (bits 7:3 of a pixel's id byte) on every pixel of the box [x0, x1) x [y0, y1).
 fn drawable(s: &mut Board, id: u8, x0: i32, y0: i32, x1: i32, y1: i32) {
+    let did = s.dest_mem().did;
     for y in y0..y1 {
         for x in x0..x1 {
-            s.planes.did[(y * WIDTH + x) as usize] = id << ODSY_DID_MAIN_SHIFT;
+            did.store1(x, y, id << ODSY_DID_MAIN_SHIFT);
         }
     }
-    s.scanout.invalidate(y0, y1 - y0);
 }
 
 /// Colour index `index` on every pixel of the box, as the plane keeps it.
@@ -258,6 +256,7 @@ fn the_drawable_register_block_takes_its_operands() {
 #[test]
 fn the_draw_and_read_drawable_words_are_kept_apart() {
     let (mut s, _) = board("v12");
+    (s.draw_word, s.read_word) = (0, 0);
 
     cmd64(&mut s, swap::SYNC_A, 0x8000_2000);
     assert_eq!((s.draw_word, s.read_word), (0x8000_2000, 0));
@@ -304,25 +303,6 @@ fn the_two_colour_buffers_hold_opposite_colours() {
     rgb_fill(&mut s, 0xff, 0xff, 0xff, 100, 100, 110, 110);
     assert_eq!(pixel(&s, 0, 105, 105), 0xff00_00ff);
     assert_eq!(pixel(&s, 1, 105, 105), 0x0000_ffff);
-}
-
-/// The display copies a frame's lines aside, with no lock, and resolves the
-/// copy while the raster unit goes on: what is drawn after the copy shows
-/// only in the next frame, never part-way through this one.
-#[test]
-fn a_frame_resolves_the_lines_it_copied_while_the_raster_unit_draws_on() {
-    let (mut s, _) = board("v12");
-    display_identity(&mut s, 0);
-    rgb_fill(&mut s, 0xff, 0, 0, 100, 100, 110, 110);
-    s.scanout_update();
-
-    s.scanout.invalidate_all();
-    s.scanout_stage();
-    rgb_fill(&mut s, 0, 0, 0xff, 100, 100, 110, 110);
-    assert!(s.scanout_resolve().is_some());
-    let at = (105 * s.reader.frame_width + 105) as usize;
-    assert_eq!(s.reader.frame[at] & 0xff_ffff, 0xff0000, "the frame shows the copy");
-    assert_eq!(shown(&mut s, 105, 105), 0x0000ff, "and the next frame the new drawing");
 }
 
 /// A double-buffered client draws each frame in two halves into the buffer
@@ -403,7 +383,7 @@ fn colour_is_resolved_at_scanout_so_a_reloaded_map_brings_pixels_back() {
 /// QEMU: scanout-display-mode-recolours.
 #[test]
 fn rewriting_a_display_mode_recolours_its_pixels() {
-    const GROUP18_CI: u32 = 0x004b_5f20;
+    const GROUP18_CI: u32 = 0x0096_5f20;
     let (mut s, _) = board("v12");
     dispmode(&mut s, 1, DISPMODE_GROUP17);
     dispmode(&mut s, 2, GROUP18_CI);
@@ -557,6 +537,8 @@ fn a_reset_with_a_primitive_open_leaves_the_board_responsive() {
     s.reset();
 
     assert_eq!(reg_read(&mut s, CONTROL), VPRO_WIDGET);
+    // The X server sets the board up again.
+    s.test_screen();
     rgb_fill(&mut s, 1, 2, 3, 0, 0, 4, 4);
     assert_eq!(pixel(&s, 0, 1, 1), 0x0102_03ff, "the next primitive draws");
 }
@@ -797,84 +779,3 @@ fn a_reset_leaves_the_cursor_off_and_empty() {
     assert_eq!(shown(&mut s, 2, 3), 0);
 }
 
-/// The dirty-line counters name each mark's site and the lines a frame
-/// resolved, which `vpro dirty` reports.
-#[test]
-fn the_dirty_counters_name_the_site_and_the_frame_rows() {
-    let (mut s, _) = board("v12");
-    display_identity(&mut s, 0);
-    s.scanout_update();
-    s.reader.stats = DirtyStats::default();
-
-    s.scanout.invalidate_for(DirtySite::Pixel, 7, 3);
-    s.scanout.repaint_for(DirtySite::Cursor, 1000, 100);
-    s.scanout_update();
-
-    let h = s.scanout.mode.height as u64;
-    let st = &s.reader.stats;
-    assert_eq!(s.scanout.marks.site(DirtySite::Pixel), [1, 3]);
-    assert_eq!(s.scanout.marks.site(DirtySite::Cursor), [1, h - 1000], "clipped to the frame");
-    assert_eq!((st.frames, st.busy_frames, st.rows, st.max_rows), (1, 1, 3 + h - 1000, 3 + h - 1000));
-    s.scanout_update();
-    assert_eq!((s.reader.stats.frames, s.reader.stats.busy_frames), (2, 1), "an idle frame counts, with no rows");
-}
-
-/// The display lines a draw marked to resolve again.
-fn dirty_rows(s: &Board) -> Vec<usize> {
-    s.scanout.marks.dirty_rows()
-}
-
-/// A 2D draw marks only the lines it wrote, not the whole frame: the
-/// display resolves those and the idle rest of the frame stays as it was.
-#[test]
-fn a_2d_draw_dirties_only_its_rows() {
-    let (mut s, _) = board("v12");
-    display_identity(&mut s, 0);
-    s.scanout_update();
-    assert!(dirty_rows(&s).is_empty());
-
-    rgb_fill(&mut s, 0xff, 0, 0, 20, 200, 60, 204);
-    assert_eq!(dirty_rows(&s), vec![200, 201, 202, 203], "a solid fill");
-    s.scanout_update();
-
-    s.pattern_fill(10, 300, 16, 3, 0, 0, false, 0xff_0000);
-    assert_eq!(dirty_rows(&s), vec![300, 301, 302], "a pattern fill");
-    s.scanout_update();
-
-    s.clear_planes(0, 400, 8, 2, 0x10, 0xff);
-    assert_eq!(dirty_rows(&s), vec![400, 401], "an id-plane write");
-    s.scanout_update();
-
-    s.copy_src = 5 << 16 | 20;
-    s.copy_dst = 600 << 16 | 20;
-    s.copy_size = 7 << 16 | 40;
-    s.copy_rect();
-    assert_eq!(dirty_rows(&s), (600..607).collect::<Vec<_>>(), "a screen-to-screen copy marks its destination");
-    s.scanout_update();
-
-    s.copy_dst = (ODSY_HEIGHT - 2) << 16;
-    s.copy_size = 50 << 16 | 8;
-    s.copy_rect();
-    let h = ODSY_HEIGHT as usize;
-    assert_eq!(dirty_rows(&s), vec![h - 2, h - 1], "a copy past the bottom is clipped to the plane");
-}
-
-/// A register store that lands after the display copied the registers and
-/// before it filed the copy is not lost: the copy is filed under the
-/// generation read before it began, so the next frame copies again and sees
-/// the store.
-#[test]
-fn a_register_store_during_the_copy_is_copied_by_the_next_frame() {
-    let regs = SharedRegs::default();
-    let mut copy = DisplayRegs::default();
-
-    regs.set_lut(0, 1);
-    *regs.test_after_copy.lock() = Some(Box::new(|r| {
-        r.set_lut(0, 0x2a5);
-    }));
-    let seen = regs.snapshot(&mut copy, u64::MAX);
-    assert_eq!(copy.lut[0], 1, "the store landed after the word was copied");
-    *regs.test_after_copy.lock() = None;
-    regs.snapshot(&mut copy, seen);
-    assert_eq!(copy.lut[0], 0x2a5, "the store during the copy was never copied");
-}

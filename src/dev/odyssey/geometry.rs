@@ -4,9 +4,8 @@
 //!
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code in jamesbraid/qemu-sgi-origami.
 
-
 use crate::devlog::LogModule;
-use super::raster::{cmax, cmin};
+use super::bits::{cmax, cmin};
 use super::board::{
     Board, ODSY_GL_CONSTANTS, ODSY_GL_LIGHTS, ODSY_GL_PROGRAM_ENTRIES, ODSY_GL_PROGRAM_REPORTS,
     ODSY_HEIGHT, ODSY_WIDTH,
@@ -17,10 +16,8 @@ use super::consts::{
     ODSY_ENTRY_33, ODSY_PLANE_MASK_SHIFT,
 };
 use super::gl::{float_index, gl_index_rgba, prog_value, ucode_is_texgen};
-use super::gl_context::{
-    op, GL_ALWAYS, GL_CLIP_PLANES, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_LINES,
-    GL_MODELVIEW, GL_PROJECTION, GL_REPLACE, GL_STENCIL_BUFFER_BIT, RASTER_CLEAR, RasterOp,
-};
+use super::assembly::{CLIP_PLANES, LINES};
+use super::draw::{RasterOp, CLEAR_COLOUR, CLEAR_DEPTH, CLEAR_STENCIL, RASTER_CLEAR};
 use crate::dev::gl::light::Lighting;
 
 /// What a program asks for, as far as the model recognises it.
@@ -225,6 +222,9 @@ pub(super) fn gl_lit_record(e: &[u32; 3]) -> bool {
 /// lighting (INFERRED: it is set in resident record 7, the two-sided one).
 #[derive(Clone, Copy, Default)]
 pub(super) struct WindowRecord {
+    /// Which resident record the row is: it names the row, and nothing
+    /// reads it.
+    #[allow(dead_code, reason = "names the table's row")]
     pub record: u8,
     pub local_viewer: bool,
     pub two_sided: bool,
@@ -243,7 +243,6 @@ pub(super) static WINDOW_RECORDS: [WindowRecord; 8] = [
     WindowRecord { record: 19, local_viewer: true, two_sided: false, entry: [0x738, 0x75b, 0x77d], entries: 199, crc: 0xa419c456a8238b77 },
     WindowRecord { record: 23, local_viewer: false, two_sided: false, entry: [0x738, 0x760, 0x787], entries: 199, crc: 0x8d6174822a99856f },
 ];
-
 
 impl Board {
     /// CRC-64/ECMA-182 (no reflection, zero initial value) of n window entries.
@@ -432,12 +431,7 @@ impl Board {
     /// reported once.
     pub fn colour_mode(&mut self, cls: u32, v: u32) {
         let known: u32 = if cls == prog::COLOUR_MODE { 0x1 } else { 0x3 };
-        let index = self.gl_index_mode();
-
         self.colour_mode[(cls - prog::COLOUR_MODE) as usize] = v;
-        if self.gl_index_mode() != index && !self.prim.in_prim {
-            self.gl_apply_blend();
-        }
         let disagree = cls == prog::COLOUR_MODE_B && ((self.colour_mode[0] ^ self.colour_mode[1]) & colour::MODE_INDEX) != 0;
         if ((v & !known) != 0 || disagree) && !self.diag.colour_mode_reported {
             self.diag.colour_mode_reported = true;
@@ -681,7 +675,7 @@ impl Board {
         LitVertex { eye, normal, colour, alpha: md[3], lit }
     }
 
-    /// The colour a GL vertex takes, handed to the shared context just before
+    /// The colour a GL vertex takes, set in primitive assembly just before
     /// the vertex: in index mode the current index (glIndex, not glColor); under
     /// a lit program the lit colour; otherwise the current glColor, restored if
     /// an index or lit vertex replaced it. xyz is the vertex's object position,
@@ -693,16 +687,13 @@ impl Board {
                 self.diag.gl_index_lit_reported = true;
                 crate::dlog!(LogModule::Odyssey, "sgi-odyssey: colour-index lighting is not modeled; drawn with the current index");
             }
-            let words = gl_index_rgba(self.gl_color_index).map(f32::to_bits);
-            self.gl_feed(op::COLOR4F as u16, &words);
+            self.assembly.colour = gl_index_rgba(self.gl_color_index);
             self.geom.colour_overridden = true;
         } else if self.geom.lit {
-            let words = self.gl_light(&[xyz[0], xyz[1], xyz[2], 1.0]).map(f32::to_bits);
-            self.gl_feed(op::COLOR4F as u16, &words);
+            self.assembly.colour = self.gl_light(&[xyz[0], xyz[1], xyz[2], 1.0]);
             self.geom.colour_overridden = true;
         } else if self.geom.colour_overridden {
-            let words = self.geom.colour;
-            self.gl_feed(op::COLOR4F as u16, &words);
+            self.assembly.colour = self.geom.colour.map(f32::from_bits);
             self.geom.colour_overridden = false;
         }
     }
@@ -799,7 +790,7 @@ impl Board {
         let depth_scale = self.gl_depth_scale();
         let mut p = [0f32; 16];
 
-        self.gl().cur.viewport = [0; 4];
+        self.assembly.xf.viewport = [0; 4];
         if (m[0] == 0.0 && m[4] == 0.0 && m[8] == 0.0) || (m[1] == 0.0 && m[5] == 0.0 && m[9] == 0.0) {
             return;
         }
@@ -813,8 +804,8 @@ impl Board {
             };
             p[col * 4 + 3] = m[col * 4 + 3];
         }
-        self.gl().set_matrix(GL_PROJECTION, &p);
-        let vp = &mut self.gl().cur.viewport;
+        self.assembly.xf.projection = p;
+        let vp = &mut self.assembly.xf.viewport;
         vp[0] = -gl_cmd::WINDOW_REACH;
         vp[1] = -gl_cmd::WINDOW_REACH;
         vp[2] = 2 * gl_cmd::WINDOW_REACH;
@@ -822,12 +813,9 @@ impl Board {
     }
 }
 
-/// A board-side matrix load: 16 IEEE-754 floats, ROW-major on the wire.
-/// GlContext::set_matrix() takes column-major, so transpose before the call.
-/// gl_matrix_slot is the slot the last matrix-select chose; the normal slot
-/// (gl_cmd::SLOT_NORMAL) is one the context refuses, and its false return is
-/// expected. The texture matrix is kept as sent and applied to the current
-/// ST by the shared context.
+/// A board-side matrix load: 16 IEEE-754 floats, ROW-major on the wire; the
+/// transform state is column-major. The texture matrix is kept as sent and
+/// applied to the current texture coordinates in primitive assembly.
 pub(super) fn gl_transpose(rows: &[u32]) -> [f32; 16] {
     std::array::from_fn(|i| f32::from_bits(rows[(i % 4) * 4 + i / 4]))
 }
@@ -853,19 +841,17 @@ impl Board {
             self.gl_reload_combined();
             return;
         }
-        if self.gl_matrix_slot == GL_MODELVIEW {
+        if self.gl_matrix_slot == gl_cmd::SLOT_MODELVIEW {
             // The combined matrix already carries the model-view
-            // (Board::gl_load_combined()), so the shared context keeps its
-            // identity model-view; this copy serves lighting's eye position.
+            // (Board::gl_load_combined()), so the transform state keeps its
+            // identity model-view; this copy serves lighting's eye position
+            // and the user clip planes.
             self.geom.modelview = self.gl_matrix;
-            for i in 0..GL_CLIP_PLANES {
-                self.gl_apply_clip_plane(i);
+            for i in 0..CLIP_PLANES {
+                self.load_clip_plane(i);
             }
-            return;
         }
-        let m = gl_transpose(&self.gl_matrix);
-        let slot = self.gl_matrix_slot;
-        self.gl().set_matrix(slot, &m);
+        // Any other block has no home.
     }
 
     /// The four floats behind index 16, gathered in cmd_operand[]. Their sign
@@ -911,7 +897,6 @@ impl Board {
         let mut anchor_x: u32 = 0;
         let mut anchor_y: u32 = 0;
         let patterned = (self.stream.pattern_mode & gl_cmd::RECT_PATTERN_ENABLE) != 0;
-        let rules = self.gl_operation_rules();
         let mut op = RasterOp {
             kind: RASTER_CLEAR,
             clear_colour_mask: u32::MAX,
@@ -943,29 +928,29 @@ impl Board {
             anchor_y = ((self.win.origin[1] % 32).wrapping_add(((f[5] as f64) % 32.0) as i32) & 31) as u32;
         }
         if ((self.gl_write_mask >> write::COLOUR_SHIFT) & write::COLOUR_MASK) != 0 {
-            op.clear_buffers |= GL_COLOR_BUFFER_BIT;
+            op.clear_buffers |= CLEAR_COLOUR;
         }
         if (self.gl_write_mask & write::DEPTH) != 0 {
             let mut d = f[6] as f64 / (2.0 * gl_cmd::DEPTH_S);
             d = cmin(cmax(d, 0.0), 1.0);
-            op.clear_buffers |= GL_DEPTH_BUFFER_BIT;
-            op.clear_depth24 = rules.depth_code(d);
+            op.clear_buffers |= CLEAR_DEPTH;
+            op.clear_depth24 = super::depth_word::word_for_fraction(d);
         }
-        if (self.stream.pattern_mode & mode::STENCIL_TEST) != 0 && self.gl_ref().cur.stencil_write_mask != 0 {
-            let st = &self.gl_ref().cur;
+        let w = self.fragment_words().backend;
+        if (self.stream.pattern_mode & mode::STENCIL_TEST) != 0 && w.stencil_write_mask() != 0 {
+            use super::pipe::state::{Compare, StencilOp};
 
-            if st.stencil_func == GL_ALWAYS && st.stencil_op[2] == GL_REPLACE {
-                // glClear's form (mode::STENCIL_TEST): write the reference.
-                op.clear_buffers |= GL_STENCIL_BUFFER_BIT;
-                op.clear_stencil = st.stencil_ref as u32;
-                op.stencil_mask = st.stencil_write_mask;
+            if w.stencil_func() == Compare::Always && w.stencil_ops()[2] == StencilOp::Replace {
+                // A clear's form (mode::STENCIL_TEST): write the reference.
+                op.clear_buffers |= CLEAR_STENCIL;
+                op.clear_stencil = w.stencil_ref();
+                op.stencil_mask = w.stencil_write_mask();
             } else if !self.diag.gl_rect_stencil_logged {
-                let (func, sop) = (st.stencil_func, st.stencil_op[2]);
                 self.diag.gl_rect_stencil_logged = true;
-                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: stencil-tested rectangle under comparison {} and operation {:#x} is not modeled; stencil left unchanged", func, sop);
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: stencil-tested rectangle under comparison {:?} and operation {:?} is not modeled; stencil left unchanged", w.stencil_func(), w.stencil_ops()[2]);
             }
         }
-        if (self.stream.pattern_mode & mode::DEPTH_TEST) != 0 && (self.gl_depth_func & ODSY_DEPTH_FUNC_MASK) != GL_ALWAYS && !self.diag.gl_rect_depth_logged {
+        if (self.stream.pattern_mode & mode::DEPTH_TEST) != 0 && (self.gl_depth_func & ODSY_DEPTH_FUNC_MASK) != 7 && !self.diag.gl_rect_depth_logged {
             self.diag.gl_rect_depth_logged = true;
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: depth-tested rectangle under comparison {} is not modeled; written unconditionally", self.gl_depth_func & ODSY_DEPTH_FUNC_MASK);
         }
@@ -1014,7 +999,7 @@ impl Board {
         if !self.gl_index_mode() {
             op.clear_colour_mask = (self.gl_write_mask >> write::COLOUR_SHIFT) & write::COLOUR_MASK;
         }
-        if (op.clear_buffers & GL_COLOR_BUFFER_BIT) != 0 {
+        if (op.clear_buffers & CLEAR_COLOUR) != 0 {
             if self.gl_index_mode() {
                 // glClearIndex travels as the first float (the probe's 3.0).
                 op.clear_rgba = gl_index_rgba(float_index(self.gl_rect[0]));
@@ -1058,7 +1043,7 @@ impl Board {
             y += 1;
         }
         if runs.is_empty() {
-            self.gl_report_refusals(op.kind != RASTER_CLEAR || (op.clear_buffers & GL_COLOR_BUFFER_BIT) != 0);
+            self.gl_report_refusals(op.kind != RASTER_CLEAR || (op.clear_buffers & CLEAR_COLOUR) != 0);
         }
         self.gl_raster_ops(runs);
     }
@@ -1165,7 +1150,7 @@ impl Board {
         // The bit's physical meaning is unknown. Limit this model policy to
         // solid axial independent lines; other integer paths retain their rules.
         if !stippled
-            && self.stream.primitive == GL_LINES
+            && self.stream.primitive == LINES
             && ((self.stream.pattern_mode & !(1u32 << 25)) == 0x00080000 || (self.stream.pattern_mode & !(1u32 << 25)) == 0x00100000)
             && (x1 == x2 || y1 == y2)
         {

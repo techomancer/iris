@@ -6,12 +6,12 @@
 
 use crate::devlog::LogModule;
 use super::bits::sextract32;
+use super::vram::{ADDR_MASK, UNIT};
 use super::board::{Board, ODSY_GL_LIGHTS, ODSY_GL_LIGHT_COLOURS, ODSY_TEX_LEVELS};
 use super::consts::{
-    alpha, blend, cmd, cmd_arity, dest, dma, gl_cmd, image, line, mode, pattern, polygon, prog,
-    query, reg, stencil, swap, tex, write, ODSY_DEPTH_FUNC_MASK, ODSY_DRAW_MASK_BITS,
-    ODSY_DRAW_MASK_RIGHT, ODSY_F32_ONE, ODSY_FENCE_VALID, ODSY_FIFO_SETUP_7B5_INDEX,
-    ODSY_LOGIC_OP_MASK, ODSY_ORIGIN_BITS, ODSY_RASTER_POS_LATCH_WORD,
+    cmd, cmd_arity, dest, dma, gl_cmd, image, line, mode, pattern, prog,
+    query, reg, swap, tex, write, ODSY_DEPTH_FUNC_MASK, ODSY_DRAW_MASK_BITS,
+    ODSY_DRAW_MASK_RIGHT, ODSY_F32_ONE, ODSY_FENCE_VALID, ODSY_FIFO_SETUP_7B5_INDEX, ODSY_ORIGIN_BITS, ODSY_RASTER_POS_LATCH_WORD,
 };
 use super::dma::{
     float_channel, integer_colour, is_integer_colour, signed_to_float, ODSY_CMD_COPY_RECT,
@@ -20,16 +20,14 @@ use super::dma::{
 };
 use super::draw::{float_to_u32, image_burst_fmt, pack_pixel};
 use super::geometry::{f32_bits, odyssey_f32};
-use super::gl::{
-    blend_factor, float_index, is_program_word, polygon_mode, prog_value, stencil_op,
-    BLEND_EQUATION, GL_LIGHT_WORDS,
-};
-use super::gl_context::{
-    op, GL_BACK, GL_CLEAR, GL_CLIP_PLANES, GL_FRONT, GL_MODELVIEW,
-    GL_NEVER_ENUM,
-};
+use super::gl::{float_index, is_program_word, prog_value, GL_LIGHT_WORDS};
+use super::trace::TRACE_FIFO;
+use super::assembly::CLIP_PLANES;
 impl Board {
     pub fn cmd_dispatch(&mut self, tag: u32) {
+        if self.trace.on(TRACE_FIFO) {
+            self.trace_command(tag);
+        }
         let mut after_tail = false;
 
         // Only the kernel command right after its window-origin write can be its tail.
@@ -50,14 +48,13 @@ impl Board {
             let block = tag - reg::TEX_DETAIL_FUNCTION;
 
             if self.cmd.operand_count != tex::DETAIL_FUNCTION_BLOCK_WORDS {
-                self.tex.detail_function_valid &= !(1u32 << block);
                 self.cmd_unimplemented(tag);
                 return;
             }
             let w = tex::DETAIL_FUNCTION_BLOCK_WORDS as usize;
             let at = block as usize * w;
-            self.tex.detail_function[at..at + w].copy_from_slice(&self.cmd.operand[..w]);
-            self.tex.detail_function_valid |= 1u32 << block;
+            let op = self.cmd.operand;
+            self.tex_mut().detail[at..at + w].copy_from_slice(&op[..w]);
             return;
         }
         if (reg::TEX_TABLE3..reg::TEX_TABLE3 + tex::TABLE3_BLOCKS).contains(&tag) {
@@ -77,13 +74,14 @@ impl Board {
             }
             let w = tex::COLOUR_TABLE_BLOCK_WORDS as usize;
             let at = block as usize * w;
-            self.tex.colour_table[plane][at..at + w].copy_from_slice(&self.cmd.operand[..w]);
-            self.tex.colour_table_valid[plane] |= 1u32 << block;
+            let op = self.cmd.operand;
+            self.tex_mut().colour_table[plane][at..at + w].copy_from_slice(&op[..w]);
             return;
         }
         if (reg::TEX_LEVEL..reg::TEX_LEVEL + ODSY_TEX_LEVELS).contains(&tag) {
             let at = (tag - reg::TEX_LEVEL) as usize * 3;
-            self.tex.levels[at..at + 3].copy_from_slice(&self.cmd.operand[..3]);
+            let op = self.cmd.operand;
+            self.tex_mut().levels[at..at + 3].copy_from_slice(&op[..3]);
             return;
         }
         if tag == gl_cmd::TEXCOORD_3F || tag == gl_cmd::TEXCOORD_4F {
@@ -121,7 +119,7 @@ impl Board {
             self.gl_matrix_slot = match tag & 0xff {
                 gl_cmd::MATRIX_SELECT_COMBINED => gl_cmd::SLOT_COMBINED,
                 gl_cmd::MATRIX_SELECT_TEXTURE => gl_cmd::SLOT_TEXTURE,
-                gl_cmd::MATRIX_SELECT_MODELVIEW => GL_MODELVIEW,
+                gl_cmd::MATRIX_SELECT_MODELVIEW => gl_cmd::SLOT_MODELVIEW,
                 gl_cmd::MATRIX_SELECT_BLOCK16 => gl_cmd::SLOT_BLOCK16,
                 gl_cmd::MATRIX_SELECT_NORMAL => gl_cmd::SLOT_NORMAL_MATRIX,
                 // Any other block: no home.
@@ -135,9 +133,11 @@ impl Board {
                 self.gl_color_is_index = false;
                 if !self.gl_index_mode() {
                     let opd = self.cmd.operand;
+                    // A byte c is c / 255; alpha is 1.
+                    let rgba = [0, 1, 2, 3].map(|i| if i == 3 { 1.0 } else { (opd[i] & 0xff) as f32 / 255.0 });
 
-                    self.gl_feed(op::COLOR3UB as u16, &opd[..3]);
-                    self.geom.colour = self.gl().current_color();
+                    self.assembly.colour = rgba;
+                    self.geom.colour = rgba.map(f32::to_bits);
                     self.geom.colour_overridden = false;
                 }
             }
@@ -151,31 +151,17 @@ impl Board {
                 self.gl_color_is_index = true;
             }
             reg::DEST_SELECT => {
-                // Destination-buffer select: its third operand marks an id-plane
-                // write when it is dest::ID_PLANES. A colour select's non-zero
-                // first operand names the colour buffer, the base a DMA header's
-                // destination word is matched against (the all-zero blocks are GL
-                // context setup, not a buffer).
+                // The pixel mode (block 0x017): where drawing lands and how
+                // its pixels are laid out (view::DestViews).
+                self.pixel_mode.copy_from_slice(&self.cmd.operand[..4]);
                 self.dest_buffer_word = self.cmd.operand[dest::SELECT_VALUE_INDEX];
                 self.dest_base = self.cmd.operand[dest::SELECT_BASE_INDEX];
-                if self.dest_base == 0 || self.dest_is_id_planes() {
-                    return;
-                }
-                let base = self.dest_base;
-                if !self.board_address_valid(base) || (self.dest_buffer_word & !dest::FLAGS) == 0 {
-                    return;
-                }
-                if (self.dest_buffer_word >> dest::FORMAT_SHIFT) == dest::FORMAT_SCREEN
-                    || self.dest_base == self.dma_colour_base
-                {
-                    self.dma_colour_base = self.dest_base;
-                    if self.screen_base == 0 {
-                        self.screen_base = self.dest_base;
-                    }
-                } else {
-                    // An off-screen object: create it, or update its row length.
-                    let width = self.cmd.operand[dest::WIDTH_INDEX].wrapping_mul(dest::WIDTH_UNIT);
-                    self.object_select(base, width);
+                // An origin past the memory the board reports is a guest
+                // bug; its drawing lands nowhere.
+                let origin = (self.pixel_mode[0] & ADDR_MASK) as u64 * UNIT;
+                if origin >= self.vram.size() && !self.diag.board_oob_reported {
+                    self.diag.board_oob_reported = true;
+                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: pixel mode origin {:#x} is beyond the {} MiB this board reports", self.pixel_mode[0], self.vram.size() >> 20);
                 }
             }
             reg::PLANE_MASK => {
@@ -198,7 +184,7 @@ impl Board {
                 if self.prim.begin_open
                     && !self.image.active
                     && ((self.stream.pattern_mode & (1u32 << 13)) != 0
-                        || (self.tex.mode & (tex::MODE_1D | tex::MODE_2D | tex::MODE_3D)) != 0
+                        || (self.tex_regs().path & (tex::MODE_1D | tex::MODE_2D | tex::MODE_3D)) != 0
                         || self.stream.primitive == gl_cmd::TRIANGLES
                         || self.stream.primitive == gl_cmd::TRIANGLE_STRIP
                         || self.stream.primitive == gl_cmd::TRIANGLE_FAN
@@ -210,17 +196,15 @@ impl Board {
                         (self.cmd.operand[1] as i32) as f32,
                         0.0,
                     ];
-                    let opd = self.cmd.operand;
-
                     if !self.prim.in_prim {
                         let mode = self.stream.primitive;
 
-                        self.gl_feed(op::BEGIN as u16, &[mode]);
+                        self.assembly.begin(mode);
                         self.prim.in_prim = true;
                     }
                     self.gl_vertex_colour(&xyz);
                     self.texture_vertex();
-                    self.gl_feed(op::VERTEX2I as u16, &opd[..2]);
+                    self.assemble_vertex(&xyz[..2], 2);
                 } else {
                     // The X path uses window-relative integer coordinates.
                     let x = self.cmd.operand[0].wrapping_add(self.win.origin[0] as u32);
@@ -259,11 +243,7 @@ impl Board {
                 }
                 self.geom.colour.copy_from_slice(&rgba);
                 self.geom.colour_overridden = false;
-                if n == 4 {
-                    self.gl_feed(op::COLOR4F as u16, &rgba[..4]);
-                } else {
-                    self.gl_feed(op::COLOR3F as u16, &rgba[..3]);
-                }
+                self.assembly.colour = rgba.map(f32::from_bits);
                 if !self.gl_index_mode() {
                     self.stream.color = pack_pixel(
                         float_channel(rgba[0]),
@@ -336,10 +316,10 @@ impl Board {
                 {
                     let plane = (self.geom.light_vec_sel - gl_cmd::CLIP_PLANE_BASE) / gl_cmd::CLIP_PLANE_STRIDE;
 
-                    if plane < GL_CLIP_PLANES {
+                    if plane < CLIP_PLANES {
                         let at = plane as usize * 4;
                         self.geom.clip_eye[at..at + 4].copy_from_slice(&self.cmd.operand[..4]);
-                        self.gl_apply_clip_plane(plane);
+                        self.load_clip_plane(plane);
                     }
                 } else if !self.diag.gl_block_logged {
                     self.diag.gl_block_logged = true;
@@ -414,7 +394,7 @@ impl Board {
                 if !self.prim.in_prim && self.prim.restart_absorb == 0 {
                     let mode = self.stream.primitive;
 
-                    self.gl_feed(op::BEGIN as u16, &[mode]);
+                    self.assembly.begin(mode);
                     self.prim.in_prim = true;
                 }
                 if self.prim.begin_open && !self.prim.integer_prim && self.stream.primitive <= 8 {
@@ -436,20 +416,13 @@ impl Board {
 
                     if slot < self.prim.restart_vertex.len() {
                         self.prim.restart_vertex[slot] =
-                            self.gl_ctx.capture_vertex(self.prim.restart_type, &xyz, components);
+                            self.assembly.capture_vertex(self.prim.restart_type, &xyz.map(f32::from_bits), components);
                     }
                     self.prim.restart_absorb -= 1;
                     self.restart_finish();
                     return;
                 }
-                let op = if components == 4 {
-                    op::VERTEX4F
-                } else if components == 3 {
-                    op::VERTEX3F
-                } else {
-                    op::VERTEX2F
-                };
-                self.gl_feed(op as u16, &xyz[..components as usize]);
+                self.assemble_vertex(&xyz.map(f32::from_bits)[..components as usize], components);
             }
             gl_cmd::LOAD_4F => {
                 self.gl_load_block16();
@@ -464,164 +437,80 @@ impl Board {
                     );
                 }
                 self.gl_depth_func = self.cmd.operand[0];
-                self.gl_apply_depth();
             }
             reg::WRITE_MASK => {
-                let stencil_mask = (self.cmd.operand[0] >> write::STENCIL_SHIFT) & write::STENCIL_MASK;
-
                 self.gl_write_mask = self.cmd.operand[0];
-                self.gl_apply_depth();
-                // The library forces it to 0 for a drawable with no stencil.
-                self.gl_feed(op::STENCIL_MASK as u16, &[stencil_mask]);
             }
             reg::ALPHA_FUNC => {
-                let word = self.cmd.operand[0];
-                let mut args = [0u32; 2];
-
-                args[0] = GL_NEVER_ENUM + ((word >> alpha::FUNC_SHIFT) & alpha::FUNC_MASK);
-                // The reference is a 12-bit field, x4096 with 1.0 sent as 4095
-                // (ESTABLISHED). Decoding it as field / 4096 is INFERRED; the
-                // vendor frames rule out field / 4095.
-                let field = word & alpha::REF_MASK;
-                let reference = if field == alpha::REF_ONE { 1.0 } else { field as f32 / alpha::REF_SCALE };
-                args[1] = f32_bits(reference);
-                self.gl_feed(op::ALPHA_FUNC as u16, &args);
+                self.alpha_word = self.cmd.operand[0];
             }
             reg::STENCIL_FUNC => {
-                let word = self.cmd.operand[0];
-                let mut args = [0u32; 3];
-
-                args[0] = GL_NEVER_ENUM + ((word >> stencil::FUNC_SHIFT) & stencil::FUNC_MASK);
-                args[1] = word & stencil::REF_MASK;
-                args[2] = (word >> stencil::VALUE_MASK_SHIFT) & stencil::VALUE_MASK_MASK;
-                self.gl_feed(op::STENCIL_FUNC as u16, &args);
-
-                let fail = stencil_op((word >> stencil::OP_FAIL_SHIFT) & stencil::OP_MASK);
-                let zfail = stencil_op((word >> stencil::OP_ZFAIL_SHIFT) & stencil::OP_MASK);
-                let zpass = stencil_op((word >> stencil::OP_ZPASS_SHIFT) & stencil::OP_MASK);
-                if fail == u32::MAX || zfail == u32::MAX || zpass == u32::MAX {
-                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: stencil op word {:#x} is not modeled", word);
-                } else {
-                    args[0] = fail;
-                    args[1] = zfail;
-                    args[2] = zpass;
-                    self.gl_feed(op::STENCIL_OP as u16, &args);
-                }
+                self.stencil_word = self.cmd.operand[0];
             }
             reg::BLEND => {
-                let mut args = [0u32; 4];
-
                 // Every operand is kept whatever bit 17 says (mode::BLEND): the
-                // library sends glBlendFunc's factors, and the X server its
+                // library sends its factors, and the X server its
                 // opaque-stipple background, before the 0x0404 that sets the bit.
+                self.blend_word = self.cmd.operand[0];
                 self.const_colour[0] = self.cmd.operand[1];
                 self.const_colour[1] = self.cmd.operand[2];
-                self.blend_word = self.cmd.operand[0];
-                let word = self.cmd.operand[0];
-                let eq = (word >> blend::EQ_SHIFT) & blend::EQ_MASK;
-                let src = blend_factor((word >> blend::SRC_SHIFT) & blend::SRC_MASK, false);
-                let dst = blend_factor(word & blend::DST_MASK, true);
-                if src == u32::MAX || dst == u32::MAX {
-                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: blend factor word {:#x} is not modeled", word);
-                } else {
-                    args[0] = src;
-                    args[1] = dst;
-                    self.gl_feed(op::BLEND_FUNC as u16, &args[..2]);
-                }
-                if eq == 3 || eq == 4 {
-                    crate::dlog!(
-                        LogModule::Odyssey,
-                        "sgi-odyssey: blend equation {} (the SGIX alpha min/max extension) is not modeled",
-                        eq
-                    );
-                } else {
-                    args[0] = BLEND_EQUATION[eq as usize];
-                    self.gl_feed(op::BLEND_EQUATION as u16, &args[..1]);
-                }
-                let c1 = self.cmd.operand[1];
-                let c2 = self.cmd.operand[2];
-                args[0] = f32_bits(((c1 >> blend::COLOUR_SHIFT) & blend::COLOUR_MASK) as f32 / blend::COLOUR_SCALE);
-                args[1] = f32_bits((c1 & blend::COLOUR_MASK) as f32 / blend::COLOUR_SCALE);
-                args[2] = f32_bits(((c2 >> blend::COLOUR_SHIFT) & blend::COLOUR_MASK) as f32 / blend::COLOUR_SCALE);
-                args[3] = f32_bits((c2 & blend::COLOUR_MASK) as f32 / blend::COLOUR_SCALE);
-                self.gl_feed(op::BLEND_COLOR as u16, &args);
             }
             reg::LOGIC_OP => {
-                let mode = GL_CLEAR + (self.cmd.operand[0] & ODSY_LOGIC_OP_MASK);
-
-                self.gl_feed(op::LOGIC_OP as u16, &[mode]);
+                self.logic_op_word = self.cmd.operand[0];
             }
             reg::LINE_POINT_SIZE => {
-                let mut args = [0u32; 2];
-
-                args[0] = f32_bits(
-                    (self.cmd.operand[0] & line::POINT_SIZE_MASK) as f32 / line::POINT_SIZE_SCALE,
-                );
-                self.gl_feed_raster_state(op::LINE_WIDTH as u16, &args[0..1]);
-                args[1] = f32_bits(
-                    (self.cmd.operand[1] & line::POINT_SIZE_MASK) as f32 / line::POINT_SIZE_SCALE,
-                );
-                self.gl_feed_raster_state(op::POINT_SIZE as u16, &args[1..2]);
+                self.line_point_words = [self.cmd.operand[0], self.cmd.operand[1]];
             }
             reg::POLYGON_MODE => {
-                let mut front = [0u32; 2];
-                let mut back = [0u32; 2];
-
-                front[0] = GL_FRONT;
-                front[1] = polygon_mode(
-                    (self.cmd.operand[0] >> polygon::MODE_FRONT_SHIFT) & polygon::MODE_MASK,
-                );
-                self.gl_feed_raster_state(op::POLYGON_MODE as u16, &front);
-                back[0] = GL_BACK;
-                back[1] = polygon_mode(
-                    (self.cmd.operand[0] >> polygon::MODE_BACK_SHIFT) & polygon::MODE_MASK,
-                );
-                self.gl_feed_raster_state(op::POLYGON_MODE as u16, &back);
+                self.polygon_mode_word = self.cmd.operand[0];
             }
             reg::POLYGON_OFFSET => {
-                let mut args = [0u32; 2];
-
-                args[0] = f32_bits(0.0f32);
-                args[1] = f32_bits(
-                    sextract32(self.cmd.operand[0], 0, polygon::OFFSET_BITS) as f32 * polygon::OFFSET_SCALE,
-                );
-                self.gl_feed(op::POLYGON_OFFSET_EXT as u16, &args);
+                self.polygon_offset_word = self.cmd.operand[0];
             }
             reg::CLIP_BOX => {
                 self.gl_clip_box[0] = self.cmd.operand[0];
                 self.gl_clip_box[1] = self.cmd.operand[1];
-                self.gl_apply_clip_box();
             }
             reg::FOG => {
                 let n = self.gl_fog.len();
                 self.gl_fog.copy_from_slice(&self.cmd.operand[..n]);
             }
             reg::TEX_MODE => {
-                self.tex.mode = self.cmd.operand[0];
-                self.gl_apply_clip_planes();
+                self.tex_mut().path = self.cmd.operand[0];
+                self.load_clip_planes();
             }
             reg::TEX_SAMPLER => {
-                let n = self.tex.sampler.len();
-                self.tex.sampler.copy_from_slice(&self.cmd.operand[..n]);
+                let op = self.cmd.operand;
+                let t = self.tex_mut();
+                let n = t.sampler.len();
+                t.sampler.copy_from_slice(&op[..n]);
             }
             reg::TEX_ENV => {
-                let n = self.tex.env.len();
-                self.tex.env.copy_from_slice(&self.cmd.operand[..n]);
+                let op = self.cmd.operand;
+                let t = self.tex_mut();
+                let n = t.env.len();
+                t.env.copy_from_slice(&op[..n]);
             }
             reg::TEX_LEVEL0 => {
-                self.tex.level0 = self.cmd.operand[0];
+                self.tex_mut().level0 = self.cmd.operand[0];
             }
             reg::TEX_LOD => {
-                let n = self.tex.lod.len();
-                self.tex.lod.copy_from_slice(&self.cmd.operand[..n]);
+                let op = self.cmd.operand;
+                let t = self.tex_mut();
+                let n = t.lod.len();
+                t.lod.copy_from_slice(&op[..n]);
             }
             reg::TEX_SCALE_BIAS => {
-                let n = self.tex.scale_bias.len();
-                self.tex.scale_bias.copy_from_slice(&self.cmd.operand[..n]);
+                let op = self.cmd.operand;
+                let t = self.tex_mut();
+                let n = t.scale_bias.len();
+                t.scale_bias.copy_from_slice(&op[..n]);
             }
             reg::TEX_OFFSET => {
-                let n = self.tex.offset.len();
-                self.tex.offset.copy_from_slice(&self.cmd.operand[..n]);
+                let op = self.cmd.operand;
+                let t = self.tex_mut();
+                let n = t.offset.len();
+                t.offset.copy_from_slice(&op[..n]);
             }
             reg::POST_FILTER_DEFAULT => {
                 self.cmd_unimplemented(tag);
@@ -704,7 +593,7 @@ impl Board {
                 self.prim.begin_open = false;
                 self.prim.open_held = 0;
                 if self.prim.in_prim {
-                    self.gl_feed(op::END as u16, &[]);
+                    self.assemble(|a, b| a.end(b));
                     self.prim.in_prim = false;
                 } else {
                     self.gl_end();
@@ -718,7 +607,7 @@ impl Board {
             0x0444 => {
                 // Drop an outgoing primitive, without draw.
                 if self.cmd.operand[0] == 0 && !self.prim.integer_prim && !(self.prim.begin_open && self.stream.primitive == 9) {
-                    self.gl().discard_primitive();
+                    self.assembly.discard_primitive();
                     self.prim.in_prim = false;
                     self.prim.begin_open = false;
                     self.prim.open_held = 0;
@@ -733,7 +622,7 @@ impl Board {
 
                 if type_ == 0xf {
                     if !self.prim.integer_prim && !(self.prim.begin_open && self.stream.primitive == 9) {
-                        self.gl().discard_primitive();
+                        self.assembly.discard_primitive();
                         self.prim.in_prim = false;
                         self.prim.begin_open = false;
                         self.prim.open_held = 0;
@@ -808,11 +697,15 @@ impl Board {
             }
             reg::PATTERN_SHAPE => {
                 self.stream.pattern_shape = self.cmd.operand[0];
-                self.gl_apply_polygon_stipple();
             }
             reg::PATTERN_MODE => {
                 self.stream.pattern_mode = self.cmd.operand[0];
-                self.gl_apply_mode();
+                // The board draws undithered: the first word that asks for
+                // dithering is reported.
+                if (self.stream.pattern_mode & mode::DITHER) != 0 && !self.diag.gl_dither_reported {
+                    self.diag.gl_dither_reported = true;
+                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: dither not modelled; drawing undithered");
+                }
             }
             reg::WINDOW_ORIGIN => {
                 self.win.origin[0] = sextract32(self.cmd.operand[0], 0, ODSY_ORIGIN_BITS);
@@ -865,7 +758,6 @@ impl Board {
             reg::LINE_STIPPLE => {
                 let n = self.stream.line_stipple.len();
                 self.stream.line_stipple.copy_from_slice(&self.cmd.operand[..n]);
-                self.gl_apply_line_stipple();
                 if self.stream.line_stipple[line::STIPPLE_CONTROL] != line::STIPPLE_CONTROL_32
                     && (self.stream.line_stipple[line::STIPPLE_CONTROL] & !0xffu32) != 0
                     && !self.diag.line_stipple_reported
@@ -970,6 +862,8 @@ impl Board {
             self.query_update(tag);
             if tag != 0x2f00c02e && tag != 0x3000c02e {
                 self.cmd_dispatch(tag);
+            } else if self.trace.on(TRACE_FIFO) {
+                self.trace_command(tag);
             }
         } else {
             self.cmd.state = ODSY_CMD_OPERANDS;
@@ -1241,6 +1135,9 @@ impl Board {
                 return;
             }
             4 => {
+                if self.trace.on(TRACE_FIFO) {
+                    self.trace_note(format_args!("query kind {} count {} sync {:#x} fence {word:#x}", self.query.kind, self.query.count, self.query.sync_index));
+                }
                 self.query_finish(word);
                 return;
             }
@@ -1268,15 +1165,21 @@ impl Board {
             }
             ODSY_CMD_COPY_RECT => {
                 self.cmd.operand[self.cmd.operand_index as usize] = word;
-                match self.cmd.operand_index {
-                    cmd::COPY_RECT_SRC_INDEX => self.copy_src = word,
-                    cmd::COPY_RECT_SIZE_INDEX => self.copy_size = word,
-                    cmd::COPY_RECT_DST_INDEX => self.copy_dst = word,
-                    _ => {}
-                }
                 self.cmd.operand_index += 1;
                 if self.cmd.operand_index == cmd::COPY_RECT_WORDS {
-                    self.copy_rect();
+                    if self.trace.on(TRACE_FIFO) {
+                        let o = &self.cmd.operand;
+                        let c = super::copy::CopyOperands::decode(o);
+                        let (sr, ds, (w, h)) = (c.src(), c.dst(), c.size());
+                        self.trace_note(format_args!(
+                            "COPY 0x2031 [8] {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}  {w}x{h} from {:#x}{} ({}, {}) field {}+{} to {:#x}{} ({}, {}) field {}+{}, word 7 bits 31:30 {}{}",
+                            o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7],
+                            sr.base, if sr.drawable { " drawable" } else { "" }, sr.x, sr.y, sr.at, sr.bytes,
+                            ds.base, if ds.drawable { " drawable" } else { "" }, ds.x, ds.y, ds.at, ds.bytes,
+                            o[7] >> 31, (o[7] >> 30) & 1
+                        ));
+                    }
+                    self.copy_block();
                     self.cmd.state = ODSY_CMD_IDLE;
                 }
             }
@@ -1287,7 +1190,10 @@ impl Board {
                 }
                 self.cmd.operand_index += 1;
                 if self.cmd.operand_index == self.cmd.operand_count {
-                    self.gl_apply_polygon_stipple();
+                    if self.trace.on(TRACE_FIFO) {
+                        let at = self.stream.pattern_load_offset;
+                        self.trace_note(format_args!("pattern load words {at}..{}", at + pattern::WORDS));
+                    }
                     self.cmd.state = ODSY_CMD_IDLE;
                 }
             }
@@ -1306,6 +1212,9 @@ impl Board {
                 if self.cmd.operand_index == self.cmd.operand_count {
                     self.image.cur_x = if self.image.x2 < self.image.x1 { self.image.x1.wrapping_sub(1) } else { self.image.x1 };
                     self.image.cur_y = if self.image.y2 < self.image.y1 { self.image.y1.wrapping_sub(1) } else { self.image.y1 };
+                    if self.trace.on(TRACE_FIFO) {
+                        self.trace_note(format_args!("image box ({}, {})-({}, {})", self.image.x1, self.image.y1, self.image.x2, self.image.y2));
+                    }
                     self.cmd.state = ODSY_CMD_IDLE;
                 }
             }
@@ -1314,6 +1223,9 @@ impl Board {
                 self.image_burst_word(word);
                 self.cmd.operand_index += 1;
                 if self.cmd.operand_index == self.cmd.operand_count {
+                    if self.trace.on(TRACE_FIFO) {
+                        self.trace_note(format_args!("image burst {} words fmt {:#x} cursor ({}, {})", self.cmd.operand_count, self.image.fmt, self.image.cur_x, self.image.cur_y));
+                    }
                     // The header's count bounds only the group's first burst; the
                     // bursts after it are full (cmd::IMAGE_HEADER).
                     self.image.group_len = 0;
@@ -1327,6 +1239,10 @@ impl Board {
                 }
                 self.cmd.operand_index += 1;
                 if self.cmd.operand_index == self.cmd.operand_count {
+                    if self.trace.on(TRACE_FIFO) {
+                        let m: Vec<String> = self.gl_matrix.iter().map(|&w| format!("{}", f32::from_bits(w))).collect();
+                        self.trace_note(format_args!("matrix load slot {:#x} ({})", self.gl_matrix_slot, m.join(", ")));
+                    }
                     self.gl_load_matrix();
                     self.cmd.state = ODSY_CMD_IDLE;
                 }
@@ -1336,6 +1252,10 @@ impl Board {
                 self.gl_rect[self.cmd.operand_index as usize] = word;
                 self.cmd.operand_index += 1;
                 if self.cmd.operand_index == self.cmd.operand_count {
+                    if self.trace.on(TRACE_FIFO) {
+                        let r: Vec<String> = self.gl_rect.iter().map(|&w| format!("{}", f32::from_bits(w))).collect();
+                        self.trace_note(format_args!("rect ({})", r.join(", ")));
+                    }
                     self.gl_rect();
                     self.cmd.state = ODSY_CMD_IDLE;
                 }

@@ -49,6 +49,23 @@ pub(super) fn encode_f64(v: f64) -> u32 {
     ((exp as u32) << DEPTH_MANTISSA_BITS) | ((bits >> (52 - DEPTH_MANTISSA_BITS)) as u32 & DEPTH_MANTISSA_MASK)
 }
 
+#[cfg(test)]
+/// The value a 24-bit depth word encodes: (1 + m / 2^18) * 2^(e - 31) for
+/// exponent e in bits 23:18 and mantissa m in bits 17:0; 0 for the word 0.
+/// The inverse of `encode_f64` up to the mantissa bits it truncated. Bits
+/// above 23 are ignored.
+pub(super) fn decode_f64(word: u32) -> f64 {
+    let word = word & ODSY_DEPTH24_MAX;
+
+    if word == 0 {
+        return 0.0;
+    }
+    let exp = (word >> DEPTH_MANTISSA_BITS) as i32 - DEPTH_EXP_BIAS;
+    let mantissa = 1.0 + (word & DEPTH_MANTISSA_MASK) as f64 / (1u64 << DEPTH_MANTISSA_BITS) as f64;
+
+    mantissa * 2f64.powi(exp)
+}
+
 /// The word for an eye-linear depth fraction z in [0, 1] (0 at the near
 /// plane, 1 at the far plane): the encoding of 2S * z. A fraction outside
 /// [0, 1] clamps to it.
@@ -56,6 +73,24 @@ pub(super) fn word_for_fraction(z: f64) -> u32 {
     let z = if z > 1.0 { 1.0 } else if z > 0.0 { z } else { 0.0 };
 
     encode_f64(z * DEPTH_2S) & ODSY_DEPTH24_MAX
+}
+
+/// word_for_fraction() for a 32-bit float window depth: 2S z rounded to
+/// a float's 24 mantissa bits, then the exponent rebased and the top 18
+/// mantissa bits kept, from the float's own bits.
+#[inline(always)]
+pub(super) fn word_for_fraction32(z: f32) -> u32 {
+    let z = if z > 1.0 { 1.0 } else if z > 0.0 { z } else { 0.0 };
+    let v = z * DEPTH_2S as f32;
+
+    if !(v >= DEPTH_MIN_VALUE as f32) {
+        return 0;
+    }
+    let bits = v.to_bits();
+    // 2S z is below 2^33, so the exponent stays inside the word's.
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + DEPTH_EXP_BIAS;
+
+    (((exp as u32) << DEPTH_MANTISSA_BITS) | ((bits >> (23 - DEPTH_MANTISSA_BITS)) & DEPTH_MANTISSA_MASK)) & ODSY_DEPTH24_MAX
 }
 
 /// The 16-bit form (ESTABLISHED): the exponent in bits 15:10 and the top ten
@@ -68,9 +103,11 @@ pub(super) fn word16_from_word24(word: u32) -> u32 {
     (word & ODSY_DEPTH24_MAX) >> 8
 }
 
+#[cfg(test)]
 /// The polygon-offset field (block 0x058) is a signed 25-bit count of steps
 /// of the encoded 24-bit word, the limits the library clamps to.
 pub(super) const OFFSET_STEPS_MIN: i64 = -(1 << 24);
+#[cfg(test)]
 pub(super) const OFFSET_STEPS_MAX: i64 = (1 << 24) - 1;
 
 /// The word after a polygon offset. INFERRED placement: the board adds the field to the encoded word, so the offset
@@ -83,16 +120,50 @@ pub(super) fn word_with_offset(word: u32, steps: i64) -> u32 {
 }
 
 #[cfg(test)]
+mod tests_f32 {
+    use super::*;
+
+    #[test]
+    fn the_float_encoder_matches_the_double_one_to_a_step() {
+        let mut differ = 0;
+        for i in 0..=100_000u32 {
+            let z = (i as f64 / 100_000.0).powi(3);
+            let a = word_for_fraction(z);
+            let b = word_for_fraction32(z as f32);
+            assert!((a as i64 - b as i64).abs() <= 1, "{z}: {a:#x} {b:#x}");
+            differ += (a != b) as u32;
+        }
+        assert!(differ < 10_000, "{differ}");
+        assert_eq!(word_for_fraction32(1.0), word_for_fraction(1.0));
+        assert_eq!(word_for_fraction32(0.0), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// decode_f64 inverts encode_f64 up to the 18 mantissa bits kept, over
+    /// the word's range, and reads 0 and the far plane as themselves.
+    #[test]
+    fn decode_inverts_encode_within_the_mantissa() {
+        assert_eq!(decode_f64(0), 0.0);
+        // 2S is 2^33 - 2^15, which the 18 mantissa bits hold exactly.
+        assert_eq!(decode_f64(word_for_fraction(1.0)), DEPTH_2S);
+        // Past 2^33 the encoder saturates and the plane keeps the largest word.
+        assert_eq!(decode_f64(encode_f64(9e9)), (2.0 - 2f64.powi(-18)) * 2f64.powi(32));
+        for &v in &[1.0f64, 0.5, 3.0, 1e-9, 12345.678, 1.5 / 2147483648.0] {
+            let d = decode_f64(encode_f64(v));
+            let step = 2f64.powi(v.log2().floor() as i32 - 18);
+            assert!(d <= v && v - d < step, "{v} -> {d} (step {step})");
+        }
+    }
     use crate::dev::odyssey::raster_bench;
     use crate::dev::odyssey::consts::polygon;
-    use crate::dev::odyssey::gl_context::{
-        vtx, GL_COLOUR_MASK_ALL, GL_FLAT, GL_LEQUAL, GL_LESS, GL_OFFSET_FILL, GL_TRIANGLES, GlDraw,
-        GlDrawState,
+    use crate::dev::odyssey::pipe::encode::{
+        vtx, GL_FLAT, GL_LEQUAL, GL_LESS, GL_OFFSET_FILL, GL_TRIANGLES, LibDraw,
+        LibState,
     };
-    use crate::dev::odyssey::memory::ClipRect;
-    use crate::dev::odyssey::raster::{LineRule, NoTexels, RasterRules};
 
 
 
@@ -223,27 +294,17 @@ mod tests {
     /// board's depth rules, depth test `func`, and `steps` of polygon offset
     /// through the register's path (the shared context's bias).
     fn draw_flat(depth: &mut [u32], zw: f64, func: u32, steps: i64) {
-        draw_sloped(depth, zw, 0.0, func, steps, (0.0, 0.0));
+        draw_sloped(depth, zw, 0.0, func, steps);
     }
 
     /// [`draw_flat`] with the third vertex `tilt` further in window depth, so
-    /// the triangle has a depth slope, and the context's glPolygonOffset
-    /// factor and units set to `(factor, units)`.
-    fn draw_sloped(depth: &mut [u32], zw: f64, tilt: f64, func: u32, steps: i64, (factor, units): (f32, f32)) {
-        let rules = RasterRules {
-            subpixel_bits: 4,
-            color_bits: 8,
-            depth_bits: 24,
-            line_rule: LineRule::Diamond,
-            depth_float: true,
-            ..Default::default()
-        };
-        assert!(rules.rules_supported());
+    /// the triangle has a depth slope.
+    fn draw_sloped(depth: &mut [u32], zw: f64, tilt: f64, func: u32, steps: i64) {
         let mut id = [0.0f32; 16];
         for k in 0..4 {
             id[k * 5] = 1.0;
         }
-        let mut st = GlDrawState {
+        let st = LibState {
             modelview: id,
             projection: id,
             viewport: [0, 0, WIDTH as i32, WIDTH as i32],
@@ -253,18 +314,11 @@ mod tests {
             depth_mask: true,
             depth_range: [0.0, 1.0],
             draw_buffers: 1,
-            colour_mask: GL_COLOUR_MASK_ALL,
             polygon_offset: GL_OFFSET_FILL,
-            // What the 0x058 write puts in the shared context.
+            // The 0x058 field, in steps of the depth word.
             offset_bias: steps as f32 * polygon::OFFSET_SCALE,
-            offset_factor: factor,
-            offset_units: units,
             ..Default::default()
         };
-        st.drawable.bound = true;
-        st.drawable.front = 1;
-        st.drawable.clip.n = 1;
-        st.drawable.clip.r[0] = ClipRect { x0: 0, y0: 0, x1: WIDTH as i32 - 1, y1: WIDTH as i32 - 1 };
         let mut verts = vec![0.0f32; 3 * vtx::FLOATS];
         let ndc_z = (zw * 2.0 - 1.0) as f32;
 
@@ -275,13 +329,11 @@ mod tests {
             v[vtx::COLOR..vtx::COLOR + 4].copy_from_slice(&[1.0; 4]);
         }
         let stipple = [0u32; 32];
-        let mut d = GlDraw::new(GL_TRIANGLES, 3, &verts, &st, &stipple);
+        let mut d = LibDraw::new(GL_TRIANGLES, 3, &verts, &st, &stipple);
         let mut b = raster_bench::Bench::empty();
 
-        b.rules = rules;
         b.set_depth(WIDTH as i32, depth);
-        let t = b.board.gl_target();
-        b.draw(&t, &NoTexels, &mut d);
+        b.draw(&mut d);
         depth.copy_from_slice(&b.depth(WIDTH as i32));
     }
 
@@ -335,24 +387,18 @@ mod tests {
     }
 
     #[test]
-    fn the_offset_field_is_the_whole_offset_whatever_the_slope_factor_and_units() {
+    fn the_offset_field_is_the_whole_offset_whatever_the_slope() {
         // The library folds factor and 2 units into the one field, and the board
-        // has no slope term, so a context carrying a factor and units, on a
-        // triangle with a depth slope, offsets exactly as the field says.
-        let mut plain = plane(ODSY_DEPTH24_MAX);
-        let mut loaded = plane(ODSY_DEPTH24_MAX);
-
-        draw_sloped(&mut plain, 0.25, 0.5, GL_LESS, 40, (0.0, 0.0));
-        draw_sloped(&mut loaded, 0.25, 0.5, GL_LESS, 40, (1.5, 2000.0));
-        assert_ne!(plain[0], ODSY_DEPTH24_MAX, "the triangle drew");
-        assert!(plain.iter().zip(&loaded).all(|(a, b)| a == b), "factor and units changed the stored depth");
-        // Same word delta from the unoffset draw at two depths.
+        // has no slope term, so a triangle with a depth slope offsets exactly as
+        // the field says: the same word delta from the unoffset draw at two
+        // depths.
         for zw in [0.125, 0.5] {
             let mut off = plane(ODSY_DEPTH24_MAX);
             let mut none = plane(ODSY_DEPTH24_MAX);
 
-            draw_sloped(&mut off, zw, 0.25, GL_LESS, 40, (1.5, 2000.0));
-            draw_sloped(&mut none, zw, 0.25, GL_LESS, 0, (0.0, 0.0));
+            draw_sloped(&mut off, zw, 0.25, GL_LESS, 40);
+            draw_sloped(&mut none, zw, 0.25, GL_LESS, 0);
+            assert_ne!(none[0], ODSY_DEPTH24_MAX, "the triangle drew");
             assert!(off.iter().zip(&none).all(|(a, b)| *b == ODSY_DEPTH24_MAX || *a == *b + 40), "zw {zw}");
         }
     }

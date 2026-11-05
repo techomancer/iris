@@ -1,34 +1,27 @@
-//! A fill-rate benchmark for the rasteriser, and the scenes it draws.
+//! A fill-rate benchmark for the drawing pipeline, and the scenes it draws.
 //!
-//! Each scene drives RasterRules::draw() and RasterRules::raster() the way
-//! Board::gl_draw() does: one primitive per draw, into a v12 board's own
-//! planes (Board::gl_parts()), with the board's raster rules (depth row,
-//! float depth, RGBA stores). No guest is involved, so the numbers are the
-//! rasteriser's and the planes', not the command decoder's or the geometry
-//! program's.
+//! Each scene drives Board::gl_draw() the way the GL context does: one
+//! primitive per draw, into a v12 board's own memory, its state words
+//! encoded from a draw state (pipe/encode.rs) and its textures loaded into
+//! board memory (load_texture()). No guest is involved, so the numbers are
+//! the pipeline's, not the command decoder's or the geometry program's.
 //!
 //! Run it from a release build, one test thread:
 //!
 //!     cargo test --release --lib odyssey::raster_bench -- --ignored --nocapture --test-threads=1
 //!
 //! BENCH_SCENE picks one scene, BENCH_SECS the time each takes (default
-//! one second), BENCH_FILL the row loops (table, dynamic or off; see
-//! raster_set_fill_path()). The tests in raster_fill.rs draw with the same
-//! board and state.
+//! one second).
 
-
+use crate::dev::odyssey::draw::{RasterOp, RASTER_CLEAR};
 use super::board::{Board, ODSY_HEIGHT, ODSY_WIDTH};
-use super::consts::gl_cmd;
-use super::draw::gl_rules;
-use super::gl_context::{
-    vtx, GL_ALWAYS, GL_CLAMP_TO_EDGE, GL_COLOR_BUFFER_BIT, GL_COLOUR_MASK_ALL, GL_DEPTH_BUFFER_BIT,
-    GL_EQUAL, GL_FLAT, GL_INCR, GL_KEEP, GL_LEQUAL, GL_LESS, GL_LINEAR, GL_LINEAR_MIPMAP_LINEAR,
-    GL_LINES, GL_MODULATE, GL_ONE_MINUS_SRC_ALPHA, GL_QUADS, GL_REPEAT, GL_RGB, GL_RGBA, GL_SMOOTH,
-    GL_SRC_ALPHA, GL_TRIANGLES, GlDraw, GlDrawResult, GlDrawState, RASTER_CLEAR, RasterOp,
+use super::consts::{gl_cmd, tex};
+use super::pipe::encode::{
+    vtx, GL_ALWAYS, GL_COLOR_BUFFER_BIT, GL_COLOUR_MASK_ALL, GL_DEPTH_BUFFER_BIT, GL_EQUAL, GL_FLAT, GL_INCR,
+    GL_KEEP, GL_LEQUAL, GL_LESS, GL_LINES, GL_ONE_MINUS_SRC_ALPHA, GL_QUADS, GL_SMOOTH, GL_SRC_ALPHA,
+    GL_TRIANGLES, LibDraw, LibState,
 };
-use super::memory::ClipRect;
-use super::raster::{GlTexImage, GlTexLevel, GlTexPyramid, RasterRules, RasterTarget, Texels};
-use super::raster_fill::{raster_set_fill_path, FillPath};
+use super::clip::ClipRect;
 pub(super) const BENCH_W: i32 = ODSY_WIDTH as i32;
 pub(super) const BENCH_H: i32 = ODSY_HEIGHT as i32;
 
@@ -48,79 +41,111 @@ impl Lcg {
 
 /// Texels that are a hash of their level and position, so a wrong filter or
 /// level shows.
-pub(super) struct HashTexels;
+// Textures. Each level lives in board memory where its descriptor places
+// it, the way the library's uploads leave them.
 
-impl Texels for HashTexels {
-    fn texel(&self, level: Option<&GlTexLevel>, x: u32, y: u32) -> Option<u32> {
-        let l = level.map_or(0, |l| l.level);
-        let h = x.wrapping_mul(0x9e3779b1) ^ y.wrapping_mul(0x85ebca77) ^ l.wrapping_mul(0xc2b2ae35) ^ 0x5bd1e995;
-        Some(h ^ (h >> 13))
-    }
-    fn border_texel(&self, _: Option<&GlTexLevel>, _: i32, _: i32) -> Option<u32> {
-        None
-    }
-    fn texel_3d(&self, _: Option<&GlTexLevel>, _: u32, _: u32, _: u32) -> Option<u32> {
-        None
-    }
-    fn border_texel_3d(&self, _: Option<&GlTexLevel>, _: i32, _: i32, _: i32) -> Option<u32> {
-        None
-    }
-}
-
-/// A square mipmapped texture of side size: its levels and sampler.
-pub(super) struct BenchTexture {
-    pub levels: Vec<GlTexLevel>,
+#[derive(Clone, Copy)]
+pub struct Tex {
+    /// The sampler word's component code: 0x01000000 luminance, 0x01800000
+    /// luminance-alpha, 0x00800000 alpha, 0x02000000 intensity, 0x02800000
+    /// RGB, 0x03000000 RGBA.
+    pub components: u32,
+    pub size: u32,
+    /// 0 nearest, 1 linear, 2 to 5 the mipmapped filters in GL's order.
     pub min: u32,
-    pub mag: u32,
-    pub format: u32,
-    pub wrap_s: u32,
-    pub wrap_t: u32,
+    pub mag_linear: bool,
+    /// 0 repeat, 1 clamp to edge.
+    pub wrap: u32,
+    /// 1 replace, 2 modulate, 3 decal, 4 blend.
+    pub env: u32,
 }
 
-impl BenchTexture {
-    pub fn new(size: u32, min: u32, mag: u32, format: u32) -> BenchTexture {
-        let mut levels = Vec::new();
-        let mut s = size;
-        let mut level = 0;
-        loop {
-            levels.push(GlTexLevel {
-                level,
-                width: s,
-                height: s,
-                depth: 1,
-                base_format: format,
-                internal_format: format,
-                read_texel: true,
-                ..Default::default()
-            });
-            if s == 1 {
-                break;
-            }
-            s /= 2;
-            level += 1;
-        }
-        BenchTexture { levels, min, mag, format, wrap_s: GL_REPEAT, wrap_t: GL_REPEAT }
-    }
+pub const LUMINANCE: u32 = 0x0100_0000;
+pub const LUMINANCE_ALPHA: u32 = 0x0180_0000;
+pub const ALPHA: u32 = 0x0080_0000;
+pub const INTENSITY: u32 = 0x0200_0000;
+pub const RGB: u32 = 0x0280_0000;
+pub const RGBA: u32 = 0x0300_0000;
 
-    pub fn image(&self) -> GlTexImage<'_> {
-        GlTexImage {
-            width: self.levels[0].width,
-            height: self.levels[0].height,
-            base_format: self.format,
-            min_filter: self.min,
-            mag_filter: self.mag,
-            wrap_s: self.wrap_s,
-            wrap_t: self.wrap_t,
-            read_texel: true,
-            pyramid: Some(GlTexPyramid {
-                levels: &self.levels,
-                base_level: 0,
-                max_level: 1000,
-                min_lod: -1000.0,
-                max_lod: 1000.0,
-            }),
-            ..Default::default()
+impl Tex {
+    pub fn new(components: u32) -> Tex {
+        Tex { components, size: 16, min: 0, mag_linear: false, wrap: 0, env: 2 }
+    }
+}
+
+/// Texel (x, y) of a level: a gradient and a check, tinted by level so a
+/// wrong level shows.
+pub fn texel(level: u32, x: u32, y: u32, w: u32, h: u32) -> u32 {
+    let r = x * 255 / w.max(2).saturating_sub(1).max(1);
+    let g = y * 255 / h.max(2).saturating_sub(1).max(1);
+    let b = if (x / 2 + y / 2) & 1 == 0 { 230 } else { 40 };
+    let a = 255 - ((x + y) * 200 / (w + h)).min(200);
+    let tint = [0, 60, 120, 30, 90, 150, 20, 70][level as usize & 7];
+    ((r.min(255) ^ tint) << 24) | (g.min(255) << 16) | (b << 8) | a
+}
+
+/// Level descriptor word 1's size code and format index for a sampler
+/// component code: alpha 8 (index 0), luminance 8 (4), luminance-alpha 8/8
+/// (11), intensity 8 (2), and 8/8/8/8 (17) for RGB and RGBA, which the class
+/// alone tells apart.
+/// Store a texel where level descriptor words (word0, word1) place it.
+pub fn put_texel(b: &Board, word0: u32, word1: u32, x: u32, y: u32, texel: u32) {
+    use super::view::{Rows, View, MAX_DIM};
+    let (surface, field) = super::field::level_surface(word0, word1).expect("a level the library emits");
+    Rows::new(b.vram_ptr(), View::colour(&surface, field, MAX_DIM)).store_word(x as i32, y as i32, texel);
+}
+
+pub fn texel_format_word(components: u32) -> u32 {
+    match components {
+        ALPHA => 0x0000_0000,
+        LUMINANCE => 0x0040_0000,
+        LUMINANCE_ALPHA => 0x00b0_0000,
+        INTENSITY => 0x0020_0000,
+        _ => 0x4110_0000,
+    }
+}
+
+/// Load texture t into the board's memory and its texture words, as the
+/// library's uploads and texture activation leave them.
+pub fn load_texture(b: &mut Board, st: &mut LibState, t: &Tex) {
+    {
+        let levels = if t.min >= 2 { t.size.trailing_zeros() + 1 } else { 1 };
+        let (ws, wt) = (t.wrap, t.wrap);
+
+        let mut base = 0x10_0000;
+        for level in 0..levels {
+            let w = (t.size >> level).max(1);
+            let units = (w.div_ceil(16) + 1) & !1;
+            let word1 = texel_format_word(t.components) | units;
+            for y in 0..w {
+                for x in 0..w {
+                    put_texel(b, base, word1, x, y, texel(level, x, y, w, w));
+                }
+            }
+            b.tex_mut().levels[level as usize * 3..][..3].copy_from_slice(&[base, word1, 0]);
+            // The next level after this one's rows of tiles (16-byte units).
+            base += units * 256 * 8 * w.div_ceil(16) / 16;
         }
+        let axis = |w: u32, wrap: u32| w | if wrap == 1 { 0x4_0000 } else { 0 };
+        let filter = (t.min << 5) | if t.mag_linear { 2 } else { 0 };
+        b.tex_mut().path = tex::MODE_2D;
+        b.tex_mut().level0 = 0;
+        b.tex_mut().sampler = [
+            0x0800_0000 | (t.size.trailing_zeros() << 10) | (t.size.trailing_zeros() << 5),
+            axis(t.size, ws),
+            axis(t.size, wt),
+            1,
+            0x1000_0000 | t.components | (ws << 12) | (wt << 10) | filter,
+            0,
+            0,
+        ];
+        b.tex_mut().env = [t.env, 0, 0, 0, 0];
+        if t.env == 4 {
+            // The environment colour: two normalized 12-bit components a word.
+            b.tex_mut().env[1] = 0xc00 << 12 | 0x400;
+            b.tex_mut().env[2] = 0x200 << 12 | 0xfff;
+        }
+        st.texture_2d = true;
     }
 }
 
@@ -204,9 +229,8 @@ pub(super) const ALL_SCENES: [Scene; 20] = [
 /// primitives and the pixels they stand for.
 pub(super) struct Bench {
     pub board: Box<Board>,
-    pub st: GlDrawState,
-    pub rules: RasterRules,
-    pub tex: Option<BenchTexture>,
+    pub st: LibState,
+    pub tex: Option<Tex>,
     /// Each primitive's vertices, vtx::FLOATS apiece.
     pub prims: Vec<Vec<f32>>,
     pub mode: u32,
@@ -232,7 +256,7 @@ fn ndc(x: f32, size: i32) -> f32 {
 /// A triangle of about side 2 * size pixels around a random centre, with
 /// random colours and depths, its texture coordinates texscale a pixel; and
 /// its area in pixels.
-fn triangle(rng: &mut Lcg, size: f32, texscale: f32) -> (Vec<f32>, f64) {
+pub(super) fn triangle(rng: &mut Lcg, size: f32, texscale: f32) -> (Vec<f32>, f64) {
     let cx = rng.range(0.0, BENCH_W as f32);
     let cy = rng.range(0.0, BENCH_H as f32);
     let mut v = vec![0.0f32; 3 * vtx::FLOATS];
@@ -259,20 +283,20 @@ impl Bench {
     /// The board and draw state every scene starts from, with no primitives.
     pub fn empty() -> Bench {
         let mut board = Board::new("v12", 11).expect("board");
+        board.test_screen();
 
         // Every pixel of the screen is the window's.
         board.win.clip_kept = 1;
         board.win.clip_rect[0] = ClipRect { x0: 0, y0: 0, x1: BENCH_W - 1, y1: BENCH_H - 1 };
-        let mut rules = gl_rules();
-        rules.alpha_bits = 8;
-        rules.depth_row_given = true;
         // Depth (z + w) / 2 over w: the identity projection's [-1, 1] mapped
-        // to [0, 1], as Board::gl_operation_rules() derives it from a
-        // combined matrix.
-        rules.depth_row = [0.0, 0.0, 0.5, 0.5];
-        rules.depth_slack = gl_cmd::DEPTH_SLACK;
+        // to [0, 1], in the combined matrix's words as Board::gl_depth_row()
+        // unscales them.
+        let scale = 2.0 * gl_cmd::DEPTH_S * board.gl_depth_scale();
+        for (k, r) in [0.0f64, 0.0, 0.5, 0.5].into_iter().enumerate() {
+            board.gl_combined[8 + k] = ((r * scale) as f32).to_bits();
+        }
 
-        let mut st = GlDrawState {
+        let st = LibState {
             modelview: identity(),
             projection: identity(),
             viewport: [0, 0, BENCH_W, BENCH_H],
@@ -281,19 +305,11 @@ impl Bench {
             depth_mask: true,
             depth_range: [0.0, 1.0],
             draw_buffers: 1,
-            colour_mask: GL_COLOUR_MASK_ALL,
-            texture_env_mode: GL_MODULATE,
             ..Default::default()
         };
-        st.drawable.bound = true;
-        st.drawable.front = 0;
-        st.drawable.back = 0;
-        st.drawable.clip.n = 1;
-        st.drawable.clip.r[0] = ClipRect { x0: 0, y0: 0, x1: BENCH_W - 1, y1: BENCH_H - 1 };
         Bench {
             board,
             st,
-            rules,
             tex: None,
             prims: Vec::new(),
             mode: GL_TRIANGLES,
@@ -330,24 +346,16 @@ impl Bench {
                 tris(&mut b.prims, &mut b.pixels, if scene == Scene::MidSmooth { 110.0 } else { 40.0 }, 0.0);
             }
             Scene::TexBilinearDepth | Scene::TexTrilinearDepth | Scene::TexFogBlend => {
-                let (min, mag) = if scene == Scene::TexBilinearDepth {
-                    (GL_LINEAR, GL_LINEAR)
-                } else {
-                    (GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR)
-                };
+                let min = if scene == Scene::TexBilinearDepth { 1 } else { 5 };
                 st.depth_test = true;
                 st.texture_2d = true;
                 if scene == Scene::TexFogBlend {
                     st.fog = true;
-                    st.fog_mode = GL_LINEAR;
-                    st.fog_start = 0.0;
-                    st.fog_end = 2.0;
-                    st.fog_color = [0.5, 0.5, 0.6, 1.0];
                     st.blend = true;
                     st.blend_src = GL_SRC_ALPHA;
                     st.blend_dst = GL_ONE_MINUS_SRC_ALPHA;
                 }
-                b.tex = Some(BenchTexture::new(256, min, mag, GL_RGBA));
+                b.tex = Some(Tex { size: 256, min, mag_linear: true, ..Tex::new(RGBA) });
                 // Minified by about 1.5: a trilinear draw mixes two levels.
                 tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
             }
@@ -355,12 +363,9 @@ impl Bench {
                 st.depth_test = true;
                 st.texture_2d = true;
                 if scene == Scene::TexPerspective {
-                    b.tex = Some(BenchTexture::new(256, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_RGBA));
+                    b.tex = Some(Tex { size: 256, min: 5, mag_linear: true, ..Tex::new(RGBA) });
                 } else {
-                    let mut tex = BenchTexture::new(256, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_RGB);
-
-                    tex.wrap_s = GL_CLAMP_TO_EDGE;
-                    b.tex = Some(tex);
+                    b.tex = Some(Tex { size: 256, min: 5, mag_linear: true, wrap: 1, ..Tex::new(RGB) });
                     st.depth_func = GL_LEQUAL;
                     st.shade_model = GL_FLAT;
                 }
@@ -396,13 +401,12 @@ impl Bench {
                 st.stencil_value_mask = u32::MAX;
                 st.stencil_write_mask = u32::MAX;
                 st.stencil_op = [GL_KEEP; 3];
-                b.tex = Some(BenchTexture::new(256, GL_LINEAR, GL_LINEAR, GL_RGB));
+                b.tex = Some(Tex { size: 256, min: 1, mag_linear: true, ..Tex::new(RGB) });
                 tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
             }
             Scene::StencilMark => {
                 st.depth_test = true;
                 st.depth_mask = false;
-                st.colour_mask = 0;
                 st.stencil_test = true;
                 st.stencil_func = GL_ALWAYS;
                 st.stencil_value_mask = u32::MAX;
@@ -418,7 +422,7 @@ impl Bench {
                 st.blend = true;
                 st.blend_src = GL_SRC_ALPHA;
                 st.blend_dst = GL_ONE_MINUS_SRC_ALPHA;
-                b.tex = Some(BenchTexture::new(256, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_RGBA));
+                b.tex = Some(Tex { size: 256, min: 5, mag_linear: true, ..Tex::new(RGBA) });
                 tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
             }
             Scene::PolySmooth => {
@@ -437,14 +441,14 @@ impl Bench {
                 st.blend_dst = GL_ONE_MINUS_SRC_ALPHA;
                 // The bilinear texture has no alpha, so the blend weighs the
                 // vertices' own.
-                b.tex = Some(BenchTexture::new(256, GL_LINEAR, GL_LINEAR, GL_RGB));
+                b.tex = Some(Tex { size: 256, min: 1, mag_linear: true, ..Tex::new(RGB) });
                 tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
             }
             Scene::TexQuads => {
                 st.depth_test = true;
                 st.texture_2d = true;
                 b.mode = GL_QUADS;
-                b.tex = Some(BenchTexture::new(256, GL_LINEAR, GL_LINEAR, GL_RGB));
+                b.tex = Some(Tex { size: 256, min: 1, mag_linear: true, ..Tex::new(RGB) });
                 for _ in 0..count {
                     // A triangle's three corners and the fourth that makes
                     // a parallelogram of them.
@@ -461,7 +465,7 @@ impl Bench {
                 b.mode = GL_QUADS;
                 if scene == Scene::BigTexTrilinear {
                     st.texture_2d = true;
-                    b.tex = Some(BenchTexture::new(256, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_RGBA));
+                    b.tex = Some(Tex { size: 256, min: 5, mag_linear: true, ..Tex::new(RGBA) });
                 }
                 for i in 0..count {
                     let mut v = vec![0.0f32; 4 * vtx::FLOATS];
@@ -505,10 +509,13 @@ impl Bench {
                 b.pixels = (BENCH_W * BENCH_H) as f64 * count as f64;
             }
         }
+        if let Some(t) = b.tex {
+            load_texture(&mut b.board, &mut b.st, &t);
+        }
         b
     }
 
-    fn clear_op(buffers: u32) -> RasterOp {
+    pub(super) fn clear_op(buffers: u32) -> RasterOp {
         let mut op = RasterOp {
             kind: RASTER_CLEAR,
             ntargets: 1,
@@ -530,35 +537,30 @@ impl Bench {
     /// Reset the depth plane to its farthest, so that each pass of a
     /// depth-tested scene draws the same fragments; outside the timing.
     pub fn prepare(&mut self) {
-        let t = self.board.gl_target();
-
-        self.rules.raster(&t, &mut self.board.gl_parts(None).0, &Bench::clear_op(GL_DEPTH_BUFFER_BIT));
+        self.board.gl_raster(&Bench::clear_op(GL_DEPTH_BUFFER_BIT));
     }
 
     /// Draw the scene once.
     pub fn run(&mut self) {
-        let mut t = self.board.gl_target();
         let stipple = [0u32; 32];
 
-        t.texture = self.tex.as_ref().map(|tex| tex.image());
         for _ in 0..self.clears {
-            let op = Bench::clear_op(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-            self.rules.raster(&t, &mut self.board.gl_parts(None).0, &op);
+            self.board.gl_raster(&Bench::clear_op(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
         }
         let floats = vtx::FLOATS as u32;
         for v in self.prims.iter() {
-            let mut d = GlDraw::new(self.mode, v.len() as u32 / floats, v, &self.st, &stipple);
+            let mut d = LibDraw::new(self.mode, v.len() as u32 / floats, v, &self.st, &stipple);
 
             d.polygon_smooth = self.polygon_smooth;
-            self.rules.draw(&t, &mut self.board.gl_parts(None).0, &HashTexels, &mut d);
+            self.board.lib_draw(&mut d);
         }
+        self.board.raster_wait();
     }
 
-    /// Draw d on the board under the bench's rules, as Board::gl_draw()
-    /// would, reading texels from texels.
-    pub fn draw(&mut self, t: &RasterTarget, texels: &dyn Texels, d: &mut GlDraw) -> GlDrawResult {
-        self.rules.draw(t, &mut self.board.gl_parts(None).0, texels, d)
+    /// Draw d on the board as the library would (Board::lib_draw()).
+    pub fn draw(&mut self, d: &mut LibDraw) {
+        self.board.lib_draw(d);
+        self.board.raster_wait();
     }
 
     /// The depth plane's words in the square from (0, 0) to side - 1, row
@@ -570,12 +572,11 @@ impl Bench {
     /// Set the depth plane's words in the square from (0, 0) to side - 1
     /// from words, row by row.
     pub fn set_depth(&mut self, side: i32, words: &[u32]) {
-        let b = &mut self.board;
-        let depth = b.planes.depth.plane(b.planes.depth_plane).expect("the depth plane");
+        let depth = self.board.dest_mem().depth;
 
         for y in 0..side {
             for x in 0..side {
-                b.planes.depth.plane_store(&depth, x, y, words[(y * side + x) as usize]);
+                depth.store_word(x, y, words[(y * side + x) as usize]);
             }
         }
     }
@@ -583,18 +584,16 @@ impl Bench {
     /// The colour, depth and stencil planes in the square from (0, 0) to
     /// side - 1.
     pub fn snapshot(&self, side: i32) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-        let b = &self.board;
-        let depth = b.planes.depth.plane(b.planes.depth_plane).expect("the depth plane");
-        let stencil = b.planes.stencil.plane(b.planes.stencil_plane).expect("the stencil plane");
+        let m = self.board.dest_mem();
         let mut c = Vec::new();
         let mut z = Vec::new();
         let mut s = Vec::new();
 
         for y in 0..side {
             for x in 0..side {
-                c.push(b.buffer_load(0, x as i64, y as i64));
-                z.push(b.planes.depth.plane_load(&depth, x, y));
-                s.push(b.planes.stencil.plane_load(&stencil, x, y));
+                c.push(m.colour[0].load_word(x, y).unwrap_or(0));
+                z.push(m.depth.load_word(x, y).unwrap_or(0));
+                s.push(m.stencil.load1(x, y).unwrap_or(0) as u32);
             }
         }
         (c, z, s)
@@ -617,13 +616,6 @@ pub(super) fn bench_count(scene: Scene) -> usize {
 fn raster_bench() {
     let only = std::env::var("BENCH_SCENE").ok();
     let secs: f64 = std::env::var("BENCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-    let fill = match std::env::var("BENCH_FILL").as_deref() {
-        Ok("dynamic") => FillPath::Dynamic,
-        Ok("off") => FillPath::Off,
-        _ => FillPath::Table,
-    };
-
-    raster_set_fill_path(fill);
     for scene in ALL_SCENES {
         if let Some(o) = &only {
             if !format!("{scene:?}").eq_ignore_ascii_case(o) {
@@ -655,5 +647,4 @@ fn raster_bench() {
             runs
         );
     }
-    raster_set_fill_path(FillPath::Table);
 }

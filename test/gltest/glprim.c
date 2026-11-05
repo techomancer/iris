@@ -52,6 +52,7 @@ static int cull = 0;                  /* --cull front|back|both */
 static int front_cw = 0;              /* --cw */
 static GLenum polymode = GL_FILL;     /* --polymode point|line|fill */
 static float line_w = 1.0f, point_sz = 1.0f;
+static int line_smooth = 0, point_smooth = 0;  /* --linesmooth, --pointsmooth */
 static int dither = 1;                /* --nodither */
 static int no_clear = 0;              /* --noclear */
 static int hold_ms = 2000;            /* --hold MS */
@@ -877,6 +878,8 @@ static void usage(void) {
            "  --polymode point|line|fill   glPolygonMode(GL_FRONT_AND_BACK)\n"
            "  --linewidth W        glLineWidth\n"
            "  --pointsize S        glPointSize\n"
+           "  --linesmooth         glEnable(GL_LINE_SMOOTH) (blend with --blendfunc)\n"
+           "  --pointsmooth        glEnable(GL_POINT_SMOOTH) (blend with --blendfunc)\n"
            "  --nodither           glDisable(GL_DITHER)\n"
            "  --stipple test|half  polygon stipple: test = row 0 solid, other rows\n"
            "                       only the leftmost pixel of each 32; half = checker\n"
@@ -1052,6 +1055,8 @@ static void parse_args(int argc, char **argv) {
             else { fprintf(stderr, "bad --polymode\n"); exit(2); }
         } else if (!strcmp(a, "--linewidth")) { NEED(); line_w = (float)atof(next); }
         else if (!strcmp(a, "--pointsize")) { NEED(); point_sz = (float)atof(next); }
+        else if (!strcmp(a, "--linesmooth")) line_smooth = 1;
+        else if (!strcmp(a, "--pointsmooth")) point_smooth = 1;
         else if (!strcmp(a, "--nodither")) dither = 0;
         else if (!strcmp(a, "--stipple")) {
             NEED();
@@ -1802,6 +1807,8 @@ int main(int argc, char **argv) {
     } else glDisable(GL_POLYGON_STIPPLE);
     glLineWidth(line_w);
     glPointSize(point_sz);
+    if (line_smooth) glEnable(GL_LINE_SMOOTH);
+    if (point_smooth) glEnable(GL_POINT_SMOOTH);
 
     if (dbl) glDrawBuffer(GL_BACK); else glDrawBuffer(GL_FRONT);
 

@@ -2,13 +2,15 @@
 //!
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code in jamesbraid/qemu-sgi-origami.
 
-
-use super::bits::{be16, be32, be64};
+use super::field::Field;
+use super::view::{Kind, Rows, View, MAX_DIM};
+use super::vram::{Format, Surface, ADDR_MASK, PITCH_MASK};
+use super::bits::{be32, be64};
 use crate::devlog::LogModule;
 use std::sync::atomic::Ordering;
-use super::board::{Board, ODSY_CMD_OPERANDS_MAX, ODSY_HEIGHT, ODSY_OBJECTS, ODSY_WIDTH};
+use super::board::{Board, ODSY_CMD_OPERANDS_MAX};
 use super::consts::{
-    clip, cmd_arity, dest, dma, gl_cmd, image, mode, query, route, tex, write, ODSY_BUFFERS,
+    clip, cmd_arity, dma, gl_cmd, image, mode, query, route, tex, write,
     ODSY_DEPTH24_MAX, ODSY_DRAW_WORD_STATE, ODSY_F32_ONE, ODSY_F32_SCALE_16, ODSY_F32_SCALE_32,
     ODSY_F32_SCALE_8, ODSY_GAMMA_GROUP,
 };
@@ -19,8 +21,6 @@ use super::draw::{code_is_index, decode_texel12, pixel_bytes, texel12_components
 use super::geometry::{f32_bits, odyssey_f32};
 use super::pixel_dma::{write_guest, DmaBus, DmaDirection, DmaError, DmaMap, DmaPageList};
 use super::pixel_write::{write_form, WriteForm};
-use super::sampler::{texture_level_texel_format, texture_mip_build_word, LEVEL_FORMAT_MASK};
-use super::scanout::DirtySite;
 #[derive(Clone, Copy, Default)]
 pub(super) struct DmaEntry {
     pub addr: u64,
@@ -66,8 +66,13 @@ pub(super) enum ReadPlane {
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct DmaSource {
-    /// The board-memory object read, or None for the colour buffer.
-    pub obj: Option<usize>,
+    /// The header's A and B fields of its surface (Board::dma_fields()), and
+    /// its depth and stencil, read through the A field's place.
+    pub fields: [Rows; 2],
+    pub depth: Rows,
+    pub stencil: Rows,
+    /// Word 0 names the read drawable, not an address.
+    pub drawable: bool,
     pub front: bool,
     pub x: i64,
     pub y: i64,
@@ -148,17 +153,45 @@ impl Board {
     /// One pixel of a transfer at (x, y) of the colour buffers the drawing
     /// mask selects, decoded by the header's source format as an image
     /// transfer's pixel is. Clipped to the plane only.
-    pub fn dma_put(&mut self, x: i64, y: i64, src: &[u8], code: u32) {
+    /// One pixel of a DMA to an address: stored with no window clip or id
+    /// test (the X server's screen DMA puts land outside the clip rectangles
+    /// in force, traced: the icon catalog's tab strip). The drawable-relative
+    /// form (dma_draw_sentinel_short()) is window-tested.
+    pub fn dma_put(&mut self, to: &Rows, x: i64, y: i64, src: &[u8], code: u32) {
         let pixel = self.decode_pixel(code, src).unwrap_or(0);
-        if x < 0 || y < 0 || x >= ODSY_WIDTH as i64 || y >= ODSY_HEIGHT as i64 {
-            return;
-        }
-        for b in 0..ODSY_BUFFERS {
-            if self.draw_buffers() & (1u32 << b) != 0 {
-                let word = if code_is_index(code) { pixel } else { (pixel & !0xffu32) | 0xff };
-                self.buffer_store(b, x, y, word);
-            }
-        }
+        let word = if code_is_index(code) { pixel } else { (pixel & !0xffu32) | 0xff };
+        to.store_word(x as i32, y as i32, word);
+    }
+
+    /// The A and B fields of the surface a DMA header names: word 0's
+    /// address (with the drawable bit, the read or draw register's), word
+    /// 2's stride in tiles, word 4's pixel size (19:16), field size (15:13)
+    /// and field offsets (23:20 A, 27:24 B, in 2-byte units), the field's
+    /// code and class (7:0) for its packing.
+    pub fn dma_fields(&self, hdr: &[u32], read: bool) -> ([Rows; 2], bool) {
+        self.raster_wait();
+        let base = hdr[dma::HDR_DEST];
+        let fmt = hdr[dma::HDR_FORMAT];
+        let drawable = base & dma::SENTINEL != 0;
+        let addr = if drawable { if read { self.read_word } else { self.draw_word } } else { base } & ADDR_MASK;
+        let surface = Surface::new(addr, hdr[dma::HDR_WIDTH] & PITCH_MASK, ((fmt >> 16) & 0xf) as u8 + 1);
+        let bytes = 2u8 << ((fmt >> 13) & 7);
+        // The field's packing: the pixel mode's when the transfer goes to the
+        // surface it selects (the library selects a level before it uploads
+        // to it), else what word 4's code and class name.
+        let mode = Format::decode(self.pixel_mode[2]);
+        let layout = super::field::Layout::of(mode);
+        let selected = !drawable && addr == self.pixel_mode[0] & ADDR_MASK;
+        let codec = |at: u8| match [layout.front, layout.back].into_iter().find(|f| selected && f.at == at) {
+            Some(f) => f.codec,
+            None => super::copy::source_codec(bytes, fmt & 0xff),
+        };
+        let mem = self.vram_ptr();
+        let field = |at: u32| {
+            let at = 2 * at as u8;
+            Rows::new(mem, View::colour(&surface, Field { at, codec: codec(at) }, MAX_DIM))
+        };
+        ([field((fmt >> 20) & 0xf), field((fmt >> 24) & 0xf)], drawable)
     }
 
     /// The source format of a DMA: word 7's low byte, the same code as an image
@@ -186,53 +219,9 @@ pub(super) fn dma_raw(hdr: &[u32], bpp: u32) -> bool {
         && ((fmt == dma::FMT_RAW16 && bpp == 2) || (fmt == dma::FMT_RAW32 && bpp == 4))
 }
 
-impl Board {
-    /// True, reported once, when hdr is an 8-byte backing-store page.
-    pub fn dma_raw64(&mut self, hdr: &[u32], bpp: u32) -> bool {
-        if hdr[dma::HDR_FORMAT] != dma::FMT_RAW64
-            || bpp != 8
-            || (hdr[dma::HDR_CONTROL] & image::CODE_MASK) != 0
-        {
-            return false;
-        }
-        if self.dma_report(dma::REPORT_RAW64) {
-            crate::dlog!(
-                LogModule::Odyssey,
-                "sgi-odyssey: an 8-byte backing-store page of object {:#x} is not modeled",
-                hdr[dma::HDR_DEST]
-            );
-        }
-        true
-    }
-}
-
-pub(super) fn raw_nibble(byte: u32) -> u32 {
-    (byte * 15 + 127) / 255
-}
-
-/// A stored texel as a backing-store page's bpp raw bytes.
-pub(super) fn raw_pack(rgba: u32, bpp: u32, dst: &mut [u8]) {
-    if bpp == 4 {
-        dst[..4].copy_from_slice(&rgba.to_be_bytes());
-        return;
-    }
-    let word = raw_nibble(rgba >> 24) << 12
-        | raw_nibble((rgba >> 16) & 0xff) << 8
-        | raw_nibble((rgba >> 8) & 0xff) << 4
-        | raw_nibble(rgba & 0xff);
-    dst[..2].copy_from_slice(&(word as u16).to_be_bytes());
-}
-
-/// A backing-store page's bpp raw bytes back as a stored texel.
-pub(super) fn raw_unpack(src: &[u8], bpp: u32) -> u32 {
-    if bpp == 4 {
-        return be32(&src[..4]);
-    }
-    let v = be16(&src[..2]) as u32;
-    (((v >> 12) & 0xf) * 0x11u32) << 24
-        | (((v >> 8) & 0xf) * 0x11u32) << 16
-        | (((v >> 4) & 0xf) * 0x11u32) << 8
-        | ((v & 0xf) * 0x11u32)
+/// True when hdr is an 8-byte backing-store page.
+pub(super) fn dma_raw64(hdr: &[u32], bpp: u32) -> bool {
+    hdr[dma::HDR_FORMAT] == dma::FMT_RAW64 && bpp == 8 && (hdr[dma::HDR_CONTROL] & image::CODE_MASK) == 0
 }
 
 impl Board {
@@ -242,7 +231,18 @@ impl Board {
     /// takes rowbytes bytes, moving to the next entry whenever the current one's
     /// count runs out, then the cursor steps over skip uncounted bytes. No byte
     /// outside the entries is read.
-    pub fn dma_to_buffer(&mut self, bus: &DmaBus, table: u64, seq: u64, hdr: &[u32], obj: Option<usize>) {
+    pub fn dma_to_buffer(&mut self, bus: &DmaBus, table: u64, seq: u64, hdr: &[u32]) {
+        let ([a, b], drawable) = self.dma_fields(hdr, false);
+        // Word 4 bit 31: the front (A) field, else the back (B).
+        let to = if hdr[dma::HDR_FORMAT] & dma::FMT_FRONT != 0 { a } else { b };
+        // Memory, not the screen: a scratch surface the pixel mode selects,
+        // or any address but the frame buffer the scan-out shows. Its texels
+        // keep the source's alpha and pass no window tests. The library
+        // uploads a texture or a zoomed image's scratch while the window is
+        // still the pixel mode (traced), so the select alone does not say.
+        let screen = self.pbj(super::frame::pbj::PIXEL_BASE);
+        let memory = Format::decode(self.pixel_mode[2]).scratch || (!drawable && hdr[dma::HDR_DEST] & ADDR_MASK != screen);
+        let obj = memory.then_some(());
         let mut e = [DmaEntry::default(); dma::MAX_PAGES];
         let x = hdr[dma::HDR_ORIGIN] & 0xffff;
         let y = hdr[dma::HDR_ORIGIN] >> 16;
@@ -252,17 +252,15 @@ impl Board {
         let rowbytes = hdr[dma::HDR_ROWBYTES] & dma::ROWBYTES_MASK;
         let bpp = DMA_BPP[((hdr[dma::HDR_CONTROL] >> dma::BPP_SHIFT) & dma::BPP_MASK) as usize] as u32;
         let comps = texel12_components(hdr[dma::HDR_CONTROL] & image::CODE_MASK);
-        // A 12-bit texture source into an object: a byte or two a component.
+        // A 12-bit texture source into a scratch surface: a byte or two a component.
         let texel12 = obj.is_some() && comps != 0 && (bpp == comps || bpp == 2 * comps);
-        // An 8-bit luminance-alpha source into an object, two bytes a pixel.
+        // An 8-bit luminance-alpha source into a scratch surface, two bytes a pixel.
         let lum_alpha = obj.is_some() && bpp == 2 && (hdr[dma::HDR_CONTROL] & image::CODE_MASK) == image::CODE_LUM_ALPHA;
         let raw = obj.is_some() && dma_raw(hdr, bpp);
         let mut payload: u64 = 0;
         let mut pos: u64 = 0;
 
-        if obj.is_some() && self.dma_raw64(hdr, bpp) {
-            return;
-        }
+        let raw = raw || (obj.is_some() && dma_raw64(hdr, bpp));
         if bpp != 4 && bpp != 3 && bpp != 1 && !texel12 && !lum_alpha && !raw {
             if !self.diag.dma_bpp_reported {
                 self.diag.dma_bpp_reported = true;
@@ -293,7 +291,6 @@ impl Board {
             return;
         }
         let mut row = vec![0u8; rowbytes as usize];
-        let mut staged = Vec::new();
         let mut i: usize = 0;
         let mut left: u32 = if n > 0 { e[0].len } else { 0 };
         'done: {
@@ -325,30 +322,26 @@ impl Board {
                 }
                 for c in 0..w {
                     let px = &row[(c * bpp) as usize..];
-                    // An object's texels land on the raster unit, in order
-                    // behind the draws that may still read the old ones.
-                    let (ox, oy) = (x.wrapping_add(c), y.wrapping_add(r));
-                    if let (true, Some(obj)) = (raw, obj) {
-                        self.object_stage(&mut staged, obj, ox, oy, raw_unpack(px, bpp));
+                    let (ox, oy) = (x.wrapping_add(c) as i32, y.wrapping_add(r) as i32);
+                    if raw {
+                        // The kernel's page-in: the stored bytes as they were.
+                        let mut b = [0u8; 8];
+                        let n = (bpp as usize).min(8);
+                        b[..n].copy_from_slice(&px[..n]);
+                        to.store_raw(ox, oy, &b);
                         continue;
                     }
-                    if let (true, Some(obj)) = (texel12, obj) {
-                        self.object_stage(&mut staged, obj, ox, oy, decode_texel12(code, px, bpp != comps));
+                    if let (true, Some(())) = (texel12, obj) {
+                        to.store_word(ox, oy, decode_texel12(code, px, bpp != comps));
                         continue;
                     }
-                    if let Some(obj) = obj {
-                        let pixel = self.decode_pixel(code, px).unwrap_or(0);
-                        self.object_stage(&mut staged, obj, ox, oy, pixel);
+                    if obj.is_some() {
+                        to.store_word(ox, oy, self.decode_pixel(code, px).unwrap_or(0));
                         continue;
                     }
-                    self.dma_put((x as i64) + (c as i64), (y as i64) + (r as i64), px, code);
+                    self.dma_put(&to, ox as i64, oy as i64, px, code);
                 }
             }
-        }
-        self.object_flush(&mut staged);
-        // An object is board memory the raster unit samples, not a line the display scans.
-        if obj.is_none() {
-            self.scanout.invalidate_rows_for(DirtySite::Dma, y, h);
         }
     }
 }
@@ -430,29 +423,23 @@ pub(super) fn dma_draw_sentinel_form(hdr: &[u32], top_down: &mut bool) -> Option
 }
 
 impl Board {
+#[cfg(test)]
     /// The depth plane's word at plane pixel (x, y), which is in the plane.
+    /// The destination's depth and stencil fields (Board::dest_mem()).
     pub fn depth_load(&mut self, x: i64, y: i64) -> u32 {
-        self.raster_wait();
-        let p = self.planes.depth.plane(self.planes.depth_plane).expect("the depth plane");
-        self.planes.depth.plane_load(&p, x as i32, y as i32)
+        self.dest_mem().depth.load_word(x as i32, y as i32).unwrap_or(0)
     }
 
     pub fn depth_store(&mut self, x: i64, y: i64, word: u32) {
-        self.raster_wait();
-        let p = self.planes.depth.plane(self.planes.depth_plane).expect("the depth plane");
-        self.planes.depth.plane_store(&p, x as i32, y as i32, word);
+        self.dest_mem().depth.store_word(x as i32, y as i32, word);
     }
 
     pub fn stencil_load(&mut self, x: i64, y: i64) -> u32 {
-        self.raster_wait();
-        let p = self.planes.stencil.plane(self.planes.stencil_plane).expect("the stencil plane");
-        self.planes.stencil.plane_load(&p, x as i32, y as i32)
+        self.dest_mem().stencil.load1(x as i32, y as i32).unwrap_or(0) as u32
     }
 
     pub fn stencil_store(&mut self, x: i64, y: i64, value: u8) {
-        self.raster_wait();
-        let p = self.planes.stencil.plane(self.planes.stencil_plane).expect("the stencil plane");
-        self.planes.stencil.plane_store(&p, x as i32, y as i32, value as u32);
+        self.dest_mem().stencil.store1(x as i32, y as i32, value);
     }
 
     /// Stage the pixel bytes first so a failed source read cannot leave a
@@ -810,73 +797,60 @@ impl Board {
         None
     }
 
-    /// Resolve word 0 to the read's source. False, reported once, when it names
-    /// nothing the model can read. A sentinel never creates or names a
-    /// board-memory object.
+    /// Resolve word 0 to the read's source: the header's fields of its
+    /// surface (Board::dma_fields()). False, reported once, for a drawable
+    /// read the model does not know.
     pub fn dma_read_source(&mut self, hdr: &[u32], src: &mut DmaSource) -> bool {
         let base = hdr[dma::HDR_DEST];
         let fmt = hdr[dma::HDR_FORMAT];
         let selector = (fmt >> dma::FMT_SELECTOR_SHIFT) & dma::FMT_SELECTOR_MASK;
 
-        src.obj = None;
-        // Front and back per pixel (Board::dma_read_pixel()).
-        src.front = true;
-        src.x = (hdr[dma::HDR_ORIGIN] & 0xffff) as i64;
-        src.y = (hdr[dma::HDR_ORIGIN] >> 16) as i64;
-
-        if base & dma::SENTINEL != 0 {
-            if base == dma::SENTINEL_DRAW && selector == dma::FMT_SELECTOR_DRAW {
-                if self.dma_report(dma::REPORT_DRAW_SENTINEL) {
-                    crate::dlog!(
-                        LogModule::Odyssey,
-                        "sgi-odyssey: DMA read of the draw drawable ({:#x}); never captured, read as the read drawable is",
-                        base
-                    );
-                }
-            } else if base != dma::SENTINEL_READ || selector != dma::FMT_SELECTOR_READ {
-                if self.dma_report(dma::REPORT_SENTINEL) {
-                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read of sentinel {:#x} with word 4 {:#x} is not modeled", base, fmt);
-                }
-                return false;
-            }
-            // INFERRED: both sentinels are the current window, whose origin the
-            // model tracks; it keeps no separate read and draw drawable.
-            src.x += self.win.origin[0] as i64;
-            src.y += self.win.origin[1] as i64;
-            src.front = fmt & dma::FMT_FRONT != 0;
-            return true;
-        }
-        if base != 0 && base == self.dma_colour_base {
-            return true;
-        }
-        src.obj = self.object_find(base);
-        if src.obj.is_none() {
-            if self.dma_report(dma::REPORT_SOURCE) {
-                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read of board base {:#x}, which holds no buffer", base);
+        if base & dma::SENTINEL != 0 && !(base == dma::SENTINEL_READ && selector == dma::FMT_SELECTOR_READ) && !(base == dma::SENTINEL_DRAW && selector == dma::FMT_SELECTOR_DRAW) {
+            if self.dma_report(dma::REPORT_SENTINEL) {
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read of sentinel {:#x} with word 4 {:#x} is not modeled", base, fmt);
             }
             return false;
+        }
+        let (fields, drawable) = self.dma_fields(hdr, true);
+        let a = fields[0].v;
+        // Depth and stencil through the A field's place: a 24-bit word and
+        // its stencil byte (field.rs).
+        let mem = self.vram_ptr();
+        let depth_at = |kind: Kind, off: i64| {
+            let mut v = a;
+            v.kind = kind;
+            Rows::new(mem, v.shifted(off))
+        };
+        src.fields = fields;
+        src.depth = depth_at(Kind::Z24, 0);
+        src.stencil = depth_at(Kind::Byte, 3);
+        src.drawable = drawable;
+        src.front = fmt & dma::FMT_FRONT != 0;
+        src.x = (hdr[dma::HDR_ORIGIN] & 0xffff) as i64;
+        src.y = (hdr[dma::HDR_ORIGIN] >> 16) as i64;
+        if drawable {
+            src.x += self.win.read_origin[0] as i64;
+            src.y += self.win.read_origin[1] as i64;
         }
         true
     }
 
-    /// Source pixel (x, y) as the plane's 0xRRGGBBAA word, or a raw index. A
-    /// colour-buffer pixel comes from the buffer its main drawable shows, or from
-    /// the other buffer for a back read. (x, y) is inside the plane.
+    /// Source pixel (x, y) as the model's word: from a drawable, the field of
+    /// the buffer its window shows for a front read (the other for a back),
+    /// otherwise the A field for front and B for back.
     pub fn dma_read_pixel(&mut self, src: &DmaSource, x: i64, y: i64) -> u32 {
-        if let Some(obj) = src.obj {
-            return self.object_load(obj, x as u32, y as u32);
-        }
-        let buffer = self.read_buffer(src.front, x, y);
-        self.buffer_load(buffer, x, y)
+        let b = if src.drawable { self.read_buffer(src.front, x, y) as usize } else { (!src.front) as usize };
+        src.fields[b & 1].load_word(x as i32, y as i32).unwrap_or(0)
     }
 
-    /// Whether the bound read drawable is an off-screen object (a pixel
-    /// buffer) and not the screen: the base 0x609 names is not the first
-    /// colour buffer the X server selected, which is the screen's.
+    /// Whether the bound read drawable is off screen (a pixel buffer): the
+    /// base 0x609 names is not the frame buffer the scan-out shows (PB&J
+    /// entry 0x2801).
     pub fn read_drawable_offscreen(&self) -> bool {
         let base = self.read_word & !ODSY_DRAW_WORD_STATE;
+        let screen = self.pbj(super::frame::pbj::PIXEL_BASE);
 
-        self.screen_base != 0 && base != 0 && base != self.screen_base
+        screen != 0 && base != 0 && base != screen
     }
 
     /// The colour buffer, 0 or 1, that a GL read of pixel (x, y) names by
@@ -956,13 +930,9 @@ impl Board {
         let index_max: u32 = if first == dma::BYTE_INDEX_HIGH { 0xfff } else { 0xff };
         let mut o: usize = 0;
 
-        if let (true, Some(obj)) = (index_read, src.obj) {
+        if index_read && !src.drawable {
             if self.dma_report(dma::REPORT_INDEX_OBJECT) {
-                crate::dlog!(
-                    LogModule::Odyssey,
-                    "sgi-odyssey: DMA index read of board object {:#x}, which records no display mode",
-                    self.objects.base[obj]
-                );
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA index read of board memory, which records no display mode");
             }
             return false;
         }
@@ -974,10 +944,12 @@ impl Board {
                 let y = src.y + board_row as i64;
                 if l.plane != ReadPlane::Colour {
                     let n = l.bytes as usize;
+                    let (xi, yi) = (x as i32, y as i32);
+                    let depth = src.depth.load_word(xi, yi).unwrap_or(0);
                     let word = match l.plane {
-                        ReadPlane::Depth16 => super::depth_word::word16_from_word24(self.depth_load(x, y)),
-                        ReadPlane::Depth32 => self.depth_load(x, y) & ODSY_DEPTH24_MAX,
-                        _ => self.stencil_load(x, y),
+                        ReadPlane::Depth16 => super::depth_word::word16_from_word24(depth),
+                        ReadPlane::Depth32 => depth & ODSY_DEPTH24_MAX,
+                        _ => src.stencil.load1(xi, yi).unwrap_or(0) as u32,
                     };
 
                     out[o..o + n].copy_from_slice(&word.to_be_bytes()[4 - n..]);
@@ -987,7 +959,7 @@ impl Board {
                 let word = self.dma_read_pixel(src, x, y);
                 let mut group = ODSY_GAMMA_GROUP;
 
-                if src.obj.is_none() {
+                if src.drawable {
                     let id = self.main_id(x as u32, y as u32);
                     group = self.display_group(id);
                 }
@@ -1117,23 +1089,11 @@ impl Board {
         let mut src = DmaSource::default();
         let mut total: u64 = 0;
 
-        let raw = dma_raw(hdr, bpp);
+        // The kernel's page-out reads the stored bytes as they are.
+        let raw = dma_raw(hdr, bpp) || dma_raw64(hdr, bpp);
 
-        if self.dma_raw64(hdr, bpp) {
-            return;
-        }
         let l = if raw { None } else { self.dma_read_layout(hdr, bpp) };
         if (!raw && l.is_none()) || !self.dma_read_source(hdr, &mut src) {
-            return;
-        }
-        if raw && src.obj.is_none() {
-            if self.dma_report(dma::REPORT_SOURCE) {
-                crate::dlog!(
-                    LogModule::Odyssey,
-                    "sgi-odyssey: raw DMA read of {:#x}, which is not a board-memory object, is not modeled",
-                    hdr[dma::HDR_DEST]
-                );
-            }
             return;
         }
         let Ok(n) = bus.entries(table, seq, &mut e) else {
@@ -1150,33 +1110,16 @@ impl Board {
             }
             return;
         }
-        let inside = if let Some(obj) = src.obj {
-            // Rows past an object's store were never written: the model holds no
-            // value for them, so a read reaching them is refused, not zero-filled.
-            src.x + (w as i64) <= self.objects.width[obj] as i64 && src.y + (h as i64) <= self.objects.rows[obj] as i64
-        } else {
-            src.x >= 0
-                && src.y >= 0
-                && src.x + (w as i64) <= ODSY_WIDTH as i64
-                && src.y + (h as i64) <= ODSY_HEIGHT as i64
-        };
-        if !inside {
-            if self.dma_report(dma::REPORT_BOUNDS) {
-                crate::dlog!(
-                    LogModule::Odyssey,
-                    "sgi-odyssey: DMA read of {}x{} at ({}, {}) from {:#x} leaves its source",
-                    w, h, src.x, src.y, hdr[dma::HDR_DEST]
-                );
-            }
-            return;
-        }
         let mut payload = vec![0u8; total as usize];
-        if let (true, Some(obj)) = (raw, src.obj) {
+        if raw {
             for r in 0..h {
                 for c in 0..w {
-                    let word = self.object_load(obj, (src.x + c as i64) as u32, (src.y + r as i64) as u32);
+                    let mut px = [0u8; 8];
+                    let f = src.fields[(!src.front) as usize];
+                    f.load_raw((src.x + c as i64) as i32, (src.y + r as i64) as i32, &mut px);
                     let off = ((r as u64) * (rowbytes as u64) + (c as u64) * (bpp as u64)) as usize;
-                    raw_pack(word, bpp, &mut payload[off..]);
+                    let n = (bpp as usize).min(8);
+                    payload[off..off + n].copy_from_slice(&px[..n]);
                 }
             }
             if self.dma_read_write(bus, &e[..n], rowbytes, h, skip, &mut payload) {
@@ -1220,6 +1163,18 @@ impl Board {
         for i in 0..dma::HDR_WORDS {
             hdr[i] = be32(&raw[i * 4..][..4]);
         }
+        if self.trace.on(super::trace::TRACE_DMA) {
+            let what = if readback {
+                "readback"
+            } else if hdr[dma::HDR_CONTROL] & dma::TO_HOST != 0 {
+                "to host"
+            } else if hdr[dma::HDR_DEST] & dma::SENTINEL != 0 {
+                "sentinel"
+            } else {
+                "upload"
+            };
+            self.trace_dma(seq, what, table, &hdr);
+        }
         if readback {
             if !self.diag.dma_readback_reported {
                 self.diag.dma_readback_reported = true;
@@ -1238,18 +1193,10 @@ impl Board {
                     hdr[dma::HDR_FORMAT]
                 );
             }
-        } else if self.dma_colour_base != 0 && hdr[dma::HDR_DEST] == self.dma_colour_base {
-            self.dma_to_buffer(&bus, table, seq, &hdr, None);
         } else if hdr[dma::HDR_DEST] == 0 {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA header at {:#x} names no destination buffer", table);
         } else {
-            // The header's row length is the object's, as a select's.
-            let obj = self.object_select(
-                hdr[dma::HDR_DEST],
-                hdr[dma::HDR_WIDTH].wrapping_mul(dest::WIDTH_UNIT),
-            );
-
-            self.dma_to_buffer(&bus, table, seq, &hdr, Some(obj));
+            self.dma_to_buffer(&bus, table, seq, &hdr);
         }
         if hdr[dma::HDR_CONTROL] & dma::IRQ_REQUEST != 0 {
             self.dma_done();
@@ -1618,40 +1565,30 @@ pub(super) fn is_integer_colour(word: u32) -> bool {
     )
 }
 
-impl Board {
-    /// True when base lies within the board memory the active product reports
-    /// (the "memory-size" property, in megabytes), false and reported, once per
-    /// reset, otherwise. A destination select's base is in 16-byte units, so the
-    /// capacity is converted into that unit first. A guest that addresses past
-    /// the reported size is a guest bug, kept observable.
-    pub fn board_address_valid(&mut self, base: u32) -> bool {
-        let limit: u64 = (self.widget.memory_size as u64) * (1u64 << 20) / 16;
+/// Level descriptor word 1 bits 31:30 and 25:20, the size code and format
+/// index.
+const LEVEL_FORMAT_MASK: u32 = 0xc3f00000;
 
-        if (base as u64) < limit {
-            return true;
-        }
-        if !self.diag.board_oob_reported {
-            self.diag.board_oob_reported = true;
-            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: destination base {:#x} is beyond the {} MiB this board reports", base, self.widget.memory_size);
-        }
-        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: board memory out of bounds: destination base {:#x} exceeds the {} MiB this board reports", base, self.widget.memory_size);
-        false
-    }
+impl Board {
 
     /// Build the next mipmap level from the level above by taking every second
     /// texel (a model policy), for the one construction template the model has
-    /// seen. Sampler word 4 must be the builder's (texture_mip_build_word())
-    /// and the source level's entry must name a listed format index with its
-    /// own size code, with no other bits but the row; the class is not
-    /// checked against the index. The store keeps
-    /// whole texel words whatever the level's format, so the copy is the same.
+    /// seen. Sampler word 4 must be the builder's: the image path's context
+    /// (bits 22:18 25, bit 0 clear) with bit 28 set and no wrap, filter or
+    /// bit 17 (bits 17:1 clear); the words seen from it differ only in the
+    /// class. The store keeps whole texel words whatever the level's format,
+    /// so the copy is the same.
     pub fn texture_build_level(&mut self) -> bool {
         let p = self.cmd.operand;
-        let entry = [self.tex.levels[60 * 3], self.tex.levels[60 * 3 + 1], self.tex.levels[60 * 3 + 2]];
-        let ws = self.tex.sampler[1];
-        let hs = self.tex.sampler[2];
+        let t = self.tex_regs();
+        let entry = t.entry(60);
+        let sampler = t.sampler;
+        let (path, level0) = (t.path, t.level0);
+        let ws = sampler[1];
+        let hs = sampler[2];
+        let w4 = sampler[4];
 
-        if !texture_mip_build_word(self.tex.sampler[4]) || texture_level_texel_format(entry[1]).is_none() {
+        if (w4 >> 18) & 0x1f != 25 || w4 & 1 != 0 || w4 & (1 << 28) == 0 || w4 & 0x3fffe != 0 {
             return false;
         }
         if ws == 0 || hs == 0 || ws > i32::MAX as u32 || hs > i32::MAX as u32 || !(ws as u64).is_power_of_two() || !(hs as u64).is_power_of_two() {
@@ -1662,14 +1599,14 @@ impl Board {
         let source_units = (ws.div_ceil(16) + 1) & !1u32;
         let dest_units = (wd.div_ceil(16) + 1) & !1u32;
         if self.stream.primitive != gl_cmd::QUADS
-            || (self.tex.mode & tex::MODE_2D) == 0
-            || self.tex.level0 != 60
+            || (path & tex::MODE_2D) == 0
+            || level0 != 60
             || (entry[1] & !LEVEL_FORMAT_MASK) != source_units
             || entry[2] != 0
-            || self.tex.sampler[0] != ((ws.trailing_zeros() << 10) | (hs.trailing_zeros() << 5))
-            || self.tex.sampler[3] != 0
-            || self.tex.sampler[5] != 0
-            || self.tex.sampler[6] != 0
+            || sampler[0] != ((ws.trailing_zeros() << 10) | (hs.trailing_zeros() << 5))
+            || sampler[3] != 0
+            || sampler[5] != 0
+            || sampler[6] != 0
             || p[0] != 0
             || p[1] != 0
             || p[2] != 0
@@ -1688,27 +1625,21 @@ impl Board {
             return false;
         }
         let source_base = entry[0] & 0x1fffffff;
-        if source_base == 0 || source_base == self.dest_base || self.objects.count > ODSY_OBJECTS {
+        if source_base == 0 || source_base == self.dest_base {
             return false;
         }
-        let (Some(su), Some(du)) = (self.object_find(source_base), self.image_object()) else {
+        // The source level from its descriptor, the destination the pixel
+        // mode's: every second texel.
+        let Some((surface, field)) = super::field::level_surface(entry[0], entry[1]) else {
             return false;
         };
-        if self.objects.width[su] != source_units * 16 || self.objects.rows[su] < hs || self.objects.width[du] != dest_units * 16 {
-            return false;
-        }
-        let source_end = ((hs - 1) as u64)
-            .checked_mul(self.objects.width[su] as u64)
-            .and_then(|v| v.checked_add(self.objects.offset[su] as u64))
-            .and_then(|v| v.checked_add(ws as u64));
-        let Some(source_end) = source_end else { return false };
-        if source_end > self.objects.used as u64 || source_end > self.objects.mem.size / 4 || !self.object_rows(du, hd) {
-            return false;
-        }
+        let mem = self.vram_ptr();
+        let from = super::view::Rows::new(mem, super::view::View::colour(&surface, field, super::view::MAX_DIM));
+        let to = self.dest_mem().colour[0];
         for y in 0..hd {
             for x in 0..wd {
-                let v = self.object_load(su, 2 * x, 2 * y);
-                self.object_store(du, x, y, v);
+                let v = from.load_word(2 * x as i32, 2 * y as i32).unwrap_or(0);
+                to.store_word(x as i32, y as i32, v);
             }
         }
         true

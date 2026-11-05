@@ -271,16 +271,6 @@ impl HostInterface {
         self.fifo.level()
     }
 
-    /// The FIFO's level went from 'before' to its current value. Falling below
-    /// the model's low-water threshold (cfifo::LOW_WATER, a model choice)
-    /// latches the low-water flag whatever the enable mask
-    /// says; it reaches the driver only while the source is enabled.
-    pub fn fifo_level_changed(&mut self, before: u32) {
-        if before >= cfifo::LOW_WATER && self.fifo_level() < cfifo::LOW_WATER {
-            self.intr_flags |= intr::FIFO_LOW_WATER;
-            self.update_irq();
-        }
-    }
 }
 
 // The front registers.
