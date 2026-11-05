@@ -7,6 +7,7 @@
 //! function only sees configuration registers, accesses to its BARs, and an
 //! [`IrqLine`] for its pin.
 
+pub mod bus;
 pub mod host;
 pub mod intx;
 pub mod slots;
