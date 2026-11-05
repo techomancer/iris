@@ -328,7 +328,7 @@ impl OctaneMachine {
         // Device-window pages a PCI BAR decodes whole go straight to the
         // function.
         let weak = Arc::downgrade(&phys);
-        bridge.on_bar_runs(Box::new(move |runs| {
+        bridge.bus().on_bar_runs(Box::new(move |runs| {
             if let Some(p) = weak.upgrade() {
                 p.set_widget_runs(WIDGET_BRIDGE, runs);
             }
@@ -697,6 +697,8 @@ impl OctaneMachine {
         self.rad.reset();
         if let Some(v) = &self.virtio {
             Resettable::power_on(&**v);
+            // It reset its own header; the bus's decode table follows.
+            self.bridge.bus().refresh();
         }
         self.flash.reset();
         if let Some(g) = &self.gfx {

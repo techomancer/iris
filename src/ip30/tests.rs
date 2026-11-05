@@ -1068,7 +1068,7 @@ fn a_bar_run_answers_as_the_window_does() {
     let o = Octane::new();
     let runs = Arc::new(parking_lot::Mutex::new(Vec::<crate::pci::BarRun>::new()));
     let sink = runs.clone();
-    o.bridge.on_bar_runs(Box::new(move |r| *sink.lock() = r));
+    o.bridge.bus().on_bar_runs(Box::new(move |r| *sink.lock() = r));
     assert!(runs.lock().is_empty(), "nothing decodes before the PROM places a BAR");
     o.ioc3_map();
     let win = Octane::ioc3_win() as u64;

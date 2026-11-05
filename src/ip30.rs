@@ -215,7 +215,7 @@ impl Ip30Bus {
     }
 
     /// Widget `w` says which runs of its small window a PCI BAR decodes
-    /// whole (the Bridge's `on_bar_runs`): map them over the widget while
+    /// whole (the bus's `on_bar_runs`): map them over the widget while
     /// its link is up, giving the runs it named before back to the widget.
     pub fn set_widget_runs(&self, w: u8, new: Vec<BarRun>) {
         if !(9..16).contains(&w) {
