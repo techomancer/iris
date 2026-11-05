@@ -535,6 +535,35 @@ fn a_gl_copy_between_the_drawables_moves_the_rectangle() {
     assert_eq!(got, [0x1100_00ff, 0x2200_00ff, 0x1100_00ff, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff]);
 }
 
+/// TyrQuake's water and lava: it draws the warped liquid into its
+/// 10:10:10:2 window and copies it into the liquid's 8:8:8:8 texture
+/// (glCopyTexSubImage). The copy's source format byte 0x02 names the
+/// window's 10:10:10:2 field, which converts on the way; moved raw, its
+/// 10-bit components landed in the texture's 8-bit ones.
+#[test]
+fn a_copy_from_a_10_10_10_2_window_into_a_texture_converts_the_colour() {
+    let (mut s, _) = window();
+    let (x, y) = (130u32, 7u32);
+    // The window's back colour, 10:10:10:2 in the B field (byte 4 of its
+    // 16-byte pixels): word 4's bit 31 is clear, so the copy reads B, the
+    // buffer TyrQuake has just drawn.
+    let w10 = |c: u64| (c << 2) | (c >> 6);
+    let v = w10(0xc0) << 22 | w10(0x40) << 12 | w10(0x20) << 2 | 3;
+    let fb = Surface::new(0x2000, 0x50, 4);
+    s.read_word = 0x2000;
+    s.vram.ptr().store(fb.offset(x, y) + 4, 4, v);
+    // The pixel belongs to window id 21, whose display mode (the value a
+    // TyrQuake session had) says 10:10:10:2 with A at byte 12, B at 4.
+    s.regs().set_dispmode(21, 0x0096_53a6);
+    set_aux(&mut s, 0, y * ODSY_WIDTH + x, 21 << crate::dev::odyssey::consts::ODSY_DID_MAIN_SHIFT);
+    // The texture the copy lands in, selected first as the library does.
+    s.pixel_mode = [0x39_de80, 0x10, 0x0800_24d0, 0];
+    copy_block(&mut s, [0x3000_0019, y << 16 | x, 0x8010_0050, 1 << 16 | 1, 0x1263_3002, 0x39_de80, 0, 0xf801_210b]);
+    s.raster_wait();
+    let tex = Surface::new(0x39_de80, 0x10, 2);
+    assert_eq!(s.vram.ptr_shared().load(tex.offset(0, 0), 4), 0xc040_20ff);
+}
+
 /// The id-plane destination as the X server selects it for a menu: the
 /// overlay byte under drawing mask 0xc, every bit writable.
 fn select_overlay_destination(s: &mut Board) {
@@ -1179,16 +1208,16 @@ fn a_window_move_copies_every_byte_of_both_halves() {
     s.raster_wait();
     let screen = Surface::new(0x2000, 0x50, 4);
     s.pixel_mode = [0x2000, 0x50, 0x6950, 0];
-    let src = screen.offset(10, 10) as usize;
+    let src = screen.offset(10, 10);
     for k in 0..16 {
-        s.vram.bytes_mut()[src + k] = 0x40 + k as u8;
+        s.vram.ptr().store(src + k, 1, 0x40 + k);
     }
     let (sx, sy, dx, dy) = (10u32, 10u32, 100u32, 12u32);
     for (w2, w4) in [(0x0050_0050u32, 0x0003_4000u32), (0x8050_4050, 0x8043_4000)] {
         copy_block(&mut s, [0x2000, sy << 16 | sx, w2, 1 << 16 | 1, w4, 0x2000, dy << 16 | dx, 0xc003_4000]);
     }
     s.raster_wait();
-    let dst = screen.offset(dx, dy) as usize;
-    let got: Vec<u8> = s.vram.bytes()[dst..dst + 16].to_vec();
+    let dst = screen.offset(dx, dy);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(dst + k, 1) as u8).collect();
     assert_eq!(got, (0..16).map(|k| 0x40 + k as u8).collect::<Vec<_>>());
 }

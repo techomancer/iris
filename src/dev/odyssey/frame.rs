@@ -18,7 +18,7 @@
 use super::display::{IdShow, ResolveCtx};
 use super::field::{Codec, Field, Layout, FIELD_FOUR, FIELD_INDEX, FIELD_PACKED, PIXEL_FMT_B};
 use super::reader::DisplayRegs;
-use super::vram::{Format, Surface, TILE};
+use super::vram::{Format, Surface, VramPtr, TILE};
 use super::consts::{dispmode, lut, ODSY_DID_MAIN_SHIFT, ODSY_DID_OVERLAY_MASK};
 
 /// The PB&J scan-out entries of the backend register file, in the order the
@@ -128,37 +128,33 @@ impl Frame {
     /// What pixel (x, y) is made of, for the monitor: its window-id and
     /// overlay bytes, its main window id, the two colour fields' words, the
     /// one the window shows and the colour shown (before the cursor).
-    pub fn parts(&self, mem: &[u8], x: u32, y: u32) -> Option<PixelParts> {
-        let at = |s: &Surface| {
-            let o = s.offset(x, y) as usize;
-            mem.get(o..o + s.bytes_per_pixel() as usize)
-        };
-        let (w, p) = (at(&self.wid)?, at(&self.fb)?);
-        let did = self.wid_layout.front.load(w);
+    pub fn parts(&self, mem: VramPtr, x: u32, y: u32) -> Option<PixelParts> {
+        let (w, p) = (self.wid.offset(x, y), self.fb.offset(x, y));
+        if w.max(p) >= mem.size() {
+            return None;
+        }
+        let did = field_word(mem, w, &self.wid_layout.front);
         let id = (did >> ODSY_DID_MAIN_SHIFT) as usize & (dispmode::COUNT as usize - 1);
         let f = &self.fields[id];
-        let load = |f: &Field| if f.at as usize + 2 <= p.len() { f.load(p) } else { 0 };
+        let n = self.fb.bytes_per_pixel();
+        let load = |f: &Field| if f.at as u32 + 2 <= n { field_word(mem, p, f) } else { 0 };
         Some(PixelParts {
             did,
-            overlay: self.wid_layout.back.load(w),
+            overlay: field_word(mem, w, &self.wid_layout.back),
             id: id as u32,
             fields: [load(&f[0]), load(&f[1])],
             shown: self.ctx.ids[id].buf & 1,
             rgb: self.pixel(mem, x, y),
-            bytes: p.to_vec(),
+            bytes: (0..n as u64).map(|i| mem.load(p + i, 1) as u8).collect(),
         })
     }
 
     /// One displayed pixel as 0x00RRGGBB.
     #[inline]
-    fn pixel(&self, mem: &[u8], x: u32, y: u32) -> u32 {
-        let at = |s: &Surface| {
-            let o = s.offset(x, y) as usize;
-            mem.get(o..o + s.bytes_per_pixel() as usize)
-        };
-        let (Some(w), Some(p)) = (at(&self.wid), at(&self.fb)) else { return 0 };
-        let did = self.wid_layout.front.load(w);
-        let ov = self.wid_layout.back.load(w);
+    fn pixel(&self, mem: VramPtr, x: u32, y: u32) -> u32 {
+        let (w, p) = (self.wid.offset(x, y), self.fb.offset(x, y));
+        let did = field_word(mem, w, &self.wid_layout.front);
+        let ov = field_word(mem, w, &self.wid_layout.back);
         let (enabled, obase) = self.ctx.overlay[(did & ODSY_DID_OVERLAY_MASK) as usize];
         if enabled && ov != 0 {
             return self.ctx.rgb[(obase + ov) as usize & (lut::SIZE as usize - 1)];
@@ -166,10 +162,10 @@ impl Frame {
         let id = (did >> ODSY_DID_MAIN_SHIFT) as usize & (dispmode::COUNT as usize - 1);
         let show: &IdShow = &self.ctx.ids[id];
         let field = self.fields[id][show.buf & 1];
-        if field.at as usize + 2 > p.len() {
+        if field.at as u32 + 2 > self.fb.bytes_per_pixel() {
             return 0;
         }
-        let word = field.load(p);
+        let word = field_word(mem, p, &field);
         if show.rgb {
             let [red, green, blue] = &*self.ctx.gamma;
             let f = |c: u32| ((c & show.keep) | (c >> show.down)) as usize & 0xff;
@@ -181,7 +177,7 @@ impl Frame {
 
     /// The whole frame into `out` (rows of `stride` pixels, at most
     /// `rows` of them), the cursor over it.
-    pub fn compose(&self, mem: &[u8], regs: &DisplayRegs, out: &mut [u32], stride: usize, rows: usize) {
+    pub fn compose(&self, mem: VramPtr, regs: &DisplayRegs, out: &mut [u32], stride: usize, rows: usize) {
         let w = (self.width as usize).min(stride);
         for y in 0..(self.height as usize).min(rows) as u32 {
             let row = &mut out[y as usize * stride..y as usize * stride + w];
@@ -191,6 +187,12 @@ impl Frame {
             regs.cursor_row(y, row, w as u32);
         }
     }
+}
+
+/// The word of field f in the pixel at byte address p.
+#[inline(always)]
+fn field_word(mem: VramPtr, p: u64, f: &Field) -> u32 {
+    f.load(mem.load(p + f.at as u64, f.value_len()))
 }
 
 #[cfg(test)]
@@ -229,14 +231,16 @@ mod tests {
         // Drawn as the pixel mode of each window places it.
         let single = Layout::of(Format::decode(0x6950));
         let double = Layout::of(Format::decode(0x20406d50));
-        single.front.store(m.pixel_mut(&fb, 3, 2).unwrap(), 0x40_80_c0_ff);
-        double.back.store(m.pixel_mut(&fb, 20, 9).unwrap(), 0x10_20_30_ff);
+        let mem = m.ptr();
+        let put = |f: &Field, x, y, w| mem.store(fb.offset(x, y) + f.at as u64, f.value_len(), f.store(w));
+        put(&single.front, 3, 2, 0x40_80_c0_ff);
+        put(&double.back, 20, 9, 0x10_20_30_ff);
         assert_eq!(mode_fields(0x009655a6)[1], double.back);
         assert_eq!(mode_fields(0x005215a6)[0], single.front);
-        m.pixel_mut(&wid, 3, 2).unwrap()[0] = 1 << ODSY_DID_MAIN_SHIFT;
-        m.pixel_mut(&wid, 20, 9).unwrap()[0] = 2 << ODSY_DID_MAIN_SHIFT;
+        mem.store(wid.offset(3, 2), 1, 1 << ODSY_DID_MAIN_SHIFT);
+        mem.store(wid.offset(20, 9), 1, 2 << ODSY_DID_MAIN_SHIFT);
         let mut out = vec![0u32; 32 * 16];
-        frame.compose(m.bytes(), &regs, &mut out, 32, 16);
+        frame.compose(mem, &regs, &mut out, 32, 16);
         assert_eq!(out[2 * 32 + 3], 0x40_80_c0);
         assert_eq!(out[9 * 32 + 20], 0x10_20_30);
     }

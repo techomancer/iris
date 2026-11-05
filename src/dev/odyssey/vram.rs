@@ -1,6 +1,14 @@
-//! The board's memory as the board addresses it: one byte array of the size
-//! the strap reports, and surfaces over it named the way the command stream
-//! names them (block 0x017, the texture level descriptors, the copy operands).
+//! The board's memory as the board addresses it: one array of 64-bit words,
+//! of the size the strap reports, and surfaces over it named the way the
+//! command stream names them (block 0x017, the texture level descriptors,
+//! the copy operands).
+//!
+//! Memory is words, as main memory is. A field narrower than a word, n bytes
+//! at byte address a, is the bit range of its word that a 64-bit load of
+//! guest memory gives those addresses: bits (8 - a % 8 - n) * 8 up, the
+//! lowest address highest. Nothing converts byte order: DMA moves the
+//! guest's words in and out whole, and every field is read and written by
+//! shift and mask (`VramPtr::load`, `store`).
 //!
 //! A surface is a base address in 16-byte units, a pitch in 16 x 16-pixel
 //! tiles and a pixel size of 2 << n bytes (n, the frame-buffer depth, from
@@ -114,79 +122,36 @@ impl Surface {
 /// The board's memory.
 #[derive(Clone, Default)]
 pub(super) struct Vram {
-    bytes: Vec<u8>,
+    words: Vec<u64>,
 }
 
 impl Vram {
     /// Memory of at least size bytes, a power of two, so an address masks
-    /// into it (the texture unit's reads, Span::texels()).
+    /// into it.
     pub fn new(size: u64) -> Vram {
-        Vram { bytes: vec![0; size.next_power_of_two() as usize] }
+        Vram { words: vec![0; (size.next_power_of_two() / 8).max(1) as usize] }
     }
 
+    /// Its size in bytes.
     pub fn size(&self) -> u64 {
-        self.bytes.len() as u64
+        self.words.len() as u64 * 8
     }
 
     /// The memory as the raster unit and the display reach it. The array is
     /// sized once, at allocation, and never moves, so the pointer stays
     /// good for the board's life.
     pub fn ptr(&mut self) -> VramPtr {
-        VramPtr { ptr: self.bytes.as_mut_ptr(), len: self.bytes.len() }
+        VramPtr { ptr: self.words.as_mut_ptr(), mask: self.words.len() - 1 }
     }
 
     /// ptr() from a shared borrow: the memory is written through the pointer
     /// by units that race as the board's do (see VramPtr).
     pub fn ptr_shared(&self) -> VramPtr {
-        VramPtr { ptr: self.bytes.as_ptr() as *mut u8, len: self.bytes.len() }
+        VramPtr { ptr: self.words.as_ptr() as *mut u64, mask: self.words.len() - 1 }
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
-    }
-
-#[cfg(test)]
-    /// The bytes of pixel (x, y), or None past the end of memory (a guest
-    /// bug; the caller reports it).
-    pub fn pixel(&self, s: &Surface, x: u32, y: u32) -> Option<&[u8]> {
-        let at = s.offset(x, y) as usize;
-        self.bytes.get(at..at + s.bytes_per_pixel() as usize)
-    }
-
-    #[cfg(test)]
-    pub fn pixel_mut(&mut self, s: &Surface, x: u32, y: u32) -> Option<&mut [u8]> {
-        let at = s.offset(x, y) as usize;
-        self.bytes.get_mut(at..at + s.bytes_per_pixel() as usize)
-    }
-
-    #[cfg(test)]
-    /// Copy a w x h rectangle between two surfaces of the same pixel size,
-    /// byte for byte. Overlapping rectangles copy as if through a temporary.
-    pub fn copy_rect(&mut self, src: &Surface, sx: u32, sy: u32, dst: &Surface, dx: u32, dy: u32, w: u32, h: u32) -> bool {
-        if src.bpp_log2 != dst.bpp_log2 {
-            return false;
-        }
-        let bpp = src.bytes_per_pixel() as usize;
-        let mut rect = vec![0u8; w as usize * h as usize * bpp];
-        for y in 0..h {
-            for x in 0..w {
-                let Some(p) = self.pixel(src, sx + x, sy + y) else { return false };
-                let at = (y as usize * w as usize + x as usize) * bpp;
-                rect[at..at + bpp].copy_from_slice(p);
-            }
-        }
-        for y in 0..h {
-            for x in 0..w {
-                let at = (y as usize * w as usize + x as usize) * bpp;
-                let Some(p) = self.pixel_mut(dst, dx + x, dy + y) else { return false };
-                p.copy_from_slice(&rect[at..at + bpp]);
-            }
-        }
-        true
+    pub fn words_mut(&mut self) -> &mut [u64] {
+        &mut self.words
     }
 }
 
@@ -197,8 +162,9 @@ impl Vram {
 /// shows it for one frame.
 #[derive(Clone, Copy)]
 pub(super) struct VramPtr {
-    ptr: *mut u8,
-    len: usize,
+    ptr: *mut u64,
+    /// Words less one: a word index masks into the memory.
+    mask: usize,
 }
 
 // SAFETY: the array outlives every user (Board owns it and stops the raster
@@ -207,13 +173,55 @@ unsafe impl Send for VramPtr {}
 unsafe impl Sync for VramPtr {}
 
 impl VramPtr {
-    /// # Safety
-    /// The board's memory must still exist; writers and readers race as
-    /// the hardware's do (see the type).
-    pub unsafe fn bytes<'a>(self) -> &'a mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    /// The word holding byte address a.
+    #[inline(always)]
+    fn word(&self, a: u64) -> *mut u64 {
+        // SAFETY: masked into the array.
+        unsafe { self.ptr.add((a >> 3) as usize & self.mask) }
     }
 
+    /// The value of the n bytes (1 to 8) at byte address a, which lie in
+    /// one word: the bits of it they are, the lowest address highest.
+    #[inline(always)]
+    pub fn load(&self, a: u64, n: u32) -> u64 {
+        // SAFETY: the word is in the memory; readers and writers race as
+        // the board's units do (see the type).
+        let w = unsafe { *self.word(a) };
+        let shift = 64 - 8 * ((a & 7) as u32 + n);
+        if n == 8 { w } else { (w >> shift) & ((1u64 << (8 * n)) - 1) }
+    }
+
+    /// Store v as the n bytes at byte address a (load()'s bits).
+    #[inline(always)]
+    pub fn store(&self, a: u64, n: u32, v: u64) {
+        let p = self.word(a);
+        // SAFETY: as load().
+        unsafe {
+            if n == 8 {
+                *p = v;
+            } else {
+                let shift = 64 - 8 * ((a & 7) as u32 + n);
+                let m = ((1u64 << (8 * n)) - 1) << shift;
+                *p = (*p & !m) | ((v << shift) & m);
+            }
+        }
+    }
+
+    /// The memory's size in bytes.
+    pub fn size(&self) -> u64 {
+        (self.mask as u64 + 1) * 8
+    }
+
+    /// The memory as bytes in address order, for what is a byte stream by
+    /// nature: a dump file, the memory hash.
+    pub fn address_bytes(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..self.size()).map(move |a| self.load(a, 1) as u8)
+    }
+
+    /// No memory: a view of a field the surface lacks, which nothing reads.
+    pub fn null() -> VramPtr {
+        VramPtr { ptr: std::ptr::null_mut(), mask: 0 }
+    }
 }
 
 #[cfg(test)]
@@ -263,19 +271,18 @@ mod tests {
     }
 
     #[test]
-    fn copy_between_board_addresses() {
-        // The signed-texture upload's copy, scratch to level, minus the
-        // conversion: the bytes land where the level's select names.
-        let mut m = Vram::new(128 << 20);
-        let a = Surface::new(SCRATCH[0], SCRATCH[1], 2);
-        let b = Surface::from_select(&LEVEL);
-        for y in 0..4 {
-            for x in 0..4 {
-                m.pixel_mut(&a, x, y).unwrap().copy_from_slice(&[x as u8, y as u8, 7, 9]);
-            }
-        }
-        assert!(m.copy_rect(&a, 0, 0, &b, 0, 0, 4, 4));
-        assert_eq!(m.pixel(&b, 3, 2).unwrap(), &[3, 2, 7, 9]);
-        assert!(m.pixel(&b, 0, 1u32 << 20).is_none());
+    fn fields_are_bit_ranges_of_words() {
+        let mut m = Vram::new(1 << 20);
+        let p = m.ptr();
+        p.store(16, 8, 0x0011_2233_4455_6677);
+        assert_eq!(p.load(16, 4), 0x0011_2233);
+        assert_eq!(p.load(20, 4), 0x4455_6677);
+        assert_eq!(p.load(17, 3), 0x11_2233);
+        assert_eq!(p.load(23, 1), 0x77);
+        p.store(18, 2, 0xabcd);
+        assert_eq!(p.load(16, 8), 0x0011_abcd_4455_6677);
+        // Addresses wrap at the memory's end.
+        p.store(1 << 20, 4, 0x5a5a_5a5a);
+        assert_eq!(p.load(0, 4), 0x5a5a_5a5a);
     }
 }

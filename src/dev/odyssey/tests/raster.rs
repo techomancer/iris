@@ -682,7 +682,7 @@ fn assert_frame_is_whole_resolve(h: &BoardLocks, display: &Display, what: &str) 
     let regs = s.regs().read();
     let frame = crate::dev::odyssey::frame::Frame::snapshot(&regs, s.front.lock().displayed_buffer).expect("the scan-out is set up");
     let mut want = vec![0u32; w * ht];
-    frame.compose(s.vram.bytes(), &regs, &mut want, w, ht);
+    frame.compose(s.vram.ptr_shared(), &regs, &mut want, w, ht);
     for y in 0..ht {
         assert_eq!(&reader.frame[y * w..(y + 1) * w], &want[y * w..(y + 1) * w], "{what}: row {y}");
     }

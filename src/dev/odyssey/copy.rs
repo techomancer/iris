@@ -48,7 +48,7 @@
 
 use super::bits::sextract32;
 use super::board::Board;
-use super::consts::{tex, ODSY_PLANE_MASK_SHIFT};
+use super::consts::{tex, ODSY_DID_MAIN_SHIFT, ODSY_PLANE_MASK_SHIFT};
 use super::field::{Codec, Field, Layout, FIELD_FOUR, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
 use super::view::{Rows, View, MAX_DIM};
 use super::vram::{Format, Surface, ADDR_MASK, DRAWABLE, PITCH_MASK};
@@ -122,6 +122,15 @@ impl CopyOperands {
 /// How a field of `bytes` bytes with code and class `format` holds a word:
 /// the pairs the library's reads name (measured.md section 6), four equal
 /// components otherwise.
+/// Bytes a field of codec c holds.
+fn codec_bytes(c: Codec) -> u8 {
+    match c {
+        Codec::Lanes => 8,
+        Codec::Byte => 1,
+        Codec::Texel { bytes, .. } => bytes,
+    }
+}
+
 pub(super) fn source_codec(bytes: u8, format: u32) -> Codec {
     let (class, code) = (format & 7, (format >> 3) & 0x1f);
     match (bytes, class, code) {
@@ -135,6 +144,18 @@ pub(super) fn source_codec(bytes: u8, format: u32) -> Codec {
 }
 
 impl Board {
+    /// How the read drawable's field at offset `at` holds a colour at plane
+    /// pixel (x, y): as the display mode of the window the pixel belongs to
+    /// (0x2900 + its main id) says, as the scan-out reads it. The pixel mode
+    /// names the copy's destination by then, and the copy's own format byte
+    /// is the packing it asks for, not the window's. None where the mode
+    /// names no field there.
+    pub fn drawable_codec(&self, x: i32, y: i32, at: u8) -> Option<Codec> {
+        let did = self.dest_mem().did.load1(x, y)? as u32;
+        let mode = self.regs().dispmode((did >> ODSY_DID_MAIN_SHIFT) as usize);
+        super::frame::mode_fields(mode).into_iter().find(|f| f.at == at).map(|f| f.codec)
+    }
+
     /// Block 0x2031 (see the module).
     pub fn copy_block(&mut self) {
         let c = CopyOperands::decode(&self.cmd.operand);
@@ -166,12 +187,22 @@ impl Board {
         };
         let src_base = if src.drawable { self.read_word & ADDR_MASK } else { src.base };
         let dst_base = if dst.drawable { self.draw_word & ADDR_MASK } else { dst.base };
-        let from = side_rows(&src, source_codec(src.bytes, src.format), src_base);
+        // A drawable source holds its colour as its window's display mode
+        // says; memory as the copy's format byte names.
+        let src_codec = |at: u8| {
+            let named = source_codec(src.bytes, src.format);
+            if !src.drawable {
+                return named;
+            }
+            let (x, y) = ((src.x as i32).wrapping_add(self.win.read_origin[0]), (src.y as i32).wrapping_add(self.win.read_origin[1]));
+            self.drawable_codec(x, y, at).filter(|c| codec_bytes(*c) == src.bytes).unwrap_or(named)
+        };
+        let from = side_rows(&src, src_codec(src.at), src_base);
         // A drawable source's front is the buffer its window shows, as a
         // DMA read's is (Board::read_buffer()): buffer 0 the A field, 1 the B.
         let w4 = c.w[4];
         let ab = src.drawable.then(|| {
-            [(w4 >> 20) & 0xf, (w4 >> 24) & 0xf].map(|u| side_rows(&Side { at: 2 * u as u8, ..src }, source_codec(src.bytes, src.format), src_base))
+            [(w4 >> 20) & 0xf, (w4 >> 24) & 0xf].map(|u| side_rows(&Side { at: 2 * u as u8, ..src }, src_codec(2 * u as u8), src_base))
         });
         let front = w4 >> 31 != 0;
         let to = side_rows(&dst, dst_codec, dst_base);
@@ -193,12 +224,12 @@ impl Board {
         let sb = &self.tex_regs().scale_bias;
         let filter = (0..4).any(|c| sb[c * 2] != tex::SCALE_BIAS_ONE || sb[c * 2 + 1] != 0);
         // Bytes move as they are when both sides hold a word the same way.
-        let raw = source_codec(src.bytes, src.format) == dst_codec && !filter;
+        let raw = src_codec(src.at) == dst_codec && !filter;
 
         // The whole source first, so an overlapping copy reads what was there.
         let n = w as usize * h as usize;
         let mut words = vec![0u32; n];
-        let mut bytes = vec![[0u8; 8]; if raw { n } else { 0 }];
+        let mut raws = vec![0u64; if raw { n } else { 0 }];
         for y in 0..h {
             for x in 0..w {
                 let (sx, sy) = ((src.x + x) as i32 + ox, (src.y + y) as i32 + oy);
@@ -208,7 +239,7 @@ impl Board {
                     None => &from,
                 };
                 if raw {
-                    from.load_raw(sx, sy, &mut bytes[i]);
+                    raws[i] = from.load_raw(sx, sy);
                 } else {
                     words[i] = from.load_word(sx, sy).unwrap_or(0);
                 }
@@ -226,14 +257,13 @@ impl Board {
                 }
                 let i = (y * w + x) as usize;
                 if let (true, Some(m)) = (raw, byte_masks) {
-                    let mut v = [0u8; 8];
-                    to.load_raw(px, py, &mut v);
-                    for k in 0..2 {
-                        v[k] = (v[k] & !m[k]) | (bytes[i][k] & m[k]);
-                    }
-                    to.store_raw(px, py, &v);
+                    // The id byte, then the overlay byte: the field's top two.
+                    let n = to.v.len();
+                    let mask = (m[0] as u64) << (8 * (n - 1)) | (m[1] as u64) << (8 * (n.max(2) - 2));
+                    let v = to.load_raw(px, py);
+                    to.store_raw(px, py, (v & !mask) | (raws[i] & mask));
                 } else if raw {
-                    to.store_raw(px, py, &bytes[i]);
+                    to.store_raw(px, py, raws[i]);
                 } else {
                     to.store_word(px, py, words[i]);
                 }

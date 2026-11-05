@@ -227,14 +227,14 @@ pub(super) fn screen_field(s: &Board, buffer: u32) -> crate::dev::odyssey::view:
 pub(super) fn aux_at(s: &Board, b: u32, i: u32) -> u8 {
     s.raster_wait();
     let w = crate::dev::odyssey::vram::Surface::new(0x14_2000, 80, 1);
-    s.vram.bytes()[w.offset(i % 1280, i / 1280) as usize + b as usize]
+    s.vram.ptr_shared().load(w.offset(i % 1280, i / 1280) + b as u64, 1) as u8
 }
 
 pub(super) fn set_aux(s: &mut Board, b: u32, i: u32, v: u8) {
     s.raster_wait();
     let w = crate::dev::odyssey::vram::Surface::new(0x14_2000, 80, 1);
-    let at = w.offset(i % 1280, i / 1280) as usize + b as usize;
-    s.vram.bytes_mut()[at] = v;
+    let at = w.offset(i % 1280, i / 1280) + b as u64;
+    s.vram.ptr().store(at, 1, v as u64);
 }
 
 /// The test screen's stencil at (x, y).

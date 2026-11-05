@@ -19,7 +19,7 @@ use super::context::{
 };
 use super::draw::{code_is_index, decode_texel12, pixel_bytes, texel12_components};
 use super::geometry::{f32_bits, odyssey_f32};
-use super::pixel_dma::{write_guest, DmaBus, DmaDirection, DmaError, DmaMap, DmaPageList};
+use super::pixel_dma::{guest_value, put_guest_value, write_guest, DmaBus, DmaDirection, DmaError, DmaMap, DmaPageList};
 use super::pixel_write::{write_form, WriteForm};
 #[derive(Clone, Copy, Default)]
 pub(super) struct DmaEntry {
@@ -324,11 +324,11 @@ impl Board {
                     let px = &row[(c * bpp) as usize..];
                     let (ox, oy) = (x.wrapping_add(c) as i32, y.wrapping_add(r) as i32);
                     if raw {
-                        // The kernel's page-in: the stored bytes as they were.
-                        let mut b = [0u8; 8];
+                        // The kernel's page-in: the stored value as it was,
+                        // its first bytes the pixel's, the rest zero.
                         let n = (bpp as usize).min(8);
-                        b[..n].copy_from_slice(&px[..n]);
-                        to.store_raw(ox, oy, &b);
+                        let top = guest_value(&px[..n]) << (8 * (8 - n));
+                        to.store_raw(ox, oy, top.checked_shr(8 * (8 - to.v.len())).unwrap_or(0));
                         continue;
                     }
                     if let (true, Some(())) = (texel12, obj) {
@@ -1114,12 +1114,13 @@ impl Board {
         if raw {
             for r in 0..h {
                 for c in 0..w {
-                    let mut px = [0u8; 8];
                     let f = src.fields[(!src.front) as usize];
-                    f.load_raw((src.x + c as i64) as i32, (src.y + r as i64) as i32, &mut px);
+                    let v = f.load_raw((src.x + c as i64) as i32, (src.y + r as i64) as i32);
                     let off = ((r as u64) * (rowbytes as u64) + (c as u64) * (bpp as u64)) as usize;
+                    // The field's bytes then zeros, as many as the pixel has.
                     let n = (bpp as usize).min(8);
-                    payload[off..off + n].copy_from_slice(&px[..n]);
+                    let top = v.checked_shl(8 * (8 - f.v.len())).unwrap_or(0);
+                    put_guest_value(top >> (8 * (8 - n)), &mut payload[off..off + n]);
                 }
             }
             if self.dma_read_write(bus, &e[..n], rowbytes, h, skip, &mut payload) {

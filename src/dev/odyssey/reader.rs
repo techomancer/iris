@@ -188,6 +188,11 @@ impl SharedRegs {
         self.gen.fetch_add(1, Release);
     }
 
+    /// Display mode word `index` (0x2900 + id).
+    pub fn dispmode(&self, index: usize) -> u32 {
+        self.dispmode[index & 31].load(Relaxed)
+    }
+
     pub fn set_dispmode(&self, index: usize, value: u32) {
         self.dispmode[index].store(value, Relaxed);
         self.gen.fetch_add(1, Release);
@@ -470,10 +475,9 @@ impl ScanoutReader {
             self.frame.fill(0);
             return true;
         };
-        // SAFETY: the memory lives as long as the board; the display reads
-        // it while the board's units write it, as the scan-out does.
-        let bytes = unsafe { mem.bytes() };
-        frame.compose(bytes, &self.snap, &mut self.frame, self.frame_width as usize, self.frame_height as usize);
+        // The memory lives as long as the board; the display reads it while
+        // the board's units write it, as the scan-out does.
+        frame.compose(*mem, &self.snap, &mut self.frame, self.frame_width as usize, self.frame_height as usize);
         true
     }
 }

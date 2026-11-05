@@ -24,7 +24,7 @@ use super::pipe::setup::{LiveDraw, Transform};
 use super::pipe::slot::DrawState;
 use super::pipe::texture::{Target, Unit};
 use super::raster_unit::{
-    primitive_cost, rect_cost, LINE_PHASE_ON_RASTER, RasterCtx, Span,
+    primitive_cost, rect_cost, LINE_PHASE_ON_RASTER, RasterCtx,
 };
 
 impl Board {
@@ -130,7 +130,7 @@ pub(super) struct GlPixelState {
 #[derive(Clone, Copy)]
 pub(super) struct GlPixelJob {
     pub state: GlPixelState,
-    pub obj: Span,
+    pub obj: super::vram::VramPtr,
 }
 
 // SAFETY: the texel span is the board's memory, which outlives the job;
@@ -284,8 +284,7 @@ impl GlDrawJob {
         let xf = Transform { st: &job.state, depth_row: job.depth.row, divisor: job.depth.divisor, back_colours: d.back_colours };
         // SAFETY: the job holds its slot until it is given back.
         let st: &'static DrawState = unsafe { &*job.slot };
-        let (mem, mask) = job.pixels.obj.texels();
-        let tex = Unit { regs: &st.tex, latch: &st.latch, mem, mask };
+        let tex = Unit { regs: &st.tex, latch: &st.latch, mem: job.pixels.obj };
         let mut p = PipeDraw::new(&job.words, tex, job.pixels.state.mem, job.index, job.pixels.state.to_aux, xf.depth_range(), job.depth.slack, ctx.ring.as_ref());
         if p.ring.is_none() {
             ctx.drain_back();
@@ -536,7 +535,7 @@ impl Board {
 
     /// The board's planes and pixel state as a raster job takes them.
     pub fn gl_pixel_job(&mut self) -> GlPixelJob {
-        GlPixelJob { state: self.gl_pixel_state(), obj: Span::of(self.vram.bytes_mut()) }
+        GlPixelJob { state: self.gl_pixel_state(), obj: self.vram.ptr() }
     }
 
     /// glClear's raster op, and the pattern rectangle's runs: the raster
@@ -750,10 +749,10 @@ fn clear_draw(index: bool, pixels: &GlPixelJob, op: &RasterOp) -> Option<Box<sup
     };
     let colour = (op.clear_buffers & CLEAR_COLOUR != 0 && targets != [false; 2] && colour_mask != 0).then(|| {
         if index {
-            // The index's two carrier bytes (gl_index_rgba()).
-            return ((c[1] << 8 | c[2]) & ODSY_INDEX_MASK).to_be_bytes();
+            // The index from its two carrier components (gl_index_rgba()).
+            return (c[1] << 8 | c[2]) & ODSY_INDEX_MASK;
         }
-        c.map(|x| x as u8)
+        super::pipe::backend::pack_rgba8(c)
     });
     let depth = (op.clear_buffers & CLEAR_DEPTH != 0).then_some(op.clear_depth24 & ODSY_DEPTH24_MAX);
     let stencil = (op.clear_buffers & CLEAR_STENCIL != 0).then_some(((op.clear_stencil & 0xff) as u8, (op.stencil_mask & 0xff) as u8));

@@ -29,7 +29,7 @@ use super::consts::{
 };
 use super::frame::Frame;
 use super::reader::DisplayRegs;
-use super::vram::UNIT;
+use super::vram::{VramPtr, UNIT};
 use super::record::Recorder;
 use super::trace::trace_mask;
 use super::Odyssey;
@@ -48,7 +48,18 @@ pub(super) fn memory_hash(b: &Board) -> String {
 
 /// `memory_hash` as bytes: what a recording's mark holds.
 pub(super) fn memory_hash_bytes(b: &Board) -> [u8; 32] {
-    *blake3::hash(b.vram.bytes()).as_bytes()
+    let mut h = blake3::Hasher::new();
+    let mem = b.vram.ptr_shared();
+    let mut buf = Vec::with_capacity(1 << 16);
+    for byte in mem.address_bytes() {
+        buf.push(byte);
+        if buf.len() == buf.capacity() {
+            h.update(&buf);
+            buf.clear();
+        }
+    }
+    h.update(&buf);
+    *h.finalize().as_bytes()
 }
 
 pub(super) const HELP: &[&str] = &[
@@ -152,12 +163,12 @@ fn write_png(path: &Path, width: usize, height: usize, data: &[u8], color: png::
 
 impl Odyssey {
     /// The frame the scan-out registers describe now, and board memory.
-    fn screen(&self) -> Result<(Frame, &[u8], DisplayRegs), String> {
+    fn screen(&self) -> Result<(Frame, VramPtr, DisplayRegs), String> {
         let regs = self.state.shared.regs.read();
         let frame = Frame::snapshot(&regs, self.displayed()).ok_or_else(|| "vpro: the scan-out is not set up (PB&J 0x2800-0x2809)".to_string())?;
         let mem = self.state.shared.vram.get().ok_or_else(|| "vpro: board memory is not allocated".to_string())?;
-        // SAFETY: read only, racing the board's units as the display does.
-        Ok((frame, unsafe { mem.bytes() }, regs))
+        // Read only, racing the board's units as the display does.
+        Ok((frame, *mem, regs))
     }
 
     fn displayed(&self) -> u32 {
@@ -652,8 +663,7 @@ impl Odyssey {
         let mut bbox = [(u32::MAX, u32::MAX, 0u32, 0u32); 256];
         for y in 0..height {
             for x in 0..width {
-                let o = wid.offset(x, y) as usize;
-                let d = mem.get(o).copied().unwrap_or(0) as usize;
+                let d = mem.load(wid.offset(x, y), 1) as usize;
                 count[d] += 1;
                 let b = &mut bbox[d];
                 *b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
@@ -746,8 +756,8 @@ impl Odyssey {
         for yy in y..y + ht.max(1) {
             for xx in x..x + wd.max(1) {
                 let get = |s: &super::vram::Surface| {
-                    let o = s.offset(xx, yy) as usize;
-                    mem.get(o..o + s.bytes_per_pixel() as usize).map_or_else(|| "--".to_string(), |b| b.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    let o = s.offset(xx, yy);
+                    (0..s.bytes_per_pixel() as u64).map(|i| format!("{:02x}", mem.load(o + i, 1))).collect::<String>()
                 };
                 let _ = writeln!(out, "  ({xx:4}, {yy:4}) {} | {}", get(&fb), get(&wid));
             }
@@ -758,13 +768,16 @@ impl Odyssey {
     /// `vpro peek`: board memory bytes from an address in 16-byte units.
     fn peek_text(&self, addr: u64, n: u64) -> Result<String, String> {
         let mem = self.state.shared.vram.get().ok_or_else(|| "vpro: board memory is not allocated".to_string())?;
-        // SAFETY: read only, as the display reads.
-        let bytes = unsafe { mem.bytes() };
-        let start = (addr * UNIT) as usize;
-        let end = (start + n as usize).min(bytes.len());
+        // Read only, as the display reads.
+        let start = addr * UNIT;
+        if start >= mem.size() {
+            return Err(format!("vpro peek: {addr:#x} is past the end of board memory"));
+        }
+        let end = (start + n).min(mem.size());
+        let bytes: Vec<u8> = (start..end).map(|a| mem.load(a, 1) as u8).collect();
         let mut out = String::new();
-        for (i, chunk) in bytes.get(start..end).ok_or_else(|| format!("vpro peek: {addr:#x} is past the end of board memory"))?.chunks(16).enumerate() {
-            let _ = writeln!(out, "  {:#010x}: {}", start + 16 * i, chunk.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+        for (i, chunk) in bytes.chunks(16).enumerate() {
+            let _ = writeln!(out, "  {:#010x}: {}", start + 16 * i as u64, chunk.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
         }
         Ok(out)
     }
@@ -795,7 +808,7 @@ impl Odyssey {
             rgb.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
         }
         write_png(&dir.join("screen.png"), w, h, &rgb, png::ColorType::Rgb).map_err(io)?;
-        std::fs::write(dir.join("board.bin"), mem).map_err(io)?;
+        std::fs::write(dir.join("board.bin"), mem.address_bytes().collect::<Vec<u8>>()).map_err(io)?;
         let mut layout = match self.state.quiesce(QUIESCE) {
             Some(g) => Self::layout_text(&g),
             None => "board busy: the registers were not read; vpro mem\n".to_string(),
@@ -809,7 +822,7 @@ impl Odyssey {
 
 #[cfg(test)]
 /// Board memory as a file in `dir`, for the replay's `VPRO_REPLAY_DUMP`.
-pub(super) fn dump_memory(mem: &[u8], dir: &Path) -> std::io::Result<()> {
+pub(super) fn dump_memory(mem: VramPtr, dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join("board.bin"), mem)
+    std::fs::write(dir.join("board.bin"), mem.address_bytes().collect::<Vec<u8>>())
 }

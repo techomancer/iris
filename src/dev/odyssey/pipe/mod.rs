@@ -69,15 +69,7 @@ impl PipeDraw {
                 r.push_shaded(q);
                 self.used.set(true);
             }
-            None => {
-                for i in 0..4usize {
-                    if q.cov & (1 << i) != 0 {
-                        let c = q.rgba[i];
-
-                        self.backend.fragment_q(&self.planes, q.x + (i & 1) as i32, q.y + (i >> 1) as i32, q.zq[i], c.map(u32::from));
-                    }
-                }
-            }
+            None => (self.backend.store)(&self.backend, &self.planes, q),
         }
     }
 }
@@ -94,6 +86,7 @@ impl PipeDraw {
         if to_aux {
             backend.targets = aux_targets(backend.targets, index);
         }
+        backend.store = backend.select(&planes);
         let depth = (planes.depth.v.kind != super::view::Kind::None).then_some(planes.depth);
         let mut raster = RasterState::of(
             &w.raster,

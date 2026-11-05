@@ -25,6 +25,8 @@ pub(super) struct Display {
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
     pub screen: Mutex<Rex3Screen>,
     pub screenshot: AtomicBool,
+    /// Screenshots saved, for the next file's number.
+    screenshot_counter: std::sync::atomic::AtomicU32,
     pub frame: AtomicBool,
     /// Whether the display thread releases the renderer when it ends.
     pub(super) display_stop: crate::gfx_display::DisplayStop,
@@ -56,6 +58,7 @@ impl Display {
             renderer: Mutex::new(None),
             screen: Mutex::new(Rex3Screen::new()),
             screenshot: AtomicBool::new(false),
+            screenshot_counter: std::sync::atomic::AtomicU32::new(0),
             frame: AtomicBool::new(false),
             display_stop: Default::default(),
             local: Mutex::new(None),
@@ -119,6 +122,16 @@ impl Display {
         }
         *self.shown.lock() = (width, height);
         screen.frame_seq = screen.frame_seq.wrapping_add(1);
+        // RCtrl+PrintScreen (ui.rs): save the screen as it is presented.
+        if self.screenshot.swap(false, Ordering::AcqRel) {
+            let pixels = screen.rgba.clone();
+            let n = self.screenshot_counter.fetch_add(1, Ordering::Relaxed);
+            let path = format!("screenshot_{:04}.png", n);
+            std::thread::spawn(move || match crate::disp::save_screenshot(&path, &pixels, w, h) {
+                Ok(()) => println!("iris: screenshot saved to {}", path),
+                Err(e) => println!("iris: screenshot failed: {}", e),
+            });
+        }
         let mut renderer = self.renderer.lock();
         if let Some(renderer) = renderer.as_mut() {
             let mut local = self.local.lock();

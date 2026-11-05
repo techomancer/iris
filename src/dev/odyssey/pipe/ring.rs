@@ -532,12 +532,16 @@ impl QuadRing {
             KIND_SHADED => {
                 // SAFETY: the draw outlives its slots (QuadRing::hold).
                 let d = unsafe { &*s.ptr.cast::<BackendDraw>() };
+                // The quad's pixels in this tile.
+                let mut q = BackQuad { draw: d, x: s.x as i32, y: s.y as i32, zq: s.zq, cov: 0, ..BackQuad::default() };
                 for i in 0..4usize {
-                    let (x, y) = (s.x as i32 + (i & 1) as i32, s.y as i32 + (i >> 1) as i32);
+                    let (x, y) = (q.x + (i & 1) as i32, q.y + (i >> 1) as i32);
                     if s.cov & (1 << i) != 0 && (x & !(size - 1) & (GRID_SPAN - 1)) == px && (y & !(size - 1) & (GRID_SPAN - 1)) == py {
-                        d.state.fragment_q(&d.planes, x, y, s.zq[i], s.colour(i));
+                        q.cov |= 1 << i;
+                        q.rgba[i] = s.colour(i).map(|c| c as u16);
                     }
                 }
+                (d.state.store)(&d.state, &d.planes, &q);
             }
             KIND_RECT => {
                 // SAFETY: the clear outlives its slots (QuadRing::hold_clear).
@@ -570,11 +574,7 @@ impl QuadRing {
                     triangle_quads(&rst, &t.tri, Some((wx0, wy0, wx1, wy1)), |q| {
                         let mut out = BackQuad { x: rst.ox.wrapping_add(q.x), y: rst.oy.wrapping_add(q.y), ..BackQuad::default() };
                         d.shade_quad(t, q, &mut out);
-                        for i in 0..4usize {
-                            if out.cov & (1 << i) != 0 {
-                                p.backend.fragment_q(&p.planes, out.x + (i & 1) as i32, out.y + (i >> 1) as i32, out.zq[i], out.rgba[i].map(u32::from));
-                            }
-                        }
+                        (p.backend.store)(&p.backend, &p.planes, &out);
                     });
                 }
             }
