@@ -32,6 +32,7 @@ What you can inspect depends on how iris was built:
 | `lightning` (official releases) | Strips breakpoint checks and the traceback buffer for speed: breakpoints and `dt` do nothing. Inspection commands still work. |
 | `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`debug`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
 | `--features gputrace` | Graphics traces and recordings (`rex/gr2/mgras/vpro trace`, `rex/mgras rec`) without the rest of `developer`; works with `lightning`. `vpro rec` needs no feature. |
+| `--features rex-gpu` | Experimental REX3 wgpu/WGSL recording replay; implies `gputrace`, remains replay-only, and does not replace the live CPU renderer. |
 | `--features jitv2` | The `j2` commands. `jitv2_lockstep` checks every JIT instruction against the interpreter. |
 | `--features perfetto` | Perfetto timeline traces ([docs/perfetto.md](docs/perfetto.md)). |
 
@@ -386,7 +387,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `rex jit <on\|off\|status\|list>` | REX3 shader JIT (`rex-jit`): switch, counters, compiled and failed shaders |
 | `rex jit <disable\|enable> <dm0> <dm1>` | Take one draw mode out of (or back into) JIT dispatch |
 | `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (also `IRIS_REX3_TRACE=<file>`) |
-| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); replay with `REX3_REPLAY=<file> cargo test --release rex3_replay_file` |
+| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); replay with `REX3_REPLAY=<file> cargo test --release rex3_replay_file`, or add `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the experimental host-GPU path |
 | `rex fbdump [DIR]` | Framebuffers as files in `DIR` (default `.`) |
 | `rex cmap <on\|off>` | CMAP access trace |
 | `rex debug <on\|off>` | REX3 register trace **[DEV]** |
@@ -399,6 +400,12 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `disp compositor <gl\|sw>` | Switch between the GL and software compositor |
 | `block debug <on\|off>` | Block/span draw logging to `block.log` **[DEV]** |
 | `draw debug <on\|off>` | Draw a debug overlay on the framebuffer **[DEV]** |
+
+GPU replay also accepts `REX3_GPU_BACKEND=auto|vulkan|metal|dx12`. It prints
+the selected adapter and coverage/transfer counters, synchronizes before every
+CPU fallback, and rejects a run that submits no draw on the GPU. The current
+subset and standalone hardware-probe command are documented in
+[FEATURES.md](FEATURES.md).
 
 Build with `--features rex-dirty-upload` to make Newport framebuffer snapshot
 copies and GL source-texture uploads use conservative 64x32 RGB/auxiliary

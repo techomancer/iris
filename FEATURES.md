@@ -41,6 +41,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `rex-gpu` | Experimental, replay-only Newport wgpu/WGSL engine. It does not replace the live CPU renderer and is not part of `gpujit` or release builds. | `gputrace`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit`, `gr2-jit` |
@@ -764,6 +765,48 @@ monitor inspects and controls it.
 ```
 cargo run --release --features rex-jit
 ```
+
+### REX3 host-GPU replay prototype (`--features rex-gpu`)
+
+`rex-gpu` adds a headless wgpu/WGSL compute path for differential REX3
+recording replay. It is deliberately separate from `gpujit`, is not enabled by
+default or in release packaging, and does not change the live emulator's CPU
+renderer. Compiling it also enables `gputrace`, which supplies the existing
+REX3 record/replay harness.
+
+The initial GPU subset is intentionally narrow: complete `DRAW` blocks and
+spans with positive integer coordinates, 24-bit RGB planes, RGB color mode,
+`SRC` logic operation, disabled alpha compare, no screen masks, and no
+shading, blending, dithering, patterns, host pixels, fast clear, XY move,
+Y-flip, skip flags, continuation state, or length-32 mode. RGB write masks and
+screen-edge clipping are supported. Unsupported draws first synchronize
+pending GPU work, then use the existing CPU path.
+
+Supported fills share a bounded command batch. The prototype uploads the full
+8 MiB RGB plane when a batch begins and reads the full plane back when it ends.
+Those transfers and every submission, fence, handled draw, fallback, and
+fallback reason are reported. This replay transfer remains full-plane and
+does not make the live presentation framebuffer GPU-resident.
+
+`REX3_GPU_BACKEND=auto|vulkan|metal|dx12` selects the backend. `auto` tries
+Vulkan then D3D12 on Windows, Metal on macOS, and Vulkan elsewhere. The
+hardware probe checks adapter selection, two ordered overlapping fills,
+architectural context progression, batching, and readback:
+
+```sh
+REX3_GPU_BACKEND=vulkan cargo run --release --example rex3-gpu-probe --features rex-gpu
+```
+
+Replay an existing recording with:
+
+```sh
+REX3_REPLAY=draw.rec REX3_REPLAY_ENGINE=gpu REX3_GPU_BACKEND=vulkan \
+  cargo test --release --features rex-gpu rex3_replay_file -- --nocapture
+```
+
+GPU replay fails rather than reporting success if adapter/device setup fails,
+wgpu reports an error, a readback times out, checkpoints diverge, or the
+recording submits no draw through the initial GPU subset.
 
 ### Newport framebuffer presentation
 
