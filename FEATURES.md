@@ -763,6 +763,26 @@ monitor inspects and controls it.
 cargo run --release --features rex-jit
 ```
 
+### Newport framebuffer presentation
+
+Newport tracks conservative 64x32 damage tiles independently for its RGB and
+auxiliary planes. The refresh thread copies only dirty rectangles into its
+cached snapshot, and the GL compositor uploads only those rectangles to the
+existing source textures. This is the default behavior and does not require a
+Cargo feature; the CPU framebuffer and the interpreter/precompiled/Cranelift
+raster engines remain authoritative.
+
+The first frame after GL texture creation uploads both complete 2048x1024
+planes. Later palette-, cursor-, topscan-, and heartbeat-only redraws can
+reuse both source textures without uploading framebuffer data. Set
+`REX3_FORCE_FULL_UPLOAD=1` to restore the previous two-full-plane upload
+behavior for comparison or fallback.
+
+With `--features perfetto`, the raster, snapshot copy, per-plane upload,
+composition, and readback stages have independent slices and
+byte/tile/rectangle counters; see
+[docs/perfetto.md](docs/perfetto.md#newport-framebuffer-damage-and-presentation).
+
 ### IMPACT raster JIT (`--features gr4-jit`)
 
 `gr4-jit` compiles IMPACT's raster pipelines (`src/dev/mgras/rss_jit`). The

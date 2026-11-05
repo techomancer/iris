@@ -37,7 +37,7 @@ event that belongs to several categories is recorded when any of them is on.
 | `net` | Ethernet frames sent, received, refused and filtered. |
 | `audio` | HAL2 codec arm/disarm, codec A pacing, host underruns. |
 | `gfx` | vblank, flips, guest busy-waits, FIFO-full stalls, FIFO level, REX3 present, IMPACT engine busy. |
-| `prim` | One REX3 GO per primitive: up to millions per second under a busy X server. Drop it (`all,-prim`) for long captures. |
+| `prim` | One REX3 GO and its CPU raster work per primitive: up to millions per second under a busy X server. Drop it (`all,-prim`) for long captures. |
 | `jit` | jitv2 compile requests, compiles, compile queue full. |
 | `misc` | Reserved; nothing uses it yet. |
 
@@ -78,7 +78,7 @@ host thread's name.
 | `WD33C93A` | thread | `wd cmd` (arg: command), nested `cdb` (arg: target << 8 \| opcode), `chip int` (arg: status). |
 | `seeq-enet` | thread | `tx frame`, `rx frame` (arg: length), `rx no buffer`, `rx filtered`. |
 | Audio | `HAL2`, `hptimer` | Codec `arm`/`disarm`, `host underrun` (the host audio callback found the ring empty), and a `codec A pace` slice per pacing wake on the timer thread. |
-| Graphics | `REX3 display`, `REX3 busy wait`, `REX3 gfifo full`, `REX3 gfifo level` | `vblank`; `xmap mode write` (how IRIX swaps Newport buffers); the guest reading GFXBUSY from STATUS (waiting for idle); CPU stores retried on a full GFIFO; the FIFO level as STATUS reports it. `REX3-Processor` has a `GO` slice per primitive (`prim`); the refresh thread has `present`. |
+| Graphics | `REX3 display`, `REX3 busy wait`, `REX3 gfifo full`, `REX3 gfifo level` | `vblank`; `xmap mode write` (how IRIX swaps Newport buffers); the guest reading GFXBUSY from STATUS (waiting for idle); CPU stores retried on a full GFIFO; the FIFO level as STATUS reports it. `REX3-Processor` has `GO` and nested `raster` slices per CPU primitive (`prim`); the refresh thread has `present`, `framebuffer copy`, per-plane upload, `compose`, and `readback` work. |
 | Graphics | `GR2 display`, `GR2 busy wait`, `GR2 fifo full` | `vblank`; reads and stores the board answered with bus-busy. |
 | Graphics | `GBE display`, `RE ib full`, `RE ib level` | O2: `timing interrupt` and `shadow latched` on the display track; the interface buffer's level and stores that found it full. The `CRIME-RE` thread shows `CRIME RE busy`, and with the `prim` category `RE primitive` / `RE MTE` slices. |
 | Graphics | `IMPACT display`, `IMPACT busy wait`, `IMPACT fifo full` | `schedule swap` (GL's flip request reaching the GE), `draw bank` (the bank GL draws into, from VALIDATE_BANKS or a context image), `buf select` (the kernel's flip at retrace), `xmap mode write` (a window ID's display mode), `retrace`; reads waiting for idle; stores stalled on the FIFO. `MGRAS-HQ3` / `MGRAS-RSS*` threads show `HQ3 busy` / `RSS busy` and host DMA slices. |
@@ -92,6 +92,61 @@ host thread's name.
 | `odyssey-work` | thread | `slice` per run of queued stores on the front-end thread (arg: stores waiting), `dma descriptor` per page-table transfer (arg: table address). A processor access that drains the queue shows `drain` on its own thread. |
 | `odyssey-raster` | thread | `raster slice` per run of raster jobs on the raster thread (arg: jobs pending). A front end that waits for the raster unit before it touches the planes shows `raster wait` on its own thread (arg: jobs pending). |
 | jitv2 | `jitv2 compile queue`, `jitv2-compile-*` | `compile queue full` from the first dropped request to the next that fits; a `compile` slice per page compile (on the CPU thread in inline-compile mode). |
+
+### Newport framebuffer damage and presentation
+
+Newport tracks RGB and auxiliary-plane damage independently in 64x32 tiles
+over each physical 2048x1024 plane. Writers publish tiles only after their
+stores are visible; the refresh thread atomically takes them before copying.
+Adjacent tiles are coalesced into rectangles for both the CPU snapshot and GL
+texture updates.
+
+The following slices separate work that was previously covered only by the
+outer `present` slice:
+
+| Slice | Meaning |
+|---|---|
+| `raster` | CPU interpreter, precompiled shader, or Cranelift shader dispatch. The argument is the REX3 opcode. |
+| `framebuffer copy` | Dirty RGB/aux tiles copied into the presentation cache. The argument is combined bytes. |
+| `RGB upload` / `aux upload` | CPU and driver time submitting the corresponding `glTexSubImage2D` calls. The argument is bytes. |
+| `compose` | CPU software composition or the Newport GL composition draw, excluding source-plane upload and readback. |
+| `readback` | GL output readback or software-compositor copy into the capture buffer. The argument is bytes. |
+
+Upload slices measure host submission time, not asynchronous GPU completion.
+IRIS deliberately does not insert `glFinish` just to time them.
+
+Every rendered frame samples these counters, including zero values:
+
+- `rex3.dirty.rgb_tiles`, `rex3.dirty.aux_tiles`
+- `rex3.copy.rgb_bytes`, `rex3.copy.aux_bytes`
+- `rex3.upload.rgb_bytes`, `rex3.upload.aux_bytes`
+- `rex3.upload.rgb_rects`, `rex3.upload.aux_rects`
+- `rex3.readback.bytes`
+
+A full plane is 8,388,608 bytes. The first frame after GL texture creation
+uploads both full planes. Later palette-, cursor-, topscan-, or heartbeat-only
+frames upload zero framebuffer bytes. Set `REX3_FORCE_FULL_UPLOAD=1` to make
+every Newport GL composition upload both complete planes, matching the legacy
+path for A/B traces.
+
+To list the per-frame values in `trace_processor`:
+
+```sql
+SELECT
+  ct.name,
+  c.ts,
+  CAST(c.value AS INT) AS value
+FROM counter AS c
+JOIN counter_track AS ct ON ct.id = c.track_id
+WHERE ct.name GLOB 'rex3.*'
+ORDER BY c.ts, ct.name;
+```
+
+Record both `gfx` and `prim` to see the complete pipeline:
+
+```sh
+iris --perfetto rex3.pftrace --perfetto-cats gfx,prim
+```
 
 ## Adding instrumentation
 
