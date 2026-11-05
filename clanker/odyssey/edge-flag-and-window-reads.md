@@ -47,3 +47,27 @@ light the back with the back material and the reversed normal
 (`dev::gl::light::Lighting::light_vertex` already did both faces), and the
 vertices carry the back colour in `vtx::BACK_COLOR` with
 `Prim::back_colours` set, which setup already honoured.
+
+## Separate specular, sphere maps, pixel transfer (2026-11-05)
+
+- **GL_SEPARATE_SPECULAR_COLOR.** Block 0x005 (`TEX_MODE`) bit 19 says the
+  raster adds a second, specular colour after texturing
+  (`tex::MODE_SEPARATE_SPECULAR`). The model lights such vertices with
+  `Lighting::light_vertex_separate`, carries the specular in
+  `vtx::SPECULAR`/`BACK_SPECULAR`, interpolates it in setup and adds it in
+  `ShaderState::shade12`. Points, lines and polygons drawn in line, point
+  or smooth mode take the sum before shading (exact untextured). The lit
+  program is often an uploaded window record: record 15's body also
+  arrives entered at 0x738 (0x738 0x4c5 0x4c5).
+- **GL_SPHERE_MAP.** In the precompiled unlit programs the list continues
+  with 0x06b (S and T from planes) or 0x06c (S and T sphere map) then
+  0x077, without the 0x033 the assembled lists lead with. `sphere_texgen`
+  computes s, t in `Board::sphere_map`.
+- **glPixelTransfer scale and bias** arrive as block 0x203b before an image
+  and apply to image pixels drawn into a window (`Board::image_transfer`),
+  as to copies.
+- **Still open:** pixel maps (uploaded by DMA to 0xcb000, not used),
+  colour-index images into RGBA windows, signed texel uploads one or two
+  steps below the board, ABGR with BYTE, byte-swapped INT and 5:5:5:1
+  draws, glCopyPixels with zoom (1, -1), the depth of glDrawPixels
+  (`drawpixels-skips-fragment-operations.md`).
