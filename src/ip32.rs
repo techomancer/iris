@@ -122,6 +122,54 @@ pub use crate::dev::mace_uart::*;
 pub use crate::dev::ns16550::*;
 pub use crate::dev::mace_id::*;
 
+/// The two SCSI controllers an O2 has on its motherboard. CRIME carries a
+/// separate interrupt line for each, which is the clearest evidence that
+/// both are expected to be there.
+pub const IP32_SCSI_SLOT: u8 = 1;
+pub const IP32_SCSI_SLOT_B: u8 = 2;
+
+/// Which of CRIME's interrupt inputs the pin of the function in that slot
+/// drives. NetBSD works this out for itself and prints it: "interrupting at
+/// crime interrupt 8".
+pub const IP32_SCSI_CRIME_INT: u32 = 8;
+pub const IP32_SCSI_CRIME_INT_B: u32 = 9;
+
+/// The O2's PCI bus: MACE's bus 0, with its host outputs being CRIME's
+/// interrupt inputs.
+pub static PCI_BUS: crate::pci::slots::BusDesc = {
+    use crate::pci::slots::{BusDesc, Evidence, SlotDesc, SlotKind};
+    BusDesc {
+        id: "pci",
+        name: "O2 PCI bus",
+        devices: 32,
+        outputs: 16,
+        slots: &[
+            SlotDesc {
+                device: IP32_SCSI_SLOT, label: "internal SCSI", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: "MACE specification Tables 85, 87, 90; the board's two AIC-7880s",
+                routes: [Some(IP32_SCSI_CRIME_INT as u8), None, None, None],
+            },
+            SlotDesc {
+                device: IP32_SCSI_SLOT_B, label: "external SCSI", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: "MACE specification Tables 85, 87, 90; the board's two AIC-7880s",
+                routes: [Some(IP32_SCSI_CRIME_INT_B as u8), None, None, None],
+            },
+            SlotDesc {
+                device: 3, label: "PCI option", kind: SlotKind::AddIn, evidence: Evidence::Established,
+                source: "MACE specification Tables 85, 87, 90 (routing); O2 Workstation Hardware Reference Guide \
+                         007-3275-003 pp. 3-4 (rear-panel label, 'PCI option board')",
+                routes: [Some(10), Some(13), Some(14), Some(15)],
+            },
+            SlotDesc {
+                device: 4, label: "virtio-serial", kind: SlotKind::ParavirtualSpare, evidence: Evidence::Approximation,
+                source: "a device number the MACE specification routes (Table 85) and no O2 board uses",
+                routes: [Some(11), None, None, None],
+            },
+        ],
+        wires: &[],
+    }
+};
+
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 /// CRIME's no-ECC alias of the memory window: the same memory as
@@ -471,7 +519,7 @@ impl Ip32Bus {
                 gbe.tr = crime.tr.clone();
                 gbe
             },
-            mace: Mace::new(ram.clone(), crime, ust),
+            mace: Mace::new(&PCI_BUS, ram.clone(), crime, ust),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
         };
@@ -498,8 +546,8 @@ impl Ip32Bus {
             let scsi_b = crate::dev::aic7880::Aic7880::new_at(1, bus_b);
             scsi.set_heartbeat(bus.mace.id.heartbeat.clone());
             scsi_b.set_heartbeat(bus.mace.id.heartbeat.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
+            bus.mace.pci.bus().attach(crate::pci::slots::PciAddr::dev(IP32_SCSI_SLOT_B), scsi_b.clone());
+            bus.mace.pci.bus().attach(crate::pci::slots::PciAddr::dev(IP32_SCSI_SLOT), scsi.clone());
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
