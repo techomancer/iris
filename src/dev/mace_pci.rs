@@ -728,7 +728,7 @@ mod tests {
         let crime = Arc::new(Crime(Mutex::new(Vec::new())));
         let pci = MacePci::new(crime.clone(), test_ram());
         let f = Arc::new(Fake {
-            cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1,
+            cfg: PciConfig::new(0x9004, 0x8078, 0x01_0000, 1,
                 [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA),
             last: Mutex::new(None),
             irq: std::sync::OnceLock::new(),
@@ -770,7 +770,7 @@ mod tests {
         let crime = Arc::new(Crime(Mutex::new(Vec::new())));
         let pci = MacePci::new(crime, test_ram());
         let f = Arc::new(Fake {
-            cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1,
+            cfg: PciConfig::new(0x9004, 0x8078, 0x01_0000, 1,
                 [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA),
             last: Mutex::new(None),
             irq: std::sync::OnceLock::new(),
@@ -803,7 +803,7 @@ mod tests {
         let make = |crime: Arc<Crime>| {
             let pci = MacePci::new(crime, test_ram());
             let f = Arc::new(Fake {
-                cfg: PciConfig::new(0x9004, 0x8078, 0x0100_00, 1,
+                cfg: PciConfig::new(0x9004, 0x8078, 0x01_0000, 1,
                     [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA),
                 last: Mutex::new(None),
                 irq: std::sync::OnceLock::new(),
