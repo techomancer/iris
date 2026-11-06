@@ -292,9 +292,9 @@ pub struct MaceAudio {
     gaps: [AtomicU64; 2],
     gap_items: [AtomicU64; 2],
     last_report: Mutex<Option<Instant>>,
-    /// IRIS_O2_AUDIO_DUMP=<file>: every sample each output plays, at the
+    /// IRIS_AUDIO_DUMP=<file>: every sample each output plays, at the
     /// guest's rate, before resampling (see `dump`).
-    dump: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+    dump: Option<crate::dev::audio_dump::AudioDump>,
     /// Its bits of MACE's ISA status (0..7).
     irq: std::sync::OnceLock<Vec<crate::irq::IrqLine>>,
 }
@@ -317,11 +317,7 @@ impl MaceAudio {
             gaps: [AtomicU64::new(0), AtomicU64::new(0)],
             gap_items: [AtomicU64::new(0), AtomicU64::new(0)],
             last_report: Mutex::new(None),
-            dump: Mutex::new(
-                std::env::var_os("IRIS_O2_AUDIO_DUMP")
-                    .and_then(|p| std::fs::File::create(p).ok())
-                    .map(std::io::BufWriter::new),
-            ),
+            dump: crate::dev::audio_dump::AudioDump::from_env(),
             irq: std::sync::OnceLock::new(),
         }
     }
@@ -596,28 +592,14 @@ impl MaceAudio {
         }
     }
 
-    /// Append one record per output that played: the output (u8), its rate
-    /// and pair count (u32 each), then the pairs, all little-endian. Works
-    /// with or without host output, so a muted run can still be checked.
+    /// Append one record per output that played, tagged with the output
+    /// number (see `audio_dump`). Works with or without host output, so a
+    /// muted run can still be checked.
     fn dump(&self, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
-        use std::io::Write;
-        let mut dump = self.dump.lock();
-        let Some(w) = dump.as_mut() else { return };
+        let Some(dump) = self.dump.as_ref() else { return };
         for out in 0..2 {
-            if pcm[out].is_empty() {
-                continue;
-            }
-            let mut rec = Vec::with_capacity(9 + pcm[out].len() * 4);
-            rec.push(out as u8);
-            rec.extend_from_slice(&rates[out].to_le_bytes());
-            rec.extend_from_slice(&(pcm[out].len() as u32).to_le_bytes());
-            for &(l, r) in &pcm[out] {
-                rec.extend_from_slice(&l.to_le_bytes());
-                rec.extend_from_slice(&r.to_le_bytes());
-            }
-            let _ = w.write_all(&rec);
+            dump.record(Some(out as u8), rates[out], pcm[out].iter().copied());
         }
-        let _ = w.flush();
     }
 
     /// Resample each channel to the host rate, mix and push.
@@ -805,6 +787,30 @@ mod tests {
     fn read_codec(a: &MaceAudio, reg: u32) -> u16 {
         a.write(MACE_AUDIO + 0x08, (reg as u64) << 17 | 1 << 16);
         a.read(MACE_AUDIO + 0x18) as u16
+    }
+
+    /// The dump keeps the layout it has always had on the O2: a record per
+    /// output that played, the output number ahead of the rate and count.
+    #[test]
+    fn the_dump_records_each_output_that_played() {
+        let path = std::env::temp_dir().join(format!("iris-mace-dump-{}.bin", std::process::id()));
+        let mut a = MaceAudio::new();
+        a.dump = crate::dev::audio_dump::AudioDump::create(path.as_os_str());
+        a.dump(&[vec![(1, -2)], vec![]], &[48000, 8000]);
+        a.dump(&[vec![], vec![(3, 4), (5, 6)]], &[48000, 8000]);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut want = Vec::new();
+        for (out, rate, pairs) in [(0u8, 48000u32, vec![(1i16, -2i16)]), (1, 8000, vec![(3, 4), (5, 6)])] {
+            want.push(out);
+            want.extend_from_slice(&rate.to_le_bytes());
+            want.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+            for (l, r) in pairs {
+                want.extend_from_slice(&l.to_le_bytes());
+                want.extend_from_slice(&r.to_le_bytes());
+            }
+        }
+        assert_eq!(bytes, want);
     }
 
     #[test]

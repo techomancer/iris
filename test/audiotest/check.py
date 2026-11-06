@@ -7,7 +7,7 @@ four bytes):
   Octane  a WAV, 44.1 kHz stereo 16-bit (IRIS_AUDIO_DUMP=x.wav). MARKS holds
           byte offsets into its data chunk.
   O2      a dump of what MACE audio played at the guest's own rate
-          (IRIS_O2_AUDIO_DUMP): records of out:u8, rate:u32, pairs:u32, then
+          (IRIS_AUDIO_DUMP): records of out:u8, rate:u32, pairs:u32, then
           pairs x (l:i16, r:i16), little-endian. MARKS holds byte offsets into
           the file. A case is the records that start inside its span; they
           are joined per (output, rate) and the group with the most sound

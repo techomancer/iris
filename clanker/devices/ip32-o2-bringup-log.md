@@ -50,7 +50,7 @@ Diagnostics that remain, all off unless set:
 | `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the control port's `retrace` |
 | `IRIS_IP32_MEC_TRACE` | Ethernet frames sent and received, and why a received one was dropped |
 | `IRIS_O2_AUDIO_TRACE` | audio output activity, and each time a ring ran dry between sounds |
-| `IRIS_O2_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling |
+| `IRIS_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling |
 | `IRIS_O2_AUDIO_CAPTURE=file` | what the host plays, after resampling and mixing (raw 16-bit stereo) |
 
 ## The assessment (2026-09-19)
@@ -1902,6 +1902,6 @@ was wrong, and what it turned out to be:
 Instruments added for it: the control port's `pixel X Y` (one scanned-out
 point: frame-buffer word, DID, mode-table entry, colour map, overlay) and
 `unmapped`; `IRIS_O2_FRAG_PROBE=x,y` (every triangle fragment at a pixel,
-with texture coordinates, LOD and level); `IRIS_O2_AUDIO_DUMP` (each
+with texture coordinates, LOD and level); `IRIS_O2_AUDIO_DUMP`, now `IRIS_AUDIO_DUMP` (each
 output's samples at the guest's rate); and the "ring ran dry" count in the
 audio trace.
