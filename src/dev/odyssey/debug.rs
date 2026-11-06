@@ -51,8 +51,8 @@ pub(super) fn memory_hash_bytes(b: &Board) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     let mem = b.vram.ptr_shared();
     let mut buf = Vec::with_capacity(1 << 16);
-    for byte in mem.address_bytes() {
-        buf.push(byte);
+    for word in mem.address_words() {
+        buf.extend_from_slice(&word.to_be_bytes());
         if buf.len() == buf.capacity() {
             h.update(&buf);
             buf.clear();

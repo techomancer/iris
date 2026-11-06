@@ -215,7 +215,13 @@ impl VramPtr {
     /// The memory as bytes in address order, for what is a byte stream by
     /// nature: a dump file, the memory hash.
     pub fn address_bytes(&self) -> impl Iterator<Item = u8> + '_ {
-        (0..self.size()).map(move |a| self.load(a, 1) as u8)
+        self.address_words().flat_map(u64::to_be_bytes)
+    }
+
+    /// The memory as words in address order, the lowest address the
+    /// highest byte (load()'s bits).
+    pub fn address_words(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.size()).step_by(8).map(move |a| self.load(a, 8))
     }
 
     /// No memory: a view of a field the surface lacks, which nothing reads.
