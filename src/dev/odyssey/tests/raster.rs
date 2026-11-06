@@ -759,9 +759,9 @@ fn stress(seed: u64, last_is_lut: bool) {
                 }
                 5 => {
                     let i = rng.next_u32() % 0x600;
-                    s.backend_data(ODSY_GAMMA_BASE + i, rng.next_u32() & lut::ENTRY_MASK);
+                    s.display_fifo.lock().data(ODSY_GAMMA_BASE + i, rng.next_u32() & lut::ENTRY_MASK);
                 }
-                6 => s.backend_data(cursor::BASE + cursor::POSITION, (rng.next_u32() % 1200) << 16 | (rng.next_u32() % 1000)),
+                6 => s.display_fifo.lock().data(cursor::BASE + cursor::POSITION, (rng.next_u32() % 1200) << 16 | (rng.next_u32() % 1000)),
                 7 => {
                     let (x, y) = (rng.next_u32() % 1200, rng.next_u32() % 1000);
                     s.draw_mask = ODSY_DRAW_MASK_BUFFER0;
@@ -787,7 +787,7 @@ fn stress(seed: u64, last_is_lut: bool) {
                 s.paint_pixel((rng.next_u32() % 1280) as i64, (rng.next_u32() % 1024) as i64, rng.next_u32());
             } else {
                 // The entry every black pixel is looked up in.
-                s.backend_data(ODSY_GAMMA_BASE, rng.next_u32() & lut::ENTRY_MASK);
+                s.display_fifo.lock().data(ODSY_GAMMA_BASE, rng.next_u32() & lut::ENTRY_MASK);
             }
         }
         std::thread::sleep(Duration::from_micros(1500));

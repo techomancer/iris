@@ -23,8 +23,9 @@ use super::consts::{
     cfifo, flctl, intr, route, status0, swap, ODSY_CONTROL, ODSY_DISPLAYED_BUFFER,
     ODSY_ERROR_ADDR_LOWER, ODSY_ERROR_ADDR_UPPER, ODSY_ERROR_COMMAND, ODSY_IDENTITY,
     ODSY_INT_DEST_LOWER, ODSY_INT_DEST_UPPER, ODSY_INT_DEST_WIDGET_BITS, ODSY_STATUS, ODSY_STATUS0,
-    ODSY_SW_TOKEN, ODSY_XT_REQ_TIMEOUT,
+    ODSY_SW_TOKEN, ODSY_XT_REQ_TIMEOUT, ODSY_BLOCK_END,
 };
+use super::display_fifo::display_fifo_access;
 use super::fifo::CommandFifo;
 use super::mmio::{access_waits, command_store, fifo_port};
 use super::registers::reg;
@@ -277,10 +278,15 @@ impl HostInterface {
 
 /// Whether `addr` is a front register for this access: one of the
 /// registers that do not wait for the board's work. The other accesses
-/// that do not wait (the back end's read window, unmodeled offsets) read
-/// the board's state directly (`BoardCell`).
+/// that do not wait are the display FIFO's (display_fifo.rs), and the
+/// unmodeled offsets, which read the board's state directly (`BoardCell`).
 pub(super) fn front_register(addr: u64, size: u32, write: bool) -> bool {
-    if fifo_port(addr) || reg(addr, size).is_none() || access_waits(addr, size, write) {
+    if fifo_port(addr) || reg(addr, size).is_none() || display_fifo_access(addr, size, write) || access_waits(addr, size, write) {
+        return false;
+    }
+    // The configuration block's unmodelled words (the link configuration at
+    // 0x48 and the two after it) are logged and read zero on the board.
+    if addr < ODSY_BLOCK_END && !matches!(reg(addr, size), Some(ODSY_IDENTITY | ODSY_STATUS | ODSY_ERROR_ADDR_UPPER | ODSY_ERROR_ADDR_LOWER | ODSY_CONTROL | ODSY_XT_REQ_TIMEOUT | ODSY_INT_DEST_UPPER | ODSY_INT_DEST_LOWER | ODSY_ERROR_COMMAND)) {
         return false;
     }
     if !write {

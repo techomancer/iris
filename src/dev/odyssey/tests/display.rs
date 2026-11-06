@@ -472,7 +472,7 @@ fn a_plane_pixel_reaches_the_display_without_its_alpha() {
 #[test]
 fn the_display_channel_size_sets_the_scanout_mode() {
     let (mut s, _) = board("v12");
-    let size = |s: &Board| (s.scanout.mode.width, s.scanout.mode.height);
+    let size = |s: &Board| (s.scanout_mode().width, s.scanout_mode().height);
     assert_eq!(size(&s), (1280, 1024));
 
     backend(&mut s, 0x3000_0000 | 0x2802 << 14 | 5);
@@ -726,7 +726,7 @@ fn the_host_reads_the_cursor_glyph_and_position_from_the_registers() {
 
     let (mut s, _) = board("v12");
     let display = Display::new(crate::disp::StatusSource::detached());
-    display.attach_registers(s.scanout.shared.clone());
+    display.attach_registers(s.display.clone());
     assert_eq!(display.hw_cursor(), None, "out of reset the cursor is off");
 
     cursor_load(&mut s, 2, 3);

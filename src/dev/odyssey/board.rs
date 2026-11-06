@@ -16,7 +16,7 @@ use super::clip::ClipRect;
 use super::pixel_dma::GuestMemory;
 use super::raster_unit::RasterQueue;
 use super::reader::DisplayShared;
-use super::scanout::Scanout;
+use super::display_fifo::DisplayFifo;
 #[cfg(test)]
 use super::reader::ScanoutReader;
 /// Distinct unimplemented offsets reported before the device falls silent
@@ -74,8 +74,6 @@ pub(super) struct Reports {
     pub memory_control_reported: bool,
     pub setup_7f0_reported: bool,
     pub stats_reported: bool,
-    pub overlay_mode_reported: bool,
-    pub cursor_reported: u32,
     pub draw_mask_stereo_reported: bool,
     pub draw_mask_high_reported: bool,
     pub drawable_word_reported: bool,
@@ -255,14 +253,6 @@ pub(super) struct Widget {
     pub ctx_shadow_addr_lower: u32,
     pub buzz: [u32; 6],
     pub nic: u32,
-    pub i2c_main_cmd: u32,
-    pub i2c_opt_cmd: u32,
-    /// Back-end entries 0x2000-0x2fff as last written (0x1000 entries). The
-    /// colour lookup RAM, the display modes, the overlay modes and the
-    /// cursor, which the display reads, are in `scanout.shared.regs`.
-    pub backend_ctl: Vec<u32>,
-    pub backend_index: u32,
-    pub backend_count: u32,
     // Command-FIFO self-test.
     pub selftest_progress: u32,
     pub cfifo_selftest_ready: bool,
@@ -496,9 +486,13 @@ pub(super) struct Board {
     /// The BEGIN-0xa image raster path.
     pub image: ImageRaster,
 
-    /// The scanout's mode and the marks the display takes. The presented
-    /// frame and the retrace are the display's own (`ScanoutReader`).
-    pub scanout: Scanout,
+    /// What the board shares with the display: the display's registers,
+    /// board memory, the retrace. The presented frame and the retrace are
+    /// the display's own (`ScanoutReader`).
+    pub display: std::sync::Arc<DisplayShared>,
+    /// The display FIFO, with its own lock: processors store to it with no
+    /// wait for the board's work (display_fifo.rs).
+    pub display_fifo: std::sync::Arc<parking_lot::Mutex<DisplayFifo>>,
     /// Tests: the reader that stands in for the display thread
     /// (Board::scanout_update()).
     #[cfg(test)]
@@ -510,8 +504,8 @@ impl Default for Board {
         let front: std::sync::Arc<parking_lot::Mutex<HostInterface>> = Default::default();
         let fifo = front.lock().fifo.clone();
         let raster: std::sync::Arc<RasterQueue> = Default::default();
-        let shared = std::sync::Arc::new(DisplayShared::new(front.clone()));
-        let scanout = Scanout::new(shared);
+        let display = std::sync::Arc::new(DisplayShared::new(front.clone()));
+        let display_fifo = std::sync::Arc::new(parking_lot::Mutex::new(DisplayFifo::new(display.clone())));
         Board {
             slot: 0,
             front,
@@ -543,11 +537,6 @@ impl Default for Board {
                 ctx_shadow_addr_lower: 0,
                 buzz: [0; 6],
                 nic: 0,
-                i2c_main_cmd: 0,
-                i2c_opt_cmd: 0,
-                backend_ctl: vec![0; 0x1000],
-                backend_index: 0,
-                backend_count: 0,
                 selftest_progress: 0,
                 cfifo_selftest_ready: false,
             },
@@ -555,8 +544,6 @@ impl Default for Board {
                 memory_control_reported: false,
                 setup_7f0_reported: false,
                 stats_reported: false,
-                overlay_mode_reported: false,
-                cursor_reported: 0,
                 draw_mask_stereo_reported: false,
                 draw_mask_high_reported: false,
                 drawable_word_reported: false,
@@ -766,7 +753,8 @@ impl Default for Board {
                 bytes: 0,
                 nbytes: 0,
             },
-            scanout,
+            display,
+            display_fifo,
             #[cfg(test)]
             reader: Default::default(),
         }
@@ -900,18 +888,12 @@ impl Board {
         self.diag.draw_mask_high_reported = false;
         self.diag.drawable_word_reported = false;
         self.widget.nic = 0;
-        self.widget.i2c_main_cmd = 0;
-        self.widget.i2c_opt_cmd = 0;
-        self.widget.backend_ctl.fill(0);
+        self.display_fifo.lock().reset();
         self.regs().reset();
-        self.diag.overlay_mode_reported = false;
-        self.diag.cursor_reported = 0;
         self.diag.gl_aux_reported = false;
         self.diag.aux_mask_reported = false;
         self.diag.copy_mixed_base_reported = false;
         self.diag.aux_image_reported = false;
-        self.widget.backend_index = 0;
-        self.widget.backend_count = 0;
         self.diag.reported_addr_count.store(0, std::sync::atomic::Ordering::Relaxed);
         self.diag.reported_cmd_count = 0;
         self.diag.line_stipple_reported = false;
@@ -1170,7 +1152,7 @@ impl Board {
         self.draw_word = 0x8000_2000;
         self.read_word = 0x8000_2000;
         for (i, v) in [(pbj::OVERLAY_BASE, 0x14_2000), (pbj::PIXEL_BASE, 0x2000), (pbj::WIDTH, 1280), (pbj::HEIGHT, 1024), (pbj::STRIDE, 80), (pbj::DEPTH, 3)] {
-            self.widget.backend_ctl[(pbj::BASE - super::consts::backend::CTL_BASE) as usize + i] = v;
+            self.display_fifo.lock().ctl[(pbj::BASE - super::consts::backend::CTL_BASE) as usize + i] = v;
             self.regs().set_pbj(i, v);
         }
         self.regs().set_dispmode(0, 0x0096_55a6);
@@ -1183,9 +1165,10 @@ impl Board {
         }
     }
 
-    /// Scan-out entry 0x2800 + i (frame::pbj) as the back end last took it.
+    /// Scan-out entry 0x2800 + i (frame::pbj) as the back end last took it,
+    /// from the display's words (no lock: drawing reads it).
     pub fn pbj(&self, i: usize) -> u32 {
-        self.widget.backend_ctl[(super::frame::pbj::BASE - super::consts::backend::CTL_BASE) as usize + i]
+        self.regs().pbj(i)
     }
 
     /// Where drawing lands now (view::DestViews), kept for the register
@@ -1244,7 +1227,7 @@ impl Board {
         // long as the board: the memory is never resized or moved.
         {
             let mem = self.vram.ptr();
-            let _ = self.scanout.shared.vram.set(mem);
+            let _ = self.display.vram.set(mem);
         }
 
         // Setting the mode restarts the retrace at the mode's rate.
@@ -1265,10 +1248,11 @@ impl Board {
         self.vram.words_mut().fill(0);
         self.stream.poly_marks.fill(0);
         // Back to the boot size, and restart the phase.
-        if self.scanout.mode.width != ODSY_WIDTH || self.scanout.mode.height != ODSY_HEIGHT {
+        let mode = self.scanout_mode();
+        if mode.width != ODSY_WIDTH || mode.height != ODSY_HEIGHT {
             self.set_scanout_size(ODSY_WIDTH, ODSY_HEIGHT);
         }
-        self.scanout.reset();
+        self.display.restart_retrace();
     }
 }
 

@@ -317,11 +317,8 @@ impl Odyssey {
                     "  board: {} revision {:#x} at widget {}, {} MB in {} banks, identity {:#010x}, back end version {}",
                     g.widget.product, g.widget.revision, g.slot, g.widget.memory_size, g.widget.memory_banks, id, g.widget.backend_version
                 );
-                let _ = writeln!(
-                    out,
-                    "  scanout {}x{}, {} clocks a frame at {} Hz",
-                    g.scanout.mode.width, g.scanout.mode.height, g.scanout.mode.frame_clocks, g.scanout.mode.clock_hz
-                );
+                let mode = g.scanout_mode();
+                let _ = writeln!(out, "  scanout {}x{}, {} clocks a frame at {} Hz", mode.width, mode.height, mode.frame_clocks, mode.clock_hz);
                 let _ = writeln!(
                     out,
                     "  drawing: draw mask {:#x} draw word {:#010x} read word {:#010x} dest {:#010x} plane write mask {:#010x}",
@@ -428,8 +425,10 @@ impl Odyssey {
         let _ = writeln!(out, "  fifo setup 0x6b0-0x6b3,0x7b5: {:x?}  0x7f0 {:#x}", wg.fifo_setup, wg.setup_7f0);
         let _ = writeln!(out, "  host write addr {:#x}:{:#x}  stats addr {:#x}:{:#x} control {:#x}  ctx shadow {:#x}:{:#x}",
             wg.host_write_addr_upper, wg.host_write_addr_lower, wg.stats_addr_upper, wg.stats_addr_lower, wg.stats_control, wg.ctx_shadow_addr_upper, wg.ctx_shadow_addr_lower);
-        let _ = writeln!(out, "  buzz {:x?}  nic {:#x} (serial {:#x})  i2c main {:#x} opt {:#x}", wg.buzz, wg.nic, wg.nic_serial, wg.i2c_main_cmd, wg.i2c_opt_cmd);
-        let _ = writeln!(out, "  back end: index {:#x} count {}  version {}  selftest progress {} ready {}", wg.backend_index, wg.backend_count, wg.backend_version, wg.selftest_progress, wg.cfifo_selftest_ready);
+        let df = g.display_fifo.lock();
+        let _ = writeln!(out, "  buzz {:x?}  nic {:#x} (serial {:#x})  i2c main {:#x} opt {:#x}", wg.buzz, wg.nic, wg.nic_serial, df.i2c_main_cmd, df.i2c_opt_cmd);
+        let _ = writeln!(out, "  back end: index {:#x} count {}  version {}  selftest progress {} ready {}", df.index, df.count, wg.backend_version, wg.selftest_progress, wg.cfifo_selftest_ready);
+        drop(df);
         let _ = writeln!(out, "  product record: {}", if wg.nic_record.is_empty() { &wg.product_record } else { &wg.nic_record });
         Ok(out)
     }
@@ -578,11 +577,14 @@ impl Odyssey {
         let _ = writeln!(out, "  FB_DEPTH {} bytes, WIN_DEPTH {} bytes, PIXEL_FMT {}, FIELD_FMT {}, index {}, scratch {}", 1u32 << f.fb_log2, 1u32 << f.win_log2, f.pixel_fmt, f.field_fmt, f.index, f.scratch);
         let _ = writeln!(out, "  fields: A {:?}  B {:?}  depth {:?}  stencil {:?}", d.colour[0].kind, d.colour[1].kind, d.depth.kind, d.stencil.kind);
         let _ = writeln!(out, "buffer select (0x024) {:#x}, draw word {:#010x}, read word {:#010x}", b.draw_mask, b.draw_word, b.read_word);
-        let ctl = |i: u32| b.widget.backend_ctl[(i - backend::CTL_BASE) as usize];
+        let df = b.display_fifo.lock();
+        let ctl = |i: u32| df.ctl[(i - backend::CTL_BASE) as usize];
         let _ = writeln!(out, "scan-out (PB&J): window-id base {:#x}, pixel base {:#x}, {}x{}, stride {} tiles, depth code {} ({} bytes)",
             ctl(0x2800), ctl(0x2801), ctl(0x2802), ctl(0x2803), ctl(0x2807), ctl(0x2809), 2u32 << (ctl(0x2809) & 7));
+        let mode = df.scanout.mode;
+        drop(df);
         let _ = writeln!(out, "scanout {}x{}, {} clocks a frame at {} Hz; displayed-buffer bits {:#010x}",
-            b.scanout.mode.width, b.scanout.mode.height, b.scanout.mode.frame_clocks, b.scanout.mode.clock_hz, b.front.lock().displayed_buffer);
+            mode.width, mode.height, mode.frame_clocks, mode.clock_hz, b.front.lock().displayed_buffer);
         out
     }
 
@@ -593,11 +595,12 @@ impl Odyssey {
 
     fn backend_text(&self, start: u32, n: u32) -> Result<String, String> {
         let g = self.quiesced()?;
-        let ctl = &g.widget.backend_ctl;
+        let df = g.display_fifo.lock();
+        let ctl = &df.ctl;
         let first = start.saturating_sub(backend::CTL_BASE).min(backend::CTL_ENTRIES) as usize;
         let last = (first + n as usize).min(ctl.len());
         let mut out = String::new();
-        let _ = writeln!(out, "back-end register file (PB&J), index {:#x} count {}; entries {:#x}..{:#x} that are set:", g.widget.backend_index, g.widget.backend_count, backend::CTL_BASE + first as u32, backend::CTL_BASE + last as u32);
+        let _ = writeln!(out, "back-end register file (PB&J), index {:#x} count {}; entries {:#x}..{:#x} that are set:", df.index, df.count, backend::CTL_BASE + first as u32, backend::CTL_BASE + last as u32);
         let mut shown = 0;
         for i in first..last {
             if ctl[i] == 0 {

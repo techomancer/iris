@@ -777,6 +777,35 @@ fn a_flow_control_target_store_does_not_wait_for_the_fifo() {
     h.work_stop();
 }
 
+/// The display FIFO is its own path to the back end: a store to it, and a
+/// read of the window, go in at once while the command FIFO holds queued
+/// work. The driver makes some of these stores with its interrupts masked,
+/// so a store answered busy there would keep them masked for the drain.
+#[test]
+fn a_display_fifo_store_does_not_wait_for_the_command_fifo() {
+    use crate::dev::odyssey::consts::{backend, cursor};
+    let (h, _rec) = threaded_board();
+    let words = preamble_twice();
+
+    start_long_slice(&h, &words, 2000);
+    assert!(h.bus_write(consts::cmd::FIFO, 0, 4));
+    assert!(h.fifo.pending(), "work is queued behind the slice in flight");
+
+    // A record of one word: the cursor position.
+    let entry = cursor::BASE + cursor::POSITION;
+    let header = (backend::TAG_HEADER << backend::TAG_SHIFT) | (entry << backend::SELECTOR_INDEX_SHIFT) | 1;
+    assert!(h.bus_write(backend::SELECT, (header as u64) << 32 | 0x0002_0003, 8), "the store is accepted at once");
+    let window = backend::READ_BASE + ((entry as u64) << 3);
+    assert_eq!(h.bus_read(window, 4), Some(0x0002_0003), "and reads back at once");
+    assert!(h.fifo.pending(), "it did not drain the FIFO");
+
+    let mut report = Vec::new();
+    h.refusals.report(&mut report).unwrap();
+    let report = String::from_utf8(report).unwrap();
+    assert!(!report.contains("offset 0x400000"), "{report}");
+    h.work_stop();
+}
+
 /// Both processors can find room for one more store in a ring that has
 /// room for one. The check and the push are not one step, so the second
 /// push meets a full ring: exactly one store goes in, the other is

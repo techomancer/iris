@@ -172,14 +172,14 @@ impl Board {
     /// The colormap group main drawable main_id shows through: bits 8:4 of its
     /// display mode. Below ODSY_GAMMA_GROUP the word is an index.
     pub fn display_group(&mut self, main_id: u32) -> u32 {
-        self.scanout.shared.regs.display_group(main_id)
+        self.display.regs.display_group(main_id)
     }
 
     /// A vertical retrace: the host interface latches the swaps armed and
     /// raises the retrace source (HostInterface::retrace()).
     #[cfg(test)]
     pub fn retrace(&mut self) {
-        self.scanout.shared.retrace();
+        self.display.retrace();
     }
 }
 
@@ -189,7 +189,7 @@ impl Board {
 impl Board {
     fn test_reader(&mut self) -> &mut ScanoutReader {
         self.raster_wait();
-        self.reader.attach(&self.scanout.shared);
+        self.reader.attach(&self.display);
         &mut self.reader
     }
 
