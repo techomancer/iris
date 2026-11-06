@@ -1033,6 +1033,9 @@ impl Inner {
         let t = self.clock_locked(&at);
         let held = self.stalled_ns.load(Ordering::SeqCst);
         let late = t - due;
+        if late > interval {
+            crate::pf_instant!(crate::perfetto::events::RAD_LATE, late / 1000);
+        }
         let shift = if late > interval {
             let floor = self.seen_ns.load(Ordering::SeqCst);
             -late.min(STALL_MAX_NS - held).min(t.saturating_sub(floor)).max(0)
@@ -1533,7 +1536,24 @@ impl Inner {
         if !ok {
             crate::dlog!(LogModule::Rad1, "rad1: status DMA at {slot:#x} failed");
         }
+        crate::pf_instant!(crate::perfetto::events::RAD_STATUS, s.status_cursor);
+        crate::pf_counter!(crate::perfetto::events::RAD_STATUS_UNREAD, self.status_unread(s));
         ok
+    }
+
+    /// For the trace: the ring's slots whose done bit (bit 31 of the done
+    /// word) the driver has not yet cleared; it consumes a slot by clearing
+    /// that bit.
+    #[cfg(feature = "perfetto")]
+    fn status_unread(&self, s: &State) -> u32 {
+        let Some(dma) = self.dma.get() else { return 0 };
+        let base = Self::status_base(s);
+        (0..s.status_slots)
+            .filter(|&i| {
+                let mut w = [0u8; 4];
+                base.checked_add(u64::from(i) * SLOT_STRIDE + SLOT_DONE_OFFSET).is_some_and(|a| dma.dma_read(a, &mut w).is_ok()) && u32::from_le_bytes(w) & 0x8000_0000 != 0
+            })
+            .count() as u32
     }
 
     /// A write to a channel's enable register. Its own bit starts and stops
