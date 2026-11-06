@@ -48,6 +48,7 @@ pub mod ds1x86;
 pub mod eeprom_93c56;
 pub mod elsc;
 pub mod elsc_nvram;
+pub mod sgi_nvram;
 pub mod hal2;
 pub mod hpc3;
 pub mod i2c;
