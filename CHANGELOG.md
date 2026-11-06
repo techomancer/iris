@@ -22,6 +22,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   `iris-bench run --cpu r10000` and the GUI benchmark panel drop the R10000 for
   the same reason: the benchmark machine is an Indy.
 
+### R16000 processors
+
+- Four more `CpuModel` chips, `r16000_700`, `r16000_800`, `r16000_900` and
+  `r16000_1000`, with a 4 MB secondary cache for the first two, 8 MB for the
+  900 MHz chip and 16 MB for the 1 GHz chip. The size is a cache type picked
+  once when a machine is built, so no run-time field or branch is added. The
+  PRId of each is the revision the Tezro's inventories show, graded in
+  `CpuModel::prid`; the FIR is the R12000's, a model choice. No machine takes
+  them yet.
+
 ### Boot test before publishing
 
 - `build.yml` can boot IRIX 5.3 to a login prompt on Linux, macOS and Windows

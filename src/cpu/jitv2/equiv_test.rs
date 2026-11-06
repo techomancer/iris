@@ -4441,7 +4441,10 @@ mod tests {
     /// `partial_lwr_keeps_the_upper_word_on_the_r10000_family` pins.
     #[test]
     fn jit_lwr_matches_the_interpreter_on_the_r10000_family_and_r5000() {
-        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache, R5000ShadowCache};
+        use crate::cpu::mips_cache_shadow::{
+            R10000ShadowCache, R12000ShadowCache, R16000Scache16ShadowCache, R16000Scache8ShadowCache, R16000ShadowCache,
+            R5000ShadowCache,
+        };
         fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>(model_keeps_upper: bool) {
             use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KX, STATUS_SX, STATUS_UX};
             const RESERVED: u32 = 3 << 3;
@@ -4484,6 +4487,9 @@ mod tests {
         }
         check::<R10000ShadowCache>(true);
         check::<R12000ShadowCache>(true);
+        check::<R16000ShadowCache>(true);
+        check::<R16000Scache8ShadowCache>(true);
+        check::<R16000Scache16ShadowCache>(true);
         check::<R5000ShadowCache>(false);
     }
 

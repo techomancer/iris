@@ -384,6 +384,7 @@ impl<
         model::R4400 => "R4400",
         model::R5000 => "R5000",
         model::R12000 => "R12000",
+        model::R16000 => "R16000",
         _ => "shadow",
     };
     const CACHE_KIND: &'static str = "shadow";
@@ -789,6 +790,27 @@ pub type R10000ShadowCache =
 pub type R12000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
 
+/// The R16000 with a 4 MB secondary cache, the Tezro's 700 and 800 MHz chips:
+/// the R12000's geometry and programming model with the larger secondary (SS
+/// code 3 in Config) and 128-byte secondary lines (SB: a model choice). The
+/// PRId is the 700 MHz chip's, which `CpuModel::prid` replaces for the 800 MHz
+/// one. FIR 0x900 is the R12000 and R14000 value: no R16000 FIR was found in
+/// the retained evidence, so it is a model choice.
+pub type R16000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0f41, 0x0000_0900, 64, { model::R16000 }>;
+
+/// The R16000 with an 8 MB secondary cache, the 900 MHz chip's: the 4 MB type
+/// with twice the secondary (SS code 4). The size is a type parameter so the
+/// executor, the translator and the cache know it when they are built, and no
+/// run-time field is read to find it.
+pub type R16000Scache8ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 8388608, 128, true, 0x0000_0f50, 0x0000_0900, 64, { model::R16000 }>;
+
+/// The R16000 with a 16 MB secondary cache, the 1 GHz chip's (SS code 5);
+/// otherwise the 4 MB type.
+pub type R16000Scache16ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 16777216, 128, true, 0x0000_0f50, 0x0000_0900, 64, { model::R16000 }>;
+
 /// R12000 3.5 as the O2 has it: the Octane part with 64-byte secondary lines
 /// (SB clear). With 128-byte lines the O2 PROM panics before its banner
 /// (write TLB miss at 0x0); 64 boots. IRIX on the O2 never reads SB and sizes
@@ -1034,6 +1056,20 @@ mod tests {
         assert_eq!(run::<R12000ShadowCache>(), 0);
         assert_eq!(run::<R12000O2ShadowCache>(), 0);
         assert_eq!(run::<R10000ShadowCache>(), 0x0000_0001_2345_6780);
+        assert_eq!(run::<R16000ShadowCache>(), 0, "the R16000 follows the R12000 and R14000");
+    }
+
+    /// The three R16000 types differ in the secondary cache alone: size, the
+    /// SS code Config reads from it, and the placeholder PRId each starts
+    /// with; the PRId a chip really presents is `CpuModel::prid`'s.
+    #[test]
+    fn the_r16000_types_differ_only_in_the_secondary_cache() {
+        fn id<C: CpuModel + MipsCache>() -> (u32, u32, usize, usize, &'static str, u32, u32, bool) {
+            (C::PRID, C::FIR, C::L2_SIZE, C::L2_LINE, C::NAME, C::VA_BITS, C::PA_BITS, C::R10K_CACHE_OPS)
+        }
+        assert_eq!(id::<R16000ShadowCache>(), (0xf41, 0x900, 4 << 20, 128, "R16000", 44, 40, true));
+        assert_eq!(id::<R16000Scache8ShadowCache>(), (0xf50, 0x900, 8 << 20, 128, "R16000", 44, 40, true));
+        assert_eq!(id::<R16000Scache16ShadowCache>(), (0xf50, 0x900, 16 << 20, 128, "R16000", 44, 40, true));
     }
 
     /// Geometry is what CP0 Config is built from, so it must be the real

@@ -22,6 +22,9 @@ macro_rules! with_cpu {
             M::R10000_195 => { type $C = sh::R10000ShadowCache; $body }
             M::R12000_360 | M::R14000_500 | M::R14000_600 => { type $C = sh::R12000ShadowCache; $body }
             M::R12000_400 => { type $C = sh::R12000O2ShadowCache; $body }
+            M::R16000_700 | M::R16000_800 => { type $C = sh::R16000ShadowCache; $body }
+            M::R16000_900 => { type $C = sh::R16000Scache8ShadowCache; $body }
+            M::R16000_1000 => { type $C = sh::R16000Scache16ShadowCache; $body }
         }
     }};
 }

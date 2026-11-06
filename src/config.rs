@@ -1080,10 +1080,14 @@ pub enum CpuModel {
     R12000_400,
     R14000_500,
     R14000_600,
+    R16000_700,
+    R16000_800,
+    R16000_900,
+    R16000_1000,
 }
 
 impl CpuModel {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::R4400_150,
         Self::R5000_180,
         Self::R10000_250,
@@ -1092,6 +1096,10 @@ impl CpuModel {
         Self::R12000_400,
         Self::R14000_500,
         Self::R14000_600,
+        Self::R16000_700,
+        Self::R16000_800,
+        Self::R16000_900,
+        Self::R16000_1000,
     ];
 
     /// Pipeline clock in MHz. CP0 Count ticks at half of it. Each is a
@@ -1125,6 +1133,13 @@ impl CpuModel {
             // Where the manuals say nothing it follows the R10000, as the
             // sgi-origami QEMU model does.
             Self::R14000_600 => 600,
+            // The Tezro's R16000s, one chip per shipped clock: 4 MB secondary
+            // cache at 700 and 800 MHz, 8 MB at 900, 16 MB at 1 GHz (Tezro
+            // inventories; see `docs/tezro-ip53.md` for how each is graded).
+            Self::R16000_700 => 700,
+            Self::R16000_800 => 800,
+            Self::R16000_900 => 900,
+            Self::R16000_1000 => 1000,
         }
     }
 
@@ -1144,6 +1159,16 @@ impl CpuModel {
             // like the others. The lines and FIR are the R12000 type's.
             Self::R14000_500 => Some(0x0f23),
             Self::R14000_600 => Some(0x0f24),
+            // The R16000 revisions as the Tezro's inventories show them, in
+            // the PRId encoding: 2.1 is raw 0x41, 2.2 raw 0x42 and 3.0 raw
+            // 0x50 (the display subtracts 2 from the major revision of an
+            // R16000). Established for the 1 GHz chip: the PROM banner
+            // prints `f50` there. Inferred for the others, from inventories
+            // alone: 700 MHz 0x0f41, 800 MHz 0x0f42 and 900 MHz 0x0f50. No
+            // PROM or register read pairs a revision with a clock.
+            Self::R16000_700 => Some(0x0f41),
+            Self::R16000_800 => Some(0x0f42),
+            Self::R16000_900 | Self::R16000_1000 => Some(0x0f50),
             _ => None,
         }
     }
@@ -1168,6 +1193,10 @@ impl CpuModel {
             Self::R12000_400 => "MIPS R12000 400 MHz",
             Self::R14000_500 => "MIPS R14000 500 MHz",
             Self::R14000_600 => "MIPS R14000 600 MHz",
+            Self::R16000_700 => "MIPS R16000 700 MHz",
+            Self::R16000_800 => "MIPS R16000 800 MHz",
+            Self::R16000_900 => "MIPS R16000 900 MHz",
+            Self::R16000_1000 => "MIPS R16000 1 GHz",
         }
     }
 

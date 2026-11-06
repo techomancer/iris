@@ -7145,6 +7145,9 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
         check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>(true);
     }
 
     /// Config reports each part's secondary cache: SS (bits 18:16) is
@@ -7166,6 +7169,10 @@ mod tests {
                 ("R10000", config::<R10000ShadowCache>(), 1, 1),
                 ("R12000", config::<R12000ShadowCache>(), 2, 1),
                 ("R12000 O2", config::<R12000O2ShadowCache>(), 2, 0),
+                // 4, 8 and 16 MB, 128-byte lines: SS codes 3, 4 and 5.
+                ("R16000", config::<R16000ShadowCache>(), 3, 1),
+                ("R16000 8 MB", config::<R16000Scache8ShadowCache>(), 4, 1),
+                ("R16000 16 MB", config::<R16000Scache16ShadowCache>(), 5, 1),
             ] {
                 assert_eq!(c >> 26, 0b011_011, "{name}: IC and DC read 32 KB");
                 assert_eq!(c & 0x03FF_FFFF, (ss << 16) | (sb << 13) | 0x8000 | 2, "{name}: Config {c:#x}");
@@ -7196,6 +7203,13 @@ mod tests {
             // Physical bit 24 is EntryLo bit 18, FrameMask bit 0.
             let masked = (((0x0300_5000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1)) & !(1 << 18);
             assert_eq!(written::<R12000ShadowCache>(), (1, masked, 0x0200_5000), "R12000");
+            for (name, got) in [
+                ("R16000", written::<R16000ShadowCache>()),
+                ("R16000 8 MB", written::<R16000Scache8ShadowCache>()),
+                ("R16000 16 MB", written::<R16000Scache16ShadowCache>()),
+            ] {
+                assert_eq!(got, (1, masked, 0x0200_5000), "{name}");
+            }
         });
     }
 }
