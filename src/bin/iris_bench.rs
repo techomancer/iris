@@ -148,13 +148,14 @@ fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
 /// at the command line — so this echoes every line rather than waiting for the
 /// end and printing the parsed summary.
 fn run_embedded(label: &str, timeout_s: u64, quick: bool, cpu: iris::config::CpuModel,
-                cache: iris::config::CacheModel) -> Result<Run, String> {
+                cache: iris::config::CacheModel, deterministic: bool) -> Result<Run, String> {
     let opts = BenchOptions {
         quick,
         label: label.to_string(),
         timeout: Duration::from_secs(timeout_s),
         cpu,
         cache,
+        deterministic,
         ..Default::default()
     };
     bench_runner::run(&opts, |p| {
@@ -729,6 +730,16 @@ enum Cmd {
         /// build), full or shadow. With --iris: `-- --cache shadow`.
         #[arg(long, default_value = "auto")]
         cache: iris::config::CacheModel,
+        /// Make two runs do the same work: JIT compiles on the CPU thread and,
+        /// in a `ci_clock` build (required in process), the suite reads a clock
+        /// driven by retired instructions, so it picks the same iteration
+        /// counts every time. The rates it prints are then
+        /// constant by construction; compare instruction counts and host cost.
+        /// The result is labelled `<label>+deterministic`. With --iris this
+        /// passes `--jitv2-compile sync`; the emulator must itself be a
+        /// `ci_clock` build.
+        #[arg(long)]
+        deterministic: bool,
         /// Extra arguments passed through to --iris.
         #[arg(last = true)]
         extra: Vec<String>,
@@ -850,8 +861,9 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, cache, extra } => {
+        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, cache, deterministic, mut extra } => {
             let out = out.unwrap_or_else(default_out);
+            let label = if deterministic { format!("{label}+deterministic") } else { label };
             let run = match iris {
                 Some(iris) => {
                     if quick {
@@ -859,6 +871,9 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                     }
                     let elf = elf.unwrap_or_else(|| repo_relative("bench/build/irisbench.elf"));
                     let config = config.unwrap_or_else(|| repo_relative("bench/run/bare.toml"));
+                    if deterministic {
+                        extra.extend(["--jitv2-compile", "sync"].map(String::from));
+                    }
                     run_guest(&iris, &elf, &config, &label, timeout, &extra)?
                 }
                 None => {
@@ -879,7 +894,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                             "{} only {} to --iris, and `run` is in-process by default. \
                              Add --iris PATH, or drop {}.", stray.join(" and "), verb, obj));
                     }
-                    run_embedded(&label, timeout, quick, cpu, cache)?
+                    run_embedded(&label, timeout, quick, cpu, cache, deterministic)?
                 }
             };
             let path = save(&run, &out)?;
