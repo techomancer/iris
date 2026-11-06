@@ -69,5 +69,5 @@ vertices carry the back colour in `vtx::BACK_COLOR` with
 - **Still open:** pixel maps (uploaded by DMA to 0xcb000, not used),
   colour-index images into RGBA windows, signed texel uploads one or two
   steps below the board, ABGR with BYTE, byte-swapped INT and 5:5:5:1
-  draws, glCopyPixels with zoom (1, -1), the depth of glDrawPixels
-  (`drawpixels-skips-fragment-operations.md`).
+  draws, glCopyPixels with zoom (1, -1). The depth of glDrawPixels is
+  resolved (`drawpixels-depth-rides-in-the-image-box.md`).

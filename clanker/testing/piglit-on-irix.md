@@ -50,13 +50,15 @@ errors from the IRIX server's GLX), 216 skip, 1 timeout, 1 warn. Emulated
 V10 (IRIX 6.5.30): 94 pass before the fixes of that day, 145 after (window
 colour reads, edge flags, stencil-or-index reads, two-sided lighting).
 
+Fixed since (2026-11-05): `drawbuffer-modes` (the guest needs an 8-byte
+frame buffer, `clanker/odyssey/front-and-back-arrives-as-front.md`),
+`drawpixels-depth-test` (`clanker/odyssey/drawpixels-depth-rides-in-the-image-box.md`),
+`gl-1.0-texgen` (sphere map), `two-sided-lighting-separate-specular`.
+
 Still failing in the emulator, passing on the V10:
-`drawbuffer-modes` (`clanker/odyssey/front-and-back-arrives-as-front.md`),
-`drawpixels-depth-test` (`clanker/odyssey/drawpixels-skips-fragment-operations.md`),
-`gl-1.0-texgen` (sphere map, not modelled), `two-sided-lighting-separate-specular`
-(separate specular colour, not modelled), `read-pixels-after-display-list`
-(a texture uploaded through the pixel maps), `draw-elements-vs-inputs`
-(a colour 0.005 off), `glx-multithread`, one `dlist-beginend` subtest.
+`read-pixels-after-display-list` (a texture uploaded through the pixel maps),
+`draw-elements-vs-inputs` (a colour 0.005 off), `glx-multithread`, one
+`dlist-beginend` subtest.
 
 Passing in the emulator, failing on the V10: `glx-make-current`,
 `glx-multi-context-single-window`, `long-line-loop`, `user-clip-all-planes`,
