@@ -433,9 +433,23 @@ fn guest_power_off(m: &mut dyn Workstation) {
     }
 }
 
-fn ci_send(path: &Path, line: &str) -> String {
+/// Where the CI server listens: a Unix socket in `dir`, or on Windows, which
+/// has no Unix sockets in std, a free localhost port.
+fn ci_socket(dir: &Dir) -> String {
+    if cfg!(unix) {
+        dir.file("ci.sock").display().to_string()
+    } else {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        format!("127.0.0.1:{port}")
+    }
+}
+
+fn ci_send(path: &str, line: &str) -> String {
     use std::io::{BufRead, Write};
+    #[cfg(unix)]
     let mut s = std::os::unix::net::UnixStream::connect(path).unwrap();
+    #[cfg(not(unix))]
+    let mut s = std::net::TcpStream::connect(path).unwrap();
     s.write_all(line.as_bytes()).unwrap();
     s.write_all(b"\n").unwrap();
     let mut reply = String::new();
@@ -456,8 +470,8 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             Snapshot::take(dir)
         }
         Exit::CiQuit => {
-            let sock = dir.file("ci.sock");
-            let _server = crate::ci::start_server(&mut *m, sock.to_str().unwrap()).unwrap();
+            let sock = ci_socket(dir);
+            let _server = crate::ci::start_server(&mut *m, &sock).unwrap();
             let reply = ci_send(&sock, r#"{"cmd":"quit"}"#);
             assert!(reply.contains("\"ok\":true"), "quit refused: {reply}");
             // The reply promises the disks are already safe, before the
@@ -481,6 +495,7 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             relay.join().unwrap();
             Snapshot::take(dir)
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Exit::Signal => {
             workstation::exit_on_signal(m.machine_slot());
             // SAFETY: raise(3) sends the signal to this process.
@@ -488,6 +503,8 @@ fn end_session(mut m: Box<dyn Workstation>, exit: Exit, dir: &Dir) {
             wait_for_exit_request(before);
             Snapshot::take(dir)
         }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        Exit::Signal => unreachable!("no exit signals on this platform"),
         Exit::MainReturn => {
             let _ = workstation::stop_and_flush(&mut *m, "exit");
             Snapshot::take(dir)
@@ -569,6 +586,7 @@ fn console_quit() {
 
 /// Ctrl-C or `kill` at the terminal. The handler stays installed for the rest
 /// of the test process; nextest gives each test its own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn signal() {
     round_trip(Machine::Indy, &[Exit::Signal], false, true)

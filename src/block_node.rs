@@ -2203,7 +2203,6 @@ mod tests {
     /// and is left as it was, rather than being compacted into an empty one.
     #[test]
     fn cow_unreadable_record_stops_the_open_and_is_kept() {
-        use std::os::unix::fs::PermissionsExt;
         let (backing, backing_path) = raw_filled(0xAA, 4 * SECTOR_BYTES);
         let overlay_path = tmp_path("cow-bad-record");
         let size = 4 * SECTOR_SIZE;
@@ -2222,13 +2221,18 @@ mod tests {
         assert!(open().is_err());
         assert_eq!(std::fs::read(&sidecar).unwrap(), &record[..3]);
 
-        // A record the process may not read (not testable as root).
+        // A record the process may not read (not testable as root, and Unix
+        // modes have no Windows equivalent in std).
         std::fs::write(&sidecar, &record).unwrap();
-        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0)).unwrap();
-        if File::open(&sidecar).is_err() {
-            assert!(open().is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0)).unwrap();
+            if File::open(&sidecar).is_err() {
+                assert!(open().is_err());
+            }
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(std::fs::read(&sidecar).unwrap(), record);
 
         // Missing is a fresh overlay, not an error.
