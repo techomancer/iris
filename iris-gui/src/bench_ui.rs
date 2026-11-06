@@ -235,12 +235,12 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
 
         ui.add_enabled_ui(!busy, |ui| {
             // The CPU is a machine setting, not a build, so the suite can measure
-            // either one from this binary. IRIX-visible: different PRId, cache
+            // either one the bench machine takes from this binary. IRIX-visible: different PRId, cache
             // geometry and ISA level, so treat the two scores as different machines.
             egui::ComboBox::from_id_salt("bench_cpu")
                 .selected_text(st.cpu.label())
                 .show_ui(ui, |ui| {
-                    for m in iris::config::CpuModel::ALL {
+                    for &m in iris::bench_runner::bench_cpus() {
                         ui.selectable_value(&mut st.cpu, m, m.label());
                     }
                 })

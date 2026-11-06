@@ -133,10 +133,25 @@ pub fn run(
         .map_err(|_| "the benchmark runner panicked".to_string())?
 }
 
+/// The processors the bench machine can have: the ones its profile takes.
+pub fn bench_cpus() -> &'static [CpuModel] {
+    bench_config(BENCH_BANKS, CpuModel::default()).machine.profile.cpus()
+}
+
+fn check_cpu(cpu: CpuModel) -> Result<(), String> {
+    let profile = bench_config(BENCH_BANKS, cpu).machine.profile;
+    if profile.accepts_cpu(cpu).is_ok() {
+        return Ok(());
+    }
+    let offered: Vec<_> = profile.cpus().iter().map(|c| format!("{c:?}")).collect();
+    Err(format!("the benchmark machine is an Indy, which takes {}, not the {cpu:?}", offered.join(" or ")))
+}
+
 fn run_inner(
     opts: &BenchOptions,
     mut progress: impl FnMut(Progress),
 ) -> Result<Run, String> {
+    check_cpu(opts.cpu)?;
     let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
     let done = Arc::new(AtomicBool::new(false));
     let code = Arc::new(AtomicU32::new(0));
@@ -404,28 +419,18 @@ mod tests {
         assert!(lines.load(Ordering::Relaxed) > kernels, "no console lines beyond the rows");
     }
 
-    /// The suite runs with no PROM, so nothing but the harness sets KSEG0's
-    /// cacheability, and the R10000 resets with Config.K0 = 2 (uncached).
-    /// If the harness stops choosing K0 = 3, every R10000 load and store goes
-    /// to the bus and the R10000 cells measure uncached memory, about half the
-    /// R4400's rate on the memory kernels, while still scoring 100%.
+    /// The bench machine is an Indy, and an Indy takes no R10000 (that is the
+    /// IP28 board, whose memory map the bare-metal suite does not use), so the
+    /// run is refused up front instead of building a machine no config could.
     #[test]
-    #[ignore = "runs the emulator for ~30s; run with --ignored"]
-    fn the_r10000_runs_the_suite_with_kseg0_cached() {
-        let run = run(
-            &BenchOptions {
-                quick: true,
-                label: "test".into(),
-                cpu: CpuModel::R10000,
-                ..Default::default()
-            },
-            |_| {},
-        )
-        .expect("the embedded suite must run on the R10000");
-        assert_eq!(run.matched, run.checked, "the R10000 computed a wrong answer");
-        let config = u32::from_str_radix(run.machine.config.trim_start_matches("0x"), 16)
-            .expect("the guest reports Config in hex");
-        assert_eq!(config & 7, 3, "KSEG0 not cacheable: Config {:#x}", config);
+    fn the_r10000_is_refused_before_a_machine_is_built() {
+        let e = run(&BenchOptions { cpu: CpuModel::R10000, ..Default::default() }, |_| {})
+            .expect_err("an Indy has no R10000");
+        assert!(e.contains("R4400") && e.contains("R5000"), "{e}");
+        for &cpu in bench_cpus() {
+            assert!(check_cpu(cpu).is_ok(), "{cpu:?}");
+        }
+        assert!(!bench_cpus().contains(&CpuModel::R10000));
     }
 
     /// A bare-metal program that sizes its work by the test device's clock, as

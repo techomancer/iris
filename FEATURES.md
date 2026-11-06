@@ -174,7 +174,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)). |
-| `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. An O2 takes r5000 or r10000 (an r4400 is refused when the machine is built); the Octane is r10000 only. |
+| `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. The Indy and `indigo2_ip22` take r4400 or r5000, `indigo2_ip28` r10000 only (so it needs `cpu = "r10000"` set, as `ip28.toml.example` does), an O2 r5000 or r10000 (an r4400 is refused when the machine is built), the Octane r10000 only. |
 | `machine.cpus` | `1` | Processors fitted. 2 only on the Octane; see [its guide](docs/Octane/multiprocessor.md). |
 
 ### [graphics]
@@ -431,7 +431,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--validate` | Check the configuration (parse, settings, files, directories, ports) without starting the machine; exit 0 or 1. See [HELP.md](HELP.md#checking-a-configuration). |
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
-| `--cpu` | Emulated CPU: `r4400` (default), `r5000`, or `r10000`. Overrides `[machine] cpu`.  |
+| `--cpu` | Emulated CPU: `r4400` (default), `r5000`, or `r10000`, as the machine profile allows. Overrides `[machine] cpu`.  |
 | `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane only). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |

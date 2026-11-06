@@ -706,21 +706,19 @@ impl MachineProfile {
         }
     }
 
-    /// Whether this profile can have `cpu`, and why not if it cannot. The
-    /// Octane takes an R10000, R12000 or R14000 and the IP28 an R10000; the
+    /// Whether this profile can have `cpu`, and why not if it cannot: the
+    /// refusal for every profile that lists its models in [`Self::cpus`]. The
     /// O2 constructor still refuses its own, after `validate()`.
     pub fn accepts_cpu(self, cpu: CpuModel) -> Result<(), String> {
-        match self {
-            Self::OctaneIp30 if !matches!(cpu, CpuModel::R10000 | CpuModel::R12000 | CpuModel::R14000) => Err(
-                "an Octane has an R10000, R12000 or R14000 ([machine] cpu = \"r10000\", \"r12000\" or \"r14000\")".into(),
-            ),
-            Self::Indigo2Ip28
-                if matches!(cpu, CpuModel::R12000 | CpuModel::R14000) =>
-            {
-                Err("an Indigo2 IMPACT (IP28) has an R10000 ([machine] cpu = \"r10000\")".into())
-            }
-            _ => Ok(()),
+        if self == Self::O2Ip32 || self.cpus().contains(&cpu) {
+            return Ok(());
         }
+        Err(match self {
+            Self::OctaneIp30 => "an Octane has an R10000, R12000 or R14000 ([machine] cpu = \"r10000\", \"r12000\" or \"r14000\")",
+            Self::Indigo2Ip28 => "an Indigo2 IMPACT (IP28) has an R10000 ([machine] cpu = \"r10000\")",
+            _ => "an Indy or Indigo2 has an R4400 or R5000 ([machine] cpu = \"r4400\")",
+        }
+        .into())
     }
 
     pub fn label(self) -> &'static str {
@@ -767,18 +765,19 @@ impl MachineProfile {
     }
 
     /// The CPU models this machine can be built with. The O2 has an R5000,
-    /// an R10000 or an R12000 (the others are refused when the machine is
-    /// built, not by `validate()`); the Octane has an R10000, R12000 or
-    /// R14000; the Indy and the Indigo2 take any part, except that the IP28
-    /// is refused anything but the R10000 by `validate()`.
+    /// an R10000 or an R12000 (an R4400 is refused when the machine is built,
+    /// not by `validate()`); the Octane has an R10000, R12000 or R14000; the
+    /// Indigo2 IMPACT (IP28) is the Indigo2 with an R10000 module, and has
+    /// only that; the Indy and the other Indigo2 take the R4400 or R5000.
     ///
-    /// Single source of truth for the front-ends' Processor pickers, so they
-    /// cannot offer a CPU the machine will refuse.
+    /// Single source of truth for `validate` and the front-ends' Processor
+    /// pickers, so they cannot offer a CPU the machine will refuse.
     pub fn cpus(self) -> &'static [CpuModel] {
         match self {
             Self::OctaneIp30 => &[CpuModel::R10000, CpuModel::R12000, CpuModel::R14000],
+            Self::Indigo2Ip28 => &[CpuModel::R10000],
             Self::O2Ip32 => &[CpuModel::R5000, CpuModel::R10000, CpuModel::R12000],
-            _ => &CpuModel::ALL,
+            Self::IndyIp24 | Self::Indigo2Ip22 => &[CpuModel::R4400, CpuModel::R5000],
         }
     }
 
@@ -3553,13 +3552,51 @@ mod export_tests {
         }
     }
 
+    /// The IP28's default `[machine] cpu` is the R4400 it cannot have; the
+    /// error names the line to change.
+    #[test]
+    fn the_default_cpu_on_the_ip28_names_the_fix() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::Indigo2Ip28;
+        assert_eq!(cfg.machine.cpu, CpuModel::R4400, "the default cpu");
+        let e = cfg.validate().unwrap_err();
+        assert!(e.contains("cpu = \"r10000\""), "{e}");
+        cfg.machine.cpu = CpuModel::R10000;
+        assert!(cfg.validate().is_ok());
+        // ... and the R10000 is no longer an Indy's or an Indigo2's.
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22] {
+            cfg.machine.profile = p;
+            let e = cfg.validate().unwrap_err();
+            assert!(e.contains("cpu = \"r4400\""), "{p:?}: {e}");
+        }
+    }
+
+    /// `validate` and the front-ends' pickers read the same list: a model is
+    /// accepted exactly when `cpus()` offers it. The O2 is the one exception
+    /// (its constructor, not `validate`, refuses an R4400).
+    #[test]
+    fn accepts_cpu_agrees_with_cpus_for_every_profile() {
+        for p in MachineProfile::EVERY {
+            if p == MachineProfile::O2Ip32 {
+                continue;
+            }
+            for c in CpuModel::ALL {
+                assert_eq!(p.accepts_cpu(c).is_ok(), p.cpus().contains(&c), "{p:?} {c:?}");
+            }
+        }
+    }
+
     /// A profile says which processors and counts it accepts, and `validate()`
     /// and the Octane constructor refuse a bad processor with the same words.
     #[test]
     fn a_profile_says_which_processors_it_accepts() {
         let accepted = |p: MachineProfile| CpuModel::ALL.into_iter().filter(|&c| p.accepts_cpu(c).is_ok()).collect::<Vec<_>>();
         assert_eq!(accepted(MachineProfile::OctaneIp30), [CpuModel::R10000, CpuModel::R12000, CpuModel::R14000]);
-        assert_eq!(accepted(MachineProfile::IndyIp24), CpuModel::ALL);
+        assert_eq!(accepted(MachineProfile::IndyIp24), [CpuModel::R4400, CpuModel::R5000]);
+        assert_eq!(accepted(MachineProfile::Indigo2Ip22), [CpuModel::R4400, CpuModel::R5000]);
+        assert_eq!(accepted(MachineProfile::Indigo2Ip28), [CpuModel::R10000]);
+        // The O2 constructor refuses its R4400 itself, so validate() lets it by.
+        assert_eq!(accepted(MachineProfile::O2Ip32), CpuModel::ALL);
 
         // The counts are what the checks in validate() and the Octane
         // constructor allowed before they moved here: one on every machine

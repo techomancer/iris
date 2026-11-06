@@ -340,11 +340,10 @@ and the normal mode for speed. The result is labelled
 | `r5000-jitv2` | `jitv2` | `r5000` |
 | `r4400-lightning` | `lightning` | `r4400` |
 | `r4400-jitv2-lightning` | `jitv2,lightning` | `r4400` |
-| `r10000-interp`, `r12000-interp`, `r14000-interp` | (default) | `r10000`, `r12000`, `r14000` |
 
-The R10000 family always runs the shadow caches, so these share the default
-build. The Indy and Indigo2 (non-IP28) profiles build any part, and the
-cells rely on that.
+The bench machine is an Indy, which takes the R4400 and R5000 only; the R10000
+family is the IP28's, Octane's and O2's, whose memory maps the bare-metal
+suite does not use.
 
 Each build is copied to `bench/build/iris-<features>` before the next one starts —
 the next `cargo build` overwrites `target/release/iris`, and a matrix that races
