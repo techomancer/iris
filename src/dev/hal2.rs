@@ -345,6 +345,9 @@ pub struct Hal2 {
     underruns: Arc<AtomicU64>,
     // [audio]: which host to play through, and its buffer size.
     audio: AudioConfig,
+    /// IRIS_AUDIO_DUMP=<file>: every frame codec A plays, at the codec's
+    /// own rate, before resampling (see `audio_dump`).
+    dump: Option<Arc<crate::dev::audio_dump::AudioDump>>,
 }
 
 // ─── cpal helpers ─────────────────────────────────────────────────────────────
@@ -395,6 +398,7 @@ impl Hal2 {
             ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new(), timer_id: None })),
             underruns: Arc::new(AtomicU64::new(0)),
             audio,
+            dump: crate::dev::audio_dump::AudioDump::from_env().map(Arc::new),
         }
     }
 
@@ -455,6 +459,7 @@ impl Hal2 {
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
+        let dump = self.dump.clone();
         let mut pacer = Pacer::new(pitch_rate);
 
         self.ca_state.lock().armed_ch = Some(dma_ch);
@@ -483,8 +488,10 @@ impl Hal2 {
             let stream_rate = match st.out.as_ref() {
                 Some(o) => o.stream_rate,
                 None => {
-                    for _ in 0..due {
-                        let _ = read_frame_from(&dma_client, mode);
+                    let frames = (0..due).filter_map(|_| read_frame_from(&dma_client, mode));
+                    match dump.as_ref() {
+                        Some(d) => d.record(None, pitch_rate, frames.collect::<Vec<_>>().into_iter()),
+                        None => frames.for_each(drop),
                     }
                     return TimerReturn::Continue;
                 }
@@ -497,8 +504,10 @@ impl Hal2 {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
             }
 
+            let mut played = Vec::new();
             for _ in 0..due {
                 let frame = read_frame_from(&dma_client, mode);
+                if let (Some(f), true) = (frame, dump.is_some()) { played.push(f); }
                 if frame.is_some() { st.frames += 1; } else { st.dry_reads += 1; }
                 let was_prebuffering = st.prebuffering;
 
@@ -545,6 +554,7 @@ impl Hal2 {
                     }
                 }
             }
+            if let Some(d) = dump.as_ref() { d.record(None, pitch_rate, played.into_iter()); }
 
             TimerReturn::Continue
         });
