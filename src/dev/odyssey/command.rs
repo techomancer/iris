@@ -1213,6 +1213,9 @@ impl Board {
                 // The ten raster-box floats. Only 4, 5, 7 and 8 carry the destination
                 // corners; the rest are the zero the DDX's private was allocated with.
                 // Set the cursor to the top-left corner once all ten have arrived.
+                if let Some(w) = self.image.box_words.get_mut(self.cmd.operand_index as usize) {
+                    *w = word;
+                }
                 match self.cmd.operand_index {
                     image::BOX_X1_INDEX => self.image.x1 = float_to_u32(word),
                     image::BOX_Y1_INDEX => self.image.y1 = float_to_u32(word),
@@ -1224,8 +1227,10 @@ impl Board {
                 if self.cmd.operand_index == self.cmd.operand_count {
                     self.image.cur_x = if self.image.x2 < self.image.x1 { self.image.x1.wrapping_sub(1) } else { self.image.x1 };
                     self.image.cur_y = if self.image.y2 < self.image.y1 { self.image.y1.wrapping_sub(1) } else { self.image.y1 };
+                    self.image_box_loaded();
                     if self.trace.on(TRACE_FIFO) {
-                        self.trace_note(format_args!("image box ({}, {})-({}, {})", self.image.x1, self.image.y1, self.image.x2, self.image.y2));
+                        let f: Vec<String> = self.image.box_words.iter().map(|&w| format!("{}", f32::from_bits(w))).collect();
+                        self.trace_note(format_args!("image box ({}, {})-({}, {}) [{}]", self.image.x1, self.image.y1, self.image.x2, self.image.y2, f.join(", ")));
                     }
                     self.cmd.state = ODSY_CMD_IDLE;
                 }

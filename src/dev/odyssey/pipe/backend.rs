@@ -184,7 +184,7 @@ pub(crate) fn colour12(c: i32) -> u32 {
 
 /// An 8-bit stored value widened to 12 bits by repeating its top bits.
 #[inline(always)]
-fn widen8(v: u32) -> u32 {
+pub(crate) fn widen8(v: u32) -> u32 {
     (v << 4) | (v >> 4)
 }
 

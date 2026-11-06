@@ -4,7 +4,8 @@
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code in jamesbraid/qemu-sgi-origami.
 
 
-use super::pipe::backend::DestMem;
+use super::depth_word::word_for_fraction;
+use super::pipe::backend::{widen8, BackendState, DestMem};
 use super::view::{Kind, MAX_DIM};
 use super::field::{Codec, Layout};
 use super::vram::Format;
@@ -489,6 +490,13 @@ impl Board {
         if self.dest_views().scratch {
             let rows = self.dest_mem().colour[0];
             rows.store_word(self.image.cur_x as i32, self.image.cur_y as i32, word);
+        } else if let Some(f) = self.image.fragment.as_deref().filter(|_| !is_index) {
+            let word = self.image_transfer(word, is_index);
+            let (x, y) = (self.image.cur_x as i64 + self.win.origin[0] as i64, self.image.cur_y as i64 + self.win.origin[1] as i64);
+            if self.pixel_allowed(x, y) {
+                let src = [word >> 24, word >> 16, word >> 8, word].map(|c| widen8(c & 0xff));
+                f.0.fragment_q(&self.dest_mem(), x as i32, y as i32, f.1, src);
+            }
         } else {
             let word = self.image_transfer(word, is_index);
             self.paint_pixel(
@@ -498,6 +506,40 @@ impl Board {
             );
         }
         self.image_advance(x_decreasing, y_decreasing);
+    }
+
+    /// A box record has arrived. Its operands 6 and 9 carry the raster
+    /// position's depth when the library depth-tests the image (they are
+    /// zero otherwise): normalised-device z on the scale the combined
+    /// matrix's depth row uses, 2 * DEPTH_S per unit, offset by one unit
+    /// (traced: raster z 0, 0.5 and 1 under glOrtho(..., 2, -2) send DEPTH_S
+    /// times 1, 1.25 and 1.5, the same under any glDepthRange). The board
+    /// maps it through the depth range as it does a vertex (measured, V10:
+    /// the stored depths are 0.5, 0.625 and 0.75, and 0.5 and 0.625 under
+    /// glDepthRange(0.25, 0.75)), and the image's pixels then go through the
+    /// depth test and the rest of the fragment back end. An image with no
+    /// depth is stored as before.
+    pub fn image_box_loaded(&mut self) {
+        let z = f32::from_bits(self.image.box_words[6]) as f64;
+
+        self.image.fragment = None;
+        if z == 0.0 || !z.is_finite() || self.dest_views().scratch {
+            return;
+        }
+        // The image runs under the library's own raster state, so the client's
+        // depth sign word (Board::gl_depth_scale()) does not apply.
+        let z01 = (z / (2.0 * super::consts::gl_cmd::DEPTH_S)).clamp(0.0, 1.0);
+        let [n, f] = self.assembly.xf.depth_range.map(f64::from);
+        let zq = word_for_fraction((n + (f - n) * z01).clamp(0.0, 1.0));
+        let backend = BackendState::of(&self.fragment_words().backend, true, true);
+        if self.trace.on(super::trace::TRACE_FIFO) {
+            let depth_kind = self.dest_mem().depth.v.kind;
+            self.trace_note(format_args!(
+                "image depth {z01} -> word {zq:#x}: depth test {} write {} func {:?}, targets {:?}, depth plane {:?}",
+                backend.depth_test, backend.depth_write, backend.depth_func, backend.targets, depth_kind
+            ));
+        }
+        self.image.fragment = Some(Box::new((backend, zq)));
     }
 
     /// Step the raster cursor to the next pixel of the open image.

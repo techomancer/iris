@@ -162,6 +162,12 @@ pub(super) struct ImageRaster {
     pub y1: u32,
     pub x2: u32,
     pub y2: u32,
+    /// The box record's ten words as sent (operands 6 and 9 carry the
+    /// raster depth under depth testing).
+    pub box_words: [u32; 10],
+    /// The fragment state and depth word a depth-tested image's pixels take,
+    /// decoded once per box (Board::image_box_loaded()).
+    pub fragment: Option<Box<(super::pipe::backend::BackendState, u32)>>,
     pub cur_x: u32,
     pub cur_y: u32,
     pub fmt: u32,
@@ -747,6 +753,8 @@ impl Default for Board {
                 y1: 0,
                 x2: 0,
                 y2: 0,
+                box_words: [0; 10],
+                fragment: None,
                 cur_x: 0,
                 cur_y: 0,
                 fmt: 0,

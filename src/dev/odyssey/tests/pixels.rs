@@ -10,6 +10,7 @@ use crate::dev::odyssey::consts::{
     ODSY_DRAW_MASK_BUFFER1, ODSY_GAMMA_GROUP, ODSY_PLANE_MASK_SHIFT, ODSY_USER_CMD_FIFO,
 };
 use crate::dev::odyssey::dma::DMA_BPP;
+use crate::dev::odyssey::depth_word::word_for_fraction;
 use crate::dev::odyssey::clip::ClipRect;
 use crate::dev::odyssey::pixel_write::write_form;
 use crate::dev::odyssey::tests::{aux_at, board_with_ram, cmd, cmd64, pixel, pixel_write, screen_field, screen_stencil, select, set_aux, Ram};
@@ -36,19 +37,26 @@ fn burst_image(s: &mut Board, bounds: (u32, u32, u32, u32), header: u32, fmt: u3
 /// The same for an image the library sends as several transfer headers,
 /// each followed by its bursts (a tag and its words): the shape of a draw
 /// wider than one burst, where a header finishes the previous row.
-fn burst_image_groups(s: &mut Board, (x1, y1, x2, y2): (u32, u32, u32, u32), groups: &[(u32, &[(u32, &[u32])])]) {
+fn burst_image_groups(s: &mut Board, bounds: (u32, u32, u32, u32), groups: &[(u32, &[(u32, &[u32])])]) {
+    burst_image_groups_at(s, bounds, 0.0, groups);
+}
+
+/// The same with the box's depth operands (6 and 9) set to z, as the
+/// library sends them for a depth-tested image.
+fn burst_image_groups_at(s: &mut Board, (x1, y1, x2, y2): (u32, u32, u32, u32), z: f32, groups: &[(u32, &[(u32, &[u32])])]) {
     cmd(s, select(reg::GL_BEGIN));
     cmd(s, gl_cmd::PRIMITIVE_IMAGE);
     cmd(s, consts::cmd::IMAGE_BOX);
     for i in 0..10 {
         let v = match i {
-            image::BOX_X1_INDEX => x1,
-            image::BOX_Y1_INDEX => y1,
-            image::BOX_X2_INDEX => x2,
-            image::BOX_Y2_INDEX => y2,
-            _ => 0,
+            image::BOX_X1_INDEX => x1 as f32,
+            image::BOX_Y1_INDEX => y1 as f32,
+            image::BOX_X2_INDEX => x2 as f32,
+            image::BOX_Y2_INDEX => y2 as f32,
+            6 | 9 => z,
+            _ => 0.0,
         };
-        cmd(s, (v as f32).to_bits());
+        cmd(s, v.to_bits());
     }
     for &(header, bursts) in groups {
         cmd(s, consts::cmd::IMAGE_HEADER);
@@ -76,6 +84,46 @@ fn a_gl_rgba_image_keeps_its_alpha() {
     burst_image(&mut s, (40, 10, 42, 11), 0x0021_104b, image::FMT_RGB, &[0x116c_c722, 0x2233_4400]);
     assert_eq!(pixel(&s, 0, 40, 10), 0x116c_c722);
     assert_eq!(pixel(&s, 0, 41, 10), 0x2233_4400);
+}
+
+/// A depth-tested glDrawPixels: the box carries the raster depth as
+/// normalised-device z on the depth row's scale, 2 * DEPTH_S per unit and
+/// offset by one, and the pixels go through the depth test and write at
+/// that depth mapped through the depth range. piglit's
+/// gl-1.0-drawpixels-depth-test: two pixels at window depth 0.625 under
+/// GL_ALWAYS, then one at 0.5 under GL_LESS (drawn) and one at 0.75
+/// (discarded). Traced (box operands) and measured on a V10 (stored depths).
+#[test]
+fn a_depth_tested_image_takes_the_box_depth() {
+    let (mut s, _) = window();
+    let box_z = |window: f64| ((2.0 * window - 1.0 + 1.0) * gl_cmd::DEPTH_S) as f32;
+    let image = |s: &mut Board, x: u32, z: f32, rgba: u32| {
+        burst_image_groups_at(s, (x, 10, x + 1, 11), z, &[(0x0011_104b, &[(image::FMT_RGB, &[rgba])])]);
+    };
+    let set = |s: &mut Board, r: u32, v: u32| {
+        cmd(s, select(r));
+        cmd(s, v);
+    };
+    set(&mut s, reg::PATTERN_MODE, consts::mode::DEPTH_TEST);
+    set(&mut s, reg::WRITE_MASK, 0x01f0_0000);
+    let far = word_for_fraction(1.0);
+    s.depth_store(40, 10, far);
+    s.depth_store(42, 10, far);
+
+    set(&mut s, reg::DEPTH_FUNC, 7);
+    image(&mut s, 40, box_z(0.625), 0xffff_ffff);
+    image(&mut s, 42, box_z(0.625), 0xffff_ffff);
+    assert_eq!(s.depth_load(40, 10), word_for_fraction(0.625));
+
+    set(&mut s, reg::DEPTH_FUNC, 1);
+    image(&mut s, 40, box_z(0.5), 0xff00_00ff);
+    image(&mut s, 42, box_z(0.75), 0x0000_ffff);
+    assert_eq!(pixel(&s, 0, 40, 10), 0xff00_00ff, "nearer: drawn");
+    assert_eq!(pixel(&s, 0, 42, 10), 0xffff_ffff, "farther: discarded");
+
+    // With no depth in the box the image is stored as before, untested.
+    image(&mut s, 42, 0.0, 0x0000_ffff);
+    assert_eq!(pixel(&s, 0, 42, 10), 0x0000_ffff);
 }
 
 /// Luminance-alpha bytes (0x48) and A, B, G, R bytes (0x4c) keep their
