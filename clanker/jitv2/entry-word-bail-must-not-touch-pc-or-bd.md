@@ -1,16 +1,25 @@
 # An entry-word bail must not touch `pc` or `in_delay_slot`
 
-`j2 entrypre on` (`IRIS_ENTRY_PREAMBLE=1`) makes an externally-dispatched entry
-word sample `hot.interrupts` before running, instead of deferring to the next
-head. Getting the *bail* wrong panics IRIX within seconds of kernel start.
+`j2 entrypre on` makes an externally-dispatched entry word sample
+`hot.interrupts` before running, instead of deferring to the next head.
+Getting the *bail* wrong panics IRIX within seconds of kernel start.
 
-## Why the feature exists
+Status (2026-11-06): **on by default** (`IRIS_ENTRY_PREAMBLE=0` or `j2
+entrypre off` turns it off). Off, nothing checked on an external entry:
+`step_jit` runs no preamble, and a store the bus answered busy re-dispatched
+at the same entry on every retry, holding the clock tick off for tens of ms
+(Octane RAD "thread held off"). Guest Whetstone, Dhrystone and iris_bench
+showed no cost. A check only on load/store entry words measured the same, so
+it was not kept.
+
+## Why the check exists
 
 Normally the dispatch head jumps straight to an entry word's **body block**,
 bypassing its preamble (`skip_entry_preamble`). Delivery is therefore deferred
-by one dispatch — bounded, never lost, since every internal back-edge onto an
-entry word still pays the preamble. But the window scales with how fast the JIT
-retires code.
+to the next head. Every internal back-edge onto an entry word still pays the
+preamble, but an entry word that exits before any other head (a load or store
+the bus answers busy, retried by re-dispatching at the same PC) never reaches
+one, so delivery waits as long as the device stays busy.
 
 That matters because a full `jitv2_lockstep` boot — every JIT instruction
 verified against the interpreter inline, hence very slow — reaches a working
