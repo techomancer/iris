@@ -23,6 +23,7 @@ use super::backend::{DestMem, BackendState, ClearDraw};
 use super::raster::{triangle_quads, RasterState};
 use super::super::gl::{DrawFrame, GlDrawJob};
 use super::setup::Tri;
+use super::super::raster_unit::Completion;
 use parking_lot::{Condvar, Mutex};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
@@ -211,6 +212,10 @@ pub(crate) struct QuadRing {
     held: Mutex<VecDeque<Held>>,
     /// Clears' records, kept as the draws are.
     held_clears: Mutex<VecDeque<(u64, Box<ClearDraw>)>>,
+    /// Completions waiting for the tail to pass every slot written before
+    /// them, in order, and how many.
+    completions: Mutex<VecDeque<(u64, Completion)>>,
+    completing: AtomicU32,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -247,6 +252,8 @@ impl QuadRing {
             exit: AtomicBool::new(false),
             held: Mutex::new(VecDeque::new()),
             held_clears: Mutex::new(VecDeque::new()),
+            completions: Mutex::new(VecDeque::new()),
+            completing: AtomicU32::new(0),
             threads: Mutex::new(Vec::new()),
         });
         let mut threads = r.threads.lock();
@@ -276,6 +283,36 @@ impl QuadRing {
             t += 1;
         }
         self.tail.store(t, Release);
+        if self.completing.load(Relaxed) != 0 {
+            self.run_completions(t);
+        }
+    }
+
+    /// Run `job` once every slot written so far is stored: now, when the
+    /// ring is idle.
+    pub fn complete(&self, job: Completion) {
+        self.completions.lock().push_back((self.staged.load(Relaxed), job));
+        self.completing.fetch_add(1, Relaxed);
+        self.retire();
+    }
+
+    /// Whether completions wait for the tail.
+    pub fn completing(&self) -> bool {
+        self.completing.load(Relaxed) != 0
+    }
+
+    /// Run the completions the tail is past, in order, with no lock held.
+    fn run_completions(&self, tail: u64) {
+        loop {
+            let mut c = self.completions.lock();
+            if !c.front().is_some_and(|(end, _)| *end <= tail) {
+                return;
+            }
+            let (_, job) = c.pop_front().expect("a completion");
+            drop(c);
+            self.completing.fetch_sub(1, Relaxed);
+            job();
+        }
     }
 
     /// Wait while `busy`, running ready tiles meanwhile.

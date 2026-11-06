@@ -120,6 +120,13 @@ impl RasterCtx {
         }
     }
 
+    /// Whether completions wait in the ring for the quads before them: a
+    /// raster thread with nothing else to do then drains rather than
+    /// sleep, so the guest is not kept waiting.
+    pub fn completing(&self) -> bool {
+        self.ring.as_ref().is_some_and(|r| r.completing())
+    }
+
     /// Whether the shader and back end have stored every quad in the ring.
     pub fn pipe_idle(&self) -> bool {
         self.ring.as_ref().is_none_or(|r| r.idle())
@@ -134,6 +141,10 @@ impl RasterCtx {
 /// One unit of raster work.
 pub(super) type RasterJob = Box<dyn FnOnce(&mut RasterCtx) + Send>;
 
+/// One completion: a write the guest sees once the drawing before it is
+/// stored.
+pub(super) type Completion = Box<dyn FnOnce() + Send>;
+
 /// The ring entry's address word: the value is a boxed `RasterJob`.
 const ENTRY_JOB: u32 = 1;
 /// The value is a boxed `GlDrawJob`, which goes back to the front end
@@ -142,6 +153,9 @@ const ENTRY_DRAW: u32 = 2;
 /// A boxed `RasterJob` that only puts work into the quad ring (a clear's
 /// spans): ordered by the ring, it waits for no stage.
 const ENTRY_RING: u32 = 4;
+/// A boxed `Completion`: it goes into the quad ring behind the quads
+/// before it and runs once they are stored, with no drain.
+const ENTRY_COMPLETION: u32 = 3;
 /// The entry's address word is its kind in the low bits and its cost
 /// (`RasterQueue::push`) above them.
 const ENTRY_KIND_MASK: u32 = 7;
@@ -401,11 +415,16 @@ impl RasterQueue {
     }
 
     /// Hand the raster unit a job whose effect the guest can see, a fence's
-    /// token or a query's answer, behind every job before it.
-    pub fn submit_completion(&self, job: impl FnOnce(&mut RasterCtx) + Send + 'static) {
-        self.submit_work(RASTER_JOB_OVERHEAD, move |ctx| {
-            job(ctx);
-        });
+    /// token or a query's answer, behind every job before it. It runs once
+    /// the drawing before it is stored (QuadRing::complete); the raster
+    /// thread goes on to the jobs after it meanwhile.
+    pub fn submit_completion(&self, job: impl FnOnce() + Send + 'static) {
+        if !self.threaded() {
+            job();
+            return;
+        }
+        let entry = Box::into_raw(Box::new(Box::new(job) as Completion)) as u64;
+        self.push(ENTRY_COMPLETION, entry, RASTER_JOB_OVERHEAD);
     }
 
     /// Hand a GL draw to the raster unit, behind every job before it. The
@@ -630,7 +649,7 @@ impl RasterQueue {
                 while self.pushed.load(SeqCst) == self.taken.load(SeqCst) && !self.exit.load(SeqCst) {
                     if !self.held.load(SeqCst) {
                         self.kick.wait(&mut g);
-                    } else if self.flush.load(SeqCst) || ctx.pipe_idle() {
+                    } else if self.flush.load(SeqCst) || ctx.completing() || ctx.pipe_idle() {
                         break;
                     } else {
                         // The pipeline gives up its count once it runs dry
@@ -682,6 +701,14 @@ impl RasterQueue {
                     }
                     for job in ctx.reclaim_shade() {
                         self.give_back(job);
+                    }
+                } else if kind == ENTRY_COMPLETION {
+                    // SAFETY: submit_completion() put it there, and it is
+                    // taken once.
+                    let job = unsafe { Box::from_raw(value as *mut Completion) };
+                    match &ctx.ring {
+                        Some(r) => r.complete(*job),
+                        None => job(),
                     }
                 } else if kind == ENTRY_RING {
                     // SAFETY: submit_ring() put it there, and it is taken once.
