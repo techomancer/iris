@@ -175,9 +175,10 @@ rex-dirty-upload = []
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # Replay-only host-GPU prototype for REX3. This is deliberately separate from
-# `gpujit`: it adds a headless wgpu/WGSL engine selected explicitly with
-# REX3_REPLAY_ENGINE=gpu and never changes the live CPU renderer by default.
-rex-gpu = ["gputrace", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
+# `gpujit`: it builds on the opt-in damage tracker and adds a headless wgpu/WGSL
+# engine selected explicitly with REX3_REPLAY_ENGINE=gpu. It never changes the
+# live CPU renderer by default.
+rex-gpu = ["gputrace", "rex-dirty-upload", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
 # Cranelift-based JIT for IMPACT (GR4) raster shaders: RSS/TE1 pixel
 # pipelines monomorphised on a 64-bit key (src/dev/mgras/rss_jit).
 gr4-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
@@ -448,4 +449,3 @@ winit = { path = "third_party/winit-0.30.13" }
 # nokhwa -> cocoa/metal. The vendored copy makes `Class` opaque-but-inhabited, as
 # its maintained successor block2 does. Drop when nokhwa stops pulling `block`.
 block = { path = "third_party/block-0.1.6" }
-
