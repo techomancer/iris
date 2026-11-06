@@ -117,64 +117,68 @@ impl ShaderState {
         }
     }
 
-    /// ShaderState::apply() in 12.12.
+    /// ShaderState::apply() in 12.12 at a quad's four pixels, as lanes
+    /// (texel[k] and rgba[k] are component k at pixels 0 to 3).
     #[inline(always)]
-    pub fn apply12(&self, class: Class, texel: &[i32; 4], rgba: &mut [i32; 4]) {
+    fn apply12x4(&self, class: Class, texel: &[[i32; 4]; 4], rgba: &mut [[i32; 4]; 4]) {
         for k in 0..4usize {
             if !takes(class, k) {
                 continue;
             }
             let alpha = k == 3;
-            match self.env {
-                Env::Replace => rgba[k] = texel[k],
-                Env::Modulate => rgba[k] = fixed::mul(rgba[k], texel[k]),
-                Env::Add => rgba[k] = if alpha && class != Class::Intensity { fixed::mul(rgba[k], texel[k]) } else { fixed::clamp(rgba[k] + texel[k]) },
-                Env::Decal => {
-                    if !alpha {
-                        rgba[k] = if class == Class::Rgb { texel[k] } else { fixed::lerp(rgba[k], texel[k], texel[3]) };
-                    }
-                }
-                Env::Blend => {
-                    rgba[k] = if alpha && class != Class::Intensity {
-                        fixed::mul(rgba[k], texel[k])
-                    } else {
-                        fixed::lerp(rgba[k], self.env_colour12[k], texel[k])
-                    };
-                }
-            }
+            let (t, c) = (texel[k], rgba[k]);
+            let lanes = |f: &dyn Fn(i32, i32) -> i32| -> [i32; 4] { std::array::from_fn(|i| f(c[i], t[i])) };
+
+            rgba[k] = match self.env {
+                Env::Replace => t,
+                Env::Modulate => lanes(&fixed::mul),
+                Env::Add if alpha && class != Class::Intensity => lanes(&fixed::mul),
+                Env::Add => lanes(&|c, t| fixed::clamp(c + t)),
+                Env::Decal if alpha => c,
+                Env::Decal if class == Class::Rgb => t,
+                Env::Decal => std::array::from_fn(|i| fixed::lerp(c[i], t[i], texel[3][i])),
+                Env::Blend if alpha && class != Class::Intensity => lanes(&fixed::mul),
+                Env::Blend => lanes(&|c, t| fixed::lerp(c, self.env_colour12[k], t)),
+            };
         }
     }
 
-    /// Shade a fragment of colour rgba in 12.12 at window depth zw: its
-    /// texel (from the texture unit, for the draw's texel class)
-    /// by the environment, fog and the alpha test. False where the fragment
-    /// is dropped.
+    /// Shade a quad's fragments of colour rgba in 12.12 at window depths
+    /// zw(i), as lanes (rgba[k], spec[k] and texel[k] are component k at
+    /// pixels 0 to 3): each texel (from the texture unit, for the draw's
+    /// texel class) by the environment, fog and the alpha test. The mask
+    /// has the pixels the alpha test keeps.
     #[inline]
-    pub fn shade12(&self, textured: bool, rgba: &mut [i32; 4], spec: &[i32; 3], texel: &[i32; 4], zw: f64) -> bool {
+    pub fn shade12x4(&self, textured: bool, rgba: &mut [[i32; 4]; 4], spec: &[[i32; 4]; 3], texel: &[[i32; 4]; 4], zw: impl Fn(usize) -> f64) -> u8 {
         if textured {
-            self.apply12(self.class, texel, rgba);
+            self.apply12x4(self.class, texel, rgba);
         }
         // GL 1.2's colour sum: the separate specular after texturing.
         if self.specular {
             for k in 0..3usize {
-                rgba[k] = fixed::clamp(rgba[k] + spec[k]);
+                rgba[k] = std::array::from_fn(|i| fixed::clamp(rgba[k][i] + spec[k][i]));
             }
         }
         if self.fog {
-            let f = fixed::from_f64(self.fog_factor(zw as f32) as f64);
-            // A factor of 1.0 keeps the colour.
-            let f = if f == fixed::MAX { fixed::ONE } else { f };
+            for i in 0..4usize {
+                let f = fixed::from_f64(self.fog_factor(zw(i) as f32) as f64);
+                // A factor of 1.0 keeps the colour.
+                let f = if f == fixed::MAX { fixed::ONE } else { f };
 
-            for k in 0..3usize {
-                rgba[k] = fixed::lerp(self.fog_colour12[k], rgba[k], f);
+                for k in 0..3usize {
+                    rgba[k][i] = fixed::lerp(self.fog_colour12[k], rgba[k][i], f);
+                }
             }
         }
+        let mut kept = 0xf;
         if let Some((func, reference)) = self.alpha {
-            if !func.test(fixed::alpha12(rgba[3]), reference) {
-                return false;
+            for i in 0..4usize {
+                if !func.test(fixed::alpha12(rgba[3][i]), reference) {
+                    kept &= !(1 << i);
+                }
             }
         }
-        true
+        kept
     }
 
     /// The alpha test's 12-bit value of an alpha: min(4095, floor(4096 a))
@@ -247,11 +251,13 @@ mod tests {
         let regs = TexRegs { path: MODE_SEPARATE_SPECULAR, ..TexRegs::default() };
         let s = ShaderState::of(&ShaderWords::default(), &regs);
         assert!(s.specular);
-        let mut c = [fixed::MAX; 4];
-        assert!(s.shade12(true, &mut c, &spec, &texel, 0.0));
-        let mut plain = [fixed::MAX; 4];
+        let (spec, texel) = (spec.map(|v| [v; 4]), texel.map(|v| [v; 4]));
+        let mut c = [[fixed::MAX; 4]; 4];
+        assert_eq!(s.shade12x4(true, &mut c, &spec, &texel, |_| 0.0), 0xf);
+        let mut plain = [[fixed::MAX; 4]; 4];
         let off = ShaderState::of(&ShaderWords::default(), &TexRegs::default());
-        assert!(off.shade12(true, &mut plain, &spec, &texel, 0.0));
+        assert_eq!(off.shade12x4(true, &mut plain, &spec, &texel, |_| 0.0), 0xf);
+        let (c, plain) = (c.map(|k| k[0]), plain.map(|k| k[0]));
         // Red: the texture's product plus a quarter; green clamps; blue as
         // without the specular.
         assert_eq!(c[0], plain[0] + fixed::ONE / 4);

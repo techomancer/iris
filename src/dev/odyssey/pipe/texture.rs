@@ -25,6 +25,8 @@ use super::super::bits::sextract32;
 use super::super::consts::tex;
 use super::super::field::{texel_storage, texel_unpack, value_len, FIELD_FOUR, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
 use super::super::vram::VramPtr;
+use super::lanes;
+use fearless_simd::{dispatch, Simd};
 
 /// Level table entries (0x0e80 .. 0x0ebf).
 pub(crate) const LEVEL_ENTRIES: usize = 64;
@@ -435,6 +437,9 @@ pub(crate) struct Latch {
     pub clamp: [i64; 3],
     /// The border colour, 12-bit components with the class's filled in.
     pub border: [u32; 4],
+    /// The post-filter changes a texel: a scale or bias that is not the
+    /// identity, or the colour table (Unit::post).
+    pub post: bool,
     /// unimplemented::* bits.
     pub unimplemented: u32,
 }
@@ -455,6 +460,7 @@ impl Default for Latch {
             detail_scale: [0.0; 2],
             clamp: [i64::MAX; 3],
             border: [0; 4],
+            post: false,
             unimplemented: 0,
         }
     }
@@ -597,6 +603,9 @@ impl Latch {
         // A 1D image's one row is every row.
         let wrap_t = if target == Target::OneD { Wrap::ClampToEdge } else { r.wrap(1) };
         l.addr = [addr_for(r.wrap(0), 0), addr_for(wrap_t, 1), addr_for(r.wrap(2), 2)];
+        let sb = &r.scale_bias;
+        l.post = r.colour_table().0
+            || (0..4).any(|k| sextract32(sb[k * 2], 0, tex::SCALE_BIAS_BITS) != tex::SCALE_BIAS_ONE as i32 || sextract32(sb[k * 2 + 1], 0, tex::SCALE_BIAS_BITS) != 0);
         l
     }
 }
@@ -791,16 +800,30 @@ fn pos(mut u: i64, l: u32, wrap: Wrap, linear: bool) -> (i64, u32) {
     (x, 0)
 }
 
-/// floor(x) for |x| below 2^31; beyond, the cast saturates.
+/// A quad's positions on its first `axes` axes in 1/256 of a texel (S, T
+/// or R over Q times the axis's scale, floored by lanes::floor_i32), as
+/// lanes; the other axes' are 0.
 #[inline(always)]
-fn floor_i32(x: f32) -> i32 {
-    let i = x as i32;
-    i - (x < i as f32) as i32
+fn positions(q: &TexQuad, scale: &[f32; 3], axes: usize) -> [[i64; 4]; 3] {
+    dispatch!(lanes::level(), s => positions_lanes(s, q, scale, axes))
 }
 
-/// A quad's texture coordinates: pixel i (at x + (i & 1), y + (i >> 1))
-/// has homogeneous S, T, R and Q in c[i]. The pixels a primitive does not
-/// cover are still its helpers for the level of detail.
+#[inline(always)]
+fn positions_lanes<S: Simd>(s: S, q: &TexQuad, scale: &[f32; 3], axes: usize) -> [[i64; 4]; 3] {
+    let rq = s.div_f32x4(s.splat_f32x4(1.0), s.load_array_f32x4(q.c[3]));
+    let mut p = [[0i64; 4]; 3];
+
+    for (a, pa) in p.iter_mut().enumerate().take(axes) {
+        let v = s.mul_f32x4(s.mul_f32x4(s.load_array_f32x4(q.c[a]), rq), s.splat_f32x4(scale[a]));
+        *pa = s.as_array_i32x4(lanes::floor_i32(s, v)).map(i64::from);
+    }
+    p
+}
+
+/// A quad's texture coordinates, as lanes: c[0] to c[3] are homogeneous S,
+/// T, R and Q, each at pixels 0 to 3 (pixel i at x + (i & 1), y + (i >> 1)).
+/// The pixels a primitive does not cover are still its helpers for the
+/// level of detail.
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(C)]
 pub(crate) struct TexQuad {
@@ -816,40 +839,32 @@ pub(crate) struct Unit<'a> {
     pub mem: VramPtr,
 }
 
-/// One pixel's taps on one level: the first tap's index per axis before
-/// wrapping, and the second taps' weights.
+/// A quad's taps on one level, as lanes per axis: each pixel's first tap's
+/// index before wrapping, and the second taps' weights.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Taps {
-    at: [i64; 3],
-    w: [u32; 3],
+    at: [[i64; 4]; 3],
+    w: [[u32; 4]; 3],
 }
 
 impl Unit<'_> {
     /// Sample a quad: each pixel's position in each axis, the quad's level
     /// of detail from its diagonals, then the texel of each pixel in `cov`
-    /// into out in 12.12.
+    /// into out in 12.12, as lanes (out[k] is component k at pixels 0 to 3).
     #[inline]
     pub fn sample_quad(&self, q: &TexQuad, cov: u8, out: &mut [[i32; 4]; 4]) {
         let l = self.latch;
         let r = self.regs;
         let axes = r.target().axes();
-        let mut p = [[0i64; 3]; 4];
-        let mut d = [[0i64; 2]; 4];
-
-        for i in 0..4 {
-            let c = &q.c[i];
-            let rq = 1.0 / c[3];
-            p[i] = [0, 1, 2].map(|a| if a < axes { floor_i32(c[a] * rq * l.scale[a]) as i64 } else { 0 });
-            d[i] = [0, 1].map(|a| floor_i32(c[a] * rq * l.detail_scale[a]) as i64);
-        }
+        let mut p = positions(q, &l.scale, axes);
         // The diagonal rule: the largest difference along the quad's two
         // diagonals, in 1/256 of a base texel, scaled by the bias.
         let mut lambda = if l.lod {
             let mut rho = 0.0f32;
             for (a, b) in [(0, 3), (1, 2)] {
                 for k in 0..3 {
-                    rho = rho.max((p[b][k] - p[a][k]).unsigned_abs() as f32 * l.lod_scale[k]);
+                    rho = rho.max((p[k][b] - p[k][a]).unsigned_abs() as f32 * l.lod_scale[k]);
                 }
             }
             let rho = rho.min(u32::MAX as f32) as u32;
@@ -882,10 +897,8 @@ impl Unit<'_> {
                 }
             }
         }
-        for pi in p.iter_mut() {
-            for a in 0..3 {
-                pi[a] = pi[a].min(l.clamp[a]);
-            }
+        for a in 0..3 {
+            p[a] = p[a].map(|v| v.min(l.clamp[a]));
         }
         let mut acc = [[0u32; 4]; 4];
         self.level_quad(first, linear, &p, cov, &mut acc);
@@ -900,7 +913,8 @@ impl Unit<'_> {
         }
         let mut dt = [[0u32; 4]; 4];
         if detail {
-            self.detail_quad(&d, cov, &mut dt);
+            let d = positions(q, &[l.detail_scale[0], l.detail_scale[1], 0.0], 2);
+            self.detail_quad(&[d[0], d[1]], cov, &mut dt);
         }
         let weight = if detail { r.detail_weight(lambda) } else { 0 };
         for i in 0..4 {
@@ -912,27 +926,38 @@ impl Unit<'_> {
             if detail {
                 self.apply_detail(weight, &dt[i], &mut c);
             }
-            self.post(&mut c);
-            out[i] = c;
+            if l.post {
+                self.post(&mut c);
+            }
+            for k in 0..4 {
+                out[k][i] = c[k];
+            }
         }
     }
 
     /// Each covered pixel's taps on level lv at base positions p.
     #[inline(always)]
-    fn taps(&self, lv: &Level, linear: bool, p: &[[i64; 3]; 4], cov: u8) -> [Taps; 4] {
+    fn taps(&self, lv: &Level, linear: bool, p: &[[i64; 4]; 3], cov: u8) -> Taps {
         let r = self.regs;
         let l0 = &self.latch.level[0];
         let target = r.target();
-        let mut t = [Taps::default(); 4];
+        let mut t = Taps::default();
+        // The axes the target has, each with its shift down to the level,
+        // its log2 size there and its wrap.
+        let n = match target {
+            Target::OneD => 1,
+            Target::ThreeD => 3,
+            _ => 2,
+        };
+        let axis = [(l0.wl - lv.wl, lv.wl), (l0.hl - lv.hl, lv.hl), (l0.dl - lv.dl, lv.dl)];
 
-        for i in 0..4 {
-            if cov & (1 << i) == 0 {
-                continue;
+        for (a, &(shift, size)) in axis.iter().enumerate().take(n) {
+            let wrap = r.wrap(a);
+            for i in 0..4 {
+                if cov & (1 << i) != 0 {
+                    (t.at[a][i], t.w[a][i]) = pos(p[a][i] >> shift, size, wrap, linear);
+                }
             }
-            let (x, a) = pos(p[i][0] >> (l0.wl - lv.wl), lv.wl, r.wrap(0), linear);
-            let (y, b) = if target == Target::OneD { (0, 0) } else { pos(p[i][1] >> (l0.hl - lv.hl), lv.hl, r.wrap(1), linear) };
-            let (z, c) = if target == Target::ThreeD { pos(p[i][2] >> (l0.dl - lv.dl), lv.dl, r.wrap(2), linear) } else { (0, 0) };
-            t[i] = Taps { at: [x, y, z], w: [a, b, c] };
         }
         t
     }
@@ -940,7 +965,7 @@ impl Unit<'_> {
     /// Level i sampled at each covered pixel's base position, each component
     /// 12 bits with 16 fraction bits: the quad's taps gathered once into a
     /// window where they fit one, else each pixel's own.
-    fn level_quad(&self, i: u32, linear: bool, p: &[[i64; 3]; 4], cov: u8, out: &mut [[u32; 4]; 4]) {
+    fn level_quad(&self, i: u32, linear: bool, p: &[[i64; 4]; 3], cov: u8, out: &mut [[u32; 4]; 4]) {
         let lv = &self.latch.level[i as usize];
         let t = self.taps(lv, linear, p, cov);
         let target = self.regs.target();
@@ -950,8 +975,8 @@ impl Unit<'_> {
         let mut hi = [i64::MIN; 3];
         for i in (0..4).filter(|i| cov & (1 << i) != 0) {
             for a in 0..3 {
-                lo[a] = lo[a].min(t[i].at[a]);
-                hi[a] = hi[a].max(t[i].at[a] + more[a]);
+                lo[a] = lo[a].min(t.at[a][i]);
+                hi[a] = hi[a].max(t.at[a][i] + more[a]);
             }
         }
         if lo[0] > hi[0] {
@@ -963,15 +988,16 @@ impl Unit<'_> {
             self.gather(lv, lo, [hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1], win.as_mut_ptr().cast());
         }
         for i in (0..4).filter(|i| cov & (1 << i) != 0) {
+            let first = [t.at[0][i], t.at[1][i], t.at[2][i]];
             let base = if fits {
                 lo
             } else {
-                self.gather(lv, t[i].at, [1 + more[0], 1 + more[1], 1 + more[2]], win.as_mut_ptr().cast());
-                t[i].at
+                self.gather(lv, first, [1 + more[0], 1 + more[1], 1 + more[2]], win.as_mut_ptr().cast());
+                first
             };
-            let at = [0, 1, 2].map(|a| (t[i].at[a] - base[a]) as usize);
+            let at = [0, 1, 2].map(|a| (first[a] - base[a]) as usize);
             // SAFETY: the taps lie in what gather() wrote.
-            out[i] = unsafe { filter(win.as_ptr().cast(), at, t[i].w, linear, target == Target::ThreeD) };
+            out[i] = unsafe { filter(win.as_ptr().cast(), at, [t.w[0][i], t.w[1][i], t.w[2][i]], linear, target == Target::ThreeD) };
         }
     }
 
@@ -995,14 +1021,14 @@ impl Unit<'_> {
 
     /// The detail image at each covered pixel's position, LINEAR and
     /// repeated, 12 bits with 16 fraction bits.
-    fn detail_quad(&self, d: &[[i64; 2]; 4], cov: u8, out: &mut [[u32; 4]; 4]) {
+    fn detail_quad(&self, d: &[[i64; 4]; 2], cov: u8, out: &mut [[u32; 4]; 4]) {
         let lv = &self.latch.detail;
         let mut win = std::mem::MaybeUninit::<Win>::uninit();
         let repeat = [addr_for(Wrap::Repeat, 0), addr_for(Wrap::Repeat, 1)];
 
         for i in (0..4).filter(|i| cov & (1 << i) != 0) {
-            let (x, a) = pos(d[i][0], lv.wl, Wrap::Repeat, true);
-            let (y, b) = pos(d[i][1], lv.hl, Wrap::Repeat, true);
+            let (x, a) = pos(d[0][i], lv.wl, Wrap::Repeat, true);
+            let (y, b) = pos(d[1][i], lv.hl, Wrap::Repeat, true);
             let mut axes = [Axis::default(); 3];
             repeat[0](lv, x, 2, false, &mut axes[0]);
             repeat[1](lv, y, 2, false, &mut axes[1]);

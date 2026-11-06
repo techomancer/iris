@@ -296,6 +296,8 @@ png = "0.18"
 flate2 = "1"
 parking_lot = "0.12"
 spin = "0.9"
+# The VPro fragment pipeline's four-pixel lanes (src/dev/odyssey/pipe/lanes.rs).
+fearless_simd = "0.4.1"
 # rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now
 # pulls its own `pollster` executor to block on the portal's async D-Bus calls.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

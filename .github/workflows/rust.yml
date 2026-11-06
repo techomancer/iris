@@ -59,6 +59,12 @@ jobs:
     # workflow. Shared runners there are slower and noisier, and several tests
     # read the wall clock. Their Build step above still gates; Linux gates on
     # both.
+    # The VPro fragment pipeline's SIMD kernels against their scalar
+    # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
+    # lanes.rs): deterministic, so they gate everywhere. macos-26 is the
+    # only runner with NEON.
+    - name: Run SIMD lane tests
+      run: cargo test -p iris --lib the_lane_
     - name: Run tests
       continue-on-error: ${{ matrix.informational }}
       run: cargo test --workspace --verbose

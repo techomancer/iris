@@ -17,7 +17,10 @@
 use super::super::view::{Rows, MAX_DIM};
 use super::state::{Compare, Cull, RasterWords};
 use super::super::consts::{ODSY_ID_COMPARE_ENABLE, ODSY_ID_COMPARE_MASK_SHIFT};
-use super::super::depth_word::word_with_offset;
+use super::super::depth_word::{word_for_fraction32_lanes, word_with_offset};
+use super::super::consts::ODSY_DEPTH24_MAX;
+use super::lanes;
+use fearless_simd::{dispatch, Simd};
 use super::super::clip::ClipRect;
 
 /// Window coordinates snap to 1/2^SUBPIXEL_BITS pixel (established).
@@ -26,6 +29,10 @@ const SUB: i64 = 1 << SUBPIXEL_BITS;
 
 /// The tile the walk subdivides to, in pixels.
 pub(crate) const TILE: i32 = 8;
+
+/// A quad's pixel i is column x + LANE_X[i] of row y + LANE_Y[i].
+pub(crate) const LANE_X: [i64; 4] = [0, 1, 0, 1];
+pub(crate) const LANE_Y: [i64; 4] = [0, 0, 1, 1];
 
 /// A vertex as the rasteriser takes it: window position in subpixels,
 /// depth over w and its divisor, 1/w for perspective, and the attributes
@@ -132,9 +139,9 @@ pub(crate) struct RasterState {
     /// The depth word of a window depth (RasterRules::depth_code) and the
     /// unsigned-float depth encoder, as the board's rules make them.
     pub depth_code: fn(f64) -> u32,
-    /// The same encoder for a 32-bit float depth, where the walk takes depth
-    /// from the triangle's planes (`Triangle::depth`).
-    pub depth_code32: Option<fn(f32) -> u32>,
+    /// The walk takes depth in 32-bit floats from the triangle's planes
+    /// and encodes it with word_for_fraction32 (`Triangle::depth4`).
+    pub depth32: bool,
 }
 
 impl RasterState {
@@ -234,7 +241,7 @@ impl RasterState {
             pretest: (pretest_allowed && depth.is_some()).then(|| w.depth_func()),
             depth,
             depth_code,
-            depth_code32: None,
+            depth32: false,
         }
     }
 }
@@ -351,6 +358,39 @@ impl Triangle {
         [0, 1, 2].map(|k| self.e00[k].wrapping_add(self.dx[k].wrapping_mul(px)).wrapping_add(self.dy[k].wrapping_mul(py)))
     }
 
+    /// A quad's depth at its barycentrics (l1, l2) under st, in 32 bits, as
+    /// lanes: depth_ratio() through RasterState::window_depth32(), its word
+    /// (word_for_fraction32()) with `steps` of polygon offset, and the
+    /// pixels that have a depth.
+    #[inline(always)]
+    pub fn depth4(&self, st: &RasterState, l1: &[f32; 4], l2: &[f32; 4], steps: i64) -> ([f32; 4], [u32; 4], u8) {
+        dispatch!(lanes::level(), s => self.depth4_lanes(s, st, l1, l2, steps))
+    }
+
+    #[inline(always)]
+    fn depth4_lanes<S: Simd>(&self, s: S, st: &RasterState, l1: &[f32; 4], l2: &[f32; 4], steps: i64) -> ([f32; 4], [u32; 4], u8) {
+        let k = |v: f32| s.splat_f32x4(v);
+        let (l1, l2) = (s.load_array_f32x4(*l1), s.load_array_f32x4(*l2));
+        let plane = |v: &[f64; 3]| s.add_f32x4(s.add_f32x4(k(v[0] as f32), s.mul_f32x4(l1, k((v[1] - v[0]) as f32))), s.mul_f32x4(l2, k((v[2] - v[0]) as f32)));
+        let z = s.div_f32x4(plane(&self.z), plane(&self.d));
+        // window_depth32(): the slack clamps, the range, the clamp to [0, 1].
+        let slack = st.depth_slack as f32;
+        let low = s.and_mask32x4(s.simd_lt_f32x4(z, k(0.0)), s.simd_ge_f32x4(z, k(-slack)));
+        let high = s.and_mask32x4(s.simd_gt_f32x4(z, k(1.0)), s.simd_le_f32x4(z, k(1.0 + slack)));
+        let z = s.select_f32x4(low, k(0.0), s.select_f32x4(high, k(1.0), z));
+        let kept = s.and_mask32x4(s.simd_ge_f32x4(z, k(0.0)), s.simd_le_f32x4(z, k(1.0)));
+        let (n, f) = (st.depth_range[0] as f32, st.depth_range[1] as f32);
+        let zw = s.add_f32x4(k(n), s.mul_f32x4(k(f - n), z));
+        let zw = s.select_f32x4(s.simd_ge_f32x4(zw, k(1.0)), k(1.0), s.select_f32x4(s.simd_gt_f32x4(zw, k(0.0)), zw, k(0.0)));
+        // word_with_offset(): the word is below 2^24, so steps past 2^25
+        // either way clamp as those at 2^25 do.
+        let steps = s.splat_i32x4(steps.clamp(-(1 << 25), 1 << 25) as i32);
+        let word = s.add_i32x4(word_for_fraction32_lanes(s, zw), steps);
+        let word = s.min_i32x4(s.max_i32x4(word, s.splat_i32x4(0)), s.splat_i32x4(ODSY_DEPTH24_MAX as i32));
+
+        (s.as_array_f32x4(zw), s.as_array_i32x4(word).map(|w| w as u32), lanes::bits(s, kept))
+    }
+
     /// Depth over the divisor at barycentrics (l1, l2), in 32 bits.
     #[inline(always)]
     pub fn depth_ratio(&self, l1: f32, l2: f32) -> f32 {
@@ -449,66 +489,65 @@ pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32
 
                 while qx <= qx1 {
                     let e = t.edges_at(qx as i64, qy as i64);
+                    // The four pixels as lanes: the edge values, and the
+                    // barycentrics for every pixel of the quad (the level
+                    // of detail reads the undrawn ones).
+                    let ei: [[i64; 4]; 3] = std::array::from_fn(|k| std::array::from_fn(|i| e[k] + t.dx[k] * LANE_X[i] + t.dy[k] * LANE_Y[i]));
 
                     q.x = qx;
                     q.y = qy;
-                    q.cov = 0;
+                    q.l1 = ei[1].map(|v| v as f32 * t.inv_area);
+                    q.l2 = ei[2].map(|v| v as f32 * t.inv_area);
+                    let mut cov = 0u8;
                     for i in 0..4usize {
-                        let px = qx + (i & 1) as i32;
-                        let py = qy + (i >> 1) as i32;
-                        let ei = [
-                            e[0] + t.dx[0] * (i & 1) as i64 + t.dy[0] * (i >> 1) as i64,
-                            e[1] + t.dx[1] * (i & 1) as i64 + t.dy[1] * (i >> 1) as i64,
-                            e[2] + t.dx[2] * (i & 1) as i64 + t.dy[2] * (i >> 1) as i64,
-                        ];
-
-                        // The barycentrics, for every pixel of the quad:
-                        // the level of detail reads the undrawn ones.
-                        let l1 = ei[1] as f32 * t.inv_area;
-                        let l2 = ei[2] as f32 * t.inv_area;
-
-                        q.l1[i] = l1;
-                        q.l2[i] = l2;
-                        if px < x0 || px > x1 || py < y0 || py > y1 {
-                            continue;
+                        let (px, py) = (qx + LANE_X[i] as i32, qy + LANE_Y[i] as i32);
+                        let inside = px >= x0 && px <= x1 && py >= y0 && py <= y1;
+                        let edges = all_in || (ei[0][i] >= t.need[0] && ei[1][i] >= t.need[1] && ei[2][i] >= t.need[2]);
+                        cov |= ((inside && edges) as u8) << i;
+                    }
+                    for i in 0..4usize {
+                        if cov & (1 << i) != 0 && !st.owned(st.ox.wrapping_add(qx + LANE_X[i] as i32), st.oy.wrapping_add(qy + LANE_Y[i] as i32)) {
+                            cov &= !(1 << i);
                         }
-                        if !all_in && (ei[0] < t.need[0] || ei[1] < t.need[1] || ei[2] < t.need[2]) {
-                            continue;
-                        }
-                        if !st.owned(st.ox.wrapping_add(px), st.oy.wrapping_add(py)) {
-                            continue;
-                        }
-                        let (zw, zq) = match st.depth_code32 {
-                            Some(code) => {
-                                // Depth from the barycentrics, in 32 bits.
-                                let Some(zw) = st.window_depth32(t.depth_ratio(l1, l2)) else {
-                                    continue;
-                                };
-                                (zw as f64, word_with_offset(code(zw), steps))
+                    }
+                    if cov == 0 {
+                        qx += 2;
+                        continue;
+                    }
+                    if st.depth32 {
+                        // Depth from the barycentrics, in 32 bits.
+                        let (zw, zq, kept) = t.depth4(st, &q.l1, &q.l2, steps);
+                        cov &= kept;
+                        q.zw = zw.map(|z| z as f64);
+                        q.zq = zq;
+                    } else {
+                        for i in 0..4usize {
+                            let b1 = ei[1][i] as f64 / area;
+                            let b2 = ei[2][i] as f64 / area;
+                            let z = t.z[0] + b1 * dz1 + b2 * dz2;
+                            let depth_w = (1.0 - b1 - b2) * t.d[0] + b1 * t.d[1] + b2 * t.d[2];
+                            match st.window_depth(z, depth_w) {
+                                Some(zw) => {
+                                    q.zw[i] = zw;
+                                    q.zq[i] = word_with_offset((st.depth_code)(zw), steps);
+                                }
+                                None => cov &= !(1 << i),
                             }
-                            None => {
-                                let b1 = ei[1] as f64 / area;
-                                let b2 = ei[2] as f64 / area;
-                                let z = t.z[0] + b1 * dz1 + b2 * dz2;
-                                let depth_w = (1.0 - b1 - b2) * t.d[0] + b1 * t.d[1] + b2 * t.d[2];
-                                let Some(zw) = st.window_depth(z, depth_w) else {
-                                    continue;
-                                };
-                                (zw, word_with_offset((st.depth_code)(zw), steps))
+                        }
+                    }
+                    if let (Some(func), Some(depth)) = (st.pretest, st.depth) {
+                        for i in 0..4usize {
+                            if cov & (1 << i) == 0 {
+                                continue;
                             }
-                        };
-
-                        if let (Some(func), Some(depth)) = (st.pretest, st.depth) {
-                            if let Some(stored) = depth.load_word(st.ox.wrapping_add(px), st.oy.wrapping_add(py)) {
-                                if !func.test(zq, stored) {
-                                    continue;
+                            if let Some(stored) = depth.load_word(st.ox.wrapping_add(qx + LANE_X[i] as i32), st.oy.wrapping_add(qy + LANE_Y[i] as i32)) {
+                                if !func.test(q.zq[i], stored) {
+                                    cov &= !(1 << i);
                                 }
                             }
                         }
-                        q.zw[i] = zw;
-                        q.zq[i] = zq;
-                        q.cov |= 1 << i;
                     }
+                    q.cov = cov;
                     if q.cov != 0 {
                         emit(&q);
                     }
@@ -527,8 +566,54 @@ mod tests {
     use super::*;
     use super::super::super::board::ODSY_WIDTH;
     use super::super::super::consts::gl_cmd;
+    use super::super::super::depth_word::word_for_fraction32;
     use super::super::super::raster_bench::Lcg;
     use std::collections::HashSet;
+
+    /// depth4() is, at each pixel, the scalar path: depth_ratio() through
+    /// window_depth32(), then word_for_fraction32() and the offset, over
+    /// random planes (some with no divisor), barycentrics, depth ranges,
+    /// slacks and offsets as far as the field reaches and past it.
+    #[test]
+    fn the_lane_depth_is_the_scalar_one() {
+        let mut rng = Lcg(29);
+        let mut r = |lo: f64, hi: f64| rng.range(lo as f32, hi as f32) as f64;
+        let words = RasterWords { clip_kept: 1, ..Default::default() };
+        let cases: Vec<_> = (0..20_000)
+            .map(|n| {
+                let range = [r(-0.2, 0.6), r(0.4, 1.2)];
+                let slack = if n % 3 == 0 { 0.0 } else { r(0.0, 0.01) };
+                let st = RasterState::of(&words, ODSY_WIDTH, Rows::default(), range, slack, super::super::super::depth_word::word_for_fraction, None, false);
+                let z = [r(-1.5, 1.5), r(-1.5, 1.5), r(-1.5, 1.5)];
+                let d = if n % 17 == 0 { [0.0; 3] } else { [r(0.1, 3.0), r(0.1, 3.0), r(0.1, 3.0)] };
+                let t = Triangle::setup([(0, 0), (256, 0), (0, 256)], z, d, 1, true);
+                let l1: [f32; 4] = std::array::from_fn(|_| r(-0.2, 1.2) as f32);
+                let l2: [f32; 4] = std::array::from_fn(|_| r(-0.2, 1.2) as f32);
+                let steps = match n % 5 {
+                    0 => 0,
+                    1 => r(-16777216.0, 16777216.0) as i64,
+                    2 => r(-1.1e12, 1.1e12) as i64,
+                    _ => r(-1000.0, 1000.0) as i64,
+                };
+                (st, t, l1, l2, steps)
+            })
+            .collect();
+        super::super::lanes::each_level!(s, level => {
+            for (n, (st, t, l1, l2, steps)) in cases.iter().enumerate() {
+                let (zw, zq, kept) = t.depth4_lanes(s, st, l1, l2, *steps);
+                for i in 0..4 {
+                    match st.window_depth32(t.depth_ratio(l1[i], l2[i])) {
+                        Some(want) => {
+                            assert!(kept & (1 << i) != 0, "{level}: round {n} pixel {i}");
+                            assert_eq!(zw[i].to_bits(), want.to_bits(), "{level}: round {n} pixel {i}");
+                            assert_eq!(zq[i], word_with_offset(word_for_fraction32(want), *steps), "{level}: round {n} pixel {i}");
+                        }
+                        None => assert!(kept & (1 << i) == 0, "{level}: round {n} pixel {i}"),
+                    }
+                }
+            }
+        });
+    }
 
     /// The tiled walk keeps exactly the pixels whose centres the edge
     /// functions and their tie rule own, each once, over random triangles

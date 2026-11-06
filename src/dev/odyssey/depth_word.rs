@@ -15,6 +15,7 @@
 //! the library's encoder does.
 
 use super::consts::ODSY_DEPTH24_MAX;
+use fearless_simd::{f32x4, i32x4, Simd};
 
 /// The depth range's far value, 2S = 2^33 - 2^15.
 pub(super) const DEPTH_2S: f64 = 8589901824.0;
@@ -77,8 +78,10 @@ pub(super) fn word_for_fraction(z: f64) -> u32 {
 
 /// word_for_fraction() for a 32-bit float window depth: 2S z rounded to
 /// a float's 24 mantissa bits, then the exponent rebased and the top 18
-/// mantissa bits kept, from the float's own bits.
-#[inline(always)]
+/// mantissa bits kept, from the float's own bits. The pipeline runs it as
+/// word_for_fraction32_lanes(); this is the reference the tests hold that
+/// to.
+#[cfg(test)]
 pub(super) fn word_for_fraction32(z: f32) -> u32 {
     let z = if z > 1.0 { 1.0 } else if z > 0.0 { z } else { 0.0 };
     let v = z * DEPTH_2S as f32;
@@ -91,6 +94,22 @@ pub(super) fn word_for_fraction32(z: f32) -> u32 {
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + DEPTH_EXP_BIAS;
 
     (((exp as u32) << DEPTH_MANTISSA_BITS) | ((bits >> (23 - DEPTH_MANTISSA_BITS)) & DEPTH_MANTISSA_MASK)) & ODSY_DEPTH24_MAX
+}
+
+/// word_for_fraction32() at four lanes, as the integers the words are.
+#[inline(always)]
+pub(super) fn word_for_fraction32_lanes<S: Simd>(s: S, z: f32x4<S>) -> i32x4<S> {
+    let zero = s.splat_f32x4(0.0);
+    let one = s.splat_f32x4(1.0);
+    let z = s.select_f32x4(s.simd_gt_f32x4(z, one), one, s.select_f32x4(s.simd_gt_f32x4(z, zero), z, zero));
+    let v = s.mul_f32x4(z, s.splat_f32x4(DEPTH_2S as f32));
+    // v is not negative, so its bits shift as an unsigned word's.
+    let bits = s.reinterpret_i32_f32x4(v);
+    let exp = s.add_i32x4(s.and_i32x4(s.shr_i32x4(bits, 23), s.splat_i32x4(0xff)), s.splat_i32x4(DEPTH_EXP_BIAS - 127));
+    let mantissa = s.and_i32x4(s.shr_i32x4(bits, 23 - DEPTH_MANTISSA_BITS), s.splat_i32x4(DEPTH_MANTISSA_MASK as i32));
+    let word = s.and_i32x4(s.or_i32x4(s.shl_i32x4(exp, DEPTH_MANTISSA_BITS), mantissa), s.splat_i32x4(ODSY_DEPTH24_MAX as i32));
+
+    s.select_i32x4(s.simd_ge_f32x4(v, s.splat_f32x4(DEPTH_MIN_VALUE as f32)), word, s.splat_i32x4(0))
 }
 
 /// The 16-bit form (ESTABLISHED): the exponent in bits 15:10 and the top ten
@@ -122,6 +141,25 @@ pub(super) fn word_with_offset(word: u32, steps: i64) -> u32 {
 #[cfg(test)]
 mod tests_f32 {
     use super::*;
+
+    /// The lane encoder gives the scalar one's word for every depth,
+    /// those outside [0, 1], the smallest, NaN and the infinities included.
+    #[test]
+    fn the_lane_encoder_matches_the_scalar_one() {
+        let mut zs: Vec<f32> = (0..=400_000u32).map(|i| i as f32 / 200_000.0 - 0.5).collect();
+        zs.extend((0..200).map(|e| (-(e as f32)).exp2()));
+        zs.extend([f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0, 0.0, f32::MIN_POSITIVE, 1e-40, 1.0, 1.0000001, 0.99999994, f32::MAX, f32::MIN]);
+        super::super::pipe::lanes::each_level!(s, level => {
+            for c in zs.chunks(4) {
+                let mut z = [0.0f32; 4];
+                z[..c.len()].copy_from_slice(c);
+                let got = s.as_array_i32x4(word_for_fraction32_lanes(s, s.load_array_f32x4(z)));
+                for i in 0..4 {
+                    assert_eq!(got[i] as u32, word_for_fraction32(z[i]), "{level}: {:e}", z[i]);
+                }
+            }
+        });
+    }
 
     #[test]
     fn the_float_encoder_matches_the_double_one_to_a_step() {

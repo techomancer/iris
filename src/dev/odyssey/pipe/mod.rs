@@ -9,6 +9,7 @@
 pub(super) mod backend;
 pub(super) mod fixed;
 pub(super) mod interp;
+pub(super) mod lanes;
 #[cfg(test)]
 pub(super) mod encode;
 pub(super) mod prims;
@@ -20,7 +21,7 @@ pub(super) mod texture;
 pub(super) mod ring;
 pub(super) mod slot;
 
-use super::depth_word::{word_for_fraction, word_for_fraction32};
+use super::depth_word::word_for_fraction;
 use backend::{DestMem, BackendState};
 use raster::RasterState;
 use shader::ShaderState;
@@ -98,7 +99,7 @@ impl PipeDraw {
             depth,
             backend.depth_test && !backend.stencil,
         );
-        raster.depth_code32 = Some(word_for_fraction32);
+        raster.depth32 = true;
 
 
         Box::new(PipeDraw {

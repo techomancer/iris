@@ -83,12 +83,13 @@ fn a_quad_samples_each_pixels_texel() {
     // Texel (x, y)'s centre: s = (x + 0.5) / 512, t = (y + 0.5) / 256, with
     // q 2 to divide out.
     let at = |x: f32, y: f32| [2.0 * (x + 0.5) / 512.0, 2.0 * (y + 0.5) / 256.0, 0.0, 2.0];
-    let q = TexQuad { c: [at(3.0, 5.0), at(4.0, 5.0), at(3.0, 6.0), at(4.0, 6.0)] };
+    let px = [at(3.0, 5.0), at(4.0, 5.0), at(3.0, 6.0), at(4.0, 6.0)];
+    let q = TexQuad { c: std::array::from_fn(|k| px.map(|c| c[k])) };
     let mut out = [[0i32; 4]; 4];
 
     with_unit(&mut s, |u| u.sample_quad(&q, 0xf, &mut out));
     for (i, w) in [0x1122_33ffu32, 0x4455_66ff, 0x7788_99ff, 0xaabb_ccff].into_iter().enumerate() {
-        assert_eq!(out[i], c12(w).map(|c| (c * 4097) as i32), "pixel {i}");
+        assert_eq!(out.map(|c| c[i]), c12(w).map(|c| (c * 4097) as i32), "pixel {i}");
     }
 }
 
