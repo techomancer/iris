@@ -174,10 +174,9 @@ default = ["tlbvmap", "rexdiag"]
 rex-dirty-upload = []
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
-# Replay-only host-GPU prototype for REX3. This is deliberately separate from
-# `gpujit`: it builds on the opt-in damage tracker and adds a headless wgpu/WGSL
-# engine selected explicitly with REX3_REPLAY_ENGINE=gpu. It never changes the
-# live CPU renderer by default.
+# Host-GPU prototype for REX3 replay and opt-in live experiments. This is
+# deliberately separate from `gpujit`: it builds on the opt-in damage tracker
+# and adds a wgpu/WGSL engine. The live CPU renderer remains the default.
 rex-gpu = ["gputrace", "rex-dirty-upload", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
 # Host-GPU rasterisation on wgpu: board memory on the GPU, primitives binned
 # into 8x8 tiles and rasterised by compute kernels (src/wgpu, and

@@ -13,22 +13,23 @@ struct FlatFill {
 var<storage, read_write> rgb: array<u32>;
 
 @group(0) @binding(1)
-var<uniform> fill: FlatFill;
+var<storage, read> fills: array<FlatFill>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let pixel_count = fill.width * fill.height;
-    if id.x >= pixel_count {
-        return;
+fn main(@builtin(local_invocation_id) id: vec3<u32>) {
+    let fill_count = arrayLength(&fills);
+    for (var draw = 0u; draw < fill_count; draw += 1u) {
+        let fill = fills[draw];
+        let pixel_count = fill.width * fill.height;
+        for (var pixel = id.x; pixel < pixel_count; pixel += 256u) {
+            let x = fill.min_x + pixel % fill.width;
+            let y = fill.min_y + pixel / fill.width;
+            let address = y * fill.stride + x;
+            if address < fill.plane_len {
+                let old = rgb[address];
+                rgb[address] = (old & ~fill.write_mask) | (fill.color & fill.write_mask);
+            }
+        }
+        storageBarrier();
     }
-
-    let x = fill.min_x + id.x % fill.width;
-    let y = fill.min_y + id.x / fill.width;
-    let address = y * fill.stride + x;
-    if address >= fill.plane_len {
-        return;
-    }
-
-    let old = rgb[address];
-    rgb[address] = (old & ~fill.write_mask) | (fill.color & fill.write_mask);
 }

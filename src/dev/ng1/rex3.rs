@@ -1703,25 +1703,22 @@ impl Rex3 {
             match result {
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Enqueued) => return true,
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::FlushRequired) => {
-                    let rgb = unsafe { &mut *self.fb_rgb.get() };
-                    match gpu.flush(rgb) {
-                        Ok(damage) => self.fb_damage.publish(&damage),
-                        Err(error) => {
-                            log::error!(
-                                "REX3 GPU replay could not flush a full batch: {error}"
-                            );
-                            return false;
-                        }
+                    if let Err(error) = gpu.submit() {
+                        log::error!("REX3 GPU could not submit a full batch: {error}");
+                        return false;
                     }
                 }
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Unsupported(reason)) => {
                     gpu.note_fallback(reason);
                     let rgb = unsafe { &mut *self.fb_rgb.get() };
                     match gpu.flush(rgb) {
-                        Ok(damage) => self.fb_damage.publish(&damage),
+                        Ok(damage) => {
+                            self.fb_damage.publish(&damage);
+                            gpu.cpu_framebuffer_changed();
+                        }
                         Err(error) => {
                             log::error!(
-                                "REX3 GPU replay could not synchronize before CPU fallback: {error}"
+                                "REX3 GPU could not synchronize before CPU fallback: {error}"
                             );
                         }
                     }
@@ -3483,6 +3480,8 @@ impl Rex3 {
             // DISP_SYNC sentinel: all prior draws are done — advance the fence.
             // Display thread spins on gfifo_fence >= sampled xmap_fence.
             GFIFO_DISP_SYNC => {
+                #[cfg(feature = "rex-gpu")]
+                self.flush_gpu_replay();
                 self.gfifo_fence.store(val64 as u32, Ordering::Release);
             }
             // PURE_GO sentinel (GO-only, no register write): no-op here; execute_go() is
@@ -3687,6 +3686,7 @@ impl Rex3 {
 
     /// Save RGB/aux planes with a custom filename prefix (e.g. `rex3_head1`).
     pub fn save_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
+        self.wait_idle();
         let rgb = unsafe { &*self.fb_rgb.get() };
         let mut bytes = Vec::with_capacity(rgb.len() * 4);
         for &word in rgb.iter() {
@@ -3707,6 +3707,7 @@ impl Rex3 {
     /// buffers. Pair with `restore_framebuffers_inmem` for the in-memory
     /// rollback checkpoint; bypasses the byte-shuffle the disk path needs.
     pub fn snapshot_framebuffers_inmem(&self) -> (Vec<u32>, Vec<u32>) {
+        self.wait_idle();
         let rgb = unsafe { &*self.fb_rgb.get() };
         let aux = unsafe { &*self.fb_aux.get() };
         (rgb.to_vec(), aux.to_vec())
@@ -3716,11 +3717,16 @@ impl Rex3 {
     /// `snapshot_framebuffers_inmem`. Lengths are clamped to the actual
     /// framebuffer size.
     pub fn restore_framebuffers_inmem(&self, rgb: &[u32], aux: &[u32]) {
+        self.wait_idle();
         let dst_rgb = unsafe { &mut *self.fb_rgb.get() };
         let n = rgb.len().min(dst_rgb.len());
         dst_rgb[..n].copy_from_slice(&rgb[..n]);
         if n != 0 {
             self.mark_framebuffer_full(DamagePlane::Rgb);
+            #[cfg(feature = "rex-gpu")]
+            if let Some(gpu) = self.gpu_replay.lock().as_mut() {
+                gpu.cpu_framebuffer_changed();
+            }
         }
 
         let dst_aux = unsafe { &mut *self.fb_aux.get() };
@@ -3777,6 +3783,8 @@ impl Rex3 {
     }
 
     pub fn load_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
+        self.wait_idle();
+        let mut rgb_changed = false;
         let path_rgb = dir.join(format!("{prefix}_rgb.bin"));
         if path_rgb.exists() {
             let bytes = std::fs::read(path_rgb)?;
@@ -3789,6 +3797,7 @@ impl Rex3 {
             }
             if count != 0 {
                 self.mark_framebuffer_full(DamagePlane::Rgb);
+                rgb_changed = true;
             }
         }
 
@@ -3806,6 +3815,14 @@ impl Rex3 {
                 self.mark_framebuffer_full(DamagePlane::Aux);
             }
         }
+        #[cfg(feature = "rex-gpu")]
+        if rgb_changed {
+            if let Some(gpu) = self.gpu_replay.lock().as_mut() {
+                gpu.cpu_framebuffer_changed();
+            }
+        }
+        #[cfg(not(feature = "rex-gpu"))]
+        let _ = rgb_changed;
         Ok(())
     }
 
@@ -3854,6 +3871,13 @@ impl Device for Rex3 {
             let _ = handle.join();
         }
 
+        #[cfg(feature = "rex-gpu")]
+        if std::env::var_os("IRIS_REX3_GPU").is_some() {
+            if let Some(report) = self.gpu_replay_report() {
+                eprintln!("REX3: live GPU report: {report:?}");
+            }
+        }
+
         // Save the corpus in every build. `seen_shapes` is device state, so this
         // works with or without `rex-jit` and with IRIS_NO_JIT set — the cases
         // where the old JIT-owned save wrote nothing at all.
@@ -3870,6 +3894,30 @@ impl Device for Rex3 {
 
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
+
+        #[cfg(feature = "rex-gpu")]
+        if let Ok(backend) = std::env::var("IRIS_REX3_GPU") {
+            let already_enabled = self.gpu_replay.lock().is_some();
+            if !already_enabled {
+                match self.enable_gpu_replay(&backend) {
+                    Ok(diagnostics) => {
+                        eprintln!("REX3: experimental live GPU renderer enabled: {diagnostics}")
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "REX3: cannot enable IRIS_REX3_GPU={backend}; using CPU renderer: {error}"
+                        )
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "rex-gpu"))]
+        if let Some(backend) = std::env::var_os("IRIS_REX3_GPU") {
+            eprintln!(
+                "REX3: ignoring IRIS_REX3_GPU={}; rebuild with --features rex-gpu",
+                backend.to_string_lossy()
+            );
+        }
 
         let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
 

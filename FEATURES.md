@@ -42,7 +42,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT). Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
-| `rex-gpu` | Experimental, replay-only Newport wgpu/WGSL engine. It does not replace the live CPU renderer and is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
+| `rex-gpu` | Experimental Newport wgpu/WGSL engine for replay and explicit live experiments. The CPU renderer remains the default; this feature is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit`, `gr2-jit` |
@@ -606,6 +606,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_ODSY_REC` | Record VPro bus stores, loads and DMA reads from power-on to this path (gzip; replayed by the tests in `src/dev/odyssey/golden/`; `vpro rec` does the same from the monitor). | [src/dev/odyssey/record.rs](src/dev/odyssey/record.rs) |
 | `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/pipe/ring.rs](src/dev/odyssey/pipe/ring.rs) |
 | `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
+| `IRIS_REX3_GPU` | `auto`, `vulkan`, `metal`, or `dx12` enables the experimental live REX3 host-GPU engine in a `rex-gpu` build. Unset keeps live rendering on the CPU. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
 | `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
@@ -838,14 +839,14 @@ monitor inspects and controls it.
 cargo run --release --features rex-jit
 ```
 
-### REX3 host-GPU replay prototype (`--features rex-gpu`)
+### REX3 host-GPU prototype (`--features rex-gpu`)
 
 `rex-gpu` adds a headless wgpu/WGSL compute path for differential REX3
-recording replay. It is deliberately separate from `gpujit`, is not enabled by
-default or in release packaging, and does not change the live emulator's CPU
-renderer. Compiling it also enables `gputrace`, which supplies the existing
-REX3 record/replay harness, and `rex-dirty-upload`, whose damage snapshots
-publish completed GPU batches to the existing presentation path.
+recording replay and explicit live experiments. It is deliberately separate
+from `gpujit` and is not enabled by default or in release packaging. Compiling
+it also enables `gputrace`, which supplies the existing REX3 record/replay
+harness, and `rex-dirty-upload`, whose damage snapshots publish completed GPU
+batches to the existing presentation path.
 
 The initial GPU subset is intentionally narrow: complete `DRAW` blocks and
 spans with positive integer coordinates, 24-bit RGB planes, RGB color mode,
@@ -855,19 +856,31 @@ Y-flip, skip flags, continuation state, or length-32 mode. RGB write masks and
 screen-edge clipping are supported. Unsupported draws first synchronize
 pending GPU work, then use the existing CPU path.
 
-Supported fills share a bounded command batch. The prototype uploads the full
-8 MiB RGB plane when a batch begins and reads the full plane back when it ends.
-Those transfers and every submission, fence, handled draw, fallback, and
-fallback reason are reported. This replay transfer remains full-plane and
-does not make the live presentation framebuffer GPU-resident.
+Supported fills share bounded command batches. Consecutive full batches remain
+GPU-resident; a CPU observation boundary, display fence, unsupported draw, or
+idle GFIFO synchronizes the full 8 MiB RGB plane back to the CPU. A CPU
+fallback invalidates the GPU copy so the next supported batch uploads the
+current CPU plane. Transfers, submissions, fences, handled draws, fallbacks,
+and fallback reasons are reported.
 
 `REX3_GPU_BACKEND=auto|vulkan|metal|dx12` selects the backend. `auto` tries
 Vulkan then D3D12 on Windows, Metal on macOS, and Vulkan elsewhere. The
 hardware probe checks adapter selection, two ordered overlapping fills,
 architectural context progression, batching, and readback:
 
+`REX3_GPU_BATCH_DRAWS` changes the bounded batch size for experiments from its
+default of 1,024 draws; accepted values are 1 through 65,536. It does not
+enable the GPU engine by itself.
+
 ```sh
 REX3_GPU_BACKEND=vulkan cargo run --release --example rex3-gpu-probe --features rex-gpu
+```
+
+The live experiment uses the same backend names through `IRIS_REX3_GPU`.
+Normal live rendering remains CPU-only when it is unset:
+
+```sh
+IRIS_REX3_GPU=vulkan cargo run --release --features rex-gpu
 ```
 
 Replay an existing recording with:

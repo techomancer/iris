@@ -8247,6 +8247,128 @@ fn gpu_replay_synchronizes_before_cpu_fallback() {
     assert_eq!(report.error, None);
 }
 
+#[cfg(feature = "rex-gpu")]
+#[test]
+#[ignore = "hardware performance gate: runs five samples per workload"]
+fn gpu_live_gfifo_performance_gate() {
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+    const SAMPLES: usize = 5;
+    const BATCH: u64 = 256;
+
+    fn configure(rex: &Rex3) {
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00ff_ffff);
+        reg(rex, REX3_CLIPMODE, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+    }
+
+    fn run(rex: &Rex3, len: i32) -> f64 {
+        configure(rex);
+        let start = std::time::Instant::now();
+        let mut draws = 0u64;
+        loop {
+            for _ in 0..BATCH {
+                let i = draws;
+                let y = (i % 1024) as i32;
+                let x = ((i / 1024) as i32 * len) % (1280 - len).max(1);
+                reg(rex, REX3_COLORRED, ((i * 7 % 256) as u32) << 11);
+                reg(rex, REX3_COLORGRN, ((i * 3 % 256) as u32) << 11);
+                reg(rex, REX3_COLORBLUE, ((i * 5 % 256) as u32) << 11);
+                reg(rex, REX3_XYENDI, xy(x + len - 1, y));
+                reg(rex, REX3_XYSTARTI, xy(x, y));
+                w32(rex, go_addr(REX3_DRAWMODE0), DM0_DRAW_BLOCK);
+                draws += 1;
+            }
+            if start.elapsed() >= BUDGET {
+                break;
+            }
+        }
+        rex.wait_idle();
+        draws as f64 * len as f64 / start.elapsed().as_secs_f64() / 1_000_000.0
+    }
+
+    fn paired_samples(cpu: &Rex3, gpu: &Rex3, len: i32) -> (Vec<f64>, Vec<f64>) {
+        let mut cpu_rates = Vec::with_capacity(SAMPLES);
+        let mut gpu_rates = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample % 2 == 0 {
+                cpu_rates.push(run(cpu, len));
+                gpu_rates.push(run(gpu, len));
+            } else {
+                gpu_rates.push(run(gpu, len));
+                cpu_rates.push(run(cpu, len));
+            }
+        }
+        (cpu_rates, gpu_rates)
+    }
+
+    fn median(rates: &[f64]) -> f64 {
+        let mut sorted = rates.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[SAMPLES / 2]
+    }
+
+    let cpu = make_rex3_reset();
+    {
+        let mut shaders = cpu.shaders.write();
+        for (key, shader) in crate::dev::ng1::rex3_shaders::SHADERS {
+            shaders.insert(*key, *shader);
+        }
+    }
+
+    let gpu = make_rex3_reset();
+    let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "vulkan".into());
+    let diagnostics = gpu
+        .enable_gpu_replay(&backend)
+        .expect("initialize the live REX3 GPU backend");
+    eprintln!("REX3 live GPU performance gate {diagnostics}");
+
+    let before = gpu.gpu_replay_report().expect("GPU report before benchmark");
+    let (cpu_raster_samples, gpu_raster_samples) = paired_samples(&cpu, &gpu, 1280);
+    let (cpu_command_samples, gpu_command_samples) = paired_samples(&cpu, &gpu, 8);
+    let after = gpu.gpu_replay_report().expect("GPU report after benchmark");
+
+    let cpu_raster = median(&cpu_raster_samples);
+    let gpu_raster = median(&gpu_raster_samples);
+    let cpu_command = median(&cpu_command_samples);
+    let gpu_command = median(&gpu_command_samples);
+    let raster_ratio = gpu_raster / cpu_raster;
+    let command_ratio = gpu_command / cpu_command;
+
+    eprintln!(
+        "raster-bound 1280px spans: CPU={cpu_raster:.1} GPU={gpu_raster:.1} Mpx/s \
+         ratio={raster_ratio:.3} CPU_samples={cpu_raster_samples:.1?} \
+         GPU_samples={gpu_raster_samples:.1?}"
+    );
+    eprintln!(
+        "command-bound 8px spans: CPU={cpu_command:.1} GPU={gpu_command:.1} Mpx/s \
+         ratio={command_ratio:.3} CPU_samples={cpu_command_samples:.1?} \
+         GPU_samples={gpu_command_samples:.1?}"
+    );
+    eprintln!(
+        "GPU deltas: handled={} fallback={} submissions={} fences={} upload_bytes={} \
+         readback_bytes={} fallback_reasons={:?}",
+        after.handled_draws - before.handled_draws,
+        after.fallback_draws - before.fallback_draws,
+        after.submissions - before.submissions,
+        after.fences - before.fences,
+        after.bytes_uploaded - before.bytes_uploaded,
+        after.bytes_read_back - before.bytes_read_back,
+        after.fallback_reasons,
+    );
+
+    assert!(after.handled_draws > before.handled_draws);
+    assert_eq!(after.fallback_draws, before.fallback_draws);
+    assert_eq!(after.error, None);
+    assert!(
+        raster_ratio >= 1.20,
+        "live GPU raster gate failed: {raster_ratio:.3}x, need at least 1.20x"
+    );
+    assert!(
+        command_ratio >= 0.95,
+        "live GPU command gate failed: {command_ratio:.3}x, need at least 0.95x"
+    );
+}
+
 /// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
 /// 32, and STATUS reports only the last 32 slots of it.
 ///

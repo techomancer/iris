@@ -1,4 +1,4 @@
-//! Opt-in, replay-only REX3 host-GPU prototype.
+//! Opt-in REX3 host-GPU prototype for replay and experimental live execution.
 
 use std::fmt;
 use std::sync::Arc;
@@ -21,8 +21,8 @@ use super::rex3_dirty::{DamagePlane, DamageRect, DamageSnapshot};
 const FB_STRIDE: u32 = 2048;
 const FB_PIXELS: usize = FB_STRIDE as usize * REX3_SCREEN_HEIGHT as usize;
 const FB_BYTES: u64 = (FB_PIXELS * std::mem::size_of::<u32>()) as u64;
-const WORKGROUP_SIZE: u32 = 256;
-const MAX_BATCH_DRAWS: usize = 1024;
+const DEFAULT_MAX_BATCH_DRAWS: usize = 1024;
+const MAX_CONFIGURED_BATCH_DRAWS: usize = 65536;
 const MAP_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_STACK_BYTES: usize = 8 * 1024 * 1024;
 
@@ -73,6 +73,7 @@ pub struct AdapterDiagnostics {
     pub driver_info: String,
     pub max_storage_buffer_binding_size: u64,
     pub max_compute_workgroups_per_dimension: u32,
+    pub max_batch_draws: usize,
 }
 
 impl fmt::Display for AdapterDiagnostics {
@@ -80,7 +81,7 @@ impl fmt::Display for AdapterDiagnostics {
         write!(
             f,
             "backend={:?} adapter={:?} type={:?} driver={:?} driver_info={:?} \
-             max_storage_buffer={} max_workgroups={}",
+             max_storage_buffer={} max_workgroups={} batch_draws={}",
             self.backend,
             self.name,
             self.device_type,
@@ -88,6 +89,7 @@ impl fmt::Display for AdapterDiagnostics {
             self.driver_info,
             self.max_storage_buffer_binding_size,
             self.max_compute_workgroups_per_dimension,
+            self.max_batch_draws,
         )
     }
 }
@@ -136,12 +138,6 @@ struct FlatFill {
     plane_len: u32,
 }
 
-impl FlatFill {
-    fn pixels(self) -> u32 {
-        self.width * self.height
-    }
-}
-
 pub struct Rex3Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -151,6 +147,10 @@ pub struct Rex3Gpu {
     readback: wgpu::Buffer,
     pending: Vec<FlatFill>,
     pending_damage: DamageSnapshot,
+    submitted_damage: DamageSnapshot,
+    gpu_current: bool,
+    submitted_work: bool,
+    max_batch_draws: usize,
     diagnostics: AdapterDiagnostics,
     report: ReplayReport,
     async_error: Arc<Mutex<Option<String>>>,
@@ -159,9 +159,24 @@ pub struct Rex3Gpu {
 impl Rex3Gpu {
     pub fn new(backend: &str) -> Result<Self, String> {
         let requested = RequestedBackend::parse(backend)?;
+        let max_batch_draws = match std::env::var("REX3_GPU_BATCH_DRAWS") {
+            Ok(value) => {
+                let parsed = value.parse::<usize>().map_err(|error| {
+                    format!("REX3_GPU_BATCH_DRAWS={value}: expected an integer: {error}")
+                })?;
+                if !(1..=MAX_CONFIGURED_BATCH_DRAWS).contains(&parsed) {
+                    return Err(format!(
+                        "REX3_GPU_BATCH_DRAWS={value}: want 1..={MAX_CONFIGURED_BATCH_DRAWS}"
+                    ));
+                }
+                parsed
+            }
+            Err(std::env::VarError::NotPresent) => DEFAULT_MAX_BATCH_DRAWS,
+            Err(error) => return Err(format!("read REX3_GPU_BATCH_DRAWS: {error}")),
+        };
         let mut failures = Vec::new();
         for (name, backends) in requested.candidates() {
-            match Self::new_for_backend(backends) {
+            match Self::new_for_backend(backends, max_batch_draws) {
                 Ok(gpu) => return Ok(gpu),
                 Err(error) => failures.push(format!("{name}: {error}")),
             }
@@ -172,7 +187,7 @@ impl Rex3Gpu {
         ))
     }
 
-    fn new_for_backend(backends: wgpu::Backends) -> Result<Self, String> {
+    fn new_for_backend(backends: wgpu::Backends, max_batch_draws: usize) -> Result<Self, String> {
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = backends;
         let instance = wgpu::Instance::new(instance_desc);
@@ -255,6 +270,10 @@ impl Rex3Gpu {
             readback,
             pending: Vec::new(),
             pending_damage: DamageSnapshot::default(),
+            submitted_damage: DamageSnapshot::default(),
+            gpu_current: false,
+            submitted_work: false,
+            max_batch_draws,
             diagnostics: AdapterDiagnostics {
                 backend: info.backend,
                 name: info.name,
@@ -263,6 +282,7 @@ impl Rex3Gpu {
                 driver_info: info.driver_info,
                 max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
                 max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
+                max_batch_draws,
             },
             report: ReplayReport::default(),
             async_error,
@@ -305,10 +325,10 @@ impl Rex3Gpu {
         };
 
         if let Some(fill) = fill {
-            if self.pending.len() == MAX_BATCH_DRAWS {
+            if self.pending.len() == self.max_batch_draws {
                 return Ok(EnqueueResult::FlushRequired);
             }
-            if self.pending.is_empty() {
+            if !self.gpu_current {
                 if rgb.len() != FB_PIXELS {
                     return self.fail(format!(
                         "REX3 RGB plane has {} pixels, expected {FB_PIXELS}",
@@ -318,6 +338,7 @@ impl Rex3Gpu {
                 self.queue
                     .write_buffer(&self.rgb, 0, bytemuck::cast_slice(rgb));
                 self.report.bytes_uploaded += FB_BYTES;
+                self.gpu_current = true;
             }
             if let Some(rect) = DamageRect::clipped(
                 fill.min_x as i64,
@@ -334,6 +355,14 @@ impl Rex3Gpu {
         Ok(EnqueueResult::Enqueued)
     }
 
+    pub(crate) fn submit(&mut self) -> Result<(), String> {
+        let result = self.submit_inner(false).map(|_| ());
+        if let Err(error) = &result {
+            self.report.error = Some(error.clone());
+        }
+        result
+    }
+
     pub(crate) fn flush(&mut self, rgb: &mut [u32]) -> Result<DamageSnapshot, String> {
         let result = self.flush_inner(rgb);
         if let Err(error) = &result {
@@ -344,7 +373,7 @@ impl Rex3Gpu {
 
     fn flush_inner(&mut self, rgb: &mut [u32]) -> Result<DamageSnapshot, String> {
         self.check_async_error()?;
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && !self.submitted_work {
             return Ok(DamageSnapshot::default());
         }
         if rgb.len() != FB_PIXELS {
@@ -354,53 +383,9 @@ impl Rex3Gpu {
             ));
         }
 
-        let mut uniform_buffers = Vec::with_capacity(self.pending.len());
-        let mut bind_groups = Vec::with_capacity(self.pending.len());
-        for fill in &self.pending {
-            let uniform = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("IRIS REX3 flat-fill parameters"),
-                    contents: bytemuck::bytes_of(fill),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("IRIS REX3 flat-fill bind group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.rgb.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: uniform.as_entire_binding(),
-                    },
-                ],
-            });
-            uniform_buffers.push(uniform);
-            bind_groups.push(bind_group);
-        }
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("IRIS REX3 replay batch"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("IRIS REX3 flat-fill batch"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            for (fill, bind_group) in self.pending.iter().zip(&bind_groups) {
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(fill.pixels().div_ceil(WORKGROUP_SIZE), 1, 1);
-            }
-        }
-        encoder.copy_buffer_to_buffer(&self.rgb, 0, &self.readback, 0, FB_BYTES);
-        let submission = self.queue.submit([encoder.finish()]);
-        self.report.submissions += 1;
+        let submission = self
+            .submit_inner(true)?
+            .ok_or_else(|| "REX3 GPU readback requested without submitted work".to_owned())?;
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         self.readback
@@ -431,11 +416,87 @@ impl Rex3Gpu {
             rgb.copy_from_slice(words);
         }
         self.readback.unmap();
-        self.pending.clear();
-        let damage = std::mem::take(&mut self.pending_damage);
+        self.submitted_work = false;
         self.report.bytes_read_back += FB_BYTES;
-        drop(uniform_buffers);
-        Ok(damage)
+        Ok(std::mem::take(&mut self.submitted_damage))
+    }
+
+    fn submit_inner(
+        &mut self,
+        copy_to_readback: bool,
+    ) -> Result<Option<wgpu::SubmissionIndex>, String> {
+        self.check_async_error()?;
+        if self.pending.is_empty() && (!copy_to_readback || !self.submitted_work) {
+            return Ok(None);
+        }
+
+        let fill_buffer = if self.pending.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("IRIS REX3 flat-fill batch parameters"),
+                        contents: bytemuck::cast_slice(&self.pending),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    }),
+            )
+        };
+        let bind_group = fill_buffer.as_ref().map(|fill_buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("IRIS REX3 flat-fill bind group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.rgb.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: fill_buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("IRIS REX3 GPU batch"),
+            });
+        if let Some(bind_group) = &bind_group {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("IRIS REX3 flat-fill batch"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        if copy_to_readback {
+            encoder.copy_buffer_to_buffer(&self.rgb, 0, &self.readback, 0, FB_BYTES);
+        }
+        let submission = self.queue.submit([encoder.finish()]);
+        self.report.submissions += 1;
+        self.submitted_work = true;
+        self.pending.clear();
+        self.submitted_damage.merge(&self.pending_damage);
+        self.pending_damage = DamageSnapshot::default();
+
+        if !copy_to_readback {
+            self.device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|error| format!("poll after REX3 GPU submission: {error}"))?;
+            self.check_async_error()?;
+        }
+
+        Ok(Some(submission))
+    }
+
+    pub(crate) fn cpu_framebuffer_changed(&mut self) {
+        debug_assert!(self.pending.is_empty());
+        debug_assert!(!self.submitted_work);
+        self.gpu_current = false;
     }
 
     fn check_async_error(&self) -> Result<(), String> {
