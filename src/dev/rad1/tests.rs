@@ -542,7 +542,7 @@ fn the_wav_capture_stays_at_44100_whatever_the_card_rate() {
     let dir = std::env::temp_dir().join(format!("rad1-wav-rate-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("o.wav");
-    let mut sink = Sink { host: None, host_failed_at: None, wav: Wav::create(path.as_os_str()), dump: None, tap: None };
+    let mut sink = Sink { host: None, host_failed_at: None, wav: Wav::create(path.as_os_str()), dump: None, lead: Lead::default(), tap: None };
     sink.play(&[0i16; 2 * 2205], 22050, false);
     sink.play(&[0i16; 2 * 4410], 44100, false);
     let b = std::fs::read(&path).unwrap();
@@ -875,7 +875,7 @@ fn host_frames_encode_into_ring_frames() {
 fn output_ring_reaches_the_sink() {
     let (r, ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, lead: Lead::default(), tap: Some(tap.clone()) });
     // A 512-frame ring (4 KiB), each frame left = n, right = -n.
     {
         let mut m = ram.0.lock().unwrap();
@@ -913,7 +913,7 @@ fn output_ring_reaches_the_sink() {
 fn input_ring_is_not_played() {
     let (r, _ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, lead: Lead::default(), tap: Some(tap.clone()) });
     program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
     wr(&r, 0x4c, 1);
     at(&r, 1_000_000);
@@ -1019,7 +1019,7 @@ fn a_recorded_adat_frame_plays_back_unchanged() {
 #[test]
 fn a_failed_host_open_is_retried_after_a_wait() {
     let now = Instant::now();
-    let mut sink = Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: None };
+    let mut sink = Sink { host: None, host_failed_at: None, wav: None, dump: None, lead: Lead::default(), tap: None };
     assert!(sink.host_retry_due(now), "never tried");
     sink.host_failed_at = Some(now);
     assert!(!sink.host_retry_due(now), "just failed");
@@ -1030,7 +1030,7 @@ const SEC: i64 = 1_000_000_000;
 
 fn tapped(r: &Rad1) -> Arc<parking_lot::Mutex<Vec<i16>>> {
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, lead: Lead::default(), tap: Some(tap.clone()) });
     tap
 }
 
@@ -1469,7 +1469,7 @@ fn the_dump_records_each_burst_at_the_card_rate() {
     let dir = std::env::temp_dir().join(format!("rad1-dump-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("o.dump");
-    let mut sink = Sink { host: None, host_failed_at: None, wav: None, dump: crate::dev::audio_dump::AudioDump::create(path.as_os_str()), tap: None };
+    let mut sink = Sink { host: None, host_failed_at: None, wav: None, dump: crate::dev::audio_dump::AudioDump::create(path.as_os_str()), lead: Lead::default(), tap: None };
     sink.play(&[1, -2, 300, -400], 44100, false);
     sink.play(&[i16::MIN, i16::MAX], 32000, false);
     // A muted card plays silence, and the dump records what is played.
@@ -1485,4 +1485,124 @@ fn the_dump_records_each_burst_at_the_card_rate() {
         }
     }
     assert_eq!(b, want);
+}
+
+/// A 48 kHz host stream with the card's 200 ms ring.
+fn host_48k(_: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
+    let (p, c) = rtrb::RingBuffer::new(48_000 * 2 / 5);
+    HOST_RING.with(|h| *h.borrow_mut() = Some(c));
+    Some(HostOut::detached(48_000, p))
+}
+
+/// The host pulls a whole period each time it calls back and plays silence
+/// for what the ring lacks. The card makes each frame only when its clock
+/// says it is due, so without a lead every callback finds the ring a pump
+/// interval short of the period and the tune breaks up the whole way
+/// through, worst in its first 100 ms. A 512-frame period at 48 kHz, 10.7 ms, against the 10 ms pump.
+#[test]
+fn a_host_callback_a_period_long_never_finds_the_ring_short_while_the_tune_plays() {
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: host_48k, ..Inner::new(me.clone()) }) };
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns.store(0, Ordering::Relaxed);
+    let ram = Arc::new(Ram(Mutex::new(vec![0; 0x40_0000])));
+    for (f, w) in ram.0.lock().unwrap()[TUNE_BUF as usize..][..TUNE_FRAMES * 8].chunks_exact_mut(4).enumerate() {
+        w.copy_from_slice(&sample_to_word((f / 2 % 30_000 + 1) as i16).to_le_bytes());
+    }
+    r.state().connect_dma(ram);
+    r.enable_output(crate::config::AudioConfig::default());
+    Device::start(&r);
+    prom_tune(&r, TUNE_CTRL);
+    const PERIOD: i64 = 512;
+    let callback_ns = |k: i64| 3_000_000 + k * PERIOD * SEC / 48_000;
+    let (mut pump, mut call) = (1i64, 0i64);
+    let (mut dry, mut calls, mut played) = (0, 0, 0usize);
+    while callback_ns(call) < 2 * SEC {
+        let t = (pump * 10_000_000).min(callback_ns(call));
+        at(&r, t);
+        if t == pump * 10_000_000 {
+            rd(&r, 0x58);
+            pump += 1;
+        }
+        if t == callback_ns(call) {
+            let got = HOST_RING.with(|h| {
+                let mut h = h.borrow_mut();
+                let c = h.as_mut().unwrap();
+                (0..PERIOD * 2).take_while(|_| c.pop().is_ok()).count()
+            });
+            played += got;
+            // Silence before the tune is not a glitch; a partly filled
+            // period is, until the tune's last frames have been made.
+            if got != 0 || played > 0 {
+                calls += 1;
+                dry += usize::from(got < PERIOD as usize * 2 && t < 2_200_000_000);
+            }
+            call += 1;
+        }
+    }
+    assert!(calls > 100, "the tune reached the host");
+    assert_eq!(dry, 0, "{dry} of {calls} callbacks found the ring short");
+}
+
+/// A card whose host stream is `slow_host`'s 32 kHz ring, its RAM counting
+/// up from 1 at the tune buffer, with the machine started.
+fn host_tune_card() -> Rad1 {
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone()) }) };
+    r.state().config().write(4, BAR as u32);
+    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns.store(0, Ordering::Relaxed);
+    let ram = Arc::new(Ram(Mutex::new(vec![0; 0x40_0000])));
+    for (f, w) in ram.0.lock().unwrap()[TUNE_BUF as usize..][..0x1_0000].chunks_exact_mut(4).enumerate() {
+        w.copy_from_slice(&sample_to_word((f / 2 % 30_000 + 1) as i16).to_le_bytes());
+    }
+    r.state().connect_dma(ram);
+    r.enable_output(crate::config::AudioConfig::default());
+    Device::start(&r);
+    r
+}
+
+fn host_taken() -> Vec<i16> {
+    HOST_RING.with(|h| std::iter::from_fn(|| h.borrow_mut().as_mut().unwrap().pop().ok()).collect())
+}
+
+#[test]
+fn a_sound_shorter_than_the_lead_still_reaches_the_host() {
+    let r = host_tune_card();
+    // 256 frames, 8 ms, with end of descriptor.
+    prom_tune(&r, 0xffff_f804);
+    let start = r.fake_ns.load(Ordering::Relaxed);
+    at(&r, start + 100 * SEC / 1000);
+    rd(&r, 0x58);
+    let played = host_taken();
+    let want: Vec<i16> = (0..256 * 2).map(|i| (i / 2 + 1) as i16).collect();
+    assert!(played == want, "all {} samples, in order, got {}", want.len(), played.len());
+}
+
+#[test]
+fn stopping_the_output_releases_what_is_held_and_the_next_run_builds_its_own_lead() {
+    let r = host_tune_card();
+    let start = r.fake_ns.load(Ordering::Relaxed);
+    program(&r, &RING_OUTPUT, TUNE_BUF as u32, 0xffff_f008);
+    wr(&r, 0x58, 0x2000_0001);
+    // 44.1 kHz into the 32 kHz host: 30 ms is under the lead.
+    for ms in (5..=30).step_by(5) {
+        at(&r, start + ms * SEC / 1000);
+        rd(&r, 0x58);
+    }
+    assert!(host_taken().is_empty(), "held back while the lead builds");
+    wr(&r, 0x58, 0x2000_0000);
+    let released = host_taken().len();
+    assert!(released >= 2 * 28 * 32, "the held frames play when the output stops, got {released}");
+    // The next run holds back again.
+    wr(&r, 0x58, 0x2000_0001);
+    for ms in (35..=60).step_by(5) {
+        at(&r, start + ms * SEC / 1000);
+        rd(&r, 0x58);
+    }
+    assert!(host_taken().is_empty(), "a new run builds a new lead");
+    for ms in (65..=120).step_by(5) {
+        at(&r, start + ms * SEC / 1000);
+        rd(&r, 0x58);
+    }
+    assert!(!host_taken().is_empty());
 }

@@ -304,7 +304,46 @@ struct Sink {
     /// before resampling, with or without a host sound device. A muted card
     /// records the silence it plays.
     dump: Option<crate::dev::audio_dump::AudioDump>,
+    lead: Lead,
     tap: Option<Arc<Mutex<Vec<i16>>>>,
+}
+
+/// How much of a run of output is held back before the host hears any of
+/// it. The card makes each frame only when its clock says it is due, so the
+/// host's ring never holds more than the pump's last interval, while the
+/// host asks for a whole period at a time and plays silence for what is
+/// missing: with no lead the start of every sound is broken up, and any
+/// late pump after it breaks it again. 50 ms covers the pump interval, a
+/// 1024-frame host period and some scheduling jitter.
+const HOST_LEAD_MS: u64 = 50;
+
+/// Interleaved samples of lead at `rate`.
+fn lead_samples(rate: u32) -> usize {
+    rate as usize * PCM_CHANNELS * HOST_LEAD_MS as usize / 1000
+}
+
+/// The start of a run of output, held until the lead is built.
+#[derive(Default)]
+struct Lead {
+    held: Vec<i16>,
+    /// The rate of `held`.
+    rate: u32,
+    /// The lead is built and frames go straight to the host.
+    primed: bool,
+}
+
+/// Send frames the card produced at `rate` Hz to the host stream.
+fn host_push(host: &mut (HostOut, Resampler), pcm: &[i16], rate: u32) {
+    if pcm.is_empty() {
+        return;
+    }
+    let (out, rs) = host;
+    if rs.in_rate != rate {
+        *rs = Resampler::new(rate, out.stream_rate);
+    }
+    for p in pcm.chunks_exact(PCM_CHANNELS) {
+        rs.push(p[0], p[1], &mut out.producer);
+    }
 }
 
 /// How long to wait before trying to open the host stream again.
@@ -314,6 +353,16 @@ impl Sink {
     /// Whether the host stream, wanted but not open, is due another try.
     fn host_retry_due(&self, now: Instant) -> bool {
         self.host.is_none() && self.host_failed_at.is_none_or(|t| now.duration_since(t) >= HOST_RETRY)
+    }
+
+    /// The output run is over: a run shorter than the lead, or its tail,
+    /// plays now, and the next run builds its own lead.
+    fn end_run(&mut self) {
+        if let Some(host) = self.host.as_mut() {
+            let held = std::mem::take(&mut self.lead.held);
+            host_push(host, &held, self.lead.rate);
+        }
+        self.lead = Lead::default();
     }
 
     /// Play stereo frames the card produced at `rate` Hz. A muted output
@@ -327,12 +376,22 @@ impl Sink {
         } else {
             pcm
         };
-        if let Some((out, rs)) = self.host.as_mut() {
-            if rs.in_rate != rate {
-                *rs = Resampler::new(rate, out.stream_rate);
-            }
-            for p in host_pcm.chunks_exact(PCM_CHANNELS) {
-                rs.push(p[0], p[1], &mut out.producer);
+        if let Some(host) = self.host.as_mut() {
+            if self.lead.primed {
+                host_push(host, host_pcm, rate);
+            } else {
+                // Frames held at another rate go out first, at their own.
+                if self.lead.rate != rate {
+                    let held = std::mem::take(&mut self.lead.held);
+                    host_push(host, &held, self.lead.rate);
+                    self.lead.rate = rate;
+                }
+                self.lead.held.extend_from_slice(host_pcm);
+                if self.lead.held.len() >= lead_samples(rate) {
+                    let held = std::mem::take(&mut self.lead.held);
+                    host_push(host, &held, rate);
+                    self.lead.primed = true;
+                }
             }
         }
         if let Some(w) = self.wav.as_mut() {
@@ -1002,7 +1061,7 @@ impl Inner {
             None => {
                 let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
                 let dump = crate::dev::audio_dump::AudioDump::from_env();
-                *sink = Some(Sink { host, host_failed_at: failed_at, wav, dump, tap: None });
+                *sink = Some(Sink { host, host_failed_at: failed_at, wav, dump, lead: Lead::default(), tap: None });
             }
         }
     }
@@ -1113,6 +1172,7 @@ impl Inner {
         }
         *s = State::new(now);
         s.status_gen = gen;
+        self.end_output_run();
     }
 
     fn startup_index(off: u32) -> Option<usize> {
@@ -1576,13 +1636,31 @@ impl Inner {
             // Stop where the sample clock has got to.
             self.sync_chan(s, idx, now);
             s.chan[idx].running = false;
+            if idx == CH_OUT {
+                self.end_output_run();
+            }
         }
     }
 
     /// Move frames between the ring and the host, wrapping at the ring's end.
     /// Output frames are decoded and played (or dropped with no sink); input
     /// frames are silence.
-    fn chan_move(&self, s: &mut State, idx: usize, mut frames: u64) -> bool {
+    fn chan_move(&self, s: &mut State, idx: usize, frames: u64) -> bool {
+        let ok = self.chan_move_frames(s, idx, frames);
+        if idx == CH_OUT && !(ok && s.chan[idx].running && !s.chan[idx].stalled) {
+            self.end_output_run();
+        }
+        ok
+    }
+
+    /// The output has stopped: let the host have what it was holding back.
+    fn end_output_run(&self) {
+        if let Some(sink) = self.sink.lock().as_mut() {
+            sink.end_run();
+        }
+    }
+
+    fn chan_move_frames(&self, s: &mut State, idx: usize, mut frames: u64) -> bool {
         let info = &CHAN_INFO[idx];
         let Some(dma) = self.pci.dma() else { return false };
         // A position read after a long look-away would replay every
