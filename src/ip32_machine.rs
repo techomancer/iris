@@ -82,12 +82,16 @@ impl BootState {
     }
 }
 
-/// The CPU's interrupt pins as a controller: line n is IPn.
-struct CpuIrq(Arc<dyn crate::traits::Device>);
+/// The CPU's interrupt pins as a controller: line n is IPn. It holds the CPU
+/// weakly: the CPU holds the bus, and the bus holds this through CRIME, so a
+/// strong reference would keep both alive after the machine is dropped.
+struct CpuIrq(std::sync::Weak<dyn CpuDevice>);
 
 impl crate::irq::InterruptController for CpuIrq {
     fn set_line(&self, line: u32, level: bool) {
-        self.0.signal(Signal::Interrupt(line, level));
+        if let Some(cpu) = self.0.upgrade() {
+            cpu.as_device().signal(Signal::Interrupt(line, level));
+        }
     }
 }
 
@@ -180,15 +184,26 @@ impl O2Machine {
         // machines; `controller` is the bus (0 internal, 1 external). The
         // buses are filled before the controllers exist.
         let scsi = [crate::dev::aic7880::Aic7880::new_bus(), crate::dev::aic7880::Aic7880::new_bus()];
+        // Cards from `[[pci]]`, built first: their buses take the controller
+        // numbers after the board's, and `[scsi.N]` can name them.
+        let profile = MachineProfile::O2Ip32;
+        let cards = crate::pci::place::build(crate::pci::place::resolve(profile.pci_buses(), &cfg.pci, profile.scsi_controllers())?)?;
         let attached = crate::scsi::attach_from_config(cfg, Some("ip32"), &|c| {
             scsi.get(c as usize)
-                .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1)"))
+                .or_else(|| {
+                    cards.iter().find_map(|f| {
+                        let k = (c as usize).checked_sub(f.placement.first_controller as usize)?;
+                        f.function.scsi_buses().get(k).copied()
+                    })
+                })
+                .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1, and each add-in card its own)"))
         })?;
         let opts = Ip32Options {
             scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
             mac,
+            cards,
         };
         let bus = Ip32Bus::with_options(mem, prom, opts);
         // MACE audio plays through the host unless audio is off.
@@ -286,13 +301,11 @@ impl O2Machine {
                 let stats = g.stats.clone();
                 g.compile_queue.start(bus.phys.clone() as Arc<dyn BusDevice>, stats);
             }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
         }
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();
-        bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
+        bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(Arc::downgrade(&cpu))), 2));
 
         bus.gbe.use_cpu_clock(cpu.cycles_ptr(), cpu_mhz);
         // CRIME's rendering engine draws on its own thread, fed through
@@ -324,6 +337,9 @@ impl O2Machine {
         // The SCSI controllers' `scsi`/`scsi1` and `cow`/`cow1`.
         for ctl in bus.scsi.lock().unwrap().iter() {
             monitor.register_device(ctl.clone());
+        }
+        for card in bus.card_devices() {
+            monitor.register_device(card);
         }
         monitor.register_device(Arc::new(O2Control::new(bus.clone())));
         #[cfg(feature = "perfetto")]
@@ -542,6 +558,9 @@ impl O2Machine {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.stop();
         }
+        for card in self.bus.card_devices() {
+            card.stop();
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
@@ -568,6 +587,9 @@ impl O2Machine {
     fn start_scsi(&self) {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.start();
+        }
+        for card in self.bus.card_devices() {
+            card.start();
         }
     }
 
@@ -608,6 +630,7 @@ impl O2Machine {
         manifest.nvram = self.flash_path.clone();
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
         manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
+        manifest.pci = crate::pci::place::card_refs(self.bus.mace.pci.bus());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
         snap.write_state("cpu", &self.cpu.save_state(), sv).map_err(|e| e.to_string())?;
@@ -619,10 +642,11 @@ impl O2Machine {
         chunks.bank_chunks[0] = put_bank_words(&store, &self.bus.ram)
             .map_err(|e| format!("CAS memory put: {e}"))?;
         snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
-        for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
+        for ctl in self.bus.scsi_buses() {
+            let i = ctl.number();
             let dir = snap.dir.join(format!("ctrl{i}"));
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let overlays = ctl.export_overlays(&dir).map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
+            let overlays = ctl.bus().export_overlays(&dir).map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
             snap.write_toml(&format!("cow{i}.toml"), &crate::machine::build_cow_table(overlays))
                 .map_err(|e| e.to_string())?;
         }
@@ -646,7 +670,7 @@ impl O2Machine {
 
     fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
         use crate::chunk_store::{get_chunks_as_words, ChunkStore};
-        use crate::snapshot::{Snapshot, SCHEMA_VERSION};
+        use crate::snapshot::Snapshot;
         let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
         let m = snap.read_manifest()?.ok_or_else(|| format!("saves/{name}: no snapshot.toml"))?;
         if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
@@ -655,15 +679,8 @@ impl O2Machine {
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version > SCHEMA_VERSION {
-            return Err(format!("snapshot schema_version {} is newer than this iris build supports ({SCHEMA_VERSION})", m.schema_version));
-        }
-        if m.schema_version < SCHEMA_VERSION {
-            return Err(format!(
-                "snapshot {name} is schema {}; the O2's UART state changed shape in schema 5, so it cannot be restored",
-                m.schema_version
-            ));
-        }
+        crate::snapshot::require_schema(&m, name, "O2")?;
+        crate::snapshot::check_pci(&m.pci, &crate::pci::place::card_refs(self.bus.mace.pci.bus()))?;
         // As the Indy: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
@@ -675,7 +692,7 @@ impl O2Machine {
             return Err(format!("snapshot memory is {} MB, this O2 has {} MB",
                 memory.len() >> 18, self.bus.ram.len() >> 20));
         }
-        let ctrls = self.bus.scsi.lock().unwrap().len();
+        let ctrls = self.bus.scsi_buses().len();
         let overlays = (0..ctrls)
             .map(|i| snap.read_toml(&format!("cow{i}.toml")).ok().map(|t| crate::machine::parse_cow_table(&t)))
             .collect();
@@ -701,9 +718,10 @@ impl O2Machine {
         self.boot.load(&s.boot);
         self.bus.set_flash(&s.flash)?;
         self.bus.ram.restore_words(&s.memory)?;
-        for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
+        for ctl in self.bus.scsi_buses() {
+            let i = ctl.number();
             if let Some(Some(sets)) = s.overlays.get(i) {
-                ctl.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
+                ctl.bus().import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
                     .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
             }
         }
@@ -763,6 +781,8 @@ impl Drop for O2Machine {
         }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
+        // Its thread holds the bus.
+        self.bus.crime.re.shutdown();
     }
 }
 
@@ -814,7 +834,7 @@ impl Workstation for O2Machine {
     }
 
     fn pending_chd_sync_count(&self) -> usize {
-        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+        self.bus.scsi_buses().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
     }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.bus.flush_disks()
@@ -825,7 +845,7 @@ impl Workstation for O2Machine {
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
-        let controllers = self.bus.scsi.lock().unwrap().clone();
+        let controllers = self.bus.scsi_buses();
         let buses: Vec<_> = controllers.iter().map(|c| c.bus()).collect();
         crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
     }
@@ -1189,6 +1209,75 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
             "ok".into()
         }
         _ => format!("err unknown command {cmd:?}"),
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use crate::config::GraphicsBoard;
+    use crate::display_stop_tests::{big_stack, config, scratch};
+
+    /// A process may have only 64 decode tables, so a dropped O2 must let go
+    /// of its bus and every thing that holds it: the CPU (through its
+    /// interrupt line from CRIME and a handle the JIT's compile pool does not
+    /// need), and the rendering engine's thread.
+    #[test]
+    fn a_dropped_o2_releases_its_bus() {
+        let dir = scratch("o2-drop");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let (bus, phys, cpu) = big_stack(move || {
+            let mut m = O2Machine::new(&cfg).expect("an O2");
+            let held = (Arc::downgrade(&m.bus), Arc::downgrade(&m.bus.phys), Arc::downgrade(&m.cpu));
+            Workstation::stop(&mut m);
+            drop(m);
+            held
+        });
+        assert_eq!(cpu.strong_count(), 0, "the CPU outlives its machine");
+        assert_eq!(bus.strong_count(), 0, "the bus outlives its machine");
+        assert_eq!(phys.strong_count(), 0, "the decode table outlives its machine");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GraphicsBoard;
+    use crate::display_stop_tests::{big_stack, config, scratch};
+    use crate::snapshot::{Manifest, PciRef, Snapshot, SCHEMA_VERSION};
+
+    /// A snapshot from before the PCI bus saved its own table, and one taken
+    /// with a card this O2 does not have, are both refused by the machine,
+    /// before anything of the snapshot is read.
+    #[test]
+    fn a_snapshot_of_another_schema_or_with_cards_is_refused_by_the_machine() {
+        let dir = scratch("o2-pci-refuse");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        // Snapshots are read from `saves` under the current directory.
+        let name = format!("pci-refusal-{}", std::process::id());
+        let (old, card) = big_stack({
+            let name = name.clone();
+            move || {
+                let mut m = O2Machine::new(&cfg).expect("an O2");
+                let snap = Snapshot::new(std::path::PathBuf::from("saves").join(&name));
+                snap.ensure_dir().unwrap();
+                let mut manifest = Manifest::for_current_save();
+                manifest.machine = Some(SNAPSHOT_MACHINE.into());
+                manifest.schema_version = 5;
+                snap.write_manifest(&manifest).unwrap();
+                let old = m.read_snapshot(&name).err().expect("refused");
+                manifest.schema_version = SCHEMA_VERSION;
+                manifest.pci = vec![PciRef { bus: "pci".into(), device: 3, card: "aic7880".into(), options: String::new() }];
+                snap.write_manifest(&manifest).unwrap();
+                let card = m.read_snapshot(&name).err().expect("refused");
+                let _ = std::fs::remove_dir_all(&snap.dir);
+                let _ = std::fs::remove_dir("saves");
+                Workstation::stop(&mut m);
+                (old, card)
+            }
+        });
+        assert_eq!(old, format!("snapshot {name} is schema 5; this build reads O2 snapshots of schema 6"));
+        assert!(card.starts_with("snapshot PCI cards differ:") && card.contains("device 3 = aic7880"), "{card}");
     }
 }
 

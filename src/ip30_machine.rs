@@ -35,9 +35,10 @@ use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::Xbow;
 use crate::hptimer::TimerManager;
 use crate::ip30::{
-    widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
-    WIDGET_XBOW,
+    widget_small_base, CachedFlashLines, Ip30Bus, IP30_PCI_IOC3, IP30_PCI_RAD1, IP30_PCI_SCSI0, IP30_PCI_SCSI1,
+    IP30_PCI_VIRTIO, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE, WIDGET_XBOW,
 };
+use crate::pci::slots::PciAddr;
 use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
 use crate::snapshot::{field, ChunksManifest, Manifest, Snapshot, StateTable, SCHEMA_VERSION};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
@@ -88,11 +89,6 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
-/// The Bridge input IOC3's SuperIO block (serial, keyboard, clock) is
-/// wired to; the Ethernet uses IOC3's PCI pin.
-const SUPERIO_PIN: u8 = 4;
-/// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
-const VIRTIO_SLOT: u8 = 4;
 /// The blank part on the Bridge's second flash select: reads all ones and
 /// keeps no writes, an approximation from one word read on a real Octane2.
 /// The PROM looks for a part there too.
@@ -221,7 +217,7 @@ impl OctaneMachine {
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
-        let bridge = Bridge::new(mem.clone(), heart.clone());
+        let bridge = Bridge::new(&crate::ip30::PCI_BUS, mem.clone(), heart.clone());
         bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
@@ -248,15 +244,15 @@ impl OctaneMachine {
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
         }
-        bridge.attach(0, scsi[0].clone());
-        bridge.attach(1, scsi[1].clone());
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_SCSI0), scsi[0].clone());
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_SCSI1), scsi[1].clone());
         let ioc3 = Arc::new(Ioc3::octane(mac, false));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = Ioc3Eth::new(mac);
         eth.set_heartbeat(heartbeat.clone());
         ioc3.attach_eth(eth.clone());
-        bridge.attach(2, ioc3.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN));
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_IOC3), ioc3.clone());
+        ioc3.connect_superio_interrupt(bridge.bus().wire("super I/O"));
         ioc3.set_timer_manager(timer_manager.clone());
         // The guest switching the machine off through the clock.
         ioc3.set_event_sender(event_tx.clone());
@@ -272,13 +268,13 @@ impl OctaneMachine {
         if !cfg.no_audio {
             rad.enable_output(cfg.audio.clone());
         }
-        bridge.attach(3, rad.clone());
+        bridge.bus().attach(PciAddr::dev(IP30_PCI_RAD1), rad.clone());
         let virtio = cfg.virtio_serial.enabled.then(|| {
             let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
                 crate::dev::virtio::console::from_config(&cfg.virtio_serial),
             ));
-            bridge.attach(VIRTIO_SLOT, dev.clone());
-            eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
+            bridge.bus().attach(PciAddr::dev(IP30_PCI_VIRTIO), dev.clone());
+            eprintln!("iris: virtio-serial on Bridge slot {IP30_PCI_VIRTIO}");
             dev
         });
 
@@ -332,7 +328,7 @@ impl OctaneMachine {
         // Device-window pages a PCI BAR decodes whole go straight to the
         // function.
         let weak = Arc::downgrade(&phys);
-        bridge.on_bar_runs(Box::new(move |runs| {
+        bridge.bus().on_bar_runs(Box::new(move |runs| {
             if let Some(p) = weak.upgrade() {
                 p.set_widget_runs(WIDGET_BRIDGE, runs);
             }
@@ -701,6 +697,8 @@ impl OctaneMachine {
         self.rad.reset();
         if let Some(v) = &self.virtio {
             Resettable::power_on(&**v);
+            // It reset its own header; the bus's decode table follows.
+            self.bridge.bus().refresh();
         }
         self.flash.reset();
         if let Some(g) = &self.gfx {
@@ -871,6 +869,7 @@ impl OctaneMachine {
         manifest.nvram = Some(self.nvram_path.clone());
         manifest.cpu_model = Some(cpu.model_name().to_string());
         manifest.cpu_cache = Some(cpu.cache_kind().to_string());
+        manifest.pci = crate::pci::place::card_refs(self.bridge.bus());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
         let io = |e: std::io::Error| e.to_string();
@@ -923,9 +922,8 @@ impl OctaneMachine {
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version != SCHEMA_VERSION {
-            return Err(format!("snapshot {name} is schema {}; this build reads Octane snapshots of schema {SCHEMA_VERSION}", m.schema_version));
-        }
+        crate::snapshot::require_schema(&m, name, "Octane")?;
+        crate::snapshot::check_pci(&m.pci, &crate::pci::place::card_refs(self.bridge.bus()))?;
         // As the Indy and the O2: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, cpu.model_name(), cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
@@ -1136,7 +1134,7 @@ struct Ip30Monitor {
     gfx: Option<Arc<ImpactXio>>,
 }
 
-const IP30_SUBCOMMANDS: &str = "ip30 unmapped | memcfg | bridge | gfx | xbow";
+const IP30_SUBCOMMANDS: &str = "ip30 unmapped | memcfg | bridge | pci [config <device>] | gfx | xbow";
 
 impl Ip30Monitor {
     fn text(&self, sub: &str) -> Result<String, String> {
@@ -1179,6 +1177,7 @@ impl Ip30Monitor {
                 }
                 s
             }
+            "pci" => crate::pci::monitor::report(self.bridge.bus()).iter().map(|l| format!("  {l}\n")).collect(),
             "gfx" => match &self.gfx {
                 Some(g) => format!(
                     "IMPACT on widget {WIDGET_GFX}: link {}, identification {:#010x}\n",
@@ -1216,6 +1215,11 @@ impl Device for Ip30Monitor {
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         if cmd != "ip30" {
             return Err("Command not found".into());
+        }
+        if let ["pci", "config", dev] = args {
+            let at = crate::pci::slots::PciAddr::dev(dev.parse().map_err(|_| format!("Usage: {IP30_SUBCOMMANDS}"))?);
+            let rows = crate::pci::monitor::config_dump(self.bridge.bus(), at).ok_or(format!("pci: nothing at {at}"))?;
+            return w.write_all(rows.join("\n").as_bytes()).and_then(|_| w.write_all(b"\n")).map_err(|e| e.to_string());
         }
         let text = self.text(args.first().copied().unwrap_or("unmapped"))?;
         w.write_all(text.as_bytes()).map_err(|e| e.to_string())
@@ -1465,6 +1469,34 @@ mod snapshot_tests {
             let e = a.load_snapshot("flash").unwrap_err();
             assert!(e.contains("flash"), "{e}");
             assert_eq!(digest(&a), before, "the machine is as it was");
+        }).unwrap().join().unwrap();
+    }
+
+    /// A snapshot from before the PCI bus saved its own table, and one taken
+    /// with a card this Octane does not have, are both refused by the
+    /// machine, before anything is read or touched.
+    #[test]
+    fn a_snapshot_of_another_schema_or_with_cards_is_refused_by_the_machine() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("pci-refuse");
+            let prom = empty_prom(&dir);
+            let mut a = machine(&prom, &dir);
+            a.save_snapshot("old").unwrap();
+            a.save_snapshot("card").unwrap();
+            let edit = |name: &str, f: &dyn Fn(String) -> String| {
+                let path = dir.join(format!("saves/{name}/snapshot.toml"));
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(&path, f(text)).unwrap();
+            };
+            edit("old", &|t| {
+                assert!(t.contains("schema_version = 6"), "{t}");
+                t.replace("schema_version = 6", "schema_version = 5")
+            });
+            edit("card", &|t| t + "\n[[pci]]\nbus = \"pci\"\ndevice = 3\ncard = \"aic7880\"\noptions = \"\"\n");
+            let e = a.read_snapshot("old").err().expect("refused");
+            assert_eq!(e, "snapshot old is schema 5; this build reads Octane snapshots of schema 6");
+            let e = a.read_snapshot("card").err().expect("refused");
+            assert!(e.starts_with("snapshot PCI cards differ:") && e.contains("device 3 = aic7880"), "{e}");
         }).unwrap().join().unwrap();
     }
 }

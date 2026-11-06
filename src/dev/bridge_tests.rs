@@ -8,7 +8,32 @@
 
 use super::*;
 use crate::irq::IrqLine;
+use crate::pci::slots::{Evidence, SlotDesc, SlotKind, WireDesc};
 use crate::pci::{Bar, PciConfig, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
+
+/// The Bridge's interrupt map as the tests state it: A and C reach the input
+/// numbered as the device, B and D that number with bit two flipped.
+const fn slot(device: u8) -> SlotDesc {
+    SlotDesc {
+        device,
+        label: "test slot",
+        kind: SlotKind::Onboard,
+        evidence: Evidence::Established,
+        source: "test",
+        routes: [Some(device), Some(device ^ 4), Some(device), Some(device ^ 4)],
+    }
+}
+
+/// A bus of eight devices, so a test can put a function in any slot, and
+/// the SuperIO wire on input 4.
+static TEST_BUS: crate::pci::slots::BusDesc = crate::pci::slots::BusDesc {
+    id: "pci",
+    name: "test Bridge bus",
+    devices: 8,
+    outputs: 8,
+    slots: &[slot(0), slot(1), slot(2), slot(3), slot(4), slot(5), slot(6), slot(7)],
+    wires: &[WireDesc { name: "super I/O", output: 4, source: "test" }],
+};
 
 /// HEART stand-in: the interrupt packets it received, in order. A line is
 /// the ISR bit, so `set_line(vector, set)` is a packet.
@@ -170,7 +195,7 @@ impl Rig {
     fn new() -> Self {
         let sink = Arc::new(Sink::default());
         let mem = Arc::new(Mem::new());
-        Rig { bridge: Bridge::new(mem.clone(), sink.clone()), sink, mem }
+        Rig { bridge: Bridge::new(&TEST_BUS, mem.clone(), sink.clone()), sink, mem }
     }
 
     /// Write register `off` (a slot base such as `reg::CONTROL`).
@@ -221,7 +246,7 @@ impl Rig {
     /// at 0x2000 and both enabled, and the slot's window aimed at memory.
     fn card(&self, slot: u8, pin: u8) -> Arc<Card> {
         let c = Card::new(pin);
-        self.bridge.attach(slot, c.clone());
+        self.bridge.bus().attach(PciAddr::dev(slot), c.clone());
         self.cfg_write(slot as u32, 0x10, 4, 0x2000);
         self.cfg_write(slot as u32, 0x14, 4, 0x1300_0000);
         self.cfg_write(slot as u32, 0x04, 2, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
@@ -404,7 +429,7 @@ fn the_one_wire_master_runs_a_bit_slot_per_write() {
 #[test]
 fn configuration_space() {
     let r = Rig::new();
-    r.bridge.attach(1, Card::new(PCI_INTA));
+    r.bridge.bus().attach(PciAddr::dev(1), Card::new(PCI_INTA));
     assert_eq!(r.cfg_read(1, 0, 2), CARD_VENDOR);
     assert_eq!(r.cfg_read(1, 2, 2), CARD_DEVICE);
     assert_eq!(r.cfg_read(1, 0, 4), CARD_VENDOR | (CARD_DEVICE << 16));
@@ -417,7 +442,7 @@ fn configuration_space() {
 fn narrow_configuration_writes_merge_into_the_word() {
     let r = Rig::new();
     let c = Card::new(PCI_INTA);
-    r.bridge.attach(1, c.clone());
+    r.bridge.bus().attach(PciAddr::dev(1), c.clone());
     r.cfg_write(1, 0x3c, 4, 0x0000_0100);
     r.cfg_write(1, 0x3c, 1, 0x0b);
     assert_eq!(r.cfg_read(1, 0x3c, 4), 0x0000_010b, "pin kept, line written");
@@ -447,7 +472,7 @@ fn an_empty_slot_fails_the_read_and_posts_the_write() {
     r.set(reg::INT_RESET, INT_RESET_PCI_GRP | INT_RESET_MULTI_ERR);
     assert_eq!(r.get(reg::INT_STATUS), 0);
     // A function other than 0 is not there either.
-    r.bridge.attach(2, Card::new(PCI_INTA));
+    r.bridge.bus().attach(PciAddr::dev(2), Card::new(PCI_INTA));
     assert!(!r.bridge.read32(u64::from(Rig::cfg(2, 0x100))).is_ok());
 }
 
@@ -815,11 +840,51 @@ fn pins_follow_the_slot_wiring_and_share_by_or() {
 fn a_directly_wired_input_shares_the_pins() {
     let r = Rig::new();
     r.route(4, 33);
-    r.bridge.set_wire_irq(4, true);
+    let wire = r.bridge.bus().wire("super I/O");
+    wire.set(true);
     assert_eq!(r.sink.take(), [(33, true)]);
     assert_eq!(r.get(reg::INT_STATUS) & 0xff, 1 << 4);
-    r.bridge.set_wire_irq(4, false);
+    wire.set(false);
     assert_eq!(r.get(reg::INT_STATUS) & 0xff, 0);
+}
+
+/// The wire and a PCI pin on the same input are one level: it stays up
+/// until both drop, and the guest sees the OR.
+#[test]
+fn a_wire_and_a_pci_pin_on_one_input_stay_up_until_both_drop() {
+    let r = Rig::new();
+    r.route(4, 33);
+    let c = r.card(4, PCI_INTA); // device 4 INTA -> input 4
+    let wire = r.bridge.bus().wire("super I/O");
+    wire.set(true);
+    c.raise(true);
+    assert_eq!(r.sink.take(), [(33, true)], "one edge for the shared input");
+    wire.set(false);
+    assert_eq!(r.get(reg::INT_STATUS) & 0xff, 1 << 4, "the card still holds it");
+    c.raise(false);
+    assert_eq!(r.get(reg::INT_STATUS) & 0xff, 0);
+    c.raise(true);
+    assert_eq!(r.get(reg::INT_STATUS) & 0xff, 1 << 4);
+    wire.set(true);
+    c.raise(false);
+    assert_eq!(r.get(reg::INT_STATUS) & 0xff, 1 << 4, "and the wire still holds it");
+}
+
+/// Device d's pins reach the inputs the Bridge's interrupt map names, the
+/// formula QEMU's sgi_bridge_map_irq has: A and C the device's own input,
+/// B and D that number with bit two flipped. The Octane's description
+/// must say the same.
+#[test]
+fn octane_routes_equal_the_bridge_map_irq_formula() {
+    for d in 0..=4u8 {
+        let want = |pin0: u8| if pin0 & 1 != 0 { d ^ 4 } else { d };
+        let s = crate::ip30::PCI_BUS.slot(d).expect("described");
+        for pin0 in 0..4u8 {
+            assert_eq!(s.routes[pin0 as usize], Some(want(pin0)), "device {d} pin {pin0}");
+        }
+    }
+    assert!(crate::ip30::PCI_BUS.slot(5).is_none(), "nothing described past the board's functions");
+    assert_eq!(crate::ip30::PCI_BUS.wire("super I/O").unwrap().output, 4);
 }
 
 /// A Bridge-only reset leaves the functions' lines alone: a card still
@@ -1060,16 +1125,11 @@ fn the_64_bit_direct_window_refuses_widget_zero_and_other_widgets() {
 fn a_pin_line_drives_its_pin_and_does_not_keep_the_bridge_alive() {
     let r = Rig::new();
     r.route(4, 33);
-    let line = r.bridge.pin_line(4);
-    assert_eq!(line.line(), 4);
+    let line = r.bridge.bus().wire("super I/O");
     line.set(true);
     assert_eq!(r.sink.take(), [(33, true)]);
     assert_eq!(r.get(reg::INT_STATUS) & 0xff, 1 << 4);
-    // The Bridge is itself a controller whose line is the pin.
-    r.bridge.set_line(4, false);
-    assert_eq!(r.get(reg::INT_STATUS) & 0xff, 0);
-    // A line past the eight pins is dropped.
-    r.bridge.set_line(8, true);
+    line.set(false);
     assert_eq!(r.get(reg::INT_STATUS) & 0xff, 0);
 
     let weak = Arc::downgrade(&r.bridge);
@@ -1091,11 +1151,11 @@ fn a_packet_reaches_heart_outside_the_state_lock() {
         }
     }
     let heart = Arc::new(Prying(Mutex::new(None), Mutex::new(Vec::new())));
-    let bridge = Bridge::new(Arc::new(Mem::new()), heart.clone());
+    let bridge = Bridge::new(&TEST_BUS, Arc::new(Mem::new()), heart.clone());
     *heart.0.lock() = Some(bridge.clone());
     let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
     r.route(4, 3);
-    r.bridge.set_wire_irq(4, true);
+    r.bridge.bus().wire("super I/O").set(true);
     assert_eq!(*heart.1.lock(), [1 << 4], "the status already shows the level");
     // Errors leave the same way.
     r.set(reg::INT_ENABLE, 1 << 4 | INT_PCI_MASTER_TIMEOUT);
@@ -1111,10 +1171,9 @@ fn edges_from_two_threads_reach_heart_in_decision_order() {
     let r = Rig::new();
     r.route(4, 7);
     r.set(reg::INT_MODE, 1 << 4);
-    let b1 = r.bridge.clone();
-    let b2 = r.bridge.clone();
-    let t1 = std::thread::spawn(move || (0..2000).for_each(|_| { b1.set_wire_irq(4, true); b1.set_wire_irq(4, false); }));
-    let t2 = std::thread::spawn(move || (0..2000).for_each(|_| { b2.set_wire_irq(4, true); b2.set_wire_irq(4, false); }));
+    let (w1, w2) = (r.bridge.bus().wire("super I/O"), r.bridge.bus().wire("super I/O"));
+    let t1 = std::thread::spawn(move || (0..2000).for_each(|_| { w1.set(true); w1.set(false); }));
+    let t2 = std::thread::spawn(move || (0..2000).for_each(|_| { w2.set(true); w2.set(false); }));
     t1.join().unwrap();
     t2.join().unwrap();
     let packets = r.sink.take();
@@ -1134,7 +1193,7 @@ fn edges_from_two_threads_reach_heart_in_decision_order() {
 fn window_2_reaches_a_bar_the_way_the_prom_points_it() {
     let r = Rig::new();
     let c = Card::new(PCI_INTA);
-    r.bridge.attach(2, c.clone());
+    r.bridge.bus().attach(PciAddr::dev(2), c.clone());
     // Nothing decodes before the setup.
     assert!(!r.bridge.read8(u64::from(Rig::win(2) + SCRATCH)).is_ok());
     r.cfg_write(2, 0x04, 4, PCI_COMMAND_MEMORY);
@@ -1224,4 +1283,108 @@ fn save_load_round_trip_keeps_the_function_reachable() {
     let _c = other.card(1, PCI_INTA);
     other.bridge.set_revision(4);
     assert!(other.bridge.load_state(&v1).unwrap_err().contains("revision"));
+}
+
+// ---- the shared PCI bus under the Bridge ----
+
+/// The Bridge used to read a register, merge the bytes a narrow write
+/// carried and write the dword back; the header now takes a byte mask. A
+/// guest cannot tell the difference, for any register with a write rule.
+#[test]
+fn a_sub_dword_config_write_equals_the_old_read_modify_write() {
+    let new_card = || Card::new(PCI_INTA);
+    for (reg_off, size, val) in [
+        (0x04u32, 4u32, 0xffff_ffffu32), (0x04, 2, 0x0003), (0x05, 1, 0xa5), (0x06, 2, 0xffff), (0x07, 1, 0xff),
+        (0x0c, 4, 0x00ff_2810), (0x0d, 1, 0x40), (0x0e, 1, 0x80),
+        (0x10, 4, 0x0000_2010), (0x11, 1, 0x30), (0x12, 2, 0xffff),
+        (0x14, 4, 0xffff_ffff), (0x15, 1, 0x20), (0x16, 2, 0x1300), (0x17, 1, 0x13),
+        (0x3c, 4, 0xffff_ffff), (0x3c, 1, 0x0b), (0x3d, 1, 0x02), (0x3e, 2, 0x1234),
+        (0x40, 4, 0xdead_beef), (0x41, 1, 0x55), (0x42, 2, 0xa5a5),
+    ] {
+        let r = Rig::new();
+        let card = new_card();
+        r.bridge.bus().attach(PciAddr::dev(1), card.clone());
+        let legacy = new_card();
+        // The same starting point in both.
+        for c in [&card.cfg, &legacy.cfg] {
+            c.write(1, 0);
+            c.write(3, 0x0000_1020);
+            c.write(4, 0x2000);
+            c.write(5, 0x1300_0000);
+            c.write(15, 0x0000_0101);
+            c.write(16, 0x1122_3344);
+        }
+        r.cfg_write(1, reg_off, size, val);
+        let (i, shift) = ((reg_off / 4) as usize, 8 * (reg_off & 3));
+        let mask = ((u64::MAX >> (64 - 8 * size)) << shift) as u32;
+        legacy.cfg.write(i, (legacy.cfg.read(i) & !mask) | (((val as u64) << shift) as u32 & mask));
+        assert_eq!(card.cfg.read(i), legacy.cfg.read(i), "{size} byte write of {val:#x} at {reg_off:#x}");
+        assert_eq!((0..64).map(|k| card.cfg.read(k)).collect::<Vec<_>>(), (0..64).map(|k| legacy.cfg.read(k)).collect::<Vec<_>>());
+    }
+}
+
+/// Nothing answers function 1 of a present device: the read fails and the
+/// master time-out is captured, as for an empty slot.
+#[test]
+fn an_absent_function_times_out_and_raises_a_bus_error() {
+    let r = Rig::new();
+    r.card(1, PCI_INTA);
+    r.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+    assert!(!r.bridge.read32(u64::from(Rig::cfg(1, 0x100))).is_ok(), "function 1 of a present device");
+    assert_ne!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
+    assert_eq!(r.get(reg::PCI_ERR_UPPER), 1 << 16);
+    r.set(reg::INT_RESET, INT_RESET_PCI_GRP | INT_RESET_MULTI_ERR);
+    assert!(!r.bridge.read32(u64::from(Rig::cfg(4, 0))).is_ok(), "an empty device");
+    assert_eq!(r.get(reg::PCI_ERR_UPPER), 4 << 16);
+    // A store to either posts and still captures the time-out.
+    r.set(reg::INT_RESET, INT_RESET_PCI_GRP | INT_RESET_MULTI_ERR);
+    assert_eq!(r.bridge.write32(u64::from(Rig::cfg(1, 0x104)), 0), BUS_OK);
+    assert_eq!(r.get(reg::PCI_ERR_UPPER), 1 << 16);
+}
+
+/// A BAR a device window reaches whole is also published as a run. An
+/// access through the run and the Bridge's own decode of the same address
+/// move the same bytes.
+#[test]
+fn fast_path_and_slow_path_agree() {
+    let r = Rig::new();
+    let runs = Arc::new(Mutex::new(Vec::<BarRun>::new()));
+    let sink = runs.clone();
+    r.bridge.bus().on_bar_runs(Box::new(move |v| *sink.lock() = v));
+    let c = r.card(2, PCI_INTA);
+    c.regs.lock()[FIXED as usize..FIXED as usize + 8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let run = runs.lock().first().cloned().expect("the memory BAR is published");
+    let w = Rig::win(2);
+    assert_eq!(run.start, w as u64, "the BAR fills the page the window starts on");
+    for (off, size) in [(FIXED, 4u32), (FIXED + 4, 4), (FIXED ^ 3, 1), (FIXED ^ 2, 2)] {
+        let a = u64::from(w + off);
+        let (fast, slow) = match size {
+            1 => (run.dev.read8(a).data as u32, r.bridge.read8(a).data as u32),
+            2 => (run.dev.read16(a).data as u32, r.bridge.read16(a).data as u32),
+            _ => (run.dev.read32(a).data, r.bridge.read32(a).data),
+        };
+        assert_eq!(fast, slow, "read of {size} at {off:#x}");
+    }
+    assert_eq!(run.dev.write32(u64::from(w + SCRATCH), 0xcafe_f00d), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0xcafe_f00d, "a write through the run");
+    assert_eq!(r.bridge.write32(u64::from(w + SCRATCH), 0x0bad_cafe), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0x0bad_cafe, "and through the Bridge's decode");
+}
+
+/// A snapshot taken with a different set of functions is refused, naming
+/// which side differs.
+#[test]
+fn a_saved_bridge_with_another_function_set_is_refused() {
+    use crate::traits::Saveable;
+    let src = Rig::new();
+    src.card(1, PCI_INTA);
+    let saved = src.bridge.save_state();
+    let dst = Rig::new();
+    let e = dst.bridge.load_state(&saved).unwrap_err();
+    assert_eq!(e, "pci: saved state has device 1, which is empty here");
+    let both = Rig::new();
+    both.card(1, PCI_INTA);
+    both.card(2, PCI_INTA);
+    let e = both.bridge.load_state(&saved).unwrap_err();
+    assert_eq!(e, "pci: this bus has device 2, the saved state has none");
 }

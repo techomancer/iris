@@ -269,6 +269,28 @@ or clear. The CPU polls it between instructions (jitv2 at region boundaries
 and checkpoints inside regions). The full map of which source lands where is
 in [docs/interrupt_map.md](docs/interrupt_map.md).
 
+### PCI
+
+PCI is one layer (`src/pci.rs` and `src/pci/`), and the host bridges are its
+clients. Read the module comment at the top of `src/pci/bus.rs` for the
+model. In short: a machine describes its bus as a `static BusDesc` next to its
+own code (device numbers, what each is, interrupt routes, the source of each
+fact); a bridge owns a `PciBus` built from it and implements `PciHost` for
+what is its own; functions implement `PciBusDevice`, whose default methods are
+the abilities a machine asks for (`scsi_buses`, `connect_heartbeat`,
+`device`, `saveable`) without naming the type.
+
+- **Adding a card** is one file: implement `PciBusDevice` on the device, give
+  the file a `static CardDesc` (summary, SCSI buses, an options check, a
+  constructor that reads its options into a typed struct), and add the
+  variant to `PciCard` and its arm in `PciCard::desc`. Nothing else lists
+  cards.
+- **Adding a bus** is a `BusDesc` for the machine and a `PciHost` for its
+  bridge; placement, interrupts, decode, publication, reset and saved state
+  come with `PciBus`.
+- Register-contract tests for the layer use `TestHost` (`src/pci/host.rs`),
+  a recording host, so the bus is tested without a bridge.
+
 ### Time
 
 CP0 Count is derived from host wall-clock time at a fixed rate (33 MHz on

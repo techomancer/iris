@@ -13,6 +13,25 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### PCI
+
+- The PCI side of the O2 (MACE) and the Octane (the Bridge) now sits on one
+  shared layer: placing a function, its DMA and interrupt lines, the OR of
+  pins that share an interrupt input, configuration cycles, BAR decoding and
+  direct-mapped BAR runs, reset and saved headers are written once. Each
+  machine's slots and interrupt routing are data beside its code. Guests see
+  the same hardware, except that the O2's PCI option slot (device 3) now routes
+  as the MACE specification has it.
+- **A PCI card can be fitted in the O2's PCI option slot.** The AIC-7880 SCSI
+  controller is the first: `[[pci]]` with `slot = "PCI option"` (or `slot = 3`)
+  and `card = "aic7880"`, or `--pci "PCI option=aic7880"`. Its bus is
+  controller 2, so `[scsi.35]` is id 3 on it, and ids 1 to 15 work there. IRIX
+  shows it as `PCI SCSI controller 2`. A slot is named as the machine's manual
+  labels it; the Octane has no add-in slot.
+- Snapshots of the O2 and Octane use a new schema (6). Older ones are refused
+  and say which schema they are. A restore onto a machine with other cards, or
+  none, is refused and says which differ.
+
 ### Networking
 
 - IRIX 6.5.30 guests mount the NFS share with a plain `mount`: the

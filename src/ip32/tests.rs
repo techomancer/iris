@@ -926,13 +926,54 @@ fn nvram_survives_and_decodes_maces_spacing() {
 /// 0x91, 0x93 and 0xbc, which are nothing; with it they are HCNTRL,
 /// CLRINT, SCBPTR and the SCB array, which is exactly right.
 #[test]
-fn the_bridge_swaps_byte_lanes_for_a_little_endian_device() {
-    assert_eq!(MacePci::lane_swizzle(0x84, 1), 0x87, "HCNTRL");
-    assert_eq!(MacePci::lane_swizzle(0x91, 1), 0x92, "CLRINT");
-    assert_eq!(MacePci::lane_swizzle(0x93, 1), 0x90, "SCBPTR");
-    assert_eq!(MacePci::lane_swizzle(0xbc, 1), 0xbf, "last byte of the SCB");
-    assert_eq!(MacePci::lane_swizzle(0x84, 2), 0x86, "16-bit lanes swap in pairs");
-    assert_eq!(MacePci::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
+fn window_accesses_swizzle_byte_lanes_through_the_bus() {
+    use crate::pci::slots::PciAddr;
+    use crate::pci::{Bar, PciBusDevice, PciConfig};
+
+    struct Probe {
+        cfg: PciConfig,
+        last: Mutex<Option<(u32, usize)>>,
+    }
+    impl PciBusDevice for Probe {
+        fn config(&self) -> &PciConfig { &self.cfg }
+        fn bar_read(&self, _: usize, off: u32, width: usize) -> u32 {
+            *self.last.lock().unwrap() = Some((off, width));
+            0
+        }
+        fn bar_write(&self, _: usize, off: u32, _: u32, width: usize) {
+            *self.last.lock().unwrap() = Some((off, width));
+        }
+    }
+
+    let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+    let f = Arc::new(Probe {
+        cfg: PciConfig::new(0x9004, 0x8078, 0x01_0000, 1, [Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0),
+        last: Mutex::new(None),
+    });
+    bus.mace.pci.bus().attach(PciAddr::dev(3), f.clone());
+    // Firmware's way in: MACE's configuration registers.
+    let reg = |off: u32| (MACEPCI_BASE + off) as u64;
+    let cfg_write = |r: u32, v: u32| {
+        bus.mace.pci.write32(reg(macepci_reg::CONFIG_ADDR), (1 << 31) | (3 << 11) | (r << 2));
+        bus.mace.pci.write32(reg(macepci_reg::CONFIG_DATA), v);
+    };
+    cfg_write(4, 0x8000_0000);
+    cfg_write(1, 2);
+
+    let at = |off: u32| PCI_MEM_BASE + off;
+    for (off, width, want) in [
+        (0x84, 1, 0x87), // HCNTRL
+        (0x91, 1, 0x92), // CLRINT
+        (0x93, 1, 0x90), // SCBPTR
+        (0xbc, 1, 0xbf), // last byte of the SCB
+        (0x84, 2, 0x86), // 16-bit lanes swap in pairs
+        (0x84, 4, 0x84), // a whole word needs no swap
+    ] {
+        bus.mace.pci.window_read(at(off), width);
+        assert_eq!(*f.last.lock().unwrap(), Some((want, width)), "read {width} at {off:#x}");
+        bus.mace.pci.window_write(at(off), 0, width);
+        assert_eq!(*f.last.lock().unwrap(), Some((want, width)), "write {width} at {off:#x}");
+    }
 }
 
 /// Every O2 device answers the monitor through the bus: its command is
@@ -957,4 +998,82 @@ fn every_device_answers_the_monitor_through_the_bus() {
         assert!(!out.lock().unwrap().is_empty(), "{cmd} status printed nothing");
     }
     assert!(bus.execute_command("nonesuch", &[], Box::new(std::io::sink())).is_err());
+}
+
+// ---- cards fitted in the PCI option slot ----
+
+/// The machine as `[[pci]]` would fit it: the board's two controllers and
+/// whatever cards `entries` names, built from the real catalog.
+fn with_cards(entries: &[crate::pci::place::PciEntry]) -> Arc<Ip32Bus> {
+    let profile = crate::config::MachineProfile::O2Ip32;
+    let placements = crate::pci::place::resolve(profile.pci_buses(), entries, profile.scsi_controllers()).unwrap();
+    let opts = Ip32Options {
+        scsi: Some([crate::dev::aic7880::Aic7880::new_bus(), crate::dev::aic7880::Aic7880::new_bus()]),
+        cards: crate::pci::place::build(placements).unwrap(),
+        ..Default::default()
+    };
+    Ip32Bus::with_options(O2Memory::single(16 << 20), vec![0u8; PROM_SIZE as usize], opts)
+}
+
+fn option_slot() -> Vec<crate::pci::place::PciEntry> {
+    vec![crate::pci::place::PciEntry::parse_cli("PCI option=aic7880").unwrap()]
+}
+
+/// A configuration read of register 0 of `device`, through MACE's registers.
+fn config_id(bus: &Ip32Bus, device: u32) -> u32 {
+    let reg = |off: u32| (MACEPCI_BASE + off) as u64;
+    bus.mace.pci.write32(reg(macepci_reg::CONFIG_ADDR), (1 << 31) | (device << 11));
+    bus.mace.pci.read32(reg(macepci_reg::CONFIG_DATA)).data
+}
+
+#[test]
+fn a_fitted_card_answers_config_reads_at_the_option_slot() {
+    let bus = with_cards(&option_slot());
+    assert_eq!(config_id(&bus, 3), 0x8078_9004);
+    assert_eq!(config_id(&bus, 4), 0xffff_ffff, "nothing in the spare slot");
+    assert_eq!(bus.mace.pci.bus().cards().len(), 1);
+}
+
+#[test]
+fn fitted_card_buses_are_numbered_after_the_onboard_ones() {
+    let bus = with_cards(&option_slot());
+    let numbers: Vec<usize> = bus.scsi_buses().iter().map(|c| c.number()).collect();
+    assert_eq!(numbers, [0, 1, 2]);
+    assert_eq!(bus.card_devices().len(), 1);
+    assert!(bus.flush_disks().is_ok());
+}
+
+#[test]
+fn no_cards_means_the_same_bus_as_before() {
+    let bus = with_cards(&[]);
+    let mut at: Vec<u8> = bus.mace.pci.bus().functions().iter().map(|(a, _)| a.device).collect();
+    at.sort();
+    assert_eq!(at, [IP32_SCSI_SLOT, IP32_SCSI_SLOT_B]);
+    assert!(bus.mace.pci.bus().cards().is_empty());
+    assert_eq!(bus.scsi_buses().len(), 2);
+    assert!(bus.card_devices().is_empty());
+}
+
+#[test]
+fn an_o2_saved_with_a_card_will_not_load_without_one() {
+    use crate::traits::Saveable;
+    let with = with_cards(&option_slot());
+    let without = with_cards(&[]);
+    let saved = with.save_state();
+    let e = without.load_state(&saved).unwrap_err();
+    assert!(e.contains("saved state has 1 PCI cards, this machine 0"), "{e}");
+    let e = with.load_state(&without.save_state()).unwrap_err();
+    assert!(e.contains("saved state has 0 PCI cards, this machine 1"), "{e}");
+}
+
+#[test]
+fn a_card_fitted_o2_state_round_trips() {
+    use crate::traits::Saveable;
+    let src = with_cards(&option_slot());
+    let saved = src.save_state();
+    let dst = with_cards(&option_slot());
+    dst.load_state(&saved).expect("same cards, same state");
+    assert_eq!(dst.save_state(), saved);
+    let refs = crate::pci::place::card_refs(src.mace.pci.bus());
+    assert_eq!((refs[0].card.as_str(), refs[0].device), ("aic7880", 3));
 }

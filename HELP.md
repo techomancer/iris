@@ -658,6 +658,12 @@ path  = "cdrom4.iso"
 cdrom = true
 # discs = ["irix65.iso", "extras.iso", "patches.iso"]   # changer; "scsi eject 4" cycles
 
+# A PCI card in the O2's "PCI option" slot (device 3 also works as `slot = 3`).
+# The AIC-7880 brings SCSI controller 2: [scsi.35] is id 3 on it, ids 1 to 15 (0 is the controller).
+# [[pci]]
+# slot = "PCI option"
+# card = "aic7880"
+
 # Scratch volume for file injection without networking (see README).
 # [scsi.2]
 # path    = "scratch.raw"
@@ -799,6 +805,7 @@ Storage
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
   --no-write-cache            Turn every hard disk's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
+  --pci <SLOT=CARD>           Fit a PCI card: [BUS:]SLOT=CARD[,KEY=VALUE]... such as "PCI option=aic7880"; repeatable
 
 Display and audio
   --2x                        2× window scaling

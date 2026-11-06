@@ -174,8 +174,9 @@ are described in [NETWORKING.md](../NETWORKING.md).
 
 The monitor (`monitor_port`) has, besides the usual CPU and device commands:
 
-- `ip30 memcfg | bridge | gfx | xbow | unmapped`: the memory banks as HEART
-  places them, the Bridge's interrupt routing and device registers, the
+- `ip30 memcfg | bridge | pci [config <device>] | gfx | xbow | unmapped`: the
+  memory banks as HEART places them, the Bridge's interrupt routing and device
+  registers, the functions on its PCI bus (or one header), the
   graphics widget's link and identification, the Crossbow accesses it
   refused, and physical accesses that failed (the first 64, with the PC).
 - `heart status`: HEART's interrupt bits, mask, counter and bank descriptors;

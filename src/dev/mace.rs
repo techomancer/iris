@@ -55,12 +55,12 @@ impl Mace {
     /// MACE with its blocks reset, its interrupts wired into `crime`: the
     /// Ethernet straight in, the ISA peripherals (the PS/2 ports, audio, the
     /// console UART while driven by PIO, serial DMA) through the ISA block.
-    pub fn new(ram: Arc<O2Memory>, crime: Arc<Crime>, ust: Arc<MaceUst>) -> Self {
+    pub fn new(pci: &'static crate::pci::slots::BusDesc, ram: Arc<O2Memory>, crime: Arc<Crime>, ust: Arc<MaceUst>) -> Self {
         let isa = Arc::new(MaceIsa::new(crime.clone()));
         let mace = Self {
             isa,
             regs: Stub::new("mace"),
-            pci: MacePci::new(crime.clone(), ram.clone()),
+            pci: MacePci::new(pci, crime.clone(), ram.clone()),
             ust,
             rtc: MaceRtc::new(),
             ps2: MacePs2::new(),

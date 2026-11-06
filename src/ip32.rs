@@ -122,6 +122,54 @@ pub use crate::dev::mace_uart::*;
 pub use crate::dev::ns16550::*;
 pub use crate::dev::mace_id::*;
 
+/// The two SCSI controllers an O2 has on its motherboard. CRIME carries a
+/// separate interrupt line for each, which is the clearest evidence that
+/// both are expected to be there.
+pub const IP32_SCSI_SLOT: u8 = 1;
+pub const IP32_SCSI_SLOT_B: u8 = 2;
+
+/// Which of CRIME's interrupt inputs the pin of the function in that slot
+/// drives. NetBSD works this out for itself and prints it: "interrupting at
+/// crime interrupt 8".
+pub const IP32_SCSI_CRIME_INT: u32 = 8;
+pub const IP32_SCSI_CRIME_INT_B: u32 = 9;
+
+/// The O2's PCI bus: MACE's bus 0, with its host outputs being CRIME's
+/// interrupt inputs.
+pub static PCI_BUS: crate::pci::slots::BusDesc = {
+    use crate::pci::slots::{BusDesc, Evidence, SlotDesc, SlotKind};
+    BusDesc {
+        id: "pci",
+        name: "O2 PCI bus",
+        devices: 32,
+        outputs: 16,
+        slots: &[
+            SlotDesc {
+                device: IP32_SCSI_SLOT, label: "internal SCSI", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: "MACE specification Tables 85, 87, 90; the board's two AIC-7880s",
+                routes: [Some(IP32_SCSI_CRIME_INT as u8), None, None, None],
+            },
+            SlotDesc {
+                device: IP32_SCSI_SLOT_B, label: "external SCSI", kind: SlotKind::Onboard, evidence: Evidence::Established,
+                source: "MACE specification Tables 85, 87, 90; the board's two AIC-7880s",
+                routes: [Some(IP32_SCSI_CRIME_INT_B as u8), None, None, None],
+            },
+            SlotDesc {
+                device: 3, label: "PCI option", kind: SlotKind::AddIn, evidence: Evidence::Established,
+                source: "MACE specification Tables 85, 87, 90 (routing); O2 Workstation Hardware Reference Guide \
+                         007-3275-003 pp. 3-4 (rear-panel label, 'PCI option board')",
+                routes: [Some(10), Some(13), Some(14), Some(15)],
+            },
+            SlotDesc {
+                device: 4, label: "virtio-serial", kind: SlotKind::ParavirtualSpare, evidence: Evidence::Approximation,
+                source: "a device number the MACE specification routes (Table 85) and no O2 board uses",
+                routes: [Some(11), None, None, None],
+            },
+        ],
+        wires: &[],
+    }
+};
+
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 /// CRIME's no-ECC alias of the memory window: the same memory as
@@ -175,6 +223,8 @@ pub struct Ip32Options {
     pub keyboard: Option<bool>,
     /// The Ethernet address in the 1-Wire ID chip, if not the default.
     pub mac: Option<[u8; 6]>,
+    /// Cards fitted in the add-in slot, from `[[pci]]`.
+    pub cards: Vec<crate::pci::place::Fitted>,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -406,7 +456,7 @@ pub struct Ip32Bus {
     /// The bus everything is mapped on: what the CPU and the DMA masters use.
     pub phys: Arc<Physical>,
     /// The runs of the PCI windows a BAR decodes whole, mapped over MACE
-    /// (`MacePci::on_bar_runs`).
+    /// (`PciBus::on_bar_runs`).
     pci_runs: Mutex<Vec<crate::pci::BarRun>>,
     pub(crate) ram: Arc<O2Memory>,
     pub(crate) flash: O2Flash,
@@ -432,11 +482,61 @@ pub struct Ip32Bus {
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
 }
 
+/// One SCSI controller of the machine, on the board or on a fitted card,
+/// with the number the config and the monitor give it.
+pub struct ScsiController {
+    number: usize,
+    owner: ScsiOwner,
+}
+
+enum ScsiOwner {
+    Board(Arc<crate::dev::aic7880::Aic7880>),
+    /// The `n`th SCSI bus of a card.
+    Card(Arc<dyn crate::pci::PciBusDevice>, usize),
+}
+
+impl ScsiController {
+    pub fn number(&self) -> usize {
+        self.number
+    }
+
+    pub fn bus(&self) -> &crate::scsi::ScsiBus {
+        match &self.owner {
+            ScsiOwner::Board(c) => c.bus(),
+            ScsiOwner::Card(f, n) => f.scsi_buses()[*n],
+        }
+    }
+}
+
 impl Ip32Bus {
+    /// The SCSI controllers: the board's two (0 and 1), then those of each
+    /// fitted card, numbered from the card's first controller.
+    pub fn scsi_buses(&self) -> Vec<ScsiController> {
+        let mut out: Vec<ScsiController> = self
+            .scsi
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(number, c)| ScsiController { number, owner: ScsiOwner::Board(c.clone()) })
+            .collect();
+        for (_, card, f) in self.mace.pci.bus().cards() {
+            for n in 0..f.scsi_buses().len() {
+                out.push(ScsiController { number: card.first_controller as usize + n, owner: ScsiOwner::Card(f.clone(), n) });
+            }
+        }
+        out
+    }
+
+    /// The fitted cards that are devices to start, stop and list in the
+    /// monitor, in the order they were fitted.
+    pub fn card_devices(&self) -> Vec<Arc<dyn crate::traits::Device>> {
+        self.mace.pci.bus().cards().into_iter().filter_map(|(_, _, f)| f.device()).collect()
+    }
+
     /// Flush the disks on every SCSI controller.
     pub fn flush_disks(&self) -> std::io::Result<()> {
-        let controllers = self.scsi.lock().unwrap().clone();
-        controllers.iter().try_for_each(|c| c.bus().flush())
+        self.scsi_buses().iter().try_for_each(|c| c.bus().flush())
     }
 
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
@@ -471,7 +571,7 @@ impl Ip32Bus {
                 gbe.tr = crime.tr.clone();
                 gbe
             },
-            mace: Mace::new(ram.clone(), crime, ust),
+            mace: Mace::new(&PCI_BUS, ram.clone(), crime, ust),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
         };
@@ -498,11 +598,16 @@ impl Ip32Bus {
             let scsi_b = crate::dev::aic7880::Aic7880::new_at(1, bus_b);
             scsi.set_heartbeat(bus.mace.id.heartbeat.clone());
             scsi_b.set_heartbeat(bus.mace.id.heartbeat.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
+            bus.mace.pci.bus().attach(crate::pci::slots::PciAddr::dev(IP32_SCSI_SLOT_B), scsi_b.clone());
+            bus.mace.pci.bus().attach(crate::pci::slots::PciAddr::dev(IP32_SCSI_SLOT), scsi.clone());
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
+        }
+        // Cards the user fitted in the add-in slot.
+        for f in opts.cards {
+            bus.mace.pci.bus().attach_card(f.placement.addr, f.function.clone(), f.placement.card_ref());
+            f.function.connect_heartbeat(bus.mace.id.heartbeat.clone());
         }
         // A saved flash carries the guest's environment -- boot paths, console
         // choice, everything the PROM's `setenv` writes -- from one run to
@@ -521,7 +626,7 @@ impl Ip32Bus {
         bus.map();
         // Window pages a PCI BAR decodes whole go straight to the function.
         let weak = Arc::downgrade(&bus);
-        bus.mace.pci.on_bar_runs(Box::new(move |runs| {
+        bus.mace.pci.bus().on_bar_runs(Box::new(move |runs| {
             if let Some(b) = weak.upgrade() {
                 b.set_pci_runs(runs);
             }
@@ -667,6 +772,17 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
+        // Each fitted card's own state (its header is in MACE's), in the
+        // order they were fitted.
+        let cards = self
+            .mace
+            .pci
+            .bus()
+            .cards()
+            .iter()
+            .map(|(_, _, f)| f.saveable().map_or(toml::Value::Boolean(false), |s| s.save_state()))
+            .collect();
+        t.insert("cards".into(), toml::Value::Array(cards));
         if let Some(words) = self.ram.stack_page_words() {
             t.insert("stack_page".into(), toml::Value::Array(words.into_iter().map(crate::snapshot::hex_u64).collect()));
         }
@@ -675,6 +791,15 @@ impl crate::traits::Saveable for Ip32Bus {
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         use crate::snapshot::get_field;
+        // Before anything is touched: another set of cards is another machine.
+        let cards = self.mace.pci.bus().cards();
+        let saved_cards = match get_field(v, "cards") {
+            Some(toml::Value::Array(a)) => a.as_slice(),
+            _ => &[],
+        };
+        if saved_cards.len() != cards.len() {
+            return Err(format!("saved state has {} PCI cards, this machine {}", saved_cards.len(), cards.len()));
+        }
         if let Some(m) = get_field(v, "mace") {
             self.mace.load_state(m)?;
         }
@@ -694,6 +819,11 @@ impl crate::traits::Saveable for Ip32Bus {
             }
             for (c, s) in scsi.iter().zip(a) {
                 c.load_state(s)?;
+            }
+        }
+        for ((_, _, f), saved) in cards.iter().zip(saved_cards) {
+            if let Some(s) = f.saveable() {
+                s.load_state(saved)?;
             }
         }
         if let Some(toml::Value::Array(a)) = get_field(v, "stack_page") {

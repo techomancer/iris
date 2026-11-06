@@ -1181,6 +1181,10 @@ pub struct CrimeRe {
     polled_busy: std::sync::atomic::AtomicBool,
     asleep: std::sync::atomic::AtomicBool,
     started: std::sync::atomic::AtomicBool,
+    /// Set to end the engine's thread (see [`Self::shutdown`]); read only
+    /// when the thread has nothing to do.
+    quit: std::sync::atomic::AtomicBool,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     engine: std::sync::OnceLock<std::thread::Thread>,
     /// The annotated trace, shared with CRIME and GBE.
     pub tr: Arc<O2Trace>,
@@ -1281,6 +1285,8 @@ impl CrimeRe {
             polled_busy: std::sync::atomic::AtomicBool::new(false),
             asleep: std::sync::atomic::AtomicBool::new(false),
             started: std::sync::atomic::AtomicBool::new(false),
+            quit: std::sync::atomic::AtomicBool::new(false),
+            thread: std::sync::Mutex::new(None),
             engine: std::sync::OnceLock::new(),
             tr: Arc::new(O2Trace::default()),
             rec: Mutex::new(None),
@@ -1303,7 +1309,7 @@ impl CrimeRe {
         if self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("CRIME-RE".into())
             .spawn(move || {
                 let re = get(&owner);
@@ -1311,6 +1317,20 @@ impl CrimeRe {
                 re.run();
             })
             .expect("CRIME-RE thread");
+        *self.thread.lock().unwrap() = Some(handle);
+    }
+
+    /// End the engine's thread once it has no writes left, and wait for it.
+    /// The thread holds the machine that owns the engine, so until it ends
+    /// that machine is never freed. Not callable from the engine's thread.
+    pub fn shutdown(&self) {
+        self.quit.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(t) = self.engine.get() {
+            t.unpark();
+        }
+        if let Some(h) = self.thread.lock().unwrap().take() {
+            let _ = h.join();
+        }
     }
 
     /// The engine's thread: carry out each write in order. With none left
@@ -1320,7 +1340,7 @@ impl CrimeRe {
     /// backs off between looks: looking without pause took the buffer's
     /// tail away from the CPU on every write and lost a fifth of small
     /// triangles.
-    fn run(&self) -> ! {
+    fn run(&self) {
         use std::sync::atomic::Ordering::*;
         const IDLE_SPIN: std::time::Duration = std::time::Duration::from_micros(250);
         let backoff = crossbeam_utils::Backoff::new();
@@ -1333,6 +1353,9 @@ impl CrimeRe {
                     busy = false;
                     self.busy.store(false, Release);
                     crate::pf_level!(self.pf_busy, crate::perfetto::events::RE_BUSY, false);
+                }
+                if self.quit.load(Acquire) {
+                    return;
                 }
                 // Stays set across sleeps, so an idle engine wakes only for
                 // the park backstop and goes straight back to sleep.
