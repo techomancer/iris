@@ -7907,4 +7907,144 @@ mod tests {
             println!("{:<12} {:8.3} ns/instruction", name, ns);
         }
     }
+
+    /// Run `code` from kseg0 0x8000_1000 through the real dispatch gate until
+    /// `core.pc` reaches `end` (or `max_steps` dispatches), on the JIT with
+    /// inline compile (`jit`) or on the interpreter alone. Returns the
+    /// retired-instruction count (`core.hot.cycles` advance) and the final
+    /// state.
+    #[cfg(not(feature = "lightning"))]
+    fn run_counting(code: &[u32], gpr: [u64; 32], status: u32, end: u64, max_steps: usize, jit: bool) -> (u64, CoreSnapshot) {
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let mem = if jit { MockMemory::new() } else { MockMemory::new_not_compilable() };
+        let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.set_cp0_status(status);
+        for (i, &raw) in code.iter().enumerate() {
+            let va = pc + 4 * i as u64;
+            mem.set_word(va, raw);
+            mem.set_word(va & 0x1FFF_FFFF, raw);
+        }
+        exec.install_jit_hooks();
+        exec.jitv2_inline_compile = jit;
+        let start = exec.core.hot.cycles;
+        for _ in 0..max_steps {
+            if exec.core.pc == end {
+                break;
+            }
+            exec.step_jit();
+        }
+        (exec.core.hot.cycles - start, CoreSnapshot::capture(&exec.core))
+    }
+
+    /// The retired-instruction count is guest-visible (CP0 Count, a clock
+    /// driven by it), so a loop must count the same per pass whichever engine
+    /// runs it. A not-taken Likely branch annuls its slot: the branch retires,
+    /// the slot does not. Compiled code used to lose every instruction since
+    /// the last flush on that arm, because the flush for the branch's edges
+    /// sits on the slot, which only the taken arm runs: the beql loop below
+    /// counted 3 per pass instead of 5.
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn loops_with_likely_branches_count_like_the_interpreter() {
+        use crate::cpu::mips_isa::*;
+        let nop = 0u32;
+        let dec_a0 = make_i(OP_ADDIU, 4, 4, 0xFFFF);
+        let inc_a1 = make_i(OP_ADDIU, 5, 5, 1);
+        let inc_a2 = make_i(OP_ADDIU, 6, 6, 1);
+        let add_d = make_r(OP_COP1, RS_D, 2, 0, 0, FUNCT_FADD); // f0 += f2
+        let c_lt_d = make_r(OP_COP1, RS_D, 0, 4, 0, FUNCT_FC_LT); // cc0 = f4 < f0, false
+        let jr_ra = make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        let end = 0xFFFF_FFFF_8000_3000u64;
+        let passes = 100u64;
+        // (name, code, a3, instructions per pass)
+        let cases: [(&str, Vec<u32>, u64, u64); 5] = [
+            // beql a3, zero (a3 = 1, not taken), its slot annulled.
+            ("beql", vec![
+                dec_a0,
+                make_i(OP_BEQL, 7, 0, 2), inc_a2,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFFB), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 1, 5),
+            // A beql whose target is its own fall-through word, so both arms
+            // land on a branch target: the not-taken arm must flush, or the
+            // taken arm's arrival counts the branch twice.
+            ("beql to word+2, not taken", vec![
+                dec_a0,
+                make_i(OP_BEQL, 7, 0, 1), inc_a2,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFFB), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 1, 5),
+            ("beql to word+2, taken", vec![
+                dec_a0,
+                make_i(OP_BEQL, 7, 0, 1), inc_a2,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFFB), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 0, 6),
+            // bc1tl on a false condition, as compiled C tests a rarely
+            // true FP compare.
+            ("bc1tl", vec![
+                dec_a0,
+                add_d,
+                c_lt_d,
+                make_bc1(0, true, true, 2), inc_a2,
+                add_d,
+                inc_a1,
+                make_i(OP_BNE, 4, 0, 0xFFF8), inc_a1, // back to word 0
+                jr_ra, nop,
+            ], 1, 8),
+            // The not-taken arm's edge leaving the region: bnel back to the
+            // top while a0 is non-zero, falling out of the loop past the
+            // annulled slot.
+            ("bnel exit", vec![
+                dec_a0,
+                inc_a1,
+                make_i(OP_BNEL, 4, 0, 0xFFFD), inc_a2, // back to word 0
+                jr_ra, nop,
+            ], 1, 4),
+        ];
+        for (name, code, a3, per_pass) in cases {
+            let mut gpr = [0u64; 32];
+            gpr[4] = passes;
+            gpr[7] = a3;
+            gpr[31] = end;
+            let status = crate::cpu::mips_core::STATUS_CU1;
+            let (interp, interp_state) = run_counting(&code, gpr, status, end, 100_000, false);
+            let (jit, jit_state) = run_counting(&code, gpr, status, end, 100_000, true);
+            // The bnel loop's last pass falls out with its slot annulled.
+            let expected = per_pass * passes + 2 - if name == "bnel exit" { 1 } else { 0 };
+            assert_eq!(interp_state.pc, end, "{name}: interpreter did not reach the end");
+            assert_eq!(jit_state, interp_state, "{name}: JIT and interpreter diverged");
+            assert_eq!(interp, expected, "{name}: interpreter retired-instruction count");
+            assert_eq!(jit, expected, "{name}: JIT retired-instruction count");
+        }
+    }
+
+    /// An exception in the middle of a batched run counts what retired before
+    /// it and the faulting instruction itself, as the interpreter does.
+    /// Compiled code used to return without storing the run's pending count.
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn exception_mid_run_counts_like_the_interpreter() {
+        use crate::cpu::mips_isa::*;
+        let code = [
+            make_i(OP_ADDIU, 0, 5, 1),
+            make_i(OP_ADDIU, 0, 6, 2),
+            make_r(OP_SPECIAL, 8, 8, 9, 0, FUNCT_ADD), // t1 = t0 + t0 overflows
+            make_i(OP_ADDIU, 0, 7, 3),
+        ];
+        let mut gpr = [0u64; 32];
+        gpr[8] = 0x4000_0000;
+        // Three dispatches on the interpreter, one on the JIT: both stop on
+        // the exception vector.
+        let (interp, interp_state) = run_counting(&code, gpr, 0, 0, 3, false);
+        let (jit, jit_state) = run_counting(&code, gpr, 0, 0, 1, true);
+        assert_eq!(jit_state, interp_state, "JIT and interpreter diverged");
+        assert_eq!(interp_state.cp0_cause >> 2 & 0x1f, 12, "the add must raise an overflow");
+        assert_eq!(interp, 3);
+        assert_eq!(jit, 3);
+    }
 }

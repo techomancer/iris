@@ -2905,6 +2905,9 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset_val: Value) {
 /// `step_preamble!`'s real interrupt-delivery logic) instead of treating a
 /// still-pending interrupt as if this instruction had just retired normally.
 fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset, status: ExecStatus) {
+    // A bail from the middle of a batched run (a pending interrupt, a busy
+    // bus) leaves before the run's flush: count what already retired.
+    emit_store_pending_cycles(ctx);
     let word_offset_val = ctx.builder.ins().iconst(ir::types::I64, word_offset as i64);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     ctx.builder.ins().jump(exit_block, &[ir::BlockArg::Value(ctx.core_ptr), ir::BlockArg::Value(word_offset_val), ir::BlockArg::Value(status_val)]);
@@ -3605,7 +3608,26 @@ fn core_offset_of_cycles() -> i32 {
 fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) {
     let instr = &instrs[word as usize];
     *ctx.cycles_pending += instr.cycles_delta;
-    if !instr.cycles_flush {
+    if instr.cycles_flush {
+        emit_flush_cycles(ctx);
+    }
+}
+
+/// Store the running pending count to `core.hot.cycles` and reset it: the
+/// flush half of `emit_account_for_cycles`, for a point that must flush
+/// without retiring a word of its own.
+fn emit_flush_cycles(ctx: &mut EmitCtx) {
+    emit_store_pending_cycles(ctx);
+    *ctx.cycles_pending = 0;
+}
+
+/// Add the pending count to `core.hot.cycles` on a side exit (a bail or an
+/// exception) without resetting it: the compiled path that continues past
+/// the exit still owes the same count at its own flush. Nothing is emitted
+/// when nothing is pending, which is every region exit taken from a flush
+/// word.
+fn emit_store_pending_cycles(ctx: &mut EmitCtx) {
+    if *ctx.cycles_pending == 0 {
         return;
     }
     let mem = MemFlagsData::trusted();
@@ -3613,7 +3635,6 @@ fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_P
     let prev = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
     let next = ctx.builder.ins().iadd_imm_s(prev, *ctx.cycles_pending as i64);
     ctx.builder.ins().store(mem, next, ctx.core_ptr, off);
-    *ctx.cycles_pending = 0;
 }
 fn core_offset_of_interrupts() -> i32 {
     (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::cpu::mips_core::Hot, interrupts)) as i32
@@ -5857,6 +5878,10 @@ fn emit_exception_exit(ctx: &mut EmitCtx, status: Value) {
 /// branch target (§6.1.4 dual semantics), which is always a different,
 /// freshly-constructed `ctx` with its own default `bd = false`.
 fn emit_exception_exit_const(ctx: &mut EmitCtx, status: Value) {
+    // The faulting word was accounted before its semantics, as the
+    // interpreter counts a faulting instruction; count it and the rest of
+    // the batched run before leaving.
+    emit_store_pending_cycles(ctx);
     let fault_pc = emit_word_addr(ctx, ctx.word);
     let bd_val = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
     ctx.builder.ins().jump(ctx.exception_call_block, &[
@@ -5880,6 +5905,7 @@ fn emit_exception_exit_const(ctx: &mut EmitCtx, status: Value) {
 /// passes the loaded values as arguments. Two loads on a cold path, versus
 /// the stores every *other* site would otherwise have to pay on the hot one.
 fn emit_exception_exit_live(ctx: &mut EmitCtx, status: Value) {
+    emit_store_pending_cycles(ctx);
     let mem = MemFlagsData::trusted();
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
     let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
@@ -6749,6 +6775,12 @@ fn emit_branch_or_jump(
         _ => {
             // Annulling Likely branch: slot only emitted on the taken arm.
             let cond_val = emit_cond(ctx, raw, branch.cond);
+            // The pending count up to and including this branch. The taken
+            // arm adds the slot and flushes (the flush for this word's edges
+            // sits on its slot, `compute_cycles_flush`), which resets the
+            // compile-time count; the not-taken arm never runs the slot, so
+            // it starts again from here.
+            let pending_at_branch = *ctx.cycles_pending;
 
             let taken_block = ctx.builder.create_block();
             let not_taken_block = ctx.builder.create_block();
@@ -6784,6 +6816,16 @@ fn emit_branch_or_jump(
             // regardless of whether emit_slot_semantics terminated it.
             ctx.builder.switch_to_block(not_taken_block);
             ctx.builder.seal_block(not_taken_block);
+            *ctx.cycles_pending = pending_at_branch;
+            // The flush this edge needs was put on the slot, which does not
+            // run here. Flush on the arm instead when the edge leaves the
+            // region or lands where every arrival must have flushed: a
+            // branch target, an entry point, or `word + 2` reached also from
+            // the slot word as a head of its own. Otherwise the count
+            // carries into `word + 2`, the next head emitted.
+            if !foreign_page_slot && not_taken_edge_needs_flush(instrs, word) {
+                emit_flush_cycles(ctx);
+            }
             if foreign_page_slot {
                 // Nothing to arm — the annulled slot never executes, so
                 // there's no pending transfer to defer onto the next page's
@@ -6794,6 +6836,20 @@ fn emit_branch_or_jump(
                 let fallthrough_word = word + 2;
                 emit_target_edge(ctx, exit_block, block_for_word, instrs[word as usize].fallthrough_exit, fallthrough_word);
             }
+        }
+    }
+}
+
+/// Whether a Likely branch's not-taken edge, out of `word` past its
+/// annulled inline slot, needs the pending cycles count stored before it is
+/// taken: see the not-taken arm in `emit_branch_or_jump`.
+fn not_taken_edge_needs_flush(instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) -> bool {
+    let instr = &instrs[word as usize];
+    match instr.continues_to_fallthrough {
+        None => true,
+        Some(t) => {
+            let t = &instrs[t as usize];
+            t.is_branch_target || t.is_entry_point || !instrs[word as usize + 1].is_slot_only
         }
     }
 }
