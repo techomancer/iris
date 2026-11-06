@@ -1,13 +1,20 @@
-//! The 256-byte settings block the Indigo2 PROMs keep in a 93C56 EEPROM.
+//! The 256-byte settings block the Indy and Indigo2 PROMs keep in battery
+//! RAM (Indy) or a 93C56 EEPROM (Indigo2), shared by both models.
 //!
 //! The first byte is a checksum and the second a layout revision. Settings are
 //! NUL-terminated ASCII strings at fixed offsets, and the Ethernet address
 //! fills the last six bytes. A PROM that finds a bad checksum fills in its
-//! defaults; seeding a blank block with those values gives a new image the
-//! state a machine has when it leaves the factory.
-//! Layout and defaults: SGI IP22nvram.h and libsk/ml/nvram.c; checksum:
-//! IPXXprom/IPXXnvram.c nvchecksum().
+//! defaults, but only after it has played the boot tune, and the tune player
+//! skips itself when the volume string (offset 232) parses as zero. A new,
+//! blank image therefore makes the first boot silent, where a machine that left
+//! the factory with its block programmed chimes every time. Seeding the block
+//! with the values the PROM writes itself gives a new image the factory state.
+//! Layout, checksum and defaults come from reading back what the Indy and
+//! Indigo2 PROMs wrote into a blank block on first boot (the checksum
+//! reproduces the PROM's), and from the existing Indigo2 Impact seed.
 
+/// Layout revision the Indy (IP24) and Indigo2 (IP22) PROMs write.
+pub const REV_IP22: u8 = 8;
 /// Layout revision the Indigo2 Impact (IP28) PROM writes.
 pub const REV_IP26: u8 = 9;
 
@@ -60,7 +67,9 @@ pub fn write_defaults(block: &mut [u8; 256], rev: u8) {
 mod tests {
     use super::*;
 
-    /// Pin the algorithm on a hand-computed block.
+    /// The Indy PROM's own first-boot image checksummed to 0xBA with this
+    /// settings subset plus text it left in unused slots; the subset alone has
+    /// its own value, so pin the algorithm on a hand-computed block instead.
     #[test]
     fn checksum_matches_hand_computation() {
         let mut block = [0u8; 256];
@@ -74,10 +83,9 @@ mod tests {
     fn defaults_set_volume_and_survive_checksum() {
         let mut block = [0u8; 256];
         block[MAC_OFFSET..].copy_from_slice(&[8, 0, 0x69, 1, 2, 3]);
-        write_defaults(&mut block, REV_IP26);
+        write_defaults(&mut block, REV_IP22);
         assert_eq!(&block[232..234], b"80");
-        assert_eq!(block[235], b'0');
-        assert_eq!(&block[MAC_OFFSET..], &[8, 0, 0x69, 1, 2, 3]);
+        assert_eq!(block[235], 0);
         assert_eq!(block[0], checksum(&block));
         assert!(!is_erased(&block, 0));
     }
