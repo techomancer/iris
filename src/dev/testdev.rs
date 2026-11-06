@@ -359,24 +359,33 @@ pub fn dump_json(core: &MipsCore, tag: u32) -> String {
 
 impl TestDevice {
     /// Nanoseconds since `epoch`, latched so the HI read that follows sees the
-    /// same sample.
+    /// same sample. Under `ci_clock` it is the retired instructions times
+    /// `NS_PER_GUEST_CYCLE`, as CP0 Count is, so a guest that sizes its work by
+    /// this clock does the same work every run.
     fn latch_host_ns(&self) -> u64 {
+        #[cfg(not(feature = "ci_clock"))]
         let ns = self.epoch.elapsed().as_nanos() as u64;
+        #[cfg(feature = "ci_clock")]
+        let ns = self.icount().wrapping_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
         self.host_ns_latch.store(ns, Ordering::Relaxed);
         ns
     }
 
-    /// Retired guest instructions, latched the same way. Zero when no core is
-    /// attached (a guest reading a flat zero learns the counter is unusable
-    /// rather than getting a plausible-looking wrong number).
-    fn latch_icount(&self) -> u64 {
+    /// Retired guest instructions. Zero when no core is attached (a guest
+    /// reading a flat zero learns the counter is unusable rather than getting
+    /// a plausible-looking wrong number).
+    fn icount(&self) -> u64 {
         let guard = self.core.lock();
-        let n = match guard.as_ref() {
+        match guard.as_ref() {
             // SAFETY: see CorePtr — the CPU thread is the one issuing this load.
             Some(CorePtr(ptr)) => unsafe { (**ptr).hot.cycles },
             None => 0,
-        };
-        drop(guard);
+        }
+    }
+
+    /// `icount`, latched the same way as the host clock.
+    fn latch_icount(&self) -> u64 {
+        let n = self.icount();
         self.icount_latch.store(n, Ordering::Relaxed);
         n
     }
@@ -590,6 +599,26 @@ mod tests {
         let hi2 = d.read32((TEST_DEV_BASE + REG_HOST_NS_HI) as u64).data;
         let second = ((hi2 as u64) << 32) | lo2 as u64;
         assert!(second >= first, "host clock went backwards: {} -> {}", first, second);
+    }
+
+    #[test]
+    #[cfg(feature = "ci_clock")]
+    fn the_guest_clock_follows_retired_instructions_and_nothing_else() {
+        let d = TestDevice::new("unused");
+        let mut core = MipsCore::new();
+        d.attach_core(&core as *const MipsCore);
+        let read = |d: &TestDevice| {
+            let lo = d.read32((TEST_DEV_BASE + REG_HOST_NS_LO) as u64).data;
+            let hi = d.read32((TEST_DEV_BASE + REG_HOST_NS_HI) as u64).data;
+            ((hi as u64) << 32) | lo as u64
+        };
+        core.hot.cycles = 1_000;
+        let a = read(&d);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(read(&d), a, "wall time must not move the guest clock");
+        core.hot.cycles = 0x1_0000_0000;
+        assert_eq!(read(&d), 0x1_0000_0000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+        assert_eq!(a, 1_000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
     }
 
     #[test]

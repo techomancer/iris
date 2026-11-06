@@ -283,8 +283,8 @@ impl O2Machine {
             // join waits on workers parked on the Jitv2 lock it holds).
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
-                let stats = g.stats.clone();
-                g.compile_queue.start(bus.phys.clone() as Arc<dyn BusDevice>, stats);
+                drop(g);
+                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, bus.phys.clone() as Arc<dyn BusDevice>);
             }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);

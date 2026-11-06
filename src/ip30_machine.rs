@@ -438,8 +438,8 @@ impl OctaneMachine {
             }
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
-                let stats = g.stats.clone();
-                g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
+                drop(g);
+                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, phys.phys.clone() as Arc<dyn BusDevice>);
             }
         }
 

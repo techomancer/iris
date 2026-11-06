@@ -323,6 +323,7 @@ fn tail(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{JitCompile, TestDeviceClock};
 
     /// The whole embedded path end to end: build a machine, load the suite out
     /// of the binary, run it, parse what it printed. Quick mode so it is a test
@@ -413,6 +414,112 @@ mod tests {
         let config = u32::from_str_radix(run.machine.config.trim_start_matches("0x"), 16)
             .expect("the guest reports Config in hex");
         assert_eq!(config & 7, 3, "KSEG0 not cacheable: Config {:#x}", config);
+    }
+
+    /// A bare-metal program that sizes its work by the test device's clock, as
+    /// the suite does: count loop passes until 20 us have gone by, print the
+    /// count (big-endian) and exit.
+    fn clock_spin_elf() -> Vec<u8> {
+        const T0: u32 = 8; const T1: u32 = 9; const T2: u32 = 10; const T3: u32 = 11;
+        const T4: u32 = 12; const T5: u32 = 13; const S0: u32 = 16;
+        let i = |op: u32, rs: u32, rt: u32, imm: u32| (op << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFF);
+        let srl = |rd: u32, rt: u32, sa: u32| (rt << 16) | (rd << 11) | (sa << 6) | 0x02;
+        let ns = crate::dev::testdev::REG_HOST_NS_LO;
+        let code = [
+            i(0x0F, 0, T0, 0xBF40),         // lui   t0, 0xbf40       testdev, uncached
+            i(0x23, T0, T1, ns),            // lw    t1, ns(t0)       start
+            (S0 << 11) | 0x21,              // move  s0, zero
+            i(0x09, S0, S0, 1),             // loop: addiu s0, s0, 1
+            i(0x23, T0, T2, ns),            //       lw    t2, ns(t0)
+            (T2 << 21) | (T1 << 16) | (T3 << 11) | 0x23, // subu t3, t2, t1
+            i(0x0B, T3, T4, 20_000),        //       sltiu t4, t3, 20000
+            i(0x05, T4, 0, (-5i32) as u32), //       bne   t4, zero, loop
+            0,                              //       nop
+            srl(T5, S0, 24), i(0x2B, T0, T5, 4), // sw count byte 3 to PUTC
+            srl(T5, S0, 16), i(0x2B, T0, T5, 4),
+            srl(T5, S0, 8), i(0x2B, T0, T5, 4),
+            i(0x2B, T0, S0, 4),
+            i(0x2B, T0, 0, 0xC),            // sw    zero, EXIT(t0)
+            (0x02 << 26) | (0x0820_1000 >> 2), // j     spin, on the next page
+            0,
+        ];
+        // After the exit store the guest spins on a page of its own, through
+        // a register jump. A compiled loop never returns to the CPU thread to
+        // notice a stop; a jump through a register leaves the compiled
+        // region every time round.
+        let mut payload: Vec<u8> = code.iter().flat_map(|w| w.to_be_bytes()).collect();
+        payload.resize(0x1000, 0);
+        const T6: u32 = 14;
+        for w in [i(0x0F, 0, T6, 0x8820), i(0x0D, T6, T6, 0x1008), (T6 << 21) | 0x08, 0] {
+            payload.extend_from_slice(&w.to_be_bytes());
+        }
+        let vaddr: u32 = 0x8820_0000;
+        let mut v = vec![0u8; 84];
+        v[0..4].copy_from_slice(b"\x7fELF");
+        v[4] = 1; v[5] = 2; v[6] = 1;
+        v[16..18].copy_from_slice(&2u16.to_be_bytes());
+        v[18..20].copy_from_slice(&8u16.to_be_bytes());
+        v[24..28].copy_from_slice(&vaddr.to_be_bytes());
+        v[28..32].copy_from_slice(&52u32.to_be_bytes());
+        v[42..44].copy_from_slice(&32u16.to_be_bytes());
+        v[44..46].copy_from_slice(&1u16.to_be_bytes());
+        v[52..56].copy_from_slice(&1u32.to_be_bytes());
+        v[56..60].copy_from_slice(&84u32.to_be_bytes());
+        v[60..64].copy_from_slice(&vaddr.to_be_bytes());
+        v[68..72].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        v[72..76].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        v[76..80].copy_from_slice(&5u32.to_be_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    /// Run `clock_spin_elf` once on a machine built the way the runner builds
+    /// one. Returns what it printed.
+    fn run_clock_spin(deterministic: bool) -> Vec<u8> {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+                let done = Arc::new(AtomicBool::new(false));
+                let on_exit = { let done = done.clone(); Box::new(move |_| done.store(true, Ordering::Release)) };
+                let clock = if deterministic { TestDeviceClock::Guest } else { TestDeviceClock::Host };
+                let testdev = Arc::new(
+                    TestDevice::new_embedded(sink.clone(), on_exit, RunConfig::ALL).with_clock(clock));
+                let mut cfg = bench_config([32, 0, 0, 0], CpuModel::default());
+                if deterministic {
+                    cfg.jitv2.compile = JitCompile::Sync;
+                }
+                let mut machine = Box::new(Machine::new_with_testdev(cfg, Some(testdev)));
+                machine.load_elf_bytes(&clock_spin_elf(), "clock-spin.elf").expect("load");
+                machine.start();
+                machine.cpu_start();
+                let started = Instant::now();
+                while !done.load(Ordering::Acquire) {
+                    assert!(started.elapsed() < Duration::from_secs(60), "the guest never exited");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                machine.stop();
+                let out = sink.lock().clone();
+                out
+            })
+            .expect("spawn")
+            .join()
+            .expect("the machine panicked")
+    }
+
+    /// Deterministic mode makes a guest that sizes its work by time do the
+    /// same work every run: the same loop count, whatever else the host is
+    /// doing.
+    #[test]
+    fn deterministic_mode_repeats_a_time_sized_guest_exactly() {
+        let a = run_clock_spin(true);
+        let b = run_clock_spin(true);
+        assert_eq!(a.len(), 4, "the guest prints its loop count: {a:?}");
+        assert_eq!(a, b, "two deterministic runs must agree");
+        // A pass is six instructions at 4 ns each, so 20 us is about 833 of
+        // them, give or take the setup and the reads at the edges.
+        let passes = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
+        assert!((830..=837).contains(&passes), "loop count {passes} does not follow the guest clock");
     }
 
     #[test]
