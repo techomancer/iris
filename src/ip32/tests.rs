@@ -1079,3 +1079,54 @@ fn the_rtc_survives_a_relaunch_in_its_file() {
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&clock).ok();
 }
+
+/// A PROM file in the installer's form: `ip32prom.image` is the flash
+/// contents behind a 256-byte header ("PROM", then the payload length at +12).
+fn wrapped_prom(payload: &[u8], said: u32) -> Vec<u8> {
+    let mut image = vec![0u8; 0x100];
+    image[..4].copy_from_slice(b"PROM");
+    image[8..12].copy_from_slice(&0x4400u32.to_be_bytes());
+    image[12..16].copy_from_slice(&said.to_be_bytes());
+    image.extend_from_slice(payload);
+    image
+}
+
+/// The installer's `ip32prom.image` is 431,616 bytes of the 512 KiB flash.
+/// Run as it comes it jumps through a wrong section table and hangs in the
+/// PROM's fatal-error spin, so the machine never reaches audio. The loader
+/// must take the payload and fill the rest of the flash with erased bytes.
+#[test]
+fn a_wrapped_prom_image_is_unwrapped_into_a_full_flash() {
+    let payload: Vec<u8> = (0..0x6_9600u32).map(|i| (i % 251) as u8).collect();
+    let flash = Ip32Bus::unwrap_prom_image(wrapped_prom(&payload, payload.len() as u32)).unwrap();
+    assert_eq!(flash.len(), PROM_SIZE as usize);
+    assert_eq!(flash[..payload.len()], payload[..]);
+    assert!(flash[payload.len()..].iter().all(|&b| b == 0xff), "the rest is erased flash");
+}
+
+/// The raw flash (`ip32prom.rev4.18.bin`) is used as it is, whatever its
+/// first bytes.
+#[test]
+fn a_raw_512k_prom_image_is_left_alone() {
+    let mut raw: Vec<u8> = (0..PROM_SIZE).map(|i| (i % 253) as u8).collect();
+    assert_eq!(Ip32Bus::unwrap_prom_image(raw.clone()).unwrap(), raw);
+    raw[..4].copy_from_slice(b"PROM");
+    assert_eq!(Ip32Bus::unwrap_prom_image(raw.clone()).unwrap(), raw);
+}
+
+/// A file that is neither form is refused with the reason, not run: the PROM
+/// would park the CPU without a message.
+#[test]
+fn a_prom_file_that_is_neither_form_is_refused() {
+    let payload = vec![0x11u8; 0x1000];
+    let e = Ip32Bus::unwrap_prom_image(wrapped_prom(&payload, 0x2000)).unwrap_err();
+    assert!(e.contains("says 8192 bytes of payload") && e.contains("holds 4096"), "{e}");
+    let e = Ip32Bus::unwrap_prom_image(wrapped_prom(&vec![0; PROM_SIZE as usize + 1], PROM_SIZE + 1)).unwrap_err();
+    assert!(e.contains("more than"), "{e}");
+    let e = Ip32Bus::unwrap_prom_image(b"PROM\0\0".to_vec()).unwrap_err();
+    assert!(e.contains("shorter than"), "{e}");
+    for len in [0, 4096, PROM_SIZE as usize - 1, PROM_SIZE as usize + 1] {
+        let e = Ip32Bus::unwrap_prom_image(vec![0x5a; len]).unwrap_err();
+        assert!(e.contains(&format!("{len} bytes is neither")), "{e}");
+    }
+}

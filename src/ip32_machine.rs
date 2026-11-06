@@ -166,6 +166,7 @@ impl O2Machine {
         let prom_path = MachineProfile::O2Ip32.prom_path(&cfg.prom);
         let prom = std::fs::read(&prom_path)
             .map_err(|e| format!("O2 PROM {prom_path}: {e} (set `prom` to the O2 PROM image; 4.18 is the last release)"))?;
+        let prom = Ip32Bus::unwrap_prom_image(prom).map_err(|e| format!("O2 PROM {prom_path}: {e}"))?;
         // `banks`: the kit in each DIMM pair from A (validate checked them).
         let kits = cfg.o2_kits();
         let mem = O2Memory::from_kits(&kits)?;

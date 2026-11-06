@@ -475,6 +475,46 @@ impl Ip32Bus {
         self.nvme.get().map_or(Ok(()), |n| n.scsi_bus().flush())
     }
 
+    /// The flash contents of a PROM file, in either of the two forms an O2
+    /// PROM comes in:
+    ///
+    /// - the raw 512 KiB flash (`ip32prom.rev4.18.bin`), used as it is;
+    /// - the installer's `ip32prom.image`: the flash behind a 256-byte header,
+    ///   "PROM", then the payload's length at +12 (big-endian). The payload is
+    ///   shorter than the 512 KiB part, and the rest of an erased part reads
+    ///   0xff.
+    ///
+    /// Anything else is an error: a PROM run from the wrong place parks the
+    /// CPU in the fatal-error spin without a word, which is hard to tell from
+    /// a hang.
+    pub fn unwrap_prom_image(file: Vec<u8>) -> Result<Vec<u8>, String> {
+        const HEADER: usize = 0x100;
+        let flash = PROM_SIZE as usize;
+        if file.len() == flash {
+            return Ok(file);
+        }
+        if !file.starts_with(b"PROM") {
+            return Err(format!(
+                "{} bytes is neither a raw {flash}-byte flash image nor an installer image (which starts \"PROM\")",
+                file.len()));
+        }
+        if file.len() < HEADER {
+            return Err(format!("installer image is {} bytes, shorter than its {HEADER}-byte header", file.len()));
+        }
+        let payload = file.len() - HEADER;
+        let said = u32::from_be_bytes(file[12..16].try_into().unwrap()) as usize;
+        if said != payload {
+            return Err(format!(
+                "installer image header says {said} bytes of payload but the file holds {payload} after the header"));
+        }
+        if payload > flash {
+            return Err(format!("installer image payload is {payload} bytes, more than the {flash}-byte flash"));
+        }
+        let mut image = file[HEADER..].to_vec();
+        image.resize(flash, 0xff);
+        Ok(image)
+    }
+
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
     /// size no O2 can have, one bank of it (power-of-two sizes only). `prom`
     /// must be the raw 512 KiB IP32 PROM image.

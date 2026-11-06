@@ -65,6 +65,16 @@ graphics explicitly out of scope.
 genuine IP32 firmware. Verified by parsing the section table rather than
 trusting the filenames.
 
+The installer's `ip32prom.image` (IRIX 6.5.30, 431,872 bytes, sha256
+`11230c35...fb23c`) is the same flash behind a 256-byte header: `PROM`, the
+payload length 431,616 at +12 (big-endian). Its payload equals the 4.18 file
+except in the `env` section, where 4.18 carries a stock environment
+(`AutoLoad`, `console`, `diskless`, `dbaud`, `volume`, `sgilogo`, an address
+and `crt_option`: 120 bytes differing at 0x4040 and its checksum word at
+0x43fc) and 6.5.30 has it blank (the PROM then writes the same defaults on
+first boot; the boot chime's PCM is byte-identical for both). iris takes both
+forms (`unwrap_prom_image` in `src/ip32.rs`); a file that is neither is refused.
+
 Rev 4.18:
 
 | SHDR @ | name | length | version | load |

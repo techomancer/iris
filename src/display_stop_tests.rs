@@ -83,7 +83,9 @@ pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) 
     cfg.nveeprom = dir.join("nveeprom").to_string_lossy().into_owned();
     if matches!(profile, MachineProfile::OctaneIp30 | MachineProfile::O2Ip32) {
         let prom = dir.join("prom.bin");
-        std::fs::write(&prom, vec![0u8; 1 << 20]).unwrap();
+        // The O2 loads only a whole flash (512 KiB) or the installer's image.
+        let len = if profile == MachineProfile::O2Ip32 { 1 << 19 } else { 1 << 20 };
+        std::fs::write(&prom, vec![0u8; len]).unwrap();
         cfg.prom = prom.to_string_lossy().into_owned();
     }
     // The O2's GBE is its own display; it has no `[graphics] board`.
