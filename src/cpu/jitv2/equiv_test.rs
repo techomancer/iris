@@ -8047,4 +8047,60 @@ mod tests {
         assert_eq!(interp, 3);
         assert_eq!(jit, 3);
     }
+
+
+    /// A region entered from outside at a word that flushes the count (a CP0
+    /// fallback head, or a word whose fallthrough lands on a branch target)
+    /// counts that word, as the interpreter does. The flush store sat in the
+    /// entry word's ordinary block, which only internal edges run; an
+    /// external dispatch jumps past it to the body block. A TLB refill
+    /// handler opens with `dmfc0` and is entered this way on every refill,
+    /// so the bench suite's sys/tlb_miss counted 25 instructions per refill
+    /// compiled against 26 interpreted.
+    #[cfg(not(feature = "lightning"))]
+    #[test]
+    fn region_entered_at_a_flushing_word_counts_it() {
+        use crate::cpu::mips_isa::*;
+        let dmfc0 = |rt: u32, rd: u32| make_r(OP_COP0, RS_DMFC0, rt, rd, 0, 0);
+        let dmtc0 = |rt: u32, rd: u32| make_r(OP_COP0, RS_DMTC0, rt, rd, 0, 0);
+        let tlbwr = make_r(OP_COP0, 0x10, 0, 0, 0, FUNCT_TLBWR);
+        let jr_ra = make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        // Where each run stops: the refill handler's tlbwr, which ends the
+        // region, or the target of the loop's jr ra.
+        let tlbwr_pc = 0xFFFF_FFFF_8000_101Cu64;
+        let ra = 0xFFFF_FFFF_8000_3000u64;
+        // (name, code, a0, stop, instructions retired before it)
+        let cases: [(&str, Vec<u32>, u64, u64, u64); 2] = [
+            // The shape of a TLB refill handler: BadVAddr into an EntryLo,
+            // stopping at the tlbwr.
+            ("refill handler", vec![
+                dmfc0(26, 8),
+                make_r(OP_SPECIAL, 0, 26, 26, 13, FUNCT_DSRL),
+                make_r(OP_SPECIAL, 0, 26, 26, 6, FUNCT_DSLL),
+                make_i(OP_ORI, 26, 26, 0x1F),
+                dmtc0(26, 2),
+                0,
+                0,
+                tlbwr,
+            ], 0, tlbwr_pc, 7),
+            // The entry word falls through into a loop head.
+            ("entry before loop head", vec![
+                make_i(OP_ADDIU, 5, 5, 1),
+                make_i(OP_ADDIU, 4, 4, 0xFFFF),
+                make_i(OP_BNE, 4, 0, 0xFFFE), make_i(OP_ADDIU, 6, 6, 1), // back to word 1
+                jr_ra, 0,
+            ], 3, ra, 1 + 3 * 3 + 2),
+        ];
+        for (name, code, a0, end, expected) in cases {
+            let mut gpr = [0u64; 32];
+            gpr[4] = a0;
+            gpr[31] = ra;
+            let (interp, interp_state) = run_counting(&code, gpr, 0, end, 1000, false);
+            let (jit, jit_state) = run_counting(&code, gpr, 0, end, 1000, true);
+            assert_eq!(interp_state.pc, end, "{name}: interpreter did not reach the end");
+            assert_eq!(jit_state, interp_state, "{name}: JIT and interpreter diverged");
+            assert_eq!(interp, expected, "{name}: interpreter retired-instruction count");
+            assert_eq!(jit, expected, "{name}: JIT retired-instruction count");
+        }
+    }
 }
