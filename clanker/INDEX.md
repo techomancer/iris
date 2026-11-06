@@ -367,6 +367,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 | Note | Kind | Title |
 |---|---|---|
 | [cpu-tests-make-dry-run-is-a-fork-bomb.md](testing/cpu-tests-make-dry-run-is-a-fork-bomb.md) | rule | `make -n` in cpu-tests recurses without end: 11k processes and an OOM |
+| [ci-unattended-irix-boot.md](testing/ci-unattended-irix-boot.md) | howto | Unattended IRIX boot under `--ci`: seed NVRAM first, and what the boot test needs from the disk |
 | [arcs-console-from-bare-metal.md](testing/arcs-console-from-bare-metal.md) | howto | Calling ARCS firmware from the bare-metal harness |
 | [bare-metal-harness-platform-assumptions.md](testing/bare-metal-harness-platform-assumptions.md) | howto | What the bare-metal suites assume about the machine |
 | [benchmark-suite-gotchas.md](testing/benchmark-suite-gotchas.md) | howto | Writing benchmark kernels for `bench/` — things that bit |

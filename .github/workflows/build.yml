@@ -8,6 +8,9 @@
 # behind as workflow artifacts. Run it by hand (Actions > Build > Run workflow)
 # to check that a branch builds everywhere without publishing anything.
 #
+# The boot-test job then boots IRIX 5.3 with the Linux, macOS and Windows CLI
+# builds, when the IRIX53_BOOT_IMAGE_URL secret is set.
+#
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
 # and macos-26 keeps the macOS job off GitHub's moving `macos-latest`.
@@ -361,6 +364,117 @@ jobs:
           name: dist-linux-riscv64
           path: dist/*
           if-no-files-found: error
+
+  # Boots IRIX 5.3 to a login prompt with the CLI just built, through
+  # scripts/ci-boot-test.sh. The disk image comes from the
+  # IRIX53_BOOT_IMAGE_URL secret; without it every step is skipped and the job
+  # passes with a warning. nightly.yml and release.yml publish only if this
+  # whole workflow succeeds, so a failed boot stops the publish.
+  boot-test:
+    name: Boot test (${{ matrix.os }}-${{ matrix.arch }})
+    needs: [version, windows, macos, linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      VER: ${{ needs.version.outputs.version }}
+      BOOT_TIMEOUT: 900
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: x64,       runner: ubuntu-24.04 }
+          - { os: macos,   arch: universal, runner: "${{ inputs.macos_runner || 'macos-26' }}" }
+          - { os: windows, arch: x64,       runner: windows-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check for the disk image secret
+        id: image
+        env:
+          IMAGE_URL: ${{ secrets.IRIX53_BOOT_IMAGE_URL }}
+        run: |
+          if [ -z "$IMAGE_URL" ]; then
+            echo "::warning::IRIX53_BOOT_IMAGE_URL is not set - boot test skipped."
+            echo "### Boot test skipped: \`IRIX53_BOOT_IMAGE_URL\` secret not set" >> "$GITHUB_STEP_SUMMARY"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if command -v sha256sum >/dev/null; then
+            HASH=$(printf '%s' "$IMAGE_URL" | sha256sum | cut -c1-16)
+          else
+            HASH=$(printf '%s' "$IMAGE_URL" | shasum -a 256 | cut -c1-16)
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          echo "hash=$HASH"   >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: ${{ steps.image.outputs.present == 'true' }}
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+
+      - name: Download the CLI build
+        if: ${{ steps.image.outputs.present == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist
+
+      - name: Unpack the CLI build
+        if: ${{ steps.image.outputs.present == 'true' }}
+        run: |
+          mkdir -p core
+          if [ "${{ matrix.os }}" = windows ]; then
+            7z x -ocore "dist/IRIS-cli-windows-${{ matrix.arch }}-${VER}.zip"
+          else
+            tar -C core -xzf "dist/IRIS-cli-${{ matrix.os }}-${{ matrix.arch }}-${VER}.tar.gz"
+          fi
+          ls -la core
+
+      # The CLI links libGL through the hostgl feature.
+      - name: Install runtime libraries
+        if: ${{ steps.image.outputs.present == 'true' && matrix.os == 'linux' }}
+        run: sudo apt-get update && sudo apt-get install -y libasound2t64 libgl1
+
+      - name: Restore the disk image
+        if: ${{ steps.image.outputs.present == 'true' }}
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: boot-image
+          key: irix53-boot-image-${{ steps.image.outputs.hash }}
+
+      - name: Download the disk image
+        if: ${{ steps.image.outputs.present == 'true' && steps.cache.outputs.cache-hit != 'true' }}
+        env:
+          IMAGE_URL: ${{ secrets.IRIX53_BOOT_IMAGE_URL }}
+        run: |
+          mkdir -p boot-image
+          curl -fL --retry 3 --retry-delay 10 -o boot-image/irix53.chd "$IMAGE_URL"
+          ls -la boot-image
+
+      - name: Save the disk image to the cache
+        if: ${{ steps.image.outputs.present == 'true' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: boot-image
+          key: irix53-boot-image-${{ steps.image.outputs.hash }}
+
+      - name: Boot IRIX 5.3 to the login prompt
+        if: ${{ steps.image.outputs.present == 'true' }}
+        run: bash scripts/ci-boot-test.sh core boot-image/irix53.chd boot-test "$BOOT_TIMEOUT"
+
+      # Named boot-test-*, so the publish jobs' dist-* download leaves it out.
+      - name: Upload the boot test results
+        if: ${{ always() && steps.image.outputs.present == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: boot-test-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            boot-test/*.png
+            boot-test/*.log
+            boot-test/boot-test.toml
+          if-no-files-found: warn
 
   # Everything the downloads table links to must exist before anyone publishes.
   check:
