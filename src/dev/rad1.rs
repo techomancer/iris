@@ -300,6 +300,10 @@ struct Sink {
     /// When the host stream was last tried and failed to open.
     host_failed_at: Option<Instant>,
     wav: Option<Wav>,
+    /// IRIS_AUDIO_DUMP=<file>: every frame the card plays at its own rate,
+    /// before resampling, with or without a host sound device. A muted card
+    /// records the silence it plays.
+    dump: Option<crate::dev::audio_dump::AudioDump>,
     tap: Option<Arc<Mutex<Vec<i16>>>>,
 }
 
@@ -333,6 +337,9 @@ impl Sink {
         }
         if let Some(w) = self.wav.as_mut() {
             w.play(host_pcm, rate);
+        }
+        if let Some(d) = self.dump.as_ref() {
+            d.record(None, rate, host_pcm.chunks_exact(PCM_CHANNELS).map(|p| (p[0], p[1])));
         }
         if let Some(t) = self.tap.as_ref() {
             t.lock().extend_from_slice(pcm);
@@ -994,7 +1001,8 @@ impl Inner {
             }
             None => {
                 let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
-                *sink = Some(Sink { host, host_failed_at: failed_at, wav, tap: None });
+                let dump = crate::dev::audio_dump::AudioDump::from_env();
+                *sink = Some(Sink { host, host_failed_at: failed_at, wav, dump, tap: None });
             }
         }
     }

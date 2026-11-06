@@ -542,7 +542,7 @@ fn the_wav_capture_stays_at_44100_whatever_the_card_rate() {
     let dir = std::env::temp_dir().join(format!("rad1-wav-rate-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("o.wav");
-    let mut sink = Sink { host: None, host_failed_at: None, wav: Wav::create(path.as_os_str()), tap: None };
+    let mut sink = Sink { host: None, host_failed_at: None, wav: Wav::create(path.as_os_str()), dump: None, tap: None };
     sink.play(&[0i16; 2 * 2205], 22050, false);
     sink.play(&[0i16; 2 * 4410], 44100, false);
     let b = std::fs::read(&path).unwrap();
@@ -875,7 +875,7 @@ fn host_frames_encode_into_ring_frames() {
 fn output_ring_reaches_the_sink() {
     let (r, ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: Some(tap.clone()) });
     // A 512-frame ring (4 KiB), each frame left = n, right = -n.
     {
         let mut m = ram.0.lock().unwrap();
@@ -913,7 +913,7 @@ fn output_ring_reaches_the_sink() {
 fn input_ring_is_not_played() {
     let (r, _ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: Some(tap.clone()) });
     program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
     wr(&r, 0x4c, 1);
     at(&r, 1_000_000);
@@ -1019,7 +1019,7 @@ fn a_recorded_adat_frame_plays_back_unchanged() {
 #[test]
 fn a_failed_host_open_is_retried_after_a_wait() {
     let now = Instant::now();
-    let mut sink = Sink { host: None, host_failed_at: None, wav: None, tap: None };
+    let mut sink = Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: None };
     assert!(sink.host_retry_due(now), "never tried");
     sink.host_failed_at = Some(now);
     assert!(!sink.host_retry_due(now), "just failed");
@@ -1030,7 +1030,7 @@ const SEC: i64 = 1_000_000_000;
 
 fn tapped(r: &Rad1) -> Arc<parking_lot::Mutex<Vec<i16>>> {
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, dump: None, tap: Some(tap.clone()) });
     tap
 }
 
@@ -1462,4 +1462,27 @@ fn a_corrupt_save_is_refused_naming_the_field() {
         let e = card().load_state(&v).expect_err(want);
         assert!(e.contains(want), "{want}: got {e}");
     }
+}
+
+#[test]
+fn the_dump_records_each_burst_at_the_card_rate() {
+    let dir = std::env::temp_dir().join(format!("rad1-dump-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("o.dump");
+    let mut sink = Sink { host: None, host_failed_at: None, wav: None, dump: crate::dev::audio_dump::AudioDump::create(path.as_os_str()), tap: None };
+    sink.play(&[1, -2, 300, -400], 44100, false);
+    sink.play(&[i16::MIN, i16::MAX], 32000, false);
+    // A muted card plays silence, and the dump records what is played.
+    sink.play(&[5, 6], 32000, true);
+    let b = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut want = Vec::new();
+    for (rate, pcm) in [(44100u32, vec![1i16, -2, 300, -400]), (32000, vec![i16::MIN, i16::MAX]), (32000, vec![0, 0])] {
+        want.extend_from_slice(&rate.to_le_bytes());
+        want.extend_from_slice(&((pcm.len() / 2) as u32).to_le_bytes());
+        for v in pcm {
+            want.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    assert_eq!(b, want);
 }
