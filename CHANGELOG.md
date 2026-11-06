@@ -13,6 +13,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Boot test before publishing
+
+- `build.yml` can boot IRIX 5.3 to a login prompt on Linux, macOS and Windows
+  with the CLI it just built, and a failed boot stops the nightly or release
+  from publishing. It runs when the `IRIX53_BOOT_IMAGE_URL` secret is set.
+
 ### Networking
 
 - IRIX 6.5.30 guests mount the NFS share with a plain `mount`: the
