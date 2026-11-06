@@ -2114,6 +2114,15 @@ macro_rules! step_preamble {
 
         let pc = $self.core.pc;
 
+        // For the trace: IP7 pending and not deliverable here.
+        crate::pf_level!(
+            crate::perfetto::events::IP7_HELD_LEVEL,
+            crate::perfetto::events::IP7_HELD,
+            pending as u32 & crate::cpu::mips_core::CAUSE_IP7 != 0
+                && !($self.core.interrupts_enabled() && $self.core.cp0_status & crate::cpu::mips_core::CAUSE_IP7 != 0),
+            (($self.core.cp0_status as u64) << 32) | (pc & 0xffff_ffff)
+        );
+
         // Spin/idle-loop PC sampler. Armed lock-free via the shared atomic, so
         // the CPU is never paused/resumed to enable it (resuming corrupts a
         // live kernel). Inert (one relaxed load + branch) when disarmed.
@@ -3022,6 +3031,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// may have made the flush unnecessary.
     #[cfg(feature = "jitv2")]
     pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
+        crate::pf_scope!(crate::perfetto::events::JIT_CPU_FLUSH);
         let bus = self.sysad.clone();
         let jit = self.jitv2.clone();
         let flush = || {
@@ -3160,8 +3170,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // whatever it was pinned to).
         let fr1 = (self.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
 
-        let mut jit = self.jitv2.lock();
-        let lookup = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1);
+        let (mut jit, lookup) = {
+            crate::pf_scope!(crate::perfetto::events::JIT_CPU_TRACK);
+            let mut jit = self.jitv2.lock();
+            let lookup = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1);
+            (jit, lookup)
+        };
         match lookup {
             Some(slot) => {
                 // Assigned directly rather than through `set_pcp`: the
@@ -3284,6 +3298,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.update_translate_fn();
         self.update_fpr_mode();
         self.nanotlb_invalidate();
+        // The clock interrupt's mask, for the trace (IE and IM7; see
+        // events::IP7_MASKED).
+        crate::pf_level!(
+            crate::perfetto::events::IP7_MASKED_LEVEL,
+            crate::perfetto::events::IP7_MASKED,
+            self.core.cp0_status & crate::cpu::mips_core::STATUS_IE == 0 || self.core.cp0_status & (1 << (crate::cpu::mips_core::STATUS_IM_SHIFT + 7)) == 0
+        );
         #[cfg(feature = "cache-ecc")]
         self.sync_cache_error_control();
     }

@@ -60,6 +60,19 @@ pub static IP7_LEVEL: crate::PfLevel = crate::PfLevel::new();
 /// The CPU took an interrupt exception (arg: Cause.IP & Status.IM >> 8).
 pub static INT_TAKEN: EventDef = EventDef::new("interrupt taken", cat::CPU | cat::IRQ).with_arg("ip");
 
+/// The guest has the clock interrupt masked: Status IE clear or IM7 clear
+/// (IRIX's spl levels; EXL and ERL, held only for an exception's entry, are
+/// left out to keep the edge rate down). A slice here while IP7 is raised is
+/// the guest's own hold-off of its clock tick.
+pub static IP7_MASKED: EventDef = EventDef::new("IP7 masked (Status)", cat::CPU | cat::IRQ).on_track("IP7 masked (Status)").in_group(PIN_GROUP);
+pub static IP7_MASKED_LEVEL: crate::PfLevel = crate::PfLevel::new();
+/// IP7 is pending but the CPU cannot take it (interrupts disabled by IE,
+/// EXL or ERL, or IM7 clear), seen at the instruction boundaries where a
+/// pending interrupt is examined (arg at the rising edge: Status << 32 | the
+/// PC's low 32 bits).
+pub static IP7_HELD: EventDef = EventDef::new("IP7 pending, held", cat::CPU | cat::IRQ).on_track("IP7 pending, held").in_group(PIN_GROUP).with_arg("status<<32|pc");
+pub static IP7_HELD_LEVEL: crate::PfLevel = crate::PfLevel::new();
+
 // ── HPC3 peripheral DMA ──────────────────────────────────────────────────────
 
 macro_rules! pdma {
@@ -123,6 +136,14 @@ pub static HAL2_ARM: EventDef = EventDef::new("arm", cat::AUDIO).on_track("HAL2"
 pub static HAL2_DISARM: EventDef = EventDef::new("disarm", cat::AUDIO).on_track("HAL2").in_group(AUDIO_GROUP).with_arg("codec");
 /// The host audio callback found the ring empty (arg: underruns so far).
 pub static HAL2_UNDERRUN: EventDef = EventDef::new("host underrun", cat::AUDIO).on_track("HAL2").in_group(AUDIO_GROUP).with_arg("total");
+/// Octane RAD: a continuous status DMA completion (arg: the slot written),
+/// and the slots the driver has not yet consumed after it. The driver warns
+/// "RAD thread held off" when it finds all but one of the ring's slots done.
+pub static RAD_STATUS: EventDef = EventDef::new("status slot", cat::AUDIO).on_track("RAD").in_group(AUDIO_GROUP).with_arg("slot");
+pub static RAD_STATUS_UNREAD: EventDef = EventDef::new("RAD status slots unread", cat::AUDIO).in_group(AUDIO_GROUP);
+/// A RAD completion found the host had held up the timer thread (arg:
+/// microseconds late).
+pub static RAD_LATE: EventDef = EventDef::new("late completion", cat::AUDIO).on_track("RAD").in_group(AUDIO_GROUP).with_arg("us");
 
 // ── Newport (REX3) ───────────────────────────────────────────────────────────
 
@@ -287,6 +308,11 @@ pub static ODSY_DRAIN: EventDef = EventDef::new("drain", cat::GFX).with_arg("wai
 /// its jobs before it touches the planes itself (arg: jobs pending).
 pub static ODSY_RASTER_SLICE: EventDef = EventDef::new("raster slice", cat::GFX).with_arg("pending");
 pub static ODSY_RASTER_WAIT: EventDef = EventDef::new("raster wait", cat::GFX).with_arg("pending");
+/// The processor retrying one VPro access the bus answered busy, from its
+/// first refusal until the access completes (arg: aperture offset). The
+/// processor takes its enabled interrupts in between.
+pub static ODSY_BUSY: EventDef = EventDef::new("VPro access busy", cat::GFX | cat::CPU).on_track("VPro access busy").in_group(GFX_GROUP).with_arg("offset");
+pub static ODSY_BUSY_LEVEL: crate::PfLevel = crate::PfLevel::new();
 /// A page-table DMA descriptor run (arg: table address).
 pub static ODSY_DMA: EventDef = EventDef::new("dma descriptor", cat::GFX | cat::DMA).with_arg("table");
 /// The DMA-done interrupt raised after a transfer that asked for it.
@@ -321,3 +347,9 @@ pub static JIT_HOT_REQUEST: EventDef = EventDef::new("hot request", cat::JIT).wi
 /// A page compile: on a jitv2-compile thread, or on the CPU thread in
 /// inline-compile mode.
 pub static JIT_COMPILE: EventDef = EventDef::new("compile", cat::JIT);
+/// The CPU thread flushing the code pool when it has run out of pages
+/// (`jitv2_flush_from_here`): the vCPU runs no guest code meanwhile.
+pub static JIT_CPU_FLUSH: EventDef = EventDef::new("pool flush (CPU thread)", cat::JIT | cat::CPU);
+/// The CPU thread taking the JIT's lock to track a code page it has just
+/// arrived on (`jitv2_track_pcp`), including any wait for another holder.
+pub static JIT_CPU_TRACK: EventDef = EventDef::new("track page (CPU thread)", cat::JIT | cat::CPU);
