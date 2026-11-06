@@ -239,8 +239,13 @@ def act_pull(args):
 
 def act_mount_shared(args):
     def go(s):
+        # UDP first: IRIX 6.5.30 asks for TCP by default and the share is
+        # served over UDP only; a mount without the option is the fallback
+        # for releases that do not know it.
+        share = f"{args.nfs_host}:/shared"
         out, rc = s.run("mkdir -p /shared; (mount | grep -q ' /shared ') || "
-                        f"mount {args.nfs_host}:/shared /shared; mount | grep ' /shared '",
+                        f"mount -o proto=udp {share} /shared || mount {share} /shared; "
+                        "mount | grep ' /shared '",
                         args.timeout)
         sys.stdout.write(out)
         return rc

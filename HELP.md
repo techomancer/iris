@@ -412,6 +412,13 @@ The export is a single root, so mount it as `/`:
 # ls /shared
 ```
 
+IRIX 6.5.30 asks for the mount service over TCP first, and the share is served
+over UDP only, so on 6.5.30 add `-o proto=udp`:
+
+```
+# mount -o proto=udp 192.168.0.1:/ /shared
+```
+
 Use the gateway address shown in the GUI (it tracks your NAT subnet). The server
 fakes uid/gid/mode so the export behaves the same regardless of the host OS. The one
 mode bit it keeps is the execute bit (on Unix hosts): a file the host marks
