@@ -2018,14 +2018,19 @@ impl Codegen {
             // the interpreter's step() re-entering at this same PC within
             // the *same* step() call, which already incremented once at its
             // own entry; incrementing here too would double-count).
-            emit_account_for_cycles(&mut ctx, instrs, word);
-
+            //
+            // An entry word with a body block is accounted inside it: an
+            // external dispatch jumps straight there, past this block, so a
+            // flush emitted here (a fallback head, a word whose edge lands on
+            // a loop head) ran only for internal arrivals and the external
+            // one lost the word.
             if is_entry_point {
                 if let Some(&body_block) = entry_body_blocks.get(&word) {
                     ctx.builder.ins().jump(body_block, &[]);
                     ctx.builder.switch_to_block(body_block);
                 }
             }
+            emit_account_for_cycles(&mut ctx, instrs, word);
 
             if instrs[word as usize].is_fallback {
                 // Interpreter-fallback head (analyzer kept an Excluded word in
