@@ -11,6 +11,12 @@ flush it, and rename it over the previous image. A failed write leaves the
 previous image intact and reports an error. A forced process termination does
 not run Stop.
 
+## Fresh Indy and Indigo2 NVRAM
+
+A new `nvram.bin` (Indy) or `nveeprom.bin` (IP22) that is blank apart from the
+Ethernet address is seeded with the PROM defaults too, so the first boot plays
+its chime; see [boot chimes](boot-chimes.md).
+
 ## Fresh IP28 EEPROMs
 
 The IP28 PROM reads `volume` for the boot tune before it initializes an erased
