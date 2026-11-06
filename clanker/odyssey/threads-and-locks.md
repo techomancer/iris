@@ -157,9 +157,14 @@ Sync points kept, each because the hardware has it:
   and arms the swap after its fence never shows a mix of two frames. The
   host-interface lock only serialises the register file the swap bank lives
   in; the display holds it for a few instructions.
-- **Fences, queries and sync words.** A completion job runs behind the
-  draws queued before it, so a guest that waits for one before it arms a
-  swap has its drawing in memory when the swap latches.
+- **Fences, queries and sync words.** A completion runs behind the draws
+  queued before it, so a guest that waits for one before it arms a swap
+  has its drawing in memory when the swap latches. The raster thread does
+  not drain for it: it parks the completion in the quad ring at the ring's
+  current position (`QuadRing::complete`), and the completion runs when
+  the ring retires past that position. The raster thread meanwhile sets up
+  the jobs behind it. With nothing else queued it drains rather than
+  sleep, so the guest is not kept waiting.
 - **Waiting reads.** A register read that waits drains the command FIFO and
   the raster queue (rule 2 below).
 
@@ -250,8 +255,9 @@ must keep them.
    whatever the enable mask says; it reaches the driver only while enabled.
 5. Completion words are written when the raster unit is done with the work
    before them: fences and a current-state query's publication (snapshot,
-   counter, sync word) run as raster jobs; the context-switch done word
-   waits for the raster queue to empty.
+   counter, sync word) run once the quad ring retires past the quads
+   queued before them; the context-switch done word waits for the raster
+   queue to empty.
 6. Stopping the machine finishes the command FIFO and then the raster queue;
    a reset abandons the waiting stores and waits for the raster queue before
    it clears the planes.

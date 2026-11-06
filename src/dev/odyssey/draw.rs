@@ -99,7 +99,7 @@ impl Board {
         let base = (((self.widget.host_write_addr_upper & 0xffff) as u64) << 32) | self.widget.host_write_addr_lower as u64;
         let (guest, front) = (self.guest.clone(), self.front.clone());
 
-        self.raster.submit_completion(move |_| {
+        self.raster.submit_completion(move || {
             write_guest(&guest, base.wrapping_add(2 * slot as u64), &(token as u16).to_be_bytes());
             if word & dma::FENCE_INTERRUPT != 0 {
                 front.lock().deliver_softsync();

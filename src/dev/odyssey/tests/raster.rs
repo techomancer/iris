@@ -884,7 +884,7 @@ fn swap_atomicity() {
             // The completion the guest waits for, slow to finish after it
             // has written its token.
             let r = ram.clone();
-            s.raster.submit_completion(move |_| {
+            s.raster.submit_completion(move || {
                 r.put(0x1000, &[1]);
                 std::thread::sleep(Duration::from_millis(150));
             });
