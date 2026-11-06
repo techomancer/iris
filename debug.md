@@ -32,7 +32,7 @@ What you can inspect depends on how iris was built:
 | `lightning` (official releases) | Strips breakpoint checks and the traceback buffer for speed: breakpoints and `dt` do nothing. Inspection commands still work. |
 | `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`debug`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
 | `--features gputrace` | Graphics traces and recordings (`rex/gr2/mgras/vpro trace`, `rex/mgras rec`) without the rest of `developer`; works with `lightning`. `vpro rec` needs no feature. |
-| `--features rex-gpu` | Experimental REX3 wgpu/WGSL recording replay; implies `gputrace`, remains replay-only, and does not replace the live CPU renderer. |
+| `--features rex-gpu` | Experimental REX3 wgpu/WGSL recording replay; implies `gputrace` and `rex-dirty-upload`, remains replay-only, and does not replace the live CPU renderer. |
 | `--features jitv2` | The `j2` commands. `jitv2_lockstep` checks every JIT instruction against the interpreter. |
 | `--features perfetto` | Perfetto timeline traces ([docs/perfetto.md](docs/perfetto.md)). |
 
