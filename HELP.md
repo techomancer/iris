@@ -594,7 +594,8 @@ ignored. The checked-in `iris.toml` is a commented example of everything in this
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
-prom     = "prom.bin"       # PROM image; the embedded one is used if missing (the O2 has none: its 4.18 image)
+prom     = "prom.bin"       # PROM image; the embedded one is used if missing (the O2 has none: its 4.18 image).
+                            # Another revision gives that revision's boot chime: clanker/devices/boot-chimes.md
 nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy); the PROM's flash (O2). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 

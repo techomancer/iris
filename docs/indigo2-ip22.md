@@ -13,7 +13,9 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 - **PROM:** IRIS tries `prom` from the config, then `070-1367-012.bin` in the
   working directory, then falls back to an embedded Indigo2 PROM
-  (`src/prombini2.rs`) — not the Indy one.
+  (`src/prombini2.rs`) — not the Indy one. Set `prom` to another revision to
+  get its boot chime; an older 5.1 PROM plays a stored tune, not the embedded
+  PROM's synthesized one ([boot chimes](../clanker/devices/boot-chimes.md)).
 - **NVRAM and MAC:** the Indigo2 keeps its PROM environment and Ethernet address
   in a 93CS56 serial EEPROM, not the Indy's DS1386. It is loaded from `nveeprom`
   (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
