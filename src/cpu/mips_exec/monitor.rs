@@ -2091,11 +2091,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         }
                     }
                     "entrypre" => {
-                        // Entry-word interrupt preamble. Normally an
-                        // externally-dispatched entry word bypasses its own
-                        // preamble (`skip_entry_preamble`), so a pending
-                        // interrupt is sampled one head later. Turning this on
-                        // emits the check at the entry word too.
+                        // Entry-word interrupt check (on by default). Off, an
+                        // externally-dispatched entry word samples no pending
+                        // interrupt until the next head.
                         //
                         // Read by codegen at compile time, so a `j2 flush` (CPU
                         // stopped) is required for it to affect regions that are

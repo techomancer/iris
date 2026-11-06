@@ -1132,12 +1132,14 @@ impl Codegen {
     /// target is on- or off-page, not a value ever written into `core.pc`.
     /// `skip_entry_preamble`: when `true`, the entry word's own IP7/pending-
     /// interrupt checks (§3.2's "check 1"/"check 2") are omitted from the
-    /// path reached directly from the function's entry — the production
-    /// caller (`comp.rs`'s `handle_request`, reached from
-    /// `mips_exec.rs::step()`'s dispatch) already ran both checks for this
-    /// exact PC, in the interpreter loop, immediately before ever calling
-    /// into compiled code; repeating them here would just recheck the same
-    /// state a second time for no reason. `false` for every other caller
+    /// path reached directly from the function's entry. The production
+    /// caller is `step_jit`, which does NOT run the interpreter's preamble,
+    /// so an external entry samples interrupts only through the separate
+    /// check in `entry_block` before the dispatch Switch
+    /// (`emit_entry_interrupt_bail`, on by default, `j2 entrypre`). The
+    /// body-block bypass is still needed with that check on: the ordinary
+    /// block clears `in_delay_slot`, which an external arrival on a delay
+    /// slot must keep. `false` for every other caller
     /// (the equivalence-test harness, `jitv2-verify`): none of them are
     /// preceded by a real interpreter dispatch loop, so the entry word's
     /// preamble is the *only* place those checks would ever run for it —
@@ -1545,8 +1547,9 @@ impl Codegen {
         // verifies every instruction inline) reaches a working desktop, so the
         // instruction emulation is correct and what differs under a fast JIT
         // is when interrupts get sampled, not what the code computes.
-        // NOTE: `entry_preamble_forced()` is deliberately NOT consulted here.
-        // Routing the dispatch head into the entry word's *ordinary* block —
+        // NOTE: `entry_preamble_forced()` is deliberately NOT consulted here:
+        // the entry check is the bail emitted in `entry_block` below. Routing
+        // the dispatch head into the entry word's *ordinary* block instead —
         // which is what emptying this map does — is WRONG, and panics IRIX at
         // "tlbmiss: invalid kptbl entry" within seconds of kernel start.
         //
@@ -1559,10 +1562,9 @@ impl Codegen {
         // destroys an armed delay-slot transfer, the guest branches somewhere
         // it should not, and the kernel faults on a garbage KSEG2 address.
         //
-        // Making the entry word pay its own interrupt check therefore needs the
-        // preamble emitted into the *body* block (after the dispatch head's
-        // foreign-slot handling), not a redirect to the ordinary block. Left
-        // unimplemented rather than half-done.
+        // So the entry check must leave `pc` and `in_delay_slot` alone: the
+        // bail in `entry_block`, before the dispatch Switch, does
+        // (`clanker/jitv2/entry-word-bail-must-not-touch-pc-or-bd.md`).
         if skip_entry_preamble {
             for &w in &entry_words {
                 entry_body_blocks.insert(w, builder.create_block());
@@ -1658,16 +1660,12 @@ impl Codegen {
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
-        // `j2 entrypre on`: sample pending interrupts at the entry word too.
-        //
-        // Normally an externally-dispatched entry word bypasses its own
-        // preamble (`skip_entry_preamble`), so a pending interrupt is not seen
-        // until the next head — bounded, never lost, but a window that widens
-        // with how fast the JIT retires code. A full `jitv2_lockstep` boot
-        // (every instruction verified inline, hence very slow) reaches a
-        // working desktop, so what differs under a fast JIT is *when*
-        // interrupts are sampled, not what the code computes. This closes that
-        // window so the difference can be tested against a live boot.
+        // `j2 entrypre` (on by default): sample pending interrupts at the entry
+        // word. An externally-dispatched entry word bypasses its own preamble
+        // (`skip_entry_preamble`) and `step_jit` runs none, so without this a
+        // pending interrupt is not seen until the next head; an instruction
+        // the bus answers busy re-dispatches here on every retry and never
+        // reaches one.
         //
         // Emitted HERE, in entry_block before the dispatch Switch, for the same
         // reason `emit_fr_mode_guard` is: at this point the function has not

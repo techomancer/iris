@@ -504,7 +504,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
 | `IRIS_CRASH_SELFTEST` | Standalone crash diagnostic self-test selector; deliberately crashes. | [src/main.rs](src/main.rs) |
 | `IRIS_DEBUG_LOG` | Device log specification; applied to developer devlog after machine creation. | [src/main.rs](src/main.rs) |
-| `IRIS_ENTRY_PREAMBLE` | 1 forces entry-word preamble in the opt-in codegen test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
+| `IRIS_ENTRY_PREAMBLE` | 0 turns off jitv2's interrupt check at an externally dispatched entry word (on by default; `j2 entrypre`). | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_GUI_GL` | 1 selects the GUI GL capture path. | [iris-gui/src/framebuffer.rs](iris-gui/src/framebuffer.rs) |
 | `IRIS_HAL2_CAPTURE` | HAL2 host audio capture output path. | [src/dev/hal2.rs](src/dev/hal2.rs) |
 | `IRIS_HOSTGL_CALLS` | Substring filter for HostGL call logging (bounded log). | [iris-hostgl/src/service.rs](iris-hostgl/src/service.rs) |

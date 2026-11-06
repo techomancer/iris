@@ -307,7 +307,7 @@ take effect after `j2 flush`.
 | `j2 min-calls [N]` | Legacy setting; stored and reported but not used by whole-page dispatch | `0` |
 | `j2 intrun [N]` | Instructions sharing one pending-interrupt check; 1 = every instruction (forced under lockstep) | `1` |
 | `j2 fallback [on\|off]` | Keep an unsupported instruction inside a region as an interpreter call instead of ending the region | `off` |
-| `j2 entrypre [on\|off]` | Check for interrupts at an externally dispatched entry word too | `off` |
+| `j2 entrypre [on\|off]` | Check for interrupts at an externally dispatched entry word (off: not until the next instruction head, which a retried bus access never reaches); takes effect after `j2 flush` | `on` |
 | `j2 inline_mem [on\|off]` | Inline L1D loads and stores (forced off under lockstep) | `on` |
 | `j2 memhelpers [on\|off]` | Call shared memory-helper functions instead of inlining the cache probe | — |
 | `j2 pagewb [on\|off]` | Write back dirty L1D/L2 lines covering a code page when a fetch crosses onto it (diagnostic) | `off` |

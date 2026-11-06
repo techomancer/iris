@@ -3340,8 +3340,34 @@ mod tests {
         assert_eq!(jit.pc, PAGE_B_WORD0, "must fall through onto the next page's word 0, not wrap back onto this page");
     }
 
+    /// Holds `ENTRY_PREAMBLE_TEST_LOCK` with the entry-word check set to
+    /// `on`, and puts the previous setting back when dropped, panics
+    /// included.
+    struct EntryCheck {
+        prev: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EntryCheck {
+        fn set(on: bool) -> EntryCheck {
+            let lock = crate::cpu::jitv2::ENTRY_PREAMBLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = crate::cpu::jitv2::entry_preamble_forced();
+            crate::cpu::jitv2::set_entry_preamble_forced(on);
+            EntryCheck { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for EntryCheck {
+        fn drop(&mut self) {
+            crate::cpu::jitv2::set_entry_preamble_forced(self.prev);
+        }
+    }
+
     #[test]
     fn skip_entry_preamble_true_bypasses_the_entry_words_own_checks() {
+        // The bypass itself, with the separate entry check (on by default)
+        // turned off.
+        let _check = EntryCheck::set(false);
         // skip_entry_preamble=true (comp.rs's production path): the entry
         // word's own preamble is skipped, so the compiled function runs the
         // entry instruction's real semantics directly instead of re-checking
@@ -3534,6 +3560,8 @@ mod tests {
 
     #[test]
     fn skip_entry_preamble_true_still_checks_on_an_internal_back_edge_into_entry() {
+        // With the entry check off, as the test above.
+        let _check = EntryCheck::set(false);
         // The flip side of the test above: skip_entry_preamble only ever
         // affects the path reached directly from the function's real entry
         // (entry_block). Every *other* head in the region -- including one
