@@ -6,6 +6,7 @@
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use crate::dev::ioc3_kbc::{ctrl, RX_OVERFLOW};
 use std::sync::Mutex;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
@@ -104,6 +105,15 @@ impl Rig {
     /// The firmware's chip-control value: ports at 0x178/0x170, strobe 4.
     fn aim_engines(&self) {
         self.w32(reg::CHIP_CONTROL, 0x0002_2e5e);
+    }
+
+    /// Let `chars` looped-back characters cross the line at the reset rate
+    /// (about a millisecond each), then play the timers. A looped-back
+    /// character takes a character time to reach the receiver, as it does
+    /// on the part.
+    fn line(&self, chars: u64) {
+        std::thread::sleep(Duration::from_micros(1100 * chars + 3000));
+        self.c.service();
     }
 
     /// DMA the way the chip sees memory: internal bytes.
@@ -528,7 +538,7 @@ fn type_keys(r: &Rig) {
 #[test]
 fn the_ps2_receive_holds_three_behind_the_clamp() {
     let r = Rig::new();
-    r.w32(CTRL, KBC_K_CLAMP_3 | KBC_M_CLAMP_3);
+    r.w32(CTRL, ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3);
     r.w32(K_TX, 0xf4); // enable scanning
     let _ = r.r32(K_RX);
     r.w32(reg::INT_STATUS, int::KEYBOARD);
@@ -536,11 +546,85 @@ fn the_ps2_receive_holds_three_behind_the_clamp() {
     assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
     let first = r.r32(K_RX);
     assert_eq!(first & (VALID[0] | VALID[1] | VALID[2]), VALID[0] | VALID[1] | VALID[2]);
-    assert_eq!(first & KBC_RX_OVERFLOW, 0, "nothing lost");
+    assert_eq!(first & RX_OVERFLOW, 0, "nothing lost");
     // The read released the clamp; the stopped keyboard resumed.
     let second = r.r32(K_RX);
     assert_ne!(second & VALID[2], 0, "the rest were held back, not dropped");
     assert_ne!((second >> 16) & 0xff, (first >> 16) & 0xff, "and are not a replay");
+}
+
+/// Five key presses behind clamp-after-three, with the keyboard scanning
+/// and its acknowledge read away.
+fn five_keys_behind_the_clamp(r: &Rig) {
+    use winit::keyboard::KeyCode::{KeyA, KeyB, KeyC, KeyD, KeyE};
+    r.w32(CTRL, ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3);
+    r.w32(K_TX, 0xf4);
+    let _ = r.r32(K_RX);
+    r.w32(reg::INT_STATUS, int::KEYBOARD);
+    for k in [KeyA, KeyB, KeyC, KeyD, KeyE] {
+        r.c.ps2().push_kb(k, true);
+    }
+    assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+}
+
+/// Ports sn0/ioc3/ps2-backlog-survives-an-early-acknowledge: Linux
+/// acknowledges before its handler reads. A guest that acknowledges and
+/// reads nothing is not handed the same interrupt again, the read that
+/// follows still finds all three characters, and the backlog behind the
+/// clamp raises the source a second time.
+#[test]
+fn the_ps2_backlog_survives_an_early_acknowledge() {
+    let r = Rig::new();
+    five_keys_behind_the_clamp(&r);
+    for _ in 0..4 {
+        r.w32(reg::INT_STATUS, int::KEYBOARD);
+        assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+    }
+    let all = VALID[0] | VALID[1] | VALID[2];
+    assert_eq!(r.r32(K_RX) & all, all);
+    assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "the resumed keyboard raises it again");
+    r.w32(reg::INT_STATUS, int::KEYBOARD);
+    assert_eq!(r.r32(K_RX) & all, VALID[2] | VALID[1]);
+    assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "nothing left, nothing asserts it");
+}
+
+/// Ports sn0/ioc3/ps2-drain-then-acknowledge-takes-one: OpenBSD reads until
+/// the register comes back empty and acknowledges afterwards, so a whole
+/// backlog drains in one pass and one acknowledge ends it.
+#[test]
+fn the_ps2_drain_then_one_acknowledge_ends_the_backlog() {
+    let r = Rig::new();
+    five_keys_behind_the_clamp(&r);
+    let (mut reads, mut valid) = (0, 0);
+    loop {
+        let v = r.r32(K_RX);
+        valid += VALID.iter().filter(|&&f| v & f != 0).count();
+        reads += 1;
+        assert!(reads <= 4);
+        assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "pending until the guest answers it");
+        if v == 0 {
+            break;
+        }
+    }
+    assert_eq!((valid, reads), (5, 3), "3, 2, then empty");
+    r.w32(reg::INT_STATUS, int::KEYBOARD);
+    assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+    assert_eq!(r.r32(K_RX), 0);
+    assert_eq!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+}
+
+/// Ports sn0/ioc3/ps2-clamp-after-one-splits-a-reply: clamping after one
+/// character splits a reset reply, the acknowledge first and the self-test
+/// byte next, each alone in the oldest slot.
+#[test]
+fn clamp_after_one_splits_a_reset_reply() {
+    let r = Rig::new();
+    r.w32(CTRL, ctrl::K_CLAMP_1);
+    r.w32(K_TX, 0xff);
+    assert_eq!(r.r32(K_RX), 0x80fa_0000);
+    assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
+    assert_eq!(r.r32(K_RX), 0x80aa_0000);
+    assert_eq!(r.r32(K_RX), 0);
 }
 
 #[test]
@@ -550,7 +634,7 @@ fn the_ps2_receive_overflows_without_a_clamp() {
     let _ = r.r32(K_RX);
     type_keys(&r);
     let v = r.r32(K_RX);
-    assert_ne!(v & KBC_RX_OVERFLOW, 0, "a fourth character was lost");
+    assert_ne!(v & RX_OVERFLOW, 0, "a fourth character was lost");
 }
 
 #[test]
@@ -567,7 +651,7 @@ fn the_ps2_control_masks_writes() {
     r.w32(CTRL, 0xffff_ffff);
     assert_eq!(
         r.r32(CTRL),
-        0x0000_ffff | K_TO_EN | M_TO_EN | KBC_K_CLAMP_1 | KBC_M_CLAMP_1 | KBC_K_CLAMP_3 | KBC_M_CLAMP_3
+        0x0000_ffff | K_TO_EN | M_TO_EN | ctrl::K_CLAMP_1 | ctrl::M_CLAMP_1 | ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3
     );
     r.c.reset();
     assert_eq!(r.r32(CTRL), 0);
@@ -682,6 +766,7 @@ fn ring_dma_loops_back_through_port_a() {
     put(&r, 0x2000, &[b'a', b'b', b'c', b'd', 0x40, 0x40, 0x40, 0x40]);
     r.w32(A, sdma_ctl::ENABLE);
     r.w32(A + sdma_off::TX_PRODUCE, 8);
+    r.line(4);
     assert_eq!(r.r32(A + sdma_off::TX_CONSUME), 8, "the engine took the entry");
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) & 0xfff, 8, "and posted one back");
     let e = get(&r, 0x3000, 8);
@@ -702,6 +787,7 @@ fn ring_dma_runs_on_port_b_too() {
     put(&r, 0x4000, &[b'w', b'x', b'y', b'z', 0x40, 0x40, 0x40, 0x40]);
     r.w32(B, sdma_ctl::ENABLE);
     r.w32(B + sdma_off::TX_PRODUCE, 8);
+    r.line(4);
     assert_eq!(r.r32(B + sdma_off::TX_CONSUME), 8);
     assert_eq!(&get(&r, 0x5000, 4), b"wxyz");
 }
@@ -716,6 +802,7 @@ fn flow_control_in_loopback_reports_cts() {
     put(&r, 0x2000, &[b'a', b'b', b'c', b'd', 0x40, 0x40, 0x40, 0x40]);
     r.w32(A, sdma_ctl::ENABLE | sdma_ctl::FLOW_CONTROL | 32);
     r.w32(A + sdma_off::TX_PRODUCE, 8);
+    r.line(4);
     let e = get(&r, 0x3000, 8);
     assert_eq!(e[4] & 0xdf, 0xd0, "data valid, modem valid, clear to send");
 }
@@ -732,6 +819,7 @@ fn an_empty_slot_ends_the_entry() {
     put(&r, 0x2008, &[b'e', b'f', b'g', b'h', 0x40, 0x40, 0x40, 0x00]);
     r.w32(A, sdma_ctl::ENABLE);
     r.w32(A + sdma_off::TX_PRODUCE, 16);
+    r.line(4);
     assert_eq!(r.r32(A + sdma_off::TX_CONSUME), 16);
     // a, then e f g: "aefg" in one receive entry.
     assert_eq!(&get(&r, 0x3000, 4), b"aefg");
@@ -1375,7 +1463,7 @@ fn running_rig() -> (Rig, Arc<TimerManager>) {
 /// deadline briefly shows none; the callback holds `gate` throughout.
 fn timer_pending(r: &Rig, kind: usize) -> bool {
     let _idle = r.c.sh.gate.lock();
-    r.c.sh.armed.lock()[kind].is_some()
+    r.c.sh.timers.is_armed(kind)
 }
 
 /// Poll `cond` for up to two seconds.
@@ -1507,7 +1595,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     r.c.stop();
     assert!(!r.c.is_running());
     assert!(r.c.threads.lock().is_empty());
-    assert!(r.c.sh.armed.lock().iter().all(|a| a.is_none()));
+    assert!(r.c.sh.timers.none_armed());
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
     std::thread::sleep(Duration::from_millis(20));
@@ -1635,4 +1723,83 @@ fn a_short_buffer_ram_is_refused() {
     let chip = v.as_table_mut().unwrap().get_mut("chip").unwrap().as_table_mut().unwrap();
     chip.insert("ssram".into(), toml::Value::Array(Vec::new()));
     assert!(c.load_state(&v).unwrap_err().contains("ssram"));
+}
+
+/// The Octane keeps the IOC3's PCI header across a chip reset; only the
+/// Fuel population resets it along with the chip.
+#[test]
+fn an_octane_chip_reset_keeps_the_pci_header() {
+    let r = Rig::new();
+    let cfg = r.c.config();
+    cfg.write(1, 0xffff_0146);
+    cfg.write(3, 0xffff_ffff);
+    r.c.reset();
+    assert_eq!(cfg.read(1), 0x0200_0146);
+    assert_eq!(cfg.read(3), 0xffff);
+}
+
+/// Fuel's IOC3 has its own header write policy and resets the header with
+/// the chip, reaches the flat Timekeeper on byte-bus device 0, leaves the
+/// Dallas clock ports unfitted, and has no PHY reset on GPIO 5.
+#[test]
+fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
+    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
+    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
+    r.c.attach_timekeeper(clock.clone());
+    let cfg = r.c.config();
+    cfg.write(1, 0xffff_0146);
+    cfg.write(3, 0xffff_ffff);
+    assert_eq!(cfg.read(1), 0x0280_0146);
+    assert_eq!(cfg.read(3), 0x0000_ff00);
+    let base = reg::BYTEBUS_DEV0;
+    r.w8(base + 0x7f8, 0xa5);
+    r.c.reset();
+    clock.power_on();
+    assert_eq!(r.r8(base + 0x7fff), 0x58);
+    assert_eq!(r.r8(base + 0x7f8), 0xa5);
+    assert_eq!(cfg.read(1), 0x0280_0000);
+    assert_eq!(cfg.read(3), 0);
+    // Fuel selects the flat clock, leaving indexed Dallas ports unfitted.
+    r.w8(reg::BYTEBUS_DEV1, 0x40);
+    r.w8(reg::BYTEBUS_DEV2, 0x55);
+    assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0);
+    r.c.attach_eth(crate::dev::ioc3_eth::Ioc3Eth::new_fuel(MAC));
+    use crate::dev::ioc3_eth::{bits::MII_READ, reg::{MII_CONTROL, MII_DATA_R, MII_DATA_W}};
+    r.w32(MII_DATA_W, 7);
+    r.w32(MII_CONTROL, (1 << 5) | 0x19);
+    r.w32(reg::PIN_CONTROL_SET, 1 << 5);
+    r.w32(reg::PIN_REG_FIRST + 5 * 4, 0);
+    r.w32(reg::PIN_DATA, 1 << 5);
+    r.w32(MII_CONTROL, MII_READ | (7 << 5) | 3);
+    assert_eq!(r.r32(MII_DATA_R), 0x5c10, "Fuel GPIO5 has no PHY reset connection");
+}
+
+/// Fuel's IOC3 fits the keyboard and mouse controller, as the Octane's does
+/// (OpenBSD configures it through the onboard IOC3's keyboard controller). A
+/// key pushed from the host arrives in K_RX through the IOC3 registers and
+/// latches the keyboard interrupt, and a mouse report arrives in M_RX; both
+/// survive a chip reset.
+#[test]
+fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
+    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
+    for _ in 0..2 {
+        r.c.reset();
+        r.c.ps2().power_on();
+        r.w32(K_TX, 0xff);
+        let v = r.r32(K_RX);
+        assert_ne!(v & VALID[2], 0, "the keyboard answers a reset");
+        assert_eq!((v >> 16) & 0xff, 0xfa, "with an ACK");
+        r.w32(M_TX, 0xf2);
+        let v = r.r32(M_RX);
+        assert_ne!(v & (1 << 27), 0, "the mouse answers from its own port");
+        // Enable scanning, then inject a key from the host.
+        r.w32(K_TX, 0xf4);
+        while r.r32(K_RX) & VALID[2] != 0 {}
+        r.w32(reg::INT_STATUS, int::KEYBOARD);
+        r.c.ps2().push_kb(winit::keyboard::KeyCode::KeyA, true);
+        assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "a key latches the interrupt");
+        let v = r.r32(K_RX);
+        assert_ne!(v & VALID[2], 0, "and arrives in K_RX");
+        assert_eq!(v & (1 << 27), 0, "from the keyboard");
+    }
 }

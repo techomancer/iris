@@ -43,6 +43,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [r5000-taglo-is-the-r4400-pstate.md](cpu/r5000-taglo-is-the-r4400-pstate.md) | rule | R5000 L1 TagLo uses the R4400 PState encoding |
 | [r5k-l1i-cache-bugs.md](cpu/r5k-l1i-cache-bugs.md) | open | R5000 secondary cache: no working configuration currently exists |
 | [sc-succeeds-on-llbit-alone.md](cpu/sc-succeeds-on-llbit-alone.md) | rule | `SC` succeeds on the LLbit alone — `LLAddr` is not a gate |
+| [staged-secondary-cache-lines.md](cpu/staged-secondary-cache-lines.md) | rule | Staged secondary-cache lines hit until an explicit op ends them; the page fast paths must be told |
 | [tcache-discards-dirty-data-semantics.md](cpu/tcache-discards-dirty-data-semantics.md) | rule | tcache makes L1-D write-through, so Hit_Invalidate cannot discard |
 | [tcache-l2-instr-coherency.md](cpu/tcache-l2-instr-coherency.md) | rule | tcache: L2 decoded-instruction coherency, and how it was broken |
 | [tlb-c-field-uses-the-models-table.md](cpu/tlb-c-field-uses-the-models-table.md) | rule | The TLB decodes EntryLo C with the CPU model's table; C=4 read as uncached sent every Octane user access to the bus |

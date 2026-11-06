@@ -165,6 +165,75 @@ hashes are given where a change is easiest to understand by reading the commit.
   the cost follows what the guest wrote. Reflinking is unchanged. On Windows the
   copy is marked sparse first.
 
+### R10000 TLB widths
+
+- **Full 44-bit user addresses.** On the R10000 (Octane, IP28, and an O2 set to
+  `r10000`) EntryHi, the TLB match and the user-segment check keep VA bits 43:40;
+  they stopped at bit 39 before, so an address above 1 TiB took an Address Error.
+  The R4400 and R5000 are unchanged.
+- **FrameMask (CP0 register 21)** on the R10000 clears the EntryLo bits it
+  names, 33:18, on every TLB write, so a kernel that keeps software flags there
+  gets the physical address it meant. The register read as zero and ignored
+  writes before. The R4400 and R5000 have none.
+- **EntryLo** on the R10000 keeps its 28-bit PFN (bits 33:6, a 40-bit physical
+  address) and the uncached attribute in 63:62; it kept 30 bits before. The
+  attribute is stored and read back, not sent to the bus.
+- **TLB writes on the R10000** store zeros in the PFN bits below the page size,
+  so TLBR reads them back as zero, as the part does; on 16 KB pages that is
+  EntryLo bits 7:6. Translation is unchanged. The PROM's `ide` `tlb` test
+  failed 320 compares on this. The manual documents it for the R10000; the
+  R12000, R14000 and R16000 do the same as a model choice. The R4400 and
+  R5000 still keep the whole PFN.
+- **TLB refill vector on the R10000** follows the address space that missed:
+  a user address takes the XTLB vector only with UX set, xsseg with SX, and
+  kernel addresses with KX. A 64-bit kernel touching a 32-bit user address now
+  refills through 0x000, as the part does, not 0x080. The R4400 and R5000 still
+  choose by the current mode.
+
+### Refused uncached stores on the R10000 family
+
+- On the R10000 family (Octane, IP28, O2), an uncached store that nothing answers now
+  completes instead of raising a Data Bus Error, as the processor does. iris prints
+  "Unsupported uncached write ... (posted, completes)" for the first four such
+  stores and then at each power of two. Loads, instruction fetches, the R4400 and
+  the R5000 are unchanged.
+
+### Partial LWR on the R10000
+
+- On the R10000 (Octane, IP28, and an O2 with the R10000), an `LWR` that loads fewer
+  than four bytes now keeps bits 63:32 of the destination instead of sign-extending,
+  as the reference results for the part show. R4400 and R5000 machines are unchanged.
+  The JIT matches the interpreter, and the code-cache key changes only for the
+  machines that have the behaviour.
+
+### R10000 cache operations
+
+- **Index Load Data and Index Store Data** on the R10000's primary caches keep their
+  data (they read back zero before). The secondary cache's data slot is the address
+  shifted right by 3 instead of 4: one slot per doubleword.
+- **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
+  TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
+
+### R12000, R14000 and R16000
+
+- `[machine] cpu` and `--cpu` take `r12000`, `r14000`, `r16000` (revision 2.2,
+  the 800 MHz part) and `r16000_700` (revision 2.1, the 700 MHz part). The Octane
+  takes the R10000, R12000 and R14000 (defaulting to 195, 360 and 600 MHz), the
+  O2 the R5000, R10000 and R12000 (400 MHz for the R12000), the IP28 the R10000.
+  The R16000 has no machine yet; `iris-bench` is its only user. CP0 Config now
+  reports the part's own secondary-cache size, where every part read 1 MB, and
+  each R16000 presents its own reset word.
+
+### SGI Tezro (IP53 board, IP35 software platform)
+
+- Added a headless Tezro profile with the 700 MHz R16000 (`r16000_700`, the default; `r16000` selects the 800 MHz part), 4 MiB cache, 4 GiB RAM, a PIC with PXBOW, and the IO9's IOC4, ISP12160 and BCM5701; see the [Tezro guide](docs/tezro-ip53.md).
+- A Tezro can fit a VPro V12 at widget 12 with `[graphics] board = "v12"`, on the VPro model the Octane and the Fuel use.
+- A Tezro fits one, two or four processors, four by default, and two or four bring a second PIC at widget 11 on the PXBOW's link 11. Every fitted processor runs, each on its own host thread, so a default four-processor Tezro runs four.
+- A fresh flash store for a two-processor Tezro is seeded with the environment records that mark the empty B and D slots disabled, as QEMU's boot tests seed them; this is a model policy, not a factory image.
+- The Tezro's PIC fails a configuration read of an empty slot as a master timeout, so the PROM no longer records two phantom devices per empty slot.
+- The Tezro returns the V12's graphics credits to PI0 along the node's graphics map, settles owed credits on a map write, and stops PI0's graphics slot below its bias as the Bedrock does.
+- The Tezro's PROM stops while copying itself to memory unless the R10000 cache index operations are present; see the [Tezro guide](docs/tezro-ip53.md).
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
@@ -254,6 +323,35 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Memory past 4 GB is as fast as the rest: such a machine gets a 16 GB direct
   window, and the JIT compiles code anywhere in it.
 - A store-conditional on memory outside the window is now atomic with two CPUs.
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- **The Fuel takes a VPro board**: `[graphics] board = "v12"` or `"v10"`
+  fits the Octane's VPro model at crossbar widget 13. IRIX 6.5.30 with the
+  VPro driver brings the X login screen up on it.
+
+- Added a headless Fuel profile with the 500 MHz R14000, 512 MiB RAM,
+  Bedrock, dual-head XBridge, IOC3 networking and two-channel ISP12160 SCSI.
+  The normal interpreter boot reaches the IRIX 6.5.30 root shell with PROM
+  6.210. See the [Fuel guide](docs/fuel-ip34.md).
+- **jitv2 compiles uncached code from the uncached view.** The PROM runs from the
+  reset window uncached; once memory covers that window the cached view returns
+  RAM there, and the compile pool used to compile RAM's bytes in place of the
+  PROM's. An uncached fetch now keys a code page of its own and is compiled and
+  invalidated through the view the CPU fetched it by. Other machines are
+  unchanged.
+- Marking an ECC doubleword or a directory line in Bedrock's memory no longer
+  rebuilds the whole memory map. The PROM's memory test marks and lifts a few
+  hundred of them thousands of times. A mark now changes only its own page,
+  and a lifted mark's page stays on Bedrock's checking path until a batch
+  returns it.
+
+### PCI configuration
+
+- A PCI function can describe its own writable header fields and
+  write-one-to-clear status bits. Byte and halfword configuration writes
+  through a Bridge carry their byte enables, so such a function keeps the
+  status events a narrow write did not select. No Octane function has
+  write-one-to-clear status bits, so the Octane behaves as before.
 
 ### VNC, and screen and pointer commands
 
@@ -564,6 +662,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2's memory alias holds for pages with high PTE bits set.** A mapped page
+  whose address had a bit set above bit 31 missed the alias of RAM at
+  0x8000_0000 and reached the PCI window instead.
 - **The O2 runs on the shadow cache from reset.** The full cache model, and
   the switch to and from it during POST and reboots, are gone
   (`src/ip32_handover.rs`), and with them a branch on every cached load, store

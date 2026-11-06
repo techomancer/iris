@@ -55,6 +55,9 @@ pub enum LogModule {
     /// The Octane's VPro (Odyssey) graphics board: guest accesses the
     /// model does not support.
     Odyssey = 28,
+    Bedrock = 29,
+    L1 = 30,
+    Usb = 31,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -63,7 +66,7 @@ pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
 impl LogModule {
-    pub const COUNT: usize = 29;
+    pub const COUNT: usize = 32;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -96,6 +99,9 @@ impl LogModule {
             "gr2"    => Some(Self::Gr2),
             "rad1"   => Some(Self::Rad1),
             "odyssey" => Some(Self::Odyssey),
+            "bedrock" => Some(Self::Bedrock),
+            "l1" => Some(Self::L1),
+            "usb" => Some(Self::Usb),
             _        => None,
         }
     }
@@ -131,6 +137,9 @@ impl LogModule {
             Self::Gr2    => "gr2",
             Self::Rad1   => "rad1",
             Self::Odyssey => "odyssey",
+            Self::Bedrock => "bedrock",
+            Self::L1 => "l1",
+            Self::Usb => "usb",
         }
     }
 
@@ -141,7 +150,7 @@ impl LogModule {
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
-            Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey,
+            Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock, Self::L1, Self::Usb,
         ]
     }
 
@@ -283,6 +292,9 @@ impl DevLog {
                 ModuleLog::new(), // Gr2
                 ModuleLog::new(), // Rad1
                 ModuleLog::new(), // Odyssey
+                ModuleLog::new(), // Bedrock
+                ModuleLog::new(), // L1
+                ModuleLog::new(), // Usb
             ],
         }
     }

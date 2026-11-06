@@ -1,0 +1,938 @@
+//! Bedrock PI exposes processor-slot control, pending interrupts, real-time
+//! counters, timers and shared graphics registers. A node has two PIs with two
+//! processor slots each, A and B; the board names which of the four slots hold
+//! a processor ([`Population`]). Fuel fits PI0 slot A only. A Tezro fits one,
+//! two or four, filled in the order CPU 0 = PI0/A, CPU 1 = PI1/A, CPU 2 =
+//! PI0/B, CPU 3 = PI1/B. Node hooks carry cache-alias changes, CPU enable and
+//! NMI events to the board.
+//!
+//! # What is approximated here
+//!
+//! The board names which fitted slots have a running processor
+//! ([`BedrockPiConfig::running`]); every fitted slot reads present. A
+//! running slot starts with its CPU-enable bit set and runs from reset
+//! whatever the register later holds: an approximation QEMU's IP35 node
+//! makes too, since no cold-reset value for the bit is known and the
+//! register is not known to stop a processor. A write that clears a running
+//! slot's enable is stored and recorded, not carried out.
+//!
+//! For a slot without a running processor nothing is delivered, and each
+//! kind is recorded the first time it happens ([`Refused`],
+//! [`BedrockPi::refused`]) and logged under the `bedrock` module instead of
+//! being dropped silently: a write that enables the processor, an NMI, an
+//! interrupt output for the slot (an interprocessor interrupt is one) and a
+//! timer enable. The enable bit itself is stored, as the register holds it
+//! on hardware, and still reaches the node hooks.
+//!
+//! The CPU-number register answers the reading processor's slice: its slot
+//! in bit 0 and the interface in bit 1. A read from a thread that runs no
+//! processor (a device, the monitor, a test) answers slot A, as QEMU does
+//! for an access with no issuing processor; that is model behavior, since
+//! hardware always has a requester. Which processor is in which slot is
+//! the board's order ([`Population::slot_of`]).
+//!
+//! The model accepts Linux's public `SGIrules` key at offset 0x8 for
+//! compatibility. Linux documents the literal for Hub I/O, but the available
+//! evidence does not establish that this PI offset maps to the same register.
+//! Unconnected graphics registers read as zero and are logged as unsupported.
+//!
+//! Ported from hw/misc/sgi-bedrock-pi.c in jamesbraid/qemu-sgi-origami.
+
+use crate::dev::bedrock_io::IIO_PROTECT_OVRRD_KEY;
+use crate::dev::heart::Clock;
+use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::irq::InterruptController;
+use crate::traits::{BusDevice, BusRead32, BusRead64, Device, Resettable, BUS_ERR, BUS_OK};
+use parking_lot::{Mutex, ReentrantMutex};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
+const RT_MASK: u64 = (1 << 55) - 1;
+const ERROR_MASK: u64 = (1 << 35) - 1;
+const MEMORY_ERROR: u64 = 1 << 24;
+const REFLECT: u64 = (1 << 54) | (1 << 55) | (1 << 62) | (1 << 63);
+const TICK: u64 = 800;
+pub const SIZE: u64 = 0x30108;
+
+pub mod reg {
+    pub const NODE_REGION: u64 = 0x0;
+    pub const PROTECTION_KEY: u64 = 0x8;
+    pub const OFFSET_0010: u64 = 0x10;
+    pub const OFFSET_0018: u64 = 0x18;
+    pub const INTERFACE_ID: u64 = 0x20;
+    pub const CACHED_ALIAS: u64 = 0x28;
+    pub const OFFSET_0030: u64 = 0x30;
+    pub const OFFSET_0038: u64 = 0x38;
+    pub const INTERFACE_SLOT_A: u64 = 0x40;
+    pub const INTERFACE_SLOT_B: u64 = 0x48;
+    pub const CPU_A_ENABLE: u64 = 0x50;
+    pub const CPU_B_ENABLE: u64 = 0x58;
+    pub const NMI_SLOT_A: u64 = 0x70;
+    pub const NMI_SLOT_B: u64 = 0x78;
+    pub const PENDING_MODIFY: u64 = 0x90;
+    pub const PENDING_STATUS_A: u64 = 0x98;
+    pub const PENDING_STATUS_B: u64 = 0xa0;
+    pub const OFFSET_00A8: u64 = 0xa8;
+    pub const OFFSET_00B0: u64 = 0xb0;
+    pub const OFFSET_00B8: u64 = 0xb8;
+    pub const OFFSET_00C0: u64 = 0xc0;
+    pub const REQUEST_A: u64 = 0xc8;
+    pub const REQUEST_B: u64 = 0xd0;
+    pub const PENDING_A_CLEAR: u64 = 0xd8;
+    pub const PENDING_B_CLEAR: u64 = 0xe0;
+    pub const OFFSET_00E8: u64 = 0xe8;
+    pub const OFFSET_00F0: u64 = 0xf0;
+    pub const RT_COMPARE_A: u64 = 0x108;
+    pub const RT_COMPARE_B: u64 = 0x110;
+    pub const PROFILE_COMPARE: u64 = 0x118;
+    pub const RT_STATUS_A: u64 = 0x120;
+    pub const RT_STATUS_B: u64 = 0x128;
+    pub const PROFILE_STATUS_A: u64 = 0x130;
+    pub const PROFILE_STATUS_B: u64 = 0x138;
+    pub const RT_ENABLE_A: u64 = 0x140;
+    pub const RT_ENABLE_B: u64 = 0x148;
+    pub const PROFILE_ENABLE_A: u64 = 0x150;
+    pub const PROFILE_ENABLE_B: u64 = 0x158;
+    pub const PENDING_MODIFY_B: u64 = 0x180;
+    pub const ERROR_SUMMARY_ALIAS: u64 = 0x3f8;
+    pub const ERROR_SUMMARY: u64 = 0x400;
+    pub const ERROR_CAUSE_A: u64 = 0x408;
+    pub const ERROR_CAUSE_B: u64 = 0x410;
+    pub const ERROR_ADDRESS_A: u64 = 0x418;
+    pub const ERROR_ADDRESS_B: u64 = 0x420;
+    pub const ERROR_CONTROL: u64 = 0x428;
+    pub const ERROR_CAPTURE_A: u64 = 0x438;
+    pub const ERROR_CAPTURE_B: u64 = 0x448;
+    pub const ERROR_CAPTURE_C: u64 = 0x458;
+    pub const ERROR_CAPTURE_D: u64 = 0x468;
+    pub const ERROR_SOURCE_A: u64 = 0x490;
+    pub const ERROR_SOURCE_B: u64 = 0x4c0;
+    pub const ERROR_DETAIL_A: u64 = 0x4a8;
+    pub const ERROR_DETAIL_B: u64 = 0x4b0;
+    pub const ERROR_DETAIL_C: u64 = 0x4b8;
+    pub const OFFSET_0430: u64 = 0x430;
+    pub const OFFSET_0440: u64 = 0x440;
+    pub const OFFSET_0450: u64 = 0x450;
+    pub const OFFSET_0460: u64 = 0x460;
+    pub const OFFSET_04C8: u64 = 0x4c8;
+    pub const OFFSET_04D0: u64 = 0x4d0;
+    pub const CREDIT_MODE: u64 = 0x20068;
+    pub const COUNTER: u64 = 0x30100;
+    pub const GRAPHICS_BASE: u64 = 0x300;
+    pub const GRAPHICS_END: u64 = 0x350;
+}
+
+/// The processor slots a board fits, as one bit per slot: bit `interface * 2
+/// + slot`, with slot 0 = A and slot 1 = B.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Population(u8);
+impl Default for Population {
+    fn default() -> Self {
+        Self::SINGLE
+    }
+}
+impl Population {
+    /// One processor, in PI0 slot A.
+    pub const SINGLE: Self = Self(0b0001);
+    /// Slots named by `mask`. CPU 0 runs in PI0/A, so it must be fitted, and
+    /// only the four slots exist.
+    pub fn new(mask: u8) -> Result<Self, String> {
+        if mask & !0b1111 != 0 {
+            return Err(format!("processor mask {mask:#x} names a slot outside the node's four"));
+        }
+        if mask & 1 == 0 {
+            return Err(format!("processor mask {mask:#x} leaves PI0 slot A empty, where CPU 0 runs"));
+        }
+        Ok(Self(mask))
+    }
+    /// `count` processors in the board's order: PI0/A, PI1/A, PI0/B, PI1/B.
+    pub fn fitted_cpus(count: usize) -> Result<Self, String> {
+        if !(1..=4).contains(&count) {
+            return Err(format!("{count} processors; a node fits 1 to 4"));
+        }
+        Self::new(ORDER[..count].iter().fold(0, |mask, bit| mask | (1 << bit)))
+    }
+    /// The slot (interface, 0 = A or 1 = B) CPU `cpu` sits in: the board puts
+    /// CPU n in the nth slot of this set in its order, one processor per
+    /// interface before a second on either.
+    pub fn slot_of(self, cpu: usize) -> Option<(u8, usize)> {
+        ORDER.iter().filter(|&&bit| self.0 & (1 << bit) != 0).nth(cpu).map(|&bit| (bit / 2, usize::from(bit % 2)))
+    }
+    /// The CPU in `slot` of `interface`, if this set holds one.
+    pub fn cpu_in(self, interface: u8, slot: usize) -> Option<usize> {
+        (0..self.count()).find(|&cpu| self.slot_of(cpu) == Some((interface, slot)))
+    }
+    pub fn mask(self) -> u8 {
+        self.0
+    }
+    pub fn count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+    /// Whether a processor is fitted in `slot` (0 = A, 1 = B) of `interface`.
+    pub fn fitted(self, interface: u8, slot: usize) -> bool {
+        self.0 & (1 << (usize::from(interface) * 2 + slot)) != 0
+    }
+}
+/// The board's population order, as physical slot numbers `interface * 2 +
+/// slot`: PI0/A, PI1/A, PI0/B, PI1/B.
+const ORDER: [u8; 4] = [0, 2, 1, 3];
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BedrockPiConfig {
+    pub interface: u8,
+    pub request_region: u8,
+    pub population: Population,
+    /// The fitted slots whose processor runs. The Fuel runs PI0/A alone.
+    pub running: Population,
+}
+/// Something a processor slot would do or receive that the model does not
+/// carry out because no processor runs there. See the module notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// A write set the slot's CPU-enable bit.
+    Start { interface: u8, slot: usize },
+    /// A write cleared the CPU-enable bit of a slot whose processor runs; it
+    /// keeps running.
+    Stop { interface: u8, slot: usize },
+    /// A non-maskable interrupt the node did not take to a processor.
+    Nmi { interface: u8, slot: usize },
+    /// An interrupt output of the slot went high: output line 0..9 of the PI.
+    Interrupt { interface: u8, line: usize },
+    /// A real-time or profile timer interrupt was enabled for the slot.
+    Timer { interface: u8, slot: usize },
+}
+/// Called outside the state lock. Graphics indices 0..9 are the shared PI
+/// graphics registers at offsets 0x300..0x348. Disconnected access is observable.
+pub trait NodeHooks: Send + Sync {
+    fn cached_alias_changed(&self, _size: u8) {}
+    fn rt_compare_written(&self, _interface: u8, _slot: usize) {}
+    fn rt_counter_read(&self, _interface: u8) {}
+    fn cpu_enable(&self, _interface: u8, _slot: usize, _enabled: bool) {}
+    /// Whether the node took the NMI to its processor. No processor model
+    /// here has an NMI entry, so by default it is not taken.
+    fn nmi(&self, _interface: u8, _slot: usize) -> bool {
+        false
+    }
+    fn gfx_read(&self, _index: usize) -> Option<u64> {
+        None
+    }
+    fn gfx_write(&self, _index: usize, _value: u64) -> bool {
+        false
+    }
+    fn gfx_reset(&self) {}
+    /// Software cleared graphics interrupt bit 1 + `slot` of bank 0 through
+    /// the pending-modify register: the processor took it.
+    fn gfx_interrupt_taken(&self, _slot: usize) {}
+}
+struct State {
+    w: [u64; 160],
+    pending: [u64; 2],
+    reflected: u64,
+    uart: bool,
+    base: u64,
+    epoch: u64,
+    paused: Option<u64>,
+    running: bool,
+    rt_due: [u128; 2],
+    profile_due: u128,
+    levels: [u8; 256],
+    rearm: [u64; 128],
+    credit_mode: u64,
+}
+impl State {
+    fn new(now: u64) -> Self {
+        let mut s = Self {
+            w: [0; 160],
+            pending: [0; 2],
+            reflected: 0,
+            uart: false,
+            base: 0,
+            epoch: now,
+            paused: Some(now),
+            running: false,
+            rt_due: [0; 2],
+            profile_due: 0,
+            levels: [0; 256],
+            rearm: [0; 128],
+            credit_mode: 0,
+        };
+        s.w[0] = !0;
+        s.w[2] = !0;
+        s.w[3] = !0;
+        s.arm_all(now);
+        s
+    }
+    fn time(&self, now: u64) -> u64 {
+        self.paused.unwrap_or(now)
+    }
+    fn count(&self, now: u64) -> u64 {
+        self.base
+            .wrapping_add(self.time(now).saturating_sub(self.epoch) / TICK)
+            & RT_MASK
+    }
+    fn arm_rt(&mut self, slot: usize, now: u64) {
+        let now = self.time(now);
+        let ticks = (self.w[0x108 / 8 + slot]
+            .wrapping_sub(self.count(now))
+            .wrapping_sub(1)
+            & RT_MASK)
+            + 1;
+        self.rt_due[slot] = u128::from(now - now.saturating_sub(self.epoch) % TICK)
+            + u128::from(ticks) * u128::from(TICK);
+    }
+    fn arm_profile(&mut self, now: u64) {
+        let now = self.time(now);
+        let ticks = (self.w[0x118 / 8] as u32).wrapping_sub(self.count(now) as u32);
+        let ticks = if ticks == 0 {
+            1u64 << 32
+        } else {
+            u64::from(ticks)
+        };
+        self.profile_due = u128::from(now - now.saturating_sub(self.epoch) % TICK)
+            + u128::from(ticks) * u128::from(TICK);
+    }
+    fn arm_all(&mut self, now: u64) {
+        self.arm_rt(0, now);
+        self.arm_rt(1, now);
+        self.arm_profile(now);
+    }
+    fn sync(&mut self, now: u64) {
+        let now = self.time(now);
+        for slot in 0..2 {
+            if u128::from(now) >= self.rt_due[slot] {
+                self.w[0x120 / 8 + slot] = 1;
+                self.arm_rt(slot, now);
+            }
+        }
+        if u128::from(now) >= self.profile_due {
+            self.w[0x130 / 8] = 1;
+            self.w[0x138 / 8] = 1;
+            self.arm_profile(now);
+        }
+        for level in 7..128 {
+            if self.rearm[level] != 0 && self.rearm[level] <= now {
+                self.rearm[level] = 0;
+                if self.levels.iter().any(|&v| usize::from(v) == level + 1) {
+                    self.pending[level / 64] |= 1 << (level % 64);
+                }
+            }
+        }
+    }
+    fn pending(&self, bank: usize) -> u64 {
+        if bank == 1 {
+            (self.pending[1] & !REFLECT) | self.reflected
+        } else {
+            self.pending[0]
+                | if self.uart { 1 << 4 } else { 0 }
+                | if self.w[0xc8 / 8] & self.w[0xe8 / 8] != 0 {
+                    1 << 5
+                } else {
+                    0
+                }
+                | if self.w[0xd0 / 8] & self.w[0xe8 / 8] != 0 {
+                    1 << 6
+                } else {
+                    0
+                }
+        }
+    }
+    fn outputs(&self) -> [bool; 10] {
+        let mut out = [false; 10];
+        for slot in 0..2 {
+            out[slot * 5] = self.pending(0) & self.w[0xa8 / 8 + slot * 2] != 0;
+            out[slot * 5 + 1] = self.pending(1) & self.w[0xb0 / 8 + slot * 2] != 0;
+            out[slot * 5 + 2] = self.w[0x120 / 8 + slot] & self.w[0x140 / 8 + slot] != 0;
+            out[slot * 5 + 3] = self.w[0x130 / 8 + slot] & self.w[0x150 / 8 + slot] != 0;
+            out[slot * 5 + 4] = self.w[0x400 / 8] & self.w[0x408 / 8 + slot] != 0;
+        }
+        out
+    }
+    fn modify(&mut self, value: u64, reissue: bool, now: u64) {
+        let bank = ((value >> 6) & 1) as usize;
+        let bit = value & 63;
+        let mask = 1 << bit;
+        if bank == 1 && mask & REFLECT != 0 {
+            return;
+        }
+        if value & 0x100 != 0 {
+            self.pending[bank] |= mask;
+        } else {
+            self.pending[bank] &= !mask;
+            let level = bank * 64 + bit as usize;
+            if reissue && self.levels.iter().any(|&v| usize::from(v) == level + 1) {
+                self.rearm[level] = now.saturating_add(1_000_000);
+            }
+        }
+    }
+}
+pub struct BedrockPi {
+    cfg: BedrockPiConfig,
+    clock: Clock,
+    state: Mutex<State>,
+    hooks: Mutex<Option<Arc<dyn NodeHooks>>>,
+    irq: Mutex<Option<Arc<dyn InterruptController>>>,
+    timers: OnceLock<Arc<TimerManager>>,
+    timer: Mutex<Option<TimerId>>,
+    timer_pass: Mutex<()>,
+    dispatch: ReentrantMutex<()>,
+    driven: Mutex<[Option<bool>; 10]>,
+    weak: Weak<Self>,
+    refused: Mutex<Vec<(Refused, u64)>>,
+}
+impl BedrockPi {
+    pub fn new(cfg: BedrockPiConfig, clock: Clock) -> Arc<Self> {
+        assert!(cfg.interface < 2 && cfg.request_region < 64);
+        // The running processor starts with its bus grant; the rest are held
+        // disabled until a guest enables them.
+        assert_eq!(cfg.running.mask() & !cfg.population.mask(), 0, "a running slot is fitted");
+        let mut state = State::new(clock());
+        for slot in 0..2 {
+            state.w[reg::CPU_A_ENABLE as usize / 8 + slot] = u64::from(cfg.running.fitted(cfg.interface, slot));
+        }
+        Arc::new_cyclic(|weak| Self {
+            cfg,
+            state: Mutex::new(state),
+            clock,
+            hooks: Mutex::new(None),
+            irq: Mutex::new(None),
+            timers: OnceLock::new(),
+            timer: Mutex::new(None),
+            timer_pass: Mutex::new(()),
+            dispatch: ReentrantMutex::new(()),
+            driven: Mutex::new([None; 10]),
+            weak: weak.clone(),
+            refused: Mutex::new(Vec::new()),
+        })
+    }
+    pub fn set_node_hooks(&self, hooks: Arc<dyn NodeHooks>) {
+        let _dispatch = self.dispatch.lock();
+        *self.hooks.lock() = Some(hooks);
+    }
+    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
+        let _ = self.timers.set(tm);
+        self.schedule();
+    }
+    /// Lines 0..4 are slot A IP2..IP6; lines 5..9 are slot B IP2..IP6.
+    pub fn set_interrupt_controller(&self, irq: Arc<dyn InterruptController>) {
+        let _dispatch = self.dispatch.lock();
+        *self.irq.lock() = Some(irq);
+        *self.driven.lock() = [None; 10];
+        self.drive();
+    }
+    /// Whether a processor runs in `slot` of this interface.
+    fn started(&self, slot: usize) -> bool {
+        self.cfg.running.fitted(self.cfg.interface, slot)
+    }
+    /// The CPU-number register: the reading processor's slot in bit 0 and
+    /// this interface in bit 1; slot A for a reader that is no processor
+    /// here.
+    fn cpu_number(&self) -> u64 {
+        let interface = self.cfg.interface;
+        let slot = crate::cpu::smp::on_cpu_thread()
+            .and_then(|cpu| self.cfg.running.slot_of(cpu))
+            .filter(|&(i, _)| i == interface)
+            .map_or(0, |(_, slot)| slot as u64);
+        slot | u64::from(interface) << 1
+    }
+    fn hooks(&self) -> Option<Arc<dyn NodeHooks>> {
+        self.hooks.lock().clone()
+    }
+    /// Report an access to a register the model does not implement.
+    fn note(&self, off: u64, write: bool) {
+        crate::dlog!(crate::devlog::LogModule::Bedrock,
+            "Bedrock PI{} unsupported {} at {off:#x}", self.cfg.interface,
+            if write { "write" } else { "read" });
+    }
+    /// What the model could not carry out for a processor slot, with how many
+    /// times each happened. Each kind is logged once, on its first occurrence.
+    pub fn refused(&self) -> Vec<(Refused, u64)> {
+        self.refused.lock().clone()
+    }
+    fn refuse(&self, what: Refused) {
+        let mut refused = self.refused.lock();
+        if let Some((_, count)) = refused.iter_mut().find(|(seen, _)| *seen == what) {
+            *count += 1;
+        } else if refused.len() < 64 {
+            refused.push((what, 1));
+            crate::dlog!(crate::devlog::LogModule::Bedrock,
+                "Bedrock PI{}: not carried out: {what:?}", self.cfg.interface);
+        }
+    }
+    fn drive(&self) {
+        // Serialize publication, including reentrant reads by a controller.
+        // Publish one line at a time: a callback may change another line.
+        let _dispatch = self.dispatch.lock();
+        let irq = self.irq.lock().clone();
+        for line in 0..10 {
+            if self.state.lock().outputs()[line] && !self.started(line / 5) {
+                self.refuse(Refused::Interrupt { interface: self.cfg.interface, line });
+            }
+        }
+        if let Some(irq) = irq {
+            for line in 0..10 {
+                let level = self.state.lock().outputs()[line];
+                let changed = {
+                    let mut driven = self.driven.lock();
+                    let changed = driven[line] != Some(level);
+                    driven[line] = Some(level);
+                    changed
+                };
+                if changed {
+                    irq.set_line(line as u32, level);
+                }
+            }
+        }
+    }
+    fn schedule(&self) {
+        let _pass = self.timer_pass.lock();
+        let Some(tm) = self.timers.get() else { return };
+        let mut timer = self.timer.lock();
+        if let Some(id) = timer.take() {
+            tm.remove(id);
+        }
+        let s = self.state.lock();
+        if !s.running {
+            return;
+        }
+        let next = s
+            .rt_due
+            .iter()
+            .copied()
+            .chain([s.profile_due])
+            .chain(s.rearm.iter().filter(|&&v| v != 0).map(|&v| u128::from(v)))
+            .min()
+            .unwrap();
+        let delay = next
+            .saturating_sub(u128::from((self.clock)()))
+            .min(1_000_000_000)
+            .max(1) as u64;
+        drop(s);
+        *timer = Some(
+            tm.add_one_shot(Duration::from_nanos(delay), self.weak.clone(), |weak| {
+                if let Some(pi) = weak.upgrade() {
+                    {
+                        let _pass = pi.timer_pass.lock();
+                        let mut s = pi.state.lock();
+                        if !s.running {
+                            return TimerReturn::Delete;
+                        }
+                        s.sync((pi.clock)());
+                    }
+                    pi.drive();
+                    pi.schedule();
+                }
+                TimerReturn::Delete
+            }),
+        );
+    }
+    pub fn poll(&self) {
+        self.state.lock().sync((self.clock)());
+        self.drive();
+    }
+    pub fn set_pending(&self, bank: usize, bit: u8) {
+        if bank < 2 && bit < 64 {
+            self.state.lock().pending[bank] |= 1 << bit;
+            self.drive();
+        }
+    }
+    fn reflected(&self, bit: u8, level: bool) {
+        let mut s = self.state.lock();
+        if level {
+            s.reflected |= 1 << bit;
+        } else {
+            s.reflected &= !(1 << bit);
+        }
+        drop(s);
+        self.drive();
+    }
+    pub fn set_lb_error(&self, level: bool) {
+        self.reflected(55, level);
+    }
+    pub fn set_ni_error(&self, level: bool) {
+        self.reflected(62, level);
+    }
+    pub fn set_xb_error(&self, level: bool) {
+        self.reflected(54, level);
+    }
+    pub fn set_uart_irq(&self, level: bool) {
+        self.state.lock().uart = level;
+        self.drive();
+    }
+    pub fn set_memory_uncorrectable(&self) {
+        self.state.lock().w[0x400 / 8] |= MEMORY_ERROR;
+        self.drive();
+    }
+    pub fn set_level_source(&self, source: usize, level: u8, active: bool) {
+        if source < 256 && (!active || (7..=127).contains(&level)) {
+            self.state.lock().levels[source] = if active { level + 1 } else { 0 };
+            self.drive();
+        }
+    }
+    pub fn io_modify(&self, value: u64, region: u8) -> bool {
+        let mut s = self.state.lock();
+        if region >= 64 || s.w[2] & (1 << region) == 0 {
+            drop(s);
+            self.note(0x90, true);
+            return false;
+        }
+        let now = s.time((self.clock)());
+        s.modify(value, false, now);
+        drop(s);
+        self.drive();
+        true
+    }
+    fn read(&self, off: u64) -> u64 {
+        if (reg::GRAPHICS_BASE..reg::GRAPHICS_END).contains(&off) {
+            if let Some(v) = self
+                .hooks()
+                .and_then(|h| h.gfx_read(((off - 0x300) / 8) as usize))
+            {
+                return v;
+            }
+            self.note(off, false);
+            return 0;
+        }
+        let mut s = self.state.lock();
+        s.sync((self.clock)());
+        let value = match off {
+            reg::INTERFACE_ID => self.cpu_number(),
+            reg::INTERFACE_SLOT_A => u64::from(self.cfg.population.fitted(self.cfg.interface, 0)),
+            reg::INTERFACE_SLOT_B => u64::from(self.cfg.population.fitted(self.cfg.interface, 1)),
+            reg::PENDING_STATUS_A => s.pending(0),
+            reg::PENDING_STATUS_B => s.pending(1),
+            reg::PENDING_A_CLEAR => s.w[reg::REQUEST_A as usize / 8],
+            reg::PENDING_B_CLEAR => s.w[reg::REQUEST_B as usize / 8],
+            reg::ERROR_SUMMARY_ALIAS => s.w[reg::ERROR_SUMMARY as usize / 8],
+            reg::ERROR_CAPTURE_A | reg::ERROR_CAPTURE_B | reg::ERROR_CAPTURE_C | reg::ERROR_CAPTURE_D => s.w[(off - reg::PROTECTION_KEY) as usize / 8],
+            reg::CREDIT_MODE => s.credit_mode,
+            reg::COUNTER => s.count((self.clock)()),
+            _ if readable(off) => s.w[off as usize / 8],
+            _ => {
+                self.note(off, false);
+                0
+            }
+        };
+        drop(s);
+        self.drive();
+        if off == reg::COUNTER {
+            if let Some(h) = self.hooks() {
+                h.rt_counter_read(self.cfg.interface);
+            }
+        }
+        value
+    }
+    fn write(&self, off: u64, value: u64) {
+        // Keep register changes and their node notifications in one order.
+        // The state lock still drops before callbacks; dispatch is reentrant
+        // so a node callback can read registers and recompute IRQ outputs.
+        let _dispatch = self.dispatch.lock();
+        if (reg::GRAPHICS_BASE..reg::GRAPHICS_END).contains(&off) {
+            if !self
+                .hooks()
+                .is_some_and(|h| h.gfx_write(((off - 0x300) / 8) as usize, value))
+            {
+                self.note(off, true);
+            }
+            return;
+        }
+        let now = (self.clock)();
+        let mut s = self.state.lock();
+        s.sync(now);
+        let mut taken = None;
+        let mut alias = None;
+        let mut compare = None;
+        let mut enable = None;
+        let mut nmi = None;
+        let mut refused = Vec::new();
+        match off {
+            reg::NODE_REGION | reg::OFFSET_0010 | reg::OFFSET_0018 | reg::OFFSET_00A8 | reg::OFFSET_00B0 | reg::OFFSET_00B8 | reg::OFFSET_00C0 | reg::OFFSET_00E8 | reg::OFFSET_04C8 | reg::OFFSET_04D0 => {
+                s.w[off as usize / 8] = value
+            }
+            reg::PROTECTION_KEY => {
+                if value == IIO_PROTECT_OVRRD_KEY {
+                    s.w[0] |= 1 << self.cfg.request_region;
+                }
+            }
+            reg::CACHED_ALIAS => {
+                if s.w[5] != value & 15 {
+                    s.w[5] = value & 15;
+                    alias = Some((value & 15) as u8);
+                }
+            }
+            reg::OFFSET_0030 => s.w[6] = value & 255,
+            reg::OFFSET_0038 => s.w[7] = value & 0xffffff,
+            reg::CPU_A_ENABLE | reg::CPU_B_ENABLE => {
+                let slot = ((off - 0x50) / 8) as usize;
+                s.w[off as usize / 8] = value & 1;
+                enable = Some((slot, value & 1 != 0));
+                if value & 1 != 0 && !self.started(slot) {
+                    refused.push(Refused::Start { interface: self.cfg.interface, slot });
+                } else if value & 1 == 0 && self.started(slot) {
+                    refused.push(Refused::Stop { interface: self.cfg.interface, slot });
+                }
+            }
+            reg::NMI_SLOT_A | reg::NMI_SLOT_B => {
+                if value & 1 != 0 {
+                    nmi = Some(((off - 0x70) / 8) as usize);
+                } else {
+                    self.note(off, true);
+                }
+            }
+            reg::PENDING_MODIFY | reg::PENDING_MODIFY_B => {
+                let now = s.time(now);
+                s.modify(value, true, now);
+                // A clear (bit 8) of bank 0 (bit 6) of a graphics bit.
+                if value & 0x140 == 0 && matches!(value & 0x3f, 1 | 2) {
+                    taken = Some((value & 0x3f) as usize - 1);
+                }
+            }
+            reg::REQUEST_A | reg::REQUEST_B => s.w[off as usize / 8] |= 1 << self.cfg.request_region,
+            reg::PENDING_A_CLEAR | reg::PENDING_B_CLEAR => s.w[(off - reg::OFFSET_0010) as usize / 8] &= !value,
+            reg::OFFSET_00F0 => {
+                s.w[0xf0 / 8] = value & 31;
+                if value & 31 != 0 {
+                    self.note(off, true);
+                }
+            }
+            reg::RT_COMPARE_A | reg::RT_COMPARE_B => {
+                let slot = ((off - 0x108) / 8) as usize;
+                s.w[off as usize / 8] = value & RT_MASK;
+                s.arm_rt(slot, now);
+                compare = Some(slot);
+            }
+            reg::PROFILE_COMPARE => {
+                s.w[0x118 / 8] = value & 0xffffffff;
+                s.arm_profile(now);
+            }
+            reg::RT_STATUS_A | reg::RT_STATUS_B | reg::PROFILE_STATUS_A | reg::PROFILE_STATUS_B => s.w[off as usize / 8] = 0,
+            reg::RT_ENABLE_A | reg::RT_ENABLE_B | reg::PROFILE_ENABLE_A | reg::PROFILE_ENABLE_B => {
+                s.w[off as usize / 8] = value & 1;
+                let slot = usize::from(matches!(off, reg::RT_ENABLE_B | reg::PROFILE_ENABLE_B));
+                if value & 1 != 0 && !self.started(slot) {
+                    refused.push(Refused::Timer { interface: self.cfg.interface, slot });
+                }
+            }
+            reg::ERROR_SUMMARY_ALIAS => {
+                s.w[0x400 / 8] =
+                    (s.w[0x400 / 8] & MEMORY_ERROR) | (value & ERROR_MASK & !MEMORY_ERROR)
+            }
+            reg::ERROR_SUMMARY => s.w[reg::ERROR_SUMMARY as usize / 8] &= !(value & ERROR_MASK),
+            reg::ERROR_CAUSE_A | reg::ERROR_CAUSE_B => s.w[off as usize / 8] = value & ERROR_MASK,
+            reg::ERROR_ADDRESS_A | reg::ERROR_ADDRESS_B => s.w[off as usize / 8] = value & 0x1fffffff8,
+            reg::ERROR_CONTROL => {
+                s.w[0x428 / 8] = value & 15;
+                if value & 15 != 0 {
+                    self.note(off, true);
+                }
+            }
+            reg::ERROR_CAPTURE_A | reg::ERROR_CAPTURE_B | reg::ERROR_CAPTURE_C | reg::ERROR_CAPTURE_D => {
+                let slot = usize::from(off >= 0x450);
+                s.w[0x430 / 8 + slot * 4] = 0;
+                s.w[0x440 / 8 + slot * 4] = 0;
+            }
+            reg::ERROR_SOURCE_A | reg::ERROR_SOURCE_B => s.w[off as usize / 8] = value & 63,
+            reg::ERROR_DETAIL_A | reg::ERROR_DETAIL_B => s.w[off as usize / 8] = value & 0x1fffff,
+            reg::ERROR_DETAIL_C => s.w[off as usize / 8] = value & 0xfffff,
+            reg::CREDIT_MODE => s.credit_mode = value & 1,
+            reg::COUNTER => {
+                s.base = value & RT_MASK;
+                s.epoch = s.time(now);
+                s.arm_all(now);
+            }
+            _ => self.note(off, true),
+        }
+        drop(s);
+        let hooks = self.hooks();
+        for what in refused {
+            self.refuse(what);
+        }
+        if let Some(h) = &hooks {
+            if let Some(size) = alias {
+                h.cached_alias_changed(size);
+            }
+            if let Some(slot) = compare {
+                h.rt_compare_written(self.cfg.interface, slot);
+            }
+            if let Some((slot, value)) = enable {
+                h.cpu_enable(self.cfg.interface, slot, value);
+            }
+            // An NMI no node takes to a running processor is recorded, not lost.
+            if let Some(slot) = nmi {
+                if !(h.nmi(self.cfg.interface, slot) && self.started(slot)) {
+                    self.refuse(Refused::Nmi { interface: self.cfg.interface, slot });
+                }
+            }
+            if let Some(slot) = taken {
+                h.gfx_interrupt_taken(slot);
+            }
+        }
+        if let (None, Some(slot)) = (&hooks, nmi) {
+            self.refuse(Refused::Nmi { interface: self.cfg.interface, slot });
+        }
+        self.drive();
+        self.schedule();
+    }
+}
+fn readable(off: u64) -> bool {
+    matches!(
+        off,
+        reg::NODE_REGION | reg::OFFSET_0010
+            | reg::OFFSET_0018
+            | reg::CACHED_ALIAS
+            | reg::OFFSET_0030
+            | reg::OFFSET_0038
+            | reg::CPU_A_ENABLE
+            | reg::CPU_B_ENABLE
+            | reg::OFFSET_00A8
+            | reg::OFFSET_00B0
+            | reg::OFFSET_00B8
+            | reg::OFFSET_00C0
+            | reg::REQUEST_A
+            | reg::REQUEST_B
+            | reg::OFFSET_00E8
+            | reg::OFFSET_00F0
+            | reg::RT_COMPARE_A
+            | reg::RT_COMPARE_B
+            | reg::PROFILE_COMPARE
+            | reg::RT_STATUS_A
+            | reg::RT_STATUS_B
+            | reg::PROFILE_STATUS_A
+            | reg::PROFILE_STATUS_B
+            | reg::RT_ENABLE_A
+            | reg::RT_ENABLE_B
+            | reg::PROFILE_ENABLE_A
+            | reg::PROFILE_ENABLE_B
+            | reg::ERROR_SUMMARY
+            | reg::ERROR_CAUSE_A
+            | reg::ERROR_CAUSE_B
+            | reg::ERROR_ADDRESS_A
+            | reg::ERROR_ADDRESS_B
+            | reg::ERROR_CONTROL
+            | reg::OFFSET_0430
+            | reg::OFFSET_0440
+            | reg::OFFSET_0450
+            | reg::OFFSET_0460
+            | reg::ERROR_SOURCE_A
+            | reg::ERROR_DETAIL_A
+            | reg::ERROR_DETAIL_B
+            | reg::ERROR_DETAIL_C
+            | reg::ERROR_SOURCE_B
+            | reg::OFFSET_04C8
+            | reg::OFFSET_04D0
+    )
+}
+impl BusDevice for BedrockPi {
+    fn read64(&self, addr: u64) -> BusRead64 {
+        if addr < SIZE && addr & 7 == 0 {
+            BusRead64::ok(self.read(addr))
+        } else {
+            self.note(addr, false);
+            BusRead64::err()
+        }
+    }
+    fn read32(&self, addr: u64) -> BusRead32 {
+        if addr == reg::COUNTER || addr == reg::COUNTER + 4 {
+            let value = self.read(reg::COUNTER);
+            BusRead32::ok(if addr & 4 == 0 {
+                (value >> 32) as u32
+            } else {
+                value as u32
+            })
+        } else {
+            self.note(addr, false);
+            BusRead32::err()
+        }
+    }
+    fn write64(&self, addr: u64, value: u64) -> u32 {
+        if addr < SIZE && addr & 7 == 0 {
+            self.write(addr, value);
+            BUS_OK
+        } else {
+            self.note(addr, true);
+            BUS_ERR
+        }
+    }
+}
+impl Device for BedrockPi {
+    fn start(&self) {
+        let now = (self.clock)();
+        let mut s = self.state.lock();
+        if s.running {
+            return;
+        }
+        if let Some(paused) = s.paused.take() {
+            let delta = now.saturating_sub(paused);
+            s.epoch = s.epoch.saturating_add(delta);
+            for due in &mut s.rt_due {
+                *due += u128::from(delta);
+            }
+            s.profile_due += u128::from(delta);
+            for due in &mut s.rearm {
+                if *due != 0 {
+                    *due = due.saturating_add(delta);
+                }
+            }
+        }
+        s.running = true;
+        drop(s);
+        self.schedule();
+    }
+    fn stop(&self) {
+        {
+            let _pass = self.timer_pass.lock();
+            let mut s = self.state.lock();
+            s.sync((self.clock)());
+            s.paused = Some(s.time((self.clock)()));
+            s.running = false;
+            if let Some(id) = self.timer.lock().take() {
+                if let Some(tm) = self.timers.get() {
+                    tm.remove(id);
+                }
+            }
+        }
+        self.drive();
+    }
+    fn is_running(&self) -> bool {
+        self.state.lock().running
+    }
+    fn step(&self, _cycles: u64) {
+        self.poll();
+    }
+    fn get_clock(&self) -> u64 {
+        self.state.lock().count((self.clock)())
+    }
+}
+impl Resettable for BedrockPi {
+    fn power_on(&self) {
+        let _dispatch = self.dispatch.lock();
+        let now = (self.clock)();
+        let mut s = self.state.lock();
+        // These controls and captures survive the PI block's local reset.
+        let old = s.w;
+        let running = s.running;
+        let reflected = s.reflected;
+        let uart = s.uart;
+        *s = State::new(now);
+        for off in [
+            0, 0x10, 0x18, 0x28, 0x50, 0x58, 0x400, 0x418, 0x420, 0x428, 0x430, 0x440, 0x450,
+            0x460, 0x4c8, 0x4d0,
+        ] {
+            s.w[off / 8] = old[off / 8];
+        }
+        s.running = running;
+        s.paused = if running { None } else { Some(now) };
+        s.reflected = reflected;
+        s.uart = uart;
+        drop(s);
+        if let Some(h) = self.hooks() {
+            h.gfx_reset();
+            for slot in 0..2 {
+                let enabled = self.state.lock().w[0x50 / 8 + slot] != 0;
+                h.cpu_enable(self.cfg.interface, slot, enabled);
+            }
+        }
+        self.drive();
+        self.schedule();
+    }
+}
+#[cfg(test)]
+mod tests;

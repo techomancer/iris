@@ -41,7 +41,8 @@
 //! - `memory`, `scanout`, `reader`, `display`: board memory and planes; the
 //!   marks writers make and the display thread's own reader, with the scanned
 //!   frame and retrace; what reaches the window.
-//! - `pixel_dma`: DMA between guest memory and planes.
+//! - `pixel_dma`, `pi_gfx`: DMA between guest memory and planes, and graphics
+//!   credits for machines whose processor interface counts them.
 //! - `depth_word`: the board's 24-bit float depth word and its offset.
 //! - `consts`: register, command and field constants.
 //!
@@ -80,6 +81,12 @@ mod interface;
 mod clip;
 mod logic;
 mod mmio;
+mod pi_gfx;
+pub use pi_gfx::{PiGfx, PI_GFX_REGS};
+pub(crate) use pi_gfx::{
+    pi_gfx_mark_store, pi_gfx_unmark_store, PiGfxLink, PI_GFX_BIAS, PI_GFX_CREDIT, PI_GFX_CREDIT_MASK,
+    PI_GFX_INT_COUNT, PI_GFX_PAGE, PI_GFX_PAGE_ADDRESS, PI_GFX_PAGE_ENABLE, PI_GFX_SLOTS, PI_GFX_SLOT_REGS,
+};
 mod pixel_dma;
 mod pipe;
 mod pixel_write;
@@ -128,9 +135,15 @@ pub struct Odyssey {
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Carries a board interrupt packet into a machine's crosstalk fabric: the
+/// destination widget, the address within it, the vector, and whether the
+/// source rose or fell. False when nothing at the destination takes it.
+pub type PacketSender = Arc<dyn Fn(u8, u64, u8, bool) -> bool + Send + Sync>;
+
 impl Odyssey {
-    /// A board of `product` (v12, v10, v8, v6) at `widget`: its interrupt
-    /// packets reach `irq` (HEART), its DMA reaches `mem`.
+    /// A board of `product` (v12, v10, v8, v6) at `widget` on the Octane:
+    /// the processor reaches it through the IP30 widget windows, its
+    /// interrupt packets reach `irq` (HEART), its DMA reaches `mem`.
     pub fn new(
         widget: u8,
         product: &str,
@@ -140,26 +153,64 @@ impl Odyssey {
         pool: (usize, u32),
     ) -> Result<Arc<Self>, String> {
         let mut s = Board::new(product, widget as u32)?;
-        // The fragment pipeline's workers and tile size (`[graphics]`).
-        s.raster.set_pool(pool.0, pool.1);
-        // The recorder's slot is there whether or not a recording runs, so
-        // the monitor can start one (`vpro rec`); the DMA path records
-        // through it.
-        let rec = record::RecSlot::new(match std::env::var("IRIS_ODSY_REC") {
+        let rec = Self::recorder()?;
+        s.guest = Some(Self::recorded_mem(mem, &rec));
+        s.front.lock().irq = Some(irq);
+        Self::with_board(s, widget_small_base(widget), widget_large_base(widget), status, rec, pool)
+    }
+
+    /// A board of `product` at `widget` on a machine that hands the board
+    /// widget-relative addresses, as Bedrock's I/O interface does, and
+    /// carries its interrupt packets through `packets`.
+    pub fn new_widget_relative(
+        widget: u8,
+        product: &str,
+        packets: PacketSender,
+        mem: Arc<dyn BusDevice>,
+        status: Arc<crate::disp::StatusSource>,
+        pool: (usize, u32),
+    ) -> Result<Arc<Self>, String> {
+        let mut s = Board::new(product, widget as u32)?;
+        let rec = Self::recorder()?;
+        s.guest = Some(Self::recorded_mem(mem, &rec));
+        s.front.lock().packets = Some(packets);
+        // Every address is already an aperture offset: no large window.
+        Self::with_board(s, 0, u64::MAX, status, rec, pool)
+    }
+
+    /// The recorder's slot: there whether or not a recording runs, so the
+    /// monitor can start one (`vpro rec`); the DMA path records through it.
+    /// `IRIS_ODSY_REC` starts a recording at once.
+    fn recorder() -> Result<record::RecHandle, String> {
+        Ok(record::RecSlot::new(match std::env::var("IRIS_ODSY_REC") {
             Ok(path) => Some(record::Recorder::create(&path).map_err(|e| format!("IRIS_ODSY_REC {path}: {e}"))?),
             Err(_) => None,
-        });
-        let mem: Arc<dyn BusDevice> = Arc::new(record::RecordingMem { inner: mem, rec: rec.clone() });
-        s.guest = Some(mem);
-        s.front.lock().irq = Some(irq);
+        }))
+    }
+
+    /// `mem`, recorded through `rec`.
+    fn recorded_mem(mem: Arc<dyn BusDevice>, rec: &record::RecHandle) -> Arc<dyn BusDevice> {
+        Arc::new(record::RecordingMem { inner: mem, rec: rec.clone() })
+    }
+
+    fn with_board(
+        mut s: Box<Board>,
+        small: u64,
+        large: u64,
+        status: Arc<crate::disp::StatusSource>,
+        rec: record::RecHandle,
+        pool: (usize, u32),
+    ) -> Result<Arc<Self>, String> {
+        // The fragment pipeline's workers and tile size (`[graphics]`).
+        s.raster.set_pool(pool.0, pool.1);
         if let Ok(path) = std::env::var("IRIS_ODSY_TRACE") {
             s.trace.start(&path, trace::TRACE_ALL).map_err(|e| format!("IRIS_ODSY_TRACE {path}: {e}"))?;
         }
         let mut state = BoardLocks::new(s);
         state.rec = rec;
         Ok(Arc::new(Self {
-            small: widget_small_base(widget),
-            large: widget_large_base(widget),
+            small,
+            large,
             state,
             display: Arc::new(Display::new(status)),
             running: Arc::new(AtomicBool::new(false)),
@@ -171,6 +222,18 @@ impl Odyssey {
         // The host's cursor query reads the registers the display reads.
         self.display.attach_registers(self.state.shared.clone());
         self.display.clone()
+    }
+
+    /// Link the board to the node whose processor interfaces count its
+    /// graphics credits, as a Bedrock node does. With none linked, as on
+    /// the Octane and the Fuel, every credit call is a no-op.
+    pub(crate) fn set_pi_link(&self, link: Arc<dyn PiGfxLink>) {
+        self.state.front.lock().pi = Some(link);
+    }
+
+    /// The node link [`Self::set_pi_link`] set, if any.
+    pub(crate) fn pi_link(&self) -> Option<Arc<dyn PiGfxLink>> {
+        self.state.front.lock().pi.clone()
     }
 
     /// The aperture offset of `addr`, in either window.

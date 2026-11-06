@@ -270,6 +270,13 @@ const CELLS: &[Cell] = &[
     Cell { name: "r5000-jitv2",     features: "jitv2",      cpu: "r5000", expect_cpu: "R5000" },
     Cell { name: "r4400-lightning", features: "lightning",  cpu: "r4400", expect_cpu: "R4400" },
     Cell { name: "r4400-jitv2-lightning", features: "jitv2,lightning", cpu: "r4400", expect_cpu: "R4400" },
+    // The R10000 family. It always runs the shadow caches, so the default
+    // build covers it.
+    Cell { name: "r10000-interp",   features: "",           cpu: "r10000", expect_cpu: "R10000" },
+    Cell { name: "r12000-interp",   features: "",           cpu: "r12000", expect_cpu: "R12000" },
+    Cell { name: "r14000-interp",   features: "",           cpu: "r14000", expect_cpu: "R14000" },
+    Cell { name: "r16000-interp",   features: "",           cpu: "r16000", expect_cpu: "R16000" },
+    Cell { name: "r16000-700-interp", features: "",          cpu: "r16000_700", expect_cpu: "R16000" },
 ];
 
 fn build_cell(cell: &Cell, root: &Path, force: bool) -> Result<PathBuf, String> {
@@ -1077,12 +1084,20 @@ mod tests {
     #[test]
     fn every_cell_name_is_unique_and_maps_to_a_cpu() {
         for (i, a) in CELLS.iter().enumerate() {
-            assert!(a.expect_cpu == "R4400" || a.expect_cpu == "R5000");
+            assert!(["R4400", "R5000", "R10000", "R12000", "R14000", "R16000"].contains(&a.expect_cpu));
             // `expect_cpu` is what the `matrix` guard compares the guest's
             // `#machine cpu=` line against, so it must describe the `--cpu`
             // this cell actually passes. CPU is a runtime flag (see `Cell::cpu`),
             // not a cargo feature, so the two agreeing is the whole contract.
-            let want = match a.cpu { "r4400" => "R4400", "r5000" => "R5000", c => panic!("{}: unknown --cpu {}", a.name, c) };
+            let want = match a.cpu {
+                "r4400" => "R4400",
+                "r5000" => "R5000",
+                "r10000" => "R10000",
+                "r12000" => "R12000",
+                "r14000" => "R14000",
+                "r16000" | "r16000_700" => "R16000",
+                c => panic!("{}: unknown --cpu {}", a.name, c),
+            };
             assert_eq!(a.expect_cpu, want, "{}", a.name);
             for b in CELLS.iter().skip(i + 1) { assert_ne!(a.name, b.name); }
         }
