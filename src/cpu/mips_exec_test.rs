@@ -673,6 +673,9 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
         check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>();
     }
 
     /// JIT store callouts carry the same source register as the interpreter.
@@ -7614,6 +7617,11 @@ mod tests {
             assert_eq!(entry::<R10000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, (3 << 62) | (lo & !(3 << 32))));
             assert_eq!(entry::<R10000ShadowCache>(0), (0, 0xC0_0300_4000, (3 << 62) | lo));
             assert_eq!(entry::<R4400ShadowCache>(0xFFFF_C000), (0, 0x0300_4000, (lo & 0x3FFF_FFFF) | 0xC0));
+            // The R16000 types share the R10000 family's TLB.
+            let masked = (3 << 62) | (lo & !(3 << 32));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
         });
     }
 
@@ -7774,6 +7782,10 @@ mod tests {
             assert_eq!(ss_sb::<R10000ShadowCache>(), (1, 1));
             assert_eq!(ss_sb::<R12000ShadowCache>(), (2, 1));
             assert_eq!(ss_sb::<R12000O2ShadowCache>(), (2, 0));
+            // 4, 8 and 16 MB with 128-byte lines: SS codes 3, 4 and 5.
+            assert_eq!(ss_sb::<R16000ShadowCache>(), (3, 1));
+            assert_eq!(ss_sb::<R16000Scache8ShadowCache>(), (4, 1));
+            assert_eq!(ss_sb::<R16000Scache16ShadowCache>(), (5, 1));
         });
     }
 }

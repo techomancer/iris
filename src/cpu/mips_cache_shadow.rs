@@ -610,6 +610,7 @@ impl<
         model::R4400 => "R4400",
         model::R5000 => "R5000",
         model::R12000 => "R12000",
+        model::R16000 => "R16000",
         _ => "shadow",
     };
     const CACHE_KIND: &'static str = "shadow";
@@ -1055,6 +1056,27 @@ pub type R12000ShadowCache =
 pub type R12000Module4MShadowCache =
     ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
 
+/// The R16000 with a 4 MB secondary cache, the Tezro's 700 and 800 MHz parts:
+/// the R12000's geometry and programming model with the larger secondary (SS
+/// code 3 in Config) and 128-byte secondary lines (SB: a model choice). The
+/// PRId here is a placeholder: the part's own, `Part::prid`, is set at build
+/// time, as for the R14000. FIR 0x0900, the one R14000 value on record; a
+/// model choice: no R16000 FIR was found in the retained evidence.
+pub type R16000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0f41, 0x0000_0900, 64, { model::R16000 }>;
+
+/// The R16000 with an 8 MB secondary cache, the 900 MHz part's: the 4 MB type
+/// with twice the secondary (SS code 4). The size is a type parameter so the
+/// executor, the translator and the cache know it when they are built, and no
+/// run-time field is read to find it.
+pub type R16000Scache8ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 8388608, 128, true, 0x0000_0f50, 0x0000_0900, 64, { model::R16000 }>;
+
+/// The R16000 with a 16 MB secondary cache, the 1 GHz part's (SS code 5);
+/// otherwise the 4 MB type.
+pub type R16000Scache16ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 16777216, 128, true, 0x0000_0f50, 0x0000_0900, 64, { model::R16000 }>;
+
 /// R12000 3.5 as the O2 has it: the Octane part with 64-byte secondary lines
 /// (SB clear). With 128-byte lines the O2 PROM panics before its banner
 /// (write TLB miss at 0x0); 64 boots. IRIX on the O2 never reads SB and sizes
@@ -1294,6 +1316,20 @@ mod tests {
         }
         assert_eq!(run::<R12000ShadowCache>(), 0);
         assert_eq!(run::<R10000ShadowCache>(), 0x1_2345_6780);
+        assert_eq!(run::<R16000ShadowCache>(), 0, "the R16000 follows the R12000 and R14000");
+    }
+
+    /// The three R16000 types differ in the secondary cache alone: size, the
+    /// SS code Config reads from it, and the placeholder PRId each starts
+    /// with; the PRId a part really presents is `Part::prid`'s.
+    #[test]
+    fn the_r16000_types_differ_only_in_the_secondary_cache() {
+        fn id<C: CpuModel + MipsCache>() -> (u32, u32, usize, usize, &'static str, u32, u32, bool) {
+            (C::PRID, C::FIR, C::L2_SIZE, C::L2_LINE, C::NAME, C::VA_BITS, C::PA_BITS, C::R10K_CACHE_OPS)
+        }
+        assert_eq!(id::<R16000ShadowCache>(), (0xf41, 0x900, 4 << 20, 128, "R16000", 44, 40, true));
+        assert_eq!(id::<R16000Scache8ShadowCache>(), (0xf50, 0x900, 8 << 20, 128, "R16000", 44, 40, true));
+        assert_eq!(id::<R16000Scache16ShadowCache>(), (0xf50, 0x900, 16 << 20, 128, "R16000", 44, 40, true));
     }
 
     /// Geometry is what CP0 Config is built from, so it must be the real
@@ -1632,6 +1668,41 @@ mod tests {
         c.cache_op(C_IWBINV | CACH_PD, 0x8000_6040, 0);
         assert!(space.held_line_pages(v).is_empty());
         assert_eq!(c.read::<4>(0, 0x6000).data, 0x600d);
+    }
+
+    /// The R16000 parts keep the R10000 family's index operations: a valid
+    /// primary data line or secondary line holds its page in the CPU's view,
+    /// with 4, 8 and 16 MiB secondary caches, and Index Store Data fills it.
+    #[test]
+    fn the_r16000_types_hold_lines_in_the_view() {
+        fn run<C: MipsCache + From<Arc<dyn BusDevice>>>() {
+            let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+            let space = Box::new(space);
+            let bank = Arc::new(banks.remove(0));
+            let c = Box::new(C::from(bank.clone() as Arc<dyn BusDevice>));
+            let v = space.add_cached_view(&[c.tcache_bitmap_ptr()]).unwrap();
+            unsafe {
+                c.set_tcache_window(space.view_base(v));
+                c.set_cached_view(&*space, v);
+            }
+            space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+            bank.write32(0x2004, 0x5555_5555);
+            c.cache_op(C_R10K_ISD | CACH_PD, 0x8000_0004, 0xdead_beef);
+            c.cache_op(C_IST | CACH_PD, 0x8000_0000, pd_dirty(0x2000));
+            assert_eq!(space.held_line_pages(v), vec![0x2000]);
+            assert_eq!(c.read::<4>(0, 0x2004).data, 0xdead_beef);
+            assert_eq!(bank.read32(0x2004).data, 0x5555_5555, "memory never saw the line");
+            c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3008, 0x1111_2222_3333_4444);
+            c.cache_op(C_IST | CACH_SD, 0x8000_3000, sd_tag(0x3000, 2));
+            assert_eq!(space.held_line_pages(v), vec![0x2000, 0x3000]);
+            assert_eq!(c.read::<4>(0, 0x3008).data, 0x3333_4444, "TagLo at the lower address");
+            c.cache_op(C_IST | CACH_PD, 0x8000_0000, 0);
+            c.cache_op(C_IST | CACH_SD, 0x8000_3000, 0);
+            assert!(space.held_line_pages(v).is_empty());
+        }
+        run::<R16000ShadowCache>();
+        run::<R16000Scache8ShadowCache>();
+        run::<R16000Scache16ShadowCache>();
     }
 
     /// Power-on drops every held page. A snapshot taken while lines hold

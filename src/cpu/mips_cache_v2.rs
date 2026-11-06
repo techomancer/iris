@@ -1516,11 +1516,12 @@ pub mod model {
     pub const R5000: u8 = 1;
     pub const R10000: u8 = 2;
     pub const R12000: u8 = 3;
+    pub const R16000: u8 = 4;
 
     /// The R10000 family: the R10000 and the parts that follow it, which share
     /// one programming model.
     pub const fn r10k_family(model: u8) -> bool {
-        matches!(model, R10000 | R12000)
+        matches!(model, R10000 | R12000 | R16000)
     }
 }
 
