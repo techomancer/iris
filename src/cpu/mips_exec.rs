@@ -10927,6 +10927,11 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn count_hz_atomic(&self) -> Arc<AtomicU64>;
     #[cfg(feature = "jitv2")]
     fn jitv2(&self) -> Arc<Mutex<crate::cpu::jitv2::Jitv2>>;
+    /// Compile on this CPU's own thread, at the dispatch gate, from now on
+    /// (`JitCompile::Sync`). The compile pool must not be running: the inline
+    /// path uses the `Codegen` the pool would own.
+    #[cfg(feature = "jitv2")]
+    fn compile_on_cpu_thread(&self);
 }
 
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCpu<T, C> {
@@ -10988,6 +10993,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     }
     #[cfg(feature = "jitv2")]
     fn jitv2(&self) -> Arc<Mutex<crate::cpu::jitv2::Jitv2>> { MipsCpu::jitv2(self) }
+    #[cfg(feature = "jitv2")]
+    fn compile_on_cpu_thread(&self) {
+        self.executor.lock().jitv2_inline_compile = true;
+    }
 }
 
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Resettable for MipsCpu<T, C> {

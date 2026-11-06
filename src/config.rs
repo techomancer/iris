@@ -1323,6 +1323,24 @@ fn set_or_remove_env(key: &str, val: &str) {
     }
 }
 
+/// Where jitv2 compiles a region it has just found hot.
+///
+/// - `async`: on the compile pool's threads, while the CPU keeps interpreting
+///   the page until the compiled code is published. Fastest wall clock, but
+///   when a region switches from interpreted to compiled depends on thread
+///   timing, so no two runs execute the same host code.
+/// - `sync`: on the CPU thread, at the instruction that asked for it, and the
+///   compiled code runs at once. Slower to warm up, and the same every run.
+///   One CPU only: several share the pool's threads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "lower")]
+pub enum JitCompile {
+    #[default]
+    Async,
+    Sync,
+}
+
 /// jitv2 compile-pool tuning (`[jitv2]` section): the compile-pool thread
 /// count, fixed at process startup, never changed at runtime — see
 /// `CompileQueue::set_thread_count`'s own doc comment for why — plus the
@@ -1337,6 +1355,10 @@ fn set_or_remove_env(key: &str, val: &str) {
 pub struct Jitv2Config {
     #[serde(default = "default_jitv2_threads")]
     pub threads: usize,
+    /// Compile on the pool's threads (`async`, the default) or on the CPU
+    /// thread at the dispatch gate (`sync`). See [`JitCompile`].
+    #[serde(default)]
+    pub compile: JitCompile,
     /// Keep compiled pages on disk across runs (`IRIS_JIT_CACHE`). 86-95%
     /// warm hits in the measurements in `docs/jitv2-persistent-cache.md`.
     #[serde(default)]
@@ -1354,7 +1376,7 @@ fn default_jitv2_threads() -> usize { 1 }
 
 impl Default for Jitv2Config {
     fn default() -> Self {
-        Self { threads: default_jitv2_threads(), cache: false, cache_dir: String::new() }
+        Self { threads: default_jitv2_threads(), compile: JitCompile::default(), cache: false, cache_dir: String::new() }
     }
 }
 
@@ -2520,6 +2542,14 @@ impl MachineConfig {
                 "jitv2.threads must be at least 1 — 0 would silently degrade to no compile threads, everything sticky-fails to compile forever".into(),
             );
         }
+        if self.jitv2.compile == JitCompile::Sync {
+            if cfg!(feature = "lightning") {
+                return Err("jitv2.compile = \"sync\" is not available in a `lightning` build, which always compiles on the pool".into());
+            }
+            if self.machine.cpus > 1 {
+                return Err("jitv2.compile = \"sync\" needs one CPU: several share the compile pool's threads".into());
+            }
+        }
         Ok(())
     }
 
@@ -2635,6 +2665,12 @@ pub struct Cli {
     /// jitv2 compile-pool thread count (fixed at startup, see jitv2.threads)
     #[arg(long = "jitv2-threads", value_name = "N")]
     pub jitv2_threads: Option<usize>,
+
+    /// Where jitv2 compiles: `async` on the pool's threads (default) or `sync`
+    /// on the CPU thread, so a run executes the same host code every time.
+    /// One CPU only.
+    #[arg(long = "jitv2-compile", value_name = "MODE")]
+    pub jitv2_compile: Option<JitCompile>,
 
     /// SCSI ID 1 image path (HDD)
     #[arg(long)]
@@ -2896,6 +2932,7 @@ impl Cli {
         if let Some(v) = self.bank2    { cfg.banks[2] = v; }
         if let Some(v) = self.bank3    { cfg.banks[3] = v; }
         if let Some(n) = self.jitv2_threads { cfg.jitv2.threads = n; }
+        if let Some(m) = self.jitv2_compile { cfg.jitv2.compile = m; }
 
         // Helper: insert or update a SCSI device entry.
         let apply_scsi = |map: &mut std::collections::HashMap<u8, ScsiDeviceConfig>,
@@ -3274,6 +3311,40 @@ mod export_tests {
         assert!(parse_mac("00:80:19:12:34").is_err());
         assert!(parse_mac("zz:80:19:12:34:56").is_err());
         assert!(parse_mac("01:80:19:12:34:56").is_err(), "multicast bit must be rejected");
+    }
+
+    #[test]
+    fn jit_compile_defaults_to_the_pool() {
+        let cfg = MachineConfig::default();
+        assert_eq!(cfg.jitv2.compile, JitCompile::Async);
+        let parsed: MachineConfig = toml::from_str("").expect("parse");
+        assert_eq!(parsed.jitv2.compile, JitCompile::Async);
+    }
+
+    #[test]
+    fn jit_compile_reads_from_toml_and_the_command_line() {
+        let parsed: MachineConfig =
+            toml::from_str("[jitv2]\ncompile = \"sync\"\n").expect("parse");
+        assert_eq!(parsed.jitv2.compile, JitCompile::Sync);
+        assert!(toml::from_str::<MachineConfig>("[jitv2]\ncompile = \"inline\"\n").is_err());
+
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["iris", "--jitv2-compile", "sync"])
+            .expect("parse flags");
+        assert_eq!(cli.jitv2_compile, Some(JitCompile::Sync));
+        assert!(Cli::try_parse_from(["iris", "--jitv2-compile", "never"]).is_err());
+    }
+
+    #[test]
+    #[cfg(not(feature = "lightning"))]
+    fn sync_compile_needs_one_cpu() {
+        let mut cfg = MachineConfig::default();
+        cfg.jitv2.compile = JitCompile::Sync;
+        cfg.validate().expect("sync compile on the default machine");
+        cfg.machine.profile = MachineProfile::OctaneIp30;
+        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpus = 2;
+        assert!(cfg.validate().unwrap_err().contains("one CPU"));
     }
 
     #[test]

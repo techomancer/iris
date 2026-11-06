@@ -2773,6 +2773,27 @@ pub(crate) fn push_compile_request(
     accepted
 }
 
+/// Start compiling for `cpu` the way `mode` asks. `Async` starts the pool.
+/// `Sync` leaves it stopped and has the CPU compile at its dispatch gate with
+/// the `Codegen` that `Jitv2` keeps idle for that, as the monitor's `j2 inline
+/// on` does at run time. Call with no lock on `jit` held.
+#[cfg(not(feature = "jitv2_lockstep"))]
+pub fn start_compiling(
+    cpu: &dyn crate::cpu::mips_exec::CpuDevice,
+    jit: &Mutex<Jitv2>,
+    mode: crate::config::JitCompile,
+    bus: Arc<dyn BusDevice>,
+) {
+    match mode {
+        crate::config::JitCompile::Async => {
+            let mut g = jit.lock();
+            let stats = g.stats.clone();
+            g.compile_queue.start(bus, stats);
+        }
+        crate::config::JitCompile::Sync => cpu.compile_on_cpu_thread(),
+    }
+}
+
 pub struct CompileQueue {
     /// The ISA level every worker's `Analyzer` walks at — the `CpuModel`'s
     /// `MIPS4` const, set by `MipsExecutor::new` through [`set_isa`] before
