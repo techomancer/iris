@@ -1,6 +1,6 @@
 # The audio test suite (`test/audiotest`): rates x channels x widths
 
-**Keywords:** audio,rad1,octane,o2,mace,sample rate,alSetParams,playaiff,sfplay,audiotest,sweep,capture,IRIS_OCTANE_AUDIO_WAV,IRIS_O2_AUDIO_DUMP
+**Keywords:** audio,rad1,octane,o2,mace,sample rate,alSetParams,playaiff,sfplay,audiotest,sweep,capture,IRIS_AUDIO_DUMP,IRIS_O2_AUDIO_DUMP
 
 A guest program that plays a tone through the IRIX audio library, a sweep
 that runs it and the stock players over every rate and format, and a host
@@ -48,14 +48,15 @@ socket on (`ci = true`, `ci_socket`), plus a scratch volume for `iris-ci put`
 (`[scsi.N]` with `scratch = true`). The emulator records the card's output
 to a file:
 
-- Octane: `IRIS_OCTANE_AUDIO_WAV=FILE` writes a 44.1 kHz stereo 16-bit WAV.
+- Octane: `IRIS_AUDIO_DUMP=FILE.wav` (a name ending in `.wav`; this was
+  `IRIS_OCTANE_AUDIO_WAV`) writes a 44.1 kHz stereo 16-bit WAV.
 - O2: `IRIS_O2_AUDIO_DUMP=FILE` writes what MACE audio played at the guest's
   own rate, before resampling, as records of output (u8), rate (u32) and
   pair count (u32), then the pairs, little-endian. It needs no host sound
   device. `check.py` measures each case at its records' rate.
 
 ```sh
-IRIS_OCTANE_AUDIO_WAV=/path/cap iris --config octane.toml &   # or
+IRIS_AUDIO_DUMP=/path/cap.wav iris --config octane.toml &   # or
 IRIS_O2_AUDIO_DUMP=/path/cap iris --config o2.toml &          # then: iris-ci start
 sh test/audiotest/host.sh /path/ci.sock /path/cap /path/out [EGREP_PATTERN]
 python3 test/audiotest/check.py /path/cap /path/out/marks.txt

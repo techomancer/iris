@@ -3,7 +3,7 @@
 #
 # The guest is an Octane or an O2 with a MIPSpro compiler, logged in or
 # loginable, with iris started with the control socket SOCKET and the capture
-# file in its environment: IRIS_OCTANE_AUDIO_WAV=CAPTURE on the Octane,
+# file in its environment: IRIS_AUDIO_DUMP=CAPTURE.wav on the Octane,
 # IRIS_O2_AUDIO_DUMP=CAPTURE on the O2. This copies the test in, builds it,
 # plays each case from sweep.sh (only those matching the egrep PATTERN, if
 # given), and writes OUT/marks.txt. Then run check.py CAPTURE OUT/marks.txt.

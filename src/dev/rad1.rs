@@ -165,8 +165,6 @@ const STALL_REPAY_DIV: i64 = 32;
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// The rate of a clock generator no guest has programmed.
 const FREQ_ANALOG: u64 = 44100;
-/// The WAV capture's rate.
-const WAV_RATE: u32 = 44100;
 const FREQ_AES_SUB: u64 = 48000 / 192;
 /// Ring bytes moved per DMA access; a whole number of frames of any type.
 const CHUNK_BYTES: u64 = 1024;
@@ -293,15 +291,14 @@ impl Rate {
 }
 
 /// Where decoded output goes: the host stream (through the shared resampler),
-/// an optional 44.1 kHz WAV file of what the card played, and for tests a
+/// an optional dump file of what the card played (see `audio_dump`), and for tests a
 /// plain buffer of the card's own frames.
 struct Sink {
     host: Option<(HostOut, Resampler)>,
     /// When the host stream was last tried and failed to open.
     host_failed_at: Option<Instant>,
-    wav: Option<Wav>,
-    /// IRIS_AUDIO_DUMP=<file>: every frame the card plays at its own rate,
-    /// before resampling, with or without a host sound device. A muted card
+    /// IRIS_AUDIO_DUMP=<file>: what the card plays, raw at its own rate or as
+    /// a 44.1 kHz WAV, with or without a host sound device. A muted card
     /// records the silence it plays.
     dump: Option<crate::dev::audio_dump::AudioDump>,
     lead: Lead,
@@ -366,7 +363,7 @@ impl Sink {
     }
 
     /// Play stereo frames the card produced at `rate` Hz. A muted output
-    /// still moves the ring; the host and the WAV get silence. Returns the
+    /// still moves the ring; the host and the dump get silence. Returns the
     /// host ring's free and total samples.
     fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) -> Option<(usize, usize)> {
         let silence;
@@ -394,9 +391,6 @@ impl Sink {
                 }
             }
         }
-        if let Some(w) = self.wav.as_mut() {
-            w.play(host_pcm, rate);
-        }
         if let Some(d) = self.dump.as_ref() {
             d.record(None, rate, host_pcm.chunks_exact(PCM_CHANNELS).map(|p| (p[0], p[1])));
         }
@@ -404,75 +398,6 @@ impl Sink {
             t.lock().extend_from_slice(pcm);
         }
         self.host.as_ref().map(|(out, _)| (out.producer.slots(), out.producer.buffer().capacity()))
-    }
-}
-
-/// A 44.1 kHz stereo 16-bit WAV of the output, converted from the card's
-/// rate, its sizes rewritten after every append so a file from a killed run
-/// still plays. A debugging aid: `IRIS_OCTANE_AUDIO_WAV`.
-struct Wav {
-    file: std::fs::File,
-    data_bytes: u32,
-    rs: Resampler,
-}
-
-impl Wav {
-    fn create(path: &std::ffi::OsStr) -> Option<Self> {
-        let file = std::fs::File::create(path).ok()?;
-        let mut w = Self { file, data_bytes: 0, rs: Resampler::new(WAV_RATE, WAV_RATE) };
-        w.header().ok()?;
-        Some(w)
-    }
-
-    /// Append frames the card produced at `rate` Hz.
-    fn play(&mut self, pcm: &[i16], rate: u32) {
-        if self.rs.in_rate != rate {
-            self.rs = Resampler::new(rate, WAV_RATE);
-        }
-        if self.rs.passthrough() {
-            self.append(pcm);
-            return;
-        }
-        // The resampler writes into a ring; take its output back out.
-        let frames = pcm.len() / PCM_CHANNELS;
-        let room = (frames * WAV_RATE as usize / rate.max(1) as usize + 2) * PCM_CHANNELS;
-        let (mut prod, mut cons) = rtrb::RingBuffer::<i16>::new(room);
-        for p in pcm.chunks_exact(PCM_CHANNELS) {
-            self.rs.push(p[0], p[1], &mut prod);
-        }
-        let out: Vec<i16> = std::iter::from_fn(|| cons.pop().ok()).collect();
-        self.append(&out);
-    }
-
-    fn header(&mut self) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
-        let rate = WAV_RATE;
-        let mut h = Vec::with_capacity(44);
-        h.extend_from_slice(b"RIFF");
-        h.extend_from_slice(&(36 + self.data_bytes).to_le_bytes());
-        h.extend_from_slice(b"WAVEfmt ");
-        h.extend_from_slice(&16u32.to_le_bytes());
-        h.extend_from_slice(&1u16.to_le_bytes());
-        h.extend_from_slice(&(PCM_CHANNELS as u16).to_le_bytes());
-        h.extend_from_slice(&rate.to_le_bytes());
-        h.extend_from_slice(&(rate * 4).to_le_bytes());
-        h.extend_from_slice(&4u16.to_le_bytes());
-        h.extend_from_slice(&16u16.to_le_bytes());
-        h.extend_from_slice(b"data");
-        h.extend_from_slice(&self.data_bytes.to_le_bytes());
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&h)?;
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(())
-    }
-
-    fn append(&mut self, pcm: &[i16]) {
-        use std::io::Write;
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        if self.file.write_all(&bytes).is_ok() {
-            self.data_bytes = self.data_bytes.wrapping_add(bytes.len() as u32);
-            let _ = self.header();
-        }
     }
 }
 
@@ -1059,9 +984,8 @@ impl Inner {
                 sk.host_failed_at = failed_at;
             }
             None => {
-                let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
                 let dump = crate::dev::audio_dump::AudioDump::from_env();
-                *sink = Some(Sink { host, host_failed_at: failed_at, wav, dump, lead: Lead::default(), tap: None });
+                *sink = Some(Sink { host, host_failed_at: failed_at, dump, lead: Lead::default(), tap: None });
             }
         }
     }

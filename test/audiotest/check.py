@@ -4,7 +4,7 @@
 CAPTURE is the card's capture, in either of two forms (told apart by the first
 four bytes):
 
-  Octane  a WAV, 44.1 kHz stereo 16-bit (IRIS_OCTANE_AUDIO_WAV). MARKS holds
+  Octane  a WAV, 44.1 kHz stereo 16-bit (IRIS_AUDIO_DUMP=x.wav). MARKS holds
           byte offsets into its data chunk.
   O2      a dump of what MACE audio played at the guest's own rate
           (IRIS_O2_AUDIO_DUMP): records of out:u8, rate:u32, pairs:u32, then
