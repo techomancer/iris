@@ -168,6 +168,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
 - `cpu` takes the parts each machine shipped with, such as `r12000_360` on the Octane, or a family name for the machine's own. The Indy and Indigo2 R4400 is now rev 5.0 at 150 MHz, the O2 R10000 rev 3.4 at 250 MHz, and an Indy no longer takes an R10000 (the R10000 Indigo2 is the IP28). The R12000 and R14000 are new.
+- The R16000 is a family of its own, with four parts for the Tezro (`r16000_700` rev 2.1, `r16000_800` rev 2.2, `r16000_900` and `r16000_1000` rev 3.0) and a 4, 8 or 16 MB secondary cache picked once when a machine is built, so no run-time field or branch is added. `hinv` prints an R16000's major revision two below the PRId register's, and the part table undoes that in one place. The FIR is 0x0900, the one R14000 value on record; a model choice. No machine takes them yet.
 
 ### Onyx2
 

@@ -4544,6 +4544,22 @@ mod tests {
         }
     }
 
+    /// The R16000 types take the R10000 family's LWR path, whatever their
+    /// secondary cache.
+    #[test]
+    fn jit_lwr_matches_the_interpreter_on_the_r16000() {
+        use crate::cpu::mips_cache_shadow::{R16000Scache16ShadowCache, R16000Scache8ShadowCache, R16000ShadowCache};
+        use crate::cpu::mips_core::STATUS_KX;
+        fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>() {
+            let (interp, jit) = lwr_both::<C>(STATUS_KX, 1);
+            assert_eq!(jit, interp, "{}", C::NAME);
+            assert_eq!(interp.gpr[2] >> 32, 0x1122_3344, "{} keeps the upper word", C::NAME);
+        }
+        check::<R16000ShadowCache>();
+        check::<R16000Scache8ShadowCache>();
+        check::<R16000Scache16ShadowCache>();
+    }
+
     /// One instruction at 0x1000, interpreted and compiled, on CPU model `C`
     /// after `setup`. The JIT learns the model's choices from
     /// `install_jit_hooks`, as in production.
