@@ -316,6 +316,18 @@ nothing platform-specific. Pass `--iris` to measure a *different* emulator
 binary in a subprocess instead — which is what `matrix` does, and what CI does
 for each cell, because a cell's features live in its binary.
 
+`run --deterministic` makes two runs do the same work. The suite sizes each
+kernel's iteration count from the test device's clock, so on the host clock a
+faster or slower run picks a different count, and the compile pool finishes
+regions at different times. With the flag, JIT compiles happen on the CPU
+thread and, in a `ci_clock` build (required), the test device's clock is
+derived from retired instructions (`--jitv2-compile sync`, which it passes on
+with `--iris`), so guest instruction counts match exactly and host instructions
+retired match to a few parts per million. The rates it prints are constant by
+construction: use it to compare instruction counts and host cost (`perf stat`),
+and the normal mode for speed. The result is labelled
+`<label>+deterministic`.
+
 `matrix` builds a **separate emulator per feature set**, because the JIT and
 `lightning` are compile-time cargo features. The CPU is not: it is passed as
 `--cpu`, so cells that differ only by CPU share one binary.

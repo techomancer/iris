@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 
 use crate::bench_report::{host_info, parse_block, Run};
 use crate::benchsuite;
-use crate::config::{CpuModel, MachineConfig};
+use crate::config::{CpuModel, JitCompile, MachineConfig};
 use crate::machine::Machine;
 use crate::dev::testdev::{RunConfig, TestDevice};
 
@@ -62,6 +62,12 @@ pub struct BenchOptions {
     pub cpu: CpuModel,
     /// Cache model, as `[machine] cache`.
     pub cache: crate::config::CacheModel,
+    /// Make two runs do the same work: compile on the CPU thread
+    /// (`jitv2.compile = "sync"`). Needs a `ci_clock` build, whose test device
+    /// clock counts retired instructions, so the iteration counts the suite
+    /// picks by time are the same every run. The rates it reports are then constant
+    /// by construction; compare instruction counts and host cost instead.
+    pub deterministic: bool,
     /// Set this to abort. The machine is stopped and `run` returns an error —
     /// there is no partial report, because the suite prints its block only at
     /// the end. Exists so an interactive caller's Stop button does something
@@ -77,6 +83,7 @@ impl Default for BenchOptions {
             banks: BENCH_BANKS,
             cpu: CpuModel::default(),
             cache: crate::config::CacheModel::default(),
+            deterministic: false,
             timeout: Duration::from_secs(1800),
             cancel: None,
         }
@@ -148,9 +155,15 @@ fn run_inner(
         Arc::new(TestDevice::new_embedded(sink.clone(), on_exit, cfg))
     };
 
+    if opts.deterministic && !cfg!(feature = "ci_clock") {
+        return Err("--deterministic needs a build with the `ci_clock` feature: the suite sizes its work by the test device's clock, which only counts retired instructions there".into());
+    }
     let started = Instant::now();
     let mut cfg = bench_config(opts.banks, opts.cpu);
     cfg.machine.cache = opts.cache;
+    if opts.deterministic {
+        cfg.jitv2.compile = JitCompile::Sync;
+    }
     let mut machine = Box::new(Machine::new_with_testdev(cfg, Some(testdev)));
     // Deliberately no `register_system_controller`: it hands a raw pointer to
     // this Machine to a thread that outlives the call, and this one is dropped
@@ -323,7 +336,6 @@ fn tail(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{JitCompile, TestDeviceClock};
 
     /// The whole embedded path end to end: build a machine, load the suite out
     /// of the binary, run it, parse what it printed. Quick mode so it is a test
@@ -482,9 +494,8 @@ mod tests {
                 let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
                 let done = Arc::new(AtomicBool::new(false));
                 let on_exit = { let done = done.clone(); Box::new(move |_| done.store(true, Ordering::Release)) };
-                let clock = if deterministic { TestDeviceClock::Guest } else { TestDeviceClock::Host };
                 let testdev = Arc::new(
-                    TestDevice::new_embedded(sink.clone(), on_exit, RunConfig::ALL).with_clock(clock));
+                    TestDevice::new_embedded(sink.clone(), on_exit, RunConfig::ALL));
                 let mut cfg = bench_config([32, 0, 0, 0], CpuModel::default());
                 if deterministic {
                     cfg.jitv2.compile = JitCompile::Sync;
@@ -511,15 +522,16 @@ mod tests {
     /// same work every run: the same loop count, whatever else the host is
     /// doing.
     #[test]
+    #[cfg(feature = "ci_clock")]
     fn deterministic_mode_repeats_a_time_sized_guest_exactly() {
         let a = run_clock_spin(true);
         let b = run_clock_spin(true);
         assert_eq!(a.len(), 4, "the guest prints its loop count: {a:?}");
         assert_eq!(a, b, "two deterministic runs must agree");
-        // A pass is six instructions at 4 ns each, so 20 us is about 833 of
-        // them, give or take the setup and the reads at the edges.
+        // A pass is six instructions at NS_PER_GUEST_CYCLE each, so 20 us is
+        // about 333 of them, give or take the setup and the reads at the edges.
         let passes = u32::from_be_bytes([a[0], a[1], a[2], a[3]]);
-        assert!((830..=837).contains(&passes), "loop count {passes} does not follow the guest clock");
+        assert!((331..=336).contains(&passes), "loop count {passes} does not follow the guest clock");
     }
 
     #[test]
