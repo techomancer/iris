@@ -219,7 +219,10 @@ impl CommandFifo {
 
     /// Whether the host ring has room for another store.
     fn has_room(&self) -> bool {
-        self.stores() < RING_STORES
+        // The ring's own view too: its published head can lag the stores
+        // retired, and a push it refuses would leave the processor spinning
+        // on the host, with no interrupts, instead of answered busy.
+        self.stores() < RING_STORES && self.ring.has_space()
     }
 
     /// The stores waiting.
@@ -325,11 +328,10 @@ impl CommandFifo {
         self.levels.stores.fetch_add(1, SeqCst);
         let before = self.levels.words.fetch_add(words, SeqCst);
         if !self.ring.try_push(q.entry(), q.value) {
-            // With one processor this cannot happen: has_room counted the
-            // ring's stores and nothing else pushes. With two, the other
-            // processor's store can hold the ring's lock, or take the last
-            // place between has_room and here. Refused, the store is pushed
-            // again (`write_command`). Nothing took it out, so its counts
+            // has_room reads the ring's own view and `submit` serialises
+            // the producers, so this should not happen; if it does, the
+            // store is refused (answered busy on the bus, pushed again by
+            // `write_command` off it). Nothing took it out, so its counts
             // come back off.
             self.levels.words.fetch_sub(words, SeqCst);
             self.levels.stores.fetch_sub(1, SeqCst);
@@ -381,6 +383,9 @@ impl CommandFifo {
         let words: u32 = ran.iter().map(QueuedStore::words).sum();
         let _c = self.pop.lock();
         self.ring.consume_n_at(0, n);
+        // Publish the head with the run, so the room the counts below give
+        // back is room the ring shows a producer too (has_room).
+        self.ring.flush_head();
         if self.levels.words.load(SeqCst) < cfifo::LOW_WATER + words {
             let mut f = front.lock();
             let before = self.levels.words.fetch_sub(words, SeqCst);

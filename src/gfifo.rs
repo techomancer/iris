@@ -97,6 +97,18 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         slow
     }
 
+    /// Whether a push would find a free slot now, as `try_push` judges it:
+    /// against the heads the consumers have published, which may lag what
+    /// they have consumed (`consume_at` publishes in batches). For a
+    /// producer that must not record or commit a store before knowing it
+    /// will go in. Only producers move `tail`, so with the producers
+    /// serialised a true here stays true until the next push.
+    #[inline]
+    pub fn has_space(&self) -> bool {
+        let tail = self.tail.load(Ordering::Acquire);
+        (tail.wrapping_add(1) & Self::MASK) != self.slowest_head(tail)
+    }
+
     /// Capacity in entries (one slot is always kept empty).
     pub const DEPTH: usize = DEPTH;
 
@@ -675,6 +687,27 @@ mod tests {
         f.consume_n_at(0, 2);
         assert!(f.is_empty(), "the run that empties the queue publishes the head");
         assert_eq!(f.peek_run_at(0, &mut rest), 0);
+    }
+
+    /// `has_space` answers as `try_push` would: entries a consumer has taken
+    /// but not yet published still hold their slots, and publishing them
+    /// frees them.
+    #[test]
+    fn space_waits_for_the_published_head() {
+        let f: Box<GFifo<256>> = Box::new(GFifo::new());
+        for i in 0..255 {
+            assert!(f.try_push(i, 0));
+        }
+        assert!(!f.has_space() && !f.try_push(255, 0), "full");
+        // Three taken, short of a 64-entry boundary and of empty: not yet
+        // published, so the producer still sees the ring full.
+        let mut run = [(0u32, 0u64); 3];
+        assert_eq!(f.peek_run_at(0, &mut run), 3);
+        f.consume_n_at(0, 3);
+        assert!(!f.has_space() && !f.try_push(255, 0), "the head is not published yet");
+        f.flush_head();
+        assert!(f.has_space());
+        assert!(f.try_push(255, 0));
     }
 
     #[test]

@@ -272,6 +272,8 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 | [lanes-field-view-is-eight-bytes.md](odyssey/lanes-field-view-is-eight-bytes.md) | rule | Window moves copy 16-byte pixels as two 8-byte halves; a lanes field's view length must be 8, not 6 (ghost text in title bars) |
 | [screen-tiles.md](odyssey/screen-tiles.md) | design | The fragment pipeline on screen tiles: one command per primitive, its index on every tile it touches, one owner per tile walks, shades and stores in order; bit-exact; Quake replay 86 s (three stages) to 18 s (64-pixel tiles, 16 workers) |
 | [quake-replay-is-fragment-bound.md](odyssey/quake-replay-is-fragment-bound.md) | measure | Whole Quake replay at 2 workers: ~550 cycles per textured fragment (texture 48%), front end waits most of the run, fences moved onto the ring (no wall change); quads as lanes plus fearless_simd kernels took the full replay from ~193 s to 152 s; unpinned workers on the 2990WX cost 60% more CPU across dies |
+| [a-refused-command-store-answers-busy-never-spins.md](odyssey/a-refused-command-store-answers-busy-never-spins.md) | rule | RAD "thread held off" under Quake: the room check counted retired stores while the GFifo head is published lazily, so `write_command` spun on the host with no interrupts; check the ring's own view and answer busy |
+| [sharegroup-warning-at-gl-exit-is-normal.md](odyssey/sharegroup-warning-at-gl-exit-is-normal.md) | rule | `odsy: attempted sharegroup operation from unbound gfxp` at GL program exit is normal: a real V10 logs it 57 times when tyrquake quits; only a sign of trouble mid-run or after a teardown |
 
 ## hostgl/
 

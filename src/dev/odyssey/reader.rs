@@ -203,6 +203,11 @@ impl SharedRegs {
         self.gen.fetch_add(1, Release);
     }
 
+    /// Scan-out entry 0x2800 + index (frame::pbj).
+    pub fn pbj(&self, index: usize) -> u32 {
+        self.pbj[index].load(Relaxed)
+    }
+
     pub fn set_pbj(&self, index: usize, value: u32) {
         self.pbj[index].store(value, Relaxed);
         self.gen.fetch_add(1, Release);

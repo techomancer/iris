@@ -264,8 +264,14 @@ must keep them.
 7. The display waits for nothing: it copies what is in the planes and the
    registers when the frame runs. Rows and entries it copies half-written
    are copied again at the next frame.
-8. The back end's display-FIFO level (`0x106c` bits 6:0) stays 0: back-end
-   writes apply when the front end runs them.
+8. The display FIFO (+0x400000) is its own path to the back end, with its
+   own lock (`display_fifo.rs`): a processor's store to it, and its reads of
+   the read window and the I2C words, land at once, whatever the command
+   FIFO and the raster unit hold. Its level (`0x106c` bits 6:0) stays 0. The
+   driver paces it by that level alone, and makes some of its stores with
+   interrupts masked (a pending cursor position flushed under the display
+   FIFO's spin lock), so answering one busy until the command FIFO drained
+   kept the guest masked for the whole drain.
 
 ## Tracing it
 

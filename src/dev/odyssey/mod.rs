@@ -20,8 +20,9 @@
 //! - `fifo`: the command FIFO between the processor and the board's thread.
 //! - `worker`: the board's thread, which runs the queued stores.
 //! - `raster_unit`: the raster unit's thread and the queue that feeds it.
-//! - `registers`: identity, the board NIC, the cursor and the back end's
-//!   register file.
+//! - `registers`: identity, the board NIC and the widget registers.
+//! - `display_fifo`: the display FIFO, PB&J's register file (cursor, lookup
+//!   RAM, display modes, scan-out size, I2C), with its own lock.
 //! - `command`: the command-FIFO interpreter.
 //! - `context`: graphics context save and switch.
 //! - `draw`: buffers, integer drawing and the image path.
@@ -66,6 +67,7 @@ mod depth_word;
 mod display;
 #[cfg(test)]
 mod display_bench;
+mod display_fifo;
 mod dma;
 mod draw;
 mod field;

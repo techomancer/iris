@@ -63,10 +63,6 @@ impl Scanout {
         crate::dlog!(LogModule::Odyssey, "sgi-odyssey: scanout mode: {}x{} frame {} clocks at {} Hz", self.mode.width, self.mode.height, self.mode.frame_clocks, self.mode.clock_hz);
         self.shared.publish_mode(self.mode);
     }
-    /// Restart the retrace phase.
-    pub fn reset(&mut self) {
-        self.shared.restart_retrace();
-    }
 }
 
 /// Nanoseconds in a second.
