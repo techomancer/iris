@@ -16,6 +16,11 @@ that lists AUTH_UNIX.
 
 Fix (src/net/portmap.rs, src/net/nfsudp.rs): GETPORT answers 0 for a
 non-UDP mapping, and the v3 MNT reply lists AUTH_UNIX and AUTH_NULL.
-Credentials are still not checked. A plain `mount` now prints "Program not
-registered" for its TCP attempts and mounts NFSv2 over UDP; `-o
-vers=3,proto=udp` mounts NFSv3.
+Credentials are still not checked. `-o proto=udp` mounts (NFSv3; `-o
+proto=udp,vers=2` for v2), and `tools/irix-sh.py mount-shared` passes it.
+
+A plain `mount` still does not mount on 6.5.30 (corrected 2026-11-06): it
+prints "cannot connect to mountd ... Program not registered" for v3 and
+then v2, both over TCP, and does not fall back to UDP within 300 s. Before
+the fix it failed with "Connection refused" instead. A plain mount working
+needs the MOUNT and NFS programs served over TCP too.
