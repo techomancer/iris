@@ -287,10 +287,11 @@ impl Draw<'_> {
         let mut texel = [[0i32; 4]; 4];
         if self.textured {
             let at = |dx: f64, dy: f64| std::array::from_fn(|k| (frag.tex[k] + dx * frag.dx[k] + dy * frag.dy[k]) as f32);
-            let q = TexQuad { c: [at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0), at(1.0, 1.0)] };
+            let px: [[f32; 4]; 4] = [at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0), at(1.0, 1.0)];
+            let q = TexQuad { c: std::array::from_fn(|k| px.map(|c| c[k])) };
             self.tex.sample_quad(&q, 1, &mut texel);
         }
-        if !p.shader.shade(self.textured, &mut rgba, &texel[0], zw, coverage) {
+        if !p.shader.shade(self.textured, &mut rgba, &texel.map(|c| c[0]), zw, coverage) {
             return;
         }
         let c = rgba.map(|c| quantise12(c) as u16);
@@ -451,22 +452,23 @@ impl Draw<'_> {
         let iw = t.inv_w.map(|w| w as f32);
         // Window depth, which fog reads, from the barycentrics as the walk
         // takes it.
-        let zw = |i: usize| -> f64 {
-            if !p.shader.fog {
-                return 0.0;
-            }
-            p.raster.window_depth32(t.tri.depth_ratio(q.l1[i], q.l2[i])).unwrap_or(0.0) as f64
-        };
+        let zw = |i: usize| -> f64 { p.raster.window_depth32(t.tri.depth_ratio(q.l1[i], q.l2[i])).unwrap_or(0.0) as f64 };
+        // The pixels the stipple and the user planes keep, and those an
+        // opaque stipple paints its background on.
+        let mut cov = q.cov;
+        let mut background = 0u8;
 
         for i in 0..4usize {
-            if q.cov & (1 << i) == 0 {
+            if cov & (1 << i) == 0 {
                 continue;
             }
             let px = q.x + (i & 1) as i32;
             let py = q.y + (i >> 1) as i32;
-            let Some(background) = self.stipple_pass(px, py) else {
+            let Some(b) = self.stipple_pass(px, py) else {
+                cov &= !(1 << i);
                 continue;
             };
+            background |= (b as u8) << i;
             if self.xf.user_planes() != 0 {
                 let (b1, b2) = t.bary(px, py);
                 let w = [(1.0 - b1 - b2) * t.inv_w[0], b1 * t.inv_w[1], b2 * t.inv_w[2]];
@@ -474,34 +476,43 @@ impl Draw<'_> {
                 let d: [f64; CLIP_PLANES as usize] = std::array::from_fn(|k| (w[0] * t.clip[0][k] + w[1] * t.clip[1][k] + w[2] * t.clip[2][k]) / sum);
 
                 if self.xf.user_clipped(&d) {
-                    continue;
+                    cov &= !(1 << i);
                 }
             }
-            let mut c = t.flat12;
-            let mut s = t.flat_spec12;
+        }
+        background &= cov;
+        // The colours as lanes: c[k] is component k at pixels 0 to 3.
+        let mut c = t.flat12.map(|v| [v; 4]);
+        let mut s = t.flat_spec12.map(|v| [v; 4]);
 
-            if background {
-                c = self.background.expect("an opaque stipple").map(fixed::from_f64);
-                s = [0; 3];
-            } else if t.smooth {
-                let Some(w) = interp::weights(q.l1[i], q.l2[i], &iw) else {
-                    continue;
-                };
-                for (k, ck) in c.iter_mut().enumerate() {
-                    *ck = fixed::interpolate(&w, [t.rgba12[0][k], t.rgba12[1][k], t.rgba12[2][k]]);
+        if t.smooth {
+            let (w, kept) = interp::weights4(&q.l1, &q.l2, &iw);
+            let lanes = |v: [i32; 3]| -> [i32; 4] { std::array::from_fn(|i| fixed::interpolate(&[w[0][i], w[1][i], w[2][i]], v)) };
+
+            // A background pixel takes no weights.
+            cov &= kept | background;
+            c = std::array::from_fn(|k| lanes([t.rgba12[0][k], t.rgba12[1][k], t.rgba12[2][k]]));
+            if p.shader.specular {
+                s = std::array::from_fn(|k| lanes([t.spec12[0][k], t.spec12[1][k], t.spec12[2][k]]));
+            }
+        }
+        if background != 0 {
+            let bg = self.background.expect("an opaque stipple").map(fixed::from_f64);
+
+            for i in (0..4).filter(|i| background & (1 << i) != 0) {
+                for k in 0..4 {
+                    c[k][i] = bg[k];
                 }
-                if p.shader.specular {
-                    for (k, sk) in s.iter_mut().enumerate() {
-                        *sk = fixed::interpolate(&w, [t.spec12[0][k], t.spec12[1][k], t.spec12[2][k]]);
-                    }
+                for sk in s.iter_mut() {
+                    sk[i] = 0;
                 }
             }
-            if !p.shader.shade12(self.textured, &mut c, &s, &texel[i], zw(i)) {
-                continue;
-            }
-            out.cov |= 1 << i;
+        }
+        cov &= p.shader.shade12x4(self.textured, &mut c, &s, &texel, zw);
+        out.cov = cov;
+        for i in (0..4).filter(|i| cov & (1 << i) != 0) {
             out.zq[i] = q.zq[i];
-            out.rgba[i] = c.map(|c| colour12(c) as u16);
+            out.rgba[i] = std::array::from_fn(|k| colour12(c[k][i]) as u16);
         }
     }
 }
