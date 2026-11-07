@@ -201,7 +201,7 @@ design; the rest are register-level details that could be fixed inside it.
     drivers check `INTSTAT` first, so this is a safe simplification, but
     note it when implementing stepping (`SEQCTL.STEP` is ignored today).
 
-## C. PCI configuration space (`src/pci.rs` as used by `Aic7880::new_at`)
+## C. PCI configuration space (`src/pci/config.rs` as used by `Aic7880::new_at`)
 
 23. **Expansion ROM BAR (`0x30`) stores any value** (§5). The chip
     implements a 64 KB ROM BAR (bits 31:15 writable, 14:11 read 0, bit 0
