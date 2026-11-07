@@ -105,6 +105,76 @@ recordings of a failing case (`vpro rec`) replay on both raster units offline:
 unit and the GPU unit with live-style slice ends, and compares what the board
 wrote to guest memory and its final memory.
 
+## Strict synthetic REX3 replay corpus
+
+The redistributable [REX3 corpus](src/dev/ng1/testdata/README.md) contains
+independently authored register programs on zeroed state, not guest captures.
+It is functional coverage, not a representative desktop workload or benchmark.
+Run the mandatory CPU gate and the manifest, negative, and in-memory
+byte-for-byte regeneration tests with:
+
+```sh
+cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_replay_testdata -- --nocapture
+cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_ -- --nocapture
+```
+
+The first command requires every named case, verifies reads and checkpoints,
+and proves actual Cranelift dispatch (no interpreter fallbacks) before
+comparing full state with the interpreter. Omitting `rex-jit` or `rexdiag`
+allows an interpreter-only test but does **not** satisfy the strict CPU gate.
+Linux CI runs both commands and an explicitly selected filesystem security
+test; no GPU is required. Discovery rejects unexpected names before reading
+content, rejects links and reparse points beneath the checkout root, and caps
+the manifest/README at 64 KiB and each recording at 256 KiB. Checkout paths
+reached through a symlink or junction ancestor remain valid. The required
+`.rex3-corpus-root` anchor is allowed in the directory, but is not a recording
+or generated content.
+
+The ordinary negative tests do not write the source tree. To also test real
+filesystem symlinks, junctions and atomic replacement, provide a writable
+build directory. The test provisions its own anchor; on Windows it also
+checks checkout-junction retargeting, non-listable checkout parents (using
+`icacls` on a test directory), and attribute-only junction mutation while the
+anchor is held, after guard release, and after anchor removal:
+
+```sh
+REX3_CORPUS_IO_DIR=target cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_filesystem_security -- --ignored --nocapture
+```
+
+The hardware GPU gate is explicitly ignored unless selected. It requires an
+integrated/discrete adapter, checks nonzero handled work and declared
+fallbacks, and reports unavailable hardware rather than passing it. The batch
+case compares framebuffer state and completed readback at the instant the
+display fence is published, before any subsequent idle flush. The second
+selected GPU test injects an early signal and requires this check to reject
+stale pixels even when the later final state matches:
+
+```sh
+REX3_GPU_BACKEND=vulkan cargo test -p iris --lib --features rex-gpu,rex-jit,rexdiag rex3_corpus_gpu_ -- --ignored --nocapture --test-threads=1
+```
+
+To deliberately regenerate, set `REX3_CORPUS_OUT` to an existing relative
+directory with a pre-existing regular `.rex3-corpus-root` file and run
+`rex3_corpus_generate -- --ignored --nocapture` with the strict CPU feature
+set. The checked-in corpus has its anchor; for a new output directory create
+the anchor before invoking the generator. For example, on PowerShell:
+
+```powershell
+$env:REX3_CORPUS_OUT = 'src\dev\ng1\testdata'
+cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_generate -- --ignored --nocapture
+```
+
+Review the generated files and rerun both CPU commands. Ordinary tests do not
+write the corpus. Generator outputs are individually atomically replaced;
+links within the relative output path and existing link destinations are
+rejected, while checkout-ancestor aliases are allowed. The generator pins the
+anchor for its entire run and never creates or overwrites it; on Windows this
+prevents directory reparse conversion while handle-relative writes are active.
+To replay a separate recording instead, explicitly select
+the optional ignored test, e.g.
+`REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored --nocapture`.
+That single-file run is not corpus coverage.
+
 ## Disk persistence on exit
 
 `src/exit_persistence_tests.rs` builds every machine (Indy, Indigo2, Indigo2

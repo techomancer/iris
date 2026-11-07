@@ -1,0 +1,4 @@
+# The generated corpus is checked byte-for-byte, including line endings.
+src/dev/ng1/testdata/*.txt text eol=lf
+src/dev/ng1/testdata/manifest.toml text eol=lf
+src/dev/ng1/testdata/.rex3-corpus-root text eol=lf

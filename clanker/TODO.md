@@ -155,15 +155,18 @@ guide and changelog when it lands.
   engines, with zero differing reads. They are not corpus candidates.
   Recapture them privately after the fix and require matching initial/mark/final
   hashes and reads on every engine; do not waive hashes.
-- [ ] **Prerequisite — independent strict REX3 corpus.** Generate synthetic
-  post-fix cases independently rather than sharing the private captures. Cover
-  overlap/window blocks, 1,200-pixel spans, 8x8, 8-pixel and single-pixel
-  draws, HOSTW/HOSTR residual state, clipping, CI8/mixed fallback, and
-  1,024-draw batch/fence boundaries. Make the corpus non-empty and fail rather
-  than silently pass when recordings or expected GPU-handled draws are absent.
-  Compare interpreter, CPU JIT, and GPU planes, context, reads, overlaps,
-  fallback, snapshots, and hashes; cover GFIFO back-pressure and display
-  fences.
+- [x] **Prerequisite — independent strict REX3 corpus.** Seven independently
+  generated zero-state cases cover overlap/window blocks, 1,200-pixel spans,
+  8x8, 8-pixel and single-pixel draws, HOSTRW residual state and single-word
+  DMA, clipping, CI8/mixed fallback, and a 1,024-draw batch/display fence.
+  The non-vacuous manifest gate compares reads, hashes, context and full planes
+  on the interpreter and counter-proven Cranelift; Linux CI is configured to
+  run that gate, deterministic regeneration and link/size security checks.
+  An explicitly selected RTX 5070 Vulkan run verified handling/fallback and
+  completed readback at fence publication; injected early publication and a
+  dropped first batch are rejected even when later draws overlap.
+  Metal/D3D12 corpus runs, real GFIFO-full back-pressure and broader REX3 modes
+  remain open. See the [corpus README](../src/dev/ng1/testdata/README.md).
 - [ ] **Prerequisite — REX3 GPU recovery.** After strict corpus validation,
   define and fault-test device-loss and readback-error recovery so pending
   draws are not lost and CPU fallback never uses stale pixels. Complete before

@@ -9,7 +9,7 @@
 //! at any time: the recording opens with the board's state (`S`), so it does
 //! not have to start at power-on. `IRIS_REX3_REC=<file>` starts one when the
 //! board starts. Replay:
-//! `REX3_REPLAY=<file> cargo test --release rex3_replay_file -- --nocapture`
+//! `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored --nocapture`
 //! (`REX3_REPLAY_OUT=<dir>` saves the final framebuffers there,
 //! `REX3_REPLAY_TRACE=<file>` writes the annotated trace of the replay,
 //! `REX3_REPLAY_ENGINE=interp|jit|gpu` picks the draw path (`gpu` requires the
@@ -693,6 +693,10 @@ pub(crate) mod tests {
     #[derive(Debug, Default)]
     pub struct Report {
         pub records: usize,
+        /// Records actually executed, excluding any after an access error.
+        pub executed: usize,
+        /// Successful read transactions (including DMA and bulk reads).
+        pub reads_checked: usize,
         pub checked: usize,
         /// Record indices of failed checkpoints.
         pub failed: Vec<usize>,
@@ -793,6 +797,13 @@ pub(crate) mod tests {
     fn replay_recs_with_bus(
         rex: &Rex3, bus: &dyn BusDevice, recs: &[Rec], check_hashes: bool,
     ) -> Report {
+        replay_recs_with_hook(rex, bus, recs, check_hashes, |_, _| {})
+    }
+
+    pub(super) fn replay_recs_with_hook(
+        rex: &Rex3, bus: &dyn BusDevice, recs: &[Rec], check_hashes: bool,
+        mut before_record: impl FnMut(usize, &Rec),
+    ) -> Report {
         let mut rep = Report { records: recs.len(), ..Default::default() };
         let addr = |off: u32| (REX3_BASE | (off & (REX3_SIZE - 1))) as u64;
         let differ = |rep: &mut Report, off: u32| {
@@ -800,6 +811,7 @@ pub(crate) mod tests {
             *rep.differ_at.entry(off).or_default() += 1;
         };
         for (i, r) in recs.iter().enumerate() {
+            before_record(i, r);
             match r {
                 Rec::Write { bits, off, val } => {
                     let a = addr(*off);
@@ -839,6 +851,7 @@ pub(crate) mod tests {
                         std::hint::spin_loop();
                     };
                     let Some(got) = got else { break };
+                    rep.reads_checked += 1;
                     if !read_matches(*bits, *off, got, *val) {
                         differ(&mut rep, *off);
                     }
@@ -848,8 +861,12 @@ pub(crate) mod tests {
                         let r = bus.dma_read64(addr(*off));
                         (r.status, r.data)
                     }) {
-                        Ok(got) if !read_matches(64, *off, got, *val) => differ(&mut rep, *off),
-                        Ok(_) => {}
+                        Ok(got) => {
+                            rep.reads_checked += 1;
+                            if !read_matches(64, *off, got, *val) {
+                                differ(&mut rep, *off);
+                            }
+                        }
                         Err(status) => {
                             rep.access_error = Some(access_failure(i, *off, "dma_read64", status));
                             break;
@@ -868,6 +885,7 @@ pub(crate) mod tests {
                         rep.access_error = Some(access_failure(i, *off, "dma_read64_bulk", status));
                         break;
                     }
+                    rep.reads_checked += 1;
                     if got != *vals {
                         differ(&mut rep, *off);
                     }
@@ -883,6 +901,7 @@ pub(crate) mod tests {
                 }
                 Rec::State(_) => {}
             }
+            rep.executed += 1;
         }
         // A failed access can leave the processor blocked or already dead.
         // Only a completed replay may synchronously drain it.
@@ -1678,26 +1697,11 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "optional one-file replay; set REX3_REPLAY and run with --ignored"]
     fn rex3_replay_file() {
-        let Ok(path) = std::env::var("REX3_REPLAY") else { return };
+        let path = std::env::var("REX3_REPLAY").expect("set REX3_REPLAY to a recording");
         let png = std::env::var("REX3_REPLAY_OUT").ok();
         replay(&path, png.as_deref()).unwrap();
-    }
-
-    /// Every recording in `testdata/` replays with its checkpoints intact.
-    #[test]
-    fn rex3_replay_testdata() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dev/ng1/testdata");
-        let Ok(entries) = std::fs::read_dir(&dir) else { return };
-        let mut n = 0;
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "txt" || x == "rec") {
-                replay(p.to_str().unwrap(), None).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-                n += 1;
-            }
-        }
-        eprintln!("{n} REX3 recordings replayed");
     }
 
     fn all() -> Vec<Rec> {
@@ -1764,3 +1768,11 @@ pub(crate) mod tests {
         assert_eq!(at, out.len());
     }
 }
+
+#[cfg(test)]
+#[path = "rex3_corpus.rs"]
+mod corpus;
+
+#[cfg(test)]
+#[path = "rex3_corpus_io.rs"]
+mod corpus_io;

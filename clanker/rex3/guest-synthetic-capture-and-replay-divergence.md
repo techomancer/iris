@@ -93,9 +93,18 @@ with zero differing reads, because they recorded old live compiled state.
 They require fresh post-fix recapture and are not corpus candidates. No hashes
 were waived; matching pixels and reads alone do not excuse failed checkpoints.
 
-Recapture those five cases privately, then generate independent synthetic
-post-fix corpus cases for overlapping window blocks, 1,200-pixel spans, 8x8
-blocks, 8-pixel spans, single pixels, HOSTW/HOSTR residual state and reads,
-clipping, CI8/mixed fallback, and 1,024-draw batch/fence boundaries. Require
-every hash and bus read to match; do not use private raw captures as
-repository assets.
+Recapture those five cases privately and require every hash and bus read to
+match; do not use private raw captures as repository assets.
+
+The separate [redistributable corpus](../../src/dev/ng1/testdata/README.md) now
+has seven newly authored zero-state programs covering overlapping blocks,
+1,200-pixel spans, 8x8/8-pixel/single-pixel operations, HOSTRW residual state,
+single-word bulk/primed DMA, SMASK0, CI8 mixed fallback, and the 1,024-draw
+batch/display-fence boundary. Interpreter, counter-proven Cranelift, and RTX
+5070 Vulkan replay match its reads, checkpoint hashes, planes and context;
+the GPU test checks per-case handled/fallback counts and framebuffer/readback
+state at fence publication, before any idle flush. Its first-batch survivor and
+overlapping final pixel reject a dropped batch; an injected early fence rejects
+stale framebuffer data. This synthetic corpus
+does not replace the five private recaptures or establish real desktop
+representativeness. Metal and D3D12 corpus replay remain unvalidated.

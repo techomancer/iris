@@ -930,7 +930,7 @@ Replay an existing recording with:
 
 ```sh
 REX3_REPLAY=draw.rec REX3_REPLAY_ENGINE=gpu REX3_GPU_BACKEND=vulkan \
-  cargo test --release --features rex-gpu rex3_replay_file -- --nocapture
+  cargo test --release --features rex-gpu rex3_replay_file -- --ignored --nocapture
 ```
 
 GPU replay fails rather than reporting success if adapter/device setup fails,

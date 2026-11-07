@@ -1408,6 +1408,10 @@ pub struct Rex3 {
     /// Written by the GFIFO consumer when it processes GFIFO_DISP_SYNC.
     /// Display thread spins until gfifo_fence >= sampled xmap_fence (wrapping).
     pub gfifo_fence: AtomicU32,
+    #[cfg(all(test, feature = "gputrace"))]
+    fence_observer: Mutex<Option<Box<dyn Fn(&Rex3, u32) + Send>>>,
+    #[cfg(all(test, feature = "rex-gpu"))]
+    test_signal_fence_early: AtomicBool,
     pub debug: Arc<AtomicBool>,
     #[cfg(feature = "developer")]
     pub block_debug: Arc<AtomicBool>,
@@ -1591,6 +1595,10 @@ impl Rex3 {
             fifo_full_cb: Mutex::new(None),
             xmap_fence: AtomicU32::new(0),
             gfifo_fence: AtomicU32::new(0),
+            #[cfg(all(test, feature = "gputrace"))]
+            fence_observer: Mutex::new(None),
+            #[cfg(all(test, feature = "rex-gpu"))]
+            test_signal_fence_early: AtomicBool::new(false),
             debug: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "developer")]
             block_debug: Arc::new(AtomicBool::new(false)),
@@ -3488,6 +3496,13 @@ impl Rex3 {
         self.display_stop.finish(&self.renderer);
     }
 
+    #[cfg(all(test, feature = "gputrace"))]
+    fn observe_test_fence(&self, value: u32) {
+        if let Some(observer) = self.fence_observer.lock().as_ref() {
+            observer(self, value);
+        }
+    }
+
     /// Returns `true` if the register offset was recognized and updated state.
     /// Process a register write from the GFIFO consumer.
     /// `reg_offset` is `entry.addr & !0x0800` (GO bit stripped; is_64bit bit kept).
@@ -3505,9 +3520,26 @@ impl Rex3 {
             // DISP_SYNC sentinel: all prior draws are done — advance the fence.
             // Display thread spins on gfifo_fence >= sampled xmap_fence.
             GFIFO_DISP_SYNC => {
+                #[cfg(all(test, feature = "rex-gpu"))]
+                let early = self.test_signal_fence_early.load(Ordering::Relaxed);
+                #[cfg(all(test, feature = "rex-gpu"))]
+                if early {
+                    self.gfifo_fence.store(val64 as u32, Ordering::Release);
+                    self.observe_test_fence(val64 as u32);
+                }
                 #[cfg(feature = "rex-gpu")]
                 self.flush_gpu_replay(FlushReason::DisplayFence);
-                self.gfifo_fence.store(val64 as u32, Ordering::Release);
+                #[cfg(all(test, feature = "rex-gpu"))]
+                if !early {
+                    self.gfifo_fence.store(val64 as u32, Ordering::Release);
+                    self.observe_test_fence(val64 as u32);
+                }
+                #[cfg(not(all(test, feature = "rex-gpu")))]
+                {
+                    self.gfifo_fence.store(val64 as u32, Ordering::Release);
+                    #[cfg(all(test, feature = "gputrace"))]
+                    self.observe_test_fence(val64 as u32);
+                }
             }
             // PURE_GO sentinel (GO-only, no register write): no-op here; execute_go() is
             // triggered by the GO bit in the loop.

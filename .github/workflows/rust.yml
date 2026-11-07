@@ -75,6 +75,12 @@ jobs:
     - name: Test REX3 GPU matcher
       if: runner.os == 'Linux'
       run: cargo test -p iris --lib --example rex3-gpu-probe --features rex-gpu rex3_gpu::tests
+    - name: Validate strict synthetic REX3 CPU corpus
+      if: runner.os == 'Linux'
+      run: |
+        cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_replay_testdata -- --nocapture
+        cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_ -- --nocapture
+        REX3_CORPUS_IO_DIR=target cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_filesystem_security -- --ignored --nocapture
     # The VPro fragment pipeline's SIMD kernels against their scalar
     # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
     # lanes.rs): deterministic, so they gate everywhere. macos-26 and

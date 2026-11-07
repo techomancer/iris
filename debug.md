@@ -388,7 +388,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `rex jit <on\|off\|status\|list>` | REX3 shader JIT (`rex-jit`): switch, counters, compiled and failed shaders |
 | `rex jit <disable\|enable> <dm0> <dm1>` | Take one draw mode out of (or back into) JIT dispatch |
 | `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (also `IRIS_REX3_TRACE=<file>`) |
-| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); replay with `REX3_REPLAY=<file> cargo test --release rex3_replay_file`, or add `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the experimental host-GPU path |
+| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, or add `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the experimental host-GPU path |
 | `rex fbdump [DIR]` | Framebuffers as files in `DIR` (default `.`) |
 | `rex cmap <on\|off>` | CMAP access trace |
 | `rex debug <on\|off>` | REX3 register trace **[DEV]** |
