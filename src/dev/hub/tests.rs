@@ -476,6 +476,32 @@ fn the_io_space_holds_the_registers_at_both_offsets_and_the_widgets_behind_them(
     assert_eq!(io.read8(IO_BIG_WINDOWS + 7 * hub_io::BIG_WINDOW_SIZE).status, BUS_ERR);
 }
 
+#[test]
+fn a_processors_own_register_alias_stays_on_its_node_whatever_the_number() {
+    let (a, b) = pair();
+    for hub in [&a, &b] {
+        hub.set_space(Space::Io, hub.io_space());
+    }
+    number(&b, 1);
+    let at = IO_REGISTERS_LOCAL + hub_io::reg::SCRATCH_1;
+    // The claim by node number sends node zero's alias to the node holding
+    // zero; the processor's view keeps it on its own.
+    assert_eq!(b.claim(Space::Io).write64(at, 0x11), BUS_OK);
+    assert_eq!(r64(&*a, hub_io::reg::SCRATCH_1), 0x11);
+    assert_eq!(b.cpu_io().write64(at, 0x22), BUS_OK);
+    assert_eq!(r64(&*b, hub_io::reg::SCRATCH_1), 0x22);
+    assert_eq!(r64(&*a, hub_io::reg::SCRATCH_1), 0x11);
+    // The node-explicit window still goes by node number.
+    assert_eq!(b.cpu_io().read64(IO_REGISTERS_NAMED + hub_io::reg::SCRATCH_1).data, 0x11);
+    assert_eq!(b.cpu_io().read64(NODE(1) + IO_REGISTERS_NAMED + hub_io::reg::SCRATCH_1).data, 0x22);
+    // The alias is the one with node field zero: another node's number at
+    // the same offset goes to that node.
+    assert_eq!(b.cpu_io().read64(NODE(0) + at).data, 0x22);
+    assert_eq!(a.cpu_io().write64(NODE(1) + at, 0x33), BUS_OK);
+    assert_eq!(r64(&*b, hub_io::reg::SCRATCH_1), 0x33);
+    assert_eq!(r64(&*a, hub_io::reg::SCRATCH_1), 0x11);
+}
+
 // ---- the engines through the fabric ----
 
 #[test]

@@ -463,7 +463,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
     fn build_cpu(cfg: &MachineConfig, module: &CpuModule, node: &Node, cpu_id: usize, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
         let bus = Arc::new(Ip27Bus::new(
             node.hub.cpu_special(),
-            node.hub.processor_io(node.hub.claim(Space::Io)),
+            node.hub.processor_io(node.hub.cpu_io()),
             node.hub.claim(Space::Special),
             node.hub.cpu_memory(),
         ));
