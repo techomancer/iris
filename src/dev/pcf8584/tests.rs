@@ -421,3 +421,100 @@ fn every_access_width_is_one_register_access() {
     assert!(!p.read32(MMIO_SIZE).is_ok());
     assert_eq!(p.write8(MMIO_SIZE, 0), BUS_ERR);
 }
+
+#[test]
+fn a_start_on_a_bus_another_adapter_holds_waits_and_runs_after_its_stop() {
+    let echo = Echo::new(0x10);
+    let owner = BusOwner::new();
+    let make = |id: u32| {
+        let mut bus = I2cBus::new();
+        bus.add(echo.clone());
+        Pcf8584::shared(bus, BusBusy::default(), owner.clone(), id)
+    };
+    let (a, b) = (make(0), make(1));
+    for p in [&a, &b] {
+        p.write_register(CTRL, ctl::PIN | ctl::ESO);
+    }
+    a.write_register(DATA, 0x10 << 1);
+    a.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STA | ctl::ACK);
+    assert!(owner.busy());
+    // B sees the bus busy, and its START waits.
+    assert_eq!(status(&b) & sts::BB, 0);
+    b.write_register(DATA, 0x10 << 1);
+    b.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STA | ctl::ACK);
+    assert_eq!(status(&b) & sts::PIN, sts::PIN);
+    a.write_register(DATA, 0x11);
+    a.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    // After A's STOP, B's START runs and completes.
+    assert_eq!(status(&b) & (sts::PIN | sts::LRB), 0);
+    b.write_register(DATA, 0x22);
+    b.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    assert!(!owner.busy());
+    assert_eq!(echo.state.lock().0, [0x22]);
+}
+
+/// A holder that STARTs again straight after its STOP must not overtake an
+/// adapter that was already waiting: the STOP hands the bus to the waiter.
+#[test]
+fn a_waiting_start_is_served_before_the_holders_next_start() {
+    let echo = Echo::new(0x10);
+    let owner = BusOwner::new();
+    let make = |id: u32| {
+        let mut bus = I2cBus::new();
+        bus.add(echo.clone());
+        Pcf8584::shared(bus, BusBusy::default(), owner.clone(), id)
+    };
+    let (a, b) = (make(0), make(1));
+    for p in [&a, &b] {
+        p.write_register(CTRL, ctl::PIN | ctl::ESO);
+    }
+    let start = |p: &Pcf8584| {
+        p.write_register(DATA, 0x10 << 1);
+        p.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STA | ctl::ACK);
+    };
+    start(&a);
+    start(&b);
+    assert_eq!(status(&b) & sts::PIN, sts::PIN);
+    a.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    // A, without having looked at the bus, STARTs again at once.
+    start(&a);
+    // The bus is B's: A waits, B's START has run.
+    assert_eq!(status(&a) & sts::PIN, sts::PIN);
+    assert_eq!(status(&a) & sts::BB, 0);
+    assert_eq!(status(&b) & (sts::PIN | sts::LRB), 0);
+    b.write_register(DATA, 0xb1);
+    b.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    // B's STOP hands it to A in turn.
+    assert_eq!(status(&a) & (sts::PIN | sts::LRB), 0);
+    a.write_register(DATA, 0xa1);
+    a.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    assert!(!owner.busy());
+    assert_eq!(echo.state.lock().0, [0xa1]);
+}
+
+#[test]
+fn the_lowest_waiter_is_served_first_and_a_withdrawn_one_passes_the_bus_on() {
+    let echo = Echo::new(0x10);
+    let owner = BusOwner::new();
+    let make = |id: u32| {
+        let mut bus = I2cBus::new();
+        bus.add(echo.clone());
+        Pcf8584::shared(bus, BusBusy::default(), owner.clone(), id)
+    };
+    let adapters: Vec<_> = (0..3).map(make).collect();
+    for p in &adapters {
+        p.write_register(CTRL, ctl::PIN | ctl::ESO);
+        p.write_register(DATA, 0x10 << 1);
+    }
+    let go = |p: &Pcf8584| p.write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STA | ctl::ACK);
+    go(&adapters[0]);
+    go(&adapters[2]);
+    go(&adapters[1]);
+    // Adapter 1 gives up while waiting; the bus goes 0 -> 2.
+    adapters[1].write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    adapters[0].write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    assert_eq!(status(&adapters[2]) & (sts::PIN | sts::LRB), 0);
+    assert_eq!(status(&adapters[1]) & sts::BB, 0);
+    adapters[2].write_register(CTRL, ctl::PIN | ctl::ESO | ctl::STO);
+    assert!(!owner.busy());
+}
