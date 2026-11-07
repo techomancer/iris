@@ -345,6 +345,19 @@ table adds a port, in order.
 | `port.tcp_port` | none | Serve the port as raw TCP on 127.0.0.1 (no telnet). Exclusive with `socket`. |
 | `port.socket` | none | Serve the port on a raw Unix socket at this path. |
 
+### [nvme]
+
+An NVM Express controller with one namespace; see [docs/nvme.md](docs/nvme.md).
+O2 and Octane only; on the Octane it sits in a slot of an `[[xio_board]]`.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `nvme.path` | none | Disk image for the namespace (raw or CHD, at most 2 TiB). The card is present when this is set. |
+| `nvme.overlay` | `false` | Copy-on-write: writes go to `PATH.overlay`, as for `[scsi.N]`. |
+| `nvme.bridge` | `false` | Put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
+| `nvme.board` | `0` | Octane: which `[[xio_board]]` table holds the card, counting from 0. Refused on the O2. |
+| `nvme.slot` | first free | Octane: the board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). Refused on the O2. |
+
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
