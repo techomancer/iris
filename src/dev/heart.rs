@@ -332,7 +332,7 @@ impl Heart {
         let mut u = self.unsupported.lock();
         if !u.iter().any(|&(o, s, w)| o == off && s as usize == size && w == write) {
             if trace() {
-                eprintln!("ip30: HEART: unsupported {size}-byte {} at {off:#x}", if write { "write" } else { "read" });
+                crate::safe_eprintln!("ip30: HEART: unsupported {size}-byte {} at {off:#x}", if write { "write" } else { "read" });
             }
             u.push((off, size as u8, write));
             if u.len() == 64 {
