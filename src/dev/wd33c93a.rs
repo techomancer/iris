@@ -821,7 +821,13 @@ impl FifoDevice for Wd33c93a {
 impl Device for Wd33c93a {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
+        // Under the state lock: the worker checks `running` holding it and
+        // then waits, so a store and notify between the two would be lost
+        // and the join below would wait forever.
+        {
+            let _state = self.state.lock();
+            self.running.store(false, Ordering::SeqCst);
+        }
         self.cond.notify_all();
         if let Some(t) = self.thread.lock().take() {
             let _ = t.join();
