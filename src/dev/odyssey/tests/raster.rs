@@ -674,7 +674,9 @@ fn stop_releases_a_waiting_front_end() {
     if super::gpu_unit_tests() {
         return;
     }
-    let (h, _st) = slow_raster(1500);
+    // A slice long enough that a release by the stop, even one whose threads
+    // wait for a core, cannot be taken for a release by the slice.
+    let (h, _st) = slow_raster(4000);
     let ran = std::sync::Arc::new(Mutex::new(Vec::new()));
     let job = |i: u32| {
         let ran = ran.clone();
@@ -693,7 +695,7 @@ fn stop_releases_a_waiting_front_end() {
         assert!(!waiter.is_finished(), "the front end waits for room");
         let stopper = sc.spawn(|| h.raster.stop());
         let waited = waiter.join().unwrap();
-        assert!(waited < Duration::from_millis(1000), "released by the stop after {waited:?}, not by the slice");
+        assert!(waited < Duration::from_millis(3000), "released by the stop after {waited:?}, not by the slice");
         stopper.join().unwrap();
     });
     assert_eq!(*ran.lock(), vec![0, 1]);

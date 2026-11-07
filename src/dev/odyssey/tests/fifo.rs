@@ -951,7 +951,9 @@ fn a_refused_command_push_retries_behind_the_board_thread() {
     let (h, _rec) = threaded_board();
     let words = preamble_twice();
 
-    start_long_slice(&h, &words, 1000);
+    // The ring must fill and the retry be seen waiting while this one slice
+    // holds the board, however long the test's threads wait for a core.
+    start_long_slice(&h, &words, 4000);
     while h.fifo.stores() < RING_STORES {
         assert!(h.bus_write(consts::cmd::FIFO, 0, 4));
     }
