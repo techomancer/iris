@@ -6221,6 +6221,68 @@ mod tests {
         assert!(out.contains("[hits 1]"), "{}", out);
     }
 
+    /// A guest spinning in a region the JIT compiled never returns to the run
+    /// loop on its own, so `stop` used to join a thread that only looked at
+    /// `running` between steps. The spin is one `beq` to itself, the smallest
+    /// loop jitv2 keeps inside compiled code; the test waits until that code
+    /// is published and then requires `stop` to return.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn stop_returns_while_the_guest_spins_in_compiled_code() {
+        use std::time::{Duration, Instant};
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        // Compile in the CPU thread, so no compile worker has to exist.
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        let jit = exec.jitv2.clone();
+        let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+        crate::traits::Device::start(&*cpu);
+
+        let compiled = || {
+            let mut jit = jit.lock();
+            let slot = jit.page_for(1, 0x1000, mem.as_ref(), false).expect("page for the spin");
+            unsafe { (*jit.page_ptr(slot)).is_runnable(0) }
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !compiled() {
+            assert!(Instant::now() < deadline, "the spin was never compiled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Let it reach the loop inside compiled code.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopper = cpu.clone();
+        std::thread::spawn(move || {
+            crate::traits::Device::stop(&*stopper);
+            let _ = done_tx.send(());
+        });
+        // A failed run leaves the stopper and the spinning CPU behind; the
+        // test process exits regardless.
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("stop did not return while the guest spun in compiled code");
+        assert!(!cpu.is_running());
+
+        // The stop request must not outlive the stop: the CPU runs again, and
+        // stops again.
+        crate::traits::Device::start(&*cpu);
+        assert!(cpu.is_running());
+        std::thread::sleep(Duration::from_millis(20));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopper = cpu.clone();
+        std::thread::spawn(move || {
+            crate::traits::Device::stop(&*stopper);
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("second stop did not return");
+    }
+
     #[test]
     fn bad_conditions_are_refused_and_lists_round_trip() {
         let cpu = nop_cpu();
