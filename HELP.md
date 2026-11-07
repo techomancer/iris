@@ -905,6 +905,7 @@ likely to need while just using IRIS:
 | `rtc save` / `nveeprom save` | Write the Indy NVRAM / Indigo2 EEPROM to disk now |
 | `scsi status` / `scsi eject <id>` / `scsi add <id> <path>` | Show disks and CD queues, change CDs |
 | `ps2 type <text>` / `ps2 enter` / `ps2 esc` | Type on the guest keyboard (Esc stops PROM autoboot) |
+| `pci status` / `pci config <slot>` | O2 and Octane: the functions on the PCI bus / one function's configuration header |
 | `net status` | NAT connections |
 | `mc regs` | Memory configuration, including MEMCFG |
 

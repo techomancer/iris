@@ -1,7 +1,10 @@
 # PCI bus masters: one DMA trait, shared on the O2, per device on the Octane
 
 Status: plan, 2026-10-26. Step 1 done (the trait takes 64-bit bus addresses
-and returns a status; the O2 is its first user). Steps 2-6 open.
+and returns a status; the O2 is its first user). Steps 2-6 open. Since then
+the Octane's Bridge and MACE both sit on one shared PCI layer that keeps
+each function's interrupt line and DMA in its state: see `docs/pci.md`,
+which overtakes the steps below where they differ.
 
 Scope: how a PCI function reaches host memory and raises interrupts
 (`src/pci/function.rs`: `PciFunction`, `PciDma`), the O2's MACE bridge

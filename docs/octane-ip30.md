@@ -5,7 +5,8 @@ controller and interrupt hub), a Crossbow switch joining the widgets, the
 onboard Bridge (XIO to PCI) carrying two QLogic ISP1040 SCSI controllers, the
 IOC3 I/O chip (serial ports, keyboard and mouse, the clock, Ethernet) and RAD
 audio, and a graphics board on one of the XIO ports. IRIS emulates a
-single-processor Octane with a 195 MHz R10000.
+single-processor Octane with a 195 MHz R10000. The Bridge's PCI bus, its
+wiring and reset are described in [pci.md](pci.md).
 
 With the stock IP30 PROM (the 879,312-byte image, SHA-256 `ee4722ca6f9b821f…`)
 and an installed IRIX 6.5.30 disk, the machine boots to a serial login.
