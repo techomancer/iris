@@ -6212,8 +6212,8 @@ mod tests {
     // ============ T3: Config.K0 cacheability, per model ====================
     //
     // `Config.K0` and EntryLo's C field share an encoding, but **the two parts
-    // decode it differently** — verified against docs/R4000_um2.pdf Table 4-6
-    // and docs/"VR5000 User Manual.pdf" Table 6-6:
+    // decode it differently** — verified against docs/datasheets/cpu/R4000_um2.pdf Table 4-6
+    // and docs/"docs/datasheets/cpu/VR5000 User Manual.pdf" Table 6-6:
     //
     //   C | R4400                             | VR5000
     //   --+-----------------------------------+-------------------------------

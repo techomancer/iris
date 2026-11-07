@@ -249,4 +249,4 @@ The device models are ported from the author's QEMU models in
 derives from MAME's
 [intelfsh](https://github.com/mamedev/mame/blob/master/src/devices/machine/intelfsh.cpp).
 The physical map is in [octane-ip30-address-map.md](octane-ip30-address-map.md);
-the Bridge, Xbridge and Crossbow specifications are in [Octane/](Octane/).
+the Bridge, Xbridge and Crossbow specifications are in [datasheets/octane](datasheets/octane/).

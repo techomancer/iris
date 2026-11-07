@@ -307,7 +307,7 @@ bugs.
 
 Priority order for each expected value:
 
-1. **The manuals.** `docs/R4000_um2.pdf` is already in-repo; the MIPS IV ISA
+1. **The manuals.** `docs/datasheets/cpu/R4000_um2.pdf` is already in-repo; the MIPS IV ISA
    spec and the R5000 user manual cover the rest. Everything in §5 except the
    FP numeric edge cases is derivable from the spec by hand.
 2. **Host-computed IEEE-754 values** for the FPU vectors: a generator script

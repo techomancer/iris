@@ -208,7 +208,7 @@ AND
 ### CID Masking (Per-Pixel Window IDs)
 For complex, non-rectangular window clipping, REX3 relies on Coordinate ID (CID) planes. The frame buffer dedicates physical bitplanes specifically to store a "Window ID" for every pixel on the screen.
 
-The `CIDMATCH` field in `CLIPMODE` is a four-bit mask: bit N permits writes to pixels whose two-bit CID is N. For example, `0010` permits CID `01`. The mask `1111` permits all CIDs; `0000` rejects all writes. Popup bits are separate and do not participate in this check. Drawing and screen-to-screen copies check the destination CID; framebuffer reads do not check CID. See the [REX3 specification](../Indy/rex3.pdf), table 16 and section 3.3.
+The `CIDMATCH` field in `CLIPMODE` is a four-bit mask: bit N permits writes to pixels whose two-bit CID is N. For example, `0010` permits CID `01`. The mask `1111` permits all CIDs; `0000` rejects all writes. Popup bits are separate and do not participate in this check. Drawing and screen-to-screen copies check the destination CID; framebuffer reads do not check CID. See the [REX3 specification](../datasheets/indy/rex3.pdf), table 16 and section 3.3.
 
 ## Drawing Modes
 

@@ -563,7 +563,7 @@ comparison (6.3) measured and recorded in `clanker/jitv2/`.
 
 **M5. Polish.** FR per-mode slots if the thrash shows, GDB multi-thread,
 error-register CPU fields, perfetto per-CPU tracks, the 4-slot HEART facts
-into `docs/Octane/`.
+into `docs/datasheets/octane/`.
 
 ## 6. Problems foreseen
 

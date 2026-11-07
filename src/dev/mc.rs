@@ -177,7 +177,7 @@ impl MemoryController {
         // diagnostic reads this and demands "rev B or greater" (fails hard
         // with "Check or replace: CPU base board" otherwise) — we previously
         // reported Rev A (0) here for fullhouse, which fails that check.
-        // Bit 4 is documented as "EISA bus present" in docs/mc.pdf — on Indy
+        // Bit 4 is documented as "EISA bus present" in docs/datasheets/indy/mc.pdf — on Indy
         // that's clear per the spec — but the IRIX 5.3 vino driver's
         // vino_init() checks bit 4 of SYSID at 0xBFA0001C as a gate before
         // any further probing, and silently bails if it's clear (see

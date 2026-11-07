@@ -49,7 +49,7 @@ red herring — they come from independent code paths.
 
 ## What bit 4 of SYSID means
 
-`docs/mc.pdf` (the SGI MC ASIC datasheet) documents SYSID bit 4 as
+`docs/datasheets/indy/mc.pdf` (the SGI MC ASIC datasheet) documents SYSID bit 4 as
 "EISA bus present. Determined by `eisa_present_n` pin." Indy is **not**
 an EISA system, so per the spec this bit should be clear on Indy and
 set on Indigo2. But the IRIX 5.3 vino driver (the same `vino.a` is used
@@ -115,6 +115,6 @@ rule.
 
 - [vino-gio-alias-offset.md](vino-gio-alias-offset.md) — the prior alias
   fix that made REV_ID reachable in the first place.
-- `docs/mc.pdf` §5.4 — SYSID register layout (documented).
+- `docs/datasheets/indy/mc.pdf` §5.4 — SYSID register layout (documented).
 - `src/dev/mc.rs` — `REG_SYSID` and `init_registers`.
 - `src/dev/vino.rs` — `REV_ID @ 0x0000` returns `0xB0` (chip_id=0xB rev=0).

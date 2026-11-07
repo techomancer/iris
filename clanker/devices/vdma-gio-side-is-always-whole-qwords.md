@@ -104,7 +104,7 @@ shape that transfers nothing fails instead of passing vacuously.
 
 ## A spec question left open
 
-rex3.pdf §3.10 says for *linear* block DMA "the width per scanline must be an
+docs/datasheets/indy/rex3.pdf §3.10 says for *linear* block DMA "the width per scanline must be an
 integer number of bus words... the end pixel of a block row must never be packed
 into the same GIO word as the start pixel of the next row: this is a REX3
 restriction; to overcome this limitation, stride block DMA is used."

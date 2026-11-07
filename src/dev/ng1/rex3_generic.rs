@@ -940,7 +940,7 @@ fn pixel_draw<M: Mode>(
     }
 
     // FASTCLEAR: flat fill from COLORVRAM, no per-pixel operation at all
-    // (rex3.pdf §3.5.5). Only set where hardware honours it — DRAW opcode, CID
+    // (docs/datasheets/indy/rex3.pdf §3.5.5). Only set where hardware honours it — DRAW opcode, CID
     // checking off, not overridden by colorhost.
     if m.fastclear() != 0 {
         // Hoisted by the caller: depends only on the mode and COLORVRAM, both
@@ -1402,7 +1402,7 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
     // word boundary so the next GO picks up where we left off.
     //
     // Except a host DRAW block with STOPONY: that is a full block, not Segments I
-    // (rex3.pdf §3.5.4.1 has STOPONX=STOPONY=0). It runs to its end on one GO and
+    // (docs/datasheets/indy/rex3.pdf §3.5.4.1 has STOPONX=STOPONY=0). It runs to its end on one GO and
     // reloads the shifter from HOSTRW whenever it empties; a single PIO word is
     // re-read, so its pixels replicate across the block. IRIX's glPixelZoom path
     // (snoop) draws each zoomed pixel this way: a 6x6 STOPONX|STOPONY block fed
@@ -1626,7 +1626,7 @@ pub fn draw_span_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
 }
 
 
-/// Bresenham setup for F_LINE/A_LINE (rex3.pdf §3.6.1.2, "Code for aliased
+/// Bresenham setup for F_LINE/A_LINE (docs/datasheets/indy/rex3.pdf §3.6.1.2, "Code for aliased
 /// line with fractional endpoints"). The pixels: the start point's own pixel,
 /// then in each column of the major axis the row holding the true line at the
 /// column's centre (pixel n covers [n, n+1)), moving at most one row per
