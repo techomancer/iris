@@ -319,7 +319,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 ### [virtio_serial]
 
 virtio-console / virtio-serial for guests that carry a driver; see
-[docs/virtio-serial.md](docs/virtio-serial.md). Each `[[virtio_serial.port]]`
+[docs/dev/virtio-serial.md](docs/dev/virtio-serial.md). Each `[[virtio_serial.port]]`
 table adds a port, in order.
 
 | Key | Default | Values and behavior |

@@ -136,7 +136,7 @@ configuration inventory for both `iris` and `iris-gui`.
 | [HACKING.md](HACKING.md) | How the emulator is built: bus and device traits, threads and locks, the GFIFO, jitv2. |
 | [iris-gui-README.md](iris-gui-README.md) | GUI build, machine management, input, disks, networking, benchmarks, and distribution. |
 | [FEATURES.md](FEATURES.md) | All build features, profiles, configuration keys, CLI switches, GUI settings, diagnostic environment controls, CPU specifications, and JIT behavior. |
-| [NETWORKING.md](NETWORKING.md) | PCAP bridging and DaynaPort setup; [DaynaPort protocol](docs/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
+| [NETWORKING.md](NETWORKING.md) | PCAP bridging and DaynaPort setup; [DaynaPort protocol](docs/dev/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
 | [STORAGE.md](STORAGE.md) | CHD, overlays, snapshots, CI automation, and scratch-volume file transfer. |
 | [TESTING.md](TESTING.md) | Rust and guest tests, benchmark commands, CPU matrices, and performance methodology. |
 | [CHANGELOG.md](CHANGELOG.md) | Dated repository changes. |
@@ -149,7 +149,7 @@ Hardware, testing, and development references:
 | Area | Documentation |
 |---|---|
 | Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/indy-xz-elan.md), the [SGI O2 (IP32)](docs/o2-ip32.md), and the [SGI Octane (IP30)](docs/octane-ip30.md) with its [address map](docs/octane-ip30-address-map.md). |
-| Graphics and peripherals | [virtio-serial](docs/virtio-serial.md) (guest byte channels, Indy/Indigo2/Octane), [REX3](docs/Indy/rex3.md), [HAL2 audio](docs/Indy/hal2.md), [WD33C93A SCSI](docs/Indy/wd33c93a.md), [QLogic ISP1040 SCSI (Octane)](docs/Octane/qla1040.md), [IOC3 PS/2 keyboard and mouse (Octane)](docs/Octane/ioc3-ps2.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/Indy/ultra64.md) / [N64 GIO specifications](docs/Indy/n64_gio_specs.md). |
+| Graphics and peripherals | [virtio-serial](docs/dev/virtio-serial.md) (guest byte channels, Indy/Indigo2/Octane), [REX3](docs/dev/rex3.md), [HAL2 audio](docs/dev/hal2.md), [WD33C93A SCSI](docs/dev/wd33c93a.md), [QLogic ISP1040 SCSI (Octane)](docs/dev/isp1040.md), [IOC3 PS/2 keyboard and mouse (Octane)](docs/dev/ioc3-ps2.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/dev/ultra64.md) / [N64 GIO specifications](docs/dev/ultra64-gio.md). |
 | CPU test suite | [Suite README](cpu-tests/README.md), [current status](cpu-tests/docs/status.md), [findings](cpu-tests/docs/findings.md), [gotchas](cpu-tests/docs/gotchas.md), and [emulator support](docs/cpu-test-support.md). |
 | CPU test infrastructure | [Toolchain](cpu-tests/docs/toolchain.md), [memory map](cpu-tests/docs/memory-map.md), [oracle overview](cpu-tests/docs/oracle.md), [hardware oracle](cpu-tests/oracle/README.md), [R4600 notes](cpu-tests/docs/r4600.md), and [original test plan](cpu-tests/PLAN.md). |
 | Benchmarks and memory tests | [Benchmark suite](bench/README.md), [prebuilt assets](bench/prebuilt/README.md), [reference results](data/bench_reference.README.md), [GUI benchmark design](clanker/plans/gui-benchmark-plan.md), and [memory stress utility](test/memstress/README.md). |

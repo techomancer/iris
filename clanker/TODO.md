@@ -189,7 +189,7 @@ condition; update the linked guide and changelog when it lands.
   input/quad/AES behavior, endian handling, CTRL2 gain/mute effects, recovered
   AES clock, and timestamp DMA. Complete when guest diagnostics and channel
   recordings verify the advertised modes, or unsupported physical modes are
-  explicitly scoped out. Sources: [HAL2](../src/dev/hal2.rs), [guide](../docs/Indy/hal2.md).
+  explicitly scoped out. Sources: [HAL2](../src/dev/hal2.rs), [guide](../docs/dev/hal2.md).
 - [ ] **Validation — audio lifecycle.** Check boot chimes, IRIX playback,
   rate changes, underruns, enable/disable, stop/start, host device changes, and
   restoration on supported hosts. Complete when sound is independently heard

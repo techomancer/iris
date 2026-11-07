@@ -8,7 +8,7 @@ SLINKCMD.TXT rev 1.20, cross-checked against `dp_do_rx()` in
 2026-08-13** against both IRIX drivers, with no IRIS changes needed: 6.5 walks
 the whole ladder (attach → MAC → ARP → ping → TCP), 5.3 reaches rung 2 before
 hitting driver bugs of its own. Details and the per-rung evidence are in
-`docs/daynaport.md`.
+`docs/dev/daynaport.md`.
 
 ## 1. `0x08`/`0x0A` are READ(6)/WRITE(6) — dispatch on device kind first
 

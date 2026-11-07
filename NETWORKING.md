@@ -129,6 +129,6 @@ subnet = "192.168.10.0/24"    # optional; this target's own NAT subnet
 Each DaynaPort runs its own NAT gateway (or PCAP bridge, in a `--features pcap`
 build) on its own subnet, so `dp0` and `ec0` never share a network. `scsi dayna`
 in the monitor shows its MAC, addresses and counters. Full protocol and
-verification notes: [docs/daynaport.md](docs/daynaport.md).
+verification notes: [docs/dev/daynaport.md](docs/dev/daynaport.md).
 
 

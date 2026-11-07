@@ -3,7 +3,7 @@
 Status: implemented 2026-11-01 for IP22/IP24/IP28 (mmio, GIO slot) and IP30
 (pci, Bridge slot 4). IP32 transport exists, not wired. No guest driver has
 exercised it yet, only unit and bus-level tests. User docs:
-`docs/virtio-serial.md`.
+`docs/dev/virtio-serial.md`.
 
 ## Layers (`src/dev/virtio/`)
 

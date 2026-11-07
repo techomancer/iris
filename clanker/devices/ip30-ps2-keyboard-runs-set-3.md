@@ -1,6 +1,6 @@
 # Octane: the PROM and IRIX run the PS/2 keyboard in scan code set 3
 
-Status: rule (2026-10-27). Reference: `docs/Octane/ioc3-ps2.md`.
+Status: rule (2026-10-27). Reference: `docs/dev/ioc3-ps2.md`.
 
 **Rule.** On the Octane, PROM 4.17 and IRIX 6.5.30's `ioc3_pckm` both put
 the keyboard in set 3 (F0 03), then FA (all keys typematic and

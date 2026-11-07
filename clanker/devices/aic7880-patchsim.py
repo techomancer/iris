@@ -5,7 +5,7 @@ Usage: aic7880-patchsim.py PATH/TO/aic7xxx_seq.h_shipped
 
 Prints how many of the 880 source instructions survive for each 7880
 configuration (revision 0 or >= 1, Ultra, wide) and the critical sections at
-their downloaded addresses. Background: docs/o2/aic7880.md section 8.1.
+their downloaded addresses. Background: docs/dev/aic7880.md section 8.1.
 """
 import re,sys
 src=open(sys.argv[1]).read()

@@ -90,7 +90,7 @@ pins the board wires to that device.
 "Swap" keeps byte addresses (address invariant): in a byte-addressed model
 it is a plain copy. "No swap" keeps byte lanes: T5 byte 0 lands on PCI
 byte 3 of a 32-bit bus (`^3`), presumably `^7` on a 64-bit one. This is the
-same `^3`/`^7` question `docs/o2/aic7880.md` §12.1 leaves open for MACE.
+same `^3`/`^7` question `docs/dev/aic7880.md` §12.1 leaves open for MACE.
 
 ## 3. What the O2's MACE does
 
@@ -98,7 +98,7 @@ Fixed views, no per-device state (`mace_pci.rs`): bus addresses 0-1 GB the
 swapped view, 1-2 GB the native view, both onto CRIME memory; 2 GB and up
 not host memory. Today both views deliver bytes in address order and the
 AIC-7880 model compensates per driver (`dma_read32` vs `dma_read32_le`,
-`complete_him` at `p ^ 3`); see `docs/o2/aic7880.md` §3.3. MACE's own
+`complete_him` at `p ^ 3`); see `docs/dev/aic7880.md` §3.3. MACE's own
 engines (MEC, audio, serial DMA) address CRIME physical memory, not PCI
 space, and today hold `O2Memory` directly.
 

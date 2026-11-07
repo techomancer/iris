@@ -5,7 +5,7 @@ Usage: aic7880-seqdis.py SEQ_ARRAY.h OUT.dis
 
 Written for the HIM's image; any `UBYTE name[] = { 0x.., ... };` array
 works, e.g. a SEQRAM download captured from the monitor and dumped as one.
-Encoding and register names follow docs/o2/aic7880.md sections 6 and 7
+Encoding and register names follow docs/dev/aic7880.md sections 6 and 7
 (register names are the HIM's scratch layout, section 8.2). The listing is
 not kept in the repository because the bytes are Adaptec's firmware; run
 this to regenerate it.
