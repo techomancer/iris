@@ -5599,7 +5599,9 @@ mod tests {
         // function with worker threads still live against `pages` — see
         // the page-cross test's own comment for the confirmed
         // use-after-free this guards.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // Well under a second alone; with a test on every core the four
+        // workers can wait a long time for one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 let published = pages.iter().filter(|p| p.is_runnable(0)).count();
