@@ -77,7 +77,8 @@ const R_DEPTH: u32 = 6u;
 const R_STENCIL: u32 = 7u; // value | mask << 8
 const R_ID: u32 = 8u;      // value | mask << 8
 
-// Blit word offsets: a row run of pixels from the stage buffer into one
+// Blit word offsets: a row run of pixels from the stage buffer (or one
+// word over a box, with BLIT_CONST) into one
 // of the slot's views, under a mask, through the window's tests or not.
 const B_BOX: u32 = 0u;      // x0, y0, x1, y1 (one row)
 const B_OFF: u32 = 4u;      // the first pixel's word in the stage
@@ -89,6 +90,7 @@ const B_OR: u32 = 9u;
 const B_OWN: u32 = 10u;     // the record's own view, with BLIT_OWN_VIEW
 const BLIT_WINDOW: u32 = 1u;
 const BLIT_OWN_VIEW: u32 = 2u;
+const BLIT_CONST: u32 = 4u;  // B_OFF is the word itself, at every pixel of the box
 
 // Pixels the blits of the batch store (wgpu/mod.rs `GpuRaster::stage`).
 @group(2) @binding(2) var<storage, read> stage: array<u32>;
@@ -345,7 +347,10 @@ fn blit(pi: u32, si: u32, px: i32, py: i32) {
     } else {
         v = slots[si].views[ru(pi, B_VIEW)];
     }
-    let w = stage[ru(pi, B_OFF) + u32(px - ri(pi, B_BOX))];
+    var w = ru(pi, B_OFF);
+    if (recs[pi].flags & BLIT_CONST) == 0u {
+        w = stage[w + u32(px - ri(pi, B_BOX))];
+    }
     let mask = ru(pi, B_MASK);
     let op = ru(pi, B_OP);
     if op == 0u && mask == 0xffffffffu {

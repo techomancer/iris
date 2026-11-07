@@ -80,6 +80,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   memory without a readback, and Newport's display is composed on the GPU
   (the GL compositor's work in WGSL). Branch `wgpu-raster`, plan in
   `clanker/plans/wgpu-raster.md`.
+- The X server's and the PROM's 2D fills (solid rectangles, window-id
+  writes, pattern spans) are one operation per rectangle instead of one per
+  pixel: a single record per buffer on the GPU unit, row spans on the CPU
+  unit. In replays of recorded sessions, the PROM's power-on screen draws
+  about 6x faster on the CPU unit and 27x faster on the GPU unit, and a
+  file manager's minimize and restore about 4x and 6x faster.
 
 ### VPro drawing
 

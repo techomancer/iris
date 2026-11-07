@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 mod catalogue;
 mod display;
+mod fills;
 mod dma;
 mod fifo;
 mod index;

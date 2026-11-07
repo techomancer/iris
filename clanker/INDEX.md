@@ -422,6 +422,7 @@ The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels 
 | [read-storage-in-place.md](wgpu/read-storage-in-place.md) | rule | Read records, slots and tables from their buffers in place: a 4.8 KB struct copied by value gave silently wrong texels on RADV once the kernel grew |
 | [swaps-wait-on-stream-positions-not-fences.md](wgpu/swaps-wait-on-stream-positions-not-fences.md) | design | A swap latches once the GPU unit has submitted the stores before its arm (stream positions, no CPU wait); polled idle words could follow the same scheme (open, minor) |
 | [window-id-bytes-are-written-through-to-the-mirror.md](wgpu/window-id-bytes-are-written-through-to-the-mirror.md) | rule | The front end reads window-id bytes without a wait, so the GPU unit's id and overlay byte stores are made in the mirror too; found with replays that compare both raster units |
+| [2d-fills-are-one-record-not-pixels.md](wgpu/2d-fills-are-one-record-not-pixels.md) | rule | X/PROM fills, id writes and pattern spans go through Board::fill_box: one constant-word blit record per buffer on the GPU unit, row spans on the CPU; the slot is cached; PROM power-on 4.2 s to 0.16 s drawing on the GPU unit |
 
 
 ## build/
