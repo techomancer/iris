@@ -163,7 +163,17 @@ impl PciBus {
     /// keeps its line, as its hardware would, and a function that was drops
     /// its own.
     pub fn reset(&self) {
-        for (_, f) in self.0.decode.functions() {
+        self.reset_where(|_| true);
+    }
+
+    /// RST# to the functions at device number `device` alone, as `reset`
+    /// does for the whole bus. For a host with a reset line per device.
+    pub fn reset_device(&self, device: u8) {
+        self.reset_where(|at| at.device == device);
+    }
+
+    fn reset_where(&self, hit: impl Fn(DevFn) -> bool) {
+        for (_, f) in self.0.decode.functions().filter(|&(at, _)| hit(at)) {
             f.state().config().reset();
             f.reset();
         }
@@ -453,6 +463,20 @@ mod tests {
         }
         b.reset();
         assert_eq!(*log.lock().unwrap(), vec!["b cmd=0x0", "a cmd=0x0", "c cmd=0x0"], "header already reset when reset() runs");
+    }
+
+    #[test]
+    fn reset_device_resets_the_functions_at_one_device_number_only() {
+        let (_h, b) = bus();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for (name, d, f) in [("a0", 1, 0), ("a1", 1, 1), ("b", 2, 0), ("c", 3, 0)] {
+            b.attach(at(d, f), TestCard::logged(name, bars(), 0, &log));
+            b.config_write(at(d, f), 4, 2, PCI_COMMAND_MEMORY);
+        }
+        b.reset_device(1);
+        assert_eq!(*log.lock().unwrap(), vec!["a0 cmd=0x0", "a1 cmd=0x0"]);
+        assert_eq!(b.config_read(at(2, 0), 4, 2), Some(PCI_COMMAND_MEMORY), "device 2 keeps its header");
+        assert_eq!(b.config_read(at(1, 1), 4, 2), Some(0));
     }
 
     #[test]

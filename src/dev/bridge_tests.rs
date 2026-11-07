@@ -822,6 +822,112 @@ fn a_directly_wired_input_shares_the_pins() {
     assert_eq!(r.get(reg::INT_STATUS) & 0xff, 0);
 }
 
+// ---- the PCI reset pins, Control 27:24 ----
+
+/// A recording function at `slot`, command register enabled, and the
+/// log of the RST# deliveries it has seen.
+fn watcher(r: &Rig, slot: u8) -> (Arc<std::sync::Mutex<Vec<String>>>, DevFn) {
+    use crate::pci::testing::TestCard;
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let at = DevFn { device: slot, function: 0 };
+    let bars = [Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
+    let name = ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"][slot as usize];
+    r.fit(slot, TestCard::logged(name, bars, 0, &log));
+    r.bridge.bus().config_write(at, 4, 2, PCI_COMMAND_MEMORY);
+    (log, at)
+}
+
+const RST_PINS: u32 = 0xf << 24;
+
+/// Control resets with every pin deasserted (1); writing it back with them
+/// still deasserted resets nothing, so the PROM's first Control write
+/// does not reset the functions.
+#[test]
+fn releasing_untouched_reset_pins_resets_nothing() {
+    let r = Rig::new();
+    let (log, at) = watcher(&r, 0);
+    assert_eq!(r.get(reg::CONTROL) & RST_PINS, RST_PINS, "deasserted at reset");
+    r.set(reg::CONTROL, r.get(reg::CONTROL));
+    r.set(reg::CONTROL, r.get(reg::CONTROL) | DEV_ERROR_LOCK);
+    assert!(log.lock().unwrap().is_empty());
+    assert_eq!(r.bridge.bus().config_read(at, 4, 2), Some(PCI_COMMAND_MEMORY), "and the header is as it was");
+}
+
+/// Pin `n` going from 1 to 0 resets the function at device `n`, once, and no
+/// other: not another pin's device and not a device with no pin. Raising the
+/// pin again resets nothing. (The pin-to-device wiring is inferred.)
+#[test]
+fn a_one_to_zero_on_reset_pin_n_resets_device_n_only_once() {
+    for pin in 0..4u8 {
+        let r = Rig::new();
+        let watchers: Vec<_> = [0u8, 1, 2, 3, 6].iter().map(|&slot| (slot, watcher(&r, slot))).collect();
+        let ctl = r.get(reg::CONTROL);
+        r.set(reg::CONTROL, ctl & !(1 << (24 + pin)));
+        for (slot, (log, at)) in &watchers {
+            if *slot == pin {
+                assert_eq!(*log.lock().unwrap(), [format!("w{slot} cmd=0x0")], "pin {pin}: header reset first, then the function");
+                assert_eq!(r.bridge.bus().config_read(*at, 4, 2), Some(0));
+            } else {
+                assert!(log.lock().unwrap().is_empty(), "pin {pin} left device {slot} alone");
+                assert_eq!(r.bridge.bus().config_read(*at, 4, 2), Some(PCI_COMMAND_MEMORY));
+            }
+        }
+        r.set(reg::CONTROL, ctl);
+        assert_eq!(watchers[pin as usize].1 .0.lock().unwrap().len(), 1, "pin {pin}: releasing it resets nothing");
+    }
+}
+
+/// On the Octane's own devices: pin 0 resets the first ISP1040 and leaves the
+/// IOC3 (the console and Ethernet) and the other ISP alone.
+#[test]
+fn reset_pin_0_resets_device_0_and_leaves_the_ioc3_and_the_other_isp() {
+    use crate::pci::testing::TestCard;
+    let r = Rig::new();
+    let bars = [Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Devices 0 and 1 are the ISPs and 2 the IOC3 on the Octane.
+    for (slot, name) in [(0u8, "isp0"), (1, "isp1"), (2, "ioc3")] {
+        r.fit(slot, TestCard::logged(name, bars, 0, &log));
+        r.bridge.bus().config_write(DevFn { device: slot, function: 0 }, 4, 2, PCI_COMMAND_MEMORY);
+    }
+    let ctl = r.get(reg::CONTROL);
+    r.set(reg::CONTROL, ctl & !(1 << 24));
+    assert_eq!(*log.lock().unwrap(), ["isp0 cmd=0x0"]);
+    for slot in [1u8, 2] {
+        assert_eq!(r.bridge.bus().config_read(DevFn { device: slot, function: 0 }, 4, 2), Some(PCI_COMMAND_MEMORY));
+    }
+}
+
+#[test]
+fn holding_a_pin_low_does_not_reset_again() {
+    let r = Rig::new();
+    let (log1, _) = watcher(&r, 1);
+    let (log2, _) = watcher(&r, 2);
+    let ctl = r.get(reg::CONTROL);
+    r.set(reg::CONTROL, ctl & !(1 << 25));
+    r.set(reg::CONTROL, ctl & !(1 << 25) | DEV_ERROR_LOCK);
+    r.set(reg::CONTROL, ctl & !(0x3 << 25));
+    assert_eq!(log1.lock().unwrap().len(), 1, "holding pin 1 low is not a new 1 to 0");
+    assert_eq!(log2.lock().unwrap().len(), 1, "pin 2 is");
+}
+
+/// The specification does not say that a Bridge core reset or a Crossbow
+/// link reset pulses the pins, so neither resets the bus; the functions
+/// keep their lines.
+#[test]
+fn a_core_reset_and_a_link_reset_run_no_bus_reset_and_keep_pin_levels() {
+    let r = Rig::new();
+    let (log, at) = watcher(&r, 6);
+    let c = r.card(2, PCI_INTA);
+    r.route(2, 1);
+    c.raise(true);
+    r.reset();
+    r.bridge.link_reset();
+    assert!(log.lock().unwrap().is_empty());
+    assert_eq!(r.bridge.bus().config_read(at, 4, 2), Some(PCI_COMMAND_MEMORY));
+    assert_eq!(r.get(reg::INT_STATUS) & 0xff, 1 << 2, "the card still holds its line");
+}
+
 /// The wiring table is the rule the Bridge always had: pins A and C reach
 /// the pin numbered as the slot, B and D that number with bit two flipped.
 #[test]

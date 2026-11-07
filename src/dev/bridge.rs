@@ -210,7 +210,23 @@ const STATUS_PCI_MODE: u32 = 1 << 5;
 pub const CONTROL_FLASH_WRITE_EN: u32 = 1 << 31;
 pub const CONTROL_MEM_SWAP: u32 = 1 << 22;
 pub const CONTROL_PAGE_16K: u32 = 1 << 21;
-const CONTROL_RESET: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (0xf << 24) | (3 << 12) | (1 << 9) | (0x1f << 4) | 0xf;
+/// Control 27:24, RST_PIN_N(3:0): the four PCI reset pins, active low, all
+/// high (deasserted) at reset. Established: the bits, their reset value and
+/// that a 1 drives the pin high (Bridge ASIC specification rev 4.0, Control
+/// register; the pin list names four `BUS_RSTN` outputs, "PCI Bus reset
+/// signals").
+///
+/// Which device each pin serves is not documented. The O2 Device Driver
+/// Programming Guide (007-3443-002, pciio(D3), p. 550) describes
+/// `pciio_reset()` as activating the reset line of one card "without
+/// affecting other devices on the PCI bus", so a pin is taken to reset one
+/// device. Pin `n` resets the functions at PCI device `n` and no others: the
+/// pin-to-device wiring is inferred, from the pin count and the driver
+/// interface alone. A write that takes a pin from 1 to 0 is logged. A core
+/// reset and a link reset do not pulse the pins, because the specification
+/// does not say that either does.
+const CONTROL_RST_PINS: u32 = 0xf << 24;
+const CONTROL_RESET: u32 = (1 << 30) | (1 << 29) | (1 << 28) | CONTROL_RST_PINS | (3 << 12) | (1 << 9) | (0x1f << 4) | 0xf;
 /// Two strobes that clear the link retry counters and always read zero.
 const CONTROL_RETRY_CLEAR: u32 = 0x3 << 10;
 
@@ -841,7 +857,8 @@ impl Bridge {
             return false;
         }
         let val = val as u32;
-        self.irq_locked(|st, p| {
+        let mut asserted = 0u32;
+        let ok = self.irq_locked(|st, p| {
             let Some(info) = (if off % 8 == SLOT_DATA { reg_info(off - SLOT_DATA) } else { None }) else {
                 self.invalid_address(st, p, off, true);
                 return true;
@@ -872,6 +889,11 @@ impl Bridge {
                     let old = st.r(base);
                     let new = (old & !info.writable) | (val & info.writable);
                     st.set_r(base, new);
+                    // Control 27:24 going from 1 to 0 asserts RST# (see
+                    // CONTROL_RST_PINS).
+                    if base == reg::CONTROL {
+                        asserted = (old & !new & CONTROL_RST_PINS) >> 24;
+                    }
                     if base == reg::NIC {
                         self.onewire_slot(st, val);
                     } else if base == reg::INT_ENABLE {
@@ -886,7 +908,13 @@ impl Bridge {
                 }
             }
             true
-        })
+        });
+        // With the state lock dropped: the functions reset themselves.
+        for pin in (0..4).filter(|pin| asserted >> pin & 1 != 0) {
+            log::warn!("bridge: Control drops reset pin {pin}: resetting PCI device {pin} (pin wiring is inferred)");
+            self.bus.reset_device(pin);
+        }
+        ok
     }
 
     /// One bit slot, reported finished inside the write the guest polls after.
