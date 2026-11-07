@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Machine profiles
+
+- An Indy or `indigo2_ip22` no longer accepts an R10000, and `indigo2_ip28`
+  accepts only the R10000: the R10000 Indigo2 is the IP28 board. A config with
+  no `cpu` takes its machine's first processor (the R4400 for an Indy, the
+  R10000 for the IP28). The front ends' Processor pickers list the same models.
+  The bare-metal benchmark rig (test device on) still takes every chip on its
+  Indy, so iris-bench keeps its r10000, r12000 and r14000 cells.
+
 ### Boot test before publishing
 
 - `build.yml` can boot IRIX 5.3 to a login prompt on Linux, macOS and Windows
@@ -194,6 +203,72 @@ hashes are given where a change is easiest to understand by reading the commit.
   sectors in the overlay's dirty record and leaves the rest sparse, on every OS, so
   the cost follows what the guest wrote. Reflinking is unchanged. On Windows the
   copy is marked sparse first.
+
+### R10000 TLB widths
+
+- **Full 44-bit user addresses.** On the R10000 (Octane, IP28, and an O2 set to
+  `r10000`) EntryHi, the TLB match and the user-segment check keep VA bits 43:40;
+  they stopped at bit 39 before, so an address above 1 TiB took an Address Error.
+  The R4400 and R5000 are unchanged.
+- **FrameMask (CP0 register 21)** on the R10000 clears the EntryLo bits it
+  names, 33:18, on every TLB write, so a kernel that keeps software flags there
+  gets the physical address it meant. The register read as zero and ignored
+  writes before. The R4400 and R5000 have none.
+- **EntryLo** on the R10000 keeps its 28-bit PFN (bits 33:6, a 40-bit physical
+  address) and the uncached attribute in 63:62; it kept 30 bits before. The
+  attribute is stored and read back, not sent to the bus.
+- **TLB writes on the R10000** store zeros in the PFN bits below the page size,
+  so TLBR reads them back as zero, as the part does; on 16 KB pages that is
+  EntryLo bits 7:6. Translation is unchanged. The PROM's `ide` `tlb` test
+  failed 320 compares on this. The manual documents it for the R10000; the
+  R12000 and R14000 do the same as a model choice. The R4400 and
+  R5000 still keep the whole PFN.
+- **TLB refill vector on the R10000** follows the address space that missed:
+  a user address takes the XTLB vector only with UX set, xsseg with SX, and
+  kernel addresses with KX. A 64-bit kernel touching a 32-bit user address now
+  refills through 0x000, as the part does, not 0x080. The R4400 and R5000 still
+  choose by the current mode.
+
+### Refused uncached stores on the R10000 family
+
+- On the R10000 family (Octane, IP28, O2), an uncached store that nothing answers now
+  completes instead of raising a Data Bus Error, as the processor does. iris prints
+  "Unsupported uncached write ... (posted, completes)" for the first four such
+  stores and then at each power of two. Loads, instruction fetches, the R4400 and
+  the R5000 are unchanged.
+
+### Partial LWR on the R10000
+
+- On the R10000 (Octane, IP28, and an O2 with the R10000), an `LWR` that loads fewer
+  than four bytes now keeps bits 63:32 of the destination instead of sign-extending,
+  as the reference results for the part show. R4400 and R5000 machines are unchanged.
+  The JIT matches the interpreter, and the code-cache key changes only for the
+  machines that have the behaviour.
+
+### R10000 cache operations
+
+- **Index Load Data and Index Store Data** on the R10000's primary caches keep their
+  data (they read back zero before). The secondary cache's data slot is the address
+  shifted right by 3 instead of 4: one slot per doubleword.
+- **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
+  TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
+
+### R12000 and R14000
+
+- `[machine] cpu` and `--cpu` take `r12000` and `r14000`. The Octane
+  takes the R10000, R12000 and R14000 (defaulting to 195, 360 and 600 MHz), the
+  O2 the R5000, R10000 and R12000 (400 MHz for the R12000), the IP28 the R10000.
+  CP0 Config now reports the part's own secondary-cache size, where every part
+  read 1 MB.
+- Each processor SGI shipped in a machine iris models is one `CpuModel`
+  variant named by family and clock (`r14000_600`, `r12000_400`), and a
+  machine lists the ones it takes. A family name still works and means the
+  machine's chip of that family; a chip name must be one the machine lists.
+  CP0 Count is half the chip's clock. Each is a configuration seen in real
+  hinv dumps. Guest-visible: an Indy or Indigo2 R4400 is now rev 5.0 at 150
+  MHz (Count 75 MHz, was rev 4.0 and 33), its R5000 rev 1.0 at 180 MHz (was
+  rev 2.1); the O2 R10000 is rev 3.4 at 250 MHz (was rev 2.5 at 180). The
+  Octane and IP28 are unchanged.
 
 ### `IRIS_GUI_GL` works in iris-gui
 
@@ -594,6 +669,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2's memory alias holds for pages with high PTE bits set.** A mapped page
+  whose address had a bit set above bit 31 missed the alias of RAM at
+  0x8000_0000 and reached the PCI window instead.
 - **The O2 runs on the shadow cache from reset.** The full cache model, and
   the switch to and from it during POST and reboots, are gone
   (`src/ip32_handover.rs`), and with them a branch on every cached load, store

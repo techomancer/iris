@@ -147,6 +147,11 @@ fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
 /// for a minute is not mistaken for a hang, and that property is worth keeping
 /// at the command line — so this echoes every line rather than waiting for the
 /// end and printing the parsed summary.
+/// `--cpu`: a family or a chip of the ones the suite measures.
+fn bench_cpu(name: &str) -> Result<iris::config::CpuModel, String> {
+    iris::config::CpuModel::resolve(name, iris::bench_runner::BENCH_CPUS)
+}
+
 fn run_embedded(label: &str, timeout_s: u64, quick: bool, cpu: iris::config::CpuModel,
                 cache: iris::config::CacheModel, deterministic: bool) -> Result<Run, String> {
     let opts = BenchOptions {
@@ -271,6 +276,12 @@ const CELLS: &[Cell] = &[
     Cell { name: "r5000-jitv2",     features: "jitv2",      cpu: "r5000", expect_cpu: "R5000" },
     Cell { name: "r4400-lightning", features: "lightning",  cpu: "r4400", expect_cpu: "R4400" },
     Cell { name: "r4400-jitv2-lightning", features: "jitv2,lightning", cpu: "r4400", expect_cpu: "R4400" },
+    // The R10000 family. It always runs the shadow caches, so the default
+    // build covers it. Full chip names: a bare family name would pick the
+    // chip of the first machine that lists it.
+    Cell { name: "r10000-interp",   features: "",           cpu: "r10000_195", expect_cpu: "R10000" },
+    Cell { name: "r12000-interp",   features: "",           cpu: "r12000_360", expect_cpu: "R12000" },
+    Cell { name: "r14000-interp",   features: "",           cpu: "r14000_600", expect_cpu: "R14000" },
 ];
 
 fn build_cell(cell: &Cell, root: &Path, force: bool) -> Result<PathBuf, String> {
@@ -724,7 +735,7 @@ enum Cmd {
         quick: bool,
         /// Emulated CPU for the in-process run. With --iris, forward it to the
         /// emulator instead: `-- --cpu r5000`.
-        #[arg(long, default_value = "r4400")]
+        #[arg(long, default_value = "r4400", value_parser = bench_cpu)]
         cpu: iris::config::CpuModel,
         /// Cache model for the in-process run: auto (shadow in a jitv2
         /// build), full or shadow. With --iris: `-- --cache shadow`.
@@ -1092,13 +1103,13 @@ mod tests {
     #[test]
     fn every_cell_name_is_unique_and_maps_to_a_cpu() {
         for (i, a) in CELLS.iter().enumerate() {
-            assert!(a.expect_cpu == "R4400" || a.expect_cpu == "R5000");
             // `expect_cpu` is what the `matrix` guard compares the guest's
             // `#machine cpu=` line against, so it must describe the `--cpu`
             // this cell actually passes. CPU is a runtime flag (see `Cell::cpu`),
             // not a cargo feature, so the two agreeing is the whole contract.
-            let want = match a.cpu { "r4400" => "R4400", "r5000" => "R5000", c => panic!("{}: unknown --cpu {}", a.name, c) };
+            let want = a.cpu.split('_').next().unwrap().to_uppercase();
             assert_eq!(a.expect_cpu, want, "{}", a.name);
+            assert!(iris::config::CpuModel::resolve(a.cpu, iris::bench_runner::BENCH_CPUS).is_ok());
             for b in CELLS.iter().skip(i + 1) { assert_ne!(a.name, b.name); }
         }
     }

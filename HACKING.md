@@ -18,7 +18,8 @@ Other documents:
 
 IRIS emulates five SGI workstations: the Indy (IP24), the Indigo2 (IP22), the
 Indigo2 IMPACT (IP28), the O2 (IP32) and the Octane (IP30). The CPU is an
-R4400, R5000 or R10000, chosen at runtime (the Octane takes the R10000 only).
+R4400, R5000, R10000, R12000 or R14000, chosen at runtime (the IP28 takes the R10000;
+the Octane the R10000, R12000 or R14000; the O2 the R5000, R10000 or R12000).
 Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and
 Indigo2, GBE on the O2 and Solid IMPACT on the Octane. It boots the real PROMs
 and IRIX 5.3 and 6.5 to a desktop with networking.
@@ -271,8 +272,8 @@ in [docs/interrupt_map.md](docs/interrupt_map.md).
 
 ### Time
 
-CP0 Count is derived from host wall-clock time at a fixed rate (33 MHz on
-IP22/IP24, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). The Compare
+CP0 Count is derived from host wall-clock time at a fixed rate (half the chip's clock, from
+`CpuModel::mhz`: 75 MHz on the Indy R4400, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). The Compare
 interrupt and other periodic device events come from host timers
 (`src/hptimer.rs`), not from counting instructions. A guest that runs faster
 or slower than real hardware sees the same time passing. `--features
@@ -371,7 +372,7 @@ consumer thread never takes `rec`.
   handler sets the PC itself, including delay slots.
 - The CPU model is the `CpuModel` trait (`MIPS4`, `PRID`, `FIR`,
   `TLB_ENTRIES`, ...), implemented by each cache model. The executor is
-  monomorphised over it, so all three CPUs are in every binary with no
+  monomorphised over it, so every CPU is in every binary with no
   per-model branch on the hot path. `Machine::new` picks one from `[machine]
   cpu`.
 - With `opcodefusion` (implied by `lightning`), the interpreter executes

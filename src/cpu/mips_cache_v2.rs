@@ -85,6 +85,77 @@ pub const C_R10K_CBARRIER: u32 = 5 << 2;
 pub const C_R10K_ILD: u32 = 6 << 2;
 pub const C_R10K_ISD: u32 = 7 << 2;
 
+/// What one CACHE encoding (target in bits 1:0, operation in 4:2) does on a
+/// model.
+struct CacheOp {
+    /// The address is translated (a hit operation), rather than used as an
+    /// index.
+    translates: bool,
+    /// The operation stores TagHi:TagLo into the cache.
+    stores_tag: bool,
+    /// The operation loads TagHi:TagLo from the cache.
+    loads_tag: bool,
+    /// The operation loads CP0 ECC with the selected doubleword's check bits.
+    loads_ecc: bool,
+}
+
+impl CacheOp {
+    const fn decode(r10k: bool, cache_op: u32) -> CacheOp {
+        let op = cache_op & 0x1C;
+        let sel = cache_op & 3;
+        // The R10000 index operations that name a cache entry rather than an
+        // address: they are not translated. The primary Index Load/Store Data
+        // operations select by virtual address, but a mapped one still takes
+        // TLB Refill and Invalid (VR10000 Instruction Set UM p. 15), so they
+        // are.
+        let primary_data = r10k
+            && (op == C_R10K_ILD || op == C_R10K_ISD)
+            && (sel == CACH_PI || sel == CACH_PD);
+        let index_op = r10k
+            && ((op == C_R10K_CBARRIER && sel == CACH_PI)
+                || (op == C_R10K_ILD && (sel == CACH_PI || sel == CACH_PD || sel == CACH_SD))
+                || (op == C_R10K_ISD && (sel == CACH_SI || sel == CACH_SD)));
+        let hit_op = op == C_CDX || op == C_HINV || op == C_HWBINV || op == C_HWB || op == C_HSV;
+        CacheOp {
+            translates: primary_data || (!index_op && hit_op),
+            stores_tag: op == C_IST || ((index_op || primary_data) && op == C_R10K_ISD),
+            loads_tag: op == C_ILT || (index_op && op == C_R10K_ILD),
+            // Index_Load_Tag also loads CP0 ECC with the selected doubleword's
+            // check bits (R4000 UM A-42); the R10000 does this on
+            // Index_Load_Data.
+            loads_ecc: (r10k && op == C_R10K_ILD) || (cfg!(feature = "cache-ecc") && !r10k && op == C_ILT),
+        }
+    }
+}
+
+/// Which CACHE encodings (bit n = `cache_op` n) do each thing on a model, so
+/// `exec_cache` tests a bit of a compile-time constant instead of re-deriving
+/// the decision with compares on every operation.
+pub struct CacheOpMasks {
+    pub translates: u32,
+    pub stores_tag: u32,
+    pub loads_tag: u32,
+    pub loads_ecc: u32,
+}
+
+impl CacheOpMasks {
+    const fn for_model(r10k: bool) -> CacheOpMasks {
+        let mut m = CacheOpMasks { translates: 0, stores_tag: 0, loads_tag: 0, loads_ecc: 0 };
+        let mut cache_op = 0;
+        while cache_op < 32 {
+            let op = CacheOp::decode(r10k, cache_op);
+            let bit = 1 << cache_op;
+            if op.translates { m.translates |= bit; }
+            if op.stores_tag { m.stores_tag |= bit; }
+            if op.loads_tag { m.loads_tag |= bit; }
+            if op.loads_ecc { m.loads_ecc |= bit; }
+            cache_op += 1;
+        }
+        m
+    }
+}
+
+
 /// Decode a raw cache_op field (5-bit: op[4:2] | target[1:0]) to a human-readable name.
 /// Matches the disassembler mnemonic convention used by gas/objdump.
 pub fn cache_op_name(op: u32) -> &'static str {
@@ -565,6 +636,30 @@ pub trait CpuModel: MipsCache {
     /// and `Index_Load_Data` returns into it, neither of which is true of the
     /// R4000 hit operations that share those encodings.
     const R10K_CACHE_OPS: bool = false;
+    /// What each CACHE encoding does on this model, derived from
+    /// [`Self::R10K_CACHE_OPS`].
+    const CACHE_OPS: CacheOpMasks = CacheOpMasks::for_model(Self::R10K_CACHE_OPS);
+    /// The part is in the R10000 family, which shares one programming model:
+    /// FrameMask, and 44 virtual and 40 physical address bits.
+    /// Established for the R10000. The R12000 is inferred to match: its manual's
+    /// list of changes from the R10000 has no TLB or CP0 change. The R14000 is
+    /// a model choice that gives it the same TLB.
+    const R10K_FAMILY: bool = false;
+    /// A partial LWR keeps bits 63:32 of the destination. Observed on the
+    /// R10000; whether the later parts do the same is not established, so they
+    /// keep the sign extension for now.
+    const PARTIAL_LWR_KEEPS_UPPER: bool = Self::R10K_FAMILY;
+    /// An uncached store the system refuses completes instead of raising a
+    /// Data Bus Error. The R10000 sends it as a write request, which gets no
+    /// response, and Bus Error comes only from an error response to a read or
+    /// upgrade request or from uncorrectable read data (R10000 UM pp. 104, 316).
+    /// The R12000 manual documents the same path and the later parts are taken
+    /// to match. An uncached SC succeeding is a model choice. Loads and fetches
+    /// still fault.
+    const POSTS_UNCACHED_STORES: bool = Self::R10K_FAMILY;
+    /// Bits `Index_Store_Tag` keeps for the secondary cache: all of them, except
+    /// on the R10000 family, whose reserved tag bits read as zero (R10000 UM p. 270).
+    const SECONDARY_TAG_MASK: u64 = u64::MAX;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -1385,6 +1480,13 @@ pub mod model {
     pub const R4400: u8 = 0;
     pub const R5000: u8 = 1;
     pub const R10000: u8 = 2;
+    pub const R12000: u8 = 3;
+
+    /// The R10000 family: the R10000 and the parts that follow it, which share
+    /// one programming model.
+    pub const fn r10k_family(model: u8) -> bool {
+        matches!(model, R10000 | R12000)
+    }
 }
 
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.
@@ -3596,6 +3698,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
+    const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.

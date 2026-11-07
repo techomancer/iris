@@ -577,17 +577,26 @@ pub const TR_GLOBAL: u32 = 1 << 4;
 /// the privilege epoch that filled it. The only thing rejected here is a VA
 /// shape that is not a valid address in the first place.
 #[inline]
-fn nutlb_cacheable_segment(va: u64, is_64bit: bool) -> bool {
+fn nutlb_cacheable_segment<C: CpuModel>(va: u64, is_64bit: bool) -> bool {
     if !is_64bit {
         // Every 32-bit segment (kuseg/kseg0/kseg1/ksseg/kseg3) is a real
         // address whose finished translation is worth caching.
         return true;
     }
-    // xuseg: bits 63:40 must be zero to be a valid user address. Every other
-    // 64-bit segment (xsseg, xkphys, xkseg and the 0xFFFFFFFF_* compat
-    // windows) is fine — translate_64bit_impl raises before returning ok for
-    // the illegal xkphys sub-ranges, so nothing invalid reaches a fill.
-    (va >> 62) != 0 || (va >> 40) == 0
+    // xuseg: bits 63:`C::VA_BITS` must be zero to be a valid user address.
+    // Every other 64-bit segment (xsseg, xkphys, xkseg and the 0xFFFFFFFF_*
+    // compat windows) is fine — translate_64bit_impl raises before returning ok
+    // for the illegal xkphys sub-ranges, so nothing invalid reaches a fill.
+    (va >> 62) != 0 || (va >> C::VA_BITS) == 0
+}
+
+/// PageMask bit n covers physical address bit n-1, which is EntryLo bit n-7.
+const PAGEMASK_TO_ENTRYLO: u32 = 7;
+
+/// The EntryHi bits this model keeps: region, VPN2 up to `C::VA_BITS` and ASID.
+#[inline(always)]
+const fn model_entryhi_mask<C: CpuModel>() -> u64 {
+    0xC000_0000_0000_00FF | crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS)
 }
 
 /// Per-access-class tally of how far a guest load/store would get through the
@@ -698,13 +707,16 @@ pub struct MipsCpuConfig {
     pub tlb_entries: usize,
     /// Where the machine has memory.
     pub memory: Arc<crate::memory_map::MemoryMap>,
+    /// The PRId a guest reads: the cache type's unless the machine sets its
+    /// chip's (`with_prid`).
+    pub prid: Option<u32>,
 }
 
 impl MipsCpuConfig {
     /// Default configuration matching SGI Indy (R4400): 48-entry TLB.
     /// Cache geometry is fixed at compile time via constants in mips_cache_v2.
     pub fn indy() -> Self {
-        Self { tlb_entries: 48, memory: Arc::new(crate::ip22_bus::memory_map(false)) }
+        Self { tlb_entries: 48, memory: Arc::new(crate::ip22_bus::memory_map(false)), prid: None }
     }
 
     /// The JTLB size the CPU model declares.
@@ -716,7 +728,12 @@ impl MipsCpuConfig {
     /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
     /// test — every one of its reported failures was that write going nowhere.
     pub fn for_model<C: crate::cpu::mips_cache_v2::CpuModel>(memory: Arc<crate::memory_map::MemoryMap>) -> Self {
-        Self { tlb_entries: C::TLB_ENTRIES, memory }
+        Self { tlb_entries: C::TLB_ENTRIES, memory, prid: None }
+    }
+
+    pub fn with_prid(mut self, prid: u32) -> Self {
+        self.prid = Some(prid);
+        self
     }
 }
 
@@ -1023,12 +1040,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
     /// A window of physical addresses that reaches memory at another address,
     /// `(base, size, target)`, applied to mapped and XKPHYS translations
-    /// before [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
+    /// after [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
     /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
     /// there. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
-    /// XKPHYS and ERL-identity translations after [`Self::phys_alias`]. The
+    /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
     /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
     /// alias the rest away, and IRIX relies on it: its page-table entries keep
     /// software bits (the PFN lock among them) just above the PFN, so they
@@ -2202,6 +2219,23 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.sysad.describe_fault(phys_addr, size).map_or_else(String::new, |why| format!(" [{why}]"))
     }
 
+    /// Status.TS follows a TLB write that left two entries matching. Branchless:
+    /// a refill handler writes often and the flag is almost always clear.
+    #[inline(always)]
+    fn note_tlb_write_conflict(&mut self) {
+        self.core.cp0_status |= crate::cpu::mips_core::STATUS_TS & 0u32.wrapping_sub(self.tlb.take_write_conflict() as u32);
+    }
+
+    /// An uncached store the system refused, on a model that posts stores
+    /// (`CpuModel::POSTS_UNCACHED_STORES`): say so and let the store complete.
+    /// The caller returns `BUS_OK`. Always built, so a missing device or a
+    /// guest bug stays visible in every build.
+    #[cold]
+    fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
+        eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
+            size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -2211,7 +2245,16 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let mut core = MipsCore::new();
         // Mapped pages decode their C field with this model's table, as KSEG0
         // and xkphys do.
+        tlb.set_va_bits(C::VA_BITS);
         tlb.set_cache_attrs(Self::cache_attr_table());
+        tlb.set_conflict_invalidation(C::R10K_FAMILY);
+        core.entryhi_mask = model_entryhi_mask::<C>();
+        if C::R10K_FAMILY {
+            core.framemask_mask = 0xFFFF;
+            // PFN in bits 33:6 and the uncached attribute in 63:62 (R10000 UM v2.0
+            // pp. 239-240); 61:34 are reserved.
+            core.entrylo_mask = 0xC000_0003_FFFF_FFFF;
+        }
 
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
@@ -2292,15 +2335,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             c |= log2(32768) << 26;          // 32 KB L1D
             c |= 1 << 15;                    // big endian
             if C::L2_LINE == 128 { c |= 1 << 13; }
-            // Secondary cache size. The encoding is not in anything to hand,
-            // so it was swept against the PROM rather than guessed.
-            //
-            // 1 is the value to keep: IRIX reports "Secondary unified
-            // instruction/data cache size: 1 Mbyte", which agrees with this
-            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
-            // and IRIX boots with it. 4 also passes POST but has IRIX report
-            // 8 MB, contradicting the model.
-            c |= 1 << 16;
+            // SS is log2(secondary cache size / 512 KB): 0 is 512 KB, 1 is 1 MB,
+            // 2 is 2 MB, up to 5 for 16 MB (NEC U10278EJ4V0UM p.230). It follows
+            // the model's own `L2_SIZE`. EC, SC, DN, PM, DSD and SK stay zero.
+            c |= (C::L2_SIZE / (512 << 10)).trailing_zeros() << 16;
             c |= 2;                          // K0 = uncached at reset
             config = c;
         }
@@ -2310,9 +2348,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // MipsCore::new already ran reset_registers, so set both the reset value
         // and the live register — otherwise the model's identity only appears
         // after the next power_on.
-        core.reset_prid = C::PRID;
+        let prid = cfg.prid.unwrap_or(C::PRID);
+        core.reset_prid = prid;
         core.reset_fir = C::FIR;
-        core.cp0_prid = C::PRID;
+        core.cp0_prid = prid;
         core.fpu_fir = C::FIR;
 
         // Triton: sync initial L2 enabled state from Config SE bit (starts 0 = disabled).
@@ -2627,6 +2666,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 // set) -- the property a persistent code cache needs.
                 // Several CPUs share compiled code, so no one core's address.
                 core: if self.core.smp || std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
+                lwr_keeps_upper: C::PARTIAL_LWR_KEEPS_UPPER,
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -2882,7 +2922,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // user address. Everything else is cacheable regardless of which
         // mode filled it, because privilege is enforced by flushing on
         // transition rather than by the tag.
-        if !nutlb_cacheable_segment(va, self.core.is_64bit_mode()) {
+        if !nutlb_cacheable_segment::<C>(va, self.core.is_64bit_mode()) {
             return;
         }
 
@@ -3234,6 +3274,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn update_translate_fn(&mut self) {
         use crate::cpu::mips_core::PrivilegeMode;
         let is_64bit = self.core.is_64bit_mode();
+        self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER && is_64bit { 3 } else { 0 };
         let privilege = self.core.get_privilege_mode();
         self.translate_fn = match (is_64bit, privilege) {
             (false, PrivilegeMode::Kernel)     => translate_32_kernel::<T, C>,
@@ -4539,11 +4580,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let top_bits = virt_addr >> 62;
 
         match top_bits {
-            // xuseg: 0x0000_0000_0000_0000 - 0x0000_00FF_FFFF_FFFF (user mapped)
-            // Accessible from all privilege levels
+            // xuseg is user-mapped below 2^C::VA_BITS (0x0000_00FF_FFFF_FFFF
+            // for the 40-bit models) and accessible from every privilege level.
             0 => {
-                if (virt_addr >> 40) != 0 {
-                    // Bits 63:40 must be zero for valid user address
+                if (virt_addr >> C::VA_BITS) != 0 {
+                    // Bits above the model's implemented user VA must be zero
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     return TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }));
                 }
@@ -4629,15 +4670,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
-    /// A CPU physical address as the board decodes it: through
-    /// [`Self::phys_alias`] if it falls in it, then cut to [`Self::phys_mask`].
+    /// A CPU physical address as the board decodes it: cut to
+    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
-        let pa = match self.phys_alias {
-            Some((base, size, target)) if pa.wrapping_sub(base) < size => pa - base + target,
+        // Cut first: the PTE software bits above the PFN are not part of the
+        // address the alias window sees. Window and target lie within the mask.
+        let pa = pa & self.phys_mask;
+        match self.phys_alias {
+            Some((base, size, target)) if pa.wrapping_sub(base) < size => (pa - base + target) & self.phys_mask,
             _ => pa,
-        };
-        pa & self.phys_mask
+        }
     }
 
     /// TLB translation.  When `DEBUG` is true, CP0 side-effect registers are
@@ -4670,7 +4713,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             TlbResult::Miss { .. } => {
                 if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                 // Miss: XTLB vector (0x080) for 64-bit extended addresses, UTLB vector (0x000) otherwise
-                TranslateResult::exc(if XTLB != 0 { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
+                let xrefill = if C::R10K_FAMILY { self.r10k_xtlb_refill::<XTLB>(virt_addr) } else { XTLB != 0 };
+                TranslateResult::exc(if xrefill { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
             }
             TlbResult::Invalid { .. } => {
                 if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
@@ -4684,6 +4728,20 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// Whether a refill miss on `virt_addr` takes the XTLB vector on the
+    /// R10000 family: it follows the address space (UX for user, SX for
+    /// xsseg, KX otherwise), not the mode, unlike the R4400 (R10000 UM v2.0
+    /// pp. 333-334, 342). A 32-bit mode sign-extends the address first.
+    #[inline(always)]
+    fn r10k_xtlb_refill<const XTLB: u8>(&self, virt_addr: u64) -> bool {
+        use crate::cpu::mips_core::{STATUS_KX, STATUS_SX, STATUS_UX};
+        const _: () = assert!(STATUS_SX == STATUS_UX << 1 && STATUS_KX == STATUS_SX << 1);
+        let va = if XTLB != 0 { virt_addr } else { virt_addr as u32 as i32 as i64 as u64 };
+        // Region 0 is UX, 1 is SX, 2 and 3 are KX: three adjacent Status bits.
+        let bit = (va >> 62).min(2) as u32;
+        (self.core.cp0_status & (STATUS_UX << bit)) != 0
+    }
+
     /// Debug helper to translate address without side effects
     pub fn debug_translate(&mut self, virt_addr: u64) -> TranslateResult {
         self.translate_impl::<true>(virt_addr, AccessType::Debug)
@@ -4694,8 +4752,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn update_tlb_exception_registers<const XTLB: u8>(&mut self, virt_addr: u64) {
         const EH_VPN2_32: u64 = 0x0000_0000_FFFF_E000;
-        const EH_VPN2_64: u64 = 0x0000_00FF_FFFF_E000;
         const EH_REGION:  u64 = 0xC000_0000_0000_0000;
+        // VPN2 is bits 43:13 on the R10000 family (R10000 UM pp. 219, 288) and
+        // 39:13 on the R4x00 and R5000. The R12000 is inferred to match (its
+        // manual lists no TLB change); the R14000 is a model choice
+        // that follows the same width.
+        let eh_vpn2_64 = crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS);
 
         self.core.cp0_badvaddr = virt_addr;
 
@@ -4718,9 +4780,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         //
         // This is MAME r4000's `EH_WM` (0xC000_00FF_FFFF_E0FF) less the ASID
         // bits, which are carried separately below.
-        const EH_VPN_MASK: u64 = EH_REGION | EH_VPN2_64; // 0xC000_00FF_FFFF_E000
+        let eh_vpn_mask = EH_REGION | eh_vpn2_64;
         let asid = self.core.cp0_entryhi & 0xFF;
-        self.core.cp0_entryhi = (virt_addr & EH_VPN_MASK) | asid;
+        self.core.cp0_entryhi = (virt_addr & eh_vpn_mask) | asid;
 
         // Context: PTEBase[63:23] preserved, BadVPN2 = virt_addr[31:13] in bits [22:4].
         // Always 32-bit VPN — Context is used by the 32-bit UTLB handler.
@@ -4741,10 +4803,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // the address it computes lands outside the page table it wired, the
         // nested miss is unrecoverable, and IRIX panics with "Entered tlbmiss
         // with invalid vaddr".
-        //
-        // EntryHi keeps the 40-bit VPN2 field on every model: a 64-bit kernel
-        // zero-fills those upper bits itself when it builds an EntryHi value,
-        // and widening the mask here breaks it.
         self.core.cp0_xcontext =
             xcontext_on_miss(C::VA_BITS, self.core.cp0_xcontext, virt_addr);
     }
@@ -5099,9 +5157,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.sysad.write64(phys_addr, val)
             };
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, SIZE, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         };
         // jitv2_lockstep's load/store verification (see MipsCore's
         // lockstep_mem field doc comment, and read_data_impl's matching
@@ -5155,9 +5220,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             let ws = self.sysad.write64_masked(phys_addr, val, mask);
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
-                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                if C::POSTS_UNCACHED_STORES {
+                    self.post_refused_store(virt_addr, phys_addr, mask.count_ones() as usize / 8, val, ws);
+                    BUS_OK
+                } else {
+                    eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                    ws
+                }
+            } else {
+                ws
             }
-            ws
         }
     }
 
@@ -6375,8 +6447,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 let mask = 0xFFFFFFFFu32 >> shift;
                 let result = (mem_word >> shift) | (rt_val & !mask);
 
-                // Sign-extend to 64 bits
-                self.core.write_gpr(rt_reg, result as i32 as i64 as u64);
+                // The manual leaves the upper word of a partial LWR
+                // implementation specific (NEC U12754E pp. 125-126); the R10000
+                // keeps bits 63:32. A full word, or any word with 64-bit
+                // operations off, sign-extends. `lwr_upper_below` folds both.
+                let value = if C::PARTIAL_LWR_KEEPS_UPPER && (byte_offset as u8) < self.core.lwr_upper_below {
+                    (self.core.read_gpr(rt_reg) & 0xffff_ffff_0000_0000) | result as u64
+                } else {
+                    // Sign-extend to 64 bits
+                    result as i32 as i64 as u64
+                };
+                self.core.write_gpr(rt_reg, value);
                 self.handle_exec_complete()
             }
             Err(status) => self.finish_status(status)
@@ -6557,20 +6638,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let cache_op = d.rt as u32;  // Encoded operation: cache_sel in bits[1:0], op in bits[4:2]
         let op = cache_op & 0x1C;
 
-        // Determine if this is a Hit operation that needs address translation
-        // On an R10000 the encodings for 5/6/7 are index operations, not the
-        // R4000 hit operations — translating them would fault on an index that
-        // is not a valid virtual address. See C_R10K_ISD in mips_cache_v2.
+        // Hit operations need address translation; index operations use the
+        // address as an index. On an R10000 the encodings for 5/6/7 are index
+        // operations, not the R4000 hit operations: translating them would
+        // fault on an index that is not a valid virtual address (see
+        // C_R10K_ISD in mips_cache_v2). `CpuModel::CACHE_OPS` holds that
+        // decision per encoding, so the choice here is one bit test.
         let sel = cache_op & 3;
-        let r10k_index_op = C::R10K_CACHE_OPS
-            && match op {
-                C_R10K_CBARRIER => sel == CACH_PI,
-                C_R10K_ILD => matches!(sel, CACH_PI | CACH_PD | CACH_SD),
-                C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
-                _ => false,
-            };
-        let needs_translation =
-            !r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
+        let bit = 1u32 << cache_op;
+        let needs_translation = C::CACHE_OPS.translates & bit != 0;
 
         let phys_addr = if needs_translation {
             // Hit operations need address translation
@@ -6583,15 +6659,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         };
 
         // For Index_Store_Tag, pass TagLo via phys_addr
-        let op = cache_op & 0x1C;
         // A cache tag is TagHi:TagLo, not TagLo alone. The IP28 PROM writes
         // the low 32 bits to $28 and the bits above to $29 — a 36-bit
         // secondary tag arrives as TagLo=0xffffcdfe, TagHi=0xf — so a model
         // that reads only TagLo sees a different tag from the one written.
         // Harmless for R4400/R5000, whose tags fit in 32 bits and who leave
         // TagHi zero: the shift-in contributes nothing there.
-        let stores_taglo = op == C_IST || (r10k_index_op && op == C_R10K_ISD);
-        let phys_addr_or_taglo = if stores_taglo {
+        let phys_addr_or_taglo = if C::CACHE_OPS.stores_tag & bit != 0 {
             ((self.core.cp0_taghi as u64) << 32) | (self.core.cp0_taglo as u32 as u64)
         } else {
             phys_addr
@@ -6652,17 +6726,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         // Index_Load_Tag also loads CP0 ECC with the selected doubleword's
         // check bits (R4000 UM A-42); the R10000 does this on Index_Load_Data.
-        if (C::R10K_CACHE_OPS && op == C_R10K_ILD)
-            || (cfg!(feature = "cache-ecc") && !C::R10K_CACHE_OPS && op == C_ILT) {
+        if C::CACHE_OPS.loads_ecc & bit != 0 {
             self.core.cp0_ecc = self.cache.cache_op_ecc();
             self.cache.set_cache_ecc(self.core.cp0_ecc);
         }
 
         // For Index_Load_Tag, update CP0 TagLo from result
-        if op == C_ILT || (r10k_index_op && op == C_R10K_ILD) {
+        if C::CACHE_OPS.loads_tag & bit != 0 {
             // Split back the way it arrived. Zeroing TagHi unconditionally
             // threw away the top of every tag wider than 32 bits.
             self.core.cp0_taglo = result & 0xFFFF_FFFF;
+            // A primary data cache access leaves TagHi zero (a model choice).
             self.core.cp0_taghi = (result >> 32) as u32;
         }
 
@@ -7150,13 +7224,20 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let g1 = (self.core.cp0_entrylo1 & 1) != 0;
         let g_combined = if g0 && g1 { 1u64 << 12 } else { 0 };
 
-        // EH_WM = 0xC000_00FF_FFFF_E0FF — same mask MAME applies on TLBWI (clears reserved bits).
-        // Then clear bit 12 (G bit from EntryHi) and set combined G from Lo0&Lo1.
-        const EH_WM: u64 = 0xC000_00FF_FFFF_E0FF;
+        // EntryHi's writable mask (0xC000_00FF_FFFF_E0FF on a 40-bit model, MAME's
+        // `EH_WM`) clears reserved bits, as on TLBWI. Then clear bit 12 (G bit
+        // from EntryHi) and set combined G from Lo0&Lo1.
+        //
+        // The R10000 family stores zeros in the PFN bits the page size leaves
+        // out of the address, so TLBR does not return them (R10000 UM v2.0
+        // pp. 299-300). The manual documents this for the R10000 only; the
+        // later parts follow it as a model choice.
+        let unused_pfn = if C::R10K_FAMILY { (self.core.cp0_pagemask & 0x01FF_E000) >> PAGEMASK_TO_ENTRYLO } else { 0 };
+        let lo = |v: u64| self.core.framemask_entrylo(v) & !unused_pfn;
         TlbEntry {
             page_mask: self.core.cp0_pagemask,
-            entry_hi: (self.core.cp0_entryhi & EH_WM & !0x1000) | g_combined,
-            entry_lo: [self.core.cp0_entrylo0, self.core.cp0_entrylo1],
+            entry_hi: (self.core.cp0_entryhi & self.core.entryhi_mask & !0x1000) | g_combined,
+            entry_lo: [lo(self.core.cp0_entrylo0), lo(self.core.cp0_entrylo1)],
             selector_bit_shift: 0, // all derived fields overwritten by MipsTlb::write()
             vcmp32: 0, vpn_hi32: 0, vcmp64: 0, vpn_hi64: 0,
             offset_mask: 0, pfn_base: [0; 2],
@@ -7217,6 +7298,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let entry = self.create_tlb_entry_from_cp0();
         self.ip28_trace_tlb_write("tlbwi", index, &entry);
         self.tlb.write(index, entry);
+        self.note_tlb_write_conflict();
         // Flushes the nutlb too — the TLB it caches just changed.
         self.nanotlb_invalidate();
 
@@ -7246,6 +7328,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let entry = self.create_tlb_entry_from_cp0();
         self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);
+        self.note_tlb_write_conflict();
         self.nanotlb_invalidate();
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBWR: Write Random Index {}\n{}", index, self.tlb.format_entry(index)); }
@@ -11062,7 +11145,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
         cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
         cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
-        cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
+        cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext); cp0u32!(cp0_framemask);
         tbl.insert("cp0".into(), toml::Value::Table(cp0));
 
         // FPU
@@ -11127,7 +11210,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
-            ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
+            ld64!(cp0_xcontext); ld32!(cp0_framemask); ld64!(cp0_epc); ld64!(cp0_errorepc);
             // Restart the virtual count from the restored value and re-arm
             // the compare timer — Instants from the previous run are
             // meaningless here — with a live ticket for the restored deadline.
