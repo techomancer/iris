@@ -243,5 +243,5 @@ The device models are ported from the author's QEMU models in
 [sgi-origami branch](https://github.com/jamesbraid/qemu-sgi-origami)). The boot flash (`src/dev/sflash.rs`)
 derives from MAME's
 [intelfsh](https://github.com/mamedev/mame/blob/master/src/devices/machine/intelfsh.cpp).
-The physical map is in [Octane/ip30-address-map.md](Octane/ip30-address-map.md);
+The physical map is in [octane-ip30-address-map.md](octane-ip30-address-map.md);
 the Bridge, Xbridge and Crossbow specifications are in [Octane/](Octane/).

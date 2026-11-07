@@ -631,7 +631,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 [machine]
 profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
 cpu     = "r4400"           # "r5000" (--cpu); IP28: "r10000", Octane: r10000/r12000/r14000, O2: r5000/r10000/r12000; or a part, "r14000_600"
-# cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
+# cpus  = 2                 # Octane only: a second processor (docs/octane-ip30-multiprocessor.md)
 
 [graphics]
 board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"

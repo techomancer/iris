@@ -258,7 +258,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **`[machine] cpus = 2`** runs an Octane with two R10000s on two host threads.
   The real PROM and IRIX bring the second up through HEART, which now answers per
   processor; IRIX 6.5 schedules across both. Both share one body of jitv2 compiled
-  code. See [docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md).
+  code. See [docs/octane-ip30-multiprocessor.md](docs/octane-ip30-multiprocessor.md).
 - **Monitor.** CPU commands moved out of `mips_exec.rs` behind one `CpuMonitor`.
   With one CPU nothing changes. With two there are `cpus`, `cpu <n>`,
   `cpu <n> <command>`, `r<n>` and `s<n>`, and the status bar shows MIPS and Hz per
