@@ -90,7 +90,7 @@ cdrom  = false
 #   mac    — optional; default 00:80:19:44:50:<scsi-id>
 #   subnet — optional; this target's own NAT subnet (gateway .1, guest .2).
 #            Must differ from nat_subnet (ec0's). Default 192.168.10.0/24.
-# See docs/daynaport.md.
+# See docs/dev/daynaport.md.
 #[scsi.3]
 #kind   = "daynaport"
 #mac    = "00:80:19:12:34:56"

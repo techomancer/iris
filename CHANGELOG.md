@@ -204,7 +204,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   (IP28), which have no PCI bus, and virtio-pci for the Octane's Bridge. The
   O2 has the transport but no interrupt route yet, and refuses the section.
   It needs a guest driver and is off by default. See
-  [docs/virtio-serial.md](docs/virtio-serial.md).
+  [docs/dev/virtio-serial.md](docs/dev/virtio-serial.md).
 - `PciConfig` can carry a read-only capability list (`with_capabilities`).
 
 ### CHD disks
@@ -740,7 +740,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   thread no longer holds up the CPU. Disk throughput under IRIX is bounded
   by the emulated CPU, not by SCSI or DMA (the controller's thread uses
   about 1% of a core while IRIX reads at its full rate).
-- **The AIC-7880 is specified.** [docs/o2/aic7880.md](docs/o2/aic7880.md)
+- **The AIC-7880 is specified.** [docs/dev/aic7880.md](docs/dev/aic7880.md)
   describes the O2's SCSI controller from the Adaptec data books, the
   open-source drivers, the MACE spec and what the PROM and IRIX download: principles of operation, PCI
   configuration space, every register and bit, the sequencer's instruction
@@ -898,7 +898,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   its brim. Both behaviours, and the deliberate divergences from a real REX3
   (reset values, visible `GFIFOLEVEL` only for the last 32 slots, no FIFO
   threshold interrupt), are now pinned by tests and recorded in
-  `docs/Indy/rex3.md`.
+  `docs/dev/rex3.md`.
 ### Monitor and CI
 
 - **The emulator's name matches the machine.** The IRIS expansion shown by
@@ -1807,7 +1807,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   retrace delivery for Indigo2 graphics.
 - **DaynaPort SCSI/Link** (`--features daynaport`, `734660b`): Ethernet over the
   SCSI bus as a per-ID target with its own NAT or PCAP backend
-  (`docs/daynaport.md`, `clanker/plans/iris-daynaport-target.md`).
+  (`docs/dev/daynaport.md`, `clanker/plans/iris-daynaport-target.md`).
 - **TFTP server** in the NAT gateway for PROM network boot (`--tftp-dir`,
   `src/net/tftp.rs`).
 - **SGI volume headers**: volume-directory support and the `mkvh` tool.

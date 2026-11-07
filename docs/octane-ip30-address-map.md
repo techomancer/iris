@@ -452,7 +452,7 @@ noted with the PC for `ip30 unmapped`.
 | 0x1800_0000 | `dev/heart.rs`: HEART's widget registers |
 | 0x1B00_0000 | the graphics widget, 11: `dev/mgras/hq4.rs`, the HQ4 in front of the Solid IMPACT raster chips (`dev/mgras/`); absent with `graphics = "none"` |
 | 0x1F00_0000 | `dev/bridge.rs`: the Bridge's local registers, PCI configuration space, the device windows routed by slot, the NIC on its MicroLAN |
-| 0x1F20_0000, 0x1F40_0000 | device windows 0 and 1: the two QL1040s (`dev/isp1040.rs`, `docs/Octane/qla1040.md`) |
+| 0x1F20_0000, 0x1F40_0000 | device windows 0 and 1: the two QL1040s (`dev/isp1040.rs`, `docs/dev/isp1040.md`) |
 | 0x1F60_0000 | device window 2: `dev/ioc3.rs` with its own UARTs, the DS1685 on its byte bus, the keyboard and mouse controller, the parallel port and the MAC part on its MicroLAN; the Ethernet MAC and PHY are `dev/ioc3_eth.rs` |
 | 0x1F70_0000 | device window 3: RAD, `dev/rad1.rs` |
 | 0x1FC0_0000 – 0x1FFF_FFFF | `dev/sflash.rs`: the boot flash with its command set; the CPU's cached view (`CachedFlashLines`) keeps the PROM's cached stores into it. `[octane] flash` keeps the part between runs |

@@ -7945,7 +7945,7 @@ fn test_span_end_leaves_y_and_x_past_end() {
 //
 // Two behaviours the OS REX3 driver depends on. Both are pinned here against
 // the emulator's public register interface, and the places where IRIS is more
-// forgiving than a real Indy are recorded in docs/Indy/rex3.md
+// forgiving than a real Indy are recorded in docs/dev/rex3.md
 // ("Where IRIS diverges from real hardware"). A change to either side should
 // fail a test here rather than show up as an OS-only bug.
 // ============================================================================
@@ -8318,7 +8318,7 @@ fn status_reports_only_the_last_32_fifo_slots() {
 /// interrupt and never stalls. A driver that *only* waits for GFIFO_INT instead
 /// of polling GFXBUSY would therefore hang here.
 ///
-/// This is a documented divergence (docs/Indy/rex3.md); if the interrupt is
+/// This is a documented divergence (docs/dev/rex3.md); if the interrupt is
 /// ever wired up, this test is the reminder to change the documentation too.
 #[test]
 fn fifo_threshold_interrupt_stays_clear() {
@@ -8336,7 +8336,7 @@ fn fifo_threshold_interrupt_stays_clear() {
     let s = read_status_now(rex);
     assert_ne!(s & STATUS_GFXBUSY, 0);
     assert_eq!(s & STATUS_GFIFO_INT, 0,
-        "IRIS does not raise GFIFO_INT; a level-based wait would hang (see docs/Indy/rex3.md)");
+        "IRIS does not raise GFIFO_INT; a level-based wait would hang (see docs/dev/rex3.md)");
 }
 
 /// Back-to-back fills with no STATUS poll in between all land, in order.

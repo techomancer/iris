@@ -1,6 +1,6 @@
 # AIC-7880: where `src/dev/aic7880.rs` departs from the specification
 
-Status: open, 2026-10-25. Companion to `docs/o2/aic7880.md` (the spec; section
+Status: open, 2026-10-25. Companion to `docs/dev/aic7880.md` (the spec; section
 numbers below refer to it). Each item says what the chip does, what the
 model does, how it shows, and the fix. Ordered by how likely a real driver is
 to notice.

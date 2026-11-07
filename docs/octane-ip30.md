@@ -114,7 +114,7 @@ A PS/2 keyboard and mouse are always plugged into IOC3's two PS/2 ports;
 the iris window (or iris-gui) and the monitor's `ps2` commands type and
 move them. The PROM and IRIX run the keyboard in scan code set 3. How the
 controller works and what each driver does with it is in
-[Octane/ioc3-ps2.md](Octane/ioc3-ps2.md).
+[ioc3-ps2.md](dev/ioc3-ps2.md).
 
 The front lightbar is two IOC3 general-purpose pins: pin 0 the white power
 LED, pin 1 the red fault LED. The GUI's front LED shows them, green for white
@@ -235,6 +235,11 @@ through its event channel. `HACKING.md` lists the thread names.
   reason.
   Restoring also rewrites the configured flash and NVRAM files, and the
   guest's clocks resume from the time they showed at the save.
+
+## Chips
+
+- [IOC3 PS/2 keyboard and mouse](dev/ioc3-ps2.md)
+- [QLogic ISP1040 SCSI controllers](dev/isp1040.md)
 
 ## Sources
 

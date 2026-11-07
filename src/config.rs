@@ -564,7 +564,7 @@ pub struct VirtioSerialPort {
 }
 
 /// virtio-serial (virtio-console) device for the guest, `[virtio_serial]`.
-/// See `src/dev/virtio` and `docs/virtio-serial.md`.
+/// See `src/dev/virtio` and `docs/dev/virtio-serial.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct VirtioSerialConfig {
     #[serde(default)]
@@ -2195,7 +2195,7 @@ impl MachineConfig {
             MachineProfile::OctaneIp30 => Ok(()),
             MachineProfile::O2Ip32 => Err(
                 "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
-                 MACE PCI bridge has no interrupt route for a third slot (see docs/virtio-serial.md)"
+                 MACE PCI bridge has no interrupt route for a third slot (see docs/dev/virtio-serial.md)"
                     .into(),
             ),
         }

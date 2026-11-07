@@ -18,7 +18,7 @@ Know which one you are reading and which one you are writing.
 `TESTING.md`, `iris-gui-README.md`, `CHANGELOG.md`, and in `docs/` the
 per-device guides, the design records, the references we aggregated from
 datasheets, SGI sources, MAME and the BSDs (`interrupt_map.md`,
-`docs/Indy/*.md`), and the datasheets themselves (PDFs). They describe the
+`docs/dev/*.md`), and the datasheets themselves (PDFs). They describe the
 emulator as it is, in prose a newcomer can follow. When you change behaviour
 they describe, update them, and keep them readable: no session logs, no
 "I tried X", no agent shorthand.

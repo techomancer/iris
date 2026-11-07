@@ -93,3 +93,9 @@ For the R10000 Indigo2 profile and larger RAM banks, see
 - Full EXTIO bus-error and EISA interrupt paths
 
 See also [`docs/interrupt_map.md`](interrupt_map.md) and [`clanker/gui/machine-profile-vs-guest-ip22.md`](../clanker/gui/machine-profile-vs-guest-ip22.md).
+
+## Chips
+
+- [REX3 graphics](dev/rex3.md), the Newport board
+- [HAL2 audio](dev/hal2.md)
+- [WD33C93A SCSI controllers](dev/wd33c93a.md)

@@ -2298,7 +2298,7 @@ fn emit_draw_iline(
     // MAME is no reference: newport.cpp models the stipple as a local
     // `bit = 31` per draw with no persistent cursor, no lsrcount, and no
     // LSADVLAST (it only logs bit 14). Spec text for bit 14 is just "Enables
-    // stipple advance at the end of a line" (docs/Indy/rex3.md). To be checked
+    // stipple advance at the end of a line" (docs/dev/rex3.md). To be checked
     // against a real XL Indy before treating either behaviour as settled.
     let advance_pattern: Value = if dm0.lsadvlast() || iterate_one {
         b.ins().iconst(types::I8, 1)

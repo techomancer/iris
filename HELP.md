@@ -157,7 +157,7 @@ Other networking paths, each covered in this file or in its own doc: NFS file sh
 (in-process, nothing to install), port forwarding, TFTP for PROM network boot
 (`--tftp-dir`), an XDMCP helper ([docs/xdmcp.md](docs/xdmcp.md)), PCAP bridging
 onto a real LAN (README), and DaynaPort SCSI Ethernet
-([docs/daynaport.md](docs/daynaport.md)).
+([docs/dev/daynaport.md](docs/dev/daynaport.md)).
 
 ### Addresses
 
@@ -677,7 +677,7 @@ cdrom = true
 # size_mb = 64
 
 # DaynaPort SCSI/Link — Ethernet over the SCSI bus. Needs a guest driver
-# (IRIX: irixdayna -> dp0). See docs/daynaport.md.
+# (IRIX: irixdayna -> dp0). See docs/dev/daynaport.md.
 # [scsi.3]
 # kind   = "daynaport"      # "disk" (default) | "cdrom" | "daynaport"
 # mac    = "00:80:19:12:34:56"
