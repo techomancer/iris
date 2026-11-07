@@ -10,6 +10,7 @@ use super::*;
 use crate::ip30::{HEART_HOST, WIDGET_HEART};
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
+use crate::xtalk::{Upstream, XtalkHost};
 
 /// HEART stand-in: the interrupt packets it received, in order. A line is
 /// the ISR bit, so `set_line(vector, set)` is a packet.
@@ -175,7 +176,7 @@ impl Rig {
     fn with_host(host: XtalkHost) -> Self {
         let sink = Arc::new(Sink::default());
         let mem = Arc::new(Mem::new());
-        Rig { bridge: Bridge::new(mem.clone(), host, sink.clone()), sink, mem }
+        Rig { bridge: Bridge::new(Upstream::single(host, mem.clone(), sink.clone())), sink, mem }
     }
 
     /// Write register `off` (a slot base such as `reg::CONTROL`).
@@ -964,6 +965,101 @@ fn a_host_with_no_packet_address_takes_any_address_and_over_64_vectors() {
     assert_eq!(r.sink.take(), [(100, true)]);
 }
 
+/// Behind a Crossbow with two hosts, the widget the guest programs picks the
+/// host: the direct map moves DMA and the interrupt destination moves
+/// packets, and a host whose link is down hears neither.
+#[test]
+fn the_programmed_widget_picks_the_host_behind_a_crossbow() {
+    use crate::dev::xbow::Xbow;
+    use crate::xtalk::HostPort;
+    let host_b = XtalkHost { widget: 10, int_packet: 0, int_packet_mask: 0, vectors: 128 };
+    let build = |links: u16| {
+        let xbow = Arc::new(Xbow::new(5, links));
+        let (mem_a, sink_a) = (Arc::new(Mem::new()), Arc::new(Sink::default()));
+        let (mem_b, sink_b) = (Arc::new(Mem::new()), Arc::new(Sink::default()));
+        let up = xbow.upstream(vec![
+            HostPort::new(HEART_HOST, mem_a.clone(), sink_a.clone()),
+            HostPort::new(host_b, mem_b.clone(), sink_b.clone()),
+        ]);
+        let r = Rig { bridge: Bridge::new(up), sink: sink_a.clone(), mem: mem_a };
+        (r, mem_b, sink_b)
+    };
+    let (r, mem_b, sink_b) = build(1 << 8 | 1 << 10 | 1 << 15);
+    let c = r.card(2, PCI_INTA);
+    let dma_to = |widget: u32| r.set(reg::DIRECT_MAP, widget << DIRECT_WIDGET_SHIFT);
+
+    dma_to(8);
+    assert!(c.dma().dma_write(0x8000_1000, &[1, 2, 3, 4]).is_ok());
+    assert_eq!(r.mem.peek(0x1000, 4), [4, 3, 2, 1]);
+    assert_eq!(mem_b.peek(0x1000, 4), [0; 4]);
+    dma_to(10);
+    assert!(c.dma().dma_write(0x8000_2000, &[5, 6, 7, 8]).is_ok());
+    assert_eq!(mem_b.peek(0x2000, 4), [8, 7, 6, 5]);
+    assert_eq!(r.mem.peek(0x2000, 4), [0; 4]);
+    let mut back = [0u8; 4];
+    assert!(c.dma().dma_read(0x8000_2000, &mut back).is_ok());
+    assert_eq!(back, [5, 6, 7, 8]);
+    // A widget with no host is dropped, as an unreachable one always was.
+    dma_to(9);
+    assert_eq!(c.dma().dma_write(0x8000_3000, &[1]), PciDmaStatus::MasterAbort);
+
+    r.set(reg::INT_ENABLE, 1 << 2);
+    r.set(reg::int_host(2), 5);
+    r.set(reg::INT_DEST_UPPER, 8 << 16);
+    r.set(reg::INT_DEST_LOWER, 0x80);
+    c.raise(true);
+    c.raise(false);
+    assert_eq!(r.sink.take(), [(5, true)]);
+    assert!(sink_b.take().is_empty());
+    r.set(reg::INT_DEST_UPPER, 10 << 16);
+    r.set(reg::INT_DEST_LOWER, 0);
+    c.raise(true);
+    c.raise(false);
+    assert_eq!(sink_b.take(), [(5, true)]);
+    assert!(r.sink.take().is_empty());
+
+    // A translation entry names its own widget.
+    r.set(reg::device(2), r.get(reg::device(2)) | DEV_SWAP_TRANSLATED);
+    let entry = |w: u32, a: u64| ATE_VALID | ((w as u64) << ATE_TARGET_WIDGET_SHIFT) | a;
+    r.bridge.write64(u64::from(ATE_BASE), entry(10, 0x5000));
+    r.bridge.write64(u64::from(ATE_BASE + 8), entry(8, 0x6000));
+    assert!(c.dma().dma_write(0x4000_0000, &[1, 2, 3, 4]).is_ok());
+    assert!(c.dma().dma_write(0x4000_1000, &[5, 6, 7, 8]).is_ok());
+    assert_eq!(mem_b.peek(0x5000, 4), [1, 2, 3, 4]);
+    assert_eq!(r.mem.peek(0x5000, 4), [0; 4]);
+    assert_eq!(r.mem.peek(0x6000, 4), [5, 6, 7, 8]);
+    assert_eq!(mem_b.peek(0x6000, 4), [0; 4]);
+
+    // The chip's own error interrupt goes to the destination widget too.
+    r.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+    r.set(reg::INT_DEST_UPPER, 10 << 16);
+    assert!(!r.bridge.read32(u64::from(Rig::cfg(5, 0))).is_ok());
+    assert_eq!(sink_b.take().len(), 1);
+    assert!(r.sink.take().is_empty());
+    r.set(reg::INT_RESET, INT_RESET_PCI_GRP | INT_RESET_MULTI_ERR);
+    r.set(reg::INT_DEST_UPPER, 8 << 16);
+    r.set(reg::INT_DEST_LOWER, 0x80);
+    assert!(!r.bridge.read32(u64::from(Rig::cfg(5, 0))).is_ok());
+    assert_eq!(r.sink.take().len(), 1);
+    assert!(sink_b.take().is_empty());
+
+    // With no live link to host B, neither its DMA nor its interrupt arrives,
+    // and a read the Crossbow drops is timed out.
+    let (r, mem_b, sink_b) = build(1 << 8 | 1 << 15);
+    let c = r.card(2, PCI_INTA);
+    r.set(reg::DIRECT_MAP, 10 << DIRECT_WIDGET_SHIFT);
+    assert_eq!(c.dma().dma_write(0x8000_1000, &[1]), PciDmaStatus::MasterAbort);
+    assert_eq!(mem_b.peek(0x1000, 1), [0]);
+    r.set(reg::INT_ENABLE, INT_XREAD_REQ_TIMEOUT);
+    assert_eq!(c.dma().dma_read(0x8000_1000, &mut [0u8; 4]), PciDmaStatus::MasterAbort);
+    assert_ne!(r.get(reg::INT_STATUS) & INT_XREAD_REQ_TIMEOUT, 0);
+    r.set(reg::INT_ENABLE, 1 << 2);
+    r.set(reg::int_host(2), 5);
+    r.set(reg::INT_DEST_UPPER, 10 << 16);
+    c.raise(true);
+    assert!(sink_b.take().is_empty());
+}
+
 // ---- flash ----
 
 fn image() -> Vec<u8> {
@@ -1135,7 +1231,7 @@ fn a_packet_reaches_heart_outside_the_state_lock() {
         }
     }
     let heart = Arc::new(Prying(Mutex::new(None), Mutex::new(Vec::new())));
-    let bridge = Bridge::new(Arc::new(Mem::new()), HEART_HOST, heart.clone());
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(Mem::new()), heart.clone()));
     *heart.0.lock() = Some(bridge.clone());
     let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
     r.route(4, 3);

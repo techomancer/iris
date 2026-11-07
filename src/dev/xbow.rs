@@ -32,6 +32,7 @@ use parking_lot::Mutex;
 use crate::irq::InterruptController;
 use crate::snapshot::{field_bool, field_u32, field_u32s, field_u8, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK, Saveable};
+use crate::xtalk::{HostPort, Upstream};
 
 /// A widget ID register: JTAG IDCODE layout, bit 0 set.
 pub const fn widget_id(rev: u32, part: u32, mfgr: u32) -> u32 {
@@ -598,6 +599,19 @@ impl crate::traits::Resettable for Xbow {
 /// Widget 0's window as the machine's bus sees it: the full physical
 /// address, of which the window's 16 MB is decoded.
 const WINDOW_MASK: u64 = REG_SPAN as u64 - 1;
+
+impl Xbow {
+    /// What a Bridge behind this Crossbow sends to: each of `hosts` sits on
+    /// its widget's port, and a request to it is dropped while that link is
+    /// down.
+    pub fn upstream(self: &Arc<Self>, hosts: Vec<HostPort>) -> Upstream {
+        hosts.into_iter().fold(Upstream::new(), |up, h| {
+            let (xbow, widget) = (self.clone(), h.host.widget);
+            assert!(link_bit(widget).is_some(), "widget {widget} is not a Crossbow port");
+            up.with(h.with_link(Arc::new(move || xbow.carries(widget))))
+        })
+    }
+}
 
 impl BusDevice for Xbow {
     fn read8(&self, addr: u64) -> BusRead8 {
