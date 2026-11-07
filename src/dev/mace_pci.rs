@@ -33,6 +33,10 @@ pub const MACEPCI_REVISION_VALUE: u32 = 1;
 pub const IP32_SCSI_SLOT: u8 = 1;
 pub const IP32_SCSI_SLOT_B: u8 = 2;
 
+/// The "PCI option" slot: device 3, whose four pins the MACE specification
+/// routes to CRIME inputs 10 and 13 to 15.
+pub const IP32_OPTION_SLOT: u8 = 3;
+
 /// The CPU-side window onto PCI memory, and the PCI address it starts at.
 ///
 /// These are not the same number, which is the whole point. The PROM programs
@@ -602,5 +606,84 @@ mod tests {
         assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0x5678_1234);
         pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(2 << 16 | 2 << 11, 0));
         assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0xffff_ffff, "bus 2 is not behind it");
+    }
+
+    /// An NVMe card in the option slot, driven as the CPU and a bus master
+    /// would drive it: registers through the CPU's memory window (lanes and
+    /// all), queues and data in RAM through the native view, and the card's
+    /// pin on CRIME input 10.
+    struct NvmeHost {
+        pci: Arc<MacePci>,
+        ram: Arc<O2Memory>,
+    }
+
+    impl crate::dev::nvme::tests::HostIo for NvmeHost {
+        fn w(&self, off: u32, v: u32) {
+            self.pci.window_write(PCI_MEM_BASE + off, v as u64, 4);
+        }
+        fn r(&self, off: u32) -> u32 {
+            self.pci.window_read(PCI_MEM_BASE + off, 4) as u32
+        }
+        fn put(&self, at: u64, data: &[u8]) {
+            self.ram.write(at as usize, data);
+        }
+        fn get(&self, at: u64, len: usize) -> Vec<u8> {
+            self.ram.bytes(at as usize, len)
+        }
+        fn bus(&self, at: u64) -> u64 {
+            PCI_NATIVE_VIEW as u64 + at
+        }
+    }
+
+    fn nvme_in_the_option_slot(bridge: bool) {
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let ram = test_ram();
+        let pci = MacePci::new(&PCI0, crime.clone(), ram.clone());
+        let img = crate::dev::nvme::tests::temp_image(if bridge { "mace-ppb" } else { "mace" });
+        let card = crate::dev::nvme::Card::open(&crate::config::NvmeConfig {
+            path: img.to_string_lossy().into_owned(),
+            overlay: false,
+            bridge,
+            ..Default::default()
+        })
+        .unwrap();
+        card.fit(pci.bus(), IP32_OPTION_SLOT);
+        let cycle = |bus: u32, dev: u32, reg: u32, val: u32| {
+            pci.write32(bridge_reg(macepci_reg::CONFIG_ADDR), cfg(bus << 16 | dev << 11, reg));
+            pci.write32(bridge_reg(macepci_reg::CONFIG_DATA), val);
+        };
+        let (bus, dev) = if bridge {
+            // As the PROM does: number the bus, open memory 0x80000000 up.
+            cycle(0, 3, 6, 0x0001_0100);
+            cycle(0, 3, 8, 0x800f_8000);
+            cycle(0, 3, 1, PCI_COMMAND_MEMORY);
+            (1, 0)
+        } else {
+            (0, 3)
+        };
+        cycle(bus, dev, 4, 0x8000_0000);
+        cycle(bus, dev, 5, 0);
+        cycle(bus, dev, 1, PCI_COMMAND_MEMORY);
+        let host = NvmeHost { pci: pci.clone(), ram };
+        crate::dev::nvme::tests::smoke(&host);
+        // The completions raised INTA of the slot, CRIME input 10, and the
+        // host's reading them dropped it.
+        assert!(crime.0.lock().unwrap().contains(&(10, true)));
+        assert_eq!(crime.0.lock().unwrap().last(), Some(&(10, false)));
+        let _ = std::fs::remove_file(img);
+    }
+
+    fn bridge_reg(reg: u32) -> u64 {
+        bridge(reg)
+    }
+
+    #[test]
+    fn an_nvme_card_in_the_option_slot_masters_ram_and_raises_input_10() {
+        nvme_in_the_option_slot(false);
+    }
+
+    #[test]
+    fn an_nvme_card_behind_a_bridge_in_the_option_slot_does_the_same() {
+        nvme_in_the_option_slot(true);
     }
 }

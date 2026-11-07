@@ -199,6 +199,12 @@ impl O2Machine {
         if let Some(d) = attached.daynaports.first() {
             return Err(format!("{}: kind = \"daynaport\" is not available on the O2", crate::config::scsi_label(d.controller, d.id)));
         }
+        // The NVMe card, in the "PCI option" slot.
+        if !cfg.nvme.path.is_empty() {
+            let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
+            card.fit(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
+            let _ = bus.nvme.set(card.nvme);
+        }
         let scratch_path = attached.scratch;
         eprintln!(
             "iris: O2 with {} MB ({}), {}",
@@ -320,6 +326,10 @@ impl O2Machine {
         for ctl in bus.scsi.lock().unwrap().iter() {
             monitor.register_device(ctl.clone());
         }
+        // `nvme`: the card's registers, queues and copy-on-write disk.
+        if let Some(n) = bus.nvme.get() {
+            monitor.register_device(n.clone());
+        }
         monitor.register_device(Arc::new(O2Control::new(bus.clone())));
         #[cfg(feature = "perfetto")]
         {
@@ -333,6 +343,7 @@ impl O2Machine {
         let disks: Vec<crate::snapshot::DiskRef> = attached.tables.iter()
             .filter(|t| !t.is_cdrom)
             .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
+            .chain(bus.nvme.get().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)))
             .collect();
         Ok(Self {
             memory,
@@ -537,6 +548,9 @@ impl O2Machine {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.stop();
         }
+        if let Some(n) = self.bus.nvme.get() {
+            n.stop();
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
@@ -563,6 +577,9 @@ impl O2Machine {
     fn start_scsi(&self) {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.start();
+        }
+        if let Some(n) = self.bus.nvme.get() {
+            n.start();
         }
     }
 
@@ -608,6 +625,13 @@ impl O2Machine {
         snap.write_state("cpu", &self.cpu.save_state(), sv).map_err(|e| e.to_string())?;
         snap.write_state("o2", &self.bus.save_state(), sv).map_err(|e| e.to_string())?;
         snap.write_state("boot", &self.boot.save(), sv).map_err(|e| e.to_string())?;
+        if let Some(n) = self.bus.nvme.get() {
+            snap.write_state("nvme", &n.save_state(), sv).map_err(|e| e.to_string())?;
+            let dir = snap.dir.join("nvme");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let overlays = n.export_overlays(&dir).map_err(|e| format!("COW overlay export (NVMe): {e}"))?;
+            snap.write_toml("cow_nvme.toml", &crate::machine::build_cow_table(overlays)).map_err(|e| e.to_string())?;
+        }
         snap.write_bin("flash.bin", &self.bus.flash_bytes()).map_err(|e| e.to_string())?;
         let store = ChunkStore::new("saves");
         let mut chunks = ChunksManifest::default();
@@ -666,10 +690,17 @@ impl O2Machine {
         let overlays = (0..ctrls)
             .map(|i| snap.read_toml(&format!("cow{i}.toml")).ok().map(|t| crate::machine::parse_cow_table(&t)))
             .collect();
+        let nvme = match self.bus.nvme.get() {
+            Some(_) => Some(state("nvme")?),
+            None => None,
+        };
+        let nvme_overlays = snap.read_toml("cow_nvme.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
         Ok(O2Snapshot {
             cpu: state("cpu")?,
             bus: state("o2")?,
             boot: state("boot")?,
+            nvme,
+            nvme_overlays,
             flash: snap.read_bin("flash.bin").map_err(|e| format!("flash.bin: {e}"))?,
             memory,
             overlays,
@@ -693,6 +724,12 @@ impl O2Machine {
                 ctl.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
                     .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
             }
+        }
+        if let (Some(n), Some(v)) = (self.bus.nvme.get(), &s.nvme) {
+            if let Some(sets) = &s.nvme_overlays {
+                n.import_overlays(&s.dir.join("nvme"), sets).map_err(|e| format!("COW overlay import (NVMe): {e}"))?;
+            }
+            n.load_state(v).map_err(|e| format!("nvme: {e}"))?;
         }
         Ok(())
     }
@@ -733,6 +770,9 @@ struct O2Snapshot {
     memory: Vec<u32>,
     /// Each controller's copy-on-write sets, when the snapshot has them.
     overlays: Vec<Option<Vec<(usize, Vec<u64>)>>>,
+    /// The NVMe card's state and copy-on-write sets, with `[nvme]`.
+    nvme: Option<toml::Value>,
+    nvme_overlays: Option<Vec<(usize, Vec<u64>)>>,
     dir: std::path::PathBuf,
 }
 
@@ -808,7 +848,9 @@ impl Workstation for O2Machine {
     }
 
     fn pending_chd_sync_count(&self) -> usize {
-        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+        use crate::scsi_monitor::ScsiTargets;
+        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum::<usize>()
+            + self.bus.nvme.get().map_or(0, |n| n.scsi_bus().pending_chd_sync_count())
     }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.bus.flush_disks()
@@ -819,8 +861,10 @@ impl Workstation for O2Machine {
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
+        use crate::scsi_monitor::ScsiTargets;
         let controllers = self.bus.scsi.lock().unwrap().clone();
-        let buses: Vec<_> = controllers.iter().map(|c| c.bus()).collect();
+        let nvme = self.bus.nvme.get();
+        let buses: Vec<_> = controllers.iter().map(|c| c.bus()).chain(nvme.map(|n| n.scsi_bus())).collect();
         crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
     }
 
@@ -1203,6 +1247,25 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[nvme]` puts a card in the "PCI option" slot and records its disk;
+    /// the bus's disk flush reaches its namespace.
+    #[test]
+    fn an_nvme_card_is_fitted_in_the_option_slot() {
+        let dir = scratch("o2-nvme");
+        let disk = dir.join("nvme.raw");
+        std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None };
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        let at = crate::pci::DevFn { device: crate::dev::mace_pci::IP32_OPTION_SLOT, function: 0 };
+        assert_eq!(machine.bus.mace.pci.bus().config_read(at, 8, 4).map(|d| d >> 8), Some(0x01_0802), "the card in the slot");
+        assert!(machine.disks.iter().any(|d| d.id == crate::dev::nvme::SNAPSHOT_SLOT && d.size_bytes == 1 << 20));
+        assert!(machine.bus.nvme.get().is_some());
+        machine.bus.flush_disks().unwrap();
+        drop(machine);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

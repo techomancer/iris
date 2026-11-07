@@ -139,6 +139,8 @@ pub struct OctaneMachine {
     rad: Arc<Rad1>,
     /// virtio-serial (`[virtio_serial]`), the next free Bridge slot.
     virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
+    /// The NVMe card (`[nvme]`), in a slot of an option board.
+    nvme: Option<Arc<crate::dev::nvme::Nvme>>,
     flash: Arc<CfiFlash>,
     /// The IMPACT board, when `[graphics] board` names one.
     pub gfx: Option<Arc<ImpactXio>>,
@@ -261,7 +263,7 @@ impl OctaneMachine {
         let mac = cfg.network().mac;
         // The buses are filled from `[scsi.N]` before the controllers exist.
         let [bus_a, bus_b] = [Isp1040::new_bus(), Isp1040::new_bus()];
-        let (scratch_path, disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
+        let (scratch_path, mut disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
         let scsi = [Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
@@ -270,6 +272,19 @@ impl OctaneMachine {
         let slot = |device| DevFn { device, function: 0 };
         pci.attach(slot(0), scsi[0].clone());
         pci.attach(slot(1), scsi[1].clone());
+        let nvme = (!cfg.nvme.path.is_empty())
+            .then(|| -> Result<_, String> {
+                // `validate` found the board; the slot may still be taken.
+                let board = &xio_boards[cfg.nvme.board.unwrap_or(0)];
+                let slot = cfg.nvme.slot.or_else(|| board.free_slot()).ok_or("[nvme]: the board has no free slot")?;
+                board.check_slot(slot).map_err(|e| format!("[nvme]: {e}"))?;
+                let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
+                card.fit(board.bus(), slot);
+                eprintln!("iris: NVMe in the {} on XIO slot {}, slot {slot}", board.kind().label(), board.widget());
+                Ok(card.nvme)
+            })
+            .transpose()?;
+        disks.extend(nvme.as_ref().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)));
         let ioc3 = Arc::new(Ioc3::octane(mac, false));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = Ioc3Eth::new(mac);
@@ -497,6 +512,10 @@ impl OctaneMachine {
         monitor.register_device(heart.clone());
         // `pci`: the Bridge's bus, as the O2's MACE shows its own.
         monitor.register_device(bridge.clone());
+        // `nvme`: the card's registers, queues and copy-on-write disk.
+        if let Some(n) = &nvme {
+            monitor.register_device(n.clone());
+        }
         monitor.register_device(phys.phys.clone());
         monitor.register_device(Arc::new(Ip30Monitor {
             phys: phys.clone(),
@@ -569,6 +588,7 @@ impl OctaneMachine {
             eth,
             rad,
             virtio,
+            nvme,
             flash,
             gfx,
             vpro,
@@ -676,6 +696,9 @@ impl OctaneMachine {
         ];
         if let Some(v) = &self.virtio {
             d.push(v.clone());
+        }
+        if let Some(n) = &self.nvme {
+            d.push(n.clone());
         }
         if let Some(g) = &self.gfx {
             d.push(g.clone());
@@ -847,10 +870,19 @@ struct OctaneSnapshot {
     flash: Vec<u8>,
     memory: Vec<u32>,
     overlays: [Option<OverlaySets>; 2],
+    /// The NVMe disk's, when the snapshot has them.
+    nvme_overlays: Option<OverlaySets>,
     dir: std::path::PathBuf,
 }
 
 impl OctaneMachine {
+    /// The SCSI buses that hold disks: both controllers', then the NVMe
+    /// card's namespace.
+    fn disk_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
+        use crate::scsi_monitor::ScsiTargets;
+        self.scsi.iter().map(|c| c.bus()).chain(self.nvme.iter().map(|n| n.scsi_bus())).collect()
+    }
+
     /// Why this machine cannot be saved, when it cannot.
     fn snapshot_refusal(&self) -> Option<String> {
         snapshot_refusal_for(self.gfx.is_some(), self.vpro.is_some(), self.cpus.len())
@@ -863,6 +895,9 @@ impl OctaneMachine {
         // Only with boards, so a machine without them saves what it always did.
         if !self.xio_boards.is_empty() {
             t.value("xio_boards", toml::Value::Array(self.xio_boards.iter().map(|b| b.bridge().save_state()).collect()));
+        }
+        if let Some(n) = &self.nvme {
+            t.value("nvme", n.save_state());
         }
         t
             .value("ioc3", self.ioc3.save_state())
@@ -889,6 +924,9 @@ impl OctaneMachine {
         load("scsi0", &*self.scsi[0])?;
         load("scsi1", &*self.scsi[1])?;
         load("rad", &*self.rad)?;
+        if let Some(n) = &self.nvme {
+            load("nvme", &**n)?;
+        }
         load("flash", &*self.flash)?;
         let lines = field(v, "flash_lines")?.as_array().filter(|l| l.len() == self.flash_lines.len())
             .ok_or("flash_lines: not one entry per processor")?;
@@ -959,6 +997,12 @@ impl OctaneMachine {
                 .map_err(|e| format!("COW overlay export (controller {i}): {e}"))?;
             snap.write_toml(&format!("cow{i}.toml"), &crate::machine::build_cow_table(overlays)).map_err(io)?;
         }
+        if let Some(n) = &self.nvme {
+            let dir = snap.dir.join("nvme");
+            std::fs::create_dir_all(&dir).map_err(io)?;
+            let overlays = n.export_overlays(&dir).map_err(|e| format!("COW overlay export (NVMe): {e}"))?;
+            snap.write_toml("cow_nvme.toml", &crate::machine::build_cow_table(overlays)).map_err(io)?;
+        }
         Ok(())
     }
 
@@ -1013,12 +1057,14 @@ impl OctaneMachine {
         if flash.len() != self.flash.size() {
             return Err(format!("saved flash is {} bytes, this Octane's holds {}", flash.len(), self.flash.size()));
         }
+        let nvme_overlays = snap.read_toml("cow_nvme.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
         Ok(OctaneSnapshot {
             cpu: state("cpu")?,
             board: state("octane")?,
             flash,
             memory,
             overlays,
+            nvme_overlays,
             dir: snap.dir,
         })
     }
@@ -1038,6 +1084,9 @@ impl OctaneMachine {
                 ctl.bus().import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
                     .map_err(|e| format!("COW overlay import (controller {i}): {e}"))?;
             }
+        }
+        if let (Some(n), Some(sets)) = (&self.nvme, &s.nvme_overlays) {
+            n.import_overlays(&s.dir.join("nvme"), sets).map_err(|e| format!("COW overlay import (NVMe): {e}"))?;
         }
         self.load_board(&s.board)
     }
@@ -1174,10 +1223,10 @@ impl Workstation for OctaneMachine {
         Some(self.scsi[0].clone() as Arc<dyn crate::workstation::DiscChanger>)
     }
     fn pending_chd_sync_count(&self) -> usize {
-        self.scsi.iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+        self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()
     }
     fn flush_disks(&self) -> std::io::Result<()> {
-        self.scsi.iter().try_for_each(|c| c.bus().flush())
+        self.disk_buses().iter().try_for_each(|b| b.flush())
     }
     fn sync_chd_disks(
         &self,
@@ -1185,8 +1234,7 @@ impl Workstation for OctaneMachine {
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
-        let buses: Vec<_> = self.scsi.iter().map(|c| c.bus()).collect();
-        crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
+        crate::scsi::ScsiBus::sync_chd_disks(&self.disk_buses(), only, progress, cancel)
     }
     fn net_frames(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
         self.frames.clone()
@@ -1509,6 +1557,90 @@ mod snapshot_tests {
             b.cpus[0].step_n_inline(1_000_000).unwrap();
             assert_eq!(digest(&a), digest(&b));
         }).unwrap().join().unwrap();
+    }
+
+    /// `[nvme]` puts a card in a slot of an option board, behind a
+    /// PCI-to-PCI bridge when asked, and in no slot of the onboard Bridge. The
+    /// machine starts and stops it with the other parts and records its disk.
+    /// A snapshot takes back what the overlay held when it was saved, and the
+    /// controller's state with it; a reset of the machine resets the
+    /// controller to its power-on state.
+    fn nvme_in_a_slot(kind: crate::dev::xio_pci::Kind, slot: Option<u8>, bridge: bool) {
+        use crate::config::{NvmeConfig, XioBoardConfig};
+        use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
+        use crate::scsi_monitor::ScsiTargets;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+            let dir = scratch(&format!("nvme-{}-{}", kind.name(), slot.unwrap_or(0)));
+            let prom = empty_prom(&dir);
+            let disk = dir.join("nvme.raw");
+            std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+            let path = disk.to_string_lossy().into_owned();
+            let mut m = machine_with(&prom, &dir, |cfg| {
+                cfg.xio_board = vec![XioBoardConfig { kind, widget: None }];
+                cfg.nvme = NvmeConfig { path, overlay: true, bridge, board: None, slot };
+            });
+            let board = &m.xio_boards[0];
+            let slot = slot.unwrap_or(1);
+            let at = DevFn { device: slot, function: 0 };
+            let class = |bus: &crate::pci::PciBus, at| bus.config_read(at, 8, 4).map(|d| d >> 8);
+            // Through the processor's address of the board's widget, as the
+            // PROM reads it.
+            let w = board.widget();
+            let window = u64::from(crate::dev::bridge::CFG0_BASE + u32::from(slot) * 0x1000 + 8);
+            let seen = m.phys.phys.read32(widget_small_base(w) + window).data >> 8;
+            let pci = board.bus();
+            if bridge {
+                assert_eq!((seen, class(pci, at)), (0x06_0400, Some(0x06_0400)), "a PCI-to-PCI bridge in the slot");
+                pci.config_write(at, 0x18, 4, 0x0001_0100);
+                let sec = pci.find_bus(1).expect("the bus behind it");
+                assert_eq!(class(&sec, DevFn { device: 0, function: 0 }), Some(0x01_0802), "the card behind it");
+            } else {
+                assert_eq!((seen, class(pci, at)), (0x01_0802, Some(0x01_0802)), "the card in the slot");
+            }
+            for (i, b) in m.xio_boards.iter().enumerate() {
+                assert_eq!(b.bus().occupied(slot), true, "board {i}");
+            }
+            // The onboard Bridge keeps its own devices.
+            let onboard: Vec<u8> = (0..8).filter(|&d| m.bridge.bus().occupied(d)).collect();
+            assert_eq!(onboard, [0, 1, 2, 3], "SCSI, IOC3 and the RAD, and nothing else");
+            assert!(m.disks.iter().any(|d| d.id == crate::dev::nvme::SNAPSHOT_SLOT && d.size_bytes == 1 << 20));
+
+            let nvme = m.nvme.clone().unwrap();
+            let io = |cdb: Vec<u8>, data: Option<Vec<u8>>| {
+                let req = ScsiRequest { cdb, data_len: ScsiDataLength::Unlimited, data_in: data };
+                nvme.scsi_bus().request(0, &req).unwrap().unwrap().data
+            };
+            let rw = |op: u8| vec![op, 0, 0, 0, 0, 3, 0, 0, 1, 0];
+            io(rw(scsi_cmd::WRITE_10), Some(vec![0x11; 512]));
+            m.save_snapshot("s").unwrap();
+            assert!(m.saves.join("s/nvme/scsi0.overlay").exists(), "the overlay goes with the snapshot");
+            io(rw(scsi_cmd::WRITE_10), Some(vec![0x22; 512]));
+            assert_eq!(io(rw(scsi_cmd::READ_10), None), vec![0x22; 512]);
+            m.load_snapshot("s").unwrap();
+            assert_eq!(io(rw(scsi_cmd::READ_10), None), vec![0x11; 512], "the disk is as saved");
+
+            // The machine's reset (HEART's software reset, the monitor's
+            // reset) is RST#, which reaches the card on the option board.
+            crate::dev::nvme::tests::dirty(&nvme);
+            m.reset();
+            m.stop();
+            crate::dev::nvme::tests::assert_power_on(&nvme);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn an_nvme_card_is_fitted_behind_a_bridge_in_a_cage_slot() {
+        nvme_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2), true);
+    }
+
+    #[test]
+    fn an_nvme_card_is_fitted_in_the_cages_last_slot() {
+        nvme_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(3), false);
+    }
+
+    #[test]
+    fn an_nvme_card_is_fitted_in_a_shoehorn() {
+        nvme_in_a_slot(crate::dev::xio_pci::Kind::Shoehorn, None, false);
     }
 
     /// An empty PROM in place of the stock one, so these run anywhere.

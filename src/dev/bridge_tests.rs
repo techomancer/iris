@@ -1758,3 +1758,85 @@ fn save_load_round_trip_keeps_the_function_reachable() {
     other.bridge.set_revision(4);
     assert!(other.bridge.load_state(&v1).unwrap_err().contains("revision"));
 }
+
+/// CC and CSTS through slot 1's device window in each of its lane modes, by
+/// word and by doubleword: CSTS.RDY is set by the store that sets CC.EN and
+/// is there for the next load, whichever width either uses, and a store that
+/// clears CC.EN clears it.
+#[test]
+fn nvme_ready_follows_enable_through_every_lane_mode_and_width() {
+    #[derive(Clone, Copy, Debug)]
+    enum Mode {
+        ByteStream,
+        Words4,
+        Words8,
+    }
+    for mode in [Mode::ByteStream, Mode::Words4, Mode::Words8] {
+        let r = Rig::new();
+        let img = crate::dev::nvme::tests::temp_image("bridge-lanes");
+        let card = crate::dev::nvme::Card::open(&crate::config::NvmeConfig {
+            path: img.to_string_lossy().into_owned(),
+            overlay: false,
+            bridge: false,
+            ..Default::default()
+        })
+        .unwrap();
+        card.fit(r.bridge.bus(), 1);
+        let bits = match mode {
+            Mode::ByteStream => DEV_SWAP_PROGRAMMED,
+            Mode::Words4 => 0,
+            Mode::Words8 => DEV_64BIT_DEVICE,
+        };
+        r.set(reg::device(1), DEV_MEMORY_SPACE | bits | 0x130);
+        r.cfg_write(1, 0x10, 4, 0x1300_0000);
+        r.cfg_write(1, 0x14, 4, 0);
+        r.cfg_write(1, 0x04, 2, PCI_COMMAND_MEMORY);
+        let at = |off: u32| u64::from(Rig::win(1) + off);
+        // The CPU's word store or load that reaches register `off`.
+        let st32 = |off: u32, v: u32| {
+            let s = match mode {
+                Mode::ByteStream => r.bridge.write32(at(off), v.swap_bytes()),
+                Mode::Words4 => r.bridge.write32(at(off), v),
+                Mode::Words8 => r.bridge.write32(at(off ^ 4), v),
+            };
+            assert_eq!(s, BUS_OK);
+        };
+        let ld32 = |off: u32| match mode {
+            Mode::ByteStream => r.bridge.read32(at(off)).data.swap_bytes(),
+            Mode::Words4 => r.bridge.read32(at(off)).data,
+            Mode::Words8 => r.bridge.read32(at(off ^ 4)).data,
+        };
+        // CC by a doubleword store to 0x10 (INTMC, which takes a zero) and
+        // CSTS from a doubleword load at 0x18.
+        let st64_cc = |cc: u32| {
+            let v = match mode {
+                Mode::ByteStream => u64::from(cc.swap_bytes()),
+                Mode::Words4 => u64::from(cc),
+                Mode::Words8 => u64::from(cc) << 32,
+            };
+            assert_eq!(r.bridge.write64(at(0x10), v), BUS_OK);
+        };
+        let ld64_csts = || {
+            let d = r.bridge.read64(at(0x18)).data;
+            match mode {
+                Mode::ByteStream => (d as u32).swap_bytes(),
+                Mode::Words4 => d as u32,
+                Mode::Words8 => (d >> 32) as u32,
+            }
+        };
+        assert_eq!(ld32(0x08), 0x0001_0400, "{mode:?}: VS");
+        st32(0x24, 3 | 3 << 16);
+        st32(0x28, 0x8000_1000);
+        st32(0x30, 0x8000_2000);
+        let cc = 1 | 6 << 16 | 4 << 20;
+        st32(0x14, cc);
+        assert_eq!((ld32(0x14), ld32(0x1c), ld64_csts()), (cc, 1, 1), "{mode:?}: word store, ready at once");
+        st32(0x14, 0);
+        assert_eq!((ld32(0x1c), ld64_csts()), (0, 0), "{mode:?}: disabled");
+        st64_cc(cc);
+        assert_eq!((ld32(0x14), ld32(0x1c), ld64_csts()), (cc, 1, 1), "{mode:?}: doubleword store, ready at once");
+        st64_cc(0);
+        assert_eq!(ld32(0x1c), 0, "{mode:?}: disabled by a doubleword store");
+        let _ = std::fs::remove_file(img);
+    }
+}

@@ -1,6 +1,7 @@
 //! Register, queue, command, interrupt and snapshot tests, with a host that
 //! is a block of memory and a pin that is a probe; and the controller placed
-//! on a real bus, directly and behind a PCI-to-PCI bridge.
+//! on a real bus, directly and behind a PCI-to-PCI bridge. [`smoke`] is the
+//! same host-visible sequence for the machines' own bridges to run.
 
 use super::spec::*;
 use super::*;
@@ -1064,4 +1065,78 @@ fn a_bar_placed_above_4_gib_decodes_nothing() {
     place(&bus, at(3), 0x8000_0000);
     bus.config_write(at(3), 0x14, 4, 1);
     assert!(bus.decode(Space::Mem, 0x8000_0000).is_none());
+}
+
+/// A host as a CPU and a bus master see it: 32-bit accesses to BAR0, and
+/// memory by RAM offset and by the address a bus master uses for it.
+pub(crate) trait HostIo {
+    fn w(&self, off: u32, v: u32);
+    fn r(&self, off: u32) -> u32;
+    fn put(&self, at: u64, data: &[u8]);
+    fn get(&self, at: u64, len: usize) -> Vec<u8>;
+    fn bus(&self, at: u64) -> u64;
+}
+
+/// Bring the controller up, identify it, create an I/O queue pair, write
+/// two blocks, read them back to another place, and check the bytes where
+/// the host sees them. Returns the completion count so a caller can check
+/// the interrupt it should have raised.
+pub(crate) fn smoke(h: &dyn HostIo) {
+    let (asq, acq, ioq, data, back) = (0x1000, 0x2000, 0x3000, 0x10000, 0x20000);
+    assert_eq!(h.r(REG_VS), 0x0001_0400);
+    h.w(REG_AQA, 3 | 3 << 16);
+    h.w(REG_ASQ, h.bus(asq) as u32);
+    h.w(0x2c, (h.bus(asq) >> 32) as u32);
+    h.w(REG_ACQ, h.bus(acq) as u32);
+    h.w(0x34, (h.bus(acq) >> 32) as u32);
+    h.w(REG_CC, Rig::CC_ON);
+    assert_eq!(h.r(REG_CSTS) & CSTS_RDY, 1);
+    let mut tails = [0u32; 2];
+    let mut heads = [0u32; 2];
+    let mut cid = 0u16;
+    let mut run = |qid: usize, sqe: Sqe| -> u32 {
+        cid += 1;
+        let (sq, cq) = if qid == 0 { (asq, acq) } else { (ioq, ioq + 0x1000) };
+        h.put(sq + u64::from(tails[qid]) * 64, &Sqe { cid, ..sqe }.encode());
+        tails[qid] = (tails[qid] + 1) % 4;
+        h.w(DOORBELLS + 8 * qid as u32, tails[qid]);
+        let e = h.get(cq + u64::from(heads[qid]) * 16, 16);
+        let dw3 = u32::from_le_bytes(e[12..16].try_into().unwrap());
+        assert_eq!(dw3 & 0xffff, u32::from(cid), "the completion for this command");
+        assert_eq!(dw3 >> 17, 0, "success");
+        heads[qid] = (heads[qid] + 1) % 4;
+        h.w(DOORBELLS + 8 * qid as u32 + 4, heads[qid]);
+        u32::from_le_bytes(e[0..4].try_into().unwrap())
+    };
+    let sq = |opcode, cdw: [u32; 6], prp1| Sqe { opcode, prp1, cdw, ..Default::default() };
+    run(0, sq(admin::IDENTIFY, [1, 0, 0, 0, 0, 0], h.bus(data)));
+    assert_eq!(u16::from_le_bytes(h.get(data, 2).try_into().unwrap()), PCI_VENDOR, "Identify data in host memory");
+    run(0, sq(admin::CREATE_IO_CQ, [1 | 3 << 16, 3, 0, 0, 0, 0], h.bus(ioq + 0x1000)));
+    run(0, sq(admin::CREATE_IO_SQ, [1 | 3 << 16, 1 | 1 << 16, 0, 0, 0, 0], h.bus(ioq)));
+    let bytes = pattern(1024, 0x5a);
+    h.put(data, &bytes);
+    let nsid = |s: Sqe| Sqe { nsid: 1, ..s };
+    run(1, nsid(sq(io::WRITE, [4, 0, 1, 0, 0, 0], h.bus(data))));
+    run(1, nsid(sq(io::READ, [4, 0, 1, 0, 0, 0], h.bus(back))));
+    assert_eq!(h.get(back, 1024), bytes, "what the controller read is what it wrote");
+}
+
+/// Option-slot and Bridge-slot cards are driven through their hosts.
+#[allow(dead_code)]
+pub(crate) fn temp_image(tag: &str) -> std::path::PathBuf {
+    image(tag, 64)
+}
+
+
+/// Put `n` in a used state through its registers and state: admin queues
+/// programmed, enabled, an I/O queue pair present and the interrupt masked.
+/// For the machines' reset tests.
+pub(crate) fn dirty(n: &Nvme) {
+    for (off, v) in [(REG_AQA, 3 | 3 << 16), (REG_ASQ, ASQ as u32), (REG_ACQ, ACQ as u32), (REG_INTMS, 1), (REG_CC, Rig::CC_ON)] {
+        n.bar_write(0, off, v, 4);
+    }
+    let mut st = n.st.lock().unwrap();
+    st.cqs[1] = Some(Cq { base: IOCQ, entries: 4, phase: true, ien: true, ..Default::default() });
+    st.sqs[1] = Some(Sq { base: IOSQ, entries: 4, cqid: 1, ..Default::default() });
+    assert_eq!(st.csts, CSTS_RDY);
 }
