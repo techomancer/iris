@@ -185,6 +185,7 @@ pub mod ip30_machine;
 /// The SN0 node: its processor bus, memory and uncached views. The Origin 200 and
 /// the Origin 2000 and Onyx2 desksides are built from it.
 pub mod ip27;
+pub mod ip27_machine;
 /// Fuel has an IP34 board and uses the IP35 software platform and processor views.
 pub mod ip35;
 pub mod machine_state;

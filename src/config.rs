@@ -614,6 +614,11 @@ pub enum MachineProfile {
     /// R10000. Configured by the shared keys and the `[octane]` section; see
     /// `src/ip30_machine.rs` and `docs/octane-ip30-address-map.md`.
     OctaneIp30,
+    /// SGI Origin 200: the IP29 System Board on the IP27 software platform,
+    /// one Hub node with an R10000 or R12000, the Bridge, two ISP1040s and an
+    /// IOC3. Configured by the shared keys and `[origin200]`; see
+    /// `src/ip27_machine.rs`.
+    Origin200Ip29,
 }
 
 impl MachineProfile {
@@ -634,6 +639,7 @@ impl MachineProfile {
     pub fn bank_sizes(self) -> &'static [u32] {
         match self {
             Self::OctaneIp30 => &[0, 64, 128, 256, 512, 1024, 2048],
+            Self::Origin200Ip29 => &[0, 64, 128, 256, 512],
             Self::O2Ip32 => &[0, 32, 64, 128, 256],
             Self::Indigo2Ip28 => MC_BANK_SIZES,
             _ => &[0, 8, 16, 32, 64, 128],
@@ -652,6 +658,7 @@ impl MachineProfile {
     pub fn prom_path(self, prom: &str) -> String {
         match self {
             Self::OctaneIp30 => prom_file(prom, crate::ip30_machine::OCTANE_PROM_FILE),
+            Self::Origin200Ip29 => prom_file(prom, crate::ip27_machine::ORIGIN200_PROM_FILE),
             Self::O2Ip32 => prom_file(prom, crate::ip32_machine::O2_PROM_FILE),
             _ => prom.to_string(),
         }
@@ -659,12 +666,13 @@ impl MachineProfile {
 
     /// Every profile, in the order `workstation::build` lists them. `ALL` is
     /// only the ones the GUI offers.
-    pub const EVERY: [Self; 5] = [
+    pub const EVERY: [Self; 6] = [
         Self::IndyIp24,
         Self::Indigo2Ip22,
         Self::Indigo2Ip28,
         Self::O2Ip32,
         Self::OctaneIp30,
+        Self::Origin200Ip29,
     ];
 
     /// The name `[machine] profile` and `--machine` give this profile.
@@ -675,6 +683,7 @@ impl MachineProfile {
             Self::Indigo2Ip28 => "indigo2_ip28",
             Self::O2Ip32 => "o2_ip32",
             Self::OctaneIp30 => "octane_ip30",
+            Self::Origin200Ip29 => "origin200_ip29",
         }
     }
 
@@ -729,6 +738,7 @@ impl MachineProfile {
             Self::Indigo2Ip28 => "SGI Indigo2 IMPACT (IP28)",
             Self::O2Ip32 => "SGI O2 (IP32)",
             Self::OctaneIp30 => "SGI Octane (IP30)",
+            Self::Origin200Ip29 => "SGI Origin 200 (IP29)",
         }
     }
 
@@ -738,7 +748,7 @@ impl MachineProfile {
     /// connector), one on the Indy.
     pub fn scsi_controllers(self) -> u8 {
         match self {
-            Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 => 2,
+            Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::Origin200Ip29 => 2,
             _ => 1,
         }
     }
@@ -750,7 +760,7 @@ impl MachineProfile {
     /// purpose.
     pub fn max_scsi_id(self) -> u8 {
         match self {
-            Self::OctaneIp30 => 15,
+            Self::OctaneIp30 | Self::Origin200Ip29 => 15,
             _ => 7,
         }
     }
@@ -770,6 +780,7 @@ impl MachineProfile {
     pub fn cpus(self) -> &'static [&'static Part] {
         match self {
             Self::OctaneIp30 => crate::ip30_machine::CPUS,
+            Self::Origin200Ip29 => crate::ip27_machine::CPUS,
             Self::O2Ip32 => crate::ip32_machine::CPUS,
             Self::Indigo2Ip28 => crate::machine::IP28_CPUS,
             Self::IndyIp24 | Self::Indigo2Ip22 => crate::machine::CPUS,
@@ -884,6 +895,7 @@ impl GraphicsBoard {
     pub fn supports(self, profile: MachineProfile) -> bool {
         match profile {
             MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
+            MachineProfile::Origin200Ip29 => self == Self::None,
             MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
             _ => !self.is_vpro() && !matches!(self, Self::Extreme | Self::None),
         }
@@ -893,6 +905,7 @@ impl GraphicsBoard {
     pub fn default_for(profile: MachineProfile) -> Self {
         match profile {
             MachineProfile::OctaneIp30 => Self::SolidImpact,
+            MachineProfile::Origin200Ip29 => Self::None,
             _ => Self::Newport,
         }
     }
@@ -1215,6 +1228,25 @@ impl OctaneSection {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
         self.flash.is_none()
+    }
+}
+
+/// `[origin200]`: the Origin 200's persistent stores.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Origin200Section {
+    /// Persistent 1 MiB node boot flash; absent means volatile flash.
+    #[serde(default)]
+    pub flash: Option<String>,
+    /// Persistent 2048-byte module controller store; absent means volatile.
+    #[serde(default)]
+    pub controller_store: Option<String>,
+}
+
+impl Origin200Section {
+    /// Left out of a written config when nothing in it was set.
+    fn is_default(&self) -> bool {
+        self.flash.is_none() && self.controller_store.is_none()
     }
 }
 
@@ -1915,6 +1947,9 @@ pub struct MachineConfig {
     /// The Octane (`[octane]` section), used when `[machine] profile = "octane_ip30"`.
     #[serde(default, skip_serializing_if = "OctaneSection::is_default")]
     pub octane: OctaneSection,
+    /// Persistent flash and controller store for the Origin 200.
+    #[serde(default, skip_serializing_if = "Origin200Section::is_default")]
+    pub origin200: Origin200Section,
 
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
@@ -2144,6 +2179,7 @@ impl Default for MachineConfig {
             jitv2: Jitv2Config::default(),
             o2: O2Section::default(),
             octane: OctaneSection::default(),
+            origin200: Origin200Section::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
@@ -2193,6 +2229,7 @@ impl MachineConfig {
             }
             // The Octane has a PCI bridge with a free slot.
             MachineProfile::OctaneIp30 => Ok(()),
+            MachineProfile::Origin200Ip29 => Err("[virtio_serial] is not wired on the Origin 200".into()),
             MachineProfile::O2Ip32 => Err(
                 "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
                  MACE PCI bridge has no interrupt route for a third slot (see docs/dev/virtio-serial.md)"
@@ -2390,6 +2427,8 @@ impl MachineConfig {
             if !board.supports(self.machine.profile) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
                     format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
+                } else if self.machine.profile == MachineProfile::Origin200Ip29 {
+                    format!("graphics.board \"{name}\" is not modelled on the Origin 200 (valid: none)")
                 } else {
                     format!("graphics.board \"{name}\" is only valid on the Octane")
                 });
@@ -2431,7 +2470,7 @@ impl MachineConfig {
                     "scsi.{} and scsi.{} both name {}", other, key, scsi_label(controller, id)
                 ));
             }
-            if dev.is_daynaport() && self.machine.profile == MachineProfile::O2Ip32 {
+            if dev.is_daynaport() && matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::Origin200Ip29) {
                 return Err(format!(
                     "scsi.{}: kind = \"daynaport\" is not available on the O2 (its Ethernet is built in)", key
                 ));
@@ -2468,6 +2507,28 @@ impl MachineConfig {
                 }
             }
             crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
+        } else if self.machine.profile == MachineProfile::Origin200Ip29 {
+            // The System Board has four banks of a DIMM pair each, filled from
+            // bank 0 without a gap.
+            let banks = &self.banks[..bank_count];
+            if banks[0] == 0 {
+                return Err("banks: an Origin 200 needs memory in bank 0".into());
+            }
+            if let Some(gap) = banks.iter().position(|&b| b == 0) {
+                if banks[gap..].iter().any(|&b| b != 0) {
+                    return Err(format!("banks: bank {gap} is empty but a later bank is populated; fill the banks from 0"));
+                }
+            }
+            for (i, &sz) in banks.iter().enumerate() {
+                if !MachineProfile::Origin200Ip29.bank_sizes().contains(&sz) {
+                    return Err(format!("bank{i} size {sz} MB is invalid for an Origin 200 (valid: 64, 128, 256, 512)"));
+                }
+                // The stock PROM disables a 256 MB bank whenever the processor
+                // clock is 180 MHz, which leaves a bank 0 of that size no memory.
+                if sz == 256 && self.cpu() == &parts::R10000_180 {
+                    return Err(format!("bank{i} size 256 MB: the PROM disables 256 MB banks on the 180 MHz R10000 module (use 128 and 128, or the r12000 module)"));
+                }
+            }
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
             // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
             // bank 0 without a gap, 8 GB at most (SGI's memory upgrade guide).
@@ -2513,8 +2574,8 @@ impl MachineConfig {
             }
         }
         match (self.network.mode, self.machine.profile) {
-            (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 => {
-                return Err("network.mode = \"off\" is only available on the O2 and the Octane for now; the Indy and Indigo2 always have their Ethernet".into());
+            (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 && p != MachineProfile::Origin200Ip29 => {
+                return Err("network.mode = \"off\" is only available on the O2, the Octane and the Origin 200 for now; the Indy and Indigo2 always have their Ethernet".into());
             }
             (NetMode::Stream, _) => {
                 let ep = self.network.stream.as_deref()
@@ -3578,7 +3639,7 @@ mod export_tests {
         assert_eq!(apply(&["--ip22"]).machine.profile, MachineProfile::Indigo2Ip22);
         assert!(Cli::try_parse_from(["iris", "--ip22", "--machine", "o2_ip32"]).is_err());
         let e = MachineProfile::from_name("vax").unwrap_err();
-        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30)");
+        assert_eq!(e, "unknown machine \"vax\" (valid: indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32, octane_ip30, origin200_ip29)");
         let list = MachineProfile::list();
         assert_eq!(list.lines().count(), MachineProfile::EVERY.len());
         assert!(list.starts_with("indy_ip24     SGI Indy (IP24)\n"), "{list}");
@@ -3587,7 +3648,7 @@ mod export_tests {
         for p in MachineProfile::EVERY {
             match p {
                 MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28
-                | MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 => {}
+                | MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::Origin200Ip29 => {}
             }
             let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"{}\"", p.name())).unwrap();
             assert_eq!(cfg.machine.profile, p);
@@ -3606,7 +3667,7 @@ mod export_tests {
         // The counts are what the checks in validate() and the Octane
         // constructor allowed before they moved here: one on every machine
         // but the Octane, one or two on the Octane.
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::Origin200Ip29] {
             for cpus in 0..=4u8 {
                 let old_ok = if p == MachineProfile::OctaneIp30 { (1..=2).contains(&cpus) } else { cpus == 1 };
                 assert_eq!(p.accepts_cpus(cpus).is_ok(), old_ok, "{p:?} with {cpus}");

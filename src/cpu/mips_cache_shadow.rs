@@ -781,6 +781,13 @@ pub type R10000ShadowCache =
 pub type R12000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
 
+/// R12000 as the Origin 200's 270 MHz module has it: the Octane part with the
+/// module's 4 MB secondary cache (its Config word says SS = 3). The stock IP27
+/// PROM's secondary-cache tag test fails on the Octane type's 2 MB. The 128-byte
+/// lines are the Octane part's, not read from the module.
+pub type R12000Module4MShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
+
 /// R12000 3.5 as the O2 has it: the Octane part with 64-byte secondary lines
 /// (SB clear). With 128-byte lines the O2 PROM panics before its banner
 /// (write TLB miss at 0x0); 64 boots. IRIX on the O2 never reads SB and sizes

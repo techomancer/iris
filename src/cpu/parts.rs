@@ -44,6 +44,10 @@ pub const R5000_180: Part = Part { family: Family::R5000, mhz: 180, rev: (2, 1),
 pub const R5000_180_EARLY: Part = Part { rev: (1, 0), ..R5000_180 };
 pub const R10000_195: Part = Part { family: Family::R10000, mhz: 195, rev: (2, 7), l2_kb: 1024 };
 pub const R10000_195_EARLY: Part = Part { rev: (2, 5), ..R10000_195 };
+/// The Origin 200's processor modules: the 180 MHz R10000 (rev 2.6, 1 MB
+/// secondary cache) and the 270 MHz R12000 (rev 2.3, 4 MB).
+pub const R10000_180: Part = Part { mhz: 180, rev: (2, 6), ..R10000_195 };
+pub const R12000_270: Part = Part { mhz: 270, rev: (2, 3), l2_kb: 4096, ..R12000_360 };
 pub const R10000_250: Part = Part { mhz: 250, rev: (3, 4), ..R10000_195 };
 pub const R12000_360: Part = Part { family: Family::R12000, mhz: 360, rev: (3, 5), l2_kb: 2048 };
 pub const R12000_400: Part = Part { mhz: 400, ..R12000_360 };
@@ -53,7 +57,7 @@ pub const R14000_600: Part = Part { family: Family::R14000, mhz: 600, rev: (2, 4
 /// the first listed, so the rig runs the later silicon of a clock that has two.
 pub const ALL: &[&Part] = &[
     &R4400_150, &R5000_180_EARLY, &R5000_180, &R10000_195, &R10000_195_EARLY, &R10000_250,
-    &R12000_360, &R12000_400, &R14000_600,
+    &R10000_180, &R12000_270, &R12000_360, &R12000_400, &R14000_600,
 ];
 
 impl Part {
