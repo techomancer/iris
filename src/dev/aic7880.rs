@@ -1691,6 +1691,11 @@ impl crate::traits::Saveable for Aic7880 {
             Some(a) if a.len() == 3 => Some((toml_u8(&a[0]).unwrap_or(0), toml_u8(&a[1]).unwrap_or(0), toml_u8(&a[2]).unwrap_or(0))),
             _ => None,
         };
+        // The snapshot holds the chip, not the SCSI bus behind it. A fresh
+        // process has its targets as built, and this one may have a CD-ROM
+        // at 512 bytes from the last driver, so put them where a bus reset
+        // leaves them under the restored driver (see `reset_targets`).
+        self.reset_targets();
         self.update_irq();
         Ok(())
     }
@@ -2305,6 +2310,42 @@ mod tests {
         let order: Vec<u8> = c.executed().iter().map(|e| e.0).collect();
         assert_eq!(order, vec![1, 0], "restarting runs them in the new order");
         assert_eq!(c.read(reg::QINCNT, 1), 0);
+    }
+
+    /// A restore into a chip that has been in use equals one into a fresh
+    /// chip, targets included: the snapshot holds the chip, not the SCSI
+    /// bus, so the targets go back to what a bus reset leaves under the
+    /// restored driver (a CD-ROM at 512 bytes under SGI's), whatever the
+    /// controller had done to them before.
+    #[test]
+    fn aic7880_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
+        use crate::traits::Saveable;
+        let make = |name: &str| {
+            let (c, ram) = him_rig(name);
+            let cd = image_path(&format!("{name}-cd"));
+            std::fs::write(&cd, vec![0u8; 64 * BLOCK_SIZE]).unwrap();
+            c.bus().attach_image(3, &cd, true).expect("attach cd");
+            (c, ram)
+        };
+        let block_sizes = |c: &Aic7880| {
+            let mut sizes = Vec::new();
+            c.bus().for_each(|id, d| sizes.push((id, d.block_size())));
+            sizes
+        };
+        let (src, ram) = make("ld-src");
+        put_cmd(&ram, 2, 1, &TUR, 0);
+        src.write(reg::QINFIFO, 2, 1);
+        let v = src.save_state();
+
+        let (used, _) = make("ld-used");
+        used.bus().for_each(|_, d| d.reset_block_size(true));
+        let (fresh, _) = make("ld-fresh");
+        assert_ne!(block_sizes(&used), block_sizes(&fresh), "the dirtied bus differs before the load");
+        used.load_state(&v).unwrap();
+        fresh.load_state(&v).unwrap();
+        assert_eq!(used.save_state(), fresh.save_state());
+        assert_eq!(block_sizes(&used), block_sizes(&fresh), "and agrees after");
+        assert!(block_sizes(&used).contains(&(3, Some(512))), "a CD-ROM is at 512 under the HIM");
     }
 
     /// Nobody at an id: the selection times out, the way the HIM expects,
