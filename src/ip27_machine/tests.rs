@@ -79,9 +79,9 @@ fn a_modules_config_word_part_and_cache_type_say_the_same_secondary_cache() {
 fn the_r12000_module_has_no_record_on_its_one_wire_part() {
     let mut cfg = config(&std::env::temp_dir());
     cfg.set_cpu(&parts::R12000_270);
-    assert!(Origin200::spec(&cfg).unwrap().node_record.is_none());
+    assert!(Origin200::specs(&cfg).unwrap()[0].node_record.is_none());
     cfg.set_cpu(&parts::R10000_180);
-    assert_eq!(Origin200::spec(&cfg).unwrap().node_record.unwrap().name, "PIMM_1XT5_1MB");
+    assert_eq!(Origin200::specs(&cfg).unwrap()[0].node_record.unwrap().name, "PIMM_1XT5_1MB");
 }
 
 #[test]
@@ -127,14 +127,14 @@ fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         // Node memory view, the Hub-special views of the flash (own and named),
         // all show the PROM's first word at the reset address and the window.
-        let memory = m.node.hub.cpu_memory();
+        let memory = m.node().hub.cpu_memory();
         assert_eq!(memory.read32(0x1fc0_0000).data, 0x3c08_a600);
-        let special = m.node.hub.cpu_special();
+        let special = m.node().hub.cpu_special();
         assert_eq!(special.read32(0x1000_0000).data, 0x3c08_a600);
         assert_eq!(special.read32(0x3000_0000).data, 0x3c08_a600);
         // The Hub's own register: PI_CPU_ENABLE_A reads one without the PROM
         // having stored it.
-        let io = m.node.hub.claim(Space::Io);
+        let io = m.node().hub.claim(Space::Io);
         let enable = crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::reg::CPU_ENABLE_A;
         assert_eq!(io.read64(enable).data, 1);
         // And its slice B, which a one-processor module does not fit, is clear.
@@ -147,7 +147,7 @@ fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
     big_stack(|| {
         let dir = Scratch::new("bridge");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
-        let io = m.node.hub.claim(Space::Io);
+        let io = m.node().hub.claim(Space::Io);
         let widget = |w: u64| w << 24;
         // The Bridge's identification register, in the data half of its slot.
         let id = |w: u64| io.read32(widget(w) + 4).data;
@@ -165,7 +165,7 @@ fn a_reset_enables_the_processor_again() {
         let dir = Scratch::new("restart");
         let mut m = Origin200Machine::new(&config(&dir.0)).unwrap();
         m.reset();
-        let io = m.node.hub.claim(Space::Io);
+        let io = m.node().hub.claim(Space::Io);
         assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::reg::CPU_ENABLE_A).data, 1);
         m.stop();
     });
@@ -176,7 +176,7 @@ fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
     big_stack(|| {
         let dir = Scratch::new("flash");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
-        let word = |at: u64| m.node.hub.cpu_special().read32(0x1000_0000 + at).data;
+        let word = |at: u64| m.node().hub.cpu_special().read32(0x1000_0000 + at).data;
         // Offsets 0x8c, 0x90, 0x94 and 0x9c of the configuration block.
         assert_eq!(word(0x8c), 15);
         assert_eq!(word(0x90), 1);
@@ -224,10 +224,10 @@ fn a_dropped_machine_frees_its_hub_memory_and_timers() {
     big_stack(|| {
         let dir = Scratch::new("free");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
-        let hub = Arc::downgrade(&m.node.hub);
-        let memory = Arc::downgrade(m.node.memory.physical());
-        let timers = Arc::downgrade(&m.node.timers);
-        let cpu = Arc::downgrade(&m.cpu);
+        let hub = Arc::downgrade(&m.node().hub);
+        let memory = Arc::downgrade(m.node().memory.physical());
+        let timers = Arc::downgrade(&m.node().timers);
+        let cpu = Arc::downgrade(m.cpu_at(0));
         let bridge = Arc::downgrade(m.bridge());
         drop(m);
         assert_eq!(hub.strong_count(), 0, "the Hub");

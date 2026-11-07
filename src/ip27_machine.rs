@@ -168,6 +168,9 @@ pub struct BoardSpec {
     pub banks_mb: [u32; ip27::BANKS],
     /// What the flash configuration block carries for this product and module.
     pub flash: FlashValues,
+    /// The file that keeps the node's boot flash between runs; absent means
+    /// volatile.
+    pub flash_file: Option<PathBuf>,
     /// The record on the node's one-wire part. None leaves the part
     /// unprogrammed, which IRIX reports as missing page data.
     pub node_record: Option<NodeRecord>,
@@ -190,6 +193,15 @@ impl NodeRecord {
     pub const IP27: Self = Self { part: "030-0733-003", revision: "G", name: "IP27" };
 }
 
+/// What the machine asks of the module controller a board wires.
+pub trait ModuleController: Send + Sync {
+    /// The module resets: the controller's bus side returns to power-on.
+    fn reset(&self);
+    /// The controller's outputs since the last call, with its time brought
+    /// up to date.
+    fn take_events(&self) -> Vec<ElscEvent>;
+}
+
 /// What a board's I/O hands the machine once it is wired to the node.
 pub struct BoardIo {
     /// The devices with threads or timers, in start order.
@@ -205,6 +217,8 @@ pub struct BoardIo {
     /// The `scratch = true` volume.
     pub scratch: Option<PathBuf>,
     pub nat: Option<Nat>,
+    /// The module controller the nodes' I2C controllers reach.
+    pub controller: Arc<dyn ModuleController>,
     /// Put the board's devices back to power-on.
     pub reset: Box<dyn Fn() + Send + Sync>,
     /// The Bridge, for a test to drive.
@@ -223,23 +237,27 @@ pub struct Nat {
 /// else about one is the [`BoardSpec`].
 pub trait Ip27Board: 'static {
     const NAME: &'static str;
-    fn spec(cfg: &MachineConfig) -> Result<BoardSpec, String>;
-    /// Wire the board's I/O to the node.
-    fn wire(node: &Node, cfg: &MachineConfig) -> Result<BoardIo, String>;
+    /// The nodes the board carries, in slot order.
+    fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String>;
+    /// Wire the board's I/O to the nodes, and the nodes to each other.
+    fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String>;
 }
 
 pub type Origin200Machine = Ip27Machine<Origin200>;
 
+/// A node with its processor and module controller.
+struct Unit {
+    node: Node,
+    cpu: Arc<dyn CpuDevice>,
+}
+
 pub struct Ip27Machine<B: Ip27Board> {
     io: BoardIo,
     _board: std::marker::PhantomData<fn() -> B>,
-    node: Node,
-    elsc: Arc<Elsc>,
+    units: Vec<Unit>,
     controller_events: Sender<MachineEvent>,
-    i2c: Arc<Pcf8584>,
     /// The recurring timer that brings the controller up to date.
     controller_timer: Option<TimerId>,
-    cpu: Arc<dyn CpuDevice>,
     monitor: Arc<Monitor>,
     monitor_port: u16,
     ci: bool,
@@ -263,15 +281,16 @@ impl InterruptController for CpuIrq {
 
 /// What the Hub asks of the machine around it.
 struct Hooks {
+    name: &'static str,
     cpu: Weak<dyn CpuDevice>,
     events: Sender<MachineEvent>,
 }
 impl HubHooks for Hooks {
     fn cpu_enable(&self, slice: usize, enabled: bool) {
-        crate::dlog!(LogModule::Hub, "Origin 200: PI_CPU_ENABLE {slice} = {enabled} (no effect on the processor)");
+        crate::dlog!(LogModule::Hub, "{}: PI_CPU_ENABLE {slice} = {enabled} (no effect on the processor)", self.name);
     }
     fn nmi(&self, slice: usize) {
-        crate::dlog!(LogModule::Hub, "Origin 200: NMI to slice {slice} (not delivered)");
+        crate::dlog!(LogModule::Hub, "{}: NMI to slice {slice} (not delivered)", self.name);
     }
     fn soft_reset(&self, _slice: usize) {
         if let Some(cpu) = self.cpu.upgrade() {
@@ -280,7 +299,7 @@ impl HubHooks for Hooks {
     }
     fn node_number_changed(&self, number: u16) {
         if number != 0 {
-            crate::dlog!(LogModule::Hub, "Origin 200: node number {number}: cached accesses still use node-relative offsets");
+            crate::dlog!(LogModule::Hub, "{}: node number {number}: cached accesses still use node-relative offsets", self.name);
         }
     }
     fn machine_restart(&self) {
@@ -296,7 +315,7 @@ fn controller_output(event: ElscEvent, machine: &Sender<MachineEvent>) {
         ElscEvent::Power(false) => machine.send(MachineEvent::PowerOff),
         ElscEvent::Power(true) | ElscEvent::Reset => machine.send(MachineEvent::HardReset),
         ElscEvent::Nmi(level) => {
-            crate::dlog!(LogModule::Hub, "Origin 200: module controller NMI {level} (not delivered)");
+            crate::dlog!(LogModule::Hub, "IP27: module controller NMI {level} (not delivered)");
             Ok(())
         }
     };
@@ -306,19 +325,19 @@ fn controller_output(event: ElscEvent, machine: &Sender<MachineEvent>) {
 struct Unmodelled(&'static str);
 impl BusDevice for Unmodelled {
     fn read32(&self, a: u64) -> crate::traits::BusRead32 {
-        crate::dlog!(LogModule::Hub, "Origin 200: read of unmodelled {} {a:#x}", self.0);
+        crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.0);
         crate::traits::BusRead32::err()
     }
     fn read64(&self, a: u64) -> crate::traits::BusRead64 {
-        crate::dlog!(LogModule::Hub, "Origin 200: read of unmodelled {} {a:#x}", self.0);
+        crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.0);
         crate::traits::BusRead64::err()
     }
     fn write32(&self, a: u64, v: u32) -> u32 {
-        crate::dlog!(LogModule::Hub, "Origin 200: write of {v:#x} to unmodelled {} {a:#x}", self.0);
+        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.0);
         BUS_ERR
     }
     fn write64(&self, a: u64, v: u64) -> u32 {
-        crate::dlog!(LogModule::Hub, "Origin 200: write of {v:#x} to unmodelled {} {a:#x}", self.0);
+        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.0);
         BUS_ERR
     }
 }
@@ -326,87 +345,88 @@ impl BusDevice for Unmodelled {
 impl<B: Ip27Board> Ip27Machine<B> {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let spec = B::spec(cfg)?;
-        let module = spec.module;
+        let specs = B::specs(cfg)?;
         let prom = prom_image::load(Path::new(&cfg.machine.profile.prom_path(&cfg.prom)), node_flash::SIZE)
             .map_err(|e| format!("{} {e}", B::NAME))?;
-        let image = node_flash::initial_image(&prom, &spec.flash)?;
-        let flash = match &cfg.origin200.flash {
-            Some(path) => NodeFlash::with_file(image, path).map_err(|e| format!("origin200.flash {path}: {e}"))?,
-            None => NodeFlash::new(image)?,
-        };
-        let clock = host_clock();
-        let timers = Arc::new(TimerManager::new());
-        let memory = NodeMemory::new(spec.banks_mb)?;
-        memory.map_reset_view(&flash);
-        let hub = Hub::new(spec.hub, clock.clone());
-        hub.pi().set_timer_manager(timers.clone());
-        // The Hub's one-wire master reads the node board's record, whose
-        // serial is the node's identity: a peer's PROM reads it as the remote
-        // NIC.
-        let mut onewire = w1::Bus::new();
-        match &spec.node_record {
-            Some(r) => {
-                let record = BoardRecord { barcode: "EMUN00", part: r.part, revision: r.revision, name: r.name };
-                onewire.add(Box::new(board_record_part(&record, 0x5145_4d55_4e00)));
+        let mut parts = Vec::new();
+        for (i, spec) in specs.iter().enumerate() {
+            let image = node_flash::initial_image(&prom, &spec.flash)?;
+            let flash = match &spec.flash_file {
+                Some(path) => NodeFlash::with_file(image, path).map_err(|e| format!("node {i} flash {}: {e}", path.display()))?,
+                None => NodeFlash::new(image)?,
+            };
+            let clock = host_clock();
+            let timers = Arc::new(TimerManager::new());
+            let memory = NodeMemory::new(spec.banks_mb)?;
+            memory.map_reset_view(&flash);
+            let hub = Hub::new(spec.hub, clock.clone());
+            hub.pi().set_timer_manager(timers.clone());
+            // The Hub's one-wire master reads the node board's record, whose
+            // serial is the node's identity: the other node's PROM reads it
+            // as the remote NIC.
+            let mut onewire = w1::Bus::new();
+            let barcode = format!("EMUN{i:02}");
+            let serial = 0x5145_4d55_4e00 | i as u64;
+            match &spec.node_record {
+                Some(r) => {
+                    let record = BoardRecord { barcode: &barcode, part: r.part, revision: r.revision, name: r.name };
+                    onewire.add(Box::new(board_record_part(&record, serial)));
+                }
+                None => onewire.add(Box::new(w1::Ds2505::new(0x0b, serial, &[]))),
             }
-            None => onewire.add(Box::new(w1::Ds2505::new(0x0b, 0x5145_4d55_4e00, &[]))),
+            hub.md().set_onewire(onewire);
+            hub.set_space(Space::Memory, memory.physical().clone());
+            hub.set_space(
+                Space::HubSpecial,
+                ip27::hub_special(memory.physical().clone(), &flash, memory.back_door(), memory.back_door()),
+            );
+            hub.set_space(Space::Io, hub.io_space());
+            hub.set_space(Space::Special, Arc::new(Unmodelled("memory-special space")));
+            let node = Node { hub, memory, flash, clock: clock.clone(), timers: timers.clone() };
+            node.enable_cpu();
+
+            parts.push(node);
         }
-        hub.md().set_onewire(onewire);
-        hub.set_space(Space::Memory, memory.physical().clone());
-        hub.set_space(
-            Space::HubSpecial,
-            ip27::hub_special(memory.physical().clone(), &flash, memory.back_door(), memory.back_door()),
-        );
-        hub.set_space(Space::Io, hub.io_space());
-        hub.set_space(Space::Special, Arc::new(Unmodelled("memory-special space")));
-        let node = Node { hub, memory, flash, clock: clock.clone(), timers: timers.clone() };
-        node.enable_cpu();
 
-        // The module controller on the Hub's I2C controller.
-        let store = ElscNvram::origin200(cfg.origin200.controller_store.as_deref().map(Path::new)).map(Arc::new)
-            .map_err(|e| format!("origin200.controller_store: {e}"))?;
-        let busy = BusBusy::default();
-        let elsc = Arc::new(Elsc::new(ElscConfig::default(), store.clone(), clock.clone(), busy.clone()));
-        let mut bus = I2cBus::new();
-        bus.add(elsc.clone());
-        bus.add(store);
-        let i2c = Arc::new(Pcf8584::new(bus, busy));
-        node.hub.attach_i2c(i2c.clone());
-
-        let io = B::wire(&node, cfg)?;
+        let nodes: Vec<&Node> = parts.iter().collect();
+        let io = B::wire(&nodes, cfg)?;
 
         let (tx, rx) = channel();
-        let cpu = Self::build_cpu(cfg, &module, &node)?;
-        node.hub.pi().set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
-        node.hub.set_hooks(Arc::new(Hooks { cpu: Arc::downgrade(&cpu), events: tx.clone() }));
-        node.hub.register_locks();
+        let mut units = Vec::new();
+        for (node, spec) in parts.into_iter().zip(&specs) {
+            let cpu = Self::build_cpu(cfg, &spec.module, &node, spec.hub.cpu_base, specs.len() > 1)?;
+            node.hub.pi().set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
+            node.hub.set_hooks(Arc::new(Hooks { name: B::NAME, cpu: Arc::downgrade(&cpu), events: tx.clone() }));
+            node.hub.register_locks();
+            cpu.register_locks();
+            units.push(Unit { node, cpu });
+        }
 
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
-        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
-        monitor.register_device(node.memory.physical().clone());
-        monitor.register_device(node.hub.clone());
+        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(units.iter().map(|u| u.cpu.clone()).collect())));
+        for u in &units {
+            monitor.register_device(u.node.memory.physical().clone());
+            monitor.register_device(u.node.hub.clone());
+        }
         for d in &io.monitor {
             monitor.register_device(d.clone());
         }
-        cpu.register_locks();
 
         eprintln!(
-            "iris: {}, {}, {} MB",
+            "iris: {}, {} node{}, {}, {} MB each",
             B::NAME,
-            module.part.label(),
-            node.memory.banks_mb().iter().sum::<u32>()
+            units.len(),
+            if units.len() == 1 { "" } else { "s" },
+            specs[0].module.part.label(),
+            units[0].node.memory.banks_mb().iter().sum::<u32>()
         );
         Ok(Self {
             io,
             _board: std::marker::PhantomData,
-            node,
-            elsc,
+            units,
             controller_events: tx,
-            i2c,
             controller_timer: None,
-            cpu,
             monitor: Arc::new(monitor),
             monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
             ci: cfg.ci,
@@ -417,13 +437,30 @@ impl<B: Ip27Board> Ip27Machine<B> {
         })
     }
 
+    /// The first node, the one the front ends and the monitor address.
+    pub(crate) fn node(&self) -> &Node {
+        self.node_at(0)
+    }
+
+    /// Node `n`'s processor, for tests.
+    #[cfg(test)]
+    pub(crate) fn cpu_at(&self, n: usize) -> &Arc<dyn CpuDevice> {
+        &self.units[n].cpu
+    }
+
     /// The board's Bridge, for tests.
     #[cfg(test)]
     pub(crate) fn bridge(&self) -> &Arc<Bridge> {
         &self.io.bridge
     }
 
-    fn build_cpu(cfg: &MachineConfig, module: &CpuModule, node: &Node) -> Result<Arc<dyn CpuDevice>, String> {
+    pub(crate) fn node_at(&self, n: usize) -> &Node {
+        &self.units[n].node
+    }
+
+    /// `smp` when the board carries more than one node: the processors then
+    /// share memory, and a store-conditional has to be a compare-and-swap.
+    fn build_cpu(cfg: &MachineConfig, module: &CpuModule, node: &Node, cpu_id: usize, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
         let bus = Arc::new(Ip27Bus::new(
             node.hub.cpu_special(),
             node.hub.processor_io(node.hub.claim(Space::Io)),
@@ -437,9 +474,9 @@ impl<B: Ip27Board> Ip27Machine<B> {
         // shared table has only the Octane's 2 MB, which the PROM's tag test
         // refuses.
         let cpu = if module.part.l2_kb == 4096 {
-            Self::cpu::<crate::cpu::mips_cache_shadow::R12000Module4MShadowCache>(module, bus, phys, memory, &node.timers, count_hz)
+            Self::cpu::<crate::cpu::mips_cache_shadow::R12000Module4MShadowCache>(module, bus, phys, memory, &node.timers, count_hz, cpu_id, smp)
         } else {
-            crate::with_cpu!(module.part, true, false, C => Self::cpu::<C>(module, bus, phys, memory, &node.timers, count_hz))
+            crate::with_cpu!(module.part, true, false, C => Self::cpu::<C>(module, bus, phys, memory, &node.timers, count_hz, cpu_id, smp))
         };
         // The shadow cache and the JIT read RAM straight from the ppmem window.
         if let Some(sp) = node.memory.physical().ppmem_space() {
@@ -483,13 +520,13 @@ impl<B: Ip27Board> Ip27Machine<B> {
     /// recurring timer brings it up to date. Nothing runs per instruction.
     fn start_controller_timer(&mut self) {
         self.stop_controller_timer();
-        let (elsc, events) = (self.elsc.clone(), self.controller_events.clone());
-        let id = self.node.timers.add_recurring(
+        let (controller, events) = (self.io.controller.clone(), self.controller_events.clone());
+        let id = self.units[0].node.timers.add_recurring(
             std::time::Instant::now() + CONTROLLER_PERIOD,
             CONTROLLER_PERIOD,
             (),
             move |_| {
-                for event in elsc.take_events() {
+                for event in controller.take_events() {
                     controller_output(event, &events);
                 }
                 TimerReturn::Continue
@@ -500,7 +537,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
 
     fn stop_controller_timer(&mut self) {
         if let Some(id) = self.controller_timer.take() {
-            self.node.timers.remove(id);
+            self.units[0].node.timers.remove(id);
         }
     }
 
@@ -511,6 +548,8 @@ impl<B: Ip27Board> Ip27Machine<B> {
         memory: Arc<crate::memory_map::MemoryMap>,
         timers: &Arc<TimerManager>,
         count_hz: u64,
+        cpu_id: usize,
+        smp: bool,
     ) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
@@ -525,7 +564,8 @@ impl<B: Ip27Board> Ip27Machine<B> {
         exec.core.cp0_config = module.config();
         exec.core.count_write_samples = true;
         exec.phys_mask = ip27::CPU_PHYS_MASK;
-        exec.core.cpu_id = 0;
+        exec.core.cpu_id = cpu_id as u8;
+        exec.core.smp = smp;
         Arc::new(MipsCpu::new(exec))
     }
 }
@@ -540,12 +580,16 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         }
     }
     fn stop(&mut self) {
-        self.cpu.clone().as_device().stop();
+        for u in &self.units {
+            u.cpu.clone().as_device().stop();
+        }
         self.stop_controller_timer();
         for d in self.io.devices.iter().rev() {
             d.stop();
         }
-        self.node.hub.stop();
+        for u in &self.units {
+            u.node.hub.stop();
+        }
         if let Err(e) = self.io.timekeeper.flush_nvram() {
             crate::dlog!(LogModule::Hub, "{} NVRAM: {e}", B::NAME);
         }
@@ -555,28 +599,33 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
     }
     fn reset(&mut self) {
         self.stop();
-        self.cpu.power_on();
-        self.node.hub.power_on();
-        self.node.enable_cpu();
-        self.node.flash.power_on();
-        self.i2c.power_on();
-        self.elsc.power_on();
+        for u in &self.units {
+            u.cpu.power_on();
+            u.node.hub.power_on();
+            u.node.enable_cpu();
+            u.node.flash.power_on();
+        }
+        self.io.controller.reset();
         (self.io.reset)();
         self.io.timekeeper.power_on();
         self.restart_peripherals();
     }
     fn restart_peripherals(&mut self) {
-        self.node.hub.start();
+        for u in &self.units {
+            u.node.hub.start();
+        }
         for d in &self.io.devices {
             d.start();
         }
         self.start_controller_timer();
     }
     fn cpu_start(&self) {
-        self.cpu.clone().as_device().start();
+        for u in &self.units {
+            u.cpu.clone().as_device().start();
+        }
     }
     fn cpu_is_running(&self) -> bool {
-        self.cpu.clone().as_device().is_running()
+        self.units[0].cpu.clone().as_device().is_running()
     }
     fn machine_slot(&mut self) -> MachineSlot {
         let ptr = self as *mut Self as *mut dyn Workstation;
@@ -606,13 +655,13 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         self.io.ps2.clone()
     }
     fn get_timer_manager(&self) -> Arc<TimerManager> {
-        self.node.timers.clone()
+        self.node().timers.clone()
     }
     fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> {
-        self.cpu.clone().debug_adapter()
+        self.units[0].cpu.clone().debug_adapter()
     }
     fn fasttick_count(&self) -> Arc<AtomicU64> {
-        self.cpu.fasttick_count()
+        self.units[0].cpu.fasttick_count()
     }
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>> {
         self.io.console.clone()
@@ -672,12 +721,16 @@ impl<B: Ip27Board> Drop for Ip27Machine<B> {
         self.stop();
         // The compile pool's requests point into the memory freed below.
         #[cfg(feature = "jitv2")]
-        crate::cpu::jitv2::Jitv2::stop_for_drop(&self.cpu.jitv2(), || self.cpu.clone().as_device().stop());
+        for u in &self.units {
+            crate::cpu::jitv2::Jitv2::stop_for_drop(&u.cpu.jitv2(), || u.cpu.clone().as_device().stop());
+        }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
         // The bus holds the devices, and the Hub and Bridge hold its memory,
         // which owns the bus: let go, or none of it is freed.
-        self.node.memory.physical().release_devices();
+        for u in &self.units {
+            u.node.memory.physical().release_devices();
+        }
     }
 }
 
@@ -723,12 +776,42 @@ impl Origin200 {
     }
 }
 
+/// The Origin 200's module controller, on its own node's I2C controller.
+struct Origin200Controller {
+    elsc: Arc<Elsc>,
+    i2c: Arc<Pcf8584>,
+}
+
+impl Origin200Controller {
+    fn new(node: &Node, store: Option<&Path>) -> Result<Arc<Self>, String> {
+        let store = ElscNvram::origin200(store).map(Arc::new).map_err(|e| format!("origin200.controller_store: {e}"))?;
+        let busy = BusBusy::default();
+        let elsc = Arc::new(Elsc::new(ElscConfig::default(), store.clone(), node.clock.clone(), busy.clone()));
+        let mut bus = I2cBus::new();
+        bus.add(elsc.clone());
+        bus.add(store);
+        let i2c = Arc::new(Pcf8584::new(bus, busy));
+        node.hub.attach_i2c(i2c.clone());
+        Ok(Arc::new(Self { elsc, i2c }))
+    }
+}
+
+impl ModuleController for Origin200Controller {
+    fn reset(&self) {
+        self.i2c.power_on();
+        self.elsc.power_on();
+    }
+    fn take_events(&self) -> Vec<ElscEvent> {
+        self.elsc.take_events()
+    }
+}
+
 impl Ip27Board for Origin200 {
     const NAME: &'static str = "Origin 200";
 
-    fn spec(cfg: &MachineConfig) -> Result<BoardSpec, String> {
+    fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String> {
         let module = *cpu_module(cfg.cpu_part()?).ok_or("an Origin 200 has an R10000 or an R12000")?;
-        Ok(BoardSpec {
+        Ok(vec![BoardSpec {
             // Hub 2.1 on the Origin 200; the node is not in a numbered midplane slot.
             hub: HubConfig { cpus: 1, ni_revision: 3, ..Default::default() },
             module,
@@ -738,11 +821,14 @@ impl Ip27Board for Origin200 {
                 cpu_clock_hz: module.clock_hz(),
                 ..FlashValues::ORIGIN200_R10000_180_1M
             },
+            flash_file: cfg.origin200.flash.as_ref().map(PathBuf::from),
             node_record: (module.part == &parts::R10000_180).then_some(NodeRecord::PIMM_1XT5),
-        })
+        }])
     }
 
-    fn wire(node: &Node, cfg: &MachineConfig) -> Result<BoardIo, String> {
+    fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
+        let node = nodes[0];
+        let controller = Origin200Controller::new(node, cfg.origin200.controller_store.as_deref().map(Path::new))?;
         let bridge = Bridge::new(Upstream::single(HUB_HOST, node.hub.inbound(), node.hub.interrupt_target()));
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
@@ -750,86 +836,101 @@ impl Ip27Board for Origin200 {
         for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
             node.hub.io().connect_widget(widget, bridge.clone());
         }
-
-        let heartbeat = Arc::new(AtomicU64::new(0));
-        let mac = cfg.network().mac;
-        let (bus_a, bus_b) = (Isp1040::new_bus(), Isp1040::new_bus());
-        let attached = crate::scsi::attach_from_config(cfg, Some("origin200"), &|c| match c {
-            0 => Ok(&bus_a),
-            1 => Ok(&bus_b),
-            _ => Err(format!("controller {c} (an Origin 200 has controllers 0 and 1)")),
-        })?;
-        if let Some(d) = attached.daynaports.first() {
-            return Err(format!("{}: kind = \"daynaport\" is not available on the Origin 200", crate::config::scsi_label(d.controller, d.id)));
-        }
-        let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
-        for s in &scsi {
-            s.set_heartbeat(heartbeat.clone());
-        }
-        bridge.attach(0, scsi[0].clone());
-        bridge.attach(1, scsi[1].clone());
-        let ioc3 = Arc::new(Ioc3::new(Self::ioc3_config(mac)));
-        ioc3.set_heartbeat(heartbeat.clone());
-        let eth = Ioc3Eth::new_origin200(mac);
-        eth.set_heartbeat(heartbeat);
-        ioc3.attach_eth(eth.clone());
-        bridge.attach(2, ioc3.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN));
-        ioc3.set_timer_manager(node.timers.clone());
-        // The Fuel's M48T35 Timekeeper is the same part.
-        let timekeeper = Arc::new(Timekeeper::fuel_with_nvram_file(Path::new(&cfg.nvram))?);
-        ioc3.attach_timekeeper(timekeeper.clone());
-
-        let console = cfg.ci.then(|| Arc::new(CiSerialBackend::new()));
-        let (port_a, port_b) = crate::dev::serial_host::console_backends(cfg, Self::NAME, console.as_ref());
-        ioc3.set_serial_backend(0, port_a);
-        if let Some(b) = port_b {
-            ioc3.set_serial_backend(1, b);
-        }
-
-        let mut nat = None;
-        let net = GatewayConfig::from_network(&cfg.network());
-        if let Some(link) = Link::with_gateway(net.clone())? {
-            nat = Some(Nat { control: link.nat(), expected: (net.client_ip, net.gateway_ip, net.netmask), frames: link.frames() });
-            eth.attach(link);
-        }
-        bridge.register_locks();
-        ioc3.register_locks();
-        eth.register_locks();
-        for s in &scsi {
-            s.register_locks();
-        }
-
-        let mut monitor: Vec<Arc<dyn Device>> = scsi.iter().map(|s| s.clone() as Arc<dyn Device>).collect();
-        monitor.push(ioc3.ps2());
-        let devices: Vec<Arc<dyn Device>> = vec![ioc3.clone(), eth.clone(), scsi[0].clone(), scsi[1].clone()];
-        let ps2 = ioc3.ps2();
-        #[cfg(test)]
-        let test_bridge = bridge.clone();
-        let reset_scsi = scsi.clone();
-        let reset: Box<dyn Fn() + Send + Sync> = Box::new(move || {
-            bridge.reset();
-            bridge.reset_pci();
-            ioc3.power_on();
-            eth.power_on();
-            for s in &reset_scsi {
-                s.reset();
-            }
-        });
-        Ok(BoardIo {
-            devices,
-            monitor,
-            scsi,
-            ps2,
-            timekeeper,
-            console,
-            scratch: attached.scratch,
-            nat,
-            reset,
-            #[cfg(test)]
-            bridge: test_bridge,
-        })
+        let eth = Ioc3Eth::new_origin200(cfg.network().mac);
+        pci_devices(node, cfg, bridge, Self::ioc3_config(cfg.network().mac), eth, controller, SUPERIO_PIN, "origin200", Self::NAME)
     }
+}
+
+/// The PCI devices both IP27 I/O boards carry behind their Bridge: two
+/// ISP1040s and an IOC3 with its Ethernet, serial ports and Timekeeper.
+pub(crate) fn pci_devices(
+    node: &Node,
+    cfg: &MachineConfig,
+    bridge: Arc<Bridge>,
+    ioc3_config: Ioc3Config,
+    eth: Arc<Ioc3Eth>,
+    controller: Arc<dyn ModuleController>,
+    superio_pin: u8,
+    scsi_name: &str,
+    name: &str,
+) -> Result<BoardIo, String> {
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    let (bus_a, bus_b) = (Isp1040::new_bus(), Isp1040::new_bus());
+    let attached = crate::scsi::attach_from_config(cfg, Some(scsi_name), &|c| match c {
+        0 => Ok(&bus_a),
+        1 => Ok(&bus_b),
+        _ => Err(format!("controller {c} ({name} has controllers 0 and 1)")),
+    })?;
+    if let Some(d) = attached.daynaports.first() {
+        return Err(format!("{}: kind = \"daynaport\" is not available on the {name}", crate::config::scsi_label(d.controller, d.id)));
+    }
+    let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
+    for s in &scsi {
+        s.set_heartbeat(heartbeat.clone());
+    }
+    bridge.attach(0, scsi[0].clone());
+    bridge.attach(1, scsi[1].clone());
+    let ioc3 = Arc::new(Ioc3::new(ioc3_config));
+    ioc3.set_heartbeat(heartbeat.clone());
+    eth.set_heartbeat(heartbeat);
+    ioc3.attach_eth(eth.clone());
+    bridge.attach(2, ioc3.clone());
+    ioc3.connect_superio_interrupt(bridge.pin_line(superio_pin));
+    ioc3.set_timer_manager(node.timers.clone());
+    // The Fuel's M48T35 Timekeeper is the same part.
+    let timekeeper = Arc::new(Timekeeper::fuel_with_nvram_file(Path::new(&cfg.nvram))?);
+    ioc3.attach_timekeeper(timekeeper.clone());
+
+    let console = cfg.ci.then(|| Arc::new(CiSerialBackend::new()));
+    let (port_a, port_b) = crate::dev::serial_host::console_backends(cfg, name, console.as_ref());
+    ioc3.set_serial_backend(0, port_a);
+    if let Some(b) = port_b {
+        ioc3.set_serial_backend(1, b);
+    }
+
+    let mut nat = None;
+    let net = GatewayConfig::from_network(&cfg.network());
+    if let Some(link) = Link::with_gateway(net.clone())? {
+        nat = Some(Nat { control: link.nat(), expected: (net.client_ip, net.gateway_ip, net.netmask), frames: link.frames() });
+        eth.attach(link);
+    }
+    bridge.register_locks();
+    ioc3.register_locks();
+    eth.register_locks();
+    for s in &scsi {
+        s.register_locks();
+    }
+
+    let mut monitor: Vec<Arc<dyn Device>> = scsi.iter().map(|s| s.clone() as Arc<dyn Device>).collect();
+    monitor.push(ioc3.ps2());
+    let devices: Vec<Arc<dyn Device>> = vec![ioc3.clone(), eth.clone(), scsi[0].clone(), scsi[1].clone()];
+    let ps2 = ioc3.ps2();
+    #[cfg(test)]
+    let test_bridge = bridge.clone();
+    let reset_scsi = scsi.clone();
+    let reset: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+        bridge.reset();
+        bridge.reset_pci();
+        ioc3.power_on();
+        eth.power_on();
+        for s in &reset_scsi {
+            s.reset();
+        }
+    });
+    Ok(BoardIo {
+        devices,
+        monitor,
+        scsi,
+        ps2,
+        timekeeper,
+        console,
+        scratch: attached.scratch,
+        nat,
+        controller,
+        reset,
+        #[cfg(test)]
+        bridge: test_bridge,
+    })
 }
 
 #[cfg(test)]
