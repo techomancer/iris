@@ -4,10 +4,10 @@
 //! packets the guest programmed, and a function's DMA reaching memory.
 
 use super::*;
-use crate::dev::bridge::{reg, CFG0_BASE};
+use crate::dev::bridge::{device_window_offset, reg, CFG0_BASE, DEV_MEMORY_SPACE, DEV_SWAP_DIRECT};
 use crate::irq::InterruptController;
 use crate::pci::testing::TestCard;
-use crate::pci::{Bar, PCI_INTA};
+use crate::pci::{Bar, PCI_COMMAND_MEMORY, PCI_INTA};
 use crate::traits::{BusDevice, BusRead32, BusRead8, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 
@@ -33,6 +33,10 @@ struct Mem(Mutex<Vec<u8>>);
 impl Mem {
     fn peek(&self, a: usize, n: usize) -> Vec<u8> {
         self.0.lock()[a..a + n].to_vec()
+    }
+
+    fn poke(&self, a: usize, data: &[u8]) {
+        self.0.lock()[a..a + data.len()].copy_from_slice(data);
     }
 }
 
@@ -307,4 +311,101 @@ fn two_boards_keep_their_own_interrupt_state() {
     assert_eq!(heart.take(), [(31, true)], "only the second board's pin rose");
     a.state().irq().unwrap().set(true);
     assert_eq!(heart.take(), [(30, true)]);
+}
+
+/// An NVMe card on a board, driven through the slot's device window and the
+/// direct map with the swap bit set (a byte stream, as a little-endian master
+/// wants), the way the Octane's own Bridge drives one.
+struct NvmeHost<'a>(&'a Rig, u8);
+
+impl crate::dev::nvme::tests::HostIo for NvmeHost<'_> {
+    fn w(&self, off: u32, v: u32) {
+        assert_eq!(self.0.bridge().write32(u64::from(device_window_offset(self.1 as u32) + off), v), BUS_OK);
+    }
+
+    fn r(&self, off: u32) -> u32 {
+        self.0.bridge().read32(u64::from(device_window_offset(self.1 as u32) + off)).data
+    }
+
+    fn put(&self, at: u64, data: &[u8]) {
+        self.0.mem.poke(at as usize, data);
+    }
+
+    fn get(&self, at: u64, len: usize) -> Vec<u8> {
+        self.0.mem.peek(at as usize, len)
+    }
+
+    fn bus(&self, at: u64) -> u64 {
+        0x8000_0000 + at
+    }
+}
+
+/// An NVMe card in `slot` of a board, directly or behind a PCI-to-PCI bridge,
+/// is configured as firmware would, runs the controller through a queue pair
+/// with data both ways, and its completions reach HEART on the slot's pin.
+fn nvme_in_slot(kind: Kind, widget: u8, slot: u8, behind_bridge: bool) {
+    let rig = Rig::new(kind, widget);
+    let img = crate::dev::nvme::tests::temp_image(&format!("xio-{}-{slot}-{behind_bridge}", kind.name()));
+    let card = crate::dev::nvme::Card::open(&crate::config::NvmeConfig {
+        path: img.to_string_lossy().into_owned(),
+        bridge: behind_bridge,
+        ..Default::default()
+    })
+    .unwrap();
+    rig.board.check_slot(slot).unwrap();
+    card.fit(rig.board.bus(), slot);
+    let cfg_write = |off: u32, size: u32, v: u32| {
+        let (a, w) = (u64::from(CFG0_BASE + u32::from(slot) * 0x1000 + ((off & !3) | ((off & 3) ^ (4 - size)))), size);
+        let s = match w {
+            2 => rig.bridge().write16(a, v as u16),
+            _ => rig.bridge().write32(a, v),
+        };
+        assert_eq!(s, BUS_OK);
+    };
+    rig.set(reg::DIRECT_MAP, HEART_WIDGET << 20);
+    rig.set(reg::device(slot as u32), DEV_MEMORY_SPACE | DEV_SWAP_DIRECT | 0x130);
+    rig.route(slot as u32, 0x21);
+    if behind_bridge {
+        // Bus 1 behind the bridge in the slot, memory 0x13000000 forwarded.
+        cfg_write(0x18, 4, 0x0001_0100);
+        cfg_write(0x20, 4, 0x130f_1300);
+        cfg_write(0x04, 2, PCI_COMMAND_MEMORY);
+        let sec = rig.board.bus().find_bus(1).expect("bus 1");
+        let at = DevFn { device: 0, function: 0 };
+        sec.config_write(at, 0x10, 4, 0x1300_0000);
+        sec.config_write(at, 0x14, 4, 0);
+        sec.config_write(at, 0x04, 2, PCI_COMMAND_MEMORY);
+    } else {
+        cfg_write(0x10, 4, 0x1300_0000);
+        cfg_write(0x14, 4, 0);
+        cfg_write(0x04, 2, PCI_COMMAND_MEMORY);
+    }
+    rig.heart.take();
+    crate::dev::nvme::tests::smoke(&NvmeHost(&rig, slot));
+    // The completion raised INTA of the slot, Bridge pin `slot`: a packet
+    // for vector 0x21 reached HEART.
+    assert!(rig.heart.take().contains(&(0x21, true)), "{} slot {slot}", kind.label());
+    let _ = std::fs::remove_file(img);
+}
+
+#[test]
+fn an_nvme_card_in_the_shoehorn_masters_ram_and_raises_its_pin() {
+    nvme_in_slot(Kind::Shoehorn, 10, 1, false);
+}
+
+#[test]
+fn an_nvme_card_behind_a_bridge_in_the_shoehorn_does_the_same() {
+    nvme_in_slot(Kind::Shoehorn, 12, 1, true);
+}
+
+#[test]
+fn an_nvme_card_in_each_slot_of_the_pci_module_masters_ram_and_raises_its_pin() {
+    for slot in 1..=3 {
+        nvme_in_slot(Kind::Cage, 13, slot, false);
+    }
+}
+
+#[test]
+fn an_nvme_card_behind_a_bridge_in_the_pci_module_does_the_same() {
+    nvme_in_slot(Kind::Cage, 13, 2, true);
 }

@@ -603,6 +603,36 @@ pub struct XioBoardConfig {
 /// shoehorn with no slot named takes them. Port 13 is the PCI module's own.
 pub const OCTANE_XIO_SLOTS: [u8; 4] = [10, 12, 9, 11];
 
+/// `[nvme]`: an NVM Express card in the O2's PCI option slot or in a slot of
+/// an Octane's `[[xio_board]]`. See `docs/nvme.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct NvmeConfig {
+    /// The namespace's disk image (raw or CHD). Empty: no card.
+    #[serde(default)]
+    pub path: String,
+    /// Copy-on-write: writes go to `{path}.overlay`, as `[scsi.N] overlay`.
+    #[serde(default)]
+    pub overlay: bool,
+    /// Put the card behind a PCI-to-PCI bridge in the slot, as a card on an
+    /// expansion cage sits, instead of in the slot itself.
+    #[serde(default)]
+    pub bridge: bool,
+    /// Octane: which `[[xio_board]]` holds the card, counting from 0. Unset:
+    /// the first. The O2 has one slot and takes neither this nor `slot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<usize>,
+    /// Octane: the slot on that board, its PCI device number. Unset: the
+    /// first free one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u8>,
+}
+
+impl NvmeConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Emulated SGI machine profile (hardware layout scaffold).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -2043,6 +2073,10 @@ pub struct MachineConfig {
     /// Option boards in the Octane's XIO slots (`[[xio_board]]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub xio_board: Vec<XioBoardConfig>,
+
+    /// NVM Express card (`[nvme]`).
+    #[serde(default, skip_serializing_if = "NvmeConfig::is_default")]
+    pub nvme: NvmeConfig,
 }
 
 fn default_scsi_deferred_int() -> bool { true }
@@ -2260,6 +2294,7 @@ impl Default for MachineConfig {
             ultra64: Ultra64Config::default(),
             virtio_serial: VirtioSerialConfig::default(),
             xio_board: Vec::new(),
+            nvme: NvmeConfig::default(),
         }
     }
 }
@@ -2268,8 +2303,6 @@ impl Default for MachineConfig {
 fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::default() }
 
 impl MachineConfig {
-    /// `[virtio_serial]`: the ports it lists, and whether this machine has
-    /// somewhere to put it.
     /// `[[xio_board]]`: the Octane's XIO slots, each holding at most one board,
     /// and not the one the graphics board is in. Returns each board's slot.
     pub fn xio_widgets(&self) -> Result<Vec<u8>, String> {
@@ -2310,6 +2343,8 @@ impl MachineConfig {
         Ok(out)
     }
 
+    /// `[virtio_serial]`: the ports it lists, and whether this machine has
+    /// somewhere to put it.
     fn validate_virtio_serial(&self) -> Result<(), String> {
         let v = &self.virtio_serial;
         if !v.enabled {
@@ -2352,6 +2387,41 @@ impl MachineConfig {
                  MACE PCI bridge has no interrupt route for a third slot (see docs/dev/virtio-serial.md)"
                     .into(),
             ),
+        }
+    }
+
+    /// `[nvme]`: only machines with PCI slots have somewhere to put it.
+    fn validate_nvme(&self) -> Result<(), String> {
+        if self.nvme.is_default() {
+            return Ok(());
+        }
+        if self.nvme.path.is_empty() {
+            return Err("[nvme] needs a path".into());
+        }
+        match self.machine.profile {
+            MachineProfile::O2Ip32 if self.nvme.board.is_some() || self.nvme.slot.is_some() => {
+                Err("[nvme] board and slot place a card on an Octane's [[xio_board]]; the O2 has one slot".into())
+            }
+            MachineProfile::O2Ip32 => Ok(()),
+            // The Octane's own Bridge keeps its built-in devices; a card
+            // goes on an option board.
+            MachineProfile::OctaneIp30 => {
+                let board = self.nvme.board.unwrap_or(0);
+                let Some(b) = self.xio_board.get(board) else {
+                    return Err(if self.xio_board.is_empty() {
+                        "[nvme] on the Octane needs a [[xio_board]] to sit in: a pci-cage or a pci-shoehorn".into()
+                    } else {
+                        format!("[nvme] board {board}: there are {} [[xio_board]] tables", self.xio_board.len())
+                    });
+                };
+                match self.nvme.slot {
+                    Some(s) if !b.kind.slots().contains(&s) => {
+                        Err(format!("[nvme] slot {s}: the {} has slots {:?}", b.kind.label(), b.kind.slots()))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            _ => Err("[nvme] needs a machine with PCI slots: the O2 or the Octane".into()),
         }
     }
 
@@ -2526,6 +2596,7 @@ impl MachineConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.validate_virtio_serial()?;
         self.xio_widgets()?;
+        self.validate_nvme()?;
         self.cpu_part()?;
         self.machine.profile.accepts_cpus(self.machine.cpus)?;
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
@@ -3434,6 +3505,38 @@ mod export_tests {
         let mut o2 = octane(shoehorn);
         o2.machine.profile = MachineProfile::O2Ip32;
         assert!(o2.xio_widgets().unwrap_err().contains("needs an Octane"));
+    }
+
+    #[test]
+    fn an_octane_nvme_card_needs_a_board_and_one_of_its_slots() {
+        let octane = |t: &str| -> MachineConfig {
+            let mut c: MachineConfig =
+                toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
+                    .expect("parse");
+            c.scsi.clear();
+            c
+        };
+        let nvme = |extra: &str| format!("[nvme]\npath = \"d.img\"\n{extra}");
+        let err = octane(&nvme("")).validate().unwrap_err();
+        assert!(err.contains("needs a [[xio_board]]"), "the onboard Bridge has no slot for it: {err}");
+        let cage = "[[xio_board]]\nkind = \"pci-cage\"\n";
+        let shoehorn = "[[xio_board]]\nkind = \"pci-shoehorn\"\n";
+        // [nvme] is a table, so the arrays go first.
+        octane(&format!("{cage}{}", nvme(""))).validate().expect("the first board, its first free slot");
+        octane(&format!("{cage}{}", nvme("slot = 3\nbridge = true"))).validate().expect("the module's third slot");
+        let err = octane(&format!("{cage}{}", nvme("slot = 4"))).validate().unwrap_err();
+        assert!(err.contains("slot 4") && err.contains("[1, 2, 3]"), "{err}");
+        let err = octane(&format!("{shoehorn}{}", nvme("slot = 2"))).validate().unwrap_err();
+        assert!(err.contains("slot 2") && err.contains("[1]"), "{err}");
+        octane(&format!("{cage}{shoehorn}{}", nvme("board = 1"))).validate().expect("the shoehorn");
+        let err = octane(&format!("{cage}{}", nvme("board = 1"))).validate().unwrap_err();
+        assert!(err.contains("board 1") && err.contains("1 [[xio_board]]"), "{err}");
+        // The O2 has the one slot.
+        let mut o2 = octane(&nvme("slot = 1"));
+        o2.machine.profile = MachineProfile::O2Ip32;
+        assert!(o2.validate_nvme().unwrap_err().contains("the O2 has one slot"));
+        o2.nvme.slot = None;
+        o2.validate_nvme().expect("the O2's option slot");
     }
 
     #[test]

@@ -41,7 +41,7 @@
 mod cmd;
 mod spec;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,7 +49,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::devlog::{LogModule, NVME_LOG_ADMIN, NVME_LOG_IO, NVME_LOG_REGS, NVME_LOG_STATE};
-use crate::pci::{Bar, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
+use crate::pci::{Bar, DevFn, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PciToPciBridge, PCI_INTA};
 use crate::scsi::{ScsiBus, ScsiIdentities, ScsiIdentity};
 use crate::scsi_monitor::ScsiTargets;
 use crate::snapshot::{get_field, hex_u32, hex_u64, toml_u32, toml_u64};
@@ -64,6 +64,12 @@ use spec::*;
 pub const PCI_VENDOR: u16 = 0x1b36;
 pub const PCI_DEVICE: u16 = 0x0010;
 pub const PCI_CLASS_NVME: u32 = 0x01_0802;
+
+/// The identity of the bridge a `bridge = true` card sits behind: a DEC
+/// 21150, the generic PCI-to-PCI bridge drivers know. Only its type 1 header
+/// is modelled.
+const BRIDGE_VENDOR: u16 = 0x1011;
+const BRIDGE_DEVICE: u16 = 0x0026;
 
 /// A trace line of category `cat` (a `NVME_LOG_*` bit), stamped with the
 /// microseconds since the controller was made. Nothing is formatted unless
@@ -84,6 +90,40 @@ const IDENTITY: ScsiIdentity = ScsiIdentity::new(b"IRIS    ", b"NVME NAMESPACE  
 /// The snapshot slot the namespace's disk is recorded under in the manifest:
 /// the SCSI controllers have 0 to 31.
 pub const SNAPSHOT_SLOT: u8 = 0xf0;
+
+/// The card a `[nvme]` section describes, before it is in a slot.
+pub struct Card {
+    pub nvme: Arc<Nvme>,
+    bridge: bool,
+}
+
+impl Card {
+    /// The controller with its namespace open.
+    pub fn open(cfg: &crate::config::NvmeConfig) -> Result<Card, String> {
+        let nvme = Nvme::new();
+        let blocks = nvme.attach_image(&cfg.path, cfg.overlay, None).map_err(|e| format!("[nvme]: {e}"))?;
+        eprintln!("iris: NVMe {} ({blocks} blocks){}", cfg.path, if cfg.bridge { " behind a PCI bridge" } else { "" });
+        Ok(Card { nvme, bridge: cfg.bridge })
+    }
+
+    /// Put the card in `device` of `bus`: in the slot itself, or behind a
+    /// PCI-to-PCI bridge there, as device 0 of the bridge's bus.
+    pub fn fit(&self, bus: &PciBus, device: u8) {
+        let at = |device| DevFn { device, function: 0 };
+        if self.bridge {
+            let ppb = PciToPciBridge::new(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE);
+            bus.attach(at(device), ppb.clone());
+            ppb.secondary().attach(at(0), self.nvme.clone());
+        } else {
+            bus.attach(at(device), self.nvme.clone());
+        }
+    }
+}
+
+/// The snapshot manifest's record of the card's disk.
+pub fn disk_ref(cfg: &crate::config::NvmeConfig, nvme: &Nvme) -> crate::snapshot::DiskRef {
+    crate::snapshot::DiskRef { id: SNAPSHOT_SLOT, path: cfg.path.clone(), size_bytes: nvme.blocks() * 512 }
+}
 
 /// A submission queue (5.4).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -313,6 +353,17 @@ impl Nvme {
         self.blocks.store(blocks, Ordering::Release);
         *self.nguid.lock().unwrap() = nguid_of(path);
         Ok(blocks)
+    }
+
+    /// Copy the namespace's overlay into `dir` and return its dirty sectors,
+    /// for a snapshot.
+    pub fn export_overlays(&self, dir: &std::path::Path) -> std::io::Result<Vec<(usize, Vec<u64>)>> {
+        self.bus.export_overlays(dir)
+    }
+
+    /// Put back what [`Nvme::export_overlays`] wrote.
+    pub fn import_overlays(&self, dir: &std::path::Path, sets: &[(usize, Vec<u64>)]) -> std::io::Result<()> {
+        self.bus.import_overlays(dir, sets)
     }
 
     /// The namespace's size in 512-byte blocks.
