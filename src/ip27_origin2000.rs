@@ -217,7 +217,7 @@ impl Ip27Board for Origin2000 {
             node.hub.io().connect_widget(host.widget, xbow.port(host.widget, node.hub.widget_face()));
             xbow.register_locks();
             if i == 0 {
-                let bridge = Bridge::new(Upstream::single(host, node.hub.inbound(), node.hub.interrupt_target()));
+                let bridge = Bridge::new(Upstream::single(host, node.hub.inbound(), node.hub.interrupt_target()), &crate::ip30::PCI0);
                 bridge.set_revision(BRIDGE_REVISION);
                 bridge.set_microlan(Self::board_record());
                 let links = xbow.clone();

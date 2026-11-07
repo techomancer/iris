@@ -153,7 +153,7 @@ impl Ip27Board for Onyx2Deskside {
             .enumerate()
             .map(|(i, n)| HostPort::new(hub_host(i), n.hub.inbound(), n.hub.interrupt_target()))
             .collect();
-        let bridge = Bridge::new(xbow.upstream(hosts));
+        let bridge = Bridge::new(xbow.upstream(hosts), &crate::ip30::PCI0);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
         let links = xbow.clone();

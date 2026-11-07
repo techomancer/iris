@@ -24,18 +24,41 @@
 //!
 //! Set IRIS_IP30_TRACE=1 to log unmapped accesses as they happen.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::dev::heart_mem::HeartRam;
-use crate::pci::BarRun;
+use crate::pci::IntxRouting;
 use crate::physical::Physical;
 use crate::ppmem::devmap::{entry_eq, SLOT_SHIFT};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
 
 /// Widget numbers on the Octane's Crossbow.
+/// The Bridge's PCI bus; the outputs are the Bridge's eight interrupt pins.
+/// Pins A and C of a device reach the pin numbered as the device, B and D
+/// that number with bit two flipped. That rule is inferred from the system's
+/// software and is not established by a board document. `BoardIrq(i)` is the
+/// Bridge's pin `i`, which the GPIO inputs share with PCI; the IOC3's
+/// SuperIO interrupt is `BoardIrq(4)`. The wire numbering is iris's own.
+pub static PCI0: IntxRouting = IntxRouting {
+    devices: 8,
+    irqs: 8,
+    intx: &[
+        (0, [Some(0), Some(4), Some(0), Some(4)]),
+        (1, [Some(1), Some(5), Some(1), Some(5)]),
+        (2, [Some(2), Some(6), Some(2), Some(6)]),
+        (3, [Some(3), Some(7), Some(3), Some(7)]),
+        (4, [Some(4), Some(0), Some(4), Some(0)]),
+        (5, [Some(5), Some(1), Some(5), Some(1)]),
+        (6, [Some(6), Some(2), Some(6), Some(2)]),
+        (7, [Some(7), Some(3), Some(7), Some(3)]),
+    ],
+    board_irqs: &[0, 1, 2, 3, 4, 5, 6, 7],
+};
+
 pub const WIDGET_XBOW: u8 = 0x0;
 pub const WIDGET_HEART: u8 = 0x8;
 pub const WIDGET_BRIDGE: u8 = 0xf;
@@ -142,9 +165,9 @@ pub struct Ip30Bus {
     /// takes its large window.
     widgets: Mutex<[Option<(Arc<dyn BusDevice>, bool)>; 16]>,
     /// Per port, the runs of its small window that a PCI BAR decodes whole
-    /// (the Bridge's [`crate::pci::BarRun`]s, offsets in the window), mapped
-    /// over the widget while its link is up.
-    runs: Mutex<[Vec<BarRun>; 16]>,
+    /// (the Bridge's runs, offsets in the window), mapped over the widget
+    /// while its link is up.
+    runs: Mutex<[Vec<(Range<u64>, Arc<dyn BusDevice>)>; 16]>,
 }
 
 impl Ip30Bus {
@@ -220,9 +243,9 @@ impl Ip30Bus {
     }
 
     /// Widget `w` says which runs of its small window a PCI BAR decodes
-    /// whole (the Bridge's `on_bar_runs`): map them over the widget while
+    /// whole (the Bridge's BAR runs): map them over the widget while
     /// its link is up, giving the runs it named before back to the widget.
-    pub fn set_widget_runs(&self, w: u8, new: Vec<BarRun>) {
+    pub fn set_widget_runs(&self, w: u8, new: Vec<(Range<u64>, Arc<dyn BusDevice>)>) {
         if !(9..16).contains(&w) {
             return;
         }
@@ -236,16 +259,16 @@ impl Ip30Bus {
         if !entry_eq(self.phys.entry_at(base), Arc::as_ptr(dev)) {
             return; // link down: `set_widget_link` maps them when it comes up
         }
-        for r in &old {
+        for (r, _) in &old {
             self.phys.map(base + r.start, base + r.end, dev.clone(), &format!("widget {w:#x}"));
         }
         self.map_runs(w, &runs[w as usize]);
     }
 
-    fn map_runs(&self, w: u8, runs: &[BarRun]) {
+    fn map_runs(&self, w: u8, runs: &[(Range<u64>, Arc<dyn BusDevice>)]) {
         let base = widget_small_base(w);
-        for r in runs {
-            self.phys.map(base + r.start, base + r.end, r.dev.clone(), &format!("widget {w:#x} pci bar"));
+        for (r, dev) in runs {
+            self.phys.map(base + r.start, base + r.end, dev.clone(), &format!("widget {w:#x} pci bar"));
         }
     }
 

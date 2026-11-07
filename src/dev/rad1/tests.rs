@@ -63,8 +63,7 @@ fn bar_sizing_and_assignment() {
     c.write(1, 2);
     assert_eq!(c.read(4), BAR as u32);
     assert_eq!(c.read(1) & 0xffff, 2);
-    assert_eq!(c.decode(crate::pci::Space::Mem, BAR as u32 + 0x30), Some((0, 0x30)));
-    assert_eq!(c.decode(crate::pci::Space::Mem, BAR as u32 + 0x2000), None);
+    assert_eq!(c.bar_regions(), vec![(crate::pci::Space::Mem, 0, BAR as u32, BAR0_SIZE)]);
 }
 
 #[test]

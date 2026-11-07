@@ -1,10 +1,8 @@
 //! A function's configuration header and its base address registers.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use super::{PciFunction, PciFunctionState};
 use crate::snapshot::{get_field, load_u32_slice, u32_slice_to_toml};
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_OK};
 
 /// Command register bits.
 pub const PCI_COMMAND_IO: u32 = 0x1;
@@ -35,15 +33,6 @@ pub enum Bar {
 enum BarSlot {
     Bar(Bar),
     Upper,
-}
-
-impl Bar {
-    fn size(self) -> u32 {
-        match self {
-            Bar::Unused => 0,
-            Bar::Io(n) | Bar::Mem(n) => n,
-        }
-    }
 }
 
 /// Which address space an access is in.
@@ -334,37 +323,6 @@ impl PciConfig {
             })
             .collect()
     }
-
-    /// The BAR decoding `addr` in `space`, and the offset within it: only
-    /// once the command register enables that space, and only for a BAR
-    /// that has been assigned an address.
-    pub fn decode(&self, space: Space, addr: u32) -> Option<(usize, u32)> {
-        self.decode_with(space, addr, false)
-    }
-
-    /// [`Self::decode`], but a BAR left at zero decodes at zero: what a
-    /// function does on a bus whose firmware enables it without moving it
-    /// (the Octane's PROM reaches the RAD that way).
-    pub fn decode_unmoved(&self, space: Space, addr: u32) -> Option<(usize, u32)> {
-        self.decode_with(space, addr, true)
-    }
-
-    fn decode_with(&self, space: Space, addr: u32, zero_ok: bool) -> Option<(usize, u32)> {
-        let enable = match space {
-            Space::Io => PCI_COMMAND_IO,
-            Space::Mem => PCI_COMMAND_MEMORY,
-        };
-        if self.command() & enable == 0 {
-            return None;
-        }
-        (0..6).find_map(|i| {
-            let bar = self.bars[i];
-            let in_space = matches!((bar, space), (Bar::Io(_), Space::Io) | (Bar::Mem(_), Space::Mem));
-            let base = self.bar_base(i);
-            let size = bar.size();
-            (in_space && (base != 0 || zero_ok) && addr.wrapping_sub(base) < size).then(|| (i, addr - base))
-        })
-    }
 }
 
 /// The header's registers. Identity, class and the BARs' sizes come from
@@ -388,133 +346,6 @@ impl crate::traits::Saveable for PciConfig {
         Ok(())
     }
 }
-
-// ---- BARs on the physical bus ----
-
-/// What a host bridge does to a CPU access on its way to a function: which
-/// byte lanes carry it, and how an access wider than the bus is split.
-/// The bridge implements it once per way it is configured to move bytes.
-pub trait PciLanes: Send + Sync {
-    /// A CPU read of `size` bytes (1, 2, 4 or 8) whose first byte is at
-    /// offset `off` of BAR `bar` of `f`, before the bridge moves lanes.
-    /// The value is in CPU order, most significant byte first in memory.
-    fn read(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize) -> u64;
-
-    fn write(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize, val: u64);
-}
-
-/// A run of a host bridge's CPU window that one BAR decodes whole, as a
-/// decode-table entry: the access goes straight to the function through the
-/// bridge's lanes, with no search of the bus and no bridge lock. The bridge
-/// builds these with [`bar_runs`] whenever what its windows reach changes,
-/// and the machine maps them on its physical bus over the bridge's own
-/// window; every other page of the window stays with the bridge.
-pub struct PciBar {
-    lanes: Arc<dyn PciLanes>,
-    dev: Arc<dyn PciFunction>,
-    bar: usize,
-    /// The CPU address bits the bridge decodes, and where in them the BAR's
-    /// byte 0 sits (it may lie below the window: a BAR larger than it).
-    mask: u64,
-    base: u64,
-}
-
-impl PciBar {
-    pub fn new(lanes: Arc<dyn PciLanes>, dev: Arc<dyn PciFunction>, bar: usize, mask: u64, base: u64) -> Self {
-        Self { lanes, dev, bar, mask, base }
-    }
-
-    #[inline]
-    fn off(&self, addr: u64) -> u32 {
-        (addr & self.mask).wrapping_sub(self.base) as u32
-    }
-
-    fn read(&self, addr: u64, size: usize) -> u64 {
-        self.lanes.read(&*self.dev, self.bar, self.off(addr), size)
-    }
-
-    fn write(&self, addr: u64, size: usize, val: u64) -> u32 {
-        self.lanes.write(&*self.dev, self.bar, self.off(addr), size, val);
-        BUS_OK
-    }
-}
-
-impl BusDevice for PciBar {
-    fn read8(&self, a: u64) -> BusRead8 { BusRead8::ok(self.read(a, 1) as u8) }
-    fn read16(&self, a: u64) -> BusRead16 { BusRead16::ok(self.read(a, 2) as u16) }
-    fn read32(&self, a: u64) -> BusRead32 { BusRead32::ok(self.read(a, 4) as u32) }
-    fn read64(&self, a: u64) -> BusRead64 { BusRead64::ok(self.read(a, 8)) }
-    fn write8(&self, a: u64, v: u8) -> u32 { self.write(a, 1, v as u64) }
-    fn write16(&self, a: u64, v: u16) -> u32 { self.write(a, 2, v as u64) }
-    fn write32(&self, a: u64, v: u32) -> u32 { self.write(a, 4, v as u64) }
-    fn write64(&self, a: u64, v: u64) -> u32 { self.write(a, 8, v) }
-}
-
-/// A run of a bridge's CPU window, `start..end`, and what answers it.
-#[derive(Clone)]
-pub struct BarRun {
-    pub start: u64,
-    pub end: u64,
-    pub dev: Arc<dyn BusDevice>,
-}
-
-/// One BAR some function decodes, as [`bar_runs`] reports it to `entry`:
-/// the function's slot, the function, the BAR, and the CPU address (in the
-/// window's terms) of its byte 0.
-pub struct BarAt<'a> {
-    pub slot: usize,
-    pub dev: &'a Arc<dyn PciFunction>,
-    pub bar: usize,
-    pub cpu_base: u64,
-}
-
-/// The runs of a CPU window `cpu..cpu + len` opening onto PCI `space` at
-/// PCI address `pci` that one BAR decodes whole, in whole decode-table
-/// pages. `entry` makes (or finds) the table entry for each BAR. Pages a
-/// BAR covers only in part, and pages two BARs claim (a misconfiguration
-/// the bridge resolves its own way), are left out: the bridge decodes those
-/// itself.
-pub fn bar_runs(
-    funcs: &[(usize, Arc<dyn PciFunction>)],
-    space: Space,
-    cpu: u64,
-    pci: u32,
-    len: u64,
-    mut entry: impl FnMut(BarAt) -> Arc<dyn BusDevice>,
-) -> Vec<BarRun> {
-    const PAGE: u64 = 1 << crate::ppmem::devmap::SLOT_SHIFT;
-    let (wlo, whi) = (pci as u64, pci as u64 + len);
-    let mut found: Vec<(u64, u64, usize, usize, u64)> = Vec::new();
-    for (k, (_, f)) in funcs.iter().enumerate() {
-        for (sp, bar, base, size) in f.state().config().bar_regions() {
-            if sp != space {
-                continue;
-            }
-            let (lo, hi) = ((base as u64).max(wlo), (base as u64 + size as u64).min(whi));
-            let (lo, hi) = (lo.next_multiple_of(PAGE), hi & !(PAGE - 1));
-            if lo < hi {
-                found.push((lo, hi, k, bar, base as u64));
-            }
-        }
-    }
-    let overlaps = |i: usize| {
-        let (lo, hi, ..) = found[i];
-        found.iter().enumerate().any(|(j, &(l, h, ..))| j != i && l < hi && lo < h)
-    };
-    (0..found.len())
-        .filter(|&i| !overlaps(i))
-        .map(|i| {
-            let (lo, hi, k, bar, base) = found[i];
-            let (slot, dev) = (&funcs[k].0, &funcs[k].1);
-            let at = |p: u64| cpu.wrapping_add(p).wrapping_sub(wlo);
-            BarRun { start: at(lo), end: at(hi), dev: entry(BarAt { slot: *slot, dev, bar, cpu_base: at(base) }) }
-        })
-        .collect()
-}
-
-/// Where a bridge's runs go: the machine's bus maps each over the bridge's
-/// window and gives the pages the last call named back to the bridge.
-pub type BarRunSink = Box<dyn Fn(Vec<BarRun>) + Send + Sync>;
 
 #[cfg(test)]
 mod tests {
@@ -627,16 +458,14 @@ mod tests {
     }
 
     /// A function decodes a space only once it has been told it may, and
-    /// only within the BAR it was assigned.
+    /// only the BARs that have been assigned an address.
     #[test]
-    fn a_function_claims_only_its_own_window_and_only_when_enabled() {
+    fn a_function_claims_only_its_own_region_and_only_when_enabled() {
         let c = scsi_like();
         c.write(5, 0x8000_1000);
-        assert_eq!(c.decode(Space::Mem, 0x8000_1000), None, "memory decoding is off until enabled");
+        assert!(c.bar_regions().is_empty(), "memory decoding is off until enabled");
         c.write(1, PCI_COMMAND_MEMORY);
-        assert_eq!(c.decode(Space::Mem, 0x8000_1084), Some((1, 0x84)));
-        assert_eq!(c.decode(Space::Mem, 0x8000_2000), None, "past the end of the BAR");
-        assert_eq!(c.decode(Space::Io, 0x8000_1084), None, "and not in I/O space");
+        assert_eq!(c.bar_regions(), vec![(Space::Mem, 1, 0x8000_1000, 0x1000)], "BAR 1 alone, and not the I/O BAR");
     }
 
     #[test]
@@ -649,7 +478,7 @@ mod tests {
         c.write(15, 0x0000_0009);
         c.reset();
         assert_eq!((0..64).map(|i| c.read(i)).collect::<Vec<_>>(), fresh);
-        assert_eq!(c.decode(Space::Mem, 0x8000_1000), None);
+        assert!(c.bar_regions().is_empty());
         assert_eq!(c.interrupt_pin(), PCI_INTA, "the pin is wiring, not state");
     }
 
@@ -799,42 +628,4 @@ mod tests {
             assert_eq!(dst.read(18), 0x20);
         }
     }
-
-    struct Nothing;
-    impl BusDevice for Nothing {}
-
-    struct Func(PciFunctionState);
-    impl PciFunction for Func {
-        fn state(&self) -> &PciFunctionState { &self.0 }
-        fn bar_read(&self, _: usize, off: u32, _: usize) -> u32 { off }
-        fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
-    }
-
-    /// Whole pages of a window a BAR decodes become runs at their CPU
-    /// addresses; an I/O BAR smaller than a page, a page shared by two
-    /// BARs, and a BAR outside the window do not.
-    #[test]
-    fn bar_runs_are_the_pages_one_bar_decodes_whole() {
-        let a: Arc<dyn PciFunction> = Arc::new(Func(PciFunctionState::new(scsi_like())));
-        let b: Arc<dyn PciFunction> = Arc::new(Func(PciFunctionState::new(scsi_like())));
-        for (f, io, mem) in [(&a, 0x100, 0x8000_1000u32), (&b, 0x200, 0x8000_3000)] {
-            f.state().config().write(4, io);
-            f.state().config().write(5, mem);
-            f.state().config().write(1, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
-        }
-        let funcs = vec![(1, a.clone()), (2, b.clone())];
-        let mut seen = Vec::new();
-        let runs = bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x8000_0000, 0x200_0000, |at| {
-            seen.push((at.slot, at.bar, at.cpu_base));
-            Arc::new(Nothing) as Arc<dyn BusDevice>
-        });
-        let spans: Vec<_> = runs.iter().map(|r| (r.start, r.end)).collect();
-        assert_eq!(spans, vec![(0x1a00_1000, 0x1a00_2000), (0x1a00_3000, 0x1a00_4000)]);
-        assert_eq!(seen, vec![(1, 1, 0x1a00_1000), (2, 1, 0x1a00_3000)]);
-        assert!(bar_runs(&funcs, Space::Io, 0x1800_0000, 0, 0x200_0000, |_| unreachable!()).is_empty(), "I/O BARs are smaller than a page");
-        b.state().config().write(5, 0x8000_1000);
-        assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x8000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "two BARs on one page");
-        assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x9000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "outside the window");
-    }
-
 }

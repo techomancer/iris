@@ -185,7 +185,7 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
         let (_dir, m) = built("bridge", 2);
         let bridge = m.bridge().clone();
         let card = Card::new();
-        bridge.attach(7, card.clone());
+        bridge.bus().attach(crate::pci::DevFn { device: 7, function: 0 }, card.clone());
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
         let dma = card.state.dma().unwrap().clone();
         let memory = |i: usize, off: u64| m.node_at(i).memory.physical().read32(off).data;

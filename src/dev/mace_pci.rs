@@ -359,15 +359,7 @@ impl crate::traits::Device for MacePci {
                     reg(macepci_reg::ERROR_ADDR), *self.config_addr.lock().unwrap()).ok();
                 self.bus.describe(&mut w);
             }
-            "config" => {
-                let device: u8 = args.get(1).and_then(|v| v.parse().ok()).ok_or("Usage: pci config <slot>")?;
-                let f = self.bus.function(DevFn { device, function: 0 }).ok_or(format!("pci: nothing in slot {device}"))?;
-                for row in 0..16 {
-                    let v: Vec<String> = (0..4).map(|k| format!("{:08x}", f.state().config().read(row * 4 + k))).collect();
-                    writeln!(w, "  {:02x}: {}", row * 16, v.join(" ")).ok();
-                }
-            }
-            _ => return Err("Usage: pci status | config <slot>".to_string()),
+            _ => return self.bus.command(args, &mut w),
         }
         Ok(())
     }

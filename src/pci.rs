@@ -17,10 +17,7 @@ mod intx;
 pub(crate) mod testing;
 
 pub use bus::PciBus;
-pub use config::{
-    PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA, Bar, BarAt, BarRun, BarRunSink, PciBar, PciConfig, PciConfigPolicy,
-    PciLanes, PciRegisterPolicy, Space, bar_runs,
-};
+pub use config::{Bar, PciConfig, PciConfigPolicy, PciRegisterPolicy, Space, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
 pub use decode::{BarMapping, BarMappingSink, CpuWindow};
 pub use function::{DevFn, PciDma, PciDmaStatus, PciFunction, PciFunctionState};
 pub use host::{BarDevice, BarDevices, ByteOrder, PciHost};
