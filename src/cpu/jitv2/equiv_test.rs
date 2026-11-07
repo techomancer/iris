@@ -1274,8 +1274,25 @@ mod tests {
     fn run_interpreter_fpu_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool, fcsr: Option<u32>) -> CoreSnapshot {
         let (mut exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
         if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
+        let _rounding = HostRounding::from_fcsr(fcsr);
         exec.exec(instr);
         CoreSnapshot::capture(&exec.core)
+    }
+
+    /// Sets the host FPU's rounding mode to FCSR.RM for one run and puts
+    /// round-to-nearest back on drop. Building an executor resets the host
+    /// mode to nearest, so it has to be set after construction, once the
+    /// test's FCSR is in place. The interpreter and compiled code both
+    /// round on the host, so without this only round-to-nearest runs.
+    struct HostRounding;
+    impl HostRounding {
+        fn from_fcsr(fcsr: Option<u32>) -> Self {
+            crate::platform::set_fpu_mode((fcsr.unwrap_or(0) & 3) as u8);
+            HostRounding
+        }
+    }
+    impl Drop for HostRounding {
+        fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
     }
 
     fn run_jit_fpu(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, word_offset: u16, fr1: bool) -> Option<CoreSnapshot> {
@@ -1299,6 +1316,7 @@ mod tests {
         let mut exec = Box::new(exec);
         exec.install_jit_hooks();
         if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
+        let _rounding = HostRounding::from_fcsr(fcsr);
 
         unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         std::mem::forget(codegen);
@@ -5521,6 +5539,430 @@ mod tests {
                     "ordinary-operand arithmetic must clear Cause and keep sticky Flags \
                      (instr=0x{:08x} fmt={} funct={})", instr, fmt, funct);
             }
+        }
+    }
+
+    /// Quiet and signalling NaNs use the original MIPS encoding: the fraction
+    /// MSB set means signalling. The default NaN the FPU delivers (0x7FBFFFFF,
+    /// 0x7FF7FFFF_FFFFFFFF) is therefore quiet and takes the Unimplemented
+    /// path as an operand, while 0x7FC00000 / 0x7FF80000_00000000 is an
+    /// Invalid Operation. Compiled code must classify like the interpreter on
+    /// ADD, MUL, DIV, SQRT and the compare predicates.
+    #[test]
+    fn nan_operand_encoding_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FC_EQ, FUNCT_FC_LT, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSQRT, OP_COP1, RS_D, RS_S};
+        for (fmt, quiet, signalling) in [
+            (RS_S, 0x7FBF_FFFFu64, 0x7FC0_0000u64),
+            (RS_D, 0x7FF7_FFFF_FFFF_FFFF, 0x7FF8_0000_0000_0000),
+        ] {
+            let one = if fmt == RS_S { 0x3F80_0000u64 } else { 0x3FF0_0000_0000_0000 };
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV, FUNCT_FSQRT, FUNCT_FC_EQ, FUNCT_FC_LT] {
+                for fcsr in [0u32, 0x0800] {
+                    for (nan, other) in [(quiet, one), (one, quiet), (signalling, one), (one, signalling)] {
+                        // SQRT reads fs only.
+                        if funct == FUNCT_FSQRT && nan == one {
+                            continue;
+                        }
+                        let mut fpr = [0u64; 32];
+                        fpr[1] = nan;
+                        fpr[2] = other;
+                        fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                        let jit = assert_fpu_matches_interpreter_fcsr(
+                            make_r(OP_COP1, fmt, 2, 1, 3, funct), [0u64; 32], fpr, true, Some(fcsr));
+                        let sig = nan == signalling || other == signalling;
+                        let cause = jit.fpu_fcsr & 0x0003_F000;
+                        let what = format!("fmt={fmt} funct={funct:#x} fcsr={fcsr:#x} nan={nan:#x} other={other:#x}");
+                        if funct == FUNCT_FC_EQ || funct == FUNCT_FC_LT {
+                            // Compare never takes Unimplemented. A signalling
+                            // NaN is Invalid on every predicate; a quiet one
+                            // only on the signalling predicates, such as LT.
+                            let invalid = sig || funct == FUNCT_FC_LT;
+                            assert_eq!(cause, if invalid { 0x0001_0000 } else { 0 }, "{what}");
+                        } else if sig {
+                            assert_eq!(cause, 0x0001_0000, "{what}: Invalid alone");
+                        } else {
+                            assert_eq!(cause, 0x0002_0000, "{what}: Unimplemented alone");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// ADD/SUB/MUL/DIV on operands whose results reach the top of the
+    /// range (±MAX, ±infinity, NaN), in every rounding mode, trapped and
+    /// untrapped: the JIT's cold classifier call must agree with the
+    /// interpreter on result, Cause, Flags and the exception. Two absolute
+    /// pins tie the shared answer to the manuals: MAX+MAX in single
+    /// precision overflows with Cause and Flag O|I (VR5000 manual
+    /// U11761EJ6V0UM, 9.4.4), and a trapped 0/0 raises Invalid, not
+    /// divide-by-zero (9.4.2, 9.4.3).
+    #[test]
+    fn arithmetic_at_top_of_range_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSUB, OP_COP1, RS_D, RS_S};
+        // One case per rule, since each compile costs tens of milliseconds:
+        // the invalid operations (untrapped and trapped), an overflow per
+        // operation in all four rounding modes and trapped, a largest-finite
+        // result that is exact, MAX+1 rounded toward zero, an exact
+        // infinity, and the zero and denormal results below.
+        // (zero, one, two, half, MAX, infinity) by format.
+        let s = [0u64, 0x3F80_0000, 0x4000_0000, 0x3F00_0000, 0x7F7F_FFFF, 0x7F80_0000];
+        let d = [
+            0u64, 0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000, 0x3FE0_0000_0000_0000,
+            0x7FEF_FFFF_FFFF_FFFF, 0x7FF0_0000_0000_0000,
+        ];
+        let mut cases: Vec<(u32, u32, u64, u64, u32)> = Vec::new();
+        for (fmt, v, sign) in [(RS_S, s, 1u64 << 31), (RS_D, d, 1u64 << 63)] {
+            let [zero, one, two, half, max, inf] = v;
+            for enables in [0, 0x0F80] {
+                cases.push((fmt, FUNCT_FADD, inf, inf | sign, enables));
+                cases.push((fmt, FUNCT_FSUB, inf, inf, enables));
+                cases.push((fmt, FUNCT_FMUL, zero, inf, enables));
+                cases.push((fmt, FUNCT_FDIV, zero, zero, enables));
+                cases.push((fmt, FUNCT_FDIV, inf, inf, enables));
+            }
+            for fcsr in [0, 1, 2, 3, 0x0200] {
+                cases.push((fmt, FUNCT_FADD, max, max, fcsr));
+                cases.push((fmt, FUNCT_FSUB, max | sign, max, fcsr));
+                cases.push((fmt, FUNCT_FMUL, max, two, fcsr));
+                cases.push((fmt, FUNCT_FDIV, max | sign, half, fcsr));
+            }
+            cases.push((fmt, FUNCT_FMUL, max, one, 1));
+            cases.push((fmt, FUNCT_FMUL, max & !0xFFFF_FFFF, one, 0));
+            cases.push((fmt, FUNCT_FADD, max, one, 1));
+            cases.push((fmt, FUNCT_FADD, inf, one, 0));
+            cases.push((fmt, FUNCT_FDIV, inf, zero, 0));
+            // The same range test also sends zero and denormal results to
+            // the cold side: an exact cancellation, and the smallest normal
+            // halved with FS clear (trap).
+            let min_normal = if fmt == RS_S { 0x0080_0000 } else { 0x0010_0000_0000_0000 };
+            cases.push((fmt, FUNCT_FSUB, one, one, 0));
+            cases.push((fmt, FUNCT_FMUL, min_normal, half, 0));
+        }
+        for (fmt, funct, a, b, fcsr) in cases {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+            let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+            assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(fcsr));
+        }
+        let mut fpr = [0u64; 32];
+        fpr[1] = 0x7F7F_FFFF;
+        fpr[2] = 0x7F7F_FFFF;
+        let jit = assert_fpu_matches_interpreter_fcsr(make_r(OP_COP1, RS_S, 2, 1, 3, FUNCT_FADD), [0u64; 32], fpr, true, Some(0));
+        assert_eq!((jit.fpr[3] as u32, jit.fpu_fcsr), (0x7F80_0000, 0x0000_5014));
+        let fpr = [0u64; 32];
+        let jit = assert_fpu_matches_interpreter_fcsr(make_r(OP_COP1, RS_S, 2, 1, 3, FUNCT_FDIV), [0u64; 32], fpr, true, Some(0x0F80));
+        assert_eq!(jit.fpu_fcsr, 0x0001_0F80);
+    }
+
+    /// An instruction that raises nothing still ends with Cause clear, and
+    /// the JIT does that on the cold side of its one combined test: a stale
+    /// Cause left by the previous instruction, ordinary and zero operands,
+    /// a zero result, in both formats, for ADD/SUB/MUL/DIV and for RECIP,
+    /// RSQRT and the multiply-add family, whose finite results take their own
+    /// single branch.
+    #[test]
+    fn stale_cause_is_cleared_by_an_ordinary_result() {
+        use crate::cpu::mips_isa::{
+            FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FRECIP, FUNCT_FRSQRT, FUNCT_FSUB,
+            FUNCT_MADD_D, FUNCT_MADD_S, OP_COP1, OP_COP1X, RS_D, RS_S,
+        };
+        let s = [0u64, 0x3F80_0000, 0x4000_0000];
+        let d = [0u64, 0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000];
+        let mut all: Vec<(u32, u32, u64, u64, u32)> = Vec::new();
+        for (fmt, v) in [(RS_S, s), (RS_D, d)] {
+            let [zero, one, two] = v;
+            for stale in [0u32, 0x0000_1000, 0x0001_0000, 0x0001_F000, 0x0001_F000 | 0x0F80] {
+                for funct in [FUNCT_FADD, FUNCT_FSUB, FUNCT_FMUL, FUNCT_FDIV] {
+                    // Ordinary operands, then a zero operand.
+                    all.push((fmt, funct, one, two, stale));
+                    all.push((fmt, funct, zero, two, stale));
+                }
+                // An exact cancellation: a zero result from ordinary operands.
+                all.push((fmt, FUNCT_FSUB, one, one, stale));
+            }
+        }
+        for (fmt, funct, a, b, fcsr) in all {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+            let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+            let jit = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(fcsr));
+            assert_eq!(jit.fpu_fcsr & 0x0001_F000, 0, "fmt={fmt} funct={funct:#x} a={a:#x} b={b:#x} fcsr={fcsr:#x}");
+        }
+        // f1 = 2.0, f4 = 1.0, f6 = 1.0: RECIP and RSQRT of f1 and f2*f4+f6.
+        for (fmt, madd, two, one) in [(RS_S, FUNCT_MADD_S, s[2], s[1]), (RS_D, FUNCT_MADD_D, d[2], d[1])] {
+            for stale in [0u32, 0x0000_1000, 0x0001_F000] {
+                let mut fpr = [0u64; 32];
+                fpr[1] = two;
+                fpr[2] = two;
+                fpr[4] = one;
+                fpr[6] = one;
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                for instr in [
+                    make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRECIP),
+                    make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRSQRT),
+                    make_r(OP_COP1X, 6, 4, 2, 3, madd),
+                ] {
+                    let jit = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(stale));
+                    assert_eq!(jit.fpu_fcsr & 0x0001_F000, 0, "instr={instr:#010x} fcsr={stale:#x}");
+                }
+            }
+        }
+    }
+
+    /// An infinite operand beside an ordinary one, either way round, for
+    /// ADD/SUB/MUL/DIV. The inline test checks only that both operand
+    /// exponents are nonzero and leaves these to the result test (one over
+    /// infinity is a zero, the rest are infinities), so the cold side must
+    /// still classify them exactly as the interpreter does.
+    #[test]
+    fn arithmetic_with_an_infinite_operand_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSUB, OP_COP1, RS_D, RS_S};
+        for (fmt, one, inf, sign) in [
+            (RS_S, 0x3F80_0000u64, 0x7F80_0000u64, 1u64 << 31),
+            (RS_D, 0x3FF0_0000_0000_0000, 0x7FF0_0000_0000_0000, 1u64 << 63),
+        ] {
+            for funct in [FUNCT_FADD, FUNCT_FSUB, FUNCT_FMUL, FUNCT_FDIV] {
+                for x in [inf, inf | sign] {
+                    for (a, b) in [(one, x), (x, one)] {
+                        let mut fpr = [0u64; 32];
+                        fpr[1] = a;
+                        fpr[2] = b;
+                        fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                        let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+                        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(0));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The operand side of the same call-out: signed zeros, denormal,
+    /// quiet-NaN and signalling-NaN operands and negative values in every
+    /// pair for ADD/SUB/MUL/DIV, with the denormal-result rule under FS
+    /// clear, FS set, and FS set with Underflow or Inexact enabled, and
+    /// cancelling operands under every rounding mode. Then the signs of
+    /// zero results pinned absolutely, since agreement between the engines
+    /// would also hold if both lost a sign.
+    #[test]
+    fn arithmetic_with_unusual_operands_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FADD, FUNCT_FDIV, FUNCT_FMUL, FUNCT_FSUB, OP_COP1, RS_D, RS_S};
+        const FS: u32 = 0x0100_0000;
+        // zero, -zero, denormal, quiet NaN, signalling NaN, one, -one,
+        // smallest normal, half
+        let s = [0u64, 0x8000_0000, 1, 0x7FA0_0000, 0x7FC0_0000, 0x3F80_0000, 0xBF80_0000, 0x0080_0000, 0x3F00_0000];
+        let d = [
+            0u64, 1 << 63, 1, 0x7FF4_0000_0000_0000, 0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000,
+            0xBFF0_0000_0000_0000, 0x0010_0000_0000_0000, 0x3FE0_0000_0000_0000,
+        ];
+        let mut cases: Vec<(u32, u32, u64, u64, u32)> = Vec::new();
+        for (fmt, v) in [(RS_S, s), (RS_D, d)] {
+            let [_, _, denorm, _, _, one, neg_one, min_normal, half] = v;
+            for funct in [FUNCT_FADD, FUNCT_FSUB, FUNCT_FMUL, FUNCT_FDIV] {
+                for &a in &v[..8] {
+                    for &b in &v[..8] {
+                        cases.push((fmt, funct, a, b, 0));
+                        cases.push((fmt, funct, a, b, FS));
+                    }
+                }
+                // A denormal result from ordinary operands, per FCSR.
+                for fcsr in [0, FS, FS | 0x100, FS | 0x80, FS | 0x0F80] {
+                    cases.push((fmt, funct, min_normal, half, fcsr));
+                    cases.push((fmt, funct, denorm, one, fcsr));
+                }
+                // Exact cancellation and signed zeros, per rounding mode.
+                for rm in 0..4 {
+                    cases.push((fmt, funct, one, neg_one, rm));
+                    cases.push((fmt, funct, neg_one, neg_one, rm));
+                    cases.push((fmt, funct, neg_one, v[0], rm));
+                    cases.push((fmt, funct, v[1], neg_one, rm));
+                }
+            }
+        }
+        for (fmt, funct, a, b, fcsr) in cases {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+            let instr = make_r(OP_COP1, fmt, 2, 1, 3, funct);
+            assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(fcsr));
+        }
+
+        // Absolute pins, double: [fd] = [fs] op [ft].
+        let run = |funct: u32, a: u64, b: u64, rm: u32| {
+            let mut fpr = [0u64; 32];
+            fpr[1] = a;
+            fpr[2] = b;
+            let instr = make_r(OP_COP1, RS_D, 2, 1, 3, funct);
+            assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(rm)).fpr[3]
+        };
+        let (pz, nz, one, neg_one) = (0u64, 1u64 << 63, 0x3FF0_0000_0000_0000u64, 0xBFF0_0000_0000_0000u64);
+        // x + (-x) is +0, or -0 rounding toward minus infinity.
+        for rm in 0..4 {
+            let want = if rm == 3 { nz } else { pz };
+            assert_eq!(run(FUNCT_FADD, one, neg_one, rm), want, "1 + -1, rm {rm}");
+            assert_eq!(run(FUNCT_FSUB, one, one, rm), want, "1 - 1, rm {rm}");
+        }
+        assert_eq!(run(FUNCT_FADD, nz, nz, 0), nz, "-0 + -0");
+        assert_eq!(run(FUNCT_FMUL, neg_one, pz, 0), nz, "-1 * 0");
+        assert_eq!(run(FUNCT_FDIV, pz, neg_one, 0), nz, "0 / -1");
+    }
+
+    /// Two FPU instructions back to back through the interpreter and through
+    /// one compiled region, FR=1, FCSR zero; returns the JIT snapshot after
+    /// asserting the two agree.
+    fn assert_fpu_pair_matches_interpreter(first: u32, second: u32, fpr: [u64; 32]) -> CoreSnapshot {
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let word_offset = (pc as u16 / 4) & 0x3FF;
+        let (mut exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, pc, true);
+        exec.exec(first);
+        exec.exec(second);
+        let interp = CoreSnapshot::capture(&exec.core);
+
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[word_offset as usize] = first;
+        page[word_offset as usize + 1] = second;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, 0, 2);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word_offset, true, false)
+            .expect("FPU pair must be compilable for this test to be meaningful");
+        let (exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, pc, true);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        let jit = CoreSnapshot::capture(&exec.core);
+        assert_eq!(jit, interp, "JIT and interpreter diverged for {first:#010x}; {second:#010x}");
+        jit
+    }
+
+    /// RECIP and RSQRT of zero are a divide by zero: positive infinity with
+    /// Cause and Flag Z (VR5000 manual U11761EJ6V0UM, 9.4.3), nothing else.
+    /// Pinned absolutely, since the two engines compute the flags the same
+    /// way and an equivalence check alone would pass if both lost them.
+    #[test]
+    fn recip_and_rsqrt_of_zero_are_a_divide_by_zero() {
+        use crate::cpu::mips_isa::{FUNCT_FRECIP, FUNCT_FRSQRT, OP_COP1, RS_D, RS_S};
+        for (fmt, inf) in [(RS_S, 0x7F80_0000u64), (RS_D, 0x7FF0_0000_0000_0000)] {
+            for funct in [FUNCT_FRECIP, FUNCT_FRSQRT] {
+                let mut fpr = [0u64; 32];
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                let jit = assert_fpu_matches_interpreter_fcsr(make_r(OP_COP1, fmt, 0, 7, 3, funct), [0u64; 32], fpr, true, Some(0));
+                let got = if fmt == RS_S { jit.fpr[3] & 0xFFFF_FFFF } else { jit.fpr[3] };
+                assert_eq!((got, jit.fpu_fcsr), (inf, 0x0000_8020), "fmt={fmt} funct={funct:#x}");
+            }
+        }
+    }
+
+    /// A denormal result with FCSR.FS set and neither Underflow nor Inexact
+    /// enabled is replaced by a signed zero with Cause and Flag U|I, no trap
+    /// (R10000 User's Manual v2.0, 15.4, Flush (FS) bit: "A denormalized
+    /// result is replaced with zero"; VR5000 manual U11761EJ6V0UM, 9.4.5).
+    /// With FS clear, or with Underflow enabled, it is an Unimplemented
+    /// Operation. The smallest normal halved gives an exact denormal.
+    #[test]
+    fn denormal_result_with_fs_set_flushes_like_the_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FMUL, OP_COP1, RS_D, RS_S};
+        const FS: u32 = 0x0100_0000;
+        for (fmt, min_normal, half, sign) in [
+            (RS_S, 0x0080_0000u64, 0x3F00_0000u64, 1u64 << 31),
+            (RS_D, 0x0010_0000_0000_0000, 0x3FE0_0000_0000_0000, 1u64 << 63),
+        ] {
+            for fcsr in [FS, 0, FS | 0x0100] {
+                let mut fpr = [0u64; 32];
+                fpr[1] = min_normal | sign;
+                fpr[2] = half;
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                let jit = assert_fpu_matches_interpreter_fcsr(
+                    make_r(OP_COP1, fmt, 2, 1, 3, FUNCT_FMUL), [0u64; 32], fpr, true, Some(fcsr));
+                if fcsr == FS {
+                    assert_eq!(jit.fpu_fcsr, FS | 0x0000_300C, "fmt={fmt}: Cause and Flag U|I, no trap");
+                    let r = if fmt == RS_S { jit.fpr[3] & 0xFFFF_FFFF } else { jit.fpr[3] };
+                    assert_eq!(r, sign, "fmt={fmt}: negative zero delivered");
+                } else {
+                    assert_eq!(jit.fpu_fcsr & 0x0003_F000, 0x0002_0000, "fmt={fmt} fcsr={fcsr:#x}: Cause E alone");
+                }
+            }
+        }
+    }
+
+    /// SQRT, RSQRT, the multiply-add family and CVT.S.D leave an Invalid
+    /// Operation's result as the MIPS default NaN, not the host's
+    /// (0xFFC00000 on x86, which is a signalling NaN under the MIPS
+    /// encoding). The next instruction must then see a quiet NaN and take
+    /// Unimplemented (E) rather than Invalid (V). Both engines, both
+    /// formats.
+    #[test]
+    fn invalid_result_is_the_default_nan_and_reads_as_quiet() {
+        use crate::cpu::mips_isa::{
+            FUNCT_FADD, FUNCT_FCVT_S, FUNCT_FRECIP, FUNCT_FRSQRT, FUNCT_FSQRT, FUNCT_MADD_D,
+            FUNCT_MADD_S, FUNCT_MSUB_D, FUNCT_MSUB_S, FUNCT_NMADD_D, FUNCT_NMADD_S, FUNCT_NMSUB_D,
+            FUNCT_NMSUB_S, OP_COP1, OP_COP1X, RS_D, RS_S,
+        };
+        const NAN_S: u64 = 0x7FBF_FFFF;
+        const NAN_D: u64 = 0x7FF7_FFFF_FFFF_FFFF;
+        // f1 = -1, f2 = infinity, f4 = zero, f6 = 1.0, f7 = a signalling
+        // NaN (quiet bit set, the MIPS encoding), by format.
+        let single = |f: &mut [u64; 32]| {
+            f[1] = 0xBF80_0000; f[2] = 0x7F80_0000; f[4] = 0; f[6] = 0x3F80_0000;
+            f[7] = 0x7FC0_0000;
+        };
+        let double = |f: &mut [u64; 32]| {
+            f[1] = 0xBFF0_0000_0000_0000; f[2] = 0x7FF0_0000_0000_0000; f[4] = 0;
+            f[6] = 0x3FF0_0000_0000_0000; f[7] = 0x7FF8_0000_0000_0000;
+        };
+        // (producer, double result, FPRs); every producer writes f3.
+        let mut cases: Vec<(u32, bool, [u64; 32])> = Vec::new();
+        for (fmt, is_d, init) in [(RS_S, false, &single as &dyn Fn(&mut [u64; 32])), (RS_D, true, &double)] {
+            let mut f = [0u64; 32];
+            init(&mut f);
+            cases.push((make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FSQRT), is_d, f));
+            cases.push((make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRSQRT), is_d, f));
+            // RECIP of a signalling NaN: the operand's V is already flagged,
+            // the delivered value must still be the default NaN.
+            cases.push((make_r(OP_COP1, fmt, 0, 7, 3, FUNCT_FRECIP), is_d, f));
+            // f3 = f2 * f4 +/- f6, negated for NMADD and NMSUB: infinity
+            // times zero.
+            let functs = if is_d {
+                [FUNCT_MADD_D, FUNCT_MSUB_D, FUNCT_NMADD_D, FUNCT_NMSUB_D]
+            } else {
+                [FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S]
+            };
+            for funct in functs {
+                cases.push((make_r(OP_COP1X, 6, 4, 2, 3, funct), is_d, f));
+            }
+        }
+        let mut f = [0u64; 32];
+        double(&mut f);
+        cases.push((make_r(OP_COP1, RS_D, 0, 7, 3, FUNCT_FCVT_S), false, f));
+
+        for (producer, is_d, fpr) in cases {
+            let what = format!("producer {producer:#010x}");
+            let jit = assert_fpu_matches_interpreter_fcsr(producer, [0u64; 32], fpr, true, Some(0));
+            let want = if is_d { NAN_D } else { NAN_S };
+            let got = if is_d { jit.fpr[3] } else { jit.fpr[3] & 0xFFFF_FFFF };
+            assert_eq!(got, want, "{what}: default NaN");
+            assert_eq!(jit.fpu_fcsr, 0x0001_0040, "{what}: Cause and Flag V");
+
+            // f5 = f3 + f6: the NaN operand is quiet, so Unimplemented, and
+            // never Invalid. The cvt's result is single even from a double.
+            let fmt = if is_d { RS_D } else { RS_S };
+            let add = make_r(OP_COP1, fmt, 6, 3, 5, FUNCT_FADD);
+            let jit = assert_fpu_pair_matches_interpreter(producer, add, fpr);
+            assert_eq!(jit.fpu_fcsr & 0x0003_F000, 0x0002_0000, "{what}: ADD takes E, not V");
+
+            // With Enable.V set the same instruction traps: Cause V, the
+            // Flags unchanged, and f3 (zero here) not written.
+            let jit = assert_fpu_matches_interpreter_fcsr(producer, [0u64; 32], fpr, true, Some(0x0800));
+            assert_eq!(jit.fpu_fcsr, 0x0001_0800, "{what}: trapped V");
+            assert_eq!(jit.fpr[3], 0, "{what}: trapped result not stored");
         }
     }
 

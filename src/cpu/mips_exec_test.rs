@@ -2744,14 +2744,15 @@ mod tests {
     }
 
     /// Same rule for a quiet NaN operand — the surprising half of the table:
-    /// an R4400/R5000 does not propagate NaN through ADD in hardware.
+    /// an R4400/R5000 does not propagate NaN through ADD in hardware. The
+    /// MIPS encoding has a quiet NaN with the fraction MSB clear.
     #[test]
     fn test_fpu_qnan_operand_is_unimplemented() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
-        exec.core.write_fpr_w(1, 0x7FC0_0000); // quiet NaN
+        exec.core.write_fpr_w(1, 0x7FA0_0000); // quiet NaN
         exec.core.write_fpr_s(2, 1.0);
         exec.core.write_fpr_w(0, 0x5a5a5a5a);
 
@@ -2760,6 +2761,87 @@ mod tests {
         assert!(s & EXEC_IS_EXCEPTION != 0, "qNaN operand must trap");
         assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
         assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
+    }
+
+    /// The default NaN an untrapped Invalid Operation delivers (0x7FBFFFFF,
+    /// 0x7FF7FFFF_FFFFFFFF) is a quiet NaN in the MIPS encoding, so used as an
+    /// operand it is not an Invalid Operation. It takes the quiet-NaN path
+    /// (Unimplemented Operation), the same as any other quiet NaN. Under
+    /// IEEE 754-2008 the fraction MSB set means quiet, which would make this
+    /// pattern signalling.
+    #[test]
+    fn test_fpu_default_nan_operand_is_not_invalid() {
+        for (is_d, nan) in [(false, 0x7FBF_FFFFu64), (true, 0x7FF7_FFFF_FFFF_FFFFu64)] {
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV] {
+                let (mut exec, _) = create_executor();
+                exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+                exec.update_fpr_mode();
+
+                let fmt = if is_d { RS_D } else { RS_S };
+                if is_d {
+                    exec.core.write_fpr_d(1, f64::from_bits(nan));
+                    exec.core.write_fpr_d(2, 1.0);
+                    exec.core.write_fpr_d(0, f64::from_bits(0x5a5a_5a5a_5a5a_5a5a));
+                } else {
+                    exec.core.write_fpr_w(1, nan as u32);
+                    exec.core.write_fpr_s(2, 1.0);
+                    exec.core.write_fpr_w(0, 0x5a5a_5a5a);
+                }
+                let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                let fcsr = exec.core.read_fpu_control(31);
+                let what = format!("is_d={is_d} funct={funct:#x}");
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{what}: quiet NaN operand traps");
+                assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{what}");
+                assert_eq!(fcsr & 0x0002_0000, 0x0002_0000, "{what}: Cause.E");
+                assert_eq!(fcsr & 0x0001_0000, 0, "{what}: no Cause.V");
+                assert_eq!(fcsr & 0x40, 0, "{what}: no Flag.V");
+            }
+        }
+    }
+
+    /// A signalling NaN (fraction MSB set, MIPS encoding) operand is an
+    /// Invalid Operation, not Unimplemented: untrapped it sets Cause.V and
+    /// Flag.V and completes. cpu-tests `fpu/qnan_operand` measures this on an
+    /// R4400 with 0x7FC00000.
+    #[test]
+    fn test_fpu_snan_operand_is_invalid() {
+        for (is_d, nan) in [(false, 0x7FC0_0000u64), (true, 0x7FF8_0000_0000_0000u64),
+                            (false, 0x7FFF_FFFFu64), (true, 0xFFF8_0000_0000_0001u64)] {
+            for funct in [FUNCT_FADD, FUNCT_FMUL, FUNCT_FDIV] {
+                let (mut exec, _) = create_executor();
+                exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+                exec.update_fpr_mode();
+
+                let fmt = if is_d { RS_D } else { RS_S };
+                if is_d {
+                    exec.core.write_fpr_d(1, f64::from_bits(nan));
+                    exec.core.write_fpr_d(2, 1.0);
+                } else {
+                    exec.core.write_fpr_w(1, nan as u32);
+                    exec.core.write_fpr_s(2, 1.0);
+                }
+                let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                let fcsr = exec.core.read_fpu_control(31);
+                let what = format!("is_d={is_d} nan={nan:#x} funct={funct:#x}");
+                assert!(s & EXEC_IS_EXCEPTION == 0, "{what}: untrapped Invalid completes");
+                assert_eq!(fcsr & 0x0001_f000, 0x0001_0000, "{what}: Cause is V alone");
+                assert_eq!(fcsr & 0x7c, 0x40, "{what}: Flag is V alone");
+            }
+        }
+
+        // With the Invalid enable set it traps, Cause.V, destination untouched.
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        exec.core.fpu_fcsr = 0x0000_0800;
+        exec.core.write_fpr_w(1, 0x7FC0_0000);
+        exec.core.write_fpr_s(2, 1.0);
+        exec.core.write_fpr_w(0, 0x5a5a_5a5a);
+        let s = exec.exec(make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FADD));
+        assert!(s & EXEC_IS_EXCEPTION != 0, "enabled Invalid traps");
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+        assert_eq!(exec.core.read_fpu_control(31) & 0x0001_f000, 0x0001_0000, "Cause is V alone");
+        assert_eq!(exec.core.read_fpr_w(0), 0x5a5a_5a5a, "destination untouched on trap");
     }
 
     /// Denormalized result, FS clear: Unimplemented Operation, destination
@@ -2958,6 +3040,299 @@ mod tests {
         let div_d_instr = make_cop1_compute(RS_D, 4, 3, 5, FUNCT_FDIV);
         assert_eq!(exec.exec(div_d_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.read_fpr_d(5), 2.5);
+    }
+
+    /// Runs one ADD/SUB/MUL/DIV with FCSR set to `fcsr` (through CTC1's own
+    /// path, so the host rounding mode follows RM) and a sentinel in the
+    /// destination. Returns the status, the destination bits and FCSR.
+    /// Puts the host back in round-to-nearest before returning, since test
+    /// threads are reused.
+    fn fpu_top_case(fmt: u32, funct: u32, a: u64, b: u64, fcsr: u32) -> (crate::cpu::mips_exec::ExecStatus, u64, u32) {
+        struct RestoreRounding;
+        impl Drop for RestoreRounding {
+            fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
+        }
+        let _restore = RestoreRounding;
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        exec.core.write_fpu_control(31, fcsr);
+        if fmt == RS_S {
+            exec.core.write_fpr_w(1, a as u32);
+            exec.core.write_fpr_w(2, b as u32);
+            exec.core.write_fpr_w(0, 0x5a5a5a5a);
+        } else {
+            exec.core.write_fpr_l(1, a);
+            exec.core.write_fpr_l(2, b);
+            exec.core.write_fpr_l(0, 0x5a5a5a5a_5a5a5a5a);
+        }
+        let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+        let r = if fmt == RS_S { exec.core.read_fpr_w(0) as u64 } else { exec.core.read_fpr_l(0) };
+        (s, r, exec.core.fpu_fcsr)
+    }
+
+    const FCSR_CAUSE_V: u32 = 0x0001_0000;
+    const FCSR_CAUSE_Z: u32 = 0x0000_8000;
+    const FCSR_CAUSE_OI: u32 = 0x0000_5000;
+    const FCSR_FLAG_V: u32 = 0x0000_0040;
+    const FCSR_FLAG_OI: u32 = 0x0000_0014;
+    const FCSR_ENABLE_ALL: u32 = 0x0000_0F80;
+    const FCSR_ENABLE_O: u32 = 0x0000_0200;
+    const FCSR_ENABLE_V: u32 = 0x0000_0800;
+
+    /// Invalid operations: infinity minus infinity, zero times infinity,
+    /// 0/0 and infinity/infinity (VR5000 manual U11761EJ6V0UM, 9.4.2, the
+    /// MIPS IV list). Untrapped, Cause.V and Flag.V are set and the result
+    /// is the default quiet NaN, 0x7FBFFFFF / 0x7FF7FFFF_FFFFFFFF (MIPS64
+    /// Volume I, Table 6.3, original NaN encoding). 0/0 is not a divide by
+    /// zero: Z needs a finite nonzero dividend (9.4.3).
+    #[test]
+    fn test_fpu_invalid_operation_untrapped() {
+        let si = f32::INFINITY.to_bits() as u64;
+        let s0 = 0u64;
+        let s1 = 1.0f32.to_bits() as u64;
+        let di = f64::INFINITY.to_bits();
+        let d1 = 1.0f64.to_bits();
+        let cases = [
+            (RS_S, FUNCT_FADD, si, (-f32::INFINITY).to_bits() as u64),
+            (RS_S, FUNCT_FSUB, si, si),
+            (RS_S, FUNCT_FMUL, s0, si),
+            (RS_S, FUNCT_FDIV, s0, s0),
+            (RS_S, FUNCT_FDIV, si, si),
+            (RS_D, FUNCT_FADD, di, (-f64::INFINITY).to_bits()),
+            (RS_D, FUNCT_FSUB, di, di),
+            (RS_D, FUNCT_FMUL, di, 0),
+            (RS_D, FUNCT_FDIV, 0, 0),
+            (RS_D, FUNCT_FDIV, di, di),
+        ];
+        for (fmt, funct, a, b) in cases {
+            let (s, r, fcsr) = fpu_top_case(fmt, funct, a, b, 0);
+            assert_eq!(s, EXEC_COMPLETE, "fmt={fmt} funct={funct}");
+            let want = if fmt == RS_S { 0x7FBF_FFFF } else { 0x7FF7_FFFF_FFFF_FFFF };
+            assert_eq!(r, want, "default NaN, fmt={fmt} funct={funct}");
+            assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "fmt={fmt} funct={funct}");
+        }
+        // Not invalid: these stay as they were.
+        let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FDIV, s1, s0, 0);
+        assert_eq!((r, fcsr), (si, FCSR_CAUSE_Z | 0x20), "1/0 is a divide by zero");
+        let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FDIV, si, s0, 0);
+        assert_eq!((r, fcsr), (si, 0), "infinity/0 is an exact infinity");
+        let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FADD, di, d1, 0);
+        assert_eq!((r, fcsr), (di, 0), "infinity plus a finite number is exact");
+    }
+
+    /// The default NaN an Invalid Operation delivers, fed back in as an
+    /// operand, is a quiet NaN and not a second Invalid Operation. A
+    /// signalling NaN operand delivers the default NaN too. Both formats.
+    #[test]
+    fn test_fpu_default_nan_result_reused_as_operand() {
+        for (fmt, snan, one) in [
+            (RS_S, 0x7FC0_0000u64, 1.0f32.to_bits() as u64),
+            (RS_D, 0x7FF8_0000_0000_0000, 1.0f64.to_bits()),
+        ] {
+            let (s, default_nan, fcsr) = fpu_top_case(fmt, FUNCT_FADD, snan, one, 0);
+            assert_eq!(s, EXEC_COMPLETE, "fmt={fmt}");
+            let want = if fmt == RS_S { 0x7FBF_FFFF } else { 0x7FF7_FFFF_FFFF_FFFF };
+            assert_eq!(default_nan, want, "sNaN operand delivers the default NaN, fmt={fmt}");
+            assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "fmt={fmt}");
+
+            let (s, r, fcsr) = fpu_top_case(fmt, FUNCT_FADD, default_nan, one, 0);
+            assert!(s & EXEC_IS_EXCEPTION != 0, "quiet NaN operand traps, fmt={fmt}");
+            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+            assert_eq!(fcsr, 0x0002_0000, "Cause.E alone, no Invalid, fmt={fmt}");
+            let sentinel = if fmt == RS_S { 0x5a5a5a5a } else { 0x5a5a5a5a_5a5a5a5a };
+            assert_eq!(r, sentinel, "destination untouched, fmt={fmt}");
+        }
+    }
+
+    /// The same invalid 0/0 with every exception enabled, as a diagnostic
+    /// does: Cause.V alone (not Z), a Floating-Point exception, and the
+    /// result and Flag bits untouched. R10000 User's Manual v2.0, 15.4:
+    /// "When a Cause bit is set and its corresponding Enable bit is also
+    /// set, an exception is taken on the instruction. The result of the
+    /// instruction is not stored, and the Flag bits are not changed."
+    #[test]
+    fn test_fpu_invalid_operation_trapped() {
+        for fmt in [RS_S, RS_D] {
+            let (s, r, fcsr) = fpu_top_case(fmt, FUNCT_FDIV, 0, 0, FCSR_ENABLE_ALL);
+            assert!(s & EXEC_IS_EXCEPTION != 0, "fmt={fmt}");
+            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+            assert_eq!(fcsr, FCSR_ENABLE_ALL | FCSR_CAUSE_V, "fmt={fmt}");
+            let sentinel = if fmt == RS_S { 0x5a5a5a5a } else { 0x5a5a5a5a_5a5a5a5a };
+            assert_eq!(r, sentinel, "destination untouched, fmt={fmt}");
+        }
+    }
+
+    /// Overflow from finite operands, all four rounding modes. VR5000 manual
+    /// 9.4.4: Overflow "also sets the Inexact exception and Flag bits", and
+    /// the untrapped result follows Table 9-1: RN gives a signed infinity;
+    /// RZ the largest finite number with the result's sign; RP +infinity or
+    /// the most negative finite number; RM the largest finite number or
+    /// -infinity.
+    #[test]
+    fn test_fpu_overflow_result_per_rounding_mode() {
+        let smax = f32::MAX.to_bits() as u64;
+        let sinf = f32::INFINITY.to_bits() as u64;
+        let sneg = |b: u64| b | 0x8000_0000;
+        let dmax = f64::MAX.to_bits();
+        let dinf = f64::INFINITY.to_bits();
+        let dneg = |b: u64| b | 0x8000_0000_0000_0000;
+        // (rm, positive result, negative result)
+        let s_want = [(0, sinf, sneg(sinf)), (1, smax, sneg(smax)), (2, sinf, sneg(smax)), (3, smax, sneg(sinf))];
+        let d_want = [(0, dinf, dneg(dinf)), (1, dmax, dneg(dmax)), (2, dinf, dneg(dmax)), (3, dmax, dneg(dinf))];
+        for (rm, pos, neg) in s_want {
+            for (funct, a, b, want) in [
+                (FUNCT_FADD, smax, smax, pos),
+                (FUNCT_FSUB, sneg(smax), smax, neg),
+                (FUNCT_FMUL, smax, 2.0f32.to_bits() as u64, pos),
+                (FUNCT_FDIV, sneg(smax), 0.5f32.to_bits() as u64, neg),
+            ] {
+                let (s, r, fcsr) = fpu_top_case(RS_S, funct, a, b, rm);
+                assert_eq!(s, EXEC_COMPLETE, "rm={rm} funct={funct}");
+                assert_eq!(r, want, "single rm={rm} funct={funct}");
+                assert_eq!(fcsr, rm | FCSR_CAUSE_OI | FCSR_FLAG_OI, "single rm={rm} funct={funct}");
+            }
+        }
+        for (rm, pos, neg) in d_want {
+            for (funct, a, b, want) in [
+                (FUNCT_FADD, dmax, dmax, pos),
+                (FUNCT_FSUB, dneg(dmax), dmax, neg),
+                (FUNCT_FMUL, 2.0f64.to_bits(), dmax, pos),
+                (FUNCT_FDIV, dneg(dmax), 0.5f64.to_bits(), neg),
+            ] {
+                let (s, r, fcsr) = fpu_top_case(RS_D, funct, a, b, rm);
+                assert_eq!(s, EXEC_COMPLETE, "rm={rm} funct={funct}");
+                assert_eq!(r, want, "double rm={rm} funct={funct}");
+                assert_eq!(fcsr, rm | FCSR_CAUSE_OI | FCSR_FLAG_OI, "double rm={rm} funct={funct}");
+            }
+        }
+    }
+
+    /// A largest-finite result that is not an overflow raises nothing: MAX
+    /// times 1 is exact, and MAX plus 1 rounded toward zero is MAX because
+    /// the exact sum is below 2^128 (2^1024 for double). Nor does a double
+    /// just below MAX.
+    #[test]
+    fn test_fpu_largest_finite_result_is_not_overflow() {
+        let smax = f32::MAX.to_bits() as u64;
+        let dmax = f64::MAX.to_bits();
+        for rm in 0..4 {
+            let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FMUL, smax, 1.0f32.to_bits() as u64, rm);
+            assert_eq!((r, fcsr), (smax, rm), "single MAX*1 rm={rm}");
+            let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FMUL, dmax, 1.0f64.to_bits(), rm);
+            assert_eq!((r, fcsr), (dmax, rm), "double MAX*1 rm={rm}");
+            // Shares MAX's high word, which is all the double-precision
+            // range test looks at.
+            let near = 0x7FEF_FFFF_0000_0000u64;
+            let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FMUL, near, 1.0f64.to_bits(), rm);
+            assert_eq!((r, fcsr), (near, rm), "double just below MAX rm={rm}");
+        }
+        let (_, r, fcsr) = fpu_top_case(RS_S, FUNCT_FADD, smax, 1.0f32.to_bits() as u64, 1);
+        assert_eq!((r, fcsr), (smax, 1), "single MAX+1 toward zero");
+        let (_, r, fcsr) = fpu_top_case(RS_D, FUNCT_FADD, dmax, 1.0f64.to_bits(), 1);
+        assert_eq!((r, fcsr), (dmax, 1), "double MAX+1 toward zero");
+    }
+
+    /// Overflow with its Enable set traps with Cause.O and Cause.I (VR5000
+    /// Table 9-2, "Exponent overflow O,I"), destination and Flags untouched.
+    #[test]
+    fn test_fpu_overflow_trapped() {
+        let (s, r, fcsr) = fpu_top_case(RS_S, FUNCT_FADD, f32::MAX.to_bits() as u64, f32::MAX.to_bits() as u64, FCSR_ENABLE_O);
+        assert!(s & EXEC_IS_EXCEPTION != 0);
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
+        assert_eq!(fcsr, FCSR_ENABLE_O | FCSR_CAUSE_OI);
+        assert_eq!(r, 0x5a5a5a5a);
+        let (s, r, fcsr) = fpu_top_case(RS_D, FUNCT_FMUL, f64::MAX.to_bits(), 4.0f64.to_bits(), FCSR_ENABLE_O);
+        assert!(s & EXEC_IS_EXCEPTION != 0);
+        assert_eq!(fcsr, FCSR_ENABLE_O | FCSR_CAUSE_OI);
+        assert_eq!(r, 0x5a5a5a5a_5a5a5a5a);
+    }
+
+    /// Runs one instruction with f1 = `a`, f2 = `b`, f4 = `c` and a sentinel
+    /// in f0, the destination. Returns the status, the destination bits
+    /// (read as a word when `double_result` is false) and FCSR.
+    fn fpu_instr_case(instr: u32, double: bool, a: u64, b: u64, c: u64, fcsr: u32, double_result: bool) -> (crate::cpu::mips_exec::ExecStatus, u64, u32) {
+        struct RestoreRounding;
+        impl Drop for RestoreRounding {
+            fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
+        }
+        let _restore = RestoreRounding;
+        let (mut exec, _) = create_executor_m4();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        exec.core.write_fpu_control(31, fcsr);
+        if double {
+            exec.core.write_fpr_l(1, a);
+            exec.core.write_fpr_l(2, b);
+            exec.core.write_fpr_l(4, c);
+        } else {
+            exec.core.write_fpr_w(1, a as u32);
+            exec.core.write_fpr_w(2, b as u32);
+            exec.core.write_fpr_w(4, c as u32);
+        }
+        exec.core.write_fpr_l(0, 0x5a5a5a5a_5a5a5a5a);
+        let s = exec.exec(instr);
+        let r = if double_result { exec.core.read_fpr_l(0) } else { exec.core.read_fpr_w(0) as u64 };
+        (s, r, exec.core.fpu_fcsr)
+    }
+
+    /// Instructions whose invalid result does not come through the plain
+    /// arithmetic path: SQRT and RSQRT of -1, every multiply-add on
+    /// infinity times zero, and CVT.S.D of a signalling NaN (quiet bit set,
+    /// the MIPS encoding). Each entry is (instruction, source is double,
+    /// f1, f2, f4, result is double); f2 is zero, f4 is 1.0.
+    fn fpu_invalid_producers() -> Vec<(u32, bool, u64, u64, u64, bool)> {
+        let mut v = Vec::new();
+        for (fmt, d) in [(RS_S, false), (RS_D, true)] {
+            let (m1, inf, zero, one) = if d {
+                ((-1.0f64).to_bits(), f64::INFINITY.to_bits(), 0u64, 1.0f64.to_bits())
+            } else {
+                ((-1.0f32).to_bits() as u64, f32::INFINITY.to_bits() as u64, 0u64, 1.0f32.to_bits() as u64)
+            };
+            v.push((make_cop1_compute(fmt, 0, 1, 0, FUNCT_FSQRT), d, m1, zero, one, d));
+            v.push((make_cop1_compute(fmt, 0, 1, 0, FUNCT_FRSQRT), d, m1, zero, one, d));
+            // fd = fs * ft op fr with fs = f1 (infinity), ft = f2 (zero), fr = f4.
+            let functs = if d {
+                [FUNCT_MADD_D, FUNCT_MSUB_D, FUNCT_NMADD_D, FUNCT_NMSUB_D]
+            } else {
+                [FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S]
+            };
+            for funct in functs {
+                v.push((make_cop1x(4, 2, 1, 0, funct), d, inf, zero, one, d));
+            }
+        }
+        v.push((make_cop1_compute(RS_D, 0, 1, 0, FUNCT_FCVT_S), true, 0x7FF8_0000_0000_0000, 0, 0, false));
+        v
+    }
+
+    /// SQRT, RSQRT, the multiply-add family and CVT.S.D give the default
+    /// quiet NaN with Cause.V and Flag.V for an invalid operation (VR5000
+    /// manual U11761EJ6V0UM, 9.4.2; MIPS64 Volume I, Table 6.3), not the
+    /// host's NaN, which is a signalling NaN under the MIPS encoding.
+    #[test]
+    fn test_fpu_invalid_unary_and_madd_untrapped() {
+        for (instr, dbl, a, b, c, dbl_result) in fpu_invalid_producers() {
+            let (s, r, fcsr) = fpu_instr_case(instr, dbl, a, b, c, 0, dbl_result);
+            assert_eq!(s, EXEC_COMPLETE, "instr={instr:#010x}");
+            let want = if dbl_result { 0x7FF7_FFFF_FFFF_FFFFu64 } else { 0x7FBF_FFFF };
+            assert_eq!(r, want, "default NaN, instr={instr:#010x}");
+            assert_eq!(fcsr, FCSR_CAUSE_V | FCSR_FLAG_V, "instr={instr:#010x}");
+        }
+    }
+
+    /// The same operations with Enable.V set raise a Floating-Point
+    /// exception with Cause.V, store nothing and leave the Flags alone
+    /// (R10000 User's Manual v2.0, 15.4).
+    #[test]
+    fn test_fpu_invalid_unary_and_madd_trapped() {
+        for (instr, dbl, a, b, c, dbl_result) in fpu_invalid_producers() {
+            let (s, r, fcsr) = fpu_instr_case(instr, dbl, a, b, c, FCSR_ENABLE_V, dbl_result);
+            assert!(s & EXEC_IS_EXCEPTION != 0, "instr={instr:#010x}");
+            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "instr={instr:#010x}");
+            assert_eq!(fcsr, FCSR_ENABLE_V | FCSR_CAUSE_V, "instr={instr:#010x}");
+            let sentinel = if dbl_result { 0x5a5a5a5a_5a5a5a5a } else { 0x5a5a5a5a };
+            assert_eq!(r, sentinel, "destination untouched, instr={instr:#010x}");
+        }
     }
 
     #[test]

@@ -722,6 +722,12 @@ pub struct MipsCore {
     /// `ctx`: `fs_reg, fd_reg, fr1` (bool as u32). Returns nonzero if trapped.
     #[cfg(feature = "jitv2")]
     pub fpu_cvt_d_to_s_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32, u32) -> u32,
+    /// ADD/SUB/MUL/DIV whose result is at the top of the range — see
+    /// `fpu_binop_commit`. Args after `ctx`: the packed instruction
+    /// fields and the result bits (single precision zero-extended).
+    /// Classifies, updates FCSR and writes fd. Returns nonzero if trapped.
+    #[cfg(feature = "jitv2")]
+    pub fpu_binop_commit_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u64) -> u32,
     /// `jitv2_lockstep` load/store verification scratch (see
     /// `MipsExecutor::lockstep_check_load_store`): records the real
     /// interpreter dispatch's virtual address, translated physical address,
@@ -1275,6 +1281,10 @@ unsafe extern "C" fn jit_hooks_not_installed_fpu_cvt_int_to_float(_ctx: *mut cor
 unsafe extern "C" fn jit_hooks_not_installed_fpu_cvt_d_to_s(_ctx: *mut core::ffi::c_void, _fs: u32, _fd: u32, _fr1: u32) -> u32 {
     panic!("jitv2: fpu_cvt_d_to_s hook called before MipsExecutor::install_jit_hooks");
 }
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_binop_commit(_ctx: *mut core::ffi::c_void, _op: u32, _r: u64) -> u32 {
+    panic!("jitv2: fpu_binop_commit hook called before MipsExecutor::install_jit_hooks");
+}
 
 // SAFETY: The raw pointer in status_changed_cb is only accessed from the CPU thread.
 unsafe impl Send for MipsCore {}
@@ -1377,6 +1387,8 @@ impl MipsCore {
             fpu_cvt_int_to_float_fn: jit_hooks_not_installed_fpu_cvt_int_to_float,
             #[cfg(feature = "jitv2")]
             fpu_cvt_d_to_s_fn: jit_hooks_not_installed_fpu_cvt_d_to_s,
+            #[cfg(feature = "jitv2")]
+            fpu_binop_commit_fn: jit_hooks_not_installed_fpu_binop_commit,
             #[cfg(feature = "jitv2_lockstep")]
             lockstep_step_fn: jit_hooks_not_installed_lockstep_step,
             #[cfg(feature = "jitv2_lockstep")]
