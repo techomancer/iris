@@ -83,7 +83,7 @@ Set `[graphics] board` to `xz`, `extreme`, `solidimpact`, `highimpact`, or
 command interpreters, software rasterizers, and a display path; they are no
 longer preview stubs. Require `heads = 1` and `resolution = "guest"` for these
 boards. There is no separate `[impact]` section. See
-[GR2 graphics](indy-xz-elan.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
+[GR2 graphics](graphics/gr2-xz-extreme.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
 
 For the R10000 Indigo2 profile and larger RAM banks, see
 [Indigo2 IP28](indigo2-ip28.md). IP28 has its own embedded PROM fallback.
