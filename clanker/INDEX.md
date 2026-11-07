@@ -196,6 +196,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | [fastclear-cid-divergence.md](rex3/fastclear-cid-divergence.md) | rule | FASTCLEAR + CID checking: three code paths, two of which ignored CID — 2026-09-15 |
 | [gfifo-batching-constraints.md](rex3/gfifo-batching-constraints.md) | measure | Batching GFIFO publication: what must still be ordered |
 | [gpu-replay-must-flush-before-cpu-fallback.md](rex3/gpu-replay-must-flush-before-cpu-fallback.md) | rule | GPU replay must flush before CPU fallback |
+| [guest-synthetic-capture-and-replay-divergence.md](rex3/guest-synthetic-capture-and-replay-divergence.md) | open | Guest REX3 scanout works; five old compiled captures need recapture |
 | [host-full-block-replicates.md](rex3/host-full-block-replicates.md) | rule | A host DRAW BLOCK with STOPONY fills the whole block from HOSTRW |
 | [hostrw-batching-design.md](rex3/hostrw-batching-design.md) | design | Batched HOSTRW / VDMA — design sketch |
 | [hostrw-row-boundary-forces-a-word-flush.md](rex3/hostrw-row-boundary-forces-a-word-flush.md) | rule | A row boundary forces a HOSTRW word flush — unconditionally |

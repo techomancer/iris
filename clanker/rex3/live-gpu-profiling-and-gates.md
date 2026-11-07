@@ -140,12 +140,24 @@ superseded `0.849x` baseline; the corrected baseline is `0.887x`.
 ## Next decision
 
 The shader processes an ordered batch in one workgroup, serializing draws with
-barriers. First capture representative IRIX traffic privately and establish a
-strict non-empty replay corpus plus correctness and device-loss/readback
-recovery. Then try conflict-free epochs or order-preserving per-tile
-parallelism, keeping overlapping draws and observation/fallback boundaries
-ordered. Split dispatches where a global barrier is required, including
-cross-tile read/write hazards. Repeat the corpus and performance gates before
-reconsidering submission. Do not replace wgpu with native Vulkan unless
-measurements identify material overhead specific to wgpu. Raw guest captures
-stay private.
+barriers. Instrumentation and private synthetic guest capture are complete;
+the captures are functional evidence, not live timing data. Actual desktop
+capture is externally blocked by a missing licensed guest driver. The retained
+HOSTRW state fix is validated: current interpreter, counter-proven Cranelift,
+and Vulkan agree on `pixelclip`'s `host_shifter = 0xff000001`, full RGB/aux
+planes, and reads. All three pass all hashes and reads for 9/14 captures:
+all seven interpreter-origin cases and compiled-origin `barsB` and
+`longfills`. The other five are old compiled-origin recordings whose mark and
+final hashes fail on all engines because they contain pre-fix live state. See
+[guest capture and replay validation](guest-synthetic-capture-and-replay-divergence.md);
+raw captures stay private.
+
+Recapture those five cases after the fix without waiving hashes, then establish
+a non-empty independently generated synthetic/post-fix corpus and test
+device-loss/readback recovery. After those prerequisites, try conflict-free
+epochs or order-preserving per-tile parallelism, keeping overlapping draws and
+observation/fallback boundaries ordered. Split dispatches where a global
+barrier is required, including cross-tile read/write hazards. Repeat the corpus
+and performance gates before reconsidering submission. Do not replace wgpu
+with native Vulkan unless measurements identify material overhead specific to
+wgpu.

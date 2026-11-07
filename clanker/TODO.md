@@ -132,18 +132,44 @@ guide and changelog when it lands.
   stable telemetry A/A passed; the live renderer failed both speed gates and
   is not ready to submit. Details:
   [REX3 GPU profiling and gates](rex3/live-gpu-profiling-and-gates.md).
-- [ ] **Prerequisites — REX3 guest capture, strict corpus, and recovery.**
-  Capture representative IRIX draw, fallback, HOSTRW, and observation workloads
-  privately; share only safe aggregates or redistributable synthetic cases.
-  Make the corpus non-empty and fail rather than silently pass when recordings
-  or expected GPU-handled draws are absent. Compare interpreter, CPU JIT, and
-  GPU framebuffer, context, reads, overlaps, fallback, snapshots, and checkpoint
-  behavior; cover GFIFO back-pressure and display fences. Define and fault-test
-  recovery from device loss and readback errors so pending draws are not lost
-  and CPU fallback never uses stale pixels. Complete before the parallelism
-  experiment, with evidence across available backends.
-- [ ] **Experiment — conflict-free REX3 epochs/tiles.** After the capture,
-  corpus, and recovery prerequisites, test parallel conflict-free epochs or
+- [x] **Capture — synthetic REX3 guest workloads.** Fourteen private captures
+  of seven ROM-free direct-MMIO cases under compiled and interpreted CPU
+  rendering passed guest pixel and host screenshot checks. They are not real
+  desktop traffic or timing data; raw captures stay private. Details:
+  [guest capture and replay validation](rex3/guest-synthetic-capture-and-replay-divergence.md).
+- [ ] **External blocker — real REX3 desktop capture.** Both available IRIX
+  images lack the licensed Newport driver, so Xsgi cannot find a screen.
+  Obtain an authorized matching driver, install it only into a disposable
+  overlay, autoconfigure, reboot, and verify graphics discovery and X before
+  capturing real desktop workloads. This is not a CI display-black bug.
+- [x] **Correctness — REX3 HOSTRW replay state.** Validated: interpreter,
+  counter-proven Cranelift, and Vulkan agree on `pixelclip`'s
+  `host_shifter = 0xff000001`, full RGB/aux planes, and reads; 9/14 captures
+  pass all hashes and reads on all engines (all seven interpreter-origin,
+  plus compiled-origin `barsB` and `longfills`). The retained fix persists
+  the Cranelift shifter, aligns HOSTRW word boundaries and PIO idle-cursor
+  retirement, and corrects compiled offscreen HOSTR reads.
+- [ ] **Validation — recapture old compiled-origin cases.** The old `barsA`,
+  `windowlike`, `tiny`, `pixelclip`, and `mixed` captures recorded pre-fix live
+  compiled state and fail the same mark and final hashes on all current
+  engines, with zero differing reads. They are not corpus candidates.
+  Recapture them privately after the fix and require matching initial/mark/final
+  hashes and reads on every engine; do not waive hashes.
+- [ ] **Prerequisite — independent strict REX3 corpus.** Generate synthetic
+  post-fix cases independently rather than sharing the private captures. Cover
+  overlap/window blocks, 1,200-pixel spans, 8x8, 8-pixel and single-pixel
+  draws, HOSTW/HOSTR residual state, clipping, CI8/mixed fallback, and
+  1,024-draw batch/fence boundaries. Make the corpus non-empty and fail rather
+  than silently pass when recordings or expected GPU-handled draws are absent.
+  Compare interpreter, CPU JIT, and GPU planes, context, reads, overlaps,
+  fallback, snapshots, and hashes; cover GFIFO back-pressure and display
+  fences.
+- [ ] **Prerequisite — REX3 GPU recovery.** After strict corpus validation,
+  define and fault-test device-loss and readback-error recovery so pending
+  draws are not lost and CPU fallback never uses stale pixels. Complete before
+  the parallelism experiment, with evidence across available backends.
+- [ ] **Experiment — conflict-free REX3 epochs/tiles.** After strict corpus
+  and recovery prerequisites, test parallel conflict-free epochs or
   order-preserving tile work against the single-workgroup serial bottleneck.
   Split dispatches at global barriers and cross-tile hazards; preserve
   overlapping draw order, CPU fallback, and fence/readback boundaries;
