@@ -1,0 +1,10 @@
+from 192.168.0.1:6.5.22/ovl1/dist
+from 192.168.0.1:6.5.22/ovl2/dist
+from 192.168.0.1:6.5.22/ovl2/dist/unbundled
+from 192.168.0.1:6.5.22/ovl3/dist
+from 192.168.0.1:6.5.22/apps/dist
+from 192.168.0.1:devf13/dist
+from 192.168.0.1:devl/dist
+from 192.168.0.1:f1/dist
+from 192.168.0.1:f2/dist
+from 192.168.0.1:nfs/dist/dist6.5
