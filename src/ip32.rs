@@ -122,6 +122,27 @@ pub use crate::dev::mace_uart::*;
 pub use crate::dev::ns16550::*;
 pub use crate::dev::mace_id::*;
 
+use crate::pci::{DevFn, IntxRouting};
+
+/// MACE's PCI bus 0; the outputs are CRIME inputs. Source: the MACE
+/// specification (Tables 85 and 87, pp. 164 and 166; Table 90, p. 179), which
+/// gives the routing the software uses. No published document shows how the
+/// board connects INTB-D of the option slot.
+pub static PCI0: IntxRouting = IntxRouting {
+    devices: 32,
+    irqs: 16,
+    intx: &[
+        (1, [Some(8), None, None, None]),                // internal SCSI
+        (2, [Some(9), None, None, None]),                // external SCSI
+        (3, [Some(10), Some(13), Some(14), Some(15)]),   // INTB-D shared
+        // The specification routes device 4; no O2 board populates it. Using
+        // it for virtio-serial is iris's choice of a spare number, not
+        // hardware use.
+        (4, [Some(11), None, None, None]),
+    ],
+    board_irqs: &[],
+};
+
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 /// CRIME's no-ECC alias of the memory window: the same memory as
@@ -406,8 +427,10 @@ pub struct Ip32Bus {
     /// The bus everything is mapped on: what the CPU and the DMA masters use.
     pub phys: Arc<Physical>,
     /// The runs of the PCI windows a BAR decodes whole, mapped over MACE
-    /// (`MacePci::on_bar_runs`).
-    pci_runs: Mutex<Vec<crate::pci::BarRun>>,
+    /// (`PciBus::on_bar_mappings`): where each starts and ends.
+    pci_runs: Mutex<Vec<(u64, u64)>>,
+    /// The devices made for MACE's BAR mappings, once each.
+    bar_devices: crate::pci::BarDevices,
     pub(crate) ram: Arc<O2Memory>,
     pub(crate) flash: O2Flash,
     /// Where to keep the flash between runs, if anywhere. Never the image the
@@ -460,6 +483,7 @@ impl Ip32Bus {
         let mut bus = Self {
             phys: phys.clone(),
             pci_runs: Mutex::new(Vec::new()),
+            bar_devices: Default::default(),
             ram: ram.clone(),
             flash: O2Flash { bytes: Mutex::new(prom), writes: Mutex::new(Vec::new()) },
             flash_file: opts.flash_file.clone(),
@@ -471,7 +495,7 @@ impl Ip32Bus {
                 gbe.tr = crime.tr.clone();
                 gbe
             },
-            mace: Mace::new(ram.clone(), crime, ust),
+            mace: Mace::new(ram.clone(), crime, ust, &PCI0),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
         };
@@ -498,8 +522,9 @@ impl Ip32Bus {
             let scsi_b = crate::dev::aic7880::Aic7880::new_at(1, bus_b);
             scsi.set_heartbeat(bus.mace.id.heartbeat.clone());
             scsi_b.set_heartbeat(bus.mace.id.heartbeat.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
-            bus.mace.pci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
+            let pci = bus.mace.pci.bus();
+            pci.attach(DevFn { device: IP32_SCSI_SLOT_B, function: 0 }, scsi_b.clone());
+            pci.attach(DevFn { device: IP32_SCSI_SLOT, function: 0 }, scsi.clone());
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
@@ -521,7 +546,7 @@ impl Ip32Bus {
         bus.map();
         // Window pages a PCI BAR decodes whole go straight to the function.
         let weak = Arc::downgrade(&bus);
-        bus.mace.pci.on_bar_runs(Box::new(move |runs| {
+        bus.mace.pci.bus().on_bar_mappings(Box::new(move |runs| {
             if let Some(b) = weak.upgrade() {
                 b.set_pci_runs(runs);
             }
@@ -531,16 +556,19 @@ impl Ip32Bus {
 
     /// MACE says which runs of its PCI windows a BAR decodes whole: map
     /// them over MACE, giving the runs it named before back to it.
-    fn set_pci_runs(&self, new: Vec<crate::pci::BarRun>) {
+    fn set_pci_runs(&self, new: Vec<crate::pci::BarMapping>) {
+        use crate::pci::ByteOrder;
         let mut runs = self.pci_runs.lock().unwrap();
-        for r in runs.iter() {
+        for &(start, end) in runs.iter() {
             // SAFETY: MACE is a field of this bus, alive as long as it is.
-            unsafe { self.phys.map_borrowed(r.start, r.end, &self.mace, "mace") };
+            unsafe { self.phys.map_borrowed(start, end, &self.mace, "mace") };
         }
         for r in &new {
-            self.phys.map(r.start, r.end, r.dev.clone(), "pci bar");
+            // MACE's three windows share one set of order, so a run needs
+            // nothing from the window it lies in.
+            self.phys.map(r.cpu, r.cpu + r.len, self.bar_devices.get(r, 0xffff_ffff, ByteOrder::values(4)), "pci bar");
         }
-        *runs = new;
+        *runs = new.iter().map(|r| (r.cpu, r.cpu + r.len)).collect();
     }
 
     /// Put everything where CRIME and MACE decode it. The devices are fields
@@ -700,6 +728,9 @@ impl crate::traits::Saveable for Ip32Bus {
             let words: Option<Vec<u64>> = a.iter().map(crate::snapshot::toml_u64).collect();
             self.ram.restore_stack_page(&words.ok_or("stack_page: not a list of dwords")?)?;
         }
+        // MACE loaded before CRIME and the controllers: tell CRIME the pin
+        // levels now that it can take them.
+        self.mace.pci.bus().redrive();
         Ok(())
     }
 }

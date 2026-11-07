@@ -36,7 +36,7 @@ pub struct Mace {
     /// and count accesses per offset.
     pub regs: Stub,
     /// The PCI host bridge: its registers here, its windows outside MACE.
-    pub pci: MacePci,
+    pub pci: Arc<MacePci>,
     pub ust: Arc<MaceUst>,
     pub rtc: MaceRtc,
     pub ps2: MacePs2,
@@ -55,12 +55,12 @@ impl Mace {
     /// MACE with its blocks reset, its interrupts wired into `crime`: the
     /// Ethernet straight in, the ISA peripherals (the PS/2 ports, audio, the
     /// console UART while driven by PIO, serial DMA) through the ISA block.
-    pub fn new(ram: Arc<O2Memory>, crime: Arc<Crime>, ust: Arc<MaceUst>) -> Self {
+    pub fn new(ram: Arc<O2Memory>, crime: Arc<Crime>, ust: Arc<MaceUst>, pci: &'static crate::pci::IntxRouting) -> Self {
         let isa = Arc::new(MaceIsa::new(crime.clone()));
         let mace = Self {
             isa,
             regs: Stub::new("mace"),
-            pci: MacePci::new(crime.clone(), ram.clone()),
+            pci: MacePci::new(pci, crime.clone(), ram.clone()),
             ust,
             rtc: MaceRtc::new(),
             ps2: MacePs2::new(),
@@ -111,7 +111,7 @@ impl Mace {
     /// commands through on the Indigo2.
     pub fn devices(&self) -> Vec<&dyn crate::traits::Device> {
         vec![
-            &self.pci, &*self.ust, &self.rtc, &self.ps2, &self.id, &self.com0, &self.com1, &self.sdma,
+            &*self.pci, &*self.ust, &self.rtc, &self.ps2, &self.id, &self.com0, &self.com1, &self.sdma,
             &self.audio, &*self.mec, &*self.isa,
         ]
     }
@@ -276,7 +276,7 @@ impl Mace {
         [
             ("ust", &*self.ust),
             ("regs", &self.regs),
-            ("pci", &self.pci),
+            ("pci", &*self.pci),
             ("rtc", &self.rtc),
             ("ps2", &self.ps2),
             ("id", &self.id),
