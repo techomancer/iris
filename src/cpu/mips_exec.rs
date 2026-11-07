@@ -913,6 +913,10 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// every dispatch.
     #[cfg(feature = "jitv2")]
     pub jitv2_compile_queue_handle: std::sync::Arc<crossbeam_queue::ArrayQueue<crate::cpu::jitv2::CompileRequest>>,
+    /// The same pool's hot lane (`CompileQueue::hot_handle`), held for the
+    /// same reason.
+    #[cfg(feature = "jitv2")]
+    pub jitv2_hot_queue_handle: std::sync::Arc<crossbeam_queue::ArrayQueue<crate::cpu::jitv2::CompileRequest>>,
     /// Cheap handle to `jitv2.lock().stats`, cloned once at construction —
     /// same reasoning as `jitv2_compile_queue_handle`: `JitStats` is already
     /// `Arc`-shared internally (see `Jitv2::stats`'s own doc comment), so
@@ -2346,6 +2350,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         #[cfg(feature = "jitv2")]
         let jitv2_compile_queue_handle = jitv2.compile_queue.queue_handle();
         #[cfg(feature = "jitv2")]
+        let jitv2_hot_queue_handle = jitv2.compile_queue.hot_handle();
+        #[cfg(feature = "jitv2")]
         let jitv2_stats = jitv2.stats.clone();
 
         let mut executor = Self {
@@ -2424,6 +2430,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_pages_base: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
             jitv2_compile_queue_handle,
+            #[cfg(feature = "jitv2")]
+            jitv2_hot_queue_handle,
             #[cfg(feature = "jitv2")]
             jitv2_stats,
             #[cfg(feature = "jitv2")]
@@ -3066,6 +3074,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         {
             let j = jit.lock();
             self.jitv2_compile_queue_handle = j.compile_queue.queue_handle();
+            self.jitv2_hot_queue_handle = j.compile_queue.hot_handle();
             self.jitv2_stats = j.stats.clone();
         }
         self.jitv2 = jit;
@@ -3726,7 +3735,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         // Already queued, and being executed hard while it
                         // waits: jump the queue (jitv2::HOT_QUEUE).
                         crate::pf_instant!(crate::perfetto::events::JIT_HOT_REQUEST, pc);
-                        crate::cpu::jitv2::jitv2::push_hot_request(req);
+                        crate::cpu::jitv2::jitv2::push_hot_request(&self.jitv2_hot_queue_handle, req);
                     }
                     break 'gate self.step_int();
                 }
