@@ -17,7 +17,7 @@ use crate::ppmem::devmap::{Entry, SLOT_SHIFT};
 use crate::physical::Physical;
 
 use crate::dev::prom::PromPort;
-use crate::dev::mc::MemoryController;
+use crate::dev::mc::{BankPlacement, MemoryController};
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ng1::rex3::Rex3;
 use crate::dev::gr2::Gr2;
@@ -159,6 +159,9 @@ fn alias_offset_for(ip28: bool) -> u32 {
 enum BankSlot {
     Unmapped,
     Bank(usize),
+    /// The bank answering this many bytes up the bus: a subbank placed
+    /// apart from where the bank's mask would put it.
+    View(usize, u32),
 }
 
 /// Decide every decode-table slot a MEMCFG write can affect: the lomem and
@@ -182,8 +185,12 @@ enum BankSlot {
 ///   moved or invalidated.
 ///
 /// Slots past a bank's `limit` stay `Unmapped`, so reads there return 0.
+///
+/// A bank whose two subbanks the MC places `subbank_span` apart (see
+/// `MemoryController::memcfg_bank_info`) gets one span per subbank, each
+/// mirroring that subbank: the second span reaches the bank's second half.
 fn plan_bank_slots(
-    bank_addrs: &[Option<(u32, u32, u32)>; 4],
+    bank_addrs: &[Option<BankPlacement>; 4],
     previously_outside: &[u32],
 ) -> (Vec<(u32, BankSlot)>, Vec<u32>) {
     const WINDOW: u32 = 0x1000_0000;
@@ -202,16 +209,45 @@ fn plan_bank_slots(
     }
     let mut outside = Vec::new();
     for (bank, entry) in bank_addrs.iter().enumerate() {
-        let Some((conf_base, _addr_mask, limit)) = *entry else { continue };
+        let Some((conf_base, addr_mask, limit, span)) = *entry else { continue };
+        let subbank = (addr_mask >> 1) + 1;
         for slot in 0..(limit >> SLOT_SHIFT) {
-            let phys = conf_base.wrapping_add(slot << SLOT_SHIFT);
-            plan.insert(phys >> SLOT_SHIFT, BankSlot::Bank(bank));
+            let off = slot << SLOT_SHIFT;
+            let phys = conf_base.wrapping_add(off);
+            let target = if span == 0 {
+                BankSlot::Bank(bank)
+            } else {
+                let i = off / span;
+                let at = i * subbank + (off - i * span) % subbank;
+                if at == off { BankSlot::Bank(bank) } else { BankSlot::View(bank, off.wrapping_sub(at)) }
+            };
+            plan.insert(phys >> SLOT_SHIFT, target);
             if !in_window(phys) {
                 outside.push(phys >> SLOT_SHIFT);
             }
         }
     }
     (plan.into_iter().collect(), outside)
+}
+
+/// Point the decode table at a plan from [`plan_bank_slots`], as runs of one
+/// target, leaving a run alone that already answers as planned.
+fn apply_bank_plan(phys: &Physical, plan: &[(u32, BankSlot)]) {
+    let mut i = 0;
+    while i < plan.len() {
+        let (start, target) = plan[i];
+        let mut j = i + 1;
+        while j < plan.len() && plan[j].1 == target && plan[j].0 == plan[j - 1].0 + 1 {
+            j += 1;
+        }
+        let ptr: Entry = match target {
+            BankSlot::Unmapped => phys.unmapped_entry(),
+            BankSlot::Bank(b) => phys.bank_entry(b),
+            BankSlot::View(b, delta) => phys.bank_view(b, delta as u64),
+        };
+        phys.fill_slots(start as u64, (j - i) as u64, ptr);
+        i = j;
+    }
 }
 
 // Mystery Black Hole (64KB at 0x02080000)
@@ -228,7 +264,7 @@ struct RemapState {
     banks_outside_windows: Vec<u32>,
     /// IP28: the bank placement ppmem's window was last built for, so a
     /// MEMCFG write that moves nothing leaves the window alone.
-    ppmem_last_placement: Option<([Option<(u32, u32, u32)>; 4], [usize; 4])>,
+    ppmem_last_placement: Option<([Option<BankPlacement>; 4], [usize; 4])>,
 }
 
 /// The Indy's or Indigo2's devices on its physical bus.
@@ -416,7 +452,7 @@ impl Ip22Bus {
     ///
     /// Called by the MC whenever MEMCFG0/1 change (including at boot), on the
     /// CPU thread.
-    pub fn remap_banks(&self, bank_addrs: [Option<(u32, u32, u32)>; 4]) {
+    pub fn remap_banks(&self, bank_addrs: [Option<BankPlacement>; 4]) {
         let phys = &*self.phys;
         let banks = phys.banks();
         let mut st = self.remap.lock().unwrap();
@@ -452,7 +488,7 @@ impl Ip22Bus {
         }
 
         for (bank_idx, maybe_bank) in bank_addrs.iter().enumerate() {
-            let Some((conf_base, addr_mask, limit)) = *maybe_bank else {
+            let Some((conf_base, addr_mask, limit, span)) = *maybe_bank else {
                 dlog_dev!(LogModule::Mc, "[MEMCFG] bank {} not mapped", bank_idx);
                 continue;
             };
@@ -477,7 +513,12 @@ impl Ip22Bus {
                 // handles both — see its doc comment.
                 let period = (addr_mask as u64).wrapping_add(1);
                 let bank_bytes = banks[bank_idx].size() as u64;
-                if period > 0 && period <= bank_bytes {
+                if span != 0 {
+                    // Only the IP28 PROM's subbank probe does this, and only
+                    // for a moment; the bus path has the views.
+                    dlog_dev!(LogModule::Mc,
+                        "ppmem: bank {bank_idx} subbanks {span:#x} apart; leaving it to the bus path");
+                } else if period > 0 && period <= bank_bytes {
                     if let Err(e) =
                         sp.map_bank(bank_idx, conf_base as u64, limit as u64, period)
                     {
@@ -498,20 +539,7 @@ impl Ip22Bus {
         // a run alone that already answers as planned. See `plan_bank_slots`.
         let (plan, outside) = plan_bank_slots(&bank_addrs, &st.banks_outside_windows);
         st.banks_outside_windows = outside;
-        let mut i = 0;
-        while i < plan.len() {
-            let (start, target) = plan[i];
-            let mut j = i + 1;
-            while j < plan.len() && plan[j].1 == target && plan[j].0 == plan[j - 1].0 + 1 {
-                j += 1;
-            }
-            let ptr: Entry = match target {
-                BankSlot::Unmapped => phys.unmapped_entry(),
-                BankSlot::Bank(b) => phys.bank_entry(b),
-            };
-            phys.fill_slots(start as u64, (j - i) as u64, ptr);
-            i = j;
-        }
+        apply_bank_plan(phys, &plan);
 
         // ppmem: the low-512KB alias of bank 0 (MC spec — the bottom 512KB
         // mirrors 0x08000000..0x0807ffff). Mapped as real pages rather than
@@ -519,7 +547,7 @@ impl Ip22Bus {
         // no re-dispatch. The bus alias stays installed in the decode table as
         // the bus-path equivalent; both see identical memory.
         if let (true, Some(sp)) = (ppmem_placement_changed, phys.ppmem_space()) {
-            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == self.alias_offset);
+            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _, _)| base == self.alias_offset);
             if bank0_mapped {
                 let alias_len = (ALIAS_END - ALIAS_BASE) as u64;
                 if (banks[0].size() as u64) >= alias_len {
@@ -545,7 +573,7 @@ mod ppmem_tests {
 
     /// Bank placements exactly as `memcfg_bank_info` decodes them for two
     /// 128MB SIMMs at LOMEM, which is what `iris.toml`'s default config gives.
-    fn two_128mb_banks() -> [Option<(u32, u32, u32)>; 4] {
+    fn two_128mb_banks() -> [Option<BankPlacement>; 4] {
         let m0 = MemoryController::encode_memcfg_half(LOMEM_BASE, 128).unwrap();
         let m1 = MemoryController::encode_memcfg_half(LOMEM_BASE + BANK_SIZE, 128).unwrap();
         [
@@ -575,7 +603,7 @@ mod ppmem_tests {
         // Drive the same mapping remap_banks would, then verify agreement.
         space.clear_mappings();
         for (i, entry) in addrs.iter().enumerate() {
-            let Some((base, _mask, limit)) = *entry else { continue };
+            let Some((base, _mask, limit, _)) = *entry else { continue };
             let period = (_mask as u64).wrapping_add(1);
             space.map_bank(i, base as u64, limit as u64, period).unwrap();
         }
@@ -586,7 +614,7 @@ mod ppmem_tests {
         // Write through the bus, read through the window, at several offsets
         // spanning both banks.
         for (i, entry) in addrs.iter().enumerate() {
-            let Some((base, _, limit)) = *entry else { continue };
+            let Some((base, _, limit, _)) = *entry else { continue };
             for off in [0u32, 0x1000, 0x10_0000, limit - 8] {
                 let phys = base + off;
                 if bm & (1u64 << (phys >> crate::ppmem::BITMAP_SHIFT)) == 0 {
@@ -618,7 +646,7 @@ mod ppmem_tests {
         let space = PpMemSpace::over(&banks).expect("reserve window");
         let (plan, _) = plan_bank_slots(&addrs, &[]);
         for (i, entry) in addrs.iter().enumerate() {
-            let Some((base, mask, limit)) = *entry else { continue };
+            let Some((base, mask, limit, _)) = *entry else { continue };
             banks[i].set_addr_mask(mask);
             space.map_bank(i, base as u64, limit as u64, mask as u64 + 1).unwrap();
             // Distinct words on both sides of the old 256 MB limit and at
@@ -642,6 +670,58 @@ mod ppmem_tests {
         assert_eq!(plan.iter().filter(|(_, slot)| matches!(slot, BankSlot::Bank(_))).count(), (1024 << 20) >> SLOT_SHIFT);
     }
 
+    /// The addresses the IP28 PROM's POST reaches in two 128 MB banks, through
+    /// the decode table, for each MEMCFG0 it writes while sizing bank 0 and
+    /// for the one it settles on. With bank 0 decoded as a single 128 MB
+    /// subbank the PROM sized it as 256 MB, a decode in which 0x2800000c
+    /// aliases 0x2000000c, and its data test failed at 0x2000000c.
+    #[test]
+    fn ip28_128_mb_bank_answers_the_prom_probe() {
+        use crate::dev::eeprom_93c56::Eeprom93c56;
+        use parking_lot::Mutex;
+        const MB: u32 = 1 << 20;
+        let mc = MemoryController::new_for_profile(
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [128, 128, 0, 0], true,
+        );
+        let phys = Physical::new(vec![RamBank::new(128), RamBank::new(128), RamBank::new(1), RamBank::new(1)]);
+        let mut outside = Vec::new();
+        let mut place = |memcfg0: u32| {
+            let addrs = mc.parse_memcfg(memcfg0, 0);
+            for (i, a) in addrs.iter().enumerate() {
+                if let Some((_, mask, _, _)) = *a { phys.banks()[i].set_addr_mask(mask); }
+            }
+            let (plan, out) = plan_bank_slots(&addrs, &outside);
+            outside = out;
+            apply_bank_plan(&phys, &plan);
+        };
+        let rd = |a: u32| phys.read32(a as u64).data;
+        let wr = |a: u32, v: u32| assert_eq!(phys.write32(a as u64, v), BUS_OK);
+
+        // BNK clear: the first subbank alone, every 64 MB.
+        place(0x3f20_0000);
+        wr(0x2000_0000, 0xaaaa_0000);
+        assert_eq!(rd(0x2400_0000), 0xaaaa_0000);
+        assert_eq!(rd(0x3000_0000), 0xaaaa_0000);
+
+        // BNK set: the second subbank 256 MB up, mirrored at 64 MB, and
+        // distinct from the first. It is the bank's second half.
+        place(0x7f20_0000);
+        wr(0x3000_0000, 0xbbbb_0000);
+        assert_eq!(rd(0x2000_0000), 0xaaaa_0000, "the second subbank is not the first");
+        assert_eq!(rd(0x2400_0000), 0xaaaa_0000);
+        assert_eq!(rd(0x3400_0000), 0xbbbb_0000);
+        assert_eq!(phys.banks()[0].read32(64 * MB as u64).data, 0xbbbb_0000);
+
+        // Settled: 128 MB with no alias inside it, bank 1 straight after.
+        place(0x6720_6728);
+        for a in (0x2000_000c..0x3000_0000u32).step_by(MB as usize) { wr(a, a); }
+        for a in (0x2000_000c..0x3000_0000u32).step_by(MB as usize) { assert_eq!(rd(a), a, "{a:#x}"); }
+        wr(0x2000_000c, 0);
+        wr(0x2800_000c, 1);
+        assert_eq!(rd(0x2000_000c), 0);
+        assert_eq!(phys.banks()[1].read32(0xc).data, 1);
+    }
+
     /// The bitmap must never claim a region that contains MMIO — otherwise the
     /// CPU would take the direct path into a device aperture.
     #[test]
@@ -654,7 +734,7 @@ mod ppmem_tests {
         ];
         let space = PpMemSpace::over(&banks).expect("reserve window");
         for (i, entry) in two_128mb_banks().iter().enumerate() {
-            let Some((base, mask, limit)) = *entry else { continue };
+            let Some((base, mask, limit, _)) = *entry else { continue };
             space
                 .map_bank(i, base as u64, limit as u64, (mask as u64) + 1)
                 .unwrap();
@@ -683,8 +763,8 @@ mod bank_plan_tests {
     const MB: u32 = 1 << 20;
     const SLOTS_PER_128MB: usize = (128 * MB >> SLOT_SHIFT) as usize;
 
-    fn bank(base: u32, size: u32) -> Option<(u32, u32, u32)> {
-        Some((base, size - 1, size))
+    fn bank(base: u32, size: u32) -> Option<BankPlacement> {
+        Some((base, size - 1, size, 0))
     }
 
     /// The decode table in miniature: apply a plan the way `remap_banks` does and
