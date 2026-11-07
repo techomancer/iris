@@ -69,6 +69,11 @@ struct MemoryControllerState {
     dma_irq: Option<IrqLine>,
 }
 
+/// Where one RAM bank answers after a MEMCFG write:
+/// `(base, addr_mask, limit, subbank_span)`. See
+/// [`MemoryController::memcfg_bank_info`].
+pub type BankPlacement = (u32, u32, u32, u32);
+
 #[derive(Clone)]
 pub struct MemoryController {
     state: Arc<Mutex<MemoryControllerState>>,
@@ -85,9 +90,9 @@ pub struct MemoryController {
     /// Actual SIMM sizes in MB for each bank (index 0..3). Used by parse_memcfg to
     /// derive addr_mask (for aliasing) and limit (for device_map range).
     ram_sizes: Arc<[u32; 4]>,
-    /// Invoked on every MEMCFG write with per-bank (base, addr_mask, limit) triples.
+    /// Invoked on every MEMCFG write with each bank's placement.
     /// None = bank invalid/empty.
-    memcfg_callback: Arc<OnceLock<Box<dyn Fn([Option<(u32, u32, u32)>; 4]) + Send + Sync>>>,
+    memcfg_callback: Arc<OnceLock<Box<dyn Fn([Option<BankPlacement>; 4]) + Send + Sync>>>,
     /// Channel to send async machine events (HardReset, PowerOff) to the machine thread.
     event_tx: Arc<OnceLock<mpsc::SyncSender<MachineEvent>>>,
     /// Set when `mc vdma on` is active; gates the per-transfer logging in dma_worker.
@@ -253,7 +258,7 @@ impl MemoryController {
         let _ = self.phys.set(phys);
     }
 
-    pub fn set_memcfg_callback(&self, cb: Box<dyn Fn([Option<(u32, u32, u32)>; 4]) + Send + Sync>) {
+    pub fn set_memcfg_callback(&self, cb: Box<dyn Fn([Option<BankPlacement>; 4]) + Send + Sync>) {
         let _ = self.memcfg_callback.set(cb);
     }
 
@@ -325,13 +330,15 @@ impl MemoryController {
     fn memcfg_size_rank_at(shift: u32, size_mb: u32) -> Option<(u32, u32)> {
         if shift == 24 {
             // 16 MB granule. All five size bits are usable: field 31
-            // describes a 512 MB bank. POST sizes it as two 256 MB
-            // subbanks, so BNK must participate in alias detection.
+            // describes a 512 MB bank. The MC specification's size table
+            // makes every other size two subbanks (fields 1, 7 and 31), and
+            // the IP28 PROM sizes 32, 128 and 512 MB banks that way: it finds
+            // the subbank with BNK clear and the second one with BNK set.
             return match size_mb {
                 16  => Some((0,  0)),
-                32  => Some((1,  0)),
+                32  => Some((1,  1)),
                 64  => Some((3,  0)),
-                128 => Some((7,  0)),
+                128 => Some((7,  1)),
                 256 => Some((15, 0)),
                 512 => Some((31, 1)),
                 _   => None,
@@ -368,13 +375,21 @@ impl MemoryController {
         )
     }
 
-    pub fn memcfg_bank_info(half: u16, size_mb: u32) -> Option<(u32, u32, u32)> {
+    pub fn memcfg_bank_info(half: u16, size_mb: u32) -> Option<BankPlacement> {
         Self::memcfg_bank_info_at(22, half, size_mb)
     }
 
     /// `memcfg_bank_info` with the granule passed in. See
     /// [`memcfg_size_rank_at`](Self::memcfg_size_rank_at).
-    fn memcfg_bank_info_at(shift: u32, half: u16, size_mb: u32) -> Option<(u32, u32, u32)> {
+    ///
+    /// The fourth value, `subbank_span`, is nonzero when BNK places a
+    /// two-subbank bank's subbanks `subbank_span` bytes apart and that is not
+    /// the length of one installed subbank. Each subbank then answers in its
+    /// own span, mirrored at its own size, which `addr_mask` cannot say. The
+    /// IP28 PROM's POST writes such a value (BNK with the largest size field,
+    /// 0x7f20) while it sizes a bank. Only the 16 MB-granule rows describe
+    /// real subbank sizes, so IP22/IP24 always get 0.
+    fn memcfg_bank_info_at(shift: u32, half: u16, size_mb: u32) -> Option<BankPlacement> {
         if size_mb == 0 { return None; }
         if (half >> 13) & 1 == 0 { return None; }
 
@@ -394,7 +409,9 @@ impl MemoryController {
         // BNK=1 (subbank/walkingbit): wrap at full bank size so both ranks are independent
         let addr_mask = if conf_rank == 0 { minus_size - 1 } else { plus_size - 1 };
         let limit = conf_size << (conf_rank & simm_rank);
-        Some((base, addr_mask, limit))
+        let subbank_span =
+            if shift == 24 && conf_rank & simm_rank == 1 && conf_size != minus_size { conf_size } else { 0 };
+        Some((base, addr_mask, limit, subbank_span))
     }
 
     /// Map the RAM banks at their conventional bases exactly as the PROM's POST
@@ -417,9 +434,9 @@ impl MemoryController {
         self.write32((MC_BASE + REG_MEMCFG0) as u64, memcfg0) == BUS_OK
     }
 
-    /// Parse MEMCFG0/1 registers into 4 bank (base, addr_mask, limit) triples using the
+    /// Parse MEMCFG0/1 registers into 4 bank placements using the
     /// configured ram_sizes. Returns None for invalid/empty banks.
-    pub fn parse_memcfg(&self, memcfg0: u32, memcfg1: u32) -> [Option<(u32, u32, u32)>; 4] {
+    pub fn parse_memcfg(&self, memcfg0: u32, memcfg1: u32) -> [Option<BankPlacement>; 4] {
         let halves = [
             (memcfg0 >> 16) as u16,    // bank 0: high half of MEMCFG0
             (memcfg0 & 0xFFFF) as u16, // bank 1: low  half of MEMCFG0
@@ -1509,12 +1526,12 @@ mod tests {
         assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2000_0000, 64), Some(h0));
         assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2400_0000, 64), Some(h1));
 
-        let (base0, mask0, limit0) = MemoryController::memcfg_bank_info_at(24, h0, 64).unwrap();
+        let (base0, mask0, limit0, _) = MemoryController::memcfg_bank_info_at(24, h0, 64).unwrap();
         assert_eq!(base0, 0x2000_0000);
         assert_eq!(limit0, 64 << 20, "a 64 MB bank must not claim more");
         assert_eq!(mask0, (64 << 20) - 1, "and must alias within its own 64 MB");
 
-        let (base1, _, limit1) = MemoryController::memcfg_bank_info_at(24, h1, 64).unwrap();
+        let (base1, _, limit1, _) = MemoryController::memcfg_bank_info_at(24, h1, 64).unwrap();
         assert_eq!(base1, 0x2400_0000);
         assert_eq!(base1, base0 + limit0, "banks 0 and 1 are contiguous, not overlapping");
         assert_eq!(limit1, 64 << 20);
@@ -1530,7 +1547,7 @@ mod tests {
         for bank in 0..4 {
             let half = MemoryController::encode_memcfg_half_at(24, next, 64)
                 .unwrap_or_else(|| panic!("bank {bank} did not encode"));
-            let (base, _, limit) = MemoryController::memcfg_bank_info_at(24, half, 64).unwrap();
+            let (base, _, limit, _) = MemoryController::memcfg_bank_info_at(24, half, 64).unwrap();
             assert_eq!(base, next, "bank {bank} base");
             assert_eq!(limit, 64 << 20, "bank {bank} limit");
             next = base + limit;
@@ -1546,14 +1563,14 @@ mod tests {
         );
         // Real POST probes 0x3f20, then 0x7f20. With BNK clear,
         // the second subbank aliases the first; setting BNK exposes both.
-        let (base, mask, limit) = mc.parse_memcfg(0x3f20_0000, 0)[0].unwrap();
-        assert_eq!((base, mask, limit), (0x2000_0000, 0x0fff_ffff, 0x2000_0000));
+        let (base, mask, limit, span) = mc.parse_memcfg(0x3f20_0000, 0)[0].unwrap();
+        assert_eq!((base, mask, limit, span), (0x2000_0000, 0x0fff_ffff, 0x2000_0000, 0));
         let bank = PpMemory::new(512);
         bank.set_addr_mask(mask);
         bank.write32(base as u64, 0x1234_5678);
         assert_eq!(bank.read32(base as u64 + (256 << 20)).data, 0x1234_5678);
-        let (_, mask, limit) = mc.parse_memcfg(0x7f20_0000, 0)[0].unwrap();
-        assert_eq!((mask, limit), (0x1fff_ffff, 0x2000_0000));
+        let (_, mask, limit, span) = mc.parse_memcfg(0x7f20_0000, 0)[0].unwrap();
+        assert_eq!((mask, limit, span), (0x1fff_ffff, 0x2000_0000, 0), "256 MB subbanks 256 MB apart are contiguous");
         bank.set_addr_mask(mask);
         bank.write32(base as u64 + (256 << 20), 0x8765_4321);
         assert_eq!(bank.read32(base as u64).data, 0x1234_5678);
@@ -1566,11 +1583,39 @@ mod tests {
         let (m0, m1) = mc.get_memcfg();
         assert_eq!(m1, 0, "IP28 must leave the other banks to the PROM");
         assert_eq!(mc.parse_memcfg(m0, m1), [
-            Some((0x2000_0000, 0x1fff_ffff, 0x2000_0000)),
-            Some((0x4000_0000, 0x1fff_ffff, 0x2000_0000)),
+            Some((0x2000_0000, 0x1fff_ffff, 0x2000_0000, 0)),
+            Some((0x4000_0000, 0x1fff_ffff, 0x2000_0000, 0)),
             None, None,
         ]);
         assert_eq!(MemoryController::memcfg_bank_info_at(22, 0x3f20, 512), None);
+    }
+
+    /// A 128 MB IP28 bank is two 64 MB subbanks. The PROM sizes a subbank
+    /// with BNK clear (0x3f20) and looks for the second one with BNK set
+    /// (0x7f20), then writes 0x6720: size field 7 with BNK, as the MC
+    /// specification lists the two-subbank sizes. Decoded as one 128 MB
+    /// subbank, the PROM sized the bank as 256 MB and its data test failed.
+    #[test]
+    fn ip28_128_mb_banks_are_two_subbanks() {
+        assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2000_0000, 128), Some(0x6720));
+        assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2800_0000, 128), Some(0x6728));
+        assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2000_0000, 32), Some(0x6120));
+        let mc = MemoryController::new_for_profile(
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [128, 128, 0, 0], true,
+        );
+        // BNK clear: only the first subbank answers, every 64 MB.
+        let (base, mask, limit, span) = mc.parse_memcfg(0x3f20_0000, 0)[0].unwrap();
+        assert_eq!((base, mask, limit, span), (0x2000_0000, 0x03ff_ffff, 0x2000_0000, 0));
+        // BNK set with the largest size: the subbanks answer 256 MB apart,
+        // each mirrored at 64 MB. One mask cannot say that; the span does.
+        let (_, mask, limit, span) = mc.parse_memcfg(0x7f20_0000, 0)[0].unwrap();
+        assert_eq!((mask, limit, span), (0x07ff_ffff, 0x2000_0000, 0x1000_0000));
+        // What the PROM settles on: 128 MB, contiguous, bank 1 straight after.
+        assert_eq!(mc.parse_memcfg(0x6720_6728, 0), [
+            Some((0x2000_0000, 0x07ff_ffff, 0x0800_0000, 0)),
+            Some((0x2800_0000, 0x07ff_ffff, 0x0800_0000, 0)),
+            None, None,
+        ]);
     }
 
     /// The IP22 encodings are unchanged by the granule work.
@@ -1580,7 +1625,7 @@ mod tests {
             assert_eq!(MemoryController::memcfg_size_rank_at(22, size_mb), Some(want), "{size_mb} MB");
         }
         let half = MemoryController::encode_memcfg_half_at(22, crate::ip22_bus::LOMEM_BASE, 64).unwrap();
-        let (base, _, limit) = MemoryController::memcfg_bank_info_at(22, half, 64).unwrap();
+        let (base, _, limit, _) = MemoryController::memcfg_bank_info_at(22, half, 64).unwrap();
         assert_eq!(base, crate::ip22_bus::LOMEM_BASE);
         assert_eq!(limit, 64 << 20);
     }
