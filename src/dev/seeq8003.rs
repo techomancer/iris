@@ -679,10 +679,10 @@ impl Seeq8003 {
     }
 
     pub fn register_locks(self: &Arc<Self>) {
-        use crate::locks::register_lock_fn;
-        let me = self.clone(); register_lock_fn("seeq::state",             move || me.state.is_locked());
-        let me = self.clone(); register_lock_fn("seeq::net",               move || me.net.is_locked());
-        let me = self.clone(); register_lock_fn("seeq::nat_ctl::snapshot", move || me.net.try_lock().map_or(false, |n| n.nat.snapshot.is_locked()));
+        use crate::locks::register_mutex_fn;
+        register_mutex_fn("seeq::state", self, |s| s.state.is_locked());
+        register_mutex_fn("seeq::net", self, |s| s.net.is_locked());
+        register_mutex_fn("seeq::nat_ctl::snapshot", self, |s| s.net.try_lock().map_or(false, |n| n.nat.snapshot.is_locked()));
     }
 }
 

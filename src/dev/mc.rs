@@ -563,18 +563,14 @@ impl MemoryController {
     pub(crate) fn vdma_stage(&self) -> &Mutex<Box<[u64]>> { &self.vdma_stage }
 
     pub fn register_locks(&self) {
-        use crate::locks::register_lock_fn;
-        let giodma = self.giodma.clone();
-        register_lock_fn("mc::giodma_state", move || giodma.state.is_locked());
-        let state = self.state.clone();
-        register_lock_fn("mc::state",        move || state.is_locked());
-        let threads = self.threads.clone();
-        register_lock_fn("mc::threads",      move || threads.is_locked());
+        use crate::locks::{register_mutex, register_mutex_fn};
+        register_mutex_fn("mc::giodma_state", &self.giodma, |g| g.state.is_locked());
+        register_mutex("mc::state", &self.state);
+        register_mutex("mc::threads", &self.threads);
         // Held across REX3 bus calls (which take REX3's own locks and can
         // wait_idle), so it must be visible to the deadlock detector even
         // though only the MC-DMA thread ever acquires it.
-        let stage = self.vdma_stage.clone();
-        register_lock_fn("mc::vdma_stage",   move || stage.is_locked());
+        register_mutex("mc::vdma_stage", &self.vdma_stage);
     }
 }
 

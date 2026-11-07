@@ -546,13 +546,10 @@ impl Z85c30 {
         BUS_OK
     }
     pub fn register_locks(&self) {
-        use crate::locks::register_lock_fn;
-        let ch = self.channel_a.clone();
-        register_lock_fn("scc::channel_a", move || ch.0.is_locked());
-        let ch = self.channel_b.clone();
-        register_lock_fn("scc::channel_b", move || ch.0.is_locked());
-        let th = self.threads.clone();
-        register_lock_fn("scc::threads", move || th.is_locked());
+        use crate::locks::{register_mutex, register_mutex_fn};
+        register_mutex_fn("scc::channel_a", &self.channel_a, |c| c.0.is_locked());
+        register_mutex_fn("scc::channel_b", &self.channel_b, |c| c.0.is_locked());
+        register_mutex("scc::threads", &self.threads);
     }
 }
 

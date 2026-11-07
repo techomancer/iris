@@ -3810,29 +3810,18 @@ impl Rex3 {
     }
 
     pub fn register_locks(self: &Arc<Self>) {
-        use crate::locks::register_lock_fn;
-        let r = self.clone();
-        register_lock_fn("rex3::dcb",              move || r.dcb.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::vc2",              move || r.vc2.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::xmap0",            move || r.xmap0.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::xmap1",            move || r.xmap1.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::cmap0",            move || r.cmap0.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::cmap1",            move || r.cmap1.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::processor_thread", move || r.processor_thread.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::refresh_thread",   move || r.refresh_thread.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::vblank_cb",        move || r.vblank_cb.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::renderer",         move || r.renderer.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::debug_state",      move || r.debug_state.is_locked());
+        use crate::locks::register_mutex_fn;
+        register_mutex_fn("rex3::dcb", self, |r| r.dcb.is_locked());
+        register_mutex_fn("rex3::vc2", self, |r| r.vc2.is_locked());
+        register_mutex_fn("rex3::xmap0", self, |r| r.xmap0.is_locked());
+        register_mutex_fn("rex3::xmap1", self, |r| r.xmap1.is_locked());
+        register_mutex_fn("rex3::cmap0", self, |r| r.cmap0.is_locked());
+        register_mutex_fn("rex3::cmap1", self, |r| r.cmap1.is_locked());
+        register_mutex_fn("rex3::processor_thread", self, |r| r.processor_thread.is_locked());
+        register_mutex_fn("rex3::refresh_thread", self, |r| r.refresh_thread.is_locked());
+        register_mutex_fn("rex3::vblank_cb", self, |r| r.vblank_cb.is_locked());
+        register_mutex_fn("rex3::renderer", self, |r| r.renderer.is_locked());
+        register_mutex_fn("rex3::debug_state", self, |r| r.debug_state.is_locked());
         crate::locks::register_mutex("rex3::screen", &self.screen);
     }
 }

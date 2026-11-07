@@ -1019,12 +1019,12 @@ impl Hal2 {
     }
 
     pub fn register_locks(self: &Arc<Self>) {
-        use crate::locks::register_lock_fn;
-        let me = self.clone(); register_lock_fn("hal2::state",    move || me.state.is_locked());
-        let me = self.clone(); register_lock_fn("hal2::ca_state", move || me.ca_state.is_locked());
-        let me = self.clone(); register_lock_fn("hal2::cb_state", move || me.cb_state.is_locked());
-        let me = self.clone(); register_lock_fn("hal2::at_state", move || me.at_state.is_locked());
-        let me = self.clone(); register_lock_fn("hal2::ar_state", move || me.ar_state.is_locked());
+        use crate::locks::register_mutex_fn;
+        register_mutex_fn("hal2::state",    self, |h| h.state.is_locked());
+        register_mutex_fn("hal2::ca_state", self, |h| h.ca_state.is_locked());
+        register_mutex_fn("hal2::cb_state", self, |h| h.cb_state.is_locked());
+        register_mutex_fn("hal2::at_state", self, |h| h.at_state.is_locked());
+        register_mutex_fn("hal2::ar_state", self, |h| h.ar_state.is_locked());
     }
 }
 

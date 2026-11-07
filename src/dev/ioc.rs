@@ -677,14 +677,12 @@ impl Ioc {
     }
 
     pub fn register_locks(&self) {
-        use crate::locks::register_lock_fn;
-        let s = self.state.clone();
-        register_lock_fn("ioc::state", move || s.is_locked());
+        use crate::locks::{register_mutex, register_mutex_fn};
+        register_mutex("ioc::state", &self.state);
         // SCC (Z85c30) channels
         self.scc.register_locks();
         // PS/2
-        let ps2 = self.ps2.clone();
-        register_lock_fn("ps2::state", move || ps2.is_state_locked());
+        register_mutex_fn("ps2::state", &self.ps2, |p| p.is_state_locked());
     }
 }
 

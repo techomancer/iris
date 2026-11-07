@@ -982,6 +982,11 @@ impl Drop for OctaneMachine {
             slot.lock().0 = MachineRef::null();
         }
         self.stop_cpus();
+        // The compile pool's requests point into the memory freed below.
+        #[cfg(feature = "jitv2")]
+        for c in &self.cpus {
+            crate::cpu::jitv2::Jitv2::stop_for_drop(&c.jitv2(), || self.stop_cpus());
+        }
         self.stop_devices();
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
