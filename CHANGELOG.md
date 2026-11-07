@@ -51,6 +51,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   Crossbow port with a PCI bus, interrupts to HEART and DMA through the
   Crossbow ([docs/pci.md](docs/pci.md#option-boards-in-xio-slots)).
 
+### NVM Express
+
+- `[nvme]` puts an NVM Express controller in the O2's "PCI option" slot or in
+  a slot of an Octane's PCI module or shoehorn (`[[xio_board]]`), directly or
+  behind a PCI-to-PCI bridge (`bridge = true`). One namespace backed by a raw
+  or CHD image, optionally copy-on-write; pin interrupts; saved in snapshots
+  with the other disks ([docs/nvme.md](docs/nvme.md)).
+
 ### R10000 family fixes, R12000 and R14000
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
