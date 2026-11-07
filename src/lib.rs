@@ -182,6 +182,8 @@ pub mod ip32_machine;
 /// The SGI Octane (IP30): its bus and machine -- see `docs/octane-ip30-address-map.md`.
 pub mod ip30;
 pub mod ip30_machine;
+/// Fuel has an IP34 board and uses the IP35 software platform and processor views.
+pub mod ip35;
 pub mod machine_state;
 pub mod platform;
 pub mod physical;
