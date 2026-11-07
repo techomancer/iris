@@ -34,6 +34,7 @@ use crate::dev::sflash::{CfiFlash, FLASH_SIZE};
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::Xbow;
+use crate::dev::xio_pci::XioPciBoard;
 use crate::hptimer::TimerManager;
 use crate::ip30::{
     widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
@@ -44,7 +45,7 @@ use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
 use crate::snapshot::{field, ChunksManifest, Manifest, Snapshot, StateTable, SCHEMA_VERSION};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
-use crate::xtalk::Upstream;
+use crate::xtalk::{HostPort, Upstream};
 
 /// The PROM image tried when `prom` is left at the shared default, named
 /// as IRIX ships it in /usr/cpu/firmware. The Octane has no embedded PROM.
@@ -129,6 +130,9 @@ pub struct OctaneMachine {
     /// The console UART's in-process host end in CI mode (`--ci`).
     ci_serial: Option<Arc<crate::dev::serial_host::CiSerialBackend>>,
     pub bridge: Arc<Bridge>,
+    /// The option boards in XIO slots (`[[xio_board]]`), each a Bridge of its
+    /// own, in config order.
+    pub xio_boards: Vec<XioPciBoard>,
     pub ioc3: Arc<Ioc3>,
     pub scsi: [Arc<Isp1040>; 2],
     eth: Arc<Ioc3Eth>,
@@ -215,7 +219,9 @@ impl OctaneMachine {
         heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", module, 0x5145_4d55_5500));
 
         let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
-        let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
+        let xio_widgets = cfg.xio_widgets()?;
+        let xio_links = xio_widgets.iter().fold(0u16, |m, w| m | 1 << w);
+        let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link | xio_links));
         xbow.connect_host(crate::ip30::HEART_HOST, heart.clone());
 
         // The onboard Bridge: memory and interrupts through HEART, the boot
@@ -237,6 +243,17 @@ impl OctaneMachine {
         // DMA reaches only widgets the Crossbow has a live link to.
         let links = xbow.clone();
         bridge.set_link_alive(Box::new(move |w| links.carries(w)));
+
+        // Option boards: each a Bridge on its own port, reaching memory and
+        // HEART as the onboard one does, over the links the Crossbow has up.
+        let xio_boards: Vec<XioPciBoard> = cfg.xio_board.iter().zip(&xio_widgets).map(|(b, &w)| {
+            let up = xbow.upstream(vec![HostPort::new(crate::ip30::HEART_HOST, mem.clone(), heart.clone())]);
+            let board = XioPciBoard::new(b.kind, w, up);
+            let links = xbow.clone();
+            board.bridge().set_link_alive(Box::new(move |w| links.carries(w)));
+            eprintln!("iris: {} in XIO slot {w}", b.kind.label());
+            board
+        }).collect();
 
         // The status bar's activity bits, shared with the graphics board.
         let heartbeat = Arc::new(AtomicU64::new(0));
@@ -306,6 +323,10 @@ impl OctaneMachine {
         phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
         phys.attach_long_window(WIDGET_BRIDGE, bridge.long_window());
+        for b in &xio_boards {
+            phys.attach_widget(b.widget(), b.bridge().clone(), false);
+            phys.attach_long_window(b.widget(), b.bridge().long_window());
+        }
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);
         }
@@ -343,10 +364,21 @@ impl OctaneMachine {
                 p.set_widget_runs(WIDGET_BRIDGE, runs);
             }
         }));
-        let weak = Arc::downgrade(&bridge);
+        // Every option board's runs reach the processor over its own widget.
+        for b in &xio_boards {
+            let (weak, bridge_weak, w) = (Arc::downgrade(&phys), Arc::downgrade(b.bridge()), b.widget());
+            b.bridge().bus().on_bar_mappings(Box::new(move |runs| {
+                if let (Some(p), Some(b)) = (weak.upgrade(), bridge_weak.upgrade()) {
+                    let runs = runs.iter().map(|r| (r.cpu..r.cpu + r.len, b.bar_device(r))).collect();
+                    p.set_widget_runs(w, runs);
+                }
+            }));
+        }
+        let mut resettable: Vec<(u8, std::sync::Weak<Bridge>)> = vec![(WIDGET_BRIDGE, Arc::downgrade(&bridge))];
+        resettable.extend(xio_boards.iter().map(|b| (b.widget(), Arc::downgrade(b.bridge()))));
         xbow.on_link_reset(Box::new(move |w| {
-            if w == WIDGET_BRIDGE {
-                if let Some(b) = weak.upgrade() {
+            if let Some((_, b)) = resettable.iter().find(|(p, _)| *p == w) {
+                if let Some(b) = b.upgrade() {
                     b.link_reset();
                 }
             }
@@ -486,6 +518,9 @@ impl OctaneMachine {
         heart.register_locks();
         xbow.register_locks();
         bridge.register_locks();
+        for b in &xio_boards {
+            b.bridge().register_locks();
+        }
         flash.register_locks();
         ioc3.register_locks();
         eth.register_locks();
@@ -527,6 +562,7 @@ impl OctaneMachine {
             monitor_port,
             ci_serial,
             bridge,
+            xio_boards,
             ioc3,
             scsi,
             eth,
@@ -709,6 +745,10 @@ impl OctaneMachine {
         }
         self.bridge.reset();
         self.bridge.reset_pci();
+        for b in &self.xio_boards {
+            b.bridge().reset();
+            b.bridge().reset_pci();
+        }
         self.ioc3.power_on();
         self.eth.power_on();
         for c in &self.scsi {
@@ -818,7 +858,12 @@ impl OctaneMachine {
     /// Every device's state but the CPU's. Called with the machine stopped.
     fn save_board(&self) -> toml::Value {
         let lines = self.flash_lines.iter().map(|f| f.save_state()).collect();
-        StateTable::new()
+        let mut t = StateTable::new();
+        // Only with boards, so a machine without them saves what it always did.
+        if !self.xio_boards.is_empty() {
+            t.value("xio_boards", toml::Value::Array(self.xio_boards.iter().map(|b| b.bridge().save_state()).collect()));
+        }
+        t
             .value("ioc3", self.ioc3.save_state())
             .value("eth", self.eth.save_state())
             .value("scsi0", self.scsi[0].save_state())
@@ -850,6 +895,13 @@ impl OctaneMachine {
             f.load_state(saved)?;
         }
         load("bridge", &*self.bridge)?;
+        if !self.xio_boards.is_empty() {
+            let boards = field(v, "xio_boards")?.as_array().filter(|l| l.len() == self.xio_boards.len())
+                .ok_or("xio_boards: not one entry per option board")?;
+            for (b, saved) in self.xio_boards.iter().zip(boards) {
+                b.bridge().load_state(saved).map_err(|e| format!("xio_boards: {e}"))?;
+            }
+        }
         load("xbow", &*self.xbow)?;
         Self::sync_links(&self.phys, &self.xbow);
         load("heart", &*self.heart)?;
@@ -1347,6 +1399,76 @@ mod snapshot_tests {
         let mut m = OctaneMachine::new(&cfg).expect("an Octane");
         m.saves = dir.join("saves");
         m
+    }
+
+    /// An Octane with shoehorns: each board's Crossbow link comes up and its
+    /// Bridge answers on its own port, a function in its slot is reached by a
+    /// configuration read through the processor's address, its interrupt
+    /// arrives at HEART and its DMA lands in RAM. Ports with nothing fitted
+    /// stay down.
+    #[test]
+    fn option_boards_are_fitted_on_their_ports() {
+        use crate::config::{XioBoardConfig, MachineProfile};
+        use crate::dev::bridge::{reg, CFG0_BASE};
+        use crate::dev::xio_pci::Kind;
+        use crate::pci::testing::TestCard;
+        use crate::pci::{Bar, PciFunction, PCI_INTA};
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("xio-boards");
+            let prom = empty_prom(&dir);
+            let m = machine_with(&prom, &dir, |cfg| {
+                assert_eq!(cfg.machine.profile, MachineProfile::OctaneIp30);
+                cfg.xio_board = vec![
+                    XioBoardConfig { kind: Kind::Shoehorn, widget: None },
+                    XioBoardConfig { kind: Kind::Shoehorn, widget: None },
+                    XioBoardConfig { kind: Kind::Shoehorn, widget: Some(9) },
+                ];
+            });
+            let ports: Vec<u8> = m.xio_boards.iter().map(|b| b.widget()).collect();
+            assert_eq!(ports, [10, 12, 9], "one takes 10, the next 12, and one asked for 9");
+            for w in 9..=13u8 {
+                assert_eq!(m.xbow.carries(w), ports.contains(&w), "link to port {w}");
+            }
+            let word = |w: u8, off: u32| {
+                let r = m.phys.phys.read32(widget_small_base(w) + u64::from(off));
+                r.is_ok().then_some(r.data)
+            };
+            for &w in &ports {
+                let id = word(w, 4).expect("the Bridge answers on its port");
+                assert_eq!(id >> 12 & 0xffff, 0xc002, "port {w} reports a Bridge");
+            }
+            assert_eq!(word(11, 4), None, "nothing answers on port 11");
+            assert_eq!(word(13, 4), None, "nor on 13");
+
+            // One bank of memory at 0x2000_0000, as the PROM's descriptor
+            // places it.
+            m.ram.set_memcfg([0x8001_0000, 0, 0, 0]);
+            // A function in each board's first slot, through the processor.
+            for b in &m.xio_boards {
+                let card = TestCard::new([Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA);
+                let slot = b.kind().slots()[0];
+                b.attach(slot, card.clone()).unwrap();
+                let w = b.widget();
+                assert_eq!(word(w, CFG0_BASE + u32::from(slot) * 0x1000), Some(0x5678_1234), "port {w}: the card answers");
+                assert_eq!(word(w, CFG0_BASE), None, "port {w}: device 0 is empty");
+
+                // Its interrupt, as HEART's vector 20 + port.
+                let vector = 20 + u32::from(w);
+                let set = |off: u32, v: u32| assert_eq!(m.phys.phys.write32(widget_small_base(w) + u64::from(off + 4), v), crate::traits::BUS_OK);
+                set(reg::INT_DEST_UPPER, u32::from(WIDGET_HEART) << 16);
+                set(reg::INT_DEST_LOWER, 0x80);
+                set(reg::int_host(u32::from(slot)), vector);
+                set(reg::INT_ENABLE, 1 << slot);
+                assert_eq!(m.heart.pending() >> vector & 1, 0);
+                card.state().irq().unwrap().set(true);
+                assert_eq!(m.heart.pending() >> vector & 1, 1, "port {w}: the card's pin sets HEART's bit {vector}");
+
+                // Its DMA, through the direct map to HEART, into RAM.
+                set(reg::DIRECT_MAP, u32::from(WIDGET_HEART) << 20 | crate::dev::bridge::DIRECT_ADD_512MB);
+                assert!(card.state().dma().unwrap().dma_write(0x8000_1000 + u64::from(w) * 16, &[1, 2, 3, 4]).is_ok());
+                assert_eq!(m.ram.dma_view().read32(0x2000_1000 + u64::from(w) * 16).data, u32::from_be_bytes([4, 3, 2, 1]), "port {w}: DMA reached memory");
+            }
+        }).unwrap().join().unwrap();
     }
 
     fn digest(m: &OctaneMachine) -> (CpuStateDigest, blake3::Hash) {

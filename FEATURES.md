@@ -384,6 +384,17 @@ is the internal bus, 1 the external) and `[graphics] board`. See [the Octane gui
 |---|---|---|
 | `octane.flash` | unset | Boot flash file, keeping the PROM's records between runs. Created from `prom` when missing and then used as it is, so delete it after changing `prom`; a file of another size is refused. Unset, the flash is in memory and every start is from `prom`. |
 
+### [[xio_board]]
+
+An option board in one of the Octane's XIO slots, each with a Bridge and a PCI
+bus of its own; see [docs/pci.md](docs/pci.md#option-boards-in-xio-slots).
+Octane only. The array takes one table per board.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `xio_board.kind` | required | `"pci-shoehorn"`: the single-slot XIO-to-PCI adapter, its slot PCI device 1. |
+| `xio_board.widget` | first free of 10, 12, 9, 11 | The XIO slot, Crossbow port 9 to 12. Not the one the graphics board is in (11 with `[graphics] board` set), and no two boards share one. |
+
 ### Hardware constraints and precedence
 
 On the Indy and Indigo2 bank values are 0, 8, 16, 32, 64, or 128 MB, and only
