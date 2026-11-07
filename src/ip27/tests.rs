@@ -86,3 +86,55 @@ fn hub_special_repeats_memory_and_the_flash_at_the_named_node_offsets_too() {
     }
     assert_eq!(special.read8(0x4000_0000).status, BUS_ERR, "nothing between the windows");
 }
+
+/// A view that answers every read with its address, as the Hub's
+/// node-qualified memory does for the Hub it names.
+struct Echo;
+impl BusDevice for Echo {
+    fn read64(&self, a: u64) -> BusRead64 {
+        BusRead64::ok(a)
+    }
+}
+
+#[test]
+fn cached_references_to_other_node_numbers_go_to_the_view() {
+    let mem = NodeMemory::new([64, 0, 0, 0]).unwrap();
+    mem.route_nodes(Arc::new(Echo));
+    let phys = mem.physical();
+    // Node zero's window is the node's own memory.
+    assert_eq!(phys.write64(0x1000, 0x55), BUS_OK);
+    assert_eq!(phys.read64(0x1000).data, 0x55);
+    // Every other node number reaches the view with the number still in the
+    // address.
+    assert_eq!(phys.read64(0x1_0000_1000).data, 0x1_0000_1000);
+    assert_eq!(phys.read64(0x7_0000_2000).data, 0x7_0000_2000);
+    assert_eq!(phys.read64(0xff_0000_3000).data, 0xff_0000_3000);
+}
+
+#[test]
+fn a_node_that_holds_another_number_sends_node_zero_beyond_the_cached_alias_to_the_view() {
+    let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
+    let phys = mem.physical();
+    let echo: Arc<dyn BusDevice> = Arc::new(Echo);
+    let zero = mem.node_zero();
+    mem.route_nodes(echo.clone());
+    let alias = 64 << 20;
+    assert_eq!(phys.write64(alias + 0x1000, 0x77), BUS_OK);
+    // Holding zero changes nothing.
+    zero.update(0, alias);
+    assert_eq!(phys.read64(alias + 0x1000).data, 0x77);
+    // Holding one: the alias stays local, memory beyond it reaches the view
+    // with node zero in the address.
+    zero.update(1, alias);
+    assert_eq!(phys.write64(0x1000, 0x55), BUS_OK);
+    assert_eq!(phys.read64(0x1000).data, 0x55);
+    assert_eq!(phys.read64(alias + 0x1000).data, alias + 0x1000);
+    // A larger alias keeps more of it local, a smaller one less.
+    zero.update(1, 96 << 20);
+    assert_eq!(phys.read64(alias + 0x1000).data, 0x77);
+    assert_eq!(phys.read64((96 << 20) + 0x1000).data, (96 << 20) + 0x1000);
+    // The number back to zero returns all of it.
+    zero.update(0, alias);
+    assert_eq!(phys.read64(alias + 0x1000).data, 0x77);
+    assert_eq!(phys.read64(0x1000).data, 0x55);
+}

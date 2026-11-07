@@ -284,6 +284,16 @@ struct Hooks {
     name: &'static str,
     cpu: Weak<dyn CpuDevice>,
     events: Sender<MachineEvent>,
+    /// Where a cached reference naming node zero goes, as the node's number
+    /// and cached alias set it.
+    zero: Arc<ip27::NodeZero>,
+    pi: Weak<crate::dev::hub_pi::HubPi>,
+}
+impl Hooks {
+    fn route(&self, number: u16) {
+        let calias = self.pi.upgrade().map_or(0, |pi| pi.calias_bytes());
+        self.zero.update(number, calias);
+    }
 }
 impl HubHooks for Hooks {
     fn cpu_enable(&self, slice: usize, enabled: bool) {
@@ -297,10 +307,12 @@ impl HubHooks for Hooks {
             cpu.as_device().signal(Signal::Reset(true));
         }
     }
+    fn cached_alias_changed(&self, bytes: u64) {
+        let number = self.zero.number();
+        self.zero.update(number, bytes);
+    }
     fn node_number_changed(&self, number: u16) {
-        if number != 0 {
-            crate::dlog!(LogModule::Hub, "{}: node number {number}: cached accesses still use node-relative offsets", self.name);
-        }
+        self.route(number);
     }
     fn machine_restart(&self) {
         let _ = self.events.send(MachineEvent::HardReset);
@@ -375,10 +387,10 @@ impl<B: Ip27Board> Ip27Machine<B> {
                 None => onewire.add(Box::new(w1::Ds2505::new(0x0b, serial, &[]))),
             }
             hub.md().set_onewire(onewire);
-            hub.set_space(Space::Memory, memory.physical().clone());
+            hub.set_space(Space::Memory, memory.home());
             hub.set_space(
                 Space::HubSpecial,
-                ip27::hub_special(memory.physical().clone(), &flash, memory.back_door(), memory.back_door()),
+                ip27::hub_special(memory.home(), &flash, memory.back_door(), memory.back_door()),
             );
             hub.set_space(Space::Io, hub.io_space());
             hub.set_space(Space::Special, Arc::new(Unmodelled("memory-special space")));
@@ -396,7 +408,14 @@ impl<B: Ip27Board> Ip27Machine<B> {
         for (node, spec) in parts.into_iter().zip(&specs) {
             let cpu = Self::build_cpu(cfg, &spec.module, &node, spec.hub.cpu_base, specs.len() > 1)?;
             node.hub.pi().set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
-            node.hub.set_hooks(Arc::new(Hooks { name: B::NAME, cpu: Arc::downgrade(&cpu), events: tx.clone() }));
+            let zero = node.memory.node_zero();
+            node.hub.set_hooks(Arc::new(Hooks {
+                name: B::NAME,
+                cpu: Arc::downgrade(&cpu),
+                events: tx.clone(),
+                zero,
+                pi: Arc::downgrade(node.hub.pi()),
+            }));
             node.hub.register_locks();
             cpu.register_locks();
             units.push(Unit { node, cpu });

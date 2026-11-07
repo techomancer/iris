@@ -578,6 +578,14 @@ macro_rules! view_access {
     };
 }
 impl BusDevice for View {
+    // A store-conditional to another node's memory has to be as atomic as
+    // one to the processor's own.
+    fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> {
+        self.run(a, |d, at| d.cas32(at, old, new)).flatten()
+    }
+    fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
+        self.run(a, |d, at| d.cas64(at, old, new)).flatten()
+    }
     view_access!(read8, write8, u8, BusRead8);
     view_access!(read16, write16, u16, BusRead16);
     view_access!(read32, write32, u32, BusRead32);
