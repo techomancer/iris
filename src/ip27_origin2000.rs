@@ -65,11 +65,11 @@ const fn slot_bits(node: usize) -> u8 {
     7 - node as u8
 }
 /// The Crossbow revision: 1.1, the earliest the kernel accepts.
-const XBOW_REVISION: u32 = 2;
+pub(crate) const XBOW_REVISION: u32 = 2;
 /// The BaseIO's Bridge revision.
-const BRIDGE_REVISION: u32 = 4;
+pub(crate) const BRIDGE_REVISION: u32 = 4;
 /// The Bridge input the BaseIO's IOC3 SuperIO interrupt is wired to.
-const SUPERIO_PIN: u8 = 4;
+pub(crate) const SUPERIO_PIN: u8 = 4;
 /// The BaseIO's PCI subsystem identification.
 const SUBSYS_BASEIO: u16 = 0xc302;
 
@@ -87,7 +87,7 @@ const MODULE_IDENTITY_SERIAL: u64 = 0x5145_4d55_4d00;
 
 /// The module management as the machine drives it: the adapters to reset
 /// with the module, and the outputs to drain.
-struct ModuleManagement {
+pub(crate) struct ModuleManagement {
     module: Arc<Origin2000Module>,
     adapters: usize,
 }
@@ -126,7 +126,7 @@ impl Origin2000 {
         bus
     }
 
-    fn ioc3_config(mac: [u8; 6]) -> Ioc3Config {
+    pub(crate) fn ioc3_config(mac: [u8; 6]) -> Ioc3Config {
         Ioc3Config {
             subsystem_id: SUBSYS_BASEIO,
             pci_policy: Default::default(),
@@ -144,13 +144,13 @@ impl Origin2000 {
 
     /// A file for node `node` beside the one the configuration names for the
     /// first.
-    fn per_node(path: &Option<String>, node: usize) -> Option<PathBuf> {
+    pub(crate) fn per_node(path: &Option<String>, node: usize) -> Option<PathBuf> {
         path.as_ref().map(|p| if node == 0 { PathBuf::from(p) } else { PathBuf::from(format!("{p}.{node}")) })
     }
 
     /// The module controller: one for the module, in front of every node's
     /// I2C controller.
-    fn controller(nodes: &[&Node], cfg: &MachineConfig) -> Result<Arc<ModuleManagement>, String> {
+    pub(crate) fn controller(nodes: &[&Node], cfg: &MachineConfig) -> Result<Arc<ModuleManagement>, String> {
         let store = ElscNvram::origin2000(MODULE_NUMBER, cfg.origin2000.controller_store.as_deref().map(Path::new))
             .map(Arc::new)
             .map_err(|e| format!("origin2000.controller_store: {e}"))?;

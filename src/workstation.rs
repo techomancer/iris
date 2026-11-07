@@ -46,6 +46,7 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
         crate::config::MachineProfile::OctaneIp30 => Ok(Box::new(crate::ip30_machine::OctaneMachine::new(&cfg)?)),
         crate::config::MachineProfile::Origin200Ip29 => Ok(Box::new(crate::ip27_machine::Origin200Machine::new(&cfg)?)),
         crate::config::MachineProfile::Origin2000Ip27 => Ok(Box::new(crate::ip27_origin2000::Origin2000Machine::new(&cfg)?)),
+        crate::config::MachineProfile::Onyx2Ip27 => Ok(Box::new(crate::ip27_onyx2::Onyx2Machine::new(&cfg)?)),
         _ => Ok(Box::new(Machine::new(cfg))),
     }
 }
