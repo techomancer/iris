@@ -7237,7 +7237,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     // The random index is determined by CP0.Random register
     fn exec_tlbwr(&mut self) -> ExecStatus {
         self.core.update_random();
-        let index = (self.core.cp0_random as usize) % self.tlb.num_entries();
+        // Random counts over the CPU model's entries, which a real TLB
+        // always has; an executor with no TLB has none. Skip as TLBWI does.
+        let index = self.core.cp0_random as usize;
+        if index >= self.tlb.num_entries() {
+            return self.handle_exec_complete();
+        }
         let entry = self.create_tlb_entry_from_cp0();
         self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);

@@ -3958,6 +3958,18 @@ mod tests {
         assert_eq!(entry.entry_hi, 0xDEADBEEF & EH_WM & !0x1000); // 0xDEADA0EF
     }
 
+    /// TLBWR on an executor with no TLB (PassthroughTlb has no entries)
+    /// writes nothing, as TLBWI does for an Index past the end. Random still
+    /// counts over the CPU model's entries, so taking it modulo the TLB's
+    /// size divided by zero.
+    #[test]
+    fn tlbwr_with_no_tlb_entries_writes_nothing() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_random = 10;
+        let instr_tlbwr = (OP_COP0 << 26) | (0x10 << 21) | 0x06;
+        assert_eq!(exec.exec(instr_tlbwr), EXEC_COMPLETE);
+    }
+
     #[test]
     fn test_cache() {
         let (mut exec, _) = create_executor();
