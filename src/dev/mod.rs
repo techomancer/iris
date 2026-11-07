@@ -36,6 +36,7 @@ pub mod serial_log;
 pub mod sflash;
 pub mod xbow;
 pub mod bridge;
+pub mod xio_pci;
 pub mod w1;
 
 pub mod camera;

@@ -585,6 +585,22 @@ impl VirtioSerialConfig {
     }
 }
 
+/// `[[xio_board]]`: an option board in one of the Octane's XIO slots. See
+/// `docs/pci.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XioBoardConfig {
+    pub kind: crate::dev::xio_pci::Kind,
+    /// The XIO slot, a Crossbow port from 9 to 12. Unset: the first of 10, 12,
+    /// 9 and 11 that nothing else holds (10 is where real Octanes have one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget: Option<u8>,
+}
+
+/// The Octane's four XIO slots, Crossbow ports 9 to 12, in the order a board
+/// with no slot named takes them.
+pub const OCTANE_XIO_SLOTS: [u8; 4] = [10, 12, 9, 11];
+
 /// Emulated SGI machine profile (hardware layout scaffold).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -2021,6 +2037,10 @@ pub struct MachineConfig {
     /// virtio-serial guest device (`[virtio_serial]`, `[[virtio_serial.port]]`).
     #[serde(default, skip_serializing_if = "VirtioSerialConfig::is_default")]
     pub virtio_serial: VirtioSerialConfig,
+
+    /// Option boards in the Octane's XIO slots (`[[xio_board]]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xio_board: Vec<XioBoardConfig>,
 }
 
 fn default_scsi_deferred_int() -> bool { true }
@@ -2237,6 +2257,7 @@ impl Default for MachineConfig {
             rtc_offset: RtcOffset::default(),
             ultra64: Ultra64Config::default(),
             virtio_serial: VirtioSerialConfig::default(),
+            xio_board: Vec::new(),
         }
     }
 }
@@ -2247,6 +2268,41 @@ fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::defau
 impl MachineConfig {
     /// `[virtio_serial]`: the ports it lists, and whether this machine has
     /// somewhere to put it.
+    /// `[[xio_board]]`: the Octane's XIO slots, each holding at most one board,
+    /// and not the one the graphics board is in. Returns each board's slot.
+    pub fn xio_widgets(&self) -> Result<Vec<u8>, String> {
+        if self.xio_board.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.machine.profile != MachineProfile::OctaneIp30 {
+            return Err("[[xio_board]] needs an Octane: it is the machine with XIO slots".into());
+        }
+        let graphics = (self.graphics_board() != GraphicsBoard::None).then_some(crate::ip30_machine::WIDGET_GFX);
+        let mut taken: Vec<u8> = Vec::new();
+        let mut out = vec![0u8; self.xio_board.len()];
+        // Named slots first, so a board with no slot takes one nothing names.
+        for (i, w) in self.xio_board.iter().enumerate().filter_map(|(i, b)| b.widget.map(|w| (i, w))) {
+            if !OCTANE_XIO_SLOTS.contains(&w) {
+                return Err(format!("[[xio_board]] widget {w} is not an Octane XIO slot (9 to 12)"));
+            }
+            if graphics == Some(w) {
+                return Err(format!("[[xio_board]] widget {w} holds the graphics board"));
+            }
+            if taken.contains(&w) {
+                return Err(format!("[[xio_board]] widget {w} is named twice"));
+            }
+            taken.push(w);
+            out[i] = w;
+        }
+        for (i, b) in self.xio_board.iter().enumerate().filter(|(_, b)| b.widget.is_none()) {
+            let w = OCTANE_XIO_SLOTS.into_iter().find(|w| !taken.contains(w) && graphics != Some(*w))
+                .ok_or_else(|| format!("[[xio_board]] a {} has no free XIO slot", b.kind.label()))?;
+            taken.push(w);
+            out[i] = w;
+        }
+        Ok(out)
+    }
+
     fn validate_virtio_serial(&self) -> Result<(), String> {
         let v = &self.virtio_serial;
         if !v.enabled {
@@ -2462,6 +2518,7 @@ impl MachineConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         self.validate_virtio_serial()?;
+        self.xio_widgets()?;
         self.cpu_part()?;
         self.machine.profile.accepts_cpus(self.machine.cpus)?;
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
@@ -3338,6 +3395,33 @@ mod export_tests {
         let err = indy(8).validate().unwrap_err();
         assert!(err.contains("SCSI ID 8") && err.contains("1–7"), "{err}");
         assert!(indy(0).validate().is_err(), "the controller is ID 0");
+    }
+
+    #[test]
+    fn xio_boards_take_distinct_octane_slots() {
+        let octane = |t: &str| -> MachineConfig {
+            let mut c: MachineConfig =
+                toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
+                    .expect("parse");
+            c.scsi.clear();
+            c
+        };
+        let shoehorn = "[[xio_board]]\nkind = \"pci-shoehorn\"\n";
+        assert_eq!(octane("").xio_widgets().unwrap(), Vec::<u8>::new());
+        assert_eq!(octane(&shoehorn.repeat(5)).validate().unwrap_err(), "[[xio_board]] a PCI shoehorn has no free XIO slot");
+        assert_eq!(octane(&shoehorn.repeat(4)).xio_widgets().unwrap(), [10, 12, 9, 11]);
+        assert_eq!(octane(&format!("{shoehorn}{shoehorn}widget = 10\n")).xio_widgets().unwrap(), [12, 10]);
+        assert!(octane(&format!("{shoehorn}widget = 13\n")).validate().unwrap_err().contains("not an Octane XIO slot"));
+        assert!(octane(&format!("{shoehorn}widget = 9\n{shoehorn}widget = 9\n")).validate().unwrap_err().contains("named twice"));
+        // The graphics board's slot is its own; with none fitted it is free.
+        let mut with_graphics = octane(&format!("{shoehorn}widget = 11\n"));
+        with_graphics.validate().expect("no graphics board in 11");
+        with_graphics.graphics.board = Some(GraphicsBoard::SolidImpact);
+        assert!(with_graphics.validate().unwrap_err().contains("holds the graphics board"));
+        // Only the Octane has XIO slots.
+        let mut o2 = octane(shoehorn);
+        o2.machine.profile = MachineProfile::O2Ip32;
+        assert!(o2.xio_widgets().unwrap_err().contains("needs an Octane"));
     }
 
     #[test]

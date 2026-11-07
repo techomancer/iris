@@ -94,6 +94,28 @@ through the 64 GB window, are not modelled. The external ATE SSRAM (`0x080000`)
 is not fitted on the Octane and reads as all ones, which is what the PROM
 expects when it sizes it.
 
+## Option boards in XIO slots
+
+An Octane takes boards that put a PCI bus on a spare XIO slot. Each is a
+Bridge (the onboard one's model) on its own Crossbow port, with its own bus,
+interrupt pins to HEART and DMA through the Crossbow's live links.
+`[[xio_board]]` fits them:
+
+```toml
+[[xio_board]]
+kind = "pci-shoehorn"    # one slot, PCI device 1
+# widget = 10            # a shoehorn's XIO slot, 9 to 12; unset: 10, then 12, 9, 11
+```
+
+The shoehorn is the single-slot XIO-to-PCI adapter: Bridge revision 4, one
+slot at device 1 whose INTA and INTB reach the board's Bridge pins 1 and 5, and
+a one-wire record naming it `XTALK_PCI` (part 030-1275-004, revision A). It does
+not use the slot the graphics board is in. Which of this is established and
+which inferred is in `src/dev/xio_pci.rs`: the slot number is established on
+the Origin 2000 and inferred on the Octane; the pins are inferred from OpenBSD
+and Linux; the Bridge revision is the Origin 2000's. A board's Bridge has no
+`pci` monitor command yet; the onboard Bridge's `pci` shows only its own bus.
+
 ## PCI-to-PCI bridges
 
 `PciToPciBridge` is a function with a type 1 header and a bus behind it. The

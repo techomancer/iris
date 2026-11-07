@@ -43,6 +43,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   straight to the function as in the device windows. IRIX 6.5.30 reads a
   BAR behind a PCI-to-PCI bridge there, which used to be an unmapped access.
 
+### Octane XIO option boards
+
+- `[[xio_board]]` fits a PCI shoehorn, the single-slot XIO-to-PCI adapter, in
+  one of the Octane's four XIO slots. It is a Bridge of its own on that
+  Crossbow port with a PCI bus of one slot (device 1), interrupts to HEART and
+  DMA through the Crossbow ([docs/pci.md](docs/pci.md#option-boards-in-xio-slots)).
+
 ### R10000 family fixes, R12000 and R14000
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
