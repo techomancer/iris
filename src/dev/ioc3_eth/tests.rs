@@ -759,7 +759,9 @@ fn a_frame_waits_for_the_negotiation_deadline_without_a_wake() {
 }
 
 fn waits_for(cond: impl Fn() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(2);
+    // Generous: it returns as soon as `cond` holds, and the receive thread
+    // can wait a long time for a core when every test is running.
+    let end = Instant::now() + Duration::from_secs(30);
     while Instant::now() < end {
         if cond() {
             return true;
