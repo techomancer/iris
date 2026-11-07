@@ -46,7 +46,7 @@ use super::consts::{cfifo, intr, ODSY_WORK_QUEUE_MAX};
 use super::interface::HostInterface;
 use super::worker::GAP;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::{Relaxed, SeqCst}};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{Relaxed, SeqCst}};
 use std::thread::JoinHandle;
 
 use crossbeam_utils::CachePadded;
@@ -126,6 +126,12 @@ struct Levels {
     words: AtomicU32,
     /// Stores pushed and not yet taken out.
     stores: AtomicU32,
+    /// Positions in the stream of stores: how many have ever been pushed,
+    /// and how many the board has run (retired or abandoned). A swap arm
+    /// notes the first; the GPU raster unit publishes how far behind the
+    /// second its submissions reach (`DisplayShared::covered`).
+    pushed: AtomicU64,
+    retired: AtomicU64,
 }
 
 pub(super) struct CommandFifo {
@@ -182,7 +188,7 @@ impl Default for CommandFifo {
             // place because the ring is too big for the stack.
             ring: unsafe { Box::new_zeroed().assume_init() },
             pop: Mutex::new(()),
-            levels: CachePadded::new(Levels { words: AtomicU32::new(0), stores: AtomicU32::new(0) }),
+            levels: CachePadded::new(Levels { words: AtomicU32::new(0), stores: AtomicU32::new(0), pushed: AtomicU64::new(0), retired: AtomicU64::new(0) }),
             threshold_6b2: CachePadded::new(AtomicU32::new(0)),
             running: CachePadded::new(AtomicBool::new(false)),
             asleep: CachePadded::new(AtomicBool::new(false)),
@@ -232,6 +238,17 @@ impl CommandFifo {
 
     pub fn pending(&self) -> bool {
         self.level() != 0
+    }
+
+    /// Stores ever pushed: the position in the stream after the last one.
+    pub fn pushed(&self) -> u64 {
+        self.levels.pushed.load(SeqCst)
+    }
+
+    /// Stores the board has run or abandoned: the position in the stream
+    /// its state reflects.
+    pub fn retired(&self) -> u64 {
+        self.levels.retired.load(SeqCst)
     }
 
     /// Whether the level is at or above the model's high-water threshold.
@@ -337,6 +354,7 @@ impl CommandFifo {
             self.levels.stores.fetch_sub(1, SeqCst);
             return false;
         }
+        self.levels.pushed.fetch_add(1, SeqCst);
         #[cfg(test)]
         if let Some(consumer) = self.test_after_ring_push.lock().take() {
             consumer(self, front);
@@ -383,6 +401,7 @@ impl CommandFifo {
         let words: u32 = ran.iter().map(QueuedStore::words).sum();
         let _c = self.pop.lock();
         self.ring.consume_n_at(0, n);
+        self.levels.retired.fetch_add(n as u64, SeqCst);
         // Publish the head with the run, so the room the counts below give
         // back is room the ring shows a producer too (has_room).
         self.ring.flush_head();
@@ -409,6 +428,7 @@ impl CommandFifo {
             let q = QueuedStore::from_entry(addr, value);
             self.levels.words.fetch_sub(q.words(), SeqCst);
             self.levels.stores.fetch_sub(1, SeqCst);
+            self.levels.retired.fetch_add(1, SeqCst);
         }
     }
 

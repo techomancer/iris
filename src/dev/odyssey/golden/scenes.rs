@@ -160,7 +160,7 @@ impl Ctx {
         op.clip.n = 1;
         op.clip.r[0] = ClipRect { x0: 0, y0: 0, x1: BENCH_W_MAX, y1: BENCH_H_MAX };
         self.board.gl_raster(&op);
-        self.board.raster_wait();
+        self.board.gpu_sync();
     }
 
     /// Draw one primitive through the board's own GL draw.

@@ -54,7 +54,10 @@ impl Board {
         // Registers that do not wait for the board's work live in the front
         // (interface.rs).
         if front_register(addr, size, true) {
-            self.front.lock().write(addr, value, size);
+            let mut f = self.front.lock();
+            // Where in the command stream this store falls, for a swap arm.
+            f.stream_pos = self.fifo.pushed();
+            f.write(addr, value, size);
             return;
         }
 
@@ -556,7 +559,9 @@ impl BoardLocks {
                 return Some(g);
             }
             self.raster.request_flush();
-            if !self.fifo.pending() && self.raster.pending() == 0 {
+            // The board's thread ends a slice after its last store
+            // (`work_step`'s GPU tick): idle means the slice is over too.
+            if !self.fifo.pending() && self.raster.pending() == 0 && !self.fifo.slice.load(Ordering::SeqCst) {
                 // SAFETY: as `bus_read`: the FIFO and the raster queue are
                 // empty, so the board's thread is idle, and no processor
                 // can push a store while `submit` is held.

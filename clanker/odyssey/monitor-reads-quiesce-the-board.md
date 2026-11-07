@@ -1,6 +1,6 @@
 # Monitor reads of VPro state quiesce the board; pixel reads go lock-free
 
-Status: design, 2026-11-02; pixel side updated 2026-11-04 for board memory.
+Status: design, 2026-11-02; pixel side updated 2026-11-04 for board memory, and 2026-11-07 for the GPU raster unit.
 Implemented in `src/dev/odyssey/debug.rs`.
 
 ## The problem
@@ -41,6 +41,13 @@ UB, not a stale number.
   through `SharedRegs` (atomics), exactly as the display thread does, so they
   never stall the guest. A pixel read under a draw in flight may be a frame
   stale, which is what a screenshot is anyway.
+- **On the GPU raster unit** (2026-11-07) board memory lives on the GPU and
+  `DisplayShared::vram` is only its mirror, current after a readback. So
+  there the pixel commands quiesce briefly to take one (`gpu_sync`) and read
+  the mirror as it is if the board stays busy; the state commands sync under
+  their guard. Without it `vpro shot` composed garbage and `vpro pix` showed
+  stale pixels. `quiesce` also waits for the board thread's slice to end,
+  since the GPU tick runs at its tail.
 
 ## Why not quiesce the pixel commands too
 

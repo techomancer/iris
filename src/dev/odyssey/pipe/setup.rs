@@ -411,7 +411,21 @@ impl Draw<'_> {
         };
         let rst = super::raster::RasterState { offset_steps: p.fill_steps, offset_fill: true, ..p.raster };
 
-        if let (Some(live), Some(ring)) = (self.live, p.ring.as_ref().filter(|_| p.shade)) {
+        if let Some(g) = p.gpu_unit() {
+            // The unit walks, textures and shades what its kernels cover; a
+            // fogged or user-clipped triangle is shaded here and its quads
+            // stored by the unit (emit()).
+            let tex = p.gpu_tex.as_deref().filter(|_| self.textured);
+            let simple = !p.shader.fog && self.xf.user_planes() == 0 && (tex.is_some() || !self.textured);
+            if simple {
+                if let Some((x0, y0, x1, y1)) = super::raster::walk_bounds(&rst, &ts.tri, Some((px0, py0, px1, py1))) {
+                    let (ox, oy) = (rst.ox, rst.oy);
+                    let bounds = (ox.wrapping_add(x0), oy.wrapping_add(y0), ox.wrapping_add(x1), oy.wrapping_add(y1));
+                    g.push_tri(&ts, ox, oy, bounds, rst.offset_steps, rst.depth_range, rst.depth_slack, p.gpu_words.0, p.gpu_words.1, p.gpu_slot.as_ref().expect("a slot with the unit"), tex, p.shader.specular);
+                }
+                return;
+            }
+        } else if let (Some(live), Some(ring)) = (self.live, p.ring.as_ref().filter(|_| p.shade)) {
             // The shader thread shades the quads in the ring, from the draw's
             // context and the triangle's record.
             live.capture(self);

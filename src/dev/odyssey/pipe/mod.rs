@@ -54,7 +54,19 @@ pub(crate) struct PipeDraw {
     pub shade: bool,
     /// Some quad of the draw went into the ring.
     pub used: std::cell::Cell<bool>,
+    /// The GPU raster unit, when the board draws on it and the draw's
+    /// planes are ones its kernels address, else null; the draw's slot on
+    /// it; and the raster enable and alpha-test words its triangle records
+    /// carry.
+    pub gpu: *mut super::gpu_unit::GpuRaster,
+    pub gpu_slot: Option<super::gpu_unit::Slot>,
+    pub gpu_words: (u32, u32),
+    /// The draw's texture on the unit, when it textures.
+    pub gpu_tex: Option<Box<super::gpu_unit::TexSlot>>,
 }
+
+/// A draw the GPU unit could not take was reported.
+static GPU_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl PipeDraw {
     /// Store a shaded quad (q.draw is set here): on the back-end thread, or
@@ -62,6 +74,10 @@ impl PipeDraw {
     #[inline]
     pub fn emit(&self, q: &mut BackQuad) {
         if q.cov == 0 {
+            return;
+        }
+        if let Some(g) = self.gpu_unit() {
+            g.push_frag(q, self.gpu_slot.as_ref().expect("a slot with the unit"));
             return;
         }
         match &self.ring {
@@ -81,8 +97,51 @@ impl PipeDraw {
     /// (Board::gl_to_aux), whose destination is the window-id buffer. The
     /// transform side supplies the depth range and the depth's rounding
     /// slack.
+    /// The GPU unit, when this draw goes through it.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref, reason = "the unit is reached through the draw's pointer, not borrowed from the draw")]
+    pub fn gpu_unit(&self) -> Option<&mut super::gpu_unit::GpuRaster> {
+        if self.gpu.is_null() {
+            return None;
+        }
+        // SAFETY: the unit lives in the raster context the draw runs under,
+        // on the one thread that runs draws with a GPU unit (no raster
+        // thread starts with one), and nothing else reaches it while a
+        // draw runs (gl.rs run_frame takes it from the context).
+        Some(unsafe { &mut *self.gpu })
+    }
+
     #[allow(clippy::too_many_arguments, reason = "the stages' inputs")]
-    pub fn new(w: &FragmentWords, tex: texture::Unit<'static>, planes: DestMem, index: bool, to_aux: bool, depth_range: [f64; 2], slack: f64, ring: Option<&Arc<QuadRing>>) -> Box<PipeDraw> {
+    pub fn new(
+        w: &FragmentWords,
+        tex: texture::Unit<'static>,
+        planes: DestMem,
+        index: bool,
+        to_aux: bool,
+        depth_range: [f64; 2],
+        slack: f64,
+        ring: Option<&Arc<QuadRing>>,
+        stipple: Option<&[u32; 32]>,
+        background: Option<[f64; 4]>,
+        gpu: Option<&mut super::gpu_unit::GpuRaster>,
+    ) -> Box<PipeDraw> {
+        // The draw's slot on the GPU unit; a draw into planes the kernels
+        // cannot address takes the CPU path on a memory brought current.
+        let (gpu, gpu_slot): (*mut super::gpu_unit::GpuRaster, Option<super::gpu_unit::Slot>) = match gpu {
+            Some(g) => match super::gpu_unit::Slot::new(&w.backend, &planes, index, to_aux, &w.raster, stipple, background) {
+                Ok(s) => (g as *mut _, Some(s)),
+                Err(e) => {
+                    if !GPU_REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu unit: {} drawn on the CPU", e.0);
+                    }
+                    if let Err(e) = g.read_back() {
+                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
+                    }
+                    (std::ptr::null_mut(), None)
+                }
+            },
+            None => (std::ptr::null_mut(), None),
+        };
         let mut backend = BackendState::of(&w.backend, true, !index);
         if to_aux {
             backend.targets = aux_targets(backend.targets, index);
@@ -100,7 +159,13 @@ impl PipeDraw {
             backend.depth_test && !backend.stencil,
         );
         raster.depth32 = true;
+        if !gpu.is_null() {
+            // The unit stores behind this thread: no depth pre-test against
+            // the memory here.
+            raster.pretest = None;
+        }
 
+        let gpu_tex = (!gpu.is_null() && tex.regs.target() != texture::Target::None).then(|| Box::new(super::gpu_unit::TexSlot::new(tex.regs, tex.latch)));
 
         Box::new(PipeDraw {
             raster,
@@ -115,6 +180,10 @@ impl PipeDraw {
             back_draw: BackendDraw { state: backend, planes },
             shade: false,
             used: std::cell::Cell::new(false),
+            gpu,
+            gpu_slot,
+            gpu_words: (w.raster.mode, w.shader.alpha),
+            gpu_tex,
         })
     }
 }

@@ -476,6 +476,7 @@ How each board uses it:
 | Newport (`src/dev/ng1/`) | REX3 register writes, GO commands, HOSTRW data | `REX3-Processor` executes REX3 drawing; `REX3-Refresh` composites VC2/XMAP/CMAP scanout and owns the GL context |
 | GR2 (`src/dev/gr2/`) | HQ2 command FIFO (`hq_fifo`) | `GR2-HQ2` interprets HQ2/GE commands at the GL level and feeds `re3_fifo`; `GR2-RE3` rasterises; `GR2-Display` scans out |
 | IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO); a refresh thread scans out |
+| VPro (`src/dev/odyssey/`) | the command FIFO (`fifo.rs`) | `odyssey-work` decodes, transforms and sets primitives up and hands them to the raster queue; `odyssey-raster` and its `odyssey-pool` tile workers rasterise, texture and store; the display thread scans out. With `[graphics] raster = "wgpu"` the raster and pool threads do not start: the front end records into batches the host GPU draws (below) |
 
 GR2 and IMPACT are emulated at a high level: their microcode is uploaded but
 not executed; the command and GL token stream is interpreted directly. All
@@ -495,6 +496,78 @@ Scanout is decoupled from drawing: the display thread reads the framebuffer
 without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
 thread that owns it.
+
+### The raster unit on the host GPU (`wgpu` feature)
+
+With `[graphics] raster = "wgpu"` the VPro's raster unit runs as compute
+kernels on the host GPU (`src/wgpu` is the common layer, `src/dev/odyssey/
+wgpu` the board's kernels; the design is `clanker/plans/wgpu-raster.md`).
+The front end runs every draw inside its submit and appends one *record*
+per primitive (a triangle's setup, a quad it shaded itself, a clear's
+rectangle, a row of pixels of an image put) to a *batch*, with the state
+each was issued under in a *slot*; a batch is two dispatches, a bin pass
+that gives each 8x8 tile a bitmask over the batch's primitives and a raster
+pass with one workgroup per busy tile that walks its mask in order and
+stores pixels itself. Order per pixel is the record order, so the kernels
+need no atomics on pixels and no synchronisation between workgroups.
+
+Board memory lives in a GPU buffer; nothing on the CPU maps it. The front
+end's own pixel paths (image puts, the integer primitives and their logical
+operations, the X server's window-id writes, plane clears, DMA puts, depth
+and stencil image writes) store through the unit as *blit* records, so they
+keep their place in the order and nothing waits. The board's `Vram` is a
+*mirror* for what still runs on the CPU (copies, DMA gets, the hashes and
+the monitor), kept in step by two dirty maps: CPU stores mark 16 KB blocks
+that go up before the next batch and at the end of each run of stores, and
+records mark the blocks their boxes touch; a reader brings back only the
+marked blocks under the box it reads (`Board::planes_in`), `dest_mem` and
+`gpu_sync` bring everything back, and `Board::raster_wait` on this unit is a
+flush and a GPU wait with no readback. A batch is submitted when it fills,
+when something waits, and at the end of a run of stores once the board is
+going idle or the batch has been open a few milliseconds
+(`GpuRaster::tick`), so the screen follows the guest as it would on the
+board without a submission per primitive. Swaps follow the same order
+without a wait: a swap arm notes its position in the command stream
+(`CommandFifo::pushed`), the unit publishes the position its submissions
+cover (`DisplayShared::covered`), and the retrace latches a flip only once
+the drawing before its arm is submitted; the scanout's own submission
+queues behind that drawing on the same GPU queue. The invariant for the mirror is the
+one the raster thread already imposed: the front end waits before it touches
+memory itself; paths that must not wait (texture and scratch uploads) store
+through an untracked pointer and upload exactly the tiles they wrote. The
+display thread composes on the GPU as well (`src/wgpu/scanout.rs`), from
+the same buffer, and reads the frame back into `Rex3Screen`; `Frame::compose`
+on the CPU remains for screenshots and the replay harness.
+
+The front end reads the window-id buffer's bytes itself, without waiting
+for the raster unit (the drawable format for a read, the ownership test).
+So when it sends a store into those byte fields to the GPU it makes the
+same store in the mirror, untracked: the mirror's id bytes stay current
+with nothing uploaded twice. A new path that writes them on the GPU must do
+the same.
+
+With `renderer = "wgpu"` the window is drawn by `src/wgpu/present.rs`
+(`Presenter`: the surface, a pipeline of textured quads for the frame, the
+debug overlay and the status bar, and a small kernel that unpacks a frame
+already on the device). The surface comes from the instance the board's
+`Gpu` was opened on (`GfxDisplay::gpu`). The VPro's display thread then
+composes on the GPU and hands the scan-out buffer to the renderer
+(`Renderer::present_gpu_frame`) unless something wants `screen.rgba` filled
+(a screenshot, a frame request, a capturing VNC client), in which case it
+reads the frame back as before. Newport's planes are composed on the
+GPU too, by `src/dev/ng1/wgpu` (the GL and software compositors' rules as a
+kernel on the common scan-out driver, checked pixel for pixel against
+`SwCompositor`), and presented from there. The other boards' frames are
+uploaded from the CPU.
+
+The kernels are held to the CPU model word for word by parity tests
+(`cargo test --features wgpu --lib odyssey::wgpu`), the golden scenes with
+`VPRO_GPU=1` and the replay checkpoints with `VPRO_REPLAY_GPU=1`. Two rules
+came out of that and live in `clanker/wgpu/`: a GPU's division is not
+correctly rounded and its compiler fuses multiply-adds, so the kernels
+divide through `div_exact` and keep products apart from sums; and a large
+struct copied by value into a lane's private memory gave silently wrong
+results, so records, slots and tables are read from their buffers in place.
 
 The status bar under the frame is fed by `StatusSource` (`src/disp.rs`),
 which the machine builds once and hands to every graphics board: the

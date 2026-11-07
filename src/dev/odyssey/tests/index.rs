@@ -64,7 +64,7 @@ fn index_triangle_then(s: &mut Board, st: &LibState, index: u32, words: impl FnO
 }
 
 fn index_at(s: &Board, buffer: usize, x: i32, y: i32) -> u32 {
-    s.raster_wait();
+    s.gpu_sync();
     s.dest_mem().colour[buffer].load_word(x, y).unwrap_or(0)
 }
 

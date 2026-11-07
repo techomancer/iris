@@ -57,6 +57,12 @@ pub trait GfxDisplay: Send + Sync {
     /// The hardware cursor as the guest has set it, read live from the
     /// board's registers (not the last composed frame).
     fn hw_cursor(&self) -> Option<HwCursor> { None }
+
+    /// The host GPU the board draws or composes on, when it uses one (the
+    /// VPro with `raster = "wgpu"`): a wgpu window renderer presents on the
+    /// same device, so a frame composed there need not come back to the CPU.
+    #[cfg(feature = "wgpu")]
+    fn gpu(&self) -> Option<std::sync::Arc<crate::wgpu::Gpu>> { None }
 }
 
 /// Whether the display thread tears its renderer down when it ends.

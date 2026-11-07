@@ -92,6 +92,14 @@ impl View {
         self.base.wrapping_add((tile << 8 | (y & 15) << 4 | (x & 15)) << self.log2).wrapping_add(self.at as u64)
     }
 
+    /// The view's placement: the surface's first byte, its pitch in tiles,
+    /// log2 of its pixel size and the field's byte inside the pixel (for
+    /// the GPU instantiation's slots).
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn parts(&self) -> (u64, u32, u8, u8) {
+        (self.base, self.pitch, self.log2, self.at)
+    }
+
     /// The view `by` bytes further into the pixel.
     pub fn shifted(mut self, by: i64) -> View {
         self.at = (self.at as i64 + by) as u8;

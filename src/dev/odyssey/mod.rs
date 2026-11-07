@@ -77,6 +77,7 @@ mod frame;
 mod golden;
 mod geometry;
 mod gl;
+mod gpu_unit;
 mod assembly;
 mod interface;
 mod clip;
@@ -95,6 +96,8 @@ mod scanout;
 mod trace;
 mod view;
 mod vram;
+#[cfg(feature = "wgpu")]
+mod wgpu;
 mod worker;
 #[cfg(test)]
 mod tests;
@@ -132,7 +135,10 @@ pub struct Odyssey {
 
 impl Odyssey {
     /// A board of `product` (v12, v10, v8, v6) at `widget`: its interrupt
-    /// packets reach `irq` (HEART), its DMA reaches `mem`.
+    /// packets reach `irq` (HEART), its DMA reaches `mem`. `pool` is the
+    /// CPU raster unit's workers and tile size, `raster` which unit draws
+    /// and, for the GPU, the wgpu backend (`[graphics]`).
+    #[allow(clippy::too_many_arguments, reason = "the board's wiring")]
     pub fn new(
         widget: u8,
         product: &str,
@@ -140,10 +146,17 @@ impl Odyssey {
         mem: Arc<dyn BusDevice>,
         status: Arc<crate::disp::StatusSource>,
         pool: (usize, u32),
+        raster: (crate::config::RasterUnit, &str),
     ) -> Result<Arc<Self>, String> {
         let mut s = Board::new(product, widget as u32)?;
         // The fragment pipeline's workers and tile size (`[graphics]`).
         s.raster.set_pool(pool.0, pool.1);
+        if raster.0 == crate::config::RasterUnit::Wgpu {
+            #[cfg(feature = "wgpu")]
+            s.enable_gpu(&crate::wgpu::GpuOptions { backend: raster.1.to_string(), ..Default::default() })?;
+            #[cfg(not(feature = "wgpu"))]
+            return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
+        }
         // The recorder's slot is there whether or not a recording runs, so
         // the monitor can start one (`vpro rec`); the DMA path records
         // through it.
@@ -215,6 +228,25 @@ impl Odyssey {
         let mut reader = display.reader.lock();
         reader.attach(&state.shared);
         reader.poll(monotonic_ns());
+        // On the GPU raster unit with the wgpu renderer on the same device,
+        // the frame is composed and presented there with no readback.
+        #[cfg(feature = "wgpu")]
+        if display.gpu_frames_wanted() {
+            crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
+            let composed = reader.update_on_gpu();
+            crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
+            if let Some((buffer, w, h)) = composed {
+                set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
+                crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
+                drop(reader);
+                if display.due(true) {
+                    crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
+                    display.present_gpu(&buffer, w, h);
+                    crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
+                }
+                return;
+            }
+        }
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let composed = reader.update();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
@@ -270,7 +302,7 @@ impl Device for Odyssey {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![(
             "vpro".to_string(),
-            "VPro (Odyssey) graphics: status|regs|fifo|state|geom|tex|win|mem|backend|lut|dispmode|cursor|pix|raw|peek|shot|fbdump|hash|unimp|refusals|trace|rec (vpro help)".to_string(),
+            "VPro (Odyssey) graphics: status|regs|fifo|state|geom|tex|win|mem|backend|lut|dispmode|cursor|pix|raw|peek|shot|fbdump|hash|unimp|refusals|gpu|trace|rec (vpro help)".to_string(),
         )]
     }
 

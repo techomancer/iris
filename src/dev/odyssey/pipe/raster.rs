@@ -402,10 +402,11 @@ impl Triangle {
     }
 }
 
-/// Walk a triangle into quads under st, handing each quad with any drawn
-/// pixel to emit. `within`, where given, bounds the walk further, in
-/// window pixels (the viewport the transform side keeps).
-pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32, i32, i32, i32)>, mut emit: impl FnMut(&Quad)) {
+/// The window pixels the walk of t under st covers, inclusive: the
+/// triangle's bounds within `within` (window pixels), the scissor (window
+/// coordinates), the clip rectangles and the plane (plane coordinates);
+/// None when nothing is left.
+pub(crate) fn walk_bounds(st: &RasterState, t: &Triangle, within: Option<(i32, i32, i32, i32)>) -> Option<(i32, i32, i32, i32)> {
     let (mut x0, mut y0, mut x1, mut y1) = t.bounds;
 
     if let Some((wx0, wy0, wx1, wy1)) = within {
@@ -414,9 +415,6 @@ pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32
         x1 = x1.min(wx1);
         y1 = y1.min(wy1);
     }
-
-    // The walk is bounded by the scissor, in window coordinates, and by
-    // the clip rectangles and the plane, in plane coordinates.
     if let Some((sx0, sy0, sx1, sy1)) = st.scissor {
         x0 = x0.max(sx0);
         y0 = y0.max(sy0);
@@ -425,7 +423,7 @@ pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32
     }
     let n = st.clip_kept.min(4) as usize;
     if n == 0 {
-        return;
+        return None;
     }
     {
         let cx0 = st.clip_rect[..n].iter().map(|r| r.x0).min().unwrap();
@@ -443,8 +441,19 @@ pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32
     x1 = x1.min((st.width as i32 - 1).wrapping_sub(st.ox));
     y1 = y1.min((MAX_DIM as i32 - 1).wrapping_sub(st.oy));
     if x0 > x1 || y0 > y1 {
-        return;
+        return None;
     }
+    Some((x0, y0, x1, y1))
+}
+
+/// Walk a triangle into quads under st, handing each quad with any drawn
+/// pixel to emit. `within`, where given, bounds the walk further, in
+/// window pixels (the viewport the transform side keeps).
+pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32, i32, i32, i32)>, mut emit: impl FnMut(&Quad)) {
+    let Some((x0, y0, x1, y1)) = walk_bounds(st, t, within) else {
+        return;
+    };
+
     let area = t.area as f64;
     let steps = if st.offset_fill { st.offset_steps } else { 0 };
     let dz1 = t.z[1] - t.z[0];

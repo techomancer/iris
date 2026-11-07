@@ -56,7 +56,7 @@ The checkpoints (`replay/<name>.hashes`) are what is committed. `VPRO_REPLAY=<fi
 replays one file; `VPRO_REPLAY_THREADS=1` replays it with the raster thread and its worker pool
 running, as a live machine draws (`IRIS_ODSY_BACKEND=inline` stores on the
 raster thread with no pool; `VPRO_REPLAY_POOL=<threads>,<tile>` sets the
-pool's workers and tile size, default 2 and 32); `VPRO_REPLAY_LIMIT=<n>` stops after n records;
+pool's workers and tile size, default 2 and 32); `VPRO_REPLAY_GPU=1` draws on the GPU raster unit (a build with the `wgpu` feature; `VPRO_REPLAY_LAZY=1` skips the readbacks between checkpoints to time the GPU path alone); `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks the checkpoints reached;
 `VPRO_REPLAY_OUT=<png>` saves the final colour buffer
 (unmapped: no colour map, window ids or cursor, so it is the planes, not the
 screen). `VPRO_REPLAY_SHOTS=<dir>` saves the composed screen at each mark as

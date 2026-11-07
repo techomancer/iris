@@ -105,11 +105,16 @@ pub(super) struct RasterCtx {
     /// The quad ring to the shader and back-end threads, while the raster
     /// thread runs (pipe/ring.rs).
     pub ring: Option<Arc<super::pipe::ring::QuadRing>>,
+    /// The raster unit on the host GPU (gpu_unit.rs), when the board draws
+    /// there: then no raster thread runs, every job runs inside its
+    /// submit on the front end, and the drawing goes into the unit's
+    /// batches.
+    pub gpu: Option<Box<super::gpu_unit::GpuRaster>>,
 }
 
 impl RasterCtx {
     fn new() -> Self {
-        RasterCtx { line_phase: 0, ring: None }
+        RasterCtx { line_phase: 0, ring: None, gpu: None }
     }
 
     /// Wait for the back-end thread to store everything queued to it, so
@@ -590,6 +595,11 @@ impl RasterQueue {
         self.closing.store(false, SeqCst);
         // SAFETY: no raster thread runs yet, so the context is this thread's.
         let ctx = unsafe { &mut *self.ctx.get() };
+        if ctx.gpu.is_some() {
+            // The GPU unit draws inside each submit; the front end is the
+            // only thread that touches it.
+            return;
+        }
         if ctx.ring.is_none() && backend {
             // The shader's thread shades in the ring, so it comes with the
             // back end's.
@@ -778,7 +788,56 @@ impl Board {
     /// Wait for the raster unit to finish its queued jobs. The front end
     /// calls it before it touches board memory itself,
     /// and before it writes a completion word that must follow the drawing.
+    /// With the GPU unit, that means its batches are drawn and what they
+    /// wrote is back in the memory the front end reads.
     pub fn raster_wait(&self) {
         self.raster.wait_idle();
+        if !self.raster.threaded() {
+            // The unit's batches drawn; memory comes back where a reader
+            // asks for it (planes_in, dest_mem, gpu_sync).
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    if let Err(e) = g.wait() {
+                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu wait: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    /// With the GPU unit, the end of a run of stores: the mirror's changes
+    /// go up, and the open batch is submitted when the board is going idle
+    /// or has held it long enough (`GpuRaster::tick`), so the scanout
+    /// composing from the GPU's memory shows what the guest drew; nothing
+    /// waits.
+    pub fn gpu_upload_tick(&self, idle: bool) {
+        if !self.raster.threaded() {
+            let retired = self.fifo.retired();
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    g.tick(idle, retired);
+                }
+            });
+        }
+    }
+
+    /// `raster_wait`, and with the GPU unit the mirror brought current even
+    /// when the unit is set to skip readbacks (the replay's checkpoints).
+    pub fn gpu_sync(&self) {
+        self.raster_wait();
+        if !self.raster.threaded() {
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    if let Err(e) = g.read_back_now() {
+                        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    /// Whether the board draws on the GPU unit.
+    pub fn gpu_unit(&self) -> bool {
+        !self.raster.threaded() && self.raster.run_now(|ctx| ctx.gpu.is_some())
     }
 }

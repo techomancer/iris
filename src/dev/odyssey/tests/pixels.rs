@@ -532,7 +532,7 @@ fn a_write_code_without_a_pixel_form_is_refused() {
 /// A scratch surface at `base`: `pitch` tiles a row, 1 << `log2` bytes a
 /// pixel, its field at byte 0 packed as `codec`.
 fn scratch(s: &Board, base: u32, pitch: u32, log2: u8, codec: Codec) -> Rows {
-    s.raster_wait();
+    s.gpu_sync();
     Rows::new(s.vram_ptr(), View::colour(&Surface::new(base, pitch, log2), Field { at: 0, codec }, MAX_DIM))
 }
 
@@ -606,7 +606,7 @@ fn a_copy_from_a_10_10_10_2_window_into_a_texture_converts_the_colour() {
     // The texture the copy lands in, selected first as the library does.
     s.pixel_mode = [0x39_de80, 0x10, 0x0800_24d0, 0];
     copy_block(&mut s, [0x3000_0019, y << 16 | x, 0x8010_0050, 1 << 16 | 1, 0x1263_3002, 0x39_de80, 0, 0xf801_210b]);
-    s.raster_wait();
+    s.gpu_sync();
     let tex = Surface::new(0x39_de80, 0x10, 2);
     assert_eq!(s.vram.ptr_shared().load(tex.offset(0, 0), 4), 0xc040_20ff);
 }
@@ -933,7 +933,7 @@ fn bind_read_drawable(s: &mut Board, word: u32) {
 fn a_pixel_buffers_front_is_the_buffer_a_front_draw_mask_writes() {
     let (mut s, ram) = read_window();
     colour_destination(&mut s);
-    s.raster_wait();
+    s.gpu_sync();
     screen_field(&s, 1).store_word(30, 40, 0x0102_0304);
     let front = read_word4(2, 8);
     let back = front & !dma::FMT_FRONT;
@@ -1252,7 +1252,7 @@ fn a_row_that_ends_inside_a_word_drops_the_rest_of_the_word() {
 #[test]
 fn a_window_move_copies_every_byte_of_both_halves() {
     let (mut s, _, _) = board_with_ram();
-    s.raster_wait();
+    s.gpu_sync();
     let screen = Surface::new(0x2000, 0x50, 4);
     s.pixel_mode = [0x2000, 0x50, 0x6950, 0];
     let src = screen.offset(10, 10);
@@ -1263,7 +1263,7 @@ fn a_window_move_copies_every_byte_of_both_halves() {
     for (w2, w4) in [(0x0050_0050u32, 0x0003_4000u32), (0x8050_4050, 0x8043_4000)] {
         copy_block(&mut s, [0x2000, sy << 16 | sx, w2, 1 << 16 | 1, w4, 0x2000, dy << 16 | dx, 0xc003_4000]);
     }
-    s.raster_wait();
+    s.gpu_sync();
     let dst = screen.offset(dx, dy);
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(dst + k, 1) as u8).collect();
     assert_eq!(got, (0..16).map(|k| 0x40 + k as u8).collect::<Vec<_>>());

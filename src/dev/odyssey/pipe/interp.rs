@@ -89,6 +89,13 @@ impl TriTex {
         TriTex { v: v.map(|a| a.map(|x| x as f32)) }
     }
 
+    /// The values at the vertices: S/W, T/W, R/W and Q/W, each at the
+    /// three vertices (the GPU record carries them).
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn values(&self) -> &[[f32; 3]; 4] {
+        &self.v
+    }
+
     /// The texture coordinates of a quad whose pixels' barycentrics are l1
     /// and l2.
     #[inline(always)]

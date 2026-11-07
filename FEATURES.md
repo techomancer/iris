@@ -41,6 +41,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and, as they land, the boards' GPU raster units under `src/dev/<board>/wgpu`. Work in progress on branch `wgpu-raster`; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `rex-gpu` | Experimental, replay-only Newport wgpu/WGSL engine. It does not replace the live CPU renderer and is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
@@ -164,6 +165,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `ci_display` | `false` | Keep host graphics window visible in CI mode. |
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
+| `renderer` | `gl` | What draws the window: `gl`, or `wgpu` (needs a build with the `wgpu` feature). With `wgpu` the window is presented through wgpu on the same GPU as a VPro whose raster unit is on the GPU, and its frames are shown without being read back. The iris-gui front end ignores it. |
 | `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
 | `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's). Truncated at start on the Octane and O2, appended to on the Indy and Indigo2, like `serial_log`. |
 | `serial_log_timestamps` | `off` | `off` (raw transcript), `wall` (prefix each completed line with a UTC ISO-8601 stamp) or `ecs` (one Elastic Common Schema JSON document per non-empty line, logger `irix.guest`, control characters dropped). A partial line is held until its newline and written on stop. |
@@ -186,6 +188,8 @@ the first `[section]`, because TOML tables continue until the next header.
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 | `graphics.threads` | `2` | Worker threads the board's fragment pipeline draws on, at least 1. VPro: the screen tiles' owners, besides its front-end and raster threads; more help on a host with cores to spare. |
 | `graphics.tile` | `32` | VPro: the fragment pipeline's screen tile size in pixels, a power of two from 8 to 256. Each tile's work runs in order on one worker at a time; with many threads, 64 can be faster. |
+| `graphics.raster` | `cpu` | VPro: where the raster unit runs. `cpu` draws on the threads above; `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature; work in progress, see `clanker/plans/wgpu-raster.md`). |
+| `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. |
 
 ### [scsi.<ID>]
 
@@ -433,6 +437,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
 | `--cpu` | Emulated CPU: `r4400` (default), `r5000`, or `r10000`. Overrides `[machine] cpu`.  |
 | `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane only). |
+| `--raster` | VPro: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |
+| `--renderer` | What draws the window: `gl` (default) or `wgpu` (`renderer`; needs a build with the `wgpu` feature). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |
 | `--vnc [ADDR]` | Serve the screen, keyboard and mouse over VNC on ADDR (`host:port` or a port; default 127.0.0.1:5900). Sets `vnc.listen`. |
@@ -566,7 +572,9 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `MGRAS_REPLAY_TRACE` | IMPACT replay tracing selector (`gputrace` builds). | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_SIZE_PROBE` | Input for the opt-in IMPACT size/probe test. | [src/dev/mgras/mgras_tests.rs](src/dev/mgras/mgras_tests.rs) |
 | `VPRO_GOLDEN` | `tolerance` lets a VPro golden frame whose hash changed pass inside its stored limits. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
-| `VPRO_REPLAY` | Replay input path for one VPro recording; `VPRO_REPLAY_DIR` picks the directory that is replayed otherwise, `VPRO_REPLAY_THREADS=1` replays with the raster and back-end threads running, `VPRO_REPLAY_LIMIT=<n>` stops after n records (with `VPRO_REPLAY_DUMP` to see the board there). | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `IRIS_WGPU_DUMP` | With the `wgpu` feature: a directory the composed WGSL of every GPU kernel is written to as it is compiled, for `naga` and `spirv-val`. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
+| `VPRO_GPU_TRACE_WAITS` | With the `wgpu` feature: the VPro GPU unit counts its readbacks by the board function that caused them; the replay prints the histogram. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
+| `VPRO_REPLAY` | Replay input path for one VPro recording; `VPRO_REPLAY_DIR` picks the directory that is replayed otherwise, `VPRO_REPLAY_THREADS=1` replays with the raster and back-end threads running, `VPRO_REPLAY_GPU=1` replays on the GPU raster unit (`wgpu` feature; with `VPRO_REPLAY_LAZY=1` the unit skips the readbacks between checkpoints, to time the GPU path alone), `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks only the checkpoints reached (with `VPRO_REPLAY_DUMP` to see the board there), `VPRO_REPLAY_TICK=<n>` ends a board slice every n stores as a running machine does (on the GPU unit each slice end can submit a batch), `VPRO_REPLAY_WRITES=<file>` logs every write the board makes to guest memory (pixel reads, fences, query results); the report line gives their hash and the final memory hash, to compare two replays. `VPRO_GPU=1` puts every VPro test board (the golden scenes among them) on the GPU raster unit. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
 
 `RUST_LOG` configures the host Rust logger; `IRIS_DEBUG_LOG` configures device
 logging. Standard host variables (`HOME`, `XDG_CACHE_HOME`, `LOCALAPPDATA`,

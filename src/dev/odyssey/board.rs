@@ -166,6 +166,8 @@ pub(super) struct ImageRaster {
     /// The fragment state and depth word a depth-tested image's pixels take,
     /// decoded once per box (Board::image_box_loaded()).
     pub fragment: Option<Box<(super::pipe::backend::BackendState, u32)>>,
+    /// The slot those fragments go through on the GPU unit.
+    pub gpu_slot: Option<super::gpu_unit::Slot>,
     pub cur_x: u32,
     pub cur_y: u32,
     pub fmt: u32,
@@ -742,6 +744,7 @@ impl Default for Board {
                 y2: 0,
                 box_words: [0; 10],
                 fragment: None,
+                gpu_slot: None,
                 cur_x: 0,
                 cur_y: 0,
                 fmt: 0,
@@ -1246,6 +1249,13 @@ impl Board {
         // CHOICE: memory reads zero after a reset (the board's SDRAM holds
         // whatever it held; the PROM and the driver clear what they use).
         self.vram.words_mut().fill(0);
+        if !self.raster.threaded() {
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    g.clear_all();
+                }
+            });
+        }
         self.stream.poly_marks.fill(0);
         // Back to the boot size, and restart the phase.
         let mode = self.scanout_mode();
@@ -1279,7 +1289,39 @@ impl Board {
         s.slot = slot;
         s.configure()?;
         s.allocate()?;
+        // VPRO_GPU=1 puts every test board on the GPU unit.
+        #[cfg(all(test, feature = "wgpu"))]
+        if std::env::var("VPRO_GPU").is_ok() {
+            s.enable_gpu(&crate::wgpu::GpuOptions::default())?;
+        }
         Ok(s)
+    }
+
+    /// Draw on the host GPU from here on (gpu_unit.rs): the raster unit's
+    /// work goes into batches on a GPU buffer, and this memory becomes the
+    /// front end's mirror of it, brought current by `raster_wait`. Before
+    /// the threads start.
+    #[cfg(feature = "wgpu")]
+    pub fn enable_gpu(&mut self, opts: &crate::wgpu::GpuOptions) -> Result<(), String> {
+        use super::wgpu::{GpuRaster, PLANE_SPAN};
+
+        if self.raster.threaded() {
+            return Err("the GPU unit must be chosen before the board's threads start".into());
+        }
+        let gpu = crate::wgpu::Gpu::new(opts)?;
+        let mut unit = GpuRaster::new(&gpu, self.vram.size(), PLANE_SPAN, PLANE_SPAN)?;
+        self.vram.track_dirty();
+        unit.attach_mirror(self.vram.ptr());
+        // The display composes on the GPU too, from the same memory.
+        let (vram, words) = unit.vram_buffer();
+        let scanout = super::wgpu::scanout::VproScanout::new(&gpu, &vram, words)?;
+        let _ = self.display.gpu_scanout.set(parking_lot::Mutex::new(scanout));
+        // Flips latch only once the unit has submitted the drawing before
+        // them (HostInterface::retrace).
+        unit.publish_stream(self.display.covered.clone());
+        crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: raster unit on the GPU: {}", gpu.caps);
+        self.raster.run_now(|ctx| ctx.gpu = Some(Box::new(unit)));
+        Ok(())
     }
 }
 

@@ -38,6 +38,7 @@ fn main() {
 
     let scroll_pixels_per_line = cfg.mouse_scroll_pixels_per_line;
     let lock_aspect_ratio = cfg.lock_aspect_ratio;
+    let ui_renderer = cfg.renderer;
     let headless = cfg.headless;
     let gdb_port = cfg.gdb_port;
     let ci_enabled = cfg.ci;
@@ -188,7 +189,7 @@ fn main() {
         use winit::event_loop::EventLoop;
         let event_loop = EventLoop::new().unwrap();
         let display = machine.get_display().expect("a graphics board must be present in non-headless mode");
-        let ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio);
+        let ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer);
         ui.run(event_loop);
     }
 

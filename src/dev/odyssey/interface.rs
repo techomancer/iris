@@ -62,6 +62,12 @@ pub(super) struct HostInterface {
     pub route_dest_lower: u32,
     pub route_vectors: u32,
     pub swap_arm: u32,
+    /// The command stream's position (`CommandFifo::pushed`) when the
+    /// latest flip was armed, and the position at the store being written
+    /// (set by the bus path before `write`). A flip latches only once the
+    /// raster unit's submissions cover the stores before its arm.
+    pub swap_after: u64,
+    pub stream_pos: u64,
     pub swap_pending: u32,
     pub swap_control: u32,
     pub swap_control_companion: u32,
@@ -101,6 +107,8 @@ impl Default for HostInterface {
             route_dest_lower: 0,
             route_vectors: 0,
             swap_arm: 0,
+            swap_after: 0,
+            stream_pos: 0,
             swap_pending: 0,
             swap_control: 0,
             swap_control_companion: 0,
@@ -137,11 +145,16 @@ impl HostInterface {
     /// in the same frame's update; a frame is never presented half from each
     /// buffer.
     ///
-    /// Whether a swap latched. The latch needs this lock alone.
-    pub fn retrace(&mut self) -> bool {
-        let flips = self.swap_arm;
+    /// Whether a swap latched. The latch needs this lock alone. `covered`
+    /// is the stream position the raster unit's submitted work reaches
+    /// (`DisplayShared::covered`): a flip armed after stores not yet
+    /// submitted stays armed for a later retrace, so the buffer it shows
+    /// holds the drawing issued before it.
+    pub fn retrace(&mut self, covered: u64) -> bool {
+        let ready = self.swap_after <= covered;
+        let flips = if ready { self.swap_arm } else { 0 };
 
-        if self.swap_set != 0 || self.swap_clear != 0 {
+        if ready && (self.swap_set != 0 || self.swap_clear != 0) {
             self.displayed_buffer = (self.displayed_buffer | self.swap_set) & !self.swap_clear;
             self.swap_set = 0;
             self.swap_clear = 0;
@@ -396,6 +409,7 @@ impl HostInterface {
                 // when a flip has not shown after two retraces. Whether the
                 // board ORs or replaces is unknown; ORing loses no flip.
                 self.swap_arm |= value as u32;
+                self.swap_after = self.stream_pos;
                 crate::pf_instant!(crate::perfetto::events::ODSY_SWAP_ARM, value);
             }
             Some(swap::PENDING) => self.swap_pending = value as u32,
@@ -406,11 +420,13 @@ impl HostInterface {
                 self.swap_control = value as u32;
                 self.swap_set |= value as u32;
                 self.swap_clear &= !(value as u32);
+                self.swap_after = self.stream_pos;
             }
             Some(swap::CONTROL_COMPANION) => {
                 self.swap_control_companion = value as u32;
                 self.swap_clear |= value as u32;
                 self.swap_set &= !(value as u32);
+                self.swap_after = self.stream_pos;
             }
             Some(ODSY_DISPLAYED_BUFFER) => {
                 // Board-produced status; a guest write is not seen in the
@@ -452,7 +468,11 @@ pub(super) fn front_mmio_read(f: &Mutex<HostInterface>, addr: u64, size: u32) ->
 /// when it needs the board's state.
 pub(super) fn front_mmio_write(f: &Mutex<HostInterface>, fifo: &CommandFifo, addr: u64, value: u64, size: u32) -> bool {
     if front_register(addr, size, true) {
-        f.lock().write(addr, value, size);
+        let mut g = f.lock();
+        // The store falls after every command store the processor made
+        // before it: a swap arm waits for them (HostInterface::retrace).
+        g.stream_pos = fifo.pushed();
+        g.write(addr, value, size);
         return true;
     }
     // A queued store needs the board's thread to run it, and the queue to

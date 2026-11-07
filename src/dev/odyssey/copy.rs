@@ -46,6 +46,7 @@
 //! address is not tested: the X server's window moves copy outside the clip
 //! rectangles in force (traced), as screen-to-screen copies do.
 
+use super::pipe::backend::DestMem;
 use super::bits::sextract32;
 use super::board::Board;
 use super::consts::{tex, ODSY_DID_MAIN_SHIFT, ODSY_PLANE_MASK_SHIFT};
@@ -151,7 +152,8 @@ impl Board {
     /// is the packing it asks for, not the window's. None where the mode
     /// names no field there.
     pub fn drawable_codec(&self, x: i32, y: i32, at: u8) -> Option<Codec> {
-        let did = self.dest_mem().did.load1(x, y)? as u32;
+        // The id bytes are the front end's own: no wait (Board::id_compare_passes).
+        let did = DestMem::of(self.vram_ptr(), &self.dest_views()).did.load1(x, y)? as u32;
         let mode = self.regs().dispmode((did >> ODSY_DID_MAIN_SHIFT) as usize);
         super::frame::mode_fields(mode).into_iter().find(|f| f.at == at).map(|f| f.codec)
     }
@@ -162,9 +164,14 @@ impl Board {
         let (w, h) = c.size();
         let (src, dst) = (c.src(), c.dst());
 
-        self.raster_wait();
         if w == 0 || h == 0 {
             return;
+        }
+        // The copy's own rectangles come back below; the CPU unit waits
+        // for everything.
+        let gpu = self.gpu_unit();
+        if !gpu {
+            self.raster_wait();
         }
         // The destination's format is the pixel mode's field at the offset
         // the copy names; word 7's field size is the unit moved, the colour
@@ -227,6 +234,25 @@ impl Board {
         let raw = src_codec(src.at) == dst_codec && !filter;
 
         // The whole source first, so an overlapping copy reads what was there.
+        if gpu {
+            // The source and destination rectangles, current in the mirror.
+            let region = |rows: &Rows, x: i32, y: i32| {
+                self.raster.run_now(|ctx| {
+                    if let Some(g) = &mut ctx.gpu {
+                        if let Err(e) = g.read_back_view(&rows.v, x, y, x.wrapping_add(w as i32 - 1), y.wrapping_add(h as i32 - 1)) {
+                            crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
+                        }
+                    }
+                });
+            };
+            let (sx, sy) = ((src.x as i32).wrapping_add(ox), (src.y as i32).wrapping_add(oy));
+            region(&from, sx, sy);
+            if let Some(f) = &ab {
+                region(&f[0], sx, sy);
+                region(&f[1], sx, sy);
+            }
+            region(&to, (dst.x as i32).wrapping_add(dx0), (dst.y as i32).wrapping_add(dy0));
+        }
         let n = w as usize * h as usize;
         let mut words = vec![0u32; n];
         let mut raws = vec![0u64; if raw { n } else { 0 }];

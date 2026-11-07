@@ -1,6 +1,7 @@
 //! What the board shows: the scanout's colour lookup and gamma, the retrace
 //! with its swap latching, and the window iris presents the frame in.
 
+use super::pipe::backend::DestMem;
 use super::board::Board;
 use super::consts::{
     dispmode, lut, overlay, ODSY_CMAP_UNVERIFIED_GROUP, ODSY_DID_MAIN_SHIFT,
@@ -43,6 +44,9 @@ pub(super) struct Display {
     /// The registers the display reads, for the host's cursor query; set
     /// when the board hands the display out.
     shared: OnceLock<Arc<DisplayShared>>,
+    /// Consumers (VNC) that read `screen.rgba` every frame
+    /// (`GfxDisplay::set_capture`): while any does, frames are read back.
+    capture: AtomicU32,
 }
 
 struct Local {
@@ -67,6 +71,47 @@ impl Display {
             shown: Mutex::new((0, 0)),
             status,
             shared: OnceLock::new(),
+            capture: AtomicU32::new(0),
+        }
+    }
+
+    /// Whether this frame can stay on the GPU: the installed renderer takes
+    /// frames on the board's device, and nothing wants `screen.rgba` filled
+    /// (a screenshot, a frame request, a capturing VNC client).
+    #[cfg(feature = "wgpu")]
+    pub(super) fn gpu_frames_wanted(&self) -> bool {
+        !self.screenshot.load(Ordering::Acquire)
+            && !self.frame.load(Ordering::Acquire)
+            && self.capture.load(Ordering::Acquire) == 0
+            && self.renderer.lock().as_ref().is_some_and(|r| r.takes_gpu_frames())
+    }
+
+    /// Present a frame composed on the GPU (0x00RRGGBB, rows of `width`)
+    /// through the installed renderer; `screen.rgba` keeps its last frame.
+    #[cfg(feature = "wgpu")]
+    pub(super) fn present_gpu(&self, frame: &wgpu::Buffer, width: u32, height: u32) {
+        let (w, h) = (width as usize, height as usize);
+        let mut screen = self.screen.lock();
+        screen.width = w.min(FB_STRIDE);
+        screen.height = h;
+        screen.prebuilt = true;
+        screen.status_bar_only = false;
+        *self.shown.lock() = (w, h);
+        let mut renderer = self.renderer.lock();
+        if let Some(renderer) = renderer.as_mut() {
+            let mut local = self.local.lock();
+            let local = local.get_or_insert_with(|| Local {
+                overlay: crate::debug_overlay::DebugOverlay::new(),
+                status: crate::disp::StatusBar::new(),
+                texture: crate::disp::StatusBarTexture::new(),
+                size: (0, 0),
+            });
+            if local.size != (w, h) {
+                renderer.resize(w, h);
+                local.size = (w, h);
+            }
+            let stats = self.status.snapshot(std::time::Instant::now(), display_fifo_pending());
+            renderer.present_gpu_frame(frame, width, height, &mut screen, &mut local.overlay, &mut local.status, &mut local.texture, &stats);
         }
     }
 
@@ -165,7 +210,8 @@ impl Board {
     /// Pixel (x, y)'s main window id: bits 7:3 of its window-id byte in the
     /// buffer the scan-out names (PB&J 0x2800 base, 0x2807 stride).
     pub fn main_id(&mut self, x: u32, y: u32) -> u32 {
-        let did = self.dest_mem().did.load1(x as i32, y as i32).unwrap_or(0);
+        // The id bytes are the front end's own: no wait (Board::id_compare_passes).
+        let did = DestMem::of(self.vram_ptr(), &self.dest_views()).did.load1(x as i32, y as i32).unwrap_or(0);
         ((did as u32) >> ODSY_DID_MAIN_SHIFT) & (dispmode::COUNT - 1)
     }
 
@@ -307,8 +353,19 @@ impl crate::gfx_display::GfxDisplay for Display {
     fn frame_pending(&self) -> bool {
         self.frame.load(Ordering::Acquire)
     }
+    fn set_capture(&self, on: bool) {
+        if on {
+            self.capture.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let _ = self.capture.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        }
+    }
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         // A racy read of the registers, as the display thread's frame does.
         self.shared.get()?.regs.hw_cursor()
+    }
+    #[cfg(feature = "wgpu")]
+    fn gpu(&self) -> Option<std::sync::Arc<crate::wgpu::Gpu>> {
+        Some(self.shared.get()?.gpu_scanout.get()?.lock().gpu())
     }
 }

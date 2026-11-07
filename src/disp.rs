@@ -554,10 +554,17 @@ impl StatusBarTexture {
         t
     }
 
-    /// Render the status bar and upload to the GL texture; returns the texture handle.
-    pub fn render_and_upload(&mut self, bar: &mut StatusBar, stats: &BarStats, width: usize, gl: &glow::Context) -> glow::Texture {
+    /// Render the status bar into `buf` (stride 2048, 0xAABBGGRR) with no
+    /// GL: what a renderer other than the GL one uploads itself.
+    pub fn render_pixels(&mut self, bar: &mut StatusBar, stats: &BarStats, width: usize) -> &[u32] {
         bar.update(stats.hb);
         bar.render(&mut self.buf, width, 0, stats);
+        &self.buf
+    }
+
+    /// Render the status bar and upload to the GL texture; returns the texture handle.
+    pub fn render_and_upload(&mut self, bar: &mut StatusBar, stats: &BarStats, width: usize, gl: &glow::Context) -> glow::Texture {
+        self.render_pixels(bar, stats, width);
         let tex = self.ensure_tex(gl);
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));

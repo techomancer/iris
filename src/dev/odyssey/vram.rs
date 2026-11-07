@@ -19,6 +19,9 @@
 //! format word's decode: `ignore/odsy/docs/measured.md` sections 4 and 5,
 //! `clanker/plans/odyssey-board-memory.md`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 /// Bytes in one unit of a base address.
 pub(super) const UNIT: u64 = 16;
 /// Pixels on a side of a tile.
@@ -119,17 +122,83 @@ impl Surface {
 
 }
 
+/// Bytes in one block of the dirty map, log2.
+pub(super) const DIRTY_BLOCK_SHIFT: u32 = 14;
+
+/// Which blocks of the memory the CPU has stored to since the map was last
+/// taken: kept when the memory is the CPU's mirror of the GPU's
+/// (`wgpu::GpuRaster`), so an upload moves only what changed. Marked by
+/// `VramPtr::store` from any thread.
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+pub(super) struct DirtyBlocks {
+    bits: Box<[AtomicU64]>,
+    blocks: u64,
+}
+
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+impl DirtyBlocks {
+    fn new(size: u64) -> DirtyBlocks {
+        let blocks = (size >> DIRTY_BLOCK_SHIFT).max(1);
+        DirtyBlocks { bits: (0..blocks.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(), blocks }
+    }
+
+    /// Mark the block holding word index w.
+    #[inline(always)]
+    fn mark_word(&self, w: usize) {
+        let b = w >> (DIRTY_BLOCK_SHIFT - 3);
+        self.bits[b >> 6].fetch_or(1 << (b & 63), Ordering::Relaxed);
+    }
+
+    pub fn clear(&self) {
+        for w in self.bits.iter() {
+            w.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The marked blocks as runs of bytes (offset, length), unmarked.
+    pub fn take_runs(&self) -> Vec<(u64, u64)> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let block = 1u64 << DIRTY_BLOCK_SHIFT;
+        for (i, w) in self.bits.iter().enumerate() {
+            let mut bits = w.swap(0, Ordering::Relaxed);
+            while bits != 0 {
+                let b = (i as u64) * 64 + bits.trailing_zeros() as u64;
+                bits &= bits - 1;
+                if b >= self.blocks {
+                    break;
+                }
+                let off = b * block;
+                match runs.last_mut() {
+                    Some((o, l)) if *o + *l == off => *l += block,
+                    _ => runs.push((off, block)),
+                }
+            }
+        }
+        runs
+    }
+}
+
 /// The board's memory.
 #[derive(Clone, Default)]
 pub(super) struct Vram {
     words: Vec<u64>,
+    /// The dirty map, once the memory mirrors the GPU's.
+    dirty: Option<Arc<DirtyBlocks>>,
 }
 
 impl Vram {
     /// Memory of at least size bytes, a power of two, so an address masks
     /// into it.
     pub fn new(size: u64) -> Vram {
-        Vram { words: vec![0; (size.next_power_of_two() / 8).max(1) as usize] }
+        Vram { words: vec![0; (size.next_power_of_two() / 8).max(1) as usize], dirty: None }
+    }
+
+    /// Start keeping the dirty map (the GPU instantiation's mirror).
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn track_dirty(&mut self) {
+        if self.dirty.is_none() {
+            self.dirty = Some(Arc::new(DirtyBlocks::new(self.size())));
+        }
     }
 
     /// Its size in bytes.
@@ -141,13 +210,17 @@ impl Vram {
     /// sized once, at allocation, and never moves, so the pointer stays
     /// good for the board's life.
     pub fn ptr(&mut self) -> VramPtr {
-        VramPtr { ptr: self.words.as_mut_ptr(), mask: self.words.len() - 1 }
+        VramPtr { ptr: self.words.as_mut_ptr(), mask: self.words.len() - 1, dirty: self.dirty_ptr() }
     }
 
     /// ptr() from a shared borrow: the memory is written through the pointer
     /// by units that race as the board's do (see VramPtr).
     pub fn ptr_shared(&self) -> VramPtr {
-        VramPtr { ptr: self.words.as_ptr() as *mut u64, mask: self.words.len() - 1 }
+        VramPtr { ptr: self.words.as_ptr() as *mut u64, mask: self.words.len() - 1, dirty: self.dirty_ptr() }
+    }
+
+    fn dirty_ptr(&self) -> *const DirtyBlocks {
+        self.dirty.as_ref().map_or(std::ptr::null(), |d| Arc::as_ptr(d))
     }
 
     pub fn words_mut(&mut self) -> &mut [u64] {
@@ -165,6 +238,8 @@ pub(super) struct VramPtr {
     ptr: *mut u64,
     /// Words less one: a word index masks into the memory.
     mask: usize,
+    /// The dirty map, or null when none is kept (Vram::track_dirty).
+    dirty: *const DirtyBlocks,
 }
 
 // SAFETY: the array outlives every user (Board owns it and stops the raster
@@ -204,7 +279,54 @@ impl VramPtr {
                 let m = ((1u64 << (8 * n)) - 1) << shift;
                 *p = (*p & !m) | ((v << shift) & m);
             }
+            if !self.dirty.is_null() {
+                (*self.dirty).mark_word((a >> 3) as usize & self.mask);
+            }
         }
+    }
+
+    /// The same memory with no dirty map: for a writer that uploads what
+    /// it wrote itself (`GpuRaster::upload_region`).
+    pub fn untracked(&self) -> VramPtr {
+        VramPtr { ptr: self.ptr, mask: self.mask, dirty: std::ptr::null() }
+    }
+
+    /// The dirty map's marked blocks as byte runs, unmarked; none without a
+    /// map.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn take_dirty_runs(&self) -> Vec<(u64, u64)> {
+        if self.dirty.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: the map lives as long as the memory (Vram::dirty).
+        unsafe { (*self.dirty).take_runs() }
+    }
+
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn clear_dirty(&self) {
+        if !self.dirty.is_null() {
+            // SAFETY: as take_dirty_runs().
+            unsafe { (*self.dirty).clear() }
+        }
+    }
+
+    /// The words at byte offset `off` (8-aligned, in range, not wrapping),
+    /// `len` bytes of them, for an upload.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn words_at(&self, off: u64, len: u64) -> &[u64] {
+        debug_assert!(off % 8 == 0 && len % 8 == 0 && off + len <= self.size());
+        // SAFETY: in range; readers and writers race as the board's units do.
+        unsafe { std::slice::from_raw_parts(self.ptr.add((off >> 3) as usize), (len >> 3) as usize) }
+    }
+
+    /// Store `words` at byte offset `off` (8-aligned, in range) without
+    /// marking the dirty map: a readback from the GPU, which the GPU
+    /// already holds.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "used by the GPU raster unit"))]
+    pub fn write_words_untracked(&self, off: u64, words: &[u64]) {
+        debug_assert!(off % 8 == 0 && off + 8 * words.len() as u64 <= self.size());
+        // SAFETY: in range; as above.
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), self.ptr.add((off >> 3) as usize), words.len()) }
     }
 
     /// The memory's size in bytes.
@@ -226,7 +348,7 @@ impl VramPtr {
 
     /// No memory: a view of a field the surface lacks, which nothing reads.
     pub fn null() -> VramPtr {
-        VramPtr { ptr: std::ptr::null_mut(), mask: 0 }
+        VramPtr { ptr: std::ptr::null_mut(), mask: 0, dirty: std::ptr::null() }
     }
 }
 

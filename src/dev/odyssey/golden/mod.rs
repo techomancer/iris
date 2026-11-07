@@ -250,7 +250,7 @@ fn every_scene_draws_the_same_on_the_raster_and_back_end_threads() {
 
         c.board.raster.start_threads(true);
         assert!(scenes::run_scene(name, &mut c));
-        c.board.raster_wait();
+        c.board.gpu_sync();
         let threaded = Frame::of(&c.board);
         c.board.raster.stop();
         assert_eq!(threaded.hash(), inline.hash(), "scene {name}: {:?}", distance(&threaded, &inline, &Tolerance::default()));

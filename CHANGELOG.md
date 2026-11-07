@@ -52,6 +52,30 @@ hashes are given where a change is easiest to understand by reading the commit.
   `vpro fbdump`'s files, to diff against a live board's dump, and `vpro
   fbdump` adds `objects.bin`.
 
+### VPro on the host GPU (`wgpu` feature, in progress)
+
+- `[graphics] raster = "wgpu"` moves the VPro's raster unit to the host GPU
+  through wgpu compute (`src/wgpu`, `src/dev/odyssey/wgpu`): filled
+  triangles, textured or not, clears and the whole back end run as
+  kernels over board memory in a GPU buffer, word for word with the CPU
+  pipeline (the golden scenes, the parity tests and the quake1 replay's
+  checkpoints pass on it); fogged and user-clipped primitives, lines and
+  points are still shaded on the CPU and stored by the GPU in order. The
+  front end's own pixel paths work on a mirror the unit keeps current, and
+  the display composes on the GPU too, read back into the window until the
+  GUI shares the device. Batches are submitted as the board goes idle, so
+  the PROM and X painting reach the screen at once, and a swap latches only
+  after the drawing armed before it is submitted. `vpro gpu` shows the
+  unit's counters. Window-id writes are kept in step with the front end's
+  own reads, which fixed GPU-only failures in the visual sweep; the GL
+  test suites, the visual and line sweeps and the scenes now read back the
+  same on both raster units.
+- `renderer = "wgpu"` (`--renderer wgpu`) draws the window through wgpu;
+  with the VPro on the GPU unit the frame is presented from the board's
+  memory without a readback, and Newport's display is composed on the GPU
+  (the GL compositor's work in WGSL). Branch `wgpu-raster`, plan in
+  `clanker/plans/wgpu-raster.md`.
+
 ### VPro drawing
 
 - Copies from a window into a texture (`glCopyTexSubImage`) read the
