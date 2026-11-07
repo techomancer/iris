@@ -64,7 +64,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::dev::heart::host_clock()));
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
     xbow.connect_host(HEART_HOST, heart.clone());
-    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()));
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()), &crate::ip30::PCI0);
     bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
     let phys = Ip30Bus::new(ram);
     phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
@@ -463,19 +463,20 @@ impl Octane {
         ram.set_memcfg([0x8001_0000, 0, 0, 0]);
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
-        let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()));
+        let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()), &crate::ip30::PCI0);
 
         let eth = Ioc3Eth::with_negotiation_delay(MAC, std::time::Duration::ZERO);
         let (link, sent, inject) = crate::net::Link::loopback();
         eth.attach(link);
         let ioc3 = Arc::new(Ioc3::octane(MAC, false));
         ioc3.attach_eth(eth.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN as u8));
+        ioc3.connect_superio_interrupt(bridge.bus().board_irq(crate::pci::BoardIrq(SUPERIO_PIN as u8)));
 
         let isp = [Arc::new(Isp1040::new_at(0, Isp1040::new_bus())), Arc::new(Isp1040::new_at(1, Isp1040::new_bus()))];
-        bridge.attach(SLOT_ISP0 as u8, isp[0].clone());
-        bridge.attach(SLOT_ISP1 as u8, isp[1].clone());
-        bridge.attach(SLOT_IOC3 as u8, ioc3.clone());
+        let at = |slot: u32| crate::pci::DevFn { device: slot as u8, function: 0 };
+        bridge.bus().attach(at(SLOT_ISP0 as u32), isp[0].clone());
+        bridge.bus().attach(at(SLOT_ISP1 as u32), isp[1].clone());
+        bridge.bus().attach(at(SLOT_IOC3 as u32), ioc3.clone());
         Octane { heart, mem, bridge, isp, sent, inject, eth }
     }
 
@@ -1066,26 +1067,29 @@ fn flash_serves_the_stock_prom_as_the_processor_sees_it() {
 #[test]
 fn a_bar_run_answers_as_the_window_does() {
     let o = Octane::new();
-    let runs = Arc::new(parking_lot::Mutex::new(Vec::<crate::pci::BarRun>::new()));
-    let sink = runs.clone();
-    o.bridge.on_bar_runs(Box::new(move |r| *sink.lock() = r));
+    let runs = Arc::new(parking_lot::Mutex::new(Vec::<(std::ops::Range<u64>, Arc<dyn BusDevice>)>::new()));
+    let (sink, bridge) = (runs.clone(), Arc::downgrade(&o.bridge));
+    o.bridge.bus().on_bar_mappings(Box::new(move |r| {
+        let b = bridge.upgrade().unwrap();
+        *sink.lock() = r.iter().map(|r| (r.cpu..r.cpu + r.len, b.bar_device(r))).collect();
+    }));
     assert!(runs.lock().is_empty(), "nothing decodes before the PROM places a BAR");
     o.ioc3_map();
     let win = Octane::ioc3_win() as u64;
-    let run = runs.lock().iter().find(|r| r.start <= win && win < r.end).cloned().expect("IOC3's window is a run");
-    assert_eq!((run.start, run.end), (win, win + (1 << 20)), "the whole 1 MB window");
+    let run = runs.lock().iter().find(|r| r.0.contains(&win)).cloned().expect("IOC3's window is a run");
+    assert_eq!((run.0.start, run.0.end), (win, win + (1 << 20)), "the whole 1 MB window");
     let at = win + RTC_DATA as u64;
     o.w8(RTC_INDEX, 0x0e); // a byte of the clock's RAM
-    assert_eq!(run.dev.write32(at, 0xaabb_ccdd), BUS_OK);
+    assert_eq!(run.1.write32(at, 0xaabb_ccdd), BUS_OK);
     assert_eq!(o.i8(RTC_DATA), 0xaa, "a word store through the run lands as through the window");
     o.w8(RTC_DATA + 3, 0x77);
-    assert_eq!(run.dev.read8(at).data, o.bridge.read8(at).data);
-    assert_eq!(run.dev.read16(at).data, o.bridge.read16(at).data);
-    assert_eq!(run.dev.read32(at).data, o.bridge.read32(at).data);
-    assert_eq!(run.dev.read64(at).data, o.bridge.read64(at).data);
-    assert_eq!(run.dev.read32(at).data, 0x7777_7777);
+    assert_eq!(run.1.read8(at).data, o.bridge.read8(at).data);
+    assert_eq!(run.1.read16(at).data, o.bridge.read16(at).data);
+    assert_eq!(run.1.read32(at).data, o.bridge.read32(at).data);
+    assert_eq!(run.1.read64(at).data, o.bridge.read64(at).data);
+    assert_eq!(run.1.read32(at).data, 0x7777_7777);
     // The window aimed at PCI space nothing decodes: no run, and the
     // Bridge's master time-out is what answers there.
     o.set(reg::device(SLOT_IOC3), 0x1000 | (0x3000_0000 >> 20));
-    assert!(runs.lock().iter().all(|r| !(r.start <= win && win < r.end)));
+    assert!(runs.lock().iter().all(|r| !r.0.contains(&win)));
 }

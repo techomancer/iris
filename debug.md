@@ -593,9 +593,14 @@ Per-module logging; all of it needs a developer build to produce output.
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
 Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
-xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock pci`. `pci` logs every
+xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock pci bridge heart`. `pci` logs every
 configuration cycle on a PCI bus (MACE's, the Octane Bridge's) and
-whether a function answered it. Mask categories: `pdma` —
+whether a function answered it. `bridge` logs the Octane Bridge's
+register and translation-table accesses by name, and any transfer a PCI
+function started that reached no memory, and each interrupt pin's edges
+and the HEART vector it sets or clears. `heart` logs HEART's register
+accesses, one counter read in 256 with the host's clock, and every
+interrupt vector raised or lowered. Mask categories: `pdma` —
 `hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; every module also takes `on`/`all`, `off`/`none` or a hex mask.
 `bedrock` covers the Fuel's devices on its Bedrock hub.
@@ -634,7 +639,7 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `re dither [on\|off]` | Show or set whether the engine dithers, to compare renderings; on by default |
 | `gbe status` | GBE display engine: timing, frame buffer, tiles |
 | `isa status` | MACE ISA interrupts |
-| `pci status` / `pci config <slot>` | MACE PCI bridge / a function's configuration space |
+| `pci status` / `pci config <slot>` | The PCI bus (on the O2 with MACE's registers; the Octane has it too) / a function's configuration space |
 | `mec status` | MACE Ethernet: rings, receive buffers, frame counts |
 | `sdma status` | MACE serial DMA |
 | `maceps2 status` / `maceps2 traffic` | PS/2 ports / recent bytes each way |

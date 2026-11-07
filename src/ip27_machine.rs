@@ -848,7 +848,7 @@ impl Ip27Board for Origin200 {
     fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
         let node = nodes[0];
         let controller = Origin200Controller::new(node, cfg.origin200.controller_store.as_deref().map(Path::new))?;
-        let bridge = Bridge::new(Upstream::single(HUB_HOST, node.hub.inbound(), node.hub.interrupt_target()));
+        let bridge = Bridge::new(Upstream::single(HUB_HOST, node.hub.inbound(), node.hub.interrupt_target()), &crate::ip30::PCI0);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
         // The Bridge answers every small window but the Hub's own.
@@ -887,14 +887,16 @@ pub(crate) fn pci_devices(
     for s in &scsi {
         s.set_heartbeat(heartbeat.clone());
     }
-    bridge.attach(0, scsi[0].clone());
-    bridge.attach(1, scsi[1].clone());
+    let pci = bridge.bus();
+    let slot = |device| crate::pci::DevFn { device, function: 0 };
+    pci.attach(slot(0), scsi[0].clone());
+    pci.attach(slot(1), scsi[1].clone());
     let ioc3 = Arc::new(Ioc3::new(ioc3_config));
     ioc3.set_heartbeat(heartbeat.clone());
     eth.set_heartbeat(heartbeat);
     ioc3.attach_eth(eth.clone());
-    bridge.attach(2, ioc3.clone());
-    ioc3.connect_superio_interrupt(bridge.pin_line(superio_pin));
+    pci.attach(slot(2), ioc3.clone());
+    ioc3.connect_superio_interrupt(pci.board_irq(crate::pci::BoardIrq(superio_pin)));
     ioc3.set_timer_manager(node.timers.clone());
     // The Fuel's M48T35 Timekeeper is the same part.
     let timekeeper = Arc::new(Timekeeper::fuel_with_nvram_file(Path::new(&cfg.nvram))?);

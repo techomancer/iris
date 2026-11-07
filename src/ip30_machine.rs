@@ -39,6 +39,7 @@ use crate::ip30::{
     widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
     WIDGET_XBOW,
 };
+use crate::pci::{BoardIrq, DevFn};
 use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkStore};
 use crate::snapshot::{field, ChunksManifest, Manifest, Snapshot, StateTable, SCHEMA_VERSION};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
@@ -220,7 +221,7 @@ impl OctaneMachine {
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
-        let bridge = Bridge::new(Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()));
+        let bridge = Bridge::new(Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()), &crate::ip30::PCI0);
         bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
@@ -247,15 +248,17 @@ impl OctaneMachine {
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
         }
-        bridge.attach(0, scsi[0].clone());
-        bridge.attach(1, scsi[1].clone());
+        let pci = bridge.bus();
+        let slot = |device| DevFn { device, function: 0 };
+        pci.attach(slot(0), scsi[0].clone());
+        pci.attach(slot(1), scsi[1].clone());
         let ioc3 = Arc::new(Ioc3::octane(mac, false));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = Ioc3Eth::new(mac);
         eth.set_heartbeat(heartbeat.clone());
         ioc3.attach_eth(eth.clone());
-        bridge.attach(2, ioc3.clone());
-        ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN));
+        pci.attach(slot(2), ioc3.clone());
+        ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(SUPERIO_PIN)));
         ioc3.set_timer_manager(timer_manager.clone());
         // The guest switching the machine off through the clock.
         ioc3.set_event_sender(event_tx.clone());
@@ -271,12 +274,12 @@ impl OctaneMachine {
         if !cfg.no_audio {
             rad.enable_output(cfg.audio.clone());
         }
-        bridge.attach(3, rad.clone());
+        pci.attach(slot(3), rad.clone());
         let virtio = cfg.virtio_serial.enabled.then(|| {
             let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
                 crate::dev::virtio::console::from_config(&cfg.virtio_serial),
             ));
-            bridge.attach(VIRTIO_SLOT, dev.clone());
+            pci.attach(slot(VIRTIO_SLOT), dev.clone());
             eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
             dev
         });
@@ -332,9 +335,10 @@ impl OctaneMachine {
         }));
         // Device-window pages a PCI BAR decodes whole go straight to the
         // function.
-        let weak = Arc::downgrade(&phys);
-        bridge.on_bar_runs(Box::new(move |runs| {
-            if let Some(p) = weak.upgrade() {
+        let (weak, bridge_weak) = (Arc::downgrade(&phys), Arc::downgrade(&bridge));
+        bridge.bus().on_bar_mappings(Box::new(move |runs| {
+            if let (Some(p), Some(b)) = (weak.upgrade(), bridge_weak.upgrade()) {
+                let runs = runs.iter().map(|r| (r.cpu..r.cpu + r.len, b.bar_device(r))).collect();
                 p.set_widget_runs(WIDGET_BRIDGE, runs);
             }
         }));
@@ -457,6 +461,8 @@ impl OctaneMachine {
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         monitor.register_device(heart.clone());
+        // `pci`: the Bridge's bus, as the O2's MACE shows its own.
+        monitor.register_device(bridge.clone());
         monitor.register_device(phys.phys.clone());
         monitor.register_device(Arc::new(Ip30Monitor {
             phys: phys.clone(),

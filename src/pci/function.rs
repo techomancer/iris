@@ -50,7 +50,7 @@ impl PciFunctionState {
 /// A PCI function, as a host bridge sees it.
 ///
 /// BAR accesses arrive with the offset and value the device sees: whatever
-/// the bridge does to byte lanes it has already done.
+/// the bridge does to byte order it has already done.
 pub trait PciFunction: Send + Sync {
     /// The function's header, and the interrupt line and DMA the bus gave it.
     fn state(&self) -> &PciFunctionState;

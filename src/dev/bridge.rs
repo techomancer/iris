@@ -53,8 +53,11 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 
 use crate::dev::w1;
-use crate::irq::{InterruptController, IrqLine};
-use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciFunction, PciDma, PciDmaStatus, PciLanes, Space};
+use crate::devlog::LogModule;
+use crate::irq::InterruptController;
+use crate::pci::BarMapping;
+use crate::pci::{CpuWindow, DevFn, IntxRouting, PciBus, PciDma, PciDmaStatus, PciHost, Space};
+use crate::pci::{BarDevices, ByteOrder};
 use crate::snapshot::{field, field_u32, field_u32s, field_u64, field_u64_vec, field_u8, field_u8s, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
 use crate::xtalk::Upstream;
@@ -108,6 +111,46 @@ pub mod reg {
     pub const RRB_ODD: u32 = 0x288;
     pub const RRB_STATUS: u32 = 0x290;
     pub const RRB_CLEAR: u32 = 0x298;
+}
+
+/// A register's name for the `bridge` log, from its slot base.
+fn reg_name(base: u32) -> String {
+    use reg::*;
+    let name = match base {
+        IDENTIFICATION => "identification",
+        STATUS => "status",
+        ERR_UPPER => "error upper",
+        ERR_LOWER => "error lower",
+        CONTROL => "control",
+        REQUEST_TIMEOUT => "request timeout",
+        INT_DEST_UPPER => "interrupt destination upper",
+        INT_DEST_LOWER => "interrupt destination lower",
+        ERR_CMD_WORD => "error command word",
+        LINK_CONFIG => "link config",
+        TARGET_FLUSH => "target flush",
+        DIRECT_MAP => "direct map",
+        ARBITRATION => "arbitration",
+        NIC => "nic",
+        BUS_TIMEOUT => "bus timeout",
+        PCI_TYPE1_CONFIG => "type 1 config",
+        PCI_ERR_UPPER => "pci error upper",
+        PCI_ERR_LOWER => "pci error lower",
+        INT_STATUS => "interrupt status",
+        INT_ENABLE => "interrupt enable",
+        INT_RESET => "interrupt reset",
+        INT_MODE => "interrupt mode",
+        INT_DEVICE => "interrupt device",
+        HOST_ERR_FIELD => "host error field",
+        RRB_EVEN => "rrb even",
+        RRB_ODD => "rrb odd",
+        RRB_STATUS => "rrb status",
+        RRB_CLEAR => "rrb clear",
+        0x130..=0x168 => return format!("interrupt host {}", (base - 0x130) / 8),
+        0x200..=0x238 => return format!("device {}", (base - 0x200) / 8),
+        0x240..=0x278 => return format!("device {} flush", (base - 0x240) / 8),
+        _ => "",
+    };
+    format!("{base:#05x} {name}")
 }
 
 /// Window geometry, as offsets in the small window.
@@ -322,12 +365,8 @@ struct State {
     /// Latched error bits of the interrupt status register (31:8).
     int_error: u32,
     /// The eight pins' driven levels, which the status register reports.
-    /// They follow the level and never latch.
+    /// They follow the level the bus combines for each pin and never latch.
     pin_level: u8,
-    pci_pin_level: u8,
-    gpio_pin_level: u8,
-    /// Each slot's INTA..INTD, as `slot * 4 + pin - 1`.
-    pci_lines: [bool; DEVICES * 4],
     /// Slots whose data phases are 64 bits wide.
     dma_64bit: u8,
     /// The transfer the last DMA translation served, for error capture.
@@ -386,50 +425,23 @@ pub struct Bridge {
     /// The host chips this Bridge's transfers and interrupt packets can go
     /// to, by the widget number the guest programs.
     up: Upstream,
-    slots: RwLock<[Option<Arc<dyn PciFunction>>; DEVICES]>,
+    /// The functions on the Bridge's PCI bus, their BAR windows and their
+    /// interrupt pins.
+    bus: PciBus,
+    /// This Bridge, for the DMA a function is given: it must not keep the
+    /// Bridge alive.
+    me: Weak<Bridge>,
     flash: RwLock<[Option<FlashPart>; 2]>,
     flash_strap: AtomicBool,
     /// The silicon revision in the identification word, bits 31:28.
     revision: AtomicU32,
+    /// The devices made for BAR mappings, once each.
+    bar_devices: BarDevices,
     /// The one-wire net behind the NIC register; none fitted reads as an
     /// empty bus.
     microlan: Mutex<Option<w1::Bus>>,
     /// Whether the Crossbow has a live link to a widget; default the hosts.
     link_alive: RwLock<Box<dyn Fn(u8) -> bool + Send + Sync>>,
-    /// Where the runs of the device windows a BAR decodes whole go (the
-    /// machine maps them over this widget's window), and the table entries
-    /// made for them, so one configuration maps to one entry.
-    bar_sink: RwLock<Option<BarRunSink>>,
-    bar_entries: Mutex<std::collections::HashMap<(usize, usize, usize, bool, u64), Arc<dyn BusDevice>>>,
-}
-
-/// A function's INTA..INTD, as a level into the Bridge: the line is
-/// `slot * 4 + pin - 1`.
-struct PciPin {
-    bridge: Weak<Bridge>,
-}
-
-impl InterruptController for PciPin {
-    fn set_line(&self, line: u32, level: bool) {
-        if let Some(b) = self.bridge.upgrade() {
-            b.set_pci_line(line as usize, level);
-        }
-    }
-}
-
-/// One of the chip's eight pins driven directly (the GPIO inputs that
-/// share them with PCI), holding the Bridge weakly so the device that
-/// holds the line does not keep it alive.
-struct WirePin {
-    bridge: Weak<Bridge>,
-}
-
-impl InterruptController for WirePin {
-    fn set_line(&self, line: u32, level: bool) {
-        if let Some(b) = self.bridge.upgrade() {
-            b.set_wire_irq(line, level);
-        }
-    }
 }
 
 /// A function's way to memory, tagged with its slot: the swap bits that
@@ -484,35 +496,40 @@ impl Placement {
 impl Bridge {
     /// A Bridge that masters memory and interrupts the host chips of `up`,
     /// each addressed as it states and chosen by the widget number the guest
-    /// programs. Registers start at their power-up values.
-    pub fn new(up: Upstream) -> Arc<Self> {
+    /// programs, its PCI bus wired as `wiring`. Registers start at their
+    /// power-up values.
+    pub fn new(up: Upstream, wiring: &'static IntxRouting) -> Arc<Self> {
         let mut st = State {
             reg: [0; REG_SLOTS],
             ate: [0; ATE_ENTRIES],
             int_error: 0,
             pin_level: 0,
-            pci_pin_level: 0,
-            gpio_pin_level: 0,
-            pci_lines: [false; DEVICES * 4],
             dma_64bit: 0,
             dma_pci_address: 0,
             dma_device: 0,
         };
         st.reset_core(false, REVISION);
         let hosts = (0..16u8).filter(|&w| up.get(w).is_some()).fold(0u16, |m, w| m | 1 << w);
-        Arc::new(Self {
+        let this = Arc::new_cyclic(|me: &Weak<Bridge>| Self {
             st: Mutex::new(st),
             irq_order: Mutex::new(()),
             up,
-            slots: RwLock::new(Default::default()),
+            bus: PciBus::new(0, wiring, me.clone()),
+            me: me.clone(),
             flash: RwLock::new(Default::default()),
             flash_strap: AtomicBool::new(false),
             revision: AtomicU32::new(REVISION),
             microlan: Mutex::new(None),
+            bar_devices: Default::default(),
             link_alive: RwLock::new(Box::new(move |w| hosts.checked_shr(w as u32).is_some_and(|m| m & 1 != 0))),
-            bar_sink: RwLock::new(None),
-            bar_entries: Mutex::new(Default::default()),
-        })
+        });
+        this.bus.set_host_windows(&|| this.windows());
+        this
+    }
+
+    /// The functions on the Bridge's PCI bus.
+    pub fn bus(&self) -> &PciBus {
+        &self.bus
     }
 
     pub fn register_locks(self: &Arc<Self>) {
@@ -538,73 +555,48 @@ impl Bridge {
         ret
     }
 
-    /// One of the chip's pins as a line a device can hold: the level drives
-    /// the pin directly, sharing it with whatever PCI functions are wired
-    /// to it (IOC3's SuperIO interrupt is `pin_line(4)`). The line holds the
-    /// Bridge weakly.
-    pub fn pin_line(self: &Arc<Self>, pin: u8) -> IrqLine {
-        IrqLine::new(Arc::new(WirePin { bridge: Arc::downgrade(self) }), pin as u32)
-    }
-
-    /// Put a function in `slot` (0..8), give it its way to memory and wire
-    /// its interrupt pin (INTA..INTD per its header) to the Bridge's pins.
-    pub fn attach(self: &Arc<Self>, slot: u8, dev: Arc<dyn PciFunction>) {
-        let slot = slot as usize;
-        assert!(slot < DEVICES, "Bridge has {DEVICES} slots");
-        dev.state().connect_dma(Arc::new(SlotDma { bridge: Arc::downgrade(self), slot }));
-        let pin = dev.state().config().interrupt_pin();
-        if (1..=4).contains(&pin) {
-            let router = Arc::new(PciPin { bridge: Arc::downgrade(self) });
-            dev.state().connect_irq(IrqLine::new(router, (slot * 4 + pin as usize - 1) as u32));
-        }
-        dev.attached();
-        self.slots.write()[slot] = Some(dev);
-        self.publish_bars();
-    }
-
-    /// Send the runs of the device windows that one BAR decodes whole to
-    /// `sink`, now and whenever a Device(x) register, a configuration
-    /// header or a reset changes them. Each run is a [`PciBar`] offset in
-    /// this widget's window: the machine maps it over the window, so the
-    /// processor reaches the function with no search of the bus and no
-    /// Bridge lock. Everything else in a window (pages a BAR covers in
-    /// part, an unclaimed address and its master time-out) still comes here.
-    pub fn on_bar_runs(&self, sink: BarRunSink) {
-        *self.bar_sink.write() = Some(sink);
-        self.publish_bars();
-    }
-
-    fn publish_bars(&self) {
-        let sink = self.bar_sink.read();
-        let Some(sink) = sink.as_ref() else { return };
-        let regs: Vec<u32> = {
-            let st = self.st.lock();
-            (0..DEVICES as u32).map(|s| st.r(reg::device(s))).collect()
-        };
-        let funcs: Vec<(usize, Arc<dyn PciFunction>)> =
-            self.slots.read().iter().enumerate().filter_map(|(i, d)| Some((i, d.clone()?))).collect();
-        let mut runs: Vec<BarRun> = Vec::new();
-        for (s, &d) in regs.iter().enumerate() {
-            let base = (d & DEV_WINDOW_BASE_MASK) << 20;
-            let width = if d & DEV_64BIT_DEVICE != 0 { 8 } else { 4 };
-            let swap = d & DEV_SWAP_PROGRAMMED != 0;
-            let space = if d & DEV_MEMORY_SPACE != 0 { Space::Mem } else { Space::Io };
-            let (off, size) = (device_window_offset(s as u32) as u64, device_window_size(s as u32) as u64);
-            runs.extend(bar_runs(&funcs, space, off, base, size, |b| self.bar_entry(b, width, swap)));
-        }
-        sink(runs);
-    }
-
-    fn bar_entry(&self, b: BarAt, width: usize, swap: bool) -> Arc<dyn BusDevice> {
-        let key = (b.slot, b.bar, width, swap, b.cpu_base);
-        self.bar_entries
-            .lock()
-            .entry(key)
-            .or_insert_with(|| {
-                let lanes = Arc::new(Lanes { width, swap });
-                Arc::new(PciBar::new(lanes, b.dev.clone(), b.bar, WINDOW_MASK as u64, b.cpu_base))
+    /// The eight device windows as the Device(x) registers have them: each
+    /// opens onto PCI memory or I/O space at the base its register names.
+    fn windows(&self) -> Vec<CpuWindow> {
+        let st = self.st.lock();
+        (0..DEVICES as u32)
+            .map(|s| {
+                let d = st.r(reg::device(s));
+                CpuWindow {
+                    space: if d & DEV_MEMORY_SPACE != 0 { Space::Mem } else { Space::Io },
+                    cpu: device_window_offset(s) as u64,
+                    pci: (d & DEV_WINDOW_BASE_MASK) << 20,
+                    len: device_window_size(s) as u64,
+                    mask: WINDOW_MASK as u64,
+                }
             })
-            .clone()
+            .collect()
+    }
+
+    /// How a CPU access to window `window` reaches a function, from its
+    /// Device(x) register: the programmed swap gives a byte stream, otherwise
+    /// the device's width gives word values.
+    fn order(&self, window: usize) -> ByteOrder {
+        Self::order_of(self.st.lock().r(reg::device(window as u32)))
+    }
+
+    fn order_of(device: u32) -> ByteOrder {
+        if device & DEV_SWAP_PROGRAMMED != 0 {
+            ByteOrder::Stream
+        } else {
+            ByteOrder::values(if device & DEV_64BIT_DEVICE != 0 { 8 } else { 4 })
+        }
+    }
+
+    /// The bus device the machine maps over the part of the Bridge's window
+    /// that `run` covers: the function's BAR through the order the window's
+    /// Device(x) register sets, so the processor reaches the function with no
+    /// search of the bus and no Bridge lock. The run is in the widget's small
+    /// window, so a mapped device sees offsets in it. The same configuration
+    /// gives back the same device, so updating the mappings does not make the
+    /// physical bus keep a new one.
+    pub fn bar_device(&self, run: &BarMapping) -> Arc<dyn BusDevice> {
+        self.bar_devices.get(run, WINDOW_MASK as u64, self.order(run.window as usize))
     }
 
     /// Fit a flash part on chip select 0. `part` is addressed from the
@@ -671,43 +663,22 @@ impl Bridge {
         st.dma_64bit = (st.dma_64bit & !(1 << slot)) | ((wide as u8) << slot);
     }
 
-    /// Drive one of the chip's directly wired interrupt inputs (the GPIO
-    /// pins), which share the eight pins with PCI. `pin` is 0..8; anything
-    /// else is not a pin.
-    pub fn set_wire_irq(&self, pin: u32, level: bool) {
-        if pin as usize >= PINS {
-            return;
-        }
-        self.irq_locked(|st, p| {
-            st.gpio_pin_level = (st.gpio_pin_level & !(1 << pin)) | ((level as u8) << pin);
-            self.update_pin(st, p, pin as usize);
-        });
-    }
-
     /// Reset the Bridge's own state: the register file, the translation
     /// table and the latched errors return to power-up. The interrupt
     /// inputs keep their levels, since the functions holding them are not
-    /// in this reset and would never raise another edge; the pins are
-    /// re-evaluated against the cleared enables.
+    /// in this reset and would never raise another edge.
     pub fn reset(&self) {
         let strap = self.flash_strap.load(Ordering::Acquire);
         let revision = self.revision.load(Ordering::Acquire);
-        let mut st = self.st.lock();
-        st.reset_core(strap, revision);
-        st.pin_level = st.pci_pin_level | st.gpio_pin_level;
-        drop(st);
-        self.publish_bars();
+        self.st.lock().reset_core(strap, revision);
+        self.bus.set_host_windows(&|| self.windows());
     }
 
-    /// The machine's reset reaching the PCI side: RST# returns every
-    /// function's configuration header to power-up, so none decodes until
-    /// firmware assigns its BARs again. The functions' own state is theirs
-    /// to reset.
+    /// The machine's reset reaching the PCI side: RST# on the bus. Every
+    /// function's configuration header returns to power-up, so none decodes
+    /// until firmware assigns its BARs again.
     pub fn reset_pci(&self) {
-        for d in self.slots.read().iter().flatten() {
-            d.state().config().reset();
-        }
-        self.publish_bars();
+        self.bus.reset();
     }
 
     /// The Crossbow's link reset arriving. IRIX saves the control and link
@@ -734,36 +705,17 @@ impl Bridge {
 
     // ---- interrupts ----
 
-    /// Pins A and C reach the pin numbered as the slot, B and D that
-    /// number with bit two flipped.
-    fn pin_of(slot: usize, pin0: usize) -> usize {
-        if pin0 & 1 != 0 {
-            slot ^ 4
-        } else {
-            slot
-        }
-    }
-
-    fn set_pci_line(&self, line: usize, level: bool) {
-        if line >= DEVICES * 4 {
-            return;
-        }
-        self.irq_locked(|st, p| {
-            st.pci_lines[line] = level;
-            // Several functions can share a pin: the pin is the OR of its lines.
-            let pin = Self::pin_of(line / 4, line % 4);
-            let any = (0..DEVICES * 4).any(|l| st.pci_lines[l] && Self::pin_of(l / 4, l % 4) == pin);
-            st.pci_pin_level = (st.pci_pin_level & !(1 << pin)) | ((any as u8) << pin);
-            self.update_pin(st, p, pin);
-        });
-    }
-
-    fn update_pin(&self, st: &mut State, p: &mut Packets, pin: usize) {
-        let level = (st.pci_pin_level | st.gpio_pin_level) >> pin & 1 != 0;
+    /// Pin `pin` is now at `level`, as the bus combined every function and
+    /// board wire routed to it. The chip sends on a transition, not while a
+    /// level is held.
+    fn update_pin(&self, st: &mut State, p: &mut Packets, pin: usize, level: bool) {
         let was = st.pin_level >> pin & 1 != 0;
         let enabled = st.r(reg::INT_ENABLE) >> pin & 1 != 0;
+        if level != was {
+            crate::dlog!(LogModule::Bridge, "bridge: pin {pin} {}{}", if level { "rose" } else { "fell" },
+                if enabled { "" } else { " (not enabled)" });
+        }
         st.pin_level = (st.pin_level & !(1 << pin)) | ((level as u8) << pin);
-        // The chip sends on a transition, not while a level is held.
         if level && !was && enabled {
             self.send_interrupt(st, p, pin, true);
         } else if !level && was && enabled && st.r(reg::INT_MODE) >> pin & 1 != 0 {
@@ -791,7 +743,10 @@ impl Bridge {
         let address = (dest.address & !(0x3ffu64 << 38)) | field << 38;
         let vector = (host & INT_HOST_FIELD) as u8;
         match self.up.get(dest.widget) {
-            Some(h) if h.host.accepts(dest.widget, address, vector) => p.push((dest.widget, vector, set)),
+            Some(h) if h.host.accepts(dest.widget, address, vector) => {
+                crate::dlog!(LogModule::Bridge, "bridge: pin {pin} {} vector {vector} of widget {}", if set { "sets" } else { "clears" }, dest.widget);
+                p.push((dest.widget, vector, set));
+            }
             Some(_) => log::debug!("bridge: interrupt packet to widget {} address {address:#x} vector {vector} is not one its host takes; dropped", dest.widget),
             None => log::debug!("bridge: interrupt packet to widget {}, which is not a host; dropped", dest.widget),
         }
@@ -984,18 +939,15 @@ impl Bridge {
 
     /// The function a type 0 configuration offset selects, and the corrected
     /// register byte offset within it.
-    fn cfg_target(&self, off: u32, size: usize) -> (usize, u32, Option<Arc<dyn PciFunction>>) {
-        let slot = ((off >> 12) & 7) as usize;
-        let func = (off >> 8) & 7;
-        let reg = Self::lane_correct(off & 0xff, size);
-        let dev = if func == 0 { self.slots.read()[slot].clone() } else { None };
-        (slot, reg, dev)
+    fn cfg_target(off: u32, size: usize) -> (DevFn, u32) {
+        let at = DevFn { device: ((off >> 12) & 7) as u8, function: ((off >> 8) & 7) as u8 };
+        (at, Self::lane_correct(off & 0xff, size))
     }
 
     /// No device drove device select: a master time-out. The cycle's PCI
     /// address is the device's ID select, one line per device from line 24,
     /// then the register's word.
-    fn config_master_timeout(&self, slot: usize, reg: u32) {
+    fn config_master_timeout(&self, slot: u8, reg: u32) {
         self.irq_locked(|st, p| {
             self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, slot as u32, (1u64 << (24 + slot)) | (reg & 0x7fc) as u64)
         });
@@ -1005,15 +957,14 @@ impl Bridge {
         if size > 4 {
             return None;
         }
-        let (slot, reg, dev) = self.cfg_target(off, size);
-        let Some(dev) = dev else {
-            self.config_master_timeout(slot, reg);
+        let (at, reg) = Self::cfg_target(off, size);
+        let read = self.bus.config_read(at, reg as usize, size);
+        if read.is_none() {
+            self.config_master_timeout(at.device, reg);
             // An unclaimed read fails back to the requester: guests read
             // empty slots only inside a bus-error guard.
-            return None;
-        };
-        let dword = dev.config_dword((reg >> 2) as usize) as u64;
-        Some((dword >> (8 * (reg & 3))) & (u64::MAX >> (64 - 8 * size)))
+        }
+        read.map(u64::from)
     }
 
     /// Why a configuration access failed, when the cause is that nothing
@@ -1024,12 +975,12 @@ impl Bridge {
         if size > 4 {
             return None;
         }
-        let (slot, _, dev) = self.cfg_target(off, size);
-        if dev.is_some() {
+        let (at, _) = Self::cfg_target(off, size);
+        if self.bus.function(at).is_some() {
             return None;
         }
-        let func = (off >> 8) & 7;
-        Some(if self.slots.read()[slot].is_none() {
+        let DevFn { device: slot, function: func } = at;
+        Some(if !self.bus.occupied(slot) {
             format!("PCI config master timeout: empty slot {slot} function {func}")
         } else {
             format!("PCI config master timeout: slot {slot} has no function {func}")
@@ -1041,121 +992,50 @@ impl Bridge {
         if size > 4 {
             return false;
         }
-        let (slot, reg, dev) = self.cfg_target(off, size);
-        let Some(dev) = dev else {
-            self.config_master_timeout(slot, reg);
-            return true;
-        };
-        let cfg = dev.state().config();
-        let i = (reg >> 2) as usize;
-        let shift = 8 * (reg & 3);
-        let mask = (u64::MAX >> (64 - 8 * size)) << shift;
-        cfg.write_masked(i, (val << shift) as u32, mask as u32);
+        let (at, reg) = Self::cfg_target(off, size);
+        if !self.bus.config_write(at, reg as usize, size, val as u32) {
+            self.config_master_timeout(at.device, reg);
+        }
         true
     }
 
     // ---- device windows ----
 
-    /// One PCI cycle of `host.len()` bytes (at most the bus width) at window
-    /// offset `woff`. `host` is in CPU address order, most significant byte
-    /// first. With the programmed swap set, host byte k is PCI byte k; clear,
-    /// a 32-bit device sees it at k ^ 3 within its word and a 64-bit one at
-    /// 7 - k within its doubleword (the specification's big-endian tables 65
-    /// to 80), and an access narrower than the device moves to
-    /// offset ^ (width - size).
-    #[allow(clippy::too_many_arguments)]
-    fn pio_cycle(&self, slot: usize, space: Space, base: u32, woff: u32, width: usize, swap: bool, host: &mut [u8], write: bool) -> bool {
-        let n = host.len();
-        let target = base.wrapping_add(if swap { woff } else { woff ^ (width - n) as u32 });
-        let claimed = self.slots.read().iter().flatten().find_map(|d| {
-            let (bar, boff) = d.state().config().decode(space, target)?;
-            Some((d.clone(), bar, boff))
-        });
-        let Some((dev, bar, boff)) = claimed else {
-            // Nobody drove device select: a master time-out.
-            self.irq_locked(|st, p| self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, slot as u32, target as u64));
-            return false;
-        };
-        Self::bar_cycle(&*dev, bar, boff, swap, host, write);
-        true
-    }
-
-    /// The cycle `pio_cycle` found a target for: `host` (CPU order) to or
-    /// from BAR `bar` of `dev` at `boff`, lanes as `swap` says.
-    fn bar_cycle(dev: &dyn PciFunction, bar: usize, boff: u32, swap: bool, host: &mut [u8], write: bool) {
-        let n = host.len();
-        // PCI bytes in address order; a function sees little-endian values.
-        let mut pci = [0u8; 8];
-        if write {
-            for i in 0..n {
-                pci[i] = host[if swap { i } else { n - 1 - i }];
-            }
-        }
-        let mut done = 0;
-        while done < n {
-            let chunk = (n - done).min(4);
-            let at = boff + done as u32;
-            if write {
-                let v = pci[done..done + chunk].iter().rev().fold(0u32, |a, &b| a << 8 | b as u32);
-                dev.bar_write(bar, at, v, chunk);
-            } else {
-                let v = dev.bar_read(bar, at, chunk);
-                for i in 0..chunk {
-                    pci[done + i] = (v >> (8 * i)) as u8;
-                }
-            }
-            done += chunk;
-        }
-        if !write {
-            for i in 0..n {
-                host[i] = pci[if swap { i } else { n - 1 - i }];
-            }
-        }
-    }
-
     /// A processor access of `size` bytes to slot `slot`'s window at window
-    /// offset `woff`; `val` is `Some` for a write. A doubleword to a 32-bit
-    /// device is two word cycles, lower address first, carrying host bytes 0
-    /// to 3 and then 4 to 7. A read that fails on its first cycle ends
-    /// there; a write posts, so both cycles go out and it never fails.
+    /// offset `woff`; `val` is `Some` for a write. The bus finds the BAR the
+    /// address reaches and the window's byte order carries the bytes. Where
+    /// nothing drives device select the cycle ends in a master time-out: a read
+    /// fails, and a write posts and never does. A doubleword to a 32-bit device
+    /// is two word cycles, and a read that fails on its first ends there while
+    /// a write sends both.
     fn window_access(&self, slot: usize, woff: u32, size: usize, val: Option<u64>) -> Option<u64> {
         let dev_reg = self.st.lock().r(reg::device(slot as u32));
         let base = (dev_reg & DEV_WINDOW_BASE_MASK) << 20;
-        let width = if dev_reg & DEV_64BIT_DEVICE != 0 { 8 } else { 4 };
-        let swap = dev_reg & DEV_SWAP_PROGRAMMED != 0;
         let space = if dev_reg & DEV_MEMORY_SPACE != 0 { Space::Mem } else { Space::Io };
-        Self::cycles(width, woff, size, val, |woff, host, write| {
-            self.pio_cycle(slot, space, base, woff, width, swap, host, write)
-        })
-    }
-
-    /// A processor access of `size` bytes at window offset `woff` as the
-    /// PCI cycles a `width`-byte device takes, each made by `cycle(offset,
-    /// host bytes, write)`.
-    fn cycles(width: usize, woff: u32, size: usize, val: Option<u64>, mut cycle: impl FnMut(u32, &mut [u8], bool) -> bool) -> Option<u64> {
-        let write = val.is_some();
-        let mut host = [0u8; 8];
-        if let Some(v) = val {
-            for (k, b) in host.iter_mut().enumerate().take(size) {
-                *b = (v >> (8 * (size - 1 - k))) as u8;
-            }
+        let order = Self::order_of(dev_reg);
+        if let Some((f, bar, off)) = self.bus.decode(space, base.wrapping_add(woff)) {
+            return Some(match val {
+                None => order.read(f, bar, off, size),
+                Some(v) => {
+                    order.write(f, bar, off, size, v);
+                    0
+                }
+            });
         }
-        let ok = if size > width {
-            let (a, b) = host.split_at_mut(4);
-            let first = cycle(woff, a, write);
-            if first || write {
-                let second = cycle(woff + 4, &mut b[..4], write);
-                first && second
-            } else {
-                false
+        // The cycle's PCI address is where the byte order sends it: a byte stream as
+        // given, word values with the access moved to the device's own byte position.
+        let width = if dev_reg & DEV_64BIT_DEVICE != 0 { 8 } else { 4 };
+        let aim = |woff: u32, n: usize| base.wrapping_add(if order == ByteOrder::Stream { woff } else { woff ^ (width - n) as u32 });
+        let miss = |target: u32| self.irq_locked(|st, p| self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, slot as u32, target as u64));
+        if size > width {
+            miss(aim(woff, 4));
+            if val.is_some() {
+                miss(aim(woff + 4, 4));
             }
         } else {
-            cycle(woff, &mut host[..size], write)
-        };
-        if write {
-            return Some(0);
+            miss(aim(woff, size));
         }
-        ok.then(|| host[..size].iter().fold(0u64, |a, &b| a << 8 | b as u64))
+        val.map(|_| 0)
     }
 
     // ---- flash ----
@@ -1172,7 +1052,7 @@ impl Bridge {
     }
 
     /// The port is 16 bits wide, so a read of any size is the part's words
-    /// read one cycle at a time with the requested byte lanes kept.
+    /// read one cycle at a time with the requested byte order kept.
     fn flash_read(&self, woff: u32, size: usize) -> Option<u64> {
         let end = woff + size as u32;
         let mut result = 0u64;
@@ -1315,6 +1195,9 @@ impl Bridge {
                 },
             };
             if !good {
+                crate::dlog!(LogModule::Bridge, "bridge: slot {slot} {} of {step} bytes at PCI {a:#x} reached no memory ({})",
+                    if matches!(buf, DmaBuf::Read(_)) { "read" } else { "write" },
+                    match target { None => "no translation".to_string(), Some((x, _, w)) => format!("widget {w:#x} address {x:#x}") });
                 ok = false;
                 if let DmaBuf::Read(b) = &mut buf {
                     b[done..done + step].fill(0);
@@ -1412,7 +1295,12 @@ impl Bridge {
     /// is a bus error.
     fn read(&self, off: u32, size: usize) -> Option<u64> {
         match off {
-            0..=0xffff => self.reg_read(off, size),
+            0..=0xffff => {
+                let v = self.reg_read(off, size);
+                crate::dlog!(LogModule::Bridge, "bridge: read {} /{size} -> {}", reg_name(off & !7),
+                    v.map_or("bus error".to_string(), |v| format!("{v:#x}")));
+                v
+            }
             ATE_BASE..=0x10fff => self.ate_read(off - ATE_BASE, size),
             ATE_LOW_BASE..=0x11fff => self.ate_low_read(off - ATE_LOW_BASE, size),
             _ if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) => self.cfg_read(off - CFG0_BASE, size),
@@ -1431,8 +1319,14 @@ impl Bridge {
     /// As [`Bridge::read`]; the result is a bus status.
     fn write(&self, off: u32, size: usize, val: u64) -> u32 {
         let ok = match off {
-            0..=0xffff => self.reg_write(off, size, val),
-            ATE_BASE..=0x10fff => self.ate_write(off - ATE_BASE, size, val),
+            0..=0xffff => {
+                crate::dlog!(LogModule::Bridge, "bridge: write {} /{size} {val:#x}", reg_name(off & !7));
+                self.reg_write(off, size, val)
+            }
+            ATE_BASE..=0x10fff => {
+                crate::dlog!(LogModule::Bridge, "bridge: write translation entry {} /{size} {val:#x}", (off - ATE_BASE) / 8);
+                self.ate_write(off - ATE_BASE, size, val)
+            }
             _ if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) => self.cfg_write(off - CFG0_BASE, size, val),
             _ if (SSRAM_BASE..SSRAM_BASE + SSRAM_SIZE).contains(&off) => true,
             _ if (DEVICE_WINDOW_BASE..FLASH_BASE).contains(&off) => match window_slot(off) {
@@ -1442,9 +1336,10 @@ impl Bridge {
             FLASH_BASE..=0xff_ffff => self.flash_write(off - FLASH_BASE, size, val),
             _ => false,
         };
-        let device_reg = (reg::device(0)..reg::device(DEVICES as u32)).contains(&(off & !7));
-        if device_reg || (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) {
-            self.publish_bars();
+        // A Device(x) write moves or re-aims a window. Configuration writes
+        // update the mappings inside the bus.
+        if (reg::device(0)..reg::device(DEVICES as u32)).contains(&(off & !7)) {
+            self.bus.set_host_windows(&|| self.windows());
         }
         if ok {
             BUS_OK
@@ -1464,11 +1359,36 @@ impl Bridge {
     }
 }
 
-/// A pin of the chip, 0..8, driven as a level (see [`Bridge::pin_line`],
-/// which holds the Bridge weakly).
-impl InterruptController for Bridge {
-    fn set_line(&self, line: u32, level: bool) {
-        self.set_wire_irq(line, level);
+/// What the bus asks of its host: the DMA of a requester (the swap bits that
+/// steer a transfer are its own slot's Device(x) register), and a pin's
+/// level, as the OR of everything routed to it. The bus calls it with every
+/// delivery to one pin serialised and in order, outside any lock of ours.
+impl PciHost for Bridge {
+    fn dma_for(&self, requester: u8) -> Arc<dyn PciDma> {
+        Arc::new(SlotDma { bridge: self.me.clone(), slot: requester as usize })
+    }
+
+    fn set_irq(&self, pin: u8, level: bool) {
+        self.irq_locked(|st, p| self.update_pin(st, p, pin as usize, level));
+    }
+}
+
+impl crate::traits::Device for Bridge {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { true }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        vec![("pci".to_string(), "Bridge PCI bus: pci status | pci config <slot>".to_string())]
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if cmd != "pci" {
+            return Err("Command not found".to_string());
+        }
+        self.bus.command(args, &mut w)
     }
 }
 
@@ -1482,36 +1402,6 @@ impl crate::traits::Resettable for Bridge {
 
 /// The widget window is decoded from the full physical address.
 const WINDOW_MASK: u32 = WIDGET_SMALL_SIZE - 1;
-
-/// A device window's lanes, as its Device(x) register sets them: the
-/// device's width and the programmed swap. What [`PciBar`] entries drive
-/// a function through, the same cycles `window_access` makes once it has
-/// found the target.
-struct Lanes {
-    width: usize,
-    swap: bool,
-}
-
-impl Lanes {
-    fn access(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize, val: Option<u64>) -> u64 {
-        let (width, swap) = (self.width, self.swap);
-        Bridge::cycles(width, off, size, val, |o, host, write| {
-            let boff = if swap { o } else { o ^ (width - host.len()) as u32 };
-            Bridge::bar_cycle(f, bar, boff, swap, host, write);
-            true
-        })
-        .unwrap_or(0)
-    }
-}
-
-impl PciLanes for Lanes {
-    fn read(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize) -> u64 {
-        self.access(f, bar, off, size, None)
-    }
-    fn write(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize, val: u64) {
-        self.access(f, bar, off, size, Some(val));
-    }
-}
 
 impl BusDevice for Bridge {
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
@@ -1598,29 +1488,24 @@ impl BusDevice for RawFlash {
 }
 
 // The Bridge's state for a snapshot: its registers, address translation
-// entries, interrupt pins and latched errors, its MicroLAN bus, and the
-// configuration header of every function on its bus (reached through the
-// Bridge, and not in the functions' own saved state). Loading puts the
-// headers back first and then publishes the BAR pages from them, so the
-// native PIO decode is derived, not stored. The flash parts behind its
-// chip selects save themselves.
+// entries, interrupt pin levels and latched errors, its MicroLAN bus, and
+// the PCI bus (the configuration header of every function on it and the
+// levels of the pins and board IRQs into the Bridge). Loading puts the headers
+// back first and then publishes the BAR pages from them, so the native PIO
+// decode is derived, not stored. The flash parts behind its chip selects
+// save themselves.
 impl Saveable for Bridge {
     fn save_state(&self) -> toml::Value {
         let microlan = self.microlan.lock().as_ref().map_or(toml::Value::Boolean(false), |bus| bus.save_state());
-        let configs: Vec<toml::Value> = self.slots.read().iter()
-            .map(|f| f.as_ref().map_or(toml::Value::Boolean(false), |f| f.state().config().save_state()))
-            .collect();
         let st = self.st.lock();
-        let lines: Vec<u8> = st.pci_lines.iter().map(|&l| u8::from(l)).collect();
         StateTable::new()
             .u32s("reg", &st.reg)
             .u64s("ate", &st.ate)
             .u32("int_error", st.int_error)
-            .u8s("pins", &[st.pin_level, st.pci_pin_level, st.gpio_pin_level, st.dma_64bit])
-            .u8s("pci_lines", &lines)
+            .u8s("pins", &[st.pin_level, st.dma_64bit])
             .u64("dma_pci_address", st.dma_pci_address)
             .u32("dma_device", st.dma_device)
-            .value("functions", toml::Value::Array(configs))
+            .value("bus", self.bus.save_state())
             .value("microlan", microlan)
             .u32("revision", self.revision.load(Ordering::Acquire))
             .build()
@@ -1635,19 +1520,7 @@ impl Saveable for Bridge {
         if ate.len() != ATE_ENTRIES {
             return Err(format!("ate: {} entries, expected {ATE_ENTRIES}", ate.len()));
         }
-        let lines = field_u8s::<{ DEVICES * 4 }>(v, "pci_lines")?;
-        let configs = field(v, "functions")?.as_array().ok_or("functions: not a list")?;
-        let slots = self.slots.read().clone();
-        if configs.len() != slots.len() {
-            return Err(format!("functions: {} slots, expected {}", configs.len(), slots.len()));
-        }
-        for (slot, (f, saved)) in slots.iter().zip(configs).enumerate() {
-            match (f, saved.as_bool()) {
-                (Some(f), None) => f.state().config().load_state(saved).map_err(|e| format!("slot {slot}: {e}"))?,
-                (None, Some(false)) => {}
-                _ => return Err(format!("slot {slot}: the saved bus has a different function there")),
-            }
-        }
+        self.bus.load_state(field(v, "bus")?)?;
         let saved = field(v, "microlan")?;
         match (self.microlan.lock().as_mut(), saved.as_bool()) {
             (Some(bus), None) => bus.load_state(saved).map_err(|e| format!("MicroLAN: {e}"))?,
@@ -1655,20 +1528,17 @@ impl Saveable for Bridge {
             _ => return Err("the saved Bridge has a different MicroLAN bus".into()),
         }
         {
-            let [pin_level, pci_pin_level, gpio_pin_level, dma_64bit] = field_u8s::<4>(v, "pins")?;
+            let [pin_level, dma_64bit] = field_u8s::<2>(v, "pins")?;
             let mut st = self.st.lock();
             st.reg = field_u32s(v, "reg")?;
             st.ate.copy_from_slice(&ate);
             st.int_error = field_u32(v, "int_error")?;
             st.pin_level = pin_level;
-            st.pci_pin_level = pci_pin_level;
-            st.gpio_pin_level = gpio_pin_level;
             st.dma_64bit = dma_64bit;
-            st.pci_lines = lines.map(|l| l != 0);
             st.dma_pci_address = field_u64(v, "dma_pci_address")?;
             st.dma_device = field_u32(v, "dma_device")?;
         }
-        self.publish_bars();
+        self.bus.set_host_windows(&|| self.windows());
         Ok(())
     }
 }

@@ -2106,7 +2106,7 @@ type Deadlines = [Option<Instant>; KINDS];
 type NvramJob = (std::path::PathBuf, Vec<u8>);
 
 /// Lock order: `gate`, then `line_order`, then `st`; `armed`, the line and
-/// Ethernet slots (`pin_line`, `superio_line`, `eth`, `raw_dma`) and the
+/// Ethernet slots (`pin_line`, `superio_line`, `eth`, the port's DMA) and the
 /// NVRAM hand-off are leaves.
 /// The serial and parallel engines move their rings with `st` held: the
 /// DMA goes down through the Bridge and HEART, which never call back into
