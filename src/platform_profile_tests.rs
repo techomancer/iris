@@ -42,10 +42,6 @@ mod tests {
     fn virtio_cfg(profile: MachineProfile) -> MachineConfig {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = profile;
-        // The Octane refuses the default R4400.
-        if !profile.cpus().contains(&cfg.machine.cpu) {
-            cfg.machine.cpu = profile.cpus()[0];
-        }
         cfg.virtio_serial.enabled = true;
         cfg
     }

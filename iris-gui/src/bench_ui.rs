@@ -44,7 +44,7 @@ pub struct BenchState {
     last: Option<Result<Box<Run>, String>>,
     quick: bool,
     /// Which CPU to benchmark. Runtime config, so this needs no separate build.
-    cpu: iris::config::CpuModel,
+    cpu: &'static iris::cpu::parts::Part,
     /// Parsed once. Normally empty — see `iris::bench_report::bundled_reference`.
     reference: Option<ReferenceTable>,
     dev: DevRunner,
@@ -62,7 +62,7 @@ impl Default for BenchState {
             // number, and is required before a result can go in the reference
             // table.
             quick: true,
-            cpu: iris::config::CpuModel::default(),
+            cpu: &iris::cpu::parts::R4400_150,
             reference: None,
             dev: DevRunner::default(),
         }
@@ -102,7 +102,7 @@ impl BenchState {
         self.live.is_some() || self.dev.is_running()
     }
 
-    fn start(&mut self, quick: bool, cpu: iris::config::CpuModel) {
+    fn start(&mut self, quick: bool, cpu: &'static iris::cpu::parts::Part) {
         if self.is_running() { return; }
 
         let lines = Arc::new(Mutex::new(Vec::new()));
@@ -240,7 +240,7 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
             egui::ComboBox::from_id_salt("bench_cpu")
                 .selected_text(st.cpu.label())
                 .show_ui(ui, |ui| {
-                    for m in iris::config::CpuModel::ALL {
+                    for &m in iris::bench_runner::BENCH_CPUS {
                         ui.selectable_value(&mut st.cpu, m, m.label());
                     }
                 })

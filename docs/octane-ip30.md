@@ -59,9 +59,11 @@ overlay = true
 ```
 
 Paths are relative to the directory iris runs in. Every key is listed in
-[FEATURES.md](../FEATURES.md). `machine.cpu` must be `r10000`. `[clock]
-fixed_mhz` sets CP0 Count; unset it is 97.5 MHz, half of the R10000's
-195 MHz pipeline clock.
+[FEATURES.md](../FEATURES.md). `machine.cpu` is `r10000` (revision 2.7),
+`r12000` (revision 3.5, 2 MB secondary cache) or `r14000` (revision 2.4, 2 MB).
+`[clock] fixed_mhz` sets CP0 Count, half the pipeline clock. Unset it is
+97.5 MHz for the 195 MHz R10000, 180 MHz for a 360 MHz R12000 and 300 MHz for a
+600 MHz R14000.
 
 ## PROM and flash
 

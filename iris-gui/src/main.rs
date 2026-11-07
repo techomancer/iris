@@ -244,7 +244,7 @@ struct App {
     /// Banks passed to the last `Cmd::Start` (guest-visible RAM is fixed until Stop).
     started_banks: Option<[u32; iris::config::MAX_BANKS]>,
     /// The CPU the running guest booted on — see `MemoryUiContext::started_cpu`.
-    started_cpu: Option<iris::config::CpuModel>,
+    started_cpu: Option<&'static iris::cpu::parts::Part>,
     tab: Tab,
     /// Benchmark tab state: the child process, its streamed output, and the
     /// last outcome. Lives here rather than in the tab function because a run
@@ -829,7 +829,7 @@ impl App {
             (iris::config::NetMode::Nat, None)
         });
         self.started_banks = Some(self.cfg.banks);
-        self.started_cpu = Some(self.cfg.machine.cpu);
+        self.started_cpu = Some(self.cfg.cpu());
         // Don't resize the window when the VM launches — its size is latched at
         // app load (the saved window size, or the first-launch fit to vm_scale)
         // and the guest display is letterboxed into it. Only the VM-scale slider
@@ -1339,12 +1339,11 @@ impl App {
                 // Chosen at Machine::new, so an edit while running is pending, not live —
                 // same shape as the Memory menu's RAM rows.
                 ui.set_min_width(240.0);
-                ui.label(RichText::new(t!("menu-machine-processor", cpu = self.cfg.machine.cpu.label())).strong());
-                // The Octane is an R10000 and nothing else.
-                ui.add_enabled_ui(!running && self.cfg.machine.profile != iris::config::MachineProfile::OctaneIp30, |ui| {
-                    for c in iris::config::CpuModel::ALL {
-                        if ui.radio(self.cfg.machine.cpu == c, c.label()).clicked() {
-                            self.cfg.machine.cpu = c;
+                ui.label(RichText::new(t!("menu-machine-processor", cpu = self.cfg.cpu().label())).strong());
+                ui.add_enabled_ui(!running && self.cfg.machine.profile.cpus().len() > 1, |ui| {
+                    for &c in self.cfg.machine.profile.cpus() {
+                        if ui.radio(self.cfg.cpu() == c, c.label()).clicked() {
+                            self.cfg.set_cpu(c);
                             self.mark_dirty();
                             self.toast(t!("toast-cpu-set", cpu = c.label()));
                             ui.close();
@@ -1353,7 +1352,7 @@ impl App {
                 });
                 if running {
                     match self.started_cpu {
-                        Some(started) if started != self.cfg.machine.cpu => {
+                        Some(started) if started != self.cfg.cpu() => {
                             ui.label(RichText::new(t!("menu-machine-running-pending", cpu = started.label()))
                                 .color(Color32::YELLOW));
                         }
@@ -3073,10 +3072,10 @@ impl App {
             // Guest-visible (PRId, cache geometry, ISA level), so it belongs in
             // the summary next to the platform rather than buried in a tab.
             ui.label(t!("welcome-processor"));
-            ui.label(self.cfg.machine.cpu.label());
+            ui.label(self.cfg.cpu().label());
             ui.end_row();
             if let Some(started) = self.started_cpu {
-                if started != self.cfg.machine.cpu {
+                if started != self.cfg.cpu() {
                     ui.label(t!("welcome-processor-running"));
                     ui.label(started.label());
                     ui.end_row();
@@ -3171,16 +3170,16 @@ impl App {
         // While running, name the CPU the guest actually booted on — the config
         // may already have been changed to one that only takes effect next Start.
         let running_cpu = if self.emu.is_running() { self.started_cpu } else { None };
-        let cpu = running_cpu.unwrap_or(self.cfg.machine.cpu);
+        let cpu = running_cpu.unwrap_or(self.cfg.cpu());
         ui.label(if self.cfg_dirty {
             t!("status-machine-unsaved", name = &name, profile = profile, cpu = cpu.label())
         } else {
             t!("status-machine", name = &name, profile = profile, cpu = cpu.label())
         });
         if let Some(started) = running_cpu {
-            if started != self.cfg.machine.cpu {
+            if started != self.cfg.cpu() {
                 ui.label(
-                    RichText::new(t!("status-cpu-pending", cpu = self.cfg.machine.cpu.label()))
+                    RichText::new(t!("status-cpu-pending", cpu = self.cfg.cpu().label()))
                         .color(Color32::YELLOW).small(),
                 );
             }

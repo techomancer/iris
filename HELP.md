@@ -39,8 +39,8 @@ host. `lightning` builds and the JIT stack (`--features jitv2,gpujit`) give
 higher MIPS; the hinv MHz string stays the same.
 
 The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at
-33 MHz on IP22/IP24 (66 MHz CPU inventory) or 97.5 MHz on IP28
-(195 MHz CPU inventory), anchored to host wall-clock time. There is
+half the configured part's clock (75 MHz for the 150 MHz R4400 of an Indy or
+Indigo2, 97.5 MHz for the 195 MHz R10000 of an IP28), anchored to host wall-clock time. There is
 no calibration or inference. Override it with `[clock] fixed_mhz` or
 `--clock-fixed-mhz` if a guest needs something else.
 
@@ -630,7 +630,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 
 [machine]
 profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
-cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
+cpu     = "r4400"           # "r5000" (--cpu); IP28: "r10000", Octane: r10000/r12000/r14000, O2: r5000/r10000/r12000; or a part, "r14000_600"
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
@@ -643,7 +643,7 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"
 
 [clock]
-# fixed_mhz = 33            # Count MHz: default 33 on IP22/IP24, 97.5 on IP28
+# fixed_mhz = 33            # Count MHz: default half the part's clock: 75 on the Indy and Indigo2 R4400, 97.5 on IP28
 
 # [rtc_offset]              # guest clock start, relative to host time (all signed)
 # years   = -18             # years/months step the calendar (Mar 31 -1 month = Feb 28/29)
@@ -801,9 +801,9 @@ Configuration
   --machine <NAME>            Machine to emulate (a [machine] profile name); `help` lists them
   --ip22                      Same as --machine indigo2_ip22
   --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
-  --cpu <MODEL>               r4400 (default), r5000, or r10000
+  --cpu <MODEL>               r4400 (default), r5000, r10000, r12000 or r14000, as the machine allows
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
-  --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)
+  --clock-fixed-mhz <MHZ>     CP0 Count frequency (default: half the part's clock, 75 for an Indy R4400)
 
 Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
