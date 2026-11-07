@@ -1890,10 +1890,11 @@ mod tests {
         // Still full, still busy: nothing was consumed or lost silently.
         assert_eq!(r.b.write(SH + hq4::RE_STATUS as u64, 32, 0), BUS_BUSY);
         r.b.mgras().start_engines();
-        let mut tries = 0u32;
+        // A deadline, not a count of retries: the engine thread may wait a
+        // long time for a core when every test is running.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while r.b.write(SH + hq4::RE_STATUS as u64, 32, 0) == BUS_BUSY {
-            tries += 1;
-            assert!(tries < 10_000_000, "the store never landed after the engine drained");
+            assert!(std::time::Instant::now() < deadline, "the store never landed after the engine drained");
             std::thread::yield_now();
         }
     }
