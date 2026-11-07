@@ -28,7 +28,7 @@ const BANNER: &str = "\x14MSC V 3.1S  \r\n";
 
 /// The AUX connector's far end.
 #[derive(Default)]
-struct Aux(Mutex<Vec<u8>>);
+pub(crate) struct Aux(Mutex<Vec<u8>>);
 
 impl SerialBackend for Aux {
     fn send_byte(&self, byte: u8) {
@@ -41,33 +41,33 @@ impl SerialBackend for Aux {
 }
 
 impl Aux {
-    fn take(&self) -> String {
+    pub(crate) fn take(&self) -> String {
         String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock())).into_owned()
     }
 }
 
 /// Virtual time, set by hand.
 #[derive(Clone, Default)]
-struct TestClock(Arc<AtomicU64>);
+pub(crate) struct TestClock(Arc<AtomicU64>);
 
 impl TestClock {
-    fn now_ns(&self) -> u64 {
+    pub(crate) fn now_ns(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
     }
 
-    fn advance_ns(&self, ns: u64) {
+    pub(crate) fn advance_ns(&self, ns: u64) {
         self.0.fetch_add(ns, Ordering::SeqCst);
     }
 
-    fn advance_ms(&self, ms: u64) {
+    pub(crate) fn advance_ms(&self, ms: u64) {
         self.advance_ns(ms * 1_000_000);
     }
 
-    fn advance_secs(&self, s: u64) {
+    pub(crate) fn advance_secs(&self, s: u64) {
         self.advance_ms(s * 1000);
     }
 
-    fn clock(&self) -> Clock {
+    pub(crate) fn clock(&self) -> Clock {
         let now = self.0.clone();
         Arc::new(move || now.load(Ordering::SeqCst))
     }
@@ -75,7 +75,7 @@ impl TestClock {
 
 /// The sum of a frame's bytes modulo 256, written out here rather than shared
 /// with the controller: a valid frame sums to zero.
-fn byte_sum(buf: &[u8]) -> u8 {
+pub(crate) fn byte_sum(buf: &[u8]) -> u8 {
     (buf.iter().map(|b| *b as u32).sum::<u32>() % 256) as u8
 }
 
@@ -88,7 +88,7 @@ struct Rig {
     aux: Arc<Aux>,
 }
 
-fn frame(text: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(text: &[u8]) -> Vec<u8> {
     let mut req = vec![text.len() as u8];
     req.extend_from_slice(text);
     req.push(((256 - byte_sum(&req) as u32) % 256) as u8);
@@ -373,7 +373,7 @@ impl Rig {
 }
 
 /// Text of a framed response.
-fn text(resp: &[u8]) -> String {
+pub(crate) fn text(resp: &[u8]) -> String {
     String::from_utf8_lossy(&resp[1..1 + resp[0] as usize]).into_owned()
 }
 
@@ -1876,4 +1876,42 @@ fn replies_stay_below_the_prom_length_limit() {
         assert!(resp.len() < 96 + 2 && resp.len() == resp[0] as usize + 2, "{text}");
         assert_eq!(byte_sum(&resp), 0);
     }
+}
+
+// ---- the Origin 2000 build, with no module owner ---------------------------
+
+fn rig_2000() -> Rig {
+    Rig::with(ElscConfig { build: Build::Origin2000, master: false, ..Default::default() })
+}
+
+#[test]
+fn the_origin_2000_build_has_its_own_version_commands_and_display() {
+    let rig = rig_2000();
+    assert_eq!(rig.aux.take(), "\x14MSC VER 3.2 \r\n");
+    rig.assert_reply("ver", "ok VER 3.2 ");
+    rig.assert_reply("key", "ok on");
+    rig.assert_reply("vlm 5", "ok n");
+    rig.assert_reply("vlm 5h", "ok ");
+    rig.assert_reply("vlm 5", "ok h");
+    rig.assert_reply("dsp hello", "ok ");
+    rig.assert_reply("dsc 1 J", "ok ");
+    assert!(rig.elsc.describe().contains("display: \"Jello.2 \""), "{}", rig.elsc.describe());
+    // The Origin 200 build's own commands are not in this table.
+    for absent in ["aut", "mod", "pas none"] {
+        rig.assert_reply(absent, "err cmd");
+    }
+    // The role bit belongs to the Origin 200 build.
+    rig.assert_reply("rsw", "ok ff");
+    rig.assert_reply("sla o", "ok ");
+}
+
+#[test]
+fn the_origin_2000_build_holds_reset_4_4_seconds_when_it_powers_up() {
+    let rig = rig_2000();
+    rig.assert_reply("pwr c 5", "ok ");
+    assert_eq!(power_events(&rig.events()), [false]);
+    rig.clock.advance_ms(9_399);
+    rig.assert_reply("pwr", "ok d");
+    rig.step_ms(1);
+    rig.assert_reply("pwr", "ok u");
 }
