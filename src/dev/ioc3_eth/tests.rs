@@ -178,6 +178,19 @@ fn software_reset_restores_defaults_and_self_clears() {
     assert_eq!(t.mii(1, 0x13), 0x4001);
 }
 
+/// The Origin 200 System Board's transceiver is a DP83840A at management
+/// address 31: its identity answers there and an address the Octane and Fuel
+/// use reads as an absent part.
+#[test]
+fn the_origin_200_transceiver_answers_at_address_31_only() {
+    let mut t = rig();
+    t.eth = Ioc3Eth::new_origin200(STATION);
+    assert_eq!(t.mii(31, 2), 0x2000);
+    assert_eq!(t.mii(31, 3), 0x5c01);
+    assert_eq!(t.mii(1, 3), 0xffff);
+    assert_eq!(t.mii(1, 0), 0xffff);
+}
+
 #[test]
 fn wrong_address_writes_do_not_reach_the_phy() {
     let t = rig();
