@@ -3,7 +3,7 @@
 //! bank descriptors put it. `ip30_machine` builds and drives it.
 //!
 //! The map, from OpenBSD's `ip30.h` and Linux's `ip30-xtalk.c` (also
-//! `docs/Octane/ip30-address-map.md`):
+//! `docs/octane-ip30-address-map.md`):
 //!
 //! | Range | What |
 //! |---|---|

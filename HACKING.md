@@ -381,7 +381,7 @@ consumer thread never takes `rec`.
 
 ### Several CPUs
 
-An Octane can have two ([docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md)).
+An Octane can have two ([docs/octane-ip30-multiprocessor.md](docs/octane-ip30-multiprocessor.md)).
 Each is its own `MipsCpu` with its own core, TLB, cache model and thread, over
 one `Physical`. `src/cpu/smp.rs` holds what they share:
 

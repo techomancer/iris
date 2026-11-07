@@ -81,7 +81,7 @@ code, with its executor unlocked.
 
 ## Debugging
 
-See [debug.md](../../debug.md#several-cpus) for the monitor commands: `cpus`,
+See [debug.md](../debug.md#several-cpus) for the monitor commands: `cpus`,
 `cpu <n>`, `r0`, `s1` and stepping one processor while the other holds still.
 
 ## What is not there yet

@@ -179,7 +179,7 @@ pub mod workstation;
 pub mod ip32;
 pub mod ip32_screen;
 pub mod ip32_machine;
-/// The SGI Octane (IP30): its bus and machine -- see `docs/Octane/ip30-address-map.md`.
+/// The SGI Octane (IP30): its bus and machine -- see `docs/octane-ip30-address-map.md`.
 pub mod ip30;
 pub mod ip30_machine;
 pub mod machine_state;

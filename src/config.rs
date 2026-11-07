@@ -612,7 +612,7 @@ pub enum MachineProfile {
     O2Ip32,
     /// SGI Octane IP30: HEART, the Crossbow and the onboard Bridge, with an
     /// R10000. Configured by the shared keys and the `[octane]` section; see
-    /// `src/ip30_machine.rs` and `docs/Octane/ip30-address-map.md`.
+    /// `src/ip30_machine.rs` and `docs/octane-ip30-address-map.md`.
     OctaneIp30,
 }
 

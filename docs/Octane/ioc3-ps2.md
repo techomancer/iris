@@ -6,7 +6,7 @@ PS/2 ports that each hold up to three received bytes, the clamp that holds
 a device off until the bytes are read, and one interrupt bit in the
 SuperIO block. The Octane's on-board IOC3 is PCI device 2 behind the
 Bridge (widget 15); its 1 MB memory BAR is at PCI 0x0040_0000, reached
-through device window 2 at physical 0x1F60_0000 (`ip30-address-map.md`
+through device window 2 at physical 0x1F60_0000 (`octane-ip30-address-map.md`
 §7). The keyboard and mouse registers are 0x9C – 0xAF of that block.
 
 The controller is not an 8042. There is no command byte, no status port
