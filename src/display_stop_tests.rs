@@ -70,8 +70,8 @@ pub(crate) fn scratch(test: &str) -> PathBuf {
 
 pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineConfig {
     let (mb, cpu) = match profile {
-        MachineProfile::OctaneIp30 => (64, CpuModel::R10000),
-        MachineProfile::O2Ip32 => (32, CpuModel::R5000),
+        MachineProfile::OctaneIp30 => (64, CpuModel::R10000_195),
+        MachineProfile::O2Ip32 => (32, CpuModel::R5000_180),
         _ => (16, CpuModel::default()),
     };
     let mut cfg = crate::bench_runner::bench_config([mb, 0, 0, 0], cpu);

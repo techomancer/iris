@@ -28,13 +28,22 @@ use super::consts::{
 use super::display_fifo::display_fifo_access;
 use super::fifo::CommandFifo;
 use super::mmio::{access_waits, command_store, fifo_port};
+use super::pi_gfx::{pi_gfx_return_credits, PiGfxLink};
 use super::registers::reg;
+use super::PacketSender;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub(super) struct HostInterface {
-    /// Where interrupt packets go (the iris glue's HEART).
+    /// The crosstalk widget number.
+    pub slot: u32,
+    /// Where interrupt packets go on the Octane (the iris glue's HEART).
     pub irq: Option<Arc<dyn crate::irq::InterruptController>>,
+    /// Where interrupt packets go on a machine whose fabric carries them to
+    /// any widget (the Fuel's XBridge crossbar); `irq` is unused then.
+    pub packets: Option<PacketSender>,
+    /// The master node's processor interface, for graphics credits.
+    pub pi: Option<Arc<dyn PiGfxLink>>,
     /// The widget number of HEART, the packets' destination.
     pub heart_widget: u32,
     /// ODSY_IDENTITY, composed from the revision at reset.
@@ -80,6 +89,9 @@ pub(super) struct HostInterface {
 
     /// The command FIFO (fifo.rs), whose level STATUS0 reports.
     pub fifo: Arc<CommandFifo>,
+    /// Tests: stores count as counted by a processor interface.
+    #[cfg(test)]
+    pub test_counted_stores: u8,
     /// The front accesses' own trace numbering; the board's accesses keep
     /// the state's.
     pub trace_sequence: u64,
@@ -88,7 +100,10 @@ pub(super) struct HostInterface {
 impl Default for HostInterface {
     fn default() -> Self {
         HostInterface {
+            slot: 0,
             irq: None,
+            packets: None,
+            pi: None,
             heart_widget: 8,
             identity: 0,
             widget_control: 0,
@@ -117,6 +132,8 @@ impl Default for HostInterface {
             displayed_buffer: 0,
             displayed_written: false,
             fifo: Default::default(),
+            #[cfg(test)]
+            test_counted_stores: 0,
             trace_sequence: 0,
         }
     }
@@ -285,6 +302,25 @@ impl HostInterface {
         self.fifo.level()
     }
 
+    /// The FIFO's level went from 'before' to its current value. Falling below
+    /// the model's low-water threshold (cfifo::LOW_WATER, a model choice)
+    /// latches the low-water flag whatever the enable mask
+    /// says; it reaches the driver only while the source is enabled.
+    pub fn fifo_level_changed(&mut self, before: u32) {
+        if before >= cfifo::LOW_WATER && self.fifo_level() < cfifo::LOW_WATER {
+            self.intr_flags |= intr::FIFO_LOW_WATER;
+            self.update_irq();
+        }
+    }
+
+    /// A counted store's credit, to the processor interface the node names.
+    pub fn return_credit(&mut self) {
+        if let Some(pi) = &self.pi {
+            pi_gfx_return_credits(pi.as_ref(), self.slot, 1);
+        } else {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: counted graphics store has no processor interface for its return");
+        }
+    }
 }
 
 // The front registers.
@@ -396,7 +432,7 @@ impl HostInterface {
                     self.flctl_target_reported = true;
                     crate::dlog!(
                         LogModule::Odyssey,
-                        "sgi-odyssey: flow-control interrupt target {} and credit target {} stored",
+                        "sgi-odyssey: flow-control interrupt target {} and credit target {} stored; credits still return through the node interface",
                         (value as u32) >> flctl::INTR_TARGET_SHIFT,
                         ((value >> flctl::TARGET_SHIFT) as u32) & flctl::TARGET_MASK
                     );
@@ -465,19 +501,23 @@ pub(super) fn front_mmio_read(f: &Mutex<HostInterface>, addr: u64, size: u32) ->
 
 /// A processor's store through the front alone: true when it went to a
 /// front register or joined the command FIFO for the board's thread, false
-/// when it needs the board's state.
-pub(super) fn front_mmio_write(f: &Mutex<HostInterface>, fifo: &CommandFifo, addr: u64, value: u64, size: u32) -> bool {
+/// when it needs the board's state. `counted`: the processor interface counted
+/// it.
+pub(super) fn front_mmio_write(f: &Mutex<HostInterface>, fifo: &CommandFifo, addr: u64, value: u64, size: u32, counted: bool) -> bool {
     if front_register(addr, size, true) {
         let mut g = f.lock();
         // The store falls after every command store the processor made
         // before it: a swap arm waits for them (HostInterface::retrace).
         g.stream_pos = fifo.pushed();
         g.write(addr, value, size);
+        if counted {
+            g.return_credit();
+        }
         return true;
     }
     // A queued store needs the board's thread to run it, and the queue to
     // have room; otherwise the caller runs it.
-    command_store(addr, size) && fifo.running.load(std::sync::atomic::Ordering::SeqCst) && fifo.push(f, addr, value, size)
+    command_store(addr, size) && fifo.running.load(std::sync::atomic::Ordering::SeqCst) && fifo.push(f, addr, value, size, counted)
 }
 
 /// The fabric packet's address bits; the widget sits above them.
@@ -504,6 +544,12 @@ impl HostInterface {
     pub fn send_interrupt(&mut self, packet: u64, number: u8, set: bool) {
         let widget = (packet >> XIO_PACKET_ADDRESS_BITS) as u32;
         let address = packet & ((1u64 << XIO_PACKET_ADDRESS_BITS) - 1);
+        if let Some(send) = &self.packets {
+            if !send(widget as u8, address, number, set) {
+                crate::dlog!(LogModule::Odyssey, "odyssey: interrupt packet to widget {widget} address {address:#x} was refused");
+            }
+            return;
+        }
         if widget != self.heart_widget || address != HEART_PACKET {
             crate::dlog!(LogModule::Odyssey, "odyssey: interrupt packet to widget {widget} address {address:#x} has no receiver");
             return;

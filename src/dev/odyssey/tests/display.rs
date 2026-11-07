@@ -180,8 +180,8 @@ fn a_flip_waits_until_the_raster_unit_covers_the_stores_before_its_arm() {
     route_to_heart(&mut s);
 
     // Two stores queued in the command stream, not yet run.
-    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_A as u64) << 32 | 0x8000_2000, 8));
-    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_B as u64) << 32 | 0x8000_2000, 8));
+    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_A as u64) << 32 | 0x8000_2000, 8, false));
+    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_B as u64) << 32 | 0x8000_2000, 8, false));
     assert_eq!(s.fifo.pushed(), 2);
     assert_eq!(s.fifo.retired(), 0);
 

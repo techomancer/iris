@@ -23,7 +23,8 @@ pub(super) const ODYSSEY_WORK_THREAD: &str = "odyssey-work";
 /// The pause before the board's thread runs a burst, so the stores of the
 /// burst land first and one run takes them together. A processor that
 /// waits on the thread cuts it short (`CommandFifo::hurry`): an access the
-/// bus refused.
+/// bus refused, or a counted store whose credit stays owed until the stores
+/// ahead of it retire.
 pub(super) const GAP: Duration = Duration::from_micros(100);
 
 /// How much one run may do: for tests a count of stores. The budget is
@@ -141,7 +142,11 @@ impl Board {
             // A run that takes as long as a long draw would.
             let sleep_ms = std::mem::take(&mut self.test_slice_sleep_ms);
             if sleep_ms != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms as u64));
+                // Until the time is up or a test releases the hold.
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(sleep_ms as u64);
+                while std::time::Instant::now() < end && !self.fifo.test_release.load(SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
         }
 
@@ -196,6 +201,6 @@ impl Board {
 
     /// Reset clears the FIFO and abandons the waiting stores.
     pub fn work_reset(&mut self) {
-        self.fifo.clear();
+        self.fifo.clear(&self.front);
     }
 }

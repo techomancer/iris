@@ -20,14 +20,17 @@ use crate::physical::RamBank;
 use crate::dev::prom::Prom;
 use crate::dev::mc::MemoryController;
 
-/// Count on the IP28's 195 MHz R10000: half the pipeline clock, and what
-/// IRIX assumes there (see where the MC is created).
-const IP28_COUNT_HZ: u64 = 97_500_000;
+/// The processors an Indy or `indigo2_ip22` takes, the default first: the
+/// R4400 and R5000. The R10000 Indigo2 is the IP28 board.
+pub const CPUS: &[CpuModel] = &[CpuModel::R4400_150, CpuModel::R5000_180];
+
+/// The IP28 takes the R10000 only.
+pub const IP28_CPUS: &[CpuModel] = &[CpuModel::R10000_195];
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::cpu::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
-use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
+use crate::config::CpuModel;
+use crate::cpu::mips_cache_v2::MipsCache;
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -50,7 +53,7 @@ pub fn set_emulator_profile(profile: MachineProfile) {
 
 fn emulator_profile() -> Option<MachineProfile> {
     let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
-    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30]
+    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::FuelIp34]
         .into_iter().find(|p| *p as u8 == raw)
 }
 
@@ -65,6 +68,7 @@ fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static s
         Some(MachineProfile::Indigo2Ip28) => &["IRIX", "Iris", "IPsomething", "Indigo2", "IP28"],
         Some(MachineProfile::O2Ip32) => &["IRIX", "Iris", "IPsomething", "IP32"],
         Some(MachineProfile::OctaneIp30) => &["IRIX", "Iris", "IPsomething", "IP30"],
+        Some(MachineProfile::FuelIp34) => &["IRIX", "Iris", "IPsomething", "IP34"],
         None => &["IRIX", "Iris", "IPsomething"],
     }
 }
@@ -333,7 +337,6 @@ impl Machine {
         let display_resolution = cfg.graphics.resolution;
         let newport_active = !cfg.headless && cfg.graphics_board() == GraphicsBoard::Newport;
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
-        let clock_fixed_mhz = cfg.clock.fixed_mhz;
         let cfg_cpu_model = cfg.machine.cpu;
 
         let guinness = cfg.machine.profile.guinness();
@@ -352,11 +355,7 @@ impl Machine {
         // 256 MB L2 and IRIX spends the boot flushing a cache that does not exist.
         // Keyed on the configured CPU, not on a cargo feature: the model is a
         // runtime choice, so a feature gate here silently stopped firing.
-        let model_has_l2 = match cfg_cpu_model {
-            crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
-            crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
-            crate::config::CpuModel::R10000 => <R10000ShadowCache as MipsCache>::L2_SIZE > 0,
-        };
+        let model_has_l2 = crate::with_cpu!(cfg_cpu_model, cfg.machine.cache.is_shadow(cfg_cpu_model), C => <C as MipsCache>::L2_SIZE > 0);
         if !model_has_l2 {
             eeprom_mc.lock().set_cachsz(0);
         }
@@ -373,12 +372,8 @@ impl Machine {
         // divider it programs. The generic 33 MHz Count and 50 MHz MC made
         // UST run at a third of real time (Quake in slow motion) and the
         // cycle counter at a quarter.
-        let ip28_count_hz: Option<u64> = if cfg.machine.profile.ip28() {
-            Some(clock_fixed_mhz.map_or(IP28_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64))
-        } else {
-            None
-        };
-        if let Some(count_hz) = ip28_count_hz {
+        let count_hz = cfg.clock.count_hz(cfg_cpu_model);
+        if cfg.machine.profile.ip28() {
             // The R10000's Count ticks at half the pipeline clock.
             mc.set_clock_hz(2 * count_hz);
         }
@@ -740,11 +735,12 @@ impl Machine {
         }
 
         // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
-        //    arm below monomorphises its own CPU — no per-model branch on the hot path.
+        //    family monomorphises its own CPU (`crate::cpu::build`) — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
+        let cpu_prid = cfg.machine.profile.cpu_prid(cfg_cpu_model);
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone());
+        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone()).with_prid(cpu_prid);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
@@ -761,14 +757,10 @@ impl Machine {
             }
         }
 
-        // CP0 Count runs at a fixed frequency: DEFAULT_COUNT_HZ unless the
-        // user overrode it via `[clock] fixed_mhz` or the CLI. Must happen
+        // CP0 Count runs at half the chip's clock unless the user overrode
+        // it via `[clock] fixed_mhz` or the CLI. Must happen
         // before the core starts executing.
-        if let Some(hz) = ip28_count_hz {
-            executor.core.set_count_hz(hz);
-        } else if let Some(mhz) = clock_fixed_mhz {
-            executor.core.set_count_hz((mhz * 1_000_000.0) as u64);
-        }
+        executor.core.set_count_hz(count_hz);
 
         // Inject the shared fasttick_count Arc into the executor core before wrapping in MipsCpu.
         // (cycles has no equivalent here — it's inline on MipsCore.hot now.)
@@ -791,18 +783,8 @@ impl Machine {
         }}}
 
         let shadow = cfg.machine.cache.is_shadow(cfg_cpu_model);
-        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
-            // R4400/R5000: the functional caches, or the shadow ones that
-            // keep only what CACHE instructions observe — see CacheModel.
-            crate::config::CpuModel::R4400 if shadow => build_cpu!(R4400ShadowCache),
-            crate::config::CpuModel::R5000 if shadow => build_cpu!(R5000ShadowCache),
-            crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
-            crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
-            // IP28 uses the shadow cache: out of the data path entirely, with
-            // tag and data arrays that exist only to answer CACHE ops and the
-            // PROM's diagnostics. See mips_cache_shadow.rs.
-            crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
-        };
+        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> =
+            crate::with_cpu!(cfg_cpu_model, shadow, C => build_cpu!(C));
 
         // The developer status bar shows the CPU's Count rate.
         status.set_count_hz(cpu.count_hz_atomic());
@@ -2177,11 +2159,12 @@ mod emulator_name_tests {
                 Some(MachineProfile::Indigo2Ip28) => &["Indy", "IP24", "IP22", "IP32", "O2"],
                 Some(MachineProfile::O2Ip32) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "O2"],
                 Some(MachineProfile::OctaneIp30) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP32", "O2"],
+                Some(MachineProfile::FuelIp34) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
                 None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
             }
         };
         for p in [None, Some(MachineProfile::IndyIp24), Some(MachineProfile::Indigo2Ip22),
-                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30)] {
+                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30), Some(MachineProfile::FuelIp34)] {
             let thirds = emulator_name_thirds(p);
             assert!(!thirds.is_empty());
             for w in thirds {
@@ -2193,7 +2176,7 @@ mod emulator_name_tests {
 
     #[test]
     fn profile_round_trips_through_the_global() {
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::FuelIp34] {
             set_emulator_profile(p);
             assert_eq!(emulator_profile(), Some(p));
         }
@@ -2368,7 +2351,7 @@ mod virtio_tests {
                 cfg.headless = true;
                 cfg.machine.profile = profile;
                 if profile == MachineProfile::Indigo2Ip28 {
-                    cfg.machine.cpu = crate::config::CpuModel::R10000;
+                    cfg.machine.cpu = crate::config::CpuModel::R10000_195;
                     cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
                     cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact);
                 }
@@ -2401,5 +2384,39 @@ mod virtio_tests {
     #[test]
     fn ip28_slot_exp1() {
         probe(MachineProfile::Indigo2Ip28, VirtioGioSlot::Exp1, 0x1F60_0000);
+    }
+}
+
+#[cfg(test)]
+mod cpu_identity_tests {
+    use super::*;
+    use crate::cpu::build::tests::{probe, row};
+    use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
+    use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
+
+    /// Each part the Indy, Indigo2 and IP28 take has the cache type it had
+    /// when the machines kept their own tables, on both cache models, and
+    /// the revision the real machines report: the Indy R4400 is rev 5.0 (was
+    /// 4.0) and its R5000 rev 1.0 (was 2.1); the IP28's R10000 stays rev 2.5.
+    #[test]
+    fn each_indy_and_indigo2_part_keeps_its_cache_and_has_a_real_prid() {
+        let p = MachineProfile::IndyIp24;
+        let got: Vec<_> = CPUS.iter().map(|&c| (c, probe(p, c, true), probe(p, c, false))).collect();
+        assert_eq!(got, [
+            (CpuModel::R4400_150, row::<R4400ShadowCache>(0x0450), row::<R4400Cache>(0x0450)),
+            (CpuModel::R5000_180, row::<R5000ShadowCache>(0x2310), row::<R5000Cache>(0x2310)),
+        ]);
+        assert_eq!(probe(MachineProfile::Indigo2Ip28, IP28_CPUS[0], true), row::<R10000ShadowCache>(0x0925));
+    }
+
+    /// A bare family name is the part of that family these machines take.
+    #[test]
+    fn a_bare_family_name_is_the_machines_part() {
+        for (name, chip) in [("r4400", CpuModel::R4400_150), ("r5000", CpuModel::R5000_180)] {
+            assert_eq!(CpuModel::resolve(name, CPUS), Ok(chip), "{name}");
+        }
+        assert_eq!(CpuModel::resolve("r10000", IP28_CPUS), Ok(CpuModel::R10000_195));
+        assert_eq!(CpuModel::resolve("r14000_600", IP28_CPUS), Ok(CpuModel::R14000_600), "a full name needs no list");
+        assert!(CpuModel::resolve("r8000", CPUS).is_err());
     }
 }
