@@ -40,6 +40,11 @@ pub const WIDGET_XBOW: u8 = 0x0;
 pub const WIDGET_HEART: u8 = 0x8;
 pub const WIDGET_BRIDGE: u8 = 0xf;
 
+/// HEART as the widgets address it: widget 8, taking an interrupt packet at
+/// offset 0x80 that names one of its 64 interrupt bits.
+pub const HEART_HOST: crate::xtalk::XtalkHost =
+    crate::xtalk::XtalkHost { widget: WIDGET_HEART, int_packet: 0x80, int_packet_mask: !0, vectors: 64 };
+
 /// Widget `w`'s small window: 16 MiB at `0x1000_0000 + (w << 24)`.
 pub const fn widget_small_base(w: u8) -> u64 {
     0x1000_0000 | (w as u64) << 24

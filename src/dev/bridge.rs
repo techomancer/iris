@@ -57,10 +57,9 @@ use crate::irq::{InterruptController, IrqLine};
 use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
 use crate::snapshot::{field, field_u32, field_u32s, field_u64, field_u64_vec, field_u8, field_u8s, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
+use crate::xtalk::XtalkHost;
 
-/// The widgets this chip addresses by number on the Crossbow: HEART takes
-/// its interrupt packets and memory transfers, widget 15 is its own port.
-const WIDGET_HEART: u8 = 0x8;
+/// The widget number of this chip's own port on the Crossbow.
 const WIDGET_BRIDGE: u8 = 0xf;
 /// A widget's 16 MB small window.
 const WIDGET_SMALL_SIZE: u32 = 0x0100_0000;
@@ -149,8 +148,6 @@ fn window_slot(off: u32) -> Option<u32> {
 }
 
 const SLOT_DATA: u32 = 4;
-/// Where in HEART's widget space an interrupt packet lands.
-const HEART_INT_PACKET: u64 = 0x80;
 const REGS_DEFINED: u32 = 0x300;
 const REG_SLOTS: usize = (REGS_DEFINED / 8) as usize;
 /// The one reserved data half this chip answers specially.
@@ -375,7 +372,7 @@ struct FlashPart {
     size: u32,
 }
 
-/// The packets a locked section decided to send to HEART: (vector, set).
+/// The packets a locked section decided to send to the host: (vector, set).
 type Packets = Vec<(u8, bool)>;
 
 /// The onboard Bridge. Hand it out as the `BusDevice` of the widget's small
@@ -384,13 +381,16 @@ type Packets = Vec<(u8, bool)>;
 pub struct Bridge {
     st: Mutex<State>,
     /// Held across "decide a packet, send it", never with `st`.
-    /// Nothing but HEART's `set_line` is called under it.
+    /// Nothing but the host's `set_line` is called under it.
     irq_order: Mutex<()>,
     /// Memory as a bus master reaches it: physical addresses, fitted SDRAM
     /// only, a bus error for anything else.
     mem: Arc<dyn BusDevice>,
-    /// HEART: a line is an interrupt bit, the vector a packet names.
+    /// The host chip's interrupt inputs: a line is the vector a packet names.
     heart: Arc<dyn InterruptController>,
+    /// How the host chip is addressed: it takes this chip's interrupt
+    /// packets and memory transfers.
+    host: XtalkHost,
     slots: RwLock<[Option<Arc<dyn PciBusDevice>>; DEVICES]>,
     flash: RwLock<[Option<FlashPart>; 2]>,
     flash_strap: AtomicBool,
@@ -399,7 +399,7 @@ pub struct Bridge {
     /// The one-wire net behind the NIC register; none fitted reads as an
     /// empty bus.
     microlan: Mutex<Option<w1::Bus>>,
-    /// Whether the Crossbow has a live link to a widget; default only HEART.
+    /// Whether the Crossbow has a live link to a widget; default only the host chip.
     link_alive: RwLock<Box<dyn Fn(u8) -> bool + Send + Sync>>,
     /// Where the runs of the device windows a BAR decodes whole go (the
     /// machine maps them over this widget's window), and the table entries
@@ -487,10 +487,10 @@ impl Placement {
 }
 
 impl Bridge {
-    /// A Bridge that masters memory through `mem` and interrupts HEART
-    /// through `heart` (line = vector). Registers start at their power-up
-    /// values.
-    pub fn new(mem: Arc<dyn BusDevice>, heart: Arc<dyn InterruptController>) -> Arc<Self> {
+    /// A Bridge that masters memory through `mem` and interrupts the host
+    /// chip, addressed as `host`, through `heart` (line = vector). Registers
+    /// start at their power-up values.
+    pub fn new(mem: Arc<dyn BusDevice>, host: XtalkHost, heart: Arc<dyn InterruptController>) -> Arc<Self> {
         let mut st = State {
             reg: [0; REG_SLOTS],
             ate: [0; ATE_ENTRIES],
@@ -509,12 +509,13 @@ impl Bridge {
             irq_order: Mutex::new(()),
             mem,
             heart,
+            host,
             slots: RwLock::new(Default::default()),
             flash: RwLock::new(Default::default()),
             flash_strap: AtomicBool::new(false),
             revision: AtomicU32::new(REVISION),
             microlan: Mutex::new(None),
-            link_alive: RwLock::new(Box::new(|w| w == WIDGET_HEART)),
+            link_alive: RwLock::new(Box::new(move |w| w == host.widget)),
             bar_sink: RwLock::new(None),
             bar_entries: Mutex::new(Default::default()),
         })
@@ -529,7 +530,7 @@ impl Bridge {
 
     /// Run `f` on the state, then send the packets it decided on. The
     /// order lock spans both, so packets for one pin leave in the order
-    /// they were decided; HEART is called with the state lock dropped.
+    /// they were decided; the host is called with the state lock dropped.
     fn irq_locked<R>(&self, f: impl FnOnce(&mut State, &mut Packets) -> R) -> R {
         let _order = self.irq_order.lock();
         let mut packets = Packets::new();
@@ -649,7 +650,7 @@ impl Bridge {
 
     /// Tell the Bridge which widgets the Crossbow has a live link to. A DMA
     /// request to any other widget is dropped by the Crossbow, which the
-    /// Bridge's request timer reports. The default is HEART alone.
+    /// Bridge's request timer reports. The default is the host chip alone.
     pub fn set_link_alive(&self, alive: Box<dyn Fn(u8) -> bool + Send + Sync>) {
         *self.link_alive.write() = alive;
     }
@@ -768,15 +769,15 @@ impl Bridge {
         if level && !was && enabled {
             self.send_interrupt(st, p, pin, true);
         } else if !level && was && enabled && st.r(reg::INT_MODE) >> pin & 1 != 0 {
-            // A falling edge clears HEART's bit only when the mode bit asks;
+            // A falling edge clears the host's bit only when the mode bit asks;
             // otherwise the guest clears it in its own handler.
             self.send_interrupt(st, p, pin, false);
         }
     }
 
     /// A pin's interrupt goes to the destination pair's widget with the
-    /// vector from that pin's host register. HEART is the only widget that
-    /// takes it; a pair naming any other has nowhere to go. The packet is
+    /// vector from that pin's host register. The host chip is the only
+    /// widget that takes it; a pair naming any other has nowhere to go. The packet is
     /// queued for `irq_locked` to send once the state lock is dropped.
     fn send_interrupt(&self, st: &State, p: &mut Packets, pin: usize, set: bool) {
         let host = st.r(reg::int_host(pin as u32));
@@ -790,17 +791,11 @@ impl Bridge {
         // destination address.
         let field = ((host & INT_HOST_ADDRESS) >> 8) as u64;
         let address = (dest.address & !(0x3ffu64 << 38)) | field << 38;
-        if !Self::heart_accepts(&dest, address, (host & INT_HOST_FIELD) as u8) {
-            log::debug!("bridge: interrupt packet to widget {} address {address:#x} is not HEART's; dropped", dest.widget);
+        if !self.host.accepts(dest.widget, address, (host & INT_HOST_FIELD) as u8) {
+            log::debug!("bridge: interrupt packet to widget {} address {address:#x} is not the host's (widget {}); dropped", dest.widget, self.host.widget);
             return;
         }
         p.push(((host & INT_HOST_FIELD) as u8, set));
-    }
-
-    /// HEART takes an interrupt packet only at its interrupt-set offset
-    /// (0x80), naming one of its 64 bits.
-    fn heart_accepts(dest: &IntDest, address: u64, vector: u8) -> bool {
-        dest.widget == WIDGET_HEART && address == HEART_INT_PACKET && vector < 64
     }
 
     /// Chip errors go to the host-error bit at the destination pair.
@@ -808,7 +803,7 @@ impl Bridge {
         let number = (st.r(reg::HOST_ERR_FIELD) & INT_HOST_FIELD) as u8;
         let dest = int_dest(st.r(reg::INT_DEST_UPPER), st.r(reg::INT_DEST_LOWER));
         // An unrouted error is one nobody asked for.
-        if !Self::heart_accepts(&dest, dest.address, number) {
+        if !self.host.accepts(dest.widget, dest.address, number) {
             log::debug!("bridge: error interrupt with no usable destination; dropped");
             return;
         }
@@ -1292,15 +1287,15 @@ impl Bridge {
                 st.dma_device = slot as u32;
                 self.translate(&st, slot, a)
             };
-            // Only HEART is memory. The Crossbow drops a request to a widget
+            // Only the host chip is memory. The Crossbow drops a request to a widget
             // it has no live link to (1 to 7 are illegal, 15 is this Bridge's
             // own port), and the Bridge's request timer reports a dropped
-            // read. A refused translation, or a read that reaches HEART and
+            // read. A refused translation, or a read that reaches the host and
             // finds no memory, is a silent master abort.
             let mut dropped = false;
             let good = match target {
                 None => false,
-                Some((_, _, w)) if w != WIDGET_HEART => {
+                Some((_, _, w)) if w != self.host.widget => {
                     // Approximation: QEMU routes peer DMA to a fitted widget;
                     // no supported Octane guest is known to need it.
                     dropped = w == WIDGET_BRIDGE || !(self.link_alive.read())(w);

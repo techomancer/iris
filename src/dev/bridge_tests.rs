@@ -7,6 +7,7 @@
 //! Ported from tests/qtest/sgi-bridge-bus-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use crate::ip30::{HEART_HOST, WIDGET_HEART};
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
 
@@ -168,9 +169,13 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
+        Self::with_host(HEART_HOST)
+    }
+
+    fn with_host(host: XtalkHost) -> Self {
         let sink = Arc::new(Sink::default());
         let mem = Arc::new(Mem::new());
-        Rig { bridge: Bridge::new(mem.clone(), sink.clone()), sink, mem }
+        Rig { bridge: Bridge::new(mem.clone(), host, sink.clone()), sink, mem }
     }
 
     /// Write register `off` (a slot base such as `reg::CONTROL`).
@@ -920,6 +925,45 @@ fn interrupt_packets_must_land_on_hearts_interrupt_offset() {
     assert!(r.sink.take().is_empty());
 }
 
+/// The host chip's widget number, packet offset and vector count are the
+/// machine's to state: a packet follows the host it was built with.
+#[test]
+fn interrupt_packets_follow_the_host_the_bridge_was_built_with() {
+    let host = XtalkHost { widget: 0xa, int_packet: 0x40, int_packet_mask: !0, vectors: 16 };
+    let r = Rig::with_host(host);
+    let c = r.card(2, PCI_INTA);
+    r.set(reg::INT_ENABLE, 1 << 2);
+    r.set(reg::int_host(2), 5);
+    // HEART's address is nothing to this host.
+    r.set(reg::INT_DEST_UPPER, (WIDGET_HEART as u32) << 16);
+    r.set(reg::INT_DEST_LOWER, 0x80);
+    c.raise(true);
+    c.raise(false);
+    assert!(r.sink.take().is_empty());
+    r.set(reg::INT_DEST_UPPER, 0xa << 16);
+    r.set(reg::INT_DEST_LOWER, 0x40);
+    c.raise(true);
+    c.raise(false);
+    assert_eq!(r.sink.take(), [(5, true)]);
+    r.set(reg::int_host(2), 16);
+    c.raise(true);
+    assert!(r.sink.take().is_empty(), "only 16 vectors exist");
+}
+
+/// A host with an empty packet mask takes a packet at any address, and its
+/// vector count can pass 64.
+#[test]
+fn a_host_with_no_packet_address_takes_any_address_and_over_64_vectors() {
+    let r = Rig::with_host(XtalkHost { widget: 0xa, int_packet: 0, int_packet_mask: 0, vectors: 128 });
+    let c = r.card(2, PCI_INTA);
+    r.set(reg::INT_ENABLE, 1 << 2);
+    r.set(reg::INT_DEST_UPPER, 0xa << 16);
+    r.set(reg::INT_DEST_LOWER, 0x1230);
+    r.set(reg::int_host(2), 100);
+    c.raise(true);
+    assert_eq!(r.sink.take(), [(100, true)]);
+}
+
 // ---- flash ----
 
 fn image() -> Vec<u8> {
@@ -1091,7 +1135,7 @@ fn a_packet_reaches_heart_outside_the_state_lock() {
         }
     }
     let heart = Arc::new(Prying(Mutex::new(None), Mutex::new(Vec::new())));
-    let bridge = Bridge::new(Arc::new(Mem::new()), heart.clone());
+    let bridge = Bridge::new(Arc::new(Mem::new()), HEART_HOST, heart.clone());
     *heart.0.lock() = Some(bridge.clone());
     let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
     r.route(4, 3);

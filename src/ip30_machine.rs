@@ -219,7 +219,7 @@ impl OctaneMachine {
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
-        let bridge = Bridge::new(mem.clone(), heart.clone());
+        let bridge = Bridge::new(mem.clone(), crate::ip30::HEART_HOST, heart.clone());
         bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
