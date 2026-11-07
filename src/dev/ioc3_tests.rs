@@ -1,6 +1,6 @@
 //! IOC3 register-contract tests.
 //!
-//! Accesses go through `PciBusDevice` the way a host bridge makes them: a
+//! Accesses go through `PciFunction` the way a host bridge makes them: a
 //! 32-bit access at its offset, a byte access at `offset ^ 3`.
 //!
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
@@ -9,7 +9,7 @@ use super::*;
 use std::sync::Mutex;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
-use crate::pci::PciBusDevice;
+use crate::pci::PciFunction;
 
 const MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 
@@ -78,7 +78,8 @@ impl Rig {
 
     fn with(c: Ioc3) -> Rig {
         let mem = TestMem::new();
-        c.connect_dma(mem.clone());
+        c.state().connect_dma(mem.clone());
+        c.attached();
         let wire = [Arc::new(Wire::default()), Arc::new(Wire::default())];
         c.set_serial_backend(0, wire[0].clone());
         c.set_serial_backend(1, wire[1].clone());
@@ -119,7 +120,7 @@ impl Rig {
 #[test]
 fn identity_and_bar() {
     let r = Rig::new();
-    let cfg = r.c.config();
+    let cfg = r.c.state().config();
     assert_eq!(cfg.read(0), 0x0003_10a9);
     assert_eq!(cfg.read(2) >> 8, 0xff_0000, "no defined class");
     assert_eq!(cfg.read(2) & 0xff, 1, "revision 1");
@@ -141,7 +142,7 @@ fn identity_and_bar() {
 #[test]
 fn configuration_space_repeats_its_first_32_bytes() {
     let r = Rig::new();
-    let cfg = r.c.config();
+    let cfg = r.c.state().config();
     cfg.write(4, 0x0050_0000);
     cfg.write(3, 0x2800);
     cfg.write(1, 0x146);
@@ -170,7 +171,7 @@ fn configuration_space_repeats_its_first_32_bytes() {
 #[test]
 fn the_register_block_starts_with_the_configuration_header() {
     let r = Rig::new();
-    let cfg = r.c.config();
+    let cfg = r.c.state().config();
     cfg.write(4, 0x0050_0000);
     cfg.write(3, 0x2800);
     cfg.write(1, 0x146);
@@ -1108,9 +1109,10 @@ fn the_ethernet_level_drives_the_pci_pin_not_the_superio_line() {
     let c = Ioc3::octane(MAC, false);
     let eth = Arc::new(MockEth::default());
     c.attach_eth(eth.clone());
-    c.connect_dma(TestMem::new());
+    c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
-    c.connect_interrupt(line);
+    c.state().connect_irq(line);
+    c.attached();
     let (sup, sline) = LevelProbe::line();
     c.connect_superio_interrupt(sline);
     let wired = eth.wired.lock().unwrap();
@@ -1201,9 +1203,10 @@ fn the_ethernet_pin_follows_the_last_level_given() {
     let c = Ioc3::octane(MAC, false);
     let eth = Arc::new(MockEth::default());
     c.attach_eth(eth.clone());
-    c.connect_dma(TestMem::new());
+    c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
-    c.connect_interrupt(line);
+    c.state().connect_irq(line);
+    c.attached();
     let wired = eth.wired.lock().unwrap();
     let irq = &wired.as_ref().unwrap().1;
     for i in 0..1000 {
@@ -1609,6 +1612,28 @@ fn save_load_round_trip() {
     }
 }
 
+/// A restore into a chip that has been in use equals one into a fresh chip.
+#[test]
+fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
+    let dirty = |r: &Rig, salt: u32| {
+        r.w8(reg::SERIAL_A + 3, 0x80);
+        r.w8(reg::SERIAL_A + 7, 4 + salt as u8);
+        r.w8(reg::SERIAL_A + 3, 0x03);
+        r.w32(reg::SSRAM + 0x100 * salt, 0x1000 + salt);
+        r.w32(reg::INT_ENABLE_SET, 0x40 << salt);
+    };
+    let src = Rig::new();
+    dirty(&src, 1);
+    let v = src.c.save_state();
+    let used = Rig::new();
+    dirty(&used, 2);
+    let fresh = Rig::new();
+    used.c.load_state(&v).unwrap();
+    fresh.c.load_state(&v).unwrap();
+    assert_eq!(used.c.save_state(), fresh.c.save_state());
+    assert_eq!(used.c.save_state(), v);
+}
+
 /// A periodic interrupt output keeps the time its next pulse had left,
 /// counted from the load rather than from the save.
 #[test]
@@ -1642,7 +1667,7 @@ fn a_short_buffer_ram_is_refused() {
 #[test]
 fn an_octane_chip_reset_keeps_the_pci_header() {
     let r = Rig::new();
-    let cfg = r.c.config();
+    let cfg = r.c.state().config();
     cfg.write(1, 0xffff_0146);
     cfg.write(3, 0xffff_ffff);
     r.c.reset();
@@ -1658,7 +1683,7 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
     let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
     r.c.attach_timekeeper(clock.clone());
-    let cfg = r.c.config();
+    let cfg = r.c.state().config();
     cfg.write(1, 0xffff_0146);
     cfg.write(3, 0xffff_ffff);
     assert_eq!(cfg.read(1), 0x0280_0146);

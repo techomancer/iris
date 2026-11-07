@@ -420,11 +420,12 @@ pub struct Aic7880 {
     /// CHDs, overlays, CD-ROMs). An install needs at least two -- the media
     /// to read and the disk to write.
     bus: ScsiBus,
-    /// Host memory, through the PCI bridge the chip masters. The controller
-    /// fetches its work from there rather than being handed it a register at
-    /// a time, so without this it can see the tag of a command and nothing
-    /// else about it.
-    dma: std::sync::OnceLock<std::sync::Arc<dyn crate::pci::PciDma>>,
+    /// The configuration header, the interrupt pin as the board routes it,
+    /// and host memory through the PCI bridge the chip masters. The
+    /// controller fetches its work from host memory rather than being handed
+    /// it a register at a time, so without it the chip sees the tag of a
+    /// command and nothing else about it.
+    pci: crate::pci::PciFunctionState,
     /// The SCSI id a disk attached without one answers at.
     target: u8,
     /// The status bar's activity bits, shared with the display thread.
@@ -439,9 +440,6 @@ pub struct Aic7880 {
     sense: Mutex<Option<(u8, u8, u8)>>,
     /// Pages of DMA addresses already reported as not memory.
     dma_misses: Mutex<std::collections::BTreeSet<u32>>,
-    /// The chip's interrupt pin, as the board routes it.
-    irq: std::sync::OnceLock<crate::irq::IrqLine>,
-    pci: crate::pci::PciConfig,
 }
 
 /// The chip's PCI identity: Adaptec, AIC-7880.
@@ -476,16 +474,14 @@ impl Aic7880 {
             running: AtomicBool::new(false),
             me: me.clone(),
             bus,
-            dma: std::sync::OnceLock::new(),
             sense: Mutex::new(None),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
-            irq: std::sync::OnceLock::new(),
             // 256 bytes of I/O and 4 KiB of memory, both onto the same
             // registers: what the part has.
             pci: {
-                use crate::pci::{Bar, PciConfig, PCI_INTA};
-                PciConfig::new(PCI_VENDOR_ADAPTEC, PCI_DEVICE_AIC7880, PCI_CLASS_SCSI, 0x01,
-                    [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA)
+                use crate::pci::{Bar, PciConfig, PciFunctionState, PCI_INTA};
+                PciFunctionState::new(PciConfig::new(PCI_VENDOR_ADAPTEC, PCI_DEVICE_AIC7880, PCI_CLASS_SCSI, 0x01,
+                    [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA))
             },
             target: 1,
             heartbeat: std::sync::OnceLock::new(),
@@ -503,7 +499,7 @@ impl Aic7880 {
     /// CDB pointer inside it is `0x0107532c`.
     fn dma_read_bytes(&self, addr: u32, n: usize) -> Vec<u8> {
         let mut b = vec![0u8; n];
-        if !self.dma.get().is_some_and(|d| d.dma_read(addr as u64, &mut b).is_ok()) {
+        if !self.pci.dma().is_some_and(|d| d.dma_read(addr as u64, &mut b).is_ok()) {
             self.dma_miss(addr, false);
         }
         b
@@ -514,7 +510,7 @@ impl Aic7880 {
     }
 
     fn dma_write_bytes(&self, addr: u32, data: &[u8]) {
-        if !self.dma.get().is_some_and(|d| d.dma_write(addr as u64, data).is_ok()) {
+        if !self.pci.dma().is_some_and(|d| d.dma_write(addr as u64, data).is_ok()) {
             self.dma_miss(addr, true);
         }
     }
@@ -585,12 +581,6 @@ impl Aic7880 {
         self.st.lock().intstat & 0x0f != 0
     }
 
-    /// Wire the chip's interrupt pin to `line`.
-    pub fn connect_irq(&self, line: crate::irq::IrqLine) {
-        let _ = self.irq.set(line);
-        self.update_irq();
-    }
-
     /// Drive the interrupt pin to the chip's state.
     fn update_irq(&self) {
         self.drive_irq(&self.st.lock());
@@ -601,7 +591,7 @@ impl Aic7880 {
     /// same lock as the change; set after releasing it, a completion's
     /// "high" could land after the host's clear and stick.
     fn drive_irq(&self, st: &State) {
-        if let Some(l) = self.irq.get() {
+        if let Some(l) = self.pci.irq() {
             l.set(st.intstat & 0x0f != 0);
         }
     }
@@ -665,7 +655,7 @@ impl Aic7880 {
     /// bytes the HIM also uses, so a doorbell whose rings are not memory is
     /// somebody else's bytes and not a doorbell.
     fn is_memory(&self, addr: u32) -> bool {
-        self.dma.get().is_some_and(|d| d.dma_read(addr as u64, &mut [0u8]).is_ok())
+        self.pci.dma().is_some_and(|d| d.dma_read(addr as u64, &mut [0u8]).is_ok())
     }
 
     /// A CDB's length follows from its opcode group. Taking it from the
@@ -1697,8 +1687,8 @@ impl crate::traits::Saveable for Aic7880 {
 }
 
 /// Both BARs reach the same registers.
-impl crate::pci::PciBusDevice for Aic7880 {
-    fn config(&self) -> &crate::pci::PciConfig {
+impl crate::pci::PciFunction for Aic7880 {
+    fn state(&self) -> &crate::pci::PciFunctionState {
         &self.pci
     }
 
@@ -1710,12 +1700,9 @@ impl crate::pci::PciBusDevice for Aic7880 {
         self.write(off, val, width)
     }
 
-    fn connect_interrupt(&self, line: crate::irq::IrqLine) {
-        self.connect_irq(line);
-    }
-
-    fn connect_dma(&self, dma: std::sync::Arc<dyn crate::pci::PciDma>) {
-        let _ = self.dma.set(dma);
+    /// Drive the pin the bus wired to the chip's state.
+    fn attached(&self) {
+        self.update_irq();
     }
 }
 
@@ -1760,7 +1747,7 @@ mod tests {
     /// A chip that masters host memory `ram` through the bridge.
     fn on(ram: Ram) -> Arc<Aic7880> {
         let c = Aic7880::new();
-        crate::pci::PciBusDevice::connect_dma(&*c, std::sync::Arc::new(crate::dev::mace_pci::HostMemory::new(ram)));
+        crate::pci::PciFunction::state(&*c).connect_dma(std::sync::Arc::new(crate::dev::mace_pci::HostMemory::new(ram)));
         c
     }
 
@@ -2313,7 +2300,8 @@ mod tests {
     fn an_empty_id_times_out_its_selection() {
         let (c, ram) = him_rig("him-selto");
         let (irq, line) = crate::irq::LevelProbe::line();
-        c.connect_irq(line);
+        crate::pci::PciFunction::state(&*c).connect_irq(line);
+        crate::pci::PciFunction::attached(&*c);
         let inquiry = [0x12, 0, 0, 0, 36, 0];
         put_cmd(&ram, 2, 3, &inquiry, 36);
         c.write(reg::QINFIFO, 2, 1);
@@ -2476,7 +2464,8 @@ mod tests {
         use crate::traits::Device;
         let (c, ram) = him_rig("worker");
         let irq = std::sync::Arc::new(crate::irq::LevelProbe::default());
-        c.connect_irq(crate::irq::IrqLine::new(irq.clone(), 0));
+        crate::pci::PciFunction::state(&*c).connect_irq(crate::irq::IrqLine::new(irq.clone(), 0));
+        crate::pci::PciFunction::attached(&*c);
         put_cmd(&ram, 0, 1, &TUR, 0);
         put_cmd(&ram, 1, 1, &TUR, 0);
         c.start();
