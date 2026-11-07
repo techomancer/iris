@@ -6,7 +6,8 @@
 //! translates no address: the machine routes a processor access by widget
 //! number and asks [`Xbow::carries`] whether the link is up. Packets from
 //! widget 0 itself are its interrupts, which go to the target its interrupt
-//! destination registers name; on the Octane that is HEART.
+//! destination registers name; on the Octane that is HEART, which the machine
+//! gives as an [`XtalkHost`].
 //!
 //! Which links are present and alive are atomics, so the routing decision
 //! (`carries`) never takes a lock; they change only under the register
@@ -32,15 +33,12 @@ use parking_lot::Mutex;
 use crate::irq::InterruptController;
 use crate::snapshot::{field_bool, field_u32, field_u32s, field_u8, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK, Saveable};
-use crate::xtalk::{HostPort, Upstream};
+use crate::xtalk::{HostPort, Upstream, XtalkHost};
 
 /// A widget ID register: JTAG IDCODE layout, bit 0 set.
 pub const fn widget_id(rev: u32, part: u32, mfgr: u32) -> u32 {
     (rev << 28) | (part << 12) | (mfgr << 1) | 1
 }
-
-/// The widget HEART answers as, where widget 0's interrupt packets go.
-const WIDGET_HEART: u8 = 8;
 
 const FIRST_WIDGET: u8 = 8;
 const LINKS: usize = 8;
@@ -210,8 +208,9 @@ pub struct Xbow {
     /// widget 0's one interrupt arrive in the order they were decided.
     /// Never held with `regs`, and nothing but HEART is called under it.
     irq_order: Mutex<()>,
-    /// Where widget 0's interrupt packets go when they target HEART.
-    heart: OnceLock<Arc<dyn InterruptController>>,
+    /// The host chip widget 0's interrupt packets go to when they target
+    /// it: how it is addressed, and its interrupt inputs.
+    host: OnceLock<(XtalkHost, Arc<dyn InterruptController>)>,
     /// Told when a link comes up or goes down, with the widget and its new
     /// state, outside the register lock.
     on_link_change: OnceLock<Box<dyn Fn(u8, bool) + Send + Sync>>,
@@ -238,7 +237,7 @@ impl Xbow {
             present: AtomicU8::new(present),
             alive: AtomicU8::new(present),
             irq_order: Mutex::new(()),
-            heart: OnceLock::new(),
+            host: OnceLock::new(),
             on_link_change: OnceLock::new(),
             on_link_reset: OnceLock::new(),
             unsupported: Mutex::new(Vec::new()),
@@ -246,10 +245,11 @@ impl Xbow {
         }
     }
 
-    /// Where widget 0's interrupt packets go: HEART, whose line is the
-    /// vector the packet names. Once, before the machine runs.
-    pub fn connect_heart(&self, heart: Arc<dyn InterruptController>) {
-        let _ = self.heart.set(heart);
+    /// Where widget 0's interrupt packets go: the host chip addressed as
+    /// `host`, whose line is the vector the packet names. Once, before the
+    /// machine runs.
+    pub fn connect_host(&self, host: XtalkHost, irq: Arc<dyn InterruptController>) {
+        let _ = self.host.set((host, irq));
     }
 
     /// What to do when a link comes up or goes down (`widget`, `alive`):
@@ -280,7 +280,7 @@ impl Xbow {
         let before = self.alive.load(Ordering::Acquire);
         let mut out = Out::default();
         let ret = f(&mut self.regs.lock(), &mut out);
-        if let Some(h) = self.heart.get() {
+        if let Some((_, h)) = self.host.get() {
             for (vector, set) in out.packets {
                 h.set_line(vector as u32, set);
             }
@@ -363,7 +363,7 @@ impl Xbow {
     /// Recompute the request bits and, when the summary changes, queue widget
     /// 0's interrupt packet: one assertion outstanding at a time, the
     /// deassertion once every request is acknowledged. A packet to anything
-    /// but HEART goes nowhere on this machine.
+    /// but the host chip goes nowhere on this machine.
     fn update_interrupt(&self, r: &mut Regs, out: &mut Out) {
         for link in 0..LINKS {
             if Self::link_requesting(r, link) {
@@ -381,8 +381,9 @@ impl Xbow {
         }
         let target = ((r.int_upper >> 16) & 0xf) as u8;
         let vector = (r.int_upper >> 24) as u8;
-        if target != WIDGET_HEART || !self.carries(target) || self.heart.get().is_none() {
-            return;
+        match self.host.get() {
+            Some((host, _)) if target == host.widget && self.carries(target) => {}
+            _ => return,
         }
         out.packets.push((vector, pending));
         r.interrupt_asserted = pending;
@@ -711,6 +712,7 @@ impl Saveable for Xbow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ip30::HEART_HOST;
     use std::sync::atomic::AtomicU64;
 
     /// HEART's ISR as the Crossbow sees it: one bit per vector.
@@ -774,7 +776,7 @@ mod tests {
     fn a_link_reset_restores_a_live_link() {
         let x = octane();
         let isr = Arc::new(Isr::default());
-        x.connect_heart(isr.clone());
+        x.connect_host(HEART_HOST, isr.clone());
         // Interrupt to HEART, vector 0x2a, alive events enabled on link 15.
         assert!(x.write(INT_UPPER + 4, 4, (0x2a << 24) | (8 << 16)));
         let ctl = LINK_BASE + LINK_STRIDE * 7 + LINK_CONTROL + 4;
@@ -788,6 +790,27 @@ mod tests {
         // An empty port stays down.
         assert!(x.write(LINK_BASE + LINK_STRIDE * 3 + LINK_RESET + 4, 4, 0));
         assert!(!x.carries(11));
+    }
+
+    /// Widget 0's interrupt goes to the host the machine named, not to a
+    /// fixed widget number.
+    #[test]
+    fn interrupts_follow_the_host_the_machine_names() {
+        let x = octane();
+        let isr = Arc::new(Isr::default());
+        x.connect_host(XtalkHost { widget: 15, ..HEART_HOST }, isr.clone());
+        let ctl = LINK_BASE + LINK_STRIDE * 7 + LINK_CONTROL + 4;
+        let reset = LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4;
+        // Addressed to widget 8, which is not the host here.
+        assert!(x.write(INT_UPPER + 4, 4, (0x2a << 24) | (8 << 16)));
+        assert!(x.write(ctl, 4, LINK_ALIVE_ENABLE as u64));
+        assert!(x.write(reset, 4, 0));
+        assert_eq!(isr.0.load(Ordering::SeqCst), 0);
+        // Addressed to widget 15, which is.
+        x.read(LINK_BASE + LINK_STRIDE * 7 + LINK_STATUS_CLEAR + 4, 4).unwrap();
+        assert!(x.write(INT_UPPER + 4, 4, (0x2b << 24) | (15 << 16)));
+        assert!(x.write(reset, 4, 0));
+        assert_eq!(isr.0.load(Ordering::SeqCst), 1 << 0x2b);
     }
 
     #[test]

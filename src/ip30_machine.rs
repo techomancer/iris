@@ -215,7 +215,7 @@ impl OctaneMachine {
 
         let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
         let xbow = Arc::new(Xbow::new(xbow_revision, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
-        xbow.connect_heart(heart.clone());
+        xbow.connect_host(crate::ip30::HEART_HOST, heart.clone());
 
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
