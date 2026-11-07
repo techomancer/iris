@@ -4,7 +4,7 @@ Status: plan, 2026-10-26. Step 1 done (the trait takes 64-bit bus addresses
 and returns a status; the O2 is its first user). Steps 2-6 open.
 
 Scope: how a PCI function reaches host memory and raises interrupts
-(`src/pci.rs`: `PciBusDevice`, `PciDma`), the O2's MACE bridge
+(`src/pci/function.rs`: `PciBusDevice`, `PciDma`), the O2's MACE bridge
 (`src/dev/mace_pci.rs`) and the Octane's Bridge/Xbridge to come. Sources:
 `docs/datasheets/octane/SGI-Bridge_ASIC_Specification-*.pdf` (chapters 3.3, 3.8, 3.9,
 4, 11, appendix A) and `SGI-Xbridge_ASIC_Specification-*.pdf` (1.5, 7.3,
