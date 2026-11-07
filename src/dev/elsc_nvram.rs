@@ -71,6 +71,21 @@ pub fn origin200_image() -> [u8; BYTES] {
     fresh_image(CONFIG_AUTO_POWER, 0, CLOCK_FULL)
 }
 
+/// The controller store an Origin 2000 module starts from. The controller
+/// writes this after its first power-up: the marker, the password `none`,
+/// configuration byte 0 (no automatic power-up bit), the module number the
+/// machine selects and clock-select byte 0, which an Origin 2000 PROM reads as
+/// the domain. Every other byte is zero.
+///
+/// Byte `0x70b` is an approximation. A controller writes its clock-select
+/// default there, `0x78` on the full-clock midplane type and 0 on the others,
+/// and that this module is the full-clock type is only inferred, so it stays 0.
+/// The Origin 200 image differs in the configuration byte (`0x02`) and this
+/// byte (`0x78`).
+pub fn origin2000_image(module: u8) -> [u8; BYTES] {
+    fresh_image(0, module, 0)
+}
+
 struct State {
     mem: [u8; BYTES],
     /// Block the current transfer addressed.
@@ -162,6 +177,16 @@ impl ElscNvram {
         match path {
             None => Ok(Self::from_image(origin200_image(), None)),
             Some(p) => Self::open(p, CONFIG_AUTO_POWER, 0, CLOCK_FULL),
+        }
+    }
+
+    /// The Origin 2000 module's store for module number `module`: see
+    /// [`origin2000_image`]. In memory when `path` is `None`, otherwise
+    /// backed by that file as [`Self::open`] does, its contents winning.
+    pub fn origin2000(module: u8, path: Option<&Path>) -> io::Result<Self> {
+        match path {
+            None => Ok(Self::from_image(origin2000_image(module), None)),
+            Some(p) => Self::open(p, 0, module, 0),
         }
     }
 
@@ -352,6 +377,17 @@ mod tests {
         want[0x70b] = 0x78;
         assert_eq!(image, want);
         assert_eq!(ElscNvram::origin200(None).unwrap().contents(), want);
+    }
+
+    #[test]
+    fn the_origin_2000_image_has_no_auto_power_bit_and_the_selected_module() {
+        let image = origin2000_image(3);
+        let mut want = [0u8; BYTES];
+        want[0x700] = 0x37;
+        want[0x701..0x705].copy_from_slice(b"none");
+        want[0x708] = 3;
+        assert_eq!(image, want);
+        assert_eq!(ElscNvram::origin2000(3, None).unwrap().contents(), want);
     }
 
     #[test]
