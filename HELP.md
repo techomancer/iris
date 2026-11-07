@@ -524,6 +524,8 @@ standalone `iris` window if you need them.
 
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
+`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu` feature) draws the window through wgpu instead of OpenGL, with the same scaling rules. With a VPro whose raster unit is on the GPU (`raster = "wgpu"`) the window shares that GPU, and each frame goes from the board's memory to the screen without passing through main memory; screenshots and VNC still read frames back when they ask for them. Newport's display (Indy, Indigo2 XL) is composed on the GPU as well. If wgpu cannot open the window, iris says so and draws with OpenGL.
+
 ## VNC
 
 iris has a built-in VNC server. Any VNC viewer (TigerVNC, RealVNC, Remmina,
@@ -602,6 +604,7 @@ scale = 1                   # window scale, kept across guest mode changes; --2x
 headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
 no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
+# renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
 mouse_scroll_pixels_per_line = 40
 
 nat_subnet = "192.168.0.0/24"   # gateway .1, guest .2
@@ -636,6 +639,8 @@ heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
 # tile     = 32             # VPro: screen tile size, a power of two from 8 to 256
+# raster   = "cpu"          # VPro: "wgpu" draws on the host GPU (builds with the wgpu feature; work in progress)
+# gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"
 
 [clock]
 # fixed_mhz = 33            # Count MHz: default 33 on IP22/IP24, 97.5 on IP28

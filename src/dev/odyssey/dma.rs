@@ -161,7 +161,18 @@ impl Board {
         let pixel = self.decode_pixel(code, src).unwrap_or(0);
         let index = code_is_index(code);
         let word = if index { pixel } else { (pixel & !0xffu32) | 0xff };
-        to.store_word(x as i32, y as i32, self.image_transfer(word, index));
+        let word = self.image_transfer(word, index);
+        #[cfg(feature = "wgpu")]
+        if self.gpu_unit() {
+            // A blit into the put's own surface, in order, no wait.
+            if let Ok(view) = super::gpu_unit::Slot::own_view(to) {
+                let key = super::gpu_unit::BlitKey { view: super::gpu_unit::BlitView::Own(view), ..super::gpu_unit::BlitKey::store(0, u32::MAX) };
+                let slot = super::gpu_unit::Slot::none();
+                self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").blit_pixel(&slot, &key, x as i32, y as i32, word));
+                return;
+            }
+        }
+        to.store_word(x as i32, y as i32, word);
     }
 
     /// The A and B fields of the surface a DMA header names: word 0's
@@ -169,8 +180,12 @@ impl Board {
     /// 2's stride in tiles, word 4's pixel size (19:16), field size (15:13)
     /// and field offsets (23:20 A, 27:24 B, in 2-byte units), the field's
     /// code and class (7:0) for its packing.
-    pub fn dma_fields(&self, hdr: &[u32], read: bool) -> ([Rows; 2], bool) {
-        self.raster_wait();
+    /// With `wait`, after the raster unit's queued work; a put into memory
+    /// no drawing touches skips it on the GPU unit (`dma_to_buffer`).
+    pub fn dma_fields(&self, hdr: &[u32], read: bool, wait: bool) -> ([Rows; 2], bool) {
+        if wait {
+            self.raster_wait();
+        }
         let base = hdr[dma::HDR_DEST];
         let fmt = hdr[dma::HDR_FORMAT];
         let drawable = base & dma::SENTINEL != 0;
@@ -246,16 +261,27 @@ impl Board {
     /// count runs out, then the cursor steps over skip uncounted bytes. No byte
     /// outside the entries is read.
     pub fn dma_to_buffer(&mut self, bus: &DmaBus, table: u64, seq: u64, hdr: &[u32]) {
-        let ([a, b], drawable) = self.dma_fields(hdr, false);
-        // Word 4 bit 31: the front (A) field, else the back (B).
-        let to = if hdr[dma::HDR_FORMAT] & dma::FMT_FRONT != 0 { a } else { b };
         // Memory, not the screen: a scratch surface the pixel mode selects,
         // or any address but the frame buffer the scan-out shows. Its texels
         // keep the source's alpha and pass no window tests. The library
         // uploads a texture or a zoomed image's scratch while the window is
         // still the pixel mode (traced), so the select alone does not say.
+        let drawable = hdr[dma::HDR_DEST] & dma::SENTINEL != 0;
         let screen = self.pbj(super::frame::pbj::PIXEL_BASE);
         let memory = Format::decode(self.pixel_mode[2]).scratch || (!drawable && hdr[dma::HDR_DEST] & ADDR_MASK != screen);
+        // On the GPU unit a put into memory the drawing does not touch
+        // need not wait for it: the texels go into the mirror and up with
+        // the next batch, and the draws that sample them have already run
+        // inside their submit.
+        let direct = memory && self.gpu_unit();
+        let ([a, b], drawable) = self.dma_fields(hdr, false, !direct);
+        // Word 4 bit 31: the front (A) field, else the back (B).
+        let mut to = if hdr[dma::HDR_FORMAT] & dma::FMT_FRONT != 0 { a } else { b };
+        if direct {
+            // Stored into the mirror untracked and uploaded as the pixels
+            // written (GpuRaster::upload_region), below.
+            to = Rows::new(to.mem().untracked(), to.v);
+        }
         let obj = memory.then_some(());
         let mut e = [DmaEntry::default(); dma::MAX_PAGES];
         let x = hdr[dma::HDR_ORIGIN] & 0xffff;
@@ -357,6 +383,14 @@ impl Board {
                 }
             }
         }
+        if direct {
+            let (x0, y0) = (x as i32, y as i32);
+            self.raster.run_now(|ctx| {
+                if let Some(g) = &mut ctx.gpu {
+                    g.upload_region(&to.v, x0, y0, x0.wrapping_add(w as i32 - 1), y0.wrapping_add(h as i32 - 1));
+                }
+            });
+        }
     }
 }
 
@@ -439,21 +473,27 @@ pub(super) fn dma_draw_sentinel_form(hdr: &[u32], top_down: &mut bool) -> Option
 impl Board {
 #[cfg(test)]
     /// The depth plane's word at plane pixel (x, y), which is in the plane.
-    /// The destination's depth and stencil fields (Board::dest_mem()).
+    /// The destination's depth and stencil fields (Board::planes_in()).
     pub fn depth_load(&mut self, x: i64, y: i64) -> u32 {
-        self.dest_mem().depth.load_word(x as i32, y as i32).unwrap_or(0)
+        self.planes_in(x, y, x, y).depth.load_word(x as i32, y as i32).unwrap_or(0)
     }
 
     pub fn depth_store(&mut self, x: i64, y: i64, word: u32) {
-        self.dest_mem().depth.store_word(x as i32, y as i32, word);
+        if self.gpu_blit_view(2, x, y, word, u32::MAX) {
+            return;
+        }
+        self.planes_in(x, y, x, y).depth.store_word(x as i32, y as i32, word);
     }
 
     pub fn stencil_load(&mut self, x: i64, y: i64) -> u32 {
-        self.dest_mem().stencil.load1(x as i32, y as i32).unwrap_or(0) as u32
+        self.planes_in(x, y, x, y).stencil.load1(x as i32, y as i32).unwrap_or(0) as u32
     }
 
     pub fn stencil_store(&mut self, x: i64, y: i64, value: u8) {
-        self.dest_mem().stencil.store1(x as i32, y as i32, value);
+        if self.gpu_blit_view(3, x, y, value as u32, u32::MAX) {
+            return;
+        }
+        self.planes_in(x, y, x, y).stencil.store1(x as i32, y as i32, value);
     }
 
     /// Stage the pixel bytes first so a failed source read cannot leave a
@@ -822,7 +862,9 @@ impl Board {
             }
             return false;
         }
-        let (fields, drawable) = self.dma_fields(hdr, true);
+        // On the GPU unit the read's own rectangle comes back below
+        // (dma_from_board), not the whole drawing.
+        let (fields, drawable) = self.dma_fields(hdr, true, !self.gpu_unit());
         let a = fields[0].v;
         // Depth and stencil through the A field's place: a 24-bit word and
         // its stencil byte (field.rs).
@@ -1106,6 +1148,12 @@ impl Board {
         let l = if raw { None } else { self.dma_read_layout(hdr, bpp) };
         if (!raw && l.is_none()) || !self.dma_read_source(hdr, &mut src) {
             return;
+        }
+        if self.gpu_unit() {
+            // What the read covers, current in the mirror.
+            let (x0, y0, x1, y1) = (src.x, src.y, src.x + w as i64 - 1, src.y + h as i64 - 1);
+            let planes = super::pipe::backend::DestMem { colour: src.fields, depth: src.depth, stencil: src.stencil, did: src.fields[0], overlay: src.fields[1] };
+            self.gpu_read_back(&planes, x0, y0, x1, y1);
         }
         let Ok(n) = bus.entries(table, seq, &mut e) else {
             return;
@@ -1647,12 +1695,23 @@ impl Board {
         };
         let mem = self.vram_ptr();
         let from = super::view::Rows::new(mem, super::view::View::colour(&surface, field, super::view::MAX_DIM));
-        let to = self.dest_mem().colour[0];
+        // The destination is a texture level: on the GPU unit it is stored
+        // untracked and uploaded as a rectangle, with no wait (as a scratch
+        // image through the FIFO, Board::image_put()).
+        let gpu = self.gpu_unit();
+        let to = if gpu { super::pipe::backend::DestMem::of(mem.untracked(), &self.dest_views()).colour[0] } else { self.dest_mem().colour[0] };
         for y in 0..hd {
             for x in 0..wd {
                 let v = from.load_word(2 * x as i32, 2 * y as i32).unwrap_or(0);
                 to.store_word(x as i32, y as i32, v);
             }
+        }
+        if gpu && wd > 0 && hd > 0 {
+            self.raster.run_now(|ctx| {
+                let g = ctx.gpu.as_mut().expect("the unit");
+                g.note_region(&to.v, 0, 0);
+                g.note_region(&to.v, wd as i32 - 1, hd as i32 - 1);
+            });
         }
         true
     }

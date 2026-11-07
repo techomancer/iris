@@ -62,7 +62,7 @@ fn object_header(rows: u32, irq: bool) -> [u32; 8] {
 /// Pixel (x, y) of the surface at `base` (`stride` tiles, 1 << `log2`
 /// bytes a pixel) as the model's word, its field packed as `codec`.
 fn mem_word(s: &Board, base: u32, stride: u32, log2: u8, codec: Codec, x: i32, y: i32) -> u32 {
-    s.raster_wait();
+    s.gpu_sync();
     let surface = Surface::new(base, stride, log2);
     Rows::new(s.vram_ptr(), View::colour(&surface, Field { at: 0, codec }, MAX_DIM)).load_word(x, y).unwrap()
 }

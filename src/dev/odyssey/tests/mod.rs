@@ -225,13 +225,13 @@ pub(super) fn screen_field(s: &Board, buffer: u32) -> crate::dev::odyssey::view:
 /// Byte `b` (0 the window id, 1 the overlay) of the window-id buffer
 /// Board::test_screen() sets up, at linear screen index `i` (y * 1280 + x).
 pub(super) fn aux_at(s: &Board, b: u32, i: u32) -> u8 {
-    s.raster_wait();
+    s.gpu_sync();
     let w = crate::dev::odyssey::vram::Surface::new(0x14_2000, 80, 1);
     s.vram.ptr_shared().load(w.offset(i % 1280, i / 1280) + b as u64, 1) as u8
 }
 
 pub(super) fn set_aux(s: &mut Board, b: u32, i: u32, v: u8) {
-    s.raster_wait();
+    s.gpu_sync();
     let w = crate::dev::odyssey::vram::Surface::new(0x14_2000, 80, 1);
     let at = w.offset(i % 1280, i / 1280) + b as u64;
     s.vram.ptr().store(at, 1, v as u64);
@@ -242,20 +242,27 @@ pub(super) fn screen_stencil(s: &Board, x: i32, y: i32) -> u32 {
     use crate::dev::odyssey::field::Layout;
     use crate::dev::odyssey::view::{Rows, View, MAX_DIM};
     use crate::dev::odyssey::vram::{Format, Surface};
-    s.raster_wait();
+    s.gpu_sync();
     let f = Format::decode(0x0040_6d50);
     let (_, st) = View::depth_stencil(&Surface::new(0x2000, 80, f.fb_log2), &Layout::of(f), MAX_DIM);
     Rows::new(s.vram_ptr(), st).load1(x, y).unwrap_or(0) as u32
 }
 
 /// The pixel at (x, y) of colour buffer `buffer`, as 0xRRGGBBAA.
+/// Whether the test boards run on the GPU raster unit (`VPRO_GPU=1` with
+/// the `wgpu` feature): the raster thread's own mechanics are not there
+/// to test then.
+pub(super) fn gpu_unit_tests() -> bool {
+    cfg!(feature = "wgpu") && std::env::var("VPRO_GPU").is_ok()
+}
+
 pub(super) fn pixel(s: &Board, buffer: u32, x: i32, y: i32) -> u32 {
-    s.raster_wait();
+    s.gpu_sync();
     screen_field(s, buffer).load_word(x, y).unwrap_or(0)
 }
 
 /// Store a pixel into colour buffer 0, as a draw would.
 pub(super) fn pixel_write(s: &mut Board, x: i32, y: i32, value: u32) {
-    s.raster_wait();
+    s.gpu_sync();
     screen_field(s, 0).store_word(x, y, value);
 }

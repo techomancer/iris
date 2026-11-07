@@ -974,6 +974,33 @@ pub struct GraphicsSection {
     /// two from 8 to 256.
     #[serde(default = "default_graphics_tile")]
     pub tile: u32,
+    /// VPro: where the raster unit runs: `cpu` (the threads above) or
+    /// `wgpu` (the host GPU through wgpu compute; needs the `wgpu`
+    /// feature).
+    #[serde(default)]
+    pub raster: RasterUnit,
+    /// The wgpu backend for `raster = "wgpu"`: `auto`, `vulkan`, `metal`,
+    /// `dx12` or `gl`.
+    #[serde(default = "default_gpu_backend")]
+    pub gpu_backend: String,
+}
+
+/// What draws the host window (`renderer`, `--renderer`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum UiRenderer {
+    #[default]
+    Gl,
+    Wgpu,
+}
+
+/// Where a board's raster unit runs (`[graphics] raster`, `--raster`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum RasterUnit {
+    #[default]
+    Cpu,
+    Wgpu,
 }
 
 impl GraphicsSection {
@@ -988,6 +1015,7 @@ impl GraphicsSection {
 fn default_graphics_heads() -> u8 { 1 }
 fn default_graphics_threads() -> usize { 2 }
 fn default_graphics_tile() -> u32 { 32 }
+fn default_gpu_backend() -> String { "auto".into() }
 
 impl Default for GraphicsSection {
     fn default() -> Self {
@@ -997,6 +1025,8 @@ impl Default for GraphicsSection {
             resolution: crate::dev::ng1::vc2_timings::NewportResolution::default(),
             threads: default_graphics_threads(),
             tile: default_graphics_tile(),
+            raster: RasterUnit::Cpu,
+            gpu_backend: default_gpu_backend(),
         }
     }
 }
@@ -1818,6 +1848,14 @@ pub struct MachineConfig {
     #[serde(default = "default_lock_aspect_ratio")]
     pub lock_aspect_ratio: bool,
 
+    /// What draws the window: `gl` (default) or `wgpu` (the host GPU
+    /// through wgpu, on the same device as a board drawing there, so a
+    /// VPro frame composed on the GPU is presented without a readback;
+    /// needs a build with the `wgpu` feature). The iris-gui front end has
+    /// its own window and ignores this.
+    #[serde(default)]
+    pub renderer: UiRenderer,
+
     /// Optional file path that will receive every byte emitted on ttyd1
     /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
     /// keeping a continuously-updated transcript of the install or test run.
@@ -2118,6 +2156,7 @@ impl Default for MachineConfig {
             network: NetworkSection::default(),
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
+            renderer: UiRenderer::default(),
             scsi_deferred_int: default_scsi_deferred_int(),
             audio: AudioConfig::default(),
             machine: MachineSection::default(),
@@ -2534,6 +2573,15 @@ impl MachineConfig {
         if self.graphics.threads == 0 {
             return Err("graphics.threads must be at least 1".into());
         }
+        if self.renderer == UiRenderer::Wgpu && !cfg!(feature = "wgpu") {
+            return Err("renderer = \"wgpu\" needs a build with the wgpu feature".into());
+        }
+        if self.graphics.raster == RasterUnit::Wgpu && !cfg!(feature = "wgpu") {
+            return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
+        }
+        if !["auto", "vulkan", "metal", "dx12", "gl"].contains(&self.graphics.gpu_backend.as_str()) {
+            return Err(format!("graphics.gpu_backend {:?} must be auto, vulkan, metal, dx12 or gl", self.graphics.gpu_backend));
+        }
         if !self.graphics.tile.is_power_of_two() || !(8..=256).contains(&self.graphics.tile) {
             return Err(format!("graphics.tile {} must be a power of two from 8 to 256", self.graphics.tile));
         }
@@ -2789,6 +2837,14 @@ pub struct Cli {
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
     pub graphics: Option<GraphicsBoard>,
 
+    /// VPro: where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
+    #[arg(long = "raster", value_name = "UNIT")]
+    pub raster: Option<RasterUnit>,
+
+    /// What draws the window: `gl` (default) or `wgpu` (needs a build with the `wgpu` feature).
+    #[arg(long = "renderer", value_name = "RENDERER")]
+    pub renderer: Option<UiRenderer>,
+
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
@@ -2965,6 +3021,8 @@ impl Cli {
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
+        if let Some(r) = self.raster { cfg.graphics.raster = r; }
+        if let Some(r) = self.renderer { cfg.renderer = r; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }

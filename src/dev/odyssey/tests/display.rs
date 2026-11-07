@@ -166,6 +166,42 @@ fn an_armed_swap_toggles_the_displayed_buffer_at_the_retrace() {
     assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), 0x5);
 }
 
+/// A flip armed after command stores the raster unit has not submitted
+/// yet waits: the retrace leaves it armed until the unit's submissions
+/// cover the stream up to the arm (`DisplayShared::covered`, published by
+/// the GPU unit's tick), so the buffer shown holds the drawing issued
+/// before the swap. The CPU unit leaves the position at its maximum and
+/// flips latch at once, as the tests above see.
+#[test]
+fn a_flip_waits_until_the_raster_unit_covers_the_stores_before_its_arm() {
+    use std::sync::atomic::Ordering::SeqCst;
+    const ARM_BIT: u32 = 0x0100_0000;
+    let (mut s, _rec) = board("v12");
+    route_to_heart(&mut s);
+
+    // Two stores queued in the command stream, not yet run.
+    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_A as u64) << 32 | 0x8000_2000, 8));
+    assert!(s.fifo.push(&s.front, cmd::FIFO, (swap::SYNC_B as u64) << 32 | 0x8000_2000, 8));
+    assert_eq!(s.fifo.pushed(), 2);
+    assert_eq!(s.fifo.retired(), 0);
+
+    // The unit has submitted the drawing from the first store only.
+    s.display.covered.store(1, SeqCst);
+    reg_write(&mut s, swap::ARM, ARM_BIT);
+    retrace(&mut s);
+    assert_eq!(reg_read(&mut s, swap::ARM), ARM_BIT, "the flip stays armed");
+    assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), 0, "nothing flips before the stores before the arm are drawn");
+
+    s.display.covered.store(2, SeqCst);
+    retrace(&mut s);
+    assert_eq!(reg_read(&mut s, swap::ARM), 0);
+    assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), ARM_BIT, "the flip latches once they are");
+
+    // The queued stores run; the stream positions meet.
+    s.work_drain(0);
+    assert_eq!(s.fifo.retired(), 2);
+}
+
 /// Arm writes between two retraces accumulate: separate windows issued
 /// before one retrace all flip there, and the interrupt handler's re-arm
 /// of a window still pending does not cancel the others.

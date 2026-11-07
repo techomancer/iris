@@ -46,6 +46,29 @@ pub trait Renderer: Send {
     fn compositor_status(&self) -> String { "compositor=sw shader=n/a".to_string() }
     /// Whether the GL compositor is in use, or is about to be.
     fn gl_compositor(&self) -> bool { false }
+
+    /// Whether `present_gpu_frame` presents frames that are already on the
+    /// board's GPU (the wgpu renderer, on the board's own device). A board
+    /// that composes on the GPU then skips its readback.
+    #[cfg(feature = "wgpu")]
+    fn takes_gpu_frames(&self) -> bool { false }
+
+    /// Present a frame of 0x00RRGGBB words (rows of `width`) that is on the
+    /// board's GPU, with `screen` giving the overlay's sources; the status
+    /// bar and overlay as `present` draws them. `screen.rgba` is not updated.
+    #[cfg(feature = "wgpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn present_gpu_frame(
+        &mut self,
+        _frame:   &wgpu::Buffer,
+        _width:   u32,
+        _height:  u32,
+        _screen:  &mut crate::disp::Rex3Screen,
+        _overlay: &mut crate::debug_overlay::DebugOverlay,
+        _status:  &mut crate::disp::StatusBar,
+        _sbtex:   &mut crate::disp::StatusBarTexture,
+        _stats:   &crate::disp::BarStats,
+    ) {}
 }
 
 pub const REX3_SIZE: u32 = 0x2000; // 8KB

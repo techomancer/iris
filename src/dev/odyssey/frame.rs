@@ -90,12 +90,12 @@ pub(super) struct PixelParts {
 pub(super) struct Frame {
     pub width: u32,
     pub height: u32,
-    fb: Surface,
+    pub(super) fb: Surface,
     /// Per main window id, its two colour fields (mode_fields()).
-    fields: [[Field; 2]; dispmode::COUNT as usize],
-    wid: Surface,
-    wid_layout: Layout,
-    ctx: ResolveCtx,
+    pub(super) fields: [[Field; 2]; dispmode::COUNT as usize],
+    pub(super) wid: Surface,
+    pub(super) wid_layout: Layout,
+    pub(super) ctx: ResolveCtx,
 }
 
 impl Frame {

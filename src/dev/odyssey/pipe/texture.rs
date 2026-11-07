@@ -1118,7 +1118,10 @@ unsafe fn filter(win: *const [u32; 4], at: [usize; 3], w: [u32; 3], linear: bool
     }
     let [a, b, c] = w;
     let plane = |z: usize| -> [u32; 4] {
-        let (c00, c10, c01, c11) = (at_(0, 0, z), at_(1, 0, z), at_(0, 1, z), at_(1, 1, z));
+        let (c00, c10) = (at_(0, 0, z), at_(1, 0, z));
+        // A 1D texture's window has one row: its second row's weight is
+        // zero and the row is not read.
+        let (c01, c11) = if b != 0 { (at_(0, 1, z), at_(1, 1, z)) } else { (c00, c10) };
         std::array::from_fn(|k| {
             let top = c00[k] * (256 - a) + c10[k] * a;
             let bot = c01[k] * (256 - a) + c11[k] * a;

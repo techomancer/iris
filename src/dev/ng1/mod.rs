@@ -33,6 +33,9 @@ pub mod rex3_jit_queue;
 #[cfg(feature = "rex-jit")]
 pub mod rex3_jit;
 pub mod vc2;
+/// The display composed on the host GPU (the wgpu window renderer).
+#[cfg(feature = "wgpu")]
+pub mod wgpu;
 pub mod vc2_timings;
 pub mod xmap9;
 pub mod cmap;

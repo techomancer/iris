@@ -14,7 +14,8 @@
 //! `cargo test ... replay_bless -- --ignored` re-takes every recording's
 //! checkpoints. `VPRO_REPLAY_LIMIT=<n>` stops after n records, so a dump
 //! shows the board there; `VPRO_REPLAY_THREADS=1` draws on the raster and
-//! back-end threads.
+//! back-end threads; `VPRO_REPLAY_GPU=1` draws on the GPU raster unit
+//! (with the `wgpu` feature).
 
 use crate::dev::odyssey::board::{Board, ODSY_HEIGHT, ODSY_WIDTH};
 use crate::dev::odyssey::consts::{cmd, gl_cmd, image, reg, ODSY_BUZZ_1};
@@ -39,12 +40,20 @@ pub struct ReplayMem {
     reads: Vec<Rec>,
     next: Mutex<usize>,
     pub mismatches: Mutex<u64>,
+    /// What the board wrote to guest memory (pixel reads, fences, query
+    /// results), hashed in order with each write's address: two replays of
+    /// one recording on different raster units read back the same pixels
+    /// exactly when this matches.
+    pub writes: Mutex<(blake3::Hasher, u64)>,
+    /// `VPRO_REPLAY_WRITES=<file>`: each write as a line, address and words.
+    log: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
 }
 
 impl ReplayMem {
     pub fn new(recs: &[Rec]) -> Self {
         let reads = recs.iter().filter(|r| matches!(r, Rec::DmaBlock { .. } | Rec::DmaByte { .. })).cloned().collect();
-        ReplayMem { reads, next: Mutex::new(0), mismatches: Mutex::new(0) }
+        let log = std::env::var("VPRO_REPLAY_WRITES").ok().and_then(|f| std::fs::File::create(f).ok()).map(|f| Mutex::new(std::io::BufWriter::new(f)));
+        ReplayMem { reads, next: Mutex::new(0), mismatches: Mutex::new(0), writes: Mutex::new((blake3::Hasher::new(), 0)), log }
     }
     pub fn consumed(&self) -> (usize, usize) {
         (*self.next.lock(), self.reads.len())
@@ -67,7 +76,15 @@ impl BusDevice for ReplayMem {
             }
         }
     }
-    fn write8(&self, _addr: u64, _val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        let mut w = self.writes.lock();
+        w.0.update(&addr.to_be_bytes());
+        w.0.update(&[val]);
+        w.1 += 1;
+        if let Some(l) = &self.log {
+            use std::io::Write;
+            let _ = writeln!(l.lock(), "{addr:#x} b {val:02x}");
+        }
         BUS_OK
     }
     fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 {
@@ -83,7 +100,22 @@ impl BusDevice for ReplayMem {
             }
         }
     }
-    fn write_block(&self, _addr: u64, _buf: &[u64]) -> u32 {
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 {
+        let mut w = self.writes.lock();
+        w.0.update(&addr.to_be_bytes());
+        for v in buf {
+            w.0.update(&v.to_be_bytes());
+        }
+        w.1 += 8 * buf.len() as u64;
+        if let Some(l) = &self.log {
+            use std::io::Write;
+            let mut l = l.lock();
+            let _ = write!(l, "{addr:#x} {}", buf.len());
+            for v in buf {
+                let _ = write!(l, " {v:016x}");
+            }
+            let _ = writeln!(l);
+        }
         BUS_OK
     }
 }
@@ -98,6 +130,8 @@ pub struct Report {
     pub dma_total: usize,
     pub dma_mismatched: u64,
     pub reads_differ: u64,
+    /// The board's writes to guest memory: their hash and byte count.
+    pub host_writes: (String, u64),
     /// The recording's marks (`vpro rec`), and those whose hash the replayed
     /// planes did not reach.
     pub marks: usize,
@@ -138,7 +172,31 @@ fn programs_scan_out(recs: &[Rec]) -> bool {
 
 /// Feed `recs` through a fresh board's registers, `setup` run on it first.
 /// `board_out` receives the board when it is done.
+/// How a replay draws: on the GPU raster unit or not, with its readbacks
+/// skipped (`lazy`, for timing), ending a board slice every `tick` stores.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Opts {
+    pub gpu: bool,
+    pub lazy: bool,
+    pub tick: Option<usize>,
+}
+
+impl Opts {
+    /// `VPRO_REPLAY_GPU`, `VPRO_REPLAY_LAZY`, `VPRO_REPLAY_TICK`.
+    pub fn from_env() -> Opts {
+        Opts {
+            gpu: std::env::var("VPRO_REPLAY_GPU").is_ok(),
+            lazy: std::env::var("VPRO_REPLAY_LAZY").is_ok(),
+            tick: std::env::var("VPRO_REPLAY_TICK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0),
+        }
+    }
+}
+
 pub fn run(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize) -> (Report, Box<Board>) {
+    run_with(recs, setup, every, Opts::from_env())
+}
+
+pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts: Opts) -> (Report, Box<Board>) {
     let mut b = Board::new("v12", 11).expect("board");
     // A recording with marks (version 2) was taken from a board the machine
     // reset at power-on (the depth plane at all ones): start there, as the
@@ -156,6 +214,21 @@ pub fn run(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize) -> (Repor
     let mem = Arc::new(ReplayMem::new(recs));
     b.guest = Some(mem.clone());
     setup(&mut b);
+    // VPRO_REPLAY_GPU=1: draw on the GPU raster unit.
+    if opts.gpu {
+        #[cfg(feature = "wgpu")]
+        {
+            b.enable_gpu(&crate::wgpu::GpuOptions::default()).expect("the GPU raster unit");
+            // VPRO_REPLAY_LAZY=1: no readbacks between checkpoints, to time
+            // the GPU path alone (the planes the front end reads go stale,
+            // so the checkpoints are not expected to hold).
+            if opts.lazy {
+                b.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").lazy = true);
+            }
+        }
+        #[cfg(not(feature = "wgpu"))]
+        panic!("VPRO_REPLAY_GPU needs a build with the wgpu feature");
+    }
     // VPRO_REPLAY_THREADS=1: draw on the raster and back-end threads, as a
     // running machine does; the checkpoints must not move.
     let threads = std::env::var("VPRO_REPLAY_THREADS").is_ok();
@@ -177,16 +250,27 @@ pub fn run(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize) -> (Repor
     // VPRO_REPLAY_EVERY=<n> with VPRO_REPLAY_SHOTS: the screen every n
     // records too, as rec-NNNNNNNNN.png.
     let shot_every = std::env::var("VPRO_REPLAY_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0);
+    // VPRO_REPLAY_TICK=<n>: end a slice every n stores, as the board's thread
+    // does between runs of stores (`gpu_upload_tick`, the board going idle):
+    // the GPU unit then submits mid-stream as it does live.
+    let tick = opts.tick;
+    let mut stores = 0usize;
     for (i, r) in recs.iter().enumerate().take(limit) {
         if let (Some(n), Some(dir)) = (shot_every, &shots) {
             if i % n == 0 && i != 0 {
-                b.raster_wait();
+                b.gpu_sync();
                 let _ = std::fs::create_dir_all(dir);
                 save_screen(&b, &format!("{dir}/rec-{i:09}.png"));
             }
         }
         match r {
-            Rec::Write { size, off, val } => b.mmio_write(*off as u64, *val, *size as u32),
+            Rec::Write { size, off, val } => {
+                b.mmio_write(*off as u64, *val, *size as u32);
+                stores += 1;
+                if tick.is_some_and(|n| stores % n == 0) {
+                    b.gpu_upload_tick(true);
+                }
+            }
             Rec::Read { size, off, val } => {
                 let mask = if *size >= 8 { u64::MAX } else { (1u64 << (8 * *size as u32)) - 1 };
                 if b.mmio_read(*off as u64, *size as u32) & mask != val & mask {
@@ -195,7 +279,7 @@ pub fn run(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize) -> (Repor
             }
             Rec::DmaBlock { .. } | Rec::DmaByte { .. } => {}
             Rec::Mark(h) => {
-                b.raster_wait();
+                b.gpu_sync();
                 let got = memory_hash_bytes(&b);
                 rep.marks += 1;
                 if got != *h {
@@ -212,7 +296,7 @@ pub fn run(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize) -> (Repor
             }
         }
         if every != 0 && (i + 1) % every == 0 && rep.hashes.last().is_none_or(|(j, _)| *j != i + 1) {
-            b.raster_wait();
+            b.gpu_sync();
             rep.hashes.push((i + 1, memory_hash(&b)));
             if let Some(dir) = &shots {
                 let _ = std::fs::create_dir_all(dir);
@@ -220,15 +304,37 @@ pub fn run(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize) -> (Repor
             }
         }
     }
-    b.raster_wait();
+    b.gpu_sync();
     if threads {
         b.raster.stop();
+    }
+    #[cfg(feature = "wgpu")]
+    if b.gpu_unit() {
+        let (batches, records, dropped, up, blocks, tiles, down, readbacks) = b.raster.run_now(|ctx| {
+            let g = ctx.gpu.as_ref().expect("the unit");
+            let (batches, records) = g.counts();
+            (batches, records, g.dropped, g.uploaded, g.uploaded_blocks, g.uploaded_tiles, g.read_back_bytes, g.readbacks)
+        });
+        eprintln!("gpu unit: {records} records in {batches} batches ({dropped} dropped), {} MiB uploaded ({} MiB dirty blocks, {} MiB regions), {} MiB read back in {readbacks} readbacks", up >> 20, blocks >> 20, tiles >> 20, down >> 20);
+        b.raster.run_now(|ctx| {
+            if let Some(by) = &ctx.gpu.as_ref().expect("the unit").waits_by {
+                let mut v: Vec<_> = by.iter().collect();
+                v.sort_by(|a, b| b.1.cmp(a.1));
+                for (who, n) in v {
+                    eprintln!("  {n:8} readbacks from {who}");
+                }
+            }
+        });
     }
     if every != 0 && recs.len() % every != 0 && rep.hashes.last().is_none_or(|(j, _)| *j != recs.len()) {
         rep.hashes.push((recs.len(), memory_hash(&b)));
     }
     (rep.dma_used, rep.dma_total) = mem.consumed();
     rep.dma_mismatched = *mem.mismatches.lock();
+    {
+        let w = mem.writes.lock();
+        rep.host_writes = (w.0.clone().finalize().to_hex()[..16].to_string(), w.1);
+    }
     (rep, b)
 }
 
@@ -280,8 +386,10 @@ pub fn replay_file(path: &Path, png: Option<&str>) -> Result<Report, String> {
     let recs = record::load(&path.to_string_lossy()).map_err(|e| format!("{}: {e}", path.display()))?;
     let t0 = std::time::Instant::now();
     let (rep, board) = run(&recs, |_| {}, EVERY);
+    // The memory as drawn, on either raster unit.
+    board.gpu_sync();
     eprintln!(
-        "{}: {} records in {:.1} s, DMA reads {}/{} ({} mismatched), {} bus loads differ, {} of {} marks reached{}",
+        "{}: {} records in {:.1} s, DMA reads {}/{} ({} mismatched), {} bus loads differ, host writes {} bytes {}, memory {}, {} of {} marks reached{}",
         path.display(),
         rep.records,
         t0.elapsed().as_secs_f64(),
@@ -289,6 +397,9 @@ pub fn replay_file(path: &Path, png: Option<&str>) -> Result<Report, String> {
         rep.dma_total,
         rep.dma_mismatched,
         rep.reads_differ,
+        rep.host_writes.1,
+        rep.host_writes.0,
+        &memory_hash(&board)[..16],
         rep.marks - rep.marks_failed.len(),
         rep.marks,
         if rep.mid_session { " (started mid-session: the marks are informational)" } else { "" }
@@ -309,7 +420,10 @@ pub fn replay_file(path: &Path, png: Option<&str>) -> Result<Report, String> {
     }
     // Read last, so a recording without checkpoints still gives its
     // picture and memory.
-    let want = load_hashes(path)?;
+    let mut want = load_hashes(path)?;
+    if let Some(limit) = std::env::var("VPRO_REPLAY_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+        want.retain(|(i, _)| *i <= limit);
+    }
     let failed: Vec<usize> = want.iter().filter(|(i, h)| rep.hashes.iter().find(|(j, _)| j == i).is_none_or(|(_, g)| g != h)).map(|(i, _)| *i).collect();
     if want.is_empty() || !failed.is_empty() || want.len() != rep.hashes.len() {
         return Err(format!("{}: {} of {} checkpoints failed, at records {:?}", path.display(), failed.len(), want.len(), &failed[..failed.len().min(8)]));
@@ -347,6 +461,48 @@ fn recordings() -> Vec<PathBuf> {
 }
 
 /// Every recording in the recordings directory replays to its checkpoints.
+/// The two raster units agree on recorded guest sessions: each recording in
+/// `VPRO_PARITY_DIR` (default `ignore/recordings/gpu-cases`) replays on the
+/// CPU unit, on the GPU unit, and on the GPU unit ending a board slice every
+/// 64 stores as a running machine does; all three must write the same bytes
+/// to guest memory (the pixels the guest reads back) and leave the same
+/// board memory. The recordings are short guest test programs (vissweep
+/// cases, pixtest groups, cicopy); like the others they are not in git, and
+/// the test skips without them.
+#[cfg(feature = "wgpu")]
+#[test]
+fn the_raster_units_agree_on_recorded_sessions() {
+    let dir = std::env::var("VPRO_PARITY_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("ignore/recordings/gpu-cases"));
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "rec")).collect())
+        .unwrap_or_default();
+    files.sort();
+    if files.is_empty() {
+        eprintln!("SKIPPED: no recordings in {}", dir.display());
+        return;
+    }
+    let mut bad = vec![];
+    for f in &files {
+        let recs = record::load(&f.to_string_lossy()).expect("a recording");
+        let outcome = |opts: Opts| {
+            let (rep, b) = run_with(&recs, |_| {}, 0, opts);
+            b.gpu_sync();
+            (rep.host_writes, memory_hash(&b))
+        };
+        let cpu = outcome(Opts::default());
+        let gpu = outcome(Opts { gpu: true, ..Default::default() });
+        let ticked = outcome(Opts { gpu: true, tick: Some(64), ..Default::default() });
+        eprintln!("{}: host writes {} bytes", f.display(), cpu.0 .1);
+        if gpu != cpu {
+            bad.push(format!("{}: the GPU unit differs ({:?} vs {:?})", f.display(), gpu, cpu));
+        }
+        if ticked != cpu {
+            bad.push(format!("{}: the GPU unit with slice ends differs ({:?} vs {:?})", f.display(), ticked, cpu));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// With no recordings the test says so and passes, since they are not in the
 /// tree; `VPRO_REPLAY_REQUIRE=1` (the script's `replay`) makes that a failure.
 #[test]
@@ -446,6 +602,7 @@ fn a_replayed_session_reaches_the_planes_the_stores_do() {
             direct.mmio_write(*off as u64, *val, *size as u32);
         }
     }
+    direct.gpu_sync();
     assert_eq!(memory_hash(&direct), rep.hashes.last().unwrap().1);
 
     let mut changed = session.clone();
@@ -511,6 +668,7 @@ fn marks_are_checked_against_the_replayed_planes() {
     let mut fresh = Board::new("v12", 11).unwrap();
     fresh.reset();
     window(&mut fresh);
+    fresh.gpu_sync();
     let h0 = memory_hash_bytes(&fresh);
     let (rep, b) = run(&session, window, 0);
     assert_eq!(rep.hashes.len(), 0);
@@ -520,6 +678,7 @@ fn marks_are_checked_against_the_replayed_planes() {
             fresh.mmio_write(*off as u64, *val, *size as u32);
         }
     }
+    fresh.gpu_sync();
     let h1 = memory_hash_bytes(&fresh);
 
     let mut marked = vec![Rec::Mark(h0)];

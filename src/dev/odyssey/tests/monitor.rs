@@ -22,7 +22,7 @@ const DISPMODE_RGB: u32 = 0x0096_55a6;
 fn board() -> Arc<Odyssey> {
     let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), host_clock()));
     let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
-    let v = Odyssey::new(WIDGET, "v12", heart, ram.dma_view(), crate::disp::StatusSource::detached(), (2, 32)).expect("board");
+    let v = Odyssey::new(WIDGET, "v12", heart, ram.dma_view(), crate::disp::StatusSource::detached(), (2, 32), (crate::config::RasterUnit::Cpu, "auto")).expect("board");
     v.state.test_board().test_screen();
     v
 }

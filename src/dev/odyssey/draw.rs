@@ -48,19 +48,53 @@ impl Board {
     /// the front end's own stores: it waits for the raster unit's queued
     /// jobs first.
     pub fn dest_mem(&self) -> DestMem {
-        self.raster_wait();
+        // Everything the drawing wrote, back: the general path; the hot
+        // ones use planes_in() or store through the unit.
+        self.gpu_sync();
         DestMem::of(self.vram_ptr(), &self.dest_views())
+    }
+
+    /// The destination for a front-end path that reads or writes the
+    /// pixels of one box (inclusive): on the GPU unit, only the blocks the
+    /// drawing touched under that box come back, and nothing waits when
+    /// none did; with the CPU unit, `dest_mem`.
+    pub fn planes_in(&self, x0: i64, y0: i64, x1: i64, y1: i64) -> DestMem {
+        if !self.gpu_unit() {
+            return self.dest_mem();
+        }
+        let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
+        self.gpu_read_back(&planes, x0, y0, x1, y1);
+        planes
+    }
+
+    /// Bring the mirror current under a box of every plane of `planes`
+    /// (GpuRaster::read_back_view).
+    pub fn gpu_read_back(&self, planes: &DestMem, x0: i64, y0: i64, x1: i64, y1: i64) {
+        let clamp = |v: i64| v.clamp(-1, MAX_DIM as i64) as i32;
+        let (x0, y0, x1, y1) = (clamp(x0), clamp(y0), clamp(x1), clamp(y1));
+        self.raster.run_now(|ctx| {
+            if let Some(g) = &mut ctx.gpu {
+                for rows in [&planes.colour[0], &planes.colour[1], &planes.depth, &planes.stencil, &planes.did, &planes.overlay] {
+                    if let Err(e) = g.read_back_view(&rows.v, x0, y0, x1, y1) {
+                        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
+                    }
+                }
+            }
+        });
     }
 
     /// Field b of the destination: 0 the A (front) field, 1 the B (back).
     pub fn buffer_load(&self, b: u32, x: i64, y: i64) -> u32 {
-        self.dest_mem().colour[(b & 1) as usize].load_word(x as i32, y as i32).unwrap_or(0)
+        self.planes_in(x, y, x, y).colour[(b & 1) as usize].load_word(x as i32, y as i32).unwrap_or(0)
     }
 
     /// Store field b of the destination. A byte field (the window-id
     /// buffer's id and overlay bytes) is stored under the plane mask.
     pub fn buffer_store(&mut self, b: u32, x: i64, y: i64, word: u32) {
-        let rows = self.dest_mem().colour[(b & 1) as usize];
+        if self.gpu_blit_buffers(1 << (b & 1), x, y, word, None, u32::MAX, 0) {
+            return;
+        }
+        let rows = self.planes_in(x, y, x, y).colour[(b & 1) as usize];
         if rows.v.kind == Kind::Byte {
             let mask = (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8;
             if let Some(old) = rows.load1(x as i32, y as i32) {
@@ -155,7 +189,9 @@ impl Board {
     pub fn id_compare_passes(&self, x: i64, y: i64) -> bool {
         let c = self.win.id_compare;
         let mask = (c >> ODSY_ID_COMPARE_MASK_SHIFT) as u8;
-        c & ODSY_ID_COMPARE_ENABLE == 0 || self.dest_mem().did.load1(x as i32, y as i32).is_some_and(|id| (id ^ c as u8) & mask == 0)
+        // The id bytes are the X server's, written by the front end alone,
+        // never by the raster unit: no wait before reading them.
+        c & ODSY_ID_COMPARE_ENABLE == 0 || DestMem::of(self.vram_ptr(), &self.dest_views()).did.load1(x as i32, y as i32).is_some_and(|id| (id ^ c as u8) & mask == 0)
     }
 
     /// The one pixel test every write but a copy destination passes: the plane
@@ -227,12 +263,102 @@ impl Board {
         if !self.pixel_allowed(x, y) {
             return;
         }
+        if self.gpu_paint(buffers, x, y, pixel) {
+            return;
+        }
         for b in 0..ODSY_BUFFERS {
             if buffers & (1u32 << b) != 0 {
                 self.buffer_store(b, x, y, pixel);
             }
         }
     }
+
+    /// `paint_pixel`'s stores on the GPU unit, in order behind the drawing
+    /// and with no wait: the pixel joins a blit record. False without the
+    /// unit, or for planes its kernels cannot address.
+    fn gpu_paint(&mut self, buffers: u32, x: i64, y: i64, pixel: u32) -> bool {
+        self.gpu_blit_buffers(buffers, x, y, pixel, None, u32::MAX, 0)
+    }
+
+    /// A store into each colour buffer of `buffers` on the GPU unit, with
+    /// `op` combining the pixel with the old word first and its result
+    /// and-ed and or-ed (Board::paint_integer, paint_aux); a byte field is
+    /// stored under the plane mask (Board::buffer_store). False without
+    /// the unit, or for planes its kernels cannot address.
+    fn gpu_blit_buffers(&mut self, buffers: u32, x: i64, y: i64, pixel: u32, op: Option<u8>, and: u32, or: u32) -> bool {
+        if !self.gpu_unit() {
+            return false;
+        }
+        let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
+        let Some(slot) = self.gpu_dest_slot(&planes) else {
+            return false;
+        };
+        let plane_mask = (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8;
+        self.raster.run_now(|ctx| {
+            let g = ctx.gpu.as_mut().expect("the unit");
+            for b in 0..ODSY_BUFFERS {
+                if buffers & (1u32 << b) == 0 {
+                    continue;
+                }
+                let mask = if planes.colour[b as usize].v.kind == Kind::Byte { plane_mask as u32 } else { u32::MAX };
+                let key = super::gpu_unit::BlitKey { mask, op: op.map_or(0, |o| 0x100 | o as u32), and, or, ..super::gpu_unit::BlitKey::store(b, mask) };
+                g.blit_pixel(&slot, &key, x as i32, y as i32, pixel);
+                mirror_byte_store(&planes.colour[b as usize], x, y, pixel, &key);
+            }
+        });
+        true
+    }
+
+    /// A store into one view of the destination (`backend.wgsl` V_*) on the
+    /// GPU unit, the bits of `mask`. False without the unit.
+    pub fn gpu_blit_view(&mut self, view: u32, x: i64, y: i64, word: u32, mask: u32) -> bool {
+        if !self.gpu_unit() {
+            return false;
+        }
+        let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
+        let Some(slot) = self.gpu_dest_slot(&planes) else {
+            return false;
+        };
+        let key = super::gpu_unit::BlitKey::store(view, mask);
+        self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").blit_pixel(&slot, &key, x as i32, y as i32, word));
+        let rows = [planes.colour[0], planes.colour[1], planes.depth, planes.stencil, planes.did, planes.overlay];
+        if let Some(r) = rows.get(view as usize) {
+            mirror_byte_store(r, x, y, word, &key);
+        }
+        true
+    }
+
+    /// The slot of the destination and window for the front end's own
+    /// stores, when the kernels can address the planes.
+    pub fn gpu_dest_slot(&self, planes: &DestMem) -> Option<super::gpu_unit::Slot> {
+        let words = super::pipe::state::RasterWords { clip_rect: self.win.clip_rect, clip_kept: self.win.clip_kept, id_compare: self.win.id_compare, ..Default::default() };
+        super::gpu_unit::Slot::clear(planes, &words).ok()
+    }
+}
+
+/// The window-id buffer's bytes (a byte field: the id and overlay bytes)
+/// are read by the front end itself, with no wait for the raster unit
+/// (`Board::id_compare_passes`, `drawable_codec`, `main_id`). On the GPU unit
+/// the unit stores them, so the front end makes each such store in the
+/// mirror too, as the blit kernel makes it (vpro.wgsl `blit`), through an
+/// untracked pointer: the mirror's id bytes stay current, nothing is
+/// uploaded twice, and a later readback of the block brings back the same
+/// bytes. Other fields are left to the unit and its readbacks.
+fn mirror_byte_store(rows: &super::view::Rows, x: i64, y: i64, word: u32, key: &super::gpu_unit::BlitKey) {
+    if rows.v.kind != Kind::Byte || key.window {
+        return;
+    }
+    let rows = super::view::Rows::new(rows.mem().untracked(), rows.v);
+    let (x, y) = (x as i32, y as i32);
+    let Some(old) = rows.load1(x, y) else { return };
+    let old = old as u32;
+    let new = if key.op == 0 && key.mask == u32::MAX {
+        word
+    } else {
+        let val = if key.op != 0 { (logic_op((key.op & 0xf) as u8, word, old) & key.and) | key.or } else { word };
+        (old & !key.mask) | (val & key.mask)
+    };
+    rows.store1(x, y, new as u8);
 }
 
 /// The plane word a fill stores: the packed RGB pixel of an RGB fill, or the
@@ -252,6 +378,9 @@ impl Board {
             return;
         }
         let buffers = self.draw_buffers();
+        if self.gpu_blit_buffers(buffers, x, y, index, (op as u32 != LOGIC_COPY).then_some(op), 0xff, 0) {
+            return;
+        }
         for b in 0..ODSY_BUFFERS {
             if buffers & (1u32 << b) != 0 {
                 let byte = if op as u32 == LOGIC_COPY { index } else { logic_op(op, index, self.buffer_load(b, x, y)) };
@@ -288,6 +417,9 @@ impl Board {
             return;
         }
         if !self.pixel_allowed(x, y) {
+            return;
+        }
+        if self.gpu_blit_buffers(buffers, x, y, src, Some(op), if is_index { ODSY_INDEX_MASK } else { u32::MAX }, if is_index { 0 } else { 0xff }) {
             return;
         }
         for b in 0..ODSY_BUFFERS {
@@ -329,6 +461,8 @@ impl Board {
     pub fn clear_planes(&mut self, x: u32, y: u32, w: u32, h: u32, value: u8, mask: u8) {
         let buffers = self.draw_buffers();
         let id_test = self.id_compare_active();
+        let gpu = self.gpu_unit();
+        let planes = if gpu { DestMem::of(self.vram_ptr(), &self.dest_views()) } else { self.planes_in(x as i64, y as i64, x as i64 + w as i64 - 1, y as i64 + h as i64 - 1) };
         for row in 0..h {
             let py = y as i64 + row as i64;
             let runs = self.row_runs(py);
@@ -338,9 +472,20 @@ impl Board {
 
                 for px in a..e {
                     if !id_test || self.id_compare_passes(px, py) {
+                        if gpu {
+                            for b in 0..ODSY_BUFFERS {
+                                if buffers & (1u32 << b) != 0 && !self.gpu_blit_view(b, px, py, value as u32, mask as u32) {
+                                    let rows = self.planes_in(px, py, px, py).colour[b as usize];
+                                    if let Some(old) = rows.load1(px as i32, py as i32) {
+                                        rows.store1(px as i32, py as i32, (old & !mask) | (value & mask));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         for b in 0..ODSY_BUFFERS {
                             if buffers & (1u32 << b) != 0 {
-                                let rows = self.dest_mem().colour[b as usize];
+                                let rows = planes.colour[b as usize];
                                 if let Some(old) = rows.load1(px as i32, py as i32) {
                                     rows.store1(px as i32, py as i32, (old & !mask) | (value & mask));
                                 }
@@ -488,14 +633,33 @@ impl Board {
         }
         let word = if is_index || preserve_alpha { rgba } else { (rgba & !0xffu32) | 0xff };
         if self.dest_views().scratch {
-            let rows = self.dest_mem().colour[0];
-            rows.store_word(self.image.cur_x as i32, self.image.cur_y as i32, word);
+            // A texture or scratch image: memory no drawing touches. On the
+            // GPU unit it goes into the mirror untracked and up as a
+            // rectangle when the image is done (GpuRaster::note_region),
+            // with no wait.
+            let (x, y) = (self.image.cur_x as i32, self.image.cur_y as i32);
+            if self.gpu_unit() {
+                let rows = DestMem::of(self.vram_ptr().untracked(), &self.dest_views()).colour[0];
+                rows.store_word(x, y, word);
+                self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").note_region(&rows.v, x, y));
+            } else {
+                let rows = self.dest_mem().colour[0];
+                rows.store_word(x, y, word);
+            }
         } else if let Some(f) = self.image.fragment.as_deref().filter(|_| !is_index) {
             let word = self.image_transfer(word, is_index);
             let (x, y) = (self.image.cur_x as i64 + self.win.origin[0] as i64, self.image.cur_y as i64 + self.win.origin[1] as i64);
             if self.pixel_allowed(x, y) {
                 let src = [word >> 24, word >> 16, word >> 8, word].map(|c| widen8(c & 0xff));
-                f.0.fragment_q(&self.dest_mem(), x as i32, y as i32, f.1, src);
+                let zq = f.1;
+                match self.image.gpu_slot {
+                    // The unit tests and stores it in order, as a fragment.
+                    Some(slot) => {
+                        let q = super::pipe::ring::BackQuad { x: x as i32, y: y as i32, cov: 1, zq: [zq, 0, 0, 0], rgba: [src.map(|c| c as u16), [0; 4], [0; 4], [0; 4]], ..Default::default() };
+                        self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").push_frag(&q, &slot));
+                    }
+                    None => f.0.fragment_q(&self.dest_mem(), x as i32, y as i32, zq, src),
+                }
             }
         } else {
             let word = self.image_transfer(word, is_index);
@@ -531,9 +695,17 @@ impl Board {
         let z01 = (z / (2.0 * super::consts::gl_cmd::DEPTH_S)).clamp(0.0, 1.0);
         let [n, f] = self.assembly.xf.depth_range.map(f64::from);
         let zq = word_for_fraction((n + (f - n) * z01).clamp(0.0, 1.0));
-        let backend = BackendState::of(&self.fragment_words().backend, true, true);
+        let words = self.fragment_words();
+        let backend = BackendState::of(&words.backend, true, true);
+        // On the GPU unit the image's pixels go through its back end as
+        // fragments under this slot.
+        self.image.gpu_slot = None;
+        if self.gpu_unit() {
+            let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
+            self.image.gpu_slot = super::gpu_unit::Slot::new(&words.backend, &planes, false, false, &words.raster, None, None).ok();
+        }
         if self.trace.on(super::trace::TRACE_FIFO) {
-            let depth_kind = self.dest_mem().depth.v.kind;
+            let depth_kind = self.dest_views().depth.kind;
             self.trace_note(format_args!(
                 "image depth {z01} -> word {zq:#x}: depth test {} write {} func {:?}, targets {:?}, depth plane {:?}",
                 backend.depth_test, backend.depth_write, backend.depth_func, backend.targets, depth_kind

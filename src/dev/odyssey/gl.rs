@@ -285,7 +285,8 @@ impl GlDrawJob {
         // SAFETY: the job holds its slot until it is given back.
         let st: &'static DrawState = unsafe { &*job.slot };
         let tex = Unit { regs: &st.tex, latch: &st.latch, mem: job.pixels.obj };
-        let mut p = PipeDraw::new(&job.words, tex, job.pixels.state.mem, job.index, job.pixels.state.to_aux, xf.depth_range(), job.depth.slack, ctx.ring.as_ref());
+        let (ring, gpu) = (ctx.ring.as_ref(), ctx.gpu.as_deref_mut());
+        let mut p = PipeDraw::new(&job.words, tex, job.pixels.state.mem, job.index, job.pixels.state.to_aux, xf.depth_range(), job.depth.slack, ring, fr.words_stipple.as_ref(), job.background, gpu);
         if p.ring.is_none() {
             ctx.drain_back();
         }
@@ -606,6 +607,27 @@ impl Board {
                     continue;
                 };
                 let st = &pixels.state;
+                if let Some(g) = ctx.gpu.as_deref_mut() {
+                    // The unit clears its part of each rectangle.
+                    let words = super::pipe::state::RasterWords { clip_rect: st.clip_rect, clip_kept: st.clip_kept, id_compare: st.id_compare, ..Default::default() };
+                    match super::gpu_unit::Slot::clear(&clear.planes, &words) {
+                        Ok(slot) => {
+                            for r in &st.clip_rect[..st.clip_kept as usize] {
+                                let (x0, y0, x1, y1) = (op.x0.max(r.x0), op.y0.max(r.y0), op.x1.min(r.x1), op.y1.min(r.y1));
+                                if x0 <= x1 && y0 <= y1 {
+                                    g.push_rect(x0, y0, x1, y1, &clear, &slot);
+                                }
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: gpu unit: {} cleared on the CPU", e.0);
+                            if let Err(e) = g.read_back() {
+                                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
+                            }
+                        }
+                    }
+                }
                 let Some(ring) = &ring else {
                     for y in op.y0..=op.y1 {
                         for r in &st.clip_rect[..st.clip_kept as usize] {

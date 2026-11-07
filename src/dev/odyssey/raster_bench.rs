@@ -554,13 +554,13 @@ impl Bench {
             d.polygon_smooth = self.polygon_smooth;
             self.board.lib_draw(&mut d);
         }
-        self.board.raster_wait();
+        self.board.gpu_sync();
     }
 
     /// Draw d on the board as the library would (Board::lib_draw()).
     pub fn draw(&mut self, d: &mut LibDraw) {
         self.board.lib_draw(d);
-        self.board.raster_wait();
+        self.board.gpu_sync();
     }
 
     /// The depth plane's words in the square from (0, 0) to side - 1, row

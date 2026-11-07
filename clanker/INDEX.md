@@ -254,6 +254,7 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 
 | Note | Kind | Title |
 |---|---|---|
+| [gaps-found-by-the-2026-11-07-sweeps.md](odyssey/gaps-found-by-the-2026-11-07-sweeps.md) | open | Model gaps the full test sweep found on both raster units: CI8 reads return 0, X screen reads over some windows are noise, 10:10:10:2 pbuffers and 12-bit z16 visuals, double-buffered gltest shows only the clear |
 | [bringup.md](odyssey/bringup.md) | howto | VPro on the Octane: board catalogue, Crossbow code 5, PROM/IRIX minimums, disk images |
 | [gotchas.md](odyssey/gotchas.md) | rule | VPro gotchas: IMPACT installs lack the driver, textport FIFO cost, the f64 depth path |
 | [monitor-reads-quiesce-the-board.md](odyssey/monitor-reads-quiesce-the-board.md) | design | `vpro` state commands quiesce the board through `BoardLocks::quiesce` (format under the guard, write after); pixel, screen and memory dumps read board memory lock-free as the display does |
@@ -409,6 +410,20 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | [networking.md](irix/networking.md) | howto | IRIX 6.5 Networking Configuration |
 | [octane-halt-request-outlives-a-quit.md](irix/octane-halt-request-outlives-a-quit.md) | rule | Octane: quitting during the PROM's halt leaves the next boot at "Okay to power off" |
 
+## wgpu/
+
+The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels may assume of a GPU, and how they are held to the CPU models.
+
+| Note | Kind | Title |
+|---|---|---|
+| [gpu-floats-are-not-the-hosts.md](wgpu/gpu-floats-are-not-the-hosts.md) | rule | GPU float division is not correctly rounded and products get fused: `div_exact` and the multiply-by-one guard before comparing with the CPU model (measured on RADV) |
+| [vram-accesses-are-atomic.md](wgpu/vram-accesses-are-atomic.md) | design | Board memory on the GPU is accessed with atomics, because two pixels can share a word |
+| [the-mirror-and-its-dirty-maps.md](wgpu/the-mirror-and-its-dirty-maps.md) | design | The GPU unit's board memory has a CPU mirror; dirty maps both ways keep them in step, and the front end must wait before it touches memory |
+| [read-storage-in-place.md](wgpu/read-storage-in-place.md) | rule | Read records, slots and tables from their buffers in place: a 4.8 KB struct copied by value gave silently wrong texels on RADV once the kernel grew |
+| [swaps-wait-on-stream-positions-not-fences.md](wgpu/swaps-wait-on-stream-positions-not-fences.md) | design | A swap latches once the GPU unit has submitted the stores before its arm (stream positions, no CPU wait); polled idle words could follow the same scheme (open, minor) |
+| [window-id-bytes-are-written-through-to-the-mirror.md](wgpu/window-id-bytes-are-written-through-to-the-mirror.md) | rule | The front end reads window-id bytes without a wait, so the GPU unit's id and overlay byte stores are made in the mirror too; found with replays that compare both raster units |
+
+
 ## build/
 
 Toolchain, dependency upgrades, platform build issues.
@@ -425,6 +440,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 
 | Note | Kind | Title |
 |---|---|---|
+| [wgpu-ui.md](plans/wgpu-ui.md) | plan | The iris window on wgpu: a presenter in `src/wgpu`, the board's device shared, VPro frames presented with no readback, then Newport's compositor in WGSL |
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
 | [iris-daynaport-target.md](plans/iris-daynaport-target.md) | plan | Task: add a DaynaPort SCSI/Link target to the IRIS emulator |
@@ -433,6 +449,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [net-stack.md](plans/net-stack.md) | plan | The NAT network stack: analysis and redesign plan |
 | [odyssey-architecture-review.md](plans/odyssey-architecture-review.md) | plan | The VPro (Odyssey) model after the merge: data path, threads, debug tooling vs the other boards, T&L overlap, float vs fixed, texture specialisations, JIT feasibility, quad scanline raster |
 | [odyssey-quad-pipeline.md](plans/odyssey-quad-pipeline.md) | plan | Plan: a three-stage quad pipeline for the VPro rasteriser (rasteriser, shader, back end on threads; quake1 timedemo as the workload) |
+| [wgpu-raster.md](plans/wgpu-raster.md) | plan | Plan: the boards' raster units on the host GPU through wgpu compute (board memory on the GPU, tile-binned batches; common layer landed, VPro first, IMPACT second, GR2 open) |
 | [odyssey-board-memory.md](plans/odyssey-board-memory.md) | plan | VPro board memory as the hardware has it: one tiled SDRAM pool addressed by base/pitch/format, replacing the fixed planes and the invented object store; measure the tile layout on a real V10 first |
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
 | [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |

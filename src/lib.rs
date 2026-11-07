@@ -1,5 +1,5 @@
 #![allow(dead_code, unused_variables, unused_imports)]
-#![cfg_attr(feature = "rex-gpu", recursion_limit = "256")]
+#![cfg_attr(any(feature = "rex-gpu", feature = "wgpu"), recursion_limit = "256")]
 
 #[cfg(all(feature = "lightning", feature = "developer"))]
 compile_error!(
@@ -204,6 +204,8 @@ pub mod ui;
 pub mod cpu;
 pub mod dev;
 pub mod gfifo;
+#[cfg(feature = "wgpu")]
+pub mod wgpu;
 pub mod trace_writer;
 pub mod gfx_display;
 pub mod hostinput;

@@ -169,9 +169,11 @@ impl Board {
                 break 'slice;
             }
         }
-        if fifo.pending() {
+        let behind = fifo.pending();
+        if behind {
             crate::dlog_dev!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.stores());
         }
+        self.gpu_upload_tick(!behind);
     }
 
     /// Finish the waiting work now, for an access at addr that must see it,

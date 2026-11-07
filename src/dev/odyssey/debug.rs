@@ -83,6 +83,7 @@ pub(super) const HELP: &[&str] = &[
     "vpro hash                       the memory hash a replay checkpoint takes",
     "vpro unimp                      offsets and command words reported as not modelled",
     "vpro refusals [reset]           bus refusals by reason and register",
+    "vpro gpu [trace on|off]         the GPU raster unit's counters; trace counts readbacks by cause",
     "vpro trace <file> [fifo,draw,cpu,dma|all]   annotated trace (gputrace builds); alone: its state",
     "vpro trace flush|off            write the trace out / close it",
     "vpro rec [<file>|mark|off]      replayable recording: start, mark, stop; alone: its state",
@@ -164,6 +165,16 @@ fn write_png(path: &Path, width: usize, height: usize, data: &[u8], color: png::
 impl Odyssey {
     /// The frame the scan-out registers describe now, and board memory.
     fn screen(&self) -> Result<(Frame, VramPtr, DisplayRegs), String> {
+        // The GPU unit's mirror is current only after a readback: take one
+        // when the board can be quiesced, else read it as it is. The CPU
+        // unit's memory is the board's own, read lock-free as the display
+        // reads it.
+        #[cfg(feature = "wgpu")]
+        if self.state.shared.gpu_scanout.get().is_some() {
+            if let Some(g) = self.state.quiesce(QUIESCE) {
+                g.gpu_sync();
+            }
+        }
         let regs = self.state.shared.regs.read();
         let frame = Frame::snapshot(&regs, self.displayed()).ok_or_else(|| "vpro: the scan-out is not set up (PB&J 0x2800-0x2809)".to_string())?;
         let mem = self.state.shared.vram.get().ok_or_else(|| "vpro: board memory is not allocated".to_string())?;
@@ -175,9 +186,14 @@ impl Odyssey {
         self.state.front.lock().displayed_buffer
     }
 
-    /// A state command's view of the board, or the busy answer.
+    /// A state command's view of the board, or the busy answer. On the GPU
+    /// raster unit the mirror is brought current first, so commands that
+    /// read board memory read what the unit drew.
     fn quiesced(&self) -> Result<super::mmio::BoardGuard<'_>, String> {
-        self.state.quiesce(QUIESCE).ok_or_else(|| {
+        self.state.quiesce(QUIESCE).map(|g| {
+            g.gpu_sync();
+            g
+        }).ok_or_else(|| {
             format!(
                 "vpro: board busy for {} ms (FIFO {} words in {} stores, raster {} jobs); try again",
                 QUIESCE.as_millis(),
@@ -249,6 +265,12 @@ impl Odyssey {
                 format!("{}\n", memory_hash(&g))
             }
             ["unimp"] => self.unimp_text()?,
+            ["gpu"] => self.gpu_text().unwrap_or_else(|| "the raster unit is the CPU's (gpu off)\n".to_string()),
+            ["gpu", "trace", on @ ("on" | "off")] => {
+                let on = *on == "on";
+                self.gpu_run(|g| g.trace_waits(on)).ok_or("the raster unit is the CPU's (gpu off)")?;
+                format!("gpu readback tracing {}\n", if on { "on" } else { "off" })
+            }
             ["refusals"] => {
                 let mut v = Vec::new();
                 self.state.refusals.report(&mut v).map_err(|e| e.to_string())?;
@@ -264,6 +286,28 @@ impl Odyssey {
     }
 
     // ── state commands ───────────────────────────────────────────────────────
+
+    /// Run `f` on the GPU raster unit, if the board draws on one.
+    fn gpu_run<T>(&self, f: impl FnOnce(&mut super::gpu_unit::GpuRaster) -> T) -> Option<T> {
+        if self.state.raster.threaded() {
+            return None;
+        }
+        self.state.raster.run_now(|ctx| ctx.gpu.as_mut().map(|g| f(g)))
+    }
+
+    /// The GPU unit's counters (`GpuRaster::report`) and the GPU scan-out's
+    /// (frames composed, bytes read back: a frame the window presents from
+    /// the GPU is not read back), None on the CPU unit.
+    fn gpu_text(&self) -> Option<String> {
+        #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
+        let mut out = self.gpu_run(|g| g.report())?;
+        #[cfg(feature = "wgpu")]
+        if let Some(s) = self.state.shared.gpu_scanout.get() {
+            let (frames, bytes) = s.lock().counts();
+            out.push_str(&format!("  gpu scanout: {frames} frames composed, {} MiB read back\n", bytes >> 20));
+        }
+        Some(out)
+    }
 
     fn status_text(&self) -> Result<String, String> {
         let mut out = String::new();
@@ -299,6 +343,9 @@ impl Odyssey {
             raster.queued(),
             if raster.threaded() { "running" } else { "stopped" }
         );
+        if let Some(g) = self.gpu_text() {
+            out.push_str(&g);
+        }
         {
             let r = self.display.reader.lock();
             let _ = writeln!(out, "  display: frame {}x{}, {} retraces", r.frame_width, r.frame_height, r.clock.frames);
