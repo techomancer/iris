@@ -467,6 +467,13 @@ impl Hub {
         Arc::new(View { hub: self.clone(), space: Space::HubSpecial, local: Local::Always })
     }
 
+    /// The processor's view of the I/O space: this node's registers at the
+    /// reader's own alias (node field zero), whatever number the node holds,
+    /// and any other address claimed by the node number it carries.
+    pub fn cpu_io(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        Arc::new(View { hub: self.clone(), space: Space::Io, local: Local::IoAlias })
+    }
+
     /// This node's I/O space, addressed from the node's base: the crossbar
     /// widgets' small windows, the Hub's own registers at both offsets, and
     /// the seven big windows.
@@ -521,6 +528,10 @@ enum Local {
     Calias,
     /// Node-zero addresses are always this node's own.
     Always,
+    /// Node-zero addresses in the registers' own alias are this node's
+    /// whatever number the node holds: the alias is the one I/O region the
+    /// reader's Hub answers without asking which node holds zero.
+    IoAlias,
 }
 
 /// A node-qualified address space as a processor, an engine or a widget sees
@@ -534,12 +545,12 @@ impl View {
     fn run<R>(&self, a: u64, f: impl FnOnce(&dyn BusDevice, u64) -> R) -> Option<R> {
         let offset = a & (NODE_SPAN - 1);
         let number = ((a >> NODE_SHIFT) & NODE_MASK) as u8;
-        let stays = number == 0
-            && match self.local {
-                Local::Never => false,
-                Local::Calias => a < self.hub.calias.load(Ordering::Acquire),
-                Local::Always => true,
-            };
+        let stays = match self.local {
+            Local::Never => false,
+            Local::Calias => number == 0 && a < self.hub.calias.load(Ordering::Acquire),
+            Local::Always => number == 0,
+            Local::IoAlias => number == 0 && (IO_REGISTERS_LOCAL..IO_REGISTERS_NAMED).contains(&offset),
+        };
         if stays {
             return self.hub.view.spaces[self.space as usize].get().map(|d| f(&**d, offset));
         }
