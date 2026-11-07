@@ -4736,7 +4736,18 @@ fn emit_mem_write_split(
             let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
                 ir::immediates::Offset32::new(0));
             let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
-            ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+            // Release, after the bytes: a compile snapshot that sees the new
+            // generation sees them too, as the Rust side's release bump
+            // (`tc_bump_gen`) gives. On x86_64 a plain store is that already
+            // (stores are not reordered with earlier stores), and Cranelift's
+            // `atomic_store` would add an `mfence` to every guest store; on
+            // a weakly ordered host it is `stlr`. The atomic add above is
+            // sequentially consistent already.
+            if cfg!(target_arch = "x86_64") {
+                ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+            } else {
+                ctx.builder.ins().atomic_store(mem, inc, gp);
+            }
         }
 
         // tc_invalidate_l2_code: writing the line makes L2's decoded

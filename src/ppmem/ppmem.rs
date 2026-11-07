@@ -297,7 +297,8 @@ impl PpMemory {
     #[inline]
     pub fn bump_gen_off(&self, off: usize) {
         let page = (off & self.mask()) / JITV2_PAGE_SIZE;
-        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Relaxed) };
+        // Release, after the bytes, as `bump_gen`.
+        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Release) };
     }
 
     /// The shared object behind this bank, for mapping it into a window.
@@ -342,9 +343,9 @@ impl PpMemory {
     #[inline(always)]
     fn bump_gen(&self, addr: u64) {
         let page = self.off(addr) / JITV2_PAGE_SIZE;
-        // Relaxed for the same reason `Memory::bump_gen` is: the publish-side
-        // re-check provides the ordering (jit-v2-design.md §6.5).
-        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Relaxed) };
+        // Release, after the bytes, for the same reason `Memory::bump_gen` is: a
+        // compile snapshot that sees the new generation must see them too.
+        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Release) };
     }
 
     /// JIT v2: raw pointer to the generation counter for `addr`'s page.
@@ -364,7 +365,7 @@ impl PpMemory {
     #[cfg(feature = "jitv2")]
     pub fn bump_gen_all(&self) {
         for i in 0..self.gen_count() {
-            unsafe { (*self.gen_base.add(i)).fetch_add(1, Ordering::Relaxed) };
+            unsafe { (*self.gen_base.add(i)).fetch_add(1, Ordering::Release) };
         }
     }
 
@@ -546,8 +547,9 @@ impl BusDevice for PpMemory {
             let start = self.off(addr) / JITV2_PAGE_SIZE;
             let last = addr.wrapping_add((buf.len().max(1) - 1) as u64 * 8);
             let end = self.off(last) / JITV2_PAGE_SIZE;
+            // Release, after the bytes (`bump_gen`).
             let bump = |page: usize| unsafe {
-                (*self.gen_base.add(page)).fetch_add(1, Ordering::Relaxed);
+                (*self.gen_base.add(page)).fetch_add(1, Ordering::Release);
             };
             if end >= start {
                 for page in start..=end {

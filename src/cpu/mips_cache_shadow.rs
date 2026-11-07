@@ -241,7 +241,8 @@ impl<
         {
             let g = unsafe { *self.tc_gen.get() };
             if !g.is_null() {
-                unsafe { (*g.add((_phys >> 12) as usize)).fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
+                // Release, after the bytes (`PpMemory::bump_gen`).
+                unsafe { (*g.add((_phys >> 12) as usize)).fetch_add(1, std::sync::atomic::Ordering::Release) };
             }
         }
     }

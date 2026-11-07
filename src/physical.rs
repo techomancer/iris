@@ -666,7 +666,8 @@ impl Physical {
         let last = ((addr + (qwords.max(1) - 1) as u64 * 8) >> 12) as usize;
         for page in first..=last.max(first) {
             unsafe {
-                (*(self.ppmem_gen_base.add(page))).fetch_add(1, Ordering::Relaxed);
+                // Release, after the bytes (`PpMemory::bump_gen`).
+                (*(self.ppmem_gen_base.add(page))).fetch_add(1, Ordering::Release);
             }
         }
     }
