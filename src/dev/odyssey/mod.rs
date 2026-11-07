@@ -83,6 +83,7 @@ mod interface;
 mod clip;
 mod logic;
 mod mmio;
+mod pi_gfx;
 mod pixel_dma;
 mod pipe;
 mod pixel_write;
@@ -115,6 +116,7 @@ use crate::traits::{
     BUS_OK,
 };
 
+pub use pi_gfx::{PiGfx, PI_GFX_REGS};
 use board::Board;
 use consts::ODSY_APERTURE;
 use display::Display;
