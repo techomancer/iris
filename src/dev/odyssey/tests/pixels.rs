@@ -1268,3 +1268,158 @@ fn a_window_move_copies_every_byte_of_both_halves() {
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(dst + k, 1) as u8).collect();
     assert_eq!(got, (0..16).map(|k| 0x40 + k as u8).collect::<Vec<_>>());
 }
+
+/// A board with the pixel mode the X server selects for a colour-index
+/// window (front field the 2 bytes at byte 6) and four distinct 16-byte
+/// pixels at the left of a screen. Returns the screen and the 16 bytes at
+/// x = 256, which the copies below overwrite.
+fn index_window_board() -> (Box<Board>, Surface, Vec<u8>) {
+    let (mut s, _, _) = board_with_ram();
+    s.raster_wait();
+    let screen = Surface::new(0x2000, 0x50, 4);
+    s.pixel_mode = [0x2000, 0x50, 0x2008_6a00, 0];
+    for x in 0..4u32 {
+        let p = screen.offset(x, 0);
+        for k in 0..16 {
+            s.vram.ptr().store(p + k, 1, 0x10 * x as u64 + k);
+        }
+    }
+    let before = (0..16).map(|k| s.vram.ptr_shared().load(screen.offset(256, 0) + k, 1) as u8).collect();
+    (s, screen, before)
+}
+
+fn assert_indices_moved(s: &Board, screen: &Surface, before: &[u8]) {
+    for x in 0..4u32 {
+        let d = screen.offset(256 + x, 0);
+        let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+        let mut want = before.to_vec();
+        want[6] = (0x10 * x + 6) as u8;
+        want[7] = (0x10 * x + 7) as u8;
+        assert_eq!(got, want, "pixel {x}: the index moves, nothing else");
+    }
+}
+
+/// The X server fills a colour-index root window by uploading a seed block
+/// and copying it across the screen onto itself (operand words from a trace
+/// of IRIX 6.5.30's desktop). Each 2-byte index lands unchanged: read as a
+/// luminance texel it became its top byte twice, a black background.
+#[test]
+fn a_root_tile_copy_moves_colour_indices_unchanged() {
+    let (mut s, screen, before) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
+    s.raster_wait();
+    assert_indices_moved(&s, &screen, &before);
+}
+
+/// Scale and bias act on the copy's colours. Whether the board applies them
+/// to an index is unknown (INFERRED: it does not for a copy from the same
+/// read), so with one in force the copy converts as it always did.
+#[test]
+fn an_index_copy_under_scale_and_bias_still_converts() {
+    let (mut s, screen, before) = index_window_board();
+    for c in 0..4 {
+        s.tex_mut().scale_bias[c * 2] = 0x2000;
+        s.tex_mut().scale_bias[c * 2 + 1] = 0x0001;
+    }
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
+    s.raster_wait();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+    assert_eq!(got[..6], before[..6], "the other bytes stay");
+}
+
+/// Only the read that names one component in a 2-byte field is an index
+/// (class 0, code 1: format byte 0x08). Another packing (here four 4-bit
+/// components, format byte 0x00) into the same index field converts.
+#[test]
+fn a_four_component_copy_into_an_index_field_still_converts() {
+    let (mut s, screen, _) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1000, 0x2000, 256, 0x3233_0041]);
+    s.raster_wait();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+}
+
+/// The seed upload holds 8-bit indices, 0x00nn; the copy moves the field
+/// whole, so an index above 0xff (0x012a) keeps its high byte too. That is
+/// what the model does; INFERRED, no measurement of a real board.
+#[test]
+fn a_copied_index_keeps_both_bytes_of_the_field() {
+    let (mut s, screen, _) = index_window_board();
+    let p = screen.offset(0, 0);
+    s.vram.ptr().store(p + 6, 1, 0x01);
+    s.vram.ptr().store(p + 7, 1, 0x2a);
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 1, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
+    s.raster_wait();
+    let d = screen.offset(256, 0);
+    assert_eq!(s.vram.ptr_shared().load(d + 6, 1), 0x01);
+    assert_eq!(s.vram.ptr_shared().load(d + 7, 1), 0x2a);
+}
+
+/// The move needs the source to hold the index in the field's width. A
+/// 4-byte source (word 4 bits 15:13 = 1) into the 2-byte index field still
+/// converts: the word's low 16 bits land (bytes 2, 3 of the source field).
+#[test]
+fn a_copy_from_a_wider_source_into_an_index_field_still_converts() {
+    let (mut s, screen, before) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8303_2008, 0x2000, 256, 0x3233_0041]);
+    s.raster_wait();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_eq!(got[6..8], [0x02, 0x03], "converted to the word's low 16 bits");
+}
+
+/// A copy that is a textured rectangle (word 7 bit 27; a zoom sets it too)
+/// is not the short copy path, so it converts.
+#[test]
+fn a_transform_copy_into_an_index_field_still_converts() {
+    let (mut s, screen, _) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3a33_0041]);
+    s.raster_wait();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+}
+
+/// Word 7's write format is bits 4:0; only COLOR_INDEX (1) moves the field.
+/// 0x4b is format 0xb (RGBA), type 2: the same size and mode, so only the
+/// write format keeps it converting.
+#[test]
+fn a_copy_that_writes_rgba_into_an_index_field_still_converts() {
+    let (mut s, screen, _) = index_window_board();
+    copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_004b]);
+    s.raster_wait();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+}
+
+fn scale_bias_block(s: &mut Board, ops: [u32; 8]) {
+    cmd(s, consts::cmd::REGISTER_TAG | consts::reg::TEX_SCALE_BIAS);
+    for w in ops {
+        cmd(s, w);
+    }
+}
+
+/// The scale and bias come from block 0x203b, run before the copy; the copy
+/// words do not carry them. A non-identity pair set by that block keeps an
+/// index copy converting; the identity pair (0x1000, 0) moves the field.
+#[test]
+fn a_scale_and_bias_block_before_an_index_copy_decides_the_path() {
+    let words = [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041];
+    let (mut s, screen, before) = index_window_board();
+    scale_bias_block(&mut s, [0x1000, 0, 0x1000, 0, 0x1000, 0, 0x1000, 0]);
+    copy_block(&mut s, words);
+    s.raster_wait();
+    assert_indices_moved(&s, &screen, &before);
+
+    let (mut s, screen, _) = index_window_board();
+    scale_bias_block(&mut s, [0x2000, 1, 0x2000, 1, 0x2000, 1, 0x2000, 1]);
+    copy_block(&mut s, words);
+    s.raster_wait();
+    let d = screen.offset(256, 0);
+    let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
+    assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
+}

@@ -71,3 +71,12 @@ vertices carry the back colour in `vtx::BACK_COLOR` with
   steps below the board, ABGR with BYTE, byte-swapped INT and 5:5:5:1
   draws, glCopyPixels with zoom (1, -1). The depth of glDrawPixels is
   resolved (`drawpixels-depth-rides-in-the-image-box.md`).
+  A DMA read of colour-index data from memory that is not the pixel-mode
+  surface: `dma_fields` still decodes class 0, code 1 (format byte 0x08) as
+  one-byte luminance there, so an X GetImage or a read of an index pixmap
+  held on the board under another address would keep only the top byte.
+  The copy path moves such an index unchanged (`copy_block`), only for the
+  short copy path (word 7 bit 27 clear) writing COLOR_INDEX (word 7 bits
+  4:0 = 1) at the read's field size, with identity scale and bias; no trace
+  shows a DMA read of this kind yet. Unknown: what a non-identity scale or
+  bias (block 0x203b) does to an index copy, so that case converts.

@@ -50,7 +50,7 @@ use super::pipe::backend::DestMem;
 use super::bits::sextract32;
 use super::board::Board;
 use super::consts::{tex, ODSY_DID_MAIN_SHIFT, ODSY_PLANE_MASK_SHIFT};
-use super::field::{Codec, Field, Layout, FIELD_FOUR, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
+use super::field::{Codec, Field, Layout, FIELD_FOUR, FIELD_INDEX, FIELD_ONE, FIELD_PACKED, FIELD_TWO};
 use super::view::{Rows, View, MAX_DIM};
 use super::vram::{Format, Surface, ADDR_MASK, DRAWABLE, PITCH_MASK};
 
@@ -77,6 +77,12 @@ pub(super) struct CopyOperands {
     pub w: [u32; 8],
 }
 
+/// Word 7 bits 4:0, the format the copy writes (the Odyssey RE notes).
+const WRITE_FORMAT_MASK: u32 = 0x1f;
+const WRITE_FORMAT_COLOR_INDEX: u32 = 1;
+/// Word 7 bit 27.
+const COPY_TRANSFORM: u32 = 1 << 27;
+
 impl CopyOperands {
     pub fn decode(op: &[u32]) -> CopyOperands {
         let mut w = [0; 8];
@@ -102,6 +108,24 @@ impl CopyOperands {
             bytes: 2 << ((w[4] >> 13) & 7),
             format: w[4] & 0xff,
         }
+    }
+
+    /// Word 7's write format, bits 4:0 (the Odyssey RE notes; not checked
+    /// against a board). Its type, bits 8:5, runs into bit 8: do not mask a
+    /// byte.
+    pub fn write_format(&self) -> u32 {
+        self.w[7] & WRITE_FORMAT_MASK
+    }
+
+    /// Word 7 bit 27: the copy is a textured rectangle (a zoom sets it too)
+    /// and not the short copy path.
+    pub fn transform(&self) -> bool {
+        self.w[7] & COPY_TRANSFORM != 0
+    }
+
+    /// The read and write field sizes, bits 15:13 of words 4 and 7.
+    pub fn same_width(&self) -> bool {
+        (self.w[4] >> 13) & 7 == (self.w[7] >> 13) & 7
     }
 
     pub fn dst(&self) -> Side {
@@ -230,8 +254,37 @@ impl Board {
         });
         let sb = &self.tex_regs().scale_bias;
         let filter = (0..4).any(|c| sb[c * 2] != tex::SCALE_BIAS_ONE || sb[c * 2 + 1] != 0);
+        // A colour index is not a colour. The X server tiles a colour-index
+        // root window by copying a seed block across the screen with read
+        // byte 0x08 (traced), the read that names one component in a 2-byte
+        // field; the same read serves luminance and alpha, so the index
+        // meaning comes from the write side. Unpacked as a luminance texel
+        // the 8-bit index, held as 0x00nn, came out as its top byte, 0,
+        // twice: a black background. The field moves as it is when all hold
+        // (the Odyssey RE notes, not checked against a board):
+        //  - the short copy path: word 7 bit 27 clear; a textured rectangle,
+        //    a zoom included, keeps converting;
+        //  - the copy writes COLOR_INDEX (word 7 bits 4:0);
+        //  - read and write fields are the same size (bits 15:13 of words 4
+        //    and 7), here the 2-byte one;
+        //  - the read is the one-component 2-byte one above;
+        //  - the scale and bias (block 0x203b, separate state, not in these
+        //    words) are the identity.
+        // Known limitation: what a non-identity scale or bias does to an
+        // index copy is unknown, so that case converts as before.
+        // The seed's own DMA upload names the same format word and already
+        // lands as an index, because `dma_fields` takes the pixel-mode
+        // surface's layout over the format byte; the copy is the one place
+        // that read the byte differently.
+        let one_component = Codec::Texel { bytes: 2, field: FIELD_ONE };
+        let index = !filter
+            && !c.transform()
+            && c.write_format() == WRITE_FORMAT_COLOR_INDEX
+            && c.same_width()
+            && src_codec(src.at) == one_component
+            && matches!(dst_codec, Codec::Texel { field: FIELD_INDEX, bytes: 2 });
         // Bytes move as they are when both sides hold a word the same way.
-        let raw = src_codec(src.at) == dst_codec && !filter;
+        let raw = index || (src_codec(src.at) == dst_codec && !filter);
 
         // The whole source first, so an overlapping copy reads what was there.
         if gpu {
@@ -271,7 +324,7 @@ impl Board {
                 }
             }
         }
-        if filter {
+        if filter && !raw {
             self.copy_post_filter(&mut words, !src.drawable);
         }
         for y in 0..h {
