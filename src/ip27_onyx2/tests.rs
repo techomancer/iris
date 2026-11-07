@@ -146,35 +146,32 @@ fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
 /// A PCI function with nothing behind it but the DMA and interrupt line the
 /// Bridge hands it.
 struct Card {
-    cfg: crate::pci::PciConfig,
-    irq: parking_lot::Mutex<Option<crate::irq::IrqLine>>,
-    dma: parking_lot::Mutex<Option<Arc<dyn crate::pci::PciDma>>>,
+    state: crate::pci::PciFunctionState,
 }
 
 impl Card {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            cfg: crate::pci::PciConfig::new(0x1234, 0x5678, 0x01_0000, 1, [crate::pci::Bar::Unused; 6], crate::pci::PCI_INTA),
-            irq: Default::default(),
-            dma: Default::default(),
+            state: crate::pci::PciFunctionState::new(crate::pci::PciConfig::new(
+                0x1234,
+                0x5678,
+                0x01_0000,
+                1,
+                [crate::pci::Bar::Unused; 6],
+                crate::pci::PCI_INTA,
+            )),
         })
     }
 }
 
-impl crate::pci::PciBusDevice for Card {
-    fn config(&self) -> &crate::pci::PciConfig {
-        &self.cfg
+impl crate::pci::PciFunction for Card {
+    fn state(&self) -> &crate::pci::PciFunctionState {
+        &self.state
     }
     fn bar_read(&self, _bar: usize, _off: u32, _width: usize) -> u32 {
         0
     }
     fn bar_write(&self, _bar: usize, _off: u32, _val: u32, _width: usize) {}
-    fn connect_interrupt(&self, line: crate::irq::IrqLine) {
-        *self.irq.lock() = Some(line);
-    }
-    fn connect_dma(&self, dma: Arc<dyn crate::pci::PciDma>) {
-        *self.dma.lock() = Some(dma);
-    }
 }
 
 /// The BaseIO-G's Bridge sends DMA and interrupts to the Hub at the widget
@@ -190,7 +187,7 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
         let card = Card::new();
         bridge.attach(7, card.clone());
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
-        let dma = card.dma.lock().clone().unwrap();
+        let dma = card.state.dma().unwrap().clone();
         let memory = |i: usize, off: u64| m.node_at(i).memory.physical().read32(off).data;
         let pending = |i: usize| m.node_at(i).hub.read64(crate::dev::hub_pi::reg::INT_PEND0).data;
 
@@ -207,10 +204,10 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
             set(reg::INT_DEST_LOWER, 0);
             set(reg::int_host(7), 5);
             set(reg::INT_ENABLE, 1 << 7);
-            card.irq.lock().as_ref().unwrap().set(true);
+            card.state.irq().unwrap().set(true);
             assert_eq!(pending(node) & 1 << 5, 1 << 5, "widget {widget}");
             assert_eq!(pending(other) & 1 << 5, 0, "widget {widget}: the other node heard it");
-            card.irq.lock().as_ref().unwrap().set(false);
+            card.state.irq().unwrap().set(false);
             // The guest's handler clears the pending bit.
             assert_eq!(m.node_at(node).hub.write64(crate::dev::hub_pi::reg::INT_PEND_MOD, 5), BUS_OK);
         }

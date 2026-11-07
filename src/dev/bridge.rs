@@ -54,7 +54,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::dev::w1;
 use crate::irq::{InterruptController, IrqLine};
-use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
+use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciFunction, PciDma, PciDmaStatus, PciLanes, Space};
 use crate::snapshot::{field, field_u32, field_u32s, field_u64, field_u64_vec, field_u8, field_u8s, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
 use crate::xtalk::Upstream;
@@ -386,7 +386,7 @@ pub struct Bridge {
     /// The host chips this Bridge's transfers and interrupt packets can go
     /// to, by the widget number the guest programs.
     up: Upstream,
-    slots: RwLock<[Option<Arc<dyn PciBusDevice>>; DEVICES]>,
+    slots: RwLock<[Option<Arc<dyn PciFunction>>; DEVICES]>,
     flash: RwLock<[Option<FlashPart>; 2]>,
     flash_strap: AtomicBool,
     /// The silicon revision in the identification word, bits 31:28.
@@ -548,15 +548,16 @@ impl Bridge {
 
     /// Put a function in `slot` (0..8), give it its way to memory and wire
     /// its interrupt pin (INTA..INTD per its header) to the Bridge's pins.
-    pub fn attach(self: &Arc<Self>, slot: u8, dev: Arc<dyn PciBusDevice>) {
+    pub fn attach(self: &Arc<Self>, slot: u8, dev: Arc<dyn PciFunction>) {
         let slot = slot as usize;
         assert!(slot < DEVICES, "Bridge has {DEVICES} slots");
-        dev.connect_dma(Arc::new(SlotDma { bridge: Arc::downgrade(self), slot }));
-        let pin = dev.config().interrupt_pin();
+        dev.state().connect_dma(Arc::new(SlotDma { bridge: Arc::downgrade(self), slot }));
+        let pin = dev.state().config().interrupt_pin();
         if (1..=4).contains(&pin) {
             let router = Arc::new(PciPin { bridge: Arc::downgrade(self) });
-            dev.connect_interrupt(IrqLine::new(router, (slot * 4 + pin as usize - 1) as u32));
+            dev.state().connect_irq(IrqLine::new(router, (slot * 4 + pin as usize - 1) as u32));
         }
+        dev.attached();
         self.slots.write()[slot] = Some(dev);
         self.publish_bars();
     }
@@ -580,7 +581,7 @@ impl Bridge {
             let st = self.st.lock();
             (0..DEVICES as u32).map(|s| st.r(reg::device(s))).collect()
         };
-        let funcs: Vec<(usize, Arc<dyn PciBusDevice>)> =
+        let funcs: Vec<(usize, Arc<dyn PciFunction>)> =
             self.slots.read().iter().enumerate().filter_map(|(i, d)| Some((i, d.clone()?))).collect();
         let mut runs: Vec<BarRun> = Vec::new();
         for (s, &d) in regs.iter().enumerate() {
@@ -704,7 +705,7 @@ impl Bridge {
     /// to reset.
     pub fn reset_pci(&self) {
         for d in self.slots.read().iter().flatten() {
-            d.config().reset();
+            d.state().config().reset();
         }
         self.publish_bars();
     }
@@ -983,7 +984,7 @@ impl Bridge {
 
     /// The function a type 0 configuration offset selects, and the corrected
     /// register byte offset within it.
-    fn cfg_target(&self, off: u32, size: usize) -> (usize, u32, Option<Arc<dyn PciBusDevice>>) {
+    fn cfg_target(&self, off: u32, size: usize) -> (usize, u32, Option<Arc<dyn PciFunction>>) {
         let slot = ((off >> 12) & 7) as usize;
         let func = (off >> 8) & 7;
         let reg = Self::lane_correct(off & 0xff, size);
@@ -1045,7 +1046,7 @@ impl Bridge {
             self.config_master_timeout(slot, reg);
             return true;
         };
-        let cfg = dev.config();
+        let cfg = dev.state().config();
         let i = (reg >> 2) as usize;
         let shift = 8 * (reg & 3);
         let mask = (u64::MAX >> (64 - 8 * size)) << shift;
@@ -1067,7 +1068,7 @@ impl Bridge {
         let n = host.len();
         let target = base.wrapping_add(if swap { woff } else { woff ^ (width - n) as u32 });
         let claimed = self.slots.read().iter().flatten().find_map(|d| {
-            let (bar, boff) = d.config().decode(space, target)?;
+            let (bar, boff) = d.state().config().decode(space, target)?;
             Some((d.clone(), bar, boff))
         });
         let Some((dev, bar, boff)) = claimed else {
@@ -1081,7 +1082,7 @@ impl Bridge {
 
     /// The cycle `pio_cycle` found a target for: `host` (CPU order) to or
     /// from BAR `bar` of `dev` at `boff`, lanes as `swap` says.
-    fn bar_cycle(dev: &dyn PciBusDevice, bar: usize, boff: u32, swap: bool, host: &mut [u8], write: bool) {
+    fn bar_cycle(dev: &dyn PciFunction, bar: usize, boff: u32, swap: bool, host: &mut [u8], write: bool) {
         let n = host.len();
         // PCI bytes in address order; a function sees little-endian values.
         let mut pci = [0u8; 8];
@@ -1492,7 +1493,7 @@ struct Lanes {
 }
 
 impl Lanes {
-    fn access(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize, val: Option<u64>) -> u64 {
+    fn access(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize, val: Option<u64>) -> u64 {
         let (width, swap) = (self.width, self.swap);
         Bridge::cycles(width, off, size, val, |o, host, write| {
             let boff = if swap { o } else { o ^ (width - host.len()) as u32 };
@@ -1504,10 +1505,10 @@ impl Lanes {
 }
 
 impl PciLanes for Lanes {
-    fn read(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize) -> u64 {
+    fn read(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize) -> u64 {
         self.access(f, bar, off, size, None)
     }
-    fn write(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize, val: u64) {
+    fn write(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize, val: u64) {
         self.access(f, bar, off, size, Some(val));
     }
 }
@@ -1607,7 +1608,7 @@ impl Saveable for Bridge {
     fn save_state(&self) -> toml::Value {
         let microlan = self.microlan.lock().as_ref().map_or(toml::Value::Boolean(false), |bus| bus.save_state());
         let configs: Vec<toml::Value> = self.slots.read().iter()
-            .map(|f| f.as_ref().map_or(toml::Value::Boolean(false), |f| f.config().save_state()))
+            .map(|f| f.as_ref().map_or(toml::Value::Boolean(false), |f| f.state().config().save_state()))
             .collect();
         let st = self.st.lock();
         let lines: Vec<u8> = st.pci_lines.iter().map(|&l| u8::from(l)).collect();
@@ -1642,7 +1643,7 @@ impl Saveable for Bridge {
         }
         for (slot, (f, saved)) in slots.iter().zip(configs).enumerate() {
             match (f, saved.as_bool()) {
-                (Some(f), None) => f.config().load_state(saved).map_err(|e| format!("slot {slot}: {e}"))?,
+                (Some(f), None) => f.state().config().load_state(saved).map_err(|e| format!("slot {slot}: {e}"))?,
                 (None, Some(false)) => {}
                 _ => return Err(format!("slot {slot}: the saved bus has a different function there")),
             }

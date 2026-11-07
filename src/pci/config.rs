@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::PciBusDevice;
+use super::{PciFunction, PciFunctionState};
 use crate::snapshot::{get_field, load_u32_slice, u32_slice_to_toml};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_OK};
 
@@ -368,9 +368,9 @@ pub trait PciLanes: Send + Sync {
     /// A CPU read of `size` bytes (1, 2, 4 or 8) whose first byte is at
     /// offset `off` of BAR `bar` of `f`, before the bridge moves lanes.
     /// The value is in CPU order, most significant byte first in memory.
-    fn read(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize) -> u64;
+    fn read(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize) -> u64;
 
-    fn write(&self, f: &dyn PciBusDevice, bar: usize, off: u32, size: usize, val: u64);
+    fn write(&self, f: &dyn PciFunction, bar: usize, off: u32, size: usize, val: u64);
 }
 
 /// A run of a host bridge's CPU window that one BAR decodes whole, as a
@@ -381,7 +381,7 @@ pub trait PciLanes: Send + Sync {
 /// window; every other page of the window stays with the bridge.
 pub struct PciBar {
     lanes: Arc<dyn PciLanes>,
-    dev: Arc<dyn PciBusDevice>,
+    dev: Arc<dyn PciFunction>,
     bar: usize,
     /// The CPU address bits the bridge decodes, and where in them the BAR's
     /// byte 0 sits (it may lie below the window: a BAR larger than it).
@@ -390,7 +390,7 @@ pub struct PciBar {
 }
 
 impl PciBar {
-    pub fn new(lanes: Arc<dyn PciLanes>, dev: Arc<dyn PciBusDevice>, bar: usize, mask: u64, base: u64) -> Self {
+    pub fn new(lanes: Arc<dyn PciLanes>, dev: Arc<dyn PciFunction>, bar: usize, mask: u64, base: u64) -> Self {
         Self { lanes, dev, bar, mask, base }
     }
 
@@ -433,7 +433,7 @@ pub struct BarRun {
 /// window's terms) of its byte 0.
 pub struct BarAt<'a> {
     pub slot: usize,
-    pub dev: &'a Arc<dyn PciBusDevice>,
+    pub dev: &'a Arc<dyn PciFunction>,
     pub bar: usize,
     pub cpu_base: u64,
 }
@@ -445,7 +445,7 @@ pub struct BarAt<'a> {
 /// the bridge resolves its own way), are left out: the bridge decodes those
 /// itself.
 pub fn bar_runs(
-    funcs: &[(usize, Arc<dyn PciBusDevice>)],
+    funcs: &[(usize, Arc<dyn PciFunction>)],
     space: Space,
     cpu: u64,
     pci: u32,
@@ -456,7 +456,7 @@ pub fn bar_runs(
     let (wlo, whi) = (pci as u64, pci as u64 + len);
     let mut found: Vec<(u64, u64, usize, usize, u64)> = Vec::new();
     for (k, (_, f)) in funcs.iter().enumerate() {
-        for (sp, bar, base, size) in f.config().windows() {
+        for (sp, bar, base, size) in f.state().config().windows() {
             if sp != space {
                 continue;
             }
@@ -726,9 +726,9 @@ mod tests {
     struct Nothing;
     impl BusDevice for Nothing {}
 
-    struct Func(PciConfig);
-    impl PciBusDevice for Func {
-        fn config(&self) -> &PciConfig { &self.0 }
+    struct Func(PciFunctionState);
+    impl PciFunction for Func {
+        fn state(&self) -> &PciFunctionState { &self.0 }
         fn bar_read(&self, _: usize, off: u32, _: usize) -> u32 { off }
         fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
     }
@@ -738,12 +738,12 @@ mod tests {
     /// BARs, and a BAR outside the window do not.
     #[test]
     fn bar_runs_are_the_pages_one_bar_decodes_whole() {
-        let a: Arc<dyn PciBusDevice> = Arc::new(Func(scsi_like()));
-        let b: Arc<dyn PciBusDevice> = Arc::new(Func(scsi_like()));
+        let a: Arc<dyn PciFunction> = Arc::new(Func(PciFunctionState::new(scsi_like())));
+        let b: Arc<dyn PciFunction> = Arc::new(Func(PciFunctionState::new(scsi_like())));
         for (f, io, mem) in [(&a, 0x100, 0x8000_1000u32), (&b, 0x200, 0x8000_3000)] {
-            f.config().write(4, io);
-            f.config().write(5, mem);
-            f.config().write(1, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
+            f.state().config().write(4, io);
+            f.state().config().write(5, mem);
+            f.state().config().write(1, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
         }
         let funcs = vec![(1, a.clone()), (2, b.clone())];
         let mut seen = Vec::new();
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(spans, vec![(0x1a00_1000, 0x1a00_2000), (0x1a00_3000, 0x1a00_4000)]);
         assert_eq!(seen, vec![(1, 1, 0x1a00_1000), (2, 1, 0x1a00_3000)]);
         assert!(bar_runs(&funcs, Space::Io, 0x1800_0000, 0, 0x200_0000, |_| unreachable!()).is_empty(), "I/O BARs are smaller than a page");
-        b.config().write(5, 0x8000_1000);
+        b.state().config().write(5, 0x8000_1000);
         assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x8000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "two BARs on one page");
         assert!(bar_runs(&funcs, Space::Mem, 0x1a00_0000, 0x9000_0000, 0x200_0000, |_| unreachable!()).is_empty(), "outside the window");
     }

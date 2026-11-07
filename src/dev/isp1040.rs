@@ -81,7 +81,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::devlog::LogModule;
 use crate::irq::IrqLine;
-use crate::pci::{Bar, PciBusDevice, PciConfig, PciDma, PCI_INTA};
+use crate::pci::{Bar, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
 use crate::snapshot::{get_field, hex_u16, hex_u32, load_u16_slice, toml_u16, toml_u32, toml_u8, u16_slice_to_toml, u8_slice_to_toml};
 
@@ -567,13 +567,11 @@ pub struct Core {
     /// next command to take `bus`, before it runs: no command can see the
     /// targets as they were. See [`Core::scsi`].
     targets_reset: AtomicBool,
-    dma: OnceLock<Arc<dyn PciDma>>,
-    irq: OnceLock<IrqLine>,
     /// Which of the Octane's two controllers this is (0 internal, 1
     /// external): the monitor's `scsi`/`cow` address the first,
     /// `scsi1`/`cow1` the second.
     index: u8,
-    pci: PciConfig,
+    pci: PciFunctionState,
     notes: Mutex<Vec<String>>,
     dma_misses: Mutex<std::collections::BTreeSet<u64>>,
     odd_accesses: Mutex<u32>,
@@ -673,16 +671,14 @@ impl Core {
             line_order: Mutex::new(()),
             bus,
             targets_reset: AtomicBool::new(false),
-            dma: OnceLock::new(),
-            irq: OnceLock::new(),
             index,
             // BAR 0 is the I/O window and BAR 1 its memory-space alias, one
             // register file.
-            pci: PciConfig::new(
+            pci: PciFunctionState::new(PciConfig::new(
                 PCI_VENDOR_QLOGIC, PCI_DEVICE_ISP1040, PCI_CLASS_SCSI, PCI_REVISION_ISP1040,
                 [Bar::Io(reg::WINDOW_SIZE), Bar::Mem(reg::WINDOW_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused],
                 PCI_INTA,
-            ),
+            )),
             notes: Mutex::new(Vec::new()),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
             odd_accesses: Mutex::new(0),
@@ -731,12 +727,6 @@ impl Core {
         let _ = self.heartbeat.set(heartbeat);
     }
 
-    /// Wire the adapter's interrupt pin to `line` (a level).
-    pub fn connect_irq(&self, line: IrqLine) {
-        let _ = self.irq.set(line);
-        self.sync_irq();
-    }
-
     /// True while the adapter asserts its interrupt line.
     pub fn interrupting(&self) -> bool {
         self.st.lock().irq_level()
@@ -749,7 +739,7 @@ impl Core {
     fn sync_irq(&self) {
         let _order = self.line_order.lock();
         let level = self.st.lock().irq_level();
-        if let Some(l) = self.irq.get() {
+        if let Some(l) = self.pci.irq() {
             l.set(level);
         }
     }
@@ -985,7 +975,7 @@ impl Core {
     /// `buf.len()` bytes from bus address `addr`; false (and zeros) if the
     /// fabric refuses any of them.
     fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        let ok = Self::dma_ok(addr, buf.len()) && self.dma.get().is_some_and(|d| d.dma_read(addr, buf).is_ok());
+        let ok = Self::dma_ok(addr, buf.len()) && self.pci.dma().is_some_and(|d| d.dma_read(addr, buf).is_ok());
         if !ok {
             buf.iter_mut().for_each(|b| *b = 0);
             self.dma_miss(addr, false);
@@ -994,7 +984,7 @@ impl Core {
     }
 
     fn dma_write(&self, addr: u64, data: &[u8]) -> bool {
-        let ok = Self::dma_ok(addr, data.len()) && self.dma.get().is_some_and(|d| d.dma_write(addr, data).is_ok());
+        let ok = Self::dma_ok(addr, data.len()) && self.pci.dma().is_some_and(|d| d.dma_write(addr, data).is_ok());
         if !ok {
             self.dma_miss(addr, true);
         }
@@ -2010,8 +2000,8 @@ impl crate::scsi_monitor::ScsiTargets for Isp1040 {
 }
 
 /// Both BARs reach the same registers.
-impl PciBusDevice for Isp1040 {
-    fn config(&self) -> &PciConfig {
+impl PciFunction for Isp1040 {
+    fn state(&self) -> &PciFunctionState {
         &self.pci
     }
 
@@ -2023,12 +2013,13 @@ impl PciBusDevice for Isp1040 {
         self.write(off, val, width)
     }
 
-    fn connect_interrupt(&self, line: IrqLine) {
-        self.connect_irq(line);
+    /// Drive the pin the bus wired to the adapter's state.
+    fn attached(&self) {
+        self.sync_irq();
     }
 
-    fn connect_dma(&self, dma: Arc<dyn PciDma>) {
-        let _ = self.dma.set(dma);
+    fn reset(&self) {
+        self.core.reset();
     }
 }
 

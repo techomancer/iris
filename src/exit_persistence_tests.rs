@@ -410,7 +410,7 @@ fn wait_for_exit_request(before: usize) {
 /// The guest's own power-off, down the device path each machine has.
 fn guest_power_off(m: &mut dyn Workstation) {
     use crate::dev::ioc3::reg;
-    use crate::pci::PciBusDevice;
+    use crate::pci::PciFunction;
     use crate::traits::BusDevice;
     let any = m.as_any_mut();
     if let Some(m) = any.downcast_mut::<crate::machine::Machine>() {

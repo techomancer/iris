@@ -12,7 +12,7 @@
 //! | `0x3000` | notifications, one dword per queue | 2 |
 //!
 //! Everything in the BAR is little-endian as the device sees it; the host
-//! bridge has already applied its byte-lane rules (see `PciBusDevice`), so a
+//! bridge has already applied its byte-lane rules (see `PciFunction`), so a
 //! guest driver swaps exactly as it does for any other PCI device on that
 //! machine.
 //!
@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use crate::irq::IrqLine;
-use crate::pci::{Bar, PciBusDevice, PciConfig, PciDma, PCI_INTA};
+use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState, PCI_INTA};
 use crate::traits::Resettable;
 
 use super::{PciMemory, VirtioCore};
@@ -57,7 +57,7 @@ fn cap(cfg_type: u8, next: u8, len: u8, offset: u32, length: u32, extra: Option<
 /// A virtio device as a PCI function.
 pub struct VirtioPci {
     core: VirtioCore,
-    pci: PciConfig,
+    pci: PciFunctionState,
     sel: parking_lot::Mutex<Selectors>,
 }
 
@@ -88,7 +88,7 @@ impl VirtioPci {
         .with_capabilities(16, &caps);
         // Subsystem: vendor and the virtio device ID, dword 11.
         pci.write(11, ((id as u32) << 16) | VENDOR_ID as u32);
-        Self { core, pci, sel: Default::default() }
+        Self { core, pci: PciFunctionState::new(pci), sel: Default::default() }
     }
 
     pub fn core(&self) -> &VirtioCore {
@@ -171,8 +171,8 @@ fn lanes(off: u32, width: usize, word: impl Fn(u32) -> u32) -> u32 {
     }
 }
 
-impl PciBusDevice for VirtioPci {
-    fn config(&self) -> &PciConfig {
+impl PciFunction for VirtioPci {
+    fn state(&self) -> &PciFunctionState {
         &self.pci
     }
 
@@ -208,12 +208,14 @@ impl PciBusDevice for VirtioPci {
         }
     }
 
-    fn connect_interrupt(&self, line: IrqLine) {
-        self.core.connect_interrupt(line);
-    }
-
-    fn connect_dma(&self, dma: Arc<dyn PciDma>) {
-        self.core.connect_dma(Arc::new(PciMemory(dma)));
+    /// The shared core drives the line and reaches memory through the bus.
+    fn attached(&self) {
+        if let Some(dma) = self.pci.dma() {
+            self.core.connect_dma(Arc::new(PciMemory(dma.clone())));
+        }
+        if let Some(line) = self.pci.irq() {
+            self.core.connect_interrupt(line.clone());
+        }
     }
 }
 
@@ -235,7 +237,7 @@ impl crate::traits::Device for VirtioPci {
 
 impl Resettable for VirtioPci {
     fn power_on(&self) {
-        self.pci.reset();
+        self.pci.config().reset();
         *self.sel.lock() = Selectors::default();
         self.core.power_on();
     }
@@ -248,7 +250,7 @@ mod tests {
     use crate::dev::virtio::console::{Console, PortConfig};
     use crate::dev::virtio::{VecMemory, Waker, F_VERSION_1};
     use crate::irq::LevelProbe;
-    use crate::pci::PciDmaStatus;
+    use crate::pci::{PciDma, PciDmaStatus};
 
     struct Dma(Arc<VecMemory>);
     impl PciDma for Dma {
@@ -272,15 +274,16 @@ mod tests {
         let dev = Arc::new(VirtioPci::new(core));
         let mem = Arc::new(VecMemory::new(0x2_0000));
         let (probe, line) = LevelProbe::line();
-        dev.connect_dma(Arc::new(Dma(mem.clone())));
-        dev.connect_interrupt(line);
+        dev.state().connect_dma(Arc::new(Dma(mem.clone())));
+        dev.state().connect_irq(line);
+        dev.attached();
         (dev, mem, port, probe)
     }
 
     #[test]
     fn header_and_capability_list() {
         let (dev, ..) = rig();
-        let c = dev.config();
+        let c = dev.state().config();
         assert_eq!(c.read(0), (0x1043 << 16) | 0x1af4);
         assert_eq!(c.read(2) >> 8, 0x07_80_00);
         assert_eq!(c.read(1) & 0x0010_0000, 0x0010_0000, "capability list present");
