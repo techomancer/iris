@@ -250,17 +250,16 @@ impl MacePci {
         }
     }
 
-    /// The function and byte offset CONFIG_ADDR selects. Bit 31 is the
+    /// The bus, function and byte offset CONFIG_ADDR selects. Bit 31 is the
     /// enable bit of the standard PCI mechanism, and MACE's bridge does not
     /// insist on it: the PROM sets it (0x80000800) and NetBSD's driver does
     /// not (0x00000800). Requiring it makes the whole bus invisible to one
-    /// of them. Only bus 0 exists here.
-    fn selected(&self) -> Option<(DevFn, usize)> {
+    /// of them. Bus 0 is MACE's own; another number is a bus behind a
+    /// PCI-to-PCI bridge, if firmware has numbered one that far.
+    fn selected(&self) -> Option<(PciBus, DevFn, usize)> {
         let a = *self.config_addr.lock().unwrap() & 0x7fff_ffff;
-        if (a >> 16) & 0xff != 0 {
-            return None;
-        }
-        Some((DevFn { device: ((a >> 11) & 0x1f) as u8, function: ((a >> 8) & 7) as u8 }, (a & 0xfc) as usize))
+        let bus = self.bus.find_bus(((a >> 16) & 0xff) as u8)?;
+        Some((bus, DevFn { device: ((a >> 11) & 0x1f) as u8, function: ((a >> 8) & 7) as u8 }, (a & 0xfc) as usize))
     }
 }
 
@@ -273,7 +272,7 @@ impl BusDevice for MacePci {
             // as vendor ID 0x0000, which firmware takes for a device that
             // is present but broken.
             macepci_reg::CONFIG_DATA => BusRead32::ok(
-                self.selected().and_then(|(at, off)| self.bus.config_read(at, off, 4)).unwrap_or(0xffff_ffff),
+                self.selected().and_then(|(bus, at, off)| bus.config_read(at, off, 4)).unwrap_or(0xffff_ffff),
             ),
             macepci_reg::CONFIG_ADDR => BusRead32::ok(*self.config_addr.lock().unwrap()),
             macepci_reg::REVISION => BusRead32::ok(MACEPCI_REVISION_VALUE),
@@ -286,8 +285,8 @@ impl BusDevice for MacePci {
         match off {
             macepci_reg::CONFIG_ADDR => *self.config_addr.lock().unwrap() = val,
             macepci_reg::CONFIG_DATA => {
-                if let Some((at, off)) = self.selected() {
-                    self.bus.config_write(at, off, 4, val);
+                if let Some((bus, at, off)) = self.selected() {
+                    bus.config_write(at, off, 4, val);
                 }
             }
             _ => self.regs.lock().unwrap()[(off / 4) as usize] = val,
@@ -580,5 +579,28 @@ mod tests {
         pci.window_read(base + 4, 4);
         pci.window_read(base + 8, 8);
         assert_eq!(f.calls(), vec![(7, 1), (6, 2), (4, 4), (8, 4), (12, 4)]);
+    }
+
+    /// A configuration cycle naming bus 1 reaches the bus behind a
+    /// PCI-to-PCI bridge once firmware has numbered it, and floats high
+    /// before.
+    #[test]
+    fn a_host_config_cycle_for_bus_1_reaches_the_secondary() {
+        use crate::pci::PciToPciBridge;
+        let crime = Arc::new(Crime(Mutex::new(Vec::new())));
+        let pci = bridge_with(&crime);
+        let p2p = PciToPciBridge::new(pci.bus(), at(4), 0x1234, 0x5678);
+        pci.bus().attach(at(4), p2p.clone());
+        p2p.secondary().attach(at(2), TestCard::new(bars(), 0));
+        let behind = |reg| cfg(1 << 16 | 2 << 11, reg);
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), behind(0));
+        assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0xffff_ffff, "no bus 1 yet");
+        // Secondary 1, subordinate 1, as the PROM numbers it.
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(4 << 11, 6));
+        pci.write32(bridge(macepci_reg::CONFIG_DATA), 0x0001_0100);
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), behind(0));
+        assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0x5678_1234);
+        pci.write32(bridge(macepci_reg::CONFIG_ADDR), cfg(2 << 16 | 2 << 11, 0));
+        assert_eq!(pci.read32(bridge(macepci_reg::CONFIG_DATA)).data, 0xffff_ffff, "bus 2 is not behind it");
     }
 }

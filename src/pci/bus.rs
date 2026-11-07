@@ -15,11 +15,12 @@
 //! header.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
-use super::decode::{BarMappingSink, CpuWindow, Decode};
+use super::decode::{BarMappingSink, BarRegion, CpuWindow, Decode};
 use super::intx::{BoardIrq, Combiner, IntxRouting};
-use super::{DevFn, PciFunction, PciHost, Space};
+use super::{DevFn, PciDma, PciFunction, PciHost, Space};
 use crate::devlog::LogModule;
 use crate::irq::IrqLine;
 use crate::snapshot::{get_field, hex_u32, hex_u64, toml_u32, toml_u64};
@@ -32,13 +33,27 @@ const HEADER_MULTIFUNCTION: u32 = 1 << 23;
 #[derive(Clone)]
 pub struct PciBus(Arc<Inner>);
 
+/// What is in front of a bus: the host, for a root bus, or the bridge
+/// function it sits behind.
+enum Uplink {
+    Root {
+        up: Weak<dyn PciHost>,
+        wiring: &'static IntxRouting,
+        combiner: Arc<Combiner>,
+        /// The next iris bus number to hand a secondary bus.
+        next: AtomicU8,
+    },
+    /// Held weakly: the parent holds the bridge function, which holds this
+    /// bus.
+    Behind { parent: Weak<Inner>, bridge: DevFn },
+}
+
 struct Inner {
     number: u8,
-    wiring: &'static IntxRouting,
-    up: Weak<dyn PciHost>,
+    uplink: Uplink,
     decode: Decode,
-    combiner: Arc<Combiner>,
 }
+
 
 impl PciBus {
     /// A bus numbered `number` (iris's own, from 0 per machine) wired as
@@ -47,15 +62,74 @@ impl PciBus {
     pub fn new(number: u8, wiring: &'static IntxRouting, up: Weak<dyn PciHost>) -> Self {
         Self(Arc::new(Inner {
             number,
-            wiring,
             decode: Decode::new(wiring.devices),
-            combiner: Combiner::new(wiring, up.clone()),
-            up,
+            uplink: Uplink::Root { combiner: Combiner::new(wiring, up.clone()), up, wiring, next: AtomicU8::new(number + 1) },
         }))
+    }
+
+    /// The bus behind the PCI-to-PCI bridge function that will sit at `bridge`
+    /// on `parent`. It has no host and no outputs: its functions' DMA is the
+    /// bridge's (so a function behind a bridge inherits the root slot the
+    /// bridge sits in), and a pin of device `d` reaches the parent's pin
+    /// `(pin + d) mod 4` of the bridge's device. Its regions join the
+    /// parent's table while the bridge's header forwards them.
+    pub fn secondary(parent: PciBus, bridge: DevFn) -> Self {
+        Self(Arc::new(Inner {
+            number: parent.next_number(),
+            decode: Decode::new(32),
+            uplink: Uplink::Behind { parent: Arc::downgrade(&parent.0), bridge },
+        }))
+    }
+
+    /// This bus's regions and those behind its bridges, for the bus in front.
+    pub(super) fn all_regions(&self) -> Vec<BarRegion> {
+        self.0.decode.all_regions()
     }
 
     pub fn number(&self) -> u8 {
         self.0.number
+    }
+
+    /// The next iris bus number: the root bus counts them for its tree.
+    fn next_number(&self) -> u8 {
+        match &self.0.uplink {
+            Uplink::Root { next, .. } => next.fetch_add(1, Ordering::Relaxed),
+            Uplink::Behind { parent, .. } => parent.upgrade().map_or(0, |p| PciBus(p).next_number()),
+        }
+    }
+
+    /// The DMA of a function on this bus: the host's for the root slot the
+    /// function sits in, or behind, so a bridge's children are masters as
+    /// the bridge's slot.
+    fn dma_of(&self, requester: u8) -> Arc<dyn PciDma> {
+        match &self.0.uplink {
+            Uplink::Root { up, .. } => up.upgrade().expect("pci: the host is gone").dma_for(requester),
+            Uplink::Behind { parent, bridge } => PciBus(parent.upgrade().expect("pci: the parent bus is gone")).dma_of(bridge.device),
+        }
+    }
+
+    /// The line device `dev`'s pin (1 = INTA) drives, if it is routed: at
+    /// the root through the wiring, behind a bridge by the bridge's own
+    /// swizzle onto the pins of the bridge's device.
+    fn pin_line(&self, dev: u8, pin: u8) -> Option<IrqLine> {
+        match &self.0.uplink {
+            Uplink::Root { combiner, .. } => combiner.pin_line(dev, pin),
+            Uplink::Behind { parent, bridge } => {
+                let parent = PciBus(parent.upgrade()?);
+                parent.pin_line(bridge.device, (pin - 1 + dev) % 4 + 1)
+            }
+        }
+    }
+
+    /// Update the decode table and the BAR mappings here and on every bus
+    /// in front of this one, which merges this bus's regions.
+    fn update_mappings(&self, make: Option<&dyn Fn() -> Vec<CpuWindow>>) {
+        self.0.decode.update_mappings(make);
+        if let Uplink::Behind { parent, .. } = &self.0.uplink {
+            if let Some(parent) = parent.upgrade() {
+                PciBus(parent).update_mappings(None);
+            }
+        }
     }
 
     /// Fit a function: give it its way to memory and, if it has an interrupt
@@ -64,21 +138,20 @@ impl PciBus {
     /// address already taken, or a pin the wiring does not route.
     pub fn attach(&self, at: DevFn, f: Arc<dyn PciFunction>) {
         let i = &*self.0;
-        assert!(at.device < i.wiring.devices, "pci: bus {} has no device {}", i.number, at.device);
+        assert!(at.device < i.decode.devices(), "pci: bus {} has no device {}", i.number, at.device);
         let pin = f.state().config().interrupt_pin();
         let line = (pin != 0).then(|| {
-            i.combiner.pin_line(at.device, pin).unwrap_or_else(|| {
+            self.pin_line(at.device, pin).unwrap_or_else(|| {
                 panic!("pci: bus {} does not route INT{} of device {}", i.number, (b'A' + pin - 1) as char, at.device)
             })
         });
-        let up = i.up.upgrade().expect("pci: the host is gone");
-        f.state().connect_dma(up.dma_for(at.device));
+        f.state().connect_dma(self.dma_of(at.device));
         if let Some(line) = line {
             f.state().connect_irq(line);
         }
         f.attached();
         assert!(i.decode.insert(at, f), "pci: bus {} device {} function {} is taken", i.number, at.device, at.function);
-        i.decode.update_mappings(None);
+        self.update_mappings(None);
     }
 
     pub fn function(&self, at: DevFn) -> Option<&Arc<dyn PciFunction>> {
@@ -91,13 +164,19 @@ impl PciBus {
     }
 
     /// A configuration read of `width` bytes (1, 2 or 4) at byte `off`.
-    /// None: nothing answers, and the host decides what that looks like.
+    /// None: nothing answers on a root bus, and the host decides what that
+    /// looks like. On a bus behind a PCI-to-PCI bridge the cycle ends in
+    /// master abort at the bridge: it reads all ones and the bridge's
+    /// secondary status records the abort.
     ///
     /// Function 0 of a device with a function above it reports the
     /// multifunction bit of the header type, so a scan visits the rest.
     pub fn config_read(&self, at: DevFn, off: usize, width: usize) -> Option<u32> {
         let mask = u32::MAX >> (32 - 8 * width);
-        let val = self.function(at).map(|f| (self.header_dword(at, f, off / 4) >> ((off & 3) * 8)) & mask);
+        let val = match self.function(at) {
+            Some(f) => Some((self.header_dword(at, f, off / 4) >> ((off & 3) * 8)) & mask),
+            None => self.master_abort().then_some(mask),
+        };
         crate::dlog!(LogModule::Pci, "pci: bus {} {}.{} read {off:#04x}/{width} -> {}", self.0.number, at.device, at.function,
             val.map_or("no answer".to_string(), |v| format!("{v:#x}")));
         val
@@ -111,21 +190,45 @@ impl PciBus {
         f.config_dword(index) | if multifunction { HEADER_MULTIFUNCTION } else { 0 }
     }
 
-    /// A configuration write of `width` bytes at byte `off`: only those
-    /// bytes change, and the header decides which of their bits stick. False
-    /// if nothing answers. The mappings are updated when the command
-    /// register or a BAR changed, the only registers it is built from.
+    /// A cycle that no function on this bus claims. Behind a bridge it
+    /// ends in master abort: the bridge returns all ones for a read and
+    /// drops a write, and sets received master abort in its secondary
+    /// status. True when this bus handled it so. A root bus leaves the
+    /// outcome to its host.
+    fn master_abort(&self) -> bool {
+        let Uplink::Behind { parent, bridge } = &self.0.uplink else { return false };
+        if let Some(parent) = parent.upgrade() {
+            if let Some(f) = PciBus(parent).function(*bridge) {
+                f.state().config().record_master_abort();
+            }
+        }
+        true
+    }
+
+    /// A configuration write of `width` bytes at byte `off`: only those bytes
+    /// change, and the header decides which of their bits stick. False if
+    /// nothing answers on a root bus; behind a bridge the write is discarded by
+    /// master abort, as a read of nothing is (see [`PciBus::config_read`]), and
+    /// counts as answered. The mappings are updated when the command register,
+    /// a BAR, or a bridge's bus numbers or windows changed, the only registers
+    /// they are built from.
     pub fn config_write(&self, at: DevFn, off: usize, width: usize, val: u32) -> bool {
         let f = self.function(at);
         crate::dlog!(LogModule::Pci, "pci: bus {} {}.{} write {off:#04x}/{width} {val:#x}{}", self.0.number, at.device, at.function,
             if f.is_some() { "" } else { ", no answer" });
-        let Some(f) = f else { return false };
+        let Some(f) = f else { return self.master_abort() };
         let (cfg, reg, shift) = (f.state().config(), off / 4, (off & 3) * 8);
         let mask = (u32::MAX >> (32 - 8 * width)) << shift;
         let old = cfg.read(reg);
         cfg.write_masked(reg, val << shift, mask);
-        if cfg.read(reg) != old && matches!(reg, 1 | 4..=9) {
-            self.0.decode.update_mappings(None);
+        let new = cfg.read(reg);
+        if new != old {
+            f.config_written(reg, old, new);
+            // The command register, the BARs and, in a bridge's header, its
+            // bus numbers and windows: the registers the table is built from.
+            if matches!(reg, 1 | 4..=9) {
+                self.update_mappings(None);
+            }
         }
         true
     }
@@ -154,7 +257,10 @@ impl PciBus {
 
     /// The line board IRQ `w` drives into the host.
     pub fn board_irq(&self, w: BoardIrq) -> IrqLine {
-        self.0.combiner.board_irq_line(w)
+        match &self.0.uplink {
+            Uplink::Root { combiner, .. } => combiner.board_irq_line(w),
+            Uplink::Behind { .. } => panic!("pci: a bus behind a bridge has no board IRQs"),
+        }
     }
 
     /// RST#: each function in (device, function) order has its header
@@ -177,14 +283,34 @@ impl PciBus {
             f.state().config().reset();
             f.reset();
         }
-        self.0.decode.update_mappings(None);
+        self.update_mappings(None);
     }
 
     /// Tell the host every output's level again, whatever it already has.
     /// A restore ends with this, after the host and the interrupt
     /// controller behind it have loaded.
     pub fn redrive(&self) {
-        self.0.combiner.redrive();
+        if let Uplink::Root { combiner, .. } = &self.0.uplink {
+            combiner.redrive();
+        }
+    }
+
+    /// Each output's (dirty, fell, last), for a test to compare.
+    #[cfg(test)]
+    pub(crate) fn delivery_flags(&self) -> Vec<(bool, bool, bool)> {
+        match &self.0.uplink {
+            Uplink::Root { combiner, .. } => combiner.flags(),
+            Uplink::Behind { .. } => Vec::new(),
+        }
+    }
+
+    /// Latch every output's `fell` and `dirty`, as an interrupted delivery
+    /// would leave them.
+    #[cfg(test)]
+    pub(crate) fn latch_delivery_flags(&self) {
+        if let Uplink::Root { combiner, .. } = &self.0.uplink {
+            combiner.out_force_flags();
+        }
     }
 
     /// One line per function: address, identity, command, assigned BARs and
@@ -199,15 +325,58 @@ impl PciBus {
                 0 => "no interrupt".to_string(),
                 p => {
                     let name = (b'A' + p - 1) as char;
-                    match self.0.combiner.output(at.device, p) {
-                        Some(o) => format!("INT{name} to output {o}"),
-                        None => format!("INT{name} unrouted"),
+                    match &self.0.uplink {
+                        Uplink::Root { combiner, .. } => match combiner.output(at.device, p) {
+                            Some(o) => format!("INT{name} to output {o}"),
+                            None => format!("INT{name} unrouted"),
+                        },
+                        Uplink::Behind { .. } if self.pin_line(at.device, p).is_some() => format!("INT{name} through the bridge"),
+                        Uplink::Behind { .. } => format!("INT{name} unrouted"),
                     }
                 }
             };
             let _ = writeln!(w, "  {}.{}: {:04x}:{:04x}, command {:#06x}, BARs [{}], {irq}",
                 at.device, at.function, id & 0xffff, id >> 16, c.command(), bars.join(", "));
+            if let Some(sec) = f.secondary() {
+                let _ = writeln!(w, "    bus {} behind {}.{}:", sec.number(), at.device, at.function);
+                sec.describe(w);
+            }
         }
+    }
+
+    /// The bus a guest's bus number reaches: bus 0 is this (root) bus, and
+    /// any other number is found by the bridges' secondary and subordinate
+    /// bus numbers as firmware has programmed them, however deep. None if
+    /// no bridge's range holds it. A scan, for configuration cycles.
+    pub fn find_bus(&self, guest_bus: u8) -> Option<PciBus> {
+        if guest_bus == 0 {
+            return Some(self.clone());
+        }
+        self.find_behind(guest_bus)
+    }
+
+    /// The bus a type 1 configuration cycle for `guest_bus` on this bus
+    /// reaches. Type 0 functions ignore a type 1 cycle; a PCI-to-PCI bridge
+    /// claims it when the number is in its secondary to subordinate range.
+    /// None when no bridge does. Unlike [`PciBus::find_bus`], bus 0 is not this
+    /// bus: it too reaches only a bridge whose range holds it.
+    pub fn type1_target(&self, guest_bus: u8) -> Option<PciBus> {
+        self.find_behind(guest_bus)
+    }
+
+    /// The bus numbered `guest_bus` among the buses behind this one's
+    /// bridges (number 0 is never behind a bridge).
+    fn find_behind(&self, guest_bus: u8) -> Option<PciBus> {
+        self.0.decode.functions().find_map(|(_, f)| {
+            let sec = f.secondary()?;
+            let numbers = f.state().config().read(6);
+            let (first, last) = ((numbers >> 8 & 0xff) as u8, (numbers >> 16 & 0xff) as u8);
+            match guest_bus {
+                n if n == first => Some(sec.clone()),
+                n if first < n && n <= last => sec.find_behind(n),
+                _ => None,
+            }
+        })
     }
 }
 
@@ -244,10 +413,22 @@ impl Saveable for PciBus {
             funcs.insert(format!("{}.{}", at.device, at.function), f.state().config().save_state());
         }
         t.insert("functions".into(), toml::Value::Table(funcs));
-        let (lo, hi, wires) = i.combiner.save();
-        t.insert("pins_lo".into(), hex_u64(lo));
-        t.insert("pins_hi".into(), hex_u64(hi));
-        t.insert("wires".into(), hex_u32(wires));
+        // The buses behind bridges save their headers here too.
+        let mut behind = toml::map::Map::new();
+        for (at, f) in i.decode.functions() {
+            if let Some(sec) = f.secondary() {
+                behind.insert(format!("{}.{}", at.device, at.function), sec.save_state());
+            }
+        }
+        if !behind.is_empty() {
+            t.insert("behind".into(), toml::Value::Table(behind));
+        }
+        if let Uplink::Root { combiner, .. } = &i.uplink {
+            let (lo, hi, wires) = combiner.save();
+            t.insert("pins_lo".into(), hex_u64(lo));
+            t.insert("pins_hi".into(), hex_u64(hi));
+            t.insert("wires".into(), hex_u32(wires));
+        }
         toml::Value::Table(t)
     }
 
@@ -261,11 +442,18 @@ impl Saveable for PciBus {
                 saved.keys().cloned().collect::<Vec<_>>().join(", "), ours.join(", ")));
         }
         for (at, f) in i.decode.functions() {
-            f.state().config().load_state(&saved[&format!("{}.{}", at.device, at.function)])?;
+            let key = format!("{}.{}", at.device, at.function);
+            f.state().config().load_state(&saved[&key])?;
+            if let Some(sec) = f.secondary() {
+                let state = get_field(v, "behind").and_then(|b| get_field(b, &key)).ok_or_else(|| format!("pci: saved state has no bus behind {key}"))?;
+                sec.load_state(state)?;
+            }
         }
-        let word = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
-        i.combiner.load((word("pins_lo"), word("pins_hi"), get_field(v, "wires").and_then(toml_u32).unwrap_or(0)));
-        i.decode.update_mappings(None);
+        if let Uplink::Root { combiner, .. } = &i.uplink {
+            let word = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
+            combiner.load((word("pins_lo"), word("pins_hi"), get_field(v, "wires").and_then(toml_u32).unwrap_or(0)));
+        }
+        self.update_mappings(None);
         Ok(())
     }
 }
@@ -545,10 +733,10 @@ mod tests {
         cd.state().irq().unwrap().set(true);
         cd.state().irq().unwrap().set(false);
         dirty.board_irq(BoardIrq(0)).set(true);
-        dirty.0.combiner.out_force_flags();
+        dirty.latch_delivery_flags();
         dirty.load_state(&v).unwrap();
         assert_eq!(dirty.save_state(), fresh.save_state());
-        assert_eq!(dirty.0.combiner.flags(), fresh.0.combiner.flags());
+        assert_eq!(dirty.delivery_flags(), fresh.delivery_flags());
         assert_eq!(dirty.config_read(at(3, 0), 4, 2), fresh.config_read(at(3, 0), 4, 2));
     }
 
@@ -590,5 +778,28 @@ mod tests {
         assert_eq!(bus.config_read(at(2, 0), 0x0c, 4).unwrap() >> 16 & 0xff, 0x80, "in the dword too");
         bus.attach(at(3, 0), card());
         assert_eq!(bus.config_read(at(3, 0), 0x0e, 1), Some(0), "another device is unaffected");
+    }
+
+    #[test]
+    fn behind_a_bridge_an_unclaimed_config_cycle_reads_ones_and_a_write_is_dropped() {
+        use crate::pci::PciToPciBridge;
+        let (_host, bus) = bus();
+        let bridge = PciToPciBridge::new(&bus, at(3, 0), 0x1234, 0x5678);
+        bus.attach(at(3, 0), bridge.clone());
+        let sec = bridge.secondary();
+        let status = || bus.config_read(at(3, 0), 0x1e, 2).unwrap();
+        assert_eq!(status() & 0x2000, 0);
+        assert_eq!(sec.config_read(at(5, 0), 0, 4), Some(0xffff_ffff));
+        assert_eq!(sec.config_read(at(5, 0), 2, 2), Some(0xffff));
+        assert_eq!(sec.config_read(at(5, 0), 1, 1), Some(0xff));
+        assert_eq!(status() & 0x2000, 0x2000, "received master abort");
+        assert!(sec.config_write(at(5, 0), 4, 2, 0x2), "dropped, not unanswered");
+        // Write one to clear.
+        bus.config_write(at(3, 0), 0x1c, 4, 0x2000_0000);
+        assert_eq!(status() & 0x2000, 0);
+        // The root bus leaves an absent function to its host.
+        assert_eq!(bus.config_read(at(5, 0), 0, 4), None);
+        assert!(!bus.config_write(at(5, 0), 4, 2, 0x2));
+        assert_eq!(status() & 0x2000, 0, "the root bus's miss is not the bridge's");
     }
 }

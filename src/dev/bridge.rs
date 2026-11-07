@@ -15,6 +15,7 @@
 //! | 0x010000   | translation table, 128 eight-byte entries        |
 //! | 0x011000   | the same entries' lower halves, read only         |
 //! | 0x020000   | type 0 configuration space, 4 KB per device       |
+//! | 0x028000   | type 1 configuration space, 4 KB                  |
 //! | 0x080000   | external SSRAM (unpopulated)                      |
 //! | 0x200000   | device windows: two of 2 MB, then six of 1 MB     |
 //! | 0xc00000   | flash, two 2 MB chip selects on a 16-bit port     |
@@ -158,6 +159,8 @@ pub const ATE_BASE: u32 = 0x01_0000;
 pub const ATE_LOW_BASE: u32 = 0x01_1000;
 pub const CFG0_BASE: u32 = 0x02_0000;
 pub const CFG0_SIZE: u32 = 8 * 0x1000;
+pub const TYPE1_BASE: u32 = 0x02_8000;
+pub const TYPE1_SIZE: u32 = 0x1000;
 pub const SSRAM_BASE: u32 = 0x08_0000;
 pub const SSRAM_SIZE: u32 = 0x08_0000;
 pub const DEVICE_WINDOW_BASE: u32 = 0x20_0000;
@@ -976,9 +979,68 @@ impl Bridge {
     /// address is the device's ID select, one line per device from line 24,
     /// then the register's word.
     fn config_master_timeout(&self, slot: u8, reg: u32) {
-        self.irq_locked(|st, p| {
-            self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, slot as u32, (1u64 << (24 + slot)) | (reg & 0x7fc) as u64)
-        });
+        self.config_error(slot as u32, (1u64 << (24 + slot)) | (reg & 0x7fc) as u64);
+    }
+
+    fn config_error(&self, device: u32, pci_address: u64) {
+        self.irq_locked(|st, p| self.pci_error(st, p, INT_PCI_MASTER_TIMEOUT, device, pci_address));
+    }
+
+    /// The bus and function a type 1 configuration offset selects, and the
+    /// corrected register byte offset. The PCI Type 1 Configuration register
+    /// names the bus (bits 23:16) and device (bits 15:11); the aperture
+    /// offset gives the function and register (specification tables 26 and
+    /// 43). A type 1 cycle on the Bridge's bus is claimed only by a
+    /// PCI-to-PCI bridge whose secondary to subordinate range holds the bus
+    /// number, so the bus is None when none does. The last element is the
+    /// cycle's PCI address (type 1 format, AD[1:0] = 01), for the error
+    /// capture.
+    fn type1_target(&self, off: u32, size: usize) -> (Option<PciBus>, DevFn, u32, u64) {
+        let sel = self.st.lock().r(reg::PCI_TYPE1_CONFIG);
+        let bus_number = (sel >> 16) as u8;
+        let at = DevFn { device: ((sel >> 11) & 0x1f) as u8, function: ((off >> 8) & 7) as u8 };
+        let reg = Self::lane_correct(off & 0xff, size);
+        let address = (sel & TYPE1_WRITABLE) | (at.function as u32) << 8 | (reg & 0xfc) | 1;
+        (self.bus.type1_target(bus_number), at, reg, address as u64)
+    }
+
+    fn type1_read(&self, off: u32, size: usize) -> Option<u64> {
+        if size > 4 {
+            return None;
+        }
+        let (bus, at, reg, address) = self.type1_target(off, size);
+        let read = bus.and_then(|b| b.config_read(at, reg as usize, size));
+        if read.is_none() {
+            // Which device the capture names for a type 1 cycle is not in
+            // the specification; the device number the cycle carried.
+            self.config_error(at.device as u32, address);
+        }
+        read.map(u64::from)
+    }
+
+    fn type1_write(&self, off: u32, size: usize, val: u64) -> bool {
+        if size > 4 {
+            return false;
+        }
+        let (bus, at, reg, address) = self.type1_target(off, size);
+        if !bus.is_some_and(|b| b.config_write(at, reg as usize, size, val as u32)) {
+            self.config_error(at.device as u32, address);
+        }
+        true
+    }
+
+    fn type1_fault(&self, off: u32, size: usize) -> Option<String> {
+        if size > 4 {
+            return None;
+        }
+        let (bus, _, _, address) = self.type1_target(off, size);
+        let n = address >> 16 & 0xff;
+        match bus {
+            None => Some(format!("PCI type 1 config master timeout: no bridge reaches bus {n}")),
+            // Behind a bridge an unclaimed cycle master-aborts there and the
+            // Bridge sees it complete.
+            Some(_) => None,
+        }
     }
 
     fn cfg_read(&self, off: u32, size: usize) -> Option<u64> {
@@ -1339,6 +1401,8 @@ impl Bridge {
                 let slot = window_slot(off)?;
                 self.window_access(slot as usize, off - device_window_offset(slot), size, None)
             }
+            // Behind the device windows: probe traffic, not the PIO path.
+            _ if (TYPE1_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&off) => self.type1_read(off - TYPE1_BASE, size),
             FLASH_BASE..=0xff_ffff => self.flash_read(off - FLASH_BASE, size),
             _ => None,
         }
@@ -1361,6 +1425,7 @@ impl Bridge {
                 Some(s) => self.window_access(s as usize, off - device_window_offset(s), size, Some(val)).is_some(),
                 None => false,
             },
+            _ if (TYPE1_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&off) => self.type1_write(off - TYPE1_BASE, size, val),
             FLASH_BASE..=0xff_ffff => self.flash_write(off - FLASH_BASE, size, val),
             _ => false,
         };
@@ -1434,7 +1499,13 @@ const WINDOW_MASK: u32 = WIDGET_SMALL_SIZE - 1;
 impl BusDevice for Bridge {
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
         let off = addr as u32 & WINDOW_MASK;
-        if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) { self.cfg_fault(off - CFG0_BASE, size) } else { None }
+        if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) {
+            self.cfg_fault(off - CFG0_BASE, size)
+        } else if (TYPE1_BASE..TYPE1_BASE + TYPE1_SIZE).contains(&off) {
+            self.type1_fault(off - TYPE1_BASE, size)
+        } else {
+            None
+        }
     }
 
     fn read8(&self, addr: u64) -> BusRead8 {

@@ -24,6 +24,18 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
 - CI judges `cpu-tests` by test name, not by failure count: the harness prints TAP, `cpu-tests/expected-failures.txt` lists the failing tests per CPU and engine, and `make -C cpu-tests check-run CPU=... ENGINE=...` runs the suite and the check, locally as in CI.
 
+### PCI
+
+- The O2's MACE and the Octane's Bridge share one PCI layer (`src/pci/`,
+  `src/pci/host.rs`, [docs/pci.md](docs/pci.md)): the function table, BAR
+  decode, interrupt combining, byte order, RST# and a PCI-to-PCI bridge
+  function (`PciToPciBridge`, not yet fitted to a machine), reached on the
+  Octane through the Bridge's type 1 configuration aperture. A write that
+  lowers Octane Bridge reset pin `n` (Control bit `24 + n`) resets PCI device
+  `n` and logs a warning. Snapshot schema 6: the PCI bus saves its own state,
+  and older O2 and Octane snapshots are refused. The Octane gains the `pci`
+  monitor command.
+
 ### R10000 family fixes, R12000 and R14000
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.

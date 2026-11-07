@@ -9,6 +9,7 @@
 use super::*;
 use crate::ip30::{HEART_HOST, WIDGET_HEART};
 use crate::irq::IrqLine;
+use crate::pci::PciToPciBridge;
 use crate::pci::{Bar, BoardIrq, DevFn, PciConfig, PciFunction, PciFunctionState, PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA};
 use crate::xtalk::{Upstream, XtalkHost};
 
@@ -567,6 +568,146 @@ fn an_empty_slot_config_read_names_the_master_timeout() {
     assert_eq!(r.bridge.describe_fault(0x1f00_0000 + at(3, 0), 4), empty(3));
 }
 
+// ---- type 1 configuration ----
+
+impl Rig {
+    /// A PCI-to-PCI bridge in `slot` with a card at device 0 behind it.
+    fn bridge_with_card_behind(&self, slot: u8) -> Arc<Card> {
+        let p2p = PciToPciBridge::new(self.bridge.bus(), DevFn { device: slot, function: 0 }, 0x1011, 0x0026);
+        let c = Card::new(PCI_INTA);
+        p2p.secondary().attach(DevFn { device: 0, function: 0 }, c.clone());
+        self.fit(slot, p2p);
+        c
+    }
+
+    /// Aim the type 1 aperture at `bus` and `device`.
+    fn type1_target(&self, bus: u32, device: u32) {
+        self.set(reg::PCI_TYPE1_CONFIG, bus << 16 | device << 11);
+        assert_eq!(self.get(reg::PCI_TYPE1_CONFIG), bus << 16 | device << 11);
+    }
+
+    fn type1_read(&self, func: u32, reg: u32, size: u32) -> Option<u32> {
+        let a = u64::from(TYPE1_BASE + (func << 8) + Self::aim(reg, size));
+        match size {
+            1 => Some(self.bridge.read8(a)).filter(|r| r.is_ok()).map(|r| r.data as u32),
+            2 => Some(self.bridge.read16(a)).filter(|r| r.is_ok()).map(|r| r.data as u32),
+            _ => Some(self.bridge.read32(a)).filter(|r| r.is_ok()).map(|r| r.data),
+        }
+    }
+
+    fn type1_write(&self, func: u32, reg: u32, size: u32, val: u32) {
+        let a = u64::from(TYPE1_BASE + (func << 8) + Self::aim(reg, size));
+        let s = match size {
+            1 => self.bridge.write8(a, val as u8),
+            2 => self.bridge.write16(a, val as u16),
+            _ => self.bridge.write32(a, val),
+        };
+        assert_eq!(s, BUS_OK);
+    }
+}
+
+/// IRIX 6.5.30 on the Octane finds a bridge in slot 5, numbers its buses
+/// with byte writes (primary 0, secondary and subordinate 0x10) and scans
+/// all 32 devices of bus 0x10 through the type 1 aperture. The card behind
+/// the bridge answers at device 0 and nothing else does: the bridge returns
+/// all ones for the rest.
+#[test]
+fn the_type_1_aperture_reaches_the_bus_behind_a_bridge() {
+    let r = Rig::new();
+    let c = r.bridge_with_card_behind(5);
+    assert_eq!(r.cfg_read(5, 0x08, 4) >> 8, 0x06_0400, "a PCI-to-PCI bridge");
+    assert_eq!(r.cfg_read(5, 0x0e, 1) & 0x7f, 1, "type 1 header");
+    r.cfg_write(5, 0x18, 1, 0x00);
+    r.cfg_write(5, 0x19, 1, 0x10);
+    r.cfg_write(5, 0x1a, 1, 0x10);
+
+    let found: Vec<u32> = (0..32)
+        .filter(|&d| {
+            r.type1_target(0x10, d);
+            r.type1_read(0, 0, 4) != Some(0xffff_ffff)
+        })
+        .collect();
+    assert_eq!(found, [0]);
+
+    r.type1_target(0x10, 0);
+    assert_eq!(r.type1_read(0, 0, 4), Some(CARD_VENDOR | CARD_DEVICE << 16));
+    assert_eq!(r.type1_read(0, 2, 2), Some(CARD_DEVICE), "the same byte order as type 0");
+    assert_eq!(r.type1_read(0, 1, 1), Some(CARD_VENDOR >> 8));
+    assert_eq!(r.type1_read(1, 0, 4), Some(0xffff_ffff), "the card has no function 1");
+
+    // Size and place the card's memory BAR through the aperture.
+    r.type1_write(0, 0x14, 4, 0xffff_ffff);
+    assert_eq!(r.type1_read(0, 0x14, 4), Some(0xffff_f000));
+    r.type1_write(0, 0x14, 4, 0x1300_0000);
+    r.type1_write(0, 0x04, 2, PCI_COMMAND_MEMORY);
+    assert_eq!(c.state().config().bar_base(1), 0x1300_0000);
+    assert_eq!(r.type1_read(0, 0x04, 2), Some(PCI_COMMAND_MEMORY));
+
+    // Open the bridge's memory window over it: slot 5's device window
+    // reaches the card's registers.
+    r.cfg_write(5, 0x20, 4, 0x1300_1300);
+    r.cfg_write(5, 0x04, 2, PCI_COMMAND_MEMORY);
+    r.set(reg::device(5), DEV_MEMORY_SPACE | 0x130);
+    assert_eq!(r.bridge.read32(u64::from(Rig::win(5) + FIXED)).data, 0x1234_5678);
+}
+
+/// A type 1 cycle no bridge claims ends in a master time-out, like an empty
+/// slot: bus 0 itself (type 0 functions ignore type 1 cycles) and a bus
+/// number outside every bridge's range.
+#[test]
+fn a_type_1_cycle_nobody_claims_is_a_master_timeout() {
+    let r = Rig::new();
+    r.bridge_with_card_behind(5);
+    r.cfg_write(5, 0x18, 4, 0x0001_0100);
+    r.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+
+    r.type1_target(0, 5);
+    assert_eq!(r.type1_read(0, 0, 4), None, "the bridge itself is on bus 0");
+    assert_eq!(r.bridge.describe_fault(u64::from(TYPE1_BASE), 4),
+        Some("PCI type 1 config master timeout: no bridge reaches bus 0".to_string()));
+    r.type1_target(2, 0);
+    r.type1_write(0, 0x04, 2, 0);
+    assert_eq!(r.type1_read(0, 0, 4), None);
+    assert_ne!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
+    // The capture holds the first: a type 1 address (bus 0, device 5).
+    assert_eq!(r.get(reg::PCI_ERR_LOWER), 5 << 11 | 1);
+
+    r.type1_target(1, 0);
+    assert!(r.type1_read(0, 0, 4).is_some());
+    assert_eq!(r.bridge.describe_fault(u64::from(TYPE1_BASE), 4), None);
+}
+
+/// Behind a PCI-to-PCI bridge an unclaimed type 1 cycle ends in master abort
+/// at the bridge, not at the Bridge: a read returns all ones, a write is
+/// dropped, the bridge's secondary status records the abort, and no master
+/// time-out is raised (PCI-to-PCI Bridge Architecture, master abort handling
+/// with Master-Abort Mode clear).
+#[test]
+fn an_absent_device_behind_a_pci_bridge_master_aborts_at_the_bridge() {
+    let r = Rig::new();
+    r.bridge_with_card_behind(5);
+    r.cfg_write(5, 0x18, 4, 0x0001_0100);
+    r.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+    assert_eq!(r.cfg_read(5, 0x1c, 4) >> 29 & 1, 0, "no abort yet");
+
+    r.type1_target(1, 9);
+    assert_eq!(r.type1_read(0, 0, 4), Some(0xffff_ffff));
+    assert_eq!(r.type1_read(0, 0, 2), Some(0xffff));
+    assert_eq!(r.type1_read(0, 3, 1), Some(0xff));
+    r.type1_write(0, 0x04, 2, PCI_COMMAND_MEMORY);
+    assert_eq!(r.bridge.describe_fault(u64::from(TYPE1_BASE), 4), None);
+    assert_eq!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0, "the Bridge saw every cycle complete");
+    assert_eq!(r.cfg_read(5, 0x1c, 4) >> 29 & 1, 1, "received master abort in secondary status");
+
+    // Write one to clear.
+    r.cfg_write(5, 0x1c, 4, 1 << 29);
+    assert_eq!(r.cfg_read(5, 0x1c, 4) >> 29 & 1, 0);
+
+    // The Bridge's own bus is unchanged: nothing there is a master time-out.
+    r.type1_target(0, 9);
+    assert_eq!(r.type1_read(0, 0, 4), None);
+    assert_ne!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
+}
 #[test]
 fn a_disabled_command_register_hides_the_bars() {
     let r = Rig::new();

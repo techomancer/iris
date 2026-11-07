@@ -8,6 +8,9 @@ use crate::snapshot::{get_field, load_u32_slice, u32_slice_to_toml};
 pub const PCI_COMMAND_IO: u32 = 0x1;
 pub const PCI_COMMAND_MEMORY: u32 = 0x2;
 
+/// Secondary status (dword 7 bit 29): received master abort.
+const SEC_STATUS_MASTER_ABORT: u32 = 1 << 29;
+
 /// Interrupt pins, as register 0x3d holds them.
 pub const PCI_INTA: u8 = 1;
 
@@ -107,6 +110,9 @@ pub struct PciConfig {
     latency_mask: u8,
     cache_line_mask: u8,
     writable_masks: [u32; 64],
+    /// A type 1 header (PCI-to-PCI bridge): no BARs, and dwords 6 to 12 are
+    /// bus numbers and forwarding windows.
+    type1: bool,
 }
 
 impl PciConfig {
@@ -174,6 +180,49 @@ impl PciConfig {
             cache_line_mask: policy.cache_line_mask,
             writable_masks,
             caps_end: 0,
+            type1: false,
+        }
+    }
+
+    /// A PCI-to-PCI bridge's type 1 header: class 0604, header type 1, no
+    /// BARs and no interrupt pin. Dwords 6 (primary, secondary and
+    /// subordinate bus numbers), 7 (16-bit I/O base and limit, bits 15:12 of
+    /// each), 8 (memory base and limit, bits 31:20) and 9 (32-bit
+    /// prefetchable memory) store what firmware writes, to the granularity
+    /// the register has; dwords 10 to 12, the 64-bit and 32-bit-I/O upper
+    /// halves, and dword 14, the expansion ROM base, read zero. The bridge
+    /// control register is the top half of dword 15. Everything resets to
+    /// zero, and the windows forward nothing until the command register
+    /// enables them.
+    pub fn type1(vendor: u16, device: u16, revision: u8) -> Self {
+        let mut c = Self::new(vendor, device, 0x06_0400, revision, [Bar::Unused; 6], 0);
+        c.type1 = true;
+        let r = c.regs.get_mut().unwrap();
+        r[3] = 1 << 16;
+        c.power_on = *r;
+        c
+    }
+
+    /// Whether this type 1 header forwards the range `base..base + size` of
+    /// `space` to its secondary bus: the range lies wholly inside one
+    /// enabled window (I/O, memory or prefetchable memory). A range that
+    /// straddles a window's edge is not forwarded; what a bridge does with
+    /// one is not defined.
+    pub fn forwards(&self, space: Space, base: u32, size: u32) -> bool {
+        let r = self.regs.lock().unwrap();
+        let (lo, hi) = (base as u64, base as u64 + size as u64 - 1);
+        let inside = |wlo: u64, whi: u64| wlo <= whi && wlo <= lo && hi <= whi;
+        match space {
+            Space::Io => {
+                r[1] & PCI_COMMAND_IO != 0 && inside(((r[7] & 0xf0) as u64) << 8, ((r[7] >> 8 & 0xf0) as u64) << 8 | 0xfff)
+            }
+            Space::Mem => {
+                r[1] & PCI_COMMAND_MEMORY != 0 && {
+                    let window = |dword: u32| (((dword & 0xfff0) as u64) << 16, ((dword >> 16 & 0xfff0) as u64) << 16 | 0xf_ffff);
+                    let (mem, pf) = (window(r[8]), window(r[9]));
+                    inside(mem.0, mem.1) || inside(pf.0, pf.1)
+                }
+            }
         }
     }
 
@@ -204,6 +253,15 @@ impl PciConfig {
         let subsystem = r[11];
         *r = self.power_on;
         r[11] = subsystem;
+    }
+
+    /// A type 1 header's secondary status gains received master abort: a
+    /// cycle forwarded to the bus behind the bridge went unclaimed.
+    pub fn record_master_abort(&self) {
+        let mut r = self.regs.lock().unwrap();
+        if self.type1 {
+            r[7] |= SEC_STATUS_MASTER_ABORT;
+        }
     }
 
     /// Register `reg` (a dword index, 0..64).
@@ -242,6 +300,22 @@ impl PciConfig {
                 r[1] = (r[1] & !(mask & 0xffff) & !clear)
                     | (val & mask & self.command_mask as u32);
             }
+            // A bridge's bus numbers and forwarding windows. The low nibbles
+            // of the base and limit registers are read-only zero (16-bit I/O
+            // and 32-bit memory), which also makes the upper halves of the
+            // prefetchable and I/O windows (dwords 10 to 12) read-only zero;
+            // the I/O secondary status is not kept.
+            6 if self.type1 => r[reg] = (r[reg] & !mask) | (val & mask),
+            10..=12 if self.type1 => {}
+            // I/O base and limit; the secondary status above them is
+            // write-one-to-clear, and only received master abort is kept.
+            7 if self.type1 => {
+                r[reg] = (((r[reg] & !mask) | (val & mask)) & 0x0000_f0f0) | (r[reg] & !(val & mask) & SEC_STATUS_MASTER_ABORT)
+            }
+            8 | 9 if self.type1 => r[reg] = ((r[reg] & !mask) | (val & mask)) & 0xfff0_fff0,
+            // A type 1 header's expansion ROM base is dword 14, and the
+            // bridge has no ROM either.
+            14 if self.type1 => {}
             4..=9 => {
                 let val = (r[reg] & !mask) | (val & mask);
                 r[reg] = match self.bars[reg - 4] {

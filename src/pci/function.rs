@@ -5,7 +5,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::irq::IrqLine;
-use super::PciConfig;
+use super::{PciBus, PciConfig};
 
 /// What the bus sees of one function: its configuration header, and the
 /// interrupt line and the way to memory the bus gives it when it is
@@ -72,6 +72,16 @@ pub trait PciFunction: Send + Sync {
     /// here: IOC3 wraps its DMA and drives its pin, virtio hands both to its
     /// shared core, and the SCSI controllers drive their pins.
     fn attached(&self) {}
+
+    /// The bus wrote configuration dword `reg` of this function's header and
+    /// it changed from `old` to `new`. A PCI-to-PCI bridge acts on bridge
+    /// control here; every other function has nothing to do.
+    fn config_written(&self, _reg: usize, _old: u32, _new: u32) {}
+
+    /// The bus behind this function, if it is a PCI-to-PCI bridge.
+    fn secondary(&self) -> Option<&PciBus> {
+        None
+    }
 
     /// RST# reaches the function after the bus has reset its header: drop
     /// the interrupt line and return to power-on state. A function never
