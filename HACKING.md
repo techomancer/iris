@@ -198,16 +198,17 @@ view of it); `physical::read_bytes`/`write_bytes` move byte ranges a page
 at a time with `read_block`/`write_block`, and both PCI host bridges'
 `PciDma` use them.
 
-PCI is shaped the same way on both machines that have it. A host bridge
-(the Octane's Bridge, the O2's MACE) works out which pages of its CPU
-windows one BAR decodes whole (`pci::bar_runs`) and hands them to the
-machine's bus through a callback (`on_bar_runs`); the bus maps each run on
-`Physical` as a `pci::PciBar` entry, which drives the function directly
-through the bridge's byte-lane rules (`pci::PciLanes`). The bridge
-recomputes the runs after a configuration write, a write to a window
-register and a reset. Everything else in a window (BARs smaller than a
-page, shared pages, unclaimed addresses and their master aborts) stays with
-the bridge's own decode.
+PCI is shaped the same way on both machines that have it
+([docs/pci.md](docs/pci.md)). A host bridge (the Octane's Bridge, the O2's MACE)
+owns a `pci::PciBus`, which works out which pages of the host's CPU windows one
+BAR decodes whole and hands them to the machine's bus through a callback
+(`PciBus::on_bar_mappings`); the bus maps each run on `Physical` as a
+`pci::BarDevice` entry, which drives the function directly through the window's
+byte order (`pci::ByteOrder`, held by value). The bus updates the BAR mappings
+after a configuration write, and the host after a write to a window register.
+Everything else in a window (BARs smaller than a page, shared pages, unclaimed
+addresses and their master aborts) stays with the host's own decode, which asks
+`PciBus::decode`.
 
 `Physical` decodes physical addresses through a table of
 4 KB slots (one `*const dyn BusDevice` per `addr >> 12`), so finding the
