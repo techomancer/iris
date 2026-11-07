@@ -297,7 +297,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // `[machine] cache`. The R10000 only has the shadow model, so the
         // choice is fixed there.
         ui.label(t!("config-cache-model"));
-        let r10k = cfg.machine.cpu == CpuModel::R10000;
+        let r10k = cfg.machine.cpu.is_r10000_family();
         ui.add_enabled_ui(!mem_ctx.running && !r10k, |ui| {
             let shown = if r10k { t!("config-cache-shadow-only") } else { cache_model_label(cfg.machine.cache, cfg.machine.cpu) };
             ComboBox::from_id_salt("cache_model")
@@ -314,16 +314,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
         ui.label(t!("config-clock"));
         ui.horizontal(|ui| {
-            // CP0 Count: half the CPU clock on the R10000 machines (the Octane's
-            // is 195 MHz) and on the O2 (90 MHz); a third of it on the Indy and
-            // the Indigo2 (33 MHz).
-            let auto_default = if cfg.machine.profile.ip28() || octane {
-                97.5
-            } else if o2 {
-                90.0
-            } else {
-                33.0
-            };
+            // CP0 Count: half the chip's clock.
+            let auto_default = cfg.machine.cpu.count_hz() as f64 / 1e6;
             let mut mhz = cfg.clock.fixed_mhz.unwrap_or(auto_default);
             let changed = ui.add(DragValue::new(&mut mhz).range(0.1..=1000.0).suffix(" MHz")).changed();
             if changed { cfg.clock.fixed_mhz = Some(mhz); }
@@ -351,7 +343,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         subtitle(ui, t!("config-cpu-applies-subtitle"));
     }
     subtitle(ui, t!("config-cpu-subtitle"));
-    if cfg.machine.cpu == CpuModel::R10000 {
+    if cfg.machine.cpu.is_r10000_family() {
         subtitle(ui, t!("config-r10000-subtitle"));
     }
     // jitv2's compile pool and its persistent code cache live on the Performance
@@ -680,11 +672,11 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
 /// an Indy a moment ago carries both.
 fn o2_defaults(cfg: &mut MachineConfig) {
     if !cfg.machine.profile.cpus().contains(&cfg.machine.cpu) {
-        cfg.machine.cpu = CpuModel::R5000;
+        cfg.machine.cpu = MachineProfile::O2Ip32.cpus()[0];
     }
-    // CP0 Count is half the CPU clock here (90 MHz), and a clock carried over
-    // from the Indy (33 MHz) would make IRIX's clock run at the wrong rate.
-    // Unset it so the O2's own default applies.
+    // CP0 Count is half the chip's clock, and a clock carried over from
+    // another machine would make IRIX's clock run at the wrong rate. Unset it
+    // so the chip's own default applies.
     cfg.clock.fixed_mhz = None;
     // Kits only, filled from pair A. Judge the layout by the core's own rules
     // rather than restating them here, so the two cannot drift.
@@ -705,7 +697,7 @@ fn o2_defaults(cfg: &mut MachineConfig) {
 }
 
 fn octane_defaults(cfg: &mut MachineConfig) {
-    cfg.machine.cpu = CpuModel::R10000;
+    cfg.machine.cpu = MachineProfile::OctaneIp30.cpus()[0];
     let sizes = MachineProfile::OctaneIp30.bank_sizes();
     let banks = &cfg.banks[..MachineProfile::OctaneIp30.memory_banks()];
     let filled = banks.iter().take_while(|&&b| b != 0).count();

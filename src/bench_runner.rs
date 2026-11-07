@@ -313,6 +313,16 @@ impl Table {
 /// The bare-metal machine the suite runs on: RAM, a test device, and nothing
 /// else. No SCSI (there is no disk image and no filesystem to find one on), no
 /// graphics, no audio.
+/// The chips the suite measures. The bench machine is an Indy with the test
+/// device on, which takes any chip.
+pub const BENCH_CPUS: &[CpuModel] = &[
+    CpuModel::R4400_150,
+    CpuModel::R5000_180,
+    CpuModel::R10000_195,
+    CpuModel::R12000_360,
+    CpuModel::R14000_600,
+];
+
 pub fn bench_config(banks: [u32; 4], cpu: CpuModel) -> MachineConfig {
     let mut cfg = MachineConfig {
         banks: crate::config::banks_from4(banks),
@@ -416,7 +426,7 @@ mod tests {
             &BenchOptions {
                 quick: true,
                 label: "test".into(),
-                cpu: CpuModel::R10000,
+                cpu: CpuModel::R10000_195,
                 ..Default::default()
             },
             |_| {},

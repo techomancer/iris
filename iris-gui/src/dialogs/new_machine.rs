@@ -124,13 +124,13 @@ impl NewMachineDialog {
                         // nudge the Processor pick to match; leaving it un-does the
                         // nudge rather than stranding the user on R10000 elsewhere.
                         if self.profile == MachineProfile::Indigo2Ip28 {
-                            self.cpu = CpuModel::R10000;
+                            self.cpu = MachineProfile::Indigo2Ip28.cpus()[0];
                             // Newport resolution presets don't apply to IMPACT.
                             self.resolution = NewportResolution::Guest;
                         } else if self.profile == MachineProfile::OctaneIp30 {
                             // An R10000 machine with no built-in PROM; its RAM
                             // is matched pairs of 64 to 512 MB in bank 0 up.
-                            self.cpu = CpuModel::R10000;
+                            self.cpu = MachineProfile::OctaneIp30.cpus()[0];
                             self.use_embedded_prom = false;
                             self.ram_total_mb = 128;
                             self.ram_banks = [128, 0, 0, 0];
@@ -140,7 +140,7 @@ impl NewMachineDialog {
                             // RAM is DIMM-pair kits of 32 to 256 MB, filled from
                             // pair A, so a plain total cannot describe it — refit
                             // whatever the previous profile had.
-                            self.cpu = CpuModel::R5000;
+                            self.cpu = MachineProfile::O2Ip32.cpus()[0];
                             self.use_embedded_prom = false;
                             self.prom_path = "ip32prom.bin".into();
                             self.ram_total_mb = 128;
@@ -167,9 +167,8 @@ impl NewMachineDialog {
                     let octane = self.profile == MachineProfile::OctaneIp30;
                     let o2 = self.profile == MachineProfile::O2Ip32;
                     ui.label(t!("dialog-new-machine-cpu"));
-                    // Only the CPUs this machine can be built with. The Octane
-                    // has one (the 195 MHz R10000), so its row is not a choice
-                    // at all; an O2 refuses an R4400.
+                    // Only the CPUs this machine can be built with; a machine
+                    // with one has no choice.
                     let cpus = self.profile.cpus();
                     ui.add_enabled_ui(cpus.len() > 1, |ui| {
                         ComboBox::from_id_salt("nm_cpu")
@@ -180,7 +179,7 @@ impl NewMachineDialog {
                                 }
                             });
                     });
-                    if octane {
+                    if cpus.len() == 1 {
                         ui.label(RichText::new(cpus[0].label()).weak());
                     }
                     ui.end_row();
@@ -451,7 +450,7 @@ mod ram_tests {
         for &total in crate::ram::ram_presets(octane) {
             let mut cfg = iris::config::MachineConfig::default();
             cfg.machine.profile = octane;
-            cfg.machine.cpu = iris::config::CpuModel::R10000;
+            cfg.machine.cpu = octane.cpus()[0];
             cfg.banks = distribute_ram(total, octane);
             cfg.validate().unwrap_or_else(|e| panic!("{total} MB: {e}"));
         }

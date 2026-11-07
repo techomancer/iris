@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::{CpuModel, MachineConfig, MachineProfile};
-use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
@@ -46,12 +46,9 @@ use crate::workstation::{MachineRef, MachineSlot, Workstation};
 /// The PROM image tried when `prom` is left at the shared default, named
 /// as IRIX ships it in /usr/cpu/firmware. The Octane has no embedded PROM.
 pub const OCTANE_PROM_FILE: &str = "IP30prom.bin";
-/// The 195 MHz R10000 of SGI's standard 128 MB Octane configurations (the
-/// OCTANE Technical Report): Count at half that.
-pub const OCTANE_COUNT_HZ: u64 = 97_500_000;
-/// R10000 revision 2.7, as an Octane's hinv reports it; the raw PRId is
-/// inferred from the R10000 manual's encoding.
-pub const OCTANE_PRID: u32 = 0x0927;
+/// The processors an Octane takes, the default first.
+pub const CPUS: &[CpuModel] = &[CpuModel::R10000_195, CpuModel::R12000_360, CpuModel::R14000_600];
+
 /// The Crossbow on the Octane reports revision code 4.
 const XBOW_REVISION: u32 = 4;
 /// The Octane2's Crossbow: revision code 5, which IRIX's inventory names
@@ -353,7 +350,7 @@ impl OctaneMachine {
             if has_vpro { kind.label() } else { board.map_or("no graphics", |b| b.label()) }
         );
 
-        let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
+        let count_hz = cfg.clock.count_hz(cfg.machine.cpu);
         let flash_lines: Vec<_> = (0..cpu_count)
             .map(|_| {
                 let bus: Arc<dyn BusDevice> = phys.phys.clone();
@@ -365,7 +362,10 @@ impl OctaneMachine {
         ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
         let memory = Arc::new(crate::ip30::memory_map(&cfg.banks[..4]));
         let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
-            .map(|id| Self::build_cpu(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .map(|id| {
+                let (sysad, cached, tm, fasttick) = (phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, ticks[id as usize].clone());
+                crate::with_cpu!(cfg.machine.cpu, true, C => Self::build_cpu::<C>(id, cpu_count, memory.clone(), sysad, cached, tm, count_hz.max(1), fasttick, MachineProfile::OctaneIp30.cpu_prid(cfg.machine.cpu)))
+            })
             .collect();
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
@@ -575,8 +575,9 @@ impl OctaneMachine {
         }
     }
 
+    /// An Octane's processor `id` of `cpu_count` over cache type `C`.
     #[allow(clippy::too_many_arguments)]
-    fn build_cpu(
+    fn build_cpu<C>(
         id: u8,
         cpu_count: u8,
         memory: Arc<crate::memory_map::MemoryMap>,
@@ -585,17 +586,20 @@ impl OctaneMachine {
         tm: &Arc<TimerManager>,
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
-    ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>(memory);
+        prid: u32,
+    ) -> Arc<dyn CpuDevice>
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
+        MipsCpu<MipsTlb, C>: CpuDevice,
+    {
+        let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(prid);
         let tlb = MipsTlb::new(cfg.tlb_entries);
-        let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.
-        exec.cache = R10000ShadowCache::from(cached as Arc<dyn BusDevice>);
+        exec.cache = C::from(cached as Arc<dyn BusDevice>);
         exec.core.set_timer_manager(tm.clone());
         exec.core.set_count_hz(count_hz);
         exec.core.fasttick_count = fasttick;
-        exec.core.reset_prid = OCTANE_PRID;
-        exec.core.cp0_prid = OCTANE_PRID;
         // IRIX zeroes Count and arms Compare a few instructions later; see
         // `MipsCore::count_write_samples`.
         exec.core.count_write_samples = true;
@@ -605,7 +609,7 @@ impl OctaneMachine {
         exec.phys_mask = (1 << 40) - 1;
         exec.core.cpu_id = id;
         exec.core.smp = cpu_count > 1;
-        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, R10000ShadowCache>| {
+        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
             LAST_PC[id as usize].store(exec.core.pc, Ordering::Relaxed);
         }));
         Arc::new(MipsCpu::new(exec))
@@ -1305,7 +1309,7 @@ mod snapshot_tests {
     fn machine_with(prom: &str, dir: &std::path::Path, edit: impl FnOnce(&mut MachineConfig)) -> OctaneMachine {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = crate::config::MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = CpuModel::R10000_195;
         cfg.banks = [256, 0, 0, 0, 0, 0, 0, 0];
         cfg.prom = prom.into();
         cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
@@ -1467,5 +1471,34 @@ mod snapshot_tests {
             assert!(e.contains("flash"), "{e}");
             assert_eq!(digest(&a), before, "the machine is as it was");
         }).unwrap().join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cpu_clock_tests {
+    use super::*;
+    use crate::cpu::build::tests::{probe, row};
+    use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache};
+
+    /// Each Octane part has the PRId and cache type it had when this file
+    /// kept its own constants (an R10000 rev 2.7, an R12000 rev 3.5, an
+    /// R14000 rev 2.4), and a Count at half the clock it shipped at (195,
+    /// 360 and 600 MHz).
+    #[test]
+    fn each_octane_part_keeps_its_prid_cache_and_count() {
+        let got: Vec<_> = CPUS.iter().map(|&c| (c, probe(MachineProfile::OctaneIp30, c, true), c.count_hz())).collect();
+        assert_eq!(got, [
+            (CpuModel::R10000_195, row::<R10000ShadowCache>(0x0927), 97_500_000),
+            (CpuModel::R12000_360, row::<R12000ShadowCache>(0x0e35), 180_000_000),
+            (CpuModel::R14000_600, row::<R12000ShadowCache>(0x0f24), 300_000_000),
+        ]);
+    }
+
+    /// A bare family name means the Octane's part of that family.
+    #[test]
+    fn a_bare_family_name_is_the_octanes_part() {
+        for (name, chip) in [("r10000", CpuModel::R10000_195), ("r12000", CpuModel::R12000_360), ("r14000", CpuModel::R14000_600)] {
+            assert_eq!(CpuModel::resolve(name, CPUS), Ok(chip), "{name}");
+        }
     }
 }

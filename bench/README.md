@@ -341,6 +341,12 @@ and the normal mode for speed. The result is labelled
 | `r4400-lightning` | `lightning` | `r4400` |
 | `r4400-jitv2-lightning` | `jitv2,lightning` | `r4400` |
 
+| `r10000-interp`, `r12000-interp`, `r14000-interp` | (default) | `r10000_195`, `r12000_360`, `r14000_600` |
+
+The R10000 family always runs the shadow caches, so these share the default
+build. The suite runs on an Indy with the test device on, which takes any
+chip (a product Indy takes the R4400 and R5000 only), and the cells rely on that.
+
 Each build is copied to `bench/build/iris-<features>` before the next one starts —
 the next `cargo build` overwrites `target/release/iris`, and a matrix that races
 its own artefacts produces results labelled with the wrong build. After the run,
@@ -409,7 +415,7 @@ device on real hardware, so results come back over serial with CP0 Count as the
 time base; the header says so.
 
 **On which SGI machines?** The suite identifies any MIPS CPU by name from PRId
-— R4000, R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, RM5200,
+— R4000, R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, R16000, RM5200,
 RM7000 — and an implementation it has no name for prints as `MIPS-imp-0xNN`
 rather than refusing. That is safe to do because **nothing here is
 CPU-specific**: the kernels are ordinary compiled MIPS III, and `golden.h` is

@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Machine profiles
+
+- An Indy or `indigo2_ip22` no longer accepts an R10000, and `indigo2_ip28`
+  accepts only the R10000: the R10000 Indigo2 is the IP28 board. A config with
+  no `cpu` takes its machine's first processor (the R4400 for an Indy, the
+  R10000 for the IP28). The front ends' Processor pickers list the same models.
+  The bare-metal benchmark rig (test device on) still takes every chip on its
+  Indy, so iris-bench keeps its r10000, r12000 and r14000 cells.
+
 ### Boot test before publishing
 
 - `build.yml` can boot IRIX 5.3 to a login prompt on Linux, macOS and Windows
@@ -212,7 +221,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   so TLBR reads them back as zero, as the part does; on 16 KB pages that is
   EntryLo bits 7:6. Translation is unchanged. The PROM's `ide` `tlb` test
   failed 320 compares on this. The manual documents it for the R10000; the
-  R12000, R14000 and R16000 do the same as a model choice. The R4400 and
+  R12000 and R14000 do the same as a model choice. The R4400 and
   R5000 still keep the whole PFN.
 - **TLB refill vector on the R10000** follows the address space that missed:
   a user address takes the XTLB vector only with UX set, xsseg with SX, and
@@ -243,6 +252,23 @@ hashes are given where a change is easiest to understand by reading the commit.
   shifted right by 3 instead of 4: one slot per doubleword.
 - **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
   TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
+
+### R12000 and R14000
+
+- `[machine] cpu` and `--cpu` take `r12000` and `r14000`. The Octane
+  takes the R10000, R12000 and R14000 (defaulting to 195, 360 and 600 MHz), the
+  O2 the R5000, R10000 and R12000 (400 MHz for the R12000), the IP28 the R10000.
+  CP0 Config now reports the part's own secondary-cache size, where every part
+  read 1 MB.
+- Each processor SGI shipped in a machine iris models is one `CpuModel`
+  variant named by family and clock (`r14000_600`, `r12000_400`), and a
+  machine lists the ones it takes. A family name still works and means the
+  machine's chip of that family; a chip name must be one the machine lists.
+  CP0 Count is half the chip's clock. Each is a configuration seen in real
+  hinv dumps. Guest-visible: an Indy or Indigo2 R4400 is now rev 5.0 at 150
+  MHz (Count 75 MHz, was rev 4.0 and 33), its R5000 rev 1.0 at 180 MHz (was
+  rev 2.1); the O2 R10000 is rev 3.4 at 250 MHz (was rev 2.5 at 180). The
+  Octane and IP28 are unchanged.
 
 ### `IRIS_GUI_GL` works in iris-gui
 

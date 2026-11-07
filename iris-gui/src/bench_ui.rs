@@ -240,7 +240,7 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
             egui::ComboBox::from_id_salt("bench_cpu")
                 .selected_text(st.cpu.label())
                 .show_ui(ui, |ui| {
-                    for m in iris::config::CpuModel::ALL {
+                    for &m in iris::bench_runner::BENCH_CPUS {
                         ui.selectable_value(&mut st.cpu, m, m.label());
                     }
                 })
