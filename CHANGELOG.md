@@ -35,6 +35,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   `n` and logs a warning. Snapshot schema 6: the PCI bus saves its own state,
   and older O2 and Octane snapshots are refused. The Octane gains the `pci`
   monitor command.
+- The Octane's Bridge answers in its widget's 2 GB window at
+  `0xF_8000_0000`: the first 16 MB is its small window, and from offset
+  `0x4000_0000` the 32-bit alias of PCI memory, with BARs there mapped
+  straight to the function as in the device windows. IRIX 6.5.30 reads a
+  BAR behind a PCI-to-PCI bridge there, which used to be an unmapped access.
 
 ### R10000 family fixes, R12000 and R14000
 

@@ -305,6 +305,7 @@ impl OctaneMachine {
         // switch.
         phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
+        phys.attach_long_window(WIDGET_BRIDGE, bridge.long_window());
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);
         }

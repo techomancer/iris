@@ -70,7 +70,8 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
     phys.map(widget_small_base(WIDGET_XBOW), widget_small_base(WIDGET_XBOW) + WIDGET_SMALL_SIZE, xbow.clone(), "xbow");
     phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
-    phys.attach_widget(WIDGET_BRIDGE, bridge, false);
+    phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
+    phys.attach_long_window(WIDGET_BRIDGE, bridge.long_window());
     let phys = Arc::new(phys);
     phys.init();
     for w in 9..16 {
@@ -388,6 +389,60 @@ fn widgets_route_by_number() {
     assert_eq!(p.read64(0x0ff1_0030).data, 0, "HEART's pending bits");
     assert_eq!(p.read32(0x0ff0_0020).data, 0);
     assert_eq!(p.read32(widget_large_base(WIDGET_BRIDGE)).status, BUS_ERR, "the Bridge takes no large window");
+}
+
+/// The Bridge's 2 GiB window at 0xF_8000_0000 starts with its small
+/// window, and a BAR run in its PCI memory alias is mapped there, not in
+/// the small window. IRIX 6.5.30 reads a BAR behind a PCI-to-PCI bridge at
+/// 0xF_C080_0008 (PCI memory 0x80_0008).
+#[test]
+fn the_bridge_2gb_window_holds_its_registers_and_alias_runs() {
+    let b = board(&[]);
+    let p = &b.phys;
+    let long = widget_long_base(WIDGET_BRIDGE);
+    assert_eq!(long, 0xf_8000_0000);
+    assert_eq!(p.read32(long + 4).data, p.read32(widget_small_base(WIDGET_BRIDGE) + 4).data, "identification");
+    assert_eq!(p.read32(long + 0x0100_0000).status, BUS_ERR, "nothing past the small window's 16 MiB");
+    let at = PIO32_ALIAS as u64 + 0x80_0000;
+    let marker: Arc<dyn BusDevice> = Arc::new(Marker(0x5a5a_5a5a));
+    b.bus.set_widget_runs(WIDGET_BRIDGE, vec![(at..at + 0x2000, marker)]);
+    assert_eq!(p.read32(long + at + 8).data, 0x5a5a_5a5a, "the run answers in the 2 GiB window");
+    assert_eq!(p.read32(widget_small_base(WIDGET_BRIDGE) + 0x80_0008).status, BUS_ERR, "and not in the small window");
+    b.bus.set_widget_runs(WIDGET_BRIDGE, vec![]);
+    assert_eq!(p.read32(long + at + 8).status, BUS_ERR, "given back: a master time-out, with nothing decoding");
+}
+
+/// A widget with no 2 GiB window attached keeps a run above 16 MiB out of
+/// the bus altogether: it is not mapped, and dropping it maps nothing back
+/// (the small window's base plus the run's offset is SDRAM space).
+#[test]
+fn a_run_above_16_mib_without_a_2gb_window_maps_nothing() {
+    let ram = Arc::new(HeartRam::new([128, 0, 0, 0]));
+    let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::dev::heart::host_clock()));
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart), &PCI0);
+    let p = Arc::new(Ip30Bus::new(ram));
+    let dev: Arc<dyn BusDevice> = bridge;
+    p.attach_widget(WIDGET_BRIDGE, dev, false);
+    p.init();
+    p.set_widget_link(WIDGET_BRIDGE, true);
+    let at = PIO32_ALIAS as u64 + 0x80_0000;
+    let marker: Arc<dyn BusDevice> = Arc::new(Marker(0x5a5a_5a5a));
+    let (small, long) = (widget_small_base(WIDGET_BRIDGE) + at, widget_long_base(WIDGET_BRIDGE) + at);
+    let empty = p.phys.default_entry();
+    p.set_widget_runs(WIDGET_BRIDGE, vec![(at..at + 0x2000, marker)]);
+    assert!(entry_eq(p.phys.entry_at(long), empty), "no run in a window it does not have");
+    p.set_widget_runs(WIDGET_BRIDGE, vec![]);
+    assert!(entry_eq(p.phys.entry_at(small), empty), "nothing given back over memory space");
+    assert!(entry_eq(p.phys.entry_at(long), empty));
+}
+
+/// A device that answers every word read with one value.
+struct Marker(u32);
+
+impl BusDevice for Marker {
+    fn read32(&self, _: u64) -> crate::traits::BusRead32 {
+        crate::traits::BusRead32::ok(self.0)
+    }
 }
 
 #[test]
