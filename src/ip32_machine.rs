@@ -286,8 +286,6 @@ impl O2Machine {
                 drop(g);
                 crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, bus.phys.clone() as Arc<dyn BusDevice>);
             }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
         }
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
@@ -756,6 +754,11 @@ impl Drop for O2Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = MachineRef::null();
         }
+        // The CPU and its compile pool first: they reach the bus, which is
+        // freed once this returns.
+        self.cpu.clone().as_device().stop();
+        #[cfg(feature = "jitv2")]
+        crate::cpu::jitv2::Jitv2::stop_for_drop(&self.cpu.jitv2(), || self.cpu.clone().as_device().stop());
         self.display.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
@@ -763,6 +766,8 @@ impl Drop for O2Machine {
         }
         crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
+        // The rendering engine's thread runs from construction and holds the bus.
+        self.bus.crime.re.stop();
     }
 }
 
@@ -1192,3 +1197,23 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
     }
 }
 
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use crate::config::{GraphicsBoard, MachineProfile};
+    use crate::display_stop_tests::{big_stack, config, scratch};
+
+    /// A dropped O2 frees its bus and with it the decode table: a process may
+    /// have only 64, and a test binary builds many machines.
+    #[test]
+    fn a_dropped_o2_frees_its_bus_and_decode_table() {
+        let dir = scratch("o2-drop");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        let phys = Arc::downgrade(&machine.bus.phys);
+        drop(machine);
+        assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
