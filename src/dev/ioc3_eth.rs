@@ -161,6 +161,8 @@ const FRAME_MAX: usize = 2048;
 const NREGS: usize = ((MII_DATA_W + 4 - MAC_CONTROL) / 4) as usize;
 /// The PHY's management address on the Octane's IOC3.
 pub const PHY_ADDR: u8 = 1;
+/// The Origin 200 System Board's transceiver address.
+pub const ORIGIN200_PHY_ADDR: u8 = 31;
 /// How long the synthetic link partner takes to complete negotiation.
 pub const NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
 
@@ -762,6 +764,11 @@ impl Ioc3Eth {
     /// Fuel uses the DP83843 at management address 1.
     pub fn new_fuel(mac: [u8; 6]) -> Arc<Self> {
         Self::with_phy(mac, Box::new(crate::dev::dp83843::Dp83843::new(PHY_ADDR)), "ioc3-eth")
+    }
+
+    /// The Origin 200 System Board's DP83840A, at management address 31.
+    pub fn new_origin200(mac: [u8; 6]) -> Arc<Self> {
+        Self::with_phy(mac, Box::new(crate::dev::dp83840::Dp83840::new(ORIGIN200_PHY_ADDR)), "ioc3-eth")
     }
 
     fn with_phy(mac: [u8; 6], phy: Box<dyn MiiPhy>, thread_prefix: &'static str) -> Arc<Self> {
