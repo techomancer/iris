@@ -20,14 +20,17 @@ use crate::physical::RamBank;
 use crate::dev::prom::Prom;
 use crate::dev::mc::MemoryController;
 
-/// Count on the IP28's 195 MHz R10000: half the pipeline clock, and what
-/// IRIX assumes there (see where the MC is created).
-const IP28_COUNT_HZ: u64 = 97_500_000;
+/// The processors an Indy or `indigo2_ip22` shipped with, the default first.
+/// The R10000 Indigo2 is the IP28 board.
+pub const CPUS: &[&Part] = &[&parts::R4400_150, &parts::R5000_180_EARLY];
+
+/// The IP28's.
+pub const IP28_CPUS: &[&Part] = &[&parts::R10000_195_EARLY];
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::cpu::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
-use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
+use crate::cpu::parts::{self, Part};
+use crate::cpu::mips_cache_v2::MipsCache;
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -319,9 +322,11 @@ impl Machine {
     /// console and exit code delivered in-process instead of to stdout and
     /// `process::exit` (`crate::bench_runner`, `TestDevice::new_embedded`).
     pub fn new_with_testdev(
-        cfg: MachineConfig,
+        mut cfg: MachineConfig,
         testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
     ) -> Self {
+        // The rig takes any part: `MachineConfig::cpu_part` looks at this.
+        cfg.test_device |= testdev_override.is_some();
         // Capture config flags that are needed after the local `cfg` binding
         // is shadowed later in this function.
         let ci_enabled = cfg.ci;
@@ -333,8 +338,7 @@ impl Machine {
         let display_resolution = cfg.graphics.resolution;
         let newport_active = !cfg.headless && cfg.graphics_board() == GraphicsBoard::Newport;
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
-        let clock_fixed_mhz = cfg.clock.fixed_mhz;
-        let cfg_cpu_model = cfg.machine.cpu;
+        let cfg_cpu_model = cfg.cpu_part().expect("validate() accepted the cpu");
 
         let guinness = cfg.machine.profile.guinness();
 
@@ -352,11 +356,7 @@ impl Machine {
         // 256 MB L2 and IRIX spends the boot flushing a cache that does not exist.
         // Keyed on the configured CPU, not on a cargo feature: the model is a
         // runtime choice, so a feature gate here silently stopped firing.
-        let model_has_l2 = match cfg_cpu_model {
-            crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
-            crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
-            crate::config::CpuModel::R10000 => <R10000ShadowCache as MipsCache>::L2_SIZE > 0,
-        };
+        let model_has_l2 = cfg_cpu_model.l2_kb > 0;
         if !model_has_l2 {
             eeprom_mc.lock().set_cachsz(0);
         }
@@ -373,12 +373,8 @@ impl Machine {
         // divider it programs. The generic 33 MHz Count and 50 MHz MC made
         // UST run at a third of real time (Quake in slow motion) and the
         // cycle counter at a quarter.
-        let ip28_count_hz: Option<u64> = if cfg.machine.profile.ip28() {
-            Some(clock_fixed_mhz.map_or(IP28_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64))
-        } else {
-            None
-        };
-        if let Some(count_hz) = ip28_count_hz {
+        let count_hz = cfg.clock.count_hz(cfg_cpu_model);
+        if cfg.machine.profile.ip28() {
             // The R10000's Count ticks at half the pipeline clock.
             mc.set_clock_hz(2 * count_hz);
         }
@@ -740,11 +736,11 @@ impl Machine {
         }
 
         // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
-        //    arm below monomorphises its own CPU — no per-model branch on the hot path.
+        //    family monomorphises its own CPU (`crate::cpu::build`) — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
         macro_rules! build_cpu { ($cache:ty) => {{
-        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone());
+        let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone()).with_prid(cfg_cpu_model.prid());
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
@@ -761,14 +757,10 @@ impl Machine {
             }
         }
 
-        // CP0 Count runs at a fixed frequency: DEFAULT_COUNT_HZ unless the
-        // user overrode it via `[clock] fixed_mhz` or the CLI. Must happen
+        // CP0 Count runs at half the chip's clock unless the user overrode
+        // it via `[clock] fixed_mhz` or the CLI. Must happen
         // before the core starts executing.
-        if let Some(hz) = ip28_count_hz {
-            executor.core.set_count_hz(hz);
-        } else if let Some(mhz) = clock_fixed_mhz {
-            executor.core.set_count_hz((mhz * 1_000_000.0) as u64);
-        }
+        executor.core.set_count_hz(count_hz);
 
         // Inject the shared fasttick_count Arc into the executor core before wrapping in MipsCpu.
         // (cycles has no equivalent here — it's inline on MipsCore.hot now.)
@@ -791,18 +783,8 @@ impl Machine {
         }}}
 
         let shadow = cfg.machine.cache.is_shadow(cfg_cpu_model);
-        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
-            // R4400/R5000: the functional caches, or the shadow ones that
-            // keep only what CACHE instructions observe — see CacheModel.
-            crate::config::CpuModel::R4400 if shadow => build_cpu!(R4400ShadowCache),
-            crate::config::CpuModel::R5000 if shadow => build_cpu!(R5000ShadowCache),
-            crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
-            crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
-            // IP28 uses the shadow cache: out of the data path entirely, with
-            // tag and data arrays that exist only to answer CACHE ops and the
-            // PROM's diagnostics. See mips_cache_shadow.rs.
-            crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
-        };
+        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> =
+            crate::with_cpu!(cfg_cpu_model, shadow, false, C => build_cpu!(C));
 
         // The developer status bar shows the CPU's Count rate.
         status.set_count_hz(cpu.count_hz_atomic());
@@ -2248,7 +2230,7 @@ mod controller_lifetime_tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| Box::new(Machine::new(crate::bench_runner::bench_config(
-                [16, 0, 0, 0], crate::config::CpuModel::default()))))
+                [16, 0, 0, 0], &parts::R4400_150))))
             .unwrap()
             .join()
             .unwrap()
@@ -2301,7 +2283,7 @@ mod controller_lifetime_tests {
         let mut machine = std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], crate::config::CpuModel::default());
+                let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
                 cfg.scsi.insert(1, crate::config::ScsiDeviceConfig { path: path_str, overlay: true, ..Default::default() });
                 Box::new(Machine::new(cfg))
             })
@@ -2372,7 +2354,7 @@ mod stop_order_tests {
         // A REX3 saves its shape corpus when it stops; keep it out of $HOME.
         let dir = crate::display_stop_tests::scratch("indy-order");
         let mut machine = big_stack(|| {
-            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], crate::config::CpuModel::default());
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
             cfg.headless = false;
             Box::new(Machine::new(cfg))
         });
@@ -2405,7 +2387,7 @@ mod virtio_tests {
                 cfg.headless = true;
                 cfg.machine.profile = profile;
                 if profile == MachineProfile::Indigo2Ip28 {
-                    cfg.machine.cpu = crate::config::CpuModel::R10000;
+                    cfg.machine.cpu = Some("r10000".into());
                     cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
                     cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact);
                 }

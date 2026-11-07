@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig};
+use crate::config::{MachineConfig, MachineProfile, ScsiDeviceConfig};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiRequest};
 use crate::workstation::{self, Workstation};
 
@@ -203,7 +203,7 @@ enum Machine {
 }
 
 fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
-    let mut cfg = crate::bench_runner::bench_config([32, 0, 0, 0], CpuModel::default());
+    let mut cfg = crate::bench_runner::bench_config([32, 0, 0, 0], &crate::cpu::parts::R4400_150);
     cfg.machine.profile = match machine {
         Machine::Indy => MachineProfile::IndyIp24,
         Machine::Indigo2 => MachineProfile::Indigo2Ip22,
@@ -211,11 +211,11 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
         Machine::O2 => MachineProfile::O2Ip32,
         Machine::Octane => MachineProfile::OctaneIp30,
     };
-    cfg.machine.cpu = match machine {
-        Machine::Indy | Machine::Indigo2 => CpuModel::R4400,
-        Machine::O2 => CpuModel::R5000,
-        Machine::Indigo2Ip28 | Machine::Octane => CpuModel::R10000,
-    };
+    cfg.machine.cpu = Some(match machine {
+        Machine::Indy | Machine::Indigo2 => "r4400",
+        Machine::O2 => "r5000",
+        Machine::Indigo2Ip28 | Machine::Octane => "r10000",
+    }.into());
     // The O2 and the Octane have no embedded PROM; an empty one builds.
     match machine {
         Machine::O2 => {

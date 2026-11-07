@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use crate::config::{CpuModel, GraphicsBoard, MachineConfig, MachineProfile};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
 use crate::dev::ng1::rex3::Renderer;
 use crate::workstation::Workstation;
 
@@ -69,11 +69,12 @@ pub(crate) fn scratch(test: &str) -> PathBuf {
 }
 
 pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineConfig {
-    let (mb, cpu) = match profile {
-        MachineProfile::OctaneIp30 => (64, CpuModel::R10000),
-        MachineProfile::O2Ip32 => (32, CpuModel::R5000),
-        _ => (16, CpuModel::default()),
+    let mb = match profile {
+        MachineProfile::OctaneIp30 => 64,
+        MachineProfile::O2Ip32 => 32,
+        _ => 16,
     };
+    let cpu = profile.cpus()[0];
     let mut cfg = crate::bench_runner::bench_config([mb, 0, 0, 0], cpu);
     cfg.headless = false;
     cfg.machine.profile = profile;

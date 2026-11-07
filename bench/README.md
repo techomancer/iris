@@ -340,6 +340,10 @@ and the normal mode for speed. The result is labelled
 | `r5000-jitv2` | `jitv2` | `r5000` |
 | `r4400-lightning` | `lightning` | `r4400` |
 | `r4400-jitv2-lightning` | `jitv2,lightning` | `r4400` |
+| `r10000-interp`, `r12000-interp`, `r14000-interp` | (default) | `r10000_195`, `r12000_360`, `r14000_600` |
+
+The R10000 family always runs the shadow caches. The suite's Indy has the test
+device on, which takes any part; a product Indy takes only the R4400 and R5000.
 
 Each build is copied to `bench/build/iris-<features>` before the next one starts —
 the next `cargo build` overwrites `target/release/iris`, and a matrix that races

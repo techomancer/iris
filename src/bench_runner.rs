@@ -22,7 +22,8 @@ use parking_lot::Mutex;
 
 use crate::bench_report::{host_info, parse_block, Run};
 use crate::benchsuite;
-use crate::config::{CpuModel, JitCompile, MachineConfig};
+use crate::config::{JitCompile, MachineConfig};
+use crate::cpu::parts::{self, Part};
 use crate::machine::Machine;
 use crate::dev::testdev::{RunConfig, TestDevice};
 
@@ -59,7 +60,7 @@ pub struct BenchOptions {
     pub timeout: Duration,
     /// Emulated CPU. Runtime config since 96e5ddd, so the in-process runner picks
     /// it like any other machine setting rather than needing its own build.
-    pub cpu: CpuModel,
+    pub cpu: &'static Part,
     /// Cache model, as `[machine] cache`.
     pub cache: crate::config::CacheModel,
     /// Make two runs do the same work: compile on the CPU thread
@@ -81,7 +82,7 @@ impl Default for BenchOptions {
             quick: false,
             label: "local".to_string(),
             banks: BENCH_BANKS,
-            cpu: CpuModel::default(),
+            cpu: &parts::R4400_150,
             cache: crate::config::CacheModel::default(),
             deterministic: false,
             timeout: Duration::from_secs(1800),
@@ -310,10 +311,20 @@ impl Table {
     }
 }
 
+/// The parts the suite measures. It runs on an Indy with the test device on,
+/// which takes any part.
+pub const BENCH_CPUS: &[&Part] = &[
+    &parts::R4400_150,
+    &parts::R5000_180_EARLY,
+    &parts::R10000_195,
+    &parts::R12000_360,
+    &parts::R14000_600,
+];
+
 /// The bare-metal machine the suite runs on: RAM, a test device, and nothing
 /// else. No SCSI (there is no disk image and no filesystem to find one on), no
 /// graphics, no audio.
-pub fn bench_config(banks: [u32; 4], cpu: CpuModel) -> MachineConfig {
+pub fn bench_config(banks: [u32; 4], cpu: &Part) -> MachineConfig {
     let mut cfg = MachineConfig {
         banks: crate::config::banks_from4(banks),
         headless: true,
@@ -324,7 +335,7 @@ pub fn bench_config(banks: [u32; 4], cpu: CpuModel) -> MachineConfig {
     // when the file is absent — and here it always is. Same reason
     // bench/run/bare.toml carries a present-but-empty `[scsi]`.
     cfg.scsi.clear();
-    cfg.machine.cpu = cpu;
+    cfg.set_cpu(cpu);
     cfg
 }
 
@@ -416,7 +427,7 @@ mod tests {
             &BenchOptions {
                 quick: true,
                 label: "test".into(),
-                cpu: CpuModel::R10000,
+                cpu: &parts::R10000_195,
                 ..Default::default()
             },
             |_| {},
@@ -496,7 +507,7 @@ mod tests {
                 let on_exit = { let done = done.clone(); Box::new(move |_| done.store(true, Ordering::Release)) };
                 let testdev = Arc::new(
                     TestDevice::new_embedded(sink.clone(), on_exit, RunConfig::ALL));
-                let mut cfg = bench_config([32, 0, 0, 0], CpuModel::default());
+                let mut cfg = bench_config([32, 0, 0, 0], &parts::R4400_150);
                 if deterministic {
                     cfg.jitv2.compile = JitCompile::Sync;
                 }
@@ -536,7 +547,7 @@ mod tests {
 
     #[test]
     fn the_bench_machine_has_no_disks() {
-        let cfg = bench_config(BENCH_BANKS, CpuModel::default());
+        let cfg = bench_config(BENCH_BANKS, &parts::R4400_150);
         assert!(cfg.scsi.is_empty(), "a bench machine must not try to open a disk image");
         assert!(cfg.headless && cfg.no_audio);
     }

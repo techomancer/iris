@@ -24,10 +24,10 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::config::{CpuModel, MachineConfig, MachineProfile};
+use crate::config::{MachineConfig, MachineProfile};
+use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
-use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R5000ShadowCache};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
@@ -154,11 +154,12 @@ const SNAPSHOT_MACHINE: &str = "o2_ip32";
 /// release's, named as SGI shipped it. The O2 has no embedded PROM.
 pub const O2_PROM_FILE: &str = "ip32prom.rev4.18.bin";
 
-/// CP0 Count when `[clock] fixed_mhz` is unset: half of a 180 MHz CPU.
-pub const O2_COUNT_MHZ: f64 = 90.0;
+/// The processors an O2 shipped with, the default first.
+pub const CPUS: &[&Part] = &[&parts::R5000_180, &parts::R10000_250, &parts::R12000_400];
 
 impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
+        let part = MachineProfile::O2Ip32.part(cfg.machine.cpu.as_deref())?;
         let o2 = &cfg.o2;
         // `prom`, or the last release's file when `prom` is the shared default
         // and that file is not there: there is no embedded O2 PROM.
@@ -233,17 +234,13 @@ impl O2Machine {
         let timer_manager = Arc::new(TimerManager::new());
         let sysad: Arc<dyn BusDevice> = bus.phys.clone();
         let arcs_fpu = o2.arcs_fpu;
-        // `[clock] fixed_mhz` is CP0 Count; the CPU clock the PROM measures
-        // and reports is twice it.
-        let count_mhz = cfg.clock.fixed_mhz.unwrap_or(O2_COUNT_MHZ);
-        let cpu_mhz = (count_mhz * 2.0).round().max(1.0) as u32;
+        // The CPU clock the PROM measures and reports is twice Count.
+        let count_hz = cfg.clock.count_hz(part);
+        let cpu_mhz = (count_hz as f64 * 2.0 / 1e6).round().max(1.0) as u32;
         let boot = Arc::new(BootState::new());
         let memory = Arc::new(crate::ip32::memory_map());
-        let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
-            CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
-        };
+        let cpu: Arc<dyn CpuDevice> = crate::with_cpu!(part, true, true, C =>
+            Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), bus.ram.clone(), part.prid()));
 
         // ppmem: the CPU's cache and the JIT reach RAM through the memory's
         // window, publishing the mapped bitmap into the CPU's own fields, as
@@ -363,19 +360,19 @@ impl O2Machine {
         })
     }
 
-    fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
-                    ram: Arc<O2Memory>) -> Arc<dyn CpuDevice>
+    fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, count_hz: u64, boot: Arc<BootState>,
+                    ram: Arc<O2Memory>, prid: u32) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
     {
-        let cfg = MipsCpuConfig::for_model::<C>(memory);
+        let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(prid);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
         exec.cache.set_pd_tag_store_hook(Box::new(move |tag| ram.stack_tag_store(tag)));
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
-        exec.core.set_count_hz(mhz.max(1) as u64 * 500_000);
+        exec.core.set_count_hz(count_hz.max(1));
         // The no-ECC alias of memory reaches memory, not the PCI window the
         // bus decodes at the same low 32 bits.
         exec.phys_alias = Some((NO_ECC_BASE, RAM_WINDOW_SIZE as u64, RAM_BASE as u64));

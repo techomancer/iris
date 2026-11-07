@@ -707,13 +707,16 @@ pub struct MipsCpuConfig {
     pub tlb_entries: usize,
     /// Where the machine has memory.
     pub memory: Arc<crate::memory_map::MemoryMap>,
+    /// The PRId a guest reads: the cache type's unless the machine sets its
+    /// chip's (`with_prid`).
+    pub prid: Option<u32>,
 }
 
 impl MipsCpuConfig {
     /// Default configuration matching SGI Indy (R4400): 48-entry TLB.
     /// Cache geometry is fixed at compile time via constants in mips_cache_v2.
     pub fn indy() -> Self {
-        Self { tlb_entries: 48, memory: Arc::new(crate::ip22_bus::memory_map(false)) }
+        Self { tlb_entries: 48, memory: Arc::new(crate::ip22_bus::memory_map(false)), prid: None }
     }
 
     /// The JTLB size the CPU model declares.
@@ -725,7 +728,12 @@ impl MipsCpuConfig {
     /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
     /// test — every one of its reported failures was that write going nowhere.
     pub fn for_model<C: crate::cpu::mips_cache_v2::CpuModel>(memory: Arc<crate::memory_map::MemoryMap>) -> Self {
-        Self { tlb_entries: C::TLB_ENTRIES, memory }
+        Self { tlb_entries: C::TLB_ENTRIES, memory, prid: None }
+    }
+
+    pub fn with_prid(mut self, prid: u32) -> Self {
+        self.prid = Some(prid);
+        self
     }
 }
 
@@ -2331,15 +2339,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             c |= log2(32768) << 26;          // 32 KB L1D
             c |= 1 << 15;                    // big endian
             if C::L2_LINE == 128 { c |= 1 << 13; }
-            // Secondary cache size. The encoding is not in anything to hand,
-            // so it was swept against the PROM rather than guessed.
-            //
-            // 1 is the value to keep: IRIX reports "Secondary unified
-            // instruction/data cache size: 1 Mbyte", which agrees with this
-            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
-            // and IRIX boots with it. 4 also passes POST but has IRIX report
-            // 8 MB, contradicting the model.
-            c |= 1 << 16;
+            // SS is log2(secondary cache size / 512 KB): 0 is 512 KB, 1 is 1 MB,
+            // 2 is 2 MB, up to 5 for 16 MB (NEC U10278EJ4V0UM p.230). It follows
+            // the model's own `L2_SIZE`. EC, SC, DN, PM, DSD and SK stay zero.
+            c |= (C::L2_SIZE / (512 << 10)).trailing_zeros() << 16;
             c |= 2;                          // K0 = uncached at reset
             config = c;
         }
@@ -2349,9 +2352,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // MipsCore::new already ran reset_registers, so set both the reset value
         // and the live register — otherwise the model's identity only appears
         // after the next power_on.
-        core.reset_prid = C::PRID;
+        let prid = cfg.prid.unwrap_or(C::PRID);
+        core.reset_prid = prid;
         core.reset_fir = C::FIR;
-        core.cp0_prid = C::PRID;
+        core.cp0_prid = prid;
         core.fpu_fir = C::FIR;
 
         // Triton: sync initial L2 enabled state from Config SE bit (starts 0 = disabled).
@@ -4760,7 +4764,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         const EH_REGION:  u64 = 0xC000_0000_0000_0000;
         // VPN2 is bits 43:13 on the R10000 family (R10000 UM pp. 219, 288) and
         // 39:13 on the R4x00 and R5000. The R12000 is inferred to match (its
-        // manual lists no TLB change); the R14000 and R16000 are a model choice
+        // manual lists no TLB change); the R14000 is a model choice
         // that follows the same width.
         let eh_vpn2_64 = crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS);
 

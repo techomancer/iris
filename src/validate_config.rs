@@ -149,7 +149,7 @@ pub fn report(path: &str, cfg: &MachineConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{banks_from4, CpuModel};
+    use crate::config::banks_from4;
 
     fn dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("iris-check-{name}-{}", std::process::id()));
@@ -216,7 +216,7 @@ mod tests {
         let d = dir("bad");
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R4400;
+        cfg.machine.cpu = Some("r4400".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
         cfg.prom = d.join("no-prom").to_string_lossy().into_owned();
         cfg.scsi.clear();
@@ -226,7 +226,7 @@ mod tests {
         cfg.monitor_port = Some(8880);
         let all = problems(&cfg).join("\n");
         for want in [
-            "an Octane has an R10000",
+            "SGI Octane (IP30) takes [machine] cpu = ",
             "prom ",
             "scsi.1 ",
             "scsi.2: a disk needs a path",
@@ -253,7 +253,7 @@ mod tests {
         assert!(warnings(&cfg)[0].contains("built-in PROM"));
         assert_eq!(report("indy.toml", &cfg), 0);
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = Some("r10000".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
         assert!(warnings(&cfg).is_empty());
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")));
@@ -266,7 +266,7 @@ mod tests {
         let d = dir("lenient");
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = Some("r10000".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
         cfg.prom = d.join("absent-prom").to_string_lossy().into_owned();
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")), "{:?}", problems(&cfg));

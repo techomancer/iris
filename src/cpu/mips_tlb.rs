@@ -361,7 +361,7 @@ pub trait Tlb {
     /// Make a TLB write invalidate every other entry it would match together
     /// with, as the R10000 and R12000 do (NEC U10278EJ4V0UM, Status register
     /// TS bit, p.223, and "Avoiding TLB Conflict", p.300): they do not shut
-    /// down on a multiple match. The R14000 and R16000 are given the same
+    /// down on a multiple match. The R14000 is given the same
     /// rule as a model choice, matching QEMU's r10k_invalidate_conflicts();
     /// no manual for them was read. Off for the R4400 and R5000, whose
     /// behaviour on a multiple match is not modelled.

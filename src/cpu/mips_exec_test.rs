@@ -6683,4 +6683,21 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
     }
+
+    /// Config SS (bits 18:16) is log2(secondary size / 512 KB) and SB (bit 13) is
+    /// set for 128-byte lines (NEC U10278EJ4V0UM p.230): a 2 MB R12000 reads
+    /// SS=2, and the O2's 64-byte lines clear SB. Fix: Config reports each part.
+    #[test]
+    fn config_reports_the_secondary_cache_of_each_part() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn ss_sb<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u64, u64) {
+            let c = tlb_exec::<C>(Arc::new(MockMemory::new())).core.read_cp0(16);
+            ((c >> 16) & 7, (c >> 13) & 1)
+        }
+        on_big_stack(|| {
+            assert_eq!(ss_sb::<R10000ShadowCache>(), (1, 1));
+            assert_eq!(ss_sb::<R12000ShadowCache>(), (2, 1));
+            assert_eq!(ss_sb::<R12000O2ShadowCache>(), (2, 0));
+        });
+    }
 }
