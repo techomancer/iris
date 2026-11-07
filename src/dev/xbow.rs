@@ -601,6 +601,61 @@ impl crate::traits::Resettable for Xbow {
 /// address, of which the window's 16 MB is decoded.
 const WINDOW_MASK: u64 = REG_SPAN as u64 - 1;
 
+/// The widget at one of the Crossbow's ports, as a processor reaches it: the
+/// widget answers while the link is up and the access fails while it is not.
+/// The Crossbow routes a request by widget number and translates no address,
+/// so the window is the widget's own.
+struct Port {
+    xbow: Arc<Xbow>,
+    widget: u8,
+    dev: Arc<dyn BusDevice>,
+}
+
+/// A packet into a peer's I/O view: the widget it names in bits 51:48 gets it,
+/// with those bits cleared, while the link to that widget is up.
+struct Packets {
+    xbow: Arc<Xbow>,
+    ports: Vec<(u8, Arc<dyn BusDevice>)>,
+}
+
+/// An access that a Crossbow passes on to a device, or fails.
+macro_rules! routed_access {
+    ($r:ident, $w:ident, $t:ty, $out:ident) => {
+        fn $r(&self, a: u64) -> $out {
+            self.route(a).map_or($out::err(), |(d, at)| d.$r(at))
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            self.route(a).map_or(BUS_ERR, |(d, at)| d.$w(at, v))
+        }
+    };
+}
+
+impl Port {
+    fn route(&self, a: u64) -> Option<(&dyn BusDevice, u64)> {
+        self.xbow.carries(self.widget).then(|| (&*self.dev, a))
+    }
+}
+impl BusDevice for Port {
+    routed_access!(read8, write8, u8, BusRead8);
+    routed_access!(read16, write16, u16, BusRead16);
+    routed_access!(read32, write32, u32, BusRead32);
+    routed_access!(read64, write64, u64, BusRead64);
+}
+
+impl Packets {
+    fn route(&self, a: u64) -> Option<(&dyn BusDevice, u64)> {
+        let widget = ((a >> 48) & 0xf) as u8;
+        let (_, dev) = self.ports.iter().find(|(w, _)| *w == widget)?;
+        self.xbow.carries(widget).then(|| (&**dev, a & ((1 << 48) - 1)))
+    }
+}
+impl BusDevice for Packets {
+    routed_access!(read8, write8, u8, BusRead8);
+    routed_access!(read16, write16, u16, BusRead16);
+    routed_access!(read32, write32, u32, BusRead32);
+    routed_access!(read64, write64, u64, BusRead64);
+}
+
 impl Xbow {
     /// What a Bridge behind this Crossbow sends to: each of `hosts` sits on
     /// its widget's port, and a request to it is dropped while that link is
@@ -611,6 +666,18 @@ impl Xbow {
             assert!(link_bit(widget).is_some(), "widget {widget} is not a Crossbow port");
             up.with(h.with_link(Arc::new(move || xbow.carries(widget))))
         })
+    }
+
+    /// `dev` as the widget behind port `widget` (8 to 15).
+    pub fn port(self: &Arc<Self>, widget: u8, dev: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+        assert!(link_bit(widget).is_some(), "widget {widget} is not a Crossbow port");
+        Arc::new(Port { xbow: self.clone(), widget, dev })
+    }
+
+    /// The packet face a Hub's big window reaches a peer's I/O view through:
+    /// each of `ports` is a port widget and the device a packet to it lands on.
+    pub fn packets(self: &Arc<Self>, ports: Vec<(u8, Arc<dyn BusDevice>)>) -> Arc<dyn BusDevice> {
+        Arc::new(Packets { xbow: self.clone(), ports })
     }
 }
 
@@ -915,5 +982,45 @@ mod tests {
         assert_eq!(dst.read(LOCK + 4, 4), Some(9));
         assert!(Xbow::new(5, 0x8400).load_state(&v).is_err(), "other links fitted");
         assert!(Xbow::new(4, 0x8100).load_state(&v).is_err(), "another revision");
+    }
+
+    /// A widget that answers every read with a marker.
+    struct Marker;
+    impl BusDevice for Marker {
+        fn read32(&self, a: u64) -> BusRead32 {
+            BusRead32::ok(0x1234_0000 | a as u32)
+        }
+        fn write32(&self, _: u64, _: u32) -> u32 {
+            BUS_OK
+        }
+    }
+
+    #[test]
+    fn a_port_passes_accesses_while_its_link_is_up_and_fails_them_otherwise() {
+        let x = Arc::new(octane());
+        let fitted = x.port(15, Arc::new(Marker));
+        assert_eq!(fitted.read32(0x10).data, 0x1234_0010);
+        assert_eq!(fitted.write32(0x10, 0), BUS_OK);
+        // Widget 11 has nothing attached, so its link is down.
+        let empty = x.port(11, Arc::new(Marker));
+        assert_eq!(empty.read32(0x10).status, BUS_ERR);
+        assert_eq!(empty.write32(0x10, 0), BUS_ERR);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a Crossbow port")]
+    fn only_the_eight_link_widgets_are_ports() {
+        let _ = Arc::new(octane()).port(7, Arc::new(Marker));
+    }
+
+    #[test]
+    fn a_packet_goes_to_the_widget_it_names_while_that_link_is_up() {
+        let x = Arc::new(octane());
+        let packets = x.packets(vec![(15, Arc::new(Marker)), (11, Arc::new(Marker))]);
+        // The widget is cleared from the address the device sees.
+        assert_eq!(packets.read32(15u64 << 48 | 0x10).data, 0x1234_0010);
+        // A named port with no link, and a widget with no port, fail.
+        assert_eq!(packets.read32(11u64 << 48 | 0x10).status, BUS_ERR);
+        assert_eq!(packets.read32(9u64 << 48 | 0x10).status, BUS_ERR);
     }
 }
