@@ -591,14 +591,16 @@ impl VirtioSerialConfig {
 #[serde(deny_unknown_fields)]
 pub struct XioBoardConfig {
     pub kind: crate::dev::xio_pci::Kind,
-    /// The XIO slot, a Crossbow port from 9 to 12. Unset: the first of 10, 12,
-    /// 9 and 11 that nothing else holds (10 is where real Octanes have one).
+    /// The XIO slot: a Crossbow port from 9 to 12 for a shoehorn, 13 for the
+    /// PCI module. Unset: the module is in 13 and a shoehorn in the first of
+    /// 10, 12, 9 and 11 that nothing else holds (10 is where real Octanes have
+    /// one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub widget: Option<u8>,
 }
 
-/// The Octane's four XIO slots, Crossbow ports 9 to 12, in the order a board
-/// with no slot named takes them.
+/// The Octane's four XIO slots, Crossbow ports 9 to 12, in the order a
+/// shoehorn with no slot named takes them. Port 13 is the PCI module's own.
 pub const OCTANE_XIO_SLOTS: [u8; 4] = [10, 12, 9, 11];
 
 /// Emulated SGI machine profile (hardware layout scaffold).
@@ -2271,6 +2273,7 @@ impl MachineConfig {
     /// `[[xio_board]]`: the Octane's XIO slots, each holding at most one board,
     /// and not the one the graphics board is in. Returns each board's slot.
     pub fn xio_widgets(&self) -> Result<Vec<u8>, String> {
+        use crate::dev::xio_pci::{Kind, CAGE_WIDGET};
         if self.xio_board.is_empty() {
             return Ok(Vec::new());
         }
@@ -2281,8 +2284,12 @@ impl MachineConfig {
         let mut taken: Vec<u8> = Vec::new();
         let mut out = vec![0u8; self.xio_board.len()];
         // Named slots first, so a board with no slot takes one nothing names.
-        for (i, w) in self.xio_board.iter().enumerate().filter_map(|(i, b)| b.widget.map(|w| (i, w))) {
-            if !OCTANE_XIO_SLOTS.contains(&w) {
+        let named = |b: &XioBoardConfig| b.widget.or((b.kind == Kind::Cage).then_some(CAGE_WIDGET));
+        for (i, w) in self.xio_board.iter().enumerate().filter_map(|(i, b)| named(b).map(|w| (i, w))) {
+            if self.xio_board[i].kind == Kind::Cage && w != CAGE_WIDGET {
+                return Err(format!("[[xio_board]] the PCI module goes in port {CAGE_WIDGET}, not {w}"));
+            }
+            if self.xio_board[i].kind == Kind::Shoehorn && !OCTANE_XIO_SLOTS.contains(&w) {
                 return Err(format!("[[xio_board]] widget {w} is not an Octane XIO slot (9 to 12)"));
             }
             if graphics == Some(w) {
@@ -2294,7 +2301,7 @@ impl MachineConfig {
             taken.push(w);
             out[i] = w;
         }
-        for (i, b) in self.xio_board.iter().enumerate().filter(|(_, b)| b.widget.is_none()) {
+        for (i, b) in self.xio_board.iter().enumerate().filter(|(_, b)| named(b).is_none()) {
             let w = OCTANE_XIO_SLOTS.into_iter().find(|w| !taken.contains(w) && graphics != Some(*w))
                 .ok_or_else(|| format!("[[xio_board]] a {} has no free XIO slot", b.kind.label()))?;
             taken.push(w);
@@ -3407,11 +3414,16 @@ mod export_tests {
             c
         };
         let shoehorn = "[[xio_board]]\nkind = \"pci-shoehorn\"\n";
+        let cage = "[[xio_board]]\nkind = \"pci-cage\"\n";
         assert_eq!(octane("").xio_widgets().unwrap(), Vec::<u8>::new());
+        assert_eq!(octane(cage).xio_widgets().unwrap(), [13], "the module is in port 13");
+        assert_eq!(octane(&format!("{shoehorn}{cage}{shoehorn}")).xio_widgets().unwrap(), [10, 13, 12]);
+        assert!(octane(&format!("{cage}widget = 12\n")).validate().unwrap_err().contains("goes in port 13"));
+        assert!(octane(&cage.repeat(2)).validate().unwrap_err().contains("named twice"));
         assert_eq!(octane(&shoehorn.repeat(5)).validate().unwrap_err(), "[[xio_board]] a PCI shoehorn has no free XIO slot");
         assert_eq!(octane(&shoehorn.repeat(4)).xio_widgets().unwrap(), [10, 12, 9, 11]);
         assert_eq!(octane(&format!("{shoehorn}{shoehorn}widget = 10\n")).xio_widgets().unwrap(), [12, 10]);
-        assert!(octane(&format!("{shoehorn}widget = 13\n")).validate().unwrap_err().contains("not an Octane XIO slot"));
+        assert!(octane(&format!("{shoehorn}widget = 13\n")).validate().unwrap_err().contains("not an Octane XIO slot"), "13 is the module's");
         assert!(octane(&format!("{shoehorn}widget = 9\n{shoehorn}widget = 9\n")).validate().unwrap_err().contains("named twice"));
         // The graphics board's slot is its own; with none fitted it is free.
         let mut with_graphics = octane(&format!("{shoehorn}widget = 11\n"));

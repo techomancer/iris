@@ -392,8 +392,8 @@ Octane only. The array takes one table per board.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `xio_board.kind` | required | `"pci-shoehorn"`: the single-slot XIO-to-PCI adapter, its slot PCI device 1. |
-| `xio_board.widget` | first free of 10, 12, 9, 11 | The XIO slot, Crossbow port 9 to 12. Not the one the graphics board is in (11 with `[graphics] board` set), and no two boards share one. |
+| `xio_board.kind` | required | `"pci-shoehorn"`: the single-slot XIO-to-PCI adapter, its slot PCI device 1. `"pci-cage"`: the Octane PCI module, slots at PCI devices 1 to 3. |
+| `xio_board.widget` | cage 13; shoehorn the first free of 10, 12, 9, 11 | The XIO slot, Crossbow port: 9 to 12 for a shoehorn, 13 for the module. Not the one the graphics board is in (11 with `[graphics] board` set), and no two boards share one. |
 
 ### Hardware constraints and precedence
 

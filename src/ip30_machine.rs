@@ -246,9 +246,10 @@ impl OctaneMachine {
 
         // Option boards: each a Bridge on its own port, reaching memory and
         // HEART as the onboard one does, over the links the Crossbow has up.
+        let bridge_revision = if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION };
         let xio_boards: Vec<XioPciBoard> = cfg.xio_board.iter().zip(&xio_widgets).map(|(b, &w)| {
             let up = xbow.upstream(vec![HostPort::new(crate::ip30::HEART_HOST, mem.clone(), heart.clone())]);
-            let board = XioPciBoard::new(b.kind, w, up);
+            let board = XioPciBoard::new(b.kind, w, up, bridge_revision);
             let links = xbow.clone();
             board.bridge().set_link_alive(Box::new(move |w| links.carries(w)));
             eprintln!("iris: {} in XIO slot {w}", b.kind.label());
@@ -1401,15 +1402,16 @@ mod snapshot_tests {
         m
     }
 
-    /// An Octane with shoehorns: each board's Crossbow link comes up and its
-    /// Bridge answers on its own port, a function in its slot is reached by a
-    /// configuration read through the processor's address, its interrupt
-    /// arrives at HEART and its DMA lands in RAM. Ports with nothing fitted
-    /// stay down.
+    /// An Octane with a PCI module and shoehorns: each board's Crossbow link
+    /// comes up and its Bridge answers on its own port, a function in each
+    /// slot is reached by a configuration read through the processor's
+    /// address, its interrupt arrives at HEART and its DMA lands in RAM. Ports
+    /// with nothing fitted stay down, and so do the device numbers a board
+    /// has no slot at.
     #[test]
     fn option_boards_are_fitted_on_their_ports() {
-        use crate::config::{XioBoardConfig, MachineProfile};
-        use crate::dev::bridge::{reg, CFG0_BASE};
+        use crate::config::{MachineProfile, XioBoardConfig};
+        use crate::dev::bridge::{reg, CFG0_BASE, DIRECT_ADD_512MB};
         use crate::dev::xio_pci::Kind;
         use crate::pci::testing::TestCard;
         use crate::pci::{Bar, PciFunction, PCI_INTA};
@@ -1420,12 +1422,12 @@ mod snapshot_tests {
                 assert_eq!(cfg.machine.profile, MachineProfile::OctaneIp30);
                 cfg.xio_board = vec![
                     XioBoardConfig { kind: Kind::Shoehorn, widget: None },
-                    XioBoardConfig { kind: Kind::Shoehorn, widget: None },
+                    XioBoardConfig { kind: Kind::Cage, widget: None },
                     XioBoardConfig { kind: Kind::Shoehorn, widget: Some(9) },
                 ];
             });
             let ports: Vec<u8> = m.xio_boards.iter().map(|b| b.widget()).collect();
-            assert_eq!(ports, [10, 12, 9], "one takes 10, the next 12, and one asked for 9");
+            assert_eq!(ports, [10, 13, 9], "a shoehorn takes 10, the module is in 13, one shoehorn asked for 9");
             for w in 9..=13u8 {
                 assert_eq!(m.xbow.carries(w), ports.contains(&w), "link to port {w}");
             }
@@ -1433,40 +1435,46 @@ mod snapshot_tests {
                 let r = m.phys.phys.read32(widget_small_base(w) + u64::from(off));
                 r.is_ok().then_some(r.data)
             };
-            for &w in &ports {
+            for (&w, revision) in ports.iter().zip([4, BRIDGE_REVISION, 4]) {
                 let id = word(w, 4).expect("the Bridge answers on its port");
-                assert_eq!(id >> 12 & 0xffff, 0xc002, "port {w} reports a Bridge");
+                assert_eq!((id >> 12 & 0xffff, id >> 28), (0xc002, revision), "port {w}: a Bridge of the board's revision");
             }
             assert_eq!(word(11, 4), None, "nothing answers on port 11");
-            assert_eq!(word(13, 4), None, "nor on 13");
+            assert_eq!(word(12, 4), None, "nor on 12");
 
             // One bank of memory at 0x2000_0000, as the PROM's descriptor
             // places it.
             m.ram.set_memcfg([0x8001_0000, 0, 0, 0]);
-            // A function in each board's first slot, through the processor.
             for b in &m.xio_boards {
-                let card = TestCard::new([Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA);
-                let slot = b.kind().slots()[0];
-                b.attach(slot, card.clone()).unwrap();
                 let w = b.widget();
-                assert_eq!(word(w, CFG0_BASE + u32::from(slot) * 0x1000), Some(0x5678_1234), "port {w}: the card answers");
-                assert_eq!(word(w, CFG0_BASE), None, "port {w}: device 0 is empty");
-
-                // Its interrupt, as HEART's vector 20 + port.
-                let vector = 20 + u32::from(w);
                 let set = |off: u32, v: u32| assert_eq!(m.phys.phys.write32(widget_small_base(w) + u64::from(off + 4), v), crate::traits::BUS_OK);
                 set(reg::INT_DEST_UPPER, u32::from(WIDGET_HEART) << 16);
                 set(reg::INT_DEST_LOWER, 0x80);
-                set(reg::int_host(u32::from(slot)), vector);
-                set(reg::INT_ENABLE, 1 << slot);
-                assert_eq!(m.heart.pending() >> vector & 1, 0);
-                card.state().irq().unwrap().set(true);
-                assert_eq!(m.heart.pending() >> vector & 1, 1, "port {w}: the card's pin sets HEART's bit {vector}");
+                set(reg::DIRECT_MAP, u32::from(WIDGET_HEART) << 20 | DIRECT_ADD_512MB);
+                for device in 0..8u8 {
+                    let slot = b.kind().slots().contains(&device);
+                    assert_eq!(word(w, CFG0_BASE + u32::from(device) * 0x1000), None, "port {w}: device {device} is empty");
+                    if !slot {
+                        continue;
+                    }
+                    let card = TestCard::new([Bar::Unused; 6], PCI_INTA);
+                    b.attach(device, card.clone()).unwrap();
+                    assert_eq!(word(w, CFG0_BASE + u32::from(device) * 0x1000), Some(0x5678_1234), "port {w}: slot {device} answers");
 
-                // Its DMA, through the direct map to HEART, into RAM.
-                set(reg::DIRECT_MAP, u32::from(WIDGET_HEART) << 20 | crate::dev::bridge::DIRECT_ADD_512MB);
-                assert!(card.state().dma().unwrap().dma_write(0x8000_1000 + u64::from(w) * 16, &[1, 2, 3, 4]).is_ok());
-                assert_eq!(m.ram.dma_view().read32(0x2000_1000 + u64::from(w) * 16).data, u32::from_be_bytes([4, 3, 2, 1]), "port {w}: DMA reached memory");
+                    // Its INTA is Bridge pin `device`, sent to HEART as a
+                    // vector of the test's choosing.
+                    let vector = 16 + 8 * u32::from(w - 9) + u32::from(device);
+                    set(reg::int_host(u32::from(device)), vector);
+                    set(reg::INT_ENABLE, 1 << device);
+                    assert_eq!(m.heart.pending() >> vector & 1, 0);
+                    card.state().irq().unwrap().set(true);
+                    assert_eq!(m.heart.pending() >> vector & 1, 1, "port {w} slot {device}: HEART's bit {vector}");
+
+                    // Its DMA, through the direct map to HEART, into RAM.
+                    let at = u64::from(vector) * 16;
+                    assert!(card.state().dma().unwrap().dma_write(0x8000_0000 + at, &[1, 2, 3, 4]).is_ok());
+                    assert_eq!(m.ram.dma_view().read32(0x2000_0000 + at).data, u32::from_be_bytes([4, 3, 2, 1]), "port {w} slot {device}: DMA reached memory");
+                }
             }
         }).unwrap().join().unwrap();
     }

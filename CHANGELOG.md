@@ -46,9 +46,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Octane XIO option boards
 
 - `[[xio_board]]` fits a PCI shoehorn, the single-slot XIO-to-PCI adapter, in
-  one of the Octane's four XIO slots. It is a Bridge of its own on that
-  Crossbow port with a PCI bus of one slot (device 1), interrupts to HEART and
-  DMA through the Crossbow ([docs/pci.md](docs/pci.md#option-boards-in-xio-slots)).
+  one of the Octane's four XIO slots, and the Octane's PCI module (the card
+  cage, three slots) in its own port, 13. Each is a Bridge of its own on that
+  Crossbow port with a PCI bus, interrupts to HEART and DMA through the
+  Crossbow ([docs/pci.md](docs/pci.md#option-boards-in-xio-slots)).
 
 ### R10000 family fixes, R12000 and R14000
 

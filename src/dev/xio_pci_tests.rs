@@ -63,6 +63,8 @@ impl BusDevice for Mem {
 }
 
 const HEART_WIDGET: u32 = 8;
+/// A Bridge revision the machine would hand a PCI module, not the default.
+const MACHINE_REVISION: u32 = 3;
 
 struct Rig {
     board: XioPciBoard,
@@ -74,7 +76,7 @@ impl Rig {
     fn new(kind: Kind, widget: u8) -> Self {
         let heart = Arc::new(Heart::default());
         let mem = Arc::new(Mem(Mutex::new(vec![0; 0x10_0000])));
-        let board = XioPciBoard::new(kind, widget, Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()));
+        let board = XioPciBoard::new(kind, widget, Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()), MACHINE_REVISION);
         Rig { board, heart, mem }
     }
 
@@ -147,6 +149,24 @@ fn a_shoehorn_is_a_bridge_with_revision_4_and_a_record() {
     assert_eq!(family, 0x0b);
 }
 
+#[test]
+fn the_pci_module_reports_the_machines_bridge_revision_and_a_record() {
+    let rig = Rig::new(Kind::Cage, crate::dev::xio_pci::CAGE_WIDGET);
+    let id = identity_word(&rig);
+    assert_eq!(id >> 12 & 0xffff, 0xc002);
+    assert_eq!(id >> 28, MACHINE_REVISION);
+    // A part answers the reset pulse by pulling the line low.
+    rig.set(reg::NIC, 500 << 10 | 65 << 2);
+    assert_eq!(rig.get(reg::NIC) & 3, 2);
+}
+
+#[test]
+fn the_boards_have_the_slots_the_documents_number() {
+    assert_eq!(Kind::Shoehorn.slots(), [1]);
+    assert_eq!(Kind::Cage.slots(), [1, 2, 3]);
+    assert_eq!(crate::dev::xio_pci::CAGE_WIDGET, 13);
+}
+
 /// A function in each slot answers configuration reads through the
 /// widget's window; every other device position times out.
 fn each_slot_answers(kind: Kind, widget: u8) {
@@ -168,6 +188,36 @@ fn each_slot_answers(kind: Kind, widget: u8) {
 #[test]
 fn the_shoehorns_slot_answers_configuration_reads() {
     each_slot_answers(Kind::Shoehorn, 12);
+}
+
+#[test]
+fn each_slot_of_the_pci_module_answers_configuration_reads() {
+    each_slot_answers(Kind::Cage, 13);
+}
+
+#[test]
+fn the_flash_aperture_reads_all_ones_and_ignores_writes() {
+    let rig = Rig::new(Kind::Shoehorn, 10);
+    for off in [0xc0_0000u32, 0xc0_0004, 0xdf_fffc, 0xe0_0000, 0xff_fffc] {
+        assert_eq!(rig.bridge().read32(u64::from(off)).data, 0xffff_ffff, "{off:#x}");
+    }
+    // Writes are refused while the control register's write enable is clear.
+    assert_ne!(rig.bridge().write16(0xc0_0000, 0x1234), BUS_OK);
+}
+
+#[test]
+fn a_function_goes_only_in_a_free_slot_the_board_has() {
+    let rig = Rig::new(Kind::Cage, 13);
+    let card = TestCard::new([Bar::Unused; 6], 0);
+    assert!(rig.board.attach(0, card.clone()).is_err(), "device 0 is not a slot");
+    assert!(rig.board.attach(4, card.clone()).is_err(), "nor is device 4");
+    assert_eq!(rig.board.free_slot(), Some(1));
+    rig.board.attach(1, card.clone()).unwrap();
+    assert!(rig.board.attach(1, card.clone()).is_err(), "slot 1 is taken");
+    assert_eq!(rig.board.free_slot(), Some(2));
+    rig.board.attach(2, TestCard::new([Bar::Unused; 6], 0)).unwrap();
+    rig.board.attach(3, TestCard::new([Bar::Unused; 6], 0)).unwrap();
+    assert_eq!(rig.board.free_slot(), None);
 }
 
 /// INTA of a slot reaches the Bridge pin numbered as the device, INTB that
@@ -198,6 +248,11 @@ fn a_shoehorn_cards_interrupts_reach_heart() {
     interrupts(Kind::Shoehorn, 10);
 }
 
+#[test]
+fn the_pci_modules_interrupts_reach_heart() {
+    interrupts(Kind::Cage, 13);
+}
+
 /// A function's DMA goes through the Bridge's direct map to the memory the
 /// board was given. The default direct map names no widget that is memory.
 fn dma(kind: Kind, widget: u8) {
@@ -225,28 +280,9 @@ fn a_shoehorn_cards_dma_reaches_memory() {
     dma(Kind::Shoehorn, 9);
 }
 
-
 #[test]
-fn the_flash_aperture_reads_all_ones_and_ignores_writes() {
-    let rig = Rig::new(Kind::Shoehorn, 10);
-    for off in [0xc0_0000u32, 0xc0_0004, 0xdf_fffc, 0xe0_0000, 0xff_fffc] {
-        assert_eq!(rig.bridge().read32(u64::from(off)).data, 0xffff_ffff, "{off:#x}");
-    }
-    // Writes are refused while the control register's write enable is clear.
-    assert_ne!(rig.bridge().write16(0xc0_0000, 0x1234), BUS_OK);
-}
-
-#[test]
-fn a_function_goes_only_in_the_free_slot_the_board_has() {
-    let rig = Rig::new(Kind::Shoehorn, 10);
-    let card = TestCard::new([Bar::Unused; 6], 0);
-    assert_eq!(Kind::Shoehorn.slots(), [1]);
-    assert!(rig.board.attach(0, card.clone()).is_err(), "device 0 is not the slot");
-    assert!(rig.board.attach(2, card.clone()).is_err(), "nor is device 2");
-    assert_eq!(rig.board.free_slot(), Some(1));
-    rig.board.attach(1, card).unwrap();
-    assert!(rig.board.attach(1, TestCard::new([Bar::Unused; 6], 0)).is_err(), "the slot is taken");
-    assert_eq!(rig.board.free_slot(), None);
+fn a_pci_module_cards_dma_reaches_memory() {
+    dma(Kind::Cage, 13);
 }
 
 #[test]
@@ -254,8 +290,8 @@ fn two_boards_keep_their_own_interrupt_state() {
     let heart = Arc::new(Heart::default());
     let mem: Arc<dyn BusDevice> = Arc::new(Mem(Mutex::new(vec![0; 0x1000])));
     let up = || Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone());
-    let one = XioPciBoard::new(Kind::Shoehorn, 10, up());
-    let two = XioPciBoard::new(Kind::Shoehorn, 12, up());
+    let one = XioPciBoard::new(Kind::Shoehorn, 12, up(), 3);
+    let two = XioPciBoard::new(Kind::Cage, 13, up(), 3);
     let a = TestCard::new([Bar::Unused; 6], PCI_INTA);
     let b = TestCard::new([Bar::Unused; 6], PCI_INTA);
     one.attach(1, a.clone()).unwrap();
