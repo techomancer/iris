@@ -764,8 +764,14 @@ pub(crate) mod tests {
                 report.bytes_read_back,
                 report.fallback_reasons,
             );
+            if let Some(telemetry) = &report.telemetry {
+                eprintln!("{path}: GPU telemetry={telemetry:?}");
+            }
             if let Some(error) = &report.error {
                 return Err(format!("GPU replay failed: {error}"));
+            }
+            if let Some(error) = &report.timestamp_error {
+                return Err(format!("GPU timestamp profiling failed: {error}"));
             }
             if report.handled_draws == 0 || report.submissions == 0 {
                 return Err(

@@ -1,9 +1,9 @@
 # Feature-completion backlog
 
 Reviewed against repository code through `862d0fe` on **2026-10-07**;
-re-audited through `3a3caeb0` on **2026-10-21**. No item was found complete.
-IMPACT buffer formats made real progress and its entry now lists only what is
-left; the Ethernet FIXME moved to `src/net/engine.rs`.
+re-audited through `3a3caeb0` on **2026-10-21**. No item was found complete
+at that review. IMPACT buffer formats made real progress and its entry now
+lists only what is left; the Ethernet FIXME moved to `src/net/engine.rs`.
 
 The old scratch list (`TODO_archive.md`) has been deleted. Its entries marked
 DONE were done; its open reports are quoted in the items below that cite
@@ -21,9 +21,10 @@ projects. High-level graphics emulation is the current implementation strategy.
 **Implementation** identifies a gap visible in current source. **Validation**
 identifies behavior that needs an observed guest/host test before it can be
 considered complete. **Triage** retains an old report that must be reproduced
-before treating it as a current bug. Items below are proposed work, not fixes
-performed by the documentation review. Each checkbox includes its completion
-condition; update the linked guide and changelog when it lands.
+before treating it as a current bug. Open items below are proposed work, not
+fixes performed by the documentation review; checked items record later
+milestones. Each checkbox includes its completion condition; update the linked
+guide and changelog when it lands.
 
 ## First: complete restore and CPU correctness
 
@@ -125,6 +126,30 @@ condition; update the linked guide and changelog when it lands.
 
 ## Graphics
 
+- [x] **Measurement — REX3 live telemetry and synthetic baseline.** Completed
+  locally on 2026-11-06: opt-in accounting and bounded timestamps, the adaptive
+  telemetry A/A gate, and the corrected seeded five-sample Vulkan gate. The
+  stable telemetry A/A passed; the live renderer failed both speed gates and
+  is not ready to submit. Details:
+  [REX3 GPU profiling and gates](rex3/live-gpu-profiling-and-gates.md).
+- [ ] **Prerequisites — REX3 guest capture, strict corpus, and recovery.**
+  Capture representative IRIX draw, fallback, HOSTRW, and observation workloads
+  privately; share only safe aggregates or redistributable synthetic cases.
+  Make the corpus non-empty and fail rather than silently pass when recordings
+  or expected GPU-handled draws are absent. Compare interpreter, CPU JIT, and
+  GPU framebuffer, context, reads, overlaps, fallback, snapshots, and checkpoint
+  behavior; cover GFIFO back-pressure and display fences. Define and fault-test
+  recovery from device loss and readback errors so pending draws are not lost
+  and CPU fallback never uses stale pixels. Complete before the parallelism
+  experiment, with evidence across available backends.
+- [ ] **Experiment — conflict-free REX3 epochs/tiles.** After the capture,
+  corpus, and recovery prerequisites, test parallel conflict-free epochs or
+  order-preserving tile work against the single-workgroup serial bottleneck.
+  Split dispatches at global barriers and cross-tile hazards; preserve
+  overlapping draw order, CPU fallback, and fence/readback boundaries;
+  rerun the strict corpus and the five-sample 1.20x raster / 0.95x tiny gates.
+  Consider native Vulkan only if measurements isolate material wgpu-specific
+  overhead, not merely because the present shader is slow.
 - [ ] **Implementation — VPro quad worker pool.** Balance shading and stores over a pool fed by the rasteriser in batches of ~16 quads, the rasteriser running a quad itself when the pool is dry, in-order completion by atomics per 8x8-grid position. See `clanker/plans/odyssey-quad-pipeline.md`, "Idea: a quad worker pool".
 - [ ] **Implementation — VPro memory access, specialised.** Board-memory
   access goes through run-time field decoding per pixel (`odyssey/view.rs`).

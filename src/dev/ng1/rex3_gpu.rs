@@ -2,21 +2,33 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use parking_lot::Mutex;
 use wgpu::util::DeviceExt;
 
 use super::rex3::{
-    CLIPMODE_CIDMATCH_MASK, CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_MASK,
-    DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_BLOCK_SH, DRAWMODE0_ADRMODE_SPAN,
-    DRAWMODE0_ADRMODE_SPAN_SH, DRAWMODE0_OPCODE_DRAW, DRAWMODE1_COMPARE_DISABLE,
-    DRAWMODE1_COMPARE_DISABLE_SH, DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC,
-    DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_RGB, DrawMode0, DrawMode1, OCTANT_XDEC, OCTANT_YDEC,
-    REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH, Rex3Context,
+    DrawMode0, DrawMode1, Rex3Context, CLIPMODE_CIDMATCH_MASK, CLIPMODE_CIDMATCH_SHIFT,
+    CLIPMODE_ENSMASK_MASK, DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_BLOCK_SH,
+    DRAWMODE0_ADRMODE_SPAN, DRAWMODE0_ADRMODE_SPAN_SH, DRAWMODE0_OPCODE_DRAW,
+    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_COMPARE_DISABLE_SH, DRAWMODE1_DRAWDEPTH_24,
+    DRAWMODE1_LOGICOP_SRC, DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_RGB, OCTANT_XDEC,
+    OCTANT_YDEC, REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
 use super::rex3_dirty::{DamagePlane, DamageRect, DamageSnapshot};
+
+#[path = "rex3_gpu_telemetry.rs"]
+mod telemetry;
+pub(crate) use telemetry::FlushReason;
+#[cfg(test)]
+pub(crate) use telemetry::{
+    abba_log_rate_ratio, live_aa_stop, live_gate_stats, log_rate_ratio, paired_order_shift,
+    paired_rate_stats, paired_rate_stats_with_alpha, require_usable_timestamps, LiveAaOptions,
+    LiveAaStop,
+};
+use telemetry::{record_timestamp, timestamp_duration_ns};
+pub use telemetry::{FlushCounts, ReplayReport, StageTelemetry, TimestampSupport, TimestampTotals};
 
 const FB_STRIDE: u32 = 2048;
 const FB_PIXELS: usize = FB_STRIDE as usize * REX3_SCREEN_HEIGHT as usize;
@@ -25,6 +37,12 @@ const DEFAULT_MAX_BATCH_DRAWS: usize = 1024;
 const MAX_CONFIGURED_BATCH_DRAWS: usize = 65536;
 const MAP_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_STACK_BYTES: usize = 8 * 1024 * 1024;
+const DRAW_TIMING_SAMPLE_INTERVAL: u64 = 256;
+const MAX_PENDING_TIMESTAMP_SUBMISSIONS: usize = 64;
+
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestedBackend {
@@ -74,6 +92,7 @@ pub struct AdapterDiagnostics {
     pub max_storage_buffer_binding_size: u64,
     pub max_compute_workgroups_per_dimension: u32,
     pub max_batch_draws: usize,
+    pub timestamps: TimestampSupport,
 }
 
 impl fmt::Display for AdapterDiagnostics {
@@ -81,7 +100,8 @@ impl fmt::Display for AdapterDiagnostics {
         write!(
             f,
             "backend={:?} adapter={:?} type={:?} driver={:?} driver_info={:?} \
-             max_storage_buffer={} max_workgroups={} batch_draws={}",
+             max_storage_buffer={} max_workgroups={} batch_draws={} \
+             gpu_timestamps={:?} gpu_upload_timing=unavailable(queue.write_buffer)",
             self.backend,
             self.name,
             self.device_type,
@@ -90,21 +110,9 @@ impl fmt::Display for AdapterDiagnostics {
             self.max_storage_buffer_binding_size,
             self.max_compute_workgroups_per_dimension,
             self.max_batch_draws,
+            self.timestamps,
         )
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ReplayReport {
-    pub handled_draws: u64,
-    pub fallback_draws: u64,
-    pub fallback_reasons: std::collections::BTreeMap<String, u64>,
-    pub submissions: u64,
-    pub fences: u64,
-    pub bytes_uploaded: u64,
-    pub bytes_read_back: u64,
-    pub pending_draws: usize,
-    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +133,32 @@ enum FlatFillMatch {
     Unsupported(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProfilingOptions {
+    pub telemetry: bool,
+    pub timestamps: bool,
+}
+
+fn profiling_flag(name: &str) -> Result<bool, String> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) => Err(format!("{name}={value}: expected 0 or 1")),
+        Err(error) => Err(format!("read {name}: {error}")),
+    }
+}
+
+impl ProfilingOptions {
+    fn from_env() -> Result<Self, String> {
+        let timestamps = profiling_flag("REX3_GPU_TIMESTAMPS")?;
+        Ok(Self {
+            telemetry: profiling_flag("REX3_GPU_TELEMETRY")? || timestamps,
+            timestamps,
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct FlatFill {
@@ -136,6 +170,22 @@ struct FlatFill {
     write_mask: u32,
     stride: u32,
     plane_len: u32,
+}
+
+struct TimestampResources {
+    queries: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    count: u32,
+    compute_index: Option<u32>,
+    transfer_index: Option<u32>,
+}
+
+struct PendingTimestamps {
+    readback: wgpu::Buffer,
+    bytes: u64,
+    compute_index: Option<u32>,
+    transfer_index: Option<u32>,
 }
 
 pub struct Rex3Gpu {
@@ -154,10 +204,19 @@ pub struct Rex3Gpu {
     diagnostics: AdapterDiagnostics,
     report: ReplayReport,
     async_error: Arc<Mutex<Option<String>>>,
+    timestamp_period: f32,
+    timestamp_pending: Vec<PendingTimestamps>,
 }
 
 impl Rex3Gpu {
     pub fn new(backend: &str) -> Result<Self, String> {
+        Self::new_with_options(backend, ProfilingOptions::from_env()?)
+    }
+
+    pub(crate) fn new_with_options(
+        backend: &str,
+        options: ProfilingOptions,
+    ) -> Result<Self, String> {
         let requested = RequestedBackend::parse(backend)?;
         let max_batch_draws = match std::env::var("REX3_GPU_BATCH_DRAWS") {
             Ok(value) => {
@@ -176,7 +235,7 @@ impl Rex3Gpu {
         };
         let mut failures = Vec::new();
         for (name, backends) in requested.candidates() {
-            match Self::new_for_backend(backends, max_batch_draws) {
+            match Self::new_for_backend(backends, max_batch_draws, options) {
                 Ok(gpu) => return Ok(gpu),
                 Err(error) => failures.push(format!("{name}: {error}")),
             }
@@ -187,18 +246,24 @@ impl Rex3Gpu {
         ))
     }
 
-    fn new_for_backend(backends: wgpu::Backends, max_batch_draws: usize) -> Result<Self, String> {
+    fn new_for_backend(
+        backends: wgpu::Backends,
+        max_batch_draws: usize,
+        options: ProfilingOptions,
+    ) -> Result<Self, String> {
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = backends;
         let instance = wgpu::Instance::new(instance_desc);
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|error| format!("request adapter: {error}"))?;
+        let request_adapter = || {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            }))
+        };
+        let adapter = request_adapter().map_err(|error| format!("request adapter: {error}"))?;
 
-        let info = adapter.get_info();
-        let limits = adapter.limits();
+        let mut info = adapter.get_info();
+        let mut limits = adapter.limits();
         if limits.max_storage_buffer_binding_size < FB_BYTES {
             return Err(format!(
                 "{} only exposes a {}-byte storage binding; REX3 RGB needs {FB_BYTES} bytes",
@@ -206,14 +271,62 @@ impl Rex3Gpu {
             ));
         }
 
-        let descriptor = wgpu::DeviceDescriptor {
+        let features = adapter.features();
+        let mut timestamp_support = if !options.timestamps {
+            TimestampSupport::Disabled
+        } else if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            TimestampSupport::Unsupported("adapter does not expose TIMESTAMP_QUERY")
+        } else {
+            TimestampSupport::Enabled {
+                readback_transfer: features
+                    .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            }
+        };
+        let mut required_features = wgpu::Features::empty();
+        if let TimestampSupport::Enabled { readback_transfer } = timestamp_support {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+            if readback_transfer {
+                required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            }
+        }
+        let mut descriptor = wgpu::DeviceDescriptor {
             label: Some("IRIS REX3 replay device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             ..Default::default()
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
-            .map_err(|error| format!("request device for {}: {error}", info.name))?;
+        let (device, queue) = match pollster::block_on(adapter.request_device(&descriptor)) {
+            Ok(device) => device,
+            Err(error) if !required_features.is_empty() => {
+                timestamp_support = TimestampSupport::Unavailable(format!(
+                    "device rejected optional timestamp features: {error}"
+                ));
+                descriptor.required_features = wgpu::Features::empty();
+                let fallback = request_adapter().map_err(|retry| {
+                    format!("timestamp device request failed ({error}); request fallback adapter: {retry}")
+                })?;
+                info = fallback.get_info();
+                limits = fallback.limits();
+                if limits.max_storage_buffer_binding_size < FB_BYTES {
+                    return Err(format!(
+                        "{} only exposes a {}-byte storage binding; REX3 RGB needs {FB_BYTES} bytes",
+                        info.name, limits.max_storage_buffer_binding_size
+                    ));
+                }
+                pollster::block_on(fallback.request_device(&descriptor)).map_err(|retry| {
+                    format!("timestamp device request failed ({error}); request device for {} without timestamps: {retry}", info.name)
+                })?
+            }
+            Err(error) => return Err(format!("request device for {}: {error}", info.name)),
+        };
+        let timestamp_period = queue.get_timestamp_period();
+        if matches!(timestamp_support, TimestampSupport::Enabled { .. })
+            && (!timestamp_period.is_finite() || timestamp_period <= 0.0)
+        {
+            timestamp_support = TimestampSupport::Unavailable(format!(
+                "invalid GPU timestamp period {timestamp_period}"
+            ));
+        }
 
         let async_error = Arc::new(Mutex::new(None));
         let uncaptured = Arc::clone(&async_error);
@@ -283,10 +396,29 @@ impl Rex3Gpu {
                 max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
                 max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
                 max_batch_draws,
+                timestamps: timestamp_support.clone(),
             },
-            report: ReplayReport::default(),
+            report: ReplayReport {
+                timestamp_support: timestamp_support.clone(),
+                telemetry: (options.telemetry || options.timestamps)
+                    .then(|| Self::new_telemetry(&timestamp_support)),
+                ..ReplayReport::fresh()
+            },
             async_error,
+            timestamp_period,
+            timestamp_pending: Vec::new(),
         })
+    }
+
+    fn new_telemetry(timestamps: &TimestampSupport) -> StageTelemetry {
+        let mut telemetry = StageTelemetry::default();
+        if let TimestampSupport::Enabled { readback_transfer } = timestamps {
+            telemetry.gpu_compute = Some(TimestampTotals::default());
+            if *readback_transfer {
+                telemetry.gpu_readback_transfer = Some(TimestampTotals::default());
+            }
+        }
+        telemetry
     }
 
     pub fn diagnostics(&self) -> &AdapterDiagnostics {
@@ -296,10 +428,36 @@ impl Rex3Gpu {
     pub fn report(&self) -> ReplayReport {
         let mut report = self.report.clone();
         report.pending_draws = self.pending.len();
+        report.timestamp_support = self.diagnostics.timestamps.clone();
         if report.error.is_none() {
             report.error = self.async_error.lock().clone();
         }
         report
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_telemetry_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if !self.pending.is_empty() || self.submitted_work {
+            return Err("cannot change telemetry while GPU work is pending".into());
+        }
+        if !enabled
+            && matches!(
+                self.diagnostics.timestamps,
+                TimestampSupport::Enabled { .. }
+            )
+        {
+            return Err("cannot disable telemetry while GPU timestamps are enabled".into());
+        }
+        if enabled {
+            if self.report.telemetry.is_none() {
+                self.report.telemetry = Some(Self::new_telemetry(&self.diagnostics.timestamps));
+                self.report.advance_counter_epoch();
+            }
+        } else if self.report.telemetry.is_some() {
+            self.report.telemetry = None;
+            self.report.advance_counter_epoch();
+        }
+        Ok(())
     }
 
     pub fn note_fallback(&mut self, reason: &'static str) {
@@ -317,7 +475,33 @@ impl Rex3Gpu {
         rgb: &[u32],
     ) -> Result<EnqueueResult, String> {
         self.check_async_error()?;
-        let fill = match flat_fill(context) {
+        let sample_start = self.report.telemetry.as_mut().and_then(|telemetry| {
+            telemetry.match_attempts += 1;
+            (telemetry.match_attempts % DRAW_TIMING_SAMPLE_INTERVAL == 0).then(Instant::now)
+        });
+        let fill = flat_fill(context);
+        let enqueue_start = sample_start.map(|start| {
+            let now = Instant::now();
+            if let Some(telemetry) = &mut self.report.telemetry {
+                telemetry.sampled_match_ns += now.duration_since(start).as_nanos() as u64;
+            }
+            now
+        });
+        let result = self.enqueue_matched(context, rgb, fill);
+        if let (Some(start), Some(telemetry)) = (enqueue_start, &mut self.report.telemetry) {
+            telemetry.sampled_draws += 1;
+            telemetry.sampled_enqueue_ns += elapsed_ns(start);
+        }
+        result
+    }
+
+    fn enqueue_matched(
+        &mut self,
+        context: &mut Rex3Context,
+        rgb: &[u32],
+        fill: FlatFillMatch,
+    ) -> Result<EnqueueResult, String> {
+        let fill = match fill {
             FlatFillMatch::Supported(fill) => fill,
             FlatFillMatch::Unsupported(reason) => {
                 return Ok(EnqueueResult::Unsupported(reason));
@@ -335,8 +519,12 @@ impl Rex3Gpu {
                         rgb.len()
                     ));
                 }
+                let upload_start = self.report.telemetry.as_ref().map(|_| Instant::now());
                 self.queue
                     .write_buffer(&self.rgb, 0, bytemuck::cast_slice(rgb));
+                if let (Some(start), Some(telemetry)) = (upload_start, &mut self.report.telemetry) {
+                    telemetry.upload_enqueue_ns += elapsed_ns(start);
+                }
                 self.report.bytes_uploaded += FB_BYTES;
                 self.gpu_current = true;
             }
@@ -355,23 +543,31 @@ impl Rex3Gpu {
         Ok(EnqueueResult::Enqueued)
     }
 
-    pub(crate) fn submit(&mut self) -> Result<(), String> {
-        let result = self.submit_inner(false).map(|_| ());
+    pub(crate) fn submit(&mut self, reason: FlushReason) -> Result<(), String> {
+        let result = self.submit_inner(false, reason).map(|_| ());
         if let Err(error) = &result {
             self.report.error = Some(error.clone());
         }
         result
     }
 
-    pub(crate) fn flush(&mut self, rgb: &mut [u32]) -> Result<DamageSnapshot, String> {
-        let result = self.flush_inner(rgb);
+    pub(crate) fn flush(
+        &mut self,
+        rgb: &mut [u32],
+        reason: FlushReason,
+    ) -> Result<DamageSnapshot, String> {
+        let result = self.flush_inner(rgb, reason);
         if let Err(error) = &result {
             self.report.error = Some(error.clone());
         }
         result
     }
 
-    fn flush_inner(&mut self, rgb: &mut [u32]) -> Result<DamageSnapshot, String> {
+    fn flush_inner(
+        &mut self,
+        rgb: &mut [u32],
+        reason: FlushReason,
+    ) -> Result<DamageSnapshot, String> {
         self.check_async_error()?;
         if self.pending.is_empty() && !self.submitted_work {
             return Ok(DamageSnapshot::default());
@@ -384,28 +580,62 @@ impl Rex3Gpu {
         }
 
         let submission = self
-            .submit_inner(true)?
+            .submit_inner(true, reason)?
             .ok_or_else(|| "REX3 GPU readback requested without submitted work".to_owned())?;
 
+        let map_start = self.report.telemetry.as_ref().map(|_| Instant::now());
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         self.readback
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = sender.send(result);
             });
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(MAP_TIMEOUT),
+        let timestamp_receivers: Vec<_> = self
+            .timestamp_pending
+            .iter()
+            .map(|pending| {
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                pending
+                    .readback
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = sender.send(result);
+                    });
+                receiver
             })
-            .map_err(|error| format!("wait for REX3 GPU batch: {error}"))?;
+            .collect();
+        if let (Some(start), Some(telemetry)) = (map_start, &mut self.report.telemetry) {
+            telemetry.map_request_ns += elapsed_ns(start);
+        }
+        let wait_start = self.report.telemetry.as_ref().map(|_| Instant::now());
+        let wait_result = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(MAP_TIMEOUT),
+        });
+        if let (Some(start), Some(telemetry)) = (wait_start, &mut self.report.telemetry) {
+            telemetry.device_wait_ns += elapsed_ns(start);
+        }
+        wait_result.map_err(|error| format!("wait for REX3 GPU batch: {error}"))?;
         self.report.fences += 1;
-        receiver
+        let callback_start = self.report.telemetry.as_ref().map(|_| Instant::now());
+        let callback_result = receiver
             .recv_timeout(MAP_TIMEOUT)
-            .map_err(|error| format!("wait for REX3 GPU readback callback: {error}"))?
-            .map_err(|error| format!("map REX3 GPU readback: {error}"))?;
+            .map_err(|error| format!("wait for REX3 GPU readback callback: {error}"));
+        if let (Some(start), Some(telemetry)) = (callback_start, &mut self.report.telemetry) {
+            telemetry.map_callback_wait_ns += elapsed_ns(start);
+        }
+        callback_result?.map_err(|error| format!("map REX3 GPU readback: {error}"))?;
         self.check_async_error()?;
 
+        if !timestamp_receivers.is_empty() {
+            if let Err(error) = self.collect_timestamps(timestamp_receivers) {
+                log::error!("REX3 GPU timestamp profiling unavailable: {error}");
+                self.report.timestamp_collection_failed(error.clone());
+                self.diagnostics.timestamps = TimestampSupport::Unavailable(error);
+            }
+        }
+
+        let copy_start = self.report.telemetry.as_ref().map(|_| Instant::now());
         {
             let mapped = self
                 .readback
@@ -416,6 +646,9 @@ impl Rex3Gpu {
             rgb.copy_from_slice(words);
         }
         self.readback.unmap();
+        if let (Some(start), Some(telemetry)) = (copy_start, &mut self.report.telemetry) {
+            telemetry.cpu_readback_copy_ns += elapsed_ns(start);
+        }
         self.submitted_work = false;
         self.report.bytes_read_back += FB_BYTES;
         Ok(std::mem::take(&mut self.submitted_damage))
@@ -424,12 +657,14 @@ impl Rex3Gpu {
     fn submit_inner(
         &mut self,
         copy_to_readback: bool,
+        reason: FlushReason,
     ) -> Result<Option<wgpu::SubmissionIndex>, String> {
         self.check_async_error()?;
         if self.pending.is_empty() && (!copy_to_readback || !self.submitted_work) {
             return Ok(None);
         }
 
+        let resource_start = self.report.telemetry.as_ref().map(|_| Instant::now());
         let fill_buffer = if self.pending.is_empty() {
             None
         } else {
@@ -458,7 +693,12 @@ impl Rex3Gpu {
                 ],
             })
         });
+        let timestamps = self.timestamp_resources(!self.pending.is_empty(), copy_to_readback);
 
+        if let (Some(start), Some(telemetry)) = (resource_start, &mut self.report.telemetry) {
+            telemetry.resource_creation_ns += elapsed_ns(start);
+        }
+        let encode_start = self.report.telemetry.as_ref().map(|_| Instant::now());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -467,16 +707,62 @@ impl Rex3Gpu {
         if let Some(bind_group) = &bind_group {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("IRIS REX3 flat-fill batch"),
-                timestamp_writes: None,
+                timestamp_writes: timestamps.as_ref().and_then(|timestamps| {
+                    timestamps
+                        .compute_index
+                        .map(|index| wgpu::ComputePassTimestampWrites {
+                            query_set: &timestamps.queries,
+                            beginning_of_pass_write_index: Some(index),
+                            end_of_pass_write_index: Some(index + 1),
+                        })
+                }),
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         if copy_to_readback {
+            if let Some(timestamps) = &timestamps {
+                if let Some(index) = timestamps.transfer_index {
+                    encoder.write_timestamp(&timestamps.queries, index);
+                }
+            }
             encoder.copy_buffer_to_buffer(&self.rgb, 0, &self.readback, 0, FB_BYTES);
+            if let Some(timestamps) = &timestamps {
+                if let Some(index) = timestamps.transfer_index {
+                    encoder.write_timestamp(&timestamps.queries, index + 1);
+                }
+            }
         }
-        let submission = self.queue.submit([encoder.finish()]);
+        if let Some(timestamps) = &timestamps {
+            let size = u64::from(timestamps.count) * u64::from(wgpu::QUERY_SIZE);
+            encoder.resolve_query_set(
+                &timestamps.queries,
+                0..timestamps.count,
+                &timestamps.resolve,
+                0,
+            );
+            encoder.copy_buffer_to_buffer(&timestamps.resolve, 0, &timestamps.readback, 0, size);
+        }
+        let commands = encoder.finish();
+        if let (Some(start), Some(telemetry)) = (encode_start, &mut self.report.telemetry) {
+            telemetry.command_encoding_ns += elapsed_ns(start);
+        }
+        let submit_start = self.report.telemetry.as_ref().map(|_| Instant::now());
+        let submission = self.queue.submit([commands]);
+        if let Some(timestamps) = timestamps {
+            self.timestamp_pending.push(PendingTimestamps {
+                readback: timestamps.readback,
+                bytes: u64::from(timestamps.count) * u64::from(wgpu::QUERY_SIZE),
+                compute_index: timestamps.compute_index,
+                transfer_index: timestamps.transfer_index,
+            });
+        }
+        if let (Some(start), Some(telemetry)) = (submit_start, &mut self.report.telemetry) {
+            telemetry.queue_submit_ns += elapsed_ns(start);
+            telemetry.record_batch(self.pending.len(), std::mem::size_of::<FlatFill>());
+            telemetry.flush_reasons.record(reason);
+        }
         self.report.submissions += 1;
         self.submitted_work = true;
         self.pending.clear();
@@ -484,13 +770,121 @@ impl Rex3Gpu {
         self.pending_damage = DamageSnapshot::default();
 
         if !copy_to_readback {
-            self.device
-                .poll(wgpu::PollType::Poll)
-                .map_err(|error| format!("poll after REX3 GPU submission: {error}"))?;
+            let poll_start = self.report.telemetry.as_ref().map(|_| Instant::now());
+            let poll_result = self.device.poll(wgpu::PollType::Poll);
+            if let (Some(start), Some(telemetry)) = (poll_start, &mut self.report.telemetry) {
+                telemetry.device_poll_ns += elapsed_ns(start);
+            }
+            poll_result.map_err(|error| format!("poll after REX3 GPU submission: {error}"))?;
             self.check_async_error()?;
         }
 
         Ok(Some(submission))
+    }
+
+    fn timestamp_resources(
+        &mut self,
+        compute: bool,
+        copy_to_readback: bool,
+    ) -> Option<TimestampResources> {
+        let TimestampSupport::Enabled { readback_transfer } = self.diagnostics.timestamps else {
+            return None;
+        };
+        let transfer = copy_to_readback && readback_transfer;
+        if !compute && !transfer {
+            return None;
+        }
+        // Keep one slot for the eventual readback without adding a wait to full batches.
+        let limit = if copy_to_readback {
+            MAX_PENDING_TIMESTAMP_SUBMISSIONS
+        } else {
+            MAX_PENDING_TIMESTAMP_SUBMISSIONS - 1
+        };
+        if self.timestamp_pending.len() >= limit {
+            if let Some(telemetry) = &mut self.report.telemetry {
+                telemetry.timestamp_submissions_skipped += 1;
+            }
+            return None;
+        }
+
+        let compute_index = compute.then_some(0);
+        let transfer_index = transfer.then_some(if compute { 2 } else { 0 });
+        let count = 2 * (u32::from(compute) + u32::from(transfer));
+        let size = u64::from(count) * u64::from(wgpu::QUERY_SIZE);
+        let queries = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("IRIS REX3 GPU timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count,
+        });
+        let resolve = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("IRIS REX3 timestamp resolve"),
+            size,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("IRIS REX3 timestamp readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(TimestampResources {
+            queries,
+            resolve,
+            readback,
+            count,
+            compute_index,
+            transfer_index,
+        })
+    }
+
+    fn collect_timestamps(
+        &mut self,
+        receivers: Vec<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    ) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.timestamp_pending);
+        if pending.len() != receivers.len() {
+            return Err("timestamp readback callback count does not match pending queries".into());
+        }
+        let start = self.report.telemetry.as_ref().map(|_| Instant::now());
+        for (pending, receiver) in pending.into_iter().zip(receivers) {
+            receiver
+                .recv_timeout(MAP_TIMEOUT)
+                .map_err(|error| format!("wait for timestamp readback callback: {error}"))?
+                .map_err(|error| format!("map timestamp readback: {error}"))?;
+            let (compute_ns, transfer_ns) = {
+                let mapped = pending
+                    .readback
+                    .slice(..)
+                    .get_mapped_range()
+                    .map_err(|error| format!("access timestamp readback: {error}"))?;
+                let compute = pending
+                    .compute_index
+                    .map(|index| timestamp_duration_ns(&mapped, index, self.timestamp_period))
+                    .transpose()?;
+                let transfer = pending
+                    .transfer_index
+                    .map(|index| timestamp_duration_ns(&mapped, index, self.timestamp_period))
+                    .transpose()?;
+                (compute, transfer)
+            };
+            pending.readback.unmap();
+            if let Some(telemetry) = &mut self.report.telemetry {
+                telemetry.timestamp_readback_bytes += pending.bytes;
+                if let (Some(duration), Some(total)) = (compute_ns, &mut telemetry.gpu_compute) {
+                    record_timestamp(total, duration)?;
+                }
+                if let (Some(duration), Some(total)) =
+                    (transfer_ns, &mut telemetry.gpu_readback_transfer)
+                {
+                    record_timestamp(total, duration)?;
+                }
+            }
+        }
+        if let (Some(start), Some(telemetry)) = (start, &mut self.report.telemetry) {
+            telemetry.timestamp_readback_ns += elapsed_ns(start);
+        }
+        Ok(())
     }
 
     pub(crate) fn cpu_framebuffer_changed(&mut self) {
@@ -570,7 +964,7 @@ fn probe_inner(backend: &str) -> Result<ProbeResult, String> {
     {
         return Err("flat-fill context progression did not match the CPU walker".into());
     }
-    let _ = gpu.flush(&mut rgb)?;
+    let _ = gpu.flush(&mut rgb, FlushReason::Explicit)?;
 
     let pixel = |x: usize, y: usize| rgb[y * FB_STRIDE as usize + x];
     let with_rgb = |color: u32| (initial & 0xFF00_0000) | color;
@@ -595,6 +989,9 @@ fn probe_inner(backend: &str) -> Result<ProbeResult, String> {
         || !gpu.pending.is_empty()
     {
         return Err(format!("unexpected probe report: {:?}", gpu.report()));
+    }
+    if let Some(error) = &gpu.report.timestamp_error {
+        return Err(format!("GPU timestamp profiling failed: {error}"));
     }
 
     Ok(ProbeResult {
@@ -789,6 +1186,202 @@ mod tests {
         assert_eq!(RequestedBackend::parse("dx12"), Ok(RequestedBackend::Dx12));
         assert!(RequestedBackend::parse("gl").is_err());
         assert!(RequestedBackend::parse("Vulkan").is_err());
+    }
+
+    #[test]
+    fn timestamp_telemetry_marks_unavailable_stages_absent() {
+        for support in [
+            TimestampSupport::Disabled,
+            TimestampSupport::Unsupported("test adapter"),
+            TimestampSupport::Unavailable("test device".into()),
+        ] {
+            let telemetry = Rex3Gpu::new_telemetry(&support);
+            assert_eq!(telemetry.gpu_compute, None);
+            assert_eq!(telemetry.gpu_readback_transfer, None);
+        }
+        let compute_only = Rex3Gpu::new_telemetry(&TimestampSupport::Enabled {
+            readback_transfer: false,
+        });
+        assert_eq!(compute_only.gpu_compute, Some(TimestampTotals::default()));
+        assert_eq!(compute_only.gpu_readback_transfer, None);
+        let both = Rex3Gpu::new_telemetry(&TimestampSupport::Enabled {
+            readback_transfer: true,
+        });
+        assert_eq!(both.gpu_compute, Some(TimestampTotals::default()));
+        assert_eq!(both.gpu_readback_transfer, Some(TimestampTotals::default()));
+    }
+
+    fn empty_enqueue_attempts(gpu: &mut Rex3Gpu, context: &mut Rex3Context, attempts: u64) {
+        let ystart = context.yend;
+        for _ in 0..attempts {
+            context.ystart = ystart;
+            let result = gpu.try_enqueue(context, &[]).expect("enqueue empty draw");
+            assert_eq!(result, EnqueueResult::Enqueued);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a conformant host GPU"]
+    fn gpu_empty_enqueue_can_repeat_timed_blocks() {
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        let mut gpu = Rex3Gpu::new_with_options(&backend, ProfilingOptions::default()).unwrap();
+        let mut context = context(DRAWMODE0_ADRMODE_BLOCK_SH, (0, 0), (7, 0));
+        context.wrmask = 0;
+        for enabled in [false, true, true, false] {
+            gpu.set_telemetry_enabled(enabled).unwrap();
+            empty_enqueue_attempts(&mut gpu, &mut context, 2);
+        }
+        assert_eq!(gpu.report().handled_draws, 8);
+        assert_eq!(gpu.report().submissions, 0);
+    }
+
+    #[test]
+    #[ignore = "hardware-dependent isolated matcher/enqueue telemetry measurement"]
+    fn gpu_empty_enqueue_telemetry_cost() {
+        // Long enough to reduce scheduling-quantum noise on typical hosts.
+        const ATTEMPTS: u64 = 256 * 32768;
+        const BLOCKS: usize = 16;
+
+        fn sample(gpu: &mut Rex3Gpu, context: &mut Rex3Context, enabled: bool) -> (f64, Instant) {
+            gpu.set_telemetry_enabled(enabled)
+                .expect("toggle idle telemetry");
+            let before = gpu.report();
+            let start = Instant::now();
+            empty_enqueue_attempts(gpu, context, ATTEMPTS);
+            let elapsed = start.elapsed();
+            let delta = gpu
+                .report()
+                .delta_since(&before)
+                .expect("enqueue telemetry delta");
+            assert_eq!(delta.handled_draws, ATTEMPTS);
+            assert_eq!(delta.fallback_draws, 0);
+            assert_eq!(delta.submissions, 0);
+            assert_eq!(delta.pending_draws, 0);
+            assert_eq!(delta.telemetry.is_some(), enabled);
+            if let Some(telemetry) = delta.telemetry {
+                assert_eq!(telemetry.match_attempts, ATTEMPTS);
+                assert_eq!(
+                    telemetry.sampled_draws,
+                    ATTEMPTS / DRAW_TIMING_SAMPLE_INTERVAL
+                );
+            }
+            (ATTEMPTS as f64 / elapsed.as_secs_f64(), start + elapsed / 2)
+        }
+
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        let mut gpu = Rex3Gpu::new_with_options(&backend, ProfilingOptions::default())
+            .expect("initialize GPU for isolated enqueue measurement");
+        let mut context = context(DRAWMODE0_ADRMODE_BLOCK_SH, (0, 0), (7, 0));
+        context.wrmask = 0;
+        for enabled in [false, true, true, false] {
+            sample(&mut gpu, &mut context, enabled);
+        }
+        let mut controls = Vec::with_capacity(BLOCKS);
+        let mut effects = Vec::with_capacity(BLOCKS);
+        let mut orders = Vec::with_capacity(BLOCKS);
+        for block in 0..BLOCKS {
+            let aa = [
+                sample(&mut gpu, &mut context, false),
+                sample(&mut gpu, &mut context, false),
+            ]
+            .map(|sample| sample.0);
+            let (a, b) = if block % 2 == 0 {
+                (aa[0], aa[1])
+            } else {
+                (aa[1], aa[0])
+            };
+            controls.push(log_rate_ratio(a, b));
+            let on_first = block % 2 != 0;
+            let samples = [on_first, !on_first, !on_first, on_first]
+                .map(|enabled| sample(&mut gpu, &mut context, enabled));
+            let start = samples[0].1;
+            let rates = samples.map(|sample| sample.0);
+            let times = samples.map(|sample| sample.1.duration_since(start).as_secs_f64());
+            effects.push(abba_log_rate_ratio(rates, times, on_first));
+            orders.push(on_first);
+            eprintln!(
+                "enqueue block {}: A/A={aa:.0?} on_first={on_first} ABBA={rates:.0?}",
+                block + 1
+            );
+        }
+        let control = paired_rate_stats(&controls);
+        let effect = paired_rate_stats(&effects);
+        eprintln!(
+            "isolated empty-fill enqueue: A/A={control:?} telemetry={effect:?} order_shift={:.3}%; \
+             signed throughput ratios, no GPU submissions or GFIFO",
+            paired_order_shift(&effects, &orders) * 100.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a conformant host GPU with optional timestamps"]
+    fn gpu_timestamp_readback_is_bounded() {
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        let mut gpu = Rex3Gpu::new_with_options(
+            &backend,
+            ProfilingOptions {
+                telemetry: true,
+                timestamps: true,
+            },
+        )
+        .expect("initialize GPU timestamp test");
+        eprintln!("REX3 timestamp test {}", gpu.diagnostics());
+        let transfer = match &gpu.diagnostics().timestamps {
+            TimestampSupport::Enabled { readback_transfer } => *readback_transfer,
+            TimestampSupport::Unsupported(_) | TimestampSupport::Unavailable(_) => return,
+            TimestampSupport::Disabled => panic!("requested timestamps were reported disabled"),
+        };
+        let before = gpu.report();
+        let mut context = context(DRAWMODE0_ADRMODE_BLOCK_SH, (0, 0), (0, 0));
+        let color = context.get_colori() & 0x00FF_FFFF;
+        let mut rgb = vec![0; FB_PIXELS];
+        let draws = MAX_PENDING_TIMESTAMP_SUBMISSIONS + 1;
+        for _ in 0..draws {
+            context.ystart = context.yend;
+            assert_eq!(
+                gpu.try_enqueue(&mut context, &rgb).expect("enqueue draw"),
+                EnqueueResult::Enqueued
+            );
+            gpu.submit(FlushReason::BatchFull).expect("submit draw");
+        }
+        gpu.flush(&mut rgb, FlushReason::Explicit)
+            .expect("read back framebuffer and timestamps");
+        let delta = gpu.report().delta_since(&before).expect("timestamp delta");
+        assert_eq!(delta.error, None);
+        assert_eq!(delta.timestamp_error, None);
+        assert_eq!(delta.handled_draws, draws as u64);
+        assert_eq!(delta.fallback_draws, 0);
+        assert_eq!(delta.submissions, draws as u64 + 1);
+        assert_eq!(delta.fences, 1);
+        assert_eq!(rgb[0], color);
+        assert!(rgb[1..].iter().all(|pixel| *pixel == 0));
+
+        let telemetry = delta.telemetry.expect("timestamp telemetry");
+        assert_eq!(telemetry.batch_count, draws as u64);
+        assert_eq!(telemetry.batch_draws, draws as u64);
+        assert_eq!(telemetry.flush_reasons.batch_full, draws as u64);
+        assert_eq!(telemetry.flush_reasons.explicit, 1);
+        assert_eq!(telemetry.timestamp_submissions_skipped, 2);
+        let compute = telemetry.gpu_compute.expect("compute timestamps");
+        assert_eq!(
+            compute.count + compute.discarded,
+            (MAX_PENDING_TIMESTAMP_SUBMISSIONS - 1) as u64
+        );
+        require_usable_timestamps("compute", &compute).unwrap_or_else(|error| panic!("{error}"));
+        if transfer {
+            let transfer = telemetry
+                .gpu_readback_transfer
+                .expect("transfer timestamps");
+            assert_eq!(transfer.count + transfer.discarded, 1);
+            require_usable_timestamps("readback transfer", &transfer)
+                .unwrap_or_else(|error| panic!("{error}"));
+        } else {
+            assert_eq!(telemetry.gpu_readback_transfer, None);
+        }
+        assert_eq!(
+            telemetry.timestamp_readback_bytes,
+            (MAX_PENDING_TIMESTAMP_SUBMISSIONS as u64 - 1) * 16 + if transfer { 16 } else { 0 }
+        );
     }
 
     #[test]

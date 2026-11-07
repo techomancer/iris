@@ -202,6 +202,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | [hostrw-tests-must-use-partial-word-rows.md](rex3/hostrw-tests-must-use-partial-word-rows.md) | rule | HOSTRW tests must use rows that do not fill a whole 64-bit word |
 | [jit-reads-take-the-plane-bits.md](rex3/jit-reads-take-the-plane-bits.md) | rule | Compiled READ and SCR2SCR reads take the plane's bits, as the interpreter does |
 | [line-plus-host-not-jittable.md](rex3/line-plus-host-not-jittable.md) | rule | Lines with COLORHOST/ALPHAHOST: legal, but Cranelift refuses them |
+| [live-gpu-profiling-and-gates.md](rex3/live-gpu-profiling-and-gates.md) | measure | Live REX3 telemetry passes A/A, but the shader misses both speed gates |
 | [prefetch-primes-the-pio-read-pipeline.md](rex3/prefetch-primes-the-pio-read-pipeline.md) | rule | PREFETCH primes the PIO read pipeline — the `0xdeadbeef` GO is the primer |
 | [rex-jit-queue-retry.md](rex3/rex-jit-queue-retry.md) | rule | Retry rejected REX JIT compile requests |
 | [rex3-fline-fractional-bresenham.md](rex3/rex3-fline-fractional-bresenham.md) | open | REX3 F_LINE fractional Bresenham — fixes and open A_LINE follow-up |

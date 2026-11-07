@@ -15,6 +15,8 @@ use crate::dev::ng1::bt445::Bt445;
 use crate::dev::ng1::rex3_dirty::{DamagePlane, DamageRect};
 #[cfg(feature = "rex-dirty-upload")]
 use crate::dev::ng1::rex3_dirty::DamageTracker;
+#[cfg(feature = "rex-gpu")]
+use crate::dev::ng1::rex3_gpu::FlushReason;
 use bitfield::bitfield;
 use crate::disp::Rex3Screen;
 use std::io::Write;
@@ -1676,14 +1678,39 @@ impl Rex3 {
         self.gpu_replay.lock().as_ref().map(|gpu| gpu.report())
     }
 
+    #[cfg(all(feature = "rex-gpu", test))]
+    fn enable_gpu_replay_with_options(
+        &self,
+        backend: &str,
+        options: crate::dev::ng1::rex3_gpu::ProfilingOptions,
+    ) -> Result<crate::dev::ng1::rex3_gpu::AdapterDiagnostics, String> {
+        let mut slot = self.gpu_replay.lock();
+        if slot.is_some() {
+            return Err("REX3 GPU replay is already enabled".into());
+        }
+        let gpu = crate::dev::ng1::rex3_gpu::Rex3Gpu::new_with_options(backend, options)?;
+        let diagnostics = gpu.diagnostics().clone();
+        *slot = Some(gpu);
+        Ok(diagnostics)
+    }
+
+    #[cfg(all(feature = "rex-gpu", test))]
+    fn set_gpu_telemetry_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.gpu_replay
+            .lock()
+            .as_mut()
+            .ok_or_else(|| "REX3 GPU replay is not enabled".to_owned())?
+            .set_telemetry_enabled(enabled)
+    }
+
     #[cfg(feature = "rex-gpu")]
-    fn flush_gpu_replay(&self) {
+    fn flush_gpu_replay(&self, reason: FlushReason) {
         let mut slot = self.gpu_replay.lock();
         let Some(gpu) = slot.as_mut() else {
             return;
         };
         let rgb = unsafe { &mut *self.fb_rgb.get() };
-        match gpu.flush(rgb) {
+        match gpu.flush(rgb, reason) {
             Ok(damage) => self.fb_damage.publish(&damage),
             Err(error) => log::error!("REX3 GPU replay flush failed: {error}"),
         }
@@ -1703,7 +1730,7 @@ impl Rex3 {
             match result {
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Enqueued) => return true,
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::FlushRequired) => {
-                    if let Err(error) = gpu.submit() {
+                    if let Err(error) = gpu.submit(FlushReason::BatchFull) {
                         log::error!("REX3 GPU could not submit a full batch: {error}");
                         return false;
                     }
@@ -1711,7 +1738,7 @@ impl Rex3 {
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Unsupported(reason)) => {
                     gpu.note_fallback(reason);
                     let rgb = unsafe { &mut *self.fb_rgb.get() };
-                    match gpu.flush(rgb) {
+                    match gpu.flush(rgb, FlushReason::CpuFallback) {
                         Ok(damage) => {
                             self.fb_damage.publish(&damage);
                             gpu.cpu_framebuffer_changed();
@@ -2763,7 +2790,7 @@ impl Rex3 {
             std::hint::spin_loop();
         }
         #[cfg(feature = "rex-gpu")]
-        self.flush_gpu_replay();
+        self.flush_gpu_replay(FlushReason::WaitIdle);
     }
 
     fn register_processor(&self) {
@@ -2812,7 +2839,7 @@ impl Rex3 {
 
                 if exit {
                     #[cfg(feature = "rex-gpu")]
-                    self.flush_gpu_replay();
+                    self.flush_gpu_replay(FlushReason::Exit);
                     self.gfxbusy.store(false, Ordering::Release);
                     self.gfifo.flush_head();
                     break; 
@@ -2820,7 +2847,7 @@ impl Rex3 {
             } else {
                 if is_busy {
                     #[cfg(feature = "rex-gpu")]
-                    self.flush_gpu_replay();
+                    self.flush_gpu_replay(FlushReason::Idle);
                     self.gfxbusy.store(false, Ordering::Release);
                     is_busy = false;
                     //self.update_gfifo_irqs();
@@ -3481,7 +3508,7 @@ impl Rex3 {
             // Display thread spins on gfifo_fence >= sampled xmap_fence.
             GFIFO_DISP_SYNC => {
                 #[cfg(feature = "rex-gpu")]
-                self.flush_gpu_replay();
+                self.flush_gpu_replay(FlushReason::DisplayFence);
                 self.gfifo_fence.store(val64 as u32, Ordering::Release);
             }
             // PURE_GO sentinel (GO-only, no register write): no-op here; execute_go() is

@@ -1,5 +1,10 @@
 # GPU replay must flush before CPU fallback
 
+**Scope:** the merged replay-only implementation at `341ceda`. The local live
+experiment submits full batches without immediate readback, but still
+synchronizes at CPU observations and fallback; see
+[live GPU profiling and gates](live-gpu-profiling-and-gates.md).
+
 The replay-only `rex-gpu` path temporarily makes its wgpu RGB buffer
 authoritative while a supported batch is pending. The CPU framebuffer must be
 made current before any unsupported draw uses the interpreter, precompiled
@@ -27,7 +32,7 @@ integer RGB `SRC` blocks and spans. A multi-row block also requires
 for later rows, so any mismatch is not the rectangle the WGSL kernel executes.
 Unsupported states report a stable reason and take the synchronized CPU path.
 
-The current full-plane 8 MiB upload and 8 MiB readback are validation
+The full-plane 8 MiB upload and 8 MiB readback are validation
 boundaries, not the intended live architecture. On 2026-11-05 the RTX 5070
 probe completed two overlapping fills in one submission and one fence, with
 exact readback, zero fallbacks, and no wgpu error. `auto` selected Vulkan
