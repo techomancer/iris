@@ -63,3 +63,4 @@ pub mod z85c30;
 pub mod dp83843;
 pub mod ics1890;
 pub mod timekeeper;
+pub mod prom_image;
