@@ -67,6 +67,9 @@ pub enum LogModule {
     /// The Octane's HEART: processor-interface register accesses (not
     /// counter reads) and interrupt vectors raised and lowered.
     Heart = 33,
+    /// The NVM Express controller: register writes, controller state
+    /// changes, and the commands it runs (categories `NVME_LOG_*`).
+    Nvme = 34,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -74,8 +77,14 @@ pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path — verbose)
 pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
+// Mask bits for Nvme
+pub const NVME_LOG_STATE: u32 = 0x1;  // CC writes, CSTS changes, resets, fatal errors
+pub const NVME_LOG_ADMIN: u32 = 0x2;  // admin doorbells, commands and completions
+pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the doorbells
+pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
+
 impl LogModule {
-    pub const COUNT: usize = 34;
+    pub const COUNT: usize = 35;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -113,6 +122,7 @@ impl LogModule {
             "pci"    => Some(Self::Pci),
             "bridge" => Some(Self::Bridge),
             "heart"  => Some(Self::Heart),
+            "nvme"   => Some(Self::Nvme),
             _        => None,
         }
     }
@@ -153,6 +163,7 @@ impl LogModule {
             Self::Pci    => "pci",
             Self::Bridge => "bridge",
             Self::Heart  => "heart",
+            Self::Nvme   => "nvme",
         }
     }
 
@@ -164,7 +175,7 @@ impl LogModule {
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
-            Self::Hub, Self::Pci, Self::Bridge, Self::Heart,
+            Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
         ]
     }
 
@@ -204,6 +215,14 @@ impl LogModule {
                 if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
                 if s.is_empty() { format!("{:#010x}", mask) } else { s }
             }
+            Self::Nvme => {
+                let names = [(NVME_LOG_STATE, "state"), (NVME_LOG_ADMIN, "admin"), (NVME_LOG_REGS, "regs"), (NVME_LOG_IO, "io")];
+                let parts: Vec<&str> = names.iter().filter(|(b, _)| mask & b != 0).map(|(_, n)| *n).collect();
+                let rest = mask & !(NVME_LOG_STATE | NVME_LOG_ADMIN | NVME_LOG_REGS | NVME_LOG_IO);
+                let mut s = parts.join("+");
+                if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
+                if s.is_empty() { format!("{:#010x}", mask) } else { s }
+            }
             _ => format!("{:#010x}", mask),
         }
     }
@@ -235,6 +254,15 @@ impl LogModule {
                 "hit"  => Some(CACHE_LOG_HIT),
                 "miss" => Some(CACHE_LOG_MISS),
                 "op"   => Some(CACHE_LOG_OP),
+                "on" | "all"   => Some(0xFFFF_FFFF),
+                "off" | "none" => Some(0x0000_0000),
+                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
+            },
+            Self::Nvme => match s {
+                "state" => Some(NVME_LOG_STATE),
+                "admin" => Some(NVME_LOG_ADMIN),
+                "regs"  => Some(NVME_LOG_REGS),
+                "io"    => Some(NVME_LOG_IO),
                 "on" | "all"   => Some(0xFFFF_FFFF),
                 "off" | "none" => Some(0x0000_0000),
                 _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
@@ -311,6 +339,7 @@ impl DevLog {
                 ModuleLog::new(), // Pci
                 ModuleLog::new(), // Bridge
                 ModuleLog::new(), // Heart
+                ModuleLog::new(), // Nvme
             ],
         }
     }
