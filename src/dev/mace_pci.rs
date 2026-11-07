@@ -308,7 +308,7 @@ impl MacePci {
     fn rebuild_windows(&self, slots: &std::collections::BTreeMap<u8, Arc<Slot>>) {
         let mut n = 0;
         for (&slot, s) in slots {
-            for (space, bar, base, size) in s.dev.state().config().windows() {
+            for (space, bar, base, size) in s.dev.state().config().bar_regions() {
                 if n == MAX_WINDOWS {
                     log::warn!("pci: more than {MAX_WINDOWS} BAR windows open; slot {slot} BAR {bar} ignored");
                     continue;

@@ -21,6 +21,20 @@ pub enum Bar {
     Io(u32),
     /// 32-bit memory space, this many bytes (a power of two).
     Mem(u32),
+    /// 64-bit memory space, this many bytes (a power of two, under 4 GiB).
+    /// The BAR takes two header dwords: the next entry of the array must be
+    /// [`Bar::Unused`], and the header makes it the upper half. Both host
+    /// bridges generate 32-bit PCI addresses, so a base programmed above 4
+    /// GiB (a non-zero upper half) is not reachable and decodes nothing.
+    Mem64(u32),
+}
+
+/// What the header holds for each BAR dword: a BAR, or the upper half of
+/// the 64-bit BAR before it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BarSlot {
+    Bar(Bar),
+    Upper,
 }
 
 impl Bar {
@@ -92,7 +106,7 @@ impl<'a> Default for PciConfigPolicy<'a> {
 /// given reports a size of four gigabytes and the bus layout falls apart.
 pub struct PciConfig {
     regs: Mutex<[u32; 64]>,
-    bars: [Bar; 6],
+    bars: [BarSlot; 6],
     /// The registers as the function powers up, for [`PciConfig::reset`].
     power_on: [u32; 64],
     /// Dwords `16..caps_end` hold a capability list, which firmware cannot
@@ -132,13 +146,24 @@ impl PciConfig {
         pin: u8,
         policy: PciConfigPolicy<'_>,
     ) -> Self {
+        let mut slots = bars.map(BarSlot::Bar);
+        for i in 0..5 {
+            if let Bar::Mem64(_) = bars[i] {
+                assert!(bars[i + 1] == Bar::Unused, "a 64-bit BAR takes the next one");
+                slots[i + 1] = BarSlot::Upper;
+            }
+        }
+        assert!(!matches!(bars[5], Bar::Mem64(_)), "a 64-bit BAR needs a BAR after it");
         let mut r = [0u32; 64];
         r[0] = ((device as u32) << 16) | vendor as u32;
         r[2] = (class << 8) | revision as u32;
         r[15] = (pin as u32) << 8;
         for (i, b) in bars.iter().enumerate() {
-            if let Bar::Io(_) = b {
-                r[4 + i] = 1;
+            match b {
+                Bar::Io(_) => r[4 + i] = 1,
+                // Memory type 10b: decodes anywhere in 64-bit space.
+                Bar::Mem64(_) => r[4 + i] = 0x4,
+                _ => {}
             }
         }
         let mut writable_masks = [u32::MAX; 64];
@@ -151,7 +176,7 @@ impl PciConfig {
         }
         Self {
             regs: Mutex::new(r),
-            bars,
+            bars: slots,
             power_on: r,
             status: policy.status,
             status_w1c_mask: policy.status_w1c_mask,
@@ -230,14 +255,16 @@ impl PciConfig {
             }
             4..=9 => {
                 let val = (r[reg] & !mask) | (val & mask);
-                let bar = self.bars[reg - 4];
-                r[reg] = match bar {
-                    Bar::Unused => 0,
+                r[reg] = match self.bars[reg - 4] {
+                    BarSlot::Bar(Bar::Unused) => 0,
+                    // The upper half of a 64-bit base takes every bit.
+                    BarSlot::Upper => val,
                     // Address bits above the size take the write; those
                     // below read back as zero, which tells firmware the
                     // size. The type bits stay what the BAR is.
-                    Bar::Io(n) => (val & !(n - 1)) | 1,
-                    Bar::Mem(n) => val & !(n - 1),
+                    BarSlot::Bar(Bar::Io(n)) => (val & !(n - 1)) | 1,
+                    BarSlot::Bar(Bar::Mem(n)) => val & !(n - 1),
+                    BarSlot::Bar(Bar::Mem64(n)) => (val & !(n - 1)) | 0x4,
                 };
             }
             // Expansion ROM base: no function has a ROM, so the register is
@@ -271,9 +298,12 @@ impl PciConfig {
 
     /// The base address firmware programmed into BAR `i`, type bits masked.
     pub fn bar_base(&self, i: usize) -> u32 {
-        let v = self.regs.lock().unwrap()[4 + i];
+        let r = self.regs.lock().unwrap();
+        let v = r[4 + i];
         match self.bars[i] {
-            Bar::Io(_) => v & !3,
+            BarSlot::Bar(Bar::Io(_)) => v & !3,
+            // Above 4 GiB: out of reach of a 32-bit PCI address.
+            BarSlot::Bar(Bar::Mem64(_)) if r[5 + i] != 0 => 0,
             _ => v & !15,
         }
     }
@@ -290,13 +320,13 @@ impl PciConfig {
     /// each BAR that has been assigned an address in a space the command
     /// register enables, in BAR order. The bus caches these and updates its
     /// mappings after a configuration write.
-    pub fn windows(&self) -> Vec<(Space, usize, u32, u32)> {
+    pub fn bar_regions(&self) -> Vec<(Space, usize, u32, u32)> {
         let cmd = self.command();
         (0..6)
             .filter_map(|i| {
                 let (space, size) = match self.bars[i] {
-                    Bar::Io(n) if cmd & PCI_COMMAND_IO != 0 => (Space::Io, n),
-                    Bar::Mem(n) if cmd & PCI_COMMAND_MEMORY != 0 => (Space::Mem, n),
+                    BarSlot::Bar(Bar::Io(n)) if cmd & PCI_COMMAND_IO != 0 => (Space::Io, n),
+                    BarSlot::Bar(Bar::Mem(n) | Bar::Mem64(n)) if cmd & PCI_COMMAND_MEMORY != 0 => (Space::Mem, n),
                     _ => return None,
                 };
                 let base = self.bar_base(i);
@@ -456,7 +486,7 @@ pub fn bar_runs(
     let (wlo, whi) = (pci as u64, pci as u64 + len);
     let mut found: Vec<(u64, u64, usize, usize, u64)> = Vec::new();
     for (k, (_, f)) in funcs.iter().enumerate() {
-        for (sp, bar, base, size) in f.state().config().windows() {
+        for (sp, bar, base, size) in f.state().config().bar_regions() {
             if sp != space {
                 continue;
             }
@@ -520,6 +550,53 @@ mod tests {
         assert_eq!(dst.bar_base(1), 0x8000_1000);
         let other = PciConfig::new(0x1234, 0x5678, 0, 0, [Bar::Unused; 6], 0);
         assert!(other.load_state(&v1).is_err(), "a header loads only into the same kind of function");
+    }
+
+    fn nvme_like() -> PciConfig {
+        PciConfig::new(0x1b36, 0x0010, 0x01_0802, 1,
+            [Bar::Mem64(0x2000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA)
+    }
+
+    /// A 64-bit BAR reads as memory type 10b, sizes through its lower dword,
+    /// and keeps whatever its upper dword is given.
+    #[test]
+    fn a_64_bit_bar_probes_and_stores_both_halves() {
+        let c = nvme_like();
+        assert_eq!(c.read(4), 0x4, "64-bit memory, not prefetchable");
+        c.write(4, 0xffff_ffff);
+        c.write(5, 0xffff_ffff);
+        assert_eq!(c.read(4), 0xffff_e004, "8 KiB, type bits kept");
+        assert_eq!(c.read(5), 0xffff_ffff, "the upper half is plain storage");
+        c.write(5, 0);
+        c.write(4, 0x8000_2000);
+        assert_eq!(c.bar_base(0), 0x8000_2000);
+        assert_eq!(c.read(4), 0x8000_2004);
+        c.write(6, 0xffff_ffff);
+        assert_eq!(c.read(6), 0, "the BAR after the pair is its own");
+    }
+
+    #[test]
+    fn a_64_bit_bar_decodes_below_4_gib_only() {
+        let c = nvme_like();
+        c.write(4, 0x8000_2000);
+        c.write(1, PCI_COMMAND_MEMORY);
+        assert_eq!(c.bar_regions(), vec![(Space::Mem, 0, 0x8000_2000, 0x2000)]);
+        c.write(5, 1);
+        assert!(c.bar_regions().is_empty(), "a base above 4 GiB cannot be reached");
+        c.write(1, 0);
+        c.reset();
+        assert_eq!((c.read(4), c.read(5)), (4, 0), "reset forgets both halves");
+    }
+
+    #[test]
+    fn a_64_bit_bar_saves_with_its_upper_half() {
+        use crate::traits::Saveable;
+        let src = nvme_like();
+        src.write(4, 0x8000_2000);
+        src.write(5, 3);
+        let dst = nvme_like();
+        dst.load_state(&src.save_state()).unwrap();
+        assert_eq!((dst.read(4), dst.read(5)), (0x8000_2004, 3));
     }
 
     #[test]

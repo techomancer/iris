@@ -7,11 +7,21 @@
 //! sees configuration registers, accesses to its BARs, and an interrupt
 //! line for its pin.
 
+mod bus;
 mod config;
+mod decode;
 mod function;
+mod host;
+mod intx;
+#[cfg(test)]
+pub(crate) mod testing;
 
+pub use bus::PciBus;
 pub use config::{
     PCI_COMMAND_IO, PCI_COMMAND_MEMORY, PCI_INTA, Bar, BarAt, BarRun, BarRunSink, PciBar, PciConfig, PciConfigPolicy,
     PciLanes, PciRegisterPolicy, Space, bar_runs,
 };
+pub use decode::{BarMapping, BarMappingSink, CpuWindow};
 pub use function::{DevFn, PciDma, PciDmaStatus, PciFunction, PciFunctionState};
+pub use host::{BarDevice, BarDevices, ByteOrder, PciHost};
+pub use intx::{BoardIrq, IntxRouting};
