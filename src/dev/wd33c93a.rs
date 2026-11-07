@@ -803,9 +803,9 @@ impl Wd33c93a {
     }
 
     pub fn register_locks(self: &Arc<Self>) {
-        use crate::locks::register_lock_fn;
-        let me = self.clone(); register_lock_fn("scsi::state",  move || me.state.is_locked());
-        let me = self.clone(); register_lock_fn("scsi::thread", move || me.thread.is_locked());
+        use crate::locks::register_mutex_fn;
+        register_mutex_fn("scsi::state", self, |s| s.state.is_locked());
+        register_mutex_fn("scsi::thread", self, |s| s.thread.is_locked());
     }
 }
 

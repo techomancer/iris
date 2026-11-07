@@ -2380,6 +2380,32 @@ impl Drop for Jitv2 {
 }
 
 impl Jitv2 {
+    /// Stop the CPUs that run on `jit` and its compile pool for good, before
+    /// the machine frees the memory and devices their requests point into.
+    /// A queued request holds its page's generation pointer, into the
+    /// machine's RAM, and the pool outlives the machine's own drop.
+    ///
+    /// Not `CompileQueue::stop` under the lock: a worker leading a flush
+    /// takes that lock, and restarts the CPUs when the flush is done, so
+    /// stop both until neither comes back.
+    pub fn stop_for_drop(jit: &Mutex<Jitv2>, stop_cpus: impl Fn()) {
+        loop {
+            stop_cpus();
+            let workers = {
+                let mut g = jit.lock();
+                g.compile_queue.running.store(false, Ordering::SeqCst);
+                std::mem::take(&mut g.compile_queue.threads)
+            };
+            if workers.is_empty() {
+                break;
+            }
+            for w in workers {
+                let _ = w.join();
+            }
+        }
+        jit.lock().compile_queue.drain_pending_queue();
+    }
+
     /// Allocate the full page pool up front, `capacity` slots, every one
     /// starting unclaimed (`PhysicalCodePage::new(UNCLAIMED_PFN, null)`) —
     /// see `Jitv2`'s own doc comment for why this is a single one-shot

@@ -10211,9 +10211,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
 
 
     pub fn register_locks(&self) {
-        use crate::locks::register_lock_fn;
-        let ex = self.executor.clone();
-        register_lock_fn("cpu::executor", move || ex.is_locked());
+        crate::locks::register_mutex("cpu::executor", &self.executor);
     }
 
     fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<'_, MipsExecutor<T, C>>, String> {

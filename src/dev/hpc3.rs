@@ -1400,15 +1400,23 @@ impl Hpc3 {
         self.scsi_dev1.as_ref()
     }
 
+    /// Let go of the bus and of the interrupt wiring that loops back through
+    /// the SCSI channels (each channel holds the line that holds both), so a
+    /// dropped machine's memory can be freed. The machine is stopped.
+    pub fn release(&self) {
+        for chan in &self.pdma_channels {
+            let mut chan = chan.lock();
+            chan.sys_mem = None;
+            chan.irq = None;
+        }
+    }
+
     pub fn register_locks(&self) {
-        use crate::locks::register_lock_fn;
-        let state = self.state.clone();
-        register_lock_fn("hpc3::state",   move || state.is_locked());
-        let eeprom = self.eeprom.clone();
-        register_lock_fn("hpc3::eeprom",  move || eeprom.is_locked());
+        use crate::locks::register_mutex;
+        register_mutex("hpc3::state", &self.state);
+        register_mutex("hpc3::eeprom", &self.eeprom);
         for (i, chan) in self.pdma_channels.iter().enumerate() {
-            let chan = chan.clone();
-            register_lock_fn(format!("hpc3::pdma_channels[{}]", i), move || chan.is_locked());
+            register_mutex(format!("hpc3::pdma_channels[{}]", i), chan);
         }
         // Delegate to child components
         self.seeq.register_locks();
