@@ -76,6 +76,9 @@ pub enum LogModule {
     /// configuration NVRAM and its I2C controller: protocol surprises and
     /// refused commands.
     Module = 37,
+    /// The InfiniteReality (KONA) graphics pipe's host interface: guest
+    /// accesses and command words the model does not support.
+    Kona = 38,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -90,7 +93,7 @@ pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the
 pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 38;
+    pub const COUNT: usize = 39;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -132,6 +135,7 @@ impl LogModule {
             "l1" => Some(Self::L1),
             "usb" => Some(Self::Usb),
             "module" => Some(Self::Module),
+            "kona" => Some(Self::Kona),
             _        => None,
         }
     }
@@ -176,6 +180,7 @@ impl LogModule {
             Self::L1 => "l1",
             Self::Usb => "usb",
             Self::Module => "module",
+            Self::Kona => "kona",
         }
     }
 
@@ -188,7 +193,7 @@ impl LogModule {
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
             Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
-            Self::L1, Self::Usb, Self::Module,
+            Self::L1, Self::Usb, Self::Module, Self::Kona,
         ]
     }
 
@@ -356,6 +361,7 @@ impl DevLog {
                 ModuleLog::new(), // L1
                 ModuleLog::new(), // Usb
                 ModuleLog::new(), // Module
+                ModuleLog::new(), // Kona
             ],
         }
     }
