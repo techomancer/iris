@@ -8061,6 +8061,12 @@ mod tests {
     #[test]
     fn region_entered_at_a_flushing_word_counts_it() {
         use crate::cpu::mips_isa::*;
+        // Interpreter fallback is a process global that other tests turn on.
+        // With it on, the tlbwr joins the region and runs on this test's
+        // TLB-less executor instead of ending the region.
+        let _serialize = crate::cpu::jitv2::analyzer::FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dmfc0 = |rt: u32, rd: u32| make_r(OP_COP0, RS_DMFC0, rt, rd, 0, 0);
         let dmtc0 = |rt: u32, rd: u32| make_r(OP_COP0, RS_DMTC0, rt, rd, 0, 0);
         let tlbwr = make_r(OP_COP0, 0x10, 0, 0, 0, FUNCT_TLBWR);
