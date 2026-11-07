@@ -60,6 +60,8 @@ pub mod vino;
 pub mod virtio;
 pub mod wd33c93a;
 pub mod z85c30;
+pub mod hub;
+pub mod hub_pi;
 pub mod dp83843;
 pub mod ics1890;
 pub mod timekeeper;
