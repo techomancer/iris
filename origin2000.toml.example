@@ -1,0 +1,38 @@
+# SGI Origin 2000 deskside (IP27 node boards), serial-only setup.
+# Copy to origin2000.toml and run from the repository root:
+#   iris --config origin2000.toml
+# Supply the IP27 PROM image (the stock 6.156 image from the IRIX 6.5.30
+# distribution) and, to boot IRIX, a raw IRIX 6.5.30 disk. No images are
+# included. Convert QCOW2 disks to raw first.
+
+prom = "ignore/origin2000/ip27prom.img"
+nvram = "ignore/origin2000/nvram.bin"
+# One bank of a DIMM pair per node, in MB: 64, 128, 256 or 512 each.
+banks = [128, 0, 0, 0]
+headless = true
+no_audio = true
+monitor_port = 18988
+# The IOC3's first port is the console.
+serial_port_a = 18980
+serial_port_b = 18981
+
+[machine]
+profile = "origin2000_ip27"
+# r10000 (180 MHz, 1 MiB secondary cache) or r12000 (270 MHz, 4 MiB).
+cpu = "r10000"
+
+[origin2000]
+# One or two node boards; two are joined by the direct cable.
+nodes = 1
+flash = "ignore/origin2000/flash.raw"
+controller_store = "ignore/origin2000/controller.raw"
+
+[network]
+# Disconnected cable. For NAT, use mode = "nat".
+mode = "off"
+
+[scsi.1]
+path = "ignore/origin2000/irix.raw"
+cdrom = false
+# Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
+overlay = true

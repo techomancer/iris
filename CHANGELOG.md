@@ -18,6 +18,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
 - `cpu` takes the parts each machine shipped with, such as `r12000_360` on the Octane, or a family name for the machine's own. The Indy and Indigo2 R4400 is now rev 5.0 at 150 MHz, the O2 R10000 rev 3.4 at 250 MHz, and an Indy no longer takes an R10000 (the R10000 Indigo2 is the IP28). The R12000 and R14000 are new.
 
+### Origin 2000
+
+- `machine.profile = "origin2000_ip27"` runs the stock IP27 PROM on one or
+  two Hub nodes of an Origin 2000 deskside, the second joined by the direct
+  cable. One node boots IRIX 6.5.30 to a serial login. See
+  [the guide](docs/origin2000-ip27.md).
+
 ### Origin 200
 
 - `machine.profile = "origin200_ip29"` runs the stock IP27 PROM on one Hub
