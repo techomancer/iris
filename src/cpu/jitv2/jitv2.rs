@@ -5627,9 +5627,11 @@ mod tests {
 
     #[test]
     fn compile_queue_send_drops_when_full() {
+        // Declared before the queue so it outlives it: dropping the queue
+        // drains the requests, and each clears its page's scheduled flag.
+        let mut page = PhysicalCodePage::new(0, std::ptr::null());
         let q = CompileQueue::new();
         // Don't start the worker: nothing drains, so capacity fills exactly.
-        let mut page = PhysicalCodePage::new(0, std::ptr::null());
         let stats = JitStats::default();
         let mut accepted = 0;
         for i in 0..(COMPILE_QUEUE_CAPACITY + 10) {
