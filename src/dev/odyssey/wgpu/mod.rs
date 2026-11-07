@@ -119,6 +119,8 @@ const B_OR: usize = 9;
 const B_OWN: usize = 10;
 const BLIT_WINDOW: u32 = 1;
 const BLIT_OWN_VIEW: u32 = 2;
+/// The record stores one word, B_OFF itself, at every pixel of its box.
+const BLIT_CONST: u32 = 4;
 
 /// Words the stage buffer holds (the pixels of a batch's blits).
 const STAGE_WORDS: usize = 1 << 20;
@@ -298,12 +300,17 @@ impl Rec {
     /// A row run of pixels at (x0, y) to (x1, y) from stage word `off`,
     /// stored as `key` says.
     fn blit(x0: i32, y: i32, x1: i32, off: u32, key: &BlitKey) -> Rec {
+        Rec::blit_box(x0, y, x1, y, off, key)
+    }
+
+    /// The same over a box of rows (inclusive): a fill, with BLIT_CONST.
+    fn blit_box(x0: i32, y0: i32, x1: i32, y1: i32, off: u32, key: &BlitKey) -> Rec {
         let mut flags = if key.window { BLIT_WINDOW } else { 0 };
         let mut r = Rec::new(REC_BLIT, 0);
         r.set_i(B_BOX, x0);
-        r.set_i(B_BOX + 1, y);
+        r.set_i(B_BOX + 1, y0);
         r.set_i(B_BOX + 2, x1);
-        r.set_i(B_BOX + 3, y);
+        r.set_i(B_BOX + 3, y1);
         r.w[B_OFF] = off;
         r.w[B_MASK] = key.mask;
         r.w[B_OP] = key.op;
@@ -1153,6 +1160,18 @@ impl GpuRaster {
         self.stage.push(word);
         self.run.as_mut().expect("the run").next_x = x + 1;
         self.opened.get_or_insert_with(std::time::Instant::now);
+    }
+
+    /// A 2D fill: `word` at every pixel of the inclusive box, stored as
+    /// `key` says under slot `s`, in one record and with nothing staged.
+    #[allow(clippy::too_many_arguments, reason = "a box, its word, its key and slot")]
+    pub fn blit_fill(&mut self, s: &Slot, key: &BlitKey, x0: i32, y0: i32, x1: i32, y1: i32, word: u32) {
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        let mut rec = Rec::blit_box(x0, y0, x1, y1, word, key);
+        rec.flags |= BLIT_CONST;
+        self.push(rec, s);
     }
 
     /// Close the blit run being collected, if any, into its record.

@@ -254,10 +254,21 @@ impl Rows {
     }
 
     /// Store the same word at pixels x0 to x1 of row y, those in the view.
+    /// The word is encoded for the field once, as store_word() encodes it.
     pub fn fill(&self, y: i32, x0: i32, x1: i32, w: u32) {
         let (x0, x1) = (x0.max(0), x1.min(self.v.width as i32 - 1));
+        if self.v.kind == Kind::None || y < 0 || y as u32 >= self.v.height || x0 > x1 {
+            return;
+        }
+        let v = match self.v.kind {
+            Kind::Coded(_) => self.v.field().store(w),
+            Kind::Z24 => w as u64 & 0xff_ffff,
+            Kind::Byte => w as u64 & 0xff,
+            _ => w as u64,
+        };
+        let len = self.v.value_len();
         for x in x0..=x1 {
-            self.store_word(x, y, w);
+            self.mem.store(self.v.addr(x, y), len, v);
         }
     }
 }

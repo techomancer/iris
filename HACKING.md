@@ -547,6 +547,17 @@ same store in the mirror, untracked: the mirror's id bytes stay current
 with nothing uploaded twice. A new path that writes them on the GPU must do
 the same.
 
+The X server's rectangle fills, window-id writes and pattern spans go
+through one operation, `Board::fill_box`, rather than a pixel at a time. It
+takes the window's tests (plane bound, clip list, id test), the logical
+operation, the plane mask and the buffers the drawing mask selects. On the
+GPU unit each buffer becomes one blit record over the whole box that
+carries its word in place of staged pixels; the kernel applies the window
+tests itself, and the front end repeats the store in the mirror only for
+the window-id bytes. With the CPU unit it waits once and stores along each
+row's clip runs. Each record's state slot is built once per destination,
+clip list and id test (`Board::gpu_dest_slot`), not per pixel.
+
 With `renderer = "wgpu"` the window is drawn by `src/wgpu/present.rs`
 (`Presenter`: the surface, a pipeline of textured quads for the frame, the
 debug overlay and the status bar, and a small kernel that unpacks a frame

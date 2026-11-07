@@ -141,6 +141,9 @@ pub struct Report {
     /// replay is still deterministic and its checkpoints still a regression
     /// net.
     pub mid_session: bool,
+    /// The time the stores took to replay and draw, without the
+    /// checkpoints' hashing and screenshots.
+    pub draw_secs: f64,
 }
 
 /// Whether `recs` store to the PB&J scan-out entries (0x2800-0x280f) through
@@ -255,6 +258,8 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
     // the GPU unit then submits mid-stream as it does live.
     let tick = opts.tick;
     let mut stores = 0usize;
+    let t0 = std::time::Instant::now();
+    let mut aside = std::time::Duration::ZERO;
     for (i, r) in recs.iter().enumerate().take(limit) {
         if let (Some(n), Some(dir)) = (shot_every, &shots) {
             if i % n == 0 && i != 0 {
@@ -280,6 +285,7 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
             Rec::DmaBlock { .. } | Rec::DmaByte { .. } => {}
             Rec::Mark(h) => {
                 b.gpu_sync();
+                let t = std::time::Instant::now();
                 let got = memory_hash_bytes(&b);
                 rep.marks += 1;
                 if got != *h {
@@ -293,18 +299,22 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
                     let _ = std::fs::create_dir_all(dir);
                     save_screen(&b, &format!("{dir}/mark-{:03}.png", rep.marks));
                 }
+                aside += t.elapsed();
             }
         }
         if every != 0 && (i + 1) % every == 0 && rep.hashes.last().is_none_or(|(j, _)| *j != i + 1) {
             b.gpu_sync();
+            let t = std::time::Instant::now();
             rep.hashes.push((i + 1, memory_hash(&b)));
             if let Some(dir) = &shots {
                 let _ = std::fs::create_dir_all(dir);
                 save_screen(&b, &format!("{dir}/check-{:03}.png", rep.hashes.len()));
             }
+            aside += t.elapsed();
         }
     }
     b.gpu_sync();
+    rep.draw_secs = (t0.elapsed() - aside).as_secs_f64();
     if threads {
         b.raster.stop();
     }
@@ -389,10 +399,11 @@ pub fn replay_file(path: &Path, png: Option<&str>) -> Result<Report, String> {
     // The memory as drawn, on either raster unit.
     board.gpu_sync();
     eprintln!(
-        "{}: {} records in {:.1} s, DMA reads {}/{} ({} mismatched), {} bus loads differ, host writes {} bytes {}, memory {}, {} of {} marks reached{}",
+        "{}: {} records in {:.1} s ({:.3} s drawing), DMA reads {}/{} ({} mismatched), {} bus loads differ, host writes {} bytes {}, memory {}, {} of {} marks reached{}",
         path.display(),
         rep.records,
         t0.elapsed().as_secs_f64(),
+        rep.draw_secs,
         rep.dma_used,
         rep.dma_total,
         rep.dma_mismatched,

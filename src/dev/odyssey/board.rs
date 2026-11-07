@@ -399,6 +399,9 @@ pub(super) struct Board {
     pub pixel_mode: [u32; 4],
     /// Board::dest_views() for the words it was built from.
     pub dest_cache: std::cell::Cell<Option<([u32; 6], super::view::DestViews)>>,
+    /// Board::gpu_dest_slot() for the destination, clip list and id test
+    /// it was built from.
+    pub slot_cache: std::cell::Cell<Option<(super::draw::SlotKey, Option<super::gpu_unit::Slot>)>>,
 
     /// The draw state slots: the fragment side's texture registers.
     pub slots: super::pipe::slot::Slots,
@@ -591,6 +594,7 @@ impl Default for Board {
             vram: Default::default(),
             pixel_mode: [0; 4],
             dest_cache: Default::default(),
+            slot_cache: Default::default(),
             slots: Default::default(),
             tex: TexState {
                 coord: [0; 2],

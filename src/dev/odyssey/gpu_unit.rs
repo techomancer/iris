@@ -98,6 +98,11 @@ mod stub {
             match *self {}
         }
 
+        #[allow(clippy::too_many_arguments, reason = "a box, its word, its key and slot")]
+        pub fn blit_fill(&mut self, _s: &Slot, _key: &super::BlitKey, _x0: i32, _y0: i32, _x1: i32, _y1: i32, _word: u32) {
+            match *self {}
+        }
+
         pub fn note_region(&mut self, _v: &super::super::view::View, _x: i32, _y: i32) {
             match *self {}
         }

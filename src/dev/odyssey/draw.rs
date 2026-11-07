@@ -330,9 +330,71 @@ impl Board {
 
     /// The slot of the destination and window for the front end's own
     /// stores, when the kernels can address the planes.
+    /// Built once per destination, clip list and id test: the paths that
+    /// store a pixel at a time ask for it at every pixel.
     pub fn gpu_dest_slot(&self, planes: &DestMem) -> Option<super::gpu_unit::Slot> {
+        let mut clip = [0i32; 4 * ODSY_CLIP_RECTS as usize];
+        for (i, r) in self.win.clip_rect.iter().enumerate() {
+            clip[4 * i..4 * i + 4].copy_from_slice(&[r.x0, r.y0, r.x1, r.y1]);
+        }
+        let views = [&planes.colour[0], &planes.colour[1], &planes.depth, &planes.stencil, &planes.did, &planes.overlay].map(|r| r.v);
+        let key = SlotKey { views, clip, kept: self.win.clip_kept, id: self.win.id_compare };
+        if let Some((k, s)) = self.slot_cache.get() {
+            if k == key {
+                return s;
+            }
+        }
         let words = super::pipe::state::RasterWords { clip_rect: self.win.clip_rect, clip_kept: self.win.clip_kept, id_compare: self.win.id_compare, ..Default::default() };
-        super::gpu_unit::Slot::clear(planes, &words).ok()
+        let s = super::gpu_unit::Slot::clear(planes, &words).ok();
+        self.slot_cache.set(Some((key, s)));
+        s
+    }
+}
+
+/// What Board::gpu_dest_slot() builds its slot from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotKey {
+    views: [super::view::View; 6],
+    clip: [i32; 4 * ODSY_CLIP_RECTS as usize],
+    kept: u32,
+    id: u32,
+}
+
+/// How a 2D fill combines its word with each pixel it passes
+/// (Board::fill_box): the word as is, or through `op` with the old word,
+/// its result and-ed and or-ed (Board::paint_integer, paint_aux). A byte
+/// field is stored under `byte_mask`, or the plane mask without one.
+#[derive(Clone, Copy)]
+pub(super) struct FillOp {
+    pub word: u32,
+    pub op: Option<u8>,
+    pub and: u32,
+    pub or: u32,
+    pub byte_mask: Option<u8>,
+}
+
+impl FillOp {
+    fn value(&self, old: u32) -> u32 {
+        match self.op {
+            Some(op) => (logic_op(op, self.word, old) & self.and) | self.or,
+            None => self.word,
+        }
+    }
+
+    /// The pixel's new contents in `rows`, from its old ones.
+    fn store(&self, rows: &super::view::Rows, x: i32, y: i32, plane_mask: u8) {
+        if rows.v.kind == Kind::Byte {
+            if let Some(old) = rows.load1(x, y) {
+                let m = self.byte_mask.unwrap_or(plane_mask);
+                rows.store1(x, y, (old & !m) | (self.value(old as u32) as u8 & m));
+            }
+            return;
+        }
+        let val = match self.op {
+            Some(_) => self.value(rows.load_word(x, y).unwrap_or(0)),
+            None => self.word,
+        };
+        rows.store_word(x, y, val);
     }
 }
 
@@ -431,25 +493,158 @@ impl Board {
         }
     }
 
-    /// Board::paint_integer() at each pixel of row y from x0 up to x1, given the
-    /// row's runs.
-    pub fn paint_integer_span(&mut self, runs: &RowRuns, y: i64, x0: i64, x1: i64, is_index: bool, value: u32) {
-        for r in 0..runs.n as usize {
-            for x in x0.max(runs.start[r])..x1.min(runs.end[r]) {
-                self.paint_integer(x, y, is_index, value);
-            }
-        }
-    }
-
     /// The solid rectangle fill: BEGIN(QUADS)/COLOR_3UB or COLOR_INDEX/four VERTEX_2I
     /// corners/END drives the solid rectangle fill. Board::gl_end() routes a
     /// QUADS fill here when pattern mode is off, and to Board::pattern_fill()
     /// when it is on. is_index selects whether value is a packed RGB pixel or a
     /// PseudoColor index resolved per pixel.
     pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, is_index: bool, value: u32) {
-        for row in 0..h {
-            let runs = self.row_runs(y as i64 + row as i64);
-            self.paint_integer_span(&runs, y as i64 + row as i64, x as i64, x as i64 + w as i64, is_index, value);
+        let f = self.integer_fill(is_index, value);
+        self.fill_box(x as i64, y as i64, x as i64 + w as i64, y as i64 + h as i64, f);
+    }
+
+    /// How Board::paint_integer() stores `value` at a pixel, as a FillOp.
+    pub(super) fn integer_fill(&self, is_index: bool, value: u32) -> FillOp {
+        let src = fill_pixel(is_index, value);
+        let enable = if is_index { mode::INDEX_LOGIC_OP } else { mode::COLOR_LOGIC_OP };
+        let op = (self.logic_op_word & super::consts::ODSY_LOGIC_OP_MASK) as u8;
+        let use_op = (self.stream.pattern_mode & enable) != 0 && op as u32 != LOGIC_COPY;
+        if self.dest_is_id_planes() {
+            // Board::paint_aux: the low byte, through the operation.
+            return FillOp { word: src, op: use_op.then_some(op), and: 0xff, or: 0, byte_mask: None };
+        }
+        if !use_op {
+            return FillOp { word: src, op: None, and: u32::MAX, or: 0, byte_mask: None };
+        }
+        FillOp { word: src, op: Some(op), and: if is_index { ODSY_INDEX_MASK } else { u32::MAX }, or: if is_index { 0 } else { 0xff }, byte_mask: None }
+    }
+
+    /// A 2D fill of the box [x0, x1) x [y0, y1): `f` at each pixel
+    /// Board::pixel_allowed() passes, in each buffer the drawing mask
+    /// selects, as Board::paint_integer() stores it a pixel at a time. The
+    /// GPU unit takes one record per buffer and applies the window's tests
+    /// itself; the CPU unit walks the rows' clip runs once.
+    pub(super) fn fill_box(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, f: FillOp) {
+        let buffers = self.draw_buffers();
+        if buffers == 0 || x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let plane_mask = (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8;
+        let id_test = self.id_compare_active();
+        if self.gpu_unit() {
+            let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
+            let byte = |b: u32| planes.colour[b as usize].v.kind == Kind::Byte;
+            // Two buffers where one writes the id bytes the test reads:
+            // the test must see each pixel before both stores, which one
+            // record per buffer does not keep. Nor does the kernel's test
+            // fail a pixel with no id byte, as the CPU's does.
+            let per_pixel = id_test && ((buffers == 3 && (byte(0) || byte(1))) || planes.did.v.kind == Kind::None);
+            match self.gpu_dest_slot(&planes) {
+                Some(slot) if !per_pixel => {
+                    let (bx0, by0, bx1, by1) = (x0.max(-1) as i32, y0.max(-1) as i32, (x1 - 1).min(MAX_DIM as i64) as i32, (y1 - 1).min(MAX_DIM as i64) as i32);
+                    self.raster.run_now(|ctx| {
+                        let g = ctx.gpu.as_mut().expect("the unit");
+                        for b in 0..ODSY_BUFFERS {
+                            if buffers & (1u32 << b) == 0 {
+                                continue;
+                            }
+                            let mask = if byte(b) { f.byte_mask.unwrap_or(plane_mask) as u32 } else { u32::MAX };
+                            let key = super::gpu_unit::BlitKey { window: true, mask, op: f.op.map_or(0, |o| 0x100 | o as u32), and: f.and, or: f.or, ..super::gpu_unit::BlitKey::store(b, mask) };
+                            g.blit_fill(&slot, &key, bx0, by0, bx1, by1, f.word);
+                        }
+                    });
+                    // The id and overlay bytes in the mirror too
+                    // (mirror_byte_store), with the same tests.
+                    let rows: [Option<super::view::Rows>; 2] = std::array::from_fn(|b| {
+                        (buffers & (1 << b) != 0 && byte(b as u32)).then(|| super::view::Rows::new(planes.colour[b].mem().untracked(), planes.colour[b].v))
+                    });
+                    if rows.iter().any(Option::is_some) {
+                        self.fill_rows(&planes, &rows, x0, y0, x1, y1, f, plane_mask, id_test);
+                    }
+                    return;
+                }
+                _ => {
+                    // The kernels cannot take it: a pixel at a time.
+                    for y in y0..y1 {
+                        let runs = self.row_runs(y);
+                        for r in 0..runs.n as usize {
+                            for x in x0.max(runs.start[r])..x1.min(runs.end[r]) {
+                                self.fill_pixel_slow(x, y, f);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        let planes = self.dest_mem();
+        let rows: [Option<super::view::Rows>; 2] = std::array::from_fn(|b| (buffers & (1 << b) != 0).then_some(planes.colour[b]));
+        self.fill_rows(&planes, &rows, x0, y0, x1, y1, f, plane_mask, id_test);
+    }
+
+    /// Board::fill_box's stores into `rows` on the CPU: each row's clip
+    /// runs, then the id test a pixel at a time when it is on.
+    #[allow(clippy::too_many_arguments, reason = "a box, its fill, and the tests")]
+    fn fill_rows(&self, planes: &DestMem, rows: &[Option<super::view::Rows>; 2], x0: i64, y0: i64, x1: i64, y1: i64, f: FillOp, plane_mask: u8, id_test: bool) {
+        let c = self.win.id_compare;
+        let (id_mask, id_value) = ((c >> ODSY_ID_COMPARE_MASK_SHIFT) as u8, c as u8);
+        for y in y0.max(0)..y1.min(MAX_DIM as i64) {
+            let runs = self.row_runs(y);
+            for r in 0..runs.n as usize {
+                let (a, e) = (x0.max(runs.start[r]), x1.min(runs.end[r]));
+                if !id_test && f.op.is_none() {
+                    // A plain store: the word field by field, a run at a time.
+                    for rows in rows.iter().flatten() {
+                        if rows.v.kind == Kind::Byte {
+                            let m = f.byte_mask.unwrap_or(plane_mask);
+                            if m == 0xff {
+                                rows.fill(y as i32, a as i32, e as i32 - 1, f.word);
+                                continue;
+                            }
+                            for x in a..e {
+                                f.store(rows, x as i32, y as i32, plane_mask);
+                            }
+                        } else {
+                            rows.fill(y as i32, a as i32, e as i32 - 1, f.word);
+                        }
+                    }
+                    continue;
+                }
+                for x in a..e {
+                    let (x, y) = (x as i32, y as i32);
+                    if id_test && !planes.did.load1(x, y).is_some_and(|id| (id ^ id_value) & id_mask == 0) {
+                        continue;
+                    }
+                    for r in rows.iter().flatten() {
+                        f.store(r, x, y, plane_mask);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One pixel of a fill the GPU unit's kernels cannot take, through the
+    /// per-pixel paths.
+    fn fill_pixel_slow(&mut self, x: i64, y: i64, f: FillOp) {
+        if !self.pixel_allowed(x, y) {
+            return;
+        }
+        let buffers = self.draw_buffers();
+        let plane_mask = (self.plane_write_mask >> ODSY_PLANE_MASK_SHIFT) as u8;
+        for b in 0..ODSY_BUFFERS {
+            if buffers & (1u32 << b) == 0 {
+                continue;
+            }
+            let rows = self.planes_in(x, y, x, y).colour[b as usize];
+            let mask = if rows.v.kind == Kind::Byte { f.byte_mask.unwrap_or(plane_mask) as u32 } else { u32::MAX };
+            let key = super::gpu_unit::BlitKey { mask, op: f.op.map_or(0, |o| 0x100 | o as u32), and: f.and, or: f.or, ..super::gpu_unit::BlitKey::store(b, mask) };
+            let planes = DestMem::of(self.vram_ptr(), &self.dest_views());
+            if let Some(slot) = self.gpu_dest_slot(&planes) {
+                self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").blit_pixel(&slot, &key, x as i32, y as i32, f.word));
+                mirror_byte_store(&planes.colour[b as usize], x, y, f.word, &key);
+            } else {
+                f.store(&rows, x as i32, y as i32, plane_mask);
+            }
         }
     }
 
@@ -459,42 +654,8 @@ impl Board {
     /// the drawing mask selects buffer 0 and in the overlay pixel byte when it
     /// selects buffer 1, leaving the colour framebuffer untouched.
     pub fn clear_planes(&mut self, x: u32, y: u32, w: u32, h: u32, value: u8, mask: u8) {
-        let buffers = self.draw_buffers();
-        let id_test = self.id_compare_active();
-        let gpu = self.gpu_unit();
-        let planes = if gpu { DestMem::of(self.vram_ptr(), &self.dest_views()) } else { self.planes_in(x as i64, y as i64, x as i64 + w as i64 - 1, y as i64 + h as i64 - 1) };
-        for row in 0..h {
-            let py = y as i64 + row as i64;
-            let runs = self.row_runs(py);
-            for r in 0..runs.n as usize {
-                let a = (x as i64).max(runs.start[r]);
-                let e = (x as i64 + w as i64).min(runs.end[r]);
-
-                for px in a..e {
-                    if !id_test || self.id_compare_passes(px, py) {
-                        if gpu {
-                            for b in 0..ODSY_BUFFERS {
-                                if buffers & (1u32 << b) != 0 && !self.gpu_blit_view(b, px, py, value as u32, mask as u32) {
-                                    let rows = self.planes_in(px, py, px, py).colour[b as usize];
-                                    if let Some(old) = rows.load1(px as i32, py as i32) {
-                                        rows.store1(px as i32, py as i32, (old & !mask) | (value & mask));
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        for b in 0..ODSY_BUFFERS {
-                            if buffers & (1u32 << b) != 0 {
-                                let rows = planes.colour[b as usize];
-                                if let Some(old) = rows.load1(px as i32, py as i32) {
-                                    rows.store1(px as i32, py as i32, (old & !mask) | (value & mask));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let f = FillOp { word: value as u32, op: None, and: u32::MAX, or: 0, byte_mask: Some(mask) };
+        self.fill_box(x as i64, y as i64, x as i64 + w as i64, y as i64 + h as i64, f);
     }
 
     /// Pattern mode is on when the 0x0404 mode's bits 3,4 are set and a shape is
@@ -563,6 +724,7 @@ impl Board {
     pub fn pattern_fill(&mut self, x: u32, y: u32, w: u32, h: u32, pat_u0: u32, pat_v0: u32, is_index: bool, value: u32) {
         let opaque = self.stream.pattern_shape & pattern::SHAPE_OPAQUE != 0;
         let background = self.pattern_background(is_index);
+        let (fg, bg) = (self.integer_fill(is_index, value), self.integer_fill(is_index, background));
         // Each row as spans of equal pattern bits, painted a span at a time.
         for v in 0..h {
             let py = y as i64 + v as i64;
@@ -583,14 +745,8 @@ impl Board {
                     }
                 }
                 if bit || opaque {
-                    self.paint_integer_span(
-                        &runs,
-                        py,
-                        x as i64 + first as i64,
-                        x as i64 + u as i64,
-                        is_index,
-                        if bit { value } else { background },
-                    );
+                    let f = if bit { fg } else { bg };
+                    self.fill_box(x as i64 + first as i64, py, x as i64 + u as i64, py + 1, f);
                 }
             }
         }
