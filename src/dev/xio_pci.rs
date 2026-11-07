@@ -1,30 +1,46 @@
-//! The PCI shoehorn: an XIO board with a Bridge on a Crossbow port of its own,
-//! owning a PCI bus with one slot. The Bridge is the onboard one
-//! ([`super::bridge`]) unchanged, on another port.
+//! PCI option boards for an XIO slot: a Bridge on a Crossbow port of its own,
+//! owning a PCI bus with a few slots. Two products share the model, which is
+//! the onboard Bridge ([`super::bridge`]) unchanged on another port.
 //!
-//! The shoehorn fits any of the Octane's four XIO slots, ports 9 to 12 (real
-//! Octane2 captures put it at 10), and its card is configuration device 1.
+//! | board                 | Octane port | slots (PCI device numbers) |
+//! |-----------------------|-------------|----------------------------|
+//! | shoehorn              | 9 to 12     | 1                          |
+//! | Octane PCI module     | 13          | 1, 2 and 3                 |
+//!
 //! Grades below are the datasheets' own: established (a published SGI
 //! document or a real capture), inferred, unknown.
 //!
-//! * The slot is device 1: established on the Origin 2000, whose hardware
-//!   graph shows the card at `.../xtalk_pci/pci/1`, and inferred on the
-//!   Octane. Devices other than 1 hold no function; the Bridge decodes all
-//!   eight, and a configuration cycle to a position nothing answers is a
-//!   master time-out, as for an empty slot.
-//! * Interrupts, inferred: INTA and INTC reach the Bridge pin numbered as the
-//!   device (pin 1), INTB and INTD that number with bit two flipped (pin 5).
-//!   That is the rule OpenBSD and Linux use for any Bridge and the onboard
-//!   one has ([`crate::ip30::PCI0`]); no board trace is held.
-//! * The Bridge is the Bridge ASIC (part 0xc002), inferred. Its revision is 4
-//!   (Bridge D): established on the Origin 2000, where the PROM prints
-//!   `ASIC BRIDGE Rev 4` for every such board, and unknown on the Octane, so
-//!   the Origin 2000's stands.
-//! * The one-wire record is part 030-1275-004, revision A, name `XTALK_PCI`,
-//!   which real Octane and Origin 2000 `hinv` captures print. That the board
-//!   keeps it on its Bridge's one-wire part is inferred; no dump is held. The
-//!   barcode and serial are marked synthetic.
-//! * The slot is 32 bit; the board's width is unknown.
+//! The PCI module is on its own Crossbow port, 13, beside the four XIO slots
+//! at 9 to 12 (established), and holds up to three boards, PCI ID 1 to 3
+//! (OCTANE PCI Module Installation Guide 007-3547-001, printed pages 3 and
+//! 13, and its `ioconfig.conf` table, page 65; established). That slot N is
+//! configuration device N is inferred: the guide and real hardware graphs
+//! name the software slot, which the guide says matches the physical one,
+//! and `/hw/node/xtalk/13/pci/N` for N of 1, 2 and 3, but a software slot
+//! name is not a device number. Devices 0 and 4 to 7 are not slots; whether
+//! the module's Bridge answers there is unknown, and here it does not, since
+//! nothing is fitted. A shoehorn has one slot, device 1: established on the
+//! Origin 2000, inferred on the Octane.
+//!
+//! Inferred or unknown, and what is picked here:
+//!
+//! * Interrupts, inferred for both boards: a slot's INTA and INTC reach the
+//!   Bridge pin numbered as its device, INTB and INTD that number with bit
+//!   two flipped. That is the default Bridge board wiring OpenBSD and Linux
+//!   use for any Bridge and the onboard one has ([`crate::ip30::PCI0`]); no
+//!   board trace is held.
+//! * The widget is a Bridge-class one, established; that it reports the Bridge
+//!   (part 0xc002) and not the XBridge (0xd002) is inferred. Its revision is
+//!   unknown for the module, so it carries the machine's own Bridge revision
+//!   as a placeholder. A shoehorn's is revision 4 (Bridge D), established on
+//!   the Origin 2000 and unknown on the Octane.
+//! * One-wire records. The part, revision and name are established by `hinv`
+//!   captures: the shoehorn is 030-1275-004 rev A `XTALK_PCI`, the module
+//!   030-0952-005 rev E `XTALKPCI` (the most common of the revisions seen).
+//!   That each board keeps its record on its Bridge's one-wire part is
+//!   inferred from the adapter and the Origin 2000 carriers; no dump of
+//!   either is held. The barcodes are marked synthetic.
+//! * Which slots are 32 or 64 bit is unknown; every slot is 32 bit here.
 //! * The Bridge's flash pins: IRIX reads the start of the flash aperture
 //!   (offset 0xc00000) and its second select (0xe00000) on every Bridge it
 //!   finds, and a bus error on either is a kernel fault. What a board with no
@@ -42,14 +58,19 @@ use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::pci::{DevFn, PciBus, PciFunction};
 use crate::xtalk::Upstream;
 
-/// Which board, as `[[xio_board]] kind` names it.
+/// Which product, as `[[xio_board]] kind` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     /// The single-slot XIO-to-PCI adapter.
     #[serde(rename = "pci-shoehorn")]
     Shoehorn,
+    /// The Octane's three-slot PCI module.
+    #[serde(rename = "pci-cage")]
+    Cage,
 }
 
+/// The Octane PCI module's XIO number.
+pub const CAGE_WIDGET: u8 = 13;
 /// The blank part on each of a board's flash selects: one select's worth.
 const BLANK_FLASH_SIZE: u32 = 2 << 20;
 /// A shoehorn's Bridge revision: Bridge D, as the Origin 2000's PROM prints it
@@ -61,12 +82,14 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Kind::Shoehorn => "pci-shoehorn",
+            Kind::Cage => "pci-cage",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Kind::Shoehorn => "PCI shoehorn",
+            Kind::Cage => "PCI module",
         }
     }
 
@@ -75,6 +98,7 @@ impl Kind {
     pub fn slots(self) -> &'static [u8] {
         match self {
             Kind::Shoehorn => &[1],
+            Kind::Cage => &[1, 2, 3],
         }
     }
 }
@@ -84,6 +108,7 @@ impl Kind {
 fn record(kind: Kind, widget: u8) -> w1::Bus {
     let (part, revision, name) = match kind {
         Kind::Shoehorn => ("030-1275-004", "A", "XTALK_PCI"),
+        Kind::Cage => ("030-0952-005", "E", "XTALKPCI"),
     };
     let barcode = format!("EMUO{widget:02}");
     let serial = 0x5145_4d55_4f00 | widget as u64;
@@ -101,14 +126,17 @@ pub struct XioPciBoard {
 
 impl XioPciBoard {
     /// A board of `kind` on Crossbow port `widget`. Its Bridge masters memory
-    /// and interrupts the hosts `up` names. The machine maps
-    /// [`Self::bridge`] at the port, tells the Bridge which links are alive
-    /// ([`Bridge::set_link_alive`]) and resets the board with the machine.
-    pub fn new(kind: Kind, widget: u8, up: Upstream) -> Self {
+    /// and interrupts the hosts `up` names; `revision` is the machine's
+    /// Bridge revision, which a PCI module takes as a placeholder. The machine
+    /// maps [`Self::bridge`] at the port, tells the Bridge which links are
+    /// alive ([`Bridge::set_link_alive`]) and resets the board with the
+    /// machine.
+    pub fn new(kind: Kind, widget: u8, up: Upstream, revision: u32) -> Self {
         let bridge = Bridge::new(up, &crate::ip30::PCI0);
         bridge.set_widget(widget);
         bridge.set_revision(match kind {
             Kind::Shoehorn => SHOEHORN_BRIDGE_REVISION,
+            Kind::Cage => revision,
         });
         bridge.set_microlan(record(kind, widget));
         bridge.attach_flash(Arc::new(RawFlash::new(&[], BLANK_FLASH_SIZE as usize)), BLANK_FLASH_SIZE);

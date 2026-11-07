@@ -105,16 +105,29 @@ interrupt pins to HEART and DMA through the Crossbow's live links.
 [[xio_board]]
 kind = "pci-shoehorn"    # one slot, PCI device 1
 # widget = 10            # a shoehorn's XIO slot, 9 to 12; unset: 10, then 12, 9, 11
+
+[[xio_board]]
+kind = "pci-cage"        # the Octane PCI module: three slots, PCI devices 1 to 3, port 13
 ```
 
 The shoehorn is the single-slot XIO-to-PCI adapter: Bridge revision 4, one
 slot at device 1 whose INTA and INTB reach the board's Bridge pins 1 and 5, and
 a one-wire record naming it `XTALK_PCI` (part 030-1275-004, revision A). It does
-not use the slot the graphics board is in. Which of this is established and
-which inferred is in `src/dev/xio_pci.rs`: the slot number is established on
-the Origin 2000 and inferred on the Octane; the pins are inferred from OpenBSD
-and Linux; the Bridge revision is the Origin 2000's. A board's Bridge has no
-`pci` monitor command yet; the onboard Bridge's `pci` shows only its own bus.
+not use the slot the graphics board is in.
+
+The PCI module (the card cage) is the Octane's own three-slot option, on
+Crossbow port 13 beside the four XIO slots. Its slots are PCI ID 1 to 3, the
+guide's numbering, taken as configuration devices 1 to 3, with INTA of device
+`d` on the board's Bridge pin `d` and INTB on pin `d ^ 4`. Its record names it
+`XTALKPCI` (part 030-0952-005, revision E). Devices 0 and 4 to 7 hold nothing.
+
+Which of this is established and which inferred is in `src/dev/xio_pci.rs`.
+The shoehorn's slot number is established on the Origin 2000 and inferred on
+the Octane; the module's slot-to-device numbering is inferred; the pins are
+inferred from OpenBSD and Linux for both; the shoehorn's Bridge revision is the
+Origin 2000's and the module's is a placeholder, the onboard Bridge's. A
+board's Bridge has no `pci` monitor command yet; the onboard Bridge's `pci`
+shows only its own bus.
 
 ## PCI-to-PCI bridges
 
