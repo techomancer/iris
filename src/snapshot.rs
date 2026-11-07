@@ -49,7 +49,13 @@ use toml::Value;
 /// changed shape: the serial DMA, the Indy's SCC and the rest are as before.
 /// Octane snapshots start at v5, and an Octane reads only snapshots of the
 /// schema it was built with, so the next bump refuses every older one.
-pub const SCHEMA_VERSION: u32 = 5;
+///
+/// v5 → v6: the PCI bus saves its own state (each function's header, the pin
+/// and wire levels) where MACE and the Bridge each saved headers and pin
+/// levels in their own layout. A v5 reader would load none of it and leave
+/// every BAR unassigned under a running kernel, and a v6 reader does the
+/// same with a v5 snapshot, so both machines refuse the other schema.
+pub const SCHEMA_VERSION: u32 = 6;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 
@@ -125,6 +131,16 @@ pub fn enabled_features() -> Vec<String> {
     push_if!("debug_cache");
     f.sort();
     f
+}
+
+/// Refuse a snapshot of any schema but the one this build writes. The
+/// Octane and the O2 read only their own schema; the Indy's loader reads
+/// older ones itself.
+pub fn check_schema(name: &str, found: u32) -> Result<(), String> {
+    if found != SCHEMA_VERSION {
+        return Err(format!("snapshot {name} is schema {found}; this build reads schema {SCHEMA_VERSION}"));
+    }
+    Ok(())
 }
 
 /// Check that a snapshot fits this build, CPU and disks: the same build
@@ -755,6 +771,16 @@ impl StateTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot of another schema is refused with both versions named.
+    #[test]
+    fn check_schema_names_both_versions() {
+        let older = SCHEMA_VERSION - 1;
+        let e = check_schema("old", older).unwrap_err();
+        assert!(e.contains(&format!("schema {older}")) && e.contains(&format!("schema {SCHEMA_VERSION}")), "{e}");
+        assert!(check_schema("newer", SCHEMA_VERSION + 1).is_err());
+        assert!(check_schema("current", SCHEMA_VERSION).is_ok());
+    }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

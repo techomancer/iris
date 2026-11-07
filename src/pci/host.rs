@@ -258,14 +258,20 @@ mod tests {
         }
     }
 
-    /// MACE's old swizzle: bytes `^3`, halves `^2`, words as given.
+    /// MACE's byte rule as it was written before ByteOrder: bytes `^3`, halves
+    /// `^2`, words as given.
     #[test]
     fn values_4_matches_mace_swizzle() {
+        let swizzle = |off: u32, width: usize| match width {
+            1 => off ^ 3,
+            2 => off ^ 2,
+            _ => off,
+        };
         for size in [1usize, 2, 4] {
             for off in 0..32u32 {
                 let c = card();
                 ByteOrder::values(4).read(&*c, 0, off, size);
-                let want = crate::dev::mace_pci::MacePci::lane_swizzle(off, size);
+                let want = swizzle(off, size);
                 assert_eq!(c.calls(), vec![(want, size)], "size {size} off {off}");
             }
         }

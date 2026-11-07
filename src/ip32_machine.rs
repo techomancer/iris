@@ -641,7 +641,7 @@ impl O2Machine {
 
     fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
         use crate::chunk_store::{get_chunks_as_words, ChunkStore};
-        use crate::snapshot::{Snapshot, SCHEMA_VERSION};
+        use crate::snapshot::Snapshot;
         let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
         let m = snap.read_manifest()?.ok_or_else(|| format!("saves/{name}: no snapshot.toml"))?;
         if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
@@ -650,15 +650,7 @@ impl O2Machine {
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version > SCHEMA_VERSION {
-            return Err(format!("snapshot schema_version {} is newer than this iris build supports ({SCHEMA_VERSION})", m.schema_version));
-        }
-        if m.schema_version < SCHEMA_VERSION {
-            return Err(format!(
-                "snapshot {name} is schema {}; the O2's UART state changed shape in schema 5, so it cannot be restored",
-                m.schema_version
-            ));
-        }
+        crate::snapshot::check_schema(name, m.schema_version)?;
         // As the Indy: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;

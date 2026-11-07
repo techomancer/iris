@@ -940,12 +940,19 @@ fn nvram_survives_and_decodes_maces_spacing() {
 /// CLRINT, SCBPTR and the SCB array, which is exactly right.
 #[test]
 fn the_bridge_swaps_byte_lanes_for_a_little_endian_device() {
-    assert_eq!(MacePci::lane_swizzle(0x84, 1), 0x87, "HCNTRL");
-    assert_eq!(MacePci::lane_swizzle(0x91, 1), 0x92, "CLRINT");
-    assert_eq!(MacePci::lane_swizzle(0x93, 1), 0x90, "SCBPTR");
-    assert_eq!(MacePci::lane_swizzle(0xbc, 1), 0xbf, "last byte of the SCB");
-    assert_eq!(MacePci::lane_swizzle(0x84, 2), 0x86, "16-bit lanes swap in pairs");
-    assert_eq!(MacePci::lane_swizzle(0x84, 4), 0x84, "a whole word needs no swap");
+    use crate::pci::testing::TestCard;
+    use crate::pci::Bar;
+    let reached = |off: u32, size: usize| {
+        let card = TestCard::new([Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0);
+        crate::pci::ByteOrder::values(4).read(&*card, 0, off, size);
+        card.calls()[0].0
+    };
+    assert_eq!(reached(0x84, 1), 0x87, "HCNTRL");
+    assert_eq!(reached(0x91, 1), 0x92, "CLRINT");
+    assert_eq!(reached(0x93, 1), 0x90, "SCBPTR");
+    assert_eq!(reached(0xbc, 1), 0xbf, "last byte of the SCB");
+    assert_eq!(reached(0x84, 2), 0x86, "16-bit order swap in pairs");
+    assert_eq!(reached(0x84, 4), 0x84, "a whole word needs no swap");
 }
 
 /// Every O2 device answers the monitor through the bus: its command is
@@ -971,3 +978,40 @@ fn every_device_answers_the_monitor_through_the_bus() {
     }
     assert!(bus.execute_command("nonesuch", &[], Box::new(std::io::sink())).is_err());
 }
+
+// ---- the physical bus keeps what it maps ----
+
+/// The physical bus keeps every device mapped on it for as long as it lives,
+/// and every configuration write updates the BAR mappings, so a run must map
+/// the same device each time or the list grows with every write.
+#[test]
+fn configuration_writes_do_not_make_the_physical_bus_keep_more_devices() {
+    use crate::pci::testing::TestCard;
+    use crate::pci::Bar;
+    let bus = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    let pci = bus.mace.pci.bus();
+    // A card in the specification's spare slot, with one memory BAR.
+    let at = DevFn { device: 4, function: 0 };
+    let bars = [Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
+    pci.attach(at, TestCard::new(bars, 0));
+    pci.config_write(at, 0x10, 4, 0x8000_2000);
+    pci.config_write(at, 0x04, 2, crate::pci::PCI_COMMAND_MEMORY);
+    let kept = bus.phys.kept_len();
+    for i in 0..1000u32 {
+        pci.config_write(at, 0x3c, 1, i & 0xff); // interrupt line
+    }
+    assert_eq!(bus.phys.kept_len(), kept, "1000 interrupt-line writes");
+    // A BAR that moves and comes back maps what it mapped before.
+    let place = |base: u32| {
+        pci.config_write(at, 0x10, 4, base);
+    };
+    place(0x8000_4000);
+    let moved = bus.phys.kept_len();
+    assert!(moved > kept, "a new placement maps new devices (one per window it appears in)");
+    for _ in 0..50 {
+        place(0x8000_2000);
+        place(0x8000_4000);
+    }
+    assert_eq!(bus.phys.kept_len(), moved, "both placements are already mapped");
+}
+

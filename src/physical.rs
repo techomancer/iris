@@ -405,6 +405,12 @@ impl Physical {
         p
     }
 
+    /// How many devices the bus is keeping alive.
+    #[cfg(test)]
+    pub(crate) fn kept_len(&self) -> usize {
+        self.devices.lock().unwrap().len()
+    }
+
     /// What answers wherever nothing else is mapped: the whole 32-bit space
     /// now, and any slot above it the first time the guest reaches it.
     pub fn set_default(&self, dev: Arc<dyn BusDevice>, name: &str) {

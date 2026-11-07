@@ -932,9 +932,7 @@ impl OctaneMachine {
         if m.host_arch != std::env::consts::ARCH {
             return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
         }
-        if m.schema_version != SCHEMA_VERSION {
-            return Err(format!("snapshot {name} is schema {}; this build reads Octane snapshots of schema {SCHEMA_VERSION}", m.schema_version));
-        }
+        crate::snapshot::check_schema(name, m.schema_version)?;
         // As the Indy and the O2: build, CPU and disks must match.
         crate::snapshot::check_provenance(&m, cpu.model_name(), cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
