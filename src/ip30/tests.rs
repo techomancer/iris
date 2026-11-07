@@ -63,7 +63,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let ram = Arc::new(HeartRam::new(banks_mb));
     let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::dev::heart::host_clock()));
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
-    xbow.connect_heart(heart.clone());
+    xbow.connect_host(HEART_HOST, heart.clone());
     let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()));
     bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
     let phys = Ip30Bus::new(ram);
@@ -403,7 +403,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
     let id = widget_small_base(WIDGET_GFX) + 4;
     for (links, alive) in [(0x8100u16, false), (0x8100 | 1 << WIDGET_GFX, true)] {
         let xbow = Arc::new(Xbow::new(XBOW_REVISION, links));
-        xbow.connect_heart(heart.clone());
+        xbow.connect_host(HEART_HOST, heart.clone());
         let p = Arc::new(Ip30Bus::new(ram.clone()));
         p.attach_widget(WIDGET_GFX, gfx.clone(), false);
         p.init();
