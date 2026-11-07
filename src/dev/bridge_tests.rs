@@ -708,6 +708,58 @@ fn an_absent_device_behind_a_pci_bridge_master_aborts_at_the_bridge() {
     assert_eq!(r.type1_read(0, 0, 4), None);
     assert_ne!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
 }
+
+// ---- the 2 GB window ----
+
+/// Through the widget's 2 GB window the first 16 MB is the small window
+/// again, and offset 0x4000_0000 on is PCI memory from address 0, with
+/// the bytes placed by Control's memory swap bit (Bridge specification
+/// pp. 52 and 55). IRIX 6.5.30 reaches a BAR this way when a bridge
+/// window is too wide for the slot's device window.
+#[test]
+fn the_2gb_window_reaches_pci_memory_through_the_32_bit_alias() {
+    let r = Rig::new();
+    let c = r.card(1, PCI_INTA); // memory BAR at PCI 0x1300_0000
+    let long = r.bridge.long_window();
+    let alias = |pci: u32| u64::from(PIO32_ALIAS + pci) + 0xf_8000_0000;
+    assert_eq!(long.read32(0xf_8000_0000 + u64::from(reg::IDENTIFICATION) + 4).data, r.get(reg::IDENTIFICATION));
+    assert_eq!(long.read32(alias(0x1300_0000 + FIXED)).data, 0x1234_5678, "swap clear: word values");
+    assert_eq!(long.write32(alias(0x1300_0000 + SCRATCH), 0x8b7a_6950), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0x8b7a_6950);
+    assert_eq!(long.read8(alias(0x1300_0000 + (FIXED ^ 3))).data, 0x78, "a byte moves to its position");
+    r.set(reg::CONTROL, r.get(reg::CONTROL) | CONTROL_MEM_SWAP);
+    assert_eq!(long.read32(alias(0x1300_0000 + FIXED)).data, 0x7856_3412, "swap set: a byte stream");
+    // Between the small window and the alias, and PCI memory nothing decodes.
+    assert!(!long.read32(0xf_8000_0000 + 0x0100_0000).is_ok());
+    r.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+    assert!(!long.read32(alias(0x2000_0000)).is_ok());
+    assert_ne!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
+    // Approximation: the capture names device 0, and the PCI address the
+    // cycle carried.
+    assert_eq!(r.get(reg::PCI_ERR_UPPER), 0);
+    assert_eq!(r.get(reg::PCI_ERR_LOWER), 0x2000_0000);
+}
+
+/// A BAR the alias decodes whole is published as a run at its alias
+/// offset, and the run answers as the 2 GB window does.
+#[test]
+fn a_bar_in_the_alias_is_a_run() {
+    let r = Rig::new();
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let (sink, b) = (runs.clone(), Arc::downgrade(&r.bridge));
+    r.bridge.bus().on_bar_mappings(Box::new(move |rs| {
+        let b = b.upgrade().unwrap();
+        *sink.lock() = rs.iter().map(|x| (x.cpu..x.cpu + x.len, b.bar_device(x))).collect::<Vec<_>>();
+    }));
+    r.card(1, PCI_INTA);
+    let at = u64::from(PIO32_ALIAS + 0x1300_0000);
+    let run = runs.lock().iter().find(|x| x.0.contains(&at)).cloned().expect("the alias carries a run");
+    assert_eq!(run.0, at..at + 0x1000);
+    let pa = 0xf_8000_0000 + at + u64::from(FIXED);
+    assert_eq!(run.1.read32(pa).data, r.bridge.long_window().read32(pa).data);
+    assert_eq!(run.1.read32(pa).data, 0x1234_5678);
+}
+
 #[test]
 fn a_disabled_command_register_hides_the_bars() {
     let r = Rig::new();

@@ -59,6 +59,9 @@ The three window kinds are three views of the same XIO address space (§8):
 a short window shows the first 16 MB of a widget, a large window its first
 2 GB, a huge window its first 64 GB. Widget 0 (the Xbow) has no huge
 window; its place is taken by memory and the large windows.
+The code names them differently: `src/ip30.rs` calls the 2 GB window the
+long window (`widget_long_base`) and the 64 GB one the large window
+(`widget_large_base`).
 
 Memory starting at 512 MB is what lets the widgets' short windows, HEART
 and the PROM all sit below it, with the PROM at the address the CPU expects
@@ -379,8 +382,8 @@ The Bridge decodes its XIO space as:
 | 0x8000_0000 – 0xBFFF_FFFF | PCI memory space, 64-bit-attribute variant of the same 1 GB |
 | 0x1_0000_0000 – 0x1_FFFF_FFFF | PCI I/O space, 4 GB |
 
-So PCI memory address a is at physical 0xF_4000_0000 + a through widget
-15's large window (0xF_0000_0000 + 0x4000_0000), and PCI I/O at
+So PCI memory address a is at physical 0xF_C000_0000 + a through widget
+15's large window (0xF_8000_0000 + 0x4000_0000), and PCI I/O at
 0xF0_0000_0000 + 0x1_0000_0000 + a through its huge window. The control
 register's swap bits (§7) say whether PIO through those spaces is
 byte-swapped. The graphics widget's registers are at the start of its

@@ -32,8 +32,12 @@
 //!   errors are never raised.
 //! * The translation table is the chip's internal 128 entries; no external
 //!   SRAM extends it.
-//! * Processor accesses to the 2 GB long window (the translated PIO window
-//!   at 0x4000_0000) are not modelled.
+//! * Through the widget's 2 GB window the first 16 MB is the small window
+//!   and 0x4000_0000 on is the 32-bit alias of PCI memory (specification
+//!   p. 52); the rest of that window is a bus error. The 64-bit alias at
+//!   0x8000_0000 and PCI I/O at 4 GB, which only the 64 GB window reaches,
+//!   are not modelled. Which device a master time-out through the alias
+//!   names in the error capture is not in the specification; iris names 0.
 //! * A function's DMA address at or above 4 GiB goes through the 64-bit
 //!   direct window: bits 63:60 name the widget and the low 48 bits pass
 //!   through. PCI-local space (below 0x4000_0000), which would reach
@@ -167,6 +171,15 @@ pub const DEVICE_WINDOW_BASE: u32 = 0x20_0000;
 pub const FLASH_BASE: u32 = 0xc0_0000;
 pub const FLASH_SELECT_SIZE: u32 = 0x20_0000;
 pub const DEVICES: usize = 8;
+/// The 32-bit alias of PCI memory space, as an offset in the widget's XIO
+/// space: PCI address 0 on (specification p. 52).
+pub const PIO32_ALIAS: u32 = 0x4000_0000;
+const PIO32_ALIAS_SIZE: u32 = 0x4000_0000;
+/// The widget's 2 GB window, and the CPU window index the alias takes
+/// after the eight device windows.
+pub const LONG_WINDOW_SIZE: u64 = 0x8000_0000;
+const LONG_MASK: u64 = LONG_WINDOW_SIZE - 1;
+const ALIAS_WINDOW: usize = DEVICES;
 pub const PINS: usize = 8;
 pub const ATE_ENTRIES: usize = 128;
 
@@ -576,8 +589,10 @@ impl Bridge {
 
     /// The eight device windows as the Device(x) registers have them: each
     /// opens onto PCI memory or I/O space at the base its register names.
+    /// After them, the 32-bit alias of PCI memory in the 2 GB window.
     fn windows(&self) -> Vec<CpuWindow> {
         let st = self.st.lock();
+        let alias = CpuWindow { space: Space::Mem, cpu: PIO32_ALIAS as u64, pci: 0, len: PIO32_ALIAS_SIZE as u64, mask: LONG_MASK };
         (0..DEVICES as u32)
             .map(|s| {
                 let d = st.r(reg::device(s));
@@ -589,14 +604,25 @@ impl Bridge {
                     mask: WINDOW_MASK as u64,
                 }
             })
+            .chain(std::iter::once(alias))
             .collect()
     }
 
     /// How a CPU access to window `window` reaches a function, from its
     /// Device(x) register: the programmed swap gives a byte stream, otherwise
     /// the device's width gives word values.
+    /// Through the alias, Control's memory swap bit decides, as the
+    /// programmed swap does for a window, and the device counts as 32-bit.
     fn order(&self, window: usize) -> ByteOrder {
-        Self::order_of(self.st.lock().r(reg::device(window as u32)))
+        let st = self.st.lock();
+        if window == ALIAS_WINDOW {
+            return Self::alias_order(st.r(reg::CONTROL));
+        }
+        Self::order_of(st.r(reg::device(window as u32)))
+    }
+
+    fn alias_order(control: u32) -> ByteOrder {
+        if control & CONTROL_MEM_SWAP != 0 { ByteOrder::Stream } else { ByteOrder::values(4) }
     }
 
     fn order_of(device: u32) -> ByteOrder {
@@ -613,9 +639,16 @@ impl Bridge {
     /// search of the bus and no Bridge lock. The run is in the widget's small
     /// window, so a mapped device sees offsets in it. The same configuration
     /// gives back the same device, so updating the mappings does not make the
-    /// physical bus keep a new one.
+    /// physical bus keep a new one. A run in the alias is in the 2 GB window,
+    /// and its device sees offsets in that.
     pub fn bar_device(&self, run: &BarMapping) -> Arc<dyn BusDevice> {
-        self.bar_devices.get(run, WINDOW_MASK as u64, self.order(run.window as usize))
+        let mask = if run.window as usize == ALIAS_WINDOW { LONG_MASK } else { WINDOW_MASK as u64 };
+        self.bar_devices.get(run, mask, self.order(run.window as usize))
+    }
+
+    /// What the machine maps over the widget's 2 GB window.
+    pub fn long_window(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        Arc::new(LongWindow(self.clone()))
     }
 
     /// Fit a flash part on chip select 0. `part` is addressed from the
@@ -1128,6 +1161,25 @@ impl Bridge {
         val.map(|_| 0)
     }
 
+    /// A processor access to PCI memory address `pci` through the 32-bit
+    /// alias. As through a window, nothing driving device select is a
+    /// master time-out: a read fails and a write posts.
+    fn alias_access(&self, pci: u32, size: usize, val: Option<u64>) -> Option<u64> {
+        let order = Self::alias_order(self.st.lock().r(reg::CONTROL));
+        if let Some((f, bar, off)) = self.bus.decode(Space::Mem, pci) {
+            return Some(match val {
+                None => order.read(f, bar, off, size),
+                Some(v) => {
+                    order.write(f, bar, off, size, v);
+                    0
+                }
+            });
+        }
+        let aim = |a: u32, n: usize| if order == ByteOrder::Stream { a } else { a ^ (4 - n.min(4)) as u32 };
+        self.config_error(0, aim(pci, size) as u64);
+        val.map(|_| 0)
+    }
+
     // ---- flash ----
 
     /// The part a window offset selects, and the offset within it. A chip
@@ -1410,6 +1462,7 @@ impl Bridge {
 
     /// As [`Bridge::read`]; the result is a bus status.
     fn write(&self, off: u32, size: usize, val: u64) -> u32 {
+        let swap_was = (off & !7 == reg::CONTROL).then(|| self.st.lock().r(reg::CONTROL) & CONTROL_MEM_SWAP);
         let ok = match off {
             0..=0xffff => {
                 crate::dlog!(LogModule::Bridge, "bridge: write {} /{size} {val:#x}", reg_name(off & !7));
@@ -1429,9 +1482,11 @@ impl Bridge {
             FLASH_BASE..=0xff_ffff => self.flash_write(off - FLASH_BASE, size, val),
             _ => false,
         };
-        // A Device(x) write moves or re-aims a window. Configuration writes
+        // A Device(x) write moves or re-aims a window, and a change of
+        // Control's memory swap bit re-aims the alias. Configuration writes
         // update the mappings inside the bus.
-        if (reg::device(0)..reg::device(DEVICES as u32)).contains(&(off & !7)) {
+        let swap_changed = swap_was.is_some_and(|was| self.st.lock().r(reg::CONTROL) & CONTROL_MEM_SWAP != was);
+        if (reg::device(0)..reg::device(DEVICES as u32)).contains(&(off & !7)) || swap_changed {
             self.bus.set_host_windows(&|| self.windows());
         }
         if ok {
@@ -1495,6 +1550,68 @@ impl crate::traits::Resettable for Bridge {
 
 /// The widget window is decoded from the full physical address.
 const WINDOW_MASK: u32 = WIDGET_SMALL_SIZE - 1;
+
+/// The widget's 2 GB window: the small window's 16 MB, then nothing up to
+/// the 32-bit alias of PCI memory. Runs a BAR decodes whole are mapped over
+/// it; this answers the rest.
+struct LongWindow(Arc<Bridge>);
+
+impl LongWindow {
+    fn read(&self, addr: u64, size: usize) -> Option<u64> {
+        match (addr & LONG_MASK) as u32 {
+            off @ 0..WIDGET_SMALL_SIZE => self.0.read(off, size),
+            off @ PIO32_ALIAS.. => self.0.alias_access(off - PIO32_ALIAS, size, None),
+            // Approximation: the specification calls 16 MB to 1 GB reserved
+            // (p. 52) and does not say what an access there does; a bus
+            // error here.
+            _ => None,
+        }
+    }
+
+    fn write(&self, addr: u64, size: usize, val: u64) -> u32 {
+        match (addr & LONG_MASK) as u32 {
+            off @ 0..WIDGET_SMALL_SIZE => self.0.write(off, size, val),
+            off @ PIO32_ALIAS.. => {
+                self.0.alias_access(off - PIO32_ALIAS, size, Some(val));
+                BUS_OK
+            }
+            _ => BUS_ERR,
+        }
+    }
+}
+
+impl BusDevice for LongWindow {
+    /// A configuration master time-out reached through the window's first
+    /// 16 MB is explained as through the small window.
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
+        let off = addr & LONG_MASK;
+        if off < WIDGET_SMALL_SIZE as u64 { self.0.describe_fault(off, size) } else { None }
+    }
+    fn read8(&self, addr: u64) -> BusRead8 {
+        self.read(addr, 1).map_or(BusRead8::err(), |v| BusRead8::ok(v as u8))
+    }
+    fn read16(&self, addr: u64) -> BusRead16 {
+        self.read(addr, 2).map_or(BusRead16::err(), |v| BusRead16::ok(v as u16))
+    }
+    fn read32(&self, addr: u64) -> BusRead32 {
+        self.read(addr, 4).map_or(BusRead32::err(), |v| BusRead32::ok(v as u32))
+    }
+    fn read64(&self, addr: u64) -> BusRead64 {
+        self.read(addr, 8).map_or(BusRead64::err(), BusRead64::ok)
+    }
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        self.write(addr, 1, val as u64)
+    }
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        self.write(addr, 2, val as u64)
+    }
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        self.write(addr, 4, val as u64)
+    }
+    fn write64(&self, addr: u64, val: u64) -> u32 {
+        self.write(addr, 8, val)
+    }
+}
 
 impl BusDevice for Bridge {
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
