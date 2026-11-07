@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{GraphicsBoard, NetMode};
-use crate::dev::hub_pi;
+use crate::dev::{hub_ni, hub_pi};
 use crate::traits::BUS_OK;
 
 struct Scratch(PathBuf);
@@ -224,6 +224,10 @@ fn a_dropped_machine_frees_its_hub_memory_and_timers() {
     big_stack(|| {
         let dir = Scratch::new("free");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        // A single node has nothing that holds its Hub from its own memory
+        // map. Route the other node numbers through the Hub, as a board with
+        // a cable does, so that only the release in `Drop` can free it.
+        m.node().memory.route_nodes(m.node().hub.claim(Space::Memory));
         let hub = Arc::downgrade(&m.node().hub);
         let memory = Arc::downgrade(m.node().memory.physical());
         let timers = Arc::downgrade(&m.node().timers);
@@ -235,5 +239,51 @@ fn a_dropped_machine_frees_its_hub_memory_and_timers() {
         assert_eq!(timers.strong_count(), 0, "the timer manager");
         assert_eq!(cpu.strong_count(), 0, "the processor");
         assert_eq!(bridge.strong_count(), 0, "the Bridge");
+    });
+}
+
+/// The PROM of a board's second node keeps its stack in uncached Hub-special
+/// memory above the 4 KiB cached alias it programs, and renumbers the node
+/// between saving its return address there and reloading it. The Hub-special
+/// space and the memory claimed by the node's own number stay the node's own
+/// memory; only node zero's window beyond the alias leaves the node, for the
+/// Hub that holds zero, of which there is none here.
+#[test]
+fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
+    big_stack(|| {
+        let dir = Scratch::new("renumber");
+        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let hub = &m.node().hub;
+        m.node().memory.route_nodes(hub.claim(Space::Memory));
+        const SLOT: u64 = 0x1bef_e78;
+        assert_eq!(hub.write64(hub_pi::reg::CALIAS_SIZE, 1), BUS_OK);
+        assert_eq!(hub.cpu_special().write64(SLOT, 0x5a5a), BUS_OK);
+        assert_eq!(hub.write64(hub_ni::reg::STATUS, 1 << 8), BUS_OK);
+        assert_eq!(hub.cpu_special().read64(SLOT).data, 0x5a5a, "the stack slot");
+        assert_eq!(hub.claim(Space::Memory).read64((1 << 32) + SLOT).data, 0x5a5a, "node 1 by number");
+        assert_ne!(m.node().memory.physical().read64(SLOT).status, BUS_OK, "cached, node zero");
+        assert_ne!(hub.cpu_memory().read64(SLOT).status, BUS_OK, "uncached memory, node zero");
+    });
+}
+
+/// A store-conditional is a compare-and-swap once processors share memory,
+/// and a cached reference to a node by number reaches it through the Hub.
+/// Without one there, the processor would fall back to a plain store and two
+/// nodes could both take the same lock.
+#[test]
+fn a_reference_by_node_number_can_compare_and_swap() {
+    big_stack(|| {
+        let dir = Scratch::new("cas");
+        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let hub = &m.node().hub;
+        m.node().memory.route_nodes(hub.claim(Space::Memory));
+        assert_eq!(hub.write64(hub_ni::reg::STATUS, 1 << 8), BUS_OK);
+        let phys = m.node().memory.physical();
+        const WORD: u64 = (1 << 32) + 0x61_c000;
+        assert_eq!(phys.write64(WORD, 0x99), BUS_OK);
+        assert_eq!(phys.cas64(WORD, 0x99, 0x9a), Some(true));
+        assert_eq!(phys.cas64(WORD, 0x99, 0x9b), Some(false));
+        assert_eq!(phys.cas32(WORD + 4, 0x9a, 0x9c), Some(true));
+        assert_eq!(hub.cpu_special().read64(0x61_c000).data, 0x9c);
     });
 }

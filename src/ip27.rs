@@ -18,9 +18,12 @@
 //!
 //! # What is approximated here
 //!
-//! - Cached accesses ignore the node number in address bits 39:32 and use
-//!   node-relative offsets, so they are right for a node numbered zero, which
-//!   is the one-node Origin 200.
+//! - Cached accesses to node zero's window use node-relative offsets while
+//!   the node holds zero, which is the one-node Origin 200 and the first node
+//!   of a deskside. A board with several nodes routes the windows of the
+//!   other node numbers through the Hub ([`NodeMemory::route_nodes`]), and
+//!   sends node zero's, beyond the cached alias, to the Hub that holds zero
+//!   once the node holds another number ([`NodeZero`]).
 //! - The low 128 KiB of the Hub-special memory view is not private to each
 //!   processor of the pair.
 //! - A bank no larger than 128 MiB is one run at its 512 MiB stride; a larger
@@ -40,7 +43,7 @@ use crate::ppmem::devmap::SLOT_SHIFT;
 use crate::ppmem::MappedMemory;
 use crate::traits::*;
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub(crate) const PA_MASK: u64 = (1u64 << 40) - 1;
 /// XKPHYS bits 58:57 ride along with the physical address into the bus.
@@ -54,6 +57,8 @@ pub const SLOT_STRIDE: u64 = 128 << 20;
 pub const BANKS: usize = 4;
 
 const MIB: u64 = 1 << 20;
+/// Node numbers, whose cached windows [`NodeMemory::route_nodes`] answers.
+const NODE_WINDOWS: u64 = 256;
 
 /// Where bank `bank` of `mb` MiB lies: `(node offset, length)` runs, in the
 /// order they take the bank's storage.
@@ -75,6 +80,9 @@ pub fn bank_runs(bank: usize, mb: u32) -> Vec<(u64, u64)> {
 pub struct NodeMemory {
     phys: Arc<Physical>,
     banks_mb: [u32; BANKS],
+    /// The view [`Self::route_nodes`] sent the other node numbers to, held
+    /// weakly: it reaches the Hub, which holds this memory's users.
+    claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
 }
 
 impl NodeMemory {
@@ -104,7 +112,7 @@ impl NodeMemory {
             }
             index += 1;
         }
-        Ok(Self { phys, banks_mb })
+        Ok(Self { phys, banks_mb, claim: Arc::default() })
     }
 
     pub fn physical(&self) -> &Arc<Physical> {
@@ -113,6 +121,40 @@ impl NodeMemory {
 
     pub fn banks_mb(&self) -> [u32; BANKS] {
         self.banks_mb
+    }
+
+    /// Answer cached references to node numbers 1 to 255 through `view`, the
+    /// Hub's node-qualified memory, so a reference to memory another Hub holds
+    /// reaches it across the cable and one that no Hub holds fails, logged by
+    /// the Hub. The windows are 4 GiB apart at address bit 32, above
+    /// everything the node's own banks occupy. Node zero's window is the
+    /// node's own memory and is not routed.
+    pub fn route_nodes(&self, view: Arc<dyn BusDevice>) {
+        *self.claim.lock() = Some(Arc::downgrade(&view));
+        for node in 1..NODE_WINDOWS {
+            self.phys.map(node << 32, (node + 1) << 32, view.clone(), "node-qualified memory");
+        }
+    }
+
+    /// The node's answer to a node-zero cached reference once the node holds
+    /// another number, for [`NodeZero::update`] to apply. It sends the
+    /// reference to the view [`Self::route_nodes`] was given, so a board with
+    /// one node, which routes nothing, never sends it anywhere.
+    pub fn node_zero(&self) -> Arc<NodeZero> {
+        Arc::new(NodeZero {
+            phys: Arc::downgrade(&self.phys),
+            banks_mb: self.banks_mb,
+            claim: self.claim.clone(),
+            state: Mutex::new(NodeZeroState { number: 0, calias: 0, away: false }),
+        })
+    }
+
+    /// The node's memory at its node-relative offsets whatever number the
+    /// node holds, for the Hub's spaces: the Hub-special space, and every
+    /// reference another Hub or an engine makes by the node's number.
+    /// [`NodeZero`] reroutes only the processor's own cached references.
+    pub fn home(&self) -> Arc<dyn BusDevice> {
+        Arc::new(Home::new(self.phys.clone(), self.banks_mb))
     }
 
     /// Place the boot flash's reset view in node memory.
@@ -148,6 +190,88 @@ impl NodeMemory {
     pub fn back_door(&self) -> Arc<Backdoor> {
         Backdoor::new(self.banks_mb)
     }
+}
+
+/// [`NodeMemory::home`]: an offset inside a fitted run reaches its bank
+/// directly, past whatever [`NodeZero`] put in the decode table there; any
+/// other offset is the decode table's.
+struct Home {
+    phys: Arc<Physical>,
+    /// Each bank's fitted runs, built once: a node offset names a bank by
+    /// its stride, and a bank has at most four runs.
+    runs: [[Option<HomeRun>; 4]; BANKS],
+}
+
+/// One fitted run: where it lies in the node's offsets, which RAM bank holds
+/// it and where in that bank it starts.
+#[derive(Clone, Copy)]
+struct HomeRun {
+    at: u64,
+    len: u64,
+    index: usize,
+    src: u64,
+}
+
+impl Home {
+    fn new(phys: Arc<Physical>, banks_mb: [u32; BANKS]) -> Self {
+        let mut runs = [[None; 4]; BANKS];
+        let mut index = 0;
+        for (bank, &mb) in banks_mb.iter().enumerate() {
+            if mb == 0 {
+                continue;
+            }
+            let mut src = 0;
+            for (n, (at, len)) in bank_runs(bank, mb).into_iter().enumerate() {
+                runs[bank][n] = Some(HomeRun { at, len, index, src });
+                src += len;
+            }
+            index += 1;
+        }
+        Self { phys, runs }
+    }
+
+    /// The bank index and the offset within it that node offset `a` names,
+    /// if a fitted run holds it. No allocation: this is on every access.
+    #[inline]
+    fn bank(&self, a: u64) -> Option<(usize, u64)> {
+        let runs = self.runs.get((a / BANK_STRIDE) as usize)?;
+        runs.iter().flatten().find(|r| (r.at..r.at + r.len).contains(&a)).map(|r| (r.index, r.src + a - r.at))
+    }
+}
+
+macro_rules! home_access {
+    ($r:ident, $w:ident, $t:ty, $out:ident) => {
+        fn $r(&self, a: u64) -> $out {
+            match self.bank(a) {
+                Some((i, at)) => self.phys.banks()[i].$r(at),
+                None => self.phys.$r(a),
+            }
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            match self.bank(a) {
+                Some((i, at)) => self.phys.banks()[i].$w(at, v),
+                None => self.phys.$w(a, v),
+            }
+        }
+    };
+}
+impl BusDevice for Home {
+    fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> {
+        match self.bank(a) {
+            Some((i, at)) => self.phys.banks()[i].cas32(at, old, new),
+            None => self.phys.cas32(a, old, new),
+        }
+    }
+    fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
+        match self.bank(a) {
+            Some((i, at)) => self.phys.banks()[i].cas64(at, old, new),
+            None => self.phys.cas64(a, old, new),
+        }
+    }
+    home_access!(read8, write8, u8, BusRead8);
+    home_access!(read16, write16, u16, BusRead16);
+    home_access!(read32, write32, u32, BusRead32);
+    home_access!(read64, write64, u64, BusRead64);
 }
 
 /// Memory that is not fitted: reads zero, drops writes. `phys hole on` logs it.
@@ -297,6 +421,96 @@ impl BusDevice for Ip27Bus {
     bus_access!(read16, write16, u16, BusRead16);
     bus_access!(read32, write32, u32, BusRead32);
     bus_access!(read64, write64, u64, BusRead64);
+}
+
+/// Where a node that holds a nonzero number sends a cached reference that
+/// names node zero. Within the cached alias the reference stays on the node.
+/// Beyond it the node-qualified memory answers by number, and the reference
+/// reaches whichever Hub holds zero, across the cable. The node's own memory
+/// is then reached by its own number.
+///
+/// Node zero's window is the node's own memory, and its RAM is mapped into
+/// the ppmem window the cache and the JIT read directly. Sending a reference
+/// elsewhere takes the mapping away, so every cached reference of the node
+/// takes the bus path while the number is nonzero. That costs the second node
+/// speed and nothing else, since its software addresses its memory by its
+/// number.
+pub struct NodeZero {
+    /// Weak: the Hub that owns this through its hooks also owns the memory.
+    phys: Weak<Physical>,
+    banks_mb: [u32; BANKS],
+    claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
+    state: Mutex<NodeZeroState>,
+}
+
+struct NodeZeroState {
+    number: u16,
+    /// The cached alias size in bytes.
+    calias: u64,
+    /// Whether the RAM beyond the alias is sent through the claim.
+    away: bool,
+}
+
+impl NodeZero {
+    /// The number the node last held.
+    pub fn number(&self) -> u16 {
+        self.state.lock().number
+    }
+
+    /// The node holds `number` and its cached alias spans `calias` bytes
+    /// (the node's number changed, or the alias did).
+    pub fn update(&self, number: u16, calias: u64) {
+        let mut st = self.state.lock();
+        st.number = number;
+        st.calias = calias;
+        self.apply(&mut st);
+    }
+
+    fn apply(&self, st: &mut NodeZeroState) {
+        let Some(phys) = self.phys.upgrade() else { return };
+        let claim = self.claim.lock().as_ref().and_then(Weak::upgrade);
+        let away = st.number != 0 && claim.is_some();
+        if !away && !st.away {
+            return;
+        }
+        let ppmem = phys.ppmem_space();
+        if let Some(sp) = ppmem {
+            sp.clear_mappings();
+        }
+        let mut index = 0;
+        for (bank, &mb) in self.banks_mb.iter().enumerate() {
+            if mb == 0 {
+                continue;
+            }
+            let mut src = 0u64;
+            for (at, len) in bank_runs(bank, mb) {
+                let end = at + len;
+                // The part of the run past the alias goes through the claim;
+                // the rest, and every run when the number is zero, is the
+                // bank.
+                let split = if away { st.calias.clamp(at, end) } else { end };
+                if split > at {
+                    let first = at >> SLOT_SHIFT;
+                    phys.fill_slots(first, (split - at) >> SLOT_SHIFT, phys.bank_view(index, at.wrapping_sub(src)));
+                }
+                if split < end {
+                    if let Some(claim) = &claim {
+                        phys.map(split, end, claim.clone(), "node zero beyond the cached alias");
+                    }
+                }
+                if !away {
+                    if let Some(sp) = ppmem {
+                        if end <= sp.window_size() {
+                            let _ = sp.map_range(index, src, at, len);
+                        }
+                    }
+                }
+                src += len;
+            }
+            index += 1;
+        }
+        st.away = away;
+    }
 }
 
 #[cfg(test)]
