@@ -71,6 +71,7 @@ pub mod hub_io;
 pub mod hub_md;
 pub mod hub_ni;
 pub mod hub_pi;
+pub mod dp83840;
 pub mod dp83843;
 pub mod ics1890;
 pub mod timekeeper;
