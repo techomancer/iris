@@ -142,6 +142,15 @@ impl Media {
         }
     }
 
+    /// What a diagnostic calls this device: the disk's image path, or the
+    /// CD-ROM drive.
+    fn label(&self) -> &str {
+        match self {
+            Media::Fixed(_, path) => path,
+            Media::Changer(_) => "CD-ROM drive",
+        }
+    }
+
     fn present(&self) -> bool {
         match self {
             Media::Fixed(..) => true,
@@ -153,6 +162,51 @@ impl Media {
         match self {
             Media::Fixed(..) => false,
             Media::Changer(c) => c.take_changed(),
+        }
+    }
+}
+
+/// Host I/O errors behind MEDIUM ERROR answers, counted per operation and
+/// error. A guest that keeps writing to a full host disk fails thousands of
+/// commands; the log gets the first of each kind and then each power of two,
+/// enough to tell a host problem from a guest one without flooding.
+#[derive(Default)]
+struct HostErrors {
+    seen: Vec<(&'static str, String, u64)>,
+    /// Where a line goes; stderr, through [`crate::safe_eprintln!`], when unset.
+    sink: Option<Box<dyn io::Write + Send>>,
+}
+
+impl HostErrors {
+    /// Distinct errors tracked; a host has few ways to fail, and a bound
+    /// keeps a flood of odd ones from growing this.
+    const MAX_KINDS: usize = 8;
+
+    fn note(&mut self, target: &str, op: &'static str, lba: Option<u64>, e: &io::Error) {
+        let msg = e.to_string();
+        let n = match self.seen.iter().position(|(o, m, _)| *o == op && *m == msg) {
+            Some(i) => {
+                self.seen[i].2 += 1;
+                self.seen[i].2
+            }
+            None if self.seen.len() < Self::MAX_KINDS => {
+                self.seen.push((op, msg.clone(), 1));
+                1
+            }
+            None => return,
+        };
+        if !n.is_power_of_two() {
+            return;
+        }
+        let at = lba.map(|l| format!(" at LBA {l}")).unwrap_or_default();
+        let args = format_args!(
+            "iris: scsi: host {op} of {target}{at} failed: {msg} (occurrence {n}); the guest sees MEDIUM ERROR 3/0c/00"
+        );
+        match &mut self.sink {
+            Some(w) => {
+                let _ = writeln!(w, "{args}");
+            }
+            None => crate::safe_eprintln!("{args}"),
         }
     }
 }
@@ -180,6 +234,7 @@ pub struct ScsiDevice {
     /// The disk's background sync, whose thread runs until this is dropped.
     /// A read-only image has none.
     background: Option<std::sync::Arc<Background>>,
+    host_errors: HostErrors,
 }
 
 impl Drop for ScsiDevice {
@@ -232,6 +287,7 @@ impl ScsiDevice {
             write_cache: false,
             power_on_write_cache: false,
             background,
+            host_errors: HostErrors::default(),
         }
     }
 
@@ -251,6 +307,7 @@ impl ScsiDevice {
             write_cache: false,
             power_on_write_cache: false,
             background: None,
+            host_errors: HostErrors::default(),
         }
     }
 
@@ -322,6 +379,14 @@ impl ScsiDevice {
         self.pending_sense[7] = 10;   // Additional length
         self.pending_sense[12] = asc;
         self.pending_sense[13] = ascq;
+    }
+
+    /// MEDIUM ERROR / write error for a write or sync the host refused, with
+    /// the host's reason logged. Without it a full host disk looks like a
+    /// failing disk to the guest and nothing at all to the person running iris.
+    fn write_failed(&mut self, op: &'static str, lba: Option<u64>, e: &io::Error) -> ScsiResponse {
+        self.host_errors.note(self.media.label(), op, lba, e);
+        self.check_condition(0x03, 0x0c, 0x00)
     }
 
     fn check_condition(&mut self, key: u8, asc: u8, ascq: u8) -> ScsiResponse {
@@ -493,13 +558,15 @@ impl ScsiDevice {
         if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         }
-        if self.media.node_mut().write(lba * 512, data).is_err() {
-            return Ok(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+        if let Err(e) = self.media.node_mut().write(lba * 512, data) {
+            return Ok(self.write_failed("write", Some(lba), &e));
         }
         // The backend has the data, but only a sync puts it on the host's disk.
         // The guest asks for that with FUA, or for every write by clearing WCE.
-        if (fua || !self.write_cache) && self.media.node_mut().flush_data().is_err() {
-            return Ok(self.check_condition(0x03, 0x0c, 0x00));
+        if fua || !self.write_cache {
+            if let Err(e) = self.media.node_mut().flush_data() {
+                return Ok(self.write_failed("sync", Some(lba), &e));
+            }
         }
 
         Ok(ScsiResponse {
@@ -735,8 +802,10 @@ impl ScsiDevice {
         let cleared = self.write_cache && !write_cache;
         self.write_cache = write_cache;
         // A guest that clears WCE believes what it wrote so far is stored.
-        if cleared && self.media.node_mut().flush_data().is_err() {
-            return Err(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+        if cleared {
+            if let Err(e) = self.media.node_mut().flush_data() {
+                return Err(self.write_failed("sync", None, &e));
+            }
         }
         Ok(())
     }
@@ -1781,6 +1850,120 @@ mod tests {
         let r = dev.request(&request(&[0x2a, 0x08, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x5a; 512]))).unwrap();
         assert_eq!(r.status, 0x02);
         assert_eq!(sense_key_asc(&mut dev), (0x03, 0x0c));
+    }
+
+    /// A writer the test reads back what iris would have put on stderr.
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    impl Sink {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap().lines().map(String::from).collect()
+        }
+    }
+
+    /// A disk whose host file refuses writes with `ENOSPC`, as a full
+    /// filesystem does.
+    struct FullHostDisk(CountingNode);
+    impl crate::block_node::BlockNode for FullHostDisk {
+        fn size(&self) -> u64 { self.0.size() }
+        fn read(&mut self, o: u64, b: &mut [u8]) -> io::Result<()> { self.0.read(o, b) }
+        fn write(&mut self, _: u64, _: &[u8]) -> io::Result<()> { Err(io::Error::from_raw_os_error(28)) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn discard(&mut self, o: u64, l: u64) -> io::Result<()> { self.0.discard(o, l) }
+        fn block_status(&self, o: u64, l: u64) -> io::Result<crate::block_node::BlockStatus> { self.0.block_status(o, l) }
+        fn backing(&self) -> Option<&dyn crate::block_node::BlockNode> { None }
+    }
+
+    fn full_host_disk() -> (ScsiDevice, Sink) {
+        let inner = CountingNode { data: vec![0u8; 8 * 512], counts: Default::default() };
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        let mut dev = ScsiDevice::new(Box::new(FullHostDisk(inner)), false, "/runs/root.overlay".into(), Vec::new(), identity);
+        let sink = Sink::default();
+        dev.host_errors.sink = Some(Box::new(sink.clone()));
+        (dev, sink)
+    }
+
+    fn write_lba(dev: &mut ScsiDevice, lba: u8) -> ScsiResponse {
+        dev.request(&request(&[0x2a, 0, 0, 0, 0, lba, 0, 0, 1, 0], Some(vec![0x5a; 512]))).unwrap()
+    }
+
+    /// A write the host refuses is MEDIUM ERROR to the guest and, to the
+    /// person running iris, a line naming the device and the host's reason.
+    #[test]
+    fn a_failed_host_write_is_logged_with_its_errno() {
+        let (mut dev, sink) = full_host_disk();
+        let r = write_lba(&mut dev, 3);
+        assert_eq!(r.status, 0x02);
+        assert_eq!(sense_key_asc(&mut dev), (0x03, 0x0c));
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for part in ["write", "/runs/root.overlay", "LBA 3", "No space left on device", "os error 28", "3/0c/00"] {
+            assert!(lines[0].contains(part), "{part:?} missing from {:?}", lines[0]);
+        }
+    }
+
+    /// The same failure repeated logs on the first and each power of two, so
+    /// a guest hammering a full disk does not flood stderr.
+    #[test]
+    fn a_repeating_host_error_is_logged_at_powers_of_two() {
+        let (mut dev, sink) = full_host_disk();
+        for _ in 0..9 {
+            assert_eq!(write_lba(&mut dev, 1).status, 0x02);
+        }
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 4, "{lines:?}"); // 1, 2, 4, 8
+        for (line, n) in lines.iter().zip([1, 2, 4, 8]) {
+            assert!(line.contains(&format!("(occurrence {n})")), "{line}");
+        }
+    }
+
+    /// A different error is a new kind, logged on its own first occurrence.
+    #[test]
+    fn a_different_host_error_is_logged_separately() {
+        let mut log = HostErrors::default();
+        let sink = Sink::default();
+        log.sink = Some(Box::new(sink.clone()));
+        let enospc = io::Error::from_raw_os_error(28);
+        let eio = io::Error::from_raw_os_error(5);
+        log.note("d", "write", Some(0), &enospc);
+        log.note("d", "write", Some(1), &enospc);
+        log.note("d", "write", Some(2), &eio);
+        log.note("d", "sync", Some(2), &eio);
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 4, "{lines:?}"); // enospc 1 and 2, eio write 1, eio sync 1
+        assert!(lines[2].contains("Input/output error") && lines[2].contains("occurrence 1"));
+    }
+
+    /// A sync that fails names the sync and the host's reason too.
+    #[test]
+    fn a_failed_host_sync_is_logged() {
+        let inner = CountingNode { data: vec![0u8; 8 * 512], counts: Default::default() };
+        struct Failing(CountingNode);
+        impl crate::block_node::BlockNode for Failing {
+            fn size(&self) -> u64 { self.0.size() }
+            fn read(&mut self, o: u64, b: &mut [u8]) -> io::Result<()> { self.0.read(o, b) }
+            fn write(&mut self, o: u64, b: &[u8]) -> io::Result<()> { self.0.write(o, b) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush_data(&mut self) -> io::Result<()> { Err(io::Error::from_raw_os_error(5)) }
+            fn discard(&mut self, o: u64, l: u64) -> io::Result<()> { self.0.discard(o, l) }
+            fn block_status(&self, o: u64, l: u64) -> io::Result<crate::block_node::BlockStatus> { self.0.block_status(o, l) }
+            fn backing(&self) -> Option<&dyn crate::block_node::BlockNode> { None }
+        }
+        let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
+        let mut dev = ScsiDevice::new(Box::new(Failing(inner)), false, "mock".into(), Vec::new(), identity);
+        let sink = Sink::default();
+        dev.host_errors.sink = Some(Box::new(sink.clone()));
+        assert_eq!(write_lba(&mut dev, 2).status, 0x02);
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("sync") && lines[0].contains("Input/output error"), "{}", lines[0]);
     }
 
     /// The raw and overlay backends take FUA without error.
