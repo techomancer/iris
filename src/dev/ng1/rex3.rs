@@ -3085,12 +3085,9 @@ impl Rex3 {
                     if ctx.host_len > 1 && (ctx.drawmode0.colorhost() || ctx.drawmode0.alphahost()) {
                         self.note_hostrw_writes(ctx.host_len);
                     }
-                    // Same batch resume loop the interpreter path runs below: a
-                    // shader consumes exactly one host word per call (its
-                    // host_xstop stops it at a word boundary), so a batch of N
-                    // words needs N calls. Without this the JIT would paint the
-                    // first word and silently drop the rest — which is why
-                    // batches used to bypass the JIT entirely instead.
+                    // Same batch resume loop the interpreter path runs below:
+                    // a shader can return at a row or word boundary before a
+                    // batch is drained. Resume it until the port is consumed.
                     //
                     // Not gated on `mid_primitive`: without STOPONY the walker
                     // clears it at every row end, and each row is its own
@@ -3105,10 +3102,11 @@ impl Rex3 {
                         // holding the GFIFO.
                         if ctx.host_cursor == before { break; }
                     }
-                    if ctx.host_len > 1 {
-                        ctx.host_len = 1;
-                        ctx.host_cursor = 0;
-                    }
+                    // Retire single-word PIO transfers too, just as the
+                    // interpreter does. A checkpoint may start a replay
+                    // between GOs and the resting port cursor is not saved.
+                    ctx.host_len = 1;
+                    ctx.host_cursor = 0;
                     #[cfg(feature = "rex-dirty-upload")]
                     if let Some(damage) = damage {
                         self.mark_framebuffer_rect(damage.plane, damage.rect);

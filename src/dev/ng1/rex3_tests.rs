@@ -1223,6 +1223,685 @@ const DM1_RGB24_HOSTRW: u32 =
 // RGB24 64-bit: same as above + rwdouble (bit 10)
 const DM1_RGB24_HOSTRW64: u32 = DM1_RGB24_HOSTRW | (1 << 10);
 
+#[cfg(all(feature = "rex-jit", feature = "rexdiag"))]
+mod hostrw_context_equivalence {
+    use super::*;
+
+    fn compile(rex: &Rex3, dm0: u32, dm1: u32, clipmode: u32) {
+        let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(dm1, dm0 & 3);
+        let jit = rex.rex_jit.as_ref().expect("REX JIT");
+        jit.request_compile(dm0, dm1, clipmode);
+        assert!(jit.wait_compiled(dm0, dm1, clipmode),
+            "shader did not compile: dm0={dm0:#x} dm1={dm1:#x} cm={clipmode:#x}");
+    }
+
+    fn assert_context_equal(interp: &Rex3, compiled: &Rex3) {
+        wait(interp);
+        wait(compiled);
+        let a = unsafe { &*interp.context.get() };
+        let b = unsafe { &*compiled.context.get() };
+        assert_eq!(save_rex3_context(b), save_rex3_context(a));
+        assert_eq!((b.hostrw[0], b.host_cursor, b.host_len, b.pat_bit, b.zpat_bit, b.mid_primitive),
+            (a.hostrw[0], a.host_cursor, a.host_len, a.pat_bit, a.zpat_bit, a.mid_primitive));
+    }
+
+    fn assert_checkpoint_equal(interp: &Rex3, compiled: &Rex3) {
+        assert_context_equal(interp, compiled);
+        #[cfg(feature = "gputrace")]
+        assert_eq!(interp.rec_state_hash(), compiled.rec_state_hash());
+    }
+
+    #[test]
+    fn one_pixel_hostw_and_hostr_preserve_shifter_state() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compile(compiled, DM0_READ_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+            reg(rex, REX3_HOSTRW1, 0x1122_3344);
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0xff12_3456);
+            wait(rex);
+        }
+
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 1);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        assert_eq!(read_pixel(interp, 4, 5) & 0x00ff_ffff, 0x0012_3456);
+        assert_eq!(read_pixel(compiled, 4, 5), read_pixel(interp, 4, 5));
+        let interp_ctx = unsafe { &*interp.context.get() };
+        let compiled_ctx = unsafe { &*compiled.context.get() };
+        assert_eq!(interp_ctx.host_shifter, 0x1122_3344_0000_0000);
+        assert_eq!(save_rex3_context(compiled_ctx), save_rex3_context(interp_ctx),
+            "context after 1x1 HOSTW");
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            assert_eq!(read_hostrw32_last(rex), 0xff12_3456);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 2);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        let interp_ctx = unsafe { &*interp.context.get() };
+        let compiled_ctx = unsafe { &*compiled.context.get() };
+        assert_eq!(interp_ctx.host_shifter, 0x0000_0000_ff12_3456);
+        assert_eq!(save_rex3_context(compiled_ctx), save_rex3_context(interp_ctx),
+            "context after 1x1 HOSTR");
+        assert_checkpoint_equal(interp, compiled);
+    }
+
+    #[test]
+    fn generated_live_shader_and_cranelift_match_interpreter() {
+        let interp = &make_rex3();
+        let generated = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_RGB24_HOSTRW, DM0_HOSTW_BLOCK & 3);
+        let key = (DM0_HOSTW_BLOCK, dm1, cm);
+        let shader = crate::dev::ng1::rex3_shaders::SHADERS.iter()
+            .find_map(|(k, f)| (*k == key).then_some(*f))
+            .expect("generated HOSTW shader");
+        generated.shaders.write().insert(key, shader);
+        generated.jit_enabled.store(true, Ordering::Relaxed);
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compile(compiled, DM0_READ_BLOCK, DM1_RGB24_HOSTRW, cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, generated, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+            reg(rex, REX3_HOSTRW1, 0x1122_3344);
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0xff12_3456);
+            wait(rex);
+        }
+        assert_eq!(generated.jit_go_count.load(Ordering::Relaxed), 1);
+        assert_eq!(generated.interp_go_count.load(Ordering::Relaxed), 0);
+        assert_checkpoint_equal(interp, generated);
+        assert_checkpoint_equal(interp, compiled);
+
+        generated.jit_enabled.store(false, Ordering::Relaxed);
+        for rex in [interp, generated, compiled] {
+            reg(rex, REX3_XYENDI, xy(4, 5));
+            reg(rex, REX3_XYSTARTI, xy(4, 5));
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            assert_eq!(read_hostrw32_last(rex), 0xff12_3456);
+        }
+        assert_checkpoint_equal(interp, generated);
+        assert_checkpoint_equal(interp, compiled);
+        assert_eq!(generated.interp_go_count.load(Ordering::Relaxed), 1);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 2);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn packed_rows_preserve_full_and_partial_words() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        for dm1 in [DM1_CI8_HOSTRW, DM1_CI8_HOSTRW64] {
+            compile(compiled, DM0_HOSTW_BLOCK, dm1, cm);
+            compile(compiled, DM0_READ_BLOCK, dm1, cm);
+        }
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for (dm1, slots) in [(DM1_CI8_HOSTRW, 4usize), (DM1_CI8_HOSTRW64, 8)] {
+            for width in [1usize, 3, 4, 5, 8, 9] {
+                let before = compiled.jit_go_count.load(Ordering::Relaxed);
+                for rex in [interp, compiled] {
+                    rex3init(rex);
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK, 0xff);
+                    reg(rex, REX3_HOSTRW1, 0);
+                    reg(rex, REX3_XYENDI, xy(50 + width as i32 - 1, 21));
+                    reg(rex, REX3_XYSTARTI, xy(50, 20));
+                    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+                }
+
+                let mut expected_reads = Vec::new();
+                for row in 0..2usize {
+                    for start in (0..width).step_by(slots) {
+                        let used = (width - start).min(slots);
+                        let mut input = 0u64;
+                        let mut output = 0u64;
+                        for slot in 0..slots {
+                            let pixel = if slot < used {
+                                (1 + row * 32 + start + slot) as u64
+                            } else {
+                                0xd0 + slot as u64
+                            };
+                            input |= pixel << (56 - slot * 8);
+                            if slot < used {
+                                output |= pixel << (56 - slot * 8);
+                            }
+                        }
+                        expected_reads.push(output);
+                        for rex in [interp, compiled] {
+                            if slots == 4 {
+                                write_hostrw32(rex, (input >> 32) as u32);
+                            } else {
+                                write_hostrw64(rex, input);
+                            }
+                            wait(rex);
+                        }
+                        assert_context_equal(interp, compiled);
+                        let ctx = unsafe { &*interp.context.get() };
+                        assert_eq!(ctx.hostcnt, (slots - used) as u32, "{width}px row {row}");
+                        assert_eq!(ctx.host_shifter, input.checked_shl((used * 8) as u32).unwrap_or(0),
+                            "{width}px row {row}");
+                    }
+                }
+                for row in 0..2usize {
+                    for x in 0..width {
+                        assert_eq!(read_pixel(interp, 50 + x as i32, 20 + row as i32) & 0xff,
+                            (1 + row * 32 + x) as u32);
+                    }
+                }
+                assert_checkpoint_equal(interp, compiled);
+
+                for rex in [interp, compiled] {
+                    reg(rex, REX3_HOSTRW1, 0);
+                    reg(rex, REX3_XYENDI, xy(50 + width as i32 - 1, 21));
+                    reg(rex, REX3_XYSTARTI, xy(50, 20));
+                    reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+                }
+                for (i, &expected) in expected_reads.iter().enumerate() {
+                    let last = i + 1 == expected_reads.len();
+                    let read = |rex: &Rex3| {
+                        if slots == 4 {
+                            (if last { read_hostrw32_last(rex) } else { read_hostrw32(rex) }) as u64
+                        } else if last {
+                            read_hostrw64_last(rex)
+                        } else {
+                            read_hostrw64(rex)
+                        }
+                    };
+                    let a = read(interp);
+                    let b = read(compiled);
+                    let want = if slots == 4 { expected >> 32 } else { expected };
+                    assert_eq!((a, b), (want, want), "{width}px read {i}");
+                    assert_context_equal(interp, compiled);
+                }
+                assert_checkpoint_equal(interp, compiled);
+                assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed) - before,
+                    (2 * expected_reads.len()) as u64);
+                assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn clipping_consumes_host_pixels_but_pattern_misses_do_not() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = (0xF << CLIPMODE_CIDMATCH_SHIFT) | CLIPMODE_ENSMASK_SMASK0;
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+        compile(compiled, DM0_READ_BLOCK, DM1_CI8_HOSTRW, cm);
+        let patterned = DM0_HOSTW_BLOCK | DRAWMODE0_ENZPATTERN;
+        let default_cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(compiled, patterned, DM1_CI8_HOSTRW, default_cm);
+        let cid_cm = 1 << CLIPMODE_CIDMATCH_SHIFT;
+        compile(compiled, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cid_cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+            reg(rex, REX3_WRMASK, 0xff);
+            reg(rex, REX3_CLIPMODE, cm);
+            reg(rex, REX3_SMASK0X, xy(12, 13));
+            reg(rex, REX3_SMASK0Y, xy(20, 20));
+            reg(rex, REX3_XYENDI, xy(13, 20));
+            reg(rex, REX3_XYSTARTI, xy(10, 20));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0x1122_3344);
+            wait(rex);
+        }
+        assert_eq!((read_pixel(interp, 10, 20), read_pixel(interp, 11, 20),
+            read_pixel(interp, 12, 20), read_pixel(interp, 13, 20)), (0, 0, 0x33, 0x44));
+        assert_checkpoint_equal(interp, compiled);
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_XYENDI, xy(13, 20));
+            reg(rex, REX3_XYSTARTI, xy(10, 20));
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            assert_eq!(read_hostrw32_last(rex), 0x0000_3344);
+        }
+        assert_checkpoint_equal(interp, compiled);
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_CLIPMODE, default_cm);
+            reg(rex, REX3_ZPATTERN, 0b101110 << 26);
+            reg(rex, REX3_XYENDI, xy(35, 21));
+            reg(rex, REX3_XYSTARTI, xy(30, 21));
+            reg(rex, REX3_DRAWMODE0, patterned);
+            write_hostrw32(rex, 0x1122_3344);
+            wait(rex);
+        }
+        let row: Vec<_> = (30..=35).map(|x| read_pixel(interp, x, 21)).collect();
+        assert_eq!(row, [0x11, 0, 0x22, 0x33, 0x44, 0]);
+        assert_checkpoint_equal(interp, compiled);
+
+        for rex in [interp, compiled] {
+            for x in 40..=43 {
+                unsafe { (*rex.fb_aux.get())[21 * 2048 + x] = (x & 1) as u32; }
+            }
+            reg(rex, REX3_CLIPMODE, cid_cm);
+            reg(rex, REX3_XYENDI, xy(43, 21));
+            reg(rex, REX3_XYSTARTI, xy(40, 21));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0x1122_3344);
+            wait(rex);
+        }
+        let row: Vec<_> = (40..=43).map(|x| read_pixel(interp, x, 21)).collect();
+        assert_eq!(row, [0x11, 0, 0x33, 0]);
+        assert_checkpoint_equal(interp, compiled);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 4);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn host_formats_preserve_shifter_and_readback_state() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        let modes = [
+            ("4-bit CI", DM1_CI8_HOSTRW & !(3 << 8), 4usize, false),
+            ("12-bit CI", (DM1_CI8_HOSTRW & !(3 << 8)) | (2 << 8), 2, false),
+            ("unpacked CI", DM1_CI8_HOSTRW & !(1 << 7), 1, false),
+            ("swapped CI", DM1_CI8_HOSTRW | (1 << 11), 4, false),
+            ("swapped double CI", DM1_CI8_HOSTRW64 | (1 << 11), 8, true),
+            ("double RGB", DM1_RGB24_HOSTRW64, 2, true),
+        ];
+        for &(_, dm1, _, _) in &modes {
+            compile(compiled, DM0_HOSTW_BLOCK, dm1, cm);
+            compile(compiled, DM0_READ_BLOCK, dm1, cm);
+        }
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for &(name, dm1, slots, double) in &modes {
+            let nwords = (3 + slots - 1) / slots;
+            let before = compiled.jit_go_count.load(Ordering::Relaxed);
+            for rex in [interp, compiled] {
+                rex3init(rex);
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK, 0x00ff_ffff);
+                reg(rex, REX3_HOSTRW1, 0x5566_7788);
+                reg(rex, REX3_XYENDI, xy(82, 25));
+                reg(rex, REX3_XYSTARTI, xy(80, 25));
+                reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            }
+            for i in 0..nwords {
+                let word = 0x1234_5678_9abc_def0u64 ^ ((i as u64) << 40);
+                for rex in [interp, compiled] {
+                    if double {
+                        write_hostrw64(rex, word);
+                    } else {
+                        write_hostrw32(rex, (word >> 32) as u32);
+                    }
+                    wait(rex);
+                }
+                assert_context_equal(interp, compiled);
+            }
+            assert_checkpoint_equal(interp, compiled);
+            for x in 80..=82 {
+                assert_eq!(read_pixel(compiled, x, 25), read_pixel(interp, x, 25), "{name} x={x}");
+            }
+            for rex in [interp, compiled] {
+                reg(rex, REX3_XYENDI, xy(82, 25));
+                reg(rex, REX3_XYSTARTI, xy(80, 25));
+                reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            }
+            for i in 0..nwords {
+                let read = |rex: &Rex3| {
+                    if double {
+                        if i + 1 == nwords { read_hostrw64_last(rex) } else { read_hostrw64(rex) }
+                    } else {
+                        (if i + 1 == nwords { read_hostrw32_last(rex) } else { read_hostrw32(rex) }) as u64
+                    }
+                };
+                assert_eq!(read(compiled), read(interp), "{name} word {i}");
+                assert_context_equal(interp, compiled);
+            }
+            assert_checkpoint_equal(interp, compiled);
+            assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed) - before, (2 * nwords) as u64,
+                "{name}");
+            assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn hostr_reads_offscreen_vram_and_zeroes_out_of_bounds_pixels() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        compile(compiled, DM0_READ_BLOCK, DM1_CI8_HOSTRW, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+            for (x, pixel) in [(0usize, 0x55), (1343, 0x11), (1344, 0x22),
+                (1345, 0x33), (2047, 0x44)] {
+                unsafe { (*rex.fb_rgb.get())[28 * 2048 + x] = pixel; }
+            }
+        }
+        for (start, end, expected) in [(1343, 1345, 0x1122_3300),
+            (2047, 2048, 0x4400_0000), (-1, 0, 0x0055_0000)] {
+            for rex in [interp, compiled] {
+                reg(rex, REX3_HOSTRW1, 0);
+                reg(rex, REX3_XYENDI, xy(end, 28));
+                reg(rex, REX3_XYSTARTI, xy(start, 28));
+                reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            }
+            assert_eq!(read_hostrw32_last(interp), expected);
+            assert_eq!(read_hostrw32_last(compiled), expected);
+            assert_checkpoint_equal(interp, compiled);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 3);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn alphahost_preserves_nonpacked_shifter_state() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+            | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+            | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+            | DRAWMODE1_LOGICOP_SRC_SH;
+        let dm0 = DM0_DRAW_BLOCK | (1 << 7);
+        compile(compiled, dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(rex, REX3_HOSTRW1, 0x1122_3344);
+            reg(rex, REX3_COLORRED, 0xc0 << 11);
+            reg(rex, REX3_COLORGRN, 0xc0 << 11);
+            reg(rex, REX3_COLORBLUE, 0xc0 << 11);
+            reg(rex, REX3_DRAWMODE0, dm0);
+        }
+        for (x, alpha) in [0x00u32, 0x80, 0xff].into_iter().enumerate() {
+            for rex in [interp, compiled] {
+                reg(rex, REX3_XYENDI, xy(x as i32, 27));
+                reg(rex, REX3_XYSTARTI, xy(x as i32, 27));
+                write_hostrw32(rex, alpha << 24);
+                wait(rex);
+            }
+            assert_context_equal(interp, compiled);
+            assert_eq!(unsafe { (*compiled.context.get()).host_shifter },
+                ((alpha as u64) << 56) | 0x1122_3344);
+        }
+        assert_eq!((0..3).map(|x| read_pixel(interp, x, 27)).collect::<Vec<_>>(),
+            [0x000000, 0x606060, 0xc0c0c0]);
+        assert_checkpoint_equal(interp, compiled);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 3);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn review_alphahost_stopony_single_row_per_go() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let dm0 = 0x286;
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+            | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+            | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+            | DRAWMODE1_LOGICOP_SRC_SH;
+        compile(compiled, dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compile(compiled, dm0 | DM0_STOPONX, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(rex, REX3_COLORRED, 0xc0 << 11);
+            reg(rex, REX3_COLORGRN, 0xc0 << 11);
+            reg(rex, REX3_COLORBLUE, 0xc0 << 11);
+            reg(rex, REX3_XYENDI, xy(30, 62));
+            reg(rex, REX3_XYSTARTI, xy(30, 60));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        }
+
+        for (row, alpha) in [0xffu32, 0x80, 0x40].into_iter().enumerate() {
+            for rex in [interp, compiled] {
+                write_hostrw32(rex, alpha << 24);
+                wait(rex);
+            }
+            assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), (row + 1) as u64);
+            assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+            let ctx = unsafe { &*interp.context.get() };
+            assert_eq!((ctx.xstart >> 11) - REX3_COORD_BIAS, 30);
+            assert_eq!((ctx.ystart >> 11) - REX3_COORD_BIAS, 61 + row as i32);
+            assert_eq!(ctx.mid_primitive, row < 2);
+            let expected = [0xc0c0c0, 0x606060, 0x303030];
+            for y in 0..3 {
+                let want = if y <= row { expected[y] } else { 0 };
+                assert_eq!(read_pixel(interp, 30, 60 + y as i32), want);
+                assert_eq!(read_pixel(compiled, 30, 60 + y as i32), want);
+            }
+            assert_checkpoint_equal(interp, compiled);
+        }
+
+        for rex in [interp, compiled] {
+            reg(rex, REX3_XYENDI, xy(30, 67));
+            reg(rex, REX3_XYSTARTI, xy(30, 65));
+            reg(rex, REX3_DRAWMODE0, dm0 | DM0_STOPONX);
+            write_hostrw32(rex, 0xff00_0000);
+            wait(rex);
+        }
+        for y in 65..=67 {
+            assert_eq!(read_pixel(interp, 30, y), 0xc0c0c0);
+            assert_eq!(read_pixel(compiled, 30, y), 0xc0c0c0);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 4);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+        assert_checkpoint_equal(interp, compiled);
+    }
+
+    #[test]
+    fn review_stopony_without_stoponx_yields_on_nonhost_rows() {
+        let interp = &make_rex3();
+        let compiled = &make_rex3();
+        let dm0 = 0x206;
+        compile(compiled, dm0, DM1_RGB24_SRC, 0xF << CLIPMODE_CIDMATCH_SHIFT);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        for rex in [interp, compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+            reg(rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(rex, REX3_COLORI, 0x123456);
+            reg(rex, REX3_XYENDI, xy(41, 71));
+            reg(rex, REX3_XYSTARTI, xy(40, 70));
+            reg(rex, REX3_DRAWMODE0, dm0);
+        }
+
+        for (i, (x, y, mid)) in [(41, 70, true), (40, 71, true),
+                                  (41, 71, true), (40, 72, false)].into_iter().enumerate() {
+            for rex in [interp, compiled] {
+                reg_go(rex, REX3_DRAWMODE0, dm0);
+            }
+            let ctx = unsafe { &*interp.context.get() };
+            assert_eq!(((ctx.xstart >> 11) - REX3_COORD_BIAS,
+                        (ctx.ystart >> 11) - REX3_COORD_BIAS, ctx.mid_primitive), (x, y, mid));
+            for pixel in 0..4 {
+                let expected = if pixel <= i { 0x123456 } else { 0 };
+                let px = 40 + (pixel % 2) as i32;
+                let py = 70 + (pixel / 2) as i32;
+                assert_eq!(read_pixel(interp, px, py) & 0x00ff_ffff, expected);
+                assert_eq!(read_pixel(compiled, px, py) & 0x00ff_ffff, expected);
+            }
+            assert_checkpoint_equal(interp, compiled);
+        }
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 4);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reset_clears_a_residual_compiled_transfer() {
+        let compiled = make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(&compiled, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+        compiled.jit_enabled.store(true, Ordering::Relaxed);
+        rex3init(&compiled);
+        reg(&compiled, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+        reg(&compiled, REX3_XYENDI, xy(1, 1));
+        reg(&compiled, REX3_XYSTARTI, xy(1, 1));
+        reg(&compiled, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        write_hostrw32(&compiled, 0x1122_3344);
+        wait(&compiled);
+        assert_eq!(unsafe { (*compiled.context.get()).hostcnt }, 3);
+        compiled.stop();
+        let compiled = with_big_stack(move || {
+            compiled.power_on();
+            compiled
+        });
+        compiled.start();
+        let interp = &make_rex3_reset();
+        let ctx = unsafe { &*compiled.context.get() };
+        assert_eq!((ctx.host_shifter, ctx.hostcnt, ctx.host_cursor, ctx.host_len), (0, 0, 0, 1));
+        assert_context_equal(interp, &compiled);
+        for rex in [interp, &*compiled] {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+            reg(rex, REX3_WRMASK, 0xff);
+            reg(rex, REX3_XYENDI, xy(2, 2));
+            reg(rex, REX3_XYSTARTI, xy(2, 2));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+            write_hostrw32(rex, 0xaabb_ccdd);
+            wait(rex);
+        }
+        assert_eq!(read_pixel(interp, 2, 2), 0xaa);
+        assert_checkpoint_equal(interp, &compiled);
+        assert_eq!(compiled.jit_go_count.load(Ordering::Relaxed), 2);
+        assert_eq!(compiled.interp_go_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "gputrace")]
+    #[test]
+    fn live_recording_replays_residual_hostrw_on_both_cpu_engines() {
+        use super::super::rec::{self, tests::{replay_recs, start_state}};
+
+        struct RecordingFile(std::path::PathBuf);
+        impl Drop for RecordingFile {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let path = RecordingFile(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target").join(format!("rex3-hostrw-record-{}.rec", std::process::id())));
+        std::fs::create_dir_all(path.0.parent().unwrap()).unwrap();
+
+        let live = &make_rex3();
+        let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+        compile(live, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+        compile(live, DM0_READ_BLOCK, DM1_CI8_HOSTRW, cm);
+        live.jit_enabled.store(true, Ordering::Relaxed);
+        rex3init(live);
+        reg(live, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+        reg(live, REX3_WRMASK, 0xff);
+        reg(live, REX3_XYENDI, xy(0, 0));
+        reg(live, REX3_XYSTARTI, xy(0, 0));
+        reg(live, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        write_hostrw32(live, 0x1122_3344);
+        wait(live);
+        assert_eq!(unsafe { (*live.context.get()).hostcnt }, 3);
+        assert_eq!(unsafe { (*live.context.get()).host_cursor }, 0);
+
+        live.set_recording(Some(path.0.to_str().unwrap()), true).unwrap();
+        reg(live, REX3_XYENDI, xy(5, 1));
+        reg(live, REX3_XYSTARTI, xy(0, 1));
+        reg_go(live, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        assert_eq!(read_hostrw32_last(live), 0x1122_3344);
+        live.record_mark().unwrap();
+        reg(live, REX3_HOSTRW1, 0);
+        reg(live, REX3_XYENDI, xy(2, 1));
+        reg(live, REX3_XYSTARTI, xy(0, 1));
+        reg_go(live, REX3_DRAWMODE0, DM0_READ_BLOCK);
+        assert_eq!(read_hostrw32_last(live), 0x2233_4400);
+        live.set_recording(None, false).unwrap();
+        assert_eq!(live.jit_go_count.load(Ordering::Relaxed), 3);
+        assert_eq!(live.interp_go_count.load(Ordering::Relaxed), 0);
+
+        let recs = rec::load(path.0.to_str().unwrap()).unwrap();
+        let state = start_state(&recs).expect("recorded initial state");
+        for use_jit in [false, true] {
+            let replay = &make_rex3_unstarted();
+            replay.rec_state_decode(state).unwrap();
+            replay.start();
+            if use_jit {
+                compile(replay, DM0_HOSTW_BLOCK, DM1_CI8_HOSTRW, cm);
+                compile(replay, DM0_READ_BLOCK, DM1_CI8_HOSTRW, cm);
+                replay.jit_enabled.store(true, Ordering::Relaxed);
+            }
+            let report = replay_recs(replay, &recs, true);
+            assert!(report.checked >= 3, "{report:?}");
+            assert!(!report.diverged(), "{report:?}");
+            assert_checkpoint_equal(live, replay);
+            assert!(unsafe { &*live.fb_rgb.get() } == unsafe { &*replay.fb_rgb.get() },
+                "replay RGB plane differs");
+            assert!(unsafe { &*live.fb_aux.get() } == unsafe { &*replay.fb_aux.get() },
+                "replay auxiliary plane differs");
+            if use_jit {
+                assert_eq!(replay.jit_go_count.load(Ordering::Relaxed), 2);
+                assert_eq!(replay.interp_go_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "gputrace", feature = "rex-jit", feature = "rexdiag"))]
+#[test]
+fn recording_restores_a_partially_consumed_host_word() {
+    let live = &make_rex3();
+    let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+    let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_HOSTRW, DM0_HOSTW_BLOCK & 3);
+    let jit = live.rex_jit.as_ref().unwrap();
+    jit.request_compile(DM0_HOSTW_BLOCK, dm1, cm);
+    assert!(jit.wait_compiled(DM0_HOSTW_BLOCK, dm1, cm));
+    live.jit_enabled.store(true, Ordering::Relaxed);
+    rex3init(live);
+    reg(live, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(live, REX3_WRMASK, 0xff);
+    reg(live, REX3_XYENDI, xy(0, 0));
+    reg(live, REX3_XYSTARTI, xy(0, 0));
+    reg(live, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    write_hostrw32(live, 0x1122_3344);
+    wait(live);
+    let initial = unsafe { &*live.context.get() };
+    assert_eq!((initial.host_shifter, initial.hostcnt), (0x2233_4400_0000_0000, 3));
+    assert_eq!(live.jit_go_count.load(Ordering::Relaxed), 1);
+    assert_eq!(live.interp_go_count.load(Ordering::Relaxed), 0);
+
+    let state = live.rec_state_encode();
+    let replay = &make_rex3_unstarted();
+    replay.rec_state_decode(&state).unwrap();
+    replay.start();
+    assert_eq!(live.rec_state_hash(), replay.rec_state_hash());
+
+    for rex in [live, replay] {
+        reg(rex, REX3_XYENDI, xy(5, 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 1));
+        reg_go(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    }
+    assert_eq!((read_pixel(live, 0, 1), read_pixel(live, 1, 1), read_pixel(live, 2, 1)),
+        (0x22, 0x33, 0x44));
+    assert_eq!(live.rec_state_hash(), replay.rec_state_hash(),
+        "restored transfer resumed past the end of its first word");
+    assert_eq!(live.jit_go_count.load(Ordering::Relaxed), 2);
+    assert_eq!(live.interp_go_count.load(Ordering::Relaxed), 0);
+    assert_eq!(unsafe { (*live.context.get()).host_cursor }, 0);
+    assert_eq!(read_pixel(live, 3, 1), 0x11);
+}
+
 // ============================================================================
 // GIO bus loopback (ng1giobustest):
 // Write to SET.hostrw0/1, read back from SET.hostrw0/1 after drain.
@@ -7434,14 +8113,15 @@ mod batch_jit_equivalence {
             rex3init(rex_j);
             #[cfg(feature = "rexdiag")]
             let before = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "rexdiag")]
+            let interp_before = rex_j.interp_go_count.load(std::sync::atomic::Ordering::Relaxed);
             let jitted = run_hostr(rex_j, w, h, n);
             #[cfg(feature = "rexdiag")]
             {
                 let after = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
-                assert!(after >= before + n as u64,
-                    "{w}x{h}: only {} GOs reached compiled code for {n} words — the \
-                     batch is not being driven through the shader",
-                    after - before);
+                assert!(after > before, "{w}x{h}: the batch never reached compiled code");
+                assert_eq!(rex_j.interp_go_count.load(std::sync::atomic::Ordering::Relaxed),
+                    interp_before, "{w}x{h}: the batch fell back to the interpreter");
             }
 
             for k in 0..n {
@@ -8286,6 +8966,144 @@ fn gpu_replay_synchronizes_before_cpu_fallback() {
     assert_eq!(report.bytes_read_back, (2 * 2048 * 1024 * 4) as u64);
     assert_eq!(report.error, None);
     assert_gpu_timestamp_report(&report, 2);
+}
+
+#[cfg(all(feature = "rex-gpu", feature = "rex-jit", feature = "rexdiag"))]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn gpu_hostrw_fallback_preserves_context_and_checkpoints() {
+    fn case(rex: &Rex3) -> u32 {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00ff_ffff);
+        reg(rex, REX3_COLORRED, 0x11 << 11);
+        reg(rex, REX3_COLORGRN, 0x22 << 11);
+        reg(rex, REX3_COLORBLUE, 0x33 << 11);
+        reg(rex, REX3_XYENDI, xy(20, 20));
+        reg(rex, REX3_XYSTARTI, xy(10, 10));
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+        reg(rex, REX3_HOSTRW1, 0x1122_3344);
+        reg(rex, REX3_XYENDI, xy(12, 12));
+        reg(rex, REX3_XYSTARTI, xy(12, 12));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+        write_hostrw32(rex, 0xffaa_bbcc);
+        wait(rex);
+        assert_eq!(unsafe { (*rex.context.get()).host_shifter }, 0x1122_3344_0000_0000);
+
+        reg(rex, REX3_XYENDI, xy(12, 12));
+        reg(rex, REX3_XYSTARTI, xy(12, 12));
+        reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+        read_hostrw32_last(rex)
+    }
+
+    let cpu = &make_rex3_reset();
+    assert_eq!(case(cpu), 0xffaa_bbcc);
+    for compiled_fallback in [false, true] {
+        let gpu = &make_rex3_reset();
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        gpu.enable_gpu_replay(&backend).expect("initialize GPU replay");
+        if compiled_fallback {
+            let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+            let jit = gpu.rex_jit.as_ref().unwrap();
+            for dm0 in [DM0_HOSTW_BLOCK, DM0_READ_BLOCK] {
+                let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_RGB24_HOSTRW, dm0 & 3);
+                jit.request_compile(dm0, dm1, cm);
+                assert!(jit.wait_compiled(dm0, dm1, cm));
+            }
+            gpu.jit_enabled.store(true, Ordering::Relaxed);
+        }
+        assert_eq!(case(gpu), 0xffaa_bbcc);
+        wait(gpu);
+        let report = gpu.gpu_replay_report().expect("GPU replay report");
+        assert_eq!(report.handled_draws, 1, "{report:?}");
+        assert_eq!(report.fallback_draws, 2, "{report:?}");
+        assert!(report.submissions > 0 && report.fences > 0, "{report:?}");
+        assert_eq!(report.error, None);
+        assert!(unsafe { &*gpu.fb_rgb.get() } == unsafe { &*cpu.fb_rgb.get() },
+            "GPU fallback RGB plane differs");
+        assert!(unsafe { &*gpu.fb_aux.get() } == unsafe { &*cpu.fb_aux.get() },
+            "GPU fallback auxiliary plane differs");
+        assert_eq!(save_rex3_context(unsafe { &*gpu.context.get() }),
+            save_rex3_context(unsafe { &*cpu.context.get() }));
+        #[cfg(feature = "gputrace")]
+        assert_eq!(gpu.rec_state_hash(), cpu.rec_state_hash());
+        if compiled_fallback {
+            assert_eq!(gpu.jit_go_count.load(Ordering::Relaxed), 2);
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 2);
+        }
+    }
+}
+
+#[cfg(all(feature = "rex-gpu", feature = "rex-jit", feature = "rexdiag"))]
+#[test]
+#[ignore = "requires a conformant host GPU"]
+fn review_gpu_alphahost_stopony_fallback_preserves_checkpoints() {
+    let alpha_dm0 = 0x286;
+    let alpha_dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+        | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+        | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+        | DRAWMODE1_LOGICOP_SRC_SH;
+
+    fn prepare(rex: &Rex3, dm0: u32, dm1: u32) {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0x00ff_ffff);
+        reg(rex, REX3_COLORI, 0x123456);
+        reg(rex, REX3_XYENDI, xy(20, 20));
+        reg(rex, REX3_XYSTARTI, xy(10, 10));
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+        reg(rex, REX3_DRAWMODE1, dm1);
+        reg(rex, REX3_COLORRED, 0xc0 << 11);
+        reg(rex, REX3_COLORGRN, 0xc0 << 11);
+        reg(rex, REX3_COLORBLUE, 0xc0 << 11);
+        reg(rex, REX3_XYENDI, xy(30, 62));
+        reg(rex, REX3_XYSTARTI, xy(30, 60));
+        reg(rex, REX3_DRAWMODE0, dm0);
+    }
+
+    for compiled_fallback in [false, true] {
+        let cpu = &make_rex3_reset();
+        let gpu = &make_rex3_reset();
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        gpu.enable_gpu_replay(&backend).expect("initialize GPU replay");
+        if compiled_fallback {
+            let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(alpha_dm1, alpha_dm0 & 3);
+            let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+            let jit = gpu.rex_jit.as_ref().unwrap();
+            jit.request_compile(alpha_dm0, dm1, cm);
+            assert!(jit.wait_compiled(alpha_dm0, dm1, cm));
+            gpu.jit_enabled.store(true, Ordering::Relaxed);
+        }
+        prepare(cpu, alpha_dm0, alpha_dm1);
+        prepare(gpu, alpha_dm0, alpha_dm1);
+        for (row, alpha) in [0xffu32, 0x80, 0x40].into_iter().enumerate() {
+            for rex in [cpu, gpu] {
+                write_hostrw32(rex, alpha << 24);
+                wait(rex);
+            }
+            assert_eq!(read_pixel(cpu, 30, 60 + row as i32),
+                [0xc0c0c0, 0x606060, 0x303030][row]);
+            assert!(unsafe { &*gpu.fb_rgb.get() } == unsafe { &*cpu.fb_rgb.get() });
+            assert!(unsafe { &*gpu.fb_aux.get() } == unsafe { &*cpu.fb_aux.get() });
+            assert_eq!(save_rex3_context(unsafe { &*gpu.context.get() }),
+                save_rex3_context(unsafe { &*cpu.context.get() }));
+            assert_eq!(gpu.rec_state_hash(), cpu.rec_state_hash());
+        }
+        let report = gpu.gpu_replay_report().expect("GPU replay report");
+        assert_eq!((report.handled_draws, report.fallback_draws), (1, 3), "{report:?}");
+        assert!(report.submissions > 0 && report.fences > 0, "{report:?}");
+        assert_eq!(report.error, None);
+        if compiled_fallback {
+            assert_eq!(gpu.jit_go_count.load(Ordering::Relaxed), 3);
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(gpu.interp_go_count.load(Ordering::Relaxed), 3);
+        }
+    }
 }
 
 #[cfg(feature = "rex-gpu")]
