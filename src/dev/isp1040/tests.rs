@@ -731,7 +731,9 @@ fn every_move_of_the_test_clock_reaches_a_waiting_selection() {
         }
         let _ = tx.send(());
     });
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    // A lost move hangs the loop for good, so the bound only has to be
+    // longer than 2000 handoffs take when the threads wait for a core.
+    match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(()) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("a clock move was lost: the selection never ended"),
         Err(e) => panic!("the clock loop failed: {e}"),
