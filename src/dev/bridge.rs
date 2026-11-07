@@ -57,7 +57,7 @@ use crate::irq::{InterruptController, IrqLine};
 use crate::pci::{bar_runs, BarAt, BarRun, BarRunSink, PciBar, PciBusDevice, PciDma, PciDmaStatus, PciLanes, Space};
 use crate::snapshot::{field, field_u32, field_u32s, field_u64, field_u64_vec, field_u8, field_u8s, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_ERR, BUS_OK};
-use crate::xtalk::XtalkHost;
+use crate::xtalk::Upstream;
 
 /// The widget number of this chip's own port on the Crossbow.
 const WIDGET_BRIDGE: u8 = 0xf;
@@ -372,8 +372,8 @@ struct FlashPart {
     size: u32,
 }
 
-/// The packets a locked section decided to send to the host: (vector, set).
-type Packets = Vec<(u8, bool)>;
+/// The packets a locked section decided to send: (host widget, vector, set).
+type Packets = Vec<(u8, u8, bool)>;
 
 /// The onboard Bridge. Hand it out as the `BusDevice` of the widget's small
 /// window: `Arc<Bridge>` coerces to `Arc<dyn BusDevice>`. As an
@@ -383,14 +383,9 @@ pub struct Bridge {
     /// Held across "decide a packet, send it", never with `st`.
     /// Nothing but the host's `set_line` is called under it.
     irq_order: Mutex<()>,
-    /// Memory as a bus master reaches it: physical addresses, fitted SDRAM
-    /// only, a bus error for anything else.
-    mem: Arc<dyn BusDevice>,
-    /// The host chip's interrupt inputs: a line is the vector a packet names.
-    heart: Arc<dyn InterruptController>,
-    /// How the host chip is addressed: it takes this chip's interrupt
-    /// packets and memory transfers.
-    host: XtalkHost,
+    /// The host chips this Bridge's transfers and interrupt packets can go
+    /// to, by the widget number the guest programs.
+    up: Upstream,
     slots: RwLock<[Option<Arc<dyn PciBusDevice>>; DEVICES]>,
     flash: RwLock<[Option<FlashPart>; 2]>,
     flash_strap: AtomicBool,
@@ -399,7 +394,7 @@ pub struct Bridge {
     /// The one-wire net behind the NIC register; none fitted reads as an
     /// empty bus.
     microlan: Mutex<Option<w1::Bus>>,
-    /// Whether the Crossbow has a live link to a widget; default only the host chip.
+    /// Whether the Crossbow has a live link to a widget; default the hosts.
     link_alive: RwLock<Box<dyn Fn(u8) -> bool + Send + Sync>>,
     /// Where the runs of the device windows a BAR decodes whole go (the
     /// machine maps them over this widget's window), and the table entries
@@ -487,10 +482,10 @@ impl Placement {
 }
 
 impl Bridge {
-    /// A Bridge that masters memory through `mem` and interrupts the host
-    /// chip, addressed as `host`, through `heart` (line = vector). Registers
-    /// start at their power-up values.
-    pub fn new(mem: Arc<dyn BusDevice>, host: XtalkHost, heart: Arc<dyn InterruptController>) -> Arc<Self> {
+    /// A Bridge that masters memory and interrupts the host chips of `up`,
+    /// each addressed as it states and chosen by the widget number the guest
+    /// programs. Registers start at their power-up values.
+    pub fn new(up: Upstream) -> Arc<Self> {
         let mut st = State {
             reg: [0; REG_SLOTS],
             ate: [0; ATE_ENTRIES],
@@ -504,18 +499,17 @@ impl Bridge {
             dma_device: 0,
         };
         st.reset_core(false, REVISION);
+        let hosts = (0..16u8).filter(|&w| up.get(w).is_some()).fold(0u16, |m, w| m | 1 << w);
         Arc::new(Self {
             st: Mutex::new(st),
             irq_order: Mutex::new(()),
-            mem,
-            heart,
-            host,
+            up,
             slots: RwLock::new(Default::default()),
             flash: RwLock::new(Default::default()),
             flash_strap: AtomicBool::new(false),
             revision: AtomicU32::new(REVISION),
             microlan: Mutex::new(None),
-            link_alive: RwLock::new(Box::new(move |w| w == host.widget)),
+            link_alive: RwLock::new(Box::new(move |w| hosts.checked_shr(w as u32).is_some_and(|m| m & 1 != 0))),
             bar_sink: RwLock::new(None),
             bar_entries: Mutex::new(Default::default()),
         })
@@ -535,8 +529,11 @@ impl Bridge {
         let _order = self.irq_order.lock();
         let mut packets = Packets::new();
         let ret = f(&mut self.st.lock(), &mut packets);
-        for (vector, set) in packets {
-            self.heart.set_line(vector as u32, set);
+        for (widget, vector, set) in packets {
+            match self.up.get(widget) {
+                Some(h) if h.link_up() => h.irq.set_line(vector as u32, set),
+                _ => log::debug!("bridge: interrupt packet to widget {widget} dropped; no live link to a host"),
+            }
         }
         ret
     }
@@ -791,11 +788,12 @@ impl Bridge {
         // destination address.
         let field = ((host & INT_HOST_ADDRESS) >> 8) as u64;
         let address = (dest.address & !(0x3ffu64 << 38)) | field << 38;
-        if !self.host.accepts(dest.widget, address, (host & INT_HOST_FIELD) as u8) {
-            log::debug!("bridge: interrupt packet to widget {} address {address:#x} is not the host's (widget {}); dropped", dest.widget, self.host.widget);
-            return;
+        let vector = (host & INT_HOST_FIELD) as u8;
+        match self.up.get(dest.widget) {
+            Some(h) if h.host.accepts(dest.widget, address, vector) => p.push((dest.widget, vector, set)),
+            Some(_) => log::debug!("bridge: interrupt packet to widget {} address {address:#x} vector {vector} is not one its host takes; dropped", dest.widget),
+            None => log::debug!("bridge: interrupt packet to widget {}, which is not a host; dropped", dest.widget),
         }
-        p.push(((host & INT_HOST_FIELD) as u8, set));
     }
 
     /// Chip errors go to the host-error bit at the destination pair.
@@ -803,11 +801,10 @@ impl Bridge {
         let number = (st.r(reg::HOST_ERR_FIELD) & INT_HOST_FIELD) as u8;
         let dest = int_dest(st.r(reg::INT_DEST_UPPER), st.r(reg::INT_DEST_LOWER));
         // An unrouted error is one nobody asked for.
-        if !self.host.accepts(dest.widget, dest.address, number) {
-            log::debug!("bridge: error interrupt with no usable destination; dropped");
-            return;
+        match self.up.get(dest.widget) {
+            Some(h) if h.host.accepts(dest.widget, dest.address, number) => p.push((dest.widget, number, true)),
+            _ => log::debug!("bridge: error interrupt with no usable destination; dropped"),
         }
-        p.push((number, true));
     }
 
     /// The first enabled error in the PCI group owns its capture registers
@@ -1295,15 +1292,25 @@ impl Bridge {
             let mut dropped = false;
             let good = match target {
                 None => false,
-                Some((_, _, w)) if w != self.host.widget => {
-                    // Approximation: QEMU routes peer DMA to a fitted widget;
-                    // no supported Octane guest is known to need it.
-                    dropped = w == WIDGET_BRIDGE || !(self.link_alive.read())(w);
-                    false
-                }
-                Some((xio, p, _)) => match &mut buf {
-                    DmaBuf::Read(b) => self.placed_read(xio, p, &mut b[done..done + step]),
-                    DmaBuf::Write(b) => self.placed_write(xio, p, &b[done..done + step]),
+                Some((xio, p, w)) => match self.up.get(w) {
+                    Some(h) if !h.link_up() => {
+                        // The Crossbow drops it; a dropped read is timed out.
+                        log::debug!("bridge: transfer to widget {w}, whose link is down; dropped");
+                        dropped = true;
+                        false
+                    }
+                    Some(h) => match &mut buf {
+                        DmaBuf::Read(b) => self.placed_read(&*h.mem, xio, p, &mut b[done..done + step]),
+                        DmaBuf::Write(b) => self.placed_write(&*h.mem, xio, p, &b[done..done + step]),
+                    },
+                    None => {
+                        // Approximation: a transfer to a widget that is not a
+                        // host is dropped, not routed to a peer; no supported
+                        // guest is known to need peer DMA.
+                        log::debug!("bridge: transfer to widget {w}, which is not a host; dropped");
+                        dropped = w == WIDGET_BRIDGE || !(self.link_alive.read())(w);
+                        false
+                    }
                 },
             };
             if !good {
@@ -1322,47 +1329,47 @@ impl Bridge {
 
     /// Memory bytes at `addr`, as every DMA master moves them
     /// (`physical::read_bytes`); a failed read leaves the buffer zero.
-    fn mem_read(&self, addr: u64, out: &mut [u8]) -> bool {
-        let ok = crate::physical::read_bytes(&*self.mem, addr, out) == crate::traits::BUS_OK;
+    fn mem_read(&self, mem: &dyn BusDevice, addr: u64, out: &mut [u8]) -> bool {
+        let ok = crate::physical::read_bytes(mem, addr, out) == crate::traits::BUS_OK;
         if !ok {
             out.fill(0);
         }
         ok
     }
 
-    fn mem_write(&self, addr: u64, data: &[u8]) -> bool {
-        crate::physical::write_bytes(&*self.mem, addr, data) == crate::traits::BUS_OK
+    fn mem_write(&self, mem: &dyn BusDevice, addr: u64, data: &[u8]) -> bool {
+        crate::physical::write_bytes(mem, addr, data) == crate::traits::BUS_OK
     }
 
     /// Read `out.len()` bytes at PCI-order position `xio`, undoing the
     /// placement: the PCI byte at address p is memory byte p ^ mask.
-    fn placed_read(&self, xio: u64, placement: Placement, out: &mut [u8]) -> bool {
+    fn placed_read(&self, mem: &dyn BusDevice, xio: u64, placement: Placement, out: &mut [u8]) -> bool {
         let mask = placement.mask();
         if mask == 0 {
-            return self.mem_read(xio, out);
+            return self.mem_read(mem, xio, out);
         }
         let unit = mask as usize + 1;
         if xio & mask == 0 && out.len() % unit == 0 {
             // Whole units: the bytes come straight into place and each unit
             // is reversed where it lies.
-            let ok = self.mem_read(xio, out);
+            let ok = self.mem_read(mem, xio, out);
             out.chunks_exact_mut(unit).for_each(<[u8]>::reverse);
             return ok;
         }
         let lo = xio & !mask;
         let hi = (xio + out.len() as u64 + mask) & !mask;
         let mut span = vec![0u8; (hi - lo) as usize];
-        let ok = self.mem_read(lo, &mut span);
+        let ok = self.mem_read(mem, lo, &mut span);
         for (i, b) in out.iter_mut().enumerate() {
             *b = if ok { span[(((xio + i as u64) ^ mask) - lo) as usize] } else { 0 };
         }
         ok
     }
 
-    fn placed_write(&self, xio: u64, placement: Placement, data: &[u8]) -> bool {
+    fn placed_write(&self, mem: &dyn BusDevice, xio: u64, placement: Placement, data: &[u8]) -> bool {
         let mask = placement.mask();
         if mask == 0 {
-            return self.mem_write(xio, data);
+            return self.mem_write(mem, xio, data);
         }
         let unit = mask as usize + 1;
         if xio & mask == 0 && data.len() % unit == 0 {
@@ -1377,7 +1384,7 @@ impl Bridge {
             };
             swapped.copy_from_slice(data);
             swapped.chunks_exact_mut(unit).for_each(<[u8]>::reverse);
-            return self.mem_write(xio, swapped);
+            return self.mem_write(mem, xio, swapped);
         }
         let lo = xio & !mask;
         let hi = (xio + data.len() as u64 + mask) & !mask;
@@ -1386,14 +1393,14 @@ impl Bridge {
             span[(((xio + i as u64) ^ mask) - lo) as usize] = b;
         }
         if xio == lo && xio + data.len() as u64 == hi {
-            return self.mem_write(lo, &span);
+            return self.mem_write(mem, lo, &span);
         }
         // Partial units: write only the bytes covered, so a neighbour
         // another master is changing is not overwritten with a stale copy.
         let mut ok = true;
         for i in 0..data.len() as u64 {
             let p = (xio + i) ^ mask;
-            ok &= self.mem_write(p, &span[(p - lo) as usize..(p - lo) as usize + 1]);
+            ok &= self.mem_write(mem, p, &span[(p - lo) as usize..(p - lo) as usize + 1]);
         }
         ok
     }

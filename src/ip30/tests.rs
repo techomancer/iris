@@ -36,6 +36,7 @@ use crate::dev::ioc3_eth::{bits as ebit, reg as ereg, Ioc3Eth};
 use crate::dev::isp1040::{mbox, reg as ireg, Isp1040, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, ENTRY_SIZE, ENTRY_TYPE_REQUEST, ENTRY_TYPE_STATUS};
 use crate::dev::mgras::hq4::ImpactXio;
 use crate::dev::xbow::Xbow;
+use crate::xtalk::Upstream;
 use crate::traits::{BusDevice, Device, Resettable, BUS_ERR, BUS_OK};
 
 const FLASH_SIZE: usize = 1 << 20;
@@ -63,7 +64,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::dev::heart::host_clock()));
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
     xbow.connect_heart(heart.clone());
-    let bridge = Bridge::new(ram.dma_view(), HEART_HOST, heart.clone());
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()));
     bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
     let phys = Ip30Bus::new(ram);
     phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
@@ -462,7 +463,7 @@ impl Octane {
         ram.set_memcfg([0x8001_0000, 0, 0, 0]);
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
-        let bridge = Bridge::new(mem.clone(), HEART_HOST, heart.clone());
+        let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()));
 
         let eth = Ioc3Eth::with_negotiation_delay(MAC, std::time::Duration::ZERO);
         let (link, sent, inject) = crate::net::Link::loopback();
