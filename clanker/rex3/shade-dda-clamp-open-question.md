@@ -7,7 +7,7 @@ stash for this reason (see the bottom of this note).
 
 ## The question
 
-`rex3.pdf` (line ~6834 of `pdftotext` output) says:
+`docs/datasheets/indy/rex3.pdf` (line ~6834 of `pdftotext` output) says:
 
 > DDA values of R,G,B,A are clamped each iteration before sending down the
 > pipeline. As each of these components has an additional, overflow bit at the

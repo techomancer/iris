@@ -423,7 +423,7 @@ pub const EXC_VCED: u32 = 31;     // Virtual Coherency Exception (Data)
 /// XContext as hardware writes it on a TLB miss, for a CPU implementing
 /// `va_bits` virtual address bits.
 ///
-/// `docs/R4000_um2.pdf`, Figure 5-10 and Table 5-8, gives the layout for a
+/// `docs/datasheets/cpu/R4000_um2.pdf`, Figure 5-10 and Table 5-8, gives the layout for a
 /// 40-bit CPU:
 ///
 /// ```text
@@ -4679,7 +4679,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// **The two parts have genuinely different tables — this is not one table
     /// with reserved holes.** Verified against the manuals in `docs/`:
     ///
-    /// | C | R4400 (`R4000_um2.pdf` Table 4-6) | VR5000 (`VR5000 User Manual.pdf` Table 6-6) |
+    /// | C | R4400 (`docs/datasheets/cpu/R4000_um2.pdf` Table 4-6) | VR5000 (`docs/datasheets/cpu/VR5000 User Manual.pdf` Table 6-6) |
     /// |---|---|---|
     /// | 0 | Reserved | Cacheable noncoherent, **write-through, no write allocate** |
     /// | 1 | Reserved | Cacheable noncoherent, **write-through, write allocate** |
@@ -11632,7 +11632,7 @@ impl<T: Tlb, C: CpuModel> iris_hostcall::PageAccess for HostMemory<'_, T, C> {
 mod xcontext_layout_tests {
     use super::xcontext_on_miss;
 
-    /// Field edges as `docs/R4000_um2.pdf` Figure 5-10 draws them, for the
+    /// Field edges as `docs/datasheets/cpu/R4000_um2.pdf` Figure 5-10 draws them, for the
     /// 40-bit CPU the manual describes. These are the numbers in the figure,
     /// not numbers derived from the code under test.
     const R4000_PTEBASE_LSB: u32 = 33;

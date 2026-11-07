@@ -4,7 +4,7 @@ REX3 CLIPMODE bits 12:9 are a four-bit permission mask, not an equality value.
 Bit N permits a framebuffer write to a destination with two-bit CID N.
 Mask 0 rejects all CIDs; mask 15 permits all. Popup bits are not CID bits.
 Framebuffer reads bypass this check; screen-to-screen copies check the destination.
-See `docs/rex3.pdf`, table 16 and section 3.3.
+See `docs/datasheets/indy/rex3.pdf`, table 16 and section 3.3.
 
 The StudioPaint artifact capture had CLIPMODE 0x00000403, selecting CID 1
 with mask 0010. The pending destination rectangle had AUX bytes 0x11,

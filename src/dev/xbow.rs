@@ -2,7 +2,7 @@
 //! the eight links (widgets 8 to 15) are present and carrying traffic.
 //!
 //! Cut to what the Octane uses; registers follow the Crossbow ASIC
-//! specification, revision 12.0 (`docs/Octane/`). The switch
+//! specification, revision 12.0 (`docs/datasheets/octane/`). The switch
 //! translates no address: the machine routes a processor access by widget
 //! number and asks [`Xbow::carries`] whether the link is up. Packets from
 //! widget 0 itself are its interrupts, which go to the target its interrupt

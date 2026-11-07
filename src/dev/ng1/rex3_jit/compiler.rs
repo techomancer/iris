@@ -207,7 +207,7 @@ impl ShaderCompiler {
         // path never asks for and every GO silently falls back to the interpreter.
         let dm1_val = crate::dev::ng1::rex3_shape::normalize_dm1(dm1_val, opcode);
 
-        // Hardware disables FASTCLEAR when CID checking is enabled — rex3.pdf
+        // Hardware disables FASTCLEAR when CID checking is enabled — docs/datasheets/indy/rex3.pdf
         // says so in DRAWMODE1 bit 17 ("when CID checking disabled (CLIPMODE
         // CIDMATCH = 0xF)"), §3.5.5 ("CID checking is not allowed for this
         // drawing mode") and the programming notes. The interpreter honours this
@@ -1602,7 +1602,7 @@ fn emit_shader(
     };
 
     // A SPAN never steps y: at its end XSTART is left one past XEND and
-    // YSTART is untouched (rex3.pdf §3.5.3; draw_span; MAME writes back only
+    // YSTART is untouched (docs/datasheets/indy/rex3.pdf §3.5.3; draw_span; MAME writes back only
     // x). Only a BLOCK row end wraps x to XSAVE and steps y.
     let is_span = dm0.adrmode() == DRAWMODE0_ADRMODE_SPAN;
     if !stopony || is_span {

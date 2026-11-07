@@ -664,7 +664,7 @@ pub const OCTANT_XMAJOR: u32 = 1 << 2;
 /// octant. The spec numbers octants 1-8 with octant 1 in the msb; hardware
 /// octant {XMAJOR, XDEC, YDEC} 5,1,3,7,6,2,0,4 is spec octant 1..8.
 /// A set bit steps straight only when d < 0, a clear one when d <= 0
-/// (rex3.pdf §3.6, "BRESROUND"); it only matters when d is exactly 0.
+/// (docs/datasheets/indy/rex3.pdf §3.6, "BRESROUND"); it only matters when d is exactly 0.
 pub(crate) const BRESROUND_BIT: [u32; 8] = [1, 6, 2, 5, 0, 7, 3, 4];
 
 /// Whether a Bresenham step with d == 0 goes straight (BRESROUND clear for
@@ -2855,7 +2855,7 @@ impl Rex3 {
     }
 
     /// A GO on STEPZ fails the Z pattern test for the current pixel only
-    /// (rex3.pdf: "Enables ZPATTERN (Z test fail) for one iteration"). IRIX's
+    /// (docs/datasheets/indy/rex3.pdf: "Enables ZPATTERN (Z test fail) for one iteration"). IRIX's
     /// software rasteriser on Newport steps over the pixels it must not write
     /// this way, one GO per pixel (blast's billboards: transparent texels): the
     /// iterators advance, and the pixel is not written, or is written in
@@ -3576,7 +3576,7 @@ impl Rex3 {
             REX3_LSPATTERN => ctx.lspattern = val,
             REX3_LSPATSAVE => ctx.lspatsave = val,
             // ZPATTERN is a recirculating register, "msb = first pixel"
-            // (rex3.pdf register table): writing it reloads the pattern, so
+            // (docs/datasheets/indy/rex3.pdf register table): writing it reloads the pattern, so
             // the next pixel tests bit 31 whatever the last primitive left.
             // IRIS GL's software-Z lines rely on it: each stroke is an F_LINE
             // without DOSETUP drawn by a ZPATTERN GO with an MSB-aligned mask.

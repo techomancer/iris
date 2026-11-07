@@ -694,8 +694,7 @@ round trips and, with `--features jitv2`, the JIT equivalence tests),
 
 ## 11. References
 
-- Hardware manuals and datasheets: `docs/*.pdf`, `docs/Indy/`, `docs/o2/`,
-  `docs/Octane/`; per-device notes: `docs/dev/*.md`,
+- Hardware manuals and datasheets: `docs/datasheets/`; per-device notes: `docs/dev/*.md`,
   [docs/interrupt_map.md](docs/interrupt_map.md).
 - [SGI driver programmer's guide — address spaces](https://tqd1.physik.uni-freiburg.de/library/SGI_bookshelves/SGI_Developer/books/DevDriver_PG/sgi_html/ch01.html)
 - MAME's `newport.cpp` for the REX3 drawing engine; MAME's R4000 core for TLB

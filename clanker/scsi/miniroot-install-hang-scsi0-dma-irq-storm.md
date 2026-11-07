@@ -205,6 +205,6 @@ the actual W1C / read-to-clear behavior of `MISC_INTSTAT`.
 
 ## See also
 
-- `docs/hpc3.pdf` — section on MISC_INTSTAT / SCSI ack convention
-- `docs/WD33C93A_Data_Sheet_and_Application_Notes_Nov1990.pdf` — ASR.INT
+- `docs/datasheets/indy/hpc3.pdf` — section on MISC_INTSTAT / SCSI ack convention
+- `docs/datasheets/indy/WD33C93A_Data_Sheet_and_Application_Notes_Nov1990.pdf` — ASR.INT
   lifecycle

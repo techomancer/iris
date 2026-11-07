@@ -104,7 +104,7 @@ pub const fn host_shift(dm1: u32) -> u32 {
 /// The two are ordered, not combined: fastclear wins, matching the JIT's
 /// `compile_shader` and the dispatch key it has to agree with.
 ///
-/// **Scope note.** FASTCLEAR kills much more than BLEND. Per `rex3.pdf` §3.5.5:
+/// **Scope note.** FASTCLEAR kills much more than BLEND. Per `docs/datasheets/indy/rex3.pdf` §3.5.5:
 /// "No support for any per pixel operations, such as shade, stipple, dither,
 /// blend. Flat fill only, via value previously written by host into the
 /// COLORVRAM register." Restricted to OPCODE=draw with ADRMODE=block or span,
@@ -154,7 +154,7 @@ pub const fn unpack(dm0: u32, dm1: u32, clipmode: u32) -> crate::dev::ng1::rex3_
 
     let cidtest = if (clipmode >> CLIPMODE_CIDMATCH_SHIFT) & 0xF == 0xF { 0 } else { 1 };
 
-    // FASTCLEAR collapses the whole pixel pipeline (rex3.pdf §3.5.5: "No support
+    // FASTCLEAR collapses the whole pixel pipeline (docs/datasheets/indy/rex3.pdf §3.5.5: "No support
     // for any per pixel operation ... Flat fill only, via COLORVRAM"), but only
     // where hardware actually honours it: DRAW + block/span, CID checking off,
     // and not overridden by colorhost. Outside that it is an ordinary draw and
@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(a.sfactor, 0);
     }
 
-    /// Per rex3.pdf §3.5.5 fastclear supports no per-pixel operation, so every
+    /// Per docs/datasheets/indy/rex3.pdf §3.5.5 fastclear supports no per-pixel operation, so every
     /// variant collapses onto one shape regardless of the stale bits around it.
     #[test]
     fn fastclear_collapses_the_pipeline() {
@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(a.compare, 7, "fastclear bypasses afunction");
     }
 
-    /// Hardware disables FASTCLEAR when CID checking is on (rex3.pdf bit 17,
+    /// Hardware disables FASTCLEAR when CID checking is on (docs/datasheets/indy/rex3.pdf bit 17,
     /// §3.5.5, and the programming notes), so the fold must not apply there —
     /// the draw is an ordinary one and its fields stay live.
     /// See clanker/rex3/fastclear-cid-divergence.md.

@@ -115,4 +115,4 @@ geometry/transform block the hard one.
 - OpenBSD odyssey(4): https://man.openbsd.org/odyssey.4
 - Mainline IP30 patch (2019): https://lkml.rescloud.iu.edu/1910.1/01791.html
 - Related: `clanker/cpu/mp-llsc-is-a-host-compare-exchange.md` (Octane MP
-  prerequisites), `docs/Octane/` (Xbow, Bridge, Xbridge ASIC specs).
+  prerequisites), `docs/datasheets/octane/` (Xbow, Bridge, Xbridge ASIC specs).

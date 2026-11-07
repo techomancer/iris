@@ -6,7 +6,7 @@ and returns a status; the O2 is its first user). Steps 2-6 open.
 Scope: how a PCI function reaches host memory and raises interrupts
 (`src/pci.rs`: `PciBusDevice`, `PciDma`), the O2's MACE bridge
 (`src/dev/mace_pci.rs`) and the Octane's Bridge/Xbridge to come. Sources:
-`docs/Octane/SGI-Bridge_ASIC_Specification-*.pdf` (chapters 3.3, 3.8, 3.9,
+`docs/datasheets/octane/SGI-Bridge_ASIC_Specification-*.pdf` (chapters 3.3, 3.8, 3.9,
 4, 11, appendix A) and `SGI-Xbridge_ASIC_Specification-*.pdf` (1.5, 7.3,
 appendix C). Both are scans: read them with the PDF reader, not
 `pdftotext`. Bridge document page N is PDF page N+14; Xbridge pages match.
@@ -151,7 +151,7 @@ its sources and sends set/clear packets to Heart.
 
 ## 6. Open
 
-- No Heart specification in `docs/Octane`: Heart's Crosstalk-to-memory
+- No Heart specification in `docs/datasheets/octane`: Heart's Crosstalk-to-memory
   decode and its interrupt register are taken from appendix C of the Xbridge
   spec and the Octane technical report until one turns up.
 - Which Octane board revision has Bridge and which Xbridge, and whether the

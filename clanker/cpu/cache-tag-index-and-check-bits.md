@@ -1,6 +1,6 @@
 # Cache tags: index ops index by address; check bits are generated, not stored
 
-Both from `docs/R4000_um2.pdf` and `docs/VR5000 User Manual.pdf`, now in the tree.
+Both from `docs/datasheets/cpu/R4000_um2.pdf` and `docs/datasheets/cpu/VR5000 User Manual.pdf`, now in the tree.
 
 ## Index_Store_Tag(SD) indexes by the CACHE address
 

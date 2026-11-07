@@ -11,7 +11,7 @@
 //! (offsets as in physical 0x1f00_0000 + offset); a function's DMA goes
 //! through the Bridge into memory at physical 0x2000_0000. Expected bytes
 //! come from the Bridge specification's byte-placement rules
-//! (`docs/Octane/`) and another Octane emulator's register tests, not from
+//! (`docs/datasheets/octane/`) and another Octane emulator's register tests, not from
 //! reading the Rust back. Where a layout is derived rather than copied, the
 //! rule is written next to it.
 //!

@@ -5,7 +5,7 @@ It is a full block. One GO runs it to the end, and the shifter reloads from
 HOSTRW every time it empties. With a single PIO word (`host_len == 1`), the
 same word is re-read, so its pixels repeat across the block.
 
-The segmented upload, one word per GO (rex3.pdf §3.5.4.1 "Segments I"), is
+The segmented upload, one word per GO (docs/datasheets/indy/rex3.pdf §3.5.4.1 "Segments I"), is
 specified with STOPONX=STOPONY=0. IRIX always uses that form for pixmap and
 icon uploads: `DRAWMODE0 = 0x46`.
 

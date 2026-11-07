@@ -16,7 +16,7 @@ carry the GO bit**, and it is the software half of the PREFETCH protocol.
 ## What the spec says
 
 `DRAWMODE1` bit 26, PREFETCH — "Enables host framebuffer pixel prefetch
-mechanism for PIO reads" (rex3.pdf §3.10, *Framebuffer PIO and DMA*):
+mechanism for PIO reads" (docs/datasheets/indy/rex3.pdf §3.10, *Framebuffer PIO and DMA*):
 
 > For pixel reads, the DRAWMODE1 PREFETCH bit must be set to 1, with the
 > DRAWMODE0 OPCODE=read. The set up of the DRAWMODE registers should be
@@ -86,5 +86,5 @@ against. Not a useful reference here.
   why DMA reads invert the PIO ordering.
 - `clanker/rex3/hostrw-tests-must-use-partial-word-rows.md` — the STOPONX/STOPONY
   shapes and why test widths must not be multiples of 8.
-- rex3.pdf §3.10 *Framebuffer PIO and DMA*, §3.11 *FIFO Management* (the
+- docs/datasheets/indy/rex3.pdf §3.10 *Framebuffer PIO and DMA*, §3.11 *FIFO Management* (the
   GFXBUSY/GFIFOLEVEL idle check before a read series).

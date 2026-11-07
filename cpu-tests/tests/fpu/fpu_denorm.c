@@ -32,7 +32,7 @@
  *      underflow sets the E Cause bit."
  *
  * Which CPU each expectation applies to: the R4000 manual is in-repo
- * (docs/R4000_um2.pdf) and pins the R4400 side of every rule here. The R5000's
+ * (docs/datasheets/cpu/R4000_um2.pdf) and pins the R4400 side of every rule here. The R5000's
  * manual is not, and denormal handling is exactly the kind of thing two
  * implementations of the same architecture are allowed to differ on — so the
  * R5000 side is reported rather than asserted. See docs/oracle.md §2.

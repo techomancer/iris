@@ -5090,7 +5090,7 @@ mod jit_tests {
 
     /// FASTCLEAR with CID checking ENABLED must draw as an ordinary draw.
     ///
-    /// rex3.pdf says so three times — DRAWMODE1 bit 17 ("when CID checking
+    /// docs/datasheets/indy/rex3.pdf says so three times — DRAWMODE1 bit 17 ("when CID checking
     /// disabled (CLIPMODE CIDMATCH = 0xF)"), §3.5.5 ("CID checking is not
     /// allowed for this drawing mode"), and the programming notes ("REX3 will
     /// disable FASTCLEAR mode if CID checking is enabled ... host must setup
@@ -7894,7 +7894,7 @@ fn test_fline_fsn_label_stroke() {
 }
 
 /// A SPAN never steps y: once it reaches XEND, XSTART is left one past it and
-/// YSTART is unchanged (rex3.pdf §3.5.3), and both pattern bit positions
+/// YSTART is unchanged (docs/datasheets/indy/rex3.pdf §3.5.3), and both pattern bit positions
 /// restart at 31. The JIT used to end a span like a block row (x back to
 /// XSAVE, y + 1), and left a disabled pattern's bit position stale; IRIS GL
 /// reads XSTART/YSTART back (fsn.rec). fsn's soft-Z span: two LEN32 GOs.

@@ -21,7 +21,7 @@
 //!
 //! Registers are 32 bits in the data (upper) half of an eight-byte slot.
 //! The register, translation, byte-lane and interrupt behaviour follows the
-//! published Bridge ASIC specification (rev 4.0, `docs/Octane/`). Where the
+//! published Bridge ASIC specification (rev 4.0, `docs/datasheets/octane/`). Where the
 //! specification is silent the choice is marked as an approximation:
 //!
 //! * Arbitration, read response buffers, the SSRAM parity and request
