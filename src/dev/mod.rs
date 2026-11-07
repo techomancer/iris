@@ -44,6 +44,7 @@ pub mod ds1x86;
 pub mod eeprom_93c56;
 pub mod hal2;
 pub mod hpc3;
+pub mod i2c;
 pub mod ioc;
 pub mod mc;
 pub mod mc_vdma;
