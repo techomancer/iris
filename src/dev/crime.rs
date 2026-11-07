@@ -127,10 +127,12 @@ pub struct Crime {
     pub tr: std::sync::Arc<crate::dev::o2gfx_trace::O2Trace>,
 }
 
-/// CRIME's counter runs at 66.67 MHz. The PROM's own delay routine computes
-/// `66 * microseconds` before waiting on it, which is where this number comes
-/// from — it is the firmware's arithmetic, not a datasheet's.
-pub const CRIME_TICKS_PER_US: u64 = 66;
+/// CRIME's timer counts its 66.67 MHz system clock (CRIME 1.5 spec, pages
+/// 2-9 and 5-31): 200 ticks every 3 us. The PROM's delay routine waits for
+/// `66 * microseconds`, a rounding of its own. The CPU clock `hinv` prints is
+/// measured against this timer, so counting 66 a microsecond measured every
+/// CPU 1% fast (a 250 MHz R10000 printed as 255 MHz).
+pub const CRIME_TICKS_PER_3_US: u64 = 200;
 
 impl Crime {
     pub fn new(ust: std::sync::Arc<MaceUst>) -> Self {
@@ -220,7 +222,7 @@ impl Crime {
 
     /// The raw counter, before the offset a write installs.
     fn raw_time(&self) -> u64 {
-        self.ust.guest_us().wrapping_mul(CRIME_TICKS_PER_US)
+        self.ust.guest_us() * CRIME_TICKS_PER_3_US / 3
     }
 
     #[inline]

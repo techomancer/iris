@@ -246,17 +246,30 @@ fn the_time_counter_tracks_the_clock_and_can_be_reset() {
 
     ust.advance_to(1_000 * UST_TICKS_DEN as u64);
     let a = c.read64((CRIME_BASE + crime_reg::TIME) as u64).data;
-    assert!(a >= 1_000 * CRIME_TICKS_PER_US, "counter must follow the clock, got {a}");
+    assert!(a >= 1_000 * CRIME_TICKS_PER_3_US / 3, "counter must follow the clock, got {a}");
     assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, a,
                "and must not advance merely because it was read");
 
-    // Zero it, wait 100us, and it must read about 100us worth of ticks.
+    // Zero it, wait 300us, and it must read 300us worth of ticks.
     c.write64((CRIME_BASE + crime_reg::TIME) as u64, 0);
     assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, 0, "a write sets the counter");
-    ust.advance_to(1_100 * UST_TICKS_DEN as u64);
+    ust.advance_to(1_300 * UST_TICKS_DEN as u64);
     let d = c.read64((CRIME_BASE + crime_reg::TIME) as u64).data;
-    assert_eq!(d, 100 * CRIME_TICKS_PER_US,
-               "100us must be 100 * {CRIME_TICKS_PER_US} ticks, got {d}");
+    assert_eq!(d, 100 * CRIME_TICKS_PER_3_US,
+               "300us must be 100 * {CRIME_TICKS_PER_3_US} ticks, got {d}");
+}
+
+/// The CPU clock `hinv` prints is measured by counting CP0 Count against this
+/// timer, so the timer's rate sets it. CRIME counts its 66.67 MHz system
+/// clock: 200 ticks every 3 us. At 66 a microsecond a 250 MHz R10000 measured
+/// 252.5 MHz and printed as 255.
+#[test]
+fn the_time_counter_runs_at_66_67_mhz() {
+    let ust = std::sync::Arc::new(MaceUst::new());
+    let c = Crime::new(ust.clone());
+    c.write64((CRIME_BASE + crime_reg::TIME) as u64, 0);
+    ust.advance_to(3_000 * UST_TICKS_DEN as u64);
+    assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, 200_000, "3 ms of a 66.67 MHz clock");
 }
 
 #[test]
