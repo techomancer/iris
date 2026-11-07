@@ -124,13 +124,13 @@ impl NewMachineDialog {
                         // nudge the Processor pick to match; leaving it un-does the
                         // nudge rather than stranding the user on R10000 elsewhere.
                         if self.profile == MachineProfile::Indigo2Ip28 {
-                            self.cpu = CpuModel::R10000;
+                            self.cpu = MachineProfile::Indigo2Ip28.cpus()[0];
                             // Newport resolution presets don't apply to IMPACT.
                             self.resolution = NewportResolution::Guest;
                         } else if self.profile == MachineProfile::OctaneIp30 {
                             // An R10000 machine with no built-in PROM; its RAM
                             // is matched pairs of 64 to 512 MB in bank 0 up.
-                            self.cpu = CpuModel::R10000;
+                            self.cpu = MachineProfile::OctaneIp30.cpus()[0];
                             self.use_embedded_prom = false;
                             self.ram_total_mb = 128;
                             self.ram_banks = [128, 0, 0, 0];
@@ -140,7 +140,7 @@ impl NewMachineDialog {
                             // RAM is DIMM-pair kits of 32 to 256 MB, filled from
                             // pair A, so a plain total cannot describe it — refit
                             // whatever the previous profile had.
-                            self.cpu = CpuModel::R5000;
+                            self.cpu = MachineProfile::O2Ip32.cpus()[0];
                             self.use_embedded_prom = false;
                             self.prom_path = "ip32prom.bin".into();
                             self.ram_total_mb = 128;
@@ -451,7 +451,7 @@ mod ram_tests {
         for &total in crate::ram::ram_presets(octane) {
             let mut cfg = iris::config::MachineConfig::default();
             cfg.machine.profile = octane;
-            cfg.machine.cpu = iris::config::CpuModel::R10000;
+            cfg.machine.cpu = octane.cpus()[0];
             cfg.banks = distribute_ram(total, octane);
             cfg.validate().unwrap_or_else(|e| panic!("{total} MB: {e}"));
         }

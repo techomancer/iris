@@ -143,8 +143,8 @@ fn check_cpu(cpu: CpuModel) -> Result<(), String> {
     if profile.accepts_cpu(cpu).is_ok() {
         return Ok(());
     }
-    let offered: Vec<_> = profile.cpus().iter().map(|c| format!("{c:?}")).collect();
-    Err(format!("the benchmark machine is an Indy, which takes {}, not the {cpu:?}", offered.join(" or ")))
+    let offered: Vec<_> = profile.cpus().iter().map(|c| c.name()).collect();
+    Err(format!("the benchmark machine is an Indy, which takes {}, not {}", offered.join(" or "), cpu.name()))
 }
 
 fn run_inner(
@@ -424,13 +424,13 @@ mod tests {
     /// run is refused up front instead of building a machine no config could.
     #[test]
     fn the_r10000_is_refused_before_a_machine_is_built() {
-        let e = run(&BenchOptions { cpu: CpuModel::R10000, ..Default::default() }, |_| {})
+        let e = run(&BenchOptions { cpu: CpuModel::R10000_195, ..Default::default() }, |_| {})
             .expect_err("an Indy has no R10000");
-        assert!(e.contains("R4400") && e.contains("R5000"), "{e}");
+        assert!(e.contains("r4400") && e.contains("r5000"), "{e}");
         for &cpu in bench_cpus() {
             assert!(check_cpu(cpu).is_ok(), "{cpu:?}");
         }
-        assert!(!bench_cpus().contains(&CpuModel::R10000));
+        assert!(!bench_cpus().contains(&CpuModel::R10000_195));
     }
 
     /// A bare-metal program that sizes its work by the test device's clock, as

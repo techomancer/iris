@@ -783,14 +783,11 @@ pub type R10000ShadowCache =
 /// 2 MB secondary cache. PRId 0x0e35, FIR 0x900, 128-byte secondary lines
 /// (SB: a model choice).
 ///
-/// The Octane's R14000 is this type with `R14000_PRID` set at runtime, as the
-/// Octane's own R10000 revision is; only the PRId differs. Both report
-/// "R12000" as `NAME`.
+/// The Octane's R14000 is this type with its own PRId set at build time (see
+/// `CpuModel::prid`), as the Octane's own R10000 revision is; only the PRId
+/// differs. Both report "R12000" as `NAME`.
 pub type R12000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
-
-/// PRId of the R14000 2.4 in the Octane, to set on an `R12000ShadowCache`.
-pub const R14000_PRID: u32 = 0x0000_0f24;
 
 /// R12000 3.5 as the O2 has it: the Octane part with 64-byte secondary lines
 /// (SB clear). With 128-byte lines the O2 PROM panics before its banner

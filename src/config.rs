@@ -706,19 +706,19 @@ impl MachineProfile {
         }
     }
 
-    /// Whether this profile can have `cpu`, and why not if it cannot: the
-    /// refusal for every profile that lists its models in [`Self::cpus`]. The
-    /// O2 constructor still refuses its own, after `validate()`.
+    /// Whether this profile can have `cpu`, and why not if it cannot: it
+    /// must be one of `cpus()`.
     pub fn accepts_cpu(self, cpu: CpuModel) -> Result<(), String> {
-        if self == Self::O2Ip32 || self.cpus().contains(&cpu) {
+        let cpus = self.cpus();
+        if cpus.contains(&cpu) {
             return Ok(());
         }
-        Err(match self {
-            Self::OctaneIp30 => "an Octane has an R10000, R12000 or R14000 ([machine] cpu = \"r10000\", \"r12000\" or \"r14000\")",
-            Self::Indigo2Ip28 => "an Indigo2 IMPACT (IP28) has an R10000 ([machine] cpu = \"r10000\")",
-            _ => "an Indy or Indigo2 has an R4400 or R5000 ([machine] cpu = \"r4400\")",
-        }
-        .into())
+        let names: Vec<String> = cpus.iter().map(|c| format!("{:?}", c.name())).collect();
+        let list = match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            _ => names.join(""),
+        };
+        Err(format!("{} takes [machine] cpu = {list}", self.label()))
     }
 
     pub fn label(self) -> &'static str {
@@ -764,20 +764,30 @@ impl MachineProfile {
         matches!(self, Self::IndyIp24)
     }
 
-    /// The CPU models this machine can be built with. The O2 has an R5000,
-    /// an R10000 or an R12000 (an R4400 is refused when the machine is built,
-    /// not by `validate()`); the Octane has an R10000, R12000 or R14000; the
-    /// Indigo2 IMPACT (IP28) is the Indigo2 with an R10000 module, and has
-    /// only that; the Indy and the other Indigo2 take the R4400 or R5000.
-    ///
-    /// Single source of truth for `validate` and the front-ends' Processor
-    /// pickers, so they cannot offer a CPU the machine will refuse.
+    /// PRId to set for `cpu` on this machine: the chip's own revision
+    /// (`CpuModel::prid`) unless the machine's differs. The IP28's R10000 is
+    /// rev 2.5 (46 dumps) where the Octane's is 2.7; the Indy and Indigo2
+    /// R5000 is rev 1.0 (33 dumps).
+    pub fn cpu_prid(self, cpu: CpuModel) -> Option<u32> {
+        match (self, cpu) {
+            (Self::Indigo2Ip28, CpuModel::R10000_195) => Some(0x0925),
+            (Self::IndyIp24 | Self::Indigo2Ip22, CpuModel::R5000_180) => Some(0x2310),
+            _ => cpu.prid(),
+        }
+    }
+
+    /// The processors this machine can be built with, the default first:
+    /// the R4400 and R5000 for the Indy and `indigo2_ip22`, the R10000 alone
+    /// for the IP28 (the R10000 Indigo2 is that board), and each of the
+    /// O2's and the Octane's own. Single source of truth for `validate` and
+    /// the front-ends' Processor pickers, so they cannot offer a CPU the
+    /// machine will refuse.
     pub fn cpus(self) -> &'static [CpuModel] {
         match self {
-            Self::OctaneIp30 => &[CpuModel::R10000, CpuModel::R12000, CpuModel::R14000],
-            Self::Indigo2Ip28 => &[CpuModel::R10000],
-            Self::O2Ip32 => &[CpuModel::R5000, CpuModel::R10000, CpuModel::R12000],
-            Self::IndyIp24 | Self::Indigo2Ip22 => &[CpuModel::R4400, CpuModel::R5000],
+            Self::OctaneIp30 => crate::ip30_machine::CPUS,
+            Self::O2Ip32 => crate::ip32_machine::CPUS,
+            Self::Indigo2Ip28 => crate::machine::IP28_CPUS,
+            Self::IndyIp24 | Self::Indigo2Ip22 => crate::machine::CPUS,
         }
     }
 
@@ -1040,45 +1050,129 @@ impl KeyboardLayout {
     }
 }
 
-/// Emulated CPU. Runtime-selectable: each model is its own monomorphisation,
-/// so the hot path carries no per-model branch.
+/// Emulated processor: one variant per chip SGI shipped in a machine iris
+/// models, named by family and clock. Runtime-selectable: `with_cpu!` picks
+/// each one's cache and executor type once, at machine construction, so the
+/// hot path carries no per-model branch. The cache types carry the PRId, TLB
+/// and cache geometry; this carries what they do not: the clock, the display
+/// name, and a PRId where the chip's differs from its cache type's.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-#[clap(rename_all = "lower")]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "snake_case")]
+#[allow(non_camel_case_types)]
 pub enum CpuModel {
-    /// MIPS R4400, 16K direct-mapped L1s, 1 MB L2. The Indy IRIS has always shipped.
     #[default]
-    R4400,
-    /// MIPS R5000, 2-way 32K L1s, no secondary cache, MIPS IV.
-    R5000,
-    /// MIPS R10000, 2-way 32K L1s, 1 MB secondary cache, MIPS IV. The CPU in
-    /// the Indigo2 IMPACT (IP28). The machine uses shadow cache arrays;
-    /// see `docs/indigo2-ip28.md` and `src/cpu/mips_cache_shadow.rs`.
-    R10000,
-    /// MIPS R12000: the R10000's programming model. The Octane and the O2
-    /// have it as revision 3.5 with a 2 MB secondary cache.
-    R12000,
-    /// MIPS R14000, revision 2.4, with a 2 MB secondary cache. Selectable on
-    /// the Octane.
-    R14000,
+    R4400_150,
+    R5000_180,
+    R10000_250,
+    R10000_195,
+    R12000_360,
+    R12000_400,
+    R14000_600,
 }
 
 impl CpuModel {
-    pub const ALL: [Self; 5] = [Self::R4400, Self::R5000, Self::R10000, Self::R12000, Self::R14000];
+    pub const ALL: [Self; 7] = [
+        Self::R4400_150,
+        Self::R5000_180,
+        Self::R10000_250,
+        Self::R10000_195,
+        Self::R12000_360,
+        Self::R12000_400,
+        Self::R14000_600,
+    ];
+
+    /// Pipeline clock in MHz. CP0 Count ticks at half of it. Each is a
+    /// configuration seen in real dumps (hinv-archive survey, 2320 unique
+    /// dumps); N is the dumps with that chip, revision and clock.
+    pub const fn mhz(self) -> u32 {
+        match self {
+            // Indy and Indigo2: R4400 rev 5.0, 150 MHz, 1 MB secondary (106
+            // dumps, the most common IP22 configuration).
+            Self::R4400_150 => 150,
+            // Indy and Indigo2 R5000 rev 1.0, 180 MHz, 512 KB secondary (33
+            // dumps). The O2's R5000 is rev 2.1 at the same clock (98).
+            Self::R5000_180 => 180,
+            // O2 R10000 rev 3.4, 250 MHz, 1 MB secondary (7 dumps, the most
+            // common O2 R10000). The O2's secondary cache has 64-byte lines,
+            // because the O2 PROM panics with 128.
+            Self::R10000_250 => 250,
+            // R10000 195 MHz, 1 MB secondary: rev 2.7 in the Octane (24
+            // dumps) and rev 2.5 in the IP28 (46 dumps); see `cpu_prid`.
+            Self::R10000_195 => 195,
+            // Octane R12000 rev 3.5, 360 MHz, 2 MB secondary (11 dumps). Its
+            // secondary cache has 128-byte lines (a model choice).
+            Self::R12000_360 => 360,
+            // O2 R12000 rev 3.5, 400 MHz, 2 MB secondary (14 dumps), with
+            // 64-byte lines.
+            Self::R12000_400 => 400,
+            // Octane R14000 rev 2.4, 600 MHz, 2 MB secondary (32 dumps).
+            // Where the manuals say nothing it follows the R10000, as the
+            // sgi-origami QEMU model does.
+            Self::R14000_600 => 600,
+        }
+    }
+
+    /// PRId to set over the cache type's, where the chip's differs; the
+    /// default for the chip's revision, which a machine can override
+    /// (`MachineProfile::cpu_prid`). Established: each value is the
+    /// documented PRId encoding (implementation byte, then major and minor
+    /// revision) of the revision hinv-archive dumps report for that chip
+    /// (counts on `mhz`).
+    pub const fn prid(self) -> Option<u32> {
+        match self {
+            Self::R4400_150 => Some(0x0450),
+            Self::R10000_250 => Some(0x0934),
+            Self::R10000_195 => Some(0x0927),
+            Self::R14000_600 => Some(0x0f24),
+            _ => None,
+        }
+    }
+
+    /// CP0 Count rate: half the pipeline clock.
+    pub const fn count_hz(self) -> u64 {
+        self.mhz() as u64 * 500_000
+    }
 
     /// Whether the part is in the R10000 family.
     pub fn is_r10000_family(self) -> bool {
-        matches!(self, Self::R10000 | Self::R12000 | Self::R14000)
+        !matches!(self, Self::R4400_150 | Self::R5000_180)
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::R4400 => "MIPS R4400",
-            Self::R5000 => "MIPS R5000",
-            Self::R10000 => "MIPS R10000",
-            Self::R12000 => "MIPS R12000",
-            Self::R14000 => "MIPS R14000",
+            Self::R4400_150 => "MIPS R4400 150 MHz",
+            Self::R5000_180 => "MIPS R5000 180 MHz",
+            Self::R10000_250 => "MIPS R10000 175 MHz",
+            Self::R10000_195 => "MIPS R10000 195 MHz",
+            Self::R12000_360 => "MIPS R12000 360 MHz",
+            Self::R12000_400 => "MIPS R12000 400 MHz",
+            Self::R14000_600 => "MIPS R14000 600 MHz",
         }
+    }
+
+    /// The `cpu = ` name, such as `r14000_600`.
+    pub fn name(self) -> String {
+        clap::ValueEnum::to_possible_value(&self).expect("no skipped variants").get_name().to_owned()
+    }
+
+    /// The chip a `cpu = ` value names. A full chip name names that chip; a
+    /// bare family (`"r14000"`) names the first part of that family in `cpus`
+    /// (a machine's list, default first), or failing that the first of the
+    /// family anywhere, so that validation reports the machine's choices
+    /// instead of this lookup. The one place a bare name is resolved.
+    pub fn resolve(name: &str, cpus: &[CpuModel]) -> Result<Self, String> {
+        let name = name.trim().to_ascii_lowercase();
+        if let Some(chip) = Self::ALL.into_iter().find(|c| c.name() == name) {
+            return Ok(chip);
+        }
+        let family = |c: &CpuModel| c.name().split('_').next() == Some(name.as_str());
+        cpus.iter().copied().find(family)
+            .or_else(|| Self::ALL.into_iter().find(family))
+            .ok_or_else(|| {
+                let names: Vec<_> = Self::ALL.iter().map(|c| c.name()).collect();
+                format!("unknown cpu {name:?}; expected one of {}", names.join(", "))
+            })
     }
 }
 
@@ -1118,17 +1212,39 @@ impl CacheModel {
 
 /// `[machine]` section — platform identity (not performance knobs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MachineSectionFile")]
 pub struct MachineSection {
-    #[serde(default)]
     pub profile: MachineProfile,
-    #[serde(default)]
     pub cpu: CpuModel,
-    #[serde(default)]
     pub cache: CacheModel,
     /// Processors fitted. More than one only on the Octane.
-    #[serde(default = "default_cpus")]
     pub cpus: u8,
+}
+
+/// `[machine]` as written. `cpu` stays text until the profile is known: a
+/// bare family name (`"r14000"`) means that machine's part of the family.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineSectionFile {
+    #[serde(default)]
+    profile: MachineProfile,
+    cpu: Option<String>,
+    #[serde(default)]
+    cache: CacheModel,
+    #[serde(default = "default_cpus")]
+    cpus: u8,
+}
+
+impl TryFrom<MachineSectionFile> for MachineSection {
+    type Error = String;
+
+    fn try_from(f: MachineSectionFile) -> Result<Self, String> {
+        let cpu = match f.cpu {
+            Some(name) => CpuModel::resolve(&name, f.profile.cpus())?,
+            None => f.profile.cpus()[0],
+        };
+        Ok(Self { profile: f.profile, cpu, cache: f.cache, cpus: f.cpus })
+    }
 }
 
 fn default_cpus() -> u8 {
@@ -2789,15 +2905,16 @@ pub struct Cli {
     #[arg(long = "no-scsi-deferred-int", default_value_t = false)]
     pub no_scsi_deferred_int: bool,
 
-    /// Emulated CPU: `r4400` (default), `r5000`, `r10000`, `r12000` or `r14000`. Overrides `[machine] cpu`.
+    /// Emulated CPU: a family (`r4400` (default), `r5000`, `r10000`, `r12000` or `r14000`) or a chip (`r14000_600`). Overrides `[machine] cpu`.
     ///
     /// Every model is compiled into every build — each is its own
     /// monomorphisation, so the hot path carries no per-model branch — and this
     /// picks between them at construction. The `r5k` Cargo feature is removed.
-    /// The Octane takes `r10000`, `r12000` and `r14000`; the O2 `r5000`,
-    /// `r10000` and `r12000`; the IP28 `r10000`.
+    /// A family means the machine's chip of that family. The Indy and
+    /// `indigo2_ip22` take `r4400` and `r5000`; the IP28 `r10000`; the Octane
+    /// `r10000`, `r12000` and `r14000`; the O2 `r5000`, `r10000` and `r12000`.
     #[arg(long = "cpu", value_name = "MODEL")]
-    pub cpu: Option<CpuModel>,
+    pub cpu: Option<String>,
 
     /// Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`),
     /// `full` or `shadow`. Overrides `[machine] cache`. The R10000 family is always
@@ -2982,7 +3099,15 @@ impl Cli {
             }
         }
 
-        if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
+        if self.cpu.is_none() && !cfg.machine.profile.cpus().contains(&cfg.machine.cpu) {
+            cfg.machine.cpu = cfg.machine.profile.cpus()[0];
+        }
+        if let Some(cpu) = &self.cpu {
+            cfg.machine.cpu = CpuModel::resolve(cpu, cfg.machine.profile.cpus()).unwrap_or_else(|e| {
+                eprintln!("iris: --cpu: {e}");
+                std::process::exit(1);
+            });
+        }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
         if self.scale2x { cfg.scale = 2; }
@@ -3362,7 +3487,7 @@ mod export_tests {
         cfg.jitv2.compile = JitCompile::Sync;
         cfg.validate().expect("sync compile on the default machine");
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = CpuModel::R10000_195;
         cfg.machine.cpus = 2;
         assert!(cfg.validate().unwrap_err().contains("one CPU"));
     }
@@ -3392,7 +3517,7 @@ mod export_tests {
             assert!(cfg.validate().unwrap_err().contains("512 MB needs the IP28"));
         }
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = CpuModel::R10000_195;
         cfg.validate().expect("IP28 accepts two 512 MB banks");
     }
 
@@ -3405,7 +3530,7 @@ mod export_tests {
         assert!(err.contains("256 MB"), "{err}");
         {
             cfg.machine.profile = MachineProfile::Indigo2Ip28;
-            cfg.machine.cpu = CpuModel::R10000;
+            cfg.machine.cpu = CpuModel::R10000_195;
             cfg.validate().expect("the IP28 MC can");
         }
     }
@@ -3417,14 +3542,14 @@ mod export_tests {
     fn o2_takes_scsi_tables_with_controller_as_bus() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::O2Ip32;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = CpuModel::R10000_250;
         cfg.scsi.insert(2, ScsiDeviceConfig { path: "external.raw".into(), controller: 1, ..Default::default() });
         cfg.validate().expect("the O2 has two SCSI controllers");
         cfg.machine.profile = MachineProfile::IndyIp24;
         cfg.machine.cpu = CpuModel::default();
         assert!(cfg.validate().unwrap_err().contains("controller 1"), "the Indy has one");
         cfg.machine.profile = MachineProfile::O2Ip32;
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = CpuModel::R10000_250;
         cfg.scsi.insert(3, ScsiDeviceConfig { kind_field: ScsiKind::Daynaport, ..Default::default() });
         assert!(cfg.validate().unwrap_err().contains("daynaport"));
     }
@@ -3435,7 +3560,7 @@ mod export_tests {
         for profile in [MachineProfile::default(), MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
             let mut cfg = MachineConfig::default();
             cfg.machine.profile = profile;
-            if profile != MachineProfile::default() { cfg.machine.cpu = CpuModel::R10000; }
+            if profile != MachineProfile::default() { cfg.machine.cpu = profile.cpus()[0]; }
             cfg.network.mode = NetMode::Stream;
             assert!(cfg.validate().unwrap_err().contains("needs [network] stream"), "{profile:?}");
             cfg.network.stream = Some("tcp:nope".into());
@@ -3468,7 +3593,7 @@ mod export_tests {
 
         let mut o2 = MachineConfig::default();
         o2.machine.profile = MachineProfile::O2Ip32;
-        o2.machine.cpu = CpuModel::R10000;
+        o2.machine.cpu = CpuModel::R10000_250;
         o2.validate().expect("two 128 MB kits are an O2's 256 MB");
         o2.banks = banks_from4([256, 256, 256, 256]);
         o2.validate().expect("1 GB");
@@ -3553,36 +3678,20 @@ mod export_tests {
     }
 
     /// The IP28's default `[machine] cpu` is the R4400 it cannot have; the
-    /// error names the line to change.
+    /// error names the line to change. The R10000 is no Indy's or Indigo2's.
     #[test]
     fn the_default_cpu_on_the_ip28_names_the_fix() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        assert_eq!(cfg.machine.cpu, CpuModel::R4400, "the default cpu");
+        assert_eq!(cfg.machine.cpu, CpuModel::R4400_150, "the default cpu");
         let e = cfg.validate().unwrap_err();
-        assert!(e.contains("cpu = \"r10000\""), "{e}");
-        cfg.machine.cpu = CpuModel::R10000;
+        assert!(e.contains("cpu = \"r10000_195\""), "{e}");
+        cfg.machine.cpu = CpuModel::R10000_195;
         assert!(cfg.validate().is_ok());
-        // ... and the R10000 is no longer an Indy's or an Indigo2's.
         for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22] {
             cfg.machine.profile = p;
             let e = cfg.validate().unwrap_err();
-            assert!(e.contains("cpu = \"r4400\""), "{p:?}: {e}");
-        }
-    }
-
-    /// `validate` and the front-ends' pickers read the same list: a model is
-    /// accepted exactly when `cpus()` offers it. The O2 is the one exception
-    /// (its constructor, not `validate`, refuses an R4400).
-    #[test]
-    fn accepts_cpu_agrees_with_cpus_for_every_profile() {
-        for p in MachineProfile::EVERY {
-            if p == MachineProfile::O2Ip32 {
-                continue;
-            }
-            for c in CpuModel::ALL {
-                assert_eq!(p.accepts_cpu(c).is_ok(), p.cpus().contains(&c), "{p:?} {c:?}");
-            }
+            assert!(e.contains("cpu = \"r4400_150\""), "{p:?}: {e}");
         }
     }
 
@@ -3591,12 +3700,14 @@ mod export_tests {
     #[test]
     fn a_profile_says_which_processors_it_accepts() {
         let accepted = |p: MachineProfile| CpuModel::ALL.into_iter().filter(|&c| p.accepts_cpu(c).is_ok()).collect::<Vec<_>>();
-        assert_eq!(accepted(MachineProfile::OctaneIp30), [CpuModel::R10000, CpuModel::R12000, CpuModel::R14000]);
-        assert_eq!(accepted(MachineProfile::IndyIp24), [CpuModel::R4400, CpuModel::R5000]);
-        assert_eq!(accepted(MachineProfile::Indigo2Ip22), [CpuModel::R4400, CpuModel::R5000]);
-        assert_eq!(accepted(MachineProfile::Indigo2Ip28), [CpuModel::R10000]);
-        // The O2 constructor refuses its R4400 itself, so validate() lets it by.
-        assert_eq!(accepted(MachineProfile::O2Ip32), CpuModel::ALL);
+        assert_eq!(accepted(MachineProfile::OctaneIp30), [CpuModel::R10000_195, CpuModel::R12000_360, CpuModel::R14000_600]);
+        assert_eq!(accepted(MachineProfile::IndyIp24), [CpuModel::R4400_150, CpuModel::R5000_180]);
+        assert_eq!(accepted(MachineProfile::Indigo2Ip22), [CpuModel::R4400_150, CpuModel::R5000_180]);
+        assert_eq!(accepted(MachineProfile::Indigo2Ip28), [CpuModel::R10000_195]);
+        assert_eq!(accepted(MachineProfile::O2Ip32), [CpuModel::R5000_180, CpuModel::R10000_250, CpuModel::R12000_400]);
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+            assert_eq!(accepted(p), p.cpus(), "{p:?}");
+        }
 
         // The counts are what the checks in validate() and the Octane
         // constructor allowed before they moved here: one on every machine
@@ -3616,20 +3727,20 @@ mod export_tests {
 
         let mut octane = MachineConfig::default();
         octane.machine.profile = MachineProfile::OctaneIp30;
-        octane.machine.cpu = CpuModel::R10000;
+        octane.machine.cpu = CpuModel::R10000_195;
         octane.banks = banks_from4([128, 0, 0, 0]);
         octane.machine.cpus = 2;
         octane.validate().expect("two processors");
         octane.machine.cpus = 3;
         assert!(octane.validate().unwrap_err().contains("1 or 2"));
         octane.machine.cpus = 1;
-        octane.machine.cpu = CpuModel::R4400;
-        assert!(octane.validate().unwrap_err().contains("an Octane has an R10000"));
+        octane.machine.cpu = CpuModel::R4400_150;
+        assert!(octane.validate().unwrap_err().contains("takes [machine] cpu = \"r10000_195\""));
 
         // The constructor refuses a processor with the words validate() does.
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.machine.cpu = CpuModel::R4400;
+        cfg.machine.cpu = CpuModel::R4400_150;
         let from_validate = cfg.validate().unwrap_err();
         assert_eq!(crate::ip30_machine::OctaneMachine::new(&cfg).err(), Some(from_validate));
     }
@@ -3680,36 +3791,71 @@ mod export_tests {
         assert_eq!(back.serial_socket_a.as_deref(), Some("/run/x.sock"));
     }
 
-    /// `cpu` names each part, and the R10000 family runs the shadow caches.
+    /// `cpu` names each chip, or a family: the machine's chip of that family.
+    /// With no machine named, a family is the first of it anywhere.
+    /// The R10000 family runs the shadow caches.
     #[test]
     fn every_cpu_part_is_selectable_by_name() {
         for (name, cpu, family) in [
-            ("r4400", CpuModel::R4400, false),
-            ("r5000", CpuModel::R5000, false),
-            ("r10000", CpuModel::R10000, true),
-            ("r12000", CpuModel::R12000, true),
-            ("r14000", CpuModel::R14000, true),
+            ("r4400", CpuModel::R4400_150, false),
+            ("r5000", CpuModel::R5000_180, false),
+            ("r10000", CpuModel::R10000_250, true),
+            ("r12000", CpuModel::R12000_360, true),
+            ("r14000", CpuModel::R14000_600, true),
         ] {
-            let cfg: MachineConfig = toml::from_str(&format!("[machine]\ncpu = \"{name}\"\n")).unwrap();
-            assert_eq!(cfg.machine.cpu, cpu, "{name}");
+            for text in [name.to_string(), cpu.name()] {
+                let cfg: MachineConfig = toml::from_str(&format!("[machine]\ncpu = \"{text}\"\n")).unwrap();
+                assert_eq!(cfg.machine.cpu, cpu, "{text}");
+            }
             assert_eq!(cpu.is_r10000_family(), family, "{name}");
             assert_eq!(CacheModel::Full.is_shadow(cpu), family, "{name}");
-            assert!(CpuModel::ALL.contains(&cpu), "{name}");
+        }
+        for cpu in CpuModel::ALL {
+            let mut cfg = MachineConfig::default();
+            cfg.machine.cpu = cpu;
+            let back: MachineConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(back.machine.cpu, cpu, "{cpu:?} survives a save");
+        }
+        let e = toml::from_str::<MachineConfig>("[machine]\ncpu = \"r8000\"\n").unwrap_err().to_string();
+        assert!(e.contains("unknown cpu"), "{e}");
+    }
+
+    /// A config with no `cpu` takes its machine's first processor, in a file
+    /// and with `--machine`, for every machine.
+    #[test]
+    fn no_cpu_means_the_machines_first_processor() {
+        for p in MachineProfile::EVERY {
+            let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"{}\"\n", p.name())).unwrap();
+            assert_eq!(cfg.machine.cpu, p.cpus()[0], "{p:?} in a file");
+            let cli = Cli::parse_from(["iris", "--machine", p.name()]);
+            assert_eq!(cli.apply(MachineConfig::default()).machine.cpu, p.cpus()[0], "{p:?} on the command line");
+            assert!(p.accepts_cpu(p.cpus()[0]).is_ok());
         }
     }
 
-    /// The IP28 shipped with the R10000 only, so it refuses the later family
-    /// parts; the Octane and the O2 each name the parts they take.
+    /// A bare family name is the chip of the machine named in the same file
+    /// (the Octane's R10000 is its own revision), and `--cpu` does the same.
+    #[test]
+    fn a_bare_family_name_is_the_machines_chip() {
+        let cfg: MachineConfig = toml::from_str("[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n").unwrap();
+        assert_eq!(cfg.machine.cpu, CpuModel::R10000_195);
+        let cfg: MachineConfig = toml::from_str("[machine]\ncpu = \"r10000\"\nprofile = \"o2_ip32\"\n").unwrap();
+        assert_eq!(cfg.machine.cpu, CpuModel::R10000_250);
+        let cli = Cli::parse_from(["iris", "--machine", "octane_ip30", "--cpu", "r14000"]);
+        assert_eq!(cli.apply(MachineConfig::default()).machine.cpu, CpuModel::R14000_600);
+    }
+
+    /// Each machine refuses a chip it does not take, naming the chips it does.
     #[test]
     fn machines_name_the_cpus_they_accept() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        for cpu in [CpuModel::R12000, CpuModel::R14000] {
+        for cpu in [CpuModel::R12000_360, CpuModel::R14000_600] {
             cfg.machine.cpu = cpu;
             let err = cfg.validate().expect_err("the IP28 has an R10000");
-            assert_eq!(err, "an Indigo2 IMPACT (IP28) has an R10000 ([machine] cpu = \"r10000\")");
+            assert_eq!(err, "SGI Indigo2 IMPACT (IP28) takes [machine] cpu = \"r10000_195\"");
         }
-        cfg.machine.cpu = CpuModel::R10000;
+        cfg.machine.cpu = CpuModel::R10000_195;
         cfg.validate().expect("the IP28 takes the R10000");
 
         // Both machines check the part before they look for a PROM.
@@ -3722,12 +3868,12 @@ mod export_tests {
                 _ => crate::ip32_machine::O2Machine::new(&cfg).err(),
             }
         };
-        let octane = "an Octane has an R10000, R12000 or R14000 ([machine] cpu = \"r10000\", \"r12000\" or \"r14000\")";
-        let o2 = "an O2 has an R5000, R10000 or R12000 ([machine] cpu = \"r5000\", \"r10000\" or \"r12000\")";
-        for cpu in [CpuModel::R4400, CpuModel::R5000] {
+        let octane = "SGI Octane (IP30) takes [machine] cpu = \"r10000_195\", \"r12000_360\" or \"r14000_600\"";
+        let o2 = "SGI O2 (IP32) takes [machine] cpu = \"r5000_180\", \"r10000_250\" or \"r12000_400\"";
+        for cpu in [CpuModel::R4400_150, CpuModel::R5000_180, CpuModel::R10000_250] {
             assert_eq!(refusal(MachineProfile::OctaneIp30, cpu).as_deref(), Some(octane), "{cpu:?}");
         }
-        for cpu in [CpuModel::R4400, CpuModel::R14000] {
+        for cpu in [CpuModel::R4400_150, CpuModel::R14000_600, CpuModel::R12000_360, CpuModel::R10000_195] {
             assert_eq!(refusal(MachineProfile::O2Ip32, cpu).as_deref(), Some(o2), "{cpu:?}");
         }
     }

@@ -297,7 +297,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // `[machine] cache`. The R10000 only has the shadow model, so the
         // choice is fixed there.
         ui.label(t!("config-cache-model"));
-        let r10k = cfg.machine.cpu == CpuModel::R10000;
+        let r10k = cfg.machine.cpu.is_r10000_family();
         ui.add_enabled_ui(!mem_ctx.running && !r10k, |ui| {
             let shown = if r10k { t!("config-cache-shadow-only") } else { cache_model_label(cfg.machine.cache, cfg.machine.cpu) };
             ComboBox::from_id_salt("cache_model")
@@ -351,7 +351,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         subtitle(ui, t!("config-cpu-applies-subtitle"));
     }
     subtitle(ui, t!("config-cpu-subtitle"));
-    if cfg.machine.cpu == CpuModel::R10000 {
+    if cfg.machine.cpu.is_r10000_family() {
         subtitle(ui, t!("config-r10000-subtitle"));
     }
     // jitv2's compile pool and its persistent code cache live on the Performance
@@ -680,7 +680,7 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
 /// an Indy a moment ago carries both.
 fn o2_defaults(cfg: &mut MachineConfig) {
     if !cfg.machine.profile.cpus().contains(&cfg.machine.cpu) {
-        cfg.machine.cpu = CpuModel::R5000;
+        cfg.machine.cpu = MachineProfile::O2Ip32.cpus()[0];
     }
     // CP0 Count is half the CPU clock here (90 MHz), and a clock carried over
     // from the Indy (33 MHz) would make IRIX's clock run at the wrong rate.
@@ -705,7 +705,7 @@ fn o2_defaults(cfg: &mut MachineConfig) {
 }
 
 fn octane_defaults(cfg: &mut MachineConfig) {
-    cfg.machine.cpu = CpuModel::R10000;
+    cfg.machine.cpu = MachineProfile::OctaneIp30.cpus()[0];
     let sizes = MachineProfile::OctaneIp30.bank_sizes();
     let banks = &cfg.banks[..MachineProfile::OctaneIp30.memory_banks()];
     let filled = banks.iter().take_while(|&&b| b != 0).count();

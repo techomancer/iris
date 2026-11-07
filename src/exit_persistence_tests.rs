@@ -212,9 +212,10 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
         Machine::Octane => MachineProfile::OctaneIp30,
     };
     cfg.machine.cpu = match machine {
-        Machine::Indy | Machine::Indigo2 => CpuModel::R4400,
-        Machine::O2 => CpuModel::R5000,
-        Machine::Indigo2Ip28 | Machine::Octane => CpuModel::R10000,
+        Machine::Indy | Machine::Indigo2 => CpuModel::R4400_150,
+        Machine::O2 => CpuModel::R5000_180,
+        Machine::Indigo2Ip28 => CpuModel::R10000_195,
+        Machine::Octane => CpuModel::R10000_195,
     };
     // The O2 and the Octane have no embedded PROM; an empty one builds.
     match machine {
@@ -739,7 +740,7 @@ fn no_process_exit_bypasses_the_flush() {
         // The bare-metal test device ends the run with the guest's exit code.
         ("dev/testdev.rs", 1, "bare-metal test device, a harness only"),
         // Command-line and configuration front ends: nothing is running yet.
-        ("config.rs", 9, "command-line and configuration errors, the --validate result and --machine"),
+        ("config.rs", 10, "command-line and configuration errors, the --validate result, --machine and --cpu"),
         ("iris_ci_main.rs", 1, "the iris-ci client"),
         ("crash_diag.rs", 1, "fatal-signal handler: the process is already dying"),
     ];

@@ -1342,7 +1342,7 @@ impl App {
                 ui.label(RichText::new(t!("menu-machine-processor", cpu = self.cfg.machine.cpu.label())).strong());
                 // The Octane is an R10000 and nothing else.
                 ui.add_enabled_ui(!running && self.cfg.machine.profile != iris::config::MachineProfile::OctaneIp30, |ui| {
-                    for c in iris::config::CpuModel::ALL {
+                    for &c in self.cfg.machine.profile.cpus() {
                         if ui.radio(self.cfg.machine.cpu == c, c.label()).clicked() {
                             self.cfg.machine.cpu = c;
                             self.mark_dirty();

@@ -118,7 +118,7 @@ mod tests {
     fn newport_on_ip28_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.machine.cpu = crate::config::CpuModel::R10000;
+        cfg.machine.cpu = crate::config::CpuModel::R10000_195;
         cfg.graphics.board = Some(GraphicsBoard::Newport);
         cfg.validate().expect("Newport on IP28");
     }
@@ -127,7 +127,7 @@ mod tests {
     fn xz_on_ip28_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.machine.cpu = crate::config::CpuModel::R10000;
+        cfg.machine.cpu = crate::config::CpuModel::R10000_195;
         cfg.graphics.board = Some(GraphicsBoard::Xz);
         cfg.validate().expect("XZ on IP28");
     }

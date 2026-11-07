@@ -140,6 +140,11 @@ fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
     })
 }
 
+/// `--cpu`: a family or a chip, on the machine the suite runs on.
+fn bench_cpu(name: &str) -> Result<iris::config::CpuModel, String> {
+    iris::config::CpuModel::resolve(name, iris::config::MachineProfile::default().cpus())
+}
+
 /// Run the suite inside this process, streaming the guest's console as it
 /// arrives.
 ///
@@ -724,7 +729,7 @@ enum Cmd {
         quick: bool,
         /// Emulated CPU for the in-process run. With --iris, forward it to the
         /// emulator instead: `-- --cpu r5000`.
-        #[arg(long, default_value = "r4400")]
+        #[arg(long, default_value = "r4400", value_parser = bench_cpu)]
         cpu: iris::config::CpuModel,
         /// Cache model for the in-process run: auto (shadow in a jitv2
         /// build), full or shadow. With --iris: `-- --cache shadow`.

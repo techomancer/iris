@@ -272,8 +272,8 @@ in [docs/interrupt_map.md](docs/interrupt_map.md).
 
 ### Time
 
-CP0 Count is derived from host wall-clock time at a fixed rate (33 MHz on
-IP22/IP24, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). The Compare
+CP0 Count is derived from host wall-clock time at a fixed rate (half the chip's clock, from
+`CpuModel::mhz`: 75 MHz on the Indy R4400, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). The Compare
 interrupt and other periodic device events come from host timers
 (`src/hptimer.rs`), not from counting instructions. A guest that runs faster
 or slower than real hardware sees the same time passing. `--features
