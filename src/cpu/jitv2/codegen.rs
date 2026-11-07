@@ -11053,6 +11053,12 @@ mod tests {
         let pages: [(&str, &[u32]); 5] =
             [("simple", &simple), ("narrow", &narrow), ("fp", &fp), ("likely", &likely), ("blocks", &blocks)];
 
+        // The two compiles must see the same process-wide switches: other
+        // tests flip the entry check, interpreter fallback and the enable
+        // table while they run, each under its own lock.
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
+        let _fallback = crate::cpu::jitv2::analyzer::FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _entry = crate::cpu::jitv2::ENTRY_PREAMBLE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (name, words) in pages {
             let mut page = [0u32; ENTRIES_PER_PAGE];
             page[..words.len()].copy_from_slice(words);
