@@ -10211,9 +10211,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// latched, jitv2 `pcp` cleared), without the stats `Device::stop` prints.
     fn halt(&self) {
         self.running.store(false, Ordering::SeqCst);
+        // A compiled loop only looks at the interrupt word, never at
+        // `running`: a guest spinning in one would keep the join below waiting
+        // for ever. The park bit makes it leave compiled code, and the run
+        // loop then sees `running` is false.
+        let word = unsafe { &*self.interrupts_ptr() };
+        word.fetch_or(crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
+        word.fetch_and(!crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
         let mut exec = self.executor.lock();
         // Latch the virtual CP0 Count and silence the compare timer while
         // stopped — debugger stepping must not see Count advance or IP7
