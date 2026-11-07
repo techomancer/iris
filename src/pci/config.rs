@@ -240,6 +240,11 @@ impl PciConfig {
                     Bar::Mem(n) => val & !(n - 1),
                 };
             }
+            // Expansion ROM base: no function has a ROM, so the register is
+            // unimplemented and reads zero (PCI 2.2, 6.1 and 6.2.5.2). A size
+            // probe that read back its ones would have firmware map a ROM
+            // that is not there.
+            12 => {}
             // The capability list is read-only.
             16.. if reg < self.caps_end => {}
             // Interrupt pin is read-only; the line is firmware's scratch.
@@ -530,6 +535,18 @@ mod tests {
         assert_eq!(c.read(6), 0);
         c.write(5, 0x8000_1000);
         assert_eq!(c.bar_base(1), 0x8000_1000, "and then holds the address assigned to it");
+    }
+
+    /// No function has an expansion ROM, so the ROM base register is
+    /// unimplemented: a size probe reads back zero, which tells firmware
+    /// there is no ROM to map (PCI 2.2, 6.1 and 6.2.5.2).
+    #[test]
+    fn the_expansion_rom_register_reads_zero_when_probed() {
+        let c = scsi_like();
+        c.write(12, 0xffff_f800);
+        assert_eq!(c.read(12), 0);
+        c.write(12, 0x00b0_2001);
+        assert_eq!(c.read(12), 0, "an assigned address does not stick either");
     }
 
     /// A function decodes a space only once it has been told it may, and
