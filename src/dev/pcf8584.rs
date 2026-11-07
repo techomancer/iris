@@ -30,6 +30,7 @@ use crate::irq::IrqLine;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// The two addresses the A0 pin selects, spaced as the Hub wires them.
 pub const A0_STRIDE: u64 = 8;
@@ -55,6 +56,86 @@ pub mod sts {
     pub const LAB: u8 = 0x02;
     /// Set means the bus is not busy.
     pub const BB: u8 = 0x01;
+}
+
+/// Which of several adapters on one module bus has it open. Adapters share
+/// targets and so a transfer by one must not interleave with another's: a
+/// START that finds the bus held waits, and the holder's STOP hands the bus
+/// to the waiting adapter with the lowest number, so a holder that STARTs
+/// again cannot overtake it.
+///
+/// The state is a few bits under a leaf mutex rather than atomics: nothing
+/// else is published through it, but owner and waiters change together and
+/// the handover at a STOP has to be one step. It is only touched by I2C
+/// register accesses, which are rare. It is a leaf lock: an adapter takes it
+/// under its own, and the module scheduler calls `busy()` under the module
+/// state lock, and nothing is called while it is held.
+pub struct BusOwner(Mutex<Held>);
+
+struct Held {
+    owner: Option<u32>,
+    /// One bit per adapter whose first START is waiting.
+    waiting: u32,
+}
+
+impl BusOwner {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(Held { owner: None, waiting: 0 })))
+    }
+
+    /// Take the bus, or confirm it is already `id`'s (a handover). A free bus
+    /// goes only to the lowest waiter when there are any.
+    fn try_acquire(&self, id: u32) -> bool {
+        let mut held = self.0.lock();
+        match held.owner {
+            Some(owner) => owner == id,
+            None if held.waiting == 0 || held.waiting.trailing_zeros() == id => {
+                held.owner = Some(id);
+                held.waiting &= !(1 << id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `id`'s START found the bus held and waits for it.
+    fn wait(&self, id: u32) {
+        self.0.lock().waiting |= 1 << id;
+    }
+
+    /// `id`'s waiting START is withdrawn. If the bus had already been handed
+    /// to it, it is passed on.
+    fn withdraw(&self, id: u32) {
+        self.0.lock().waiting &= !(1 << id);
+        self.release(id);
+    }
+
+    /// `id` lets go of the bus; the lowest waiter, if any, has it at once.
+    fn release(&self, id: u32) {
+        let mut held = self.0.lock();
+        if held.owner != Some(id) {
+            return;
+        }
+        held.owner = None;
+        if held.waiting != 0 {
+            let next = held.waiting.trailing_zeros();
+            held.waiting &= !(1 << next);
+            held.owner = Some(next);
+        }
+    }
+
+    fn held_by_other(&self, id: u32) -> bool {
+        self.0.lock().owner.is_some_and(|owner| owner != id)
+    }
+
+    fn owned_by(&self, id: u32) -> bool {
+        self.0.lock().owner == Some(id)
+    }
+
+    /// Some adapter has the bus open.
+    pub fn busy(&self) -> bool {
+        self.0.lock().owner.is_some()
+    }
 }
 
 enum Reg {
@@ -94,6 +175,11 @@ struct State {
     rx_directed: bool,
     /// Interrupt output level last reported to the line.
     irq_level: bool,
+    /// The bus this adapter shares with others, and its place among them.
+    shared: Option<(Arc<BusOwner>, u32)>,
+    /// A first START that found the bus held by another adapter, waiting for
+    /// it to be released.
+    waiting: Option<u8>,
 }
 
 impl State {
@@ -116,6 +202,8 @@ impl State {
             rx_current: false,
             rx_directed: false,
             irq_level: false,
+            shared: None,
+            waiting: None,
         }
     }
 
@@ -230,7 +318,46 @@ impl State {
         }
     }
 
+    fn acquire(&self) -> bool {
+        self.shared.as_ref().is_none_or(|(owner, id)| owner.try_acquire(*id))
+    }
+
+    fn release(&self) {
+        if let Some((owner, id)) = &self.shared {
+            owner.release(*id);
+        }
+    }
+
+    fn owns(&self) -> bool {
+        self.shared.as_ref().is_some_and(|(owner, id)| owner.owned_by(*id))
+    }
+
+    fn held_by_other(&self) -> bool {
+        self.shared.as_ref().is_some_and(|(owner, id)| owner.held_by_other(*id))
+    }
+
+    /// A waiting START is withdrawn; a bus already handed to it moves on.
+    fn withdraw(&mut self) {
+        if self.waiting.take().is_some() {
+            if let Some((owner, id)) = &self.shared {
+                owner.withdraw(*id);
+            }
+        }
+    }
+
+    /// A START that waited for the bus runs once it is handed over.
+    fn resume_waiting(&mut self) {
+        if let Some(addr) = self.waiting {
+            if self.acquire() {
+                self.waiting = None;
+                self.start(addr);
+            }
+        }
+    }
+
     fn stop(&mut self) {
+        self.withdraw();
+        self.release();
         if self.transfer {
             self.bus_end();
         }
@@ -310,7 +437,12 @@ impl State {
     }
 
     fn write_control(&mut self, val: u8) {
+        let prev = self.control;
         self.control = val;
+        if prev & ctl::ESO != 0 && val & ctl::ESO == 0 {
+            // Clearing ESO withdraws a START that is waiting.
+            self.withdraw();
+        }
 
         if val & ctl::PIN != 0 {
             // PIN from the host is the idle request. It is also written alone
@@ -332,7 +464,18 @@ impl State {
                 };
                 // First start: the address is already staged in the register.
                 self.status |= sts::PIN;
-                self.start(addr);
+                self.start_address_staged = false;
+                if self.acquire() {
+                    self.start(addr);
+                } else {
+                    // Another adapter has the bus: the START waits for it.
+                    // The specification does not say what a START on a busy
+                    // bus does, so this is a model choice.
+                    self.waiting = Some(addr);
+                    if let Some((owner, id)) = &self.shared {
+                        owner.wait(*id);
+                    }
+                }
             }
             return;
         }
@@ -349,7 +492,8 @@ impl State {
             // Write-only in the documentation with the serial interface off;
             // real parts answer with the control bits plus the PIN state.
             if self.control & ctl::ESO != 0 {
-                return self.status;
+                // The bus reads busy while another adapter has it open.
+                return if self.held_by_other() { self.status & !sts::BB } else { self.status };
             }
             return (self.control & !sts::PIN) | (self.status & sts::PIN);
         }
@@ -381,9 +525,11 @@ impl State {
         if self.transfer && self.bus_busy() {
             self.bus_end();
         }
+        self.withdraw();
+        self.release();
         // The line level survives so the access that follows reports a drop.
-        let (bus, irq_level) = (std::mem::take(&mut self.bus), self.irq_level);
-        *self = Self { bus, irq_level, ..Self::new() };
+        let (bus, irq_level, shared) = (std::mem::take(&mut self.bus), self.irq_level, self.shared.take());
+        *self = Self { bus, irq_level, shared, ..Self::new() };
     }
 }
 
@@ -406,6 +552,15 @@ impl Pcf8584 {
         }
     }
 
+    /// An adapter among several on one module bus, `id` its place. The
+    /// adapters share targets, so `owner` keeps one adapter's transfer from
+    /// interleaving with another's.
+    pub fn shared(bus: I2cBus, busy: BusBusy, owner: Arc<BusOwner>, id: u32) -> Self {
+        let p = Self::new(bus, busy);
+        p.state.lock().shared = Some((owner, id));
+        p
+    }
+
     /// Where the chip's interrupt output leads. The Origin 200 Hub does not
     /// connect it; software polls.
     pub fn set_irq(&self, irq: IrqLine) {
@@ -419,6 +574,7 @@ impl Pcf8584 {
         let (value, level) = {
             let mut st = self.state.lock();
             Self::service(&mut st);
+            st.resume_waiting();
             let value = f(&mut st);
             Self::service(&mut st);
             self.busy.store(st.bus_busy(), Ordering::Relaxed);
@@ -441,13 +597,16 @@ impl Pcf8584 {
             let service: Service = st.bus.targets()[i].service();
             if service.release_bus && st.bus_busy() {
                 st.bus_end();
+                st.release();
             }
             if let Some(byte) = service.grant {
-                // An address-only transaction nobody acknowledges; it cannot
-                // open while a transfer holds the bus.
-                if !st.bus_busy() {
-                    st.bus_start(byte >> 1, byte & 1 != 0);
-                    st.bus_end();
+                // An address-only transaction nobody acknowledges. It is seen
+                // passively, as the adapter's slave half sees any address phase
+                // at the STOP that ends it: it takes neither the bus nor
+                // notice of a START waiting, and an adapter that has a
+                // transfer of its own open is not listening.
+                if !st.bus_busy() && (0xe0..=0xef).contains(&byte) {
+                    st.observe_address(byte);
                 }
             }
         }
