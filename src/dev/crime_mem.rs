@@ -705,7 +705,8 @@ impl RamWindow {
     pub fn end(&mut self) {
         #[cfg(feature = "jitv2")]
         for &page in &self.dirty {
-            unsafe { (*self.gens.add(page)).fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
+            // Release, after the run's bytes (`PpMemory::bump_gen`).
+            unsafe { (*self.gens.add(page)).fetch_add(1, std::sync::atomic::Ordering::Release) };
         }
         self.dirty.clear();
     }

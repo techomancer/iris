@@ -1756,7 +1756,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let g = unsafe { *self.tc_gen.get() };
             if !g.is_null() {
                 let page = (_phys_addr >> 12) as usize;
-                unsafe { (*g.add(page)).fetch_add(1, Ordering::Relaxed) };
+                // Release, after the bytes (`PpMemory::bump_gen`).
+                unsafe { (*g.add(page)).fetch_add(1, Ordering::Release) };
             }
         }
     }

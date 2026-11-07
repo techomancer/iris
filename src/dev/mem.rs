@@ -65,9 +65,11 @@ impl Memory {
     #[inline(always)]
     fn bump_gen(&self, addr: u64) {
         let page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
-        // Relaxed: the publish-side gen re-check (§6.5) re-reads this counter after its
-        // own release fetch_or on entry_bits, so ordering is provided there, not here.
-        self.gen[page].fetch_add(1, Ordering::Relaxed);
+        // Release, after the bytes: a compile snapshot that sees this generation sees
+        // them too (`comp::snapshot_page`). The publish-side re-check (§6.5) cannot
+        // stand in for it: a snapshot that already paired this generation with older
+        // bytes finds the same generation there and publishes them.
+        self.gen[page].fetch_add(1, Ordering::Release);
     }
 
     /// JIT v2: raw pointer to the generation counter for the page containing `addr`.
@@ -144,7 +146,7 @@ impl Memory {
     #[cfg(feature = "jitv2")]
     fn bump_gen_all(&self) {
         for g in &self.gen {
-            g.fetch_add(1, Ordering::Relaxed);
+            g.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -285,7 +287,8 @@ impl BusDevice for Memory {
             }
         }
         // JIT v2: per-page write cursor (§7.2) — bump gen once per page touched by
-        // this DMA-style block write, not once per qword.
+        // this DMA-style block write, not once per qword. Release, after the bytes
+        // (`bump_gen`).
         #[cfg(feature = "jitv2")]
         {
             let start_page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
@@ -293,15 +296,15 @@ impl BusDevice for Memory {
             let end_page = ((last_byte & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
             if end_page >= start_page {
                 for page in start_page..=end_page {
-                    self.gen[page].fetch_add(1, Ordering::Relaxed);
+                    self.gen[page].fetch_add(1, Ordering::Release);
                 }
             } else {
                 // Wrapped around addr_mask: bump the two remaining spans.
                 for page in start_page..self.gen.len() {
-                    self.gen[page].fetch_add(1, Ordering::Relaxed);
+                    self.gen[page].fetch_add(1, Ordering::Release);
                 }
                 for page in 0..=end_page {
-                    self.gen[page].fetch_add(1, Ordering::Relaxed);
+                    self.gen[page].fetch_add(1, Ordering::Release);
                 }
             }
         }
