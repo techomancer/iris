@@ -51,6 +51,7 @@ pub mod ioc;
 pub mod mc;
 pub mod mc_vdma;
 pub mod mem;
+pub mod o2000_module;
 pub mod pcf8584;
 pub mod pit8254;
 pub mod prom;
