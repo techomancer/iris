@@ -52,6 +52,8 @@ mod rss;
 #[cfg(feature = "gr4-jit")]
 mod rss_jit;
 mod te1;
+#[cfg(feature = "wgpu")]
+mod wgpu;
 
 #[cfg(test)]
 #[path = "mgras_tests.rs"]
@@ -60,6 +62,9 @@ mod mgras_tests;
 #[cfg(all(test, feature = "gr4-jit"))]
 #[path = "rss_jit_tests.rs"]
 mod rss_jit_tests;
+
+#[cfg(all(test, any(feature = "gr4-jit", feature = "wgpu")))]
+mod test_gen;
 
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
@@ -330,8 +335,14 @@ pub struct Mgras {
     rss_more: [UnsafeCell<Rss>; MAX_ENGINES - 2],
     /// The pixel memory and clip-ID planes the engines draw into.
     planes: UnsafeCell<rss::Planes>,
-    /// Raster engines running (2 on Maximum Impact, else 1).
+    /// Raster engines running (2 on Maximum Impact, else 1; 1 with the
+    /// GPU unit).
     nrss: usize,
+    /// The GPU raster unit engine 0 draws through (`[graphics] raster =
+    /// "wgpu"`, `wgpu/`), owned here and used only by engine 0's thread
+    /// (and holders of `submit` with the board idle).
+    #[cfg(feature = "wgpu")]
+    gpu_unit: UnsafeCell<Option<Box<wgpu::GpuRaster>>>,
     /// PIO read advances engine 0 has done; engine 1 waits for each before
     /// it goes on drawing (see `rss_loop`).
     pio_advances: AtomicU64,
@@ -494,6 +505,33 @@ impl Mgras {
     /// `irqs` are the FIFO, general and retrace interrupts, as the slot
     /// wires them.
     pub fn new(board: GraphicsBoard, irqs: [crate::irq::IrqLine; 3], status: Arc<crate::disp::StatusSource>) -> Arc<Self> {
+        Self::with_raster(board, irqs, status, crate::config::RasterUnit::Cpu, "auto").expect("the CPU raster engines")
+    }
+
+    /// `new` with the raster engines where `raster` says: the CPU's threads,
+    /// or one engine whose primitives go to the host GPU through wgpu
+    /// (`wgpu/`; `backend` is `[graphics] gpu_backend`).
+    pub fn with_raster(
+        board: GraphicsBoard,
+        irqs: [crate::irq::IrqLine; 3],
+        status: Arc<crate::disp::StatusSource>,
+        raster: crate::config::RasterUnit,
+        backend: &str,
+    ) -> Result<Arc<Self>, String> {
+        let gpu = raster == crate::config::RasterUnit::Wgpu;
+        #[cfg(not(feature = "wgpu"))]
+        if gpu {
+            let _ = backend;
+            return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
+        }
+        #[cfg(feature = "wgpu")]
+        let unit = if gpu {
+            let g = crate::wgpu::Gpu::new(&crate::wgpu::GpuOptions { backend: backend.to_string(), ..Default::default() })?;
+            eprintln!("mgras: raster engine on the GPU: {}", g.caps);
+            Some(Box::new(wgpu::GpuRaster::new(&g)?))
+        } else {
+            None
+        };
         let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
         let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
         // SAFETY: `p` points at zeroed, exclusively owned memory. Every field
@@ -512,7 +550,8 @@ impl Mgras {
             addr_of_mut!((*p).flags).write(AtomicU32::new(0));
             addr_of_mut!((*p).eng).write(UnsafeCell::new(Hq3Engine::new(if board == GraphicsBoard::MaxImpact { 2 } else { 1 })));
             let planes = (*p).planes.get();
-            let nrss = Self::engines_for(board);
+            // One unit draws every scanline.
+            let nrss = if gpu { 1 } else { Self::engines_for(board) };
             addr_of_mut!((*p).nrss).write(nrss);
             for id in 0..MAX_ENGINES {
                 let e = match id {
@@ -525,6 +564,16 @@ impl Mgras {
                 (*e).set_engine(id as u32, (nrss - 1) as u32);
             }
             (*p).rss_fifo.set_heads(nrss);
+            #[cfg(feature = "wgpu")]
+            {
+                addr_of_mut!((*p).gpu_unit).write(UnsafeCell::new(unit));
+                if let Some(u) = (*(*p).gpu_unit.get()).as_mut() {
+                    // Engine 0's primitives go to the unit, which starts
+                    // from the planes as they are (zeroed).
+                    u.attach(&(*planes).mem, &(*planes).cid, &mut (*planes).te);
+                    addr_of_mut!((*(*p).rss.get()).gpu).write(wgpu::GpuLink::new(u));
+                }
+            }
             addr_of_mut!((*p).mem).write(SpinLock::new(None));
             addr_of_mut!((*p).submit).write(SpinLock::new(None));
             addr_of_mut!((*p).mem_rec).write(SpinLock::new(None));
@@ -554,7 +603,7 @@ impl Mgras {
                 Err(e) => eprintln!("mgras: cannot trace to {path}: {e}"),
             }
         }
-        m
+        Ok(m)
     }
 
     /// Put the board's locks in the `locks` monitor listing.
@@ -833,6 +882,28 @@ impl Mgras {
         Some((h, r.records))
     }
 
+    /// After a host GL composite wrote screen rows `y..y + h` of the
+    /// displayed buffers into the planes: send those rows to the GPU unit,
+    /// whose memory the planes mirror.
+    fn gpu_upload_screen_rows(&self, rss: &Rss, y: i32, h: usize) {
+        #[cfg(feature = "wgpu")]
+        {
+            // SAFETY: idle with `submit` held (the callers).
+            let Some(u) = (unsafe { &mut *self.gpu_unit.get() }) else { return };
+            let f = self.front();
+            let (main, overlay) = frame::scanout_buffers(rss, &f.dcb);
+            let (_, screen_h) = frame::display_size(&f.dcb);
+            let top = screen_h as i32 - 1 - y;
+            let (lo, hi) = ((top - h as i32 + 1).max(0), top.min(rss::HEIGHT as i32 - 1));
+            if lo <= hi {
+                let bufs: Vec<pixmem::Buffer> = std::iter::once(main).chain(overlay).collect();
+                u.upload_rows(&rss.mem, &bufs, lo as u32, hi as u32);
+            }
+        }
+        #[cfg(not(feature = "wgpu"))]
+        let _ = (rss, y, h);
+    }
+
     /// Composite a host GL frame at a screen position (see `disp::composite`).
     pub fn composite(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
         let sub = self.submit.lock();
@@ -841,6 +912,7 @@ impl Mgras {
         let rss = unsafe { &mut *self.rss.get() };
         let ok = disp::composite(rss, &self.front().dcb, x, y, bgra, stride, w, h);
         if ok {
+            self.gpu_upload_screen_rows(rss, y, h);
             if let Some(rec) = sub.as_ref() {
                 rec.lock().put(record::Rec::Composite);
             }
@@ -858,6 +930,7 @@ impl Mgras {
         let rss = unsafe { &mut *self.rss.get() };
         let ok = disp::composite_index(rss, &self.front().dcb, x, y, bgra, stride, w, h, overlay);
         if ok {
+            self.gpu_upload_screen_rows(rss, y, h);
             if let Some(rec) = sub.as_ref() {
                 rec.lock().put(record::Rec::Composite);
             }
@@ -1433,10 +1506,24 @@ impl Mgras {
         let pf_busy = crate::PfLevel::new();
         // Stored only when it changes (see `hq_loop`).
         let mut is_busy = false;
+        // With the GPU unit: the mirror's last sync, and entries since the
+        // clock was last read.
+        #[cfg(feature = "wgpu")]
+        let mut synced = std::time::Instant::now();
+        #[cfg(feature = "wgpu")]
+        let mut since_clock = 0u32;
         loop {
             let Some((t, val)) = self.rss_fifo.peek_at(id) else {
                 self.rss_fifo.flush_head_at(id);
                 if is_busy {
+                    // The GPU unit's drawing reaches the planes before the
+                    // engine reports idle: every reader waits for idle.
+                    // SAFETY: this engine's thread owns its raster state.
+                    unsafe { &mut *cell.get() }.gpu_sync();
+                    #[cfg(feature = "wgpu")]
+                    {
+                        synced = std::time::Instant::now();
+                    }
                     is_busy = false;
                     busy.store(false, Ordering::Release);
                     crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, false);
@@ -1523,6 +1610,19 @@ impl Mgras {
             }
             self.rss_fifo.consume_at(id);
             backoff.reset();
+            // A long busy stretch: bring the display's mirror current
+            // about once a frame.
+            #[cfg(feature = "wgpu")]
+            if rss.gpu.get().is_some() {
+                since_clock += 1;
+                if since_clock >= 1024 {
+                    since_clock = 0;
+                    if synced.elapsed() >= std::time::Duration::from_millis(16) {
+                        rss.gpu_sync();
+                        synced = std::time::Instant::now();
+                    }
+                }
+            }
         }
         self.rss_fifo.consume_at(id);
         self.rss_fifo.flush_head_at(id);

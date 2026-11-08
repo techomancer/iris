@@ -579,10 +579,13 @@ impl Machine {
             crate::config::GraphicsBoard::SolidImpact
             | crate::config::GraphicsBoard::HighImpact
             | crate::config::GraphicsBoard::MaxImpact => {
-                Some(crate::dev::mgras::Mgras::new(cfg.graphics_board(), {
+                Some(crate::dev::mgras::Mgras::with_raster(cfg.graphics_board(), {
                     use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
                     [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
-                }, status.clone()))
+                }, status.clone(), cfg.graphics.raster, &cfg.graphics.gpu_backend).unwrap_or_else(|e| {
+                    eprintln!("mgras: {e}");
+                    std::process::exit(1)
+                }))
             }
             _ => None,
         };

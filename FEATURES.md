@@ -41,7 +41,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
-| `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and, as they land, the boards' GPU raster units under `src/dev/<board>/wgpu`. Work in progress on branch `wgpu-raster`; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
+| `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT). Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `rex-gpu` | Experimental, replay-only Newport wgpu/WGSL engine. It does not replace the live CPU renderer and is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
@@ -201,7 +201,7 @@ keys is set. See the [Origin 2000 guide](docs/origin2000-ip27.md).
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 | `graphics.threads` | `2` | Worker threads the board's fragment pipeline draws on, at least 1. VPro: the screen tiles' owners, besides its front-end and raster threads; more help on a host with cores to spare. |
 | `graphics.tile` | `32` | VPro: the fragment pipeline's screen tile size in pixels, a power of two from 8 to 256. Each tile's work runs in order on one worker at a time; with many threads, 64 can be faster. |
-| `graphics.raster` | `cpu` | VPro: where the raster unit runs. `cpu` draws on the threads above; `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature; work in progress, see `clanker/plans/wgpu-raster.md`). |
+| `graphics.raster` | `cpu` | VPro and IMPACT: where the raster unit runs. `cpu` draws on the threads above (IMPACT: its raster engine threads); `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature; work in progress, see `clanker/plans/wgpu-raster.md`). An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
 | `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. |
 
 ### [scsi.<ID>]
@@ -450,7 +450,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
 | `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`.  |
 | `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane only). |
-| `--raster` | VPro: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |
+| `--raster` | VPro and IMPACT: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |
 | `--renderer` | What draws the window: `gl` (default) or `wgpu` (`renderer`; needs a build with the `wgpu` feature). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |
@@ -580,7 +580,8 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_SNAPSHOT_SKIP_CHECK` | 1 bypasses selected snapshot compatibility checks; diagnostic escape hatch. | [src/machine.rs](src/machine.rs) |
 | `IRIS_SOCKET` | iris-ci default socket override (Unix path or TCP address). | [src/iris_ci_main.rs](src/iris_ci_main.rs) |
 | `IRIS_TFTP_TRACE` | Any presence logs each built-in TFTP request to stderr (file, found or not, bytes, blocks, retransmits, duplicate ACKs, slowest ACK, total time), in any build. | [src/net/tftp.rs](src/net/tftp.rs) |
-| `MGRAS_REPLAY` | Replay input path for opt-in IMPACT golden tests. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
+| `MGRAS_REPLAY` | Replay input path for opt-in IMPACT golden tests (`MGRAS_REPLAY_GPU=1` replays on the GPU raster unit, `wgpu` feature). | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
+| `MGRAS_GPU_CHECK_EACH` | With the `wgpu` feature: the IMPACT GPU unit's parity tests compare memories after every primitive instead of every step, to find the primitive that differs. | [src/dev/mgras/wgpu/tests.rs](src/dev/mgras/wgpu/tests.rs) |
 | `MGRAS_REPLAY_OUT` | Optional IMPACT replay image output path. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_REPLAY_TRACE` | IMPACT replay tracing selector (`gputrace` builds). | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_SIZE_PROBE` | Input for the opt-in IMPACT size/probe test. | [src/dev/mgras/mgras_tests.rs](src/dev/mgras/mgras_tests.rs) |

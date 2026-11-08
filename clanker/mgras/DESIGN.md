@@ -19,6 +19,11 @@ blocks (src/dev/mgras):
   rss.rs        RSS backend: RE4 registers, 2D primitives, triangles and PP1 ops
   rss_jit/      raster JIT (`gr4-jit`): pipeline key, context, Cranelift
                 emitters; equivalence sweep in rss_jit_tests.rs
+  wgpu/         the raster engine on the host GPU (`wgpu`, `[graphics]
+                raster = "wgpu"`): records from Rss's drawing entry
+                points, tile kernels, parity tests (clanker/plans/
+                wgpu-raster.md, IMPACT section)
+  test_gen.rs   random register configurations both equivalence sweeps use
   te1.rs        Texture downloads, sampling, filtering and texture environment
   pixmem.rs     Tiled 36-bit and overlay pixel storage, DRB/XMAP buffer pointers
   dcb.rs        Display bus; VC3/XMAP/colormap/DAC register state

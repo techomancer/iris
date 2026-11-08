@@ -235,6 +235,9 @@ pub struct Te1 {
     /// Diagnostic: per page, the last level loaded there (page << 16 |
     /// TL_SPEC's sizes), for `stale`.
     owner: [u32; 256],
+    /// Pages a load wrote since the GPU unit last took them (one bit a
+    /// 16 KB page): what it sends up before it samples again.
+    pub dirty: [u64; 4],
 }
 
 impl Te1 {
@@ -321,6 +324,10 @@ impl Te1 {
                 Some(row) if (0..wi).contains(&s) => (row + s as usize * tn) % TRAM_NIBBLES,
                 _ => border_addr(border_page, w, h, s, t, tn),
             };
+            // A cell never straddles pages: cells are a power of two of
+            // nibbles, pages hold a whole number of them.
+            let page = a / PAGE_NIBBLES;
+            self.dirty[page >> 6] |= 1 << (page & 63);
             if d == 2 {
                 // Byte components: cells and component offsets are whole
                 // bytes, low nibble first, so each component is one byte.

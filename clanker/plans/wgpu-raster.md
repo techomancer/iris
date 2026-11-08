@@ -507,6 +507,75 @@ the CPU and emits a record per primitive instead of drawing.
   and the gr4-jit sweep (two boards, random state, word-for-word
   pages, CID and stipple positions) rerun against the GPU board.
 
+### What landed (2026-11-08, `src/dev/mgras/wgpu`)
+
+The raster FIFO stays the boundary, and the CPU keeps everything up to
+drawing: `Rss` (registers, `execute()`, the transfer and stipple state
+machines, TE tables, `tri_setup` / `gl_line_setup`). An `Rss` with a unit
+attached (`Rss::gpu`, a `GpuLink`) hands each primitive over as one
+record at the point the interpreter would walk it: `fill`, `point`,
+`line`, `stipple_bits` (one record a chunk), `put_line` (one record a
+transfer line, pixels decoded on the CPU into the stage), `triangle`,
+`gl_line`. The slot is the PP1/TE registers the pixel path reads plus the
+sampler `Te1::sampler` resolves and the polygon stipple rows.
+
+- **No scanlines.** Each lane tests its own pixel: the block rectangle;
+  an X line's Bresenham step in closed form (`xline_step`, n =
+  floor((2 minor k + major) / (2 major)), brute-forced against the
+  interpreter's loop); the stipple or transfer row and column; a
+  triangle's edges at the lane's row and a GL line's minor extent at its
+  step, both in **exact software doubles** (`src/wgpu/shaders/f64.wgsl`:
+  add, sub, mul, floor, ceil rounded as the host; tested bit for bit
+  against Rust f64 on 100k cases in `src/wgpu/tests/softfloat.rs`), so
+  coverage is the interpreter's without an i64 fast path or flags. The
+  64/128-bit integer arithmetic of the texture unit is `wide.wgsl`.
+- **Memory.** Pixel pages (binding 0, 48 MiB, atomics: four overlay cells
+  share a word), clip-ID planes (binding 1, atomics), TRAM (binding 2,
+  read only), the transfer stage (binding 3, per batch set), RECIP and
+  log2 tables (binding 4). TRAM's only writer is the CPU's texture
+  loader: `Te1::dirty` marks 16 KB pages; `before_tram_write` submits a
+  batch holding a textured primitive first, and dirty pages go up before
+  the next textured record's batch.
+- **Board.** `[graphics] raster = "wgpu"` reaches IMPACT through
+  `Mgras::with_raster` (Indigo2 `machine.rs`, Octane `ImpactXio::
+  with_raster`): one engine thread, the unit owned by the board and
+  linked into engine 0. The planes are the mirror: the RSS thread syncs
+  them (flush, wait, read back the pages and clip-ID rows records marked)
+  before it reports idle, and every 16 ms while busy, so every reader
+  that waits for idle (DMA and PIO reads, monitor, hashes, swaps) and the
+  display see current memory. A host GL composite uploads the rows it
+  wrote. TRAM reads (glGetTexImage, page saves) read the CPU's TRAM,
+  which is authoritative.
+- **Checks.** `cargo test --release --features wgpu --lib mgras::wgpu`
+  (`--test-threads 2..4`): two engines from the JIT sweep's generators
+  (`src/dev/mgras/test_gen.rs`, shared with `rss_jit_tests`), one
+  interpreting, one with the unit, compared word for word every step over
+  all pixel memory and clip IDs plus the stipple positions: fills, X
+  lines, character stipple, transfers (put, fragment, depth, stencil),
+  triangles flat/smooth/textured/fogged/stippled, steep slivers, GL
+  lines, TRAM loads between textured draws (and a targeted test that a
+  load lands between the triangles around it). Twelve deliberate kernel
+  mutations and the TRAM-ordering one were each caught.
+- **Rule found:** pixels that alias one memory word race across tiles
+  (`clanker/wgpu/aliased-pixels-race-across-tiles.md`); the GPU tests use
+  unaliased layouts, as IRIX's are.
+
+- **Goldens and a live guest (2026-11-08).** `MGRAS_REPLAY_GPU=1`
+  replays a recording on the unit: `desktop2.rec` passes 35/35
+  checkpoints, and `dense`, `desktop`, `flat`, `threaded` and
+  `irix6522-boot` end in the CPU engine's final state (those predate
+  later fixes and fail checkpoints on the CPU too). The goldens hold no
+  GL triangles; a live recording of tex_cube and atlantis (about 200k GL
+  triangles, Maximum Impact) replays to the same final state on both.
+  The IP30 guest (`ignore/ip30/iris.toml` with `raster = "wgpu"`, a COW
+  overlay, `lightning,wgpu`) boots on the unit through the PROM's
+  power-on screen, xdm and the 4Dwm desktop, and runs both demos.
+
+Open: per-row edge sharing (eight lanes of a tile row compute the
+same doubles) or an integer edge path when the setup proves the f64 walk
+exact; a GPU scan-out (the display reads the mirror today); the display
+syncs cost a GPU wait each.
+
 ## GR2 (XZ / Extreme), open
 
 The boundary is `Re3Sink` into `re3_fifo` (one RE3; the GE7 only stores

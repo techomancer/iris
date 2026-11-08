@@ -1002,9 +1002,9 @@ pub struct GraphicsSection {
     /// two from 8 to 256.
     #[serde(default = "default_graphics_tile")]
     pub tile: u32,
-    /// VPro: where the raster unit runs: `cpu` (the threads above) or
-    /// `wgpu` (the host GPU through wgpu compute; needs the `wgpu`
-    /// feature).
+    /// VPro and IMPACT: where the raster unit runs: `cpu` (the threads
+    /// above; IMPACT's raster engine threads) or `wgpu` (the host GPU
+    /// through wgpu compute; needs the `wgpu` feature).
     #[serde(default)]
     pub raster: RasterUnit,
     /// The wgpu backend for `raster = "wgpu"`: `auto`, `vulkan`, `metal`,
@@ -2965,7 +2965,7 @@ pub struct Cli {
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
     pub graphics: Option<GraphicsBoard>,
 
-    /// VPro: where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
+    /// VPro and IMPACT: where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
     #[arg(long = "raster", value_name = "UNIT")]
     pub raster: Option<RasterUnit>,
 
