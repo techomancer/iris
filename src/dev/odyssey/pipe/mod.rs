@@ -124,7 +124,7 @@ impl PipeDraw {
         stipple: Option<&[u32; 32]>,
         background: Option<[f64; 4]>,
         gpu: Option<&mut super::gpu_unit::GpuRaster>,
-    ) -> Box<PipeDraw> {
+    ) -> PipeDraw {
         // The draw's slot on the GPU unit; a draw into planes the kernels
         // cannot address takes the CPU path on a memory brought current.
         let (gpu, gpu_slot): (*mut super::gpu_unit::GpuRaster, Option<super::gpu_unit::Slot>) = match gpu {
@@ -167,7 +167,7 @@ impl PipeDraw {
 
         let gpu_tex = (!gpu.is_null() && tex.regs.target() != texture::Target::None).then(|| Box::new(super::gpu_unit::TexSlot::new(tex.regs, tex.latch)));
 
-        Box::new(PipeDraw {
+        PipeDraw {
             raster,
             shader: ShaderState::of(&w.shader, tex.regs),
             backend,
@@ -184,7 +184,7 @@ impl PipeDraw {
             gpu_slot,
             gpu_words: (w.raster.mode, w.shader.alpha),
             gpu_tex,
-        })
+        }
     }
 }
 

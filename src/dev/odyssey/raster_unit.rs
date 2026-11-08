@@ -110,11 +110,14 @@ pub(super) struct RasterCtx {
     /// submit on the front end, and the drawing goes into the unit's
     /// batches.
     pub gpu: Option<Box<super::gpu_unit::GpuRaster>>,
+    /// Draw frames back from finished draws, for the next draws: a draw's
+    /// context is not allocated per draw.
+    pub frames: Vec<Box<super::gl::DrawFrame>>,
 }
 
 impl RasterCtx {
     fn new() -> Self {
-        RasterCtx { line_phase: 0, ring: None, gpu: None }
+        RasterCtx { line_phase: 0, ring: None, gpu: None, frames: Vec::with_capacity(super::gl::FRAMES_KEPT) }
     }
 
     /// Wait for the back-end thread to store everything queued to it, so
@@ -139,7 +142,21 @@ impl RasterCtx {
 
     /// The draw jobs the stages have finished with.
     pub fn reclaim_shade(&mut self) -> Vec<Box<GlDrawJob>> {
-        self.ring.as_ref().map(|r| r.reclaim()).unwrap_or_default()
+        let Some(r) = &self.ring else {
+            return Vec::new();
+        };
+        let (jobs, frames) = r.reclaim();
+        for f in frames {
+            self.give_frame(f);
+        }
+        jobs
+    }
+
+    /// Keep a finished draw's frame for a later draw, up to FRAMES_KEPT.
+    pub fn give_frame(&mut self, f: Box<super::gl::DrawFrame>) {
+        if self.frames.len() < super::gl::FRAMES_KEPT {
+            self.frames.push(f);
+        }
     }
 }
 

@@ -530,6 +530,25 @@ the CPU cannot see. Nothing uses the CPU-visible part of VRAM, which on
 a card without resizable BAR is a 256 MiB window shared with the
 desktop. Readbacks go through one fixed host buffer.
 
+An aliased line is set up as the triangle (a, b, a) and each of its
+pixels shaded at barycentrics (t, 0), t the pixel centre's place along
+the major axis (`Draw::line_tri`, `line_pixel`): lines take the filled
+triangle's arithmetic (single-precision barycentrics, 0.15 perspective
+weights, 12.12 colours, the depth ratio), so they draw word for word the
+same on every unit. Which pixels a line covers is exact integer
+arithmetic on the snapped grid: one pixel per major-axis column, the one
+whose span holds the line at the column centre, replicated along the
+minor axis for a wide line; a real V10 draws the same pixels. The GPU
+unit takes such a line as one record (`REC_LINE`) that its kernel walks
+and shades like a triangle; with the raster thread, the line goes to the
+ring as one command its tiles' workers walk (`KIND_LINE`,
+`Draw::line_pixels`). A smoothed line is still shaded on the CPU.
+
+A draw's context (`DrawFrame`, with its `PipeDraw` and the records the
+ring's workers read) is reused from a small pool in the raster context
+once the ring is past it, not allocated per draw: SolidView issues every
+line and triangle as a draw of its own.
+
 A shaded fragment the CPU produced (a line's pixels, CPU-shaded
 polygons) joins a packed fragment record of up to 19 pixels under the
 same state slot, rather than taking a record of its own; the kernel

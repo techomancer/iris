@@ -22,7 +22,7 @@
 use super::backend::{DestMem, BackendState, ClearDraw};
 use super::raster::{triangle_quads, RasterState};
 use super::super::gl::{DrawFrame, GlDrawJob};
-use super::setup::Tri;
+use super::setup::{LiveLine, Tri};
 use super::super::raster_unit::Completion;
 use parking_lot::{Condvar, Mutex};
 use std::cell::UnsafeCell;
@@ -50,6 +50,9 @@ pub(crate) const KIND_SHADED: u8 = 1;
 /// A clear's rectangle: x, y to zq[0], zq[1] in plane pixels, the clear's
 /// record (`backend::ClearDraw`) in ptr.
 pub(crate) const KIND_RECT: u8 = 3;
+/// An aliased line: its record (`setup::LiveLine`) in ptr, its box as a
+/// triangle's.
+pub(crate) const KIND_LINE: u8 = 4;
 
 /// A draw's back-end state, as the ring's slots name it.
 #[repr(C, align(64))]
@@ -414,6 +417,18 @@ impl QuadRing {
         self.commit(x0, y0, x1, y1);
     }
 
+    /// Write an aliased line for the tiles to walk: its record as its draw
+    /// keeps it, and its box in plane pixels.
+    #[inline]
+    pub fn push_line(&self, line: *const LiveLine, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let s = self.slot();
+
+        *s = RingQuad { x: x0 as i16, y: y0 as i16, kind: KIND_LINE, ptr: line.cast(), ..RingQuad::default() };
+        s.zq[0] = x1 as u32;
+        s.zq[1] = y1 as u32;
+        self.commit(x0, y0, x1, y1);
+    }
+
     /// Write a quad the raster thread shaded itself.
     #[inline]
     pub fn push_shaded(&self, q: &BackQuad) {
@@ -463,25 +478,27 @@ impl QuadRing {
         self.held.lock().push_back((self.staged.load(Relaxed), job, frame));
     }
 
-    /// The jobs of the held draws the tail is past, to give back; their
-    /// contexts are freed.
-    pub fn reclaim(&self) -> Vec<Box<GlDrawJob>> {
+    /// The jobs of the held draws the tail is past, to give back, and
+    /// their contexts, for reuse.
+    pub fn reclaim(&self) -> (Vec<Box<GlDrawJob>>, Vec<Box<DrawFrame>>) {
         self.retire();
         let tail = self.tail.load(Acquire);
         let mut h = self.held.lock();
         let mut out = Vec::new();
+        let mut frames = Vec::new();
 
         while h.front().is_some_and(|(end, _, _)| *end <= tail) {
-            let (_, job, _) = h.pop_front().expect("a held draw");
+            let (_, job, frame) = h.pop_front().expect("a held draw");
 
             out.push(job);
+            frames.push(frame);
         }
         drop(h);
         let mut c = self.held_clears.lock();
         while c.front().is_some_and(|(end, _)| *end <= tail) {
             c.pop_front();
         }
-        out
+        (out, frames)
     }
 
     /// Whether every slot written has run on all its tiles.
@@ -588,6 +605,20 @@ impl QuadRing {
                     for y in y0.max(ty)..=y1.min(ty + size - 1) {
                         c.span(y, x0.max(tx), x1.min(tx + size - 1));
                     }
+                }
+            }
+            KIND_LINE => {
+                // SAFETY: the draw, which keeps the line's record, outlives
+                // its slots (QuadRing::hold).
+                let l = unsafe { &*s.ptr.cast::<LiveLine>() };
+                // SAFETY: as for a triangle below.
+                let d = unsafe { &*l.tri.live }.shader_draw();
+                let p = d.pipe;
+                let (x0, y0, x1, y1) = (s.x as i32, s.y as i32, s.zq[0] as i32, s.zq[1] as i32);
+                for (tx, ty) in tile_copies(x0, y0, x1, y1, px, py, size) {
+                    let (ox, oy) = (p.raster.ox, p.raster.oy);
+                    let tile = (tx.wrapping_sub(ox), ty.wrapping_sub(oy), (tx + size - 1).wrapping_sub(ox), (ty + size - 1).wrapping_sub(oy));
+                    d.line_pixels(l, tile, |q| (p.backend.store)(&p.backend, &p.planes, &q));
                 }
             }
             _ => {

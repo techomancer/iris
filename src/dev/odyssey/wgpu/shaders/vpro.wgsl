@@ -22,6 +22,7 @@ const REC_FRAG: u32 = 2u;
 const REC_RECT: u32 = 3u;
 const REC_BLIT: u32 = 4u;
 const REC_FRAGS: u32 = 5u;
+const REC_LINE: u32 = 6u;
 
 const REC_WORDS: u32 = 84u;
 
@@ -40,6 +41,20 @@ struct Rec {
 const TRI_SMOOTH: u32 = 1u;
 const TRI_TEXTURED: u32 = 2u;
 const TRI_SPECULAR: u32 = 4u;
+const LINE_X_MAJOR: u32 = 8u;
+
+// Line word offsets, where a triangle keeps its edges; the rest of a line
+// record is the triangle (a, b, a)'s (Draw::line_tri). Window subpixels
+// and window pixels.
+const L_LA: u32 = 0u;     // a's major coordinate
+const L_NA: u32 = 1u;     // a's minor coordinate, shifted for the width
+const L_DU: u32 = 2u;     // b - a along the major axis
+const L_DN: u32 = 3u;     // b - a along the minor axis
+const L_MAJOR: u32 = 4u;  // the major pixels walked, inclusive
+const L_MINOR: u32 = 6u;  // the minor pixels allowed, inclusive
+const L_WIDTH: u32 = 8u;
+const L_INV: u32 = 9u;    // 1 / (b - a) along the major axis, single
+const LINE_SUB: i32 = 256;
 
 // Triangle word offsets.
 const T_E0: u32 = 0u;      // 3 x I64: e0, e1, e2 at the centre of plane pixel (0, 0)
@@ -194,6 +209,45 @@ fn tri(pi: u32, si: u32, px: i32, py: i32) {
     let wy = py - ri(pi, T_ORIGIN + 1u);
     let qi = u32(wx & 1) | (u32(wy & 1) << 1u);
 
+    // The quad's four barycentrics, for the texture unit (interp::TriTex::quad).
+    var tl1 = vec4<f32>(l1);
+    var tl2 = vec4<f32>(l2);
+    if (recs[pi].flags & TRI_TEXTURED) != 0u {
+        for (var j = 0u; j < 4u; j++) {
+            if j == qi {
+                continue;
+            }
+            let dx = i32(j & 1u) - i32(qi & 1u);
+            let dy = i32(j >> 1u) - i32(qi >> 1u);
+            var e1 = e[1];
+            var e2 = e[2];
+            if dx > 0 {
+                e1 = i64_add(e1, r64(pi, T_DX + 2u));
+                e2 = i64_add(e2, r64(pi, T_DX + 4u));
+            } else if dx < 0 {
+                e1 = i64_add(e1, i64_neg(r64(pi, T_DX + 2u)));
+                e2 = i64_add(e2, i64_neg(r64(pi, T_DX + 4u)));
+            }
+            if dy > 0 {
+                e1 = i64_add(e1, r64(pi, T_DY + 2u));
+                e2 = i64_add(e2, r64(pi, T_DY + 4u));
+            } else if dy < 0 {
+                e1 = i64_add(e1, i64_neg(r64(pi, T_DY + 2u)));
+                e2 = i64_add(e2, i64_neg(r64(pi, T_DY + 4u)));
+            }
+            tl1[j] = p(i64_to_f32(e1) * inv_area);
+            tl2[j] = p(i64_to_f32(e2) * inv_area);
+        }
+    }
+    shade_pixel(pi, si, px, py, l1, l2, tl1, tl2, qi, true);
+}
+
+// A pixel of a triangle record (or a line record, which is the triangle
+// (a, b, a) at barycentrics (t, 0)) at barycentrics (l1, l2), the quad's
+// four in tl1, tl2 with this pixel at qi: the depth, the polygon stipple
+// for a filled triangle, the colour, the texture, the alpha test, and on
+// to the back end (Draw::shade_quad, Draw::line_pixel).
+fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, l1: f32, l2: f32, tl1: vec4<f32>, tl2: vec4<f32>, qi: u32, polygon: bool) {
     // Triangle::depth4: the planes, the ratio, the slack clamps, the range
     // and the word with the polygon offset.
     let zz = (rf(pi, T_Z) + p(l1 * rf(pi, T_Z + 1u))) + p(l2 * rf(pi, T_Z + 2u));
@@ -214,7 +268,7 @@ fn tri(pi: u32, si: u32, px: i32, py: i32) {
 
     // The polygon stipple, in window pixels.
     var background = false;
-    if (slots[si].flags & SLOT_STIPPLE) != 0u {
+    if polygon && (slots[si].flags & SLOT_STIPPLE) != 0u {
         let wx = u32(px - ri(pi, T_ORIGIN));
         let wy = u32(py - ri(pi, T_ORIGIN + 1u));
         if (slots[si].pattern[wy & 31u] & (1u << (wx & 31u))) == 0u {
@@ -265,35 +319,11 @@ fn tri(pi: u32, si: u32, px: i32, py: i32) {
     if (recs[pi].flags & TRI_TEXTURED) != 0u {
         var tq: TexQuad;
         for (var j = 0u; j < 4u; j++) {
-            let dx = i32(j & 1u) - i32(qi & 1u);
-            let dy = i32(j >> 1u) - i32(qi >> 1u);
-            var l1j = l1;
-            var l2j = l2;
-            if j != qi {
-                var e1 = e[1];
-                var e2 = e[2];
-                if dx > 0 {
-                    e1 = i64_add(e1, r64(pi, T_DX + 2u));
-                    e2 = i64_add(e2, r64(pi, T_DX + 4u));
-                } else if dx < 0 {
-                    e1 = i64_add(e1, i64_neg(r64(pi, T_DX + 2u)));
-                    e2 = i64_add(e2, i64_neg(r64(pi, T_DX + 4u)));
-                }
-                if dy > 0 {
-                    e1 = i64_add(e1, r64(pi, T_DY + 2u));
-                    e2 = i64_add(e2, r64(pi, T_DY + 4u));
-                } else if dy < 0 {
-                    e1 = i64_add(e1, i64_neg(r64(pi, T_DY + 2u)));
-                    e2 = i64_add(e2, i64_neg(r64(pi, T_DY + 4u)));
-                }
-                l1j = p(i64_to_f32(e1) * inv_area);
-                l2j = p(i64_to_f32(e2) * inv_area);
-            }
             for (var a = 0u; a < 4u; a++) {
                 let v0 = rf(pi, T_TEX + 3u * a);
                 let v1 = rf(pi, T_TEX + 3u * a + 1u);
                 let v2 = rf(pi, T_TEX + 3u * a + 2u);
-                tq.c[a][j] = (v0 + p(l1j * (v1 - v0))) + p(l2j * (v2 - v0));
+                tq.c[a][j] = (v0 + p(tl1[j] * (v1 - v0))) + p(tl2[j] * (v2 - v0));
             }
         }
         let ti = ru(pi, T_TEXSLOT);
@@ -315,6 +345,58 @@ fn tri(pi: u32, si: u32, px: i32, py: i32) {
     }
     let src = vec4<u32>(colour12(c.x), colour12(c.y), colour12(c.z), colour12(c.w));
     fragment_q(backend_of(si), si, px, py, zq, src);
+}
+
+// An aliased line's pixel (Draw::line_projected): the column's pixel
+// centre_minor() gives, exact, and its width's replicas, shaded as the
+// triangle (a, b, a) at barycentrics (t, 0), t the centre's place along
+// the major axis.
+fn line(pi: u32, si: u32, px: i32, py: i32) {
+    if px < ri(pi, T_BOX) || px > ri(pi, T_BOX + 2u) || py < ri(pi, T_BOX + 1u) || py > ri(pi, T_BOX + 3u) {
+        return;
+    }
+    let wx = px - ri(pi, T_ORIGIN);
+    let wy = py - ri(pi, T_ORIGIN + 1u);
+    let xm = (recs[pi].flags & LINE_X_MAJOR) != 0u;
+    let m = select(wy, wx, xm);
+    let r = select(wx, wy, xm);
+    if m < ri(pi, L_MAJOR) || m > ri(pi, L_MAJOR + 1u) || r < ri(pi, L_MINOR) || r > ri(pi, L_MINOR + 1u) {
+        return;
+    }
+    // The column centre's place, and whether it is on the segment.
+    let du = ri(pi, L_DU);
+    let num = m * LINE_SUB + LINE_SUB / 2 - ri(pi, L_LA);
+    if du > 0 {
+        if num < 0 || num >= du {
+            return;
+        }
+    } else if num > 0 || num <= du {
+        return;
+    }
+    // The minor coordinate there is V / D; the base pixel n has
+    // n one D < V <= (n + 1) one D, and the replicas run n to n + width - 1.
+    var t = i64_mul_i32(ri(pi, L_DN), num);
+    var d = du;
+    if du < 0 {
+        t = i64_neg(t);
+        d = -du;
+    }
+    let v = i64_add(i64_mul_i32(ri(pi, L_NA), d), t);
+    let w = ri(pi, L_WIDTH);
+    if !i64_lt(i64_mul_i32((r - w + 1) * LINE_SUB, d), v) || i64_lt(i64_mul_i32((r + 1) * LINE_SUB, d), v) {
+        return;
+    }
+    if !owned(si, px, py) {
+        return;
+    }
+    let inv = rf(pi, L_INV);
+    let l1 = clamp(p(i64_to_f32(i64_from_i32(num)) * inv), 0.0, 1.0);
+    let on = p(i64_to_f32(i64_from_i32(num + LINE_SUB)) * inv);
+    var tl1 = vec4<f32>(l1, l1, on, on);
+    if xm {
+        tl1 = vec4<f32>(l1, on, l1, on);
+    }
+    shade_pixel(pi, si, px, py, l1, 0.0, tl1, vec4<f32>(0.0), 0u, false);
 }
 
 fn frag(pi: u32, si: u32, px: i32, py: i32) {
@@ -413,6 +495,7 @@ fn arch_prim(pi: u32, px: i32, py: i32, lane: u32) {
         case REC_RECT: { rect(pi, si, px, py); }
         case REC_BLIT: { blit(pi, si, px, py); }
         case REC_FRAGS: { frags(pi, si, px, py); }
+        case REC_LINE: { line(pi, si, px, py); }
         default: {}
     }
 }

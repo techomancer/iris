@@ -255,6 +255,7 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 | Note | Kind | Title |
 |---|---|---|
 | [gaps-found-by-the-2026-11-07-sweeps.md](odyssey/gaps-found-by-the-2026-11-07-sweeps.md) | open | Model gaps the full test sweep found on both raster units: CI8 reads return 0, X screen reads over some windows are noise, 10:10:10:2 pbuffers and 12-bit z16 visuals, double-buffered gltest shows only the clear |
+| [vpro-line-rasterisation-on-a-real-v10.md](odyssey/vpro-line-rasterisation-on-a-real-v10.md) | measure | linetest on octopus: aliased line pixels match the model (centre rule, minor replication, flat ends); smoothed lines are a per-column minor-distance table with a 255 plateau, not area coverage, plus an undecoded near-45-degree spill |
 | [solidview-profile-2026-11-07.md](odyssey/solidview-profile-2026-11-07.md) | measure | SolidView: lines dominate (465k, 8.7 px each); GPU unit 6.1 s to 2.5 s; open: GPU line kernel needs exact maths, one-pixel off-by-one on the GPU unit, threaded CPU unit slower than inline |
 | [bringup.md](odyssey/bringup.md) | howto | VPro on the Octane: board catalogue, Crossbow code 5, PROM/IRIX minimums, disk images |
 | [gotchas.md](odyssey/gotchas.md) | rule | VPro gotchas: IMPACT installs lack the driver, textport FIFO cost, the f64 depth path |
@@ -460,4 +461,5 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
+| [vpro-lines-on-the-triangle-arithmetic.md](plans/vpro-lines-on-the-triangle-arithmetic.md) | plan | VPro lines: integer pixel walk kept, attributes on the triangle's f32/0.15/12.12 arithmetic instead of f64, major-axis t; then a ring primitive for the threaded CPU unit and a REC_LINE GPU kernel; validate on octopus |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |

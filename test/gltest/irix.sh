@@ -20,6 +20,7 @@ for t in $targets; do
         cicopy) src=cicopy.c; libs="-lX11 -lGL" ;;
         gepeek) src=gepeek.c; libs="-lX11 -lGL" ;;
         toktest) src=toktest.c; libs="-lX11 -lGL" ;;
+        linetest) src=linetest.c; libs="-lX11 -lGL -lm" ;;
         *) echo "unknown target $t"; exit 2 ;;
     esac
     echo "cc -o $t $src"

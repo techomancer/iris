@@ -12,6 +12,26 @@ pub(crate) enum BlitView {
     Own([u32; 4]),
 }
 
+/// An aliased line's own words on the GPU unit (`shaders/vpro.wgsl`
+/// `line`): the walk Draw::line_projected() makes, in window subpixels and
+/// window pixels. The rest of its record is its triangle (a, b, a).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LineWords {
+    pub x_major: bool,
+    /// a's major coordinate, and its minor one shifted for the width.
+    pub la: i32,
+    pub na: i32,
+    /// b - a along the major and the minor axis.
+    pub du: i32,
+    pub dn: i32,
+    /// The major pixels walked and the minor pixels allowed, inclusive.
+    pub major: (i32, i32),
+    pub minor: (i32, i32),
+    pub width: i32,
+    /// 1 / du as the walk forms it, in single.
+    pub inv: f32,
+}
+
 /// How a run of blit pixels stores: the view, the bits stored (`mask`,
 /// all ones for a plain store), the window's tests, and a logical
 /// operation (`op`, 0 none, else 0x100 | the GL code) whose result is
@@ -79,6 +99,11 @@ mod stub {
 
         #[allow(clippy::too_many_arguments, reason = "the record's sources")]
         pub fn push_tri(&mut self, _t: &Tri, _ox: i32, _oy: i32, _bounds: (i32, i32, i32, i32), _steps: i64, _depth_range: [f64; 2], _depth_slack: f64, _mode: u32, _alpha: u32, _slot: &Slot, _tex: Option<&TexSlot>, _specular: bool) {
+            match *self {}
+        }
+
+        #[allow(clippy::too_many_arguments, reason = "the record's sources")]
+        pub fn push_line(&mut self, _t: &Tri, _l: &super::LineWords, _ox: i32, _oy: i32, _bounds: (i32, i32, i32, i32), _steps: i64, _depth_range: [f64; 2], _depth_slack: f64, _mode: u32, _alpha: u32, _slot: &Slot, _tex: Option<&TexSlot>, _specular: bool) {
             match *self {}
         }
 

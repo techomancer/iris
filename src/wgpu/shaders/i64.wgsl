@@ -91,3 +91,43 @@ fn i64_to_f32(a: I64) -> f32 {
     }
     return select(r, -r, neg);
 }
+
+// The sign extension of a.
+fn i64_from_i32(a: i32) -> I64 {
+    return I64(bitcast<u32>(a), select(0u, 0xffffffffu, a < 0));
+}
+
+fn i64_sub(a: I64, b: I64) -> I64 {
+    return i64_add(a, i64_neg(b));
+}
+
+// a * b, exact: the 64-bit product of two signed 32-bit values.
+fn i64_mul_i32(a: i32, b: i32) -> I64 {
+    let ua = select(u32(a), u32(-(a + 1)) + 1u, a < 0);
+    let ub = select(u32(b), u32(-(b + 1)) + 1u, b < 0);
+    let al = ua & 0xffffu;
+    let ah = ua >> 16u;
+    let bl = ub & 0xffffu;
+    let bh = ub >> 16u;
+    let ll = al * bl;
+    let mid0 = ah * bl;
+    let mid1 = al * bh;
+    let hh = ah * bh;
+    // The middle products at bits 16 to 48, with their carries.
+    let mid = mid0 + mid1;
+    let mid_carry = select(0u, 0x10000u, mid < mid0);
+    let lo = ll + (mid << 16u);
+    let lo_carry = select(0u, 1u, lo < ll);
+    let m = I64(lo, hh + (mid >> 16u) + mid_carry + lo_carry);
+    if (a < 0) != (b < 0) {
+        return i64_neg(m);
+    }
+    return m;
+}
+
+// a < b, signed.
+fn i64_lt(a: I64, b: I64) -> bool {
+    let ah = bitcast<i32>(a.hi);
+    let bh = bitcast<i32>(b.hi);
+    return ah < bh || (ah == bh && a.lo < b.lo);
+}
