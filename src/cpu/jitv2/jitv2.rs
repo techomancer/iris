@@ -228,6 +228,13 @@ pub fn push_hot_request(hot: &crossbeam_queue::ArrayQueue<CompileRequest>, req: 
 /// for this constant.
 pub const PAGE_SIZE: u32 = 4096;
 
+/// Carried by a page's generation counter while some CPU's cache holds
+/// lines there (`PpMemSpace::hold_line_page`): that CPU runs the page from
+/// its own view, so it is not compiled (`comp::snapshot_page`). It comes off
+/// with an ordinary bump, below the held page's last publish, so `publish`
+/// takes any change of generation as new bytes.
+pub const GEN_HELD: u64 = 1 << 48;
+
 /// Number of possible entry offsets per page: one per 4-byte-aligned word
 /// (MIPS instructions are always word-aligned), i.e. `PAGE_SIZE / 4` (§2.4:
 /// `entry_bits` 16×u64 = 1024 bits, `entry_table` 1024 entries).
@@ -1620,6 +1627,11 @@ impl PhysicalCodePage {
         for word in self.denied.iter() { word.store(0, Ordering::Relaxed); }
     }
 
+    /// Undo [`Self::denylist_all`].
+    pub fn allow_all(&self) {
+        for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
+    }
+
     /// Clear `offset_word`'s `compiled` bit only — NOT `denied`. Two
     /// distinct callers:
     ///
@@ -1854,8 +1866,9 @@ impl PhysicalCodePage {
     /// a reader that observes a `compiled` bit set (Acquire-paired via
     /// `is_runnable`'s `entry_gen` load) never observes a stale/null
     /// `func` for it. `entry_gen` is written unconditionally on every actual
-    /// publish, but only **numerically advances** when `snap_gen >
-    /// entry_gen` (a real page-bump-triggered recompile, §13.6/§13.3's
+    /// publish, but only **changes** when `snap_gen != entry_gen` (a real
+    /// page-bump-triggered recompile, or the first after `GEN_HELD` comes
+    /// off, §13.6/§13.3's
     /// discussion) — a pure entry-coverage publish against unchanged bytes
     /// (`snap_gen == entry_gen` already) rewrites the same value. Readers
     /// never need to distinguish the two: `entry_gen == current_gen()` is
@@ -1909,7 +1922,8 @@ impl PhysicalCodePage {
         }
 
         let prev_entry_gen = self.entry_gen.load(Ordering::Relaxed);
-        let is_real_invalidation = snap_gen > prev_entry_gen;
+        // Not `>`: a page's generation drops when `GEN_HELD` comes off.
+        let is_real_invalidation = snap_gen != prev_entry_gen;
         // Code for the other FR mode replaces the old function outright, so
         // the old function's entries must go with it: its dispatch switch is
         // gone, and the new one only has cases for `new_entries`.
