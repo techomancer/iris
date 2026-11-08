@@ -14,15 +14,12 @@ reported, not fixed here, so the suite keeps showing them until `src/` changes.
 
 ## Build
 
-Needs a MIPS cross toolchain:
+Needs the pinned MIPS cross compiler, which comes in a container; see
+[docs/toolchain.md](docs/toolchain.md) for the two commands. Inside it:
 
 ```sh
-sudo apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu
 make                        # -> build/cputest.elf
 ```
-
-No root? `make toolchain-local` unpacks the same packages into
-`~/.local/opt`; the Makefile finds them automatically.
 
 `make ONLY=group_umode` (any `group_*` from `harness/tests.c`) builds a suite of
 `identity` plus that one group - for iterating on a slow target such as an HDL

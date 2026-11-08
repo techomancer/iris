@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Benchmark and test suites: one pinned compiler
+
+- One pinned compiler, Fedora 45's GCC 16.2.1 for MIPS, builds the `cpu-tests` and `bench` guest binaries, in a container (`cpu-tests/docs/toolchain.md`). `make -C cpu-tests toolchain-local` is gone.
+- The compiler changes the benchmark: GCC 14.2 runs Dhrystone in 428 guest instructions per iteration where GCC 16.2.1 needs 313, so results from images built by different compilers are not comparable.
+
 ### cpu-tests: results judged by test name
 
 - `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
