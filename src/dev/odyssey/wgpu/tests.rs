@@ -213,6 +213,7 @@ fn tri_textured(rng: &mut Lcg, st: &RasterState, smooth: bool, ox: i32, oy: i32,
         tex,
         inv_w: v.map(|r| r.inv_w),
         clip: [[0.0; 6]; 3],
+        planes: false,
     })
 }
 

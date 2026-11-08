@@ -124,6 +124,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   test goes through the fragment back end as a depth-tested glDrawPixels
   does; and the pixel-transfer scale and bias on copies and images is exact
   integer arithmetic (ties round up), the same on both raster units.
+- A triangle or line with every vertex inside the enabled user clip
+  planes skips the per-fragment plane test, and a triangle wholly outside
+  one is dropped. Both are exact (a fragment's plane value lies between
+  its vertices'). SGI's sgiquake1 keeps a plane enabled that never clips;
+  its triangles were shaded on the CPU because of it. The quake1 timedemo
+  replay now sends 15x fewer records to the GPU unit and draws in 18 s
+  instead of 26.
+- `WGPU_BATCH_TIMING` times each GPU batch's bin and raster passes with
+  timestamp queries and counts its busy tiles; `IRIS_WGPU_LOAD` compiles
+  edited kernels from a directory instead of the built-in ones.
 
 ### VPro drawing
 

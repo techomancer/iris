@@ -77,6 +77,26 @@ impl Transform<'_> {
         d.iter().enumerate().take(CLIP_PLANES as usize).any(|(i, &di)| self.st.clip_planes & (1 << i) != 0 && !(di >= 0.0))
     }
 
+    /// Where a convex primitive whose vertices have user plane values d
+    /// lies against the enabled planes. A plane value is linear in eye
+    /// space, so a fragment's (its perspective-correct interpolation, a
+    /// weighted mean of the vertices' with weights of one sign) is never
+    /// below the least vertex value nor above the greatest: with every
+    /// vertex on the kept side of every enabled plane no fragment needs
+    /// the test, and with every vertex outside one plane none survives.
+    pub fn user_side(&self, d: &[[f64; CLIP_PLANES as usize]]) -> PlaneSide {
+        let mut side = PlaneSide::Inside;
+        for i in (0..CLIP_PLANES as usize).filter(|&i| self.st.clip_planes & (1 << i) != 0) {
+            if d.iter().all(|v| v[i] < 0.0) {
+                return PlaneSide::Outside;
+            }
+            if !d.iter().all(|v| v[i] >= 0.0) {
+                side = PlaneSide::Across;
+            }
+        }
+        side
+    }
+
     /// The window pixels a primitive's fragments may fall on within the
     /// window's own bounds `owned`, inclusive: within the viewport. None
     /// when there are none.
@@ -160,6 +180,18 @@ pub(crate) fn clip_triangle(clip: &Clip, in_: &[VolumeVertex; 3]) -> ([VolumeVer
     let mut tmp = [VolumeVertex::default(); CLIPPED_MAX];
     let (n, _) = clip.clip_polygon_by::<NearW, _>(&mut out, &mut tmp, 3, any);
     (out, if n < 3 { 0 } else { n })
+}
+
+/// Where a primitive lies against the enabled user clip planes
+/// (Transform::user_side()).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaneSide {
+    /// Every fragment is kept: no test.
+    Inside,
+    /// No fragment is kept.
+    Outside,
+    /// The fragments are tested one by one.
+    Across,
 }
 
 /// A vertex in clip coordinates, as the shared GL core's clipper
@@ -327,6 +359,9 @@ pub(crate) struct Tri {
     /// 1/w and the user plane values at the vertices.
     pub inv_w: [f64; 3],
     pub clip: [[f64; 6]; 3],
+    /// Whether the user planes are tested at each fragment: some plane is
+    /// enabled and the triangle lies across one (Transform::user_side()).
+    pub planes: bool,
 }
 
 impl Tri {
@@ -394,6 +429,11 @@ impl Draw<'_> {
         let Some((px0, py0, px1, py1)) = self.bounds else {
             return;
         };
+        let planes = match self.xf.user_side(&v.map(|r| r.clip)) {
+            PlaneSide::Inside => false,
+            PlaneSide::Outside => return,
+            PlaneSide::Across => true,
+        };
         let repeat = [self.tex.regs.wrap(0) == Wrap::Repeat, self.tex.regs.wrap(1) == Wrap::Repeat];
         let tex = TriTex::setup(&v.map(|r| texture_values(&r)), repeat);
         let smooth = !p.raster.flat;
@@ -408,15 +448,16 @@ impl Draw<'_> {
             tex,
             inv_w: v.map(|r| r.inv_w),
             clip: v.map(|r| r.clip),
+            planes,
         };
         let rst = super::raster::RasterState { offset_steps: p.fill_steps, offset_fill: true, ..p.raster };
 
         if let Some(g) = p.gpu_unit() {
             // The unit walks, textures and shades what its kernels cover; a
-            // fogged or user-clipped triangle is shaded here and its quads
-            // stored by the unit (emit()).
+            // fogged triangle, or one across a user plane, is shaded here and
+            // its quads stored by the unit (emit()).
             let tex = p.gpu_tex.as_deref().filter(|_| self.textured);
-            let simple = !p.shader.fog && self.xf.user_planes() == 0 && (tex.is_some() || !self.textured);
+            let simple = !p.shader.fog && !planes && (tex.is_some() || !self.textured);
             if simple {
                 if let Some((x0, y0, x1, y1)) = super::raster::walk_bounds(&rst, &ts.tri, Some((px0, py0, px1, py1))) {
                     let (ox, oy) = (rst.ox, rst.oy);
@@ -483,7 +524,7 @@ impl Draw<'_> {
                 continue;
             };
             background |= (b as u8) << i;
-            if self.xf.user_planes() != 0 {
+            if t.planes {
                 let (b1, b2) = t.bary(px, py);
                 let w = [(1.0 - b1 - b2) * t.inv_w[0], b1 * t.inv_w[1], b2 * t.inv_w[2]];
                 let sum = w[0] + w[1] + w[2];
@@ -556,6 +597,8 @@ impl Draw<'_> {
             tex: TriTex::setup(&v.map(|r| texture_values(&r)), repeat),
             inv_w: v.map(|r| r.inv_w),
             clip: v.map(|r| r.clip),
+            // A segment's walk tests its planes itself (user_clip).
+            planes: false,
         }
     }
 
