@@ -639,7 +639,7 @@ heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
 # tile     = 32             # VPro: screen tile size, a power of two from 8 to 256
-# raster   = "cpu"          # VPro: "wgpu" draws on the host GPU (builds with the wgpu feature; work in progress)
+# raster   = "cpu"          # VPro, IMPACT: "wgpu" draws on the host GPU (builds with the wgpu feature; work in progress)
 # gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"
 
 [clock]

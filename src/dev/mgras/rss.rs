@@ -437,7 +437,7 @@ const STATUS_IDLE: u32 = 0x100 | (1 << 4);
 /// Config: Y-flip.
 pub(super) const CONFIG_YFLIP: u32 = 1 << 3;
 /// Fill mode: fast fill (solid, from the fill colour registers).
-const FILL_FAST: u32 = 1 << 20;
+pub(super) const FILL_FAST: u32 = 1 << 20;
 /// Fill mode: char data stipples the block (with block type 1), and the
 /// stipple is opaque, its 0 bits drawn in the background colour.
 const FILL_CHAR_STIPPLE: u32 = 1 << 3;
@@ -712,9 +712,9 @@ fn pack_rgb(r: u32, g: u32, b: u32) -> u32 {
 /// A host pixel of transfer format (PixelFormat, CompType) to a framebuffer
 /// pixel, and back. Only the RGB formats convert.
 /// Transfer format (PixelFormat, CompType) of depth pixels.
-const DEPTH_FORMAT: (u32, u32) = (2, 3);
+pub(super) const DEPTH_FORMAT: (u32, u32) = (2, 3);
 
-fn from_host(format: (u32, u32), v: u64) -> u32 {
+pub(super) fn from_host(format: (u32, u32), v: u64) -> u32 {
     // RGB with 16-bit components (glCopyPixels' round trip through the
     // host, 6 bytes a pixel, red first): the top 8 bits of each.
     if format == (7, 1) {
@@ -816,7 +816,7 @@ pub(crate) fn jit_xfer_ok(f: (u32, u32)) -> bool {
 /// Whether a transfer format gives its pixels an alpha (RGBA or alpha
 /// alone; the packed 4:4:4:4 and 5:5:5:1 types arrive without it, see
 /// `from_host`).
-fn transfer_alpha(f: (u32, u32)) -> bool {
+pub(super) fn transfer_alpha(f: (u32, u32)) -> bool {
     matches!(f.0, 6 | 8) && !matches!(f, (8, 8) | (8, 10))
 }
 
@@ -1197,6 +1197,11 @@ pub struct Rss {
     pub jit: super::rss_jit::JitState,
     #[cfg(feature = "gr4-jit")]
     pub jit_ctx: super::rss_jit::RasterCtx,
+    /// The GPU raster unit drawing for this engine (`super::wgpu`), when
+    /// the board runs one: primitives become its records instead of
+    /// stores. Null on the CPU path.
+    #[cfg(feature = "wgpu")]
+    pub gpu: super::wgpu::GpuLink,
 }
 
 impl Drop for Rss {
@@ -1324,6 +1329,10 @@ impl Rss {
     /// they read one stream.
     fn te_write(&mut self, defer: bool, f: impl FnOnce(&mut Te1, &[u32; 0x400])) {
         use std::sync::atomic::Ordering;
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.before_tram_write(&mut self.te);
+        }
         if self.te_shared == 0 {
             f(&mut self.te, &self.regs);
             return;
@@ -1518,7 +1527,7 @@ impl Rss {
     }
 
     /// Window coordinates to framebuffer coordinates.
-    fn to_fb(&self, x: i32, y: i32) -> (i32, i32) {
+    pub(super) fn to_fb(&self, x: i32, y: i32) -> (i32, i32) {
         let win = self.reg(reg::XYWIN);
         let (ox, oy) = (signed16(win), signed16(win >> 16));
         if self.reg(reg::CONFIG) & CONFIG_YFLIP != 0 {
@@ -1694,7 +1703,7 @@ impl Rss {
     }
 
     /// Drawing goes to the overlay planes.
-    fn draws_overlay(&self) -> bool {
+    pub(super) fn draws_overlay(&self) -> bool {
         draw_buffer(self.reg(reg::PP1FILLMODE)) & 0x70 == 0x40
     }
 
@@ -1878,6 +1887,11 @@ impl Rss {
 
     /// A point at the line start register, in the current colour.
     fn point(&mut self) -> bool {
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.point(self);
+            return true;
+        }
         let s = self.reg(reg::LINE_START);
         let color = self.current_block().color;
         let (fx, fy) = self.to_fb(signed16(s >> 16), signed16(s));
@@ -1889,6 +1903,11 @@ impl Rss {
     /// mode skips the last, in the current colour; with line stipple on,
     /// pixel `k` is drawn only where bit `31 - k % 32` of the pattern is set.
     fn line(&mut self) -> bool {
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.line(self);
+            return true;
+        }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::line(self) {
             return true;
@@ -1966,6 +1985,11 @@ impl Rss {
     /// not known; this is the GL rule.
     fn triangle(&mut self, ltor: bool) -> bool {
         let Some(t) = self.tri_setup(ltor) else { return true };
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.triangle(self, &t);
+            return true;
+        }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::triangle(self, &t) {
             return true;
@@ -2148,6 +2172,16 @@ impl Rss {
     /// written again.
     fn gl_line(&mut self) -> bool {
         let Some(l) = self.gl_line_setup() else { return true };
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            let pos = self.gl_line_stipple_pos;
+            g.gl_line(self, &l, pos);
+            // The stipple counts every step of a stippled line.
+            if l.stipple != 0 {
+                self.gl_line_stipple_pos = pos.wrapping_add(l.p1.wrapping_sub(l.p0).wrapping_mul(l.dir) as u32);
+            }
+            return true;
+        }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::gl_line(self, &l) {
             return true;
@@ -2376,6 +2410,11 @@ impl Rss {
     }
 
     fn fill(&mut self, b: &Block) {
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.fill(self, b);
+            return;
+        }
         // 12:12:12 fast fills keep the fill colour's twelve bits.
         let pp1 = self.reg(reg::PP1FILLMODE);
         if self.deep36() && !self.draws_overlay() && self.reg(reg::FILLMODE) & FILL_FAST != 0 {
@@ -2412,6 +2451,12 @@ impl Rss {
         let Some(mut s) = self.stipple.get() else { return false };
         if s.row >= s.block.rows() {
             return false;
+        }
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.stipple(self, &mut s, bits, n);
+            self.stipple.set(Some(s));
+            return true;
         }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::stipple(self, &mut s, bits, n) {
@@ -2484,6 +2529,11 @@ impl Rss {
     }
 
     fn put_line(&mut self, x: &Xfer, line: u32, bytes: &[u8]) {
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.transfer_line(self, x, line, bytes);
+            return;
+        }
         if self.regs[reg::ZST_STENCIL as usize] != 0 {
             self.put_stencil_line(x, line, bytes);
             return;
@@ -2544,7 +2594,7 @@ impl Rss {
     /// outside the box, under glAlphaFunc(GL_GEQUAL, 0.9); written
     /// straight, the transparent pixels covered the 3D scene in black. The
     /// fragments' depth is the raster position's (`reg::XFER_Z`).
-    fn transfer_fragments(&self) -> bool {
+    pub(super) fn transfer_fragments(&self) -> bool {
         let pp1 = self.reg(reg::PP1FILLMODE);
         if draw_buffer(pp1) == DRAW_CID || draw_buffer(pp1) & 0x70 == 0x40 {
             return false;
@@ -2743,6 +2793,7 @@ impl Rss {
 
     /// PIO read, high half: takes the next doubleword.
     pub fn pio_read_hi(&mut self) -> u32 {
+        self.gpu_sync();
         let dw = self.pio_doubleword();
         self.stats.pio_read_dw += 1;
         let Some(x) = self.xfer.as_mut() else { return 0 };
@@ -2752,6 +2803,17 @@ impl Rss {
             x.rd_settle();
         }
         (dw >> 32) as u32
+    }
+
+    /// Bring the pixel memory and clip IDs current from the GPU unit, if
+    /// one draws (its readers: PIO and DMA reads, hashes, the display).
+    pub fn gpu_sync(&mut self) {
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            if let Err(e) = g.sync(&mut self.mem, &mut self.cid) {
+                eprintln!("mgras: GPU raster unit: {e}");
+            }
+        }
     }
 
     /// PIO read, low half of the doubleword the last high read took.

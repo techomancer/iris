@@ -304,7 +304,13 @@ pub(super) mod tests {
 
     /// A board of kind `kind` with its engine threads running (no display).
     pub fn live_board_of(kind: GraphicsBoard) -> Arc<Mgras> {
-        let m = Mgras::new(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached());
+        live_board_raster(kind, crate::config::RasterUnit::Cpu)
+    }
+
+    /// A board of kind `kind` whose raster engines are where `raster` says.
+    pub fn live_board_raster(kind: GraphicsBoard, raster: crate::config::RasterUnit) -> Arc<Mgras> {
+        let m = Mgras::with_raster(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached(), raster, "auto")
+            .unwrap_or_else(|e| panic!("{e}"));
         m.start_engines();
         m
     }
@@ -442,7 +448,9 @@ pub(super) mod tests {
             Ok("max") => GraphicsBoard::MaxImpact,
             _ => GraphicsBoard::HighImpact,
         };
-        let m = live_board_of(kind);
+        // MGRAS_REPLAY_GPU=1: the raster engine on the GPU unit (`wgpu`).
+        let raster = if std::env::var("MGRAS_REPLAY_GPU").is_ok() { crate::config::RasterUnit::Wgpu } else { crate::config::RasterUnit::Cpu };
+        let m = live_board_raster(kind, raster);
         // MGRAS_REPLAY_TRACE=<file>: the annotated trace of the replay
         // (`mgras trace`), all categories.
         if let Ok(t) = std::env::var("MGRAS_REPLAY_TRACE") {
@@ -461,11 +469,14 @@ pub(super) mod tests {
         }
         let h = m.state_hash();
         m.stop_engines();
+        // SAFETY: the engines are stopped.
+        let prims = unsafe { &*m.rss.get() }.stats.prims;
         eprintln!(
-            "{path}: {kind:?} with {} raster engine(s), {:.3} s, final state {}",
+            "{path}: {kind:?} with {} raster engine(s), {:.3} s, final state {}, primitives by IR opcode {:?}",
             m.nrss,
             took.as_secs_f64(),
-            h.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+            h.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>(),
+            prims.iter().enumerate().filter(|(_, n)| **n != 0).collect::<Vec<_>>()
         );
         if !check {
             return Ok(());
