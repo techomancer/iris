@@ -214,6 +214,18 @@ fn a_bus_saves_and_loads_whole() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A snapshot an older iris took during POST kept the stack page outside
+/// the cache, which nothing can put back now: it is refused.
+#[test]
+fn a_snapshot_with_the_old_stack_page_is_refused() {
+    use crate::traits::Saveable;
+    let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+    let mut v = bus.save_state();
+    v.as_table_mut().unwrap().insert("stack_page".into(), toml::Value::Array(vec![]));
+    let e = bus.load_state(&v).unwrap_err();
+    assert!(e.contains("take it again"), "{e}");
+}
+
 /// Setting CONTROL's cold-reset bit asks the machine for a reset once, and
 /// the bit reads back clear, as the hardware clears it.
 #[test]

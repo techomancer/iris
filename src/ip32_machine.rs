@@ -249,7 +249,7 @@ impl O2Machine {
         let boot = Arc::new(BootState::new());
         let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = crate::with_cpu!(part, true, true, C =>
-            Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), bus.ram.clone(), part.prid()));
+            Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), part.prid()));
 
         // ppmem: the CPU's cache and the JIT reach RAM through a cached view
         // of the memory's window, publishing its bitmap into the CPU's own
@@ -374,7 +374,7 @@ impl O2Machine {
     }
 
     fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, count_hz: u64, boot: Arc<BootState>,
-                    ram: Arc<O2Memory>, prid: u32) -> Arc<dyn CpuDevice>
+                    prid: u32) -> Arc<dyn CpuDevice>
     where
         C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
@@ -382,7 +382,6 @@ impl O2Machine {
         let cfg = MipsCpuConfig::for_model::<C>(memory).with_prid(prid);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
-        exec.cache.set_pd_tag_store_hook(Box::new(move |tag| ram.stack_tag_store(tag)));
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
         exec.core.set_count_hz(count_hz.max(1));
