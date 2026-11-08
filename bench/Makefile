@@ -37,10 +37,10 @@ CFLAGS    := $(ARCHFLAGS) -ffreestanding -nostdlib -nostdinc \
              -fno-builtin -fno-stack-protector -fno-strict-aliasing \
              -fno-delete-null-pointer-checks -fomit-frame-pointer \
              -ffp-contract=off -fexcess-precision=standard \
-             -O2 -g -std=gnu11 \
+             -O2 -g $(PREFIXMAP) -std=gnu11 \
              -Wall -Wextra -Werror -Wno-unused-parameter \
              -Iharness -Igolden -I$(CPUTESTS)/harness
-ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib -I$(CPUTESTS)/harness -Iharness \
+ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib $(PREFIXMAP) -I$(CPUTESTS)/harness -Iharness \
              -g -Wa,--fatal-warnings
 LDFLAGS   := -EB -T harness/link.ld -nostdlib --no-warn-mismatch
 

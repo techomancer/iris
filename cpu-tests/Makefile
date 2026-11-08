@@ -36,10 +36,10 @@ ARCHFLAGS := -march=mips3 -mabi=n32 -EB -mno-abicalls -fno-pic -G0 -msoft-float
 CFLAGS    := $(ARCHFLAGS) -ffreestanding -nostdlib -nostdinc \
              -fno-builtin -fno-stack-protector -fno-strict-aliasing \
              -fno-delete-null-pointer-checks -fomit-frame-pointer \
-             -O1 -g -std=gnu11 \
+             -O1 -g $(PREFIXMAP) -std=gnu11 \
              -Wall -Wextra -Werror -Wno-unused-parameter \
              -Iharness $(if $(ONLY),-DCPUTEST_ONLY=$(ONLY))
-ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib -Iharness -g -Wa,--fatal-warnings
+ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib $(PREFIXMAP) -Iharness -g -Wa,--fatal-warnings
 LDFLAGS   := -EB -T harness/link.ld -nostdlib --no-warn-mismatch
 
 HARNESS_C := harness/console.c harness/testlib.c harness/scsilog.c harness/arcs.c
