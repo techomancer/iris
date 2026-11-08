@@ -61,15 +61,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install the MIPS cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mips-linux-gnu binutils-mips-linux-gnu
+      # Every guest binary is built with the one pinned MIPS compiler, in the
+      # container developers use (cpu-tests/docs/toolchain.md). The benchmark
+      # measures compiled guest code, so CI building with another compiler
+      # would test another benchmark.
+      - name: Build the pinned MIPS toolchain
+        run: docker build -t iris-guest-toolchain -f cpu-tests/toolchain.Containerfile cpu-tests
 
       # Three checked-in generated files, all verified the same way: regenerate
       # and fail on a diff. That is what stops a generator and its output from
-      # drifting apart, and it is why building either suite needs nothing but
-      # the cross toolchain.
+      # drifting apart. The FP vectors and golden checksums come from host
+      # programs, the guest binaries from the pinned toolchain.
 
       # `make vectors` also runs the generator's --check pass, which cross-checks
       # its exact rational arithmetic against the runner's own FPU before
@@ -91,8 +93,8 @@ jobs:
 
       - name: Build the guest binaries
         run: |
-          make -C cpu-tests
-          make -C bench
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+            iris-guest-toolchain sh -c 'make -C cpu-tests all && make -C bench all'
 
       # bench/prebuilt/irisbench.elf is linked into `iris` with include_bytes!
       # so the benchmark runs on a machine with no cross toolchain — a released

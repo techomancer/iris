@@ -17,8 +17,7 @@ and R5000, both passing every check); see
 [cpu-tests/README.md](cpu-tests/README.md).
 
 ```sh
-sudo apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu   # or: make -C cpu-tests toolchain-local
-make -C cpu-tests && make -C cpu-tests run
+make -C cpu-tests all && make -C cpu-tests run   # compiler: see cpu-tests/docs/toolchain.md
 cpu-tests/run/matrix.sh                 # R4400/R5000 x interp/jitv2
 ```
 
@@ -36,7 +35,7 @@ cargo build --release --bin iris-bench
 ./target/release/iris-bench run         # ~60 s; --quick for about half that
 ./target/release/iris-bench run --quick
 
-make -C bench && make -C bench hostbench            # only to change the suite
+make -C bench all && make -C bench hostbench        # only to change the suite; compiler as above
 ./target/release/iris-bench matrix      # builds and runs every CPU x engine cell
 ./target/release/iris-bench host        # the same kernels, natively, for the ratio
 ```
