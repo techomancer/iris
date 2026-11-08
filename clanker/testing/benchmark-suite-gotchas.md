@@ -108,3 +108,16 @@ If the change cannot affect the image (comments, docs-only lines), don't rebuild
 existing `irisbench.elf`, and `make -C bench check-prebuilt` confirms. Commit
 `bench/prebuilt/PROVENANCE` with the edit. Anything that can change the code
 still needs the full `make -C bench prebuilt`.
+
+## The compiler is part of the benchmark
+
+An image rebuilt with GCC 14.2 instead of 16.2.1 from the same sources ran
+Dhrystone in 428 guest instructions per iteration instead of 313, and the rates
+fell on an unchanged emulator. Guest instructions per iteration (`icount /
+iters` in a result JSON) shows a compiler change directly; the numbers are in
+[guest-compiler-changes-the-benchmark](../perf/guest-compiler-changes-the-benchmark.md).
+`iris-bench report` warns when the runs it compares used different images.
+
+- Compare emulator builds on one guest: `iris-bench run --iris BIN --elf FIXED`,
+  never the image embedded in each commit, or a bisect lands on the commit that
+  rebuilt the image.
