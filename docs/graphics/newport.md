@@ -208,5 +208,5 @@ The device commands: `vc2 status|ramdump`, `xmap status|dump`,
 - `examples/rex3_gpu_probe.rs` probes the host-GPU path.
 
 Design notes for this board are in `clanker/rex3/`. The published documents for
-its chips are in `docs/Indy/`: `rex3.pdf`, `vc2.pdf`, `xmap9.pdf`, `bt445_ramdac.pdf`
+its chips are in `docs/datasheets/indy/`: `rex3.pdf`, `vc2.pdf`, `xmap9.pdf`, `bt445_ramdac.pdf`
 and `cmap_MS622424.pdf`.

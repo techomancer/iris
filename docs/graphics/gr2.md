@@ -4,7 +4,7 @@ Source: `src/dev/gr2/`. Part of [Graphics boards](README.md).
 Paths are relative to that directory unless they start with another one.
 
 The machines these boards ship in, and how to select them, are in
-[GR2 XZ and Extreme graphics](../indy-xz-elan.md).
+[GR2 XZ and Extreme graphics](gr2-xz-extreme.md).
 
 Express (GR2) is the graphics board of the Indy XZ, the Indigo2 XZ, the Indigo2 Elan and the Indigo2 Extreme. Iris models the XZ and the Extreme (the `Xz` and `Extreme` graphics boards in `src/config.rs`); there is no Elan setting.
 The XZ carries two geometry engines (GE7), the Elan four and the Extreme eight (inferred from the published counts; `Gr2Variant::ges`). The board has four parts: the HQ2 command engine, the GE7
