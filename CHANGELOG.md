@@ -112,6 +112,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   unit. In replays of recorded sessions, the PROM's power-on screen draws
   about 6x faster on the CPU unit and 27x faster on the GPU unit, and a
   file manager's minimize and restore about 4x and 6x faster.
+- Copies (the X server's window moves and window-id copies, glCopyPixels,
+  glCopyTexImage, the library's texture conversions through scratch
+  memory) run on the GPU unit as a kernel: a gather of the source into a
+  scratch buffer and a scatter into the destination, in order with the
+  drawing, instead of reading both rectangles back and copying on the CPU
+  (`vpro gpu` counts them). The quake1 timedemo's copies no longer read
+  anything back. Traced against the GL library: a copy mirrors along an
+  axis where the copy's walk bits and the image box's direction disagree,
+  which fixes glCopyPixels at zoom 1, -1; a colour copy under the depth
+  test goes through the fragment back end as a depth-tested glDrawPixels
+  does; and the pixel-transfer scale and bias on copies and images is exact
+  integer arithmetic (ties round up), the same on both raster units.
 
 ### VPro drawing
 
