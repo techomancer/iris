@@ -82,13 +82,25 @@ static void t_index_store_load_tag(void)
     u32 idx;
 
     /* Invalidate a handful of D-cache lines by storing a zero tag, then read
-     * each back and confirm it reads as invalid (tag zero). */
+     * each back and confirm it reads as invalid (tag zero).
+     *
+     * A zero tag drops the line without writing it back, and these indexes
+     * hold whatever the suite's own data happens to map there: stack frames,
+     * .bss, depending on how big the code came out. So write each line back
+     * first, in the same asm as the tag store, with no load or store between
+     * them that could bring the line back dirty. */
     for (idx = 0; idx < 4; idx++) {
         void *line = (void *)(unsigned long)
                      (KSEG0_BASE + idx * dc_line);
-        cp0_taglo_set(0);
-        cp0_taghi_set(0);
-        CACHE_OP(CACHE_D | CACHE_OP_IDX_STORE_TAG, line);
+        __asm__ __volatile__(A
+            "cache  %1, 0(%0)\n\t"          /* Index_Writeback_Invalidate_D */
+            "mtc0   $0, $28\n\t"            /* TagLo */
+            "mtc0   $0, $29\n\t"            /* TagHi */
+            "nop; nop; nop; nop\n\t"
+            "cache  %2, 0(%0)" Z           /* Index_Store_Tag_D */
+            :: "r"(line), "i"(CACHE_D | CACHE_OP_IDX_INV),
+               "i"(CACHE_D | CACHE_OP_IDX_STORE_TAG)
+            : "memory");
 
         cp0_taglo_set(0xFFFFFFFFu);          /* poison, so a no-op is visible */
         CACHE_OP(CACHE_D | CACHE_OP_IDX_LOAD_TAG, line);
