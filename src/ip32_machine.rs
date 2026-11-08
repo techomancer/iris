@@ -262,6 +262,7 @@ impl O2Machine {
                 .map_err(|e| format!("ppmem: the CPU's cached view: {e}"))?;
             unsafe {
                 cpu.set_tcache_window(sp.view_base(v));
+                cpu.set_cached_view(sp, v);
                 #[cfg(feature = "jitv2")]
                 {
                     use crate::ppmem::MappedMemory;

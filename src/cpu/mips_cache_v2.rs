@@ -684,6 +684,15 @@ pub trait MipsCache: Send + Sync {
     /// `base` must be ppmem's window base and `bitmap` a live `u64` that
     /// outlives this cache.
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
+
+    /// The cached view this cache reads memory through
+    /// (`PpMemSpace::add_cached_view`), as `sp` and its number, so valid
+    /// lines can hold their pages there. Set with the window, before the CPU
+    /// runs. No-op where the cache holds no lines.
+    ///
+    /// # Safety
+    /// `sp` must outlive the cache.
+    unsafe fn set_cached_view(&self, _sp: *const crate::ppmem::PpMemSpace, _view: usize) {}
     /// The ppmem window's `window_shift`, when it is not the 4GB window's.
     fn set_tcache_shift(&self, _shift: u32) {}
 

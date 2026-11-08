@@ -67,6 +67,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   with the other disks ([docs/nvme.md](docs/nvme.md)).
 ### R10000-family cache lines as memory
 
+- A valid primary data or secondary cache line now holds its page in that CPU's own copy of ppmem's window, so a PROM that keeps its stack in cache lines reads and writes the lines with cached accesses while the uncached path, DMA and the other CPUs see memory. Index Store Data writes through to such a line. `l2 probe 0` lists the pages held. Nothing changes on a load, store or fetch. A valid R5000 primary data line does the same, for the O2's POST stack.
 - jitv2 does not compile a page any CPU's cache holds lines in: that CPU runs it from its own view in the interpreter, and every other page stays compiled.
 
 ### R10000 family fixes, R12000 and R14000

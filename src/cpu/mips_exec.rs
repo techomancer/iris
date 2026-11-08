@@ -2927,6 +2927,14 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         unsafe { self.cache.set_tcache_window(base) };
     }
 
+    /// See `MipsCache::set_cached_view`.
+    ///
+    /// # Safety
+    /// `sp` must outlive the executor.
+    pub unsafe fn set_cached_view(&self, sp: *const crate::ppmem::PpMemSpace, view: usize) {
+        unsafe { self.cache.set_cached_view(sp, view) };
+    }
+
     /// tcache: the window's `ppmem::window_shift`, when it is not 4GB's.
     pub fn set_tcache_shift(&self, shift: u32) {
         self.cache.set_tcache_shift(shift);
@@ -10580,6 +10588,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         unsafe { self.executor.lock().set_tcache_window(base) };
     }
 
+    /// See `MipsExecutor::set_cached_view`.
+    ///
+    /// # Safety
+    /// `sp` must outlive the CPU.
+    pub unsafe fn set_cached_view(&self, sp: *const crate::ppmem::PpMemSpace, view: usize) {
+        unsafe { self.executor.lock().set_cached_view(sp, view) };
+    }
+
     /// tcache: see `MipsExecutor::set_tcache_shift`.
     pub fn set_tcache_shift(&self, shift: u32) {
         self.executor.lock().set_tcache_shift(shift);
@@ -11305,6 +11321,11 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_window`.
     unsafe fn set_tcache_window(&self, base: *mut u8);
+    /// See `MipsCache::set_cached_view`.
+    ///
+    /// # Safety
+    /// `sp` must outlive the CPU.
+    unsafe fn set_cached_view(&self, sp: *const crate::ppmem::PpMemSpace, view: usize);
     /// tcache: see `MipsExecutor::set_tcache_shift`.
     fn set_tcache_shift(&self, shift: u32);
     /// tcache: pointer to the cache's inline mapped-region bitmap.
@@ -11371,6 +11392,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn set_tcache_shift(&self, shift: u32) { MipsCpu::set_tcache_shift(self, shift) }
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { MipsCpu::set_tcache_window(self, base) }
+    }
+    unsafe fn set_cached_view(&self, sp: *const crate::ppmem::PpMemSpace, view: usize) {
+        unsafe { MipsCpu::set_cached_view(self, sp, view) }
     }
     fn tcache_bitmap_ptr(&self) -> *mut u64 { MipsCpu::tcache_bitmap_ptr(self) }
     #[cfg(feature = "jitv2")]
