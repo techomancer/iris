@@ -174,47 +174,7 @@ fn clip_edge(in_: &[Point2], n: usize, out: &mut [Point2], axis: u32, bound: f64
     count
 }
 
-/// The area of pixel square (x, y) a convex polygon covers.
-fn square_area(polygon: &[Point2], n: usize, x: i32, y: i32) -> f64 {
-    let mut a = [Point2::default(); 12];
-    let mut b = [Point2::default(); 12];
-    let mut area = 0.0f64;
-    let mut n = n;
 
-    a[..n].copy_from_slice(&polygon[..n]);
-    n = clip_edge(&a, n, &mut b, 0, x as f64, true);
-    n = clip_edge(&b, n, &mut a, 0, (x + 1) as f64, false);
-    n = clip_edge(&a, n, &mut b, 1, y as f64, true);
-    n = clip_edge(&b, n, &mut a, 1, (y + 1) as f64, false);
-    for i in 0..n {
-        let p = &a[i];
-        let q = &a[(i + 1) % n];
-
-        area += p.x * q.y - p.y * q.x;
-    }
-    (area.abs() * 0.5).min(1.0)
-}
-
-/// The coverage of pixel (x, y) by a smoothed line from a to b of width
-/// `width`, in pixels: the rectangle about it.
-fn line_coverage(ax: f64, ay: f64, bx: f64, by: f64, width: f64, x: i32, y: i32) -> f64 {
-    let dx = bx - ax;
-    let dy = by - ay;
-    let length = dx.hypot(dy);
-
-    if !(length > 0.0) || !(width > 0.0) {
-        return 0.0;
-    }
-    let nx = -dy * width / (2.0 * length);
-    let ny = dx * width / (2.0 * length);
-    let rectangle = [
-        Point2 { x: ax + nx, y: ay + ny },
-        Point2 { x: bx + nx, y: by + ny },
-        Point2 { x: bx - nx, y: by - ny },
-        Point2 { x: ax - nx, y: ay - ny },
-    ];
-    square_area(&rectangle, 4, x, y)
-}
 
 fn circle_integral(x: f64, radius: f64) -> f64 {
     let y = (radius * radius - x * x).max(0.0).sqrt();
@@ -603,6 +563,9 @@ impl Draw<'_> {
                 return;
             }
         }
+        // A smoothed segment's columns are an aliased one's; its slope
+        // picks the coverage profile (line_aa).
+        let slope = if major(&b) != major(&a) { ((minor(&b) - minor(&a)) as f64 / (major(&b) - major(&a)) as f64).abs() } else { 0.0 };
         let mut mm = major0;
         loop {
             if !(if step > 0 { mm <= major1 } else { mm >= major1 }) {
@@ -610,13 +573,23 @@ impl Draw<'_> {
             }
             let m = mm;
             mm += step;
-            // A smoothed segment tries every pixel its filter can reach
-            // across the minor axis; an aliased one covers one minor pixel
-            // here at most, the one centre_minor() gives, which is exact
-            // integer arithmetic on the snapped grid.
+            // A smoothed segment covers the pixels of a column whose centre
+            // is on it (as an aliased one does) that are near enough the
+            // line there, the minor coordinate at the column centre `v`;
+            // an aliased one covers one minor pixel here at most, the one
+            // centre_minor() gives, which is exact integer arithmetic on
+            // the snapped grid.
+            let mut v = 0.0f64;
             let (minor0, minor1) = if line_smooth {
-                let (q0, q1) = (minor(&a) as f64, minor(&b) as f64);
-                ((q0.min(q1) / one - pad).floor() as i64 - 1, (q0.max(q1) / one + pad).ceil() as i64 + 1)
+                let c = m as i64 * SUB + SUB / 2;
+                let (la, lb) = (major(&a), major(&b));
+                if !(if lb > la { c >= la && c < lb } else { c > lb && c <= la }) {
+                    (1, 0)
+                } else {
+                    v = minor(&a) as f64 + (minor(&b) - minor(&a)) as f64 * (c - la) as f64 / (lb - la) as f64;
+                    let reach = super::line_aa::reach(smooth_width);
+                    ((v / one - reach).floor() as i64 - 1, (v / one + reach).ceil() as i64 + 1)
+                }
             } else {
                 match centre_minor(&sa, &sb, m as i64) {
                     Some(n) => (n, n),
@@ -628,7 +601,8 @@ impl Draw<'_> {
                 let replica0 = n.max((if x_major { by0 } else { bx0 }) as i64);
                 let replica1 = if line_smooth { replica0 } else { (n + width as i64 - 1).min((if x_major { by1 } else { bx1 }) as i64) };
                 let coverage = if line_smooth {
-                    line_coverage(a.x as f64 / one, a.y as f64 / one, b.x as f64 / one, b.y as f64 / one, smooth_width, base_x as i32, base_y as i32)
+                    // The distance in 64ths of a pixel (subpixels are 256ths).
+                    super::line_aa::coverage(smooth_width, slope, ((n * SUB + SUB / 2) as f64 - v) / 4.0)
                 } else {
                     // The one pixel centre_minor() found.
                     1.0

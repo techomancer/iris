@@ -8,6 +8,12 @@
  * With "profile": smoothed horizontal lines at 64 offsets a pixel apart
  * by 1/64 each, for widths 1, 1.5, 2 and 3; prints the column x = 25:
  * "width64 k y r" (k the offset in 64ths).
+ * With "slopes": one smoothed line at a time, from (8, 8 + k/16) with
+ * slope s/8 for s 0 to 8 and k 0 to 15, widths 1 and 2; prints columns
+ * 30 to 33: "width s k x y r".
+ * With "fine": smoothed lines of slope j/64, j 0 to 64, placed so the
+ * line crosses column 31's centre at y = 20.5 + k/16, k 0 to 15, widths 1
+ * and 2; prints column 31: "width j k y r".
  */
 #include <string.h>
 #include <stdio.h>
@@ -100,6 +106,73 @@ static void profile(void)
     }
 }
 
+static void slopes(void)
+{
+    static unsigned char blk[4 * 120 * 4];
+    int wi, sl, k, x, y;
+
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glShadeModel(GL_FLAT);
+    for (wi = 1; wi <= 2; wi++) {
+        glLineWidth((float)wi);
+        for (sl = 0; sl <= 8; sl++) {
+            for (k = 0; k < 16; k++) {
+                double y0 = 8.0 + k / 16.0;
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glColor3f(1.0f, 1.0f, 1.0f);
+                glBegin(GL_LINES);
+                glVertex2d(8.0, y0);
+                glVertex2d(72.0, y0 + 64.0 * sl / 8.0);
+                glEnd();
+                glFinish();
+                glReadPixels(30, 0, 4, 120, GL_RGBA, GL_UNSIGNED_BYTE, blk);
+                for (y = 0; y < 120; y++) {
+                    for (x = 0; x < 4; x++) {
+                        int v = blk[4 * (y * 4 + x)];
+                        if (v) printf("%d %d %d %d %d %d\n", wi, sl, k, 30 + x, y, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void fine(void)
+{
+    static unsigned char col[64 * 4];
+    int wi, j, k, y;
+
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glShadeModel(GL_FLAT);
+    for (wi = 1; wi <= 2; wi++) {
+        glLineWidth((float)wi);
+        for (j = 0; j <= 64; j++) {
+            for (k = 0; k < 16; k++) {
+                double y0 = 20.5 + k / 16.0 - 23.5 * j / 64.0;
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glColor3f(1.0f, 1.0f, 1.0f);
+                glBegin(GL_LINES);
+                glVertex2d(8.0, y0);
+                glVertex2d(56.0, y0 + 48.0 * j / 64.0);
+                glEnd();
+                glFinish();
+                glReadPixels(31, 0, 1, 64, GL_RGBA, GL_UNSIGNED_BYTE, col);
+                for (y = 0; y < 64; y++) {
+                    if (col[4 * y]) printf("%d %d %d %d %d\n", wi, j, k, y, col[4 * y]);
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     static int attr[] = { GLX_RGBA, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None };
@@ -134,6 +207,18 @@ int main(int argc, char **argv)
     glDisable(GL_DITHER);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
+    if (argc > 1 && strcmp(argv[1], "fine") == 0) {
+        fine();
+        glXMakeCurrent(dpy, None, NULL);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "slopes") == 0) {
+        slopes();
+        glXMakeCurrent(dpy, None, NULL);
+        XCloseDisplay(dpy);
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "profile") == 0) {
         profile();
         glXMakeCurrent(dpy, None, NULL);

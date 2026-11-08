@@ -24,6 +24,8 @@ use super::board::Board;
 pub mod replay;
 pub mod scenes;
 pub mod vertices;
+#[cfg(test)]
+mod linetest;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
