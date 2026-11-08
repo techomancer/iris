@@ -99,6 +99,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   pixel for pixel. A draw's context is reused rather than allocated per
   draw. SolidView now draws in 2.1 s on the GPU unit (was 2.5) and 2.0 s
   on the threaded CPU unit (was 3.3).
+- Smoothed (antialiased) lines are drawn as a real V10 draws them: the
+  aliased line's columns with flat ends, each pixel's coverage taken from
+  a table measured on the board by the line's slope and the pixel's
+  distance from the line along the minor axis. They were the area of a
+  rectangle before, which made diagonal lines too bright and faded the
+  ends. Against the board: within 1 at the measured points, within 6
+  elsewhere.
 - The X server's and the PROM's 2D fills (solid rectangles, window-id
   writes, pattern spans) are one operation per rectangle instead of one per
   pixel: a single record per buffer on the GPU unit, row spans on the CPU

@@ -10,6 +10,7 @@ pub(super) mod backend;
 pub(super) mod fixed;
 pub(super) mod interp;
 pub(super) mod lanes;
+pub(super) mod line_aa;
 #[cfg(test)]
 pub(super) mod encode;
 pub(super) mod prims;

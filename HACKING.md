@@ -542,7 +542,11 @@ minor axis for a wide line; a real V10 draws the same pixels. The GPU
 unit takes such a line as one record (`REC_LINE`) that its kernel walks
 and shades like a triangle; with the raster thread, the line goes to the
 ring as one command its tiles' workers walk (`KIND_LINE`,
-`Draw::line_pixels`). A smoothed line is still shaded on the CPU.
+`Draw::line_pixels`). A smoothed line covers the same columns; in each,
+a pixel's coverage comes from a table measured on a real V10 by the
+line's slope and the pixel's minor-axis distance from the line
+(`pipe/line_aa.rs`, generated from `test/gltest/linetest.c`'s output),
+not from the area of a rectangle; it is still shaded on the CPU.
 
 A draw's context (`DrawFrame`, with its `PipeDraw` and the records the
 ring's workers read) is reused from a small pool in the raster context
