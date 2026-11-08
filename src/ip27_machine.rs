@@ -497,21 +497,21 @@ impl<B: Ip27Board> Ip27Machine<B> {
         } else {
             crate::with_cpu!(module.part, true, false, C => Self::cpu::<C>(module, bus, phys, memory, &node.timers, count_hz, cpu_id, smp))
         };
-        // The shadow cache and the JIT read RAM straight from the ppmem window.
+        // The shadow cache and the JIT read RAM through a cached view of the
+        // ppmem window that is the CPU's own.
         if let Some(sp) = node.memory.physical().ppmem_space() {
-            use crate::ppmem::MappedMemory;
+            let v = sp
+                .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
+                .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
             unsafe {
-                sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-                cpu.set_tcache_window(sp.window_base());
+                cpu.set_tcache_window(sp.view_base(v));
                 cpu.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
-                let bitmap = cpu.tcache_bitmap_ptr();
-                if !bitmap.is_null() {
-                    sp.set_bitmap_sink2(bitmap);
-                }
                 #[cfg(feature = "jitv2")]
-                cpu.set_tcache_gen_window(sp.gen_window_base());
+                {
+                    use crate::ppmem::MappedMemory;
+                    cpu.set_tcache_gen_window(sp.gen_window_base());
+                }
             }
-            node.memory.physical().resync_ppmem_bitmap();
         }
         #[cfg(feature = "jitv2")]
         {
