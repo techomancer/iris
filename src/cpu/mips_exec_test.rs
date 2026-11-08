@@ -7057,6 +7057,32 @@ mod tests {
         assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
     }
 
+    /// An uncached instruction fetch from a failing bus takes the bus error
+    /// as before, with or without a description: the same status, Cause, EPC
+    /// and BadVAddr, and the bus is asked once, after the fetch failed.
+    #[test]
+    fn test_described_uncached_fetch_fault_still_raises_the_bus_error() {
+        use crate::traits::BUS_ERR;
+        let mut outcome = Vec::new();
+        for explains in [false, true] {
+            let bus = Arc::new(FailingProbe { explains, asked: Mutex::new(Vec::new()) });
+            let dev: Arc<dyn BusDevice> = bus.clone();
+            let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> = MipsExecutor::new(dev, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.core.cp0_badvaddr = 0x5555;
+            exec.core.pc = 0xFFFFFFFF_A0000100;
+
+            // The fetch passes the bus's status through; a bus error leaves
+            // BadVAddr alone.
+            assert_eq!(exec.step_int(), BUS_ERR);
+            assert_eq!(exec.core.cp0_epc, 0xFFFFFFFF_A0000100);
+            assert_eq!(exec.core.cp0_badvaddr, 0x5555);
+            assert_eq!(*bus.asked.lock().unwrap(), vec![(0x100, 4)]);
+            outcome.push(exec.core.cp0_cause);
+        }
+        assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
+    }
+
     type TlbExec<C> = Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>>;
 
     fn on_big_stack(f: impl FnOnce() + Send + 'static) {
