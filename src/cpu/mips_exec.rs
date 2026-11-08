@@ -995,6 +995,15 @@ pub struct LlSiteStats {
     pub max_run: u64,
 }
 
+/// Which access `MipsExecutor::report_bus_error` is describing.
+#[derive(Clone, Copy)]
+enum BusErrorOp {
+    Fetch,
+    Read,
+    Write,
+    MaskedWrite,
+}
+
 pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub core: MipsCore,
     pub sysad: Arc<dyn BusDevice>,
@@ -2519,8 +2528,44 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// can say why the access failed. Asked only after a failure, so a good
     /// access never pays; it changes nothing the guest sees.
     #[cold]
+    #[inline(never)]
     fn fault_note(&self, phys_addr: u64, size: usize) -> String {
         self.sysad.describe_fault(phys_addr, size).map_or_else(String::new, |why| format!(" [{why}]"))
+    }
+
+    /// One bus-error report for the fetch, load and store paths, kept out of
+    /// line. Formatted inside those paths, the message and its `fault_note`
+    /// String were compiled into the hot code and slowed the interpreter
+    /// (more cycles for the same host instructions), although they never
+    /// run on a good access.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn report_bus_error(&self, op: BusErrorOp, size: usize, virt_addr: u64, phys_addr: u64, val: u64, mask: u64, status: u32) {
+        match op {
+            BusErrorOp::Fetch => eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}{}", virt_addr, phys_addr, status, self.fault_note(phys_addr, size)),
+            BusErrorOp::Read => {
+                // jitcheck tag: which pass this read happened in, so a
+                // divergence investigation can tell at a glance whether
+                // the reference (interpreter-only) pass ever reached
+                // this same faulting read at all, or only the replay
+                // (real-JIT-dispatch) pass did — see hw_read_fixup_recording/
+                // hw_read_fixup_replay's doc comments for what arms each.
+                #[cfg(feature = "developer")]
+                let jitcheck_pass = if self.hw_read_fixup_recording {
+                    " [jitcheck:reference]"
+                } else if self.hw_read_fixup_replay.is_some() {
+                    " [jitcheck:replay]"
+                } else {
+                    ""
+                };
+                #[cfg(not(feature = "developer"))]
+                let jitcheck_pass = "";
+                eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}{}", size*8, self.core.pc, virt_addr, phys_addr, status, jitcheck_pass, self.fault_note(phys_addr, size));
+            }
+            BusErrorOp::Write => eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", size*8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size)),
+            BusErrorOp::MaskedWrite => eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, status, self.fault_note(phys_addr, size)),
+        }
     }
 
     /// Status.TS follows a TLB write that left two entries matching. Branchless:
@@ -2535,6 +2580,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// The caller returns `BUS_OK`. Always built, so a missing device or a
     /// guest bug stays visible in every build.
     #[cold]
+    #[inline(never)]
     fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
         eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
             size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
@@ -5185,7 +5231,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             } else {
                 // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
                 if r.status != BUS_BUSY {
-                    eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}{}", virt_addr, phys_addr, r.status, self.fault_note(phys_addr, 4));
+                    self.report_bus_error(BusErrorOp::Fetch, 4, virt_addr, phys_addr, 0, 0, r.status);
                 }
                 FetchInstrResult::exception(r.status)
             }
@@ -5297,23 +5343,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         } else {
                             if r.status != BUS_BUSY {
                                 if !DEBUG {
-                                    // jitcheck tag: which pass this read happened in, so a
-                                    // divergence investigation can tell at a glance whether
-                                    // the reference (interpreter-only) pass ever reached
-                                    // this same faulting read at all, or only the replay
-                                    // (real-JIT-dispatch) pass did — see hw_read_fixup_recording/
-                                    // hw_read_fixup_replay's doc comments for what arms each.
-                                    #[cfg(feature = "developer")]
-                                    let jitcheck_pass = if self.hw_read_fixup_recording {
-                                        " [jitcheck:reference]"
-                                    } else if self.hw_read_fixup_replay.is_some() {
-                                        " [jitcheck:replay]"
-                                    } else {
-                                        ""
-                                    };
-                                    #[cfg(not(feature = "developer"))]
-                                    let jitcheck_pass = "";
-                                    eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, r.status, jitcheck_pass, self.fault_note(phys_addr, SIZE));
+                                    self.report_bus_error(BusErrorOp::Read, SIZE, virt_addr, phys_addr, 0, 0, r.status);
                                     self.core.cp0_badvaddr = virt_addr;
                                 }
                             }
@@ -5471,7 +5501,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     self.post_refused_store(virt_addr, phys_addr, SIZE, val, ws);
                     BUS_OK
                 } else {
-                    eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws, self.fault_note(phys_addr, SIZE));
+                    self.report_bus_error(BusErrorOp::Write, SIZE, virt_addr, phys_addr, val, 0, ws);
                     ws
                 }
             } else {
@@ -5534,7 +5564,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     self.post_refused_store(virt_addr, phys_addr, mask.count_ones() as usize / 8, val, ws);
                     BUS_OK
                 } else {
-                    eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, ws, self.fault_note(phys_addr, 8));
+                    self.report_bus_error(BusErrorOp::MaskedWrite, 8, virt_addr, phys_addr, val, mask, ws);
                     ws
                 }
             } else {
