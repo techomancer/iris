@@ -96,18 +96,14 @@ the banner cannot name it. `iris-bench matrix` cross-checks the guest's own
 `#machine cpu=` line, read from PRId — same guard, and for the same reason, as
 `cpu-tests/run/matrix.sh`.
 
-## A comment edit in a guest input makes the prebuilt image "stale"
+## Moving a line in a guest source changes the prebuilt image
 
-`make -C bench check-prebuilt` (CI) hashes the *files* the guest is built from —
-`bench/harness`, `bench/kernels`, `bench/golden/golden.h`, `bench/Makefile`,
-`cpu-tests/harness`, `cpu-tests/toolchain.mk` — not the code. Rewording a
-comment in `bench/Makefile` during an unrelated cleanup was enough to fail it.
-
-If the change cannot affect the image (comments, docs-only lines), don't rebuild:
-`python3 bench/prebuilt-stamp.py --write` re-records the digest against the
-existing `irisbench.elf`, and `make -C bench check-prebuilt` confirms. Commit
-`bench/prebuilt/PROVENANCE` with the edit. Anything that can change the code
-still needs the full `make -C bench prebuilt`.
+CI rebuilds `bench/prebuilt/irisbench.elf` with the pinned toolchain and fails
+on any byte difference. The image carries `-g` line tables, so an edit that only
+moves lines in a guest C or assembly file (a comment, a blank line) still changes
+the bytes, and CI asks for a rebuild. Run `make -C bench prebuilt` and commit the
+image; the code is unchanged, so no figure moves. Comments in `bench/Makefile` or
+`cpu-tests/toolchain.mk` do not reach the image.
 
 ## The compiler is part of the benchmark
 

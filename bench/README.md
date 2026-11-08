@@ -265,12 +265,10 @@ script, the compiler flags — and commit it alongside the source change, built
 with the one pinned compiler (`cpu-tests/docs/toolchain.md`): the compiler
 decides how much guest code each kernel runs, so an image from another one is a
 different benchmark.
-`make -C bench check-prebuilt` — which CI runs — fails if the guest sources have
-moved since the image was last refreshed, because this is a build product that
-drifts dangerously: accuracy is scored against golden checksums compiled *into*
-the image, so a stale image against fresh goldens reports failures to users that
-are not real. It compares a digest of the *sources*, not the image bytes:
-`bench/prebuilt-stamp.py` explains why byte comparison cannot work.
+CI rebuilds the image and fails on any byte difference, and
+`make -C bench check-prebuilt` reads its compiler out of the debug information
+and fails if it is not the pinned one; see
+[prebuilt/README.md](prebuilt/README.md).
 
 ---
 

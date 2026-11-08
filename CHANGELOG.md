@@ -16,6 +16,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Benchmark and test suites: one pinned compiler
 
 - One pinned compiler, Fedora 45's GCC 16.2.1 for MIPS, builds the `cpu-tests` and `bench` guest binaries, in a container (`cpu-tests/docs/toolchain.md`). Builds are reproducible: debug information no longer records the checkout's path. `make -C cpu-tests toolchain-local` is gone.
+- The embedded benchmark image is built with GCC 16.2.1 again. Since 6adc7927 it had been built with GCC 14.2, and benchmark results recorded on images built in between are not comparable with results from before or after. CI rebuilds the image in the container and fails on any byte difference, replacing the digest of the guest sources.
 - The compiler changes the benchmark: GCC 14.2 runs Dhrystone in 428 guest instructions per iteration where GCC 16.2.1 needs 313, so results from images built by different compilers are not comparable.
 
 ### cpu-tests: results judged by test name
