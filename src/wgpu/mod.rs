@@ -53,6 +53,13 @@ pub mod library {
     pub const I64: Fragment = Fragment::new("i64.wgsl", include_str!("shaders/i64.wgsl"));
     /// A correctly rounded f32 division (`shaders/float.wgsl`).
     pub const FLOAT: Fragment = Fragment::new("float.wgsl", include_str!("shaders/float.wgsl"));
+    /// 64- and 128-bit integer products and shifts (`shaders/wide.wgsl`;
+    /// includes `I64`).
+    pub const WIDE: Fragment = Fragment::new("wide.wgsl", include_str!("shaders/wide.wgsl"));
+    /// IEEE double add, subtract, multiply, floor and ceil on integer
+    /// halves, rounded as the host rounds (`shaders/f64.wgsl`; includes
+    /// `WIDE`).
+    pub const F64: Fragment = Fragment::new("f64.wgsl", include_str!("shaders/f64.wgsl"));
 }
 
 pub use batch::{ArchShaders, Batch, BatchPipelines, Full};
