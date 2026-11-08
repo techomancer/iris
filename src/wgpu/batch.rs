@@ -146,6 +146,90 @@ struct BatchSet {
     done: Arc<AtomicBool>,
 }
 
+/// GPU time per batch, measured with timestamp queries when
+/// `WGPU_BATCH_TIMING` is set (and the device has them). Each flush then
+/// waits for its batch, so CPU and GPU no longer overlap: the GPU figures
+/// are true, the wall time is not.
+pub struct Timing {
+    queries: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: wgpu::Buffer,
+    period_ns: f64,
+    pub batches: u64,
+    pub prims: u64,
+    pub bin_ns: f64,
+    pub raster_ns: f64,
+    /// Busy tiles, summed over batches, and the most in one.
+    pub tiles: u64,
+    pub tiles_max: u32,
+    /// Batches by raster time: under 0.1, 0.3, 1, 3, 10 ms and over.
+    pub raster_hist: [u64; 6],
+}
+
+impl Timing {
+    fn new(gpu: &Gpu) -> Option<Timing> {
+        if std::env::var("WGPU_BATCH_TIMING").is_err() || !gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("batch timing"), ty: wgpu::QueryType::Timestamp, count: 4 });
+        let resolve = gpu.buffer("batch timing resolve", 32, wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
+        let read = gpu.buffer("batch timing read", 48, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        let period_ns = gpu.queue.get_timestamp_period() as f64;
+        Some(Timing { queries, resolve, read, period_ns, batches: 0, prims: 0, bin_ns: 0.0, raster_ns: 0.0, tiles: 0, tiles_max: 0, raster_hist: [0; 6] })
+    }
+
+    fn writes(&self, first: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        Some(wgpu::ComputePassTimestampWrites { query_set: &self.queries, beginning_of_pass_write_index: Some(first), end_of_pass_write_index: Some(first + 1) })
+    }
+
+    /// Wait for the batch and add up its times and busy tiles.
+    fn take(&mut self, gpu: &Gpu, submission: wgpu::SubmissionIndex, prims: usize) {
+        let slice = self.read.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if gpu.wait(Some(submission)).is_err() {
+            return;
+        }
+        let _ = gpu.wait(None);
+        let (t, busy) = {
+            let Ok(v) = slice.get_mapped_range() else {
+                self.read.unmap();
+                return;
+            };
+            let t: [u64; 4] = bytemuck::pod_read_unaligned(&v[0..32]);
+            let busy: u32 = bytemuck::pod_read_unaligned(&v[32..36]);
+            (t, busy)
+        };
+        self.read.unmap();
+        let ns = |a: u64, b: u64| b.saturating_sub(a) as f64 * self.period_ns;
+        let raster = ns(t[2], t[3]);
+        self.batches += 1;
+        self.prims += prims as u64;
+        self.bin_ns += ns(t[0], t[1]);
+        self.raster_ns += raster;
+        self.tiles += busy as u64;
+        self.tiles_max = self.tiles_max.max(busy);
+        let ms = raster / 1e6;
+        let i = [0.1, 0.3, 1.0, 3.0, 10.0].iter().position(|&l| ms < l).unwrap_or(5);
+        self.raster_hist[i] += 1;
+    }
+
+    /// One line: the totals and the averages per batch.
+    pub fn report(&self) -> String {
+        let n = self.batches.max(1) as f64;
+        format!(
+            "gpu timing: {} batches, {:.1} prims/batch, bin {:.3} s, raster {:.3} s ({:.3} ms/batch), busy tiles {:.0}/batch (max {}), raster ms <0.1/<0.3/<1/<3/<10/more: {:?}",
+            self.batches,
+            self.prims as f64 / n,
+            self.bin_ns / 1e9,
+            self.raster_ns / 1e9,
+            self.raster_ns / 1e6 / n,
+            self.tiles as f64 / n,
+            self.tiles_max,
+            self.raster_hist
+        )
+    }
+}
+
 /// Sets made with the batch: enough for the submissions a running board
 /// keeps in flight. More are added, and kept, when all are busy.
 const BATCH_SETS: usize = 4;
@@ -176,6 +260,8 @@ pub struct Batch<R: Pod, S: Pod> {
     pub flushes: u64,
     /// Primitives drawn so far.
     pub prims_total: u64,
+    /// GPU times, with WGPU_BATCH_TIMING.
+    pub timing: Option<Timing>,
     _p: PhantomData<(R, S)>,
 }
 
@@ -185,7 +271,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         let tiles = grid.tiles().max(1);
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let masks_buf = gpu.buffer("batch masks", tiles as u64 * MASK_WORDS as u64 * 4, storage);
-        let busy_buf = gpu.buffer("batch busy", 16 + tiles as u64 * 4, storage);
+        let busy_buf = gpu.buffer("batch busy", 16 + tiles as u64 * 4, storage | wgpu::BufferUsages::COPY_SRC);
         let args_buf = gpu.buffer("batch dispatch args", 16, storage | wgpu::BufferUsages::INDIRECT);
         let flags_buf = gpu.buffer("batch flags", tiles as u64 * 4, storage);
         let mut b = Batch {
@@ -205,6 +291,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             last_set: 0,
             flushes: 0,
             prims_total: 0,
+            timing: Timing::new(gpu),
             _p: PhantomData,
         };
         for _ in 0..BATCH_SETS {
@@ -372,7 +459,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
 
         let mut enc = self.gpu.encoder("batch");
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bin"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bin"), timestamp_writes: self.timing.as_ref().and_then(|t| t.writes(0)) });
             pass.set_pipeline(&pipelines.bin);
             pass.set_bind_group(0, &set.bin_group, &[]);
             pass.set_bind_group(1, &set.records_group, &[]);
@@ -382,7 +469,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             pass.dispatch_workgroups(self.records.len() as u32, 1, 1);
         }
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("raster"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("raster"), timestamp_writes: self.timing.as_ref().and_then(|t| t.writes(2)) });
             pass.set_pipeline(&pipelines.raster);
             pass.set_bind_group(0, &set.batch_group, &[]);
             pass.set_bind_group(1, &set.records_group, &[]);
@@ -391,8 +478,16 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             }
             pass.dispatch_workgroups_indirect(&self.args_buf, 0);
         }
+        if let Some(t) = &self.timing {
+            enc.resolve_query_set(&t.queries, 0..4, &t.resolve, 0);
+            enc.copy_buffer_to_buffer(&t.resolve, 0, &t.read, 0, 32);
+            enc.copy_buffer_to_buffer(&self.busy_buf, 0, &t.read, 32, 16);
+        }
         set.done.store(false, Ordering::Release);
         let submission = self.gpu.submit(enc);
+        if let Some(t) = &mut self.timing {
+            t.take(&self.gpu, submission.clone(), self.records.len());
+        }
         let done = Arc::clone(&set.done);
         self.gpu.on_done(move || done.store(true, Ordering::Release));
         self.flushes += 1;
