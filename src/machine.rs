@@ -800,33 +800,21 @@ impl Machine {
         mc.set_cpu(Arc::downgrade(&cpu_device));
         ioc.set_interrupts(cpu.interrupts_ptr());
 
-        // ppmem: hand the CPU's inline bitmap field to the memory space, so a
-        // MEMCFG remap publishes straight into the object the CPU executes out
-        // of. Safe per `set_bitmap_sink`: the executor is at its final address
-        // by now and the only writer is this same CPU thread's MEMCFG path.
+        // ppmem: the CPU's cache and the JIT read RAM through a cached view of
+        // the window that is the CPU's own, so what the cache holds stays out
+        // of every other master's sight (`PpMemSpace::add_cached_view`). Its
+        // bitmap is published straight into the CPU's inline fields, the
+        // executor's and the cache's, which are at their final addresses by
+        // now; the only writer is this CPU thread's MEMCFG path. A cache with
+        // no bitmap field (the full cache without tcache) returns null, which
+        // the view skips. Physical's direct paths keep the shared window.
         {
             use crate::ppmem::MappedMemory;
             if let Some(sp) = phys.ppmem_space() {
-                unsafe { sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr()) };
-            }
-            // Point Physical's cached bitmap at the CPU's field too, or its
-            // direct-access fast path would keep reading the sink the space
-            // just abandoned.
-            phys.resync_ppmem_bitmap();
-            // The cache reads RAM straight out of the same window: the full
-            // cache under tcache, the shadow cache always. A cache that does
-            // not (the full cache without tcache) has no bitmap field and
-            // returns null. Must come after set_bitmap_sink, so it captures
-            // the CPU's inline field rather than the sink the space just
-            // abandoned.
-            if let Some(sp) = phys.ppmem_space() {
-                unsafe { cpu.set_tcache_window(sp.window_base()) };
-                // The cache keeps the bitmap inline; ppmem publishes into it
-                // directly on every remap, so the hot path needs no indirection.
-                let bitmap = cpu.tcache_bitmap_ptr();
-                if !bitmap.is_null() {
-                    unsafe { sp.set_bitmap_sink2(bitmap) };
-                }
+                let v = sp
+                    .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
+                    .expect("ppmem: the CPU's cached view");
+                unsafe { cpu.set_tcache_window(sp.view_base(v)) };
                 // Window writes bypass BusDevice, so the cache needs the gen
                 // window to bump page counters itself — otherwise jitv2 keeps
                 // running compiled code for pages the guest has modified.

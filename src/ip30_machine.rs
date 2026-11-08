@@ -449,33 +449,24 @@ impl OctaneMachine {
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(g.mgras().clone())));
         }
 
-        // The shadow cache and the JIT read RAM straight from the ppmem
-        // window; descriptor writes lay it out again on the CPU thread.
+        // The shadow cache and the JIT read RAM through a cached view of the
+        // ppmem window, one per CPU; descriptor writes lay the window and
+        // every view out again on the CPU thread.
         if let Some(sp) = phys.phys.ppmem_space() {
-            use crate::ppmem::MappedMemory;
-            unsafe {
-                sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-                cpu.set_tcache_window(sp.window_base());
-                cpu.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
-                let bitmap = cpu.tcache_bitmap_ptr();
-                if !bitmap.is_null() {
-                    sp.set_bitmap_sink2(bitmap);
-                }
-                #[cfg(feature = "jitv2")]
-                cpu.set_tcache_gen_window(sp.gen_window_base());
-                for c in cpus.iter().skip(1) {
-                    sp.add_bitmap_sink(c.ppmem_bitmap_ptr());
-                    c.set_tcache_window(sp.window_base());
+            for c in cpus.iter() {
+                let v = sp
+                    .add_cached_view(&[c.ppmem_bitmap_ptr(), c.tcache_bitmap_ptr()])
+                    .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
+                unsafe {
+                    c.set_tcache_window(sp.view_base(v));
                     c.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
-                    let bitmap = c.tcache_bitmap_ptr();
-                    if !bitmap.is_null() {
-                        sp.add_bitmap_sink(bitmap);
-                    }
                     #[cfg(feature = "jitv2")]
-                    c.set_tcache_gen_window(sp.gen_window_base());
+                    {
+                        use crate::ppmem::MappedMemory;
+                        c.set_tcache_gen_window(sp.gen_window_base());
+                    }
                 }
             }
-            phys.phys.resync_ppmem_bitmap();
         }
         // Publish the descriptors as they stand into the sinks just set.
         ram.set_memcfg(heart.memcfg());
