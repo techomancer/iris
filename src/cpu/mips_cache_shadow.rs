@@ -30,6 +30,18 @@
 //! The shadow is deliberately not consulted by `read`/`write`/`fetch`. If it
 //! ever needs to be, this type is the wrong shape and should say so loudly
 //! rather than growing a slow path.
+//!
+//! The R10000-family PROMs use the caches as memory before memory works: they
+//! make lines valid with Index Store Tag and Index Store Data and keep a stack
+//! or run code in them, while the uncached path sees memory (NEC VR10000
+//! user's manual p. 75). Such a line lives in ppmem's window rather than
+//! here: the window this cache reads is the CPU's own cached view
+//! (`PpMemSpace::add_cached_view`), and a valid line makes its page private
+//! memory in that view, holding the line's bytes
+//! ([`ShadowCache::line_enters`]). Loads, stores and fetches read the view as
+//! they always did. The CACHE instruction is the only thing that moves a page
+//! in or out, and the tags stay the only record of which lines are valid.
+//! `clanker/cpu/cache-lines-live-in-the-cpus-view.md` has the limits.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -38,6 +50,7 @@ use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
     C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
+use crate::ppmem::PpMemSpace;
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 
@@ -63,11 +76,15 @@ struct Shadow {
     /// — see `MRU_BIT`. Hardware state rather than tag storage, which is why
     /// it is kept here and re-applied on read instead of living in `tags`.
     mru: Box<[bool]>,
+    /// The line holds its page in the CPU's cached view
+    /// (`ShadowCache::line_enters`).
+    held: Box<[bool]>,
 }
 
 impl Shadow {
     fn new(lines: usize, data_words: usize) -> Self {
         Self {
+            held: vec![false; lines.max(1)].into_boxed_slice(),
             tags: vec![0u64; lines.max(1)].into_boxed_slice(),
             data: vec![0u64; data_words].into_boxed_slice(),
             ecc: vec![0u32; data_words].into_boxed_slice(),
@@ -86,6 +103,13 @@ impl Shadow {
 /// there. Storing "which way is MRU" and reporting it only on that way passes
 /// nothing, because the way that is read is never the way that was written.
 const MRU_BIT: u64 = 1 << 63;
+
+/// R10000-family tag states (NEC U10278EJ3V0UM pp. 285-287): the primary data
+/// state in TagLo[7:6] and the secondary state in TagLo[11:10], 0 Invalid.
+const PD_STATE_SHIFT: u32 = 6;
+const SD_STATE_SHIFT: u32 = 10;
+
+
 
 /// R10000 only: ways per set, as CACHE index operations address them. Bit 0
 /// of the index selects the way; the set starts above the line offset. The
@@ -156,6 +180,10 @@ pub struct ShadowCache<
     decode: UnsafeCell<crate::cpu::decode_cache::DecodeCache>,
     /// See [`MipsCache::set_pd_tag_store_hook`]. Consulted by `cache_op` only.
     pd_tag_hook: UnsafeCell<Option<Box<dyn Fn(u32) + Send + Sync>>>,
+    /// The cached view `tc_base` is, and its number in `PpMemSpace`: where
+    /// valid lines hold their pages. Null without one.
+    view_space: UnsafeCell<*const PpMemSpace>,
+    view: UnsafeCell<usize>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -213,6 +241,8 @@ impl<
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
             pd_tag_hook: UnsafeCell::new(None),
+            view_space: UnsafeCell::new(std::ptr::null()),
+            view: UnsafeCell::new(0),
         }
     }
 
@@ -340,6 +370,155 @@ impl<
             crate::dlog!(LogModule::L2c, "shadow:   -> ISD slot={slot} data={phys_addr:#018x} ecc={:#x}",
                          s.ecc[slot]);
         }
+        if s.held.get(self.tag_slot(sel, virt_addr)) == Some(&true) {
+            self.store_into_held_line(sel, virt_addr, phys_addr);
+        }
+    }
+
+    // ---- valid lines hold pages in the CPU's cached view ----
+
+    fn view_space(&self) -> Option<&PpMemSpace> {
+        unsafe { (*self.view_space.get()).as_ref() }
+    }
+
+    fn view_no(&self) -> usize {
+        unsafe { *self.view.get() }
+    }
+
+    /// The physical address and length of the line `tag` names, if it is
+    /// valid. `va` is an index operand naming the line's slot: the primary
+    /// caches take PA[11:5] or PA[11:6] from it, the secondary PA[17:7] (NEC
+    /// U10278EJ3V0UM pp. 285-287; the tag holds the rest). The R5000's
+    /// primary data tag has the same PTag and PState fields (NEC
+    /// U11761EJ6V0UM p. 133).
+    fn line_of(&self, sel: u32, tag: u64, va: u64) -> Option<(u64, usize)> {
+        let pa_hi = ((tag >> 32) & 0xf) << 36;
+        match sel {
+            CACH_PD if DC_LINE != 0 && (tag >> PD_STATE_SHIFT) & 3 != 0 => {
+                Some((pa_hi | ((tag >> 8) & 0xff_ffff) << 12 | (va & 0xfff & !(DC_LINE as u64 - 1)), DC_LINE))
+            }
+            CACH_SD if L2_LINE != 0 && (tag >> SD_STATE_SHIFT) & 3 != 0 => {
+                Some((pa_hi | ((tag >> 14) & 0x3_ffff) << 18 | (va & 0x3_ffff & !(L2_LINE as u64 - 1)), L2_LINE))
+            }
+            _ => None,
+        }
+    }
+
+    /// An index operand that names slot `i` of `sel`: `tag_slot`'s inverse.
+    fn slot_va(&self, sel: u32, i: usize) -> u64 {
+        let line = match sel { CACH_PI => IC_LINE, CACH_PD => DC_LINE, _ => L2_LINE };
+        if Self::R5K && matches!(sel, CACH_PI | CACH_PD) {
+            let sets = if sel == CACH_PI { Self::IC_LINES } else { Self::DC_LINES } / 2;
+            return ((i / sets) << 14 | (i % sets) * line) as u64;
+        }
+        ((i / WAYS) * line + (i % WAYS)) as u64
+    }
+
+    /// A CACHE instruction changed slot `idx` of `sel`'s tag from `old` to
+    /// `new`; `va` is the operand that named it. A held line that stops being
+    /// valid, or moves, gives its page back; one that becomes valid takes one.
+    /// The tags stay the only record of which lines are valid.
+    #[cold]
+    #[inline(never)]
+    fn tag_changes(&self, sel: u32, idx: usize, va: u64, old: u64, new: u64) {
+        let Some(sp) = self.view_space() else { return };
+        let now = self.line_of(sel, new, va);
+        if self.shadow(sel).held[idx] {
+            let was = self.line_of(sel, old, va).expect("a held line is valid");
+            if now == Some(was) {
+                return; // the state changed, not the line
+            }
+            self.line_leaves(sp, sel, idx, was);
+        }
+        if let Some(line) = now {
+            self.line_enters(sp, sel, idx, va, line);
+        }
+    }
+
+    /// Slot `idx` of `sel` holds a valid line for `[pa, pa + len)`: its page
+    /// becomes private in the CPU's view and the line's bytes are written
+    /// into it from the data array, since Index Store Tag writes the tag
+    /// alone (NEC VR5000/VR10000 instruction manual pp. 24-25). A line with
+    /// no memory behind it holds no page and stays in the arrays, as every
+    /// line did before.
+    fn line_enters(&self, sp: &PpMemSpace, sel: u32, idx: usize, va: u64, (pa, len): (u64, usize)) {
+        let Some(new) = sp.hold_line_page(self.view_no(), pa) else { return };
+        let base = unsafe { *self.tc_base.get() };
+        if l2_op_log(CACHE_LOG_OP) {
+            crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} holds its page (new: {new})");
+        }
+        let s = self.shadow(sel);
+        s.held[idx] = true;
+        if s.data.is_empty() {
+            return; // the R5000 has no Index Store Data: the page starts as memory
+        }
+        let (way, first) = (va & 1, va & !(len as u64 - 1));
+        let unit = if sel == CACH_SD { 8 } else { 4 };
+        for k in 0..len / unit {
+            let word = s.data[self.data_slot(sel, s.data.len(), first + (unit * k) as u64 + way)];
+            let at = pa + (unit * k) as u64;
+            match sel {
+                CACH_PD => unsafe { *(base.add(at as usize) as *mut u32) = word as u32 },
+                // TagHi is the doubleword's high word and TagLo its low word
+                // (MIPS R10000 UM p. 201; NEC VR10000 UM p. 289, Fig. 13-33).
+                // Neither manual says which address each word belongs to.
+                // TagLo at the lower address is inferred from shipped PROMs:
+                // PROM 6.210 stages code pairs with the word at A in TagLo
+                // and the one at A + 4 in TagHi, and its staged code equals
+                // its image only this way, as does the IP35 boot-flash
+                // PROM's staging. The window keeps a doubleword's words in
+                // address order, low half first, so this is the data as is.
+                _ => unsafe { *(base.add(at as usize) as *mut u64) = word },
+            }
+        }
+    }
+
+    /// The line in slot `idx` of `sel` leaves, unwritten, as Index Store Tag
+    /// leaves it. With the page's last line the view shows memory there
+    /// again. Until then the line's bytes stay in the page.
+    fn line_leaves(&self, sp: &PpMemSpace, sel: u32, idx: usize, (pa, len): (u64, usize)) {
+        let s = self.shadow(sel);
+        s.held[idx] = false;
+        let gone = sp.release_line_page(self.view_no(), pa);
+        if l2_op_log(CACHE_LOG_OP) {
+            crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} leaves (page released: {gone})");
+        }
+    }
+
+    /// Index Store Data into a held line writes through to its page, so the
+    /// next cached access sees it. Same quadword rule as the data array.
+    fn store_into_held_line(&self, sel: u32, va: u64, value: u64) {
+        let idx = self.tag_slot(sel, va);
+        let Some((pa, len)) = self.line_of(sel, self.shadow(sel).tags[idx], va) else { return };
+        let unit = if sel == CACH_SD { 8 } else { 4 };
+        let at = pa + (va & (len as u64 - 1) & !(unit - 1));
+        let base = unsafe { *self.tc_base.get() };
+        match sel {
+            CACH_PD => unsafe { *(base.add(at as usize) as *mut u32) = value as u32 },
+            _ => unsafe {
+                *(base.add(at as usize) as *mut u64) = value;
+                *(base.add((at ^ 8) as usize) as *mut u64) = 0;
+            },
+        }
+    }
+
+    /// How many lines hold pages.
+    fn held_count(&self) -> usize {
+        [CACH_PD, CACH_SD].iter().map(|&sel| self.shadow(sel).held.iter().filter(|&&h| h).count()).sum()
+    }
+
+    /// Every held line goes, with no writeback: power-on, or a snapshot
+    /// restore.
+    fn drop_held_lines(&self) {
+        let Some(sp) = self.view_space() else { return };
+        for sel in [CACH_PD, CACH_SD] {
+            for i in 0..self.shadow(sel).held.len() {
+                if self.shadow(sel).held[i] {
+                    let line = self.line_of(sel, self.shadow(sel).tags[i], self.slot_va(sel, i)).expect("a held line is valid");
+                    self.line_leaves(sp, sel, i, line);
+                }
+            }
+        }
     }
 }
 
@@ -419,6 +598,21 @@ impl<
 
     fn set_pd_tag_store_hook(&self, hook: Box<dyn Fn(u32) + Send + Sync>) {
         unsafe { *self.pd_tag_hook.get() = Some(hook) };
+    }
+
+    unsafe fn set_cached_view(&self, sp: *const PpMemSpace, view: usize) {
+        unsafe {
+            *self.view_space.get() = sp;
+            *self.view.get() = view;
+        }
+    }
+
+    /// `l2 probe`: the lines holding pages in the CPU's cached view.
+    fn debug_probe(&self, _cache_name: &str, _virt_addr: u64, _phys_addr: u64) -> String {
+        let pages = self.view_space().map(|sp| sp.held_line_pages(self.view_no())).unwrap_or_default();
+        let list: Vec<String> = pages.iter().map(|p| format!("{p:#x}")).collect();
+        format!("shadow: {} valid lines hold {} pages in the cached view [{}]",
+                self.held_count(), pages.len(), list.join(" "))
     }
 
     /// Tags only: a fetch reads memory through the decode cache and changes
@@ -589,7 +783,13 @@ impl<
             let idx = self.tag_slot(sel, virt_addr);
             let s = self.shadow(sel);
             if op == C_IST {
-                s.tags[idx] = r4k_store_taglo(Self::R5K, sel, phys_addr as u32) as u64;
+                let old = std::mem::replace(&mut s.tags[idx], r4k_store_taglo(Self::R5K, sel, phys_addr as u32) as u64);
+                // The O2's POST keeps its stack in R5000 primary data lines
+                // as it does in R10000 ones. An instruction line, with no
+                // Index Store Data to fill it, could hold only memory.
+                if Self::R5K && sel == CACH_PD && old != s.tags[idx] {
+                    self.tag_changes(sel, idx, virt_addr, old, s.tags[idx]);
+                }
                 return 0;
             }
             return r4k_load_taglo(Self::R5K, sel, s.tags[idx] as u32) as u64;
@@ -619,7 +819,11 @@ impl<
                     // here destroyed real tag bits.
                     let set = (idx / WAYS).min(s.mru.len() - 1);
                     s.mru[set] = phys_addr & MRU_BIT != 0;
+                    let old = s.tags[idx];
                     s.tags[idx] = phys_addr & mask & !MRU_BIT;
+                    if Self::R10K && matches!(sel, CACH_PD | CACH_SD) && old != s.tags[idx] {
+                        self.tag_changes(sel, idx, virt_addr, old, s.tags[idx]);
+                    }
                 }
                 0
             }
@@ -666,7 +870,8 @@ impl<
                 let idx = self.tag_slot(sel, virt_addr);
                 let s = self.shadow(sel);
                 if idx < s.tags.len() {
-                    s.tags[idx] = 0;
+                    let old = std::mem::take(&mut s.tags[idx]);
+                    self.tag_changes(sel, idx, virt_addr, old, 0);
                 }
                 0
             }
@@ -680,6 +885,7 @@ impl<
     /// Power-on: tags read back invalid, and nothing decoded survives — RAM
     /// may be reloaded without a write counter moving.
     fn power_on(&self) {
+        self.drop_held_lines();
         for sel in [CACH_PI, CACH_PD, CACH_SD] {
             let s = self.shadow(sel);
             s.tags.fill(0);
@@ -688,10 +894,27 @@ impl<
         unsafe { (*self.decode.get()).flush() };
     }
 
-    /// A restore replaces RAM wholesale; drop every decoded instruction. The
-    /// shadow arrays are not snapshotted (nothing reads them but diagnostics).
-    fn load_cache_state(&self, _v: &toml::Value) -> Result<(), String> {
+    /// The shadow arrays are not snapshotted (nothing reads them but
+    /// diagnostics). Lines holding pages are, as a count: a PROM's cache
+    /// phase is the only time any are held, and a snapshot of it would
+    /// restore without them, so it is refused.
+    fn save_cache_state(&self) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        let n = self.held_count();
+        if n > 0 {
+            t.insert("held_lines".into(), toml::Value::Integer(n as i64));
+        }
+        toml::Value::Table(t)
+    }
+
+    /// A restore replaces RAM wholesale; drop every decoded instruction and
+    /// every held line.
+    fn load_cache_state(&self, v: &toml::Value) -> Result<(), String> {
+        if let Some(n) = crate::snapshot::get_field(v, "held_lines") {
+            return Err(format!("cache: the snapshot was taken with {n} cache lines holding memory, which it does not carry"));
+        }
         unsafe { (*self.decode.get()).flush() };
+        self.drop_held_lines();
         Ok(())
     }
 
@@ -1143,5 +1366,255 @@ mod tests {
         let g = c.jit_dc_geometry();
         assert!(g.supported && g.tagless && !g.has_l2,
             "tagless, and no L2 decode slots for a store to invalidate: {g:?}");
+    }
+
+    // ---- valid lines hold pages in the CPU's cached view ----
+
+    use crate::ppmem::{MappedMemory, PpMemory};
+
+    /// A cache reading memory through a cached view of a fresh window, with
+    /// a 64 MB bank mapped at 0. Its bus is the bank itself: memory as the
+    /// uncached path sees it. Boxed: the view publishes into the cache's
+    /// inline bitmap field.
+    fn windowed() -> (Box<R10000ShadowCache>, Box<PpMemSpace>, Arc<PpMemory>) {
+        let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let space = Box::new(space);
+        let bank = Arc::new(banks.remove(0));
+        let c = Box::new(R10000ShadowCache::from(bank.clone() as Arc<dyn BusDevice>));
+        attach(&c, &space);
+        space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+        (c, space, bank)
+    }
+
+    fn attach(c: &R10000ShadowCache, space: &PpMemSpace) -> usize {
+        let v = space.add_cached_view(&[c.tcache_bitmap_ptr()]).unwrap();
+        unsafe {
+            c.set_tcache_window(space.view_base(v));
+            c.set_cached_view(space, v);
+        }
+        v
+    }
+
+    /// TagLo of a DirtyExclusive primary data line for `pa`'s page.
+    fn pd_dirty(pa: u64) -> u64 { (pa >> 12) << 8 | 3 << PD_STATE_SHIFT }
+
+    /// TagLo of a secondary line for `pa` in `state`.
+    fn sd_tag(pa: u64, state: u64) -> u64 { (pa >> 18) << 14 | state << SD_STATE_SHIFT }
+
+    /// The O2's POST: a valid tag for page 0, the page tested uncached while
+    /// the cached side keeps its stack, and an invalid tag that drops the
+    /// line without a writeback.
+    #[test]
+    fn a_valid_line_gives_the_cached_side_its_own_page() {
+        let (c, space, bank) = windowed();
+        bank.write32(0x40, 0x1111_1111);
+        c.cache_op(C_R10K_ISD | CACH_PD, 0x8000_0040, 0x1111_1111);
+        c.cache_op(C_IST | CACH_PD, 0x8000_0040, pd_dirty(0));
+        assert_eq!(space.held_line_pages(0), vec![0]);
+        assert_eq!(c.read::<4>(0, 0x40).data, 0x1111_1111);
+        c.write::<4>(0, 0x40, 0x2222_2222);
+        bank.write32(0x40, 0x3333_3333);
+        assert_eq!(c.read::<4>(0, 0x40).data, 0x2222_2222, "cached: the line");
+        assert_eq!(bank.read32(0x40).data, 0x3333_3333, "uncached: memory");
+        c.cache_op(C_IST | CACH_PD, 0x8000_0040, 0);
+        assert!(space.held_line_pages(0).is_empty());
+        assert_eq!(c.read::<4>(0, 0x40).data, 0x3333_3333, "dropped, not written back");
+    }
+
+    /// Index Store Tag writes the tag alone, so the line holds what Index
+    /// Store Data put in the data array before, and Index Store Data after
+    /// writes through. Index Load Data reads the array.
+    #[test]
+    fn a_line_holds_its_data_array_and_takes_later_stores() {
+        let (c, _space, bank) = windowed();
+        bank.write32(0x2004, 0x5555_5555);
+        c.cache_op(C_R10K_ISD | CACH_PD, 0x8000_0004, 0xdead_beef);
+        c.cache_op(C_IST | CACH_PD, 0x8000_0000, pd_dirty(0x2000));
+        assert_eq!(c.read::<4>(0, 0x2004).data, 0xdead_beef);
+        c.cache_op(C_R10K_ISD | CACH_PD, 0x8000_000c, 0x0123_4567);
+        assert_eq!(c.read::<4>(0, 0x200c).data, 0x0123_4567);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PD, 0x8000_000c, 0), 0x0123_4567);
+        assert_eq!(bank.read32(0x2004).data, 0x5555_5555, "memory never saw the line");
+    }
+
+    /// A secondary line takes a doubleword at a time with TagLo at the lower
+    /// address. That is how the shipped PROMs stage code: the instruction at
+    /// A in TagLo and the one at A + 4 in TagHi, then Index Store Data (S),
+    /// and cached accesses see them in that order. Index Store Data (S) also
+    /// zeroes the other doubleword of its quadword (R10000 UM p. 202).
+    #[test]
+    fn a_secondary_line_runs_code_staged_the_way_the_proms_stage_it() {
+        let (c, space, _bank) = windowed();
+        let (at_a, at_a4) = (0x2404_0002u64, 0x03e0_0008u64); // addiu $4,$0,2; jr $31
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3008, at_a4 << 32 | at_a);
+        c.cache_op(C_IST | CACH_SD, 0x8000_3000, sd_tag(0x3000, 2));
+        assert_eq!(space.held_line_pages(0), vec![0x3000]);
+        assert_eq!(c.read::<4>(0, 0x3008).data, at_a, "the word at A");
+        assert_eq!(c.read::<4>(0, 0x300c).data, at_a4, "the word at A + 4");
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3000, 0x9999);
+        assert_eq!(c.read::<8>(0, 0x3000).data, 0x9999 << 32);
+        assert_eq!(c.read::<8>(0, 0x3008).data, 0, "the partner doubleword is zeroed");
+    }
+
+    /// A tag test's patterns name no memory: they hold nothing, and stay
+    /// in the arrays as before.
+    #[test]
+    fn a_line_with_no_memory_behind_holds_no_page() {
+        let (c, space, _bank) = windowed();
+        c.cache_op(C_IST | CACH_SD, 0x8000_0000, sd_tag(0x55_5554_0000, 3) | 0x5);
+        c.cache_op(C_IST | CACH_PD, 0x8000_0000, pd_dirty(0x8000_0000));
+        assert!(space.held_line_pages(0).is_empty());
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0x8000_0000, 0) & 0xffff_ffff, (sd_tag(0x55_5554_0000, 3) | 0x5) & 0xffff_ffff);
+    }
+
+    /// The R4400 PROMs keep nothing in their caches: a valid tag there holds
+    /// no page, and none of this runs for them.
+    #[test]
+    fn an_r4400_tag_holds_nothing() {
+        let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let bank = Arc::new(banks.remove(0));
+        let c = Box::new(R4400ShadowCache::from(bank as Arc<dyn BusDevice>));
+        let v = space.add_cached_view(&[c.tcache_bitmap_ptr()]).unwrap();
+        unsafe {
+            c.set_tcache_window(space.view_base(v));
+            c.set_cached_view(&space, v);
+        }
+        space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+        c.cache_op(C_IST | CACH_PD, 0x8000_2000, 0x2 << 8 | 3 << 6);
+        c.cache_op(C_IST | CACH_SD, 0x8000_2000, 0x1 << 13 | 5 << 10);
+        assert!(space.held_line_pages(v).is_empty());
+    }
+
+    /// An R5000 cache on a cached view of a fresh window with a 64 MB bank
+    /// at 0, as `windowed` builds an R10000 one.
+    fn r5000_windowed() -> (Box<R5000ShadowCache>, Box<PpMemSpace>, Arc<PpMemory>) {
+        let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let space = Box::new(space);
+        let bank = Arc::new(banks.remove(0));
+        let c = Box::new(R5000ShadowCache::from(bank.clone() as Arc<dyn BusDevice>));
+        let v = space.add_cached_view(&[c.tcache_bitmap_ptr()]).unwrap();
+        unsafe {
+            c.set_tcache_window(space.view_base(v));
+            c.set_cached_view(&*space, v);
+        }
+        space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+        (c, space, bank)
+    }
+
+    /// The O2's POST on the R5000, as the shipped PROM runs it on iris:
+    /// Index Store Tag (D) with TagLo 0xc0 (page 0, Valid) at every index of
+    /// 0x8000_0000..=0x8000_1000, the stack stored cached, page 0 tested
+    /// uncached, then an invalid tag at each index. The cached side keeps
+    /// the stack until the last line goes, which drops it unwritten. The
+    /// R5000 has no Index Store Data, so the page starts as memory.
+    #[test]
+    fn an_r5000_primary_data_line_gives_the_cached_side_its_own_page() {
+        let (c, space, bank) = r5000_windowed();
+        bank.write32(0xff4, 0x1111_1111);
+        for va in (0x8000_0000..=0x8000_1000u64).step_by(32) {
+            c.cache_op(C_IST | CACH_PD, va, 0xc0);
+        }
+        assert_eq!(space.held_line_pages(0), vec![0]);
+        assert_eq!(c.read::<4>(0, 0xff4).data, 0x1111_1111, "the page starts as memory");
+        c.write::<4>(0, 0xff4, 0xbfc0_4400);
+        bank.write32(0xff4, 0xa000_0ff0);
+        assert_eq!(c.read::<4>(0, 0xff4).data, 0xbfc0_4400, "cached: the stack");
+        assert_eq!(bank.read32(0xff4).data, 0xa000_0ff0, "uncached: the memory test");
+        assert_eq!(c.cache_op(C_ILT | CACH_PD, 0x8000_0fe0, 0) & 0xc0, 0xc0, "the tag reads back");
+        for va in (0x8000_0020..=0x8000_1000u64).step_by(32) {
+            c.cache_op(C_IST | CACH_PD, va, 0);
+        }
+        assert_eq!(space.held_line_pages(0), vec![0], "until its last line goes");
+        c.cache_op(C_IST | CACH_PD, 0x8000_0000, 0);
+        assert!(space.held_line_pages(0).is_empty());
+        assert_eq!(c.read::<4>(0, 0xff4).data, 0xa000_0ff0, "dropped, not written back");
+    }
+
+    /// The R5000's second way, VA[14], holds a page like the first, and
+    /// power-on drops it. Instruction lines hold nothing: with no Index
+    /// Store Data, one could hold only what memory holds. There is no
+    /// secondary.
+    #[test]
+    fn an_r5000_line_in_either_way_holds_and_power_on_drops_it() {
+        let (c, space, _bank) = r5000_windowed();
+        c.cache_op(C_IST | CACH_PI, 0x8000_0000, 0x3 << 8 | 0x80);
+        c.cache_op(C_IST | CACH_SD, 0x8000_0000, 0x1 << 13 | 5 << 10);
+        assert!(space.held_line_pages(0).is_empty());
+        c.cache_op(C_IST | CACH_PD, 0x8000_4fe0, 0x5 << 8 | 0xc0);
+        assert_eq!(space.held_line_pages(0), vec![0x5000]);
+        assert_eq!(c.cache_op(C_ILT | CACH_PD, 0x8000_0fe0, 0) & 0xc0, 0, "way 0 is untouched");
+        c.power_on();
+        assert!(space.held_line_pages(0).is_empty());
+        assert!(c.debug_probe("l2", 0, 0).contains("0 valid lines hold 0 pages"));
+    }
+
+    /// The Tezro: two CPUs keep their stacks in lines for the same physical
+    /// page, with different contents, and neither sees the other's.
+    #[test]
+    fn two_cpus_hold_the_same_page_apart() {
+        let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let space = Box::new(space);
+        let bank = Arc::new(banks.remove(0));
+        let a = Box::new(R10000ShadowCache::from(bank.clone() as Arc<dyn BusDevice>));
+        let b = Box::new(R10000ShadowCache::from(bank.clone() as Arc<dyn BusDevice>));
+        attach(&a, &space);
+        attach(&b, &space);
+        space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+        bank.write32(0x10_0040, 0x1234_5678);
+        for c in [&a, &b] {
+            c.cache_op(C_R10K_ISD | CACH_PD, 0x8000_0040, 0x1234_5678);
+            c.cache_op(C_IST | CACH_PD, 0x8000_0040, pd_dirty(0x10_0000));
+        }
+        a.write::<4>(0, 0x10_0040, 0xaaaa_aaaa);
+        b.write::<4>(0, 0x10_0040, 0xbbbb_bbbb);
+        assert_eq!(a.read::<4>(0, 0x10_0040).data, 0xaaaa_aaaa);
+        assert_eq!(b.read::<4>(0, 0x10_0040).data, 0xbbbb_bbbb);
+        assert_eq!(bank.read32(0x10_0040).data, 0x1234_5678, "memory is neither");
+        assert_eq!(unsafe { *(space.window_base().add(0x10_0040) as *const u32) }, 0x1234_5678,
+                   "the shared window, which other masters read, is memory");
+        a.cache_op(C_IST | CACH_PD, 0x8000_0040, 0);
+        assert_eq!(a.read::<4>(0, 0x10_0040).data, 0x1234_5678);
+        assert_eq!(b.read::<4>(0, 0x10_0040).data, 0xbbbb_bbbb);
+    }
+
+    /// Two lines of one page: the page stays until the last goes. The R12000
+    /// zeroing a primary data tag at Index Writeback Invalidate ends a line
+    /// like an invalid tag store.
+    #[test]
+    fn a_page_goes_with_its_last_line() {
+        let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let space = Box::new(space);
+        let bank = Arc::new(banks.remove(0));
+        let c = Box::new(R12000ShadowCache::from(bank.clone() as Arc<dyn BusDevice>));
+        let v = space.add_cached_view(&[c.tcache_bitmap_ptr()]).unwrap();
+        unsafe {
+            c.set_tcache_window(space.view_base(v));
+            c.set_cached_view(&*space, v);
+        }
+        space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+        bank.write32(0x6000, 0x600d);
+        c.cache_op(C_IST | CACH_PD, 0x8000_6000, pd_dirty(0x6000));
+        c.cache_op(C_IST | CACH_PD, 0x8000_6040, pd_dirty(0x6000));
+        c.write::<4>(0, 0x6000, 0xbad);
+        c.cache_op(C_IST | CACH_PD, 0x8000_6000, 0);
+        assert_eq!(space.held_line_pages(v), vec![0x6000]);
+        assert_eq!(c.read::<4>(0, 0x6000).data, 0xbad, "the page stays the view's");
+        c.cache_op(C_IWBINV | CACH_PD, 0x8000_6040, 0);
+        assert!(space.held_line_pages(v).is_empty());
+        assert_eq!(c.read::<4>(0, 0x6000).data, 0x600d);
+    }
+
+    /// Power-on drops every held page. A snapshot taken while lines hold
+    /// pages is refused at restore.
+    #[test]
+    fn power_on_drops_held_pages_and_a_snapshot_of_them_is_refused() {
+        let (c, space, _bank) = windowed();
+        c.cache_op(C_IST | CACH_PD, 0x8000_0000, pd_dirty(0x7000));
+        let saved = c.save_cache_state();
+        assert!(c.load_cache_state(&saved).is_err());
+        c.power_on();
+        assert!(space.held_line_pages(0).is_empty());
+        assert!(c.debug_probe("l2", 0, 0).contains("0 valid lines hold 0 pages"));
+        assert!(c.load_cache_state(&c.save_cache_state()).is_ok());
     }
 }

@@ -405,6 +405,7 @@ impl OctaneMachine {
                     .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
                 unsafe {
                     c.set_tcache_window(sp.view_base(v));
+                    c.set_cached_view(sp, v);
                     c.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
                     #[cfg(feature = "jitv2")]
                     {

@@ -815,6 +815,7 @@ impl Machine {
                     .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
                     .expect("ppmem: the CPU's cached view");
                 unsafe { cpu.set_tcache_window(sp.view_base(v)) };
+                unsafe { cpu.set_cached_view(sp, v) };
                 // Window writes bypass BusDevice, so the cache needs the gen
                 // window to bump page counters itself — otherwise jitv2 keeps
                 // running compiled code for pages the guest has modified.
