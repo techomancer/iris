@@ -363,6 +363,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | Note | Kind | Title |
 |---|---|---|
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
+| [guest-compiler-changes-the-benchmark.md](perf/guest-compiler-changes-the-benchmark.md) | measure | The guest compiler is part of the benchmark: GCC 14.2 against 16.2.1 changes Dhrystone and rotate90 by 37% in guest instructions, and the pin that fixes it |
 | [gfifo-backend-experiment.md](perf/gfifo-backend-experiment.md) | history | GFIFO backend: swappable ring for benchmarking — 2026-09-14 |
 | [gui-idle-refresh.md](perf/gui-idle-refresh.md) | rule | Status-bar-only heartbeat refresh skips the compose and (in iris-gui) publishes nothing; iris-gui uploads only the damaged scanlines |
 | [hal2-pump-thread.md](perf/hal2-pump-thread.md) | rule | HAL2 dedicated pump thread — reverted, do not reintroduce as-is |
