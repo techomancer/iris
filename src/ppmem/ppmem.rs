@@ -818,6 +818,7 @@ impl PpMemSpace {
         let b = &self.banks[bank];
         assert!(src + size <= b.len() as u64, "ppmem: range [{src:#x}, +{size:#x}) escapes bank {bank}");
         assert!(offset + size <= self.window_size(), "ppmem: [{offset:#x}, +{size:#x}) escapes the window");
+        self.marks(false);
         unsafe {
             self.space.map(offset as usize, size as usize, b, src, Prot::ReadWrite)?;
         }
@@ -836,6 +837,7 @@ impl PpMemSpace {
         }
         let st = unsafe { &mut *self.state.get() };
         Self::record(st, Mapping { at: offset, len: size, bank, src, period: 0 });
+        self.marks(true);
         Ok(())
     }
 
@@ -973,6 +975,9 @@ impl PpMemSpace {
         if !bitmap_maps_at(st.bits, shift, page) && !st.views[v].held.keys().any(|&p| p >> shift == page >> shift) {
             self.scrub_region_gaps(st, v, page >> shift << shift, 1u64 << shift);
         }
+        if !Self::held_anywhere(st, page) {
+            self.mark(st, page, true);
+        }
         let view = &st.views[v];
         let at = unsafe { view.space.base().add(page as usize) };
         let mut bytes = vec![0u8; gran as usize];
@@ -1000,12 +1005,47 @@ impl PpMemSpace {
             return false;
         }
         st.views[v].held.remove(&page);
+        if !Self::held_anywhere(st, page) {
+            self.mark(st, page, false);
+        }
         let _ = unsafe { st.views[v].space.scrub(page as usize, gran as usize) };
         for m in st.mappings.iter().filter(|m| m.at < page + gran && m.at + m.len > page) {
             let _ = self.lay(st, v, m, page.max(m.at), (page + gran).min(m.at + m.len));
         }
         Self::publish_view(st, v);
         true
+    }
+
+    fn held_anywhere(st: &SpaceState, page: u64) -> bool {
+        st.views.iter().any(|view| view.held.contains_key(&page))
+    }
+
+    /// A page some view holds carries one `GEN_HELD` in its generation
+    /// counters while memory backs it, so jitv2 does not compile it.
+    #[cfg_attr(not(feature = "jitv2"), allow(unused_variables))]
+    fn mark(&self, st: &SpaceState, page: u64, on: bool) {
+        #[cfg(feature = "jitv2")]
+        {
+            use crate::cpu::jitv2::jitv2::{GEN_HELD, PAGE_SIZE};
+            let end = page + granularity() as u64;
+            if !st.mappings.iter().any(|m| m.at <= page && m.at + m.len >= end) {
+                return;
+            }
+            let d = if on { GEN_HELD } else { 1u64.wrapping_sub(GEN_HELD) };
+            let gens = self.gen_space.base() as *const AtomicU64;
+            for a in (page..end).step_by(PAGE_SIZE as usize) {
+                unsafe { (*gens.add((a / PAGE_SIZE as u64) as usize)).fetch_add(d, Ordering::Release) };
+            }
+        }
+    }
+
+    /// Every held page's mark, off before a mapping change and on after.
+    fn marks(&self, on: bool) {
+        let st = unsafe { &*self.state.get() };
+        let pages: std::collections::BTreeSet<u64> = st.views.iter().flat_map(|v| v.held.keys().copied()).collect();
+        for page in pages {
+            self.mark(st, page, on);
+        }
     }
 
     /// Make the parts of `[r, r + len)` that nothing maps private zeros in
@@ -1093,6 +1133,7 @@ impl PpMemSpace {
 
 impl MappedMemory for PpMemSpace {
     fn clear_mappings(&self) {
+        self.marks(false);
         let st = unsafe { &mut *self.state.get() };
         // Views keep the pages they hold. Scrubbed, not left mapped, so a
         // view never shows memory the shared window no longer maps.
@@ -1124,6 +1165,7 @@ impl MappedMemory for PpMemSpace {
     }
 
     fn map_bank(&self, bank: usize, offset: u64, size: u64, period: u64) -> io::Result<()> {
+        self.marks(false);
         let b = &self.banks[bank];
         let bank_size = b.len() as u64;
         assert!(size > 0, "ppmem: map_bank with zero size");
@@ -1176,10 +1218,12 @@ impl MappedMemory for PpMemSpace {
 
         let st = unsafe { &mut *self.state.get() };
         Self::record(st, Mapping { at: offset, len: size, bank, src: 0, period });
+        self.marks(true);
         Ok(())
     }
 
     fn map_alias(&self, bank: usize, offset: u64, size: u64) -> io::Result<()> {
+        self.marks(false);
         let b = &self.banks[bank];
         assert!(
             size <= b.len() as u64,
@@ -1247,6 +1291,7 @@ impl MappedMemory for PpMemSpace {
         }
         let st = unsafe { &mut *self.state.get() };
         Self::record(st, Mapping { at: offset, len: size, bank, src: 0, period: 0 });
+        self.marks(true);
         Ok(())
     }
 
@@ -1980,5 +2025,30 @@ mod tests {
         assert_eq!(word(space.view_base(v), 0x3ff_fffc), 0, "the rest of the region is safe to touch");
         space.release_line_page(v, 0x10_0040);
         assert_eq!(*field, 0);
+    }
+
+    /// A held page's counter carries one `GEN_HELD` however many views hold
+    /// it, and the mark follows the page to the counter that backs it after
+    /// a remap, leaving none on the old one.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn the_held_mark_follows_the_page() {
+        use crate::cpu::jitv2::jitv2::GEN_HELD;
+        let (space, banks) = PpMemSpace::with_bank_sizes(&[64, 64]).unwrap();
+        space.map_bank(0, 0, 64 * MB as u64, 64 * MB as u64).unwrap();
+        let ((a, _fa), (b, _fb)) = (view_of(&space), view_of(&space));
+        let gen = |g: *const AtomicU64| unsafe { (*g).load(Ordering::Relaxed) };
+        let at = || unsafe { space.gen_window_base().add(0x2000 >> 12) as *const AtomicU64 };
+        space.hold_line_page(a, 0x2000);
+        space.hold_line_page(b, 0x2040);
+        assert_eq!(gen(at()) / GEN_HELD, 1, "one mark for two CPUs");
+        space.clear_mappings();
+        space.map_bank(1, 0, 64 * MB as u64, 64 * MB as u64).unwrap();
+        assert_eq!(gen(at()) / GEN_HELD, 1, "on the counter that backs the page now");
+        assert_eq!(gen(banks[0].gen_ptr(0x2000)) / GEN_HELD, 0, "and off the old one");
+        space.release_line_page(a, 0x2000);
+        assert_eq!(gen(at()) / GEN_HELD, 1);
+        space.release_line_page(b, 0x2040);
+        assert_eq!(gen(at()) / GEN_HELD, 0);
     }
 }

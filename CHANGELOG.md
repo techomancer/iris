@@ -13,6 +13,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### R10000-family cache lines as memory
+
+- jitv2 does not compile a page any CPU's cache holds lines in: that CPU runs it from its own view in the interpreter, and every other page stays compiled.
+
 ### R10000 family fixes, R12000 and R14000
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.

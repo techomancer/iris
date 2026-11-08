@@ -116,6 +116,8 @@ pub(crate) enum Snapshot {
     Taken(u64),
     /// A word could not be read (not RAM right now).
     Unreadable,
+    /// A CPU's cache holds lines in the page, under this generation.
+    Held(u64),
     /// The generation moved under every attempt.
     Busy,
 }
@@ -129,6 +131,10 @@ pub(crate) fn snapshot_page(page: &PhysicalCodePage, bus: &dyn BusDevice, phys_b
     const MAX_SEQLOCK_RETRIES: u32 = 8;
     for _ in 0..MAX_SEQLOCK_RETRIES {
         let gen0 = page.current_gen();
+        // A CPU's cache holds lines in the page (`GEN_HELD`).
+        if gen0 >= crate::cpu::jitv2::jitv2::GEN_HELD {
+            return Snapshot::Held(gen0);
+        }
         // A seqlock reader: the words are read after `gen0` and before
         // `gen1` (acquire), and every writer bumps the generation after its
         // bytes, with release. Then a generation that held means these are
@@ -199,10 +205,26 @@ fn prepare_multi_entry_compile(
     // §13.3 step 2: seqlock-snapshot the page bytes.
     let mut words = [0u32; ENTRIES_PER_PAGE];
     let gen_snap = match snapshot_page(page, &**bus, phys_base, &mut words) {
-        Snapshot::Taken(gen) => gen,
+        Snapshot::Taken(gen) => {
+            // The lines are gone: lift the held publish's denials (below).
+            if page.entry_gen() >= crate::cpu::jitv2::jitv2::GEN_HELD {
+                page.allow_all();
+            }
+            gen
+        }
         Snapshot::Unreadable => {
             page.mark_prepare_bounced();
             return PrepareOutcome::Done(false); // page not readable right now; retry later
+        }
+        Snapshot::Held(gen) => {
+            // Publish no code for this generation and deny every offset, so
+            // arrivals interpret the page without asking again until the
+            // release moves the generation (`step_jit`'s denylist gate).
+            if page.publish(&[0; crate::cpu::jitv2::BITMAP_WORDS], std::ptr::null(), gen, 0, 0, req.compiled_for_fr1) {
+                page.denylist_all();
+            }
+            page.mark_prepare_bounced();
+            return PrepareOutcome::Done(false);
         }
         Snapshot::Busy => {
             // A sufficiently hot self-modifying/shared-DMA page can bounce here
@@ -974,6 +996,26 @@ mod tests {
 
         assert!(page.is_runnable(4), "a plain ADDIU must compile and publish");
         assert!(!page.is_denylisted(4));
+    }
+
+    /// A page whose counter carries `GEN_HELD` compiles nothing and denies
+    /// every offset, and compiles once the mark comes off.
+    #[test]
+    fn a_held_page_compiles_once_its_lines_go() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        let counter = AtomicU64::new(crate::cpu::jitv2::jitv2::GEN_HELD);
+        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let mut compile = |page: &mut PhysicalCodePage| {
+            page.mark_requested(4);
+            let req = CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true };
+            handle_request_for_test(&req, &bus, &mut Analyzer::new(), &mut Codegen::new());
+        };
+        compile(&mut page);
+        assert!(!page.is_runnable(4) && page.is_denylisted(4), "held: interpreted, not asked again");
+        counter.fetch_add(1u64.wrapping_sub(crate::cpu::jitv2::jitv2::GEN_HELD), std::sync::atomic::Ordering::Release);
+        compile(&mut page);
+        assert!(page.is_runnable(4) && !page.is_denylisted(4), "released: compiled");
     }
 
     #[test]
