@@ -1,10 +1,11 @@
 # O2 PROM stack is one cached page at physical 0, and RAM behind it is a different thing
 
-Status: landed 2026-10-30. Both O2 CPUs run the shadow cache from reset; the handover
-([o2-cache-handover-full-to-shadow.md](o2-cache-handover-full-to-shadow.md)) is gone. Code:
-`O2Memory::stack_tag_store` in `src/dev/crime_mem.rs`, the tag-store hook in
-`src/cpu/mips_cache_shadow.rs`. Sections below are the measurements that chose the design; the
-prototype results used earlier binaries.
+Status: retired 2026-11-08. The stack now lives in the CPU's own cached view of ppmem's window:
+a valid primary data or secondary line holds its page there (`ShadowCache::line_enters` in
+`src/cpu/mips_cache_shadow.rs`, `PpMemSpace::add_cached_view`), and the uncached path, the decode
+table and the rendering engine keep seeing memory. `O2Memory::stack_tag_store`, its side page and
+the tag-store hook are gone. The sections below are the measurements that chose the old design;
+what they say about the PROM still holds.
 
 ## Where the stack is
 
