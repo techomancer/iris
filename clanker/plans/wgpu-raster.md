@@ -434,7 +434,22 @@ live IRIS session doing whole-screen readbacks hit an amdgpu ring timeout
 and reported 41 GiB of uploads; neither reproduced on an idle GPU (10 M
 records: 148 MiB uploaded, 4 MiB of them dirty blocks, 16 MiB regions).
 
-### Next: copies as a kernel, then the walkers
+### Copies as a kernel (landed 2026-11-08), then the walkers
+
+Copies are the kernel now (`shaders/copy.wgsl`, `GpuRaster::copy`): the
+batch is flushed, then a gather of the source rectangle into a 16 MiB
+scratch buffer and a scatter into the destination run as two dispatches
+on the queue, with the mirror rule, the window's clip list and id test,
+the per-pixel front/back choice from the window-id plane, the
+scale-and-bias filter and raw byte moves under the window-id masks. A
+depth-tested copy (fragments), a copy over 2M pixels or a view the kernels
+cannot address falls back to the readback path. The replay prints the
+count (`N copies`); on quake1 the 16 copies leave only the checkpoints'
+own readbacks. What the library sends for reads and copies is in
+`clanker/odyssey/gl-reads-and-copies-as-traced.md`. The remaining
+readbacks are the DMA gets (glReadPixels; a rectangle each, but one per
+row today in the recordings: 670 for 27 reads in the pixtest copy run).
+
 
 Texture and scratch uploads (`dma_to_buffer` into memory no drawing
 touches) no longer wait: they store through an untracked pointer and

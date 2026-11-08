@@ -3,6 +3,8 @@
 //! kernels cannot address gets. Without the feature the types are
 //! uninhabited, so the board's dispatch compiles to the CPU path alone.
 
+use super::view::View;
+
 /// Which view a blit stores into: one of its slot's, or one of its own
 /// (a DMA put's surface).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +56,57 @@ impl BlitKey {
     }
 }
 
+
+/// A copy (block 0x2031) as the GPU unit takes it (`copy.rs`
+/// `Board::copy_block`, `GpuRaster::copy`): the views, the rectangles, and
+/// what the copy does to each pixel on the way.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "made only with the unit"))]
+pub(crate) struct CopyOp {
+    /// The source's A and B views (both the one view where it has one).
+    pub src: [View; 2],
+    pub select: CopySelect,
+    pub dst: View,
+    pub size: (u32, u32),
+    /// The source's and destination's first pixel, in plane pixels.
+    pub src_xy: (i32, i32),
+    pub dst_xy: (i32, i32),
+    /// Whether the copy mirrors along x and along y.
+    pub mirror: (bool, bool),
+    /// Bytes move as they are.
+    pub raw: bool,
+    /// A raw store under this mask of the field's bytes (as they lie in
+    /// a 64-bit load, the lowest address highest).
+    pub byte_mask: Option<u64>,
+    /// Scale and bias pairs for R, G, B, A, signed 3.12, and whether the
+    /// source bytes are read as signed.
+    pub filter: Option<([i32; 8], bool)>,
+    /// The destination is a window: its pixels pass these tests.
+    pub window: Option<CopyWindow>,
+}
+
+/// Which source view holds a pixel (`Board::read_buffer`).
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "made only with the unit"))]
+pub(crate) enum CopySelect {
+    Fixed(usize),
+    /// Per pixel, from the window-id plane: the buffer the pixel's window
+    /// shows (`front`) or the other, `displayed` being the display's
+    /// shown-buffer bits by window id.
+    PerPixel { did: View, displayed: u32, front: bool },
+}
+
+/// `Board::pixel_allowed` for a copy's destination window.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code, reason = "made only with the unit"))]
+pub(crate) struct CopyWindow {
+    pub width: u32,
+    pub clip: [[i32; 4]; 4],
+    pub clip_kept: u32,
+    pub id_compare: u32,
+    pub did: View,
+}
+
 #[cfg(feature = "wgpu")]
 pub(super) use super::wgpu::scanout::VproScanout as GpuScanout;
 #[cfg(feature = "wgpu")]
@@ -86,6 +139,10 @@ mod stub {
 
     impl GpuRaster {
         pub fn read_back(&mut self) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn copy(&mut self, _op: &super::CopyOp) -> bool {
             match *self {}
         }
 

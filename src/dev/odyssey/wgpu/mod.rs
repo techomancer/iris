@@ -28,17 +28,18 @@ use crate::wgpu::host::HostBuffer;
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::wgpu::shader::Source;
 use crate::wgpu::{library, ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, GpuMemory, TileGrid};
 
-use super::consts::write;
+use super::consts::{dispmode, write, ODSY_DID_MAIN_SHIFT};
 use super::field::Codec;
-use super::gpu_unit::{BlitKey, BlitView, LineWords};
+use super::gpu_unit::{BlitKey, BlitView, CopyOp, CopySelect, LineWords};
 use super::pipe::backend::{ClearDraw, DestMem};
 use super::pipe::ring::BackQuad;
 use super::pipe::setup::Tri;
 use super::pipe::state::{BackendWords, RasterWords};
 use super::pipe::texture;
-use super::view::{Kind, Rows, MAX_DIM};
+use super::view::{Kind, Rows, View, MAX_DIM};
 use super::vram::{VramPtr, DIRTY_BLOCK_SHIFT};
 
 /// The plane the batch grid covers, per axis, in pixels: records beyond
@@ -50,6 +51,7 @@ pub(crate) const VIEWS: Fragment = Fragment::new("views.wgsl", include_str!("sha
 const BACKEND: Fragment = Fragment::new("backend.wgsl", include_str!("shaders/backend.wgsl"));
 const TEXTURE: Fragment = Fragment::new("texture.wgsl", include_str!("shaders/texture.wgsl"));
 const VPRO: Fragment = Fragment::new("vpro.wgsl", include_str!("shaders/vpro.wgsl"));
+const COPY: Fragment = Fragment::new("copy.wgsl", include_str!("shaders/copy.wgsl"));
 
 /// `fixed::log2_q8`'s table: log2(1 + i/256) in 1/256, for the kernels'
 /// level of detail (a small buffer of their own).
@@ -147,6 +149,21 @@ const BLIT_CONST: u32 = 4;
 
 /// Words the stage buffer holds (the pixels of a batch's blits).
 const STAGE_WORDS: usize = 1 << 20;
+
+/// Pixels the copy kernel's scratch holds (two words each): a larger copy
+/// stays on the CPU.
+const COPY_SCRATCH_PIXELS: u32 = 1 << 21;
+// Copy flags (shaders/copy.wgsl).
+const COPY_MIRROR_X: u32 = 1;
+const COPY_MIRROR_Y: u32 = 2;
+const COPY_RAW: u32 = 4;
+const COPY_FILTER: u32 = 8;
+const COPY_SIGNED: u32 = 16;
+const COPY_WINDOW: u32 = 32;
+const COPY_SELECT_PIXEL: u32 = 64;
+const COPY_SELECT_B: u32 = 128;
+const COPY_BYTE_MASKS: u32 = 256;
+const COPY_SELECT_FRONT: u32 = 512;
 
 /// How long a batch stays open with the board busy before `tick` submits it.
 const MAX_OPEN: std::time::Duration = std::time::Duration::from_millis(4);
@@ -398,8 +415,7 @@ pub(crate) fn codec_kind(c: Codec) -> Result<u32, Unsupported> {
     })
 }
 
-fn pack_view(r: &Rows) -> Result<[u32; 4], Unsupported> {
-    let v = &r.v;
+fn pack_view(v: &View) -> Result<[u32; 4], Unsupported> {
     let kind = match v.kind {
         Kind::None => KIND_NONE,
         Kind::Rgba8 => KIND_RGBA8,
@@ -435,7 +451,7 @@ impl Slot {
         s.words[10] = raster.clip_kept;
         s.words[11] = raster.id_compare;
         for (i, r) in [&planes.colour[0], &planes.colour[1], &planes.depth, &planes.stencil, &planes.did, &planes.overlay].iter().enumerate() {
-            s.views[i] = pack_view(r)?;
+            s.views[i] = pack_view(&r.v)?;
         }
         for (i, c) in raster.clip_rect.iter().enumerate().take(4) {
             s.clip[i] = [c.x0, c.y0, c.x1, c.y1];
@@ -467,7 +483,7 @@ impl Slot {
     /// A view the slot holds, for a blit of its own view into a surface
     /// the kernels address (`BlitView::Own`).
     pub fn own_view(rows: &Rows) -> Result<[u32; 4], Unsupported> {
-        pack_view(rows)
+        pack_view(&rows.v)
     }
 }
 
@@ -490,6 +506,137 @@ impl Slot {
         let lo = base + ((tile(x0, y0) << 8) << log2);
         let hi = base + (((tile(x1, y1) + 1) << 8) << log2);
         Some((lo, hi - lo))
+    }
+}
+
+/// A copy's operands as `shaders/copy.wgsl` reads them (`CopyOp` there).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct CopyUniform {
+    src_a: [u32; 4],
+    src_b: [u32; 4],
+    dst: [u32; 4],
+    did: [u32; 4],
+    /// width, height, source x, source y
+    geo: [i32; 4],
+    /// destination x, y, the flags, the display's shown-buffer bits
+    geo2: [i32; 4],
+    /// clip rectangles kept, the id compare word, the byte mask low and high
+    misc: [u32; 4],
+    /// the destination plane's width
+    misc2: [u32; 4],
+    clip: [[i32; 4]; 4],
+    /// scale and bias pairs: (sR, bR, sG, bG), (sB, bB, sA, bA)
+    sb: [[i32; 4]; 2],
+}
+
+const _: () = assert!(size_of::<CopyUniform>() == 224);
+
+impl CopyUniform {
+    fn of(op: &CopyOp) -> Result<CopyUniform, Unsupported> {
+        let mut flags = 0;
+        for (on, f) in [(op.mirror.0, COPY_MIRROR_X), (op.mirror.1, COPY_MIRROR_Y), (op.raw, COPY_RAW), (op.byte_mask.is_some(), COPY_BYTE_MASKS), (op.window.is_some(), COPY_WINDOW)] {
+            if on {
+                flags |= f;
+            }
+        }
+        let mut did = [0u32; 4];
+        let mut displayed = 0;
+        match op.select {
+            CopySelect::Fixed(0) => {}
+            CopySelect::Fixed(_) => flags |= COPY_SELECT_B,
+            CopySelect::PerPixel { did: d, displayed: shown, front } => {
+                flags |= COPY_SELECT_PIXEL | if front { COPY_SELECT_FRONT } else { 0 };
+                did = pack_view(&d)?;
+                displayed = shown;
+            }
+        }
+        let mut sb = [[0i32; 4]; 2];
+        if let Some((v, signed)) = op.filter {
+            flags |= COPY_FILTER | if signed { COPY_SIGNED } else { 0 };
+            sb = [[v[0], v[1], v[2], v[3]], [v[4], v[5], v[6], v[7]]];
+        }
+        let (mut clip, mut clip_kept, mut id_compare, mut width) = ([[0i32; 4]; 4], 0, 0, 0);
+        if let Some(w) = op.window {
+            (clip, clip_kept, id_compare, width) = (w.clip, w.clip_kept, w.id_compare, w.width);
+            did = pack_view(&w.did)?;
+        }
+        let mask = op.byte_mask.unwrap_or(0);
+        Ok(CopyUniform {
+            src_a: pack_view(&op.src[0])?,
+            src_b: pack_view(&op.src[1])?,
+            dst: pack_view(&op.dst)?,
+            did,
+            geo: [op.size.0 as i32, op.size.1 as i32, op.src_xy.0, op.src_xy.1],
+            geo2: [op.dst_xy.0, op.dst_xy.1, flags as i32, displayed as i32],
+            misc: [clip_kept, id_compare, mask as u32, (mask >> 32) as u32],
+            misc2: [width, 0, 0, 0],
+            clip,
+            sb,
+        })
+    }
+}
+
+/// The copy kernel (`shaders/copy.wgsl`): its two passes, its operand
+/// buffer and scratch, and its groups; the memory group binds the board's
+/// memory alone.
+struct CopyKernel {
+    gather: wgpu::ComputePipeline,
+    scatter: wgpu::ComputePipeline,
+    uniform: wgpu::Buffer,
+    #[allow(dead_code, reason = "held by the group; kept for its lifetime to be plain")]
+    scratch: wgpu::Buffer,
+    group: wgpu::BindGroup,
+    empty: wgpu::BindGroup,
+    vram: wgpu::BindGroup,
+}
+
+impl CopyKernel {
+    fn new(gpu: &Arc<Gpu>, words: u64, vram: &wgpu::Buffer) -> Result<CopyKernel, String> {
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let op_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vpro copy"),
+            entries: &[entry(0, wgpu::BufferBindingType::Uniform), entry(1, wgpu::BufferBindingType::Storage { read_only: false })],
+        });
+        // views.wgsl binds the memory at group 2: group 1 is empty.
+        let empty_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("vpro copy none"), entries: &[] });
+        let vram_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vpro copy vram"),
+            entries: &[entry(0, wgpu::BufferBindingType::Storage { read_only: false })],
+        });
+        let src = Source::new("vpro copy")
+            .define("VRAM_WORD_MASK", (words - 1) as u32)
+            .define("MAX_DIM", MAX_DIM)
+            .define("DID_MAIN_SHIFT", ODSY_DID_MAIN_SHIFT)
+            .define("DISPMODE_COUNT", dispmode::COUNT)
+            .library(VRAM)
+            .library(VIEWS)
+            .body(COPY);
+        let layouts = [&op_layout, &empty_layout, &vram_layout];
+        let gather = src.compute_pipeline(&gpu.device, "gather", &layouts)?;
+        let scatter = src.compute_pipeline(&gpu.device, "scatter", &layouts)?;
+        let uniform = gpu.buffer("vpro copy op", size_of::<CopyUniform>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let scratch = gpu.buffer("vpro copy scratch", COPY_SCRATCH_PIXELS as u64 * 8, wgpu::BufferUsages::STORAGE);
+        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vpro copy"),
+            layout: &op_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: scratch.as_entire_binding() },
+            ],
+        });
+        let empty = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("vpro copy none"), layout: &empty_layout, entries: &[] });
+        let vram = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vpro copy vram"),
+            layout: &vram_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: vram.as_entire_binding() }],
+        });
+        Ok(CopyKernel { gather, scatter, uniform, scratch, group, empty, vram })
     }
 }
 
@@ -677,6 +824,9 @@ pub(crate) struct GpuRaster {
     /// that caused them (the first `odyssey::` frame outside this module
     /// and the raster unit's plumbing).
     pub waits_by: Option<std::collections::BTreeMap<String, u64>>,
+    copy: CopyKernel,
+    /// Copies the kernel took (`copy`).
+    pub copies: u64,
 }
 
 
@@ -741,6 +891,7 @@ impl GpuRaster {
             },
         )?;
         let batch = Batch::new(gpu, &pipelines, TileGrid::new(width, height), MAX_SLOTS);
+        let copy = CopyKernel::new(gpu, words, &vram.buffer)?;
         let blocks = (vram_bytes >> DIRTY_BLOCK_SHIFT).max(1) as usize;
         Ok(GpuRaster {
             gpu: Arc::clone(gpu),
@@ -775,6 +926,8 @@ impl GpuRaster {
             flushes_timed: 0,
             lazy: false,
             waits_by: std::env::var("VPRO_GPU_TRACE_WAITS").is_ok().then(std::collections::BTreeMap::new),
+            copy,
+            copies: 0,
         })
     }
 
@@ -941,7 +1094,7 @@ impl GpuRaster {
     pub fn report(&self) -> String {
         let (flushes, records) = self.counts();
         let mut out = format!(
-            "  gpu unit: {records} records in {flushes} batches ({} on idle, {} timed, {} dropped), {} open now; {} MiB up ({} MiB blocks, {} MiB regions), {} waits, {} readbacks ({} MiB)\n",
+            "  gpu unit: {records} records in {flushes} batches ({} on idle, {} timed, {} dropped), {} open now; {} MiB up ({} MiB blocks, {} MiB regions), {} waits, {} readbacks ({} MiB), {} copies\n",
             self.flushes_idle,
             self.flushes_timed,
             self.dropped,
@@ -952,6 +1105,7 @@ impl GpuRaster {
             self.waits,
             self.readbacks,
             self.read_back_bytes >> 20,
+            self.copies,
         );
         if let Some(by) = &self.waits_by {
             let mut v: Vec<_> = by.iter().collect();
@@ -1063,6 +1217,40 @@ impl GpuRaster {
         self.readbacks += 1;
         self.gpu_dirty_any = self.gpu_dirty.iter().any(|w| *w != 0);
         self.gpu.check()
+    }
+
+    /// The copy `op` (block 0x2031) on the unit: the records before it are
+    /// submitted first, then a gather of the source into the scratch and a
+    /// scatter into the destination, in order on the queue; nothing waits
+    /// and nothing is read back. False when the unit cannot take it (a view
+    /// the kernels cannot address, more pixels than the scratch holds): the
+    /// CPU then copies on a mirror brought current.
+    pub fn copy(&mut self, op: &CopyOp) -> bool {
+        let (w, h) = op.size;
+        if w == 0 || h == 0 || w as u64 * h as u64 > COPY_SCRATCH_PIXELS as u64 {
+            return false;
+        }
+        let Ok(u) = CopyUniform::of(op) else { return false };
+        // What was recorded goes first, and the mirror's changes with it
+        // (the source may be the CPU's).
+        self.flush();
+        self.gpu.write(&self.copy.uniform, 0, bytemuck::bytes_of(&u));
+        let mut enc = self.gpu.encoder("vpro copy");
+        for p in [&self.copy.gather, &self.copy.scatter] {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("vpro copy"), timestamp_writes: None });
+            pass.set_pipeline(p);
+            pass.set_bind_group(0, &self.copy.group, &[]);
+            pass.set_bind_group(1, &self.copy.empty, &[]);
+            pass.set_bind_group(2, &self.copy.vram, &[]);
+            pass.dispatch_workgroups((w * h).div_ceil(64), 1, 1);
+        }
+        self.pending = Some(self.gpu.submit(enc));
+        let mut s = Slot::zeroed();
+        s.views[0] = u.dst;
+        let (x, y) = op.dst_xy;
+        self.mark_gpu(&s, (x, y, x.wrapping_add(w as i32 - 1), y.wrapping_add(h as i32 - 1)));
+        self.copies += 1;
+        true
     }
 
     // The quad ring's commands (pipe/ring.rs) as records.
