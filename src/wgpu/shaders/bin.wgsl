@@ -35,7 +35,10 @@ fn bin(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) la
                 continue;
             }
             let t = tile_index(tx, ty);
-            atomicOr(&masks[t * MASK_WORDS + word], bit);
+            // The first bit in a word marks the word in the tile's summary.
+            if atomicOr(&masks[t * MASK_STRIDE + word], bit) == 0u {
+                atomicOr(&masks[t * MASK_STRIDE + MASK_WORDS + word / 32u], 1u << (word % 32u));
+            }
             if atomicExchange(&busy_flags[t], 1u) == 0u {
                 let i = atomicAdd(&busy.count, 1u);
                 busy.tiles[i] = t;

@@ -330,6 +330,13 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
             eprintln!("{t}");
         }
         b.raster.run_now(|ctx| {
+            if let Some(by) = &ctx.gpu.as_ref().expect("the unit").flushes_by {
+                let mut v: Vec<_> = by.iter().collect();
+                v.sort_by(|a, b| b.1.cmp(a.1));
+                for (line, n) in v {
+                    eprintln!("  {n:8} batches flushed from src/dev/odyssey/wgpu/mod.rs:{line}");
+                }
+            }
             if let Some(by) = &ctx.gpu.as_ref().expect("the unit").waits_by {
                 let mut v: Vec<_> = by.iter().collect();
                 v.sort_by(|a, b| b.1.cmp(a.1));

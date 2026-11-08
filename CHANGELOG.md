@@ -140,6 +140,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   for word the same. Quads now sit at even plane coordinates on both
   raster units instead of even window coordinates, which moves the
   texture level of detail only for windows at odd positions.
+- The GPU raster pass visits only the mask words of a tile that hold
+  primitives (a summary bit per word, set by the bin pass), instead of
+  every word a full batch could use whatever the batch held: the quake1
+  timedemo's raster pass takes about 30% less GPU time.
 - `WGPU_BATCH_TIMING` times each GPU batch's bin and raster passes with
   timestamp queries and counts its busy tiles; `IRIS_WGPU_LOAD` compiles
   edited kernels from a directory instead of the built-in ones.

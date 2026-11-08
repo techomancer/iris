@@ -61,6 +61,34 @@ allocated count snaps to wave steps: 128 = 8 waves, 96 = 10):
   per instruction. Edit the dumped kernel (`IRIS_WGPU_DUMP`) and compile it
   with `IRIS_WGPU_LOAD`: no rebuild per experiment.
 
+## A texel cache in LDS: not worth it (measured 2026-11-08)
+
+Stubs in the dumped kernel, whole replay, raster GPU time (full 7.5 s):
+texel load and unpack 0.82 s (11%), the whole tap with wrap and address
+1.44 s (19%), all sampling with LOD and detail 1.94 s (26%). A 16x16 LDS
+window per tile could at best take part of the 19%, against a fill, two
+barriers a primitive a tile, slivers that fill more than they read, and a
+fallback for footprints that do not fit. The GPU's caches already absorb
+the repeated reads. Not pursued; 74% of the time is outside texturing.
+
+## Batches: why they end, and the mask walk (2026-11-08)
+
+- Not by size: 559 prims a batch against MAX_PRIMS 4096. With
+  `VPRO_GPU_TRACE_WAITS` the replay lists flushes by caller: 1603 of 1970
+  from `note_region` (a texture image or mip level going up untracked:
+  the open batch is flushed first, whether or not it touches that
+  memory), 232 waits (mostly the harness), 81 capacity. Sweeping
+  MAX_PRIMS would change little; flushing only when the batch touches the
+  upload's memory would.
+- The raster pass walked all MASK_WORDS (128) words a tile, an atomic
+  exchange and a barrier each, whatever the batch held. Walking the
+  batch's words: raster 6.43 -> 4.95 s. Then a per-tile summary bit per
+  word (bin pass sets it when a word gets its first bit): raster
+  6.53 -> 5.97 s, bin 0.81 -> 1.03 s, net -5%. Setting the summary bit
+  unconditionally (non-returning atomics) made no difference.
+- Absolute GPU times move between runs (8.2, 7.5, 6.4 s for one kernel
+  the same day): compare back to back only.
+
 ## Next
 
 The back end and the line's made-up quad are the largest remaining parts

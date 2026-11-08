@@ -25,6 +25,7 @@
 #include "common.wgsl"
 
 var<workgroup> wg_tile: u32;
+var<workgroup> wg_summary: u32;
 var<workgroup> wg_bits: u32;
 
 const NO_TILE: u32 = 0xffffffffu;
@@ -59,16 +60,27 @@ fn raster_tile(wg: vec3<u32>, lane: u32) {
     let py = batch.origin_y + i32(ty * TILE_H + lane_y(lane));
 
     arch_tile_begin(tile, px, py, lane);
-    let base = tile * MASK_WORDS;
-    for (var w = 0u; w < MASK_WORDS; w++) {
+    let base = tile * MASK_STRIDE;
+    // The summary's words that cover the batch, then in each the mask
+    // words that have a bit: the rest stay clear.
+    let words = (batch.prim_count + 31u) / 32u;
+    for (var g = 0u; g < (words + 31u) / 32u; g++) {
         if lane == 0u {
-            wg_bits = atomicExchange(&masks[base + w], 0u);
+            wg_summary = atomicExchange(&masks[base + MASK_WORDS + g], 0u);
         }
-        var bits = workgroupUniformLoad(&wg_bits);
-        while bits != 0u {
-            let p = w * 32u + firstTrailingBit(bits);
-            bits &= bits - 1u;
-            arch_prim(p, px, py, lane);
+        var summary = workgroupUniformLoad(&wg_summary);
+        while summary != 0u {
+            let w = g * 32u + firstTrailingBit(summary);
+            summary &= summary - 1u;
+            if lane == 0u {
+                wg_bits = atomicExchange(&masks[base + w], 0u);
+            }
+            var bits = workgroupUniformLoad(&wg_bits);
+            while bits != 0u {
+                let p = w * 32u + firstTrailingBit(bits);
+                bits &= bits - 1u;
+                arch_prim(p, px, py, lane);
+            }
         }
     }
     arch_tile_end(tile, px, py, lane);
