@@ -1,5 +1,7 @@
-// The texture unit (pipe/texture.rs) for one pixel of a quad: the quad's
-// positions in each axis, its level of detail from the diagonals, the
+// The texture unit (pipe/texture.rs) for one pixel of a quad: the
+// pixel's position in each axis, the quad's level of detail from the
+// diagonals (the four lanes of a quad share their positions, or a line's
+// lane makes up its quad), the
 // filter and the levels lambda chooses, the taps gathered from board
 // memory and filtered with 8-bit weights to 12 bits with 16 fraction
 // bits, the detail image, the post-filter, and the texel in 12.12. The
@@ -302,73 +304,48 @@ fn filter_level(ti: u32, lv: TexLevel, cls: u32, axes: u32, at: vec3<i32>, w: ve
     let nx = select(1u, 2u, linear);
     let ny = select(1u, 2u, linear && axes >= 2u);
     let nz = select(1u, 2u, linear && three);
-    // Every element initialised: a tap or texel a filter does not use is
-    // still read into a product with a zero weight, and an uninitialised
-    // read is not a zero to the compiler.
-    var tx = array<Tap, 2>(Tap(0u, false), Tap(0u, false));
-    var ty = array<Tap, 2>(Tap(0u, false), Tap(0u, false));
-    var tz = array<Tap, 2>(Tap(0u, false), Tap(0u, false));
-    for (var i = 0u; i < nx; i++) {
-        tx[i] = axis_tap(lv, 0u, at.x + i32(i), wraps.x, border);
-    }
-    for (var i = 0u; i < ny; i++) {
-        if axes >= 2u {
-            ty[i] = axis_tap(lv, 1u, at.y + i32(i), wraps.y, border);
-        } else {
-            ty[i] = Tap(0u, false);
-        }
-    }
-    for (var i = 0u; i < nz; i++) {
+    // Each tap is weighted as it is read instead of kept for the filter:
+    // the bilinear sum (c00 (256 - a) + c10 a) (256 - b) + (c01 (256 - a)
+    // + c11 a) b is, in wrapping 32-bit arithmetic, exactly the sum of each
+    // texel times its two weights. An axis with one tap gives it both
+    // weights (256), and the nearest filter is one texel at 256 x 256.
+    // One loop over the taps, x fastest, so that one tap is live at a time.
+    let a = select(0u, w.x, linear);
+    let b = select(0u, w.y, linear && axes >= 2u);
+    let n = nx * ny * nz;
+    var acc = vec4<u32>(0u);
+    var plane0 = vec4<u32>(0u);
+    for (var t = 0u; t < n; t++) {
+        let x = t % nx;
+        let y = (t / nx) % ny;
+        let z = t / (nx * ny);
+        var tz = Tap(0u, false);
         if three {
-            tz[i] = axis_tap(lv, 2u, at.z + i32(i), wraps.z, border);
-        } else {
-            tz[i] = Tap(0u, false);
+            tz = axis_tap(lv, 2u, at.z + i32(z), wraps.z, border);
+        }
+        var ty = Tap(0u, false);
+        if axes >= 2u {
+            ty = axis_tap(lv, 1u, at.y + i32(y), wraps.y, border);
+        }
+        let tx = axis_tap(lv, 0u, at.x + i32(x), wraps.x, border);
+        let wx = select(select(256u - a, a, x == 1u), 256u, nx == 1u);
+        let wy = select(select(256u - b, b, y == 1u), 256u, ny == 1u);
+        var c = bc;
+        if !(tz.outside || ty.outside || tx.outside) {
+            c = texel_at(lv, cls, lv.addr + tz.off + ty.off + tx.off);
+        }
+        acc += c * (wx * wy);
+        if t + 1u == nx * ny && nz == 2u {
+            plane0 = acc;
+            acc = vec4<u32>(0u);
         }
     }
-    // The window of taps, texel (x, y, z) at z * 4 + y * 2 + x.
-    var win = array<vec4<u32>, 8>();
-    for (var z = 0u; z < nz; z++) {
-        for (var y = 0u; y < ny; y++) {
-            let row = lv.addr + tz[z].off + ty[y].off;
-            let edge = tz[z].outside || ty[y].outside;
-            for (var x = 0u; x < nx; x++) {
-                if edge || tx[x].outside {
-                    win[z * 4u + y * 2u + x] = bc;
-                } else {
-                    win[z * 4u + y * 2u + x] = texel_at(lv, cls, row + tx[x].off);
-                }
-            }
-        }
-    }
-    if !linear {
-        return win[0] << vec4<u32>(16u);
-    }
-    let a = w.x;
-    let b = select(0u, w.y, axes >= 2u);
-    var planes = array<vec4<u32>, 2>();
-    for (var z = 0u; z < nz; z++) {
-        let c00 = win[z * 4u];
-        let c10 = win[z * 4u + 1u];
-        var c01 = c00;
-        var c11 = c10;
-        if ny == 2u {
-            c01 = win[z * 4u + 2u];
-            c11 = win[z * 4u + 3u];
-        }
-        var out: vec4<u32>;
-        for (var k = 0u; k < 4u; k++) {
-            let top = c00[k] * (256u - a) + c10[k] * a;
-            let bot = c01[k] * (256u - a) + c11[k] * a;
-            out[k] = top * (256u - b) + bot * b;
-        }
-        planes[z] = out;
-    }
-    if !three {
-        return planes[0];
+    if nz == 1u {
+        return acc;
     }
     var out: vec4<u32>;
     for (var k = 0u; k < 4u; k++) {
-        out[k] = blend8(planes[0][k], planes[1][k], w.z);
+        out[k] = blend8(plane0[k], acc[k], w.z);
     }
     return out;
 }
@@ -379,18 +356,23 @@ struct TexQuad {
     c: array<vec4<f32>, 4>,
 }
 
-// Each pixel's position in each of the first `axes` axes in 1/256 of a
-// texel: S, T or R over Q times the axis's scale, floored.
-fn positions(q: TexQuad, scale: array<f32, 4>, axes: u32) -> array<vec4<i32>, 3> {
-    var p = array<vec4<i32>, 3>();
-    for (var i = 0u; i < 4u; i++) {
-        let rq = div_exact(1.0, q.c[3][i]);
-        for (var a = 0u; a < axes; a++) {
-            let v = (q.c[a][i] * rq) * scale[a];
-            p[a][i] = floor_i32(v);
-        }
+// A pixel's position in each of the first `axes` axes in 1/256 of a
+// texel, from its texture coordinates c (S, T, R, Q): S, T or R over Q
+// times the axis's scale, floored. The others are zero.
+fn tex_position(c: vec4<f32>, scale: array<f32, 4>, axes: u32) -> vec3<i32> {
+    var p = vec3<i32>(0);
+    let rq = div_exact(1.0, c[3]);
+    for (var a = 0u; a < axes; a++) {
+        let v = (c[a] * rq) * scale[a];
+        p[a] = floor_i32(v);
     }
     return p;
+}
+
+// The magnitude of the difference of two positions per axis, which can
+// pass i32: the larger less the smaller in u32.
+fn tex_diff(p: vec3<i32>, q: vec3<i32>) -> vec3<u32> {
+    return vec3<u32>(max(p, q)) - vec3<u32>(min(p, q));
 }
 
 // The post-filter: the scale and bias, then the colour table.
@@ -464,27 +446,42 @@ fn detail_weight(ti: u32, lambda: i32) -> i32 {
     return (w0 << 12u) + ((((w1 - w0) << 12u) * f) >> 3u);
 }
 
-// Sample the quad for pixel i: the texel in 12.12.
-fn sample_quad(ti: u32, q: TexQuad, i: u32) -> vec4<i32> {
-    let axes = tex_slots[ti].axes;
-    var p = positions(q, tex_slots[ti].scale, axes);
-    let has_lod = (tex_slots[ti].flags & TEX_LOD) != 0u;
-    var lambda = 0;
-    if has_lod {
-        // The diagonal rule: the largest difference along the quad's two
-        // diagonals, in 1/256 of a base texel, scaled by the bias.
-        var rho = 0.0;
-        for (var k = 0u; k < 3u; k++) {
-            // The magnitude of a difference of two i32, which can pass
-            // i32: the larger less the smaller in u32.
-            let d0 = u32(max(p[k][3], p[k][0])) - u32(min(p[k][3], p[k][0]));
-            let d1 = u32(max(p[k][2], p[k][1])) - u32(min(p[k][2], p[k][1]));
-            rho = max(rho, i64_to_f32(I64(d0, 0u)) * tex_slots[ti].lod_scale[k]);
-            rho = max(rho, i64_to_f32(I64(d1, 0u)) * tex_slots[ti].lod_scale[k]);
-        }
-        let r = sat_u32(min(rho, 4294967295.0));
-        lambda = select(log2_q8(r) - (8 << 8u), LAMBDA_MIN, r == 0u);
+// The level of detail by the diagonal rule: the largest difference along
+// the quad's two diagonals (d0 between pixels 0 and 3, d1 between 1 and
+// 2, per axis), in 1/256 of a base texel, scaled by the bias. Zero for a
+// texture without levels.
+fn tex_lambda(ti: u32, d0: vec3<u32>, d1: vec3<u32>) -> i32 {
+    if (tex_slots[ti].flags & TEX_LOD) == 0u {
+        return 0;
     }
+    var rho = 0.0;
+    for (var k = 0u; k < 3u; k++) {
+        rho = max(rho, i64_to_f32(I64(d0[k], 0u)) * tex_slots[ti].lod_scale[k]);
+        rho = max(rho, i64_to_f32(I64(d1[k], 0u)) * tex_slots[ti].lod_scale[k]);
+    }
+    let r = sat_u32(min(rho, 4294967295.0));
+    return select(log2_q8(r) - (8 << 8u), LAMBDA_MIN, r == 0u);
+}
+
+// A quad's level of detail from its four pixels' texture coordinates, all
+// in one lane (a line's pixel, whose quad is made up).
+fn tex_lambda_quad(ti: u32, q: TexQuad) -> i32 {
+    let axes = tex_slots[ti].axes;
+    var p = array<vec3<i32>, 4>();
+    for (var j = 0u; j < 4u; j++) {
+        p[j] = tex_position(vec4<f32>(q.c[0][j], q.c[1][j], q.c[2][j], q.c[3][j]), tex_slots[ti].scale, axes);
+    }
+    return tex_lambda(ti, tex_diff(p[3], p[0]), tex_diff(p[2], p[1]));
+}
+
+// Sample one pixel whose texture coordinates are tc, whose position is
+// p_in (tex_position()) and whose quad's level of detail is lambda_in
+// (tex_lambda()): the texel in 12.12.
+fn sample_pixel(ti: u32, tc: vec4<f32>, p_in: vec3<i32>, lambda_in: i32) -> vec4<i32> {
+    let axes = tex_slots[ti].axes;
+    var p = p_in;
+    let has_lod = (tex_slots[ti].flags & TEX_LOD) != 0u;
+    var lambda = lambda_in;
     let mn = tex_min(ti);
     let mg = tex_mag(ti);
     var linear = min_linear(mn);
@@ -511,7 +508,7 @@ fn sample_quad(ti: u32, q: TexQuad, i: u32) -> vec4<i32> {
     }
     for (var a = 0u; a < 3u; a++) {
         if tex_slots[ti].clamp[a] != NO_CLAMP {
-            p[a] = min(p[a], vec4<i32>(tex_slots[ti].clamp[a]));
+            p[a] = min(p[a], tex_slots[ti].clamp[a]);
         }
     }
     let cls = tex_class(ti);
@@ -520,9 +517,9 @@ fn sample_quad(ti: u32, q: TexQuad, i: u32) -> vec4<i32> {
     let l0 = tex_slots[ti].levels[0];
     // This pixel's taps on a level: the base position shifted down to the
     // level, through pos().
-    var acc = level_sample(ti, first, l0, cls, p, i, linear, wraps, three);
+    var acc = level_sample(ti, first, l0, cls, p, linear, wraps, three);
     if frac != 0u {
-        let other = level_sample(ti, second, l0, cls, p, i, linear, wraps, three);
+        let other = level_sample(ti, second, l0, cls, p, linear, wraps, three);
         for (var k = 0u; k < 4u; k++) {
             acc[k] = blend8(acc[k], other[k], frac);
         }
@@ -530,10 +527,10 @@ fn sample_quad(ti: u32, q: TexQuad, i: u32) -> vec4<i32> {
     var c = vec4<i32>(to_fixed(acc.x), to_fixed(acc.y), to_fixed(acc.z), to_fixed(acc.w));
     if detail {
         let dscale = array<f32, 4>(tex_slots[ti].detail_scale[0], tex_slots[ti].detail_scale[1], 0.0, 0.0);
-        let d = positions(q, dscale, 2u);
+        let d = tex_position(tc, dscale, 2u);
         let lv = tex_slots[ti].detail;
-        let px = pos(d[0][i], lv.wl, WRAP_REPEAT, true);
-        let py = pos(d[1][i], lv.hl, WRAP_REPEAT, true);
+        let px = pos(d[0], lv.wl, WRAP_REPEAT, true);
+        let py = pos(d[1], lv.hl, WRAP_REPEAT, true);
         let dt = filter_level(ti, lv, cls, 2u, vec3<i32>(px.at, py.at, 0), vec3<u32>(px.w, py.w, 0u), true, vec3<u32>(WRAP_REPEAT, WRAP_REPEAT, WRAP_REPEAT), false);
         let weight = detail_weight(ti, lambda);
         let add = (tex_slots[ti].sampler0 & 0x80000000u) == 0u;
@@ -559,7 +556,7 @@ fn sample_quad(ti: u32, q: TexQuad, i: u32) -> vec4<i32> {
 }
 
 // Level `li` at pixel i's base position.
-fn level_sample(ti: u32, li: u32, l0: TexLevel, cls: u32, p: array<vec4<i32>, 3>, i: u32, linear: bool, wraps: vec3<u32>, three: bool) -> vec4<u32> {
+fn level_sample(ti: u32, li: u32, l0: TexLevel, cls: u32, p: vec3<i32>, linear: bool, wraps: vec3<u32>, three: bool) -> vec4<u32> {
     let lv = tex_slots[ti].levels[li];
     let n = select(select(2u, 1u, tex_slots[ti].axes == 1u), 3u, three);
     var at = vec3<i32>(0);
@@ -567,7 +564,7 @@ fn level_sample(ti: u32, li: u32, l0: TexLevel, cls: u32, p: array<vec4<i32>, 3>
     let shifts = vec3<u32>(l0.wl - lv.wl, l0.hl - lv.hl, l0.dl - lv.dl);
     let sizes = vec3<u32>(lv.wl, lv.hl, lv.dl);
     for (var a = 0u; a < n; a++) {
-        let r = pos(p[a][i] >> shifts[a], sizes[a], wraps[a], linear);
+        let r = pos(p[a] >> shifts[a], sizes[a], wraps[a], linear);
         at[a] = r.at;
         w[a] = r.w;
     }

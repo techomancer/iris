@@ -459,9 +459,12 @@ pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32
     let dz1 = t.z[1] - t.z[0];
     let dz2 = t.z[2] - t.z[0];
     let mut q = Quad::default();
-    // Tiles, from the tile holding (x0, y0).
-    let tx0 = x0.div_euclid(TILE) * TILE;
-    let ty0 = y0.div_euclid(TILE) * TILE;
+    // Tiles, from the tile holding (x0, y0), on the plane's grid: a tile
+    // and a quad (the 2x2 the level of detail reads) start at plane
+    // coordinates a multiple of TILE and of two, wherever the window is.
+    let (ox, oy) = (st.ox, st.oy);
+    let tx0 = (x0.wrapping_add(ox).div_euclid(TILE) * TILE).wrapping_sub(ox);
+    let ty0 = (y0.wrapping_add(oy).div_euclid(TILE) * TILE).wrapping_sub(oy);
     let mut ty = ty0;
 
     while ty <= y1 {
@@ -487,8 +490,8 @@ pub(crate) fn triangle_quads(st: &RasterState, t: &Triangle, within: Option<(i32
                 tx += TILE;
                 continue;
             }
-            let qx0 = tx.max(x0 & !1);
-            let qy0 = ty.max(y0 & !1);
+            let qx0 = tx.max((x0.wrapping_add(ox) & !1).wrapping_sub(ox));
+            let qy0 = ty.max((y0.wrapping_add(oy) & !1).wrapping_sub(oy));
             let qx1 = (tx + TILE - 1).min(x1);
             let qy1 = (ty + TILE - 1).min(y1);
             let mut qy = qy0;

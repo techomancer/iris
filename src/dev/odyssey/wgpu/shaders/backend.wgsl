@@ -301,67 +301,70 @@ fn mul12(a: u32, b: u32) -> u32 {
     return (p + (p >> 12u) + 2048u) >> 12u;
 }
 
-// A blend factor's 12-bit value for component k.
-fn factor(f: u32, k: u32, other_is_dst: bool, s: vec4<u32>, d: vec4<u32>, c: vec4<u32>) -> u32 {
-    let other = select(s, d, other_is_dst);
+// A blend factor's 12-bit value for component k, from that component of
+// the factor's other colour, the alphas and the constant colour's.
+fn factor(f: u32, k: u32, other: u32, sa: u32, da: u32, ck: u32, ca: u32) -> u32 {
     var r: u32;
     switch f {
         case BF_ZERO: { r = 0u; }
         case BF_ONE: { r = 4095u; }
-        case BF_OTHER: { r = other[k]; }
-        case BF_SRC_ALPHA: { r = s.w; }
-        case BF_DST_ALPHA: { r = d.w; }
-        case BF_CONST: { r = c[k]; }
-        case BF_CONST_ALPHA: { r = c.w; }
-        case BF_ONE_MINUS_OTHER: { r = 4095u - other[k]; }
-        case BF_ONE_MINUS_SRC_ALPHA: { r = 4095u - s.w; }
-        case BF_ONE_MINUS_DST_ALPHA: { r = 4095u - d.w; }
-        case BF_ONE_MINUS_CONST: { r = 4095u - c[k]; }
-        case BF_ONE_MINUS_CONST_ALPHA: { r = 4095u - c.w; }
-        case BF_SRC_ALPHA_SATURATE: { r = select(min(s.w, 4095u - d.w), 4095u, k == 3u); }
+        case BF_OTHER: { r = other; }
+        case BF_SRC_ALPHA: { r = sa; }
+        case BF_DST_ALPHA: { r = da; }
+        case BF_CONST: { r = ck; }
+        case BF_CONST_ALPHA: { r = ca; }
+        case BF_ONE_MINUS_OTHER: { r = 4095u - other; }
+        case BF_ONE_MINUS_SRC_ALPHA: { r = 4095u - sa; }
+        case BF_ONE_MINUS_DST_ALPHA: { r = 4095u - da; }
+        case BF_ONE_MINUS_CONST: { r = 4095u - ck; }
+        case BF_ONE_MINUS_CONST_ALPHA: { r = 4095u - ca; }
+        case BF_SRC_ALPHA_SATURATE: { r = select(min(sa, 4095u - da), 4095u, k == 3u); }
         default: { r = 0u; }
     }
     return r;
 }
 
-// The blend of the fragment's 12-bit components over the destination's.
-fn blend(b: Backend, s: vec4<u32>, d: vec4<u32>) -> vec4<u32> {
-    var out: vec4<u32>;
-    for (var k = 0u; k < 4u; k++) {
-        let sf = factor(b.blend_src, k, true, s, d, b.const_colour);
-        let df = factor(b.blend_dst, k, false, s, d, b.const_colour);
-        let a = i32(mul12(s[k], sf));
-        let bb = i32(mul12(d[k], df));
-        var v: i32;
-        switch b.blend_eq {
-            case BE_MIN: { v = i32(min(s[k], d[k])); }
-            case BE_MAX: { v = i32(max(s[k], d[k])); }
-            case BE_SUBTRACT: { v = a - bb; }
-            case BE_REVERSE_SUBTRACT: { v = bb - a; }
-            default: { v = a + bb; }
-        }
-        out[k] = u32(clamp(v, 0, 4095));
+// Component k of the blend of the fragment's 12-bit components over the
+// destination's: s and d that component, sa and da the alphas.
+fn blend_component(b: Backend, k: u32, s: u32, d: u32, sa: u32, da: u32) -> u32 {
+    let ck = b.const_colour[k];
+    let ca = b.const_colour.w;
+    let sf = factor(b.blend_src, k, d, sa, da, ck, ca);
+    let df = factor(b.blend_dst, k, s, sa, da, ck, ca);
+    let a = i32(mul12(s, sf));
+    let bb = i32(mul12(d, df));
+    var v: i32;
+    switch b.blend_eq {
+        case BE_MIN: { v = i32(min(s, d)); }
+        case BE_MAX: { v = i32(max(s, d)); }
+        case BE_SUBTRACT: { v = a - bb; }
+        case BE_REVERSE_SUBTRACT: { v = bb - a; }
+        default: { v = a + bb; }
     }
-    return out;
+    return u32(clamp(v, 0, 4095));
 }
 
-// The 8-bit colour a fragment of 12-bit components stores over the 8-bit
-// destination.
-fn colour_result(b: Backend, src: vec4<u32>, dst: vec4<u32>) -> vec4<u32> {
-    var out: vec4<u32>;
-    if b.blend {
-        out = blend(b, src, vec4<u32>(widen8(dst.x), widen8(dst.y), widen8(dst.z), widen8(dst.w)));
-    } else {
-        out = src;
-    }
-    out = out >> vec4<u32>(4u);
+// The packed 8:8:8:8 colour a fragment of 12-bit components stores over
+// the packed destination dw, a component at a time: the blend, the
+// logical operation, the colour mask.
+fn colour_result(b: Backend, src: vec4<u32>, dw: u32) -> u32 {
+    let da = widen8(dw & 0xffu);
+    var out = 0u;
     for (var k = 0u; k < 4u; k++) {
+        let shift = 24u - 8u * k;
+        let d8 = (dw >> shift) & 0xffu;
+        var v = src[k];
+        if b.blend {
+            v = blend_component(b, k, src[k], widen8(d8), src.w, da);
+        }
+        v = v >> 4u;
         if b.has_logic {
-            out[k] = logic_op(b.logic, out[k], dst[k]) & 0xffu;
+            v = logic_op(b.logic, v, d8) & 0xffu;
         }
         if (b.colour_mask & (1u << k)) == 0u {
-            out[k] = dst[k];
+            v = d8;
         }
+        out |= (v & 0xffu) << shift;
     }
     return out;
 }
@@ -459,7 +462,7 @@ fn fragment_q(b: Backend, si: u32, x: i32, y: i32, zq: u32, src: vec4<u32>) {
         if !d.ok {
             continue;
         }
-        view_store(v, x, y, pack_rgba8(colour_result(b, src, unpack_rgba8(d.v))));
+        view_store(v, x, y, colour_result(b, src, d.v));
     }
 }
 

@@ -131,6 +131,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   its triangles were shaded on the CPU because of it. The quake1 timedemo
   replay now sends 15x fewer records to the GPU unit and draws in 18 s
   instead of 26.
+- The GPU raster kernel shares work between the four lanes of a quad
+  (subgroup quad operations, or workgroup memory on a device without
+  them), shades and stores every record kind through one call each, and
+  filters textures a tap at a time. It needs 96 registers instead of 168,
+  so 10 waves fit per SIMD instead of 6 on an RX 6600 XT, and the quake1
+  timedemo's raster pass takes 8.2 s of GPU time instead of 12.9, word
+  for word the same. Quads now sit at even plane coordinates on both
+  raster units instead of even window coordinates, which moves the
+  texture level of detail only for windows at odd positions.
 - `WGPU_BATCH_TIMING` times each GPU batch's bin and raster passes with
   timestamp queries and counts its busy tiles; `IRIS_WGPU_LOAD` compiles
   edited kernels from a directory instead of the built-in ones.

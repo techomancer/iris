@@ -290,7 +290,9 @@ the need for both.
 
 `shaders/texture.wgsl` ports the texture unit function for function:
 the quad's positions from its four pixels' barycentrics (each lane
-recomputes its quad's edge values, so no subgroup operation is needed),
+recomputed its quad's edge values at first; since 2026-11-08 the quad's
+lanes exchange their positions, see
+`clanker/odyssey/quake-gpu-unit-profile-2026-11-07.md`),
 the diagonal level of detail through `fixed::log2_q8`'s table (generated
 into the shader), the filter and levels lambda chooses, the taps wrapped
 and gathered from board memory with every texel codec, the 8-bit filter
