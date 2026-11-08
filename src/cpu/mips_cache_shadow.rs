@@ -109,7 +109,65 @@ const MRU_BIT: u64 = 1 << 63;
 const PD_STATE_SHIFT: u32 = 6;
 const SD_STATE_SHIFT: u32 = 10;
 
+/// The primary instruction state, TagLo[6] (NEC U10278EJ3V0UM p. 285).
+const PI_VALID: u64 = 1 << 6;
 
+/// A primary instruction word is the instruction predecoded, 36 bits (NEC
+/// U10278EJ3V0UM p. 288). Neither manual gives the layout. This one is
+/// inferred from the words PROM 6.210 stores, `p` the word and `f` the
+/// instruction: p[25:20] = f[5:0], p[19:15] = f[10:6], p[14:10] = f[25:21],
+/// p[28:26] = f[28:26], p[35:29] a class that also gives f[31:29], and p[4:0]
+/// and p[9:5] the rt and rd fields in the order the class gives. Only the
+/// sampled classes decode, and every row is inferred. `addiu $4,$0,2`
+/// (0x24040002) is 0x3_4420_0004.
+///
+/// Rows: class, f[31:29], whether p[4:0] is rt, the f[28:26] values as a bit
+/// mask, and the function fields of the SPECIAL members.
+const L1I_CLASSES: &[(u8, u32, bool, u8, &[u8])] = &[
+    (0x00, 0, false, 1 << 0, &[0x00]),       // nop
+    (0x08, 0, false, 1 << 0, &[0x38, 0x3c]), // dsll, dsll32
+    (0x18, 0, false, 1 << 0, &[0x25]),       // or
+    (0x1a, 1, true, 0b1010_0011, &[]),       // addi, addiu, ori, lui
+    (0x1e, 3, true, 1 << 1, &[]),            // daddiu
+    (0x35, 5, false, 1 << 7, &[]),           // cache
+    (0x36, 6, true, 1 << 7, &[]),            // ld
+    (0x3f, 2, false, 1 << 0, &[]),           // mtc0
+    (0x40, 0, false, 1 << 3, &[]),           // jal
+    (0x41, 0, false, 0b101, &[0x08]),        // jr, j
+    (0x71, 0, false, 1 << 1, &[]),           // REGIMM
+];
+
+/// The model's own form, bits 35:32 set over an instruction no class holds.
+/// Hardware would never produce it. It takes classes 0x78-0x7f, so a real
+/// word of those classes would be read as raw.
+const L1I_RAW: u64 = 0xf << 32;
+
+/// The instruction a predecoded word encodes, or the class that is refused.
+fn l1i_decode(p: u64) -> Result<u32, u8> {
+    if p >> 32 == L1I_RAW >> 32 {
+        return Ok(p as u32);
+    }
+    let (class, op, funct) = ((p >> 29) as u8 & 0x7f, (p >> 26) as u32 & 7, (p >> 20) as u8 & 0x3f);
+    let &(_, hi3, rt_low, ops, functs) = L1I_CLASSES.iter().find(|c| c.0 == class).ok_or(class)?;
+    if ops >> op & 1 == 0 || (op == 0 && !functs.is_empty() && !functs.contains(&funct)) || (class == 0 && p != 0) {
+        return Err(class);
+    }
+    let (low, high) = ((p & 0x1f) as u32, (p >> 5) as u32 & 0x1f);
+    let (rt, rd) = if rt_low { (low, high) } else { (high, low) };
+    Ok(hi3 << 29 | op << 26 | ((p >> 10) as u32 & 0x1f) << 21 | rt << 16 | rd << 11 | ((p >> 15) as u32 & 0x1f) << 6 | funct as u32)
+}
+
+/// The predecoded word for `f`, or the raw form where no class holds it.
+fn l1i_encode(f: u32) -> u64 {
+    let w = f as u64;
+    let (rt, rd) = (w >> 16 & 0x1f, w >> 11 & 0x1f);
+    L1I_CLASSES.iter().find_map(|&(class, _, rt_low, _, _)| {
+        let (low, high) = if rt_low { (rt, rd) } else { (rd, rt) };
+        let p = (class as u64) << 29 | (w >> 26 & 7) << 26 | (w & 0x3f) << 20 | (w >> 6 & 0x1f) << 15
+            | (w >> 21 & 0x1f) << 10 | high << 5 | low;
+        (l1i_decode(p) == Ok(f)).then_some(p)
+    }).unwrap_or(L1I_RAW | w)
+}
 
 /// R10000 only: ways per set, as CACHE index operations address them. Bit 0
 /// of the index selects the way; the set starts above the line offset. The
@@ -184,6 +242,10 @@ pub struct ShadowCache<
     /// valid lines hold their pages. Null without one.
     view_space: UnsafeCell<*const PpMemSpace>,
     view: UnsafeCell<usize>,
+    /// For each primary instruction set, the 64-byte half of a held
+    /// secondary line that a refill there would load (`refilled_word`), or
+    /// `u64::MAX`.
+    refill: UnsafeCell<Box<[u64]>>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -243,6 +305,7 @@ impl<
             pd_tag_hook: UnsafeCell::new(None),
             view_space: UnsafeCell::new(std::ptr::null()),
             view: UnsafeCell::new(0),
+            refill: UnsafeCell::new(vec![u64::MAX; Self::PI_SETS].into_boxed_slice()),
         }
     }
 
@@ -373,9 +436,18 @@ impl<
         if s.held.get(self.tag_slot(sel, virt_addr)) == Some(&true) {
             self.store_into_held_line(sel, virt_addr, phys_addr);
         }
+        if sel == CACH_PI {
+            // The set now holds what the guest wrote, not a refill.
+            if let Some(r) = unsafe { &mut *self.refill.get() }.get_mut((virt_addr as usize / IC_LINE.max(1)) % Self::PI_SETS.max(1)) {
+                *r = u64::MAX;
+            }
+        }
     }
 
     // ---- valid lines hold pages in the CPU's cached view ----
+
+    /// Primary instruction sets, as Index Load Data (I) addresses them.
+    const PI_SETS: usize = if IC_LINE == 0 { 0 } else { IC_SIZE / WAYS / IC_LINE };
 
     fn view_space(&self) -> Option<&PpMemSpace> {
         unsafe { (*self.view_space.get()).as_ref() }
@@ -396,6 +468,9 @@ impl<
         match sel {
             CACH_PD if DC_LINE != 0 && (tag >> PD_STATE_SHIFT) & 3 != 0 => {
                 Some((pa_hi | ((tag >> 8) & 0xff_ffff) << 12 | (va & 0xfff & !(DC_LINE as u64 - 1)), DC_LINE))
+            }
+            CACH_PI if IC_LINE != 0 && tag & PI_VALID != 0 => {
+                Some((pa_hi | ((tag >> 8) & 0xff_ffff) << 12 | (va & 0xfff & !(IC_LINE as u64 - 1)), IC_LINE))
             }
             CACH_SD if L2_LINE != 0 && (tag >> SD_STATE_SHIFT) & 3 != 0 => {
                 Some((pa_hi | ((tag >> 14) & 0x3_ffff) << 18 | (va & 0x3_ffff & !(L2_LINE as u64 - 1)), L2_LINE))
@@ -458,6 +533,7 @@ impl<
             let word = s.data[self.data_slot(sel, s.data.len(), first + (unit * k) as u64 + way)];
             let at = pa + (unit * k) as u64;
             match sel {
+                CACH_PI => self.put_instruction(at, word),
                 CACH_PD => unsafe { *(base.add(at as usize) as *mut u32) = word as u32 },
                 // TagHi is the doubleword's high word and TagLo its low word
                 // (MIPS R10000 UM p. 201; NEC VR10000 UM p. 289, Fig. 13-33).
@@ -471,6 +547,9 @@ impl<
                 _ => unsafe { *(base.add(at as usize) as *mut u64) = word },
             }
         }
+        if sel == CACH_SD {
+            self.set_refill(s.tags[idx], pa, len, true);
+        }
     }
 
     /// The line in slot `idx` of `sel` leaves, unwritten, as Index Store Tag
@@ -479,6 +558,9 @@ impl<
     fn line_leaves(&self, sp: &PpMemSpace, sel: u32, idx: usize, (pa, len): (u64, usize)) {
         let s = self.shadow(sel);
         s.held[idx] = false;
+        if sel == CACH_SD {
+            self.set_refill(s.tags[idx], pa, len, false);
+        }
         let gone = sp.release_line_page(self.view_no(), pa);
         if l2_op_log(CACHE_LOG_OP) {
             crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} leaves (page released: {gone})");
@@ -494,24 +576,78 @@ impl<
         let at = pa + (va & (len as u64 - 1) & !(unit - 1));
         let base = unsafe { *self.tc_base.get() };
         match sel {
+            CACH_PI => self.put_instruction(at, value & 0xf_ffff_ffff),
             CACH_PD => unsafe { *(base.add(at as usize) as *mut u32) = value as u32 },
             _ => unsafe {
                 *(base.add(at as usize) as *mut u64) = value;
                 *(base.add((at ^ 8) as usize) as *mut u64) = 0;
             },
         }
+        if sel == CACH_SD {
+            self.set_refill(self.shadow(sel).tags[idx], pa, len, true);
+        }
+    }
+
+    /// A primary instruction word goes into its line's page as the
+    /// instruction it predecodes, so a fetch runs it. A word of a class the
+    /// model does not know leaves the page as it was, where hardware would
+    /// run it.
+    fn put_instruction(&self, at: u64, word: u64) {
+        match l1i_decode(word) {
+            Ok(f) => unsafe { *((*self.tc_base.get()).add(at as usize) as *mut u32) = f },
+            Err(class) => crate::dlog!(LogModule::L2c,
+                "shadow: primary instruction word {word:#011x} at {at:#x}: predecode class {class:#04x} unknown, memory's word runs"),
+        }
+    }
+
+    /// A held secondary line `[pa, pa + len)` with tag `tag` is what a primary
+    /// instruction refill in each set it maps to would load, or stops being.
+    /// The set is the line's virtual index, TagLo[8:7] (VA[13:12], NEC
+    /// U10278EJ3V0UM p. 287), over PA[11:6]. Two lines for one set: the
+    /// later wins.
+    fn set_refill(&self, tag: u64, pa: u64, len: usize, held: bool) {
+        let refill = unsafe { &mut *self.refill.get() };
+        if !held {
+            // By address: the tag may already name another line.
+            refill.iter_mut().filter(|r| (pa..pa + len as u64).contains(*r)).for_each(|r| *r = u64::MAX);
+            return;
+        }
+        for half in (pa..pa + len as u64).step_by(IC_LINE.max(1)) {
+            if let Some(r) = refill.get_mut(((tag >> 7 & 3) << 12 | (half & 0xfff)) as usize / IC_LINE) {
+                *r = half;
+            }
+        }
+    }
+
+    /// Index Load Data (I) in a set a held secondary line maps to, which
+    /// Index Store Data (I) has not written since and where no held primary
+    /// line is: the word a refill from that
+    /// line would have left, predecoded. The model never refills on a fetch,
+    /// so this assumes the line was refilled, whichever way the operand
+    /// names. The Tezro's PROM runs a staged secondary line and reads the
+    /// primary words back to stage them itself. Index Load Tag (I) still
+    /// reads the stored tag.
+    #[cold]
+    #[inline(never)]
+    fn refilled_word(&self, va: u64) -> Option<u64> {
+        let half = *unsafe { &*self.refill.get() }.get((va as usize / IC_LINE.max(1)) % Self::PI_SETS.max(1))?;
+        if half == u64::MAX || self.shadow(CACH_PI).held[self.tag_slot(CACH_PI, va)] {
+            return None;
+        }
+        let at = half + (va & (IC_LINE as u64 - 1) & !3);
+        Some(l1i_encode(unsafe { *((*self.tc_base.get()).add(at as usize) as *const u32) }))
     }
 
     /// How many lines hold pages.
     fn held_count(&self) -> usize {
-        [CACH_PD, CACH_SD].iter().map(|&sel| self.shadow(sel).held.iter().filter(|&&h| h).count()).sum()
+        [CACH_PI, CACH_PD, CACH_SD].iter().map(|&sel| self.shadow(sel).held.iter().filter(|&&h| h).count()).sum()
     }
 
     /// Every held line goes, with no writeback: power-on, or a snapshot
     /// restore.
     fn drop_held_lines(&self) {
         let Some(sp) = self.view_space() else { return };
-        for sel in [CACH_PD, CACH_SD] {
+        for sel in [CACH_PI, CACH_PD, CACH_SD] {
             for i in 0..self.shadow(sel).held.len() {
                 if self.shadow(sel).held[i] {
                     let line = self.line_of(sel, self.shadow(sel).tags[i], self.slot_va(sel, i)).expect("a held line is valid");
@@ -821,7 +957,7 @@ impl<
                     s.mru[set] = phys_addr & MRU_BIT != 0;
                     let old = s.tags[idx];
                     s.tags[idx] = phys_addr & mask & !MRU_BIT;
-                    if Self::R10K && matches!(sel, CACH_PD | CACH_SD) && old != s.tags[idx] {
+                    if Self::R10K && matches!(sel, CACH_PI | CACH_PD | CACH_SD) && old != s.tags[idx] {
                         self.tag_changes(sel, idx, virt_addr, old, s.tags[idx]);
                     }
                 }
@@ -857,6 +993,11 @@ impl<
                     if l2_op_log(CACHE_LOG_HIT) {
                         crate::dlog!(LogModule::L2c, "shadow:   -> ILD slot={slot} data={:#018x} ecc={:#x}",
                                      s.data[slot], s.ecc[slot]);
+                    }
+                    if sel == CACH_PI {
+                        if let Some(p) = self.refilled_word(virt_addr) {
+                            return p;
+                        }
                     }
                     s.data[slot]
                 }
@@ -1616,5 +1757,78 @@ mod tests {
         assert!(space.held_line_pages(0).is_empty());
         assert!(c.debug_probe("l2", 0, 0).contains("0 valid lines hold 0 pages"));
         assert!(c.load_cache_state(&c.save_cache_state()).is_ok());
+    }
+
+    // ---- primary instruction lines ----
+
+    /// Every class of the table, encoded and decoded back, one field moved
+    /// at a time for the example word, and what the table refuses.
+    #[test]
+    fn predecoded_words_round_trip() {
+        let p = 0x3_4420_0004; // addiu $4,$0,2
+        for (q, f) in [(p, 0x2404_0002), (p | 0x1f << 5, 0x2404_f802), (p | 0x1f << 10, 0x27e4_0002), (p | 0x1f << 15, 0x2404_07c2)] {
+            assert_eq!(l1i_decode(q), Ok(f), "{q:#x}");
+        }
+        for (class, f) in [(0x08, 0x0009_20f8), (0x08, 0x0009_20fc), (0x18, 0x0109_5025), (0x1a, 0x2084_0010),
+                           (0x1a, 0x3484_0010), (0x1a, 0x3c04_8000), (0x1e, 0x6484_0010), (0x35, 0xbd04_0040),
+                           (0x36, 0xdd04_0008), (0x3f, 0x4084_6000), (0x40, 0x0c00_1234), (0x41, 0x03e0_0008),
+                           (0x41, 0x0800_1234), (0x71, 0x0481_0004), (0, 0)] {
+            assert_eq!((l1i_encode(f) >> 29, l1i_decode(l1i_encode(f))), (class, Ok(f)), "{f:#x}");
+        }
+        for f in [0x0009_20c0, 0x2884_0010, 0x4422_3000] { // sll, slti, mtc1: no class
+            assert_eq!((l1i_encode(f), l1i_decode(L1I_RAW | f as u64)), (L1I_RAW | f as u64, Ok(f)));
+        }
+        assert_eq!((l1i_decode(1), l1i_decode(0x2a << 29)), (Err(0), Err(0x2a)));
+    }
+
+    /// TagLo of a valid primary instruction line for `pa`'s page.
+    fn pi_valid(pa: u64) -> u64 { (pa >> 12) << 8 | PI_VALID }
+
+    /// A valid primary instruction line puts the instructions its words
+    /// predecode into the page, leaving memory's word for one it cannot
+    /// decode, and Index Store Data (I) writes through.
+    #[test]
+    fn a_primary_instruction_line_puts_its_instructions_in_the_page() {
+        let (c, space, bank) = windowed();
+        bank.write32(0x9008, 0x1111_1111);
+        let va = 0x8000_9001u64; // way 1
+        c.cache_op(C_R10K_ISD | CACH_PI, va, 0x3_4420_0004);
+        c.cache_op(C_R10K_ISD | CACH_PI, va + 8, 0x2a << 29);
+        c.cache_op(C_IST | CACH_PI, va, pi_valid(0x9000));
+        assert_eq!(space.held_line_pages(0), vec![0x9000]);
+        assert_eq!([0x9000, 0x9008].map(|a| c.read::<4>(0, a).data), [0x2404_0002, 0x1111_1111]);
+        c.cache_op(C_R10K_ISD | CACH_PI, va + 4, l1i_encode(0x03e0_0008));
+        assert_eq!(c.read::<4>(0, 0x9004).data, 0x03e0_0008);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, va, 0), 0x3_4420_0004, "Index Load Data (I) reads the array");
+        assert_eq!(bank.read32(0x9000).data, 0, "memory never saw it");
+        c.cache_op(C_IST | CACH_PI, va, 0);
+        assert!(space.held_line_pages(0).is_empty());
+    }
+
+    /// A held secondary line answers Index Load Data (I) in the primary sets
+    /// it maps to, as the predecoded words a refill would leave, until Index
+    /// Store Data (I) writes the set or the line goes. A held primary line
+    /// answers for itself.
+    #[test]
+    fn index_load_data_i_reads_a_refill_until_the_guest_writes_the_set() {
+        let (c, _space, _bank) = windowed();
+        c.cache_op(C_IST | CACH_SD, 0x8000_4f00, sd_tag(0x4f00, 2) | 1 << 7); // VA[13:12] = 1
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_4f10, 0x0140_0008); // jr $10 at 0x4f10
+        let set = |off: u64| 0x8000_1f00 | off;
+        for va in [set(0x10), set(0x10) | 1] {
+            assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, va, 0), l1i_encode(0x0140_0008), "either way");
+        }
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, 0x8000_0f10, 0), 0, "another set: the array");
+        c.cache_op(C_R10K_ISD | CACH_PI, set(0x10), 0x5_5555_5555);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), 0x5_5555_5555, "the guest's pattern");
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_4f10, 0x0140_0008);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), l1i_encode(0x0140_0008), "restaged: a refill again");
+        c.cache_op(C_R10K_ISD | CACH_PI, set(0x10), 0x3_4420_0004);
+        c.cache_op(C_IST | CACH_PI, set(0x10), pi_valid(0x1_4000));
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_4f10, 0x0140_0008);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), 0x3_4420_0004, "a held primary line answers for itself");
+        c.cache_op(C_IST | CACH_PI, set(0x10), 0);
+        c.cache_op(C_IST | CACH_SD, 0x8000_4f00, 0);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), 0x3_4420_0004, "gone with the line: the array");
     }
 }

@@ -81,6 +81,22 @@ offset until the release. ppmem's counters are the bus's for memory; a machine w
 maps a device over memory, as the IP35 boards map their reset PROM, must mark that
 device's counter as well.
 
+## Primary instruction lines
+
+Only the Fuel's and the Tezro's PROMs use these. A valid primary instruction line
+writes each 36-bit predecoded word (p. 288) into its page as the instruction it
+predecodes, through an eleven-class table inferred from PROM 6.210's words
+(`l1i_decode`). A word of another class leaves memory's word, where hardware would
+run it. A page held only for code also answers cached loads with code.
+
+The model never refills on a fetch. The Tezro's PROM runs a staged secondary line
+and reads the primary words back with Index Load Data (I) to stage them itself, so
+Index Load Data (I) in a set a held secondary line maps to answers with that line's
+words predecoded (`refilled_word`), until Index Store Data (I) writes the set. When
+two held lines map one set, the later wins. An instruction no class holds comes back
+in the model's own form (bits 35:32 set, which takes classes 0x78-0x7f), which
+hardware would not produce. Index Load Tag (I) reads the stored tag.
+
 ## Seeing it
 
 `l2 probe 0` in the monitor prints how many lines hold pages and which. Every
