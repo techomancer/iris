@@ -10561,7 +10561,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     }
 
     /// ppmem: pointer to the executor's inline `ppmem_bitmap` field, for
-    /// `PpMemSpace::set_bitmap_sink`. Fixed for the life of this `MipsCpu` —
+    /// `PpMemSpace::add_cached_view`. Fixed for the life of this `MipsCpu` —
     /// taken once in `new()` after the executor reached its final address.
     pub fn ppmem_bitmap_ptr(&self) -> *mut u64 {
         self.ppmem_bitmap_ptr
@@ -11293,7 +11293,7 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr;
     fn interrupts_ptr(&self) -> *const AtomicU64;
     /// ppmem: the executor's inline `ppmem_bitmap` field, for
-    /// `PpMemSpace::set_bitmap_sink`.
+    /// `PpMemSpace::add_cached_view`.
     fn ppmem_bitmap_ptr(&self) -> *mut u64;
     /// tcache: hand the cache ppmem's window base + mapped-region bitmap.
     ///

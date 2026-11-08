@@ -242,25 +242,23 @@ impl O2Machine {
         let cpu: Arc<dyn CpuDevice> = crate::with_cpu!(part, true, true, C =>
             Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), bus.ram.clone(), part.prid()));
 
-        // ppmem: the CPU's cache and the JIT reach RAM through the memory's
-        // window, publishing the mapped bitmap into the CPU's own fields, as
-        // the Indigo2 does. Remaps happen on the CPU thread (a CRIME bank
-        // control write), which is the window's contract.
+        // ppmem: the CPU's cache and the JIT reach RAM through a cached view
+        // of the memory's window, publishing its bitmap into the CPU's own
+        // fields, as the Indigo2 does. Remaps happen on the CPU thread (a
+        // CRIME bank control write), which is the window's contract.
         {
-            use crate::ppmem::MappedMemory;
             let sp = bus.phys.ppmem_space().ok_or("ppmem: the O2 needs its memory window")?;
+            let v = sp
+                .add_cached_view(&[cpu.ppmem_bitmap_ptr(), cpu.tcache_bitmap_ptr()])
+                .map_err(|e| format!("ppmem: the CPU's cached view: {e}"))?;
             unsafe {
-                sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-                cpu.set_tcache_window(sp.window_base());
-                let bitmap = cpu.tcache_bitmap_ptr();
-                if !bitmap.is_null() {
-                    sp.set_bitmap_sink2(bitmap);
-                }
+                cpu.set_tcache_window(sp.view_base(v));
                 #[cfg(feature = "jitv2")]
-                cpu.set_tcache_gen_window(sp.gen_window_base());
+                {
+                    use crate::ppmem::MappedMemory;
+                    cpu.set_tcache_gen_window(sp.gen_window_base());
+                }
             }
-            // The bus's direct paths read the same bitmap.
-            bus.phys.resync_ppmem_bitmap();
         }
 
         // After the windows above: each compile worker takes the cache's
