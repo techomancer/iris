@@ -3381,12 +3381,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[cfg(feature = "jitv2")]
     pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
         crate::pf_scope!(crate::perfetto::events::JIT_CPU_FLUSH);
-        let bus = self.sysad.clone();
         let jit = self.jitv2.clone();
         let flush = || {
             let mut j = jit.lock();
             if !only_if_exhausted || j.pool_exhausted() {
-                unsafe { j.flush_from_cpu_thread(bus); }
+                unsafe { j.flush_from_cpu_thread(); }
             }
         };
         match self.jitv2_world.clone() {
@@ -9308,7 +9307,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
@@ -9344,7 +9343,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;

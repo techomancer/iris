@@ -2646,7 +2646,7 @@ impl Jitv2 {
 
     /// Self-contained page-pool + compiled-code-arena flush, called FROM the
     /// CPU thread (`jitv2_track_pcp`'s pool-exhaustion handler).
-    pub unsafe fn flush_from_cpu_thread(&mut self, bus: Arc<dyn BusDevice>) {
+    pub unsafe fn flush_from_cpu_thread(&mut self) {
         let stopped = self.compile_queue.stop();
         let was_threaded = !stopped.is_empty();
         let mut function_count = 0;
@@ -2672,6 +2672,7 @@ impl Jitv2 {
         }
         if was_threaded {
             let stats = self.stats.clone();
+            let bus = self.compile_queue.bus().expect("a pool that ran has a bus");
             self.compile_queue.start(bus, stats);
         }
     }
@@ -2841,6 +2842,12 @@ pub struct CompileQueue {
     /// machine's memory, so another machine's worker must never take it.
     hot: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
     running: Arc<AtomicBool>,
+    /// The bus the pool was last started with, kept across `stop()` so a
+    /// restart reads memory through the same view. A caller's own bus is the
+    /// CPU's `sysad`, which on a machine whose bus decodes differently from
+    /// its memory (the Octane's, the Fuel's) is not the view the first start
+    /// compiled from.
+    bus: Option<Arc<dyn BusDevice>>,
     /// One `JoinHandle` per worker thread — empty when not running. Each
     /// thread hands back its own `Codegen` on exit (see `worker_loop`'s
     /// return type); `stop()` collects all of them.
@@ -2927,6 +2934,7 @@ impl CompileQueue {
             queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
             hot: Arc::new(crossbeam_queue::ArrayQueue::new(HOT_QUEUE_CAPACITY)),
             running: Arc::new(AtomicBool::new(false)),
+            bus: None,
             threads: Vec::new(),
             cpu: Mutex::new(None),
             world: Mutex::new(None),
@@ -3135,6 +3143,11 @@ impl CompileQueue {
         self.mips4 = mips4;
     }
 
+    /// The bus the pool was last started with, if it ever was.
+    pub fn bus(&self) -> Option<Arc<dyn BusDevice>> {
+        self.bus.clone()
+    }
+
     pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
         let state = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
         let shared = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
@@ -3158,8 +3171,9 @@ impl CompileQueue {
         self.start_inner(bus, stats, shared, state);
     }
 
-    /// No-op if already running. `bus` is the executor's `sysad` — every
-    /// worker reads the page snapshot off it at compile time (§6.5 step 2).
+    /// No-op if already running. `bus` is what every worker reads the page
+    /// snapshot off at compile time (§6.5 step 2); it is kept, and a restart
+    /// after a flush uses it again.
     /// `stats` is `Jitv2::stats`, cloned in by the caller (mirrors
     /// `cpu`/`jitv2` below — see `JitStats`'s own doc comment for why this
     /// is an `Arc` handed in rather than reached via a lock on every
@@ -3187,6 +3201,7 @@ impl CompileQueue {
         if !self.threads.is_empty() {
             return;
         }
+        self.bus = Some(bus.clone());
         // Captured before the spawn loop: each worker builds its own
         // `Analyzer` and needs the level by value, not through `&self`.
         let worker_mips4 = self.mips4;
@@ -5340,6 +5355,37 @@ mod tests {
         }
         // stop() joins the worker; must return promptly even with requests in flight.
         q.stop();
+    }
+
+    /// A flush restarts the pool on the bus it was started with. The CPU
+    /// that flushes has its own bus, which can decode memory differently
+    /// (the Octane's does), and a restart on that one compiled nothing the
+    /// machine runs.
+    #[test]
+    fn a_pool_restart_after_a_flush_keeps_its_bus() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let dev: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
+        let mut jit = Jitv2::new(4);
+        let stats = jit.stats.clone();
+        jit.compile_queue.start(dev, stats);
+        unsafe { jit.flush_from_cpu_thread(); }
+
+        let slot = jit.page_for(0, 0, &*jit.compile_queue.bus().unwrap(), false).unwrap() as usize;
+        let page = &mut jit.pages[slot] as *mut PhysicalCodePage;
+        unsafe { (*page).mark_requested(0); }
+        let sent = jit.compile_queue.send(CompileRequest { page, compiled_for_fr1: true }, &JitStats::default());
+        assert!(sent);
+        // Joined in every outcome: a worker holds a raw pointer into `jit.pages`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while !unsafe { (*page).is_runnable(0) } {
+                if std::time::Instant::now() >= deadline { return false; }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            true
+        }));
+        jit.compile_queue.stop();
+        assert!(published.unwrap(), "the restarted pool compiled nothing");
     }
 
     /// Dropping a `Jitv2` joins its workers before the page array goes: they

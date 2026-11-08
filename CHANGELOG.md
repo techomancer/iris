@@ -158,6 +158,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   interpreter and in compiled code, matching the R4400 results in cpu-tests
   `fpu/qnan_operand`.
 
+### jitv2: a flushed compile pool restarts on its own bus
+
+- After the page pool ran out, the compile pool was restarted on the CPU's own bus instead of the bus it was first started on. On every current machine they are the same, but a machine that decodes the two differently compiled from the wrong view after its first flush. `CompileQueue` now keeps the bus it was started with and a restart reuses it.
+
 ### jitv2: FCSR.FS flushes denormal results
 
 - Compiled code trapped every denormal ADD/SUB/MUL/DIV/SQRT result as

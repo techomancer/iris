@@ -2027,7 +2027,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 #[cfg(not(feature = "jitv2_lockstep"))]
                                 {
                                 exec.jitv2_inline_compile = false;
-                                let bus = exec.sysad.clone();
+                                // The bus the pool was first started with, as
+                                // a flush restarts it; the CPU's own is the
+                                // fallback when it never ran (inline from boot).
+                                let bus = exec.jitv2.lock().compile_queue.bus().unwrap_or_else(|| exec.sysad.clone());
                                 let old = exec.jitv2.lock().codegen.lock().take();
                                 match old {
                                     Some(old) => {
