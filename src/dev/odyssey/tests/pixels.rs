@@ -1275,7 +1275,7 @@ fn a_window_move_copies_every_byte_of_both_halves() {
 /// x = 256, which the copies below overwrite.
 fn index_window_board() -> (Box<Board>, Surface, Vec<u8>) {
     let (mut s, _, _) = board_with_ram();
-    s.raster_wait();
+    s.gpu_sync();
     let screen = Surface::new(0x2000, 0x50, 4);
     s.pixel_mode = [0x2000, 0x50, 0x2008_6a00, 0];
     for x in 0..4u32 {
@@ -1307,7 +1307,7 @@ fn assert_indices_moved(s: &Board, screen: &Surface, before: &[u8]) {
 fn a_root_tile_copy_moves_colour_indices_unchanged() {
     let (mut s, screen, before) = index_window_board();
     copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
-    s.raster_wait();
+    s.gpu_sync();
     assert_indices_moved(&s, &screen, &before);
 }
 
@@ -1322,7 +1322,7 @@ fn an_index_copy_under_scale_and_bias_still_converts() {
         s.tex_mut().scale_bias[c * 2 + 1] = 0x0001;
     }
     copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
-    s.raster_wait();
+    s.gpu_sync();
     let d = screen.offset(256, 0);
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
     assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
@@ -1336,7 +1336,7 @@ fn an_index_copy_under_scale_and_bias_still_converts() {
 fn a_four_component_copy_into_an_index_field_still_converts() {
     let (mut s, screen, _) = index_window_board();
     copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1000, 0x2000, 256, 0x3233_0041]);
-    s.raster_wait();
+    s.gpu_sync();
     let d = screen.offset(256, 0);
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
     assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
@@ -1352,7 +1352,7 @@ fn a_copied_index_keeps_both_bytes_of_the_field() {
     s.vram.ptr().store(p + 6, 1, 0x01);
     s.vram.ptr().store(p + 7, 1, 0x2a);
     copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 1, 0x8333_1008, 0x2000, 256, 0x3233_0041]);
-    s.raster_wait();
+    s.gpu_sync();
     let d = screen.offset(256, 0);
     assert_eq!(s.vram.ptr_shared().load(d + 6, 1), 0x01);
     assert_eq!(s.vram.ptr_shared().load(d + 7, 1), 0x2a);
@@ -1365,7 +1365,7 @@ fn a_copied_index_keeps_both_bytes_of_the_field() {
 fn a_copy_from_a_wider_source_into_an_index_field_still_converts() {
     let (mut s, screen, before) = index_window_board();
     copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8303_2008, 0x2000, 256, 0x3233_0041]);
-    s.raster_wait();
+    s.gpu_sync();
     let d = screen.offset(256, 0);
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
     assert_eq!(got[6..8], [0x02, 0x03], "converted to the word's low 16 bits");
@@ -1377,7 +1377,7 @@ fn a_copy_from_a_wider_source_into_an_index_field_still_converts() {
 fn a_transform_copy_into_an_index_field_still_converts() {
     let (mut s, screen, _) = index_window_board();
     copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3a33_0041]);
-    s.raster_wait();
+    s.gpu_sync();
     let d = screen.offset(256, 0);
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
     assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
@@ -1390,7 +1390,7 @@ fn a_transform_copy_into_an_index_field_still_converts() {
 fn a_copy_that_writes_rgba_into_an_index_field_still_converts() {
     let (mut s, screen, _) = index_window_board();
     copy_block(&mut s, [0x2000, 0, 0x8050_3050, 1 << 16 | 4, 0x8333_1008, 0x2000, 256, 0x3233_004b]);
-    s.raster_wait();
+    s.gpu_sync();
     let d = screen.offset(256, 0);
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
     assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
@@ -1412,13 +1412,13 @@ fn a_scale_and_bias_block_before_an_index_copy_decides_the_path() {
     let (mut s, screen, before) = index_window_board();
     scale_bias_block(&mut s, [0x1000, 0, 0x1000, 0, 0x1000, 0, 0x1000, 0]);
     copy_block(&mut s, words);
-    s.raster_wait();
+    s.gpu_sync();
     assert_indices_moved(&s, &screen, &before);
 
     let (mut s, screen, _) = index_window_board();
     scale_bias_block(&mut s, [0x2000, 1, 0x2000, 1, 0x2000, 1, 0x2000, 1]);
     copy_block(&mut s, words);
-    s.raster_wait();
+    s.gpu_sync();
     let d = screen.offset(256, 0);
     let got: Vec<u8> = (0..16).map(|k| s.vram.ptr_shared().load(d + k, 1) as u8).collect();
     assert_ne!(got[6..8], [0x06, 0x07], "converted, not moved");
