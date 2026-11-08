@@ -524,7 +524,7 @@ standalone `iris` window if you need them.
 
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
-`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu` feature) draws the window through wgpu instead of OpenGL, with the same scaling rules. With a VPro whose raster unit is on the GPU (`raster = "wgpu"`) the window shares that GPU, and each frame goes from the board's memory to the screen without passing through main memory; screenshots and VNC still read frames back when they ask for them. Newport's display (Indy, Indigo2 XL) is composed on the GPU as well. If wgpu cannot open the window, iris says so and draws with OpenGL.
+`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu` feature) draws the window through wgpu instead of OpenGL, with the same scaling rules. With a VPro or IMPACT whose raster unit is on the GPU (`raster = "wgpu"`) the window shares that GPU, and each frame goes from the board's memory to the screen without passing through main memory; screenshots and VNC still read frames back when they ask for them. Newport's display (Indy, Indigo2 XL) is composed on the GPU as well. If wgpu cannot open the window, iris says so and draws with OpenGL.
 
 ## VNC
 

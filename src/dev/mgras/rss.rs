@@ -1241,6 +1241,11 @@ pub(super) struct TriSetup {
     pub tp: [[i64; 3]; 3],
     pub j0: i32,
     pub j1: i32,
+    /// The edges as integers (`edge_bound`): major, upper minor, lower
+    /// minor, each (C, B) with the span bound at row j `-((B j + C) >>
+    /// 25)`; the upper minor edge serves rows from `jmid` up.
+    pub edges: [[i64; 2]; 3],
+    pub jmid: i32,
     pub ltor: u32,
     pub tex: u32,
     pub fog: u32,
@@ -1272,11 +1277,54 @@ pub(super) struct GlLineSetup {
     pub p0: i32,
     pub p1: i32,
     pub xmajor: u32,
+    /// The first minor pixel at major pixel p, `(qk + qs p) >> 32`
+    /// (`gl_line_q0`): the minor position as a DDA at 2^-32, its slope
+    /// rounded to 2^-24.
+    pub qk: i64,
+    pub qs: i64,
     pub pattern: u32,
     pub repeat: u32,
     pub tex: u32,
     pub fog: u32,
     pub stipple: u32,
+}
+
+/// A position register (a float biased by 49151.5, whose mantissa is then
+/// the position in s.8 fixed point) as s.8, rounded where it has finer
+/// bits (positions below -16383.5).
+pub(super) fn pos_fixed(v: f64) -> i64 {
+    (v * 256.0).round() as i64
+}
+
+/// An edge `x + s (yref - y)` (x in s.8, s.24 in units of x per row going
+/// down, from row `yref`) as the triangle walk takes it: (C, B) such that
+/// pixel i of row j is right of the edge's crossing at the row's centre,
+/// i + 0.5 >= x + s (yref - j - 0.5), exactly when i >= `edge_bound`.
+/// In units of 2^-25: (2i + 1) 2^24 >= x 2^17 + s (2 (yref - j) - 1).
+/// Wrapping: the model's edge arithmetic is 64-bit.
+pub(super) fn edge_coeffs(x: i64, s: i64, yref: i64) -> [i64; 2] {
+    let c = (1i64 << 24).wrapping_sub(x.wrapping_shl(17)).wrapping_sub(s.wrapping_mul(yref.wrapping_mul(2).wrapping_sub(1)));
+    [c, s.wrapping_mul(2)]
+}
+
+/// The first pixel right of edge `e` on row j: `ceil(-(B j + C) / 2^25)`,
+/// saturated to i32.
+#[inline]
+pub(super) fn edge_bound(e: [i64; 2], j: i32) -> i32 {
+    let v = e[1].wrapping_mul(j as i64).wrapping_add(e[0]);
+    (-(v >> 25)).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// `ceil(v / 256 - 0.5)` of an s.8 value: the first pixel whose centre is
+/// at or past it.
+pub(super) fn first_centre(v: i64) -> i32 {
+    (-((128i64.wrapping_sub(v)) >> 8)).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// A GL line's first minor pixel at major pixel `p`.
+#[inline]
+pub(super) fn gl_line_q0(qk: i64, qs: i64, p: i32) -> i32 {
+    (qk.wrapping_add(qs.wrapping_mul(p as i64)) >> 32).clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
 /// XFRCONTROL (provisional layout, from the IDE's TRAM load writing 5):
@@ -2000,12 +2048,9 @@ impl Rss {
                 continue;
             }
             let dj = t.yref_i.wrapping_sub(j);
-            let yc = j as f64 + 0.5;
-            let major = t.x0 + t.s0 * (t.yref - yc);
-            let minor = if yc >= t.ymid { t.x1 + t.s1 * (t.yref - yc) } else { t.x2 + t.s2 * (t.yref2 - yc) };
-            let (l, r) = if t.ltor != 0 { (major, minor) } else { (minor, major) };
-            let i0 = (l - 0.5).ceil() as i32;
-            let i1 = (r - 0.5).ceil() as i32;
+            let major = edge_bound(t.edges[0], j);
+            let minor = edge_bound(t.edges[if j >= t.jmid { 1 } else { 2 }], j);
+            let (i0, i1) = if t.ltor != 0 { (major, minor) } else { (minor, major) };
             // Polygon stipple: 32 rows in the device space, window y mod 32,
             // the most significant bit at window x mod 32 = 0.
             let stip_row = (t.stipple != 0).then(|| self.device.get(POLY_STIPPLE_RAM + (j & 31) as u32));
@@ -2097,6 +2142,15 @@ impl Rss {
             }
         }
         let fog = self.reg(reg::FOG_ON) != 0;
+        // The edges in integers: positions s.8, the slopes as their
+        // registers hold them (s.24).
+        let sreg = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64;
+        let (yref_i, yref2_i) = (pos_fixed(ymax) >> 8, pos_fixed(ymid) >> 8);
+        let edges = [
+            edge_coeffs(pos_fixed(x0), sreg(self, 0x006), yref_i),
+            edge_coeffs(pos_fixed(x1), sreg(self, 0x008), yref_i),
+            edge_coeffs(pos_fixed(x2), sreg(self, 0x00A), yref2_i),
+        ];
         Some(TriSetup {
             x0,
             x1,
@@ -2114,8 +2168,10 @@ impl Rss {
             yref_i: yref as i32,
             zp: fixed::zplane(zplane),
             tp: tplanes.map(fixed::iter_plane),
-            j0: (ymin - 0.5).ceil() as i32,
-            j1: (ymax - 0.5).ceil() as i32,
+            j0: first_centre(pos_fixed(ymin)),
+            j1: first_centre(pos_fixed(ymax)),
+            edges,
+            jmid: first_centre(pos_fixed(ymid)),
             ltor: ltor as u32,
             tex: texture as u32,
             fog: fog as u32,
@@ -2198,8 +2254,7 @@ impl Rss {
                 (l.pattern >> (15 - bit)) & 1 != 0
             };
             if draw {
-                let b = l.b0 + l.slope * ((p as f64 + 0.5) - l.a0);
-                let q0 = (b - 0.5 * l.width as f64 + 0.5).floor() as i32;
+                let q0 = gl_line_q0(l.qk, l.qs, p);
                 let mut rgba = [0, 1, 2, 3].map(|c| l.cbase[c].wrapping_add(l.cstep[c].wrapping_mul(k)));
                 if let Some(smp) = &smp {
                     // Steps along the line, none across it.
@@ -2250,7 +2305,18 @@ impl Rss {
         let c0 = [fix(self, 0x05C), fix(self, 0x05D), fix(self, 0x05E), fix(self, 0x05F)];
         let dc = [fix(self, 0x060), fix(self, 0x062), fix(self, 0x064), fix(self, 0x066)];
         let (f0, df) = (fix64t(self, reg::FOG_F), fix64t(self, reg::FOG_F + 2));
+        // The minor position as a DDA at 2^-32 from the s.8 positions, the
+        // slope rounded to 2^-24: at major pixel p it is b0 + slope (p +
+        // 0.5 - a0), and the first minor pixel the floor of that less half
+        // the width plus a half.
+        let slope = (b1 - b0) / (a1 - a0);
+        let sl = (slope * (1u64 << 24) as f64).round() as i64;
+        let (a0f, b0f) = (pos_fixed(a0), pos_fixed(b0));
+        let width = (self.reg(reg::GLINECONFIG) & 0xFF) as i64 + 1;
+        let qk = b0f.wrapping_shl(24).wrapping_add(sl.wrapping_mul(128i64.wrapping_sub(a0f))).wrapping_sub((width - 1).wrapping_shl(31));
         Some(GlLineSetup {
+            qk,
+            qs: sl.wrapping_mul(256),
             cbase: [0, 1, 2, 3].map(|k| fixed::colour(c0[k] + dc[k] * t0)),
             cstep: dc.map(fixed::colour),
             fbase: fixed::fraction(f0 + df * t0),
@@ -2793,7 +2859,7 @@ impl Rss {
 
     /// PIO read, high half: takes the next doubleword.
     pub fn pio_read_hi(&mut self) -> u32 {
-        self.gpu_sync();
+        self.gpu_sync_transfer();
         let dw = self.pio_doubleword();
         self.stats.pio_read_dw += 1;
         let Some(x) = self.xfer.as_mut() else { return 0 };
@@ -2813,6 +2879,33 @@ impl Rss {
             if let Err(e) = g.sync(&mut self.mem, &mut self.cid) {
                 eprintln!("mgras: GPU raster unit: {e}");
             }
+        }
+    }
+
+    /// With the GPU unit: bring the mirror current where the armed read
+    /// transfer reads (its block, in the buffer reads come from): the
+    /// guest's pixel reads cost a readback of what they read, not of
+    /// everything drawn since the last.
+    pub fn gpu_sync_transfer(&mut self) {
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            let Some(x) = self.xfer.get().filter(|x| x.read) else { return };
+            let b = x.block;
+            let (ax, ay) = self.to_fb(b.xs, b.ys);
+            let (bx, by) = self.to_fb(b.xe, b.ye);
+            let src = self.source();
+            if let Err(e) = g.sync_box(&mut self.mem, &[src], (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))) {
+                eprintln!("mgras: GPU raster unit: {e}");
+            }
+        }
+    }
+
+    /// Submit what the GPU unit has recorded, if one draws; nothing waits
+    /// and nothing comes back (the display reads the unit's memory).
+    pub fn gpu_flush(&mut self) {
+        #[cfg(feature = "wgpu")]
+        if let Some(g) = self.gpu.get() {
+            g.flush();
         }
     }
 
@@ -2895,6 +2988,83 @@ mod tests {
         r.write(reg::IR_ALIAS, 0x18, false);
         r.write(reg::BLOCKXYSTARTI, x0 << 16 | y0, false);
         r.write(reg::BLOCKXYENDI, x1 << 16 | y1, true);
+    }
+
+    /// The integer edge walk (`edge_bound`) gives the span bounds the f64
+    /// walk gave, `ceil(x + s (yref - j - 0.5) - 0.5)`, for positions on
+    /// the s.8 grid (every position the bias leaves within +-16383 pixels)
+    /// and slopes as the registers hold them, steep ones included.
+    #[test]
+    fn integer_edges_agree_with_the_f64_walk() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200_000 {
+            let x = (next() % (1 << 22)) as i64 - (1 << 21);
+            let s = match next() % 4 {
+                0 => (next() % (1 << 30)) as i64 - (1 << 29),
+                1 => (next() % (1 << 40)) as i64 - (1 << 39),
+                2 => (next() % 64) as i64 - 32,
+                _ => ((next() % 33) as i64 - 16) << 24,
+            };
+            let yref = (next() % 4096) as i64 - 1024;
+            let e = edge_coeffs(x, s, yref);
+            for _ in 0..4 {
+                let j = (yref - (next() % 600) as i64) as i32;
+                let yc = j as f64 + 0.5;
+                let want = (x as f64 / 256.0 + s as f64 / (1u64 << 24) as f64 * (yref as f64 - yc) - 0.5).ceil() as i32;
+                assert_eq!(edge_bound(e, j), want, "x {x} s {s} yref {yref} row {j}");
+            }
+        }
+    }
+
+    /// A GL line's DDA (`gl_line_q0`) gives the f64 walk's first minor
+    /// pixel wherever the exact minor position is not within 2^-12 of a
+    /// pixel boundary; on one, the slope's rounding to 2^-24 may pick the
+    /// other side.
+    #[test]
+    fn gl_line_dda_agrees_with_the_f64_walk_off_boundaries() {
+        let mut seed = 0x0DDA_0DDA_0DDA_0DDAu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut checked = 0;
+        for _ in 0..20_000 {
+            let f = |v: u64| ((v % (1 << 19)) as i64 - (1 << 18)) as f64 / 256.0;
+            let (a0, b0) = (f(next()), f(next()));
+            let len = (next() % (1 << 18)) as f64 / 256.0 + 1.0;
+            let a1 = if next() & 1 == 0 { a0 + len } else { a0 - len };
+            let b1 = b0 + ((next() % (2 << 16)) as f64 / 256.0 - 256.0) * len / 256.0;
+            let b1 = (b1 * 256.0).round() / 256.0;
+            if (b1 - b0).abs() > (a1 - a0).abs() {
+                continue;
+            }
+            let width = (next() % 4) as i64 + 1;
+            let slope = (b1 - b0) / (a1 - a0);
+            let sl = (slope * (1u64 << 24) as f64).round() as i64;
+            let (a0f, b0f) = (pos_fixed(a0), pos_fixed(b0));
+            let qk = b0f.wrapping_shl(24).wrapping_add(sl.wrapping_mul(128 - a0f)).wrapping_sub((width - 1) << 31);
+            let qs = sl * 256;
+            let dir = if a1 > a0 { 1 } else { -1 };
+            let p0 = if dir > 0 { (a0 - 0.5).ceil() as i32 } else { (a0 - 0.5).floor() as i32 };
+            for k in 0..64 {
+                let p = p0 + dir * k;
+                let exact = b0 + slope * ((p as f64 + 0.5) - a0) - 0.5 * width as f64 + 0.5;
+                if (exact - exact.round()).abs() < 1.0 / 4096.0 {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(gl_line_q0(qk, qs, p), exact.floor() as i32, "line ({a0}, {b0})-({a1}, {b1}) width {width} at {p}");
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
     }
 
     #[test]

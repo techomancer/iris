@@ -451,7 +451,7 @@ upload, composition, and readback slices and byte/tile/rectangle counters; see
 | `mgras cmap [start] [n] [0\|1]` | Colormap entries |
 | `mgras dac` | DAC registers and gamma |
 | `mgras pix <x> <y>` | One pixel through the compositor (y = 0 is the top) |
-| `mgras stats` | Command, primitive and DMA counters |
+| `mgras stats` | Command, primitive and DMA counters; with the GPU raster unit (`raster = "wgpu"`), its records, batches, uploads and readbacks, and the scan-out's frames presented on the GPU and read back |
 | `mgras jit` | Raster JIT (`gr4-jit`) state |
 | `mgras fbdump [dir]` | Planes and the screen as PNG and raw files |
 | `mgras shot <file.png>` / `mgras dump <file>` | Screenshot / the board state image that replay checkpoints hash (waits for the board to go idle) |

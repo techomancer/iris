@@ -1132,17 +1132,31 @@ impl<'a> E<'a> {
         [self.ld(I32, base), self.ld(I32, base + 4), self.ld(I32, base + 8)]
     }
 
+    /// An i64 saturated to i32 (Rust's `clamp(i32::MIN, i32::MAX) as i32`).
+    fn sat_i32(&mut self, v: Value) -> Value {
+        let lo = self.i64c(i32::MIN as i64);
+        let hi = self.i64c(i32::MAX as i64);
+        let v = self.b.ins().smax(v, lo);
+        let v = self.b.ins().smin(v, hi);
+        self.b.ins().ireduce(I32, v)
+    }
+
+    /// `rss::edge_bound` of edge (C, B) at row `j` (as i64).
+    fn edge_bound(&mut self, e: [Value; 2], j: Value) -> Value {
+        let m = self.b.ins().imul(e[1], j);
+        let v = self.b.ins().iadd(m, e[0]);
+        let v = self.b.ins().sshr_imm_s(v, 25);
+        let v = self.b.ins().ineg(v);
+        self.sat_i32(v)
+    }
+
     /// `Rss::triangle`'s pixel loop over its setup (`ctx.tri`).
     fn triangle(&mut self) {
         let k = self.k;
-        macro_rules! t {
-            ($f:ident) => {
-                self.ld(F64, off!(tri.$f))
-            };
-        }
-        let (x0, x1, x2) = (t!(x0), t!(x1), t!(x2));
-        let (ymid, yref, yref2) = (t!(ymid), t!(yref), t!(yref2));
-        let (s0, s1, s2, xs) = (t!(s0), t!(s1), t!(s2), t!(xs));
+        // The edges (`rss::edge_bound`): (C, B) a pair, major, upper and
+        // lower minor.
+        let edges: Vec<[Value; 2]> = (0..3).map(|n| [self.ld(I64, off!(tri.edges) + 16 * n), self.ld(I64, off!(tri.edges) + 16 * n + 8)]).collect();
+        let jmid = self.ld(I32, off!(tri.jmid));
         let cplanes: Vec<[Value; 3]> = (0..4).map(|c| self.iplane(off!(tri.cplanes) + 12 * c)).collect();
         let (xs_i, yref_i) = (self.ld(I32, off!(tri.xs_i)), self.ld(I32, off!(tri.yref_i)));
         let zp = [self.ld(I64, off!(tri.zp)), self.ld(I64, off!(tri.zp) + 8), self.ld(I64, off!(tri.zp) + 16)];
@@ -1172,10 +1186,6 @@ impl<'a> E<'a> {
             let sy = e.b.ins().imul(e.ysign, j);
             let fy = e.b.ins().iadd(e.oy, sy);
             let span = e.row(fy, next_row);
-            let jf = e.itof(j);
-            let half = e.f64c(0.5);
-            let yc = e.b.ins().fadd(jf, half);
-            let dy = e.b.ins().fsub(yref, yc);
             // The row's share of the colour, fog and depth planes, once a
             // row: `p0 + p2 (yref - j)` (colours 12.16, depth z.12).
             let dj = e.b.ins().isub(yref_i, j);
@@ -1193,23 +1203,14 @@ impl<'a> E<'a> {
             let n32 = 4 + fogp.is_some() as usize;
             let zterm = terms[n32];
             let trows: Vec<Value> = terms[n32 + 1..].to_vec();
-            let m = e.b.ins().fmul(s0, dy);
-            let major = e.b.ins().fadd(x0, m);
-            let m1 = e.b.ins().fmul(s1, dy);
-            let up = e.b.ins().fadd(x1, m1);
-            let dy2 = e.b.ins().fsub(yref2, yc);
-            let m2 = e.b.ins().fmul(s2, dy2);
-            let low = e.b.ins().fadd(x2, m2);
-            let upper = e.b.ins().fcmp(FloatCC::GreaterThanOrEqual, yc, ymid);
+            let j64 = e.b.ins().sextend(I64, j);
+            let major = e.edge_bound(edges[0], j64);
+            let up = e.edge_bound(edges[1], j64);
+            let low = e.edge_bound(edges[2], j64);
+            let upper = e.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, j, jmid);
             let minor = e.b.ins().select(upper, up, low);
-            let l = e.b.ins().select(ltor, major, minor);
-            let r = e.b.ins().select(ltor, minor, major);
-            let lh = e.b.ins().fsub(l, half);
-            let lc = e.b.ins().ceil(lh);
-            let i0 = e.b.ins().fcvt_to_sint_sat(I32, lc);
-            let rh = e.b.ins().fsub(r, half);
-            let rc = e.b.ins().ceil(rh);
-            let i1 = e.b.ins().fcvt_to_sint_sat(I32, rc);
+            let i0 = e.b.ins().select(ltor, major, minor);
+            let i1 = e.b.ins().select(ltor, minor, major);
             let ilo = e.b.ins().smax(i0, vis[0]);
             let ihi = e.b.ins().smin(i1, vis[1]);
             let row = k.stipple.then(|| {
@@ -1276,7 +1277,7 @@ impl<'a> E<'a> {
         let tbase: Vec<Value> = (0..3).map(|c| self.ld(I64, off!(gll.tbase) + 8 * c)).collect();
         let tstep: Vec<Value> = (0..3).map(|c| self.ld(I64, off!(gll.tstep) + 8 * c)).collect();
         let (fbase, fstep) = (g!(I32, fbase), g!(I32, fstep));
-        let (a0, b0, slope) = (g!(F64, a0), g!(F64, b0), g!(F64, slope));
+        let (qk, qs) = (g!(I64, qk), g!(I64, qs));
         let (width, dir, p0, p1) = (g!(I32, width), g!(I32, dir), g!(I32, p0), g!(I32, p1));
         let xmajor = g!(I32, xmajor);
         let xmajor = self.b.ins().icmp_imm_s(IntCC::NotEqual, xmajor, 0);
@@ -1292,11 +1293,6 @@ impl<'a> E<'a> {
         let p = self.get(pv);
         let done = self.b.ins().icmp(IntCC::Equal, p, p1);
         self.bail(done, exit);
-        let pf = self.itof(p);
-        let half = self.f64c(0.5);
-        let pc = self.b.ins().fadd(pf, half);
-        let d = self.b.ins().fsub(pc, a0);
-        let t = self.b.ins().fabs(d);
         if k.stipple {
             let pos = self.get(posv);
             let q = self.b.ins().udiv(pos, repeat);
@@ -1309,14 +1305,12 @@ impl<'a> E<'a> {
             let on = self.b.ins().band_imm_s(on, 1);
             self.need(on, next);
         }
-        let sd = self.b.ins().fmul(slope, d);
-        let bb = self.b.ins().fadd(b0, sd);
-        let wf = self.itof(width);
-        let hw = self.b.ins().fmul(half, wf);
-        let q = self.b.ins().fsub(bb, hw);
-        let q = self.b.ins().fadd(q, half);
-        let q = self.b.ins().floor(q);
-        let q0 = self.b.ins().fcvt_to_sint_sat(I32, q);
+        // `rss::gl_line_q0`.
+        let p64 = self.b.ins().sextend(I64, p);
+        let m = self.b.ins().imul(qs, p64);
+        let v = self.b.ins().iadd(qk, m);
+        let v = self.b.ins().sshr_imm_s(v, 32);
+        let q0 = self.sat_i32(v);
         // Colours and fog `base + step k`, k pixels along (12.16).
         let kk = self.get(kv);
         let rgba: Vec<Variable> = (0..4)

@@ -9,14 +9,13 @@
 //   (`xline_step`; brute-forced against `Rss::line`'s loop in the tests);
 // - character stipple and transfer lines: the block row and column the
 //   pixel is at (`Rss::block_px` inverted);
-// - GL triangle: the row's edges in exact doubles (f64.wgsl), as
-//   `Rss::triangle` computes them, and the half-open span test;
+// - GL triangle: the row's span bounds from the integer edges
+//   (`rss::edge_bound`) and the half-open span test;
 // - GL line: the pixel's step along the major axis and the minor extent
-//   at it, likewise in doubles (`Rss::gl_line`).
+//   at it from the line's DDA (`rss::gl_line_q0`).
 //
 // Record layout: wgpu/mod.rs `Rec`; offsets arrive as defines.
 
-#include "f64.wgsl"
 #include "te1.wgsl"
 
 struct Rec {
@@ -43,7 +42,6 @@ fn r64(pi: u32, i: u32) -> I64 {
     return I64(recs[pi].w[i], recs[pi].w[i + 1u]);
 }
 
-const F64_HALF: I64 = I64(0u, 0x3fe00000u);
 
 // Framebuffer (x, y) to window coordinates (`Rss::to_fb` inverted).
 fn window_of(si: u32, x: i32, y: i32) -> vec2<i32> {
@@ -191,9 +189,12 @@ fn plane64_at(pi: u32, i: u32, di: i32, dj: i32) -> I64 {
     return i64_madd(i64_madd(r64(pi, i), r64(pi, i + 2u), di), r64(pi, i + 4u), dj);
 }
 
-// An edge's x at the centre of row j: x + s (yref - (j + 0.5)).
-fn edge_x(pi: u32, x: u32, s: u32, yref: u32, yc: I64) -> I64 {
-    return f64_add(r64(pi, x), f64_mul(r64(pi, s), f64_sub(r64(pi, yref), yc)));
+// `rss::edge_bound`: the first pixel right of edge k at row j,
+// -((B j + C) >> 25) saturated to i32.
+fn edge_bound(pi: u32, k: u32, j: i32) -> i32 {
+    let e = T_EDGES + 4u * k;
+    let v = i64_madd(r64(pi, e), r64(pi, e + 2u), j);
+    return i64_low_i32(i64_clamp32(i64_neg(i64_shr(v, 25u)), -2147483647 - 1, 2147483647));
 }
 
 fn triangle(pi: u32, si: u32, x: i32, y: i32) {
@@ -204,21 +205,15 @@ fn triangle(pi: u32, si: u32, x: i32, y: i32) {
         return;
     }
     let flags = recs[pi].flags;
-    let yc = f64_add(f64_from_i32(j), F64_HALF);
-    let major = edge_x(pi, T_X0, T_S0, T_YREF, yc);
-    var minor: I64;
-    if f64_ge(yc, r64(pi, T_YMID)) {
-        minor = edge_x(pi, T_X1, T_S1, T_YREF, yc);
-    } else {
-        minor = edge_x(pi, T_X2, T_S2, T_YREF2, yc);
-    }
-    var l = minor;
-    var r = major;
+    let major = edge_bound(pi, 0u, j);
+    let minor = edge_bound(pi, select(2u, 1u, j >= ri(pi, T_JMID)), j);
+    var i0 = minor;
+    var i1 = major;
     if (flags & TRI_LTOR) != 0u {
-        l = major;
-        r = minor;
+        i0 = major;
+        i1 = minor;
     }
-    if i < f64_ceil_i32(f64_sub(l, F64_HALF)) || i >= f64_ceil_i32(f64_sub(r, F64_HALF)) {
+    if i < i0 || i >= i1 {
         return;
     }
     if (flags & TRI_STIPPLE) != 0u && ((sr(si, SL_STIPPLE + (u32(j) & 31u)) >> (31u - (u32(i) & 31u))) & 1u) == 0u {
@@ -261,9 +256,7 @@ fn gl_line(pi: u32, si: u32, x: i32, y: i32) {
         }
     }
     let width = ri(pi, G_WIDTH);
-    let pc = f64_add(f64_from_i32(p), F64_HALF);
-    let b = f64_add(r64(pi, G_B0), f64_mul(r64(pi, G_SLOPE), f64_sub(pc, r64(pi, G_A0))));
-    let q0 = f64_floor_i32(f64_add(f64_sub(b, f64_mul(F64_HALF, f64_from_i32(width))), F64_HALF));
+    let q0 = i64_low_i32(i64_clamp32(i64_shr(i64_madd(r64(pi, G_QK), r64(pi, G_QS), p), 32u), -2147483647 - 1, 2147483647));
     let qe = q0 + width;
     if qe < q0 || q < q0 || q >= qe {
         return;

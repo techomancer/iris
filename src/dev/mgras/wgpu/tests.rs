@@ -545,3 +545,147 @@ fn a_texture_load_lands_between_the_triangles_around_it() {
     let differ = (12..58).any(|y| (12..30).any(|x| p.cpu.mem.get(&b, x, y) != p.cpu.mem.get(&b, x + 100, y)));
     assert!(differ, "the load changed nothing the triangles sample");
 }
+
+/// The GPU scan-out composes what `Frame::snapshot` and `Frame::compose`
+/// compose, pixel for pixel, over random pixel memory and random display
+/// state: window-ID tables (runs out of order, past the edge, rows with
+/// none), every main format (colour index, RGB, both pixel-pair layouts),
+/// buffer selects, overlays, colormap blocks, gamma, blanking, cursors.
+#[test]
+fn scanout_composes_as_the_cpu_frame() {
+    use super::super::dcb::Dcb;
+    use super::super::frame::{self, Frame};
+    use super::super::plain::boxed_zeroed;
+    use super::scanout::MgrasScanout;
+    let Some(g) = gpu() else { return };
+    let mut rng = Rng(0x5CA2_0001);
+    let mut r = Rss::new_boxed();
+    for w in r.mem.words.iter_mut() {
+        *w = rng.next();
+    }
+    let mut unit = GpuRaster::new(&g).unwrap_or_else(|e| panic!("{e}"));
+    unit.attach(&r.mem, &r.cid, &mut r.te);
+    let mut sc = MgrasScanout::new(&g, &unit.pix_buffer()).unwrap_or_else(|e| panic!("{e}"));
+    let mut dcb = boxed_zeroed::<Dcb>();
+    dcb.init([0, 0], [0, 0]);
+    let mut snap = boxed_zeroed::<Frame>();
+    let mut cpu = vec![0u32; frame::OUT_STRIDE * frame::H];
+    let mut out = vec![0u32; frame::OUT_STRIDE * frame::H];
+    for trial in 0..16 {
+        r.write(reg::DRBSIZE, (rng.chance(0.5) as u32) << 6 | (5 + rng.below(3) as u32) << 2 | 2, false);
+        for did in 0..32 {
+            let format = match rng.below(6) {
+                0 => 1,
+                1 => 2,
+                2 => 5,
+                3 => 7,
+                4 => 0x15,
+                _ => rng.below(32) as u32,
+            };
+            let overlay = if rng.chance(0.5) { 0 } else { (rng.below(32) as u32) << 3 | (1 + rng.below(7) as u32) };
+            dcb.xmap.set_modes(did, format | (rng.below(32) as u32) << 5, overlay);
+        }
+        let page = |rng: &mut Rng| rng.below(1024) as u32;
+        let (a, b) = (page(&mut rng), page(&mut rng));
+        let o = if rng.chance(0.2) { a } else { page(&mut rng) };
+        dcb.xmap.set_scanout(rng.u32(), a | b << 10 | o << 20, rng.u32());
+        for c in dcb.cmap[0].pal.iter_mut() {
+            *c = rng.u32() & 0xFF_FFFF;
+        }
+        for gm in dcb.dac.gamma.iter_mut() {
+            *gm = [0, 1, 2].map(|_| rng.below(1024) as u16);
+        }
+        dcb.dac.set_pixmask(if rng.chance(0.1) { 0 } else { 0xFF });
+        // Window-ID tables: frame tables at 0 (main) and 0x800 (overlay),
+        // 32 line tables from 0x2000 the rows share.
+        let h = if rng.chance(0.5) { 1024 } else { 768 };
+        let vc3 = &mut dcb.vc3;
+        vc3.regs[4] = 0;
+        vc3.regs[5] = 0x800;
+        for k in 0..32usize {
+            let base = 0x2000 + 64 * k;
+            let n = rng.below(10) as usize;
+            for e in 0..n {
+                let x = if rng.chance(0.1) { 1300 + rng.below(800) as u16 } else if e == 0 && rng.chance(0.5) { 0 } else { rng.below(1300) as u16 };
+                vc3.sram[base + e] = x << 5 | rng.below(32) as u16;
+            }
+            vc3.sram[base + n] = 0x7FF << 5;
+        }
+        for y in 0..h {
+            vc3.sram[y] = 0x2000 + 64 * rng.below(32) as u16;
+            vc3.sram[0x800 + y] = if rng.chance(0.05) { 0xFFFF } else { 0x2000 + 64 * rng.below(32) as u16 };
+        }
+        vc3.sram[h] = 0xFFFF;
+        // A cursor, mostly.
+        vc3.regs[0x1D] = if rng.chance(0.8) { 3 | if rng.chance(0.5) { 8 } else { 0 } } else { 0 };
+        vc3.regs[1] = 0x6000;
+        vc3.regs[2] = rng.below(1400) as u16;
+        vc3.regs[3] = rng.below(1100) as u16;
+        for w in vc3.sram[0x6000..0x6200].iter_mut() {
+            *w = rng.u32() as u16;
+        }
+        snap.snapshot(&r, &dcb);
+        snap.compose(&mut cpu);
+        let (w, hh) = sc.read(&r, &dcb, &mut out, frame::OUT_STRIDE).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((w, hh), (snap.width, snap.height), "trial {trial}: frame size");
+        let mut bad = Vec::new();
+        for y in 0..hh {
+            for x in 0..w {
+                let i = y * frame::OUT_STRIDE + x;
+                if cpu[i] != out[i] && bad.len() < 8 {
+                    bad.push(format!("({x}, {y}) cpu {:08x} gpu {:08x}", cpu[i], out[i]));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "trial {trial}: the scan-out differs: {}", bad.join(", "));
+    }
+}
+
+/// The guest's pixel reads see the GPU unit's drawing: after primitives,
+/// a DMA read of a random block (random format, buffer and window
+/// state) gives the same bytes on both engines. The GPU engine brings its
+/// mirror current only under the block (`Rss::gpu_sync_transfer`), so
+/// later reads elsewhere must still find their pages marked.
+#[test]
+fn transfer_reads_see_the_drawing() {
+    let Some(g) = gpu() else { return };
+    let mut p = Pair::new(&g, 0x4EAD);
+    let mut lines_read = 0;
+    for step in 0..120 {
+        if step % 8 == 0 {
+            p.refresh();
+        }
+        let prim = [Prim::Fill, Prim::Line, Prim::Tri, Prim::Stipple, Prim::GlLine][step % 5];
+        let mut mode = test_gen::mode_regs(&mut p.rng, prim, 0.3);
+        unaliased(&mut mode);
+        p.apply(&mode);
+        for _ in 0..3 {
+            let (data, op) = test_gen::data_regs(&mut p.rng, prim);
+            p.apply(&data);
+            p.draw(prim, op);
+        }
+        // A read: DMA block type 4, a transfer format the X server and
+        // libGLcore use, a block somewhere in the drawing.
+        for _ in 0..2 {
+            let (f, c) = p.rng.pick(&[(0u32, 0u32), (0, 1), (8, 8), (8, 10), (8, 0), (2, 3), (7, 0), (8, 1), (7, 1), (5, 5)]);
+            let order = if (f, c) == (8, 1) { 1 << 22 } else { 0 };
+            let mut regs: Regs = vec![(reg::XFRMODE, (p.rng.u32() & 0x7FF00) | f << 4 | c | order), (reg::FILLMODE, 4 << 22), (reg::ZST_STENCIL, 0)];
+            test_gen::block_regs(&mut p.rng, &mut regs, (60, 12));
+            regs.push((reg::XFRSIZE, p.rng.range(1, 48) as u32));
+            p.apply(&regs);
+            p.exec(reg::IR, 0x8);
+            for line in 0..p.rng.range(1, 8) as u32 {
+                let want = p.cpu.dma_read_line(line);
+                p.gpu.gpu_sync_transfer();
+                let got = p.gpu.dma_read_line(line);
+                assert_eq!(got, want, "step {step}, line {line}: the read differs\n{}", p.recent());
+                lines_read += 1;
+            }
+        }
+        p.check(&format!("reads step {step}"), false);
+    }
+    assert!(lines_read > 500, "{lines_read}");
+    // The reads brought drawn pages back (they did not pass on a stale
+    // mirror that happened to match).
+    assert!(p.unit.syncs > 50 && p.unit.read_back > 0, "{} syncs, {} bytes read back", p.unit.syncs, p.unit.read_back);
+}
