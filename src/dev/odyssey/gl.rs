@@ -17,7 +17,7 @@ use super::consts::{
     ODSY_ID_COMPARE_ENABLE, ODSY_ID_COMPARE_MASK_SHIFT, ODSY_INDEX_MASK,
 };
 use super::geometry::{gl_transpose, odyssey_f32};
-use super::assembly::{vtx, Assembly, Prim, PrimSink, XfState, CLIP_PLANES, POLYGON, TRIANGLES};
+use super::assembly::{vtx, Assembly, Prim, PrimSink, XfState, CLIP_PLANES, LINES, LINE_STRIP, POLYGON, TRIANGLES};
 use super::draw::{RasterOp, CLEAR_COLOUR, CLEAR_DEPTH, CLEAR_STENCIL, MAX_TARGETS, RASTER_CLEAR};
 use super::clip::ClipRect;
 use super::pipe::setup::{LiveDraw, Transform};
@@ -230,9 +230,12 @@ unsafe impl Send for GlDrawJob {}
 #[repr(C, align(64))]
 pub(super) struct DrawFrame {
     words_stipple: Option<[u32; 32]>,
-    pipe: Option<Box<PipeDraw>>,
+    pipe: Option<PipeDraw>,
     pub live: LiveDraw,
 }
+
+/// Frames the raster context keeps for reuse (RasterCtx::frames).
+pub(super) const FRAMES_KEPT: usize = 64;
 
 impl GlDrawJob {
     /// Draw it; the line-stipple phase assembly keeps.
@@ -243,6 +246,7 @@ impl GlDrawJob {
             // The ring's slots name the frame: store them before it goes.
             ctx.drain_back();
         }
+        ctx.give_frame(frame);
         phase
     }
 
@@ -260,7 +264,7 @@ impl GlDrawJob {
             ring.hold(self, frame);
             return None;
         }
-        drop(frame);
+        ctx.give_frame(frame);
         Some(self)
     }
 
@@ -271,11 +275,10 @@ impl GlDrawJob {
         // outlives it: the frame is dropped first, or the ring keeps both
         // and drops the frame first (QuadRing::reclaim()).
         let job: &'static GlDrawJob = unsafe { &*(self as *const GlDrawJob) };
-        let mut frame = Box::new(DrawFrame {
-            words_stipple: job.words.raster.polygon_stipple(),
-            pipe: None,
-            live: LiveDraw::default(),
-        });
+        let mut frame = ctx.frames.pop().unwrap_or_else(|| Box::new(DrawFrame { words_stipple: None, pipe: None, live: LiveDraw::default() }));
+        frame.words_stipple = job.words.raster.polygon_stipple();
+        frame.pipe = None;
+        frame.live.reset();
         let fr = &mut *frame;
         let mut d = job.fields.prim(&job.vertices, &job.state);
         if d.line_phase == Some(LINE_PHASE_ON_RASTER) {
@@ -297,14 +300,17 @@ impl GlDrawJob {
             && d.mode <= POLYGON
             && !p.prims.polygon_smooth
             && p.prims.modes == [PolygonMode::Fill, PolygonMode::Fill];
-        p.shade = allow_shader && fills && p.ring.as_ref().is_some_and(|r| r.shader());
+        // So do aliased lines (setup's line_projected(), the tiles'
+        // line_pixels()).
+        let lines = d.mode >= LINES && d.mode <= LINE_STRIP && !p.prims.line_smooth;
+        p.shade = allow_shader && (fills || lines) && p.ring.as_ref().is_some_and(|r| r.shader());
         if p.ring.is_some() && !p.shade {
             // The tiles store behind this thread, so the depth it would
             // pre-test against may be stale; the tiles' own walks read
             // their stores.
             p.raster.pretest = None;
         }
-        let p = &**fr.pipe.insert(p);
+        let p = &*fr.pipe.insert(p);
         super::pipe::setup::run(p, &mut d, xf, fr.words_stipple.as_ref(), job.background, &fr.live);
         if let Some(phase) = d.line_phase {
             ctx.line_phase = phase;

@@ -91,6 +91,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   a board takes about 190 MiB of VRAM instead of 450.
 - Aliased lines find each column's pixel directly instead of testing
   every candidate, halving the time spent setting up lines.
+- Aliased lines are drawn on the GPU unit's kernels, one record a line,
+  and walked by the raster thread's tile workers rather than handed over a
+  pixel at a time. Their colour, depth and texture use the filled
+  triangle's arithmetic instead of double precision, which moves line
+  colours by at most two steps; the pixels they cover match a real V10
+  pixel for pixel. A draw's context is reused rather than allocated per
+  draw. SolidView now draws in 2.1 s on the GPU unit (was 2.5) and 2.0 s
+  on the threaded CPU unit (was 3.3).
 - The X server's and the PROM's 2D fills (solid rectangles, window-id
   writes, pattern spans) are one operation per rectangle instead of one per
   pixel: a single record per buffer on the GPU unit, row spans on the CPU

@@ -32,7 +32,7 @@ use crate::wgpu::{library, ArchShaders, Batch, BatchPipelines, Fragment, Full, G
 
 use super::consts::write;
 use super::field::Codec;
-use super::gpu_unit::{BlitKey, BlitView};
+use super::gpu_unit::{BlitKey, BlitView, LineWords};
 use super::pipe::backend::{ClearDraw, DestMem};
 use super::pipe::ring::BackQuad;
 use super::pipe::setup::Tri;
@@ -63,10 +63,23 @@ const REC_FRAG: u32 = 2;
 const REC_RECT: u32 = 3;
 const REC_BLIT: u32 = 4;
 const REC_FRAGS: u32 = 5;
+const REC_LINE: u32 = 6;
 
 const TRI_SMOOTH: u32 = 1;
 const TRI_TEXTURED: u32 = 2;
 const TRI_SPECULAR: u32 = 4;
+const LINE_X_MAJOR: u32 = 8;
+// Line word offsets (shaders/vpro.wgsl L_*).
+const L_LA: usize = 0;
+const L_NA: usize = 1;
+const L_DU: usize = 2;
+const L_DN: usize = 3;
+const L_MAJOR: usize = 4;
+const L_MINOR: usize = 6;
+const L_WIDTH: usize = 8;
+const L_INV: usize = 9;
+// The kernel's LINE_SUB.
+const _: () = assert!(super::pipe::setup::SUB == 256);
 
 /// Payload words of a record.
 const REC_WORDS: usize = 84;
@@ -340,7 +353,7 @@ impl Rec {
     /// The box a record of this kind touches, from its own words.
     fn pixel_box(&self) -> (i32, i32, i32, i32) {
         match self.kind {
-            REC_TRI => (self.w[T_BOX] as i32, self.w[T_BOX + 1] as i32, self.w[T_BOX + 2] as i32, self.w[T_BOX + 3] as i32),
+            REC_TRI | REC_LINE => (self.w[T_BOX] as i32, self.w[T_BOX + 1] as i32, self.w[T_BOX + 2] as i32, self.w[T_BOX + 3] as i32),
             REC_FRAG => {
                 let (x, y) = (self.w[F_X] as i32, self.w[F_Y] as i32);
                 (x, y, x + 1, y + 1)
@@ -1060,6 +1073,29 @@ impl GpuRaster {
     #[allow(clippy::too_many_arguments, reason = "the record's sources")]
     pub fn push_tri(&mut self, t: &Tri, ox: i32, oy: i32, bounds: (i32, i32, i32, i32), steps: i64, depth_range: [f64; 2], depth_slack: f64, mode: u32, alpha: u32, slot: &Slot, tex: Option<&TexSlot>, specular: bool) {
         let r = Rec::tri(t, ox, oy, bounds, steps, depth_range, depth_slack, mode, alpha, tex.is_some(), specular);
+        self.push_with_tex(r, slot, tex);
+    }
+
+    /// An aliased line (`Draw::line_projected`): its triangle (a, b, a)'s
+    /// record with the line's own words where a triangle keeps its edges.
+    /// `bounds` is the plane box its pixels can reach.
+    #[allow(clippy::too_many_arguments, reason = "the record's sources")]
+    pub fn push_line(&mut self, t: &Tri, l: &LineWords, ox: i32, oy: i32, bounds: (i32, i32, i32, i32), steps: i64, depth_range: [f64; 2], depth_slack: f64, mode: u32, alpha: u32, slot: &Slot, tex: Option<&TexSlot>, specular: bool) {
+        let mut r = Rec::tri(t, ox, oy, bounds, steps, depth_range, depth_slack, mode, alpha, tex.is_some(), specular);
+        r.kind = REC_LINE;
+        if l.x_major {
+            r.flags |= LINE_X_MAJOR;
+        }
+        r.set_i(L_LA, l.la);
+        r.set_i(L_NA, l.na);
+        r.set_i(L_DU, l.du);
+        r.set_i(L_DN, l.dn);
+        r.set_i(L_MAJOR, l.major.0);
+        r.set_i(L_MAJOR + 1, l.major.1);
+        r.set_i(L_MINOR, l.minor.0);
+        r.set_i(L_MINOR + 1, l.minor.1);
+        r.set_i(L_WIDTH, l.width);
+        r.set_f(L_INV, l.inv);
         self.push_with_tex(r, slot, tex);
     }
 
