@@ -512,6 +512,29 @@ pass with one workgroup per busy tile that walks its mask in order and
 stores pixels itself. Order per pixel is the record order, so the kernels
 need no atomics on pixels and no synchronisation between workgroups.
 
+Memory is placed by who writes it and who reads it, and allocated once.
+What the CPU writes and the GPU reads once (a batch's records, boxes and
+state slots, the VPro's blit stage and texture slots) lives in host
+memory the kernels read directly over the bus (`src/wgpu/host.rs`,
+`HostBuffer`: on Vulkan a buffer in host-visible memory that is not
+device-local, mapped for its whole life and handed to wgpu). A batch
+uses one of a few such sets, made with the board and reused once the
+submission that read it completes; a set is added, and kept, only when
+all are in flight. Every other upload (the mirror's dirty blocks, small
+headers, the window's frames) goes through one ring of host-memory
+staging slots in `Gpu` (`Gpu::write`, `Gpu::write_texture`), copied
+ahead of the next submission; `Queue::write_buffer` is not used, since
+it allocates a new staging buffer per call. What only the GPU touches
+(board memory, tile masks, the scan-out frame) is device-local memory
+the CPU cannot see. Nothing uses the CPU-visible part of VRAM, which on
+a card without resizable BAR is a 256 MiB window shared with the
+desktop. Readbacks go through one fixed host buffer.
+
+A shaded fragment the CPU produced (a line's pixels, CPU-shaded
+polygons) joins a packed fragment record of up to 19 pixels under the
+same state slot, rather than taking a record of its own; the kernel
+applies a record's pixels in the order they were shaded.
+
 Board memory lives in a GPU buffer; nothing on the CPU maps it. The front
 end's own pixel paths (image puts, the integer primitives and their logical
 operations, the X server's window-id writes, plane clears, DMA puts, depth

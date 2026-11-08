@@ -24,6 +24,7 @@ pub(crate) mod scanout;
 mod tests;
 
 use std::sync::Arc;
+use crate::wgpu::host::HostBuffer;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -61,6 +62,7 @@ const REC_TRI: u32 = 1;
 const REC_FRAG: u32 = 2;
 const REC_RECT: u32 = 3;
 const REC_BLIT: u32 = 4;
+const REC_FRAGS: u32 = 5;
 
 const TRI_SMOOTH: u32 = 1;
 const TRI_TEXTURED: u32 = 2;
@@ -100,6 +102,14 @@ const F_Y: usize = 1;
 const F_COV: usize = 2;
 const F_ZQ: usize = 3;
 const F_RGBA: usize = 7;
+// Packed fragment word offsets: the pixels' box, their count, then each
+// pixel as x | y << 16, its depth word and its colour in two words.
+const P_BOX: usize = 0;
+const P_COUNT: usize = 4;
+const P_PIXELS: usize = 5;
+const P_WORDS: usize = 4;
+/// Pixels a packed fragment record holds.
+const P_MAX: usize = (REC_WORDS - P_PIXELS) / P_WORDS;
 
 // Rectangle word offsets and flags.
 const R_BOX: usize = 0;
@@ -335,7 +345,8 @@ impl Rec {
                 let (x, y) = (self.w[F_X] as i32, self.w[F_Y] as i32);
                 (x, y, x + 1, y + 1)
             }
-            // The clear's and the blit's boxes sit at the same words.
+            // The clear's, the blit's and the packed fragments' boxes sit
+            // at the same words.
             _ => (self.w[R_BOX] as i32, self.w[R_BOX + 1] as i32, self.w[R_BOX + 2] as i32, self.w[R_BOX + 3] as i32),
         }
     }
@@ -588,18 +599,25 @@ pub(crate) struct GpuRaster {
     pipelines: BatchPipelines,
     batch: Batch<Rec, Slot>,
     vram: GpuMemory,
-    group: wgpu::BindGroup,
-    /// The batch's texture slots, their buffer, and their indices by hash.
+    /// The board's group per batch set (the batch's `next_set`): the
+    /// memory and log2 table, shared, and that set's texture slots and blit
+    /// stage, in host memory the kernels read directly. The layout and the
+    /// table make more when the batch adds a set.
+    sets: Vec<RasterSet>,
+    layout: wgpu::BindGroupLayout,
+    log2_buf: wgpu::Buffer,
+    /// The batch's texture slots and their indices by hash.
     tex_slots: Vec<TexSlot>,
-    tex_buf: wgpu::Buffer,
     tex_map: std::collections::HashMap<u64, u32>,
     /// The batch's blit pixels and their buffer, and the run of
     /// consecutive pixels being collected (`blit_pixel`): its slot, view,
     /// mask and window flag, its row, first and next x, and where its
     /// pixels start in the stage.
     stage: Vec<u32>,
-    stage_buf: wgpu::Buffer,
     run: Option<BlitRun>,
+    /// The packed fragment record being collected (`push_frag`) and its
+    /// slot.
+    frags: Option<(Slot, Rec)>,
     /// A rectangle of a view the front end is storing into the mirror
     /// untracked (a scratch image through the FIFO), to upload when it is
     /// done: the view and its inclusive pixel box.
@@ -652,6 +670,31 @@ pub(crate) struct GpuRaster {
 /// Slots a batch may hold.
 const MAX_SLOTS: u32 = 1024;
 
+/// A batch set's own buffers on the board's side and its group 2.
+struct RasterSet {
+    tex: HostBuffer,
+    stage: HostBuffer,
+    group: wgpu::BindGroup,
+}
+
+impl RasterSet {
+    fn new(gpu: &Arc<Gpu>, layout: &wgpu::BindGroupLayout, vram: &wgpu::Buffer, log2: &wgpu::Buffer, n: usize) -> RasterSet {
+        let tex = HostBuffer::new(gpu, &format!("vpro texture slots {n}"), MAX_TEX_SLOTS as u64 * size_of::<TexSlot>() as u64, wgpu::BufferUsages::STORAGE);
+        let stage = HostBuffer::new(gpu, &format!("vpro blit stage {n}"), STAGE_WORDS as u64 * 4, wgpu::BufferUsages::STORAGE);
+        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vpro vram"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: vram.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: tex.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: stage.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: log2.as_entire_binding() },
+            ],
+        });
+        RasterSet { tex, stage, group }
+    }
+}
+
 impl GpuRaster {
     /// A raster unit over `vram_bytes` of board memory (a power of two)
     /// whose plane coordinates span `width` x `height` pixels.
@@ -671,9 +714,7 @@ impl GpuRaster {
             entries: &[entry(0, false), entry(1, true), entry(2, true), entry(3, true)],
         });
         let log2_buf = gpu.buffer("vpro log2 table", 256 * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        gpu.queue.write_buffer(&log2_buf, 0, bytemuck::cast_slice(&log2_table()));
-        let tex_buf = gpu.buffer("vpro texture slots", MAX_TEX_SLOTS as u64 * size_of::<TexSlot>() as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        let stage_buf = gpu.buffer("vpro blit stage", STAGE_WORDS as u64 * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        gpu.write(&log2_buf, 0, bytemuck::cast_slice(&log2_table()));
         let words = vram_bytes / 8;
         let pipelines = BatchPipelines::new(
             gpu,
@@ -686,16 +727,6 @@ impl GpuRaster {
                 layouts: &[&layout],
             },
         )?;
-        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vpro vram"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: vram.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: tex_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: stage_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: log2_buf.as_entire_binding() },
-            ],
-        });
         let batch = Batch::new(gpu, &pipelines, TileGrid::new(width, height), MAX_SLOTS);
         let blocks = (vram_bytes >> DIRTY_BLOCK_SHIFT).max(1) as usize;
         Ok(GpuRaster {
@@ -703,13 +734,14 @@ impl GpuRaster {
             pipelines,
             batch,
             vram,
-            group,
+            sets: Vec::new(),
+            layout,
+            log2_buf,
             tex_slots: Vec::new(),
-            tex_buf,
             tex_map: std::collections::HashMap::new(),
             stage: Vec::new(),
-            stage_buf,
             run: None,
+            frags: None,
             region: None,
             last: None,
             pending: None,
@@ -1069,9 +1101,52 @@ impl GpuRaster {
         }
     }
 
-    /// A quad shaded on the CPU (`QuadRing::push_shaded`).
+    /// A quad shaded on the CPU (`QuadRing::push_shaded`). Its covered
+    /// pixels join the packed fragment record being collected under the
+    /// same slot: a line's pixels, each a quad of its own, take one record
+    /// per P_MAX pixels instead of one each.
     pub fn push_frag(&mut self, q: &BackQuad, slot: &Slot) {
-        self.push(Rec::frag(q), slot);
+        if q.cov == 0b1111 {
+            self.push(Rec::frag(q), slot);
+            return;
+        }
+        for i in 0..4 {
+            if q.cov & (1 << i) == 0 {
+                continue;
+            }
+            let (x, y) = (q.x + (i & 1) as i32, q.y + (i >> 1) as i32);
+            let joins = self.frags.as_ref().is_some_and(|(s, r)| s == slot && (r.w[P_COUNT] as usize) < P_MAX);
+            if !joins {
+                self.end_pending();
+                let mut r = Rec::new(REC_FRAGS, 0);
+                r.set_i(P_BOX, x);
+                r.set_i(P_BOX + 1, y);
+                r.set_i(P_BOX + 2, x);
+                r.set_i(P_BOX + 3, y);
+                self.frags = Some((*slot, r));
+                self.opened.get_or_insert_with(std::time::Instant::now);
+            }
+            let r = &mut self.frags.as_mut().expect("the record").1;
+            let n = r.w[P_COUNT] as usize;
+            let at = P_PIXELS + n * P_WORDS;
+            let c = q.rgba[i];
+            r.w[at] = (x as u32 & 0xffff) | (y as u32) << 16;
+            r.w[at + 1] = q.zq[i];
+            r.w[at + 2] = c[0] as u32 | (c[1] as u32) << 16;
+            r.w[at + 3] = c[2] as u32 | (c[3] as u32) << 16;
+            r.w[P_COUNT] = n as u32 + 1;
+            r.set_i(P_BOX, (r.w[P_BOX] as i32).min(x));
+            r.set_i(P_BOX + 1, (r.w[P_BOX + 1] as i32).min(y));
+            r.set_i(P_BOX + 2, (r.w[P_BOX + 2] as i32).max(x));
+            r.set_i(P_BOX + 3, (r.w[P_BOX + 3] as i32).max(y));
+        }
+    }
+
+    /// Close the packed fragment record being collected, if any.
+    fn end_frags(&mut self) {
+        if let Some((s, r)) = self.frags.take() {
+            self.push_record(r, &s);
+        }
     }
 
     /// A clear's rectangle (`QuadRing::push_rect`).
@@ -1098,6 +1173,7 @@ impl GpuRaster {
     /// Close whatever the front end was collecting: the blit run into its
     /// record, the untracked region into its upload.
     fn end_pending(&mut self) {
+        self.end_frags();
         self.end_run();
         self.close_region();
     }
@@ -1237,16 +1313,21 @@ impl GpuRaster {
             self.publish_covered();
             return;
         }
+        let k = self.batch.next_set(&self.pipelines);
+        while self.sets.len() <= k {
+            let set = RasterSet::new(&self.gpu, &self.layout, &self.vram.buffer, &self.log2_buf, self.sets.len());
+            self.sets.push(set);
+        }
         if !self.stage.is_empty() {
-            self.gpu.queue.write_buffer(&self.stage_buf, 0, bytemuck::cast_slice(&self.stage));
+            self.sets[k].stage.write(0, bytemuck::cast_slice(&self.stage));
             self.stage.clear();
         }
         if !self.tex_slots.is_empty() {
-            self.gpu.queue.write_buffer(&self.tex_buf, 0, bytemuck::cast_slice(&self.tex_slots));
+            self.sets[k].tex.write(0, bytemuck::cast_slice(&self.tex_slots));
             self.tex_slots.clear();
             self.tex_map.clear();
         }
-        if let Some(sub) = self.batch.flush(&self.pipelines, &[&self.group]) {
+        if let Some(sub) = self.batch.flush(&self.pipelines, &[&self.sets[k].group]) {
             self.pending = Some(sub);
         }
         self.last = None;

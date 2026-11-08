@@ -3,10 +3,11 @@
 //!
 //! A board appends one setup record per primitive (`prim`) and one state
 //! slot per distinct state (`slot`); a record names its slot by index.
-//! `flush` uploads the records, slots and tile boxes, runs the bin and
-//! raster kernels and empties the recorder. Records, slots and the common
-//! buffers live in fixed GPU buffers, so a board's bind groups are created
-//! once.
+//! `flush` writes the records, slots and tile boxes into host memory the
+//! kernels read directly, runs the bin and raster kernels and empties the
+//! recorder. Those buffers come in a few sets made with the batch, used in
+//! turn and each reused once its submission completes; the buffers the
+//! kernels write are shared. Nothing is allocated per batch.
 //!
 //! Buffer bindings: group 0 is the batch (`shaders/common.wgsl`); group 1
 //! is the records at binding 0 and the slots at binding 1; groups from 2
@@ -19,6 +20,8 @@ use std::sync::Arc;
 use bytemuck::Pod;
 
 use super::device::Gpu;
+use super::host::HostBuffer;
+use std::sync::atomic::{AtomicBool, Ordering};
 use super::shader::{Fragment, Source};
 use super::tiles::{BatchHeader, BusyHead, DispatchArgs, TileBox, TileGrid, MASK_WORDS, MAX_GROUPS, MAX_PRIMS, TILE_H, TILE_W};
 
@@ -127,6 +130,26 @@ fn layout_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLay
     }
 }
 
+/// What the CPU writes for one batch, in host memory the kernels read
+/// directly (`HostBuffer`): the header, the tile boxes, the records and the
+/// slots, with the bind groups over them. Several sets rotate; one is
+/// written again only once the submission that read it has completed.
+struct BatchSet {
+    header: HostBuffer,
+    boxes: HostBuffer,
+    records: HostBuffer,
+    slots: HostBuffer,
+    bin_group: wgpu::BindGroup,
+    batch_group: wgpu::BindGroup,
+    records_group: wgpu::BindGroup,
+    /// No submission in flight reads the set.
+    done: Arc<AtomicBool>,
+}
+
+/// Sets made with the batch: enough for the submissions a running board
+/// keeps in flight. More are added, and kept, when all are busy.
+const BATCH_SETS: usize = 4;
+
 /// The recorder and its GPU buffers. `R` is the board's setup record, `S`
 /// its state slot; both are plain `repr(C)` data laid out as the board's
 /// WGSL declares them.
@@ -138,17 +161,17 @@ pub struct Batch<R: Pod, S: Pod> {
     records: Vec<R>,
     boxes: Vec<[u32; 4]>,
     slots: Vec<S>,
-    header_buf: wgpu::Buffer,
+    // Written by the kernels, shared by every set: the queue orders the
+    // batches.
     masks_buf: wgpu::Buffer,
     busy_buf: wgpu::Buffer,
     args_buf: wgpu::Buffer,
     flags_buf: wgpu::Buffer,
-    boxes_buf: wgpu::Buffer,
-    records_buf: wgpu::Buffer,
-    slots_buf: wgpu::Buffer,
-    bin_group: wgpu::BindGroup,
-    batch_group: wgpu::BindGroup,
-    records_group: wgpu::BindGroup,
+    sets: Vec<BatchSet>,
+    /// The set the next flush writes, once chosen (`next_set`).
+    claimed: Option<usize>,
+    /// The set the last flush wrote.
+    last_set: usize,
     /// Batches flushed so far.
     pub flushes: u64,
     /// Primitives drawn so far.
@@ -161,43 +184,11 @@ impl<R: Pod, S: Pod> Batch<R, S> {
     pub fn new(gpu: &Arc<Gpu>, pipelines: &BatchPipelines, grid: TileGrid, max_slots: u32) -> Batch<R, S> {
         let tiles = grid.tiles().max(1);
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let header_buf = gpu.buffer("batch header", 32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let masks_buf = gpu.buffer("batch masks", tiles as u64 * MASK_WORDS as u64 * 4, storage);
         let busy_buf = gpu.buffer("batch busy", 16 + tiles as u64 * 4, storage);
         let args_buf = gpu.buffer("batch dispatch args", 16, storage | wgpu::BufferUsages::INDIRECT);
         let flags_buf = gpu.buffer("batch flags", tiles as u64 * 4, storage);
-        let boxes_buf = gpu.buffer("batch boxes", MAX_PRIMS as u64 * 16, storage);
-        let records_buf = gpu.buffer("batch records", MAX_PRIMS as u64 * size_of::<R>().max(4) as u64, storage);
-        let slots_buf = gpu.buffer("batch slots", max_slots.max(1) as u64 * size_of::<S>().max(4) as u64, storage);
-        let batch_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("batch"),
-            layout: &pipelines.batch_layout,
-            entries: &[
-                entry(0, &header_buf),
-                entry(1, &masks_buf),
-                entry(2, &busy_buf),
-                entry(3, &flags_buf),
-                entry(4, &boxes_buf),
-            ],
-        });
-        let bin_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("batch bin"),
-            layout: &pipelines.bin_layout,
-            entries: &[
-                entry(0, &header_buf),
-                entry(1, &masks_buf),
-                entry(2, &busy_buf),
-                entry(3, &flags_buf),
-                entry(4, &boxes_buf),
-                entry(5, &args_buf),
-            ],
-        });
-        let records_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("batch records"),
-            layout: &pipelines.records_layout,
-            entries: &[entry(0, &records_buf), entry(1, &slots_buf)],
-        });
-        Batch {
+        let mut b = Batch {
             gpu: Arc::clone(gpu),
             grid,
             tiles_allocated: tiles,
@@ -205,21 +196,94 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             records: Vec::with_capacity(MAX_PRIMS as usize),
             boxes: Vec::with_capacity(MAX_PRIMS as usize),
             slots: Vec::with_capacity(max_slots as usize),
-            header_buf,
             masks_buf,
             busy_buf,
             args_buf,
             flags_buf,
-            boxes_buf,
-            records_buf,
-            slots_buf,
-            bin_group,
-            batch_group,
-            records_group,
+            sets: Vec::with_capacity(BATCH_SETS),
+            claimed: None,
+            last_set: 0,
             flushes: 0,
             prims_total: 0,
             _p: PhantomData,
+        };
+        for _ in 0..BATCH_SETS {
+            b.add_set(pipelines);
         }
+        b
+    }
+
+    /// One more set of the CPU-written buffers and their bind groups.
+    fn add_set(&mut self, pipelines: &BatchPipelines) {
+        let gpu = &self.gpu;
+        let storage = wgpu::BufferUsages::STORAGE;
+        let n = self.sets.len();
+        let header = HostBuffer::new(gpu, &format!("batch header {n}"), 32, wgpu::BufferUsages::UNIFORM);
+        let boxes = HostBuffer::new(gpu, &format!("batch boxes {n}"), MAX_PRIMS as u64 * 16, storage);
+        let records = HostBuffer::new(gpu, &format!("batch records {n}"), MAX_PRIMS as u64 * size_of::<R>().max(4) as u64, storage);
+        let slots = HostBuffer::new(gpu, &format!("batch slots {n}"), self.max_slots.max(1) as u64 * size_of::<S>().max(4) as u64, storage);
+        let batch_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("batch"),
+            layout: &pipelines.batch_layout,
+            entries: &[
+                entry(0, &header.buffer),
+                entry(1, &self.masks_buf),
+                entry(2, &self.busy_buf),
+                entry(3, &self.flags_buf),
+                entry(4, &boxes.buffer),
+            ],
+        });
+        let bin_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("batch bin"),
+            layout: &pipelines.bin_layout,
+            entries: &[
+                entry(0, &header.buffer),
+                entry(1, &self.masks_buf),
+                entry(2, &self.busy_buf),
+                entry(3, &self.flags_buf),
+                entry(4, &boxes.buffer),
+                entry(5, &self.args_buf),
+            ],
+        });
+        let records_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("batch records"),
+            layout: &pipelines.records_layout,
+            entries: &[entry(0, &records.buffer), entry(1, &slots.buffer)],
+        });
+        self.sets.push(BatchSet { header, boxes, records, slots, bin_group, batch_group, records_group, done: Arc::new(AtomicBool::new(true)) });
+    }
+
+    /// The set the next flush writes: the next one whose last submission
+    /// has completed, or a new one when none has. A board with buffers of
+    /// its own per set (`GpuRaster`'s stage) writes that set's before the
+    /// flush.
+    pub fn next_set(&mut self, pipelines: &BatchPipelines) -> usize {
+        if let Some(k) = self.claimed {
+            return k;
+        }
+        let n = self.sets.len();
+        let free = |sets: &[BatchSet]| (1..=n).map(|d| (self.last_set + d) % n).find(|&k| sets[k].done.load(Ordering::Acquire));
+        let k = match free(&self.sets) {
+            Some(k) => k,
+            None => {
+                self.gpu.poll();
+                match free(&self.sets) {
+                    Some(k) => k,
+                    None => {
+                        self.add_set(pipelines);
+                        log::info!("wgpu: batch sets grown to {}", n + 1);
+                        n
+                    }
+                }
+            }
+        };
+        self.claimed = Some(k);
+        k
+    }
+
+    /// Sets made so far.
+    pub fn sets(&self) -> usize {
+        self.sets.len()
     }
 
     pub fn grid(&self) -> TileGrid {
@@ -277,12 +341,6 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         Ok(self.records.len() as u32 - 1)
     }
 
-    /// The group 0 and group 1 bind groups, for a board that encodes its
-    /// own passes around the batch.
-    pub fn bind_groups(&self) -> (&wgpu::BindGroup, &wgpu::BindGroup) {
-        (&self.batch_group, &self.records_group)
-    }
-
     /// Upload and draw what was recorded, with `groups` bound from group 2
     /// up. Returns the submission, or None when nothing was recorded.
     pub fn flush(&mut self, pipelines: &BatchPipelines, groups: &[&wgpu::BindGroup]) -> Option<wgpu::SubmissionIndex> {
@@ -290,7 +348,10 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             self.slots.clear();
             return None;
         }
-        let q = &self.gpu.queue;
+        let k = self.next_set(pipelines);
+        self.claimed = None;
+        self.last_set = k;
+        let set = &self.sets[k];
         let header = BatchHeader {
             prim_count: self.records.len() as u32,
             tile_cols: self.grid.cols(),
@@ -300,21 +361,21 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             origin_y: self.grid.origin_y,
             _pad: [0; 2],
         };
-        q.write_buffer(&self.header_buf, 0, bytemuck::bytes_of(&header));
-        q.write_buffer(&self.busy_buf, 0, bytemuck::bytes_of(&BusyHead::default()));
-        q.write_buffer(&self.args_buf, 0, bytemuck::bytes_of(&DispatchArgs::EMPTY));
-        q.write_buffer(&self.boxes_buf, 0, bytemuck::cast_slice(&self.boxes));
-        q.write_buffer(&self.records_buf, 0, bytemuck::cast_slice(&self.records));
+        set.header.write(0, bytemuck::bytes_of(&header));
+        set.boxes.write(0, bytemuck::cast_slice(&self.boxes));
+        set.records.write(0, bytemuck::cast_slice(&self.records));
         if !self.slots.is_empty() {
-            q.write_buffer(&self.slots_buf, 0, bytemuck::cast_slice(&self.slots));
+            set.slots.write(0, bytemuck::cast_slice(&self.slots));
         }
+        self.gpu.write(&self.busy_buf, 0, bytemuck::bytes_of(&BusyHead::default()));
+        self.gpu.write(&self.args_buf, 0, bytemuck::bytes_of(&DispatchArgs::EMPTY));
 
         let mut enc = self.gpu.encoder("batch");
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bin"), timestamp_writes: None });
             pass.set_pipeline(&pipelines.bin);
-            pass.set_bind_group(0, &self.bin_group, &[]);
-            pass.set_bind_group(1, &self.records_group, &[]);
+            pass.set_bind_group(0, &set.bin_group, &[]);
+            pass.set_bind_group(1, &set.records_group, &[]);
             for (i, g) in groups.iter().enumerate() {
                 pass.set_bind_group(2 + i as u32, *g, &[]);
             }
@@ -323,14 +384,17 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("raster"), timestamp_writes: None });
             pass.set_pipeline(&pipelines.raster);
-            pass.set_bind_group(0, &self.batch_group, &[]);
-            pass.set_bind_group(1, &self.records_group, &[]);
+            pass.set_bind_group(0, &set.batch_group, &[]);
+            pass.set_bind_group(1, &set.records_group, &[]);
             for (i, g) in groups.iter().enumerate() {
                 pass.set_bind_group(2 + i as u32, *g, &[]);
             }
             pass.dispatch_workgroups_indirect(&self.args_buf, 0);
         }
+        set.done.store(false, Ordering::Release);
         let submission = self.gpu.submit(enc);
+        let done = Arc::clone(&set.done);
+        self.gpu.on_done(move || done.store(true, Ordering::Release));
         self.flushes += 1;
         self.prims_total += self.records.len() as u64;
         self.records.clear();

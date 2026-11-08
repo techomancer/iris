@@ -113,17 +113,17 @@ impl Ng1Scanout {
 
     /// The planes and the slot of `src` up to the GPU.
     fn upload(&mut self, src: &CompositorSource<'_>) -> Vec<u8> {
-        let q = &self.scanout.gpu().queue;
+        let q = self.scanout.gpu();
         let words = |s: &[u32]| PLANE_WORDS.min(s.len()) & !1;
         let n = words(src.fb_rgb);
-        q.write_buffer(&self.rgb, 0, bytemuck::cast_slice(&src.fb_rgb[..n]));
+        q.write(&self.rgb, 0, bytemuck::cast_slice(&src.fb_rgb[..n]));
         let m = words(src.fb_aux);
-        q.write_buffer(&self.aux, 0, bytemuck::cast_slice(&src.fb_aux[..m]));
+        q.write(&self.aux, 0, bytemuck::cast_slice(&src.fb_aux[..m]));
         // The window-id map's rows on screen, whole words.
         let d = (src.height.max(1) * crate::disp::FB_STRIDE).min(src.did.len()).min(DID_BYTES) & !3;
-        q.write_buffer(&self.did, 0, &src.did[..d]);
+        q.write(&self.did, 0, &src.did[..d]);
         let v = src.vc2_ram.len().min(VC2_WORDS) & !1;
-        q.write_buffer(&self.vc2, 0, bytemuck::cast_slice(&src.vc2_ram[..v]));
+        q.write(&self.vc2, 0, bytemuck::cast_slice(&src.vc2_ram[..v]));
         self.uploaded += 4 * (n + m) as u64 + d as u64 + 2 * v as u64;
         bytemuck::bytes_of(&Ng1Slot::of(src)).to_vec()
     }

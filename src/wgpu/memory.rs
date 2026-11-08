@@ -14,48 +14,64 @@ pub struct GpuMemory {
     staging: Staging,
 }
 
-/// A readback buffer, grown on demand and reused: copies ranges of a GPU
-/// buffer into itself, waits, and maps.
+/// A readback buffer of a fixed size, allocated on first use and kept:
+/// copies ranges of a GPU buffer into itself, waits, and maps. A read
+/// larger than the buffer goes through it in pieces.
 #[derive(Default)]
 pub struct Staging {
     buffer: Option<wgpu::Buffer>,
 }
 
+/// The staging buffer's size: a whole 1280 x 1024 frame and the region
+/// reads the boards make fit at once.
+const STAGING_BYTES: u64 = 16 << 20;
+
 impl Staging {
-    /// Read `ranges` (offset, length; each 4-aligned) of `src` in one copy
-    /// and one wait, concatenated in order. Waits for every submission so
-    /// far.
+    /// Read `ranges` (offset, length; each 4-aligned) of `src`,
+    /// concatenated in order, in as few copies and waits as the buffer
+    /// allows. Waits for every submission so far.
     pub fn read(&mut self, gpu: &Gpu, src: &wgpu::Buffer, ranges: &[(u64, u64)]) -> Result<Vec<u8>, String> {
         let span: u64 = ranges.iter().map(|r| r.1).sum();
+        let mut out = Vec::with_capacity(span as usize);
         if span == 0 {
-            return Ok(Vec::new());
+            return Ok(out);
         }
-        let staging = match &self.buffer {
-            Some(s) if s.size() >= span => s,
-            _ => {
-                let s = gpu.buffer("readback", span.max(1 << 16), wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
-                self.buffer.insert(s)
+        let staging = self.buffer.get_or_insert_with(|| gpu.buffer("readback", STAGING_BYTES, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST)).clone();
+        let mut ranges = ranges.iter().copied().peekable();
+        let mut rest: Option<(u64, u64)> = None;
+        loop {
+            // Fill the buffer with as much of the ranges as fits.
+            let mut enc = gpu.encoder("readback");
+            let mut at = 0;
+            while at < STAGING_BYTES {
+                let Some((off, len)) = rest.take().or_else(|| ranges.next()) else { break };
+                debug_assert!(off % 4 == 0 && len % 4 == 0 && off + len <= src.size());
+                let n = len.min(STAGING_BYTES - at);
+                enc.copy_buffer_to_buffer(src, off, &staging, at, n);
+                at += n;
+                if n < len {
+                    rest = Some((off + n, len - n));
+                }
             }
-        };
-        let mut enc = gpu.encoder("readback");
-        let mut at = 0;
-        for &(off, len) in ranges {
-            debug_assert!(off % 4 == 0 && len % 4 == 0 && off + len <= src.size());
-            enc.copy_buffer_to_buffer(src, off, staging, at, len);
-            at += len;
+            if at == 0 {
+                break;
+            }
+            let submission = gpu.submit(enc);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            staging.slice(..at).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            gpu.wait(Some(submission))?;
+            rx.recv().map_err(|e| format!("readback callback: {e}"))?.map_err(|e| format!("map readback: {e}"))?;
+            {
+                let view = staging.slice(..at).get_mapped_range().map_err(|e| format!("readback range: {e}"))?;
+                out.extend_from_slice(&view);
+            }
+            staging.unmap();
+            if rest.is_none() && ranges.peek().is_none() {
+                break;
+            }
         }
-        let submission = gpu.submit(enc);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        staging.slice(..span).map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        gpu.wait(Some(submission))?;
-        rx.recv().map_err(|e| format!("readback callback: {e}"))?.map_err(|e| format!("map readback: {e}"))?;
-        let out = {
-            let view = staging.slice(..span).get_mapped_range().map_err(|e| format!("readback range: {e}"))?;
-            view.to_vec()
-        };
-        staging.unmap();
         Ok(out)
     }
 }
@@ -86,7 +102,7 @@ impl GpuMemory {
     /// submitted after it.
     pub fn write(&self, offset: u64, bytes: &[u8]) {
         debug_assert!(offset + bytes.len() as u64 <= self.size);
-        self.gpu.queue.write_buffer(&self.buffer, offset, bytes);
+        self.gpu.write(&self.buffer, offset, bytes);
     }
 
     /// Zero `len` bytes at `offset`, ordered like a write.

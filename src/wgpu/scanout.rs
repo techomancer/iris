@@ -161,9 +161,8 @@ impl Scanout {
         if slot.len() as u64 > self.slot_buf.size() {
             return Err(format!("scanout: a slot of {} bytes does not fit {}", slot.len(), self.slot_buf.size()));
         }
-        let q = &self.gpu.queue;
-        q.write_buffer(&self.header_buf, 0, bytemuck::bytes_of(&Header { width, height, stride: width, pad: 0 }));
-        q.write_buffer(&self.slot_buf, 0, slot);
+        self.gpu.write(&self.header_buf, 0, bytemuck::bytes_of(&Header { width, height, stride: width, pad: 0 }));
+        self.gpu.write(&self.slot_buf, 0, slot);
         let mut enc = self.gpu.encoder("scanout");
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("scanout"), timestamp_writes: None });
