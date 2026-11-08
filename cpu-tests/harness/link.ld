@@ -59,10 +59,12 @@ SECTIONS
         _stack_bottom = .;
         . += 0x10000;
         _stack_top = .;
-        /* Scratch pages for the mem/tlb/cache tests: 16 MB-aligned so a
-         * 16 MB TLB page can map them, and large enough for a 4-way cache
-         * eviction sweep. */
-        . = ALIGN(0x4000);
+        /* Scratch pages for the mem/tlb/cache tests, large enough for a
+         * 4-way cache eviction sweep. 32 KB-aligned so offset N in here has
+         * VA[14:12] = N[14:12] through KSEG0: the tlb, excep and umode tests
+         * map these pages at user addresses chosen to match, and the R4400
+         * raises a Virtual Coherency exception when they do not. */
+        . = ALIGN(0x8000);
         _scratch_start = .;
         . += 0x40000;              /* 256 KB */
         _scratch_end = .;
