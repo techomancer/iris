@@ -322,20 +322,38 @@ impl Presenter {
         if fw == 0 || fh == 0 {
             return Ok(());
         }
-        let target = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                // Draw this one; configure again for the next.
-                self.surface.configure(&self.gpu.device, &self.config);
-                t
+        // A texture the surface calls suboptimal (the window changed size
+        // under it, as while its border is dragged) is given back before the
+        // surface is configured again: wgpu refuses to configure a surface
+        // with a texture of its outstanding, and that refusal left the
+        // surface stale for every frame after. One retry on the fresh
+        // configuration; a frame that still cannot be had is skipped.
+        let mut target = None;
+        for attempt in 0..2 {
+            match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t) => {
+                    target = Some(t);
+                    break;
+                }
+                wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                    if attempt == 1 {
+                        // Still suboptimal on the fresh configuration: the
+                        // window moved again; draw it, the next frame catches up.
+                        target = Some(t);
+                        break;
+                    }
+                    drop(t);
+                    self.surface.configure(&self.gpu.device, &self.config);
+                }
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    self.surface.configure(&self.gpu.device, &self.config);
+                    return Ok(());
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+                wgpu::CurrentSurfaceTexture::Validation => return self.gpu.check(),
             }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.gpu.device, &self.config);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
-            wgpu::CurrentSurfaceTexture::Validation => return self.gpu.check(),
-        };
+        }
+        let Some(target) = target else { return Ok(()) };
 
         let mut enc = self.gpu.encoder("present");
         match frame {
