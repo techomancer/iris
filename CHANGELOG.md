@@ -65,6 +65,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   behind a PCI-to-PCI bridge (`bridge = true`). One namespace backed by a raw
   or CHD image, optionally copy-on-write; pin interrupts; saved in snapshots
   with the other disks ([docs/nvme.md](docs/nvme.md)).
+### R10000-family cache lines as memory
+
+- jitv2 does not compile a page any CPU's cache holds lines in: that CPU runs it from its own view in the interpreter, and every other page stays compiled.
 
 ### R10000 family fixes, R12000 and R14000
 
