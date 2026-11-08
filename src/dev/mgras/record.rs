@@ -461,7 +461,30 @@ pub(super) mod tests {
         // and the final state, unchecked.
         let check = std::env::var("MGRAS_REPLAY_NOCHECK").is_err();
         let t0 = std::time::Instant::now();
-        let rep = replay_recs(&m, &recs, check)?;
+        // On the GPU unit, at every checkpoint: the GPU scan-out's frame
+        // must be the CPU compose's of the same memory.
+        #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
+        let mut frames = 0usize;
+        #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
+        let mut scan_bad: Vec<String> = Vec::new();
+        let mut compare = |m: &Mgras| {
+            #[cfg(feature = "wgpu")]
+            if let Some((n, first)) = m.compare_scanouts() {
+                frames += 1;
+                if n != 0 {
+                    scan_bad.push(format!("checkpoint {frames}: {n} pixels differ, first (x, y, cpu, gpu) {first:x?}"));
+                }
+            }
+            let _ = m;
+        };
+        let rep = replay_recs_with(&m, &recs, check, &mut compare)?;
+        compare(&m);
+        if frames != 0 {
+            eprintln!("{path}: GPU scan-out compared with the CPU compose at {frames} frames, {} differ", scan_bad.len());
+        }
+        if !scan_bad.is_empty() {
+            return Err(format!("GPU scan-out differs:\n{}", scan_bad.join("\n")));
+        }
         let took = t0.elapsed();
         m.trace_flush(true);
         if let Some(p) = png {

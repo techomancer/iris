@@ -252,11 +252,25 @@ impl Mgras {
             }
             let dirty = self.dirty.swap(false, Ordering::AcqRel);
             let shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
+            // Someone reads `screen.rgba` (monitor screenshots, VNC): with
+            // the GPU scan-out, only then is a frame read back.
+            let want = self.frame_request.load(Ordering::Acquire) || self.capture.load(Ordering::Acquire) != 0;
             idle_frames += 1;
-            if dirty || shot || idle_frames >= 6 {
+            // The window shares the GPU unit's device: compose there and
+            // present from there, every frame (cheap; the cursor and the
+            // last batches show without a dirty mark).
+            #[cfg(feature = "wgpu")]
+            let on_gpu = self.presents_on_gpu() && !shot && !want && self.renderer.lock().as_ref().is_some_and(|r| r.takes_gpu_frames());
+            #[cfg(not(feature = "wgpu"))]
+            let on_gpu = false;
+            #[cfg(feature = "wgpu")]
+            if on_gpu {
+                self.present_on_gpu(&mut shown, &mut overlay, &mut status_bar, &mut sbtex, &stats);
+            }
+            if !on_gpu && (dirty || shot || want || idle_frames >= 6) {
                 idle_frames = 0;
                 let mut screen = self.screen.lock();
-                if dirty || shot {
+                if dirty || shot || want {
                     let screen = &mut *screen;
                     // The snapshot comes before this frame's retrace pulse:
                     // the last retrace's updates (window-ID tables, swaps)
@@ -265,13 +279,18 @@ impl Mgras {
                     // tolerated.
                     let rss = unsafe { &*self.rss.get() };
                     crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
-                    snap.snapshot(rss, &self.front_view().dcb);
-                    snap.compose(&mut screen.fb_rgb);
+                    let (w, h) = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
+                        Some(size) => size,
+                        None => {
+                            snap.snapshot(rss, &self.front_view().dcb);
+                            snap.compose(&mut screen.fb_rgb);
+                            (snap.width, snap.height)
+                        }
+                    };
                     crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
                     // The frame is already final RGB, so keep `rgba` (what CI
                     // screenshots read) current without a renderer readback,
                     // as GR2 does. This also makes screenshots work headless.
-                    let (w, h) = (snap.width, snap.height);
                     for y in 0..h {
                         let row = y * 2048;
                         screen.rgba[row..row + w].copy_from_slice(&screen.fb_rgb[row..row + w]);
@@ -280,6 +299,7 @@ impl Mgras {
                     screen.width = w;
                     screen.height = h;
                     screen.status_bar_only = false;
+                    self.frame_request.store(false, Ordering::Release);
                 } else {
                     screen.status_bar_only = true;
                 }
@@ -332,7 +352,74 @@ impl Mgras {
         self.display_stop.finish(&self.renderer);
     }
 
-    /// Start the engines and the display refresh thread.
+    /// With the GPU unit: compose the displayed frame on the GPU and read
+    /// it back into `out` (`frame.rs`'s layout); its size. None on the CPU
+    /// raster path, or if the scan-out fails (the planes are then composed
+    /// on the CPU, current as of the last sync).
+    fn compose_gpu_into(&self, rss: &Rss, out: &mut [u32]) -> Option<(usize, usize)> {
+        #[cfg(feature = "wgpu")]
+        {
+            // SAFETY: the scan-out is the display thread's (and this runs
+            // there, or from the monitor with the display stopped).
+            let sc = unsafe { &mut *self.gpu_scanout.get() }.as_mut()?;
+            match sc.read(rss, &self.front_view().dcb, out, frame::OUT_STRIDE) {
+                Ok(size) => {
+                    self.gpu_frames[1].fetch_add(1, Ordering::Relaxed);
+                    return Some(size);
+                }
+                Err(e) => eprintln!("mgras: GPU scan-out: {e}"),
+            }
+        }
+        let _ = (rss, out);
+        None
+    }
+
+    /// One frame composed on the GPU and presented from there by a renderer
+    /// on the same device: nothing is read back. `screen.rgba` keeps its
+    /// last frame.
+    #[cfg(feature = "wgpu")]
+    fn present_on_gpu(
+        &self,
+        shown: &mut (usize, usize),
+        overlay: &mut crate::debug_overlay::DebugOverlay,
+        status_bar: &mut crate::disp::StatusBar,
+        sbtex: &mut crate::disp::StatusBarTexture,
+        stats: &crate::disp::BarStats,
+    ) {
+        // SAFETY: the scan-out is the display thread's; the registers and
+        // the DCB are read racily, as the CPU snapshot reads them.
+        let Some(sc) = (unsafe { &mut *self.gpu_scanout.get() }).as_mut() else { return };
+        let rss = unsafe { &*self.rss.get() };
+        crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
+        let composed = sc.compose(rss, &self.front_view().dcb);
+        crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
+        let (buffer, w, h) = match composed {
+            Ok(f) => {
+                self.gpu_frames[0].fetch_add(1, Ordering::Relaxed);
+                f
+            }
+            Err(e) => {
+                eprintln!("mgras: GPU scan-out: {e}");
+                return;
+            }
+        };
+        let mut screen = self.screen.lock();
+        screen.width = w as usize;
+        screen.height = h as usize;
+        screen.prebuilt = true;
+        screen.status_bar_only = false;
+        if let Some(r) = self.renderer.lock().as_mut() {
+            if *shown != (w as usize, h as usize) {
+                *shown = (w as usize, h as usize);
+                r.resize(shown.0, shown.1);
+            }
+            crate::pf_begin!(crate::perfetto::events::MGRAS_PRESENT);
+            r.present_gpu_frame(&buffer, w, h, &mut screen, overlay, status_bar, sbtex, stats);
+            crate::pf_end!(crate::perfetto::events::MGRAS_PRESENT);
+        }
+    }
+
+    /// Start the engines and the display refresh thread.    /// Start the engines and the display refresh thread.
     pub fn start_display(self: &Arc<Self>) {
         self.start_engines();
         if self.running.swap(true, Ordering::AcqRel) {

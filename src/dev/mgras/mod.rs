@@ -383,6 +383,21 @@ pub struct Mgras {
     /// (`Rex3Screen::prebuilt`), as GR2 does.
     screen: Mutex<crate::disp::Rex3Screen>,
     screenshot_pending: AtomicBool,
+    /// A consumer wants the next frame in `screen.rgba` (`request_frame`),
+    /// and how many keep wanting every frame there (`set_capture`, VNC):
+    /// with the GPU scan-out presenting on the GPU, only then is a frame
+    /// read back.
+    frame_request: AtomicBool,
+    capture: AtomicU32,
+    /// Frames the GPU scan-out presented on the GPU, and read back.
+    gpu_frames: [AtomicU64; 2],
+    /// The GPU scan-out over the GPU unit's pixel pages, the display
+    /// thread's alone, and the device it runs on (the wgpu window shares
+    /// it, so frames are presented with no readback).
+    #[cfg(feature = "wgpu")]
+    gpu_scanout: UnsafeCell<Option<Box<wgpu::scanout::MgrasScanout>>>,
+    #[cfg(feature = "wgpu")]
+    gpu_device: Option<Arc<crate::wgpu::Gpu>>,
     status: Arc<crate::disp::StatusSource>,
     /// Annotated trace (`mgras trace`); `trace_mask` gates the hot paths.
     trace: SpinLock<debug::MgrasTrace>,
@@ -426,6 +441,8 @@ impl Hq3Sink for HqSink<'_> {
     }
     fn dma_read_line(&mut self, line: u32) -> Vec<u8> {
         self.0.drain_rss();
+        // SAFETY: the RSS is drained and idle; only the HQ3 feeds it now.
+        unsafe { &mut *self.0.rss.get() }.gpu_sync_transfer();
         // SAFETY: as in `transfer`.
         unsafe { &*self.0.rss.get() }.dma_read_line(line)
     }
@@ -525,12 +542,14 @@ impl Mgras {
             return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
         }
         #[cfg(feature = "wgpu")]
-        let unit = if gpu {
+        let (unit, scanout, device) = if gpu {
             let g = crate::wgpu::Gpu::new(&crate::wgpu::GpuOptions { backend: backend.to_string(), ..Default::default() })?;
             eprintln!("mgras: raster engine on the GPU: {}", g.caps);
-            Some(Box::new(wgpu::GpuRaster::new(&g)?))
+            let unit = Box::new(wgpu::GpuRaster::new(&g)?);
+            let scanout = Box::new(wgpu::scanout::MgrasScanout::new(&g, &unit.pix_buffer())?);
+            (Some(unit), Some(scanout), Some(g))
         } else {
-            None
+            (None, None, None)
         };
         let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
         let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
@@ -566,6 +585,8 @@ impl Mgras {
             (*p).rss_fifo.set_heads(nrss);
             #[cfg(feature = "wgpu")]
             {
+                addr_of_mut!((*p).gpu_scanout).write(UnsafeCell::new(scanout));
+                addr_of_mut!((*p).gpu_device).write(device);
                 addr_of_mut!((*p).gpu_unit).write(UnsafeCell::new(unit));
                 if let Some(u) = (*(*p).gpu_unit.get()).as_mut() {
                     // Engine 0's primitives go to the unit, which starts
@@ -791,6 +812,7 @@ impl Mgras {
     fn state_bytes(&self) -> Vec<u8> {
         const RW: u32 = 1280;
         const RH: u32 = 1024;
+        self.mirror_sync();
         // SAFETY: idle, and the caller holds `submit` (see the Sync impl).
         let rss = unsafe { &*self.rss.get() };
         let f = self.front();
@@ -882,6 +904,37 @@ impl Mgras {
         Some((h, r.records))
     }
 
+    /// With the GPU unit: bring the planes current from its memory (a
+    /// readback of what drawing changed since the last). Call with the
+    /// board idle and `submit` held, or on the HQ3 thread after
+    /// `drain_rss`.
+    fn mirror_sync(&self) {
+        #[cfg(feature = "wgpu")]
+        // SAFETY: the board is idle (see above): engine 0's thread does not
+        // touch its state or the unit.
+        unsafe { &mut *self.rss.get() }.gpu_sync();
+    }
+
+    /// `mirror_sync` from anywhere: holds `submit` and waits for the board
+    /// to go idle first. Nothing to do on the CPU raster path. Not with
+    /// `submit` or the front lock held.
+    fn mirror_now(&self) {
+        #[cfg(feature = "wgpu")]
+        if unsafe { (*self.gpu_unit.get()).is_some() } {
+            let _sub = self.submit.lock();
+            self.wait_idle();
+            self.mirror_sync();
+        }
+    }
+
+    /// Whether frames are composed on the GPU (the GPU unit's scan-out).
+    fn presents_on_gpu(&self) -> bool {
+        #[cfg(feature = "wgpu")]
+        return self.gpu_device.is_some();
+        #[cfg(not(feature = "wgpu"))]
+        false
+    }
+
     /// After a host GL composite wrote screen rows `y..y + h` of the
     /// displayed buffers into the planes: send those rows to the GPU unit,
     /// whose memory the planes mirror.
@@ -908,6 +961,7 @@ impl Mgras {
     pub fn composite(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
         let sub = self.submit.lock();
         self.wait_idle();
+        self.mirror_sync();
         // SAFETY: idle with `submit` held.
         let rss = unsafe { &mut *self.rss.get() };
         let ok = disp::composite(rss, &self.front().dcb, x, y, bgra, stride, w, h);
@@ -926,6 +980,7 @@ impl Mgras {
     pub fn composite_index(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize, overlay: bool) -> bool {
         let sub = self.submit.lock();
         self.wait_idle();
+        self.mirror_sync();
         // SAFETY: idle with `submit` held.
         let rss = unsafe { &mut *self.rss.get() };
         let ok = disp::composite_index(rss, &self.front().dcb, x, y, bgra, stride, w, h, overlay);
@@ -946,6 +1001,7 @@ impl Mgras {
     pub(crate) fn fb_pixel(&self, x: usize, y: usize) -> u32 {
         let _sub = self.submit.lock();
         self.wait_idle();
+        self.mirror_sync();
         // SAFETY: idle with `submit` held.
         let dcb = &self.front().dcb;
         let h = frame::display_size(dcb).1;
@@ -969,8 +1025,45 @@ impl Mgras {
         self.idle_state_hash()
     }
 
+    /// The displayed frame composed both ways, by the CPU from the synced
+    /// planes (`Frame::compose`) and by the GPU scan-out from the unit's
+    /// memory: the differing pixels, the first few as (x, y, cpu, gpu).
+    /// None without the GPU unit.
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn compare_scanouts(&self) -> Option<(usize, Vec<(usize, usize, u32, u32)>)> {
+        let _sub = self.submit.lock();
+        self.wait_idle();
+        self.mirror_sync();
+        // SAFETY: idle with `submit` held; no display thread runs in tests.
+        let sc = unsafe { &mut *self.gpu_scanout.get() }.as_mut()?;
+        let rss = unsafe { &*self.rss.get() };
+        let f = self.front();
+        let mut snap = plain::boxed_zeroed::<frame::Frame>();
+        snap.snapshot(rss, &f.dcb);
+        let mut cpu = vec![0u32; frame::OUT_STRIDE * frame::H];
+        snap.compose(&mut cpu);
+        let mut gpu = vec![0u32; frame::OUT_STRIDE * frame::H];
+        let (w, h) = sc.read(rss, &f.dcb, &mut gpu, frame::OUT_STRIDE).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((w, h), (snap.width, snap.height), "the scan-out's size");
+        let mut n = 0;
+        let mut first = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * frame::OUT_STRIDE + x;
+                if cpu[i] != gpu[i] {
+                    n += 1;
+                    if first.len() < 8 {
+                        first.push((x, y, cpu[i], gpu[i]));
+                    }
+                }
+            }
+        }
+        Some((n, first))
+    }
+
     /// A frame snapshot of what is displayed now (monitor, screenshots).
     fn snapshot_frame(&self) -> Box<frame::Frame> {
+        self.mirror_now();
         let mut f = plain::boxed_zeroed::<frame::Frame>();
         // SAFETY: a read-only view; tearing tolerated.
         let rss = unsafe { &*self.rss.get() };
@@ -1272,6 +1365,8 @@ impl Mgras {
             host::PIO_READ_HI => {
                 // Taking the high half moves the stream on; the RSS does
                 // that, in order (the FIFO is empty, so this fits).
+                // SAFETY: idle with `submit` held.
+                unsafe { &mut *self.rss.get() }.gpu_sync_transfer();
                 let v = unsafe { &*self.rss.get() }.pio_peek_hi();
                 self.hq_fifo.push(tag::PIO_ADVANCE, 0);
                 self.wake_hq();
@@ -1516,10 +1611,12 @@ impl Mgras {
             let Some((t, val)) = self.rss_fifo.peek_at(id) else {
                 self.rss_fifo.flush_head_at(id);
                 if is_busy {
-                    // The GPU unit's drawing reaches the planes before the
-                    // engine reports idle: every reader waits for idle.
+                    // The GPU unit's drawing is submitted before the engine
+                    // reports idle: a swap the idle board answers shows it,
+                    // and readers bring the planes current themselves
+                    // (`mirror_sync`).
                     // SAFETY: this engine's thread owns its raster state.
-                    unsafe { &mut *cell.get() }.gpu_sync();
+                    unsafe { &mut *cell.get() }.gpu_flush();
                     #[cfg(feature = "wgpu")]
                     {
                         synced = std::time::Instant::now();
@@ -1610,15 +1707,15 @@ impl Mgras {
             }
             self.rss_fifo.consume_at(id);
             backoff.reset();
-            // A long busy stretch: bring the display's mirror current
-            // about once a frame.
+            // A long busy stretch: submit what is recorded every few
+            // milliseconds, so the scan-out follows the drawing.
             #[cfg(feature = "wgpu")]
             if rss.gpu.get().is_some() {
                 since_clock += 1;
-                if since_clock >= 1024 {
+                if since_clock >= 256 {
                     since_clock = 0;
-                    if synced.elapsed() >= std::time::Duration::from_millis(16) {
-                        rss.gpu_sync();
+                    if synced.elapsed() >= std::time::Duration::from_millis(4) {
+                        rss.gpu_flush();
                         synced = std::time::Instant::now();
                     }
                 }
@@ -1680,6 +1777,21 @@ impl crate::gfx_display::GfxDisplay for Mgras {
     fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
     fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
+    fn request_frame(&self) {
+        if self.presents_on_gpu() {
+            self.frame_request.store(true, Ordering::Release);
+        }
+    }
+    fn frame_pending(&self) -> bool { self.frame_request.load(Ordering::Acquire) }
+    fn set_capture(&self, on: bool) {
+        if on {
+            self.capture.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let _ = self.capture.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        }
+    }
+    #[cfg(feature = "wgpu")]
+    fn gpu(&self) -> Option<Arc<crate::wgpu::Gpu>> { self.gpu_device.clone() }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.status.cycles() }
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         // A racy read of the VC3, as the display thread's snapshot does.

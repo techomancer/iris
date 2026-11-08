@@ -523,12 +523,15 @@ sampler `Te1::sampler` resolves and the polygon stipple rows.
   an X line's Bresenham step in closed form (`xline_step`, n =
   floor((2 minor k + major) / (2 major)), brute-forced against the
   interpreter's loop); the stipple or transfer row and column; a
-  triangle's edges at the lane's row and a GL line's minor extent at its
-  step, both in **exact software doubles** (`src/wgpu/shaders/f64.wgsl`:
-  add, sub, mul, floor, ceil rounded as the host; tested bit for bit
-  against Rust f64 on 100k cases in `src/wgpu/tests/softfloat.rs`), so
-  coverage is the interpreter's without an i64 fast path or flags. The
-  64/128-bit integer arithmetic of the texture unit is `wide.wgsl`.
+  triangle's span bounds at the lane's row and a GL line's minor extent
+  at its step. The model walks both in integers since 2026-11-08
+  (interpreter, JIT and kernels alike; `clanker/mgras/gr4-jit.md`): an
+  edge is (C, B) with the bound `-((B j + C) >> 25)`, a GL line a DDA
+  `(qk + qs p) >> 32`, i64 products and shifts per lane (`wide.wgsl`,
+  which also carries the texture unit's 64/128-bit arithmetic). The first
+  version evaluated the f64 walk in exact software doubles
+  (`src/wgpu/shaders/f64.wgsl`, kept as a tested library), about ten
+  times the per-lane work.
 - **Memory.** Pixel pages (binding 0, 48 MiB, atomics: four overlay cells
   share a word), clip-ID planes (binding 1, atomics), TRAM (binding 2,
   read only), the transfer stage (binding 3, per batch set), RECIP and
@@ -571,10 +574,27 @@ sampler `Te1::sampler` resolves and the polygon stipple rows.
   overlay, `lightning,wgpu`) boots on the unit through the PROM's
   power-on screen, xdm and the 4Dwm desktop, and runs both demos.
 
-Open: per-row edge sharing (eight lanes of a tile row compute the
-same doubles) or an integer edge path when the setup proves the f64 walk
-exact; a GPU scan-out (the display reads the mirror today); the display
-syncs cost a GPU wait each.
+- **Scan-out on the GPU (2026-11-08).** `wgpu/scanout.rs` and
+  `shaders/scanout.wgsl` are `Frame::snapshot` and `Frame::compose` over
+  the unit's pages: the slot is the frame's decoded state (XMAP modes,
+  colormap 0, gamma, the cursor glyph and colours, the VC3 window-ID runs
+  as a run list per row). With `renderer = "wgpu"` the window shares the
+  unit's device (`GfxDisplay::gpu`) and frames are presented from there;
+  a frame is read back only when someone reads `screen.rgba` (monitor
+  `screen`, VNC capture, the screenshot hotkey, the GL renderer). The RSS
+  thread no longer syncs the mirror: it submits on idle and every 4 ms
+  while busy. Readers sync what they read: a guest's PIO or DMA read the
+  dirty pages under its block in its source buffer
+  (`Rss::gpu_sync_transfer`, `GpuRaster::sync_box`), `state_bytes` and the
+  monitor's pixel commands everything (`Mgras::mirror_now`). Checks:
+  `scanout_composes_as_the_cpu_frame` (random state, whole frames; nine
+  kernel mutations caught), every golden replay comparing the scan-out
+  with the CPU compose at each checkpoint (396 frames, both boards), and
+  `transfer_reads_see_the_drawing`. Live on the IP30 guest: about 6,000
+  frames presented with 0 bytes read back through the PROM.
+
+Open: per-row edge sharing (eight lanes of a tile row compute the same
+bounds); the host GL composite still uploads rows the CPU wrote.
 
 ## GR2 (XZ / Extreme), open
 

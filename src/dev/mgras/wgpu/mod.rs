@@ -17,10 +17,9 @@
 //! covered (the triangle's edges at its row, a line's closed-form
 //! Bresenham step, a block's rectangle) and then runs the pixel through the
 //! model's arithmetic (rss.rs, te1.rs, fixed.rs) function for function. The
-//! CPU walks triangle edges and GL lines in f64; the kernels evaluate the
-//! same expressions in an exact software double (`src/wgpu/shaders/
-//! f64.wgsl`), so a pixel is covered on the GPU exactly when the
-//! interpreter covers it.
+//! model walks triangle edges and GL lines in 64-bit integers
+//! (`rss::edge_bound`, `rss::gl_line_q0`), so a lane finds its row's span
+//! bounds with the interpreter's exact arithmetic.
 //!
 //! Memory: the pixel pages (`PixMem`: two engines' 12 MB as u64 words,
 //! binding 0), the clip-ID planes (binding 1) and TRAM (binding 2) are
@@ -35,6 +34,7 @@
 //! the memory layout here (`DRBsize` bits 7:6, which the kernels' locate
 //! follows), as it is for one CPU engine with `IRIS_MGRAS_ENGINES=1`.
 
+pub(crate) mod scanout;
 #[cfg(test)]
 mod tests;
 
@@ -121,16 +121,10 @@ const XFER_FRAG: u32 = 1;
 const XFER_DEPTH: u32 = 2;
 const XFER_STENCIL: u32 = 3;
 const XFER_ALPHA: u32 = 4;
-// Triangle (`TriSetup`): f64s as two words, low first.
-const T_X0: usize = 0;
-const T_X1: usize = 2;
-const T_X2: usize = 4;
-const T_YMID: usize = 6;
-const T_YREF: usize = 8;
-const T_YREF2: usize = 10;
-const T_S0: usize = 12;
-const T_S1: usize = 14;
-const T_S2: usize = 16;
+// Triangle (`TriSetup`): the edges (C, B as i64s, low word first: major,
+// upper minor, lower minor) and the row from which the upper serves.
+const T_EDGES: usize = 0;
+const T_JMID: usize = 12;
 const T_J0: usize = 18;
 const T_J1: usize = 19;
 const T_XS: usize = 20;
@@ -143,10 +137,9 @@ const TRI_LTOR: u32 = 1;
 const TRI_TEX: u32 = 2;
 const TRI_FOG: u32 = 4;
 const TRI_STIPPLE: u32 = 8;
-// GL line (`GlLineSetup`).
-const G_A0: usize = 0;
-const G_B0: usize = 2;
-const G_SLOPE: usize = 4;
+// GL line (`GlLineSetup`): the minor DDA (qk, qs as i64s).
+const G_QK: usize = 0;
+const G_QS: usize = 2;
 const G_P0: usize = 6;
 const G_P1: usize = 7;
 const G_DIR: usize = 8;
@@ -181,9 +174,6 @@ impl Rec {
         self.w[i + 1] = (v >> 32) as u32;
     }
 
-    fn set_f64(&mut self, i: usize, v: f64) {
-        self.set_i64(i, v.to_bits() as i64);
-    }
 }
 
 // ── slots ────────────────────────────────────────────────────────────────────
@@ -335,15 +325,8 @@ const DEFINES: &[(&str, u32)] = &[
     ("XFER_DEPTH", XFER_DEPTH),
     ("XFER_STENCIL", XFER_STENCIL),
     ("XFER_ALPHA", XFER_ALPHA),
-    ("T_X0", T_X0 as u32),
-    ("T_X1", T_X1 as u32),
-    ("T_X2", T_X2 as u32),
-    ("T_YMID", T_YMID as u32),
-    ("T_YREF", T_YREF as u32),
-    ("T_YREF2", T_YREF2 as u32),
-    ("T_S0", T_S0 as u32),
-    ("T_S1", T_S1 as u32),
-    ("T_S2", T_S2 as u32),
+    ("T_EDGES", T_EDGES as u32),
+    ("T_JMID", T_JMID as u32),
     ("T_J0", T_J0 as u32),
     ("T_J1", T_J1 as u32),
     ("T_XS", T_XS as u32),
@@ -356,9 +339,8 @@ const DEFINES: &[(&str, u32)] = &[
     ("TRI_TEX", TRI_TEX),
     ("TRI_FOG", TRI_FOG),
     ("TRI_STIPPLE", TRI_STIPPLE),
-    ("G_A0", G_A0 as u32),
-    ("G_B0", G_B0 as u32),
-    ("G_SLOPE", G_SLOPE as u32),
+    ("G_QK", G_QK as u32),
+    ("G_QS", G_QS as u32),
     ("G_P0", G_P0 as u32),
     ("G_P1", G_P1 as u32),
     ("G_DIR", G_DIR as u32),
@@ -507,7 +489,7 @@ impl GpuRaster {
                 label: "mgras",
                 raster: &[RSS],
                 bin_accept: None,
-                library: &[library::I64, library::WIDE, library::F64, PIXMEM, PP1, TE1],
+                library: &[library::I64, library::WIDE, PIXMEM, PP1, TE1],
                 defines: DEFINES,
                 layouts: &[&layout],
             },
@@ -670,6 +652,65 @@ impl GpuRaster {
             }
             Err(Full) => false,
         }
+    }
+
+    /// Every page (engine-major index) of buffer `buf` under the
+    /// framebuffer box `x0..=x1`, `y0..=y1` (clamped to the framebuffer).
+    fn buffer_pages(buf: &Buffer, b: (i32, i32, i32, i32), mut f: impl FnMut(usize)) {
+        let (x0, y0, x1, y1) = (b.0.max(0) as u32, b.1.max(0) as u32, b.2.min(WIDTH as i32 - 1), b.3.min(HEIGHT as i32 - 1));
+        if x1 < x0 as i32 || y1 < y0 as i32 {
+            return;
+        }
+        let (x1, y1) = (x1 as u32, y1 as u32);
+        let tile_w = if buf.kind == Kind::Wide { pixmem::TILE_W } else { pixmem::OVERLAY_TILE_W } as u32;
+        let (r0, r1) = ((y0 >> buf.yshift) / pixmem::TILE_H as u32, (y1 >> buf.yshift) / pixmem::TILE_H as u32);
+        for e in 0..(1usize << buf.yshift) {
+            for pr in r0..=r1 {
+                for pc in x0 / tile_w..=x1 / tile_w {
+                    f(e * PAGES + (buf.ptr + pr * buf.xtiles + pc) as usize % PAGES);
+                }
+            }
+        }
+    }
+
+    /// Bring the mirror `mem` current under framebuffer box `b` of buffers
+    /// `bufs` (a transfer's read): the pages there that drawing marked are
+    /// read back, after a wait; the others stay marked. Nothing waits when
+    /// none is marked.
+    pub fn sync_box(&mut self, mem: &mut PixMem, bufs: &[Buffer], b: (i32, i32, i32, i32)) -> Result<(), String> {
+        let mut pages = Vec::new();
+        for buf in bufs {
+            let dirty = &mut self.dirty_pages;
+            Self::buffer_pages(buf, b, |p| {
+                if dirty[p / 64] & 1 << (p % 64) != 0 {
+                    dirty[p / 64] &= !(1 << (p % 64));
+                    pages.push(p);
+                }
+            });
+        }
+        if pages.is_empty() {
+            return Ok(());
+        }
+        self.wait()?;
+        self.syncs += 1;
+        pages.sort_unstable();
+        let page_bytes = (PAGE_WORDS * 8) as u64;
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for p in pages {
+            match runs.last_mut() {
+                Some(r) if r.0 + r.1 == p as u64 * page_bytes => r.1 += page_bytes,
+                _ => runs.push((p as u64 * page_bytes, page_bytes)),
+            }
+        }
+        let bytes = self.pix.read_ranges(&runs)?;
+        self.read_back += bytes.len() as u64;
+        let mut at = 0usize;
+        for (off, len) in runs {
+            let w0 = off as usize / 8;
+            mem.words[w0..w0 + len as usize / 8].copy_from_slice(bytemuck::cast_slice(&bytes[at..at + len as usize]));
+            at += len as usize;
+        }
+        Ok(())
     }
 
     /// Note the pages and clip-ID rows a record may write.
@@ -847,6 +888,11 @@ impl GpuRaster {
     pub fn gpu(&self) -> &Arc<Gpu> {
         &self.gpu
     }
+
+    /// The pixel pages' buffer, for the scan-out.
+    pub fn pix_buffer(&self) -> wgpu::Buffer {
+        self.pix.buffer.clone()
+    }
 }
 
 // ── primitives, as the RSS hands them over ──────────────────────────────────
@@ -1022,9 +1068,11 @@ impl GpuRaster {
             flags |= TRI_STIPPLE;
         }
         let mut rec = Rec::new(REC_TRI, flags);
-        for (k, v) in [(T_X0, t.x0), (T_X1, t.x1), (T_X2, t.x2), (T_YMID, t.ymid), (T_YREF, t.yref), (T_YREF2, t.yref2), (T_S0, t.s0), (T_S1, t.s1), (T_S2, t.s2)] {
-            rec.set_f64(k, v);
+        for (k, e) in t.edges.iter().enumerate() {
+            rec.set_i64(T_EDGES + 4 * k, e[0]);
+            rec.set_i64(T_EDGES + 4 * k + 2, e[1]);
         }
+        rec.set_i(T_JMID, t.jmid);
         rec.set_i(T_J0, t.j0);
         rec.set_i(T_J1, t.j1);
         rec.set_i(T_XS, t.xs_i);
@@ -1091,9 +1139,8 @@ impl GpuRaster {
             flags |= GL_STIPPLE;
         }
         let mut rec = Rec::new(REC_GLLINE, flags);
-        rec.set_f64(G_A0, l.a0);
-        rec.set_f64(G_B0, l.b0);
-        rec.set_f64(G_SLOPE, l.slope);
+        rec.set_i64(G_QK, l.qk);
+        rec.set_i64(G_QS, l.qs);
         rec.set_i(G_P0, l.p0);
         rec.set_i(G_P1, l.p1);
         rec.set_i(G_DIR, l.dir);

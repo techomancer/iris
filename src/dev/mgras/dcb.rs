@@ -163,6 +163,12 @@ impl Dac {
     pub fn pixmask(&self) -> u32 {
         self.regs.lookup(DAC_PIXMASK).unwrap_or(0xFF)
     }
+
+    /// Set the pixel mask (tests).
+    #[cfg(test)]
+    pub fn set_pixmask(&mut self, v: u32) {
+        self.regs.insert(DAC_PIXMASK, v);
+    }
 }
 
 /// The XMAP: the pixel processors' display side (display modes per window ID,
@@ -298,6 +304,23 @@ impl Xmap {
     /// Display mode of window ID `did` (`MAIN_MODE`, index `did * 4`).
     pub fn main_mode(&self, did: u32) -> u32 {
         self.regs.get(key(xmap::MAIN_MODE, did << 2))
+    }
+
+    /// Set the display state directly (tests): window ID `did`'s main and
+    /// overlay modes.
+    #[cfg(test)]
+    pub fn set_modes(&mut self, did: u32, main: u32, overlay: u32) {
+        self.regs.insert(key(xmap::MAIN_MODE, did << 2), main);
+        self.regs.insert(key(xmap::OVERLAY_MODE, (did & 0x1F) << 2), overlay);
+    }
+
+    /// The buffer selects, the scan-out pointers and the config register
+    /// (tests).
+    #[cfg(test)]
+    pub fn set_scanout(&mut self, buf_select: u32, dib: u32, config: u32) {
+        self.regs.insert(key(xmap::BUF_SELECT, 0), buf_select);
+        self.regs.insert(key(xmap::DIB, 0), dib);
+        self.config = config;
     }
 }
 
