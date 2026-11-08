@@ -46,18 +46,44 @@ benchmark image iris embeds) is built with one compiler: GCC 16.2.1 for
 kernel runs, so a different one is a different benchmark: GCC 14.2 runs
 Dhrystone in 428 guest instructions per iteration where 16.2.1 needs 313.
 
-Build the compiler's container once, then run `make` inside it:
+The compiler runs in a container, so the build is the same on Linux, macOS and
+Windows. Use Docker (Docker Desktop on macOS and Windows) or Podman, and run
+the commands from the repository root. On Windows run them in a WSL 2 shell;
+that path is untested.
+
+Build the image once:
+
+```sh
+docker build -t iris-guest-toolchain -f cpu-tests/toolchain.Containerfile cpu-tests
+```
+
+Then run `make` in it:
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+    iris-guest-toolchain make -C cpu-tests all
+```
+
+With Podman:
 
 ```sh
 podman build -t iris-guest-toolchain -f cpu-tests/toolchain.Containerfile cpu-tests
-podman run --rm --userns=keep-id --security-opt label=disable \
-    -v "$PWD":/src -w /src iris-guest-toolchain \
-    make -C cpu-tests all        # or: make -C bench all
+podman run --rm --userns=keep-id --security-opt label=disable -v "$PWD":/src -w /src \
+    iris-guest-toolchain make -C cpu-tests all
 ```
 
-With Docker, replace `podman` with `docker` and `--userns=keep-id` with
-`--user "$(id -u):$(id -g)"`. Use the image's native architecture; emulating
-amd64 on arm64 crashed `cc1` at random.
+The targets you'll want:
+
+| Command | Builds |
+|---|---|
+| `make -C cpu-tests all` | the cpu-tests guest |
+| `make -C bench all` | the benchmark guest |
+| `make -C bench prebuilt` | `bench/prebuilt/irisbench.elf`, from clean; commit it |
+
+Mount the repository at `/src`: the build records paths relative to the
+repository root, so the output doesn't depend on where your checkout is. Use
+your machine's native architecture; emulating amd64 on arm64 crashed `cc1` at
+random. Podman on Linux x86-64 and Docker on macOS arm64 produce identical bytes.
 
 Installing Fedora 45's `gcc-mips64-linux-gnu` natively also works, and plain
 `make` finds it. Any other MIPS cross compiler still builds for quick local

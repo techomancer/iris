@@ -11,6 +11,16 @@
 GUEST_GCC_VERSION := 16.2.1
 GUEST_CROSS       := mips64-linux-gnu-
 
+# The repository root, for -ffile-prefix-map.
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))..)
+
+# Both suites compile with this, so their debug information records source
+# paths relative to the repository root rather than wherever the checkout
+# lives, and two builds of the same sources are byte-identical. The root
+# rather than each suite's directory, because bench compiles cpu-tests/harness
+# too.
+PREFIXMAP := -ffile-prefix-map=$(REPO_ROOT)=.
+
 # Search order when CROSS is not given: the pinned triple first, then the
 # names other distributions use (any version; see the warning below).
 # A candidate is accepted only if `$(name)gcc --version` actually runs — a
@@ -51,6 +61,6 @@ endif
 .PHONY: toolchain-check
 toolchain-check:
 	@command -v $(CC) >/dev/null 2>&1 || { \
-	  echo "error: $(CC) not found. See cpu-tests/docs/toolchain.md"; \
+	  echo "error: $(CC) not found. See $(REPO_ROOT)/cpu-tests/docs/toolchain.md"; \
 	  exit 1; }
 	@echo "toolchain: $$($(CC) --version | head -1)"
