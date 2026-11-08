@@ -88,6 +88,22 @@ counter instead, so each CPU's cache puts the same mark there when a page become
 held in its view and takes it off with the page's last line (`mark_foreign`). That
 work is at CACHE instructions only; a load, store or fetch is unchanged.
 
+## Primary instruction lines
+
+Only the Tezro's PROM uses these. A valid primary instruction line
+writes each 36-bit predecoded word (p. 288) into its page as the instruction it
+predecodes, through an eleven-class table inferred from PROM 6.210's words
+(`l1i_decode`). A word of another class leaves memory's word, where hardware would
+run it. A page held only for code also answers cached loads with code.
+
+The model never refills on a fetch. The PROM runs a staged secondary line
+and reads the primary words back with Index Load Data (I) to stage them itself, so
+Index Load Data (I) in a set a held secondary line maps to answers with that line's
+words predecoded (`refilled_word`), until Index Store Data (I) writes the set. When
+two held lines map one set, the later wins. An instruction no class holds comes back
+in the model's own form (bits 35:32 set, which takes classes 0x78-0x7f), which
+hardware would not produce. Index Load Tag (I) reads the stored tag.
+
 ## Seeing it
 
 `l2 probe 0` in the monitor prints how many lines hold pages and which. Every
