@@ -33,6 +33,17 @@ const COMMON: Fragment = Fragment::new("common.wgsl", include_str!("shaders/comm
 const BIN: Fragment = Fragment::new("bin.wgsl", include_str!("shaders/bin.wgsl"));
 const BIN_ACCEPT_ALL: Fragment = Fragment::new("bin_accept_all.wgsl", include_str!("shaders/bin_accept_all.wgsl"));
 const RASTER: Fragment = Fragment::new("raster.wgsl", include_str!("shaders/raster.wgsl"));
+const RASTER_ENTRY: Fragment = Fragment::new("raster_entry.wgsl", include_str!("shaders/raster_entry.wgsl"));
+const RASTER_ENTRY_SUBGROUP: Fragment = Fragment::new("raster_entry_subgroup.wgsl", include_str!("shaders/raster_entry_subgroup.wgsl"));
+const QUAD_SHARED: Fragment = Fragment::new("quad_shared.wgsl", include_str!("shaders/quad_shared.wgsl"));
+const QUAD_SUBGROUP: Fragment = Fragment::new("quad_subgroup.wgsl", include_str!("shaders/quad_subgroup.wgsl"));
+
+/// Whether the raster kernel's quads exchange values with subgroup
+/// operations: the device has them, and `WGPU_NO_SUBGROUPS` is not set
+/// (which tries the workgroup-memory path on a device that has them).
+pub fn quad_subgroups(gpu: &Gpu) -> bool {
+    gpu.caps.subgroups && std::env::var("WGPU_NO_SUBGROUPS").is_err()
+}
 
 /// A board's side of the kernels.
 pub struct ArchShaders<'a> {
@@ -112,7 +123,11 @@ impl BatchPipelines {
         bin_src = bin_src.body(arch.bin_accept.unwrap_or(BIN_ACCEPT_ALL));
         let bin = bin_src.compute_pipeline(&gpu.device, "bin", &bin_layouts)?;
 
-        let mut raster_src = base(&format!("{} raster", arch.label)).body(RASTER);
+        let sub = quad_subgroups(gpu);
+        let mut raster_src = base(&format!("{} raster", arch.label))
+            .body(RASTER)
+            .body(if sub { RASTER_ENTRY_SUBGROUP } else { RASTER_ENTRY })
+            .body(if sub { QUAD_SUBGROUP } else { QUAD_SHARED });
         for f in arch.raster {
             raster_src = raster_src.body(*f);
         }

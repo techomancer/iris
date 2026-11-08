@@ -512,6 +512,24 @@ pass with one workgroup per busy tile that walks its mask in order and
 stores pixels itself. Order per pixel is the record order, so the kernels
 need no atomics on pixels and no synchronisation between workgroups.
 
+The raster workgroup's 64 lanes take the tile's pixels a quad at a time
+(lane bits 0 and 1 the pixel within its 2x2 quad, bits 2 to 5 the quad),
+and a quad's four lanes exchange values with `quad_swap_x` and
+`quad_swap_diagonal`: WGSL quad operations where the device has subgroups
+(the lane then counted by subgroup, so lanes 4k to 4k + 3 are one
+hardware quad on any subgroup size), workgroup memory between barriers
+where it has not (`WGPU_NO_SUBGROUPS` forces that path). Quads sit at even
+plane coordinates on both raster units, wherever the window is
+(`raster::triangle_quads`). A textured triangle's lane computes only its
+own pixel's barycentrics and texture position and takes its neighbours'
+for the level of detail from the exchange, so every lane of the tile works
+out its pixel, drawn or not, in uniform control flow. The VPro kernel
+keeps one shading call and one back-end call for every record kind, and
+its texture filter weights each tap as it reads it, one tap at a time:
+GPU compilers give the whole kernel the registers of its worst point, and
+fewer registers mean more waves resident. `RADV_DEBUG=shaderstats` on
+Linux shows the count; `WGPU_BATCH_TIMING` times the passes.
+
 Memory is placed by who writes it and who reads it, and allocated once.
 What the CPU writes and the GPU reads once (a batch's records, boxes and
 state slots, the VPro's blit stage and texture slots) lives in host

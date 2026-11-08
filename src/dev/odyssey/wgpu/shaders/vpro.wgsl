@@ -180,74 +180,91 @@ fn colour12(c: i32) -> u32 {
     return u32(clamp(c, 0, FIXED_MAX) >> 12u);
 }
 
-fn tri(pi: u32, si: u32, px: i32, py: i32) {
-    // The walk's bounds, every clip already folded in.
-    if px < ri(pi, T_BOX) || px > ri(pi, T_BOX + 2u) || py < ri(pi, T_BOX + 1u) || py > ri(pi, T_BOX + 3u) {
-        return;
+// What a triangle or line record hands the shading for the lane's pixel:
+// whether it is drawn, its barycentrics, whether the polygon stipple
+// applies, and for a textured record its texture coordinates (S, T, R,
+// Q), its position (tex_position()) and its quad's level of detail.
+struct ShadeIn {
+    drawn: bool,
+    l1: f32,
+    l2: f32,
+    polygon: bool,
+    tc: vec4<f32>,
+    tp: vec3<i32>,
+    lambda: i32,
+}
+
+// A fragment for the back end.
+struct Frag {
+    ok: bool,
+    zq: u32,
+    src: vec4<u32>,
+}
+
+// The texture coordinates at barycentrics (l1, l2) (interp::TriTex::quad).
+fn tex_coords(pi: u32, l1: f32, l2: f32) -> vec4<f32> {
+    var c: vec4<f32>;
+    for (var a = 0u; a < 4u; a++) {
+        let v0 = rf(pi, T_TEX + 3u * a);
+        let v1 = rf(pi, T_TEX + 3u * a + 1u);
+        let v2 = rf(pi, T_TEX + 3u * a + 2u);
+        c[a] = (v0 + p(l1 * (v1 - v0))) + p(l2 * (v2 - v0));
     }
-    // The three edge values at the pixel centre, exact.
-    var e: array<I64, 3>;
+    return c;
+}
+
+// A triangle record at the lane's pixel. Every lane of the tile works out
+// its own pixel's edge values (exact), barycentrics and texture position,
+// drawn or not: a quad's four pixels all feed its level of detail, as the
+// CPU's walk computes them for every pixel of a quad (raster::
+// triangle_quads, quads at even plane coordinates). The quad's lanes
+// exchange their positions, so this runs in uniform control flow.
+fn tri_in(pi: u32, si: u32, px: i32, py: i32) -> ShadeIn {
+    var s = ShadeIn(false, 0.0, 0.0, true, vec4<f32>(0.0), vec3<i32>(0), 0);
+    // The walk's bounds, every clip already folded in.
+    var inside = px >= ri(pi, T_BOX) && px <= ri(pi, T_BOX + 2u) && py >= ri(pi, T_BOX + 1u) && py <= ri(pi, T_BOX + 3u);
     let need = ru(pi, T_NEED);
+    var e1 = I64(0u, 0u);
+    var e2 = I64(0u, 0u);
     for (var k = 0u; k < 3u; k++) {
         var v = r64(pi, T_E0 + 2u * k);
         v = i64_add(v, i64_mul_u16(r64(pi, T_DX + 2u * k), u32(px)));
         v = i64_add(v, i64_mul_u16(r64(pi, T_DY + 2u * k), u32(py)));
-        if !i64_ge_need(v, (need >> k) & 1u) {
-            return;
+        inside = inside && i64_ge_need(v, (need >> k) & 1u);
+        if k == 1u {
+            e1 = v;
+        } else if k == 2u {
+            e2 = v;
         }
-        e[k] = v;
-    }
-    if !owned(si, px, py) {
-        return;
     }
     let inv_area = rf(pi, T_INV_AREA);
-    let l1 = p(i64_to_f32(e[1]) * inv_area);
-    let l2 = p(i64_to_f32(e[2]) * inv_area);
-    // The pixel's quad (2x2, even window coordinates) and its index in
-    // it: the texture unit reads the whole quad's positions.
-    let wx = px - ri(pi, T_ORIGIN);
-    let wy = py - ri(pi, T_ORIGIN + 1u);
-    let qi = u32(wx & 1) | (u32(wy & 1) << 1u);
-
-    // The quad's four barycentrics, for the texture unit (interp::TriTex::quad).
-    var tl1 = vec4<f32>(l1);
-    var tl2 = vec4<f32>(l2);
+    s.l1 = p(i64_to_f32(e1) * inv_area);
+    s.l2 = p(i64_to_f32(e2) * inv_area);
     if (recs[pi].flags & TRI_TEXTURED) != 0u {
-        for (var j = 0u; j < 4u; j++) {
-            if j == qi {
-                continue;
-            }
-            let dx = i32(j & 1u) - i32(qi & 1u);
-            let dy = i32(j >> 1u) - i32(qi >> 1u);
-            var e1 = e[1];
-            var e2 = e[2];
-            if dx > 0 {
-                e1 = i64_add(e1, r64(pi, T_DX + 2u));
-                e2 = i64_add(e2, r64(pi, T_DX + 4u));
-            } else if dx < 0 {
-                e1 = i64_add(e1, i64_neg(r64(pi, T_DX + 2u)));
-                e2 = i64_add(e2, i64_neg(r64(pi, T_DX + 4u)));
-            }
-            if dy > 0 {
-                e1 = i64_add(e1, r64(pi, T_DY + 2u));
-                e2 = i64_add(e2, r64(pi, T_DY + 4u));
-            } else if dy < 0 {
-                e1 = i64_add(e1, i64_neg(r64(pi, T_DY + 2u)));
-                e2 = i64_add(e2, i64_neg(r64(pi, T_DY + 4u)));
-            }
-            tl1[j] = p(i64_to_f32(e1) * inv_area);
-            tl2[j] = p(i64_to_f32(e2) * inv_area);
-        }
+        let ti = ru(pi, T_TEXSLOT);
+        s.tc = tex_coords(pi, s.l1, s.l2);
+        s.tp = tex_position(s.tc, tex_slots[ti].scale, tex_slots[ti].axes);
+        // The diagonal rule's two differences: lanes 0 and 3 of the quad
+        // find pixel 0 to 3's, lanes 1 and 2 pixel 1 to 2's, and the lane
+        // across in x has the other.
+        let across = vec3<i32>(quad_swap_diagonal(vec4<u32>(vec3<u32>(s.tp), 0u)).xyz);
+        let mine = tex_diff(s.tp, across);
+        let other = quad_swap_x(vec4<u32>(mine, 0u)).xyz;
+        s.lambda = tex_lambda(ti, mine, other);
     }
-    shade_pixel(pi, si, px, py, l1, l2, tl1, tl2, qi, true);
+    s.drawn = inside && owned(si, px, py);
+    return s;
 }
 
-// A pixel of a triangle record (or a line record, which is the triangle
-// (a, b, a) at barycentrics (t, 0)) at barycentrics (l1, l2), the quad's
-// four in tl1, tl2 with this pixel at qi: the depth, the polygon stipple
-// for a filled triangle, the colour, the texture, the alpha test, and on
-// to the back end (Draw::shade_quad, Draw::line_pixel).
-fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, l1: f32, l2: f32, tl1: vec4<f32>, tl2: vec4<f32>, qi: u32, polygon: bool) {
+// A drawn pixel of a triangle record (or a line record, which is the
+// triangle (a, b, a) at barycentrics (t, 0)) as tri_in() or line_in()
+// prepared it: the depth, the polygon stipple for a filled triangle, the
+// colour, the texture, the alpha test; the fragment for the back end
+// (Draw::shade_quad, Draw::line_pixel).
+fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, s: ShadeIn) -> Frag {
+    let l1 = s.l1;
+    let l2 = s.l2;
+    let none = Frag(false, 0u, vec4<u32>(0u));
     // Triangle::depth4: the planes, the ratio, the slack clamps, the range
     // and the word with the polygon offset.
     let zz = (rf(pi, T_Z) + p(l1 * rf(pi, T_Z + 1u))) + p(l2 * rf(pi, T_Z + 2u));
@@ -260,7 +277,7 @@ fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, l1: f32, l2: f32, tl1: vec4<f
         z = 1.0;
     }
     if !(z >= 0.0 && z <= 1.0) {
-        return;
+        return none;
     }
     var zw = rf(pi, T_SLACK + 1u) + p(rf(pi, T_SLACK + 2u) * z);
     zw = select(select(0.0, zw, zw > 0.0), 1.0, zw >= 1.0);
@@ -268,15 +285,23 @@ fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, l1: f32, l2: f32, tl1: vec4<f
 
     // The polygon stipple, in window pixels.
     var background = false;
-    if polygon && (slots[si].flags & SLOT_STIPPLE) != 0u {
+    if s.polygon && (slots[si].flags & SLOT_STIPPLE) != 0u {
         let wx = u32(px - ri(pi, T_ORIGIN));
         let wy = u32(py - ri(pi, T_ORIGIN + 1u));
         if (slots[si].pattern[wy & 31u] & (1u << (wx & 31u))) == 0u {
             if (slots[si].flags & SLOT_BACKGROUND) == 0u {
-                return;
+                return none;
             }
             background = true;
         }
+    }
+
+    // The texel, at the pixel's coordinates and the quad's level of detail
+    // (tri_in(), line_in()), before the colours, which it does not read.
+    let textured = (recs[pi].flags & TRI_TEXTURED) != 0u;
+    var texel = vec4<i32>(0);
+    if textured {
+        texel = sample_pixel(ru(pi, T_TEXSLOT), s.tc, s.tp, s.lambda);
     }
 
     // The colour: the provoking vertex's, or interpolated by the
@@ -294,7 +319,7 @@ fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, l1: f32, l2: f32, tl1: vec4<f
         let w2 = p(l2 * rf(pi, T_IW + 2u));
         let sum = (p(((1.0 - l1) - l2) * iw0) + w1) + w2;
         if sum == 0.0 || !(abs(sum) < bitcast<f32>(0x7f800000u)) {
-            return;
+            return none;
         }
         let rr = div_exact(f32(W_ONE), sum);
         let p1 = clamp(sat_i32(p(w1 * rr) + 0.5), 0, W_ONE);
@@ -313,22 +338,9 @@ fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, l1: f32, l2: f32, tl1: vec4<f
         c = vec4<i32>(ri(pi, T_FLAT12), ri(pi, T_FLAT12 + 1u), ri(pi, T_FLAT12 + 2u), ri(pi, T_FLAT12 + 3u));
     }
 
-    // The texture: the quad's coordinates from its four pixels'
-    // barycentrics (interp::TriTex::quad), sampled for this pixel, then
-    // the environment.
-    if (recs[pi].flags & TRI_TEXTURED) != 0u {
-        var tq: TexQuad;
-        for (var j = 0u; j < 4u; j++) {
-            for (var a = 0u; a < 4u; a++) {
-                let v0 = rf(pi, T_TEX + 3u * a);
-                let v1 = rf(pi, T_TEX + 3u * a + 1u);
-                let v2 = rf(pi, T_TEX + 3u * a + 2u);
-                tq.c[a][j] = (v0 + p(tl1[j] * (v1 - v0))) + p(tl2[j] * (v2 - v0));
-            }
-        }
-        let ti = ru(pi, T_TEXSLOT);
-        let texel = sample_quad(ti, tq, qi);
-        c = tex_env(ti, texel, c);
+    // The texture environment, on the texel sampled above.
+    if textured {
+        c = tex_env(ru(pi, T_TEXSLOT), texel, c);
     }
     if specular {
         for (var k = 0u; k < 3u; k++) {
@@ -340,20 +352,21 @@ fn shade_pixel(pi: u32, si: u32, px: i32, py: i32, l1: f32, l2: f32, tl1: vec4<f
     if (ru(pi, T_MODE) & MODE_ALPHA_TEST) != 0u {
         let a = ru(pi, T_ALPHA);
         if !compare((a >> 12u) & 7u, colour12(c.w), a & 0xfffu) {
-            return;
+            return none;
         }
     }
     let src = vec4<u32>(colour12(c.x), colour12(c.y), colour12(c.z), colour12(c.w));
-    fragment_q(backend_of(si), si, px, py, zq, src);
+    return Frag(true, zq, src);
 }
 
 // An aliased line's pixel (Draw::line_projected): the column's pixel
 // centre_minor() gives, exact, and its width's replicas, shaded as the
 // triangle (a, b, a) at barycentrics (t, 0), t the centre's place along
 // the major axis.
-fn line(pi: u32, si: u32, px: i32, py: i32) {
+fn line_in(pi: u32, si: u32, px: i32, py: i32) -> ShadeIn {
+    var s = ShadeIn(false, 0.0, 0.0, false, vec4<f32>(0.0), vec3<i32>(0), 0);
     if px < ri(pi, T_BOX) || px > ri(pi, T_BOX + 2u) || py < ri(pi, T_BOX + 1u) || py > ri(pi, T_BOX + 3u) {
-        return;
+        return s;
     }
     let wx = px - ri(pi, T_ORIGIN);
     let wy = py - ri(pi, T_ORIGIN + 1u);
@@ -361,17 +374,17 @@ fn line(pi: u32, si: u32, px: i32, py: i32) {
     let m = select(wy, wx, xm);
     let r = select(wx, wy, xm);
     if m < ri(pi, L_MAJOR) || m > ri(pi, L_MAJOR + 1u) || r < ri(pi, L_MINOR) || r > ri(pi, L_MINOR + 1u) {
-        return;
+        return s;
     }
     // The column centre's place, and whether it is on the segment.
     let du = ri(pi, L_DU);
     let num = m * LINE_SUB + LINE_SUB / 2 - ri(pi, L_LA);
     if du > 0 {
         if num < 0 || num >= du {
-            return;
+            return s;
         }
     } else if num > 0 || num <= du {
-        return;
+        return s;
     }
     // The minor coordinate there is V / D; the base pixel n has
     // n one D < V <= (n + 1) one D, and the replicas run n to n + width - 1.
@@ -384,10 +397,10 @@ fn line(pi: u32, si: u32, px: i32, py: i32) {
     let v = i64_add(i64_mul_i32(ri(pi, L_NA), d), t);
     let w = ri(pi, L_WIDTH);
     if !i64_lt(i64_mul_i32((r - w + 1) * LINE_SUB, d), v) || i64_lt(i64_mul_i32((r + 1) * LINE_SUB, d), v) {
-        return;
+        return s;
     }
     if !owned(si, px, py) {
-        return;
+        return s;
     }
     let inv = rf(pi, L_INV);
     let l1 = clamp(p(i64_to_f32(i64_from_i32(num)) * inv), 0.0, 1.0);
@@ -396,45 +409,62 @@ fn line(pi: u32, si: u32, px: i32, py: i32) {
     if xm {
         tl1 = vec4<f32>(l1, on, l1, on);
     }
-    shade_pixel(pi, si, px, py, l1, 0.0, tl1, vec4<f32>(0.0), 0u, false);
+    s.l1 = l1;
+    if (recs[pi].flags & TRI_TEXTURED) != 0u {
+        // The pixel's made-up quad: the parameter one pixel on in x, in
+        // y and in both, at barycentrics (t, 0).
+        let ti = ru(pi, T_TEXSLOT);
+        var tq: TexQuad;
+        for (var j = 0u; j < 4u; j++) {
+            let c = tex_coords(pi, tl1[j], 0.0);
+            for (var a = 0u; a < 4u; a++) {
+                tq.c[a][j] = c[a];
+            }
+        }
+        s.tc = tex_coords(pi, l1, 0.0);
+        s.tp = tex_position(s.tc, tex_slots[ti].scale, tex_slots[ti].axes);
+        s.lambda = tex_lambda_quad(ti, tq);
+    }
+    s.drawn = true;
+    return s;
 }
 
-fn frag(pi: u32, si: u32, px: i32, py: i32) {
+fn frag(pi: u32, px: i32, py: i32) -> Frag {
+    let none = Frag(false, 0u, vec4<u32>(0u));
     let x = ri(pi, F_X);
     let y = ri(pi, F_Y);
     let dx = px - x;
     let dy = py - y;
     if dx < 0 || dx > 1 || dy < 0 || dy > 1 {
-        return;
+        return none;
     }
     let i = u32(dx) + 2u * u32(dy);
     if (ru(pi, F_COV) & (1u << i)) == 0u {
-        return;
+        return none;
     }
     let a = ru(pi, F_RGBA + 2u * i);
     let b = ru(pi, F_RGBA + 2u * i + 1u);
     let src = vec4<u32>(a & 0xffffu, a >> 16u, b & 0xffffu, b >> 16u);
-    fragment_q(backend_of(si), si, px, py, ru(pi, F_ZQ + i), src);
+    return Frag(true, ru(pi, F_ZQ + i), src);
 }
 
-// The record's pixels at (px, py), in the order they were shaded.
-fn frags(pi: u32, si: u32, px: i32, py: i32) {
-    if px < ri(pi, P_BOX) || px > ri(pi, P_BOX + 2u) || py < ri(pi, P_BOX + 1u) || py > ri(pi, P_BOX + 3u) {
-        return;
-    }
-    let key = (u32(px) & 0xffffu) | (u32(py) << 16u);
-    let n = ru(pi, P_COUNT);
-    for (var i = 0u; i < n; i++) {
-        let at = P_PIXELS + i * P_WORDS;
-        if ru(pi, at) != key {
-            continue;
-        }
-        let a = ru(pi, at + 2u);
-        let b = ru(pi, at + 3u);
-        let src = vec4<u32>(a & 0xffffu, a >> 16u, b & 0xffffu, b >> 16u);
-        fragment_q(backend_of(si), si, px, py, ru(pi, at + 1u), src);
-    }
+// Whether the packed record's box holds (px, py).
+fn frags_cover(pi: u32, px: i32, py: i32) -> bool {
+    return px >= ri(pi, P_BOX) && px <= ri(pi, P_BOX + 2u) && py >= ri(pi, P_BOX + 1u) && py <= ri(pi, P_BOX + 3u);
 }
+
+// The packed record's pixel i, if it is (px, py): the record's pixels at a
+// place are stored in the order they were shaded.
+fn frags_one(pi: u32, i: u32, px: i32, py: i32) -> Frag {
+    let at = P_PIXELS + i * P_WORDS;
+    if ru(pi, at) != ((u32(px) & 0xffffu) | (u32(py) << 16u)) {
+        return Frag(false, 0u, vec4<u32>(0u));
+    }
+    let a = ru(pi, at + 2u);
+    let b = ru(pi, at + 3u);
+    return Frag(true, ru(pi, at + 1u), vec4<u32>(a & 0xffffu, a >> 16u, b & 0xffffu, b >> 16u));
+}
+
 
 fn rect(pi: u32, si: u32, px: i32, py: i32) {
     if px < ri(pi, R_BOX) || px > ri(pi, R_BOX + 2u) || py < ri(pi, R_BOX + 1u) || py > ri(pi, R_BOX + 3u) {
@@ -489,14 +519,39 @@ fn arch_tile_begin(tile: u32, px: i32, py: i32, lane: u32) {
 fn arch_prim(pi: u32, px: i32, py: i32, lane: u32) {
     let si = recs[pi].slot;
     nc = bitcast<f32>(recs[pi].one);
-    switch recs[pi].kind {
-        case REC_TRI: { tri(pi, si, px, py); }
-        case REC_FRAG: { frag(pi, si, px, py); }
-        case REC_RECT: { rect(pi, si, px, py); }
-        case REC_BLIT: { blit(pi, si, px, py); }
-        case REC_FRAGS: { frags(pi, si, px, py); }
-        case REC_LINE: { line(pi, si, px, py); }
-        default: {}
+    let kind = recs[pi].kind;
+    if kind == REC_RECT {
+        rect(pi, si, px, py);
+        return;
+    }
+    if kind == REC_BLIT {
+        blit(pi, si, px, py);
+        return;
+    }
+    // Every other kind makes fragments for the one back end, a triangle's
+    // and a line's through the one shading.
+    var s = ShadeIn(false, 0.0, 0.0, false, vec4<f32>(0.0), vec3<i32>(0), 0);
+    if kind == REC_TRI {
+        s = tri_in(pi, si, px, py);
+    } else if kind == REC_LINE {
+        s = line_in(pi, si, px, py);
+    }
+    var n = 1u;
+    if kind == REC_FRAGS {
+        n = select(0u, ru(pi, P_COUNT), frags_cover(pi, px, py));
+    }
+    for (var i = 0u; i < n; i++) {
+        var f = Frag(false, 0u, vec4<u32>(0u));
+        if s.drawn {
+            f = shade_pixel(pi, si, px, py, s);
+        } else if kind == REC_FRAG {
+            f = frag(pi, px, py);
+        } else if kind == REC_FRAGS {
+            f = frags_one(pi, i, px, py);
+        }
+        if f.ok {
+            fragment_q(backend_of(si), si, px, py, f.zq, f.src);
+        }
     }
 }
 
