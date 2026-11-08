@@ -12,6 +12,12 @@ pub const LANES: u32 = TILE_W * TILE_H;
 /// Primitives a batch can hold, and the mask words per tile that implies.
 pub const MAX_PRIMS: u32 = 4096;
 pub const MASK_WORDS: u32 = MAX_PRIMS / 32;
+/// After a tile's mask words, its summary: one bit per mask word, set when
+/// the word gets its first bit, so the raster pass visits only the words
+/// that have any.
+pub const SUMMARY_WORDS: u32 = MASK_WORDS.div_ceil(32);
+/// Words per tile in the mask buffer: the mask, then the summary.
+pub const MASK_STRIDE: u32 = MASK_WORDS + SUMMARY_WORDS;
 
 /// wgpu's cap on workgroups along one dispatch axis. The raster dispatch
 /// folds the busy count over x and y when it is larger.

@@ -1,5 +1,5 @@
 // Batch layout shared by the bin and raster kernels. src/wgpu/tiles.rs
-// defines the same structs; TILE_W, TILE_H, MASK_WORDS and MAX_GROUPS
+// defines the same structs; TILE_W, TILE_H, MASK_WORDS, MASK_STRIDE and MAX_GROUPS
 // arrive as defines.
 
 struct BatchHeader {
@@ -23,7 +23,8 @@ struct BusyList {
 }
 
 @group(0) @binding(0) var<uniform> batch: BatchHeader;
-// MASK_WORDS words per tile, one bit per primitive of the batch.
+// MASK_STRIDE words per tile: MASK_WORDS words with one bit per primitive
+// of the batch, then the summary, one bit per mask word that has any.
 @group(0) @binding(1) var<storage, read_write> masks: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> busy: BusyList;
 // One word per tile: set when the tile is on the busy list.

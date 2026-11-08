@@ -509,7 +509,8 @@ rectangle, a row of pixels of an image put) to a *batch*, with the state
 each was issued under in a *slot*; a batch is two dispatches, a bin pass
 that gives each 8x8 tile a bitmask over the batch's primitives and a raster
 pass with one workgroup per busy tile that walks its mask in order and
-stores pixels itself. Order per pixel is the record order, so the kernels
+stores pixels itself. A tile's mask has a summary, one bit per mask word
+that holds any primitive, so the walk visits only those words. Order per pixel is the record order, so the kernels
 need no atomics on pixels and no synchronisation between workgroups.
 
 The raster workgroup's 64 lanes take the tile's pixels a quad at a time

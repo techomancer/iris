@@ -23,7 +23,7 @@ use super::device::Gpu;
 use super::host::HostBuffer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use super::shader::{Fragment, Source};
-use super::tiles::{BatchHeader, BusyHead, DispatchArgs, TileBox, TileGrid, MASK_WORDS, MAX_GROUPS, MAX_PRIMS, TILE_H, TILE_W};
+use super::tiles::{BatchHeader, BusyHead, DispatchArgs, TileBox, TileGrid, MASK_STRIDE, MASK_WORDS, MAX_GROUPS, MAX_PRIMS, TILE_H, TILE_W};
 
 /// The batch has no room for another primitive or slot: flush it first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +109,7 @@ impl BatchPipelines {
                 .define("TILE_W", TILE_W)
                 .define("TILE_H", TILE_H)
                 .define("MASK_WORDS", MASK_WORDS)
+                .define("MASK_STRIDE", MASK_STRIDE)
                 .define("MAX_GROUPS", MAX_GROUPS)
                 .library(COMMON);
             for (k, v) in arch.defines {
@@ -285,7 +286,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
     pub fn new(gpu: &Arc<Gpu>, pipelines: &BatchPipelines, grid: TileGrid, max_slots: u32) -> Batch<R, S> {
         let tiles = grid.tiles().max(1);
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let masks_buf = gpu.buffer("batch masks", tiles as u64 * MASK_WORDS as u64 * 4, storage);
+        let masks_buf = gpu.buffer("batch masks", tiles as u64 * MASK_STRIDE as u64 * 4, storage);
         let busy_buf = gpu.buffer("batch busy", 16 + tiles as u64 * 4, storage | wgpu::BufferUsages::COPY_SRC);
         let args_buf = gpu.buffer("batch dispatch args", 16, storage | wgpu::BufferUsages::INDIRECT);
         let flags_buf = gpu.buffer("batch flags", tiles as u64 * 4, storage);

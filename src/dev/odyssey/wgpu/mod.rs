@@ -824,6 +824,9 @@ pub(crate) struct GpuRaster {
     /// that caused them (the first `odyssey::` frame outside this module
     /// and the raster unit's plumbing).
     pub waits_by: Option<std::collections::BTreeMap<String, u64>>,
+    /// With VPRO_GPU_TRACE_WAITS: batches submitted, by the line that
+    /// called `flush`.
+    pub flushes_by: Option<std::collections::BTreeMap<u32, u64>>,
     copy: CopyKernel,
     /// Copies the kernel took (`copy`).
     pub copies: u64,
@@ -926,6 +929,7 @@ impl GpuRaster {
             flushes_timed: 0,
             lazy: false,
             waits_by: std::env::var("VPRO_GPU_TRACE_WAITS").is_ok().then(std::collections::BTreeMap::new),
+            flushes_by: std::env::var("VPRO_GPU_TRACE_WAITS").is_ok().then(std::collections::BTreeMap::new),
             copy,
             copies: 0,
         })
@@ -1528,7 +1532,13 @@ impl GpuRaster {
 
     /// Submit what was recorded, the mirror's changes ahead of it; nothing
     /// waits.
+    #[track_caller]
     pub fn flush(&mut self) {
+        if let Some(by) = &mut self.flushes_by {
+            if !self.batch.is_empty() {
+                *by.entry(std::panic::Location::caller().line()).or_insert(0) += 1;
+            }
+        }
         self.end_pending();
         // The mirror's changes go up whether or not records follow: the
         // scanout reads the GPU's memory directly.
