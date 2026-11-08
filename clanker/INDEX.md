@@ -243,6 +243,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [guest-gl-benchmarks-miss-board-time.md](mgras/guest-gl-benchmarks-miss-board-time.md) | rule | Board-bound GL work slows the guest clock (and guest benchmarks lie) |
 | [header-errata.md](mgras/header-errata.md) | design | ignore/gr4 headers: known errata (fold back into the headers) |
 | [hq4-microcode-moves-eram-state.md](mgras/hq4-microcode-moves-eram-state.md) | rule | The Octane's IMPACT microcode keeps ERAM state 0x8C words higher |
+| [mid-session-replays-need-the-live-drbsize.md](mgras/mid-session-replays-need-the-live-drbsize.md) | rule | A recording started mid-session lacks DRBsize; replay it with MGRAS_REPLAY_INIT=16e=<live value> or buffers wrap and alias (and the GPU unit races) |
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
 | [texture-readback-follows-libglcore.md](mgras/texture-readback-follows-libglcore.md) | rule | glGetTexImage of ALPHA, LUMINANCE, INTENSITY and RGB textures is libGLcore's, not the board's |

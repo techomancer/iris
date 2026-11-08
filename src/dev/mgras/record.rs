@@ -309,8 +309,16 @@ pub(super) mod tests {
 
     /// A board of kind `kind` whose raster engines are where `raster` says.
     pub fn live_board_raster(kind: GraphicsBoard, raster: crate::config::RasterUnit) -> Arc<Mgras> {
+        live_board_with(kind, raster, false)
+    }
+
+    /// As `live_board_raster`, set up as the Octane's board where `octane`.
+    pub fn live_board_with(kind: GraphicsBoard, raster: crate::config::RasterUnit, octane: bool) -> Arc<Mgras> {
         let m = Mgras::with_raster(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached(), raster, "auto")
             .unwrap_or_else(|e| panic!("{e}"));
+        if octane {
+            crate::dev::mgras::hq4::octane_board(&m, kind);
+        }
         m.start_engines();
         m
     }
@@ -450,11 +458,38 @@ pub(super) mod tests {
         };
         // MGRAS_REPLAY_GPU=1: the raster engine on the GPU unit (`wgpu`).
         let raster = if std::env::var("MGRAS_REPLAY_GPU").is_ok() { crate::config::RasterUnit::Wgpu } else { crate::config::RasterUnit::Cpu };
-        let m = live_board_raster(kind, raster);
+        // MGRAS_REPLAY_OCTANE=1: the board as the Octane sets it up (a
+        // recording made there).
+        let octane = std::env::var("MGRAS_REPLAY_OCTANE").is_ok();
+        // MGRAS_REPLAY_WARM=1: replay once untimed first, on a board of its
+        // own, so the raster JIT's shaders (kept per process) are compiled
+        // before the timed replay.
+        if std::env::var("MGRAS_REPLAY_WARM").is_ok() {
+            let w = live_board_with(kind, raster, octane);
+            let t = std::time::Instant::now();
+            replay_recs(&w, &recs, false)?;
+            w.stop_engines();
+            eprintln!("{path}: warm-up replay {:.3} s", t.elapsed().as_secs_f64());
+        }
+        let m = live_board_with(kind, raster, octane);
+        // MGRAS_REPLAY_INIT=<reg>=<val>,...: raster registers to write
+        // before the stream (hex), for a recording that starts mid-session
+        // after the X server set up registers it never writes again
+        // (DRBsize, 0x16e).
+        if let Ok(init) = std::env::var("MGRAS_REPLAY_INIT") {
+            for kv in init.split(',').filter(|s| !s.is_empty()) {
+                let (r, v) = kv.split_once('=').ok_or(format!("MGRAS_REPLAY_INIT: {kv}"))?;
+                let hex = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|e| format!("MGRAS_REPLAY_INIT {s}: {e}"));
+                write(&m, 32, crate::dev::mgras::hq3::host::RASTER + 4 * hex(r)?, hex(v)? as u64);
+            }
+        }
         // MGRAS_REPLAY_TRACE=<file>: the annotated trace of the replay
         // (`mgras trace`), all categories.
+        // MGRAS_REPLAY_TRACE_MASK: the categories (`mgras trace`'s, e.g.
+        // `rss`), all by default.
         if let Ok(t) = std::env::var("MGRAS_REPLAY_TRACE") {
-            m.start_trace(&t, crate::dev::mgras::debug::TRACE_ALL).map_err(|e| format!("{t}: {e}"))?;
+            let mask = std::env::var("MGRAS_REPLAY_TRACE_MASK").map_or(crate::dev::mgras::debug::TRACE_ALL, |s| crate::dev::mgras::debug::trace_mask(&s));
+            m.start_trace(&t, mask).map_err(|e| format!("{t}: {e}"))?;
         }
         // MGRAS_REPLAY_NOCHECK=1: a recording that starts mid-session (its
         // checkpoints cannot match a fresh board's): replay it for timing
@@ -467,17 +502,62 @@ pub(super) mod tests {
         let mut frames = 0usize;
         #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
         let mut scan_bad: Vec<String> = Vec::new();
+        // MGRAS_REPLAY_NOSCAN=1: no scan-out comparisons (timing).
+        let scan = std::env::var("MGRAS_REPLAY_NOSCAN").is_err();
         let mut compare = |m: &Mgras| {
             #[cfg(feature = "wgpu")]
-            if let Some((n, first)) = m.compare_scanouts() {
+            if let Some((n, first)) = if scan { m.compare_scanouts() } else { None } {
                 frames += 1;
                 if n != 0 {
                     scan_bad.push(format!("checkpoint {frames}: {n} pixels differ, first (x, y, cpu, gpu) {first:x?}"));
                 }
             }
-            let _ = m;
+            let _ = (m, scan);
         };
-        let rep = replay_recs_with(&m, &recs, check, &mut compare)?;
+        // MGRAS_REPLAY_HASHES_OUT=<file>: every checkpoint's state hash
+        // (hex, a line each); MGRAS_REPLAY_HASHES_IN=<file>: compare with
+        // such a list (a replay of a mid-session recording on another
+        // engine), reporting the first checkpoint that differs.
+        let hashes_out = std::env::var("MGRAS_REPLAY_HASHES_OUT").ok();
+        let hashes_in: Option<Vec<String>> = std::env::var("MGRAS_REPLAY_HASHES_IN").ok().map(|f| std::fs::read_to_string(f).unwrap_or_default().lines().map(str::to_owned).collect());
+        let mut taken: Vec<String> = Vec::new();
+        let mut first_diff: Option<usize> = None;
+        let mut checkpoint = |m: &Mgras| {
+            compare(m);
+            if hashes_out.is_some() || hashes_in.is_some() {
+                let h: String = m.state_hash().iter().map(|b| format!("{b:02x}")).collect();
+                if let Some(want) = hashes_in.as_ref().and_then(|v| v.get(taken.len())) {
+                    if *want != h && first_diff.is_none() {
+                        first_diff = Some(taken.len());
+                        eprintln!("{path}: checkpoint {} differs from the list", taken.len());
+                    }
+                }
+                taken.push(h);
+            }
+            // MGRAS_REPLAY_DUMP_AT=<n> with MGRAS_REPLAY_DUMP=<file>: pixel
+            // memory (u64 words, little-endian) and the clip IDs after
+            // checkpoint n, synced from the GPU unit where one draws.
+            if let (Ok(n), Ok(f)) = (std::env::var("MGRAS_REPLAY_DUMP_AT"), std::env::var("MGRAS_REPLAY_DUMP")) {
+                if n.parse::<usize>().ok() == Some(taken.len().saturating_sub(1)) {
+                    let _sub = m.submit.lock();
+                    m.wait_idle();
+                    m.mirror_sync();
+                    // SAFETY: idle with `submit` held.
+                    let rss = unsafe { &*m.rss.get() };
+                    let mut out: Vec<u8> = bytemuck::cast_slice(&rss.mem.words[..]).to_vec();
+                    out.extend_from_slice(&rss.cid[..]);
+                    std::fs::write(&f, out).unwrap_or_else(|e| panic!("{f}: {e}"));
+                    eprintln!("{path}: dumped checkpoint {n} to {f}");
+                }
+            }
+        };
+        let rep = replay_recs_with(&m, &recs, check, &mut checkpoint)?;
+        if let Some(f) = &hashes_out {
+            std::fs::write(f, taken.join("\n")).map_err(|e| format!("{f}: {e}"))?;
+        }
+        if hashes_in.is_some() {
+            eprintln!("{path}: {} checkpoints hashed, first differing {first_diff:?}", taken.len());
+        }
         compare(&m);
         if frames != 0 {
             eprintln!("{path}: GPU scan-out compared with the CPU compose at {frames} frames, {} differ", scan_bad.len());
@@ -494,6 +574,8 @@ pub(super) mod tests {
         m.stop_engines();
         // SAFETY: the engines are stopped.
         let prims = unsafe { &*m.rss.get() }.stats.prims;
+        let (drbsize, drb) = unsafe { ((*m.rss.get()).reg(crate::dev::mgras::rss::reg::DRBSIZE), (*m.rss.get()).reg(crate::dev::mgras::rss::reg::DRBPOINTERS)) };
+        eprintln!("{path}: at the end DRBsize {drbsize:#x}, DRBpointers {drb:#x}");
         eprintln!(
             "{path}: {kind:?} with {} raster engine(s), {:.3} s, final state {}, primitives by IR opcode {:?}",
             m.nrss,
@@ -502,6 +584,10 @@ pub(super) mod tests {
             prims.iter().enumerate().filter(|(_, n)| **n != 0).collect::<Vec<_>>()
         );
         if !check {
+            eprintln!(
+                "{path}: {} records, DMA reads {}/{} ({} mismatched), {} bus reads differ",
+                rep.records, rep.dma_used, rep.dma_total, rep.dma_mismatched, rep.reads_differ
+            );
             return Ok(());
         }
         eprintln!(

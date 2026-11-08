@@ -358,6 +358,24 @@ fn route(off: u32) -> Route {
 /// The HQ4 microcode's differences the engine has to know about.
 struct Hq4Quirks;
 
+/// What `ImpactXio::with_raster` sets up on its board for the Octane, on a
+/// bare board of kind `kind` before its engines start (replays of Octane
+/// recordings): the board's identity, reads started at the kick, the HQ4
+/// microcode's quirks, the bounded busy status.
+#[cfg(test)]
+pub(super) fn octane_board(m: &Mgras, kind: GraphicsBoard) {
+    let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
+    let cmap = (board.cmap_revision & 7) as u32;
+    m.set_identity(
+        [board.version0 as u32, board.version1 as u32],
+        [(MONITOR_ID as u32) << 4 | cmap, 0x80 | ((board.ra_revision & 7) as u32) << 4 | cmap],
+        board.ge_revision as u32,
+    );
+    m.start_reads_at_kick();
+    m.set_board(Box::new(Hq4Quirks));
+    m.bound_busy_status();
+}
+
 impl Hq3Board for Hq4Quirks {
     /// The HQ4 microcode's GE state sits 0x8C words above the Indigo2
     /// microcode's from (at the latest) the polygon-stipple enables on:
