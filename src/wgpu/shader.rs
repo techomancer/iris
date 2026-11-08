@@ -116,13 +116,22 @@ impl Source {
     /// Compile. A validation error comes back as text with the composed
     /// source's line numbers, not as a panic.
     pub fn compile(&self, device: &wgpu::Device) -> Result<wgpu::ShaderModule, String> {
-        let text = self.text()?;
+        let mut text = self.text()?;
+        let name = self.label.replace(['/', ' '], "_");
         // IRIS_WGPU_DUMP=<dir>: the composed WGSL of every kernel, for
         // offline tools.
         if let Ok(dir) = std::env::var("IRIS_WGPU_DUMP") {
-            let name = self.label.replace(['/', ' '], "_");
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(format!("{dir}/{name}.wgsl"), &text);
+        }
+        // IRIS_WGPU_LOAD=<dir>: compile <dir>/<kernel>.wgsl instead, where
+        // there is one (a dumped kernel, edited), to try a change without a
+        // rebuild.
+        if let Ok(dir) = std::env::var("IRIS_WGPU_LOAD") {
+            if let Ok(t) = std::fs::read_to_string(format!("{dir}/{name}.wgsl")) {
+                log::warn!("wgpu: {} loaded from {dir}", self.label);
+                text = t;
+            }
         }
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

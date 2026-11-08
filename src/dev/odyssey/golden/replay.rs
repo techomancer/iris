@@ -326,6 +326,9 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
             (batches, records, g.dropped, g.uploaded, g.uploaded_blocks, g.uploaded_tiles, g.read_back_bytes, g.readbacks, g.copies)
         });
         eprintln!("gpu unit: {records} records in {batches} batches ({dropped} dropped), {} MiB uploaded ({} MiB dirty blocks, {} MiB regions), {} MiB read back in {readbacks} readbacks, {copies} copies", up >> 20, blocks >> 20, tiles >> 20, down >> 20);
+        if let Some(t) = b.raster.run_now(|ctx| ctx.gpu.as_ref().expect("the unit").timing_report()) {
+            eprintln!("{t}");
+        }
         b.raster.run_now(|ctx| {
             if let Some(by) = &ctx.gpu.as_ref().expect("the unit").waits_by {
                 let mut v: Vec<_> = by.iter().collect();

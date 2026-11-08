@@ -1581,6 +1581,11 @@ impl GpuRaster {
         (self.batch.flushes, self.batch.prims_total)
     }
 
+    /// The batch's GPU times, when measured (WGPU_BATCH_TIMING).
+    pub fn timing_report(&self) -> Option<String> {
+        self.batch.timing.as_ref().map(|t| t.report())
+    }
+
     /// Write `words` at byte offset `offset` of board memory, in the
     /// model's word order (vram.rs: a `Vram`'s words as bytes).
     pub fn write_words(&mut self, offset: u64, words: &[u64]) {
