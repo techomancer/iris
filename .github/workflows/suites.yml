@@ -94,7 +94,7 @@ jobs:
       - name: Build the guest binaries
         run: |
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
-            iris-guest-toolchain sh -c 'make -C cpu-tests all && make -C bench all'
+            iris-guest-toolchain sh -c 'make -C cpu-tests all && make -C bench prebuilt'
 
       # bench/prebuilt/irisbench.elf is linked into `iris` with include_bytes!
       # so the benchmark runs on a machine with no cross toolchain — a released
@@ -102,15 +102,21 @@ jobs:
       # build product that can drift is worse than no build product, and this
       # one drifts dangerously: accuracy is scored against golden checksums
       # compiled *into* the image, so a stale image against fresh goldens
-      # reports failures to users that are not real.
+      # reports failures to users that are not real, and an image from another
+      # compiler silently changes every benchmark figure.
       #
-      # Compares a digest of the *sources* rather than the image bytes. Byte
-      # comparison against a fresh build does not work and this job proved it:
-      # the guest is compiled with -g, so DWARF records the build directory, and
-      # a runner's path is never a developer's. Two correct builds of identical
-      # source differ. See bench/prebuilt-stamp.py.
-      - name: bench — checked-in guest binary matches its sources
+      # The step above rebuilt the image from clean with the pinned toolchain
+      # (`prebuilt` also leaves build/irisbench.elf for the cells below). The
+      # builds are reproducible, so any difference from the committed image
+      # means it is stale, hand-copied, or from another compiler. The quick
+      # check first, because it names the compiler.
+      - name: bench — checked-in guest binary was built by the pinned compiler
         run: make -C bench check-prebuilt
+
+      - name: bench — checked-in guest binary is what its sources build
+        run: |
+          git diff --exit-code --stat bench/prebuilt/ \
+            || { echo "::error::bench/prebuilt/irisbench.elf is not what the pinned toolchain builds from these sources. Run make -C bench prebuilt in the toolchain container and commit the result."; exit 1; }
 
       # One binary of each for every cell below — that is what makes the matrix
       # a differential test rather than N independent runs.

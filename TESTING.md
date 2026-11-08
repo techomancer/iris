@@ -36,6 +36,7 @@ cargo build --release --bin iris-bench
 ./target/release/iris-bench run --quick
 
 make -C bench all && make -C bench hostbench        # only to change the suite; compiler as above
+make -C bench prebuilt      # only after changing a kernel; see bench/prebuilt/README.md
 ./target/release/iris-bench matrix      # builds and runs every CPU x engine cell
 ./target/release/iris-bench host        # the same kernels, natively, for the ratio
 ```
