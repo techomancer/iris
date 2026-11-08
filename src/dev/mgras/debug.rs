@@ -627,7 +627,7 @@ impl Mgras {
     }
 }
 
-fn trace_mask(spec: &str) -> u32 {
+pub(super) fn trace_mask(spec: &str) -> u32 {
     spec.split(',').fold(0, |m, c| m | match c {
         "hq" => TRACE_HQ,
         "rss" => TRACE_RSS,
