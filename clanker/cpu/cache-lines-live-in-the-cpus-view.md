@@ -10,6 +10,7 @@ VR10000 user's manual p. 75), and every other master see memory. What the shippe
 | O2 | secondary and primary data lines for page 0 and 0x1000 hold POST's stack for about 50-65 ms, while POST tests page 0 uncached. On the R5000, primary data lines for page 0 (TagLo 0xc0) | yes |
 | Octane | a tag and data RAM test on secondary set 0, read back only with Index Load Tag/Data | no: the patterns name no memory |
 | IP28 | a secondary line for page 0, once while the PROM starts, then released | yes |
+| Fuel | primary data lines for 0x100000-0x107fff hold the stack | no, until memory is configured mid-phase |
 | Origin 200 | none held in a boot to the IRIX login | - |
 | Indy, Indigo2 (R4400) | none: an R4400 line never holds a page | - |
 
@@ -32,10 +33,11 @@ with Index Load Data while it holds a page.
   R10000's PTag and PState fields (NEC VR5000 user's manual U11761EJ6V0UM p. 133).
   It has no Index Store Data, so the page starts as memory. Its instruction lines
   hold nothing, since one could hold only what memory holds.
-- A page with no memory behind it holds nothing: the line stays in the arrays, as
-  a tag test's patterns do. The region bitmap is all a CPU tests, so a held page's
-  whole region is the view's while it stands, reading zeros wherever nothing is
-  mapped. The O2's POST holds lines for page 0 before CRIME maps the rest of that
+- A page with no memory behind it holds nothing, and the line stays in the arrays,
+  as a tag test's patterns do, unless the machine allows lines there
+  (`PpMemSpace::allow_unbacked_lines`, as the Fuel does for its bank slots). The
+  region bitmap is all a CPU tests, so a held page's whole region is the view's
+  while it stands, reading zeros wherever nothing is mapped. The O2's POST holds lines for page 0 before CRIME maps the rest of that
   region.
 - A remap saves and restores held pages, so memory configuration mid-phase keeps
   the stack.
@@ -76,8 +78,11 @@ A page some CPU holds is not compiled: compiles read memory, and compiled code i
 shared. ppmem puts `GEN_HELD` on the page's generation counter at the first hold
 and takes it off at the last release, moving it with the page on a remap
 (`PpMemSpace::mark`). The compile that finds it publishes nothing and denies every
-offset until the release. ppmem's counters are the bus's for memory; a machine whose bus
-maps a device over memory must mark that device's counter as well.
+offset until the release. ppmem's counters are the bus's for memory. Where the bus
+maps a device over memory, as the IP35 boards map their reset PROM, the compile checks
+that device's counter instead, so the cache puts the same mark there when a page
+becomes held and takes it off with the page's last line (`mark_foreign`). That work
+is at CACHE instructions only; a load, store or fetch is unchanged.
 
 ## Seeing it
 
