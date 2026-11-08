@@ -13,6 +13,8 @@ use super::memory::GpuMemory;
 use super::shader::Fragment;
 use super::tiles::{TileGrid, MAX_PRIMS};
 
+mod softfloat;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct Rec {
