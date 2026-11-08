@@ -412,6 +412,10 @@ impl Draw<'_> {
     #[allow(clippy::too_many_arguments, reason = "a segment and how it is drawn")]
     fn line_projected(&self, a: &RasterVertex, b: &RasterVertex, provoking: &[f32], steps: i64, width: u32, stipple: Option<&mut LineStipple>, user_clip: bool) {
         let mut stipple = stipple;
+        // A segment with both ends inside every enabled user plane has
+        // every fragment inside (Transform::user_side()). One outside a
+        // plane still walks, for its stipple count.
+        let user_clip = user_clip && self.xf.user_side(&[a.clip, b.clip]) != super::setup::PlaneSide::Inside;
         let smooth = !self.pipe.raster.flat;
         let line_smooth = self.pipe.prims.line_smooth;
         let smooth_width = self.pipe.prims.line_width as f64;
