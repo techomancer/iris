@@ -49,12 +49,15 @@ extern char _scratch_start[];
 #define UMX_DATA2_VA  0x00800000ull
 #define UMX_CODE2_VA  0x00810000ull
 
-/* Physical pages, offsets into the suite's scratch area (16 KB aligned). Each
- * one has the same address bits 13:12 as the virtual page it is mapped at, so
- * no virtually indexed cache sees two colours of it. */
+/* Physical pages, offsets into the suite's scratch area (32 KB aligned). Each
+ * one has the same address bits 14:12 as the virtual page it is mapped at, and
+ * the suite reaches every one of them through KSEG0 as well. Bits 13:12 are
+ * the primary caches' virtual index; bit 14 is in the R4400's secondary-cache
+ * PIdx too, and a primary miss that hits the secondary under a different
+ * VA[14:12] takes a Virtual Coherency exception. */
 #define UMX_P_CODE    0x0000u
 #define UMX_P_DATA    0x1000u
-#define UMX_P_DATA2   0x4000u
+#define UMX_P_DATA2   0x10000u
 #define UMX_P_CODE2   0x8000u
 
 #define UMX_TLB_INDEX 20u      /* code + data */
