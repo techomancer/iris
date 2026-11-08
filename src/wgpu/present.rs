@@ -308,12 +308,7 @@ impl Presenter {
         if w == 0 || h == 0 || rgba.len() < (h as usize - 1) * stride + w as usize {
             return;
         }
-        self.gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &layer.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytemuck::cast_slice(&rgba[..(h as usize - 1) * stride + w as usize]),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * stride as u32), rows_per_image: Some(h) },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
+        self.gpu.write_texture(&layer.texture, rgba, stride, w, h);
     }
 
     /// Draw `frame` letterboxed, `overlay` (0xAABBGGRR, stride `stride`)
@@ -359,7 +354,7 @@ impl Presenter {
                     });
                     self.unpack_group = Some((buffer.clone(), group));
                 }
-                self.gpu.queue.write_buffer(&self.unpack_size, 0, bytemuck::cast_slice(&[fw, fh, 0u32, 0u32]));
+                self.gpu.write(&self.unpack_size, 0, bytemuck::cast_slice(&[fw, fh, 0u32, 0u32]));
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("present unpack"), timestamp_writes: None });
                 pass.set_pipeline(&self.unpack);
                 pass.set_bind_group(0, &self.unpack_group.as_ref().expect("the unpack group").1, &[]);
@@ -375,7 +370,7 @@ impl Presenter {
         let integer = p.scale == p.scale.round() && p.scale >= 1.0;
         let r = p.frame;
         let win = (self.config.width as f32, self.config.height as f32);
-        let q = &self.gpu.queue;
+        let q = &*self.gpu;
         place(q, win, &mut self.frame, r, fw, fh);
         place(q, win, &mut self.overlay, r, fw, fh);
         place(q, win, &mut self.status, [r[0], r[3], r[2], r[3] + p.status], fw, self.status_rows);
@@ -417,7 +412,7 @@ impl Presenter {
 /// Point `layer`'s quad at window pixels `r` (x0, y0, x1, y1) of a window
 /// `win` pixels in size, showing its top-left `w` x `h` texels; the uniform
 /// is written only when that changes.
-fn place(queue: &wgpu::Queue, (ww, wh): (f32, f32), layer: &mut Layer, r: [f32; 4], w: u32, h: u32) {
+fn place(gpu: &Gpu, (ww, wh): (f32, f32), layer: &mut Layer, r: [f32; 4], w: u32, h: u32) {
     let ndc_x = |x: f32| x / ww * 2.0 - 1.0;
     let ndc_y = |y: f32| 1.0 - y / wh * 2.0;
     let q = Quad {
@@ -425,7 +420,7 @@ fn place(queue: &wgpu::Queue, (ww, wh): (f32, f32), layer: &mut Layer, r: [f32; 
         uv: [0.0, 0.0, w as f32 / layer.width as f32, h as f32 / layer.height as f32],
     };
     if q != layer.last {
-        queue.write_buffer(&layer.uniform, 0, bytemuck::bytes_of(&q));
+        gpu.write(&layer.uniform, 0, bytemuck::bytes_of(&q));
         layer.last = q;
     }
 }

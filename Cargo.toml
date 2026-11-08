@@ -182,7 +182,7 @@ rex-gpu = ["gputrace", "rex-dirty-upload", "dep:bytemuck", "dep:pollster", "dep:
 # Host-GPU rasterisation on wgpu: board memory on the GPU, primitives binned
 # into 8x8 tiles and rasterised by compute kernels (src/wgpu, and
 # src/dev/<board>/wgpu for each board). See clanker/plans/wgpu-raster.md.
-wgpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+wgpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu", "dep:ash"]
 # Cranelift-based JIT for IMPACT (GR4) raster shaders: RSS/TE1 pixel
 # pipelines monomorphised on a 64-bit key (src/dev/mgras/rss_jit).
 gr4-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
@@ -318,6 +318,9 @@ wasmtime-jit-icache-coherence = { version = "=47.0.3", optional = true, package 
 bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "30", optional = true }
+# The wgpu feature's host-memory buffers (src/wgpu/host.rs): Vulkan memory
+# chosen by type, which wgpu itself does not offer. The version wgpu-hal uses.
+ash = { version = "0.38", optional = true }
 libchdman-rs = { version = "0.289.2", features = ["prebuilt"] }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12" }

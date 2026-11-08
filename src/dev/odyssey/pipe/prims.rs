@@ -107,21 +107,23 @@ pub(crate) fn dimension(requested: f32) -> Option<u32> {
     Some(n.max(1.0) as u32)
 }
 
-/// Whether pixel (px, py) is on the segment a to b under the centre-sampled
-/// rule. Exact on the snapped grid: with the minor coordinate at the centre
-/// v = n + t / den, the pixel is ceil(v / 2^sub) - 1. Coordinate differences
-/// are at most 2^29, so t fits, and the minor base shifted by the width
-/// stays below 2^43.
-fn centre_covers(a: &RasterVertex, b: &RasterVertex, px: i64, py: i64) -> bool {
+/// The minor-axis pixel the segment a to b covers in major-axis pixel
+/// `major` under the centre-sampled rule, or None when the pixel centre is
+/// outside the segment's span; an aliased segment covers no other pixel
+/// there. Exact on the snapped grid: with the minor coordinate at the
+/// centre v = n + t / den, the pixel is ceil(v / 2^sub) - 1. Coordinate
+/// differences are at most 2^29, so t fits, and the minor base shifted by
+/// the width stays below 2^43.
+fn centre_minor(a: &RasterVertex, b: &RasterVertex, major: i64) -> Option<i64> {
     let one = SUB;
     let half = one >> 1;
     let x_major = b.x.wrapping_sub(a.x).wrapping_abs() >= b.y.wrapping_sub(a.y).wrapping_abs();
     let (la, lb, na, nb) = if x_major { (a.x, b.x, a.y, b.y) } else { (a.y, b.y, a.x, b.x) };
-    let c = (if x_major { px } else { py }).wrapping_mul(one).wrapping_add(half);
+    let c = major.wrapping_mul(one).wrapping_add(half);
     let mut den = lb.wrapping_sub(la);
 
     if if den > 0 { c < la || c >= lb } else { c > la || c <= lb } {
-        return false;
+        return None;
     }
     let mut t = nb.wrapping_sub(na).wrapping_mul(c.wrapping_sub(la));
     if den < 0 {
@@ -130,8 +132,7 @@ fn centre_covers(a: &RasterVertex, b: &RasterVertex, px: i64, py: i64) -> bool {
     }
     // v = na + floor(t / den) plus a fraction that is zero or not.
     let v = na.wrapping_add(t.div_euclid(den));
-    let minor = if t % den != 0 { v.div_euclid(one) } else { v.wrapping_neg().div_euclid(one).wrapping_neg().wrapping_sub(1) };
-    (if x_major { py } else { px }) == minor
+    Some(if t % den != 0 { v.div_euclid(one) } else { v.wrapping_neg().div_euclid(one).wrapping_neg().wrapping_sub(1) })
 }
 
 #[derive(Clone, Copy, Default)]
@@ -559,16 +560,23 @@ impl Draw<'_> {
                 minor0 = (q0.min(q1) / one - pad).floor() as i64 - 1;
                 minor1 = (q0.max(q1) / one + pad).ceil() as i64 + 1;
             }
+            // An aliased segment covers one minor pixel here at most, the
+            // one centre_minor() gives: visit that one alone.
+            if !line_smooth {
+                match centre_minor(&sa, &sb, m as i64) {
+                    Some(n) if n >= minor0 && n <= minor1 => (minor0, minor1) = (n, n),
+                    _ => (minor0, minor1) = (1, 0),
+                }
+            }
             for n in minor0..=minor1 {
                 let (base_x, base_y) = if x_major { (m as i64, n) } else { (n, m as i64) };
                 let replica0 = n.max((if x_major { by0 } else { bx0 }) as i64);
                 let replica1 = if line_smooth { replica0 } else { (n + width as i64 - 1).min((if x_major { by1 } else { bx1 }) as i64) };
                 let coverage = if line_smooth {
                     line_coverage(a.x as f64 / one, a.y as f64 / one, b.x as f64 / one, b.y as f64 / one, smooth_width, base_x as i32, base_y as i32)
-                } else if centre_covers(&sa, &sb, base_x, base_y) {
-                    1.0
                 } else {
-                    0.0
+                    // The one pixel centre_minor() found.
+                    1.0
                 };
 
                 if !(coverage > 0.0) {

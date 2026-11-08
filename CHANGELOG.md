@@ -80,6 +80,17 @@ hashes are given where a change is easiest to understand by reading the commit.
   memory without a readback, and Newport's display is composed on the GPU
   (the GL compositor's work in WGSL). Branch `wgpu-raster`, plan in
   `clanker/plans/wgpu-raster.md`.
+- The VPro's GPU raster unit no longer allocates GPU memory per batch.
+  What the CPU writes for the kernels lives in host memory they read
+  directly, in a few sets made once with the board; other uploads go
+  through one fixed staging ring; nothing uses the CPU-visible part of
+  VRAM, which on a card without resizable BAR the desktop also needs.
+  Line pixels shaded on the CPU travel 19 to a record instead of one. A
+  SolidView session replays with 12x fewer records and 4x fewer batches
+  and draws 2.4x faster on the GPU unit, now level with the CPU unit, and
+  a board takes about 190 MiB of VRAM instead of 450.
+- Aliased lines find each column's pixel directly instead of testing
+  every candidate, halving the time spent setting up lines.
 - The X server's and the PROM's 2D fills (solid rectangles, window-id
   writes, pattern spans) are one operation per rectangle instead of one per
   pixel: a single record per buffer on the GPU unit, row spans on the CPU

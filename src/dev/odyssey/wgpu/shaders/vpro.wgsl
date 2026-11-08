@@ -21,6 +21,7 @@ const REC_TRI: u32 = 1u;
 const REC_FRAG: u32 = 2u;
 const REC_RECT: u32 = 3u;
 const REC_BLIT: u32 = 4u;
+const REC_FRAGS: u32 = 5u;
 
 const REC_WORDS: u32 = 84u;
 
@@ -68,6 +69,13 @@ const F_Y: u32 = 1u;
 const F_COV: u32 = 2u;
 const F_ZQ: u32 = 3u;      // 4
 const F_RGBA: u32 = 7u;    // 4 pixels x 2 words: r | g << 16, b | a << 16
+
+// Packed fragment word offsets: the pixels' box, their count, then each
+// pixel as x | y << 16, its depth word and its colour in two words.
+const P_BOX: u32 = 0u;
+const P_COUNT: u32 = 4u;
+const P_PIXELS: u32 = 5u;
+const P_WORDS: u32 = 4u;
 
 // Rectangle word offsets.
 const R_BOX: u32 = 0u;     // x0, y0, x1, y1
@@ -327,6 +335,25 @@ fn frag(pi: u32, si: u32, px: i32, py: i32) {
     fragment_q(backend_of(si), si, px, py, ru(pi, F_ZQ + i), src);
 }
 
+// The record's pixels at (px, py), in the order they were shaded.
+fn frags(pi: u32, si: u32, px: i32, py: i32) {
+    if px < ri(pi, P_BOX) || px > ri(pi, P_BOX + 2u) || py < ri(pi, P_BOX + 1u) || py > ri(pi, P_BOX + 3u) {
+        return;
+    }
+    let key = (u32(px) & 0xffffu) | (u32(py) << 16u);
+    let n = ru(pi, P_COUNT);
+    for (var i = 0u; i < n; i++) {
+        let at = P_PIXELS + i * P_WORDS;
+        if ru(pi, at) != key {
+            continue;
+        }
+        let a = ru(pi, at + 2u);
+        let b = ru(pi, at + 3u);
+        let src = vec4<u32>(a & 0xffffu, a >> 16u, b & 0xffffu, b >> 16u);
+        fragment_q(backend_of(si), si, px, py, ru(pi, at + 1u), src);
+    }
+}
+
 fn rect(pi: u32, si: u32, px: i32, py: i32) {
     if px < ri(pi, R_BOX) || px > ri(pi, R_BOX + 2u) || py < ri(pi, R_BOX + 1u) || py > ri(pi, R_BOX + 3u) {
         return;
@@ -385,6 +412,7 @@ fn arch_prim(pi: u32, px: i32, py: i32, lane: u32) {
         case REC_FRAG: { frag(pi, si, px, py); }
         case REC_RECT: { rect(pi, si, px, py); }
         case REC_BLIT: { blit(pi, si, px, py); }
+        case REC_FRAGS: { frags(pi, si, px, py); }
         default: {}
     }
 }

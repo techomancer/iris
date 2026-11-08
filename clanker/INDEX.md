@@ -255,6 +255,7 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 | Note | Kind | Title |
 |---|---|---|
 | [gaps-found-by-the-2026-11-07-sweeps.md](odyssey/gaps-found-by-the-2026-11-07-sweeps.md) | open | Model gaps the full test sweep found on both raster units: CI8 reads return 0, X screen reads over some windows are noise, 10:10:10:2 pbuffers and 12-bit z16 visuals, double-buffered gltest shows only the clear |
+| [solidview-profile-2026-11-07.md](odyssey/solidview-profile-2026-11-07.md) | measure | SolidView: lines dominate (465k, 8.7 px each); GPU unit 6.1 s to 2.5 s; open: GPU line kernel needs exact maths, one-pixel off-by-one on the GPU unit, threaded CPU unit slower than inline |
 | [bringup.md](odyssey/bringup.md) | howto | VPro on the Octane: board catalogue, Crossbow code 5, PROM/IRIX minimums, disk images |
 | [gotchas.md](odyssey/gotchas.md) | rule | VPro gotchas: IMPACT installs lack the driver, textport FIFO cost, the f64 depth path |
 | [monitor-reads-quiesce-the-board.md](odyssey/monitor-reads-quiesce-the-board.md) | design | `vpro` state commands quiesce the board through `BoardLocks::quiesce` (format under the guard, write after); pixel, screen and memory dumps read board memory lock-free as the display does |
@@ -422,6 +423,7 @@ The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels 
 | [read-storage-in-place.md](wgpu/read-storage-in-place.md) | rule | Read records, slots and tables from their buffers in place: a 4.8 KB struct copied by value gave silently wrong texels on RADV once the kernel grew |
 | [swaps-wait-on-stream-positions-not-fences.md](wgpu/swaps-wait-on-stream-positions-not-fences.md) | design | A swap latches once the GPU unit has submitted the stores before its arm (stream positions, no CPU wait); polled idle words could follow the same scheme (open, minor) |
 | [window-id-bytes-are-written-through-to-the-mirror.md](wgpu/window-id-bytes-are-written-through-to-the-mirror.md) | rule | The front end reads window-id bytes without a wait, so the GPU unit's id and overlay byte stores are made in the mirror too; found with replays that compare both raster units |
+| [cpu-written-buffers-live-in-host-memory.md](wgpu/cpu-written-buffers-live-in-host-memory.md) | rule | No Queue::write_buffer; CPU-written GPU buffers are HostBuffers (Vulkan host memory, mapped once) in per-batch sets; one static upload ring; small memory blocks; nothing in the 256 MiB BAR window; run GPU tests with few threads |
 | [2d-fills-are-one-record-not-pixels.md](wgpu/2d-fills-are-one-record-not-pixels.md) | rule | X/PROM fills, id writes and pattern spans go through Board::fill_box: one constant-word blit record per buffer on the GPU unit, row spans on the CPU; the slot is cached; PROM power-on 4.2 s to 0.16 s drawing on the GPU unit |
 
 

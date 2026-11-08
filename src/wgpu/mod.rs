@@ -34,6 +34,7 @@
 
 pub mod batch;
 pub mod device;
+pub mod host;
 pub mod memory;
 pub mod present;
 pub mod scanout;
