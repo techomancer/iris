@@ -15,7 +15,10 @@ header and, once the bus attaches it, its interrupt line and DMA. The bus resets
 a function's header; a function never resets its own, so the decode table cannot
 go stale behind a BAR that moved. Headers change only through the bus: a
 configuration write, a reset or a snapshot load, and each updates the decode
-table and the BAR mappings.
+table and the BAR mappings. A function whose chip
+computes a configuration register (the indirect windows of a NIC) overrides
+`config_dword` for the read, and `config_write` to take a whole-dword write
+itself, which the header then never sees.
 
 `PciBus::attach` gives the function its DMA and, if its header names an
 interrupt pin, the line that pin drives, then calls `attached` for a function
