@@ -105,7 +105,7 @@ use crate::devlog::LogModule;
 use crate::irq::InterruptController;
 use crate::physical::{read_bytes, write_bytes};
 use crate::traits::{
-    BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK,
+    BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK,
 };
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -654,7 +654,8 @@ macro_rules! processor_read {
     ($r:ident, $out:ident) => {
         fn $r(&self, a: u64) -> $out {
             let r = self.downstream.$r(a);
-            if r.status != BUS_OK {
+            // A busy answer is a retry, not a failed read.
+            if r.status != BUS_OK && r.status != BUS_BUSY {
                 self.failed(a);
             }
             r
@@ -670,7 +671,7 @@ impl BusDevice for ProcessorIo {
         // 0x0240_0208 (IIO_IIBUSERR, "reads here cause a bus error"), whatever
         // node it names. Nothing goes out on the XIO link.
         let r = if a & (NODE_SPAN - 1) == IO_BUS_ERROR_PROBE { BusRead64::err() } else { self.downstream.read64(a) };
-        if r.status != BUS_OK {
+        if r.status != BUS_OK && r.status != BUS_BUSY {
             self.failed(a);
         }
         r
