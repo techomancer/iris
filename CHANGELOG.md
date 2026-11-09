@@ -26,6 +26,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Benchmark report
 
 - The per-kernel table has a "vs base" column for every cell and a "native" column for every cell. Both used to divide the best cell by the base or the host, so a build that lost 14% still read 1.00x.
+- A rerun under the same label is kept (`<label>.2.json`, `.3.json`) instead of replacing the last result. `report` groups them into one column showing the median, `[min-max]` and the run count, and ratios use the medians.
 
 ### R10000 family fixes, R12000 and R14000
 
