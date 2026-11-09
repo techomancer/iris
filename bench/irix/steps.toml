@@ -121,13 +121,14 @@ requires = "tar"
 
 # ── memory and syscalls ─────────────────────────────────────────────────────
 # No disk in the path at all: 256 MB through the read/write syscall pair, which
-# is IRIX's own copy loop plus the emulator's memory model.
+# is IRIX's own copy loop plus the emulator's memory model. IRIX's dd takes
+# no m suffix, so the block size is spelled in bytes.
 
 [[step]]
 name = "mem/syscall_copy"
 unit = "B"
 work = 268435456
-cmd = "dd if=/dev/zero of=/dev/null bs=1m count=256 >/dev/null 2>&1"
+cmd = "dd if=/dev/zero of=/dev/null bs=1048576 count=256 >/dev/null 2>&1"
 requires = "dd"
 
 # ── networking ──────────────────────────────────────────────────────────────
@@ -135,8 +136,10 @@ requires = "dd"
 [[step]]
 name = "net/loopback_ping"
 unit = "pkt"
-work = 100
-cmd = "ping -c 100 -i 0 127.0.0.1 > /dev/null 2>&1"
+work = 10000
+# IRIX's ping refuses `-i 0` ("Bad/invalid interval"); flood mode sends back to
+# back, which is what a zero interval was meant to do.
+cmd = "ping -f -c 10000 127.0.0.1 > /dev/null 2>&1"
 requires = "ping"
 
 # ── graphics ────────────────────────────────────────────────────────────────
