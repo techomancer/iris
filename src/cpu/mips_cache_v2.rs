@@ -46,6 +46,11 @@ impl FetchInstrResult {
     pub fn exception(status: ExecStatus) -> Self {
         Self { status, instr: std::ptr::null() }
     }
+    /// A failed fetch: the bus says `BUS_ERR` (DBE), but a fetch raises IBE.
+    #[inline(always)]
+    pub fn fault(status: ExecStatus) -> Self {
+        Self::exception(if status == BUS_ERR { exec_exception_const(EXC_IBE) } else { status })
+    }
 }
 
 
@@ -999,7 +1004,7 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
             FetchInstrResult::hit(slot as *const DecodedInstr)
         } else {
             // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
-            FetchInstrResult::exception(r.status)
+            FetchInstrResult::fault(r.status)
         }
     }
 
@@ -2842,7 +2847,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     for i in 0..Self::IC_INSTRS_PER_LINE {
                         let word_addr = line_base + (i as u64) * 4;
                         let r = self.downstream.read32(word_addr);
-                        let w = if r.is_ok() { r.data } else { 0 };
+                        // A failed refill is an instruction bus error; the tag stays clear.
+                        if !r.is_ok() { return exec_exception_const(EXC_IBE); }
+                        let w = r.data;
                         let d = &mut ic_instrs[ic_slot_base + i];
                         d.flags = FLAG_NOT_DECODED;
                         d.raw = w;

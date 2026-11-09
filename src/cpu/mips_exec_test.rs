@@ -7145,12 +7145,11 @@ mod tests {
         assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
     }
 
-    /// An uncached instruction fetch from a failing bus takes the bus error
-    /// as before, with or without a description: the same status, Cause, EPC
+    /// An uncached instruction fetch from a failing bus takes the instruction
+    /// bus error, with or without a description: the same status, Cause, EPC
     /// and BadVAddr, and the bus is asked once, after the fetch failed.
     #[test]
     fn test_described_uncached_fetch_fault_still_raises_the_bus_error() {
-        use crate::traits::BUS_ERR;
         let mut outcome = Vec::new();
         for explains in [false, true] {
             let bus = Arc::new(FailingProbe { explains, asked: Mutex::new(Vec::new()) });
@@ -7160,9 +7159,8 @@ mod tests {
             exec.core.cp0_badvaddr = 0x5555;
             exec.core.pc = 0xFFFFFFFF_A0000100;
 
-            // The fetch passes the bus's status through; a bus error leaves
-            // BadVAddr alone.
-            assert_eq!(exec.step_int(), BUS_ERR);
+            // The bus's BUS_ERR becomes IBE; a bus error leaves BadVAddr alone.
+            assert_eq!(exec.step_int(), exec_exception(crate::cpu::mips_exec::EXC_IBE));
             assert_eq!(exec.core.cp0_epc, 0xFFFFFFFF_A0000100);
             assert_eq!(exec.core.cp0_badvaddr, 0x5555);
             assert_eq!(*bus.asked.lock().unwrap(), vec![(0x100, 4)]);
@@ -7273,6 +7271,32 @@ mod tests {
         }
         assert_eq!(run::<R10K>(OP_SC), (EXEC_COMPLETE, 1), "SC succeeds");
         assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
+    }
+
+    /// A bus error on an instruction fetch is IBE (ExcCode 6), not DBE, on the
+    /// uncached (kseg1) and cache-fill (kseg0) paths of every cache model, and
+    /// in a delay slot EPC is the branch with BD set (R4000 UM p. 134; VR5000
+    /// UM p. 168; R10000 UM p. 346). A refused load stays DBE, see
+    /// `refused_uncached_store_completes_only_on_the_r10000`. Fix: fetch bus
+    /// error code.
+    #[test]
+    fn instruction_fetch_bus_error_is_ibe_on_every_model() {
+        use crate::cpu::mips_cache_shadow::*;
+        use crate::cpu::mips_cache_v2::{R10000Cache, R5000Cache};
+        use crate::cpu::mips_core::CAUSE_BD;
+        use crate::cpu::mips_exec::EXC_IBE;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            for (pc, in_slot) in [(0xFFFF_FFFF_A000_0100u64, false), (0xFFFF_FFFF_8000_0100, false), (0xFFFF_FFFF_A000_0104, true)] {
+                let bus: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+                let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+                disable_jitv2(&mut exec);
+                (exec.core.pc, exec.core.in_delay_slot) = (pc, in_slot);
+                assert_eq!(exec.step_int(), exec_exception(EXC_IBE), "{} pc {pc:#x}", C::NAME);
+                assert_eq!((exec.core.cp0_epc, exec.core.cp0_cause & CAUSE_BD != 0), (pc - 4 * in_slot as u64, in_slot));
+            }
+        }
+        check::<PassthroughCache>(); check::<R4400Cache>(); check::<R5000Cache>(); check::<R10000Cache>();
+        check::<R4400ShadowCache>(); check::<R5000ShadowCache>(); check::<R10000ShadowCache>();
     }
 
     /// The O2's RAM alias at 0x8000_0000 is matched on the 32 bits the board
