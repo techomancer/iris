@@ -8,9 +8,6 @@ BIN_DIR=$1
 IMAGE=$2
 OUT=$3
 TIMEOUT=${4:-900}
-SHOT_EVERY=${SHOT_EVERY:-60}
-# Seconds to let the screen settle after the login prompt, before the final screenshot.
-SETTLE=${SETTLE:-30}
 
 EXE=""
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;; esac
@@ -48,7 +45,7 @@ cdrom   = false
 overlay = true
 EOF
 
-rm -f nvram.bin serial.log phase-a.log transcript.log iris-*.log shot-*.png final.png
+rm -f nvram.bin serial.log phase-a.log transcript.log iris-*.log
 
 log() { echo "[boot-test $(date -u +%H:%M:%S)] $*"; }
 ic() { "$IRIS_CI" "$@"; }
@@ -104,6 +101,7 @@ for c in \
   "setenv -f OSLoadPartition scsi(0)disk(1)rdisk(0)partition(0)" \
   "setenv -f OSLoadFilename /unix" \
   "setenv -f AutoLoad Yes" \
+  "setenv -f console d" \
   "printenv"; do
   monitor_cmd "$c" || { log "phase A: '$c' got no prompt back"; cat phase-a.log; exit 1; }
 done
@@ -112,15 +110,14 @@ stop_iris
 log "phase A: done"
 
 # ── Phase B: boot ────────────────────────────────────────────────────────────
-# Graphics console + AutoLoad: the PROM boots the disk unattended.
+# Serial console (console=d) + AutoLoad: the PROM boots the disk unattended
+# and the login arrives on serial, where the wait below sees it.
 
 start_iris iris.log
 log "phase B: booting; deadline ${TIMEOUT}s"
 ic -q start
 
 START=$(date +%s)
-NEXT_SHOT=$((START + 15))   # the display isn't configured at t=0
-SHOT=0
 RESULT=1
 
 while :; do
@@ -131,12 +128,6 @@ while :; do
 
   if ! kill -0 "$IRIS_PID" 2>/dev/null; then
     log "iris exited after ${ELAPSED}s"; IRIS_PID=""; break
-  fi
-
-  if [ "$NOW" -ge "$NEXT_SHOT" ]; then
-    SHOT=$((SHOT + 1))
-    ic -q screenshot "$(printf 'shot-%03d-%04ds.png' "$SHOT" "$ELAPSED")" || true
-    NEXT_SHOT=$((NOW + SHOT_EVERY))
   fi
 
   if grep -q 'login:' transcript.log; then
@@ -150,12 +141,6 @@ while :; do
   fi
   sleep 5
 done
-
-if [ -n "$IRIS_PID" ]; then
-  [ $RESULT -eq 0 ] && sleep "$SETTLE"
-  ic serial-read >> transcript.log 2>/dev/null || true
-  ic -q screenshot final.png || log "final screenshot failed"
-fi
 
 log "last serial output:"
 tail -n 40 transcript.log

@@ -45,8 +45,8 @@ scripts/dist/package-linux.sh --version 1.2.3
   `IRIX53_BOOT_IMAGE_URL` secret holds the URL of an installed IRIX 5.3 CHD, it
   also boots that disk to a login prompt on Linux, macOS and Windows with
   `scripts/ci-boot-test.sh`, and a failed boot stops the nightly or release
-  from publishing. The disk needs a getty on `ttyd1`, because the test watches
-  the serial port for `login:`. Screenshots and logs are attached to the run.
+  from publishing. The test sets the PROM console to serial and watches it for
+  `login:`; the logs are attached to the run.
 - `nightly.yml` runs daily at 05:00 UTC, builds `main` as
   `nightly.YYYY.MM.DD`, and replaces the single `nightly` pre-release. It skips
   the day when `main` has not moved.

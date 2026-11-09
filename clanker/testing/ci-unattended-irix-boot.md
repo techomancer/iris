@@ -20,9 +20,8 @@ Fix: a headless pass first. With `--headless` the PROM falls back to the serial
 console, which the CI socket can drive: wait `Option?` → `5` → `setenv -f
 SystemPartition scsi(0)disk(1)rdisk(0)partition(8)`, `OSLoadPartition
 ...partition(0)`, `OSLoadFilename /unix`, `AutoLoad Yes` → `iris-ci rtc-save`
-→ quit. The next (graphics) run auto-boots the disk unattended. Leave
-`console` unset (= `g`) if you want the graphical login on screen; `console=d`
-puts everything on serial and leaves the framebuffer dark (irix-install.md §8).
+→ quit. The next run auto-boots the disk unattended. The script also sets
+`console d`, so `login:` arrives on serial; the framebuffer stays dark (irix-install.md §8).
 
 ## Screenshots under --ci
 
@@ -39,5 +38,3 @@ mode yet`: VC2 timings aren't programmed. Wait ~15s.
   SUN_LEN`); keep `ci_socket` under `/tmp`, not a deep workspace path.
 - A config with no `[scsi.1]` falls back to `scsi1.raw` and iris exits fatally
   if it's missing.
-- Detecting login with a graphics console needs a getty on ttyd1 in the image;
-  otherwise serial is silent after the PROM.
