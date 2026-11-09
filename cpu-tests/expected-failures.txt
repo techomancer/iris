@@ -1,0 +1,78 @@
+# The cpu-tests that fail today, per CPU and engine. run/check.py fails a run
+# when a test fails that is not listed for its cell and when a listed test
+# passes, so this file always says exactly what is broken. Every test here
+# passes on a real Indy (oracle/): each is an IRIS bug, not a test bug.
+#
+#   fpu/vec_*, fpu/cvt_*   FCSR Inexact/Invalid are not computed for ordinary
+#                          arithmetic (clanker/jitv2/fpu-flags-are-computed-not-read.md)
+#   fpu/trap_*, inexact    a trapped exception still writes its result and Flag
+#                          bit (docs/findings.md, findings 3, 4 and 6)
+#   mips4/*                an R4400 raises FPE for unimplemented COP1 encodings,
+#                          IRIS raises RI (docs/findings.md)
+#   mem/lwr_all_offsets, excep/cop2_unusable   docs/gotchas.md
+#   cache/hit_inv_discards jitv2 implies tcache, whose write-through L1-D has no
+#                          dirty line to discard
+#                          (clanker/cpu/tcache-discards-dirty-data-semantics.md)
+#
+# A fix that makes a test pass deletes its line in the same commit. A change
+# that makes a test fail does not add one unless the gap is written up.
+
+[r4400-interp]
+excep/cop2_unusable
+fpu/cvt_out_of_range
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_cvt_from_l
+fpu/vec_sqrt
+mem/lwr_all_offsets
+mips4/fp_cond_move_d
+mips4/fp_cond_move_s
+mips4/recip_rsqrt
+mips4/recip_rsqrt_d
+
+[r4400-jitv2]
+cache/hit_inv_discards
+excep/cop2_unusable
+fpu/cvt_out_of_range
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_cvt_from_l
+fpu/vec_sqrt
+mem/lwr_all_offsets
+mips4/fp_cond_move_d
+mips4/fp_cond_move_s
+mips4/recip_rsqrt
+mips4/recip_rsqrt_d
+
+[r5000-interp]
+excep/cop2_unusable
+fpu/cvt_out_of_range
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_cvt_from_l
+fpu/vec_sqrt
+
+[r5000-jitv2]
+cache/hit_inv_discards
+excep/cop2_unusable
+fpu/cvt_out_of_range
+fpu/cvt_s_d_rounds
+fpu/inexact_flag
+fpu/trap_disabled_control
+fpu/trap_inexact
+fpu/vec_arith_double
+fpu/vec_arith_single
+fpu/vec_cvt_from_l
+fpu/vec_sqrt
