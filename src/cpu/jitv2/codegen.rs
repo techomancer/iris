@@ -9025,7 +9025,7 @@ fn emit_fcvt_d_l(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, true
 // ---- CP1 compares: C.cond.fmt ------
 
 /// Evaluate one of the 16 MIPS FP compare conditions against Cranelift's
-/// `fcmp`, matching `fpu_compare_s`/`fpu_compare_d`'s match table exactly.
+/// `fcmp`, matching the interpreter's `fpu_compare_holds` exactly.
 /// `cond` (`funct & 0xF`) is a compile-time constant (part of the fixed
 /// instruction encoding), so this resolves to one `fcmp` (or a constant
 /// `false`, for F/SF) — no runtime branch on which condition it is.
@@ -9033,11 +9033,10 @@ fn emit_fcvt_d_l(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_from_int(ctx, f, true
 /// Cranelift has its own `FloatCC` enum whose `Equal`/`LessThan`/
 /// `LessThanOrEqual`/`Unordered`/`NotEqual`... — MIPS's condition set maps
 /// directly onto small ORs of `FloatCC::{LessThan,Equal,Unordered}`-shaped
-/// primitives the same way `fpu_compare_s` builds `less`/`equal`/`unordered`
-/// from three separate host comparisons and ORs them — so this mirrors that
-/// exact structure (three `fcmp`s + boolean logic) rather than searching
-/// for a single closer `FloatCC` variant, to keep the correspondence to the
-/// interpreter's own formula obvious.
+/// primitives: `less`, `equal` and `unordered` from three host comparisons
+/// and ORs of them (the interpreter folds the same three into a three-bit mask
+/// and ANDs it with the condition) — so this keeps three `fcmp`s + boolean
+/// logic rather than searching for a single closer `FloatCC` variant.
 fn emit_fpu_compare(builder: &mut FunctionBuilder, a: Value, b: Value, cond: u32) -> Value {
     use cranelift_codegen::ir::condcodes::FloatCC;
     let less = builder.ins().fcmp(FloatCC::LessThan, a, b);
