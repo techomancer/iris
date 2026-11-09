@@ -102,6 +102,33 @@ pub fn parse(bytes: &[u8]) -> Result<Elf32, String> {
     Ok(Elf32 { entry: sext(be32(24)), segments })
 }
 
+/// File offset of the initialised 4-byte data object `name`, from the symbol
+/// table of an ELF32 MSB image, or None when the image has no such symbol, it
+/// is not a data object, it lies outside its section, or it is in .bss (which
+/// holds no initial value to read or change).
+pub fn symbol_offset(b: &[u8], name: &str) -> Option<usize> {
+    let be32 = |o: usize| Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?) as usize);
+    let be16 = |o: usize| Some(u16::from_be_bytes(b.get(o..o + 2)?.try_into().ok()?) as usize);
+    if b.get(..6)? != b"\x7fELF\x01\x02" { return None; }
+    let (shoff, shentsize, shnum) = (be32(0x20)?, be16(0x2E)?, be16(0x30)?);
+    // Section header fields, 4 bytes each: name, type, flags, addr, offset, size, link.
+    let sh = |i: usize, f: usize| be32(shoff + i * shentsize + f * 4);
+    let symtab = (0..shnum).find(|&i| sh(i, 1) == Some(2))?;
+    let (off, size, strtab) = (sh(symtab, 4)?, sh(symtab, 5)?, sh(sh(symtab, 6)?, 4)?);
+    // Each 16-byte entry: name, value, size, info, other, section index.
+    (0..size / 16).find_map(|k| {
+        let (e, n) = (off + k * 16, strtab + be32(off + k * 16)?);
+        if b.get(n..n + name.len())? != name.as_bytes() || *b.get(n + name.len())? != 0 { return None; }
+        let (value, sec) = (be32(e + 4)?, be16(e + 14)?);
+        if b.get(e + 12)? & 0xf != 1 { return None; } // STT_OBJECT
+        if be32(e + 8)? != 4 || sh(sec, 1)? != 1 { return None; } // size 4, SHT_PROGBITS
+        let (addr, len) = (sh(sec, 3)?, sh(sec, 5)?);
+        if value < addr || value + 4 > addr + len { return None; } // inside its section
+        let at = sh(sec, 4)? + (value - addr);
+        (at + 4 <= b.len()).then_some(at)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +195,50 @@ mod tests {
         v[52 + 16..52 + 20].copy_from_slice(&0x1000u32.to_be_bytes()); // p_filesz
         v[52 + 20..52 + 24].copy_from_slice(&0x1000u32.to_be_bytes()); // p_memsz
         assert!(parse(&v).unwrap_err().contains("past the end"));
+    }
+
+    /// One initialised word `bench_x` (0x2a) in .data, one in .bss, and the
+    /// section headers, symbol table and string table that name them.
+    fn elf_with_symbols() -> Vec<u8> {
+        let w = |v: &mut Vec<u8>, xs: &[u32]| for x in xs { v.extend(x.to_be_bytes()) };
+        let mut v = vec![0u8; 52];
+        v[..6].copy_from_slice(b"\x7fELF\x01\x02");
+        v.extend(42u32.to_be_bytes());                          // .data at 52
+        let strtab = b"\0bench_x\0bench_bss\0";
+        let (str_at, sym_at, sh_at) = (56, 56 + strtab.len(), 56 + strtab.len() + 48);
+        v.extend(strtab);
+        for (name, value, size, sec) in [(0u32, 0u32, 0u32, 0u16), (1, 0x1000, 4, 1), (10, 0x2000, 4, 2)] {
+            w(&mut v, &[name, value, size]);
+            v.extend([if name == 0 { 0 } else { 1 }, 0]); // st_info (STT_OBJECT), st_other
+            v.extend(sec.to_be_bytes());
+        }
+        // null, .data (PROGBITS), .bss (NOBITS), .symtab, .strtab
+        for (ty, addr, off, size, link) in [(0, 0, 0, 0, 0), (1, 0x1000, 52, 4, 0), (8, 0x2000, 0, 4, 0),
+                                            (2, 0, sym_at as u32, 48, 4), (3, 0, str_at as u32, strtab.len() as u32, 0)] {
+            w(&mut v, &[0, ty, 0, addr, off, size, link, 0, 0, 0]);
+        }
+        v[0x20..0x24].copy_from_slice(&(sh_at as u32).to_be_bytes());
+        v[0x2E..0x32].copy_from_slice(&[0, 40, 0, 5]);
+        v
+    }
+
+    #[test]
+    fn finds_an_initialised_word_by_symbol_name() {
+        let v = elf_with_symbols();
+        let at = symbol_offset(&v, "bench_x").unwrap();
+        assert_eq!(v[at..at + 4], 42u32.to_be_bytes());
+        assert_eq!(symbol_offset(&v, "bench"), None, "a prefix is not the name");
+        assert_eq!(symbol_offset(&v, "bench_bss"), None, ".bss has no initial value");
+        assert_eq!(symbol_offset(&v, "missing"), None);
+        assert_eq!(symbol_offset(&v[..100], "bench_x"), None);
+
+        // Second symbol-table entry is bench_x: value at +4, st_info at +12.
+        let entry = 56 + b"\0bench_x\0bench_bss\0".len() + 16;
+        let mut past = v.clone();
+        past[entry + 4..entry + 8].copy_from_slice(&0x1002u32.to_be_bytes());
+        assert_eq!(symbol_offset(&past, "bench_x"), None, "runs past the end of .data");
+        let mut func = v.clone();
+        func[entry + 12] = 2; // STT_FUNC
+        assert_eq!(symbol_offset(&func, "bench_x"), None, "not a data object");
     }
 }
