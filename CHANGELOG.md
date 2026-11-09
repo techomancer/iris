@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### cpu-tests: results judged by test name
+
+- `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
+- CI judges `cpu-tests` by test name, not by failure count: the harness prints TAP, `cpu-tests/expected-failures.txt` lists the failing tests per CPU and engine, and `make -C cpu-tests check-run CPU=... ENGINE=...` runs the suite and the check, locally as in CI.
+
 ### R10000 family fixes, R12000 and R14000
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
