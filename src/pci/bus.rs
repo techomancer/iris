@@ -206,7 +206,8 @@ impl PciBus {
     }
 
     /// A configuration write of `width` bytes at byte `off`: only those bytes
-    /// change, and the header decides which of their bits stick. False if
+    /// change, and the header decides which of their bits stick. A function
+    /// may take a whole-dword write itself ([`PciFunction::config_write`]). False if
     /// nothing answers on a root bus; behind a bridge the write is discarded by
     /// master abort, as a read of nothing is (see [`PciBus::config_read`]), and
     /// counts as answered. The mappings are updated when the command register,
@@ -217,6 +218,9 @@ impl PciBus {
         crate::dlog!(LogModule::Pci, "pci: bus {} {}.{} write {off:#04x}/{width} {val:#x}{}", self.0.number, at.device, at.function,
             if f.is_some() { "" } else { ", no answer" });
         let Some(f) = f else { return self.master_abort() };
+        if width == 4 && f.config_write(off / 4, val) {
+            return true;
+        }
         let (cfg, reg, shift) = (f.state().config(), off / 4, (off & 3) * 8);
         let mask = (u32::MAX >> (32 - 8 * width)) << shift;
         let old = cfg.read(reg);
@@ -542,6 +546,39 @@ mod tests {
         f0.state().irq().unwrap().set(false);
         assert_eq!(h.irqs(), vec![(10, true), (10, false)], "one pin, one output");
         assert!(b.occupied(3) && !b.occupied(4));
+    }
+
+    /// A function whose dword 0x1e is a window into the chip: a whole-dword
+    /// write goes to the chip every time, even when it repeats a value, and
+    /// the header stores nothing; a narrower one takes the header's path.
+    #[test]
+    fn a_function_takes_a_whole_dword_configuration_write_itself() {
+        struct Window(crate::pci::PciFunctionState, Mutex<Vec<u32>>);
+        impl PciFunction for Window {
+            fn state(&self) -> &crate::pci::PciFunctionState {
+                &self.0
+            }
+            fn bar_read(&self, _: usize, _: u32, _: usize) -> u32 {
+                0
+            }
+            fn bar_write(&self, _: usize, _: u32, _: u32, _: usize) {}
+            fn config_write(&self, reg: usize, val: u32) -> bool {
+                (reg == 0x1e).then(|| self.1.lock().unwrap().push(val)).is_some()
+            }
+        }
+        let (_h, b) = bus();
+        let w = Arc::new(Window(crate::pci::PciFunctionState::new(PciConfig::new(1, 2, 0, 1, bars(), PCI_INTA)), Mutex::new(Vec::new())));
+        b.attach(at(1, 0), w.clone());
+        assert!(b.config_write(at(1, 0), 0x78, 4, 0x1234_5678));
+        assert!(b.config_write(at(1, 0), 0x78, 4, 0x1234_5678));
+        assert_eq!(*w.1.lock().unwrap(), [0x1234_5678, 0x1234_5678], "a repeated value reaches the chip again");
+        assert_eq!(b.config_read(at(1, 0), 0x78, 4), Some(0), "the header stored nothing");
+        assert!(b.config_write(at(1, 0), 0x78, 2, 0xffff));
+        assert_eq!(w.1.lock().unwrap().len(), 2, "a halfword write is the header's");
+        // Another dword is the header's too.
+        assert!(b.config_write(at(1, 0), 0x3c, 4, 0x0000_00ab));
+        assert_eq!(b.config_read(at(1, 0), 0x3c, 1), Some(0xab));
+        assert_eq!(w.1.lock().unwrap().len(), 2);
     }
 
     #[test]

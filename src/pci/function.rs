@@ -73,6 +73,15 @@ pub trait PciFunction: Send + Sync {
     /// shared core, and the SCSI controllers drive their pins.
     fn attached(&self) {}
 
+    /// A configuration write of the whole dword `reg`, offered before the
+    /// header sees it. A function whose chip computes the register (the
+    /// indirect windows of a NIC) takes it here, returns true, and the header
+    /// stores nothing; every other function leaves it to the header. Narrower
+    /// writes always take the header's path. Called with no header lock held.
+    fn config_write(&self, _reg: usize, _val: u32) -> bool {
+        false
+    }
+
     /// The bus wrote configuration dword `reg` of this function's header and
     /// it changed from `old` to `new`. A PCI-to-PCI bridge acts on bridge
     /// control here; every other function has nothing to do.
