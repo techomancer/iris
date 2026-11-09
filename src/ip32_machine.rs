@@ -34,7 +34,7 @@ use crate::dev::crime_mem::O2Memory;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::Rex3Screen;
 use crate::hptimer::TimerManager;
-use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, RAM_BASE, RAM_WINDOW_SIZE};
+use crate::ip32::{Ip32Bus, Ip32Options, IP32_VIRTIO_SLOT, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
@@ -185,11 +185,16 @@ impl O2Machine {
             scsi.get(c as usize)
                 .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1)"))
         })?;
+        let virtio = cfg.virtio_serial.enabled.then(|| {
+            eprintln!("iris: virtio-serial on PCI device {IP32_VIRTIO_SLOT}");
+            Arc::new(crate::dev::virtio::pci::VirtioPci::new(crate::dev::virtio::console::from_config(&cfg.virtio_serial)))
+        });
         let opts = Ip32Options {
             scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
             mac,
+            virtio,
         };
         let bus = Ip32Bus::with_options(mem, prom, opts);
         // MACE audio plays through the host unless audio is off.
@@ -537,6 +542,9 @@ impl O2Machine {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.stop();
         }
+        if let Some(v) = &self.bus.virtio {
+            v.stop();
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
@@ -559,10 +567,13 @@ impl O2Machine {
     }
 
     /// Give each SCSI controller its own thread, so disk transfers do not
-    /// run on the CPU's.
+    /// run on the CPU's, and start the virtio device's host ends.
     fn start_scsi(&self) {
         for ctl in self.bus.scsi.lock().unwrap().iter() {
             ctl.start();
+        }
+        if let Some(v) = &self.bus.virtio {
+            v.start();
         }
     }
 

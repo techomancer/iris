@@ -1015,3 +1015,43 @@ fn configuration_writes_do_not_make_the_physical_bus_keep_more_devices() {
     assert_eq!(bus.phys.kept_len(), moved, "both placements are already mapped");
 }
 
+
+/// An O2 with `[virtio_serial]` and one port wired to nothing, so tests don't
+/// compete for the default TCP port.
+fn o2_with_virtio() -> Arc<Ip32Bus> {
+    let cfg = crate::config::VirtioSerialConfig { enabled: true, ports: vec![Default::default()], ..Default::default() };
+    let virtio = Arc::new(crate::dev::virtio::pci::VirtioPci::new(crate::dev::virtio::console::from_config(&cfg)));
+    let opts = Ip32Options { virtio: Some(virtio), ..Default::default() };
+    Ip32Bus::with_options(O2Memory::single(1 << 20), vec![0u8; PROM_SIZE as usize], opts)
+}
+
+#[test]
+fn virtio_serial_is_pci_device_4_with_its_inta_on_crime_11() {
+    use crate::pci::PciFunction;
+    let bus = o2_with_virtio();
+    let pci = bus.mace.pci.bus();
+    let at = |device| DevFn { device, function: 0 };
+    assert_eq!(pci.config_read(at(IP32_VIRTIO_SLOT), 0, 4), Some(0x1043_1af4), "virtio console at device 4");
+    assert_eq!(pci.config_read(at(3), 0, 4), None, "the option slot stays empty");
+    let v = bus.virtio.as_ref().unwrap();
+    assert_eq!(v.state().config().interrupt_pin(), 1, "INTA");
+    let crime_11 = || bus.crime.regs.intstat() & (1 << 11) != 0;
+    v.state().irq().unwrap().set(true);
+    assert!(crime_11(), "raised on CRIME 11");
+    v.state().irq().unwrap().set(false);
+    assert!(!crime_11(), "and dropped");
+}
+
+/// The bus refuses a snapshot whose functions differ from its own, so one
+/// taken with the device does not load without it, nor the other way round.
+#[test]
+fn a_snapshot_is_only_for_an_o2_with_the_same_virtio_serial() {
+    use crate::traits::Saveable;
+    let with = o2_with_virtio();
+    let without = Ip32Bus::new(1 << 20, vec![0u8; PROM_SIZE as usize]);
+    for (from, into) in [(&with, &without), (&without, &with)] {
+        let err = into.load_state(&from.save_state()).unwrap_err();
+        assert!(err.contains("pci: saved state has functions"), "{err}");
+    }
+    with.load_state(&with.save_state()).expect("its own state loads");
+}

@@ -2279,16 +2279,12 @@ impl MachineConfig {
                     _ => Ok(()),
                 }
             }
-            // The Octane has a PCI bridge with a free slot.
-            MachineProfile::OctaneIp30 => Ok(()),
+            // The Octane has a PCI bridge with a free slot, and the O2 an
+            // unpopulated device number whose INTA MACE routes.
+            MachineProfile::OctaneIp30 | MachineProfile::O2Ip32 => Ok(()),
             MachineProfile::Origin200Ip29 => Err("[virtio_serial] is not wired on the Origin 200".into()),
             MachineProfile::Origin2000Ip27 => Err("[virtio_serial] is not wired on the Origin 2000".into()),
             MachineProfile::Onyx2Ip27 => Err("[virtio_serial] is not wired on the Onyx2".into()),
-            MachineProfile::O2Ip32 => Err(
-                "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
-                 MACE PCI bridge has no interrupt route for a third slot (see docs/dev/virtio-serial.md)"
-                    .into(),
-            ),
         }
     }
 

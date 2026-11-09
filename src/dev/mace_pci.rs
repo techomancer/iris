@@ -33,6 +33,10 @@ pub const MACEPCI_REVISION_VALUE: u32 = 1;
 pub const IP32_SCSI_SLOT: u8 = 1;
 pub const IP32_SCSI_SLOT_B: u8 = 2;
 
+/// Where `[virtio_serial]` puts its paravirtual device: device 4, which no
+/// O2 board populates and whose INTA `crate::ip32::PCI0` routes to CRIME 11.
+pub const IP32_VIRTIO_SLOT: u8 = 4;
+
 /// The CPU-side window onto PCI memory, and the PCI address it starts at.
 ///
 /// These are not the same number, which is the whole point. The PROM programs

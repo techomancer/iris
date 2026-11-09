@@ -20,7 +20,7 @@ chooses a transport:
 | Indy (IP24) | virtio-mmio v2 | GIO expansion slot 1 (`0x1F600000`), or slot 0 (`0x1F400000`) | `GioExp1` / `GioExp0` (IOC local/mappable) |
 | Indigo2 (IP22), Indigo2 IMPACT (IP28) | virtio-mmio v2 | same two slots | the slot's EXT_IO fan-out line (`GioS1Graphics` / `GioS0Graphics`) |
 | Octane (IP30) | virtio-pci (modern) | Bridge slot 4 | INTA through the Bridge |
-| O2 (IP32) | virtio-pci (modern) | **not wired** | the MACE PCI router has no route for a spare slot |
+| O2 (IP32) | virtio-pci (modern) | PCI device 4 on the MACE bus | INTA to CRIME input 11 |
 
 The Indy and Indigo2 have no PCI bus, so they get the memory-mapped transport
 in a 64 KB window of an empty GIO expansion slot (an empty slot otherwise
@@ -29,10 +29,11 @@ default. Slot 0 is shared with `test_device` and the Ultra64 board; slot 1 is
 shared with the second Newport head (`graphics.heads = 2`). A clash is refused
 when the configuration is validated.
 
-The O2's transport is complete and tested but the machine does not use it: its
-bridge routes only the two SCSI slots' pins to CRIME inputs, and which CRIME
-input a third slot would drive is a hardware fact we do not have. `validate()`
-says so rather than silently ignoring the section.
+On the O2 the device is PCI device 4 on the MACE bus, which no O2 board
+populates; the MACE specification routes that device's INTA to CRIME input 11
+(see [the PCI notes](../pci.md)). The option slot, device 3, is left alone. A
+snapshot restores only into an O2 with the same PCI functions, so one taken
+with the device is refused by a machine without it, and the other way round.
 
 ## Configuration
 
@@ -104,7 +105,7 @@ registers `0x030`..`0x0a4`, `InterruptStatus`/`ACK` `0x060`/`0x064`, `Status`
 - Rings are in guest RAM and are addressed by guest physical address (the
   address the CPU would use through KSEG0/KSEG1, with the top bits removed).
 
-### virtio-pci (Octane)
+### virtio-pci (Octane, O2)
 
 Vendor `0x1af4`, device `0x1043` (`0x1040 + 3`), class `0x078000`, BAR0 a
 16 KB memory BAR holding the four structures the vendor capabilities at
@@ -126,3 +127,7 @@ any other function on that machine.
   driver.
 - Host-side connect/disconnect is reported through `PORT_OPEN` only for
   multiport guests.
+- On the O2 no guest with a virtio driver has run yet: IRIX finds the device
+  on the bus and leaves it unclaimed. Its cold reset does not reach PCI
+  functions yet (see [the PCI notes](../pci.md)), so the device keeps its
+  state across one until a driver resets it.

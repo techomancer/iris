@@ -23,6 +23,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
 - CI judges `cpu-tests` by test name, not by failure count: the harness prints TAP, `cpu-tests/expected-failures.txt` lists the failing tests per CPU and engine, and `make -C cpu-tests check-run CPU=... ENGINE=...` runs the suite and the check, locally as in CI.
+### O2 virtio-serial
+
+- `[virtio_serial]` now works on the O2: the device is PCI device 4 on the MACE
+  bus, which no O2 board populates, with INTA on CRIME input 11.
 
 ### PCI
 

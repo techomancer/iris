@@ -71,7 +71,7 @@ and 90; established as software, and the board's INTB-D wiring is not known).
 | 1 | CRIME 8 | | | | Internal SCSI controller 0 |
 | 2 | CRIME 9 | | | | Internal SCSI controller 1 |
 | 3 | CRIME 10 | CRIME 13 | CRIME 14 | CRIME 15 | The PCI option slot |
-| 4 | CRIME 11 | | | | Not populated on an O2; iris keeps it spare for virtio-serial |
+| 4 | CRIME 11 | | | | Not populated on an O2; virtio-serial when enabled |
 
 **Octane**, Bridge bus 0. Outputs are the Bridge's eight pins. Pins A and C of
 device `d` reach pin `d`, B and D reach `d ^ 4`: inferred from software, not

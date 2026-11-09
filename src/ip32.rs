@@ -196,6 +196,8 @@ pub struct Ip32Options {
     pub keyboard: Option<bool>,
     /// The Ethernet address in the 1-Wire ID chip, if not the default.
     pub mac: Option<[u8; 6]>,
+    /// The paravirtual serial device (`[virtio_serial]`), at PCI device 4.
+    pub virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -453,6 +455,9 @@ pub struct Ip32Bus {
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
+    /// The paravirtual serial device, if configured, for the machine to
+    /// start and stop.
+    pub virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
 }
 
 impl Ip32Bus {
@@ -498,6 +503,7 @@ impl Ip32Bus {
             mace: Mace::new(ram.clone(), crime, ust, &PCI0),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
+            virtio: opts.virtio,
         };
         bus.gbe.tr.start_from_env();
         if let Some(mac) = opts.mac {
@@ -528,6 +534,9 @@ impl Ip32Bus {
             let mut list = bus.scsi.lock().unwrap();
             list.push(scsi);
             list.push(scsi_b);
+        }
+        if let Some(v) = &bus.virtio {
+            bus.mace.pci.bus().attach(DevFn { device: IP32_VIRTIO_SLOT, function: 0 }, v.clone());
         }
         // A saved flash carries the guest's environment -- boot paths, console
         // choice, everything the PROM's `setenv` writes -- from one run to
