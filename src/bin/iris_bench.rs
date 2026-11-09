@@ -92,7 +92,7 @@ fn run_guest(
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let p = parse_block(&stdout).map_err(|e| {
-        format!("{}\n--- last 20 lines of emulator output ---\n{}", e, tail(&stdout, 20))
+        format!("{}\n{}", e, failure_context(&out.status, &stdout, &stderr))
     })?;
 
     Ok(Run {
@@ -189,6 +189,16 @@ fn junit_suite(cell: &str, rows: &[Row]) -> junit::TestSuite {
     junit::suite(&junit::classname("bench", cell), cases)
 }
 
+/// What to show when an emulator run produced no report: how it ended, and
+/// the tail of both streams. The reason is usually on stderr (a configuration
+/// error, a refused option, a panic).
+fn failure_context(status: &impl std::fmt::Display, stdout: &str, stderr: &str) -> String {
+    format!(
+        "emulator {}\n--- last 20 lines of emulator stderr ---\n{}\n\
+         --- last 20 lines of emulator stdout ---\n{}",
+        status, tail(stderr, 20), tail(stdout, 20))
+}
+
 /// Wait for a child, killing it after `timeout_s`. A benchmark that hangs is a
 /// finding, not a reason to block a matrix run forever.
 fn run_with_timeout(mut cmd: Command, timeout_s: u64) -> Result<std::process::Output, String> {
@@ -210,8 +220,13 @@ fn run_with_timeout(mut cmd: Command, timeout_s: u64) -> Result<std::process::Ou
             None => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("timed out after {}s", timeout_s));
+                    let status = child.wait().map_or("was killed".into(), |s| s.to_string());
+                    // Killing closes the pipes, so the readers finish: what the
+                    // child said before it hung is the best clue why.
+                    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).into_owned();
+                    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).into_owned();
+                    return Err(format!("timed out after {}s\n{}", timeout_s,
+                                       failure_context(&status, &stdout, &stderr)));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -1507,5 +1522,14 @@ mod tests {
         assert!(md.contains("epyc 7443 (") && md.contains("epyc 7663 ("), "{md}");
         assert!(is_counted(&run_with("x", 1, "cpu", &["lightning", "ci_clock"], false)));
         assert!(!is_counted(&run_with("x", 1, "cpu", &["lightning"], false)));
+    }
+
+    /// A failed run showed only "no IRIS-BENCH-BEGIN" and stdout's tail, though
+    /// the reason (a refused option, a panic) was on stderr.
+    #[test]
+    fn a_failed_run_shows_the_status_and_both_streams() {
+        let e = failure_context(&"exit status: 3", "some stdout", "Configuration error: no sync\n");
+        assert!(e.contains("emulator exit status: 3") && e.contains("some stdout"), "{e}");
+        assert!(e.contains("Configuration error: no sync"), "{e}");
     }
 }
