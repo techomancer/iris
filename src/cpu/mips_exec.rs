@@ -8607,9 +8607,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // for the eight signalling predicates (cond 0x8-0xF, funct bit 3)
         // whenever either operand is any NaN.
         let is_signaling_predicate = (funct_val & 0x8) != 0;
-        let has_nan = fs_val.is_nan() || ft_val.is_nan();
-        let has_snan = is_snan_s(fs_bits) || is_snan_s(ft_bits);
-        let invalid = has_snan || (is_signaling_predicate && has_nan);
+        // Ordinary operands are the common case and need only the one unordered
+        // test (a single ucomiss); the NaN classification stays behind it.
+        let unordered = fs_val.is_nan() | ft_val.is_nan();
+        let invalid = unordered
+            && (is_signaling_predicate || is_snan_s(fs_bits) || is_snan_s(ft_bits));
         // Cause reflects only the last instruction (R4000 manual), so it is
         // rewritten every compare, not just when this one raises Invalid.
         self.core.fpu_fcsr = (self.core.fpu_fcsr & !FCSR_CM) | if invalid { FCSR_CV } else { 0 };
@@ -8845,9 +8847,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // for the eight signalling predicates (cond 0x8-0xF, funct bit 3)
         // whenever either operand is any NaN.
         let is_signaling_predicate = (funct_val & 0x8) != 0;
-        let has_nan = fs_val.is_nan() || ft_val.is_nan();
-        let has_snan = is_snan_d(fs_val.to_bits()) || is_snan_d(ft_val.to_bits());
-        let invalid = has_snan || (is_signaling_predicate && has_nan);
+        // Ordinary operands are the common case and need only the one unordered
+        // test (a single ucomisd); the NaN classification stays behind it.
+        let unordered = fs_val.is_nan() | ft_val.is_nan();
+        let invalid = unordered
+            && (is_signaling_predicate || is_snan_d(fs_val.to_bits()) || is_snan_d(ft_val.to_bits()));
         // Cause reflects only the last instruction (R4000 manual), so it is
         // rewritten every compare, not just when this one raises Invalid.
         self.core.fpu_fcsr = (self.core.fpu_fcsr & !FCSR_CM) | if invalid { FCSR_CV } else { 0 };

@@ -3805,6 +3805,94 @@ mod tests {
         assert!(exec.core.get_fpu_cc(0)); // ULT (unordered or less) is true with NaN
     }
 
+    /// C.cond.fmt raises Invalid for a signalling NaN under every predicate,
+    /// and for a quiet NaN only under the eight signalling predicates
+    /// (cond bit 3). Cause is rewritten by every compare, ordinary operands
+    /// included. The quiet and signalling encodings are the MIPS ones (the
+    /// fraction MSB set means signalling); see `test_fpu_snan_operand_is_invalid`.
+    #[test]
+    fn test_fpu_compare_invalid_per_predicate() {
+        const CAUSE: u32 = 0x0001_f000;
+        const CAUSE_V: u32 = 0x0001_0000;
+        const FLAG_V: u32 = 0x40;
+        const FLAG_I: u32 = 0x04; // pre-set sticky flag, must survive
+        const ENABLE_V: u32 = 0x800;
+        const CC0: u32 = 0x0080_0000;
+
+        // (name, fs, ft, a NaN is present, a signalling NaN is present)
+        let cases_s: [(&str, f32, f32, bool, bool); 6] = [
+            ("ordinary", 1.0, 2.0, false, false),
+            ("qnan,ord", f32::from_bits(0x7FBF_FFFF), 1.0, true, false),
+            ("ord,qnan", 1.0, f32::from_bits(0xFFBF_FFFF), true, false),
+            ("snan,ord", f32::from_bits(0x7FC0_0000), 1.0, true, true),
+            ("ord,snan", 1.0, f32::from_bits(0xFFC0_0001), true, true),
+            ("qnan,snan", f32::from_bits(0x7FBF_FFFF), f32::from_bits(0x7FC0_0000), true, true),
+        ];
+        let cases_d: [(&str, f64, f64, bool, bool); 6] = [
+            ("ordinary", 1.0, 2.0, false, false),
+            ("qnan,ord", f64::from_bits(0x7FF7_FFFF_FFFF_FFFF), 1.0, true, false),
+            ("ord,qnan", 1.0, f64::from_bits(0xFFF7_FFFF_FFFF_FFFF), true, false),
+            ("snan,ord", f64::from_bits(0x7FF8_0000_0000_0000), 1.0, true, true),
+            ("ord,snan", 1.0, f64::from_bits(0xFFF8_0000_0000_0001), true, true),
+            ("qnan,snan", f64::from_bits(0x7FF7_FFFF_FFFF_FFFF), f64::from_bits(0x7FF8_0000_0000_0000), true, true),
+        ];
+
+        for is_d in [false, true] {
+            for i in 0..6 {
+                let (name, a_nan, a_snan) = if is_d {
+                    (cases_d[i].0, cases_d[i].3, cases_d[i].4)
+                } else {
+                    (cases_s[i].0, cases_s[i].3, cases_s[i].4)
+                };
+                for funct in FUNCT_FC_F..=FUNCT_FC_NGT {
+                    for enable in [0, ENABLE_V] {
+                        let (mut exec, _) = create_executor();
+                        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+                        exec.update_fpr_mode();
+                        // Stale Cause everywhere, cc0 set, one sticky flag.
+                        let before = CAUSE | CC0 | FLAG_I | enable;
+                        exec.core.fpu_fcsr = before;
+                        let (less, equal) = if is_d {
+                            let (_, x, y, _, _) = cases_d[i];
+                            exec.core.write_fpr_d(1, x);
+                            exec.core.write_fpr_d(2, y);
+                            (x < y, x == y)
+                        } else {
+                            let (_, x, y, _, _) = cases_s[i];
+                            exec.core.write_fpr_s(1, x);
+                            exec.core.write_fpr_s(2, y);
+                            (x < y, x == y)
+                        };
+                        let fmt = if is_d { RS_D } else { RS_S };
+                        let s = exec.exec(make_cop1_compute(fmt, 2, 1, 0, funct));
+                        let fcsr = exec.core.read_fpu_control(31);
+                        let what = format!("is_d={is_d} {name} funct={funct:#x} enable={enable:#x}");
+
+                        let signalling_predicate = funct & 0x8 != 0;
+                        let invalid = a_snan || (signalling_predicate && a_nan);
+                        if invalid && enable != 0 {
+                            assert!(s & EXEC_IS_EXCEPTION != 0, "{what}: enabled Invalid traps");
+                            assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{what}");
+                            assert_eq!(fcsr & CAUSE, CAUSE_V, "{what}: Cause is V alone");
+                            assert_eq!(fcsr & 0x7c, FLAG_I, "{what}: trap leaves Flags alone");
+                            assert_eq!(fcsr & CC0, CC0, "{what}: trap leaves cc0 alone");
+                            continue;
+                        }
+                        assert_eq!(s, EXEC_COMPLETE, "{what}");
+                        assert_eq!(fcsr & CAUSE, if invalid { CAUSE_V } else { 0 }, "{what}: Cause");
+                        assert_eq!(fcsr & 0x7c, FLAG_I | if invalid { FLAG_V } else { 0 }, "{what}: Flags");
+                        assert_eq!(fcsr & ENABLE_V, enable, "{what}: Enable kept");
+                        // bit0 unordered, bit1 equal, bit2 less
+                        let want = ((funct & 1) != 0 && a_nan)
+                            || ((funct & 2) != 0 && equal)
+                            || ((funct & 4) != 0 && less);
+                        assert_eq!(exec.core.get_fpu_cc(0), want, "{what}: cc0");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_fpu_complete_computation() {
         // Comprehensive test: (a + b) * (c - d) / e, then convert and compare
