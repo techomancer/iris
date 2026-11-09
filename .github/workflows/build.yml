@@ -471,7 +471,6 @@ jobs:
         with:
           name: boot-test-${{ matrix.os }}-${{ matrix.arch }}
           path: |
-            boot-test/*.png
             boot-test/*.log
             boot-test/boot-test.toml
           if-no-files-found: warn
