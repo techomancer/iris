@@ -23,6 +23,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
 - CI judges `cpu-tests` by test name, not by failure count: the harness prints TAP, `cpu-tests/expected-failures.txt` lists the failing tests per CPU and engine, and `make -C cpu-tests check-run CPU=... ENGINE=...` runs the suite and the check, locally as in CI.
+### Benchmark report
+
+- The per-kernel table has a "vs base" column for every cell and a "native" column for every cell. Both used to divide the best cell by the base or the host, so a build that lost 14% still read 1.00x.
 
 ### R10000 family fixes, R12000 and R14000
 
