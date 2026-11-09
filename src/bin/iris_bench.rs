@@ -661,8 +661,8 @@ fn run_irix(ci: &Ci, steps: &[Step], label: &str) -> Result<(Run, Vec<junit::Tes
         let in_setup = !matches!(o, Outcome::Done { .. });
         if !in_setup { o = ci.run(&wrap(&step.cmd), step.timeout)?; }
 
-        let secs = match o {
-            Outcome::Done { secs, .. } => secs,
+        let (secs, last) = match o {
+            Outcome::Done { out, secs } => (secs, out.trim_end().lines().last().unwrap_or("").to_string()),
             bad => {
                 let hung = matches!(bad, Outcome::TimedOut);
                 let (why, out) = match bad {
@@ -692,6 +692,8 @@ fn run_irix(ci: &Ci, steps: &[Step], label: &str) -> Result<(Run, Vec<junit::Tes
                 String::new()
             }
         );
+        // Programs like Dhrystone print their own figure last.
+        if !last.is_empty() { println!("      {last}"); }
         // Nothing here is checksummed: these are IRIX's own tools against
         // IRIX's own filesystem, and their output is not ours to predict.
         rows.push(row(step, ns, "UNCHECKED"));
