@@ -231,6 +231,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 |---|---|---|
 | [DESIGN.md](mgras/DESIGN.md) | design | MGRAS (IMPACT / GR4) design |
 | [ci-copypixels-unloaded-mask.md](mgras/ci-copypixels-unloaded-mask.md) | rule | Colour-index glCopyPixels runs a pipeline whose state is never loaded |
+| [detail-textures-follow-the-drivers-table.md](mgras/detail-textures-follow-the-drivers-table.md) | rule | IMPACT detail textures: one additive operation, F from the driver's 32-entry table at k = 32 2^LOD; run dettex with --impact |
 | [dcb-device-numbers.md](mgras/dcb-device-numbers.md) | design | DCB device numbers: trust the kernel's dcbctrl writes, not header names |
 | [display-snapshot-before-retrace.md](mgras/display-snapshot-before-retrace.md) | rule | Take the IMPACT display frame before the retrace pulse, not after |
 | [swap-waits-for-raster.md](mgras/swap-waits-for-raster.md) | rule | Report SCHEDULE_SWAP only once the raster engines have drawn the frame |
@@ -243,6 +244,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [guest-gl-benchmarks-miss-board-time.md](mgras/guest-gl-benchmarks-miss-board-time.md) | rule | Board-bound GL work slows the guest clock (and guest benchmarks lie) |
 | [header-errata.md](mgras/header-errata.md) | design | ignore/gr4 headers: known errata (fold back into the headers) |
 | [hq4-microcode-moves-eram-state.md](mgras/hq4-microcode-moves-eram-state.md) | rule | The Octane's IMPACT microcode keeps ERAM state 0x8C words higher |
+| [replay-hashing-dominates-replay-time.md](mgras/replay-hashing-dominates-replay-time.md) | rule | MGRAS_REPLAY_HASHES_OUT/_IN hash pixel memory at every checkpoint: about 130 s of a 13 s sgiquake GPU replay; time replays without them |
 | [mid-session-replays-need-the-live-drbsize.md](mgras/mid-session-replays-need-the-live-drbsize.md) | rule | A recording started mid-session lacks DRBsize; replay it with MGRAS_REPLAY_INIT=16e=<live value> or buffers wrap and alias (and the GPU unit races) |
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |

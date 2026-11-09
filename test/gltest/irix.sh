@@ -1,9 +1,9 @@
 #!/bin/sh
 # Build the GL tests on IRIX with MIPSpro cc (stock IRIX has no bash).
-# Usage: sh irix.sh [target...]   targets: gltest glprim pixtest blendtest glstate seltest xgetpix xresize xclick cicopy gepeek toktest (default: all)
+# Usage: sh irix.sh [target...]   targets: gltest glprim pixtest blendtest glstate seltest xgetpix xresize xclick cicopy gepeek toktest dettex (default: all)
 
 targets="$*"
-[ -z "$targets" ] && targets="gltest glprim pixtest blendtest glstate seltest xgetpix xresize xclick cicopy gepeek toktest"
+[ -z "$targets" ] && targets="gltest glprim pixtest blendtest glstate seltest xgetpix xresize xclick cicopy gepeek toktest dettex"
 
 status=0
 for t in $targets; do
@@ -21,6 +21,7 @@ for t in $targets; do
         gepeek) src=gepeek.c; libs="-lX11 -lGL" ;;
         toktest) src=toktest.c; libs="-lX11 -lGL" ;;
         linetest) src=linetest.c; libs="-lX11 -lGL -lm" ;;
+        dettex) src=dettex.c; libs="-lX11 -lGL -lm" ;;
         *) echo "unknown target $t"; exit 2 ;;
     esac
     echo "cc -o $t $src"

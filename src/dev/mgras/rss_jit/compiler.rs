@@ -40,7 +40,7 @@ use crate::dev::ng1::rex3_generic::BAYER_PACKED;
 use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, RE_WORDS, TILE_H, TILE_W, WORD_MASK};
 use crate::dev::mgras::rss::WIDTH;
 use crate::dev::mgras::fixed;
-use crate::dev::mgras::te1::{PAGE_NIBBLES, TRAM_NIBBLES};
+use crate::dev::mgras::te1::{self, PAGE_NIBBLES, TRAM_NIBBLES};
 
 macro_rules! off {
     ($($f:tt)+) => {
@@ -1701,8 +1701,8 @@ impl<'a> E<'a> {
         let s = self.mul_shr128(sw, y, true, n);
         let t = self.mul_shr128(tw, y, true, n);
         // Without mipmaps, and with one filter for both, the level of
-        // detail decides nothing.
-        let lambda = if !tex.mipmap && tex.mag_linear == tex.min_linear {
+        // detail decides nothing (unless a detail texture weighs by it).
+        let lambda = if !tex.mipmap && tex.mag_linear == tex.min_linear && !tex.detail {
             self.i32c(0)
         } else {
             let ls = self.inv(off!(gl.smp.ls));
@@ -1830,7 +1830,7 @@ impl<'a> E<'a> {
     /// `Sampler::sample`: the filtered texel (12.16) at (s, t) (Q31) for
     /// lambda (Q8).
     fn sample(&mut self, tex: &Tex, s: Value, t: Value, lambda: Value) -> [Value; 4] {
-        if !tex.mipmap && tex.mag_linear == tex.min_linear {
+        if !tex.mipmap && tex.mag_linear == tex.min_linear && !tex.detail {
             let l0 = self.i32c(0);
             return self.level(tex, l0, s, t, tex.mag_linear);
         }
@@ -1845,6 +1845,7 @@ impl<'a> E<'a> {
         self.b.seal_block(magb);
         let l0 = self.i32c(0);
         let r = self.level(tex, l0, s, t, tex.mag_linear);
+        let r = if tex.detail { self.detail(tex, r, s, t, lambda) } else { r };
         self.def_all(&res, r);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(minb);
@@ -1910,6 +1911,133 @@ impl<'a> E<'a> {
         self.b.switch_to_block(join);
         self.b.seal_block(join);
         res.map(|v| self.get(v))
+    }
+
+    /// `Sampler::detail`: the detail image, bilinear and repeating at the
+    /// level-0 coordinate scaled by 2^-L, added to the magnified sample
+    /// `base` as base + F (2 detail - 1), F from the weight table at
+    /// k = 32 2^lambda (`Sampler::detail_weight`).
+    fn detail(&mut self, tex: &Tex, base: [Value; 4], s: Value, t: Value, lambda: Value) -> [Value; 4] {
+        let ld64 = |e: &mut Self, off: i32| {
+            let v = e.b.ins().load(I32, e.mr, e.ctx, off);
+            e.b.ins().uextend(I64, v)
+        };
+        let page = ld64(self, off!(gl.smp.detail.page));
+        let log = ld64(self, off!(gl.smp.detail.log));
+        let shs = ld64(self, off!(gl.smp.detail.shift_s));
+        let sht = ld64(self, off!(gl.smp.detail.shift_t));
+        // Q31 to Q16 detail texels: v >> (15 - sh), or << past 15.
+        let coord = |e: &mut Self, v: Value, sh: Value| {
+            let c15 = e.i64c(15);
+            let r = e.b.ins().isub(c15, sh);
+            let right = e.b.ins().sshr(v, r);
+            let l = e.b.ins().isub(sh, c15);
+            let left = e.b.ins().ishl(v, l);
+            let le = e.b.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, sh, 15);
+            let x = e.b.ins().select(le, right, left);
+            e.b.ins().iadd_imm_s(x, -0x8000)
+        };
+        let u = coord(self, s, shs);
+        let v = coord(self, t, sht);
+        let one = self.i64c(1);
+        let n = self.b.ins().ishl(one, log);
+        let nm = self.b.ins().iadd_imm_s(n, -1);
+        let wrap = |e: &mut Self, x: Value| e.b.ins().band(x, nm);
+        let i = self.b.ins().sshr_imm_s(u, 16);
+        let i = wrap(self, i);
+        let j = self.b.ins().sshr_imm_s(v, 16);
+        let j = wrap(self, j);
+        let i1 = self.b.ins().iadd_imm_s(i, 1);
+        let i1 = wrap(self, i1);
+        let j1 = self.b.ins().iadd_imm_s(j, 1);
+        let j1 = wrap(self, j1);
+        let frac = |e: &mut Self, x: Value| {
+            let x = e.b.ins().ushr_imm_s(x, 8);
+            let x = e.b.ins().band_imm_s(x, 0xFF);
+            e.b.ins().ireduce(I32, x)
+        };
+        let a = frac(self, u);
+        let b = frac(self, v);
+        // The image is the left half of a 2N x N level; indices are
+        // already wrapped, so texel()'s repeat leaves them be.
+        let zero64 = self.i64c(0);
+        let w2 = self.b.ins().ishl_imm_s(n, 1);
+        let geo = Geo { wi: w2, hi: n, page, off: zero64, bpage: page, boff: zero64 };
+        let rep = Tex { clamp_s: false, clamp_t: false, gl_clamp: false, no_border: false, ..*tex };
+        let t00 = self.texel(&rep, &geo, i, j);
+        let t10 = self.texel(&rep, &geo, i1, j);
+        let t01 = self.texel(&rep, &geo, i, j1);
+        let t11 = self.texel(&rep, &geo, i1, j1);
+        let c256 = self.i32c(256);
+        let na = self.b.ins().isub(c256, a);
+        let nb = self.b.ins().isub(c256, b);
+        let w00 = self.b.ins().imul(na, nb);
+        let w10 = self.b.ins().imul(a, nb);
+        let w01 = self.b.ins().imul(na, b);
+        let w11 = self.b.ins().imul(a, b);
+        // The weight: x = 2^(e / 256) in Q8, e = lambda + 5 * 256; its top
+        // bits index the table, its low byte blends two entries.
+        let e = self.b.ins().iadd_imm_s(lambda, 5 * 256);
+        let fe = self.b.ins().band_imm_s(e, 0xFF);
+        let fe = self.b.ins().uextend(I64, fe);
+        let fe = self.b.ins().ishl_imm_s(fe, 2);
+        let exp2 = self.i64c(te1::exp2_q8().as_ptr() as i64);
+        let pe = self.b.ins().iadd(exp2, fe);
+        let x = self.b.ins().load(I32, self.mr, pe, 0);
+        let k = self.b.ins().sshr_imm_s(e, 8);
+        let c8 = self.i32c(8);
+        let kl = self.b.ins().smin(k, c8);
+        let left = self.b.ins().ishl(x, kl);
+        let nk = self.b.ins().ineg(k);
+        let c31 = self.i32c(31);
+        let kr = self.b.ins().smin(nk, c31);
+        let right = self.b.ins().ushr(x, kr);
+        let up = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, k, 0);
+        let x = self.b.ins().select(up, left, right);
+        let big = self.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, x, 31 << 8);
+        let xi = self.b.ins().ushr_imm_s(x, 8);
+        let idx = self.b.ins().select(big, c31, xi);
+        let xf = self.b.ins().band_imm_s(x, 0xFF);
+        let zero = self.i32c(0);
+        let fr = self.b.ins().select(big, zero, xf);
+        let entry = |e: &mut Self, i: Value| {
+            let i = e.b.ins().uextend(I64, i);
+            let i = e.b.ins().ishl_imm_s(i, 2);
+            let p = e.b.ins().iadd(e.ctx, i);
+            e.b.ins().load(I32, e.mr, p, off!(gl.smp.detail.table))
+        };
+        let t0 = entry(self, idx);
+        let idx1 = self.b.ins().iadd_imm_s(idx, 1);
+        let idx1 = self.b.ins().umin(idx1, c31);
+        let t1 = entry(self, idx1);
+        let nfr = self.b.ins().isub(c256, fr);
+        let w0 = self.b.ins().imul(t0, nfr);
+        let w1 = self.b.ins().imul(t1, fr);
+        let w = self.b.ins().iadd(w0, w1);
+        let f = self.b.ins().imul_imm_s(w, 33825);
+        let f = self.b.ins().sextend(I64, f);
+        let max = self.i32c(fixed::MAX as i64);
+        let mut out = base;
+        for k in 0..4 {
+            let x = self.b.ins().imul(w00, t00[k]);
+            let y = self.b.ins().imul(w10, t10[k]);
+            let td = self.b.ins().iadd(x, y);
+            let z = self.b.ins().imul(w01, t01[k]);
+            let td = self.b.ins().iadd(td, z);
+            let q = self.b.ins().imul(w11, t11[k]);
+            let td = self.b.ins().iadd(td, q);
+            // mul(F, 2 detail - ONE), 12.16.
+            let d2 = self.b.ins().iadd(td, td);
+            let d2 = self.b.ins().iadd_imm_s(d2, -(fixed::ONE as i64));
+            let d2 = self.b.ins().sextend(I64, d2);
+            let m = self.b.ins().imul(f, d2);
+            let m = self.b.ins().sshr_imm_s(m, 28);
+            let m = self.b.ins().ireduce(I32, m);
+            let o = self.b.ins().iadd(base[k], m);
+            let o = self.b.ins().smax(o, zero);
+            out[k] = self.b.ins().smin(o, max);
+        }
+        out
     }
 
     fn def_all(&mut self, vars: &[Variable; 4], vals: [Value; 4]) {

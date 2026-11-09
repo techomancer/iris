@@ -174,9 +174,18 @@ pub fn gl_regs(rng: &mut Rng, regs: &mut Regs, tex_bias: f64) {
     let tex_on = rng.chance(tex_bias);
     let m1 = (rng.u32() & 0xFFE) | tex_on as u32;
     regs.push((te::TEXMODE1, m1));
-    regs.push((te::TEXMODE2, rng.u32() & 0xFFFFF));
-    regs.push((te::TXSIZE, rng.range(0, 9) as u32 | (rng.range(0, 9) as u32) << 4));
-    regs.push((te::TXLOD, { let opts = [0u32, 1, 3, 7, 15, rng.u32() & 0xF]; rng.pick(&opts) }));
+    // Detail textures (bit 9) on a quarter of them: the JIT declines them.
+    let detail = rng.chance(0.25);
+    regs.push((te::TEXMODE2, rng.u32() & 0xFFDFF | (detail as u32) << 9));
+    let dlevel = (rng.below(5) as u32 + 2) << 16;
+    regs.push((te::TXSIZE, rng.range(0, 9) as u32 | (rng.range(0, 9) as u32) << 4 | dlevel));
+    let last = { let opts = [0u32, 15, 31, rng.below(32) as u32]; rng.pick(&opts) };
+    regs.push((te::TXLOD, { let opts = [0u32, 1, 3, 7, 15, rng.u32() & 0xF]; rng.pick(&opts) } | last << 11));
+    regs.push((te::TXDETAIL, rng.u32() & 0xFF));
+    regs.push((te::TXADDR, 0));
+    for _ in 0..32 {
+        regs.push((te::DETAILSCALE, rng.u32() & 0x1F));
+    }
     regs.push((te::TXBCOLOR_RG, rng.u32()));
     regs.push((te::TXBCOLOR_BA, rng.u32()));
     regs.push((te::TXENV_RG, rng.u32()));

@@ -593,6 +593,20 @@ sampler `Te1::sampler` resolves and the polygon stipple rows.
   `transfer_reads_see_the_drawing`. Live on the IP30 guest: about 6,000
   frames presented with 0 bytes read back through the PROM.
 
+- **sgiquake and detail textures (2026-11-08).** `mgrasq1.rec`, a
+  mid-session recording of sgiquake on the Octane's Maximum IMPACT,
+  replays (with its live DRBsize, see
+  `clanker/mgras/mid-session-replays-need-the-live-drbsize.md`) with all
+  518 checkpoints equal on both units. Detail textures
+  (SGIS_detail_texture, which GLQuake uses on every world surface) are in
+  the interpreter, the JIT and the kernels
+  (`clanker/mgras/detail-textures-follow-the-drivers-table.md`). Host
+  times for the whole recording, side by side on the 2990WX + RX 6600 XT
+  (`NOCHECK`, `NOSCAN`): before detail, CPU two engines with warm JIT
+  62.6 s, one engine 111.4 s, GPU unit 9.3-11.4 s; with detail, CPU two
+  engines with the JIT 67.6 s, GPU unit 11.6-13.0 s. Time replays without
+  checkpoint hashes (`clanker/mgras/replay-hashing-dominates-replay-time.md`).
+
 Open: per-row edge sharing (eight lanes of a tile row compute the same
 bounds); the host GL composite still uploads rows the CPU wrote.
 

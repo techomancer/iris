@@ -443,6 +443,7 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
             gl_clamp: m2 & te1::TM2_GL_CLAMP != 0,
             no_border: m2 & te1::TM2_NO_BORDER != 0,
             depth: te1::depth_nibbles(m2 >> 2) as u8,
+            detail: m2 & te1::TM2_DETAIL != 0,
         });
         c.smp = rss.sampler();
         let (w, h) = c.smp.size();

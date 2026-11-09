@@ -43,8 +43,21 @@
 //!
 //! Colour arithmetic is 12.16 fixed point (`fixed`).
 //!
-//! Not yet: detail and sharpen textures, 3D textures, texture lookup tables,
-//! video texture.
+//! Detail textures (SGIS_detail_texture; observed on the board's driver):
+//! TEXMODE2 bit 9 turns them on, bit 10 picks a 128-texel detail image
+//! (else 256). TXDETAIL bits 7:0 is its TRAM page; it is stored as a level
+//! twice as wide as high (2N x N) whose left N columns hold the image, in
+//! the base texture's format. TXSIZE bits 18:16 hold 6 + the detail level
+//! L (L < 0), so the detail texel coordinate is the base's level-0
+//! coordinate times 2^-L, repeating. The weight F(LOD) comes from the
+//! DETAILSCALE table: 32 five-bit weights (31 = 1.0) at k = 32 2^LOD,
+//! linear between, zero past the last entry the driver used (TXLOD bits
+//! 15:10, twice that index). The board only adds: out = base + F (2 detail
+//! - 1), whatever detail mode GL asked for. Detail applies when
+//! magnifying (LOD <= 0) only (`Sampler::detail`).
+//!
+//! Not yet: sharpen textures, 3D textures, texture lookup tables, video
+//! texture.
 
 use super::fixed;
 
@@ -61,6 +74,8 @@ pub mod reg {
     /// Index into the per-level tables below, advanced by each table write.
     pub const TXADDR: u32 = 0x190;
     pub const TXMIPMAP: u32 = 0x191;
+    /// The detail image's TRAM page (bits 7:0).
+    pub const TXDETAIL: u32 = 0x192;
     pub const TXBORDER: u32 = 0x193;
     pub const DETAILSCALE: u32 = 0x194;
     pub const TL_WBUFFER: u32 = 0x1A0;
@@ -130,6 +145,9 @@ pub(crate) const TM2_CLAMP_T: u32 = 1 << 12;
 pub(crate) const TM2_GL_CLAMP: u32 = 1 << 14;
 /// The texture has no border: clamped fetches outside it read TXBCOLOR.
 pub(crate) const TM2_NO_BORDER: u32 = 1 << 16;
+/// Detail texture on; with bit 10 its image is 128 texels square, else 256.
+pub(crate) const TM2_DETAIL: u32 = 1 << 9;
+pub(crate) const TM2_DETAIL_128: u32 = 1 << 10;
 pub(crate) const TM2_MM_ENABLE: u32 = 1 << 19;
 
 pub const TRAM_BYTES: usize = 4 << 20;
@@ -495,8 +513,62 @@ impl Te1 {
             pages,
             border_pages,
             border_color,
+            detail: self.detail(regs, size),
         }
     }
+
+    /// The detail texture's parameters, or all zero when it is off.
+    fn detail(&self, regs: &[u32], size: u32) -> Detail {
+        let m2 = regs[reg::TEXMODE2 as usize];
+        if m2 & TM2_DETAIL == 0 {
+            return Detail::default();
+        }
+        let log = if m2 & TM2_DETAIL_128 != 0 { 7 } else { 8 };
+        // TXSIZE 18:16 = 6 + L: detail texels per level-0 texel 2^(6 - D).
+        let up = 6 - ((size >> 16) & 7) as i32;
+        let mut table = [0u32; TABLE_LEN];
+        let last = ((regs[reg::TXLOD as usize] >> 10) & 0x3F) as usize / 2;
+        for (k, w) in table.iter_mut().enumerate().take(last + 1) {
+            *w = self.tables[2][k] & 0x1F;
+        }
+        Detail {
+            on: 1,
+            page: regs[reg::TXDETAIL as usize] & 0xFF,
+            log,
+            shift_s: ((size & 0xF) as i32 + up).max(0) as u32,
+            shift_t: (((size >> 4) & 0xF) as i32 + up).max(0) as u32,
+            pad: [0; 3],
+            table,
+        }
+    }
+}
+
+/// `round(256 * 2^(f / 256))` for an 8-bit fraction `f`: the detail
+/// weight's table index from the LOD (`Sampler::detail_weight`). The GPU
+/// unit uploads the same table.
+pub fn exp2_q8() -> &'static [u32; 256] {
+    static T: std::sync::LazyLock<[u32; 256]> =
+        std::sync::LazyLock::new(|| std::array::from_fn(|f| (256.0 * (f as f64 / 256.0).exp2()).round() as u32));
+    &T
+}
+
+/// A primitive's detail texture (`Te1::detail`). Plain data.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Detail {
+    /// 1 when on.
+    pub on: u32,
+    /// TRAM page of the 2N x N level holding the image.
+    pub page: u32,
+    /// log2 N.
+    pub log: u32,
+    /// log2 of the detail image's size over the base texture's [0, 1]
+    /// (log2 of level 0's size - L).
+    pub shift_s: u32,
+    pub shift_t: u32,
+    pub pad: [u32; 3],
+    /// Five-bit weights, zero past the last one used.
+    pub table: [u32; TABLE_LEN],
 }
 
 /// What the TE needs to sample one primitive's fragments. Plain data: the
@@ -518,6 +590,8 @@ pub struct Sampler {
     pub border_pages: [u32; 16],
     /// 12-bit components.
     pub border_color: [u32; 4],
+    /// The detail texture (the JIT reads it by offset too).
+    pub detail: Detail,
 }
 
 impl Sampler {
@@ -595,7 +669,8 @@ impl Sampler {
     pub fn sample(&self, te: &Te1, s: i64, t: i64, lambda: i32) -> [i32; 4] {
         let m = self.mode2;
         if lambda <= 0 {
-            return self.level(te, 0, s, t, m & TM2_MAG_LINEAR != 0);
+            let base = self.level(te, 0, s, t, m & TM2_MAG_LINEAR != 0);
+            return if self.detail.on != 0 { self.detail(te, base, s, t, lambda) } else { base };
         }
         let linear = m & TM2_MIN_LINEAR != 0;
         if self.max_level == 0 {
@@ -613,6 +688,55 @@ impl Sampler {
         let f = (lambda - (l0 << 8)).clamp(0, 256) as i64;
         let (a, b) = (self.level(te, l0 as u32, s, t, linear), self.level(te, l1 as u32, s, t, linear));
         [0, 1, 2, 3].map(|k| a[k] + (((b[k] - a[k]) as i64 * f) >> 8) as i32)
+    }
+
+    /// The detail weight F at `lambda` (<= 0, Q8) in 12.16: the table at
+    /// k = 32 2^lambda, its top 24 bits an index and an 8-bit fraction.
+    pub fn detail_weight(&self, lambda: i32) -> i32 {
+        let e = lambda.saturating_add(5 * 256);
+        let x = exp2_q8()[(e & 0xFF) as usize];
+        let x = if e >= 0 { x << (e >> 8).min(8) } else { x >> (-(e >> 8)).min(31) };
+        let (i, f) = if x >= 31 << 8 { (31, 0) } else { ((x >> 8) as usize, x & 0xFF) };
+        let tab = &self.detail.table;
+        let t1 = if i < 31 { tab[i + 1] } else { 0 };
+        let w = tab[i] * (256 - f) + t1 * f;
+        // 31 * 256 is 1.0: 2^28 / 7936, rounded.
+        (w * 33825) as i32
+    }
+
+    /// The detail texture added to the magnified base sample `base` (12.16)
+    /// at (s, t) (Q31): the detail image, bilinear and repeating, at the
+    /// base's level-0 coordinate scaled by 2^-L, out = base + F (2 detail -
+    /// 1) per component, clamped.
+    fn detail(&self, te: &Te1, base: [i32; 4], s: i64, t: i64, lambda: i32) -> [i32; 4] {
+        use fixed::{mul, ONE};
+        let d = &self.detail;
+        let coord = |v: i64, sh: u32| if sh <= 15 { v >> (15 - sh) } else { v << (sh - 15) };
+        let (u, v) = (coord(s, d.shift_s).wrapping_sub(0x8000), coord(t, d.shift_t).wrapping_sub(0x8000));
+        let n = 1i64 << d.log;
+        let (i, j) = ((u >> 16).rem_euclid(n), (v >> 16).rem_euclid(n));
+        let (a, b) = (((u >> 8) & 0xFF) as i32, ((v >> 8) & 0xFF) as i32);
+        let (i1, j1) = ((i + 1) & (n - 1), (j + 1) & (n - 1));
+        let (nc, sel, dn) = (self.nc as usize, self.sel as usize, self.d as usize);
+        let tn = cell_nibbles(dn);
+        let (w, h) = (2 * n as usize, n as usize);
+        let texel = |i: i64, j: i64| {
+            let at = texel_addr(d.page, w, h, i as usize, j as usize, tn);
+            let mut c = [0i32; 4];
+            for (k, o) in c.iter_mut().enumerate().take(nc) {
+                *o = te.component(at + comp_offset(sel, nc, k, dn), dn) as i32;
+            }
+            c
+        };
+        let (t00, t10, t01, t11) = (texel(i, j), texel(i1, j), texel(i, j1), texel(i1, j1));
+        let (w00, w10, w01, w11) = ((256 - a) * (256 - b), a * (256 - b), (256 - a) * b, a * b);
+        let f = self.detail_weight(lambda);
+        let mut out = base;
+        for k in 0..4 {
+            let td = t00[k] * w00 + t10[k] * w10 + t01[k] * w01 + t11[k] * w11;
+            out[k] = fixed::clamp(base[k].wrapping_add(mul(f, 2 * td - ONE)));
+        }
+        out
     }
 }
 
@@ -681,6 +805,74 @@ pub fn tex_env(mode1: u32, env_rg: u32, env_b: u32, f: [i32; 4], tex: [i32; 4]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A detail texture as the driver sets one up (base 8x8 RGBA8, detail
+    /// 256 at level -3, a constant weight of 1): the sample is the base
+    /// plus 2 detail - 1, the detail image repeating at 2^3 times the
+    /// base's texel rate, within three levels of the specification's
+    /// doubles.
+    #[test]
+    fn detail_adds_the_scaled_detail_image() {
+        // SAFETY: Te1 is plain data, valid zeroed.
+        let mut te = unsafe { Box::<Te1>::new_zeroed().assume_init() };
+        let mut regs = vec![0u32; 0x400];
+        let mut seed = 0xDE7A_11u32;
+        let mut rnd = |lo: u32, n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (lo + (seed >> 16) % n) as u8
+        };
+        let base: Vec<u8> = (0..8 * 8 * 4).map(|_| rnd(48, 160)).collect();
+        let det: Vec<u8> = (0..256 * 256 * 4).map(|_| rnd(0, 256)).collect();
+        // RGBA, 8-bit components.
+        regs[reg::TL_MODE as usize] = 3 << 1 | 1 << 5;
+        regs[reg::TL_SPEC as usize] = 3 << 8 | 3 << 4;
+        for t in 0..8 {
+            te.load_line(&regs, t, &base[t as usize * 32..][..32]);
+        }
+        // The detail image: the left half of a 512x256 level at page 16.
+        regs[reg::TL_SPEC as usize] = 8 << 8 | 9 << 4;
+        regs[reg::TL_MIPMAP as usize] = 16;
+        for t in 0..256 {
+            te.load_line(&regs, t, &det[t as usize * 1024..][..1024]);
+        }
+        te.table_write(reg::TXMIPMAP, 0, 0);
+        for k in 0..32 {
+            te.table_write(reg::DETAILSCALE, k, 0x1F);
+        }
+        regs[reg::TEXMODE1 as usize] = TEXMODE1_ENABLE | 3 << 3 | 4 << 9;
+        regs[reg::TEXMODE2 as usize] = 1 << 2 | TM2_MAG_LINEAR | TM2_DETAIL;
+        regs[reg::TXSIZE as usize] = 3 << 16 | 3 << 4 | 3;
+        regs[reg::TXLOD as usize] = 62 << 10;
+        regs[reg::TXDETAIL as usize] = 16;
+        let smp = te.sampler(&regs);
+        assert_eq!(smp.detail_weight(-3 * 256), fixed::ONE - 256);
+        let bilinear = |img: &[u8], n: usize, u: f64, v: f64, c: usize| {
+            let (fu, fv) = (u - 0.5, v - 0.5);
+            let (a, b) = (fu - fu.floor(), fv - fv.floor());
+            let w = |i: f64| (i as i64).rem_euclid(n as i64) as usize;
+            let (i0, j0) = (w(fu.floor()), w(fv.floor()));
+            let (i1, j1) = ((i0 + 1) % n, (j0 + 1) % n);
+            let at = |i: usize, j: usize| img[(j * n + i) * 4 + c] as f64 / 255.0;
+            (1.0 - a) * (1.0 - b) * at(i0, j0) + a * (1.0 - b) * at(i1, j0) + (1.0 - a) * b * at(i0, j1) + a * b * at(i1, j1)
+        };
+        let mut worst = 0.0f64;
+        for k in 0..400 {
+            let (x, y) = ((k * 37 % 400) as f64 / 400.0 + 0.0013, (k * 91 % 400) as f64 / 400.0 + 0.0007);
+            let (s, t) = ((x * 2f64.powi(31)) as i64, (y * 2f64.powi(31)) as i64);
+            let got = smp.sample(&te, s, t, -3 * 256);
+            for c in 0..4 {
+                let tb = bilinear(&base, 8, x * 8.0, y * 8.0, c);
+                let td = bilinear(&det, 256, x * 64.0, y * 64.0, c);
+                let want = (tb + 2.0 * td - 1.0).clamp(0.0, 1.0) * 255.0;
+                worst = worst.max((fixed::to_byte(got[c]) as f64 - want).abs());
+            }
+        }
+        // 8-bit filter weights, and the detail term counts twice.
+        assert!(worst <= 3.0, "off by {worst}");
+        // Detail off (and minification): the base alone.
+        let plain = Sampler { detail: Detail::default(), ..smp };
+        assert_eq!(smp.sample(&te, 1 << 29, 1 << 29, 64), plain.sample(&te, 1 << 29, 1 << 29, 64));
+    }
 
     /// A 64x128 RGB8 level takes two pages (32-bit texels), so the page
     /// view of its second page starts at texel row 64: libGLcore saves a

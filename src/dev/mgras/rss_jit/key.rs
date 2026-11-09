@@ -225,6 +225,8 @@ pub struct Tex {
     pub gl_clamp: bool,
     pub no_border: bool,
     pub depth: u8,
+    /// A detail texture adds to magnified samples (TEXMODE2 bit 9).
+    pub detail: bool,
 }
 
 impl Tex {
@@ -267,6 +269,7 @@ impl Tex {
             self.clamp_t,
             self.gl_clamp,
             self.no_border,
+            self.detail,
         ]
         .iter()
         .enumerate()
@@ -275,7 +278,7 @@ impl Tex {
         e.put(self.env as u64, 4);
         e.put(ncslot, 8);
         e.put(self.class as u64, 4);
-        e.put(flags, 256);
+        e.put(flags, 512);
         e.put(self.depth as u64 - 1, 3);
         e.v
     }
@@ -285,7 +288,7 @@ impl Tex {
         let env = d.get(4) as u8;
         let ncslot = d.get(8) as u8;
         let class = d.get(4) as u8;
-        let flags = d.get(256);
+        let flags = d.get(512);
         let depth = d.get(3) as u8 + 1;
         let (nc, slot) = match ncslot {
             0..=3 => (1, ncslot),
@@ -308,10 +311,11 @@ impl Tex {
             gl_clamp: f(6),
             no_border: f(7),
             depth,
+            detail: f(8),
         }
     }
 
-    const RADIX: u64 = 4 * 8 * 4 * 256 * 3;
+    const RADIX: u64 = 4 * 8 * 4 * 512 * 3;
 }
 
 /// A raster pipeline configuration. Build one, `normalized()` it, `pack()`
@@ -595,7 +599,7 @@ impl fmt::Display for PipeKey {
             if let Some(t) = k.tex {
                 write!(
                     f,
-                    " tex(env{} nc{} slot{} class{} d{}{}{}{}{}{}{}{}{})",
+                    " tex(env{} nc{} slot{} class{} d{}{}{}{}{}{}{}{}{}{})",
                     t.env,
                     t.nc,
                     t.slot,
@@ -609,6 +613,7 @@ impl fmt::Display for PipeKey {
                     if t.clamp_t { " clamp-t" } else { "" },
                     if t.gl_clamp { " gl-clamp" } else { "" },
                     if t.no_border { " no-border" } else { "" },
+                    if t.detail { " detail" } else { "" },
                 )?;
             }
             if k.fog {
@@ -643,6 +648,7 @@ mod tests {
             gl_clamp: true,
             no_border: true,
             depth: 3,
+            detail: true,
             ..Tex::default()
         };
         let k = PipeKey {

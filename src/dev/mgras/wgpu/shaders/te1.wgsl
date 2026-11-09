@@ -11,7 +11,8 @@
 #include "pp1.wgsl"
 
 @group(2) @binding(2) var<storage, read> tram: array<u32>;
-// fixed::RECIP (1024 words), then log2(1 + i/256) in Q8 (256).
+// fixed::RECIP (1024 words), then log2(1 + i/256) in Q8 (256), then
+// round(256 2^(i/256)) (256).
 @group(2) @binding(4) var<storage, read> tables: array<u32>;
 
 const LOD_NONE: i32 = -(1 << 24);
@@ -207,7 +208,11 @@ fn smp_level(si: u32, level: u32, s_in: I64, t_in: I64, linear: bool) -> vec4<i3
 fn smp_sample(si: u32, s: I64, t: I64, lambda: i32) -> vec4<i32> {
     let m = sr(si, SL_MODE2);
     if lambda <= 0 {
-        return smp_level(si, 0u, s, t, (m & TM2_MAG_LINEAR) != 0u);
+        let base = smp_level(si, 0u, s, t, (m & TM2_MAG_LINEAR) != 0u);
+        if sr(si, SL_DETAIL) != 0u {
+            return smp_detail(si, base, s, t, lambda);
+        }
+        return base;
     }
     let linear = (m & TM2_MIN_LINEAR) != 0u;
     let max_level = sr(si, SL_MAXLEVEL);
@@ -229,6 +234,117 @@ fn smp_sample(si: u32, s: I64, t: I64, lambda: i32) -> vec4<i32> {
         out[k] = a[k] + i64_low_i32(i64_shr(i64_mul_i32(b[k] - a[k], f), 8u));
     }
     return out;
+}
+
+// `Sampler::detail_weight`: F at lambda (<= 0, Q8) in 12.16.
+fn detail_weight(si: u32, lambda: i32) -> i32 {
+    let e = max(lambda, -(1 << 24)) + 5 * 256;
+    var x = tables[1280u + u32(e & 0xff)];
+    let k = e >> 8u;
+    if k >= 0 {
+        x = x << u32(min(k, 8));
+    } else {
+        x = x >> u32(min(-k, 31));
+    }
+    var i = 31u;
+    var f = 0u;
+    if x < (31u << 8u) {
+        i = x >> 8u;
+        f = x & 0xffu;
+    }
+    var t1 = 0u;
+    if i < 31u {
+        t1 = sr(si, SL_DTABLE + i + 1u);
+    }
+    let w = sr(si, SL_DTABLE + i) * (256u - f) + t1 * f;
+    return i32(w * 33825u);
+}
+
+// A detail coordinate: Q31 to Q16 detail texels.
+fn detail_coord(v: I64, sh: u32) -> I64 {
+    if sh <= 15u {
+        return i64_shr(v, 15u - sh);
+    }
+    return u64_shl(v, sh - 15u);
+}
+
+// A texel cell of tn nibbles (4, 8 or 16) at nibble address a, a multiple
+// of tn: its bits, the first nibble lowest (as `nibble` numbers them).
+fn cell_bits(a: u32, tn: u32) -> vec2<u32> {
+    let w = a >> 3u;
+    let lo = tram[w];
+    if tn == 16u {
+        return vec2<u32>(lo, tram[w + 1u]);
+    }
+    if tn == 8u {
+        return vec2<u32>(lo, 0u);
+    }
+    return vec2<u32>((lo >> (4u * (a & 7u))) & 0xffffu, 0u);
+}
+
+// `component` of a cell from `cell_bits`: d nibbles at nibble o, widened.
+fn cell_comp(c: vec2<u32>, o: u32, d: u32) -> u32 {
+    let b = 4u * o;
+    var v: u32;
+    if b >= 32u {
+        v = c.y >> (b - 32u);
+    } else if b == 0u {
+        v = c.x;
+    } else {
+        v = (c.x >> b) | (c.y << (32u - b));
+    }
+    v &= (1u << (4u * d)) - 1u;
+    if d == 1u {
+        return v * 0x111u;
+    }
+    if d == 2u {
+        return (v << 4u) | (v >> 4u);
+    }
+    return v;
+}
+
+// Texel (i, j) of the detail image (the left half of a 2n x n level at
+// `page`), its components widened to 12 bits.
+fn detail_texel(page: u32, n: u32, i: u32, j: u32, nc: u32, sel: u32, d: u32) -> vec4<i32> {
+    let tn = cell_nibbles(d);
+    let c = cell_bits((page * TRAM_PAGE_NIBBLES + (j * 2u * n + i) * tn) % TRAM_NIBBLES, tn);
+    var t = vec4<i32>(0);
+    t.x = i32(cell_comp(c, comp_offset(sel, nc, 0u, d), d));
+    if nc > 1u {
+        t.y = i32(cell_comp(c, comp_offset(sel, nc, 1u, d), d));
+    }
+    if nc > 2u {
+        t.z = i32(cell_comp(c, comp_offset(sel, nc, 2u, d), d));
+    }
+    if nc > 3u {
+        t.w = i32(cell_comp(c, comp_offset(sel, nc, 3u, d), d));
+    }
+    return t;
+}
+
+// `Sampler::detail`: base + F (2 detail - 1), the detail image bilinear and
+// repeating at the level-0 coordinate scaled by 2^-L.
+fn smp_detail(si: u32, base: vec4<i32>, s: I64, t: I64, lambda: i32) -> vec4<i32> {
+    let page = sr(si, SL_DETAIL + 1u);
+    let n = 1u << sr(si, SL_DETAIL + 2u);
+    let uu = i64_sub(detail_coord(s, sr(si, SL_DETAIL + 3u)), I64(0x8000u, 0u));
+    let vv = i64_sub(detail_coord(t, sr(si, SL_DETAIL + 4u)), I64(0x8000u, 0u));
+    let i = i64_shr(uu, 16u).lo & (n - 1u);
+    let j = i64_shr(vv, 16u).lo & (n - 1u);
+    let a = i32((uu.lo >> 8u) & 0xffu);
+    let b = i32((vv.lo >> 8u) & 0xffu);
+    let i1 = (i + 1u) & (n - 1u);
+    let j1 = (j + 1u) & (n - 1u);
+    let nc = sr(si, SL_NC);
+    let sel = sr(si, SL_SEL);
+    let d = sr(si, SL_D);
+    let td = detail_texel(page, n, i, j, nc, sel, d) * ((256 - a) * (256 - b))
+        + detail_texel(page, n, i1, j, nc, sel, d) * (a * (256 - b))
+        + detail_texel(page, n, i, j1, nc, sel, d) * ((256 - a) * b)
+        + detail_texel(page, n, i1, j1, nc, sel, d) * (a * b);
+    let f = detail_weight(si, lambda);
+    let x = 2 * td - vec4<i32>(FIX_ONE);
+    return clamp(base + vec4<i32>(fmul(f, x.x), fmul(f, x.y), fmul(f, x.z), fmul(f, x.w)), vec4<i32>(0), vec4<i32>(FIX_MAX));
 }
 
 // ── fixed.rs: the reciprocal unit and the level of detail ────────────────────
