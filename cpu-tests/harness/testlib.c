@@ -217,15 +217,24 @@ static void print_name(const char *name)
 
 /* Every console byte also goes to the disk log and, when the PROM is present,
  * to the ARCS console — the only sink a graphics-console Indy can show. */
+static int last_c = '\n';
 static void console_tee(int c)
 {
+    last_c = c;
     scsilog_tap(c);
     arcs_putc(c);
 }
 
+/* run/check.py reads one result line per test. Some tests leave a line open. */
+static void tap_result(unsigned k, const char *name, int ok, int skip)
+{
+    if (last_c != '\n') con_putc('\n');
+    con_printf("%sok %u - %s%s\n", ok ? "" : "not ", k, name, skip ? " # SKIP" : "");
+}
+
 int main(void)
 {
-    unsigned gi, ti;
+    unsigned gi, ti, k = 0, planned = 0;
     int have_arcs;
 
     con_init();
@@ -258,15 +267,21 @@ int main(void)
         testdev_exit(127);
     }
 
+    /* Announced up front, so check.py can tell a derailed run by its shortfall. */
+    for (gi = 0; gi < n_groups; gi++) planned += all_groups[gi]->count;
+    con_printf("1..%u\n", planned);
+
     for (gi = 0; gi < n_groups; gi++) {
         const struct test_group *g = all_groups[gi];
         for (ti = 0; ti < g->count; ti++) {
             const struct test *t = &g->tests[ti];
 
+            k++;
             if (!(t->cpus & cpu_kind)) {
                 n_skip++;
                 print_name(t->name);
                 con_printf("skip (%s only)\n", cpus_name(t->cpus));
+                tap_result(k, t->name, 1, 1);
                 continue;
             }
 
@@ -282,6 +297,7 @@ int main(void)
             n_tests_run++;
             if (cur_test_fails == 0 && line_open) con_puts("PASS\n");
             line_open = 0;
+            tap_result(k, t->name, cur_test_fails == 0, 0);
         }
     }
 
