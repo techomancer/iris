@@ -358,7 +358,9 @@ exercised an R5000.
 The report gives per-cell summaries with DMIPS/MWIPS/MFLOPS, per-kernel
 throughput with speedups against a baseline cell and against native, any
 checksum mismatches, any unexpected exceptions, and per-cell time-share and
-efficiency rankings.
+efficiency rankings. A rerun under the same label is kept as `<label>.2.json`,
+`<label>.3.json` and so on; the report shows such a cell as one column, with the
+median, `[min-max]` and the number of runs, and ratios use the medians.
 
 ---
 

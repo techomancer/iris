@@ -227,12 +227,26 @@ fn tail(s: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// Write a result without replacing an earlier one: `<label>.json`, then
+/// `<label>.2.json`, `<label>.3.json`. A rerun is another sample of that cell
+/// and `report` combines them. `create_new` keeps two runs finishing together
+/// from picking one name.
 fn save(run: &Run, dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
-    let path = dir.join(format!("{}.json", run.cell));
     let json = serde_json::to_string_pretty(run).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("{}: {}", path.display(), e))?;
-    Ok(path)
+    for n in 1u32.. {
+        let name = if n == 1 { format!("{}.json", run.cell) } else { format!("{}.{}.json", run.cell, n) };
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                f.write_all(json.as_bytes()).map_err(|e| format!("{}: {}", path.display(), e))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {}", path.display(), e)),
+        }
+    }
+    unreachable!()
 }
 
 /// Most recently modified `*.json` in `dir`, skipping the host run (it has no
@@ -243,7 +257,9 @@ fn newest_result(dir: &Path) -> Result<PathBuf, String> {
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
-        if p.file_stem().and_then(|s| s.to_str()) == Some("host") { continue; }
+        // `host.json`, or `host.2.json` for a repeat.
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.split('.').next() == Some("host") { continue; }
         let Ok(m) = e.metadata().and_then(|m| m.modified()) else { continue };
         if best.as_ref().map_or(true, |(t, _)| m > *t) { best = Some((m, p)); }
     }
@@ -253,10 +269,12 @@ fn newest_result(dir: &Path) -> Result<PathBuf, String> {
 
 fn load_all(dir: &Path) -> Result<Vec<Run>, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json")).collect();
+    // Directory order is arbitrary; a report of the same files should read the same.
+    paths.sort();
     let mut runs = Vec::new();
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+    for p in paths {
         let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
         match serde_json::from_str::<Run>(&text) {
             Ok(r) => runs.push(r),
@@ -524,6 +542,70 @@ fn fmt_ratio(a: f64, b: f64) -> String {
     if r >= 100.0 { format!("{:.0}x", r) } else { format!("{:.2}x", r) }
 }
 
+/// A cell and its runs: a rerun is another sample of the same cell, so the
+/// report combines them. Cells keep the order in which they first appear.
+type Group<'a> = (&'a str, Vec<&'a Run>);
+
+fn groups(runs: &[Run]) -> Vec<Group<'_>> {
+    let mut g: Vec<Group<'_>> = Vec::new();
+    for r in runs {
+        match g.iter_mut().find(|(c, _)| *c == r.cell) {
+            Some((_, v)) => v.push(r),
+            None => g.push((&r.cell, vec![r])),
+        }
+    }
+    g
+}
+
+/// Median, minimum, maximum and count of some samples.
+type Stat = (f64, f64, f64, usize);
+
+fn stat(mut v: Vec<f64>) -> Option<Stat> {
+    if v.is_empty() { return None; }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    let median = if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 };
+    Some((median, v[0], v[n - 1], n))
+}
+
+/// `stat` of `f` over a group's runs; a run without a value is not a sample.
+fn over(g: &Group, f: impl Fn(&Run) -> Option<f64>) -> Option<Stat> {
+    stat(g.1.iter().filter_map(|r| f(r)).collect())
+}
+
+/// One kernel's rate over a group's runs; a run that measured nothing for it is not a sample.
+fn kernel_rate(g: &Group, kernel: &str) -> Option<Stat> {
+    over(g, |r| r.row(kernel).map(|x| x.rate()).filter(|v| *v > 0.0))
+}
+
+/// `median`, and `[min-max]` after it when there is more than one sample.
+fn fmt_stat(s: Option<Stat>, f: impl Fn(f64) -> String) -> String {
+    match s {
+        None => "-".into(),
+        Some((m, _, _, 1)) => f(m),
+        Some((m, lo, hi, _)) => format!("{} [{}-{}]", f(m), f(lo), f(hi)),
+    }
+}
+
+fn label(g: &Group) -> String {
+    if g.1.len() > 1 { format!("{} (n={})", g.0, g.1.len()) } else { g.0.to_string() }
+}
+
+/// The run whose overall speed is the group's median, for the sections that
+/// need one run's rows.
+fn typical<'a>(g: &Group<'a>) -> &'a Run {
+    let mut v = g.1.clone();
+    v.sort_by(|a, b| a.mips().total_cmp(&b.mips()));
+    v[(v.len() - 1) / 2]
+}
+
+/// A group is as correct as its worst run.
+fn least_accurate<'a>(g: &Group<'a>) -> &'a Run {
+    g.1.iter().copied().min_by(|a, b| a.accuracy().total_cmp(&b.accuracy())).unwrap()
+}
+
+fn mips_of(r: &Run) -> Option<f64> { Some(r.mips()).filter(|v| *v > 0.0) }
+
 /// A cell's rate as a fraction of the host's own on the same kernel: `1/12`
 /// when the emulator is twelve times slower, `1.50x` if it were faster.
 fn fmt_native(rate: f64, host: f64) -> String {
@@ -536,10 +618,11 @@ fn fmt_native(rate: f64, host: f64) -> String {
 
 fn markdown(runs: &[Run], baseline: Option<&str>) -> String {
     let mut o = String::new();
-    let emulated: Vec<&Run> = runs.iter().filter(|r| r.cell != "host").collect();
-    let host = runs.iter().find(|r| r.cell == "host");
+    let groups = groups(runs);
+    let emulated: Vec<&Group> = groups.iter().filter(|g| g.0 != "host").collect();
+    let host = groups.iter().find(|g| g.0 == "host");
     let base = baseline
-        .and_then(|b| runs.iter().find(|r| r.cell == b))
+        .and_then(|b| groups.iter().find(|g| g.0 == b))
         .or_else(|| emulated.first().copied());
 
     o.push_str("# IRIS benchmark report\n\n");
@@ -552,19 +635,23 @@ fn markdown(runs: &[Run], baseline: Option<&str>) -> String {
 
     // ── per-cell summary ────────────────────────────────────────────────────
     o.push_str("## Cells\n\n");
-    o.push_str("| cell | features | CPU | accuracy | guest MIPS | DMIPS | whet/s | LINPACK MFLOPS | timed | wall |\n");
-    o.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
-    for r in runs {
+    o.push_str("A cell run more than once shows the median, with `[min-max]` after it.\n\n");
+    o.push_str("| cell | n | features | CPU | accuracy | guest MIPS | DMIPS | whet/s | LINPACK MFLOPS | timed | wall |\n");
+    o.push_str("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    for g in &groups {
+        let r = g.1[0];
         let feats = if r.features.is_empty() { "-".to_string() } else { r.features.join(" ") };
+        let worst = least_accurate(g);
         o.push_str(&format!(
-            "| {} | {} | {} | {:.1}% ({}/{}) | {} | {} | {} | {} | {:.1} s | {:.1} s |\n",
-            r.cell, feats, r.machine.cpu,
-            r.accuracy(), r.matched, r.checked,
-            if r.mips() > 0.0 { format!("{:.1}", r.mips()) } else { "n/a".into() },
-            r.dmips().map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
-            r.whet_loops().map(|v| format!("{:.0}", v)).unwrap_or_else(|| "-".into()),
-            r.linpack_mflops().map(|v| format!("{:.2}", v)).unwrap_or_else(|| "-".into()),
-            r.total_ns as f64 / 1e9, r.wall_s,
+            "| {} | {} | {} | {} | {:.1}% ({}/{}) | {} | {} | {} | {} | {} | {} |\n",
+            g.0, g.1.len(), feats, r.machine.cpu,
+            worst.accuracy(), worst.matched, worst.checked,
+            fmt_stat(over(g, mips_of), |v| format!("{:.1}", v)),
+            fmt_stat(over(g, |r| r.dmips()), |v| format!("{:.1}", v)),
+            fmt_stat(over(g, |r| r.whet_loops()), |v| format!("{:.0}", v)),
+            fmt_stat(over(g, |r| r.linpack_mflops()), |v| format!("{:.2}", v)),
+            fmt_stat(over(g, |r| Some(r.total_ns as f64 / 1e9)), |v| format!("{:.1} s", v)),
+            fmt_stat(over(g, |r| Some(r.wall_s)), |v| format!("{:.1} s", v)),
         ));
     }
     o.push('\n');
@@ -612,23 +699,23 @@ fn markdown(runs: &[Run], baseline: Option<&str>) -> String {
     // ── per-kernel rates ────────────────────────────────────────────────────
     o.push_str("## Per-kernel throughput\n\n");
     o.push_str("Work units per second, in each kernel's own unit. Each `vs base` column \
-                is that cell's rate over the rate of **");
-    o.push_str(base.map(|b| b.cell.as_str()).unwrap_or("-"));
+                is that cell's median rate over the median rate of **");
+    o.push_str(base.map(|b| b.0).unwrap_or("-"));
     o.push_str("**");
     if host.is_some() {
-        o.push_str("; each `native` column is that cell's rate as a fraction of the host's \
+        o.push_str("; each `native` column is that cell's median rate as a fraction of the host's \
                     own on the identical kernel");
     }
     o.push_str(".\n\n");
 
-    let versus: Vec<&Run> = emulated.iter().copied()
-        .filter(|r| base.map_or(false, |b| r.cell != b.cell)).collect();
+    let versus: Vec<&Group> = emulated.iter().copied()
+        .filter(|g| base.map_or(false, |b| g.0 != b.0)).collect();
     o.push_str("| benchmark | unit |");
-    for r in &emulated { o.push_str(&format!(" {} |", r.cell)); }
-    for r in &versus { o.push_str(&format!(" {} vs base |", r.cell)); }
-    if host.is_some() {
-        o.push_str(" host |");
-        for r in &emulated { o.push_str(&format!(" {} native |", r.cell)); }
+    for g in &emulated { o.push_str(&format!(" {} |", label(g))); }
+    for g in &versus { o.push_str(&format!(" {} vs base |", g.0)); }
+    if let Some(h) = host {
+        o.push_str(&format!(" {} |", label(h)));
+        for g in &emulated { o.push_str(&format!(" {} native |", g.0)); }
     }
     o.push('\n');
     o.push_str("|---|---|");
@@ -641,26 +728,28 @@ fn markdown(runs: &[Run], baseline: Option<&str>) -> String {
         let unit = runs.iter().find_map(|r| r.row(name).map(|x| x.unit.clone()))
             .unwrap_or_default();
         o.push_str(&format!("| {} | {} |", name, unit));
-        let rate = |r: &Run| r.row(name).map_or(0.0, |x| x.rate());
-        for r in &emulated {
-            o.push_str(&format!(" {} |", r.row(name).map(|x| fmt_rate(x.rate()))
-                                             .unwrap_or_else(|| "-".into())));
-        }
+        let rate = |g: &Group| kernel_rate(g, name);
+        let median = |g: &Group| rate(g).map_or(0.0, |s| s.0);
+        for g in &emulated { o.push_str(&format!(" {} |", fmt_stat(rate(g), fmt_rate))); }
         if let Some(b) = base {
-            for r in &versus { o.push_str(&format!(" {} |", fmt_ratio(rate(r), rate(b)))); }
+            for g in &versus { o.push_str(&format!(" {} |", fmt_ratio(median(g), median(b)))); }
         }
         if let Some(h) = host {
-            o.push_str(&format!(" {} |", fmt_rate(rate(h))));
-            for r in &emulated { o.push_str(&format!(" {} |", fmt_native(rate(r), rate(h)))); }
+            o.push_str(&format!(" {} |", fmt_stat(rate(h), fmt_rate)));
+            for g in &emulated { o.push_str(&format!(" {} |", fmt_native(median(g), median(h)))); }
         }
         o.push('\n');
     }
     o.push('\n');
 
     // ── efficiency ──────────────────────────────────────────────────────────
-    for r in &emulated {
+    for g in &emulated {
+        let r = typical(g);
         if r.mips() <= 0.0 { continue; }
-        o.push_str(&format!("## Where {} spends its time\n\n", r.cell));
+        o.push_str(&format!("## Where {} spends its time\n\n", g.0));
+        if g.1.len() > 1 {
+            o.push_str(&format!("The median-speed run of {}.\n\n", g.1.len()));
+        }
 
         let mut by_time: Vec<&Row> = r.rows.iter().filter(|x| x.ns > 0).collect();
         by_time.sort_by(|a, b| b.ns.cmp(&a.ns));
@@ -701,13 +790,16 @@ fn ordered_names(runs: &[Run]) -> Vec<String> {
 
 fn text_summary(runs: &[Run]) -> String {
     let mut o = String::new();
-    for r in runs {
+    for g in groups(runs) {
         o.push_str(&format!(
-            "{:<24} {:>6.1}% accuracy   {:>8}   {:>7} DMIPS   {:>7.1} s timed\n",
-            r.cell, r.accuracy(),
-            if r.mips() > 0.0 { format!("{:.1} MIPS", r.mips()) } else { "n/a".into() },
-            r.dmips().map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
-            r.total_ns as f64 / 1e9,
+            "{:<24} {:>6.1}% accuracy   {:>8}   {:>7} DMIPS   {:>7} timed\n",
+            label(&g), least_accurate(&g).accuracy(),
+            match over(&g, mips_of) {
+                Some(s) => format!("{} MIPS", fmt_stat(Some(s), |v| format!("{:.1}", v))),
+                None => "n/a".into(),
+            },
+            fmt_stat(over(&g, |r| r.dmips()), |v| format!("{:.1}", v)),
+            fmt_stat(over(&g, |r| Some(r.total_ns as f64 / 1e9)), |v| format!("{:.1} s", v)),
         ));
     }
     o
@@ -1213,5 +1305,56 @@ mod tests {
         assert_eq!(fmt_native(1500.0, 1000.0), "1.50x");
         // no base named: the first emulated cell is the base
         assert_eq!(alu_cells(&markdown(&runs[..2], None))[4], "1.25x");
+    }
+
+    /// A scratch directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("iris-bench-test-{}-{}", std::process::id(), name));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    /// `save` wrote `<label>.json`, so a rerun replaced the earlier result.
+    #[test]
+    fn a_rerun_is_kept_and_host_repeats_are_not_results() {
+        let dir = TempDir::new("rerun");
+        let names: Vec<_> = (1..=3).map(|n| {
+            let p = save(&run_rates("cell", 100, n * 1_000_000_000), &dir.0).unwrap();
+            p.file_name().unwrap().to_str().unwrap().to_string()
+        }).collect();
+        assert_eq!(names, ["cell.json", "cell.2.json", "cell.3.json"]);
+        assert_eq!(load_all(&dir.0).unwrap().len(), 3);
+        let want = save(&run_rates("emu", 1, 1), &dir.0).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        save(&run_rates("host", 1, 1), &dir.0).unwrap();
+        save(&run_rates("host", 1, 1), &dir.0).unwrap();
+        assert_eq!(newest_result(&dir.0).unwrap(), want);
+    }
+
+    /// Three samples of one cell are one column, not three with one heading,
+    /// and ratios use each cell's median.
+    #[test]
+    fn repeated_runs_report_median_min_max_and_count() {
+        assert_eq!(stat(vec![3.0, 1.0, 2.0]), Some((2.0, 1.0, 3.0, 3)));
+        assert_eq!(stat(vec![4.0, 1.0, 2.0, 3.0]).unwrap().0, 2.5);
+        assert_eq!(stat(Vec::new()), None);
+        let s = 1_000_000_000;
+        let runs = [
+            run_rates("base", 100, s), run_rates("base", 100, s), run_rates("base", 40, s),
+            run_rates("new", 80, s), run_rates("new", 90, s), run_rates("new", 120, s),
+        ];
+        let md = markdown(&runs, Some("base"));
+        assert_eq!(md.matches("base (n=3)").count(), 1, "{md}");
+        let c = alu_cells(&md);
+        assert_eq!((c[2].as_str(), c[3].as_str(), c[4].as_str()),
+                   ("100.0 [40.0-100.0]", "90.0 [80.0-120.0]", "0.90x"), "{md}");
+        assert!(text_summary(&runs).starts_with("base (n=3)"));
     }
 }
