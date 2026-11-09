@@ -35,6 +35,10 @@ use iris::bench_runner::{self, BenchOptions};
 use iris::junit;
 use iris::cpu::parts::{self, Part};
 
+// A bin crate root resolves `mod` relative to src/bin/, so say where it is.
+#[path = "iris_bench/ab.rs"]
+mod ab;
+
 // ─── running ─────────────────────────────────────────────────────────────────
 
 /// Everything `bench/` produces lives under one directory so a report can be
@@ -1113,6 +1117,12 @@ enum Cmd {
 
     /// List the cells `matrix` knows about.
     Cells,
+
+    /// Compare two emulator builds with paired runs.
+    ///
+    /// Runs the same guest image under A and B for N rounds and flags the
+    /// kernels whose paired B/A ratio is clearly past the threshold.
+    Ab(ab::AbArgs),
 }
 
 fn main() {
@@ -1125,6 +1135,8 @@ fn main() {
 
 fn dispatch(cmd: Cmd) -> Result<(), String> {
     match cmd {
+        Cmd::Ab(args) => ab::run(args),
+
         Cmd::Cells => {
             println!("{:<24} {:<22} {}", "cell", "cargo features", "--cpu");
             for c in CELLS {
