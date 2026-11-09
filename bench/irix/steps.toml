@@ -16,9 +16,9 @@
 # does not depend on whether the account uses csh. Consequence: **no single
 # quotes in a command**, and no unescaped newlines.
 #
-# `requires` names a program that must be on PATH; the step is skipped (not
-# failed) when it is absent, because IRIX installs vary enormously and a
-# missing x11perf is not a benchmark result.
+# `requires` names a program that must be on PATH, or a path if it contains a
+# slash; the step is skipped (not failed) when it is absent, because IRIX
+# installs vary enormously and a missing x11perf is not a benchmark result.
 
 # ── storage ─────────────────────────────────────────────────────────────────
 # 16 MB is comfortably larger than the buffer cache will hold onto across a

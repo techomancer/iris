@@ -94,6 +94,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `iris --test-device-run-config time_pct=N,repeats=N,groups=MASK` (config key `test_device_run_config`) sets the run configuration the test device publishes, so a bare-metal benchmark started from the command line can be asked for a shorter run, as the in-process runner's `--quick` already could.
 - `iris-bench ab --a BASE --b CHANGE` compares two emulator builds with paired rounds on one guest image and judges each kernel by an interval, so a slowdown shows without a stored baseline. `--concurrent` starts both builds together each round; pin the command with `taskset` or `start /affinity` if the host needs it.
 
+### iris-bench guest suite
+
+- `iris-bench irix` finds the programs a step `requires` on IRIX 6.5.22; it skipped every step before. A `requires` with a slash in it is tested as a path.
+
 ### Boot test
 
 - `iris-ci junit FILE --suite NAME --case 'pass|SECONDS|NAME'` writes a JUnit report of checks a shell script has made, one case each (`fail|SECONDS|NAME|MESSAGE` for a failed one), so a CI test reporter can name the check that failed.

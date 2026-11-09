@@ -453,6 +453,21 @@ fn wrap(cmd: &str) -> String {
     format!("sh -c 'PATH={}; export PATH; {}'", IRIX_PATH, cmd)
 }
 
+/// Shell that prints `IRISBENCH-HAVE` when `prog` is an executable the guest can
+/// run: a name is looked up in `$PATH`, a path is tested as given. PATH is split
+/// with IFS; `tr : \" \"` inside backquotes hands IRIX's tr literal `\"`
+/// arguments, so it prints usage and no program was ever found.
+///
+/// The marker is typed as `HAV\E` so the tty's echo of the command line cannot
+/// itself contain the word the output is searched for.
+fn probe_command(prog: &str) -> String {
+    if prog.contains('/') {
+        format!("test -x {prog} && echo IRISBENCH-HAV\\E; true")
+    } else {
+        format!("IFS=:; for d in $PATH; do test -x $d/{prog} && echo IRISBENCH-HAV\\E; done; true")
+    }
+}
+
 struct Ci {
     bin: PathBuf,
     socket: Option<PathBuf>,
@@ -485,11 +500,7 @@ impl Ci {
     }
 
     fn has(&self, prog: &str) -> Result<bool, String> {
-        let probe = format!(
-            "for d in `echo {} | tr : \\\" \\\"`; do test -x $d/{} && echo IRISBENCH-HAVE; done",
-            IRIX_PATH, prog
-        );
-        let (out, _) = self.run(&wrap(&probe))?;
+        let (out, _) = self.run(&wrap(&probe_command(prog)))?;
         Ok(out.contains("IRISBENCH-HAVE"))
     }
 
@@ -1596,5 +1607,31 @@ mod tests {
         assert!(deterministic_args(&f("lightning ci_clock")).unwrap().is_empty());
         // with the JIT it needs the sync compile that lightning rejects
         assert!(deterministic_args(&f("lightning jitv2 ci_clock")).is_err());
+    }
+
+    /// Run a guest command line through the local Bourne shell, the way the
+    /// guest's `sh -c` does after `iris-ci` types it.
+    #[cfg(unix)]
+    fn local_sh(cmd: &str) -> bool {
+        let out = Command::new("sh").arg("-c").arg(cmd).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains("IRISBENCH-HAVE")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_finds_a_program_by_name_or_path_and_not_a_missing_one() {
+        assert!(local_sh(&probe_command("sh")));
+        assert!(!local_sh(&probe_command("irisbench-no-such-program")));
+        let sh = ["/bin/sh", "/usr/bin/sh"].into_iter().find(|p| Path::new(p).exists()).unwrap();
+        assert!(local_sh(&probe_command(sh)));
+        assert!(!local_sh(&probe_command("/nonexistent/irisbench")));
+    }
+
+    /// The tty echoes the typed line into the captured output, so the line must
+    /// not contain the word it is searched for.
+    #[test]
+    fn the_probe_command_line_does_not_contain_its_own_answer() {
+        assert!(!probe_command("dd").contains("IRISBENCH-HAVE"));
+        assert!(!probe_command("/usr/bin/dd").contains("IRISBENCH-HAVE"));
     }
 }
