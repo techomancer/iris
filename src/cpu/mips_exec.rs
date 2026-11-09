@@ -196,6 +196,15 @@ fn is_qnan_d(bits: u64) -> bool {
     f64::from_bits(bits).is_nan() && !is_snan_d(bits)
 }
 
+/// The C.cond.fmt result from the three relations of an operand pair. Condition
+/// bits 0, 1 and 2 select unordered, equal and less; bit 3 only picks the
+/// signalling variant, which changes Invalid and not the result. Built from
+/// plain comparisons so it compiles to flag tests, not a branch on the data.
+#[inline]
+fn fpu_compare_holds(unordered: bool, equal: bool, less: bool, funct: u32) -> bool {
+    funct & (unordered as u32 | (equal as u32) << 1 | (less as u32) << 2) != 0
+}
+
 /// The quiet NaN an R10000 delivers for an untrapped Invalid Operation:
 /// MIPS64 Volume I, Table 6.3 ("Value Supplied When a New Quiet NaN Is
 /// Created"), the column for the original MIPS NaN encoding the R10000 uses.
@@ -8625,7 +8634,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             self.core.fpu_fcsr |= FCSR_FV; // untrapped: set sticky Flag V too
         }
-        let cond = self.fpu_compare_s(fs_val, ft_val, funct_val);
+        let cond = fpu_compare_holds(unordered, fs_val == ft_val, fs_val < ft_val, funct_val);
         let cc = (d.raw >> 8) & 0x7;
         self.core.set_fpu_cc(cc, cond);
         if mips_log(MIPS_LOG_FPU) {
@@ -8865,7 +8874,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
             self.core.fpu_fcsr |= FCSR_FV; // untrapped: set sticky Flag V too
         }
-        let cond = self.fpu_compare_d(fs_val, ft_val, funct_val);
+        let cond = fpu_compare_holds(unordered, fs_val == ft_val, fs_val < ft_val, funct_val);
         let cc = (d.raw >> 8) & 0x7;
         self.core.set_fpu_cc(cc, cond);
         if mips_log(MIPS_LOG_FPU) {
@@ -9113,62 +9122,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Store doubleword to memory (alignment check done by write_data)
         let status = self.write_data::<8>(addr, value);
         self.finish_status(status)
-    }
-
-    // FPU single-precision comparison
-    fn fpu_compare_s(&self, fs: f32, ft: f32, funct: u32) -> bool {
-        let cond = funct & 0xF;
-        let less = fs < ft;
-        let equal = fs == ft;
-        let unordered = fs.is_nan() || ft.is_nan();
-
-        match cond {
-            0x0 => false, // F (always false)
-            0x1 => unordered, // UN
-            0x2 => equal, // EQ
-            0x3 => unordered || equal, // UEQ
-            0x4 => less, // OLT (ordered less than)
-            0x5 => unordered || less, // ULT
-            0x6 => less || equal, // OLE
-            0x7 => unordered || less || equal, // ULE
-            0x8 => false, // SF (signaling false)
-            0x9 => unordered, // NGLE
-            0xA => equal, // SEQ
-            0xB => unordered || equal, // NGL
-            0xC => less, // LT
-            0xD => unordered || less, // NGE
-            0xE => less || equal, // LE
-            0xF => unordered || less || equal, // NGT
-            _ => false,
-        }
-    }
-
-    // FPU double-precision comparison
-    fn fpu_compare_d(&self, fs: f64, ft: f64, funct: u32) -> bool {
-        let cond = funct & 0xF;
-        let less = fs < ft;
-        let equal = fs == ft;
-        let unordered = fs.is_nan() || ft.is_nan();
-
-        match cond {
-            0x0 => false, // F (always false)
-            0x1 => unordered, // UN
-            0x2 => equal, // EQ
-            0x3 => unordered || equal, // UEQ
-            0x4 => less, // OLT (ordered less than)
-            0x5 => unordered || less, // ULT
-            0x6 => less || equal, // OLE
-            0x7 => unordered || less || equal, // ULE
-            0x8 => false, // SF (signaling false)
-            0x9 => unordered, // NGLE
-            0xA => equal, // SEQ
-            0xB => unordered || equal, // NGL
-            0xC => less, // LT
-            0xD => unordered || less, // NGE
-            0xE => less || equal, // LE
-            0xF => unordered || less || equal, // NGT
-            _ => false,
-        }
     }
 
     /// Create a snapshot of the current CPU state for undo
