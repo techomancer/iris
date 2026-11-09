@@ -289,7 +289,9 @@ Every field means "unrestricted" when zero — which is what an emulator
 predating the register returns — so the guest reads it unconditionally and an
 older emulator simply runs everything. `iris-bench run --quick` sets
 `time_pct=30, repeats=1`: about half the wall clock, the same numbers to within
-a couple of percent.
+a couple of percent. An `iris` started from the command line takes the same
+fields as `--test-device-run-config time_pct=30,repeats=1` (config key
+`test_device_run_config`). The guest raises a `time_pct` below 10 to 10.
 
 **Quick mode never runs fewer kernels.** Accuracy is the number this suite
 exists to report, and a short run that quietly checked less would report the

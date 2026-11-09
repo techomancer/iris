@@ -128,6 +128,38 @@ impl RunConfig {
     }
 }
 
+/// `time_pct=10,repeats=3,groups=0x5`, the form `--test-device-run-config`
+/// takes: any of the fields, in any order, decimal or `0x` hex. A field left
+/// out is 0, unrestricted. A value too wide for its field is refused rather
+/// than masked, so the guest never runs something other than what was asked.
+impl std::str::FromStr for RunConfig {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let mut c = Self::ALL;
+        for field in s.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            let (key, val) = field.split_once('=')
+                .ok_or_else(|| format!("{field:?} is not name=value"))?;
+            let (key, val) = (key.trim(), val.trim());
+            let num = |max: u32| -> Result<u32, String> {
+                let n = match val.strip_prefix("0x") {
+                    Some(hex) => u32::from_str_radix(hex, 16),
+                    None => val.parse(),
+                }.map_err(|_| format!("{key}: {val:?} is not a number"))?;
+                if n > max { return Err(format!("{key}: {n} is more than {max}")); }
+                Ok(n)
+            };
+            match key {
+                "time_pct" => c.time_pct = num(0xFFF)? as u16,
+                "repeats" => c.repeats = num(0xF)? as u8,
+                "groups" => c.groups = num(0xFFFF)? as u16,
+                _ => return Err(format!("unknown field {key:?}: the fields are time_pct, repeats and groups")),
+            }
+        }
+        Ok(c)
+    }
+}
+
 /// Where `REG_DUMP` writes go when no path is configured.
 pub const DEFAULT_DUMP_PATH: &str = "iris-testdev-dump.json";
 
@@ -182,7 +214,13 @@ unsafe impl Sync for CorePtr {}
 
 impl TestDevice {
     pub fn new(dump_path: impl Into<std::path::PathBuf>) -> Self {
-        Self::build(Some(dump_path.into()), Console::Stdout, None, RunConfig::ALL)
+        Self::with_run_config(dump_path, RunConfig::ALL)
+    }
+
+    /// `new`, with `cfg` published at `REG_RUN_CONFIG`: how a bare-metal image
+    /// started from the command line is asked for a shorter run.
+    pub fn with_run_config(dump_path: impl Into<std::path::PathBuf>, cfg: RunConfig) -> Self {
+        Self::build(Some(dump_path.into()), Console::Stdout, None, cfg)
     }
 
     /// In-process mode: guest console into `sink`, `EXIT` into `on_exit`, no
@@ -553,6 +591,31 @@ mod tests {
         );
         assert_eq!(d.read32((TEST_DEV_BASE + REG_CAPS) as u64).data & CAP_RUN_CONFIG, CAP_RUN_CONFIG);
         assert_eq!(RunConfig::from_word(d.read32((TEST_DEV_BASE + REG_RUN_CONFIG) as u64).data), want);
+    }
+
+    #[test]
+    fn a_run_config_parses_from_named_fields() {
+        let parse = |s: &str| s.parse::<RunConfig>();
+        assert_eq!(parse("time_pct=10,repeats=3"), Ok(RunConfig { groups: 0, time_pct: 10, repeats: 3 }));
+        assert_eq!(parse(" groups=0x5 , time_pct=4095,repeats=15"),
+                   Ok(RunConfig { groups: 5, time_pct: 4095, repeats: 15 }));
+        assert_eq!(parse(""), Ok(RunConfig::ALL));
+        // too wide for the field: refused, not masked into another value
+        assert!(parse("time_pct=4096").unwrap_err().contains("more than 4095"));
+        assert!(parse("repeats=16").is_err());
+        assert!(parse("groups=0x10000").is_err());
+        assert!(parse("repeat=3").unwrap_err().contains("unknown field"));
+        assert!(parse("time_pct").is_err());
+        assert!(parse("time_pct=ten").is_err());
+    }
+
+    #[test]
+    fn the_command_line_device_publishes_its_run_config() {
+        let want = RunConfig { groups: 0, time_pct: 10, repeats: 3 };
+        let d = TestDevice::with_run_config("unused", want);
+        assert_eq!(RunConfig::from_word(d.read32((TEST_DEV_BASE + REG_RUN_CONFIG) as u64).data), want);
+        let d = TestDevice::new("unused");
+        assert_eq!(d.read32((TEST_DEV_BASE + REG_RUN_CONFIG) as u64).data, 0);
     }
 
     #[test]

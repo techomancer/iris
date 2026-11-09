@@ -1995,6 +1995,12 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_device_dump: Option<String>,
 
+    /// What the test device publishes at its run-configuration register, as
+    /// `time_pct=10,repeats=3` (see `RunConfig`). Unset publishes 0, which the
+    /// bare-metal benchmark suite reads as "every kernel, full length".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_device_run_config: Option<String>,
+
     /// cheritest convention: a guest write to CP0 register 26 triggers the same
     /// dump as the test device's DUMP register. Off by default and must stay
     /// that way for a normal boot — CP0 26 is ECC on a real R4400 and the PROM
@@ -2348,6 +2354,7 @@ impl Default for MachineConfig {
             perfetto_clock: None,
             test_device: false,
             test_device_dump: None,
+            test_device_run_config: None,
             cheritest_dump_hook: false,
             nat_subnet: None,
             ci: false,
@@ -2766,6 +2773,12 @@ impl MachineConfig {
             }
         }
         self.validate_serial_sockets()?;
+        if self.test_device_run_config.is_some() {
+            if !self.test_device {
+                return Err("test_device_run_config needs test_device".into());
+            }
+            self.test_device_run_config()?;
+        }
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }
@@ -2990,6 +3003,13 @@ impl MachineConfig {
     }
 
     /// Extract network-related settings into a `NetworkConfig`.
+    /// The test device's run configuration; all zero when unset.
+    pub fn test_device_run_config(&self) -> Result<crate::dev::testdev::RunConfig, String> {
+        self.test_device_run_config.as_deref().map_or(Ok(crate::dev::testdev::RunConfig::ALL), |s| {
+            s.parse().map_err(|e| format!("test_device_run_config {s:?}: {e}"))
+        })
+    }
+
     /// Parses `nat_subnet` from CIDR — safe to unwrap because `validate()` already accepted it.
     pub fn network(&self) -> NetworkConfig {
         let nat_subnet = self.nat_subnet.as_deref().map(|cidr| {
@@ -3259,6 +3279,11 @@ pub struct Cli {
     #[arg(long = "test-device-dump", value_name = "FILE")]
     pub test_device_dump: Option<String>,
 
+    /// Ask a bare-metal guest for a shorter run through the test device:
+    /// `time_pct=N,repeats=N,groups=MASK`, any of them. Needs --test-device.
+    #[arg(long = "test-device-run-config", value_name = "FIELDS")]
+    pub test_device_run_config: Option<String>,
+
     /// cheritest convention: a guest write to CP0 register 26 dumps machine
     /// state. Needs --test-device. Never enable for a normal boot — CP0 26 is
     /// ECC on a real R4400 and the PROM writes it during cache init.
@@ -3433,6 +3458,7 @@ impl Cli {
         if let Some(ref d) = self.rsh_dir { cfg.network.rsh_dir = Some(d.clone()); }
         if self.test_device { cfg.test_device = true; }
         if let Some(ref p) = self.test_device_dump { cfg.test_device_dump = Some(p.clone()); }
+        if let Some(ref s) = self.test_device_run_config { cfg.test_device_run_config = Some(s.clone()); }
         if self.cheritest_dump_hook { cfg.cheritest_dump_hook = true; }
         if let Some(ref s) = self.nat_subnet { cfg.nat_subnet = Some(s.clone()); }
 
@@ -3792,6 +3818,20 @@ mod export_tests {
         let cfg: MachineConfig = toml::from_str(
             "[scsi.3]\nkind = \"daynaport\"\noverlay = true\n").expect("parse");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn the_test_device_run_config_comes_from_the_command_line_and_is_checked() {
+        use crate::dev::testdev::RunConfig;
+        let cli = |a: &[&str]| Cli::parse_from(["iris"].iter().chain(a)).apply(MachineConfig::default());
+        let cfg = cli(&["--test-device", "--test-device-run-config", "time_pct=10,repeats=3"]);
+        cfg.validate().expect("a valid run config");
+        assert_eq!(cfg.test_device_run_config(), Ok(RunConfig { groups: 0, time_pct: 10, repeats: 3 }));
+        assert_eq!(cli(&["--test-device"]).test_device_run_config(), Ok(RunConfig::ALL));
+        let bad = cli(&["--test-device", "--test-device-run-config", "repeats=16"]).validate().unwrap_err();
+        assert!(bad.contains("test_device_run_config"), "{bad}");
+        let alone = cli(&["--test-device-run-config", "time_pct=10"]).validate().unwrap_err();
+        assert!(alone.contains("needs test_device"), "{alone}");
     }
 
     #[test]

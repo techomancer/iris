@@ -626,6 +626,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # load_elf = "test.elf"
 # test_device = false
 # test_device_dump = "iris-testdev-dump.json"
+# test_device_run_config = "time_pct=10,repeats=3"   # ask the bench suite for a shorter run
 # cheritest_dump_hook = false
 
 # ── Machine ──────────────────────────────────────────────────────────────────
@@ -850,6 +851,8 @@ Automation and debugging
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry
   --test-device               Map the bare-metal test device into GIO slot 0
   --test-device-dump <FILE>   Where its machine-state dump goes
+  --test-device-run-config <FIELDS>
+                              Ask the guest for a shorter run (time_pct=N,repeats=N)
   --cheritest-dump-hook       CP0 register 26 writes trigger a dump (tests only)
 
   -h, --help                  Print help

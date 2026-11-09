@@ -627,7 +627,9 @@ impl Machine {
                 .unwrap_or_else(|| crate::dev::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
                       crate::dev::testdev::TEST_DEV_BASE, path);
-            Some(Arc::new(crate::dev::testdev::TestDevice::new(path)))
+            let run = cfg.test_device_run_config()
+                .expect("test_device_run_config: validate() should have caught this");
+            Some(Arc::new(crate::dev::testdev::TestDevice::with_run_config(path, run)))
         } else {
             None
         };
