@@ -545,13 +545,26 @@ fn an_engine_addresses_memory_by_node_number_and_interrupts_the_node_it_names() 
 #[derive(Default)]
 struct Downstream {
     fail: AtomicBool,
+    busy: AtomicBool,
 }
 impl BusDevice for Downstream {
     fn read64(&self, a: u64) -> BusRead64 {
-        if self.fail.load(Ordering::SeqCst) { BusRead64::err() } else { BusRead64::ok(a) }
+        if self.busy.load(Ordering::SeqCst) {
+            BusRead64::busy()
+        } else if self.fail.load(Ordering::SeqCst) {
+            BusRead64::err()
+        } else {
+            BusRead64::ok(a)
+        }
     }
     fn read32(&self, a: u64) -> BusRead32 {
-        if self.fail.load(Ordering::SeqCst) { BusRead32::err() } else { BusRead32::ok(a as u32) }
+        if self.busy.load(Ordering::SeqCst) {
+            BusRead32::busy()
+        } else if self.fail.load(Ordering::SeqCst) {
+            BusRead32::err()
+        } else {
+            BusRead32::ok(a as u32)
+        }
     }
     fn write64(&self, _a: u64, _v: u64) -> u32 {
         if self.fail.load(Ordering::SeqCst) { BUS_ERR } else { BUS_OK }
@@ -601,6 +614,26 @@ fn a_failed_processor_read_is_recorded_for_the_slice_that_issued_it() {
     // A full-width zero store to the status-1 alias ends the record
     // (inferred).
     hub.write64(hub_pi::reg::ERR_STATUS1_A_RCLR, 0);
+    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_A).data, 0);
+}
+
+/// A read the device answers busy is retried, not failed: it records nothing,
+/// or a pipe that makes the processor wait leaves an error behind for the
+/// kernel to find.
+#[test]
+fn a_busy_processor_read_records_no_error() {
+    let hub = hub(1, 3);
+    let down = Arc::new(Downstream::default());
+    down.busy.store(true, Ordering::SeqCst);
+    let io = hub.processor_io(down);
+    let i = io.clone();
+    std::thread::spawn(move || {
+        crate::cpu::smp::set_current_cpu(0);
+        assert_eq!(i.read32(0x0800_0098).status, BUS_BUSY);
+        assert_eq!(i.read64(0x0800_0098).status, BUS_BUSY);
+    })
+    .join()
+    .unwrap();
     assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_A).data, 0);
 }
 
