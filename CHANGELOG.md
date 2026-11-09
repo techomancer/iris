@@ -50,6 +50,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   portmapper no longer offers TCP mappings it cannot serve, and the MOUNT
   v3 reply lists AUTH_UNIX.
 
+### IMPACT detail textures
+
+- IMPACT draws detail textures (SGIS_detail_texture), which GLQuake and
+  sgiquake put on every world surface: the interpreter, the raster JIT
+  (`gr4-jit`) and the host-GPU raster unit (`raster = "wgpu"`) all model
+  the board's single additive detail operation, with the weight read from
+  the 32-entry table the IRIX driver loads. `test/gltest/dettex.c` checks
+  them in the guest; `--impact` compares against what the board and its
+  driver do rather than the extension's specification.
+
 ### VPro introspection
 
 - The Octane's VPro (Odyssey) board has a monitor surface like the other

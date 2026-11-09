@@ -217,7 +217,11 @@ const SL_BORDER: usize = 39;
 const SL_PAGES: usize = 48;
 const SL_BPAGES: usize = 64;
 const SL_STIPPLE: usize = 80;
-const SLOT_WORDS: usize = 112;
+/// The detail texture (`te1::Detail`): on, page, log2 N, shift S, shift T,
+/// then its 32 weights at SL_DTABLE.
+const SL_DETAIL: usize = 112;
+const SL_DTABLE: usize = 120;
+const SLOT_WORDS: usize = 152;
 
 /// A state slot, as the kernels read it.
 #[repr(C)]
@@ -276,6 +280,9 @@ impl Slot {
             w[SL_BORDER..SL_BORDER + 4].copy_from_slice(&smp.border_color);
             w[SL_PAGES..SL_PAGES + 16].copy_from_slice(&smp.pages);
             w[SL_BPAGES..SL_BPAGES + 16].copy_from_slice(&smp.border_pages);
+            let d = &smp.detail;
+            w[SL_DETAIL..SL_DETAIL + 5].copy_from_slice(&[d.on, d.page, d.log, d.shift_s, d.shift_t]);
+            w[SL_DTABLE..SL_DTABLE + 32].copy_from_slice(&d.table);
         }
         if stipple {
             for j in 0..32 {
@@ -397,6 +404,8 @@ const DEFINES: &[(&str, u32)] = &[
     ("SL_PAGES", SL_PAGES as u32),
     ("SL_BPAGES", SL_BPAGES as u32),
     ("SL_STIPPLE", SL_STIPPLE as u32),
+    ("SL_DETAIL", SL_DETAIL as u32),
+    ("SL_DTABLE", SL_DTABLE as u32),
     ("FB_W", WIDTH as u32),
     ("FB_H", HEIGHT as u32),
     ("PAGES", PAGES as u32),
@@ -416,8 +425,9 @@ const DEFINES: &[(&str, u32)] = &[
 const STAGE_WORDS: usize = 1 << 20;
 /// Slots a batch may hold.
 const MAX_SLOTS: u32 = 1024;
-/// RECIP (1024 words), then log2 in Q8 (256).
-const TABLE_WORDS: usize = 1024 + 256;
+/// RECIP (1024 words), then log2 in Q8 (256), then 2^x in Q8 (256,
+/// `te1::exp2_q8`).
+const TABLE_WORDS: usize = 1024 + 256 + 256;
 /// TRAM pages, as the dirty map counts them (`Te1::dirty`).
 const TRAM_PAGES: usize = te1::TRAM_BYTES / (te1::PAGE_NIBBLES / 2);
 
@@ -472,6 +482,7 @@ impl GpuRaster {
         let tables = gpu.buffer("mgras tables", (TABLE_WORDS * 4) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let mut t: Vec<u32> = fixed::RECIP.to_vec();
         t.extend_from_slice(&log2_q8_table());
+        t.extend_from_slice(te1::exp2_q8());
         gpu.write(&tables, 0, bytemuck::cast_slice(&t));
         let entry = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,

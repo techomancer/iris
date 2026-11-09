@@ -252,6 +252,7 @@ fn digits(k: &PipeKey) -> Vec<(u8, u32)> {
                 (31, t.gl_clamp as u32),
                 (32, t.no_border as u32),
                 (33, t.depth as u32),
+                (35, t.detail as u32),
             ]);
         }
     } else {
@@ -265,7 +266,7 @@ fn domain(prim: Prim, field: u8) -> Vec<u32> {
     let r = |n: u32| (0..n).collect::<Vec<u32>>();
     match field {
         0 => vec![prim as u32],
-        1 | 6 | 10 | 19 | 20 | 25..=32 | 40 | 41 => r(2),
+        1 | 6 | 10 | 19 | 20 | 25..=32 | 35 | 40 | 41 => r(2),
         2 => r(5),
         3 => {
             if prim.is_gl() {
@@ -296,7 +297,7 @@ fn domain(prim: Prim, field: u8) -> Vec<u32> {
 fn fields(prim: Prim) -> Vec<u8> {
     let mut f = vec![0, 1, 2, 3, 4, 5];
     match prim {
-        Prim::Tri | Prim::GlLine => f.extend([6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]),
+        Prim::Tri | Prim::GlLine => f.extend([6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35]),
         Prim::Line => f.extend([6, 40, 41]),
         Prim::Stipple => f.push(40),
         Prim::Xfer => f.extend([42, 43]),
