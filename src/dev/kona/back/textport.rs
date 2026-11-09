@@ -59,6 +59,17 @@ impl Textport {
         self.colour_map.lock().clone()
     }
 
+    /// The colour, the raster position and the colour map, as the stream module reads and
+    /// writes them.
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { colour: _, raster: _, colour_map: _, drawn: _, unmodelled: _ } = self;
+        s.u32(&mut self.colour);
+        s.i32(&mut self.raster.0);
+        s.i32(&mut self.raster.1);
+        self.colour_map.lock().visit(s);
+    }
+
     /// Power-on state.
     pub fn reset(&mut self) {
         let map = self.colour_map.clone();

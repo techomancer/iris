@@ -50,6 +50,7 @@ use crate::dev::kona::back::raster::DrawState;
 use crate::dev::kona::back::store::{PixelStore, WordArray, DID_PLANE};
 use crate::dev::kona::defs::pixel::*;
 use crate::dev::kona::defs::*;
+use crate::dev::kona::stream::Stream;
 use std::collections::BTreeMap;
 
 /// Most values a pixel map keeps. The pipe's and the client's table sizes are unknown (model cap).
@@ -104,6 +105,17 @@ impl Record {
         }
     }
 
+    fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { swap_bytes: _, lsb_first: _, row_length: _, skip_rows: _, skip_pixels: _, alignment: _, volume: _ } = self;
+        s.bool(&mut self.swap_bytes);
+        s.bool(&mut self.lsb_first);
+        s.u32(&mut self.row_length);
+        s.u32(&mut self.skip_rows);
+        s.u32(&mut self.skip_pixels);
+        s.u32(&mut self.alignment);
+        s.u32s(&mut self.volume);
+    }
 }
 
 /// A pixel map's values and the form they arrived in (float, or an unsigned integer of 32 or 16 bits,
@@ -205,6 +217,62 @@ impl Default for Pixels {
 }
 
 impl Pixels {
+    pub fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { unpack: _, pack: _, scale: _, bias: _, depth_scale: _, depth_bias: _, index_shift: _, index_offset: _, map_colour: _, map_stencil: _, post: _, zoom: _, maps: _, suspended: _, records: _, read: _, pos: _, accum_clear: _, pending: _ } = self;
+        self.unpack.visit(s);
+        self.pack.visit(s);
+        s.f32s(&mut self.scale);
+        s.f32s(&mut self.bias);
+        s.f32(&mut self.depth_scale);
+        s.f32(&mut self.depth_bias);
+        s.i32(&mut self.index_shift);
+        s.i32(&mut self.index_offset);
+        s.bool(&mut self.map_colour);
+        s.bool(&mut self.map_stencil);
+        s.f32s(&mut self.post);
+        s.f32s(&mut self.zoom);
+        let mut n = self.maps.len() as u32;
+        s.u32(&mut n);
+        if s.loading() {
+            self.maps.clear();
+            for _ in 0..n.min(64) {
+                if !s.ok() {
+                    break;
+                }
+                let (mut name, mut max, mut bits) = (0u32, 0f32, Vec::new());
+                s.u32(&mut name);
+                s.f32(&mut max);
+                s.vec_u32(&mut bits);
+                self.maps.insert(name, Map { max, values: bits.into_iter().map(f32::from_bits).collect() });
+            }
+        } else {
+            for (name, m) in &self.maps {
+                let (mut name, mut max, mut bits) = (*name, m.max, m.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                s.u32(&mut name);
+                s.f32(&mut max);
+                s.vec_u32(&mut bits);
+            }
+        }
+        s.bool(&mut self.suspended);
+        s.u32(&mut self.records);
+        s.opt(&mut self.read, |s, v| s.u32(v));
+        s.bool(&mut self.pos.valid);
+        s.f32(&mut self.pos.x);
+        s.f32(&mut self.pos.y);
+        s.u32(&mut self.pos.z);
+        s.f32s(&mut self.pos.colour);
+        s.f32s(&mut self.accum_clear);
+        let mut has = self.pending.is_some();
+        s.bool(&mut has);
+        if has {
+            let mut h = self.pending.unwrap_or_default();
+            s.u32s(&mut h);
+            self.pending = Some(h);
+        } else {
+            self.pending = None;
+        }
+    }
 
     /// The unpack record in force: a suspend can switch to a fixed one.
     pub fn unpack_in_force(&self) -> Record {
@@ -1244,6 +1312,7 @@ pub fn clear_accumulation(gl: &Gl, c: &mut Counts, env: &Env<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev::kona::stream::{Reader, Writer};
 
     fn header(w: u32, h: u32, format: u32, ty: u32, row_mode: u32) -> Header {
         Header { w, h, format, ty, offset: 0, dma: false, row_mode, column: 0 }
@@ -1413,4 +1482,24 @@ mod tests {
         }
     }
 
+    /// What the context keeps of the pixel operations is saved and restored.
+    #[test]
+    fn the_pixel_state_round_trips_through_a_stream() {
+        let mut p = Pixels::default();
+        p.unpack.alignment = 1;
+        p.pack.swap_bytes = true;
+        p.scale[2] = 0.25;
+        p.zoom = [2.0, -1.0];
+        p.maps.insert(MAP_INDEX_TO_RED, Map { max: 65535.0, values: vec![1.0, 2.0, 3.0] });
+        p.read = Some(2);
+        p.pos = RasterPos { valid: false, x: 3.5, y: 4.5, z: 9, colour: [0.1, 0.2, 0.3, 0.4] };
+        p.pending = Some([1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut w = Writer::default();
+        p.visit(&mut w);
+        let mut q = Pixels::default();
+        let mut r = Reader::new(&w.out);
+        q.visit(&mut r);
+        assert!(r.finish().is_ok());
+        assert_eq!(q, p);
+    }
 }

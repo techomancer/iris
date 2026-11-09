@@ -90,6 +90,47 @@ impl Front {
         }
     }
 
+    /// The registers, as the stream module reads and writes them. The configuration
+    /// (the widget's reset value, the probe) and the epoch are the board's, not the
+    /// guest's, and stay. The identity chain's state goes as the text its own save makes.
+    pub fn visit<S: super::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { widget_control: _, widget_control_reset: _, identity: _, onewire_reg: _, probe_value: _, low_window_write: _, int_dest_upper: _, int_dest_lower: _, int_vectors: _, reset_arg: _, int_enable: _, credit_config: _, int_cause: _, mailbox: _, mailbox_len: _, mailbox_pos: _, completions: _, retrace_tag: _, reset_strobe: _, eeprom_enable: _, loader_3b0: _, loader_328: _, video_delivered: _, video_unrouted_logged: _, epoch: _ } = self;
+        s.u32(&mut self.widget_control);
+        let mut bus = self.identity.bus.save_state().to_string();
+        s.string(&mut bus);
+        if s.loading() {
+            match bus.parse::<toml::Value>().map_err(|e| e.to_string()).and_then(|v| self.identity.bus.load_state(&v)) {
+                Ok(()) => {}
+                Err(e) => s.fail(&format!("the one-wire chain: {e}")),
+            }
+        }
+        for v in [
+            &mut self.onewire_reg,
+            &mut self.low_window_write,
+            &mut self.int_dest_upper,
+            &mut self.int_dest_lower,
+            &mut self.int_vectors,
+            &mut self.reset_arg,
+            &mut self.int_enable,
+            &mut self.credit_config,
+            &mut self.int_cause,
+            &mut self.completions,
+            &mut self.retrace_tag,
+            &mut self.reset_strobe,
+            &mut self.eeprom_enable,
+            &mut self.loader_3b0,
+            &mut self.loader_328,
+        ] {
+            s.u32(v);
+        }
+        s.u32s(&mut self.mailbox);
+        s.usize(&mut self.mailbox_len);
+        s.usize(&mut self.mailbox_pos);
+        s.bool(&mut self.video_delivered);
+        s.bool(&mut self.video_unrouted_logged);
+    }
+
     /// Power-on state. The identity chain and the probe value are the
     /// board's, not the driver's, and stay.
     pub fn reset(&mut self) {

@@ -66,6 +66,7 @@
 //! Ported from hw/misc/sgi-kona.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::kona::defs::*;
+use crate::dev::kona::stream::Stream;
 use crate::devlog::LogModule;
 
 /// The channels a display generator drives (the board reports eight).
@@ -128,6 +129,22 @@ impl Channel {
         }
     }
 
+    fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { enabled: _, loaded: _, format: _, input: _, blanked: _, gamma_map: _, cursor_priority: _, source: _, name: _, pan: _, placement: _ } = self;
+        s.bool(&mut self.enabled);
+        s.bool(&mut self.loaded);
+        s.u32(&mut self.format.0);
+        s.u32(&mut self.format.1);
+        s.u32s(&mut self.input);
+        s.bool(&mut self.blanked);
+        s.u32(&mut self.gamma_map);
+        s.u32(&mut self.cursor_priority);
+        s.u32(&mut self.source);
+        s.u32s(&mut self.name);
+        s.u32s(&mut self.pan);
+        s.u32s(&mut self.placement);
+    }
 }
 
 /// The display generator's video state.
@@ -162,6 +179,16 @@ impl Channels {
 
     pub fn reset(&mut self) {
         *self = Channels::new(self.rm_count);
+    }
+
+    /// The state, as the stream module reads and writes it.
+    pub fn visit<S: Stream>(&mut self, s: &mut S) {
+        let Self { channel: _, blanked: _, frame: _, error: _, rm_count: _ } = self;
+        self.channel.iter_mut().for_each(|c| c.visit(s));
+        s.bool(&mut self.blanked);
+        s.u32(&mut self.frame.0);
+        s.u32(&mut self.frame.1);
+        s.bool(&mut self.error);
     }
 
     /// Raster-manager pixel budget at a managed size: how many bytes a pixel may take.
@@ -753,4 +780,21 @@ mod tests {
         assert_eq!((f.source, f.gamma_map, f.name[0], f.name[16]), (5, 0, 0, 0));
     }
 
+    #[test]
+    fn the_state_survives_a_stream_round_trip_and_a_reset_clears_it() {
+        use crate::dev::kona::stream::{Reader, Writer};
+        let mut c = Channels::new(2);
+        c.set(VIDEO_LOAD_FORMAT, &format(1, "640x486_30i.vfo", 9, 640, 486));
+        c.set(VIDEO_TEMP_BLANK, &[1]);
+        let mut w = Writer::default();
+        c.visit(&mut w);
+        let bytes = w.out;
+        let mut back = Channels::new(2);
+        let mut r = Reader::new(&bytes);
+        back.visit(&mut r);
+        assert!(r.finish().is_ok());
+        assert_eq!(back, c);
+        back.reset();
+        assert_eq!(back, Channels::new(2));
+    }
 }

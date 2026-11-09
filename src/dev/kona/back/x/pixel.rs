@@ -183,6 +183,26 @@ pub struct Pixel {
 }
 
 impl Pixel {
+    /// Whether a write waits for its rows or a read bracket is open, neither of which a
+    /// snapshot carries.
+    pub fn busy(&self) -> bool {
+        self.pending.is_some() || self.read_dma.is_some()
+    }
+
+    /// The set-up, as the stream module reads and writes it (the counters are not saved).
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { setup: _, pending: _, read_dma: _, counts: _, row: _ } = self;
+        s.opt(&mut self.setup, |s, v| {
+            for w in [&mut v.mode, &mut v.src, &mut v.dst, &mut v.shift, &mut v.width, &mut v.height, &mut v.pad] {
+                s.u32(w);
+            }
+        });
+        if s.loading() {
+            self.pending = None;
+            self.read_dma = None;
+        }
+    }
 
     fn count(&mut self, v: Verdict) {
         match v {

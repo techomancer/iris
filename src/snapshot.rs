@@ -55,7 +55,12 @@ use toml::Value;
 /// levels in their own layout. A v5 reader would load none of it and leave
 /// every BAR unassigned under a running kernel, and a v6 reader does the
 /// same with a v5 snapshot, so both machines refuse the other schema.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// v6 → v7: `ChunksManifest` gains the KONA board's chunk lists (the pixel store's
+/// arrays and the cursor memory). postcard is not self-describing, so a v6 reader
+/// would take the new field's bytes for something else and a v7 reader would fail on
+/// a v6 `chunks.bin`; the bump makes both refuse. Nothing else changed shape.
+pub const SCHEMA_VERSION: u32 = 7;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 
@@ -475,6 +480,8 @@ pub struct ChunksManifest {
     pub bank_chunks: [Vec<ChunkHash>; 4],
     /// REX3 framebuffer chunks: (rgb, aux). `None` when running headless.
     pub framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
+    /// The KONA pipe's pixel store and cursor memory; empty when the machine has none.
+    pub kona_chunks: Vec<crate::dev::kona::KonaChunk>,
 }
 
 impl ChunksManifest {
@@ -486,6 +493,8 @@ impl ChunksManifest {
                 .iter()
                 .flat_map(|(rgb, aux)| rgb.iter().chain(aux.iter())),
         )
+        // A zero chunk's place holds the zero hash, which the store never holds.
+        .chain(self.kona_chunks.iter().flat_map(|c| c.hashes.iter()).filter(|h| **h != [0u8; 32]))
     }
 }
 

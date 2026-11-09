@@ -15,6 +15,7 @@ use crate::dev::kona::back::raster::ops::{BlendEq, BlendFactor, Compare, LogicOp
 use crate::dev::kona::back::raster::texel::{EnvMode, TexDesc};
 use crate::dev::kona::back::raster::{AlphaTest, BlendState, DrawState, Rect, Smooth, StencilState};
 use crate::dev::kona::defs::{gl, *};
+use crate::dev::kona::stream::Stream;
 use crate::dev::gl::light::{Lighting, MAX_LIGHTS};
 use crate::dev::gl::math::{self, Mat4, Stack};
 use crate::dev::gl::texgen::{self, TexGen};
@@ -303,10 +304,165 @@ pub enum Taken {
 }
 
 
+/// A matrix stack, as the stream module reads and writes it.
+fn visit_stack<S: Stream, const N: usize>(s: &mut S, st: &mut Stack<N>) {
+    for m in st.m.iter_mut() {
+        s.f32s(m);
+    }
+    s.u32(&mut st.top);
+}
+
+fn visit_lighting<S: Stream>(s: &mut S, l: &mut Lighting) {
+    for v in [&mut l.on, &mut l.two_sided, &mut l.local_viewer, &mut l.ambient_folded, &mut l.count, &mut l.cmat_param, &mut l.cmat_face, &mut l.cmat_on, &mut l.normalize, &mut l.fog_on, &mut l.fog_mode] {
+        s.u32(v);
+    }
+    s.f32s(&mut l.amb_sum);
+    for m in l.mat.iter_mut() {
+        s.f32s(&mut m.emission);
+        s.f32s(&mut m.ambient);
+        s.f32s(&mut m.diffuse);
+        s.f32s(&mut m.specular);
+        s.f32(&mut m.shininess);
+        s.u32(&mut m.spec_table);
+        s.f32(&mut m.spec_scale);
+        s.f32(&mut m.spec_start);
+        s.f32s(&mut m.spec);
+    }
+    for g in l.lights.iter_mut() {
+        s.f32s(&mut g.ambient);
+        s.f32s(&mut g.diffuse);
+        s.f32s(&mut g.specular);
+        s.f32s(&mut g.pos);
+        s.f32s(&mut g.spot_dir);
+        s.f32s(&mut g.atten);
+        s.u32(&mut g.spot_on);
+        s.f32(&mut g.spot_exp);
+        s.f32(&mut g.spot_cos_cutoff);
+        s.u32(&mut g.spot_table);
+        s.f32(&mut g.spot_scale);
+        s.f32(&mut g.spot_start);
+        s.f32s(&mut g.spot);
+        s.i32(&mut g.next);
+    }
+    s.i32(&mut l.head);
+    s.f32s(&mut l.normal_matrix);
+    s.f32(&mut l.fog_a);
+    s.f32(&mut l.fog_b);
+    s.f32s(&mut l.fog_color);
+}
+
 impl Raster {
+    /// The switches, as the stream module reads and writes them. The target is made again
+    /// from the layout and the window when the draw state is built.
+    fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { viewport: _, depth_range: _, scissor: _, scissor_test: _, depth_test: _, depth_func: _, cull: _, cull_mode: _, front_cw: _, flat: _, texture_2d: _, texture_3d: _, lighting: _, target: _, alpha_test: _, alpha_func: _, alpha_ref: _, stencil_test: _, stencil_func: _, stencil_ref: _, stencil_read_mask: _, stencil_write_mask: _, stencil_ops: _, blend: _, blend_factors: _, blend_colour: _, logic_op_on: _, logic_op: _, colour_mask: _, depth_mask: _, dither: _, offset_fill: _, offset: _, line_width: _, point_size: _, line_stipple_on: _, line_stipple: _, polygon_stipple_on: _, polygon_stipple: _, env_mode: _, env_colour: _, fog: _, polygon_mode: _, point_smooth: _, line_smooth: _, polygon_smooth: _, ms: _ } = self;
+        s.f32s(&mut self.viewport);
+        s.f32s(&mut self.depth_range);
+        s.i32s(&mut self.scissor);
+        for b in [&mut self.scissor_test, &mut self.depth_test, &mut self.cull, &mut self.front_cw, &mut self.flat, &mut self.texture_2d, &mut self.texture_3d, &mut self.lighting, &mut self.alpha_test, &mut self.stencil_test, &mut self.blend, &mut self.logic_op_on, &mut self.depth_mask, &mut self.dither, &mut self.offset_fill, &mut self.line_stipple_on, &mut self.polygon_stipple_on, &mut self.point_smooth, &mut self.line_smooth, &mut self.polygon_smooth] {
+            s.bool(b);
+        }
+        for v in [&mut self.depth_func, &mut self.cull_mode, &mut self.alpha_func, &mut self.stencil_func, &mut self.stencil_ref, &mut self.stencil_read_mask, &mut self.stencil_write_mask, &mut self.logic_op, &mut self.env_mode] {
+            s.u32(v);
+        }
+        s.u32s(&mut self.stencil_ops);
+        s.u32s(&mut self.blend_factors);
+        s.f32(&mut self.alpha_ref);
+        s.f32s(&mut self.blend_colour);
+        for b in self.colour_mask.iter_mut() {
+            s.bool(b);
+        }
+        s.f32s(&mut self.offset);
+        s.f32(&mut self.line_width);
+        s.f32(&mut self.point_size);
+        s.u32(&mut self.line_stipple.0);
+        s.u16(&mut self.line_stipple.1);
+        s.u32s(&mut self.polygon_stipple);
+        s.f32s(&mut self.env_colour);
+        let fog = &mut self.fog;
+        s.bool(&mut fog.on);
+        s.u32(&mut fog.mode);
+        for v in [&mut fog.density, &mut fog.start, &mut fog.end] {
+            s.f32(v);
+        }
+        s.f32s(&mut fog.colour);
+        s.u32s(&mut self.polygon_mode);
+        self.ms.visit(s);
+    }
 }
 
 impl Gl {
+    /// Whether a primitive is open, which a snapshot does not carry.
+    pub fn busy(&self) -> bool {
+        self.in_begin
+    }
+
+    /// The context's GL state, as the stream module reads and writes it. The draw state
+    /// is made again (`dirty`) on a load.
+    pub fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { mode: _, mv: _, proj: _, tex: _, light: _, normal_stale: _, color: _, normal: _, texcoord: _, edge_flag: _, user_plane: _, user_on: _, texgen: _, raster: _, in_begin: _, prim: _, error: _, light_bits: _, dirty: _, layout: _, double: _, origin: _, clip: _, placed: _, window_id: _, id_test: _, display_id: _, shown: _, draw: _, clear_colour: _, clear_depth: _, clear_stencil: _, texture: _, pix: _, feed: _, attrib_depth: _, ds: _ } = self;
+        s.u32(&mut self.mode);
+        visit_stack(s, &mut self.mv);
+        visit_stack(s, &mut self.proj);
+        visit_stack(s, &mut self.tex);
+        visit_lighting(s, &mut self.light);
+        s.bool(&mut self.normal_stale);
+        s.f32s(&mut self.color);
+        s.f32s(&mut self.normal);
+        s.f32s(&mut self.texcoord);
+        s.bool(&mut self.edge_flag);
+        for p in &mut self.user_plane {
+            s.f32s(p);
+        }
+        s.u32(&mut self.user_on);
+        s.u32(&mut self.texgen.enabled);
+        for i in 0..4 {
+            s.u32(&mut self.texgen.mode[i]);
+            s.f32s(&mut self.texgen.object[i]);
+            s.f32s(&mut self.texgen.eye[i]);
+        }
+        self.raster.visit(s);
+        s.u32(&mut self.prim);
+        s.u32(&mut self.error);
+        s.u32(&mut self.light_bits);
+        let mut has_layout = self.layout.is_some();
+        s.bool(&mut has_layout);
+        if s.loading() {
+            self.layout = has_layout.then(|| crate::dev::kona::back::store::layout::Layout { colour: 0..0, depth: 0..0, stencil: 0..0, multisample: 0..0, accumulation: 0..0, last: 0 });
+        }
+        if let Some(l) = &mut self.layout {
+            for r in [&mut l.colour, &mut l.depth, &mut l.stencil, &mut l.multisample, &mut l.accumulation] {
+                s.u32(&mut r.start);
+                s.u32(&mut r.end);
+            }
+            s.u32(&mut l.last);
+        }
+        s.bool(&mut self.double);
+        s.i32s(&mut self.origin);
+        for v in [&mut self.clip.x0, &mut self.clip.y0, &mut self.clip.x1, &mut self.clip.y1] {
+            s.i32(v);
+        }
+        s.bool(&mut self.placed);
+        s.i32(&mut self.window_id);
+        s.bool(&mut self.id_test);
+        s.u32(&mut self.display_id);
+        s.u8(&mut self.shown);
+        s.opt(&mut self.draw, |s, v| s.u32(v));
+        s.f32s(&mut self.clear_colour);
+        s.f32(&mut self.clear_depth);
+        s.u32(&mut self.clear_stencil);
+        s.opt(&mut self.texture, |s, t| t.visit(s));
+        self.pix.visit(s);
+        self.feed.visit(s);
+        s.u32(&mut self.attrib_depth);
+        if s.loading() {
+            self.in_begin = false;
+            self.dirty = true;
+            self.ds = None;
+        }
+    }
 
     fn matrix_op(&mut self, op: impl FnOnce(&mut Mat4)) {
         match self.mode {

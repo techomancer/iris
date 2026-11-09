@@ -39,6 +39,7 @@
 
 use super::state::Gl;
 use crate::dev::kona::defs::*;
+use crate::dev::kona::stream::Stream;
 use std::collections::BTreeMap;
 
 pub const RENDER: u32 = 0x1c00;
@@ -86,6 +87,23 @@ impl Default for Feed {
 }
 
 impl Feed {
+    pub fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { mode: _, kind: _, names: _, open: _, words: _, limit: _, overflow: _, bracket: _ } = self;
+        s.u32(&mut self.mode);
+        s.u32(&mut self.kind);
+        s.vec_u32(&mut self.names);
+        s.opt(&mut self.open, |s, v| {
+            s.u32(&mut v.0);
+            s.u32(&mut v.1);
+        });
+        s.vec_u32(&mut self.words);
+        let mut limit = self.limit.map_or(u32::MAX, |l| l as u32);
+        s.u32(&mut limit);
+        self.limit = (limit != u32::MAX).then_some(limit as usize);
+        s.bool(&mut self.overflow);
+        s.bool(&mut self.bracket);
+    }
 
     /// A start: the buffer's size in bytes, and an empty result.
     pub fn start(&mut self, bytes: u32) {
@@ -693,4 +711,22 @@ mod tests {
         assert_eq!(&w[2..4], &[0, 4_294_967_040], "below 0 and above 1 clamp");
     }
 
+    #[test]
+    fn the_select_and_feedback_state_round_trips_through_a_stream() {
+        use crate::dev::kona::stream::{Reader, Writer};
+        let mut f = Feed::default();
+        f.start(64);
+        f.mode = SELECT;
+        f.names = vec![1, 2];
+        f.open = Some((3, 4));
+        f.words = vec![9, 8];
+        f.bracket = true;
+        let mut w = Writer::default();
+        f.visit(&mut w);
+        let mut g = Feed::default();
+        let mut r = Reader::new(&w.out);
+        g.visit(&mut r);
+        assert!(r.finish().is_ok());
+        assert_eq!(g, f);
+    }
 }

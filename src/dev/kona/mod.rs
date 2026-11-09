@@ -65,6 +65,7 @@
 #![warn(dead_code, unused_imports)]
 
 mod back;
+pub mod stream;
 mod defs;
 mod dma;
 mod flash;
@@ -80,6 +81,7 @@ mod tables;
 mod tests;
 
 // What a machine needs: the board, its configuration and the flash's size.
+pub use back::snapshot::KonaChunk;
 pub use flash::{flash_file, FLASH_SIZE};
 pub use ident::{KonaConfig, Product as KonaProduct};
 use back::KonaBackend;
@@ -624,6 +626,74 @@ impl Kona {
             std::thread::yield_now();
         }
         s.pipe.lock().backend.quiesce();
+    }
+
+    /// The board's state as chunks, for a snapshot: the pixel store, the cursor memory and the
+    /// texture arena, and the small state (the register file, the pipe's registers, pages,
+    /// contexts and memories, the display tables, the textport and every rendering context
+    /// with its level map) as one more list named `state`. The board is quiesced, and the
+    /// stream is between commands: a snapshot taken in the middle of one is refused, so is
+    /// one with a primitive or a pixel transfer open. Counters are not saved.
+    pub fn save_chunks(&self, store: &crate::chunk_store::ChunkStore) -> std::io::Result<Vec<KonaChunk>> {
+        let io = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+        let mut pipe = self.shared.pipe.lock();
+        let p = &mut *pipe;
+        let state = self.state_bytes(p).map_err(io)?;
+        let mut chunks = p.backend.save_chunks(store)?;
+        let n = state.len();
+        chunks.push(KonaChunk { name: format!("state-{n}"), hashes: back::snapshot::put_bytes(store, &state)? });
+        Ok(chunks)
+    }
+
+    /// Restore what `save_chunks` wrote, into a board of the same configuration, all or nothing.
+    /// Every chunk is read, and the small state is parsed once over throwaway objects, before
+    /// the board is touched; only then does the real pass run (which cannot fail on the bytes,
+    /// since a visit is a function of them alone), the bulk state go in, and the flash image,
+    /// the one effect outside the board, be written through to its file last.
+    pub fn load_chunks(&self, store: &crate::chunk_store::ChunkStore, list: &[KonaChunk]) -> Result<(), String> {
+        let (state, rest): (Vec<_>, Vec<_>) = list.iter().cloned().partition(|c| c.name.starts_with("state-"));
+        let [c] = &state[..] else { return Err("a snapshot holds one state list".into()) };
+        let n: usize = c.name["state-".len()..].parse().map_err(|_| "the state list's size is not a number")?;
+        let blob = back::snapshot::get_bytes(store, &c.hashes, n)?;
+        let mut pipe = self.shared.pipe.lock();
+        let p = &mut *pipe;
+        let prepared = p.backend.prepare_chunks(store, &rest)?;
+        self.load_state(p, &blob)?;
+        p.backend.apply_chunks(prepared)?;
+        p.core.flash.write_through();
+        self.shared.host.activity.store(false, Relaxed);
+        self.shared.publish(&p.core);
+        Ok(())
+    }
+
+    /// The small state as the bytes `load_state` reads: the register file, the pipe's registers,
+    /// pages, queues, contexts and memories, and the back end's small state. Refused between the
+    /// words of a command and with a primitive or a pixel transfer open.
+    fn state_bytes(&self, p: &mut Pipe) -> Result<Vec<u8>, String> {
+        p.core.at_boundary()?;
+        let mut w = stream::Writer::default();
+        self.shared.host.front.lock().visit(&mut w);
+        p.core.visit(&mut w);
+        p.backend.visit_small(&mut w)?;
+        Ok(w.out)
+    }
+
+    /// Read the small state from `blob`: parsed once over throwaway objects, which changes
+    /// nothing and refuses a blob that is cut short or has bytes left, then read into the board.
+    fn load_state(&self, p: &mut Pipe, blob: &[u8]) -> Result<(), String> {
+        {
+            let cfg = p.core.cfg.clone();
+            let mut r = stream::Reader::new(blob);
+            Front::new(&cfg).visit(&mut r);
+            Core::new(cfg, flash::Flash::fresh()).visit(&mut r);
+            KonaBackend::check_small(&mut r);
+            r.finish()?;
+        }
+        let mut r = stream::Reader::new(blob);
+        self.shared.host.front.lock().visit(&mut r);
+        p.core.visit(&mut r);
+        p.backend.visit_small(&mut r)?;
+        r.finish()
     }
 
     /// Undo `quiesce`.

@@ -16,6 +16,7 @@
 pub mod display;
 pub mod raster;
 pub mod tiles;
+pub mod snapshot;
 pub mod store;
 pub mod context;
 pub mod gl;
@@ -40,6 +41,7 @@ use raster::Rect;
 use tiles::{ClearJob, RasterJob, Tiles};
 use store::texture::{TextureStore, PAGE_WORDS};
 use store::PixelStore;
+use super::stream;
 use crate::devlog::LogModule;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -309,10 +311,66 @@ impl KonaBackend {
         self.display.clone()
     }
 
+    /// Parse the small state over throwaway objects, to see that it parses, changing nothing.
+    pub fn check_small<S: stream::Stream>(s: &mut S) {
+        Tables::default().visit(s);
+        Textport::default().visit(s);
+        Contexts::default().visit(s);
+        display::channels::Channels::new(0).visit(s);
+    }
+
     /// Tell the display whether channel 0, the frame it shows, is blanked: by its own blanking or by
     /// a temporary blank of every channel.
     fn sync_blank(&self) {
         self.tables.lock().set_blank(self.channels.blanked || self.channels.channel[0].blanked);
+    }
+
+    /// The small state the back end holds, as the stream module reads and writes it: the
+    /// display tables, the textport and every context. Refused on save when a context is
+    /// part way through a primitive or a pixel transfer. The counters, the tile scheduler and
+    /// what a frame is composed from are not saved.
+    pub fn visit_small<S: stream::Stream>(&mut self, s: &mut S) -> Result<(), String> {
+        if !s.loading() {
+            self.drain();
+            if self.contexts.busy() {
+                return Err("a context is in the middle of a primitive or a pixel transfer".into());
+            }
+        }
+        self.tables.lock().visit(s);
+        self.textport.visit(s);
+        self.contexts.visit(s);
+        self.channels.visit(s);
+        self.sync_blank();
+        if s.loading() {
+            self.drain();
+            self.last_layout = None;
+            self.pending_config = None;
+        }
+        Ok(())
+    }
+
+    /// The bulk state as chunks (see `snapshot`), after every queued raster job has run.
+    pub fn save_chunks(&mut self, cs: &crate::chunk_store::ChunkStore) -> std::io::Result<Vec<snapshot::KonaChunk>> {
+        self.drain();
+        snapshot::save(&self.store, &self.tables.lock(), cs)
+    }
+
+    /// Read and check the bulk state from chunks, changing nothing.
+    pub fn prepare_chunks(&mut self, cs: &crate::chunk_store::ChunkStore, list: &[snapshot::KonaChunk]) -> Result<snapshot::Prepared, String> {
+        self.drain();
+        snapshot::prepare(&self.store, &self.tables.lock(), cs, list)
+    }
+
+    /// Put what `prepare_chunks` read into the store.
+    pub fn apply_chunks(&mut self, p: snapshot::Prepared) -> Result<(), String> {
+        self.drain();
+        snapshot::apply(&self.store, &mut self.tables.lock(), p)
+    }
+
+    /// Restore the bulk state from chunks.
+    pub fn load_chunks(&mut self, cs: &crate::chunk_store::ChunkStore, list: &[snapshot::KonaChunk]) -> Result<(), String> {
+        let p = self.prepare_chunks(cs, list)?;
+        self.apply_chunks(p)
     }
 
     /// Wire the machine's status-bar inputs into the display.
@@ -2168,6 +2226,30 @@ mod tests {
         assert!(run(&mut b, &["status"]).1.contains("blanked [3] (channel 0's, and all while temporarily blanked, are drawn black), frame 1280 x 1024, all blanked\n"));
         b.reset();
         assert_eq!(b.channels.channel[2].cursor_priority, 0);
+    }
+
+    /// The channels are part of the saved small state: what the video setters left comes back from a snapshot
+    /// into a fresh backend, and a snapshot of the restored backend is the same bytes.
+    #[test]
+    fn the_video_channels_are_saved_and_restored_with_the_backend() {
+        use crate::dev::kona::stream::{Reader, Writer};
+        let mut b = backend();
+        send(&mut b, Job::Video { command: VIDEO_CURSOR_PRIORITY, data: &[2, 9] });
+        send(&mut b, Job::Video { command: VIDEO_CHANNEL_BLANKING, data: &[4, 1] });
+        send(&mut b, Job::Video { command: VIDEO_TEMP_BLANK, data: &[1] });
+        send(&mut b, Job::Video { command: VIDEO_RESIZE, data: &[1, 10, 500, 640, 480, 1, 1, 0] });
+        let mut w = Writer::default();
+        b.visit_small(&mut w).unwrap();
+        let mut back = backend();
+        assert_ne!(back.channels, b.channels);
+        let mut r = Reader::new(&w.out);
+        back.visit_small(&mut r).unwrap();
+        r.finish().unwrap();
+        assert_eq!(back.channels, b.channels);
+        assert_eq!((back.channels.channel[2].cursor_priority, back.channels.channel[4].blanked, back.channels.blanked, back.channels.channel[1].input), (9, true, true, [10, 500, 640, 480]));
+        let mut again = Writer::default();
+        back.visit_small(&mut again).unwrap();
+        assert_eq!(again.out, w.out);
     }
 
     /// The loader releasing the firmware runs the stored combination, or the built-in one when there is none: the

@@ -35,6 +35,19 @@ impl Context {
         Context { tex: TexContext::new(slot), ..Default::default() }
     }
 
+    /// Whether the context is part way through something a snapshot does not carry.
+    pub fn busy(&self) -> bool {
+        self.x.busy() || self.gl.busy()
+    }
+
+    /// The context's state, as the stream module reads and writes it.
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { x: _, gl: _, tex: _ } = self;
+        self.x.visit(s);
+        self.gl.visit(s);
+        self.tex.visit(s);
+    }
 }
 
 pub struct Contexts {
@@ -95,6 +108,38 @@ impl Contexts {
     /// or a window release touched does not count.
     pub fn held(&self) -> usize {
         self.slots.iter().flatten().filter(|c| c.x.loads != 0).count()
+    }
+
+    /// Whether any context is part way through something a snapshot does not carry.
+    pub fn busy(&self) -> bool {
+        self.none.busy() || self.slots.iter().flatten().any(|c| c.busy())
+    }
+
+    /// Every context, as the stream module reads and writes them: the no-context state,
+    /// then each table entry that holds one. The entry the last job named is not saved
+    /// (the next job names it again).
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { none: _, slots: _, current: _ } = self;
+        self.none.visit(s);
+        let n = s.len(self.slots.len());
+        if s.loading() {
+            self.slots.clear();
+            self.slots.resize_with(n.min(CONTEXT_SLOTS), || None);
+        }
+        for (at, slot) in self.slots.iter_mut().enumerate() {
+            let mut some = slot.is_some();
+            s.bool(&mut some);
+            if s.loading() {
+                *slot = some.then(|| Box::new(Context::new(at)));
+            }
+            if let Some(c) = slot {
+                c.visit(s);
+            }
+        }
+        if s.loading() {
+            self.current = None;
+        }
     }
 
     /// Power-on state for every entry.

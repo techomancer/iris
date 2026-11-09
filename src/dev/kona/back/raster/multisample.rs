@@ -47,6 +47,7 @@
 //! - Lines and points go through the same triangles, so they are multisampled the same way
 //!   (the table has no rule for them).
 
+use crate::dev::kona::stream::Stream;
 
 /// The sample patterns, 0x80a1 to 0x80a7, as a pair of location words for 4 samples and one for 8.
 const PATTERN_FIRST: u32 = 0x80a1;
@@ -135,6 +136,20 @@ impl Multisample {
         Some(Samples { count: self.samples as u8, at, cover: if self.mask_on { self.coverage_word() } else { !0 }, alpha_to_mask: self.alpha_to_mask, alpha_to_one: self.alpha_to_one, colour, depth, stencil })
     }
 
+    pub fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { samples: _, enable: _, alpha_to_mask: _, alpha_to_one: _, mask_on: _, pattern: _, mask_value: _, mask_invert: _ } = self;
+        s.u32(&mut self.samples);
+        for b in [&mut self.enable, &mut self.alpha_to_mask, &mut self.alpha_to_one, &mut self.mask_on, &mut self.mask_invert] {
+            s.bool(b);
+        }
+        s.u32(&mut self.pattern);
+        s.f32(&mut self.mask_value);
+        // A pattern read from a damaged snapshot would index past the tables.
+        if !(PATTERN_FIRST..PATTERN_FIRST + 7).contains(&self.pattern) {
+            self.pattern = PATTERN_FIRST;
+        }
+    }
 }
 
 impl Samples {
@@ -215,4 +230,21 @@ mod tests {
         assert_eq!(s.alpha_samples(4096).count_ones(), 4);
     }
 
+    #[test]
+    fn the_state_round_trips_through_a_stream() {
+        use crate::dev::kona::stream::{Reader, Writer};
+        let mut m = Multisample::default();
+        m.configure(8);
+        m.mask_on = true;
+        m.mask_value = 0.25;
+        m.mask_invert = true;
+        m.set_pattern(0x80a5);
+        let mut w = Writer::default();
+        m.visit(&mut w);
+        let mut n = Multisample::default();
+        let mut r = Reader::new(&w.out);
+        n.visit(&mut r);
+        assert!(r.finish().is_ok());
+        assert_eq!(n, m);
+    }
 }

@@ -96,6 +96,23 @@ pub(super) struct Input {
 }
 
 impl Input {
+    /// The stream's position between commands, as the stream module reads and writes it.
+    fn visit<S: super::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { textport: _, gl: _, kernel_suspended: _, expect_sync: _, gl_sync_held: _, level1: _, level1_arg: _, gl_token_high: _, bitmap: _, run: _, spare_args: _, spare_words: _ } = self;
+        s.bool(&mut self.expect_sync);
+        s.bool(&mut self.gl_sync_held);
+        s.u8(&mut self.level1);
+        s.u32(&mut self.level1_arg);
+        s.u32(&mut self.gl_token_high);
+        if s.loading() {
+            self.textport.reset();
+            self.gl.reset();
+            self.kernel_suspended.reset();
+            self.bitmap = Bitmap::idle();
+            self.run = Run::None;
+        }
+    }
 
     fn new(t: &'static FrameTables) -> Self {
         Input {
@@ -242,6 +259,101 @@ impl Core {
             load_sections: Vec::new(),
             load_record: Vec::new(),
             indirect_select: 0,
+        }
+    }
+
+    /// Whether the stream is between commands, which is the only place a snapshot is
+    /// taken: no framer has a command open, no run waits for its words and no swap is
+    /// part way in (the context table's saved streams too).
+    pub(super) fn at_boundary(&self) -> Result<(), String> {
+        let idle = |i: &Input| !i.textport.framing() && !i.gl.framing() && !i.kernel_suspended.framing() && matches!(i.run, Run::None) && i.bitmap.state == BitmapState::Idle;
+        let still = idle(&self.input) && self.saved.iter().flatten().all(|i| idle(i)) && !self.kernel.framing() && !self.dma_fifo.framing() && self.swapin.stage == SwapStage::Idle && !self.dma.running();
+        if still { Ok(()) } else { Err("the command stream is in the middle of a command".into()) }
+    }
+
+    /// The pipe's registers, pages, contexts and memories, as the stream module reads
+    /// and writes them. Save only `at_boundary`; the configuration and the framing tables
+    /// are the build's. A loaded stream starts with every framer idle.
+    pub(super) fn visit<S: super::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { cfg: _, tables: _, input: _, saved: _, kernel: _, dma_fifo: _, kernel_input: _, kernel_privileged: _, suspended_owner: _, gl_grammar: _, swapin: _, return_page: _, reason_page: _, reason_unread: _, reason_posted: _, reason_queue: _, contexts: _, context_count: _, current: _, context_page_pending: _, failed: _, managed: _, map_ram: _, flash: _, dma: _, dma_fault: _, port_addr: _, icu_control: _, arm_low: _, arm_high: _, load_open: _, load_count: _, load_sections: _, load_record: _, indirect_select: _ } = self;
+        self.input.visit(s);
+        s.len(self.saved.len());
+        let t = self.tables;
+        for slot in self.saved.iter_mut() {
+            let mut some = slot.is_some();
+            s.bool(&mut some);
+            if s.loading() {
+                *slot = some.then(|| Box::new(Input::new(t)));
+            }
+            if let Some(i) = slot {
+                i.visit(s);
+            }
+        }
+        s.bool(&mut self.kernel_input);
+        s.bool(&mut self.kernel_privileged);
+        s.opt(&mut self.suspended_owner, |s, v| s.usize(v));
+        s.bool(&mut self.gl_grammar);
+        s.opt(&mut self.return_page, |s, v| s.u64(v));
+        s.opt(&mut self.reason_page, |s, v| s.u64(v));
+        s.bool(&mut self.reason_unread);
+        s.u32(&mut self.reason_posted);
+        let n = s.len(self.reason_queue.len());
+        if s.loading() {
+            self.reason_queue.clear();
+            self.reason_queue.resize(n.min(1 << 16), (0, [0; REASON_WORDS], 0));
+        }
+        for (a, w, b) in self.reason_queue.iter_mut() {
+            s.u32(a);
+            s.u32s(w);
+            s.usize(b);
+        }
+        s.len(self.contexts.len());
+        for c in self.contexts.iter_mut() {
+            s.u32(&mut c.save_page);
+            s.u32(&mut c.save_offset);
+            s.opt(&mut c.return_page, |s, v| s.u64(v));
+        }
+        s.usize(&mut self.context_count);
+        s.opt(&mut self.current, |s, v| s.usize(v));
+        s.bool(&mut self.context_page_pending);
+        let mut failed = self.failed.clone().unwrap_or_default();
+        let mut has = self.failed.is_some();
+        s.bool(&mut has);
+        s.string(&mut failed);
+        if s.loading() {
+            self.failed = has.then_some(failed);
+        }
+        s.u32(&mut self.managed.0);
+        s.u32(&mut self.managed.1);
+        s.u32s(&mut self.map_ram);
+        self.flash.visit(s);
+        self.dma.visit(s);
+        s.bool(&mut self.dma_fault);
+        s.u32(&mut self.port_addr);
+        s.u32(&mut self.icu_control);
+        s.u32s(&mut self.arm_low);
+        s.vec_u32(&mut self.arm_high);
+        s.bool(&mut self.load_open);
+        s.usize(&mut self.load_count);
+        for list in [&mut self.load_sections, &mut self.load_record] {
+            let n = s.len(list.len());
+            if s.loading() {
+                list.clear();
+                list.resize(n, LoadSection { addr: 0, words: 0 });
+            }
+            for l in list.iter_mut() {
+                s.u32(&mut l.addr);
+                s.u32(&mut l.words);
+            }
+        }
+        s.u32(&mut self.indirect_select);
+        if s.loading() {
+            for p in [&mut self.kernel, &mut self.dma_fifo] {
+                p.reset();
+            }
+            self.swapin.stage = SwapStage::Idle;
+            self.swapin.data_left = 0;
         }
     }
 

@@ -70,7 +70,21 @@ impl EnvMode {
 }
 
 impl Filter {
+    fn bits(self) -> u32 {
+        match self {
+            Filter::Nearest => 0,
+            Filter::Linear => 1,
+            Filter::Mip { within_linear, between_linear } => 2 | (within_linear as u32) << 2 | (between_linear as u32) << 3,
+        }
+    }
 
+    fn from_bits(b: u32) -> Filter {
+        match b & 3 {
+            0 => Filter::Nearest,
+            1 => Filter::Linear,
+            _ => Filter::Mip { within_linear: b >> 2 & 1 != 0, between_linear: b >> 3 & 1 != 0 },
+        }
+    }
 }
 
 /// The curve nodes a filter table holds: 64 samples at x = log2(i / 64) (the detail and sharpen
@@ -138,6 +152,35 @@ pub fn spline_samples(words: &[u32; 33]) -> Option<[f32; CURVE_NODES]> {
 }
 
 impl Combine {
+    fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        let (mut kind, mut modulate, mut scale, mut channels) = (0u32, false, 0u8, 0u8);
+        let (mut image, mut weights) = (TexLevel::default(), [0.0f32; CURVE_NODES]);
+        match self {
+            Combine::None => {}
+            Combine::Detail(d) => (kind, modulate, scale, channels, image, weights) = (1, d.modulate, d.scale, d.channels, d.image, d.weights),
+            Combine::Sharpen(p) => (kind, channels, weights) = (2, p.channels, p.weights),
+        }
+        s.u32(&mut kind);
+        s.bool(&mut modulate);
+        s.u8(&mut scale);
+        s.u8(&mut channels);
+        for v in [&mut image.pitch, &mut image.ox, &mut image.oy, &mut image.w, &mut image.h] {
+            s.u16(v);
+        }
+        s.u32(&mut image.off);
+        for w in weights.iter_mut() {
+            let mut b = w.to_bits();
+            s.u32(&mut b);
+            *w = f32::from_bits(b);
+        }
+        if s.loading() {
+            *self = match kind {
+                1 => Combine::Detail(Detail { modulate, scale, channels, image, weights }),
+                2 => Combine::Sharpen(Sharpen { channels, weights }),
+                _ => Combine::None,
+            };
+        }
+    }
 }
 
 /// A bound texture and its environment.
@@ -163,6 +206,44 @@ pub struct TexDesc {
 }
 
 impl TexDesc {
+    /// A bound texture, as the stream module reads and writes it.
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { levels: _, count: _, min: _, mag: _, wrap: _, lod_scale: _, volume: _, combine: _, class: _, env: _, env_colour: _ } = self;
+        for l in self.levels.iter_mut() {
+            s.u32(&mut l.off);
+            for v in [&mut l.pitch, &mut l.ox, &mut l.oy, &mut l.w, &mut l.h, &mut l.d] {
+                s.u16(v);
+            }
+            s.u32(&mut l.slice);
+        }
+        s.u8(&mut self.count);
+        for f in [&mut self.min, &mut self.mag] {
+            let mut b = f.bits();
+            s.u32(&mut b);
+            *f = Filter::from_bits(b);
+        }
+        for w in self.wrap.iter_mut() {
+            let mut b = (*w == Wrap::Clamp) as u32;
+            s.u32(&mut b);
+            *w = if b != 0 { Wrap::Clamp } else { Wrap::Repeat };
+        }
+        for v in self.lod_scale.iter_mut() {
+            s.u8(v);
+        }
+        s.bool(&mut self.volume);
+        self.combine.visit(s);
+        s.u8(&mut self.class);
+        let mut e = match self.env {
+            EnvMode::Modulate => 0,
+            EnvMode::Decal => 1,
+            EnvMode::Blend => 2,
+            EnvMode::Replace => 3,
+        };
+        s.u32(&mut e);
+        self.env = [EnvMode::Modulate, EnvMode::Decal, EnvMode::Blend, EnvMode::Replace][(e & 3) as usize];
+        s.u32s(&mut self.env_colour);
+    }
 }
 
 /// A coordinate wrapped into `0..n`.
