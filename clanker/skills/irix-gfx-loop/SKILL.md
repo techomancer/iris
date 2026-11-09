@@ -56,10 +56,14 @@ the compiled path. If the user has a build they use, build into your own
 
 `test/gltest` holds board-neutral GL/X programs: `glprim` (one primitive per
 run, `--help` lists every option), `gltest` (scenes and `--bench`),
-`pixtest`, `blendtest`, `glstate`, `seltest` (selection hit records), `dettex`
-(detail textures; `--impact` on IMPACT), plus helpers `xgetpix` (read root-window
-pixels through XGetImage), `xclick`, `xresize`. `irix.sh` builds them with
-MIPSpro.
+`pixtest`, `blendtest` (`-a` lists every cell), `glstate`, `seltest`
+(selection hit records), `dettex` (detail textures; `--impact` on IMPACT,
+`--fill`/`--dump` and `dettexsweep.sh` to measure a board), `rdist` (the
+raster distance query), plus helpers `xgetpix` (read root-window pixels
+through XGetImage), `xclick`, `xresize`, `gepeek` (IMPACT GE words and user
+registers) and `bdinfo` (the board-info record gfxinfo reads). `irix.sh`
+builds them with MIPSpro. A real IMPACT to compare with:
+`clanker/mgras/real-high-impact.md`.
 
 ```sh
 mkdir -p shared/gltest && cp test/gltest/* shared/gltest/

@@ -77,6 +77,9 @@ in each. Both write to `/shared/results/TAG`; the host-side
 `test/gltest/glsuite-compare.sh A B` lists every difference between two runs.
 Running both on the CPU and the GPU raster unit and comparing is how the GPU
 unit is checked against the reference end to end.
+The same suite on a real board, from the same binaries, against a guest
+emulating that board is how the model is checked against hardware; the
+board's quirks then show up as differences instead of as failures.
 
 ```sh
 mkdir -p shared/gltest && cp test/gltest/* shared/gltest/       # piglit: shared/piglit (clanker/testing/piglit-on-irix.md)

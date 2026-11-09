@@ -54,10 +54,11 @@ static const struct { const char *name; const char *why; int gr2_only; } xfails[
     { "frag/BLEND_COLOR_EXT", "libGLcore sends glBlendColorEXT but answers the query with zeros" },
     { "lightmodel/AMBIENT", "libGLcore sends the light model ambient's RGB only" },
     { "eval/MAP1_VERTEX_3", "libGLcore returns the control points transposed" },
+    { "current/RASTER_DISTANCE", "the raster vertex's eye z, not divided by w (negative in front of the eye), not the distance: the GE's word on IMPACT (a real High IMPACT), libGLcore EXPRESS's own on GR2" },
     /* GR2 (XZ / Extreme), IRIX 6.5.22 libGLcore EXPRESS: it answers every
        query from its own state except the current and raster colour,
        index and normal (__glExpDoGet), and textures are all software. */
-    { "current/RASTER_DISTANCE", "libGLcore EXPRESS keeps the raster position itself and returns eye z (negative in front of the eye), not the distance", 1 },
+
     { "texlevel/RED_SIZE", "libGLcore EXPRESS (software textures): an RGBA8 level reports 24 bits a component", 1 },
     { "texlevel/GREEN_SIZE", "libGLcore EXPRESS (software textures): an RGBA8 level reports 24 bits a component", 1 },
     { "texlevel/BLUE_SIZE", "libGLcore EXPRESS (software textures): an RGBA8 level reports 24 bits a component", 1 },

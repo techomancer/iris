@@ -218,7 +218,7 @@ const SL_PAGES: usize = 48;
 const SL_BPAGES: usize = 64;
 const SL_STIPPLE: usize = 80;
 /// The detail texture (`te1::Detail`): on, page, log2 N, shift S, shift T,
-/// then its 32 weights at SL_DTABLE.
+/// the TXLOD cutoff index, then its 32 weights at SL_DTABLE.
 const SL_DETAIL: usize = 112;
 const SL_DTABLE: usize = 120;
 const SLOT_WORDS: usize = 152;
@@ -281,7 +281,7 @@ impl Slot {
             w[SL_PAGES..SL_PAGES + 16].copy_from_slice(&smp.pages);
             w[SL_BPAGES..SL_BPAGES + 16].copy_from_slice(&smp.border_pages);
             let d = &smp.detail;
-            w[SL_DETAIL..SL_DETAIL + 5].copy_from_slice(&[d.on, d.page, d.log, d.shift_s, d.shift_t]);
+            w[SL_DETAIL..SL_DETAIL + 6].copy_from_slice(&[d.on, d.page, d.log, d.shift_s, d.shift_t, d.last]);
             w[SL_DTABLE..SL_DTABLE + 32].copy_from_slice(&d.table);
         }
         if stipple {

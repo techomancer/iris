@@ -17,20 +17,28 @@
  *
  * Usage: dettex [--only SUBSTR] [--hold MS] [--mipmap] [--objects] [--early]
  *               [--base N] [--detail N] [--level L] [--func LOD,W,LOD,W...]
- *               [--size N] [--detail-last] [--impact]
+ *               [--size N] [--detail-last] [--impact] [--fill B,D]
+ *               [--dump PREFIX]
  *
  * --func replaces the detail function of the "func" case (up to 4 points);
  * --size sets that case's quad size (default 240);
- * --detail-last defines the detail image after the base texture.
+ * --detail-last defines the detail image after the base texture;
+ * --fill B,D makes every base texel B and every detail texel D (all four
+ * components), so a case measures the combine alone;
+ * --dump writes each case's readback to PREFIX_<case>.ppm (RGB, the GL
+ * window's rows bottom up as glReadPixels returns them).
  *
  * --impact checks against what IMPACT does instead of the specification.
  * Its driver turns the detail function into a table of 32 five-bit
  * weights at k = 32 2^LOD (each point at the nearest k, linear in k
  * between them, held at the ends, halves rounded down, zero past the last
  * nonzero entry), and the board reads F from that table, linear between
- * entries; the driver sends detail levels above -2 as -2; and the board
- * only adds, so the COLOR, ALPHA and MODULATE cases expect ADD on every
- * component.
+ * entries, an entry of 31 being 31/32, and none from the last nonzero
+ * entry's index on (k = 31 for a function that ends nonzero); the driver sends detail levels above
+ * -2 as -2; and the board only adds, so the COLOR, ALPHA and MODULATE cases
+ * expect ADD on every component. Its sum is base + F (detail - 0.5334), not
+ * the extension's base + F (2 detail - 1): measured on a real High IMPACT
+ * with --fill (texels widened to 12 bits, the centre 2185/4096).
  *
  * --mipmap gives the base texture its mipmaps and a mipmapped minification
  * filter; --objects binds both textures as texture objects; --early sets the
@@ -66,7 +74,8 @@ static Window win;
 static int fails, has_alpha, mipmap, objects, early, detail_last, impact, func_size = 240;
 static float user_func[8];
 static int user_n;
-static const char *only;
+static const char *only, *dump;
+static int fill_b = -1, fill_d = -1;
 static unsigned char base[MAXT * MAXT * 4], det[MAXT * MAXT * 4];
 static unsigned char px[WIN * WIN * 4];
 
@@ -130,9 +139,10 @@ static double table_weight(double lod)
     }
     for (k = last + 1; k < 32; k++) tab[k] = 0;
     x = 32.0 * pow(2.0, lod);
-    if (x >= 31.0) return tab[31] / 31.0;
+    /* No detail from the last nonzero entry's index on. */
+    if (x >= 31.0 || (int)floor(x) >= last) return 0.0;
     i = (int)floor(x);
-    return (tab[i] + (tab[i + 1] - tab[i]) * (x - i)) / 31.0;
+    return (tab[i] + (tab[i + 1] - tab[i]) * (x - i)) / 32.0;
 }
 
 static void fill_textures(unsigned seed)
@@ -147,6 +157,24 @@ static void fill_textures(unsigned seed)
         seed = seed * 1103515245u + 12345u;
         det[i] = (unsigned char)((seed >> 16) & 0xff);
     }
+    if (fill_b >= 0) {
+        memset(base, fill_b, sizeof base);
+        memset(det, fill_d, sizeof det);
+    }
+}
+
+static void dump_case(const char *name)
+{
+    char path[512];
+    FILE *f;
+    int i;
+    sprintf(path, "%s_%s.ppm", dump, name);
+    f = fopen(path, "wb");
+    if (!f) { perror(path); return; }
+    fprintf(f, "P6\n%d %d\n255\n", WIN, WIN);
+    for (i = 0; i < WIN * WIN; i++)
+        fwrite(&px[i * 4], 1, 3, f);
+    fclose(f);
 }
 
 /* One case: magnification filter `mag`, detail mode `mode`, detail level
@@ -176,6 +204,7 @@ static void run(const char *name, GLenum mag, GLenum mode, int level, int size)
     glEnd();
     glFinish();
     glReadPixels(0, 0, WIN, WIN, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    if (dump) dump_case(name);
     /* Interior pixels (the quad's edge pixels follow the fill rule). */
     for (y = y0 + 1; y < y0 + size - 1; y++) {
         for (x = x0 + 1; x < x0 + size - 1; x++) {
@@ -188,7 +217,10 @@ static void run(const char *name, GLenum mag, GLenum mode, int level, int size)
                     int l = impact && level > -2 ? -2 : level;
                     double scale = TS * pow(2.0, -l); /* 2^(n - L), n = log2 TS */
                     double td = bilinear(det, DS, s * scale, t * scale, c);
-                    want = mode == GL_ADD || impact ? clamp01(tb + f * (2 * td - 1)) : clamp01(tb * (1 + f * (2 * td - 1)));
+                    if (impact)
+                        want = clamp01(tb + f * (td * 4095.0 / 4096.0 - 2185.0 / 4096.0));
+                    else
+                        want = mode == GL_ADD ? clamp01(tb + f * (2 * td - 1)) : clamp01(tb * (1 + f * (2 * td - 1)));
                 }
                 err = fabs(px[(y * WIN + x) * 4 + c] - want * 255.0);
                 if (err > maxerr) maxerr = err;
@@ -234,6 +266,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--early")) early = 1;
         else if (!strcmp(argv[i], "--detail-last")) detail_last = 1;
         else if (!strcmp(argv[i], "--impact")) impact = 1;
+        else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
+        else if (!strcmp(argv[i], "--fill") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%d,%d", &fill_b, &fill_d) != 2) fill_b = -1;
+        }
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) func_size = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--base") && i + 1 < argc) TS = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--detail") && i + 1 < argc) DS = atoi(argv[++i]);

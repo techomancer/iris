@@ -537,11 +537,22 @@ impl Te1 {
             log,
             shift_s: ((size & 0xF) as i32 + up).max(0) as u32,
             shift_t: (((size >> 4) & 0xF) as i32 + up).max(0) as u32,
-            pad: [0; 3],
+            last: last as u32,
+            pad: [0; 2],
             table,
         }
     }
 }
+
+/// The detail weight in 12.16 for one unit of the table blend (a 5-bit
+/// entry times a 256ths fraction): an entry of 31 is 31/32, not 1.0.
+/// Measured on a real High IMPACT (IRIX 6.5.22): a uniform base b and
+/// detail d come back as b + w (d - 136.6) / 32 for entry w, the texels
+/// widened to 12 bits by replication, within one level at 161 of 165
+/// points (dettex --fill).
+pub const DETAIL_SCALE: i32 = 1 << 15;
+/// The detail value that adds nothing, 12.16: 2185 of 4095.
+pub const DETAIL_CENTER: i32 = 2185 << 16;
 
 /// `round(256 * 2^(f / 256))` for an 8-bit fraction `f`: the detail
 /// weight's table index from the LOD (`Sampler::detail_weight`). The GPU
@@ -566,7 +577,9 @@ pub struct Detail {
     /// (log2 of level 0's size - L).
     pub shift_s: u32,
     pub shift_t: u32,
-    pub pad: [u32; 3],
+    /// TXLOD 15:10 / 2: from this table index on, F is 0.
+    pub last: u32,
+    pub pad: [u32; 2],
     /// Five-bit weights, zero past the last one used.
     pub table: [u32; TABLE_LEN],
 }
@@ -691,23 +704,30 @@ impl Sampler {
     }
 
     /// The detail weight F at `lambda` (<= 0, Q8) in 12.16: the table at
-    /// k = 32 2^lambda, its top 24 bits an index and an 8-bit fraction.
+    /// k = 32 2^lambda, its top 24 bits an index and an 8-bit fraction;
+    /// 0 from the TXLOD index on.
     pub fn detail_weight(&self, lambda: i32) -> i32 {
         let e = lambda.saturating_add(5 * 256);
         let x = exp2_q8()[(e & 0xFF) as usize];
         let x = if e >= 0 { x << (e >> 8).min(8) } else { x >> (-(e >> 8)).min(31) };
         let (i, f) = if x >= 31 << 8 { (31, 0) } else { ((x >> 8) as usize, x & 0xFF) };
+        // From the TXLOD index on there is no detail: a real board gives
+        // full weight at k = 15.5 and none at 16 for a table whose index is
+        // 16 (entries 16 and 15 both 31), and none at k >= 31 for TXLOD 62.
+        if i as u32 >= self.detail.last {
+            return 0;
+        }
         let tab = &self.detail.table;
         let t1 = if i < 31 { tab[i + 1] } else { 0 };
         let w = tab[i] * (256 - f) + t1 * f;
-        // 31 * 256 is 1.0: 2^28 / 7936, rounded.
-        (w * 33825) as i32
+        (w * DETAIL_SCALE as u32) as i32
     }
 
     /// The detail texture added to the magnified base sample `base` (12.16)
     /// at (s, t) (Q31): the detail image, bilinear and repeating, at the
-    /// base's level-0 coordinate scaled by 2^-L, out = base + F (2 detail -
-    /// 1) per component, clamped.
+    /// base's level-0 coordinate scaled by 2^-L, out = base + F (detail -
+    /// DETAIL_CENTER) per component, clamped (as a real board does it, not
+    /// the extension's 2 detail - 1).
     fn detail(&self, te: &Te1, base: [i32; 4], s: i64, t: i64, lambda: i32) -> [i32; 4] {
         use fixed::{mul, ONE};
         let d = &self.detail;
@@ -734,7 +754,7 @@ impl Sampler {
         let mut out = base;
         for k in 0..4 {
             let td = t00[k] * w00 + t10[k] * w10 + t01[k] * w01 + t11[k] * w11;
-            out[k] = fixed::clamp(base[k].wrapping_add(mul(f, 2 * td - ONE)));
+            out[k] = fixed::clamp(base[k].wrapping_add(mul(f, td - DETAIL_CENTER)));
         }
         out
     }
@@ -845,7 +865,17 @@ mod tests {
         regs[reg::TXLOD as usize] = 62 << 10;
         regs[reg::TXDETAIL as usize] = 16;
         let smp = te.sampler(&regs);
-        assert_eq!(smp.detail_weight(-3 * 256), fixed::ONE - 256);
+        // An entry of 31 is 31/32.
+        assert_eq!(smp.detail_weight(-3 * 256), fixed::ONE / 32 * 31);
+        // No detail from the TXLOD index on (k = 32 2^lambda): index 31
+        // here, and with TXLOD 32 (index 16) full weight at k = 15.5, none
+        // at 16.
+        assert_eq!(smp.detail_weight(-10), 0);
+        regs[reg::TXLOD as usize] = 32 << 10;
+        let cut = te.sampler(&regs);
+        assert_eq!(cut.detail_weight(-268), fixed::ONE / 32 * 31);
+        assert_eq!(cut.detail_weight(-256), 0);
+        regs[reg::TXLOD as usize] = 62 << 10;
         let bilinear = |img: &[u8], n: usize, u: f64, v: f64, c: usize| {
             let (fu, fv) = (u - 0.5, v - 0.5);
             let (a, b) = (fu - fu.floor(), fv - fv.floor());
@@ -863,12 +893,13 @@ mod tests {
             for c in 0..4 {
                 let tb = bilinear(&base, 8, x * 8.0, y * 8.0, c);
                 let td = bilinear(&det, 256, x * 64.0, y * 64.0, c);
-                let want = (tb + 2.0 * td - 1.0).clamp(0.0, 1.0) * 255.0;
+                // The board's combine (DETAIL_CENTER, DETAIL_SCALE).
+                let want = (tb + 31.0 / 32.0 * (td * 4095.0 / 4096.0 - 2185.0 / 4096.0)).clamp(0.0, 1.0) * 255.0;
                 worst = worst.max((fixed::to_byte(got[c]) as f64 - want).abs());
             }
         }
-        // 8-bit filter weights, and the detail term counts twice.
-        assert!(worst <= 3.0, "off by {worst}");
+        // 8-bit filter weights.
+        assert!(worst <= 2.0, "off by {worst}");
         // Detail off (and minification): the base alone.
         let plain = Sampler { detail: Detail::default(), ..smp };
         assert_eq!(smp.sample(&te, 1 << 29, 1 << 29, 64), plain.sample(&te, 1 << 29, 1 << 29, 64));

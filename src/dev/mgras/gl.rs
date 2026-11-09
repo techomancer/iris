@@ -1196,8 +1196,11 @@ impl Gl {
                 self.raster = [w.x, w.y, w.z];
                 self.raster_color = w.c;
                 self.raster_valid = (w.ok != 0 && inside) as u32;
+                // The GE keeps the raster vertex's eye-space z, not divided
+                // by w, and glGet answers it as the distance: -0.5 for a
+                // point 0.5 in front of the eye (a real High IMPACT, 6.5.22).
                 let e = math::xform(self.mv.get(), args_f32(d));
-                self.q.raster_dist = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+                self.q.raster_dist = e[2];
                 self.q.raster_color = w.c;
                 self.q.raster_tex = math::xform(self.tex.get(), self.texcoord);
             }
@@ -1662,8 +1665,11 @@ impl Gl {
         }
         self.begin_raster(sink);
         self.fill_mode(if self.poly_stipple != 0 { FILL_POLY_STIPPLE } else { 0 }, sink);
+        // A quad splits along its 1-3 diagonal (a real High IMPACT, smooth
+        // shaded GL_QUADS and GL_QUAD_STRIP); polygons fan from vertex 0.
+        let s = usize::from(n == 4 && matches!(self.prim, prim::QUADS | prim::QSTRIP));
         for k in 1..n - 1 {
-            self.triangle(&v[0], &v[k], &v[k + 1], flat, sink);
+            self.triangle(&v[s], &v[(s + k) % n], &v[(s + k + 1) % n], flat, sink);
         }
     }
 
@@ -2363,9 +2369,10 @@ impl Gl {
             GL_MAX => super::rss::BLEND_EQ_MAX,
             _ => super::rss::BLEND_EQ_ADD,
         };
+        let (sf, df) = impact_subtract_factors(eq, self.blend_src, self.blend_dst);
         sink.rss_write(
             re::BLENDFACTOR,
-            if blend { eq << super::rss::BLEND_EQ_SHIFT | 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 },
+            if blend { eq << super::rss::BLEND_EQ_SHIFT | 1 << 8 | df << 4 | sf } else { 0 },
             false,
         );
         let k = self.blend_color.map(|c| (c * 4095.0).round() as u32);
@@ -3242,6 +3249,41 @@ fn lerp_window(a: &Wv, b: &Wv, t: f32) -> Wv {
     }
     v.f[0] = l(a.f[0], b.f[0]);
     v
+}
+
+/// The factors a real High IMPACT (IRIX 6.5.22) blends with for the
+/// subtract equations, as PP1 codes (`blend_code`). Measured with blendtest
+/// -a, one cell a legal factor pair, 309 of 312 cells explained:
+/// - SUBTRACT drops the destination term when the source factor is an
+///   alpha or constant one (SRC_ALPHA, DST_ALPHA, CONSTANT_COLOR,
+///   CONSTANT_ALPHA, their ONE_MINUS forms, SRC_ALPHA_SATURATE) and the
+///   destination factor is ONE_MINUS of a different one of those (with
+///   SATURATE, also ONE_MINUS_SRC_COLOR).
+/// - REVERSE_SUBTRACT with ONE_MINUS_SRC_ALPHA, ONE_MINUS_DST_ALPHA,
+///   ONE_MINUS_CONSTANT_COLOR or ONE_MINUS_CONSTANT_ALPHA as the source
+///   factor uses the factor without the ONE_MINUS, and then drops the
+///   destination term under the same conflict (or for SRC_COLOR); with
+///   ONE_MINUS_DST_COLOR it drops the destination term for SRC_COLOR and
+///   the alpha and constant factors.
+/// The three cells left (REVERSE_SUBTRACT, an inverted source factor over
+/// SRC_COLOR) match no pair of factors.
+fn impact_subtract_factors(eq: u32, sf: u32, df: u32) -> (u32, u32) {
+    use super::rss::{BLEND_EQ_REVERSE_SUBTRACT, BLEND_EQ_SUBTRACT};
+    let alpha_or_const = |c: u32| matches!(c, 4..=7 | 10..=14);
+    let inverted = |c: u32| matches!(c, 5 | 7 | 12 | 14);
+    let base = |c: u32| match c {
+        3 | 5 | 7 | 9 | 12 | 14 => c - 1,
+        c => c,
+    };
+    match eq {
+        BLEND_EQ_SUBTRACT if alpha_or_const(sf) && ((inverted(df) && base(sf) != base(df)) || (sf == 10 && df == 3)) => (sf, 0),
+        BLEND_EQ_REVERSE_SUBTRACT if inverted(sf) => {
+            let sf = base(sf);
+            if (alpha_or_const(df) && base(df) != sf) || df == 2 { (sf, 0) } else { (sf, df) }
+        }
+        BLEND_EQ_REVERSE_SUBTRACT if sf == 9 && (df == 2 || alpha_or_const(df)) => (sf, 0),
+        _ => (sf, df),
+    }
 }
 
 /// A GL blend factor enum as the PP1 code (see `rss::blend_rgba`).

@@ -231,9 +231,11 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 |---|---|---|
 | [DESIGN.md](mgras/DESIGN.md) | design | MGRAS (IMPACT / GR4) design |
 | [ci-copypixels-unloaded-mask.md](mgras/ci-copypixels-unloaded-mask.md) | rule | Colour-index glCopyPixels runs a pipeline whose state is never loaded |
-| [detail-textures-follow-the-drivers-table.md](mgras/detail-textures-follow-the-drivers-table.md) | rule | IMPACT detail textures: one additive operation, F from the driver's 32-entry table at k = 32 2^LOD; run dettex with --impact |
+| [detail-textures-follow-the-drivers-table.md](mgras/detail-textures-follow-the-drivers-table.md) | rule | IMPACT detail textures, measured on a real board: base + w (detail - 0.53) / 32 from the driver's table at k = 32 2^LOD, nothing from the TXLOD index on; level -2 is broken on the board; run dettex with --impact |
+| [dma-past-the-mapped-window.md](mgras/dma-past-the-mapped-window.md) | open | A host DMA past the kernel's mapped page window wrote the IP28 exception vectors; it now stops there, the virtual-DMA TLB-miss refill is not modelled |
 | [dcb-device-numbers.md](mgras/dcb-device-numbers.md) | design | DCB device numbers: trust the kernel's dcbctrl writes, not header names |
 | [display-snapshot-before-retrace.md](mgras/display-snapshot-before-retrace.md) | rule | Take the IMPACT display frame before the retrace pulse, not after |
+| [subtract-blend-follows-the-real-board.md](mgras/subtract-blend-follows-the-real-board.md) | rule | IMPACT's SUBTRACT / REVERSE_SUBTRACT drop or un-invert factors for some alpha/constant pairs; the GE HLE copies the board (309 of 312 cells) |
 | [swap-waits-for-raster.md](mgras/swap-waits-for-raster.md) | rule | Report SCHEDULE_SWAP only once the raster engines have drawn the frame |
 | [engine-pipeline-performance.md](mgras/engine-pipeline-performance.md) | measure | The CPU -> HQ -> raster pipeline: what made it slow |
 | [eram-state-ideas.md](mgras/eram-state-ideas.md) | open | GE state and ERAM: ideas for later (not built) |
@@ -247,6 +249,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [replay-hashing-dominates-replay-time.md](mgras/replay-hashing-dominates-replay-time.md) | rule | MGRAS_REPLAY_HASHES_OUT/_IN hash pixel memory at every checkpoint: about 130 s of a 13 s sgiquake GPU replay; time replays without them |
 | [mid-session-replays-need-the-live-drbsize.md](mgras/mid-session-replays-need-the-live-drbsize.md) | rule | A recording started mid-session lacks DRBsize; replay it with MGRAS_REPLAY_INIT=16e=<live value> or buffers wrap and alias (and the GPU unit races) |
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
+| [real-high-impact.md](mgras/real-high-impact.md) | howto | The real High IMPACT (purple) and its emulated twin: access, share, screen saver, the cloned image's network, identity bytes, GE fresh-context words, what differs |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
 | [texture-readback-follows-libglcore.md](mgras/texture-readback-follows-libglcore.md) | rule | glGetTexImage of ALPHA, LUMINANCE, INTENSITY and RGB textures is libGLcore's, not the board's |
 | [window-origin-is-signed.md](mgras/window-origin-is-signed.md) | rule | The GL window origin's halves are signed |
