@@ -544,7 +544,7 @@ pub(super) mod tests {
                     m.mirror_sync();
                     // SAFETY: idle with `submit` held.
                     let rss = unsafe { &*m.rss.get() };
-                    let mut out: Vec<u8> = bytemuck::cast_slice(&rss.mem.words[..]).to_vec();
+                    let mut out: Vec<u8> = rss.mem.words.iter().flat_map(|w| w.to_le_bytes()).collect();
                     out.extend_from_slice(&rss.cid[..]);
                     std::fs::write(&f, out).unwrap_or_else(|e| panic!("{f}: {e}"));
                     eprintln!("{path}: dumped checkpoint {n} to {f}");
