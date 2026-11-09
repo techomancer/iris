@@ -100,6 +100,10 @@ jobs:
         restore-keys: ${{ runner.os }}-features-cargo-
     - name: Build
       run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
+    # Needs this build: lightning, and fat LTO from the release profile.
+    - name: Check the interpreter's hot paths
+      if: runner.os == 'Linux'
+      run: tools/hot-path-check.sh target/release/iris
     - name: Build opt-in REX3 dirty uploads
       run: |
         cargo build -p iris --features rex-dirty-upload
