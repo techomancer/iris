@@ -265,6 +265,9 @@ impl ReadHeader {
 /// as one colour (sixteen bytes) a texel before it is packed, so this bounds that vector. It is a separate cap
 /// from the byte one: a one-byte texel makes a 2048 by 1024 read only 2 MiB packed but a 32 MiB colour vector.
 pub const MAX_READ_TEXELS: u64 = 1 << 20;
+/// The most bytes a read-back may pack, for a read in a bracket (the bracket's buffer holds 8192 by 8192 bytes at
+/// most). The packed size includes the pack record's skips, which are the guest's.
+pub const MAX_READ_BYTES: u64 = super::pixels::MAX_PACK_BYTES;
 
 /// A texel in the model's layout from component values 0..=255 of a format: missing
 /// alpha is one and missing colour zero (alpha only), luminance is the colour.

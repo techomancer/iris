@@ -743,6 +743,38 @@ impl XState {
         Next::Nothing
     }
 
+    /// Whether a select-feed bracket is open.
+    pub fn bracket_open(&self) -> bool {
+        self.pixel.read_dma.is_some()
+    }
+
+    /// A texel read-back's bytes (token 0x052) for the open bracket: the packed image, `rows` rows of
+    /// `row` bytes. The client's descriptor names the image's padded length as one line with no stride
+    /// (the table), and the bracket's finish writes the bytes there from its first byte. A descriptor of
+    /// `rows` lines of `row` is taken too. Any other length refuses the bracket, counted, as an X read's
+    /// would be. False when no bracket is open.
+    pub fn feed_texels(&mut self, row: u32, rows: u32, mut data: Vec<u8>) -> bool {
+        let Some(mut dma) = self.pixel.read_dma.take() else { return false };
+        let header = [0, 0, row, rows, 1, 0, 0];
+        let d = dma.descriptor;
+        if dma.refused || dma.data.is_some() {
+            dma.refused = true;
+            dma.data = None;
+        } else if d[2] as usize == data.len() && d[3] == d[2] && d[4] == 0 && dma.buffer().is_some() {
+            dma.texels = true;
+            dma.data = Some(data);
+        } else if !dma.fits(&header) {
+            dma.refused = true;
+            dma.data = None;
+        } else {
+            data.resize(row as usize * rows as usize, 0);
+            dma.header = header;
+            dma.data = Some(data);
+        }
+        self.pixel.read_dma = Some(dma);
+        true
+    }
+
     /// Select-feed start (0x1f5): a bracket whose read will be written to a
     /// host buffer. `owned`: a context is current.
     pub fn feed_start(&mut self, args: &[u32], owned: bool) {

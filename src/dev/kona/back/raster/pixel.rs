@@ -246,6 +246,27 @@ impl<'a> Planes<'a> {
 }
 
 impl Planes<'_> {
+    /// Sample 0's depth at `index` as a fraction of `u32::MAX`, in a multisampled window (reads take one sample).
+    pub fn sample_depth(&self, ds: &DrawState, index: usize) -> Option<u32> {
+        let (ms, sa) = (ds.samples.as_ref()?, self.samples.as_ref()?);
+        let w = ms.depth.1 * 32 / ms.count as u32;
+        (!sa.depth.is_empty()).then(|| sample_get(&sa.depth, index, 0, w, w) << (32 - w.clamp(1, 32)))
+    }
+
+    /// Sample 0's stencil at `index`, in a multisampled window.
+    pub fn sample_stencil(&self, index: usize) -> Option<u32> {
+        let sa = self.samples.as_ref()?;
+        (!sa.stencil.is_empty()).then(|| sample_get(&sa.stencil, index, 0, 8, 8))
+    }
+
+    /// A stencil image's value into every sample of the pixel under the write mask, in a multisampled window.
+    pub fn set_stencil(&self, ds: &DrawState, index: usize, value: u8, mask: u8) {
+        let (Some(ms), Some(sa)) = (&ds.samples, &self.samples) else { return };
+        for k in 0..ms.count as usize {
+            let old = sample_get(&sa.stencil, index, k, 8, 8);
+            sample_set(&sa.stencil, index, k, 8, 8, (old & !mask as u32) | (value & mask) as u32);
+        }
+    }
 
     /// A clear of the samples of the pixel at `index`: colour under the colour mask, depth under the
     /// depth mask, stencil under its mask.
