@@ -29,6 +29,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - A rerun under the same label is kept (`<label>.2.json`, `.3.json`) instead of replacing the last result. `report` groups them into one column showing the median, `[min-max]` and the run count, and ratios use the medians.
 - `report` warns when the runs it compares differ in guest image, run length (quick or full), clock (timed or `ci_clock`), host CPU or emulator build features, names the cells on each side, and prints `n/c` instead of a ratio between cells that differ. Kernel rates count iterations of compiled guest code, so a rebuilt image read as an emulator regression. `--across-features` keeps ratios between feature sets, which `matrix` does since that is its point. `reference` refuses a `ci_clock` run, whose rates are constants.
 - A failed `run --iris` shows the emulator's exit status and the tail of its stderr as well as its stdout. A run killed for timing out keeps what the emulator printed before it hung.
+- `run --deterministic --iris` reads the emulator's build features first and refuses a binary without `ci_clock`, which would have produced a timed run saved as deterministic. Lightning builds are no longer passed `--jitv2-compile sync`, which they reject.
 
 ### R10000 family fixes, R12000 and R14000
 
