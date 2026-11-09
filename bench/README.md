@@ -479,7 +479,8 @@ program is missing.
 Whetstone 100k (`test/whetstone`) and `iris_bench` x20 (`test/ib`). Copy their
 binaries into the guest as the file's header says; a step whose binary is
 missing is skipped. `--steps` repeats, and with none given `iris-bench irix`
-runs `steps.toml` then `benchies.toml`.
+runs `steps.toml` then `benchies.toml`. A step's last line of output is printed
+under its time, so the program's own figure ("Dhrystones per Second: ...") shows.
 
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
