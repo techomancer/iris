@@ -26,7 +26,8 @@ use super::registers::reg;
 use super::trace::{Trace, TRACE_CPU};
 impl Board {
     pub fn write_dispatch(&mut self, addr: u64, value: u64, size: u32) {
-        let sequence = self.trace_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.trace_sequence;
+        self.trace_sequence = sequence.wrapping_add(1);
         crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: MMIO write seq {} offset {:#x} size {} value {:#x}", sequence, addr, size, value);
 
         if display_fifo_access(addr, size, true) {
@@ -235,11 +236,10 @@ impl Board {
 impl Board {
     /// A store to the board's state.
     pub fn mmio_write(&mut self, addr: u64, value: u64, size: u32) {
-        let fifo = self.fifo.clone();
-        let queued = command_store(addr, size) && fifo.queues() && fifo.push(&self.front, addr, value, size);
+        let queued = command_store(addr, size) && self.fifo.queues() && self.fifo.push(&self.front, addr, value, size);
         if queued {
             // With no board thread running the storing caller runs it.
-            if !fifo.running.load(std::sync::atomic::Ordering::SeqCst) && !fifo.held() {
+            if !self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) && !self.fifo.held() {
                 self.work_drain(addr);
             }
         } else if command_store(addr, size) {
