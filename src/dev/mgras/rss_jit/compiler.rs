@@ -1165,7 +1165,6 @@ impl<'a> E<'a> {
             [e.ld(I64, o), e.ld(I64, o + 8), e.ld(I64, o + 16)]
         };
         let tplanes: Vec<[Value; 3]> = if k.tex.is_some() { (0..3).map(|c| tp64(self, c)).collect() } else { Vec::new() };
-        let fogp = k.fog.then(|| self.iplane(off!(tri.fogp)));
         let ltor = self.ld(I32, off!(tri.ltor));
         let ltor = self.b.ins().icmp_imm_s(IntCC::NotEqual, ltor, 0);
         let (j0, j1) = (self.ld(I32, off!(tri.j0)), self.ld(I32, off!(tri.j1)));
@@ -1186,10 +1185,10 @@ impl<'a> E<'a> {
             let sy = e.b.ins().imul(e.ysign, j);
             let fy = e.b.ins().iadd(e.oy, sy);
             let span = e.row(fy, next_row);
-            // The row's share of the colour, fog and depth planes, once a
-            // row: `p0 + p2 (yref - j)` (colours 12.16, depth z.12).
+            // The row's share of the colour and depth planes, once a row:
+            // `p0 + p2 (yref - j)` (colours 12.16, depth z.12).
             let dj = e.b.ins().isub(yref_i, j);
-            let mut terms: Vec<Value> = cplanes.iter().chain(fogp.iter()).map(|p| {
+            let mut terms: Vec<Value> = cplanes.iter().map(|p| {
                 let m = e.b.ins().imul(p[2], dj);
                 e.b.ins().iadd(p[0], m)
             }).collect();
@@ -1200,7 +1199,7 @@ impl<'a> E<'a> {
                 terms.push(e.b.ins().iadd(p[0], m));
             }
             let terms = e.pin(&terms);
-            let n32 = 4 + fogp.is_some() as usize;
+            let n32 = 4;
             let zterm = terms[n32];
             let trows: Vec<Value> = terms[n32 + 1..].to_vec();
             let j64 = e.b.ins().sextend(I64, j);
@@ -1251,12 +1250,18 @@ impl<'a> E<'a> {
                     e.textured(v, d, rgba);
                 }
                 let mut c: [Value; 4] = rgba.map(|v| e.get(v));
-                if let Some(fp) = fogp {
-                    let f = fixed_at(e, &fp, terms[4]);
-                    c = e.fogged(c, f);
-                }
                 let zm = e.b.ins().imul(zp[1], di64);
                 let z = e.b.ins().iadd(zterm, zm);
+                if k.fog {
+                    // `rss::fog_pair_offset`.
+                    let odd = e.b.ins().band_imm_s(i, 1);
+                    let two = e.i32c(2);
+                    let off = e.b.ins().isub(two, odd);
+                    let off = e.b.ins().sextend(I64, off);
+                    let fm = e.b.ins().imul(zp[1], off);
+                    let zf = e.b.ins().iadd(z, fm);
+                    c = e.fogged(c, zf);
+                }
                 let fx = e.b.ins().iadd(e.ox, i);
                 e.fragment(&span, fx, c, z, cont);
             });
@@ -1276,7 +1281,6 @@ impl<'a> E<'a> {
         let (zbase, zstep) = (g!(I64, zbase), g!(I64, zstep));
         let tbase: Vec<Value> = (0..3).map(|c| self.ld(I64, off!(gll.tbase) + 8 * c)).collect();
         let tstep: Vec<Value> = (0..3).map(|c| self.ld(I64, off!(gll.tstep) + 8 * c)).collect();
-        let (fbase, fstep) = (g!(I32, fbase), g!(I32, fstep));
         let (qk, qs) = (g!(I64, qk), g!(I64, qs));
         let (width, dir, p0, p1) = (g!(I32, width), g!(I32, dir), g!(I32, p0), g!(I32, p1));
         let xmajor = g!(I32, xmajor);
@@ -1311,7 +1315,7 @@ impl<'a> E<'a> {
         let v = self.b.ins().iadd(qk, m);
         let v = self.b.ins().sshr_imm_s(v, 32);
         let q0 = self.sat_i32(v);
-        // Colours and fog `base + step k`, k pixels along (12.16).
+        // Colours `base + step k`, k pixels along (12.16).
         let kk = self.get(kv);
         let rgba: Vec<Variable> = (0..4)
             .map(|c| {
@@ -1333,14 +1337,21 @@ impl<'a> E<'a> {
             self.textured(v, d, rgba);
         }
         let mut c: [Value; 4] = rgba.map(|v| self.get(v));
-        if k.fog {
-            let m = self.b.ins().imul(fstep, kk);
-            let f = self.b.ins().iadd(fbase, m);
-            c = self.fogged(c, f);
-        }
         let k64 = self.b.ins().sextend(I64, kk);
         let zm = self.b.ins().imul(zstep, k64);
         let z = self.b.ins().iadd(zbase, zm);
+        if k.fog {
+            // `rss::fog_pair_offset` of the major coordinate, along the line.
+            let odd = self.b.ins().band_imm_s(p, 1);
+            let two = self.i32c(2);
+            let off = self.b.ins().isub(two, odd);
+            let off = self.b.ins().imul(off, dir);
+            let kf = self.b.ins().iadd(kk, off);
+            let kf = self.b.ins().sextend(I64, kf);
+            let fm = self.b.ins().imul(zstep, kf);
+            let zf = self.b.ins().iadd(zbase, fm);
+            c = self.fogged(c, zf);
+        }
         let qend = self.b.ins().iadd(q0, width);
         self.for_range(q0, qend, |e, q, cont| {
             let wx = e.b.ins().select(xmajor, p, q);
@@ -1391,12 +1402,64 @@ impl<'a> E<'a> {
         self.b.ins().isub(one, v)
     }
 
-    /// `Rss::fogged`.
-    fn fogged(&mut self, rgba: [Value; 4], f: Value) -> [Value; 4] {
-        let zero = self.i32c(0);
+    /// `Rss::fogged` at fog depth `z` (z.12): the factor from the fog
+    /// table (`rss::fog_factor`).
+    fn fogged(&mut self, rgba: [Value; 4], z: Value) -> [Value; 4] {
         let one = self.i32c(fixed::ONE as i64);
-        let f = self.b.ins().smax(f, zero);
-        let f = self.b.ins().smin(f, one);
+        // `fixed::zbuf`.
+        let zr = self.b.ins().iadd_imm_s(z, 1 << (fixed::Z_FRAC - 1));
+        let zr = self.b.ins().sshr_imm_s(zr, fixed::Z_FRAC as i64);
+        let zero64 = self.i64c(0);
+        let zr = self.b.ins().smax(zr, zero64);
+        let top = self.i64c(0xFF_FFFF);
+        let zr = self.b.ins().smin(zr, top);
+        let d = self.b.ins().ireduce(I32, zr);
+        let k = self.ld(I32, off!(gl.fog_k));
+        let bb = self.ld(I32, off!(gl.fog_b));
+        let d8 = self.b.ins().ushr_imm_s(d, 8);
+        let k8 = self.b.ins().ushr_imm_s(k, 8);
+        let t = self.b.ins().imul(d8, k8);
+        let t = self.b.ins().ushr_imm_s(t, 8);
+        let t = self.b.ins().iadd(t, bb);
+        let i = self.b.ins().ushr_imm_s(t, 16);
+        let c255 = self.i32c(255);
+        let past = self.b.ins().icmp(IntCC::UnsignedGreaterThan, i, c255);
+        // Past the last step: the last point, as a step of fraction 0 from it.
+        let c256 = self.i32c(256);
+        let i = self.b.ins().select(past, c256, i);
+        let f15 = self.b.ins().band_imm_s(t, 0xFFFF);
+        let f15 = self.b.ins().ushr_imm_s(f15, 1);
+        let zero = self.i32c(0);
+        let f15 = self.b.ins().select(past, zero, f15);
+        let pt = |e: &mut Self, n: Value| -> Value {
+            let w = e.b.ins().ushr_imm_s(n, 1);
+            let w = e.b.ins().ishl_imm_s(w, 2);
+            let w = e.b.ins().uextend(I64, w);
+            let a = e.b.ins().iadd(e.ctx, w);
+            let word = e.b.ins().load(I32, e.mr, a, off!(gl.fog_lut));
+            let sh = e.b.ins().band_imm_s(n, 1);
+            let sh = e.b.ins().ishl_imm_s(sh, 4);
+            let v = e.b.ins().ushr(word, sh);
+            e.b.ins().band_imm_s(v, 0xFFFF)
+        };
+        let p0 = pt(self, i);
+        let i1 = self.b.ins().iadd_imm_s(i, 1);
+        let c256b = self.i32c(256);
+        let i1 = self.b.ins().umin(i1, c256b);
+        let p1 = pt(self, i1);
+        let c32k = self.i32c(32768);
+        let w0 = self.b.ins().isub(c32k, f15);
+        let a = self.b.ins().imul(p0, w0);
+        let b = self.b.ins().imul(p1, f15);
+        let v = self.b.ins().iadd(a, b);
+        let v = self.b.ins().ushr_imm_s(v, 15);
+        let f8 = self.b.ins().ushr_imm_s(v, 8);
+        let f8 = self.b.ins().umin(f8, c255);
+        let f = self.b.ins().imul_imm_s(f8, 0x10_1010);
+        let full = self.b.ins().iadd_imm_s(f8, 1);
+        let full = self.b.ins().ushr_imm_s(full, 8);
+        let full = self.b.ins().ishl_imm_s(full, 4);
+        let f = self.b.ins().iadd(f, full);
         let nf = self.b.ins().isub(one, f);
         let mut out = rgba;
         for (k, o) in out.iter_mut().enumerate().take(3) {

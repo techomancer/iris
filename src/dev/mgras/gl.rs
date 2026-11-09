@@ -50,6 +50,25 @@ use crate::dev::gl::light::{Lighting, MAX_LIGHTS};
 use crate::dev::gl::math::{self, Mat4, Stack};
 use crate::dev::gl::vertex::{self, Clip, Viewport, MAX_POLY};
 
+/// An antialiased width-1 line's coverage against the pixel centre's
+/// distance from the line across its major axis, in 64ths of a pixel (0 to
+/// 64), out of 255: a real High IMPACT's, measured (test/gltest/linetest
+/// profile, white on black with GL_SRC_ALPHA, GL_ONE). It peaks at 0.67,
+/// and two pixels either side of a line sum to about 0.8.
+const AA_LINE_PROFILE: [u8; 65] = [
+    171, 169, 168, 166, 164, 162, 160, 158, 156, 154, 152, 150, 148, 146, 144, 142, 140, 138, 135, 133, 131, 129,
+    127, 125, 123, 120, 118, 116, 113, 111, 109, 107, 104, 102, 100, 97, 95, 92, 89, 87, 84, 81, 78, 76, 73, 70,
+    68, 65, 61, 59, 55, 53, 49, 46, 42, 39, 35, 31, 27, 23, 18, 13, 7, 0, 0,
+];
+
+/// `AA_LINE_PROFILE` for y-major lines, which the board covers more
+/// strongly and nearly linearly (linetest vprofile).
+const AA_LINE_PROFILE_Y: [u8; 65] = [
+    201, 199, 195, 193, 191, 187, 185, 183, 179, 177, 175, 171, 169, 167, 163, 161, 158, 155, 153, 150, 147, 144,
+    142, 139, 135, 133, 130, 127, 124, 121, 119, 115, 112, 110, 107, 103, 99, 96, 94, 91, 87, 84, 81, 78, 75, 71,
+    67, 64, 61, 58, 54, 51, 47, 43, 39, 35, 31, 27, 23, 19, 15, 10, 4, 0, 0,
+];
+
 /// IMPACT vertices: texture coordinates (s, t, r, q) and a fog factor, for
 /// the TE and per-fragment fog.
 type Wv = vertex::Wv<4, 1>;
@@ -462,6 +481,11 @@ pub struct Gl {
     fog_start: f32,
     fog_end: f32,
     fog_density: f32,
+    /// Per-pixel fog (RGBA): what the fog table the RSS holds was built
+    /// from (fog mode and parameters, the projection's depth terms, the
+    /// depth range), and whether this batch has sent it (`fog_state`).
+    fog_key: [f32; 9],
+    fog_lut_loaded: u32,
     /// IRIS GL lmcolor(LMC_COLOR): on, and whether a colour has come after
     /// the last normal (what follows is then drawn unlit; IRIS GL
     /// Programming Guide 9.6.4, as GR2's GE7 HLE models it).
@@ -614,6 +638,9 @@ pub struct Gl {
     point_size: f32,
     /// GL_POINT_SMOOTH (POINT_SMOOTH).
     point_smooth: u32,
+    /// The line stipple's position along antialiased lines, which the GE
+    /// draws pixel by pixel (`smooth_line_window`).
+    aa_stipple_pos: u32,
     /// A texture read transfer is armed (READ_TEXTURE .. RESTORE_RSS).
     tex_reading: u32,
     /// glRenderMode(GL_SELECT): the name stack and the hit records.
@@ -692,6 +719,8 @@ impl Gl {
         self.line_pattern = 0xFFFF;
         self.prim = prim::NONE;
         self.matrix_mode = 0x1700;
+        self.pix.fresh();
+        self.tl_elem = self.pix.read(super::pixpipe::ELEMENT_TYPE);
     }
 
     fn stack(&mut self) -> &mut dyn MatrixStack {
@@ -729,7 +758,8 @@ impl Gl {
         }
     }
 
-    /// The fog parameters in the shared core's form.
+    /// The fog parameters in the shared core's form (colour-index fog per
+    /// vertex; the RGBA fog table, `fog_state`).
     fn update_fog(&mut self) {
         if self.lt.fog_mode == 0 {
             let d = self.fog_end - self.fog_start;
@@ -737,6 +767,7 @@ impl Gl {
         } else {
             self.lt.fog_a = self.fog_density;
         }
+        self.fog_lut_loaded = 0;
     }
 
     /// A light parameter token: light index, then values.
@@ -1381,19 +1412,13 @@ impl Gl {
             }
             (c, cb) = self.lt.light_vertex(e, self.normal, self.color);
         }
-        // With texturing, fog comes after the texture environment: the
-        // fog factor goes with the vertex instead (`fog_after_texture`).
-        let mut f = 1.0;
-        if self.lt.fog_on != 0 {
-            if self.fog_after_texture() {
-                let z = if e[3] != 0.0 { (e[2] / e[3]).abs() } else { e[2].abs() };
-                f = self.lt.fog_factor(z);
-            } else {
-                c = self.lt.fog_color(e, c);
-                cb = self.lt.fog_color(e, cb);
-            }
+        // RGBA fog is per pixel, from the window depth (`fog_state`);
+        // colour-index fog per vertex.
+        if self.lt.fog_on != 0 && !self.fog_per_pixel() {
+            c = self.lt.fog_color(e, c);
+            cb = self.lt.fog_color(e, cb);
         }
-        let mut w = Wv { c, cb, h, e, f: [f], ..Default::default() };
+        let mut w = Wv { c, cb, h, e, ..Default::default() };
         if self.tex_on != 0 {
             let tc = self.texgen(v, e);
             w.t = math::xform(self.tex.get(), tc);
@@ -1727,19 +1752,103 @@ impl Gl {
     /// draw. `restart` restarts the stipple pattern (each GL_LINES segment,
     /// the first segment of a strip or loop).
     fn line(&mut self, a: Wv, b: Wv, restart: bool, sink: &mut dyn Hq3Sink) {
+        // Flat lines take the segment's second vertex colour: before
+        // clipping, which would interpolate it (piglit line-flat-clip-color).
+        let mut a = a;
+        if self.smooth == 0 {
+            (a.c, a.cb) = (b.c, b.cb);
+        }
         let Some((a, b)) = self.clip.clip_line(a, b) else { return };
-        let (mut a, b) = (self.vp.project(a, [0.0, 0.0], 256.0), self.vp.project(b, [0.0, 0.0], 256.0));
+        let (a, b) = (self.vp.project(a, [0.0, 0.0], 256.0), self.vp.project(b, [0.0, 0.0], 256.0));
         if a.ok == 0 || b.ok == 0 {
             return;
         }
         if self.select_hit(&[a, b]) {
             return;
         }
-        // Flat lines take the segment's second vertex colour.
-        if self.smooth == 0 {
-            a.c = b.c;
+        // GL_LINE_SMOOTH antialiases only width-1 lines on the board; wider
+        // ones are the aliased line of the rounded width.
+        if self.q.line_smooth != 0 && self.ci == 0 && self.line_width.round() <= 1.0 {
+            self.smooth_line_window(a, b, restart, sink);
+            return;
         }
         self.line_window(a, b, restart, sink);
+    }
+
+    /// An antialiased width-1 line (GL_LINE_SMOOTH), as a real High IMPACT
+    /// draws it (test/gltest/linetest profile, vprofile, slopes, vslopes
+    /// and its smooth case; `clanker/mgras/gl-lines-follow-diamond-exit.md`):
+    /// every pixel whose centre lies within half a pixel past either end
+    /// along the major axis, and less than a pixel from the line across it,
+    /// with alpha times the coverage `AA_LINE_PROFILE` (x-major) or
+    /// `AA_LINE_PROFILE_Y` (y-major) at |minor distance| x sqrt(1 +
+    /// slope^2) x the end ramps clamp(u + 1/2, 0, 1) (u: how far the
+    /// centre lies inside the line from that end). The GE sends each pixel
+    /// as a one-pixel line, like `smooth_point_window`.
+    fn smooth_line_window(&mut self, a: Wv, b: Wv, restart: bool, sink: &mut dyn Hq3Sink) {
+        let xmajor = (b.x - a.x).abs() >= (b.y - a.y).abs();
+        let (a0, a1, b0, b1) = if xmajor { (a.x, b.x, a.y, b.y) } else { (a.y, b.y, a.x, b.x) };
+        if a0 == a1 {
+            return;
+        }
+        let dir = if a1 > a0 { 1.0f32 } else { -1.0 };
+        let slope = (b1 - b0) / (a1 - a0);
+        // Brighter by the line's length per major step; y-major lines a
+        // little less near 45 degrees (measured: 0.92 at slope 7/8).
+        let mut scale = (1.0 + slope * slope).sqrt();
+        if !xmajor {
+            scale *= 1.0 - 0.1 * slope * slope;
+        }
+        let profile: &[u8; 65] = if xmajor { &AA_LINE_PROFILE } else { &AA_LINE_PROFILE_Y };
+        if restart {
+            self.aa_stipple_pos = 0;
+        }
+        let (lo, hi) = (a0.min(a1), a0.max(a1));
+        let (p_first, p_last) = ((lo - 1.0).floor() as i32, (hi + 1.0).ceil() as i32);
+        let ps: Vec<i32> = if dir > 0.0 { (p_first..=p_last).collect() } else { (p_first..=p_last).rev().collect() };
+        let stipple = std::mem::replace(&mut self.line_stipple, 0);
+        for p in ps {
+            let c = p as f32 + 0.5;
+            let (us, ue) = ((c - a0) * dir, (a1 - c) * dir);
+            let ends = (us + 0.5).clamp(0.0, 1.0) * (ue + 0.5).clamp(0.0, 1.0);
+            if ends <= 0.0 {
+                continue;
+            }
+            if stipple != 0 {
+                let bit = (self.aa_stipple_pos / (self.line_repeat + 1)) % 16;
+                self.aa_stipple_pos = self.aa_stipple_pos.wrapping_add(1);
+                // LINE_STIPPLE's pattern arrives bit-reversed: first bit in 15.
+                if (self.line_pattern >> (15 - bit)) & 1 == 0 {
+                    continue;
+                }
+            }
+            let t = ((c - a0) / (a1 - a0)).clamp(0.0, 1.0);
+            let bm = b0 + slope * (c - a0);
+            for q in (bm - 1.5).floor() as i32..=(bm + 1.5).floor() as i32 {
+                let d64 = ((q as f32 + 0.5) - bm).abs() * 64.0;
+                if d64 >= 64.0 {
+                    continue;
+                }
+                let i = d64 as usize;
+                let fr = d64 - i as f32;
+                let prof = profile[i] as f32 * (1.0 - fr) + profile[i + 1] as f32 * fr;
+                let cov = (prof / 255.0 * scale * ends).min(1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let mut v = lerp_window(&a, &b, t);
+                v.c[3] *= cov;
+                v.cb[3] *= cov;
+                let (px, py) = if xmajor { (p, q) } else { (q, p) };
+                let (mut l, mut r) = (v, v);
+                l.x = px as f32;
+                r.x = px as f32 + 1.0;
+                l.y = py as f32 + 0.5;
+                r.y = l.y;
+                self.line_window(l, r, true, sink);
+            }
+        }
+        self.line_stipple = stipple;
     }
 
     /// A window-space line: scissor, then the RE4 GL line registers.
@@ -1802,7 +1911,7 @@ impl Gl {
                 put64(sink, dr, (qb[k] - qa[k]) / len as f64 * te1::ITER_ONE);
             }
         }
-        self.fog_plane(a.f[0] as f64, (b.f[0] as f64 - a.f[0] as f64) / len as f64, 0.0, sink);
+        self.fog_state(sink);
         sink.rss_write(re::IR, IR_GL_LINE, true);
     }
 
@@ -2285,10 +2394,13 @@ impl Gl {
         }
         let size = self.point_size.round().max(1.0);
         let (mut a, mut b) = (v, v);
+        // From the left edge of the first pixel to the right edge of the
+        // last: the line's diamond exits cover exactly those
+        // (`Rss::gl_line_setup`).
         if size <= 1.0 {
             let x = v.x.floor();
-            a.x = x + 0.25;
-            b.x = x + 0.75;
+            a.x = x;
+            b.x = x + 1.0;
             self.line_window(a, b, true, sink);
             return;
         }
@@ -2299,8 +2411,8 @@ impl Gl {
         let even = size as i32 % 2 == 0;
         let (cx, cy) = if even { ((v.x + 0.5).floor(), (v.y + 0.5).floor()) } else { (v.x.floor() + 0.5, v.y.floor() + 0.5) };
         let left = cx - size / 2.0;
-        a.x = left + 0.25;
-        b.x = left + size - 0.25;
+        a.x = left;
+        b.x = left + size;
         a.y = cy;
         b.y = cy;
         let width = std::mem::replace(&mut self.line_width, size);
@@ -2308,28 +2420,42 @@ impl Gl {
         self.line_width = width;
     }
 
-    /// An antialiased point (GL_POINT_SMOOTH): a disc of the point size's
-    /// diameter (not rounded) centred on the point; each pixel it touches
-    /// is drawn with its coverage (4 x 4 samples) multiplying alpha, which
-    /// the application's blending turns into soft edges (OpenGL 1.1 3.3.2).
-    /// Colour index has no alpha: a pixel at least half covered is drawn.
-    /// How the GE11 computes coverage is not known.
+    /// An antialiased point (GL_POINT_SMOOTH), as a real High IMPACT draws
+    /// it (test/gltest/linetest points: sizes 1 to 6.5 at eighths of a
+    /// pixel). Size 1 is a one-pixel antialiased line from the point to
+    /// one pixel right of it (`smooth_line_window`). Larger points are discs
+    /// of the point size's diameter, each pixel's alpha times S(r - d), d
+    /// its centre's distance from the point: the integral of a tent filter
+    /// 0.9 pixels either side of the disc's edge (S(0) = 1/2). The pixels
+    /// tried run floor(c) - ceil(r) to floor(c) + ceil(r) on each axis,
+    /// which is what lights the far side's last pixel and not the near
+    /// side's. Colour index has no alpha: a pixel at least half covered is
+    /// drawn.
     fn smooth_point_window(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {
-        let r = self.point_size.max(1.0) / 2.0;
-        let (x0, x1) = ((v.x - r).floor() as i32, (v.x + r).ceil() as i32);
-        let (y0, y1) = ((v.y - r).floor() as i32, (v.y + r).ceil() as i32);
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let mut n = 0;
-                for k in 0..16 {
-                    let sx = px as f32 + ((k % 4) as f32 + 0.5) / 4.0 - v.x;
-                    let sy = py as f32 + ((k / 4) as f32 + 0.5) / 4.0 - v.y;
-                    n += (sx * sx + sy * sy <= r * r) as u32;
-                }
-                if n == 0 || (self.ci != 0 && n < 8) {
+        let size = self.point_size.max(1.0);
+        if size <= 1.0 && self.ci == 0 {
+            let mut b = v;
+            b.x += 1.0;
+            let stipple = std::mem::replace(&mut self.line_stipple, 0);
+            self.smooth_line_window(v, b, true, sink);
+            self.line_stipple = stipple;
+            return;
+        }
+        let r = size / 2.0;
+        const A: f32 = 0.9;
+        let s = |u: f32| {
+            let u = u.clamp(-A, A);
+            0.5 + u / A - u * u.abs() / (2.0 * A * A)
+        };
+        let box_ = |c: f32| (c.floor() as i32 - r.ceil() as i32, c.floor() as i32 + r.ceil() as i32);
+        let ((x0, x1), (y0, y1)) = (box_(v.x), box_(v.y));
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let d = ((px as f32 + 0.5 - v.x).powi(2) + (py as f32 + 0.5 - v.y).powi(2)).sqrt();
+                let cov = s(r - d);
+                if cov <= 0.0 || (self.ci != 0 && cov < 0.5) {
                     continue;
                 }
-                let cov = n as f32 / 16.0;
                 let (mut a, mut b) = (v, v);
                 for w in [&mut a, &mut b] {
                     w.y = py as f32 + 0.5;
@@ -2338,8 +2464,8 @@ impl Gl {
                         w.cb[3] *= cov;
                     }
                 }
-                a.x = px as f32 + 0.25;
-                b.x = px as f32 + 0.75;
+                a.x = px as f32;
+                b.x = px as f32 + 1.0;
                 self.line_window(a, b, true, sink);
             }
         }
@@ -2498,6 +2624,7 @@ impl Gl {
             sink.rss_write(re::DRBPOINTERS, self.draw_pointers(), false);
         }
         self.fill_loaded = 0;
+        self.fog_lut_loaded = 0;
         sink.rss_write(re::FILLMODE, 0, false);
         self.load_fragment_state(sink);
         self.load_te(sink);
@@ -2781,7 +2908,8 @@ impl Gl {
             sink.rss_write(re::DRE + 2 * k as u32, fixc(dre), false);
             sink.rss_write(re::DRE + 2 * k as u32 + 1, fixc(drx), false);
         }
-        if self.depth_test != 0 {
+        // Fog is looked up from the window depth: its plane too.
+        if self.depth_test != 0 || self.fog_per_pixel() {
             // Z: the same plane setup, 64-bit, value * 0x1000.
             let (a, b, c) = (aw.z as f64, bw.z as f64, cw.z as f64);
             let (major_x, major_y) = (major_x as f64, major_y as f64);
@@ -2800,21 +2928,7 @@ impl Gl {
                 sink.rss_write(re::Z + 2 * k as u32 + 1, f as u32, false);
             }
         }
-        if self.fog_after_texture() {
-            let (a, b, c) = (aw.f[0] as f64, bw.f[0] as f64, cw.f[0] as f64);
-            let mid = c + perc as f64 * (a - c);
-            let dx = if span_x != 0.0 { (b - mid) / span_x as f64 } else { 0.0 };
-            let ddown = (a - c - dx * major_x as f64) / major_y as f64;
-            let start = c + ddown * dy as f64 + dx * dx_x as f64;
-            let mut de = ddown + n1 as f64 * dx;
-            let dx_out = if ltor { dx } else { -dx };
-            if ltor ^ (dxdy0 >= 0.0) {
-                de -= dx_out;
-            }
-            self.fog_plane(start, dx_out, de, sink);
-        } else {
-            self.fog_plane(1.0, 0.0, 0.0, sink);
-        }
+        self.fog_state(sink);
         if self.texturing() {
             // S/W, T/W, Q/W: perspective-correct texture coordinates are
             // linear in window space divided by clip w. Each gets the same
@@ -2854,35 +2968,90 @@ impl Gl {
         self.tex_on != 0 && self.texmode1() & te1::TEXMODE1_ENABLE != 0
     }
 
-    /// Fog is applied per fragment, after the texture environment (OpenGL's
-    /// order), rather than to vertex colours.
-    fn fog_after_texture(&self) -> bool {
-        self.lt.fog_on != 0 && self.texturing()
+    /// RGBA fog is applied per fragment, after the texture environment
+    /// (OpenGL's order). Colour-index fog stays per vertex.
+    fn fog_per_pixel(&self) -> bool {
+        self.lt.fog_on != 0 && self.ci == 0
     }
 
     /// The per-fragment fog of the next primitive (model-private registers,
-    /// `rss::reg::FOG_*`): the fog colour, the fog factor's plane (start,
-    /// step along the span, step down the edge; along a line, its step per
-    /// pixel), or off.
-    fn fog_plane(&mut self, start: f64, dx: f64, de: f64, sink: &mut dyn Hq3Sink) {
+    /// `rss::reg::FOG_*`): the fog colour, and once a batch or when it
+    /// changes, the fog table; or off.
+    ///
+    /// A real High IMPACT fogs from the window depth through a table built
+    /// from the projection (perspective fog comes out exact), measured with
+    /// test/gltest/fogtest (`clanker/mgras/fog-per-pixel-through-a-table.md`):
+    /// the depth indexes the table with a bias of one step, d (N - 1) / N +
+    /// 1 / N, over N = 32 interpolated steps for EXP and EXP2 and 512 for
+    /// linear fog. The table here has 256 interpolated steps over that
+    /// biased depth: EXP's 32 chords exactly (every eighth point), linear
+    /// fog's curve under perspective closely enough.
+    fn fog_state(&mut self, sink: &mut dyn Hq3Sink) {
         use super::rss::reg as rr;
-        if !self.fog_after_texture() {
+        if !self.fog_per_pixel() {
             sink.rss_write(rr::FOG_ON, 0, false);
             return;
+        }
+        let p = self.proj.get();
+        let key = [
+            self.lt.fog_mode as f32, self.lt.fog_a, self.lt.fog_b, p[10], p[14], p[11], p[15],
+            self.depth_range[0], self.depth_range[1],
+        ];
+        if self.fog_lut_loaded == 0 || key != self.fog_key {
+            self.fog_lut_loaded = 1;
+            self.fog_key = key;
+            let (words, k, b) = self.fog_table();
+            for (n, &w) in words.iter().enumerate() {
+                sink.rss_write(rr::FOG_LUT + n as u32, w, false);
+            }
+            sink.rss_write(rr::FOG_IDX_K, k, false);
+            sink.rss_write(rr::FOG_IDX_B, b, false);
         }
         let c = self.lt.fog_color.map(|v| (v.clamp(0.0, 1.0) * 4095.0).round() as u32);
         sink.rss_write(rr::FOG_RG, c[1] << 12 | c[0], false);
         sink.rss_write(rr::FOG_B, c[2], false);
-        put64(sink, rr::FOG_F, start * te1::ITER_ONE);
-        put64(sink, rr::FOG_F + 2, dx * te1::ITER_ONE);
-        put64(sink, rr::FOG_F + 4, de * te1::ITER_ONE);
         sink.rss_write(rr::FOG_ON, 1, false);
+    }
+
+    /// The fog table (`rss::fog_factor`): 257 factors at biased depths
+    /// 0, 1/256 .. 1 (16-bit, 65536 = 1, two to a word, the even point
+    /// low), and the index's scale and offset (t = d (N - 1) / N + 1 / N
+    /// in 8.16 table steps: K = 2^24 (N - 1) / N, B = 2^24 / N).
+    fn fog_table(&self) -> ([u32; super::rss::FOG_LUT_WORDS], u32, u32) {
+        let n: u32 = if self.lt.fog_mode == 0 { 512 } else { 32 };
+        let p = self.proj.get();
+        let [dn, df] = self.depth_range;
+        // Eye distance at window depth d (GL fog takes |eye z|).
+        let eye = |d: f64| {
+            let zn = if df != dn { 2.0 * (d - dn as f64) / (df - dn) as f64 - 1.0 } else { 0.0 };
+            let (p22, p23, p32, p33) = (p[10] as f64, p[14] as f64, p[11] as f64, p[15] as f64);
+            let den = zn * p32 - p22;
+            (if den != 0.0 { (p23 - zn * p33) / den } else { 0.0 }).abs()
+        };
+        let fog = |d: f64| self.lt.fog_factor(eye(d) as f32) as f64;
+        let mut words = [0u32; super::rss::FOG_LUT_WORDS];
+        for m in 0..=256usize {
+            let d = m as f64 / 256.0;
+            let v = if n == 32 {
+                // The board's 32 steps, linear between their points.
+                let t = d * 32.0;
+                let j = (t as usize).min(31);
+                let fr = t - j as f64;
+                fog(j as f64 / 32.0) * (1.0 - fr) + fog((j + 1) as f64 / 32.0) * fr
+            } else {
+                fog(d)
+            };
+            let q = (v * 65536.0).round().clamp(0.0, 65535.0) as u32;
+            words[m / 2] |= q << (16 * (m % 2));
+        }
+        (words, (1u32 << 24) / n * (n - 1), (1u32 << 24) / n)
     }
 
     /// A GE pixel state block (PIXEL_STATE / INIT_PIXEL_STATE_ERAM, or
     /// such a token's payload sent as pixel data): [?, ?, bytes, address,
     /// 0, 0, count, values, count, values again].
     pub fn pixel_state_block(&mut self, d: &[u32]) {
+        self.ensure_init();
         if d.len() < 7 {
             return;
         }

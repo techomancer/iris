@@ -79,7 +79,14 @@ Running both on the CPU and the GPU raster unit and comparing is how the GPU
 unit is checked against the reference end to end.
 The same suite on a real board, from the same binaries, against a guest
 emulating that board is how the model is checked against hardware; the
-board's quirks then show up as differences instead of as failures.
+board's quirks then show up as differences instead of as failures. Cases
+that the GL HLE can replay without a guest become unit tests against the
+board's own read-backs, captured on a real High IMPACT and kept in
+`src/dev/mgras/testdata/real_high_impact_*.txt`: `real_board_lines` draws every
+case of `linesweep.sh` and compares it pixel for pixel,
+`real_board_smooth_lines_and_points` the antialiased lines and points of
+`linetest`, and `real_board_fog` and `real_board_fogtest` glprim's fog scenes
+and `fogtest`'s fourteen fog cases (all in `src/dev/mgras/mgras_tests.rs`).
 
 ```sh
 mkdir -p shared/gltest && cp test/gltest/* shared/gltest/       # piglit: shared/piglit (clanker/testing/piglit-on-irix.md)

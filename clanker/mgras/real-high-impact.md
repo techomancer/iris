@@ -50,7 +50,9 @@ microcode and the revision checks in libGLcore may take other paths.
   0x200..0x241 are [value, RSS register] pairs, 0x000..0x031 RSS command
   words; 0x1D0..0x1D6 (the CI copy's mask state) hold the previous
   context's leftovers; 0xDBB = 4, 0xDBE = 2, 0xDBF = 0x3F, 0xDC0 = 0xFFF
-  every time. The emulator answers only the words glquery models.
+  every time. The emulator answers the words glquery models, and a new
+  context's pixel memory holds those four ERAM words (`pixpipe::FRESH`;
+  the element type replaced the old guess).
 - pixtest differences, real board failing where the emulator passes
   (open): 8_8_8_8 and 4_4_4_4 reads (component order), ABGR draws of
   8_8_8_8 / 10_10_10_2 (alpha 255), ALPHA and INTENSITY textures loaded
@@ -60,14 +62,12 @@ microcode and the revision checks in libGLcore may take other paths.
 - Quads: the board splits GL_QUADS / GL_QUAD_STRIP along the 1-3
   diagonal (v1-v2 for a strip's quad); fixed in `gl.rs` `polygon`.
 - Open, measured (glsuite 2026-11-08, real `purple` vs emu-cpu):
-  - Fog: EXP / EXP2 are per pixel on the board (an exponential curve
-    across one quad, within 0.01-0.04 of exp(-d z)); we interpolate a
-    per-vertex factor (straight ramp, up to 59 levels off). Linear fog: the
-    board is 4 levels darker throughout. Our fog plane (FOG_F) is
-    model-private, so per-pixel fog means carrying the coordinate instead.
-  - Lines: 1-wide lines differ in 2-4 endpoint pixels; stippled lines only
-    in coverage (pattern phase); antialiased lines and points in coverage
-    and alpha.
+  - Fog: fixed 2026-11-09 (`fog-per-pixel-through-a-table.md`; a table
+    over window depth, pixel pairs; `real_board_fog`, `real_board_fogtest`).
+  - Lines and points: fixed 2026-11-09 (`gl-lines-follow-diamond-exit.md`);
+    aliased cases exact (`real_board_lines`), antialiased lines and
+    points fitted (`real_board_smooth_lines_and_points`). Open: glprim's
+    antialiased points of sizes 3 and 6.5.
   - Smooth triangles, strips, fans, polygons, lighting, blends: off by one
     level at most (rounding).
   - texsweep: ALPHA and INTENSITY textures (4/8/12/16) read back as the
@@ -77,6 +77,28 @@ microcode and the revision checks in libGLcore may take other paths.
     the truncated 32-bit index; XFRMASKLOW / HIGH (0x156/0x157) are not
     modelled.
   - vissweep: 4,4,4,4 db pbuffer passes on the board, fails here.
+
+**Piglit** (`lists/vpro.list`, 2026-11-08/09): the board 130 pass, 41
+fail, 24 crash, 224 skip; the emulated twin (results/emu2, before the fog
+and flat-line fixes) 116 pass, 54 fail. Passing on the board, failing
+here: hiz stencil reads x2 and masked-clear (a stencil index read as
+GL_UNSIGNED_INT comes back 0x05050505 for 5: the byte widened like a
+colour), edgeflag x3 (edges drawn that the flags turn off),
+drawbuffer-modes (GL_NONE still writes the front), rastercolor, texgen
+(sphere map), no-op-paths, dlist-color-material (glGetMaterial after
+a display-listed colour material), clear-accum, stencil-drawpixels,
+levelclamp / lodclamp / lodclamp-between, streaming-texture-leak
+(timeout); fixed since: line-flat-clip-color, fog-linear-floor. Failing on
+the board, passing here: dlist-bitmap, long-line-loop,
+scissor-depth-clear, scissor-stencil-clear, infinite-spot-light. The
+twin's network used to die ~20 minutes after boot
+(`clanker/net/nat-readopts-the-gateway-when-the-guest-moves-subnet.md`).
+
+**Measured 2026-11-09** (results/purple-lf on the share): `linetest` in
+every mode (default, profile, vprofile, slopes, vslopes, fine, points,
+pointsdc), `fogtest` and `fogtest 8`, glprim smooth-point variants
+(ptvar). The fits are in the notes above; the board data the unit tests
+use is in `src/dev/mgras/testdata/real_high_impact_*.txt`.
 
 **Data** (on the share, `results/`): purple/ (the real suite),
 emu-cpu/, gepeek-*.txt, bdinfo-*.txt, dettex/ (sweeps, dumps), blend/.

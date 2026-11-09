@@ -510,8 +510,25 @@ fn textured(si: u32, sw: I64, tw: I64, wi: I64, ds: array<I64, 2>, dt: array<I64
     return tex_env(sr(si, SL_TM1), sr(si, SL_TXENVRG), sr(si, SL_TXENVB), rgba, texel);
 }
 
-fn fogged(si: u32, rgba: vec4<i32>, f_in: i32) -> vec4<i32> {
-    let f = clamp(f_in, 0, FIX_ONE);
+// One point of the fog table (`rss::reg::FOG_LUT`).
+fn fog_point(si: u32, n: u32) -> u32 {
+    return (sr(si, SL_FOGLUT + (n >> 1u)) >> ((n & 1u) * 16u)) & 0xffffu;
+}
+
+// `Rss::fogged` at fog depth `z` (z.12), the factor as `rss::fog_factor`.
+fn fogged(si: u32, rgba: vec4<i32>, z: I64) -> vec4<i32> {
+    let d = zbuf(z);
+    let t = (((d >> 8u) * (sr(si, SL_FOGIK) >> 8u)) >> 8u) + sr(si, SL_FOGIB);
+    let i = t >> 16u;
+    var v: u32;
+    if i >= 256u {
+        v = fog_point(si, 256u);
+    } else {
+        let f15 = (t & 0xffffu) >> 1u;
+        v = (fog_point(si, i) * (32768u - f15) + fog_point(si, i + 1u) * f15) >> 15u;
+    }
+    let f8 = min(v >> 8u, 255u);
+    let f = i32(f8 * 0x101010u + (((f8 + 1u) >> 8u) << 4u));
     let rg = sr(si, SL_FOGRG);
     let b = sr(si, SL_FOGB);
     let fc = vec3<i32>(field12(rg), field12(rg >> 12u), field12(b));

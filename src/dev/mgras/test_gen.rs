@@ -201,10 +201,15 @@ pub fn gl_regs(rng: &mut Rng, regs: &mut Regs, tex_bias: f64) {
     regs.push((reg::FOG_ON, rng.chance(0.35) as u32));
     regs.push((reg::FOG_RG, rng.u32()));
     regs.push((reg::FOG_B, rng.u32()));
-    let one = rss_iter_one();
-    hilo(regs, reg::FOG_F, (rng.f(-0.3, 1.3) * one) as i64);
-    hilo(regs, reg::FOG_F + 2, (rng.f(-0.02, 0.02) * one) as i64);
-    hilo(regs, reg::FOG_F + 4, (rng.f(-0.02, 0.02) * one) as i64);
+    // A fog table (`rss::fog_factor`): random points, an index scale and
+    // offset like the GE's (N 32 or 512) or anything.
+    for n in 0..rss::FOG_LUT_WORDS as u32 {
+        regs.push((reg::FOG_LUT + n, rng.u32()));
+    }
+    let n = if rng.chance(0.5) { 32 } else { 512 };
+    let (k, b) = if rng.chance(0.8) { ((1u32 << 24) / n * (n - 1), (1u32 << 24) / n) } else { (rng.u32() & 0xFF_FFFF, rng.u32() & 0x1FF_FFFF) };
+    regs.push((reg::FOG_IDX_K, k));
+    regs.push((reg::FOG_IDX_B, b));
     for j in 0..32 {
         regs.push((reg::INDIRECT_ADDR, rss::POLY_STIPPLE_RAM + j));
         regs.push((reg::INDIRECT_DATA, if rng.chance(0.2) { u32::MAX } else { rng.u32() }));

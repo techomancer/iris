@@ -51,12 +51,18 @@ pub mod reg {
     /// Fog colour: red 11:0, green 23:12; blue 11:0 (12 bits each).
     pub const FOG_RG: u32 = 0x144;
     pub const FOG_B: u32 = 0x145;
-    /// Model-private (our GE HLE and this RSS agree on them; the GE11's
-    /// own way of fogging after texturing is not visible on the bus): the
-    /// fog factor's plane, 64-bit pairs at 2^32 (start, step along the span
-    /// or line, step down the edge), and whether it applies.
-    pub const FOG_F: u32 = 0x3F0;
+    /// Model-private (our GE HLE and this RSS agree on them; how the GE11
+    /// loads the board's fog table is not visible on the bus): whether fog
+    /// applies. RE4 fogs from the window depth through a table
+    /// (`fog_factor`).
     pub const FOG_ON: u32 = 0x3F6;
+    /// Model-private: the fog table, 257 16-bit factors (65536 = 1), two a
+    /// word, point 2w in the low half of word w (`FOG_LUT_WORDS` words).
+    pub const FOG_LUT: u32 = 0x300;
+    /// Model-private: the fog table index's scale and offset, t = (d * K
+    /// >> 24) + B in 8.16 table steps for a 24-bit depth d.
+    pub const FOG_IDX_K: u32 = 0x3FA;
+    pub const FOG_IDX_B: u32 = 0x3FB;
     /// Model-private: a TE read returns TRAM's bytes as they lie (the
     /// texture manager's save of pages), not texels.
     pub const TE_RAW: u32 = 0x3F7;
@@ -1229,10 +1235,9 @@ pub(super) struct TriSetup {
     pub s1: f64,
     pub s2: f64,
     pub xs: f64,
-    /// Colour planes and the fog factor's, 12.16 (`fixed::plane`): pixel
-    /// (i, j) is `p[0] + p[1] (i - xs_i) + p[2] (yref_i - j)`.
+    /// Colour planes, 12.16 (`fixed::plane`): pixel (i, j) is `p[0] + p[1]
+    /// (i - xs_i) + p[2] (yref_i - j)`.
     pub cplanes: [[i32; 3]; 4],
-    pub fogp: [i32; 3],
     pub xs_i: i32,
     pub yref_i: i32,
     /// Depth, z.12 (`fixed::zplane`), at pixels like `cplanes`.
@@ -1257,12 +1262,10 @@ pub(super) struct TriSetup {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct GlLineSetup {
-    /// Colours and the fog factor at the first pixel and their steps per
-    /// pixel, 12.16: pixel k of the line is `base + step k`, wrapping.
+    /// Colours at the first pixel and their steps per pixel, 12.16: pixel
+    /// k of the line is `base + step k`, wrapping.
     pub cbase: [i32; 4],
     pub cstep: [i32; 4],
-    pub fbase: i32,
-    pub fstep: i32,
     /// Depth at the first pixel and per pixel, z.12.
     pub zbase: i64,
     pub zstep: i64,
@@ -1319,6 +1322,40 @@ pub(super) fn edge_bound(e: [i64; 2], j: i32) -> i32 {
 /// at or past it.
 pub(super) fn first_centre(v: i64) -> i32 {
     (-((128i64.wrapping_sub(v)) >> 8)).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Words of the fog table (`reg::FOG_LUT`).
+pub const FOG_LUT_WORDS: usize = 129;
+
+/// The fog factor (12.16, ONE = no fog) at 24-bit window depth `d`: the
+/// index t = (d K >> 24) + B (FOG_IDX_K, FOG_IDX_B) in 8.16 steps of the 257-point
+/// table, linear between its points, floored to 8 bits (the board's
+/// output: 256 levels, the top one 255), which scale to [0, ONE] (255 to
+/// ONE exactly). `word(w)` is FOG_LUT word w. The JIT and the GPU unit
+/// compute the same, step for step.
+#[inline]
+pub(super) fn fog_factor(d: u32, k: u32, b: u32, word: impl Fn(u32) -> u32) -> i32 {
+    let pt = |n: u32| (word(n >> 1) >> ((n & 1) * 16)) & 0xFFFF;
+    let t = (((d >> 8).wrapping_mul(k >> 8)) >> 8).wrapping_add(b);
+    let i = t >> 16;
+    let v = if i >= 256 {
+        pt(256)
+    } else {
+        let f15 = (t & 0xFFFF) >> 1;
+        (pt(i) * (32768 - f15) + pt(i + 1) * f15) >> 15
+    };
+    let f8 = (v >> 8).min(255);
+    (f8 * 0x10_1010 + (((f8 + 1) >> 8) << 4)) as i32
+}
+
+/// The depth a fogged pixel takes its fog from: the board fogs pixels in
+/// pairs, even window x and the odd one after it, each pair at the depth
+/// of the pixel two on from its even one (x & !1) + 2 (fitted to glprim's
+/// fog scenes and fogtest on the board). The result is how many pixels on
+/// from `x` that is (along a line, `x` the major coordinate, towards +).
+#[inline]
+pub(super) fn fog_pair_offset(x: i32) -> i32 {
+    2 - (x & 1)
 }
 
 /// A GL line's first minor pixel at major pixel `p`.
@@ -2067,7 +2104,7 @@ impl Rss {
                     rgba = self.textured(v, t.tp.map(|p| [p[1], p[2]]), smp, rgba);
                 }
                 if t.fog != 0 {
-                    rgba = self.fogged(rgba, fixed::at(t.fogp, di, dj));
+                    rgba = self.fogged(rgba, fixed::zat(t.zp, di + fog_pair_offset(i), dj));
                 }
                 self.gl_fragment(i, j, rgba, fixed::zat(t.zp, di, dj));
             }
@@ -2163,7 +2200,6 @@ impl Rss {
             s2,
             xs,
             cplanes: planes.map(|p| fixed::plane(p, fixed::colour)),
-            fogp: fixed::plane(tplane(self, reg::FOG_F, reg::FOG_F + 4, reg::FOG_F + 2), fixed::fraction),
             xs_i: xs as i32,
             yref_i: yref as i32,
             zp: fixed::zplane(zplane),
@@ -2206,11 +2242,13 @@ impl Rss {
         tex_env(self.reg(te_reg::TEXMODE1), self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
     }
 
-    /// Fog applied to a fragment: factor `f` (1 = none) toward the fog
+    /// Fog applied to a fragment whose fog depth (`fog_pair_offset`) is
+    /// the z.12 `z`: the factor from the table (`fog_factor`) toward the fog
     /// colour (FOG_RG / FOG_B), alpha kept.
-    fn fogged(&self, rgba: [i32; 4], f: i32) -> [i32; 4] {
+    fn fogged(&self, rgba: [i32; 4], z: i64) -> [i32; 4] {
         use fixed::{mul, ONE};
-        let f = f.clamp(0, ONE);
+        let d = fixed::zbuf(z) as u32;
+        let f = fog_factor(d, self.reg(reg::FOG_IDX_K), self.reg(reg::FOG_IDX_B), |w| self.reg(reg::FOG_LUT + w));
         let (rg, b) = (self.reg(reg::FOG_RG), self.reg(reg::FOG_B));
         let fc = [fixed::field12(rg), fixed::field12(rg >> 12), fixed::field12(b)];
         [0, 1, 2, 3].map(|k| if k < 3 { mul(f, rgba[k]).wrapping_add(mul(ONE - f, fc[k])) } else { rgba[3] })
@@ -2220,8 +2258,9 @@ impl Rss {
     /// to gline_xendf/yendf (biased floats, as the triangle positions);
     /// colours (red..alpha) and Z (z_hi/low) at the start, their steps per
     /// pixel along the major axis in dre/dge/dbe/dae and dze. Pixels whose
-    /// centre's major coordinate lies in [start, end) along the direction
-    /// of travel (the GL rule for non-antialiased lines), `glineconfig` + 1
+    /// far edge along the major axis lies in (start, end] in the direction
+    /// of travel (`gl_line_setup`; OpenGL's diamond exit near the pixel
+    /// centres, as a real High IMPACT draws), `glineconfig` + 1
     /// pixels wide across the major axis. With line stipple (fill mode bit
     /// 5), lspat holds the 16-bit pattern, first bit in bit 15, and lscrl
     /// the repeat count less one; the position carries on until lscrl is
@@ -2247,7 +2286,6 @@ impl Rss {
         // Pixels along the line since the first (colour and fog steps).
         let mut k = 0i32;
         while p != l.p1 {
-            let t = ((p as f64 + 0.5) - l.a0).abs();
             let draw = l.stipple == 0 || {
                 let bit = (self.gl_line_stipple_pos / l.repeat) % 16;
                 self.gl_line_stipple_pos = self.gl_line_stipple_pos.wrapping_add(1);
@@ -2262,7 +2300,8 @@ impl Rss {
                     rgba = self.textured(v, l.tstep.map(|d| [d, 0]), smp, rgba);
                 }
                 if l.fog != 0 {
-                    rgba = self.fogged(rgba, l.fbase.wrapping_add(l.fstep.wrapping_mul(k)));
+                    let kf = k.wrapping_add(fog_pair_offset(p).wrapping_mul(l.dir)) as i64;
+                    rgba = self.fogged(rgba, l.zbase.wrapping_add(l.zstep.wrapping_mul(kf)));
                 }
                 for q in q0..q0.wrapping_add(l.width) {
                     let (wx, wy) = if l.xmajor != 0 { (p, q) } else { (q, p) };
@@ -2286,7 +2325,7 @@ impl Rss {
         let fix = |r: &Self, n: u32| r.reg(n) as i32 as f64 / 0xFF_F000 as f64;
         let fix64 = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64 as f64 / 4096.0;
         // Texture along the line: S/W, T/W, Q/W at the start, steps per
-        // pixel in the edge step registers; the fog factor likewise.
+        // pixel in the edge step registers.
         let fix64t = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64 as f64 / ITER_ONE;
         let q = |c: u32, d: u32| [fix64t(self, c), fix64t(self, d)];
         let tq = [q(te_reg::SW, te_reg::DSWE), q(te_reg::TW, te_reg::DTWE), q(te_reg::WI, te_reg::DWIE)];
@@ -2296,15 +2335,40 @@ impl Rss {
             return None;
         }
         let dir = if a1 > a0 { 1 } else { -1 };
-        // First and one-past-last pixel along the major axis.
-        let (p0, p1) = if dir > 0 { ((a0 - 0.5).ceil() as i32, (a1 - 0.5).ceil() as i32) } else { ((a0 - 0.5).floor() as i32, (a1 - 0.5).floor() as i32) };
-        // Colours and fog at the first pixel's centre, t0 along the line;
-        // each pixel after it is one further.
-        let t0 = ((p0 as f64 + 0.5) - a0).abs();
+        let width = (self.reg(reg::GLINECONFIG) & 0xFF) as i64 + 1;
+        // First and one-past-last pixel along the major axis, by OpenGL's
+        // diamond exit, as a real High IMPACT draws: a pixel is drawn when
+        // the line leaves its diamond within (a0, a1]. The diamond's far
+        // corner along the line, at the line's distance d from the pixel's
+        // centre across it, is d short of the pixel's far edge (x + 1
+        // going right, x going left). A wide line is judged by its spine:
+        // even widths sit half a pixel off the centres. d is taken at each
+        // end.
+        let off = |b: f64| {
+            let b = if width % 2 == 0 { b + 0.5 } else { b };
+            ((b - b.floor()) - 0.5).abs()
+        };
+        let (d0, d1) = (off(b0), off(b1));
+        let (p0, p1) = if dir > 0 {
+            let s = a0.floor();
+            let e = a1.floor();
+            (if a0 < s + 1.0 - d0 { s } else { s + 1.0 }, if e + 1.0 - d1 <= a1 { e + 1.0 } else { e })
+        } else {
+            let s = a0.ceil() - 1.0;
+            let e = a1.floor();
+            (if a0 > s + d0 { s } else { s - 1.0 }, if e + d1 >= a1 { e - 1.0 } else { e })
+        };
+        let (p0, p1) = (p0 as i32, p1 as i32);
+        if (p1 - p0) * dir <= 0 {
+            return None;
+        }
+        // Colours and depth at the first pixel's centre, t0 along the line
+        // (before the start when that centre is: the board extrapolates,
+        // and the colour clamps); each pixel after it is one further.
+        let t0 = ((p0 as f64 + 0.5) - a0) * dir as f64;
         let zfix = |v: f64| (v * (1u64 << fixed::Z_FRAC) as f64).round() as i64;
         let c0 = [fix(self, 0x05C), fix(self, 0x05D), fix(self, 0x05E), fix(self, 0x05F)];
         let dc = [fix(self, 0x060), fix(self, 0x062), fix(self, 0x064), fix(self, 0x066)];
-        let (f0, df) = (fix64t(self, reg::FOG_F), fix64t(self, reg::FOG_F + 2));
         // The minor position as a DDA at 2^-32 from the s.8 positions, the
         // slope rounded to 2^-24: at major pixel p it is b0 + slope (p +
         // 0.5 - a0), and the first minor pixel the floor of that less half
@@ -2312,15 +2376,12 @@ impl Rss {
         let slope = (b1 - b0) / (a1 - a0);
         let sl = (slope * (1u64 << 24) as f64).round() as i64;
         let (a0f, b0f) = (pos_fixed(a0), pos_fixed(b0));
-        let width = (self.reg(reg::GLINECONFIG) & 0xFF) as i64 + 1;
         let qk = b0f.wrapping_shl(24).wrapping_add(sl.wrapping_mul(128i64.wrapping_sub(a0f))).wrapping_sub((width - 1).wrapping_shl(31));
         Some(GlLineSetup {
             qk,
             qs: sl.wrapping_mul(256),
             cbase: [0, 1, 2, 3].map(|k| fixed::colour(c0[k] + dc[k] * t0)),
             cstep: dc.map(fixed::colour),
-            fbase: fixed::fraction(f0 + df * t0),
-            fstep: fixed::fraction(df),
             zbase: zfix(fix64(self, 0x068) + fix64(self, 0x06C) * t0),
             zstep: zfix(fix64(self, 0x06C)),
             tbase: tq.map(|q| fixed::iter(q[0] + q[1] * t0)),
