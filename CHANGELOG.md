@@ -87,6 +87,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The per-kernel table has a "vs base" column for every cell and a "native" column for every cell. Both used to divide the best cell by the base or the host, so a slower build still read 1.00x.
 - A rerun under the same label is kept (`<label>.2.json`, `.3.json`) instead of replacing the last result. `report` groups them into one column showing the median, `[min-max]` and the run count, and ratios use the medians.
 - `report` warns when the runs it compares differ in guest image, run length (quick or full), clock (timed or `ci_clock`), host CPU or emulator build features, names the cells on each side, and prints `n/c` instead of a ratio between cells that differ. Kernel rates count iterations of compiled guest code, so a rebuilt image read as an emulator regression. `--across-features` keeps ratios between feature sets, which `matrix` does since that is its point.
+- `iris-bench reference` refuses a `ci_clock` run, whose rates are constants of the build.
 
 ### Boot test
 

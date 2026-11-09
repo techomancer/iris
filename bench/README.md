@@ -367,7 +367,8 @@ length (quick or full), clock (timed or `ci_clock`), host CPU and emulator build
 features. Where they differ, `report` warns, names the cells, and prints `n/c`
 in place of the ratio. `--across-features` allows differing features, which is
 what `matrix` does, since comparing feature sets is its point. A `ci_clock` run
-reads `n/c` against timed runs, since its rates are constants of the build.
+reads `n/c` against timed runs, since its rates are constants of the build, and
+`reference` refuses it.
 
 ---
 

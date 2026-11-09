@@ -1248,6 +1248,13 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                     "{} has no suite_id — it predates the field, or it is a host run. \
                      Re-run the suite to record one.", path.display()));
             }
+            // A ci_clock run reports constant rates, so a row made from one
+            // would compare every machine against a number that is not a speed.
+            if is_counted(&run) {
+                return Err(format!(
+                    "{} is a ci_clock run: its rates are constants of the build, not \
+                     speeds. Reference rows must come from a timed run.", path.display()));
+            }
             // A shortened run is accurate but imprecise, and the table is what
             // every other machine gets compared against. Refuse rather than
             // quietly enshrine a noisy row.
