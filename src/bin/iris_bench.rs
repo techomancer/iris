@@ -1641,7 +1641,8 @@ mod tests {
     }
 
     /// IRIX's dd has no `m` suffix and its ping refuses `-i 0`; either made a
-    /// step fail.
+    /// step fail. The buffer cache still holds what disk/write just wrote, so
+    /// the cold read must read a file its own setup wrote.
     #[test]
     fn the_shipped_steps_stay_valid_on_irix() {
         let steps = shipped_steps();
@@ -1651,5 +1652,37 @@ mod tests {
                 assert!(!c.contains("bs=1m") && !c.contains(" -i 0"), "{}: {c}", s.name);
             }
         }
+        let cold = steps.iter().find(|s| s.name == "disk/read_cold").unwrap();
+        assert!(!cold.cmd.contains("irisbench.dat"));
+        assert!(cold.setup.as_deref().unwrap().contains("hinv -c memory"));
+    }
+
+    /// The cold read's setup, run by the local shell with hinv, dd, rm and
+    /// sync stubbed out: its exit status and what it ran.
+    #[cfg(unix)]
+    fn cold_setup(hinv: &str, dd_status: u8) -> (bool, String) {
+        let steps = shipped_steps();
+        let setup = steps.iter().find(|s| s.name == "disk/read_cold").unwrap().setup.clone().unwrap();
+        // The setup sends dd's output to /dev/null, so the stubs report on fd 3.
+        let stubs = format!("exec 3>&1; hinv() {{ echo \"{hinv}\"; }}; \
+                             dd() {{ echo dd \"$@\" >&3; return {dd_status}; }}; \
+                             rm() {{ echo rm \"$@\" >&3; }}; sync() {{ echo sync >&3; }}; ");
+        let out = Command::new("sh").arg("-c").arg(stubs + &setup).output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cold_read_setup_writes_one_and_a_half_memories_or_fails_cleanly() {
+        let (ok, out) = cold_setup("Main memory size: 256 Mbytes", 0);
+        assert!(ok && out.contains("count=384") && out.contains("sync"), "{out}");
+        // no number from hinv: fail before writing anything
+        let (ok, out) = cold_setup("", 0);
+        assert!(!ok && !out.contains("dd ") && out.contains("no memory size"), "{out}");
+        let (ok, out) = cold_setup("Main memory size: lots", 0);
+        assert!(!ok && !out.contains("dd "), "{out}");
+        // a write that fails takes its partial file with it
+        let (ok, out) = cold_setup("Main memory size: 256 Mbytes", 1);
+        assert!(!ok && out.contains("rm -f /tmp/irisbench2.dat") && !out.contains("sync"), "{out}");
     }
 }
