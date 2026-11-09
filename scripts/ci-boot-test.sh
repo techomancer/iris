@@ -1,5 +1,6 @@
 #!/bin/bash
 # Boot an installed IRIX disk in iris (Indy, R4400) and pass if "login:" reaches serial.
+# Each check is also a case in <out-dir>/boot-test.xml, a JUnit report for CI.
 # Usage: ci-boot-test.sh <bin-dir> <disk-image> <out-dir> [timeout-seconds]
 
 set -u
@@ -45,23 +46,44 @@ cdrom   = false
 overlay = true
 EOF
 
-rm -f nvram.bin serial.log phase-a.log transcript.log iris-*.log
+rm -f nvram.bin serial.log phase-a.log transcript.log iris-*.log boot-test.xml
 
 log() { echo "[boot-test $(date -u +%H:%M:%S)] $*"; }
 ic() { "$IRIS_CI" "$@"; }
 
+# The JUnit cases, written to boot-test.xml on exit by `iris-ci junit`.
+# check <pass|fail> <seconds> <name> [text]
+CASES=()
+check() { CASES+=(--case "$1|$2|$3${4:+|$4}"); }
+# fail <message>: fail the check now under way and stop.
+CHECK="start iris"
+fail() { log "$1"; check fail 0 "$CHECK" "$1"; exit 1; }
+
+# stop_iris: ask iris to quit and kill it if it has not within 5 s. QUIT says
+# how it ended: "exit N" when it quit by itself, "killed" otherwise.
 IRIS_PID=""
+QUIT=""
 stop_iris() {
   [ -z "$IRIS_PID" ] && return
   ic quit >/dev/null 2>&1 || true
-  for _ in 1 2 3 4 5; do kill -0 "$IRIS_PID" 2>/dev/null || break; sleep 1; done
+  QUIT=killed
+  for _ in 1 2 3 4 5; do kill -0 "$IRIS_PID" 2>/dev/null || { QUIT=exited; break; }; sleep 1; done
   kill "$IRIS_PID" 2>/dev/null || true
   [ -n "$EXE" ] && { taskkill //F //IM "iris$EXE" >/dev/null 2>&1 || true; }
   wait "$IRIS_PID" 2>/dev/null
+  local rc=$?
+  [ "$QUIT" = exited ] && QUIT="exit $rc"
   IRIS_PID=""
   [ -z "$EXE" ] && rm -f "$IRIS_SOCKET"
 }
-trap stop_iris EXIT
+
+finish() {
+  stop_iris
+  # ${CASES[@]+...}: bash 3.2, on macOS, calls an empty array unbound.
+  ic junit boot-test.xml --suite "boot.$(uname -s)" ${CASES[@]+"${CASES[@]}"} \
+    || log "could not write boot-test.xml"
+}
+trap finish EXIT
 
 # start_iris <log> [extra iris args...]: launch and wait for the CI socket.
 start_iris() {
@@ -71,11 +93,11 @@ start_iris() {
   for _ in $(seq 1 60); do
     ic -q ping >/dev/null 2>&1 && return 0
     if ! kill -0 "$IRIS_PID" 2>/dev/null; then
-      log "iris exited before the CI socket came up"; cat "$logf"; exit 1
+      cat "$logf"; fail "iris exited before the CI socket came up"
     fi
     sleep 1
   done
-  log "CI socket never came up"; cat "$logf"; exit 1
+  cat "$logf"; fail "CI socket never came up"
 }
 
 # monitor_cmd <command>: type a PROM Command Monitor line, wait for the prompt.
@@ -88,14 +110,16 @@ monitor_cmd() {
 # A blank NVRAM has no boot path; headless puts the PROM on serial so we can setenv.
 
 log "phase A: seeding NVRAM (headless, serial console)"
+CHECK="seed NVRAM"
+SEED_START=$(date +%s)
 start_iris iris-phase-a.log --headless
 ic -q start
 if ! ic serial-wait --timeout 180 "Option?" >> phase-a.log 2>&1; then
-  log "phase A: PROM menu never appeared on serial"; cat phase-a.log; exit 1
+  cat phase-a.log; fail "phase A: PROM menu never appeared on serial"
 fi
 ic -q serial-send 5   # Enter Command Monitor
 ic serial-wait --timeout 30 ">> " >> phase-a.log 2>&1 \
-  || { log "phase A: no Command Monitor prompt"; cat phase-a.log; exit 1; }
+  || { cat phase-a.log; fail "phase A: no Command Monitor prompt"; }
 for c in \
   "setenv -f SystemPartition scsi(0)disk(1)rdisk(0)partition(8)" \
   "setenv -f OSLoadPartition scsi(0)disk(1)rdisk(0)partition(0)" \
@@ -103,16 +127,18 @@ for c in \
   "setenv -f AutoLoad Yes" \
   "setenv -f console d" \
   "printenv"; do
-  monitor_cmd "$c" || { log "phase A: '$c' got no prompt back"; cat phase-a.log; exit 1; }
+  monitor_cmd "$c" || { cat phase-a.log; fail "phase A: '$c' got no prompt back"; }
 done
-ic -q rtc-save || { log "phase A: rtc-save failed"; exit 1; }
+ic -q rtc-save || fail "phase A: rtc-save failed"
 stop_iris
+check pass $(( $(date +%s) - SEED_START )) "$CHECK"
 log "phase A: done"
 
 # ── Phase B: boot ────────────────────────────────────────────────────────────
 # Serial console (console=d) + AutoLoad: the PROM boots the disk unattended
 # and the login arrives on serial, where the wait below sees it.
 
+CHECK="serial console: login prompt"
 start_iris iris.log
 log "phase B: booting; deadline ${TIMEOUT}s"
 ic -q start
@@ -127,21 +153,34 @@ while :; do
   ic serial-read >> transcript.log 2>/dev/null || true
 
   if ! kill -0 "$IRIS_PID" 2>/dev/null; then
-    log "iris exited after ${ELAPSED}s"; IRIS_PID=""; break
+    log "iris exited after ${ELAPSED}s"; IRIS_PID=""
+    check fail "$ELAPSED" "$CHECK" "iris exited after ${ELAPSED}s"; break
   fi
 
   if grep -q 'login:' transcript.log; then
     log "login prompt after ${ELAPSED}s"
+    check pass "$ELAPSED" "$CHECK"
     RESULT=0
     break
   fi
 
   if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
-    log "no login prompt within ${TIMEOUT}s"; break
+    log "no login prompt within ${TIMEOUT}s"
+    check fail "$ELAPSED" "$CHECK" "no login prompt within ${TIMEOUT}s"; break
   fi
   sleep 5
 done
 
 log "last serial output:"
 tail -n 40 transcript.log
+
+# A machine that will not stop when asked would hang a user's session too.
+if [ -n "$IRIS_PID" ]; then
+  stop_iris
+  if [ "$QUIT" = "exit 0" ]; then
+    check pass 0 "iris quits when asked"
+  else
+    check fail 0 "iris quits when asked" "iris after quit: $QUIT"; RESULT=1
+  fi
+fi
 exit $RESULT

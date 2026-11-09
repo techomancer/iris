@@ -464,6 +464,14 @@ jobs:
         if: ${{ steps.image.outputs.present == 'true' }}
         run: bash scripts/ci-boot-test.sh core boot-image/irix53.chd boot-test "$BOOT_TIMEOUT"
 
+      # The script writes each check as a JUnit case, so a failed run is
+      # annotated with the check that failed.
+      - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+        if: ${{ always() && steps.image.outputs.present == 'true' }}
+        with:
+          report_paths: boot-test/boot-test.xml
+          annotate_only: true
+
       # Named boot-test-*, so the publish jobs' dist-* download leaves it out.
       - name: Upload the boot test results
         if: ${{ always() && steps.image.outputs.present == 'true' }}
@@ -473,6 +481,7 @@ jobs:
           path: |
             boot-test/*.log
             boot-test/boot-test.toml
+            boot-test/boot-test.xml
           if-no-files-found: warn
 
   # Everything the downloads table links to must exist before anyone publishes.

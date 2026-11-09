@@ -23,6 +23,16 @@ SystemPartition scsi(0)disk(1)rdisk(0)partition(8)`, `OSLoadPartition
 → quit. The next run auto-boots the disk unattended. The script also sets
 `console d`, so `login:` arrives on serial; the framebuffer stays dark (irix-install.md §8).
 
+## Each check is a JUnit case
+
+The script records each check (seeding NVRAM, the login prompt, iris quitting
+when asked) with `check`, and its exit trap writes them all to
+`boot-test/boot-test.xml` with `iris-ci junit`, also after a failure that stops
+the script early. The job hands that file to the JUnit reporter with
+`annotate_only`, which needs no `checks: write`, so a failed run is annotated
+with the check that failed. Add a check the same way rather than another exit
+code.
+
 ## Screenshots under --ci
 
 `cmd_screenshot` (src/ci.rs) takes its frame from `gfx_display::fresh_frame`.
