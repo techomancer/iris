@@ -103,6 +103,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - A guest step that fails is recorded as a `FAILED` row and the suite carries on; it used to stop at the first quiet failure and lose the results so far. A step skipped for a missing program is a `SKIP` row.
 - A step in `bench/irix/steps.toml` can set `timeout`. A hung step is a `FAILED` row, the guest gets Ctrl-C, and the suite goes on once the shell answers. The X steps have timeouts; `gfx/xwd_root` blocked the suite for good on an Indy sitting at the login screen.
 - `iris-bench report` shows a guest run as a "Guest steps" table with each step's status, time and rate, instead of blank rows in the kernel tables. `iris-bench reference` refuses a guest run.
+- `iris-bench irix --junit FILE` also writes the guest suite as a JUnit report: one case per step, failed where the step failed or timed out and skipped where its program is missing.
 
 ### Boot test
 

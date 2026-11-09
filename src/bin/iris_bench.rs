@@ -599,7 +599,26 @@ fn row(step: &Step, ns: u64, status: &str) -> Row {
     }
 }
 
-fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
+/// How a guest step ended, for its JUnit case.
+enum StepEnd<'a> {
+    Timed(f64),
+    Failed(&'a str),
+    Skipped(&'a str),
+}
+
+/// A guest step as a JUnit case: passed with its time, failed with why, or
+/// skipped with the program it needs.
+fn step_case(name: &str, end: StepEnd) -> junit::TestCase {
+    use junit::{Duration, TestCase};
+    match end {
+        StepEnd::Timed(secs) => TestCase::success(name, Duration::seconds_f64(secs)),
+        StepEnd::Failed(why) => TestCase::failure(name, Duration::ZERO, "guest step", why),
+        StepEnd::Skipped(why) => TestCase::skipped_with_cause(name, "not installed", why),
+    }
+}
+
+/// The run, and a JUnit case for each of its rows.
+fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<(Run, Vec<junit::TestCase>), String> {
     let text = std::fs::read_to_string(steps_path)
         .map_err(|e| format!("{}: {}", steps_path.display(), e))?;
     let file: StepFile = toml::from_str(&text)
@@ -615,6 +634,7 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
     println!("  round-trip floor: {:.0} ms", baseline * 1e3);
 
     let mut rows = Vec::new();
+    let mut cases = Vec::new();
     let mut total_ns = 0u64;
 
     // A step that fails or is skipped gets a row of its own and the suite goes
@@ -624,6 +644,7 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
             if !ci.has(prog)? {
                 println!("  {:<22} skipped ({} not installed)", step.name, prog);
                 rows.push(row(step, 0, "SKIP"));
+                cases.push(step_case(&step.name, StepEnd::Skipped(&format!("{prog} not installed"))));
                 continue;
             }
         }
@@ -642,9 +663,11 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
                     Outcome::Failed { out, said } => (said.trim_start_matches("iris-ci: ").to_string(), out),
                     _ => (format!("did not finish in {} s", step.timeout.unwrap_or(ci.timeout)), String::new()),
                 };
-                println!("  {:<22} FAILED ({}{})", step.name, if in_setup { "setup: " } else { "" }, why);
+                let why = format!("{}{}", if in_setup { "setup: " } else { "" }, why);
+                println!("  {:<22} FAILED ({why})", step.name);
                 for l in tail(out.trim_end(), 3).lines() { println!("      {l}"); }
                 rows.push(row(step, 0, "FAILED"));
+                cases.push(step_case(&step.name, StepEnd::Failed(&why)));
                 if hung { ci.recover()?; }
                 continue;
             }
@@ -666,9 +689,10 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
         // Nothing here is checksummed: these are IRIX's own tools against
         // IRIX's own filesystem, and their output is not ours to predict.
         rows.push(row(step, ns, "UNCHECKED"));
+        cases.push(step_case(&step.name, StepEnd::Timed(ns as f64 / 1e9)));
     }
 
-    Ok(Run {
+    Ok((Run {
         cell: label.to_string(),
         features: Vec::new(),
         machine: MachineInfo { cpu, ..Default::default() },
@@ -685,7 +709,7 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
         suite_id: GUEST_SUITE.into(),
         // Not the bare-metal harness, so its run configuration does not apply.
         settings: RunSettings::default(),
-    })
+    }, cases))
 }
 
 // ─── reports ─────────────────────────────────────────────────────────────────
@@ -1226,6 +1250,10 @@ enum Cmd {
         /// Per-command timeout inside the guest.
         #[arg(long, default_value_t = 300)]
         timeout: u64,
+        /// Also write a JUnit report here: one case per step, failed where
+        /// the step failed or timed out, skipped where its program is missing.
+        #[arg(long)]
+        junit: Option<PathBuf>,
     },
 
     /// Print a `data/bench_reference.json` row for a saved result.
@@ -1419,7 +1447,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Irix { socket, steps, ci, shell, label, out, timeout } => {
+        Cmd::Irix { socket, steps, ci, shell, label, out, timeout, junit } => {
             let ci_bin = ci.unwrap_or_else(|| repo_relative(
                 if cfg!(windows) { "target/release/iris-ci.exe" } else { "target/release/iris-ci" }));
             if !ci_bin.exists() {
@@ -1429,8 +1457,11 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             let steps = steps.unwrap_or_else(|| repo_relative("bench/irix/steps.toml"));
             let out = out.unwrap_or_else(default_out);
             let ci = Ci { bin: ci_bin, socket, shell, timeout };
-            let run = run_irix(&ci, &steps, &label)?;
+            let (run, cases) = run_irix(&ci, &steps, &label)?;
             let path = save(&run, &out)?;
+            if let Some(junit) = junit {
+                junit::write(junit::suite(&junit::classname("irix", &label), cases), &junit)?;
+            }
             println!("wrote {}", path.display());
             Ok(())
         }
@@ -1526,6 +1557,20 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guest_step_is_a_passed_failed_or_skipped_case() {
+        let s = junit::suite(&junit::classname("irix", "indy"), [
+            step_case("disk/write", StepEnd::Timed(1.5)),
+            step_case("gfx/xwd_root", StepEnd::Failed("did not finish in 60 s")),
+            step_case("gfx/x11perf_rects", StepEnd::Skipped("x11perf not installed")),
+        ]);
+        assert_eq!((s.tests(), s.failures(), s.skipped()), (3, 1, 1));
+        assert_eq!(s.testcases[0].time, junit::Duration::seconds_f64(1.5));
+        assert_eq!(s.testcases[1].classname.as_deref(), Some("irix.indy"));
+        assert!(matches!(&s.testcases[1].result, junit::TestResult::Failure { message, .. }
+            if message == "did not finish in 60 s"));
+    }
 
     #[test]
     fn junit_fails_a_mismatched_kernel_and_skips_an_unchecked_one() {

@@ -471,6 +471,10 @@ status, time, rate) and keeps it out of the kernel tables; `--format text`
 counts its timed, skipped and failed steps. Guest numbers depend on the disk
 image, so `iris-bench reference` refuses them.
 
+`--junit FILE` also writes the run as a JUnit report for a CI test reporter:
+one case per step, failed where the step failed or timed out, skipped where its
+program is missing.
+
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
 Commands run as `sh -c '<cmd>'` with an IRIX-shaped PATH whatever the login
