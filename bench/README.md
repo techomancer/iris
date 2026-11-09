@@ -311,6 +311,7 @@ iris-bench matrix  [--cells r4400-interp,r5000-jitv2] [--force-build]
 iris-bench report  [--baseline CELL] [--format md|json|text] [--across-features]
 iris-bench reference --id ID [--into data/bench_reference.json]
 iris-bench cells   # what matrix knows how to build
+iris-bench ab      --a BASE --b CHANGE [--rounds 30] [--concurrent] [--across-features]
 ```
 
 `run` is **in-process by default**: `iris-bench` is itself an emulator and the
@@ -376,6 +377,58 @@ in place of the ratio. `--across-features` allows differing features, which is
 what `matrix` does, since comparing feature sets is its point. A `ci_clock` run
 reads `n/c` against timed runs, since its rates are constants of the build, and
 `reference` refuses it.
+
+## Comparing two builds
+
+"Did my change make iris slower?" is a question about two builds on one host at
+one moment. Build `iris` at the base and at the change (release profile, copied
+out of the target directories), then
+
+```sh
+iris-bench ab --a ./iris-base --b ./iris-change --label-a base --label-b change
+```
+
+It runs 30 rounds of the suite on one guest image. Each round runs A and B once,
+in a random order, and gives each kernel one B/A ratio of nanoseconds per guest
+instruction. A kernel is judged from the median of its ratios and a 99.9%
+interval for that median (the order-statistic interval the sign test inverts, so
+one spoiled round barely matters): `SLOWER` when the interval lies above 1 and
+the median is past `--threshold` (3%); `faster` is the mirror image; `same` when
+the whole interval is within the threshold either way; `inconclusive` otherwise,
+which never means "no change". Fewer than 11 rounds judge nothing: below 15
+rounds the interval is the whole range of the ratios, which misses the median
+with probability 2^(1-n), and 11 is the first count where that is under 0.1%. The table
+warns when guest instructions per iteration differ between A and B, a checksum
+fails, the whole-suite ratio scatters by more than the threshold, or there are
+too few rounds.
+
+* **Short timed runs.** Each kernel runs at `--time-pct 10` (10% of its
+  default length, the shortest the guest runs) and keeps the best of
+  `--repeats 3`, so a round takes a fraction of a full suite. When both builds
+  take `--test-device-run-config` they are given it there. When either is older
+  than that option, `ab` writes the values into a copy of the image both run
+  instead, a compatibility path for such builds. Every run is checked to report
+  the values asked for. An image without those symbols, run by an older build,
+  runs as it is, with a note.
+* **Like builds only.** `ab` reads each binary's `build features:` line and stops
+  when they differ, since a flagged row would not say whether the change or the
+  features caused it. `--across-features` compares them anyway, to measure what
+  a feature costs. A `ci_clock` build is always refused: its clock counts
+  instructions, so every ratio would read as no change.
+* **The image** is the one linked into your `iris-bench`. Pass `--elf FILE` when
+  the builds span a rebuild of `bench/prebuilt/`, which moves every rate with no
+  emulator change.
+* **Pinning.** `--concurrent` starts A and B together each round, so what the
+  host does lands on both. `ab` pins nothing; wrap it, since children inherit
+  affinity: `taskset -c 2-8 iris-bench ab --concurrent ...` on Linux (pick cores
+  that share a cache), `start /wait /affinity 0x1FC iris-bench ab --concurrent
+  ...` on Windows, nothing on macOS.
+
+Every run is saved as an ordinary result (`iris-bench report --dir` reads the
+directory) in `ab-<time>/` under `--out`, with the table as `ab.md`; attach it to
+a performance PR. The result describes this host, these two binaries and this
+image. Run the same binary as A and B to see the noise floor, and rerun a
+suspect kernel before believing it.
 
 ---
 
