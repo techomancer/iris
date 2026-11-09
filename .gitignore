@@ -36,3 +36,4 @@ pcp_dump_pfn_*.bin
 
 # Host baselines built by test/*/*_linux.sh, next to the checked-in IRIX binaries.
 /test/dhrystone/dhrystone
+/test/whetstone/whetstone
