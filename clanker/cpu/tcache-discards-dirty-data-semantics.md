@@ -78,9 +78,9 @@ The four CI cells, built and run exactly as `.github/workflows/suites.yml` does
 
 61 is uniform across every cell — r5000 skips some R4400-only checks (hence the
 lower pass count) but fails the identical fpu set, and jitv2 matches the
-interpreter check-for-check. That number is `CPUTEST_BASELINE` in the workflow's
-`Result` step; the gate fails on *more* than the baseline and prints a notice on
-fewer. Note the historical figures in 29f5602 (121 r4400 / 37 r5000) no longer
+interpreter check-for-check. CI no longer gates on that number: it judges by
+test name against `cpu-tests/expected-failures.txt`, where this test is listed
+for the jitv2 cells only. Note the historical figures in 29f5602 (121 r4400 / 37 r5000) no longer
 hold: FPU rounding/CVT and arithmetic-flag fixes since then changed both.
 
 Those 61 are the long-standing FPU exception-model gaps (no Unimplemented

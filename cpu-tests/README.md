@@ -36,19 +36,37 @@ make run                    # loads the ELF straight into RAM and runs it
 ```
 
 `make run` takes a few minutes — 262 tests, some of which take real exceptions
-or sweep the caches. You get a line per test and a summary:
+or sweep the caches. You get a padded line per test, a
+result line for tools (`1..262` first, then `ok N - name` or `not ok N - name`),
+and a summary:
 
 ```
 alu/addu_sign_extends ...................... PASS
+ok 12 - alu/addu_sign_extends
 ...
- RESULT: 2041 checks passed, 121 failed  (240 tests)
-IRIS-CPUTEST-DONE rc=100
+ RESULT: 2698 checks passed, 48 failed  (262 tests)
+IRIS-CPUTEST-DONE rc=48
 ```
 
 The exit code **is** the failure count, saturated at 100 so that it can never
-collide with the harness's own 127 ("unknown CPU, refusing to run"). The R4400
-cell exceeds that today, so read the `RESULT:` line for the real number.
+collide with the harness's own 127 ("unknown CPU, refusing to run").
 `IRIS-CPUTEST-DONE` is the token to match on if you are scripting it.
+
+### Is this run healthy?
+
+The suite has never passed every check under IRIS. The tests that fail today
+are listed by name, per CPU and engine, in
+[expected-failures.txt](expected-failures.txt). `make check-run` runs the suite
+(through `run/run-local.sh`) and judges the log with `run/check.py`:
+
+```sh
+make check-run CPU=r4400 ENGINE=interp      # IRIS= a build for that engine
+```
+
+It fails when a test fails that the list does not name, when a listed test
+passes (delete its line in the commit that fixed it), or when fewer tests
+report than the `1..N` plan promised. CI runs the same target, with
+`PREBUILT=1` because it holds a downloaded binary and no cross compiler.
 
 ### Other CPUs and engines
 
@@ -61,13 +79,12 @@ cargo build --release --features jitv2               # jitv2 (no env var needed)
 # then add --cpu r5000 to the run command above for an R5000
 ```
 
-`run/matrix.sh` does all four CPU × engine combinations and builds what it
-needs; `CELLS="r4400-jitv2" run/matrix.sh` runs just one. The *Bare-metal
-suites* CI workflow (`.github/workflows/suites.yml`) runs every cell on each
-push that touches the CPU, and gates on known failing-check limits per CPU
-and engine: R4400 124 interpreter / 126 JIT; R5000 108 / 110. The JIT adds two
-transparent-cache failures (dirty-data discard semantics). These limits are
-not a fresh scorecard for every test added since the hardware runs.
+`run/matrix.sh` does all four CPU × engine combinations, building what it
+needs and judging each with `make check-run`; `CELLS="r4400-jitv2"
+run/matrix.sh` runs just one. The *Bare-metal suites* CI workflow
+(`.github/workflows/suites.yml`) runs every cell on each push that touches the
+CPU, through the same target. The JIT adds one expected failure,
+`cache/hit_inv_discards`, because jitv2 implies the transparent cache.
 
 ### Booting it like real hardware
 
@@ -114,8 +131,8 @@ the emulator reports:
 |---|---:|---:|---:|
 | Indy R4400 rev 6.0 | 2164 | **0** | **0** |
 | Indy R5000 rev 1.0 | 2135 | **0** | **0** |
-| IRIS `--cpu r4400` | 2040 | 124 | 27 |
-| IRIS `--cpu r5000` | 2027 | 108 | 22 |
+| IRIS `--cpu r4400` | 2698 | 48 | 15 |
+| IRIS `--cpu r5000` | 2682 | 35 | 10 |
 
 Every emulator failure is a known finding, listed in
 [docs/findings.md](docs/findings.md) — and all 15 of the original FP failures are
