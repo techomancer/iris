@@ -24,3 +24,22 @@ Rules:
   function is the regression.
 
 Fixed in 28d8c01a (back to ×1.02 of `main`).
+
+Broken again by aded5989, this time without losing inlining: it put
+`eprintln!` bus-error reports with a formatted `String` into the hot fetch,
+load and store functions. They never ran on a good access, but the formatting
+code compiled into those functions, and the lightning interpreter lost 8% of
+its suite speed. Fixed by moving the reports into one `#[cold]
+#[inline(never)]` method.
+
+`tools/hot-path-check.sh BINARY` reads a lightning release binary built with
+fat LTO. It fails when any `MipsExecutor` code outside the cold methods named
+in the script calls a formatting function, or when a hit-path `fetch` has its
+own symbol. It cannot see a layout or inlining regression with no formatting in
+it, or allocation without formatting. Without fat LTO, calls into std go through
+the GOT and it reports the binary unreadable. ELF and GNU binutils only.
+
+Open: `handle_exception` prints on its bus-error, address-error and
+coprocessor-unusable branches, and it runs on every guest exception. It is on
+the script's cold list; whether that costs anything on exception-heavy guests
+(IRIX user space: TLB refills, syscalls, interrupts) has not been measured.
