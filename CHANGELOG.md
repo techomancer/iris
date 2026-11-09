@@ -85,6 +85,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Benchmark report
 
 - The per-kernel table has a "vs base" column for every cell and a "native" column for every cell. Both used to divide the best cell by the base or the host, so a slower build still read 1.00x.
+- A rerun under the same label is kept (`<label>.2.json`, `.3.json`) instead of replacing the last result. `report` groups them into one column showing the median, `[min-max]` and the run count, and ratios use the medians.
 
 ### Boot test
 
