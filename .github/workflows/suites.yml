@@ -24,13 +24,10 @@
 # perf threshold would either catch nothing or fire every other week. The
 # figures are still collected and uploaded so a run can be read after the fact.
 #
-# Both suites run in every cell even when the first one fails. cpu-tests exits
-# with its failure count and has known findings (cpu-tests/docs/findings.md),
-# so letting it abort the job would hide the benchmark's accuracy result behind
-# an unrelated red. If you want this workflow to be green-when-healthy rather
-# than red-until-every-finding-is-fixed, gate cpu-tests on "no worse than a
-# recorded baseline" instead of on zero — that still catches regressions, which
-# a permanently-red gate does not.
+# Both suites run in every cell even when the first fails, so a cpu-tests
+# failure never hides the benchmark's accuracy result. cpu-tests has known
+# findings (cpu-tests/docs/findings.md); a cell passes when exactly the tests
+# in cpu-tests/expected-failures.txt fail.
 
 name: Bare-metal suites
 
@@ -194,40 +191,11 @@ jobs:
 
       # ── cpu-tests ────────────────────────────────────────────────────────
       #
-      # Records its result rather than exiting on it, so the benchmark below
-      # still runs and reports. The gate at the end of the job is what turns a
-      # nonzero count red. A timeout or a truncated run is different — that is
-      # the harness being broken rather than the emulator being wrong — and
-      # fails here and now.
+      # continue-on-error so the benchmark still runs; Result turns it red.
       - name: cpu-tests
-        run: |
-          cd cpu-tests
-          chmod +x build/cputest.elf
-          timeout 900 ../target/release/iris \
-            --config run/bare.toml \
-            --cpu ${{ matrix.cpu }} \
-            --load-elf build/cputest.elf \
-            --test-device --test-device-dump build/dump.json \
-            --headless --noaudio 2>&1 | tee build/run.log
-          rc=${PIPESTATUS[0]}
-          echo "CPUTEST_RC=$rc" >> "$GITHUB_ENV"
-          # The exit code saturates at 100 (testlib.c), so it stopped being a
-          # usable count the moment a cell exceeded that. Take the real number
-          # off the RESULT line, which is what the gate below compares.
-          failed=$(grep -oE '^ RESULT: [0-9]+ checks passed, [0-9]+ failed' build/run.log \
-                   | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')
-          echo "CPUTEST_FAILED=${failed:-}" >> "$GITHUB_ENV"
-          if [ "$rc" = "124" ]; then echo "::error::cpu-tests timed out"; exit 1; fi
-          grep -q 'IRIS-CPUTEST-DONE' build/run.log \
-            || { echo "::error::cpu-tests never printed its DONE token"; exit 1; }
-          # A build whose cargo features did not take would run the wrong CPU
-          # and invert every mips4 expectation with no other indication. The
-          # guest's banner is authoritative: it reads the CPU out of PRId.
-          want=$(echo '${{ matrix.cpu }}' | tr 'a-z' 'A-Z')
-          got=$(grep -o 'cpu=[A-Za-z0-9]*' build/run.log | head -1)
-          [ "$got" = "cpu=$want" ] \
-            || { echo "::error::cpu-tests ran $got, expected cpu=$want"; exit 1; }
-          grep -E '^ RESULT:' build/run.log
+        id: cputests
+        continue-on-error: true
+        run: make -C cpu-tests check-run PREBUILT=1 CPU=${{ matrix.cpu }} ENGINE=${{ matrix.engine }}
 
       # ── bench ────────────────────────────────────────────────────────────
       #
@@ -286,79 +254,26 @@ jobs:
         if: matrix.cpu == 'r4400' && matrix.engine == 'interp'
         run: cargo test --release --lib bench_runner -- --ignored --nocapture
 
-      # One place both results are visible, and the only thing that turns a
-      # cpu-tests failure count red.
-      #
-      # The gate is a *baseline*, not zero. cpu-tests has never returned 0:
-      # 29f5602 grew the fpu group to 88 tests and landed 121 known failures
-      # with it, each one a deliberate finding written up in
-      # cpu-tests/docs/findings.md §6-§10 (no Unimplemented Operation, inert
-      # FCSR.FS, a trapped exception still writes its result, FCSR.Cause
-      # accumulates). Those are spec gaps in IRIS's FPU exception model, not
-      # regressions, and the count is the record of them. A later `rc == 0`
-      # gate was therefore unsatisfiable from the day it was written.
-      #
-      # So: more failures than the baseline is a regression and fails. Fewer
-      # means a gap was closed — that passes, and asks for the baseline to come
-      # down, which is what keeps this number honest instead of drifting up.
-      # Lower it in the same commit that closes the gap.
-      #
-      # CPUTEST_BASELINE was uniform at 61 until the suite was validated against
-      # two real Indys (cpu-tests/oracle/). Sixteen expectations turned out to be
-      # wrong in a way IRIS happened to share, so correcting them raised what the
-      # emulator fails — not a regression, a stricter oracle. The baseline is
-      # per cell:
-      #
-      #            interp  jitv2
-      #   r4400     124     126
-      #   r5000     108     110
-      #
-      # Interpreter numbers measured 2026-09-12. Hardware passes 240/240 on both
-      # parts, so every one of these is an emulator bug with a confirmed
-      # counter-example — see cpu-tests/docs/findings.md. jitv2 implies tcache
-      # (since 2026-10-01), which makes L1-D write-through, so
-      # cache/hit_inv_discards fails its 2 checks there by design — see
-      # clanker/cpu/tcache-discards-dirty-data-semantics.md. Otherwise jitv2
-      # matches the interpreter check-for-check.
-      #
-      # Gate on CPUTEST_FAILED, not CPUTEST_RC: the exit code saturates at 100
-      # and both cells are past it.
+      # Both results in one place, and where a cpu-tests failure turns the job red.
       - name: Result
         if: always()
-        env:
-          CPUTEST_BASELINE: ${{ matrix.cpu == 'r4400' && (matrix.engine == 'jitv2' && 126 || 124) || (matrix.engine == 'jitv2' && 110 || 108) }}
         run: |
           {
             echo "### ${{ matrix.cpu }} / ${{ matrix.engine }}"
             echo '```'
-            grep -E '^ RESULT:' cpu-tests/build/run.log 2>/dev/null || echo " cpu-tests: no result"
+            grep -hE '^ RESULT:' cpu-tests/build/*.log 2>/dev/null || echo " cpu-tests: no result"
             grep -E 'accuracy|emulator speed' bench/build/run.log 2>/dev/null | tail -2 \
               || echo " bench: no result"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-          # Unset means the cpu-tests step never recorded a result — the run
-          # died before the gate could learn anything. That is a failure, and
-          # deliberately not the same message as "too many checks failed".
-          if [ -z "${CPUTEST_FAILED:-}" ]; then
-            echo "::error::cpu-tests recorded no result"
-            exit 1
-          fi
-          if [ "$CPUTEST_FAILED" -gt "$CPUTEST_BASELINE" ]; then
-            echo "::error::cpu-tests reported $CPUTEST_FAILED failing checks, baseline is $CPUTEST_BASELINE — $(( CPUTEST_FAILED - CPUTEST_BASELINE )) new"
-            exit 1
-          fi
-          if [ "$CPUTEST_FAILED" -lt "$CPUTEST_BASELINE" ]; then
-            echo "::notice::cpu-tests improved to $CPUTEST_FAILED failing checks (baseline $CPUTEST_BASELINE) — lower CPUTEST_BASELINE in .github/workflows/suites.yml"
-            echo "cpu-tests improved to $CPUTEST_FAILED (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-          fi
+          [ "${{ steps.cputests.outcome }}" = success ]
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: suites-${{ matrix.cpu }}-${{ matrix.engine }}
           path: |
-            cpu-tests/build/run.log
+            cpu-tests/build/*.log
             cpu-tests/build/dump.json
             bench/build/run.log
             bench/build/results/*.json
