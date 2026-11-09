@@ -7,7 +7,6 @@ use super::view::{Kind, Rows, View, MAX_DIM};
 use super::vram::{Format, Surface, ADDR_MASK, PITCH_MASK};
 use super::bits::{be32, be64};
 use crate::devlog::LogModule;
-use std::sync::atomic::Ordering;
 use super::board::{Board, ODSY_CMD_OPERANDS_MAX};
 use super::consts::{
     clip, cmd_arity, dma, gl_cmd, image, mode, query, route, tex, write,
@@ -1212,7 +1211,7 @@ impl Board {
         let seq = self.dma_seq;
         let bus = DmaBus {
             mem: self.guest.clone(),
-            trace_sequence: self.trace_sequence.load(Ordering::Relaxed).wrapping_sub(1),
+            trace_sequence: self.trace_sequence.wrapping_sub(1),
         };
         let mut raw = [0u8; dma::TABLE_HEADER as usize];
         let mut hdr = [0u32; dma::HDR_WORDS];
@@ -1523,7 +1522,7 @@ impl Board {
         let softsync = self.query.sync_index & dma::FENCE_INTERRUPT != 0;
         let bus = DmaBus {
             mem: self.guest.clone(),
-            trace_sequence: self.trace_sequence.load(Ordering::Relaxed).wrapping_sub(1),
+            trace_sequence: self.trace_sequence.wrapping_sub(1),
         };
         let front = self.front.clone();
 

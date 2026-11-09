@@ -408,8 +408,8 @@ pub(super) struct Board {
     /// The vertex side's texture registers.
     pub tex: TexState,
     pub dma_seq: u64,
-    /// Monotonic for this device instance.
-    pub trace_sequence: std::sync::atomic::AtomicU64,
+    /// Monotonic for this device instance. Plain: every user holds `&mut Board`.
+    pub trace_sequence: u64,
     /// The annotated trace (trace.rs), shared with the bus side.
     pub trace: std::sync::Arc<super::trace::Trace>,
 
@@ -606,7 +606,7 @@ impl Default for Board {
                 linear_valid: 0,
             },
             dma_seq: 0,
-            trace_sequence: std::sync::atomic::AtomicU64::new(0),
+            trace_sequence: 0,
             trace: Default::default(),
             #[cfg(test)]
             test_slice_sleep_ms: 0,

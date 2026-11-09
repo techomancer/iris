@@ -203,7 +203,8 @@ impl Board {
             return self.front.lock().read(addr, size);
         }
         let mut value: u64 = 0;
-        let sequence = self.trace_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.trace_sequence;
+        self.trace_sequence = sequence.wrapping_add(1);
 
         if display_fifo_access(addr, size, false) {
             value = self.display_fifo.lock().read(addr, size);
