@@ -111,6 +111,19 @@ enum Cmd {
     /// Save the guest screen (any graphics board) to a PNG.
     Screenshot { path: PathBuf },
 
+    /// Write a JUnit report of checks a script has made, one case per
+    /// --case, so a CI test reporter can name the one that failed. Needs no
+    /// emulator. A case is `pass|SECONDS|NAME[|OUTPUT]` or
+    /// `fail|SECONDS|NAME|MESSAGE`.
+    Junit {
+        path: PathBuf,
+        /// The suite and class every case is filed under.
+        #[arg(long)]
+        suite: String,
+        #[arg(long = "case", required = true)]
+        cases: Vec<String>,
+    },
+
     /// Send keystrokes to the IRIX serial console.
     SerialSend {
         text: String,
@@ -305,6 +318,11 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::Gc                    => cmd_gc(opts),
         Cmd::Validate { name, n }  => cmd_validate(opts, &name, n),
         Cmd::Screenshot { path }   => simple(opts, "screenshot", json!({"path": path.display().to_string()}), "screenshot"),
+        Cmd::Junit { path, suite, cases } => {
+            let cases = cases.iter().map(|c| junit_case(c)).collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::Local)?;
+            iris::junit::write(iris::junit::suite(&suite, cases), &path).map_err(Error::Local)
+        }
 
         Cmd::SerialSend { text, no_cr } => {
             let data = if no_cr { text } else { format!("{}\r", text) };
@@ -467,6 +485,30 @@ fn exchange(reader: &mut impl BufRead, writer: &mut impl Write, cmd: &str, args:
 }
 
 // ---- 1:1 commands with pretty output -----------------------------------------
+
+/// One `--case` of `iris-ci junit`: `pass|SECONDS|NAME[|OUTPUT]` or
+/// `fail|SECONDS|NAME|MESSAGE`. The message is everything after the third
+/// `|`, so it may contain one.
+fn junit_case(spec: &str) -> std::result::Result<iris::junit::TestCase, String> {
+    use iris::junit::{Duration, TestCase};
+    let mut f = spec.splitn(4, '|');
+    let (status, secs, name, text) = (f.next().unwrap_or(""), f.next(), f.next(), f.next().unwrap_or(""));
+    let (Some(secs), Some(name)) = (secs, name.filter(|n| !n.is_empty())) else {
+        return Err(format!("case {spec:?}: expected STATUS|SECONDS|NAME[|TEXT]"));
+    };
+    let secs: f64 = secs.parse().ok().filter(|s: &f64| s.is_finite() && *s >= 0.0)
+        .ok_or_else(|| format!("case {spec:?}: {secs:?} is not a number of seconds"))?;
+    let time = Duration::seconds_f64(secs);
+    match status {
+        "pass" => {
+            let mut case = TestCase::success(name, time);
+            if !text.is_empty() { case.set_system_out(text); }
+            Ok(case)
+        }
+        "fail" => Ok(TestCase::failure(name, time, "check", text)),
+        _ => Err(format!("case {spec:?}: the status is pass or fail")),
+    }
+}
 
 fn simple(opts: &Opts, cmd: &str, args: Value, ok_msg: &str) -> Result<()> {
     let data = send(opts, cmd, args)?;
@@ -1288,5 +1330,19 @@ mod tests {
         assert!(!typed.contains(&marker));
         let buf = format!("echo IRIS-CI-RC=7\r\nIRIS-CI-RC=7\r\nIRIS 3# {}", marker);
         assert_eq!(extract_run_stdout(&buf, &marker), "IRIS-CI-RC=7");
+    }
+
+    #[test]
+    fn a_junit_case_reads_its_status_time_name_and_text() {
+        let c = junit_case("fail|12.5|serial login|no login: within 600s | still booting").unwrap();
+        assert_eq!(c.name, "serial login");
+        assert_eq!(c.time, iris::junit::Duration::seconds_f64(12.5));
+        assert!(matches!(&c.result, iris::junit::TestResult::Failure { message, .. }
+            if message == "no login: within 600s | still booting"));
+        let c = junit_case("pass|0|iris quits cleanly").unwrap();
+        assert!(c.is_success());
+        for bad in ["ok|1|x", "pass|soon|x", "pass|-1|x", "pass|1", "pass|1|"] {
+            assert!(junit_case(bad).is_err(), "{bad}");
+        }
     }
 }
