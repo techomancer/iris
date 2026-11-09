@@ -42,13 +42,20 @@ struct Response {
     data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Set on an error that is a wait running out, so a client can tell
+    /// "not yet" from "failed" without reading the message.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    timeout: bool,
 }
 
 impl Response {
-    fn ok() -> Self { Self { ok: true, data: None, error: None } }
-    fn data(v: Value) -> Self { Self { ok: true, data: Some(v), error: None } }
+    fn ok() -> Self { Self { ok: true, data: None, error: None, timeout: false } }
+    fn data(v: Value) -> Self { Self { ok: true, data: Some(v), error: None, timeout: false } }
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, data: None, error: Some(msg.into()) }
+        Self { ok: false, data: None, error: Some(msg.into()), timeout: false }
+    }
+    fn timed_out(msg: impl Into<String>) -> Self {
+        Self { timeout: true, ..Self::err(msg) }
     }
 }
 
@@ -677,7 +684,7 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
             let s = String::from_utf8_lossy(&consumed).into_owned();
             Response::data(Value::String(s))
         }
-        None => Response::err(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
+        None => Response::timed_out(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
     }
 }
 
@@ -1257,5 +1264,17 @@ fn cmd_push(args: &Value) -> Response {
             "bytes_transferred": report.bytes_transferred,
         })),
         Err(e) => Response::err(format!("push: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_wait_that_ran_out_says_timeout() {
+        let wire = |r: Response| serde_json::to_value(r).unwrap();
+        assert_eq!(wire(Response::err("x")), serde_json::json!({"ok": false, "error": "x"}));
+        assert_eq!(wire(Response::timed_out("x")), serde_json::json!({"ok": false, "error": "x", "timeout": true}));
     }
 }
