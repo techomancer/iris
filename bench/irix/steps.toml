@@ -164,6 +164,11 @@ unit = "grab"
 work = 20
 cmd = "i=0; while [ $i -lt 20 ]; do xwd -root -silent > /dev/null; i=`expr $i + 1`; done"
 requires = "xwd"
+# An X client waits forever on a server that is not answering, as it did on an
+# Indy sitting at the xdm login with no window attached. Give up, fail the step
+# and move on. The timeouts on the X steps are guesses with room to spare: how
+# long these steps take on a working X server was not recorded.
+timeout = 60
 
 [[step]]
 name = "gfx/x11perf_rects"
@@ -171,6 +176,7 @@ unit = "op"
 work = 0
 cmd = "x11perf -reps 3 -rect500 2>&1"
 requires = "x11perf"
+timeout = 300
 
 [[step]]
 name = "gfx/x11perf_scroll"
@@ -178,6 +184,7 @@ unit = "op"
 work = 0
 cmd = "x11perf -reps 3 -scroll500 2>&1"
 requires = "x11perf"
+timeout = 300
 
 # ── cleanup ─────────────────────────────────────────────────────────────────
 
