@@ -306,7 +306,7 @@ every result, so a shortened run cannot be mistaken for a full one —
 iris-bench run     [--quick] [--label NAME] [--iris PATH [--elf PATH]]
 iris-bench host    # measure this machine with the same kernels
 iris-bench matrix  [--cells r4400-interp,r5000-jitv2] [--force-build]
-iris-bench report  [--baseline CELL] [--format md|json|text]
+iris-bench report  [--baseline CELL] [--format md|json|text] [--across-features]
 iris-bench reference --id ID [--into data/bench_reference.json]
 iris-bench cells   # what matrix knows how to build
 ```
@@ -361,6 +361,13 @@ checksum mismatches, any unexpected exceptions, and per-cell time-share and
 efficiency rankings. A rerun under the same label is kept as `<label>.2.json`,
 `<label>.3.json` and so on; the report shows such a cell as one column, with the
 median, `[min-max]` and the number of runs, and ratios use the medians.
+
+A ratio is only printed between cells that ran alike: the same guest image, run
+length (quick or full), clock (timed or `ci_clock`), host CPU and emulator build
+features. Where they differ, `report` warns, names the cells, and prints `n/c`
+in place of the ratio. `--across-features` allows differing features, which is
+what `matrix` does, since comparing feature sets is its point. A `ci_clock` run
+reads `n/c` against timed runs, since its rates are constants of the build.
 
 ---
 
