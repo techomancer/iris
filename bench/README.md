@@ -456,6 +456,11 @@ installed rather than failed — IRIX installs vary enormously and a missing
 `x11perf` is not a benchmark result. A `requires` with a slash in it tests that
 exact path.
 
+A skipped step leaves a `SKIP` row in the saved result. A step whose command
+exits nonzero leaves a `FAILED` row with no time, the last three lines it
+printed go to the console, and the suite carries on. So end a step on a command
+whose status is the step's: a pipe reports only its last command's.
+
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
 Commands run as `sh -c '<cmd>'` with an IRIX-shaped PATH whatever the login

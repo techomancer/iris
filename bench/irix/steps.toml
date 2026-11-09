@@ -169,14 +169,14 @@ requires = "xwd"
 name = "gfx/x11perf_rects"
 unit = "op"
 work = 0
-cmd = "x11perf -reps 3 -rect500 2>&1 | tail -2"
+cmd = "x11perf -reps 3 -rect500 2>&1"
 requires = "x11perf"
 
 [[step]]
 name = "gfx/x11perf_scroll"
 unit = "op"
 work = 0
-cmd = "x11perf -reps 3 -scroll500 2>&1 | tail -2"
+cmd = "x11perf -reps 3 -scroll500 2>&1"
 requires = "x11perf"
 
 # ── cleanup ─────────────────────────────────────────────────────────────────

@@ -475,32 +475,65 @@ struct Ci {
     timeout: u64,
 }
 
+/// How one command run in the guest ended, from `iris-ci run`'s exit status.
+enum Outcome {
+    /// `secs` is host wall time around the `iris-ci run`.
+    Done { out: String, secs: f64 },
+    /// The command ran and exited nonzero. `said` is iris-ci's message, which
+    /// names the status, for the console.
+    Failed { out: String, said: String },
+}
+
+impl Outcome {
+    /// For commands whose failure means the harness is broken, not the step.
+    fn done(self) -> Result<(String, f64), String> {
+        match self {
+            Outcome::Done { out, secs } => Ok((out, secs)),
+            Outcome::Failed { said, .. } => Err(format!("guest command failed: {said}")),
+        }
+    }
+}
+
+/// `iris-ci run`'s exit status when the guest command exited nonzero (see
+/// src/iris_ci_main.rs).
+const IRIS_CI_GUEST_FAILED: i32 = 4;
+
+/// Read how an `iris-ci run` ended from its exit status. Any failure other
+/// than the guest command's (no emulator, no socket) is an error: the run
+/// cannot go on.
+fn classify(status: Option<i32>, out: String, stderr: &str, secs: f64) -> Result<Outcome, String> {
+    let said = stderr.trim().to_string();
+    match status {
+        Some(0) => Ok(Outcome::Done { out, secs }),
+        Some(IRIS_CI_GUEST_FAILED) => Ok(Outcome::Failed { out, said }),
+        _ => Err(format!("iris-ci run failed: {said}")),
+    }
+}
+
 impl Ci {
-    /// Returns the guest's stdout. An iris-ci failure is an error; a nonzero
-    /// exit status inside the guest is not — several steps end on a command
-    /// that legitimately returns nonzero.
-    fn run(&self, guest_cmd: &str) -> Result<(String, f64), String> {
+    /// Run `guest_cmd`, waiting `secs` for it (`self.timeout` when `None`). An
+    /// `Err` means the guest could not be asked; a command that ran and failed
+    /// is an `Ok`.
+    fn run(&self, guest_cmd: &str, secs: Option<u64>) -> Result<Outcome, String> {
+        let secs = secs.unwrap_or(self.timeout);
         let mut cmd = Command::new(&self.bin);
         if let Some(s) = &self.socket { cmd.arg("--socket").arg(s); }
         cmd.arg("run")
             .arg(guest_cmd)
             .arg("--shell").arg(&self.shell)
-            .arg("--timeout").arg(self.timeout.to_string());
+            .arg("--timeout").arg(secs.to_string());
         let started = Instant::now();
-        let out = run_with_timeout(cmd, self.timeout + 30)?;
-        let secs = started.elapsed().as_secs_f64();
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        if !out.status.success() && stdout.trim().is_empty() {
-            return Err(format!(
-                "iris-ci run failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok((stdout, secs))
+        let out = run_with_timeout(cmd, secs + 30)?;
+        classify(
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            &String::from_utf8_lossy(&out.stderr),
+            started.elapsed().as_secs_f64(),
+        )
     }
 
     fn has(&self, prog: &str) -> Result<bool, String> {
-        let (out, _) = self.run(&wrap(&probe_command(prog)))?;
+        let (out, _) = self.run(&wrap(&probe_command(prog)), None)?.done()?;
         Ok(out.contains("IRISBENCH-HAVE"))
     }
 
@@ -511,10 +544,26 @@ impl Ci {
     fn baseline(&self) -> Result<f64, String> {
         let mut best = f64::MAX;
         for _ in 0..3 {
-            let (_, s) = self.run(&wrap(":"))?;
+            let (_, s) = self.run(&wrap(":"), None)?.done()?;
             if s < best { best = s; }
         }
         Ok(best)
+    }
+}
+
+fn row(step: &Step, ns: u64, status: &str) -> Row {
+    Row {
+        name: step.name.clone(),
+        unit: step.unit.clone(),
+        iters: 1,
+        work: step.work,
+        ns,
+        icount: 0,
+        count: 0,
+        exc: 0,
+        checksum: "0x0000000000000000".into(),
+        golden: "0x0000000000000000".into(),
+        status: status.into(),
     }
 }
 
@@ -526,7 +575,7 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
 
     // Identify the guest before anything else: a result recorded against the
     // wrong disk image is worse than no result.
-    let (uname, _) = ci.run(&wrap("uname -a"))?;
+    let (uname, _) = ci.run(&wrap("uname -a"), None)?.done()?;
     let cpu = uname.lines().find(|l| l.contains("IRIX")).unwrap_or("IRIX").trim().to_string();
     println!("  guest: {}", cpu);
 
@@ -536,16 +585,33 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
     let mut rows = Vec::new();
     let mut total_ns = 0u64;
 
+    // A step that fails or is skipped gets a row of its own and the suite goes
+    // on: one missing tool or broken workload says nothing about the next step.
     for step in &file.step {
         if let Some(prog) = &step.requires {
             if !ci.has(prog)? {
                 println!("  {:<22} skipped ({} not installed)", step.name, prog);
+                rows.push(row(step, 0, "SKIP"));
                 continue;
             }
         }
-        if let Some(setup) = &step.setup { ci.run(&wrap(setup))?; }
+        let mut o = match &step.setup {
+            Some(setup) => ci.run(&wrap(setup), None)?,
+            None => Outcome::Done { out: String::new(), secs: 0.0 },
+        };
+        let in_setup = !matches!(o, Outcome::Done { .. });
+        if !in_setup { o = ci.run(&wrap(&step.cmd), None)?; }
 
-        let (_, secs) = ci.run(&wrap(&step.cmd))?;
+        let secs = match o {
+            Outcome::Done { secs, .. } => secs,
+            Outcome::Failed { out, said } => {
+                println!("  {:<22} FAILED ({}{})", step.name,
+                         if in_setup { "setup: " } else { "" }, said.trim_start_matches("iris-ci: "));
+                for l in tail(out.trim_end(), 3).lines() { println!("      {l}"); }
+                rows.push(row(step, 0, "FAILED"));
+                continue;
+            }
+        };
         if step.skip_timing { continue; }
 
         let ns = ((secs - baseline).max(0.0) * 1e9) as u64;
@@ -560,21 +626,9 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
                 String::new()
             }
         );
-        rows.push(Row {
-            name: step.name.clone(),
-            unit: step.unit.clone(),
-            iters: 1,
-            work: step.work,
-            ns,
-            icount: 0,
-            count: 0,
-            exc: 0,
-            checksum: "0x0000000000000000".into(),
-            golden: "0x0000000000000000".into(),
-            // Nothing here is checksummed: these are IRIX's own tools against
-            // IRIX's own filesystem, and their output is not ours to predict.
-            status: "UNCHECKED".into(),
-        });
+        // Nothing here is checksummed: these are IRIX's own tools against
+        // IRIX's own filesystem, and their output is not ours to predict.
+        rows.push(row(step, ns, "UNCHECKED"));
     }
 
     Ok(Run {
@@ -1684,5 +1738,19 @@ mod tests {
         // a write that fails takes its partial file with it
         let (ok, out) = cold_setup("Main memory size: 256 Mbytes", 1);
         assert!(!ok && out.contains("rm -f /tmp/irisbench2.dat") && !out.contains("sync"), "{out}");
+    }
+
+    #[test]
+    fn iris_ci_s_exit_status_says_how_a_run_ended() {
+        assert!(matches!(classify(Some(0), String::new(), "", 1.0), Ok(Outcome::Done { .. })));
+        match classify(Some(4), "x\n".into(), "iris-ci: guest exit 3\n", 1.0) {
+            Ok(Outcome::Failed { out, said }) => assert_eq!((out.as_str(), said.as_str()), ("x\n", "iris-ci: guest exit 3")),
+            _ => panic!("status 4 is a failed step"),
+        }
+        // The status decides, not the words.
+        assert!(classify(Some(2), String::new(), "iris-ci: iris error: guest exit 3\n", 1.0).is_err());
+        // No emulator to talk to: the run stops, it is not a step result.
+        assert!(classify(Some(1), String::new(), "iris-ci: connect /x: refused\n", 1.0).is_err());
+        assert!(classify(None, String::new(), "", 1.0).is_err());
     }
 }
