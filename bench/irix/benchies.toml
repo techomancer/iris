@@ -1,0 +1,45 @@
+# Guest steps for the benchies, programs built from source in this repository:
+# Dhrystone 2.1 (test/dhrystone), the C Whetstone (test/whetstone) and iris_bench
+# (test/ib). `iris-bench irix` runs this file after steps.toml unless --steps
+# names other files.
+#
+# Copy the binaries into the guest first. One way is `iris-ci put`, which needs
+# a scratch volume in iris.toml (a `[scsi.2]` entry with `scratch = true`, see
+# STORAGE.md). From the repo root:
+#
+#   iris-ci run "mkdir -p /usr/bench"
+#   iris-ci put test/dhrystone/dhrystone.n32 --to /usr/bench/dhrystone.n32
+#   iris-ci put test/whetstone/whetstone.n32 --to /usr/bench/whetstone.n32
+#   iris-ci put test/ib/iris_bench           --to /usr/bench/iris_bench
+#   iris-ci run "chmod +x /usr/bench/dhrystone.n32 /usr/bench/whetstone.n32 /usr/bench/iris_bench"
+#
+# `put` does not set the execute bit. If iris runs in a container, the host
+# path given to `put` must be visible at the same path inside it. A `requires`
+# with a path tests that exact file, so a step whose binary is missing is
+# skipped, not failed.
+#
+# Dhrystone and Whetstone time themselves with time(2), so the figure they print
+# (shown under the step) moves in whole seconds; the host timing around the step
+# is the finer number. They refuse to report under 1 to 2 s, so raise `work` if
+# a faster emulator finishes sooner.
+
+[[step]]
+name = "workload/dhrystone_10M"
+unit = "run"
+work = 10000000
+cmd = "cd /usr/bench; echo 10000000 | ./dhrystone.n32"
+requires = "/usr/bench/dhrystone.n32"
+
+[[step]]
+name = "workload/whetstone_100k"
+unit = "loop"
+work = 100000
+cmd = "cd /usr/bench; ./whetstone.n32 100000"
+requires = "/usr/bench/whetstone.n32"
+
+[[step]]
+name = "workload/iris_bench_x20"
+unit = "rep"
+work = 20
+cmd = "cd /usr/bench; ./iris_bench 20"
+requires = "/usr/bench/iris_bench"
