@@ -91,6 +91,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - A failed `run --iris` shows the emulator's exit status and the tail of its stderr as well as its stdout. A run killed for timing out keeps what the emulator printed before it hung.
 - `run --deterministic --iris` reads the emulator's build features first and refuses a binary without `ci_clock`, which would have produced a timed run saved as deterministic. Lightning builds are no longer passed `--jitv2-compile sync`, which they reject.
 - A lightning build is its own engine in the GUI's reference comparison. It was compared with the plain interpreter's row, though lightning compiles out breakpoints and traceback to run faster.
+- `iris --test-device-run-config time_pct=N,repeats=N,groups=MASK` (config key `test_device_run_config`) sets the run configuration the test device publishes, so a bare-metal benchmark started from the command line can be asked for a shorter run, as the in-process runner's `--quick` already could.
 
 ### Boot test
 

@@ -159,6 +159,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `load_elf` | `unset` | Load a static big-endian MIPS ELF32 binary before starting the CPU. |
 | `test_device` | `false` | Map the bare-metal test device in GIO slot 0. |
 | `test_device_dump` | `iris-testdev-dump.json when unset` | Test-device machine-state JSON output. |
+| `test_device_run_config` | `unset` | What the test device's run-configuration register publishes, as `time_pct=N,repeats=N,groups=MASK` (any of them); the benchmark suite reads it to shorten its run. Needs `test_device`. |
 | `cheritest_dump_hook` | `false` | CP0 register 26 dump convention; needs test_device, unsafe for normal PROM boot. |
 | `nat_subnet` | `192.168.0.0/24 when unset` | CIDR; NAT gateway network+1 and guest network+2. |
 | `ci` | `false` | CI server/serial backend; hides host window unless ci_display, keeps offscreen graphics. |
@@ -520,6 +521,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--serial-log-a`, `--serial-log-b` | Log what the guest sends on channel A or B when it is not the console. |
 | `--test-device` | Map the bare-metal test device into GIO expansion slot 0: SIGNATURE, PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT (terminate with the guest's exit code). Off by default. |
 | `--test-device-dump` | Where the test device writes its machine-state dump. |
+| `--test-device-run-config` | Ask a bare-metal guest for a shorter run through the test device: `time_pct=N,repeats=N,groups=MASK`, any of them (`test_device_run_config`). Needs --test-device. |
 | `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs --test-device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
 | `--tftp-dir` | Serve this directory read-only over TFTP at the gateway address, so the PROM can network-boot from it: `boot -f bootp()<file>`. Off when unset. |
 | `--rsh-dir` | Let the guest `rsh <gateway> cat\|dd\|ls\|echo\|pwd` against this directory, read-only, through a built-in rsh server at the gateway (TCP 514). Nothing is executed on the host. Off when unset. |
