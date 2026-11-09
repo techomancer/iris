@@ -9099,7 +9099,9 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
     // signalling predicates (funct bit 3) whenever either operand is any
     // NaN — mirrors `exec_fcc_s`/`exec_fcc_d`'s `invalid` computation
     // exactly. `is_snan`: exponent all-1s, mantissa nonzero, mantissa MSB
-    // set (the original MIPS NaN encoding).
+    // set (the original MIPS NaN encoding). Ordinary operands take one
+    // unordered test and skip the classification, as the interpreter does.
+    use cranelift_codegen::ir::condcodes::FloatCC;
     let is_snan = |b: &mut cranelift_frontend::FunctionBuilder, bits: ir::Value, is_d: bool| -> ir::Value {
         if is_d {
             let exp_mantissa_nonzero = {
@@ -9126,20 +9128,31 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
             b.ins().band(exp_mantissa_nonzero, snan_bit_set)
         }
     };
-    let a_snan = is_snan(ctx.builder, a_bits, is_d);
-    let b_snan = is_snan(ctx.builder, b_bits, is_d);
-    let has_snan = ctx.builder.ins().bor(a_snan, b_snan);
+    let unordered = ctx.builder.ins().fcmp(FloatCC::Unordered, a, b);
+    let nan_block = ctx.builder.create_block();
+    let invalid_block = ctx.builder.create_block();
+    let invalid_param = ctx.builder.append_block_param(invalid_block, ir::types::I32);
+    let no_invalid = ctx.builder.ins().iconst(ir::types::I32, 0);
+    ctx.builder.ins().brif(unordered, nan_block, &[], invalid_block, &[ir::BlockArg::Value(no_invalid)]);
 
-    let invalid = if funct & 0x8 != 0 {
-        use cranelift_codegen::ir::condcodes::FloatCC;
-        let a_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, a, a);
-        let b_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, b, b);
-        let either_nan = ctx.builder.ins().bor(a_nan, b_nan);
-        ctx.builder.ins().bor(has_snan, either_nan)
+    // Cold: a NaN operand on a compare is a rare edge case.
+    ctx.builder.switch_to_block(nan_block);
+    ctx.builder.set_cold_block(nan_block);
+    ctx.builder.seal_block(nan_block);
+    let nan_invalid = if funct & 0x8 != 0 {
+        // A NaN is present and the predicate signals: Invalid either way.
+        ctx.builder.ins().iconst(ir::types::I32, 1)
     } else {
-        has_snan
+        let a_snan = is_snan(ctx.builder, a_bits, is_d);
+        let b_snan = is_snan(ctx.builder, b_bits, is_d);
+        let has_snan = ctx.builder.ins().bor(a_snan, b_snan);
+        ctx.builder.ins().uextend(ir::types::I32, has_snan)
     };
-    let invalid = ctx.builder.ins().uextend(ir::types::I32, invalid);
+    ctx.builder.ins().jump(invalid_block, &[ir::BlockArg::Value(nan_invalid)]);
+
+    ctx.builder.switch_to_block(invalid_block);
+    ctx.builder.seal_block(invalid_block);
+    let invalid = invalid_param;
 
     // Cause reflects only the last instruction (rewritten every compare,
     // not just when this one raises Invalid), matching the interpreter.

@@ -5646,6 +5646,34 @@ mod tests {
         }
     }
 
+    /// Compiled C.cond.fmt skips the signalling-NaN classification for ordinary
+    /// operands. Every one of the 16 predicates, with ordinary, quiet and
+    /// signalling NaN operands in both slots, a stale Cause, a condition code
+    /// already set and Invalid trapped or not, must still match the
+    /// interpreter, which the assertion helper compares in full (FCSR, flags,
+    /// condition codes, exception status).
+    #[test]
+    fn fcc_every_predicate_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FC_F, FUNCT_FC_NGT, OP_COP1, RS_D, RS_S};
+        for (fmt, quiet, signalling, one, two) in [
+            (RS_S, 0x7FBF_FFFFu64, 0x7FC0_0000u64, 0x3F80_0000u64, 0x4000_0000u64),
+            (RS_D, 0x7FF7_FFFF_FFFF_FFFF, 0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000),
+        ] {
+            for funct in FUNCT_FC_F..=FUNCT_FC_NGT {
+                for fcsr in [0u32, 0x0800, 0x0001_f000 | 0x0080_0000 | 0x04, 0x0001_f800 | 0x0080_0000] {
+                    for (fs, ft) in [(one, two), (two, one), (one, one), (quiet, one), (one, quiet),
+                                     (signalling, one), (one, signalling), (quiet, signalling)] {
+                        let mut fpr = [0u64; 32];
+                        fpr[1] = fs;
+                        fpr[2] = ft;
+                        assert_fpu_matches_interpreter_fcsr(
+                            make_r(OP_COP1, fmt, 2, 1, 0, funct), [0u64; 32], fpr, true, Some(fcsr));
+                    }
+                }
+            }
+        }
+    }
+
     /// ADD/SUB/MUL/DIV on operands whose results reach the top of the
     /// range (±MAX, ±infinity, NaN), in every rounding mode, trapped and
     /// untrapped: the JIT's cold classifier call must agree with the
