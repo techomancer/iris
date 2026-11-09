@@ -3639,17 +3639,23 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     pub fn update_translate_fn(&mut self) {
         use crate::cpu::mips_core::PrivilegeMode;
-        let is_64bit = self.core.is_64bit_mode();
-        self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER && is_64bit { 3 } else { 0 };
         let privilege = self.core.get_privilege_mode();
-        self.translate_fn = match (is_64bit, privilege) {
-            (false, PrivilegeMode::Kernel)     => translate_32_kernel::<T, C>,
-            (false, PrivilegeMode::Supervisor) => translate_32_supervisor::<T, C>,
-            (false, PrivilegeMode::User)       => translate_32_user::<T, C>,
-            (true,  PrivilegeMode::Kernel)     => translate_64_kernel::<T, C>,
-            (true,  PrivilegeMode::Supervisor) => translate_64_supervisor::<T, C>,
-            (true,  PrivilegeMode::User)       => translate_64_user::<T, C>,
+        let status = self.core.cp0_status;
+        // The addressing mode is the Status bit of the current privilege level.
+        // It is derived here, once, and `lwr_upper_below` follows it in the same
+        // arm that picks the translator, so no separate mode test is left.
+        let (translate_fn, wide): (fn(&mut Self, u64, AccessType) -> TranslateResult, u8) = match privilege {
+            PrivilegeMode::Kernel if status & STATUS_KX != 0     => (translate_64_kernel::<T, C>, 3),
+            PrivilegeMode::Kernel                                => (translate_32_kernel::<T, C>, 0),
+            PrivilegeMode::Supervisor if status & STATUS_SX != 0 => (translate_64_supervisor::<T, C>, 3),
+            PrivilegeMode::Supervisor                            => (translate_32_supervisor::<T, C>, 0),
+            PrivilegeMode::User if status & STATUS_UX != 0       => (translate_64_user::<T, C>, 3),
+            PrivilegeMode::User                                  => (translate_32_user::<T, C>, 0),
         };
+        self.translate_fn = translate_fn;
+        // A partial LWR keeps the upper word below this offset: 3 in 64-bit mode
+        // on the R10000 family, else 0.
+        self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER { wide } else { 0 };
     }
 
     /// Re-derive `fpr_read_d/write_d/read_l/write_l` from STATUS_FR.

@@ -7313,6 +7313,56 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
     }
 
+    /// A partial LWR keeps rt[63:32] only on the R10000 family, and only while the
+    /// current privilege level's own addressing bit (KX, SX or UX) is set. Runs the
+    /// instruction after each way the mode changes: a Status write at each level,
+    /// an exception entry (EXL forces kernel, KX decides) and ERET. Fix: partial LWR.
+    #[test]
+    fn lwr_keeps_the_upper_word_only_in_64_bit_mode_on_the_r10000() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_KX, STATUS_SX, STATUS_UX};
+        const SUPERVISOR: u32 = 1 << 3;
+        const USER: u32 = 2 << 3;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mem = Arc::new(MockMemory::new());
+            mem.set_word(0x2000, 0x1122_3344);
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            // LWR at offset 0 merges one byte into rt[7:0] and, in 64-bit mode on
+            // the R10000, leaves rt[63:32] alone.
+            let lwr = |exec: &mut MipsExecutor<PassthroughTlb, C>, what: &str, wide: bool| {
+                exec.core.write_gpr(4, 0xAABB_CCDD_FFFF_FF00);
+                assert_eq!(exec.exec(make_i(OP_LWR, 0, 4, 0x2000)), EXEC_COMPLETE, "{what}");
+                let want = if wide && keeps_upper { 0xAABB_CCDD_FFFF_FF11 } else { 0xFFFF_FFFF_FFFF_FF11 };
+                assert_eq!(exec.core.read_gpr(4), want, "{} {what}", C::NAME);
+            };
+            // Each level against each of the three bits: only its own counts.
+            for (ksu, name, own) in [(0, "kernel", STATUS_KX), (SUPERVISOR, "supervisor", STATUS_SX), (USER, "user", STATUS_UX)] {
+                for bits in [0, STATUS_KX, STATUS_SX, STATUS_UX, STATUS_KX | STATUS_SX | STATUS_UX] {
+                    exec.set_cp0_status(ksu | bits);
+                    lwr(&mut exec, &format!("{name} status {bits:#x}"), bits & own != 0);
+                }
+            }
+            // Exception entry from 64-bit user mode: EXL forces kernel, KX clear.
+            exec.set_cp0_status(USER | STATUS_UX);
+            lwr(&mut exec, "user UX before the exception", true);
+            exec.core.pc = 0x40_0000;
+            exec.exec(make_r(OP_SPECIAL, 0, 0, 0, 0, FUNCT_SYSCALL));
+            assert_ne!(exec.core.cp0_status & STATUS_EXL, 0);
+            lwr(&mut exec, "in the handler, KX clear", false);
+            // ERET back to 64-bit user mode.
+            assert_eq!(exec.exec(0x4200_0018), EXEC_COMPLETE, "ERET");
+            lwr(&mut exec, "after ERET to user UX", true);
+            // Exception entry with KX set stays 64-bit.
+            exec.set_cp0_status(USER | STATUS_UX | STATUS_KX);
+            exec.core.pc = 0x40_0000;
+            exec.exec(make_r(OP_SPECIAL, 0, 0, 0, 0, FUNCT_SYSCALL));
+            lwr(&mut exec, "in the handler, KX set", true);
+        }
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+    }
+
     /// Config SS (bits 18:16) is log2(secondary size / 512 KB) and SB (bit 13) is
     /// set for 128-byte lines (NEC U10278EJ4V0UM p.230): a 2 MB R12000 reads
     /// SS=2, and the O2's 64-byte lines clear SB. Fix: Config reports each part.
