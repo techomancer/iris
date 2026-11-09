@@ -5079,8 +5079,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             TlbResult::Miss { .. } => {
                 if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                 // Miss: XTLB vector (0x080) for 64-bit extended addresses, UTLB vector (0x000) otherwise
-                let xrefill = if C::R10K_FAMILY { self.r10k_xtlb_refill::<XTLB>(virt_addr) } else { XTLB != 0 };
-                TranslateResult::exc(if xrefill { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
+                if C::R10K_FAMILY {
+                    TranslateResult::exc(self.r10k_refill_status::<XTLB>(virt_addr, tlb_miss_code))
+                } else {
+                    TranslateResult::exc(if XTLB != 0 { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
+                }
             }
             TlbResult::Invalid { .. } => {
                 if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
@@ -5106,6 +5109,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Region 0 is UX, 1 is SX, 2 and 3 are KX: three adjacent Status bits.
         let bit = (va >> 62).min(2) as u32;
         (self.core.cp0_status & (STATUS_UX << bit)) != 0
+    }
+
+    /// The refill exception status for a miss on `virt_addr`, vector chosen by
+    /// [`Self::r10k_xtlb_refill`]. Out of line so the lookup's common path does
+    /// not keep the address live across the TLB call for it.
+    #[cold]
+    #[inline(never)]
+    fn r10k_refill_status<const XTLB: u8>(&self, virt_addr: u64, code: u32) -> ExecStatus {
+        if self.r10k_xtlb_refill::<XTLB>(virt_addr) { exec_xtlb_miss(code) } else { exec_tlb_miss(code) }
     }
 
     /// Debug helper to translate address without side effects
