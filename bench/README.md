@@ -446,13 +446,15 @@ iris-bench irix
 ```
 
 Steps live in `bench/irix/steps.toml` and are ordinary shell one-liners: `dd`
-through the filesystem cold and warm, 500 small files created/stat'd/removed,
-`sum`/`compress`/`gzip`/`tar`, 256 MB through the read/write syscall pair with
-no disk in the path, a loopback ping flood, and `xwd` reading the root window
-back out of the framebuffer. A step naming a `requires` program is **skipped**
-when that program is not installed rather than failed — IRIX installs vary
-enormously and a missing `x11perf` is not a benchmark result. A `requires` with
-a slash in it tests that exact path.
+through the filesystem cold and warm (the cold read follows a write of one and
+a half times the guest's memory, so it comes from the disk, not the buffer
+cache), 500 small files created/stat'd/removed, `sum`/`compress`/`gzip`/`tar`,
+256 MB through the read/write syscall pair with no disk in the path, a loopback
+ping flood, and `xwd` reading the root window back out of the framebuffer. A
+step naming a `requires` program is **skipped** when that program is not
+installed rather than failed — IRIX installs vary enormously and a missing
+`x11perf` is not a benchmark result. A `requires` with a slash in it tests that
+exact path.
 
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
