@@ -5261,7 +5261,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 if r.status != BUS_BUSY {
                     self.report_bus_error(BusErrorOp::Fetch, 4, virt_addr, phys_addr, 0, 0, r.status);
                 }
-                FetchInstrResult::exception(r.status)
+                FetchInstrResult::fault(r.status)
             }
         }
     }

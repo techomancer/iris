@@ -461,7 +461,7 @@ impl<
         let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, *self.tc_bitmap.get()) };
         match dc.fetch(phys_addr, window, bitmap, IC_LINE, word) {
             Ok(p) => FetchInstrResult::hit(p),
-            Err(status) => FetchInstrResult::exception(status),
+            Err(status) => FetchInstrResult::fault(status),
         }
     }
 
