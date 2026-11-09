@@ -196,6 +196,7 @@ pub struct KonaBackend {
     channels: display::channels::Channels,
     /// What the texture commands did.
     tex_counts: gl::texture::TexCounts,
+    pix_counts: gl::pixels::Counts,
     /// Test hooks: a back end test double that may answer a job.
     #[cfg(test)]
     pub(super) hook: Option<TestHook>,
@@ -256,6 +257,7 @@ impl KonaBackend {
             dac_cursor_refused: 0,
             channels: display::channels::Channels::new(cfg.rm_count),
             tex_counts: Default::default(),
+            pix_counts: Default::default(),
             #[cfg(test)]
             hook: None,
             gl: gl::GlPath::new(cfg.managed),
@@ -454,6 +456,7 @@ impl KonaBackend {
         if let Some(l) = &self.last_layout {
             writeln!(w, "last layout       colour {:?} depth {:?} stencil {:?} multisample {:?} accumulation {:?}", l.colour, l.depth, l.stencil, l.multisample, l.accumulation)?;
         }
+        writeln!(w, "pixel operations  {}", self.pix_counts.render())?;
         for (s, n) in &g.unmodelled {
             writeln!(w, "not taken         {s:#x} x {n}")?;
         }
@@ -521,6 +524,7 @@ impl KonaBackend {
         self.channels.reset();
         self.sync_blank();
         self.tex_counts = Default::default();
+        self.pix_counts = Default::default();
         #[cfg(test)]
         let census = self.gl.census;
         self.gl = gl::GlPath::new(self.cfg.managed);
@@ -782,6 +786,84 @@ impl KonaBackend {
         self.contexts.select(port.context()).tex.load(self.store.texture(), args, &bytes, false, &mut self.tex_counts);
     }
 
+    /// A texel read-back (token 0x052): the named level's texels from the texture arena, packed in the
+    /// requested host format and type by the pixel packer under the pack record, with no header. There are two routes,
+    /// chosen by the client from the size of the read (established): a read of more than 0x3ff0 bytes comes inside a
+    /// select-feed bracket and returns by the bracket's output DMA; a smaller one is bare and returns on the return
+    /// page from offset 8, with the completion word written last. The client has no timeout on the bare form, so
+    /// every read is answered. A level that is not loaded answers zeros, and so does a format or type the packer does
+    /// not know (the whole reply area is zeroed, then the completion word), counted. A read too big to build, or a bare
+    /// one whose image would not fit the page, is refused and counted: only the completion word is posted, or the
+    /// bracket is refused. A read with no context or return page to answer on is counted.
+    ///
+    /// Luminance and luminance-alpha come from the sum of red, green and blue clamped at 1.0, as the pipe's colour path
+    /// makes them, unless the texture holds one channel, which is read as it is (the table: stage selection established,
+    /// the clamped sum inferred). Alpha is kept.
+    fn texel_read(&mut self, port: &mut BackPort<'_>, args: &[u32]) {
+        use crate::dev::kona::defs::{pixel::*, texture::storage_is_one_channel};
+        self.tex_counts.reads += 1;
+        let c = self.contexts.select(port.context());
+        let header = gl::texture::ReadHeader::parse(args);
+        let pack = c.gl.pix.pack;
+        let bracket = c.x.bracket_open();
+        // What the read answers with: the packed bytes and the row they step by, or nothing to pack.
+        enum Answer {
+            Image(Vec<u8>, u32),
+            Zeros,
+            TooBig,
+        }
+        let sized = header.and_then(|h| {
+            let (_, stride) = gl::pixels::row_bytes(h.w as usize, h.format, h.ty, &pack)?;
+            // The bytes the packer will build, which include the pack record's skips: all of them the guest's.
+            let bytes = gl::pixels::packed_len(h.w as usize, h.h as usize, h.format, h.ty, 0, &pack).unwrap_or(u64::MAX);
+            Some((h, stride, bytes))
+        });
+        let answer = match sized {
+            None => {
+                self.tex_counts.read_unsupported += 1;
+                Answer::Zeros
+            }
+            Some((h, stride, bytes)) => {
+                let texels = h.w as u64 * h.h as u64;
+                if texels > gl::texture::MAX_READ_TEXELS || bytes > gl::texture::MAX_READ_BYTES || (!bracket && bytes > READ_REPLY_LIMIT as u64) {
+                    self.tex_counts.read_oversize += 1;
+                    Answer::TooBig
+                } else {
+                    let texels = match c.tex.read_level(self.store.texture(), &h) {
+                        Some(t) => t,
+                        None => {
+                            self.tex_counts.read_missing += 1;
+                            vec![[0.0; 4]; texels as usize]
+                        }
+                    };
+                    let texels = match h.format {
+                        FORMAT_LUMINANCE | FORMAT_LUMINANCE_ALPHA if !storage_is_one_channel(h.storage) => texels.into_iter().map(|[r, g, b, a]| [(r + g + b).min(1.0), 0.0, 0.0, a]).collect(),
+                        FORMAT_LUMINANCE | FORMAT_LUMINANCE_ALPHA => texels.into_iter().map(|[r, _, _, a]| [r, 0.0, 0.0, a]).collect(),
+                        _ => texels,
+                    };
+                    let image = gl::pixels::Image { w: h.w as usize, h: h.h as usize, plane: gl::pixels::Plane::Colour(texels) };
+                    Answer::Image(gl::pixels::pack(&image, h.format, h.ty, 0, &pack).unwrap_or_default(), stride as u32)
+                }
+            }
+        };
+        if bracket {
+            self.tex_counts.reads_bracketed += 1;
+            match (answer, header) {
+                (Answer::Image(bytes, row), Some(h)) => c.x.feed_texels(row, h.h, bytes),
+                // Nothing to describe to the bracket: a row of none refuses it.
+                _ => c.x.feed_texels(0, 0, Vec::new()),
+            };
+        } else if port.context().is_some() && port.return_page_valid() {
+            match answer {
+                Answer::Image(bytes, _) if bytes.len() <= READ_REPLY_LIMIT => port.post_return(8, &bytes),
+                Answer::Zeros => port.post_return(8, &[0; READ_REPLY_LIMIT]),
+                _ => port.post_return(8, &[]),
+            };
+        } else {
+            self.tex_counts.read_unposted += 1;
+        }
+    }
+
     /// The texture tokens that are not an image: the load finish, binds and their records,
     /// the pixel-store parameters, and the ones nothing sends.
     fn texture_command(&mut self, port: &BackPort<'_>, selector: u32, args: &[u32]) {
@@ -831,6 +913,106 @@ impl KonaBackend {
         }
     }
 
+    /// Make the arrays a pixel operation reads or writes, and the draw state it runs under.
+    fn pixel_state(&mut self, port: &BackPort<'_>) -> raster::DrawState {
+        let screen = self.gl.screen();
+        let c = self.contexts.select(port.context());
+        let ds = c.gl.draw_state(screen);
+        if let Some(l) = c.gl.layout.clone() {
+            l.colour.chain(l.accumulation).for_each(|w| self.store.ensure(w as usize));
+        }
+        self.arrays(&ds);
+        ds
+    }
+
+    /// glClear with the accumulation bit: the accumulation words to the clear value.
+    fn clear_accumulation(&mut self, port: &BackPort<'_>) {
+        self.drain();
+        let ds = self.pixel_state(port);
+        let c = self.contexts.select(port.context());
+        gl::pixels::clear_accumulation(&c.gl, &mut self.pix_counts, &gl::pixels::Env { store: &self.store, ds });
+    }
+
+    /// A pixel-state token, which stores into the context, or a pixel operation, which waits for
+    /// the drawing queued before it and runs inline: its image words or reply follow.
+    fn pixel_command(&mut self, port: &mut BackPort<'_>, selector: u32, args: &[u32]) -> Reply {
+        // The texel loads read the same pixel-store token (the recordings send no texel-store one).
+        if selector == SET_PIXEL_STORE_PARAMETER_INTEGER_FORM {
+            self.texture_command(port, selector, args);
+        }
+        if gl::pixels::is_state(selector) {
+            let c = self.contexts.select(port.context());
+            gl::pixels::command(&mut c.gl, &mut self.pix_counts, selector, args);
+            return match gl::pixels::run_words(&c.gl, selector, args) {
+                Some(n) if n > 0 => Reply::Data(n),
+                _ => Reply::Done,
+            };
+        }
+        self.drain();
+        if let Some(n) = gl::pixels::run_words(&self.contexts.select(port.context()).gl, selector, args) {
+            let c = self.contexts.select(port.context());
+            if selector == DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA && gl::pixels::Header::parse(args).is_some_and(|h| h.dma) {
+                c.gl.pix.pending = <[u32; 8]>::try_from(args).ok();
+                return Reply::Done;
+            }
+            if n > 0 {
+                return Reply::Data(n);
+            }
+            self.pixel_data(port, selector, args, &[]);
+            return Reply::Done;
+        }
+        let ds = self.pixel_state(port);
+        let c = self.contexts.select(port.context());
+        match gl::pixels::plane_command(&mut c.gl, &mut self.pix_counts, &gl::pixels::Env { store: &self.store, ds }, selector, args) {
+            gl::pixels::Out::Reply(bytes) if port.context().is_some() && port.return_page_valid() => {
+                port.post_return(PIXEL_REPLY_OFFSET, &bytes);
+            }
+            _ => {}
+        }
+        Reply::Done
+    }
+
+    /// The words behind a pixel-state or draw token: pixel map values, a pixel draw's image, a bitmap's.
+    fn pixel_data(&mut self, port: &BackPort<'_>, selector: u32, args: &[u32], words: &[u32]) {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        self.pixel_bytes(port, selector, args, &bytes, words);
+    }
+
+    fn pixel_bytes(&mut self, port: &BackPort<'_>, selector: u32, args: &[u32], bytes: &[u8], words: &[u32]) {
+        use gl::pixels::{bitmap, draw, large_bitmap, load_map, Env, Header, Record};
+        if matches!(selector, LOAD_PIXEL_MAP_FLOAT_VALUES | LOAD_PIXEL_MAP_UNSIGNED_32_BIT_VALUES | LOAD_PIXEL_MAP_UNSIGNED_16_BIT_VALUES) {
+            let c = self.contexts.select(port.context());
+            load_map(&mut c.gl, &mut self.pix_counts, selector, args, words);
+            return;
+        }
+        self.drain();
+        let ds = self.pixel_state(port);
+        let c = self.contexts.select(port.context());
+        let env = Env { store: &self.store, ds };
+        let f = |w: u32| f32::from_bits(w);
+        match selector {
+            DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA => {
+                if let Ok(h) = <[u32; 8]>::try_from(args) {
+                    draw(&mut c.gl, &mut self.pix_counts, &env, &h, bytes);
+                }
+            }
+            DRAW_BITMAP_FROM_DISPLAY_LIST if args.len() == 8 => {
+                let h = Header { w: args[0], h: args[1], format: crate::dev::kona::defs::pixel::FORMAT_COLOUR_INDEX, ty: crate::dev::kona::defs::pixel::TYPE_BITMAP, offset: 0, dma: false, row_mode: 0, column: 0 };
+                let (xo, yo) = (f(args[2]), f(args[3]));
+                // The fifth and sixth words are the origin plus the move.
+                let image = &bytes[..bytes.len().min(args[7] as usize)];
+                bitmap(&mut c.gl, &mut self.pix_counts, &env, &h, &Record { alignment: 1, ..Record::default() }, [xo, yo], [f(args[4]) - xo, f(args[5]) - yo], image);
+            }
+            DRAW_BITMAP => {
+                if let Some(h) = large_bitmap(args) {
+                    let rec = c.gl.pix.unpack_in_force();
+                    bitmap(&mut c.gl, &mut self.pix_counts, &env, &h, &rec, [f(args[5]), f(args[6])], [f(args[7]), f(args[8])], bytes);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// A DMA packet: the rows of a pixel write that announced them, read a
     /// line at a time into words (big-endian, as the programmed-I/O path
     /// sends them). A packet with no write waiting is unclaimed. A read that
@@ -847,6 +1029,18 @@ impl KonaBackend {
             self.drain();
             self.tex_counts.dma_loads += 1;
             self.contexts.select(port.context()).tex.load(self.store.texture(), &args, &bytes, true, &mut self.tex_counts);
+            return Reply::Done;
+        }
+        if let Some(args) = self.contexts.select(port.context()).gl.pix.pending.take() {
+            // A pixel draw's image: its rows, `per_line` bytes each, as the stream would have carried them.
+            let mut bytes = vec![0u8; (lines as u64 * per_line as u64) as usize];
+            let ok = (0..lines as u64).all(|l| port.dma_read(io.wrapping_add(l.wrapping_mul(pitch)), physical, &mut bytes[(l * per_line as u64) as usize..][..per_line as usize]));
+            if !ok {
+                port.dma_fault();
+                return Reply::Done;
+            }
+            self.pix_counts.dma_draws += 1;
+            self.pixel_bytes(port, DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, &args, &bytes, &[]);
             return Reply::Done;
         }
         let x = &mut self.contexts.select(port.context()).x;
@@ -910,8 +1104,9 @@ impl KonaBackend {
             }
             Job::Command { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, .. } => return self.texel_draw(port, args),
             Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, words } => self.texel_words(port, args, words),
-            // The texture loads read the pixel-store parameters the client sends.
-            Job::Command { grammar: Grammar::Gl, selector: SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, args, .. } => self.texture_command(port, SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, args),
+            Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args, .. } => self.texel_read(port, args),
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::pixels::is_state(selector) || gl::pixels::is_plane(selector) => return self.pixel_command(port, selector, args),
+            Job::Data { grammar: Grammar::Gl, selector, args, words } if gl::pixels::is_data(selector) => self.pixel_data(port, selector, args, words),
             Job::Data { grammar: Grammar::Gl, selector: LOAD_ONE_ENTRY_OF_ARM_TEXTURE_TABLE, args: &[slot], words } => {
                 self.tex_counts.filter_tables += self.contexts.select(port.context()).tex.filter_table(slot, words) as u64;
             }
@@ -924,6 +1119,9 @@ impl KonaBackend {
                 }
             }
             Job::Command { grammar: Grammar::Gl, selector, args, packed, .. } if gl::is_geometry(selector) => {
+                if selector == CLEAR_SELECTED_BUFFERS && args.first().is_some_and(|m| m & crate::dev::kona::defs::gl::ACCUM_BUFFER_BIT != 0) {
+                    self.clear_accumulation(port);
+                }
                 let c = self.contexts.select(port.context());
                 self.gl.command(&mut c.gl, selector, args, packed, &mut self.prims);
                 self.flush();
@@ -1521,6 +1719,308 @@ mod tests {
         r.core.current = Some(0);
         r.x(&mut b, FILL_BOXES_TWO_CORNERS, &[0, 2 << 16 | 2]);
         assert_eq!(b.store.read(1, 1022, 1), 0x5a00, "context 0 kept its own");
+    }
+
+    /// A 64 x 64 level loaded at address 0x400 of bank 0: texel (x, y) is the grey `(4 x + y) mod 256`.
+    fn load_grey_level(b: &mut KonaBackend, r: &mut Rig) {
+        let mut header = [0u32; 20];
+        header[..5].copy_from_slice(&[0x0de1, 64, 64, 5, 1]);
+        header[9] = 0x30;
+        header[13] = 63;
+        header[14] = 63;
+        header[16] = 0x66;
+        header[17] = 0x2200;
+        header[18] = 0x400;
+        let words: Vec<u32> = (0..64 * 64).map(|i| { let g = ((4 * (i % 64) + i / 64) % 256) as u32; g << 24 | g << 16 | g << 8 | 0xff }).collect();
+        assert_eq!(r.send(b, Job::Command { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &header, packed: 0, handled: false }), Reply::Data(4096));
+        r.send(b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &header, words: &words });
+    }
+
+    /// The 18 words of a read-back of that level as luminance in unsigned shorts, which Quake sends: the target,
+    /// the size, format 6, type 3, storage 0xd, a spare, the first and last texel, then the load record's words.
+    const GREY_READ: [u32; 18] = [0x0de1, 64, 64, 6, 3, 0xd, 0, 0, 0, 0, 63, 63, 0, 0x0385_0030, 0x66, 0x44, 0x400, 0];
+
+    /// A bare texel read-back (token 0x052) answers on the return page: the level's texels in the requested
+    /// format and type at offset 8, then a non-zero word 0. A level that is not loaded, or a format the packer does
+    /// not know, answers zeros all the same, counted; with no context there is nothing to answer on.
+    #[test]
+    fn a_bare_texel_read_back_answers_on_the_return_page() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        load_grey_level(&mut b, &mut r);
+        r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args: &GREY_READ, packed: 0, handled: false });
+        assert_eq!(r.ram.word(RETURN_PAGE), 1, "the completion word is set");
+        let image = r.ram.bytes(RETURN_PAGE + 8, 64 * 64 * 2);
+        let texel = |x: usize, y: usize| u16::from_be_bytes([image[2 * (64 * y + x)], image[2 * (64 * y + x) + 1]]);
+        assert_eq!([texel(0, 0), texel(1, 0), texel(0, 1), texel(63, 63)], [0, 4 * 257, 257, (((4 * 63 + 63) % 256) * 257) as u16]);
+        // The same read of a sub-rectangle: first (2, 1), 2 x 2.
+        let mut part = GREY_READ;
+        part[1..3].copy_from_slice(&[2, 2]);
+        part[7..9].copy_from_slice(&[2, 1]);
+        part[10..12].copy_from_slice(&[3, 2]);
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args: &part, packed: 0, handled: false });
+        assert_eq!(r.ram.word(RETURN_PAGE), 1);
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 8), [(9 * 257u16).to_be_bytes(), (13 * 257u16).to_be_bytes(), (10 * 257u16).to_be_bytes(), (14 * 257u16).to_be_bytes()].concat());
+        // No level there: zeros, counted. An unknown format: nothing to pack, still answered.
+        let mut missing = GREY_READ;
+        missing[16] = 0x800;
+        r.ram.put(RETURN_PAGE, &[0xff; 16]);
+        r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args: &missing, packed: 0, handled: false });
+        assert_eq!((r.ram.word(RETURN_PAGE), r.ram.bytes(RETURN_PAGE + 8, 4)), (1, vec![0; 4]));
+        let mut unknown = GREY_READ;
+        unknown[3] = 0x77;
+        r.ram.put(RETURN_PAGE, &[0xff; 0x4000]);
+        r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args: &unknown, packed: 0, handled: false });
+        assert_eq!(r.ram.word(RETURN_PAGE), 1, "never left unposted");
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 0x3ff0), vec![0; 0x3ff0], "the reply area is zeros, not what the page held");
+        r.core.current = None;
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args: &GREY_READ, packed: 0, handled: false });
+        assert_eq!(r.ram.word(RETURN_PAGE), 0, "no context, no answer");
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("texel read-backs  5 (0 in a bracket); answered with zeros: 1 for a format or type the packer does not know, 2 for a level not loaded; 0 too big; 1 with nowhere to answer"), "{text}");
+    }
+
+    /// A texel level of 8 x 4 at `address` of bank `bank`, each texel the word `texel(x, y)` (red, green, blue, alpha).
+    fn load_level_words(b: &mut KonaBackend, r: &mut Rig, address: u32, bank: u32, texel: impl Fn(u32, u32) -> u32) {
+        let mut header = [0u32; 20];
+        header[..5].copy_from_slice(&[0x0de1, 8, 4, 5, 1]);
+        header[9] = 0x30;
+        header[13] = 7;
+        header[14] = 3;
+        header[16] = 0x23;
+        header[17] = 0x2200 | bank << 3;
+        header[18 + bank as usize] = address;
+        let words: Vec<u32> = (0..32).map(|i| texel(i % 8, i / 8)).collect();
+        r.send(b, Job::Command { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &header, packed: 0, handled: false });
+        r.send(b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &header, words: &words });
+    }
+
+    /// The 18 words of a read-back of an 8 x 4 level of `bank` at `address`: `format`, `ty`, storage `storage`.
+    fn level_read(format: u32, ty: u32, storage: u32, bank: u32, address: u32) -> [u32; 18] {
+        let mut a = [0x0de1, 8, 4, format, ty, storage, 0, 0, 0, 0, 7, 3, 0, 0x0385_0030 | bank << 28, 0x23, 0x44, address, 0];
+        a[13] = 0x0385_0030 | bank << 28;
+        a
+    }
+
+    fn read_texels(b: &mut KonaBackend, r: &mut Rig, args: &[u32]) {
+        r.send(b, Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args, packed: 0, handled: false });
+    }
+
+    /// A level is found by the bank in the read's mode word and the address in word 16. The empty slot of a
+    /// level in the other bank is address zero, which names a real level in this one, and must not be taken.
+    #[test]
+    fn a_texel_read_finds_its_level_by_bank_and_address() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        load_level_words(&mut b, &mut r, 0, 1, |_, _| 0x1000_00ff);
+        load_level_words(&mut b, &mut r, 0x400, 0, |_, _| 0xf000_00ff);
+        // The read is of bank 0 at 0x400 (its other slot, word 17, is the empty zero).
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        read_texels(&mut b, &mut r, &level_read(6, 1, 0x0d, 0, 0x400));
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 2), [0xf0, 0xf0], "bank 0 at 0x400 is the second level");
+        // Bank 0 at address 0 is empty, though bank 1 holds a level at address 0.
+        r.ram.put(RETURN_PAGE, &[0xff; 16]);
+        read_texels(&mut b, &mut r, &level_read(6, 1, 0x0d, 0, 0));
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 2), [0, 0], "no level in bank 0 at address 0");
+        // And bank 1 at address 0 is the first.
+        read_texels(&mut b, &mut r, &level_read(6, 1, 0x0d, 1, 0));
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 2), [0x10, 0x10]);
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("1 for a level not loaded"), "{text}");
+    }
+
+    /// A read of a colour texture as luminance is the sum of red, green and blue clamped at 1.0, with the
+    /// alpha kept; a texture that holds one channel is read as it is.
+    #[test]
+    fn a_texel_read_as_luminance_sums_the_colour_of_a_colour_texture() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        // Texel (0, 0): red 0x10, green 0x20, blue 0x30, alpha 0x40. Texel (1, 0): 0x80 in all three, alpha 0xff.
+        load_level_words(&mut b, &mut r, 0x100, 0, |x, y| match (x, y) {
+            (0, 0) => 0x1020_3040,
+            (1, 0) => 0x8080_80ff,
+            _ => 0,
+        });
+        let mut luminance = level_read(6, 1, 0x30, 0, 0x100);
+        luminance[1..3].copy_from_slice(&[2, 1]);
+        read_texels(&mut b, &mut r, &luminance);
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 2), [0x10 + 0x20 + 0x30, 0xff], "0x60 and a clamped sum");
+        let mut both = level_read(7, 1, 0x30, 0, 0x100);
+        both[1..3].copy_from_slice(&[2, 1]);
+        read_texels(&mut b, &mut r, &both);
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 4), [0x60, 0x40, 0xff, 0xff], "luminance then the alpha the texel holds");
+        // The same level read as the one-channel texture it would be is its red alone.
+        let mut one = level_read(6, 1, 0x0d, 0, 0x100);
+        one[1..3].copy_from_slice(&[2, 1]);
+        read_texels(&mut b, &mut r, &one);
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 2), [0x10, 0x80]);
+    }
+
+    /// A bare read whose image would not fit the page is not built: only the completion word is posted, the
+    /// page's reply area is not written past, and the read is counted. Inside a bracket the same read is
+    /// refused when it asks for more texels than the model will build.
+    #[test]
+    fn a_texel_read_too_big_to_answer_is_refused_and_counted() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        load_grey_level(&mut b, &mut r);
+        let mut big = GREY_READ;
+        big[1..3].copy_from_slice(&[256, 256]);
+        r.ram.put(RETURN_PAGE, &[0xaa; 0x4010]);
+        read_texels(&mut b, &mut r, &big);
+        assert_eq!(r.ram.word(RETURN_PAGE), 1, "the completion is posted so the client does not wait");
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 0x4008), vec![0xaa; 0x4008], "no image is written");
+        let mut huge = GREY_READ;
+        huge[1..3].copy_from_slice(&[u32::MAX, u32::MAX]);
+        read_texels(&mut b, &mut r, &huge);
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[0x1c0, 0x9000, 8192, 8192, 0, 0]);
+        read_texels(&mut b, &mut r, &huge);
+        assert!(b.contexts.select(Some(0)).x.feed_finish(&[0x100, 7]).is_none(), "the bracket is refused");
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("3 (1 in a bracket)") && text.contains("3 too big"), "{text}");
+    }
+
+    /// The pack record's skips are the guest's, and they lengthen what the packer builds: a small read under a
+    /// huge skip is oversize, not an allocation that aborts the host, and is answered like any other oversize read.
+    #[test]
+    fn a_texel_read_under_a_huge_pack_skip_is_refused_not_allocated() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        load_grey_level(&mut b, &mut r);
+        let store = |b: &mut KonaBackend, r: &mut Rig, name: u32, value: u32| {
+            r.send(b, Job::Command { grammar: Grammar::Gl, selector: SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, args: &[name, value], packed: 0, handled: false });
+        };
+        let mut wide = GREY_READ;
+        wide[1..3].copy_from_slice(&[8000, 1]);
+        for (name, value) in [(0xd03, u32::MAX), (0xd04, u32::MAX)] {
+            store(&mut b, &mut r, name, value);
+            r.ram.put(RETURN_PAGE, &[0xaa; 0x4010]);
+            read_texels(&mut b, &mut r, &wide);
+            assert_eq!(r.ram.word(RETURN_PAGE), 1, "the completion is posted so the client does not wait");
+            assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 0x4008), vec![0xaa; 0x4008], "no image is written");
+            store(&mut b, &mut r, name, 0);
+        }
+        // In a bracket the same read is refused, not built.
+        store(&mut b, &mut r, 0xd03, u32::MAX);
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[0x1c0, 0x9000, 16000, 16000, 0, 0]);
+        read_texels(&mut b, &mut r, &wide);
+        assert!(b.contexts.select(Some(0)).x.feed_finish(&[0x100, 7]).is_none(), "the bracket is refused");
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("3 too big"), "{text}");
+        // Without the skip the same read is answered.
+        store(&mut b, &mut r, 0xd03, 0);
+        read_texels(&mut b, &mut r, &wide);
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("texel read-backs  4 (1 in a bracket)") && text.contains("3 too big"), "{text}");
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 4), [0, 0, 4, 4], "16000 bytes fit the page, and the first texels are the level's");
+    }
+
+    /// The texel cap is its own cap: a read of one-byte texels, 2048 by 1024, packs to 2 MiB, well under the byte
+    /// cap, but would build 2^21 colours. It is refused in a bracket (where the byte cap does not stop it).
+    #[test]
+    fn a_texel_read_past_the_texel_cap_is_refused_though_its_bytes_are_few() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        load_grey_level(&mut b, &mut r);
+        let mut read = GREY_READ;
+        read[1..3].copy_from_slice(&[2048, 1024]);
+        read[3..5].copy_from_slice(&[0, 1]);
+        read[10..12].copy_from_slice(&[2047, 1023]);
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[0x1c0, 0x9000, 1 << 21, 1 << 21, 0, 0]);
+        read_texels(&mut b, &mut r, &read);
+        assert!(b.contexts.select(Some(0)).x.feed_finish(&[0x100, 7]).is_none(), "the bracket is refused");
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("1 too big") && text.contains("0 for a level not loaded"), "{text}");
+        // Half the texels (the cap itself) is answered: the level is not that big, so its texels are zeros.
+        read[2] = 512;
+        read[11] = 511;
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[0x1c0, 0x9000, 1 << 20, 1 << 20, 0, 0]);
+        read_texels(&mut b, &mut r, &read);
+        let done = b.contexts.select(Some(0)).x.feed_finish(&[0x100, 7]).expect("a read at the cap is answered");
+        assert_eq!(done.data.len(), 1 << 20);
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("1 too big"), "{text}");
+    }
+
+    /// In a bracket, a read of a format or type the packer does not know refuses the bracket, as it has
+    /// nothing to describe.
+    #[test]
+    fn an_unsupported_texel_read_in_a_bracket_refuses_it() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        load_grey_level(&mut b, &mut r);
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[0x1c0, 0x9000, 8192, 8192, 0, 0]);
+        let mut unknown = GREY_READ;
+        unknown[3] = 0x77;
+        read_texels(&mut b, &mut r, &unknown);
+        assert!(b.contexts.select(Some(0)).x.feed_finish(&[0x100, 7]).is_none());
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("1 for a format or type the packer does not know"), "{text}");
+    }
+
+    /// Inside a select-feed bracket the read goes to the bracket's host buffer and not the return page.
+    #[test]
+    fn a_bracketed_texel_read_back_leaves_the_return_page_alone() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        load_grey_level(&mut b, &mut r);
+        // A bracket for the whole read: 64 rows of 128 bytes in one line.
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[0x1c0, 0x9000, 8192, 8192, 0, 0]);
+        r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args: &GREY_READ, packed: 0, handled: false });
+        assert_eq!(r.ram.word(RETURN_PAGE), 0, "the bracket's finish returns it, by output DMA");
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("texel read-backs  1 (1 in a bracket)"), "{text}");
+        let c = b.contexts.select(Some(0));
+        let done = c.x.feed_finish(&[0x100, 7]).expect("the bracket holds the read");
+        assert_eq!((done.data.len(), done.line, done.echo), (8192, 8192, 7));
+        assert_eq!(&done.data[..4], &[0, 0, 0x04, 0x04], "texel 0 is 0 and texel 1 is 4 x 257");
+    }
+
+    /// A bracketed texel read over 0x3ff0 bytes (the 512 x 256 level Quake reads back) is delivered to the range the
+    /// start token describes: its device address from the map page and the offset (plus 0x9000), the padded image
+    /// as one line of the full length with no stride. Nothing goes to the return page, and the finish posts event
+    /// 0x100 with the slot, no bytes remaining and no overflow.
+    #[test]
+    fn a_bracketed_texel_read_is_delivered_by_output_dma_to_the_described_range() {
+        use crate::dev::kona::defs::{MAPRAM_KIND_16K, MAPRAM_PAGE_SHIFT};
+        let (mut b, mut r) = (backend(), Rig::new());
+        let host = 0x40_0000u64;
+        let dev = (8u64 << MAPRAM_PAGE_SHIFT) + 0x100;
+        for page in 0..18u64 {
+            r.core.map_ram[8 + page as usize] = MAPRAM_KIND_16K | ((host + (page << MAPRAM_PAGE_SHIFT)) >> 12) as u32;
+        }
+        let mut header = [0u32; 20];
+        header[..5].copy_from_slice(&[0x0de1, 512, 256, 5, 1]);
+        header[9] = 0x30;
+        header[13] = 511;
+        header[14] = 255;
+        header[16] = 0x89;
+        header[17] = 0x2200;
+        header[18] = 0x400;
+        let grey = |x: u32, y: u32| (x + 2 * y) % 256;
+        let words: Vec<u32> = (0..512 * 256).map(|i| { let g = grey(i % 512, i / 512); g << 24 | g << 16 | g << 8 | 0xff }).collect();
+        assert_eq!(r.send(&mut b, Job::Command { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &header, packed: 0, handled: false }), Reply::Data(512 * 256));
+        r.send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &header, words: &words });
+        // The read: 512 x 256 luminance in unsigned shorts is 262144 bytes, far over the page.
+        let len = 512 * 256 * 2u32;
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[(dev >> 12) as u32, 0x9000 | (dev & 0xfff) as u32, len, len, 0, 0]);
+        let read = [0x0de1, 512, 256, 6, 3, 0xd, 0, 0, 0, 0, 511, 255, 0, 0x0385_0030, 0x89, 0x44, 0x400, 0];
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        read_texels(&mut b, &mut r, &read);
+        assert_eq!(r.ram.bytes(RETURN_PAGE, 16), [0; 16], "no header and no completion word on the return page");
+        assert_eq!(r.ram.bytes(host + 0x100, 4), [0; 4], "and nothing is written until the finish");
+        r.x(&mut b, FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE, &[0x100, 7]);
+        let image = r.ram.bytes(host + 0x100, len as usize);
+        let texel = |x: usize, y: usize| u16::from_be_bytes([image[2 * (512 * y + x)], image[2 * (512 * y + x) + 1]]);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (511, 255), (300, 200), (127, 255)] {
+            assert_eq!(texel(x, y) as u32, grey(x as u32, y as u32) * 257, "texel ({x}, {y})");
+        }
+        assert_eq!(r.ram.bytes(host + 0xff, 1), [0], "the byte before the range is untouched");
+        assert_eq!(r.ram.bytes(host + 0x100 + len as u64, 4), [0; 4], "and the one after");
+        assert_eq!([r.ram.word(REASON_PAGE), r.ram.word(REASON_PAGE + 4), r.ram.word(REASON_PAGE + 8), r.ram.word(REASON_PAGE + 12)], [0x100, 7, 0, 0], "event 0x100: the slot, nothing remaining, no overflow");
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("texel read-backs  1 (1 in a bracket)"), "{text}");
+        // A descriptor whose length is not the image's is refused, and nothing is posted.
+        r.ram.put(REASON_PAGE, &[0; 16]);
+        r.x(&mut b, START_SELECT_FEEDBACK_RETURN_DMA, &[(dev >> 12) as u32, 0x9000 | (dev & 0xfff) as u32, len - 4, len - 4, 0, 0]);
+        read_texels(&mut b, &mut r, &read);
+        r.x(&mut b, FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE, &[0x100, 8]);
+        assert_eq!(r.ram.word(REASON_PAGE), 0);
+        assert!(run(&mut b, &["status"]).1.contains("read brackets   1 refused"));
     }
 
     /// A DAC cursor load is decoded and held by channel, and draws nothing until channel 0's control register enables it; a load of another length, or
@@ -2264,6 +2764,19 @@ mod tests {
 
     // ---- GL pixel operations ----
 
+    /// `gl_window` with a window-sized orthographic projection, so a raster position is a window pixel.
+    fn pixel_window() -> KonaBackend {
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, SELECT_CURRENT_MATRIX_STACK, &[crate::dev::kona::defs::gl::PROJECTION]);
+        let m = crate::dev::gl::math::ortho(0.0, 64.0, 0.0, 64.0, -1.0, 1.0);
+        command(&mut b, Grammar::Gl, LOAD_MATRIX_16_FLOATS, &m.map(f32::to_bits));
+        b
+    }
+
+    fn at(b: &mut KonaBackend, x: i32, y: i32) {
+        command(b, Grammar::Gl, SET_RASTER_POSITION_2_COMPONENTS_32_BIT_INTEGER, &[x as u32, y as u32]);
+    }
+
     /// A pixel draw: the header, then the image words the back end asked for.
     fn draw_pixels(b: &mut KonaBackend, w: u32, h: u32, format: u32, ty: u32, image: &[u32]) {
         let hdr = [w, h, format, ty, 0, 0, 0, 0];
@@ -2278,6 +2791,208 @@ mod tests {
         b.store.read(x, y, 2)
     }
 
+    /// A 2 x 2 RGBA image of bytes lands with its lower-left pixel at the raster position; zoom
+    /// replicates each pixel; a raster position outside the clip volume draws nothing.
+    #[test]
+    fn draw_pixels_lands_at_the_raster_position_and_zooms() {
+        use crate::dev::kona::defs::pixel::*;
+        let mut b = pixel_window();
+        at(&mut b, 10, 20);
+        draw_pixels(&mut b, 2, 2, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0xff00_00ff, 0x00ff_00ff, 0x0000_ffff, 0xffff_ffff]);
+        assert_eq!([colour_at(&mut b, 10, 20), colour_at(&mut b, 11, 20), colour_at(&mut b, 10, 21), colour_at(&mut b, 11, 21)], [0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]);
+        assert_eq!(colour_at(&mut b, 12, 20), 0, "nothing past the image");
+        command(&mut b, Grammar::Gl, SET_PIXEL_ZOOM_FACTORS, &[2.0f32.to_bits(), 3.0f32.to_bits()]);
+        at(&mut b, 30, 30);
+        draw_pixels(&mut b, 1, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0x1020_30ff]);
+        let lit = (28..40u32).flat_map(|y| (28..40u32).map(move |x| (x, y))).filter(|&(x, y)| colour_at(&mut b, x, y) == 0xff10_2030).collect::<Vec<_>>();
+        assert_eq!(lit, vec![(30, 30), (31, 30), (30, 31), (31, 31), (30, 32), (31, 32)], "two wide and three high");
+        at(&mut b, 100, 100);
+        draw_pixels(&mut b, 1, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0xffff_ffff]);
+        assert_eq!(colour_at(&mut b, 63, 63), 0);
+        assert!(run(&mut b, &["gl"]).1.contains("1 with no valid raster position"));
+    }
+
+    /// The pixel-store tokens set the unpack record that sizes the next draw; the transfer scale
+    /// and bias, and a pixel map under its flag, change what is drawn.
+    #[test]
+    fn unpack_state_transfer_and_maps_shape_a_draw() {
+        use crate::dev::kona::defs::pixel::*;
+        let mut b = pixel_window();
+        at(&mut b, 5, 5);
+        // 3 x 1 RGB bytes: nine bytes are three words, with alignment 4 or 1.
+        let hdr = [3, 1, FORMAT_RGB, TYPE_UNSIGNED_BYTE, 0, 0, 0, 0];
+        assert_eq!(command(&mut b, Grammar::Gl, DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, &hdr), Reply::Data(3));
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, args: &hdr, words: &[0, 0, 0] });
+        // Rows of 3 x 3 bytes at alignment 4 pad to 12 bytes, so two rows are six words.
+        let hdr2 = [3, 2, FORMAT_RGB, TYPE_UNSIGNED_BYTE, 0, 0, 0, 0];
+        assert_eq!(command(&mut b, Grammar::Gl, DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, &hdr2), Reply::Data(6));
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, args: &hdr2, words: &[0; 6] });
+        command(&mut b, Grammar::Gl, SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, &[UNPACK_BASE + 5, 1]);
+        assert_eq!(command(&mut b, Grammar::Gl, DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, &hdr2), Reply::Data(5), "alignment 1 packs the rows");
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, args: &hdr2, words: &[0; 5] });
+        // A red scale of 0.5.
+        command(&mut b, Grammar::Gl, SET_PIXEL_TRANSFER_PARAMETER_FLOAT_FORM, &[RED_SCALE, 0.5f32.to_bits()]);
+        at(&mut b, 20, 20);
+        draw_pixels(&mut b, 1, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0xff00_00ff]);
+        let c = colour_at(&mut b, 20, 20);
+        assert!((0x7f..=0x80).contains(&(c >> 16 & 0xff)), "{c:#x}");
+        // A red-to-red map of two entries, loaded as a header and its values, flips red once its flag is set.
+        command(&mut b, Grammar::Gl, SET_PIXEL_TRANSFER_PARAMETER_FLOAT_FORM, &[RED_SCALE, 1.0f32.to_bits()]);
+        let hdr = [MAP_RED_TO_RED, 2, 1.0f32.to_bits(), 0];
+        assert_eq!(command(&mut b, Grammar::Gl, LOAD_PIXEL_MAP_FLOAT_VALUES, &hdr), Reply::Data(2));
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: LOAD_PIXEL_MAP_FLOAT_VALUES, args: &hdr, words: &[1.0f32.to_bits(), 0.0f32.to_bits()] });
+        command(&mut b, Grammar::Gl, SET_PIXEL_TRANSFER_PARAMETER_FLOAT_FORM, &[MAP_COLOUR, 1]);
+        at(&mut b, 22, 20);
+        draw_pixels(&mut b, 1, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0xff00_00ff]);
+        assert_eq!(colour_at(&mut b, 22, 20) >> 16 & 0xff, 0);
+    }
+
+    /// A bitmap lights its set bits in the raster colour, most significant bit leftmost, and moves the
+    /// position by its advance. The small form's word count includes the byte count, as the recording's does.
+    #[test]
+    fn a_small_bitmap_draws_and_advances() {
+        let mut b = pixel_window();
+        command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_4_COMPONENTS_SINGLE_FLOAT, &[1.0f32.to_bits(), 0, 0, 1.0f32.to_bits()]);
+        at(&mut b, 8, 8);
+        // Two rows of eight: 1010 0000 and 0000 0001. Origin (-1, 0): the glyph sits one pixel right; move 8 (origin plus move is 7).
+        let args = [8, 2, (-1.0f32).to_bits(), 0, 7.0f32.to_bits(), 0, 2, 2];
+        assert_eq!(command(&mut b, Grammar::Gl, DRAW_BITMAP_FROM_DISPLAY_LIST, &args), Reply::Data(1));
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_BITMAP_FROM_DISPLAY_LIST, args: &args, words: &[0xa001_0000] });
+        let lit = lit_pixels(&mut b);
+        // Bytes 0xa0 (bottom row) and 0x01 (row above): the bottom row is first, at y = 8.
+        assert_eq!(lit, vec![(9, 8), (11, 8), (16, 9)]);
+        // The advance moved the position to x = 16: the next bitmap starts there.
+        let one = [8, 1, 0, 0, 8.0f32.to_bits(), 0, 2, 1];
+        command(&mut b, Grammar::Gl, DRAW_BITMAP_FROM_DISPLAY_LIST, &one);
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_BITMAP_FROM_DISPLAY_LIST, args: &one, words: &[0x8000_0000] });
+        assert!(lit_pixels(&mut b).contains(&(16, 8)));
+        // An empty bitmap (a large one with no rows) moves the position and draws nothing.
+        let empty = [0, 0, 0, 0, 0, 0.0f32.to_bits(), 0.0f32.to_bits(), 5.0f32.to_bits(), 0.0f32.to_bits()];
+        assert_eq!(command(&mut b, Grammar::Gl, DRAW_BITMAP, &empty), Reply::Done);
+        assert!(run(&mut b, &["gl"]).1.contains("3 bitmaps"), "{}", run(&mut b, &["gl"]).1);
+    }
+
+    /// A copy takes the read buffer's rectangle to the raster position; a read packs it for the host;
+    /// depth and stencil copies and reads carry their planes.
+    #[test]
+    fn copy_and_read_pixels() {
+        use crate::dev::kona::defs::pixel::*;
+        let mut b = pixel_window();
+        at(&mut b, 4, 4);
+        draw_pixels(&mut b, 2, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0x1122_33ff, 0x4455_66ff]);
+        // The read buffer is the back one the draw went to.
+        command(&mut b, Grammar::Gl, SELECT_READ_BUFFER, &[crate::dev::kona::defs::gl::BACK]);
+        command(&mut b, Grammar::Gl, SELECT_DRAW_BUFFER, &[crate::dev::kona::defs::gl::BACK]);
+        at(&mut b, 30, 30);
+        command(&mut b, Grammar::Gl, COPY_PIXEL_RECTANGLE_WITHIN_FRAME_BUFFER, &[4, 4, 2, 1, 0, COPY_COLOUR, 0]);
+        assert_eq!([colour_at(&mut b, 30, 30), colour_at(&mut b, 31, 30)], [0xff11_2233, 0xff44_5566]);
+        // The read's reply is the packed bytes.
+        let screen = b.gl.screen();
+        let ds = b.contexts.select(None).gl.draw_state(screen);
+        b.arrays(&ds);
+        let c = b.contexts.select(None);
+        let env = gl::pixels::Env { store: &b.store, ds };
+        let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, &[30, 30, 2, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, 0]);
+        assert_eq!(out, gl::pixels::Out::Reply(vec![0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff]));
+        let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, &[30, 30, 1, 1, FORMAT_RED, TYPE_UNSIGNED_SHORT, 2]);
+        assert_eq!(out, gl::pixels::Out::Reply(vec![0, 0, 0x11, 0x11]), "the destination's byte offset leads");
+        // The overlap query: the copy's source and its destination meet when the rectangles do.
+        let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, ASK_WHETHER_COPY_SOURCE_OVERLAPS_ITS_DESTINATION, &[29, 29, 4, 4]);
+        assert_eq!(out, gl::pixels::Out::Reply(vec![0, 0, 0, 4]));
+        let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, ASK_WHETHER_COPY_SOURCE_OVERLAPS_ITS_DESTINATION, &[0, 0, 4, 4]);
+        assert_eq!(out, gl::pixels::Out::Reply(vec![0, 0, 0, 0]));
+    }
+
+    /// Stencil and depth images draw into their planes: a stencil image directly under the write
+    /// mask, a depth image as fragments at its depths.
+    #[test]
+    fn stencil_and_depth_draws() {
+        use crate::dev::kona::defs::pixel::*;
+        let mut b = pixel_window();
+        command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 8, 0, 0]);
+        at(&mut b, 6, 6);
+        draw_pixels(&mut b, 2, 1, FORMAT_STENCIL, TYPE_UNSIGNED_BYTE, &[0x0507_0000]);
+        let (stencil, depth) = {
+            let l = b.contexts.select(None).gl.layout.clone().expect("a layout");
+            (l.stencil.start as usize, l.depth.start as usize)
+        };
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        let read = |b: &KonaBackend, w: usize, x: u32| b.store.read(x, 6, w);
+        assert_eq!([read(&b, stencil, 6), read(&b, stencil, 7)], [5, 7]);
+        // A depth image (half and full) under the always-pass depth test writes the depth plane.
+        command(&mut b, Grammar::Gl, SET_DEPTH_TEST, &[crate::dev::kona::defs::gl::ALWAYS]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[crate::dev::kona::defs::gl::DEPTH_TEST]);
+        at(&mut b, 6, 8);
+        draw_pixels(&mut b, 2, 1, FORMAT_DEPTH, TYPE_UNSIGNED_SHORT, &[0x8000_ffff]);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        let z = |x: u32| b.store.read(x, 8, depth);
+        assert!(z(6).abs_diff(0x8000_0000) < 0x0001_0000, "{:#x}", z(6));
+        assert!(z(7) > 0xfffe_0000, "{:#x}", z(7));
+    }
+
+    /// Accumulation: load the colour buffer scaled, add, multiply, and return to the draw buffer.
+    #[test]
+    fn accumulation_loads_scales_and_returns() {
+        use crate::dev::kona::defs::pixel::*;
+        let mut b = pixel_window();
+        command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 16, 0]);
+        at(&mut b, 3, 3);
+        draw_pixels(&mut b, 1, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0x8040_00ff]);
+        command(&mut b, Grammar::Gl, SELECT_READ_BUFFER, &[crate::dev::kona::defs::gl::BACK]);
+        let acc = |b: &mut KonaBackend, op: u32, v: f32| {
+            command(b, Grammar::Gl, ACCUMULATION_BUFFER_OPERATION, &[op, v.to_bits()]);
+        };
+        acc(&mut b, ACCUM_LOAD, 0.5);
+        acc(&mut b, ACCUM, 0.5);
+        acc(&mut b, ACCUM_MULT, 0.5);
+        acc(&mut b, ACCUM_ADD, 0.25);
+        // Clear the colour, then return the accumulated colour: 0.5 * c + 0.25.
+        command(&mut b, Grammar::Gl, SET_COLOUR_CLEAR_VALUE, &[0, 0, 0, 0]);
+        command(&mut b, Grammar::Gl, CLEAR_SELECTED_BUFFERS, &[crate::dev::kona::defs::gl::COLOR_BUFFER_BIT]);
+        acc(&mut b, ACCUM_RETURN, 1.0);
+        let c = colour_at(&mut b, 3, 3);
+        // red 0x80 -> 128/255 * 0.5 + 0.25 = 0.502 -> 0x80; green 0x40 -> 0.376 -> 0x60; blue 0 -> 0.25 -> 0x40
+        assert_eq!([c >> 16 & 0xff, c >> 8 & 0xff, c & 0xff], [0x80, 0x60, 0x40], "{c:#x}");
+        // Clearing the accumulation buffer takes the clear value.
+        command(&mut b, Grammar::Gl, SET_ACCUMULATION_BUFFER_CLEAR_VALUE, &[0.5f32.to_bits(), 0.5f32.to_bits(), 0.5f32.to_bits(), 1.0f32.to_bits()]);
+        command(&mut b, Grammar::Gl, CLEAR_SELECTED_BUFFERS, &[crate::dev::kona::defs::gl::ACCUM_BUFFER_BIT]);
+        acc(&mut b, ACCUM_RETURN, 1.0);
+        let c = colour_at(&mut b, 3, 3);
+        assert!(c >> 16 & 0xff >= 0x7f && c >> 16 & 0xff <= 0x80, "{c:#x}");
+        assert!(run(&mut b, &["gl"]).1.contains("6 accumulations"), "{}", run(&mut b, &["gl"]).1);
+    }
+
+
+    /// A value of exactly 1.0 runs as two half passes: loading, accumulating and adding it lands where
+    /// the single pass would, and multiplying by it changes nothing.
+    #[test]
+    fn accumulation_by_exactly_one_is_two_half_passes() {
+        use crate::dev::kona::defs::pixel::*;
+        let mut b = pixel_window();
+        command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 16, 0]);
+        at(&mut b, 3, 3);
+        draw_pixels(&mut b, 1, 1, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &[0x8040_00ff]);
+        command(&mut b, Grammar::Gl, SELECT_READ_BUFFER, &[crate::dev::kona::defs::gl::BACK]);
+        let acc = |b: &mut KonaBackend, op: u32, v: f32| {
+            command(b, Grammar::Gl, ACCUMULATION_BUFFER_OPERATION, &[op, v.to_bits()]);
+        };
+        let back = |b: &mut KonaBackend| {
+            command(b, Grammar::Gl, SET_COLOUR_CLEAR_VALUE, &[0, 0, 0, 0]);
+            command(b, Grammar::Gl, CLEAR_SELECTED_BUFFERS, &[crate::dev::kona::defs::gl::COLOR_BUFFER_BIT]);
+            acc(b, ACCUM_RETURN, 1.0);
+            let c = colour_at(b, 3, 3);
+            [c >> 16 & 0xff, c >> 8 & 0xff, c & 0xff]
+        };
+        acc(&mut b, ACCUM_LOAD, 1.0);
+        assert_eq!(back(&mut b), [0x80, 0x40, 0], "a load of 1.0 is the colour");
+        acc(&mut b, ACCUM_MULT, 1.0);
+        assert_eq!(back(&mut b), [0x80, 0x40, 0], "multiplying by 1.0 changes nothing");
+        acc(&mut b, ACCUM, 1.0);
+        acc(&mut b, ACCUM_MULT, 0.5);
+        assert_eq!(back(&mut b), [0x80, 0x40, 0], "accumulating 1.0 twice the colour, halved");
+        acc(&mut b, ACCUM_ADD, 1.0);
+        assert_eq!(back(&mut b), [0xff, 0xff, 0xff], "an add of 1.0 saturates a return");
+    }
 
     // ---- Queries, select and feedback ----
 

@@ -230,6 +230,8 @@ pub struct Gl {
     pub clear_stencil: u32,
     /// The bound texture, set by a bind and read when the draw state is built.
     pub texture: Option<TexDesc>,
+    /// Pixel-store, transfer and zoom state, the raster position, maps and the accumulation clear value.
+    pub pix: super::pixels::Pixels,
     /// The draw state built from the above, kept until a state command changes it.
     ds: Option<DrawState>,
 }
@@ -276,6 +278,7 @@ impl Default for Gl {
             clear_depth: 1.0,
             clear_stencil: 0,
             texture: None,
+            pix: Default::default(),
             ds: None,
         };
         g.light.init();

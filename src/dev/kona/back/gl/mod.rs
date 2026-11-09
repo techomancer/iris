@@ -47,6 +47,7 @@
 //! not this module's: the back end hands them to `texture`, and a bound 1D or 2D
 //! texture is sampled in `raster`.
 
+pub mod pixels;
 pub mod state;
 pub mod texture;
 pub mod vertex;
