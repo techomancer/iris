@@ -82,6 +82,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   for formatting calls in the interpreter's hot code and for a hit-path cache
   fetch left out of line, as CI does on Linux x86-64. It replaces
   `tools/hot-path-check.sh` and needs no binutils.
+### Benchmark report
+
+- The per-kernel table has a "vs base" column for every cell and a "native" column for every cell. Both used to divide the best cell by the base or the host, so a slower build still read 1.00x.
 
 ### Boot test
 
