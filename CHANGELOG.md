@@ -81,8 +81,28 @@ where they differed:
 - A large host DMA no longer runs past the pages the kernel mapped for it;
   on the IP28 it wrote over the kernel's exception vectors and hung the
   guest (the board's refill of the next window is not modelled yet).
+- GL lines follow the board's diamond exit: the start pixel is drawn, the
+  end pixel is not, judged at the line's distance from the pixel centres
+  (even widths half a pixel off). Line loops no longer lose their corners,
+  stipple patterns no longer run a pixel late, and colours start at the
+  first pixel's centre. Every aliased line and point case of
+  `linesweep.sh` matches the board, checked offline by `real_board_lines`.
+- RGBA fog follows the board: a table over the window depth built from
+  the projection, so fog is exact under perspective, with the board's
+  index bias, 8-bit output and pixel pairs, in all three raster engines.
+  glprim's fog scenes are within about a level of the board on average
+  (they were 40 levels off for EXP), and test/gltest/fogtest's fourteen
+  cases within two. Colour-index fog is still per vertex.
+- Antialiased width-1 lines and antialiased points follow the board's
+  measured coverage (lines a few levels off on average, points one); a
+  flat line clipped by the window keeps its colour.
+- A new context's GE pixel memory holds the board's fresh values for the
+  host element type and its neighbours.
 - New guest tools: `bdinfo` (the board-info record gfxinfo reads), `rdist`,
-  `blendtest -a` and `dettex --fill / --dump`.
+  `blendtest -a`, `dettex --fill / --dump`, `fogtest` (fog per pixel) and
+  `linetest points|vprofile|vslopes` (antialiased points and y-major
+  lines). The board's read-backs of lines, points and fog are unit tests
+  (`real_board_*` in `src/dev/mgras/mgras_tests.rs`).
 
 ### VPro introspection
 

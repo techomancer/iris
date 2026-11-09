@@ -130,7 +130,7 @@ const T_J1: usize = 19;
 const T_XS: usize = 20;
 const T_YREFI: usize = 21;
 const T_C: usize = 22;
-const T_FOG: usize = 34;
+// Words 34..37 are free (the old fog plane).
 const T_Z: usize = 37;
 const T_T: usize = 43;
 const TRI_LTOR: u32 = 1;
@@ -146,8 +146,7 @@ const G_DIR: usize = 8;
 const G_WIDTH: usize = 9;
 const G_CBASE: usize = 10;
 const G_CSTEP: usize = 14;
-const G_FBASE: usize = 18;
-const G_FSTEP: usize = 19;
+// Words 18 and 19 are free (the old fog steps).
 const G_ZBASE: usize = 20;
 const G_ZSTEP: usize = 22;
 const G_TBASE: usize = 24;
@@ -221,7 +220,12 @@ const SL_STIPPLE: usize = 80;
 /// the TXLOD cutoff index, then its 32 weights at SL_DTABLE.
 const SL_DETAIL: usize = 112;
 const SL_DTABLE: usize = 120;
-const SLOT_WORDS: usize = 152;
+/// The fog table (`rss::reg::FOG_LUT`) and its index's scale and offset
+/// (FOG_IDX_K, FOG_IDX_B), when fog is on.
+const SL_FOGLUT: usize = 152;
+const SL_FOGIK: usize = SL_FOGLUT + super::rss::FOG_LUT_WORDS;
+const SL_FOGIB: usize = SL_FOGIK + 1;
+const SLOT_WORDS: usize = 284;
 
 /// A state slot, as the kernels read it.
 #[repr(C)]
@@ -284,6 +288,13 @@ impl Slot {
             w[SL_DETAIL..SL_DETAIL + 6].copy_from_slice(&[d.on, d.page, d.log, d.shift_s, d.shift_t, d.last]);
             w[SL_DTABLE..SL_DTABLE + 32].copy_from_slice(&d.table);
         }
+        if r.reg(reg::FOG_ON) != 0 {
+            for n in 0..super::rss::FOG_LUT_WORDS {
+                w[SL_FOGLUT + n] = r.reg(reg::FOG_LUT + n as u32);
+            }
+            w[SL_FOGIK] = r.reg(reg::FOG_IDX_K);
+            w[SL_FOGIB] = r.reg(reg::FOG_IDX_B);
+        }
         if stipple {
             for j in 0..32 {
                 w[SL_STIPPLE + j] = r.poly_stipple_row(j as u32);
@@ -339,7 +350,6 @@ const DEFINES: &[(&str, u32)] = &[
     ("T_XS", T_XS as u32),
     ("T_YREFI", T_YREFI as u32),
     ("T_C", T_C as u32),
-    ("T_FOG", T_FOG as u32),
     ("T_Z", T_Z as u32),
     ("T_T", T_T as u32),
     ("TRI_LTOR", TRI_LTOR),
@@ -354,8 +364,6 @@ const DEFINES: &[(&str, u32)] = &[
     ("G_WIDTH", G_WIDTH as u32),
     ("G_CBASE", G_CBASE as u32),
     ("G_CSTEP", G_CSTEP as u32),
-    ("G_FBASE", G_FBASE as u32),
-    ("G_FSTEP", G_FSTEP as u32),
     ("G_ZBASE", G_ZBASE as u32),
     ("G_ZSTEP", G_ZSTEP as u32),
     ("G_TBASE", G_TBASE as u32),
@@ -406,6 +414,9 @@ const DEFINES: &[(&str, u32)] = &[
     ("SL_STIPPLE", SL_STIPPLE as u32),
     ("SL_DETAIL", SL_DETAIL as u32),
     ("SL_DTABLE", SL_DTABLE as u32),
+    ("SL_FOGLUT", SL_FOGLUT as u32),
+    ("SL_FOGIK", SL_FOGIK as u32),
+    ("SL_FOGIB", SL_FOGIB as u32),
     ("FB_W", WIDTH as u32),
     ("FB_H", HEIGHT as u32),
     ("PAGES", PAGES as u32),
@@ -1094,7 +1105,6 @@ impl GpuRaster {
             }
         }
         for k in 0..3 {
-            rec.set_i(T_FOG + k, t.fogp[k]);
             rec.set_i64(T_Z + 2 * k, t.zp[k]);
             for c in 0..3 {
                 rec.set_i64(T_T + 6 * c + 2 * k, t.tp[c][k]);
@@ -1160,8 +1170,6 @@ impl GpuRaster {
             rec.set_i(G_CBASE + k, l.cbase[k]);
             rec.set_i(G_CSTEP + k, l.cstep[k]);
         }
-        rec.set_i(G_FBASE, l.fbase);
-        rec.set_i(G_FSTEP, l.fstep);
         rec.set_i64(G_ZBASE, l.zbase);
         rec.set_i64(G_ZSTEP, l.zstep);
         for k in 0..3 {

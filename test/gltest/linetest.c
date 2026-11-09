@@ -14,6 +14,13 @@
  * With "fine": smoothed lines of slope j/64, j 0 to 64, placed so the
  * line crosses column 31's centre at y = 20.5 + k/16, k 0 to 15, widths 1
  * and 2; prints column 31: "width j k y r".
+ * With "vprofile" and "vslopes": the same as "profile" and "slopes" with x
+ * and y swapped (vertical lines, y-major slopes); they print "width64 k x
+ * r" (row y = 25) and "width s k x y r" (rows 30 to 33).
+ * With "points": smoothed points of sizes 1, 2, 3, 4.5 and 6.5 at
+ * (8 + i/8, 8 + j/8) within a 16 x 16 cell, i and j 0 to 7; prints every
+ * lit pixel of the cell: "points size64 i j x y r" (x, y in the cell).
+ * "pointsdc" the same with GL_POINT_SMOOTH_HINT left at GL_DONT_CARE.
  */
 #include <string.h>
 #include <stdio.h>
@@ -173,6 +180,109 @@ static void fine(void)
     }
 }
 
+static void vprofile(void)
+{
+    static float widths[2] = { 1.0f, 2.0f };
+    static unsigned char row[512 * 4];
+    int wi, k, x;
+
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glShadeModel(GL_FLAT);
+    for (wi = 0; wi < 2; wi++) {
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glLineWidth(widths[wi]);
+        glColor3f(1.0f, 1.0f, 1.0f);
+        glBegin(GL_LINES);
+        for (k = 0; k < 64; k++) {
+            double xx = 4.0 + 7.0 * k + k / 64.0;
+            glVertex2d(xx, 10.0);
+            glVertex2d(xx, 40.0);
+        }
+        glEnd();
+        glFinish();
+        glReadPixels(0, 25, W, 1, GL_RGBA, GL_UNSIGNED_BYTE, row);
+        for (x = 0; x < W; x++) {
+            if (row[4 * x]) {
+                k = (x - 1) / 7;
+                printf("%d %d %d %d\n", (int)(widths[wi] * 64.0f), k, x, row[4 * x]);
+            }
+        }
+    }
+}
+
+static void vslopes(void)
+{
+    static unsigned char blk[120 * 4 * 4];
+    int wi, sl, k, x, y;
+
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glShadeModel(GL_FLAT);
+    for (wi = 1; wi <= 1; wi++) {
+        glLineWidth((float)wi);
+        for (sl = 0; sl <= 8; sl++) {
+            for (k = 0; k < 16; k++) {
+                double x0 = 8.0 + k / 16.0;
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glColor3f(1.0f, 1.0f, 1.0f);
+                glBegin(GL_LINES);
+                glVertex2d(x0, 8.0);
+                glVertex2d(x0 + 64.0 * sl / 8.0, 72.0);
+                glEnd();
+                glFinish();
+                glReadPixels(0, 30, 120, 4, GL_RGBA, GL_UNSIGNED_BYTE, blk);
+                for (y = 0; y < 4; y++) {
+                    for (x = 0; x < 120; x++) {
+                        int v = blk[4 * (y * 120 + x)];
+                        if (v) printf("%d %d %d %d %d %d\n", wi, sl, k, x, 30 + y, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void points(int nicest)
+{
+    static float sizes[5] = { 1.0f, 2.0f, 3.0f, 4.5f, 6.5f };
+    static unsigned char blk[16 * 16 * 4];
+    int si, i, j, x, y;
+
+    glEnable(GL_POINT_SMOOTH);
+    glHint(GL_POINT_SMOOTH_HINT, nicest ? GL_NICEST : GL_DONT_CARE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glShadeModel(GL_FLAT);
+    for (si = 0; si < 5; si++) {
+        glPointSize(sizes[si]);
+        for (j = 0; j < 8; j++) {
+            for (i = 0; i < 8; i++) {
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glColor3f(1.0f, 1.0f, 1.0f);
+                glBegin(GL_POINTS);
+                glVertex2d(8.0 + i / 8.0, 8.0 + j / 8.0);
+                glEnd();
+                glFinish();
+                glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, blk);
+                for (y = 0; y < 16; y++) {
+                    for (x = 0; x < 16; x++) {
+                        int v = blk[4 * (y * 16 + x)];
+                        if (v) printf("points %d %d %d %d %d %d\n", (int)(sizes[si] * 64.0f), i, j, x, y, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     static int attr[] = { GLX_RGBA, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None };
@@ -215,6 +325,24 @@ int main(int argc, char **argv)
     }
     if (argc > 1 && strcmp(argv[1], "slopes") == 0) {
         slopes();
+        glXMakeCurrent(dpy, None, NULL);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "vprofile") == 0) {
+        vprofile();
+        glXMakeCurrent(dpy, None, NULL);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "vslopes") == 0) {
+        vslopes();
+        glXMakeCurrent(dpy, None, NULL);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    if (argc > 1 && (strcmp(argv[1], "points") == 0 || strcmp(argv[1], "pointsdc") == 0)) {
+        points(strcmp(argv[1], "points") == 0);
         glXMakeCurrent(dpy, None, NULL);
         XCloseDisplay(dpy);
         return 0;

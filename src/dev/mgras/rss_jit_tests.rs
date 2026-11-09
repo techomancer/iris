@@ -474,7 +474,10 @@ fn sweep(prim: Prim, salt: u64, steps: usize, tex_bias: f64) {
         p.changed,
         t0.elapsed().as_secs_f64()
     );
-    assert!(p.changed >= 10 * prims as u64, "{prim:?}: the primitives wrote only {} words", p.changed);
+    // GL lines are short a third of the time (0 to 3 pixels): about nine
+    // words each.
+    let floor = if matches!(prim, Prim::GlLine) { 8 } else { 10 };
+    assert!(p.changed >= floor * prims as u64, "{prim:?}: the primitives wrote only {} words", p.changed);
     assert!(hits as usize * 2 >= prims, "{prim:?}: shaders ran for only {hits} of {prims} primitives");
     cov.assert_complete(prim);
 }

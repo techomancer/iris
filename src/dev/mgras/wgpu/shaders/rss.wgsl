@@ -232,7 +232,8 @@ fn triangle(pi: u32, si: u32, x: i32, y: i32) {
         rgba = textured(si, sw, tw, wi, ds, dt, dw, rgba);
     }
     if (flags & TRI_FOG) != 0u {
-        rgba = fogged(si, rgba, plane_at(pi, T_FOG, di, dj));
+        // `rss::fog_pair_offset`.
+        rgba = fogged(si, rgba, plane64_at(pi, T_Z, di + 2 - (i & 1), dj));
     }
     gl_fragment(si, x, y, rgba, plane64_at(pi, T_Z, di, dj));
 }
@@ -276,7 +277,7 @@ fn gl_line(pi: u32, si: u32, x: i32, y: i32) {
         rgba = textured(si, sw, tw, wi, ds, dt, dw, rgba);
     }
     if (flags & GL_FOG) != 0u {
-        rgba = fogged(si, rgba, ri(pi, G_FBASE) + ri(pi, G_FSTEP) * k);
+        rgba = fogged(si, rgba, i64_madd(r64(pi, G_ZBASE), r64(pi, G_ZSTEP), k + (2 - (p & 1)) * dir));
     }
     gl_fragment(si, x, y, rgba, i64_madd(r64(pi, G_ZBASE), r64(pi, G_ZSTEP), k));
 }

@@ -1,0 +1,1884 @@
+# Antialiased lines and points on a real High IMPACT (Indigo2 IP28, IRIX
+# 6.5.22, 2026-11-09), test/gltest/linetest, white on black with
+# GL_SRC_ALPHA, GL_ONE: red is the coverage. 'line CELL x y r': the smooth
+# width-1 case, CELL k a 60-pixel line from ((k % 4) 128 + 20.3, (k / 4) 128
+# + 20.6) at angle 0, 5, 15, 26.565, 35, 45, 63.435, 90 degrees. 'point
+# SIZE64 I J x y r': a point of size SIZE64 / 64 at (8 + I/8, 8 + J/8).
+# Window coordinates (y up), non-zero pixels only. Used by mgras_tests.rs
+# real_board_smooth_lines_and_points.
+line 0 20 20 111
+line 0 21 20 160
+line 0 22 20 160
+line 0 23 20 160
+line 0 24 20 160
+line 0 25 20 160
+line 0 26 20 160
+line 0 27 20 160
+line 0 28 20 160
+line 0 29 20 160
+line 0 30 20 160
+line 0 31 20 160
+line 0 32 20 160
+line 0 33 20 160
+line 0 34 20 160
+line 0 35 20 160
+line 0 36 20 160
+line 0 37 20 160
+line 0 38 20 160
+line 0 39 20 160
+line 0 40 20 160
+line 0 41 20 160
+line 0 42 20 160
+line 0 43 20 160
+line 0 44 20 160
+line 0 45 20 160
+line 0 46 20 160
+line 0 47 20 160
+line 0 48 20 160
+line 0 49 20 160
+line 0 50 20 160
+line 0 51 20 160
+line 0 52 20 160
+line 0 53 20 160
+line 0 54 20 160
+line 0 55 20 160
+line 0 56 20 160
+line 0 57 20 160
+line 0 58 20 160
+line 0 59 20 160
+line 0 60 20 160
+line 0 61 20 160
+line 0 62 20 160
+line 0 63 20 160
+line 0 64 20 160
+line 0 65 20 160
+line 0 66 20 160
+line 0 67 20 160
+line 0 68 20 160
+line 0 69 20 160
+line 0 70 20 160
+line 0 71 20 160
+line 0 72 20 160
+line 0 73 20 160
+line 0 74 20 160
+line 0 75 20 160
+line 0 76 20 160
+line 0 77 20 160
+line 0 78 20 160
+line 0 79 20 160
+line 0 80 20 47
+line 1 148 20 112
+line 1 149 20 150
+line 1 150 20 138
+line 1 151 20 126
+line 1 152 20 112
+line 1 153 20 99
+line 1 154 20 83
+line 1 155 20 69
+line 1 156 20 50
+line 1 157 20 32
+line 2 276 20 117
+line 2 277 20 126
+line 2 278 20 79
+line 2 279 20 14
+line 3 404 20 117
+line 3 405 20 83
+line 0 20 21 18
+line 0 21 21 27
+line 0 22 21 27
+line 0 23 21 27
+line 0 24 21 27
+line 0 25 21 27
+line 0 26 21 27
+line 0 27 21 27
+line 0 28 21 27
+line 0 29 21 27
+line 0 30 21 27
+line 0 31 21 27
+line 0 32 21 27
+line 0 33 21 27
+line 0 34 21 27
+line 0 35 21 27
+line 0 36 21 27
+line 0 37 21 27
+line 0 38 21 27
+line 0 39 21 27
+line 0 40 21 27
+line 0 41 21 27
+line 0 42 21 27
+line 0 43 21 27
+line 0 44 21 27
+line 0 45 21 27
+line 0 46 21 27
+line 0 47 21 27
+line 0 48 21 27
+line 0 49 21 27
+line 0 50 21 27
+line 0 51 21 27
+line 0 52 21 27
+line 0 53 21 27
+line 0 54 21 27
+line 0 55 21 27
+line 0 56 21 27
+line 0 57 21 27
+line 0 58 21 27
+line 0 59 21 27
+line 0 60 21 27
+line 0 61 21 27
+line 0 62 21 27
+line 0 63 21 27
+line 0 64 21 27
+line 0 65 21 27
+line 0 66 21 27
+line 0 67 21 27
+line 0 68 21 27
+line 0 69 21 27
+line 0 70 21 27
+line 0 71 21 27
+line 0 72 21 27
+line 0 73 21 27
+line 0 74 21 27
+line 0 75 21 27
+line 0 76 21 27
+line 0 77 21 27
+line 0 78 21 27
+line 0 79 21 27
+line 0 80 21 7
+line 1 148 21 22
+line 1 149 21 54
+line 1 150 21 69
+line 1 151 21 86
+line 1 152 21 102
+line 1 153 21 114
+line 1 154 21 128
+line 1 155 21 138
+line 1 156 21 152
+line 1 157 21 161
+line 1 158 21 173
+line 1 159 21 166
+line 1 160 21 156
+line 1 161 21 143
+line 1 162 21 132
+line 1 163 21 119
+line 1 164 21 104
+line 1 165 21 91
+line 1 166 21 75
+line 1 167 21 60
+line 1 168 21 40
+line 1 169 21 13
+line 2 276 21 29
+line 2 277 21 100
+line 2 278 21 142
+line 2 279 21 180
+line 2 280 21 157
+line 2 281 21 116
+line 2 282 21 67
+line 3 404 21 38
+line 3 405 21 149
+line 3 406 21 169
+line 3 407 21 83
+line 1 159 22 24
+line 1 160 22 43
+line 1 161 22 63
+line 1 162 22 78
+line 1 163 22 94
+line 1 164 22 109
+line 1 165 22 121
+line 1 166 22 134
+line 1 167 22 145
+line 1 168 22 158
+line 1 169 22 170
+line 1 170 22 172
+line 1 171 22 159
+line 1 172 22 150
+line 1 173 22 136
+line 1 174 22 123
+line 1 175 22 112
+line 1 176 22 97
+line 1 177 22 83
+line 1 178 22 66
+line 1 179 22 47
+line 1 180 22 28
+line 2 280 22 60
+line 2 281 22 111
+line 2 282 22 152
+line 2 283 22 184
+line 2 284 22 145
+line 2 285 22 103
+line 2 286 22 50
+line 3 406 22 56
+line 3 407 22 149
+line 3 408 22 169
+line 3 409 22 83
+line 1 170 23 7
+line 1 171 23 36
+line 1 172 23 54
+line 1 173 23 72
+line 1 174 23 89
+line 1 175 23 102
+line 1 176 23 116
+line 1 177 23 128
+line 1 178 23 141
+line 1 179 23 154
+line 1 180 23 164
+line 1 181 23 175
+line 1 182 23 166
+line 1 183 23 154
+line 1 184 23 141
+line 1 185 23 130
+line 1 186 23 116
+line 1 187 23 104
+line 1 188 23 89
+line 1 189 23 72
+line 1 190 23 57
+line 1 191 23 36
+line 1 192 23 13
+line 2 284 23 76
+line 2 285 23 123
+line 2 286 23 163
+line 2 287 23 174
+line 2 288 23 136
+line 2 289 23 91
+line 2 290 23 34
+line 3 408 23 56
+line 3 409 23 149
+line 3 410 23 169
+line 3 411 23 83
+line 1 182 24 24
+line 1 183 24 47
+line 1 184 24 66
+line 1 185 24 80
+line 1 186 24 97
+line 1 187 24 109
+line 1 188 24 123
+line 1 189 24 136
+line 1 190 24 147
+line 1 191 24 159
+line 1 192 24 170
+line 1 193 24 170
+line 1 194 24 158
+line 1 195 24 147
+line 1 196 24 134
+line 1 197 24 123
+line 1 198 24 109
+line 1 199 24 94
+line 1 200 24 80
+line 1 201 24 63
+line 1 202 24 47
+line 1 203 24 24
+line 2 287 24 30
+line 2 288 24 88
+line 2 289 24 134
+line 2 290 24 171
+line 2 291 24 163
+line 2 292 24 123
+line 2 293 24 76
+line 2 294 24 7
+line 3 410 24 56
+line 3 411 24 149
+line 3 412 24 169
+line 3 413 24 83
+line 1 193 25 13
+line 1 194 25 40
+line 1 195 25 57
+line 1 196 25 75
+line 1 197 25 89
+line 1 198 25 104
+line 1 199 25 119
+line 1 200 25 130
+line 1 201 25 143
+line 1 202 25 154
+line 1 203 25 166
+line 1 204 25 173
+line 1 205 25 164
+line 1 206 25 152
+line 1 207 25 141
+line 1 208 25 8
+line 2 291 25 50
+line 2 292 25 103
+line 2 293 25 145
+line 2 294 25 183
+line 2 295 25 154
+line 2 296 25 114
+line 2 297 25 60
+line 3 412 25 56
+line 3 413 25 149
+line 3 414 25 169
+line 3 415 25 83
+line 1 205 26 28
+line 1 206 26 50
+line 1 207 26 66
+line 1 208 26 4
+line 2 295 26 64
+line 2 296 26 114
+line 2 297 26 157
+line 2 298 26 180
+line 2 299 26 142
+line 2 300 26 100
+line 2 301 26 46
+line 3 414 26 56
+line 3 415 26 149
+line 3 416 26 169
+line 3 417 26 83
+line 2 298 27 14
+line 2 299 27 79
+line 2 300 27 126
+line 2 301 27 165
+line 2 302 27 171
+line 2 303 27 134
+line 2 304 27 85
+line 2 305 27 25
+line 3 416 27 56
+line 3 417 27 149
+line 3 418 27 169
+line 3 419 27 83
+line 2 302 28 34
+line 2 303 28 91
+line 2 304 28 138
+line 2 305 28 176
+line 2 306 28 161
+line 2 307 28 121
+line 2 308 28 73
+line 3 418 28 56
+line 3 419 28 149
+line 3 420 28 169
+line 3 421 28 83
+line 2 306 29 53
+line 2 307 29 105
+line 2 308 29 147
+line 2 309 29 184
+line 2 310 29 152
+line 2 311 29 108
+line 2 312 29 57
+line 3 420 29 56
+line 3 421 29 149
+line 3 422 29 169
+line 3 423 29 83
+line 2 310 30 67
+line 2 311 30 119
+line 2 312 30 159
+line 2 313 30 178
+line 2 314 30 140
+line 2 315 30 97
+line 2 316 30 42
+line 3 422 30 56
+line 3 423 30 149
+line 3 424 30 169
+line 3 425 30 83
+line 2 313 31 20
+line 2 314 31 82
+line 2 315 31 128
+line 2 316 31 168
+line 2 317 31 169
+line 2 318 31 128
+line 2 319 31 82
+line 2 320 31 20
+line 3 424 31 56
+line 3 425 31 149
+line 3 426 31 169
+line 3 427 31 83
+line 2 317 32 39
+line 2 318 32 97
+line 2 319 32 140
+line 2 320 32 178
+line 2 321 32 159
+line 2 322 32 119
+line 2 323 32 70
+line 3 426 32 56
+line 3 427 32 149
+line 3 428 32 169
+line 3 429 32 83
+line 2 321 33 57
+line 2 322 33 108
+line 2 323 33 150
+line 2 324 33 186
+line 2 325 33 147
+line 2 326 33 105
+line 2 327 33 53
+line 3 428 33 56
+line 3 429 33 149
+line 3 430 33 169
+line 3 431 33 83
+line 2 325 34 73
+line 2 326 34 121
+line 2 327 34 161
+line 2 328 34 176
+line 2 329 34 138
+line 2 330 34 95
+line 2 331 34 34
+line 3 430 34 56
+line 3 431 34 149
+line 3 432 34 169
+line 3 433 34 83
+line 2 328 35 25
+line 2 329 35 85
+line 2 330 35 131
+line 2 331 35 171
+line 2 332 35 165
+line 2 333 35 126
+line 2 334 35 19
+line 3 432 35 56
+line 3 433 35 149
+line 3 434 35 169
+line 3 435 35 83
+line 2 332 36 46
+line 2 333 36 100
+line 2 334 36 35
+line 3 434 36 56
+line 3 435 36 149
+line 3 436 36 169
+line 3 437 36 83
+line 3 436 37 56
+line 3 437 37 149
+line 3 438 37 169
+line 3 439 37 83
+line 3 438 38 56
+line 3 439 38 149
+line 3 440 38 169
+line 3 441 38 83
+line 3 440 39 56
+line 3 441 39 149
+line 3 442 39 169
+line 3 443 39 83
+line 3 442 40 56
+line 3 443 40 149
+line 3 444 40 169
+line 3 445 40 83
+line 3 444 41 56
+line 3 445 41 149
+line 3 446 41 169
+line 3 447 41 83
+line 3 446 42 56
+line 3 447 42 149
+line 3 448 42 169
+line 3 449 42 83
+line 3 448 43 56
+line 3 449 43 149
+line 3 450 43 169
+line 3 451 43 83
+line 3 450 44 56
+line 3 451 44 149
+line 3 452 44 169
+line 3 453 44 83
+line 3 452 45 56
+line 3 453 45 149
+line 3 454 45 169
+line 3 455 45 83
+line 3 454 46 56
+line 3 455 46 149
+line 3 456 46 169
+line 3 457 46 80
+line 3 456 47 56
+line 3 457 47 143
+line 4 20 148 123
+line 4 21 148 23
+line 5 148 148 130
+line 6 275 148 26
+line 6 276 148 70
+line 7 403 148 19
+line 7 404 148 65
+line 4 20 149 50
+line 4 21 149 204
+line 4 22 149 101
+line 5 148 149 68
+line 5 149 149 187
+line 6 276 149 182
+line 6 277 149 66
+line 7 403 149 51
+line 7 404 149 167
+line 4 22 150 155
+line 4 23 150 160
+line 5 149 150 99
+line 5 150 150 187
+line 6 276 150 73
+line 6 277 150 176
+line 7 403 150 51
+line 7 404 150 167
+line 4 23 151 94
+line 4 24 151 209
+line 4 25 151 81
+line 5 150 151 99
+line 5 151 151 187
+line 6 277 151 182
+line 6 278 151 66
+line 7 403 151 51
+line 7 404 151 167
+line 4 24 152 9
+line 4 25 152 171
+line 4 26 152 141
+line 5 151 152 99
+line 5 152 152 187
+line 6 277 152 73
+line 6 278 152 176
+line 7 403 152 51
+line 7 404 152 167
+line 4 26 153 118
+line 4 27 153 192
+line 4 28 153 57
+line 5 152 153 99
+line 5 153 153 187
+line 6 278 153 182
+line 6 279 153 66
+line 7 403 153 51
+line 7 404 153 167
+line 4 27 154 49
+line 4 28 154 187
+line 4 29 154 124
+line 5 153 154 99
+line 5 154 154 187
+line 6 278 154 73
+line 6 279 154 176
+line 7 403 154 51
+line 7 404 154 167
+line 4 29 155 136
+line 4 30 155 177
+line 4 31 155 23
+line 5 154 155 99
+line 5 155 155 187
+line 6 279 155 182
+line 6 280 155 66
+line 7 403 155 51
+line 7 404 155 167
+line 4 30 156 73
+line 4 31 156 204
+line 4 32 156 101
+line 5 155 156 99
+line 5 156 156 187
+line 6 279 156 73
+line 6 280 156 176
+line 7 403 156 51
+line 7 404 156 167
+line 4 32 157 155
+line 4 33 157 160
+line 5 156 157 99
+line 5 157 157 187
+line 6 280 157 182
+line 6 281 157 66
+line 7 403 157 51
+line 7 404 157 167
+line 4 33 158 94
+line 4 34 158 209
+line 4 35 158 81
+line 5 157 158 99
+line 5 158 158 187
+line 6 280 158 73
+line 6 281 158 176
+line 7 403 158 51
+line 7 404 158 167
+line 4 34 159 9
+line 4 35 159 171
+line 4 36 159 141
+line 5 158 159 99
+line 5 159 159 187
+line 6 281 159 182
+line 6 282 159 66
+line 7 403 159 51
+line 7 404 159 167
+line 4 36 160 118
+line 4 37 160 192
+line 4 38 160 53
+line 5 159 160 99
+line 5 160 160 187
+line 6 281 160 73
+line 6 282 160 176
+line 7 403 160 51
+line 7 404 160 167
+line 4 37 161 49
+line 4 38 161 189
+line 4 39 161 124
+line 5 160 161 99
+line 5 161 161 187
+line 6 282 161 182
+line 6 283 161 66
+line 7 403 161 51
+line 7 404 161 167
+line 4 39 162 136
+line 4 40 162 177
+line 4 41 162 23
+line 5 161 162 99
+line 5 162 162 187
+line 6 282 162 73
+line 6 283 162 176
+line 7 403 162 51
+line 7 404 162 167
+line 4 40 163 73
+line 4 41 163 204
+line 4 42 163 101
+line 5 162 163 99
+line 5 163 163 187
+line 6 283 163 182
+line 6 284 163 66
+line 7 403 163 51
+line 7 404 163 167
+line 4 42 164 155
+line 4 43 164 158
+line 5 163 164 99
+line 5 164 164 187
+line 6 283 164 73
+line 6 284 164 176
+line 7 403 164 51
+line 7 404 164 167
+line 4 43 165 98
+line 4 44 165 209
+line 4 45 165 81
+line 5 164 165 99
+line 5 165 165 187
+line 6 284 165 182
+line 6 285 165 66
+line 7 403 165 51
+line 7 404 165 167
+line 4 44 166 9
+line 4 45 166 171
+line 4 46 166 141
+line 5 165 166 99
+line 5 166 166 187
+line 6 284 166 73
+line 6 285 166 176
+line 7 403 166 51
+line 7 404 166 167
+line 4 46 167 118
+line 4 47 167 192
+line 4 48 167 53
+line 5 166 167 99
+line 5 167 167 187
+line 6 285 167 182
+line 6 286 167 66
+line 7 403 167 51
+line 7 404 167 167
+line 4 47 168 49
+line 4 48 168 189
+line 4 49 168 121
+line 5 167 168 99
+line 5 168 168 187
+line 6 285 168 73
+line 6 286 168 176
+line 7 403 168 51
+line 7 404 168 167
+line 4 49 169 138
+line 4 50 169 177
+line 4 51 169 23
+line 5 168 169 99
+line 5 169 169 187
+line 6 286 169 182
+line 6 287 169 66
+line 7 403 169 51
+line 7 404 169 167
+line 4 50 170 73
+line 4 51 170 204
+line 4 52 170 101
+line 5 169 170 99
+line 5 170 170 187
+line 6 286 170 73
+line 6 287 170 176
+line 7 403 170 51
+line 7 404 170 167
+line 4 52 171 155
+line 4 53 171 158
+line 5 170 171 99
+line 5 171 171 187
+line 6 287 171 182
+line 6 288 171 66
+line 7 403 171 51
+line 7 404 171 167
+line 4 53 172 98
+line 4 54 172 206
+line 4 55 172 81
+line 5 171 172 99
+line 5 172 172 187
+line 6 287 172 73
+line 6 288 172 176
+line 7 403 172 51
+line 7 404 172 167
+line 4 54 173 16
+line 4 55 173 171
+line 4 56 173 141
+line 5 172 173 99
+line 5 173 173 187
+line 6 288 173 182
+line 6 289 173 66
+line 7 403 173 51
+line 7 404 173 167
+line 4 56 174 118
+line 4 57 174 192
+line 4 58 174 53
+line 5 173 174 99
+line 5 174 174 187
+line 6 288 174 73
+line 6 289 174 176
+line 7 403 174 51
+line 7 404 174 167
+line 4 57 175 49
+line 4 58 175 189
+line 4 59 175 121
+line 5 174 175 99
+line 5 175 175 187
+line 6 289 175 182
+line 6 290 175 66
+line 7 403 175 51
+line 7 404 175 167
+line 4 59 176 138
+line 4 60 176 177
+line 4 61 176 23
+line 5 175 176 99
+line 5 176 176 187
+line 6 289 176 73
+line 6 290 176 176
+line 7 403 176 51
+line 7 404 176 167
+line 4 60 177 73
+line 4 61 177 204
+line 4 62 177 101
+line 5 176 177 99
+line 5 177 177 187
+line 6 290 177 182
+line 6 291 177 66
+line 7 403 177 51
+line 7 404 177 167
+line 4 62 178 155
+line 4 63 178 158
+line 5 177 178 99
+line 5 178 178 187
+line 6 290 178 73
+line 6 291 178 176
+line 7 403 178 51
+line 7 404 178 167
+line 4 63 179 98
+line 4 64 179 206
+line 4 65 179 76
+line 5 178 179 99
+line 5 179 179 187
+line 6 291 179 182
+line 6 292 179 66
+line 7 403 179 51
+line 7 404 179 167
+line 4 64 180 16
+line 4 65 180 174
+line 4 66 180 141
+line 5 179 180 99
+line 5 180 180 187
+line 6 291 180 73
+line 6 292 180 176
+line 7 403 180 51
+line 7 404 180 167
+line 4 66 181 118
+line 4 67 181 192
+line 4 68 181 53
+line 5 180 181 99
+line 5 181 181 187
+line 6 292 181 182
+line 6 293 181 66
+line 7 403 181 51
+line 7 404 181 167
+line 4 67 182 49
+line 4 68 182 189
+line 4 69 182 53
+line 5 181 182 99
+line 5 182 182 187
+line 6 292 182 73
+line 6 293 182 176
+line 7 403 182 51
+line 7 404 182 167
+line 4 69 183 61
+line 5 182 183 99
+line 5 183 183 187
+line 6 293 183 182
+line 6 294 183 66
+line 7 403 183 51
+line 7 404 183 167
+line 5 183 184 99
+line 5 184 184 187
+line 6 293 184 73
+line 6 294 184 176
+line 7 403 184 51
+line 7 404 184 167
+line 5 184 185 99
+line 5 185 185 187
+line 6 294 185 182
+line 6 295 185 66
+line 7 403 185 51
+line 7 404 185 167
+line 5 185 186 99
+line 5 186 186 187
+line 6 294 186 73
+line 6 295 186 176
+line 7 403 186 51
+line 7 404 186 167
+line 5 186 187 99
+line 5 187 187 187
+line 6 295 187 182
+line 6 296 187 66
+line 7 403 187 51
+line 7 404 187 167
+line 5 187 188 99
+line 5 188 188 187
+line 6 295 188 73
+line 6 296 188 176
+line 7 403 188 51
+line 7 404 188 167
+line 5 188 189 99
+line 5 189 189 187
+line 6 296 189 182
+line 6 297 189 66
+line 7 403 189 51
+line 7 404 189 167
+line 5 189 190 99
+line 5 190 190 135
+line 6 296 190 73
+line 6 297 190 176
+line 7 403 190 51
+line 7 404 190 167
+line 5 190 191 71
+line 6 297 191 182
+line 6 298 191 66
+line 7 403 191 51
+line 7 404 191 167
+line 6 297 192 73
+line 6 298 192 176
+line 7 403 192 51
+line 7 404 192 167
+line 6 298 193 182
+line 6 299 193 66
+line 7 403 193 51
+line 7 404 193 167
+line 6 298 194 73
+line 6 299 194 176
+line 7 403 194 51
+line 7 404 194 167
+line 6 299 195 182
+line 6 300 195 66
+line 7 403 195 51
+line 7 404 195 167
+line 6 299 196 73
+line 6 300 196 176
+line 7 403 196 51
+line 7 404 196 167
+line 6 300 197 182
+line 6 301 197 66
+line 7 403 197 51
+line 7 404 197 167
+line 6 300 198 73
+line 6 301 198 176
+line 7 403 198 51
+line 7 404 198 167
+line 6 301 199 182
+line 6 302 199 66
+line 7 403 199 51
+line 7 404 199 167
+line 6 301 200 73
+line 6 302 200 176
+line 7 403 200 51
+line 7 404 200 167
+line 6 302 201 182
+line 6 303 201 66
+line 7 403 201 51
+line 7 404 201 167
+line 6 302 202 18
+line 6 303 202 46
+line 7 403 202 51
+line 7 404 202 167
+line 7 403 203 51
+line 7 404 203 167
+line 7 403 204 51
+line 7 404 204 167
+line 7 403 205 51
+line 7 404 205 167
+line 7 403 206 51
+line 7 404 206 167
+line 7 403 207 51
+line 7 404 207 167
+line 7 403 208 30
+line 7 404 208 100
+point 64 0 0 8 7 104
+point 64 0 0 8 8 104
+point 64 3 0 8 7 64
+point 64 3 0 9 7 38
+point 64 3 0 8 8 64
+point 64 3 0 9 8 38
+point 64 5 0 8 7 38
+point 64 5 0 9 7 64
+point 64 5 0 8 8 38
+point 64 5 0 9 8 64
+point 64 0 3 8 7 35
+point 64 0 3 8 8 156
+point 64 3 3 8 7 21
+point 64 3 3 9 7 12
+point 64 3 3 8 8 97
+point 64 3 3 9 8 57
+point 64 5 3 8 7 12
+point 64 5 3 9 7 21
+point 64 5 3 8 8 57
+point 64 5 3 9 8 97
+point 64 0 5 8 8 156
+point 64 0 5 8 9 35
+point 64 3 5 8 8 97
+point 64 3 5 9 8 57
+point 64 3 5 8 9 21
+point 64 3 5 9 9 12
+point 64 5 5 8 8 57
+point 64 5 5 9 8 97
+point 64 5 5 8 9 12
+point 64 5 5 9 9 21
+point 128 0 0 7 7 197
+point 128 0 0 8 7 197
+point 128 0 0 9 7 15
+point 128 0 0 7 8 197
+point 128 0 0 8 8 197
+point 128 0 0 9 8 15
+point 128 0 0 7 9 15
+point 128 0 0 8 9 15
+point 128 3 0 7 7 127
+point 128 3 0 8 7 230
+point 128 3 0 9 7 72
+point 128 3 0 7 8 127
+point 128 3 0 8 8 230
+point 128 3 0 9 8 72
+point 128 3 0 7 9 4
+point 128 3 0 8 9 23
+point 128 5 0 7 7 72
+point 128 5 0 8 7 230
+point 128 5 0 9 7 127
+point 128 5 0 7 8 72
+point 128 5 0 8 8 230
+point 128 5 0 9 8 127
+point 128 5 0 8 9 23
+point 128 5 0 9 9 4
+point 128 0 3 7 7 127
+point 128 0 3 8 7 127
+point 128 0 3 9 7 4
+point 128 0 3 7 8 230
+point 128 0 3 8 8 230
+point 128 0 3 9 8 23
+point 128 0 3 7 9 72
+point 128 0 3 8 9 72
+point 128 3 3 7 7 70
+point 128 3 3 8 7 157
+point 128 3 3 9 7 35
+point 128 3 3 7 8 157
+point 128 3 3 8 8 254
+point 128 3 3 9 8 95
+point 128 3 3 7 9 35
+point 128 3 3 8 9 95
+point 128 3 3 9 9 14
+point 128 5 3 7 7 35
+point 128 5 3 8 7 157
+point 128 5 3 9 7 70
+point 128 5 3 7 8 95
+point 128 5 3 8 8 254
+point 128 5 3 9 8 157
+point 128 5 3 7 9 14
+point 128 5 3 8 9 95
+point 128 5 3 9 9 35
+point 128 0 5 7 7 72
+point 128 0 5 8 7 72
+point 128 0 5 7 8 230
+point 128 0 5 8 8 230
+point 128 0 5 9 8 23
+point 128 0 5 7 9 127
+point 128 0 5 8 9 127
+point 128 0 5 9 9 4
+point 128 3 5 7 7 35
+point 128 3 5 8 7 95
+point 128 3 5 9 7 14
+point 128 3 5 7 8 157
+point 128 3 5 8 8 254
+point 128 3 5 9 8 95
+point 128 3 5 7 9 70
+point 128 3 5 8 9 157
+point 128 3 5 9 9 35
+point 128 5 5 7 7 14
+point 128 5 5 8 7 95
+point 128 5 5 9 7 35
+point 128 5 5 7 8 95
+point 128 5 5 8 8 254
+point 128 5 5 9 8 157
+point 128 5 5 7 9 35
+point 128 5 5 8 9 157
+point 128 5 5 9 9 70
+point 192 0 0 6 6 11
+point 192 0 0 7 6 108
+point 192 0 0 8 6 108
+point 192 0 0 9 6 11
+point 192 0 0 6 7 108
+point 192 0 0 7 7 254
+point 192 0 0 8 7 254
+point 192 0 0 9 7 108
+point 192 0 0 6 8 108
+point 192 0 0 7 8 254
+point 192 0 0 8 8 254
+point 192 0 0 9 8 108
+point 192 0 0 6 9 11
+point 192 0 0 7 9 108
+point 192 0 0 8 9 108
+point 192 0 0 9 9 11
+point 192 3 0 7 6 70
+point 192 3 0 8 6 126
+point 192 3 0 9 6 43
+point 192 3 0 6 7 32
+point 192 3 0 7 7 231
+point 192 3 0 8 7 255
+point 192 3 0 9 7 193
+point 192 3 0 10 7 7
+point 192 3 0 6 8 32
+point 192 3 0 7 8 231
+point 192 3 0 8 8 255
+point 192 3 0 9 8 193
+point 192 3 0 10 8 7
+point 192 3 0 7 9 70
+point 192 3 0 8 9 126
+point 192 3 0 9 9 43
+point 192 5 0 7 6 43
+point 192 5 0 8 6 126
+point 192 5 0 9 6 70
+point 192 5 0 7 7 193
+point 192 5 0 8 7 255
+point 192 5 0 9 7 231
+point 192 5 0 10 7 32
+point 192 5 0 7 8 193
+point 192 5 0 8 8 255
+point 192 5 0 9 8 231
+point 192 5 0 10 8 32
+point 192 5 0 7 9 43
+point 192 5 0 8 9 126
+point 192 5 0 9 9 70
+point 192 0 3 7 6 32
+point 192 0 3 8 6 32
+point 192 0 3 6 7 70
+point 192 0 3 7 7 231
+point 192 0 3 8 7 231
+point 192 0 3 9 7 70
+point 192 0 3 6 8 126
+point 192 0 3 7 8 255
+point 192 0 3 8 8 255
+point 192 0 3 9 8 126
+point 192 0 3 6 9 43
+point 192 0 3 7 9 193
+point 192 0 3 8 9 193
+point 192 0 3 9 9 43
+point 192 0 3 7 10 7
+point 192 0 3 8 10 7
+point 192 3 3 7 6 16
+point 192 3 3 8 6 42
+point 192 3 3 9 6 6
+point 192 3 3 6 7 16
+point 192 3 3 7 7 191
+point 192 3 3 8 7 244
+point 192 3 3 9 7 148
+point 192 3 3 10 7 1
+point 192 3 3 6 8 42
+point 192 3 3 7 8 244
+point 192 3 3 8 8 255
+point 192 3 3 9 8 212
+point 192 3 3 10 8 10
+point 192 3 3 6 9 6
+point 192 3 3 7 9 148
+point 192 3 3 8 9 212
+point 192 3 3 9 9 105
+point 192 3 3 7 10 1
+point 192 3 3 8 10 10
+point 192 5 3 7 6 6
+point 192 5 3 8 6 42
+point 192 5 3 9 6 16
+point 192 5 3 7 7 148
+point 192 5 3 8 7 244
+point 192 5 3 9 7 191
+point 192 5 3 10 7 16
+point 192 5 3 7 8 212
+point 192 5 3 8 8 255
+point 192 5 3 9 8 244
+point 192 5 3 10 8 42
+point 192 5 3 7 9 105
+point 192 5 3 8 9 212
+point 192 5 3 9 9 148
+point 192 5 3 10 9 6
+point 192 5 3 8 10 10
+point 192 5 3 9 10 1
+point 192 0 5 6 7 43
+point 192 0 5 7 7 193
+point 192 0 5 8 7 193
+point 192 0 5 9 7 43
+point 192 0 5 6 8 126
+point 192 0 5 7 8 255
+point 192 0 5 8 8 255
+point 192 0 5 9 8 126
+point 192 0 5 6 9 70
+point 192 0 5 7 9 231
+point 192 0 5 8 9 231
+point 192 0 5 9 9 70
+point 192 0 5 7 10 32
+point 192 0 5 8 10 32
+point 192 3 5 6 7 6
+point 192 3 5 7 7 148
+point 192 3 5 8 7 212
+point 192 3 5 9 7 105
+point 192 3 5 6 8 42
+point 192 3 5 7 8 244
+point 192 3 5 8 8 255
+point 192 3 5 9 8 212
+point 192 3 5 10 8 10
+point 192 3 5 6 9 16
+point 192 3 5 7 9 191
+point 192 3 5 8 9 244
+point 192 3 5 9 9 148
+point 192 3 5 10 9 1
+point 192 3 5 7 10 16
+point 192 3 5 8 10 42
+point 192 3 5 9 10 6
+point 192 5 5 7 7 105
+point 192 5 5 8 7 212
+point 192 5 5 9 7 148
+point 192 5 5 10 7 6
+point 192 5 5 7 8 212
+point 192 5 5 8 8 255
+point 192 5 5 9 8 244
+point 192 5 5 10 8 42
+point 192 5 5 7 9 148
+point 192 5 5 8 9 244
+point 192 5 5 9 9 191
+point 192 5 5 10 9 16
+point 192 5 5 7 10 6
+point 192 5 5 8 10 42
+point 192 5 5 9 10 16
+point 288 0 0 6 5 8
+point 288 0 0 7 5 57
+point 288 0 0 8 5 57
+point 288 0 0 9 5 8
+point 288 0 0 5 6 8
+point 288 0 0 6 6 162
+point 288 0 0 7 6 248
+point 288 0 0 8 6 248
+point 288 0 0 9 6 162
+point 288 0 0 10 6 8
+point 288 0 0 5 7 57
+point 288 0 0 6 7 248
+point 288 0 0 7 7 255
+point 288 0 0 8 7 255
+point 288 0 0 9 7 248
+point 288 0 0 10 7 57
+point 288 0 0 5 8 57
+point 288 0 0 6 8 248
+point 288 0 0 7 8 255
+point 288 0 0 8 8 255
+point 288 0 0 9 8 248
+point 288 0 0 10 8 57
+point 288 0 0 5 9 8
+point 288 0 0 6 9 162
+point 288 0 0 7 9 248
+point 288 0 0 8 9 248
+point 288 0 0 9 9 162
+point 288 0 0 10 9 8
+point 288 0 0 6 10 8
+point 288 0 0 7 10 57
+point 288 0 0 8 10 57
+point 288 0 0 9 10 8
+point 288 3 0 7 5 39
+point 288 3 0 8 5 66
+point 288 3 0 9 5 25
+point 288 3 0 6 6 90
+point 288 3 0 7 6 233
+point 288 3 0 8 6 252
+point 288 3 0 9 6 213
+point 288 3 0 10 6 48
+point 288 3 0 5 7 8
+point 288 3 0 6 7 200
+point 288 3 0 7 7 255
+point 288 3 0 8 7 255
+point 288 3 0 9 7 255
+point 288 3 0 10 7 146
+point 288 3 0 5 8 8
+point 288 3 0 6 8 200
+point 288 3 0 7 8 255
+point 288 3 0 8 8 255
+point 288 3 0 9 8 255
+point 288 3 0 10 8 146
+point 288 3 0 6 9 90
+point 288 3 0 7 9 233
+point 288 3 0 8 9 252
+point 288 3 0 9 9 213
+point 288 3 0 10 9 48
+point 288 3 0 7 10 39
+point 288 3 0 8 10 66
+point 288 3 0 9 10 25
+point 288 5 0 7 5 25
+point 288 5 0 8 5 66
+point 288 5 0 9 5 39
+point 288 5 0 6 6 48
+point 288 5 0 7 6 213
+point 288 5 0 8 6 252
+point 288 5 0 9 6 233
+point 288 5 0 10 6 90
+point 288 5 0 6 7 146
+point 288 5 0 7 7 255
+point 288 5 0 8 7 255
+point 288 5 0 9 7 255
+point 288 5 0 10 7 200
+point 288 5 0 11 7 8
+point 288 5 0 6 8 146
+point 288 5 0 7 8 255
+point 288 5 0 8 8 255
+point 288 5 0 9 8 255
+point 288 5 0 10 8 200
+point 288 5 0 11 8 8
+point 288 5 0 6 9 48
+point 288 5 0 7 9 213
+point 288 5 0 8 9 252
+point 288 5 0 9 9 233
+point 288 5 0 10 9 90
+point 288 5 0 7 10 25
+point 288 5 0 8 10 66
+point 288 5 0 9 10 39
+point 288 0 3 7 5 8
+point 288 0 3 8 5 8
+point 288 0 3 6 6 90
+point 288 0 3 7 6 200
+point 288 0 3 8 6 200
+point 288 0 3 9 6 90
+point 288 0 3 5 7 39
+point 288 0 3 6 7 233
+point 288 0 3 7 7 255
+point 288 0 3 8 7 255
+point 288 0 3 9 7 233
+point 288 0 3 10 7 39
+point 288 0 3 5 8 66
+point 288 0 3 6 8 252
+point 288 0 3 7 8 255
+point 288 0 3 8 8 255
+point 288 0 3 9 8 252
+point 288 0 3 10 8 66
+point 288 0 3 5 9 25
+point 288 0 3 6 9 213
+point 288 0 3 7 9 255
+point 288 0 3 8 9 255
+point 288 0 3 9 9 213
+point 288 0 3 10 9 25
+point 288 0 3 6 10 48
+point 288 0 3 7 10 146
+point 288 0 3 8 10 146
+point 288 0 3 9 10 48
+point 288 3 3 7 5 3
+point 288 3 3 8 5 11
+point 288 3 3 9 5 1
+point 288 3 3 6 6 38
+point 288 3 3 7 6 172
+point 288 3 3 8 6 212
+point 288 3 3 9 6 144
+point 288 3 3 10 6 14
+point 288 3 3 5 7 3
+point 288 3 3 6 7 172
+point 288 3 3 7 7 255
+point 288 3 3 8 7 255
+point 288 3 3 9 7 254
+point 288 3 3 10 7 115
+point 288 3 3 5 8 11
+point 288 3 3 6 8 212
+point 288 3 3 7 8 255
+point 288 3 3 8 8 255
+point 288 3 3 9 8 255
+point 288 3 3 10 8 158
+point 288 3 3 5 9 1
+point 288 3 3 6 9 144
+point 288 3 3 7 9 254
+point 288 3 3 8 9 255
+point 288 3 3 9 9 247
+point 288 3 3 10 9 89
+point 288 3 3 6 10 14
+point 288 3 3 7 10 115
+point 288 3 3 8 10 158
+point 288 3 3 9 10 89
+point 288 3 3 10 10 3
+point 288 5 3 7 5 1
+point 288 5 3 8 5 11
+point 288 5 3 9 5 3
+point 288 5 3 6 6 14
+point 288 5 3 7 6 144
+point 288 5 3 8 6 212
+point 288 5 3 9 6 172
+point 288 5 3 10 6 38
+point 288 5 3 6 7 115
+point 288 5 3 7 7 254
+point 288 5 3 8 7 255
+point 288 5 3 9 7 255
+point 288 5 3 10 7 172
+point 288 5 3 11 7 3
+point 288 5 3 6 8 158
+point 288 5 3 7 8 255
+point 288 5 3 8 8 255
+point 288 5 3 9 8 255
+point 288 5 3 10 8 212
+point 288 5 3 11 8 11
+point 288 5 3 6 9 89
+point 288 5 3 7 9 247
+point 288 5 3 8 9 255
+point 288 5 3 9 9 254
+point 288 5 3 10 9 144
+point 288 5 3 11 9 1
+point 288 5 3 6 10 3
+point 288 5 3 7 10 89
+point 288 5 3 8 10 158
+point 288 5 3 9 10 115
+point 288 5 3 10 10 14
+point 288 0 5 6 6 48
+point 288 0 5 7 6 146
+point 288 0 5 8 6 146
+point 288 0 5 9 6 48
+point 288 0 5 5 7 25
+point 288 0 5 6 7 213
+point 288 0 5 7 7 255
+point 288 0 5 8 7 255
+point 288 0 5 9 7 213
+point 288 0 5 10 7 25
+point 288 0 5 5 8 66
+point 288 0 5 6 8 252
+point 288 0 5 7 8 255
+point 288 0 5 8 8 255
+point 288 0 5 9 8 252
+point 288 0 5 10 8 66
+point 288 0 5 5 9 39
+point 288 0 5 6 9 233
+point 288 0 5 7 9 255
+point 288 0 5 8 9 255
+point 288 0 5 9 9 233
+point 288 0 5 10 9 39
+point 288 0 5 6 10 90
+point 288 0 5 7 10 200
+point 288 0 5 8 10 200
+point 288 0 5 9 10 90
+point 288 0 5 7 11 8
+point 288 0 5 8 11 8
+point 288 3 5 6 6 14
+point 288 3 5 7 6 115
+point 288 3 5 8 6 158
+point 288 3 5 9 6 89
+point 288 3 5 10 6 3
+point 288 3 5 5 7 1
+point 288 3 5 6 7 144
+point 288 3 5 7 7 254
+point 288 3 5 8 7 255
+point 288 3 5 9 7 247
+point 288 3 5 10 7 89
+point 288 3 5 5 8 11
+point 288 3 5 6 8 212
+point 288 3 5 7 8 255
+point 288 3 5 8 8 255
+point 288 3 5 9 8 255
+point 288 3 5 10 8 158
+point 288 3 5 5 9 3
+point 288 3 5 6 9 172
+point 288 3 5 7 9 255
+point 288 3 5 8 9 255
+point 288 3 5 9 9 254
+point 288 3 5 10 9 115
+point 288 3 5 6 10 38
+point 288 3 5 7 10 172
+point 288 3 5 8 10 212
+point 288 3 5 9 10 144
+point 288 3 5 10 10 14
+point 288 3 5 7 11 3
+point 288 3 5 8 11 11
+point 288 3 5 9 11 1
+point 288 5 5 6 6 3
+point 288 5 5 7 6 89
+point 288 5 5 8 6 158
+point 288 5 5 9 6 115
+point 288 5 5 10 6 14
+point 288 5 5 6 7 89
+point 288 5 5 7 7 247
+point 288 5 5 8 7 255
+point 288 5 5 9 7 254
+point 288 5 5 10 7 144
+point 288 5 5 11 7 1
+point 288 5 5 6 8 158
+point 288 5 5 7 8 255
+point 288 5 5 8 8 255
+point 288 5 5 9 8 255
+point 288 5 5 10 8 212
+point 288 5 5 11 8 11
+point 288 5 5 6 9 115
+point 288 5 5 7 9 254
+point 288 5 5 8 9 255
+point 288 5 5 9 9 255
+point 288 5 5 10 9 172
+point 288 5 5 11 9 3
+point 288 5 5 6 10 14
+point 288 5 5 7 10 144
+point 288 5 5 8 10 212
+point 288 5 5 9 10 172
+point 288 5 5 10 10 38
+point 288 5 5 7 11 1
+point 288 5 5 8 11 11
+point 288 5 5 9 11 3
+point 416 0 0 6 4 18
+point 416 0 0 7 4 61
+point 416 0 0 8 4 61
+point 416 0 0 9 4 18
+point 416 0 0 5 5 61
+point 416 0 0 6 5 207
+point 416 0 0 7 5 250
+point 416 0 0 8 5 250
+point 416 0 0 9 5 207
+point 416 0 0 10 5 61
+point 416 0 0 4 6 18
+point 416 0 0 5 6 207
+point 416 0 0 6 6 255
+point 416 0 0 7 6 255
+point 416 0 0 8 6 255
+point 416 0 0 9 6 255
+point 416 0 0 10 6 207
+point 416 0 0 11 6 18
+point 416 0 0 4 7 61
+point 416 0 0 5 7 250
+point 416 0 0 6 7 255
+point 416 0 0 7 7 255
+point 416 0 0 8 7 255
+point 416 0 0 9 7 255
+point 416 0 0 10 7 250
+point 416 0 0 11 7 61
+point 416 0 0 4 8 61
+point 416 0 0 5 8 250
+point 416 0 0 6 8 255
+point 416 0 0 7 8 255
+point 416 0 0 8 8 255
+point 416 0 0 9 8 255
+point 416 0 0 10 8 250
+point 416 0 0 11 8 61
+point 416 0 0 4 9 18
+point 416 0 0 5 9 207
+point 416 0 0 6 9 255
+point 416 0 0 7 9 255
+point 416 0 0 8 9 255
+point 416 0 0 9 9 255
+point 416 0 0 10 9 207
+point 416 0 0 11 9 18
+point 416 0 0 5 10 61
+point 416 0 0 6 10 207
+point 416 0 0 7 10 250
+point 416 0 0 8 10 250
+point 416 0 0 9 10 207
+point 416 0 0 10 10 61
+point 416 0 0 6 11 18
+point 416 0 0 7 11 61
+point 416 0 0 8 11 61
+point 416 0 0 9 11 18
+point 416 3 0 6 4 4
+point 416 3 0 7 4 47
+point 416 3 0 8 4 68
+point 416 3 0 9 4 35
+point 416 3 0 10 4 1
+point 416 3 0 5 5 18
+point 416 3 0 6 5 161
+point 416 3 0 7 5 243
+point 416 3 0 8 5 252
+point 416 3 0 9 5 233
+point 416 3 0 10 5 122
+point 416 3 0 11 5 3
+point 416 3 0 5 6 131
+point 416 3 0 6 6 255
+point 416 3 0 7 6 255
+point 416 3 0 8 6 255
+point 416 3 0 9 6 255
+point 416 3 0 10 6 247
+point 416 3 0 11 6 76
+point 416 3 0 4 7 8
+point 416 3 0 5 7 206
+point 416 3 0 6 7 255
+point 416 3 0 7 7 255
+point 416 3 0 8 7 255
+point 416 3 0 9 7 255
+point 416 3 0 10 7 255
+point 416 3 0 11 7 151
+point 416 3 0 4 8 8
+point 416 3 0 5 8 206
+point 416 3 0 6 8 255
+point 416 3 0 7 8 255
+point 416 3 0 8 8 255
+point 416 3 0 9 8 255
+point 416 3 0 10 8 255
+point 416 3 0 11 8 151
+point 416 3 0 5 9 131
+point 416 3 0 6 9 255
+point 416 3 0 7 9 255
+point 416 3 0 8 9 255
+point 416 3 0 9 9 255
+point 416 3 0 10 9 247
+point 416 3 0 11 9 76
+point 416 3 0 5 10 18
+point 416 3 0 6 10 161
+point 416 3 0 7 10 243
+point 416 3 0 8 10 252
+point 416 3 0 9 10 233
+point 416 3 0 10 10 122
+point 416 3 0 11 10 3
+point 416 3 0 6 11 4
+point 416 3 0 7 11 47
+point 416 3 0 8 11 68
+point 416 3 0 9 11 35
+point 416 3 0 10 11 1
+point 416 5 0 6 4 1
+point 416 5 0 7 4 35
+point 416 5 0 8 4 68
+point 416 5 0 9 4 47
+point 416 5 0 10 4 4
+point 416 5 0 5 5 3
+point 416 5 0 6 5 122
+point 416 5 0 7 5 233
+point 416 5 0 8 5 252
+point 416 5 0 9 5 243
+point 416 5 0 10 5 161
+point 416 5 0 11 5 18
+point 416 5 0 5 6 76
+point 416 5 0 6 6 247
+point 416 5 0 7 6 255
+point 416 5 0 8 6 255
+point 416 5 0 9 6 255
+point 416 5 0 10 6 255
+point 416 5 0 11 6 131
+point 416 5 0 5 7 151
+point 416 5 0 6 7 255
+point 416 5 0 7 7 255
+point 416 5 0 8 7 255
+point 416 5 0 9 7 255
+point 416 5 0 10 7 255
+point 416 5 0 11 7 206
+point 416 5 0 12 7 8
+point 416 5 0 5 8 151
+point 416 5 0 6 8 255
+point 416 5 0 7 8 255
+point 416 5 0 8 8 255
+point 416 5 0 9 8 255
+point 416 5 0 10 8 255
+point 416 5 0 11 8 206
+point 416 5 0 12 8 8
+point 416 5 0 5 9 76
+point 416 5 0 6 9 247
+point 416 5 0 7 9 255
+point 416 5 0 8 9 255
+point 416 5 0 9 9 255
+point 416 5 0 10 9 255
+point 416 5 0 11 9 131
+point 416 5 0 5 10 3
+point 416 5 0 6 10 122
+point 416 5 0 7 10 233
+point 416 5 0 8 10 252
+point 416 5 0 9 10 243
+point 416 5 0 10 10 161
+point 416 5 0 11 10 18
+point 416 5 0 6 11 1
+point 416 5 0 7 11 35
+point 416 5 0 8 11 68
+point 416 5 0 9 11 47
+point 416 5 0 10 11 4
+point 416 0 3 7 4 8
+point 416 0 3 8 4 8
+point 416 0 3 5 5 18
+point 416 0 3 6 5 131
+point 416 0 3 7 5 206
+point 416 0 3 8 5 206
+point 416 0 3 9 5 131
+point 416 0 3 10 5 18
+point 416 0 3 4 6 4
+point 416 0 3 5 6 161
+point 416 0 3 6 6 255
+point 416 0 3 7 6 255
+point 416 0 3 8 6 255
+point 416 0 3 9 6 255
+point 416 0 3 10 6 161
+point 416 0 3 11 6 4
+point 416 0 3 4 7 47
+point 416 0 3 5 7 243
+point 416 0 3 6 7 255
+point 416 0 3 7 7 255
+point 416 0 3 8 7 255
+point 416 0 3 9 7 255
+point 416 0 3 10 7 243
+point 416 0 3 11 7 47
+point 416 0 3 4 8 68
+point 416 0 3 5 8 252
+point 416 0 3 6 8 255
+point 416 0 3 7 8 255
+point 416 0 3 8 8 255
+point 416 0 3 9 8 255
+point 416 0 3 10 8 252
+point 416 0 3 11 8 68
+point 416 0 3 4 9 35
+point 416 0 3 5 9 233
+point 416 0 3 6 9 255
+point 416 0 3 7 9 255
+point 416 0 3 8 9 255
+point 416 0 3 9 9 255
+point 416 0 3 10 9 233
+point 416 0 3 11 9 35
+point 416 0 3 4 10 1
+point 416 0 3 5 10 122
+point 416 0 3 6 10 247
+point 416 0 3 7 10 255
+point 416 0 3 8 10 255
+point 416 0 3 9 10 247
+point 416 0 3 10 10 122
+point 416 0 3 11 10 1
+point 416 0 3 5 11 3
+point 416 0 3 6 11 76
+point 416 0 3 7 11 151
+point 416 0 3 8 11 151
+point 416 0 3 9 11 76
+point 416 0 3 10 11 3
+point 416 3 3 7 4 4
+point 416 3 3 8 4 10
+point 416 3 3 9 4 2
+point 416 3 3 5 5 1
+point 416 3 3 6 5 83
+point 416 3 3 7 5 188
+point 416 3 3 8 5 213
+point 416 3 3 9 5 170
+point 416 3 3 10 5 53
+point 416 3 3 5 6 83
+point 416 3 3 6 6 242
+point 416 3 3 7 6 255
+point 416 3 3 8 6 255
+point 416 3 3 9 6 255
+point 416 3 3 10 6 220
+point 416 3 3 11 6 39
+point 416 3 3 4 7 4
+point 416 3 3 5 7 188
+point 416 3 3 6 7 255
+point 416 3 3 7 7 255
+point 416 3 3 8 7 255
+point 416 3 3 9 7 255
+point 416 3 3 10 7 255
+point 416 3 3 11 7 130
+point 416 3 3 4 8 10
+point 416 3 3 5 8 213
+point 416 3 3 6 8 255
+point 416 3 3 7 8 255
+point 416 3 3 8 8 255
+point 416 3 3 9 8 255
+point 416 3 3 10 8 255
+point 416 3 3 11 8 159
+point 416 3 3 4 9 2
+point 416 3 3 5 9 170
+point 416 3 3 6 9 255
+point 416 3 3 7 9 255
+point 416 3 3 8 9 255
+point 416 3 3 9 9 255
+point 416 3 3 10 9 255
+point 416 3 3 11 9 110
+point 416 3 3 5 10 53
+point 416 3 3 6 10 220
+point 416 3 3 7 10 255
+point 416 3 3 8 10 255
+point 416 3 3 9 10 255
+point 416 3 3 10 10 188
+point 416 3 3 11 10 20
+point 416 3 3 6 11 39
+point 416 3 3 7 11 130
+point 416 3 3 8 11 159
+point 416 3 3 9 11 110
+point 416 3 3 10 11 20
+point 416 5 3 7 4 2
+point 416 5 3 8 4 10
+point 416 5 3 9 4 4
+point 416 5 3 6 5 53
+point 416 5 3 7 5 170
+point 416 5 3 8 5 213
+point 416 5 3 9 5 188
+point 416 5 3 10 5 83
+point 416 5 3 11 5 1
+point 416 5 3 5 6 39
+point 416 5 3 6 6 220
+point 416 5 3 7 6 255
+point 416 5 3 8 6 255
+point 416 5 3 9 6 255
+point 416 5 3 10 6 242
+point 416 5 3 11 6 83
+point 416 5 3 5 7 130
+point 416 5 3 6 7 255
+point 416 5 3 7 7 255
+point 416 5 3 8 7 255
+point 416 5 3 9 7 255
+point 416 5 3 10 7 255
+point 416 5 3 11 7 188
+point 416 5 3 12 7 4
+point 416 5 3 5 8 159
+point 416 5 3 6 8 255
+point 416 5 3 7 8 255
+point 416 5 3 8 8 255
+point 416 5 3 9 8 255
+point 416 5 3 10 8 255
+point 416 5 3 11 8 213
+point 416 5 3 12 8 10
+point 416 5 3 5 9 110
+point 416 5 3 6 9 255
+point 416 5 3 7 9 255
+point 416 5 3 8 9 255
+point 416 5 3 9 9 255
+point 416 5 3 10 9 255
+point 416 5 3 11 9 170
+point 416 5 3 12 9 2
+point 416 5 3 5 10 20
+point 416 5 3 6 10 188
+point 416 5 3 7 10 255
+point 416 5 3 8 10 255
+point 416 5 3 9 10 255
+point 416 5 3 10 10 220
+point 416 5 3 11 10 53
+point 416 5 3 6 11 20
+point 416 5 3 7 11 110
+point 416 5 3 8 11 159
+point 416 5 3 9 11 130
+point 416 5 3 10 11 39
+point 416 0 5 5 5 3
+point 416 0 5 6 5 76
+point 416 0 5 7 5 151
+point 416 0 5 8 5 151
+point 416 0 5 9 5 76
+point 416 0 5 10 5 3
+point 416 0 5 4 6 1
+point 416 0 5 5 6 122
+point 416 0 5 6 6 247
+point 416 0 5 7 6 255
+point 416 0 5 8 6 255
+point 416 0 5 9 6 247
+point 416 0 5 10 6 122
+point 416 0 5 11 6 1
+point 416 0 5 4 7 35
+point 416 0 5 5 7 233
+point 416 0 5 6 7 255
+point 416 0 5 7 7 255
+point 416 0 5 8 7 255
+point 416 0 5 9 7 255
+point 416 0 5 10 7 233
+point 416 0 5 11 7 35
+point 416 0 5 4 8 68
+point 416 0 5 5 8 252
+point 416 0 5 6 8 255
+point 416 0 5 7 8 255
+point 416 0 5 8 8 255
+point 416 0 5 9 8 255
+point 416 0 5 10 8 252
+point 416 0 5 11 8 68
+point 416 0 5 4 9 47
+point 416 0 5 5 9 243
+point 416 0 5 6 9 255
+point 416 0 5 7 9 255
+point 416 0 5 8 9 255
+point 416 0 5 9 9 255
+point 416 0 5 10 9 243
+point 416 0 5 11 9 47
+point 416 0 5 4 10 4
+point 416 0 5 5 10 161
+point 416 0 5 6 10 255
+point 416 0 5 7 10 255
+point 416 0 5 8 10 255
+point 416 0 5 9 10 255
+point 416 0 5 10 10 161
+point 416 0 5 11 10 4
+point 416 0 5 5 11 18
+point 416 0 5 6 11 131
+point 416 0 5 7 11 206
+point 416 0 5 8 11 206
+point 416 0 5 9 11 131
+point 416 0 5 10 11 18
+point 416 0 5 7 12 8
+point 416 0 5 8 12 8
+point 416 3 5 6 5 39
+point 416 3 5 7 5 130
+point 416 3 5 8 5 159
+point 416 3 5 9 5 110
+point 416 3 5 10 5 20
+point 416 3 5 5 6 53
+point 416 3 5 6 6 220
+point 416 3 5 7 6 255
+point 416 3 5 8 6 255
+point 416 3 5 9 6 255
+point 416 3 5 10 6 188
+point 416 3 5 11 6 20
+point 416 3 5 4 7 2
+point 416 3 5 5 7 170
+point 416 3 5 6 7 255
+point 416 3 5 7 7 255
+point 416 3 5 8 7 255
+point 416 3 5 9 7 255
+point 416 3 5 10 7 255
+point 416 3 5 11 7 110
+point 416 3 5 4 8 10
+point 416 3 5 5 8 213
+point 416 3 5 6 8 255
+point 416 3 5 7 8 255
+point 416 3 5 8 8 255
+point 416 3 5 9 8 255
+point 416 3 5 10 8 255
+point 416 3 5 11 8 159
+point 416 3 5 4 9 4
+point 416 3 5 5 9 188
+point 416 3 5 6 9 255
+point 416 3 5 7 9 255
+point 416 3 5 8 9 255
+point 416 3 5 9 9 255
+point 416 3 5 10 9 255
+point 416 3 5 11 9 130
+point 416 3 5 5 10 83
+point 416 3 5 6 10 242
+point 416 3 5 7 10 255
+point 416 3 5 8 10 255
+point 416 3 5 9 10 255
+point 416 3 5 10 10 220
+point 416 3 5 11 10 39
+point 416 3 5 5 11 1
+point 416 3 5 6 11 83
+point 416 3 5 7 11 188
+point 416 3 5 8 11 213
+point 416 3 5 9 11 170
+point 416 3 5 10 11 53
+point 416 3 5 7 12 4
+point 416 3 5 8 12 10
+point 416 3 5 9 12 2
+point 416 5 5 6 5 20
+point 416 5 5 7 5 110
+point 416 5 5 8 5 159
+point 416 5 5 9 5 130
+point 416 5 5 10 5 39
+point 416 5 5 5 6 20
+point 416 5 5 6 6 188
+point 416 5 5 7 6 255
+point 416 5 5 8 6 255
+point 416 5 5 9 6 255
+point 416 5 5 10 6 220
+point 416 5 5 11 6 53
+point 416 5 5 5 7 110
+point 416 5 5 6 7 255
+point 416 5 5 7 7 255
+point 416 5 5 8 7 255
+point 416 5 5 9 7 255
+point 416 5 5 10 7 255
+point 416 5 5 11 7 170
+point 416 5 5 12 7 2
+point 416 5 5 5 8 159
+point 416 5 5 6 8 255
+point 416 5 5 7 8 255
+point 416 5 5 8 8 255
+point 416 5 5 9 8 255
+point 416 5 5 10 8 255
+point 416 5 5 11 8 213
+point 416 5 5 12 8 10
+point 416 5 5 5 9 130
+point 416 5 5 6 9 255
+point 416 5 5 7 9 255
+point 416 5 5 8 9 255
+point 416 5 5 9 9 255
+point 416 5 5 10 9 255
+point 416 5 5 11 9 188
+point 416 5 5 12 9 4
+point 416 5 5 5 10 39
+point 416 5 5 6 10 220
+point 416 5 5 7 10 255
+point 416 5 5 8 10 255
+point 416 5 5 9 10 255
+point 416 5 5 10 10 242
+point 416 5 5 11 10 83
+point 416 5 5 6 11 53
+point 416 5 5 7 11 170
+point 416 5 5 8 11 213
+point 416 5 5 9 11 188
+point 416 5 5 10 11 83
+point 416 5 5 11 11 1
+point 416 5 5 7 12 2
+point 416 5 5 8 12 10
+point 416 5 5 9 12 4
