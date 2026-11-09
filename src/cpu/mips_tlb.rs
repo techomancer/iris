@@ -512,12 +512,25 @@ impl ShadowEntry {
         // R5000, and 4 and 5 coherent on the R10000, which the Octane's IRIX
         // maps every user page with.
         let decode_cache_attr = |lo: u64| c_attr[((lo >> 3) & 0x7) as usize];
+        // The R10000 family's uncached attribute (EntryLo 63:62) goes out
+        // beside the address of an uncached (2) or uncached accelerated (7)
+        // reference, as XKPHYS bits 58:57 do for an unmapped one (R10000 UM
+        // v2.0 pp. 239-240), so it rides in those same bits here. The SN0 Hub
+        // picks node memory, its own registers or a crossbar widget with it,
+        // and IRIX maps the InfiniteReality command page this way. Other parts
+        // never store the two bits, and boards that do not decode them cut
+        // them off with the executor's physical address mask.
+        let base = |i: usize| {
+            let lo = e.entry_lo[i];
+            let uncached = matches!((lo >> 3) & 0x7, 2 | 7);
+            e.pfn_base[i] | if uncached { (lo >> 62) << 57 } else { 0 }
+        };
         Self {
             vcmp32:             e.vcmp32,
             vpn_hi32:           e.vpn_hi32,
             vcmp64:             e.vcmp64,
             vpn_hi64:           e.vpn_hi64,
-            pfn_base:           e.pfn_base,
+            pfn_base:           [base(0), base(1)],
             offset_mask:        e.offset_mask,
             valid_dirty:        [
                 ((e.entry_lo[0] & 0x2 != 0) as u8) | ((e.entry_lo[0] & 0x4 != 0) as u8) << 1,

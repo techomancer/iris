@@ -296,6 +296,37 @@ mod tests {
         }
     }
 
+    /// An R10000 entry's uncached attribute reaches the bus with an uncached
+    /// reference, in XKPHYS's bits 58:57: the Onyx2's IRIX maps the
+    /// InfiniteReality command page uncached accelerated with attribute 1 (I/O),
+    /// and without it the pipe's commands went to node memory. A cached page
+    /// leaves the attribute behind.
+    #[test]
+    fn an_uncached_entry_carries_its_uncached_attribute() {
+        let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+        let page = 0x0000_0000_08c1_0000u64;
+        let mut entry = TlbEntry::new();
+        entry.entry_hi = (3u64 << 62) | 0x0202_0000 | (1 << 12);
+        entry.entry_lo[0] = (1u64 << 62) | (page >> 6) | (7 << 3) | 0x7;
+        entry.entry_lo[1] = (1u64 << 62) | ((page + 0x1000) >> 6) | (3 << 3) | 0x7;
+        tlb.write(3, entry);
+
+        let pa = |va: u64, tlb: &mut MipsTlb| match tlb.translate::<1>(va, 0, AccessType::Write) {
+            TlbResult::Hit { phys_addr, .. } => phys_addr,
+            res => panic!("expected a hit at {va:#x}, got {res:?}"),
+        };
+        let va = 0xc000_0000_0202_0000;
+        assert_eq!(pa(va + 8, &mut tlb), (1 << 57) | page | 8, "uncached accelerated");
+        assert_eq!(pa(va + 0x1008, &mut tlb), page + 0x1008, "cached");
+
+        // Plain uncached carries the attribute too, all of its values.
+        entry.entry_lo[0] = (3u64 << 62) | (page >> 6) | (2 << 3) | 0x7;
+        entry.entry_lo[1] = (2u64 << 62) | ((page + 0x1000) >> 6) | (2 << 3) | 0x7;
+        tlb.write(3, entry);
+        assert_eq!(pa(va + 8, &mut tlb), (3 << 57) | page | 8, "uncached, attribute 3");
+        assert_eq!(pa(va + 0x1008, &mut tlb), (2 << 57) | (page + 0x1008), "uncached, attribute 2");
+    }
+
     #[test]
     fn test_tlb_probe_32bit_vs_64bit() {
         let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
