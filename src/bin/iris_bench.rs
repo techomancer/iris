@@ -414,6 +414,10 @@ fn build_cell(cell: &Cell, root: &Path, force: bool) -> Result<PathBuf, String> 
 // no-op round trip subtracted, so nothing depends on the guest having a usable
 // clock or a working `time`.
 
+/// The `suite_id` of a guest-OS run, which has no suite image to hash. It keeps
+/// these runs out of the kernel tables and out of the reference table.
+const GUEST_SUITE: &str = "guest-os";
+
 /// Directories an IRIX 6.5 install actually puts programs in. `which` is a csh
 /// script there and `command -v` is not in its Bourne shell, so a program is
 /// probed by testing for it directly.
@@ -678,7 +682,7 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
         // The guest-OS suite runs IRIX's own tools, not the bare-metal binary,
         // so there is no suite hash and its numbers never join the reference
         // table — they are only comparable against runs on the same disk image.
-        suite_id: String::new(),
+        suite_id: GUEST_SUITE.into(),
         // Not the bare-metal harness, so its run configuration does not apply.
         settings: RunSettings::default(),
     })
@@ -827,7 +831,33 @@ fn warnings(runs: &[Run], axes: &[Axis]) -> Vec<(String, Vec<String>)> {
     }).collect()
 }
 
-fn markdown(runs: &[Run], baseline: Option<&str>, across_features: bool) -> String {
+/// Every step of each guest run, in the order it ran. The kernel tables have
+/// nothing to say about these: no accuracy, and steps like `find` have no rate.
+fn guest_steps(guest: &[Run]) -> String {
+    if guest.is_empty() { return String::new(); }
+    let mut o = String::from("## Guest steps\n\nTimes are host wall clock around each step, \
+                              less the round trip of an empty command.\n\n");
+    for r in guest {
+        o.push_str(&format!("### {}: {}\n\n| step | status | time | rate |\n|---|---|---:|---:|\n",
+                            r.cell, r.machine.cpu));
+        for row in &r.rows {
+            let (status, timed) = match row.status.as_str() {
+                "UNCHECKED" => ("ok", true),
+                "SKIP" => ("skipped", false),
+                other => (other, false),
+            };
+            let time = if timed { format!("{:.3} s", row.ns as f64 / 1e9) } else { "-".into() };
+            let rate = if timed && row.rate() > 0.0 { format!("{} {}/s", fmt_rate(row.rate()), row.unit) } else { "-".into() };
+            o.push_str(&format!("| {} | {} | {} | {} |\n", row.name, status, time, rate));
+        }
+        o.push('\n');
+    }
+    o
+}
+
+fn markdown(all: &[Run], baseline: Option<&str>, across_features: bool) -> String {
+    let (guest, runs): (Vec<Run>, Vec<Run>) = all.iter().cloned().partition(|r| r.suite_id == GUEST_SUITE);
+    let runs = &runs[..];
     let mut o = String::new();
     let (groups, axes) = (groups(runs), axes(across_features));
     let emulated: Vec<&Group> = groups.iter().filter(|g| g.0 != "host").collect();
@@ -837,12 +867,13 @@ fn markdown(runs: &[Run], baseline: Option<&str>, across_features: bool) -> Stri
         .or_else(|| emulated.first().copied());
 
     o.push_str("# IRIS benchmark report\n\n");
-    if let Some(h) = runs.first() {
+    if let Some(h) = all.first() {
         o.push_str(&format!(
             "Host: {} {} / {} / {} cores\n\n",
             h.host.os, h.host.arch, h.host.cpu_model, h.host.cores
         ));
     }
+    if runs.is_empty() { return o + &guest_steps(&guest); }
 
     for (what, values) in warnings(runs, axes) {
         o.push_str(&format!("> **Warning:** {what}\n>\n"));
@@ -1004,7 +1035,7 @@ fn markdown(runs: &[Run], baseline: Option<&str>, across_features: bool) -> Stri
         o.push('\n');
     }
 
-    o
+    o + &guest_steps(&guest)
 }
 
 /// Every kernel name that appears anywhere, in the order the first run lists
@@ -1019,8 +1050,15 @@ fn ordered_names(runs: &[Run]) -> Vec<String> {
     names
 }
 
-fn text_summary(runs: &[Run], across_features: bool) -> String {
+fn text_summary(all: &[Run], across_features: bool) -> String {
+    let (guest, runs): (Vec<Run>, Vec<Run>) = all.iter().cloned().partition(|r| r.suite_id == GUEST_SUITE);
+    let runs = &runs[..];
     let mut o = String::new();
+    for r in &guest {
+        let n = |status: &str| r.rows.iter().filter(|x| x.status == status).count();
+        o.push_str(&format!("{:<24} guest steps: {} timed, {} skipped, {} failed   {:>7.1} s timed\n",
+                            r.cell, n("UNCHECKED"), n("SKIP"), n("FAILED"), r.total_ns as f64 / 1e9));
+    }
     for g in groups(runs) {
         o.push_str(&format!(
             "{:<24} {:>6.1}% accuracy   {:>8}   {:>7} DMIPS   {:>7} timed\n",
@@ -1406,6 +1444,11 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                 .map_err(|e| format!("{}: {}", path.display(), e))?;
             let run: Run = serde_json::from_str(&text)
                 .map_err(|e| format!("{}: {}", path.display(), e))?;
+            if run.suite_id == GUEST_SUITE {
+                return Err(format!(
+                    "{} is a guest-OS run. Its numbers depend on the disk image and are \
+                     never reference rows.", path.display()));
+            }
             if run.suite_id.is_empty() {
                 return Err(format!(
                     "{} has no suite_id — it predates the field, or it is a host run. \
@@ -1788,5 +1831,30 @@ mod tests {
         // No emulator to talk to: the run stops, it is not a step result.
         assert!(classify(Some(1), String::new(), "iris-ci: connect /x: refused\n", 1.0).is_err());
         assert!(classify(None, String::new(), "", 1.0).is_err());
+    }
+
+    fn guest_run() -> Run {
+        let step = |name: &str| Step {
+            name: name.into(), unit: "B".into(), work: 1 << 20, setup: None,
+            cmd: String::new(), requires: None, skip_timing: false, timeout: None,
+        };
+        Run {
+            cell: "indy".into(), features: Vec::new(), machine: MachineInfo::default(),
+            host: host_info(), checked: 0, matched: 0, total_ns: 500_000_000, total_icount: 0,
+            wall_s: 0.5, suite_id: GUEST_SUITE.into(), settings: RunSettings::default(),
+            rows: vec![super::row(&step("disk/write"), 500_000_000, "UNCHECKED"),
+                       super::row(&step("gfx/xwd_root"), 0, "FAILED"),
+                       super::row(&step("gfx/x11perf_rects"), 0, "SKIP")],
+        }
+    }
+
+    #[test]
+    fn the_report_shows_guest_steps_apart_from_the_kernel_tables() {
+        let md = markdown(&[guest_run()], None, false);
+        assert!(md.contains("| disk/write | ok | 0.500 s |"), "{md}");
+        assert!(md.contains("| gfx/xwd_root | FAILED | - |"), "{md}");
+        assert!(md.contains("| gfx/x11perf_rects | skipped | - |"), "{md}");
+        assert!(!md.contains("## Cells"), "{md}");
+        assert!(text_summary(&[guest_run()], false).contains("1 timed, 1 skipped, 1 failed"));
     }
 }

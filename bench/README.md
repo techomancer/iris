@@ -466,6 +466,11 @@ overruns, the step is `FAILED`, iris-bench sends the guest Ctrl-C and runs a
 no-op to check the shell is back, and the run stops only if it is not. The X
 steps have one, since an X client waits forever on a server that does not answer.
 
+`iris-bench report` lists a guest run in its own "Guest steps" table (step,
+status, time, rate) and keeps it out of the kernel tables; `--format text`
+counts its timed, skipped and failed steps. Guest numbers depend on the disk
+image, so `iris-bench reference` refuses them.
+
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
 Commands run as `sh -c '<cmd>'` with an IRIX-shaped PATH whatever the login
