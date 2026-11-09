@@ -15,7 +15,9 @@
 //!   and prints per-step status + duration.
 //!
 //! Returns 0 on success, 1 on socket error, 2 on iris error response,
-//! 3 on local error (file not found etc).
+//! 3 on local error (file not found etc), 4 when `run` ran a guest command
+//! that exited nonzero, and 5 when a wait for the guest timed out. A caller
+//! tells those apart by the status, not by reading the message.
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -285,6 +287,14 @@ fn main() {
             eprintln!("iris-ci: iris error: {}", e);
             2
         }
+        Err(Error::GuestExit(rc)) => {
+            eprintln!("iris-ci: guest exit {}", rc);
+            4
+        }
+        Err(Error::Timeout(e)) => {
+            eprintln!("iris-ci: {}", e);
+            5
+        }
     };
     std::process::exit(exit);
 }
@@ -370,6 +380,10 @@ enum Error {
     Local(String),
     Connection(std::io::Error),
     Iris(String),
+    /// The guest command `run` sent exited with this status.
+    GuestExit(i32),
+    /// iris answered that a wait ran out.
+    Timeout(String),
 }
 type Result<T> = std::result::Result<T, Error>;
 impl From<std::io::Error> for Error {
@@ -479,7 +493,12 @@ fn exchange(reader: &mut impl BufRead, writer: &mut impl Write, cmd: &str, args:
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown error");
-        return Err(Error::Iris(format!("{}: {}", cmd, msg)));
+        let msg = format!("{}: {}", cmd, msg);
+        return Err(if resp.get("timeout").and_then(|v| v.as_bool()) == Some(true) {
+            Error::Timeout(msg)
+        } else {
+            Error::Iris(msg)
+        });
     }
     Ok(resp.get("data").cloned().unwrap_or(Value::Null))
 }
@@ -843,7 +862,7 @@ fn cmd_run(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Result<(
         println!("{}", stdout);
     }
     if rc != 0 {
-        return Err(Error::Iris(format!("guest exit {}", rc)));
+        return Err(Error::GuestExit(rc));
     }
     Ok(())
 }
@@ -1344,5 +1363,14 @@ mod tests {
         for bad in ["ok|1|x", "pass|soon|x", "pass|-1|x", "pass|1", "pass|1|"] {
             assert!(junit_case(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_wait_that_ran_out_is_its_own_error() {
+        let ask = |line: &str| exchange(&mut std::io::Cursor::new(line.as_bytes().to_vec()),
+                                        &mut Vec::new(), "wait-serial", json!({}));
+        assert!(matches!(ask("{\"ok\":false,\"error\":\"x\",\"timeout\":true}\n"),
+                         Err(Error::Timeout(m)) if m == "wait-serial: x"));
+        assert!(matches!(ask("{\"ok\":false,\"error\":\"x\"}\n"), Err(Error::Iris(_))));
     }
 }
