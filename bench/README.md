@@ -448,15 +448,17 @@ iris-bench irix
 Steps live in `bench/irix/steps.toml` and are ordinary shell one-liners: `dd`
 through the filesystem cold and warm, 500 small files created/stat'd/removed,
 `sum`/`compress`/`gzip`/`tar`, 256 MB through the read/write syscall pair with
-no disk in the path, loopback ping, and `xwd` reading the root window back out
-of the framebuffer. A step naming a `requires` program is **skipped** when that
-program is not installed rather than failed — IRIX installs vary enormously and
-a missing `x11perf` is not a benchmark result.
+no disk in the path, a loopback ping flood, and `xwd` reading the root window
+back out of the framebuffer. A step naming a `requires` program is **skipped**
+when that program is not installed rather than failed — IRIX installs vary
+enormously and a missing `x11perf` is not a benchmark result. A `requires` with
+a slash in it tests that exact path.
 
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
 Commands run as `sh -c '<cmd>'` with an IRIX-shaped PATH whatever the login
-shell is — so a step command may not contain a single quote.
+shell is — so a step command may not contain a single quote. Use what IRIX's
+tools take: its `dd` has no `m` suffix, so a megabyte block is `bs=1048576`.
 
 Nothing here is checksummed. These are IRIX's own tools against IRIX's own
 filesystem and their output is not ours to predict; the accuracy score belongs
