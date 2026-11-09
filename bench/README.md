@@ -475,6 +475,12 @@ image, so `iris-bench reference` refuses them.
 one case per step, failed where the step failed or timed out, skipped where its
 program is missing.
 
+`bench/irix/benchies.toml` holds the benchies: Dhrystone 10M (`test/dhrystone`),
+Whetstone 100k (`test/whetstone`) and `iris_bench` x20 (`test/ib`). Copy their
+binaries into the guest as the file's header says; a step whose binary is
+missing is skipped. `--steps` repeats, and with none given `iris-bench irix`
+runs `steps.toml` then `benchies.toml`.
+
 Timing is done on the host around one `iris-ci run`, with the measured no-op
 round trip subtracted, so nothing depends on the guest having a usable clock.
 Commands run as `sh -c '<cmd>'` with an IRIX-shaped PATH whatever the login
