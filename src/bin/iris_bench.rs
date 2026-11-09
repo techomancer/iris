@@ -28,7 +28,7 @@ use serde::Deserialize;
 // library: this binary, the in-process runner and the GUI all need them, and
 // "what accuracy means" should have exactly one definition.
 use iris::bench_report::{
-    fmt_rate, host_info, parse_block, reference_entry, MachineInfo, ReferenceTable, Row, Run,
+    find_features, fmt_rate, host_info, parse_block, reference_entry, MachineInfo, ReferenceTable, Row, Run,
     RunSettings, EXPECT_EXC,
 };
 use iris::bench_runner::{self, BenchOptions};
@@ -49,6 +49,39 @@ fn repo_relative(p: &str) -> PathBuf {
     let up = PathBuf::from("..").join(p);
     if up.exists() { return up; }
     direct
+}
+
+/// The cargo features an emulator binary was built with, from the banner it
+/// prints on stderr before it reads any configuration. `--help` gets that far
+/// and exits.
+fn probe_features(iris: &Path) -> Result<Vec<String>, String> {
+    let mut cmd = Command::new(iris);
+    cmd.arg("--help");
+    let out = run_with_timeout(cmd, 60)?;
+    find_features(&String::from_utf8_lossy(&out.stderr)).ok_or_else(|| format!(
+        "{} printed no `build features:` line for --help, so its build cannot be checked. \
+         Is it an iris binary?", iris.display()))
+}
+
+/// The emulator arguments that make a run deterministic for a binary built
+/// with `features`, or why it cannot be.
+fn deterministic_args(features: &[String]) -> Result<Vec<String>, String> {
+    let has = |f: &str| features.iter().any(|x| x == f);
+    if !has("ci_clock") {
+        return Err(format!(
+            "--deterministic needs a `ci_clock` build: its test device clock counts retired \
+             instructions, which is what makes the suite pick the same work every run. This \
+             binary was built with [{}], so the run would be timed and its counts would vary. \
+             Rebuild with --features ci_clock.", features.join(" ")));
+    }
+    if has("lightning") && has("jitv2") {
+        return Err("--deterministic needs `--jitv2-compile sync`, which a `lightning` build \
+                    rejects because it always compiles on the pool, so a build with both \
+                    `lightning` and `jitv2` cannot run it. Use lightning without jitv2, or \
+                    jitv2 without lightning.".into());
+    }
+    // Lightning without the JIT has nothing to compile, and refuses the option.
+    Ok(if has("lightning") { Vec::new() } else { ["--jitv2-compile", "sync"].map(String::from).to_vec() })
 }
 
 fn run_guest(
@@ -965,9 +998,10 @@ enum Cmd {
         /// driven by retired instructions, so it picks the same iteration
         /// counts every time. The rates it prints are then
         /// constant by construction; compare instruction counts and host cost.
-        /// The result is labelled `<label>+deterministic`. With --iris this
-        /// passes `--jitv2-compile sync`; the emulator must itself be a
-        /// `ci_clock` build.
+        /// The result is labelled `<label>+deterministic`. With --iris the
+        /// emulator's `build features:` line is read first and the run is
+        /// refused unless it has `ci_clock`; `--jitv2-compile sync` is passed
+        /// where the build allows it (not on a lightning build).
         #[arg(long)]
         deterministic: bool,
         /// Also write a JUnit report here: one case per kernel, failed when
@@ -1111,7 +1145,11 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                     let elf = elf.unwrap_or_else(|| repo_relative("bench/build/irisbench.elf"));
                     let config = config.unwrap_or_else(|| repo_relative("bench/run/bare.toml"));
                     if deterministic {
-                        extra.extend(["--jitv2-compile", "sync"].map(String::from));
+                        // Refuse before the run: a binary without ci_clock
+                        // gives a timed run, whatever the label says.
+                        let args = deterministic_args(&probe_features(&iris)?)
+                            .map_err(|e| format!("{}: {}", iris.display(), e))?;
+                        extra.extend(args);
                     }
                     run_guest(&iris, &elf, &config, &label, timeout, &extra)?
                 }
@@ -1531,5 +1569,20 @@ mod tests {
         let e = failure_context(&"exit status: 3", "some stdout", "Configuration error: no sync\n");
         assert!(e.contains("emulator exit status: 3") && e.contains("some stdout"), "{e}");
         assert!(e.contains("Configuration error: no sync"), "{e}");
+    }
+
+    /// `run --deterministic --iris` on a binary without ci_clock ran, and saved
+    /// a timed result labelled "+deterministic".
+    #[test]
+    fn deterministic_needs_ci_clock_and_picks_arguments_by_build() {
+        let f = |list: &str| -> Vec<String> { list.split_whitespace().map(String::from).collect() };
+        let e = deterministic_args(&f("tlbvmap")).unwrap_err();
+        assert!(e.contains("ci_clock") && e.contains("[tlbvmap]"), "{e}");
+        assert!(deterministic_args(&[]).is_err());
+        assert_eq!(deterministic_args(&f("jitv2 ci_clock")).unwrap(), ["--jitv2-compile", "sync"]);
+        // lightning refuses --jitv2-compile sync, and has no JIT to need it
+        assert!(deterministic_args(&f("lightning ci_clock")).unwrap().is_empty());
+        // with the JIT it needs the sync compile that lightning rejects
+        assert!(deterministic_args(&f("lightning jitv2 ci_clock")).is_err());
     }
 }

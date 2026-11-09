@@ -322,11 +322,16 @@ kernel's iteration count from the test device's clock, so on the host clock a
 faster or slower run picks a different count, and the compile pool finishes
 regions at different times. With the flag, JIT compiles happen on the CPU
 thread and, in a `ci_clock` build (required), the test device's clock is
-derived from retired instructions (`--jitv2-compile sync`, which it passes on
-with `--iris`), so guest instruction counts match exactly and host instructions
-retired match to a few parts per million. The rates it prints are constant by
-construction: use it to compare instruction counts and host cost (`perf stat`),
-and the normal mode for speed. The result is labelled
+derived from retired instructions, so guest instruction counts match exactly and
+host instructions retired match to a few parts per million. With `--iris` it
+first runs the binary with `--help` to read its `build features:` line, refuses
+a binary without `ci_clock`, and passes `--jitv2-compile sync` where the build
+accepts it. A lightning build rejects that option, since it always compiles on
+the pool, so a build with both lightning and `jitv2` is refused.
+
+The suite's rates in such a run are constants of the build, so use it to compare
+instruction counts (and host cost with `perf stat`), and the normal mode for
+speed. `reference` refuses these runs. The result is labelled
 `<label>+deterministic`.
 
 `matrix` builds a **separate emulator per feature set**, because the JIT and
