@@ -1139,3 +1139,24 @@ fn texgen_starts_as_gl_does_and_planes_are_stored_as_the_pipe_stores_them() {
     assert_eq!(r.gl.texgen.object[0], [0.0, 0.0, 1.0, 0.0], "stored unchanged");
     assert_eq!(r.gl.texgen.eye[0], [0.0, 0.0, 1.0, 5.0], "times the inverse model-view");
 }
+
+/// The generation and clip-plane state is part of a context's saved state.
+#[test]
+fn texgen_and_clip_plane_state_round_trips_through_a_stream() {
+    use crate::dev::kona::stream::{Reader, Writer};
+    let mut r = Rig::new();
+    tex_mode(&mut r, 1, 0x2402);
+    tex_plane(&mut r, 3, gl::OBJECT_PLANE, [1.0, 2.0, 3.0, 4.0]);
+    tex_plane(&mut r, 2, gl::EYE_PLANE, [5.0, 6.0, 7.0, 8.0]);
+    r.cmd(ENABLE_CAPABILITY, &[gl::TEXTURE_GEN_S + 3]);
+    plane(&mut r, 4, [1.0, 0.5, 0.25, 0.125]);
+    r.cmd(ENABLE_CAPABILITY, &[gl::CLIP_PLANE0 + 4]);
+    let mut w = Writer::default();
+    r.gl.visit(&mut w);
+    let mut g = Gl::default();
+    let mut rd = Reader::new(&w.out);
+    g.visit(&mut rd);
+    assert!(rd.finish().is_ok());
+    assert_eq!(g.texgen, r.gl.texgen);
+    assert_eq!((g.user_plane, g.user_on), (r.gl.user_plane, r.gl.user_on));
+}

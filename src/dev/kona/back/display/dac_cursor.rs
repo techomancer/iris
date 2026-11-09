@@ -44,6 +44,7 @@
 //! way; what the part does with it is not in the table.
 
 use crate::dev::kona::defs::{dac_cursor_control, DAC_CURSOR_CHANNELS, DAC_CURSOR_CHANNEL_DE};
+use crate::dev::kona::stream::Stream;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -90,6 +91,16 @@ impl DacCursor {
     pub fn describe(&self) -> String {
         let n = self.census();
         format!("channel {}: {} foreground, {} background, {} transparent, {} undefined", self.channel, n[3], n[2], n[0], n[1])
+    }
+
+    /// The cursor as the stream module reads and writes it.
+    fn visit<S: Stream>(&mut self, s: &mut S) {
+        let Self { channel: _, foreground: _, background: _, ram: _ } = self;
+        s.u32(&mut self.channel);
+        for v in self.foreground.iter_mut().chain(self.background.iter_mut()) {
+            s.u16(v);
+        }
+        s.bytes(&mut self.ram[..]);
     }
 
     /// Pixels of each value, 0 to 3.
@@ -193,6 +204,37 @@ impl Dac {
         })
     }
 
+    /// The state, as the stream module reads and writes it.
+    pub fn visit<S: Stream>(&mut self, s: &mut S) {
+        let Self { cursors: _, control: _, position: _, index: _, high: _ } = self;
+        let n = s.len(self.cursors.len());
+        if s.loading() {
+            self.cursors.clear();
+            for _ in 0..n {
+                let mut c = DacCursor { channel: 0, foreground: [0; 3], background: [0; 3], ram: Box::new([0; 1024]) };
+                c.visit(s);
+                if DAC_CURSOR_CHANNELS.contains(&c.channel) || c.channel == DAC_CURSOR_CHANNEL_DE {
+                    self.cursors.insert(c.channel, Arc::new(c));
+                } else {
+                    s.fail("a saved DAC cursor names a channel the table does not give");
+                }
+            }
+        } else {
+            for c in self.cursors.values() {
+                (**c).clone().visit(s);
+            }
+        }
+        s.u32s(&mut self.control);
+        for p in self.position.iter_mut() {
+            s.bytes(p);
+        }
+        for i in self.index.iter_mut() {
+            s.u16(i);
+        }
+        for h in self.high.iter_mut() {
+            s.bool(h);
+        }
+    }
 }
 
 impl DacDraw {
@@ -394,4 +436,22 @@ mod tests {
         assert_eq!(out, [7, 7, 7, 7, 7, 7, 0xf, 0xb]);
     }
 
+    #[test]
+    fn the_dac_state_round_trips() {
+        use crate::dev::kona::stream::{Reader, Writer};
+        let mut d = Dac::default();
+        d.load(DacCursor::from_request(&request(0, 64, &[(&[0xff; 8], &[0xff; 8])])).unwrap());
+        set(&mut d, 0, 0x204, &[5]);
+        set(&mut d, 0, 0x200, &[1, 2, 3, 4]);
+        let mut w = Writer::default();
+        d.visit(&mut w);
+        let bytes = w.out;
+        let mut e = Dac::default();
+        let mut r = Reader::new(&bytes);
+        e.visit(&mut r);
+        r.finish().unwrap();
+        let (a, b) = (d.draw(|c| c[0] as u32).unwrap(), e.draw(|c| c[0] as u32).unwrap());
+        assert_eq!((a.x0, a.y0, a.foreground), (b.x0, b.y0, b.foreground));
+        assert_eq!(a.cursor.census(), b.cursor.census());
+    }
 }

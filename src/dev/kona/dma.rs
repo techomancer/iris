@@ -66,6 +66,30 @@ impl Dma {
         Dma { list: vec![0u8; LIST_DEFAULT].into_boxed_slice(), record_pending: false, record_dest: 0, record_bytes: 0, pool: None, list_base: 0, in_list: false, words: Vec::new(), bytes: Vec::new() }
     }
 
+    /// The display-list memory and the registration the guest made, as the stream
+    /// module reads and writes them (a list is not running when it is saved).
+    /// Whether a display list is running.
+    pub fn running(&self) -> bool {
+        self.in_list
+    }
+
+    pub fn visit<S: super::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { list: _, record_pending: _, record_dest: _, record_bytes: _, pool: _, list_base: _, in_list: _, words: _, bytes: _ } = self;
+        s.bytes(&mut self.list);
+        s.bool(&mut self.record_pending);
+        s.u32(&mut self.record_dest);
+        s.u32(&mut self.record_bytes);
+        s.opt(&mut self.pool, |s, p| {
+            s.u64(&mut p.0);
+            s.u32(&mut p.1);
+        });
+        s.u32(&mut self.list_base);
+        if s.loading() {
+            self.in_list = false;
+        }
+    }
+
     pub fn reset(&mut self) {
         // Fresh, zeroed pages: nothing a list left before the reset can run.
         self.list = vec![0u8; LIST_DEFAULT].into_boxed_slice();

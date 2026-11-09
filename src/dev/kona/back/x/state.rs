@@ -81,6 +81,34 @@ impl Default for XState {
 }
 
 impl XState {
+    /// Whether a pixel transfer is part way, which a snapshot does not carry.
+    pub fn busy(&self) -> bool {
+        self.pixel.busy()
+    }
+
+    /// The graphics context, position, clip, scissor, waiting data, stipple cache and
+    /// pixel set-up, as the stream module reads and writes them. Counters, the scratch
+    /// buffers and the refused counts are not saved.
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { gc: _, position: _, clip: _, scissor: _, clip_run: _, run: _, boxes: _, spans: _, fills: _, stipple: _, pixel: _, clips_refused: _, runs_dropped: _, loads: _ } = self;
+        s.u32s(&mut self.gc);
+        s.u32s(&mut self.position);
+        let n = s.len(self.clip.len());
+        if s.loading() {
+            self.clip.clear();
+            self.clip.resize(n, [0; 4]);
+        }
+        for r in self.clip.iter_mut() {
+            s.i32s(r);
+        }
+        s.opt(&mut self.scissor, |s, v| s.u32s(v));
+        s.vec_u32(&mut self.clip_run);
+        s.vec_u32(&mut self.run);
+        self.stipple.visit(s);
+        self.pixel.visit(s);
+        s.u64(&mut self.loads);
+    }
 
     #[cfg(test)]
     /// Power-on state.

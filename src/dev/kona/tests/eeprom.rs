@@ -380,3 +380,60 @@ fn a_flash_file_outlasts_the_board() {
     assert_eq!(f.peek(INTERNAL_FLASH + 0x2000), 0xfeed_f00d);
     assert_eq!(f.peek(INTERNAL_FLASH + 0x2004), 0xcafe_0001);
 }
+
+/// A snapshot that does not parse is refused with the board and its flash file as they were: the state
+/// blob cut short (every byte of the first 64, then at a growing stride, then the last bytes) or given a
+/// trailing byte leaves the board's state unchanged and the flash file unwritten. The cuts go to the state
+/// loader as bytes in memory; one refusal and the whole snapshot go through the chunk store, the path a
+/// machine takes, and the file takes the image.
+#[test]
+fn a_snapshot_that_does_not_parse_leaves_the_board_and_its_flash_file_alone() {
+    use crate::dev::kona::back::snapshot::put_bytes;
+    let dir = ScratchDir::new("eeprom-snapshot");
+    let file = |name: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0u8; crate::dev::kona::FLASH_SIZE]).unwrap();
+        path
+    };
+    let (pa, pb) = (file("a.bin"), file("b.bin"));
+    let make = |path: &std::path::Path| {
+        let host = TestHost::new();
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        (host.clone(), Kona::new(test_cfg(), host.clone(), host, crate::dev::kona::tests::test_status(), Some(f)).unwrap())
+    };
+    let cs = crate::chunk_store::ChunkStore::new(dir.join("saves"));
+    // A board with a programmed flash image, snapshotted.
+    let (host, kona) = make(&pa);
+    let a = Fixture::of(host, kona);
+    a.reply_buffer(REPLY_PAGE);
+    a.flash_write(TYPE_IMAGE, 0x2000, &[0xfeed_f00d, 0xcafe_0001]);
+    a.settle();
+    let saved = a.kona.save_chunks(&cs).unwrap();
+    let blob = a.kona.state_bytes(&mut a.kona.shared.pipe.lock()).unwrap();
+    // Another board, its flash file untouched.
+    // Not started, so nothing moves under the comparison.
+    let (_host, b) = make(&pb);
+    let before = b.save_chunks(&cs).unwrap();
+    let state_before = b.state_bytes(&mut b.shared.pipe.lock()).unwrap();
+    let flash_before = std::fs::read(&pb).unwrap();
+    // Every byte of the first 64, a doubling stride after, and the last bytes: the cuts fall inside every field the blob has.
+    let cuts: Vec<usize> = (0..64).chain(std::iter::successors(Some(97usize), |c| Some(c * 3 / 2 + 1)).take_while(|&c| c < blob.len())).chain(blob.len() - 8..blob.len()).collect();
+    for cut in cuts {
+        assert!(b.load_state(&mut b.shared.pipe.lock(), &blob[..cut]).is_err(), "a blob cut at {cut} loaded");
+    }
+    let mut long = blob.clone();
+    long.push(0);
+    assert!(b.load_state(&mut b.shared.pipe.lock(), &long).is_err(), "a blob with a trailing byte loaded");
+    // The same refusal through the chunk store, with the bulk chunks the snapshot has.
+    let cut = &blob[..blob.len() / 2];
+    let mut list: Vec<_> = saved.iter().filter(|c| !c.name.starts_with("state-")).cloned().collect();
+    list.push(crate::dev::kona::KonaChunk { name: format!("state-{}", cut.len()), hashes: put_bytes(&cs, cut).unwrap() });
+    assert!(b.load_chunks(&cs, &list).is_err());
+    assert_eq!(b.state_bytes(&mut b.shared.pipe.lock()).unwrap(), state_before, "a refused load changed the board");
+    assert_eq!(b.save_chunks(&cs).unwrap(), before, "a refused load changed the board");
+    assert_eq!(std::fs::read(&pb).unwrap(), flash_before, "a refused load wrote the flash file");
+    // The whole snapshot loads, and the file takes the image.
+    b.load_chunks(&cs, &saved).unwrap();
+    assert_eq!(&std::fs::read(&pb).unwrap()[0x2000..0x2008], &[0xfe, 0xed, 0xf0, 0x0d, 0xca, 0xfe, 0x00, 0x01]);
+    assert_eq!(b.save_chunks(&cs).unwrap(), saved);
+}

@@ -61,6 +61,26 @@ fn fits(entry: u32, width: u32, height: u32) -> bool {
 }
 
 impl Stipple {
+    /// The cache, as the stream module reads and writes it (the counter is not saved).
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { width: _, height: _, origin: _, rows: _, loaded: _, pending: _, refused: _ } = self;
+        s.u32s(&mut self.width);
+        s.u32s(&mut self.height);
+        for o in self.origin.iter_mut() {
+            s.i32(&mut o.0);
+            s.i32(&mut o.1);
+        }
+        for r in self.rows.iter_mut() {
+            s.u32s(r);
+        }
+        s.u32(&mut self.loaded);
+        s.opt(&mut self.pending, |s, p| {
+            s.u32(&mut p.0);
+            s.u32(&mut p.1);
+            s.u32(&mut p.2);
+        });
+    }
 
     /// A store's header: the rows to expect behind it. The entry loses its
     /// pattern until they arrive.

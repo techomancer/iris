@@ -123,6 +123,19 @@ impl Flash {
         inside
     }
 
+    /// The image, as the stream module reads and writes it. A loaded image is not written to
+    /// the backing file here: `write_through` does that, once the whole snapshot has parsed.
+    pub fn visit<S: super::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { image: _, backing: _, sync_failed: _ } = self;
+        s.bytes(&mut self.image);
+    }
+
+    /// The whole image to the backing file, as every programmed byte is.
+    pub fn write_through(&mut self) {
+        self.sync(0, self.image.len());
+    }
+
     fn sync(&mut self, from: usize, to: usize) {
         let Some(file) = self.backing.as_mut() else { return };
         let r = file.seek(SeekFrom::Start(from as u64)).and_then(|_| file.write_all(&self.image[from..to]));

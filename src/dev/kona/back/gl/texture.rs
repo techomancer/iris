@@ -59,6 +59,7 @@
 
 use super::super::raster::texel::{default_weights, spline_samples, Combine, Detail, EnvMode, Filter, Sharpen, TexDesc, TexLevel, Wrap, MAX_LEVELS, CURVE_NODES};
 use super::super::store::texture::{TextureStore, PLANES_PER_CONTEXT, UNIT_WORDS};
+use crate::dev::kona::stream::Stream;
 use crate::dev::kona::defs::*;
 use std::collections::HashMap;
 
@@ -488,6 +489,39 @@ pub struct TexCounts {
     pub read_unposted: u64,
 }
 
+/// A map of levels, in key order so the same state is the same bytes.
+fn visit_levels<S: Stream>(s: &mut S, levels: &mut HashMap<(u8, u32), Level>) {
+    let mut keys: Vec<(u8, u32)> = levels.keys().copied().collect();
+    keys.sort_unstable();
+    let n = s.len(keys.len());
+    let mut out = HashMap::new();
+    for i in 0..n {
+        if !s.ok() {
+            break;
+        }
+        let (mut bank, mut addr) = keys.get(i).copied().unwrap_or((0, 0));
+        let mut l = levels.get(&(bank, addr)).copied().unwrap_or(Level { plane: 0, off: 0, pw: 0, ph: 0, pd: 1, size_code: 0, min: (0, 0), max: (0, 0), last: [(0, 0); 2], whole: [false; 2], storage: 0, raw: false });
+        s.u8(&mut bank);
+        s.u32(&mut addr);
+        let mut plane = l.plane as u32;
+        s.u32(&mut plane);
+        l.plane = plane as u16;
+        let [mut lx, mut ly] = l.last;
+        for v in [&mut l.off, &mut l.pw, &mut l.ph, &mut l.pd, &mut l.size_code, &mut l.min.0, &mut l.min.1, &mut l.max.0, &mut l.max.1, &mut lx.0, &mut lx.1, &mut ly.0, &mut ly.1] {
+            s.u32(v);
+        }
+        l.last = [lx, ly];
+        s.bool(&mut l.whole[0]);
+        s.bool(&mut l.whole[1]);
+        s.u32(&mut l.storage);
+        s.bool(&mut l.raw);
+        out.insert((bank, addr), l);
+    }
+    if s.loading() {
+        *levels = out;
+    }
+}
+
 /// The most filter-coefficient tables a context keeps (the slots are allocated by the client from zero; a stream
 /// that sends more is the guest's, and the extra are dropped).
 const MAX_FILTER_TABLES: usize = 512;
@@ -553,6 +587,50 @@ impl TexContext {
         }
         self.levels.clear();
         self.detail.clear();
+    }
+
+    /// The unpack state, the levels loaded and the bind waiting for its record, as the stream
+    /// module reads and writes them. Levels go in key order so the same state is the same
+    /// bytes.
+    pub fn visit<S: Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { slot: _, unpack: _, levels: _, detail: _, filters: _, detail_bind: _, pending: _, bind: _ } = self;
+        for v in [&mut self.unpack.row_length, &mut self.unpack.skip_rows, &mut self.unpack.skip_pixels, &mut self.unpack.alignment] {
+            s.u32(v);
+        }
+        s.bool(&mut self.unpack.swap_bytes);
+        visit_levels(s, &mut self.levels);
+        visit_levels(s, &mut self.detail);
+        let n = s.len(self.filters.len());
+        self.filters.resize(n.min(MAX_FILTER_TABLES), (0, [0; 33]));
+        for (slot, words) in self.filters.iter_mut() {
+            s.u32(slot);
+            s.u32s(words);
+        }
+        let mut have = self.detail_bind.is_some();
+        s.bool(&mut have);
+        let mut d = self.detail_bind.unwrap_or_default();
+        let DetailBind { entry, exps: [sx, tx], row, pair: [p0, p1] } = &mut d;
+        for v in [entry, sx, tx, row, p0, p1] {
+            s.u32(v);
+        }
+        if s.loading() {
+            self.detail_bind = have.then_some(d);
+        }
+        let mut p = self.pending.is_some();
+        s.bool(&mut p);
+        let mut a = self.pending.unwrap_or([0; 20]);
+        s.u32s(&mut a);
+        if s.loading() {
+            self.pending = p.then_some(a);
+        }
+        let mut b = self.bind.is_some();
+        s.bool(&mut b);
+        let mut w = self.bind.unwrap_or([0; 5]);
+        s.u32s(&mut w);
+        if s.loading() {
+            self.bind = b.then_some(w);
+        }
     }
 
     /// Decode a texel draw's image (`bytes`, the stream as bytes after the first
@@ -1902,6 +1980,49 @@ mod tests {
         // A raw load of everything it holds replaces it as raw again.
         assert!(c.load(&store, &raw, &words, false, &mut n));
         assert!(c.levels[&(0, 0x100)].raw);
+    }
+
+    /// The levels, the detail images and the unpack state are what a snapshot keeps: restored, the detail map has
+    /// its images and every level places as it did, and saving the restored state gives the same bytes.
+    #[test]
+    fn a_snapshot_keeps_the_levels_and_the_detail_images() {
+        use crate::dev::kona::stream::{Reader, Writer};
+        let store = TextureStore::default();
+        let (mut c, mut n) = (TexContext::default(), TexCounts::default());
+        c.unpack.skip_rows = 3;
+        load_copy(&mut c, &store, &copy(8, 4, 0, 0, 0x100));
+        load_copy(&mut c, &store, &copy(4, 4, 4, 0, 0x100));
+        for x in 0..8 {
+            load_copy(&mut c, &store, &copy(1, 4, x, 0, 0x200));
+        }
+        for bank in [0u32, 1] {
+            let mut d = copy(8, 4, 0, 0, 0x300);
+            d[0] = 0x8095;
+            d[17] |= bank << 3;
+            d[18 + bank as usize] = 0x300;
+            assert!(c.load(&store, &d, &vec![0x77; 8 * 4 * 4], false, &mut n));
+        }
+        assert!(slice(&mut c, &store, &mut n, 0, 0x40, 1, 0x1234_5678));
+        assert!(c.filter_table(2, &[0xabcd; 33]) && c.bind_detail(&[1, 3, 2, 0x31, 0x300, 0x301]));
+        assert_eq!((c.levels.len(), c.detail.len()), (3, 2));
+        let mut w = Writer::default();
+        c.visit(&mut w);
+        let mut back = TexContext::default();
+        let mut r = Reader::new(&w.out);
+        back.visit(&mut r);
+        r.finish().unwrap();
+        assert_eq!((back.levels.len(), back.detail.len(), back.unpack.skip_rows), (3, 2, 3));
+        assert_eq!(back.levels[&(0, 0x40)].pd, 2, "a volume level keeps its depth");
+        assert_eq!((back.filters.as_slice(), back.detail_bind), (&[(2, [0xabcd; 33])][..], c.detail_bind), "the filter tables and the detail bind");
+        for key in [(0, 0x100), (0, 0x200)] {
+            assert_eq!(back.levels[&key].place([None, None]), c.levels[&key].place([None, None]), "{key:?}");
+        }
+        assert_eq!(back.levels[&(0, 0x100)].place([None, None]), [(0, 8), (0, 4)], "the whole-first-load bit survived");
+        assert_eq!(back.levels[&(0, 0x200)].place([None, None]), [(7, 1), (0, 4)]);
+        assert_eq!(back.detail.keys().collect::<std::collections::BTreeSet<_>>(), c.detail.keys().collect());
+        let mut again = Writer::default();
+        back.visit(&mut again);
+        assert_eq!(again.out, w.out);
     }
 
     /// A level address counts 256 bits a bank, so a rectangle of 32 texels takes 2 units at

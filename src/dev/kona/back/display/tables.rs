@@ -213,6 +213,48 @@ impl Tables {
         *self = Tables::default();
     }
 
+    /// The tables as the guest loaded them, as the stream module reads and writes them.
+    /// What a frame reads (`Baked`) is made again from them on a load; the glyph memory
+    /// is the pixel store's chunks'.
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { raw: _, gamma: _, gamma_loaded: _, xmap_index: _, channel0: _, did: _, mode: _, bank: _, cursor_ram: _, cursor_mode: _, cursor_at: _, cursor_pos: _, dac: _, blank: _, baked: _, dropped: _ } = self;
+        s.vec_u32(&mut self.raw);
+        s.bool(&mut self.gamma_loaded);
+        if self.gamma_loaded {
+            let n = s.len(self.gamma.len());
+            if s.loading() {
+                self.gamma.clear();
+                self.gamma.resize(n, 0);
+            }
+            s.u16s(&mut self.gamma);
+        } else if s.loading() {
+            self.gamma.iter_mut().for_each(|g| *g = 0);
+        }
+        s.u32(&mut self.xmap_index);
+        s.u32(&mut self.channel0);
+        for e in self.did.iter_mut() {
+            s.opt(e, |s, v| s.u32(v));
+        }
+        s.u32s(&mut self.mode);
+        for b in self.bank.iter_mut() {
+            s.u8(b);
+        }
+        s.u32(&mut self.cursor_mode);
+        s.u32(&mut self.cursor_at);
+        s.u32(&mut self.cursor_pos);
+        self.dac.visit(s);
+        // `blank` is not saved: the back end derives it from the channels it restores.
+        if s.loading() {
+            if self.raw.len() != ENTRIES || self.gamma.len() != GAMMA_ENTRIES {
+                s.fail("the saved display tables are the wrong size");
+                self.raw.resize(ENTRIES, 0);
+                self.gamma.resize(GAMMA_ENTRIES, 0);
+            }
+            self.rebake_all();
+        }
+    }
+
     /// The tables a frame reads. Cheap: a reference count.
     pub fn snapshot(&self) -> Arc<Baked> {
         self.baked.clone()

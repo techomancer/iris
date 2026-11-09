@@ -92,6 +92,12 @@ impl Default for ColourMap {
 }
 
 impl ColourMap {
+    /// The entries, as the stream module reads and writes them.
+    pub fn visit<S: crate::dev::kona::stream::Stream>(&mut self, s: &mut S) {
+        // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
+        let Self { entries: _ } = self;
+        s.u32s(&mut self.entries);
+    }
 
     /// A colour-map load: an index and three 10-bit components, each the
     /// 8-bit value scaled up by four (so the top eight bits are kept).
