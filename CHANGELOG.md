@@ -49,6 +49,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### Boot test
 
 - `iris-ci junit FILE --suite NAME --case 'pass|SECONDS|NAME'` writes a JUnit report of checks a shell script has made, one case each (`fail|SECONDS|NAME|MESSAGE` for a failed one), so a CI test reporter can name the check that failed.
+- The nightly boot test writes its checks (seeding NVRAM, the serial login, iris quitting cleanly) as `boot-test.xml`, and CI annotates the run with any that failed.
 
 ### PCI
 
