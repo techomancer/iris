@@ -642,6 +642,34 @@ fn arp_for_the_gateway_is_answered() {
     assert!(net.inbox.is_empty());
 }
 
+/// A guest that boots with a static address on one subnet (a disk cloned
+/// from a machine on a LAN), routes through the gateway it adopted there,
+/// then is re-addressed onto the NAT's own subnet: its ARP for the new
+/// gateway is answered. (Before, the first adoption stayed locked, and the
+/// guest lost the network once its cached ARP entry for the old gateway
+/// expired.)
+#[test]
+fn a_guest_that_moves_subnet_gets_its_new_gateway() {
+    let mut net = TestNet::default();
+    let (gw, guest) = (net.gw_ip, net.guest_ip);
+    let (old_gw, old_guest) = (Ipv4Addr::new(10, 77, 3, 1), Ipv4Addr::new(10, 77, 3, 98));
+    net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, old_guest, [0; 6], old_gw));
+    net.wait_for("ARP reply for the adopted gateway", |f| {
+        Ether::parse(f).and_then(|e| e.arp()).is_some_and(|a| a.sender_ip() == old_gw)
+    });
+    // Routed traffic locks the adoption for this setup...
+    let id = net.next_id();
+    let f = net.route_to(old_gw).icmp(id, packet::ICMP_ECHO_REQUEST, 0, [0, 1, 0, 1], b"");
+    net.send(f);
+    net.settle(Duration::from_millis(10));
+    net.inbox.clear();
+    // ...but the guest now asks from another subnet.
+    net.send(packet::arp(packet::ARP_REQUEST, GUEST_MAC, guest, [0; 6], gw));
+    let r = net.wait_for("ARP reply for the new gateway", |f| Ether::parse(f).and_then(|e| e.arp()).is_some());
+    let a = Ether::parse(&r).unwrap().arp().unwrap().sender_ip();
+    assert_eq!(a, gw);
+}
+
 #[test]
 fn ping_the_gateway() {
     let mut net = TestNet::default();
