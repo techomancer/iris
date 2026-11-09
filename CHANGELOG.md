@@ -60,6 +60,26 @@ hashes are given where a change is easiest to understand by reading the commit.
   them in the guest; `--impact` compares against what the board and its
   driver do rather than the extension's specification.
 
+### IMPACT checked against a real High IMPACT
+
+An Indigo2 IP28 with a High IMPACT ran the guest test suites beside an
+emulated twin on the same IRIX image, and the model now follows the board
+where they differed:
+
+- Detail textures add `w (detail - 0.53) / 32` (the table's 31 is 31/32,
+  the zero at 136.6 of 255), with no detail from the table's last index on,
+  in all three raster engines; `dettex --impact` and the new
+  `test/gltest/dettexsweep.sh` measure it.
+- SUBTRACT and REVERSE_SUBTRACT blends drop or un-invert factors for some
+  alpha and constant factor pairs, as the board does.
+- `GL_CURRENT_RASTER_DISTANCE` answers the raster vertex's eye z.
+- Smooth-shaded quads and quad strips split along the board's diagonal.
+- A large host DMA no longer runs past the pages the kernel mapped for it;
+  on the IP28 it wrote over the kernel's exception vectors and hung the
+  guest (the board's refill of the next window is not modelled yet).
+- New guest tools: `bdinfo` (the board-info record gfxinfo reads), `rdist`,
+  `blendtest -a` and `dettex --fill / --dump`.
+
 ### VPro introspection
 
 - The Octane's VPro (Odyssey) board has a monitor surface like the other

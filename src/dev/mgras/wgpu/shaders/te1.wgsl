@@ -252,12 +252,16 @@ fn detail_weight(si: u32, lambda: i32) -> i32 {
         i = x >> 8u;
         f = x & 0xffu;
     }
+    // From the TXLOD index on, no detail.
+    if i >= sr(si, SL_DETAIL + 5u) {
+        return 0;
+    }
     var t1 = 0u;
     if i < 31u {
         t1 = sr(si, SL_DTABLE + i + 1u);
     }
     let w = sr(si, SL_DTABLE + i) * (256u - f) + t1 * f;
-    return i32(w * 33825u);
+    return i32(w * 32768u); // te1::DETAIL_SCALE
 }
 
 // A detail coordinate: Q31 to Q16 detail texels.
@@ -343,7 +347,7 @@ fn smp_detail(si: u32, base: vec4<i32>, s: I64, t: I64, lambda: i32) -> vec4<i32
         + detail_texel(page, n, i, j1, nc, sel, d) * ((256 - a) * b)
         + detail_texel(page, n, i1, j1, nc, sel, d) * (a * b);
     let f = detail_weight(si, lambda);
-    let x = 2 * td - vec4<i32>(FIX_ONE);
+    let x = td - vec4<i32>(2185 << 16); // te1::DETAIL_CENTER
     return clamp(base + vec4<i32>(fmul(f, x.x), fmul(f, x.y), fmul(f, x.z), fmul(f, x.w)), vec4<i32>(0), vec4<i32>(FIX_MAX));
 }
 

@@ -19,8 +19,9 @@
  * results may be off by one step of that depth.
  *
  * Output: one line per group (PASS / FAIL / SKIP) and up to 8 failing
- * cells per group; exit status = failing cells (capped at 255).
- *   blendtest [-v] [--hold MS] [--only GROUP] [--visual ID]
+ * cells per group (-v: every failing cell, -a: every cell, passing ones
+ * marked "ok"); exit status = failing cells (capped at 255).
+ *   blendtest [-v] [-a] [--hold MS] [--only GROUP] [--visual ID]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -385,6 +386,11 @@ static int check(void)
             xf[c->group]++;
             continue;
         }
+        if (ok && verbose > 1)
+            printf("  %s: cell %d %s/%s op 0x%x: s %02x%02x%02x%02x d %02x%02x%02x%02x got %02x%02x%02x%02x ok\n",
+                   groups[c->group], n, fname(c->sf), fname(c->df), c->op,
+                   c->s[0], c->s[1], c->s[2], c->s[3], c->d[0], c->d[1], c->d[2], c->d[3],
+                   p[0], p[1], p[2], p[3]);
         if (!ok) {
             bad[c->group]++;
             fails++;
@@ -432,6 +438,8 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v"))
             verbose = 1;
+        else if (!strcmp(argv[i], "-a"))
+            verbose = 2;
         else if (!strcmp(argv[i], "--hold") && i + 1 < argc)
             hold = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--only") && i + 1 < argc)
@@ -439,7 +447,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--visual") && i + 1 < argc)
             want_id = strtol(argv[++i], 0, 0);
         else {
-            fprintf(stderr, "usage: blendtest [-v] [--hold MS] [--only GROUP] [--visual ID]\n");
+            fprintf(stderr, "usage: blendtest [-v] [-a] [--hold MS] [--only GROUP] [--visual ID]\n");
             return 255;
         }
     }

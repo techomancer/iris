@@ -2006,6 +2006,9 @@ impl<'a> E<'a> {
             let p = e.b.ins().iadd(e.ctx, i);
             e.b.ins().load(I32, e.mr, p, off!(gl.smp.detail.table))
         };
+        // From the TXLOD index on, no detail (`Sampler::detail_weight`).
+        let last = self.b.ins().load(I32, self.mr, self.ctx, off!(gl.smp.detail.last));
+        let cut = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, last);
         let t0 = entry(self, idx);
         let idx1 = self.b.ins().iadd_imm_s(idx, 1);
         let idx1 = self.b.ins().umin(idx1, c31);
@@ -2014,7 +2017,8 @@ impl<'a> E<'a> {
         let w0 = self.b.ins().imul(t0, nfr);
         let w1 = self.b.ins().imul(t1, fr);
         let w = self.b.ins().iadd(w0, w1);
-        let f = self.b.ins().imul_imm_s(w, 33825);
+        let f = self.b.ins().imul_imm_s(w, te1::DETAIL_SCALE as i64);
+        let f = self.b.ins().select(cut, zero, f);
         let f = self.b.ins().sextend(I64, f);
         let max = self.i32c(fixed::MAX as i64);
         let mut out = base;
@@ -2026,9 +2030,8 @@ impl<'a> E<'a> {
             let td = self.b.ins().iadd(td, z);
             let q = self.b.ins().imul(w11, t11[k]);
             let td = self.b.ins().iadd(td, q);
-            // mul(F, 2 detail - ONE), 12.16.
-            let d2 = self.b.ins().iadd(td, td);
-            let d2 = self.b.ins().iadd_imm_s(d2, -(fixed::ONE as i64));
+            // mul(F, detail - DETAIL_CENTER), 12.16.
+            let d2 = self.b.ins().iadd_imm_s(td, -(te1::DETAIL_CENTER as i64));
             let d2 = self.b.ins().sextend(I64, d2);
             let m = self.b.ins().imul(f, d2);
             let m = self.b.ins().sshr_imm_s(m, 28);

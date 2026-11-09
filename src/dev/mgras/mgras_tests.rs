@@ -1772,9 +1772,9 @@ fn gl_raster_position_queries_valid_bias_and_update() {
     assert_eq!(ry, 60.0 + 49151.5);
     assert_eq!(rz, 0.5); // glOrtho maps z=0 to window z=0.5
     assert_eq!(rw, 1.0);
-    // The eye-space distance to the raster position (GL 1.1 2.12): (50,
-    // 60, 0) under an identity modelview.
-    assert!((dist - (50.0f32 * 50.0 + 60.0 * 60.0).sqrt()).abs() < 1e-3, "{dist}");
+    // The raster vertex's eye-space z, which a real board answers for
+    // GL_CURRENT_RASTER_DISTANCE: (50, 60, 0) under an identity modelview.
+    assert_eq!(dist, 0.0);
 
     // Raster color readback at 0x2C5..=0x2C8
     let cr = f32::from_bits(gl_return_mode(&m, 0x2C5));
