@@ -152,6 +152,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 
 | Note | Kind | Title |
 |---|---|---|
+| [nat-readopts-the-gateway-when-the-guest-moves-subnet.md](net/nat-readopts-the-gateway-when-the-guest-moves-subnet.md) | rule | A guest re-addressed after boot gets its new gateway; the boot-time adoption no longer locks it out ~20 min later |
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |

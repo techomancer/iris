@@ -369,8 +369,11 @@ impl NatEngine {
     /// resolve is almost always its configured gateway. Record it for the GUI
     /// and, while nothing routes yet, adopt it so NAT answers and traffic flows
     /// with no config change. Self-limiting: once any frame routes through us
-    /// we stop, so a working setup is never moved. Refused when the subnet
-    /// overlaps a host network, which adopting would shadow.
+    /// we stop, so a working setup is never moved, unless the guest itself
+    /// moves to another subnet (an `ifconfig` after boot): that is a new
+    /// setup, and the old gateway, once its ARP entry expires in the guest,
+    /// would never answer again. Refused when the subnet overlaps a host
+    /// network, which adopting would shadow.
     fn maybe_adopt_gateway(&mut self, spa: Ipv4Addr, tpa: Ipv4Addr) {
         let (s, t) = (spa.octets(), tpa.octets());
         dlog_dev!(LogModule::Net, "NAT guest ARP who-has {} tell {} (nat gw={} client={} guest_frames={})",
@@ -382,8 +385,14 @@ impl NatEngine {
         self.ctl.observed_gateway.store(u32::from(tpa), Ordering::Relaxed);
         let adopt_net = Ipv4Addr::new(t[0], t[1], t[2], 0);
         let conflicts = self.ctl.host_conflict(adopt_net, 24);
-        if self.config.gateway_ip != tpa && !self.ctl.routed.load(Ordering::Relaxed) && !conflicts {
-            dlog_dev!(LogModule::Net, "NAT adopting gateway {} (was {})", tpa, self.config.gateway_ip);
+        let moved = s[..3] != self.config.client_ip.octets()[..3];
+        if self.config.gateway_ip != tpa && (moved || !self.ctl.routed.load(Ordering::Relaxed)) && !conflicts {
+            dlog_dev!(LogModule::Net, "NAT adopting gateway {} (was {}{})", tpa, self.config.gateway_ip,
+                if moved { ", the guest moved subnet" } else { "" });
+            if moved {
+                self.flush_flows();
+                self.ctl.routed.store(false, Ordering::Relaxed);
+            }
             self.config.gateway_ip = tpa;
             self.config.client_ip = Ipv4Addr::new(t[0], t[1], t[2], 2);
             self.config.netmask = Ipv4Addr::new(255, 255, 255, 0);

@@ -49,6 +49,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - IRIX 6.5.30 guests mount the NFS share with a plain `mount`: the
   portmapper no longer offers TCP mappings it cannot serve, and the MOUNT
   v3 reply lists AUTH_UNIX.
+- A guest re-addressed after boot onto another subnet gets its new gateway
+  from the NAT. A disk cloned from a LAN machine, re-addressed from its
+  desktop, used to lose the network about 20 minutes later, when its
+  cached ARP entry for the old gateway expired.
 
 ### IMPACT detail textures
 
