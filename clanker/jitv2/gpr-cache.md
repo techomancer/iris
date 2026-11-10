@@ -82,6 +82,11 @@ checksum identical. That program takes 6 s on its first run and 2.1 s on its
 second: the guest is waiting for compiles, see below. Mean compile time in
 those boots was 52-54 ms, against 49-52 ms with the cache off.
 
+The two-CPU Octane (R10000, IRIX64 6.5.22, shared compile pool) gives the
+same answers and the same picture: the C program warm at 1.61-1.71 s with
+the cache at 6, 1.61-1.75 s at 0, and 1.72-1.84 s at 31. Even restricted to
+loops, a large budget costs a call-heavy program its entry loads.
+
 ## What was tried and dropped
 
 **All 31 registers, every function** (what xiri's `66f5a59b` does, minus its
