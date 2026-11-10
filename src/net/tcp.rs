@@ -14,6 +14,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use polling::Events;
 use socket2::{Domain, Socket, Type};
 
 use super::packet::{Ipv4Route, MacAddr, Tcp, TcpFlags, TcpHeader, TCP_MSS};
@@ -89,54 +90,30 @@ impl HostConn {
     }
 
     /// Ready(Ok) once connected, Ready(Err) if it failed, Pending meanwhile.
-    fn poll_connect(&mut self) -> Option<io::Result<()>> {
+    /// The connect has finished once the last wait reported the socket.
+    fn poll_connect(&mut self, events: &Events) -> Option<io::Result<()>> {
         if self.connected {
             return Some(Ok(()));
         }
+        let Some(ev) = events.iter().find(|e| e.key == self.sock.key()) else {
+            return (self.started.elapsed() > CONNECT_TIMEOUT)
+                .then(|| Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")));
+        };
         if let Ok(Some(e)) | Err(e) = self.sock.take_error().map(|o| o.map(Into::into)) {
             return Some(Err(e));
         }
-        match connect_done(&self.sock) {
-            Ok(true) => {
-                self.connected = true;
-                Some(Ok(()))
-            }
-            Err(e) => Some(Err(e)),
-            Ok(false) if self.started.elapsed() > CONNECT_TIMEOUT => {
-                Some(Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")))
-            }
-            Ok(false) => None,
+        // An error event with SO_ERROR clear (IOCP's connect failure) is still a failure.
+        if ev.is_err() == Some(true) {
+            return Some(Err(io::ErrorKind::ConnectionRefused.into()));
         }
+        self.connected = true;
+        Some(Ok(()))
     }
 
     /// The connected socket, for reads and writes.
     fn stream(&self) -> io::Result<&Socket> {
         if self.connected { Ok(&self.sock) } else { Err(io::ErrorKind::NotConnected.into()) }
     }
-}
-
-/// Whether a non-blocking connect has finished: getpeername fails until it has.
-#[cfg(not(windows))]
-fn connect_done(sock: &Socket) -> io::Result<bool> {
-    Ok(sock.peer_addr().is_ok())
-}
-
-/// Windows: getpeername can succeed for a connect to a closed port, so ask WSAPoll,
-/// which flags a failed connect POLLERR | POLLHUP (Windows 10 2004 and later).
-#[cfg(windows)]
-fn connect_done(sock: &Socket) -> io::Result<bool> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLERR, POLLHUP, POLLWRNORM, WSAPOLLFD};
-    let mut fd = WSAPOLLFD { fd: sock.as_raw_socket() as usize, events: POLLWRNORM, revents: 0 };
-    // SAFETY: one valid WSAPOLLFD, polled without waiting.
-    let n = unsafe { WSAPoll(&mut fd, 1, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if fd.revents & (POLLERR | POLLHUP) != 0 {
-        return Err(sock.take_error()?.unwrap_or_else(|| io::ErrorKind::ConnectionRefused.into()));
-    }
-    Ok(fd.revents & POLLWRNORM != 0)
 }
 
 fn in_progress(e: &io::Error) -> bool {
@@ -199,9 +176,9 @@ impl ServiceConn {
 }
 
 impl Backend {
-    fn poll_connect(&mut self) -> Option<io::Result<()>> {
+    fn poll_connect(&mut self, events: &Events) -> Option<io::Result<()>> {
         match self {
-            Backend::Host(h) => h.poll_connect(),
+            Backend::Host(h) => h.poll_connect(events),
             Backend::Service(_) => Some(Ok(())),
         }
     }
@@ -558,7 +535,7 @@ impl TcpConn {
 
     /// Advance timers and move data from the backend. `budget` is how many
     /// frames the caller can queue. Returns the frames to send.
-    pub(super) fn poll(&mut self, gw_mac: MacAddr, budget: usize) -> Vec<Vec<u8>> {
+    pub(super) fn poll(&mut self, gw_mac: MacAddr, budget: usize, events: &Events) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let now = Instant::now();
 
@@ -568,7 +545,7 @@ impl TcpConn {
 
         match self.state {
             State::Connecting => {
-                match self.backend.poll_connect() {
+                match self.backend.poll_connect(events) {
                     None => {}
                     Some(Ok(())) => {
                         self.state = State::SynReceived;

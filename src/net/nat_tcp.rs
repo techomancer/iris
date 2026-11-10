@@ -166,7 +166,7 @@ impl NatEngine {
         let mut budget = self.queue_room();
         let mut side_connects = Vec::new();
         for conn in self.tcp_nat.values_mut() {
-            let out = conn.poll(gw_mac, budget);
+            let out = conn.poll(gw_mac, budget, &self.events);
             budget = budget.saturating_sub(out.len());
             frames.extend(out);
             // A service (rsh) may have just asked for a connection back to the guest.
