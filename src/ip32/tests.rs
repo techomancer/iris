@@ -1025,6 +1025,9 @@ fn configuration_writes_do_not_make_the_physical_bus_keep_more_devices() {
         place(0x8000_4000);
     }
     assert_eq!(bus.phys.kept_len(), moved, "both placements are already mapped");
+    // The BAR's device holds the card, which holds memory for its DMA, which
+    // owns the bus: let go, or none of it is freed, nor the decode table.
+    bus.phys.release_devices();
 }
 
 

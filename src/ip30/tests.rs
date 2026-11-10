@@ -52,6 +52,17 @@ struct Board {
     bus: Arc<Ip30Bus>,
     phys: Arc<Physical>,
     heart: Arc<Heart>,
+    _release: Release,
+}
+
+/// Releases the bus's devices at the end of the test, as the machine's drop
+/// does: the Bridge and IMPACT hold HEART's memory, which owns the bus.
+struct Release(Arc<Physical>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.release_devices();
+    }
 }
 
 fn board(prom: &[u8]) -> Board {
@@ -83,7 +94,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
             p.remap_banks(m);
         }
     }));
-    Board { phys: phys.phys.clone(), bus: phys, heart }
+    Board { phys: phys.phys.clone(), _release: Release(phys.phys.clone()), bus: phys, heart }
 }
 
 /// The PROM stores to its own variables at their cached flash addresses.
@@ -419,6 +430,7 @@ fn the_bridge_2gb_window_holds_its_registers_and_alias_runs() {
 fn a_run_above_16_mib_without_a_2gb_window_maps_nothing() {
     let ram = Arc::new(HeartRam::new([128, 0, 0, 0]));
     let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::dev::heart::host_clock()));
+    let _release = Release(ram.phys().clone());
     let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart), &PCI0);
     let p = Arc::new(Ip30Bus::new(ram));
     let dev: Arc<dyn BusDevice> = bridge;
@@ -455,6 +467,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
         ram.dma_view(),
         crate::disp::StatusSource::detached(),
     );
+    let _release = Release(ram.phys().clone());
     let id = widget_small_base(WIDGET_GFX) + 4;
     for (links, alive) in [(0x8100u16, false), (0x8100 | 1 << WIDGET_GFX, true)] {
         let xbow = Arc::new(Xbow::new(XBOW_REVISION, links));
