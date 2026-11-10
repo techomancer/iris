@@ -18,18 +18,19 @@ env:
 # Runner images match release.yml: ubuntu-24.04 (glibc floor), macos-26 (pinned
 # through GitHub's macos-15 -> macos-26 migration; arm64), windows-latest (x64).
 # fail-fast is off so one platform breaking still reports the others.
+#
+# Pull requests run Linux x86-64, Linux arm64 and Windows. macOS joins them on
+# pushes to main: its runners wait longest, and from 2026-10-13 to 2026-11-10
+# no pull request's macOS job failed on its code where Linux passed.
 jobs:
-  # Default features, every workspace crate, all three host platforms.
+  # Default features, every workspace crate.
   test:
-    name: Test (${{ matrix.name }})
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: linux,   os: ubuntu-24.04,   informational: false }
-          - { name: macos,   os: macos-26,       informational: true }
-          - { name: windows, os: windows-latest, informational: true }
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest"]' || '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest","macos-26"]') }}
     steps:
     - uses: actions/checkout@v5
     # rust-toolchain.toml pins nightly; `rustup show` installs it up front so a
@@ -56,34 +57,30 @@ jobs:
     - name: Test REX3 GPU matcher
       if: runner.os == 'Linux'
       run: cargo test -p iris --lib --features rex-gpu rex3_gpu::tests
-    # macOS and Windows test results are informational: a failure is reported
-    # (red step, annotation on the run) but does not fail the job or the
-    # workflow. Shared runners there are slower and noisier, and several tests
-    # read the wall clock. Their Build step above still gates; Linux gates on
-    # both.
     # The VPro fragment pipeline's SIMD kernels against their scalar
     # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
-    # lanes.rs): deterministic, so they gate everywhere. macos-26 is the
-    # only runner with NEON.
+    # lanes.rs): deterministic, so they gate everywhere. macos-26 and
+    # ubuntu-24.04-arm are the runners with NEON.
     - name: Run SIMD lane tests
       run: cargo test -p iris --lib the_lane_
+    # Only Linux x86-64 fails the job; the other platforms report a failure
+    # (a red step, which the API still counts as a pass) and carry on.
     - name: Run tests
-      continue-on-error: ${{ matrix.informational }}
+      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
       run: cargo test --workspace --verbose
 
   # The nightly/release CLI feature set (scripts/dist/lib.sh): a build check
   # only, so a platform-specific break in the Cranelift JITs or the lightning
-  # interpreter path turns CI red before a nightly does.
+  # interpreter path turns CI red before a nightly does. Pull requests build
+  # it on Linux x86-64 and Windows; main adds macOS. A build, not a check, so
+  # hostgl's link against the platform's GL is covered too.
   features:
-    name: Build release features (${{ matrix.name }})
+    name: Build release features (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: linux,   os: ubuntu-24.04 }
-          - { name: macos,   os: macos-26 }
-          - { name: windows, os: windows-latest }
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04","windows-latest"]' || '["ubuntu-24.04","windows-latest","macos-26"]') }}
     steps:
     - uses: actions/checkout@v5
     - name: Install pinned toolchain
