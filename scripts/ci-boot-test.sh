@@ -212,11 +212,18 @@ CHECK="graphics console: login screen"
 start_iris iris-gfx.log
 log "phase C: booting; deadline ${TIMEOUT}s"
 ic -q start
-if ic screen-wait "$GOLDEN" --timeout "$TIMEOUT" \
-     --actual gfx-screen.png --diff gfx-diff.png; then
+START=$(date +%s)
+# The last line screen-wait prints gives the pixel count, matched or not.
+if SAID=$(ic screen-wait "$GOLDEN" --timeout "$TIMEOUT" \
+            --actual gfx-screen.png --diff gfx-diff.png 2>&1); then
+  echo "$SAID"
   log "graphics login matches $(basename "$GOLDEN")"
+  check pass $(( $(date +%s) - START )) "$CHECK" "$(echo "$SAID" | tail -n 1)"
 else
+  echo "$SAID"
   log "graphics login does not match $(basename "$GOLDEN")"
+  check fail $(( $(date +%s) - START )) "$CHECK" "$(echo "$SAID" | tail -n 1)"
   RESULT=1
 fi
+check_quit "iris quits when asked, graphics boot"
 exit $RESULT
