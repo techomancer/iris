@@ -65,16 +65,6 @@ pub const PENDING_BANKS: usize = 2;
 /// lock, on the thread that wrote the register. All defaults do nothing, so a
 /// test or a partial machine implements only what it wires.
 pub trait HubHooks: Send + Sync {
-    /// PI_CPU_ENABLE of `slice` was stored, or cleared by a reset. The stock
-    /// PROM stores zero to its partner's enable after a failed liveness
-    /// handshake and never stores one; what the store does to the processor is
-    /// unknown. A machine that halts the processor on a cleared bit and
-    /// releases it on a set one is making that choice. Slices the node does not
-    /// populate are not reported.
-    fn cpu_enable(&self, _slice: usize, _enabled: bool) {}
-    /// A store to PI_NMI of `slice`: the processor takes a non-maskable
-    /// interrupt.
-    fn nmi(&self, _slice: usize) {}
     /// A store to PI_SOFTRESET reached the enabled processor `slice`.
     fn soft_reset(&self, _slice: usize) {}
     /// PI_CALIAS_SIZE was written: the cached-alias window of every processor
@@ -90,7 +80,7 @@ pub trait HubHooks: Send + Sync {
 use crate::dev::heart::Clock;
 use self::io::{Io, NodeFabric};
 use self::md::Md;
-use self::ni::{NetPeer, Ni, NiEvents};
+use self::ni::{NetPeer, Ni};
 use self::pi::Pi;
 use crate::devlog::LogModule;
 use crate::dev::w1;
@@ -101,7 +91,7 @@ use crate::xtalk::{HostPort, XtalkHost};
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK,
 };
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 /// What differs between Hubs: the processors the node populates, where its
@@ -168,61 +158,27 @@ const XIO_MEMORY_SIZE: u64 = 1 << 40;
 const XIO_INT_MODIFY: u64 = IO_REGISTERS_NAMED + pi::reg::INT_PEND_MOD;
 const XIO_IDENTITY: u64 = 0x0160_0000;
 
-// A slot of the claim map: which Hub answers a node number.
-const NOBODY: u8 = 0;
-const THIS_HUB: u8 = 1;
-const PEER_HUB: u8 = 2;
-
-/// The shell's end of the hooks: it keeps the cached-alias limit current, and
-/// passes everything on to the machine's.
-struct Hooks {
-    hub: Weak<Hub>,
-    machine: OnceLock<Arc<dyn HubHooks>>,
-}
-impl HubHooks for Hooks {
-    fn cpu_enable(&self, slice: usize, enabled: bool) {
-        if let Some(h) = self.machine.get() {
-            h.cpu_enable(slice, enabled);
-        }
-    }
-    fn nmi(&self, slice: usize) {
-        if let Some(h) = self.machine.get() {
-            h.nmi(slice);
-        }
-    }
-    fn soft_reset(&self, slice: usize) {
-        if let Some(h) = self.machine.get() {
-            h.soft_reset(slice);
-        }
-    }
-    fn cached_alias_changed(&self, bytes: u64) {
-        if let Some(hub) = self.hub.upgrade() {
-            hub.calias.store(bytes, Ordering::Release);
-        }
-        if let Some(h) = self.machine.get() {
-            h.cached_alias_changed(bytes);
-        }
-    }
-    fn node_number_changed(&self, number: u16) {
-        if let Some(h) = self.machine.get() {
-            h.node_number_changed(number);
-        }
-    }
-    fn machine_restart(&self) {
-        if let Some(h) = self.machine.get() {
-            h.machine_restart();
-        }
-    }
-}
-
-/// The network section tells the shell when the claim map must move.
-struct Remap(Weak<Hub>);
-impl NiEvents for Remap {
-    fn changed(&self) {
-        if let Some(hub) = self.0.upgrade() {
-            hub.remap();
-        }
-    }
+/// What a register write changed that the rest of the chip or the machine must
+/// act on. A unit returns it from its write, as the AMD flash engine returns
+/// its program effect, and the Hub acts on it once the unit's lock is
+/// released: a unit holds no reference to a sibling and no closure.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Effect {
+    #[default]
+    None,
+    /// NI_STATUS_REV_ID changed the node number this Hub answers to.
+    NodeNumber(u16),
+    /// A vector request from this Hub's port changed the neighbour's node
+    /// number.
+    PeerNodeNumber(u16),
+    /// PI_CALIAS_SIZE changed the cached-alias window to this many bytes.
+    CachedAlias(u64),
+    /// PI_SOFTRESET reached the enabled processors flagged here.
+    SoftReset([bool; 2]),
+    /// NI_PORT_RESET asked to restart the whole machine.
+    Restart,
+    /// A control write launched a block-transfer engine.
+    Bte(usize, io::Bte),
 }
 
 /// What another Hub needs of this node: its spaces and its interrupt
@@ -230,6 +186,9 @@ impl NiEvents for Remap {
 struct NodeView {
     spaces: [OnceLock<Arc<dyn BusDevice>>; SPACES],
     pi: Arc<Pi>,
+    /// The machine's hooks for this node, shared with its Hub: a neighbour
+    /// that renumbers this node over the cable tells them.
+    machine: Arc<OnceLock<Arc<dyn HubHooks>>>,
 }
 
 /// The register window's sections. Kept apart from the Hub's address decode
@@ -269,14 +228,15 @@ impl Regs {
         }
     }
 
-    fn section_write(&self, off: u64, value: u64, size: u32) {
+    fn section_write(&self, off: u64, value: u64, size: u32) -> Effect {
         match off {
-            ..pi::END => self.pi.write_sized(off, value, size),
+            ..pi::END => return self.pi.write_sized(off, value, size),
             md::START..md::END => self.md.write(off, value),
-            io::START..io::END => self.io.write(off, value),
-            ni::START..ni::END => self.ni.write(off, value),
+            io::START..io::END => return self.io.write(off, value),
+            ni::START..ni::END => return self.ni.write(off, value),
             _ => crate::dlog!(LogModule::Hub, "Hub: write of {value:#x} to unimplemented register {off:#x}"),
         }
+        Effect::None
     }
 
     /// The narrow device over an offset, for the I2C controller mapped over
@@ -295,9 +255,6 @@ pub struct Hub {
     regs: Arc<Regs>,
     /// What answers each space of this node, addressed from the node's base.
     view: Arc<NodeView>,
-    /// Which Hub answers each node number, derived from the programmed node
-    /// numbers when one changes, never from a flag tested per access.
-    claims: [AtomicU8; 256],
     /// The Hub across the CrayLink cable, as its spaces and interrupts. Written
     /// once when the cable is fitted, so an access to it takes no lock and
     /// touches no reference count.
@@ -305,7 +262,9 @@ pub struct Hub {
     /// Bytes the cached alias spans: the processor view's node-zero memory
     /// below it stays on this node.
     calias: AtomicU64,
-    hooks: Arc<Hooks>,
+    /// The machine's side of the node: processors, the cached alias and
+    /// restart. Shared with the view a neighbour holds.
+    machine: Arc<OnceLock<Arc<dyn HubHooks>>>,
     weak: Weak<Hub>,
 }
 
@@ -319,15 +278,11 @@ impl std::ops::Deref for Hub {
 impl Hub {
     pub fn new(cfg: HubConfig, clock: Clock) -> Arc<Self> {
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
-            let hooks = Arc::new(Hooks { hub: weak.clone(), machine: OnceLock::new() });
+            let machine = Arc::new(OnceLock::new());
             let pi = Pi::new(cfg.cpus, cfg.cpu_base, clock.clone());
-            let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone() });
+            let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone(), machine: machine.clone() });
             let ni = Arc::new(Ni::new(cfg.ni_revision));
-            pi.set_hooks(hooks.clone());
-            ni.set_hooks(hooks.clone());
-            ni.set_events(Arc::new(Remap(weak.clone())));
             let io = Io::new(cfg.widget_revision, cfg.manufacturer);
-            io.set_fabric(weak.clone() as Weak<dyn NodeFabric>);
             let regs = Arc::new(Regs {
                 pi,
                 md: Md::new(clock, cfg.slot),
@@ -338,14 +293,12 @@ impl Hub {
             Self {
                 regs,
                 view,
-                claims: std::array::from_fn(|_| AtomicU8::new(NOBODY)),
                 peer: OnceLock::new(),
                 calias: AtomicU64::new(pi::calias_bytes(15)),
-                hooks,
+                machine,
                 weak: weak.clone(),
             }
         });
-        hub.remap();
         hub
     }
 
@@ -404,7 +357,45 @@ impl Hub {
     /// The machine's side of the node: processors, the cached alias and
     /// restart.
     pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
-        let _ = self.hooks.machine.set(hooks);
+        let _ = self.machine.set(hooks);
+    }
+
+    /// Act on what a register write changed, now that the unit that made it
+    /// has let go of its lock. The machine's hook is the last thing called.
+    fn apply(&self, effect: Effect) {
+        let machine = self.machine.get();
+        match effect {
+            Effect::None => {}
+            Effect::NodeNumber(number) => {
+                if let Some(h) = machine {
+                    h.node_number_changed(number);
+                }
+            }
+            Effect::PeerNodeNumber(number) => {
+                if let Some(h) = self.peer.get().and_then(|peer| peer.machine.get()) {
+                    h.node_number_changed(number);
+                }
+            }
+            Effect::CachedAlias(bytes) => {
+                self.calias.store(bytes, Ordering::Release);
+                if let Some(h) = machine {
+                    h.cached_alias_changed(bytes);
+                }
+            }
+            Effect::SoftReset(slices) => {
+                if let Some(h) = machine {
+                    for slice in (0..2).filter(|&i| slices[i]) {
+                        h.soft_reset(slice);
+                    }
+                }
+            }
+            Effect::Restart => {
+                if let Some(h) = machine {
+                    h.machine_restart();
+                }
+            }
+            Effect::Bte(engine, launch) => self.io.run_bte(engine, launch, self),
+        }
     }
 
     /// Register the sections' state locks with the `locks` monitor command.
@@ -434,31 +425,19 @@ impl Hub {
         b.ni.connect_peer(Some(Arc::downgrade(&a.ni) as Weak<dyn NetPeer>));
     }
 
-    /// Re-derive which Hub answers each node number. This Hub always answers
-    /// for its own first: while two Hubs both hold the reset value zero, each
-    /// keeps zero for itself. A number no reachable Hub holds fails.
-    pub fn remap(&self) {
-        let own = self.ni.number();
-        let peer = self.ni.neighbour_number();
-        for number in 0..256u16 {
-            let slot = if number == own {
-                THIS_HUB
-            } else if peer == Some(number) {
-                PEER_HUB
-            } else {
-                NOBODY
-            };
-            self.claims[usize::from(number)].store(slot, Ordering::Release);
-        }
-    }
-
-    /// Run `f` on the Hub the node number names. The Hub is itself in the
-    /// common case, and the peer is looked up only across the cable.
+    /// Run `f` on the Hub the node number names. This Hub always answers for
+    /// its own first: while two Hubs both hold the reset value zero, each
+    /// keeps zero for itself. The peer is looked up only across the cable, and
+    /// a number no reachable Hub holds fails. Both numbers are the network
+    /// unit's own mirrors, so the decode takes no lock.
     fn with_node<R>(&self, number: u8, f: impl FnOnce(&NodeView) -> R) -> Option<R> {
-        match self.claims[usize::from(number)].load(Ordering::Acquire) {
-            THIS_HUB => Some(f(&self.view)),
-            PEER_HUB => self.peer.get().map(|peer| f(peer)),
-            _ => None,
+        let number = u16::from(number);
+        if number == self.ni.number() {
+            Some(f(&self.view))
+        } else if self.ni.neighbour_number() == Some(number) {
+            self.peer.get().map(|peer| f(peer))
+        } else {
+            None
         }
     }
 
@@ -491,7 +470,7 @@ impl Hub {
     /// widgets' small windows, the Hub's own registers at both offsets, and
     /// the seven big windows.
     pub fn io_space(self: &Arc<Self>) -> Arc<dyn BusDevice> {
-        Arc::new(IoSpace { regs: self.regs.clone(), small: self.io.small_windows(), big: self.io.big_windows() })
+        Arc::new(IoSpace { hub: self.weak.clone(), regs: self.regs.clone(), small: self.io.small_windows(), big: self.io.big_windows() })
     }
 
     /// This Hub as the XIO host a Bridge sends to, addressed as `widget`: DMA
@@ -615,6 +594,9 @@ impl BusDevice for View {
 
 /// The node's I/O space.
 struct IoSpace {
+    /// The Hub, for the effect of a register write. Weak: the Hub owns its
+    /// spaces.
+    hub: Weak<Hub>,
     regs: Arc<Regs>,
     small: Arc<dyn BusDevice>,
     big: Arc<dyn BusDevice>,
@@ -639,7 +621,11 @@ macro_rules! io_access {
         }
         fn $w(&self, a: u64, v: $t) -> u32 {
             if let Some(off) = Self::registers(a) {
-                self.regs.$w(off, v)
+                // Through the Hub, which acts on what the write changed.
+                match self.hub.upgrade() {
+                    Some(hub) => hub.$w(off, v),
+                    None => BUS_ERR,
+                }
             } else if a >= IO_BIG_WINDOWS {
                 self.big.$w(a - IO_BIG_WINDOWS, v)
             } else {
@@ -831,7 +817,7 @@ impl NodeFabric for Hub {
     }
 }
 
-/// The register window. The I2C controller and the bring-up UART take every
+/// The register window. The I2C controller takes every
 /// width, one register access each: the stock PROM polls the controller's
 /// status with 8-byte loads. Elsewhere it takes 4- and 8-byte accesses. A 32-bit
 /// access names half of the aligned doubleword, offset 0 carrying bits 63:32
@@ -841,42 +827,27 @@ impl NodeFabric for Hub {
 /// 32-bit read of a read-to-clear register returns its half without clearing
 /// it: what hardware does for the narrower access is unknown, and this keeps
 /// a latch until software has read all of it.
-impl BusDevice for Regs {
-    fn read64(&self, a: u64) -> BusRead64 {
+///
+/// A write to a register returns what it changed ([`Effect`]) beside the bus
+/// status, for the Hub to act on once the unit's lock is released; the
+/// narrow writes reach only the I2C controller and change nothing else.
+impl Regs {
+    fn store64(&self, a: u64, v: u64) -> (u32, Effect) {
         if a & 7 != 0 || a >= WINDOW_SIZE {
-            return BusRead64::err();
+            return (BUS_ERR, Effect::None);
         }
         if let Some((dev, at)) = self.overlay(a) {
-            return dev.read64(at);
+            return (dev.write64(at, v), Effect::None);
         }
-        BusRead64::ok(self.section_read(a, true))
+        (BUS_OK, self.section_write(a, v, 8))
     }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        if a & 7 != 0 || a >= WINDOW_SIZE {
-            return BUS_ERR;
-        }
-        if let Some((dev, at)) = self.overlay(a) {
-            return dev.write64(at, v);
-        }
-        self.section_write(a, v, 8);
-        BUS_OK
-    }
-    fn read32(&self, a: u64) -> BusRead32 {
+
+    fn store32(&self, a: u64, v: u32) -> (u32, Effect) {
         if a & 3 != 0 || a >= WINDOW_SIZE {
-            return BusRead32::err();
+            return (BUS_ERR, Effect::None);
         }
         if let Some((dev, at)) = self.overlay(a & !7) {
-            return dev.read32(at + (a & 7));
-        }
-        let value = self.section_read(a & !7, false);
-        BusRead32::ok(if a & 4 != 0 { value as u32 } else { (value >> 32) as u32 })
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        if a & 3 != 0 || a >= WINDOW_SIZE {
-            return BUS_ERR;
-        }
-        if let Some((dev, at)) = self.overlay(a & !7) {
-            return dev.write32(at + (a & 7), v);
+            return (dev.write32(at + (a & 7), v), Effect::None);
         }
         let aligned = a & !7;
         let mut merged = if matches!(aligned, pi::reg::INT_PEND_MOD | ni::reg::PORT_ERROR) {
@@ -889,8 +860,29 @@ impl BusDevice for Regs {
         } else {
             (merged & 0xffff_ffff) | (u64::from(v) << 32)
         };
-        self.section_write(aligned, merged, 4);
-        BUS_OK
+        (BUS_OK, self.section_write(aligned, merged, 4))
+    }
+}
+
+impl BusDevice for Regs {
+    fn read64(&self, a: u64) -> BusRead64 {
+        if a & 7 != 0 || a >= WINDOW_SIZE {
+            return BusRead64::err();
+        }
+        if let Some((dev, at)) = self.overlay(a) {
+            return dev.read64(at);
+        }
+        BusRead64::ok(self.section_read(a, true))
+    }
+    fn read32(&self, a: u64) -> BusRead32 {
+        if a & 3 != 0 || a >= WINDOW_SIZE {
+            return BusRead32::err();
+        }
+        if let Some((dev, at)) = self.overlay(a & !7) {
+            return dev.read32(at + (a & 7));
+        }
+        let value = self.section_read(a & !7, false);
+        BusRead32::ok(if a & 4 != 0 { value as u32 } else { (value >> 32) as u32 })
     }
     fn read8(&self, a: u64) -> BusRead8 {
         match self.overlay(a & !7) {
@@ -928,25 +920,37 @@ macro_rules! delegate {
         }
     };
 }
+macro_rules! delegate_store {
+    ($r:ident, $w:ident, $store:ident, $t:ty, $out:ident) => {
+        fn $r(&self, a: u64) -> $out {
+            self.regs.$r(a)
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            let (status, effect) = self.regs.$store(a, v);
+            self.apply(effect);
+            status
+        }
+    };
+}
 /// The Hub as the register window a machine maps.
 impl BusDevice for Hub {
     delegate!(read8, write8, u8, BusRead8);
     delegate!(read16, write16, u16, BusRead16);
-    delegate!(read32, write32, u32, BusRead32);
-    delegate!(read64, write64, u64, BusRead64);
+    delegate_store!(read32, write32, store32, u32, BusRead32);
+    delegate_store!(read64, write64, store64, u64, BusRead64);
 }
 
 impl Resettable for Hub {
-    /// Every register returns to its reset value and the claim map re-derives
-    /// from the node numbers. The error stack addresses, the memory behind the
-    /// node and the one-wire part's contents survive.
+    /// Every register returns to its reset value, the node holds number zero
+    /// again and the machine is told so. The error stack addresses, the memory
+    /// behind the node and the one-wire part's contents survive.
     fn power_on(&self) {
         self.pi.power_on();
         self.md.power_on();
         self.io.power_on();
         self.ni.power_on();
         self.calias.store(self.pi.calias_bytes(), Ordering::Release);
-        self.remap();
+        self.apply(Effect::NodeNumber(self.ni.number()));
     }
 }
 

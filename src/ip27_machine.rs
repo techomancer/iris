@@ -314,12 +314,6 @@ impl Hooks {
     }
 }
 impl HubHooks for Hooks {
-    fn cpu_enable(&self, slice: usize, enabled: bool) {
-        crate::dlog!(LogModule::Hub, "{}: PI_CPU_ENABLE {slice} = {enabled} (no effect on the processor)", self.name);
-    }
-    fn nmi(&self, slice: usize) {
-        crate::dlog!(LogModule::Hub, "{}: NMI to slice {slice} (not delivered)", self.name);
-    }
     fn soft_reset(&self, _slice: usize) {
         if let Some(cpu) = self.cpu.upgrade() {
             cpu.as_device().signal(Signal::Reset(true));
