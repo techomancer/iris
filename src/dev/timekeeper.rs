@@ -12,6 +12,7 @@
 
 use crate::traits::{BusDevice, BusRead8, Device, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
+use crate::dev::battery_clock::{self, unix_now};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -265,9 +266,7 @@ impl Timekeeper {
         image[CONTROL + 5] = bcd(c.day);
         image[CONTROL + 6] = bcd(c.month);
         image[CONTROL + 7] = bcd(c.year);
-        let mut reference = [0; 16];
-        reference[..8].copy_from_slice(MAGIC);
-        reference[8..].copy_from_slice(&saved_at.to_le_bytes());
+        let reference = battery_clock::encode(MAGIC, saved_at, None).try_into().unwrap();
         (image, reference)
     }
     /// Export the exact raw image and companion clock reference, without changing RAM.
@@ -299,10 +298,9 @@ impl Timekeeper {
         st.stopped = None;
         if let Some(c) = saved_calendar(image) {
             let stopped = image[0x7ff9] & 0x80 != 0;
-            let elapsed = reference.filter(|r| &r[..8] == MAGIC).map_or(0, |r| {
-                now.saturating_sub(i64::from_le_bytes(r[8..16].try_into().unwrap()))
-                    .max(0)
-            });
+            let elapsed = reference
+                .and_then(|r| battery_clock::decode(r, MAGIC, false))
+                .map_or(0, |r| r.elapsed(now));
             let epoch = (c.seconds()
                 + if stopped {
                     0
@@ -322,7 +320,7 @@ impl Timekeeper {
     }
     /// Bind a raw store and its `.clock` companion. Validate both before creating either.
     pub fn set_nvram_file(&self, path: &Path) -> Result<(), String> {
-        let clock_path = PathBuf::from(format!("{}.clock", path.display()));
+        let clock_path = battery_clock::companion(path);
         let image = match std::fs::read(path) {
             Ok(v) => Some(v),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -370,17 +368,12 @@ impl Timekeeper {
             use std::io::Write;
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(format!("{}.clock", path.display()))
+                .open(battery_clock::companion(path))
                 .and_then(|mut f| f.write_all(&reference))
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
-}
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 impl BusDevice for Timekeeper {
     fn read8(&self, addr: u64) -> BusRead8 {
