@@ -321,6 +321,176 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     });
 }
 
+const WIDGET_PIPE: u8 = 8;
+
+fn onyx2_with(dir: &Path, nodes: u8, board: crate::config::GraphicsBoard) -> MachineConfig {
+    let mut cfg = config(ONYX2_PROFILE, dir, nodes);
+    cfg.graphics.board = Some(board);
+    cfg
+}
+
+/// A store to the pipe's aperture through a Hub's I/O space, retried while
+/// the pipe's ring is full.
+fn pipe_store(hub: &Arc<Hub>, off: u64, v: u32) {
+    let io = hub.claim(Space::Io);
+    for _ in 0..1_000_000 {
+        match io.write32((u64::from(WIDGET_PIPE) << 24) + off, v) {
+            crate::traits::BUS_BUSY => std::thread::yield_now(),
+            status => return assert_eq!(status, BUS_OK, "store of {v:#x} at {off:#x}"),
+        }
+    }
+    panic!("the pipe stayed busy");
+}
+
+fn pipe_commands(hub: &Arc<Hub>, words: &[u32]) {
+    for &w in words {
+        pipe_store(hub, 0xc1_0000, w);
+    }
+}
+
+#[test]
+fn the_onyx2_layout_puts_the_pipe_where_the_test_widget_stood() {
+    assert_eq!(ONYX2.graphics_widget, Some(WIDGET_PIPE));
+}
+
+#[test]
+fn a_two_node_onyx2_builds_with_a_pipe_that_answers_its_widget_identity() {
+    use crate::config::GraphicsBoard;
+    big_stack(|| {
+        for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2x2] {
+            let dir = Scratch::new("pipe");
+            let m = DesksideMachine::new(&onyx2_with(&dir.0, 2, board)).unwrap();
+            assert!(m.pipe().is_some());
+            assert!(crate::workstation::Workstation::get_display(&m).is_some());
+            for node in 0..2 {
+                let io = m.node_at(node).hub.claim(Space::Io);
+                let id = io.read32((u64::from(WIDGET_PIPE) << 24) + 4);
+                assert_eq!(id.status, BUS_OK, "{board:?} from node {node}");
+                // Revision in the top nibble; part, manufacturer and the
+                // presence bit under it.
+                assert_eq!(id.data & 0x0fff_ffff, 0x0c10_2555, "{board:?} from node {node}");
+                assert_ne!(id.data, TEST_WIDGET_ID);
+            }
+        }
+    });
+}
+
+#[test]
+fn without_a_board_the_graphics_slot_holds_the_test_widget() {
+    big_stack(|| {
+        let (_dir, m) = built(ONYX2_PROFILE, "nopipe", 1);
+        assert!(m.pipe().is_none());
+        assert!(crate::workstation::Workstation::get_display(&m).is_none());
+    });
+}
+
+#[test]
+fn the_pipe_names_its_boards_by_the_graphics_key() {
+    use crate::config::GraphicsBoard;
+    for (name, board) in [("ir2", GraphicsBoard::Ir2), ("ir2:1rm", GraphicsBoard::Ir2), ("ir2:2rm", GraphicsBoard::Ir2x2)] {
+        assert_eq!(name.parse::<GraphicsBoard>(), Ok(board), "{name}");
+    }
+    for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2x2] {
+        assert!(board.supports(MachineProfile::Onyx2Ip27));
+        for other in [MachineProfile::OctaneIp30, MachineProfile::Origin2000Ip27, MachineProfile::Origin200Ip29, MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22] {
+            assert!(!board.supports(other), "{board:?} on {other:?}");
+        }
+        assert_eq!(board.as_str().parse::<GraphicsBoard>(), Ok(board));
+    }
+    assert_eq!(GraphicsBoard::Ir2.rm_count(), Some(1));
+    assert_eq!(GraphicsBoard::Ir2x2.rm_count(), Some(2));
+}
+
+/// The 2E fits the deskside under the names `ir2e` and `ir2e:2rm`.
+#[test]
+fn the_deskside_takes_the_2e() {
+    use crate::config::{GraphicsBoard, MachineConfig};
+    for (name, board, rms) in [("ir2e", GraphicsBoard::Ir2e, 1), ("ir2e:2rm", GraphicsBoard::Ir2ex2, 2)] {
+        assert_eq!(name.parse::<GraphicsBoard>(), Ok(board), "{name}");
+        assert_eq!(board.rm_count(), Some(rms));
+        assert!(board.supports(MachineProfile::Onyx2Ip27), "{name}");
+        assert_eq!(board.as_str(), name);
+    }
+    let mut cfg = MachineConfig::default();
+    cfg.machine.profile = MachineProfile::Onyx2Ip27;
+    cfg.graphics.board = Some(GraphicsBoard::Ir2e);
+    assert!(cfg.validate().is_ok());
+}
+
+/// The pipe's DMA and interrupt packets reach the Hub at the widget the
+/// guest programs into it. Each packet sets its vector's pending bit; the
+/// pipe never clears one, so a second packet after the handler cleared the
+/// bit raises it again.
+#[test]
+fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
+    use crate::dev::hub::reg::pi;
+    use crate::traits::Device;
+    const WIDGET_CONTROL: u64 = 0x24;
+    const INT_DEST_UPPER: u64 = 0x34;
+    const INT_DEST_LOWER: u64 = 0x3c;
+    const INT_VECTORS: u64 = 0x5c;
+    const INT_CAUSE: u64 = 0x80_0238;
+    const GE_VECTOR: u32 = 0x11;
+    const REASON_PAGE: u64 = 0x30_0000;
+    big_stack(|| {
+        let dir = Scratch::new("route");
+        let m = DesksideMachine::new(&onyx2_with(&dir.0, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let pipe = m.pipe().unwrap().clone();
+        pipe.start();
+        let memory = |i: usize| m.node_at(i).memory.physical().read32(REASON_PAGE).data;
+        let pending = |i: usize| m.node_at(i).hub.read64(pi::INT_PEND0).data;
+        let post = |hub: &Arc<Hub>| {
+            pipe_commands(hub, &[0x1f8, 0x103]);
+            pipe.quiesce();
+            pipe.resume();
+        };
+
+        // Node slot 2 is widget 9 and node slot 1 is widget 10.
+        for (widget, node, other) in [(9u32, 1usize, 0usize), (10, 0, 1)] {
+            let from = &m.node_at(other).hub;
+            pipe_store(from, WIDGET_CONTROL, widget << 22);
+            pipe_store(from, INT_DEST_UPPER, widget << 16 | 0x8000);
+            pipe_store(from, INT_DEST_LOWER, 0x180_0090);
+            pipe_store(from, INT_VECTORS, 0x3e_2210);
+            pipe_commands(from, &[0x1f1, 0x1000_0000 | (REASON_PAGE >> 12) as u32, (REASON_PAGE & 0xfff) as u32, 0x4000]);
+
+            post(from);
+            assert_eq!(memory(node), 0x103, "widget {widget}: the named node did not get the reason");
+            assert_eq!(memory(other), 0, "widget {widget}: the other node saw it");
+            assert_eq!(pending(node) & 1 << GE_VECTOR, 1 << GE_VECTOR, "widget {widget}");
+            assert_eq!(pending(other) & 1 << GE_VECTOR, 0, "widget {widget}: the other node heard it");
+
+            // The handler acknowledges the cause and clears the pending bit;
+            // the next reason raises it again.
+            pipe_store(from, INT_CAUSE, 0x20);
+            assert_eq!(m.node_at(node).hub.write64(pi::INT_PEND_MOD, u64::from(GE_VECTOR)), BUS_OK);
+            assert_eq!(pending(node) & 1 << GE_VECTOR, 0);
+            // The pipe holds the next reason until the driver clears the page word.
+            assert_eq!(m.node_at(node).memory.physical().write32(REASON_PAGE, 0), BUS_OK);
+            post(from);
+            assert_eq!(pending(node) & 1 << GE_VECTOR, 1 << GE_VECTOR, "widget {widget}: the second packet");
+            assert_eq!(m.node_at(node).hub.write64(pi::INT_PEND_MOD, u64::from(GE_VECTOR)), BUS_OK);
+            pipe_store(from, INT_CAUSE, 0x20);
+            assert_eq!(m.node_at(node).memory.physical().write32(REASON_PAGE, 0), BUS_OK);
+        }
+        pipe.stop();
+    });
+}
+
+#[test]
+fn a_dropped_machine_frees_its_pipe() {
+    big_stack(|| {
+        let dir = Scratch::new("droppipe");
+        let m = DesksideMachine::new(&onyx2_with(&dir.0, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let pipe = Arc::downgrade(m.pipe().unwrap());
+        let hub = Arc::downgrade(&m.node_at(0).hub);
+        crate::traits::Device::start(&**m.pipe().unwrap());
+        drop(m);
+        assert_eq!(pipe.strong_count(), 0, "the pipe");
+        assert_eq!(hub.strong_count(), 0, "the Hub");
+    });
+}
+
 /// With an I/O PROM image named, the Bridge's flash window at widget offset
 /// 0xc0_0000 shows it, and without one nothing answers there.
 #[test]

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
 use crate::cpu::parts::{self, Part};
+use crate::dev::kona::KonaProduct;
 
 /// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
 /// which of them a machine takes.
@@ -943,8 +944,21 @@ pub enum GraphicsBoard {
     /// takes the Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
     V12,
+    /// InfiniteReality2 with one raster manager (`src/dev/kona`). Onyx2 only.
+    #[clap(name = "ir2", alias = "ir2:1rm", alias = "ir2_1rm", alias = "infinitereality2")]
+    Ir2,
+    /// InfiniteReality2 with two raster managers. Onyx2 only.
+    #[clap(name = "ir2:2rm", alias = "ir2_2rm", alias = "ir2x2")]
+    Ir2x2,
+    /// InfiniteReality2E (GE16-4, RM9, 64 MB texture) with one raster manager.
+    /// Onyx2 only.
+    #[clap(name = "ir2e")]
+    Ir2e,
+    /// InfiniteReality2E with two raster managers. Onyx2 only.
+    #[clap(name = "ir2e:2rm")]
+    Ir2ex2,
     /// No graphics board: the machine runs on its serial console. Octane
-    /// and Fuel.
+    /// Fuel and the IP27 machines.
     #[clap(name = "none")]
     None,
 }
@@ -971,6 +985,10 @@ impl GraphicsBoard {
             Self::V8 => "VPro V8",
             Self::V10 => "VPro V10",
             Self::V12 => "VPro V12",
+            Self::Ir2 => "InfiniteReality2 (1 RM)",
+            Self::Ir2x2 => "InfiniteReality2 (2 RM)",
+            Self::Ir2e => "InfiniteReality2E (1 RM)",
+            Self::Ir2ex2 => "InfiniteReality2E (2 RM)",
             Self::None => "None",
         }
     }
@@ -987,6 +1005,10 @@ impl GraphicsBoard {
             Self::V8 => "v8",
             Self::V10 => "v10",
             Self::V12 => "v12",
+            Self::Ir2 => "ir2",
+            Self::Ir2x2 => "ir2:2rm",
+            Self::Ir2e => "ir2e",
+            Self::Ir2ex2 => "ir2e:2rm",
             Self::None => "none",
         }
     }
@@ -1000,17 +1022,40 @@ impl GraphicsBoard {
         matches!(self, Self::V6 | Self::V8 | Self::V10 | Self::V12)
     }
 
+    /// The InfiniteReality boards (`src/dev/kona`).
+    pub fn is_kona(self) -> bool {
+        self.kona().is_some()
+    }
+
+    /// The product and raster manager count of an InfiniteReality board.
+    pub fn kona(self) -> Option<(KonaProduct, u32)> {
+        match self {
+            Self::Ir2 => Some((KonaProduct::Ir2, 1)),
+            Self::Ir2x2 => Some((KonaProduct::Ir2, 2)),
+            Self::Ir2e => Some((KonaProduct::Ir2e, 1)),
+            Self::Ir2ex2 => Some((KonaProduct::Ir2e, 2)),
+            _ => None,
+        }
+    }
+
+    /// The raster managers an InfiniteReality board carries.
+    pub fn rm_count(self) -> Option<u32> {
+        self.kona().map(|(_, rms)| rms)
+    }
+
     /// Whether `validate()` accepts this board on `profile`. The Octane
     /// models only IMPACT (High as the SI with texture option, Maximum as
-    /// the MXI) or no board.
+    /// the MXI), VPro or no board. The Onyx2 takes an InfiniteReality2 or
+    /// none.
     pub fn supports(self, profile: MachineProfile) -> bool {
         match profile {
             MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
+            MachineProfile::Onyx2Ip27 => self.is_kona() || self == Self::None,
             p if p.is_ip27() => self == Self::None,
             MachineProfile::FuelIp34 => matches!(self, Self::V10 | Self::V12 | Self::None),
             MachineProfile::TezroIp53 => matches!(self, Self::None | Self::V12),
-            MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
-            _ => !self.is_vpro() && !matches!(self, Self::Extreme | Self::None),
+            MachineProfile::Indigo2Ip22 => !self.is_vpro() && !self.is_kona() && self != Self::None,
+            _ => !self.is_vpro() && !self.is_kona() && !matches!(self, Self::Extreme | Self::None),
         }
     }
 
@@ -1041,9 +1086,13 @@ impl std::str::FromStr for GraphicsBoard {
             "v8" | "vpro:v8" | "vpro_v8" | "vpro-v8" => Ok(Self::V8),
             "v10" | "vpro:v10" | "vpro_v10" | "vpro-v10" => Ok(Self::V10),
             "v12" | "vpro:v12" | "vpro_v12" | "vpro-v12" => Ok(Self::V12),
+            "ir2" | "ir2:1rm" | "ir2_1rm" | "ir2-1rm" | "infinitereality2" => Ok(Self::Ir2),
+            "ir2:2rm" | "ir2_2rm" | "ir2-2rm" | "ir2x2" => Ok(Self::Ir2x2),
+            "ir2e" => Ok(Self::Ir2e),
+            "ir2e:2rm" => Ok(Self::Ir2ex2),
             "none" => Ok(Self::None),
             _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, none)"
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, ir2, ir2:2rm, ir2e, ir2e:2rm, none)"
             )),
         }
     }
@@ -1110,6 +1159,11 @@ pub struct GraphicsSection {
     /// `dx12` or `gl`.
     #[serde(default = "default_gpu_backend")]
     pub gpu_backend: String,
+    /// InfiniteReality2: the file that keeps the pipe's flash EEPROM between
+    /// runs, exactly the flash's size; created blank when absent. Unset
+    /// means volatile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash: Option<String>,
 }
 
 /// What draws the host window (`renderer`, `--renderer`).
@@ -1154,6 +1208,7 @@ impl Default for GraphicsSection {
             tile: default_graphics_tile(),
             raster: RasterUnit::Cpu,
             gpu_backend: default_gpu_backend(),
+            flash: None,
         }
     }
 }
@@ -2911,6 +2966,8 @@ impl MachineConfig {
             if !board.supports(self.machine.profile) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
                     format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
+                } else if self.machine.profile == MachineProfile::Onyx2Ip27 {
+                    format!("graphics.board \"{name}\" is not modelled on the Onyx2 (valid: ir2, ir2:2rm, ir2e, ir2e:2rm, none)")
                 } else if let Some(product) = self.machine.profile.ip27_name() {
                     format!("graphics.board \"{name}\" is not modelled on the {product} (valid: none)")
                 } else if self.machine.profile == MachineProfile::FuelIp34 {
