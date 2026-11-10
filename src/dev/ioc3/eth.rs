@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use crate::dev::ioc3::port::Ioc3EthPort;
 use crate::dev::ics1890::Ics1890;
+use crate::dev::mii::MiiPhy;
 use crate::pci::{PciDma, PciDmaStatus};
 use crate::snapshot::{field, field_bool, field_u16, field_u32, field_u32s, field_u64, StateTable};
 use crate::traits::{Device, Resettable, Saveable};
@@ -160,23 +161,6 @@ pub const PHY_ADDR: u8 = 1;
 pub const ORIGIN200_PHY_ADDR: u8 = 31;
 /// How long the synthetic link partner takes to complete negotiation.
 pub const NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
-
-/// The management and packet-path behavior that varies between IOC3 PHYs.
-pub(crate) trait MiiPhy: Send {
-    fn address(&self) -> u8;
-    fn deadline(&self) -> Option<Instant>;
-    fn wire_enabled(&self) -> bool;
-    fn in_loopback(&self) -> bool;
-    fn sync(&mut self, now: Instant);
-    fn read(&mut self, register: u8, now: Instant) -> u16;
-    fn write(&mut self, register: u8, value: u16, now: Instant);
-    fn set_backend_link(&mut self, up: bool, now: Instant);
-    fn power_on(&mut self);
-    /// The transceiver's registers and negotiation progress for a snapshot;
-    /// its deadline is saved as the time it had left.
-    fn save_state(&self, now: Instant) -> toml::Value;
-    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String>;
-}
 
 fn ridx(off: u32) -> usize {
     ((off - MAC_CONTROL) / 4) as usize
