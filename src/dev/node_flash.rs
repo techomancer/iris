@@ -8,9 +8,10 @@
 //! 64-bit write with chip byte N at bus offset 8N. Both reach the same bytes
 //! and the same command state.
 //!
-//! The part is not identified. The geometry, the manufacturer and device
-//! codes (0x01, 0xd5) and the unlock addresses (0x5555, 0x2aaa) are the ones
-//! the QEMU model uses. Approximations:
+//! The command set is the shared AMD engine ([`super::sflash::amd`]) at this
+//! part's [`GEOMETRY`]. The part is not identified. The geometry, the
+//! manufacturer and device codes (0x01, 0xd5) and the unlock addresses
+//! (0x5555, 0x2aaa) are the ones the node PROM's flash commands need. Approximations:
 //!
 //! * Program and sector erase complete inside the write that starts them, so
 //!   a status poll finds the finished data and no toggle ever shows.
@@ -30,6 +31,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::sflash::amd::{AmdCore, Effect, Geometry, Identity};
 use super::sflash::storage::FlashBacking;
 
 pub const SIZE: usize = 1 << 20;
@@ -149,34 +151,38 @@ pub fn initial_image(payload: &[u8], values: &FlashValues) -> Result<Vec<u8>, St
     Ok(f)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
-    Array,
-    Unlock1,
-    Unlock2,
-    Program,
-    Erase1,
-    Erase2,
-    Erase3,
-    Identify,
-}
+/// The part, to the command engine: 1 MiB, byte-wide, sixteen sectors.
+const GEOMETRY: Geometry = Geometry {
+    x8: true,
+    sector_size: SECTOR_SIZE,
+    sectors: SIZE / SECTOR_SIZE,
+    unlock: [UNLOCK_1, UNLOCK_2],
+    address_mask: usize::MAX,
+    // Manufacturer, device and "sector not protected", then erased bytes.
+    identity: Identity { codes: [MANUFACTURER as u16, DEVICE as u16, 0], other: 0xff },
+    cfi: false,
+    read_only: false,
+    // Program and sector erase complete inside the write that starts them.
+    timed_erase: false,
+    unlock_from_identify: true,
+    log: LogModule::Hub,
+};
 
 struct State {
     data: Vec<u8>,
-    mode: Mode,
+    core: AmdCore,
     backing: Option<FlashBacking>,
 }
 
 impl State {
-    fn read(&self, off: usize) -> u8 {
-        match self.mode {
-            Mode::Identify => match off & 0xff {
-                0 => MANUFACTURER,
-                1 => DEVICE,
-                2 => 0, // sector not protected
-                _ => 0xff,
-            },
-            _ => self.data[off],
+    fn new(data: Vec<u8>, backing: Option<FlashBacking>) -> Self {
+        Self { data, core: AmdCore::new(GEOMETRY), backing }
+    }
+
+    fn read(&mut self, off: usize) -> u8 {
+        match self.core.read16(off) {
+            Some(code) => code as u8,
+            None => self.data[off],
         }
     }
 
@@ -189,53 +195,19 @@ impl State {
     }
 
     fn write(&mut self, off: usize, v: u8) {
-        let reset = v == 0xf0;
-        match self.mode {
-            _ if reset => self.mode = Mode::Array,
-            Mode::Array | Mode::Identify => {
-                self.mode = if off == UNLOCK_1 && v == 0xaa {
-                    Mode::Unlock1
-                } else {
-                    dlog!(LogModule::Hub, "node flash: stray write {v:#x} at {off:#x} in array mode");
-                    Mode::Array
-                };
-            }
-            Mode::Unlock1 => {
-                self.mode = if off == UNLOCK_2 && v == 0x55 { Mode::Unlock2 } else { Mode::Array };
-            }
-            Mode::Unlock2 => {
-                self.mode = match (off, v) {
-                    (UNLOCK_1, 0xa0) => Mode::Program,
-                    (UNLOCK_1, 0x80) => Mode::Erase1,
-                    (UNLOCK_1, 0x90) => Mode::Identify,
-                    _ => {
-                        dlog!(LogModule::Hub, "node flash: unsupported command {v:#x} at {off:#x}");
-                        Mode::Array
-                    }
-                };
-            }
-            Mode::Program => {
-                let old = self.data[off];
-                self.data[off] = old & v;
-                self.persist(off, 1);
-                self.mode = Mode::Array;
-            }
-            Mode::Erase1 => {
-                self.mode = if off == UNLOCK_1 && v == 0xaa { Mode::Erase2 } else { Mode::Array };
-            }
-            Mode::Erase2 => {
-                self.mode = if off == UNLOCK_2 && v == 0x55 { Mode::Erase3 } else { Mode::Array };
-            }
-            Mode::Erase3 => {
-                if v == 0x30 {
-                    let start = off & !(SECTOR_SIZE - 1);
-                    self.data[start..start + SECTOR_SIZE].fill(0xff);
-                    self.persist(start, SECTOR_SIZE);
-                } else {
-                    dlog!(LogModule::Hub, "node flash: unsupported erase {v:#x} at {off:#x}");
-                }
-                self.mode = Mode::Array;
-            }
+        // An unsupported cycle is logged by the engine and leaves the part in
+        // array mode; the bus answers either way.
+        if let Ok(Effect::Program { offset, value }) = self.core.write16(off, u16::from(v)) {
+            self.data[offset] &= value as u8;
+            self.persist(offset, 1);
+        }
+        // An erase is selected and done at once.
+        let erase = self.core.selected_sectors().next();
+        if let Some(sector) = erase {
+            let start = sector * SECTOR_SIZE;
+            self.data[start..start + SECTOR_SIZE].fill(0xff);
+            self.persist(start, SECTOR_SIZE);
+            self.core.finish_erase(true);
         }
     }
 }
@@ -250,7 +222,7 @@ impl NodeFlash {
             return Err(format!("the node flash is {} bytes, not {SIZE}", image.len()));
         }
         Ok(Arc::new(Self {
-            st: Mutex::new(State { data: image, mode: Mode::Array, backing: None }),
+            st: Mutex::new(State::new(image, None)),
         }))
     }
 
@@ -261,7 +233,7 @@ impl NodeFlash {
         let mut data = image;
         let backing = FlashBacking::open(path, &mut data)?;
         Ok(Arc::new(Self {
-            st: Mutex::new(State { data, mode: Mode::Array, backing: Some(backing) }),
+            st: Mutex::new(State::new(data, Some(backing))),
         }))
     }
 
@@ -283,7 +255,7 @@ impl NodeFlash {
 impl Resettable for NodeFlash {
     /// The chip returns to array reads; its contents survive.
     fn power_on(&self) {
-        self.st.lock().mode = Mode::Array;
+        self.st.lock().core.reset();
     }
 }
 
@@ -292,7 +264,7 @@ struct Chip(Arc<NodeFlash>);
 impl Chip {
     fn bytes(&self, a: u64, n: usize) -> Option<u64> {
         let a = usize::try_from(a).ok().filter(|a| a.checked_add(n).is_some_and(|e| e <= SIZE))?;
-        let st = self.0.st.lock();
+        let mut st = self.0.st.lock();
         Some((0..n).fold(0u64, |v, i| (v << 8) | u64::from(st.read(a + i))))
     }
 }
@@ -327,7 +299,7 @@ struct Window(Arc<NodeFlash>);
 macro_rules! window_read {
     ($r:ident, $t:ty, $out:ident) => {
         fn $r(&self, a: u64) -> $out {
-            let st = self.0.st.lock();
+            let mut st = self.0.st.lock();
             let n = std::mem::size_of::<$t>();
             let v = (0..n).fold(0u64, |v, i| (v << 8) | u64::from(st.read((a as usize + i) % SIZE)));
             $out::ok(v as $t)
@@ -472,6 +444,17 @@ mod tests {
             command(&f, off, v);
         }
         assert_eq!(chip.read8(0x1234).data, 0xff);
+    }
+
+    /// The data cycle of a program takes every bit, so a byte of 0xf0 is
+    /// programmed rather than read as a reset.
+    #[test]
+    fn a_program_of_0xf0_is_data_not_a_reset() {
+        let f = NodeFlash::new(vec![0xff; 0x10_0000]).unwrap();
+        for (off, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0xa0), (0x77, 0xf0)] {
+            command(&f, off, v);
+        }
+        assert_eq!(f.chip().read8(0x77).data, 0xf0);
     }
 
     #[test]

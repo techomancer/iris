@@ -1,21 +1,97 @@
 //! The AMD flash command set: unlock, word program, sector erase and CFI
 //! query state, over storage supplied by the caller.
 //!
-//! Array bytes and bus translation belong to the enclosing device. Fuel uses
-//! this 8 MiB command engine for each boot-flash array. The CFI data and timing
-//! are compatibility values; they do not identify the fitted flash chip.
-//! Buffered writes, protection, bypass and erase suspend are absent.
+//! Array bytes and bus translation belong to the enclosing device. A
+//! [`Geometry`] says what the part is: its bus width, sectors, unlock
+//! addresses, identification codes and which commands it answers. The default
+//! is the 8 MiB x16 part Fuel uses for each boot-flash array; an SN0 node's
+//! boot flash (1 MiB x8) and a BaseIO card's (1 MiB x16, read-only) are the
+//! other two. The CFI data and timing are compatibility values; they do not
+//! identify a fitted flash chip. Buffered writes, protection, bypass and erase
+//! suspend are absent.
 //!
 //! Ported from MAME's intelfsh.cpp AMD command path, revision
 //! 2ee9b1e30299b122b131cab0bd7912abc2b095ba (BSD-3-Clause).
 
 // Copyright (c) Aaron Giles
 
+use crate::devlog::LogModule;
+
 pub const SECTOR_SIZE: usize = 64 * 1024;
+/// The most sectors a part can have here, and Fuel's part has.
 const SECTORS: usize = 128;
 pub const PART_SIZE: usize = SECTOR_SIZE * SECTORS;
 pub const ERASE_SETUP_NS: u64 = 50_000;
 pub const ERASE_NS: u64 = 512_000_000;
+
+/// What the part answers in autoselect mode: the manufacturer, device and
+/// sector-protection words at the first three command addresses, and `other`
+/// everywhere else.
+#[derive(Clone, Copy, Debug)]
+pub struct Identity {
+    pub codes: [u16; 3],
+    pub other: u16,
+}
+
+impl Identity {
+    fn code(&self, index: usize) -> u16 {
+        self.codes.get(index).copied().unwrap_or(self.other)
+    }
+}
+
+/// What distinguishes one part from another to the command engine. Command
+/// addresses are word addresses on a x16 part and byte addresses on a x8
+/// part; a bus cycle carries a word or a byte accordingly.
+#[derive(Clone, Copy, Debug)]
+pub struct Geometry {
+    pub x8: bool,
+    pub sector_size: usize,
+    pub sectors: usize,
+    /// The two unlock command addresses.
+    pub unlock: [usize; 2],
+    /// The bits of a command address the part compares.
+    pub address_mask: usize,
+    pub identity: Identity,
+    /// Whether the CFI query command (98 at 0x55) is answered.
+    pub cfi: bool,
+    /// Whether program and erase are refused rather than carried out.
+    pub read_only: bool,
+    /// Whether sector erase takes time and shows toggle status meanwhile. An
+    /// untimed erase is selected and left to the owner at once: see
+    /// [`AmdCore::selected_sectors`] and [`AmdCore::finish_erase`].
+    pub timed_erase: bool,
+    /// Whether a new command sequence may start from autoselect mode without
+    /// a reset between.
+    pub unlock_from_identify: bool,
+    /// Where an unsupported cycle is logged.
+    pub log: LogModule,
+}
+
+impl Geometry {
+    /// Fuel's 8 MiB x16 part.
+    pub const FUEL: Self = Self {
+        x8: false,
+        sector_size: SECTOR_SIZE,
+        sectors: SECTORS,
+        unlock: [0x555, 0x2aa],
+        address_mask: usize::MAX,
+        identity: Identity { codes: [0; 3], other: 0 },
+        cfi: true,
+        read_only: false,
+        timed_erase: true,
+        unlock_from_identify: false,
+        log: LogModule::Bedrock,
+    };
+
+    fn size(&self) -> usize {
+        self.sector_size * self.sectors
+    }
+
+    /// The command address a bus offset names.
+    fn command_address(&self, offset: usize) -> usize {
+        (if self.x8 { offset } else { offset / 2 }) & self.address_mask
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -37,6 +113,7 @@ pub enum Effect {
 }
 
 pub struct AmdCore {
+    geometry: Geometry,
     mode: Mode,
     selected: [bool; SECTORS],
     /// Remaining time includes the sector-selection interval.
@@ -48,7 +125,15 @@ pub struct AmdCore {
 
 impl Default for AmdCore {
     fn default() -> Self {
+        Self::new(Geometry::FUEL)
+    }
+}
+
+impl AmdCore {
+    pub fn new(geometry: Geometry) -> Self {
+        assert!(geometry.sectors <= SECTORS, "a part has at most {SECTORS} sectors here");
         Self {
+            geometry,
             mode: Mode::Array,
             selected: [false; SECTORS],
             remaining_ns: 0,
@@ -57,11 +142,9 @@ impl Default for AmdCore {
             failed: false,
         }
     }
-}
 
-impl AmdCore {
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::new(self.geometry);
     }
     pub fn busy(&self) -> bool {
         self.remaining_ns != 0 || self.failed
@@ -75,7 +158,7 @@ impl AmdCore {
     /// None selects ordinary backing bytes. Polling never advances time.
     pub fn read16(&mut self, offset: usize) -> Option<u16> {
         if self.busy() {
-            let selected = self.selected[offset / SECTOR_SIZE];
+            let selected = self.selected[offset / self.geometry.sector_size];
             self.toggle = !self.toggle;
             return Some(
                 (if self.toggle {
@@ -88,34 +171,37 @@ impl AmdCore {
         }
         match self.mode {
             Mode::Query => Some(query(offset / 2) as u16),
-            // IDs remain unspecified until a part/profile is selected.
-            Mode::Identify => Some(0),
+            // The geometry's codes; Fuel's part leaves them unspecified.
+            Mode::Identify => Some(self.geometry.identity.code(self.geometry.command_address(offset) & 0xff)),
             _ => None,
         }
     }
+    /// One bus cycle: a word on a x16 part, a byte on a x8 part, at byte
+    /// offset `offset`.
     pub fn write16(&mut self, offset: usize, value: u16) -> Result<Effect, ()> {
-        if offset & 1 != 0 || offset >= PART_SIZE {
+        let g = self.geometry;
+        if (!g.x8 && offset & 1 != 0) || offset >= g.size() {
             return Err(());
         }
         let cmd = value as u8;
-        let word = offset / 2;
+        let word = g.command_address(offset);
         if self.busy() {
             if (self.failed || self.setup_ns != 0) && cmd == 0xf0 {
                 self.reset();
             } else if self.setup_ns != 0 && cmd == 0x30 {
-                self.selected[offset / SECTOR_SIZE] = true;
+                self.selected[offset / g.sector_size] = true;
                 self.setup_ns = ERASE_SETUP_NS;
                 self.remaining_ns = ERASE_SETUP_NS + ERASE_NS;
             } else if self.setup_ns != 0 {
                 self.reset();
                 crate::dlog!(
-                    crate::devlog::LogModule::Bedrock,
+                    g.log,
                     "amd-flash: sector selection cancelled by command {cmd:#x} at word offset {word:#x}"
                 );
                 return Err(());
             } else if cmd != 0xf0 {
                 crate::dlog!(
-                    crate::devlog::LogModule::Bedrock,
+                    g.log,
                     "amd-flash: unsupported command {cmd:#x} while erasing at word offset {word:#x}"
                 );
                 return Err(());
@@ -131,24 +217,28 @@ impl AmdCore {
             self.reset();
             return Ok(Effect::None);
         }
+        let [unlock0, unlock1] = g.unlock;
         let next = match (self.mode, word, cmd) {
-            (Mode::Array, 0x55, 0x98) => Mode::Query,
-            (Mode::Array, 0x555, 0xaa) => Mode::Unlock1,
-            (Mode::Unlock1, 0x2aa, 0x55) => Mode::Unlock2,
-            (Mode::Unlock2, 0x555, 0xa0) => Mode::Program,
-            (Mode::Unlock2, 0x555, 0x80) => Mode::Erase1,
-            (Mode::Unlock2, 0x555, 0x90) => Mode::Identify,
-            (Mode::Erase1, 0x555, 0xaa) => Mode::Erase2,
-            (Mode::Erase2, 0x2aa, 0x55) => Mode::Erase3,
+            (Mode::Array, 0x55, 0x98) if g.cfi => Mode::Query,
+            (Mode::Array, w, 0xaa) if w == unlock0 => Mode::Unlock1,
+            (Mode::Identify, w, 0xaa) if g.unlock_from_identify && w == unlock0 => Mode::Unlock1,
+            (Mode::Unlock1, w, 0x55) if w == unlock1 => Mode::Unlock2,
+            (Mode::Unlock2, w, 0xa0) if w == unlock0 && !g.read_only => Mode::Program,
+            (Mode::Unlock2, w, 0x80) if w == unlock0 && !g.read_only => Mode::Erase1,
+            (Mode::Unlock2, w, 0x90) if w == unlock0 => Mode::Identify,
+            (Mode::Erase1, w, 0xaa) if w == unlock0 => Mode::Erase2,
+            (Mode::Erase2, w, 0x55) if w == unlock1 => Mode::Erase3,
             (Mode::Erase3, _, 0x30) => {
-                self.selected[offset / SECTOR_SIZE] = true;
-                self.setup_ns = ERASE_SETUP_NS;
-                self.remaining_ns = ERASE_SETUP_NS + ERASE_NS;
+                self.selected[offset / g.sector_size] = true;
+                if g.timed_erase {
+                    self.setup_ns = ERASE_SETUP_NS;
+                    self.remaining_ns = ERASE_SETUP_NS + ERASE_NS;
+                }
                 Mode::Array
             }
             _ => {
                 crate::dlog!(
-                    crate::devlog::LogModule::Bedrock,
+                    g.log,
                     "amd-flash: unsupported cycle {value:#06x} at byte offset {offset:#x} in {:?}",
                     self.mode
                 );
@@ -309,5 +399,78 @@ mod tests {
         assert!(f.array_reads());
         // Odd byte offsets are not word cycles.
         assert!(f.write16(UNLOCK0 + 1, 0xaa).is_err());
+    }
+
+    const NODE: Geometry = Geometry {
+        x8: true,
+        sector_size: SECTOR_SIZE,
+        sectors: 16,
+        unlock: [0x5555, 0x2aaa],
+        address_mask: usize::MAX,
+        identity: Identity { codes: [0x01, 0xd5, 0], other: 0xff },
+        cfi: false,
+        read_only: false,
+        timed_erase: false,
+        unlock_from_identify: true,
+        log: LogModule::Hub,
+    };
+
+    /// A byte-wide part takes commands at byte addresses and a data byte per
+    /// cycle, its erase is selected for the owner to do at once with no busy
+    /// status, and it answers neither a CFI query nor an offset past its end.
+    #[test]
+    fn a_byte_wide_part_takes_byte_cycles_and_erases_at_once() {
+        let mut f = AmdCore::new(NODE);
+        let cycle = |f: &mut AmdCore, at: usize, v: u16| f.write16(at, v).unwrap();
+        cycle(&mut f, 0x5555, 0xaa);
+        cycle(&mut f, 0x2aaa, 0x55);
+        cycle(&mut f, 0x5555, 0xa0);
+        assert_eq!(cycle(&mut f, 0x1235, 0xf0), Effect::Program { offset: 0x1235, value: 0xf0 }, "an odd address, and F0 as data");
+        for (at, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0x80), (0x5555, 0xaa), (0x2aaa, 0x55), (3 * SECTOR_SIZE + 9, 0x30)] {
+            cycle(&mut f, at, v);
+        }
+        assert!(!f.busy() && f.array_reads(), "no erase status is ever shown");
+        assert_eq!(f.selected_sectors().collect::<Vec<_>>(), [3]);
+        f.finish_erase(true);
+        assert_eq!(f.selected_sectors().count(), 0);
+        assert!(f.write16(0x55, 0x98).is_err(), "no CFI query");
+        assert!(f.write16(16 * SECTOR_SIZE, 0xaa).is_err(), "past the end of the part");
+    }
+
+    /// The codes come from the geometry: addresses 0, 1 and 2 of autoselect,
+    /// and the part's filler elsewhere. A new sequence starts from autoselect
+    /// only on a part that allows it.
+    #[test]
+    fn autoselect_answers_the_geometrys_codes() {
+        let mut f = AmdCore::new(NODE);
+        for (at, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0x90)] {
+            f.write16(at, v).unwrap();
+        }
+        assert_eq!([0, 1, 2, 3, 0x100].map(|a| f.read16(a).unwrap()), [0x01, 0xd5, 0, 0xff, 0x01]);
+        f.write16(0x5555, 0xaa).expect("this part starts a sequence from autoselect");
+        let mut strict = AmdCore::new(Geometry { unlock_from_identify: false, ..NODE });
+        for (at, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0x90)] {
+            strict.write16(at, v).unwrap();
+        }
+        assert!(strict.write16(0x5555, 0xaa).is_err());
+    }
+
+    /// A read-only part gets as far as autoselect and refuses program and
+    /// erase setup.
+    #[test]
+    fn a_read_only_part_refuses_program_and_erase() {
+        let mut f = AmdCore::new(Geometry { read_only: true, ..NODE });
+        for setup in [0xa0, 0x80] {
+            f.write16(0x5555, 0xaa).unwrap();
+            f.write16(0x2aaa, 0x55).unwrap();
+            assert!(f.write16(0x5555, setup).is_err(), "{setup:#x}");
+        }
+    }
+
+    /// The default geometry is Fuel's, unchanged by the others.
+    #[test]
+    fn the_default_geometry_is_fuels_part() {
+        let g = AmdCore::default().geometry;
+        assert_eq!((g.x8, g.sector_size * g.sectors, g.unlock, g.timed_erase, g.cfi), (false, PART_SIZE, [0x555, 0x2aa], true, true));
     }
 }
