@@ -5,6 +5,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    # ready_for_review: marking a draft ready starts the full set below.
+    types: [ opened, synchronize, reopened, ready_for_review ]
 
 # One run per workflow per pull request: a new push cancels the runs it
 # replaces. Pushes to main are never cancelled.
@@ -22,6 +24,11 @@ env:
 # Pull requests run Linux x86-64, Linux arm64 and Windows. macOS joins them on
 # pushes to main: its runners wait longest, and from 2026-10-13 to 2026-11-10
 # no pull request's macOS job failed on its code where Linux passed.
+#
+# Draft pull requests run the Linux x86-64 test and the script lint only, so
+# work in progress doesn't hold runners that pull requests being landed need.
+# Windows, arm64 Linux and the release-features build start when the pull
+# request is marked ready for review.
 jobs:
   # Default features, every workspace crate.
   test:
@@ -30,7 +37,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest"]' || '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest","macos-26"]') }}
+        os: ${{ fromJSON(
+          github.event_name != 'pull_request' && '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest","macos-26"]' ||
+          github.event.pull_request.draft && '["ubuntu-24.04"]' ||
+          '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest"]') }}
     steps:
     - uses: actions/checkout@v5
     # rust-toolchain.toml pins nightly; `rustup show` installs it up front so a
@@ -89,6 +99,7 @@ jobs:
   # hostgl's link against the platform's GL is covered too.
   features:
     name: Build release features (${{ matrix.os }})
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
