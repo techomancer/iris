@@ -1,0 +1,5 @@
+# Tests compare vertices.txt whole with the model's output, which has LF line
+# endings. Keep the golden text files LF in every checkout, including git for
+# Windows with core.autocrlf on.
+src/dev/odyssey/testdata/golden/*.txt text eol=lf
+src/dev/odyssey/testdata/golden/*.tsv text eol=lf
