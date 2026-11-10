@@ -4576,6 +4576,7 @@ mod tests {
         let consts = jit.jitv2.lock().jit_consts.lock().clone();
         codegen.jit_consts.lwr_keeps_upper = consts.lwr_keeps_upper;
         codegen.jit_consts.single_clears_upper = consts.single_clears_upper;
+        codegen.jit_consts.cvt_l_51_bits = consts.cvt_l_51_bits;
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable region");
         unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
         std::mem::forget(codegen);
@@ -4676,6 +4677,36 @@ mod tests {
             assert_eq!(jit, interp, "R10000 cvt.w.s {v}");
             assert_eq!(interp.fpr[3], OLD, "R10000 cvt.w.s {v} leaves fd");
             assert_eq!(interp.fpu_fcsr & 0x0003_f000, 0x0002_0000, "R10000 cvt.w.s {v} Cause.E alone");
+        }
+    }
+
+    /// Compiled and interpreted CVT.L agree at the R10000's 51-bit limit: the
+    /// inline range test narrows to [-2^51, 2^51) so 2^52 reaches the callout
+    /// and traps, while 2^49 stays inline. Fix: CVT.L stops at 51 bits.
+    #[test]
+    fn jit_cvt_l_matches_the_interpreter_at_the_r10000_limit() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache};
+        use crate::cpu::mips_isa::*;
+        let cvt_l_d = (OP_COP1 << 26) | (RS_D << 21) | (1 << 11) | (3 << 6) | FUNCT_FCVT_L;
+        for v in [(1i64 << 52) as f64, -((1i64 << 52) as f64), (1i64 << 49) as f64, -((1i64 << 51) as f64)] {
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits();
+                exec.core.fpr[3] = 0x5a5a_5a5a_5a5a_5a5a;
+            };
+            let (interp, jit) = instr_both::<R10000ShadowCache>(cvt_l_d, setup);
+            assert_eq!(jit, interp, "R10000 cvt.l.d {v}");
+            let traps = v.abs() > (1i64 << 51) as f64;
+            assert_eq!(interp.fpr[3] == 0x5a5a_5a5a_5a5a_5a5a, traps, "R10000 cvt.l.d {v}");
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R12000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits();
+            };
+            let (interp, jit) = instr_both::<R12000ShadowCache>(cvt_l_d, setup);
+            assert_eq!(jit, interp, "R12000 cvt.l.d {v}");
+            assert_eq!(interp.fpr[3] as i64, v as i64, "R12000 cvt.l.d {v}");
         }
     }
 

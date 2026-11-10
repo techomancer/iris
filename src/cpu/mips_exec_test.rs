@@ -1491,6 +1491,49 @@ mod tests {
         });
     }
 
+    /// The R10000 converts to a long "only up to 51 bits; otherwise an
+    /// Unimplemented Operation exception is taken" (R10000 UM v2.0 p. 312):
+    /// 2^52 traps there and converts on the R12000, whose manual has no such
+    /// limit. Both ends of [-2^51, 2^51) convert.
+    #[test]
+    fn cvt_l_stops_at_51_bits_on_the_r10000() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        const OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(limited: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt_l_d = make_cop1_compute(RS_D, 0, 1, 2, FUNCT_FCVT_L);
+            let cvt_l_s = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_L);
+            let p52 = (1i64 << 52) as f64;
+            let cases = [
+                (cvt_l_d, p52.to_bits(), 1i64 << 52, limited),
+                (cvt_l_d, (-p52).to_bits(), -(1i64 << 52), limited),
+                (cvt_l_s, (p52 as f32).to_bits() as u64, 1i64 << 52, limited),
+                (cvt_l_d, (((1i64 << 51) - 1) as f64).to_bits(), (1i64 << 51) - 1, false),
+                (cvt_l_d, (-((1i64 << 51) as f64)).to_bits(), -(1i64 << 51), false),
+                (cvt_l_s, ((1i64 << 49) as f32).to_bits() as u64, 1i64 << 49, false),
+            ];
+            for (instr, input, want, traps) in cases {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input;
+                exec.core.fpr[2] = OLD;
+                let s = exec.exec(instr);
+                if traps {
+                    assert!(s & EXEC_IS_EXCEPTION != 0, "{want} traps");
+                    assert_eq!(exec.core.fpu_fcsr & FCSR_CE, FCSR_CE, "{want} Cause.E");
+                    assert_eq!(exec.core.fpr[2], OLD, "{want} fd untouched");
+                } else {
+                    assert_eq!(s, EXEC_COMPLETE, "{want}");
+                    assert_eq!(exec.core.fpr[2] as i64, want, "{want} converts");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(false);
+        });
+    }
+
     /// MOVZ.S, MOVN.S, MOVT.S and MOVF.S write fd on the R10000 family even
     /// when the condition is false: the old low word stays and, with FR set,
     /// the upper word is zeroed, "even though the condition is false"

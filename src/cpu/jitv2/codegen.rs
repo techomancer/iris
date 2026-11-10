@@ -1054,6 +1054,9 @@ impl Codegen {
         if self.jit_consts.single_clears_upper {
             s.push_str(" single_zx=1");
         }
+        if self.jit_consts.cvt_l_51_bits {
+            s.push_str(" cvt_l51=1");
+        }
         s.push_str(" ops=");
         s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
         Some(blake3::hash(s.as_bytes()).as_bytes()[..16].try_into().unwrap())
@@ -4699,6 +4702,10 @@ pub struct JitConsts {
     /// destination (`CpuModel::SINGLE_CLEARS_UPPER`). Published and
     /// fingerprinted the same way as `lwr_keeps_upper`.
     pub single_clears_upper: bool,
+    /// A long conversion's result must lie in [-2^51, 2^51)
+    /// (`CpuModel::CVT_L_51_BITS`), so the inline range test narrows to it.
+    /// Published and fingerprinted the same way as `lwr_keeps_upper`.
+    pub cvt_l_51_bits: bool,
 }
 
 impl JitConsts {
@@ -8896,9 +8903,18 @@ fn emit_fpu_clear_cause_if_set(ctx: &mut EmitCtx) {
 /// `<= MAX` for W from a double (both exact), `>= -2^31 && < 2^31` for W from
 /// a single (`i32::MAX` is not a single, and 2^31 is the first one that does
 /// not fit), and `>= -2^63 && < 2^63` for L (2^63 is exact in both formats
-/// and is the first value that does not fit). Returned as
+/// and is the first value that does not fit), or `>= -2^51 && < 2^51` on a
+/// part that limits L to that (`JitConsts::cvt_l_51_bits`). Returned as
 /// `(min, max, max_inclusive)`.
 fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Value, bool) {
+    if dst_i64 && ctx.jit_consts.cvt_l_51_bits {
+        const LIMIT: f64 = 2251799813685248.0; // 2^51, exact in both formats
+        return if src_f64 {
+            (ctx.builder.ins().f64const(-LIMIT), ctx.builder.ins().f64const(LIMIT), false)
+        } else {
+            (ctx.builder.ins().f32const(-LIMIT as f32), ctx.builder.ins().f32const(LIMIT as f32), false)
+        };
+    }
     if src_f64 {
         if dst_i64 {
             let min = ctx.builder.ins().f64const(-(9223372036854775808.0f64));
