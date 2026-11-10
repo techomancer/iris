@@ -4401,21 +4401,19 @@ mod tests {
         }
     }
 
-    /// One LWR at 0x1000 reading 0x2000 + `offset`, interpreted and compiled, on
-    /// CPU model `C` with CP0 Status `status`. The JIT learns the model's
-    /// choices from `install_jit_hooks`, as in production.
-    fn lwr_both<C>(status: u32, offset: u64) -> (CoreSnapshot, CoreSnapshot)
+    /// One instruction at 0x1000, interpreted and compiled, on CPU model `C`
+    /// after `setup`. The JIT learns the model's choices from
+    /// `install_jit_hooks`, as in production.
+    fn instr_both<C>(instr: u32, setup: impl Fn(&MockMemory, &mut MipsExecutor<PassthroughTlb, C>)) -> (CoreSnapshot, CoreSnapshot)
     where
         C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>,
     {
-        let lwr = make_i(crate::cpu::mips_isa::OP_LWR, 1, 2, 0);
         let build = || {
             let mem = Arc::new(MockMemory::new_not_compilable());
-            mem.set_word(0x2000, 0xDEAD_BEEF);
             let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
-            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
-            (exec.core.gpr[1], exec.core.gpr[2], exec.core.pc) = (0x2000 + offset, 0x1122_3344_5566_7788, 0x1000);
-            exec.set_cp0_status(status);
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem.clone(), PassthroughTlb::default(), &cfg));
+            exec.core.pc = 0x1000;
+            setup(&mem, &mut exec);
             exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "fetchverify")]
             { exec.core.fetch_verify_on = false; }
@@ -4423,20 +4421,34 @@ mod tests {
         };
         let mut interp = build();
         interp.jitv2_dispatch_enabled = false;
-        interp.exec(lwr);
+        interp.exec(instr);
         let mut page = [0u32; ENTRIES_PER_PAGE];
-        page[0] = lwr;
+        page[0] = instr;
         let mut analyzer = Analyzer::new();
         let mut instrs_owned = *analyzer.walk_bounded(&page, 0, 0x1000, 1).0;
         let mut jit = build();
         jit.install_jit_hooks();
-        // Workers read the model's choice from here; stamp the codegen from it.
+        // Workers read the model's choices from here; stamp the codegen from it.
         let mut codegen = Codegen::new();
-        codegen.jit_consts.lwr_keeps_upper = jit.jitv2.lock().jit_consts.lock().lwr_keeps_upper;
+        let consts = jit.jitv2.lock().jit_consts.lock().clone();
+        codegen.jit_consts.lwr_keeps_upper = consts.lwr_keeps_upper;
+        codegen.jit_consts.single_clears_upper = consts.single_clears_upper;
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable region");
         unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
         std::mem::forget(codegen);
         (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
+    }
+
+    /// One LWR reading 0x2000 + `offset` on CPU model `C` with CP0 Status `status`.
+    fn lwr_both<C>(status: u32, offset: u64) -> (CoreSnapshot, CoreSnapshot)
+    where
+        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>,
+    {
+        instr_both::<C>(make_i(crate::cpu::mips_isa::OP_LWR, 1, 2, 0), |mem, exec| {
+            mem.set_word(0x2000, 0xDEAD_BEEF);
+            (exec.core.gpr[1], exec.core.gpr[2]) = (0x2000 + offset, 0x1122_3344_5566_7788);
+            exec.set_cp0_status(status);
+        })
     }
 
     /// Compiled and interpreted LWR agree: the R10000 keeps bits 63:32 of a
@@ -4456,6 +4468,46 @@ mod tests {
         let (interp, jit) = lwr_both::<R5000ShadowCache>(STATUS_KX, 1);
         assert_eq!(jit, interp);
         assert_ne!(interp.gpr[2] >> 32, 0x1122_3344, "R5000 sign-extends");
+    }
+
+    /// Compiled and interpreted single results agree: with FR set the R10000
+    /// zeroes the destination's upper word, the R5000 keeps it. A zero sum and an
+    /// infinity take the compiled code's cold commits. Fix: single results
+    /// clear the upper word.
+    #[test]
+    fn jit_single_results_match_the_interpreter_on_the_r10000_and_r5000() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
+        use crate::cpu::mips_isa::*;
+        let cop1 = |fmt: u32, ft: u32, fs: u32, fd: u32, funct: u32| {
+            (OP_COP1 << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | funct
+        };
+        let cases = [
+            ("add.s", cop1(RS_S, 2, 1, 3, FUNCT_FADD)),
+            ("add.s zero", cop1(RS_S, 5, 1, 3, FUNCT_FADD)),
+            ("add.s inf", cop1(RS_S, 6, 1, 3, FUNCT_FADD)),
+            ("mov.s", cop1(RS_S, 0, 1, 3, FUNCT_FMOV)),
+            ("cvt.s.d", cop1(RS_D, 0, 4, 3, FUNCT_FCVT_S)),
+            ("cvt.w.s", cop1(RS_S, 0, 2, 3, FUNCT_FCVT_W)),
+        ];
+        // Every FPR's upper word starts nonzero so a single result that keeps it shows.
+        fn setup<C: crate::cpu::mips_cache_v2::CpuModel>(_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, C>) {
+            use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+            exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+            for (i, f) in exec.core.fpr.iter_mut().enumerate() {
+                *f = 0x2989_815b_0000_0000 | 0x3fc0_0000 | i as u64; // 1.5 plus a little
+            }
+            exec.core.fpr[4] = 2.5f64.to_bits();
+            exec.core.fpr[5] = 0x2989_815b_0000_0000 | 0xbfc0_0001; // -fpr[1]
+            exec.core.fpr[6] = 0x2989_815b_0000_0000 | 0x7f80_0000; // +inf
+        }
+        for (name, instr) in cases {
+            let (interp, jit) = instr_both::<R10000ShadowCache>(instr, setup);
+            assert_eq!(jit, interp, "R10000 {name}");
+            assert_eq!(interp.fpr[3] >> 32, 0, "R10000 {name} upper word");
+            let (interp, jit) = instr_both::<R5000ShadowCache>(instr, setup);
+            assert_eq!(jit, interp, "R5000 {name}");
+            assert_eq!(interp.fpr[3] >> 32, 0x2989_815b, "R5000 {name} upper word");
+        }
     }
 
     #[test]

@@ -1390,6 +1390,46 @@ mod tests {
         });
     }
 
+    /// With FR set, a single or word result zeroes the destination's upper
+    /// word on the R10000 family (R10000 UM v2.0 p. 306) and leaves it alone
+    /// on the R4400. IRIX's olperi compares every FPR after a random
+    /// instruction run against this. Fix: single results clear the upper word.
+    #[test]
+    fn single_results_clear_the_upper_word_on_the_r10000_family() {
+        use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR};
+        const OLD: u64 = 0xdead_beef_0000_0000;
+        const GARBAGE: u64 = 0x2989_815b_0000_0000;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(clears: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cases = [
+                ("add.s", make_cop1_compute(RS_S, 2, 1, 3, FUNCT_FADD), 0x4060_0000u32),
+                ("mov.s", make_cop1_compute(RS_S, 0, 1, 3, FUNCT_FMOV), 0x3fc0_0000),
+                ("cvt.s.d", make_cop1_compute(RS_D, 0, 4, 3, FUNCT_FCVT_S), 0x4020_0000),
+                ("cvt.w.s", make_cop1_compute(RS_S, 0, 2, 3, FUNCT_FCVT_W), 2),
+                ("cvt.s.w", make_cop1_compute(RS_W, 0, 5, 3, FUNCT_FCVT_S), 0x40e0_0000),
+            ];
+            for (name, instr, low) in cases {
+                exec.core.fpr[1] = GARBAGE | 0x3fc0_0000; // 1.5
+                exec.core.fpr[2] = GARBAGE | 0x4000_0000; // 2.0
+                exec.core.fpr[4] = 2.5f64.to_bits();
+                exec.core.fpr[5] = GARBAGE | 7;
+                exec.core.fpr[3] = OLD | 0x5a5a_5a5a;
+                assert_eq!(exec.exec(instr), EXEC_COMPLETE, "{name}");
+                assert_eq!(exec.core.fpr[3] as u32, low, "{name} result");
+                if clears {
+                    assert_eq!(exec.core.fpr[3] >> 32, 0, "{name} upper word");
+                } else if name != "mov.s" {
+                    assert_eq!(exec.core.fpr[3] & !0xffff_ffff, OLD, "{name} upper word");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<R4400Cache>(false);
+        });
+    }
+
     #[cfg(feature = "tlbcheck")]
     #[test]
     fn test_tlbwi_breaks_on_duplicate_entry() {
