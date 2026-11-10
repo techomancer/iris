@@ -60,7 +60,6 @@ use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::ip27::{self, Ip27Bus, NodeMemory};
-use crate::irq::InterruptController;
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
@@ -283,18 +282,6 @@ pub struct Ip27Machine<B: Ip27Board> {
     events: Option<Receiver<MachineEvent>>,
     slot: Option<MachineSlot>,
     lifecycle: GuestState,
-}
-
-/// The CPU's three Hub lines are hardware interrupts 0 to 2, Cause IP2 to IP4.
-struct CpuIrq(Weak<dyn CpuDevice>);
-impl InterruptController for CpuIrq {
-    fn set_line(&self, line: u32, level: bool) {
-        if line < 3 {
-            if let Some(cpu) = self.0.upgrade() {
-                cpu.as_device().signal(Signal::Interrupt(line + 2, level));
-            }
-        }
-    }
 }
 
 /// What the Hub asks of the machine around it.
@@ -525,7 +512,9 @@ impl<B: Ip27Board> Ip27Machine<B> {
         let mut units = Vec::new();
         for (node, spec) in parts.into_iter().zip(&specs) {
             let cpu = Self::build_cpu(cfg, &spec.module, &node, spec.hub.cpu_base, specs.len() > 1)?;
-            node.hub.set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
+            // The Hub publishes its lines straight into the processor's
+            // interrupt word, which `Drop` lets go of before the processor goes.
+            node.hub.set_cpu_interrupts(0, cpu.interrupts_ptr());
             let zero = node.memory.node_zero();
             node.hub.set_hooks(Arc::new(Hooks {
                 name: product(cfg),
@@ -830,6 +819,11 @@ impl<B: Ip27Board> Drop for Ip27Machine<B> {
             slot.lock().0 = MachineRef::null();
         }
         self.stop();
+        // Nothing publishes into a processor's interrupt word once the
+        // processors go: another Hub can still reach this one's units.
+        for u in &self.units {
+            u.node.hub.clear_cpu_interrupts();
+        }
         // The compile pool's requests point into the memory freed below.
         #[cfg(feature = "jitv2")]
         for u in &self.units {

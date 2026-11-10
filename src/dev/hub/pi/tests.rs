@@ -8,7 +8,7 @@
 // processor-error status cases.
 
 use super::*;
-use std::sync::atomic::AtomicU8;
+use std::cell::RefCell;
 
 struct Fixture {
     pi: Arc<Pi>,
@@ -17,16 +17,13 @@ struct Fixture {
     /// What the writes so far asked the Hub to do, as text.
     effects: Mutex<Vec<String>>,
 }
+/// The processors' interrupt words, as a plain word each: line 0 to 2 are
+/// slice A's Cause bits 10 to 12 and 3 to 5 slice B's.
 #[derive(Default)]
-struct Lines([AtomicU8; 6]);
+struct Lines([AtomicU64; 2]);
 impl Lines {
     fn get(&self, line: usize) -> bool {
-        self.0[line].load(Ordering::SeqCst) == 1
-    }
-}
-impl InterruptController for Lines {
-    fn set_line(&self, line: u32, level: bool) {
-        self.0[line as usize].store(u8::from(level), Ordering::SeqCst);
+        self.0[line / LINES_PER_CPU].load(Ordering::SeqCst) >> (CAUSE_SHIFT as usize + line % LINES_PER_CPU) & 1 == 1
     }
 }
 impl Fixture {
@@ -35,7 +32,9 @@ impl Fixture {
         let clock = now.clone();
         let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
         let lines = Arc::new(Lines::default());
-        pi.set_interrupt_controller(lines.clone());
+        for (slice, word) in lines.0.iter().enumerate() {
+            pi.set_cpu_interrupts(slice, word);
+        }
         Self { pi, now, lines, effects: Mutex::default() }
     }
     fn r(&self, off: u64) -> u64 {
@@ -482,4 +481,180 @@ fn unimplemented_offsets_read_zero() {
     assert_eq!(t.r(0x1f8), 0);
     t.w(0x1f8, 0x5555);
     assert_eq!(t.r(0x1f8), 0);
+}
+
+/// A write that changes no line writes no edge: the lines are driven only on a
+/// change.
+#[test]
+fn a_write_that_changes_no_line_makes_no_edge() {
+    let t = Fixture::new(1);
+    t.w(reg::INT_MASK0_A, !0);
+    t.pi.int_modify(MODIFY_SET | 5);
+    assert!(t.lines.get(0));
+    let edges = |t: &Fixture| (t.pi.rises[0].load(Ordering::SeqCst), t.pi.falls[0].load(Ordering::SeqCst));
+    assert_eq!(edges(&t), (1, 0));
+    // The bit again, the mask again, a drive: the line stays up.
+    t.pi.int_modify(MODIFY_SET | 5);
+    t.pi.int_modify(MODIFY_SET | 6);
+    t.w(reg::INT_MASK0_A, !0);
+    t.pi.drive();
+    t.pi.poll();
+    assert_eq!(edges(&t), (1, 0));
+    // One bit clears and the other holds the line.
+    t.pi.int_modify(5);
+    assert_eq!(edges(&t), (1, 0));
+    t.pi.int_modify(6);
+    assert!(!t.lines.get(0));
+    assert_eq!(edges(&t), (1, 1));
+}
+
+/// Four threads change three inputs and two others write the same values and
+/// drive the lines over and over. A line rises exactly once for each pulse of
+/// its input and falls once, and a line nobody pulsed never moves: no stale
+/// sample writes an edge the registers did not make.
+#[test]
+fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
+    const PULSES: u64 = 4000;
+    let t = Arc::new(Fixture::new(1));
+    t.w(reg::INT_MASK0_A, !0);
+    t.w(reg::RT_EN_A, 1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let noisy: Vec<_> = (0..2)
+        .map(|n| {
+            let (t, stop) = (t.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    t.pi.drive();
+                    // The same values the registers hold.
+                    t.pi.write(reg::INT_MASK0_A, !0);
+                    t.pi.write(reg::RT_EN_A, 1);
+                    if n == 0 {
+                        t.pi.write(reg::INT_MASK1_A, 0);
+                    }
+                }
+            })
+        })
+        .collect();
+    let bank = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            for _ in 0..PULSES {
+                t.pi.int_modify(MODIFY_SET | 5);
+                t.pi.int_modify(5);
+            }
+        })
+    };
+    let comparator = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            for _ in 0..PULSES {
+                t.pi.write(reg::RT_PEND_A, 1);
+                t.pi.write(reg::RT_PEND_A, 0);
+            }
+        })
+    };
+    bank.join().unwrap();
+    comparator.join().unwrap();
+    stop.store(true, Ordering::SeqCst);
+    for n in noisy {
+        n.join().unwrap();
+    }
+    let count = |a: &[AtomicU64; 6]| [0, 1, 2].map(|l| a[l].load(Ordering::SeqCst));
+    assert_eq!(count(&t.pi.rises), [PULSES, 0, PULSES]);
+    assert_eq!(count(&t.pi.falls), [PULSES, 0, PULSES]);
+    assert_eq!((t.lines.get(0), t.lines.get(1), t.lines.get(2)), (false, false, false));
+}
+
+/// Writers that race an input against a mask and an enable leave the word as
+/// the registers say, whatever the interleaving.
+#[test]
+fn racing_writers_leave_the_word_matching_the_registers() {
+    for round in 0..40 {
+        let t = Arc::new(Fixture::new(1));
+        let (a, b, c) = (t.clone(), t.clone(), t.clone());
+        let setter = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                a.pi.int_modify(MODIFY_SET | 5);
+                a.pi.int_modify(5);
+            }
+        });
+        let masker = std::thread::spawn(move || {
+            for i in 0..2000u64 {
+                b.pi.write(reg::INT_MASK0_A, if i % 2 == 0 { !0 } else { 0 });
+            }
+        });
+        let enabler = std::thread::spawn(move || {
+            for i in 0..2000u64 {
+                c.pi.write(reg::RT_PEND_A, 1);
+                c.pi.write(reg::RT_EN_A, i & 1);
+            }
+        });
+        for h in [setter, masker, enabler] {
+            h.join().unwrap();
+        }
+        let bank0 = t.r(reg::INT_PEND0) & t.r(reg::INT_MASK0_A) != 0;
+        let rt = t.r(reg::RT_PEND_A) != 0 && t.r(reg::RT_EN_A) != 0;
+        assert_eq!((t.lines.get(0), t.lines.get(1), t.lines.get(2)), (bank0, false, rt), "round {round}");
+    }
+}
+
+/// A writer that stalls in the middle of writing the lines holds off every
+/// change of their inputs: the input changes under the same hold of `lines`
+/// as the write. Were an input changed before the lock, the second thread
+/// would clear and set the bit while the first still held the stale sample,
+/// and the first's rise would land after the second's fall and rise, one
+/// edge where the registers made two.
+#[test]
+fn a_stalled_line_write_holds_off_changes_to_its_input() {
+    use std::sync::Barrier;
+    let t = Arc::new(Fixture::new(1));
+    t.w(reg::INT_MASK0_A, !0);
+    let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    {
+        let (entered, release) = (entered.clone(), release.clone());
+        *t.pi.stall.lock() = Some(Arc::new(move || {
+            entered.wait();
+            release.wait();
+        }));
+    }
+    let first = {
+        let t = t.clone();
+        std::thread::spawn(move || t.pi.int_modify(MODIFY_SET | 5))
+    };
+    // The first writer has set the bit and is stalled before writing the line.
+    entered.wait();
+    assert_eq!(t.pi.pending(0), 1 << 5);
+    assert!(!t.lines.get(0), "the stalled writer has not written the line");
+    let second = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            t.pi.int_modify(5);
+            t.pi.int_modify(MODIFY_SET | 5);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(t.pi.pending(0), 1 << 5, "the input changed while another writer held the lines");
+    assert!(!second.is_finished());
+    release.wait();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(t.lines.get(0));
+    // The bit rose, fell and rose: three edges in the order the registers made them.
+    assert_eq!((t.pi.rises[0].load(Ordering::SeqCst), t.pi.falls[0].load(Ordering::SeqCst)), (2, 1));
+}
+
+/// A reset writes the lines with the registers it clears: a line that was up
+/// falls, once, with the reset and not at the next change of an input.
+#[test]
+fn a_reset_drops_the_lines_that_were_up() {
+    let t = Fixture::new(1);
+    t.w(reg::INT_MASK0_A, !0);
+    t.w(reg::RT_EN_A, 1);
+    t.pi.int_modify(MODIFY_SET | 5);
+    t.w(reg::RT_PEND_A, 1);
+    assert!(t.lines.get(0) && t.lines.get(2));
+    Resettable::power_on(&*t.pi);
+    assert!(!t.lines.get(0) && !t.lines.get(2), "the lines stayed up through the reset");
+    let falls = |l: usize| t.pi.falls[l].load(Ordering::SeqCst);
+    assert_eq!((falls(0), falls(2)), (1, 1));
 }

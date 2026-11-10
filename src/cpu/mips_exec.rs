@@ -3067,8 +3067,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// `MipsExecutor` being moved into its owning `Arc<Mutex<...>>`). Callers
     /// should call this once the executor is at its final, stable address
     /// (inside that `Arc`) and treat the result as valid only from then on —
-    /// which holds for the rest of the process, since the executor never
-    /// moves again once there.
+    /// the executor never moves again once there. It is valid until the
+    /// executor is dropped, which for a machine that is dropped is before the
+    /// process ends: whoever holds the pointer (a device, a Hub) must have
+    /// stopped writing through it before then.
     pub fn interrupts_ptr(&self) -> *const AtomicU64 {
         &self.core.hot.interrupts as *const AtomicU64
     }
