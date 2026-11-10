@@ -11949,7 +11949,7 @@ mod undo_range_tests {
     impl BusDevice for NoBus {}
 
     fn tracked(ranges: Vec<MemRange>, virt: u64) -> usize {
-        let cfg = MipsCpuConfig { tlb_entries: 48, memory: Arc::new(MemoryMap::new(ranges)) };
+        let cfg = MipsCpuConfig { tlb_entries: 48, memory: Arc::new(MemoryMap::new(ranges)), prid: None };
         let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
             MipsExecutor::new(Arc::new(NoBus), PassthroughTlb::default(), &cfg);
         exec.core.cp0_status |= STATUS_KX;
