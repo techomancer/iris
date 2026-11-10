@@ -64,7 +64,7 @@ fn core_for(mem: Option<Arc<Mem>>) -> (Arc<Core>, Arc<Mutex<Vec<bool>>>) {
         let _ = core.dma.set(m);
     }
     let log = Arc::new(Mutex::new(Vec::new()));
-    core.connect_pin(IrqLine::new(Arc::new(Pin(log.clone())), 0));
+    let _ = core.inta.set(IrqLine::new(Arc::new(Pin(log.clone())), 0));
     log.lock().unwrap().clear();
     (core, log)
 }
@@ -724,36 +724,52 @@ fn a_transmit_ring_at_the_top_of_the_bus_stops_the_walk() {
     assert!(t.sent.pop().is_err());
 }
 
-/// A reset that lands while the receive thread is delivering a raise
-/// leaves the line low: the reset's drop goes out after the raise. The
-/// test plays the receive thread's part of `irq_flush` by hand, stopping
-/// between taking the queued raise and delivering it.
+/// The levels a pin was given must alternate, starting with a rise: the
+/// Bridge sends a packet on each rise, and a repeated level would be a
+/// rise it never should have seen.
+fn assert_alternating(levels: &[bool]) {
+    let mut now = false;
+    for (i, &l) in levels.iter().enumerate() {
+        assert_ne!(l, now, "call {i} repeated a level: {levels:?}");
+        now = l;
+    }
+}
+
+/// A reset, a raise and a guest that acknowledges and masks race on three
+/// threads. Every call the pin gets is a change, so the edges alternate, and
+/// the pin ends where the registers say.
 #[test]
-fn a_reset_during_an_interrupt_delivery_leaves_the_line_low() {
-    let t = rig();
-    t.w(INT_ENABLE, INT_RX_TIMER);
-    let order = t.eth.irq_order.lock();
-    let events = {
-        let mut st = t.eth.st.lock();
-        st.raise_int(INT_RX_TIMER);
-        std::mem::take(&mut st.irq_events)
-    };
-    assert_eq!(events, vec![true]);
-    std::thread::scope(|s| {
-        let reset = s.spawn(|| t.eth.reset());
-        // Give a reset that does not wait its chance to drop the line first.
-        let start = std::time::Instant::now();
-        while t.irq.lock().unwrap().is_empty() && start.elapsed() < Duration::from_millis(100) {
-            std::thread::yield_now();
-        }
-        for level in events {
-            t.eth.core.set_inta(level);
-        }
-        drop(order);
+fn threads_racing_a_reset_leave_only_real_edges_in_order() {
+    for _ in 0..50 {
+        let t = rig();
+        t.w(INT_ENABLE, INT_RX_TIMER);
+        t.irq.lock().unwrap().clear();
+        let (a, b, c) = (t.eth.clone(), t.eth.clone(), t.eth.clone());
+        let raise = std::thread::spawn(move || {
+            for _ in 0..200 {
+                a.raise_for_test(INT_RX_TIMER);
+            }
+        });
+        let reset = std::thread::spawn(move || {
+            for _ in 0..200 {
+                b.reset();
+            }
+        });
+        let guest = std::thread::spawn(move || {
+            for _ in 0..200 {
+                c.write32(INT_STATUS, INT_RX_TIMER);
+                c.write32(INT_ENABLE, 0);
+                c.write32(INT_ENABLE, INT_RX_TIMER);
+            }
+        });
+        raise.join().unwrap();
         reset.join().unwrap();
-    });
-    let levels = t.irq.lock().unwrap().clone();
-    assert_eq!(levels.last(), Some(&false), "levels: {levels:?}");
+        guest.join().unwrap();
+        let levels = t.irq.lock().unwrap().clone();
+        assert_alternating(&levels);
+        let want = t.eth.st.lock().output();
+        assert_eq!(t.irq_level(), want, "levels: {levels:?}");
+    }
 }
 
 /// While stopped no frame reaches guest memory; on start the queued one is
@@ -991,7 +1007,6 @@ fn save_load_round_trip() {
         st.set(INT_ENABLE, bits::INT_TX_EMPTY);
         st.set(INT_STATUS, bits::INT_TX_EMPTY);
         st.update_irq();
-        st.irq_events.clear();
         st.tx_frames = 9;
         // Let the power-on negotiation finish, so the save holds no
         // deadline for the two saves to differ by.
@@ -1019,4 +1034,36 @@ fn the_transceiver_round_trips_with_negotiation_in_progress() {
     dst.load_state(&v, now).unwrap();
     assert_eq!(v, dst.save_state(now));
     assert_eq!(src.deadline().is_some(), dst.deadline().is_some());
+}
+
+/// A guest acknowledges a source and then unmasks it, as two writes, while
+/// other threads read the registers. The source is raised only while it is
+/// masked, so the output is low for the whole run and the pin, which the
+/// Bridge turns into a packet on each rise, is never driven at all.
+#[test]
+fn the_output_never_rises_while_status_and_enable_never_agree() {
+    let t = rig();
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (eth, done) = (t.eth.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    eth.read32(INT_STATUS);
+                    eth.read32(INT_ENABLE);
+                }
+            })
+        })
+        .collect();
+    for _ in 0..20_000 {
+        t.eth.raise_for_test(INT_RX_TIMER);
+        t.w(INT_STATUS, INT_RX_TIMER);
+        t.w(INT_ENABLE, INT_RX_TIMER);
+        t.w(INT_ENABLE, 0);
+    }
+    done.store(true, Ordering::SeqCst);
+    for r in readers {
+        r.join().unwrap();
+    }
+    assert_eq!(*t.irq.lock().unwrap(), Vec::<bool>::new(), "a pin edge the registers never made");
 }
