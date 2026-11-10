@@ -36,7 +36,7 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
-use super::Effect;
+use super::{Effect, Routing};
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
 use parking_lot::Mutex;
@@ -205,7 +205,7 @@ pub struct Ni {
     /// The node number and the neighbour's, mirrored from the state and the
     /// cable whenever either changes, so the Hub's node decode reads them
     /// without a lock. `NO_NEIGHBOUR` while no powered neighbour is across.
-    number: AtomicU16,
+    routing: Arc<Routing>,
     neighbour: AtomicU32,
 }
 
@@ -214,14 +214,14 @@ const NO_NEIGHBOUR: u32 = u32::MAX;
 impl Ni {
     /// `revision` is the chip revision code in NI_STATUS_REV_ID bits 7:4 (3 is
     /// Hub 2.1, 5 is Hub 2.3).
-    pub fn new(revision: u8) -> Self {
+    pub fn new(revision: u8, routing: Arc<Routing>) -> Self {
         assert!(revision < 16);
         Self {
             revision,
             state: Mutex::new(State::new(revision)),
             peer: Mutex::new(None),
             enabled: AtomicBool::new(true),
-            number: AtomicU16::new(0),
+            routing,
             neighbour: AtomicU32::new(NO_NEIGHBOUR),
         }
     }
@@ -254,7 +254,7 @@ impl Ni {
 
     /// The node number this Hub answers to.
     pub fn number(&self) -> u16 {
-        self.number.load(Ordering::Acquire)
+        self.routing.number()
     }
 
     /// The direction the first Router takes for a packet to `destination`, or
@@ -470,9 +470,9 @@ impl Ni {
                     s.status = (s.status & !STATUS_WRITABLE) | (value & STATUS_WRITABLE);
                     changed = true;
                     let after = s.number();
-                    self.number.store(after, Ordering::Release);
+                    self.routing.set_number(after);
                     if after != before {
-                        effect = Effect::NodeNumber(after);
+                        effect = Effect::NodeNumber;
                     }
                 }
                 reg::PORT_RESET => {
@@ -584,7 +584,7 @@ impl Ni {
             | response;
         // A request that renumbered the neighbour tells that Hub's machine.
         match effect {
-            Effect::NodeNumber(number) => Effect::PeerNodeNumber(number),
+            Effect::NodeNumber => Effect::PeerNodeNumber,
             _ => Effect::None,
         }
     }
@@ -672,7 +672,7 @@ impl Resettable for Ni {
             let mut s = self.state.lock();
             *s = State::new(self.revision);
         }
-        self.number.store(0, Ordering::Release);
+        self.routing.set_number(0);
         // The link comes out of reset now: its width is settled from both
         // ends' force bits as they stand.
         self.announce();

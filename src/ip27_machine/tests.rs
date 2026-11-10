@@ -125,6 +125,29 @@ fn a_reset_enables_the_processor_again() {
     });
 }
 
+/// A write to the Hub's soft-reset register through the processor's I/O
+/// space reaches the processor's interrupt word, and the processor restarts at
+/// the reset vector on its next step.
+#[test]
+fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
+    use std::sync::atomic::Ordering;
+    big_stack(|| {
+        let dir = Scratch::new("o200-softreset");
+        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let cpu = m.cpu_at(0);
+        cpu.step_n_inline(5).unwrap();
+        assert_ne!(cpu.state_digest().unwrap().pc, 0xffff_ffff_bfc0_0000, "the processor has left the reset vector");
+        let word = unsafe { &*cpu.interrupts_ptr() };
+        assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0);
+        let io = m.node().hub.claim(Space::Io);
+        assert_eq!(io.write64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::SOFTRESET, 1), BUS_OK);
+        assert_ne!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the write raised the line");
+        cpu.step_n_inline(1).unwrap();
+        assert_eq!(word.load(Ordering::SeqCst) & crate::cpu::mips_exec::SOFT_RESET_BIT, 0, "the processor took it");
+        assert_eq!(cpu.state_digest().unwrap().pc, 0xffff_ffff_bfc0_0000);
+    });
+}
+
 #[test]
 fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
     big_stack(|| {

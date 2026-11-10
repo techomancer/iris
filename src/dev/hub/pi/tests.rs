@@ -30,7 +30,7 @@ impl Fixture {
     fn new(cpus: u8) -> Self {
         let now = Arc::new(AtomicU64::new(1_000_000));
         let clock = now.clone();
-        let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
+        let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)), Routing::new());
         let lines = Arc::new(Lines::default());
         for (slice, word) in lines.0.iter().enumerate() {
             pi.set_cpu_interrupts(slice, word);
@@ -43,8 +43,7 @@ impl Fixture {
     fn w(&self, off: u64, value: u64) {
         let text = match self.pi.write(off, value) {
             Effect::None => return,
-            Effect::CachedAlias(bytes) => vec![format!("calias {bytes:#x}")],
-            Effect::SoftReset(slices) => (0..2).filter(|&i| slices[i]).map(|i| format!("soft {i}")).collect(),
+            Effect::CachedAlias => vec![format!("calias {:#x}", self.pi.calias_bytes())],
             other => panic!("the processor interface does not return {other:?}"),
         };
         self.effects.lock().extend(text);
@@ -53,6 +52,10 @@ impl Fixture {
     fn advance(&self, ticks: u64) {
         self.now.fetch_add(ticks * TICK_NS, Ordering::SeqCst);
         self.pi.poll();
+    }
+    /// Whether slice `slice`'s word carries the soft-reset request.
+    fn reset_requested(&self, slice: usize) -> bool {
+        self.lines.0[slice].load(Ordering::SeqCst) >> 63 == 1
     }
     fn take_effects(&self) -> Vec<String> {
         std::mem::take(&mut *self.effects.lock())
@@ -100,7 +103,7 @@ fn the_processor_number_names_the_reading_processor() {
     t.w(reg::CPU_NUM, 1);
     assert_eq!(t.r(reg::CPU_NUM), 0);
     // A node whose slice A is global CPU 2.
-    let node = Pi::new(2, 2, Arc::new(|| 0));
+    let node = Pi::new(2, 2, Arc::new(|| 0), Routing::new());
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(3);
         assert_eq!(node.read64(reg::CPU_NUM).data, 1);
@@ -120,12 +123,16 @@ fn processor_presence_enable_nmi_and_soft_reset() {
     assert_eq!(t.r(reg::CPU_ENABLE_B), 1);
     // The enable and the NMI are logged and ask nothing of the machine.
     assert!(t.take_effects().is_empty());
-    // The soft reset reaches only the enabled processors.
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, false));
+    // The soft reset reaches only the enabled processors, as bit 63 of the
+    // processor's word, and asks nothing else.
     t.w(reg::SOFTRESET, 1);
-    assert_eq!(t.take_effects(), ["soft 1"]);
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, true));
+    assert!(t.take_effects().is_empty());
     t.w(reg::NMI_A, 1);
     t.w(reg::NMI_B, 0);
     assert!(t.take_effects().is_empty());
+    assert_eq!(t.lines.0[0].load(Ordering::SeqCst), 0, "NMI does not reach the processor");
     // Reset halts both processors again; the enables read zero.
     t.pi.power_on();
     assert_eq!(t.r(reg::CPU_ENABLE_B), 0);
@@ -140,9 +147,10 @@ fn an_absent_processors_enable_stores_and_reaches_nothing() {
     t.w(reg::NMI_B, 1);
     t.w(reg::SOFTRESET, 1);
     assert!(t.take_effects().is_empty());
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, false));
     t.w(reg::CPU_ENABLE_A, 1);
     t.w(reg::SOFTRESET, 1);
-    assert_eq!(t.take_effects(), ["soft 0"]);
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (true, false));
     // Nor does the absent slot get an interrupt line.
     t.w(reg::INT_MASK0_B, !0);
     t.w(reg::INT_PEND_MOD, MODIFY_SET | 3);

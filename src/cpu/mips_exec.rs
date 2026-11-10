@@ -548,8 +548,8 @@ const EXT_INT_MASK: u32 = crate::cpu::mips_core::CAUSE_IP7 |
                           crate::cpu::mips_core::CAUSE_IP3 |
                           crate::cpu::mips_core::CAUSE_IP2;
 
-// Bit 63 of the interrupts word = soft-reset request
-const SOFT_RESET_BIT: u64 = 1u64 << 63;
+// Bit 63 of the interrupts word = soft-reset request. The Hub sets it too.
+pub(crate) const SOFT_RESET_BIT: u64 = 1u64 << 63;
 
 /// CP0 `Index` slot field, bits [5:0] — the only bits that select a TLB entry.
 ///

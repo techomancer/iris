@@ -149,7 +149,7 @@ fn a_node_that_holds_another_number_sends_node_zero_beyond_the_cached_alias_to_t
     let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
     let phys = mem.physical();
     let echo: Arc<dyn BusDevice> = Arc::new(Echo);
-    let zero = mem.node_zero();
+    let zero = mem.node_zero(Routing::new());
     mem.route_nodes(echo.clone());
     let alias = 64 << 20;
     assert_eq!(phys.write64(alias + 0x1000, 0x77), BUS_OK);

@@ -528,7 +528,7 @@ impl IdleParkState {
 /// readers (Wd33c93a's deferred-interrupt spin) and, under `ci_clock`, CP0
 /// Count keep seeing progress exactly as the old `spin_loop` stall did.
 pub fn park_wait(core: &mut MipsCore) {
-    const SOFT_RESET_BIT: u64 = 1u64 << 63;
+    use crate::cpu::mips_exec::SOFT_RESET_BIT;
     PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
     loop {
         // Announce the park before the last look at the pending word (Dekker).

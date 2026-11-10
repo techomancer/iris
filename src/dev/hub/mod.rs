@@ -61,23 +61,55 @@ pub const WINDOW_SIZE: u64 = 8 << 20;
 /// Pending interrupts are two banks of 64 bits.
 pub const PENDING_BANKS: usize = 2;
 
-/// What the Hub asks of the machine around it. Called outside every section
-/// lock, on the thread that wrote the register. All defaults do nothing, so a
-/// test or a partial machine implements only what it wires.
-pub trait HubHooks: Send + Sync {
-    /// A store to PI_SOFTRESET reached the enabled processor `slice`.
-    fn soft_reset(&self, _slice: usize) {}
-    /// PI_CALIAS_SIZE was written: the cached-alias window of every processor
-    /// view now spans `bytes` (0 disables it).
-    fn cached_alias_changed(&self, _bytes: u64) {}
-    /// The node number this Hub answers to changed, by a store to
-    /// NI_STATUS_REV_ID or a reset.
-    fn node_number_changed(&self, _number: u16) {}
-    /// NI_PORT_RESET bit 0: restart the whole machine.
-    fn machine_restart(&self) {}
+/// The numbers the rest of the node decodes by, published by the unit that
+/// owns each: the network unit stores the node number and the processor
+/// interface the cached-alias size, each under its own lock as the register
+/// changes, and any reader loads them without one. The Hub's address decode
+/// reads them on every access, and the machine's node-zero routing reads them
+/// when a store has changed one.
+///
+/// The node number is 9 bits in NI_STATUS_REV_ID (a store of 0x1ff reads
+/// back whole), so it is a `u16`, not a byte.
+pub struct Routing {
+    number: AtomicU16,
+    calias: AtomicU64,
+}
+
+impl Routing {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { number: AtomicU16::new(0), calias: AtomicU64::new(pi::calias_bytes(pi::CALIAS_RESET)) })
+    }
+
+    /// The node number the Hub answers to.
+    pub fn number(&self) -> u16 {
+        self.number.load(Ordering::Acquire)
+    }
+
+    /// Bytes the cached alias spans: the processor view's node-zero memory
+    /// below it stays on this node.
+    pub fn calias(&self) -> u64 {
+        self.calias.load(Ordering::Acquire)
+    }
+
+    fn set_number(&self, number: u16) {
+        self.number.store(number, Ordering::Release);
+    }
+
+    fn set_calias(&self, bytes: u64) {
+        self.calias.store(bytes, Ordering::Release);
+    }
+
+    /// Publish a node number and alias directly, for a test of whatever
+    /// reads them.
+    #[cfg(test)]
+    pub(crate) fn set(&self, number: u16, calias: u64) {
+        self.set_number(number);
+        self.set_calias(calias);
+    }
 }
 
 use crate::dev::heart::Clock;
+use crate::ip27::NodeZero;
 use self::io::{Io, NodeFabric};
 use self::md::Md;
 use self::ni::{NetPeer, Ni};
@@ -91,7 +123,9 @@ use crate::xtalk::{HostPort, XtalkHost};
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::traits::MachineEvent;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock, Weak};
 
 /// What differs between Hubs: the processors the node populates, where its
@@ -161,20 +195,20 @@ const XIO_IDENTITY: u64 = 0x0160_0000;
 /// What a register write changed that the rest of the chip or the machine must
 /// act on. A unit returns it from its write, as the AMD flash engine returns
 /// its program effect, and the Hub acts on it once the unit's lock is
-/// released: a unit holds no reference to a sibling and no closure.
+/// released: a unit holds no reference to a sibling and no closure. The new
+/// values are in [`Routing`], not in the effect, so two writers that race
+/// leave the routing at the last value written, not the last effect applied.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Effect {
     #[default]
     None,
     /// NI_STATUS_REV_ID changed the node number this Hub answers to.
-    NodeNumber(u16),
+    NodeNumber,
     /// A vector request from this Hub's port changed the neighbour's node
     /// number.
-    PeerNodeNumber(u16),
-    /// PI_CALIAS_SIZE changed the cached-alias window to this many bytes.
-    CachedAlias(u64),
-    /// PI_SOFTRESET reached the enabled processors flagged here.
-    SoftReset([bool; 2]),
+    PeerNodeNumber,
+    /// PI_CALIAS_SIZE changed the cached-alias window.
+    CachedAlias,
     /// NI_PORT_RESET asked to restart the whole machine.
     Restart,
     /// A control write launched a block-transfer engine.
@@ -186,9 +220,9 @@ pub enum Effect {
 struct NodeView {
     spaces: [OnceLock<Arc<dyn BusDevice>>; SPACES],
     pi: Arc<Pi>,
-    /// The machine's hooks for this node, shared with its Hub: a neighbour
-    /// that renumbers this node over the cable tells them.
-    machine: Arc<OnceLock<Arc<dyn HubHooks>>>,
+    /// The machine's node-zero routing, if it has one: a neighbour that
+    /// renumbers this node over the cable has it re-read the number.
+    zero: OnceLock<Arc<NodeZero>>,
 }
 
 /// The register window's sections. Kept apart from the Hub's address decode
@@ -259,12 +293,12 @@ pub struct Hub {
     /// once when the cable is fitted, so an access to it takes no lock and
     /// touches no reference count.
     peer: OnceLock<Arc<NodeView>>,
-    /// Bytes the cached alias spans: the processor view's node-zero memory
-    /// below it stays on this node.
-    calias: AtomicU64,
-    /// The machine's side of the node: processors, the cached alias and
-    /// restart. Shared with the view a neighbour holds.
-    machine: Arc<OnceLock<Arc<dyn HubHooks>>>,
+    /// The node number and cached-alias size, as the units that own them
+    /// publish them.
+    routing: Arc<Routing>,
+    /// Where NI_PORT_RESET bit 0 restarts the machine: the receiver goes to
+    /// the machine's system controller, as the Indy IOC's does.
+    events: OnceLock<Sender<MachineEvent>>,
     weak: Weak<Hub>,
 }
 
@@ -278,10 +312,10 @@ impl std::ops::Deref for Hub {
 impl Hub {
     pub fn new(cfg: HubConfig, clock: Clock) -> Arc<Self> {
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
-            let machine = Arc::new(OnceLock::new());
-            let pi = Pi::new(cfg.cpus, cfg.cpu_base, clock.clone());
-            let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone(), machine: machine.clone() });
-            let ni = Arc::new(Ni::new(cfg.ni_revision));
+            let routing = Routing::new();
+            let pi = Pi::new(cfg.cpus, cfg.cpu_base, clock.clone(), routing.clone());
+            let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone(), zero: OnceLock::new() });
+            let ni = Arc::new(Ni::new(cfg.ni_revision, routing.clone()));
             let io = Io::new(cfg.widget_revision, cfg.manufacturer);
             let regs = Arc::new(Regs {
                 pi,
@@ -294,8 +328,8 @@ impl Hub {
                 regs,
                 view,
                 peer: OnceLock::new(),
-                calias: AtomicU64::new(pi::calias_bytes(15)),
-                machine,
+                routing,
+                events: OnceLock::new(),
                 weak: weak.clone(),
             }
         });
@@ -347,7 +381,12 @@ impl Hub {
 
     /// The cached-alias window size PI_CALIAS_SIZE currently names.
     pub fn calias_bytes(&self) -> u64 {
-        self.pi.calias_bytes()
+        self.routing.calias()
+    }
+
+    /// The node number and cached-alias size as the units publish them.
+    pub fn routing(&self) -> &Arc<Routing> {
+        &self.routing
     }
 
     /// Where processor `slice`'s three interrupt lines go: its interrupt word
@@ -369,46 +408,40 @@ impl Hub {
     pub(crate) fn publishes_to_cpu(&self, slice: usize) -> bool {
         self.pi.publishes_to(slice)
     }
-    /// The machine's side of the node: processors, the cached alias and
-    /// restart.
-    pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
-        let _ = self.machine.set(hooks);
+    /// Where NI_PORT_RESET bit 0 sends [`MachineEvent::HardReset`]. Wired
+    /// once; a Hub with no sender logs the restart and carries on.
+    pub fn set_event_sender(&self, tx: Sender<MachineEvent>) {
+        let _ = self.events.set(tx);
+    }
+
+    /// The machine's node-zero routing for this node. It is told to re-read
+    /// [`Routing`] whenever a store changes the node number or the cached
+    /// alias, here or from the neighbour's vector PIO, and after reset.
+    pub fn set_node_zero(&self, zero: Arc<NodeZero>) {
+        let _ = self.view.zero.set(zero);
     }
 
     /// Act on what a register write changed, now that the unit that made it
-    /// has let go of its lock. The machine's hook is the last thing called.
+    /// has let go of its lock.
     fn apply(&self, effect: Effect) {
-        let machine = self.machine.get();
         match effect {
             Effect::None => {}
-            Effect::NodeNumber(number) => {
-                if let Some(h) = machine {
-                    h.node_number_changed(number);
+            Effect::NodeNumber | Effect::CachedAlias => {
+                if let Some(zero) = self.view.zero.get() {
+                    zero.refresh();
                 }
             }
-            Effect::PeerNodeNumber(number) => {
-                if let Some(h) = self.peer.get().and_then(|peer| peer.machine.get()) {
-                    h.node_number_changed(number);
+            Effect::PeerNodeNumber => {
+                if let Some(zero) = self.peer.get().and_then(|peer| peer.zero.get()) {
+                    zero.refresh();
                 }
             }
-            Effect::CachedAlias(bytes) => {
-                self.calias.store(bytes, Ordering::Release);
-                if let Some(h) = machine {
-                    h.cached_alias_changed(bytes);
+            Effect::Restart => match self.events.get() {
+                Some(tx) => {
+                    let _ = tx.send(MachineEvent::HardReset);
                 }
-            }
-            Effect::SoftReset(slices) => {
-                if let Some(h) = machine {
-                    for slice in (0..2).filter(|&i| slices[i]) {
-                        h.soft_reset(slice);
-                    }
-                }
-            }
-            Effect::Restart => {
-                if let Some(h) = machine {
-                    h.machine_restart();
-                }
-            }
+                None => crate::dlog!(LogModule::Hub, "Hub NI: restart requested; no machine is listening"),
+            },
             Effect::Bte(engine, launch) => self.io.run_bte(engine, launch, self),
         }
     }
@@ -447,7 +480,7 @@ impl Hub {
     /// unit's own mirrors, so the decode takes no lock.
     fn with_node<R>(&self, number: u8, f: impl FnOnce(&NodeView) -> R) -> Option<R> {
         let number = u16::from(number);
-        if number == self.ni.number() {
+        if number == self.routing.number() {
             Some(f(&self.view))
         } else if self.ni.neighbour_number() == Some(number) {
             self.peer.get().map(|peer| f(peer))
@@ -460,25 +493,25 @@ impl Hub {
     /// number. Addresses are the 40-bit physical address with the node in bits
     /// 39:32.
     pub fn claim(self: &Arc<Self>, space: Space) -> Arc<dyn BusDevice> {
-        Arc::new(View { hub: self.clone(), space, local: Local::Never })
+        Arc::new(View { hub: self.clone(), routing: self.routing.clone(), space, local: Local::Never })
     }
 
     /// The processor's view of memory: a node-zero address below the cached
     /// alias size stays on this node and any other goes to the claim map.
     pub fn cpu_memory(self: &Arc<Self>) -> Arc<dyn BusDevice> {
-        Arc::new(View { hub: self.clone(), space: Space::Memory, local: Local::Calias })
+        Arc::new(View { hub: self.clone(), routing: self.routing.clone(), space: Space::Memory, local: Local::Calias })
     }
 
     /// The processor's view of the Hub-special space: always this node's own.
     pub fn cpu_special(self: &Arc<Self>) -> Arc<dyn BusDevice> {
-        Arc::new(View { hub: self.clone(), space: Space::HubSpecial, local: Local::Always })
+        Arc::new(View { hub: self.clone(), routing: self.routing.clone(), space: Space::HubSpecial, local: Local::Always })
     }
 
     /// The processor's view of the I/O space: this node's registers at the
     /// reader's own alias (node field zero), whatever number the node holds,
     /// and any other address claimed by the node number it carries.
     pub fn cpu_io(self: &Arc<Self>) -> Arc<dyn BusDevice> {
-        Arc::new(View { hub: self.clone(), space: Space::Io, local: Local::IoAlias })
+        Arc::new(View { hub: self.clone(), routing: self.routing.clone(), space: Space::Io, local: Local::IoAlias })
     }
 
     /// This node's I/O space, addressed from the node's base: the crossbar
@@ -553,6 +586,9 @@ enum Local {
 /// it: the node number picks the Hub, and the rest the address within it.
 struct View {
     hub: Arc<Hub>,
+    /// The hub's published numbers, held here so a decode loads them through
+    /// one pointer.
+    routing: Arc<Routing>,
     space: Space,
     local: Local,
 }
@@ -562,7 +598,7 @@ impl View {
         let number = ((a >> NODE_SHIFT) & NODE_MASK) as u8;
         let stays = match self.local {
             Local::Never => false,
-            Local::Calias => number == 0 && a < self.hub.calias.load(Ordering::Acquire),
+            Local::Calias => number == 0 && a < self.routing.calias(),
             Local::Always => number == 0,
             Local::IoAlias => number == 0 && (IO_REGISTERS_LOCAL..IO_REGISTERS_NAMED).contains(&offset),
         };
@@ -964,8 +1000,7 @@ impl Resettable for Hub {
         self.md.power_on();
         self.io.power_on();
         self.ni.power_on();
-        self.calias.store(self.pi.calias_bytes(), Ordering::Release);
-        self.apply(Effect::NodeNumber(self.ni.number()));
+        self.apply(Effect::NodeNumber);
     }
 }
 

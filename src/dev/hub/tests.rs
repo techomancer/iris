@@ -12,6 +12,7 @@
 
 use super::*;
 use parking_lot::Mutex;
+use crate::traits::MachineEvent;
 use std::sync::atomic::AtomicBool;
 
 /// A node's memory: big-endian bytes, failing past its end.
@@ -72,23 +73,6 @@ impl BusDevice for Bytes {
     fn write8(&self, a: u64, v: u8) -> u32 {
         self.0.lock()[a as usize] = v;
         BUS_OK
-    }
-}
-
-#[derive(Default)]
-struct Machine(Mutex<Vec<String>>);
-impl HubHooks for Machine {
-    fn soft_reset(&self, slice: usize) {
-        self.0.lock().push(format!("soft {slice}"));
-    }
-    fn cached_alias_changed(&self, bytes: u64) {
-        self.0.lock().push(format!("calias {bytes:#x}"));
-    }
-    fn node_number_changed(&self, number: u16) {
-        self.0.lock().push(format!("number {number}"));
-    }
-    fn machine_restart(&self) {
-        self.0.lock().push("restart".into());
     }
 }
 
@@ -211,39 +195,96 @@ fn the_i2c_controller_takes_narrow_accesses_over_the_md_block() {
     assert_eq!(hub.read64(md::reg::I2C_BASE).data, 0x81, "an 8-byte read reaches the PCF8584 status");
 }
 
+
 #[test]
-fn the_hub_carries_what_its_units_change_to_the_machine() {
+fn a_restart_reaches_the_machines_receiver_and_a_soft_reset_the_processor() {
     let hub = hub(2, 3);
-    let machine = Arc::new(Machine::default());
-    hub.set_hooks(machine.clone());
-    let take = || std::mem::take(&mut *machine.0.lock());
+    let (tx, rx) = std::sync::mpsc::channel();
+    hub.set_event_sender(tx);
+    let words = [AtomicU64::new(0), AtomicU64::new(0)];
+    hub.set_cpu_interrupts(0, &words[0]);
+    hub.set_cpu_interrupts(1, &words[1]);
+    // Enable and NMI are stored and reach nothing.
     hub.write64(pi::reg::CPU_ENABLE_A, 1);
     hub.write64(pi::reg::NMI_B, 1);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(words[0].load(Ordering::SeqCst) | words[1].load(Ordering::SeqCst), 0);
+    // The soft reset reaches the enabled processor only.
     hub.write64(pi::reg::SOFTRESET, 1);
-    hub.write64(pi::reg::CALIAS_SIZE, 2);
+    assert_eq!(words[0].load(Ordering::SeqCst), crate::cpu::mips_exec::SOFT_RESET_BIT);
+    assert_eq!(words[1].load(Ordering::SeqCst), 0);
+    assert!(rx.try_recv().is_err(), "a soft reset restarts only the processor");
+    // A local port reset restarts the machine.
     hub.write64(ni::reg::PORT_RESET, 0x81);
-    assert_eq!(take(), ["soft 0", "calias 0x2000", "restart"]);
-    number(&hub, 4);
-    assert_eq!(take(), ["number 4"]);
-    hub.power_on();
-    assert_eq!(take(), ["number 0"]);
+    assert!(matches!(rx.try_recv(), Ok(MachineEvent::HardReset)));
+    assert!(rx.try_recv().is_err());
+    // A link reset alone does not.
+    hub.write64(ni::reg::PORT_RESET, 0x2);
+    assert!(rx.try_recv().is_err());
+    hub.clear_cpu_interrupts();
 }
 
-/// The processor reaches the registers through the node's I/O space, not the
-/// window; a write there changes the same things and tells the machine the
-/// same way.
 #[test]
-fn a_register_write_through_the_io_space_acts_on_what_it_changes() {
-    let hub = hub(2, 3);
-    let machine = Arc::new(Machine::default());
-    hub.set_hooks(machine.clone());
-    let take = || std::mem::take(&mut *machine.0.lock());
+fn a_restart_with_no_machine_listening_is_only_logged() {
+    let hub = hub(1, 3);
+    assert_eq!(hub.write64(ni::reg::PORT_RESET, 0x81), BUS_OK);
+}
+
+/// A node number or cached-alias write changes what the machine's node-zero
+/// routing sends off the node, with no call from the machine in between, and
+/// the same write through the processor's I/O space does the same.
+#[test]
+fn a_node_number_write_reaches_the_node_zero_routing() {
+    use crate::ip27::NodeMemory;
+    let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
+    let phys = mem.physical();
+    let hub = hub(1, 3);
+    let (a, b) = (0x1000, (64 << 20) + 0x1000);
+    assert_eq!(phys.write64(b, 0x77), BUS_OK);
+    mem.route_nodes(hub.claim(Space::Memory));
+    hub.set_node_zero(mem.node_zero(hub.routing().clone()));
+    // Unnumbered: node zero's memory is the node's own, wherever it is.
+    assert_eq!(phys.read64(b).data, 0x77);
+    // Numbered 6: beyond the 64 MiB sentinel alias the reference leaves the
+    // node, for the Hub that holds zero, and there is none.
+    number(&hub, 6);
+    assert_eq!(hub.routing().number(), 6);
+    assert_ne!(phys.read64(b).status, BUS_OK);
+    assert_eq!(phys.write64(a, 0x55), BUS_OK, "within the alias it stays");
+    // A smaller alias moves the same boundary down; through the I/O space too.
     let space = hub.io_space();
-    assert_eq!(space.write64(IO_REGISTERS_LOCAL + pi::reg::CALIAS_SIZE, 2), BUS_OK);
-    assert_eq!(space.write64(IO_REGISTERS_LOCAL + ni::reg::STATUS, 4 << 8), BUS_OK);
-    assert_eq!(take(), ["calias 0x2000", "number 4"]);
-    assert_eq!(hub.calias.load(Ordering::SeqCst), 0x2000);
-    assert_eq!(hub.claim(Space::Memory).read8(NODE(4) + 0x10).data, 0x10, "the node answers to its new number");
+    assert_eq!(space.write64(IO_REGISTERS_LOCAL + pi::reg::CALIAS_SIZE, 1), BUS_OK);
+    assert_eq!(hub.calias_bytes(), 4 << 10);
+    assert_ne!(phys.read64(a).status, BUS_OK);
+    // Back to zero, by reset: the memory is the node's again.
+    hub.power_on();
+    assert_eq!(hub.routing().number(), 0);
+    assert_eq!(phys.read64(b).data, 0x77);
+    // Renumbered through the I/O space.
+    assert_eq!(space.write64(IO_REGISTERS_LOCAL + ni::reg::STATUS, 6 << 8), BUS_OK);
+    assert_ne!(phys.read64(b).status, BUS_OK);
+}
+
+/// A neighbour that renumbers this node over the cable has its routing
+/// re-read the number too.
+#[test]
+fn a_neighbours_renumbering_reaches_this_nodes_routing() {
+    use crate::ip27::NodeMemory;
+    let (a, b) = pair();
+    let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
+    let phys = mem.physical();
+    let beyond = (64 << 20) + 0x1000;
+    assert_eq!(phys.write64(beyond, 0x77), BUS_OK);
+    mem.route_nodes(b.claim(Space::Memory));
+    b.set_node_zero(mem.node_zero(b.routing().clone()));
+    assert_eq!(phys.read64(beyond).data, 0x77);
+    // a's vector write of b's node number: b holds 3 now and no longer
+    // answers for node zero, so its memory beyond the alias leaves it.
+    a.write64(ni::reg::VECTOR, 0);
+    a.write64(ni::reg::VECTOR_DATA, 3 << 8);
+    a.write64(ni::reg::VECTOR_PARMS, ni::VECTOR_WRITE);
+    assert_eq!(b.routing().number(), 3);
+    assert_ne!(phys.read64(beyond).status, BUS_OK);
 }
 
 #[test]
@@ -257,7 +298,7 @@ fn reset_restores_the_registers_and_keeps_what_firmware_parks() {
     hub.power_on();
     assert_eq!(r64(&*hub, pi::reg::ERR_STACK_ADDR_B), 0xabcd_0000);
     assert_eq!(r64(&*hub, pi::reg::CALIAS_SIZE), 15);
-    assert_eq!(hub.calias.load(Ordering::SeqCst), 64 << 20);
+    assert_eq!(hub.routing().calias(), 64 << 20);
     assert_eq!(r64(&*hub, md::reg::CONFIG), 0x001e_7fbc_3fff_ffff);
     assert_eq!(r64(&*hub, io::reg::SCRATCH_0), 0);
     assert_eq!(hub.ni().number(), 0);
@@ -721,7 +762,6 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     a.pi().set_timer_manager(timers.clone());
     assert_eq!(Arc::strong_count(&timers), 1, "the interface holds the timer manager strongly");
     a.attach_i2c(Arc::new(Bytes::default()));
-    a.set_hooks(Arc::new(Machine::default()));
     a.io().connect_widget(9, Arc::new(Bytes::default()));
     a.io().connect_widget(8, a.widget_face());
     let held = (a.inbound(), a.widget_face(), a.interrupt_target(), a.cpu_memory(), a.cpu_special(), a.processor_io(Arc::new(Downstream::default())));

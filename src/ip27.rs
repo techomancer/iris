@@ -42,6 +42,7 @@
 //!
 //! Ported from hw/mips/sgi/sn0.c in jamesbraid/qemu-sgi-origami.
 
+use crate::dev::hub::Routing;
 use crate::dev::node_flash::NodeFlash;
 use crate::devlog::LogModule;
 use crate::ip35::SparseWindowMap;
@@ -175,8 +176,9 @@ impl NodeMemory {
     /// another number, for [`NodeZero::update`] to apply. It sends the
     /// reference to the view [`Self::route_nodes`] was given, so a board with
     /// one node, which routes nothing, never sends it anywhere.
-    pub fn node_zero(&self) -> Arc<NodeZero> {
+    pub fn node_zero(&self, routing: Arc<Routing>) -> Arc<NodeZero> {
         Arc::new(NodeZero {
+            routing,
             phys: Arc::downgrade(&self.phys),
             layout: self.layout.clone(),
             claim: self.claim.clone(),
@@ -453,7 +455,9 @@ impl BusDevice for Ip27Bus {
 /// speed and nothing else, since its software addresses its memory by its
 /// number.
 pub struct NodeZero {
-    /// Weak: the Hub that owns this through its hooks also owns the memory.
+    /// Where the Hub publishes the number and the alias.
+    routing: Arc<Routing>,
+    /// Weak: the Hub holds this, and the node owns the memory.
     phys: Weak<Physical>,
     layout: Arc<[Run]>,
     claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
@@ -469,18 +473,22 @@ struct NodeZeroState {
 }
 
 impl NodeZero {
-    /// The number the node last held.
-    pub fn number(&self) -> u16 {
-        self.state.lock().number
+    /// Re-read the node's number and cached alias from [`Routing`] and route
+    /// to match. The read is under this lock, so of two stores that race the
+    /// later refresh to take it applies the later value. Called after a store
+    /// changed either, never on an access.
+    pub fn refresh(&self) {
+        let mut st = self.state.lock();
+        st.number = self.routing.number();
+        st.calias = self.routing.calias();
+        self.apply(&mut st);
     }
 
-    /// The node holds `number` and its cached alias spans `calias` bytes
-    /// (the node's number changed, or the alias did).
+    /// The node holds `number` and its cached alias spans `calias` bytes.
+    #[cfg(test)]
     pub fn update(&self, number: u16, calias: u64) {
-        let mut st = self.state.lock();
-        st.number = number;
-        st.calias = calias;
-        self.apply(&mut st);
+        self.routing.set(number, calias);
+        self.refresh();
     }
 
     fn apply(&self, st: &mut NodeZeroState) {
