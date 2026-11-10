@@ -266,11 +266,9 @@ impl Xbow {
     }
 
     pub fn register_locks(self: &Arc<Self>) {
-        use crate::locks::register_lock_fn;
-        let me = self.clone();
-        register_lock_fn("xbow::regs", move || me.regs.is_locked());
-        let me = self.clone();
-        register_lock_fn("xbow::irq_order", move || me.irq_order.is_locked());
+        use crate::locks::register_mutex_fn;
+        register_mutex_fn("xbow::regs", self, |x| x.regs.is_locked());
+        register_mutex_fn("xbow::irq_order", self, |x| x.irq_order.is_locked());
     }
 
     /// Run `f` on the registers, then do what it left outside the lock:
@@ -905,6 +903,17 @@ mod tests {
         assert_eq!(x.read(0x00, 4), None);
         x.read(STATUS_CLEAR + 4, 4).unwrap();
         assert_eq!(*decoder.0.lock(), [(0, 0x12_0180_0090, 0x2a, true), (0, 0x12_0180_0090, 0x2a, false)]);
+    }
+
+    /// The lock registry outlives a machine's tests; it must not keep the
+    /// Crossbow alive.
+    #[test]
+    fn registering_the_locks_does_not_keep_the_crossbow_alive() {
+        let x = Arc::new(octane());
+        x.register_locks();
+        let weak = Arc::downgrade(&x);
+        drop(x);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
