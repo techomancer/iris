@@ -14,7 +14,8 @@
 //!   with the never-came-out-of-reset reason set, which the guest kernel
 //!   takes to mean no CrayLink rather than a lost one. The model stays in M mode.
 //! - Failing, rather than timing out, an access to a node number no reachable
-//!   Hub holds is an approximation (it is made by the shell's claim map).
+//!   Hub holds is an approximation (the Hub's node decode makes it from the numbers
+//!   this unit mirrors).
 //! - A vector launch that reaches nothing leaves the status untouched, so the
 //!   requester's poll times out. Overrun never sets. A target answers from its
 //!   own register store with no local side effects; a register outside the set
@@ -35,12 +36,12 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
-use super::HubHooks;
+use super::Effect;
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::{Arc, Weak};
 
 pub mod reg {
     pub const STATUS: u64 = 0x60_0000;
@@ -127,8 +128,9 @@ pub struct VectorRequest {
 /// The far end of the cable, as this Hub's port sees it.
 pub trait NetPeer: Send + Sync {
     /// Perform a vector request at the target: its answer, or `None` for an
-    /// address error, and the answering node number.
-    fn receive(&self, request: &VectorRequest) -> (Option<u64>, u16);
+    /// address error, the answering node number, and what the request changed
+    /// that the target's Hub must act on.
+    fn receive(&self, request: &VectorRequest) -> (Option<u64>, u16, Effect);
     /// The far end's programmed node number.
     fn number(&self) -> u16;
     /// The far end is powered and its port enabled.
@@ -138,12 +140,6 @@ pub trait NetPeer: Send + Sync {
     /// The far end reset the link: settle the width again and latch the event.
     fn link_reset(&self);
     /// The far end's node number or routes changed.
-    fn changed(&self);
-}
-
-/// What the shell does when the network state moves.
-pub trait NiEvents: Send + Sync {
-    /// The node number, a route or the link changed: re-derive the claim map.
     fn changed(&self);
 }
 
@@ -206,9 +202,14 @@ pub struct Ni {
     peer: Mutex<Option<Weak<dyn NetPeer>>>,
     /// The module has power. A disabled port reads down at its peer.
     enabled: AtomicBool,
-    hooks: OnceLock<Arc<dyn HubHooks>>,
-    events: OnceLock<Arc<dyn NiEvents>>,
+    /// The node number and the neighbour's, mirrored from the state and the
+    /// cable whenever either changes, so the Hub's node decode reads them
+    /// without a lock. `NO_NEIGHBOUR` while no powered neighbour is across.
+    number: AtomicU16,
+    neighbour: AtomicU32,
 }
+
+const NO_NEIGHBOUR: u32 = u32::MAX;
 
 impl Ni {
     /// `revision` is the chip revision code in NI_STATUS_REV_ID bits 7:4 (3 is
@@ -220,17 +221,9 @@ impl Ni {
             state: Mutex::new(State::new(revision)),
             peer: Mutex::new(None),
             enabled: AtomicBool::new(true),
-            hooks: OnceLock::new(),
-            events: OnceLock::new(),
+            number: AtomicU16::new(0),
+            neighbour: AtomicU32::new(NO_NEIGHBOUR),
         }
-    }
-
-    pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
-        let _ = self.hooks.set(hooks);
-    }
-
-    pub fn set_events(&self, events: Arc<dyn NiEvents>) {
-        let _ = self.events.set(events);
     }
 
     /// Join this port to the far end of a cable, or take the cable off.
@@ -261,7 +254,7 @@ impl Ni {
 
     /// The node number this Hub answers to.
     pub fn number(&self) -> u16 {
-        self.state.lock().number()
+        self.number.load(Ordering::Acquire)
     }
 
     /// The direction the first Router takes for a packet to `destination`, or
@@ -300,16 +293,9 @@ impl Ni {
         self.state.lock().port_error |= errors & PORT_ERROR_MASK;
     }
 
-    fn notify(&self) {
-        if let Some(events) = self.events.get() {
-            events.changed();
-        }
-    }
-
-    /// Re-derive the link bits from the cable, then tell the shell.
+    /// Re-derive the link bits and the neighbour's number from the cable.
     pub fn refresh(&self) {
         self.derive();
-        self.notify();
     }
 
     /// This port's own state changed (the node number, a route, the cable):
@@ -322,9 +308,13 @@ impl Ni {
         }
     }
 
-    /// Whether a powered neighbour is across the cable, and its node number.
+    /// Whether a powered neighbour is across the cable, and its node number,
+    /// as the cable and the neighbour last announced them. Lock-free.
     pub fn neighbour_number(&self) -> Option<u16> {
-        self.neighbour().map(|peer| peer.number())
+        match self.neighbour.load(Ordering::Acquire) {
+            NO_NEIGHBOUR => None,
+            number => Some(number as u16),
+        }
     }
 
     /// The link bits: up when a powered neighbour is across the cable. The
@@ -333,7 +323,9 @@ impl Ni {
     fn derive(&self) {
         // Ask the far end before taking this state's lock: the two ends
         // never hold their locks across a call to each other.
-        let forces = self.neighbour().map(|peer| peer.forces_eight_bit());
+        let neighbour = self.neighbour();
+        let forces = neighbour.as_ref().map(|peer| peer.forces_eight_bit());
+        self.neighbour.store(neighbour.as_ref().map_or(NO_NEIGHBOUR, |peer| u32::from(peer.number())), Ordering::Release);
         let mut s = self.state.lock();
         match forces {
             None => s.status &= !(STATUS_LINK_UP | STATUS_EIGHT_BIT),
@@ -451,23 +443,26 @@ impl Ni {
         }
     }
 
-    pub fn write(&self, off: u64, value: u64) {
-        self.store(off, value, false);
+    /// A store from the bus. What it changed beyond the register is returned
+    /// for the Hub to act on, after this unit's lock is released.
+    pub fn write(&self, off: u64, value: u64) -> Effect {
+        self.store(off, value)
     }
 
-    /// A store to the register at `off`, from the bus or, when `vector` is
-    /// set, from another node's vector PIO.
-    fn store(&self, off: u64, value: u64, vector: bool) {
+    /// A store to the register at `off`, from the bus or from another node's
+    /// vector PIO.
+    fn store(&self, off: u64, value: u64) -> Effect {
         if let Some((meta, i)) = Self::route_entry(off) {
             self.write_route(meta, i, value);
-            return;
+            return Effect::None;
         }
         let mut changed = false;
+        let mut effect = Effect::None;
         {
             let mut s = self.state.lock();
             if let Some(i) = Self::ageing(off) {
                 s.ageing[i] = value & AGEING_MASK;
-                return;
+                return Effect::None;
             }
             match off {
                 reg::STATUS => {
@@ -475,16 +470,14 @@ impl Ni {
                     s.status = (s.status & !STATUS_WRITABLE) | (value & STATUS_WRITABLE);
                     changed = true;
                     let after = s.number();
+                    self.number.store(after, Ordering::Release);
                     if after != before {
-                        drop(s);
-                        if let Some(h) = self.hooks.get() {
-                            h.node_number_changed(after);
-                        }
+                        effect = Effect::NodeNumber(after);
                     }
                 }
                 reg::PORT_RESET => {
                     drop(s);
-                    self.port_reset(value);
+                    effect = self.port_reset(value);
                 }
                 reg::PROTECTION => s.protection = value & PROTECTION_MASK,
                 reg::SCRATCH_0 | reg::SCRATCH_1 => {
@@ -495,7 +488,7 @@ impl Ni {
                 reg::VECTOR_PARMS => {
                     let request = (s.vector, s.vector_data);
                     drop(s);
-                    self.vector_launch(value, request);
+                    effect = self.vector_launch(value, request);
                 }
                 reg::VECTOR => s.vector = value,
                 reg::VECTOR_DATA => s.vector_data = value,
@@ -517,6 +510,7 @@ impl Ni {
         if changed {
             self.announce();
         }
+        effect
     }
 
     fn note_override(value: u64) {
@@ -543,36 +537,36 @@ impl Ni {
         self.announce();
     }
 
-    fn port_reset(&self, value: u64) {
+    fn port_reset(&self, value: u64) -> Effect {
         if value & PORT_RESET_WARM != 0 && value & PORT_RESET_LOCAL == 0 {
             crate::dlog!(LogModule::Hub, "Hub NI: port reset bit 7 without bit 0 is not implemented");
         }
         if value & PORT_RESET_LOCAL != 0 {
             // Software that resets the machine writes bits 7 and 0 together.
-            if let Some(h) = self.hooks.get() {
-                h.machine_restart();
-            }
-        } else if value & PORT_RESET_LINK != 0 {
-            self.link_reset();
-            self.notify();
+            return Effect::Restart;
         }
+        if value & PORT_RESET_LINK != 0 {
+            self.link_reset();
+        }
+        Effect::None
     }
 
     /// Vector PIO: launch a request from this Hub's own port and perform the
     /// access on whatever the route ends at.
-    fn vector_launch(&self, parms: u64, (vector, data): (u64, u64)) {
+    fn vector_launch(&self, parms: u64, (vector, data): (u64, u64)) -> Effect {
         let address = parms & VECTOR_ADDRESS_MASK;
         let op = parms & VECTOR_TYPE_MASK;
         let Some(peer) = self.neighbour() else {
             // A route nothing answers latches nothing: the poll times out.
             crate::dlog!(LogModule::Hub, "Hub NI: vector launch (parms {parms:#x}) reached nothing that answers");
-            return;
+            return Effect::None;
         };
         let request = VectorRequest { op, address, data, vector };
         // The neighbour is on the wire and answers, but a route past it needs
         // a Router the cable does not have: the address-error response, not
         // the timeout a cable with nothing on it leaves.
-        let (answer, source) = if vector != 0 { (None, peer.number()) } else { peer.receive(&request) };
+        let (answer, source, effect) =
+            if vector != 0 { (None, peer.number(), Effect::None) } else { peer.receive(&request) };
         let mut s = self.state.lock();
         let mut response = op;
         match answer {
@@ -588,26 +582,30 @@ impl Ni {
             | (parms & (VECTOR_PIOID_MASK | VECTOR_WRITEID_MASK))
             | (address & VECTOR_STATUS_ADDR_MASK)
             | response;
+        // A request that renumbered the neighbour tells that Hub's machine.
+        match effect {
+            Effect::NodeNumber(number) => Effect::PeerNodeNumber(number),
+            _ => Effect::None,
+        }
     }
 
     /// The target's half of a vector operation. A read or write reaches the
     /// registers a vector access decodes: status,
     /// protection, scratch, diagnostics, I/O protection, ageing, the port
     /// registers and both routing tables. An exchange writes only over a zero.
-    fn vector_access(&self, request: &VectorRequest) -> Option<u64> {
+    fn vector_access(&self, request: &VectorRequest) -> (Option<u64>, Effect) {
         let off = reg::STATUS + request.address;
-        match request.op {
+        let mut effect = Effect::None;
+        let answer = match request.op {
             VECTOR_READ => self.vector_read(off),
-            VECTOR_WRITE => self.vector_write(off, request.data).then_some(0),
-            VECTOR_EXCHANGE => {
-                let old = self.vector_read(off)?;
-                if old == 0 && !self.vector_write(off, request.data) {
-                    return None;
-                }
-                Some(old)
-            }
+            VECTOR_WRITE => self.vector_write(off, request.data, &mut effect).then_some(0),
+            VECTOR_EXCHANGE => match self.vector_read(off) {
+                Some(old) if old != 0 || self.vector_write(off, request.data, &mut effect) => Some(old),
+                _ => None,
+            },
             _ => None,
-        }
+        };
+        (answer, effect)
     }
 
     fn vector_read(&self, off: u64) -> Option<u64> {
@@ -620,12 +618,12 @@ impl Ni {
         }
     }
 
-    fn vector_write(&self, off: u64, value: u64) -> bool {
+    fn vector_write(&self, off: u64, value: u64, effect: &mut Effect) -> bool {
         match off {
             reg::STATUS | reg::PROTECTION | reg::SCRATCH_0 | reg::SCRATCH_1 | reg::DIAG_PARMS | reg::IO_PROTECT
-            | reg::PORT_PARMS | reg::PORT_ERROR => self.store(off, value, true),
+            | reg::PORT_PARMS | reg::PORT_ERROR => *effect = self.store(off, value),
             reg::IO_PROT_OVRRD => Self::note_override(value),
-            _ if Self::ageing(off).is_some() || Self::route_entry(off).is_some() => self.store(off, value, true),
+            _ if Self::ageing(off).is_some() || Self::route_entry(off).is_some() => *effect = self.store(off, value),
             _ => return false,
         }
         true
@@ -633,9 +631,10 @@ impl Ni {
 }
 
 impl NetPeer for Ni {
-    fn receive(&self, request: &VectorRequest) -> (Option<u64>, u16) {
-        let answer = if self.enabled.load(Ordering::Acquire) { self.vector_access(request) } else { None };
-        (answer, self.number())
+    fn receive(&self, request: &VectorRequest) -> (Option<u64>, u16, Effect) {
+        let (answer, effect) =
+            if self.enabled.load(Ordering::Acquire) { self.vector_access(request) } else { (None, Effect::None) };
+        (answer, self.number(), effect)
     }
     fn number(&self) -> u16 {
         Ni::number(self)
@@ -673,12 +672,10 @@ impl Resettable for Ni {
             let mut s = self.state.lock();
             *s = State::new(self.revision);
         }
+        self.number.store(0, Ordering::Release);
         // The link comes out of reset now: its width is settled from both
         // ends' force bits as they stand.
         self.announce();
-        if let Some(h) = self.hooks.get() {
-            h.node_number_changed(0);
-        }
     }
 }
 
@@ -687,7 +684,7 @@ impl BusDevice for Ni {
         BusRead64::ok(self.read(addr, true))
     }
     fn write64(&self, addr: u64, value: u64) -> u32 {
-        self.write(addr, value);
+        let _ = self.write(addr, value);
         BUS_OK
     }
 }

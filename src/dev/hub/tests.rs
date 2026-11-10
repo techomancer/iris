@@ -78,12 +78,6 @@ impl BusDevice for Bytes {
 #[derive(Default)]
 struct Machine(Mutex<Vec<String>>);
 impl HubHooks for Machine {
-    fn cpu_enable(&self, slice: usize, on: bool) {
-        self.0.lock().push(format!("enable {slice} {on}"));
-    }
-    fn nmi(&self, slice: usize) {
-        self.0.lock().push(format!("nmi {slice}"));
-    }
     fn soft_reset(&self, slice: usize) {
         self.0.lock().push(format!("soft {slice}"));
     }
@@ -218,7 +212,7 @@ fn the_i2c_controller_takes_narrow_accesses_over_the_md_block() {
 }
 
 #[test]
-fn hooks_carry_the_nodes_processor_controls_to_the_machine() {
+fn the_hub_carries_what_its_units_change_to_the_machine() {
     let hub = hub(2, 3);
     let machine = Arc::new(Machine::default());
     hub.set_hooks(machine.clone());
@@ -228,11 +222,28 @@ fn hooks_carry_the_nodes_processor_controls_to_the_machine() {
     hub.write64(pi::reg::SOFTRESET, 1);
     hub.write64(pi::reg::CALIAS_SIZE, 2);
     hub.write64(ni::reg::PORT_RESET, 0x81);
-    assert_eq!(take(), ["enable 0 true", "nmi 1", "soft 0", "calias 0x2000", "restart"]);
+    assert_eq!(take(), ["soft 0", "calias 0x2000", "restart"]);
     number(&hub, 4);
     assert_eq!(take(), ["number 4"]);
     hub.power_on();
-    assert_eq!(take(), ["enable 0 false", "enable 1 false", "number 0"]);
+    assert_eq!(take(), ["number 0"]);
+}
+
+/// The processor reaches the registers through the node's I/O space, not the
+/// window; a write there changes the same things and tells the machine the
+/// same way.
+#[test]
+fn a_register_write_through_the_io_space_acts_on_what_it_changes() {
+    let hub = hub(2, 3);
+    let machine = Arc::new(Machine::default());
+    hub.set_hooks(machine.clone());
+    let take = || std::mem::take(&mut *machine.0.lock());
+    let space = hub.io_space();
+    assert_eq!(space.write64(IO_REGISTERS_LOCAL + pi::reg::CALIAS_SIZE, 2), BUS_OK);
+    assert_eq!(space.write64(IO_REGISTERS_LOCAL + ni::reg::STATUS, 4 << 8), BUS_OK);
+    assert_eq!(take(), ["calias 0x2000", "number 4"]);
+    assert_eq!(hub.calias.load(Ordering::SeqCst), 0x2000);
+    assert_eq!(hub.claim(Space::Memory).read8(NODE(4) + 0x10).data, 0x10, "the node answers to its new number");
 }
 
 #[test]
@@ -250,8 +261,9 @@ fn reset_restores_the_registers_and_keeps_what_firmware_parks() {
     assert_eq!(r64(&*hub, md::reg::CONFIG), 0x001e_7fbc_3fff_ffff);
     assert_eq!(r64(&*hub, io::reg::SCRATCH_0), 0);
     assert_eq!(hub.ni().number(), 0);
-    assert_eq!(hub.claims[0].load(Ordering::SeqCst), THIS_HUB);
-    assert_eq!(hub.claims[3].load(Ordering::SeqCst), NOBODY);
+    let mem = hub.claim(Space::Memory);
+    assert_eq!(mem.read8(0x10).data, 0x10, "node zero is this Hub's again");
+    assert_eq!(mem.read8(NODE(3) + 0x10).status, BUS_ERR, "and node 3 is nobody's");
 }
 
 // ---- the claim map ----

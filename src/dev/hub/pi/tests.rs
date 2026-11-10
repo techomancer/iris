@@ -14,7 +14,8 @@ struct Fixture {
     pi: Arc<Pi>,
     now: Arc<AtomicU64>,
     lines: Arc<Lines>,
-    hooks: Arc<Hooks>,
+    /// What the writes so far asked the Hub to do, as text.
+    effects: Mutex<Vec<String>>,
 }
 #[derive(Default)]
 struct Lines([AtomicU8; 6]);
@@ -28,46 +29,34 @@ impl InterruptController for Lines {
         self.0[line as usize].store(u8::from(level), Ordering::SeqCst);
     }
 }
-#[derive(Default)]
-struct Hooks(Mutex<Vec<String>>);
-impl HubHooks for Hooks {
-    fn cpu_enable(&self, slice: usize, on: bool) {
-        self.0.lock().push(format!("enable {slice} {on}"));
-    }
-    fn nmi(&self, slice: usize) {
-        self.0.lock().push(format!("nmi {slice}"));
-    }
-    fn soft_reset(&self, slice: usize) {
-        self.0.lock().push(format!("soft {slice}"));
-    }
-    fn cached_alias_changed(&self, bytes: u64) {
-        self.0.lock().push(format!("calias {bytes:#x}"));
-    }
-}
 impl Fixture {
     fn new(cpus: u8) -> Self {
         let now = Arc::new(AtomicU64::new(1_000_000));
         let clock = now.clone();
         let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
         let lines = Arc::new(Lines::default());
-        let hooks = Arc::new(Hooks::default());
         pi.set_interrupt_controller(lines.clone());
-        pi.set_hooks(hooks.clone());
-        Self { pi, now, lines, hooks }
+        Self { pi, now, lines, effects: Mutex::default() }
     }
     fn r(&self, off: u64) -> u64 {
         self.pi.read64(off).data
     }
     fn w(&self, off: u64, value: u64) {
-        assert_eq!(self.pi.write64(off, value), BUS_OK);
+        let text = match self.pi.write(off, value) {
+            Effect::None => return,
+            Effect::CachedAlias(bytes) => vec![format!("calias {bytes:#x}")],
+            Effect::SoftReset(slices) => (0..2).filter(|&i| slices[i]).map(|i| format!("soft {i}")).collect(),
+            other => panic!("the processor interface does not return {other:?}"),
+        };
+        self.effects.lock().extend(text);
     }
     /// Let `ticks` counter ticks pass and bring the comparators up to date.
     fn advance(&self, ticks: u64) {
         self.now.fetch_add(ticks * TICK_NS, Ordering::SeqCst);
         self.pi.poll();
     }
-    fn take_hooks(&self) -> Vec<String> {
-        std::mem::take(&mut *self.hooks.0.lock())
+    fn take_effects(&self) -> Vec<String> {
+        std::mem::take(&mut *self.effects.lock())
     }
 }
 
@@ -124,23 +113,23 @@ fn the_processor_number_names_the_reading_processor() {
 }
 
 #[test]
-fn processor_presence_enable_nmi_and_soft_reset_reach_the_machine() {
+fn processor_presence_enable_nmi_and_soft_reset() {
     let t = Fixture::new(2);
     assert_eq!((t.r(reg::CPU_PRESENT_A), t.r(reg::CPU_PRESENT_B)), (1, 1));
     assert_eq!((t.r(reg::CPU_ENABLE_A), t.r(reg::CPU_ENABLE_B)), (0, 0));
     t.w(reg::CPU_ENABLE_B, 0xff);
     assert_eq!(t.r(reg::CPU_ENABLE_B), 1);
-    assert_eq!(t.take_hooks(), ["enable 1 true"]);
+    // The enable and the NMI are logged and ask nothing of the machine.
+    assert!(t.take_effects().is_empty());
     // The soft reset reaches only the enabled processors.
     t.w(reg::SOFTRESET, 1);
-    assert_eq!(t.take_hooks(), ["soft 1"]);
+    assert_eq!(t.take_effects(), ["soft 1"]);
     t.w(reg::NMI_A, 1);
     t.w(reg::NMI_B, 0);
-    assert_eq!(t.take_hooks(), ["nmi 0", "nmi 1"]);
+    assert!(t.take_effects().is_empty());
     // Reset halts both processors again; the enables read zero.
     t.pi.power_on();
     assert_eq!(t.r(reg::CPU_ENABLE_B), 0);
-    assert_eq!(t.take_hooks(), ["enable 0 false", "enable 1 false"]);
 }
 
 #[test]
@@ -151,10 +140,10 @@ fn an_absent_processors_enable_stores_and_reaches_nothing() {
     assert_eq!(t.r(reg::CPU_ENABLE_B), 1);
     t.w(reg::NMI_B, 1);
     t.w(reg::SOFTRESET, 1);
-    assert!(t.take_hooks().is_empty());
+    assert!(t.take_effects().is_empty());
     t.w(reg::CPU_ENABLE_A, 1);
     t.w(reg::SOFTRESET, 1);
-    assert_eq!(t.take_hooks(), ["enable 0 true", "soft 0"]);
+    assert_eq!(t.take_effects(), ["soft 0"]);
     // Nor does the absent slot get an interrupt line.
     t.w(reg::INT_MASK0_B, !0);
     t.w(reg::INT_PEND_MOD, MODIFY_SET | 3);
@@ -166,7 +155,7 @@ fn the_cached_alias_size_codes_double_from_4_kib() {
     let t = Fixture::new(2);
     for (code, bytes) in [(0, 0), (1, 4 << 10), (2, 8 << 10), (15, 64 << 20)] {
         t.w(reg::CALIAS_SIZE, code);
-        assert_eq!(t.take_hooks(), [format!("calias {bytes:#x}")]);
+        assert_eq!(t.take_effects(), [format!("calias {bytes:#x}")]);
         assert_eq!(t.pi.calias_bytes(), bytes);
     }
     // Four bits store; a wider value wraps into them.

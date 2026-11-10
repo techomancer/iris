@@ -7,8 +7,9 @@
 //! Offsets are from the base of the Hub window. Pending banks, masks, the
 //! counter origin and the comparator pending and enable bits are atomics, so
 //! the registers a waiting processor polls take no lock. The remaining
-//! register state sits behind one mutex that is never held across a hook or an
-//! interrupt-line call.
+//! register state sits behind one mutex that is never held across an interrupt-line
+//! call. A store that the machine must hear of is returned as an [`Effect`]
+//! for the Hub to act on.
 //!
 //! # What is approximated here
 //!
@@ -38,7 +39,7 @@
 
 use crate::cpu::smp::on_cpu_thread;
 use crate::dev::heart::Clock;
-use super::{HubHooks, PENDING_BANKS};
+use super::{Effect, PENDING_BANKS};
 use crate::dev::odyssey::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -184,7 +185,6 @@ pub struct Pi {
     rt_pending: [AtomicBool; 2],
     rt_enable: [AtomicBool; 2],
     state: Mutex<State>,
-    hooks: OnceLock<Arc<dyn HubHooks>>,
     irq: Mutex<Option<Arc<dyn InterruptController>>>,
     /// Serialises line publication, so two writers cannot publish a stale
     /// level after a fresh one. Reentrant: a controller may read a register.
@@ -214,7 +214,6 @@ impl Pi {
             rt_pending: Default::default(),
             rt_enable: Default::default(),
             state: Mutex::new(State::new()),
-            hooks: OnceLock::new(),
             irq: Mutex::new(None),
             dispatch: ReentrantMutex::new(()),
             driven: Mutex::new([None; 2 * LINES_PER_CPU]),
@@ -222,10 +221,6 @@ impl Pi {
             timer: Mutex::new(None),
             weak: weak.clone(),
         })
-    }
-
-    pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
-        let _ = self.hooks.set(hooks);
     }
 
     /// The machine owns the manager; the interface only keeps a weak handle to
@@ -262,10 +257,6 @@ impl Pi {
     /// The two pending banks, as a processor reads them.
     pub fn pending(&self, bank: usize) -> u64 {
         self.pend[bank].load(Ordering::Acquire)
-    }
-
-    fn hooks(&self) -> Option<&Arc<dyn HubHooks>> {
-        self.hooks.get()
     }
 
     fn count_at(&self, now: u64) -> u64 {
@@ -479,15 +470,16 @@ impl Pi {
         }
     }
 
-    pub fn write(&self, off: u64, value: u64) {
-        self.write_sized(off, value, 8);
+    pub fn write(&self, off: u64, value: u64) -> Effect {
+        self.write_sized(off, value, 8)
     }
 
     /// `size` is the guest's access width: only a full-width zero store ends
     /// a processor's error record through a clearing alias.
-    pub fn write_sized(&self, off: u64, value: u64, size: u32) {
+    /// What the store changed beyond the register is returned for the Hub to
+    /// act on, after this unit's lock is released.
+    pub fn write_sized(&self, off: u64, value: u64, size: u32) -> Effect {
         let now = || (self.clock)();
-        let hooks = self.hooks();
         match off {
             reg::REGION_PRESENT => self.state.lock().region_present = value,
             reg::CPU_NUM => {
@@ -496,35 +488,27 @@ impl Pi {
             reg::CALIAS_SIZE => {
                 let code = value & CALIAS_MASK;
                 self.state.lock().calias = code;
-                if let Some(h) = hooks {
-                    h.cached_alias_changed(calias_bytes(code));
-                }
+                return Effect::CachedAlias(calias_bytes(code));
             }
             reg::CPU_ENABLE_A | reg::CPU_ENABLE_B => {
                 let slice = ((off - reg::CPU_ENABLE_A) / 8) as usize;
                 let on = value & 1 != 0;
                 self.state.lock().cpu_enable[slice] = on;
+                // What the store does to the processor is not established.
                 if slice < usize::from(self.cpus) {
-                    if let Some(h) = hooks {
-                        h.cpu_enable(slice, on);
-                    }
+                    crate::dlog!(LogModule::Hub, "Hub PI: PI_CPU_ENABLE {slice} = {on} (no effect on the processor)");
                 }
             }
             reg::NMI_A | reg::NMI_B => {
                 let slice = ((off - reg::NMI_A) / 8) as usize;
                 if slice < usize::from(self.cpus) {
-                    if let Some(h) = hooks {
-                        h.nmi(slice);
-                    }
+                    crate::dlog!(LogModule::Hub, "Hub PI: NMI to slice {slice} (not delivered)");
                 }
             }
             reg::SOFTRESET => {
                 let enabled = self.state.lock().cpu_enable;
-                for slice in (0..usize::from(self.cpus)).filter(|&i| enabled[i]) {
-                    if let Some(h) = hooks {
-                        h.soft_reset(slice);
-                    }
-                }
+                let reached = std::array::from_fn(|i| i < usize::from(self.cpus) && enabled[i]);
+                return Effect::SoftReset(reached);
             }
             reg::INT_PEND_MOD => self.int_modify(value),
             reg::INT_PEND0 | reg::INT_PEND1 => {
@@ -597,6 +581,7 @@ impl Pi {
             }
             _ => unimp("register", off, Some(value)),
         }
+        Effect::None
     }
 
     /// Whether the register state is locked now, for the `locks` monitor command.
@@ -650,11 +635,6 @@ impl Resettable for Pi {
         }
         self.drive();
         self.schedule();
-        if let Some(h) = self.hooks() {
-            for slice in 0..usize::from(self.cpus) {
-                h.cpu_enable(slice, false);
-            }
-        }
     }
 }
 
@@ -663,7 +643,7 @@ impl BusDevice for Pi {
         BusRead64::ok(self.read(addr, true))
     }
     fn write64(&self, addr: u64, value: u64) -> u32 {
-        self.write(addr, value);
+        let _ = self.write(addr, value);
         BUS_OK
     }
 }

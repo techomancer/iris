@@ -54,12 +54,29 @@ impl NodeFabric for Fabric {
     }
 }
 
-fn io() -> (Io, Arc<Fabric>) {
+/// The I/O unit with a fabric behind it. A write that launches a block
+/// transfer is run on the fabric at once, as the Hub does after the write.
+struct Rig {
+    io: Io,
+    fabric: Arc<Fabric>,
+}
+impl std::ops::Deref for Rig {
+    type Target = Io;
+    fn deref(&self) -> &Io {
+        &self.io
+    }
+}
+impl Rig {
+    fn write64(&self, off: u64, value: u64) -> u32 {
+        if let Effect::Bte(engine, launch) = self.io.write(off, value) {
+            self.io.run_bte(engine, launch, &*self.fabric);
+        }
+        BUS_OK
+    }
+}
+fn io() -> (Rig, Arc<Fabric>) {
     let fabric = Fabric::new();
-    let io = Io::new(1, 0x36);
-    let weak: Weak<dyn NodeFabric> = Arc::downgrade(&(fabric.clone() as Arc<dyn NodeFabric>));
-    io.set_fabric(weak);
-    (io, fabric)
+    (Rig { io: Io::new(1, 0x36), fabric: fabric.clone() }, fabric)
 }
 fn r(io: &Io, off: u64) -> u64 {
     io.read64(off).data
@@ -195,20 +212,13 @@ fn the_link_reads_up_with_its_limits_and_only_the_controls_write() {
 #[test]
 fn a_warm_reset_is_a_pulse_that_reads_zero() {
     let (io, _) = io();
-    let pulses = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let p = pulses.clone();
     // With nothing at the far end the write is only logged.
     io.write64(reg::LINK_STATUS, 1 << 8);
-    io.connect_reset(Arc::new(move || {
-        p.fetch_add(1, Ordering::SeqCst);
-    }));
-    io.write64(reg::LINK_STATUS, 1 << 8);
-    assert_eq!(pulses.load(Ordering::SeqCst), 1);
     assert_eq!(r(&io, reg::LINK_STATUS) & (1 << 8), 0);
-    // Setting bit 10 by read-modify-write would send a second pulse only if
-    // bit 8 read back set.
+    // Setting bit 10 by read-modify-write would pulse again only if bit 8
+    // read back set.
     io.write64(reg::LINK_STATUS, r(&io, reg::LINK_STATUS) | (1 << 10));
-    assert_eq!(pulses.load(Ordering::SeqCst), 1);
+    assert_eq!(r(&io, reg::LINK_STATUS) & (1 << 8), 0);
     // An inbound link reset leaves everything as it was.
     let before = (r(&io, reg::LINK_STATUS), r(&io, reg::WIDGET_CONTROL));
     io.link_reset_in();
@@ -326,7 +336,7 @@ fn the_queue_and_request_buffer_registers_read_zero() {
 fn engine(n: u64) -> u64 {
     reg::BTE_BASE + n * BTE_STRIDE
 }
-fn start(io: &Io, n: u64, source: u64, dest: u64, lines: u64, control: u64) {
+fn start(io: &Rig, n: u64, source: u64, dest: u64, lines: u64, control: u64) {
     io.write64(engine(n) + bte::SOURCE, source);
     io.write64(engine(n) + bte::DEST, dest);
     io.write64(engine(n) + bte::LENGTH, BTE_BUSY | lines);
@@ -453,11 +463,4 @@ fn a_zero_length_launch_completes_at_once_and_busy_clear_launches_nothing() {
     io.write64(engine(0) + bte::CONTROL, 0);
     assert_eq!(fabric.bytes(0x9800, 128), vec![0; 128]);
     assert_eq!(r(&io, engine(0) + bte::LENGTH), 1);
-}
-
-#[test]
-fn an_engine_with_no_fabric_fails_the_launch() {
-    let io = Io::new(1, 0x36);
-    start(&io, 0, 0, 0x1000, 1, 0);
-    assert_eq!(r(&io, engine(0) + bte::LENGTH), BTE_BUSY | BTE_ERROR | 1);
 }
