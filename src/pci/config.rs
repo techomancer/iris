@@ -76,16 +76,22 @@ pub struct PciConfigPolicy<'a> {
     pub registers: &'a [PciRegisterPolicy],
 }
 
+impl PciConfigPolicy<'static> {
+    /// The policy of a plain function, as a constant a board table can
+    /// start from.
+    pub const DEFAULT: Self = Self {
+        status: 0x0200,
+        status_w1c_mask: 0,
+        command_mask: 0xffff,
+        latency_mask: 0xff,
+        cache_line_mask: 0xff,
+        registers: &[],
+    };
+}
+
 impl<'a> Default for PciConfigPolicy<'a> {
     fn default() -> Self {
-        Self {
-            status: 0x0200,
-            status_w1c_mask: 0,
-            command_mask: 0xffff,
-            latency_mask: 0xff,
-            cache_line_mask: 0xff,
-            registers: &[],
-        }
+        Self { registers: &[], ..PciConfigPolicy::DEFAULT }
     }
 }
 

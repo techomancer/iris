@@ -29,6 +29,17 @@ pub struct PinWire {
     pub to: PinUse,
 }
 
+impl PinWire {
+    pub const fn strap(pin: u8, high: bool) -> PinWire {
+        PinWire { pin, to: PinUse::Strap(high) }
+    }
+
+    pub const fn status_bit(pin: u8, bit: u64) -> PinWire {
+        PinWire { pin, to: PinUse::StatusBit(bit) }
+    }
+}
+
+/// How a board uses a pin. A pin a board does not list is unwired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PinUse {
     /// An input the board holds at a fixed level.
@@ -50,6 +61,7 @@ pub(super) struct Gpio {
 }
 
 impl Gpio {
+    /// The chip with the pins `wiring` lists wired, from the board's row.
     pub(super) fn new(wiring: &[PinWire]) -> Gpio {
         let (mut strap_mask, mut strap_values) = (0, 0);
         let mut lit = Vec::new();

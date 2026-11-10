@@ -59,6 +59,7 @@
 //! Ported from hw/misc/sgi-ioc3.c and its serial, parallel and keyboard siblings
 //! in jamesbraid/qemu-sgi-origami.
 
+mod board;
 mod dma;
 mod gpio;
 mod kbd;
@@ -78,8 +79,10 @@ use std::time::{Duration, Instant};
 
 use crate::dev::battery_clock;
 use crate::dev::ds1687::{image, MaceRtc};
+pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IP29, IP30, IP34};
 pub use self::dma::Ioc3Dma;
-use self::gpio::{Gpio, PinUse, PinWire};
+use self::gpio::Gpio;
+pub use self::gpio::{PinUse, PinWire};
 use self::kbd::Kbd;
 use self::parallel::Parallel;
 use self::eth::{Ioc3Eth, Phy};
@@ -87,12 +90,11 @@ use self::serial::Serial;
 use self::superio::SuperIo;
 use self::w1::W1;
 use crate::dev::ps2::Ps2Controller;
-use crate::dev::ng1::rex3::Rex3;
 use crate::dev::w1 as onewire;
-use crate::dev::w1::sgi::{self, BoardRecord};
+use crate::dev::w1::sgi;
 use crate::dev::serial_host::SerialBackend;
 use crate::irq::IrqLine;
-use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PCI_INTA};
+use crate::pci::{Bar, BoardIrq, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, StateTable};
@@ -100,10 +102,6 @@ use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u
 pub const VENDOR_ID: u16 = 0x10a9;
 pub const DEVICE_ID: u16 = 0x0003;
 pub const REVISION: u8 = 0x01;
-/// PCI subsystem id of the Octane's system board.
-pub const SUBSYS_IP30_SYSBOARD: u16 = 0xc304;
-/// Fuel system-board population.
-pub const SUBSYS_IP34_SYSBOARD: u16 = 0xc30a;
 pub const BAR_SIZE: u32 = 1 << 20;
 /// The configuration dwords the chip decodes; the rest of the 16 repeat them.
 const CONFIG_DECODED_DWORDS: usize = 8;
@@ -406,111 +404,31 @@ fn int_out_valid(v: u32) -> bool {
         && (mode == IO_ONE_SHOT || (mode == IO_PERIODIC && count >= IO_PULSE_TICKS) || mode == IO_SQUARE)
 }
 
-/// Which sub-devices the board fits.
-#[derive(Clone, Debug)]
-pub struct Ioc3Config {
-    pub subsystem_id: u16,
-    /// Function-specific PCI header write behavior.
-    pub pci_policy: PciConfigPolicy<'static>,
-    /// Reset the PCI header along with the chip on power-on.
-    pub reset_pci_on_power_on: bool,
-    /// The board's station address, which the one-wire part holds.
-    pub mac: [u8; 6],
-    /// The Ethernet transceiver, on a board that fits the MAC.
-    pub phy: Option<Phy>,
-    pub serial: [bool; 2],
-    pub parallel: bool,
-    pub keyboard_mouse: bool,
-    pub rtc: bool,
-    /// GPIO pins that are board inputs, and their values.
-    pub gpio_input_mask: u32,
-    pub gpio_input_values: u32,
-    /// Board-record parts on the MicroLAN, beside the Ethernet part:
-    /// `(record text, ROM serial)`.
-    pub records: Vec<(BoardRecordText, u64)>,
+/// The clock on the byte bus, built and owned by the machine because it
+/// keeps its RAM in a file the machine names.
+pub enum ByteBus {
+    None,
+    /// The M48T35-compatible Timekeeper, on select 0.
+    M48t35(Arc<crate::dev::timekeeper::Timekeeper>),
+    /// The DS1685 on selects 1 and 2. Its RAM and file are the chip's for now
+    /// ([`Ioc3::set_nvram_file`]).
+    Ds1685,
 }
 
-#[derive(Clone, Debug)]
-pub struct BoardRecordText {
-    pub barcode: String,
-    pub part: String,
-    pub revision: String,
-    pub name: String,
-}
-
-impl BoardRecordText {
-    fn new(barcode: &str, part: &str, revision: &str, name: &str) -> Self {
-        Self { barcode: barcode.into(), part: part.into(), revision: revision.into(), name: name.into() }
-    }
-}
-
-impl Ioc3Config {
-    /// Fuel's IOC3 fits the keyboard and mouse controller but no indexed Dallas clock.
-    pub fn fuel(mac: [u8; 6]) -> Self {
-        Self {
-            subsystem_id: SUBSYS_IP34_SYSBOARD,
-            pci_policy: PciConfigPolicy {
-                status: 0x0280,
-                status_w1c_mask: 0,
-                command_mask: 0xffff,
-                latency_mask: 0xff,
-                cache_line_mask: 0,
-                ..Default::default()
-            },
-            reset_pci_on_power_on: true,
-            mac,
-            phy: Some(Phy::Dp83843),
-            serial: [true, true],
-            parallel: true,
-            keyboard_mouse: true,
-            rtc: false,
-            gpio_input_mask: 0,
-            gpio_input_values: 0,
-            records: Vec::new(),
-        }
-    }
-
-    /// The Octane's IOC3 (`octane2` selects the Octane2's board records).
-    /// The fictitious barcodes and ROM serials are the
-    /// marked-synthetic ones (barcode `EMU...`).
-    pub fn octane(mac: [u8; 6], octane2: bool) -> Self {
-        let (fp_rev, ps_name, ps_part, ps_rev) = if octane2 {
-            ("H", "PWR.SPPLY.ER", "060-0035-002", "A")
-        } else {
-            ("A", "PWR.SPPLY.SR", "060-0028-003", "A")
-        };
-        Self {
-            subsystem_id: SUBSYS_IP30_SYSBOARD,
-            pci_policy: PciConfigPolicy::default(),
-            reset_pci_on_power_on: false,
-            mac,
-            phy: Some(Phy::Ics1890),
-            serial: [true, true],
-            parallel: true,
-            keyboard_mouse: true,
-            rtc: true,
-            // The board drives GPIO inputs 2 and 3 high: read on an Octane2's
-            // PROM Command Monitor (pin data 0x12d). An Octane is unmeasured
-            // and assumed the same; nothing shows a pin that tells them apart.
-            gpio_input_mask: 1 << 2 | 1 << 3,
-            gpio_input_values: 1 << 2 | 1 << 3,
-            records: vec![
-                (BoardRecordText::new("EMUF00", "030-0891-003", fp_rev, "FP1"), 0x5145_4d55_4600),
-                (BoardRecordText::new("EMUS00", ps_part, ps_rev, ps_name), 0x5145_4d55_5300),
-            ],
+impl ByteBus {
+    fn part(&self) -> ByteBusPart {
+        match self {
+            ByteBus::None => ByteBusPart::None,
+            ByteBus::M48t35(_) => ByteBusPart::M48t35,
+            ByteBus::Ds1685 => ByteBusPart::Ds1685,
         }
     }
 }
 
-/// The wire the board carries: the station-address part and the board
-/// records, the front plane and the power supply on the Octane.
-fn default_wire(cfg: &Ioc3Config) -> onewire::Bus {
+/// The wire the board carries by default: the station-address part.
+fn default_wire(mac: [u8; 6]) -> onewire::Bus {
     let mut bus = onewire::Bus::new();
-    bus.add(Box::new(sgi::ethernet_address_part(cfg.mac, sgi::ETHERNET_PART_SERIAL)));
-    for (r, serial) in &cfg.records {
-        let rec = BoardRecord { barcode: &r.barcode, part: &r.part, revision: &r.revision, name: &r.name };
-        bus.add(Box::new(sgi::board_record_part(&rec, *serial)));
-    }
+    bus.add(Box::new(sgi::ethernet_address_part(mac, sgi::ETHERNET_PART_SERIAL)));
     bus
 }
 
@@ -799,7 +717,7 @@ type NvramJob = (std::path::PathBuf, Vec<u8>, Option<Vec<u8>>);
 struct Shared {
     pci: PciFunctionState,
     core: Arc<Core>,
-    cfg: Ioc3Config,
+    board: &'static Ioc3Board,
     sio: Option<Arc<SuperIo>>,
     serial: [Option<Serial>; 2],
     kbd: Option<Arc<Kbd>>,
@@ -837,12 +755,6 @@ struct Shared {
 }
 
 impl Shared {
-    /// The wire the board carries: the station-address part and the board
-    /// records.
-    fn board_wire(cfg: &Ioc3Config) -> onewire::Bus {
-        default_wire(cfg)
-    }
-
     /// What follows every access: arm the timers for the deadlines it left,
     /// pick up a PS/2 character that arrived meanwhile, and tell the machine
     /// of a power-off.
@@ -1181,7 +1093,7 @@ impl Shared {
             }
             return 0;
         }
-        if self.cfg.rtc {
+        if self.board.cells.byte_bus == ByteBusPart::Ds1685 {
             // Each select is a byte-wide port answering on any lane of its
             // first word: the guests land on different ones.
             if (reg::BYTEBUS_DEV2..reg::BYTEBUS_DEV2 + 4).contains(&a) {
@@ -1221,7 +1133,7 @@ impl Shared {
             }
             return;
         }
-        if self.cfg.rtc {
+        if self.board.cells.byte_bus == ByteBusPart::Ds1685 {
             if (reg::BYTEBUS_DEV2..reg::BYTEBUS_DEV2 + 4).contains(&a) {
                 let mut rtc = self.rtc.lock();
                 let was = rtc.dev.powered_off();
@@ -1319,7 +1231,7 @@ impl Shared {
 
     /// A PCI reset of the chip (not of the clock or the buffer RAM).
     fn reset(&self) {
-        if self.cfg.reset_pci_on_power_on {
+        if self.board.reset_pci_on_power_on {
             self.pci.config().reset();
         }
         self.core.set_words(0, 0);
@@ -1352,33 +1264,31 @@ impl Shared {
 /// The IOC3 PCI function.
 pub struct Ioc3 {
     sh: Arc<Shared>,
-    timekeeper: OnceLock<Arc<crate::dev::timekeeper::Timekeeper>>,
+    timekeeper: Option<Arc<crate::dev::timekeeper::Timekeeper>>,
     /// The serial receive threads and the NVRAM writer, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Ioc3 {
-    pub fn new(cfg: Ioc3Config) -> Ioc3 {
-        let subsystem = cfg.subsystem_id;
-        let pci_policy = cfg.pci_policy;
+    /// The IOC3 of `board`, with the station address `mac` on its one-wire
+    /// part and the clock the machine built for the byte bus.
+    pub fn new(board: &'static Ioc3Board, mac: [u8; 6], byte_bus: ByteBus) -> Ioc3 {
+        let cells = &board.cells;
+        assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus fits {:?}", board.name, cells.byte_bus);
         let core = Arc::new(Core::new());
-        let sio = (cfg.serial[0] || cfg.serial[1] || cfg.parallel)
-            .then(|| Arc::new(SuperIo::new(core.clone(), cfg.serial, cfg.parallel)));
+        let sio = (cells.serial || cells.parallel)
+            .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel)));
         let serial = [0, 1].map(|p| {
-            cfg.serial[p].then(|| Serial::new(p, core.clone(), sio.clone().expect("a serial port has a Super I/O")))
+            cells.serial.then(|| Serial::new(p, core.clone(), sio.clone().expect("a serial port has a Super I/O")))
         });
-        let kbd = cfg.keyboard_mouse.then(|| Kbd::new(core.clone()));
-        let parallel = cfg.parallel.then(|| Parallel::new(core.clone(), sio.clone().expect("a parallel port has a Super I/O")));
-        let mut wiring: Vec<PinWire> = (0..32u8)
-            .filter(|&p| cfg.gpio_input_mask >> p & 1 != 0)
-            .map(|pin| PinWire { pin, to: PinUse::Strap(cfg.gpio_input_values >> pin & 1 != 0) })
-            .collect();
-        if cfg.subsystem_id == SUBSYS_IP30_SYSBOARD {
-            wiring.push(PinWire { pin: 0, to: PinUse::StatusBit(Rex3::HB_LED_GREEN) });
-            wiring.push(PinWire { pin: 1, to: PinUse::StatusBit(Rex3::HB_LED_RED) });
-        }
-        let gpio = Gpio::new(&wiring);
-        let eth = cfg.phy.map(|phy| Ioc3Eth::new(core.clone(), cfg.mac, phy));
+        let kbd = cells.kbd.then(|| Kbd::new(core.clone()));
+        let parallel = cells.parallel.then(|| Parallel::new(core.clone(), sio.clone().expect("a parallel port has a Super I/O")));
+        let gpio = Gpio::new(board.gpio);
+        let eth = cells.eth.then(|| Ioc3Eth::new(core.clone(), mac, board.phy));
+        let timekeeper = match byte_bus {
+            ByteBus::M48t35(clock) => Some(clock),
+            _ => None,
+        };
         let sh = Arc::new_cyclic(|weak: &Weak<Shared>| {
             let bars = [
                 Bar::Mem(BAR_SIZE),
@@ -1389,11 +1299,11 @@ impl Ioc3 {
                 Bar::Unused,
             ];
             let pci = PciConfig::new_with_policy(
-                VENDOR_ID, DEVICE_ID, 0xff_0000, REVISION, bars, PCI_INTA, pci_policy,
+                VENDOR_ID, DEVICE_ID, 0xff_0000, REVISION, bars, PCI_INTA, board.pci_policy,
             );
             // The subsystem identity selects what a guest instantiates.
-            pci.set_subsystem_identity(((subsystem as u32) << 16) | VENDOR_ID as u32);
-            let w1 = W1::new(Shared::board_wire(&cfg));
+            pci.set_subsystem_identity(((board.subsystem_id as u32) << 16) | VENDOR_ID as u32);
+            let w1 = W1::new(default_wire(mac));
             Shared {
                 pci: PciFunctionState::new(pci),
                 core: core.clone(),
@@ -1420,22 +1330,10 @@ impl Ioc3 {
                 armed_due: std::array::from_fn(|_| AtomicU64::new(0)),
                 nvram_job: Mutex::new(None),
                 nvram_ready: Condvar::new(),
-                cfg,
+                board,
             }
         });
-        Ioc3 { sh, timekeeper: OnceLock::new(), threads: Mutex::new(Vec::new()) }
-    }
-
-    /// The Octane's (or Octane2's) onboard IOC3: both serial ports, PS/2,
-    /// parallel, the DS1685 and the Ethernet-address and board-record parts.
-    pub fn octane(mac: [u8; 6], octane2: bool) -> Ioc3 {
-        Ioc3::new(Ioc3Config::octane(mac, octane2))
-    }
-
-    /// Attach Fuel's independently owned flat select-0 system clock.
-    pub fn attach_timekeeper(&self, clock: Arc<crate::dev::timekeeper::Timekeeper>) {
-        assert!(!self.sh.cfg.rtc, "indexed Dallas and flat Timekeeper populations conflict");
-        assert!(self.timekeeper.set(clock).is_ok(), "IOC3 timekeeper attached more than once");
+        Ioc3 { sh, timekeeper, threads: Mutex::new(Vec::new()) }
     }
 
     /// The timer manager for device deadlines. Set it before start.
@@ -1540,6 +1438,11 @@ impl Ioc3 {
     /// The line the board wires the SuperIO interrupt (serial, PS/2, parallel,
     /// interrupt output) to. The line in its [`PciFunctionState`] is the PCI
     /// pin, which only the Ethernet block drives.
+    pub fn connect_superio(&self, bus: &PciBus) {
+        self.connect_superio_interrupt(bus.board_irq(BoardIrq(self.sh.board.superio_pin)));
+    }
+
+    /// [`Ioc3::connect_superio`] with the line given.
     pub fn connect_superio_interrupt(&self, line: IrqLine) {
         if self.sh.core.superio_line.set(line).is_ok() {
             self.sh.core.republish();
@@ -1745,7 +1648,7 @@ impl PciFunction for Ioc3 {
             return self.header_dword((a / 4) as usize);
         }
         if (reg::BYTEBUS_DEV0..reg::BYTEBUS_DEV0 + crate::dev::timekeeper::SIZE as u32).contains(&a) {
-            if let Some(clock) = self.timekeeper.get() {
+            if let Some(clock) = self.timekeeper.as_ref() {
                 if width != 1 {
                     crate::dlog!(crate::devlog::LogModule::Ioc, "IOC3 Timekeeper {width}-byte read refused");
                     return 0;
@@ -1772,7 +1675,7 @@ impl PciFunction for Ioc3 {
         }
         let a = off ^ (4 - width.min(4) as u32);
         if (reg::BYTEBUS_DEV0..reg::BYTEBUS_DEV0 + crate::dev::timekeeper::SIZE as u32).contains(&a) {
-            if let Some(clock) = self.timekeeper.get() {
+            if let Some(clock) = self.timekeeper.as_ref() {
                 if width != 1 {
                     crate::dlog!(crate::devlog::LogModule::Ioc, "IOC3 Timekeeper {width}-byte write refused");
                     return;

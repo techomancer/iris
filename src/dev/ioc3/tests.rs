@@ -16,6 +16,8 @@ use crate::pci::PciDmaStatus;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
 use crate::pci::PciFunction;
+use crate::dev::ng1::rex3::Rex3;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 
@@ -84,6 +86,11 @@ impl PciDma for TestMem {
     }
 }
 
+/// The Octane's IOC3, as the machine builds it but for the records.
+fn octane() -> Ioc3 {
+    Ioc3::new(&IP30, MAC, ByteBus::Ds1685)
+}
+
 struct Rig {
     c: Ioc3,
     mem: Arc<TestMem>,
@@ -93,7 +100,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
-        Rig::with(Ioc3::octane(MAC, false))
+        Rig::with(octane())
     }
 
     fn with(c: Ioc3) -> Rig {
@@ -148,6 +155,43 @@ fn identity_and_bar() {
     assert_eq!(cfg.interrupt_pin(), PCI_INTA);
     cfg.write(4, 0xffff_ffff);
     assert_eq!(cfg.read(4), 0xfff0_0000, "one megabyte of memory space");
+}
+
+/// A row of the board table builds a chip with the identity, the children
+/// and the GPIO straps the row names, and nothing else.
+#[test]
+fn each_board_reads_back_as_its_row_says() {
+    for board in [&IP30, &IP29, &BASEIO, &BASEIO6G, &IP34] {
+        let bus = match board.cells.byte_bus {
+            ByteBusPart::None => ByteBus::None,
+            ByteBusPart::Ds1685 => ByteBus::Ds1685,
+            ByteBusPart::M48t35 => {
+                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap()))
+            }
+        };
+        let r = Rig::with(Ioc3::new(board, MAC, bus));
+        let name = board.name;
+        assert_eq!(r.c.state().config().read(11), (board.subsystem_id as u32) << 16 | VENDOR_ID as u32, "{name}");
+        // A child that is fitted keeps what is written to it; one that is
+        // not reads zero.
+        let keeps = |a: u32, v: u32, mask: u32| {
+            r.w32(a, v);
+            r.r32(a) & mask == v & mask
+        };
+        assert_eq!(r.c.sh.serial.iter().all(|s| s.is_some()), board.cells.serial, "{name}: serial");
+        r.w8(reg::SERIAL_A + 7, 0x5a);
+        assert_eq!(r.r8(reg::SERIAL_A + 7) == 0x5a, board.cells.serial, "{name}: UART");
+        assert_eq!(keeps(0x9c, 0x1234, 0xffff), board.cells.kbd, "{name}: keyboard");
+        assert_eq!(keeps(0x80, 0x55, u32::MAX), board.cells.parallel, "{name}: parallel");
+        assert_eq!(keeps(0xf8, 0x3, 0x3), board.cells.eth, "{name}: Ethernet");
+        assert_eq!(r.c.eth().is_some(), board.cells.eth);
+        let straps: u32 = board.gpio.iter().map(|w| matches!(w.to, PinUse::Strap(true)) as u32 * (1 << w.pin)).sum();
+        assert_eq!(r.r32(reg::PIN_DATA), straps, "{name}: straps");
+        let rtc = board.cells.byte_bus == ByteBusPart::Ds1685;
+        r.w8(reg::BYTEBUS_DEV1, 0x40);
+        r.w8(reg::BYTEBUS_DEV2, 0x55);
+        assert_eq!(r.r8(reg::BYTEBUS_DEV2) == 0x55, rtc, "{name}: DS1685");
+    }
 }
 
 /// The reference Octane2's PROM monitor reads the chip's type 0
@@ -431,11 +475,12 @@ fn a_pin_register_reaches_the_shared_data_word() {
 }
 
 /// Pins 2 and 3 are read-only inputs the board drives high, on the Octane
-/// and the Octane2 alike. Writes and direction changes cannot replace them.
+/// and the Octane2 alike (one row serves both). Writes and direction changes
+/// cannot replace them.
 #[test]
 fn the_board_inputs_are_read_only() {
-    for octane2 in [false, true] {
-        let r = Rig::with(Ioc3::octane(MAC, octane2));
+    {
+        let r = Rig::with(octane());
         for pin in [2u32, 3] {
             let reg = reg::PIN_REG_FIRST + 4 * pin;
             assert_eq!(r.r32(reg), 1);
@@ -499,6 +544,50 @@ fn the_octane_lightbar_follows_pins_0_and_1() {
     assert_eq!(lit(), 0);
 }
 
+/// What each board's row says about the pins, written out per board: the
+/// levels its straps hold, and the status-bar bits its outputs reach. A pin
+/// the row does not list is unwired: it keeps what is written and reaches no
+/// status-bar bit.
+#[test]
+fn each_row_wires_its_pins_as_listed() {
+    // (board, pins held high, [(pin, status-bar bit)])
+    let rows: [(&Ioc3Board, u32, &[(u32, u64)]); 5] = [
+        (&IP30, 0b1100, &[(0, Rex3::HB_LED_GREEN), (1, Rex3::HB_LED_RED)]),
+        (&IP29, 0, &[]),
+        (&BASEIO, 0, &[]),
+        (&BASEIO6G, 0, &[]),
+        (&IP34, 0, &[]),
+    ];
+    for (board, straps, bits) in rows {
+        let bus = match board.cells.byte_bus {
+            ByteBusPart::None => ByteBus::None,
+            ByteBusPart::Ds1685 => ByteBus::Ds1685,
+            ByteBusPart::M48t35 => {
+                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap()))
+            }
+        };
+        let r = Rig::with(Ioc3::new(board, MAC, bus));
+        let hb = Arc::new(AtomicU64::new(0));
+        r.c.set_heartbeat(hb.clone());
+        let name = board.name;
+        for pin in 0..9u32 {
+            let reg = reg::PIN_REG_FIRST + 4 * pin;
+            let strapped = straps >> pin & 1 != 0;
+            let bit = bits.iter().find(|b| b.0 == pin).map_or(0, |b| b.1);
+            r.w32(reg, 1);
+            let high = r.r32(reg) == 1;
+            let leds = hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+            let listed = board.gpio.iter().any(|w| w.pin as u32 == pin && matches!(w.to, PinUse::Strap(_)));
+            assert_eq!(high, strapped || !listed, "{name} pin {pin}: a written 1 reads back unless a strap holds it low");
+            assert_eq!(leds, bit, "{name} pin {pin}: status-bar bit after a 1");
+            r.w32(reg, 0);
+            assert_eq!(r.r32(reg) == 1, strapped, "{name} pin {pin}: a written 0");
+            assert_eq!(hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED), 0, "{name} pin {pin}: cleared");
+        }
+        assert_eq!(r.r32(reg::PIN_DATA), straps, "{name}: nothing but the straps left");
+    }
+}
+
 // The MicroLAN protocol (search, match, page reads, CRCs) is tested with the
 // wire in `dev::w1`; the register cell and the board's default wire are below.
 
@@ -513,17 +602,17 @@ fn the_microlan_register_finishes_a_slot_inside_the_write() {
     assert_eq!(v & !3, (500 << 10) | (13 << 2), "the timing written reads back");
 }
 
-/// The wire the chip builds for itself: the station-address part and the
-/// two board records.
+/// The wire the chip is built with: the station-address part. The board
+/// records are the machine's.
 #[test]
-fn the_default_wire_carries_the_mac_part_and_two_board_records() {
+fn the_default_wire_carries_the_mac_part() {
     let r = Rig::new();
     r.w32(reg::PIN_CONTROL_SET, 1 << 21);
     r.w32(reg::MICROLAN, (500 << 10) | (13 << 2));
     assert_eq!(r.r32(reg::MICROLAN) & 1, 0, "a reset is answered with presence");
     let mut families: Vec<u8> = r.c.sh.w1.roms().iter().map(|rom| rom[0]).collect();
     families.sort();
-    assert_eq!(families, [0x0b, 0x0b, 0x91]);
+    assert_eq!(families, [0x91]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,7 +1231,7 @@ fn the_ethernet_registers_are_the_macs_and_it_gets_the_chips_dma() {
 /// Ethernet drives the PCI pin; the SuperIO line is a different one.
 #[test]
 fn the_ethernet_level_drives_the_pci_pin_not_the_superio_line() {
-    let c = Ioc3::octane(MAC, false);
+    let c = octane();
     c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
     c.state().connect_irq(line);
@@ -1260,7 +1349,7 @@ impl crate::irq::InterruptController for EdgeProbe {
 /// masked, so the output is low for the whole run.
 #[test]
 fn the_superio_line_never_rises_while_status_and_enable_never_agree() {
-    let c = Arc::new(Ioc3::octane(MAC, false));
+    let c = Arc::new(octane());
     let probe = Arc::new(EdgeProbe::default());
     c.connect_superio_interrupt(crate::irq::IrqLine::new(probe.clone(), 0));
     let bit = int::KEYBOARD;
@@ -1296,7 +1385,7 @@ fn the_superio_line_never_rises_while_status_and_enable_never_agree() {
 #[test]
 fn the_superio_line_is_driven_only_on_change_and_in_order_across_threads() {
     for _ in 0..20 {
-        let c = Arc::new(Ioc3::octane(MAC, false));
+        let c = Arc::new(octane());
         let probe = Arc::new(EdgeProbe::default());
         c.connect_superio_interrupt(crate::irq::IrqLine::new(probe.clone(), 0));
         // Connecting states the line's level once, changed or not.
@@ -1354,7 +1443,7 @@ fn the_superio_line_follows_enable_writes_racing_a_host_key() {
 
 #[test]
 fn the_ethernet_pin_follows_the_last_level_given() {
-    let c = Ioc3::octane(MAC, false);
+    let c = octane();
     c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
     c.state().connect_irq(line);
@@ -1871,7 +1960,7 @@ fn the_uarts_are_in_the_superio_block() {
 
 #[test]
 fn save_load_round_trip() {
-    for build in [|| Ioc3::octane(MAC, false), || Ioc3::octane(MAC, true)] {
+    for build in [octane] {
         let src = Rig::with(build());
         src.w8(reg::SERIAL_A + 3, 0x80);
         src.w8(reg::SERIAL_A + 7, 6);
@@ -1914,7 +2003,7 @@ fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
 /// counted from the load rather than from the save.
 #[test]
 fn a_pending_output_keeps_its_time_left() {
-    let src = Ioc3::octane(MAC, false);
+    let src = octane();
     src.bar_write(0, reg::INT_OUTPUT, IO_PERIODIC | 100, 4);
     let at_save = Instant::now();
     let left = Duration::from_micros(20);
@@ -1922,7 +2011,7 @@ fn a_pending_output_keeps_its_time_left() {
         src.sh.int_out.lock().next = Some(at_save + left);
         src.sh.save_state(at_save)
     };
-    let dst = Ioc3::octane(MAC, false);
+    let dst = octane();
     let at_load = at_save + Duration::from_millis(5);
     dst.sh.load_state(&v, at_load).unwrap();
     assert_eq!(dst.sh.int_out.lock().next, Some(at_load + left));
@@ -1930,7 +2019,7 @@ fn a_pending_output_keeps_its_time_left() {
 
 #[test]
 fn a_short_buffer_ram_is_refused() {
-    let c = Ioc3::octane(MAC, false);
+    let c = octane();
     let mut v = c.save_state();
     let chip = v.as_table_mut().unwrap().get_mut("chip").unwrap().as_table_mut().unwrap();
     chip.insert("ssram".into(), toml::Value::Array(Vec::new()));
@@ -1955,9 +2044,8 @@ fn an_octane_chip_reset_keeps_the_pci_header() {
 /// Dallas clock ports unfitted, and has no PHY reset on GPIO 5.
 #[test]
 fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
-    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
     let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
-    r.c.attach_timekeeper(clock.clone());
+    let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock.clone())));
     let cfg = r.c.state().config();
     cfg.write(1, 0xffff_0146);
     cfg.write(3, 0xffff_ffff);
@@ -1992,7 +2080,8 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
 /// survive a chip reset.
 #[test]
 fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
-    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
+    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
+    let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock)));
     for _ in 0..2 {
         r.c.reset();
         r.c.ps2().power_on();
