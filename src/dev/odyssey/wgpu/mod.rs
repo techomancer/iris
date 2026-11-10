@@ -867,6 +867,8 @@ impl RasterSet {
                 wgpu::BindGroupEntry { binding: 1, resource: tex.buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: stage.buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: log2.as_entire_binding() },
+                // The memory again, as the texel reads' plain words.
+                wgpu::BindGroupEntry { binding: 4, resource: vram.as_entire_binding() },
             ],
         });
         RasterSet { tex, stage, group }
@@ -895,7 +897,7 @@ impl GpuRaster {
         };
         let layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("vpro vram"),
-            entries: &[entry(0, false), entry(1, true), entry(2, true), entry(3, true)],
+            entries: &[entry(0, false), entry(1, true), entry(2, true), entry(3, true), entry(4, false)],
         });
         let log2_buf = gpu.buffer("vpro log2 table", 256 * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         gpu.write(&log2_buf, 0, bytemuck::cast_slice(&log2_table()));
