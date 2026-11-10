@@ -312,7 +312,6 @@ impl Workstation for FuelMachine {
         self.board.flash.power_on();
         self.board.xbridge.power_on();
         self.board.ioc3.power_on();
-        self.board.eth.power_on();
         self.board.scsi.power_on();
         self.board.usb.power_on();
         if let Some(vpro) = &self.board.vpro {
@@ -646,8 +645,7 @@ impl FuelBoard {
         let mut ioc3_config = Ioc3Config::fuel(mac);
         ioc3_config.keyboard_mouse = ps2_input;
         let ioc3 = Arc::new(Ioc3::new(ioc3_config));
-        let eth = Ioc3Eth::new_fuel(mac);
-        ioc3.attach_eth(eth.clone());
+        let eth = ioc3.eth().expect("the Fuel's IOC3 fits Ethernet").clone();
         ioc3.attach_timekeeper(timekeeper);
         ioc3.set_serial_backend(0, serial[1].clone());
         ioc3.set_serial_backend(1, serial[2].clone());
@@ -659,7 +657,6 @@ impl FuelBoard {
         let fasttick = Arc::new(AtomicU64::new(0));
         scsi.set_heartbeat(heartbeat.clone());
         ioc3.set_heartbeat(heartbeat.clone());
-        eth.set_heartbeat(heartbeat.clone());
         let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
         let vpro = if graphics == GraphicsBoard::None {
             None
@@ -687,14 +684,12 @@ impl FuelBoard {
         pci.attach(slot(5), usb.clone());
         ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
         let reset_ioc3 = ioc3.clone();
-        let reset_eth = eth.clone();
         let reset_scsi = scsi.clone();
         let reset_usb = usb.clone();
         let reset_vpro = vpro.as_ref().map(Arc::downgrade);
         xbridge.set_reset_output(Arc::new(move |port| {
             if port == 15 {
                 reset_ioc3.power_on();
-                reset_eth.power_on();
                 reset_scsi.power_on();
                 reset_usb.power_on();
             }
@@ -761,7 +756,6 @@ impl FuelBoard {
         self.bedrock.start();
         self.l1.start();
         self.ioc3.start();
-        self.eth.start();
         self.scsi.start();
         self.usb.start();
         if let Some(vpro) = &self.vpro {
@@ -803,7 +797,6 @@ impl FuelBoard {
         }
         self.usb.stop();
         self.scsi.stop();
-        self.eth.stop();
         self.ioc3.stop();
         self.l1.stop();
         self.bedrock.stop();

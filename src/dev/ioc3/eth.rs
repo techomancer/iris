@@ -1,8 +1,10 @@
 //! The Ethernet MAC inside IOC3, with the Octane ICS1890 or Fuel DP83843
 //! transceiver on its management bus.
 //!
-//! IOC3 forwards the register offsets 0xf0..=0x150 of its register BAR here
-//! through [`Ioc3EthPort`]. The MAC is SGI's own design with no vendor
+//! The IOC3 forwards the register offsets 0xf0..=0x150 of its register BAR
+//! here. The MAC is a child of the IOC3, as Linux's `ioc3-eth` cell is: the
+//! parent builds it, and it reaches memory and the PCI interrupt pin through
+//! the parent's shared state. The MAC is SGI's own design with no vendor
 //! document, so what it does is the contract the public drivers (Linux and
 //! OpenBSD) depend on:
 //!
@@ -13,7 +15,7 @@
 //! - one interrupt status/enable pair, receive sources low, transmit high;
 //! - the management interface to the PHY.
 //!
-//! Memory is reached through the [`PciDma`] IOC3 hands over in `connect`.
+//! Memory is reached through the DMA the parent holds.
 //! Ring entries and descriptor words are big-endian bytes at bus addresses,
 //! frame bytes are in wire order; the Bridge applies any programmed swap.
 //!
@@ -42,7 +44,9 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::dev::ioc3::port::Ioc3EthPort;
+use super::Core;
+use crate::dev::dp83840::Dp83840;
+use crate::dev::dp83843::Dp83843;
 use crate::dev::ics1890::Ics1890;
 use crate::dev::mii::MiiPhy;
 use crate::pci::{PciDma, PciDmaStatus};
@@ -161,6 +165,27 @@ pub const PHY_ADDR: u8 = 1;
 pub const ORIGIN200_PHY_ADDR: u8 = 31;
 /// How long the synthetic link partner takes to complete negotiation.
 pub const NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
+
+/// The transceiver a board fits on the MAC's management bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phy {
+    /// The Octane's ICS1890, at MII address 1.
+    Ics1890,
+    /// The Origin 200, 2000 and Onyx2 boards' DP83840A, at address 31.
+    Dp83840,
+    /// The Fuel's DP83843, at address 1.
+    Dp83843,
+}
+
+impl Phy {
+    fn build(self) -> Box<dyn MiiPhy> {
+        match self {
+            Phy::Ics1890 => Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)),
+            Phy::Dp83840 => Box::new(Dp83840::new(ORIGIN200_PHY_ADDR)),
+            Phy::Dp83843 => Box::new(Dp83843::new(PHY_ADDR)),
+        }
+    }
+}
 
 fn ridx(off: u32) -> usize {
     ((off - MAC_CONTROL) / 4) as usize
@@ -689,9 +714,6 @@ impl State {
     }
 }
 
-/// How the MAC drives its interrupt line: called with each new level.
-type IrqFn = Box<dyn Fn(bool) + Send + Sync>;
-
 /// IOC3's Ethernet.
 ///
 /// Lock order: `link`, then `st`; `irq_order` before `st` and before `irq`. The receive thread delivers a frame into guest memory
@@ -699,10 +721,8 @@ type IrqFn = Box<dyn Fn(bool) + Send + Sync>;
 /// through the Bridge and HEART, which never call back into this device.
 pub struct Ioc3Eth {
     mac: [u8; 6],
-    thread_prefix: &'static str,
+    core: Arc<Core>,
     st: Mutex<State>,
-    dma: Mutex<Option<Arc<dyn PciDma>>>,
-    irq: Mutex<Option<IrqFn>>,
     /// Serialises delivery of level changes to the interrupt callback.
     irq_order: Mutex<()>,
     link: Mutex<Option<crate::net::Rings>>,
@@ -728,35 +748,18 @@ pub struct Ioc3Eth {
 const RX_IDLE: Duration = Duration::from_secs(60);
 
 impl Ioc3Eth {
-    /// `mac` is the station address the board's one-wire chip carries. The
-    /// guest programs the receive filter itself; this is kept for the
-    /// integrator (`mac()`).
-    pub fn new(mac: [u8; 6]) -> Arc<Self> {
-        Self::with_negotiation_delay(mac, NEGOTIATION_DELAY)
+    /// The MAC a board fits behind `phy`. `mac` is the station address the
+    /// board's one-wire chip carries; the guest programs the receive filter
+    /// itself, and this is kept for the integrator (`mac()`).
+    pub(super) fn new(core: Arc<Core>, mac: [u8; 6], phy: Phy) -> Arc<Self> {
+        Self::with_phy(core, mac, phy.build())
     }
 
-    /// As [`Ioc3Eth::new`], with the PHY's synthetic negotiation delay set.
-    pub fn with_negotiation_delay(mac: [u8; 6], delay: Duration) -> Arc<Self> {
-        Self::with_phy(mac, Box::new(Ics1890::new(PHY_ADDR, delay)), "ip30-eth")
-    }
-
-    /// Fuel uses the DP83843 at management address 1.
-    pub fn new_fuel(mac: [u8; 6]) -> Arc<Self> {
-        Self::with_phy(mac, Box::new(crate::dev::dp83843::Dp83843::new(PHY_ADDR)), "ioc3-eth")
-    }
-
-    /// The Origin 200 System Board's DP83840A, at management address 31.
-    pub fn new_origin200(mac: [u8; 6]) -> Arc<Self> {
-        Self::with_phy(mac, Box::new(crate::dev::dp83840::Dp83840::new(ORIGIN200_PHY_ADDR)), "ioc3-eth")
-    }
-
-    fn with_phy(mac: [u8; 6], phy: Box<dyn MiiPhy>, thread_prefix: &'static str) -> Arc<Self> {
+    fn with_phy(core: Arc<Core>, mac: [u8; 6], phy: Box<dyn MiiPhy>) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             mac,
-            thread_prefix,
+            core,
             st: Mutex::new(State::new(phy)),
-            dma: Mutex::new(None),
-            irq: Mutex::new(None),
             irq_order: Mutex::new(()),
             link: Mutex::new(None),
             rx_wake: Mutex::new(None),
@@ -792,14 +795,12 @@ impl Ioc3Eth {
     pub fn reset(&self) {
         let _order = self.irq_order.lock();
         self.st.lock().power_on();
-        if let Some(cb) = self.irq.lock().as_ref() {
-            cb(false);
-        }
+        self.core.set_inta(false);
         self.wake_rx();
     }
 
     fn dma(&self) -> Arc<dyn PciDma> {
-        self.dma.lock().clone().unwrap_or_else(|| Arc::new(NullDma))
+        self.core.dma().cloned().unwrap_or_else(|| Arc::new(NullDma))
     }
 
     /// Deliver queued interrupt level changes, in order, with no lock held
@@ -810,10 +811,8 @@ impl Ioc3Eth {
         if events.is_empty() {
             return;
         }
-        if let Some(cb) = self.irq.lock().as_ref() {
-            for level in events {
-                cb(level);
-            }
+        for level in events {
+            self.core.set_inta(level);
         }
     }
 
@@ -859,7 +858,7 @@ impl Ioc3Eth {
     fn spawn_nat(&self) {
         let slot = self.backend.clone();
         let Some(mut engine) = slot.lock().take() else { return };
-        let thread_name = format!("{}-net", self.thread_prefix);
+        let thread_name = "ioc3-eth-net".to_string();
         let t = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
@@ -966,7 +965,7 @@ impl Device for Ioc3Eth {
         }
         let wake = self.rx_wake.lock().get_or_insert_with(crate::net::Wake::new).clone();
         let (me, running) = (self.me.clone(), self.running.clone());
-        let thread_name = format!("{}-rx", self.thread_prefix);
+        let thread_name = "ioc3-eth-rx".to_string();
         let rx = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || Self::rx_loop(me, running, wake))
@@ -1025,8 +1024,18 @@ impl Drop for Ioc3Eth {
     }
 }
 
-impl Ioc3EthPort for Ioc3Eth {
-    fn read32(&self, off: u32) -> u32 {
+#[cfg(test)]
+impl Ioc3Eth {
+    /// Replace the Octane's transceiver with one whose negotiation ends at
+    /// once, for tests of a whole machine.
+    pub(crate) fn negotiate_at_once(&self) {
+        self.st.lock().phy = Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO));
+    }
+}
+
+impl Ioc3Eth {
+    /// A 32-bit read of the MAC register at `off` in the chip's BAR.
+    pub(super) fn read32(&self, off: u32) -> u32 {
         if !(MAC_CONTROL..=MII_DATA_W).contains(&off) || off & 3 != 0 {
             return 0;
         }
@@ -1035,7 +1044,8 @@ impl Ioc3EthPort for Ioc3Eth {
         v
     }
 
-    fn write32(&self, off: u32, val: u32) {
+    /// A 32-bit write of the MAC register at `off`.
+    pub(super) fn write32(&self, off: u32, val: u32) {
         if !(MAC_CONTROL..=MII_DATA_W).contains(&off) || off & 3 != 0 {
             return;
         }
@@ -1054,12 +1064,6 @@ impl Ioc3EthPort for Ioc3Eth {
         if wake {
             self.wake_rx();
         }
-    }
-
-    fn connect(&self, dma: Arc<dyn PciDma>, irq: Box<dyn Fn(bool) + Send + Sync>) {
-        *self.dma.lock() = Some(dma);
-        *self.irq.lock() = Some(irq);
-        self.irq_flush();
     }
 }
 

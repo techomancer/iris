@@ -49,7 +49,7 @@ use crate::dev::hub::{Hub, HubConfig, HubHooks, Space};
 use crate::dev::hub_pi;
 use crate::dev::i2c::{BusBusy, I2cBus};
 use crate::dev::ioc3::{Ioc3, Ioc3Config};
-use crate::dev::ioc3::eth::Ioc3Eth;
+use crate::dev::ioc3::eth::Phy;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::node_flash::{self, FlashValues, NodeFlash};
 use crate::dev::pcf8584::Pcf8584;
@@ -775,6 +775,7 @@ impl Origin200 {
             pci_policy: Default::default(),
             reset_pci_on_power_on: false,
             mac,
+            phy: Some(Phy::Dp83840),
             serial: [true, true],
             parallel: true,
             keyboard_mouse: true,
@@ -855,8 +856,7 @@ impl Ip27Board for Origin200 {
         for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
             node.hub.io().connect_widget(widget, bridge.clone());
         }
-        let eth = Ioc3Eth::new_origin200(cfg.network().mac);
-        pci_devices(node, cfg, bridge, Self::ioc3_config(cfg.network().mac), eth, controller, SUPERIO_PIN, "origin200", Self::NAME)
+        pci_devices(node, cfg, bridge, Self::ioc3_config(cfg.network().mac), controller, SUPERIO_PIN, "origin200", Self::NAME)
     }
 }
 
@@ -867,7 +867,6 @@ pub(crate) fn pci_devices(
     cfg: &MachineConfig,
     bridge: Arc<Bridge>,
     ioc3_config: Ioc3Config,
-    eth: Arc<Ioc3Eth>,
     controller: Arc<dyn ModuleController>,
     superio_pin: u8,
     scsi_name: &str,
@@ -892,9 +891,8 @@ pub(crate) fn pci_devices(
     pci.attach(slot(0), scsi[0].clone());
     pci.attach(slot(1), scsi[1].clone());
     let ioc3 = Arc::new(Ioc3::new(ioc3_config));
-    ioc3.set_heartbeat(heartbeat.clone());
-    eth.set_heartbeat(heartbeat);
-    ioc3.attach_eth(eth.clone());
+    ioc3.set_heartbeat(heartbeat);
+    let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 fits Ethernet").clone();
     pci.attach(slot(2), ioc3.clone());
     ioc3.connect_superio_interrupt(pci.board_irq(crate::pci::BoardIrq(superio_pin)));
     ioc3.set_timer_manager(node.timers.clone());
@@ -917,14 +915,13 @@ pub(crate) fn pci_devices(
     }
     bridge.register_locks();
     ioc3.register_locks();
-    eth.register_locks();
     for s in &scsi {
         s.register_locks();
     }
 
     let mut monitor: Vec<Arc<dyn Device>> = scsi.iter().map(|s| s.clone() as Arc<dyn Device>).collect();
     monitor.push(ioc3.ps2());
-    let devices: Vec<Arc<dyn Device>> = vec![ioc3.clone(), eth.clone(), scsi[0].clone(), scsi[1].clone()];
+    let devices: Vec<Arc<dyn Device>> = vec![ioc3.clone(), scsi[0].clone(), scsi[1].clone()];
     let ps2 = ioc3.ps2();
     #[cfg(test)]
     let test_bridge = bridge.clone();
@@ -933,7 +930,6 @@ pub(crate) fn pci_devices(
         bridge.reset();
         bridge.reset_pci();
         ioc3.power_on();
-        eth.power_on();
         for s in &reset_scsi {
             s.reset();
         }

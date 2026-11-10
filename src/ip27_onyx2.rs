@@ -26,7 +26,6 @@ use crate::dev::bridge::Bridge;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
 use crate::dev::ioc3::Ioc3Config;
-use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
@@ -189,7 +188,7 @@ impl Ip27Board for Onyx2Deskside {
             }
         }
         let mac = cfg.network().mac;
-        pci_devices(owner, cfg, bridge, Self::ioc3_config(mac), Ioc3Eth::new_origin200(mac), controller, SUPERIO_PIN, "onyx2", Self::NAME)
+        pci_devices(owner, cfg, bridge, Self::ioc3_config(mac), controller, SUPERIO_PIN, "onyx2", Self::NAME)
     }
 }
 

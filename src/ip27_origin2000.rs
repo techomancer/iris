@@ -37,7 +37,7 @@ use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
 use crate::dev::ioc3::Ioc3Config;
-use crate::dev::ioc3::eth::Ioc3Eth;
+use crate::dev::ioc3::eth::Phy;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::o2000_module::{ModuleConfig, ModuleEvent, Origin2000Module};
 use crate::traits::Resettable;
@@ -132,6 +132,7 @@ impl Origin2000 {
             pci_policy: Default::default(),
             reset_pci_on_power_on: false,
             mac,
+            phy: Some(Phy::Dp83840),
             serial: [true, true],
             parallel: false,
             keyboard_mouse: false,
@@ -232,7 +233,7 @@ impl Ip27Board for Origin2000 {
                 }));
                 node.hub.io().connect_widget(WIDGET_BASEIO, xbow.port(WIDGET_BASEIO, bridge.clone()));
                 let mac = cfg.network().mac;
-                io = Some(pci_devices(node, cfg, bridge, Self::ioc3_config(mac), Ioc3Eth::new_origin200(mac), controller.clone(), SUPERIO_PIN, "origin2000", Self::NAME)?);
+                io = Some(pci_devices(node, cfg, bridge, Self::ioc3_config(mac), controller.clone(), SUPERIO_PIN, "origin2000", Self::NAME)?);
             }
         }
         if let [a, b] = nodes {

@@ -16,8 +16,7 @@
 //! * `dma`: the chip's view of bus-master memory;
 //! * the clock on the byte bus, the interrupt-output pulse
 //!   generator and 256 KiB of Ethernet buffer RAM, in this module; and
-//! * the Ethernet MAC (`eth`, behind [`port::Ioc3EthPort`]), whose registers
-//!   sit at 0xf0.
+//! * the Ethernet MAC (`eth`), whose registers sit at 0xf0.
 //!
 //! Which children a board fits is [`Ioc3Config`] today. Behaviour follows the
 //! public Linux and OpenBSD drivers and measured guest register traces; where
@@ -60,15 +59,15 @@
 //! Ported from hw/misc/sgi-ioc3.c and its serial, parallel and keyboard siblings
 //! in jamesbraid/qemu-sgi-origami.
 
-pub mod eth;
 mod dma;
 mod gpio;
 mod kbd;
 mod parallel;
-pub mod port;
 mod serial;
 mod superio;
 mod w1;
+
+pub mod eth;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -83,7 +82,7 @@ pub use self::dma::Ioc3Dma;
 use self::gpio::{Gpio, PinUse, PinWire};
 use self::kbd::Kbd;
 use self::parallel::Parallel;
-use self::port::Ioc3EthPort;
+use self::eth::{Ioc3Eth, Phy};
 use self::serial::Serial;
 use self::superio::SuperIo;
 use self::w1::W1;
@@ -417,6 +416,8 @@ pub struct Ioc3Config {
     pub reset_pci_on_power_on: bool,
     /// The board's station address, which the one-wire part holds.
     pub mac: [u8; 6],
+    /// The Ethernet transceiver, on a board that fits the MAC.
+    pub phy: Option<Phy>,
     pub serial: [bool; 2],
     pub parallel: bool,
     pub keyboard_mouse: bool,
@@ -458,6 +459,7 @@ impl Ioc3Config {
             },
             reset_pci_on_power_on: true,
             mac,
+            phy: Some(Phy::Dp83843),
             serial: [true, true],
             parallel: true,
             keyboard_mouse: true,
@@ -482,6 +484,7 @@ impl Ioc3Config {
             pci_policy: PciConfigPolicy::default(),
             reset_pci_on_power_on: false,
             mac,
+            phy: Some(Phy::Ics1890),
             serial: [true, true],
             parallel: true,
             keyboard_mouse: true,
@@ -642,8 +645,15 @@ struct Core {
     chip_control: AtomicU32,
     ring_hi: AtomicU32,
     ring_lo: AtomicU32,
-    dma: OnceLock<Arc<Ioc3Dma>>,
+    dma: OnceLock<Arc<dyn PciDma>>,
     superio_line: OnceLock<IrqLine>,
+    /// PCI interrupt pin A: the Ethernet block.
+    pin_line: Mutex<Option<IrqLine>>,
+    /// What the pin was last driven to, and the Ethernet block's level.
+    pin_level: AtomicBool,
+    eth_level: AtomicBool,
+    /// Serialises driving the PCI pin; see [`Core::sync_pin`].
+    line_order: Mutex<()>,
 }
 
 /// What `Core`'s lock guards.
@@ -670,11 +680,42 @@ impl Core {
             ring_lo: AtomicU32::new(0),
             dma: OnceLock::new(),
             superio_line: OnceLock::new(),
+            pin_line: Mutex::new(None),
+            pin_level: AtomicBool::new(false),
+            eth_level: AtomicBool::new(false),
+            line_order: Mutex::new(()),
         }
     }
 
-    fn dma(&self) -> Option<&Arc<Ioc3Dma>> {
+    fn dma(&self) -> Option<&Arc<dyn PciDma>> {
         self.dma.get()
+    }
+
+    /// The Ethernet block's level, on the PCI pin.
+    fn set_inta(&self, level: bool) {
+        self.eth_level.store(level, Ordering::SeqCst);
+        self.sync_pin();
+    }
+
+    /// The PCI pin follows the Ethernet block's level.
+    fn sync_pin(&self) {
+        let _order = self.line_order.lock();
+        let level = self.eth_level.load(Ordering::SeqCst);
+        if self.pin_level.swap(level, Ordering::SeqCst) != level {
+            if let Some(l) = self.pin_line.lock().as_ref() {
+                l.set(level);
+            }
+        }
+    }
+
+    /// The bus gave the function its interrupt pin.
+    fn connect_pin(&self, line: IrqLine) {
+        {
+            let _order = self.line_order.lock();
+            line.set(self.pin_level.load(Ordering::SeqCst));
+            *self.pin_line.lock() = Some(line);
+        }
+        self.sync_pin();
     }
 
     /// The interrupt status word.
@@ -780,13 +821,12 @@ type Deadlines = [Option<Instant>; KINDS];
 /// A rewrite of the NVRAM file waiting for the writer thread.
 type NvramJob = (std::path::PathBuf, Vec<u8>, Option<Vec<u8>>);
 
-/// Lock order: `gate`, then `line_order`, then a child's lock (the serial
-/// engine's before the Super I/O's it reaches through), then the interrupt
-/// words' lock in `Core`, under which the SuperIO line is driven, then the
-/// Bridge's; `armed`, the line and Ethernet slots (`pin_line`, `eth`, the
-/// port's DMA) and the NVRAM hand-off are leaves. The Bridge never calls back
-/// into the chip while it holds a lock of its own, so a child's lock may be
-/// held while the SuperIO line is driven.
+/// Lock order: `gate`, then a child's lock (the serial engine's before the
+/// Super I/O's it reaches through), then the interrupt words' lock in `Core`,
+/// under which the SuperIO line is driven, then the Bridge's; `armed`, the
+/// line slots (`pin_line`) and the NVRAM hand-off are leaves. The Bridge never
+/// calls back into the chip while it holds a lock of its own, so a child's
+/// lock may be held while the SuperIO line is driven.
 /// The serial and parallel engines move their rings with their lock held: the
 /// DMA goes down through the Bridge and HEART, which never call back into
 /// the chip, and an access to the Ethernet block goes to it with no lock
@@ -814,14 +854,7 @@ struct Shared {
     /// been told yet.
     power_off_pending: AtomicBool,
     ssram: Mutex<Vec<u32>>,
-    eth: Mutex<Option<Arc<dyn Ioc3EthPort>>>,
-    /// PCI interrupt pin A: the Ethernet block.
-    pin_line: Mutex<Option<IrqLine>>,
-    /// What the pin was last driven to, and the Ethernet block's level.
-    pin_level: AtomicBool,
-    eth_level: AtomicBool,
-    /// Serialises driving the PCI pin; see [`Shared::sync_pin`].
-    line_order: Mutex<()>,
+    eth: Option<Arc<Ioc3Eth>>,
     me: Weak<Shared>,
     timers: OnceLock<Arc<TimerManager>>,
     events: OnceLock<SyncSender<MachineEvent>>,
@@ -843,17 +876,6 @@ impl Shared {
     /// records.
     fn board_wire(cfg: &Ioc3Config) -> onewire::Bus {
         default_wire(cfg)
-    }
-
-    /// The PCI pin follows the Ethernet block's level.
-    fn sync_pin(&self) {
-        let _order = self.line_order.lock();
-        let level = self.eth_level.load(Ordering::SeqCst);
-        if self.pin_level.swap(level, Ordering::SeqCst) != level {
-            if let Some(l) = self.pin_line.lock().as_ref() {
-                l.set(level);
-            }
-        }
     }
 
     /// What follows every access: arm the timers for the deadlines it left,
@@ -1027,27 +1049,8 @@ impl Shared {
         job
     }
 
-    /// Hand the Ethernet block its way to memory and its interrupt, once
-    /// both it and the bridge's DMA are in hand.
-    fn connect_eth(self: &Arc<Self>) {
-        let eth = self.eth.lock().clone();
-        let dma = self.pci.dma().cloned();
-        if let (Some(e), Some(d)) = (eth, dma) {
-            let weak = Arc::downgrade(self);
-            e.connect(
-                Arc::new(Ioc3Dma::new(d)),
-                Box::new(move |level| {
-                    if let Some(sh) = weak.upgrade() {
-                        sh.eth_level.store(level, Ordering::SeqCst);
-                        sh.sync_pin();
-                    }
-                }),
-            );
-        }
-    }
-
-    fn eth(&self) -> Option<Arc<dyn Ioc3EthPort>> {
-        self.eth.lock().clone()
+    fn eth(&self) -> Option<&Arc<Ioc3Eth>> {
+        self.eth.as_ref()
     }
 
     fn flush_nvram(&self, quiet: Duration) {
@@ -1410,6 +1413,7 @@ impl Ioc3 {
             wiring.push(PinWire { pin: 1, to: PinUse::StatusBit(Rex3::HB_LED_RED) });
         }
         let gpio = Gpio::new(&wiring);
+        let eth = cfg.phy.map(|phy| Ioc3Eth::new(core.clone(), cfg.mac, phy));
         let sh = Arc::new_cyclic(|weak: &Weak<Shared>| {
             let bars = [
                 Bar::Mem(BAR_SIZE),
@@ -1441,11 +1445,7 @@ impl Ioc3 {
                 nvram_due: AtomicU64::new(0),
                 power_off_pending: AtomicBool::new(false),
                 ssram: Mutex::new(vec![0; (reg::SSRAM_SIZE / 4) as usize]),
-                eth: Mutex::new(None),
-                pin_line: Mutex::new(None),
-                pin_level: AtomicBool::new(false),
-                eth_level: AtomicBool::new(false),
-                line_order: Mutex::new(()),
+                eth,
                 me: weak.clone(),
                 timers: OnceLock::new(),
                 events: OnceLock::new(),
@@ -1558,17 +1558,18 @@ impl Ioc3 {
         self.sh.flush_nvram(Duration::ZERO);
     }
 
-    /// Show the system board's front lightbar in the status bar through
-    /// `heartbeat`.
+    /// Show the system board's front lightbar and the Ethernet activity in
+    /// the status bar through `heartbeat`.
     pub fn set_heartbeat(&self, heartbeat: Arc<AtomicU64>) {
+        if let Some(e) = &self.sh.eth {
+            e.set_heartbeat(heartbeat.clone());
+        }
         self.sh.gpio.set_heartbeat(heartbeat);
     }
 
-    /// Attach the Ethernet MAC. It is told about DMA and the PCI interrupt
-    /// pin as soon as the bridge provides them.
-    pub fn attach_eth(&self, eth: Arc<dyn Ioc3EthPort>) {
-        *self.sh.eth.lock() = Some(eth);
-        self.sh.connect_eth();
+    /// The Ethernet MAC, on a board that fits one.
+    pub fn eth(&self) -> Option<&Arc<Ioc3Eth>> {
+        self.sh.eth.as_ref()
     }
 
     /// The line the board wires the SuperIO interrupt (serial, PS/2, parallel,
@@ -1592,9 +1593,8 @@ impl Ioc3 {
         self.sh.rtc.lock().dev.powered_off()
     }
 
-    /// A PCI reset of the chip (not of the clock or the buffer RAM). The
-    /// Ethernet block is a separate device here and keeps its state: the
-    /// machine resets it on its own.
+    /// A PCI reset of the chip (not of the clock, the buffer RAM or the
+    /// Ethernet block, which keeps its state: `power_on` resets that too).
     pub fn reset(&self) {
         self.sh.reset();
     }
@@ -1611,7 +1611,7 @@ impl Ioc3 {
     /// only a weak reference to them.
     pub fn register_locks(&self) {
         for (what, probe) in [
-            ("line_order", (|s: &Shared| s.line_order.is_locked()) as fn(&Shared) -> bool),
+            ("line_order", (|s: &Shared| s.core.line_order.is_locked()) as fn(&Shared) -> bool),
             ("int_out", |s| s.int_out.is_locked()),
             ("rtc", |s| s.rtc.is_locked()),
         ] {
@@ -1626,6 +1626,9 @@ impl Ioc3 {
         ] {
             let sh = Arc::downgrade(&self.sh);
             crate::locks::register_lock(format!("ioc3::{what}"), move || sh.upgrade().is_some_and(|s| probe(&s)));
+        }
+        if let Some(e) = &self.sh.eth {
+            e.register_locks();
         }
     }
 
@@ -1646,6 +1649,9 @@ impl Device for Ioc3 {
         }
         if let Some(k) = &self.sh.kbd {
             Device::start(&**k.ps2());
+        }
+        if let Some(e) = &self.sh.eth {
+            Device::start(&**e);
         }
         let mut threads = self.threads.lock();
         for (p, s) in self.sh.serial.iter().enumerate() {
@@ -1702,6 +1708,9 @@ impl Device for Ioc3 {
         if let Some(k) = &self.sh.kbd {
             Device::stop(&**k.ps2());
         }
+        if let Some(e) = &self.sh.eth {
+            Device::stop(&**e);
+        }
         self.flush_nvram();
     }
 
@@ -1715,10 +1724,13 @@ impl Device for Ioc3 {
 }
 
 impl Resettable for Ioc3 {
-    /// The chip as at power-on. The clock and the buffer RAM keep their
-    /// contents, as they are memory.
+    /// The chip as at power-on, MAC and transceiver included. The clock and
+    /// the buffer RAM keep their contents, as they are memory.
     fn power_on(&self) {
         self.reset();
+        if let Some(e) = &self.sh.eth {
+            e.power_on();
+        }
     }
 }
 
@@ -1823,15 +1835,9 @@ impl PciFunction for Ioc3 {
     fn attached(&self) {
         if let Some(dma) = self.sh.pci.dma() {
             let _ = self.sh.core.dma.set(Arc::new(Ioc3Dma::new(dma.clone())));
-            self.sh.connect_eth();
         }
         if let Some(line) = self.sh.pci.irq() {
-            {
-                let _order = self.sh.line_order.lock();
-                line.set(self.sh.pin_level.load(Ordering::SeqCst));
-                *self.sh.pin_line.lock() = Some(line.clone());
-            }
-            self.sh.sync_pin();
+            self.sh.core.connect_pin(line.clone());
         }
     }
 }
@@ -2022,7 +2028,7 @@ impl Saveable for Ioc3 {
         self.sh.load_state(field(v, "chip")?, now)?;
         self.sh.rearm();
         self.sh.core.republish();
-        self.sh.sync_pin();
+        self.sh.core.sync_pin();
         Ok(())
     }
 }

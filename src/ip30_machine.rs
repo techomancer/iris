@@ -287,9 +287,7 @@ impl OctaneMachine {
         disks.extend(nvme.as_ref().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)));
         let ioc3 = Arc::new(Ioc3::octane(mac, false));
         ioc3.set_heartbeat(heartbeat.clone());
-        let eth = Ioc3Eth::new(mac);
-        eth.set_heartbeat(heartbeat.clone());
-        ioc3.attach_eth(eth.clone());
+        let eth = ioc3.eth().expect("the Octane's IOC3 fits Ethernet").clone();
         pci.attach(slot(2), ioc3.clone());
         ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(SUPERIO_PIN)));
         ioc3.set_timer_manager(timer_manager.clone());
@@ -536,7 +534,6 @@ impl OctaneMachine {
         }
         flash.register_locks();
         ioc3.register_locks();
-        eth.register_locks();
         rad.register_locks();
         if let Some(g) = &gfx {
             monitor.register_device(g.mgras().clone());
@@ -682,7 +679,6 @@ impl OctaneMachine {
         let mut d: Vec<Arc<dyn Device>> = vec![
             self.heart.clone(),
             self.ioc3.clone(),
-            self.eth.clone(),
             self.scsi[0].clone(),
             self.scsi[1].clone(),
             self.rad.clone(),
@@ -767,7 +763,6 @@ impl OctaneMachine {
             b.bridge().reset_pci();
         }
         self.ioc3.power_on();
-        self.eth.power_on();
         for c in &self.scsi {
             c.reset();
         }
