@@ -446,9 +446,6 @@ pub(super) mod dma {
     pub const DESC_UPLOAD: u32 = 0x00000e01; // opcode 0xe01: either direction
     pub const DESC_READBACK: u32 = 0x00000e03; // opcode 0xe03: region path only
     pub const DESC_OPERANDS: u32 = 3; // the three words after the opcode
-    pub const DESC_ADDR_LOW_MASK: u32 = 0x1ffff; // bits 16:0 of a packed half
-    pub const DESC_ADDR_HIGH_SHIFT: u32 = 23; // bits 29:23: half bits 23:17
-    pub const DESC_ADDR_HIGH_MASK: u32 = 0x7f;
 
     // The fence word the 0x0a5a host-write command's operands form (see super::reg::HOST_WRITE).
     pub const FENCE_SLOT_MASK: u32 = 0x7fff;
@@ -469,8 +466,10 @@ pub(super) mod dma {
     pub const ROWBYTES_MASK: u32 = 0xfffff;
     pub const BPP_SHIFT: u32 = 16;
     pub const BPP_MASK: u32 = 0x7;
+    #[cfg(test)]
     pub const IRQ_REQUEST: u32 = 1 << 31;
     pub const PTE_LEN_MASK: u32 = 0xffff;
+    #[cfg(test)]
     pub const PTE_ADDR_SHIFT: u32 = 16;
 
     // One kick names one 128-byte work-list entry
@@ -479,23 +478,20 @@ pub(super) mod dma {
 
     // Board-to-host transfers.
     pub const HDR_FORMAT: usize = 4;
+    #[cfg(test)]
     pub const TO_HOST: u32 = 1 << 24; // word 7
     pub const BOTTOM_UP: u32 = 1 << 30; // word 7
     pub const SENTINEL: u32 = 1 << 29; // word 0
     pub const SENTINEL_READ: u32 = 0x30000019;
     pub const SENTINEL_DRAW: u32 = 0x30000010;
+    #[cfg(test)]
     pub const FMT_FRONT: u32 = 1 << 31; // word 4
     pub const FMT_SELECTOR_SHIFT: u32 = 28; // word 4 bits 30:28
     pub const FMT_SELECTOR_MASK: u32 = 0x7;
     pub const FMT_SELECTOR_READ: u32 = 1;
     pub const FMT_SELECTOR_DRAW: u32 = 0;
-    pub const FMT_SIZE_SHIFT: u32 = 13; // word 4 bits 15:13
-    pub const FMT_SIZE_MASK: u32 = 0x7;
     pub const FMT_SIZE_STENCIL: u32 = 0; // a write's size field: stencil
     pub const FMT_SIZE_DEPTH: u32 = 1; // and depth
-    pub const FMT_CLASS_MASK: u32 = 0x7; // word 4 bits 2:0
-    pub const FMT_CODE_SHIFT: u32 = 3; // word 4 bits 7:3
-    pub const FMT_CODE_MASK: u32 = 0x1f;
 
     // The GL library's source classes for 8- and 12-bit RGBA visuals.
 

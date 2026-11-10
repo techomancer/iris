@@ -21,6 +21,8 @@ use super::draw::{code_is_index, decode_texel12, pixel_bytes, texel12_components
 use super::geometry::{f32_bits, odyssey_f32};
 use super::pixel_dma::{guest_value, put_guest_value, write_guest, DmaBus, DmaDirection, DmaError, DmaMap, DmaPageList};
 use super::pixel_write::{write_form, WriteForm};
+use super::regs::buzz::ReadHeader;
+use super::regs::dma::{EntryW7, EntryW7ReadDir, KickALo, KickBHi, PageW0, PageW1};
 #[derive(Clone, Copy, Default)]
 pub(super) struct DmaEntry {
     pub addr: u64,
@@ -98,13 +100,15 @@ pub(super) const ODSY_CMD_GL_RECT: u32 = 7;
 pub(super) const ODSY_CMD_SKIP: u32 = 8;
 
 /// The table's physical address half, unpacked from a descriptor word.
-pub(super) fn dma_desc_half(word: u32) -> u64 {
-    ((word & dma::DESC_ADDR_LOW_MASK) as u64)
-        | ((((word >> dma::DESC_ADDR_HIGH_SHIFT) & dma::DESC_ADDR_HIGH_MASK) as u64) << 17)
+fn dma_desc_half(lo: u32, hi: u32) -> u64 {
+    (lo as u64) | ((hi as u64) << 17)
 }
 
-pub(super) fn dma_table_address(w1: u32, w3: u32) -> u64 {
-    (dma_desc_half(w1) << 24) | dma_desc_half(w3)
+/// The table's physical address from the kick's two address words: the
+/// first holds the upper 24 bits, the second the lower 24.
+pub(super) fn dma_table_address(upper: u32, lower: u32) -> u64 {
+    let (upper, lower) = (KickALo::new(upper), KickBHi::new(lower));
+    (dma_desc_half(upper.addr_lo(), upper.addr_hi()) << 24) | dma_desc_half(lower.addr_lo(), lower.addr_hi())
 }
 
 impl Board {
@@ -138,11 +142,12 @@ impl DmaBus {
                 return Err(DmaError::Bus);
             }
             let pte = be64(&raw[..8]);
-            if pte & (dma::PTE_LEN_MASK as u64) == 0 {
+            let (w0, w1) = (PageW0::new((pte >> 32) as u32), PageW1::new(pte as u32));
+            if w1.count() == 0 {
                 return Ok(n);
             }
-            e[n].addr = pte >> dma::PTE_ADDR_SHIFT;
-            e[n].len = (pte & (dma::PTE_LEN_MASK as u64)) as u32;
+            e[n].addr = ((w0.addr() as u64) << 16) | w1.addr_lo() as u64;
+            e[n].len = w1.count();
             n += 1;
         }
         Ok(n)
@@ -191,7 +196,7 @@ impl Board {
         let drawable = base & dma::SENTINEL != 0;
         let addr = if drawable { if read { self.read_word } else { self.draw_word } } else { base } & ADDR_MASK;
         let surface = Surface::new(addr, hdr[dma::HDR_WIDTH] & PITCH_MASK, ((fmt >> 16) & 0xf) as u8 + 1);
-        let bytes = 2u8 << ((fmt >> 13) & 7);
+        let bytes = 2u8 << ReadHeader::new(fmt).size_field();
         // The field's packing: the pixel mode's when the transfer goes to the
         // surface it selects (the library selects a level before it uploads
         // to it), else what word 4's code and class name.
@@ -276,7 +281,7 @@ impl Board {
         let direct = memory && self.gpu_unit();
         let ([a, b], drawable) = self.dma_fields(hdr, false, !direct);
         // Word 4 bit 31: the front (A) field, else the back (B).
-        let mut to = if hdr[dma::HDR_FORMAT] & dma::FMT_FRONT != 0 { a } else { b };
+        let mut to = if ReadHeader::new(hdr[dma::HDR_FORMAT]).front() { a } else { b };
         if direct {
             // Stored into the mirror untracked and uploaded as the pixels
             // written (GpuRaster::upload_region), below.
@@ -438,7 +443,7 @@ pub(super) fn dma_depth_stencil_write(hdr: &[u32]) -> Option<DepthStencil> {
     if hdr[dma::HDR_CONTROL] & write::CODE_MASK != image::CODE_DEPTH_STENCIL {
         return None;
     }
-    match (hdr[dma::HDR_FORMAT] >> dma::FMT_SIZE_SHIFT) & dma::FMT_SIZE_MASK {
+    match ReadHeader::new(hdr[dma::HDR_FORMAT]).size_field() {
         dma::FMT_SIZE_DEPTH => Some(DepthStencil::Depth),
         dma::FMT_SIZE_STENCIL => Some(DepthStencil::Stencil),
         _ => None,
@@ -780,8 +785,7 @@ impl Board {
     pub fn dma_read_layout(&mut self, hdr: &[u32], bpp: u32) -> Option<&'static DmaLayout> {
         let xcode = hdr[dma::HDR_CONTROL] & image::CODE_MASK;
         let fmt = hdr[dma::HDR_FORMAT];
-        let cls = fmt & dma::FMT_CLASS_MASK;
-        let code = (fmt >> dma::FMT_CODE_SHIFT) & dma::FMT_CODE_MASK;
+        let (cls, code) = (ReadHeader::new(fmt).class(), ReadHeader::new(fmt).code());
         let drawable = hdr[dma::HDR_DEST] & dma::SENTINEL != 0;
         let mut l: Option<&'static DmaLayout> = None;
 
@@ -878,7 +882,7 @@ impl Board {
         src.depth = depth_at(Kind::Z24, 0);
         src.stencil = depth_at(Kind::Byte, 3);
         src.drawable = drawable;
-        src.front = fmt & dma::FMT_FRONT != 0;
+        src.front = ReadHeader::new(fmt).front();
         src.x = (hdr[dma::HDR_ORIGIN] & 0xffff) as i64;
         src.y = (hdr[dma::HDR_ORIGIN] >> 16) as i64;
         if drawable {
@@ -1226,7 +1230,7 @@ impl Board {
         if self.trace.on(super::trace::TRACE_DMA) {
             let what = if readback {
                 "readback"
-            } else if hdr[dma::HDR_CONTROL] & dma::TO_HOST != 0 {
+            } else if EntryW7::new(hdr[dma::HDR_CONTROL]).read_dir() == EntryW7ReadDir::Read {
                 "to host"
             } else if hdr[dma::HDR_DEST] & dma::SENTINEL != 0 {
                 "sentinel"
@@ -1240,7 +1244,7 @@ impl Board {
                 self.diag.dma_readback_reported = true;
                 crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA opcode 0xe03 (buffer {:#x}) is not modeled", hdr[dma::HDR_DEST]);
             }
-        } else if hdr[dma::HDR_CONTROL] & dma::TO_HOST != 0 {
+        } else if EntryW7::new(hdr[dma::HDR_CONTROL]).read_dir() == EntryW7ReadDir::Read {
             self.dma_from_board(&bus, table, seq, &hdr);
         } else if hdr[dma::HDR_DEST] & dma::SENTINEL != 0 {
             if hdr[dma::HDR_DEST] == dma::SENTINEL_DRAW {
@@ -1258,7 +1262,7 @@ impl Board {
         } else {
             self.dma_to_buffer(&bus, table, seq, &hdr);
         }
-        if hdr[dma::HDR_CONTROL] & dma::IRQ_REQUEST != 0 {
+        if EntryW7::new(hdr[dma::HDR_CONTROL]).irq_after() {
             self.dma_done();
         }
     }

@@ -57,6 +57,7 @@
 use super::gpu_unit::{CopyOp, CopySelect, CopyWindow};
 use super::pipe::backend::{widen8, DestMem};
 use super::pipe::ring::BackQuad;
+use super::regs::buzz::{CopyMixed, ImageWord0, ReadHeader, WriteFormat, WriteHeader};
 use super::bits::sextract32;
 use super::board::Board;
 use super::consts::{tex, ODSY_DID_MAIN_SHIFT, ODSY_PLANE_MASK_SHIFT};
@@ -87,12 +88,6 @@ pub(super) struct CopyOperands {
     pub w: [u32; 8],
 }
 
-/// Word 7 bits 4:0, the format the copy writes (the Odyssey RE notes).
-const WRITE_FORMAT_MASK: u32 = 0x1f;
-const WRITE_FORMAT_COLOR_INDEX: u32 = 1;
-/// Word 7 bit 27.
-const COPY_TRANSFORM: u32 = 1 << 27;
-
 impl CopyOperands {
     pub fn decode(op: &[u32]) -> CopyOperands {
         let mut w = [0; 8];
@@ -104,9 +99,14 @@ impl CopyOperands {
         (self.w[3] & 0xffff, self.w[3] >> 16)
     }
 
+    /// Word 4: the source field's description.
+    pub fn read_header(&self) -> ReadHeader {
+        ReadHeader::new(self.w[4])
+    }
+
     pub fn src(&self) -> Side {
         let w = &self.w;
-        let front = w[4] >> 31 != 0;
+        let h = self.read_header();
         Side {
             base: w[0] & ADDR_MASK,
             drawable: w[0] & DRAWABLE != 0,
@@ -114,41 +114,39 @@ impl CopyOperands {
             y: w[1] >> 16,
             stride: w[2] & PITCH_MASK,
             pixel_log2: ((w[4] >> 16) & 0xf) as u8 + 1,
-            at: 2 * (if front { (w[4] >> 20) & 0xf } else { (w[4] >> 24) & 0xf }) as u8,
-            bytes: 2 << ((w[4] >> 13) & 7),
+            at: 2 * (if h.front() { h.field_a() } else { h.field_b() }) as u8,
+            bytes: 2 << h.size_field(),
             format: w[4] & 0xff,
         }
     }
 
-    /// Word 7's write format, bits 4:0 (the Odyssey RE notes; not checked
-    /// against a board). Its type, bits 8:5, runs into bit 8: do not mask a
-    /// byte.
-    pub fn write_format(&self) -> u32 {
-        self.w[7] & WRITE_FORMAT_MASK
+    /// Word 7's write format (not checked against a board).
+    pub fn write_format(&self) -> WriteFormat {
+        WriteHeader::new(self.w[7]).format()
     }
 
     /// Word 7 bit 27: the copy is a textured rectangle (a zoom sets it too)
     /// and not the short copy path.
     pub fn transform(&self) -> bool {
-        self.w[7] & COPY_TRANSFORM != 0
+        WriteHeader::new(self.w[7]).transform()
     }
 
     /// The read and write field sizes, bits 15:13 of words 4 and 7.
     pub fn same_width(&self) -> bool {
-        (self.w[4] >> 13) & 7 == (self.w[7] >> 13) & 7
+        self.read_header().size_field() == WriteHeader::new(self.w[7]).size_field()
     }
 
     pub fn dst(&self) -> Side {
         let w = &self.w;
         Side {
-            base: w[5] & ADDR_MASK,
+            base: ImageWord0::new(w[5]).ref_(),
             drawable: w[5] & DRAWABLE != 0,
             x: w[6] & 0xffff,
             y: w[6] >> 16,
             stride: (w[2] >> 16) & PITCH_MASK,
             pixel_log2: ((w[7] >> 16) & 0xf) as u8 + 1,
-            at: 2 * ((w[2] >> 12) & 0xf) as u8,
-            bytes: 2 << ((w[7] >> 13) & 7),
+            at: 2 * CopyMixed::new(w[2]).dst_field_b() as u8,
+            bytes: 2 << WriteHeader::new(w[7]).size_field(),
             format: 0,
         }
     }
@@ -241,11 +239,11 @@ impl Board {
         let from = side_rows(&src, src_codec(src.at), src_base);
         // A drawable source's front is the buffer its window shows, as a
         // DMA read's is (Board::read_buffer()): buffer 0 the A field, 1 the B.
-        let w4 = c.w[4];
+        let hdr = c.read_header();
         let ab = src.drawable.then(|| {
-            [(w4 >> 20) & 0xf, (w4 >> 24) & 0xf].map(|u| side_rows(&Side { at: 2 * u as u8, ..src }, src_codec(2 * u as u8), src_base))
+            [hdr.field_a(), hdr.field_b()].map(|u| side_rows(&Side { at: 2 * u as u8, ..src }, src_codec(2 * u as u8), src_base))
         });
-        let front = w4 >> 31 != 0;
+        let front = hdr.front();
         let to = side_rows(&dst, dst_codec, dst_base);
         let (ox, oy) = if src.drawable { (self.win.read_origin[0], self.win.read_origin[1]) } else { (0, 0) };
         let (dx0, dy0) = if dst.drawable { (self.win.origin[0], self.win.origin[1]) } else { (0, 0) };
@@ -300,7 +298,7 @@ impl Board {
         let one_component = Codec::Texel { bytes: 2, field: FIELD_ONE };
         let index = !filter
             && !c.transform()
-            && c.write_format() == WRITE_FORMAT_COLOR_INDEX
+            && c.write_format() == WriteFormat::Index
             && c.same_width()
             && src_codec(src.at) == one_component
             && matches!(dst_codec, Codec::Texel { field: FIELD_INDEX, bytes: 2 });
@@ -409,7 +407,7 @@ impl Board {
         let (views, select) = match ab {
             None => ([from.v, from.v], CopySelect::Fixed(0)),
             Some(f) => {
-                let front = c.w[4] >> 31 != 0;
+                let front = c.read_header().front();
                 let select = if self.read_drawable_offscreen() {
                     CopySelect::Fixed(self.read_buffer(front, 0, 0) as usize & 1)
                 } else {
