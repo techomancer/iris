@@ -21,14 +21,36 @@ alias size changes:
   to the Hub that holds zero, across the cable.
 - The node's own memory is then reached by its own number.
 
-Sending the window elsewhere takes away the ppmem mapping, so every cached
-reference of that node takes the bus path while its number is nonzero. A node
-that holds zero, and any board that routes nothing, never leaves the fast path.
-Do not add a decision to the access path for this: the rare state changes which
-mapping is installed, and nothing is tested per access.
+The ppmem window, which the cache and the JIT read without the bus, must show
+the same memory at the same addresses, or the renumbered node's processor takes
+the bus path for every cached reference (about 2.2 times as long for a
+CPU-bound loop when only the first node had a window). `Windows`
+(`src/ip27.rs`) lays every node's window from the numbers the Hubs publish,
+whenever any node's number or alias changes:
 
-The cost of the bus path for the second node is measured in
-`docs/origin2000-ip27.md`, not assumed.
+- node zero's window as above, from the node's own banks or the zero holder's;
+- each node's memory at its number (`n << 32`), its own and the other's;
+- only the difference, so a page that stays mapped is replaced in one host
+  mapping call and a renumbering never clears the window a running processor
+  executes from.
+
+A store to any Hub's number or alias publishes the numbers (`Routing`) and
+lays every node's window at once, from the storing thread: the hardware takes
+the new number at once, so no window trails the decode table. The other node's
+processor can be running meanwhile, and its CACHE instructions hold and release
+line pages in the same `PpMemSpace`. The space has one small mutex, taken by
+every remap (`map_bank`, `map_alias`, `map_range`, `unmap_range`,
+`clear_mappings`) and by `add_cached_view`, `hold_line_page` and
+`release_line_page`. A load, store or fetch never takes it: they read through
+the processor's inline bitmap and its view's base pointer. Without it a
+renumber rebuilds the mapping list under a `hold_line_page` that is reading it
+(`a_renumber_on_one_processor_does_not_disturb_the_others_line_pages`). Lock
+order is `Windows`, then the space.
+
+A two-node window is 8 GiB, so its region bitmap counts 128 MiB regions; a 64
+or 256 MiB bank leaves regions part empty, and those take the bus path. Do not
+add a decision to the access path for any of this: the rare state change lays
+a different mapping, and nothing is tested per access.
 
 ## A Bridge behind a Crossbow picks its host by the widget the guest programs
 

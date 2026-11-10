@@ -207,6 +207,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   profile's own is refused. The module controller logs under a new `module`
   category (see [debug.md](debug.md)), accesses to node memory that is not
   fitted log under `hub`, and the Origin 2000 and Onyx2 share one board type.
+- On a two-node Origin 2000 or Onyx2, both processors read both nodes' memory
+  through the ppmem window, so the second node's processor no longer takes the
+  bus path for every cached access and runs as fast as the first.
 
 ### Onyx2
 

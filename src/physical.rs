@@ -624,7 +624,7 @@ impl Physical {
     #[inline(always)]
     fn bitmap(&self) -> u64 {
         let p = self.ppmem_bitmap.load(Ordering::Relaxed);
-        if p.is_null() { 0 } else { unsafe { *p } }
+        if p.is_null() { 0 } else { crate::ppmem::ppmem::read_word(p) }
     }
 
     /// Is `addr` backed by a whole directly-mapped region?
