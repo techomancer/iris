@@ -8,8 +8,10 @@
 //! ordinary register path; after each step the two must agree word for
 //! word: VRAM, the Z buffer and the span iterators. The test then asserts
 //! that the JIT drew every span and that every value of every key field
-//! was exercised. `GR2_JIT_SWEEP=<factor>` scales the steps, `GR2_JIT_SEED`
-//! changes the seed.
+//! was exercised. `GR2_JIT_SWEEP=<factor>` scales the steps (default 1 in
+//! release, 0.15 in a debug build, where the full sweep takes over a minute
+//! and the fewest steps that still draw every key value is about 0.05 of the
+//! full count), `GR2_JIT_SEED` changes the seed.
 //!
 //! Run with `cargo test --release --features gr2-jit --lib re3_jit_tests`.
 
@@ -49,7 +51,8 @@ impl Rng {
 }
 
 fn sweep_factor() -> f64 {
-    std::env::var("GR2_JIT_SWEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0)
+    let default = if cfg!(debug_assertions) { 0.15 } else { 1.0 };
+    std::env::var("GR2_JIT_SWEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn seed(salt: u64) -> u64 {
