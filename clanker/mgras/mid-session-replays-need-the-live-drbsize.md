@@ -29,3 +29,12 @@ prints `DRBsize` and `DRBpointers` at the end: DRBsize 0 means the
 recording never set it. With the live layout the sgiquake recording's
 518 checkpoints are equal on both engines and the GPU unit is
 deterministic.
+
+**The recorded hashes never match.** A mid-session recording's own
+checkpoints hashed a board whose earlier state (pixels, TRAM) is not in
+the recording, so a plain checked replay fails all of them, from the
+first. Replay with `MGRAS_REPLAY_NOCHECK=1` and compare the engines with
+each other: the CPU engine with `MGRAS_REPLAY_HASHES_OUT=f`, then the GPU
+unit (`MGRAS_REPLAY_GPU=1`) with `MGRAS_REPLAY_HASHES_IN=f`, which
+reports `first differing None` when every checkpoint agrees (about 4 and
+2.5 minutes for sgiquake).
