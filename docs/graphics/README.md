@@ -15,7 +15,7 @@ implement, compares them, and describes the structure they share.
 | IMPACT (MGRAS) | Indigo2 IMPACT, Octane | [mgras.md](mgras.md) |
 | O2 graphics (CRIME, GBE) | O2 | [o2.md](o2.md) |
 | VPro (Odyssey) | Octane | [vpro.md](vpro.md) |
-| InfiniteReality (KONA), in progress | Onyx, Onyx2, Onyx 300 and Onyx 350 (device only; no machine profile yet) | [kona.md](kona.md) |
+| InfiniteReality (KONA) | Onyx, Onyx2, Onyx 300 and Onyx 350 (Onyx2 only, with `[graphics] board`; see the [Onyx2 guide](../onyx2-ip27.md)) | [kona.md](kona.md) |
 
 The Machines column lists the machines each board shipped in. Iris accepts some boards on more machine profiles than the column shows; `GraphicsBoard::supports` in `src/config.rs` lists them.
 
@@ -84,12 +84,10 @@ nothing: the guest's own library code runs as ordinary guest code.
 
 | Stage | Express | Newport | IMPACT | O2 | VPro | InfiniteReality |
 |---|---|---|---|---|---|---|
-| Geometry (stages 1-3) | shared GL core | guest | shared GL core | guest | shared GL core | shared GL core (planned) |
-| Rasterisation and shading | span interpreter, optional span JIT | shader table chosen per draw, optional JIT | interpreter or JIT, one thread per raster engine | plain Rust | tile workers, or the host GPU | integer 2D loops; tile workers for GL (planned) |
+| Geometry (stages 1-3) | shared GL core | guest | shared GL core | guest | shared GL core | shared GL core |
+| Rasterisation and shading | span interpreter, optional span JIT | shader table chosen per draw, optional JIT | interpreter or JIT, one thread per raster engine | plain Rust | tile workers, or the host GPU | integer 2D loops on the front end; tile workers for GL |
 | Frame buffer | word arrays | word arrays | per-engine pages | guest RAM | one word array, or a GPU buffer | one pixel store |
 | Scan-out | display thread | display thread | display thread | display thread | display thread, or the host GPU | display thread |
-
-Entries marked planned are not built yet.
 
 ### 2D drawing in Iris
 
@@ -100,7 +98,7 @@ and not publicly documented for Express, VPro and InfiniteReality.
 
 ## Threads
 
-Boards split the work into one to three threads after the CPU. The CPU thread writes drawing commands to the FIFO, and a few registers act on the CPU thread directly (O2 GBE, Newport CONFIG and DCB). Newport and O2 have one command-and-draw thread. Express and IMPACT split decode from raster, and VPro splits it twice. InfiniteReality's tile workers are planned. A display thread reads the frame buffer at each refresh and presents it.
+Boards split the work into one to three threads after the CPU. The CPU thread writes drawing commands to the FIFO, and a few registers act on the CPU thread directly (O2 GBE, Newport CONFIG and DCB). Newport and O2 have one command-and-draw thread. Express and IMPACT split decode from raster, and VPro splits it twice. InfiniteReality splits it once, into tile workers. A display thread reads the frame buffer at each refresh and presents it.
 
 ```mermaid
 flowchart LR
@@ -125,13 +123,11 @@ flowchart LR
     direction TB
     vp0["CPU"] -->|FIFO| vp1["front end"] -->|draw jobs| vpr["raster"] -->|tile queues| vp2["tile workers"] -.->|memory| vp3["display"]
   end
-  subgraph KN["InfiniteReality (in progress)"]
+  subgraph KN["InfiniteReality"]
     direction TB
-    kn0["CPU"] -->|FIFO| kn1["front end and 2D"] -.->|memory| kn2["display"]
-    kn3["tile workers (planned)"]
+    kn0["CPU"] -->|FIFO| kn1["front end, 2D and set-up"] -->|tile queues| kn3["tile workers"] -.->|memory| kn2["display"]
   end
   EX ~~~ NP ~~~ IM ~~~ O2 ~~~ VP ~~~ KN
-  style kn3 stroke-dasharray: 4 3
 ```
 
 Solid arrows are queues. Dotted arrows are reads of board memory, mostly unlocked.

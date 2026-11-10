@@ -219,6 +219,108 @@ hashes are given where a change is easiest to understand by reading the commit.
   through the ppmem window, so the second node's processor no longer takes the
   bus path for every cached access and runs as fast as the first.
 
+### InfiniteReality front end
+
+- `src/dev/kona/` is the InfiniteReality (KONA) pipe's host interface: widget
+  id and identity registers, the one-wire board record of an Onyx2 deskside's
+  InfiniteReality2 (GE14-4, one or two RM7), the flash EEPROM and the
+  operation the graphics install tool programs it with, the command FIFO on
+  `GFifo` (a full ring answers the bus busy), command framing for the
+  textport, kernel and GL grammars, DMA and display-list memory. The
+  Onyx2 fits it with `[graphics] board`.
+- The back end runs a display thread: `KonaBackend::attach` hands it a
+  `DisplayHandle` to complete retraces, raise the video interrupt and mark
+  activity for the driver's watchdog. A reset ends the epoch tickets were made
+  in, so stale calls are dropped. `stop`, `quiesce` and `resume` let it join and
+  park its threads.
+- `KonaBackend` is the InfiniteReality drawing back end: it takes the jobs the
+  front end frames, carries the pipe's configuration (raster
+  managers, texture memory per manager, board set, managed area) and answers
+  `kona status` and `kona counters`. Words the command framers drop because
+  no command is open for them reach the back end as `Job::Dropped`. Nothing
+  draws yet.
+- The KONA back end holds the pixel store (one array per word position of a
+  pixel's record, allocated when first written and published through fixed
+  pointers), lays a buffer configuration out in a pixel's words within the host's
+  budget (`kona status` shows the result and the refusals), and has packers for
+  the host and bus pixel formats. `kona pix <x> <y>` shows a pixel's words.
+- The replay reads recordings record by record, so the 71-million-record GL demo
+  recording can be censused per marked span (`KONA_GL_RECORDING`); the results
+  are in `clanker/kona/token-census.md`.
+- The KONA back end draws the PROM's textport (colour, raster position, boxes,
+  points, bitmap blits) into the pixel store, boxes by a fill rule that is a
+  parameter (`FillRule`). Replaying the PROM recording to its end draws the
+  graphics menu; `kona hash` shows the store's hash.
+- The X server's graphics context, position, clip list and scissor are decoded and held by the KONA back end (`kona status` shows what was understood). X boxes, rectangles, spans and points (and the data tokens that feed them) draw under that state into the pixel store, clipped to the screen, the clip list and the scissor, and masked by the stipple the X server stores and loads. Replaying the IRIX recording over its exactly framed window (about 20,700 records of graphics traffic) draws the greeter's start, 154 fills; `kona hash` pins it.
+- The KONA back end loads the textport's colour map and composes the frame the PROM's console draws (the default descriptor: the front colour word as an index into that map); `kona shot <file.png>` writes it. Replaying the PROM recording gives a frame with no pixel differing from the recorded capture. Other colour-index and direct-colour windows are composed from the display tables (see below); overlays are not.
+- The KONA back end runs a display thread (`kona-display`) at 60 Hz: it completes waiting retrace requests at frame boundaries (the retrace tag changes then) and raises the video interrupt once a frame, never marking activity for the driver's watchdog. A reset cancels waiting requests; stop joins the thread and quiesce holds it.
+- The KONA back end owns a screen (`KonaBackend::display`, a `GfxDisplay`): at each retrace its display thread composes the frame and presents it through the renderer slot, every frame, as VPro's does; a screenshot or frame request is answered by the first frame composed after it. A machine that holds the `Arc` can return it from `get_display`.
+- The KONA back end keeps the X server's state (graphics context, position, clip list, scissor, stipple cache) once per rendering context, as the front end names the current one with every job; commands with no context current use a copy of their own, as before. A fresh activation starts a context from power-on, a switch-out keeps its state. `kona status` shows the copy the last job ran under and how many contexts hold any.
+- The KONA back end counts the kernel's memory-region commands (place, copy down, swap out and in, with the bytes each swap names) and `kona status` shows them. The front end already answers them and moves the bytes (zeros out, dropped in); no pool lives in the back end yet, so there is nothing for a swap to encode.
+- The KONA back end takes the X server's pixel commands: setup, write (rows as a data run or, with the mode word's DMA bit, in the DMA packet that follows), copy, read and finish. Writes and copies draw under the clip list, scissor, stipple, mask and logic operation; reads answer on the return page or, inside a select-feed bracket, write the host buffer at the bracket's finish and post the four-word completion. Refused and counted: the window-copy pair, overlay, popup and display-ID targets, the two-buffer RGB form, and frame-buffer word reads (they need a per-pixel tag). `kona status` shows the counts and the refusals.
+- The X server's fills into the display-ID, overlay and popup planes now draw, into planes of their own beside the pixel record; nothing shows the overlays or the popup yet. The two-buffer RGB form and overlay-both stay refused and counted.
+- The KONA display composes index and direct-colour windows. It keeps the X colour map, the display-ID table and mode words, the gamma RAM's first page and the cursor's glyph memory and registers; each pixel's display ID (bits 7:2 of the ID plane) says whether its word is an 8-bit or a 12-bit index into the colour map, or direct colour, the map's entries go through the gamma RAM, and a glyph cursor is drawn over the frame. The textport's frame is unchanged, and replaying the IRIX recording now gives a desktop frame with no pixel differing from its capture by more than eight levels. Not composed yet: overlays, the popup, the crosshair cursor, the DAC cursor's channels.
+- The KONA back end takes the GL client's state and vertices. Each context keeps its matrix stacks, viewport, scissor, depth range, lights, material and current colour, normal and texture coordinate; a begin and its vertices are transformed and lit on the shared GL core (`src/dev/gl`), clipped to the view volume (near and far geometrically, x and y at a guard band), divided, cut to the window or scissor in window space, quantised to 1/256 pixel and handed over as typed vertices with the vertex bus's completion kinds and four texture words (`s/w, t/w, r/w, q/w`). There is no rasteriser behind it yet, so nothing is drawn; `kona status` counts what was handed over, clipped, culled and not taken (double forms, texture generation, user clip planes, fog, polygon modes, vertex arrays and the IRIS GL compatibility tokens).
+- The KONA back end has its own tile scheduler (`back/sched`): a ring of command slots, a queue of slot indices for every screen tile a command touches, a lock-free ready queue and `kona-tile-N` workers that own a tile until its queue is empty, slots retired in order, and a work budget. Nothing draws through it yet; its tests run box fills (xor and and-not, overlapping) tiled and inline and require the same store hash.
+- The KONA back end draws the GL client's triangles. Set-up (the half-pixel offset, the 1/8-pixel grid, integer edge functions with a left-and-bottom-out fill rule, `f32` attribute planes) runs on the front-end thread and each triangle becomes a job on the tile scheduler, `[graphics] threads` workers on `[graphics] tile`-pixel tiles (`BackendConfig::with_pool`); the per-pixel module has no `f64`. Colour is Gouraud or flat, depth is tested under the GL functions, glClear clears colour and depth, the scissor and the window the kernel placed bound every draw, and a double-buffered window draws into the buffer its swaps are not showing. A window with no colour-map offset that is not colour index shows as direct colour, the buffer its swaps last named. Points, lines, stencil, blending, masks and textures are not drawn yet. Replaying the GL demo recording draws atlantis's sea and ivview's windmill (with `KONA_SHOT_DIR`, frames are kept).
+- The KONA back end draws the X server's background points (one, six or twenty-four to a token) in the context's background colour. They take a waiting data run and the clip, scissor, write mask and logic operation, and not the stipple; that last rule is inferred.
+- The KONA back end draws the X server's relative points (one, six or twenty-four to a token). Each word is a step from the previous point, the first from the drawable's origin, and the walk runs on through a waiting data run and the whole burst, starting again at the origin with the next token. They draw like absolute points, stipple included. The anchor rules are inferred.
+- The KONA back end draws the X server's line segments and polylines, absolute and relative, under the context's clip, scissor, stipple, write mask and logic operation. A polyline of n points makes n - 1 segments, arriving as n - 1 words of data preload and a one-word token, and a waiting data run joins it. The drawable's position is added to every point and line vertex, absolute and relative (inferred; the X server's position loads are mostly nonzero). Which pixels the pipe lights is unknown: the model lights both ends, a segment of no length as one pixel and a shared vertex once, a labelled approximation.
+- The KONA back end takes the double-precision forms of the GL client's colour, normal, texture-coordinate and vertex tokens, which were counted as not modelled and drew nothing. A double is two words, high word first, narrowed to single precision as the command arrives and run as the float form; the word counts are established for the texture coordinates and inferred for the others. The colour-index double stays unmodelled.
+- The KONA back end clips against the GL client's user clip planes: the set-plane token and the enables for planes 0 to 5 were not taken and the query answered zeros. A plane is kept in eye space, the coefficients times the inverse of the model-view matrix at the call (inferred), and cuts lines, points and polygons beside the view volume. A model-view matrix with no inverse leaves the plane as it was; what the pipe does there is unknown.
+- The KONA back end generates texture coordinates (glTexGen): object and eye linear, and sphere map for s and t, per coordinate, with the planes and modes kept in the context's state and snapshot and the eye planes held in eye space. Generation runs while texturing is on, and the generated coordinate goes through the texture matrix. The pipe's distance planes and modes, and sphere map on r or q, are counted and change nothing.
+- The KONA back end applies fog: the setter's float and integer forms and the enable fill a fog state per context (in the snapshot and answered by the state query), and each fragment's colour is blended with the fog colour by OpenGL's linear, exp or exp2 factor of the eye-space distance, after the texture environment and before the alpha test. The pipe computes the factor from the window depth through a 12-bit table; the model approximates that table by evaluating the function at the fragment's eye distance and rounding to 12 bits, so how close it lands is unmeasured. Colour-index fog, the function-table mode and the fog offset are accepted and not modelled.
+- The KONA back end draws polygons as lines or points under the polygon fill mode, which was counted and ignored. A face in the line mode is drawn as lines between the vertices whose edge flag is set, and one in the point mode as points at them, through the paths GL lines and points take: line width and stipple, point size, the face's own colours, and not the polygon stipple. A strip, fan or quad strip draws every edge of each piece.
+- The KONA back end loads and draws volume textures, which were counted as not modelled. A volume arrives as one texel draw per slice and is bound by the 3D records; the 3D enable turns on texture coordinates, with generated coordinates running under it as under the 2D enable, and a fragment samples nearest or trilinearly with r choosing the slice. Where the texels sit inside a level's address pair and the single-level form's level of detail are unknown and approximated.
+- The KONA back end keeps the detail bind and the filter-coefficient tables per context and combines a magnified base texture with its detail image (add or modulate, by the filter curve) or sharpens it against the next coarser level, which showed only plain linear magnification before. A base bind whose format row differs from the detail bind's, or that has no detail bind, magnifies linearly. The detail's position is the base's texel coordinate times 2^|L| (inferred); the arithmetic's widths and rounding, and the sharpen arithmetic, are unknown and approximated. A minified fragment is unchanged, and a plain 2D draw runs the loop it ran before.
+- The KONA texture memory is addressed the way the pipe addresses it: a level at address a of a bank is the words from 16 a of that bank's plane, so a level reloaded at the same place overwrites it, one a later load overlaps is retired, and nothing is allocated. Before, the texture arena only grew, filled at the product's size and refused every later load and bind (a TyrQuake replay hit it). A load is now refused only when its address and extent reach past the product's bank, or when its texels would take texture memory past the product's pool. Planes are sparse 64 KiB pages made on first write, so a texel at the top of a bank costs a page, and the pages held across all planes are capped at the product's texture memory. Each context has planes of its own, given back when its slot is activated afresh; the owner's block offset is not modelled, so contexts neither contend for memory nor alias, so a texture loaded through one member of a share group (contexts the kernel lets see the same physical block) is not visible to a bind from another member. Snapshots keep each plane's pages (a snapshot with the older texture layout is refused), and `kona status` reports texture memory held, its peak and the ceiling.
+- The KONA back end loads textures sent in the packed pixel types (3-3-2, 4-4-4-4, 5-5-5-1, 8-8-8-8 and 10-10-10-2). It refused them as an unknown type, so the level never loaded and every bind of it was refused: a replay of an Onyx2 Quake session lost 478 binds to 4-4-4-4 textures. The bit order and scaling are OpenGL's (inferred).
+- The KONA back end smooths points, lines and polygons, whose enables were counted and ignored: with one on, the primitive is weighed by the share of each pixel it covers, and that share scales the fragment's alpha after fog and before the alpha test. A line is its rectangle, a point the share of an 8 x 8 grid inside its disc, and a polygon of up to eight edges after clipping its clipped outline. In a multisampled window lines and points still smooth and polygons multisample. The coverage rule is unknown, so these are the model's own approximations, kept in `back/raster/smooth.rs`.
+- The KONA board was reworked to a fixed shape: one concrete back end (no
+  `Backend` trait or null back end), one `Mutex<Pipe>` over the stream state and
+  the back end, processor accesses that only queue or `try_lock`, one fake
+  machine for the tests, named host tokens and register fields in `defs.rs`, and
+  a tile scheduler with a preallocated queue per tile and a draw-state table.
+  GL triangles reach set-up as plain window-relative vertices under a draw state;
+  nothing clips in window space, so a large triangle keeps its colour slopes
+  where it crosses the screen, and the ivview windmill's tower, which drew 54
+  red pixels, now draws about 10,600 to 13,200 (the capture shows about 11,700).
+  Every store access drains the tiles by going through `raster::surface`.
+- A recorded command stream (the `KONAREC` file QEMU's KONA model writes) can be
+  replayed into the front end: stores and loads in order, the board's DMA reads
+  served from the recording and its writes compared. With no back end the replay
+  is exact only up to the first data run one must size; past it the stream
+  misframes. With the drawing back end behind it (`replay_into`) the IRIX
+  stream frames whole and every byte the board writes to guest memory matches
+  the recording. Set `KONA_RECORDINGS` to the
+  directory of recordings (and `KONA_SHOT_DIR` to keep the frame the desktop test composes) and run `cargo test --lib kona::back::replay --
+  --nocapture`; without it the tests skip.
+
+- The KONA back end keeps the display generator's eight video channels: the
+  formats, input rectangles, placement, cursor priority, gamma map and enables the
+  X server sets, and answers its video Gets (board and channel configuration,
+  resize, blanking, enables, Vampire) on the return page. When the firmware is
+  released it runs the stored video combination, or the built-in one when the
+  stored image is not whole. The state is in the snapshot. Blanking is kept and
+  logged and `kona status` lists the blanked channels, but nothing is drawn
+  differently; a managed size other than the configured one is ignored, and
+  Vampire and X-window binding are not modelled. The video command table now gives
+  the data-word count of all 93 requests, and the monitor command has no reply.
+
+- The KONA texture read-back (token 0x052) returns a level's raw 16-bit words
+  when it is read as luminance in unsigned shorts under the one-component storage
+  code, as the library does before it reloads and rebinds a level, and a bind
+  samples whatever words a level holds under its own format. A read bigger than
+  the model builds is refused and counted before anything is allocated, including
+  one made large by the pack skips, and a bracketed read-back is delivered to the
+  range its start token describes. A level updated at its edge is no longer taken
+  for a small level's copy, and a snapshot keeps the detail images.
+- The KONA display shows black while channel 0 is blanked, by its own blanking or by a temporary blank of all channels. The pixel store is untouched. The choice is made once per frame.
+- The KONA display draws channel 0's DAC cursor over the composed frame, past the gamma RAM, in X11 mode when the control register enables it. The DAC block's index and data writes are followed for the control value and the position, and the state is saved in the snapshot. The XGA mode, the interlace bit's effect and the load for channel 0xde are not drawn.
+- The KONA display narrows the gamma RAM's 12-bit output to the DAC's 8 bits by dropping the low four, where it rounded: the colour map's output chips drive the video-output chips from bits 11:4 alone, with nothing rounding or dithering on that link (established there, inferred end to end). Colours that came out one level higher now match.
+- The KONA front end counts the kernel's write of 1 to the activity register once per video interrupt, instead of logging an unimplemented-write warning for each (about 85 a second while a guest ran).
+- The KONA back end answers every push of the GL attribute stack with a completion word, as the pipe does (inferred), so a client that pushes only the list bit no longer waits on its return page forever (the cycles demo printed "GL:Wait Rdata timed out"). Nothing is read back for the list bit, and the data for the other attribute bits is left empty and counted. A push onto a full 16-entry stack sets the stack-overflow error (inferred) and still completes.
+
 ### Onyx2
 
 - `machine.profile = "onyx2_ip27"` runs the stock IP27 PROM on one or two Hub
@@ -234,6 +336,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   BaseIO card's boot flash. The node PROM loads it at "Loading BASEIO prom";
   without it the PROM runs its own reduced copy, which has no graphics
   console.
+- `[graphics] board = "ir2e"` (or `"ir2e:2rm"`) fits an InfiniteReality2E pipe in
+  the Onyx2 deskside: GE16-4 and RM9 board records, board set 4, 64 MB of
+  texture per raster manager. The pipe's product table also holds the
+  InfiniteReality3 (board set 5, 256 MB of texture per raster manager, which
+  the texture store sizes itself for); no machine fits it, so it has no board
+  name.
+- `[graphics] board = "ir2"` (or `"ir2:2rm"`) fits the InfiniteReality2 pipe
+  in the Onyx2's graphics slot. Its interrupt packets and DMA go to the Hub at
+  the widget the guest programs into it, its window is the machine's display,
+  and `[graphics] flash` keeps its flash EEPROM in a file.
 
 ### Origin 2000
 
