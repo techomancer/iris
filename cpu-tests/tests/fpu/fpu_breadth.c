@@ -128,6 +128,12 @@ static void cvt_w_s_sentinel(void)
  * Both are defensible for these parts, so the suite accepts either — but it
  * insists on the whole of whichever story it gets, and prints which. A
  * silently wrong number passes neither branch. See docs/oracle.md §2.
+ *
+ * The R10000 family has one story: it "took an unimplemented exception
+ * whenever a conversion from an FP value would result in a value that cannot
+ * be represented in the target format", and the R12000 kept that except for a
+ * denormal source with FCSR.FS set (NEC VR10000 Series User's Manual
+ * U10278EJ4V0UM, Appendix B.4, p. 350). The R14000 is inferred to match.
  */
 static void t_convert_out_of_range(void)
 {
@@ -143,7 +149,8 @@ static void t_convert_out_of_range(void)
     obs_collect(&o);
     fcsr_reset();
 
-    if (o.exceptions) {
+    if (o.exceptions || is_r10000()) {
+        CHECK_EQ(o.exceptions, 1u);
         CHECK_EQ(o.excode, (u32)EXC_FPE);
         CHECK_EQ(o.cause & FP_E, (u32)FP_E);
         CHECK_EQ(o.result, SENTINEL_S);      /* "operands undisturbed" */
@@ -155,7 +162,8 @@ static void t_convert_out_of_range(void)
                o.exceptions, o.cause, o.result);
 }
 
-/* An infinity has no integer representation either, and takes the same path. */
+/* An infinity has no integer representation either, and takes the same path:
+ * on the R10000, Unimplemented Operation (the same Appendix B.4 sentence). */
 static void t_convert_infinity(void)
 {
     struct fp_obs o;
@@ -170,7 +178,14 @@ static void t_convert_infinity(void)
     obs_collect(&o);
     fcsr_reset();
 
-    CHECK(o.exceptions == 1u || (o.cause & FP_V) != 0);
+    if (is_r10000()) {
+        CHECK_EQ(o.exceptions, 1u);
+        CHECK_EQ(o.excode, (u32)EXC_FPE);
+        CHECK_EQ(o.cause & FP_E, (u32)FP_E);
+        CHECK_EQ(o.result, SENTINEL_S);
+    } else {
+        CHECK(o.exceptions == 1u || (o.cause & FP_V) != 0);
+    }
     con_printf("\n      [cvt.w.s of +inf: exc=%u cause=%x result=%x]",
                o.exceptions, o.cause, o.result);
 }

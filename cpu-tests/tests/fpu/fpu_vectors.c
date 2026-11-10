@@ -377,6 +377,12 @@ static void t_convert_from_long(void)
          * it; the R5000 run said otherwise.
          */
         int traps = (v->in > (1LL << 53) || v->in < -(1LL << 53));
+        /*
+         * On the R10000 a 51-bit long "no longer takes an Unimplemented
+         * Operation exception" (R10000 UM v2.0, p. 312). The manual says
+         * nothing past 2^53; converting every vector is iris's answer.
+         */
+        if (is_r10000()) traps = 0;
 
         d()[0] = (u64)v->in; w()[4] = 0;
         SYNC();

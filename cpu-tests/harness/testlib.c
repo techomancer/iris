@@ -76,7 +76,7 @@ void exc_install(void)
 /* ── cache maintenance ────────────────────────────────────────────────────── */
 /*
  * Step by 16: the R4400 line size, and a correct (if redundant) step for the
- * R5000's 32-byte lines.
+ * R5000's and R10000's 32- and 64-byte lines.
  *
  * Everything here works on `char *`, never on a u32. A `cache` instruction
  * given a zero-extended 0x0000000088218000 instead of the sign-extended
@@ -106,7 +106,10 @@ int have_l2;
 
 void cache_detect(void)
 {
-    have_l2 = (cp0_config() & CFG_SC) == 0;
+    /* The R10000's Config has no SC bit: bits 18:16 are the secondary cache's
+     * size, and it always has one (R10000 UM v2.0, p. 256, Table 14-15). */
+    if (is_r10000()) have_l2 = 1;
+    else             have_l2 = (cp0_config() & CFG_SC) == 0;
 }
 
 void icache_invalidate_range(volatile void *addr, u32 len)
@@ -179,6 +182,9 @@ static void identify(void)
      * docs/r4600.md for where each R4600 answer comes from. */
     case IMP_R4600: cpu_kind = CPU_R4600; break;
     case IMP_R5000: cpu_kind = CPU_R5000; break;
+    case IMP_R10000:
+    case IMP_R12000:
+    case IMP_R14000: cpu_kind = CPU_R10000; break;
     default:        cpu_kind = 0; break;
     }
 }
@@ -188,6 +194,13 @@ static const char *cpu_name(void)
     if (cpu_kind == CPU_R4400) return "R4400";
     if (cpu_kind == CPU_R5000) return "R5000";
     if (cpu_kind == CPU_R4600) return "R4600";
+    if (cpu_kind == CPU_R10000) {
+        switch (PRID_IMP(cpu_prid)) {
+        case IMP_R12000: return "R12000";
+        case IMP_R14000: return "R14000";
+        default:         return "R10000";
+        }
+    }
     return "unknown";
 }
 
@@ -200,6 +213,7 @@ static const char *cpus_name(u32 cpus)
     case CPU_R4400 | CPU_R4600:  return "R4400/R4600";
     case CPU_R4400 | CPU_R5000:  return "R4400/R5000";
     case CPU_R5000 | CPU_R4600:  return "R5000/R4600";
+    case CPU_R10000:             return "R10000";
     default:                     return "other CPU";
     }
 }

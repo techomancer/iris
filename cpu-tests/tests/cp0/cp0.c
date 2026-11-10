@@ -44,7 +44,8 @@ static void t_random_read_only_and_moves(void)
 
 /*
  * Random never falls below Wired. Sample it many times with Wired set high
- * and confirm every sample is in [Wired, 47].
+ * and confirm every sample is in [Wired, 47] - [Wired, 63] on the R10000,
+ * whose TLB has 64 entries (R10000 UM v2.0, p. 238).
  */
 static void t_random_respects_wired(void)
 {
@@ -56,7 +57,7 @@ static void t_random_respects_wired(void)
         u32 r = cp0_random() & 0x3F;
         if (r < 40) low++;
         if (r < min) min = r;
-        if (r > TLB_ENTRIES - 1) high++;
+        if (r > tlb_entries() - 1) high++;
     }
     /*
      * Random never exceeds the last TLB entry — that much holds on silicon.
@@ -92,7 +93,8 @@ static void t_wired_reserved_bits_read_zero(void)
 
 /*
  * R4000 manual, Wired register: "Writing this register also sets the Random
- * register to the value of its upper bound" — 47 on a 48-entry TLB.
+ * register to the value of its upper bound" — 47 on a 48-entry TLB. The
+ * R10000 manual says the same of its 64 entries (R10000 UM v2.0, p. 243).
  *
  * The reset cannot be observed exactly. Random decrements once per instruction
  * issue, and the handful of instructions between the mtc0 and the mfc0 that
@@ -107,13 +109,13 @@ static void t_wired_write_resets_random(void)
     u32 r;
     cp0_wired_set(8);
     r = cp0_random() & 0x3F;
-    CHECK(r <= TLB_ENTRIES - 1);
-    CHECK(r >= TLB_ENTRIES - 1 - 12);
+    CHECK(r <= tlb_entries() - 1);
+    CHECK(r >= tlb_entries() - 1 - 12);
 
     cp0_wired_set(0);
     r = cp0_random() & 0x3F;
-    CHECK(r <= TLB_ENTRIES - 1);
-    CHECK(r >= TLB_ENTRIES - 1 - 12);
+    CHECK(r <= tlb_entries() - 1);
+    CHECK(r >= tlb_entries() - 1 - 12);
 }
 
 /*
@@ -245,6 +247,9 @@ static void t_entrylo_round_trip(void)
  * write." So writing all-ones leaves R (63:62) and VPN2 (39:13) set but reads
  * Fill back as zero.
  *
+ * The R10000's VPN2 is wider, bits 43:13 for its 44-bit virtual address, so
+ * its Fill field is bits 61:44 (R10000 UM v2.0, p. 245, Figure 14-10).
+ *
  * There is deliberately no MTC0-sign-extension test here. The manual's
  * Operation section for MTC0 is just `CPR[0,rd] <- GPR[rt]` and says nothing
  * about the width of a 64-bit destination, so asserting sign-extension would
@@ -255,10 +260,11 @@ static void t_entrylo_round_trip(void)
 static void t_entryhi_fill_field_reads_zero(void)
 {
     u64 saved = cp0_entryhi();
+    u64 fill = is_r10000() ? 0x3FFFF00000000000ull : 0x3FFFFF0000000000ull;
     cp0_entryhi_set(0xFFFFFFFFFFFFFFFFull);
     {
         u64 v = cp0_entryhi();
-        CHECK_EQ(v & 0x3FFFFF0000000000ull, 0ull);          /* Fill 61:40 = 0 */
+        CHECK_EQ(v & fill, 0ull);                           /* Fill = 0      */
         CHECK_EQ(v & 0xC000000000000000ull, 0xC000000000000000ull); /* R kept */
         CHECK_EQ(v & 0xFFull, 0xFFull);                     /* ASID kept     */
     }
@@ -279,9 +285,12 @@ static void t_context_ptebase_writable(void)
 static void t_xcontext_ptebase_writable(void)
 {
     u64 saved = cp0_xcontext();
-    /* XContext PTEBase is bits 63:33. */
-    cp0_xcontext_set(0xFFFFFFFE00000000ull);
-    CHECK_EQ(cp0_xcontext() & 0xFFFFFFFE00000000ull, 0xFFFFFFFE00000000ull);
+    /* XContext PTEBase is bits 63:33. The R10000's is bits 63:37, above a
+     * two-bit R field and a 31-bit BadVPN2 that the hardware writes on a miss
+     * (R10000 UM v2.0, p. 259, Figure 14-19), so only 63:37 is asserted. */
+    u64 ptebase = is_r10000() ? 0xFFFFFFE000000000ull : 0xFFFFFFFE00000000ull;
+    cp0_xcontext_set(ptebase);
+    CHECK_EQ(cp0_xcontext() & ptebase, ptebase);
     cp0_xcontext_set(saved);
 }
 
