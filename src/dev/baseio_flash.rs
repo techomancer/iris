@@ -3,15 +3,17 @@
 //! at "Loading BASEIO prom". Without it the IP27 PROM falls back to its own
 //! reduced copy, which has no graphics console.
 //!
-//! The part answers the AMD command set far enough for the PROM's loader to
-//! accept it: reset (0xf0) and the autoselect sequence, with manufacturer
-//! 0x01 and device 0x22da, one of the three identities the loader accepts.
-//! Which part SGI fitted is not established. The array is read-only here:
-//! program and erase cycles are logged and refused. The unlock addresses are
-//! x16 word addresses, matched on their low eleven bits as the part does.
+//! The part answers the AMD command set ([`crate::dev::sflash::amd`]) far
+//! enough for the PROM's loader to accept it: reset (0xf0) and the autoselect
+//! sequence, with manufacturer 0x01 and device 0x22da, one of the three
+//! identities the loader accepts. Which part SGI fitted is not established.
+//! The array is read-only here: program and erase cycles are logged and
+//! refused. The unlock addresses are x16 word addresses, matched on their low
+//! eleven bits as the part does.
 //!
 //! Ported from hw/mips/sgi/baseio-flash.c in jamesbraid/qemu-sgi-origami.
 
+use crate::dev::sflash::amd::{AmdCore, Geometry, Identity};
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead16, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
@@ -19,20 +21,27 @@ use parking_lot::Mutex;
 pub const SIZE: usize = 1 << 20;
 pub const MANUFACTURER: u16 = 0x01;
 pub const DEVICE: u16 = 0x22da;
-const UNLOCK_0: usize = 0x555;
-const UNLOCK_1: usize = 0x2aa;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    Array,
-    Unlock1,
-    Unlock2,
-    Autoselect,
-}
+/// The part, to the command engine: 512K x 16, unlock addresses matched on
+/// their low eleven bits, the identification words at the first two word
+/// addresses, and program and erase refused.
+const GEOMETRY: Geometry = Geometry {
+    x8: false,
+    sector_size: 0x1_0000,
+    sectors: SIZE / 0x1_0000,
+    unlock: [0x555, 0x2aa],
+    address_mask: 0x7ff,
+    identity: Identity { codes: [MANUFACTURER, DEVICE, 0], other: 0 },
+    cfi: false,
+    read_only: true,
+    timed_erase: false,
+    unlock_from_identify: false,
+    log: LogModule::Hub,
+};
 
 pub struct BaseioFlash {
     image: Box<[u8]>,
-    mode: Mutex<Mode>,
+    core: Mutex<AmdCore>,
 }
 
 impl BaseioFlash {
@@ -43,20 +52,15 @@ impl BaseioFlash {
         }
         let mut image = vec![0xff; SIZE].into_boxed_slice();
         image[..file.len()].copy_from_slice(file);
-        Ok(Self { image, mode: Mutex::new(Mode::Array) })
+        Ok(Self { image, core: Mutex::new(AmdCore::new(GEOMETRY)) })
     }
 }
 
 impl BusDevice for BaseioFlash {
     fn read16(&self, addr: u64) -> BusRead16 {
         let a = addr as usize & !1;
-        if *self.mode.lock() == Mode::Autoselect {
-            // The identification words sit at the first two word addresses.
-            return BusRead16::ok(match a / 2 & 0xff {
-                0 => MANUFACTURER,
-                1 => DEVICE,
-                _ => 0,
-            });
+        if let Some(code) = self.core.lock().read16(a) {
+            return BusRead16::ok(code);
         }
         match self.image.get(a..a + 2) {
             Some(b) => BusRead16::ok(u16::from_be_bytes([b[0], b[1]])),
@@ -65,23 +69,12 @@ impl BusDevice for BaseioFlash {
     }
 
     fn write16(&self, addr: u64, val: u16) -> u32 {
-        let (word, cmd) = (addr as usize / 2 & 0x7ff, val as u8);
-        let mut mode = self.mode.lock();
-        if cmd == 0xf0 {
-            *mode = Mode::Array;
-            return BUS_OK;
+        // The engine logs a cycle it does not take, including the program and
+        // erase this part refuses.
+        match self.core.lock().write16(addr as usize, val) {
+            Ok(_) => BUS_OK,
+            Err(()) => BUS_ERR,
         }
-        *mode = match (*mode, word, cmd) {
-            (Mode::Array, UNLOCK_0, 0xaa) => Mode::Unlock1,
-            (Mode::Unlock1, UNLOCK_1, 0x55) => Mode::Unlock2,
-            (Mode::Unlock2, UNLOCK_0, 0x90) => Mode::Autoselect,
-            (m, _, _) => {
-                crate::dlog!(LogModule::Hub, "BaseIO flash: unsupported cycle {val:#06x} at byte offset {addr:#x} in {m:?}");
-                *mode = Mode::Array;
-                return BUS_ERR;
-            }
-        };
-        BUS_OK
     }
 }
 
