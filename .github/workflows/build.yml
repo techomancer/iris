@@ -100,12 +100,17 @@ jobs:
       - name: Toolchain
         shell: bash
         run: rustup show && rustup target add ${{ matrix.target }}
+      # Registry and git sources only. The release `target` tree is 550-650 MB
+      # per job and saving it kept the repository's Actions cache above its
+      # 10 GB quota: on 2026-11-09 and 2026-11-10 these were evicted before
+      # the nightly ran (restore found no entry), and when they
+      # did hit they saved 40-300 s of a 720-1340 s build. Only macOS keeps
+      # its `target`: a hit there saves about 700 s.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Install Inno Setup
@@ -239,12 +244,12 @@ jobs:
         run: |
           rustup show
           cargo install --locked cargo-deb cargo-generate-rpm
+      # Registry and git sources only; see the Windows job for why `target` is not cached.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Build and package
@@ -280,12 +285,12 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # Registry and git sources only; see the Windows job for why `target` is not cached.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-appimage-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-appimage-${{ matrix.arch }}-
       - name: Build and bundle
