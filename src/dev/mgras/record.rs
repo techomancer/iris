@@ -574,6 +574,8 @@ pub(super) mod tests {
         m.stop_engines();
         // SAFETY: the engines are stopped.
         let prims = unsafe { &*m.rss.get() }.stats.prims;
+        // SAFETY: the engines are stopped.
+        eprintln!("{path}: {} buffer swaps", unsafe { &*m.eng.get() }.stats.swaps);
         #[cfg(feature = "wgpu")]
         // SAFETY: the engines are stopped.
         if let Some(t) = unsafe { &*m.rss.get() }.gpu.get().and_then(|g| g.timing_report()) {
