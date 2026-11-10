@@ -319,9 +319,10 @@ fn the_inbound_dma_and_pio_paths_take_no_lock() {
     });
 }
 
-/// A test chip's configuration: one 64 MiB bank, on `clock`.
+/// A test chip's configuration: the Fuel's one processor and one 64 MiB
+/// bank, on `clock`.
 pub(super) fn test_config(clock: Clock) -> BedrockConfig<'static> {
-    BedrockConfig { name: "test", clock, banks_mib: &[64], events: None }
+    BedrockConfig { name: "test", clock, processors: Population::SINGLE, banks_mib: &[64], events: None }
 }
 
 /// A chip on a hand-driven clock, for the unit tests: its register window
@@ -335,12 +336,16 @@ pub(super) struct Rig {
     pub(super) events: parking_lot::Mutex<std::sync::mpsc::Receiver<MachineEvent>>,
 }
 impl Rig {
+    /// The Fuel's one processor.
     pub(super) fn new() -> Self {
+        Self::with(Population::SINGLE)
+    }
+    pub(super) fn with(processors: Population) -> Self {
         let now = Arc::new(AtomicU64::new(0));
         let clock = now.clone();
         let config = test_config(Arc::new(move || clock.load(Ordering::SeqCst)));
         let (events, receiver) = std::sync::mpsc::channel();
-        let chip = Bedrock::new(BedrockConfig { events: Some(events), ..config }).unwrap();
+        let chip = Bedrock::new(BedrockConfig { processors, events: Some(events), ..config }).unwrap();
         let word = Arc::new(AtomicU64::new(0));
         chip.set_cpu_interrupts(0, &*word);
         chip.start();

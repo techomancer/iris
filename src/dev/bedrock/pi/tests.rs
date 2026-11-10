@@ -1,6 +1,7 @@
 // Cases follow tests/qtest/sn1-bedrock-pi-test.c in jamesbraid/qemu-sgi-origami:
 // power-on-values, local-reset, pending-reflection, real-time-comparators,
-// profile-counter-wrap, cpu-number-fallback, cpu-enable-lines and nmi.
+// profile-counter-wrap, cpu-number-fallback, cpu-enable-lines and nmi, and
+// sn1-cpu-identity-test's four-processors-know-their-slots.
 
 use super::super::reg::PI1_BASE;
 use super::super::Rig;
@@ -171,18 +172,83 @@ fn the_timer_manager_delivers_expirations_without_mmio_polling() {
     assert!(!chip.is_running());
 }
 
-/// The PROM counts processors from the present bits: the one processor
-/// sits in PI0 slot A, present and enabled, and reads slice A of PI0 from
-/// the CPU-number register.
+/// The PROM counts processors from the present bits. A board fills PI0/A,
+/// then PI1/A, then PI0/B and PI1/B, so two processors sit one per interface.
 #[test]
-fn the_one_processor_sits_in_pi0_slot_a() {
-    let rig = Rig::new();
-    let read = |interface: u64, off| rig.r(interface * PI1_BASE + off);
-    assert_eq!([read(0, reg::INTERFACE_SLOT_A), read(0, reg::INTERFACE_SLOT_B),
-        read(1, reg::INTERFACE_SLOT_A), read(1, reg::INTERFACE_SLOT_B)], [1, 0, 0, 0]);
-    assert_eq!([read(0, reg::CPU_A_ENABLE), read(0, reg::CPU_B_ENABLE),
-        read(1, reg::CPU_A_ENABLE), read(1, reg::CPU_B_ENABLE)], [1, 0, 0, 0], "enables");
-    assert_eq!((read(0, reg::INTERFACE_ID), read(1, reg::INTERFACE_ID)), (0, 2));
+fn every_fitted_slot_reads_present_and_starts_enabled() {
+    for (mask, present) in [(0b0001, [1, 0, 0, 0]), (0b0101, [1, 0, 1, 0]), (0b0111, [1, 1, 1, 0]), (0b1111, [1, 1, 1, 1])] {
+        let rig = Rig::with(Population::new(mask).unwrap());
+        let read = |interface: u64, off| rig.r(interface * PI1_BASE + off);
+        assert_eq!([read(0, reg::INTERFACE_SLOT_A), read(0, reg::INTERFACE_SLOT_B),
+            read(1, reg::INTERFACE_SLOT_A), read(1, reg::INTERFACE_SLOT_B)], present, "{mask:#06b}");
+        assert_eq!([read(0, reg::CPU_A_ENABLE), read(0, reg::CPU_B_ENABLE),
+            read(1, reg::CPU_A_ENABLE), read(1, reg::CPU_B_ENABLE)], present, "{mask:#06b}: enables");
+        assert_eq!((read(0, reg::INTERFACE_ID), read(1, reg::INTERFACE_ID)), (0, 2), "{mask:#06b}: no requester");
+    }
+}
+
+/// A population that cannot hold CPU 0, or names a fifth slot, is refused
+/// rather than built; the board's order puts CPU n in the nth fitted slot,
+/// and one, two and four processors fill PI0/A, then PI1/A, then the B slots.
+#[test]
+fn a_population_without_cpu_0_or_beyond_four_slots_is_refused() {
+    for mask in [0, 0b0010, 0b1100, 0b1_0001, 0xff] {
+        assert!(Population::new(mask).is_err(), "{mask:#x}");
+    }
+    let four = Population::new(0b1111).unwrap();
+    assert_eq!((0..4).map(|cpu| four.slot_of(cpu).unwrap()).collect::<Vec<_>>(), [(0, 0), (1, 0), (0, 1), (1, 1)]);
+    assert_eq!(four.slot_of(4), None);
+    assert_eq!(Population::new(0b0101).unwrap().slot_of(1), Some((1, 0)));
+    assert_eq!(Population::SINGLE.count(), 1);
+    assert_eq!([1, 2, 4].map(|n| Population::fitted_cpus(n).unwrap().mask()), [0b0001, 0b0101, 0b1111]);
+    assert!(Population::fitted_cpus(0).is_err() && Population::fitted_cpus(5).is_err());
+}
+
+/// Each processor reads its own slice from the CPU-number register of its
+/// interface, and a reader that is no processor reads slot A. The local
+/// register form answers the requester's own PI at offset 0.
+/// (sn1-cpu-identity-test four-processors-know-their-slots)
+#[test]
+fn four_processors_know_their_slots_and_their_own_pi() {
+    let rig = Arc::new(Rig::with(Population::new(0b1111).unwrap()));
+    assert_eq!((rig.r(reg::INTERFACE_ID), rig.r(PI1_BASE + reg::INTERFACE_ID)), (0, 2), "no issuing processor");
+    let local = rig.chip.local_registers();
+    let slices: Vec<(u64, u64)> = (0..4u8)
+        .map(|cpu| {
+            let (rig, local) = (rig.clone(), local.clone());
+            std::thread::spawn(move || {
+                crate::cpu::smp::set_current_cpu(cpu);
+                let (interface, _) = Population::new(0b1111).unwrap().slot_of(cpu as usize).unwrap();
+                (rig.r(u64::from(interface) * PI1_BASE + reg::INTERFACE_ID), local.read64(reg::INTERFACE_ID).data)
+            })
+            .join()
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(slices, [(0, 0), (2, 2), (1, 1), (3, 3)], "slices A, C, B, D");
+    // With processors on PI0 alone, the local form is the node form.
+    let fuel = Rig::new();
+    std::thread::spawn(move || {
+        crate::cpu::smp::set_current_cpu(0);
+        assert_eq!(fuel.chip.local_registers().read64(reg::INTERFACE_ID).data, 0);
+    })
+    .join()
+    .unwrap();
+}
+
+/// Each processor's IP2..IP6 come from its own slot: an interrupt pending
+/// in PI1's bank 0 under slot A's mask reaches CPU 1 and no other.
+#[test]
+fn each_processor_takes_the_interrupts_of_its_own_slot() {
+    let rig = Rig::with(Population::new(0b1111).unwrap());
+    let words: Vec<Arc<std::sync::atomic::AtomicU64>> = (0..4).map(|_| Arc::new(Default::default())).collect();
+    for (cpu, word) in words.iter().enumerate() {
+        rig.chip.set_cpu_interrupts(cpu, &**word);
+    }
+    rig.w(PI1_BASE + reg::OFFSET_00A8, 1 << 9);
+    rig.w(PI1_BASE + reg::PENDING_MODIFY, 0x109);
+    let ip2 = |cpu: usize| (words[cpu].load(Ordering::SeqCst) >> 10) & 1;
+    assert_eq!([ip2(0), ip2(1), ip2(2), ip2(3)], [0, 1, 0, 0]);
 }
 
 /// Enabling a processor that is not fitted, or clearing the fitted one's
