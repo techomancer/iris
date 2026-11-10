@@ -74,11 +74,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, OnceLock, Weak};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::dev::battery_clock;
-use crate::dev::ds1687::{image, MaceRtc};
 pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IP29, IP30, IP34};
 pub use self::dma::Ioc3Dma;
 use self::gpio::Gpio;
@@ -89,6 +87,8 @@ use self::eth::{Ioc3Eth, Phy};
 use self::serial::Serial;
 use self::superio::SuperIo;
 use self::w1::W1;
+use crate::dev::ds1685::Ds1685;
+use crate::dev::deadline::{decode, encode};
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1 as onewire;
 use crate::dev::w1::sgi;
@@ -187,180 +187,6 @@ const CHIP_CTRL_MASK: u32 = 0x0007_ffff;
 const CHIP_CTRL_ARB_IDLE: u32 = 1 << 22;
 
 // ---------------------------------------------------------------------------
-// The DS1685 on the byte bus
-// ---------------------------------------------------------------------------
-
-/// How long the guest's NVRAM writes must pause before the file is
-/// rewritten.
-const NVRAM_QUIET: Duration = Duration::from_millis(500);
-/// Registers 0x0e.. are storage rather than clock in the file.
-const NVRAM_FIRST: usize = 0x0e;
-/// The file is the DS1685's 512-byte image (see `ds1687::image`).
-const NVRAM_IMAGE_LEN: usize = image::LEN;
-const NVRAM_OFF_NV: usize = image::NV;
-const NVRAM_OFF_EXT: usize = image::EXT;
-const NVRAM_OFF_XRAM: usize = image::XRAM;
-/// Register A bit 4 selects bank 1 for registers 0x40..0x7f.
-const RTC_A_DV0: u8 = 0x10;
-/// Bank-1 extended RAM address and data ports.
-const RTC_XRAM_ADDR: usize = 0x50;
-const RTC_XRAM_DATA: usize = 0x53;
-const RTC_XRAM_SIZE: usize = 128;
-
-/// The clock, reached through an address port and a data port. The bank bit
-/// switches only registers 0x40..0x7f: the four control registers and the
-/// low RAM are the same cells in either bank. Bank 1 carries the extended
-/// registers and, through the address and data ports at 0x50 and 0x53, 128
-/// bytes of extended RAM, where the PROM keeps part of its environment.
-///
-/// The clock and the power-control and century registers are `MaceRtc`'s;
-/// see the module notes for what the model leaves out (alarm and periodic
-/// interrupts, the model number's side effects).
-struct Rtc {
-    dev: MaceRtc,
-    index: u8,
-    file: Option<std::path::PathBuf>,
-    /// Bank-0 RAM at 0x40..0x7f.
-    nv: [u8; 64],
-    /// Bank-1 registers at 0x40..0x7f (0x48 and 0x4a live in `dev`).
-    ext: [u8; 64],
-    xram: [u8; RTC_XRAM_SIZE],
-    /// When the RAM last changed, if the file has not caught up yet.
-    dirty_since: Option<Instant>,
-    /// Where the clock starts with no reference saved (`[rtc_offset]`).
-    rtc_offset: crate::config::RtcOffset,
-}
-
-impl Rtc {
-    fn new() -> Rtc {
-        Rtc {
-            dev: MaceRtc::new(),
-            index: 0,
-            file: None,
-            nv: [0; 64],
-            ext: [0; 64],
-            xram: [0; RTC_XRAM_SIZE],
-            dirty_since: None,
-            rtc_offset: Default::default(),
-        }
-    }
-
-    fn bank1(&self) -> bool {
-        self.dev.peek(0x0a) & RTC_A_DV0 != 0
-    }
-
-    /// Whether the selected register is one `MaceRtc` models itself.
-    fn delegated(&self) -> bool {
-        let i = self.index as usize;
-        i < 0x40 || (self.bank1() && (i == 0x48 || i == 0x4a))
-    }
-
-    fn read(&self) -> u8 {
-        let i = self.index as usize;
-        if self.delegated() {
-            self.dev.read8(((i as u64) << 8) | 7).data
-        } else if !self.bank1() {
-            self.nv[i - 0x40]
-        } else if i == RTC_XRAM_DATA {
-            self.xram[self.ext[RTC_XRAM_ADDR - 0x40] as usize & (RTC_XRAM_SIZE - 1)]
-        } else {
-            self.ext[i - 0x40]
-        }
-    }
-
-    fn write(&mut self, v: u8) {
-        let i = self.index as usize;
-        if self.delegated() {
-            self.dev.write8(((i as u64) << 8) | 7, v);
-        } else if !self.bank1() {
-            self.nv[i - 0x40] = v;
-        } else if i == RTC_XRAM_DATA {
-            let at = self.ext[RTC_XRAM_ADDR - 0x40] as usize & (RTC_XRAM_SIZE - 1);
-            self.xram[at] = v;
-        } else {
-            self.ext[i - 0x40] = v;
-        }
-        // The file catches up once the writes stop: see `Ioc3::flush_nvram`.
-        // A write to the clock registers can set the clock, which is saved
-        // beside it. Register A's cannot, and the PROM flips its bank bit
-        // around every extended-RAM access.
-        if i != 0x0a && self.file.is_some() {
-            self.dirty_since = Some(Instant::now());
-        }
-    }
-
-    fn image(&self) -> Vec<u8> {
-        let mut img = vec![0u8; NVRAM_IMAGE_LEN];
-        let (regs, century) = self.dev.image_registers();
-        img[..0x40].copy_from_slice(&regs);
-        img[NVRAM_OFF_NV..NVRAM_OFF_NV + 64].copy_from_slice(&self.nv);
-        let mut ext = self.ext;
-        ext[0x08] = century;
-        ext[0x0a] = self.dev.peek(0x4a);
-        img[NVRAM_OFF_EXT..NVRAM_OFF_EXT + 64].copy_from_slice(&ext);
-        img[NVRAM_OFF_XRAM..NVRAM_OFF_XRAM + RTC_XRAM_SIZE].copy_from_slice(&self.xram);
-        img
-    }
-
-    /// Load a 512-byte image. The clock registers (0x00..0x0d) are never
-    /// loaded: the clock comes from its reference. Returns false for any
-    /// other length.
-    fn load(&mut self, img: &[u8]) -> bool {
-        if img.len() != NVRAM_IMAGE_LEN {
-            return false;
-        }
-        self.dev.load_image_registers(img);
-        self.nv.copy_from_slice(&img[NVRAM_OFF_NV..NVRAM_OFF_NV + 64]);
-        self.ext.copy_from_slice(&img[NVRAM_OFF_EXT..NVRAM_OFF_EXT + 64]);
-        self.xram.copy_from_slice(&img[NVRAM_OFF_XRAM..NVRAM_OFF_XRAM + RTC_XRAM_SIZE]);
-        // Loading never powers the machine off.
-        self.dev.poke(0x4a, self.ext[0x0a] & !0x08);
-        true
-    }
-
-    /// The file, the image to put in it and the clock reference to put
-    /// beside it, if the RAM changed at least `quiet` ago; the RAM then
-    /// counts as saved.
-    fn take_dirty(&mut self, quiet: Duration) -> Option<NvramJob> {
-        let since = self.dirty_since?;
-        if since.elapsed() < quiet {
-            return None;
-        }
-        self.dirty_since = None;
-        Some((self.file.clone()?, self.image(), self.dev.clock_reference()))
-    }
-}
-
-/// Say that an NVRAM save failed, once until a save succeeds again: the
-/// guest's writes keep scheduling saves, and a full disk would otherwise
-/// print on every one.
-fn report_nvram_save(path: &std::path::Path, result: std::io::Result<()>) {
-    static FAILING: AtomicBool = AtomicBool::new(false);
-    match result {
-        Ok(()) => FAILING.store(false, Ordering::Relaxed),
-        Err(e) => {
-            if !FAILING.swap(true, Ordering::Relaxed) {
-                eprintln!("ioc3: NVRAM {}: {e}", path.display());
-            }
-        }
-    }
-}
-
-/// Replace the NVRAM file in one step (a temporary file, synced and
-/// renamed), so a kill mid-write leaves the previous image whole, then the
-/// clock reference beside it, if the guest has set the clock.
-fn save_nvram((path, image, clock): &NvramJob) -> std::io::Result<()> {
-    let name = path
-        .to_str()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NVRAM path is not UTF-8"))?;
-    crate::nv_storage::save(name, image)?;
-    match clock {
-        Some(c) => battery_clock::write(&battery_clock::companion(path), c),
-        None => Ok(()),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Interrupt output
 // ---------------------------------------------------------------------------
 
@@ -410,9 +236,8 @@ pub enum ByteBus {
     None,
     /// The M48T35-compatible Timekeeper, on select 0.
     M48t35(Arc<crate::dev::timekeeper::Timekeeper>),
-    /// The DS1685 on selects 1 and 2. Its RAM and file are the chip's for now
-    /// ([`Ioc3::set_nvram_file`]).
-    Ds1685,
+    /// The DS1685 on selects 1 and 2.
+    Ds1685(Arc<Ds1685>),
 }
 
 impl ByteBus {
@@ -420,7 +245,7 @@ impl ByteBus {
         match self {
             ByteBus::None => ByteBusPart::None,
             ByteBus::M48t35(_) => ByteBusPart::M48t35,
-            ByteBus::Ds1685 => ByteBusPart::Ds1685,
+            ByteBus::Ds1685(_) => ByteBusPart::Ds1685,
         }
     }
 }
@@ -666,21 +491,6 @@ impl Core {
     }
 }
 
-/// An optional deadline as one word: nanoseconds after the process epoch,
-/// plus one; zero for none. A deadline can then be read without a lock.
-fn epoch() -> Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    *EPOCH.get_or_init(Instant::now)
-}
-
-fn encode(t: Option<Instant>) -> u64 {
-    t.map_or(0, |t| t.checked_duration_since(epoch()).map_or(1, |d| d.as_nanos() as u64 + 1))
-}
-
-fn decode(n: u64) -> Option<Instant> {
-    (n != 0).then(|| epoch() + Duration::from_nanos(n - 1))
-}
-
 // ---------------------------------------------------------------------------
 // The device
 // ---------------------------------------------------------------------------
@@ -701,15 +511,12 @@ const K_NVRAM: usize = 5;
 const KINDS: usize = 6;
 type Deadlines = [Option<Instant>; KINDS];
 
-/// A rewrite of the NVRAM file waiting for the writer thread.
-type NvramJob = (std::path::PathBuf, Vec<u8>, Option<Vec<u8>>);
-
 /// Lock order: `gate`, then a child's lock (the serial engine's before the
 /// Super I/O's it reaches through), then the interrupt words' lock in `Core`,
-/// under which the SuperIO line is driven, then the Bridge's; `armed`, the
-/// line slots (`pin_line`) and the NVRAM hand-off are leaves. The Bridge never
-/// calls back into the chip while it holds a lock of its own, so a child's
-/// lock may be held while the SuperIO line is driven.
+/// under which the SuperIO line is driven, then the Bridge's. `armed`, the
+/// line slots and the NVRAM hand-off are leaves. The Bridge never calls back
+/// into the chip while it holds a lock of its own, so a child's lock may be
+/// held while the line is driven.
 /// The serial and parallel engines move their rings with their lock held: the
 /// DMA goes down through the Bridge and HEART, which never call back into
 /// the chip, and an access to the Ethernet block goes to it with no lock
@@ -730,17 +537,12 @@ struct Shared {
     int_out: Mutex<IntOut>,
     /// The interrupt output's next transition, where the timers can see it.
     io_due: AtomicU64,
-    rtc: Mutex<Rtc>,
-    /// The NVRAM file's debounce deadline, likewise.
-    nvram_due: AtomicU64,
-    /// The DS1685 was told to power the machine off and the machine has not
-    /// been told yet.
-    power_off_pending: AtomicBool,
+    /// The clock on the byte bus, on a board that fits the DS1685.
+    rtc: Option<Arc<Ds1685>>,
     ssram: Mutex<Vec<u32>>,
     eth: Option<Arc<Ioc3Eth>>,
     me: Weak<Shared>,
     timers: OnceLock<Arc<TimerManager>>,
-    events: OnceLock<SyncSender<MachineEvent>>,
     /// Between `start` and `stop`.
     running: AtomicBool,
     /// Held by a timer callback while it runs, so `stop` can wait one out.
@@ -749,24 +551,15 @@ struct Shared {
     armed: Mutex<[Option<(TimerId, Instant)>; KINDS]>,
     /// The deadlines in `armed`, readable without its lock.
     armed_due: [AtomicU64; KINDS],
-    /// The NVRAM image the writer thread has yet to put in the file.
-    nvram_job: Mutex<Option<NvramJob>>,
-    nvram_ready: Condvar,
 }
 
 impl Shared {
     /// What follows every access: arm the timers for the deadlines it left,
-    /// pick up a PS/2 character that arrived meanwhile, and tell the machine
-    /// of a power-off.
+    /// and pick up a PS/2 character that arrived meanwhile.
     fn after(&self) {
         self.arm();
         if let Some(k) = &self.kbd {
             k.service();
-        }
-        if self.power_off_pending.swap(false, Ordering::SeqCst) {
-            if let Some(tx) = self.events.get() {
-                let _ = tx.try_send(MachineEvent::PowerOff);
-            }
         }
     }
 
@@ -785,7 +578,7 @@ impl Shared {
         if self.core.enabled() & int::RT_OUTPUT_PULSE != 0 {
             d[K_INT_OUT] = decode(self.io_due.load(Ordering::SeqCst));
         }
-        d[K_NVRAM] = decode(self.nvram_due.load(Ordering::SeqCst)).map(|t| t + NVRAM_QUIET);
+        d[K_NVRAM] = self.rtc.as_ref().and_then(|r| r.due());
         d
     }
 
@@ -850,10 +643,9 @@ impl Shared {
             }
         }
         if kind == K_NVRAM {
-            // The file is written by its own thread, not here.
-            if let Some(job) = sh.take_nvram_dirty(NVRAM_QUIET) {
-                *sh.nvram_job.lock() = Some(job);
-                sh.nvram_ready.notify_all();
+            // The file is written by the clock's own thread, not here.
+            if let Some(rtc) = &sh.rtc {
+                rtc.hand_over();
             }
             sh.rearm();
         } else {
@@ -900,39 +692,8 @@ impl Shared {
         }
     }
 
-    /// Write the NVRAM file when the timer hands over an image.
-    fn nvram_loop(me: Weak<Shared>) {
-        loop {
-            let job = {
-                let Some(sh) = me.upgrade() else { return };
-                let mut slot = sh.nvram_job.lock();
-                while slot.is_none() && sh.running.load(Ordering::SeqCst) {
-                    sh.nvram_ready.wait(&mut slot);
-                }
-                match slot.take() {
-                    Some(j) => j,
-                    None => return,
-                }
-            };
-            report_nvram_save(&job.0, save_nvram(&job));
-        }
-    }
-
-    /// The NVRAM image to write, if the RAM changed at least `quiet` ago.
-    fn take_nvram_dirty(&self, quiet: Duration) -> Option<NvramJob> {
-        let mut rtc = self.rtc.lock();
-        let job = rtc.take_dirty(quiet);
-        self.nvram_due.store(encode(rtc.dirty_since), Ordering::SeqCst);
-        job
-    }
-
     fn eth(&self) -> Option<&Arc<Ioc3Eth>> {
         self.eth.as_ref()
-    }
-
-    fn flush_nvram(&self, quiet: Duration) {
-        let Some(job) = self.take_nvram_dirty(quiet) else { return };
-        report_nvram_save(&job.0, save_nvram(&job));
     }
 
     /// One synchronous pass of what the receive threads and timers do:
@@ -1093,15 +854,14 @@ impl Shared {
             }
             return 0;
         }
-        if self.board.cells.byte_bus == ByteBusPart::Ds1685 {
+        if let Some(rtc) = &self.rtc {
             // Each select is a byte-wide port answering on any lane of its
             // first word: the guests land on different ones.
             if (reg::BYTEBUS_DEV2..reg::BYTEBUS_DEV2 + 4).contains(&a) {
-                return self.rtc.lock().read();
+                return rtc.read_data();
             }
             if (reg::BYTEBUS_DEV1..reg::BYTEBUS_DEV1 + 4).contains(&a) {
-                // A write port on the part; the latch is what is there.
-                return self.rtc.lock().index;
+                return rtc.read_index();
             }
         }
         0
@@ -1133,18 +893,11 @@ impl Shared {
             }
             return;
         }
-        if self.board.cells.byte_bus == ByteBusPart::Ds1685 {
+        if let Some(rtc) = &self.rtc {
             if (reg::BYTEBUS_DEV2..reg::BYTEBUS_DEV2 + 4).contains(&a) {
-                let mut rtc = self.rtc.lock();
-                let was = rtc.dev.powered_off();
-                rtc.write(v);
-                if !was && rtc.dev.powered_off() {
-                    self.power_off_pending.store(true, Ordering::SeqCst);
-                }
-                self.nvram_due.store(encode(rtc.dirty_since), Ordering::SeqCst);
+                rtc.write_data(v);
             } else if (reg::BYTEBUS_DEV1..reg::BYTEBUS_DEV1 + 4).contains(&a) {
-                // Seven bits; the bank comes from register A.
-                self.rtc.lock().index = v & 0x7f;
+                rtc.write_index(v);
             }
         }
     }
@@ -1265,7 +1018,7 @@ impl Shared {
 pub struct Ioc3 {
     sh: Arc<Shared>,
     timekeeper: Option<Arc<crate::dev::timekeeper::Timekeeper>>,
-    /// The serial receive threads and the NVRAM writer, joined in `stop`.
+    /// The serial receive threads, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
@@ -1285,9 +1038,10 @@ impl Ioc3 {
         let parallel = cells.parallel.then(|| Parallel::new(core.clone(), sio.clone().expect("a parallel port has a Super I/O")));
         let gpio = Gpio::new(board.gpio);
         let eth = cells.eth.then(|| Ioc3Eth::new(core.clone(), mac, board.phy));
-        let timekeeper = match byte_bus {
-            ByteBus::M48t35(clock) => Some(clock),
-            _ => None,
+        let (timekeeper, rtc) = match byte_bus {
+            ByteBus::M48t35(clock) => (Some(clock), None),
+            ByteBus::Ds1685(rtc) => (None, Some(rtc)),
+            ByteBus::None => (None, None),
         };
         let sh = Arc::new_cyclic(|weak: &Weak<Shared>| {
             let bars = [
@@ -1316,20 +1070,15 @@ impl Ioc3 {
                 gpio,
                 int_out: Mutex::new(IntOut::default()),
                 io_due: AtomicU64::new(0),
-                rtc: Mutex::new(Rtc::new()),
-                nvram_due: AtomicU64::new(0),
-                power_off_pending: AtomicBool::new(false),
+                rtc,
                 ssram: Mutex::new(vec![0; (reg::SSRAM_SIZE / 4) as usize]),
                 eth,
                 me: weak.clone(),
                 timers: OnceLock::new(),
-                events: OnceLock::new(),
                 running: AtomicBool::new(false),
                 gate: Mutex::new(()),
                 armed: Mutex::new([None; KINDS]),
                 armed_due: std::array::from_fn(|_| AtomicU64::new(0)),
-                nvram_job: Mutex::new(None),
-                nvram_ready: Condvar::new(),
                 board,
             }
         });
@@ -1339,12 +1088,6 @@ impl Ioc3 {
     /// The timer manager for device deadlines. Set it before start.
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
         let _ = self.sh.timers.set(tm);
-    }
-
-    /// Where the DS1685's power-off goes: one `PowerOff` event when the guest
-    /// writes it. Call before `start`.
-    pub fn set_event_sender(&self, tx: SyncSender<MachineEvent>) {
-        let _ = self.sh.events.set(tx);
     }
 
     /// Replace the MicroLAN wire the chip builds for itself (the station
@@ -1368,57 +1111,6 @@ impl Ioc3 {
         if let Some(sio) = &self.sh.sio {
             sio.set_parallel_backend(backend);
         }
-    }
-
-    /// Back the DS1685's RAM (user RAM, bank-1 registers and the 128-byte
-    /// extended RAM) with a file. A 512-byte file (the layout the QEMU model
-    /// uses) is loaded. The file is
-    /// written as 512 bytes now and replaced whole once the guest's writes
-    /// to the RAM pause (see [`Ioc3::flush_nvram`]). The clock runs from the
-    /// reference beside the file (`<file>.clock`, the layout QEMU's model
-    /// keeps) if there is one, else from where [`Ioc3::set_rtc_offset`] put
-    /// it, host time by default.
-    pub fn set_nvram_file(&self, path: impl Into<std::path::PathBuf>) -> std::io::Result<()> {
-        let path = path.into();
-        let clock = battery_clock::companion(&path);
-        let job = {
-            let mut rtc = self.sh.rtc.lock();
-            if let Ok(img) = std::fs::read(&path) {
-                if !rtc.load(&img) {
-                    log::warn!("ioc3: NVRAM file {} has {} bytes, not 512; ignored", path.display(), img.len());
-                }
-            }
-            if let Some(guest) = battery_clock::read_or_warn(&clock).and_then(|r| rtc.dev.restore_clock(&r)) {
-                battery_clock::note_override(&rtc.rtc_offset, &clock, guest);
-            }
-            rtc.file = Some(path.clone());
-            rtc.dirty_since = None;
-            self.sh.nvram_due.store(0, Ordering::SeqCst);
-            (path, rtc.image(), rtc.dev.clock_reference())
-        };
-        save_nvram(&job)
-    }
-
-    /// Start the DS1685's clock where `[rtc_offset]` puts it, for as long
-    /// as the NVRAM file keeps no clock of the guest's.
-    pub fn set_rtc_offset(&self, cfg: &crate::config::RtcOffset) {
-        let mut rtc = self.sh.rtc.lock();
-        rtc.rtc_offset = *cfg;
-        rtc.dev.set_offset(battery_clock::seed(cfg));
-    }
-
-    /// Write the NVRAM file if the RAM changed at least `quiet` ago. The
-    /// PROM writes its environment a byte at a time, so a timer waits for a
-    /// pause rather than rewriting the file per byte; stopping the machine
-    /// and dropping the chip flush with no wait. The file is written outside
-    /// the chip's lock.
-    pub fn flush_nvram_after(&self, quiet: Duration) {
-        self.sh.flush_nvram(quiet);
-    }
-
-    /// [`Ioc3::flush_nvram_after`] with no wait.
-    pub fn flush_nvram(&self) {
-        self.sh.flush_nvram(Duration::ZERO);
     }
 
     /// Show the system board's front lightbar and the Ethernet activity in
@@ -1456,11 +1148,6 @@ impl Ioc3 {
         self.sh.kbd.as_ref().map_or_else(|| self.sh.ps2_idle.clone(), |k| k.ps2().clone())
     }
 
-    /// Whether the guest has asked the clock to power the machine off.
-    pub fn powered_off(&self) -> bool {
-        self.sh.rtc.lock().dev.powered_off()
-    }
-
     /// A PCI reset of the chip (not of the clock, the buffer RAM or the
     /// Ethernet block, which keeps its state: `power_on` resets that too).
     pub fn reset(&self) {
@@ -1480,7 +1167,7 @@ impl Ioc3 {
     pub fn register_locks(&self) {
         for (what, probe) in [
             ("int_out", (|s: &Shared| s.int_out.is_locked()) as fn(&Shared) -> bool),
-            ("rtc", |s| s.rtc.is_locked()),
+            ("rtc", |s| s.rtc.as_ref().is_some_and(|r| r.is_locked())),
         ] {
             let sh = Arc::downgrade(&self.sh);
             crate::locks::register_lock(format!("ioc3::{what}"), move || sh.upgrade().is_some_and(|s| probe(&s)));
@@ -1508,8 +1195,8 @@ impl Ioc3 {
 impl Device for Ioc3 {
     fn step(&self, _cycles: u64) {}
 
-    /// Start the serial receive threads and the NVRAM writer and arm the
-    /// timers for any deadline the chip already holds.
+    /// Start the serial receive threads and the clock's NVRAM writer and arm
+    /// the timers for any deadline the chip already holds.
     fn start(&self) {
         if self.sh.running.swap(true, Ordering::SeqCst) {
             return;
@@ -1532,20 +1219,16 @@ impl Device for Ioc3 {
                 );
             }
         }
-        let me = self.sh.me.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name("IOC3-NVRAM".into())
-                .spawn(move || Shared::nvram_loop(me))
-                .expect("spawn ioc3 nvram thread"),
-        );
         drop(threads);
+        if let Some(r) = &self.sh.rtc {
+            Device::start(&**r);
+        }
         self.sh.rearm();
     }
 
     /// Remove the timers, wait out a callback in flight, join the threads and
-    /// flush the NVRAM file. Nothing touches memory or a line afterwards,
-    /// until `start`.
+    /// the clock's writer, which flushes its file. Nothing touches memory or a
+    /// line afterwards, until `start`.
     fn stop(&self) {
         if !self.sh.running.swap(false, Ordering::SeqCst) {
             return;
@@ -1560,10 +1243,6 @@ impl Device for Ioc3 {
             }
         }
         drop(self.sh.gate.lock());
-        // The writer waits on the job slot's lock: take it so the wake-up
-        // cannot fall between its check of `running` and its wait.
-        drop(self.sh.nvram_job.lock());
-        self.sh.nvram_ready.notify_all();
         let mut threads = self.threads.lock();
         for t in threads.iter() {
             t.thread().unpark();
@@ -1578,7 +1257,9 @@ impl Device for Ioc3 {
         if let Some(e) = &self.sh.eth {
             Device::stop(&**e);
         }
-        self.flush_nvram();
+        if let Some(r) = &self.sh.rtc {
+            Device::stop(&**r);
+        }
     }
 
     fn is_running(&self) -> bool {
@@ -1604,7 +1285,6 @@ impl Resettable for Ioc3 {
 impl Drop for Ioc3 {
     fn drop(&mut self) {
         Device::stop(&*self);
-        self.flush_nvram();
     }
 }
 
@@ -1798,21 +1478,11 @@ impl Shared {
             sio.save_ecp(&mut p);
             t.value("parallel", p.build());
         }
-        {
-            let r = self.rtc.lock();
-            let mut rtc = StateTable::new();
-            rtc.value("clock", r.dev.save_state())
-                .u8("index", r.index)
-                .u8s("nv", &r.nv)
-                .u8s("ext", &r.ext)
-                .u8s("xram", &r.xram)
-                .bool("dirty", r.dirty_since.is_some());
-            t.value("rtc", rtc.build());
+        if let Some(r) = &self.rtc {
+            t.value("rtc", r.save_state());
         }
-        t.u32s("ssram", &self.ssram.lock()).value("wire", wire).bool(
-            "power_off_pending",
-            self.power_off_pending.load(Ordering::SeqCst),
-        );
+        // The power-off now goes out as the guest writes it, so nothing waits.
+        t.u32s("ssram", &self.ssram.lock()).value("wire", wire).bool("power_off_pending", false);
         t.build()
     }
 
@@ -1858,17 +1528,8 @@ impl Shared {
             sio.load_ecp(p)?;
             par.load_state(p)?;
         }
-        {
-            let r = field(v, "rtc")?;
-            let mut rtc = self.rtc.lock();
-            rtc.dev.load_state(field(r, "clock")?)?;
-            rtc.index = field_u8(r, "index")?;
-            rtc.nv = field_u8s(r, "nv")?;
-            rtc.ext = field_u8s(r, "ext")?;
-            rtc.xram = field_u8s(r, "xram")?;
-            // The NVRAM file catches up with the restored RAM in the usual way.
-            rtc.dirty_since = (field_bool(r, "dirty")? || rtc.file.is_some()).then_some(now);
-            self.nvram_due.store(encode(rtc.dirty_since), Ordering::SeqCst);
+        if let Some(rtc) = &self.rtc {
+            rtc.load_state(field(v, "rtc")?, now)?;
         }
         *self.int_out.lock() = int_out;
         self.io_due.store(encode(self.int_out.lock().next), Ordering::SeqCst);
@@ -1877,7 +1538,6 @@ impl Shared {
         c.chip_control.store(field_u32(v, "chip_control")?, Ordering::SeqCst);
         self.gpio.restore(field_u32(v, "pin_control")?, field_u32(v, "pin_data")?);
         *self.ssram.lock() = ssram;
-        self.power_off_pending.store(field_bool(v, "power_off_pending")?, Ordering::SeqCst);
         Ok(())
     }
 }
