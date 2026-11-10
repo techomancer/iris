@@ -43,7 +43,7 @@ use crate::dev::bridge::Bridge;
 use crate::dev::elsc::{Elsc, ElscConfig, ModuleOutput};
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::heart::{host_clock, Clock};
-use crate::dev::hub::{Hub, HubConfig, HubHooks, Space};
+use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::i2c::{BusBusy, I2cBus};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::isp1040::Isp1040;
@@ -284,40 +284,6 @@ pub struct Ip27Machine<B: Ip27Board> {
     lifecycle: GuestState,
 }
 
-/// What the Hub asks of the machine around it.
-struct Hooks {
-    name: &'static str,
-    cpu: Weak<dyn CpuDevice>,
-    events: Sender<MachineEvent>,
-    /// Where a cached reference naming node zero goes, as the node's number
-    /// and cached alias set it.
-    zero: Arc<ip27::NodeZero>,
-    hub: Weak<Hub>,
-}
-impl Hooks {
-    fn route(&self, number: u16) {
-        let calias = self.hub.upgrade().map_or(0, |hub| hub.calias_bytes());
-        self.zero.update(number, calias);
-    }
-}
-impl HubHooks for Hooks {
-    fn soft_reset(&self, _slice: usize) {
-        if let Some(cpu) = self.cpu.upgrade() {
-            cpu.as_device().signal(Signal::Reset(true));
-        }
-    }
-    fn cached_alias_changed(&self, bytes: u64) {
-        let number = self.zero.number();
-        self.zero.update(number, bytes);
-    }
-    fn node_number_changed(&self, number: u16) {
-        self.route(number);
-    }
-    fn machine_restart(&self) {
-        let _ = self.events.send(MachineEvent::HardReset);
-    }
-}
-
 /// Brings the module controller up to date when it is next due. The
 /// controller keeps its own time and a bus access brings it up to date, so
 /// this exists for a guest that leaves the bus idle while a countdown or a
@@ -515,14 +481,8 @@ impl<B: Ip27Board> Ip27Machine<B> {
             // The Hub publishes its lines straight into the processor's
             // interrupt word, which `Drop` lets go of before the processor goes.
             node.hub.set_cpu_interrupts(0, cpu.interrupts_ptr());
-            let zero = node.memory.node_zero();
-            node.hub.set_hooks(Arc::new(Hooks {
-                name: product(cfg),
-                cpu: Arc::downgrade(&cpu),
-                events: tx.clone(),
-                zero,
-                hub: Arc::downgrade(&node.hub),
-            }));
+            node.hub.set_node_zero(node.memory.node_zero(node.hub.routing().clone()));
+            node.hub.set_event_sender(tx.clone());
             node.hub.register_locks();
             cpu.register_locks();
             units.push(Unit { node, cpu });

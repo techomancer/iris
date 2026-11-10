@@ -15,7 +15,7 @@ struct Node {
     ni: Arc<Ni>,
 }
 fn node(revision: u8) -> Node {
-    Node { ni: Arc::new(Ni::new(revision)) }
+    Node { ni: Arc::new(Ni::new(revision, Routing::new())) }
 }
 /// Two Hubs on a direct cable, the two-module Origin 200.
 fn pair() -> (Node, Node) {
@@ -64,7 +64,7 @@ fn the_status_register_names_the_node_the_mode_and_the_chip_revision() {
 #[test]
 fn a_new_node_number_is_returned_for_the_machine_and_mirrored_for_the_decode() {
     let n = node(3);
-    assert!(matches!(w(&n.ni, reg::STATUS, 5 << 8), Effect::NodeNumber(5)));
+    assert!(matches!(w(&n.ni, reg::STATUS, 5 << 8), Effect::NodeNumber));
     assert_eq!(n.ni.number(), 5);
     // Writing the number it already has is not a change.
     assert!(matches!(w(&n.ni, reg::STATUS, 5 << 8), Effect::None));
@@ -246,7 +246,7 @@ fn vector_writes_land_only_on_rows_that_store() {
     w(&a.ni, reg::VECTOR, 0);
     w(&a.ni, reg::VECTOR_DATA, 3 << 8);
     let effect = w(&a.ni, reg::VECTOR_PARMS, (reg::STATUS - reg::STATUS) | VECTOR_WRITE);
-    assert!(matches!(effect, Effect::PeerNodeNumber(3)), "{effect:?}");
+    assert!(matches!(effect, Effect::PeerNodeNumber), "{effect:?}");
     assert_eq!(b.ni.number(), 3);
     assert_eq!(a.ni.neighbour_number(), Some(3));
 }

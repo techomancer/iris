@@ -58,9 +58,10 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
+use crate::cpu::mips_exec::SOFT_RESET_BIT;
 use crate::cpu::smp::on_cpu_thread;
 use crate::dev::heart::Clock;
-use super::{Effect, PENDING_BANKS};
+use super::{Effect, Routing, PENDING_BANKS};
 use crate::dev::odyssey::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -130,7 +131,7 @@ const RT_MASK: u64 = (1 << 52) - 1;
 const RT_LOCAL_CTRL_MASK: u64 = 0x1_00ff;
 const RT_LOCAL_CTRL_RESET: u64 = 0x1_0000;
 const CALIAS_MASK: u64 = 0xf;
-const CALIAS_RESET: u64 = 15;
+pub(super) const CALIAS_RESET: u64 = 15;
 const ERR_MASK: u64 = 0x01ff_ffff;
 const ERR_STACK_ADDR_MASK: u64 = 0xffff_fff8;
 const ERR_STACK_SIZE_MASK: u64 = 0xf;
@@ -199,6 +200,9 @@ pub struct Pi {
     cpus: u8,
     cpu_base: usize,
     clock: Clock,
+    /// Where the cached-alias size is published, stored under the state lock
+    /// as the register changes.
+    routing: Arc<Routing>,
     /// Pending banks. Only `modify` changes them while the machine runs, under
     /// `lines`; other processors poll them as mailboxes without it.
     pend: [AtomicU64; PENDING_BANKS],
@@ -236,13 +240,14 @@ impl Pi {
     /// `cpus` is how many processor sockets the node populates (1 or 2) and
     /// `cpu_base` the global index of its slice A, which PI_CPU_NUM subtracts
     /// from the reading processor's.
-    pub fn new(cpus: u8, cpu_base: usize, clock: Clock) -> Arc<Self> {
+    pub fn new(cpus: u8, cpu_base: usize, clock: Clock, routing: Arc<Routing>) -> Arc<Self> {
         assert!((1..=2).contains(&cpus));
         let now = clock();
         Arc::new_cyclic(|weak| Self {
             cpus,
             cpu_base,
             clock,
+            routing,
             pend: Default::default(),
             mask: Default::default(),
             rt_origin: AtomicU64::new(now),
@@ -304,7 +309,7 @@ impl Pi {
 
     /// The cached-alias window size the register currently names.
     pub fn calias_bytes(&self) -> u64 {
-        calias_bytes(self.state.lock().calias)
+        self.routing.calias()
     }
 
     /// The two pending banks, as a processor reads them.
@@ -363,6 +368,24 @@ impl Pi {
         u64::from(self.pend[0].load(Ordering::Acquire) & m0 != 0)
             | u64::from(self.pend[1].load(Ordering::Acquire) & m1 != 0) << 1
             | u64::from(self.rt_pending[slot].load(Ordering::Acquire) && self.rt_enable[slot].load(Ordering::Acquire)) << 2
+    }
+
+    /// Reset processor `slice`: raise bit 63 of its interrupt word, which the
+    /// processor takes ahead of every interrupt and answers by fetching the
+    /// reset vector. The word is the one the three lines are published into,
+    /// so this needs no lock and no machine; a slice with no word wired
+    /// resets nothing. What the store does beyond that is not established.
+    fn soft_reset(&self, slice: usize) {
+        let p = self.words[slice].load(Ordering::SeqCst);
+        if p.is_null() {
+            return;
+        }
+        // SAFETY: as in `write_lines`: sound while no thread can reach here
+        // after the word is freed, which a machine ensures by stopping its
+        // threads before it clears the words.
+        unsafe { &*p }.fetch_or(SOFT_RESET_BIT, Ordering::SeqCst);
+        #[cfg(feature = "idle-pause")]
+        crate::cpu::idle_park::wake();
     }
 
     /// Change an input of the lines and bring every slice's lines to what
@@ -585,8 +608,10 @@ impl Pi {
             }
             reg::CALIAS_SIZE => {
                 let code = value & CALIAS_MASK;
-                self.state.lock().calias = code;
-                return Effect::CachedAlias(calias_bytes(code));
+                let mut s = self.state.lock();
+                s.calias = code;
+                self.routing.set_calias(calias_bytes(code));
+                return Effect::CachedAlias;
             }
             reg::CPU_ENABLE_A | reg::CPU_ENABLE_B => {
                 let slice = ((off - reg::CPU_ENABLE_A) / 8) as usize;
@@ -605,8 +630,9 @@ impl Pi {
             }
             reg::SOFTRESET => {
                 let enabled = self.state.lock().cpu_enable;
-                let reached = std::array::from_fn(|i| i < usize::from(self.cpus) && enabled[i]);
-                return Effect::SoftReset(reached);
+                for slice in (0..usize::from(self.cpus)).filter(|&i| enabled[i]) {
+                    self.soft_reset(slice);
+                }
             }
             reg::INT_PEND_MOD => self.int_modify(value),
             reg::INT_PEND0 | reg::INT_PEND1 => {
@@ -714,6 +740,7 @@ impl Resettable for Pi {
         let mut s = self.state.lock();
         let (addr, running) = (s.err_stack_addr, s.running);
         *s = State::new();
+        self.routing.set_calias(calias_bytes(s.calias));
         s.err_stack_addr = addr;
         s.running = running;
         drop(s);
