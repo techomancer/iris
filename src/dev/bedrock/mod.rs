@@ -264,6 +264,12 @@ impl Bedrock {
     pub fn rebuild_memory(&self) {
         self.md.rebuild_memory();
     }
+    /// Whether processor `cpu`'s join after the PROM's reset barrier has
+    /// landed on LB scratch 1 since the LB's last reset: the first store it
+    /// made there after the boot master's release. One atomic load.
+    pub fn scratch1_joined(&self, cpu: usize) -> bool {
+        self.lb.scratch1_joined(cpu)
+    }
     #[cfg(feature = "jitv2")]
     pub(crate) fn generation_base(&self) -> *mut AtomicU64 {
         self.md.generation_base()
@@ -454,8 +460,8 @@ impl Bedrock {
         let (data, effect) = match (base, value) {
             (reg::IO_BASE, None) => (self.io.read(a), Effect::None),
             (reg::IO_BASE, Some(v)) => (0, self.io.write(a, v)),
-            (reg::LB_BASE, None) => (self.lb.read(a, now), Effect::None),
-            (reg::LB_BASE, Some(v)) => (0, self.lb.write(a, v, now, &self.levels, &self.node)),
+            (reg::LB_BASE, None) => (self.lb.read(a, now, crate::cpu::smp::on_cpu_thread()), Effect::None),
+            (reg::LB_BASE, Some(v)) => (0, self.lb.write(a, v, now, crate::cpu::smp::on_cpu_thread(), &self.levels, &self.node)),
             (reg::NI_BASE, None) => self.ni.read(a, &self.levels),
             (reg::NI_BASE, Some(v)) => (0, self.ni.write(a, v, &self.levels)),
             (_, None) => (self.xb.read(a), Effect::None),
