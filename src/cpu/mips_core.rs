@@ -1988,9 +1988,29 @@ impl MipsCore {
     /// has not run yet still holds ticket 0, the "already delivered"
     /// sentinel, and the guest (waiting for that very interrupt before it
     /// writes Compare again) would never get it.
+    ///
+    /// A timer interrupt that was already pending is part of the state too:
+    /// the step preamble rebuilds Cause's IP7 from `hot.interrupts`, which no
+    /// snapshot carries, and Count is already past Compare, so the next
+    /// match is a whole Count wrap away. Re-assert it from the restored
+    /// Cause (consuming the ticket, as delivery does) so the guest still
+    /// takes it; a restore over a live core clears any IP7 the snapshot
+    /// did not have.
     pub fn restore_compare_deadline(&mut self) {
         self.arm_ip7_sequence();
         self.reanchor_count_and_reschedule();
+        if self.cp0_cause & CAUSE_IP7 != 0 {
+            claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count);
+        } else {
+            self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
+        }
+    }
+
+    /// Cause as a snapshot should record it: IP7 delivered by the compare
+    /// timer sits in `hot.interrupts` until the next step merges it, so a
+    /// snapshot taken in between would not see it in `cp0_cause`.
+    pub fn cause_for_snapshot(&self) -> u32 {
+        self.cp0_cause | (self.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7)
     }
 
     /// CPU thread is stopping: latch the virtual count at its current value
@@ -2875,6 +2895,46 @@ mod ip7_ticket_tests {
         assert_eq!(shared, core.ip7_seq, "the armed one-shot's ticket must be the live sequence");
         assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count),
             "the restored deadline's one-shot could not deliver IP7");
+    }
+
+    fn ip7_pending(core: &MipsCore) -> bool {
+        core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7 != 0
+    }
+
+    /// A snapshot taken after the timer fired has Count past Compare and IP7
+    /// in Cause. The preamble rebuilds Cause from `hot.interrupts`, so a
+    /// restore that leaves that word clear drops the interrupt, and the
+    /// next match is 2^32 ticks away.
+    #[test]
+    fn a_pending_ip7_survives_a_snapshot_restore() {
+        let mut core = MipsCore::default();
+        core.cp0_count = 0x3000;
+        core.cp0_compare = 0x2000;
+        core.cp0_cause = CAUSE_IP7;
+        core.restore_compare_deadline();
+        assert!(ip7_pending(&core), "IP7 was pending in the snapshot but not after the restore");
+        // Delivered once: the restored deadline must not fire it again.
+        assert_eq!(core.ip7_seq_shared.load(Ordering::SeqCst), IP7_SEQ_CONSUMED);
+    }
+
+    /// The other direction, for a restore over a running core: an IP7 the
+    /// snapshot did not have is not carried over from before it.
+    #[test]
+    fn a_restore_without_ip7_clears_a_live_one() {
+        let mut core = MipsCore::default();
+        core.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+        core.restore_compare_deadline();
+        assert!(!ip7_pending(&core));
+    }
+
+    /// The timer sets IP7 in `hot.interrupts`, and Cause only sees it at the
+    /// next step: a snapshot in between must still record it.
+    #[test]
+    fn a_snapshot_records_an_ip7_not_yet_merged_into_cause() {
+        let core = MipsCore::default();
+        core.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+        assert_eq!(core.cp0_cause & CAUSE_IP7, 0);
+        assert_ne!(core.cause_for_snapshot() & CAUSE_IP7, 0);
     }
 
     /// The overrun case still delivers -- suppressing the crossing must not

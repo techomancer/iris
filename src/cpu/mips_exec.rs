@@ -9204,7 +9204,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             cp0_entryhi: self.core.cp0_entryhi,
             cp0_compare: self.core.cp0_compare,
             cp0_status: self.core.cp0_status,
-            cp0_cause: self.core.cp0_cause,
+            cp0_cause: self.core.cause_for_snapshot(),
             cp0_epc: self.core.cp0_epc,
             cp0_prid: self.core.cp0_prid,
             cp0_config: self.core.cp0_config,
@@ -9282,7 +9282,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // cp0_count/cp0_compare were restored as raw fields above — re-anchor
         // the virtual count at the restored value and re-arm the compare
         // timer, exactly as a snapshot-file load does.
-        self.core.reanchor_count_and_reschedule();
+        self.core.restore_compare_deadline();
         // self.pcp (jitv2's tracked PhysicalCodePage for the current fetch)
         // and the nanotlb are both keyed off whatever PC/ASID was live
         // before this restore — neither one has any way to notice pc just
@@ -11507,7 +11507,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         // intentionally not saved: it's a host-wall anchor, not calibrated
         // state, and must be reset on load.
         cp0u64!(count_hz);
-        cp0u32!(cp0_status); cp0u32!(cp0_cause);
+        cp0u32!(cp0_status);
+        cp0.insert("cp0_cause".into(), hex_u32(c.cause_for_snapshot()));
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u64!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
         cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
