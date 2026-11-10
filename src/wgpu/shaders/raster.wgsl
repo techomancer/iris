@@ -1,9 +1,9 @@
 // The raster pass driver: one 64-lane workgroup per busy tile, one pixel
 // a lane, dispatched indirectly from the busy list. The workgroup is the
-// only writer of its tile for the batch: it walks the tile's mask in
-// primitive order and calls the board's hooks, which store pixels
-// themselves. On the way it clears the mask words and the busy flag, so
-// the next batch starts clean without a buffer clear.
+// only writer of its tile for the batch: it walks the tile's run of the
+// list (bin.wgsl), which holds its primitives in order, and calls the
+// board's hooks, which store pixels themselves. Nothing is left to clear:
+// the next batch's bin pass writes its runs and entries afresh.
 //
 // Lanes take the tile's pixels a quad at a time: lane bits 0 and 1 are
 // the pixel's x and y within its 2x2 quad (even tile coordinates, and
@@ -17,16 +17,18 @@
 //   fn arch_prim(p: u32, px: i32, py: i32, lane: u32)
 //   fn arch_tile_end(tile: u32, px: i32, py: i32, lane: u32)
 // (px, py) is the lane's pixel in target coordinates. Hooks run in
-// workgroup-uniform control flow (the tile and the mask words are read
-// with workgroupUniformLoad), so they may use barriers and the quad
-// exchanges as long as they keep every lane in the same branches and
-// gate only their stores on coverage.
+// workgroup-uniform control flow (the busy entry is read with
+// workgroupUniformLoad, the run from read-only storage), so they may use
+// barriers and the quad exchanges as long as they keep every lane in the
+// same branches and gate only their stores on coverage.
 
 #include "common.wgsl"
 
-var<workgroup> wg_tile: u32;
-var<workgroup> wg_summary: u32;
-var<workgroup> wg_bits: u32;
+// The busy tiles' primitives, a run per tile (bin.wgsl).
+@group(0) @binding(1) var<storage, read> tile_prims: array<u32>;
+
+// The workgroup's busy entry: tile, first, count.
+var<workgroup> wg_work: vec4<u32>;
 
 const NO_TILE: u32 = 0xffffffffu;
 
@@ -48,9 +50,10 @@ fn raster_tile(wg: vec3<u32>, lane: u32) {
     raster_lane = lane;
     if lane == 0u {
         let idx = wg.x + wg.y * MAX_GROUPS;
-        wg_tile = select(NO_TILE, busy.tiles[idx], idx < atomicLoad(&busy.count));
+        wg_work = select(vec4<u32>(NO_TILE, 0u, 0u, 0u), busy.tiles[idx], idx < atomicLoad(&busy.count));
     }
-    let tile = workgroupUniformLoad(&wg_tile);
+    let work = workgroupUniformLoad(&wg_work);
+    let tile = work.x;
     if tile == NO_TILE {
         return;
     }
@@ -60,31 +63,9 @@ fn raster_tile(wg: vec3<u32>, lane: u32) {
     let py = batch.origin_y + i32(ty * TILE_H + lane_y(lane));
 
     arch_tile_begin(tile, px, py, lane);
-    let base = tile * MASK_STRIDE;
-    // The summary's words that cover the batch, then in each the mask
-    // words that have a bit: the rest stay clear.
-    let words = (batch.prim_count + 31u) / 32u;
-    for (var g = 0u; g < (words + 31u) / 32u; g++) {
-        if lane == 0u {
-            wg_summary = atomicExchange(&masks[base + MASK_WORDS + g], 0u);
-        }
-        var summary = workgroupUniformLoad(&wg_summary);
-        while summary != 0u {
-            let w = g * 32u + firstTrailingBit(summary);
-            summary &= summary - 1u;
-            if lane == 0u {
-                wg_bits = atomicExchange(&masks[base + w], 0u);
-            }
-            var bits = workgroupUniformLoad(&wg_bits);
-            while bits != 0u {
-                let p = w * 32u + firstTrailingBit(bits);
-                bits &= bits - 1u;
-                arch_prim(p, px, py, lane);
-            }
-        }
+    let end = min(work.y + work.z, LIST_CAP);
+    for (var i = work.y; i < end; i++) {
+        arch_prim(tile_prims[i], px, py, lane);
     }
     arch_tile_end(tile, px, py, lane);
-    if lane == 0u {
-        atomicStore(&busy_flags[tile], 0u);
-    }
 }

@@ -513,12 +513,15 @@ wgpu` the board's kernels; the design is `clanker/plans/wgpu-raster.md`).
 The front end runs every draw inside its submit and appends one *record*
 per primitive (a triangle's setup, a quad it shaded itself, a clear's
 rectangle, a row of pixels of an image put) to a *batch*, with the state
-each was issued under in a *slot*; a batch is two dispatches, a bin pass
-that gives each 8x8 tile a bitmask over the batch's primitives and a raster
-pass with one workgroup per busy tile that walks its mask in order and
-stores pixels itself. A tile's mask has a summary, one bit per mask word
-that holds any primitive, so the walk visits only those words. Order per pixel is the record order, so the kernels
-need no atomics on pixels and no synchronisation between workgroups.
+each was issued under in a *slot*; a batch is two dispatches. The bin pass
+runs one workgroup per 32x32 coarse tile: it finds, in workgroup memory,
+the primitives whose boxes touch the coarse tile and then each of its
+sixteen 8x8 tiles, and writes every busy tile's primitives as one run of
+indices, in record order, into a shared list, with the tile's entry
+(tile, first, count) on the busy list. The raster pass runs one workgroup
+per busy tile that walks its run and stores pixels itself. Order per pixel
+is the record order, so the kernels need no atomics on pixels and no
+synchronisation between workgroups.
 
 The raster workgroup's 64 lanes take the tile's pixels a quad at a time
 (lane bits 0 and 1 the pixel within its 2x2 quad, bits 2 to 5 the quad),

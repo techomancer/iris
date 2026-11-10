@@ -63,13 +63,13 @@ for what that looks like.
 |---|---|
 | `device.rs` `Gpu` | adapter, device, queue, adapter-sized storage limits, optional features (subgroups, int64, int64 atomic min/max, timestamps) recorded in `Caps`; async errors captured for `check()` |
 | `shader.rs` `Source` | WGSL from `include_str!` fragments with `#include "name"` and `define`d constants; compile errors come back as text with the composed source numbered |
-| `tiles.rs` | 8x8 tiles, `MAX_PRIMS` 4096 a batch, 128 mask words a tile, `TileGrid::tile_box`, the header and list layouts shared with `shaders/common.wgsl` |
-| `batch.rs` `Batch<R, S>` | the recorder: `slot(S)`, `prim(R, pixel box)`; `flush` uploads records, slots, boxes and header, resets the busy count and the indirect arguments, dispatches bin then raster, returns the submission |
+| `tiles.rs` | 8x8 tiles, 32x32 coarse tiles (`COARSE`), `MAX_PRIMS` 4096 a batch, `LIST_CAP` tile-primitive pairs, `TileGrid::tile_box`, the header and busy-list layouts shared with `shaders/common.wgsl` |
+| `batch.rs` `Batch<R, S>` | the recorder: `slot(S)`, `prim(R, pixel box)` (Full past `MAX_PRIMS` or when the boxes' tile counts could pass `LIST_CAP`); `flush` uploads records, slots, boxes and header, resets the busy head and the indirect arguments, dispatches bin over the coarse tiles the boxes cover, then raster; returns the submission |
 | `batch.rs` `BatchPipelines` | builds both kernels around a board's `ArchShaders`: its raster hook fragments, an optional `bin_accept`, its defines, its bind group layouts for groups 2 and up |
 | `memory.rs` `GpuMemory`, `Staging` | a board memory: device-local storage buffer, `write`, `clear`, `read` (copy to a staging buffer, wait, map); `Staging` is the readback buffer any GPU buffer can be read through |
 | `scanout.rs` `ScanoutPipeline`, `Scanout` | the display's compose: a board's `scanout_pixel(x, y)` kernel over its memory into a frame on the GPU, one lane a pixel, read back for the window; group 0 the frame, group 1 the board's display slot, groups 2 and up the board's memory |
-| `shaders/bin.wgsl` | one workgroup per primitive, lanes over its tile rows: `atomicOr` the primitive's bit into each tile's mask, append first-touched tiles to the busy list, raise the indirect arguments |
-| `shaders/raster.wgsl` | one workgroup per busy tile, dispatched indirectly, one pixel a lane: `arch_tile_begin`, then every set bit in mask order through `arch_prim`, then `arch_tile_end`; clears its mask words and busy flag on the way |
+| `shaders/bin.wgsl` | one workgroup per coarse tile: a mask in workgroup memory of the boxes touching it, then per tile (16 lanes x 4 word ranges) the ones touching that tile and passing `bin_accept`; one `atomicAdd` each for the coarse tile's list entries and busy entries; writes each busy tile's primitives as one ordered run and its entry (tile, first, count); raises the indirect arguments |
+| `shaders/raster.wgsl` | one workgroup per busy tile, dispatched indirectly, one pixel a lane: `arch_tile_begin`, then the tile's run in order through `arch_prim`, then `arch_tile_end`; nothing to clear |
 
 Rules the kernels rely on:
 
@@ -77,19 +77,26 @@ Rules the kernels rely on:
   during a batch, so primitive order per pixel is the loop order and no
   atomics touch memory. Two pixels in one word (overlay cells, 16-bit
   pixels) are handled inside the group.
-- **Order is the bit position.** Setting bits commutes; the busy list's
-  order does not matter; the records array is in submission order.
-- **Hooks run in uniform control flow.** The tile index and each mask
-  word are read with `workgroupUniformLoad`, so hooks may use barriers
-  and subgroup quad operations as long as every lane takes the same
-  branches and only stores are gated on coverage.
+- **Order is the bit position.** The bin pass's masks are in workgroup
+  memory, a bit per primitive; a tile's run is written from them in bit
+  order, so it is in record order. The busy list's order does not
+  matter; the records array is in submission order.
+- **Hooks run in uniform control flow.** The busy entry is read with
+  `workgroupUniformLoad` and the run from read-only storage, so hooks
+  may use barriers and subgroup quad operations as long as every lane
+  takes the same branches and only stores are gated on coverage.
 - **Bindings.** Group 0 is the batch; group 1 is records (binding 0) and
   slots (binding 1); groups 2 and up are the board's. The bin pass binds
   the indirect arguments at group 0 binding 5 through its own layout: a
   buffer cannot be read-write storage and the indirect source in one
   dispatch (wgpu validation, found in milestone 0).
 - **Workgroup grids cap at 65535.** The busy count folds over x and y;
-  the bin dispatch is one group per primitive, under `MAX_PRIMS`.
+  the bin dispatch is one group per coarse tile (64 x 64 at most for a
+  2048-pixel plane).
+- **Binning was a 35 MB mask buffer until 2026-11-09:** 132 words per
+  8x8 tile, global `atomicOr`s from one bin workgroup per primitive, and
+  a raster walk with an `atomicExchange` and a barrier per mask word,
+  clearing as it went.
 
 ## What a board provides (`src/dev/<board>/wgpu`)
 

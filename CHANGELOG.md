@@ -232,9 +232,19 @@ where they differed:
   primitives (a summary bit per word, set by the bin pass), instead of
   every word a full batch could use whatever the batch held: the quake1
   timedemo's raster pass takes about 30% less GPU time.
+- Binning runs per 32x32 coarse tile in workgroup memory and writes each
+  busy tile's primitives as one ordered list, instead of setting bits in a
+  132-word mask per 8x8 tile with global atomics from one workgroup per
+  primitive. The bin pass takes a fifth of the GPU time (quake1 timedemo:
+  1.07 s to 0.20 s, bin and raster together 8% less), and the 35 MB mask
+  buffer is gone (an 8 MB list and 1 MB of busy entries instead).
+- Texture reads on the GPU unit go through a plain binding of board
+  memory with cached loads instead of atomics (1% of raster time).
 - `WGPU_BATCH_TIMING` times each GPU batch's bin and raster passes with
-  timestamp queries and counts its busy tiles; `IRIS_WGPU_LOAD` compiles
-  edited kernels from a directory instead of the built-in ones.
+  timestamp queries and counts its busy tiles and primitives per busy
+  tile; `IRIS_WGPU_LOAD` compiles edited kernels from a directory instead
+  of the built-in ones. `VPRO_TILE_CACHE=1` holds each tile's destination
+  in workgroup memory (exact, slower; off by default).
 
 ### VPro drawing
 

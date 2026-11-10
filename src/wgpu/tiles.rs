@@ -9,15 +9,20 @@ pub const TILE_W: u32 = 8;
 pub const TILE_H: u32 = 8;
 pub const LANES: u32 = TILE_W * TILE_H;
 
-/// Primitives a batch can hold, and the mask words per tile that implies.
+/// Primitives a batch can hold, and the words of a mask with a bit for each
+/// (the bin pass's masks, in workgroup memory).
 pub const MAX_PRIMS: u32 = 4096;
 pub const MASK_WORDS: u32 = MAX_PRIMS / 32;
-/// After a tile's mask words, its summary: one bit per mask word, set when
-/// the word gets its first bit, so the raster pass visits only the words
-/// that have any.
-pub const SUMMARY_WORDS: u32 = MASK_WORDS.div_ceil(32);
-/// Words per tile in the mask buffer: the mask, then the summary.
-pub const MASK_STRIDE: u32 = MASK_WORDS + SUMMARY_WORDS;
+
+/// A coarse tile is COARSE x COARSE tiles (32x32 pixels): the bin pass's
+/// workgroup, which bins its 16 tiles from the primitives that touch it.
+pub const COARSE: u32 = 4;
+
+/// Tile-primitive pairs a batch's lists can hold. The bin pass writes each
+/// tile's primitives as one run of indices in a shared list; the recorder
+/// bounds a batch by the sum of its boxes' tile counts, which the pairs
+/// cannot exceed.
+pub const LIST_CAP: u32 = 1 << 21;
 
 /// wgpu's cap on workgroups along one dispatch axis. The raster dispatch
 /// folds the busy count over x and y when it is larger.
@@ -83,33 +88,45 @@ impl TileBox {
         (self.x1 - self.x0 + 1) as u32 * (self.y1 - self.y0 + 1) as u32
     }
 
+    /// The smallest box holding both.
+    pub fn union(&self, o: &TileBox) -> TileBox {
+        TileBox { x0: self.x0.min(o.x0), y0: self.y0.min(o.y0), x1: self.x1.max(o.x1), y1: self.y1.max(o.y1) }
+    }
+
     /// As the bin kernel reads it: x0, y0, x1, y1.
     pub fn packed(&self) -> [u32; 4] {
         [self.x0 as u32, self.y0 as u32, self.x1 as u32, self.y1 as u32]
     }
 }
 
-/// `BatchHeader` in common.wgsl: the batch's uniform.
+/// `BatchHeader` in common.wgsl: the batch's uniform. The bin pass runs
+/// one workgroup per coarse tile of the rectangle `coarse_x0`, `coarse_y0`,
+/// `coarse_cols` wide, that the batch's boxes cover.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct BatchHeader {
     pub prim_count: u32,
     pub tile_cols: u32,
     pub tile_rows: u32,
-    pub mask_words: u32,
+    pub coarse_cols: u32,
     pub origin_x: i32,
     pub origin_y: i32,
-    pub _pad: [u32; 2],
+    pub coarse_x0: u32,
+    pub coarse_y0: u32,
 }
 
-/// The head of `BusyList` in common.wgsl: the busy count, then the tile
-/// indices.
+/// The head of `BusyList` in common.wgsl: the busy count and the list
+/// entries used, then per busy tile its index and its run in the list.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct BusyHead {
     pub count: u32,
-    pub _pad: [u32; 3],
+    pub pairs: u32,
+    pub _pad: [u32; 2],
 }
+
+/// Bytes per busy entry: tile, first list index, count, pad.
+pub const BUSY_ENTRY: u64 = 16;
 
 /// `DispatchArgs` in bin.wgsl: the raster pass's indirect arguments, in
 /// a buffer of their own.
