@@ -1149,11 +1149,13 @@ fn the_ethernet_level_drives_the_pci_pin_not_the_superio_line() {
     c.attached();
     let (sup, sline) = LevelProbe::line();
     c.connect_superio_interrupt(sline);
-    c.sh.core.set_inta(true);
+    let eth = c.eth().unwrap();
+    eth.write32(0xf8, 1);
+    eth.raise_for_test(1);
     assert!(pin.level());
     assert!(!sup.level());
     assert_eq!(c.int_status(), 0, "no SuperIO status bit for it");
-    c.sh.core.set_inta(false);
+    eth.write32(0xf4, 1);
     assert!(!pin.level());
 }
 
@@ -1321,6 +1323,35 @@ fn the_superio_line_is_driven_only_on_change_and_in_order_across_threads() {
     }
 }
 
+/// A host key and writes of the enable words race; once both finish, the
+/// line agrees with status AND enable.
+#[test]
+fn the_superio_line_follows_enable_writes_racing_a_host_key() {
+    for _ in 0..20 {
+        let r = Arc::new(Rig::new());
+        r.w32(K_TX, 0xf4);
+        let _ = r.r32(K_RX);
+        let (a, b) = (r.clone(), r.clone());
+        let keys = std::thread::spawn(move || {
+            for _ in 0..200 {
+                a.c.ps2().push_kb(winit::keyboard::KeyCode::KeyA, true);
+                a.c.ps2().push_kb(winit::keyboard::KeyCode::KeyA, false);
+            }
+        });
+        let enables = std::thread::spawn(move || {
+            for _ in 0..400 {
+                b.w32(reg::INT_ENABLE_SET, int::KEYBOARD);
+                b.w32(reg::INT_ENABLE_CLR, int::KEYBOARD);
+            }
+        });
+        keys.join().unwrap();
+        enables.join().unwrap();
+        r.c.service();
+        let want = r.r32(reg::INT_STATUS) & r.r32(reg::INT_ENABLE_SET) != 0;
+        assert_eq!(r.superio.level(), want);
+    }
+}
+
 #[test]
 fn the_ethernet_pin_follows_the_last_level_given() {
     let c = Ioc3::octane(MAC, false);
@@ -1328,10 +1359,13 @@ fn the_ethernet_pin_follows_the_last_level_given() {
     let (pin, line) = LevelProbe::line();
     c.state().connect_irq(line);
     c.attached();
-    for i in 0..1000 {
-        c.sh.core.set_inta(i % 2 == 0);
+    let eth = c.eth().unwrap();
+    eth.write32(0xf8, 1);
+    for _ in 0..1000 {
+        eth.raise_for_test(1);
+        eth.write32(0xf4, 1);
     }
-    c.sh.core.set_inta(true);
+    eth.raise_for_test(1);
     assert!(pin.level());
 }
 
