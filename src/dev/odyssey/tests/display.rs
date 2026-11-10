@@ -57,6 +57,13 @@ fn display_identity(s: &mut Board, did: u32) {
 /// The display's pixel at (x, y) as 0x00RRGGBB, the frame composed.
 fn shown(s: &mut Board, x: i32, y: i32) -> u32 {
     s.scanout_update();
+    in_frame(s, x, y)
+}
+
+/// The pixel at (x, y) of the frame last composed, as 0x00RRGGBB. Composing
+/// is the whole frame each time, so a run of reads with nothing changed in
+/// between composes once (`s.scanout_update()`) and reads with this.
+fn in_frame(s: &Board, x: i32, y: i32) -> u32 {
     s.reader.frame[(y * s.reader.frame_width as i32 + x) as usize] & 0xff_ffff
 }
 
@@ -371,8 +378,9 @@ fn a_swap_shows_only_complete_frames() {
         assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), 1 - back);
         retrace(&mut s);
         assert_eq!(reg_read(&mut s, ODSY_DISPLAYED_BUFFER), back);
-        assert_eq!(shown(&mut s, 10, 10), colour, "frame {i}: swapped");
-        assert_eq!(shown(&mut s, 10, 40), colour);
+        s.scanout_update();
+        assert_eq!(in_frame(&s, 10, 10), colour, "frame {i}: swapped");
+        assert_eq!(in_frame(&s, 10, 40), colour);
 
         retrace(&mut s);
         assert_eq!(shown(&mut s, 10, 40), colour, "an idle retrace keeps the frame");
@@ -665,32 +673,36 @@ fn the_cursor_position_is_signed_and_clipped_to_the_raster() {
     cursor_load(&mut s, 2, 3);
     let bg = shown(&mut s, 11, 7);
     cursor_entry(&mut s, cursor::CONTROL, 1);
-    assert_eq!(shown(&mut s, 2, 3), WORD1_RGB);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 2, 3), WORD1_RGB);
 
     // x = -1: column 0 of the glyph is off the left edge.
     cursor_entry(&mut s, cursor::POSITION, 0xffff_0005);
-    assert_eq!(shown(&mut s, 0, 5), WORD2_RGB);
-    assert_eq!(shown(&mut s, 1, 5), WORD0_RGB);
-    assert_eq!(shown(&mut s, 2, 5), bg);
-    assert_eq!(shown(&mut s, 2, 3), bg, "the old place is repainted");
-    assert_eq!(shown(&mut s, 3, 3), bg);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 0, 5), WORD2_RGB);
+    assert_eq!(in_frame(&s, 1, 5), WORD0_RGB);
+    assert_eq!(in_frame(&s, 2, 5), bg);
+    assert_eq!(in_frame(&s, 2, 3), bg, "the old place is repainted");
+    assert_eq!(in_frame(&s, 3, 3), bg);
 
     // y = -2: glyph row 2 lands on line 0. Read unsigned, 0xfffe would put
     // the whole cursor below the raster and draw nothing.
     cursor_entry(&mut s, cursor::GLYPH + 2 * 4, 0x1);
     cursor_entry(&mut s, cursor::PLANE + 2 * 2, 0x3);
     cursor_entry(&mut s, cursor::POSITION, 0x0002_fffe);
-    assert_eq!(shown(&mut s, 2, 0), WORD1_RGB);
-    assert_eq!(shown(&mut s, 3, 0), bg);
-    assert_eq!(shown(&mut s, 2, 1), bg);
-    assert_eq!(shown(&mut s, 0, 5), bg);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 2, 0), WORD1_RGB);
+    assert_eq!(in_frame(&s, 3, 0), bg);
+    assert_eq!(in_frame(&s, 2, 1), bg);
+    assert_eq!(in_frame(&s, 0, 5), bg);
 
     // The PROM's first position after its enable, x 1280 y 0, is the first
     // column right of the raster and draws nothing.
     cursor_entry(&mut s, cursor::POSITION, 0x0500_0000);
-    assert_eq!(shown(&mut s, 0, 5), bg);
-    assert_eq!(shown(&mut s, 2, 0), bg);
-    assert_eq!(shown(&mut s, 1279, 0), 0);
+    s.scanout_update();
+    assert_eq!(in_frame(&s, 0, 5), bg);
+    assert_eq!(in_frame(&s, 2, 0), bg);
+    assert_eq!(in_frame(&s, 1279, 0), 0);
 }
 
 /// The cursor request writes the position through a type 7 header when it
