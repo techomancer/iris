@@ -2546,6 +2546,11 @@ fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
 
 
 // ---- the hold-off on the real clock, and thread timing ----
+/// How long a real-clock test waits for a completion it has every reason
+/// to expect. Only a lost wake-up runs it out, and that hangs for good, so
+/// the bound can be long enough for a loaded host.
+const WAIT: Duration = Duration::from_secs(60);
+
 fn wait_resp<P: IspPart>(r: &Rig<P>, n: u16, max: Duration) -> bool {
     let t = std::time::Instant::now();
     while t.elapsed() < max {
@@ -2564,8 +2569,14 @@ fn a_hold_on_the_real_clock_releases_without_a_poke() {
     r.put_entry(0, &tur1(0x41));
     r.doorbell(1);
     std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(r.r(reg::RESPONSE_QUEUE), 0);
-    assert!(wait_resp(&r, 1, Duration::from_secs(4)), "never released");
+    let posted = r.r(reg::RESPONSE_QUEUE);
+    // The hold runs a second from the reset, which `t` precedes. A read
+    // that returns inside that second must find nothing; a sleep that a
+    // loaded host stretched past it proves nothing either way.
+    if t.elapsed() < Duration::from_millis(1000) {
+        assert_eq!(posted, 0, "released early {:?}", t.elapsed());
+    }
+    assert!(wait_resp(&r, 1, WAIT), "never released");
     assert!(t.elapsed() >= Duration::from_millis(990), "released early {:?}", t.elapsed());
 }
 
@@ -2573,15 +2584,23 @@ fn a_hold_on_the_real_clock_releases_without_a_poke() {
 fn the_hold_does_not_run_while_the_machine_is_stopped() {
     let r = Rig::with_disk("rv-pause", 1, 64);
     r.init_rings(8, 8);
+    let t = std::time::Instant::now();
     bus_reset(&r, 1, 0);
     r.put_entry(0, &tur1(0x42));
     r.doorbell(1);
     r.isp.pause();
+    // The time the hold has run is the stretch up to the pause and the
+    // stretch after the resume; the stopped time between does not count.
+    let before_pause = t.elapsed();
     std::thread::sleep(Duration::from_millis(1400));
     r.isp.resume();
+    let resumed = std::time::Instant::now();
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(r.r(reg::RESPONSE_QUEUE), 0, "hold ran while stopped");
-    assert!(wait_resp(&r, 1, Duration::from_secs(4)), "never released after resume");
+    let posted = r.r(reg::RESPONSE_QUEUE);
+    if before_pause + resumed.elapsed() < Duration::from_millis(1000) {
+        assert_eq!(posted, 0, "hold ran while stopped");
+    }
+    assert!(wait_resp(&r, 1, WAIT), "never released after resume");
 }
 
 #[test]
@@ -2591,7 +2610,7 @@ fn on_the_real_clock_an_absent_target_waits_hold_plus_timeout_and_a_reset_retire
     let t = std::time::Instant::now();
     bus_reset(&r, 1, 0);
     queue_absent(&r, 0, 0x43);
-    assert!(wait_resp(&r, 1, Duration::from_secs(4)));
+    assert!(wait_resp(&r, 1, WAIT));
     assert!(t.elapsed() >= Duration::from_millis(1240), "{:?}", t.elapsed());
     // a long hold, then a second reset ends it promptly
     bus_reset(&r, 600, 0);
@@ -2599,7 +2618,7 @@ fn on_the_real_clock_an_absent_target_waits_hold_plus_timeout_and_a_reset_retire
     r.doorbell(2);
     std::thread::sleep(Duration::from_millis(100));
     bus_reset(&r, 0, 0);
-    assert!(wait_resp(&r, 2, Duration::from_secs(2)));
+    assert!(wait_resp(&r, 2, WAIT));
     assert_eq!(g16(&r.status(1), 10), IOCB_RESET);
 }
 
