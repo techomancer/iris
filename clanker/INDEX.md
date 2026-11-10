@@ -298,6 +298,16 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 | [a-refused-command-store-answers-busy-never-spins.md](odyssey/a-refused-command-store-answers-busy-never-spins.md) | rule | RAD "thread held off" under Quake: the room check counted retired stores while the GFifo head is published lazily, so `write_command` spun on the host with no interrupts; check the ring's own view and answer busy |
 | [sharegroup-warning-at-gl-exit-is-normal.md](odyssey/sharegroup-warning-at-gl-exit-is-normal.md) | rule | `odsy: attempted sharegroup operation from unbound gfxp` at GL program exit is normal: a real V10 logs it 57 times when tyrquake quits; only a sign of trouble mid-run or after a teardown |
 
+
+## kona/
+
+The InfiniteReality (KONA) graphics pipe's host interface.
+
+| Note | Kind | Title |
+|---|---|---|
+| [front-end.md](kona/front-end.md) | design | The Host Interface Processor: attach interface, the command queue on `GFifo`, which accesses wait, the job seam to a back end, approximations |
+| [token-census.md](kona/token-census.md) | measurement | The token families two recorded streams (the PROM to its graphics menu, IRIX to the 4Dwm desktop) send, how far a replay into `NullBackend` stays exact, and the selectors QEMU's decoder leaves unresolved |
+
 ## hostgl/
 
 Host GL pass-through for guest GL programs (`iris-hostgl`).
@@ -491,3 +501,5 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
 | [vpro-lines-on-the-triangle-arithmetic.md](plans/vpro-lines-on-the-triangle-arithmetic.md) | plan | VPro lines: integer pixel walk kept, attributes on the triangle's f32/0.15/12.12 arithmetic instead of f64, major-axis t; then a ring primitive for the threaded CPU unit and a REC_LINE GPU kernel; validate on octopus |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |
+| [onyx2-infinitereality.md](plans/onyx2-infinitereality.md) | plan | Plan: the Onyx2, Onyx 3000 and InfiniteReality in Iris: order of work, decisions, finish line and per-PR rules
+| [kona-back-end.md](plans/kona-back-end.md) | design | Design: the InfiniteReality (KONA) board: concrete back end, pipe lock, draw-state table on a tile scheduler, geometry hand-off, ownership, steps and approximations
