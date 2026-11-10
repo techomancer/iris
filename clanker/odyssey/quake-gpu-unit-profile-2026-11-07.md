@@ -178,6 +178,36 @@ more than half because its boxes are padded by a pixel on each side
 (`tri_box`). The sgiquake replay's wall time (11-15 s) is the CPU side
 and does not show this.
 
+## At a pinned clock (2026-11-09)
+
+Every GPU time above was taken with the card's clocks floating: the
+replay keeps the GPU about a third busy, so amdgpu ran it near 1.2 of
+2.6 GHz (memory 480 of 1000 MHz). `WGPU_BATCH_TIMING` now prints the
+clocks; pin them with `echo profile_peak >
+/sys/class/drm/card0/device/power_dpm_force_performance_level` (root;
+`auto` undoes it). Pinned (2590 MHz, 995 MHz), two runs each, which then
+agree within 0.5%:
+
+| | bin | raster |
+|---|---|---|
+| VPro quake1, masks (a62360f0) | 0.314 s | 3.323 s |
+| VPro, lists, boxes | 0.071 s | 3.185 s |
+| VPro, lists, edges | 0.158 s | 2.535 s |
+| VPro, lists, edges, tile cache | 0.158 s | 3.60 s |
+| IMPACT sgiquake, boxes | 0.062 s | 1.41 s |
+| IMPACT, edges | 0.125 s | 1.09 s |
+
+- The lists' "raster +4%" was clock noise: pinned, the list walk is 4%
+  faster than the mask walk.
+- Edges: bin + raster -17% on both boards; against masks -26% on VPro.
+- The tile cache is +42% raster, worse than unpinned: with memory at
+  full clock the atomics it saves cost even less.
+- Per frame: VPro 2.8 ms (970 frames), IMPACT 6.0 ms (203 frames).
+- Live, sgiquake `timedemo demo1` on the IP28 guest (High IMPACT,
+  1024x768, jitv2): 27.2 fps on the GPU unit, 26.3 pinned; guest CPU
+  thread 100%, HQ3 and RSS threads 40-50%, GPU 55% busy. The guest CPU
+  is the limit. On the CPU rasteriser: 1.9 fps, RSS thread 97%.
+
 ## Batches: why they end, and the mask walk (2026-11-08)
 
 - Not by size: 559 prims a batch against MAX_PRIMS 4096. With
