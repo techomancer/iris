@@ -12,6 +12,7 @@ pub mod mace;
 pub mod mace_audio;
 pub mod mace_isa;
 pub mod crime;
+pub mod battery_clock;
 pub mod ds1687;
 pub mod heart;
 pub mod heart_mem;

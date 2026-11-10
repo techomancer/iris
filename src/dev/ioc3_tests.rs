@@ -1356,6 +1356,98 @@ fn a_qemu_layout_image_loads() {
     assert_eq!(rtc_r(&r, 0x53), b'1');
     rtc_w(&r, 0x50, 1);
     assert_eq!(rtc_r(&r, 0x53), 0x02);
+    // With no clock reference beside it, the clock starts at host time.
+    rtc_w(&r, 0x0a, 0x20);
+    assert!(rtc_r(&r, 0x09) >= 0x26, "host time, in BCD");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Set 2004-06-01 19:00:30 UTC in IRIX's order: SET, the seconds through
+/// the year, the century in bank 1, the weekday, SET clear. Binary, 24-hour.
+fn set_2004(r: &Rig) {
+    rtc_w(r, 0x0a, 0x30);
+    rtc_w(r, 0x0b, 0x86);
+    for (n, v) in [(0u8, 30u8), (2, 0), (4, 19), (7, 1), (8, 6), (9, 4), (0x48, 20), (6, 3)] {
+        rtc_w(r, n, v);
+    }
+    rtc_w(r, 0x0b, 0x06);
+    rtc_w(r, 0x0a, 0x20);
+}
+
+/// A date the guest sets survives a relaunch, still running: the clock
+/// reference beside the file, in QEMU's layout, carries it.
+#[test]
+fn a_set_date_survives_a_relaunch() {
+    let path = std::env::temp_dir().join(format!("ioc3-clock-{}", std::process::id()));
+    let clock = crate::dev::battery_clock::companion(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&clock);
+    {
+        let r = Rig::new();
+        r.c.set_nvram_file(&path).unwrap();
+        assert!(!clock.exists(), "no reference until the guest sets the clock");
+        set_2004(&r);
+    }
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0x200, "the image stays the chip's bytes");
+    let reference = std::fs::read(&clock).unwrap();
+    assert_eq!((reference.len(), &reference[..8]), (24, &b"DS168RF1"[..]));
+    {
+        let r = Rig::new();
+        r.c.set_rtc_offset(&crate::config::RtcOffset { years: -5, ..Default::default() });
+        r.c.set_nvram_file(&path).unwrap();
+        // A new run: register B is the part's power-up BCD, 24-hour.
+        rtc_w(&r, 0x0a, 0x30);
+        assert_eq!(rtc_r(&r, 0x48), 0x20);
+        assert_eq!(
+            [0x09, 0x08, 0x07, 0x04, 0x02].map(|n| rtc_r(&r, n)),
+            [0x04, 0x06, 0x01, 0x19, 0x00],
+            "2004-06-01 19:00, not host time or the seed"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&clock);
+}
+
+/// A clock file that cannot be read is reported and passed over: the
+/// NVRAM file still loads and the clock starts from host time.
+#[test]
+fn an_unreadable_clock_file_leaves_the_nvram_usable() {
+    let path = std::env::temp_dir().join(format!("ioc3-clock-bad-{}", std::process::id()));
+    let clock = crate::dev::battery_clock::companion(&path);
+    let mut img = vec![0u8; 0x200];
+    img[0x0f] = 0x42;
+    std::fs::write(&path, &img).unwrap();
+    let _ = std::fs::remove_dir_all(&clock);
+    std::fs::create_dir(&clock).unwrap(); // reading a directory fails
+    let r = Rig::new();
+    r.c.set_nvram_file(&path).unwrap();
+    assert_eq!(rtc_r(&r, 0x0f), 0x42);
+    assert!(rtc_r(&r, 0x09) >= 0x26, "host time, in BCD");
+    drop(r);
+    let _ = std::fs::remove_dir_all(&clock);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `[rtc_offset]` starts a clock the guest has not set, at every run, so an
+/// edit to it takes effect.
+#[test]
+fn rtc_offset_starts_a_clock_with_no_reference() {
+    let path = std::env::temp_dir().join(format!("ioc3-clock-seed-{}", std::process::id()));
+    let clock = crate::dev::battery_clock::companion(&path);
+    std::fs::write(&path, vec![0u8; 0x200]).unwrap();
+    let _ = std::fs::remove_file(&clock);
+    let year = |years| {
+        let r = Rig::new();
+        r.c.set_rtc_offset(&crate::config::RtcOffset { years, ..Default::default() });
+        r.c.set_nvram_file(&path).unwrap();
+        let y = rtc_r(&r, 0x09);
+        drop(r);
+        assert!(!clock.exists(), "a seed writes no reference");
+        i32::from((y >> 4) * 10 + (y & 0x0f))
+    };
+    let (now, back10, back20) = (year(0), year(-10), year(-20));
+    assert_eq!((now - back10).rem_euclid(100), 10);
+    assert_eq!((back10 - back20).rem_euclid(100), 10, "the edited offset took effect");
     let _ = std::fs::remove_file(&path);
 }
 

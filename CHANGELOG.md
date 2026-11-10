@@ -328,6 +328,16 @@ where they differed:
 - GL lines, points and rectangles into 16-bit double-buffered windows now
   dither as triangles do. `re dither on|off` compares renderings.
 
+### The clock keeps time between runs
+
+- A date the guest sets on an Octane now survives quitting iris, and the
+  clock keeps running from it as the battery-backed part does. It is kept
+  in `<nvram>.clock` beside the NVRAM image, in the layout QEMU's DS1685
+  model uses for its clock file, and the image stays the chip's 512 bytes.
+  Without that file the clock starts where `[rtc_offset]` puts it, which
+  the Octane now honours, host time by default; the file is written only
+  once the guest sets the clock.
+
 ### A dropped Octane frees its device table
 
 - A GUI Stop then Start on an Octane leaked the machine's physical bus and its

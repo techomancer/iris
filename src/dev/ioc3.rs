@@ -40,7 +40,8 @@
 //!   Host serial input is fed into the FIFOs by one thread per port.
 //! * The DS1685 is the O2's DS1687 model behind an index and a data port; it
 //!   has no alarm or periodic interrupts. Its RAM, including the 128-byte
-//!   extended RAM, persists in a 512-byte file.
+//!   extended RAM, persists in a 512-byte file, and once the guest sets the
+//!   clock, the clock persists beside it (see `battery_clock`).
 //!
 //! Ported from hw/misc/sgi-ioc3.c and its serial, parallel and keyboard siblings
 //! in jamesbraid/qemu-sgi-origami.
@@ -53,7 +54,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::dev::ds1687::MaceRtc;
+use crate::dev::battery_clock;
+use crate::dev::ds1687::{image, MaceRtc};
 use crate::dev::ioc3_port::Ioc3EthPort;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1;
@@ -529,13 +531,11 @@ impl Parallel {
 const NVRAM_QUIET: Duration = Duration::from_millis(500);
 /// Registers 0x0e.. are storage rather than clock in the file.
 const NVRAM_FIRST: usize = 0x0e;
-/// The file is a 512-byte image: common registers 0x00..0x40,
-/// bank-0 RAM 0x40..0x80, bank-1 registers 0x80..0xc0, extended RAM
-/// 0xc0..0x140, zero padding after.
-const NVRAM_IMAGE_LEN: usize = 0x200;
-const NVRAM_OFF_NV: usize = 0x40;
-const NVRAM_OFF_EXT: usize = 0x80;
-const NVRAM_OFF_XRAM: usize = 0xc0;
+/// The file is the DS1685's 512-byte image (see `ds1687::image`).
+const NVRAM_IMAGE_LEN: usize = image::LEN;
+const NVRAM_OFF_NV: usize = image::NV;
+const NVRAM_OFF_EXT: usize = image::EXT;
+const NVRAM_OFF_XRAM: usize = image::XRAM;
 /// Register A bit 4 selects bank 1 for registers 0x40..0x7f.
 const RTC_A_DV0: u8 = 0x10;
 /// Bank-1 extended RAM address and data ports.
@@ -563,6 +563,8 @@ struct Rtc {
     xram: [u8; RTC_XRAM_SIZE],
     /// When the RAM last changed, if the file has not caught up yet.
     dirty_since: Option<Instant>,
+    /// Where the clock starts with no reference saved (`[rtc_offset]`).
+    rtc_offset: crate::config::RtcOffset,
 }
 
 impl Rtc {
@@ -575,6 +577,7 @@ impl Rtc {
             ext: [0; 64],
             xram: [0; RTC_XRAM_SIZE],
             dirty_since: None,
+            rtc_offset: Default::default(),
         }
     }
 
@@ -614,19 +617,21 @@ impl Rtc {
             self.ext[i - 0x40] = v;
         }
         // The file catches up once the writes stop: see `Ioc3::flush_nvram`.
-        if i >= NVRAM_FIRST && self.file.is_some() {
+        // A write to the clock registers can set the clock, which is saved
+        // beside it. Register A's cannot, and the PROM flips its bank bit
+        // around every extended-RAM access.
+        if i != 0x0a && self.file.is_some() {
             self.dirty_since = Some(Instant::now());
         }
     }
 
     fn image(&self) -> Vec<u8> {
         let mut img = vec![0u8; NVRAM_IMAGE_LEN];
-        for (r, b) in img.iter_mut().enumerate().take(0x40) {
-            *b = self.dev.peek(r);
-        }
+        let (regs, century) = self.dev.image_registers();
+        img[..0x40].copy_from_slice(&regs);
         img[NVRAM_OFF_NV..NVRAM_OFF_NV + 64].copy_from_slice(&self.nv);
         let mut ext = self.ext;
-        ext[0x08] = self.dev.peek(0x48);
+        ext[0x08] = century;
         ext[0x0a] = self.dev.peek(0x4a);
         img[NVRAM_OFF_EXT..NVRAM_OFF_EXT + 64].copy_from_slice(&ext);
         img[NVRAM_OFF_XRAM..NVRAM_OFF_XRAM + RTC_XRAM_SIZE].copy_from_slice(&self.xram);
@@ -634,14 +639,13 @@ impl Rtc {
     }
 
     /// Load a 512-byte image. The clock registers (0x00..0x0d) are never
-    /// loaded; time starts from the host. Returns false for any other length.
+    /// loaded: the clock comes from its reference. Returns false for any
+    /// other length.
     fn load(&mut self, img: &[u8]) -> bool {
         if img.len() != NVRAM_IMAGE_LEN {
             return false;
         }
-        for (r, &b) in img.iter().enumerate().take(0x40).skip(NVRAM_FIRST) {
-            self.dev.poke(r, b);
-        }
+        self.dev.load_image_registers(img);
         self.nv.copy_from_slice(&img[NVRAM_OFF_NV..NVRAM_OFF_NV + 64]);
         self.ext.copy_from_slice(&img[NVRAM_OFF_EXT..NVRAM_OFF_EXT + 64]);
         self.xram.copy_from_slice(&img[NVRAM_OFF_XRAM..NVRAM_OFF_XRAM + RTC_XRAM_SIZE]);
@@ -650,15 +654,16 @@ impl Rtc {
         true
     }
 
-    /// The file and the image to put in it, if the RAM changed at least
-    /// `quiet` ago; the RAM then counts as saved.
-    fn take_dirty(&mut self, quiet: Duration) -> Option<(std::path::PathBuf, Vec<u8>)> {
+    /// The file, the image to put in it and the clock reference to put
+    /// beside it, if the RAM changed at least `quiet` ago; the RAM then
+    /// counts as saved.
+    fn take_dirty(&mut self, quiet: Duration) -> Option<NvramJob> {
         let since = self.dirty_since?;
         if since.elapsed() < quiet {
             return None;
         }
         self.dirty_since = None;
-        Some((self.file.clone()?, self.image()))
+        Some((self.file.clone()?, self.image(), self.dev.clock_reference()))
     }
 }
 
@@ -678,12 +683,17 @@ fn report_nvram_save(path: &std::path::Path, result: std::io::Result<()>) {
 }
 
 /// Replace the NVRAM file in one step (a temporary file, synced and
-/// renamed), so a kill mid-write leaves the previous image whole.
-fn save_nvram(path: &std::path::Path, image: &[u8]) -> std::io::Result<()> {
+/// renamed), so a kill mid-write leaves the previous image whole, then the
+/// clock reference beside it, if the guest has set the clock.
+fn save_nvram((path, image, clock): &NvramJob) -> std::io::Result<()> {
     let name = path
         .to_str()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NVRAM path is not UTF-8"))?;
-    crate::nv_storage::save(name, image)
+    crate::nv_storage::save(name, image)?;
+    match clock {
+        Some(c) => battery_clock::write(&battery_clock::companion(path), c),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2103,7 +2113,7 @@ const KINDS: usize = 6;
 type Deadlines = [Option<Instant>; KINDS];
 
 /// A rewrite of the NVRAM file waiting for the writer thread.
-type NvramJob = (std::path::PathBuf, Vec<u8>);
+type NvramJob = (std::path::PathBuf, Vec<u8>, Option<Vec<u8>>);
 
 /// Lock order: `gate`, then `line_order`, then `st`; `armed`, the line and
 /// Ethernet slots (`pin_line`, `superio_line`, `eth`, the port's DMA) and the
@@ -2333,7 +2343,7 @@ impl Shared {
                     None => return,
                 }
             };
-            report_nvram_save(&job.0, save_nvram(&job.0, &job.1));
+            report_nvram_save(&job.0, save_nvram(&job));
         }
     }
 
@@ -2385,8 +2395,8 @@ impl Shared {
     }
 
     fn flush_nvram(&self, quiet: Duration) {
-        let Some((path, image)) = self.st.lock().rtc.take_dirty(quiet) else { return };
-        report_nvram_save(&path, save_nvram(&path, &image));
+        let Some(job) = self.st.lock().rtc.take_dirty(quiet) else { return };
+        report_nvram_save(&job.0, save_nvram(&job));
     }
 
     /// One synchronous pass of what the receive threads and timers do:
@@ -2515,22 +2525,36 @@ impl Ioc3 {
     /// extended RAM) with a file. A 512-byte file (the layout the QEMU model
     /// uses) is loaded. The file is
     /// written as 512 bytes now and replaced whole once the guest's writes
-    /// to the RAM pause (see [`Ioc3::flush_nvram`]). The clock starts from
-    /// host time.
+    /// to the RAM pause (see [`Ioc3::flush_nvram`]). The clock runs from the
+    /// reference beside the file (`<file>.clock`, the layout QEMU's model
+    /// keeps) if there is one, else from where [`Ioc3::set_rtc_offset`] put
+    /// it, host time by default.
     pub fn set_nvram_file(&self, path: impl Into<std::path::PathBuf>) -> std::io::Result<()> {
         let path = path.into();
-        let image = {
+        let clock = battery_clock::companion(&path);
+        let job = {
             let mut st = self.sh.st.lock();
             if let Ok(img) = std::fs::read(&path) {
                 if !st.rtc.load(&img) {
                     log::warn!("ioc3: NVRAM file {} has {} bytes, not 512; ignored", path.display(), img.len());
                 }
             }
+            if let Some(guest) = battery_clock::read_or_warn(&clock).and_then(|r| st.rtc.dev.restore_clock(&r)) {
+                battery_clock::note_override(&st.rtc.rtc_offset, &clock, guest);
+            }
             st.rtc.file = Some(path.clone());
             st.rtc.dirty_since = None;
-            st.rtc.image()
+            (path, st.rtc.image(), st.rtc.dev.clock_reference())
         };
-        save_nvram(&path, &image)
+        save_nvram(&job)
+    }
+
+    /// Start the DS1685's clock where `[rtc_offset]` puts it, for as long
+    /// as the NVRAM file keeps no clock of the guest's.
+    pub fn set_rtc_offset(&self, cfg: &crate::config::RtcOffset) {
+        let mut st = self.sh.st.lock();
+        st.rtc.rtc_offset = *cfg;
+        st.rtc.dev.set_offset(battery_clock::seed(cfg));
     }
 
     /// Write the NVRAM file if the RAM changed at least `quiet` ago. The
