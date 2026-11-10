@@ -1997,7 +1997,8 @@ impl MipsCore {
     /// and silence the compare timer, so a stopped CPU (monitor `cpu stop`,
     /// debugger stepping) sees a frozen Count and never gets IP7 raised
     /// underneath it (use the monitor's `ip7` command to inject one
-    /// manually). Idempotent. No-op semantics under ci_clock (count follows
+    /// manually). A Compare that Count reached before the stop is still
+    /// raised here. Idempotent. No-op semantics under ci_clock (count follows
     /// `hot.cycles` there, which stops advancing on its own).
     pub fn on_cpu_stop(&mut self) {
         if self.count_paused {
@@ -2005,12 +2006,14 @@ impl MipsCore {
         }
         #[cfg(not(feature = "ci_clock"))]
         {
-            // Materialize directly, bypassing count_now's cycles memo —
-            // cycles may not have moved since the last read, but real time
-            // has.
-            let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
-            let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
-            self.cp0_count = (self.cp0_count as u32).wrapping_add(ticks as u32) as u64;
+            // Materialize past count_now's cycles memo (cycles may not have
+            // moved since the last read, but real time has), and deliver a
+            // Compare this advance steps over: the one-shot is disabled
+            // below and the restart arms the next match from the latched
+            // Count, so a deadline the timer thread had not fired yet would
+            // otherwise wait a whole Count wrap.
+            self.count_read_cycle = self.hot.cycles.wrapping_sub(1);
+            self.materialize_count(true);
         }
         self.count_read_cycle = self.hot.cycles;
         self.count_paused = true;
@@ -2058,8 +2061,12 @@ impl MipsCore {
             }
             8 => { /* BadVAddr is read-only */ }
             9 => {
-                // Re-anchor the virtual count at the written value and re-arm
-                // the compare timer against the moved count.
+                // Bring Count up to date first so a Compare it reached before
+                // this write is delivered: the re-arm below removes a one-shot
+                // the timer thread had not fired yet. Then re-anchor the
+                // virtual count at the written value and re-arm the compare
+                // timer against the moved count.
+                self.materialize_count(true);
                 self.cp0_count = value as u32 as u64;
                 if self.count_write_samples {
                     self.count_last_guest_read = value as u32;
@@ -2993,6 +3000,40 @@ mod ip7_ticket_tests {
             assert!(count >= 0x100 && count < 0x8000_0000, "Count should have wrapped: {count:#x}");
             assert!(ip7(&core), "compare {compare:#x} was crossed across the wrap");
         }
+    }
+
+    /// Stopping the CPU (a monitor command pauses it) latches Count. A
+    /// Compare deadline that passed but whose one-shot had not fired yet
+    /// (the timer thread runs late on a loaded host) is delivered there;
+    /// before, the restart armed the next match a whole Count wrap away,
+    /// and IRIX on the Tezro logged a lost scheduler clock after 12 s.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn a_deadline_passed_before_a_stop_is_delivered_not_lost_for_a_wrap() {
+        let mut core = octane_core();
+        core.write_cp0(9, 0x1000);
+        core.hot.cycles += 1;
+        core.write_cp0(11, 0x1010);
+        assert!(!ip7(&core), "the deadline is still ahead");
+        elapse_ticks(&mut core, 0x40);
+        core.on_cpu_stop();
+        core.on_cpu_start();
+        assert!(ip7(&core), "a deadline the stop stepped over must be pending");
+    }
+
+    /// A Count write throws away the time since Count was last brought up
+    /// to date and re-arms the one-shot. A deadline inside that time whose
+    /// one-shot had not fired yet is delivered by the write, not dropped.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn a_deadline_passed_before_a_count_write_is_delivered() {
+        let mut core = octane_core();
+        core.write_cp0(9, 0x1000);
+        core.hot.cycles += 1;
+        core.write_cp0(11, 0x1010);
+        elapse_ticks(&mut core, 0x40);
+        core.write_cp0(9, 0);
+        assert!(ip7(&core), "a deadline Count reached before the write must be pending");
     }
 
     /// IRIX on the Octane writes Count and then, a few instructions later,
