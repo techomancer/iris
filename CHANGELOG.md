@@ -112,6 +112,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The nightly boot test writes its checks (seeding NVRAM, the serial login, iris quitting cleanly) as `boot-test.xml`, and CI annotates the run with any that failed.
 - `iris-ci screen-wait GOLDEN` takes screenshots until the guest screen matches a PNG: a pixel differs when a channel is more than `--threshold` (32) away, and a match allows `--max-pixels` (128) of them. On a timeout it writes the last screenshot and a diff image with the differing pixels in red, and exits 5.
 - The nightly boot test also boots IRIX 5.3 on the graphics console and fails unless the login screen matches `scripts/boot-goldens/indy-irix53.png`. The job's limit is 40 minutes, enough for every wait in both boots to run out.
+- The graphics boot's checks are JUnit cases too; a passing screen match records how many pixels differed.
 
 ### PCI
 

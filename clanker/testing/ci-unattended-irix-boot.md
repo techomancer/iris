@@ -37,8 +37,9 @@ another hostname. To replace it, take `gfx-screen.png` from a failing run's
 
 ## Each check is a JUnit case
 
-The script records each check (seeding NVRAM, the login prompt, iris quitting
-when asked) with `check`, and its exit trap writes them all to
+The script records each check (seeding NVRAM, the serial login prompt, the
+graphics login screen with screen-wait's pixel count, iris quitting when asked
+after each boot) with `check`, and its exit trap writes them all to
 `boot-test/boot-test.xml` with `iris-ci junit`, also after a failure that stops
 the script early. The job hands that file to the JUnit reporter with
 `annotate_only`, which needs no `checks: write`, so a failed run is annotated
