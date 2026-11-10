@@ -662,6 +662,15 @@ pub trait CpuModel: MipsCache {
     /// an untaken conditional move's upper half undefined, so zeroing it on the
     /// R12000 and R14000 is a model choice. The other parts keep the old upper word.
     const SINGLE_CLEARS_UPPER: bool = Self::R10K_FAMILY;
+    /// A conversion to an integer format that cannot hold the result (NaN,
+    /// infinity, out of range) takes Unimplemented Operation instead of
+    /// raising Invalid with a saturated result. "R10000 took an unimplemented
+    /// exception whenever a conversion from an FP value would result in a
+    /// value that cannot be represented in the target format", and the
+    /// R12000 kept it except for a denormal source with FCSR.FS set, which
+    /// it flushes to zero (NEC VR10000 Series User's Manual U10278EJ4V0UM,
+    /// Appendix B.4, p. 350). The R14000 is inferred to match.
+    const CVT_UNREPRESENTABLE_UNIMPLEMENTED: bool = Self::R10K_FAMILY;
     /// An uncached store the system refuses completes instead of raising a
     /// Data Bus Error. The R10000 sends it as a write request, which gets no
     /// response, and Bus Error comes only from an error response to a read or

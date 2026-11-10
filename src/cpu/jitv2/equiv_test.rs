@@ -4657,6 +4657,28 @@ mod tests {
         }
     }
 
+    /// Compiled and interpreted CVT.W.S agree on the R10000 for a value a word
+    /// cannot hold: both take Unimplemented Operation and leave fd alone.
+    #[test]
+    fn jit_unrepresentable_cvt_w_s_matches_the_interpreter_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_isa::*;
+        const OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        let cvt_w_s = (OP_COP1 << 26) | (RS_S << 21) | (1 << 11) | (3 << 6) | FUNCT_FCVT_W;
+        for v in [2147483648.0f32, f32::INFINITY, f32::NAN] {
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = v.to_bits() as u64;
+                exec.core.fpr[3] = OLD;
+            };
+            let (interp, jit) = instr_both::<R10000ShadowCache>(cvt_w_s, setup);
+            assert_eq!(jit, interp, "R10000 cvt.w.s {v}");
+            assert_eq!(interp.fpr[3], OLD, "R10000 cvt.w.s {v} leaves fd");
+            assert_eq!(interp.fpu_fcsr & 0x0003_f000, 0x0002_0000, "R10000 cvt.w.s {v} Cause.E alone");
+        }
+    }
+
     #[test]
     fn lwl_lwr_combine_to_a_full_unaligned_word_load_matches_interpreter() {
         // The canonical compiler-generated idiom for an unaligned word

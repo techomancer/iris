@@ -1451,6 +1451,46 @@ mod tests {
         });
     }
 
+    /// A conversion whose result a word cannot hold takes Unimplemented
+    /// Operation on the R10000 family, leaving fd alone (NEC U10278EJ4V0UM
+    /// Appendix B.4, p. 350); the R4400 raises Invalid and writes the default.
+    #[test]
+    fn unrepresentable_conversions_are_unimplemented_on_the_r10000_family() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        const FCSR_CV: u32 = 0x0001_0000;
+        const OLD: u64 = 0x5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(traps: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
+            for input in [2147483648.0f32, f32::INFINITY, -1.0e20, f32::NAN] {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input.to_bits() as u64;
+                exec.core.fpr[2] = OLD;
+                let s = exec.exec(cvt);
+                if traps {
+                    assert!(s & EXEC_IS_EXCEPTION != 0, "{input} traps");
+                    assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{input} FPE");
+                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CE, "{input} Cause.E alone");
+                    assert_eq!(exec.core.fpr[2], OLD, "{input} fd untouched");
+                } else {
+                    assert_eq!(s, EXEC_COMPLETE, "{input}");
+                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CV, "{input} Cause.V");
+                }
+            }
+            // A representable value still converts.
+            exec.core.fpu_fcsr = 0;
+            exec.core.fpr[1] = 7.0f32.to_bits() as u64;
+            assert_eq!(exec.exec(cvt), EXEC_COMPLETE);
+            assert_eq!(exec.core.fpr[2] as u32, 7);
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            run::<R4400Cache>(false);
+        });
+    }
+
     /// MOVZ.S, MOVN.S, MOVT.S and MOVF.S write fd on the R10000 family even
     /// when the condition is false: the old low word stays and, with FR set,
     /// the upper word is zeroed, "even though the condition is false"

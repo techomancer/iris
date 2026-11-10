@@ -1885,7 +1885,7 @@ unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: CpuModel>(
     rm: u32,
 ) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
+    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
 }
 
 /// Single-implementation CVT.S.W/D.W/S.L/D.L — see `cvt_int_to_float_and_commit`'s
@@ -2300,8 +2300,10 @@ fn cvt_f64_to_int_by_value(x: f64, dst_bits: u32) -> (u64, bool, bool) {
 /// D-format (else S); destination is L (else W). `rm`: MIPS FCSR.RM
 /// encoding (0=nearest-even, 1=toward-zero, 2=toward+inf, 3=toward-inf) —
 /// callers pass a fixed mode for ROUND/TRUNC/CEIL/FLOOR or FCSR's live low
-/// 2 bits for plain CVT.W/CVT.L.
-fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
+/// 2 bits for plain CVT.W/CVT.L. `unrep_traps`: an unrepresentable result
+/// takes Unimplemented Operation rather than Invalid
+/// (`CpuModel::CVT_UNREPRESENTABLE_UNIMPLEMENTED`).
+fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, unrep_traps: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
     let dst_bits = if dst_i64 { 64 } else { 32 };
     // Inexact is judged against the source, not the rounded intermediate:
     // the by-value helpers only ever see an integral value, so their own
@@ -2321,6 +2323,10 @@ fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
     };
 
     core.fpu_fcsr &= !FCSR_CM;
+    if invalid && unrep_traps {
+        core.fpu_fcsr |= FCSR_CE;
+        return true;
+    }
     let write_result = |core: &mut MipsCore| {
         if dst_i64 {
             if fr1 { core.write_fpr_l(fd_reg, result) } else { write_fpr_l_fr0(core, fd_reg, result) }
@@ -8653,7 +8659,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn fpu_cvt_to_int(&mut self, fs_reg: u32, fd_reg: u32, src_f64: bool, dst_i64: bool, rm: u8) -> ExecStatus {
         let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
-        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, src_f64, dst_i64, rm) {
+        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, src_f64, dst_i64, rm) {
             let s = exec_exception(EXC_FPE);
             self.handle_exception(s)
         } else {
