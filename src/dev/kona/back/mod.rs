@@ -9,8 +9,8 @@
 //! - `store`: the pixel store and the plane layout inside a pixel's words.
 //! - `raster`: drawing into the store, the fill rule, and triangle set-up.
 //! - `tiles`: the tile scheduler (slot ring, tile queues, workers, budget).
-//! - `x`, `textport`: the X server's integer path and the PROM's console;
-//!   `context`: the state each rendering context keeps.
+//! - `x`, `textport`, `gl`: the X server's integer path, the PROM's console and
+//!   the GL client's commands; `context`: the state each rendering context keeps.
 //! - `display`: the tables the scan-out reads and the frame's composition.
 
 pub mod display;
@@ -18,6 +18,7 @@ pub mod raster;
 pub mod tiles;
 pub mod store;
 pub mod context;
+pub mod gl;
 pub mod textport;
 pub mod x;
 
@@ -34,8 +35,10 @@ use display::{ColourMap, Compositor};
 use store::layout::{BufferConfig, Layout, Refusal};
 use textport::Textport;
 use context::Contexts;
-use tiles::Tiles;
-use store::texture::TextureStore;
+use raster::setup::Shape;
+use raster::Rect;
+use tiles::{ClearJob, RasterJob, Tiles};
+use store::texture::{TextureStore, PAGE_WORDS};
 use store::PixelStore;
 use crate::devlog::LogModule;
 use std::io::{self, Write};
@@ -191,12 +194,19 @@ pub struct KonaBackend {
     dac_cursor_refused: u64,
     /// The display generator's channels, which the video commands set.
     channels: display::channels::Channels,
+    /// What the texture commands did.
+    tex_counts: gl::texture::TexCounts,
     /// Test hooks: a back end test double that may answer a job.
     #[cfg(test)]
     pub(super) hook: Option<TestHook>,
+    /// The GL half of the token layer: assembly scratch and counts, and where its vertices go.
+    gl: gl::GlPath,
+    /// What the GL path made in one job, until set-up takes it.
+    prims: raster::Prims,
     /// The tile scheduler, made when the first raster job comes so a board that
     /// never draws GL has no worker threads, and what set-up counted.
     tiles: Option<Tiles>,
+    raster: RasterCounts,
     /// Buffer-configuration commands that got a layout, and those refused by
     /// reason (indexed by `Refusal`).
     layouts: u64,
@@ -207,6 +217,9 @@ pub struct KonaBackend {
     malformed_logged: bool,
     /// The layout of the last buffer configuration that got one.
     last_layout: Option<Layout>,
+    /// A layout `buffer_config` made, for the job to hand the current context:
+    /// its level and whether the window is double buffered.
+    pending_config: Option<(i32, bool, Layout, u32)>,
 }
 
 /// Where on the return page a video Get's reply goes.
@@ -242,9 +255,13 @@ impl KonaBackend {
             dac_cursor_loads: 0,
             dac_cursor_refused: 0,
             channels: display::channels::Channels::new(cfg.rm_count),
+            tex_counts: Default::default(),
             #[cfg(test)]
             hook: None,
+            gl: gl::GlPath::new(cfg.managed),
+            prims: raster::Prims::default(),
             tiles: None,
+            raster: RasterCounts::default(),
             cfg,
             counts: [0; JobKind::ALL.len()],
             resets: 0,
@@ -256,6 +273,7 @@ impl KonaBackend {
             malformed: 0,
             malformed_logged: false,
             last_layout: None,
+            pending_config: None,
         }
     }
 
@@ -274,6 +292,7 @@ impl KonaBackend {
         match Layout::new(&config, 0, self.cfg.record_words()) {
             Ok(l) => {
                 self.layouts += 1;
+                self.pending_config = Some((config.level, config.double_buffer, l.clone(), config.samples));
                 self.last_layout = Some(l);
             }
             Err(why) => self.refused[why as usize] += 1,
@@ -368,6 +387,35 @@ impl KonaBackend {
             writeln!(w, "  {}", c.describe())?;
         }
         drop(tables);
+        let c = &self.tex_counts;
+        let t = self.store.texture();
+        writeln!(
+            w,
+            "textures          {} level loads ({} by DMA, {} refused, {} past memory), {} finishes, {} binds ({} refused), {} tokens not modelled; {} volume slice loads, {} volume binds; texture memory {} KiB held (peak {} KiB, ceiling {} KiB)",
+            c.loads, c.dma_loads, c.unsupported_load, c.full, c.finishes, c.binds, c.bind_refused, c.unmodelled, c.volume_loads, c.volume_binds, t.resident_pages() * (PAGE_WORDS / 256), t.peak_pages() * (PAGE_WORDS / 256), t.cap_pages() * (PAGE_WORDS / 256)
+        )?;
+        writeln!(w, "detail            {} binds, {} filter tables; mode-1 base binds: {} forced linear (no matching detail bind), {} with a detail image found, {} without", c.detail_binds, c.filter_tables, c.detail_mismatched, c.detail_resolved, c.detail_unresolved)?;
+        let g = &self.gl.counts;
+        let t = self.tiles.as_ref().map(|t| t.stats()).unwrap_or_default();
+        writeln!(
+            w,
+            "GL path           {} commands, {} vertices in {} primitives, {} draws handed over; {} clipped ({} away), {} culled, {} with no window position, {} errors",
+            g.commands, g.vertices, g.primitives, self.raster.draws, g.clipped, g.clipped_away, g.culled, g.no_window_position, g.errors
+        )?;
+        let r = &self.raster;
+        writeln!(
+            w,
+            "raster stage      {} triangles ({} with no area, {} with no sample, {} off the target), {} clears; {} points and {} lines handed over as triangles ({} of no length); {} workers, {}-pixel tiles; {} drains, {} with work queued{}",
+            r.triangles, r.no_area, r.no_sample, r.off_target, r.clears, g.points, g.lines, g.empty_lines, self.cfg.threads, self.cfg.tile, t.drains, t.busy_drains, if self.is_poisoned() { ", POISONED" } else { "" }
+        )?;
+        if let Some(t) = &self.tiles {
+            let s = t.stats();
+            writeln!(w, "  scheduler       {} jobs, {} tile runs, at most {} pixels in flight, producer waited {} times", s.submitted, s.tile_runs, s.peak_cost, s.waits)?;
+        }
+        if !g.unmodelled.is_empty() || !g.caps.is_empty() {
+            let list: Vec<String> = g.unmodelled.iter().map(|(s, n)| format!("{s:#x} x {n}")).chain(g.caps.iter().map(|(c, n)| format!("enable/disable of {c:#x} x {n}"))).collect();
+            writeln!(w, "  not taken       {}", list.join(", "))?;
+        }
         writeln!(w, "layouts           {} made", self.layouts)?;
         if self.malformed != 0 {
             writeln!(w, "  refused         {} x not {} words", self.malformed, BufferConfig::WORDS)?;
@@ -382,6 +430,37 @@ impl KonaBackend {
             writeln!(w, "  last            colour {:?} depth {:?} stencil {:?} multisample {:?} accumulation {:?} ({} words)", l.colour, l.depth, l.stencil, l.multisample, l.accumulation, l.words())?;
         }
         writeln!(w, "resets            {}", self.resets)
+    }
+
+    /// What the GL path counted: the census of vertices, assembly, the
+    /// texture-coordinate forms and what it did not take.
+    fn gl_census(&self, w: &mut dyn Write) -> io::Result<()> {
+        let g = &self.gl.counts;
+        writeln!(w, "commands          {}", g.commands)?;
+        writeln!(w, "begins by mode    {:?} (points, lines, loop, strip, triangles, tri strip, fan, quads, quad strip, polygon)", g.begins)?;
+        writeln!(w, "vertices          {} in {} primitives; {} outside a begin", g.vertices, g.primitives, g.stray)?;
+        writeln!(w, "vertex census     {} inside the window, {} outside it, {} outside the volume, {} behind the eye (counted only in tests)", g.inside, g.outside_window, g.outside_volume, g.behind)?;
+        writeln!(w, "texcoord forms    1f {}, 2f {}, 2s {}, 3f {}, 4f {}", g.texcoord[0], g.texcoord[1], g.texcoord[2], g.texcoord[3], g.texcoord[4])?;
+        writeln!(w, "clipping          {} clipped ({} away), {} culled, {} with no window position", g.clipped, g.clipped_away, g.culled, g.no_window_position)?;
+        writeln!(w, "handed over       {} draws, {} triangles", self.raster.draws, self.raster.triangles)?;
+        let r = &self.raster;
+        writeln!(w, "raster stage      {} triangles ({} no area, {} no sample, {} off the target), {} clears; {} points and {} lines", r.triangles, r.no_area, r.no_sample, r.off_target, r.clears, g.points, g.lines)?;
+        writeln!(w, "multisample       {} draws ({} with alpha to mask, {} with a sample mask), by the model's own rules", r.multisampled, r.alpha_to_mask, r.sample_mask)?;
+        let c = &self.tex_counts;
+        writeln!(w, "textures          {} level loads ({} by DMA, {} detail image loads, {} volume slice loads, {} refused, {} past memory), {} finishes, {} binds ({} of volumes, {} refused), {} tokens not modelled", c.loads, c.dma_loads, c.detail_loads, c.volume_loads, c.unsupported_load, c.full, c.finishes, c.binds, c.volume_binds, c.bind_refused, c.unmodelled)?;
+        let t = self.store.texture();
+        writeln!(w, "texture memory   {} KiB held in {} pages, peak {} KiB, ceiling {} KiB", t.resident_pages() * (PAGE_WORDS / 256), t.resident_pages(), t.peak_pages() * (PAGE_WORDS / 256), t.cap_pages() * (PAGE_WORDS / 256))?;
+        writeln!(w, "texel read-backs  {} ({} in a bracket); answered with zeros: {} for a format or type the packer does not know, {} for a level not loaded; {} too big; {} with nowhere to answer", c.reads, c.reads_bracketed, c.read_unsupported, c.read_missing, c.read_oversize, c.read_unposted)?;
+        if let Some(l) = &self.last_layout {
+            writeln!(w, "last layout       colour {:?} depth {:?} stencil {:?} multisample {:?} accumulation {:?}", l.colour, l.depth, l.stencil, l.multisample, l.accumulation)?;
+        }
+        for (s, n) in &g.unmodelled {
+            writeln!(w, "not taken         {s:#x} x {n}")?;
+        }
+        for (c, n) in &g.caps {
+            writeln!(w, "capability        {c:#x} (enable or disable) not read x {n}")?;
+        }
+        Ok(())
     }
 
     fn counters(&self, w: &mut dyn Write) -> io::Result<()> {
@@ -441,7 +520,17 @@ impl KonaBackend {
         self.dac_cursor_refused = 0;
         self.channels.reset();
         self.sync_blank();
+        self.tex_counts = Default::default();
+        #[cfg(test)]
+        let census = self.gl.census;
+        self.gl = gl::GlPath::new(self.cfg.managed);
+        #[cfg(test)]
+        {
+            self.gl.census = census;
+        }
+        self.raster = Default::default();
         self.last_layout = None;
+        self.pending_config = None;
     }
 
     pub fn stop(&mut self) {
@@ -487,7 +576,17 @@ impl KonaBackend {
             ["status"] => self.status(w)?,
             ["counters"] => self.counters(w)?,
             _ if self.pixels().read(args, w)? => {}
-            ["help"] | [] => writeln!(w, "kona: status|counters|hash|pix X Y|shot FILE.png")?,
+            ["gl"] => self.gl_census(w)?,
+            #[cfg(test)]
+            ["gl", "census"] => {
+                self.gl.census = true;
+                writeln!(w, "kona: GL census on: every vertex is also measured against the window")?;
+            }
+            ["gl", "clear"] => {
+                self.gl.counts = Default::default();
+                self.raster = Default::default();
+            }
+            ["help"] | [] => writeln!(w, "kona: status|counters|hash|pix X Y|shot FILE.png|gl [clear]")?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -511,7 +610,43 @@ fn drains_first(job: &Job<'_>) -> bool {
     }
 }
 
+/// What set-up counted, over the draws handed to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RasterCounts {
+    pub draws: u64,
+    pub triangles: u64,
+    pub no_area: u64,
+    /// Triangles with area that no pixel's sample falls inside.
+    pub no_sample: u64,
+    pub clears: u64,
+    /// Triangles and clears that had no pixel to write: no colour or depth
+    /// target, or nothing inside the clip rectangle and viewport.
+    pub off_target: u64,
+    /// Draws and clears in a multisampled window, and of those the draws with alpha-to-mask and with
+    /// the sample mask on: each is a model choice the table does not settle (see `raster::multisample`).
+    pub multisampled: u64,
+    pub alpha_to_mask: u64,
+    pub sample_mask: u64,
+}
+
+/// Slots in the job ring, and the budget in pixels of work in flight.
+const RING: usize = 1 << 10;
+const BUDGET: u64 = 1 << 17;
+/// The tile size used when `[graphics] tile` is not a power of two.
+const DEFAULT_TILE: u32 = 32;
+
 impl KonaBackend {
+    /// The tile scheduler, made now if it is not yet.
+    fn tiles(&mut self) -> &mut Tiles {
+        let (store, cfg, handle) = (&self.store, &self.cfg, &self.handle);
+        self.tiles.get_or_insert_with(|| {
+            // A tile size that is not a power of two is a configuration mistake: say so and use the default.
+            Tiles::new(store.clone(), cfg.tile, cfg.threads, RING, BUDGET, handle.clone()).unwrap_or_else(|why| {
+                crate::dlog!(crate::devlog::LogModule::Kona, "kona: tile size {} refused ({why:?}); using {DEFAULT_TILE}", cfg.tile);
+                Tiles::new(store.clone(), DEFAULT_TILE, cfg.threads, RING, BUDGET, handle.clone()).expect("the default tile size is a power of two")
+            })
+        })
+    }
 
     /// Wait until every raster job has run.
     fn drain(&mut self) {
@@ -525,11 +660,195 @@ impl KonaBackend {
         self.tiles.as_ref().is_some_and(|t| t.is_poisoned())
     }
 
+    /// Allocate the arrays a job writes, before a worker can see it.
+    fn arrays(&self, ds: &raster::DrawState) {
+        ds.colour[..ds.colours as usize].iter().for_each(|&w| self.store.ensure(w as usize));
+        if ds.depth_bits != 0 {
+            self.store.ensure(ds.depth_word as usize);
+        }
+        if ds.stencil_bits != 0 {
+            self.store.ensure(ds.stencil_word as usize);
+        }
+        if ds.ownership.is_some() {
+            self.store.ensure(store::DID_PLANE);
+        }
+        if let Some(ms) = &ds.samples {
+            [ms.colour, ms.depth, ms.stencil].iter().for_each(|&(first, n)| (first..first + n).for_each(|w| self.store.ensure(w as usize)));
+        }
+    }
+
+    /// Set up what the GL path made in `self.prims` and submit it, then empty it.
+    fn flush(&mut self) {
+        let mut prims = std::mem::take(&mut self.prims);
+        if let Some(ds) = prims.state.filter(|_| !prims.tris.is_empty() || !prims.lines.is_empty() || !prims.aa.is_empty() || !prims.discs.is_empty() || !prims.clears.is_empty()) {
+            self.raster.draws += !(prims.tris.is_empty() && prims.lines.is_empty() && prims.aa.is_empty() && prims.discs.is_empty()) as u64;
+            self.raster.triangles += (prims.tris.len() + prims.lines.len() + prims.aa.iter().map(|p| p.n as usize - 2).sum::<usize>() + 2 * prims.discs.len()) as u64;
+            self.raster.clears += prims.clears.len() as u64;
+            if let Some(ms) = &ds.samples {
+                self.raster.multisampled += 1;
+                self.raster.alpha_to_mask += ms.alpha_to_mask as u64;
+                self.raster.sample_mask += (ms.cover != !0) as u64;
+            }
+            let drawable = !ds.clip.is_empty() && (ds.colours != 0 || (ds.depth_test && ds.depth_bits != 0) || (ds.stencil.enabled && ds.stencil_bits != 0));
+            let state = self.tiles().state(ds);
+            if drawable {
+                self.arrays(&ds);
+            }
+            // A poisoned scheduler refuses a job; it stays poisoned and the board is dead,
+            // so a refusal carries nothing more.
+            let run = |b: &mut Self, t: &[raster::WVertex; 3], line: bool, shape: Shape<'_>| {
+                if !drawable {
+                    b.raster.off_target += 1;
+                    return;
+                }
+                match raster::setup::shaped(t, &ds, state, shape) {
+                    Ok(mut job) => {
+                        job.line = line;
+                        let _ = b.tiles().submit(RasterJob::Tri(job));
+                    }
+                    Err(raster::setup::Skip::NoArea) => b.raster.no_area += 1,
+                    Err(raster::setup::Skip::NoSample) => b.raster.no_sample += 1,
+                    Err(raster::setup::Skip::Outside) => b.raster.off_target += 1,
+                }
+            };
+            for t in &prims.tris {
+                run(self, t, false, Shape::Plain);
+            }
+            for t in &prims.lines {
+                run(self, t, true, Shape::Plain);
+            }
+            // A smoothed polygon or line: its fan, each triangle weighing its pixels by the whole outline.
+            for poly in &prims.aa {
+                let v = &prims.aa_verts[poly.start as usize..(poly.start + poly.n) as usize];
+                let Some(outline) = raster::setup::Outline::new(v, &ds) else {
+                    self.raster.no_area += 1;
+                    continue;
+                };
+                for i in 1..v.len() - 1 {
+                    // The edges from the fan's apex and back to it are inner, but at its two ends.
+                    let inner = [i != 1, false, i != v.len() - 2];
+                    run(self, &[v[0], v[i], v[i + 1]], poly.line, Shape::Smooth { inner, outline: &outline });
+                }
+            }
+            for d in &prims.discs {
+                let shape = Shape::Disc { x: d.x, y: d.y, r: d.r };
+                let q = d.quad;
+                run(self, &[q[0], q[1], q[2]], false, shape);
+                run(self, &[q[0], q[2], q[3]], false, shape);
+            }
+            for c in &prims.clears {
+                let mut req = *c;
+                req.colour = req.colour.filter(|_| ds.colours != 0);
+                req.depth = req.depth.filter(|_| ds.depth_bits != 0);
+                req.stencil = req.stencil.filter(|_| ds.stencil_bits != 0);
+                if req.rect.is_empty() || (req.colour.is_none() && req.depth.is_none() && req.stencil.is_none()) {
+                    self.raster.off_target += 1;
+                    continue;
+                }
+                self.arrays(&ds);
+                let _ = self.tiles().submit(RasterJob::Clear(ClearJob { req, state }));
+            }
+        }
+        prims.clear();
+        self.prims = prims;
+    }
+
+    /// A texel draw's header: the image words that follow in the stream, sized from the
+    /// header and the unpack state, or the DMA packet that will carry them.
+    fn texel_draw(&mut self, port: &BackPort<'_>, args: &[u32]) -> Reply {
+        let tex = &mut self.contexts.select(port.context()).tex;
+        let Some(h) = gl::texture::Header::parse(args) else { return Reply::Done };
+        let Some(n) = h.image_words(&tex.unpack) else {
+            self.tex_counts.unsupported_load += 1;
+            return Reply::Done;
+        };
+        if h.dma {
+            tex.pending = <[u32; 20]>::try_from(args).ok();
+            return Reply::Done;
+        }
+        if n == 0 {
+            self.drain();
+            let tex = &mut self.contexts.select(port.context()).tex;
+            tex.load(self.store.texture(), args, &[], false, &mut self.tex_counts);
+            return Reply::Done;
+        }
+        Reply::Data(n)
+    }
+
+    /// A texel draw's image words, in the stream, as bytes in the client's order.
+    fn texel_words(&mut self, port: &BackPort<'_>, args: &[u32], words: &[u32]) {
+        self.drain();
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        self.contexts.select(port.context()).tex.load(self.store.texture(), args, &bytes, false, &mut self.tex_counts);
+    }
+
+    /// The texture tokens that are not an image: the load finish, binds and their records,
+    /// the pixel-store parameters, and the ones nothing sends.
+    fn texture_command(&mut self, port: &BackPort<'_>, selector: u32, args: &[u32]) {
+        let c = self.contexts.select(port.context());
+        match selector {
+            TEXTURE_LOAD_BY_IDENTIFIER => self.tex_counts.finishes += 1,
+            SET_TEXEL_STORE_PARAMETER | SET_PIXEL_STORE_PARAMETER_INTEGER_FORM => {
+                if let [name, value] = *args {
+                    c.tex.unpack.set(name, value);
+                }
+            }
+            // The linear form (0x106) is the same five words; the record follows it as it does the other.
+            BIND_TEXTURE_CURRENT_FORM | BIND_LINEAR_TEXTURE => c.tex.short_bind(args),
+            BIND_2D_MIP_MAPPED_TEXTURE => {
+                self.tex_counts.binds += 1;
+                match c.tex.record(self.store.texture(), args, Default::default(), &mut self.tex_counts) {
+                    Some(d) => c.gl.set_texture(Some(d)),
+                    None => {
+                        self.tex_counts.bind_refused += 1;
+                        c.gl.set_texture(None);
+                    }
+                }
+            }
+            BIND_DETAIL_TEXTURE => {
+                self.tex_counts.detail_binds += 1;
+                if !c.tex.bind_detail(args) {
+                    self.tex_counts.unmodelled += 1;
+                }
+            }
+            BIND_3D_MIP_MAPPED_TEXTURE | BIND_3D_TEXTURE => {
+                self.tex_counts.binds += 1;
+                self.tex_counts.volume_binds += 1;
+                match c.tex.volume_record(self.store.texture(), args, selector == BIND_3D_MIP_MAPPED_TEXTURE, Default::default()) {
+                    Some(d) => c.gl.set_texture(Some(d)),
+                    None => {
+                        self.tex_counts.bind_refused += 1;
+                        c.gl.set_texture(None);
+                    }
+                }
+            }
+            // Naming the bound texture by number, and the cache entry's bind and free, change
+            // nothing the model keeps: the record's table found the image.
+            BIND_TEXTURE_BY_IDENTIFIER | BIND_ARM_TEXTURE_CACHE_ENTRY | FREE_ARM_TEXTURE_CACHE_ENTRY => {}
+            // Detail, the load set-up and the old-style bind: no
+            // recording draws from them (or no software sends them); counted.
+            _ => self.tex_counts.unmodelled += 1,
+        }
+    }
+
     /// A DMA packet: the rows of a pixel write that announced them, read a
     /// line at a time into words (big-endian, as the programmed-I/O path
     /// sends them). A packet with no write waiting is unclaimed. A read that
     /// fails on the bus faults the packet and draws nothing.
     fn dma_rows(&mut self, port: &mut BackPort<'_>, io: u64, physical: bool, lines: u32, per_line: u32, pitch: u64) -> Reply {
+        if let Some(args) = self.contexts.select(port.context()).tex.pending.take() {
+            // A texel draw's image: its rows, `per_line` bytes each, exactly.
+            let mut bytes = vec![0u8; (lines as u64 * per_line as u64) as usize];
+            let ok = (0..lines as u64).all(|l| port.dma_read(io.wrapping_add(l.wrapping_mul(pitch)), physical, &mut bytes[(l * per_line as u64) as usize..][..per_line as usize]));
+            if !ok {
+                port.dma_fault();
+                return Reply::Done;
+            }
+            self.drain();
+            self.tex_counts.dma_loads += 1;
+            self.contexts.select(port.context()).tex.load(self.store.texture(), &args, &bytes, true, &mut self.tex_counts);
+            return Reply::Done;
+        }
         let x = &mut self.contexts.select(port.context()).x;
         let Some(owed) = x.dma_write_words() else {
             x.pixel_unexpected();
@@ -583,7 +902,32 @@ impl KonaBackend {
                 }
                 port.set_managed_size(self.cfg.managed.0, self.cfg.managed.1)
             }
-            Job::Command { grammar: Grammar::Gl, selector: CONFIGURE_FRAME_BUFFER_LAYOUT, args, .. } => self.buffer_config(args),
+            Job::Command { grammar: Grammar::Gl, selector: CONFIGURE_FRAME_BUFFER_LAYOUT, args, .. } => {
+                self.buffer_config(args);
+                if let Some((level, double, layout, samples)) = self.pending_config.take() {
+                    self.contexts.select(port.context()).gl.configure(level, double, layout, samples);
+                }
+            }
+            Job::Command { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, .. } => return self.texel_draw(port, args),
+            Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, words } => self.texel_words(port, args, words),
+            // The texture loads read the pixel-store parameters the client sends.
+            Job::Command { grammar: Grammar::Gl, selector: SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, args, .. } => self.texture_command(port, SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, args),
+            Job::Data { grammar: Grammar::Gl, selector: LOAD_ONE_ENTRY_OF_ARM_TEXTURE_TABLE, args: &[slot], words } => {
+                self.tex_counts.filter_tables += self.contexts.select(port.context()).tex.filter_table(slot, words) as u64;
+            }
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::texture::is_texture(selector) => self.texture_command(port, selector, args),
+            // The polygon stipple's 32 rows follow its command as a run the back end sizes.
+            Job::Command { grammar: Grammar::Gl, selector: LOAD_POLYGON_STIPPLE_PATTERN, .. } => return Reply::Data(32),
+            Job::Data { grammar: Grammar::Gl, selector: LOAD_POLYGON_STIPPLE_PATTERN, words, .. } => {
+                if let Ok(rows) = <[u32; 32]>::try_from(words) {
+                    self.contexts.select(port.context()).gl.set_polygon_stipple(rows);
+                }
+            }
+            Job::Command { grammar: Grammar::Gl, selector, args, packed, .. } if gl::is_geometry(selector) => {
+                let c = self.contexts.select(port.context());
+                self.gl.command(&mut c.gl, selector, args, packed, &mut self.prims);
+                self.flush();
+            }
             Job::Command { grammar: Grammar::Textport, selector, args, .. } => {
                 let (tiles, store) = (&mut self.tiles, &self.store);
                 self.textport.command(|| raster::surface(tiles, store, textport::COLOUR_WORD), selector, args);
@@ -591,6 +935,21 @@ impl KonaBackend {
             Job::Command { grammar: Grammar::Kernel, selector, args, .. } => {
                 self.regions.note(selector, args);
                 match (selector, args) {
+                    // The kernel placing the current context's window: words 0 and 1 are the
+                    // origin, 4 to 7 the clip rectangle (origin and size), each a halfword;
+                    // words 2 and 3 hold the window's own size, which no draw reads.
+                    (WINDOW_CLIP_SETUP, a) if a.len() == 11 => {
+                        let shown = self.tables.lock().bank(a[9]);
+                        let (signed, size) = (|w: u32| w as u16 as i16 as i32, |w: u32| w as u16 as i32);
+                        let clip = Rect { x0: signed(a[4]), y0: signed(a[5]), x1: signed(a[4]) + size(a[6]), y1: signed(a[5]) + size(a[7]) };
+                        {
+                            if !raster::ops::Ownership::encode(a[9] as i32).1 {
+                                self.gl.counts.odd_window_ids += 1;
+                            }
+                            self.contexts.select(port.context()).gl.place([signed(a[0]), signed(a[1])], clip, a[9], shown, a[10] != 0)
+                        }
+                    }
+                    (WINDOW_READ_CLIP_SET_UP, a) if a.len() == 3 => self.contexts.select(port.context()).gl.move_to(a[0] as u16 as i16 as i32, a[1] as u16 as i16 as i32),
                     // A swap: the window's id, the display id and the mode. The low bit of
                     // the display's mode byte is the back buffer being shown (the X server's
                     // case split, established); that this command's third word is that same
@@ -598,6 +957,7 @@ impl KonaBackend {
                     // alternately.
                     (DISPLAY_MODE_BYTE, &[window, id, mode]) if window != 0 => {
                         self.tables.lock().load_bank(id, (mode & 1) as u8);
+                        self.contexts.swapped(id, (mode & 1) as u8);
                     }
                     (LOAD_ONE_ENTRY_OF_DISPLAY_ID_TABLE, &[id, word]) => self.tables.lock().load_did(id, word),
                     (DISPLAY_MODE_BYTE, &[0, id, mode]) => self.tables.lock().load_mode(id, mode),
@@ -675,7 +1035,17 @@ impl KonaBackend {
                     port.post_return(VIDEO_REPLY_OFFSET, &reply);
                 }
             }
-            Job::Context(e) => self.contexts.event(e),
+            Job::Context(e) => {
+                // A slot activated afresh starts from power-on: its levels give their texture memory back first,
+                // after the workers that may be reading it are done.
+                if let super::job::ContextEvent::Activated { slot, fresh: true } = e {
+                    if slot < CONTEXT_SLOTS && self.contexts.select(Some(slot)).tex.holds() {
+                        self.drain();
+                        self.contexts.select(Some(slot)).tex.release(self.store.texture());
+                    }
+                }
+                self.contexts.event(e)
+            }
             Job::Bitmap { header, payload } => {
                 let surface = raster::surface(&mut self.tiles, &self.store, textport::COLOUR_WORD);
                 self.textport.bitmap(&surface, header, payload)
@@ -1009,6 +1379,64 @@ mod tests {
 
     const INDEX_GC: [u32; 13] = [0x5a000, 0x1ffe, 0xa5000, 0x1ffe, 0xf00fff, 0, 0x180c, 0x40001, 1, 6, 5, 1, 1];
 
+    /// A tile worker that panics (here: a job that names a plane set-up never
+    /// allocated) poisons the scheduler, and the board reports itself dead.
+    #[test]
+    fn a_poisoned_tile_scheduler_makes_the_board_dead() {
+        let kona = Kona::new(test_cfg().with_pool(2, 32), TestHost::new(), TestHost::new(), crate::dev::kona::tests::test_status(), None).unwrap();
+        assert_eq!(kona.failure(), None);
+        kona.with_backend(|b| {
+            let full = Rect { x0: 0, y0: 0, x1: 64, y1: 64 };
+            let state = b.tiles().state(raster::DrawState { clip: full, colour: [77, 0], colours: 1, ..Default::default() });
+            let req = raster::ClearReq { rect: full, colour: Some(1), ..Default::default() };
+            let _ = b.tiles().submit(RasterJob::Clear(ClearJob { req, state }));
+            b.drain();
+        });
+        let why = kona.failure().expect("poisoned");
+        assert!(why.contains("tile worker"), "{why}");
+    }
+
+    /// The placement's word 9 and the enable in word 10 become the draw state's
+    /// ownership test: off with the enable clear; encoded as the board does when set;
+    /// a word in none of the ranges is encoded as the ordinary pair and counted.
+    #[test]
+    fn a_placement_sets_the_ownership_test_from_words_nine_and_ten() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        let screen = Rect { x0: 0, y0: 0, x1: 1280, y1: 1024 };
+        let own = |b: &mut KonaBackend| b.contexts.select(Some(0)).gl.draw_state(screen).ownership;
+        r.x(&mut b, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 0xe, 0]);
+        assert_eq!(own(&mut b), None, "the enable is clear");
+        r.x(&mut b, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 0xe, 1]);
+        assert_eq!(own(&mut b).map(|o| o.register()), Some(0x7e01d));
+        r.x(&mut b, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 0xffff_ffff, 1]);
+        assert_eq!(own(&mut b), Some(raster::ops::Ownership { reference: 0x3f, mask: 0x3f }), "all ones is the ordinary pair 0x3f, 0x3f");
+        assert_eq!(b.gl.counts.odd_window_ids, 0);
+        r.x(&mut b, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 0x77, 1]);
+        assert_eq!(b.gl.counts.odd_window_ids, 1);
+    }
+
+    /// The window placement keeps the window's origin and its clip rectangle
+    /// apart: the recording's tenth placement has a clip of the whole screen
+    /// and a window origin of 314, and a later move carries both.
+    #[test]
+    fn a_placement_keeps_the_window_origin_and_the_clip_rectangle_apart() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        r.x(&mut b, WINDOW_CLIP_SETUP, &[314, 0, 299, 1, 0, 0, 1280, 1024, 298, 0, 0]);
+        let ds = b.contexts.select(Some(0)).gl.draw_state(Rect { x0: 0, y0: 0, x1: 1280, y1: 1024 });
+        assert_eq!((ds.origin, ds.clip), ([314, 0], Rect { x0: 0, y0: 0, x1: 1280, y1: 1024 }));
+        // The placement before it in the recording has clip equal to window.
+        r.x(&mut b, WINDOW_CLIP_SETUP, &[100, 50, 200, 100, 100, 50, 200, 100, 0, 0, 0]);
+        let ds = b.contexts.select(Some(0)).gl.draw_state(Rect { x0: 0, y0: 0, x1: 1280, y1: 1024 });
+        assert_eq!((ds.origin, ds.clip), ([100, 50], Rect { x0: 100, y0: 50, x1: 300, y1: 150 }));
+        // Words 0 and 1 are halfwords: 0xfff0 is -16, a window partly off the left of the screen.
+        r.x(&mut b, WINDOW_CLIP_SETUP, &[0xfff0, 0, 64, 64, 0xfff0, 0, 64, 64, 0, 0, 0]);
+        let ds = b.contexts.select(Some(0)).gl.draw_state(Rect { x0: 0, y0: 0, x1: 1280, y1: 1024 });
+        assert_eq!((ds.origin, ds.clip), ([-16, 0], Rect { x0: 0, y0: 0, x1: 48, y1: 64 }));
+        r.x(&mut b, WINDOW_READ_CLIP_SET_UP, &[16, 10, 0]);
+        let ds = b.contexts.select(Some(0)).gl.draw_state(Rect { x0: 0, y0: 0, x1: 1280, y1: 1024 });
+        assert_eq!((ds.origin, ds.clip), ([16, 10], Rect { x0: 16, y0: 10, x1: 80, y1: 74 }), "the clip moves with the origin");
+    }
+
     /// An image whose rows follow the command as a data run draws once the
     /// run is in, the store's top row first.
     #[test]
@@ -1173,6 +1601,473 @@ mod tests {
         r.core.return_page = None;
         r.send(&mut b, Job::Video { command: VIDEO_GET_BOARD_CONFIG, data: &[0] });
         assert_eq!(r.ram.bytes(RETURN_PAGE, 36), [0; 36]);
+    }
+
+    /// A 64 x 64 window at the screen's corner, double buffered, with a viewport that
+    /// maps clip coordinates -1 to 1 onto it; draws go to colour word 2. The lit pixels
+    /// of that word are read back with `lit_pixels`.
+    fn gl_window() -> KonaBackend {
+        let mut b = KonaBackend::new(KonaConfig::default());
+        command(&mut b, Grammar::Kernel, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 13, 0]);
+        command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 0, 0]);
+        command(&mut b, Grammar::Gl, SET_VIEWPORT, &[0, 0, 64, 64]);
+        command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_4_COMPONENTS_SINGLE_FLOAT, &[1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()]);
+        b
+    }
+
+    /// Window coordinate to clip coordinate for `gl_window`'s 64-pixel viewport.
+    fn ndc(w: f32) -> u32 {
+        (w / 32.0 - 1.0).to_bits()
+    }
+
+    fn vertices(b: &mut KonaBackend, mode: u32, points: &[(f32, f32)]) {
+        command(b, Grammar::Gl, mode, &[0]);
+        for &(x, y) in points {
+            command(b, Grammar::Gl, SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT, &[ndc(x), ndc(y), 0.0f32.to_bits()]);
+        }
+        command(b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+    }
+
+    fn lit_pixels(b: &mut KonaBackend) -> Vec<(u32, u32)> {
+        command(b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        (0..64).flat_map(|y| (0..64u32).map(move |x| (x, y))).filter(|&(x, y)| b.store.read(x, y, 2) != 0).collect()
+    }
+
+    /// A texture through the board: a 2 x 2 image loaded inline, bound by its short bind and
+    /// record, and drawn with the replace environment, shows its texels at nearest and
+    /// blends them at linear; with the texture off the draw is the vertex colour.
+    #[test]
+    fn a_loaded_and_bound_texture_shows_on_a_triangle() {
+        use crate::dev::kona::defs::gl::TEXTURE_2D;
+        let mut b = gl_window();
+        let mut hdr = [0u32; 20];
+        hdr[..4].copy_from_slice(&[0x0de1, 2, 2, 5]);
+        hdr[4] = 1;
+        hdr[9] = 0x30;
+        hdr[13] = 1;
+        hdr[14] = 1;
+        hdr[16] = 0x11;
+        hdr[17] = 0x2200;
+        hdr[18] = 0x1000;
+        let image = [0xff00_00ffu32, 0x00ff_00ff, 0x0000_ffff, 0xffff_ffff];
+        assert_eq!(command(&mut b, Grammar::Gl, DRAW_TEXELS_INTO_TEXTURE_MEMORY, &hdr), Reply::Data(4));
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &hdr, words: &image });
+        command(&mut b, Grammar::Gl, TEXTURE_LOAD_BY_IDENTIFIER, &[0]);
+        let mut rec = [0u32; 22];
+        rec[0] = 0x44;
+        rec[1] = 0x1010;
+        rec[6] = 0x1000;
+        rec[7] = 0xffff_ffff;
+        let bind = |b: &mut KonaBackend, mag: u32| {
+            command(b, Grammar::Gl, BIND_TEXTURE_CURRENT_FORM, &[0xffff_ffff, 2 << 12, mag << 5, 0x0011, 1]);
+            command(b, Grammar::Gl, BIND_2D_MIP_MAPPED_TEXTURE, &rec);
+        };
+        bind(&mut b, 0);
+        command(&mut b, Grammar::Gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2200, (0x1e01 as f32).to_bits(), 0, 0, 0]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[TEXTURE_2D]);
+        let quad = |b: &mut KonaBackend| {
+            command(b, Grammar::Gl, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[0]);
+            for (x, y, s, t) in [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (0.0, 64.0, 0.0, 1.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)] {
+                command(b, Grammar::Gl, SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_SINGLE_FLOAT, &[(s as f32).to_bits(), (t as f32).to_bits()]);
+                command(b, Grammar::Gl, SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT, &[ndc(x), ndc(y), 0.0f32.to_bits()]);
+            }
+            command(b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+        };
+        quad(&mut b);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        let at = |b: &KonaBackend, x, y| b.store.read(x, y, 2);
+        assert_eq!([at(&b, 10, 10), at(&b, 50, 10), at(&b, 10, 50), at(&b, 50, 50)], [0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff], "nearest: each quadrant its texel");
+        // Linear magnification blends the four at the middle.
+        bind(&mut b, 1);
+        quad(&mut b);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        let mid = at(&b, 32, 32);
+        assert!([mid >> 16 & 0xff, mid >> 8 & 0xff, mid & 0xff].iter().all(|&c| (100..160).contains(&c)), "{mid:#x}: red, green, blue and white average to grey");
+        // Off, the draw is the vertex colour (white).
+        command(&mut b, Grammar::Gl, DISABLE_CAPABILITY, &[TEXTURE_2D]);
+        quad(&mut b);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        assert_eq!(at(&b, 10, 10), 0xffff_ffff);
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("1 level loads") && text.contains("2 binds (0 refused)"), "{text}");
+    }
+
+    /// A volume through the board: two 2 x 2 slices loaded one command each, bound by the short bind and the
+    /// single-level volume record, and drawn with the replace environment under the 3D enable. The texture
+    /// coordinate's r picks the slice; with the 3D enable off, the draw is the vertex colour.
+    #[test]
+    fn a_loaded_and_bound_volume_shows_the_slice_r_names() {
+        use crate::dev::kona::defs::gl::TEXTURE_3D;
+        let mut b = gl_window();
+        for (z, texel) in [(0u32, 0xff00_00ffu32), (1, 0x0000_ffff)] {
+            let mut hdr = [0u32; 20];
+            hdr[..4].copy_from_slice(&[0x806f, 2, 2, 5]);
+            hdr[4] = 1;
+            hdr[9] = 0x30;
+            hdr[13] = 1;
+            hdr[14] = 1;
+            hdr[15] = z;
+            hdr[16] = 0x111;
+            hdr[17] = 0x2200;
+            hdr[18] = 0x1000;
+            assert_eq!(command(&mut b, Grammar::Gl, DRAW_TEXELS_INTO_TEXTURE_MEMORY, &hdr), Reply::Data(4));
+            send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &hdr, words: &[texel; 4] });
+        }
+        command(&mut b, Grammar::Gl, TEXTURE_LOAD_BY_IDENTIFIER, &[0]);
+        command(&mut b, Grammar::Gl, BIND_TEXTURE_CURRENT_FORM, &[0xffff_ffff, 3 << 28 | 2 << 12, 0, 0x0111, 1]);
+        command(&mut b, Grammar::Gl, BIND_3D_TEXTURE, &[0x44, 0x111, 0x1000, 0]);
+        command(&mut b, Grammar::Gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2200, (0x1e01 as f32).to_bits(), 0, 0, 0]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[TEXTURE_3D]);
+        let quad = |b: &mut KonaBackend, r: f32, x0: f32| {
+            command(b, Grammar::Gl, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[0]);
+            for (x, y) in [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0), (32.0, 0.0), (32.0, 32.0), (0.0, 32.0)] {
+                command(b, Grammar::Gl, SET_CURRENT_TEXTURE_COORDINATE_3_COMPONENTS_SINGLE_FLOAT, &[(x / 32.0f32).to_bits(), (y / 32.0f32).to_bits(), r.to_bits()]);
+                command(b, Grammar::Gl, SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT, &[ndc(x + x0), ndc(y), 0.0f32.to_bits()]);
+            }
+            command(b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+        };
+        quad(&mut b, 0.25, 0.0);
+        quad(&mut b, 0.75, 32.0);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        let at = |b: &KonaBackend, x, y| b.store.read(x, y, 2);
+        assert_eq!([at(&b, 8, 8), at(&b, 24, 24), at(&b, 40, 8), at(&b, 56, 24)], [0xffff_0000, 0xffff_0000, 0xff00_00ff, 0xff00_00ff], "slice 0 where r is a quarter, slice 1 at three quarters");
+        command(&mut b, Grammar::Gl, DISABLE_CAPABILITY, &[TEXTURE_3D]);
+        quad(&mut b, 0.25, 0.0);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        assert_eq!(at(&b, 8, 8), 0xffff_ffff);
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("1 binds (0 refused)") && text.contains("2 volume slice loads, 1 volume binds"), "{text}");
+    }
+
+    /// A detail bind (token 0x17d) and a filter-coefficient table (token 0x17e and its 33 words) are kept and counted,
+    /// and neither refuses a bind nor draws a flat colour: the base texture stays what is bound.
+    #[test]
+    fn a_detail_bind_and_a_filter_table_are_kept_and_change_nothing_drawn() {
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, BIND_DETAIL_TEXTURE, &[0xffff_ffff, 3, 2, 0x2, 0x400, 0x400]);
+        command(&mut b, Grammar::Gl, LOAD_ONE_ENTRY_OF_ARM_TEXTURE_TABLE, &[1]);
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: LOAD_ONE_ENTRY_OF_ARM_TEXTURE_TABLE, args: &[1], words: &[0; 33] });
+        assert_eq!((b.tex_counts.detail_binds, b.tex_counts.filter_tables), (1, 1));
+        assert_eq!((b.tex_counts.unmodelled, b.tex_counts.bind_refused), (0, 0));
+        assert!(run(&mut b, &["status"]).1.contains("detail            1 binds, 1 filter tables"));
+    }
+
+    /// A perspective-divided textured quad samples with the divided coordinate. The right edge is twice as far (w = 2) as
+    /// the left, so the screen's middle column is a third of the way across the texture, not half: it shows the first texel
+    /// of a 2 x 2 image at nearest, where the affine coordinate would show the second.
+    #[test]
+    fn a_perspective_textured_quad_samples_with_the_divided_coordinate() {
+        use crate::dev::kona::defs::gl::TEXTURE_2D;
+        let mut b = gl_window();
+        let mut hdr = [0u32; 20];
+        hdr[..4].copy_from_slice(&[0x0de1, 2, 2, 5]);
+        hdr[4] = 1;
+        hdr[9] = 0x30;
+        hdr[13] = 1;
+        hdr[14] = 1;
+        hdr[16] = 0x11;
+        hdr[17] = 0x2200;
+        hdr[18] = 0x1000;
+        let image = [0xff00_00ffu32, 0x00ff_00ff, 0x0000_ffff, 0xffff_ffff];
+        command(&mut b, Grammar::Gl, DRAW_TEXELS_INTO_TEXTURE_MEMORY, &hdr);
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &hdr, words: &image });
+        command(&mut b, Grammar::Gl, TEXTURE_LOAD_BY_IDENTIFIER, &[0]);
+        let mut rec = [0u32; 22];
+        rec[0] = 0x44;
+        rec[1] = 0x1010;
+        rec[6] = 0x1000;
+        rec[7] = 0xffff_ffff;
+        command(&mut b, Grammar::Gl, BIND_TEXTURE_CURRENT_FORM, &[0xffff_ffff, 2 << 12, 0, 0x0011, 1]);
+        command(&mut b, Grammar::Gl, BIND_2D_MIP_MAPPED_TEXTURE, &rec);
+        command(&mut b, Grammar::Gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2200, (0x1e01 as f32).to_bits(), 0, 0, 0]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[TEXTURE_2D]);
+        // Clip coordinates: x = +-1 times w, so the screen's x is 0 and 64 whatever w is.
+        let corner = |b: &mut KonaBackend, xn: f32, yn: f32, w: f32, s: f32| {
+            command(b, Grammar::Gl, SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_SINGLE_FLOAT, &[s.to_bits(), 0.25f32.to_bits()]);
+            command(b, Grammar::Gl, SUBMIT_VERTEX_4_COMPONENTS_SINGLE_FLOAT, &[(xn * w).to_bits(), (yn * w).to_bits(), 0.0f32.to_bits(), w.to_bits()]);
+        };
+        command(&mut b, Grammar::Gl, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[0]);
+        for (xn, yn, w, s) in [(-1.0, -0.5, 1.0, 0.0), (1.0, -0.5, 2.0, 1.0), (1.0, 0.5, 2.0, 1.0), (-1.0, -0.5, 1.0, 0.0), (1.0, 0.5, 2.0, 1.0), (-1.0, 0.5, 1.0, 0.0)] {
+            corner(&mut b, xn, yn, w, s);
+        }
+        command(&mut b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        let at = |b: &KonaBackend, x| b.store.read(x, 32, 2);
+        // The middle is a third across (red); the affine half would be green. Near the right edge, s nears 1 (green).
+        assert_eq!(at(&b, 32), 0xffff_0000, "the divided coordinate: a third of the way across");
+        assert_eq!(at(&b, 8), 0xffff_0000);
+        assert_eq!(at(&b, 60), 0xff00_ff00, "near the far edge");
+        // The coordinate is half at two thirds of the screen: s = 0.5 t / (1 - 0.5 t), not at the middle.
+        let first_green = (0..64).find(|&x| at(&b, x) == 0xff00_ff00).expect("some green");
+        assert!((40..46).contains(&first_green), "the texel edge is at {first_green}, two thirds of the screen, not the middle");
+    }
+
+    /// A point of one pixel lights exactly the pixel its vertex is in, even on its
+    /// edge; one larger than `POINT_PIXEL_MAX` is a disc of about its area.
+    #[test]
+    fn a_point_lights_one_pixel_or_a_disc() {
+        for (x, y, want) in [(10.5, 10.5, (10, 10)), (20.0, 30.0, (20, 30)), (7.9, 3.0, (7, 3))] {
+            let mut b = gl_window();
+            vertices(&mut b, BEGIN_PRIMITIVE_POINTS, &[(x, y)]);
+            assert_eq!(lit_pixels(&mut b), [want], "a point at ({x}, {y})");
+        }
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, SET_POINT_SIZE, &[3.0f32.to_bits(), 0]);
+        vertices(&mut b, BEGIN_PRIMITIVE_POINTS, &[(10.5, 10.5)]);
+        assert_eq!(lit_pixels(&mut b), [(10, 10)], "size 3 is still one pixel");
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, SET_POINT_SIZE, &[8.0f32.to_bits(), 0]);
+        vertices(&mut b, BEGIN_PRIMITIVE_POINTS, &[(32.0, 32.0)]);
+        let lit = lit_pixels(&mut b);
+        assert!((44..=56).contains(&lit.len()), "a disc of diameter 8 holds about 50 pixels: {}", lit.len());
+        assert!(lit.iter().all(|&(x, y)| (27..=36).contains(&x) && (27..=36).contains(&y)));
+    }
+
+    /// A line of width 1 lights one row, from just past its first end to its last pixel
+    /// (the fill rule leaves the left edge out); a wide line lights its width.
+    #[test]
+    fn a_line_lights_its_width() {
+        let mut b = gl_window();
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 20.5), (40.5, 20.5)]);
+        let lit = lit_pixels(&mut b);
+        assert!(lit.iter().all(|&(_, y)| y == 20), "one row");
+        assert_eq!((lit.first().map(|p| p.0), lit.last().map(|p| p.0), lit.len()), (Some(11), Some(40), 30));
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, SET_LINE_WIDTH, &[3.0f32.to_bits(), 0]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 20.5), (40.5, 20.5)]);
+        let rows: std::collections::BTreeSet<u32> = lit_pixels(&mut b).iter().map(|p| p.1).collect();
+        assert_eq!(rows, [19, 20, 21].into(), "width 3");
+    }
+
+    /// The alpha a pixel was written with: smoothing scales it, and with no blending the colour is
+    /// the vertex's, so alpha reads the coverage back.
+    fn alpha_at(b: &KonaBackend, x: u32, y: u32) -> u32 {
+        b.store.read(x, y, 2) >> 24
+    }
+
+    /// A smoothed line of width 1 centred on a row is that row at full coverage, with each end a half
+    /// pixel in (its end passes through the end pixels' centres); moved half a pixel up it shares two
+    /// rows evenly.
+    #[test]
+    fn a_smoothed_line_ramps_its_ends_and_shares_a_row_boundary() {
+        use crate::dev::kona::defs::gl::LINE_SMOOTH;
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[LINE_SMOOTH]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 20.5), (40.5, 20.5)]);
+        let lit = lit_pixels(&mut b);
+        assert!(lit.iter().all(|&(_, y)| y == 20), "one row: {lit:?}");
+        assert_eq!((lit.first().map(|p| p.0), lit.last().map(|p| p.0), lit.len()), (Some(10), Some(40), 31), "the end pixels, half covered, are drawn too");
+        assert_eq!([alpha_at(&b, 10, 20), alpha_at(&b, 11, 20), alpha_at(&b, 25, 20), alpha_at(&b, 39, 20), alpha_at(&b, 40, 20)], [128, 255, 255, 255, 128]);
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[LINE_SMOOTH]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 21.0), (40.5, 21.0)]);
+        lit_pixels(&mut b);
+        assert_eq!([alpha_at(&b, 25, 19), alpha_at(&b, 25, 20), alpha_at(&b, 25, 21), alpha_at(&b, 25, 22)], [0, 128, 128, 0]);
+        // Off, the same line is a row of whole pixels from the second.
+        let mut b = gl_window();
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 21.0), (40.5, 21.0)]);
+        let lit = lit_pixels(&mut b);
+        assert!(lit.iter().all(|&(_, y)| y == 21) && lit.iter().all(|&(x, y)| alpha_at(&b, x, y) == 255));
+    }
+
+    /// A diagonal smoothed line through pixel centres covers its own pixel by a little under a whole and
+    /// its two neighbours across by about a quarter each: a strip one pixel wide at 45 degrees takes
+    /// 0.914 of its pixel and 0.25 of each neighbour, 1.414 in all, the line's width times the length
+    /// of a diagonal step. Set-up snaps the rectangle's corners to eighths of a pixel, which widens it
+    /// a little, so the figures here are a little above those.
+    #[test]
+    fn a_smoothed_diagonal_line_shares_its_width_across_the_pixels_it_touches() {
+        use crate::dev::kona::defs::gl::LINE_SMOOTH;
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[LINE_SMOOTH]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 10.5), (40.5, 40.5)]);
+        lit_pixels(&mut b);
+        let a = |dx: u32, dy: u32| alpha_at(&b, dx, dy);
+        assert!((235..=250).contains(&a(25, 25)), "{}", a(25, 25));
+        assert_eq!((a(26, 25), a(25, 26)), (a(24, 25), a(25, 24)), "the neighbours either side are alike");
+        assert!((60..=80).contains(&a(26, 25)), "{}", a(26, 25));
+        let sum = (a(25, 25) + a(26, 25) + a(24, 25)) as f32 / 255.0;
+        assert!((1.35..=1.6).contains(&sum), "{sum}");
+        assert_eq!(a(27, 25), 0, "and none past them");
+    }
+
+    /// A smoothed polygon ramps its outer edges and not the seam of the fan it is drawn as: a square
+    /// from pixel centre to pixel centre covers its edge pixels by half and its corners by a quarter,
+    /// and the pixels along its diagonal are whole.
+    #[test]
+    fn a_smoothed_polygon_ramps_its_outline_and_not_its_seam() {
+        use crate::dev::kona::defs::gl::POLYGON_SMOOTH;
+        let square = [(10.5, 10.5), (40.5, 10.5), (40.5, 40.5), (10.5, 40.5)];
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[POLYGON_SMOOTH]);
+        vertices(&mut b, BEGIN_PRIMITIVE_POLYGON, &square);
+        lit_pixels(&mut b);
+        let a = |x, y| alpha_at(&b, x, y);
+        assert_eq!([a(10, 25), a(25, 10), a(40, 25), a(25, 40)], [128; 4], "edge pixels, half covered");
+        assert_eq!([a(10, 10), a(40, 10), a(40, 40), a(10, 40)], [64; 4], "corners, a quarter");
+        assert_eq!([a(11, 11), a(25, 25), a(39, 39), a(20, 30)], [255; 4], "inside, seam included, whole");
+        assert_eq!([a(9, 25), a(41, 25), a(25, 9), a(25, 41)], [0; 4], "and nothing past the ramp");
+        // Off, the same polygon is whole pixels only.
+        let mut b = gl_window();
+        vertices(&mut b, BEGIN_PRIMITIVE_POLYGON, &square);
+        let lit = lit_pixels(&mut b);
+        assert!(lit.iter().all(|&(x, y)| alpha_at(&b, x, y) == 255));
+        // A triangle's slanted edge covers its pixels in part, and the pixels a plain triangle lights
+        // keep at least half a pixel's cover on their outer edge.
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[POLYGON_SMOOTH]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[(10.0, 10.0), (50.0, 10.0), (10.0, 50.0)]);
+        lit_pixels(&mut b);
+        let mid = alpha_at(&b, 30, 29);
+        assert!((1..255).contains(&mid), "a pixel on the hypotenuse is partly covered: {mid}");
+    }
+
+    /// A smoothed point covers the share of each pixel its disc does: the pixel about a size-1 point's
+    /// centre about pi / 4, a size-3 point's pixels symmetric about it and summing to the disc's area.
+    #[test]
+    fn a_smoothed_point_covers_by_its_disc() {
+        use crate::dev::kona::defs::gl::POINT_SMOOTH;
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[POINT_SMOOTH]);
+        vertices(&mut b, BEGIN_PRIMITIVE_POINTS, &[(20.5, 20.5)]);
+        let lit = lit_pixels(&mut b);
+        assert_eq!(lit, [(20, 20)]);
+        // pi / 4 of full, from an 8 x 8 grid of sample positions: within a few percent.
+        assert!((195..=212).contains(&alpha_at(&b, 20, 20)), "{}", alpha_at(&b, 20, 20));
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[POINT_SMOOTH]);
+        command(&mut b, Grammar::Gl, SET_POINT_SIZE, &[3.0f32.to_bits(), 0]);
+        vertices(&mut b, BEGIN_PRIMITIVE_POINTS, &[(20.5, 20.5)]);
+        lit_pixels(&mut b);
+        let a = |dx: i32, dy: i32| alpha_at(&b, (20 + dx) as u32, (20 + dy) as u32);
+        assert_eq!(a(0, 0), 255);
+        assert!(a(-1, 0) == a(1, 0) && a(0, -1) == a(0, 1) && a(1, 0) == a(0, 1), "the four edge neighbours alike");
+        assert!(a(1, 1) == a(-1, -1) && a(1, 1) < a(1, 0), "the corners, alike, are less than the edges");
+        let sum: u32 = (-2..=2).flat_map(|dy| (-2..=2).map(move |dx| (dx, dy))).map(|(dx, dy)| a(dx, dy)).sum();
+        let area = std::f32::consts::PI * 1.5 * 1.5;
+        assert!((sum as f32 / 255.0 - area).abs() < 0.2, "coverage sums to {} against the disc's {area}", sum as f32 / 255.0);
+    }
+
+    /// The line stipple indexes its 16-bit pattern by the distance along the line over
+    /// the repeat count; the polygon stipple, 32 x 32 bits, by window position.
+    #[test]
+    fn stipples_keep_the_pixels_their_patterns_name() {
+        use crate::dev::kona::defs::gl::{LINE_STIPPLE, POLYGON_STIPPLE};
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[LINE_STIPPLE]);
+        command(&mut b, Grammar::Gl, SET_LINE_STIPPLE, &[1, 0x00ff]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 20.5), (40.5, 20.5)]);
+        let xs: Vec<u32> = lit_pixels(&mut b).iter().map(|p| p.0).collect();
+        let want: Vec<u32> = (11..=40).filter(|x| (x - 10) % 16 < 8).collect();
+        assert_eq!(xs, want, "the low eight bits of the pattern: eight pixels on, eight off");
+        // A repeat of 2 stretches each bit over two pixels.
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[LINE_STIPPLE]);
+        command(&mut b, Grammar::Gl, SET_LINE_STIPPLE, &[2, 0x00ff]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 20.5), (50.5, 20.5)]);
+        let xs: Vec<u32> = lit_pixels(&mut b).iter().map(|p| p.0).collect();
+        let want: Vec<u32> = (11..=50).filter(|x| (x - 10) / 2 % 16 < 8).collect();
+        assert_eq!(xs, want);
+        // Polygon stipple: a checkerboard, row 0 starting set at the leftmost column.
+        let mut b = gl_window();
+        let mut rows = [0xaaaa_aaaau32; 32];
+        rows.iter_mut().skip(1).step_by(2).for_each(|r| *r = 0x5555_5555);
+        assert_eq!(command(&mut b, Grammar::Gl, LOAD_POLYGON_STIPPLE_PATTERN, &[0, 0, 0]), Reply::Data(32));
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: LOAD_POLYGON_STIPPLE_PATTERN, args: &[0, 0, 0], words: &rows });
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[POLYGON_STIPPLE]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[(0.5, 0.5), (60.5, 0.5), (0.5, 60.5)]);
+        let lit = lit_pixels(&mut b);
+        assert!(lit.len() > 500 && lit.iter().all(|&(x, y)| (x + y) % 2 == 0), "a checkerboard of {} pixels", lit.len());
+        // With the stipple off the same triangle is solid.
+        let mut b = gl_window();
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: LOAD_POLYGON_STIPPLE_PATTERN, args: &[0, 0, 0], words: &rows });
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[(0.5, 0.5), (60.5, 0.5), (0.5, 60.5)]);
+        assert!(lit_pixels(&mut b).iter().any(|&(x, y)| (x + y) % 2 == 1));
+    }
+
+    /// A GL triangle, through the board: the kernel places the window and the
+    /// buffer configuration lays the planes out; the triangle goes to the back
+    /// buffer's word, the display shows nothing of it until a swap names the
+    /// window's id with the buffer bit, and then shows it as direct colour.
+    #[test]
+    fn a_gl_triangle_draws_into_the_back_buffer_and_shows_after_the_swap() {
+        use crate::dev::kona::back::display::compose;
+        use crate::dev::kona::back::store::DID_PLANE;
+        let mut b = KonaBackend::new(KonaConfig::default());
+        let f = |v: f32| v.to_bits();
+        // Window at (10, 20), 50 x 40, display id 13, not partly covered.
+        command(&mut b, Grammar::Kernel, WINDOW_CLIP_SETUP, &[10, 20, 50, 40, 10, 20, 50, 40, 0, 13, 0]);
+        command(&mut b, Grammar::Gl, 1, &[0, 8, 0, 1, 0, 0, 24, 0, 0, 0]);
+        command(&mut b, Grammar::Gl, SET_VIEWPORT, &[0, 0, 50, 40]);
+        command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_4_COMPONENTS_SINGLE_FLOAT, &[f(1.0), f(0.0), f(0.0), f(1.0)]);
+        command(&mut b, Grammar::Gl, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[0]);
+        for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (0.0, 1.0)] {
+            command(&mut b, Grammar::Gl, SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT, &[f(x), f(y), f(0.0)]);
+        }
+        command(&mut b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+        // A job that touches pixels waits for the drawing first.
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        let red = |w: usize| (0..1024).flat_map(|y| (0..1280u32).map(move |x| (x, y))).filter(|&(x, y)| b.store.read(x, y, w) == 0xffff_0000).count();
+        assert!(red(1) == 0, "the front buffer is untouched");
+        let back = red(2);
+        assert!(back > 900 && back <= 1000, "about half of 50 x 40 pixels: {back}");
+        assert!(b.store.read(30, 30, 2) == 0xffff_0000 && b.store.read(5, 30, 2) == 0, "inside the window and outside it");
+        // The display: id 13 is direct colour, showing the back buffer once swapped.
+        b.store.write(30, 30, DID_PLANE, 13 << 2);
+        command(&mut b, Grammar::Kernel, DISPLAY_MODE_BYTE, &[0, 13, 4]);
+        let shown = |b: &KonaBackend| {
+            let mut out = vec![0u32; 1280 * 1024];
+            compose(&b.store, 1, &b.map.lock(), &b.tables.lock().snapshot(), &mut out, 1280);
+            out[(1023 - 30) * 1280 + 30]
+        };
+        assert_eq!(shown(&b), 0xff00_0000, "the front buffer is empty");
+        command(&mut b, Grammar::Kernel, DISPLAY_MODE_BYTE, &[0x3c0001, 13, 1]);
+        assert_eq!(shown(&b), 0xff00_00ff, "red, as 0xAABBGGRR, after the swap");
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("raster stage      1 triangles"), "{text}");
+    }
+
+    /// Each row of the drain table: what reads or writes the store drains the
+    /// GL stage, and what does not leaves it alone. Counted, so the test does not
+    /// depend on a worker being slow enough to lose a race.
+    #[test]
+    fn the_drain_table_row_by_row() {
+        let mut b = KonaBackend::new(test_cfg().with_pool(2, 32));
+        b.tiles();
+        let drains = |b: &KonaBackend| b.tiles.as_ref().map_or(0, |t| t.stats().drains);
+        let mut expect = 0;
+        // Rows that do not drain.
+        let quiet = |b: &mut KonaBackend, what: &str, job: Job<'_>| {
+            send(b, job);
+            assert_eq!(drains(b), expect, "{what} left the workers alone");
+        };
+        quiet(&mut b, "GL state", Job::Command { grammar: Grammar::Gl, selector: SET_VIEWPORT, args: &[0, 0, 50, 40], packed: 0, handled: false });
+        quiet(&mut b, "GL colour", Job::Command { grammar: Grammar::Gl, selector: SET_CURRENT_COLOUR_4_COMPONENTS_SINGLE_FLOAT, args: &[1.0f32.to_bits(); 4], packed: 0, handled: false });
+        quiet(&mut b, "GL begin", Job::Command { grammar: Grammar::Gl, selector: BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, args: &[0], packed: 0, handled: false });
+        quiet(&mut b, "GL end", Job::Command { grammar: Grammar::Gl, selector: END_OPEN_PRIMITIVE, args: &[0], packed: 0, handled: false });
+        quiet(&mut b, "a GL clear", Job::Command { grammar: Grammar::Gl, selector: CLEAR_SELECTED_BUFFERS, args: &[0], packed: 0, handled: false });
+        quiet(&mut b, "an X state load", Job::Command { grammar: Grammar::Kernel, selector: x::state::X_POSITION, args: &[0, 0, 8, 8], packed: 0, handled: false });
+        quiet(&mut b, "an X data token", Job::Command { grammar: Grammar::Kernel, selector: x::fill::X_DATA2, args: &[0, 0], packed: 0, handled: false });
+        quiet(&mut b, "a display-table load", Job::Command { grammar: Grammar::Kernel, selector: DISPLAY_MODE_BYTE, args: &[0, 13, 4], packed: 0, handled: false });
+        quiet(&mut b, "an indirect store", Job::Indirect { selector: XMAP_CURSOR_MODE, value: 0 });
+        quiet(&mut b, "a context event", Job::Context(super::super::job::ContextEvent::Activated { slot: 1, fresh: true }));
+        quiet(&mut b, "dropped words", Job::Dropped { word: 7 });
+        // Rows that drain, each once.
+        let mut loud = |b: &mut KonaBackend, what: &str, job: Job<'_>| {
+            send(b, job);
+            expect += 1;
+            assert_eq!(drains(b), expect, "{what} drains");
+        };
+        loud(&mut b, "a textport command", Job::Command { grammar: Grammar::Textport, selector: TEXTPORT_FILL_BOX, args: &[0, 0, 3, 3], packed: 0, handled: false });
+        loud(&mut b, "an X box", Job::Command { grammar: Grammar::Kernel, selector: x::fill::X_BOX, args: &[0, 2 << 16 | 2], packed: 0, handled: false });
+        loud(&mut b, "an X pixel finish", Job::Command { grammar: Grammar::Kernel, selector: x::pixel::X_PIXEL_FINISH, args: &[0], packed: 0, handled: false });
+        loud(&mut b, "a swap", Job::Command { grammar: Grammar::Kernel, selector: DISPLAY_MODE_BYTE, args: &[0x3c0001, 13, 1], packed: 0, handled: false });
+        loud(&mut b, "a region swap-out", Job::Command { grammar: Grammar::Kernel, selector: PIPE_MEMORY_SWAP_OUT, args: &[0; 8], packed: 0, handled: false });
+        loud(&mut b, "a retrace request", Job::Retrace { tag: 1 });
+        loud(&mut b, "a GL finish", Job::Command { grammar: Grammar::Gl, selector: FINISH_DRAIN_PIPE_AND_SIGNAL_COMPLETION, args: &[0], packed: 0, handled: false });
+        b.quiesce();
+        assert_eq!(drains(&b), expect + 1, "a quiesce drains");
+        assert_eq!(b.tiles.as_ref().map_or(0, |t| t.stats().busy_drains), 0, "no worker had anything queued");
     }
 
     /// The region commands are counted with the bytes the swaps name, and the
@@ -1369,11 +2264,152 @@ mod tests {
 
     // ---- GL pixel operations ----
 
+    /// A pixel draw: the header, then the image words the back end asked for.
+    fn draw_pixels(b: &mut KonaBackend, w: u32, h: u32, format: u32, ty: u32, image: &[u32]) {
+        let hdr = [w, h, format, ty, 0, 0, 0, 0];
+        assert_eq!(command(b, Grammar::Gl, DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, &hdr), if image.is_empty() { Reply::Done } else { Reply::Data(image.len() as u32) });
+        if !image.is_empty() {
+            send(b, Job::Data { grammar: Grammar::Gl, selector: DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, args: &hdr, words: image });
+        }
+    }
+
+    fn colour_at(b: &mut KonaBackend, x: u32, y: u32) -> u32 {
+        command(b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        b.store.read(x, y, 2)
+    }
+
 
     // ---- Queries, select and feedback ----
 
 
     // ---- Multisample ----
+
+    /// `gl_window` reconfigured with `samples` samples and a 24-bit depth buffer.
+    fn ms_window(samples: u32) -> KonaBackend {
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, samples, 24, 0, 0, 0]);
+        b
+    }
+
+    /// A rectangle of two triangles from (2, 2) to (`right`, 20).
+    fn rectangle(b: &mut KonaBackend, right: f32) {
+        vertices(b, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[(2.0, 2.0), (right, 2.0), (right, 20.0), (2.0, 2.0), (right, 20.0), (2.0, 20.0)]);
+    }
+
+    fn column(b: &mut KonaBackend, x: u32, y: u32) -> u32 {
+        command(b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        b.store.read(x, y, 2)
+    }
+
+    /// In a multisampled window a smoothed line takes coverage (smoothing wins for lines) while a smoothed
+    /// polygon multisamples (multisampling wins for polygons).
+    #[test]
+    fn a_multisampled_window_smooths_lines_and_multisamples_polygons() {
+        use crate::dev::kona::defs::gl::{LINE_SMOOTH, POLYGON_SMOOTH};
+        let mut b = ms_window(4);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[LINE_SMOOTH]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_LINES, &[(10.5, 21.0), (40.5, 21.0)]);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        assert_eq!([alpha_at(&b, 25, 19), alpha_at(&b, 25, 20), alpha_at(&b, 25, 21), alpha_at(&b, 25, 22)], [0, 128, 128, 0], "half coverage a row either side");
+        let mut b = ms_window(4);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[POLYGON_SMOOTH]);
+        rectangle(&mut b, 10.75);
+        assert_eq!([column(&mut b, 9, 10), column(&mut b, 10, 10), column(&mut b, 11, 10)], [0xffff_ffff, 0xff80_8080, 0], "the multisampled edge, not a ramp");
+    }
+
+    /// The right edge of a rectangle at 10.75 (10.25 once the half pixel comes off) falls between samples of its
+    /// column: the 4-sample pattern's samples at 0 and 2 eighths across are in (one on the edge, which a right edge
+    /// keeps), those at 4 and 6 out, so half the pixel is white; with 8 samples (0, 6, 5, 1, 2, 7, 3, 4 eighths across)
+    /// three are in. A column left of it is whole and one right of it empty; the shared diagonal of the two triangles
+    /// leaves no seam.
+    #[test]
+    fn a_four_and_an_eight_sample_edge_share_the_pixel_by_samples() {
+        let mut b = ms_window(4);
+        rectangle(&mut b, 10.75);
+        assert_eq!([column(&mut b, 9, 10), column(&mut b, 10, 10), column(&mut b, 11, 10)], [0xffff_ffff, 0xff80_8080, 0]);
+        // Every pixel the diagonal crosses is whole: no seam between the triangles.
+        let seams: Vec<_> = (3..10).flat_map(|x| (3..19).map(move |y| (x, y))).filter(|&(x, y)| column(&mut b, x, y) != 0xffff_ffff).collect();
+        assert!(seams.is_empty(), "{seams:?}");
+        let mut b = ms_window(8);
+        rectangle(&mut b, 10.75);
+        // Three of eight samples: (3 * 255 + 4) / 8 = 96.
+        assert_eq!([column(&mut b, 9, 10), column(&mut b, 10, 10), column(&mut b, 11, 10)], [0xffff_ffff, 0xff60_6060, 0]);
+        let seams: Vec<_> = (3..10).flat_map(|x| (3..19).map(move |y| (x, y))).filter(|&(x, y)| column(&mut b, x, y) != 0xffff_ffff).collect();
+        assert!(seams.is_empty(), "{seams:?}");
+    }
+
+    /// With the enable off, or no multisample buffer, the same edge is the single-sample one: the pixel is whole or empty.
+    #[test]
+    fn without_multisampling_an_edge_is_whole_or_empty() {
+        let mut b = ms_window(4);
+        command(&mut b, Grammar::Gl, DISABLE_CAPABILITY, &[crate::dev::kona::defs::gl::MULTISAMPLE]);
+        rectangle(&mut b, 10.875);
+        // The sample at the pixel's corner: 10.0 < 10.375, inside.
+        assert_eq!([column(&mut b, 10, 10), column(&mut b, 11, 10)], [0xffff_ffff, 0]);
+        let mut b = ms_window(0);
+        rectangle(&mut b, 10.875);
+        assert_eq!([column(&mut b, 10, 10), column(&mut b, 11, 10)], [0xffff_ffff, 0]);
+    }
+
+    /// Depth is kept a sample: a nearer rectangle and a farther one that share a pixel's edge each win the samples
+    /// they cover, and a farther fragment does not overwrite a nearer sample. A clear sets every sample.
+    #[test]
+    fn depth_and_clears_are_per_sample() {
+        use crate::dev::kona::defs::gl::*;
+        let mut b = ms_window(4);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[DEPTH_TEST]);
+        command(&mut b, Grammar::Gl, SET_DEPTH_TEST, &[LESS]);
+        command(&mut b, Grammar::Gl, SET_COLOUR_CLEAR_VALUE, &[0, 0, 0.5f32.to_bits(), 1.0f32.to_bits()]);
+        command(&mut b, Grammar::Gl, CLEAR_SELECTED_BUFFERS, &[COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT]);
+        assert_eq!(column(&mut b, 5, 5), 0xff00_0080, "a clear sets the samples and the word");
+        // A white rectangle at z = 0 (nearer), then a red one behind it at z = 0.5 that reaches further right.
+        let rect = |b: &mut KonaBackend, right: f32, z: f32| {
+            command(b, Grammar::Gl, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[0]);
+            for (x, y) in [(2.0, 2.0), (right, 2.0), (right, 20.0), (2.0, 2.0), (right, 20.0), (2.0, 20.0)] {
+                command(b, Grammar::Gl, SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT, &[ndc(x), ndc(y), z.to_bits()]);
+            }
+            command(b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+        };
+        rect(&mut b, 10.875, 0.0);
+        command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_4_COMPONENTS_SINGLE_FLOAT, &[1.0f32.to_bits(), 0, 0, 1.0f32.to_bits()]);
+        rect(&mut b, 14.875, 0.5);
+        // Column 5 stays white (the red is behind); column 10 has two white samples and two red ones that the
+        // far rectangle won where the near one is not (samples 2 and 3): mean red (2 * 255 + 2 * 255 + 2) / 4 = 255,
+        // green and blue (2 * 255 + 2) / 4 = 128; column 12 is red.
+        assert_eq!(column(&mut b, 5, 10), 0xffff_ffff);
+        assert_eq!(column(&mut b, 10, 10) & 0xffffff, 0xff8080);
+        assert_eq!(column(&mut b, 12, 10) & 0xffffff, 0xff0000);
+    }
+
+    /// The sample mask keeps the samples its coverage word names, by pixel column: the half-coverage mask on 4
+    /// samples is 0x33333333, nibble 3 (samples 0 and 1) a column: half the pixel.
+    #[test]
+    fn the_sample_mask_and_alpha_to_mask_thin_the_coverage() {
+        use crate::dev::kona::defs::gl::*;
+        let mut b = ms_window(4);
+        command(&mut b, Grammar::Gl, SET_MULTISAMPLE_COVERAGE_MASK, &[0.5f32.to_bits(), 0]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[SAMPLE_MASK]);
+        rectangle(&mut b, 10.875);
+        // Mask 0.5 selects the 15-16 entry: 0x33333333, samples 0 and 1 of every pixel: half of a whole pixel.
+        assert_eq!(column(&mut b, 5, 10), 0xff80_8080);
+        // Inverted, the other half.
+        let mut b = ms_window(4);
+        command(&mut b, Grammar::Gl, SET_MULTISAMPLE_COVERAGE_MASK, &[0.5f32.to_bits(), 1]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[SAMPLE_MASK]);
+        rectangle(&mut b, 10.875);
+        assert_eq!(column(&mut b, 5, 10), 0xff80_8080);
+        // Alpha to mask with alpha 0.5 lets half the samples through; alpha to one then makes the fragment opaque.
+        let mut b = ms_window(4);
+        command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_4_COMPONENTS_SINGLE_FLOAT, &[1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 0.5f32.to_bits()]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[SAMPLE_ALPHA_TO_MASK]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[SAMPLE_ALPHA_TO_ONE]);
+        rectangle(&mut b, 10.875);
+        assert_eq!(column(&mut b, 5, 10), 0xff80_8080);
+        // A bad pattern is an invalid-enumerant error; a good one is taken.
+        command(&mut b, Grammar::Gl, SET_MULTISAMPLE_PATTERN, &[0x1234]);
+        assert_eq!(b.contexts.select(None).gl.error, 0x500);
+        command(&mut b, Grammar::Gl, SET_MULTISAMPLE_PATTERN, &[0x80a3]);
+    }
 
 }
 
