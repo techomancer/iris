@@ -45,6 +45,9 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         save-if: ${{ github.ref == 'refs/heads/main' }}
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+      with:
+        tool: nextest
     # --workspace, not the default. Without it cargo only builds and tests the
     # root `iris` package, so iris-gui was never compiled here at all and its
     # tests never ran — a GUI-only breakage could not turn this red. It needs no
@@ -63,11 +66,21 @@ jobs:
     # ubuntu-24.04-arm are the runners with NEON.
     - name: Run SIMD lane tests
       run: cargo test -p iris --lib the_lane_
+    # nextest runs each test in its own process and writes the JUnit report
+    # the annotations below come from. It does not run doctests.
     # Only Linux x86-64 fails the job; the other platforms report a failure
     # (a red step, which the API still counts as a pass) and carry on.
     - name: Run tests
       continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
-      run: cargo test --workspace --verbose
+      run: cargo nextest run --workspace --profile ci
+    - name: Run doctests
+      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
+      run: cargo test --workspace --doc
+    - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+      if: ${{ !cancelled() }}
+      with:
+        report_paths: target/nextest/ci/junit.xml
+        annotate_only: true
 
   # The nightly/release CLI feature set (scripts/dist/lib.sh): a build check
   # only, so a platform-specific break in the Cranelift JITs or the lightning
