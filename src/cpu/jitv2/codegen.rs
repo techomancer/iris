@@ -8592,9 +8592,27 @@ fn emit_fcc_taken(ctx: &mut EmitCtx, raw: u32) -> Value {
 /// genuinely different-width accessors, so `.s` and `.d` need separate
 /// bodies here.
 fn emit_fmovcf_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let taken = emit_fmovcf_taken(ctx);
+    emit_fmov_s_if(ctx, fr_mode, taken);
+}
+
+/// fd = fs when `taken`, for MOVF.S/MOVT.S/MOVZ.S/MOVN.S. Mirrors
+/// `MipsExecutor::fmov_s_if`: on a part that clears a single result's upper
+/// word (`JitConsts::single_clears_upper`) fd is written either way, with its
+/// own low word when the move is not taken, so the upper word is zeroed
+/// regardless (R10000 UM v2.0, p. 313; a model choice on the R12000 and
+/// R14000). Otherwise an untaken move leaves fd alone.
+fn emit_fmov_s_if(ctx: &mut EmitCtx, fr_mode: FrMode, taken: Value) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    let taken = emit_fmovcf_taken(ctx);
+
+    if ctx.jit_consts.single_clears_upper {
+        let moved = emit_read_fpr_w(ctx, fs, fr_mode);
+        let kept = emit_read_fpr_w(ctx, fd, fr_mode);
+        let value = ctx.builder.ins().select(taken, moved, kept);
+        emit_write_fpr_w(ctx, fd, value, fr_mode);
+        return;
+    }
 
     let write_block = ctx.builder.create_block();
     let merge_block = ctx.builder.create_block();
@@ -8633,43 +8651,15 @@ fn emit_fmovcf_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 }
 
 fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    let fs = field_rd(ctx.raw);
-    let fd = field_sa(ctx.raw);
     let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
     let taken = ctx.builder.ins().icmp_imm_s(IntCC::Equal, ft_val, 0);
-
-    let write_block = ctx.builder.create_block();
-    let merge_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
-
-    ctx.builder.switch_to_block(write_block);
-    ctx.builder.seal_block(write_block);
-    let value = emit_read_fpr_w(ctx, fs, fr_mode);
-    emit_write_fpr_w(ctx, fd, value, fr_mode);
-    ctx.builder.ins().jump(merge_block, &[]);
-
-    ctx.builder.switch_to_block(merge_block);
-    ctx.builder.seal_block(merge_block);
+    emit_fmov_s_if(ctx, fr_mode, taken);
 }
 
 fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    let fs = field_rd(ctx.raw);
-    let fd = field_sa(ctx.raw);
     let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
     let taken = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ft_val, 0);
-
-    let write_block = ctx.builder.create_block();
-    let merge_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
-
-    ctx.builder.switch_to_block(write_block);
-    ctx.builder.seal_block(write_block);
-    let value = emit_read_fpr_w(ctx, fs, fr_mode);
-    emit_write_fpr_w(ctx, fd, value, fr_mode);
-    ctx.builder.ins().jump(merge_block, &[]);
-
-    ctx.builder.switch_to_block(merge_block);
-    ctx.builder.seal_block(merge_block);
+    emit_fmov_s_if(ctx, fr_mode, taken);
 }
 
 fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {

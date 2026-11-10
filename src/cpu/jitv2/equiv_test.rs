@@ -4615,8 +4615,9 @@ mod tests {
 
     /// Compiled and interpreted single results agree: with FR set the R10000
     /// zeroes the destination's upper word, the R5000 keeps it. A zero sum and an
-    /// infinity take the compiled code's cold commits. Fix: single results
-    /// clear the upper word.
+    /// infinity take the compiled code's cold commits, and an untaken MOVN.S or
+    /// MOVT.S still writes fd on the R10000. Fix: single results clear the upper
+    /// word.
     #[test]
     fn jit_single_results_match_the_interpreter_on_the_r10000_and_r5000() {
         use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
@@ -4631,6 +4632,9 @@ mod tests {
             ("mov.s", cop1(RS_S, 0, 1, 3, FUNCT_FMOV)),
             ("cvt.s.d", cop1(RS_D, 0, 4, 3, FUNCT_FCVT_S)),
             ("cvt.w.s", cop1(RS_S, 0, 2, 3, FUNCT_FCVT_W)),
+            // Untaken conditional moves: $0 is zero, FCSR's $fcc0 is clear.
+            ("movn.s untaken", cop1(RS_S, 0, 1, 3, FUNCT_FMOVN)),
+            ("movt.s untaken", cop1(RS_S, 1, 1, 3, FUNCT_FMOVCF)),
         ];
         // Every FPR's upper word starts nonzero so a single result that keeps it shows.
         fn setup<C: crate::cpu::mips_cache_v2::CpuModel>(_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, C>) {

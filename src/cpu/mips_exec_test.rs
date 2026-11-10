@@ -1430,6 +1430,46 @@ mod tests {
         });
     }
 
+    /// MOVZ.S, MOVN.S, MOVT.S and MOVF.S write fd on the R10000 family even
+    /// when the condition is false: the old low word stays and, with FR set,
+    /// the upper word is zeroed, "even though the condition is false"
+    /// (R10000 UM v2.0 p. 313). The R5000 leaves an unmoved fd alone.
+    #[test]
+    fn untaken_single_conditional_moves_clear_the_upper_word_on_the_r10000_family() {
+        const OLD: u64 = 0xdead_beef_5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(clears: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            exec.core.fpu_fcsr = 0; // $fcc0 false
+            // (name, instruction, moves) with fs = $f1, fd = $f3; $8 = 0, $9 = 1.
+            let cases = [
+                ("movz.s untaken", make_cop1_compute(RS_S, 9, 1, 3, FUNCT_FMOVZ), false),
+                ("movn.s untaken", make_cop1_compute(RS_S, 8, 1, 3, FUNCT_FMOVN), false),
+                ("movt.s untaken", make_cop1_compute(RS_S, 1, 1, 3, FUNCT_FMOVCF), false),
+                ("movf.s taken", make_cop1_compute(RS_S, 0, 1, 3, FUNCT_FMOVCF), true),
+                ("movz.s taken", make_cop1_compute(RS_S, 8, 1, 3, FUNCT_FMOVZ), true),
+            ];
+            for (name, instr, moves) in cases {
+                exec.core.gpr[8] = 0;
+                exec.core.gpr[9] = 1;
+                exec.core.fpr[1] = 0x2989_815b_3fc0_0000; // 1.5
+                exec.core.fpr[3] = OLD;
+                assert_eq!(exec.exec(instr), EXEC_COMPLETE, "{name}");
+                let low = if moves { 0x3fc0_0000 } else { OLD as u32 };
+                assert_eq!(exec.core.fpr[3] as u32, low, "{name} low word");
+                if clears {
+                    assert_eq!(exec.core.fpr[3] >> 32, 0, "{name} upper word");
+                } else if !moves {
+                    assert_eq!(exec.core.fpr[3], OLD, "{name} untouched");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(false);
+        });
+    }
+
     #[cfg(feature = "tlbcheck")]
     #[test]
     fn test_tlbwi_breaks_on_duplicate_entry() {

@@ -655,11 +655,12 @@ pub trait CpuModel: MipsCache {
     /// keep the sign extension for now.
     const PARTIAL_LWR_KEEPS_UPPER: bool = Self::R10K_FAMILY;
     /// With FR set, a single or word result (arithmetic, MOV.S, the
-    /// conditional moves when they move, MTC1, LWC1) zeroes bits 63:32 of
-    /// the destination. The architecture leaves them undefined; the R10000
-    /// sets them to zero (R10000 UM v2.0 p. 306, "Load and Store
-    /// Operations"), and the NEC VR10000/VR12000 manual repeats it. The
-    /// other parts keep the old upper word.
+    /// conditional moves whether or not they move, MTC1, LWC1) zeroes bits
+    /// 63:32 of the destination. The architecture leaves them undefined; the R10000
+    /// sets them to zero (R10000 UM v2.0 pp. 306, 313), and the NEC
+    /// VR10000/VR12000 manual repeats it for results (p. 279). That page calls
+    /// an untaken conditional move's upper half undefined, so zeroing it on the
+    /// R12000 and R14000 is a model choice. The other parts keep the old upper word.
     const SINGLE_CLEARS_UPPER: bool = Self::R10K_FAMILY;
     /// An uncached store the system refuses completes instead of raising a
     /// Data Bus Error. The R10000 sends it as a write request, which gets no

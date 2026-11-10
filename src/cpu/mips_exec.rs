@@ -8573,10 +8573,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let tf = ((d.raw >> 16) & 0x1) != 0;
         let cc_value = self.core.get_fpu_cc(cc);
         let taken = cc_value == tf;
-        if taken {
-            let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-            (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
-        }
+        self.fmov_s_if(taken, fs_reg, fd_reg);
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU fmov{}.s PC={:016x} cc{}={} taken={}",
                 if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
@@ -8586,20 +8583,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     fn exec_fmovz_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        if self.core.read_gpr(ft_reg) == 0 {
-            let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-            (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
-        }
+        self.fmov_s_if(self.core.read_gpr(ft_reg) == 0, fs_reg, fd_reg);
         self.handle_exec_complete()
     }
     fn exec_fmovn_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        if self.core.read_gpr(ft_reg) != 0 {
-            let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-            (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
-        }
+        self.fmov_s_if(self.core.read_gpr(ft_reg) != 0, fs_reg, fd_reg);
         self.handle_exec_complete()
+    }
+    /// The body of MOVF.S, MOVT.S, MOVZ.S and MOVN.S: fd = fs when `taken`.
+    /// The R10000 "always clears the upper 32 bits of the destination register
+    /// even though the condition is false" (R10000 UM v2.0, p. 313), so an
+    /// untaken move still writes fd. NEC U10278EJ4V0UM p. 279 calls that upper
+    /// half "undefined ..., even if no move occurs"; zeroing it on the R12000
+    /// and R14000 too is a model choice.
+    #[inline(always)]
+    fn fmov_s_if(&mut self, taken: bool, fs_reg: u32, fd_reg: u32) {
+        if taken || C::SINGLE_CLEARS_UPPER {
+            let src = if taken { fs_reg } else { fd_reg };
+            let val = (self.fpr_read_w)(&self.core, src);
+            (self.fpr_write_w)(&mut self.core, fd_reg, val);
+        }
     }
     fn exec_frecip_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
