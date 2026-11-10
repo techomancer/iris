@@ -456,7 +456,7 @@ noted with the PC for `ip30 unmapped`.
 | 0x1B00_0000 | the graphics widget, 11: `dev/mgras/hq4.rs`, the HQ4 in front of the Solid IMPACT raster chips (`dev/mgras/`); absent with `graphics = "none"` |
 | 0x1F00_0000 | `dev/bridge.rs`: the Bridge's local registers, PCI configuration space, the device windows routed by slot, the NIC on its MicroLAN |
 | 0x1F20_0000, 0x1F40_0000 | device windows 0 and 1: the two QL1040s (`dev/isp1040.rs`, `docs/dev/isp1040.md`) |
-| 0x1F60_0000 | device window 2: `dev/ioc3.rs` with its own UARTs, the DS1685 on its byte bus, the keyboard and mouse controller, the parallel port and the MAC part on its MicroLAN; the Ethernet MAC and PHY are `dev/ioc3_eth.rs` |
+| 0x1F60_0000 | device window 2: `dev/ioc3/` with its Super I/O UARTs, the DS1685 (`dev/ds1685.rs`) on its byte bus, the keyboard and mouse controller, the parallel port and the MAC part on its MicroLAN; the Ethernet MAC is `dev/ioc3/eth.rs`, see [dev/ioc3.md](dev/ioc3.md) |
 | 0x1F70_0000 | device window 3: RAD, `dev/rad1.rs` |
 | 0x1FC0_0000 – 0x1FFF_FFFF | `dev/sflash.rs`: the boot flash with its command set; the CPU's cached view (`CachedFlashLines`) keeps the PROM's cached stores into it. `[octane] flash` keeps the part between runs |
 | 0x2000_0000 up | `dev/heart_mem.rs`: SDRAM as MEMCFG places it, each 32 MB unit a view of one run of a bank, its first 16 KB a bus error to uncached processor accesses; `remap_banks` redraws the table and the ppmem window when a descriptor is written |
