@@ -54,7 +54,7 @@ use crate::dev::bridge::Bridge;
 use crate::dev::elsc::ModuleOutput;
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::hub::{Hub, HubConfig, Space};
-use crate::dev::hub_md::SlotSignals;
+use crate::dev::hub::SlotSignals;
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::rad1::Rad1;
 use crate::dev::node_flash::FlashValues;
@@ -295,13 +295,13 @@ impl Deskside {
             }
             let xbow = Arc::new(Xbow::new(XBOW_REVISION, widgets));
             xbow.connect_host(host.host, node.hub.interrupt_target());
-            node.hub.io().connect_widget(0, xbow.clone());
-            node.hub.io().connect_widget(widget, xbow.port(widget, node.hub.widget_face()));
+            node.hub.connect_widget(0, xbow.clone());
+            node.hub.connect_widget(widget, xbow.port(widget, node.hub.widget_face()));
             xbow.register_locks();
             if i == 0 {
                 let b = Self::baseio_bridge(cfg, layout, xbow.upstream(vec![host]))?;
                 xbow.serve_bridge(layout.baseio_widget, &b);
-                node.hub.io().connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, b.clone()));
+                node.hub.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, b.clone()));
                 bridge = Some(b);
             }
         }
@@ -336,17 +336,17 @@ impl Deskside {
         let peers: Vec<(u8, Arc<dyn BusDevice>)> =
             nodes.iter().enumerate().map(|(i, n)| (layout.hub_widgets[i], n.hub.inbound())).collect();
         for node in nodes {
-            let io = node.hub.io();
-            io.connect_widget(0, xbow.clone());
+            let hub = &node.hub;
+            hub.connect_widget(0, xbow.clone());
             if let Some(w) = layout.graphics_widget {
-                io.connect_widget(w, xbow.port(w, Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID))));
+                hub.connect_widget(w, xbow.port(w, Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID))));
             }
-            io.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, bridge.clone()));
+            hub.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, bridge.clone()));
             for (i, n) in nodes.iter().enumerate() {
                 let w = layout.hub_widgets[i];
-                io.connect_widget(w, xbow.port(w, n.hub.widget_face()));
+                hub.connect_widget(w, xbow.port(w, n.hub.widget_face()));
             }
-            io.connect_packets(xbow.packets(peers.clone()));
+            hub.connect_packets(xbow.packets(peers.clone()));
         }
         Ok((bridge, owner))
     }

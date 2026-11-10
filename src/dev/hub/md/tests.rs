@@ -9,12 +9,12 @@ use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-fn md(signals: SlotSignals) -> (HubMd, Arc<AtomicU64>) {
+fn md(signals: SlotSignals) -> (Md, Arc<AtomicU64>) {
     let now = Arc::new(AtomicU64::new(0));
     let clock = now.clone();
-    (HubMd::new(Arc::new(move || clock.load(Ordering::SeqCst)), signals), now)
+    (Md::new(Arc::new(move || clock.load(Ordering::SeqCst)), signals), now)
 }
-fn r(md: &HubMd, off: u64) -> u64 {
+fn r(md: &Md, off: u64) -> u64 {
     md.read64(off).data
 }
 

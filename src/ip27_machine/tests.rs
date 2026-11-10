@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::GraphicsBoard;
 use super::test_support::{self, big_stack, Scratch};
-use crate::dev::{hub_ni, hub_pi};
+use crate::dev::hub::reg::{ni as hub_ni, pi as hub_pi};
 use crate::traits::BUS_OK;
 
 fn config(dir: &Path) -> MachineConfig {
@@ -89,10 +89,10 @@ fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
         // The Hub's own register: PI_CPU_ENABLE_A reads one without the PROM
         // having stored it.
         let io = m.node().hub.claim(Space::Io);
-        let enable = crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::reg::CPU_ENABLE_A;
+        let enable = crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::CPU_ENABLE_A;
         assert_eq!(io.read64(enable).data, 1);
         // And its slice B, which a one-processor module does not fit, is clear.
-        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::reg::CPU_ENABLE_B).data, 0);
+        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::CPU_ENABLE_B).data, 0);
     });
 }
 
@@ -120,7 +120,7 @@ fn a_reset_enables_the_processor_again() {
         let mut m = Origin200Machine::new(&config(&dir.0)).unwrap();
         m.reset();
         let io = m.node().hub.claim(Space::Io);
-        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::reg::CPU_ENABLE_A).data, 1);
+        assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::CPU_ENABLE_A).data, 1);
         m.stop();
     });
 }
@@ -287,9 +287,9 @@ fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));
         const SLOT: u64 = 0x1bef_e78;
-        assert_eq!(hub.write64(hub_pi::reg::CALIAS_SIZE, 1), BUS_OK);
+        assert_eq!(hub.write64(hub_pi::CALIAS_SIZE, 1), BUS_OK);
         assert_eq!(hub.cpu_special().write64(SLOT, 0x5a5a), BUS_OK);
-        assert_eq!(hub.write64(hub_ni::reg::STATUS, 1 << 8), BUS_OK);
+        assert_eq!(hub.write64(hub_ni::STATUS, 1 << 8), BUS_OK);
         assert_eq!(hub.cpu_special().read64(SLOT).data, 0x5a5a, "the stack slot");
         assert_eq!(hub.claim(Space::Memory).read64((1 << 32) + SLOT).data, 0x5a5a, "node 1 by number");
         assert_ne!(m.node().memory.physical().read64(SLOT).status, BUS_OK, "cached, node zero");
@@ -308,7 +308,7 @@ fn a_reference_by_node_number_can_compare_and_swap() {
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));
-        assert_eq!(hub.write64(hub_ni::reg::STATUS, 1 << 8), BUS_OK);
+        assert_eq!(hub.write64(hub_ni::STATUS, 1 << 8), BUS_OK);
         let phys = m.node().memory.physical();
         const WORD: u64 = (1 << 32) + 0x61_c000;
         assert_eq!(phys.write64(WORD, 0x99), BUS_OK);

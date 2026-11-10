@@ -30,12 +30,12 @@ impl NiEvents for Moves {
 }
 
 struct Node {
-    ni: Arc<HubNi>,
+    ni: Arc<Ni>,
     calls: Arc<Calls>,
     moves: Arc<Moves>,
 }
 fn node(revision: u8, nasid: u16) -> Node {
-    let ni = Arc::new(HubNi::new(revision, nasid));
+    let ni = Arc::new(Ni::new(revision, nasid));
     let calls = Arc::new(Calls::default());
     let moves = Arc::new(Moves::default());
     ni.set_hooks(calls.clone());
@@ -50,16 +50,16 @@ fn pair() -> (Node, Node) {
     b.ni.connect_peer(Some(wa));
     (a, b)
 }
-fn r(ni: &HubNi, off: u64) -> u64 {
+fn r(ni: &Ni, off: u64) -> u64 {
     ni.read64(off).data
 }
-fn w(ni: &HubNi, off: u64, value: u64) {
+fn w(ni: &Ni, off: u64, value: u64) {
     assert_eq!(ni.write64(off, value), BUS_OK);
 }
 
 /// Run a vector operation from `ni` to the Hub across the cable and return
 /// the completion status.
-fn vector(ni: &HubNi, route: u64, off: u64, ty: u64, data: u64) -> u64 {
+fn vector(ni: &Ni, route: u64, off: u64, ty: u64, data: u64) -> u64 {
     w(ni, reg::VECTOR, route);
     w(ni, reg::VECTOR_DATA, data);
     w(ni, reg::VECTOR_PARMS, (off - reg::STATUS) | ty);
