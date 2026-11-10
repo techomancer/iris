@@ -1819,6 +1819,19 @@ mod tests {
         }
     }
 
+    /// Make the base unopenable and keep its bytes at `away`. Unix moves the
+    /// file. Windows will not rename a file the CHD library holds open, so the
+    /// base is copied and then emptied, which fails an open the same way.
+    fn take_base_away(base: &Path, away: &Path) {
+        #[cfg(not(windows))]
+        std::fs::rename(base, away).unwrap();
+        #[cfg(windows)]
+        {
+            std::fs::copy(base, away).unwrap();
+            std::fs::File::create(base).unwrap();
+        }
+    }
+
     /// A CHD node whose base has been moved away and whose commit has failed
     /// to reopen it. Returns the node and the paths to put the base back.
     fn closed_chd_node() -> (ChdNode, PathBuf, PathBuf) {
@@ -1826,7 +1839,7 @@ mod tests {
         let away = base.with_extension("away");
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-        std::fs::rename(&base, &away).unwrap();
+        take_base_away(&base, &away);
         assert!(node.commit().is_err());
         assert_eq!(node.size(), 256 * 1024);
         assert!(node.is_cow(), "the diff is still known");
@@ -1876,7 +1889,7 @@ mod tests {
             let away = base.with_extension("away");
             let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
             node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-            std::fs::rename(&base, &away).unwrap();
+            take_base_away(&base, &away);
             let r = if rollback { node.rollback().map(|_| 0) } else { node.commit() };
             assert!(r.is_err(), "rollback={rollback}: nothing to reopen");
             std::fs::rename(&away, &base).unwrap();
