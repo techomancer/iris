@@ -26,6 +26,10 @@ cpu = "r10000"
 nodes = 1
 flash = "ignore/origin2000/flash.raw"
 controller_store = "ignore/origin2000/controller.raw"
+# The I/O PROM the IRIX 6.5.30 media ship beside the node PROM (io6prom.img),
+# fitted in the BaseIO card's boot flash. Without it the node PROM runs its
+# reduced internal copy, which has no graphics console.
+# io_prom = "ignore/origin2000/io6prom.img"
 
 [network]
 # Disconnected cable. For NAT, use mode = "nat".

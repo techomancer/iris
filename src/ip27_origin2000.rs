@@ -42,7 +42,7 @@ use crate::traits::Resettable;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::Xbow;
-use crate::ip27_machine::{section, table, cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord};
+use crate::ip27_machine::{section, table, cpu_module, fit_io_prom, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord};
 use crate::xtalk::{Upstream, XtalkHost};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -198,6 +198,7 @@ impl Ip27Board for Origin2000 {
                 let bridge = Bridge::new(Upstream::single(host, node.hub.inbound(), node.hub.interrupt_target()), &crate::ip30::PCI0);
                 bridge.set_revision(BRIDGE_REVISION);
                 bridge.set_microlan(Self::board_record());
+                fit_io_prom(&bridge, cfg)?;
                 let links = xbow.clone();
                 bridge.set_link_alive(Box::new(move |w| links.carries(w)));
                 let weak = Arc::downgrade(&bridge);

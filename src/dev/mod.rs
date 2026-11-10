@@ -74,6 +74,7 @@ pub mod vino;
 pub mod virtio;
 pub mod wd33c93a;
 pub mod z85c30;
+pub mod baseio_flash;
 pub mod node_flash;
 pub mod hub;
 pub mod hub_io;

@@ -33,7 +33,7 @@ use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::devlog::LogModule;
-use crate::ip27_machine::{section, table, cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, Node, NodeRecord};
+use crate::ip27_machine::{section, table, cpu_module, fit_io_prom, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, Node, NodeRecord};
 use crate::pci::DevFn;
 use crate::ip27_origin2000::{Origin2000, BRIDGE_REVISION, MAX_NODES, XBOW_REVISION};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Resettable, BUS_ERR};
@@ -202,6 +202,7 @@ impl Ip27Board for Onyx2Deskside {
         let bridge = Bridge::new(xbow.upstream(hosts), &crate::ip30::PCI0);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
+        fit_io_prom(&bridge, cfg)?;
         let links = xbow.clone();
         bridge.set_link_alive(Box::new(move |w| links.carries(w)));
         let weak = Arc::downgrade(&bridge);
