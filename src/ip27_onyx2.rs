@@ -37,7 +37,6 @@ use crate::ip27_machine::{section, table, cpu_module, fit_io_prom, pci_devices, 
 use crate::pci::DevFn;
 use crate::ip27_origin2000::{Origin2000, BRIDGE_REVISION, MAX_NODES, XBOW_REVISION};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Resettable, BUS_ERR};
-use crate::xtalk::{HostPort, XtalkHost};
 use std::sync::Arc;
 
 pub type Onyx2Machine = Ip27Machine<Onyx2Deskside>;
@@ -58,9 +57,6 @@ const fn widget_hub(node: usize) -> u8 {
 /// What node slot `node` drives onto the Hub's slot identity: 3 and 2.
 const fn slot_bits(node: usize) -> u8 {
     3 - node as u8
-}
-const fn hub_host(node: usize) -> XtalkHost {
-    XtalkHost { widget: widget_hub(node), int_packet: 0, int_packet_mask: 0, vectors: 128 }
 }
 /// The test widget's identification: not a real part.
 const TEST_WIDGET_ID: u32 = widget_id(0, 0x7e57, 0x36);
@@ -191,14 +187,10 @@ impl Ip27Board for Onyx2Deskside {
         // Crossbow gives it both, each behind its port's link.
         let owner_index = nodes.len() - 1;
         let owner = nodes[owner_index];
-        xbow.connect_host(hub_host(owner_index), owner.hub.interrupt_target());
+        xbow.connect_host(owner.hub.host_port(widget_hub(owner_index)).host, owner.hub.interrupt_target());
         xbow.register_locks();
 
-        let hosts = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| HostPort::new(hub_host(i), n.hub.inbound(), n.hub.interrupt_target()))
-            .collect();
+        let hosts = nodes.iter().enumerate().map(|(i, n)| n.hub.host_port(widget_hub(i))).collect();
         let bridge = Bridge::new(xbow.upstream(hosts), &crate::ip30::PCI0);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());

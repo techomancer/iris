@@ -125,3 +125,40 @@ fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
         assert_eq!(bridge.strong_count(), 0, "the Bridge");
     });
 }
+
+/// The BaseIO's Bridge sits behind the first node's Crossbow, so it reaches
+/// that node's Hub as the host at widget 9, through the port's link. A
+/// transfer or an interrupt packet naming widget 10, the second node's port
+/// on its own Crossbow, has no host to land on and is dropped.
+#[test]
+fn the_bridge_reaches_its_nodes_hub_through_the_crossbow_port() {
+    use crate::dev::bridge::{reg, DIRECT_WIDGET_SHIFT};
+    big_stack(|| {
+        let (_dir, m) = built("bridge", 2);
+        let bridge = m.bridge().clone();
+        let card = test_support::Card::new();
+        bridge.bus().attach(crate::pci::DevFn { device: 7, function: 0 }, card.clone());
+        let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
+        let dma = card.state.dma().unwrap().clone();
+        let memory = |i: usize, off: u64| m.node_at(i).memory.physical().read32(off).data;
+        let pending = |i: usize| m.node_at(i).hub.read64(crate::dev::hub_pi::reg::INT_PEND0).data;
+
+        for (widget, lands) in [(9u32, true), (10, false)] {
+            set(reg::DIRECT_MAP, widget << DIRECT_WIDGET_SHIFT);
+            let at = 0x1000 * u64::from(widget);
+            let _ = dma.dma_write(0x8000_0000 + at, &[1, 2, 3, 4]);
+            assert_eq!(memory(0, at) != 0, lands, "widget {widget}: DMA");
+            assert_eq!(memory(1, at), 0, "widget {widget}: the second node saw it");
+
+            set(reg::INT_DEST_UPPER, widget << 16);
+            set(reg::INT_DEST_LOWER, 0);
+            set(reg::int_host(7), 5);
+            set(reg::INT_ENABLE, 1 << 7);
+            card.state.irq().unwrap().set(true);
+            assert_eq!(pending(0) & 1 << 5 != 0, lands, "widget {widget}: interrupt");
+            assert_eq!(pending(1) & 1 << 5, 0, "widget {widget}: the second node heard it");
+            card.state.irq().unwrap().set(false);
+            assert_eq!(m.node_at(0).hub.write64(crate::dev::hub_pi::reg::INT_PEND_MOD, 5), BUS_OK);
+        }
+    });
+}
