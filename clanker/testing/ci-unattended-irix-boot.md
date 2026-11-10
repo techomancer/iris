@@ -21,7 +21,27 @@ console, which the CI socket can drive: wait `Option?` → `5` → `setenv -f
 SystemPartition scsi(0)disk(1)rdisk(0)partition(8)`, `OSLoadPartition
 ...partition(0)`, `OSLoadFilename /unix`, `AutoLoad Yes` → `iris-ci rtc-save`
 → quit. The next run auto-boots the disk unattended. The script also sets
-`console d`, so `login:` arrives on serial; the framebuffer stays dark (irix-install.md §8).
+`console d`, so the kernel and rc scripts print on serial.
+
+## The disk needs a getty on ttyd1
+
+`console` moves the PROM, kernel and rc output, not the login. `login:` on
+serial comes from the getty that `/etc/inittab` runs on `ttyd1` (its `t1`
+entry), and with the install's default `chkconfig` (windowsystem, xdm and
+visuallogin on) IRIX 5.3 still starts X and draws the Visual Login when
+`console=d`; the framebuffer is not dark. Measured 2026-11-10 with the
+nightly CLI on a fresh install from `IRIX 5.3 for Indy including R5000.iso`:
+
+- stock inittab: `IRIS login:` on serial 30 s into the boot, with `console d`
+  and with `console` left at `g`.
+- the same disk with only `t1` set to `off`: serial ends after the rc
+  scripts' output, never shows `login:`, and a screenshot shows the Visual
+  Login. The CI disk's nightly boots look the same: with `console d` serial
+  ends after the rc output, with `g` after the PROM, and the screenshots the
+  first version of the test took show its Visual Login within 75 s.
+
+So a disk that fails here with a transcript ending in rc output most likely
+has no getty on `ttyd1`; check its `/etc/inittab` before blaming the boot.
 
 ## Each check is a JUnit case
 

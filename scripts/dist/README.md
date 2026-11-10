@@ -46,7 +46,9 @@ scripts/dist/package-linux.sh --version 1.2.3
   also boots that disk to a login prompt on Linux, macOS and Windows with
   `scripts/ci-boot-test.sh`, and a failed boot stops the nightly or release
   from publishing. The test sets the PROM console to serial and watches it for
-  `login:`; the logs are attached to the run.
+  `login:`; the logs are attached to the run. The disk must run a getty on
+  serial port 1 (`ttyd1`), as a stock IRIX 5.3 install does: without one the
+  login appears only on the framebuffer, whatever the console variable says.
 - `nightly.yml` runs daily at 05:00 UTC, builds `main` as
   `nightly.YYYY.MM.DD`, and replaces the single `nightly` pre-release. It skips
   the day when `main` has not moved.

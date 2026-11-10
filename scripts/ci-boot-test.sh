@@ -135,8 +135,11 @@ check pass $(( $(date +%s) - SEED_START )) "$CHECK"
 log "phase A: done"
 
 # ── Phase B: boot ────────────────────────────────────────────────────────────
-# Serial console (console=d) + AutoLoad: the PROM boots the disk unattended
-# and the login arrives on serial, where the wait below sees it.
+# Serial console (console=d) + AutoLoad: the PROM boots the disk unattended,
+# and the kernel and rc scripts print on serial. "login:" arrives there only
+# from a getty on ttyd1, which the inittab of a stock IRIX 5.3 install runs
+# whatever console is. The console variable does not move the login: a disk
+# without that getty still draws its Visual Login on the framebuffer only.
 
 CHECK="serial console: login prompt"
 start_iris iris.log
@@ -166,7 +169,8 @@ while :; do
 
   if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
     log "no login prompt within ${TIMEOUT}s"
-    check fail "$ELAPSED" "$CHECK" "no login prompt within ${TIMEOUT}s"; break
+    check fail "$ELAPSED" "$CHECK" \
+      "no login prompt within ${TIMEOUT}s; does the disk run a getty on ttyd1?"; break
   fi
   sleep 5
 done
