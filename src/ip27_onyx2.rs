@@ -82,11 +82,20 @@ impl BusDevice for TestWidget {
 pub struct Onyx2Deskside;
 
 impl Onyx2Deskside {
-    /// The BaseIO-G's base board record, with a synthetic barcode and serial.
+    /// The BaseIO-G's records on its Bridge's one-wire line: the base board
+    /// and the MediaIO daughtercard's own, as one published `hinv -vm` lists
+    /// them. The daughtercard's is a separate part, so its ROM serial is
+    /// distinct from the base board's and a one-wire search tells them apart.
+    /// Without it IRIX turns Ethernet on for the MediaIO's IOC3 too, which has
+    /// none. Barcodes and serials are synthetic.
     fn board_record() -> w1::Bus {
         let mut bus = w1::Bus::new();
-        let record = BoardRecord { barcode: "EMUB01", part: "030-0734-002", revision: "N", name: "BASEIO" };
-        bus.add(Box::new(board_record_part(&record, 0x5145_4d55_4201)));
+        for (record, serial) in [
+            (BoardRecord { barcode: "EMUB01", part: "030-0734-002", revision: "N", name: "BASEIO" }, 0x5145_4d55_4201),
+            (BoardRecord { barcode: "EMUD01", part: "030-0880-003", revision: "G", name: "MIO" }, 0x5145_4d55_4401),
+        ] {
+            bus.add(Box::new(board_record_part(&record, serial)));
+        }
         bus
     }
 }
