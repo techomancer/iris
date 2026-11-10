@@ -1,53 +1,38 @@
 //! A wake-up signal between the NIC thread and its network backend.
 //!
 //! Waiters can block on it two ways: [`Wake::wait`] (a condvar, for threads
-//! that only wait for the other side) or, on Unix, by putting [`Wake::fd`] in
-//! a `poll(2)` set next to their sockets (the NAT engine sleeps until either
+//! that only wait for the other side) or [`Wake::poller`], a readiness poller
+//! that host sockets join as [`Watched`] (the NAT engine sleeps until either
 //! the guest sends or a host socket is ready). `notify` serves both.
 //!
 //! A notify is never lost: it sets a flag that the next wait consumes, so a
 //! signal sent while the other side was busy still ends its next wait at once.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
+use polling::{AsSource, Event, PollMode, Poller};
 
 pub struct Wake {
     lock: Mutex<()>,
     cvar: Condvar,
     pending: AtomicBool,
-    #[cfg(unix)]
-    pipe: [libc::c_int; 2], // [read, write], both non-blocking
+    poller: Poller,
+    next_key: AtomicUsize,
 }
 
 impl Wake {
-    pub fn new() -> std::sync::Arc<Self> {
-        #[cfg(unix)]
-        let pipe = {
-            let mut fds = [-1 as libc::c_int; 2];
-            // SAFETY: fds is a valid 2-element array for pipe() to fill.
-            let ok = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
-            if ok {
-                for fd in fds {
-                    // SAFETY: fd was just returned by pipe().
-                    unsafe {
-                        let fl = libc::fcntl(fd, libc::F_GETFL);
-                        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    }
-                }
-                fds
-            } else {
-                [-1, -1]
-            }
-        };
-        std::sync::Arc::new(Self {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
             lock: Mutex::new(()),
             cvar: Condvar::new(),
             pending: AtomicBool::new(false),
-            #[cfg(unix)]
-            pipe,
+            poller: Poller::new().expect("iris: cannot create the network wake poller"),
+            next_key: AtomicUsize::new(0),
         })
     }
 
@@ -56,12 +41,8 @@ impl Wake {
         if self.pending.swap(true, Ordering::AcqRel) {
             return; // already signalled and not yet consumed
         }
-        #[cfg(unix)]
-        if self.pipe[1] >= 0 {
-            // SAFETY: writing one byte from a valid buffer to our own pipe fd.
-            // A full pipe (EAGAIN) still has a byte to wake the reader.
-            unsafe { libc::write(self.pipe[1], [1u8].as_ptr().cast(), 1) };
-        }
+        // With nobody in the poller, this ends its next wait at once.
+        let _ = self.poller.notify();
         // Taking the lock orders this against a waiter between its check of
         // `pending` and its sleep, so the notify can't slip through the gap.
         drop(self.lock.lock());
@@ -78,28 +59,18 @@ impl Wake {
         self.consume()
     }
 
-    /// Clear the signal (after `fd` polled readable, or to start afresh).
-    /// Returns true if it was set.
+    /// Clear the signal (after a wait in `poller` returned, or to start
+    /// afresh). Returns true if it was set. Clear it after the wait and
+    /// before handling the work: a notify landing in between then ends the
+    /// next wait early instead of being lost.
     pub fn consume(&self) -> bool {
-        // Drain first, then clear. The other order loses wakes: a notify
-        // between the two would set the flag and write a byte the drain then
-        // eats, leaving the flag set with an empty pipe, so every later notify
-        // skips the write and a poll(2) sleeper never wakes. In this order a
-        // notify that lands in between only merges with the signal being
-        // consumed, and the caller handles its work after this returns.
-        #[cfg(unix)]
-        if self.pipe[0] >= 0 {
-            let mut buf = [0u8; 64];
-            // SAFETY: reading into a valid local buffer from our own pipe fd.
-            while unsafe { libc::read(self.pipe[0], buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-        }
         self.pending.swap(false, Ordering::AcqRel)
     }
 
-    /// The read end of the self-pipe, readable while a notify is pending.
-    #[cfg(unix)]
-    pub fn fd(&self) -> Option<libc::c_int> {
-        (self.pipe[0] >= 0).then_some(self.pipe[0])
+    /// The poller `notify` wakes. One thread waits in it, with the host
+    /// sockets it registered as [`Watched`].
+    pub fn poller(&self) -> &Poller {
+        &self.poller
     }
 
     /// For the lock-holder diagnostics (`locks` monitor command).
@@ -108,15 +79,57 @@ impl Wake {
     }
 }
 
-impl Drop for Wake {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        for fd in self.pipe {
-            if fd >= 0 {
-                // SAFETY: closing fds we own exactly once.
-                unsafe { libc::close(fd) };
-            }
+/// A host socket in a [`Wake`]'s poller: while it is ready for what it is
+/// watched for, it ends the poller's wait. It leaves the poller when dropped.
+pub(crate) struct Watched<S: AsSource> {
+    sock: S,
+    wake: Arc<Wake>,
+    key: usize,
+    interest: (bool, bool), // (readable, writable) as last registered
+}
+
+impl<S: AsSource> Watched<S> {
+    /// Register `sock`, level-triggered, for readability and/or writability.
+    pub fn new(sock: S, wake: &Arc<Wake>, readable: bool, writable: bool) -> io::Result<Self> {
+        let key = wake.next_key.fetch_add(1, Ordering::Relaxed);
+        let ev = Event::new(key, readable, writable);
+        // SAFETY: `drop` deletes the socket from the poller before it closes.
+        unsafe { wake.poller.add_with_mode(&sock.source(), ev, mode(readable, writable))? };
+        Ok(Self { sock, wake: wake.clone(), key, interest: (readable, writable) })
+    }
+
+    /// The key the poller reports this socket's events under.
+    pub fn key(&self) -> usize {
+        self.key
+    }
+
+    /// Change what the socket is watched for (a system call only on a change).
+    pub fn set_interest(&mut self, readable: bool, writable: bool) {
+        if self.interest == (readable, writable) {
+            return;
         }
+        self.interest = (readable, writable);
+        let ev = Event::new(self.key, readable, writable);
+        let _ = self.wake.poller.modify_with_mode(&self.sock, ev, mode(readable, writable));
+    }
+}
+
+/// Level-triggered, except with no interest: epoll still reports a hang-up
+/// then, and level-triggered that would end every wait until the socket closes.
+fn mode(readable: bool, writable: bool) -> PollMode {
+    if readable || writable { PollMode::Level } else { PollMode::Oneshot }
+}
+
+impl<S: AsSource> Deref for Watched<S> {
+    type Target = S;
+    fn deref(&self) -> &S {
+        &self.sock
+    }
+}
+
+impl<S: AsSource> Drop for Watched<S> {
+    fn drop(&mut self) {
+        let _ = self.wake.poller.delete(&self.sock);
     }
 }
 
@@ -149,20 +162,54 @@ mod tests {
         h.join().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn the_fd_is_readable_while_pending() {
+    fn a_notify_ends_the_poller_wait() {
         let w = Wake::new();
-        let fd = w.fd().unwrap();
-        let readable = |fd| {
-            let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            // SAFETY: one valid pollfd, zero timeout.
-            unsafe { libc::poll(&mut p, 1, 0) > 0 }
-        };
-        assert!(!readable(fd));
+        let mut events = polling::Events::new();
         w.notify();
-        assert!(readable(fd));
+        let t0 = Instant::now();
+        w.poller().wait(&mut events, Some(Duration::from_secs(5))).unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(100));
         assert!(w.consume());
-        assert!(!readable(fd));
+        let t0 = Instant::now();
+        w.poller().wait(&mut events, Some(Duration::from_millis(50))).unwrap();
+        assert!(t0.elapsed() >= Duration::from_millis(45), "consumed");
+    }
+
+    #[test]
+    fn a_watched_socket_ends_the_wait_while_ready() {
+        let w = Wake::new();
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = Watched::new(rx, &w, true, false).unwrap();
+        let mut events = polling::Events::new();
+        let mut ready = || {
+            events.clear();
+            w.poller().wait(&mut events, Some(Duration::from_millis(20))).unwrap();
+            events.iter().any(|e| e.key == sock.key() && e.readable)
+        };
+        assert!(!ready());
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(b"x", sock.local_addr().unwrap()).unwrap();
+        assert!(ready());
+        assert!(ready(), "level-triggered: ready until read");
+        sock.recv_from(&mut [0u8; 8]).unwrap();
+        assert!(!ready());
+    }
+
+    #[test]
+    fn a_reset_socket_watched_for_nothing_ends_one_wait_at_most() {
+        let w = Wake::new();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        let _c = Watched::new(c, &w, false, false).unwrap();
+        socket2::SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
+        drop(s); // the far end resets: a hang-up epoll reports whatever the interest
+        std::thread::sleep(Duration::from_millis(20));
+        let mut events = polling::Events::new();
+        w.poller().wait(&mut events, Some(Duration::from_millis(20))).unwrap();
+        let t0 = Instant::now();
+        w.poller().wait(&mut events, Some(Duration::from_millis(50))).unwrap();
+        assert!(t0.elapsed() >= Duration::from_millis(45), "woken again: {:?}", t0.elapsed());
     }
 }

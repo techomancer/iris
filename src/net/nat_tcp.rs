@@ -146,7 +146,7 @@ impl NatEngine {
         } else {
             let (host_ip, host_port) = self.gateway_to_host(dst_ip, dport);
             dlog_dev!(LogModule::Net, "NAT TCP connect {}:{} → {}:{}", src_ip, syn.sport(), host_ip, host_port);
-            match HostConn::connect(SocketAddr::new(IpAddr::V4(host_ip), host_port)) {
+            match HostConn::connect(SocketAddr::new(IpAddr::V4(host_ip), host_port), &self.tx_wake) {
                 Ok(h) => Backend::Host(h),
                 Err(e) => {
                     dlog_dev!(LogModule::Net, "NAT TCP connect {}:{} failed: {}", host_ip, host_port, e);
@@ -213,7 +213,14 @@ impl NatEngine {
 
     /// Open a connection toward the guest for an accepted forward.
     pub(super) fn tcp_open_to_guest(&mut self, ends: Endpoints, stream: std::net::TcpStream) {
-        let conn = TcpConn::open(ends, Backend::Host(HostConn::connected(stream)));
+        let host = match HostConn::connected(stream, &self.tx_wake) {
+            Ok(h) => h,
+            Err(e) => {
+                dlog_dev!(LogModule::Net, "NAT FWD TCP: cannot watch the accepted socket: {}", e);
+                return;
+            }
+        };
+        let conn = TcpConn::open(ends, Backend::Host(host));
         let syn = conn.syn(self.config.gateway_mac);
         self.tcp_nat.insert((u32::from(ends.remote_ip), ends.remote_port, ends.guest_port), conn);
         self.send(syn);
