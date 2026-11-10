@@ -736,7 +736,8 @@ struct OwnBitmap(Box<u64>);
 //     `set_bitmap_sink2` — is reached only from `Physical::remap_banks`, which
 //     the MC invokes synchronously inside the CPU's store to MEMCFG. That is
 //     always a CPU thread, and with several CPUs the others are parked for it
-//     (`smp::World::stop_others`, wired where HEART's descriptors reach memory).
+//     (`smp::World::stop_others`, wired where HEART's descriptors reach memory
+//     and where Bedrock's MD takes a bank configuration write).
 //   * Device threads (MC-DMA, seeq, VINO) reach RAM through `BusDevice` on the
 //     individual `PpMemory` banks. They never touch `PpMemSpace`.
 //   * `hold_line_page`/`release_line_page` run on a CPU thread at a CACHE

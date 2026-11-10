@@ -342,6 +342,11 @@ impl Bedrock {
             pi.publish(&self.levels);
         }
     }
+    /// The node's processors, which a bank configuration write parks
+    /// while it moves memory under their cached views.
+    pub fn set_world(&self, world: Arc<crate::cpu::smp::World>) {
+        self.md.set_world(world);
+    }
     /// The PIs' comparators and profile timers fire on `tm`. Held weakly.
     pub fn set_timer_manager(&self, tm: &Arc<TimerManager>) {
         let _ = self.timers.set(Arc::downgrade(tm));

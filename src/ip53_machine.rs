@@ -518,6 +518,8 @@ impl TezroMachine {
         // processor's state through the core it is called with.
         let world = Arc::new(World::new());
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
+        // A bank configuration write parks the others while it moves memory.
+        board.bedrock.set_world(world.clone());
         #[cfg(feature = "jitv2")]
         if cpus.len() > 1 {
             if cfg!(feature = "jitv2_lockstep") {
