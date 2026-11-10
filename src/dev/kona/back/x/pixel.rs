@@ -800,6 +800,18 @@ impl XState {
         Some(FeedDone { io, pitch, line: dma.descriptor[3] as usize, data, echo })
     }
 
+    /// A select-feed bracket's host buffer, taking the bracket: the device address of the first
+    /// line, the line pitch, the bytes in a line and in all. None for a bracket the descriptor
+    /// does not describe a buffer for. A feedback or select pass writes there.
+    pub fn feed_buffer(&mut self) -> Option<(u64, u64, usize, usize)> {
+        let dma = self.pixel.read_dma.take()?;
+        if dma.refused {
+            return None;
+        }
+        let (io, pitch, _) = dma.buffer()?;
+        Some((io, pitch, dma.descriptor[3] as usize, dma.descriptor[2] as usize))
+    }
+
     /// The bytes of the rectangle at `args`, or why the store cannot answer
     /// it: the setup or context is not a form the X server's reads send, the
     /// rectangle is off the screen or too big for the page, or a source word

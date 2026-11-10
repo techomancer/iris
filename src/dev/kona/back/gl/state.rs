@@ -232,6 +232,10 @@ pub struct Gl {
     pub texture: Option<TexDesc>,
     /// Pixel-store, transfer and zoom state, the raster position, maps and the accumulation clear value.
     pub pix: super::pixels::Pixels,
+    /// The render mode and what a select or feedback pass has collected.
+    pub feed: super::query::Feed,
+    /// How many attribute-stack entries a push has made and a pop has not taken back.
+    pub attrib_depth: u32,
     /// The draw state built from the above, kept until a state command changes it.
     ds: Option<DrawState>,
 }
@@ -279,6 +283,8 @@ impl Default for Gl {
             clear_stencil: 0,
             texture: None,
             pix: Default::default(),
+            feed: Default::default(),
+            attrib_depth: 0,
             ds: None,
         };
         g.light.init();

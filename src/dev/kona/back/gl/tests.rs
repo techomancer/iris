@@ -907,9 +907,9 @@ fn a_plane_is_kept_in_eye_space_at_the_model_view_of_the_call() {
     assert_eq!(xs(&r), (25 * 256, 100 * 256));
 }
 
-/// A name out of range is an error.
+/// A name out of range is an error, and the planes answer their query in eye space.
 #[test]
-fn a_plane_name_out_of_range_is_an_error() {
+fn a_plane_name_out_of_range_is_an_error_and_the_query_returns_the_plane() {
     let mut r = Rig::new();
     let mut a = vec![gl::CLIP_PLANE0 + 6];
     a.extend(dbl(&[1.0, 0.0, 0.0, 0.0]));
@@ -917,7 +917,10 @@ fn a_plane_name_out_of_range_is_an_error() {
     assert_eq!((r.path.counts.errors, r.gl.error), (1, gl::INVALID_ENUM));
     r.gl.error = 0;
     plane(&mut r, 5, [0.0, 1.0, 0.0, -0.5]);
-    assert_eq!(r.gl.error, 0);
+    let mut c = query::Counts::default();
+    assert_eq!(query::answer(&mut r.gl, &mut c, QUERY_CLIP_PLANE, &[gl::CLIP_PLANE0 + 5]), bits(&[0.0, 1.0, 0.0, -0.5]));
+    assert_eq!(query::answer(&mut r.gl, &mut c, QUERY_CLIP_PLANE, &[gl::CLIP_PLANE0 + 9]), Vec::<u32>::new());
+    assert_eq!(r.gl.error, gl::INVALID_ENUM);
 }
 
 /// Lines and points are cut by a user plane too, and a user plane and the far plane cut together.

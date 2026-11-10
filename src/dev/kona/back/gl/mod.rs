@@ -48,6 +48,7 @@
 //! texture is sampled in `raster`.
 
 pub mod pixels;
+pub mod query;
 pub mod state;
 pub mod texture;
 pub mod vertex;
@@ -100,6 +101,14 @@ fn narrow(selector: u32, a: &[u32]) -> Option<(u32, [u32; 4])> {
         *o = (f64::from_bits((w[0] as u64) << 32 | w[1] as u64) as f32).to_bits();
     }
     Some((float_form, out))
+}
+
+/// A vertex as feedback reports it: window position, depth as a fraction, 1 / w, colour and texture.
+fn feed_vertex(gl: &Gl, v: &KVertex) -> query::Fv {
+    let [vx, vy, vw, vh] = gl.raster.viewport;
+    let [dn, df] = gl.raster.depth_range;
+    let r = if v.h[3] != 0.0 { 1.0 / v.h[3] } else { 0.0 };
+    query::Fv { x: vx + (v.h[0] * r + 1.0) * 0.5 * vw, y: vy + (v.h[1] * r + 1.0) * 0.5 * vh, z: dn + (v.h[2] * r * 0.5 + 0.5) * (df - dn), w: r, c: v.c, t: v.t }
 }
 
 /// `v` with every edge a boundary edge. A triangle or polygon takes its edges from the vertices' flags.
@@ -491,6 +500,11 @@ impl GlPath {
             self.counts.clipped_away += 1;
             return;
         }
+        if gl.feed.mode != query::RENDER {
+            let fv = feed_vertex(gl, &v);
+            gl.feed.primitive(query::POINT, &[fv]);
+            return;
+        }
         self.emit_point(gl, &v, false, prims);
     }
 
@@ -550,6 +564,11 @@ impl GlPath {
         } else {
             (a, b)
         };
+        if gl.feed.mode != query::RENDER {
+            let (fa, fb) = (feed_vertex(gl, &a), feed_vertex(gl, &b));
+            gl.feed.primitive(query::LINE, &[fa, fb]);
+            return;
+        }
         self.emit_line(gl, &a, &b, false, prims);
     }
 
@@ -649,6 +668,12 @@ impl GlPath {
         // A polygon of no area faces neither way: it is not culled, and set-up counts it as having no area.
         if area != 0 && r.cull && (r.cull_mode == gl::FRONT_AND_BACK || (r.cull_mode == gl::FRONT) != back) {
             self.counts.culled += 1;
+            return;
+        }
+        // A feedback or select pass takes what survived clipping and culling, and draws nothing.
+        if gl.feed.mode != query::RENDER {
+            let fvs: Vec<query::Fv> = v[..n].iter().map(|w| feed_vertex(gl, w)).collect();
+            gl.feed.primitive(query::POLYGON, &fvs);
             return;
         }
         // The pipe subtracts the line mode from the face's mode: zero is line, below is point and above is
