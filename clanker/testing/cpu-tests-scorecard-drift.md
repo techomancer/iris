@@ -28,9 +28,7 @@ on 2026-09-11, and IRIS `--cpu r4400` reports **2040 / 124 across 27 tests**
 against an Indy's 240/240. See `cpu-tests/docs/findings.md`.
 
 Check the numbers before concluding a change regressed something, and re-measure
-rather than trusting the table. `run/matrix.sh`'s header comment has a second
-stale claim in the same area — see
-[cpu-model-is-runtime-not-compile-time.md](../cpu/cpu-model-is-runtime-not-compile-time.md).
+rather than trusting the table.
 
 Note the failure *count* is checks, not tests: one failing test contributes
 several. `IRIS-CPUTEST-DONE rc=` saturates at 100, so read the `RESULT:` line.

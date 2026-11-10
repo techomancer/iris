@@ -109,19 +109,18 @@ IRIS ?= ../target/release/iris
 run: $(TARGET)
 	@run/run-local.sh $(TARGET)
 
-# Run the suite on one cell and judge the log with run/check.py; CI runs this
-# too. IRIS must be built for the cell's engine. PREBUILT=1 skips building the
-# guest, for CI, which holds the binary but no cross compiler.
-CPU     ?= r4400
-ENGINE  ?= interp
-CELL    := $(CPU)-$(ENGINE)
-LOG     ?= $(BUILD)/$(CELL).log
-TIMEOUT ?= 900
+# Run the suite on one cell and judge it against expected-failures.txt, as CI
+# does. The cargo test builds the emulator for ENGINE and runs the guest that
+# `make all` built; this only picks the case.
+CPU    ?= r4400
+ENGINE ?= interp
 
 .PHONY: check-run
-check-run: $(if $(PREBUILT),,$(TARGET))
-	@IRIS=$(IRIS) LOG=$(LOG) TIMEOUT=$(TIMEOUT) run/run-local.sh $(TARGET) --cpu $(CPU); \
-	 [ $$? -ne 2 ] && python3 run/check.py $(CELL) $(LOG)
+check-run:
+	$(if $(filter $(CPU),r4400 r5000),,$(error CPU=$(CPU): check-run runs r4400 or r5000))
+	$(if $(filter $(ENGINE),interp jitv2),,$(error ENGINE=$(ENGINE): check-run runs interp or jitv2))
+	cd .. && cargo test --release $(if $(filter jitv2,$(ENGINE)),--features jitv2) \
+	    --test cpu_tests -- --ignored --exact $(CPU)
 
 # ── bootable image ───────────────────────────────────────────────────────────
 MKVH ?= ../target/release/mkvh

@@ -329,7 +329,7 @@ instructions interpreter-only and through real JIT dispatch, steps past the
 first `skip` divergences and stops at the next one.
 
 Verification tools, cheapest first: the `jitv2/equiv_test.rs` unit tests, the
-cpu-tests matrix (`cpu-tests/run/matrix.sh`), `jitcheck`,
+cpu-tests on both CPUs (`cargo test --release --features jitv2 --test cpu_tests -- --ignored`), `jitcheck`,
 `--features jitv2_lockstep` (every instruction checked against the
 interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 `--features fetchverify` (stale code both engines would agree on).

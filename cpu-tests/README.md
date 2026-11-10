@@ -53,17 +53,24 @@ collide with the harness's own 127 ("unknown CPU, refusing to run").
 
 The suite has never passed every check under IRIS. The tests that fail today
 are listed by name, per CPU and engine, in
-[expected-failures.txt](expected-failures.txt). `make check-run` runs the suite
-(through `run/run-local.sh`) and judges the log with `run/check.py`:
+[expected-failures.txt](expected-failures.txt). A cargo integration test,
+[tests/cpu_tests.rs](../tests/cpu_tests.rs), runs the suite on each CPU and
+judges it against that list:
 
 ```sh
-make check-run CPU=r4400 ENGINE=interp      # IRIS= a build for that engine
+cargo test --release --test cpu_tests -- --ignored                    # interp
+cargo test --release --features jitv2 --test cpu_tests -- --ignored   # jitv2
+make check-run CPU=r5000 ENGINE=jitv2                                  # one cell
 ```
 
 It fails when a test fails that the list does not name, when a listed test
-passes (delete its line in the commit that fixed it), or when fewer tests
-report than the `1..N` plan promised. CI runs the same target, with
-`PREBUILT=1` because it holds a downloaded binary and no cross compiler.
+passes (delete its line in the commit that fixed it), when the number of
+results differs from the `1..N` plan or one is misnumbered, or when the run
+never prints `IRIS-CPUTEST-DONE`. It reads the guest from
+`IRIS_CPUTEST_ELF`, else `build/cputest.elf`, and builds the emulator itself,
+for the engine the command names, so a run cannot pick up a stale or
+wrong-engine `iris`. The cases are ignored by a plain `cargo test`. Each run's
+console log is kept under `target/tmp/bare-metal/`.
 
 ### Other CPUs and engines
 
@@ -76,11 +83,10 @@ cargo build --release --features jitv2               # jitv2 (no env var needed)
 # then add --cpu r5000 to the run command above for an R5000
 ```
 
-`run/matrix.sh` does all four CPU × engine combinations, building what it
-needs and judging each with `make check-run`; `CELLS="r4400-jitv2"
-run/matrix.sh` runs just one. The *Bare-metal suites* CI workflow
+The cargo test above runs both CPUs for the engine it was built with; the
+two commands cover all four cells. The *Bare-metal suites* CI workflow
 (`.github/workflows/suites.yml`) runs every cell on each push that touches the
-CPU, through the same target. The JIT adds one expected failure,
+CPU, through the same tests. The JIT adds one expected failure,
 `cache/hit_inv_discards`, because jitv2 implies the transparent cache.
 
 ### Booting it like real hardware
@@ -218,7 +224,7 @@ and the CPU each did about it.
 harness/   startup, exception vectors, CHECK macros, console
 tests/     identity alu muldiv mem branch excep cp0 tlb umode fpu cache mips4
 gen/       fpvectors.py — computes the FP expectation tables
-run/       run-local.sh  matrix.sh  run-prom.sh  bare.toml  boot.toml
+run/       run-local.sh  run-prom.sh  bare.toml  boot.toml
 docs/      findings gotchas status oracle memory-map toolchain
 ```
 

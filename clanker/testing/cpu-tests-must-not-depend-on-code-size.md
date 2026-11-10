@@ -51,6 +51,6 @@ be clear.
   the suite uses for it, or the R4400 raises a VCE.
 - No test expects a VCE, and the handler hides one. If a mapped-memory test
   reads a stale value, check for a VCE before suspecting the cache model.
-- CI fails a run that stops short of its TAP plan (`make check-run`): a
+- CI fails a run that stops short of its TAP plan (`tests/cpu_tests.rs`): a
   derailed run can report no more failures than a healthy one, which a
   count-only gate reads as no change or progress.

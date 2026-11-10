@@ -225,7 +225,7 @@ static void console_tee(int c)
     arcs_putc(c);
 }
 
-/* run/check.py reads one result line per test. Some tests leave a line open. */
+/* tests/cpu_tests.rs reads one result line per test. Some tests leave a line open. */
 static void tap_result(unsigned k, const char *name, int ok, int skip)
 {
     if (last_c != '\n') con_putc('\n');
@@ -267,7 +267,7 @@ int main(void)
         testdev_exit(127);
     }
 
-    /* Announced up front, so check.py can tell a derailed run by its shortfall. */
+    /* Announced up front, so the checker can tell a derailed run by its shortfall. */
     for (gi = 0; gi < n_groups; gi++) planned += all_groups[gi]->count;
     con_printf("1..%u\n", planned);
 

@@ -445,7 +445,7 @@ cpu-tests/
   tests/     alu/ muldiv/ mem/ branch/ excep/ cp0/ tlb/ cache/ fpu/ mips4/ identity/
   gen/       fpvectors.py            # host-computed IEEE-754 expectations
   image/     mkvh.py mkefs.py mkcd.sh
-  run/       run-local.sh matrix.sh cputest.yaml
+  run/       run-local.sh cputest.yaml
   expected/  r4400.txt r5000.txt     # golden transcripts, reviewed not recorded
   docs/      oracle.md prom-boot.md efs-format.md
 ```
@@ -460,7 +460,7 @@ cpu-tests/
 | **1** | Harness + `alu`, `muldiv`, `mem`, `branch` | **done** — 85 tests green |
 | **2** | `excep`, `cp0`, `tlb` | **done** |
 | **3** | `fpu`, `mips4` with the R4400-must-RI differential | **done** — the differential found two bugs; `fpu` has since grown to 88 tests across eight files and `gen/fpvectors.py` now generates its expectation tables, which is where findings 6-10 came from |
-| **4** | `cache`; JIT-vs-interp matrix in CI | **done** — `run/matrix.sh`, `.github/workflows/suites.yml` |
+| **4** | `cache`; JIT-vs-interp matrix in CI | **done** — `tests/cpu_tests.rs`, `.github/workflows/suites.yml` |
 | **5** | Volume header → bootable disk → **EFS CD** | **partly** — `mkvh` image boots through the PROM end to end; the EFS partition is the remaining piece |
 
 ### Where Phase 5 stands
