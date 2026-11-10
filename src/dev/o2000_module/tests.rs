@@ -58,7 +58,7 @@ impl Rig {
         self.clock.advance_ms(ms);
     }
 
-    fn events(&self) -> Vec<ModuleEvent> {
+    fn events(&self) -> Vec<ModuleOutput> {
         self.module.take_events()
     }
 
@@ -206,10 +206,10 @@ impl Rig {
     }
 }
 
-fn power_events(events: &[ModuleEvent]) -> Vec<bool> {
+fn power_events(events: &[ModuleOutput]) -> Vec<bool> {
     events
         .iter()
-        .filter_map(|e| if let ModuleEvent::Power(on) = e { Some(*on) } else { None })
+        .filter_map(|e| if let ModuleOutput::Power(on) = e { Some(*on) } else { None })
         .collect()
 }
 
@@ -562,9 +562,9 @@ fn nmi_pulses_the_modules_output_after_a_second() {
     rig.step_ms(990);
     assert!(rig.events().is_empty());
     rig.step_ms(20);
-    assert_eq!(rig.events(), [ModuleEvent::Nmi(true)]);
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(true)]);
     rig.step_ms(100);
-    assert_eq!(rig.events(), [ModuleEvent::Nmi(false)]);
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(false)]);
     assert_eq!(rig.cmd(0, "ver"), "ok VER 3.2 ");
 }
 
@@ -574,11 +574,12 @@ fn rst_pulses_the_modules_reset_output() {
     rig.events();
     rig.assert_cmd(1, "rst", "ok ");
     rig.step_ms(1000);
-    assert_eq!(rig.events(), [ModuleEvent::Reset(true)]);
+    assert_eq!(rig.events(), [ModuleOutput::Reset]);
     // The pulse is 100 ms, and a destructive command is refused meanwhile.
     rig.assert_cmd(0, "pwr d 0", "err cmd");
     rig.step_ms(100);
-    assert_eq!(rig.events(), [ModuleEvent::Reset(false)]);
+    // The fall of the line is not an output: a restart is the rising edge.
+    assert!(rig.events().is_empty());
     assert_eq!(rig.cmd(0, "ver"), "ok VER 3.2 ");
 }
 

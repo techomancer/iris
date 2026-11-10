@@ -51,14 +51,14 @@
 
 use crate::config::{MachineConfig, MachineProfile};
 use crate::dev::bridge::Bridge;
-use crate::dev::elsc::ElscEvent;
+use crate::dev::elsc::ModuleOutput;
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::rad1::Rad1;
 use crate::dev::node_flash::FlashValues;
-use crate::dev::o2000_module::{ModuleConfig, ModuleEvent, Origin2000Module};
+use crate::dev::o2000_module::{ModuleConfig, Origin2000Module};
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
@@ -209,17 +209,8 @@ impl ModuleController for ModuleManagement {
             self.module.adapter(i).power_on();
         }
     }
-    fn take_events(&self) -> Vec<ElscEvent> {
-        self.module
-            .take_events()
-            .into_iter()
-            .filter_map(|e| match e {
-                ModuleEvent::Power(on) => Some(ElscEvent::Power(on)),
-                ModuleEvent::Reset(true) => Some(ElscEvent::Reset),
-                ModuleEvent::Reset(false) => None,
-                ModuleEvent::Nmi(level) => Some(ElscEvent::Nmi(level)),
-            })
-            .collect()
+    fn take_events(&self) -> Vec<ModuleOutput> {
+        self.module.take_events()
     }
 }
 

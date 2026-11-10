@@ -42,7 +42,7 @@
 //! Ported from hw/misc/sgi-sn0-module-management.c in
 //! jamesbraid/qemu-sgi-origami.
 
-use crate::dev::elsc::{Action, Build, Elsc, ElscConfig, ModuleOps};
+use crate::dev::elsc::{Action, Build, Elsc, ElscConfig, ModuleOps, ModuleOutput};
 use crate::dev::heart::Clock;
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::i2c::{BusBusy, I2cBus, I2cTarget, Service};
@@ -67,18 +67,6 @@ const SERVICE_PERIOD_NS: u64 = 1_000_000;
 const MESSAGE_LIFETIME_NS: u64 = 1_000_000_000;
 const PULSE_NS: u64 = 100_000_000;
 const RECOVERY_TICKS: u32 = 5000;
-
-/// What the module does to the rest of the machine, in the order it
-/// happened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModuleEvent {
-    /// The module's reset line, high for the 100 ms of a pulse.
-    Reset(bool),
-    /// The module's NMI line, high for the 100 ms of a pulse.
-    Nmi(bool),
-    /// The module's power line.
-    Power(bool),
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleConfig {
@@ -141,7 +129,7 @@ struct State {
     /// The controller's queues need reinitialising, once the scheduler's lock
     /// is released: the controller takes its own lock for that.
     reinit: bool,
-    events: Vec<ModuleEvent>,
+    events: Vec<ModuleOutput>,
     /// The level each output line was last driven to; a line is only
     /// reported when it changes.
     reset_line: Option<bool>,
@@ -219,18 +207,22 @@ impl State {
     fn drive_power(&mut self) {
         if self.cfg.can_power && self.power_line != Some(self.power_on) {
             self.power_line = Some(self.power_on);
-            self.events.push(ModuleEvent::Power(self.power_on));
+            self.events.push(ModuleOutput::Power(self.power_on));
         }
     }
 
     fn drive_pulse(&mut self, reset: bool, nmi: bool) {
         if self.cfg.can_reset && self.reset_line != Some(reset) {
             self.reset_line = Some(reset);
-            self.events.push(ModuleEvent::Reset(reset));
+            // The line is high for the 100 ms of a pulse. A restart is asked
+            // for at the rising edge, and nothing waits for the fall.
+            if reset {
+                self.events.push(ModuleOutput::Reset);
+            }
         }
         if self.cfg.can_nmi && self.nmi_line != Some(nmi) {
             self.nmi_line = Some(nmi);
-            self.events.push(ModuleEvent::Nmi(nmi));
+            self.events.push(ModuleOutput::Nmi(nmi));
         }
     }
 
@@ -692,7 +684,7 @@ impl Origin2000Module {
 
     /// The reset, NMI and power lines' changes, in the order they happened,
     /// with time brought up to the present first.
-    pub fn take_events(&self) -> Vec<ModuleEvent> {
+    pub fn take_events(&self) -> Vec<ModuleOutput> {
         self.elsc.poll();
         self.shared.run(|s| std::mem::take(&mut s.events))
     }
