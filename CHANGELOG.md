@@ -582,6 +582,16 @@ where they differed:
   the cost follows what the guest wrote. Reflinking is unchanged. On Windows the
   copy is marked sparse first.
 
+### SGI Tezro (IP53 board, IP35 software platform)
+
+- Added a headless Tezro profile with the 700 MHz R16000 (`r16000_700`, the default; `cpu = "r16000"` takes it too), 4 MiB cache, 4 GiB RAM, a PIC with PXBOW, and the IO9's IOC4, ISP12160 and BCM5701. The 800, 900 and 1000 MHz chips (`r16000_800`, `r16000_900`, `r16000_1000`) are listed and take four processors; see the [Tezro guide](docs/tezro-ip53.md).
+- A Tezro fits one, two or four processors, four by default, and two or four bring a second PIC at widget 11 on the PXBOW's link 11. Every fitted processor runs, each on its own host thread, so a default four-processor Tezro runs four.
+- The Tezro's L1 names its node board for the chip and the processor count, as inventories print it (`IP53_4CPU` 030-1868-001 at 700 MHz, 030-1956-002 at 800 MHz, `IP59_4CPU` and `IP59_2CPU` at 1 GHz, `IP53_2CPU` and `IP53_1CPU` for the smaller 700 MHz boards), so the PROM tries only the fitted processor positions and a one- or two-processor Tezro's first boot does not power-cycle the module for its empty ones.
+- The Tezro's IO9 bus has the TI PCI-to-PCI bridge every Tezro capture shows at device 2, with nothing behind it.
+- A Tezro refuses a `banks` list whose two banks of a pair differ in size: Bedrock keeps one size code for each pair.
+- The Tezro's BCM5701 reports PCI revision 0x15 and has the chip's capability list with vital product data reads, so IRIX's driver no longer waits out its VPD poll at every attach.
+- The Tezro's PIC fails a configuration read of an empty slot as a master timeout, so the PROM no longer records two phantom devices per empty slot.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
