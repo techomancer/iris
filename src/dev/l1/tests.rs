@@ -199,6 +199,26 @@ fn the_l1_system_serial_is_the_station_address_in_hex() {
     assert_eq!(request(&l1, 8, &[], 0), text_reply("00A0C91F02BE"));
 }
 
+/// A configured system serial replaces the address text in request 0x0008
+/// and nothing else: the brick serial and the board serial in the node
+/// board's record, which the PROM ties its NVRAM to, stay the same.
+#[test]
+fn a_system_serial_changes_only_the_system_serial_reply() {
+    let plain = L1::new(Default::default()).unwrap();
+    let set = L1::new(L1Config { system_serial: Some("LEMU200420".into()), ..Default::default() }).unwrap();
+    for l1 in [&plain, &set] {
+        l1.power_on();
+    }
+    assert_eq!(request(&set, 8, &[], 0), text_reply("LEMU200420"));
+    assert_eq!(request(&plain, 8, &[], 0), text_reply("080069123456"));
+    assert_eq!(request(&set, 4, &[], 0), request(&plain, 4, &[], 0));
+    assert_eq!(set.state.lock().records, plain.state.lock().records);
+    assert_eq!(
+        L1::new(L1Config { system_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
+        Some("L1 system serial must fit a 37-byte text field")
+    );
+}
+
 /// The L1 parser recovers after malformed frames.
 #[test]
 fn the_l1_resynchronizes_after_bad_frames() {

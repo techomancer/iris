@@ -148,6 +148,13 @@ impl L1 {
         {
             return Err("L1 brick serial must fit a 37-byte text field".into());
         }
+        if config
+            .system_serial
+            .as_ref()
+            .is_some_and(|s| s.len() > 37 || s.as_bytes().contains(&0))
+        {
+            return Err("L1 system serial must fit a 37-byte text field".into());
+        }
 
         let protocol_rx = Arc::new(Mutex::new(VecDeque::new()));
         let state = Arc::new(Mutex::new(State::new(config, protocol_rx.clone())));
