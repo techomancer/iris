@@ -33,7 +33,7 @@ use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::devlog::LogModule;
-use crate::ip27_machine::{cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, Node, NodeRecord};
+use crate::ip27_machine::{section, table, cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, Node, NodeRecord};
 use crate::pci::DevFn;
 use crate::ip27_origin2000::{Origin2000, BRIDGE_REVISION, MAX_NODES, XBOW_REVISION};
 use crate::traits::{BusDevice, BusRead32, BusRead64, Resettable, BUS_ERR};
@@ -150,9 +150,9 @@ impl Ip27Board for Onyx2Deskside {
 
     fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String> {
         let module = *cpu_module(cfg.cpu_part()?).ok_or("an Onyx2 has an R10000 or an R12000")?;
-        let nodes = usize::from(cfg.origin2000.nodes);
+        let nodes = usize::from(section(cfg).nodes);
         if !(1..=MAX_NODES).contains(&nodes) {
-            return Err(format!("origin2000.nodes {nodes}: the deskside has one or two node boards"));
+            return Err(format!("{}.nodes {nodes}: the deskside has one or two node boards", table(cfg)));
         }
         Ok((0..nodes)
             .map(|node| BoardSpec {
@@ -171,7 +171,7 @@ impl Ip27Board for Onyx2Deskside {
                     machine_type: 0,
                     ..FlashValues::ORIGIN200_R10000_180_1M
                 },
-                flash_file: Origin2000::per_node(&cfg.origin2000.flash, node),
+                flash_file: Origin2000::per_node(&section(cfg).flash, node),
                 node_record: Some(NodeRecord::IP27),
             })
             .collect())

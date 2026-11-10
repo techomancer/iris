@@ -674,7 +674,7 @@ pub enum MachineProfile {
     Origin2000Ip27,
     /// SGI Onyx2 deskside: one or two IP27 node boards sharing one Crossbow,
     /// the BaseIO-G at widget 15 and a graphics slot at widget 8, which holds
-    /// a test widget. Configured by the shared keys and `[origin2000]`; see
+    /// a test widget. Configured by the shared keys and `[onyx2]`; see
     /// `src/ip27_onyx2.rs`.
     Onyx2Ip27,
     /// SGI Fuel: the IP34 board on the IP35 software platform, headless or
@@ -759,6 +759,16 @@ impl MachineProfile {
             Self::Onyx2Ip27 => "onyx2_ip27",
             Self::FuelIp34 => "fuel_ip34",
             Self::TezroIp53 => "tezro_ip53",
+        }
+    }
+
+    /// The table of SN0 keys the product reads, `None` for the other machines.
+    pub fn ip27_table(self) -> Option<&'static str> {
+        match self {
+            Self::Origin200Ip29 => Some("origin200"),
+            Self::Origin2000Ip27 => Some("origin2000"),
+            Self::Onyx2Ip27 => Some("onyx2"),
+            _ => None,
         }
     }
 
@@ -1346,55 +1356,40 @@ impl OctaneSection {
     }
 }
 
-/// `[origin200]`: the Origin 200's persistent stores.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Origin200Section {
-    /// Persistent 1 MiB node boot flash; absent means volatile flash.
-    #[serde(default)]
-    pub flash: Option<String>,
-    /// Persistent 2048-byte module controller store; absent means volatile.
-    #[serde(default)]
-    pub controller_store: Option<String>,
-}
-
-impl Origin200Section {
-    /// Left out of a written config when nothing in it was set.
-    fn is_default(&self) -> bool {
-        self.flash.is_none() && self.controller_store.is_none()
-    }
-}
-
-/// `[origin2000]`: the Origin 2000 deskside's node count and persistent
-/// stores.
+/// `[origin200]`, `[origin2000]` and `[onyx2]`: the keys the SN0 machines have
+/// beyond the shared ones. Each product reads the table named for it
+/// ([`MachineConfig::ip27_section`]); the Origin 200 has one node, so `nodes`
+/// is refused there.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Origin2000Section {
-    /// Node boards: 1 or 2. The second joins the first by the direct cable.
-    #[serde(default = "default_origin2000_nodes")]
+pub struct Ip27Section {
+    /// Node boards on a deskside: 1 or 2. The second joins the first by the
+    /// direct cable.
+    #[serde(default = "default_ip27_nodes")]
     pub nodes: u8,
-    /// Persistent 1 MiB node boot flash of the first node; the second keeps
-    /// its own beside it, at the name with `.1` added. Absent means volatile.
+    /// Persistent 1 MiB node boot flash (of the first node on a deskside; the
+    /// second keeps its own beside it, at the name with `.1` added). Absent
+    /// means volatile.
     #[serde(default)]
     pub flash: Option<String>,
-    /// Persistent file for the module's one controller store. Absent means
+    /// Persistent 2048-byte store for the module controller. Absent means
     /// volatile.
     #[serde(default)]
     pub controller_store: Option<String>,
 }
 
-fn default_origin2000_nodes() -> u8 { 1 }
+fn default_ip27_nodes() -> u8 { 1 }
 
-impl Default for Origin2000Section {
+impl Default for Ip27Section {
     fn default() -> Self {
-        Self { nodes: default_origin2000_nodes(), flash: None, controller_store: None }
+        Self { nodes: default_ip27_nodes(), flash: None, controller_store: None }
     }
 }
 
-impl Origin2000Section {
+impl Ip27Section {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
-        self.nodes == default_origin2000_nodes() && self.flash.is_none() && self.controller_store.is_none()
+        self.nodes == default_ip27_nodes() && self.flash.is_none() && self.controller_store.is_none()
     }
 }
 
@@ -2247,12 +2242,15 @@ pub struct MachineConfig {
     /// The Octane (`[octane]` section), used when `[machine] profile = "octane_ip30"`.
     #[serde(default, skip_serializing_if = "OctaneSection::is_default")]
     pub octane: OctaneSection,
-    /// Persistent flash and controller store for the Origin 200.
-    #[serde(default, skip_serializing_if = "Origin200Section::is_default")]
-    pub origin200: Origin200Section,
-    /// Node count and persistent stores for the Origin 2000 deskside.
-    #[serde(default, skip_serializing_if = "Origin2000Section::is_default")]
-    pub origin2000: Origin2000Section,
+    /// The Origin 200 (`[origin200]` section), used when `[machine] profile = "origin200_ip29"`.
+    #[serde(default, skip_serializing_if = "Ip27Section::is_default")]
+    pub origin200: Ip27Section,
+    /// The Origin 2000 deskside (`[origin2000]` section), used when `[machine] profile = "origin2000_ip27"`.
+    #[serde(default, skip_serializing_if = "Ip27Section::is_default")]
+    pub origin2000: Ip27Section,
+    /// The Onyx2 deskside (`[onyx2]` section), used when `[machine] profile = "onyx2_ip27"`.
+    #[serde(default, skip_serializing_if = "Ip27Section::is_default")]
+    pub onyx2: Ip27Section,
 
     /// Serial console and flash storage for the Fuel.
     #[serde(default, skip_serializing_if = "FuelSection::is_default")]
@@ -2500,8 +2498,9 @@ impl Default for MachineConfig {
             jitv2: Jitv2Config::default(),
             o2: O2Section::default(),
             octane: OctaneSection::default(),
-            origin200: Origin200Section::default(),
-            origin2000: Origin2000Section::default(),
+            origin200: Ip27Section::default(),
+            origin2000: Ip27Section::default(),
+            onyx2: Ip27Section::default(),
             fuel: FuelSection::default(),
             tezro: TezroSection::default(),
             perf: PerfConfig::default(),
@@ -2838,8 +2837,39 @@ impl MachineConfig {
         self.machine.cpu = Some(part.name());
     }
 
+    /// The table an SN0 product reads, named for it; `None` for the other
+    /// machines.
+    pub fn ip27_section(&self) -> Option<&Ip27Section> {
+        match self.machine.profile {
+            MachineProfile::Origin200Ip29 => Some(&self.origin200),
+            MachineProfile::Origin2000Ip27 => Some(&self.origin2000),
+            MachineProfile::Onyx2Ip27 => Some(&self.onyx2),
+            _ => None,
+        }
+    }
+
+    /// Refuse an SN0 table that is not the profile's own, and `nodes` where
+    /// the product has one node board.
+    fn validate_ip27_sections(&self) -> Result<(), String> {
+        let profile = self.machine.profile;
+        for (name, section) in [("origin200", &self.origin200), ("origin2000", &self.origin2000), ("onyx2", &self.onyx2)] {
+            if section.is_default() || profile.ip27_table() == Some(name) {
+                continue;
+            }
+            return Err(match profile.ip27_table() {
+                Some(own) => format!("[{name}] does not apply to machine.profile {}, which reads [{own}]: rename the table", profile.name()),
+                None => format!("[{name}] is set but machine.profile is {}", profile.name()),
+            });
+        }
+        if profile == MachineProfile::Origin200Ip29 && self.origin200.nodes != default_ip27_nodes() {
+            return Err("origin200.nodes: an Origin 200 has one node board".into());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.validate_virtio_serial()?;
+        self.validate_ip27_sections()?;
         self.xio_widgets()?;
         self.validate_nvme()?;
         self.cpu_part()?;
@@ -4245,6 +4275,55 @@ mod export_tests {
             assert_eq!(cfg.machine.profile, p);
             assert_eq!(MachineProfile::from_name(p.name()), Ok(p));
         }
+    }
+
+    fn sn0(profile: &str, tables: &str) -> MachineConfig {
+        toml::from_str(&format!("[machine]\nprofile = \"{profile}\"\n{tables}")).unwrap()
+    }
+
+    /// Each SN0 product reads the table named for it, and only that one.
+    #[test]
+    fn each_sn0_product_reads_its_own_table() {
+        for (profile, table) in [("origin200_ip29", "origin200"), ("origin2000_ip27", "origin2000"), ("onyx2_ip27", "onyx2")] {
+            let cfg = sn0(profile, &format!("[{table}]\nflash = \"f\"\ncontroller_store = \"c\"\n"));
+            cfg.validate().unwrap();
+            let section = cfg.ip27_section().unwrap();
+            assert_eq!((section.flash.as_deref(), section.controller_store.as_deref()), (Some("f"), Some("c")), "{profile}");
+            assert_eq!(cfg.machine.profile.ip27_table(), Some(table));
+        }
+        assert!(sn0("octane_ip30", "").ip27_section().is_none());
+    }
+
+    /// A table is written to a saved config only for the product that sets it.
+    #[test]
+    fn only_the_products_own_sn0_table_is_written() {
+        let cfg = sn0("onyx2_ip27", "[onyx2]\nnodes = 2\n");
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("[onyx2]") && !text.contains("[origin"), "{text}");
+        let back: MachineConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.onyx2.nodes, 2);
+        assert!(!toml::to_string(&sn0("origin200_ip29", "")).unwrap().contains("[origin"));
+    }
+
+    /// The Onyx2 once read `[origin2000]`; a file that still says so is told
+    /// what to rename, and so is any other table that is not the profile's.
+    #[test]
+    fn a_table_for_another_sn0_product_is_refused() {
+        let e = sn0("onyx2_ip27", "[origin2000]\nnodes = 2\n").validate().unwrap_err();
+        assert!(e.contains("[origin2000]") && e.contains("reads [onyx2]") && e.contains("rename"), "{e}");
+        let e = sn0("origin2000_ip27", "[origin200]\nflash = \"f\"\n").validate().unwrap_err();
+        assert!(e.contains("[origin200]") && e.contains("reads [origin2000]"), "{e}");
+        let e = sn0("origin200_ip29", "[origin2000]\nflash = \"f\"\n").validate().unwrap_err();
+        assert!(e.contains("[origin2000]") && e.contains("reads [origin200]"), "{e}");
+        let e = sn0("octane_ip30", "[onyx2]\nflash = \"f\"\n").validate().unwrap_err();
+        assert!(e.contains("[onyx2]") && e.contains("octane_ip30"), "{e}");
+    }
+
+    #[test]
+    fn the_origin_200_has_one_node() {
+        let e = sn0("origin200_ip29", "[origin200]\nnodes = 2\n").validate().unwrap_err();
+        assert!(e.contains("origin200.nodes"), "{e}");
+        sn0("origin200_ip29", "[origin200]\nnodes = 1\n").validate().unwrap();
     }
 
     /// A profile says which processors and counts it accepts, and `validate()`

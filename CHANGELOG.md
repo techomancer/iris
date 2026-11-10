@@ -205,7 +205,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `machine.profile = "onyx2_ip27"` runs the stock IP27 PROM on one or two Hub
   nodes of an Onyx2 deskside, sharing one Crossbow, with a test widget in the
   graphics slot, and boots an installed IRIX 6.5.30 to a serial login with one
-  node. See [the guide](docs/onyx2-ip27.md).
+  node. Its own keys are in `[onyx2]`, as `[origin200]` and `[origin2000]` hold
+  the other two products'; a table that is not the profile's own is refused.
+  An existing Onyx2 config file that keeps its keys under `[origin2000]` must
+  rename that table to `[onyx2]`; iris refuses it otherwise and names the
+  table to rename. See [the guide](docs/onyx2-ip27.md).
 
 ### Origin 2000
 

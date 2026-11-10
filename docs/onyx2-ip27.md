@@ -9,9 +9,11 @@ identification word and nothing else.
 
 ## Configuration
 
-Use [`origin2000.toml.example`](../origin2000.toml.example) with
-`machine.profile = "onyx2_ip27"`; `[origin2000]` (`nodes`, `flash`,
-`controller_store`) configures this machine too. Node slot 1 drives raw slot
+Copy [`onyx2.toml.example`](../onyx2.toml.example) to `onyx2.toml`, provide the
+PROM and disk named there, and run `iris --config onyx2.toml`. The sample
+selects `machine.profile = "onyx2_ip27"`; `[onyx2]` (`nodes`, `flash`,
+`controller_store`) holds its own keys. A file that still names `[origin2000]`
+for an Onyx2 is refused, with the table to rename it to. Node slot 1 drives raw slot
 identity 3 into its Hub and takes widget 10; slot 2 drives 2 and takes widget 9.
 With one node, the board is in slot 1.
 

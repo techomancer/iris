@@ -42,7 +42,7 @@ use crate::traits::Resettable;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::Xbow;
-use crate::ip27_machine::{cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord};
+use crate::ip27_machine::{section, table, cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord};
 use crate::xtalk::{Upstream, XtalkHost};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -129,9 +129,9 @@ impl Origin2000 {
     /// The module controller: one for the module, in front of every node's
     /// I2C controller.
     pub(crate) fn controller(nodes: &[&Node], cfg: &MachineConfig) -> Result<Arc<ModuleManagement>, String> {
-        let store = ElscNvram::origin2000(MODULE_NUMBER, cfg.origin2000.controller_store.as_deref().map(Path::new))
+        let store = ElscNvram::origin2000(MODULE_NUMBER, section(cfg).controller_store.as_deref().map(Path::new))
             .map(Arc::new)
-            .map_err(|e| format!("origin2000.controller_store: {e}"))?;
+            .map_err(|e| format!("{}.controller_store: {e}", table(cfg)))?;
         let module = Origin2000Module::new(ModuleConfig { module_number: MODULE_NUMBER, ..Default::default() }, store, nodes[0].clock.clone());
         for (i, node) in nodes.iter().enumerate() {
             node.hub.attach_i2c(module.adapter(i));
@@ -149,9 +149,9 @@ impl Ip27Board for Origin2000 {
 
     fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String> {
         let module = *cpu_module(cfg.cpu_part()?).ok_or("an Origin 2000 has an R10000 or an R12000")?;
-        let nodes = usize::from(cfg.origin2000.nodes);
+        let nodes = usize::from(section(cfg).nodes);
         if !(1..=MAX_NODES).contains(&nodes) {
-            return Err(format!("origin2000.nodes {nodes}: the deskside has one or two node boards"));
+            return Err(format!("{}.nodes {nodes}: the deskside has one or two node boards", table(cfg)));
         }
         Ok((0..nodes)
             .map(|node| BoardSpec {
@@ -174,7 +174,7 @@ impl Ip27Board for Origin2000 {
                     machine_type: 0,
                     ..FlashValues::ORIGIN200_R10000_180_1M
                 },
-                flash_file: Self::per_node(&cfg.origin2000.flash, node),
+                flash_file: Self::per_node(&section(cfg).flash, node),
                 node_record: Some(NodeRecord::IP27),
             })
             .collect())
