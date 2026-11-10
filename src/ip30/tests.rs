@@ -520,11 +520,11 @@ impl Octane {
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
         let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()), &crate::ip30::PCI0);
 
-        let eth = Ioc3Eth::with_negotiation_delay(MAC, std::time::Duration::ZERO);
+        let ioc3 = Arc::new(Ioc3::octane(MAC, false));
+        let eth = ioc3.eth().unwrap().clone();
+        eth.negotiate_at_once();
         let (link, sent, inject) = crate::net::Link::loopback();
         eth.attach(link);
-        let ioc3 = Arc::new(Ioc3::octane(MAC, false));
-        ioc3.attach_eth(eth.clone());
         ioc3.connect_superio_interrupt(bridge.bus().board_irq(crate::pci::BoardIrq(SUPERIO_PIN as u8)));
 
         let isp = [Arc::new(Isp1040::new_at(0, Isp1040::new_bus())), Arc::new(Isp1040::new_at(1, Isp1040::new_bus()))];
