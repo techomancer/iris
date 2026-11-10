@@ -25,7 +25,7 @@ use crate::dev::bridge::{Bridge, RawFlash};
 use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
 use crate::dev::ioc3::Ioc3;
-use crate::dev::ioc3_eth::Ioc3Eth;
+use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::mgras::hq4::ImpactXio;
 use crate::dev::odyssey::Odyssey;

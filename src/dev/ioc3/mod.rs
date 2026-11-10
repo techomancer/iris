@@ -5,7 +5,7 @@
 //! a parallel port, a MicroLAN (one-wire) master, the GPIO pins, a DS1685
 //! clock on the Octane byte bus or Fuel's flat system Timekeeper, the
 //! Ethernet buffer RAM and, in the register range at 0xf0,
-//! the Ethernet MAC (which lives in `ioc3_eth.rs` behind
+//! the Ethernet MAC (which lives in `eth.rs` behind
 //! [`Ioc3EthPort`]).
 //!
 //! Behaviour follows the public Linux and OpenBSD drivers and measured guest
@@ -46,6 +46,9 @@
 //! Ported from hw/misc/sgi-ioc3.c and its serial, parallel and keyboard siblings
 //! in jamesbraid/qemu-sgi-origami.
 
+pub mod eth;
+pub mod port;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -56,7 +59,7 @@ use std::time::{Duration, Instant};
 
 use crate::dev::battery_clock;
 use crate::dev::ds1687::{image, MaceRtc};
-use crate::dev::ioc3_port::Ioc3EthPort;
+use self::port::Ioc3EthPort;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{self, BoardRecord};
@@ -3119,5 +3122,4 @@ impl Saveable for Ioc3 {
 }
 
 #[cfg(test)]
-#[path = "ioc3_tests.rs"]
 mod tests;

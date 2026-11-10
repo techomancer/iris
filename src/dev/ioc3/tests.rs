@@ -1809,8 +1809,8 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     r.w8(reg::BYTEBUS_DEV1, 0x40);
     r.w8(reg::BYTEBUS_DEV2, 0x55);
     assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0);
-    r.c.attach_eth(crate::dev::ioc3_eth::Ioc3Eth::new_fuel(MAC));
-    use crate::dev::ioc3_eth::{bits::MII_READ, reg::{MII_CONTROL, MII_DATA_R, MII_DATA_W}};
+    r.c.attach_eth(crate::dev::ioc3::eth::Ioc3Eth::new_fuel(MAC));
+    use crate::dev::ioc3::eth::{bits::MII_READ, reg::{MII_CONTROL, MII_DATA_R, MII_DATA_W}};
     r.w32(MII_DATA_W, 7);
     r.w32(MII_CONTROL, (1 << 5) | 0x19);
     r.w32(reg::PIN_CONTROL_SET, 1 << 5);

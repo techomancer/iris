@@ -49,7 +49,7 @@ use crate::dev::hub::{Hub, HubConfig, HubHooks, Space};
 use crate::dev::hub_pi;
 use crate::dev::i2c::{BusBusy, I2cBus};
 use crate::dev::ioc3::{Ioc3, Ioc3Config};
-use crate::dev::ioc3_eth::Ioc3Eth;
+use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::node_flash::{self, FlashValues, NodeFlash};
 use crate::dev::pcf8584::Pcf8584;

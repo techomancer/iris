@@ -1,7 +1,7 @@
 //! The ICS1890 transceiver fitted to Octane's IOC3.
 //!
 //! This module is shared by the Octane IOC3 Ethernet model. It was moved here
-//! from `ioc3_eth.rs`; its management-register behavior follows the existing
+//! from `ioc3/eth.rs`; its management-register behavior follows the existing
 //! Octane behavior and Integrated Circuit Systems, "ICS1890 10Base-T/100Base-TX
 //! Integrated PHYceiver", document ICS1890RevG, 21 October 1997.
 //!
@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::dev::ioc3_eth::MiiPhy;
+use crate::dev::ioc3::eth::MiiPhy;
 use crate::snapshot::{field_bool, field_u16, field_u32, field_u64, field_u8, StateTable};
 
 /// Ordinary and command-override writable masks, by register.

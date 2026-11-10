@@ -427,7 +427,7 @@ impl Dp83843 {
     }
 }
 
-impl crate::dev::ioc3_eth::MiiPhy for Dp83843 {
+impl crate::dev::ioc3::eth::MiiPhy for Dp83843 {
     fn address(&self) -> u8 { Dp83843::address(self) }
     fn deadline(&self) -> Option<Instant> { Dp83843::deadline(self) }
     fn wire_enabled(&self) -> bool { Dp83843::wire_enabled(self) }
