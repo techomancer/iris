@@ -100,12 +100,12 @@ jobs:
       - name: Toolchain
         shell: bash
         run: rustup show && rustup target add ${{ matrix.target }}
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Install Inno Setup
@@ -137,6 +137,7 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Toolchain
         run: rustup show && rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      # Only macOS caches `target`: its build is the slowest, and a hit pays.
       - uses: actions/cache@v5
         with:
           path: |
@@ -239,12 +240,12 @@ jobs:
         run: |
           rustup show
           cargo install --locked cargo-deb cargo-generate-rpm
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Build and package
@@ -280,12 +281,12 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-appimage-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-appimage-${{ matrix.arch }}-
       - name: Build and bundle
