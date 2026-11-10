@@ -1564,6 +1564,70 @@ fn pwr_d_posts_pd_remote_to_the_hubs() {
     rig.assert_reply("clr", "ok ");
 }
 
+/// The controller says when it next has an output to give, and not for the
+/// grant ring's ticks: an idle controller is never due, a pending NMI is due
+/// when its wait ends and its pulse when that ends, and a power-down
+/// countdown is due when it runs out.
+#[test]
+fn the_controller_reports_when_it_is_next_due() {
+    let ms = Duration::from_millis;
+    let rig = Rig::new();
+    assert_eq!(rig.elsc.next_due(), None, "the ring ticks, but nothing is due");
+    rig.assert_reply("nmi", "ok ");
+    assert_eq!(rig.elsc.next_due(), Some(ms(1000)));
+    rig.step_ms(400);
+    assert_eq!(rig.elsc.next_due(), Some(ms(600)));
+    rig.step_ms(600);
+    assert_eq!(rig.elsc.next_due(), Some(ms(0)), "due now");
+    rig.elsc.poll();
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(true)]);
+    assert_eq!(rig.elsc.next_due(), Some(ms(100)), "the pulse ends");
+    rig.step_ms(100);
+    rig.elsc.poll();
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(false)]);
+    assert_eq!(rig.elsc.next_due(), None);
+
+    rig.assert_reply("pwr d 3", "ok ");
+    let countdown = rig.elsc.next_due().expect("a power-down is counting down");
+    assert!(countdown > ms(2900) && countdown <= ms(3000), "{countdown:?}");
+    rig.step_secs(3);
+    rig.elsc.poll();
+    assert_eq!(power_events(&rig.events()), [false]);
+}
+
+/// A bus access that passes a deadline before the machine's visit queues the
+/// output itself and clears the timer. The controller stays due until the
+/// outputs are taken, or the power-off, reset or NMI would wait for the next
+/// unrelated access.
+#[test]
+fn an_access_that_beats_the_visit_leaves_its_outputs_due() {
+    let rig = Rig::new();
+    rig.assert_reply("nmi", "ok ");
+    rig.step_ms(1100);
+    rig.assert_reply("ver", "ok V 3.1S  ");
+    assert_eq!(rig.elsc.next_due(), Some(Duration::ZERO), "the queued outputs are due now");
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(true), ModuleOutput::Nmi(false)]);
+    assert_eq!(rig.elsc.next_due(), None, "taken, so nothing is due");
+}
+
+/// An access that moves the schedule wakes the machine, and one that leaves
+/// it alone does not.
+#[test]
+fn an_access_wakes_the_machine_only_when_the_schedule_moved() {
+    let rig = Rig::new();
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let w = woken.clone();
+    rig.elsc.set_wake(Box::new(move || {
+        w.fetch_add(1, Ordering::SeqCst);
+    }));
+    rig.assert_reply("ver", "ok V 3.1S  ");
+    let after_first = woken.load(Ordering::SeqCst);
+    rig.assert_reply("ver", "ok V 3.1S  ");
+    assert_eq!(woken.load(Ordering::SeqCst), after_first, "a query changes nothing");
+    rig.assert_reply("nmi", "ok ");
+    assert!(woken.load(Ordering::SeqCst) > after_first, "an NMI request arms a timer");
+}
+
 #[test]
 fn nmi_pulses_after_one_second_for_100_ms_and_frees_the_lock() {
     let rig = Rig::new();

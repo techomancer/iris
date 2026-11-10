@@ -67,6 +67,7 @@ use crate::ip27_machine::{cpu_module, fit_io_prom, pci_devices, product, PciPopu
 use crate::traits::{BusDevice, Resettable};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub type DesksideMachine = Ip27Machine<Deskside>;
 
@@ -186,6 +187,12 @@ impl ModuleController for ModuleManagement {
     }
     fn take_events(&self) -> Vec<ModuleOutput> {
         self.module.take_events()
+    }
+    fn next_due(&self) -> Option<Duration> {
+        self.module.next_due()
+    }
+    fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        self.module.set_wake(wake);
     }
 }
 

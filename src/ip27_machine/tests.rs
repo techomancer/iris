@@ -154,19 +154,96 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
     });
 }
 
+/// A controller whose next due time and outputs the test sets.
+struct Scripted {
+    due: Mutex<Option<Duration>>,
+    outputs: Mutex<Vec<ModuleOutput>>,
+    wake: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl Scripted {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { due: Mutex::new(None), outputs: Mutex::new(Vec::new()), wake: Default::default() })
+    }
+
+    /// The controller's schedule moved, as a bus access would have moved it.
+    fn schedule(&self, due: Option<Duration>, outputs: &[ModuleOutput]) {
+        *self.due.lock() = due;
+        self.outputs.lock().extend_from_slice(outputs);
+        (self.wake.get().expect("the watch installs its wake"))();
+    }
+}
+
+impl ModuleController for Scripted {
+    fn reset(&self) {}
+    fn take_events(&self) -> Vec<ModuleOutput> {
+        *self.due.lock() = None;
+        std::mem::take(&mut *self.outputs.lock())
+    }
+    fn next_due(&self) -> Option<Duration> {
+        *self.due.lock()
+    }
+    fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.wake.set(wake);
+    }
+}
+
+/// The controller is visited when it says it is due and not before, a change
+/// to its schedule re-arms the one timer rather than adding another, and a
+/// stopped machine holds no timer.
 #[test]
-fn the_controller_is_brought_up_to_date_by_a_timer_and_stopped_with_the_machine() {
+fn the_controller_is_visited_when_due_and_not_while_stopped() {
+    let timers = Arc::new(TimerManager::new());
+    let (tx, rx) = channel();
+    let controller = Scripted::new();
+    let watch = ControllerWatch::new(controller.clone(), tx, &timers);
+    let wait = |what: &str| rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("{what}: no output"));
+    // The visit sends its outputs, then arms for what is next: wait for the
+    // arming to settle on nothing.
+    let settled = |watch: &ControllerWatch| {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while watch.armed().is_some() && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        watch.armed().is_none()
+    };
+
+    // Nothing pending: nothing armed, and a stopped watch arms nothing.
+    controller.schedule(Some(Duration::from_millis(10)), &[ModuleOutput::Power(false)]);
+    assert!(watch.armed().is_none(), "stopped");
+    watch.start();
+    assert!(watch.armed().is_none() || controller.next_due().is_some());
+    assert!(matches!(wait("power"), MachineEvent::PowerOff));
+    assert!(settled(&watch), "nothing is pending after the visit");
+
+    // A schedule that moves while armed replaces the timer.
+    controller.schedule(Some(Duration::from_secs(3600)), &[]);
+    let far = watch.armed().expect("armed for an hour");
+    controller.schedule(Some(Duration::from_millis(10)), &[ModuleOutput::Reset]);
+    assert_ne!(watch.armed(), Some(far));
+    assert!(matches!(wait("reset"), MachineEvent::HardReset));
+
+    // Stopping removes the timer, and a later move arms none.
+    controller.schedule(Some(Duration::from_secs(3600)), &[]);
+    assert!(watch.armed().is_some());
+    watch.stop();
+    assert!(watch.armed().is_none());
+    controller.schedule(Some(Duration::from_secs(3600)), &[]);
+    assert!(watch.armed().is_none());
+}
+
+/// A real machine arms its controller when started, for whatever the
+/// controller has pending, and holds nothing once stopped.
+#[test]
+fn a_machines_controller_is_armed_for_what_it_has_pending_and_stopped_with_the_machine() {
     big_stack(|| {
         let dir = Scratch::new("o200-timer");
         let mut m = Origin200Machine::new(&config(&dir.0)).unwrap();
-        assert!(m.controller_timer.is_none());
+        assert!(m.watch.armed().is_none());
         m.restart_peripherals();
-        let first = m.controller_timer;
-        assert!(first.is_some());
-        m.restart_peripherals();
-        assert_ne!(m.controller_timer, first, "a restart replaces the timer, never doubling it");
+        assert_eq!(m.watch.armed().is_some(), m.io.controller.next_due().is_some());
         m.stop();
-        assert!(m.controller_timer.is_none());
+        assert!(m.watch.armed().is_none());
     });
 }
 
