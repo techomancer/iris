@@ -1791,4 +1791,8 @@ fn window_openbsd_interleave_response() {
     assert_eq!(g32(&r.response(1), 4), 0xa2);
 }
 
+mod irix_tests;
+mod loop_tests;
 mod nvram_tests;
+mod scsi_tests;
+mod state_tests;

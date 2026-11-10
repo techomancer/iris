@@ -6,6 +6,12 @@
 //! retained, so a checksum can be verified and read back, and never run: the
 //! mailbox commands and rings the firmware would provide are done here.
 //!
+//! Behind the host interface sits a private arbitrated loop kept inside the
+//! device. Firmware hides Fibre Channel from the host, which sees loop IDs,
+//! names and SCSI commands, so frames, logins and loop initialisation are
+//! not modelled. Each target on the adapter's [`ScsiBus`] is the one port of
+//! the loop ID equal to its SCSI id, named from that id.
+//!
 //! No chip programming manual for the part was found. Every register,
 //! mailbox and ring fact comes from the public Linux, OpenBSD and NetBSD
 //! drivers. Where at least two of them agree the fact is settled; where they
@@ -17,8 +23,16 @@
 //!   access; `PciFunction::bar_read` and `bar_write` have no error path to
 //!   signal it with. Whether the chip takes either is unknown.
 //! * Commands run one at a time, in ring order, on the adapter's own
-//!   thread. No loop is behind the adapter yet, so every command completes
-//!   "port unavailable" with no SCSI status.
+//!   thread. An abort or reset matches the command running and nothing still
+//!   queued in the request ring, where the real firmware has many in flight.
+//! * The loop is read off the bus as the machine built it. A target attached
+//!   or removed later is not announced (no LIP, no port database event) and
+//!   is not seen before the next command; hotplug is not modelled.
+//! * A target has one LUN, as the SCSI layer below it does. A command to
+//!   another LUN up to 255 goes to the disk as for a LUN it lacks: INQUIRY
+//!   reports no device (peripheral qualifier 3) and anything else is CHECK
+//!   CONDITION, ILLEGAL REQUEST. REPORT LUNS is not answered, for LUN 0
+//!   either.
 //! * Every reset state, the command window that tells a ring pointer write
 //!   from a mailbox input, the posting rules and the per-command error
 //!   codes are model choices the drivers leave open.
@@ -27,15 +41,21 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use parking_lot::MutexGuard;
+use parking_lot::{Mutex, MutexGuard};
 
-use crate::dev::isp1040::{self, ENTRY_SIZE, HOST_CMD_SHIFT, MAX_REQUESTS, PCI_VENDOR_QLOGIC, RAM_WORDS, RISC_FLAG_HOST_INT, RISC_FLAG_PAUSED, RISC_FLAG_RESET, SEMAPHORE_LOCK, SIG1, SIG2, SIG3, ENTRY_TYPE_MARKER, ENTRY_TYPE_STATUS};
-use crate::dev::qlogic_ring::{self, IrqLevel, Notes, RingCtl, RingState, RingThread, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG64_SIZE};
+use crate::dev::isp1040::{
+    self, IOCB_ABORTED, IOCB_COMPLETE, IOCB_DATA_UNDERRUN, IOCB_RESET, SCSI_STATUS_SENSE_VALID, ENTRY_SIZE, HOST_CMD_SHIFT, MAX_REQUESTS, PCI_VENDOR_QLOGIC, RAM_WORDS, RISC_FLAG_HOST_INT, RISC_FLAG_PAUSED,
+    RISC_FLAG_RESET, SEMAPHORE_LOCK, SIG1, SIG2, SIG3, ENTRY_TYPE_MARKER, ENTRY_TYPE_STATUS,
+};
+use crate::dev::qlogic_ring::{
+    self, IrqLevel, Notes, RingCtl, RingState, RingThread, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE,
+};
 use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState, PCI_INTA};
-use crate::scsi::{ScsiBus, ScsiIdentities, CDROM_IDENTITY, DISK_IDENTITY};
+use crate::scsi::{get_cdb_length, scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
+use crate::snapshot::{get_field, hex_u16, hex_u32, load_u16_slice, toml_u16, toml_u32, u16_slice_to_toml, u8_slice_to_toml};
 
 pub const PCI_DEVICE_ISP2200: u16 = 0x2200;
 /// Fibre Channel serial bus controller; no driver matches on it.
@@ -240,6 +260,8 @@ const STATUS_OFF_SIGNATURE: usize = 60;
 const RESPONSE_PROCESSED: u32 = 0xdead_dead;
 
 const COMPLETION_PORT_UNAVAILABLE: u16 = 0x0028;
+/// LIP reset's m1 high byte for every loop ID.
+const LIP_RESET_ALL: u8 = 0xff;
 
 /// A model constant, deliberately not any vendor firmware release.
 const FW_VERSION: [u16; 3] = [1, 0, 0];
@@ -251,16 +273,105 @@ pub const FW_STATE_CONFIG_WAIT: u16 = 0;
 pub const FW_STATE_WAIT_AL_PA: u16 = 1;
 pub const FW_STATE_READY: u16 = 3;
 
+/// How long a loop takes to come up once something starts it. A model
+/// constant, long enough for a test to see the initialising state; how long
+/// a real loop initialisation takes is unknown.
+pub const BRINGUP: Duration = Duration::from_millis(100);
+
 /// Loop IDs 0..0x7d are loop ports; 0x7e and up are fabric and special.
 pub const LOOP_ID_MAX: u8 = 0x7d;
+/// The LUNs an FC target addresses. The SCSI layer below the adapter reads
+/// three bits of LUN from the CDB and has one LUN, so a LUN from 1 to 255 is
+/// one the disk lacks and a command to a LUN past this is refused here.
+const MAX_LUN: u16 = 255;
+/// The LUN the CDB names for a LUN the disk lacks and the CDB cannot hold.
+const ABSENT_CDB_LUN: u8 = 7;
+
+/// Get Retry Count m3. No public source gives what the firmware returns and
+/// the control block carries nothing for it. Linux halves it into its
+/// R_A_TOV in tenths of a second, and 200 then gives the 10-second minimum
+/// Linux already sets, leaving its state as it was.
+const RETRY_TIMEOUT: u16 = 200;
+/// Get Port Queue Parameters m2 and m3. Approximation: the firmware's values
+/// are unknown; these are the ones IRIX substitutes itself when the command
+/// fails, so the guest ends up with the parameters it already assumes.
+const PORT_QUEUE_DEPTH: u16 = 256;
+const PORT_QUEUE_THROTTLE: u16 = 255;
+/// Get Link Status writes eight 32-bit counters, the length IRIX copies.
+const LINK_STATUS_SIZE: usize = 32;
+/// Get Adapter ID m1 while the loop is down: Linux's "loop in transition".
+const ADAPTER_ID_NOT_READY: u16 = 7;
+/// Bit 1 of the stored Set Firmware Options m1 enables LIP-reset events.
+const FW_OPT_LIP_RESET_EVENTS: u16 = 0x0002;
+
+const PDB_SIZE: usize = 128;
+const PDB_OFF_MASTER: usize = 2;
+const PDB_OFF_SLAVE: usize = 3;
+const PDB_OFF_HARD_ADDR: usize = 6;
+const PDB_OFF_PORT_ID: usize = 8;
+const PDB_OFF_NODE_NAME: usize = 12;
+const PDB_OFF_PORT_NAME: usize = 20;
+const PDB_OFF_PRLI_SVC3: usize = 78;
+const PDB_OFF_LOOP_ID: usize = 80;
+const PDB_LOGGED_IN: u8 = 6;
+const PDB_TARGET_ROLE: u8 = 0x10;
+const POSITION_MAP_SIZE: usize = 128;
+const ID_LIST_ENTRY: usize = 4;
+const NAME_LIST_ENTRY: usize = 10;
+/// Port Name List options OpenBSD sets: include initiators, all loop IDs.
+const NAME_LIST_OPTIONS: u16 = 0x000a;
+
+const SCSI_STATUS_RESID_UNDER: u16 = 0x0800;
+const CHECK_CONDITION: u8 = 0x02;
+const COMPLETION_DMA_ERROR: u16 = 0x0002;
+const DIRECTION_DATA_IN: u16 = 0x0020;
+const DIRECTION_DATA_OUT: u16 = 0x0040;
+
+/// The standard table: loop ID n is AL_PA n, 0xef at 0 down to 0x01 at
+/// 0x7d, then 0x00 for the fabric port. A private loop has domain and area
+/// 0, so a port ID is its AL_PA alone.
+const ALPA: [u8; LOOP_ID_MAX as usize + 2] = [
+    0xef, 0xe8, 0xe4, 0xe2, 0xe1, 0xe0, 0xdc, 0xda, 0xd9, 0xd6, 0xd5, 0xd4, 0xd3, 0xd2, 0xd1, 0xce, 0xcd, 0xcc, 0xcb, 0xca, 0xc9,
+    0xc7, 0xc6, 0xc5, 0xc3, 0xbc, 0xba, 0xb9, 0xb6, 0xb5, 0xb4, 0xb3, 0xb2, 0xb1, 0xae, 0xad, 0xac, 0xab, 0xaa, 0xa9, 0xa7, 0xa6,
+    0xa5, 0xa3, 0x9f, 0x9e, 0x9d, 0x9b, 0x98, 0x97, 0x90, 0x8f, 0x88, 0x84, 0x82, 0x81, 0x80, 0x7c, 0x7a, 0x79, 0x76, 0x75, 0x74,
+    0x73, 0x72, 0x71, 0x6e, 0x6d, 0x6c, 0x6b, 0x6a, 0x69, 0x67, 0x66, 0x65, 0x63, 0x5c, 0x5a, 0x59, 0x56, 0x55, 0x54, 0x53, 0x52,
+    0x51, 0x4e, 0x4d, 0x4c, 0x4b, 0x4a, 0x49, 0x47, 0x46, 0x45, 0x43, 0x3c, 0x3a, 0x39, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x2e,
+    0x2d, 0x2c, 0x2b, 0x2a, 0x29, 0x27, 0x26, 0x25, 0x23, 0x1f, 0x1e, 0x1d, 0x1b, 0x18, 0x17, 0x10, 0x0f, 0x08, 0x04, 0x02, 0x01,
+    0x00,
+];
+
+/// The node name of the port at `loop_id`. Whoever fits a disk to the loop
+/// names it in the real fabric; the model names a port from its loop ID, so a
+/// guest sees stable names that look synthetic.
+pub const fn node_wwn(loop_id: u8) -> u64 {
+    0x2000_0000_0000_0000 | loop_id as u64
+}
+
+/// The port name of the port at `loop_id`; see [`node_wwn`].
+pub const fn port_wwn(loop_id: u8) -> u64 {
+    0x2100_0000_0000_0000 | loop_id as u64
+}
+
 const ICB_SIZE: usize = 96;
 const ICB_VERSION: u8 = 1;
 const ICB_OFF_OPTIONS: usize = 2;
+const ICB_OFF_RETRY_COUNT: usize = 10;
+const ICB_OFF_RETRY_DELAY: usize = 11;
+const ICB_OFF_HARD_ADDR: usize = 20;
+const ICB_OFF_XOPTIONS: usize = 64;
 const ICB_OFF_RQST_LEN: usize = 36;
 const ICB_OFF_RESP_LEN: usize = 38;
 const ICB_OFF_RQST_BASE: usize = 40;
 const ICB_OFF_RESP_BASE: usize = 48;
+const ICB_OPT_HARD_ADDR: u16 = 0x0001;
 const ICB_OPT_FAST_POST: u16 = 0x0008;
+const ICB_OPT_PORT_DB_EVENTS: u16 = 0x0100;
+/// Extended options: bits 3:0 the reduced-completion mode, 6:4 topology.
+const ICB_XOPT_TIMER_MASK: u16 = 0x000f;
+const CONN_LOOP: u16 = 0;
+const CONN_LOOP_PREFERRED: u16 = 2;
+const CONN_P2P_PREFERRED: u16 = 3;
+
 /// Events waiting for the host to release the result before them. No result
 /// is ever dropped, so the queue is sized for every event that can wait: the
 /// host interface raises two kinds itself, each queued at most once (see
@@ -356,12 +467,72 @@ pub struct State {
     /// one, and consumption stops once the announced command budget is
     /// held, so the queue never needs more.
     held: VecDeque<[u8; ENTRY_SIZE]>,
+    /// Initialise-firmware accepted a loop connection mode; until then, or
+    /// after a reset, nothing brings the loop up.
+    loop_active: bool,
     /// What Get Firmware State reports.
     loop_state: u16,
+    has_loop_id: bool,
+    /// The adapter's own, chosen at initialisation.
+    loop_id: u8,
+    /// The running bring-up came from a LIP reset.
+    bringup_lip_reset: bool,
+    /// When the adapter's clock says the loop is up.
+    bringup_due: Option<i64>,
+    ports: Ports,
+    /// The command running on the loop; at most one, the ring is walked in
+    /// order.
+    active: Option<Active>,
+    /// Device resets for the ring thread to pass on, in order: a loop ID or
+    /// every device.
+    pending_resets: VecDeque<Option<u8>>,
+    commands: u64,
     /// A request-ring read was refused: the entry stays unconsumed until the
     /// next producer write.
     rqst_blocked: bool,
     ctl: Ctl,
+}
+
+/// Which loop IDs have a target on the bus, as the adapter last saw it. The
+/// mailbox commands answer from this: they run with the state locked, and
+/// the bus is held across a disk command.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Ports([u64; 2]);
+
+impl Ports {
+    fn has(&self, id: usize) -> bool {
+        id <= usize::from(LOOP_ID_MAX) && self.0[id / 64] >> (id % 64) & 1 != 0
+    }
+
+    fn scan(targets: &[Option<Box<dyn crate::scsi::ScsiTarget>>]) -> Ports {
+        let mut ports = Ports::default();
+        for (id, target) in targets.iter().enumerate().take(usize::from(LOOP_ID_MAX) + 1) {
+            if target.is_some() {
+                ports.0[id / 64] |= 1 << (id % 64);
+            }
+        }
+        ports
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..=LOOP_ID_MAX).filter(|&id| self.has(usize::from(id)))
+    }
+}
+
+/// The command on the loop's one device, running with the state unlocked.
+#[derive(Clone, Copy, Debug)]
+struct Active {
+    loop_id: u8,
+    lun: u16,
+    handle: u32,
+}
+
+/// How a command ended, before it is a status entry.
+struct Done {
+    scsi_status: u16,
+    completion: u16,
+    resid: u32,
+    sense: Vec<u8>,
 }
 
 /// What the register side and the ring thread tell each other: the shared
@@ -449,7 +620,16 @@ impl State {
             completion: [0; MAILBOX_COUNT],
             events: VecDeque::new(),
             held: VecDeque::new(),
+            loop_active: false,
             loop_state: FW_STATE_CONFIG_WAIT,
+            has_loop_id: false,
+            loop_id: 0,
+            bringup_lip_reset: false,
+            bringup_due: None,
+            ports: Ports::default(),
+            active: None,
+            pending_resets: VecDeque::new(),
+            commands: 0,
             rqst_blocked: false,
             ctl: Ctl::default(),
         };
@@ -477,6 +657,7 @@ impl State {
         self.risc_paused = false;
         self.cmd_window = false;
         self.cmd_pending = false;
+        self.pending_resets.clear();
 
         self.mbox_in = [0; MAILBOX_COUNT];
         self.mbox_out = [0; MAILBOX_COUNT];
@@ -488,8 +669,78 @@ impl State {
 
         self.clear_queues();
         self.drop_queued();
-        self.loop_state = FW_STATE_CONFIG_WAIT;
+        // The loop goes with the firmware, and a command in flight posts
+        // nothing: the rings it would post to are gone.
+        self.loop_reset();
+        self.active = None;
         self.ctl.gen += 1;
+    }
+
+    // ---- the private loop --------------------------------------------
+
+    fn loop_reset(&mut self) {
+        self.bringup_due = None;
+        self.loop_active = false;
+        self.loop_state = FW_STATE_CONFIG_WAIT;
+        self.has_loop_id = false;
+        self.loop_id = 0;
+        self.bringup_lip_reset = false;
+    }
+
+    fn loop_ready(&self) -> bool {
+        self.loop_state == FW_STATE_READY
+    }
+
+    /// A port other than the adapter, at a loop ID the loop has.
+    fn target(&self, id: usize) -> bool {
+        self.ports.has(id) && !(self.has_loop_id && id == usize::from(self.loop_id))
+    }
+
+    fn is_bringup_event(code: u16) -> bool {
+        matches!(code, event::LIP_OCCURRED | event::LOOP_UP | event::LIP_RESET | event::PORT_DB_CHANGED)
+    }
+
+    /// Takes back the queued, not yet posted, events of earlier bring-ups.
+    fn drop_bringup_events(&mut self) {
+        self.events.retain(|mb| !Self::is_bringup_event(mb[0]));
+    }
+
+    /// Starts the loop coming up: state 1 until the clock reaches `due`. A
+    /// new trigger restarts the wait and takes back whatever an earlier
+    /// bring-up queued and has not posted, so the queue holds at most one
+    /// bring-up's events and each bring-up posts a whole set. An event
+    /// already posted stays until the host releases it.
+    fn bringup(&mut self, lip_reset: bool, due: i64) {
+        if !self.loop_active {
+            return;
+        }
+        self.loop_state = FW_STATE_WAIT_AL_PA;
+        self.bringup_lip_reset = lip_reset;
+        self.drop_bringup_events();
+        self.bringup_due = Some(due);
+    }
+
+    /// The loop is up. The events are a model choice conditioned on the two
+    /// option bits the drivers set: LIP (or LIP reset), loop up, and port
+    /// database changed for every port. Their payloads are zero but for that
+    /// last m1, which Linux reads as a global update.
+    fn bringup_done(&mut self) {
+        self.bringup_due = None;
+        let options = le16(&self.icb, ICB_OFF_OPTIONS);
+        // With every loop ID taken the adapter never gets one, nor a loop.
+        if !self.has_loop_id {
+            return;
+        }
+        self.loop_state = FW_STATE_READY;
+        if !self.bringup_lip_reset {
+            self.push_event(event::LIP_OCCURRED, 0);
+        } else if self.fw_options[0] & FW_OPT_LIP_RESET_EVENTS != 0 {
+            self.push_event(event::LIP_RESET, 0);
+        }
+        self.push_event(event::LOOP_UP, 0);
+        if options & ICB_OPT_PORT_DB_EVENTS != 0 {
+            self.push_event(event::PORT_DB_CHANGED, event::PORT_DB_GLOBAL);
+        }
     }
 
     /// The mailbox image the ROM code leaves once it has booted.
@@ -565,6 +816,15 @@ impl State {
         entry[STATUS_OFF_SENSE_LEN..][..2].copy_from_slice(&(sense_len as u16).to_le_bytes());
         entry[STATUS_OFF_RESIDUAL..][..4].copy_from_slice(&residual.to_le_bytes());
         self.held.push_back(entry);
+    }
+
+    /// Retire the command running on the loop with the completion the
+    /// recovery owes. True if one was running.
+    fn cancel_active(&mut self, cancel: &AtomicU64, completion: u16) -> bool {
+        let Some(active) = self.active.take() else { return false };
+        cancel.fetch_add(1, Ordering::AcqRel);
+        self.complete(active.handle, 0, completion, 0, &[]);
+        true
     }
 
     /// A malformed request goes back as itself, its entry status flagged.
@@ -754,6 +1014,9 @@ impl std::ops::Deref for Isp2200 {
 /// `fence` is held across one guest-memory store at a time.
 pub struct Core {
     ring: RingThread<State>,
+    /// Bumped when a recovery cancels the running command, so a store the
+    /// ring thread made for it is not made after the recovery returns.
+    cancel: AtomicU64,
     bus: ScsiBus,
     index: u8,
     pci: PciFunctionState,
@@ -828,6 +1091,7 @@ impl Core {
         pci.write(11, PCI_SUBSYSTEM_ID);
         Self {
             ring: RingThread::new(State::new()),
+            cancel: AtomicU64::new(0),
             bus,
             index,
             pci: PciFunctionState::new(pci),
@@ -1072,6 +1336,9 @@ impl Core {
         // new ones under stale handles.
         st.ctl.gen += 1;
         st.held.clear();
+        if st.active.take().is_some() {
+            self.cancel.fetch_add(1, Ordering::AcqRel);
+        }
         st.icb = icb;
         st.queues_init = true;
         st.rqst_base = rqst_base;
@@ -1083,7 +1350,54 @@ impl Core {
         st.resp_in = 0;
         st.resp_out = 0;
         st.rqst_blocked = false;
+        self.refresh_ports(st);
+        self.loop_init(st);
         mbox::COMPLETE
+    }
+
+    /// Initialise-firmware starts the loop from its control block. The
+    /// adapter takes the requested hard address when it asks for one, the
+    /// address is a loop ID and no port holds it, and otherwise the lowest
+    /// loop ID no port holds. Real loops settle this in loop initialisation,
+    /// and which address a port then wins is unknown. The choice holds until
+    /// the next initialisation or reset.
+    ///
+    /// Extended options bits 6:4 choose the connection. Loop only (0), loop
+    /// preferred (2) and point-to-point preferred (3) bring up the loop; with
+    /// no point-to-point partner mode 3 falls back to loop. Point-to-point
+    /// only (1) and the undefined values leave state 0 and post nothing.
+    fn loop_init(&self, st: &mut State) {
+        let options = le16(&st.icb, ICB_OFF_OPTIONS);
+        let hard = le16(&st.icb, ICB_OFF_HARD_ADDR);
+        let xopts = le16(&st.icb, ICB_OFF_XOPTIONS);
+        st.loop_reset();
+        st.drop_bringup_events();
+        if xopts & ICB_XOPT_TIMER_MASK != 0 {
+            self.note(format!(
+                "reduced-completion mode {} is not modelled; every command posts a full status entry",
+                xopts & ICB_XOPT_TIMER_MASK
+            ));
+        }
+        let conn = (xopts >> 4) & 7;
+        if !matches!(conn, CONN_LOOP | CONN_LOOP_PREFERRED | CONN_P2P_PREFERRED) {
+            self.note(format!("connection mode {conn} leaves the loop down: only a loop is modelled"));
+            return;
+        }
+        if options & ICB_OPT_HARD_ADDR != 0 && hard <= u16::from(LOOP_ID_MAX) && !st.ports.has(usize::from(hard)) {
+            st.has_loop_id = true;
+            st.loop_id = hard as u8;
+        } else if let Some(id) = (0..=LOOP_ID_MAX).find(|&id| !st.ports.has(usize::from(id))) {
+            st.has_loop_id = true;
+            st.loop_id = id;
+        }
+        st.loop_active = true;
+        self.start_bringup(st, false);
+    }
+
+    fn start_bringup(&self, st: &mut State, lip_reset: bool) {
+        let due = self.now_ns(st) + BRINGUP.as_nanos() as i64;
+        st.bringup(lip_reset, due);
+        self.kick(st);
     }
 
     /// The ROM answers these before any firmware is executed.
@@ -1114,6 +1428,7 @@ impl Core {
     /// Output mailboxes a command does not name read zero.
     fn dispatch(&self, st: &mut MutexGuard<'_, State>, input: &Mailboxes, out: &mut Mailboxes) -> u16 {
         let cmd = input[0];
+        self.refresh_ports(st);
         if !st.fw_running && !Self::rom_command(cmd) {
             self.note(format!("mailbox command {cmd:#06x} before firmware is executed"));
             return mbox::INVALID;
@@ -1166,6 +1481,7 @@ impl Core {
                 st.fw_options.copy_from_slice(&input[1..4]);
                 mbox::COMPLETE
             }
+            _ if Self::fc_owned(cmd) => self.fc_mailbox(st, cmd, input, out),
             _ => {
                 if Self::deferred_command(cmd) {
                     self.note(format!("mailbox command {cmd:#06x} not modelled"));
@@ -1232,18 +1548,34 @@ impl Core {
     /// Take the clock off the host's and set it to `ns` (tests). The thread
     /// reads the clock with `st` held and then waits on `wake` with no
     /// timeout, so the move is made with `st` held too.
+    ///
+    /// The loop comes up on the ring thread, which a command blocked on a
+    /// device keeps from looking at the clock; the test's thread does it
+    /// here, so a test can hold a command and still see the loop come up.
     #[cfg(test)]
-    pub(crate) fn set_test_clock(&self, ns: i64) {
+    fn set_test_clock(&self, ns: i64) {
         let mut st = self.st.lock();
         self.fake_ns.store(ns, Ordering::Relaxed);
+        if self.bringup_left(&st).is_some_and(|left| left <= 0) {
+            st.bringup_done();
+            self.post_waiting(&mut st);
+        }
         self.kick(&mut st);
+        self.drive_irq(&mut st);
+    }
+
+    /// How long until the loop is up, if it is coming up.
+    fn bringup_left(&self, st: &State) -> Option<i64> {
+        st.bringup_due.map(|due| due - self.now_ns(st))
     }
 
     /// Block until the ring thread has run everything it was given and is
     /// waiting for more.
     pub fn wait_idle(&self) {
         let mut st = self.st.lock();
-        while (st.ctl.hold == 0 && !st.ctl.paused && st.ctl.work) || st.ctl.walking {
+        while (st.ctl.hold == 0 && !st.ctl.paused && (st.ctl.work || self.bringup_left(&st).is_some_and(|left| left <= 0)))
+            || st.ctl.walking
+        {
             self.wake.wait(&mut st);
         }
     }
@@ -1251,11 +1583,24 @@ impl Core {
     fn run_ring(&self) {
         let mut st = self.st.lock();
         loop {
-            while !st.ctl.shutdown && !(st.ctl.hold == 0 && !st.ctl.paused && st.ctl.work) {
-                self.wake.wait(&mut st);
-            }
-            if st.ctl.shutdown {
-                return;
+            loop {
+                if st.ctl.shutdown {
+                    return;
+                }
+                let runnable = st.ctl.hold == 0 && !st.ctl.paused;
+                let left = self.bringup_left(&st);
+                if runnable && (st.ctl.work || left.is_some_and(|left| left <= 0)) {
+                    break;
+                }
+                match left {
+                    // A test clock only moves when the test moves it.
+                    Some(left) if runnable && self.fake_ns.load(Ordering::Relaxed) == i64::MIN => {
+                        self.wake.wait_for(&mut st, Duration::from_nanos(left as u64));
+                    }
+                    _ => {
+                        self.wake.wait(&mut st);
+                    }
+                }
             }
             st.ctl.work = false;
             st.ctl.walking = true;
@@ -1273,6 +1618,15 @@ impl Core {
                 // Resume once the holder lets go.
                 st.ctl.work = true;
                 return st;
+            }
+            if let Some(target) = st.pending_resets.pop_front() {
+                MutexGuard::unlocked(&mut st, || self.reset_devices(target));
+                continue;
+            }
+            if self.bringup_left(&st).is_some_and(|left| left <= 0) {
+                st.bringup_done();
+                self.drive_irq(&mut st);
+                continue;
             }
             if self.pump(&mut st) {
                 self.drive_irq(&mut st);
@@ -1340,7 +1694,7 @@ impl Core {
         if !st.queues_init || st.risc_reset || st.risc_paused || st.rqst_out == st.rqst_in || st.rqst_blocked {
             return false;
         }
-        if st.held.len() >= usize::from(MAX_REQUESTS) {
+        if st.held.len() + usize::from(st.active.is_some()) >= usize::from(MAX_REQUESTS) {
             return false;
         }
         let gen = st.ctl.gen;
@@ -1463,24 +1817,671 @@ impl Core {
         self.submit(st, cmd);
     }
 
-    // ---- commands ------------------------------------------------------
+    // ---- the loop commands -------------------------------------------
 
-    /// A command from the host interface. No loop is behind the adapter yet,
-    /// so every command completes "port unavailable" with no SCSI status, as a
-    /// disconnected adapter's do.
+    fn fc_owned(cmd: u16) -> bool {
+        matches!(
+            cmd,
+            0x0015 | 0x0017 | 0x0020 | 0x0022 | 0x0029 | 0x0032 | 0x0039 | 0x0040 | 0x0041 | 0x0047 | 0x0052
+                | 0x0062 | 0x0063 | 0x0064 | 0x006a | 0x006b | 0x006c | 0x006e | 0x006f | 0x0071 | 0x0072
+                | 0x0074 | 0x0075 | 0x007c | 0x007e
+        )
+    }
+
+    /// Look at the bus without waiting for a disk command: the ports as of
+    /// the last time the bus was free.
+    fn refresh_ports(&self, st: &mut State) {
+        if let Some(targets) = self.bus.try_lock() {
+            st.ports = Ports::scan(&targets);
+        }
+    }
+
+    fn dma_out(&self, st: &mut MutexGuard<'_, State>, addr: u64, data: &[u8]) -> bool {
+        MutexGuard::unlocked(st, || self.dma_write(addr, data))
+    }
+
+    /// The ID list: four bytes per port, AL_PA, area 0, domain 0, loop ID.
+    fn get_id_list(&self, st: &mut MutexGuard<'_, State>, input: &Mailboxes, out: &mut Mailboxes) -> u16 {
+        // Its own split: m1 bits 31:16, m2 15:0, m3 63:48, m6 47:32.
+        let addr = (u64::from(input[3]) << 48) | (u64::from(input[6]) << 32) | (u64::from(input[1]) << 16) | u64::from(input[2]);
+        if !st.loop_ready() {
+            return mbox::COMMAND_ERROR;
+        }
+        let list: Vec<u8> = (0..=LOOP_ID_MAX)
+            .filter(|&id| st.target(usize::from(id)))
+            .flat_map(|id| [ALPA[usize::from(id)], 0, 0, id])
+            .collect();
+        if !list.is_empty() && !self.dma_out(st, addr, &list) {
+            return mbox::HOST_INTERFACE_ERROR;
+        }
+        out[1] = (list.len() / ID_LIST_ENTRY) as u16;
+        mbox::COMPLETE
+    }
+
+    /// OpenBSD's port name list: ten bytes per port, the port name then the
+    /// loop ID as a little-endian word. OpenBSD decodes this name as a
+    /// little-endian integer but the port database's as big-endian, and
+    /// compares the two; the name goes here with its wire-order bytes
+    /// reversed so both decodes agree. The real firmware's order is unknown.
+    fn port_name_list(&self, st: &mut MutexGuard<'_, State>, input: &Mailboxes, out: &mut Mailboxes) -> u16 {
+        if !st.loop_ready() {
+            return mbox::COMMAND_ERROR;
+        }
+        if input[1] & !NAME_LIST_OPTIONS != 0 {
+            return mbox::PARAM_ERROR;
+        }
+        let list: Vec<u8> = (0..=LOOP_ID_MAX)
+            .filter(|&id| st.target(usize::from(id)))
+            .flat_map(|id| {
+                let mut entry = [0u8; NAME_LIST_ENTRY];
+                entry[..8].copy_from_slice(&port_wwn(id).to_le_bytes());
+                entry[8..].copy_from_slice(&u16::from(id).to_le_bytes());
+                entry
+            })
+            .collect();
+        if !list.is_empty() && !self.dma_out(st, mbox_addr(input), &list) {
+            return mbox::HOST_INTERFACE_ERROR;
+        }
+        out[1] = list.len() as u16;
+        mbox::COMPLETE
+    }
+
+    /// One port's database entry. Every present port is logged in with the
+    /// FCP target role and class 3 only; the bytes not set here are zero.
+    fn get_port_db(&self, st: &mut MutexGuard<'_, State>, input: &Mailboxes) -> u16 {
+        let id = (input[1] >> 8) as u8;
+        if !st.loop_ready() || !st.target(usize::from(id)) {
+            return mbox::COMMAND_ERROR;
+        }
+        let mut pd = [0u8; PDB_SIZE];
+        pd[PDB_OFF_MASTER] = PDB_LOGGED_IN;
+        pd[PDB_OFF_SLAVE] = PDB_LOGGED_IN;
+        pd[PDB_OFF_HARD_ADDR] = ALPA[usize::from(id)];
+        // Domain, a reserved byte, AL_PA, area.
+        pd[PDB_OFF_PORT_ID + 2] = ALPA[usize::from(id)];
+        pd[PDB_OFF_NODE_NAME..][..8].copy_from_slice(&node_wwn(id).to_be_bytes());
+        pd[PDB_OFF_PORT_NAME..][..8].copy_from_slice(&port_wwn(id).to_be_bytes());
+        // Both drivers find the target role in the low byte.
+        pd[PDB_OFF_PRLI_SVC3] = PDB_TARGET_ROLE;
+        pd[PDB_OFF_LOOP_ID..][..2].copy_from_slice(&u16::from(id).to_le_bytes());
+        if !self.dma_out(st, mbox_addr(input), &pd) {
+            return mbox::HOST_INTERFACE_ERROR;
+        }
+        mbox::COMPLETE
+    }
+
+    /// One port's name, by loop ID: option 0 the port name, 1 the node name,
+    /// the names the port database also reports. Each of m2, m3, m6 and m7
+    /// carries two wire-order bytes with the earlier in its low half. NetBSD
+    /// decodes that order on every part before the 24xx and qlogicfc on this
+    /// part; mainline Linux decodes the other way, but on this part it asks
+    /// only for the fabric port, which is refused. The real firmware's order
+    /// is unknown. Refusals follow the port database's, so the fabric check
+    /// at 0x7e finds no fabric and a scan of every loop ID skips the adapter.
+    fn get_port_name(st: &State, input: &Mailboxes, out: &mut Mailboxes) -> u16 {
+        let option = input[1] & 0xff;
+        if !st.loop_ready() {
+            return mbox::COMMAND_ERROR;
+        }
+        if option > 1 {
+            return mbox::PARAM_ERROR;
+        }
+        let id = (input[1] >> 8) as u8;
+        if !st.target(usize::from(id)) {
+            return mbox::COMMAND_ERROR;
+        }
+        let name = (if option == 1 { node_wwn(id) } else { port_wwn(id) }).to_be_bytes();
+        for (slot, pair) in [2, 3, 6, 7].into_iter().zip(name.chunks_exact(2)) {
+            out[slot] = u16::from_le_bytes([pair[0], pair[1]]);
+        }
+        mbox::COMPLETE
+    }
+
+    /// The position map: the count with the adapter, the adapter's AL_PA,
+    /// then the ports' in loop ID order. A real map follows loop position;
+    /// the order here is a model choice, and Linux reads only the count.
+    fn position_map(&self, st: &mut MutexGuard<'_, State>, input: &Mailboxes) -> u16 {
+        if !st.loop_ready() {
+            return mbox::COMMAND_ERROR;
+        }
+        let mut map = [0u8; POSITION_MAP_SIZE];
+        map[1] = ALPA[usize::from(st.loop_id)];
+        let mut n = 1;
+        for id in (0..=LOOP_ID_MAX).filter(|&id| st.target(usize::from(id))) {
+            map[1 + n] = ALPA[usize::from(id)];
+            n += 1;
+        }
+        map[0] = n as u8;
+        if !self.dma_out(st, mbox_addr(input), &map) {
+            return mbox::HOST_INTERFACE_ERROR;
+        }
+        mbox::COMPLETE
+    }
+
+    /// The recovery commands: abort one command, abort a target, reset one
+    /// LUN, LIP reset. The completions they post are the public definitions
+    /// and the reset semantics follow the SCSI parts'; what a real ISP2200
+    /// does, including any frames it sends the target, is unknown.
+    ///
+    /// Approximation: commands run one at a time in ring order, so a
+    /// recovery finds at most the one running on the loop; entries still
+    /// waiting in the request ring are not yet commands and are not matched.
+    /// A reset reaches the whole device at a loop ID: the SCSI layer below
+    /// has one LUN per target.
+    fn recovery(&self, st: &mut State, cmd: u16, input: &Mailboxes) -> u16 {
+        let loop_id = (input[1] >> 8) as u8;
+        let running = |st: &State, lun: Option<u16>| {
+            st.active.is_some_and(|a| a.loop_id == loop_id && lun.is_none_or(|lun| a.lun == lun))
+        };
+        match cmd {
+            mbox::ABORT_COMMAND => {
+                let handle = (u32::from(input[3]) << 16) | u32::from(input[2]);
+                if running(st, Some(input[6])) && st.active.is_some_and(|a| a.handle == handle) {
+                    st.cancel_active(&self.cancel, IOCB_ABORTED);
+                    mbox::COMPLETE
+                } else {
+                    mbox::COMMAND_ERROR
+                }
+            }
+            mbox::ABORT_TARGET | mbox::LUN_RESET => {
+                let lun = (cmd == mbox::LUN_RESET).then_some(input[2]);
+                if running(st, lun) {
+                    st.cancel_active(&self.cancel, IOCB_RESET);
+                }
+                st.pending_resets.push_back(Some(loop_id));
+                self.kick(st);
+                mbox::COMPLETE
+            }
+            mbox::LIP_RESET => {
+                if !st.loop_active {
+                    return mbox::COMMAND_ERROR;
+                }
+                let all = loop_id == LIP_RESET_ALL;
+                if all || running(st, None) {
+                    st.cancel_active(&self.cancel, IOCB_RESET);
+                }
+                st.pending_resets.push_back((!all).then_some(loop_id));
+                self.start_bringup(st, true);
+                mbox::COMPLETE
+            }
+            _ => unreachable!("not a recovery command"),
+        }
+    }
+
+    /// The loop commands. Each refusal's code is a model choice: the public
+    /// definitions name the codes but not which refusal returns which.
+    fn fc_mailbox(&self, st: &mut MutexGuard<'_, State>, cmd: u16, input: &Mailboxes, out: &mut Mailboxes) -> u16 {
+        match cmd {
+            mbox::GET_ADAPTER_ID => {
+                if !st.loop_ready() {
+                    out[1] = ADAPTER_ID_NOT_READY;
+                    return mbox::COMMAND_ERROR;
+                }
+                // m2 AL_PA and area 0, m3 domain 0, m6 topology 0: private loop.
+                out[1] = u16::from(st.loop_id);
+                out[2] = u16::from(ALPA[usize::from(st.loop_id)]);
+                mbox::COMPLETE
+            }
+            mbox::GET_ID_LIST => self.get_id_list(st, input, out),
+            mbox::PORT_NAME_LIST => self.port_name_list(st, input, out),
+            mbox::GET_PORT_DB => self.get_port_db(st, input),
+            mbox::GET_PORT_NAME => Self::get_port_name(st, input, out),
+            mbox::POSITION_MAP => self.position_map(st, input),
+            mbox::ABORT_COMMAND | mbox::ABORT_TARGET | mbox::LUN_RESET | mbox::LIP_RESET => self.recovery(st, cmd, input),
+            mbox::INITIATE_LIP | mbox::FULL_LOGIN_LIP => {
+                if !st.loop_active {
+                    return mbox::COMMAND_ERROR;
+                }
+                self.start_bringup(st, false);
+                mbox::COMPLETE
+            }
+            // The control block's retry count and delay, the order Linux and
+            // NetBSD read them in; that the firmware echoes the bytes rather
+            // than keeping values of its own is inferred. IRIX 6.5.30 scans
+            // its loop at attach only when this completes. The pair comes
+            // from the control block, not the loop, so it answers in any loop
+            // state.
+            mbox::GET_RETRY_COUNT => {
+                if !st.queues_init {
+                    return mbox::COMMAND_ERROR;
+                }
+                out[1] = u16::from(st.icb[ICB_OFF_RETRY_COUNT]);
+                out[2] = u16::from(st.icb[ICB_OFF_RETRY_DELAY]);
+                out[3] = RETRY_TIMEOUT;
+                mbox::COMPLETE
+            }
+            // The five commands below come from IRIX alone and no public
+            // source gives the firmware's replies. Each answer is an
+            // approximation: it keeps the guest on the path it takes when
+            // the command succeeds and invents no state.
+            //
+            // Not answered for the adapter's own loop ID: the driver asks
+            // once per discovered port, which the adapter is not. A guest
+            // that asks anyway gets the refusal the port database gives.
+            mbox::GET_PORT_QUEUE => {
+                if !st.loop_ready() || !st.target(usize::from(input[1] >> 8)) {
+                    return mbox::COMMAND_ERROR;
+                }
+                self.approximate(cmd);
+                out[2] = PORT_QUEUE_DEPTH;
+                out[3] = PORT_QUEUE_THROTTLE;
+                mbox::COMPLETE
+            }
+            // Accepted and forgotten: the retry pair stays the control block's.
+            mbox::SET_RETRY_COUNT | mbox::RESET_LINK_STATUS => {
+                self.approximate(cmd);
+                mbox::COMPLETE
+            }
+            // IRIX sends only m0 and m1 and ignores the reply. The firmware's
+            // status is unknown; 0x4000 is a model choice. Depth and throttle
+            // are not kept, and no loop ID is checked: the guest's registers
+            // come back as written.
+            mbox::SET_PORT_QUEUE => {
+                self.approximate(cmd);
+                out[1..8].copy_from_slice(&input[1..8]);
+                mbox::COMPLETE
+            }
+            // Every link counter reads zero. The driver's link-statistics
+            // thread asks for the adapter's own loop ID as well as the
+            // ports', so the adapter answers for itself, with the same zero
+            // counters.
+            mbox::GET_LINK_STATUS => {
+                let id = (input[1] >> 8) as usize;
+                if !st.loop_ready() || !(st.target(id) || (st.has_loop_id && id == usize::from(st.loop_id))) {
+                    return mbox::COMMAND_ERROR;
+                }
+                self.approximate(cmd);
+                if !self.dma_out(st, mbox_addr(input), &[0u8; LINK_STATUS_SIZE]) {
+                    return mbox::HOST_INTERFACE_ERROR;
+                }
+                mbox::COMPLETE
+            }
+            _ => {
+                self.note(format!("loop command {cmd:#06x} not modelled"));
+                mbox::INVALID
+            }
+        }
+    }
+
+    /// Mark a reply that is an approximation, for the debug log.
+    fn approximate(&self, cmd: u16) {
+        crate::dlog!(crate::devlog::LogModule::Scsi, "isp2200: approximate reply to mailbox command {cmd:#06x}");
+    }
+
+    // ---- commands on the loop ----------------------------------------
+
+    /// Device resets for the ring thread to pass on, with the bus unlocked
+    /// from `st`: each device puts its mode parameters back and owes the
+    /// host a unit attention on its next command.
+    fn reset_devices(&self, target: Option<u8>) {
+        self.bus.for_each(|id, device| {
+            if target.is_none_or(|target| usize::from(target) == id) {
+                device.reset_mode_parameters();
+                device.bus_reset();
+            }
+        });
+    }
+
+    fn block_size(&self, id: u8) -> usize {
+        self.bus
+            .lock()
+            .get(usize::from(id))
+            .and_then(|target| target.as_ref())
+            .and_then(|target| target.block_size())
+            .map(|block| block as usize)
+            .filter(|&block| block != 0)
+            .unwrap_or(isp1040::BLOCK_SIZE)
+    }
+
+    /// Run a CDB against the target at `id`; `data` is what a write sends it.
+    /// None when a reset or a recovery cancelled the command while it waited
+    /// for the target.
+    fn scsi(&self, gen: u64, cancel: u64, id: u8, cdb: &[u8], data: Option<Vec<u8>>) -> Option<(Vec<u8>, u8)> {
+        let mut targets = self.bus.lock();
+        if self.gen.load(Ordering::Acquire) != gen || self.cancel.load(Ordering::Acquire) != cancel {
+            return None;
+        }
+        let Some(device) = targets.get_mut(usize::from(id)).and_then(|target| target.as_mut()) else {
+            return Some((Vec::new(), CHECK_CONDITION));
+        };
+        let request = ScsiRequest { cdb: cdb.to_vec(), data_len: ScsiDataLength::Unlimited, data_in: data };
+        Some(match device.request(&request) {
+            Ok(response) => (response.data, response.status),
+            Err(e) => {
+                crate::dlog!(crate::devlog::LogModule::Scsi, "isp2200: target {id}: {e}");
+                self.note(format!("target {id}: {e}"));
+                (Vec::new(), CHECK_CONDITION)
+            }
+        })
+    }
+
+    /// Fixed-format sense, ILLEGAL REQUEST, LOGICAL UNIT NOT SUPPORTED.
+    fn lun_not_supported() -> Vec<u8> {
+        let mut sense = vec![0u8; 18];
+        sense[0] = 0x70;
+        sense[2] = 0x05;
+        sense[7] = 10;
+        sense[12] = 0x25;
+        sense
+    }
+
+    /// Run a command against its device and build its completion, with the
+    /// state unlocked: this is the part that waits on the disk.
+    ///
+    /// The segments name the host's buffer and the command names how much of
+    /// it the target fills, so only that much is offered and the whole named
+    /// length still counts toward the residual. A transfer the host bridge
+    /// refuses completes the command with a DMA error and no SCSI status.
+    fn run_command(&self, cmd: &Command, gen: u64, cancel: u64) -> Option<Done> {
+        let id = cmd.loop_id;
+        let mut cdb = cmd.cdb;
+        // A LUN above 7 does not fit the CDB's three bits; the disk has no
+        // LUN 7 either, so it answers as for any LUN it lacks.
+        cdb[1] = (cdb[1] & 0x1f) | (cmd.lun.min(u16::from(ABSENT_CDB_LUN)) as u8) << 5;
+        let cdb = &cdb[..get_cdb_length(cdb[0]).clamp(1, CMD_CDB_LEN)];
+        let (mut xfer, mut to_device) = qlogic_ring::cdb_transfer(cdb, self.block_size(id));
+        // An opcode with no rule here takes the direction and length the
+        // driver put in the entry.
+        if xfer == 0 && cmd.control & (DIRECTION_DATA_IN | DIRECTION_DATA_OUT) != 0 {
+            xfer = cmd.byte_count as usize;
+            to_device = cmd.control & DIRECTION_DATA_OUT != 0;
+        }
+        let mut segs = Vec::new();
+        let mut described = 0u64;
+        for &(addr, len) in &cmd.segs {
+            qlogic_ring::add_segment(&mut segs, &mut described, xfer as u64, addr, len);
+        }
+        let dma_error = Done { scsi_status: 0, completion: COMPLETION_DMA_ERROR, resid: 0, sense: Vec::new() };
+
+        let (status, moved);
+        if to_device {
+            let mut buf = Vec::new();
+            for &(addr, len) in &segs {
+                let mut chunk = vec![0u8; len as usize];
+                if !self.dma_read(addr, &mut chunk) {
+                    return Some(dma_error);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            moved = buf.len() as u64;
+            status = self.scsi(gen, cancel, id, cdb, Some(buf))?.1;
+        } else {
+            let (data, s) = self.scsi(gen, cancel, id, cdb, None)?;
+            status = s;
+            let take = (data.len() as u64).min(described).min(xfer as u64) as usize;
+            let mut off = 0usize;
+            for &(addr, len) in &segs {
+                if off >= take {
+                    break;
+                }
+                let n = (len as usize).min(take - off);
+                let stored =
+                    self.fenced(gen, || self.cancel.load(Ordering::Acquire) == cancel && self.dma_write(addr, &data[off..off + n]))?;
+                if !stored {
+                    return Some(dma_error);
+                }
+                off += n;
+            }
+            moved = off as u64;
+        }
+
+        // Auto-sense runs only after a CHECK CONDITION.
+        let mut sense = Vec::new();
+        if status == CHECK_CONDITION {
+            sense = self.scsi(gen, cancel, id, &[scsi_cmd::REQUEST_SENSE, 0, 0, 0, STATUS_SENSE_MAX as u8, 0], None)?.0;
+            sense.truncate(STATUS_SENSE_MAX);
+        }
+        Some(Self::completion(status, moved, described.max(xfer as u64), sense))
+    }
+
+    /// Completion precedence, following what the two drivers decode rather
+    /// than any firmware evidence: a SCSI status other than GOOD completes
+    /// 0x0000 carrying the status and any sense, with residual-under when
+    /// the transfer was short; GOOD and short is underrun 0x0015; GOOD and
+    /// whole is 0x0000 with no flags.
+    fn completion(status: u8, moved: u64, total: u64, sense: Vec<u8>) -> Done {
+        let unused = total - moved.min(total);
+        let mut scsi_status = 0;
+        let mut completion = IOCB_COMPLETE;
+        if status != 0 {
+            scsi_status = u16::from(status);
+            if !sense.is_empty() {
+                scsi_status |= SCSI_STATUS_SENSE_VALID;
+            }
+        } else if unused != 0 {
+            completion = IOCB_DATA_UNDERRUN;
+        }
+        if unused != 0 {
+            scsi_status |= SCSI_STATUS_RESID_UNDER;
+        }
+        Done { scsi_status, completion, resid: unused.min(u64::from(u32::MAX)) as u32, sense }
+    }
+
+    /// A command from the host interface onto the loop. With no loop -- the
+    /// connection mode left it down, or the adapter never took a loop ID --
+    /// every command completes "port unavailable" with no SCSI status, as a
+    /// disconnected adapter's do. So does one to a loop ID with no port, the
+    /// adapter's own, or one past 0x7d; which code real firmware returns for
+    /// those is unknown. Commands to present ports run while the loop comes
+    /// up. A LUN past 255 gets CHECK CONDITION, ILLEGAL REQUEST without reaching
+    /// a device.
     fn submit(&self, st: &mut MutexGuard<'_, State>, cmd: Command) {
-        crate::dlog!(
-            crate::devlog::LogModule::Scsi,
-            "isp2200: command {:#x} to loop ID {} LUN {} (cdb {:02x?}, control {:#06x}, {} bytes in {} segments) has no loop",
-            cmd.handle,
-            cmd.loop_id,
-            cmd.lun,
-            &cmd.cdb[..],
-            cmd.control,
-            cmd.byte_count,
-            cmd.segs.len()
+        let seglen: u64 = cmd.segs.iter().map(|&(_, len)| u64::from(len)).sum();
+        let gen = st.ctl.gen;
+        let id = cmd.loop_id;
+        let routed = st.loop_active && st.has_loop_id && id <= LOOP_ID_MAX && id != st.loop_id;
+        let present = routed && MutexGuard::unlocked(st, || self.bus.has_target(id));
+        if st.ctl.gen != gen {
+            return;
+        }
+        if !present {
+            st.complete(cmd.handle, 0, COMPLETION_PORT_UNAVAILABLE, 0, &[]);
+            return;
+        }
+        if cmd.lun > MAX_LUN {
+            let status = u16::from(CHECK_CONDITION) | SCSI_STATUS_SENSE_VALID | if seglen != 0 { SCSI_STATUS_RESID_UNDER } else { 0 };
+            st.complete(cmd.handle, status, IOCB_COMPLETE, seglen.min(u64::from(u32::MAX)) as u32, &Self::lun_not_supported());
+            return;
+        }
+        st.commands += 1;
+        st.active = Some(Active { loop_id: id, lun: cmd.lun, handle: cmd.handle });
+        let cancel = self.cancel.load(Ordering::Acquire);
+        let done = MutexGuard::unlocked(st, || self.run_command(&cmd, gen, cancel));
+        // A reset or a recovery retired the command while it ran: it owes
+        // nothing more.
+        if st.ctl.gen != gen || st.active.take().is_none() {
+            return;
+        }
+        if let Some(done) = done {
+            st.complete(cmd.handle, done.scsi_status, done.completion, done.resid, &done.sense);
+        }
+    }
+
+    // ---- state ---------------------------------------------------------
+
+    /// Commands run, for the whole session.
+    pub fn total_commands(&self) -> u64 {
+        self.st.lock().commands
+    }
+
+    fn save_locked(&self, st: &State, now: i64) -> toml::Value {
+        let mut t = toml::map::Map::new();
+        for (k, v) in [
+            ("csr", st.csr),
+            ("icr", st.icr),
+            ("semaphore", st.semaphore),
+            ("nvram", st.nvram),
+            ("nvram_shift", st.nvram_shift),
+            ("gpio_data", st.gpio_data),
+            ("gpio_enable", st.gpio_enable),
+            ("rqst_len", st.rqst_len),
+            ("resp_len", st.resp_len),
+            ("rqst_in", st.rqst_in),
+            ("rqst_out", st.rqst_out),
+            ("resp_in", st.resp_in),
+            ("resp_out", st.resp_out),
+            ("loop_state", st.loop_state),
+        ] {
+            t.insert(k.into(), hex_u16(v));
+        }
+        for (k, v) in [
+            ("csr_reset_visible", st.csr_reset_visible),
+            ("nvram_dout", st.nvram_dout),
+            ("risc_int", st.risc_int),
+            ("host_int", st.host_int),
+            ("risc_reset", st.risc_reset),
+            ("risc_paused", st.risc_paused),
+            ("cmd_window", st.cmd_window),
+            ("cmd_pending", st.cmd_pending),
+            ("fw_running", st.fw_running),
+            ("queues_init", st.queues_init),
+            ("completion_held", st.completion_held),
+            ("rqst_blocked", st.rqst_blocked),
+            ("loop_active", st.loop_active),
+            ("has_loop_id", st.has_loop_id),
+            ("bringup_lip_reset", st.bringup_lip_reset),
+        ] {
+            t.insert(k.into(), toml::Value::Boolean(v));
+        }
+        t.insert(
+            "nvram_mode".into(),
+            toml::Value::Integer(match st.nvram_mode {
+                NvramMode::Command => 0,
+                NvramMode::Data => 1,
+                NvramMode::Ignore => 2,
+            }),
         );
-        st.complete(cmd.handle, 0, COMPLETION_PORT_UNAVAILABLE, 0, &[]);
+        t.insert("nvram_bits".into(), toml::Value::Integer(i64::from(st.nvram_bits)));
+        t.insert("loop_id".into(), toml::Value::Integer(i64::from(st.loop_id)));
+        t.insert("commands".into(), toml::Value::Integer(st.commands as i64));
+        t.insert("rqst_base".into(), hex_u32(st.rqst_base as u32));
+        t.insert("rqst_base_hi".into(), hex_u32((st.rqst_base >> 32) as u32));
+        t.insert("resp_base".into(), hex_u32(st.resp_base as u32));
+        t.insert("resp_base_hi".into(), hex_u32((st.resp_base >> 32) as u32));
+        t.insert("mbox_in".into(), u16_slice_to_toml(&st.mbox_in));
+        t.insert("mbox_out".into(), u16_slice_to_toml(&st.mbox_out));
+        t.insert("completion".into(), u16_slice_to_toml(&st.completion));
+        t.insert("fw_options".into(), u16_slice_to_toml(&st.fw_options));
+        t.insert("icb".into(), u8_slice_to_toml(&st.icb));
+        // The downloaded microcode is large and usually all zero between a
+        // reset and the driver's download.
+        if st.risc_ram.iter().any(|&w| w != 0) {
+            t.insert("risc_ram".into(), u16_slice_to_toml(&st.risc_ram));
+        }
+        t.insert("events".into(), toml::Value::Array(st.events.iter().map(|mb| u16_slice_to_toml(mb)).collect()));
+        t.insert("held".into(), toml::Value::Array(st.held.iter().map(|entry| u8_slice_to_toml(entry)).collect()));
+        // Absolute deadlines mean nothing on another run's clock.
+        if let Some(due) = st.bringup_due {
+            t.insert("bringup_left_ns".into(), toml::Value::Integer((due - now).max(0)));
+        }
+        toml::Value::Table(t)
+    }
+
+    /// Whatever the file says, indices fold into their rings and counts stay
+    /// within what this build could have queued.
+    fn load_locked(&self, st: &mut State, v: &toml::Value, now: i64) {
+        let ctl = std::mem::take(&mut st.ctl);
+        *st = State::new();
+        st.ctl = ctl;
+        st.ctl.gen += 1;
+        let u16f = |k: &str| get_field(v, k).and_then(toml_u16).unwrap_or(0);
+        let flag = |k: &str| matches!(get_field(v, k), Some(toml::Value::Boolean(true)));
+        let int = |k: &str| match get_field(v, k) {
+            Some(toml::Value::Integer(n)) => Some(*n),
+            _ => None,
+        };
+        st.csr = u16f("csr") & CSR_BANK_MASK;
+        st.icr = u16f("icr") & ICR_MASK;
+        st.semaphore = u16f("semaphore") & SEMAPHORE_LOCK;
+        st.nvram = u16f("nvram") & NVRAM_WRITE_MASK;
+        st.nvram_shift = u16f("nvram_shift");
+        st.nvram_bits = int("nvram_bits").unwrap_or(0).clamp(0, i64::from(NVRAM_CMD_BITS.max(NVRAM_DATA_BITS))) as u8;
+        st.nvram_mode = match int("nvram_mode") {
+            Some(1) => NvramMode::Data,
+            Some(2) => NvramMode::Ignore,
+            _ => NvramMode::Command,
+        };
+        st.nvram_dout = flag("nvram_dout");
+        st.gpio_data = u16f("gpio_data");
+        st.gpio_enable = u16f("gpio_enable");
+        st.csr_reset_visible = flag("csr_reset_visible");
+        st.risc_int = flag("risc_int");
+        st.host_int = flag("host_int");
+        st.risc_reset = flag("risc_reset");
+        st.risc_paused = flag("risc_paused");
+        st.cmd_window = flag("cmd_window");
+        st.cmd_pending = flag("cmd_pending");
+        st.fw_running = flag("fw_running");
+        st.queues_init = flag("queues_init");
+        st.completion_held = flag("completion_held");
+        st.rqst_blocked = flag("rqst_blocked");
+        st.loop_active = flag("loop_active");
+        st.has_loop_id = flag("has_loop_id");
+        st.bringup_lip_reset = flag("bringup_lip_reset");
+        st.loop_state = match u16f("loop_state") {
+            state @ (FW_STATE_CONFIG_WAIT | FW_STATE_WAIT_AL_PA | FW_STATE_READY) => state,
+            _ => FW_STATE_CONFIG_WAIT,
+        };
+        st.loop_id = int("loop_id").unwrap_or(0).clamp(0, i64::from(LOOP_ID_MAX)) as u8;
+        st.commands = int("commands").unwrap_or(0).max(0) as u64;
+        let u32f = |k: &str| get_field(v, k).and_then(toml_u32).unwrap_or(0);
+        st.rqst_base = u64::from(u32f("rqst_base")) | (u64::from(u32f("rqst_base_hi")) << 32);
+        st.resp_base = u64::from(u32f("resp_base")) | (u64::from(u32f("resp_base_hi")) << 32);
+        st.rqst_len = u16f("rqst_len");
+        st.resp_len = u16f("resp_len");
+        if st.queues_init && (st.rqst_len == 0 || st.resp_len == 0) {
+            st.queues_init = false;
+        }
+        if st.queues_init {
+            st.rqst_in = u16f("rqst_in") % st.rqst_len;
+            st.rqst_out = u16f("rqst_out") % st.rqst_len;
+            st.resp_in = u16f("resp_in") % st.resp_len;
+            st.resp_out = u16f("resp_out") % st.resp_len;
+        } else {
+            st.clear_queues();
+        }
+        for (k, dst) in [("mbox_in", &mut st.mbox_in), ("mbox_out", &mut st.mbox_out), ("completion", &mut st.completion)] {
+            if let Some(m) = get_field(v, k) {
+                load_u16_slice(m, dst);
+            }
+        }
+        if let Some(m) = get_field(v, "fw_options") {
+            load_u16_slice(m, &mut st.fw_options);
+        }
+        if let Some(toml::Value::Array(icb)) = get_field(v, "icb") {
+            for (dst, src) in st.icb.iter_mut().zip(icb) {
+                *dst = toml_u16(src).unwrap_or(0) as u8;
+            }
+        }
+        if let Some(m) = get_field(v, "risc_ram") {
+            load_u16_slice(m, &mut st.risc_ram);
+        }
+        if let Some(toml::Value::Array(events)) = get_field(v, "events") {
+            for e in events.iter().take(EVENTS_MAX) {
+                let mut mb = [0; MAILBOX_COUNT];
+                load_u16_slice(e, &mut mb);
+                st.events.push_back(mb);
+            }
+        }
+        if let Some(toml::Value::Array(held)) = get_field(v, "held") {
+            for e in held.iter().take(usize::from(MAX_REQUESTS)) {
+                let mut entry = [0u8; ENTRY_SIZE];
+                if let toml::Value::Array(bytes) = e {
+                    for (dst, src) in entry.iter_mut().zip(bytes) {
+                        *dst = toml_u16(src).unwrap_or(0) as u8;
+                    }
+                }
+                st.held.push_back(entry);
+            }
+        }
+        // The wait goes on for what was left of it, from this clock.
+        st.bringup_due = int("bringup_left_ns").filter(|_| st.loop_active).map(|left| now.saturating_add(left.max(0)));
+        self.ports_unknown(st);
+    }
+
+    /// Ports are read off the bus again by the next command that needs them.
+    fn ports_unknown(&self, st: &mut State) {
+        self.refresh_ports(st);
     }
 
     // ---- registers ---------------------------------------------------
@@ -1633,8 +2634,11 @@ impl Core {
                 if val & !(CSR_SOFT_RESET | CSR_BANK_MASK) != 0 {
                     self.note(format!("CSR flash bits {:#06x} not modelled", val & !(CSR_SOFT_RESET | CSR_BANK_MASK)));
                 }
+                // The loop's devices see the reset too.
                 if val & CSR_SOFT_RESET != 0 {
                     st.soft_reset();
+                    st.pending_resets.push_back(None);
+                    self.kick(st);
                 }
                 st.csr = val & CSR_BANK_MASK;
             }
@@ -1691,9 +2695,9 @@ impl Core {
         }
         let reset = {
             let mut st = self.st.lock();
-            let gen = st.ctl.gen;
+            let (gen, cancel) = (st.ctl.gen, self.cancel.load(Ordering::Acquire));
             self.reg_write(&mut st, off, val as u16);
-            let reset = st.ctl.gen != gen;
+            let reset = st.ctl.gen != gen || self.cancel.load(Ordering::Acquire) != cancel;
             if reset {
                 self.publish_gen(&st);
                 self.kick(&mut st);
@@ -1817,7 +2821,7 @@ impl crate::traits::Device for Isp2200 {
                 return done;
             }
             if args.first().copied() == Some("notes") {
-                let _ = writeln!(w, "QLogic ISP2200, adapter {}:", self.index);
+                let _ = writeln!(w, "QLogic ISP2200, adapter {}: {} commands", self.index, self.total_commands());
                 for note in self.notes() {
                     let _ = writeln!(w, "  note: {note}");
                 }
@@ -1835,6 +2839,27 @@ impl crate::traits::Device for Isp2200 {
 impl crate::scsi_monitor::ScsiTargets for Isp2200 {
     fn scsi_bus(&self) -> &ScsiBus {
         &self.bus
+    }
+}
+
+impl crate::traits::Saveable for Isp2200 {
+    fn save_state(&self) -> toml::Value {
+        self.quiesced(|st| {
+            let now = self.now_ns(st);
+            self.save_locked(st, now)
+        })
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        self.quiesced(|st| {
+            let now = self.now_ns(st);
+            self.load_locked(st, v, now);
+            self.publish_gen(st);
+            st.ctl.work = true;
+        });
+        // The controller took its own state from the snapshot.
+        self.resync_irq();
+        Ok(())
     }
 }
 
