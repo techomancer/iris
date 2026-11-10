@@ -214,6 +214,13 @@ impl MaceRtc {
         secs + at.elapsed().as_secs() as i64
     }
 
+    /// Let `secs` of guest time pass at once, as a loaded host lets them
+    /// pass between two statements of a test.
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, secs: i64) {
+        self.clock.lock().unwrap().0 += secs;
+    }
+
     /// The clock registers' value for `t`, in the mode register B selects.
     fn field(&self, reg: usize, t: i64, b: u8) -> u8 {
         let days = t.div_euclid(86400);

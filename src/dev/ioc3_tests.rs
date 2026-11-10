@@ -1701,6 +1701,19 @@ fn the_uarts_are_in_the_superio_block() {
 // Snapshots
 // ---------------------------------------------------------------------------
 
+/// The saved clock's seconds: the chip's calendar runs on in real time, so
+/// two saves a host stall apart differ in it and in nothing else.
+fn clock_seconds(v: &toml::Value) -> i64 {
+    v["chip"]["rtc"]["clock"]["time"].as_integer().unwrap()
+}
+
+/// `v` with the running clock's seconds cleared, for comparing the rest.
+fn without_clock(v: &toml::Value) -> toml::Value {
+    let mut v = v.clone();
+    v["chip"]["rtc"]["clock"].as_table_mut().unwrap().remove("time");
+    v
+}
+
 #[test]
 fn save_load_round_trip() {
     for build in [|| Ioc3::octane(MAC, false), || Ioc3::octane(MAC, true)] {
@@ -1714,7 +1727,11 @@ fn save_load_round_trip() {
 
         let dst = Rig::with(build());
         dst.c.load_state(&v1).expect("load_state");
-        assert_eq!(v1, dst.c.save_state());
+        // Seconds may pass between the load and the save, as on a loaded host.
+        dst.c.sh.st.lock().rtc.dev.advance_clock(2);
+        let v2 = dst.c.save_state();
+        assert_eq!(without_clock(&v1), without_clock(&v2));
+        assert_eq!(clock_seconds(&v2), clock_seconds(&v1) + 2, "the restored clock runs on from the saved time");
         let st = dst.c.sh.st.lock();
         assert_eq!(st.uart[0].predivider, 6);
         assert_eq!(st.ssram[0x40] & SSRAM_DATA, 0x1234);
@@ -1739,8 +1756,10 @@ fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
     let fresh = Rig::new();
     used.c.load_state(&v).unwrap();
     fresh.c.load_state(&v).unwrap();
-    assert_eq!(used.c.save_state(), fresh.c.save_state());
-    assert_eq!(used.c.save_state(), v);
+    // The loads and saves are not at one instant, so the clock may have moved.
+    used.c.sh.st.lock().rtc.dev.advance_clock(1);
+    assert_eq!(without_clock(&used.c.save_state()), without_clock(&fresh.c.save_state()));
+    assert_eq!(without_clock(&used.c.save_state()), without_clock(&v));
 }
 
 /// A periodic interrupt output keeps the time its next pulse had left,
