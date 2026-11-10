@@ -63,18 +63,29 @@ jobs:
     # tests never ran — a GUI-only breakage could not turn this red. It needs no
     # extra system packages: wayland, X11 and GL are dlopen'd at runtime, so the
     # only thing it links is libasound, which is already installed above.
+    # Linux x86-64 skips this step: the nextest step below gates it and builds
+    # the same workspace. A separate `cargo build` there only adds a compile
+    # whose output the test build doesn't reuse (about 120 s of a 250 s
+    # sequence in a 4-CPU container). The other platforms keep it, because
+    # their test step doesn't fail the job.
     - name: Build
+      if: matrix.os != 'ubuntu-24.04'
       run: cargo build --workspace --verbose
+    # Linux compiles the replay example inside the matcher test step below.
     - name: Check REX3 GPU replay
+      if: runner.os != 'Linux'
       run: cargo check -p iris --lib --example rex3-gpu-probe --features rex-gpu
     - name: Test REX3 GPU matcher
       if: runner.os == 'Linux'
-      run: cargo test -p iris --lib --features rex-gpu rex3_gpu::tests
+      run: cargo test -p iris --lib --example rex3-gpu-probe --features rex-gpu rex3_gpu::tests
     # The VPro fragment pipeline's SIMD kernels against their scalar
     # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
     # lanes.rs): deterministic, so they gate everywhere. macos-26 and
-    # ubuntu-24.04-arm are the runners with NEON.
+    # ubuntu-24.04-arm are the runners with NEON. Linux x86-64 skips this
+    # step because its nextest run below already runs the same tests, and a
+    # separate cargo test recompiles the lib.
     - name: Run SIMD lane tests
+      if: matrix.os != 'ubuntu-24.04'
       run: cargo test -p iris --lib the_lane_
     # nextest runs each test in its own process and writes the JUnit report
     # the annotations below come from. It does not run doctests.
