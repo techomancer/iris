@@ -1534,6 +1534,36 @@ mod tests {
         });
     }
 
+    /// "undefined opcodes (bits 25:24 are 0 or 1) take Reserved Instruction
+    /// exceptions and undefined formats (bits 25:24 are 2 or 3) take
+    /// Unimplemented Operation exceptions" on the R10000 (R10000 UM v2.0
+    /// p. 357). The R5000 keeps Reserved Instruction for both.
+    #[test]
+    fn undefined_cop1_formats_are_unimplemented_on_the_r10000_family() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(r10k: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            for (name, instr, unimplemented) in [
+                ("rs=7", (OP_COP1 << 26) | (7 << 21), false),
+                ("fmt=18 add", make_cop1_compute(18, 2, 1, 3, FUNCT_FADD), r10k),
+                ("fmt=31 add", make_cop1_compute(31, 2, 1, 3, FUNCT_FADD), r10k),
+            ] {
+                exec.core.fpu_fcsr = 0;
+                let s = exec.exec(instr);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{name} traps");
+                let want = if unimplemented { crate::cpu::mips_exec::EXC_FPE } else { EXC_RI };
+                assert_eq!((s >> 2) & 0x1F, want, "{name} exception");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CE != 0, unimplemented, "{name} Cause.E");
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(false);
+        });
+    }
+
     /// MOVZ.S, MOVN.S, MOVT.S and MOVF.S write fd on the R10000 family even
     /// when the condition is false: the old low word stays and, with FR set,
     /// the upper word is zeroed, "even though the condition is false"

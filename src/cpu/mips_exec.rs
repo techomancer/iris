@@ -8185,6 +8185,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.handle_exec_complete()
     }
 
+    /// A COP1 format code no format uses, on a part that answers it with
+    /// Unimplemented Operation rather than Reserved Instruction.
+    fn exec_cop1_undefined_format(&mut self, _d: &DecodedInstr) -> ExecStatus {
+        if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
+        self.fpu_unimplemented()
+    }
+
     /// Unimplemented Operation (Cause.E): R4000/VR5000 manuals, ch 7/9.4.6 —
     /// "no Enable bit and no Flag bit; whenever this exception occurs, an
     /// unimplemented exception trap is taken" and "the result register is
@@ -10427,6 +10434,10 @@ pub fn decode_into<T: Tlb, C: CpuModel>(ins: &mut DecodedInstr) {
                 FUNCT_FCVT_D => MipsExecutor::<T,C>::exec_fcvt_d_l,
                 _            => MipsExecutor::<T,C>::exec_reserved,
             },
+            // rs 16-31 is a format. The R10000 family takes Unimplemented
+            // Operation for one it lacks, keeping Reserved Instruction for an
+            // undefined rs below 16 (R10000 UM v2.0 p. 357).
+            fmt if C::R10K_FAMILY && fmt & 0x10 != 0 => MipsExecutor::<T,C>::exec_cop1_undefined_format,
             _ => MipsExecutor::<T,C>::exec_reserved,
         },
         // The entire COP1X opcode (LWXC1/LDXC1/SWXC1/SDXC1/PREFX and the
