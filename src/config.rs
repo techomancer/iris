@@ -1226,7 +1226,8 @@ pub struct MachineSection {
     /// Mints the machine's system id (what `sysinfo -s` and `lmhostid`
     /// print) in iris's own layout: 0 to 4095, 0 the default and a plainly
     /// generic id. Machines with different ids can hold node-locked licenses
-    /// side by side. Only the Tezro takes it. See [`crate::identity`].
+    /// side by side. Only the Fuel and Tezro take it. See
+    /// [`crate::identity`].
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub emu_id: u32,
 }
@@ -3068,8 +3069,8 @@ impl MachineConfig {
         if emu_id > crate::identity::EMU_ID_MAX {
             return Err(format!("machine identity: emu_id must be 0 to {}, not {emu_id}", crate::identity::EMU_ID_MAX));
         }
-        if emu_id != 0 && self.machine.profile != MachineProfile::TezroIp53 {
-            return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Tezro takes it"));
+        if emu_id != 0 && !matches!(self.machine.profile, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
+            return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
         for (id, dev) in &self.scsi {
             // A CD-ROM may legitimately start with an empty tray (no path, no
@@ -3172,7 +3173,7 @@ impl MachineConfig {
     fn default_station_mac(&self) -> [u8; 6] {
         use crate::identity::{default_mac, KIND};
         match self.machine.profile {
-            MachineProfile::TezroIp53 if self.machine.emu_id != 0 => {
+            MachineProfile::FuelIp34 | MachineProfile::TezroIp53 if self.machine.emu_id != 0 => {
                 default_mac(KIND, self.machine.emu_id, 0).expect("node 0 always fits the default address")
             }
             _ => DEFAULT_MAC,
@@ -4761,6 +4762,27 @@ mod fuel_input_tests {
         identity_cfg("tezro_ip53", "emu_id = 4095\n").validate().unwrap();
         let e = identity_cfg("tezro_ip53", "emu_id = 4096\n").validate().unwrap_err();
         assert!(e.contains("emu_id must be 0 to 4095, not 4096"), "{e}");
+    }
+
+    /// The Fuel's L1 answers the system serial request with the station
+    /// address in hex and its IRIX takes the id from the address's last four
+    /// bytes, so emu_id moves the address. Unset, the Fuel keeps the address
+    /// it always had.
+    #[test]
+    fn the_fuel_takes_its_id_from_the_station_address() {
+        use crate::identity::hostid_from_mac;
+        let base = "banks = [256, 256]\n";
+        let cfg: MachineConfig = toml::from_str(&format!("{base}[machine]\nprofile = \"fuel_ip34\"\n")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.network().mac, DEFAULT_MAC);
+        assert_eq!(hostid_from_mac(&cfg.network().mac), 0x6912_3456);
+        let cfg: MachineConfig = toml::from_str(&format!("{base}[machine]\nprofile = \"fuel_ip34\"\nemu_id = 7\n")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.network().mac, [0x08, 0x00, 0x69, 0xe2, 0x00, 0x70]);
+        assert_eq!(hostid_from_mac(&cfg.network().mac), 0x69e2_0070);
+        let mut cfg = cfg;
+        cfg.network.mac = Some("08:00:69:aa:bb:cc".into());
+        assert_eq!(cfg.network().mac, [0x08, 0x00, 0x69, 0xaa, 0xbb, 0xcc]);
     }
 
     /// A machine that does not take emu_id refuses one rather than ignoring

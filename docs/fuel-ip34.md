@@ -35,8 +35,13 @@ mode` defaults to `nat`; `off` disconnects the link.
 The L1 reports firmware revision 1.48.1, the one a real Fuel's L1
 prints, and the made-up brick serial `EMUN00`; `[fuel] l1_revision` and
 `brick_serial` replace them. Its system serial is the machine's Ethernet
-address (`[network] mac`) as twelve uppercase hexadecimal digits, the
-text the PROM converts back into that address. IRIX's `numastatd` reads
+address as twelve uppercase hexadecimal digits, the text the PROM
+converts back into that address, and IRIX's `sysinfo -s` and `lmhostid`
+print the address's last four bytes. The address is `[network] mac`, or
+for a nonzero `[machine] emu_id` (0 to 4095) `08:00:69:e2:` and the
+emu_id (emu_id 7: `08:00:69:e2:00:70`, host id `69e20070`), or
+`08:00:69:12:34:56`; iris prints the id and the address at start-up.
+IRIX's `numastatd` reads
 the revision at startup and logs `SNDRV_GET_ELSC_VERSION: I/O error`
 without one. The L1 answers the requests the PROM and IRIX send and
 refuses others as unknown. A power cycle the PROM asks for restarts the
