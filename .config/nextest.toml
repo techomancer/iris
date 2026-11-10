@@ -1,0 +1,7 @@
+# CI's profile (.github/workflows/rust.yml and suites.yml). Every failure is
+# reported, and the JUnit report feeds the run's test annotations.
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

@@ -1,12 +1,11 @@
 # The bare-metal suites — cpu-tests/ and bench/.
 #
 # One workflow because they are the same machine: both build a guest binary
-# with the MIPS cross toolchain, then run it against IRIS built for each CPU x
-# engine cell. Kept as two workflows, that meant installing the toolchain twice
-# and — far more expensively — building *eight* emulators per push instead of
-# four, since any change to src/cpu/mips_*.rs triggers both. The release profile is
-# fat-LTO with codegen-units=1, so an emulator build is the dominant cost in
-# this repo's CI and halving the count is the whole point of merging.
+# with the MIPS cross toolchain, then run it against IRIS. The engine (interp
+# or jitv2) is a cargo feature and the CPU is a runtime flag, so each engine is
+# built once and every CPU runs on that binary. The release profile is fat-LTO
+# with codegen-units=1, so an emulator build is the dominant cost in this
+# repo's CI; running another CPU on a built binary costs under a minute.
 #
 # The two suites answer different questions and neither replaces the other:
 #
@@ -14,7 +13,9 @@
 #              R4400 vs R5000 because the mips4/ group requires each MIPS IV
 #              instruction to compute on R5000 and raise Reserved Instruction
 #              on R4400. interp vs jitv2 because a guest-visible ISA suite is
-#              the cleanest JIT differential available.
+#              the cleanest JIT differential available. It does not run on the
+#              R10000: every expectation in it is chosen by PRId, and it has
+#              none for that CPU.
 #
 #   bench      is it still correct after ten million of them, with whatever
 #              state the last million left — and how long did that take.
@@ -24,10 +25,12 @@
 # perf threshold would either catch nothing or fire every other week. The
 # figures are still collected and uploaded so a run can be read after the fact.
 #
-# Both suites run in every cell even when the first fails, so a cpu-tests
+# Both suites run on every CPU even when the first fails, so a cpu-tests
 # failure never hides the benchmark's accuracy result. cpu-tests has known
 # findings (cpu-tests/docs/findings.md); a cell passes when exactly the tests
-# in cpu-tests/expected-failures.txt fail.
+# in cpu-tests/expected-failures.txt fail. Both suites are cargo integration
+# tests (tests/cpu_tests.rs, tests/bench_accuracy.rs), one case per CPU, and
+# a failing case names the tests or kernels that broke in its message.
 
 name: Bare-metal suites
 
@@ -45,6 +48,10 @@ on:
       - 'src/bench_runner.rs'
       - 'src/benchsuite.rs'
       - 'src/bin/iris_bench.rs'
+      - 'tests/common/**'
+      - 'tests/cpu_tests.rs'
+      - 'tests/bench_accuracy.rs'
+      - '.config/nextest.toml'
       - '.github/workflows/suites.yml'
   pull_request:
     branches: [ "main" ]
@@ -74,80 +81,57 @@ jobs:
       - name: Build the pinned MIPS toolchain
         run: docker build -t iris-guest-toolchain -f cpu-tests/toolchain.Containerfile cpu-tests
 
-      # Three checked-in generated files, all verified the same way: regenerate
-      # and fail on a diff. That is what stops a generator and its output from
-      # drifting apart. The FP vectors and golden checksums come from host
-      # programs, the guest binaries from the pinned toolchain.
-
-      # `make vectors` also runs the generator's --check pass, which cross-checks
-      # its exact rational arithmetic against the runner's own FPU before
-      # writing anything.
-      - name: cpu-tests — FP vectors up to date
-        run: |
-          make -C cpu-tests vectors
-          git diff --exit-code cpu-tests/tests/fpu/fpvectors.c \
-                               cpu-tests/tests/fpu/fpvectors.h
-
-      # Doubles as a determinism check on the suite itself: a kernel whose
-      # result depends on uninitialised memory or on the host's byte order
-      # produces a different table on a different runner. Every one of those has
-      # already happened once — clanker/testing/benchmark-suite-gotchas.md.
-      - name: bench — golden checksums up to date
-        run: |
-          make -C bench golden
-          git diff --exit-code bench/golden/golden.h
-
-      - name: Build the guest binaries
-        run: |
-          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
-            iris-guest-toolchain sh -c 'make -C cpu-tests all && make -C bench prebuilt'
-
       # bench/prebuilt/irisbench.elf is linked into `iris` with include_bytes!
-      # so the benchmark runs on a machine with no cross toolchain — a released
-      # app, a sandboxed one, or anyone who just wants the number. A checked-in
-      # build product that can drift is worse than no build product, and this
-      # one drifts dangerously: accuracy is scored against golden checksums
-      # compiled *into* the image, so a stale image against fresh goldens
-      # reports failures to users that are not real, and an image from another
-      # compiler silently changes every benchmark figure.
-      #
-      # The step above rebuilt the image from clean with the pinned toolchain
-      # (`prebuilt` also leaves build/irisbench.elf for the cells below). The
-      # builds are reproducible, so any difference from the committed image
-      # means it is stale, hand-copied, or from another compiler. The quick
-      # check first, because it names the compiler.
+      # so the benchmark runs on a machine with no cross toolchain. Accuracy is
+      # scored against golden checksums compiled *into* the image, so a stale
+      # image reports failures to users that are not real, and an image from
+      # another compiler silently changes every benchmark figure. Checked
+      # before the rebuild below overwrites it; the version check names the
+      # compiler, which the byte comparison afterwards cannot.
       - name: bench — checked-in guest binary was built by the pinned compiler
         run: make -C bench check-prebuilt
 
-      - name: bench — checked-in guest binary is what its sources build
+      # The FP vectors and golden checksums come from host programs, the guest
+      # binaries from the pinned toolchain. `make vectors` also cross-checks its
+      # exact rational arithmetic against the runner's own FPU, and the golden
+      # run doubles as a determinism check: a kernel that depends on
+      # uninitialised memory or host byte order produces a different table on
+      # a different runner.
+      - name: Regenerate and rebuild everything checked in
         run: |
-          git diff --exit-code --stat bench/prebuilt/ \
-            || { echo "::error::bench/prebuilt/irisbench.elf is not what the pinned toolchain builds from these sources. Run make -C bench prebuilt in the toolchain container and commit the result."; exit 1; }
+          make -C cpu-tests vectors
+          make -C bench golden
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+            iris-guest-toolchain sh -c 'make -C cpu-tests all && make -C bench prebuilt'
 
-      # One binary of each for every cell below — that is what makes the matrix
-      # a differential test rather than N independent runs.
+      - name: Checked-in generated files match what the generators build
+        run: |
+          git diff --exit-code --stat || {
+            echo "::error::a checked-in generated file is stale. Rerun make -C cpu-tests vectors, make -C bench golden and make -C bench prebuilt (in the toolchain container), and commit the result."
+            exit 1; }
+
+      # One guest for both engines, which is what makes them a differential
+      # test rather than independent runs. The bench cases run the checked-in
+      # image, which the step above has just shown to be current.
       - uses: actions/upload-artifact@v7
         with:
-          name: guest-elfs
-          path: |
-            cpu-tests/build/cputest.elf
-            bench/build/irisbench.elf
+          name: cputest-elf
+          path: cpu-tests/build/cputest.elf
           if-no-files-found: error
 
+  # The same kernels, natively. Its accuracy score must be 100% by
+  # construction, since it is the source of the golden values, so a failure
+  # here means a kernel is not deterministic even against itself.
   host-baseline:
     name: Host baseline
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      # The same kernels, natively. Its accuracy score must be 100% by
-      # construction — it is the source of the golden values — so a failure
-      # here means a kernel is not deterministic even against itself.
       - name: Build and run
         run: |
           make -C bench hostbench
           ./bench/build/irisbench-host | tee bench/build/host.log
-      - name: The oracle must agree with itself
-        run: grep -q 'IRIS-BENCH-DONE rc=0' bench/build/host.log
+          grep -q 'IRIS-BENCH-DONE rc=0' bench/build/host.log
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -155,15 +139,35 @@ jobs:
           path: bench/build/host.log
           if-no-files-found: ignore
 
-  run:
-    name: ${{ matrix.cpu }} / ${{ matrix.engine }}
+  # The path a released application takes: no subprocess, no ELF on disk, the
+  # guest image read straight out of the binary. It exercises the plumbing, not
+  # the CPU model, so one run is enough.
+  embedded:
+    name: Embedded runner
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --release --lib bench_runner -- --ignored --nocapture
+
+  suites:
+    name: ${{ matrix.engine }}
     needs: guests
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        cpu: [r4400, r5000]
-        engine: [interp, jitv2]
+        include:
+          - engine: interp
+            features: ""
+          - engine: jitv2
+            features: jitv2
     steps:
       - uses: actions/checkout@v5
 
@@ -174,160 +178,91 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: guest-elfs
-          path: .
+          name: cputest-elf
+          path: cpu-tests/build
 
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The JIT is a compile-time cargo feature; the CPU is not — the run
-      # steps below pass `--cpu`. The R5000 cell is the R5000 without a
-      # secondary cache: r5ksc / r5ksc_triton are refused at compile time
-      # (src/lib.rs, clanker/cpu/r5k-l1i-cache-bugs.md), and CPU/FPU
-      # correctness (what cpu-tests exercises) doesn't depend on it.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+        with:
+          tool: nextest
+
+      # Each case spawns the iris and iris-bench cargo built for the tests,
+      # with this job's features, so it cannot judge another engine's binary.
+      # The CPU is a runtime flag: one build covers every CPU.
       #
-      # jitv2 is the only MIPS JIT (the v1 tiered compiler was removed in
-      # 33c4e68). It needs no runtime switch — it is active as soon as the
-      # feature is compiled in.
+      # Tests are normally built panic=unwind, which compiles the iris library
+      # a second time beside the panic=abort copy the release binaries link.
+      # Built panic=abort (a nightly cargo setting), they share the one copy.
       #
-      # iris-bench is built with the cell's features too. It embeds the guest
-      # image and can run the suite in-process, so a default-feature build here
-      # would quietly be a different machine from the one this cell is named
-      # after.
-      - name: Build IRIS
-        run: |
-          FEATURES=""
-          [ "${{ matrix.engine }}" = "jitv2" ] && FEATURES="jitv2"
-          if [ -n "$FEATURES" ]; then
-            cargo build --release --bin iris --bin iris-bench --features "$FEATURES"
-          else
-            cargo build --release --bin iris --bin iris-bench
-          fi
+      # One test thread: the bench cases time the guest, and emulators sharing
+      # the runner's cores would time each other, so the uploaded figures
+      # could not be compared.
+      - name: cpu-tests and bench
+        env:
+          CARGO_UNSTABLE_PANIC_ABORT_TESTS: true
+          IRIS_BENCH_RESULTS: ${{ github.workspace }}/bench/build/results
+          # Beside nextest's report, one case per guest test, so a failing
+          # cell's annotations name the tests and kernels that broke.
+          IRIS_SUITE_JUNIT: ${{ github.workspace }}/target/nextest/ci
+        run: >
+          cargo nextest run --profile ci --release --features "${{ matrix.features }}"
+          --test cpu_tests --test bench_accuracy --run-ignored all --test-threads 1
 
-      # ── cpu-tests ────────────────────────────────────────────────────────
-      #
-      # continue-on-error so the benchmark still runs; Result turns it red.
-      - name: cpu-tests
-        id: cputests
-        continue-on-error: true
-        run: make -C cpu-tests check-run PREBUILT=1 CPU=${{ matrix.cpu }} ENGINE=${{ matrix.engine }}
-
-      # ── bench ────────────────────────────────────────────────────────────
-      #
-      # --iris is required, not decorative: without it `run` measures this
-      # process in-process, which is a different thing from the binary this cell
-      # built. --elf then defaults to the shared artifact, which is what holds
-      # the guest side constant across cells.
-      - name: bench
-        run: |
-          chmod +x bench/build/irisbench.elf
-          ./target/release/iris-bench run \
-            --iris ./target/release/iris \
-            --label "${{ matrix.cpu }}-${{ matrix.engine }}" \
-            --timeout 2400 \
-            -- --cpu ${{ matrix.cpu }} \
-            2>&1 | tee bench/build/run.log
-
-      # Three ways this can fail quietly, so all three are checked. A build
-      # whose features did not take runs the wrong CPU and every result is
-      # mislabelled; the guest's banner is authoritative because it reads PRId.
-      # A kernel that faults is stepped over by the exception dispatcher and
-      # still reports a throughput. And a mismatch is the actual regression.
-      - name: Check the benchmark run
-        run: |
-          python3 - <<'PY'
-          import json, sys, glob
-          paths = glob.glob("bench/build/results/*.json")
-          if not paths:
-              sys.exit("::error::no result file was written")
-          run = json.load(open(paths[0]))
-          want = "${{ matrix.cpu }}".upper()
-          if run["machine"]["cpu"] != want:
-              sys.exit(f"::error::guest reports {run['machine']['cpu']}, expected {want}")
-          if not run["machine"]["timebase"]:
-              sys.exit("::error::no host time base — every timing is a guess")
-
-          expect_exc = {"sys/exception", "sys/tlb_miss"}
-          bad = [r for r in run["rows"] if r["status"] == "MISMATCH"]
-          exc = [r for r in run["rows"] if r["exc"] and r["name"] not in expect_exc]
-          for r in bad:
-              print(f"::error::{r['name']} checksum {r['checksum']} != {r['golden']}")
-          for r in exc:
-              print(f"::error::{r['name']} took {r['exc']} unexpected exceptions")
-
-          mips = run["total_icount"] * 1e3 / max(run["total_ns"], 1)
-          print(f"{run['cell']}: {run['matched']}/{run['checked']} matched, "
-                f"{mips:.1f} guest MIPS, {run['total_ns']/1e9:.1f} s timed")
-          sys.exit(1 if bad or exc else 0)
-          PY
-
-      # The path a released application actually takes: no subprocess, no ELF on
-      # disk, the guest image read straight out of the binary. Quick mode, and
-      # only on the default cell — the embedded runner is the same code in every
-      # cell, and what it exercises is the plumbing, not the CPU model.
-      - name: The embedded runner must work too
-        if: matrix.cpu == 'r4400' && matrix.engine == 'interp'
-        run: cargo test --release --lib bench_runner -- --ignored --nocapture
-
-      # Both results in one place, and where a cpu-tests failure turns the job red.
-      - name: Result
-        if: always()
-        run: |
-          {
-            echo "### ${{ matrix.cpu }} / ${{ matrix.engine }}"
-            echo '```'
-            grep -hE '^ RESULT:' cpu-tests/build/*.log 2>/dev/null || echo " cpu-tests: no result"
-            grep -E 'accuracy|emulator speed' bench/build/run.log 2>/dev/null | tail -2 \
-              || echo " bench: no result"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          [ "${{ steps.cputests.outcome }}" = success ]
+      - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+        if: ${{ !cancelled() }}
+        with:
+          report_paths: target/nextest/ci/*.xml
+          annotate_only: true
 
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ !cancelled() }}
         with:
-          name: suites-${{ matrix.cpu }}-${{ matrix.engine }}
+          name: suites-${{ matrix.engine }}
           path: |
-            cpu-tests/build/*.log
-            cpu-tests/build/dump.json
-            bench/build/run.log
-            bench/build/results/*.json
+            target/tmp/bare-metal
+            target/nextest/ci/*.xml
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: bench-results-${{ matrix.engine }}
+          path: bench/build/results
+          if-no-files-found: ignore
+
+      # The comparison report needs only this binary, failing cases or not.
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && matrix.engine == 'interp' }}
+        with:
+          name: iris-bench
+          path: target/release/iris-bench
           if-no-files-found: ignore
 
   report:
     name: Comparison report
-    needs: run
-    if: always()
+    needs: suites
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev
+      # iris-bench links libasound at run time.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2t64
       - uses: actions/download-artifact@v8
         with:
-          pattern: suites-*
-          path: artifacts
+          name: iris-bench
+          path: target/release
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-results-*
+          path: bench/build/results
           merge-multiple: true
-      - name: Assemble
+      - name: Report
         run: |
-          mkdir -p bench/build/results
-          # Path-qualified, not just *.json: the per-cell artifact now also
-          # carries cpu-tests' testdev machine-state dump, and `iris-bench
-          # report` parses everything in this directory as a saved Run.
-          find artifacts -path '*/bench/build/results/*' -name '*.json' \
-               -exec cp {} bench/build/results/ \; || true
-          if [ -z "$(ls -A bench/build/results 2>/dev/null)" ]; then
-            echo "no results to report"; exit 0
-          fi
-          cargo build --release --bin iris-bench
-          ./target/release/iris-bench report --format md > bench/build/report.md
-          cat bench/build/report.md >> "$GITHUB_STEP_SUMMARY"
+          chmod +x target/release/iris-bench
+          ./target/release/iris-bench report --format md | tee bench/build/report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-report
