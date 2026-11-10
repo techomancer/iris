@@ -27,6 +27,7 @@ use crate::dev::bridge::Bridge;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
 use crate::dev::ioc3::{ByteBus, Ioc3};
+use crate::dev::rad1::Rad1;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
@@ -43,6 +44,9 @@ pub type Onyx2Machine = Ip27Machine<Onyx2Deskside>;
 
 /// The MediaIO daughtercard's IOC3, a PCI device of the BaseIO-G's Bridge.
 const MEDIAIO_DEVICE: u8 = 6;
+
+/// The MediaIO's RAD1 audio chip, the next device of the same Bridge.
+const RAD1_DEVICE: u8 = 7;
 
 /// The graphics slot's widget, and the BaseIO-G's.
 const WIDGET_PIPE: u8 = 8;
@@ -107,13 +111,13 @@ impl Onyx2Deskside {
 }
 
 impl Onyx2Deskside {
-    /// The MediaIO daughtercard's IOC3, at PCI device 6 of the BaseIO-G's
-    /// Bridge: both serial ports, a keyboard and mouse controller and the
+    /// The MediaIO daughtercard, on the BaseIO-G's Bridge. Its IOC3 is at PCI
+    /// device 6: both serial ports, a keyboard and mouse controller and the
     /// parallel port, but no Ethernet, clock or one-wire part. Its ports have
     /// no host backend: they are peripheral lines, where the board IOC3's
     /// first is the console. The host's keys and pointer go to the board
     /// IOC3's controller.
-    fn fit_mediaio(node: &Node, bridge: &Bridge, io: &mut BoardIo) {
+    fn fit_mediaio(node: &Node, cfg: &MachineConfig, bridge: &Bridge, io: &mut BoardIo) {
         let pci = bridge.bus();
         let mio = Arc::new(Ioc3::new(&crate::dev::ioc3::MIO, [0; 6], ByteBus::None));
         pci.attach(DevFn { device: MEDIAIO_DEVICE, function: 0 }, mio.clone());
@@ -122,10 +126,21 @@ impl Onyx2Deskside {
         mio.register_locks();
         io.devices.push(mio.clone());
         io.monitor.push(mio.ps2());
+        // The RAD1 audio chip, at device 7. It raises no interrupt: the audio
+        // driver registers no data-path interrupt.
+        let rad = Arc::new(Rad1::new());
+        rad.set_timer_manager(node.timers.clone());
+        if !cfg.no_audio {
+            rad.enable_output(cfg.audio.clone());
+        }
+        pci.attach(DevFn { device: RAD1_DEVICE, function: 0 }, rad.clone());
+        rad.register_locks();
+        io.devices.push(rad.clone());
         let board = std::mem::replace(&mut io.reset, Box::new(|| {}));
         io.reset = Box::new(move || {
             board();
             mio.power_on();
+            rad.reset();
         });
     }
 }
@@ -221,7 +236,7 @@ impl Ip27Board for Onyx2Deskside {
         }
         let pci_bridge = bridge.clone();
         let mut io = pci_devices(owner, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, "onyx2", Self::NAME)?;
-        Self::fit_mediaio(owner, &pci_bridge, &mut io);
+        Self::fit_mediaio(owner, cfg, &pci_bridge, &mut io);
         Ok(io)
     }
 }

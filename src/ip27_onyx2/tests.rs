@@ -185,7 +185,7 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
         let (_dir, m) = built("bridge", 2);
         let bridge = m.bridge().clone();
         let card = Card::new();
-        bridge.bus().attach(crate::pci::DevFn { device: 7, function: 0 }, card.clone());
+        bridge.bus().attach(crate::pci::DevFn { device: 4, function: 0 }, card.clone());
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
         let dma = card.state.dma().unwrap().clone();
         let memory = |i: usize, off: u64| m.node_at(i).memory.physical().read32(off).data;
@@ -202,8 +202,8 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
             // The interrupt goes the same way, to the vector the pin names.
             set(reg::INT_DEST_UPPER, widget << 16);
             set(reg::INT_DEST_LOWER, 0);
-            set(reg::int_host(7), 5);
-            set(reg::INT_ENABLE, 1 << 7);
+            set(reg::int_host(4), 5);
+            set(reg::INT_ENABLE, 1 << 4);
             card.state.irq().unwrap().set(true);
             assert_eq!(pending(node) & 1 << 5, 1 << 5, "widget {widget}");
             assert_eq!(pending(other) & 1 << 5, 0, "widget {widget}: the other node heard it");
@@ -224,10 +224,10 @@ fn the_bridge_carries_the_baseio_and_mediaio_records() {
     assert_ne!(roms[0], roms[1], "a search tells the boards apart");
 }
 
-/// The BaseIO-G's Bridge has two IOC3s, at devices 2 and 6, and the SCSI
-/// controllers at 0 and 1; nothing at 5.
+/// The BaseIO-G's Bridge has two IOC3s, at devices 2 and 6, the SCSI
+/// controllers at 0 and 1 and RAD1 at 7; nothing at 5.
 #[test]
-fn the_baseio_g_has_a_second_ioc3_at_device_6() {
+fn the_baseio_g_has_a_second_ioc3_and_the_audio_chip() {
     big_stack(|| {
         let (_dir, m) = built("mio", 1);
         let bus = m.bridge().bus();
@@ -235,6 +235,7 @@ fn the_baseio_g_has_a_second_ioc3_at_device_6() {
         assert_eq!(id(0), Some(0x1020_1077), "an ISP1040");
         assert_eq!(id(2), Some(0x0003_10a9), "the board IOC3");
         assert_eq!(id(6), Some(0x0003_10a9), "the MediaIO IOC3");
+        assert_eq!(id(7), Some(0x0005_10a9), "RAD1");
         assert_eq!(id(5), None, "nothing at 5");
     });
 }
