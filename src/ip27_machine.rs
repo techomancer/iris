@@ -623,7 +623,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
         exec.core.set_count_hz(count_hz);
         exec.core.cp0_config = module.config();
         exec.core.count_write_samples = true;
-        exec.phys_mask = ip27::CPU_PHYS_MASK;
+        exec.phys_mask = crate::window_map::CPU_PHYS_MASK;
         exec.core.cpu_id = cpu_id as u8;
         exec.core.smp = smp;
         Arc::new(MipsCpu::new(exec))

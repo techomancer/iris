@@ -192,6 +192,9 @@ pub mod ip27_deskside;
 pub mod ip35;
 pub mod ip34_machine;
 pub mod ip53_machine;
+/// Bounded MMIO windows and the sparse map of them the SN machines place in
+/// an address map, and the physical address masks they share.
+pub mod window_map;
 pub mod machine_state;
 pub mod platform;
 pub mod physical;

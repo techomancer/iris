@@ -4644,7 +4644,7 @@ mod tests {
                 const PA: u64 = 0x0d10_0000;
                 assert_eq!(translate::<R14K>(u64::MAX, None, PA >> 12), (1 << 57) | PA,
                     "no mask: the attribute reaches the bus");
-                assert_eq!(translate::<R10K>(crate::ip27::CPU_PHYS_MASK, None, PA >> 12), (1 << 57) | PA,
+                assert_eq!(translate::<R10K>(crate::window_map::CPU_PHYS_MASK, None, PA >> 12), (1 << 57) | PA,
                     "IP27 keeps bits 58:57, and its bus routes by them");
                 for (name, mask) in [("Octane", (1u64 << 40) - 1), ("Indigo2/O2", u32::MAX as u64)] {
                     assert_eq!(translate::<R10K>(mask, None, PA >> 12), PA, "{name} folds it away");

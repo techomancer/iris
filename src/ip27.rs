@@ -45,17 +45,13 @@
 use crate::dev::hub::Routing;
 use crate::dev::node_flash::NodeFlash;
 use crate::devlog::LogModule;
-use crate::ip35::SparseWindowMap;
+use crate::window_map::{SparseWindowMap, CPU_PHYS_MASK, PA_MASK};
 use crate::physical::{Physical, RamBank};
 use crate::ppmem::devmap::SLOT_SHIFT;
 use crate::ppmem::MappedMemory;
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::sync::{Arc, Weak};
-
-pub(crate) const PA_MASK: u64 = (1u64 << 40) - 1;
-/// XKPHYS bits 58:57 ride along with the physical address into the bus.
-pub(crate) const CPU_PHYS_MASK: u64 = PA_MASK | (3u64 << 57);
 
 /// The boot flash's reset view, and the node memory a bank stride spans.
 pub const RESET_VIEW: u64 = 0x1fc0_0000;
@@ -196,7 +192,7 @@ impl NodeMemory {
 
     /// Place the boot flash's reset view in node memory.
     pub fn map_reset_view(&self, flash: &Arc<NodeFlash>) {
-        crate::ip35::map_device(&self.phys, RESET_VIEW, crate::dev::node_flash::SIZE as u64, flash.chip(), "boot flash");
+        crate::window_map::map_device(&self.phys, RESET_VIEW, crate::dev::node_flash::SIZE as u64, flash.chip(), "boot flash");
     }
 
     /// The ranges the CPU model reports as memory.
