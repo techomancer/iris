@@ -514,11 +514,11 @@ fn blit(pi: u32, si: u32, px: i32, py: i32) {
 }
 
 fn arch_tile_begin(tile: u32, px: i32, py: i32, lane: u32) {
-    tc_begin(px, py);
+    tc_begin(tile, px, py);
 }
 
 fn arch_prim(pi: u32, px: i32, py: i32, lane: u32) {
-    tc_prepare(pi);
+    tc_prepare(pi, px, py);
     let si = recs[pi].slot;
     nc = bitcast<f32>(recs[pi].one);
     let kind = recs[pi].kind;
@@ -558,5 +558,5 @@ fn arch_prim(pi: u32, px: i32, py: i32, lane: u32) {
 }
 
 fn arch_tile_end(tile: u32, px: i32, py: i32, lane: u32) {
-    tc_end();
+    tc_end(px, py);
 }
