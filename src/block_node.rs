@@ -1819,14 +1819,23 @@ mod tests {
         }
     }
 
-    /// A CHD node whose base has been moved away and whose commit has failed
+    /// Keep the base's bytes at `away` and empty the base, so opening it
+    /// fails for want of a header. Renaming the base away would fail the open
+    /// too, but Windows refuses to rename a file the CHD library holds open
+    /// (os error 32), and truncating it works on every host.
+    fn spoil_base(base: &Path, away: &Path) {
+        std::fs::copy(base, away).unwrap();
+        std::fs::File::create(base).unwrap();
+    }
+
+    /// A CHD node whose base has been emptied and whose commit has failed
     /// to reopen it. Returns the node and the paths to put the base back.
     fn closed_chd_node() -> (ChdNode, PathBuf, PathBuf) {
         let base = compressed_chd(0xAB);
         let away = base.with_extension("away");
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-        std::fs::rename(&base, &away).unwrap();
+        spoil_base(&base, &away);
         assert!(node.commit().is_err());
         assert_eq!(node.size(), 256 * 1024);
         assert!(node.is_cow(), "the diff is still known");
@@ -1839,7 +1848,8 @@ mod tests {
     }
 
     /// Writing, committing or rolling back a node whose reopen failed is an
-    /// error while the file is missing, not a panic, and works once it is back.
+    /// error while the base cannot be opened, not a panic, and works once the
+    /// base is whole again.
     #[test]
     fn chd_commands_on_a_node_that_could_not_reopen_retry() {
         let (mut node, base, away) = closed_chd_node();
@@ -1876,7 +1886,7 @@ mod tests {
             let away = base.with_extension("away");
             let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
             node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-            std::fs::rename(&base, &away).unwrap();
+            spoil_base(&base, &away);
             let r = if rollback { node.rollback().map(|_| 0) } else { node.commit() };
             assert!(r.is_err(), "rollback={rollback}: nothing to reopen");
             std::fs::rename(&away, &base).unwrap();
