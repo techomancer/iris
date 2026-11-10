@@ -3,9 +3,12 @@
 The Onyx2 deskside is one or two IP27 node boards on the 4P1G5 midplane. Both
 Hubs are hosts of the one Crossbow, which carries the BaseIO-G at widget 15 and
 the graphics slot at widget 8. Two nodes are joined by the direct cable. The
-machine runs headless on the IOC3's first serial port. There is no
-InfiniteReality pipe: the graphics slot holds a test widget that answers its
-identification word and nothing else.
+machine runs on the IOC3's first serial port. With `[graphics] board = "none"`
+(the default) the graphics slot holds a test widget that answers its
+identification word and nothing else; with `"ir2"`, `"ir2:2rm"`, `"ir2e"` or `"ir2e:2rm"` it holds an
+InfiniteReality2 or 2E pipe with one or two raster managers (`src/dev/kona`), whose
+window is the machine's display. `[graphics] flash` names a file that keeps the
+pipe's flash EEPROM between runs.
 
 ## Configuration
 
@@ -40,4 +43,8 @@ A disk installed on an Onyx2 boots; the machine cannot install without a pipe.
   and pointer go to the board IOC3's controller only.
 - The module controller, the cable and the node windows are the
   [Origin 2000 deskside's](origin2000-ip27.md), with its limits.
-- Snapshots are not supported.
+- The pipe's interrupt packets and DMA reach the Hub at the widget the guest
+  programs into it (widget 9 with two nodes, 10 with one), behind that
+  widget's Crossbow link.
+- Snapshots are not supported. The pipe can save its own state, but the Hubs
+  and node memory cannot yet.
