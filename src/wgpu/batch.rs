@@ -23,7 +23,7 @@ use super::device::Gpu;
 use super::host::HostBuffer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use super::shader::{Fragment, Source};
-use super::tiles::{BatchHeader, BusyHead, DispatchArgs, TileBox, TileGrid, MASK_STRIDE, MASK_WORDS, MAX_GROUPS, MAX_PRIMS, TILE_H, TILE_W};
+use super::tiles::{BatchHeader, BusyHead, DispatchArgs, TileBox, TileGrid, BUSY_ENTRY, COARSE, LIST_CAP, MASK_WORDS, MAX_GROUPS, MAX_PRIMS, TILE_H, TILE_W};
 
 /// The batch has no room for another primitive or slot: flush it first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,18 +75,21 @@ pub struct BatchPipelines {
 
 impl BatchPipelines {
     pub fn new(gpu: &Gpu, arch: &ArchShaders<'_>) -> Result<BatchPipelines, String> {
-        let common = [
-            layout_entry(0, wgpu::BufferBindingType::Uniform),
-            layout_entry(1, wgpu::BufferBindingType::Storage { read_only: false }),
-            layout_entry(2, wgpu::BufferBindingType::Storage { read_only: false }),
-            layout_entry(3, wgpu::BufferBindingType::Storage { read_only: false }),
-            layout_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
-        ];
+        // Binding 1 is the tiles' primitive lists: the bin pass writes them,
+        // the raster pass reads them.
+        let common = |list_read_only: bool| {
+            vec![
+                layout_entry(0, wgpu::BufferBindingType::Uniform),
+                layout_entry(1, wgpu::BufferBindingType::Storage { read_only: list_read_only }),
+                layout_entry(2, wgpu::BufferBindingType::Storage { read_only: false }),
+                layout_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
+            ]
+        };
         let batch_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("batch"),
-            entries: &common,
+            entries: &common(true),
         });
-        let mut with_args = common.to_vec();
+        let mut with_args = common(false);
         with_args.push(layout_entry(5, wgpu::BufferBindingType::Storage { read_only: false }));
         let bin_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("batch bin"),
@@ -109,7 +112,8 @@ impl BatchPipelines {
                 .define("TILE_W", TILE_W)
                 .define("TILE_H", TILE_H)
                 .define("MASK_WORDS", MASK_WORDS)
-                .define("MASK_STRIDE", MASK_STRIDE)
+                .define("COARSE", COARSE)
+                .define("LIST_CAP", LIST_CAP)
                 .define("MAX_GROUPS", MAX_GROUPS)
                 .library(COMMON);
             for (k, v) in arch.defines {
@@ -178,6 +182,8 @@ pub struct Timing {
     /// Busy tiles, summed over batches, and the most in one.
     pub tiles: u64,
     pub tiles_max: u32,
+    /// Tile-primitive pairs the bin pass listed, summed over batches.
+    pub pairs: u64,
     /// Batches by raster time: under 0.1, 0.3, 1, 3, 10 ms and over.
     pub raster_hist: [u64; 6],
 }
@@ -191,7 +197,7 @@ impl Timing {
         let resolve = gpu.buffer("batch timing resolve", 32, wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
         let read = gpu.buffer("batch timing read", 48, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         let period_ns = gpu.queue.get_timestamp_period() as f64;
-        Some(Timing { queries, resolve, read, period_ns, batches: 0, prims: 0, bin_ns: 0.0, raster_ns: 0.0, tiles: 0, tiles_max: 0, raster_hist: [0; 6] })
+        Some(Timing { queries, resolve, read, period_ns, batches: 0, prims: 0, bin_ns: 0.0, raster_ns: 0.0, tiles: 0, tiles_max: 0, pairs: 0, raster_hist: [0; 6] })
     }
 
     fn writes(&self, first: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
@@ -212,8 +218,8 @@ impl Timing {
                 return;
             };
             let t: [u64; 4] = bytemuck::pod_read_unaligned(&v[0..32]);
-            let busy: u32 = bytemuck::pod_read_unaligned(&v[32..36]);
-            (t, busy)
+            let head: BusyHead = bytemuck::pod_read_unaligned(&v[32..48]);
+            (t, head)
         };
         self.read.unmap();
         let ns = |a: u64, b: u64| b.saturating_sub(a) as f64 * self.period_ns;
@@ -222,8 +228,9 @@ impl Timing {
         self.prims += prims as u64;
         self.bin_ns += ns(t[0], t[1]);
         self.raster_ns += raster;
-        self.tiles += busy as u64;
-        self.tiles_max = self.tiles_max.max(busy);
+        self.tiles += busy.count as u64;
+        self.tiles_max = self.tiles_max.max(busy.count);
+        self.pairs += busy.pairs as u64;
         let ms = raster / 1e6;
         let i = [0.1, 0.3, 1.0, 3.0, 10.0].iter().position(|&l| ms < l).unwrap_or(5);
         self.raster_hist[i] += 1;
@@ -233,7 +240,7 @@ impl Timing {
     pub fn report(&self) -> String {
         let n = self.batches.max(1) as f64;
         format!(
-            "gpu timing: {} batches, {:.1} prims/batch, bin {:.3} s, raster {:.3} s ({:.3} ms/batch), busy tiles {:.0}/batch (max {}), raster ms <0.1/<0.3/<1/<3/<10/more: {:?}",
+            "gpu timing: {} batches, {:.1} prims/batch, bin {:.3} s, raster {:.3} s ({:.3} ms/batch), busy tiles {:.0}/batch (max {}), {:.2} prims/busy tile, raster ms <0.1/<0.3/<1/<3/<10/more: {:?}",
             self.batches,
             self.prims as f64 / n,
             self.bin_ns / 1e9,
@@ -241,6 +248,7 @@ impl Timing {
             self.raster_ns / 1e6 / n,
             self.tiles as f64 / n,
             self.tiles_max,
+            self.pairs as f64 / self.tiles.max(1) as f64,
             self.raster_hist
         )
     }
@@ -261,12 +269,15 @@ pub struct Batch<R: Pod, S: Pod> {
     records: Vec<R>,
     boxes: Vec<[u32; 4]>,
     slots: Vec<S>,
+    /// The tiles the batch's boxes cover, and the sum of their tile counts:
+    /// a bound on the tile-primitive pairs the bin pass will list.
+    cover: Option<TileBox>,
+    pairs_bound: u32,
     // Written by the kernels, shared by every set: the queue orders the
     // batches.
-    masks_buf: wgpu::Buffer,
+    list_buf: wgpu::Buffer,
     busy_buf: wgpu::Buffer,
     args_buf: wgpu::Buffer,
-    flags_buf: wgpu::Buffer,
     sets: Vec<BatchSet>,
     /// The set the next flush writes, once chosen (`next_set`).
     claimed: Option<usize>,
@@ -286,10 +297,9 @@ impl<R: Pod, S: Pod> Batch<R, S> {
     pub fn new(gpu: &Arc<Gpu>, pipelines: &BatchPipelines, grid: TileGrid, max_slots: u32) -> Batch<R, S> {
         let tiles = grid.tiles().max(1);
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let masks_buf = gpu.buffer("batch masks", tiles as u64 * MASK_STRIDE as u64 * 4, storage);
-        let busy_buf = gpu.buffer("batch busy", 16 + tiles as u64 * 4, storage | wgpu::BufferUsages::COPY_SRC);
+        let list_buf = gpu.buffer("batch tile lists", LIST_CAP as u64 * 4, storage);
+        let busy_buf = gpu.buffer("batch busy", 16 + tiles as u64 * BUSY_ENTRY, storage | wgpu::BufferUsages::COPY_SRC);
         let args_buf = gpu.buffer("batch dispatch args", 16, storage | wgpu::BufferUsages::INDIRECT);
-        let flags_buf = gpu.buffer("batch flags", tiles as u64 * 4, storage);
         let mut b = Batch {
             gpu: Arc::clone(gpu),
             grid,
@@ -298,10 +308,11 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             records: Vec::with_capacity(MAX_PRIMS as usize),
             boxes: Vec::with_capacity(MAX_PRIMS as usize),
             slots: Vec::with_capacity(max_slots as usize),
-            masks_buf,
+            cover: None,
+            pairs_bound: 0,
+            list_buf,
             busy_buf,
             args_buf,
-            flags_buf,
             sets: Vec::with_capacity(BATCH_SETS),
             claimed: None,
             last_set: 0,
@@ -328,25 +339,12 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         let batch_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("batch"),
             layout: &pipelines.batch_layout,
-            entries: &[
-                entry(0, &header.buffer),
-                entry(1, &self.masks_buf),
-                entry(2, &self.busy_buf),
-                entry(3, &self.flags_buf),
-                entry(4, &boxes.buffer),
-            ],
+            entries: &[entry(0, &header.buffer), entry(1, &self.list_buf), entry(2, &self.busy_buf), entry(4, &boxes.buffer)],
         });
         let bin_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("batch bin"),
             layout: &pipelines.bin_layout,
-            entries: &[
-                entry(0, &header.buffer),
-                entry(1, &self.masks_buf),
-                entry(2, &self.busy_buf),
-                entry(3, &self.flags_buf),
-                entry(4, &boxes.buffer),
-                entry(5, &self.args_buf),
-            ],
+            entries: &[entry(0, &header.buffer), entry(1, &self.list_buf), entry(2, &self.busy_buf), entry(4, &boxes.buffer), entry(5, &self.args_buf)],
         });
         let records_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("batch records"),
@@ -434,13 +432,18 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         self.prim_tiles(r, b).map(Some)
     }
 
-    /// Append a primitive over an explicit tile box.
+    /// Append a primitive over an explicit tile box. Full when the batch
+    /// holds MAX_PRIMS, or when its boxes could list more tile-primitive
+    /// pairs than LIST_CAP (one box alone never does: a grid has fewer
+    /// tiles).
     pub fn prim_tiles(&mut self, r: R, b: TileBox) -> Result<u32, Full> {
-        if self.records.len() as u32 >= MAX_PRIMS {
+        if self.records.len() as u32 >= MAX_PRIMS || self.pairs_bound.saturating_add(b.count()) > LIST_CAP {
             return Err(Full);
         }
         self.records.push(r);
         self.boxes.push(b.packed());
+        self.pairs_bound += b.count();
+        self.cover = Some(self.cover.map_or(b, |c| c.union(&b)));
         Ok(self.records.len() as u32 - 1)
     }
 
@@ -455,14 +458,19 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         self.claimed = None;
         self.last_set = k;
         let set = &self.sets[k];
+        // The bin pass's grid: the coarse tiles the boxes cover.
+        let cover = self.cover.expect("a batch with records covers tiles");
+        let (cx0, cy0) = (cover.x0 as u32 / COARSE, cover.y0 as u32 / COARSE);
+        let (coarse_cols, coarse_rows) = (cover.x1 as u32 / COARSE - cx0 + 1, cover.y1 as u32 / COARSE - cy0 + 1);
         let header = BatchHeader {
             prim_count: self.records.len() as u32,
             tile_cols: self.grid.cols(),
             tile_rows: self.grid.rows(),
-            mask_words: MASK_WORDS,
+            coarse_cols,
             origin_x: self.grid.origin_x,
             origin_y: self.grid.origin_y,
-            _pad: [0; 2],
+            coarse_x0: cx0,
+            coarse_y0: cy0,
         };
         set.header.write(0, bytemuck::bytes_of(&header));
         set.boxes.write(0, bytemuck::cast_slice(&self.boxes));
@@ -482,7 +490,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             for (i, g) in groups.iter().enumerate() {
                 pass.set_bind_group(2 + i as u32, *g, &[]);
             }
-            pass.dispatch_workgroups(self.records.len() as u32, 1, 1);
+            pass.dispatch_workgroups(coarse_cols, coarse_rows, 1);
         }
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("raster"), timestamp_writes: self.timing.as_ref().and_then(|t| t.writes(2)) });
@@ -511,16 +519,9 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         self.records.clear();
         self.boxes.clear();
         self.slots.clear();
+        self.cover = None;
+        self.pairs_bound = 0;
         Some(submission)
-    }
-
-    /// Zero the masks and flags. Only needed after a failed batch; a
-    /// completed raster pass leaves them clean.
-    pub fn reset(&self) {
-        let mut enc = self.gpu.encoder("batch reset");
-        enc.clear_buffer(&self.masks_buf, 0, None);
-        enc.clear_buffer(&self.flags_buf, 0, None);
-        self.gpu.submit(enc);
     }
 }
 

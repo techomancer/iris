@@ -93,11 +93,11 @@ Raster GPU time, back to back:
 
 - The ceiling is 4%: the atomics' latency is hidden by the other waves;
   the destination's accesses are not what the kernel waits on.
-- What is left, +17%, is the block traffic and a barrier a primitive: a
-  batch averages 559 primitives over 9,859 busy tiles, so a tile sees one
-  or two primitives, and a whole block in and out costs more than the
-  atomics on the fields touched. Larger batches (fewer `note_region`
-  flushes) would raise primitives per tile but not the ceiling.
+- What is left, +17%, is the block traffic and a barrier a primitive. A
+  busy tile sees 10.1 primitives a batch on average (measured with the
+  list binning below, which counts them), so the traffic is not
+  amortised over one primitive; the ceiling, not the traffic, is what
+  rules the cache out on this workload.
 
 Texel reads through a plain binding instead of `atomicLoad` (`glc dlc`,
 L2): 5.90 -> 5.85 s raster, A/B in one binary, memory hash unchanged.
@@ -125,6 +125,25 @@ next step, not more static analysis.
   `IRIS_WGPU_DUMP`/`IRIS_WGPU_LOAD` must be dumped from the same
   workload: the dump bakes in `VRAM_WORD_MASK`, and a parity test's 4 MiB
   mask in the 128 MiB replay gave wrong output and wrong timings.
+
+## Binning per coarse tile into lists (2026-11-09)
+
+The bin pass went from one workgroup per primitive, global `atomicOr`s
+into a 132-word mask per 8x8 tile (35 MB), to one workgroup per 32x32
+coarse tile with its masks in workgroup memory, writing each busy tile's
+primitives as an ordered run of a list (`src/wgpu/shaders/bin.wgsl`).
+A/B, same replay, memory hash unchanged:
+
+| | bin | raster | busy tiles/batch |
+|---|---|---|---|
+| masks | 1.07 s | 5.82 s | 9,859 |
+| lists | 0.20 s | 6.11 s | 9,872 |
+
+10.1 primitives per busy tile. The raster pass is ~4% slower with lists
+and it is not the walk: prefetching the next index (6.09 against 6.12 s)
+and running the busy tiles in screen order (6.05/6.10 s) changed nothing.
+Unexplained; the RGP traces in `ignore/rgp/2026-11-09-quake-texel-plain/`
+are from the mask build, a list-build capture would show the difference.
 
 ## Batches: why they end, and the mask walk (2026-11-08)
 
