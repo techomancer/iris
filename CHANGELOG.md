@@ -34,6 +34,25 @@ hashes are given where a change is easiest to understand by reading the commit.
   old time. The DS1685/DS1687 model now holds a century written under SET
   until SET clears, as the part does, and snapshots keep it.
 
+### IOC3
+
+- The IOC3 is a parent and one child per function, as Linux's
+  `drivers/mfd/ioc3.c` has it, with a table of boards
+  ([docs/dev/ioc3.md](docs/dev/ioc3.md)). The 16550s and the parallel port's
+  registers are modelled as the external Super I/O part they are; serial and
+  parallel ring DMA, the PS/2 controller, the one-wire master and the Ethernet
+  MAC are children. The interrupt status and enable words are atomics and a
+  change drives the Bridge input only when the output flips. The DS1685 and its
+  NVRAM file moved to `src/dev/ds1685.rs`. Snapshots are compatible.
+- The Ethernet threads are `ioc3-eth-rx` and `ioc3-eth-net` on every machine
+  (the Octane's were `ip30-eth-*`).
+- An Octane2 (V10 or V12 graphics) presents the Octane2's front plane, power
+  supply, system board and processor module records, not the Octane's.
+- The Onyx2's BaseIO-G has the MediaIO daughtercard: its own board record, a
+  second IOC3 at PCI device 6 with serial ports, keyboard and mouse and a
+  parallel port, and RAD1 audio at device 7. `hinv` now lists four serial
+  ports, the parallel port and the audio processor.
+
 ### Benchmark and test suites: one pinned compiler
 
 - One pinned compiler, Fedora 45's GCC 16.2.1 for MIPS, builds the `cpu-tests` and `bench` guest binaries, in a container (`cpu-tests/docs/toolchain.md`). Builds are reproducible: debug information no longer records the checkout's path. `make -C cpu-tests toolchain-local` is gone.

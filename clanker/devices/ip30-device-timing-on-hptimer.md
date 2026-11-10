@@ -7,12 +7,13 @@ one-shot or recurring `hptimer` that does the same catch-up a register access
 would, so an idle guest still makes progress. Threads exist only where
 something blocks.
 
-- IOC3 (`src/dev/ioc3.rs`): one receive thread per serial port feeds host
-  input into the FIFO. One-shot timers, one slot each, cover the SDMA receive
-  timer, the transmit delay, the interrupt-output pulse and the NVRAM
-  debounce. Those are also evaluated lazily on every register access. An
-  NVRAM writer thread takes the image from the timer so file I/O stays off
-  the shared timer thread. All are joined in `stop`.
+- IOC3 (`src/dev/ioc3/`, [docs/dev/ioc3.md](../../docs/dev/ioc3.md)): one
+  receive thread per serial port feeds host input into the FIFO. One-shot
+  timers, one slot each, cover the SDMA receive timer, the transmit delay, the
+  interrupt-output pulse and the DS1685's NVRAM debounce. Those are also
+  evaluated lazily on every register access. The DS1685's writer thread takes
+  the image from the timer so file I/O stays off the shared timer thread. All
+  are joined in `stop`.
 - RAD1 (`src/dev/rad1.rs`): a recurring 10 ms timer only while the analog
   output runs with host audio on, plus one-shots for status completions.
   `start` arms them and `stop` removes them and waits out a callback in

@@ -23,7 +23,7 @@ and per-key modes.
   after a read (a clamped device resumes then).
 
 **How the PROM sequence was found.** A throwaway build with an
-`eprintln!` in `kbc_read`/`kbc_write` (`src/dev/ioc3.rs`), PROM 4.17, a
+`eprintln!` in `Kbd::read_locked`/`write_locked` (`src/dev/ioc3/kbd.rs`), PROM 4.17, a
 blank NVRAM (graphics console, so it probes the keyboard), an empty
 `[scsi.4]` CD-ROM slot so no default disk is attached, run for ~100 s
 under `timeout`; then `uniq -c` over the KBC lines (millions of empty
