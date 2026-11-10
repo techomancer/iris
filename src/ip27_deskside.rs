@@ -63,7 +63,7 @@ use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::pci::DevFn;
-use crate::ip27_machine::{cpu_module, fit_io_prom, pci_devices, product, section, table, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord, Unmodelled};
+use crate::ip27_machine::{cpu_module, fit_io_prom, pci_devices, product, PciPopulation, section, table, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord, Unmodelled};
 use crate::traits::{BusDevice, Resettable};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -395,7 +395,8 @@ impl Ip27Board for Deskside {
             }
         }
         let pci_bridge = bridge.clone();
-        let mut io = pci_devices(host, cfg, bridge, layout.ioc3, controller, table(cfg), product(cfg))?;
+        let population = PciPopulation { bridge, ioc3: layout.ioc3, controller };
+        let mut io = pci_devices(host, cfg, population)?;
         if let Some(media) = &layout.mediaio {
             Self::fit_mediaio(host, cfg, &pci_bridge, media, &mut io);
         }
