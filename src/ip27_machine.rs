@@ -871,7 +871,7 @@ impl Ip27Board for Origin200 {
         for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
             node.hub.io().connect_widget(widget, bridge.clone());
         }
-        pci_devices(node, cfg, bridge, &crate::dev::ioc3::IP29, controller, table(cfg), product(cfg))
+        pci_devices(node, cfg, PciPopulation { bridge, ioc3: &crate::dev::ioc3::IP29, controller })
     }
 }
 
@@ -886,17 +886,21 @@ pub(crate) fn fit_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), St
     Ok(())
 }
 
+/// What a board's I/O hangs off its Bridge, and what the board wires to the
+/// devices it builds.
+pub(crate) struct PciPopulation {
+    pub bridge: Arc<Bridge>,
+    /// The board's IOC3: its identification, ports and the Bridge input its
+    /// SuperIO interrupt takes.
+    pub ioc3: &'static Ioc3Board,
+    pub controller: Arc<dyn ModuleController>,
+}
+
 /// The PCI devices both IP27 I/O boards carry behind their Bridge: two
 /// ISP1040s and an IOC3 with its Ethernet, serial ports and Timekeeper.
-pub(crate) fn pci_devices(
-    node: &Node,
-    cfg: &MachineConfig,
-    bridge: Arc<Bridge>,
-    ioc3_board: &'static Ioc3Board,
-    controller: Arc<dyn ModuleController>,
-    scsi_name: &str,
-    name: &str,
-) -> Result<BoardIo, String> {
+pub(crate) fn pci_devices(node: &Node, cfg: &MachineConfig, population: PciPopulation) -> Result<BoardIo, String> {
+    let PciPopulation { bridge, ioc3: ioc3_board, controller } = population;
+    let (scsi_name, name) = (table(cfg), product(cfg));
     let heartbeat = Arc::new(AtomicU64::new(0));
     let (bus_a, bus_b) = (Isp1040::new_bus(), Isp1040::new_bus());
     let attached = crate::scsi::attach_from_config(cfg, Some(scsi_name), &|c| match c {
