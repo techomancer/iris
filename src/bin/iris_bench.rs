@@ -32,6 +32,7 @@ use iris::bench_report::{
     RunSettings, EXPECT_EXC,
 };
 use iris::bench_runner::{self, BenchOptions};
+use iris::junit;
 use iris::cpu::parts::{self, Part};
 
 // ─── running ─────────────────────────────────────────────────────────────────
@@ -171,6 +172,23 @@ fn run_embedded(label: &str, timeout_s: u64, quick: bool, cpu: &'static Part,
     })
 }
 
+/// A run's kernels as JUnit, filed under `bench.<cpu>.<engine>`: failed
+/// where the checksum missed its golden value, skipped where there was none
+/// to check.
+fn junit_suite(cell: &str, rows: &[Row]) -> junit::TestSuite {
+    use junit::{Duration, TestCase};
+    let cases = rows.iter().map(|r| {
+        let time = Duration::nanoseconds(r.ns as i64);
+        match r.status.as_str() {
+            "OK" => TestCase::success(&r.name, time),
+            "MISMATCH" => TestCase::failure(&r.name, time, "checksum",
+                &format!("checksum {} != golden {}", r.checksum, r.golden)),
+            other => TestCase::skipped_with_cause(&r.name, "unchecked", &other.to_lowercase()),
+        }
+    });
+    junit::suite(&junit::classname("bench", cell), cases)
+}
+
 /// Wait for a child, killing it after `timeout_s`. A benchmark that hangs is a
 /// finding, not a reason to block a matrix run forever.
 fn run_with_timeout(mut cmd: Command, timeout_s: u64) -> Result<std::process::Output, String> {
@@ -266,7 +284,7 @@ struct Cell {
     /// What the guest must print in `#machine cpu=`. Checked, because an
     /// overwritten target/release/iris silently turning an "R4400" cell into
     /// an R5000 run is a mistake this repo has made before — see
-    /// cpu-tests/run/matrix.sh.
+    /// clanker/testing/benchmark-suite-gotchas.md.
     expect_cpu: &'static str,
 }
 
@@ -752,6 +770,10 @@ enum Cmd {
         /// `ci_clock` build.
         #[arg(long)]
         deterministic: bool,
+        /// Also write a JUnit report here: one case per kernel, failed when
+        /// its checksum does not match the golden value.
+        #[arg(long)]
+        junit: Option<PathBuf>,
         /// Extra arguments passed through to --iris.
         #[arg(last = true)]
         extra: Vec<String>,
@@ -873,7 +895,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, cache, deterministic, mut extra } => {
+        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, cache, deterministic, junit, mut extra } => {
             let out = out.unwrap_or_else(default_out);
             let label = if deterministic { format!("{label}+deterministic") } else { label };
             let run = match iris {
@@ -910,6 +932,9 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                 }
             };
             let path = save(&run, &out)?;
+            if let Some(junit) = junit {
+                junit::write(junit_suite(&run.cell, &run.rows), &junit)?;
+            }
             print!("{}", text_summary(std::slice::from_ref(&run)));
             println!("wrote {}", path.display());
             Ok(())
@@ -1097,6 +1122,22 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn junit_fails_a_mismatched_kernel_and_skips_an_unchecked_one() {
+        let row = |name: &str, status: &str| Row {
+            name: name.into(), unit: "op".into(), iters: 1, work: 1, ns: 1_500_000_000,
+            icount: 1, count: 1, exc: 0, checksum: "0x1".into(), golden: "0x2".into(),
+            status: status.into(),
+        };
+        let rows = [row("int/alu", "OK"), row("int/muldiv", "MISMATCH"), row("sys/x", "UNCHECKED")];
+        let suite = junit_suite("r4400-interp", &rows);
+        assert_eq!((suite.tests(), suite.failures(), suite.skipped()), (3, 1, 1));
+        let muldiv = &suite.testcases[1];
+        assert_eq!(muldiv.classname.as_deref(), Some("bench.r4400.interp"));
+        assert!(matches!(&muldiv.result, junit::TestResult::Failure { message, .. }
+            if message == "checksum 0x1 != golden 0x2"));
+    }
 
     /// Only what is local to this binary. The report model, its parser and the
     /// derived figures moved to `iris::bench_report` and are tested there —
