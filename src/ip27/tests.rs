@@ -237,6 +237,49 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
     assert_eq!((seen(0, near), seen(1, near), seen(1, far)), (Some(0x00), Some(0x10), Some(0x11)));
 }
 
+/// Every size bank 0 can be builds a memory map, and the boot flash's reset
+/// address belongs to the flash unless a 512 MiB bank 0 reaches it, in which
+/// case the bank holds it for cached references.
+#[test]
+fn every_bank_zero_size_builds_and_a_512_mib_one_keeps_the_reset_address() {
+    for mb in [0, 64, 128, 256, 512] {
+        let mut image = vec![0xff; 0x10_0000];
+        image[0] = 0x12;
+        let flash = NodeFlash::new(image).unwrap();
+        let mem = NodeMemory::new([mb, 0, 0, 0]).unwrap();
+        mem.map_reset_view(&flash);
+        let map = mem.memory_map();
+        assert!(map.contains(RESET_VIEW), "{mb} MiB: the reset address is in the map");
+        assert_eq!(map.is_ram(RESET_VIEW), mb == 512, "{mb} MiB");
+        let phys = mem.physical();
+        if mb == 512 {
+            assert_eq!(phys.write32(RESET_VIEW, 0xfeed_f00d), BUS_OK);
+            assert_eq!(phys.read32(RESET_VIEW).data, 0xfeed_f00d, "cached references reach the bank");
+        } else {
+            assert_eq!(phys.read8(RESET_VIEW).data, 0x12, "{mb} MiB: the flash holds it");
+        }
+    }
+}
+
+/// The reset fetch is uncached, so it reaches the boot flash through the
+/// Hub-special view and the processor's uncached bus whatever the size of
+/// bank 0, a 512 MiB one that covers the address in cached space included.
+#[test]
+fn an_uncached_read_at_the_reset_address_reaches_the_flash_with_a_64_or_512_mib_bank_zero() {
+    for mb in [64, 512] {
+        let mut image = vec![0xff; 0x10_0000];
+        image[..4].copy_from_slice(&0x3c1d_beefu32.to_be_bytes());
+        let flash = NodeFlash::new(image).unwrap();
+        let mem = NodeMemory::new([mb, 0, 0, 0]).unwrap();
+        mem.map_reset_view(&flash);
+        let special = hub_special(mem.physical().clone(), &flash, mem.back_door(), mem.back_door());
+        assert_eq!(special.read32(RESET_VIEW).data, 0x3c1d_beef, "{mb} MiB: the Hub-special view");
+        let none: Arc<dyn BusDevice> = Arc::new(Echo);
+        let bus = Ip27Bus::new(special, none.clone(), none.clone(), none);
+        assert_eq!(bus.read32(RESET_VIEW).data, 0x3c1d_beef, "{mb} MiB: the uncached bus");
+    }
+}
+
 /// A board reserves host address space for the node numbers it can hold, not
 /// for all 256, and a number past the window leaves it for the bus path.
 #[test]

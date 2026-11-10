@@ -33,6 +33,13 @@
 //!   not.
 //! - The low 128 KiB of the Hub-special memory view is not private to each
 //!   processor of the pair.
+//! - A 512 MiB bank 0 covers the boot flash's reset address. Cached references
+//!   reach the bank and the reset fetch, which is uncached, reaches the flash
+//!   through the Hub-special view; the Hub-special view, not the cached
+//!   decode, is where the PROM sits. That the hardware does the same is
+//!   *inferred*: the PROM's memory test walks that address through the cached
+//!   space as RAM, and a reset fetch of the first instruction cannot come
+//!   from anywhere but the flash.
 //! - A bank no larger than 128 MiB is one run at its 512 MiB stride; a larger
 //!   one is four runs at 128 MiB intervals.
 //! - Memory that is not fitted fails every access with a bus error, logged
@@ -209,8 +216,22 @@ impl NodeMemory {
         Arc::new(Home::new(self.phys.clone(), &self.layout))
     }
 
-    /// Place the boot flash's reset view in node memory.
+    /// Whether a fitted run holds the boot flash's reset view: a 512 MiB bank
+    /// 0 spans the whole stride, flash address included.
+    fn ram_holds_reset_view(&self) -> bool {
+        let end = RESET_VIEW + crate::dev::node_flash::SIZE as u64;
+        self.layout.iter().any(|r| r.at < end && r.at + r.len > RESET_VIEW)
+    }
+
+    /// Place the boot flash's reset view in node memory. Where a 512 MiB bank
+    /// 0 holds that address the bank keeps it for cached references: the
+    /// PROM's memory test walks it as RAM, and the reset fetch, which is
+    /// uncached, reaches the flash through the Hub-special view
+    /// ([`hub_special`]) instead.
     pub fn map_reset_view(&self, flash: &Arc<NodeFlash>) {
+        if self.ram_holds_reset_view() {
+            return;
+        }
         crate::window_map::map_device(&self.phys, RESET_VIEW, crate::dev::node_flash::SIZE as u64, flash.chip(), "boot flash");
     }
 
@@ -219,12 +240,14 @@ impl NodeMemory {
         use crate::memory_map::{MemKind, MemRange, MemoryMap};
         const NAMES: [&str; BANKS] = ["bank 0", "bank 1", "bank 2", "bank 3"];
         let mut ranges: Vec<_> = self.layout.iter().map(|r| MemRange::new(NAMES[r.bank], MemKind::Ram, r.at, r.at + r.len)).collect();
-        ranges.push(MemRange::new(
-            "boot flash",
-            MemKind::Rom,
-            RESET_VIEW,
-            RESET_VIEW + crate::dev::node_flash::SIZE as u64,
-        ));
+        if !self.ram_holds_reset_view() {
+            ranges.push(MemRange::new(
+                "boot flash",
+                MemKind::Rom,
+                RESET_VIEW,
+                RESET_VIEW + crate::dev::node_flash::SIZE as u64,
+            ));
+        }
         MemoryMap::new(ranges)
     }
 
