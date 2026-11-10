@@ -729,7 +729,11 @@ pub fn handle_request_deferred(
     if !loaded && !load_oom {
         let t_compile = std::time::Instant::now();
         func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
-        crate::cpu::jitv2::hashstats::note_compile_time(t_compile.elapsed());
+        let compile_time = t_compile.elapsed();
+        crate::cpu::jitv2::hashstats::note_compile_time(compile_time);
+        COMPILE_NS_TOTAL.fetch_add(compile_time.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        COMPILE_COUNT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        COMPILE_NS_MAX.fetch_max(compile_time.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         if let (Some(_), Some((fp, ph))) = (func_id, cache_key) {
             match codegen.take_last_blob() {
                 Some((code, align)) => crate::cpu::jitv2::pcache::store(fp, ph, req.compiled_for_fr1, crate::cpu::jitv2::pcache::Blob {
@@ -1357,3 +1361,14 @@ mod tests {
         assert!(taken > 0, "no snapshot held still long enough to check");
     }
 }
+
+/// Time spent in `compile_region_uncommitted`, summed over every worker, the
+/// number of compiles, and the slowest one. Always counted (three relaxed
+/// atomics per compile): a codegen change that makes generated code faster
+/// can make compiling it slow enough that the code arrives too late to
+/// matter, and a throughput benchmark alone does not show which happened.
+pub static COMPILE_NS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMPILE_COUNT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMPILE_NS_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Regions `define_function` rejected (out of arena included).
+pub static COMPILE_FAILED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

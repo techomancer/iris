@@ -1,9 +1,17 @@
 # Plan: keep guest registers in SSA values across a jitv2 region
 
-Status: **plan, 2026-11-09. Nothing implemented on main.** Sources: xiri's
-`perf/sgiemu-port` (`66f5a59b`, read in full) and atom's summary of revenir's
-JIT patches (0025 gpr-forward, 0026 mem-join; the patches themselves are in a
-private repository and were not read). Main at `95a3af0b`.
+Status: **done 2026-11-10.** What landed, and what the measurements changed,
+is in [../jitv2/gpr-cache.md](../jitv2/gpr-cache.md). In short: stage 1 (the
+join) and stage 3 (the region cache) are in, on by default; stage 2 (local
+forwarding) was not needed, since per-entry stubs give the region cache the
+same "no load nobody reads" property; the budget turned out to matter less
+than *where* registers are cached (loops only); and the reload-after-callout
+idea in stage 3 was measured and dropped. The "related work" list at the end
+is still open, and compile time is now the first item on it.
+
+Written from xiri's `perf/sgiemu-port` (`66f5a59b`, read in full) and atom's
+summary of revenir's JIT patches (0025 gpr-forward, 0026 mem-join; the patches
+themselves are in a private repository and were not read). Main at `95a3af0b`.
 
 ## Why
 
@@ -123,6 +131,11 @@ Revisit only if stores show up in a profile after stage 3.
   and R10000.
 
 ## Related work to pick up separately
+
+- **Compile time first.** A live IRIX boot keeps four compile workers
+  saturated at ~50 ms per page function; see "Compile time is the bigger
+  lever" in the note above. revenir's 0008 (incremental compile) and 0004
+  (idle workers) are aimed at exactly this.
 
 - From xiri: PS/2 Set 2 -> Set 1 translation (`484452d9`), TLB tags keep
   Region and VPN[39:32] in 32-bit mode (`9df1df14`, `43fdfaaf`), MC restore

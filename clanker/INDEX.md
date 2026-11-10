@@ -80,6 +80,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [gpr0-was-loaded-from-memory.md](jitv2/gpr0-was-loaded-from-memory.md) | rule | `$zero` was being loaded from memory, 79 times in one region |
 | [inlined-slot-pc-bd-bracket.md](jitv2/inlined-slot-pc-bd-bracket.md) | rule | The inlined delay slot's `core.pc` / `in_delay_slot` bracket |
 | [instructions-jitv2-still-interprets.md](jitv2/instructions-jitv2-still-interprets.md) | history | What jitv2 still interprets, and which of it is worth compiling |
+| [gpr-cache.md](jitv2/gpr-cache.md) | rule | Guest registers are cached in host registers only inside loops, and written through: the rule for callouts, the load/store join, suite and IRIX measurements, what was dropped, and compile time as the bigger lever |
 | [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | measure | The pending-interrupt check, not block structure, is what blocks GPR forwarding |
 | [j2_per_instruction_category_toggle.md](jitv2/j2_per_instruction_category_toggle.md) | design | j2 per-instruction/category enable toggle |
 | [jit-page-probe-must-be-retired-on-drop.md](jitv2/jit-page-probe-must-be-retired-on-drop.md) | history | The jitv2 dirty-page probe must be retired when its cache dies |
@@ -476,7 +477,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
 | [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
-| [jitv2-gpr-forwarding.md](plans/jitv2-gpr-forwarding.md) | plan | Guest registers as SSA values in jitv2: what xiri and revenir measured, why the all-31 cache regresses, staged plan (mem-join value, local forwarding, budgeted region cache), verification |
+| [jitv2-gpr-forwarding.md](plans/jitv2-gpr-forwarding.md) | history | Guest registers as SSA values in jitv2: what xiri and revenir measured and the staged plan; done 2026-11-10, outcome in jitv2/gpr-cache.md |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |

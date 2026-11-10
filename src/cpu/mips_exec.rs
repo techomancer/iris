@@ -11022,6 +11022,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             if e + d > 0 {
                 eprintln!("jitv2 inline memory: emitted={e} declined={d}");
             }
+            let n = crate::cpu::jitv2::comp::COMPILE_COUNT_TOTAL.load(Ordering::Relaxed);
+            if n > 0 {
+                let total = crate::cpu::jitv2::comp::COMPILE_NS_TOTAL.load(Ordering::Relaxed);
+                let max = crate::cpu::jitv2::comp::COMPILE_NS_MAX.load(Ordering::Relaxed);
+                let failed = crate::cpu::jitv2::comp::COMPILE_FAILED_TOTAL.load(Ordering::Relaxed);
+                eprintln!("jitv2 compiles: {n} in {:.1} ms (mean {:.2} ms, max {:.1} ms), {failed} rejected",
+                    total as f64 / 1e6, total as f64 / 1e6 / n as f64, max as f64 / 1e6);
+            }
         }
         #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
         {

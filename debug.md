@@ -306,6 +306,7 @@ take effect after `j2 flush`.
 | `j2 min-instrs [N]` / `j2 max-instrs [N]` | Minimum / maximum instructions walked per compile | `0` / `1024` |
 | `j2 min-calls [N]` | Legacy setting; stored and reported but not used by whole-page dispatch | `0` |
 | `j2 intrun [N]` | Instructions sharing one pending-interrupt check; 1 = every instruction (forced under lockstep) | `1` |
+| `j2 gprcache [N]` | Guest registers a compiled function with a loop keeps in host registers (the N its loops use most); 0 = none (forced under lockstep). New compiles only: `stop`, `j2 flush`, `start` to rebuild existing code | `6` (`10` on AArch64) |
 | `j2 fallback [on\|off]` | Keep an unsupported instruction inside a region as an interpreter call instead of ending the region | `off` |
 | `j2 entrypre [on\|off]` | Check for interrupts at an externally dispatched entry word (off: not until the next instruction head, which a retried bus access never reaches); takes effect after `j2 flush` | `on` |
 | `j2 inline_mem [on\|off]` | Inline L1D loads and stores (forced off under lockstep) | `on` |

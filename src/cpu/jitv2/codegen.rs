@@ -214,6 +214,11 @@ struct EmitCtx<'a, 'b> {
     /// case every access inlines its guard exactly as before.
     mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT],
     core_ptr: Value,
+    /// Variables standing in for guest GPRs, indexed by register number
+    /// (`None` = this register lives in `MipsCore` only). See
+    /// [`CODEGEN_GPR_CACHE`]. `None` altogether outside a region body
+    /// (guards, stubs, shared helpers) and when the cache is off.
+    gpr_cache: Option<&'a GprVars>,
     raw: u32,
     word: WordOffset,
     /// Compile-time-known Cause.BD value for whatever `emit_exception_exit`
@@ -449,6 +454,130 @@ fn verify_ir_enabled() -> bool {
 /// however long a straight-line run happens to be. `j2 intrun <n>` sets it.
 static CODEGEN_INTERRUPT_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
+/// How many guest GPRs a compiled function keeps in Cranelift variables
+/// instead of reloading them from `MipsCore` at every use (`0` = none;
+/// `31` = every register its loops touch).
+///
+/// Each cached register is a `Variable`: loaded once per external entry (in
+/// that entry's own dispatch stub, so Cranelift's SSA construction drops the
+/// load for a register no path from that entry reads before writing), read
+/// with `use_var`, and written **through** — `emit_write_gpr` stores to
+/// `MipsCore` and redefines the variable. `MipsCore` therefore stays precise
+/// at every exit, bail and exception with no spill protocol. The only thing
+/// that can make a variable stale is a callout that writes a GPR behind the
+/// emitter's back; there are exactly two kinds, and each redefines the
+/// variables it may have changed (`emit_interp_fallback_head`, and the shared
+/// load helper in `emit_load`). See `clanker/jitv2/gpr-cache.md`.
+///
+/// When fewer registers than the function touches are allowed, the ones with
+/// the most uses inside loops win, and a function without a loop caches
+/// none (`pick_cached_gprs`). `j2 gprcache <n>` / `IRIS_GPRCACHE` set it.
+static CODEGEN_GPR_CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DEFAULT_GPR_CACHE);
+
+/// Default budget. Cached registers stay live across the callouts in a loop
+/// body (slow memory paths, FPU special cases), so the ones that fit in the
+/// host's callee-saved registers cost nothing there and the rest are saved
+/// and restored around each call. x86-64 has five besides the frame pointer,
+/// one of which holds the core pointer; on the benchmark suite 4, 6 and 8
+/// measure the same within noise and 31 loses the FP kernels. AArch64 has
+/// ten; its figure is by that count, not yet by measurement.
+pub const DEFAULT_GPR_CACHE: u32 = if cfg!(target_arch = "aarch64") { 10 } else { 6 };
+
+/// `IRIS_GPRCACHE_EVERYWHERE`: cache registers in functions without a loop
+/// too, ranked by plain use count. Slower to compile and no faster to run
+/// (see `pick_cached_gprs`); it exists so a test run can put every
+/// instruction of every region behind the cache.
+fn gpr_cache_everywhere() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_GPRCACHE_EVERYWHERE").is_some())
+}
+
+/// Every GPR but `r0`, which is a constant and never cached.
+pub const MAX_GPR_CACHE: u32 = 31;
+
+/// One optional variable per GPR; see [`CODEGEN_GPR_CACHE`].
+type GprVars = [Option<cranelift_frontend::Variable>; 32];
+
+/// Pick which registers a function caches: the `budget` registers with the
+/// most static uses **inside loops**, and none at all for a function without
+/// a loop.
+///
+/// A variable pays once per trip round a loop (the reload it saves) and
+/// costs once per entry into the function (the stub load) plus compile time
+/// (SSA construction, block params, longer live ranges for the allocator).
+/// Straight-line code enters, runs each instruction once and leaves through
+/// a call or return, so there the trade is at best even — measured on a
+/// call-heavy IRIX program, caching registers everywhere made nothing faster
+/// and compiles about a sixth slower, with the compile workers already the
+/// bottleneck. Loops are where a register is read thousands of times per
+/// entry, so that is the only place it is cached.
+///
+/// A loop is a taken edge that stays in the region and goes backwards
+/// (`continues_to_taken <= word`); its body is the word range it spans, plus
+/// the branch's delay slot. Nested loops count once per enclosing loop. The
+/// count is a field census (`rs`, `rt`, and `rd` for SPECIAL), not a decode:
+/// good enough to rank, and a register ranked but never read costs nothing.
+fn pick_cached_gprs(instrs: &[CompiledInstr; ENTRIES_PER_PAGE], budget: u32) -> [bool; 32] {
+    let mut depth = [0u8; ENTRIES_PER_PAGE];
+    let mut any_loop = false;
+    for instr in instrs_linear(instrs) {
+        if let Some(target) = instr.continues_to_taken {
+            if target <= instr.word {
+                any_loop = true;
+                let end = (instr.word as usize + 1).min(ENTRIES_PER_PAGE - 1);
+                for d in &mut depth[target as usize..=end] {
+                    *d = d.saturating_add(1);
+                }
+            }
+        }
+    }
+    let everywhere = gpr_cache_everywhere();
+    let mut picked = [false; 32];
+    if !any_loop && !everywhere {
+        return picked;
+    }
+    let mut uses = [0u32; 32];
+    for instr in instrs_linear(instrs) {
+        let weight = depth[instr.word as usize] as u32 + everywhere as u32;
+        if weight == 0 || instr.is_fallback {
+            continue;
+        }
+        let raw = instr.raw;
+        uses[field_rs(raw) as usize] += weight;
+        uses[field_rt(raw) as usize] += weight;
+        if raw >> 26 == 0 {
+            uses[field_rd(raw) as usize] += weight;
+        }
+    }
+    let mut order: Vec<usize> = (1..32).filter(|&r| uses[r] > 0).collect();
+    order.sort_by(|&a, &b| uses[b].cmp(&uses[a]).then(a.cmp(&b)));
+    for &r in order.iter().take(budget as usize) {
+        picked[r] = true;
+    }
+    picked
+}
+
+/// (Re)define every cached GPR variable from `MipsCore`: at an external
+/// entry, and after a callout that may have written any register. A
+/// definition nothing downstream reads before the next write has no use, so
+/// Cranelift emits no load for it.
+///
+/// Deliberately NOT done after every callout. Write-through would make that
+/// legal, and it would spare the allocator keeping values alive across
+/// calls, but it was measured and lost: over a 584-page IRIX corpus it
+/// emitted 11% more code with 8 registers and 34% more with 31 (22% longer
+/// compiles), for the same benchmark throughput. Cached registers stay live
+/// across the callouts that cannot write them.
+fn emit_reload_gpr_cache(builder: &mut FunctionBuilder, core_ptr: Value, vars: &GprVars) {
+    for (reg, var) in vars.iter().enumerate() {
+        if let Some(var) = *var {
+            let value = builder.ins().load(ir::types::I64, MemFlagsData::trusted(), core_ptr,
+                ir::immediates::Offset32::new(core_offset_of_gpr(reg as u32)));
+            builder.def_var(var, value);
+        }
+    }
+}
+
 /// Hard ceiling on [`CODEGEN_INTERRUPT_RUN`]. 32 guest instructions is
 /// already well past the point of diminishing returns (runs of 32+ are 0.2%
 /// of the corpus; the mean run is 4.33), and it keeps worst-case interrupt
@@ -522,6 +651,29 @@ impl Codegen {
             }
         });
         CODEGEN_INTERRUPT_RUN.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the GPR cache budget (see [`CODEGEN_GPR_CACHE`]). Affects regions
+    /// compiled afterwards; flush to rebuild existing ones.
+    pub fn set_gpr_cache(n: u32) {
+        let _ = Self::gpr_cache();
+        CODEGEN_GPR_CACHE.store(n.min(MAX_GPR_CACHE), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current GPR cache budget. Always `0` under `jitv2_lockstep`: its
+    /// per-instruction interpreter reference writes GPRs between any two
+    /// emitted instructions, and it verifies the memory-path emission.
+    pub fn gpr_cache() -> u32 {
+        if cfg!(feature = "jitv2_lockstep") {
+            return 0;
+        }
+        static SEED: std::sync::Once = std::sync::Once::new();
+        SEED.call_once(|| {
+            if let Some(n) = std::env::var("IRIS_GPRCACHE").ok().and_then(|v| v.parse::<u32>().ok()) {
+                CODEGEN_GPR_CACHE.store(n.min(MAX_GPR_CACHE), std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        CODEGEN_GPR_CACHE.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `cranelift_jit`'s default `SystemMemoryProvider` mmaps (or
@@ -850,11 +1002,12 @@ impl Codegen {
         use std::fmt::Write as _;
         let _ = write!(
             s,
-            "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
+            "max={} min={} speed={} intrun={} gprcache={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
             crate::cpu::jitv2::comp::max_instrs_per_compile(),
             crate::cpu::jitv2::comp::min_instrs_to_compile(),
             Self::opt_level_speed(),
             Self::interrupt_run(),
+            Self::gpr_cache(),
             inline_mem_enabled(),
             mem_helpers_enabled(),
             crate::cpu::jitv2::analyzer::fallback_enabled(),
@@ -1328,6 +1481,7 @@ impl Codegen {
                 // implementation. All-None forces the inline guard here.
                 mem_helpers: [None; MEM_HELPER_COUNT],
                 core_ptr,
+                gpr_cache: None,
                 raw: 0,
                 word: 0,
                 dc_geometry,
@@ -1663,7 +1817,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1690,7 +1844,7 @@ impl Codegen {
         // start, because the armed foreign-slot transfer was destroyed.
         if crate::cpu::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
@@ -1706,6 +1860,28 @@ impl Codegen {
         // untouched core.pc, so the caller's normal interpret-or-recompile
         // path takes over exactly as if this function had never been
         // called.
+        // GPR cache (`CODEGEN_GPR_CACHE`): one variable per chosen register.
+        // They are defined per external entry, in a stub the dispatch Switch
+        // reaches first, rather than once up here: a definition in the shared
+        // entry block would be live into every entry, so each call would pay
+        // a load for every register any path of the page function reads.
+        let gpr_cache: Option<GprVars> = match Self::gpr_cache() {
+            0 => None,
+            budget => {
+                let picked = pick_cached_gprs(instrs, budget);
+                let mut vars: GprVars = [None; 32];
+                for reg in 1..32 {
+                    if picked[reg] {
+                        vars[reg] = Some(builder.declare_var(ir::types::I64));
+                    }
+                }
+                // Nothing picked (no loop): no stubs, no variables, the
+                // function is exactly what it is with the cache off.
+                picked.iter().any(|&p| p).then_some(vars)
+            }
+        };
+        let mut pending_gpr_stubs: Vec<(ir::Block, ir::Block)> = Vec::new();
+
         let dispatch_miss_block = builder.create_block();
         let mut switch = cranelift_frontend::Switch::new();
         // `developer` trace stubs are *created* here but filled only after
@@ -1718,6 +1894,14 @@ impl Codegen {
         let mut pending_trace_stubs: Vec<(ir::Block, ir::Block, u16, u32)> = Vec::new();
         for &w in &entry_words {
             let real_target = entry_body_blocks.get(&w).copied().unwrap_or_else(|| entry_word_block_for(w));
+            // Filled after `switch.emit`, like the trace stubs below.
+            let real_target = if gpr_cache.is_some() {
+                let stub = builder.create_block();
+                pending_gpr_stubs.push((stub, real_target));
+                stub
+            } else {
+                real_target
+            };
             // `developer`: trace this external arrival here, in the compiled
             // function's own dispatch head, instead of relying on the Rust
             // caller that looked this entry up to push a matching traceback
@@ -1770,10 +1954,19 @@ impl Codegen {
             builder.switch_to_block(stub);
             let raw = instrs[w as usize].raw;
             let mut unused_cycles_pending = 0u32;
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw, word: w, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
+        }
+
+        if let Some(vars) = gpr_cache.as_ref() {
+            for (stub, real_target) in pending_gpr_stubs {
+                builder.switch_to_block(stub);
+                emit_reload_gpr_cache(&mut builder, core_ptr, vars);
+                builder.ins().jump(real_target, &[]);
+                builder.seal_block(stub);
+            }
         }
 
         builder.switch_to_block(dispatch_miss_block);
@@ -1904,7 +2097,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, gpr_cache: gpr_cache.as_ref(), raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -2392,6 +2585,12 @@ impl Codegen {
             { self.last_decline_was_verifier_error = !is_oom; }
             #[cfg(feature = "developer")]
             eprintln!("jitv2: compile_region failed: {e}");
+            // Counted in every build, and the first one is reported in every
+            // build: a region Cranelift rejects is interpreted for good, which
+            // from outside looks like slow generated code.
+            if crate::cpu::jitv2::comp::COMPILE_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                eprintln!("jitv2: first rejected region (oom={is_oom}): {e}");
+            }
             #[cfg(not(any(feature = "developer", feature = "lightning")))]
             eprintln!("jitv2: codegen rejected a compiled region (run a developer build for details)");
             return None;
@@ -3117,6 +3316,11 @@ fn emit_interp_fallback_head(
         None => {
             let next_block = *block_for_word.get(&(word + 1))
                 .expect("fallback fallthrough_exit is None -> analyzer guarantees the successor is in-region");
+            // The interpreter ran an arbitrary instruction against
+            // `MipsCore`: every cached GPR may be stale.
+            if let Some(vars) = ctx.gpr_cache {
+                emit_reload_gpr_cache(ctx.builder, ctx.core_ptr, vars);
+            }
             ctx.builder.ins().jump(next_block, &[]);
         }
     }
@@ -4314,21 +4518,69 @@ fn emit_mem_read_raw(ctx: &mut EmitCtx, vaddr: Value, size: MemSize, dst: Value,
     emit_mem_read_callout(ctx, vaddr, size, dst, extend)
 }
 
-/// Generic read for callers that need the value back as an SSA value
-/// (FPU loads, LWL/LDL/LWR/LDR) rather than written straight to a GPR —
-/// see `read32_fn`'s doc comment on why those two cases differ. Always
-/// zero-extends (none of those callers want sign extension of the raw
-/// bytes). Routes the value through `jit_read_scratch` and reloads it;
-/// `emit_load`'s GPR-destination fast path (`build_mem_helper`) skips that
-/// round trip entirely by passing the real destination as `dst` instead.
-fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
+/// Read for callers that need the value back as an SSA value: GPR loads
+/// (`emit_load`), FPU loads, LWL/LDL/LWR/LDR. Checks the status itself and
+/// leaves the builder in the no-fault continuation.
+///
+/// With the inline path the value rides the fast/slow join as a block
+/// param: the fast path passes what it loaded and touches no `MipsCore`
+/// field, and only the slow path — the callout, which reports through a
+/// status and writes through a pointer — checks a status and reloads
+/// `jit_read_scratch`. A fault leaves the slow path through the exception
+/// exit and never reaches the join, so nothing after it runs.
+fn emit_mem_read_ext(ctx: &mut EmitCtx, vaddr: Value, size: MemSize, extend: LoadExtend) -> Value {
+    let mem = MemFlagsData::trusted();
+    let i64t = ir::types::I64;
     let scratch_off = std::mem::offset_of!(MipsCore, jit_read_scratch) as i64;
+
+    if inline_mem_enabled() {
+        if let Some(path) = emit_inline_mem_guard::<false>(ctx, vaddr, size) {
+            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let value = ctx.builder.append_block_param(path.join_block, i64t);
+
+            // --- fast: load from the swizzled host address ---
+            let raw = ctx.builder.ins().load(size.ir_type(), mem, path.fast_data_ptr,
+                                             ir::immediates::Offset32::new(0));
+            let raw = if size == MemSize::B8 {
+                // tcache's window stores doublewords word-swapped; the cache
+                // data array does not (see tc_read vs dc_read).
+                ctx.builder.ins().rotl_imm_s(raw, 32)
+            } else if extend == LoadExtend::Sign {
+                ctx.builder.ins().sextend(i64t, raw)
+            } else {
+                ctx.builder.ins().uextend(i64t, raw)
+            };
+            ctx.builder.ins().jump(path.join_block, &[raw.into()]);
+
+            // --- slow: the callout, its status check, and the reload ---
+            ctx.builder.switch_to_block(path.slow_block);
+            ctx.builder.set_cold_block(path.slow_block);
+            ctx.builder.seal_block(path.slow_block);
+            let dst = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, scratch_off);
+            let status = emit_mem_read_callout(ctx, vaddr, size, dst, extend);
+            emit_check_mem_status(ctx, status);
+            // Still the slow path: keep the no-fault continuation out of the
+            // hot layout too.
+            let cont = ctx.builder.current_block().unwrap();
+            ctx.builder.set_cold_block(cont);
+            let slow = ctx.builder.ins().load(i64t, mem, dst, ir::immediates::Offset32::new(0));
+            ctx.builder.ins().jump(path.join_block, &[slow.into()]);
+
+            ctx.builder.switch_to_block(path.join_block);
+            ctx.builder.seal_block(path.join_block);
+            return value;
+        }
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dst = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, scratch_off);
-    let status = emit_mem_read_raw(ctx, vaddr, size, dst, LoadExtend::Zero);
-    // The status is a live SSA value here, so the check reads a register
-    // rather than reloading a MipsCore field.
+    let status = emit_mem_read_callout(ctx, vaddr, size, dst, extend);
     emit_check_mem_status(ctx, status);
-    ctx.builder.ins().load(ir::types::I64, MemFlagsData::trusted(), dst, ir::immediates::Offset32::new(0))
+    ctx.builder.ins().load(i64t, mem, dst, ir::immediates::Offset32::new(0))
+}
+
+/// [`emit_mem_read_ext`], zero-extended.
+fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
+    emit_mem_read_ext(ctx, vaddr, size, LoadExtend::Zero)
 }
 
 /// Fast/slow join for an inline load. On entry the builder sits in the fast
@@ -4686,7 +4938,30 @@ fn emit_mem_write_raw(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSi
 }
 
 fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
-    let status = emit_mem_write_raw(ctx, vaddr, value, size);
+    if inline_mem_enabled() {
+        if let Some(path) = emit_inline_mem_guard::<true>(ctx, vaddr, size) {
+            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The fast path cannot fault, so only the callout's status is
+            // ever checked, on the slow path; the join carries nothing.
+            emit_mem_write_fast(ctx, value, size, &path);
+            ctx.builder.ins().jump(path.join_block, &[]);
+
+            ctx.builder.switch_to_block(path.slow_block);
+            ctx.builder.set_cold_block(path.slow_block);
+            ctx.builder.seal_block(path.slow_block);
+            let status = emit_mem_write_callout(ctx, vaddr, value, size);
+            emit_check_mem_status(ctx, status);
+            let cont = ctx.builder.current_block().unwrap();
+            ctx.builder.set_cold_block(cont);
+            ctx.builder.ins().jump(path.join_block, &[]);
+
+            ctx.builder.switch_to_block(path.join_block);
+            ctx.builder.seal_block(path.join_block);
+            return;
+        }
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let status = emit_mem_write_callout(ctx, vaddr, value, size);
     emit_check_mem_status(ctx, status);
 }
 
@@ -4695,9 +4970,32 @@ fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) 
 fn emit_mem_write_split(
     ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize, path: InlineMemPath,
 ) -> Value {
-    let mem = MemFlagsData::trusted();
     // Status rides the join as a block param rather than a MipsCore field.
     let status = ctx.builder.append_block_param(path.join_block, ir::types::I32);
+    emit_mem_write_fast(ctx, value, size, &path);
+
+    // The inline path cannot fault (the guard already checked every failure
+    // condition), so its status is a constant.
+    let ok = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().jump(path.join_block, &[ok.into()]);
+
+    // --- slow: the original callout ---
+    ctx.builder.switch_to_block(path.slow_block);
+    ctx.builder.set_cold_block(path.slow_block);
+    ctx.builder.seal_block(path.slow_block);
+    let slow_status = emit_mem_write_callout(ctx, vaddr, value, size);
+    ctx.builder.ins().jump(path.join_block, &[slow_status.into()]);
+
+    ctx.builder.switch_to_block(path.join_block);
+    ctx.builder.seal_block(path.join_block);
+    status
+}
+
+/// The inline store itself: data, dirty flag, generation bump and L2
+/// has-code clear. On entry the builder sits in the fast block; on return it
+/// still does, unterminated — the caller jumps to the join.
+fn emit_mem_write_fast(ctx: &mut EmitCtx, value: Value, size: MemSize, path: &InlineMemPath) {
+    let mem = MemFlagsData::trusted();
 
     // --- fast: store to the swizzled host address ---
     // `value` arrives as I64 regardless of size (see emit_mem_write_callout's
@@ -4811,23 +5109,6 @@ fn emit_mem_write_split(
         }
     }
 
-    // The inline path cannot fault (the guard already checked every failure
-    // condition), so its status is a constant that folds away — where the old
-    // design stored EXEC_COMPLETE to `jit_mem_exc` here and reloaded it in
-    // `emit_check_mem_status`.
-    let ok = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
-    ctx.builder.ins().jump(path.join_block, &[ok.into()]);
-
-    // --- slow: the original callout ---
-    ctx.builder.switch_to_block(path.slow_block);
-    ctx.builder.set_cold_block(path.slow_block);
-    ctx.builder.seal_block(path.slow_block);
-    let slow_status = emit_mem_write_callout(ctx, vaddr, value, size);
-    ctx.builder.ins().jump(path.join_block, &[slow_status.into()]);
-
-    ctx.builder.switch_to_block(path.join_block);
-    ctx.builder.seal_block(path.join_block);
-    status
 }
 
 fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) -> Value {
@@ -6273,6 +6554,9 @@ fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
     if reg == 0 {
         return ctx.builder.ins().iconst(ir::types::I64, 0);
     }
+    if let Some(var) = ctx.gpr_cache.and_then(|vars| vars[reg as usize]) {
+        return ctx.builder.use_var(var);
+    }
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
@@ -6292,6 +6576,11 @@ fn emit_write_gpr(ctx: &mut EmitCtx, reg: u32, value: Value) {
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+    // Write-through: memory stays the architectural state, the variable is
+    // only where the next read finds it without a load.
+    if let Some(var) = ctx.gpr_cache.and_then(|vars| vars[reg as usize]) {
+        ctx.builder.def_var(var, value);
+    }
 }
 
 /// Compile-time FPU register-file addressing mode, resolved once per
@@ -10198,25 +10487,20 @@ fn emit_load(ctx: &mut EmitCtx, size: MemSize, extend: LoadExtend) {
         let dst_off = ctx.builder.ins().iconst(ir::types::I64, dst_off);
         let status = emit_mem_helper_call(ctx, addr, vaddr, dst_off);
         emit_check_mem_status(ctx, status);
+        // The helper wrote `gpr[rt]` itself, behind the variable's back.
+        // Pick the new value up here, past the status check: a faulting load
+        // leaves `rt` and its variable as they were.
+        if let Some(var) = ctx.gpr_cache.and_then(|vars| vars[rt as usize]) {
+            let value = ctx.builder.ins().load(ir::types::I64, MemFlagsData::trusted(),
+                ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_gpr(rt)));
+            ctx.builder.def_var(var, value);
+        }
         return;
     }
 
-    // emit_mem_read checks the status itself and leaves the builder in the
-    // no-fault continuation block.
-    let loaded = emit_mem_read(ctx, vaddr, size);
-
-    // read*_fn always returns the value zero-extended to u64 on the Rust
-    // side (MipsCore's read*_fn field doc comments) — narrow back to the
-    // access's true width before re-extending, so a Sign extend actually
-    // sign-extends from the right bit rather than from bit 63.
-    let result = match (size, extend) {
-        (MemSize::B8, _) => loaded, // already the full 64 bits either way
-        (_, LoadExtend::Zero) => loaded, // already zero-extended by read*_fn
-        (_, LoadExtend::Sign) => {
-            let narrow = ctx.builder.ins().ireduce(size.ir_type(), loaded);
-            ctx.builder.ins().sextend(ir::types::I64, narrow)
-        }
-    };
+    // Checks the status itself, leaves the builder in the no-fault
+    // continuation block, and hands back the value already extended.
+    let result = emit_mem_read_ext(ctx, vaddr, size, extend);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
@@ -11473,7 +11757,7 @@ mod tests {
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, gpr_cache: None, raw: 0, word: word_offset, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves

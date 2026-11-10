@@ -715,6 +715,13 @@ code into host code with Cranelift. The concepts:
 - **No speculation.** Guest registers live in `MipsCore` memory; compiled
   code reads and writes them there, so the interpreter can take over at any
   instruction boundary and exceptions need no rollback.
+- **Registers in loops are also kept in host registers.** A page function
+  with a loop keeps the few registers its loops use most in Cranelift
+  variables: loaded when the function is entered, read from the variable,
+  and written to both the variable and `MipsCore`. Memory is still the
+  architectural state at every instant, so the point above holds unchanged.
+  A callout that writes a register itself (an interpreter call inside a
+  region) reloads the variables afterwards. `j2 gprcache` sets how many.
 - **Memory access.** Loads and stores that hit an already-cached L1D line are
   inlined; everything else calls back into Rust. Callouts take the core
   pointer as their first argument and return status in registers.
