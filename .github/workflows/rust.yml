@@ -78,13 +78,14 @@ jobs:
       run: cargo test -p iris --lib the_lane_
     # nextest runs each test in its own process and writes the JUnit report
     # the annotations below come from. It does not run doctests.
-    # Only Linux x86-64 fails the job; the other platforms report a failure
-    # (a red step, which the API still counts as a pass) and carry on.
+    # macOS is informational until it has a green run on main: it last passed
+    # on 2026-11-01, and a failure there is a red step that leaves the job
+    # green. Every other platform fails the job.
     - name: Run tests
-      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
+      continue-on-error: ${{ matrix.os == 'macos-26' }}
       run: cargo nextest run --workspace --profile ci
     - name: Run doctests
-      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
+      continue-on-error: ${{ matrix.os == 'macos-26' }}
       run: cargo test --workspace --doc
     - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
       if: ${{ !cancelled() }}
