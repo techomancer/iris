@@ -2013,28 +2013,28 @@ impl MipsCore {
         self.cp0_cause | (self.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7)
     }
 
-    /// CPU thread is stopping: latch the virtual count at its current value
+    /// CPU thread is stopping: bring the virtual count up to date, latch it
     /// and silence the compare timer, so a stopped CPU (monitor `cpu stop`,
     /// debugger stepping) sees a frozen Count and never gets IP7 raised
     /// underneath it (use the monitor's `ip7` command to inject one
     /// manually). A Compare that Count reached before the stop is still
-    /// raised here. Idempotent. No-op semantics under ci_clock (count follows
-    /// `hot.cycles` there, which stops advancing on its own).
+    /// raised here. This holds under ci_clock too: Count follows
+    /// `hot.cycles` there, but `cp0_count` only holds the value as of the
+    /// last read, so the cycles retired since then are materialized here or
+    /// `on_cpu_start`'s re-anchor would drop them. Idempotent.
     pub fn on_cpu_stop(&mut self) {
         if self.count_paused {
             return;
         }
-        #[cfg(not(feature = "ci_clock"))]
-        {
-            // Materialize past count_now's cycles memo (cycles may not have
-            // moved since the last read, but real time has), and deliver a
-            // Compare this advance steps over: the one-shot is disabled
-            // below and the restart arms the next match from the latched
-            // Count, so a deadline the timer thread had not fired yet would
-            // otherwise wait a whole Count wrap.
-            self.count_read_cycle = self.hot.cycles.wrapping_sub(1);
-            self.materialize_count(true);
-        }
+        // Materialize past count_now's cycles memo (cycles may not have
+        // moved since the last read, but real time has under the wall-clock
+        // build; rewinding the memo is harmless under ci_clock), and deliver
+        // a Compare this advance steps over: the one-shot is disabled below
+        // and the restart arms the next match from the latched Count, so a
+        // deadline the timer thread had not fired yet would otherwise wait
+        // a whole Count wrap.
+        self.count_read_cycle = self.hot.cycles.wrapping_sub(1);
+        self.materialize_count(true);
         self.count_read_cycle = self.hot.cycles;
         self.count_paused = true;
         if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id) {
@@ -2935,6 +2935,21 @@ mod ip7_ticket_tests {
         core.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
         assert_eq!(core.cp0_cause & CAUSE_IP7, 0);
         assert_ne!(core.cause_for_snapshot() & CAUSE_IP7, 0);
+    }
+
+    /// ci_clock Count follows retired cycles, so a stop/start pair must not
+    /// cost the cycles retired since Count was last read: start re-anchors at
+    /// the current cycle, and those ticks were never added to `cp0_count`.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn a_stop_and_start_keeps_the_count_the_cycles_earned() {
+        let mut core = MipsCore::default();
+        core.hot.cycles = 100_000;
+        let expected = core.count_peek();
+        assert_ne!(expected, 0, "the cycles should have earned some ticks");
+        core.on_cpu_stop();
+        core.on_cpu_start();
+        assert_eq!(core.count_peek(), expected, "Count lost the ticks counted before the stop");
     }
 
     /// The overrun case still delivers -- suppressing the crossing must not
