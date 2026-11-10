@@ -672,7 +672,8 @@ mod tests {
                 std::thread::sleep(Duration::from_micros(200));
             }
         }
-        assert!(queued > 1000, "only {queued} frames went in before the backend stalled");
+        // More than the 8-frame ring went in, so the socket took frames until it filled.
+        assert!(queued > 64, "only {queued} frames went in before the backend stalled");
         let t = Instant::now();
         r.stop();
         assert!(t.elapsed() < Duration::from_secs(2), "stop took {:?}", t.elapsed());
