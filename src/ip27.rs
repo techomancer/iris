@@ -28,8 +28,14 @@
 //!   processor of the pair.
 //! - A bank no larger than 128 MiB is one run at its 512 MiB stride; a larger
 //!   one is four runs at 128 MiB intervals.
-//! - Memory that is not fitted reads zero and drops writes, logged under
-//!   `phys hole on`.
+//! - Memory that is not fitted fails every access with a bus error, logged
+//!   under the `hub` log category: the IRIX kernel's handler for an uncached
+//!   bus error considers memory that does not exist, and SGI's event catalogue
+//!   lists an access to non-existent memory. No capture of a physical machine
+//!   shows it, so it is a software expectation. The PROM's memory sizing reads
+//!   each bank through the directory back door, which answers a fixed pattern
+//!   for an absent bank, so it does not reach unfitted memory: boots of one,
+//!   two and 256 MiB banks log no access.
 //! - The ECC and directory back doors keep only the low two bytes of each
 //!   eight-byte entry. An unfitted bank's back door answers a fixed pattern
 //!   to reads and drops writes.
@@ -37,6 +43,7 @@
 //! Ported from hw/mips/sgi/sn0.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::node_flash::NodeFlash;
+use crate::devlog::LogModule;
 use crate::ip35::SparseWindowMap;
 use crate::physical::{Physical, RamBank};
 use crate::ppmem::devmap::SLOT_SHIFT;
@@ -274,17 +281,27 @@ impl BusDevice for Home {
     home_access!(read64, write64, u64, BusRead64);
 }
 
-/// Memory that is not fitted: reads zero, drops writes. `phys hole on` logs it.
+/// Memory that is not fitted: every access is a bus error, logged under
+/// `hub`. Only accesses outside the fitted runs reach it, so fitted memory
+/// pays nothing for it.
 struct Absent;
+macro_rules! absent_access {
+    ($r:ident, $w:ident, $t:ty, $out:ident) => {
+        fn $r(&self, a: u64) -> $out {
+            crate::dlog!(LogModule::Hub, "Hub: read of unfitted memory {a:#x}");
+            $out::err()
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            crate::dlog!(LogModule::Hub, "Hub: write of {v:#x} to unfitted memory {a:#x}");
+            BUS_ERR
+        }
+    };
+}
 impl BusDevice for Absent {
-    fn read8(&self, _: u64) -> BusRead8 { BusRead8::ok(0) }
-    fn read16(&self, _: u64) -> BusRead16 { BusRead16::ok(0) }
-    fn read32(&self, _: u64) -> BusRead32 { BusRead32::ok(0) }
-    fn read64(&self, _: u64) -> BusRead64 { BusRead64::ok(0) }
-    fn write8(&self, _: u64, _: u8) -> u32 { BUS_OK }
-    fn write16(&self, _: u64, _: u16) -> u32 { BUS_OK }
-    fn write32(&self, _: u64, _: u32) -> u32 { BUS_OK }
-    fn write64(&self, _: u64, _: u64) -> u32 { BUS_OK }
+    absent_access!(read8, write8, u8, BusRead8);
+    absent_access!(read16, write16, u16, BusRead16);
+    absent_access!(read32, write32, u32, BusRead32);
+    absent_access!(read64, write64, u64, BusRead64);
 }
 
 const BACKDOOR_ENTRY: usize = 8;
