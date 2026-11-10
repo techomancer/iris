@@ -769,7 +769,7 @@ code into host code with Cranelift. The concepts:
   pointer as their first argument and return status in registers.
 - **The interpreter is the fallback and the reference.** Instructions without
   an emitter end the compiled region or call the interpreter's handler. The
-  equivalence tests, the cpu-tests matrix, `jitcheck` and the
+  equivalence tests, the cpu-tests suite run on both engines, `jitcheck` and the
   `jitv2_lockstep` feature compare the JIT against the interpreter.
 - **Several CPUs share one pool.** Compiled code reaches CPU state only through
   its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
@@ -836,9 +836,21 @@ with full debug info for `perf` and flamegraphs. Every feature is listed in
 [FEATURES.md](FEATURES.md).
 
 Tests: `cargo test --workspace` (unit tests, including per-device snapshot
-round trips and, with `--features jitv2`, the JIT equivalence tests),
-`make -C cpu-tests run` (bare-metal instruction correctness), `iris-bench`
-(bare-metal throughput and accuracy). See [TESTING.md](TESTING.md).
+round trips and, with `--features jitv2`, the JIT equivalence tests). The
+bare-metal suites are integration tests, ignored by a plain `cargo test`:
+
+```
+cargo test --release [--features jitv2] --test cpu_tests -- --ignored       # instruction correctness
+cargo test --release [--features jitv2] --test bench_accuracy -- --ignored  # benchmark checksums
+cargo test -p iris-checks -- --ignored                                       # no formatting in hot code (needs a lightning release build)
+iris-bench run                                                              # throughput
+```
+
+The two suites build the emulator for the engine on their command line, so a
+verdict never comes from a stale or wrong-engine binary. CI runs the unit tests on Linux x86-64, Linux
+arm64 and Windows, and the suites on a pull request that touches them; failures
+show as annotations on the pull request. [TESTING.md](TESTING.md) has the commands,
+what CI runs and how to read its results.
 
 ## 11. References
 

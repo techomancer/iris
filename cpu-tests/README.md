@@ -34,6 +34,9 @@ cargo build --release       # in the repo root, first
 make run                    # loads the ELF straight into RAM and runs it
 ```
 
+`make run` prints and does not judge; the cargo test under
+[Is this run healthy?](#is-this-run-healthy) does.
+
 `make run` takes a few minutes — 262 tests, some of which take real exceptions
 or sweep the caches. You get a padded line per test, a
 result line for tools (`1..262` first, then `ok N - name` or `not ok N - name`),
@@ -66,14 +69,23 @@ cargo test --release --test cpu_tests -- --ignored --exact r5000     # one cell
                                      # CPU: r4400 r5000 r10000 r12000 r14000
 ```
 
-It fails when a test fails that the list does not name, when a listed test
-passes (delete its line in the commit that fixed it), when the number of
-results differs from the `1..N` plan or one is misnumbered, or when the run
-never prints `IRIS-CPUTEST-DONE`. It reads the guest from
-`IRIS_CPUTEST_ELF`, else `build/cputest.elf`, and builds the emulator itself,
-for the engine the command names, so a run cannot pick up a stale or
-wrong-engine `iris`. The cases are ignored by a plain `cargo test`. Each run's
-console log is kept under `target/tmp/bare-metal/`.
+A run counts only if it is whole. The case fails when a test fails that the
+list does not name, when a listed test passes (delete its line in the commit
+that fixed it), and when the TAP stream is not complete: no `1..N` plan, a
+result number out of order, fewer or more results than the plan, no
+`IRIS-CPUTEST-DONE` line, or an emulator that was killed or timed out. The
+other rules, and why a count is not enough, are in
+[TESTING.md](../TESTING.md#strict-tap).
+
+It reads the guest from `IRIS_CPUTEST_ELF`, else `build/cputest.elf`, and builds
+the emulator itself, for the engine the command names, so a run cannot pick up
+a stale or wrong-engine `iris`. The cases (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) are ignored by a
+plain `cargo test`, and a debug build refuses to run them. Each run's console
+log is kept under `target/tmp/bare-metal/`.
+
+CI runs the same tests through `cargo nextest` and reports every guest test as
+its own case in a JUnit file, so a failing test is named on the pull request;
+[TESTING.md](../TESTING.md#reading-a-pull-requests-results) says where to look.
 
 ### Other CPUs and engines
 
@@ -89,8 +101,8 @@ cargo build --release --features jitv2               # jitv2 (no env var needed)
 The cargo test above runs every CPU for the engine it was built with —
 R4400, R5000, R10000, R12000 and R14000 — so the two commands cover every
 cell. The *Bare-metal suites* CI workflow
-(`.github/workflows/suites.yml`) runs every cell on each push that touches the
-CPU, through the same tests. The JIT adds one expected failure,
+(`.github/workflows/suites.yml`) runs every cell on each pull request and push
+that touches the CPU, through the same tests. The JIT adds one expected failure,
 `cache/hit_inv_discards`, because jitv2 implies the transparent cache.
 
 ### Booting it like real hardware
@@ -220,6 +232,20 @@ use them, or the assembler will quietly rewrite your instructions (see
 
 A whole new area also needs a `struct test_group` and one line in
 `harness/tests.c`.
+
+Then, in the toolchain container:
+
+1. `make -C cpu-tests` and `make -C cpu-tests run` on each CPU (`--cpu r4400`,
+   `--cpu r5000`; see [Other CPUs and engines](#other-cpus-and-engines)).
+2. A failure is a bug in the test unless it passes on a real Indy and the
+   emulator is wrong. Only then, with the gap written up in
+   [docs/findings.md](docs/findings.md), add its name under each `[cpu-engine]`
+   section of [expected-failures.txt](expected-failures.txt) it fails in.
+3. `cargo test --release --test cpu_tests -- --ignored`, and again with
+   `--features jitv2`. The plan count in the TAP stream follows the tables by
+   itself; nothing else lists the tests.
+
+A test name is its identity in the list and in the JUnit report, so pick it once.
 
 FP tests have their own conventions — `AF` rather than `A` for any block with
 an FP instruction, never a `$f*` clobber, values crossing through memory — all

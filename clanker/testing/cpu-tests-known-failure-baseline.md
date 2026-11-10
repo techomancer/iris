@@ -9,8 +9,11 @@ cargo test --release [--features jitv2] --test cpu_tests -- --ignored
 ```
 
 judges a run on each CPU against it by test name (`tests/cpu_tests.rs`). CI
-runs the same test. A fix that makes a listed test pass fails it until its
-line is deleted, in the same commit.
+runs the same test under `cargo nextest` and annotates each failing guest test
+on the pull request. A fix that makes a listed test pass fails it until its
+line is deleted, in the same commit. A run must also be whole (plan, numbering,
+`IRIS-CPUTEST-DONE`); the rules are in
+[TESTING.md](../../TESTING.md#strict-tap).
 
 Names, not counts. CI used to compare the number of failing checks with a
 per-cell constant, which cannot see one test starting to fail as another
