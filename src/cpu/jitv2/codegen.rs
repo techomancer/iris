@@ -385,6 +385,16 @@ pub struct BlockSkeleton {
 /// generated code `speed` produces.
 static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(feature = "developer"));
 
+/// `IRIS_JIT_REGALLOC`, when it names an allocator Cranelift has.
+fn jit_regalloc_override() -> Option<&'static str> {
+    static V: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("IRIS_JIT_REGALLOC").as_deref() {
+        Ok("single_pass") => Some("single_pass"),
+        Ok("backtracking") => Some("backtracking"),
+        _ => None,
+    })
+}
+
 /// Whether Cranelift runs its IR verifier on every compile. It only checks
 /// this codegen's own IR and never changes the emitted code, but it is a large
 /// share of compile time, and the guest interprets every page still waiting
@@ -594,10 +604,19 @@ impl Codegen {
     /// regions, but `speed` is worth comparing once regions grow larger
     /// (`MAX_INSTRS_PER_COMPILE`).
     pub fn set_opt_level_speed(speed: bool) {
+        let _ = Self::opt_level_speed();
         CODEGEN_OPT_LEVEL_SPEED.store(speed, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn opt_level_speed() -> bool {
+        // `IRIS_JIT_OPT=none|speed` seeds the level once, so a whole run
+        // (not just code compiled after a `j2 opt`) can be measured at it.
+        static SEED: std::sync::Once = std::sync::Once::new();
+        SEED.call_once(|| match std::env::var("IRIS_JIT_OPT").as_deref() {
+            Ok("none") => CODEGEN_OPT_LEVEL_SPEED.store(false, std::sync::atomic::Ordering::Relaxed),
+            Ok("speed") => CODEGEN_OPT_LEVEL_SPEED.store(true, std::sync::atomic::Ordering::Relaxed),
+            _ => {}
+        });
         CODEGEN_OPT_LEVEL_SPEED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -725,6 +744,13 @@ impl Codegen {
         let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
         flag_builder.set("opt_level", opt_level).unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        // `IRIS_JIT_REGALLOC=single_pass`: Cranelift's one-pass register
+        // allocator. For measurement: the backtracking allocator is over a
+        // third of compile time in an IRIX boot
+        // (clanker/jitv2/compile-time-profile.md).
+        if let Some(algo) = jit_regalloc_override() {
+            flag_builder.set("regalloc_algorithm", algo).unwrap();
+        }
         flag_builder.set("enable_verifier", if verify_ir { "true" } else { "false" }).unwrap();
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
