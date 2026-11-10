@@ -8,10 +8,10 @@ on:
     # ready_for_review: marking a draft ready starts the full set below.
     types: [ opened, synchronize, reopened, ready_for_review ]
 
-# One run per workflow per pull request: a new push cancels the runs it
-# replaces. Pushes to main are never cancelled.
+# One run per pull request; a new push cancels the run it replaces. Main
+# pushes are never cancelled and get a group per commit, so none queues.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -34,6 +34,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +102,7 @@ jobs:
     name: Build release features (${{ matrix.os }})
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -139,6 +141,7 @@ jobs:
   dist-scripts:
     name: Lint scripts/dist
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v5
     - run: shellcheck -x -S warning scripts/dist/*.sh scripts/build-macos.sh
