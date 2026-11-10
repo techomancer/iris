@@ -201,6 +201,18 @@ device answers; what silicon does there is not defined. A configuration read
 of an empty PCI slot fails as a master timeout; the error enable gating and
 the treatment of device 0 there are inferred.
 
+The L1 answers the system serial request with `LEMU`, iris's kind digit 2,
+`[machine] emu_id` as four digits and `0` (`LEMU200420` for emu_id 42,
+`LEMU200000` by default), and IRIX folds the low nibble of each of its first
+ten characters into the host id `sysinfo -s` and `lmhostid` print
+(`d5200420`). At start-up iris prints that id and the serial. A nonzero
+emu_id also gives the station address `08:00:69:e2:` and the emu_id, unless
+`[network] mac` names one; the address is never the id. The board serial in
+the node board's L1 record stays `EMUN00`, so the PROM keeps its NVRAM when
+the emu_id changes. The serial is a synthetic value, not a factory identity;
+a real unit's is a letter and seven digits, and whether real L1 or L2
+firmware takes other text is untested.
+
 The IRIX 6.5.30 disks tested so far were installed on an Origin 300, not a
 Tezro. On them the IOC4 serial ports appear as `tty3` and `tty4`, as on
 real single-node IP59 inventories.

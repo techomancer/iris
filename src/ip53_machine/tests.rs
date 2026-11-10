@@ -150,6 +150,46 @@ fn the_node_board_record_agrees_with_the_flash_configuration() {
     }
 }
 
+/// The L1 answers the system serial request with the text the emu_id gives,
+/// and nothing else moves with it: the node board's record keeps its EMUN00
+/// serial, which the PROM ties its NVRAM to, so a machine given a new emu_id
+/// keeps the settings it saved.
+#[test]
+fn the_system_serial_moves_and_the_board_serial_stays() {
+    let board = |emu_id: u32| {
+        let mut cfg = crate::config::MachineConfig::default();
+        cfg.machine.profile = crate::config::MachineProfile::TezroIp53;
+        cfg.machine.emu_id = emu_id;
+        TezroBoard::with_config(TezroBoardConfig {
+            payload: &[],
+            clock: Arc::new(|| 0),
+            flash_path: None,
+            station_mac: cfg.network().mac,
+            system_serial: Some(cfg.tezro_system_serial()),
+            timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+            memory: &MemoryPopulation::default(),
+            cpus: 1,
+            chip: &CHIPS[0],
+            v12: false,
+            graphics_pool: (2, 32),
+            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        })
+        .unwrap()
+    };
+    let (first, second) = (board(42), board(43));
+    assert_eq!(first.l1.config().system_serial.as_deref(), Some("LEMU200420"));
+    assert_eq!(second.l1.config().system_serial.as_deref(), Some("LEMU200430"));
+    assert_eq!(first.l1.station_mac(), [0x08, 0x00, 0x69, 0xe2, 0x02, 0xa0]);
+    for component in 0..2 {
+        for area in [1, 2, 4] {
+            assert_eq!(first.l1.record(component, area), second.l1.record(component, area), "component {component}, area {area}");
+        }
+    }
+    let area = first.l1.record(0, 2).expect("component 0's board area");
+    assert_eq!(area_fields(&area)[2], b"EMUN00");
+    assert_eq!(first.l1.config().brick_serial, second.l1.config().brick_serial);
+}
+
 /// A board of `cpus` processors of `chip`, with the defaults otherwise.
 fn board_with_chip(cpus: usize, chip: &'static TezroChip) -> TezroBoard {
     TezroBoard::with_config(TezroBoardConfig {
@@ -157,6 +197,7 @@ fn board_with_chip(cpus: usize, chip: &'static TezroChip) -> TezroBoard {
         clock: Arc::new(|| 0),
         flash_path: None,
         station_mac: L1Config::default().mac,
+        system_serial: None,
         timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
         memory: &MemoryPopulation::default(),
         cpus,
@@ -334,6 +375,7 @@ fn board_with_clock(cpus: usize) -> (TezroBoard, Arc<AtomicU64>) {
         clock: Arc::new(move || clock.load(Ordering::SeqCst)),
         flash_path: None,
         station_mac: L1Config::default().mac,
+        system_serial: None,
         timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
         memory: &MemoryPopulation::default(),
         cpus,
@@ -486,6 +528,7 @@ fn the_board_refuses_a_population_it_cannot_fit() {
         clock: Arc::new(|| 0),
         flash_path: None,
         station_mac: L1Config::default().mac,
+        system_serial: None,
         timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
         memory: &MemoryPopulation::default(),
         cpus: 1,
@@ -505,6 +548,7 @@ fn board_with(chip: &Part) -> TezroBoard {
         clock: Arc::new(|| 0),
         flash_path: None,
         station_mac: L1Config::default().mac,
+        system_serial: None,
         timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
         memory: &MemoryPopulation::one_gib(),
         cpus: usize::from(self::chip(chip).cpus[0]),
@@ -678,6 +722,7 @@ fn board_with_v12(cpus: usize) -> TezroBoard {
         clock: Arc::new(|| 0),
         flash_path: None,
         station_mac: L1Config::default().mac,
+        system_serial: None,
         timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
         memory: &MemoryPopulation::default(),
         cpus,

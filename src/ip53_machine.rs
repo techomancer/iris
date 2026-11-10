@@ -28,8 +28,10 @@
 //! - Bedrock board word 0x2001, the Tezro firmware record (the chip's clock,
 //!   an authored configuration block), and an L1 that reports
 //!   brick type 0x39, revision 1.48.1, the first port-speed integer 1, the
-//!   router `brick` reply and, in the node board's record, the CPU
-//!   configuration the flash block holds.
+//!   router `brick` reply, the system serial `[machine] emu_id` gives
+//!   (IRIX's host id is its fold) and, in the node board's record, the CPU
+//!   configuration the flash block holds. The board serial in that record
+//!   stays `EMUN00` whatever the emu_id: the PROM ties its NVRAM to it.
 //!
 //! # What is approximated here
 //!
@@ -502,6 +504,7 @@ impl TezroMachine {
             clock: host_clock(),
             flash_path: cfg.tezro.flash.as_deref().map(Path::new),
             station_mac: cfg.network().mac,
+            system_serial: Some(cfg.tezro_system_serial()),
             timekeeper: clock,
             memory: &memory,
             cpus: usize::from(cfg.machine.cpus()),
@@ -951,6 +954,9 @@ pub(crate) struct TezroBoardConfig<'a> {
     pub clock: Clock,
     pub flash_path: Option<&'a Path>,
     pub station_mac: [u8; 6],
+    /// The system serial every L1 answers with, the text IRIX folds into
+    /// its host id. `None` answers with the station address in hex.
+    pub system_serial: Option<String>,
     /// The DS1744-compatible clock and NVRAM in the IOC4's BAR.
     pub timekeeper: Arc<Ds1744>,
     pub memory: &'a MemoryPopulation,
@@ -1041,6 +1047,7 @@ impl TezroBoard {
             clock: Arc::new(|| 0),
             flash_path: None,
             station_mac: L1Config::default().mac,
+            system_serial: None,
             timekeeper: Arc::new(Ds1744::new(YearBase::From(1968))?),
             memory: &MemoryPopulation::default(),
             cpus,
@@ -1052,7 +1059,7 @@ impl TezroBoard {
     }
 
     pub fn with_config(config: TezroBoardConfig<'_>) -> Result<Self, String> {
-        let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus, chip, v12, graphics_pool, graphics_raster } = config;
+        let TezroBoardConfig { payload, clock, flash_path, station_mac, system_serial, timekeeper, memory, cpus, chip, v12, graphics_pool, graphics_raster } = config;
         if ![1, 2, 4].contains(&cpus) {
             return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
         }
@@ -1072,6 +1079,7 @@ impl TezroBoard {
                 type_code: 0x39,
                 revision: Some([1, 48, 1]),
                 mac: station_mac,
+                system_serial,
                 port_speed_first: 1,
                 router: true,
                 cpu_context: Some(cpu_context(&chip.firmware)),
