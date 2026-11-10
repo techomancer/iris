@@ -638,6 +638,10 @@ pub struct Gl {
     point_size: f32,
     /// GL_POINT_SMOOTH (POINT_SMOOTH).
     point_smooth: u32,
+    /// GL_POINT_SMOOTH as it was at the last POINT_SIZE: the GE sizes an
+    /// antialiased point's pixel box then, not when smoothing is enabled
+    /// (`smooth_point_window`).
+    point_box_smooth: u32,
     /// The line stipple's position along antialiased lines, which the GE
     /// draws pixel by pixel (`smooth_line_window`).
     aa_stipple_pos: u32,
@@ -1321,7 +1325,10 @@ impl Gl {
                 self.pixel_state_block(d);
             }
             tok::TEX_COORD => self.texcoord = args_f32(d),
-            tok::POINT_SIZE => self.point_size = f32::from_bits(w0),
+            tok::POINT_SIZE => {
+                self.point_size = f32::from_bits(w0);
+                self.point_box_smooth = self.point_smooth;
+            }
             tok::POINT_SMOOTH => self.point_smooth = on,
             // Our pixel paths never texture, which is what the bracket
             // asks the GE for; the texture state itself stays as it was.
@@ -2421,16 +2428,18 @@ impl Gl {
     }
 
     /// An antialiased point (GL_POINT_SMOOTH), as a real High IMPACT draws
-    /// it (test/gltest/linetest points: sizes 1 to 6.5 at eighths of a
-    /// pixel). Size 1 is a one-pixel antialiased line from the point to
-    /// one pixel right of it (`smooth_line_window`). Larger points are discs
-    /// of the point size's diameter, each pixel's alpha times S(r - d), d
-    /// its centre's distance from the point: the integral of a tent filter
-    /// 0.9 pixels either side of the disc's edge (S(0) = 1/2). The pixels
-    /// tried run floor(c) - ceil(r) to floor(c) + ceil(r) on each axis,
-    /// which is what lights the far side's last pixel and not the near
-    /// side's. Colour index has no alpha: a pixel at least half covered is
-    /// drawn.
+    /// it (test/gltest/linetest points and pointsal: sizes 1 to 6.5 at
+    /// eighths of a pixel). Size 1 is a one-pixel antialiased line from the
+    /// point to one pixel right of it (`smooth_line_window`). Larger points
+    /// are discs of the point size's diameter, each pixel's alpha times
+    /// S(r - d), d its centre's distance from the point: the integral of a
+    /// tent filter 0.9 pixels either side of the disc's edge (S(0) = 1/2).
+    /// On each axis the first pixel tried is the first pixel of an aliased
+    /// point of the rounded size, plus one if smoothing was on at the last
+    /// glPointSize (the GE sets the box up with the size: smoothing enabled
+    /// afterwards keeps the aliased box, which cuts off the near side's
+    /// ring); the far side runs as far as the coverage does. Colour index
+    /// has no alpha: a pixel at least half covered is drawn.
     fn smooth_point_window(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {
         let size = self.point_size.max(1.0);
         if size <= 1.0 && self.ci == 0 {
@@ -2447,7 +2456,11 @@ impl Gl {
             let u = u.clamp(-A, A);
             0.5 + u / A - u * u.abs() / (2.0 * A * A)
         };
-        let box_ = |c: f32| (c.floor() as i32 - r.ceil() as i32, c.floor() as i32 + r.ceil() as i32);
+        let m = size.round() as i32 + (self.point_box_smooth != 0) as i32;
+        let box_ = |c: f32| {
+            let first = if m % 2 == 0 { (c + 0.5).floor() as i32 - m / 2 } else { c.floor() as i32 - (m - 1) / 2 };
+            (first, (c + r + A).floor() as i32)
+        };
         let ((x0, x1), (y0, y1)) = (box_(v.x), box_(v.y));
         for py in y0..=y1 {
             for px in x0..=x1 {

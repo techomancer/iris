@@ -142,12 +142,15 @@ where they differed:
 - Antialiased width-1 lines and antialiased points follow the board's
   measured coverage (lines a few levels off on average, points one); a
   flat line clipped by the window keeps its colour.
+- An antialiased point's pixel box is set when its size is, as the GE
+  does: glPointSize before glEnable(GL_POINT_SMOOTH) keeps the aliased
+  point's box and cuts off the near side's ring, as on the board.
 - A new context's GE pixel memory holds the board's fresh values for the
   host element type and its neighbours.
 - New guest tools: `bdinfo` (the board-info record gfxinfo reads), `rdist`,
   `blendtest -a`, `dettex --fill / --dump`, `fogtest` (fog per pixel) and
-  `linetest points|vprofile|vslopes` (antialiased points and y-major
-  lines). The board's read-backs of lines, points and fog are unit tests
+  `linetest points|pointsal|vprofile|vslopes` (antialiased points and
+  y-major lines), `pttest` (one antialiased point drawn several ways). The board's read-backs of lines, points and fog are unit tests
   (`real_board_*` in `src/dev/mgras/mgras_tests.rs`).
 
 ### VPro introspection

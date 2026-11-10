@@ -66,8 +66,8 @@ microcode and the revision checks in libGLcore may take other paths.
     over window depth, pixel pairs; `real_board_fog`, `real_board_fogtest`).
   - Lines and points: fixed 2026-11-09 (`gl-lines-follow-diamond-exit.md`);
     aliased cases exact (`real_board_lines`), antialiased lines and
-    points fitted (`real_board_smooth_lines_and_points`). Open: glprim's
-    antialiased points of sizes 3 and 6.5.
+    points fitted (`real_board_smooth_lines_and_points`), including the
+    point box the GE latches at glPointSize (glprim's AA points).
   - Smooth triangles, strips, fans, polygons, lighting, blends: off by one
     level at most (rounding).
   - texsweep: ALPHA and INTENSITY textures (4/8/12/16) read back as the
@@ -96,7 +96,7 @@ twin's network used to die ~20 minutes after boot
 
 **Measured 2026-11-09** (results/purple-lf on the share): `linetest` in
 every mode (default, profile, vprofile, slopes, vslopes, fine, points,
-pointsdc), `fogtest` and `fogtest 8`, glprim smooth-point variants
+pointsdc, pointsal), `pttest` (results/purple-lf/pt), `fogtest` and `fogtest 8`, glprim smooth-point variants
 (ptvar). The fits are in the notes above; the board data the unit tests
 use is in `src/dev/mgras/testdata/real_high_impact_*.txt`.
 

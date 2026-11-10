@@ -3621,14 +3621,12 @@ fn real_board_cases() -> Vec<(String, Vec<u32>)> {
 /// Lines and points against a real High IMPACT, pixel for pixel; smooth
 /// shading within one level (glprim dithers, and the board's dither is not
 /// ours), antialiased lines and points within five (a fitted coverage,
-/// `real_board_smooth_lines_and_points`). Open, reported only: glprim's
-/// antialiased points of sizes 3 and 6.5, which on the board lack the
-/// near side's ring that linetest's points have (not the smoothing hint,
-/// the visual or the blend function; see
-/// clanker/mgras/gl-lines-follow-diamond-exit.md).
+/// `real_board_smooth_lines_and_points`). glprim sets the point size
+/// before enabling smoothing, so its antialiased points keep the aliased
+/// box (clanker/mgras/gl-lines-follow-diamond-exit.md).
 #[test]
 fn real_board_lines() {
-    const OPEN: &[&str] = &["points_aa_s3", "points_aa_s6.5"];
+    const OPEN: &[&str] = &[];
     let mut bad = Vec::new();
     for (name, want) in real_board_cases() {
         let got = linesweep_case(&name);
@@ -3756,14 +3754,14 @@ fn linetest_board() -> std::sync::Arc<Mgras> {
 fn real_board_smooth_lines_and_points() {
     use std::collections::HashMap;
     let mut lines: HashMap<u32, HashMap<(usize, usize), u32>> = HashMap::new();
-    let mut points: HashMap<(u32, u32, u32), HashMap<(usize, usize), u32>> = HashMap::new();
+    let mut points: HashMap<(bool, u32, u32, u32), HashMap<(usize, usize), u32>> = HashMap::new();
     for l in include_str!("testdata/real_high_impact_smooth.txt").lines().filter(|l| !l.starts_with('#')) {
         let v: Vec<&str> = l.split_whitespace().collect();
         let n = |k: usize| v[k].parse::<u32>().unwrap();
         if v[0] == "line" {
             lines.entry(n(1)).or_default().insert((n(2) as usize, n(3) as usize), n(4));
         } else {
-            points.entry((n(1), n(2), n(3))).or_default().insert((n(4) as usize, n(5) as usize), n(6));
+            points.entry((v[0] == "pointal", n(1), n(2), n(3))).or_default().insert((n(4) as usize, n(5) as usize), n(6));
         }
     }
     let compare = |what: &str, m: &Mgras, want: &HashMap<(usize, usize), u32>, x0: usize, y0: usize, w: usize, h: usize| {
@@ -3801,16 +3799,35 @@ fn real_board_smooth_lines_and_points() {
     m.stop_engines();
     let mut keys: Vec<_> = points.keys().copied().collect();
     keys.sort();
-    for (s64, i, j) in keys {
+    // The GE sets a smooth point's pixel box up at glPointSize: 'pointal'
+    // sets the size before enabling smoothing, which keeps the aliased box.
+    let mut by_size: std::collections::BTreeMap<(bool, u32), (f64, u32, u32)> = Default::default();
+    for (aliased_box, s64, i, j) in keys {
         let m = linetest_board();
-        fifo_token(&m, 0x6C, &[1]);
-        fifo_token(&m, 0x4D, &[f(s64 as f32 / 64.0)]);
+        if aliased_box {
+            fifo_token(&m, 0x4D, &[f(s64 as f32 / 64.0)]);
+            fifo_token(&m, 0x6C, &[1]);
+        } else {
+            fifo_token(&m, 0x6C, &[1]);
+            fifo_token(&m, 0x4D, &[f(s64 as f32 / 64.0)]);
+        }
         fifo_token(&m, 0x16, &[]);
         fifo_token(&m, 0x00, &[f(8.0 + i as f32 / 8.0), f(8.0 + j as f32 / 8.0), f(0.0)]);
         fifo_token(&m, 0x20, &[]);
-        let (mean, worst) = compare(&format!("point {} at ({i}, {j})/8", s64 as f32 / 64.0), &m, &points[&(s64, i, j)], 0, 0, 16, 16);
-        assert!(mean <= 4.0 && worst <= 30, "point {s64}/64 at ({i}, {j}): mean {mean:.2}, worst {worst}");
+        let what = format!("point{} {} at ({i}, {j})/8", if aliased_box { " (size first)" } else { "" }, s64 as f32 / 64.0);
+        let (mean, worst) = compare(&what, &m, &points[&(aliased_box, s64, i, j)], 0, 0, 16, 16);
+        let e = by_size.entry((aliased_box, s64)).or_default();
+        *e = (e.0 + mean, e.1.max(worst), e.2 + 1);
+        assert!(mean <= 2.5 && worst <= 8, "{what}: mean {mean:.2}, worst {worst}");
         m.stop_engines();
+    }
+    for ((aliased_box, s64), (sum, worst, n)) in by_size {
+        eprintln!(
+            "points{} size {}: mean {:.2}, worst {worst}",
+            if aliased_box { " (size first)" } else { "" },
+            s64 as f32 / 64.0,
+            sum / n as f64
+        );
     }
 }
 
