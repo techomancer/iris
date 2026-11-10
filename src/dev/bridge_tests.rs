@@ -1874,3 +1874,236 @@ fn nvme_ready_follows_enable_through_every_lane_mode_and_width() {
         let _ = std::fs::remove_file(img);
     }
 }
+
+// ---- the XBridge head ----
+//
+// Cases follow tests/qtest/sn1-xbridge-test.c (page-dma, interrupt-packets,
+// access-errors) in jamesbraid/qemu-sgi-origami.
+
+/// Bedrock's port as an XBridge head sees it: widget 10, packets taken at
+/// any address.
+const BEDROCK_HOST: XtalkHost = XtalkHost { widget: 0xa, int_packet: 0, int_packet_mask: 0, vectors: 256 };
+
+/// One XBridge head at crossbar port 15, strapped for a 66 MHz bus, with
+/// memory and an interrupt sink behind widget 10.
+struct Head {
+    bridge: Arc<Bridge>,
+    win: Arc<dyn BusDevice>,
+    sink: Arc<Sink>,
+    mem: Arc<Mem>,
+}
+
+impl Head {
+    fn new() -> Self {
+        let sink = Arc::new(Sink::default());
+        let mem = Arc::new(Mem::new());
+        let bridge = Bridge::with_part(Part::XBridge, Upstream::single(BEDROCK_HOST, mem.clone(), sink.clone()), &crate::ip30::PCI0);
+        bridge.set_revision(2);
+        bridge.set_widget(15);
+        bridge.set_control_strap(1 << 4);
+        let win = bridge.head_window();
+        Head { bridge, win, sink, mem }
+    }
+
+    fn set(&self, off: u32, val: u32) {
+        assert_eq!(self.win.write32(u64::from(off + 4), val), BUS_OK);
+    }
+
+    fn get(&self, off: u32) -> u32 {
+        self.win.read32(u64::from(off + 4)).data
+    }
+
+    /// A card in `slot` as [`Rig::card`] fits one: memory BAR at PCI
+    /// 0x1300_0000, I/O BAR at 0x2000, the slot's window on memory.
+    fn card(&self, slot: u8, pin: u8) -> Arc<Card> {
+        let c = Card::new(pin);
+        self.bridge.bus().attach(DevFn { device: slot, function: 0 }, c.clone());
+        let cfg = |reg: u32, size: usize, v: u64| {
+            let off = u64::from(Rig::cfg(slot as u32, reg) ^ (4 - size as u32) & 3);
+            match size {
+                2 => assert_eq!(self.win.write16(off, v as u16), BUS_OK),
+                _ => assert_eq!(self.win.write32(off, v as u32), BUS_OK),
+            }
+        };
+        cfg(0x10, 4, 0x2000);
+        cfg(0x14, 4, 0x1300_0000);
+        cfg(0x04, 2, u64::from(PCI_COMMAND_IO | PCI_COMMAND_MEMORY));
+        self.set(reg::device(slot as u32), DEV_MEMORY_SPACE | 0x130);
+        c
+    }
+}
+
+#[test]
+fn an_xbridge_head_identifies_itself_and_keeps_its_speed_strap() {
+    let h = Head::new();
+    assert_eq!(h.get(reg::IDENTIFICATION), 0x2d00_2049);
+    assert_eq!(h.get(reg::CONTROL), 0x0f00_321f);
+    h.set(reg::CONTROL, 0);
+    assert_eq!(h.get(reg::CONTROL), 0x10, "the speed strap is not the guest's to write");
+    h.bridge.reset();
+    assert_eq!(h.get(reg::CONTROL), 0x0f00_321f);
+    for (off, val, kept) in [
+        (reg::DIRECT_MAP, u32::MAX, 0xf3_ffff),
+        (reg::BUS_TIMEOUT, u32::MAX, 0x1f_03ff),
+        (reg::INT_DEST_UPPER, u32::MAX, 0xf_ffff),
+        (reg::TEST_PIN_CONTROL, u32::MAX, 0xff_ffff),
+        (reg::device(2), u32::MAX, 0x1eef_ffff),
+    ] {
+        h.set(off, val);
+        assert_eq!(h.get(off), kept, "{off:#x}");
+    }
+}
+
+/// The head's table holds 1024 entries, written whole and read a half at a
+/// time; 512 of them map a window that repeats with bytes swapped at bit
+/// 29, and an entry's own swap bit swaps too. A transfer through an entry
+/// that is not valid, or past the mapped ones, latches a page fault, which
+/// the SSRAM group's reset clears. The 64 KB below the window takes
+/// transfers and drops them.
+#[test]
+fn an_xbridge_head_maps_dma_through_its_larger_table() {
+    let h = Head::new();
+    let c = h.card(2, PCI_INTA);
+    h.win.write64(u64::from(ATE_BASE) + 800 * 8, 0xffff_1234_5678_9abc);
+    assert_eq!(h.win.read32(u64::from(ATE_BASE) + 800 * 8 + 4).data, 0x1234, "the entry keeps 48 bits");
+    assert_eq!(h.win.read32(u64::from(XBRIDGE_ATE_LOW_BASE) + 800 * 8 + 4).data, 0x5678_9abc);
+    h.win.write64(u64::from(ATE_BASE), 0x2000 | 0xa << 8 | 1);
+    h.win.write64(u64::from(ATE_BASE) + 8, 0x3000 | 0xa << 8 | 0x21);
+    let data = [0, 1, 2, 3, 4, 5, 6, 7];
+    for (pci, at, placed) in [
+        (0x4000_0010u64, 0x2010, [3, 2, 1, 0, 7, 6, 5, 4]),
+        (0x6000_0020, 0x2020, data),
+        (0x4000_1030, 0x3030, data),
+    ] {
+        assert_eq!(c.dma().dma_write(pci, &data), PciDmaStatus::Ok, "{pci:#x}");
+        assert_eq!(h.mem.peek(at, 8), placed, "{pci:#x}");
+        let mut back = [0; 8];
+        assert_eq!(c.dma().dma_read(pci, &mut back), PciDmaStatus::Ok);
+        assert_eq!(back, data);
+    }
+    assert_eq!(h.get(reg::INT_STATUS) & INT_PAGE_FAULT, 0);
+    for pci in [0x4000_2000, 0x4020_0000] {
+        let mut bytes = [0xff; 4];
+        assert_eq!(c.dma().dma_read(pci, &mut bytes), PciDmaStatus::MasterAbort, "{pci:#x}");
+        assert_eq!(bytes, [0; 4]);
+        assert_ne!(h.get(reg::INT_STATUS) & INT_PAGE_FAULT, 0, "{pci:#x}");
+        assert_ne!(h.get(reg::INT_MULTIPLE) & INT_PAGE_FAULT, 0);
+        h.set(reg::INT_RESET, 2);
+        assert_eq!(h.get(reg::INT_STATUS) & INT_PAGE_FAULT, 0);
+    }
+    let mut bytes = [0xff; 4];
+    assert_eq!(c.dma().dma_read(0x3fff_8000, &mut bytes), PciDmaStatus::Ok);
+    assert_eq!(bytes, [0; 4]);
+    assert_eq!(c.dma().dma_write(0x3fff_8000, &data), PciDmaStatus::Ok);
+    assert_eq!(c.dma().dma_read(0x4080_0000, &mut bytes), PciDmaStatus::MasterAbort, "past the window");
+}
+
+/// A 64-bit transfer names its widget in bits 63:60 and asks for its bytes
+/// unswapped with bit 55; the 31-bit direct window follows Device(x).
+#[test]
+fn an_xbridge_head_swaps_64_bit_dma_by_its_address() {
+    let h = Head::new();
+    let c = h.card(2, PCI_INTA);
+    let data = [0, 1, 2, 3, 4, 5, 6, 7];
+    assert_eq!(c.dma().dma_write(0xa << 60 | 1 << 55 | 0x2000, &data), PciDmaStatus::Ok);
+    assert_eq!(h.mem.peek(0x2000, 8), data);
+    assert_eq!(c.dma().dma_write(0xa << 60 | 0x2010, &data), PciDmaStatus::Ok);
+    assert_eq!(h.mem.peek(0x2010, 8), [3, 2, 1, 0, 7, 6, 5, 4]);
+    h.set(reg::DIRECT_MAP, 0xa << DIRECT_WIDGET_SHIFT);
+    h.set(reg::device(2), DEV_MEMORY_SPACE | DEV_SWAP_DIRECT | 0x130);
+    assert_eq!(c.dma().dma_write(0x8000_2020, &data), PciDmaStatus::Ok);
+    assert_eq!(h.mem.peek(0x2020, 8), data);
+}
+
+/// The head reaches PCI memory through two aliases and I/O through a third,
+/// each byte order from Control; nothing claiming an address reads ones,
+/// and takes a write, with no error.
+#[test]
+fn an_xbridge_head_reaches_pci_space_through_its_three_aliases() {
+    let h = Head::new();
+    let _c = h.card(2, PCI_INTA);
+    for at in [0x4000_0000u64 + 0x1300_0020, 0x8000_0000 + 0x1300_0020, 0x1_0000_0000 + 0x2020] {
+        assert_eq!(h.win.read32(at).data, 0x1234_5678, "{at:#x}");
+    }
+    h.set(reg::CONTROL, CONTROL_IO_SWAP);
+    assert_eq!(h.win.read32(0x1_0000_2020).data, 0x7856_3412, "the I/O alias swaps on its own bit");
+    assert_eq!(h.win.read32(0x4000_0000 + 0x1300_0020).data, 0x1234_5678);
+    h.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+    assert_eq!(h.win.read32(0x4800_0000).data, u32::MAX);
+    assert_eq!(h.win.write32(0x4800_0000, 0), BUS_OK);
+    assert_eq!(h.win.read32(u64::from(device_window_offset(3))).data, u32::MAX);
+    assert_eq!(h.get(reg::INT_STATUS) & !INT_DEVICE_PINS, 0);
+}
+
+/// An empty slot reads as ones and notes the master time-out in the
+/// multiple-error register; a doubleword is two words, the lower address
+/// in the upper half; a type 1 cycle for bus 0 reaches the head's own bus.
+#[test]
+fn an_xbridge_head_answers_configuration_cycles_as_its_bus_does() {
+    let h = Head::new();
+    let _c = h.card(2, PCI_INTA);
+    assert_eq!(h.win.read32(u64::from(Rig::cfg(5, 0))).data, u32::MAX);
+    assert_ne!(h.get(reg::INT_MULTIPLE) & INT_PCI_MASTER_TIMEOUT, 0);
+    assert_eq!(h.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
+    let id = u64::from(CARD_DEVICE << 16 | CARD_VENDOR);
+    let command = u64::from(h.win.read32(u64::from(Rig::cfg(2, 4))).data);
+    assert_eq!(h.win.read64(u64::from(Rig::cfg(2, 0))).data, id << 32 | command);
+    h.set(reg::PCI_TYPE1_CONFIG, 2 << 11);
+    assert_eq!(h.win.read32(u64::from(TYPE1_BASE)).data as u64, id);
+}
+
+/// An undefined address reads zero and latches an invalid-address error,
+/// capturing the first address and interrupting for it once; the deferred
+/// registers read zero with no error.
+#[test]
+fn an_xbridge_head_captures_its_first_invalid_address() {
+    let h = Head::new();
+    h.set(reg::INT_DEST_UPPER, 0xa << 16);
+    h.set(reg::INT_DEST_LOWER, 0x80);
+    h.set(reg::HOST_ERR_FIELD, 73);
+    h.set(reg::INT_ENABLE, INT_INVALID_ADDR);
+    assert_eq!(h.win.read32(0x300).data, 0, "deferred");
+    assert!(h.sink.take().is_empty());
+    assert_eq!(h.win.read32(0x100_0004).data, 0);
+    assert_eq!(h.win.read32(0x200_0004).data, 0);
+    assert_eq!(h.get(reg::ERR_LOWER), 0x100_0004);
+    assert_eq!(h.sink.take(), [(73, true)]);
+    assert_ne!(h.get(reg::INT_MULTIPLE) & INT_INVALID_ADDR, 0);
+    h.set(reg::INT_RESET, 8);
+    assert_eq!(h.get(reg::INT_STATUS) & INT_INVALID_ADDR, 0);
+}
+
+/// A pin's packet goes out even to an unprogrammed host field, and the
+/// force registers send a pin's packet: always, or only while it is high.
+#[test]
+fn an_xbridge_head_forces_its_interrupts() {
+    let h = Head::new();
+    let c = h.card(2, PCI_INTA);
+    h.set(reg::INT_DEST_UPPER, 0xa << 16);
+    h.set(reg::INT_ENABLE, 1 << 2);
+    c.raise(true);
+    assert_eq!(h.sink.take(), [(0, true)]);
+    h.set(reg::int_host(2), 0x42);
+    h.set(reg::FORCE_ALWAYS + 2 * 8, 1);
+    h.set(reg::FORCE_PIN + 2 * 8, 1);
+    assert_eq!(h.sink.take(), [(0x42, true), (0x42, true)]);
+    c.raise(false);
+    h.set(reg::FORCE_PIN + 2 * 8, 1);
+    h.set(reg::FORCE_ALWAYS + 3 * 8, 1);
+    assert!(h.sink.take().is_empty(), "pin 2 is low and pin 3 is masked");
+    assert_eq!(h.get(reg::FORCE_ALWAYS + 2 * 8), 0);
+}
+
+/// A snapshot keeps all 1024 entries and the multiple-error register.
+#[test]
+fn an_xbridge_head_snapshot_keeps_its_table_and_errors() {
+    let src = Head::new();
+    src.win.write64(u64::from(ATE_BASE) + 1000 * 8, 0x5000 | 0xa << 8 | 1);
+    let _ = src.win.read32(u64::from(Rig::cfg(5, 0)));
+    let v = src.bridge.save_state();
+    let dst = Head::new();
+    dst.bridge.load_state(&v).expect("load_state");
+    assert_eq!(v, dst.bridge.save_state());
+    assert_eq!(dst.win.read32(u64::from(XBRIDGE_ATE_LOW_BASE) + 1000 * 8 + 4).data, 0x5a01);
+    assert!(Rig::new().bridge.load_state(&v).is_err(), "a Bridge holds 128 entries");
+}
