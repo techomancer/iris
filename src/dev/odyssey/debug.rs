@@ -47,18 +47,27 @@ pub(super) fn memory_hash(b: &Board) -> String {
 }
 
 /// `memory_hash` as bytes: what a recording's mark holds.
+///
+/// The stream is the memory in address order, the lowest address the highest
+/// byte of each word (`VramPtr::address_bytes`). It is read as slices of the
+/// array and byte-swapped a block at a time: a call per word is the cost of
+/// the hash in an unoptimised build, and the replay and fill checks take it
+/// many times over 128 MB.
 pub(super) fn memory_hash_bytes(b: &Board) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
+    const BLOCK_WORDS: usize = 1 << 13;
     let mem = b.vram.ptr_shared();
-    let mut buf = Vec::with_capacity(1 << 16);
-    for word in mem.address_words() {
-        buf.extend_from_slice(&word.to_be_bytes());
-        if buf.len() == buf.capacity() {
-            h.update(&buf);
-            buf.clear();
+    let words = mem.words_at(0, mem.size());
+    let mut h = blake3::Hasher::new();
+    let mut block = [0u64; BLOCK_WORDS];
+    for chunk in words.chunks(BLOCK_WORDS) {
+        let out = &mut block[..chunk.len()];
+        for (o, w) in out.iter_mut().zip(chunk) {
+            *o = w.to_be();
         }
+        // SAFETY: any u64 is eight initialised bytes, and u8 needs no alignment.
+        let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), out.len() * 8) };
+        h.update(bytes);
     }
-    h.update(&buf);
     *h.finalize().as_bytes()
 }
 
@@ -879,4 +888,25 @@ impl Odyssey {
 pub(super) fn dump_memory(mem: VramPtr, dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("board.bin"), mem.address_bytes().collect::<Vec<u8>>())
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    /// The memory hash is the byte stream `address_bytes` gives, whatever
+    /// the block it is read in: the digests recordings and replay hashes
+    /// files hold do not move.
+    #[test]
+    fn the_memory_hash_is_the_address_byte_stream() {
+        let b = Board::new("v12", 0).unwrap();
+        let mem = b.vram_ptr();
+        // Distinct bytes in every lane, some words past the first block.
+        for w in [0u64, 1, 7, 8191, 8192, 8193, 100_000, mem.size() / 8 - 1] {
+            mem.store(w * 8, 8, 0x0102_0304_0506_0708u64.wrapping_mul(w + 1));
+        }
+        let mut want = blake3::Hasher::new();
+        want.update(&mem.address_bytes().collect::<Vec<u8>>());
+        assert_eq!(memory_hash_bytes(&b), *want.finalize().as_bytes());
+    }
 }
