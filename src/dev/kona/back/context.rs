@@ -14,6 +14,8 @@
 //! not done: a guest cannot read the back end's state through the image
 //! (established), so nothing observes the difference.
 
+use super::gl::state::Gl;
+use super::gl::texture::TexContext;
 use super::x::state::XState;
 use crate::dev::kona::defs::CONTEXT_SLOTS;
 use crate::dev::kona::job::ContextEvent;
@@ -23,13 +25,16 @@ use crate::dev::kona::job::ContextEvent;
 #[derive(Default)]
 pub struct Context {
     pub x: XState,
+    pub gl: Box<Gl>,
+    pub tex: TexContext,
 }
 
 impl Context {
     /// The power-on state of the context in slot `slot` (`CONTEXT_SLOTS` for the no-context state).
-    pub fn new(_slot: usize) -> Self {
-        Context::default()
+    pub fn new(slot: usize) -> Self {
+        Context { tex: TexContext::new(slot), ..Default::default() }
     }
+
 }
 
 pub struct Contexts {
@@ -76,6 +81,14 @@ impl Contexts {
             ContextEvent::WindowReleased { slot } if slot < CONTEXT_SLOTS => self.select(Some(slot)).x.pixel_release(),
             _ => {}
         }
+    }
+
+    /// A swap of display id `id` showing buffer `bank`: every context whose window has that id.
+    pub fn swapped(&mut self, id: u32, bank: u8) {
+        for c in self.slots.iter_mut().flatten() {
+            c.gl.swapped(id, bank);
+        }
+        self.none.gl.swapped(id, bank);
     }
 
     /// Entries that were loaded with something; one that only a job selected
