@@ -558,8 +558,14 @@ impl Device for Z85c30 {
     
     fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        self.channel_a.1.notify_all();
-        self.channel_b.1.notify_all();
+        // Each TX thread tests `running` holding its channel's lock and then
+        // waits, so a notify between the two would be lost and the join below
+        // would wait forever. Taking the lock first waits out a thread in that
+        // gap, so the notify finds it waiting.
+        for (lock, cvar) in [&*self.channel_a, &*self.channel_b] {
+            drop(lock.lock());
+            cvar.notify_all();
+        }
         let mut threads = self.threads.lock();
         for t in threads.drain(..) {
             let _ = t.join();
@@ -1128,5 +1134,36 @@ mod tests {
         assert!(probe.level(),
             "`power_on_devices` cleared map_stat SERIAL and `Ioc::load_state` \
              restored it wholesale, so only the SCC can put the line back up");
+    }
+
+    /// A TX thread tests `running` holding its channel's lock and then waits
+    /// on the channel's condition variable. `stop` must not notify in between,
+    /// or the thread sleeps on and the join in `stop` never returns (a machine
+    /// stopping for a guest power-off hung there). Play such a thread on
+    /// channel A: test the flag holding the lock, let `stop` clear it, then
+    /// wait. The wait must be woken.
+    #[test]
+    fn stop_wakes_a_tx_thread_caught_between_its_check_and_its_wait() {
+        let scc = Z85c30::new(None);
+        scc.start();
+        let (lock, cvar) = &*scc.channel_a;
+        thread::scope(|s| {
+            let mut ch = lock.lock();
+            assert!(scc.running.load(Ordering::SeqCst));
+            s.spawn(|| scc.stop());
+            let until = Instant::now() + Duration::from_secs(10);
+            while scc.running.load(Ordering::SeqCst) {
+                assert!(Instant::now() < until, "stop never cleared the running flag");
+                thread::yield_now();
+            }
+            // A stop that notifies without the lock does so right after the
+            // store: give it the time, so its notify lands ahead of the wait
+            // as it did in the hang. A stop that takes the lock is held off
+            // until the wait, however long this is.
+            thread::sleep(Duration::from_millis(200));
+            let woken = !cvar.wait_for(&mut ch, Duration::from_secs(10)).timed_out();
+            drop(ch);
+            assert!(woken, "stop notified the TX thread before it waited: the wakeup was lost");
+        });
     }
 }
