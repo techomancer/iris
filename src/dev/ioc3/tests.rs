@@ -166,7 +166,7 @@ fn each_board_reads_back_as_its_row_says() {
             ByteBusPart::None => ByteBus::None,
             ByteBusPart::Ds1685 => ByteBus::Ds1685,
             ByteBusPart::M48t35 => {
-                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap()))
+                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap()))
             }
         };
         let r = Rig::with(Ioc3::new(board, MAC, bus));
@@ -563,7 +563,7 @@ fn each_row_wires_its_pins_as_listed() {
             ByteBusPart::None => ByteBus::None,
             ByteBusPart::Ds1685 => ByteBus::Ds1685,
             ByteBusPart::M48t35 => {
-                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap()))
+                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap()))
             }
         };
         let r = Rig::with(Ioc3::new(board, MAC, bus));
@@ -2063,7 +2063,7 @@ fn an_octane_chip_reset_keeps_the_pci_header() {
 /// Dallas clock ports unfitted, and has no PHY reset on GPIO 5.
 #[test]
 fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
-    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
+    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap());
     let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock.clone())));
     let cfg = r.c.state().config();
     cfg.write(1, 0xffff_0146);
@@ -2099,7 +2099,7 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
 /// survive a chip reset.
 #[test]
 fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
-    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
+    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap());
     let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock)));
     for _ in 0..2 {
         r.c.reset();

@@ -1,7 +1,8 @@
-//! The Fuel M48T35 Timekeeper exposes 32 KiB of byte-wide NVRAM and calendar
-//! registers at the end of that window. The guest reads the clock independently
-//! of processor byte order, and software can stage clock changes through the
-//! control register before committing them.
+//! The M48T35-compatible Timekeeper (the Origin, Onyx2 and Fuel system boards')
+//! exposes 32 KiB of byte-wide NVRAM and calendar registers at the end of that
+//! window. The guest reads the clock independently of processor byte order, and
+//! software can stage clock changes through the control register before
+//! committing them.
 //!
 //! # What is approximated here
 //!
@@ -143,7 +144,7 @@ pub struct Timekeeper {
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 impl Timekeeper {
-    pub fn fuel() -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> {
         let host = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
@@ -164,7 +165,7 @@ impl Timekeeper {
             days -= month_days(year, month);
             month += 1;
         }
-        let t = Self::fuel_at(
+        let t = Self::at(
             year,
             month,
             days + 1,
@@ -175,8 +176,8 @@ impl Timekeeper {
         Ok(t)
     }
     /// Open authoritative saved clock state before applying new-store year limits.
-    pub fn fuel_with_nvram_file(path: &Path) -> Result<Self, String> {
-        Self::backed(path, Self::fuel())
+    pub fn with_nvram_file(path: &Path) -> Result<Self, String> {
+        Self::backed(path, Self::new())
     }
     fn backed(path: &Path, initial: Result<Self, String>) -> Result<Self, String> {
         let saved = match std::fs::read(path) {
@@ -186,7 +187,7 @@ impl Timekeeper {
         };
         let clock = if saved_calendar(&saved).is_some() {
             // This seed is replaced by the authoritative image before exposure.
-            Self::fuel_at(1968, 1, 1, 0, 0, 0)?
+            Self::at(1968, 1, 1, 0, 0, 0)?
         } else {
             initial?
         };
@@ -194,7 +195,7 @@ impl Timekeeper {
         Ok(clock)
     }
     /// A deterministic initial date; subsequent seconds follow monotonic host time.
-    pub fn fuel_at(
+    pub fn at(
         year: i64,
         month: i64,
         day: i64,
@@ -516,7 +517,7 @@ mod tests {
     /// The guest can freeze, stop, stage, and resume the M48T35 calendar.
     #[test]
     fn clock_control_freezes_stops_and_resets_the_calendar() {
-        let t = Timekeeper::fuel_at(2067, 12, 31, 23, 59, 59).unwrap();
+        let t = Timekeeper::at(2067, 12, 31, 23, 59, 59).unwrap();
         t.write8(0x7f8, 0x42);
         t.write8(CONTROL as u64, 0x40);
         t.advance_for_test(2);
@@ -538,7 +539,7 @@ mod tests {
     #[test]
     fn restored_clock_accounts_for_elapsed_time_unless_stopped() {
         for stopped in [false, true] {
-            let t = Timekeeper::fuel_at(2024, 2, 28, 23, 59, 59).unwrap();
+            let t = Timekeeper::at(2024, 2, 28, 23, 59, 59).unwrap();
             t.write8(0x7ff0, 0xa5);
             if stopped {
                 t.write8(CONTROL as u64, 0x80);
@@ -546,7 +547,7 @@ mod tests {
                 t.write8(CONTROL as u64, 0);
             }
             let (image, reference) = t.persistence_image_at(100);
-            let restored = Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap();
+            let restored = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
             restored.restore_image_at(&image, Some(&reference), 102).unwrap();
             assert_eq!(restored.read8(reg::DAY as u64).data, if stopped { 0x28 } else { 0x29 });
             assert_eq!(restored.read8(reg::SECONDS as u64).data, if stopped { 0x85 } else { 1 });
@@ -562,7 +563,7 @@ mod tests {
             .join(format!("timekeeper-test-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("nvram");
-        let t = Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
         t.set_nvram_file(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), vec![0; SIZE]);
         t.write8(0x7f8, 0x42);
@@ -570,18 +571,18 @@ mod tests {
         t.flush_nvram().unwrap();
         drop(t);
         // Saved clock state is authoritative even if the host date is out of range.
-        let restored = Timekeeper::backed(&path, Timekeeper::fuel_at(2068, 1, 1, 0, 0, 0)).unwrap();
+        let restored = Timekeeper::backed(&path, Timekeeper::at(2068, 1, 1, 0, 0, 0)).unwrap();
         restored.power_on();
         assert_eq!(restored.read8(0x7f8).data, 0x42);
         assert_eq!(restored.read8(reg::YEAR as u64).data, 0x58);
         drop(restored);
         std::fs::remove_file(dir.join("nvram.clock")).unwrap();
         std::fs::write(&path, [0xa5; 2048]).unwrap();
-        assert!(Timekeeper::backed(&path, Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0)).is_err());
+        assert!(Timekeeper::backed(&path, Timekeeper::at(2026, 1, 1, 0, 0, 0)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), vec![0xa5; 2048]);
         assert!(!dir.join("nvram.clock").exists());
         std::fs::remove_file(&path).unwrap();
-        assert!(Timekeeper::backed(&path, Timekeeper::fuel_at(2068, 1, 1, 0, 0, 0)).is_err());
+        assert!(Timekeeper::backed(&path, Timekeeper::at(2068, 1, 1, 0, 0, 0)).is_err());
         assert!(!path.exists());
         std::fs::remove_dir(dir).unwrap();
     }
@@ -606,7 +607,7 @@ mod tests {
     /// 2024 must have a 29 February and 2026 must not.
     #[test]
     fn the_calendar_rolls_over_february_in_leap_years_only() {
-        let t = Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
         set_clock(&t, [0x59, 0x59, 0x23, 0x05, 0x28, 0x02, 0x56]);
         t.advance_for_test(1);
         assert_eq!(clock_cells(&t), [0, 0, 0, 0x05, 0x29, 0x02, 0x56]);
@@ -619,7 +620,7 @@ mod tests {
     /// 2067; the guest must see year 00 again, not garbage.
     #[test]
     fn the_year_wraps_from_2067_to_1968() {
-        let t = Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
         set_clock(&t, [0x59, 0x59, 0x23, 0x05, 0x31, 0x12, 0x99]);
         assert_eq!(t.read8(reg::YEAR as u64).data, 0x99);
         t.advance_for_test(1);
@@ -630,7 +631,7 @@ mod tests {
     /// freeze every counter at once, or a rollover tears the timestamp.
     #[test]
     fn the_read_bit_freezes_all_counters_until_it_is_cleared() {
-        let t = Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
         let end_of_century = [0x59, 0x59, 0x23, 0x05, 0x31, 0x12, 0x99];
         set_clock(&t, end_of_century);
         t.write8(CONTROL as u64, 0x40);
@@ -646,7 +647,7 @@ mod tests {
     /// the window closes.
     #[test]
     fn staged_clock_writes_apply_only_when_the_write_bit_clears() {
-        let t = Timekeeper::fuel_at(2026, 1, 2, 3, 4, 5).unwrap();
+        let t = Timekeeper::at(2026, 1, 2, 3, 4, 5).unwrap();
         let before = clock_cells(&t);
         t.write8(CONTROL as u64, 0x80);
         for (i, v) in [0x59u8, 0x58, 0x17, 0x03, 0x15, 0x06, 0x30].into_iter().enumerate() {
@@ -665,7 +666,7 @@ mod tests {
     /// the clock must hold until the guest clears it, then continue from there.
     #[test]
     fn the_stop_bit_holds_the_seconds_until_it_is_cleared() {
-        let t = Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
         t.write8(CONTROL as u64, 0x80);
         t.write8(reg::SECONDS as u64, 0x82);
         t.write8(CONTROL as u64, 0);
@@ -682,7 +683,7 @@ mod tests {
     /// fault, and ordinary storage must keep its contents across clock writes.
     #[test]
     fn accesses_past_the_window_fault_and_ordinary_storage_is_untouched() {
-        let t = Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap();
         t.write8(0, 0x5a);
         t.write8(0x7ff7, 0xa5);
         assert_eq!(t.write8(SIZE as u64, 0x69), BUS_ERR);
