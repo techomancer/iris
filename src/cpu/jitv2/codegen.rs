@@ -8893,11 +8893,11 @@ fn emit_fpu_clear_cause_if_set(ctx: &mut EmitCtx) {
 
 /// The exact inclusive/exclusive bounds `cvt_f32/64_to_int_by_value` tests an
 /// already-rounded value against for a W or L destination: `>= MIN` and
-/// `<= MAX` for W (both bounds exact as f32/f64 — note `i32::MAX as f32`
-/// rounds *up* to 2^31, so 2^31 counts as in range for an F32 source and the
-/// saturating cast below reproduces the interpreter's i32::MAX there), and
-/// `>= -2^63 && < 2^63` for L (2^63 is exact in both formats and is the
-/// first value that does not fit). Returned as `(min, max, max_inclusive)`.
+/// `<= MAX` for W from a double (both exact), `>= -2^31 && < 2^31` for W from
+/// a single (`i32::MAX` is not a single, and 2^31 is the first one that does
+/// not fit), and `>= -2^63 && < 2^63` for L (2^63 is exact in both formats
+/// and is the first value that does not fit). Returned as
+/// `(min, max, max_inclusive)`.
 fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Value, bool) {
     if src_f64 {
         if dst_i64 {
@@ -8914,9 +8914,9 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
         let max = ctx.builder.ins().f32const(9223372036854775808.0f32);
         (min, max, false)
     } else {
-        let min = ctx.builder.ins().f32const(i32::MIN as f32);
-        let max = ctx.builder.ins().f32const(i32::MAX as f32);
-        (min, max, true)
+        let min = ctx.builder.ins().f32const(-2147483648.0f32);
+        let max = ctx.builder.ins().f32const(2147483648.0f32);
+        (min, max, false)
     }
 }
 
@@ -8928,10 +8928,7 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
 /// to "cast the rounded value to int, clear Cause, write the destination":
 ///
 /// * Saturation is unreachable: the range test is the interpreter's own, so
-///   the cast operates on a value that fits — with the single deliberate
-///   exception of an F32 source at exactly +2^31, which
-///   `cvt_f32_to_int_by_value` also admits and both sides answer with
-///   i32::MAX (`fcvt_to_sint_sat`'s saturating cast, same as Rust's `as`).
+///   the cast operates on a value that fits.
 /// * Inexact is the interpreter's rule: set when rounding changed the source
 ///   (`rounded != x`), as Cause and Flag together. With the Inexact enable
 ///   set every conversion takes the callout, exact or not.

@@ -1430,6 +1430,27 @@ mod tests {
         });
     }
 
+    /// 2^31 is a single but not a word, so CVT.W.S of it is Invalid with the
+    /// largest word as the default result, like any other overflow. It was
+    /// taken for in range because `i32::MAX as f32` rounds up to it. -2^31
+    /// still converts exactly.
+    #[test]
+    fn cvt_w_s_of_2_to_the_31_is_invalid() {
+        const FCSR_CV: u32 = 0x0001_0000;
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<R4400Cache>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
+            for (input, want, invalid) in [(2147483648.0f32, i32::MAX, true), (-2147483648.0f32, i32::MIN, false)] {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input.to_bits() as u64;
+                assert_eq!(exec.exec(cvt), EXEC_COMPLETE, "{input}");
+                assert_eq!(exec.core.fpr[2] as u32, want as u32, "{input} result");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CV != 0, invalid, "{input} Cause.V");
+            }
+        });
+    }
+
     /// MOVZ.S, MOVN.S, MOVT.S and MOVF.S write fd on the R10000 family even
     /// when the condition is false: the old low word stays and, with FR set,
     /// the upper word is zeroed, "even though the condition is false"

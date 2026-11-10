@@ -94,8 +94,9 @@ the computed *result* is correct in every case.
 
 `fpu/cvt_out_of_range` is the odd one out: it is about Invalid on an
 out-of-range conversion rather than Inexact, so it is a *different* gap in the
-same family — the conversion path classifies `+inf` but not a finite value whose
-integer result does not fit.
+same family — the conversion path classified `+inf` but not a finite value whose
+integer result does not fit. Fixed since: the word range test compared against
+`i32::MAX as f32`, which rounds up to 2^31 and so admitted it.
 
 These are distinct from the exception-model findings in
 `clanker/cpu/fpu-exception-model-vs-r4400.md`, which are about *when a trap is

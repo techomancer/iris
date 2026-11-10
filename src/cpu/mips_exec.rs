@@ -2234,9 +2234,11 @@ fn cvt_f32_to_int_by_value(x: f32, dst_bits: u32) -> (u64, bool, bool) {
         return (max_pos as u64, true, false);
     }
     // x is already integral (post-rounding); out-of-range iff it can't fit
-    // in the destination width at all.
+    // in the destination width at all. `i32::MAX as f32` rounds up to 2^31,
+    // which does not fit, so the word bound is 2^31 exclusive like the long
+    // one below.
     let in_range = if dst_bits == 32 {
-        x >= i32::MIN as f32 && x <= i32::MAX as f32
+        x >= -2147483648.0f32 && x < 2147483648.0f32
     } else {
         // i64::MAX isn't exactly representable in f32/f64; compare against
         // 2^63 (exact in both formats) the same way real hardware's range

@@ -19,7 +19,6 @@
 
 [r4400-interp]
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
@@ -37,7 +36,6 @@ mips4/recip_rsqrt_d
 [r4400-jitv2]
 cache/hit_inv_discards
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
@@ -54,7 +52,6 @@ mips4/recip_rsqrt_d
 
 [r5000-interp]
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
@@ -67,7 +64,6 @@ fpu/vec_sqrt
 [r5000-jitv2]
 cache/hit_inv_discards
 excep/cop2_unusable
-fpu/cvt_out_of_range
 fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control

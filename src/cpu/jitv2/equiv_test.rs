@@ -7035,9 +7035,8 @@ mod tests {
 
     /// Values that bracket every branch of the to-int path: in range, the
     /// four boundary values the identical range test turns on (including
-    /// +2^31, which `i32::MAX as f32` rounds up to and which the interpreter
-    /// therefore admits), values just outside them, subnormals, NaN and both
-    /// infinities.
+    /// +2^31, the first single that does not fit a word), values just
+    /// outside them, subnormals, NaN and both infinities.
     const CVT_TO_INT_EDGES: &[f64] = &[
         0.0, -0.0, 0.25, -0.25, 0.5, -0.5, 0.999_999_9, -0.999_999_9,
         1.0, -1.0, 1.5, -1.5, 2.5, -2.5, 3.5, -3.5, 3.7, -3.7,
