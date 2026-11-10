@@ -533,7 +533,7 @@ impl Octane {
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
         let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()), &crate::ip30::PCI0);
 
-        let ioc3 = Arc::new(Ioc3::octane(MAC, false));
+        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, MAC, ioc3::ByteBus::Ds1685));
         let eth = ioc3.eth().unwrap().clone();
         eth.negotiate_at_once();
         let (link, sent, inject) = crate::net::Link::loopback();

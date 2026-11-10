@@ -24,7 +24,7 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::{Bridge, RawFlash};
 use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
-use crate::dev::ioc3::Ioc3;
+use crate::dev::ioc3::{self, ByteBus, Ioc3};
 use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::mgras::hq4::ImpactXio;
@@ -89,9 +89,6 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
-/// The Bridge input IOC3's SuperIO block (serial, keyboard, clock) is
-/// wired to; the Ethernet uses IOC3's PCI pin.
-const SUPERIO_PIN: u8 = 4;
 /// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
 const VIRTIO_SLOT: u8 = 4;
 /// The blank part on the Bridge's second flash select: reads all ones and
@@ -110,6 +107,21 @@ pub fn heart_banks(cfg: &MachineConfig) -> [u64; 4] {
 fn record_bus(barcode: &str, part: &str, revision: &str, name: &str, serial: u64) -> w1::Bus {
     let mut bus = w1::Bus::new();
     bus.add(Box::new(board_record_part(&BoardRecord { barcode, part, revision, name }, serial)));
+    bus
+}
+
+/// The IOC3's MicroLAN: the station-address part and the front plane and
+/// power supply records. Barcodes and ROM serials are the marked-synthetic
+/// ones (EMU...).
+fn ioc3_wire(mac: [u8; 6]) -> w1::Bus {
+    let mut bus = w1::Bus::new();
+    bus.add(Box::new(w1::sgi::ethernet_address_part(mac, w1::sgi::ETHERNET_PART_SERIAL)));
+    for (barcode, part, revision, name, serial) in [
+        ("EMUF00", "030-0891-003", "A", "FP1", 0x5145_4d55_4600),
+        ("EMUS00", "060-0028-003", "A", "PWR.SPPLY.SR", 0x5145_4d55_5300),
+    ] {
+        bus.add(Box::new(board_record_part(&BoardRecord { barcode, part, revision, name }, serial)));
+    }
     bus
 }
 
@@ -285,11 +297,12 @@ impl OctaneMachine {
             })
             .transpose()?;
         disks.extend(nvme.as_ref().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)));
-        let ioc3 = Arc::new(Ioc3::octane(mac, false));
+        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685));
+        ioc3.set_microlan(ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = ioc3.eth().expect("the Octane's IOC3 fits Ethernet").clone();
         pci.attach(slot(2), ioc3.clone());
-        ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(SUPERIO_PIN)));
+        ioc3.connect_superio(pci);
         ioc3.set_timer_manager(timer_manager.clone());
         // The guest switching the machine off through the clock.
         ioc3.set_event_sender(event_tx.clone());

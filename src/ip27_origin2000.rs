@@ -36,8 +36,6 @@ use crate::dev::elsc::ElscEvent;
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
-use crate::dev::ioc3::Ioc3Config;
-use crate::dev::ioc3::eth::Phy;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::o2000_module::{ModuleConfig, ModuleEvent, Origin2000Module};
 use crate::traits::Resettable;
@@ -68,10 +66,6 @@ const fn slot_bits(node: usize) -> u8 {
 pub(crate) const XBOW_REVISION: u32 = 2;
 /// The BaseIO's Bridge revision.
 pub(crate) const BRIDGE_REVISION: u32 = 4;
-/// The Bridge input the BaseIO's IOC3 SuperIO interrupt is wired to.
-pub(crate) const SUPERIO_PIN: u8 = 4;
-/// The BaseIO's PCI subsystem identification.
-const SUBSYS_BASEIO: u16 = 0xc302;
 
 /// The Hub as its Crossbow and the widgets below address it.
 const fn hub_host(node: usize) -> XtalkHost {
@@ -124,23 +118,6 @@ impl Origin2000 {
         let record = BoardRecord { barcode: "EMUB00", part: "030-1124-002", revision: "J", name: "BASEIO" };
         bus.add(Box::new(board_record_part(&record, 0x5145_4d55_4200)));
         bus
-    }
-
-    pub(crate) fn ioc3_config(mac: [u8; 6]) -> Ioc3Config {
-        Ioc3Config {
-            subsystem_id: SUBSYS_BASEIO,
-            pci_policy: Default::default(),
-            reset_pci_on_power_on: false,
-            mac,
-            phy: Some(Phy::Dp83840),
-            serial: [true, true],
-            parallel: false,
-            keyboard_mouse: false,
-            rtc: false,
-            gpio_input_mask: 0,
-            gpio_input_values: 0,
-            records: Vec::new(),
-        }
     }
 
     /// A file for node `node` beside the one the configuration names for the
@@ -232,8 +209,7 @@ impl Ip27Board for Origin2000 {
                     }
                 }));
                 node.hub.io().connect_widget(WIDGET_BASEIO, xbow.port(WIDGET_BASEIO, bridge.clone()));
-                let mac = cfg.network().mac;
-                io = Some(pci_devices(node, cfg, bridge, Self::ioc3_config(mac), controller.clone(), SUPERIO_PIN, "origin2000", Self::NAME)?);
+                io = Some(pci_devices(node, cfg, bridge, &crate::dev::ioc3::BASEIO, controller.clone(), "origin2000", Self::NAME)?);
             }
         }
         if let [a, b] = nodes {
