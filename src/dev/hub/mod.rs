@@ -465,8 +465,8 @@ impl Hub {
         self.i2c.set(dev).unwrap_or_else(|_| panic!("the I2C controller is wired twice"));
     }
 
-    /// Join the Hubs across a direct CrayLink cable, as on a two-module
-    /// Origin 200.
+    /// Join the Hubs across a direct CrayLink cable, as between the two node
+    /// boards of an Origin 2000 or Onyx2 deskside.
     pub fn cable(a: &Arc<Hub>, b: &Arc<Hub>) {
         assert!(a.peer.set(b.view.clone()).is_ok() && b.peer.set(a.view.clone()).is_ok(), "a Hub is cabled once");
         a.ni.connect_peer(Some(Arc::downgrade(&b.ni) as Weak<dyn NetPeer>));

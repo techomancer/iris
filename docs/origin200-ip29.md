@@ -21,7 +21,10 @@ The sample selects `machine.profile = "origin200_ip29"`.
   module's, so its part is blank.
 - `banks` are the four DIMM-pair banks in MB (64, 128, 256 or 512), filled
   from bank 0. A bank of 128 MB or less is one run at its 512 MiB stride; a
-  larger one is four runs at 128 MiB intervals.
+  larger one is four runs at 128 MiB intervals. A 512 MB bank 0 holds the boot
+  flash's reset address: cached references reach the bank, and the reset
+  fetch, which is uncached, reaches the flash. Memory that is not fitted
+  answers every access with a bus error, logged under `hub`.
 - `[origin200] flash` keeps the 1 MiB node boot flash, where the PROM stores
   its environment log. Unset, the flash starts fresh every run.
   `controller_store` does the same for the module controller's store.
@@ -35,8 +38,9 @@ boots to a serial login.
 
 ## Limits
 
-- One node and one processor. A second module, the GIGAchannel cabinet and
-  the Origin 2000 are not built.
+- One node and one processor. A second module and the GIGAchannel cabinet
+  are not built. The [Origin 2000](origin2000-ip27.md) and
+  [Onyx2](onyx2-ip27.md) desksides are separate profiles.
 - Cached accesses use node-relative addresses, which is right for the node
   number zero a one-node machine has.
 - The module controller's NMI output and the Hub's per-processor enable and
