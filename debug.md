@@ -503,7 +503,8 @@ guest. `y = 0` is the top display line throughout.
 | `vpro rec <file>` / `vpro rec mark\|off` / `vpro rec` | Replayable recording (record.rs; also `IRIS_ODSY_REC=<file>` from power-on): every bus store and load and the DMA reads, gzip. A start, a `mark` and `off` wait for the board to go idle and write the memory hash (`vpro hash`) into the file, so a replay can check board memory at those points; a recording started mid-session cannot reproduce the live memory and says so when replayed, but still replays deterministically. Alone, the recording's state. Replay: `VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture` (see `src/dev/odyssey/testdata/README.md`) |
 
 `iris-ci screenshot` captures the composed screen from any board, also
-headless.
+headless. `iris-ci screen-wait GOLDEN.png` takes screenshots until one
+matches a PNG and, on a timeout, leaves the last one and a diff image behind.
 
 **Screen, pointer and keyboard (any board)**
 
