@@ -13,8 +13,10 @@
 //! (field, value) x (field, value) pairs not tested yet; then it draws a few
 //! primitives with it. Every test then asserts that every value of every
 //! key field its primitive uses was exercised, and reports the pair
-//! coverage. `GR4_JIT_SWEEP=<factor>` scales the number of steps (default
-//! 1), `GR4_JIT_SEED` changes the seed.
+//! coverage. `GR4_JIT_SWEEP=<factor>` scales the number of steps (default 1
+//! in release, 0.35 in a debug build, where the full sweeps take minutes and
+//! the fewest steps that still reach every key value is about 0.23 of the
+//! full count), `GR4_JIT_SEED` changes the seed.
 //!
 //! Run with `cargo test --release --features gr4-jit --lib rss_jit_tests`.
 
@@ -51,7 +53,8 @@ fn rss_iter_one() -> f64 {
 // ── randomness ───────────────────────────────────────────────────────────────
 
 fn sweep_factor() -> f64 {
-    std::env::var("GR4_JIT_SWEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0)
+    let default = if cfg!(debug_assertions) { 0.35 } else { 1.0 };
+    std::env::var("GR4_JIT_SWEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn seed(salt: u64) -> u64 {
