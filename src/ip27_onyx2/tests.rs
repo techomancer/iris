@@ -1,65 +1,17 @@
 use super::*;
-use crate::config::{MachineProfile, NetMode};
-use crate::cpu::parts;
+use crate::ip27_machine::test_support::{self, big_stack, Scratch};
+use crate::config::MachineProfile;
 use crate::dev::hub::Space;
 use crate::dev::{hub_md, hub_ni};
 use crate::traits::{BusDevice, BUS_ERR, BUS_OK};
-use std::path::{Path, PathBuf};
-
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("iris-onyx2-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A PROM stand-in: a recognisable first word and a configuration block in
-/// the shape the flash initialiser patches.
-fn prom(dir: &Path) -> String {
-    let mut p = vec![0u8; 0x1000];
-    p[..4].copy_from_slice(&0x3c08_a600u32.to_be_bytes());
-    p[0x68..0x70].copy_from_slice(&0x6970_3237_636f_6e66u64.to_be_bytes());
-    let path = dir.join("prom.bin");
-    std::fs::write(&path, p).unwrap();
-    path.to_string_lossy().into_owned()
-}
+use std::path::Path;
 
 fn config(dir: &Path, nodes: u8) -> MachineConfig {
-    let mut cfg = MachineConfig::default();
-    cfg.machine.profile = MachineProfile::Onyx2Ip27;
-    cfg.set_cpu(&parts::R10000_180);
-    cfg.onyx2.nodes = nodes;
-    cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
-    cfg.prom = prom(dir);
-    cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
-    cfg.headless = true;
-    cfg.network.mode = NetMode::Off;
-    let held: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
-    cfg.monitor_port = Some(held[0].local_addr().unwrap().port());
-    cfg.serial_port_a = Some(held[1].local_addr().unwrap().port());
-    cfg.serial_port_b = Some(held[2].local_addr().unwrap().port());
-    let disk = dir.join("disk.raw");
-    std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
-    cfg.scsi.clear();
-    cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
-    cfg
-}
-
-/// Building a machine puts more than a megabyte on the stack.
-fn big_stack(body: impl FnOnce() + Send + 'static) {
-    std::thread::Builder::new().stack_size(64 << 20).spawn(body).unwrap().join().expect("thread panicked");
+    test_support::config(MachineProfile::Onyx2Ip27, dir, nodes)
 }
 
 fn built(name: &str, nodes: u8) -> (Scratch, Onyx2Machine) {
-    let dir = Scratch::new(name);
+    let dir = Scratch::new(&format!("onyx2-{name}"));
     let m = Onyx2Machine::new(&config(&dir.0, nodes)).unwrap();
     (dir, m)
 }
@@ -143,37 +95,6 @@ fn a_dropped_machine_frees_its_hubs_memory_and_timers() {
     });
 }
 
-/// A PCI function with nothing behind it but the DMA and interrupt line the
-/// Bridge hands it.
-struct Card {
-    state: crate::pci::PciFunctionState,
-}
-
-impl Card {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            state: crate::pci::PciFunctionState::new(crate::pci::PciConfig::new(
-                0x1234,
-                0x5678,
-                0x01_0000,
-                1,
-                [crate::pci::Bar::Unused; 6],
-                crate::pci::PCI_INTA,
-            )),
-        })
-    }
-}
-
-impl crate::pci::PciFunction for Card {
-    fn state(&self) -> &crate::pci::PciFunctionState {
-        &self.state
-    }
-    fn bar_read(&self, _bar: usize, _off: u32, _width: usize) -> u32 {
-        0
-    }
-    fn bar_write(&self, _bar: usize, _off: u32, _val: u32, _width: usize) {}
-}
-
 /// The BaseIO-G's Bridge sends DMA and interrupts to the Hub at the widget
 /// the guest programs into it, not to a fixed one: the second node's Hub
 /// (widget 9) gets both when the guest names it, and the first's (10) when
@@ -184,7 +105,7 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     big_stack(|| {
         let (_dir, m) = built("bridge", 2);
         let bridge = m.bridge().clone();
-        let card = Card::new();
+        let card = test_support::Card::new();
         bridge.bus().attach(crate::pci::DevFn { device: 4, function: 0 }, card.clone());
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
         let dma = card.state.dma().unwrap().clone();
@@ -273,7 +194,7 @@ fn each_ioc3_super_io_interrupt_reaches_its_own_bridge_input() {
 #[test]
 fn the_io_prom_image_fills_the_baseio_flash() {
     big_stack(|| {
-        let dir = Scratch::new("ioprom");
+        let dir = Scratch::new("onyx2-ioprom");
         let (_none, bare) = built("noioprom", 1);
         assert_eq!(bare.bridge().read32(0xc0_0000).status, BUS_ERR);
         let image = dir.0.join("io6prom.img");

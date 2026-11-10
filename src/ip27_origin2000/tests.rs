@@ -1,65 +1,17 @@
 use super::*;
-use crate::config::{MachineProfile, NetMode};
-use crate::cpu::parts;
+use crate::ip27_machine::test_support::{self, big_stack, Scratch};
+use crate::config::MachineProfile;
 use crate::dev::hub::Space;
 use crate::dev::{hub_md, hub_ni};
 use crate::traits::{BusDevice, BUS_ERR, BUS_OK};
 use std::path::Path;
 
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("iris-o2k-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A PROM stand-in: a recognisable first word and a configuration block in
-/// the shape the flash initialiser patches.
-fn prom(dir: &Path) -> String {
-    let mut p = vec![0u8; 0x1000];
-    p[..4].copy_from_slice(&0x3c08_a600u32.to_be_bytes());
-    p[0x68..0x70].copy_from_slice(&0x6970_3237_636f_6e66u64.to_be_bytes());
-    let path = dir.join("prom.bin");
-    std::fs::write(&path, p).unwrap();
-    path.to_string_lossy().into_owned()
-}
-
 fn config(dir: &Path, nodes: u8) -> MachineConfig {
-    let mut cfg = MachineConfig::default();
-    cfg.machine.profile = MachineProfile::Origin2000Ip27;
-    cfg.set_cpu(&parts::R10000_180);
-    cfg.origin2000.nodes = nodes;
-    cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
-    cfg.prom = prom(dir);
-    cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
-    cfg.headless = true;
-    cfg.network.mode = NetMode::Off;
-    let held: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
-    cfg.monitor_port = Some(held[0].local_addr().unwrap().port());
-    cfg.serial_port_a = Some(held[1].local_addr().unwrap().port());
-    cfg.serial_port_b = Some(held[2].local_addr().unwrap().port());
-    let disk = dir.join("disk.raw");
-    std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
-    cfg.scsi.clear();
-    cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
-    cfg
-}
-
-/// Building a machine puts more than a megabyte on the stack.
-fn big_stack(body: impl FnOnce() + Send + 'static) {
-    std::thread::Builder::new().stack_size(64 << 20).spawn(body).unwrap().join().expect("thread panicked");
+    test_support::config(MachineProfile::Origin2000Ip27, dir, nodes)
 }
 
 fn built(name: &str, nodes: u8) -> (Scratch, Origin2000Machine) {
-    let dir = Scratch::new(name);
+    let dir = Scratch::new(&format!("o2k-{name}"));
     let m = Origin2000Machine::new(&config(&dir.0, nodes)).unwrap();
     (dir, m)
 }
@@ -72,7 +24,7 @@ fn the_profile_is_chosen_by_its_snake_case_name() {
 
 #[test]
 fn the_deskside_has_one_or_two_node_boards() {
-    let dir = Scratch::new("count");
+    let dir = Scratch::new("o2k-count");
     assert_eq!(config(&dir.0, 2).validate(), Ok(()));
     let err = Origin2000::specs(&config(&dir.0, 3)).err().unwrap();
     assert!(err.contains("one or two node boards"), "{err}");

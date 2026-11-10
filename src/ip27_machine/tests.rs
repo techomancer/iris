@@ -1,52 +1,11 @@
 use super::*;
-use crate::config::{GraphicsBoard, NetMode};
+use crate::config::GraphicsBoard;
+use super::test_support::{self, big_stack, Scratch};
 use crate::dev::{hub_ni, hub_pi};
 use crate::traits::BUS_OK;
 
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("iris-o200-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A PROM stand-in: a recognisable first word and a configuration block in
-/// the shape the flash initialiser patches.
-fn prom(dir: &Path) -> String {
-    let mut p = vec![0u8; 0x1000];
-    p[..4].copy_from_slice(&0x3c08_a600u32.to_be_bytes());
-    p[0x68..0x70].copy_from_slice(&0x6970_3237_636f_6e66u64.to_be_bytes());
-    let path = dir.join("prom.bin");
-    std::fs::write(&path, p).unwrap();
-    path.to_string_lossy().into_owned()
-}
-
 fn config(dir: &Path) -> MachineConfig {
-    let mut cfg = MachineConfig::default();
-    cfg.machine.profile = MachineProfile::Origin200Ip29;
-    cfg.set_cpu(&parts::R10000_180);
-    cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
-    cfg.prom = prom(dir);
-    cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
-    cfg.headless = true;
-    cfg.network.mode = NetMode::Off;
-    let held: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
-    cfg.monitor_port = Some(held[0].local_addr().unwrap().port());
-    cfg.serial_port_a = Some(held[1].local_addr().unwrap().port());
-    cfg.serial_port_b = Some(held[2].local_addr().unwrap().port());
-    let disk = dir.join("disk.raw");
-    std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
-    cfg.scsi.clear();
-    cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
-    cfg
+    test_support::config(MachineProfile::Origin200Ip29, dir, 1)
 }
 
 #[test]
@@ -86,7 +45,7 @@ fn the_r12000_module_has_no_record_on_its_one_wire_part() {
 
 #[test]
 fn the_profile_takes_an_r10000_or_r12000_and_fills_banks_from_zero() {
-    let dir = Scratch::new("config");
+    let dir = Scratch::new("o200-config");
     let mut cfg = config(&dir.0);
     assert_eq!(cfg.validate(), Ok(()));
     cfg.set_cpu(&parts::R14000_600);
@@ -115,15 +74,10 @@ fn the_profile_is_chosen_by_its_snake_case_name() {
     assert_eq!(MachineProfile::Origin200Ip29.name(), "origin200_ip29");
 }
 
-/// Building a machine puts more than a megabyte on the stack.
-fn big_stack(body: impl FnOnce() + Send + 'static) {
-    std::thread::Builder::new().stack_size(64 << 20).spawn(body).unwrap().join().expect("thread panicked");
-}
-
 #[test]
 fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
     big_stack(|| {
-        let dir = Scratch::new("reset");
+        let dir = Scratch::new("o200-reset");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         // Node memory view, the Hub-special views of the flash (own and named),
         // all show the PROM's first word at the reset address and the window.
@@ -145,7 +99,7 @@ fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
 #[test]
 fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
     big_stack(|| {
-        let dir = Scratch::new("bridge");
+        let dir = Scratch::new("o200-bridge");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         let io = m.node().hub.claim(Space::Io);
         let widget = |w: u64| w << 24;
@@ -162,7 +116,7 @@ fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
 #[test]
 fn a_reset_enables_the_processor_again() {
     big_stack(|| {
-        let dir = Scratch::new("restart");
+        let dir = Scratch::new("o200-restart");
         let mut m = Origin200Machine::new(&config(&dir.0)).unwrap();
         m.reset();
         let io = m.node().hub.claim(Space::Io);
@@ -174,7 +128,7 @@ fn a_reset_enables_the_processor_again() {
 #[test]
 fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
     big_stack(|| {
-        let dir = Scratch::new("flash");
+        let dir = Scratch::new("o200-flash");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         let word = |at: u64| m.node().hub.cpu_special().read32(0x1000_0000 + at).data;
         // Offsets 0x8c, 0x90, 0x94 and 0x9c of the configuration block.
@@ -190,7 +144,7 @@ fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
 #[test]
 fn a_scratch_volume_is_the_machines_scratch_path() {
     big_stack(|| {
-        let dir = Scratch::new("scratch");
+        let dir = Scratch::new("o200-scratch");
         let mut cfg = config(&dir.0);
         let disk = dir.0.join("scratch.raw");
         cfg.scsi.clear();
@@ -203,7 +157,7 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
 #[test]
 fn the_controller_is_brought_up_to_date_by_a_timer_and_stopped_with_the_machine() {
     big_stack(|| {
-        let dir = Scratch::new("timer");
+        let dir = Scratch::new("o200-timer");
         let mut m = Origin200Machine::new(&config(&dir.0)).unwrap();
         assert!(m.controller_timer.is_none());
         m.restart_peripherals();
@@ -222,7 +176,7 @@ fn the_controller_is_brought_up_to_date_by_a_timer_and_stopped_with_the_machine(
 #[test]
 fn a_dropped_machine_frees_its_hub_memory_and_timers() {
     big_stack(|| {
-        let dir = Scratch::new("free");
+        let dir = Scratch::new("o200-free");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         // A single node has nothing that holds its Hub from its own memory
         // map. Route the other node numbers through the Hub, as a board with
@@ -251,7 +205,7 @@ fn a_dropped_machine_frees_its_hub_memory_and_timers() {
 #[test]
 fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
     big_stack(|| {
-        let dir = Scratch::new("renumber");
+        let dir = Scratch::new("o200-renumber");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));
@@ -273,7 +227,7 @@ fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
 #[test]
 fn a_reference_by_node_number_can_compare_and_swap() {
     big_stack(|| {
-        let dir = Scratch::new("cas");
+        let dir = Scratch::new("o200-cas");
         let m = Origin200Machine::new(&config(&dir.0)).unwrap();
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));

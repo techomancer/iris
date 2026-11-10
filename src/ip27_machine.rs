@@ -949,4 +949,6 @@ pub(crate) fn pci_devices(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;
