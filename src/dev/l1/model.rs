@@ -49,6 +49,12 @@ pub struct L1Config {
     pub revision: Option<[u32; 3]>,
     pub mac: [u8; 6],
     pub brick_serial: Option<String>,
+    /// The system serial request 0x0008 answers with. `None` answers with
+    /// the station address in hex, as the Fuel's L1 does. It names the
+    /// system, so every L1 of a machine is given the same text; the board
+    /// serials in the records stay as they are, because the PROM ties its
+    /// NVRAM to the node board's serial.
+    pub system_serial: Option<String>,
     pub auto_power: bool,
     /// First integer of the port-speed reply (request 0xa). The PROM uses it
     /// to select a display branch; it is not a link speed. Zero or one.
@@ -106,6 +112,7 @@ impl Default for L1Config {
             revision: Some(DEFAULT_REVISION),
             mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
             brick_serial: Some(DEFAULT_BRICK_SERIAL.into()),
+            system_serial: None,
             auto_power: true,
             port_speed_first: 0,
             router: false,
@@ -512,18 +519,15 @@ impl State {
                 self.eeprom(channel, &a);
                 return;
             }
-            // The system serial is the station address as twelve uppercase
-            // hexadecimal digits in address order, no separators or OUI
-            // added: the text the stock PROM converts straight back into the
-            // Ethernet address.
+            // Without a configured system serial it is the station address
+            // as twelve uppercase hexadecimal digits in address order, no
+            // separators or OUI added: the text the stock PROM converts
+            // straight back into the Ethernet address.
             8 => {
-                let mac = self
-                    .config
-                    .mac
-                    .iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect::<String>();
-                text_field(&mut fields, mac.as_bytes());
+                let serial = self.config.system_serial.clone().unwrap_or_else(|| {
+                    self.config.mac.iter().map(|b| format!("{b:02X}")).collect()
+                });
+                text_field(&mut fields, serial.as_bytes());
                 field_count = 1;
             }
             // Not partitioned.
