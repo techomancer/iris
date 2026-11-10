@@ -257,15 +257,16 @@ impl Combiner {
         (self.lines[0].load(SeqCst), self.lines[1].load(SeqCst), self.lines[2].load(SeqCst) as u32)
     }
 
-    /// Replace the levels outright and forget delivery state: what the host
-    /// has is whatever the restore gave it, and `redrive` makes it agree.
+    /// Replace the levels outright and forget delivery state. The host is
+    /// taken to have the loaded levels, as a host that restores its own copy
+    /// (the Bridge's pin levels) does; `redrive` tells one that does not.
     pub(super) fn load(&self, w: (u64, u64, u32)) {
         self.lines[0].store(w.0, SeqCst);
         self.lines[1].store(w.1, SeqCst);
         self.lines[2].store(w.2 as u64, SeqCst);
         for m in self.out.iter() {
             m.state.store(0, SeqCst);
-            m.last.store(false, Relaxed);
+            m.last.store(self.any_high(m, None), Relaxed);
         }
     }
 }
@@ -509,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn load_resets_dirty_fell_and_last() {
+    fn load_resets_dirty_and_fell_and_takes_last_from_the_levels() {
         let (h, c) = rig();
         let p = c.pin_line(1, 1).unwrap();
         p.set(true);
@@ -520,11 +521,27 @@ mod tests {
         c.load(saved);
         assert_eq!(c.save(), saved);
         assert_eq!(c.out[0].state.load(SeqCst), 0, "no flag left");
-        assert!(!c.out[0].last.load(SeqCst));
-        // After the load the host is told the saved level whatever it held.
+        assert!(c.out[0].last.load(SeqCst), "the host is taken to have the saved level");
+        // A redrive tells the host the saved level whatever it held.
         let n = h.log().len();
         c.redrive();
         assert_eq!(h.log()[n], (0, true));
+    }
+
+    /// A host that restores its own copy of the levels (the Bridge keeps its
+    /// pins' levels in its snapshot) is not redriven, so the combiner takes
+    /// it to have the loaded levels: a line saved high that falls is
+    /// delivered, and the rise after it is an edge.
+    #[test]
+    fn a_line_saved_high_that_falls_after_a_load_is_delivered() {
+        let (_, c) = rig();
+        c.pin_line(1, 1).unwrap().set(true);
+        let (h, d) = rig();
+        d.load(c.save());
+        let p = d.pin_line(1, 1).unwrap();
+        p.set(false);
+        p.set(true);
+        assert_eq!(h.log(), vec![(0, false), (0, true)]);
     }
 
     /// A mutator that has set `DIRTY` and found `HELD` set returns; the
