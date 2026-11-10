@@ -62,6 +62,9 @@ env:
   # what it downloads, so tracking main keeps the two in step; set a commit SHA
   # here to hold back an upstream change.
   ANYLINUX_REF: refs/heads/main
+  # libchdman-rs downloads a prebuilt archive from GitHub releases at build
+  # time and fails the build if the download does. Compile from source then.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
 
 jobs:
   version:
