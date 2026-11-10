@@ -2,9 +2,11 @@
 //! decode selected by Bedrock's memory configuration register.
 //!
 //! The board names the fitted banks, locational bank 0 upward, one size in
-//! MiB each: two 256 MiB banks on the Fuel. Each bank answers in its own
-//! 1 GiB software slot, all four inside the 4 GiB window ppmem maps for the
-//! CPU's direct access.
+//! MiB each: two 256 MiB banks on the Fuel, up to eight on the Tezro. Each
+//! bank answers in its own 1 GiB software slot, so banks 4 to 7 sit at 4 to
+//! 8 GiB. A node with banks there asks ppmem for its 16 GiB window, as the
+//! Octane's HEART does past 4 GiB, so every bank is in the CPU's direct
+//! window.
 //!
 //! Every access reaches a bank through Physical's bank views or the bank
 //! itself, without a lock. Remapping runs on the CPU thread, or with the CPU
@@ -18,34 +20,41 @@
 use crate::physical::{Physical, RamBank};
 use crate::traits::*;
 use crate::ppmem::devmap::SLOT_SHIFT;
-use crate::ppmem::{MappedMemory, BITMAP_SHIFT};
+use crate::ppmem::{MappedMemory, BITMAP_SHIFT, LARGE_WINDOW_SIZE, WINDOW_SIZE};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const BANK_SPAN: u64 = 1 << 30;
-/// Software slots of [`BANK_SPAN`]: the bank-select swizzle permutes the
-/// four of them.
-pub const SLOTS: usize = 4;
+/// Software slots of [`BANK_SPAN`] in the node's 8 GiB.
+pub const SLOTS: usize = 8;
 /// The most memory a bank can hold: what the largest size code names.
 const MAX_BANK_MIB: u32 = 1024;
 /// Banks are mapped into the direct window in whole regions of this size.
 const REGION_MIB: u32 = 1 << (BITMAP_SHIFT - 20);
 
 /// Where fitted RAM can answer: for each software slot, the most any bank the
-/// bank-select swizzle can place there holds. The swizzle permutes the four
-/// slots, so any slot may hold the largest bank.
+/// bank-select swizzle can place there holds. The swizzle permutes slots
+/// within groups of four, so a slot may hold any bank of its group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RamExtent([u64; SLOTS]);
 impl RamExtent {
     /// `banks` are the fitted sizes in MiB from locational bank 0.
     pub fn new(banks: &[u32]) -> Self {
-        Self([banks.iter().map(|&mib| u64::from(mib) << 20).max().unwrap_or(0); SLOTS])
+        let fitted = |bank: usize| banks.get(bank).map_or(0, |&mib| u64::from(mib) << 20);
+        Self(std::array::from_fn(|slot| {
+            (0..4).map(|group_slot| fitted(slot / 4 * 4 + group_slot)).max().unwrap_or(0)
+        }))
     }
     /// Whether `address` can be fitted RAM under some bank-select setting.
     pub fn contains(&self, address: u64) -> bool {
         let slot = address / BANK_SPAN;
         slot < SLOTS as u64 && address % BANK_SPAN < self.0[slot as usize]
+    }
+    /// Slots from 0 through the last that can hold RAM.
+    #[cfg(feature = "jitv2")]
+    fn slots(&self) -> usize {
+        self.0.iter().rposition(|&size| size != 0).map_or(0, |last| last + 1)
     }
     /// The most RAM software slot `slot` can hold, in bytes.
     pub fn prefix(&self, slot: usize) -> u64 { self.0[slot] }
@@ -68,9 +77,9 @@ impl BusDevice for NoMemory {}
 pub(crate) struct Generations(Box<[AtomicU64]>);
 #[cfg(feature = "jitv2")]
 impl Generations {
-    /// One counter per 4 KiB page of every slot that can hold RAM.
+    /// One counter per 4 KiB page, up to the last slot that can hold RAM.
     fn new(extent: &RamExtent) -> Self {
-        let pages = if extent.prefix(0) == 0 { 0 } else { SLOTS << (BANK_SPAN.trailing_zeros() - 12) };
+        let pages = extent.slots() << (BANK_SPAN.trailing_zeros() - 12);
         Self((0..pages).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice())
     }
     pub(crate) fn base(&self) -> *mut AtomicU64 {
@@ -85,10 +94,10 @@ impl Generations {
         }
     }
     fn bump_all(&self, extent: &RamExtent) {
-        for slot in 0..SLOTS {
+        for slot in 0..extent.slots() {
             let first = slot * (BANK_SPAN >> 12) as usize;
             let pages = (extent.prefix(slot) >> 12) as usize;
-            for counter in self.0[first..].iter().take(pages) {
+            for counter in &self.0[first..first + pages] {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -111,7 +120,12 @@ pub struct Memory {
 impl Memory {
     /// Memory with `banks` fitted, locational bank 0 upward, each a size in
     /// MiB: at most [`SLOTS`] banks, none empty or over 1 GiB (the largest
-    /// size code), each a whole number of direct-window regions.
+    /// size code), each a whole number of direct-window regions, and banks
+    /// 2k and 2k+1 the same size where both are fitted. The configuration
+    /// word is four byte lanes, each enabling its two banks separately and
+    /// holding one size code for both, so the hardware cannot size a lane's
+    /// banks apart (established from the stock IP35 PROM's decode of that
+    /// word).
     pub fn new(banks: &[u32]) -> Result<Self, String> {
         if banks.is_empty() || banks.len() > SLOTS {
             return Err(format!("memory: {} banks; fit 1 to {SLOTS}", banks.len()));
@@ -122,7 +136,16 @@ impl Memory {
             return Err(format!(
                 "memory: bank {bank} is {mib} MiB; a bank is a multiple of {REGION_MIB} MiB up to {MAX_BANK_MIB} MiB"));
         }
-        let physical = Physical::new(banks.iter().map(|&mib| RamBank::new(mib as usize)).collect());
+        // The configuration word has one size code per byte lane, shared by
+        // the lane's two banks, so the two cannot differ.
+        if let Some(lane) = banks.chunks(2).position(|pair| pair.len() == 2 && pair[0] != pair[1]) {
+            return Err(format!(
+                "memory: banks {} and {} are {} and {} MiB; the two banks of a lane share one size",
+                2 * lane, 2 * lane + 1, banks[2 * lane], banks[2 * lane + 1]));
+        }
+        // Bank n starts at n GiB; past bank 3 the node runs over 4 GiB.
+        let window = if banks.len() as u64 * BANK_SPAN > WINDOW_SIZE { LARGE_WINDOW_SIZE } else { WINDOW_SIZE };
+        let physical = Physical::with_window(banks.iter().map(|&mib| RamBank::new(mib as usize)).collect(), window);
         physical.set_default(Arc::new(NoMemory), "Bedrock unconfigured memory");
         Ok(Self { physical, fitted: banks.iter().map(|&mib| u64::from(mib) << 20).collect(),
             config: AtomicU64::new(0), runs: Mutex::new(Vec::new()),

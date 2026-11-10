@@ -816,6 +816,15 @@ mod tests {
         assert_eq!(md.md_bus().write64(8, 0x33), BUS_OK);
         md
     }
+    /// The Tezro's default 4 GiB: two 1 GiB banks and four of 512 MiB.
+    const TEZRO_BANKS: [u32; 6] = [1024, 1024, 512, 512, 512, 512];
+    /// Banks 0 and 1 at size code 5 (1 GiB), the other four at code 4 (512 MiB).
+    const TEZRO_CONFIG: u64 = 0x53 | (0x43 << 8) | (0x43 << 16);
+    fn tezro() -> Arc<TestMd> {
+        let md = TestMd::new(&TEZRO_BANKS).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        md
+    }
 
     /// Cached, uncached and DMA memory take no MD lock: each works while
     /// both are held. An address no enabled bank holds answers a bus error
@@ -920,20 +929,35 @@ mod tests {
 
     /// The board names what it fits; nothing else is accepted. A bank is a
     /// whole number of direct-window regions and at most the largest size
-    /// code names, and the controller decodes four.
+    /// code names, and the controller decodes eight.
     #[test]
     fn a_board_may_only_fit_banks_the_controller_can_decode() {
         assert!(TestMd::new(&FUEL_BANKS).is_ok());
-        assert!(TestMd::new(&[1024; 4]).is_ok());
-        for banks in [&[][..], &[0, 256], &[2048], &[100], &[64; 5]] {
+        assert!(TestMd::new(&TEZRO_BANKS).is_ok());
+        assert!(TestMd::new(&[1024; 8]).is_ok());
+        for banks in [&[][..], &[0, 256], &[2048], &[100], &[64; 9]] {
             assert!(TestMd::new(banks).is_err(), "{banks:?}");
         }
     }
 
-    /// Where RAM can be, for a board's cached view: the swizzle permutes the
-    /// four slots, so every slot reaches as far as the largest bank.
+    /// A byte lane of the configuration word holds one size code for both
+    /// of its banks, so a board cannot fit them at different sizes; a lane
+    /// with one bank fitted is still a board's to choose.
     #[test]
-    fn the_ram_extent_reaches_as_far_as_the_largest_bank_in_every_slot() {
+    fn the_two_banks_of_a_lane_share_one_size() {
+        for banks in [&[1024, 512][..], &[512, 512, 1024, 512], &[1024, 1024, 512, 512, 512, 1024]] {
+            assert!(TestMd::new(banks).err().is_some_and(|e| e.contains("share one size")), "{banks:?}");
+        }
+        for banks in [&[512][..], &[1024, 1024, 512], &[512, 512, 1024, 1024]] {
+            assert!(TestMd::new(banks).is_ok(), "{banks:?}");
+        }
+    }
+
+    /// Where RAM can be, for a board's cached view: the swizzle permutes slots
+    /// within groups of four, so a slot reaches as far as the largest bank of
+    /// its group.
+    #[test]
+    fn the_ram_extent_reaches_as_far_as_the_largest_bank_of_a_slot_group() {
         let extent = RamExtent::new(&FUEL_BANKS);
         for slot in 0..4 {
             assert!(extent.contains(slot * BANK_SPAN + FITTED_BANK - 8), "slot {slot}");
@@ -944,6 +968,135 @@ mod tests {
         assert!(mixed.contains(3 * BANK_SPAN + (512 << 20) - 8), "slot 3 may hold the 512 MiB bank");
         assert!(!mixed.contains(512 << 20));
         assert_eq!(extent, fuel().ram_extent());
+        let tezro = RamExtent::new(&TEZRO_BANKS);
+        assert!(tezro.contains(3 * BANK_SPAN + BANK_SPAN - 8), "slot 3 may hold a 1 GiB bank");
+        assert!(tezro.contains(5 * BANK_SPAN + (512 << 20) - 8));
+        assert!(!tezro.contains(5 * BANK_SPAN + (512 << 20)));
+        assert!(!tezro.contains(8 * BANK_SPAN));
+        assert_eq!(tezro, TestMd::new(&TEZRO_BANKS).unwrap().ram_extent());
+    }
+
+    /// Each Tezro bank answers in its own 1 GiB slot at its own size: a
+    /// 1 GiB bank fills its slot, a 512 MiB bank stops halfway, and the
+    /// slots above bank 5 answer nothing. Banks 4 and 5 sit above 4 GiB,
+    /// inside the node's 16 GiB direct window. Follows the qtest memory-banks and
+    /// memory-size-boundaries cases in tests/qtest/sn1-bedrock-md-test.c.
+    #[test]
+    fn every_tezro_bank_answers_at_its_own_size_including_above_4_gib() {
+        use crate::ppmem::MappedMemory;
+        let md = tezro();
+        let bus = md.physical();
+        let sizes = [1024u64, 1024, 512, 512, 512, 512];
+        for (slot, mib) in sizes.iter().enumerate() {
+            let base = slot as u64 * BANK_SPAN;
+            let size = mib << 20;
+            assert_eq!(bus.write64(base, 0x1111 * (slot as u64 + 1)), BUS_OK, "slot {slot}");
+            assert_eq!(bus.write64(base + size - 8, 0xe0 + slot as u64), BUS_OK, "slot {slot} top");
+            if size < BANK_SPAN {
+                assert_eq!(bus.read64(base + size).status, BUS_ERR, "slot {slot} past its bank");
+            }
+        }
+        for slot in 0..6u64 {
+            assert_eq!(bus.read64(slot * BANK_SPAN).data, 0x1111 * (slot + 1), "slot {slot}");
+            let top = (sizes[slot as usize] << 20) - 8;
+            assert_eq!(bus.read64(slot * BANK_SPAN + top).data, 0xe0 + slot, "slot {slot} top");
+        }
+        for slot in [6, 7] {
+            assert_eq!(bus.read64(slot * BANK_SPAN).status, BUS_ERR, "slot {slot} holds no bank");
+        }
+        assert_eq!(bus.banks()[4].read64(0).data, 0x1111 * 5, "bank 4 holds what slot 4 wrote");
+        assert_eq!(bus.banks()[5].read64(0).data, 0x1111 * 6);
+        // The 16 GiB window maps every bank, in 256 MiB regions.
+        let space = bus.ppmem_space().expect("a window");
+        assert_eq!(space.window_size(), crate::ppmem::LARGE_WINDOW_SIZE);
+        assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 4) | (0x3 << 8) | (0x3 << 12) | (0x3 << 16) | (0x3 << 20));
+        assert_eq!(md.dma_view().read64(5 * BANK_SPAN).data, 0x1111 * 6, "DMA reaches it too");
+        assert_eq!(md.uncached_view().read64(4 * BANK_SPAN).data, 0x1111 * 5, "and uncached");
+    }
+
+    /// A node whose banks all lie below 4 GiB, as the Fuel's do, keeps the
+    /// 4 GiB window and its 64 MiB regions.
+    #[test]
+    fn a_node_below_4_gib_keeps_the_4_gib_window() {
+        use crate::ppmem::MappedMemory;
+        let md = configured();
+        let space = md.physical().ppmem_space().expect("a window");
+        assert_eq!(space.window_size(), crate::ppmem::WINDOW_SIZE);
+        assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 16));
+    }
+
+    /// A processor's SC to a bank above 4 GiB swaps through the DMA view in one step and leaves a failed compare
+    /// alone; a successful one advances the page's logical counter.
+    #[test]
+    fn a_compare_and_swap_above_4_gib_is_one_step() {
+        let md = tezro();
+        let view = md.dma_view();
+        let at = 5 * BANK_SPAN + 0x40;
+        assert_eq!(view.write64(at, 7), BUS_OK);
+        #[cfg(feature = "jitv2")]
+        let before = unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) };
+        assert_eq!(view.cas64(at, 6, 9), Some(false));
+        assert_eq!(view.read64(at).data, 7);
+        assert_eq!(view.cas64(at, 7, 9), Some(true));
+        assert_eq!(view.read64(at).data, 9);
+        assert_eq!(view.cas32(at + 4, 9, 3), Some(true));
+        assert_eq!(view.read64(at).data, 3);
+        #[cfg(feature = "jitv2")]
+        assert!(unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) } > before);
+        assert_eq!(view.cas64(7 * BANK_SPAN, 0, 1), None, "no bank there");
+    }
+
+    /// Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5
+    /// trade places above 4 GiB. Follows memory-selector-high-bank.
+    #[test]
+    fn the_bank_select_swaps_banks_above_4_gib() {
+        let md = tezro();
+        let bus = md.physical();
+        assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
+        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
+    }
+
+    /// A fitting that covers the bank under test zero-fills it, whichever slot
+    /// the bank is in; a bank that is not fitted fails. Follows the
+    /// selftest-bank-remap and origin300-selftest-fill cases.
+    #[test]
+    fn selftest_fills_a_tezro_bank_above_4_gib_and_fails_a_missing_bank() {
+        let md = TestMd::new(&TEZRO_BANKS).unwrap();
+        // Every pair at size code 1 (64 MiB): small enough to fill in a test.
+        let regs = md.md_bus();
+        regs.write64(reg::CONFIG, 0x13 | (0x13 << 8) | (0x13 << 16) | (0x13 << 24));
+        let bus = md.physical();
+        bus.write64(4 * BANK_SPAN + 0x40, 0x5555);
+        regs.write64(reg::SELFTEST_DATA, 0x80);
+        regs.write64(reg::SELFTEST_COMMAND, (4 << 4) | 1);
+        md.advance_ns(1000);
+        assert_eq!(regs.read64(reg::SELFTEST_STATUS).data, 3, "bank 4 is fitted");
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x40).data, 0, "and zeroed");
+        regs.write64(reg::SELFTEST_COMMAND, (6 << 4) | 1);
+        md.advance_ns(1000);
+        assert_eq!(regs.read64(reg::SELFTEST_STATUS).data, 2, "bank 6 is not fitted");
+    }
+
+    /// Code pages above 4 GiB have stable logical generation counters like
+    /// the rest, and a write bumps them.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn code_pages_above_4_gib_keep_a_logical_generation() {
+        let md = tezro();
+        let above = 4 * BANK_SPAN + 0x2000;
+        let pointer = md.dma_view().gen_ptr(above);
+        assert!(!pointer.is_null());
+        assert_ne!(pointer, md.dma_view().gen_ptr(5 * BANK_SPAN + 0x2000));
+        assert!(md.dma_view().gen_ptr(8 * BANK_SPAN).is_null(), "past the node's 8 GiB");
+        assert!(md.dma_view().gen_ptr(4 * BANK_SPAN + (512 << 20)).is_null(), "past the largest bank there");
+        let before = unsafe { (*pointer).load(Ordering::Relaxed) };
+        assert_eq!(md.dma_view().write64(above, 1), BUS_OK);
+        assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
+        md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32));
+        assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
     }
 
     /// Guest density settings remap fitted RAM, and reset restores the default map.
