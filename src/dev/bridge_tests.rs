@@ -1364,6 +1364,40 @@ fn a_host_with_no_packet_address_takes_any_address_and_over_64_vectors() {
     assert_eq!(r.sink.take(), [(100, true)]);
 }
 
+/// A host that decodes the packet itself, as Bedrock's two processor
+/// interfaces do, gets the whole packet: the widget ID the guest gave the
+/// chip, and the destination address with the pin's host field in bits
+/// 47:38. A host that refuses it costs the Bridge nothing.
+#[test]
+fn a_host_that_decodes_packets_sees_their_source_and_address() {
+    #[derive(Default)]
+    struct Decoder(Mutex<Vec<(u8, u64, u32, bool)>>);
+    impl InterruptController for Decoder {
+        fn set_line(&self, _: u32, _: bool) {
+            unreachable!("a packet host takes packets");
+        }
+        fn packet(&self, source: u8, address: u64, line: u32, level: bool) -> bool {
+            self.0.lock().push((source, address, line, level));
+            false
+        }
+    }
+    let host = XtalkHost { widget: 0xa, int_packet: 0, int_packet_mask: 0, vectors: 256 };
+    let decoder = Arc::new(Decoder::default());
+    let r = Rig { bridge: Bridge::new(Upstream::single(host, Arc::new(Mem::new()), decoder.clone()), &crate::ip30::PCI0),
+        sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
+    let c = r.card(2, PCI_INTA);
+    r.set(reg::CONTROL, (r.get(reg::CONTROL) & !0xf) | 0xd);
+    r.set(reg::INT_DEST_UPPER, 0xa << 16 | 0x1);
+    r.set(reg::INT_DEST_LOWER, 0x0180_0090);
+    r.set(reg::int_host(2), 0x155 << 8 | 0x42);
+    r.set(reg::INT_MODE, 1 << 2);
+    r.set(reg::INT_ENABLE, 1 << 2);
+    c.raise(true);
+    c.raise(false);
+    let address = (0x1_0180_0090u64 & !(0x3ff << 38)) | 0x155 << 38;
+    assert_eq!(*decoder.0.lock(), [(0xd, address, 0x42, true), (0xd, address, 0x42, false)]);
+}
+
 /// Behind a Crossbow with two hosts, the widget the guest programs picks the
 /// host: the direct map moves DMA and the interrupt destination moves
 /// packets, and a host whose link is down hears neither.

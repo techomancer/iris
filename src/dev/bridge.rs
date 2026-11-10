@@ -245,6 +245,8 @@ pub const CONTROL_PAGE_16K: u32 = 1 << 21;
 /// does not say that either does.
 const CONTROL_RST_PINS: u32 = 0xf << 24;
 const CONTROL_RESET: u32 = (1 << 30) | (1 << 29) | (1 << 28) | CONTROL_RST_PINS | (3 << 12) | (1 << 9) | (0x1f << 4) | 0xf;
+/// The widget ID the chip puts on the packets it sends.
+const CONTROL_WIDGET_ID: u32 = 0xf;
 /// Two strobes that clear the link retry counters and always read zero.
 const CONTROL_RETRY_CLEAR: u32 = 0x3 << 10;
 
@@ -393,6 +395,12 @@ fn int_dest(upper: u32, lower: u32) -> IntDest {
     IntDest { widget: ((upper >> 16) & 0xf) as u8, address: (((upper & 0xffff) as u64) << 32) | lower as u64 }
 }
 
+/// The widget a packet says it came from: the ID the guest gave the chip in
+/// Control bits 3:0.
+fn source(st: &State) -> u8 {
+    (st.r(reg::CONTROL) & CONTROL_WIDGET_ID) as u8
+}
+
 struct State {
     reg: [u32; REG_SLOTS],
     ate: [u64; ATE_ENTRIES],
@@ -445,8 +453,17 @@ struct FlashPart {
     size: u32,
 }
 
-/// The packets a locked section decided to send: (host widget, vector, set).
-type Packets = Vec<(u8, u8, bool)>;
+/// An interrupt packet a locked section decided to send: from the widget
+/// Control names, to `widget` at `address`, setting or clearing `vector`.
+struct Packet {
+    source: u8,
+    widget: u8,
+    address: u64,
+    vector: u8,
+    set: bool,
+}
+
+type Packets = Vec<Packet>;
 
 /// The onboard Bridge. Hand it out as the `BusDevice` of the widget's small
 /// window: `Arc<Bridge>` coerces to `Arc<dyn BusDevice>`. As an
@@ -454,7 +471,7 @@ type Packets = Vec<(u8, u8, bool)>;
 pub struct Bridge {
     st: Mutex<State>,
     /// Held across "decide a packet, send it", never with `st`.
-    /// Nothing but the host's `set_line` is called under it.
+    /// Nothing but the host's interrupt input is called under it.
     irq_order: Mutex<()>,
     /// The host chips this Bridge's transfers and interrupt packets can go
     /// to, by the widget number the guest programs.
@@ -583,9 +600,13 @@ impl Bridge {
         let _order = self.irq_order.lock();
         let mut packets = Packets::new();
         let ret = f(&mut self.st.lock(), &mut packets);
-        for (widget, vector, set) in packets {
+        for Packet { source, widget, address, vector, set } in packets {
             match self.up.get(widget) {
-                Some(h) if h.link_up() => h.irq.set_line(vector as u32, set),
+                Some(h) if h.link_up() => {
+                    if !h.irq.packet(source, address, vector as u32, set) {
+                        log::debug!("bridge: widget {widget} refused interrupt packet {address:#x} vector {vector}");
+                    }
+                }
                 _ => log::debug!("bridge: interrupt packet to widget {widget} dropped; no live link to a host"),
             }
         }
@@ -810,7 +831,7 @@ impl Bridge {
         match self.up.get(dest.widget) {
             Some(h) if h.host.accepts(dest.widget, address, vector) => {
                 crate::dlog!(LogModule::Bridge, "bridge: pin {pin} {} vector {vector} of widget {}", if set { "sets" } else { "clears" }, dest.widget);
-                p.push((dest.widget, vector, set));
+                p.push(Packet { source: source(st), widget: dest.widget, address, vector, set });
             }
             Some(_) => log::debug!("bridge: interrupt packet to widget {} address {address:#x} vector {vector} is not one its host takes; dropped", dest.widget),
             None => log::debug!("bridge: interrupt packet to widget {}, which is not a host; dropped", dest.widget),
@@ -823,7 +844,9 @@ impl Bridge {
         let dest = int_dest(st.r(reg::INT_DEST_UPPER), st.r(reg::INT_DEST_LOWER));
         // An unrouted error is one nobody asked for.
         match self.up.get(dest.widget) {
-            Some(h) if h.host.accepts(dest.widget, dest.address, number) => p.push((dest.widget, number, true)),
+            Some(h) if h.host.accepts(dest.widget, dest.address, number) => {
+                p.push(Packet { source: source(st), widget: dest.widget, address: dest.address, vector: number, set: true })
+            }
             _ => log::debug!("bridge: error interrupt with no usable destination; dropped"),
         }
     }
