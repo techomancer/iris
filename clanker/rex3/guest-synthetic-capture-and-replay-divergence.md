@@ -11,13 +11,16 @@ still need recapture before they can be used as strict replay evidence.
 
 ## Desktop blocker and scanout
 
-Both available IRIX images lack the licensed Newport kernel driver:
-`hinv` lists no graphics, `gfxinfo` reports no boards,
-`/var/sysgen/boot/ng1.a` and `/hw/gfx` are absent, and Xsgi cannot find a
-screen. This is a guest setup blocker, not a CI display-black bug. Obtain an
-authorized matching driver from appropriate media, install it only into a new
-disposable overlay, run the matching autoconfig, reboot, and verify `hinv`,
-`gfxinfo`, `/hw/gfx`, Xsgi, and X connectivity before real desktop capture.
+**Corrected 2026-11-10.** The images used here had been installed headless:
+`hinv` listed no graphics, `gfxinfo` reported no boards, `/hw/gfx` was absent
+and Xsgi could not find a screen. This was first read as a missing licensed
+Newport driver. It is not: Newport support is linked into `/unix`, and a
+headless install records `GFXBOARD=SERVER`, so `inst` drops the
+hardware-tagged Xsgi, gfxinit and `/hw/gfx` files (see
+[the install guide](../irix/irix-install.md), `headless = false`). An IRIX
+6.5.3 guest installed with Newport mapped reports `Graphics board: Indy
+24-bit` and has Xsgi and the NG1 GL libraries; a real X/GL capture on it is
+still to be done.
 
 Scanout itself works: two independent color-bar frames differed in all
 128,000 test pixels and each contained 112,000 nonblack pixels. No game or

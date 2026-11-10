@@ -129,19 +129,19 @@ guide and changelog when it lands.
 - [x] **Measurement — REX3 live telemetry and synthetic baseline.** Completed
   locally on 2026-11-06: opt-in accounting and bounded timestamps, the adaptive
   telemetry A/A gate, and the corrected seeded five-sample Vulkan gate. The
-  stable telemetry A/A passed; the live renderer failed both speed gates and
-  is not ready to submit. Details:
+  stable telemetry A/A passed; that barrier shader failed both speed gates.
+  Superseded by the tile-binned shader (below). Details:
   [REX3 GPU profiling and gates](rex3/live-gpu-profiling-and-gates.md).
 - [x] **Capture — synthetic REX3 guest workloads.** Fourteen private captures
   of seven ROM-free direct-MMIO cases under compiled and interpreted CPU
   rendering passed guest pixel and host screenshot checks. They are not real
   desktop traffic or timing data; raw captures stay private. Details:
   [guest capture and replay validation](rex3/guest-synthetic-capture-and-replay-divergence.md).
-- [ ] **External blocker — real REX3 desktop capture.** Both available IRIX
-  images lack the licensed Newport driver, so Xsgi cannot find a screen.
-  Obtain an authorized matching driver, install it only into a disposable
-  overlay, autoconfigure, reboot, and verify graphics discovery and X before
-  capturing real desktop workloads. This is not a CI display-black bug.
+- [ ] **Validation — real REX3 desktop capture.** The earlier "missing
+  Newport driver" was a headless install dropping the graphics files. An IRIX
+  6.5.3 guest installed with Newport mapped now has Xsgi and the NG1 GL
+  libraries. Switch it to the graphical console, run a small X/GL workload,
+  capture it and verify pixels, then replay it on the CPU and GPU engines.
 - [x] **Correctness — REX3 HOSTRW replay state.** Validated: interpreter,
   counter-proven Cranelift, and Vulkan agree on `pixelclip`'s
   `host_shifter = 0xff000001`, full RGB/aux planes, and reads; 9/14 captures
@@ -167,18 +167,16 @@ guide and changelog when it lands.
   dropped first batch are rejected even when later draws overlap.
   Metal/D3D12 corpus runs, real GFIFO-full back-pressure and broader REX3 modes
   remain open. See the [corpus README](../src/dev/ng1/testdata/README.md).
-- [ ] **Prerequisite — REX3 GPU recovery.** After strict corpus validation,
-  define and fault-test device-loss and readback-error recovery so pending
-  draws are not lost and CPU fallback never uses stale pixels. Complete before
-  the parallelism experiment, with evidence across available backends.
-- [ ] **Experiment — conflict-free REX3 epochs/tiles.** After strict corpus
-  and recovery prerequisites, test parallel conflict-free epochs or
-  order-preserving tile work against the single-workgroup serial bottleneck.
-  Split dispatches at global barriers and cross-tile hazards; preserve
-  overlapping draw order, CPU fallback, and fence/readback boundaries;
-  rerun the strict corpus and the five-sample 1.20x raster / 0.95x tiny gates.
-  Consider native Vulkan only if measurements isolate material wgpu-specific
-  overhead, not merely because the present shader is slow.
+- [x] **REX3 GPU recovery (lean).** Accepted draws are journaled (65,536
+  draws / 4,194,304 pixels) until each synchronization; on a GPU error, device
+  loss or readback timeout the journal is replayed on the CPU, the engine is
+  disabled and its wgpu objects are leaked. The hardened version (process
+  lease, quarantine, stop deadlines, fault-injection suite, patched wgpu-core)
+  is a follow-up: [follow-up plan](plans/rex3-gpu-live-follow-ups.md).
+- [x] **Experiment — order-preserving REX3 tiles.** Tile binning on the CPU,
+  one workgroup per 32x32 tile, tile-major GPU plane, damage-limited readback.
+  Vulkan: raster ~2.5x, tiny ~0.96x (gates 1.20x / 0.95x). See
+  [the parallelization plan](plans/rex3-gpu-parallelization.md).
 - [ ] **Implementation — VPro quad worker pool.** Balance shading and stores over a pool fed by the rasteriser in batches of ~16 quads, the rasteriser running a quad itself when the pool is dry, in-order completion by atomics per 8x8-grid position. See `clanker/plans/odyssey-quad-pipeline.md`, "Idea: a quad worker pool".
 - [ ] **Implementation — VPro memory access, specialised.** Board-memory
   access goes through run-time field decoding per pixel (`odyssey/view.rs`).

@@ -5,6 +5,13 @@ RTX 5070 / NVIDIA 617.42 / Vulkan, default 1,024-draw batches. Upstream remains
 replay-only; these synthetic results do not make the live renderer ready or
 justify submitting it.
 
+**Superseded measurements, 2026-11-10:** the barrier shader measured below was
+replaced by a tile-binned shader with a tile-major GPU plane; the raster gate
+now passes by about 2x and the tiny gate sits at its threshold. See
+[the parallelization plan](../plans/rex3-gpu-parallelization.md) for current
+numbers. The harness instructions here are unchanged, except that
+`REX3_GPU_BATCH_DRAWS` now defaults to 16,384.
+
 ## Run and interpret
 
 `rex-gpu` is required. `REX3_GPU_TELEMETRY=1` enables stage accounting;
