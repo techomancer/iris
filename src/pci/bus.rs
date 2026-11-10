@@ -295,7 +295,7 @@ impl PciBus {
         }
     }
 
-    /// Each output's (dirty, fell, last), for a test to compare.
+    /// Each output's (held, fell, force), for a test to compare.
     #[cfg(test)]
     pub(crate) fn delivery_flags(&self) -> Vec<(bool, bool, bool)> {
         match &self.0.uplink {
@@ -304,7 +304,7 @@ impl PciBus {
         }
     }
 
-    /// Latch every output's `fell` and `dirty`, as an interrupted delivery
+    /// Latch every output's `held` and `fell`, as an interrupted delivery
     /// would leave them.
     #[cfg(test)]
     pub(crate) fn latch_delivery_flags(&self) {

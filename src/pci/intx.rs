@@ -1,41 +1,48 @@
 //! Interrupt pins and board IRQs, combined per host output.
 //!
 //! Every pin of every device number is a line (`device * 4 + pin - 1`) and
-//! the board IRQs follow them. The combiner keeps each line's level and
-//! tells the host the OR of everything routed to an output, so on a shared
-//! output one source cannot clear another's interrupt.
+//! the board IRQs follow them. Each line is one bit of the word of the
+//! output it is routed to, and the host is told the OR of an output's
+//! lines, so on a shared output one source cannot clear another's
+//! interrupt.
 //!
-//! No lock of ours is held while the host is driven. A level change is one
-//! `fetch_or` or `fetch_and` on the line's word and one `fetch_or` on the
-//! output's `state` word. `state` carries everything the delivery handshake
-//! needs: `DIRTY` (a level changed), `HELD` (someone is calling the host),
-//! `FELL` and `FORCE`. A mutator sets `DIRTY | HELD` in one RMW and returns if
-//! `HELD` was already set. The holder takes the flags with a `fetch_and`,
-//! reads the OR, calls the host, and gives up with a `compare_exchange` of
-//! `HELD` to 0 that fails if any flag was set meanwhile, in which case it
-//! goes round again. So deliveries to one output are serialised and in order,
-//! the last one is the OR after the last change, and every step of the
-//! handshake is a read-modify-write on one location: acquire-release is
-//! enough, with no store-then-load pair for a store buffer to reorder. That
-//! is checked by loom (`loom_tests`, built with `RUSTFLAGS="--cfg loom"`),
-//! since x86 hardware cannot show a missing acquire or release.
+//! No lock is held while the host is driven. An output's word holds its
+//! lines and its delivery flags, `HELD` (someone is calling the host for
+//! it), `FELL` and `FORCE`, and every change is one read-modify-write of
+//! that word. A change that finds `HELD` clear sets it and delivers; one
+//! that finds it set leaves the change for the holder. The holder gives
+//! `HELD` up with a compare-exchange against the word its delivery was
+//! worked out from, which fails if anything changed meanwhile, and then
+//! goes round again. So deliveries to one output are one at a time and in
+//! order, and the last is the OR after the last change. That rests on the
+//! modification order of one word and nothing else; acquire-release only
+//! orders one holder's host calls before the next one's.
 //!
-//! A fall followed by a rise before the deliverer reads the OR would reach the
-//! host as a steady 1. That is harmless to a level host and wrong for an edge
-//! host (the Bridge sends HEART a packet only on a rising edge), so a change
-//! that takes an output from 1 to 0 sets `FELL` with its `DIRTY` and the
-//! deliverer sends 0 then 1. A rise followed by a fall that nobody saw is
-//! coalesced.
+//! While `HELD` is clear the host has the OR of the word's lines: the holder
+//! gave it that, or a restore loaded both. A fall followed by a rise while
+//! someone holds the output would reach the host as a steady 1. That is
+//! harmless to a level host and wrong for an edge host (the Bridge sends
+//! HEART a packet only on a rising edge), so a change that takes a held
+//! output from 1 to 0 sets `FELL` and the holder sends 0 then 1. A rise
+//! followed by a fall that nobody saw is coalesced.
+//!
+//! `loom_tests` checks every interleaving of a few threads, including the
+//! two ways the handshake could go wrong: a holder that gave `HELD` up
+//! without checking the word would lose a change made during its delivery,
+//! and a fall and rise during a delivery without `FELL` would reach an edge
+//! host as a steady 1. Run them with
+//! `RUSTFLAGS="--cfg loom" cargo test --release --lib intx::loom_tests`.
 
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU64, Ordering::*};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicU64, Ordering::*};
 use std::sync::{Arc, Weak};
+
+use crossbeam_utils::CachePadded;
 
 use crate::irq::{InterruptController, IrqLine};
 use crate::pci::PciHost;
-
-#[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
-#[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
 
 /// A board interrupt that is not a PCI pin but shares a host input, for
 /// example one chip's interrupt on a Bridge pin.
@@ -55,174 +62,109 @@ pub struct IntxRouting {
     pub board_irqs: &'static [u8],
 }
 
-/// Lines `0..PIN_LINES` are pins; board IRQ `n` is line `PIN_LINES + n`. Line
-/// `l` is bit `l % 64` of word `l / 64`, so the board IRQs are the third word.
-const PIN_LINES: u32 = 32 * 4;
+/// Lines `0..PIN_LINES` are pins; board IRQ `n` is line `PIN_LINES + n`.
+const PIN_LINES: usize = 32 * 4;
 
-/// Bits of [`Out::state`].
-const DIRTY: u8 = 1; // a level changed since the holder last took the flags
-const HELD: u8 = 2; // someone is calling the host for this output
-const FELL: u8 = 4; // the output went 1 to 0 since the last delivery
-const FORCE: u8 = 8; // send the current level even though the host has it
-
-/// What drives one output, and its delivery state.
-struct Out {
-    /// The lines routed here, by word.
-    mask: [u64; 3],
-    state: AtomicU8,
-    /// The level the host has; the holder's alone.
-    last: AtomicBool,
-}
-
-/// Where a test hook runs: after a lower's `fetch_and` and before it works
-/// out the output's level, or just before the holder gives up `HELD`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Point {
-    Lowered,
-    Releasing,
-}
+/// The flags at the top of an output's word; its lines are the bits below.
+const HELD: u64 = 1 << 63; // someone is calling the host for this output
+const FELL: u64 = 1 << 62; // the output went 1 to 0 while held
+const FORCE: u64 = 1 << 61; // send the level even though the host has it
+const LINES: u64 = FORCE - 1;
 
 pub(super) struct Combiner {
     up: Weak<dyn PciHost>,
-    /// Every line's level: pins in words 0 and 1, board IRQs in word 2.
-    lines: [AtomicU64; 3],
-    /// Per device, the output of INTA..INTD.
-    route: Box<[[Option<u8>; 4]]>,
-    board_irq_out: &'static [u8],
-    out: Box<[Out]>,
-    /// Lets a test act at the two points a concurrent change can land.
-    #[cfg(test)]
-    hook: std::sync::Mutex<Option<Arc<dyn Fn(Point) + Send + Sync>>>,
+    /// Per line, its output and its bit in that output's word.
+    route: Box<[Option<(u8, u8)>]>,
+    /// Per output, its lines and delivery flags, a cache line each so
+    /// outputs driven from different threads do not contend.
+    out: Box<[CachePadded<AtomicU64>]>,
 }
 
 impl Combiner {
     pub(super) fn new(w: &'static IntxRouting, up: Weak<dyn PciHost>) -> Arc<Self> {
         assert!(w.devices <= 32 && w.board_irqs.len() <= 32, "pci: routing has too many devices or board IRQs");
-        let mut route = vec![[None; 4]; w.devices as usize];
-        let mut out: Vec<Out> =
-            (0..w.irqs).map(|_| Out { mask: [0; 3], state: AtomicU8::new(0), last: AtomicBool::new(false) }).collect();
-        let target = |o: u8| {
-            assert!(o < w.irqs, "pci: routing names output {o} of {}", w.irqs);
-            o as usize
-        };
-        for &(dev, outs) in w.intx {
+        let mut outs = vec![None; PIN_LINES];
+        for &(dev, pins) in w.intx {
             assert!(dev < w.devices, "pci: wiring names device {dev} of {}", w.devices);
-            route[dev as usize] = outs;
-            for (p, o) in outs.iter().enumerate() {
-                if let Some(o) = *o {
-                    let line = dev as usize * 4 + p;
-                    out[target(o)].mask[line / 64] |= 1 << (line % 64);
-                }
-            }
+            outs[dev as usize * 4..][..4].copy_from_slice(&pins);
         }
-        for (i, &o) in w.board_irqs.iter().enumerate() {
-            out[target(o)].mask[2] |= 1 << i;
-        }
-        Arc::new(Self {
-            up,
-            lines: Default::default(),
-            route: route.into(),
-            board_irq_out: w.board_irqs,
-            out: out.into(),
-            #[cfg(test)]
-            hook: Default::default(),
-        })
+        let mut used = vec![0u8; w.irqs as usize];
+        let route = outs.into_iter().chain(w.board_irqs.iter().map(|&o| Some(o))).map(|o| {
+            let o = o?;
+            assert!(o < w.irqs, "pci: routing names output {o} of {}", w.irqs);
+            let bit = used[o as usize];
+            assert!((bit as u32) < LINES.count_ones(), "pci: output {o} has more lines than its word");
+            used[o as usize] += 1;
+            Some((o, bit))
+        });
+        Arc::new(Self { up, route: route.collect(), out: (0..w.irqs).map(|_| Default::default()).collect() })
+    }
+
+    /// The line of device `dev`'s pin (1 = INTA), routed or not.
+    fn pin(dev: u8, pin: u8) -> Option<usize> {
+        (dev < 32 && (1..=4).contains(&pin)).then(|| dev as usize * 4 + pin as usize - 1)
     }
 
     /// The line of device `dev`'s pin (1 = INTA), or None if the wiring
     /// does not route it.
     pub(super) fn pin_line(self: &Arc<Self>, dev: u8, pin: u8) -> Option<IrqLine> {
-        let routed = self.route.get(dev as usize)?.get(pin as usize - 1)?.is_some();
-        routed.then(|| IrqLine::new(self.clone(), dev as u32 * 4 + pin as u32 - 1))
+        let l = Self::pin(dev, pin)?;
+        self.route[l].map(|_| IrqLine::new(self.clone(), l as u32))
     }
 
     /// The output device `dev`'s pin (1 = INTA) is routed to.
     pub(super) fn output(&self, dev: u8, pin: u8) -> Option<u8> {
-        *self.route.get(dev as usize)?.get(pin as usize - 1)?
+        Some(self.route[Self::pin(dev, pin)?]?.0)
     }
 
     pub(super) fn board_irq_line(self: &Arc<Self>, w: BoardIrq) -> IrqLine {
-        assert!((w.0 as usize) < self.board_irq_out.len(), "pci: no board IRQ {}", w.0);
-        IrqLine::new(self.clone(), PIN_LINES + w.0 as u32)
+        assert!(PIN_LINES + (w.0 as usize) < self.route.len(), "pci: no board IRQ {}", w.0);
+        IrqLine::new(self.clone(), (PIN_LINES + w.0 as usize) as u32)
     }
 
-    /// The output line `line` is routed to, if any.
-    fn output_of(&self, line: u32) -> Option<usize> {
-        let o = if line < PIN_LINES {
-            (*self.route.get((line / 4) as usize)?.get((line % 4) as usize)?)?
-        } else {
-            *self.board_irq_out.get((line - PIN_LINES) as usize)?
+    /// Apply `f` to output `o`'s word in one read-modify-write, and deliver
+    /// unless the word did not change or someone else holds it.
+    fn change(&self, o: usize, f: impl Fn(u64) -> u64) {
+        let mut old = self.out[o].load(Relaxed);
+        let new = loop {
+            let n = f(old);
+            if n == old {
+                return;
+            }
+            let fell = old & HELD != 0 && old & LINES != 0 && n & LINES == 0;
+            let n = n | HELD | if fell { FELL } else { 0 };
+            match self.out[o].compare_exchange_weak(old, n, AcqRel, Relaxed) {
+                Ok(_) => break n,
+                Err(w) => old = w,
+            }
         };
-        Some(o as usize)
-    }
-
-    /// Whether anything routed to an output is high, given word `i` as it
-    /// is now unless `known` supplies it.
-    fn any_high(&self, m: &Out, known: Option<(usize, u64)>) -> bool {
-        (0..3).any(|i| {
-            let word = match known {
-                Some((k, w)) if k == i => w,
-                _ => self.lines[i].load(Relaxed),
-            };
-            word & m.mask[i] != 0
-        })
-    }
-
-    fn set_line_level(&self, line: u32, level: bool) {
-        let Some(o) = self.output_of(line) else { return };
-        let (w, bit) = ((line / 64) as usize, 1u64 << (line % 64));
-        if level {
-            self.lines[w].fetch_or(bit, Relaxed);
-            return self.kick(o, 0);
-        }
-        let old = self.lines[w].fetch_and(!bit, Relaxed);
-        self.at(Point::Lowered);
-        // Whether the output fell, from `old` and not from a later read of
-        // this word, so a rise that follows cannot hide the fall. (A rise in
-        // another word is read as it is now; that is the limit of doing this
-        // without a lock.)
-        let fell = old & bit != 0 && !self.any_high(&self.out[o], Some((w, old & !bit)));
-        self.kick(o, if fell { FELL } else { 0 });
-    }
-
-    #[cfg(test)]
-    fn at(&self, p: Point) {
-        // Not under the lock: a hook may change levels, which comes back here.
-        let h = self.hook.lock().unwrap().clone();
-        if let Some(h) = h {
-            h(p);
+        if old & HELD == 0 {
+            self.deliver(o, new, old & LINES != 0);
         }
     }
 
-    #[cfg(not(test))]
-    #[inline(always)]
-    fn at(&self, _: Point) {}
-
-    /// Deliver output `o` if nobody else is; whoever is will see `DIRTY`.
-    fn kick(&self, o: usize, flags: u8) {
-        let m = &self.out[o];
-        if m.state.fetch_or(DIRTY | HELD | flags, AcqRel) & HELD != 0 {
-            return;
-        }
+    /// Tell the host output `o`'s level as word `w` has it, then give up
+    /// `HELD` if the word is still `w`; otherwise take the flags and go
+    /// round again. `host` is the level the host has.
+    fn deliver(&self, o: usize, mut w: u64, mut host: bool) {
+        let mut flags = w;
         loop {
-            let s = m.state.fetch_and(!(DIRTY | FELL | FORCE), AcqRel);
-            let v = self.any_high(m, None);
-            let mut last = m.last.load(Relaxed);
+            let v = w & LINES != 0;
             if let Some(up) = self.up.upgrade() {
-                if s & FELL != 0 && v && last {
+                if flags & FELL != 0 && v && host {
                     up.set_irq(o as u8, false);
-                    last = false;
+                    host = false;
                 }
-                if s & FORCE != 0 || v != last {
+                if flags & FORCE != 0 || v != host {
                     up.set_irq(o as u8, v);
                 }
             }
-            m.last.store(v, Relaxed);
-            self.at(Point::Releasing);
-            // Fails if a change landed meanwhile: go again.
-            if m.state.compare_exchange(HELD, 0, AcqRel, Relaxed).is_ok() {
+            host = v;
+            if self.out[o].compare_exchange(w, w & LINES, AcqRel, Relaxed).is_ok() {
                 return;
             }
+            flags = self.out[o].fetch_and(!(FELL | FORCE), AcqRel);
+            w = flags & !(FELL | FORCE);
         }
     }
 
@@ -230,56 +172,64 @@ impl Combiner {
     /// already has it.
     pub(super) fn redrive(&self) {
         for o in 0..self.out.len() {
-            self.kick(o, FORCE);
+            self.change(o, |w| w | FORCE);
         }
     }
 
-    /// Each output's (dirty, fell, last), for a test to compare.
+    /// Each output's (held, fell, force), for a test to compare.
     #[cfg(test)]
     pub(super) fn flags(&self) -> Vec<(bool, bool, bool)> {
-        self.out.iter().map(|m| {
-            let s = m.state.load(SeqCst);
-            (s & DIRTY != 0, s & FELL != 0, m.last.load(SeqCst))
-        }).collect()
+        let f = |w: u64| (w & HELD != 0, w & FELL != 0, w & FORCE != 0);
+        self.out.iter().map(|m| f(m.load(SeqCst))).collect()
     }
 
-    /// Latch every output's `FELL` and `DIRTY`, as a delivery interrupted
+    /// Latch every output's `HELD` and `FELL`, as a delivery interrupted
     /// mid-flight would leave them.
     #[cfg(test)]
     pub(super) fn out_force_flags(&self) {
         for m in self.out.iter() {
-            m.state.fetch_or(FELL | DIRTY, SeqCst);
+            m.fetch_or(HELD | FELL, SeqCst);
         }
     }
 
     /// The pin words and the wire word, for a snapshot.
     pub(super) fn save(&self) -> (u64, u64, u32) {
-        (self.lines[0].load(SeqCst), self.lines[1].load(SeqCst), self.lines[2].load(SeqCst) as u32)
+        let mut s = [0u64; 3];
+        for (l, r) in self.route.iter().enumerate() {
+            if let Some((o, b)) = *r {
+                s[l / 64] |= (self.out[o as usize].load(SeqCst) >> b & 1) << (l % 64);
+            }
+        }
+        (s[0], s[1], s[2] as u32)
     }
 
-    /// Replace the levels outright and forget delivery state. The host is
-    /// taken to have the loaded levels, as a host that restores its own copy
-    /// (the Bridge's pin levels) does; `redrive` tells one that does not.
+    /// Replace the levels outright and drop any delivery in flight. The host
+    /// is taken to have the loaded levels, as a host that restores its own
+    /// copy (the Bridge's pin levels) does; `redrive` tells one that does not.
     pub(super) fn load(&self, w: (u64, u64, u32)) {
-        self.lines[0].store(w.0, SeqCst);
-        self.lines[1].store(w.1, SeqCst);
-        self.lines[2].store(w.2 as u64, SeqCst);
-        for m in self.out.iter() {
-            m.state.store(0, SeqCst);
-            m.last.store(self.any_high(m, None), Relaxed);
+        let (s, mut words) = ([w.0, w.1, w.2 as u64], vec![0u64; self.out.len()]);
+        for (l, r) in self.route.iter().enumerate() {
+            if let Some((o, b)) = *r {
+                words[o as usize] |= (s[l / 64] >> (l % 64) & 1) << b;
+            }
+        }
+        for (m, v) in self.out.iter().zip(words) {
+            m.store(v, SeqCst);
         }
     }
 }
 
 impl InterruptController for Combiner {
     fn set_line(&self, line: u32, level: bool) {
-        self.set_line_level(line, level);
+        let Some(&Some((o, b))) = self.route.get(line as usize) else { return };
+        self.change(o as usize, |w| if level { w | 1 << b } else { w & !(1 << b) });
     }
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use crate::pci::PciDma;
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::Mutex;
@@ -510,22 +460,21 @@ mod tests {
     }
 
     #[test]
-    fn load_resets_dirty_and_fell_and_takes_last_from_the_levels() {
+    fn load_replaces_the_levels_and_drops_a_delivery_in_flight() {
         let (h, c) = rig();
         let p = c.pin_line(1, 1).unwrap();
         p.set(true);
         let saved = c.save();
-        // A fall that nobody delivered: `fell` is latched and `dirty` set.
-        c.out[0].state.fetch_or(FELL | DIRTY, SeqCst);
         p.set(false);
+        c.out_force_flags();
         c.load(saved);
         assert_eq!(c.save(), saved);
-        assert_eq!(c.out[0].state.load(SeqCst), 0, "no flag left");
-        assert!(c.out[0].last.load(SeqCst), "the host is taken to have the saved level");
-        // A redrive tells the host the saved level whatever it held.
+        assert!(c.flags().iter().all(|&f| f == (false, false, false)), "no flag left");
         let n = h.log().len();
         c.redrive();
-        assert_eq!(h.log()[n], (0, true));
+        assert_eq!(h.log()[n], (0, true), "the host is told the saved level whatever it held");
+        p.set(false);
+        assert_eq!(h.log().last(), Some(&(0, false)));
     }
 
     /// A host that restores its own copy of the levels (the Bridge keeps its
@@ -543,120 +492,119 @@ mod tests {
         p.set(true);
         assert_eq!(h.log(), vec![(0, false), (0, true)]);
     }
-
-    /// A mutator that has set `DIRTY` and found `HELD` set returns; the
-    /// holder must see the flag when it tries to give up. The hook plays that
-    /// mutator in the window just before the holder does.
-    #[test]
-    fn a_hook_lower_just_before_the_holder_gives_up_is_still_delivered() {
-        let (h, c) = rig();
-        let p = c.pin_line(1, 1).unwrap();
-        let fired = Arc::new(AtomicBool::new(false));
-        {
-            let (fired, c2) = (fired.clone(), c.clone());
-            *c.hook.lock().unwrap() = Some(Arc::new(move |at| {
-                if at == Point::Releasing && !fired.swap(true, SeqCst) {
-                    c2.lines[0].fetch_and(!(1 << 4), SeqCst);
-                    let held = c2.out[0].state.fetch_or(DIRTY | HELD, SeqCst) & HELD != 0;
-                    assert!(held, "the holder still holds the output");
-                }
-            }));
-        }
-        p.set(true);
-        assert!(fired.load(SeqCst));
-        assert_eq!(h.log(), vec![(0, true), (0, false)]);
-    }
-
-    /// Another source rises between a lower's `fetch_and` and its work on
-    /// the output's level. The lower took the output to 0 (and the rise
-    /// took it back), so the host must see 0 then 1; a level read after the
-    /// lower would find the output high and see no fall. (A rise in the
-    /// other word, or from the other kind of source, is read as it is when
-    /// the lower works out the level; that is the limit of doing this
-    /// without a lock.)
-    #[test]
-    fn a_rise_between_the_lower_and_its_level_still_latches_the_fall() {
-        for wire in [false, true] {
-            let (h, c) = rig();
-            let (x, y) = if wire {
-                (c.board_irq_line(BoardIrq(0)), c.board_irq_line(BoardIrq(2)))
-            } else {
-                (c.pin_line(1, 1).unwrap(), c.pin_line(2, 1).unwrap())
-            };
-            x.set(true);
-            let fired = Arc::new(AtomicBool::new(false));
-            let fired2 = fired.clone();
-            *c.hook.lock().unwrap() = Some(Arc::new(move |at| {
-                if at == Point::Lowered && !fired2.swap(true, SeqCst) {
-                    y.set(true);
-                }
-            }));
-            x.set(false);
-            assert_eq!(h.log(), vec![(0, true), (0, false), (0, true)], "wire: {wire}");
-        }
-    }
 }
 
-/// Every interleaving of a few threads changing lines, checked by loom (run
-/// with `RUSTFLAGS="--cfg loom"`). The handshake is read-modify-writes on
-/// one word, so acquire-release is what these runs check; the tests above
-/// cannot, because x86 hardware does not reorder such operations.
+/// Every interleaving of a few threads changing one output, checked by loom
+/// (see the module comment for how to run it).
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::pci::PciDma;
     use loom::sync::atomic::{AtomicBool, AtomicU32};
-    use loom::sync::Arc;
+    use loom::sync::Mutex;
     use loom::thread;
 
-    /// Counts deliveries, remembers the last level, and notices two
-    /// deliveries to one output at once.
+    /// Logs every level it is told and notices two deliveries at once.
     struct Host {
-        last: AtomicBool,
+        log: Mutex<Vec<bool>>,
         inside: AtomicU32,
         overlapped: AtomicBool,
     }
 
     impl PciHost for Host {
-        fn dma_for(&self, _: u8) -> std::sync::Arc<dyn PciDma> {
+        fn dma_for(&self, _: u8) -> Arc<dyn PciDma> {
             unreachable!()
         }
         fn set_irq(&self, _: u8, level: bool) {
             if self.inside.fetch_add(1, SeqCst) != 0 {
                 self.overlapped.store(true, SeqCst);
             }
-            self.last.store(level, SeqCst);
+            self.log.lock().unwrap().push(level);
             self.inside.fetch_sub(1, SeqCst);
         }
     }
 
-    static W: IntxRouting = IntxRouting { devices: 4, irqs: 1, intx: &[(1, [Some(0), None, None, None]), (2, [Some(0), None, None, None])], board_irqs: &[] };
+    // Device 1 INTA and device 2 INTA share the one output.
+    static W: IntxRouting =
+        IntxRouting { devices: 4, irqs: 1, intx: &[(1, [Some(0), None, None, None]), (2, [Some(0), None, None, None])], board_irqs: &[] };
 
-    /// Two sources of one output change at once. Whatever the order, the
-    /// last level the host hears is the output's level, and no two
-    /// deliveries overlap.
+    fn rig() -> (Arc<Host>, Arc<Combiner>, IrqLine, IrqLine) {
+        let host = Arc::new(Host { log: Mutex::new(Vec::new()), inside: AtomicU32::new(0), overlapped: AtomicBool::new(false) });
+        let up: Weak<dyn PciHost> = Arc::downgrade(&(host.clone() as Arc<dyn PciHost>));
+        let c = Combiner::new(&W, up);
+        let (a, b) = (c.pin_line(1, 1).unwrap(), c.pin_line(2, 1).unwrap());
+        (host, c, a, b)
+    }
+
+    /// No two deliveries overlapped, the levels alternate, the last is the
+    /// output's level, and no flag is left set.
+    fn settled(host: &Host, c: &Combiner) {
+        assert!(!host.overlapped.load(SeqCst));
+        let w = c.out[0].load(SeqCst);
+        assert_eq!(w & !LINES, 0, "nothing left pending");
+        let log = host.log.lock().unwrap();
+        assert!(log.windows(2).all(|p| p[0] != p[1]), "levels alternate: {log:?}");
+        assert_eq!(log.last().copied().unwrap_or(false), w & LINES != 0, "{log:?}");
+    }
+
+    /// Two sources of one output change at once. A holder that gave `HELD`
+    /// up without checking the word would lose a change made during its
+    /// delivery and leave the host with a stale level.
     #[test]
-    fn the_host_ends_with_the_outputs_level() {
+    fn a_change_during_a_delivery_is_not_lost() {
         loom::model(|| {
-            let host = std::sync::Arc::new(Host { last: AtomicBool::new(false), inside: AtomicU32::new(0), overlapped: AtomicBool::new(false) });
-            let up: Weak<dyn PciHost> = std::sync::Arc::downgrade(&(host.clone() as std::sync::Arc<dyn PciHost>));
-            let c = Combiner::new(&W, up);
-            let (a, b) = (c.pin_line(1, 1).unwrap(), c.pin_line(2, 1).unwrap());
+            let (host, c, a, b) = rig();
             a.set(true);
-            let t = {
-                let a = a.clone();
-                thread::spawn(move || {
-                    a.set(false);
-                    a.set(true);
-                })
-            };
+            let t = thread::spawn(move || {
+                a.set(false);
+                a.set(true);
+            });
             b.set(true);
             b.set(false);
             t.join().unwrap();
+            settled(&host, &c);
+        });
+    }
+
+    /// Three threads on one output, one of them only lowering.
+    #[test]
+    fn three_threads_end_with_the_outputs_level() {
+        loom::model(|| {
+            let (host, c, a, b) = rig();
+            let ta = {
+                let a = a.clone();
+                thread::spawn(move || {
+                    a.set(true);
+                    a.set(false);
+                })
+            };
+            let tb = thread::spawn(move || b.set(true));
+            a.set(false);
+            ta.join().unwrap();
+            tb.join().unwrap();
+            settled(&host, &c);
+        });
+    }
+
+    /// A line falls and rises while another thread may hold the output (a
+    /// redrive). However they interleave, the host hears a 0 and then a 1
+    /// after it; without `FELL` it could hear a steady 1, which the Bridge
+    /// would not send as an interrupt.
+    #[test]
+    fn a_fall_and_rise_during_a_delivery_reaches_the_host_as_two_edges() {
+        loom::model(|| {
+            let (host, c, a, _) = rig();
+            a.set(true);
+            let c2 = c.clone();
+            let t = thread::spawn(move || c2.redrive());
+            a.set(false);
+            a.set(true);
+            t.join().unwrap();
             assert!(!host.overlapped.load(SeqCst));
-            let level = c.lines[0].load(SeqCst) & c.out[0].mask[0] != 0;
-            assert_eq!(host.last.load(SeqCst), level);
-            assert_eq!(c.out[0].state.load(SeqCst), 0, "nothing left pending");
+            let log = host.log.lock().unwrap();
+            let fall = log.iter().position(|&l| !l).expect("a fall reached the host");
+            assert!(log[fall..].contains(&true) && *log.last().unwrap(), "{log:?}");
+            assert_eq!(c.out[0].load(SeqCst) & !LINES, 0, "nothing left pending");
         });
     }
 }
