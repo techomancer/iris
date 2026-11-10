@@ -327,6 +327,9 @@ shared_memory = { version = "0.12" }
 raw_sync      = { version = "0.1" }
 iris-hostcall = { path = "iris-hostcall", optional = true }
 iris-hostgl = { path = "iris-hostgl", optional = true }
+# JUnit reports from `iris-bench run --junit` and the bare-metal suite tests,
+# so CI names each failing guest test.
+junit-report = "0.9"
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 
