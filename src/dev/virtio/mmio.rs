@@ -425,5 +425,8 @@ mod tests {
         assert_eq!(phys.read16(ring + 0x402).data, 1u16.swap_bytes());
         assert_eq!(phys.read32(ring + 0x404).data, 0);
         assert_eq!(phys.read32(ring + 0x408).data, 0);
+        // The device holds the bus as its memory and the bus holds the
+        // device: let go, or neither is freed, nor is the bus's decode table.
+        phys.release_devices();
     }
 }
