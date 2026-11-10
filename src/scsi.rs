@@ -3,7 +3,7 @@ use std::io;
 mod attach;
 mod bus;
 
-pub use attach::{attach_failed, attach_from_config, Attached, DaynaportRef, TableRef};
+pub use attach::{attach_failed, attach_from_config, attach_table, Attached, DaynaportRef, TableRef};
 pub use bus::{ScsiBus, ScsiIdentities, ScsiTarget, Targets};
 
 use crate::block_node::{Background, ChangerNode, Removable, BlockNode};

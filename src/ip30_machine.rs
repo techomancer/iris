@@ -141,6 +141,9 @@ pub struct OctaneMachine {
     virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     /// The NVMe card (`[nvme]`), in a slot of an option board.
     nvme: Option<Arc<crate::dev::nvme::Nvme>>,
+    /// The Fibre Channel adapter (`[fibre_channel]`), in a slot of an option
+    /// board, with its loop of disks.
+    fibre: Option<Arc<crate::dev::isp2200::Isp2200>>,
     flash: Arc<CfiFlash>,
     /// The IMPACT board, when `[graphics] board` names one.
     pub gfx: Option<Arc<ImpactXio>>,
@@ -285,6 +288,22 @@ impl OctaneMachine {
             })
             .transpose()?;
         disks.extend(nvme.as_ref().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)));
+        let fibre = cfg.fibre_channel.as_ref()
+            .map(|fc| -> Result<_, String> {
+                // `validate` found the board; the slot may still be taken.
+                let board = &xio_boards[fc.board.unwrap_or(0)];
+                let slot = fc.slot.or_else(|| board.free_slot()).ok_or("[fibre_channel]: the board has no free slot")?;
+                board.check_slot(slot).map_err(|e| format!("[fibre_channel]: {e}"))?;
+                let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci)?;
+                card.fit(board.bus(), slot);
+                eprintln!(
+                    "iris: Fibre Channel in the {} on XIO slot {}, slot {slot}, {} loop disk(s)",
+                    board.kind().label(), board.widget(), fc.disks.len()
+                );
+                Ok(card.fc)
+            })
+            .transpose()?;
+        disks.extend(cfg.fibre_channel.iter().flat_map(crate::dev::isp2200::card::disk_refs));
         let ioc3 = Arc::new(Ioc3::octane(mac, false));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = Ioc3Eth::new(mac);
@@ -509,6 +528,11 @@ impl OctaneMachine {
         if let Some(n) = &nvme {
             monitor.register_device(n.clone());
         }
+        // `scsi2` and `cow2`: the Fibre Channel loop's disks.
+        if let Some(f) = &fibre {
+            monitor.register_device(f.clone());
+            f.register_locks();
+        }
         monitor.register_device(phys.phys.clone());
         monitor.register_device(Arc::new(Ip30Monitor {
             phys: phys.clone(),
@@ -582,6 +606,7 @@ impl OctaneMachine {
             rad,
             virtio,
             nvme,
+            fibre,
             flash,
             gfx,
             vpro,
@@ -692,6 +717,9 @@ impl OctaneMachine {
         }
         if let Some(n) = &self.nvme {
             d.push(n.clone());
+        }
+        if let Some(f) = &self.fibre {
+            d.push(f.clone());
         }
         if let Some(g) = &self.gfx {
             d.push(g.clone());
@@ -865,15 +893,22 @@ struct OctaneSnapshot {
     overlays: [Option<OverlaySets>; 2],
     /// The NVMe disk's, when the snapshot has them.
     nvme_overlays: Option<OverlaySets>,
+    /// The Fibre Channel loop's, when the snapshot has them.
+    fibre_overlays: Option<OverlaySets>,
     dir: std::path::PathBuf,
 }
 
 impl OctaneMachine {
     /// The SCSI buses that hold disks: both controllers', then the NVMe
-    /// card's namespace.
+    /// card's namespace and the Fibre Channel loop.
     fn disk_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
         use crate::scsi_monitor::ScsiTargets;
-        self.scsi.iter().map(|c| c.bus()).chain(self.nvme.iter().map(|n| n.scsi_bus())).collect()
+        self.scsi
+            .iter()
+            .map(|c| c.bus())
+            .chain(self.nvme.iter().map(|n| n.scsi_bus()))
+            .chain(self.fibre.iter().map(|f| f.scsi_bus()))
+            .collect()
     }
 
     /// Why this machine cannot be saved, when it cannot.
@@ -891,6 +926,9 @@ impl OctaneMachine {
         }
         if let Some(n) = &self.nvme {
             t.value("nvme", n.save_state());
+        }
+        if let Some(f) = &self.fibre {
+            t.value("fibre_channel", f.save_state());
         }
         t
             .value("ioc3", self.ioc3.save_state())
@@ -919,6 +957,9 @@ impl OctaneMachine {
         load("rad", &*self.rad)?;
         if let Some(n) = &self.nvme {
             load("nvme", &**n)?;
+        }
+        if let Some(f) = &self.fibre {
+            load("fibre_channel", &**f)?;
         }
         load("flash", &*self.flash)?;
         let lines = field(v, "flash_lines")?.as_array().filter(|l| l.len() == self.flash_lines.len())
@@ -996,6 +1037,12 @@ impl OctaneMachine {
             let overlays = n.export_overlays(&dir).map_err(|e| format!("COW overlay export (NVMe): {e}"))?;
             snap.write_toml("cow_nvme.toml", &crate::machine::build_cow_table(overlays)).map_err(io)?;
         }
+        if let Some(f) = &self.fibre {
+            let dir = snap.dir.join("fibre_channel");
+            std::fs::create_dir_all(&dir).map_err(io)?;
+            let overlays = f.bus().export_overlays(&dir).map_err(|e| format!("COW overlay export (Fibre Channel): {e}"))?;
+            snap.write_toml("cow_fibre_channel.toml", &crate::machine::build_cow_table(overlays)).map_err(io)?;
+        }
         Ok(())
     }
 
@@ -1051,6 +1098,7 @@ impl OctaneMachine {
             return Err(format!("saved flash is {} bytes, this Octane's holds {}", flash.len(), self.flash.size()));
         }
         let nvme_overlays = snap.read_toml("cow_nvme.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
+        let fibre_overlays = snap.read_toml("cow_fibre_channel.toml").ok().map(|t| crate::machine::parse_cow_table(&t));
         Ok(OctaneSnapshot {
             cpu: state("cpu")?,
             board: state("octane")?,
@@ -1058,6 +1106,7 @@ impl OctaneMachine {
             memory,
             overlays,
             nvme_overlays,
+            fibre_overlays,
             dir: snap.dir,
         })
     }
@@ -1080,6 +1129,10 @@ impl OctaneMachine {
         }
         if let (Some(n), Some(sets)) = (&self.nvme, &s.nvme_overlays) {
             n.import_overlays(&s.dir.join("nvme"), sets).map_err(|e| format!("COW overlay import (NVMe): {e}"))?;
+        }
+        if let (Some(f), Some(sets)) = (&self.fibre, &s.fibre_overlays) {
+            f.bus().import_overlays(&s.dir.join("fibre_channel"), sets)
+                .map_err(|e| format!("COW overlay import (Fibre Channel): {e}"))?;
         }
         self.load_board(&s.board)
     }
@@ -1634,6 +1687,64 @@ mod snapshot_tests {
     #[test]
     fn an_nvme_card_is_fitted_in_a_shoehorn() {
         nvme_in_a_slot(crate::dev::xio_pci::Kind::Shoehorn, None, false);
+    }
+
+    /// `[fibre_channel]` puts the adapter in a slot of an option board with
+    /// its disks on the loop. The machine starts
+    /// and stops it with the other parts, records the disks, and a snapshot
+    /// takes back what each disk's overlay held when it was saved.
+    fn fibre_in_a_slot(kind: crate::dev::xio_pci::Kind, slot: Option<u8>) {
+        use crate::config::XioBoardConfig;
+        use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
+        use crate::scsi_monitor::ScsiTargets;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+            let dir = scratch(&format!("fc-{}-{}", kind.name(), slot.unwrap_or(0)));
+            let prom = empty_prom(&dir);
+            let mut disks = String::new();
+            for id in [3u8, 9] {
+                let disk = dir.join(format!("loop{id}.raw"));
+                std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+                disks.push_str(&format!("[fibre_channel.disk.{id}]\npath = \"{}\"\noverlay = true\n", disk.display()));
+            }
+            let slot_key = slot.map_or(String::new(), |s| format!("slot = {s}\n"));
+            let fc: crate::config::MachineConfig = toml::from_str(&format!("[fibre_channel]\n{slot_key}{disks}")).unwrap();
+            let mut m = machine_with(&prom, &dir, |cfg| {
+                cfg.xio_board = vec![XioBoardConfig { kind, widget: None }];
+                cfg.fibre_channel = fc.fibre_channel;
+            });
+            let slot = slot.unwrap_or(1);
+            let at = DevFn { device: slot, function: 0 };
+            let class = m.xio_boards[0].bus().config_read(at, 8, 4).map(|d| d >> 8);
+            assert_eq!(class, Some(0x0c_0400), "the Fibre Channel card in the slot");
+            let onboard: Vec<u8> = (0..8).filter(|&d| m.bridge.bus().occupied(d)).collect();
+            assert_eq!(onboard, [0, 1, 2, 3], "the onboard Bridge keeps its own devices");
+            for id in [3u8, 9] {
+                let want = crate::dev::isp2200::card::SNAPSHOT_BASE + id;
+                assert!(m.disks.iter().any(|d| d.id == want && d.size_bytes == 1 << 20), "disk {id} in the manifest");
+            }
+
+            let fc = m.fibre.clone().unwrap();
+            let io = |id: u8, cdb: Vec<u8>, data: Option<Vec<u8>>| {
+                let req = ScsiRequest { cdb, data_len: ScsiDataLength::Unlimited, data_in: data };
+                fc.scsi_bus().request(id, &req).unwrap().unwrap().data
+            };
+            let rw = |op: u8| vec![op, 0, 0, 0, 0, 3, 0, 0, 1, 0];
+            io(3, rw(scsi_cmd::WRITE_10), Some(vec![0x11; 512]));
+            io(9, rw(scsi_cmd::WRITE_10), Some(vec![0x99; 512]));
+            m.save_snapshot("s").unwrap();
+            assert!(m.saves.join("s/fibre_channel").is_dir(), "the overlays go with the snapshot");
+            io(3, rw(scsi_cmd::WRITE_10), Some(vec![0x22; 512]));
+            assert_eq!(io(3, rw(scsi_cmd::READ_10), None), vec![0x22; 512]);
+            m.load_snapshot("s").unwrap();
+            assert_eq!(io(3, rw(scsi_cmd::READ_10), None), vec![0x11; 512], "disk 3 is as saved");
+            assert_eq!(io(9, rw(scsi_cmd::READ_10), None), vec![0x99; 512], "and so is disk 9");
+            m.stop();
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn a_fibre_channel_card_is_fitted_in_a_cage_slot() {
+        fibre_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2));
     }
 
     /// An empty PROM in place of the stock one, so these run anywhere.

@@ -68,8 +68,8 @@ pub const PCI_CLASS_NVME: u32 = 0x01_0802;
 /// The identity of the bridge a `bridge = true` card sits behind: a DEC
 /// 21150, the generic PCI-to-PCI bridge drivers know. Only its type 1 header
 /// is modelled.
-const BRIDGE_VENDOR: u16 = 0x1011;
-const BRIDGE_DEVICE: u16 = 0x0026;
+pub(crate) const BRIDGE_VENDOR: u16 = 0x1011;
+pub(crate) const BRIDGE_DEVICE: u16 = 0x0026;
 
 /// A trace line of category `cat` (a `NVME_LOG_*` bit), stamped with the
 /// microseconds since the controller was made. Nothing is formatted unless

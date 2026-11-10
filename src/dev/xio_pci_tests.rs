@@ -409,3 +409,161 @@ fn an_nvme_card_in_each_slot_of_the_pci_module_masters_ram_and_raises_its_pin() 
 fn an_nvme_card_behind_a_bridge_in_the_pci_module_does_the_same() {
     nvme_in_slot(Kind::Cage, 13, 2, true);
 }
+
+/// A Fibre Channel adapter on a board, driven the way a Fibre Channel driver
+/// drives it: registers through the slot's device window, rings in memory the
+/// card masters through the Bridge's direct map.
+struct FibreHost<'a> {
+    rig: &'a Rig,
+    slot: u8,
+    fc: &'a crate::dev::isp2200::Isp2200,
+}
+
+impl FibreHost<'_> {
+    /// The window address of register `off`. Without the swap bit the Bridge
+    /// keeps a halfword's value and not its place: the register at `off`
+    /// is the halfword at `off ^ 2` (the lane the other half of the word
+    /// takes).
+    fn at(&self, off: u32) -> u64 {
+        u64::from(device_window_offset(self.slot as u32) + (off ^ 2))
+    }
+
+    fn rd(&self, off: u32) -> u16 {
+        let r = self.rig.bridge().read16(self.at(off));
+        assert!(r.is_ok(), "register {off:#x}");
+        r.data
+    }
+
+    /// A register write. A command runs on the adapter's own thread, so wait
+    /// for it before reading what it leaves.
+    fn wr(&self, off: u32, v: u16) {
+        assert_eq!(self.rig.bridge().write16(self.at(off), v), BUS_OK);
+        self.fc.wait_idle();
+    }
+
+    /// A mailbox command and its completion code, then the release.
+    fn call(&self, input: &[u16]) -> u16 {
+        use crate::dev::isp2200::{reg, tests::HCCR_CLEAR_RISC, tests::HCCR_SET_HOST};
+        for (i, &v) in input.iter().enumerate() {
+            self.wr(reg::mbox(i), v);
+        }
+        self.wr(reg::HCCR, HCCR_SET_HOST);
+        let status = self.rd(reg::mbox(0));
+        self.wr(reg::HCCR, HCCR_CLEAR_RISC);
+        self.wr(reg::SEMAPHORE, 0);
+        status
+    }
+
+    /// The firmware download, rings and loop bring-up of a driver attaching.
+    fn attach(&self) {
+        use crate::dev::isp2200::{mbox, reg, tests::*};
+        for i in 0..8u16 {
+            assert_eq!(self.call(&[mbox::WRITE_RAM_WORD, CODE_ORG + i, crate::dev::isp2200::tests::Rig::image_word(usize::from(i))]), mbox::COMPLETE);
+        }
+        assert_eq!(self.call(&[mbox::VERIFY_CHECKSUM, CODE_ORG]), mbox::COMPLETE);
+        assert_eq!(self.call(&[mbox::EXEC_FIRMWARE, CODE_ORG]), mbox::COMPLETE);
+        self.rig.mem.poke(ICB_AT as usize, &icb_build(16, 16, bus(RQST_AT), bus(RESP_AT), 0));
+        let icb = bus(ICB_AT);
+        let m = |v: u64, shift: u32| (v >> shift) as u16;
+        assert_eq!(
+            self.call(&[mbox::INIT_FIRMWARE, 0, m(icb, 16), m(icb, 0), 0, 0, m(icb, 48), m(icb, 32)]),
+            mbox::COMPLETE
+        );
+        // The loop comes up on the adapter's own clock; a LIP and loop up
+        // are posted, each released by the host before the next.
+        self.fc.set_test_clock(crate::dev::isp2200::BRINGUP.as_nanos() as i64);
+        self.fc.wait_idle();
+        for _ in 0..2 {
+            assert_eq!(self.rd(reg::ISR) & 0x8008, 0x8008);
+            self.wr(reg::HCCR, HCCR_CLEAR_RISC);
+            self.wr(reg::SEMAPHORE, 0);
+        }
+    }
+
+    /// One SCSI command to the disk at loop ID `id`, from or to `buf` in
+    /// memory (`write` is the data-out direction), through request ring entry
+    /// `n`. Returns the status entry's SCSI status and completion.
+    fn scsi(&self, n: u16, id: u8, cdb: &[u8], write: bool, buf: u64, len: u32) -> (u16, u16) {
+        use crate::dev::isp2200::{reg, tests::*};
+        let mut e = entry_command(ENTRY_CMD64, 0x7000 + u32::from(n), id, 0, cdb[0]);
+        e[20..20 + cdb.len()].copy_from_slice(cdb);
+        p16(&mut e, 12, if write { 0x40 } else { 0x20 });
+        p32(&mut e, 36, len);
+        p16(&mut e, 18, 1);
+        put_seg64(&mut e, 40, bus(buf as u32), len);
+        self.rig.mem.poke((RQST_AT + u32::from(n) * 64) as usize, &e);
+        self.wr(reg::REQUEST_QUEUE, (n + 1) % 16);
+        let r: Entry = self.rig.mem.peek((RESP_AT + u32::from(n) * 64) as usize, 64).try_into().unwrap();
+        assert_eq!((r[0], g32(&r, 4)), (ENTRY_STATUS, 0x7000 + u32::from(n)));
+        self.wr(reg::RESPONSE_QUEUE, (n + 1) % 16);
+        self.wr(reg::HCCR, HCCR_CLEAR_RISC);
+        (g16(&r, 8), g16(&r, 10))
+    }
+}
+
+/// The PCI address the card uses for memory at `phys`: the Bridge's direct map.
+fn bus(phys: u32) -> u64 {
+    0x8000_0000 + u64::from(phys)
+}
+
+/// A Fibre Channel card in a slot of the PCI module is configured as firmware
+/// would; a driver brings its loop up and writes and reads a disk on it
+/// through ring entries; and the completions reach HEART on the slot's pin.
+#[test]
+fn a_fibre_channel_card_in_the_pci_module_masters_ram_and_raises_its_pin() {
+    let (kind, widget, slot) = (Kind::Cage, 13, 2);
+    use crate::dev::isp2200::card::Card;
+    let rig = Rig::new(kind, widget);
+    let img = crate::dev::nvme::tests::temp_image(&format!("fc-{}-{slot}", kind.name()));
+    let mut cfg = crate::config::FibreChannelConfig::default();
+    cfg.disks.insert(5, crate::config::ScsiDeviceConfig { path: img.to_string_lossy().into_owned(), ..Default::default() });
+    let card = Card::open(&cfg, false).unwrap();
+    rig.board.check_slot(slot).unwrap();
+    card.fit(rig.board.bus(), slot);
+    let cfg_write = |off: u32, size: u32, v: u32| {
+        let (a, w) = (u64::from(CFG0_BASE + u32::from(slot) * 0x1000 + ((off & !3) | ((off & 3) ^ (4 - size)))), size);
+        let s = match w {
+            2 => rig.bridge().write16(a, v as u16),
+            _ => rig.bridge().write32(a, v),
+        };
+        assert_eq!(s, BUS_OK);
+    };
+    rig.set(reg::DIRECT_MAP, HEART_WIDGET << 20);
+    // Programmed accesses are a byte stream too (the swap bit), so a
+    // halfword register reads as the 16-bit value it holds.
+    rig.set(reg::device(slot as u32), DEV_MEMORY_SPACE | DEV_SWAP_DIRECT | 0x130);
+    rig.route(slot as u32, 0x21);
+    // BAR 1 is the memory window; 0x06 is memory decode and bus mastering.
+    let command = PCI_COMMAND_MEMORY | 0x4;
+    cfg_write(0x14, 4, 0x1300_0000);
+    cfg_write(0x04, 2, command);
+    let fc = &*card.fc;
+    crate::traits::Device::start(fc);
+    fc.set_test_clock(0);
+    let host = FibreHost { rig: &rig, slot, fc };
+    // Interrupt enable, then a driver's attach.
+    host.wr(crate::dev::isp2200::reg::ICR, 0x8008);
+    host.attach();
+    rig.heart.take();
+
+    const OUT: u32 = 0x10000;
+    const IN: u32 = 0x12000;
+    let pattern: Vec<u8> = (0..512u32).map(|i| (i * 7 + 3) as u8).collect();
+    rig.mem.poke(OUT as usize, &pattern);
+    let rw10 = |op: u8, lba: u32| {
+        let mut cdb = [0u8; 10];
+        cdb[0] = op;
+        cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+        cdb[8] = 1;
+        cdb
+    };
+    let at = format!("{} slot {slot}", kind.label());
+    assert_eq!(host.scsi(0, 5, &rw10(0x2a, 9), true, u64::from(OUT), 512), (0, 0), "write, {at}");
+    assert_eq!(host.scsi(1, 5, &rw10(0x28, 9), false, u64::from(IN), 512), (0, 0), "read, {at}");
+    assert_eq!(rig.mem.peek(IN as usize, 512), pattern, "{at}");
+    // The completions raised INTA of the slot, Bridge pin `slot`: a packet
+    // for vector 0x21 reached HEART.
+    assert!(rig.heart.take().contains(&(0x21, true)), "{at}");
+    crate::traits::Device::stop(fc);
+    let _ = std::fs::remove_file(img);
+}
