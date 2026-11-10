@@ -73,36 +73,58 @@ the repeated reads. Not pursued; 74% of the time is outside texturing.
 
 ## A tile cache in LDS for the destination: slower (measured 2026-11-09)
 
-Each 8x8 tile's block of every surface it draws to held in workgroup
-memory for the batch (the tile is a quarter of a 16x16 memory tile, so a
-block is 8 contiguous rows of 8 << log2 bytes), fragments reading and
-writing it, the blocks a tile changed stored back once at tile end; lane 0
-planned the directory per primitive, the workgroup fetched and evicted
-between barriers. Exact: the replay's memory hash was unchanged
-(`65a51d3cd35bf925`) and the parity tests passed. Raster GPU time, back
-to back, same binary:
+`VPRO_TILE_CACHE=1` (`shaders/tile_cache.wgsl`, off by default): each 8x8
+tile's block of every surface its primitives draw to is held in workgroup
+memory for the batch (a tile is a quarter of a 16x16 memory tile, so a
+block is 8 contiguous rows of 8 << log2 bytes); fragments read and write
+it; the blocks a tile changed are stored back once at tile end. Lane 0
+plans the directory per primitive, the workgroup fetches (a coalesced
+load or four a lane) and evicts between barriers. Exact: the replay's
+memory hash is unchanged (`65a51d3cd35bf925`), the parity tests pass.
+
+Raster GPU time, back to back:
 
 | kernel | VGPRs | raster |
 |---|---|---|
-| atomics on board memory (as is) | 96 | 5.86 s |
-| fragments in LDS, no fetch or write-back (the ceiling, wrong output) | 96 | 5.65 s |
-| fetch and write-back only, fragments to board memory | 128 | 7.52 s |
-| the whole cache | 128 | 7.83 s |
+| atomics on board memory (default) | 96 | 5.89 s |
+| fragments in LDS, no fetch or write-back (the ceiling, wrong output) | 96 | 5.66 s |
+| first cache: lookup loop, origin and lane held per lane | 128 | 7.88 s |
+| the cache with the register fixes below | 96 | 6.92 s |
 
 - The ceiling is 4%: the atomics' latency is hidden by the other waves;
-  the destination's memory accesses are not what the kernel waits on.
-- The block traffic costs 28%: a batch averages 559 primitives over 9,859
-  busy tiles, so a tile sees one or two primitives and a whole block in
-  and out costs more than the atomics on the fields actually touched. The
-  directory and fetch code also took the kernel from 96 to 128 VGPRs
-  (10 -> 8 waves a SIMD).
-- Larger batches (fewer `note_region` flushes) would raise primitives per
-  tile but not the 4% ceiling.
-- The code is kept, off by default: `VPRO_TILE_CACHE=1` registers
-  `shaders/tile_cache.wgsl` as the raster kernel's `vram_mem.wgsl` (the
-  word operations every kernel's `vram.wgsl` includes). Open: why the
-  directory and fetch code costs 32 VGPRs, when the fetch itself is a few
-  coalesced loads a lane.
+  the destination's accesses are not what the kernel waits on.
+- What is left, +17%, is the block traffic and a barrier a primitive: a
+  batch averages 559 primitives over 9,859 busy tiles, so a tile sees one
+  or two primitives, and a whole block in and out costs more than the
+  atomics on the fields touched. Larger batches (fewer `note_region`
+  flushes) would raise primitives per tile but not the ceiling.
+
+Texel reads through a plain binding instead of `atomicLoad` (`glc dlc`,
+L2): 5.90 -> 5.85 s raster, A/B in one binary, memory hash unchanged.
+Neither the destination's nor the texels' memory round trips are what
+this kernel waits on; an RGP thread trace (instruction timing) is the
+next step, not more static analysis.
+
+**Where the 32 registers went** (Pre-Sched demand; the allocation snaps
+96 -> 128, i.e. 10 -> 8 waves a SIMD, as soon as demand passes ~95):
+- 24: the directory lookup at every field access, a loop to `tc_count`
+  read from workgroup memory, inlined at ~20 sites. Unrolled compares
+  against the four entries (unused ones hold an impossible base): 122 -> 98.
+- 2: the tile origin as `px & ~7`, a per-lane value the next primitive's
+  `tc_prepare` and `tc_end` need, so held across all the fragment code.
+  From the tile index (`batch` fields) it stays in SGPRs: 98 -> 96.
+- 1: the lane index (`v_mbcnt`), held for the same reason; recomputed
+  from (px, py), which the hooks take anyway: 96 -> 95, allocated 96.
+- General rule for this kernel: anything per lane that a later hook needs
+  costs a VGPR across the whole shading path; derive it from values that
+  are live anyway, or from uniform ones.
+- Method: `RADV_DEBUG=shaders,nocache ACO_DEBUG=liveinfo`, then compare
+  the histogram of per-instruction demand of two kernels (a constant
+  shift means values held across the peak, not a new peak) and look up
+  the extra live-in temp's definition. Kernels edited through
+  `IRIS_WGPU_DUMP`/`IRIS_WGPU_LOAD` must be dumped from the same
+  workload: the dump bakes in `VRAM_WORD_MASK`, and a parity test's 4 MiB
+  mask in the 128 MiB replay gave wrong output and wrong timings.
 
 ## Batches: why they end, and the mask walk (2026-11-08)
 

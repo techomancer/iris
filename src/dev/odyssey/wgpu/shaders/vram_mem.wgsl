@@ -31,11 +31,11 @@ fn tile_addr(v: View, a: u32, x: i32, y: i32) -> u32 {
     return a;
 }
 
-fn tc_begin(px: i32, py: i32) {
+fn tc_begin(tile: u32, px: i32, py: i32) {
 }
 
-fn tc_prepare(pi: u32) {
+fn tc_prepare(pi: u32, px: i32, py: i32) {
 }
 
-fn tc_end() {
+fn tc_end(px: i32, py: i32) {
 }

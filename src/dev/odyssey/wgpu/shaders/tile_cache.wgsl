@@ -67,9 +67,28 @@ var<workgroup> tc_ops: array<TcOp, TC_OPS>;
 var<workgroup> tc_nops: u32;
 var<workgroup> tc_new_count: u32;
 
-// The tile's first pixel.
-var<private> tc_x0: i32;
-var<private> tc_y0: i32;
+// The tile (raster.wgsl's index). Its origin is derived from it when
+// needed: a value from the tile index stays in scalar registers, while one
+// derived from the lane's pixel would be a vector register held across all
+// the fragment code (the kernel went 96 -> 128 VGPRs over three of them).
+var<private> tc_tile: u32;
+
+fn tc_x0() -> i32 {
+    return batch.origin_x + i32((tc_tile % batch.tile_cols) * TILE_W);
+}
+
+fn tc_y0() -> i32 {
+    return batch.origin_y + i32((tc_tile / batch.tile_cols) * TILE_H);
+}
+
+// The lane of tile pixel (x, y) (raster.wgsl lane_x, lane_y inverted).
+// The hooks recompute it from the pixel, which is live anyway, instead of
+// holding the lane index across the fragment code.
+fn tc_lane(x: i32, y: i32) -> u32 {
+    let ux = u32(x);
+    let uy = u32(y);
+    return (ux & 1u) | ((uy & 1u) << 1u) | ((ux & 6u) << 1u) | ((uy & 6u) << 3u);
+}
 
 fn vram_word(a: u32) -> u32 {
     if (a & TC_FLAG) != 0u {
@@ -139,8 +158,8 @@ fn tc_mem_index(base: u32, geom: u32, k: u32) -> u32 {
     let per_row = 2u << log2;
     let r = k / per_row;
     let c = k % per_row;
-    let x = u32(tc_x0);
-    let y = u32(tc_y0) + r;
+    let x = u32(tc_x0());
+    let y = u32(tc_y0()) + r;
     let tile = (y >> 4u) * (geom & 0xffffu) + (x >> 4u);
     let row = base + (((tile << 8u) | ((y & 15u) << 4u) | (x & 15u)) << log2);
     return (((row >> 3u) + (c >> 1u)) & VRAM_WORD_MASK) * 2u + (c & 1u);
@@ -148,44 +167,51 @@ fn tc_mem_index(base: u32, geom: u32, k: u32) -> u32 {
 
 fn tc_cacheable(v: View) -> bool {
     return v.kind != KIND_NONE && tc_log2(v.geom) <= TC_LOG2_MAX && (v.base & 7u) == 0u
-        && u32(tc_x0) < view_width(v) && u32(tc_y0) < view_height(v);
+        && u32(tc_x0()) < view_width(v) && u32(tc_y0()) < view_height(v);
 }
 
 // Where view v's field at (x, y), a pixel of this tile at byte address a,
-// is held: in the cache when its surface is resident.
+// is held: in the cache when its surface is resident. The entries are
+// compared unrolled (an entry not in use holds base TC_NONE, which no
+// cacheable view has): a loop to tc_count at every field access cost 24
+// VGPRs.
 fn tile_addr(v: View, a: u32, x: i32, y: i32) -> u32 {
-    let n = tc_count;
     let g = tc_geom_of(v);
-    for (var e = 0u; e < n; e++) {
-        if tc_base[e] == v.base && tc_geom[e] == g {
-            let o = ((u32(y & 7) * 8u + u32(x & 7)) << tc_log2(g)) + (v.geom >> 24u);
-            return TC_FLAG | (e * TC_ENTRY_U32 * 4u + o);
-        }
+    var e = TC_NONE;
+    e = select(e, 3u, tc_base[3] == v.base && tc_geom[3] == g);
+    e = select(e, 2u, tc_base[2] == v.base && tc_geom[2] == g);
+    e = select(e, 1u, tc_base[1] == v.base && tc_geom[1] == g);
+    e = select(e, 0u, tc_base[0] == v.base && tc_geom[0] == g);
+    if e == TC_NONE {
+        return a;
     }
-    return a;
+    let o = ((u32(y & 7) * 8u + u32(x & 7)) << tc_log2(g)) + (v.geom >> 24u);
+    return TC_FLAG | (e * TC_ENTRY_U32 * 4u + o);
 }
 
-fn tc_store_block(e: u32, base: u32, geom: u32) {
+fn tc_store_block(e: u32, base: u32, geom: u32, lane: u32) {
     let n = tc_block_words(geom);
-    for (var k = raster_lane; k < n; k += 64u) {
+    for (var k = lane; k < n; k += 64u) {
         atomicStore(&vram[tc_mem_index(base, geom, k)], atomicLoad(&tc_data[e * TC_ENTRY_U32 + k]));
     }
 }
 
-fn tc_load_block(e: u32, base: u32, geom: u32) {
+fn tc_load_block(e: u32, base: u32, geom: u32, lane: u32) {
     let n = tc_block_words(geom);
-    for (var k = raster_lane; k < n; k += 64u) {
+    for (var k = lane; k < n; k += 64u) {
         atomicStore(&tc_data[e * TC_ENTRY_U32 + k], atomicLoad(&vram[tc_mem_index(base, geom, k)]));
     }
 }
 
-fn tc_begin(px: i32, py: i32) {
-    tc_x0 = px & ~7;
-    tc_y0 = py & ~7;
-    if raster_lane == 0u {
+fn tc_begin(tile: u32, px: i32, py: i32) {
+    tc_tile = tile;
+    if tc_lane(px, py) == 0u {
         tc_count = 0u;
         tc_victim = 0u;
         tc_last = TC_NONE;
+        for (var e = 0u; e < TC_ENTRIES; e++) {
+            tc_base[e] = TC_NONE;
+        }
     }
 }
 
@@ -265,9 +291,11 @@ fn tc_plan(pi: u32) {
     tc_last = select(si, TC_NONE, own);
 }
 
-// Make the surfaces of primitive pi resident; workgroup-uniform.
-fn tc_prepare(pi: u32) {
-    if raster_lane == 0u {
+// Make the surfaces of primitive pi resident; workgroup-uniform. (px, py)
+// is the lane's pixel.
+fn tc_prepare(pi: u32, px: i32, py: i32) {
+    let lane = tc_lane(px, py);
+    if lane == 0u {
         tc_plan(pi);
     }
     let n = workgroupUniformLoad(&tc_nops);
@@ -280,13 +308,13 @@ fn tc_prepare(pi: u32) {
     for (var i = 0u; i < n; i++) {
         let op = tc_ops[i];
         if op.evict != 0u && atomicLoad(&tc_dirty[op.e]) != 0u {
-            tc_store_block(op.e, op.old_base, op.old_geom);
+            tc_store_block(op.e, op.old_base, op.old_geom, lane);
         }
     }
     // Every lane has read the dirty flags before they are cleared, and
     // the directory changes while nobody reads it.
     workgroupBarrier();
-    if raster_lane == 0u {
+    if lane == 0u {
         for (var i = 0u; i < n; i++) {
             tc_base[tc_ops[i].e] = tc_ops[i].base;
             tc_geom[tc_ops[i].e] = tc_ops[i].geom;
@@ -296,17 +324,18 @@ fn tc_prepare(pi: u32) {
     for (var i = 0u; i < n; i++) {
         let op = tc_ops[i];
         atomicStore(&tc_dirty[op.e], 0u);
-        tc_load_block(op.e, op.base, op.geom);
+        tc_load_block(op.e, op.base, op.geom, lane);
     }
     workgroupBarrier();
 }
 
 // Store back the blocks the tile changed; workgroup-uniform.
-fn tc_end() {
+fn tc_end(px: i32, py: i32) {
+    let lane = tc_lane(px, py);
     let n = workgroupUniformLoad(&tc_count);
     for (var e = 0u; e < n; e++) {
         if atomicLoad(&tc_dirty[e]) != 0u {
-            tc_store_block(e, tc_base[e], tc_geom[e]);
+            tc_store_block(e, tc_base[e], tc_geom[e], lane);
         }
     }
 }
