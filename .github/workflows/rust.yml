@@ -38,10 +38,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(
-          github.event_name != 'pull_request' && '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest","macos-26"]' ||
-          github.event.pull_request.draft && '["ubuntu-24.04"]' ||
-          '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest"]') }}
+        # Platforms per event kind; a failure fails the job only where gates is true.
+        include: ${{ fromJSON('{
+          "push":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":false},{"os":"windows-latest","gates":false},{"os":"macos-26","gates":false}],
+          "draft":[{"os":"ubuntu-24.04","gates":true}],
+          "ready":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":false},{"os":"windows-latest","gates":false}]
+          }')[github.event_name != 'pull_request' && 'push' || github.event.pull_request.draft && 'draft' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
     # rust-toolchain.toml pins nightly; `rustup show` installs it up front so a
@@ -64,9 +66,9 @@ jobs:
     # tests never ran — a GUI-only breakage could not turn this red. It needs no
     # extra system packages: wayland, X11 and GL are dlopen'd at runtime, so the
     # only thing it links is libasound, which is already installed above.
-    # Linux x86-64 skips it: its nextest step builds the same code and fails the job.
+    # Gating platforms skip it: their nextest step builds the same code.
     - name: Build
-      if: matrix.os != 'ubuntu-24.04'
+      if: ${{ !matrix.gates }}
       run: cargo build --workspace --verbose
     # Linux compiles the replay example inside the matcher test step below.
     - name: Check REX3 GPU replay
@@ -84,20 +86,20 @@ jobs:
     # The VPro fragment pipeline's SIMD kernels against their scalar
     # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
     # lanes.rs): deterministic, so they gate everywhere. macos-26 and
-    # ubuntu-24.04-arm are the runners with NEON. Linux x86-64 skips it:
-    # its nextest step runs the same tests.
+    # ubuntu-24.04-arm are the runners with NEON. Gating platforms skip it:
+    # their nextest step runs the same tests.
     - name: Run SIMD lane tests
-      if: matrix.os != 'ubuntu-24.04'
+      if: ${{ !matrix.gates }}
       run: cargo test -p iris --lib the_lane_
     # nextest runs each test in its own process and writes the JUnit report
     # the annotations below come from. It does not run doctests.
-    # Only Linux x86-64 fails the job; the other platforms report a failure
+    # Only gating platforms fail the job; the others report a failure
     # (a red step, which the API still counts as a pass) and carry on.
     - name: Run tests
-      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
+      continue-on-error: ${{ !matrix.gates }}
       run: cargo nextest run --workspace --profile ci
     - name: Run doctests
-      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
+      continue-on-error: ${{ !matrix.gates }}
       run: cargo test --workspace --doc
     - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
       if: ${{ !cancelled() }}
@@ -118,7 +120,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04","windows-latest"]' || '["ubuntu-24.04","windows-latest","macos-26"]') }}
+        include: ${{ fromJSON('{
+          "push":[{"os":"ubuntu-24.04"},{"os":"windows-latest"},{"os":"macos-26"}],
+          "ready":[{"os":"ubuntu-24.04"},{"os":"windows-latest"}]
+          }')[github.event_name != 'pull_request' && 'push' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
     - name: Install pinned toolchain
