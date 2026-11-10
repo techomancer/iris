@@ -341,6 +341,10 @@ where they differed:
   Octane's 512-byte image, and its clock in `<nvram>.rtc.clock`, saved
   when the machine stops or switches itself off. Before, both started
   afresh every run. The O2 now honours `[rtc_offset]` too.
+- The Indy and Indigo2 keep their DS1386's clock in `<nvram>.clock` once
+  the guest sets it, and the NVRAM file stays the chip's 8192 bytes.
+  `[rtc_offset]` now seeds only a clock with no such file, so a date the
+  guest sets is no longer replaced by it at the next run.
 
 ### A dropped Octane frees its device table
 
