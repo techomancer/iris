@@ -210,14 +210,14 @@ fn view_load(v: View, x: i32, y: i32) -> Loaded {
     if !view_has(v, x, y) {
         return Loaded(false, 0u);
     }
-    return Loaded(true, load_kind(view_addr(v, x, y), v.kind));
+    return Loaded(true, load_kind(tile_addr(v, view_addr(v, x, y), x, y), v.kind));
 }
 
 fn view_store(v: View, x: i32, y: i32, w: u32) {
     if !view_has(v, x, y) {
         return;
     }
-    let a = view_addr(v, x, y);
+    let a = tile_addr(v, view_addr(v, x, y), x, y);
     let kind = v.kind & 0xffu;
     if kind == KIND_LANES {
         vram_store64(a, 6u, lanes_of(w));

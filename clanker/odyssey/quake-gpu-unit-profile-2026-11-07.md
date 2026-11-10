@@ -71,6 +71,39 @@ barriers a primitive a tile, slivers that fill more than they read, and a
 fallback for footprints that do not fit. The GPU's caches already absorb
 the repeated reads. Not pursued; 74% of the time is outside texturing.
 
+## A tile cache in LDS for the destination: slower (measured 2026-11-09)
+
+Each 8x8 tile's block of every surface it draws to held in workgroup
+memory for the batch (the tile is a quarter of a 16x16 memory tile, so a
+block is 8 contiguous rows of 8 << log2 bytes), fragments reading and
+writing it, the blocks a tile changed stored back once at tile end; lane 0
+planned the directory per primitive, the workgroup fetched and evicted
+between barriers. Exact: the replay's memory hash was unchanged
+(`65a51d3cd35bf925`) and the parity tests passed. Raster GPU time, back
+to back, same binary:
+
+| kernel | VGPRs | raster |
+|---|---|---|
+| atomics on board memory (as is) | 96 | 5.86 s |
+| fragments in LDS, no fetch or write-back (the ceiling, wrong output) | 96 | 5.65 s |
+| fetch and write-back only, fragments to board memory | 128 | 7.52 s |
+| the whole cache | 128 | 7.83 s |
+
+- The ceiling is 4%: the atomics' latency is hidden by the other waves;
+  the destination's memory accesses are not what the kernel waits on.
+- The block traffic costs 28%: a batch averages 559 primitives over 9,859
+  busy tiles, so a tile sees one or two primitives and a whole block in
+  and out costs more than the atomics on the fields actually touched. The
+  directory and fetch code also took the kernel from 96 to 128 VGPRs
+  (10 -> 8 waves a SIMD).
+- Larger batches (fewer `note_region` flushes) would raise primitives per
+  tile but not the 4% ceiling.
+- The code is kept, off by default: `VPRO_TILE_CACHE=1` registers
+  `shaders/tile_cache.wgsl` as the raster kernel's `vram_mem.wgsl` (the
+  word operations every kernel's `vram.wgsl` includes). Open: why the
+  directory and fetch code costs 32 VGPRs, when the fetch itself is a few
+  coalesced loads a lane.
+
 ## Batches: why they end, and the mask walk (2026-11-08)
 
 - Not by size: 559 prims a batch against MAX_PRIMS 4096. With

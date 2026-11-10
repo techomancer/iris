@@ -10,13 +10,15 @@
 // are program-ordered within a lane, which is all the order the kernels
 // need; the partial store is an AND then an OR, each lane touching only
 // its own bits. VRAM_WORD_MASK (words less one) arrives as a define.
+//
+// The word operations themselves (vram_word, mem_load, mem_store, mem_and,
+// mem_or) come from the fragment named vram_mem.wgsl: the plain atomics,
+// or in the raster kernel optionally the tile cache (tile_cache.wgsl),
+// whose addresses with TC_FLAG set are words of workgroup memory.
 
 @group(2) @binding(0) var<storage, read_write> vram: array<atomic<u32>>;
 
-// The u32 index of the low half of the word holding byte address a.
-fn vram_word(a: u32) -> u32 {
-    return ((a >> 3u) & VRAM_WORD_MASK) * 2u;
-}
+#include "vram_mem.wgsl"
 
 fn vram_mask(n: u32) -> u32 {
     return select((1u << (8u * n)) - 1u, 0xffffffffu, n >= 4u);
@@ -28,13 +30,13 @@ fn vram_load(a: u32, n: u32) -> u32 {
     let shift = 64u - 8u * ((a & 7u) + n);
     let m = vram_mask(n);
     if shift >= 32u {
-        return (atomicLoad(&vram[w + 1u]) >> (shift - 32u)) & m;
+        return (mem_load(w + 1u) >> (shift - 32u)) & m;
     }
-    let lo = atomicLoad(&vram[w]);
+    let lo = mem_load(w);
     if shift + 8u * n <= 32u {
         return (lo >> shift) & m;
     }
-    let hi = atomicLoad(&vram[w + 1u]);
+    let hi = mem_load(w + 1u);
     return ((lo >> shift) | (hi << (32u - shift))) & m;
 }
 
@@ -47,29 +49,29 @@ fn vram_store(a: u32, n: u32, v: u32) {
     if shift >= 32u {
         let s = shift - 32u;
         if n == 4u {
-            atomicStore(&vram[w + 1u], v_m);
+            mem_store(w + 1u, v_m);
         } else {
-            atomicAnd(&vram[w + 1u], ~(m << s));
-            atomicOr(&vram[w + 1u], v_m << s);
+            mem_and(w + 1u, ~(m << s));
+            mem_or(w + 1u, v_m << s);
         }
         return;
     }
     if shift + 8u * n <= 32u {
         if n == 4u {
-            atomicStore(&vram[w], v_m);
+            mem_store(w, v_m);
         } else {
-            atomicAnd(&vram[w], ~(m << shift));
-            atomicOr(&vram[w], v_m << shift);
+            mem_and(w, ~(m << shift));
+            mem_or(w, v_m << shift);
         }
         return;
     }
     // Straddling the halves: the value's low 32 - shift bits go to the
     // top of the low half, the rest to the bottom of the high half.
     let lo_bits = 32u - shift;
-    atomicAnd(&vram[w], ~(m << shift));
-    atomicOr(&vram[w], v_m << shift);
-    atomicAnd(&vram[w + 1u], ~(m >> lo_bits));
-    atomicOr(&vram[w + 1u], v_m >> lo_bits);
+    mem_and(w, ~(m << shift));
+    mem_or(w, v_m << shift);
+    mem_and(w + 1u, ~(m >> lo_bits));
+    mem_or(w + 1u, v_m >> lo_bits);
 }
 
 // The n (1 to 8) bytes at byte address a as a 64-bit value, low half
@@ -77,8 +79,8 @@ fn vram_store(a: u32, n: u32, v: u32) {
 fn vram_load64(a: u32, n: u32) -> vec2<u32> {
     let w = vram_word(a);
     let shift = 64u - 8u * ((a & 7u) + n);
-    let lo = atomicLoad(&vram[w]);
-    let hi = atomicLoad(&vram[w + 1u]);
+    let lo = mem_load(w);
+    let hi = mem_load(w + 1u);
     var r: vec2<u32>;
     if shift >= 32u {
         r = vec2<u32>(hi >> (shift - 32u), 0u);
@@ -127,18 +129,18 @@ fn vram_store64(a: u32, n: u32, v: vec2<u32>) {
     }
     if sm.x != 0u {
         if sm.x == 0xffffffffu {
-            atomicStore(&vram[w], sv.x);
+            mem_store(w, sv.x);
         } else {
-            atomicAnd(&vram[w], ~sm.x);
-            atomicOr(&vram[w], sv.x);
+            mem_and(w, ~sm.x);
+            mem_or(w, sv.x);
         }
     }
     if sm.y != 0u {
         if sm.y == 0xffffffffu {
-            atomicStore(&vram[w + 1u], sv.y);
+            mem_store(w + 1u, sv.y);
         } else {
-            atomicAnd(&vram[w + 1u], ~sm.y);
-            atomicOr(&vram[w + 1u], sv.y);
+            mem_and(w + 1u, ~sm.y);
+            mem_or(w + 1u, sv.y);
         }
     }
 }

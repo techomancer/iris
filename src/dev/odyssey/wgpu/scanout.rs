@@ -12,7 +12,7 @@ use super::super::consts::{cursor, dispmode, lut, overlay};
 use super::super::field::Codec;
 use super::super::frame::Frame;
 use super::super::reader::DisplayRegs;
-use super::{codec_kind, Unsupported, VIEWS, VRAM};
+use super::{codec_kind, Unsupported, VIEWS, VRAM, VRAM_MEM};
 
 const SCANOUT: crate::wgpu::Fragment = crate::wgpu::Fragment::new("vpro_scanout.wgsl", include_str!("shaders/scanout.wgsl"));
 
@@ -117,7 +117,7 @@ impl VproScanout {
             &ScanoutShaders {
                 label: "vpro",
                 body: &[SCANOUT],
-                library: &[VRAM, VIEWS],
+                library: &[VRAM, VRAM_MEM, VIEWS],
                 defines: &[("VRAM_WORD_MASK", (words - 1) as u32)],
                 layouts: &[&layout],
             },
