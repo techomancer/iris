@@ -12,18 +12,20 @@ use crate::pci::PciDmaStatus;
 use crate::traits::{Device, Saveable};
 use std::sync::Mutex;
 
-const MEM: usize = 1 << 20;
+pub(crate) const MEM: usize = 1 << 20;
 
-struct FakeMem(Mutex<Vec<u8>>);
+/// Host memory behind a fake bus master, shared with the other QLogic
+/// adapters' tests.
+pub(crate) struct FakeMem(Mutex<Vec<u8>>);
 
 impl FakeMem {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(FakeMem(Mutex::new(vec![0; MEM])))
     }
-    fn put(&self, addr: u32, data: &[u8]) {
+    pub(crate) fn put(&self, addr: u32, data: &[u8]) {
         self.0.lock().unwrap()[addr as usize..addr as usize + data.len()].copy_from_slice(data);
     }
-    fn get(&self, addr: u32, n: usize) -> Vec<u8> {
+    pub(crate) fn get(&self, addr: u32, n: usize) -> Vec<u8> {
         self.0.lock().unwrap()[addr as usize..addr as usize + n].to_vec()
     }
 }
