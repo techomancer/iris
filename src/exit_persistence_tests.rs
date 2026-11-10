@@ -755,7 +755,8 @@ fn no_process_exit_bypasses_the_flush() {
                 }
             } else if p.extension().is_some_and(|x| x == "rs") {
                 let text = std::fs::read_to_string(&p).unwrap();
-                let rel = p.strip_prefix(root).unwrap().display().to_string();
+                // The list below is written with forward slashes.
+                let rel = p.strip_prefix(root).unwrap().display().to_string().replace('\\', "/");
                 if rel.ends_with("exit_persistence_tests.rs") {
                     continue;
                 }
