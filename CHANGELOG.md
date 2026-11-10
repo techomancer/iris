@@ -179,6 +179,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - The ISP1040 and the ISP12160 (the Octane's and the Origin's SCSI, and the Fuel's and the Tezro's) change their interrupt state and drive the line in one hold of the state lock, and write the line only when the level changes (and once more after the bus attaches them or a snapshot loads). There is no guest-visible change: the parents already ignored a repeated level. It removes the second lock the ISP1040 took and a line write on every register access.
 
+### Fibre Channel
+
+- `[fibre_channel]` fits a QLogic ISP2200 Fibre Channel adapter in a slot of an Octane's PCI module or shoehorn, with `[fibre_channel.disk.N]` tables (N the loop ID, 0 to 125) for the disks on its private loop. IRIX 6.5.30 brings it up with its own driver and shows the disks as one SCSI controller of their own; no other guest has been tried. Only the host interface is modelled, not Fibre Channel itself, and a handful of replies are approximations ([docs/fibre-channel.md](docs/fibre-channel.md)).
+
 ### R10000 family fixes, R12000 and R14000
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
