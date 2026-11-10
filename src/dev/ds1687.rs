@@ -6,6 +6,7 @@ use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK
 use std::io::Write;
 use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, load_u8_slice, u8_slice_to_toml};
+use crate::dev::battery_clock;
 
 /// A Dallas-style RTC with battery-backed NVRAM.
 ///
@@ -30,6 +31,23 @@ pub struct MaceRtc {
     /// NetBSD and OpenBSD power down this way; without it OpenBSD retries
     /// for ever, printing "Power supply did not shut down".
     powered_off: std::sync::atomic::AtomicBool,
+    /// Set when a guest write moves the clock or a saved clock is restored:
+    /// the clock is then the guest's, and a board saves its reference (see
+    /// [`battery_clock`]).
+    set: std::sync::atomic::AtomicBool,
+}
+
+/// The 512-byte NVRAM image of a DS1685/DS1687, as QEMU's model keeps it:
+/// registers 0x00..0x40, bank-0 RAM 0x40..0x80, bank-1 registers
+/// 0x80..0xc0, the 128-byte extended RAM 0xc0..0x140, zeros after. Its
+/// clock reference beside it is 24 bytes under [`image::CLOCK_TAG`].
+pub mod image {
+    pub const LEN: usize = 0x200;
+    pub const NV: usize = 0x40;
+    pub const EXT: usize = 0x80;
+    pub const XRAM: usize = 0xc0;
+    pub const XRAM_LEN: usize = 0x80;
+    pub const CLOCK_TAG: &[u8; 8] = b"DS168RF1";
 }
 
 /// The DS1687's clock registers and the bits of register B that shape them.
@@ -92,14 +110,97 @@ impl MaceRtc {
         c[0x0d] = 0x80;
         // BCD, 24-hour: what SGI firmware leaves the part in.
         c[rtc_reg::B] = rtc_reg::B_24H;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64).unwrap_or(0);
         Self {
             cells: Mutex::new(c),
-            clock: Mutex::new((now, std::time::Instant::now())),
+            clock: Mutex::new(battery_clock::host_second()),
             held_century: Mutex::new(None),
             powered_off: std::sync::atomic::AtomicBool::new(false),
+            set: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Run the clock `offset` seconds from host time: where `[rtc_offset]`
+    /// starts a clock the guest has not set.
+    pub fn set_offset(&self, offset: i64) {
+        self.run_at(offset);
+    }
+
+    fn run_at(&self, offset: i64) {
+        let (host, at) = battery_clock::host_second();
+        *self.clock.lock().unwrap() = (host + offset, at);
+    }
+
+    /// Whether the clock is the guest's: set by a write that moved it, or
+    /// restored from a saved clock.
+    pub fn clock_set(&self) -> bool {
+        self.set.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The reference to keep beside the image, once the clock is the
+    /// guest's: the host time and the guest's time now.
+    pub fn clock_reference(&self) -> Option<Vec<u8>> {
+        self.clock_set().then(|| battery_clock::encode(image::CLOCK_TAG, battery_clock::unix_now(), Some(self.now())))
+    }
+
+    /// Run the clock from a saved reference, with the host time since the
+    /// save added. Returns the guest's time now, or `None`, leaving the
+    /// clock alone, when `bytes` is not a DS1685 reference.
+    pub fn restore_clock(&self, bytes: &[u8]) -> Option<i64> {
+        let now = battery_clock::unix_now();
+        let guest = battery_clock::decode(bytes, image::CLOCK_TAG, true)?.guest_now(now)?;
+        self.run_at(guest - now);
+        self.set.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(guest)
+    }
+
+    /// Registers 0x00..0x40 as an image keeps them, and the century byte
+    /// for bank-1 0x48. The time bytes hold the running time, or with SET
+    /// up what the guest is writing, so the image alone reads as a valid
+    /// calendar.
+    pub fn image_registers(&self) -> ([u8; 0x40], u8) {
+        let b = self.peek(rtc_reg::B);
+        let mut regs = [0u8; 0x40];
+        regs.copy_from_slice(&self.cells.lock().unwrap()[..0x40]);
+        let t = self.now();
+        let mut century = civil_from_days(t.div_euclid(86400)).0 / 100;
+        if b & rtc_reg::B_SET == 0 {
+            for &f in &rtc_reg::TIME {
+                regs[f] = self.field(f, t, b);
+            }
+        } else if let Some(c) = *self.held_century.lock().unwrap() {
+            century = c;
+        }
+        let c = century as u8;
+        (regs, if b & rtc_reg::B_BINARY != 0 { c } else { (c / 10) << 4 | c % 10 })
+    }
+
+    /// Take an image's registers 0x0e..0x40. The time bytes are not taken:
+    /// the clock comes from its reference or from host time.
+    pub fn load_image_registers(&self, img: &[u8]) {
+        self.cells.lock().unwrap()[Self::NVRAM_FIRST..0x40].copy_from_slice(&img[Self::NVRAM_FIRST..0x40]);
+    }
+
+    /// An image of this model's own RAM, for a board that keeps no RAM
+    /// banks beside it (the O2): registers 0x40..0x80 are bank-0 RAM, and
+    /// bank 1 holds only the century. Registers 0x80 up are not kept.
+    pub fn image(&self) -> Vec<u8> {
+        let (regs, century) = self.image_registers();
+        let mut img = vec![0u8; image::LEN];
+        img[..0x40].copy_from_slice(&regs);
+        img[image::NV..image::NV + 0x40].copy_from_slice(&self.cells.lock().unwrap()[0x40..0x80]);
+        img[image::EXT + 0x08] = century;
+        img
+    }
+
+    /// Load an [`MaceRtc::image`], or any image of that layout, into this
+    /// model's own RAM. Returns false, loading nothing, for another length.
+    pub fn load_image(&self, img: &[u8]) -> bool {
+        if img.len() != image::LEN {
+            return false;
+        }
+        self.load_image_registers(img);
+        self.cells.lock().unwrap()[0x40..0x80].copy_from_slice(&img[image::NV..image::NV + 0x40]);
+        true
     }
 
     /// Whether the guest has switched the machine off.
@@ -168,6 +269,9 @@ impl MaceRtc {
         let t = days_from_civil(year, month, mday) * 86400
             + hour * 3600 + get(rtc_reg::MIN) * 60 + get(rtc_reg::SEC);
         drop(c);
+        if battery_clock::sets(self.now(), t) {
+            self.set.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         *self.clock.lock().unwrap() = (t, std::time::Instant::now());
     }
 
@@ -471,6 +575,58 @@ mod tests {
         dst.load_state(&src.save_state()).unwrap();
         assert!((1_086_116_400..=1_086_116_402).contains(&dst.now()));
         assert_eq!(civil_from_days(dst.now().div_euclid(86400)), (2004, 6, 1));
+    }
+
+    /// A clock the guest set comes back from its reference with the host
+    /// time since the save added, as the battery kept it running; one it
+    /// never set has no reference, so `[rtc_offset]` keeps seeding it.
+    #[test]
+    fn a_set_clock_comes_back_from_its_reference() {
+        let reg = |n: u32| ((n << 8) | 7) as u64;
+        let src = MaceRtc::new();
+        assert_eq!(src.clock_reference(), None, "never set");
+        src.set_offset(-3600);
+        assert_eq!(src.clock_reference(), None, "a seed is not a set");
+        // Firmware raising and dropping SET commits the time it had.
+        src.write8(reg(0x0b), 0x80 | 0x02);
+        src.write8(reg(0x0b), 0x02);
+        assert_eq!(src.clock_reference(), None, "rewriting the same time is not a set");
+        set_2004(&src);
+        let mut r = src.clock_reference().expect("set");
+        // As if saved an hour ago.
+        let saved_at = i64::from_le_bytes(r[8..16].try_into().unwrap()) - 3600;
+        r[8..16].copy_from_slice(&saved_at.to_le_bytes());
+        let dst = MaceRtc::new();
+        let set = 1_086_116_400;
+        let got = dst.restore_clock(&r).expect("a reference");
+        assert!((set + 3599..=set + 3601).contains(&got), "2004-06-01 20:00 UTC, got {got}");
+        assert!((set + 3599..=set + 3601).contains(&dst.now()));
+        assert!(dst.clock_set(), "the restored clock is the guest's and is saved again");
+        assert_eq!(MaceRtc::new().restore_clock(&[0; 24]), None, "zeros are no reference");
+    }
+
+    /// The image carries a calendar QEMU's model accepts, and the reference
+    /// is QEMU's: tag, host time, guest time, little-endian.
+    #[test]
+    fn image_and_reference_follow_the_qemu_layout() {
+        let r = MaceRtc::new();
+        set_2004(&r);
+        // Back to BCD: the image holds the registers in the guest's mode.
+        r.write8(((0x0b << 8) | 7) as u64, 0x02);
+        let img = r.image();
+        assert_eq!(img.len(), 512);
+        assert_eq!([img[9], img[8], img[7], img[4], img[0x88]], [0x04, 0x06, 0x01, 0x19, 0x20], "2004-06-01 19h, century 20");
+        assert!(img[0x140..].iter().all(|&b| b == 0), "the image is the chip's bytes only");
+        let reference = r.clock_reference().unwrap();
+        assert_eq!(reference.len(), 24);
+        assert_eq!(&reference[..8], b"DS168RF1");
+        let seconds = i64::from_le_bytes(reference[16..24].try_into().unwrap());
+        assert!((1_086_116_400..=1_086_116_402).contains(&seconds));
+        // A file pair as QEMU writes it opens here.
+        let q = crate::dev::battery_clock::encode(b"DS168RF1", crate::dev::battery_clock::unix_now(), Some(1_086_116_400));
+        let o2 = MaceRtc::new();
+        assert!(o2.load_image(&img));
+        assert!((1_086_116_400..=1_086_116_401).contains(&o2.restore_clock(&q).unwrap()));
     }
 
     #[test]

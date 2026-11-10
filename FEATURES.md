@@ -323,6 +323,19 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 | `rtc_offset.minutes` | `0` | Signed minutes offset from host UTC when seeding RTC. |
 | `rtc_offset.seconds` | `0` | Signed seconds offset from host UTC when seeding RTC. |
 
+The RTC's battery keeps its clock running while the machine is off. Once
+the guest sets the clock, with a write that moves it by more than two
+seconds, iris keeps it in a file beside the RTC's NVRAM
+file, `<file>.clock`, and the next run carries on from it with the time
+in between added. Until then the clock starts where `[rtc_offset]` puts it
+at every run, so an edit to `[rtc_offset]` takes effect. Once the `.clock`
+file exists it wins, and iris says so at startup when `[rtc_offset]` is
+set. Delete the `.clock` file to start from `[rtc_offset]` again. A guest
+that writes its own clock back at shutdown, as IRIX does, sets it if its
+clock has drifted. An Octane's NVRAM file with no `.clock` beside it opens
+in QEMU at the time of its last save, since QEMU then takes the image's
+calendar without adding the time since.
+
 ### [ultra64]
 
 | Key | Default | Values and behavior |
@@ -386,7 +399,7 @@ the file is loaded, with a note, and never written back.
 Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu =
 "r10000"`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
 not embedded; `IP30prom.bin` is tried when it is left unset), `nvram` (the
-DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256,
+DS1685's NVRAM, behind IOC3, its clock in `<nvram>.clock`), `banks` (the MB in each HEART bank: 64, 128, 256,
 512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
 `headless`, `[clock] fixed_mhz` (CP0 Count; 97.5 for the 195 MHz R10000),

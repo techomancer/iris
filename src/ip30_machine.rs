@@ -299,6 +299,7 @@ impl OctaneMachine {
         heart.on_soft_reset(Box::new(move || {
             let _ = event_tx.try_send(MachineEvent::HardReset);
         }));
+        ioc3.set_rtc_offset(&cfg.rtc_offset);
         if let Err(e) = ioc3.set_nvram_file(&cfg.nvram) {
             eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
         }

@@ -1562,8 +1562,11 @@ fn is_zero_i64(v: &i64) -> bool { *v == 0 }
 /// `years = -18` alone sets the clock back 18 years to the day.
 ///
 /// Applied once, when the RTC is seeded from the host clock at startup; the
-/// clock then runs forward normally. Snapshots keep the time they were saved
-/// with, and IRIX setting the time itself still works as usual.
+/// clock then runs forward normally. Once the guest sets the clock it is
+/// kept beside the NVRAM file and seeds later runs instead (see
+/// `dev::battery_clock`), so this is where a clock the guest has not set
+/// starts. Snapshots keep the time they were saved with, and IRIX setting
+/// the time itself still works as usual.
 ///
 /// Years and months are calendar steps (applied first, day clamped to the
 /// target month, so Mar 31 − 1 month is Feb 28/29). Days, hours, minutes and
