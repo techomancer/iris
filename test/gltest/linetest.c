@@ -21,6 +21,8 @@
  * (8 + i/8, 8 + j/8) within a 16 x 16 cell, i and j 0 to 7; prints every
  * lit pixel of the cell: "points size64 i j x y r" (x, y in the cell).
  * "pointsdc" the same with GL_POINT_SMOOTH_HINT left at GL_DONT_CARE.
+ * "pointsal" the same with each size set while smoothing is off, then
+ * smoothing enabled: IMPACT keeps the aliased point's pixels then.
  */
 #include <string.h>
 #include <stdio.h>
@@ -249,7 +251,7 @@ static void vslopes(void)
     }
 }
 
-static void points(int nicest)
+static void points(int nicest, int size_first)
 {
     static float sizes[5] = { 1.0f, 2.0f, 3.0f, 4.5f, 6.5f };
     static unsigned char blk[16 * 16 * 4];
@@ -261,7 +263,9 @@ static void points(int nicest)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     glShadeModel(GL_FLAT);
     for (si = 0; si < 5; si++) {
+        if (size_first) glDisable(GL_POINT_SMOOTH);
         glPointSize(sizes[si]);
+        glEnable(GL_POINT_SMOOTH);
         for (j = 0; j < 8; j++) {
             for (i = 0; i < 8; i++) {
                 glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -341,8 +345,9 @@ int main(int argc, char **argv)
         XCloseDisplay(dpy);
         return 0;
     }
-    if (argc > 1 && (strcmp(argv[1], "points") == 0 || strcmp(argv[1], "pointsdc") == 0)) {
-        points(strcmp(argv[1], "points") == 0);
+    if (argc > 1 && (strcmp(argv[1], "points") == 0 || strcmp(argv[1], "pointsdc") == 0
+                     || strcmp(argv[1], "pointsal") == 0)) {
+        points(strcmp(argv[1], "pointsdc") != 0, strcmp(argv[1], "pointsal") == 0);
         glXMakeCurrent(dpy, None, NULL);
         XCloseDisplay(dpy);
         return 0;

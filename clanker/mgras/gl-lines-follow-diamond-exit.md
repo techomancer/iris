@@ -44,17 +44,25 @@ The GE draws them pixel by pixel as one-pixel lines with alpha scaled.
 
 Points ride on the same lines: a point is a horizontal line from the left
 edge of its first pixel to the right edge of its last (`gl.rs`
-`point_window`), and all nine aliased sizes match the board. Antialiased
-points: size 1 is a one-pixel antialiased line from the point one pixel
-right (exact); larger ones are discs with alpha S(r - d), the integral of a
-tent 0.9 pixels either side of the edge, over the pixels floor(c) - ceil(r)
-to floor(c) + ceil(r) (which lights the far side's last pixel and not the
-near side's; 1 level mean). Open: in glprim (64x48 window, three points
-in one glBegin) sizes 3 and 6.5 lack the near side's whole ring on the
-board, up to 105 levels from the model: a size-3 point on a pixel corner
-is a 3x3 box there (unblended: all 255), 4x4 in linetest. Not the hint
-(`linetest pointsdc` is identical), not the visual or the blend function
-(glprim variants on the board, results/purple-lf/ptvar). Left: the
-window, several points per glBegin, the clear between linetest's draws;
-an `mgras trace` of both in the emulated guest would show what libGLcore
-sends.
+`point_window`), and all nine aliased sizes match the board.
+
+**Antialiased points** (`smooth_point_window`; linetest points, pointsal,
+glprim, test/gltest/pttest): size 1 is a one-pixel antialiased line from
+the point one pixel right (exact). Larger ones are discs with alpha
+S(r - d), the integral of a tent 0.9 pixels either side of the edge. Which
+pixels may be lit is decided apart from the coverage:
+- On each axis the first pixel is the first pixel of an *aliased* point of
+  size round(size) + 1, the far side runs as far as the coverage does.
+- **The GE sets the box up when the size arrives, not when smoothing is
+  enabled.** Size first, then glEnable(GL_POINT_SMOOTH) (glprim's order)
+  keeps the aliased point's first pixel, round(size), cutting the near
+  side's ring off: a size-3 point on a pixel corner is 3x3, a size-6.5 one
+  7x7. The values inside are the same. Toggling smoothing without a new
+  glPointSize keeps whichever box the last size set. libGLcore sends the
+  same POINT_SMOOTH [0|1] and POINT_SIZE [float] tokens in either order,
+  so the latch is the GE's: `point_box_smooth` is taken at POINT_SIZE.
+  Size 1 does not depend on the order.
+- Window size, vertex call (2d/2f/3f/3d/2i/4f), several points per
+  glBegin, dither, blend and the smoothing hint change nothing.
+`real_board_smooth_lines_and_points` checks both orders at four offsets per
+axis, and `real_board_lines` glprim's points exactly.
