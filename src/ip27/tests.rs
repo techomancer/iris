@@ -149,7 +149,7 @@ fn a_node_that_holds_another_number_sends_node_zero_beyond_the_cached_alias_to_t
     let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
     let phys = mem.physical();
     let echo: Arc<dyn BusDevice> = Arc::new(Echo);
-    let zero = mem.node_zero(Routing::new());
+    let zero = mem.node_zero(Routing::new(), &Arc::new(Windows::default()));
     mem.route_nodes(echo.clone());
     let alias = 64 << 20;
     assert_eq!(phys.write64(alias + 0x1000, 0x77), BUS_OK);
@@ -170,4 +170,126 @@ fn a_node_that_holds_another_number_sends_node_zero_beyond_the_cached_alias_to_t
     zero.update(0, alias);
     assert_eq!(phys.read64(alias + 0x1000).data, 0x77);
     assert_eq!(phys.read64(0x1000).data, 0x55);
+}
+
+/// Two nodes' windows follow the numbers their Hubs publish, as the decode
+/// table does: each shows its own memory and the other's at their numbers,
+/// and a node that holds another number keeps its own memory below the
+/// cached alias and shows node zero's above it. A number given up leaves
+/// both windows, and one past the window's reach is left to the bus.
+#[test]
+fn each_window_shows_both_nodes_memory_at_their_numbers() {
+    use crate::ppmem::{bitmap_maps_at, window_shift};
+    let windows = Arc::new(Windows::default());
+    let echo: Arc<dyn BusDevice> = Arc::new(Echo);
+    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], window(2)).unwrap()).collect();
+    let zeros: Vec<_> = mems
+        .iter()
+        .map(|m| {
+            m.route_nodes(echo.clone());
+            m.node_zero(Routing::new(), &windows)
+        })
+        .collect();
+    let (near, far) = (0x1000, (96 << 20) + 0x1000);
+    for (n, m) in mems.iter().enumerate() {
+        let n = n as u64;
+        assert_eq!(m.physical().banks()[0].write64(near, n << 4), BUS_OK);
+        assert_eq!(m.physical().banks()[0].write64(far, n << 4 | 1), BUS_OK);
+    }
+    let seen = |n: usize, at: u64| {
+        let sp = mems[n].physical().ppmem_space().unwrap();
+        bitmap_maps_at(sp.mapped_bitmap(), window_shift(sp.window_size()), at)
+            .then(|| unsafe { (*(sp.window_base().add(at as usize) as *const u64)).rotate_left(32) })
+    };
+    let alias = 64 << 20;
+    let one = 1 << 32;
+    // Both hold zero, the reset value: each window is its own memory.
+    assert_eq!((seen(0, near), seen(1, near)), (Some(0x00), Some(0x10)));
+    assert_eq!((seen(0, one + near), seen(1, one + near)), (None, None));
+    // The second holds one.
+    zeros[1].update(1, alias);
+    assert_eq!(seen(0, near), Some(0x00));
+    assert_eq!(seen(0, one + far), Some(0x11));
+    assert_eq!(seen(1, near), Some(0x10));
+    assert_eq!(seen(1, far), Some(0x01));
+    assert_eq!(seen(1, one + near), Some(0x10));
+    // A smaller alias shows more of node zero to the second node.
+    zeros[1].update(1, 4 << 10);
+    assert_eq!(seen(1, near), Some(0x00));
+    // Two is past an 8 GiB window: both leave it to the bus.
+    zeros[1].update(2, alias);
+    assert_eq!((seen(0, one + near), seen(1, one + near)), (None, None));
+    assert_eq!(seen(0, (2 << 32) + near), None);
+    assert_eq!(seen(1, near), Some(0x10));
+    // Back to zero.
+    zeros[1].update(0, alias);
+    assert_eq!((seen(0, near), seen(1, near), seen(1, far)), (Some(0x00), Some(0x10), Some(0x11)));
+}
+
+/// Two nodes on a two-node board, each with a window: what the renumbering
+/// test below drives.
+fn two_nodes() -> (Arc<Windows>, Vec<NodeMemory>, Vec<Arc<NodeZero>>, Vec<Arc<Routing>>) {
+    let windows = Arc::new(Windows::default());
+    let echo: Arc<dyn BusDevice> = Arc::new(Echo);
+    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], window(2)).unwrap()).collect();
+    let routing: Vec<_> = (0..2).map(|_| Routing::new()).collect();
+    let zeros = mems
+        .iter()
+        .enumerate()
+        .map(|(n, m)| {
+            m.route_nodes(echo.clone());
+            m.node_zero(routing[n].clone(), &windows)
+        })
+        .collect();
+    (windows, mems, zeros, routing)
+}
+
+/// A renumbering on one processor while the other holds and releases a
+/// line's page: the renumber lays the second node's window from the first
+/// thread while the second reads the window's mapping list at a CACHE
+/// instruction. Without the space's lock the list is rebuilt under the
+/// reader and `hold_line_page` finds its page unmapped. (That failure is a
+/// SIGILL that ends the whole test binary, not one failed assertion.)
+#[test]
+fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
+    let (_windows, mems, zeros, routing) = two_nodes();
+    let sp = mems[1].physical().ppmem_space().unwrap();
+    // The view has a sink like a processor's: a plain word the space writes.
+    let mut bitmap = Box::new(0u64);
+    let v = sp.add_cached_view(&[&mut *bitmap as *mut u64]).unwrap();
+    let pages: Vec<u64> = (0..16).map(|n| 0x10_0000 + n * 0x1000).collect();
+    const RENUMBERS: u32 = 3000;
+    let (start, done) = (Barrier::new(2), AtomicBool::new(false));
+    let spurious = std::thread::scope(|s| {
+        let other = s.spawn(|| {
+            start.wait();
+            let mut spurious = 0u32;
+            let mut rounds = 0u32;
+            while !done.load(Ordering::Acquire) || rounds < 1000 {
+                // A CACHE instruction's worth.
+                for &page in &pages {
+                    spurious += u32::from(sp.hold_line_page(v, page) != Some(true));
+                }
+                for &page in &pages {
+                    spurious += u32::from(!sp.release_line_page(v, page));
+                }
+                rounds += 1;
+            }
+            spurious
+        });
+        s.spawn(|| {
+            start.wait();
+            for i in 1..=RENUMBERS {
+                // Node zero takes number one and gives it up: node one's
+                // window gains and loses node zero's memory at 4 GiB.
+                routing[0].set(u16::from(i & 1 == 0), 64 << 20);
+                zeros[0].refresh();
+            }
+            done.store(true, Ordering::Release);
+        });
+        other.join().unwrap()
+    });
+    assert_eq!(spurious, 0, "a line's page was found unmapped while another processor renumbered");
 }

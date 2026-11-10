@@ -44,6 +44,7 @@
 //! `clanker/cpu/cache-lines-live-in-the-cpus-view.md` has the limits.
 
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
@@ -228,7 +229,7 @@ pub struct ShadowCache<
     /// ppmem path uses the same window — they are here only so jitv2's inline
     /// tcache path can serve this model too (`jit_dc_geometry`).
     tc_base: UnsafeCell<*mut u8>,
-    tc_bitmap: UnsafeCell<u64>,
+    tc_bitmap: AtomicU64,
     /// The window's `ppmem::window_shift`, set before the CPU runs.
     tc_shift: UnsafeCell<u32>,
     #[cfg(feature = "jitv2")]
@@ -299,7 +300,7 @@ impl<
             dc: UnsafeCell::new(Shadow::new(Self::DC_LINES, if Self::R10K { DC_SIZE / 4 } else { 0 })),
             l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
-            tc_bitmap: UnsafeCell::new(0),
+            tc_bitmap: AtomicU64::new(0),
             tc_shift: UnsafeCell::new(crate::ppmem::BITMAP_SHIFT),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
@@ -318,7 +319,7 @@ impl<
     /// set bit also means the base is valid.
     #[inline(always)]
     fn ram(&self, phys: u64) -> Option<*mut u8> {
-        if crate::ppmem::bitmap_maps_at(unsafe { *self.tc_bitmap.get() }, unsafe { *self.tc_shift.get() }, phys) {
+        if crate::ppmem::bitmap_maps_at(self.tc_bitmap.load(Ordering::Relaxed), unsafe { *self.tc_shift.get() }, phys) {
             Some(unsafe { *self.tc_base.get() })
         } else {
             None
@@ -785,7 +786,7 @@ impl<
         }
     }
 
-    fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.get() }
+    fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.as_ptr() }
 
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
 
@@ -841,7 +842,7 @@ impl<
             let r = self.downstream.read32(a);
             if r.is_ok() { Ok(r.data) } else { Err(r.status) }
         };
-        let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, *self.tc_bitmap.get()) };
+        let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, self.tc_bitmap.load(Ordering::Relaxed)) };
         match dc.fetch(phys_addr, window, bitmap, IC_LINE, word) {
             Ok(p) => FetchInstrResult::hit(p),
             Err(status) => FetchInstrResult::fault(status),

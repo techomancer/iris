@@ -3012,7 +3012,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// (CPU store → MC register write → `remap_banks` → ppmem), and no device
     /// ever reads or writes it.
     pub fn ppmem_bitmap_ptr(&self) -> *mut u64 {
-        &self.core.ppmem_bitmap as *const u64 as *mut u64
+        self.core.ppmem_bitmap.as_ptr()
     }
 
     /// tcache: hand the cache ppmem's window base and mapped-region bitmap, so

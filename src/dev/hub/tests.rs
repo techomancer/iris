@@ -242,7 +242,7 @@ fn a_node_number_write_reaches_the_node_zero_routing() {
     let (a, b) = (0x1000, (64 << 20) + 0x1000);
     assert_eq!(phys.write64(b, 0x77), BUS_OK);
     mem.route_nodes(hub.claim(Space::Memory));
-    hub.set_node_zero(mem.node_zero(hub.routing().clone()));
+    hub.set_node_zero(mem.node_zero(hub.routing().clone(), &Default::default()));
     // Unnumbered: node zero's memory is the node's own, wherever it is.
     assert_eq!(phys.read64(b).data, 0x77);
     // Numbered 6: beyond the 64 MiB sentinel alias the reference leaves the
@@ -276,7 +276,7 @@ fn a_neighbours_renumbering_reaches_this_nodes_routing() {
     let beyond = (64 << 20) + 0x1000;
     assert_eq!(phys.write64(beyond, 0x77), BUS_OK);
     mem.route_nodes(b.claim(Space::Memory));
-    b.set_node_zero(mem.node_zero(b.routing().clone()));
+    b.set_node_zero(mem.node_zero(b.routing().clone(), &Default::default()));
     assert_eq!(phys.read64(beyond).data, 0x77);
     // a's vector write of b's node number: b holds 3 now and no longer
     // answers for node zero, so its memory beyond the alias leaves it.

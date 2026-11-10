@@ -443,7 +443,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             };
             let clock = host_clock();
             let timers = Arc::new(TimerManager::new());
-            let memory = NodeMemory::new(spec.banks_mb)?;
+            let memory = NodeMemory::with_window(spec.banks_mb, ip27::window(specs.len()))?;
             memory.map_reset_view(&flash);
             let hub = Hub::new(spec.hub, clock.clone());
             hub.set_timer_manager(timers.clone());
@@ -478,13 +478,14 @@ impl<B: Ip27Board> Ip27Machine<B> {
         let io = B::wire(&nodes, cfg)?;
 
         let (tx, rx) = channel();
+        let windows = Arc::new(ip27::Windows::default());
         let mut units = Vec::new();
         for (node, spec) in parts.into_iter().zip(&specs) {
             let cpu = Self::build_cpu(cfg, &spec.module, &node, spec.hub.cpu_base, specs.len() > 1)?;
             // The Hub publishes its lines straight into the processor's
             // interrupt word, which `Drop` lets go of before the processor goes.
             node.hub.set_cpu_interrupts(0, cpu.interrupts_ptr());
-            node.hub.set_node_zero(node.memory.node_zero(node.hub.routing().clone()));
+            node.hub.set_node_zero(node.memory.node_zero(node.hub.routing().clone(), &windows));
             node.hub.set_event_sender(tx.clone());
             node.hub.register_locks();
             cpu.register_locks();

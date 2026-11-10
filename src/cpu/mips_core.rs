@@ -347,11 +347,12 @@ pub struct MipsCore {
     /// of. `PpMemSpace` holds a `*mut u64` to this field and writes through it
     /// whenever the MC remaps banks.
     ///
-    /// Not atomic, deliberately: the only writer is `remap_banks`, reached as
-    /// CPU store → MC register write → ppmem, all on this same CPU thread, and
-    /// no device ever touches it. Zero when ppmem is not in use, which reads as
-    /// "nothing is directly mapped" and keeps every access on the bus path.
-    pub ppmem_bitmap: u64,
+    /// An `AtomicU64` read and written `Relaxed` (the same `mov` as a plain
+    /// word, and the JIT reads it at this field's offset): on the SN0 boards
+    /// another node's processor can re-lay this window while this CPU runs.
+    /// Zero when ppmem is not in use, which reads as "nothing is directly
+    /// mapped" and keeps every access on the bus path.
+    pub ppmem_bitmap: AtomicU64,
 
     pub pc: u64,         // Program Counter
     /// Whether the instruction about to execute is a branch/jump's delay
@@ -1310,7 +1311,7 @@ impl MipsCore {
             hot: Hot::default(),
             cp0_count: 0,
             cp0_compare: 0,
-            ppmem_bitmap: 0,
+            ppmem_bitmap: AtomicU64::new(0),
             pc: 0,
             in_delay_slot: false,
             delay_slot_target: 0,
