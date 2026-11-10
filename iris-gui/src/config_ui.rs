@@ -2031,10 +2031,10 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.horizontal(|ui| {
         ui.add_enabled_ui(octane, |ui| {
             ComboBox::from_id_salt("machine_cpus")
-                .selected_text(format!("{}", cfg.machine.cpus))
+                .selected_text(format!("{}", cfg.machine.cpus()))
                 .show_ui(ui, |ui| {
                     for n in [1u8, 2] {
-                        ui.selectable_value(&mut cfg.machine.cpus, n, format!("{n}"));
+                        ui.selectable_value(&mut cfg.machine.cpus, Some(n), format!("{n}"));
                     }
                 });
         });
