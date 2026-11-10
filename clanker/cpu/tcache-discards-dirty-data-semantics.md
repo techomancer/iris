@@ -1,8 +1,9 @@
 # tcache makes L1-D write-through, so Hit_Invalidate cannot discard
 
 > **Since 2026-10-01 `jitv2` implies `tcache`**, so every jitv2 build — including
-> the CI jitv2 cells — fails these 2 checks. The CI baselines are per engine:
-> r4400 124 interp / 126 jitv2, r5000 108 / 110 (`.github/workflows/suites.yml`).
+> the CI jitv2 cells — fails these 2 checks. CI judges by test name:
+> `cache/hit_inv_discards` is listed for the jitv2 cells in
+> `cpu-tests/expected-failures.txt`.
 > The tables below are the historical 2026-08-26 measurement. CPU selection
 > no longer uses `r5k`; several FPU gaps described below are now fixed. See
 > [current findings](../../cpu-tests/docs/findings.md).

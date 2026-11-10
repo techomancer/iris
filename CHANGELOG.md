@@ -78,11 +78,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The embedded benchmark image is built with GCC 16.2.1 again. Since 6adc7927 it had been built with GCC 14.2, and benchmark results recorded on images built in between are not comparable with results from before or after. CI rebuilds the image in the container and fails on any byte difference, replacing the digest of the guest sources.
 - The compiler changes the benchmark: GCC 14.2 runs Dhrystone in 428 guest instructions per iteration where GCC 16.2.1 needs 313, so results from images built by different compilers are not comparable.
 
-### cpu-tests: results judged by test name
+### Test suites in CI
 
 - `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
 - CI judges `cpu-tests` by test name, not by failure count: the harness prints TAP, `cpu-tests/expected-failures.txt` lists the failing tests per CPU and engine, and `cargo test --release --test cpu_tests -- --ignored` runs the suite and the check, locally as in CI.
-- `cpu-tests` and the benchmark's accuracy check are cargo integration tests, one case per CPU: `cargo test --release [--features jitv2] --test cpu_tests --test bench_accuracy -- --ignored` builds the emulator for the engine it names, so it cannot judge a stale or wrong-engine binary. It replaces `make -C cpu-tests check-run` and `cpu-tests/run/matrix.sh`. CI runs the same tests and marks a failing case, with the tests that broke, on the pull request.
+- `cpu-tests` and the benchmark's accuracy check are cargo integration tests, one case per CPU: `cargo test --release [--features jitv2] --test cpu_tests --test bench_accuracy -- --ignored` builds the emulator for the engine it names, so it cannot judge a stale or wrong-engine binary. It replaces `make -C cpu-tests check-run` and `cpu-tests/run/matrix.sh`, which are gone with `cpu-tests/run/check.py`.
+- CI builds each engine's emulator once for both suites and runs the tests under `cargo nextest` (`.config/nextest.toml`), with panic=abort test builds, and so does the workspace test job. Every guest test and benchmark kernel is a JUnit case, so a failure is annotated by name on the pull request. `iris-bench run --junit FILE` writes the kernels' report. See [TESTING.md](TESTING.md#continuous-integration).
+- Pull requests are tested on Linux x86-64, Linux arm64 and Windows, and draft pull requests on Linux x86-64 only; the rest start when a pull request is marked ready for review. macOS is tested on pushes to `main`. Only the Linux x86-64 test step fails the job. Every job has a time limit.
 
 ### Interpreter hot-path check
 

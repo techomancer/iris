@@ -390,7 +390,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 
 ## testing/
 
-Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk hygiene, real-hardware runs.
+Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk hygiene, real-hardware runs. How to run the suites and what CI does with them: [TESTING.md](../TESTING.md).
 
 | Note | Kind | Title |
 |---|---|---|
@@ -400,7 +400,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 | [arcs-console-from-bare-metal.md](testing/arcs-console-from-bare-metal.md) | howto | Calling ARCS firmware from the bare-metal harness |
 | [bare-metal-harness-platform-assumptions.md](testing/bare-metal-harness-platform-assumptions.md) | howto | What the bare-metal suites assume about the machine |
 | [benchmark-suite-gotchas.md](testing/benchmark-suite-gotchas.md) | howto | Writing benchmark kernels for `bench/` — things that bit |
-| [cpu-tests-known-failure-baseline.md](testing/cpu-tests-known-failure-baseline.md) | howto | cpu-tests: the known-failure baseline, and how to use it |
+| [cpu-tests-known-failure-baseline.md](testing/cpu-tests-known-failure-baseline.md) | howto | cpu-tests: the known-failure baseline, judged by test name under `cargo test`, and how to use it |
 | [cpu-tests-scorecard-drift.md](testing/cpu-tests-scorecard-drift.md) | history | The cpu-tests scorecard in README.md is stale |
 | [device-tests-must-free-their-boards.md](testing/device-tests-must-free-their-boards.md) | rule | Device tests must free their boards (`TestBoard`), not `Box::leak` them |
 | [device-write-must-honour-bus-busy.md](testing/device-write-must-honour-bus-busy.md) | rule | Test harnesses calling `write32` on a device must honour `BUS_BUSY` — 2026-09-15 |

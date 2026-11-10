@@ -135,6 +135,24 @@ accesses/s while taking an address error on three loads in four, because
 emitted a plain `lw`. The checksum caught it; the exception counter now catches
 the whole class.
 
+### Adding a kernel
+
+1. Write the kernel in the right file under `kernels/` and register it with a
+   `BENCH(...)` line in that file's table. A new file or group also goes in
+   `harness/groups.c`.
+2. `make -C bench golden` compiles the same C natively and rewrites
+   `golden/golden.h` with the new checksum. Run `make -C bench hostbench` and
+   `bench/build/irisbench-host`: the host baseline must score 100%, or the kernel
+   depends on something other than its arithmetic.
+3. In the toolchain container, `make -C bench prebuilt` rebuilds the guest
+   image `iris` links in. Commit `golden.h` and `prebuilt/irisbench.elf` with
+   the kernel; CI rebuilds both and fails on a byte of difference.
+4. `cargo test --release --test bench_accuracy -- --ignored`, and again with
+   `--features jitv2`. It must report every checksum matched and no unexpected
+   exceptions. Read
+   [clanker/testing/benchmark-suite-gotchas.md](../clanker/testing/benchmark-suite-gotchas.md)
+   first if a checksum disagrees between host and guest.
+
 ---
 
 ## The time base
@@ -302,6 +320,27 @@ every result, so a shortened run cannot be mistaken for a full one —
 
 ---
 
+## Judging accuracy: `cargo test`
+
+```sh
+cargo test --release [--features jitv2] --test bench_accuracy -- --ignored
+```
+
+One case per CPU (`r4400`, `r5000`, `r10000_195`) runs `iris-bench run --iris`
+against the `iris` that command built, so the engine is the one you named. A
+case fails on a checksum mismatch, on an exception from a kernel not marked
+`BENCH_EXC`, on a guest banner that names another CPU than the case asked for,
+and when the emulator has no host time base. Speed is never judged. The guest is
+`prebuilt/irisbench.elf`, or `IRIS_BENCH_ELF`; set `IRIS_BENCH_RESULTS` to keep
+the parsed results for `iris-bench report`.
+
+`iris-bench run --junit FILE` writes a JUnit file with one case per
+kernel: failed on a checksum mismatch, skipped where there is no golden value.
+CI feeds it to the pull request's annotations, see
+[TESTING.md](../TESTING.md#reading-a-pull-requests-results).
+
+---
+
 ## iris-bench
 
 ```
@@ -317,8 +356,8 @@ iris-bench ab      --a BASE --b CHANGE [--rounds 30] [--concurrent] [--across-fe
 `run` is **in-process by default**: `iris-bench` is itself an emulator and the
 guest image is linked into it, so there is no subprocess, no ELF on disk and
 nothing platform-specific. Pass `--iris` to measure a *different* emulator
-binary in a subprocess instead — which is what `matrix` does, and what CI does
-for each cell, because a cell's features live in its binary.
+binary in a subprocess instead — which is what `matrix` does, and what the
+accuracy test above does, because a cell's features live in its binary.
 
 `run --deterministic` makes two runs do the same work. The suite sizes each
 kernel's iteration count from the test device's clock, so on the host clock a
