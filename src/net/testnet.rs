@@ -1343,7 +1343,9 @@ fn ntp_answers_with_the_host_clock() {
 
 // ── The event loop ───────────────────────────────────────────────────────────
 
-/// The engine sleeps when idle and wakes at once when the NIC signals.
+/// The engine sleeps when idle and wakes at once when the NIC signals (Unix:
+/// elsewhere it waits in 1 ms ticks).
+#[cfg(unix)]
 #[test]
 fn engine_sleeps_until_signalled() {
     let mut net = TestNet::default();
