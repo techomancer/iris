@@ -17,6 +17,7 @@ pub mod ds1687;
 pub mod heart;
 pub mod heart_mem;
 pub mod ioc3;
+pub mod mii;
 pub mod isp1040;
 pub mod mace_id;
 pub mod mace_pci;
