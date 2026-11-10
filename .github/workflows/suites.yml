@@ -178,6 +178,8 @@ jobs:
           path: .
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The JIT is a compile-time cargo feature; the CPU is not — the run
       # steps below pass `--cpu`. The R5000 cell is the R5000 without a
@@ -301,6 +303,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install build dependencies
         run: |
           sudo apt-get update
