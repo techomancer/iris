@@ -849,6 +849,17 @@ impl Ip27Board for Origin200 {
     }
 }
 
+/// Fit the BaseIO card's boot flash with the I/O PROM image the machine's
+/// table names, if it names one.
+pub(crate) fn fit_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), String> {
+    let Some(path) = section(cfg).io_prom.as_deref() else { return Ok(()) };
+    let table = table(cfg);
+    let file = std::fs::read(path).map_err(|e| format!("{table}.io_prom {path}: {e}"))?;
+    let flash = crate::dev::baseio_flash::BaseioFlash::new(&file).map_err(|e| format!("{table}.io_prom {path}: {e}"))?;
+    bridge.attach_flash(Arc::new(flash), crate::dev::baseio_flash::SIZE as u32);
+    Ok(())
+}
+
 /// The PCI devices both IP27 I/O boards carry behind their Bridge: two
 /// ISP1040s and an IOC3 with its Ethernet, serial ports and Timekeeper.
 pub(crate) fn pci_devices(

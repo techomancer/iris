@@ -1376,20 +1376,27 @@ pub struct Ip27Section {
     /// volatile.
     #[serde(default)]
     pub controller_store: Option<String>,
+    /// The BaseIO card's I/O PROM image (`io6prom.img`, beside the node PROM
+    /// on the IRIX 6.5.30 media), fitted in the Bridge's boot flash. Absent
+    /// leaves the flash unfitted: the node PROM then runs its own reduced
+    /// copy, which has no graphics console. A deskside key; the Origin 200
+    /// has no BaseIO card.
+    #[serde(default)]
+    pub io_prom: Option<String>,
 }
 
 fn default_ip27_nodes() -> u8 { 1 }
 
 impl Default for Ip27Section {
     fn default() -> Self {
-        Self { nodes: default_ip27_nodes(), flash: None, controller_store: None }
+        Self { nodes: default_ip27_nodes(), flash: None, controller_store: None, io_prom: None }
     }
 }
 
 impl Ip27Section {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
-        self.nodes == default_ip27_nodes() && self.flash.is_none() && self.controller_store.is_none()
+        self.nodes == default_ip27_nodes() && self.flash.is_none() && self.controller_store.is_none() && self.io_prom.is_none()
     }
 }
 
@@ -2864,6 +2871,9 @@ impl MachineConfig {
         if profile == MachineProfile::Origin200Ip29 && self.origin200.nodes != default_ip27_nodes() {
             return Err("origin200.nodes: an Origin 200 has one node board".into());
         }
+        if profile == MachineProfile::Origin200Ip29 && self.origin200.io_prom.is_some() {
+            return Err("origin200.io_prom: an Origin 200 has no BaseIO card".into());
+        }
         Ok(())
     }
 
@@ -4324,6 +4334,15 @@ mod export_tests {
         let e = sn0("origin200_ip29", "[origin200]\nnodes = 2\n").validate().unwrap_err();
         assert!(e.contains("origin200.nodes"), "{e}");
         sn0("origin200_ip29", "[origin200]\nnodes = 1\n").validate().unwrap();
+    }
+
+    #[test]
+    fn the_origin_200_has_no_baseio_card_to_fit_an_io_prom() {
+        let e = sn0("origin200_ip29", "[origin200]\nio_prom = \"io6prom.img\"\n").validate().unwrap_err();
+        assert!(e.contains("origin200.io_prom"), "{e}");
+        for (profile, table) in [("origin2000_ip27", "origin2000"), ("onyx2_ip27", "onyx2")] {
+            sn0(profile, &format!("[{table}]\nio_prom = \"io6prom.img\"\n")).validate().unwrap();
+        }
     }
 
     /// A profile says which processors and counts it accepts, and `validate()`

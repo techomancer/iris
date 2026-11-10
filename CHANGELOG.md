@@ -211,6 +211,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   rename that table to `[onyx2]`; iris refuses it otherwise and names the
   table to rename. See [the guide](docs/onyx2-ip27.md).
 
+- `[onyx2] io_prom` and `[origin2000] io_prom` fit the I/O PROM image in the
+  BaseIO card's boot flash. The node PROM loads it at "Loading BASEIO prom";
+  without it the PROM runs its own reduced copy, which has no graphics
+  console.
+
 ### Origin 2000
 
 - `machine.profile = "origin2000_ip27"` runs the stock IP27 PROM on one or

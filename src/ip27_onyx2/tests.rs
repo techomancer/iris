@@ -267,3 +267,23 @@ fn each_ioc3_super_io_interrupt_reaches_its_own_bridge_input() {
         assert_eq!(pending(), 1 << 6 | 1 << 4, "the board IOC3's is input 4");
     });
 }
+
+/// With an I/O PROM image named, the Bridge's flash window at widget offset
+/// 0xc0_0000 shows it, and without one nothing answers there.
+#[test]
+fn the_io_prom_image_fills_the_baseio_flash() {
+    big_stack(|| {
+        let dir = Scratch::new("ioprom");
+        let (_none, bare) = built("noioprom", 1);
+        assert_eq!(bare.bridge().read32(0xc0_0000).status, BUS_ERR);
+        let image = dir.0.join("io6prom.img");
+        std::fs::write(&image, [0xde, 0xad, 0xbe, 0xef, 0x01]).unwrap();
+        let mut cfg = config(&dir.0, 1);
+        cfg.onyx2.io_prom = Some(image.to_string_lossy().into_owned());
+        let m = Onyx2Machine::new(&cfg).unwrap();
+        assert_eq!(m.bridge().read32(0xc0_0000).data, 0xdead_beef);
+        assert_eq!(m.bridge().read32(0xc0_0004).data, 0x01ff_ffff);
+        cfg.onyx2.io_prom = Some(dir.0.join("missing").to_string_lossy().into_owned());
+        assert!(Onyx2Machine::new(&cfg).err().unwrap().contains("onyx2.io_prom"));
+    });
+}

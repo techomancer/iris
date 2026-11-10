@@ -12,7 +12,10 @@ identification word and nothing else.
 Copy [`onyx2.toml.example`](../onyx2.toml.example) to `onyx2.toml`, provide the
 PROM and disk named there, and run `iris --config onyx2.toml`. The sample
 selects `machine.profile = "onyx2_ip27"`; `[onyx2]` (`nodes`, `flash`,
-`controller_store`) holds its own keys. A file that still names `[origin2000]`
+`controller_store`, `io_prom`) holds its own keys. `io_prom` names the I/O PROM
+image the IRIX 6.5.30 media ship beside the node PROM, fitted in the BaseIO's
+boot flash; the graphics console needs it, since the node PROM's own internal
+copy has none. A file that still names `[origin2000]`
 for an Onyx2 is refused, with the table to rename it to. Node slot 1 drives raw slot
 identity 3 into its Hub and takes widget 10; slot 2 drives 2 and takes widget 9.
 With one node, the board is in slot 1.
