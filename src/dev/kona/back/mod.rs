@@ -12,7 +12,12 @@
 //! - `x`, `textport`, `gl`: the X server's integer path, the PROM's console and
 //!   the GL client's commands; `context`: the state each rendering context keeps.
 //! - `display`: the tables the scan-out reads and the frame's composition.
+//! - `bench` (an ignored test): the fill rate of the integer drawing path.
+//! - `census`, `replay` (tests only): the jobs a command stream sends the back
+//!   end, and the replay of a recorded stream into a board.
 
+#[cfg(test)]
+mod bench;
 pub mod display;
 pub mod raster;
 pub mod tiles;
@@ -22,6 +27,14 @@ pub mod context;
 pub mod gl;
 pub mod textport;
 pub mod x;
+#[cfg(test)]
+mod golden;
+#[cfg(test)]
+pub mod census;
+#[cfg(test)]
+mod replay;
+#[cfg(test)]
+mod switch_tests;
 
 
 use super::defs::*;
@@ -167,6 +180,26 @@ pub(super) struct TestHook {
     pub on_attach: Option<Box<dyn FnMut(DisplayHandle) + Send>>,
 }
 
+/// A hook that answers every job as nothing, as a board with no drawing does:
+/// retrace requests complete at once, DMA rows are unclaimed.
+#[cfg(test)]
+pub(super) fn null_hook() -> TestHook {
+    TestHook {
+        job: Box::new(|port, job| {
+            Some(match job {
+                Job::Retrace { tag } => {
+                    port.retrace_done(*tag);
+                    Reply::Done
+                }
+                Job::DmaIn { .. } => Reply::Unclaimed,
+                _ => Reply::Done,
+            })
+        }),
+        events: Arc::default(),
+        on_attach: None,
+    }
+}
+
 /// The InfiniteReality back end.
 pub struct KonaBackend {
     cfg: KonaConfig,
@@ -200,9 +233,11 @@ pub struct KonaBackend {
     tex_counts: gl::texture::TexCounts,
     pix_counts: gl::pixels::Counts,
     query_counts: gl::query::Counts,
-    /// Test hooks: a back end test double that may answer a job.
+    /// Test hooks: a back end test double that may answer a job, and the census tap.
     #[cfg(test)]
     pub(super) hook: Option<TestHook>,
+    #[cfg(test)]
+    pub(super) tap: Option<(Arc<parking_lot::Mutex<census::Census>>, Arc<std::sync::atomic::AtomicUsize>)>,
     /// The GL half of the token layer: assembly scratch and counts, and where its vertices go.
     gl: gl::GlPath,
     /// What the GL path made in one job, until set-up takes it.
@@ -264,6 +299,8 @@ impl KonaBackend {
             query_counts: Default::default(),
             #[cfg(test)]
             hook: None,
+            #[cfg(test)]
+            tap: None,
             gl: gl::GlPath::new(cfg.managed),
             prims: raster::Prims::default(),
             tiles: None,
@@ -540,6 +577,9 @@ impl KonaBackend {
     pub fn job(&mut self, port: &mut BackPort<'_>, job: Job<'_>) -> Reply {
         #[cfg(test)]
         {
+            if let Some((census, at)) = &self.tap {
+                census.lock().tally(&job, at.load(std::sync::atomic::Ordering::Relaxed));
+            }
             if let Some(hook) = &mut self.hook {
                 if let Some(reply) = (hook.job)(port, &job) {
                     return reply;
