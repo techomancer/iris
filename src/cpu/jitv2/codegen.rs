@@ -8942,15 +8942,13 @@ fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Va
 ///   exception of an F32 source at exactly +2^31, which
 ///   `cvt_f32_to_int_by_value` also admits and both sides answer with
 ///   i32::MAX (`fcvt_to_sint_sat`'s saturating cast, same as Rust's `as`).
-/// * Inexact is unreachable in range. `x` is integral after rounding (either
-///   the dynamic-mode magic-number pair or `emit_round_to_int_mode` below),
-///   hence exactly representable in its own format, so the interpreter's
-///   round-trip test `(result as f32/f64) != x` can never fire (including the
-///   ±2^31 edge, where the *integer* round trip `x as i32 as i64` and the
-///   RN-even float cast back agree).
+/// * Inexact is the interpreter's rule: set when rounding changed the source
+///   (`rounded != x`), as Cause and Flag together. With the Inexact enable
+///   set every conversion takes the callout, exact or not.
 ///
-/// Everything else — NaN, ±infinity, out-of-range finite values, and every
-/// Invalid/Cause/Flag/trap consequence — is *not* proven here and branches to
+/// Everything else — NaN, ±infinity, out-of-range finite values, any source
+/// while Inexact is enabled, and every Invalid/Cause/Flag/trap consequence —
+/// is *not* proven here and branches to
 /// the original `core.fpu_cvt_to_int_fn` callout, unchanged: `jit_cvt_to_int`
 /// runs the very `cvt_to_int_and_commit` the interpreter calls, so the cold
 /// path's model is identical by construction rather than by reimplementation.
@@ -8986,6 +8984,10 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     let float_ty = if src_f64 { ir::types::F64 } else { ir::types::F32 };
     let int_ty = if dst_i64 { ir::types::I64 } else { i32t };
     let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    const FCSR_CM: i64 = 0x0001_f000;
+    const FCSR_CI: i64 = 0x0000_1000;
+    const FCSR_FI: i64 = 0x0000_0004;
+    const FCSR_IM: i64 = 0x0000_0080;
 
     let src_bits = if src_f64 {
         emit_read_fpr_l(ctx, fs, fr_mode)
@@ -9039,15 +9041,24 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     } else {
         ctx.builder.ins().fcmp(FloatCC::LessThan, rounded, max)
     };
-    // NaN fails both comparisons, so it takes the callout path with every
-    // other not-provably-in-range value.
+    // NaN fails both comparisons and takes the callout. So does every source
+    // while Inexact is enabled: one test, cheaper than also testing exactness.
     let in_range = ctx.builder.ins().band(ge_min, le_max);
-    ctx.builder.ins().brif(in_range, fast_block, &[], invalid_block, &[]);
+    let exact = ctx.builder.ins().fcmp(FloatCC::Equal, rounded, x);
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let inexact_enable = ctx.builder.ins().band_imm_s(fcsr, FCSR_IM);
+    let inexact_quiet = ctx.builder.ins().icmp_imm_s(IntCC::Equal, inexact_enable, 0);
+    let fast = ctx.builder.ins().band(in_range, inexact_quiet);
+    ctx.builder.ins().brif(fast, fast_block, &[], invalid_block, &[]);
 
     ctx.builder.switch_to_block(fast_block);
     ctx.builder.seal_block(fast_block);
     let result = ctx.builder.ins().fcvt_to_sint_sat(int_ty, rounded);
-    emit_fpu_clear_cause_if_set(ctx);
+    // Cause holds only this instruction's Inexact; the Flag accumulates it.
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    let inexact_bits = ctx.builder.ins().bor_imm_s(cleared, FCSR_CI | FCSR_FI);
+    let new_fcsr = ctx.builder.ins().select(exact, cleared, inexact_bits);
+    ctx.builder.ins().store(mem, new_fcsr, ctx.core_ptr, fcsr_off);
     if dst_i64 {
         emit_write_fpr_l(ctx, fd, result, fr_mode);
     } else {
