@@ -166,7 +166,7 @@ fn identity_and_bar() {
 /// and the GPIO straps the row names, and nothing else.
 #[test]
 fn each_board_reads_back_as_its_row_says() {
-    for board in [&IP30, &IP29, &BASEIO, &BASEIO6G, &IP34, &IP34_NO_PS2] {
+    for board in [&IP30, &IP29, &BASEIO, &BASEIO6G, &IP34, &IP34_NO_PS2, &MIO] {
         let bus = match board.cells.byte_bus {
             ByteBusPart::None => ByteBus::None,
             ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None)),
@@ -190,6 +190,13 @@ fn each_board_reads_back_as_its_row_says() {
         assert_eq!(keeps(0x80, 0x55, u32::MAX), board.cells.parallel, "{name}: parallel");
         assert_eq!(keeps(0xf8, 0x3, 0x3), board.cells.eth, "{name}: Ethernet");
         assert_eq!(r.c.eth().is_some(), board.cells.eth);
+        // The one-wire master is the chip's: a slot always finishes. Whether a
+        // part answers the reset with presence is the board's.
+        r.w32(reg::PIN_CONTROL_SET, 1 << 21);
+        r.w32(reg::MICROLAN, (500 << 10) | (13 << 2));
+        let v = r.r32(reg::MICROLAN);
+        assert_eq!(v & 2, 2, "{name}: the slot finishes");
+        assert_eq!(v & 1 == 0, board.cells.w1, "{name}: presence");
         let straps: u32 = board.gpio.iter().map(|w| matches!(w.to, PinUse::Strap(true)) as u32 * (1 << w.pin)).sum();
         assert_eq!(r.r32(reg::PIN_DATA), straps, "{name}: straps");
         let rtc = board.cells.byte_bus == ByteBusPart::Ds1685;
@@ -556,12 +563,13 @@ fn the_octane_lightbar_follows_pins_0_and_1() {
 #[test]
 fn each_row_wires_its_pins_as_listed() {
     // (board, pins held high, [(pin, status-bar bit)])
-    let rows: [(&Ioc3Board, u32, &[(u32, u64)]); 5] = [
+    let rows: [(&Ioc3Board, u32, &[(u32, u64)]); 6] = [
         (&IP30, 0b1100, &[(0, Rex3::HB_LED_GREEN), (1, Rex3::HB_LED_RED)]),
         (&IP29, 0, &[]),
         (&BASEIO, 0, &[]),
         (&BASEIO6G, 0, &[]),
         (&IP34, 0, &[]),
+        (&MIO, 0, &[]),
     ];
     for (board, straps, bits) in rows {
         let bus = match board.cells.byte_bus {
