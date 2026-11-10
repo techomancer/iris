@@ -1347,9 +1347,14 @@ fn ntp_answers_with_the_host_clock() {
 #[test]
 fn engine_sleeps_until_signalled() {
     let mut net = TestNet::default();
-    let t0 = Instant::now();
-    net.e.step(Duration::from_millis(50));
-    assert!(t0.elapsed() >= Duration::from_millis(45), "idle step returned early: {:?}", t0.elapsed());
+    // Off Unix the engine waits in 1 ms ticks, since host sockets cannot join
+    // the wait there, so only Unix holds a step for the whole idle time.
+    #[cfg(unix)]
+    {
+        let t0 = Instant::now();
+        net.e.step(Duration::from_millis(50));
+        assert!(t0.elapsed() >= Duration::from_millis(45), "idle step returned early: {:?}", t0.elapsed());
+    }
     net.tx_wake.notify();
     let t0 = Instant::now();
     net.e.step(Duration::from_secs(5));
