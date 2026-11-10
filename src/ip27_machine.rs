@@ -40,7 +40,7 @@ use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::Bridge;
-use crate::dev::elsc::{Elsc, ElscConfig, ElscEvent};
+use crate::dev::elsc::{Elsc, ElscConfig, ModuleOutput};
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::hub::{Hub, HubConfig, HubHooks, Space};
@@ -213,7 +213,7 @@ pub trait ModuleController: Send + Sync {
     fn reset(&self);
     /// The controller's outputs since the last call, with its time brought
     /// up to date.
-    fn take_events(&self) -> Vec<ElscEvent>;
+    fn take_events(&self) -> Vec<ModuleOutput>;
 }
 
 /// What a board's I/O hands the machine once it is wired to the node.
@@ -338,11 +338,11 @@ impl HubHooks for Hooks {
 /// What the module controller's outputs ask of the machine: its power output
 /// falling is the module losing power, rising or a reset pulse a restart.
 /// The NMI output has no path to the processor yet and is only logged.
-fn controller_output(event: ElscEvent, machine: &Sender<MachineEvent>) {
+fn controller_output(event: ModuleOutput, machine: &Sender<MachineEvent>) {
     let _ = match event {
-        ElscEvent::Power(false) => machine.send(MachineEvent::PowerOff),
-        ElscEvent::Power(true) | ElscEvent::Reset => machine.send(MachineEvent::HardReset),
-        ElscEvent::Nmi(level) => {
+        ModuleOutput::Power(false) => machine.send(MachineEvent::PowerOff),
+        ModuleOutput::Power(true) | ModuleOutput::Reset => machine.send(MachineEvent::HardReset),
+        ModuleOutput::Nmi(level) => {
             crate::dlog!(LogModule::Hub, "IP27: module controller NMI {level} (not delivered)");
             Ok(())
         }
@@ -816,7 +816,7 @@ impl ModuleController for Origin200Controller {
         self.i2c.power_on();
         self.elsc.power_on();
     }
-    fn take_events(&self) -> Vec<ElscEvent> {
+    fn take_events(&self) -> Vec<ModuleOutput> {
         self.elsc.take_events()
     }
 }

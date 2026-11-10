@@ -12,7 +12,7 @@
 //!
 //! The controller is an I2C target at seven-bit address 0x08 on the Hub's
 //! bus, next to its [`ElscNvram`]. The module's power, reset and NMI are
-//! outputs, reported as [`ElscEvent`]s the machine drains with
+//! outputs, reported as [`ModuleOutput`]s the machine drains with
 //! [`Elsc::take_events`].
 //!
 //! No specification of the controller's protocol, firmware or microcontroller
@@ -94,15 +94,18 @@ const ARB_POSITIONS: u32 = 5;
 const SIGNAL_BASE: u8 = 0xe0;
 const NS_PER_MS: u64 = 1_000_000;
 
-/// What the controller does to its module and to the processors.
+/// What a module controller does to its module and to the processors. The
+/// Origin 200's [`Elsc`] and the Origin 2000 module's controller
+/// ([`crate::dev::o2000_module`]) both emit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ElscEvent {
+pub enum ModuleOutput {
     /// Module power output: low as the module loses power, high as it
     /// returns. A power-down is repeated when the controller learns that a
     /// pending power-up was cancelled, so the machine asks again whether
     /// anything is left to bring a module back.
     Power(bool),
-    /// A pulse on the module's reset line (instantaneous in the model).
+    /// A pulse on the module's reset line (instantaneous in the model; a
+    /// controller that holds the line for a while reports its rising edge).
     Reset,
     /// The NMI output, high for the 100 ms of a pulse.
     Nmi(bool),
@@ -526,7 +529,7 @@ struct State {
 
     /// Bytes for the AUX port, sent once the lock is released.
     out: Vec<u8>,
-    events: Vec<ElscEvent>,
+    events: Vec<ModuleOutput>,
     release_bus: bool,
 }
 
@@ -645,7 +648,7 @@ impl State {
             T_NMI => self.pulse_nmi(),
             T_NMI_PULSE => {
                 self.nmi_pulse_active = false;
-                self.events.push(ElscEvent::Nmi(false));
+                self.events.push(ModuleOutput::Nmi(false));
                 self.tas_lock = TAS_FREE;
                 self.reinitialize();
             }
@@ -753,7 +756,7 @@ impl State {
     /// whether anything is left to power a module up.
     fn recheck_shutdown(&mut self) {
         if !self.powered() && self.module.is_none() {
-            self.events.push(ElscEvent::Power(false));
+            self.events.push(ModuleOutput::Power(false));
         }
     }
 
@@ -820,7 +823,7 @@ impl State {
         self.module_off = true;
         self.reinitialize();
         self.release_bus = true;
-        self.events.push(ElscEvent::Power(false));
+        self.events.push(ModuleOutput::Power(false));
     }
 
     fn power_up_complete(&mut self, announce: bool) {
@@ -834,7 +837,7 @@ impl State {
             return;
         }
         self.module_off = false;
-        self.events.push(ElscEvent::Power(true));
+        self.events.push(ModuleOutput::Power(true));
     }
 
     fn power_up_expired(&mut self) {
@@ -911,7 +914,7 @@ impl State {
             return;
         }
         self.nmi_pulse_active = true;
-        self.events.push(ElscEvent::Nmi(true));
+        self.events.push(ModuleOutput::Nmi(true));
         self.arm_ms(T_NMI_PULSE, NMI_PULSE_MS);
     }
 
@@ -926,7 +929,7 @@ impl State {
             return;
         }
         self.release_bus = true;
-        self.events.push(ElscEvent::Reset);
+        self.events.push(ModuleOutput::Reset);
     }
 
     fn hbt_arm(&mut self, seconds: u64) {
@@ -2158,7 +2161,7 @@ impl State {
         self.cancel(T_NMI_PULSE);
         if self.nmi_pulse_active {
             self.nmi_pulse_active = false;
-            self.events.push(ElscEvent::Nmi(false));
+            self.events.push(ModuleOutput::Nmi(false));
         }
         self.hbt_stop();
         self.hbt_delay = 0;
@@ -2402,7 +2405,7 @@ impl Elsc {
 
     /// The module-power, reset and NMI outputs, in the order they happened,
     /// with time brought up to the present first.
-    pub fn take_events(&self) -> Vec<ElscEvent> {
+    pub fn take_events(&self) -> Vec<ModuleOutput> {
         self.run(|st| {
             if st.deferred_scheduled {
                 st.run_committed_action();
