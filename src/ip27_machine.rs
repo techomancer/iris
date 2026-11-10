@@ -349,23 +349,45 @@ fn controller_output(event: ModuleOutput, machine: &Sender<MachineEvent>) {
     };
 }
 
-/// Accesses to a space the model does not carry stay visible in the log.
-struct Unmodelled(&'static str);
+/// A space or a widget the model does not carry: every access fails and stays
+/// visible in the log. A widget slot can answer its identification word, the
+/// 4-byte read at offset 4, so the PROM finds something fitted there.
+pub(crate) struct Unmodelled {
+    what: &'static str,
+    id: Option<u32>,
+}
+
+impl Unmodelled {
+    pub(crate) fn new(what: &'static str) -> Self {
+        Self { what, id: None }
+    }
+
+    /// `what` answers `id` as its widget identification and nothing else.
+    pub(crate) fn identified(what: &'static str, id: u32) -> Self {
+        Self { what, id: Some(id) }
+    }
+}
+
 impl BusDevice for Unmodelled {
     fn read32(&self, a: u64) -> crate::traits::BusRead32 {
-        crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.0);
-        crate::traits::BusRead32::err()
+        match self.id {
+            Some(id) if a == 4 => crate::traits::BusRead32::ok(id),
+            _ => {
+                crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.what);
+                crate::traits::BusRead32::err()
+            }
+        }
     }
     fn read64(&self, a: u64) -> crate::traits::BusRead64 {
-        crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.0);
+        crate::dlog!(LogModule::Hub, "IP27: read of unmodelled {} {a:#x}", self.what);
         crate::traits::BusRead64::err()
     }
     fn write32(&self, a: u64, v: u32) -> u32 {
-        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.0);
+        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.what);
         BUS_ERR
     }
     fn write64(&self, a: u64, v: u64) -> u32 {
-        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.0);
+        crate::dlog!(LogModule::Hub, "IP27: write of {v:#x} to unmodelled {} {a:#x}", self.what);
         BUS_ERR
     }
 }
@@ -409,7 +431,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
                 ip27::hub_special(memory.home(), &flash, memory.back_door(), memory.back_door()),
             );
             hub.set_space(Space::Io, hub.io_space());
-            hub.set_space(Space::Special, Arc::new(Unmodelled("memory-special space")));
+            hub.set_space(Space::Special, Arc::new(Unmodelled::new("memory-special space")));
             let node = Node { hub, memory, flash, clock: clock.clone(), timers: timers.clone() };
             node.enable_cpu();
 

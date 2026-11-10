@@ -62,10 +62,9 @@ use crate::dev::o2000_module::{ModuleConfig, Origin2000Module};
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
-use crate::devlog::LogModule;
 use crate::pci::DevFn;
-use crate::ip27_machine::{cpu_module, fit_io_prom, pci_devices, product, section, table, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord};
-use crate::traits::{BusDevice, BusRead32, BusRead64, Resettable, BUS_ERR};
+use crate::ip27_machine::{cpu_module, fit_io_prom, pci_devices, product, section, table, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord, Unmodelled};
+use crate::traits::{BusDevice, Resettable};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -169,30 +168,6 @@ pub static ONYX2: DesksideLayout = DesksideLayout {
 
 /// The test widget's identification: not a real part.
 const TEST_WIDGET_ID: u32 = widget_id(0, 0x7e57, 0x36);
-
-/// A widget that answers only its identification word.
-struct TestWidget;
-impl BusDevice for TestWidget {
-    fn read32(&self, a: u64) -> BusRead32 {
-        if a == 4 {
-            return BusRead32::ok(TEST_WIDGET_ID);
-        }
-        crate::dlog!(LogModule::Hub, "Onyx2: read of {a:#x} in the graphics slot, which holds a test widget");
-        BusRead32::err()
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        crate::dlog!(LogModule::Hub, "Onyx2: write of {v:#x} to {a:#x} in the graphics slot, which holds a test widget");
-        BUS_ERR
-    }
-    fn read64(&self, a: u64) -> BusRead64 {
-        crate::dlog!(LogModule::Hub, "Onyx2: 64-bit read of {a:#x} in the graphics slot, which holds a test widget");
-        BusRead64::err()
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        crate::dlog!(LogModule::Hub, "Onyx2: 64-bit write of {v:#x} to {a:#x} in the graphics slot, which holds a test widget");
-        BUS_ERR
-    }
-}
 
 /// The module management as the machine drives it: the adapters to reset
 /// with the module, and the outputs to drain.
@@ -357,7 +332,7 @@ impl Deskside {
             let io = node.hub.io();
             io.connect_widget(0, xbow.clone());
             if let Some(w) = layout.graphics_widget {
-                io.connect_widget(w, xbow.port(w, Arc::new(TestWidget)));
+                io.connect_widget(w, xbow.port(w, Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID))));
             }
             io.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, bridge.clone()));
             for (i, n) in nodes.iter().enumerate() {
