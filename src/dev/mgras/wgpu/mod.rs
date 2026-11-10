@@ -54,6 +54,15 @@ const PIXMEM: Fragment = Fragment::new("pixmem.wgsl", include_str!("shaders/pixm
 const PP1: Fragment = Fragment::new("pp1.wgsl", include_str!("shaders/pp1.wgsl"));
 const TE1: Fragment = Fragment::new("te1.wgsl", include_str!("shaders/te1.wgsl"));
 const RSS: Fragment = Fragment::new("rss.wgsl", include_str!("shaders/rss.wgsl"));
+const RSS_REC: Fragment = Fragment::new("rss_rec.wgsl", include_str!("shaders/rss_rec.wgsl"));
+const RSS_BIN: Fragment = Fragment::new("rss_bin.wgsl", include_str!("shaders/rss_bin.wgsl"));
+
+/// Whether the bin pass tests a GL triangle's spans at each tile
+/// (`shaders/rss_bin.wgsl`) or bins it by its box: `MGRAS_BIN_EDGES=0`
+/// turns the test off.
+fn bin_edges_default() -> bool {
+    std::env::var("MGRAS_BIN_EDGES").map(|v| v != "0").unwrap_or(true)
+}
 
 // ── records ──────────────────────────────────────────────────────────────────
 
@@ -510,8 +519,8 @@ impl GpuRaster {
             &ArchShaders {
                 label: "mgras",
                 raster: &[RSS],
-                bin_accept: None,
-                library: &[library::I64, library::WIDE, PIXMEM, PP1, TE1],
+                bin_accept: bin_edges_default().then_some(RSS_BIN),
+                library: &[library::I64, library::WIDE, PIXMEM, PP1, TE1, RSS_REC],
                 defines: DEFINES,
                 layouts: &[&layout],
             },
@@ -905,6 +914,11 @@ impl GpuRaster {
     /// Batches flushed and records drawn so far.
     pub fn counts(&self) -> (u64, u64) {
         (self.batch.flushes, self.batch.prims_total)
+    }
+
+    /// The batch's GPU times, when measured (WGPU_BATCH_TIMING).
+    pub fn timing_report(&self) -> Option<String> {
+        self.batch.timing.as_ref().map(|t| t.report())
     }
 
     pub fn gpu(&self) -> &Arc<Gpu> {

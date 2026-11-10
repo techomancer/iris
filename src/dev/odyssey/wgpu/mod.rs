@@ -58,10 +58,18 @@ const TILE_CACHE: Fragment = Fragment::new("vram_mem.wgsl", include_str!("shader
 fn tile_cache_default() -> bool {
     std::env::var("VPRO_TILE_CACHE").map(|v| v != "0").unwrap_or(false)
 }
+/// Whether the bin pass tests a triangle's edges at each tile
+/// (`shaders/vpro_bin.wgsl`) or bins it by its box: `VPRO_BIN_EDGES=0`
+/// turns the edge test off.
+fn bin_edges_default() -> bool {
+    std::env::var("VPRO_BIN_EDGES").map(|v| v != "0").unwrap_or(true)
+}
 pub(crate) const VIEWS: Fragment = Fragment::new("views.wgsl", include_str!("shaders/views.wgsl"));
 const BACKEND: Fragment = Fragment::new("backend.wgsl", include_str!("shaders/backend.wgsl"));
 const TEXTURE: Fragment = Fragment::new("texture.wgsl", include_str!("shaders/texture.wgsl"));
 const VPRO: Fragment = Fragment::new("vpro.wgsl", include_str!("shaders/vpro.wgsl"));
+const VPRO_REC: Fragment = Fragment::new("vpro_rec.wgsl", include_str!("shaders/vpro_rec.wgsl"));
+const VPRO_BIN: Fragment = Fragment::new("vpro_bin.wgsl", include_str!("shaders/vpro_bin.wgsl"));
 const COPY: Fragment = Fragment::new("copy.wgsl", include_str!("shaders/copy.wgsl"));
 
 /// `fixed::log2_q8`'s table: log2(1 + i/256) in 1/256, for the kernels'
@@ -907,8 +915,8 @@ impl GpuRaster {
             &ArchShaders {
                 label: "vpro",
                 raster: &[VPRO],
-                bin_accept: None,
-                library: &[library::I64, library::FLOAT, VRAM, if tile_cache { TILE_CACHE } else { VRAM_MEM }, VIEWS, BACKEND, TEXTURE],
+                bin_accept: bin_edges_default().then_some(VPRO_BIN),
+                library: &[library::I64, library::FLOAT, VPRO_REC, VRAM, if tile_cache { TILE_CACHE } else { VRAM_MEM }, VIEWS, BACKEND, TEXTURE],
                 defines: &[("VRAM_WORD_MASK", (words - 1) as u32), ("MAX_DIM", MAX_DIM)],
                 layouts: &[&layout],
             },

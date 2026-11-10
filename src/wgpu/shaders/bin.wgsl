@@ -8,9 +8,11 @@
 // entries and one of busy entries a coarse tile, and nothing to clear for
 // the next batch.
 //
-// `bin_accept(p, tx, ty)` is the board's hook: true when primitive p may
-// cover tile (tx, ty). The default accepts the whole box; a board can
-// test its edge functions at the tile's corners.
+// `bin_accept(p, tx0, ty0, tx1, ty1)` is the board's hook: true when
+// primitive p may cover a pixel of tiles tx0..=tx1, ty0..=ty1, whose
+// rectangle its box overlaps. The default accepts the whole box; a board
+// can test its edge functions at the rectangle's corners. The coarse pass
+// asks it of the coarse tile, the fine pass of each tile.
 
 #include "common.wgsl"
 
@@ -67,7 +69,10 @@ fn bin(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) la
     }
     workgroupBarrier();
     for (var p = lane; p < n; p += 64u) {
-        if overlaps(prim_boxes[p], x0, y0, x0 + COARSE - 1u, y0 + COARSE - 1u) {
+        let cx1 = min(x0 + COARSE, batch.tile_cols) - 1u;
+        let cy1 = min(y0 + COARSE, batch.tile_rows) - 1u;
+        let b = prim_boxes[p];
+        if overlaps(b, x0, y0, cx1, cy1) && bin_accept(p, max(x0, b.x), max(y0, b.y), min(cx1, b.z), min(cy1, b.w)) {
             atomicOr(&wg_coarse[p / 32u], 1u << (p % 32u));
         }
     }
@@ -90,7 +95,7 @@ fn bin(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) la
             let b = firstTrailingBit(bits);
             bits &= bits - 1u;
             let p = w * 32u + b;
-            if overlaps(prim_boxes[p], tx, ty, tx, ty) && bin_accept(p, tx, ty) {
+            if overlaps(prim_boxes[p], tx, ty, tx, ty) && bin_accept(p, tx, ty, tx, ty) {
                 fine |= 1u << b;
             }
         }

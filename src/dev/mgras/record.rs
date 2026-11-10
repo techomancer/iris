@@ -574,6 +574,11 @@ pub(super) mod tests {
         m.stop_engines();
         // SAFETY: the engines are stopped.
         let prims = unsafe { &*m.rss.get() }.stats.prims;
+        #[cfg(feature = "wgpu")]
+        // SAFETY: the engines are stopped.
+        if let Some(t) = unsafe { &*m.rss.get() }.gpu.get().and_then(|g| g.timing_report()) {
+            eprintln!("{path}: {t}");
+        }
         let (drbsize, drb) = unsafe { ((*m.rss.get()).reg(crate::dev::mgras::rss::reg::DRBSIZE), (*m.rss.get()).reg(crate::dev::mgras::rss::reg::DRBPOINTERS)) };
         eprintln!("{path}: at the end DRBsize {drbsize:#x}, DRBpointers {drb:#x}");
         eprintln!(

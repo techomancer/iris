@@ -238,6 +238,11 @@ where they differed:
   primitive. The bin pass takes a fifth of the GPU time (quake1 timedemo:
   1.07 s to 0.20 s, bin and raster together 8% less), and the 35 MB mask
   buffer is gone (an 8 MB list and 1 MB of busy entries instead).
+- The VPro and IMPACT GPU units bin a triangle only to the tiles its
+  edges (VPro) or spans (IMPACT) can reach, not to every tile of its box,
+  tested once per 32x32 coarse tile and again per 8x8 tile. Primitives
+  per busy tile: quake1 timedemo on VPro 10.1 to 4.9, sgiquake on
+  Maximum IMPACT 3.6 to 1.3; bin and raster together 13% and 12% less.
 - Texture reads on the GPU unit go through a plain binding of board
   memory with cached loads instead of atomics (1% of raster time).
 - `WGPU_BATCH_TIMING` times each GPU batch's bin and raster passes with

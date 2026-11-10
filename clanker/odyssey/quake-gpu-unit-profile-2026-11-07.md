@@ -145,6 +145,39 @@ and running the busy tiles in screen order (6.05/6.10 s) changed nothing.
 Unexplained; the RGP traces in `ignore/rgp/2026-11-09-quake-texel-plain/`
 are from the mask build, a list-build capture would show the difference.
 
+## Binning by edges, not boxes (2026-11-09)
+
+With lists, `WGPU_BATCH_TIMING` showed 10.1 primitives per busy tile:
+binning by box sends a triangle to every tile of its box, and each costs
+a full setup in all 64 lanes. The board's `bin_accept(p, tx0, ty0, tx1,
+ty1)` now rejects tile rectangles the primitive cannot draw in, asked
+once per coarse tile (32x32) and once per tile.
+
+- VPro (`vpro_bin.wgsl`): each edge function at the rectangle's corner
+  its steps point to (its largest value there), against the edge's
+  owning test. Conservative: three edges may pass at three corners.
+- IMPACT (`src/dev/mgras/wgpu/shaders/rss_bin.wgsl`): the span bounds
+  are monotonic in the row, so per run of rows on one minor edge, the
+  leftmost left bound and rightmost right bound at the run's ends.
+
+A/B with `VPRO_BIN_EDGES`/`MGRAS_BIN_EDGES=0`, back to back, output
+unchanged (VPro memory hash `65a51d3cd35bf925`; IMPACT final state
+`35e972ff3b58fadf`):
+
+| | bin | raster | busy tiles/batch | prims/busy tile |
+|---|---|---|---|---|
+| VPro quake1, boxes | 0.20 s | 6.09 s | 9,872 | 10.1 |
+| VPro, edges per tile only | 0.48 s | 5.06 s | 9,547 | 4.9 |
+| VPro, edges per coarse tile and tile | 0.37 s | 5.11 s | 9,547 | 4.9 |
+| IMPACT sgiquake, boxes | 0.14 s | 3.72 s | 3,600 | 3.6 |
+| IMPACT, edges per coarse tile and tile | 0.31 s | 3.08 s | 1,400 | 1.3 |
+
+The coarse test is what keeps the bin pass cheap: without it every
+candidate is tested at each of the 16 tiles. IMPACT's busy tiles fall by
+more than half because its boxes are padded by a pixel on each side
+(`tri_box`). The sgiquake replay's wall time (11-15 s) is the CPU side
+and does not show this.
+
 ## Batches: why they end, and the mask walk (2026-11-08)
 
 - Not by size: 559 prims a batch against MAX_PRIMS 4096. With
