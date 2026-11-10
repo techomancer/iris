@@ -57,7 +57,7 @@ use std::sync::{Arc, Weak};
 pub const RESET_VIEW: u64 = 0x1fc0_0000;
 pub const BANK_STRIDE: u64 = 512 << 20;
 pub const SLOT_STRIDE: u64 = 128 << 20;
-/// Banks the Origin 200's board wires.
+/// Banks an SN0 node board wires.
 pub const BANKS: usize = 4;
 
 const MIB: u64 = 1 << 20;
@@ -448,8 +448,9 @@ impl BusDevice for Ip27Bus {
 /// the ppmem window the cache and the JIT read directly. Sending a reference
 /// elsewhere takes the mapping away, so every cached reference of the node
 /// takes the bus path while the number is nonzero. That costs the second node
-/// speed and nothing else, since its software addresses its memory by its
-/// number.
+/// speed (a CPU-bound loop took about 2.2 times as long on the second node's
+/// processor as on the first's, see `docs/onyx2-ip27.md`) and nothing else,
+/// since its software addresses its memory by its number.
 pub struct NodeZero {
     /// Where the Hub publishes the number and the alias.
     routing: Arc<Routing>,

@@ -34,7 +34,17 @@ A disk installed on an Onyx2 boots; the machine cannot install without a pipe.
   it, and both Hubs are hosts, each behind its Crossbow port's link. With two
   nodes the PROM and IRIX program widget 9, the master's Hub; with one, widget
   10.
-- The BaseIO-G is its base board: no MediaIO or audio.
+- A node that holds a nonzero number loses the direct memory window for its
+  cached references, so the second node's processor is slower. Measured under
+  IRIX 6.5.30 on two nodes: `runon N awk 'BEGIN{for(i=0;i<1000000;i++)s+=i}'`
+  took 25.5 to 31.7 s (mean 28.1 s) on processor 0 and 56.9 to 67.0 s (mean
+  61.8 s) on processor 1, five runs each, alternating within one boot on a
+  loaded host: about 2.2 times as long. The cost is attributed to the bus
+  path; no other cause was ruled out.
+- The BaseIO-G carries the MediaIO daughtercard: a second IOC3 at PCI device 6
+  and the RAD1 audio chip at device 7, with the daughtercard's own board
+  record. The MediaIO's serial ports have no host backend, and the host's keys
+  and pointer go to the board IOC3's controller only.
 - The module controller, the cable and the node windows are the
   [Origin 2000 deskside's](origin2000-ip27.md), with its limits.
 - Snapshots are not supported.

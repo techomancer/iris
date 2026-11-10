@@ -104,6 +104,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | Note | Kind | Title |
 |---|---|---|
 | [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
+| [sn0-node-zero-and-bridge-hosts.md](devices/sn0-node-zero-and-bridge-hosts.md) | rule | SN0 machines: a renumbered node sends node zero's cached window beyond its alias to the Hub that holds zero (and loses the ppmem fast path); a Bridge behind a Crossbow reaches the host at the widget the guest programs, gated by that port's link |
 | [pci-layer-open.md](devices/pci-layer-open.md) | open | PCI layer open items: restore vs reset and the AIC-7880 chip reset, the O2's RST#, Bridge reset pins and master time-out approximations, the 2 GB window's reserved range, no external ATE SSRAM, MACE 64-bit PIO |
 | [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30); threading, byte order and open items |
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |

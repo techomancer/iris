@@ -200,6 +200,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `cpu` takes the parts each machine shipped with, such as `r12000_360` on the Octane, or a family name for the machine's own. The Indy and Indigo2 R4400 is now rev 5.0 at 150 MHz, the O2 R10000 rev 3.4 at 250 MHz, and an Indy no longer takes an R10000 (the R10000 Indigo2 is the IP28). The R12000 and R14000 are new.
 - The R16000 is a family of its own, with four parts for the Tezro (`r16000_700` rev 2.1, `r16000_800` rev 2.2, `r16000_900` and `r16000_1000` rev 3.0) and a 4, 8 or 16 MB secondary cache picked once when a machine is built, so no run-time field or branch is added. `hinv` prints an R16000's major revision two below the PRId register's, and the part table undoes that in one place. The FIR is 0x0900, the one R14000 value on record; a model choice. No machine takes them yet.
 
+### SN0 machines
+
+- The Origin 200, Origin 2000 and Onyx2 each read their own table
+  (`[origin200]`, `[origin2000]`, `[onyx2]`), and a table that is not the
+  profile's own is refused. The module controller logs under a new `module`
+  category (see [debug.md](debug.md)), accesses to node memory that is not
+  fitted log under `hub`, and the Origin 2000 and Onyx2 share one board type.
+
 ### Onyx2
 
 - `machine.profile = "onyx2_ip27"` runs the stock IP27 PROM on one or two Hub

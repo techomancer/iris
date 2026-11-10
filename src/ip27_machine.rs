@@ -6,18 +6,21 @@
 //! data, a [`BoardSpec`] of the facts the machine reads (the Hub, the
 //! processor module, the memory and the flash values), plus the one thing
 //! that differs in behaviour, how its I/O is wired to the node
-//! ([`Ip27Board::wire`], which hands back a [`BoardIo`]). The one board here
-//! is the Origin 200 (IP29), selected with
-//! `[machine] profile = "origin200_ip29"`. One node and one CPU are built; the
-//! PROM, the controller store and the timekeeper's NVRAM come from the shared
-//! `prom` and `nvram` keys and `[origin200]`.
+//! ([`Ip27Board::wire`], which hands back a [`BoardIo`]). Two boards are
+//! here: the Origin 200 (IP29), selected with
+//! `[machine] profile = "origin200_ip29"`, and the Origin 2000 and Onyx2
+//! desksides ([`crate::ip27_deskside`]). A board builds one node per node board
+//! with one CPU each; the PROM, the controller store and the timekeeper's NVRAM
+//! come from the shared `prom` and `nvram` keys and the product's own table
+//! (`[origin200]`, `[origin2000]` or `[onyx2]`).
 //!
 //! # What is approximated here
 //!
-//! - One node, one processor, node number zero. Cached accesses ignore the
-//!   node number (see [`crate::ip27`]).
-//! - The Hub's per-slice enable, NMI and cached-alias hooks only log: what a
-//!   store to those registers does to a processor is not established.
+//! - Every node holds one processor. The Origin 200 has one node, number zero,
+//!   and cached accesses to it ignore the node number; a deskside's cached
+//!   accesses are routed by node number (see [`crate::ip27`]).
+//! - The Hub's per-slice enable and NMI stores only log: what a store to those
+//!   registers does to a processor is not established.
 //! - The Bridge reaches the Hub as an XIO host ([`Hub::host_port`]) addressed
 //!   as widget 0xa, with no Crossbow between them.
 //! - The module controller's configuration store comes from
@@ -129,11 +132,11 @@ impl CpuModule {
     }
 }
 
-/// The processors an Origin 200 takes, the default first: the 180 MHz R10000
+/// The processors an SN0 node takes, the default first: the 180 MHz R10000
 /// and the 270 MHz R12000.
 pub const CPUS: &[&Part] = &[&parts::R10000_180, &parts::R12000_270];
 
-/// The processor modules an Origin 200 shipped with, by chip: the 180 MHz
+/// The processor modules an SN0 node shipped with, by chip: the 180 MHz
 /// R10000 (revision 2.6, 1 MiB secondary cache) and the 270 MHz R12000
 /// (revision 2.3, 4 MiB).
 ///
