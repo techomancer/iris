@@ -40,6 +40,11 @@ CPU/GPU parity test replays them.
   The model did not do this before 2026-11-08 (pixtest
   `depth/colour-copy/less` failed on both raster units); it now routes them
   as `Board::image_put` routes an image's pixels.
+- Back to front into a colour-index window (`cicopy`): word 2 bit 31 set with
+  bits 15:12 naming the back field, word 5 the draw drawable. The destination
+  is the window's front, the buffer it displays; the model picks A or B from
+  the displayed buffer. Word 7 bits 23:19 carry an offset the model does not
+  use. Inferred from a trace on a V12.
 - Front to back (`buffers/copy-front-to-back`): one copy within the
   drawable, source field 12 (word 4 bit 31 set: the front) to field 4.
 

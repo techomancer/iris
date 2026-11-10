@@ -582,6 +582,29 @@ fn a_gl_copy_between_the_drawables_moves_the_rectangle() {
     assert_eq!(got, [0x1100_00ff, 0x2200_00ff, 0x1100_00ff, 0x2200_00ff, 0x3300_00ff, 0x4400_00ff]);
 }
 
+/// A glCopyPixels into the front buffer sets bit 31 of word 2 and names the
+/// back field in bits 15:12 (cicopy, traced on a V12), and writes the buffer
+/// the window displays: buffer 0 until a swap, buffer 1 after. The source is
+/// the front too, so each copy reads back the pixel its window shows.
+#[test]
+fn a_copy_into_the_front_buffer_follows_the_displayed_buffer() {
+    let (mut s, _) = window();
+    let front_copy = |s: &mut Board, to: (u32, u32)| {
+        copy_block(s, [0x3000_0019, 40 << 16 | 30, 0x8050_2050, 1 << 16 | 1, 0x9263_3042, 0x3000_0010, to.1 << 16 | to.0, 0x3863_204b]);
+    };
+    pixel_write(&mut s, 30, 40, 0x1100_00ff);
+    front_copy(&mut s, (60, 70));
+    assert_eq!(pixel(&s, 0, 60, 70), 0x1100_00ff, "unswapped: buffer 0");
+    assert_eq!(pixel(&s, 1, 60, 70), 0, "the back buffer is left alone");
+
+    s.front.lock().displayed_buffer = 1;
+    s.gpu_sync();
+    screen_field(&s, 1).store_word(30, 40, 0x2200_00ff);
+    front_copy(&mut s, (62, 70));
+    assert_eq!(pixel(&s, 1, 62, 70), 0x2200_00ff, "swapped: buffer 1");
+    assert_eq!(pixel(&s, 0, 62, 70), 0, "the buffer no longer shown is left alone");
+}
+
 /// TyrQuake's water and lava: it draws the warped liquid into its
 /// 10:10:10:2 window and copies it into the liquid's 8:8:8:8 texture
 /// (glCopyTexSubImage). The copy's source format byte 0x02 names the

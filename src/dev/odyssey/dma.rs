@@ -904,7 +904,13 @@ impl Board {
     /// base 0x609 names is not the frame buffer the scan-out shows (PB&J
     /// entry 0x2801).
     pub fn read_drawable_offscreen(&self) -> bool {
-        let base = self.read_word & !ODSY_DRAW_WORD_STATE;
+        self.drawable_offscreen(self.read_word)
+    }
+
+    /// Whether the buffer register value `word` (0x608 or 0x609) names a
+    /// pixel buffer and not the screen.
+    pub fn drawable_offscreen(&self, word: u32) -> bool {
+        let base = word & !ODSY_DRAW_WORD_STATE;
         let screen = self.pbj(super::frame::pbj::PIXEL_BASE);
 
         screen != 0 && base != 0 && base != screen
@@ -912,6 +918,19 @@ impl Board {
 
     /// The colour buffer, 0 or 1, that a GL read of pixel (x, y) names by
     /// its front bit (word 4 bit 31 of the read header). `front` is logical.
+    /// See `drawable_buffer`.
+    pub fn read_buffer(&mut self, front: bool, x: i64, y: i64) -> u32 {
+        self.drawable_buffer(self.read_word, front, x, y)
+    }
+
+    /// The same for the draw drawable: the buffer a copy's destination names
+    /// by its front bit.
+    pub fn draw_buffer(&mut self, front: bool, x: i64, y: i64) -> u32 {
+        self.drawable_buffer(self.draw_word, front, x, y)
+    }
+
+    /// The colour buffer, 0 or 1, that front or back names at pixel (x, y)
+    /// of the drawable whose buffer register holds `word`.
     ///
     /// A window's logical front is the buffer its id displays and its back
     /// the other: the draw mask the kernel sends is absolute, with front and
@@ -925,16 +944,17 @@ impl Board {
     /// clear) once the halfword is nonzero. A pixel buffer's pane is an
     /// ordinary pane, so a double-buffered pixel buffer swaps like a window.
     /// INFERRED: a read with header bit 31 set returns the buffer a front draw
-    /// mask writes, for a window and a pixel buffer alike. A pixel buffer has
+    /// mask writes, for a window and a pixel buffer alike, and a copy whose
+    /// operand 2 bit 31 is set writes it. A pixel buffer has
     /// no on-screen id, so the model follows bit 31 of 0x609: set means front
     /// is buffer 0, clear means buffer 1, whatever the ids under the pixel
     /// buffer's plane coordinates display. UNKNOWN: how the board encodes bit
     /// 31 of 0x609 together with the header's bit 31. Windows keep the
     /// displayed-buffer rule, which gives the same buffer as the swap state
     /// does; the model has no swap state of its own.
-    pub fn read_buffer(&mut self, front: bool, x: i64, y: i64) -> u32 {
-        if self.read_drawable_offscreen() {
-            let buffer_0_is_front = self.read_word & ODSY_DRAW_WORD_STATE != 0;
+    fn drawable_buffer(&mut self, word: u32, front: bool, x: i64, y: i64) -> u32 {
+        if self.drawable_offscreen(word) {
+            let buffer_0_is_front = word & ODSY_DRAW_WORD_STATE != 0;
 
             return if front == buffer_0_is_front { 0 } else { 1 };
         }

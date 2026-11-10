@@ -13,7 +13,7 @@
 //! | 1 | | source x (15:0), y (31:16) |
 //! | 2 | 31 | destination front |
 //! | 2 | 27:16, 11:0 | destination and source stride, in tiles |
-//! | 2 | 15:12 | the destination field's offset |
+//! | 2 | 15:12 | the destination's B field offset |
 //! | 3 | | width (15:0), height (31:16) |
 //! | 4 | 31, 27:24, 23:20 | source front, B and A field offsets |
 //! | 4 | 19:16, 15:13 | source pixel size and field size, 2 << code bytes |
@@ -24,13 +24,22 @@
 //! | 7 | 19:16, 15:13 | destination pixel size and field size |
 //!
 //! Field offsets count 2-byte units from the start of the pixel. For the
-//! source, word 4 bit 31 picks A (front) or B. The destination's field is
-//! word 2 bits 15:12, whatever word 2 bit 31 says (INFERRED from two traces
-//! that agree on nothing else): the X server's window moves copy a 16-byte
-//! pixel as two 8-byte halves, the second with bit 31 set, word 2 at 4 and
-//! word 7's bits 23:20 at 0; a glCopyPixels into the back buffer of a
-//! double-buffered 8:8:8:8 window has bit 31 clear, word 2 at 2 (the back
-//! field) and word 7 at 6 (the front field).
+//! source, word 4 bit 31 picks A (front) or B. A destination in memory takes
+//! the field word 2 bits 15:12 names, whatever word 2 bit 31 says (the X
+//! server's window moves copy a 16-byte pixel as two 8-byte halves, the
+//! second with bit 31 set and word 2 at 4). A drawable destination with bit
+//! 31 clear takes it too. With bit 31 set it is the window's front, which is
+//! the buffer the window displays, so it follows a swap: A when buffer 0 is
+//! displayed, else the B field word 2 names. A's offset is the pixel mode's
+//! (the library sends one in word 7 bits 23:20, which is not decoded: the
+//! layout lists that bit range as unknown). ESTABLISHED: the destination and
+//! the front bit are those words and that bit. INFERRED: that the front bit
+//! means the displayed buffer, from the window's draw mask, which the kernel
+//! exchanges with a swap, and from one trace of a copy into the front of a
+//! colour-index window (cicopy: bit 31 set, word 2 at 2, the back field,
+//! and GL reads the copied pixels from the front). UNKNOWN: how the board
+//! turns the bit into a buffer, and what a back copy does after a swap, which
+//! stays the field word 2 names.
 //! Before a copy the library points the pixel mode (block 0x017) at the
 //! destination, whose layout gives the destination's packing.
 //!
@@ -104,6 +113,11 @@ impl CopyOperands {
         ReadHeader::new(self.w[4])
     }
 
+    /// Operand 2 bit 31: the copy writes the destination's front buffer.
+    pub fn dst_front(&self) -> bool {
+        CopyMixed::new(self.w[2]).dst_front()
+    }
+
     pub fn src(&self) -> Side {
         let w = &self.w;
         let h = self.read_header();
@@ -136,6 +150,9 @@ impl CopyOperands {
         self.read_header().size_field() == WriteHeader::new(self.w[7]).size_field()
     }
 
+    /// The destination with its field as operand 2 names it, bits 15:12: the
+    /// B field. For a drawable destination `copy_block` picks the buffer
+    /// (see the module).
     pub fn dst(&self) -> Side {
         let w = &self.w;
         Side {
@@ -190,6 +207,22 @@ impl Board {
         super::frame::mode_fields(mode).into_iter().find(|f| f.at == at).map(|f| f.codec)
     }
 
+    /// The destination with its buffer chosen: for a drawable whose copy
+    /// has its front bit set, the field of the buffer the window displays at
+    /// the destination's first pixel (one copy has one window), A at offset
+    /// `front_at` for buffer 0, else the B field the operands name. Any other
+    /// destination is as `CopyOperands::dst()` has it.
+    fn copy_dst_buffer(&mut self, c: &CopyOperands, dst: Side, front_at: u8) -> Side {
+        if !dst.drawable || !c.dst_front() {
+            return dst;
+        }
+        let (x, y) = (dst.x as i64 + self.win.origin[0] as i64, dst.y as i64 + self.win.origin[1] as i64);
+        match self.draw_buffer(true, x, y) {
+            0 => Side { at: front_at, ..dst },
+            _ => dst,
+        }
+    }
+
     /// Block 0x2031 (see the module).
     pub fn copy_block(&mut self) {
         let c = CopyOperands::decode(&self.cmd.operand);
@@ -214,6 +247,7 @@ impl Board {
         // server's copies, which move it whole, under the masks.
         let mode = Format::decode(self.pixel_mode[2]);
         let layout = Layout::of(mode);
+        let dst = self.copy_dst_buffer(&c, dst, layout.front.at);
         let whole_wid = layout.front.codec == Codec::Byte && dst.at == 0 && dst.bytes == 2;
         let dst_codec = [layout.front, layout.back]
             .into_iter()
@@ -521,6 +555,17 @@ mod tests {
         let (s, d) = (c.src(), c.dst());
         assert!(s.drawable && d.drawable);
         assert_eq!((s.at, d.at, d.bytes), (4, 4, 4), "back to back: field B, bytes 4-7");
+    }
+
+    /// cicopy's back-to-front glCopyPixels on a 12-bit colour-index window
+    /// (traced, V12): word 2 0x80502050 has bit 31 set with bits 15:12 at 2,
+    /// the back field, and the destination is word 5, the draw drawable.
+    #[test]
+    fn a_gl_copy_into_the_front_buffer_is_flagged_front_with_the_back_field_named() {
+        let c = CopyOperands::decode(&[0x3000_0019, 0x0094_0014, 0x8050_2050, 0x0020_0040, 0x1233_1071, 0x3000_0010, 0x0044_0096, 0x3833_0061]);
+        let (s, d) = (c.src(), c.dst());
+        assert!(s.drawable && d.drawable && c.dst_front());
+        assert_eq!((s.at, d.at, d.bytes), (4, 4, 2), "back to the back field, 2 bytes, until the board picks the buffer");
     }
 
     #[test]

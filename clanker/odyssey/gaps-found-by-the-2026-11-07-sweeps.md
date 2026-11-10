@@ -23,8 +23,9 @@ the GPU raster unit: these are model gaps, not GPU regressions.
   window shows the clear colour and never the triangle, on both units,
   while the single-buffered run shows it. Swaps happen (the displayed
   buffer bit toggles).
-- **`cicopy`**: the colour-index back-to-front copy to another position
-  leaves the destination at the clear index (`front, copied from back`).
+- **`cicopy`**: the back-to-front copy's front bit (word 2 bit 31) is now
+  honoured: the copy lands in the buffer the window displays
+  (`front, copied from back`).
 - **glstate**: 5 failures (fog index, index write mask, index clear value,
   `PIXEL_TEXTURE_SGIS` enable), as before.
 - **pixtest RGBA**: 53 failures, the ones the first V10 comparison listed
