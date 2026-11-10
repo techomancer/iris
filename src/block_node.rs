@@ -483,9 +483,22 @@ pub struct RawNode {
 impl RawNode {
     /// Open `path` read-write and use its current length as the capacity.
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_flushing_every(path, BACKGROUND_FLUSH_INTERVAL)
+    }
+
+    fn open_flushing_every(path: &Path, interval: Duration) -> io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file_capacity(&mut file)?;
-        Ok(Self::from_file(file, size))
+        let bg = Some(Background::with_interval(&file, interval));
+        Ok(Self { file, size, bg })
+    }
+
+    /// Open `path` read-write with a background flush after `interval`
+    /// rather than [`BACKGROUND_FLUSH_INTERVAL`], so a test need not wait out
+    /// the real one.
+    #[cfg(test)]
+    pub(crate) fn open_with_flush_interval(path: &Path, interval: Duration) -> io::Result<Self> {
+        Self::open_flushing_every(path, interval)
     }
 
     /// Open `path` read-only. Used for removable read-only media (CD-ROM ISOs)
