@@ -223,3 +223,46 @@ fn the_bridge_carries_the_baseio_and_mediaio_records() {
     assert_eq!(roms.len(), 2);
     assert_ne!(roms[0], roms[1], "a search tells the boards apart");
 }
+
+/// The BaseIO-G's Bridge has two IOC3s, at devices 2 and 6, and the SCSI
+/// controllers at 0 and 1; nothing at 5.
+#[test]
+fn the_baseio_g_has_a_second_ioc3_at_device_6() {
+    big_stack(|| {
+        let (_dir, m) = built("mio", 1);
+        let bus = m.bridge().bus();
+        let id = |device| bus.config_read(crate::pci::DevFn { device, function: 0 }, 0, 4);
+        assert_eq!(id(0), Some(0x1020_1077), "an ISP1040");
+        assert_eq!(id(2), Some(0x0003_10a9), "the board IOC3");
+        assert_eq!(id(6), Some(0x0003_10a9), "the MediaIO IOC3");
+        assert_eq!(id(5), None, "nothing at 5");
+    });
+}
+
+/// A SuperIO source raised on the MediaIO's IOC3 reaches Bridge input 6, and
+/// one raised on the board's IOC3 reaches input 4. The table row's pin is the
+/// only thing that sets either, and no guest reads it back from the chip.
+#[test]
+fn each_ioc3_super_io_interrupt_reaches_its_own_bridge_input() {
+    use crate::dev::bridge::reg::INT_STATUS as BRIDGE_INT_STATUS;
+    use crate::dev::ioc3::{int, reg as ioc3_reg};
+    big_stack(|| {
+        let (_dir, m) = built("sio-irq", 1);
+        let bridge = m.bridge().clone();
+        let bus = bridge.bus();
+        // The keyboard controller answers a command byte with an
+        // acknowledge, which raises the keyboard source.
+        let raise = |device: u8| {
+            let f = bus.function(crate::pci::DevFn { device, function: 0 }).unwrap();
+            f.bar_write(0, ioc3_reg::INT_ENABLE_SET, int::KEYBOARD, 4);
+            f.bar_write(0, 0xa8, 0xf4, 4);
+            assert_ne!(f.bar_read(0, ioc3_reg::INT_STATUS, 4) & int::KEYBOARD, 0, "device {device}: source raised");
+        };
+        let pending = || bridge.register(BRIDGE_INT_STATUS) & 0xff;
+        assert_eq!(pending(), 0);
+        raise(6);
+        assert_eq!(pending(), 1 << 6, "the MediaIO's interrupt is Bridge input 6 and no other");
+        raise(2);
+        assert_eq!(pending(), 1 << 6 | 1 << 4, "the board IOC3's is input 4");
+    });
+}
