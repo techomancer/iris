@@ -6,7 +6,8 @@
 //! NVRAM, memory and SCSI devices; `[tezro]` selects the processor
 //! population, the serial console and writable flash. The node itself is
 //! the one the Fuel uses ([`Node`]); this board adds its widgets and its
-//! inputs. Graphics is not attached.
+//! inputs. With `[graphics] board = "v12"` a VPro V12 sits at widget 12
+//! behind the PXBOW; otherwise there is no graphics.
 //!
 //! The board follows the QEMU Tezro compositions:
 //!
@@ -80,7 +81,7 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
-use crate::config::{scsi_label, MachineConfig, TezroConsole};
+use crate::config::{scsi_label, GraphicsBoard, MachineConfig, TezroConsole};
 use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
@@ -95,7 +96,9 @@ use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config};
+use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::pic::{Function, Pic, PicPeer, Refused};
+use crate::dev::pxbow::Pxbow;
 use crate::dev::prom_image;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend, CiSerialBackend, LogMode, SerialBackend, TeeBackend};
@@ -503,6 +506,9 @@ impl TezroMachine {
             memory: &memory,
             cpus: usize::from(cfg.machine.cpus()),
             chip,
+            v12: cfg.graphics_board() == GraphicsBoard::V12,
+            graphics_pool: (cfg.graphics.threads, cfg.graphics.tile),
+            graphics_raster: (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
         })?);
         let timers = Arc::new(TimerManager::new());
         board.ioc4.set_timer_manager(timers.clone());
@@ -593,10 +599,11 @@ impl TezroMachine {
             board.eth.attach(link);
         }
         eprintln!(
-            "iris: Tezro IP53, {} R16000 {} MHz, {} MiB, serial console {:?}",
+            "iris: Tezro IP53, {} R16000 {} MHz, {} MiB, {}, serial console {:?}",
             cpus.len(),
             chip.chip.mhz,
             memory.total_mib(),
+            if board.v12.is_some() { cfg.graphics_board().label() } else { "no graphics" },
             cfg.tezro.console
         );
         Ok(Self {
@@ -779,7 +786,7 @@ impl Workstation for TezroMachine {
         self.lifecycle = state;
     }
     fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        None
+        self.board.v12.as_ref().map(|v12| v12.display())
     }
     fn register_monitor_device(&self, device: Arc<dyn Device>) {
         self.monitor.register_device(device);
@@ -951,6 +958,12 @@ pub(crate) struct TezroBoardConfig<'a> {
     pub cpus: usize,
     /// The R16000 chip fitted.
     pub chip: &'static TezroChip,
+    /// A VPro V12 at widget 12.
+    pub v12: bool,
+    /// Rendering threads and tile size for the V12.
+    pub graphics_pool: (usize, u32),
+    /// Which unit draws and, for the GPU, the wgpu backend (`[graphics]`).
+    pub graphics_raster: (crate::config::RasterUnit, &'a str),
 }
 
 /// The Tezro's devices around its Bedrock node.
@@ -985,6 +998,8 @@ pub(crate) struct TezroBoard {
     pub serial: [Arc<CiSerialBackend>; SERIAL_PORTS],
     /// The R16000 chip fitted, whose flash record the node holds.
     pub chip: &'static TezroChip,
+    /// The VPro V12, when the board has one.
+    pub v12: Option<Arc<Odyssey>>,
     /// The status bar's activity bits and the CPU's Compare matches, which
     /// the graphics board shows.
     pub heartbeat: Arc<AtomicU64>,
@@ -1000,9 +1015,18 @@ pub(crate) struct TezroBoard {
 impl TezroBoard {
     /// The board's devices that take monitor commands: the physical map, the
     /// L1, the SCSI controller, the keyboard and mouse (`ps2 type` and
-    /// friends).
+    /// friends) and, when one is fitted, the VPro (`vpro ...`).
     pub fn monitor_devices(&self) -> Vec<Arc<dyn Device>> {
-        vec![self.bedrock.physical().clone(), self.l1.clone(), self.scsi.clone(), self.ioc4.ps2()]
+        let mut devices: Vec<Arc<dyn Device>> = vec![
+            self.bedrock.physical().clone(),
+            self.l1.clone(),
+            self.scsi.clone(),
+            self.ioc4.ps2(),
+        ];
+        if let Some(v12) = &self.v12 {
+            devices.push(v12.clone());
+        }
+        devices
     }
 
     /// Flush the disks on both channels of the storage controller.
@@ -1021,11 +1045,14 @@ impl TezroBoard {
             memory: &MemoryPopulation::default(),
             cpus,
             chip: &CHIPS[0],
+            v12: false,
+            graphics_pool: (2, 32),
+            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
         })
     }
 
     pub fn with_config(config: TezroBoardConfig<'_>) -> Result<Self, String> {
-        let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus, chip } = config;
+        let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus, chip, v12, graphics_pool, graphics_raster } = config;
         if ![1, 2, 4].contains(&cpus) {
             return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
         }
@@ -1074,6 +1101,7 @@ impl TezroBoard {
         let heartbeat = Arc::new(AtomicU64::new(0));
         let fasttick = Arc::new(AtomicU64::new(0));
         let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+        let v12 = v12.then(|| fit_v12(&bedrock, &pxbow, &status, graphics_pool, graphics_raster)).transpose()?;
         let pics = if cpus == 1 {
             vec![io9.clone()]
         } else {
@@ -1130,6 +1158,7 @@ impl TezroBoard {
             timekeeper,
             serial,
             chip,
+            v12,
             heartbeat,
             fasttick,
             status,
@@ -1161,9 +1190,15 @@ impl TezroBoard {
         for pic in &self.pics {
             pic.power_on();
         }
+        if let Some(v12) = &self.v12 {
+            v12.power_on();
+        }
     }
 
     pub fn start(&self) {
+        if let Some(v12) = &self.v12 {
+            v12.start();
+        }
         self.last_clock.store((self.clock)(), Ordering::Release);
         self.running.store(true, Ordering::Release);
         self.bedrock.start();
@@ -1184,6 +1219,9 @@ impl TezroBoard {
 
     pub fn stop(&self) {
         self.poll();
+        if let Some(v12) = &self.v12 {
+            v12.stop();
+        }
         self.running.store(false, Ordering::Release);
         self.scsi.stop();
         self.eth.stop();
@@ -1197,6 +1235,50 @@ impl Drop for TezroBoard {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Where the V12 sits: widget 12 of the crossbar behind the PIC that owns
+/// widget 0. On the two- and four-processor board this is QEMU's graphics
+/// slot. On the one-processor board the tower guide gives one XIO connector
+/// for a VPro board but names neither its widget nor its route; widget 12
+/// behind the same PXBOW is inferred, not established.
+const V12_WIDGET: u8 = 12;
+
+/// Fit the V12 behind the PXBOW: its interrupt packets and DMA reach
+/// Bedrock IO as the PIC's do. Nothing counts the processors' stores into
+/// its graphics page or returns credits for them.
+fn fit_v12(
+    bedrock: &Arc<Bedrock>,
+    pxbow: &Arc<Pxbow>,
+    status: &Arc<crate::disp::StatusSource>,
+    graphics_pool: (usize, u32),
+    graphics_raster: (crate::config::RasterUnit, &str),
+) -> Result<Arc<Odyssey>, String> {
+    let io = Arc::downgrade(bedrock);
+    let packets: PacketSender = Arc::new(move |widget, address, vector, set| {
+        if widget != HOST_WIDGET {
+            dlog!(LogModule::Bedrock, "Tezro: V12 interrupt to widget {widget} refused; only Bedrock IO is reachable");
+            return false;
+        }
+        let Some(io) = io.upgrade() else { return false };
+        let payload = u64::from(vector) | if set { 1 << 8 } else { 0 };
+        io.inbound_write(V12_WIDGET, Some(INBOUND_DEVICE), address, 8, payload) == BUS_OK
+    });
+    let dma = bedrock.widget_dma(V12_WIDGET);
+    let v12 = Odyssey::new_widget_relative(
+        V12_WIDGET,
+        GraphicsBoard::V12.as_str(),
+        packets,
+        dma,
+        status.clone(),
+        graphics_pool,
+        graphics_raster,
+    )?;
+    pxbow
+        .attach_endpoint(V12_WIDGET, v12.clone() as Arc<dyn BusDevice>)
+        .map_err(|e| format!("Tezro V12: {e:?}"))?;
+    bedrock.connect_widget(V12_WIDGET, pxbow.route(V12_WIDGET));
+    Ok(v12)
 }
 
 /// The far end of a PIC's link: Bedrock IO. Interrupt packets and DMA arrive
