@@ -1791,28 +1791,31 @@ mod tests {
         let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
     }
 
-    /// A WRITE to a disk is synced in the background within about 5 s,
-    /// and a disk nobody writes to is never synced.
+    /// A WRITE to a disk is synced in the background within the flush
+    /// interval, and a disk nobody writes to is never synced. (The interval
+    /// is shortened from the real 5 s; the node tests cover the timer.)
     #[test]
     fn a_disk_write_is_synced_in_the_background_and_an_idle_disk_is_not() {
+        let interval = std::time::Duration::from_millis(100);
         let path = tmp("bgsync");
         std::fs::write(&path, vec![0u8; 8 * 512]).unwrap();
-        let node = crate::block_node::RawNode::open(&path).unwrap();
+        let node = crate::block_node::RawNode::open_with_flush_interval(&path, interval).unwrap();
         let bg = node.background().expect("a writable image has one");
         let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
         let mut dev = ScsiDevice::new(Box::new(node), false, "t".into(), Vec::new(), identity).with_write_cache(true);
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Several intervals with no write: still no sync.
+        std::thread::sleep(interval * 3);
         assert_eq!(bg.syncs(), 0, "no writes, no sync");
         let r = dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x33; 512]))).unwrap();
         assert_eq!(r.status, 0x00);
         assert_eq!(bg.syncs(), 0, "a write does not wait for the sync");
         let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while bg.syncs() == 0 && std::time::Instant::now() < end {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(bg.syncs(), 1, "synced within the interval");
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(interval * 3);
         assert_eq!(bg.syncs(), 1, "idle again");
         // Dropping the disk ends the thread.
         drop(dev);

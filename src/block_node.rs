@@ -488,6 +488,17 @@ impl RawNode {
         Ok(Self::from_file(file, size))
     }
 
+    /// Open `path` read-write with a background flush after `interval`
+    /// rather than [`BACKGROUND_FLUSH_INTERVAL`], so a test need not wait out
+    /// the real one.
+    #[cfg(test)]
+    pub(crate) fn open_with_flush_interval(path: &Path, interval: Duration) -> io::Result<Self> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file_capacity(&mut file)?;
+        let bg = Some(Background::with_interval(&file, interval));
+        Ok(Self { file, size, bg })
+    }
+
     /// Open `path` read-only. Used for removable read-only media (CD-ROM ISOs)
     /// and for a copy-on-write base, whose contents the overlay never mutates
     /// through this node.
