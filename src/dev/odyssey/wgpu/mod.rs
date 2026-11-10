@@ -47,6 +47,17 @@ use super::vram::{VramPtr, DIRTY_BLOCK_SHIFT};
 pub(crate) const PLANE_SPAN: u32 = 2048;
 
 pub(crate) const VRAM: Fragment = Fragment::new("vram.wgsl", include_str!("shaders/vram.wgsl"));
+/// The word operations vram.wgsl includes: plain atomics on board memory.
+pub(crate) const VRAM_MEM: Fragment = Fragment::new("vram_mem.wgsl", include_str!("shaders/vram_mem.wgsl"));
+/// The raster kernel's alternative under the same name: the tile cache,
+/// which holds each tile's blocks in workgroup memory for the batch.
+const TILE_CACHE: Fragment = Fragment::new("vram_mem.wgsl", include_str!("shaders/tile_cache.wgsl"));
+
+/// Whether the raster kernel keeps each tile's blocks in workgroup memory
+/// (`shaders/tile_cache.wgsl`): `VPRO_TILE_CACHE=0` or `1`.
+fn tile_cache_default() -> bool {
+    std::env::var("VPRO_TILE_CACHE").map(|v| v != "0").unwrap_or(false)
+}
 pub(crate) const VIEWS: Fragment = Fragment::new("views.wgsl", include_str!("shaders/views.wgsl"));
 const BACKEND: Fragment = Fragment::new("backend.wgsl", include_str!("shaders/backend.wgsl"));
 const TEXTURE: Fragment = Fragment::new("texture.wgsl", include_str!("shaders/texture.wgsl"));
@@ -615,6 +626,7 @@ impl CopyKernel {
             .define("DID_MAIN_SHIFT", ODSY_DID_MAIN_SHIFT)
             .define("DISPMODE_COUNT", dispmode::COUNT)
             .library(VRAM)
+            .library(VRAM_MEM)
             .library(VIEWS)
             .body(COPY);
         let layouts = [&op_layout, &empty_layout, &vram_layout];
@@ -865,6 +877,12 @@ impl GpuRaster {
     /// A raster unit over `vram_bytes` of board memory (a power of two)
     /// whose plane coordinates span `width` x `height` pixels.
     pub fn new(gpu: &Arc<Gpu>, vram_bytes: u64, width: u32, height: u32) -> Result<GpuRaster, String> {
+        GpuRaster::with_tile_cache(gpu, vram_bytes, width, height, tile_cache_default())
+    }
+
+    /// `new`, choosing whether the raster kernel caches each tile's blocks
+    /// in workgroup memory.
+    pub fn with_tile_cache(gpu: &Arc<Gpu>, vram_bytes: u64, width: u32, height: u32, tile_cache: bool) -> Result<GpuRaster, String> {
         if !vram_bytes.is_power_of_two() || vram_bytes < 8 {
             return Err(format!("vram size {vram_bytes:#x} is not a power of two"));
         }
@@ -888,7 +906,7 @@ impl GpuRaster {
                 label: "vpro",
                 raster: &[VPRO],
                 bin_accept: None,
-                library: &[library::I64, library::FLOAT, VRAM, VIEWS, BACKEND, TEXTURE],
+                library: &[library::I64, library::FLOAT, VRAM, if tile_cache { TILE_CACHE } else { VRAM_MEM }, VIEWS, BACKEND, TEXTURE],
                 defines: &[("VRAM_WORD_MASK", (words - 1) as u32), ("MAX_DIM", MAX_DIM)],
                 layouts: &[&layout],
             },
