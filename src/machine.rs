@@ -2318,8 +2318,7 @@ mod controller_lifetime_tests {
         let held = crate::cow_disk::load_dirty_sidecar(std::path::Path::new(&sidecar)).unwrap_or_default();
         assert!(held.contains(&3) && held.contains(&4), "power-off left no record of the written sectors");
 
-        // Leak the machine as the process exit would.
-        std::mem::forget(machine);
+        drop(machine);
         let _ = std::fs::remove_file(format!("{}.overlay", path.display()));
         let _ = std::fs::remove_file(&sidecar);
         let _ = std::fs::remove_file(&path);
