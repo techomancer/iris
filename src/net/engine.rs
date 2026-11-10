@@ -45,7 +45,7 @@ pub struct NatEngine {
     // The NIC thread signals new tx frames; host sockets wait in its poller.
     pub(super) tx_wake: Arc<Wake>,
     // What the last wait reported ready.
-    events: polling::Events,
+    pub(super) events: polling::Events,
     running: Arc<AtomicBool>,
     pub(super) ctl: Arc<NatControl>,
     pub(super) udp_nat: HashMap<UdpKey, NatUdpEntry>,
@@ -183,33 +183,25 @@ impl NatEngine {
             .fold(HOUSEKEEPING, Duration::min)
     }
 
-    /// Sleep until a guest frame, a ready host socket, or `timeout`.
+    /// Sleep until a guest frame, a ready host socket, or `timeout`, and
+    /// record which host sockets are ready.
     fn wait_for_work(&mut self, timeout: Duration) {
         self.events.clear();
-        if self.short_wait(timeout) {
-            return;
-        }
         for c in self.tcp_nat.values_mut() {
             c.update_interest();
         }
+        // Windows rounds a wait up to its ~15.6 ms timer, too long for a timer
+        // about to expire: sleep that out, then only look at what is ready.
+        let timeout = if timeout < Duration::from_millis(1) {
+            if !timeout.is_zero() {
+                std::thread::sleep(timeout);
+            }
+            Duration::ZERO
+        } else {
+            timeout
+        };
         let _ = self.tx_wake.poller().wait(&mut self.events, Some(timeout));
-        self.tx_wake.consume();
-    }
-
-    /// A wait shorter than a millisecond (a timer about to expire) can't go
-    /// through the poller on Windows, which rounds it up to its ~15.6 ms timer.
-    /// Sleep instead. Host sockets and guest frames are not watched for that
-    /// long, which costs nothing: the pass that follows handles whatever
-    /// arrived. Returns true if it handled the wait.
-    fn short_wait(&mut self, timeout: Duration) -> bool {
-        if timeout >= Duration::from_millis(1) {
-            return false;
-        }
-        if !timeout.is_zero() {
-            std::thread::sleep(timeout);
-        }
         self.tx_wake.consume(); // step() drains tx_cons whatever the signal said
-        true
     }
 
     /// Drop every flow and its host socket (machine reset, subnet change).

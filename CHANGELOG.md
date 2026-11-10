@@ -145,6 +145,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - On a Windows host, the NAT handles data from a host socket as soon as it
   arrives. It used to look at its host sockets on a timer tick, a few
   milliseconds apart, and woke on that tick even with nothing to do.
+- On a Windows host, a guest connecting to a host port nothing listens on is
+  refused, as on other hosts. The NAT had answered it as an open connection.
 
 ### IMPACT detail textures
 
