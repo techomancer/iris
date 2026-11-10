@@ -28,7 +28,9 @@ pub struct Cells {
     pub parallel: bool,
     /// The Ethernet MAC behind `Ioc3Board::phy`.
     pub eth: bool,
-    /// The MicroLAN master with the station-address part.
+    /// The station-address part on the MicroLAN wire. The master is the
+    /// chip's: without a part its slots still finish and the wire reads
+    /// absent.
     pub w1: bool,
     /// What sits on the byte bus.
     pub byte_bus: ByteBusPart,
@@ -129,6 +131,21 @@ pub static BASEIO6G: Ioc3Board = Ioc3Board {
     cells: Cells { kbd: true, ..SERIAL_ETH },
     phy: Phy::Dp83840,
     superio_pin: 4,
+    gpio: &[],
+    pci_policy: PciConfigPolicy::DEFAULT,
+    reset_pci_on_power_on: false,
+};
+
+/// The Onyx2 BaseIO-G's MediaIO daughtercard (Linux's "IP27 MIO"): a second
+/// IOC3 with both serial ports, a keyboard and mouse controller and the
+/// parallel port, and no Ethernet, clock or one-wire part. Its SuperIO
+/// interrupt reaches Bridge input 6.
+pub static MIO: Ioc3Board = Ioc3Board {
+    name: "IP27 MIO",
+    subsystem_id: 0xc301,
+    cells: Cells { serial: true, kbd: true, parallel: true, eth: false, w1: false, byte_bus: ByteBusPart::None },
+    phy: Phy::Dp83840,
+    superio_pin: 6,
     gpio: &[],
     pci_policy: PciConfigPolicy::DEFAULT,
     reset_pci_on_power_on: false,
