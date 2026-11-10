@@ -36,7 +36,7 @@ fn config(dir: &Path, nodes: u8) -> MachineConfig {
     let mut cfg = MachineConfig::default();
     cfg.machine.profile = MachineProfile::Onyx2Ip27;
     cfg.set_cpu(&parts::R10000_180);
-    cfg.origin2000.nodes = nodes;
+    cfg.onyx2.nodes = nodes;
     cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
     cfg.prom = prom(dir);
     cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();

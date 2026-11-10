@@ -36,7 +36,7 @@
 //! Ported from hw/mips/sgi/sn-machine.c and hw/mips/sgi/sn0.c in
 //! jamesbraid/qemu-sgi-origami.
 
-use crate::config::{MachineConfig, MachineProfile};
+use crate::config::{Ip27Section, MachineConfig, MachineProfile};
 use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
@@ -76,6 +76,17 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{atomic::AtomicU64, Arc, Weak};
+
+/// The profile's own `[origin200]`, `[origin2000]` or `[onyx2]` table. Only an
+/// SN0 machine is built from it.
+pub(crate) fn section(cfg: &MachineConfig) -> &Ip27Section {
+    cfg.ip27_section().expect("an SN0 machine reads its product's table")
+}
+
+/// The name of that table, for the prefix of an error about one of its keys.
+pub(crate) fn table(cfg: &MachineConfig) -> &'static str {
+    cfg.machine.profile.ip27_table().expect("an SN0 machine reads its product's table")
+}
 
 /// The PROM image tried when `prom` is left at the shared default.
 pub const ORIGIN200_PROM_FILE: &str = "ip27prom.img";
@@ -819,14 +830,14 @@ impl Ip27Board for Origin200 {
                 cpu_clock_hz: module.clock_hz(),
                 ..FlashValues::ORIGIN200_R10000_180_1M
             },
-            flash_file: cfg.origin200.flash.as_ref().map(PathBuf::from),
+            flash_file: section(cfg).flash.as_ref().map(PathBuf::from),
             node_record: (module.part == &parts::R10000_180).then_some(NodeRecord::PIMM_1XT5),
         }])
     }
 
     fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
         let node = nodes[0];
-        let controller = Origin200Controller::new(node, cfg.origin200.controller_store.as_deref().map(Path::new))?;
+        let controller = Origin200Controller::new(node, section(cfg).controller_store.as_deref().map(Path::new))?;
         let bridge = Bridge::new(Upstream::single(HUB_HOST, node.hub.inbound(), node.hub.interrupt_target()), &crate::ip30::PCI0);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
