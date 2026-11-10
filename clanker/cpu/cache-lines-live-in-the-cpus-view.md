@@ -75,14 +75,18 @@ Each is an approximation, stated where it is made.
 ## Compiled code
 
 A page some CPU holds is not compiled: compiles read memory, and compiled code is
-shared. ppmem puts `GEN_HELD` on the page's generation counter at the first hold
-and takes it off at the last release, moving it with the page on a remap
-(`PpMemSpace::mark`). The compile that finds it publishes nothing and denies every
-offset until the release. ppmem's counters are the bus's for memory. Where the bus
-maps a device over memory, as the IP35 boards map their reset PROM, the compile checks
-that device's counter instead, so the cache puts the same mark there when a page
-becomes held and takes it off with the page's last line (`mark_foreign`). That work
-is at CACHE instructions only; a load, store or fetch is unchanged.
+shared. Each CPU's view puts its own `GEN_HELD` on the page's generation counter
+at its first hold and takes it off at its last release, so no CPU reads another's
+view. ppmem marks a page only while memory backs it, so one held with nothing
+mapped behind it carries no mark until memory arrives. A remap takes every view's
+marks off and puts them back on the counters that back the pages now
+(`PpMemSpace::mark`). The compile
+that finds one publishes nothing and denies every offset until the last view lets
+go. ppmem's counters are the bus's for memory. Where the bus maps a device over
+memory, as the IP35 boards map their reset PROM, the compile checks that device's
+counter instead, so each CPU's cache puts the same mark there when a page becomes
+held in its view and takes it off with the page's last line (`mark_foreign`). That
+work is at CACHE instructions only; a load, store or fetch is unchanged.
 
 ## Seeing it
 

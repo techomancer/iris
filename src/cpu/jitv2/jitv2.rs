@@ -228,11 +228,11 @@ pub fn push_hot_request(hot: &crossbeam_queue::ArrayQueue<CompileRequest>, req: 
 /// for this constant.
 pub const PAGE_SIZE: u32 = 4096;
 
-/// Carried by a page's generation counter while some CPU's cache holds
-/// lines there (`PpMemSpace::hold_line_page`): that CPU runs the page from
-/// its own view, so it is not compiled (`comp::snapshot_page`). It comes off
-/// with an ordinary bump, below the held page's last publish, so `publish`
-/// takes any change of generation as new bytes.
+/// Carried by a page's generation counter once for each CPU whose cache
+/// holds lines there (`PpMemSpace::hold_line_page`): that CPU runs the page
+/// from its own view, so it is not compiled (`comp::snapshot_page`). Each
+/// comes off with an ordinary bump, below the held page's last publish, so
+/// `publish` takes any change of generation as new bytes.
 pub const GEN_HELD: u64 = 1 << 48;
 
 /// Number of possible entry offsets per page: one per 4-byte-aligned word
