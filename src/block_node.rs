@@ -1218,6 +1218,10 @@ impl BlockNode for ChdNode {
             dirty: true,
         });
         let folded = crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false);
+        // A fold that went in left nothing to commit, even if the reopen fails.
+        if let (Ok(()), Some(c)) = (&folded, &mut self.closed) {
+            c.dirty = false;
+        }
         // base + diff are intact even when the fold failed, so either way the
         // disk can be reopened; surface the fold error after restoring the node.
         // A reopen that fails leaves `closed` for the next command to retry.
@@ -1856,6 +1860,7 @@ mod tests {
         std::fs::rename(&base, &away).unwrap();
         assert_eq!(node.size(), 256 * 1024);
         assert!(node.is_cow(), "the node still reopens with a diff");
+        assert_eq!(node.dirty_count(), 0, "the fold took the changes");
         (node, base, away)
     }
 
