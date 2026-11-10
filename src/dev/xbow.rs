@@ -55,12 +55,12 @@
 //! Ported from hw/misc/sgi-xbow.c in jamesbraid/qemu-sgi-origami.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 
 use super::heart::Clock;
-
+use crate::dev::bridge::Bridge;
 use crate::irq::InterruptController;
 use crate::snapshot::{field_bool, field_u32, field_u32s, field_u8, StateTable};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK, Saveable};
@@ -300,6 +300,9 @@ pub struct Xbow {
     /// Told of a link reset, with the widget, once the switch's own state
     /// has settled: the widget at the far end resets too.
     on_link_reset: OnceLock<Box<dyn Fn(u8) + Send + Sync>>,
+    /// The Bridges behind ports ([`Self::serve_bridge`]), reset with their
+    /// port's link.
+    served: Mutex<Vec<(u8, Weak<Bridge>)>>,
     unsupported: Mutex<Vec<(u32, u8, bool)>>,
     /// `unsupported` holds 64: a further access costs one relaxed load.
     unsupported_full: AtomicBool,
@@ -340,6 +343,7 @@ impl Xbow {
             host: OnceLock::new(),
             on_link_change: OnceLock::new(),
             on_link_reset: OnceLock::new(),
+            served: Mutex::new(Vec::new()),
             unsupported: Mutex::new(Vec::new()),
             unsupported_full: AtomicBool::new(false),
         }
@@ -406,6 +410,15 @@ impl Xbow {
         let _ = self.on_link_reset.set(f);
     }
 
+    /// Serve the Bridge behind port `widget`: it sends only to widgets with a
+    /// live link, and a reset of that link resets it. Every machine that puts
+    /// a Bridge behind a Crossbow calls this once for each Bridge.
+    pub fn serve_bridge(self: &Arc<Self>, widget: u8, bridge: &Arc<Bridge>) {
+        let links = self.clone();
+        bridge.set_link_alive(Box::new(move |w| links.carries(w)));
+        self.served.lock().push((widget, Arc::downgrade(bridge)));
+    }
+
     pub fn register_locks(self: &Arc<Self>) {
         use crate::locks::register_mutex_fn;
         register_mutex_fn("xbow::regs", self, |x| x.regs.is_locked());
@@ -438,8 +451,12 @@ impl Xbow {
                 cb(FIRST_WIDGET + link, self.alive.load(Ordering::Acquire) >> link & 1 != 0);
             }
         }
-        if let Some(cb) = self.on_link_reset.get() {
-            for w in out.link_resets {
+        for w in out.link_resets {
+            let served: Vec<_> = self.served.lock().iter().filter(|(p, _)| *p == w).filter_map(|(_, b)| b.upgrade()).collect();
+            for b in served {
+                b.link_reset();
+            }
+            if let Some(cb) = self.on_link_reset.get() {
                 cb(w);
             }
         }
@@ -1515,6 +1532,23 @@ mod tests {
         // Power-on drops nothing it fitted.
         crate::traits::Resettable::power_on(&*x);
         assert_eq!(seen.lock().len(), 1);
+    }
+
+    /// A link reset of the Bridge's port resets the Bridge, and a reset of
+    /// another port leaves it alone.
+    #[test]
+    fn a_link_reset_resets_the_bridge_behind_that_port_only() {
+        use crate::dev::bridge::reg;
+        let x = Arc::new(octane());
+        let bridge = Bridge::new(Upstream::new(), &crate::ip30::PCI0);
+        x.serve_bridge(15, &bridge);
+        let enable = |v: u32| assert_eq!(BusDevice::write32(&*bridge, u64::from(reg::INT_ENABLE + 4), v), BUS_OK);
+        enable(0x44);
+        assert_eq!(bridge.register(reg::INT_ENABLE), 0x44);
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 6 + LINK_RESET + 4, 4, 0));
+        assert_eq!(bridge.register(reg::INT_ENABLE), 0x44, "port 14 is not the Bridge's");
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
+        assert_eq!(bridge.register(reg::INT_ENABLE), 0, "port 15 is");
     }
 
     #[test]

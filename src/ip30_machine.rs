@@ -355,9 +355,6 @@ impl OctaneMachine {
         bridge.attach_flash(flash.clone(), FLASH_SIZE as u32);
         bridge.attach_flash_select1(Arc::new(RawFlash::new(&[], FLASH_SELECT1_SIZE)), FLASH_SELECT1_SIZE as u32);
         bridge.set_microlan(identity.system_board.bus());
-        // DMA reaches only widgets the Crossbow has a live link to.
-        let links = xbow.clone();
-        bridge.set_link_alive(Box::new(move |w| links.carries(w)));
 
         // Option boards: each a Bridge on its own port, reaching memory and
         // HEART as the onboard one does, over the links the Crossbow has up.
@@ -365,8 +362,7 @@ impl OctaneMachine {
         let xio_boards: Vec<XioPciBoard> = cfg.xio_board.iter().zip(&xio_widgets).map(|(b, &w)| {
             let up = xbow.upstream(vec![HostPort::new(crate::ip30::HEART_HOST, mem.clone(), heart.clone())]);
             let board = XioPciBoard::new(b.kind, w, up, bridge_revision);
-            let links = xbow.clone();
-            board.bridge().set_link_alive(Box::new(move |w| links.carries(w)));
+            xbow.serve_bridge(w, board.bridge());
             eprintln!("iris: {} in XIO slot {w}", b.kind.label());
             board
         }).collect();
@@ -504,15 +500,9 @@ impl OctaneMachine {
                 }
             }));
         }
-        let mut resettable: Vec<(u8, std::sync::Weak<Bridge>)> = vec![(WIDGET_BRIDGE, Arc::downgrade(&bridge))];
-        resettable.extend(xio_boards.iter().map(|b| (b.widget(), Arc::downgrade(b.bridge()))));
-        xbow.on_link_reset(Box::new(move |w| {
-            if let Some((_, b)) = resettable.iter().find(|(p, _)| *p == w) {
-                if let Some(b) = b.upgrade() {
-                    b.link_reset();
-                }
-            }
-        }));
+        // DMA reaches only widgets the Crossbow has a live link to, and a
+        // reset of the Bridge's link resets it.
+        xbow.serve_bridge(WIDGET_BRIDGE, &bridge);
 
         eprintln!(
             "iris: Octane with {} MB ({}), {}",
