@@ -8,12 +8,13 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::engine::NatEngine;
 use super::packet::{self, Icmp, MacAddr};
+use super::wake::Watched;
 use crate::devlog::LogModule;
 
 const ICMP_IDLE: Duration = Duration::from_secs(30);
 
 pub(super) struct NatIcmpEntry {
-    pub(super) sock: Option<Socket>, // None if socket creation failed (e.g. not admin on Windows)
+    pub(super) sock: Option<Watched<Socket>>, // None if socket creation failed (e.g. not admin on Windows)
     client_mac: MacAddr,
     client_ip: Ipv4Addr,
     pub(super) last_use: Instant,
@@ -58,9 +59,14 @@ impl NatEngine {
         if self.icmp_unavailable {
             return;
         }
+        let wake = &self.tx_wake;
         let entry = self.icmp_nat.entry(key).or_insert_with(|| {
-            let sock = match icmp_socket() {
-                Ok(s) => { let _ = s.set_nonblocking(true); Some(s) }
+            let sock = icmp_socket().and_then(|s| {
+                let _ = s.set_nonblocking(true);
+                Watched::new(s, wake, true, false)
+            });
+            let sock = match sock {
+                Ok(s) => Some(s),
                 Err(e) => {
                     #[cfg(windows)]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out. \
