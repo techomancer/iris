@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use super::engine::NatEngine;
 use super::packet::{MacAddr, Udp};
 use super::services::{BOOTP_SERVER_PORT, DNS_PORT};
+use super::wake::Watched;
 use crate::devlog::LogModule;
 
 const UDP_IDLE: Duration = Duration::from_secs(60);
@@ -31,7 +32,7 @@ pub(super) fn allow_large_datagrams(sock: &UdpSocket) {
 pub(super) type UdpKey = (u32, u16);
 
 pub(super) struct NatUdpEntry {
-    pub(super) sock: UdpSocket,
+    pub(super) sock: Watched<UdpSocket>,
     client_mac: MacAddr,
     /// Real peer address → the address the guest sent to.
     aliases: HashMap<SocketAddrV4, SocketAddrV4>,
@@ -95,6 +96,10 @@ impl NatEngine {
             let _ = sock.set_nonblocking(true);
             allow_large_datagrams(&sock);
             dlog_dev!(LogModule::Net, "NAT UDP new flow guest {}:{} via host {:?}", src_ip, sport, sock.local_addr());
+            let Ok(sock) = Watched::new(sock, &self.tx_wake, true, false) else {
+                dlog_dev!(LogModule::Net, "NAT UDP: cannot watch the host socket for guest :{}", sport);
+                return;
+            };
             self.udp_nat.insert(key, NatUdpEntry { sock, client_mac, aliases: HashMap::new(),
                                                    last_dst: visible, last_use: Instant::now() });
         }

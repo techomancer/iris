@@ -2,9 +2,11 @@
 //! injected into the guest as if they came from the gateway.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::Arc;
 
 use super::engine::NatEngine;
 use super::tcp::Endpoints;
+use super::wake::{Wake, Watched};
 use crate::config::{ForwardBind, ForwardProto, PortForwardConfig};
 use crate::devlog::LogModule;
 
@@ -16,12 +18,12 @@ const X11_BASE_PORT: u16 = 6000;
 const MAX_FTP_DATA_FWD: usize = 16;
 
 pub(super) struct TcpFwdListener {
-    pub(super) listener: TcpListener,
+    pub(super) listener: Watched<TcpListener>,
     pub(super) guest_port: u16,
 }
 
 pub(super) struct UdpFwdListener {
-    pub(super) sock: UdpSocket,
+    pub(super) sock: Watched<UdpSocket>,
     guest_port: u16,
     host_port: u16,
     /// Most recent sender; the guest's replies go back here.
@@ -29,8 +31,8 @@ pub(super) struct UdpFwdListener {
 }
 
 /// Bind host listeners for a set of forward rules (at construction, and when
-/// forwards are reconfigured live).
-pub(super) fn bind_forwards(rules: &[PortForwardConfig]) -> (Vec<TcpFwdListener>, Vec<UdpFwdListener>) {
+/// forwards are reconfigured live), watched in `wake`'s poller.
+pub(super) fn bind_forwards(rules: &[PortForwardConfig], wake: &Arc<Wake>) -> (Vec<TcpFwdListener>, Vec<UdpFwdListener>) {
     let mut tcp = Vec::new();
     let mut udp = Vec::new();
     for rule in rules {
@@ -40,7 +42,7 @@ pub(super) fn bind_forwards(rules: &[PortForwardConfig]) -> (Vec<TcpFwdListener>
         };
         let addr = SocketAddr::new(IpAddr::V4(bind_addr), rule.host_port);
         match rule.proto {
-            ForwardProto::Tcp => match TcpListener::bind(addr) {
+            ForwardProto::Tcp => match TcpListener::bind(addr).and_then(|l| Watched::new(l, wake, true, false)) {
                 Ok(listener) => {
                     let _ = listener.set_nonblocking(true);
                     eprintln!("iris: TCP port forward {}:{} → guest:{}", bind_addr, rule.host_port, rule.guest_port);
@@ -48,7 +50,7 @@ pub(super) fn bind_forwards(rules: &[PortForwardConfig]) -> (Vec<TcpFwdListener>
                 }
                 Err(e) => eprintln!("iris: TCP port forward {}:{} failed to bind: {}", bind_addr, rule.host_port, e),
             },
-            ForwardProto::Udp => match UdpSocket::bind(addr) {
+            ForwardProto::Udp => match UdpSocket::bind(addr).and_then(|s| Watched::new(s, wake, true, false)) {
                 Ok(sock) => {
                     let _ = sock.set_nonblocking(true);
                     super::nat_udp::allow_large_datagrams(&sock);
@@ -70,7 +72,7 @@ impl NatEngine {
     pub(super) fn rebind_forwards(&mut self, rules: &[PortForwardConfig]) {
         let cut = self.fwd_static_count.min(self.tcp_fwd_listeners.len());
         let transient = self.tcp_fwd_listeners.split_off(cut);
-        let (mut tcp, udp) = bind_forwards(rules);
+        let (mut tcp, udp) = bind_forwards(rules, &self.tx_wake);
         self.fwd_static_count = tcp.len();
         tcp.extend(transient);
         self.tcp_fwd_listeners = tcp;
@@ -79,6 +81,10 @@ impl NatEngine {
 
     /// Register a transient forward for an FTP passive data connection.
     pub(super) fn add_ftp_data_forward(&mut self, listener: TcpListener, guest_port: u16) {
+        let Ok(listener) = Watched::new(listener, &self.tx_wake, true, false) else {
+            dlog_dev!(LogModule::Net, "NAT FTP ALG: cannot watch the data listener for guest:{}", guest_port);
+            return;
+        };
         while self.tcp_fwd_listeners.len() >= self.fwd_static_count + MAX_FTP_DATA_FWD
             && self.tcp_fwd_listeners.len() > self.fwd_static_count
         {
