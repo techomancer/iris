@@ -1113,52 +1113,25 @@ fn parallel_dma_drains_a_context_and_raises_service() {
     assert_eq!(r.r32(reg::INT_STATUS) & int::PARALLEL_SERVICE, 0, "quieted at the port");
 }
 
-/// What the Ethernet block is told and asked.
-#[derive(Default)]
-struct MockEth {
-    regs: Mutex<std::collections::BTreeMap<u32, u32>>,
-    wired: Mutex<Option<(Arc<dyn PciDma>, Box<dyn Fn(bool) + Send + Sync>)>>,
-}
-
-impl Ioc3EthPort for MockEth {
-    fn read32(&self, off: u32) -> u32 {
-        *self.regs.lock().unwrap().get(&off).unwrap_or(&0)
-    }
-    fn write32(&self, off: u32, val: u32) {
-        self.regs.lock().unwrap().insert(off, val);
-    }
-    fn connect(&self, dma: Arc<dyn PciDma>, irq: Box<dyn Fn(bool) + Send + Sync>) {
-        *self.wired.lock().unwrap() = Some((dma, irq));
-    }
-}
-
 #[test]
-fn the_ethernet_registers_are_forwarded_and_the_block_is_wired() {
+fn the_ethernet_registers_are_the_macs_and_it_gets_the_chips_dma() {
     let r = Rig::new();
-    let eth = Arc::new(MockEth::default());
-    r.c.attach_eth(eth.clone());
-    // Attached after the bridge gave DMA: wired at once.
-    assert!(eth.wired.lock().unwrap().is_some());
-    r.w32(0xf4, 0x1234);
+    let eth = r.c.eth().unwrap().clone();
+    r.w32(0xf8, 0x1234);
     r.w32(0x150, 0xbeef);
-    assert_eq!(eth.read32(0xf4), 0x1234);
+    assert_eq!(eth.read32(0xf8), 0x1234);
     assert_eq!(eth.read32(0x150), 0xbeef);
-    assert_eq!(r.r32(0xf4), 0x1234);
+    assert_eq!(r.r32(0xf8), 0x1234);
     // Just before the block and just after it are not the block's.
     r.w32(0xec, 7);
     assert_eq!(eth.read32(0xec), 0);
     r.w32(0x154, 7);
-    assert_eq!(eth.read32(0x154), 0);
+    assert_eq!(r.r32(0x154), 0);
     // Only 32-bit accesses reach the block.
-    assert_eq!(r.r8(0xf4), 0);
-}
-
-#[test]
-fn the_ethernet_block_gets_the_chips_view_of_memory() {
-    let r = Rig::new();
-    let eth = Arc::new(MockEth::default());
-    r.c.attach_eth(eth.clone());
-    let dma = eth.wired.lock().unwrap().as_ref().unwrap().0.clone();
+    assert_eq!(r.r8(0xf8), 0);
+    // Its ring entries go through the chip's byte order: the first descriptor
+    // word is big-endian on the bus, as `Ioc3Dma` places it.
+    let dma = r.c.sh.core.dma().unwrap().clone();
     assert!(dma.dma_write(0x500, &[0xde, 0xad, 0xbe, 0xef]).is_ok());
     assert_eq!(&r.mem.0.lock().unwrap()[0x500..0x504], &[0xef, 0xbe, 0xad, 0xde]);
     let mut b = [0u8; 4];
@@ -1170,29 +1143,24 @@ fn the_ethernet_block_gets_the_chips_view_of_memory() {
 #[test]
 fn the_ethernet_level_drives_the_pci_pin_not_the_superio_line() {
     let c = Ioc3::octane(MAC, false);
-    let eth = Arc::new(MockEth::default());
-    c.attach_eth(eth.clone());
     c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
     c.state().connect_irq(line);
     c.attached();
     let (sup, sline) = LevelProbe::line();
     c.connect_superio_interrupt(sline);
-    let wired = eth.wired.lock().unwrap();
-    let irq = &wired.as_ref().unwrap().1;
-    irq(true);
+    c.sh.core.set_inta(true);
     assert!(pin.level());
     assert!(!sup.level());
     assert_eq!(c.int_status(), 0, "no SuperIO status bit for it");
-    irq(false);
+    c.sh.core.set_inta(false);
     assert!(!pin.level());
 }
 
 #[test]
 fn buffer_ram_parity_follows_the_mac_control_bit() {
     let r = Rig::new();
-    let eth = Arc::new(MockEth::default());
-    r.c.attach_eth(eth.clone());
+    let eth = r.c.eth().unwrap().clone();
     // Checking off: stored as written, 17 bits, no error flag.
     r.w32(reg::SSRAM, 0x0001_0001);
     assert_eq!(r.r32(reg::SSRAM), 0x0001_0001);
@@ -1356,18 +1324,14 @@ fn the_superio_line_is_driven_only_on_change_and_in_order_across_threads() {
 #[test]
 fn the_ethernet_pin_follows_the_last_level_given() {
     let c = Ioc3::octane(MAC, false);
-    let eth = Arc::new(MockEth::default());
-    c.attach_eth(eth.clone());
     c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
     c.state().connect_irq(line);
     c.attached();
-    let wired = eth.wired.lock().unwrap();
-    let irq = &wired.as_ref().unwrap().1;
     for i in 0..1000 {
-        irq(i % 2 == 0);
+        c.sh.core.set_inta(i % 2 == 0);
     }
-    irq(true);
+    c.sh.core.set_inta(true);
     assert!(pin.level());
 }
 
@@ -1996,7 +1960,6 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     r.w8(reg::BYTEBUS_DEV1, 0x40);
     r.w8(reg::BYTEBUS_DEV2, 0x55);
     assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0);
-    r.c.attach_eth(crate::dev::ioc3::eth::Ioc3Eth::new_fuel(MAC));
     use crate::dev::ioc3::eth::{bits::MII_READ, reg::{MII_CONTROL, MII_DATA_R, MII_DATA_W}};
     r.w32(MII_DATA_W, 7);
     r.w32(MII_CONTROL, (1 << 5) | 0x19);

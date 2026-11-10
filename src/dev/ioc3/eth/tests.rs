@@ -5,6 +5,7 @@
 //! Ported from tests/qtest/sgi-ioc3-eth-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use crate::irq::{InterruptController, IrqLine};
 use std::sync::Mutex;
 
 const MEM_SIZE: usize = 0x80_0000;
@@ -46,12 +47,42 @@ struct Rig {
     inject: rtrb::Producer<Vec<u8>>,
 }
 
+/// The PCI pin the MAC drives, as the levels it was given in order.
+struct Pin(Arc<Mutex<Vec<bool>>>);
+
+impl InterruptController for Pin {
+    fn set_line(&self, _line: u32, level: bool) {
+        self.0.lock().unwrap().push(level);
+    }
+}
+
+/// The chip state a MAC shares with its parent, with bus-master memory
+/// behind it if there is some, and a log of the pin.
+fn core_for(mem: Option<Arc<Mem>>) -> (Arc<Core>, Arc<Mutex<Vec<bool>>>) {
+    let core = Arc::new(Core::new());
+    if let Some(m) = mem {
+        let _ = core.dma.set(m);
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    core.connect_pin(IrqLine::new(Arc::new(Pin(log.clone())), 0));
+    log.lock().unwrap().clear();
+    (core, log)
+}
+
+/// A MAC behind the Octane's transceiver with a negotiation of `delay`.
+fn mac(core: &Arc<Core>, delay: Duration) -> Arc<Ioc3Eth> {
+    Ioc3Eth::with_phy(core.clone(), STATION, Box::new(Ics1890::new(PHY_ADDR, delay)))
+}
+
+/// A MAC with nothing behind it, for tests of its management port.
+fn standalone(phy: Box<dyn MiiPhy>) -> Arc<Ioc3Eth> {
+    Ioc3Eth::with_phy(core_for(None).0, STATION, phy)
+}
+
 fn rig() -> Rig {
-    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
     let mem = Arc::new(Mem(Mutex::new(vec![0; MEM_SIZE])));
-    let irq = Arc::new(Mutex::new(Vec::new()));
-    let log = irq.clone();
-    eth.connect(mem.clone(), Box::new(move |l| log.lock().unwrap().push(l)));
+    let (core, irq) = core_for(Some(mem.clone()));
+    let eth = mac(&core, Duration::ZERO);
     let (link, sent, inject) = crate::net::Link::loopback();
     eth.attach(link);
     Rig { eth, mem, irq, sent, inject }
@@ -184,7 +215,7 @@ fn software_reset_restores_defaults_and_self_clears() {
 #[test]
 fn the_origin_200_transceiver_answers_at_address_31_only() {
     let mut t = rig();
-    t.eth = Ioc3Eth::new_origin200(STATION);
+    t.eth = standalone(Box::new(Dp83840::new(ORIGIN200_PHY_ADDR)));
     assert_eq!(t.mii(31, 2), 0x2000);
     assert_eq!(t.mii(31, 3), 0x5c01);
     assert_eq!(t.mii(1, 3), 0xffff);
@@ -214,7 +245,7 @@ fn negotiation_completes_and_reports_link() {
 
 #[test]
 fn negotiation_waits_for_its_deadline() {
-    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::from_secs(3600));
+    let eth = standalone(Box::new(Ics1890::new(PHY_ADDR, Duration::from_secs(3600))));
     eth.write32(MII_CONTROL, MII_READ | (1 << 5) | 1);
     let bmsr = eth.read32(MII_DATA_R);
     assert_eq!(bmsr & 0x0024, 0, "no link before the peer answers");
@@ -715,10 +746,8 @@ fn a_reset_during_an_interrupt_delivery_leaves_the_line_low() {
         while t.irq.lock().unwrap().is_empty() && start.elapsed() < Duration::from_millis(100) {
             std::thread::yield_now();
         }
-        if let Some(cb) = t.eth.irq.lock().as_ref() {
-            for level in events {
-                cb(level);
-            }
+        for level in events {
+            t.eth.core.set_inta(level);
         }
         drop(order);
         reset.join().unwrap();
@@ -758,9 +787,8 @@ fn a_stopped_mac_takes_no_frames_until_it_starts() {
 /// at the PHY's deadline.
 #[test]
 fn a_frame_waits_for_the_negotiation_deadline_without_a_wake() {
-    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::from_millis(60));
     let mem = Arc::new(Mem(Mutex::new(vec![0; MEM_SIZE])));
-    eth.connect(mem.clone(), Box::new(|_| {}));
+    let eth = mac(&core_for(Some(mem.clone())).0, Duration::from_millis(60));
     let (link, _sent, mut inject) = crate::net::Link::loopback();
     eth.attach(link);
     let t = Rig { eth, mem, irq: Arc::new(Mutex::new(Vec::new())), sent: rtrb::RingBuffer::new(1).1, inject: rtrb::RingBuffer::new(1).0 };
@@ -789,7 +817,7 @@ fn waits_for(cond: impl Fn() -> bool) -> bool {
 /// ends them.
 #[test]
 fn stopping_the_mac_joins_its_threads() {
-    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
+    let eth = standalone(Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO)));
     let mut net = crate::config::NetworkConfig::default();
     net.port_forward.clear();
     eth.attach(crate::net::Link::open(&net).unwrap().expect("NAT is the default"));
@@ -816,7 +844,7 @@ fn stopping_the_mac_joins_its_threads() {
 /// alive and running; whoever releases the last reference stops it.
 #[test]
 fn the_last_reference_released_on_another_thread_stops_the_mac() {
-    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
+    let eth = standalone(Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO)));
     eth.start();
     let probe = Arc::downgrade(&eth);
     let running = eth.running.clone();
@@ -825,13 +853,16 @@ fn the_last_reference_released_on_another_thread_stops_the_mac() {
     assert!(probe.upgrade().is_some(), "kept alive by the other reference");
     assert!(running.load(Ordering::SeqCst), "still running");
     std::thread::spawn(move || drop(held)).join().unwrap();
-    assert!(probe.upgrade().is_none());
-    assert!(!running.load(Ordering::SeqCst), "the last release stops it");
+    // The receive thread holds a strong reference for the length of each
+    // poll, so it can be the one that releases the last: the device is gone
+    // a moment after that drop, not at it.
+    assert!(waits_for(|| probe.upgrade().is_none()), "the device is freed");
+    assert!(waits_for(|| !running.load(Ordering::SeqCst)), "the last release stops it");
 }
 
 #[test]
 fn fuel_phy_mdio_decoder_and_machine_reset() {
-    let eth = Ioc3Eth::new_fuel(STATION);
+    let eth = standalone(Box::new(Dp83843::new(PHY_ADDR)));
     assert_eq!(eth.mac(), STATION);
     let read = |phy: u32, r: u32| {
         eth.write32(MII_CONTROL, MII_READ | (phy << 5) | r);
@@ -884,9 +915,8 @@ fn a_tftp_read_through_the_ioc3_and_gateway_returns_the_file() {
 
     let gw = crate::net::GatewayConfig { tftp_dir: Some(root.clone()), ..crate::net::GatewayConfig::default() };
     let (gw_mac, gw_ip) = (gw.gateway_mac, gw.gateway_ip);
-    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
     let mem = Arc::new(Mem(Mutex::new(vec![0; MEM_SIZE])));
-    eth.connect(mem.clone(), Box::new(|_| {}));
+    let eth = mac(&core_for(Some(mem.clone())).0, Duration::ZERO);
     eth.attach(crate::net::Link::with_gateway(gw).unwrap().expect("NAT"));
     let t = Rig { eth, mem, irq: Arc::new(Mutex::new(Vec::new())), sent: rtrb::RingBuffer::new(1).1, inject: rtrb::RingBuffer::new(1).0 };
 
@@ -954,7 +984,7 @@ fn a_tftp_read_through_the_ioc3_and_gateway_returns_the_file() {
 fn save_load_round_trip() {
     use crate::traits::Saveable;
     let mac = [8, 0, 0x69, 1, 2, 3];
-    let src = Ioc3Eth::new(mac);
+    let src = standalone(Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)));
     {
         let mut st = src.st.lock();
         st.set(RX_RING_LO, 0x1000);
@@ -968,13 +998,11 @@ fn save_load_round_trip() {
         st.phy.sync(Instant::now() + Duration::from_secs(10));
     }
     let v1 = src.save_state();
-    let dst = Ioc3Eth::new(mac);
-    let level = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let seen = level.clone();
-    *dst.irq.lock() = Some(Box::new(move |l| seen.store(l, std::sync::atomic::Ordering::SeqCst)));
+    let (core, pin) = core_for(None);
+    let dst = Ioc3Eth::with_phy(core, STATION, Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)));
     dst.load_state(&v1).expect("load_state");
     assert_eq!(v1, dst.save_state());
-    assert!(level.load(std::sync::atomic::Ordering::SeqCst), "the loaded interrupt level is published");
+    assert_eq!(pin.lock().unwrap().last(), Some(&true), "the loaded interrupt level is published");
     assert_eq!(dst.st.lock().get(RX_RING_LO), 0x1000);
 }
 
