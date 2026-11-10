@@ -6,12 +6,32 @@
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use super::kbd::*;
+use super::parallel::*;
+use super::serial::*;
+use super::superio::*;
+use std::collections::VecDeque;
 use std::sync::Mutex;
+use crate::pci::PciDmaStatus;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
 use crate::pci::PciFunction;
 
 const MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
+
+impl Ioc3 {
+    fn predivider(&self, p: usize) -> u8 {
+        self.sh.sio.as_ref().unwrap().uart(p, |u| u.predivider)
+    }
+
+    fn baudbase(&self, p: usize) -> u32 {
+        self.sh.sio.as_ref().unwrap().uart(p, |u| u.core.baudbase())
+    }
+
+    fn rx_pending(&self, p: usize) -> usize {
+        self.sh.sio.as_ref().unwrap().uart(p, |u| u.core.rx_pending())
+    }
+}
 
 /// A sink for a serial line: what the guest sent, and what the host types.
 #[derive(Default)]
@@ -250,11 +270,11 @@ fn the_scratch_register_programs_the_predivider_under_dlab() {
     r.w8(reg::SERIAL_A + 3, 0x80);
     r.w8(reg::SERIAL_A + 7, 6);
     assert_eq!(r.r8(reg::SERIAL_A + 7), 6, "reads back what was written");
-    assert_eq!(r.c.sh.st.lock().uart[0].predivider, 6);
-    assert_eq!(r.c.sh.st.lock().uart[0].core.baudbase(), 22_118_400 / 3 / 16, "the divisor's clock follows it");
+    assert_eq!(r.c.predivider(0), 6);
+    assert_eq!(r.c.baudbase(0), 22_118_400 / 3 / 16, "the divisor's clock follows it");
     // Written 0 or 1 means nothing.
     r.w8(reg::SERIAL_A + 7, 1);
-    assert_eq!(r.c.sh.st.lock().uart[0].predivider, 6);
+    assert_eq!(r.c.predivider(0), 6);
 }
 
 /// A serial pass-through bit follows the 16550's level and ignores an
@@ -341,12 +361,12 @@ fn diagnostic_output_commands_keep_the_running_output() {
     let r = Rig::new();
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 100);
     r.w32(reg::INT_OUTPUT, IO_DIAG | IO_PERIODIC | 5);
-    assert_eq!(r.c.sh.st.lock().int_out.active, IO_PERIODIC | 100);
+    assert_eq!(r.c.sh.int_out.lock().active, IO_PERIODIC | 100);
     // So do counts outside 2..=0xfffe.
     r.w32(reg::INT_OUTPUT, IO_SQUARE | 1);
-    assert_eq!(r.c.sh.st.lock().int_out.active, IO_PERIODIC | 100);
+    assert_eq!(r.c.sh.int_out.lock().active, IO_PERIODIC | 100);
     r.w32(reg::INT_OUTPUT, IO_SQUARE | 0xffff);
-    assert_eq!(r.c.sh.st.lock().int_out.active, IO_PERIODIC | 100);
+    assert_eq!(r.c.sh.int_out.lock().active, IO_PERIODIC | 100);
 }
 
 #[test]
@@ -435,6 +455,50 @@ fn the_board_inputs_are_read_only() {
     }
 }
 
+/// Direction and data are separate words: control has set and clear aliases
+/// and never touches data, data holds what is written to an output pin and
+/// the per-pin register is one bit of it. Pins 2 and 3 read their strap.
+#[test]
+fn gpio_direction_data_and_inputs_are_separate_words() {
+    let r = Rig::new();
+    r.w32(reg::PIN_CONTROL_SET, 0x0000_00f0);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x0c, "direction leaves data, the straps read high");
+    r.w32(reg::PIN_DATA, 0x0000_0050);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x5c);
+    assert_eq!(r.r32(reg::PIN_REG_FIRST + 4 * 4), 1);
+    assert_eq!(r.r32(reg::PIN_REG_FIRST + 4 * 5), 0);
+    r.w32(reg::PIN_CONTROL_CLR, 0x0000_0030);
+    assert_eq!(r.r32(reg::PIN_CONTROL_SET), 0x0000_00c0);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x5c, "direction does not change data");
+    r.w32(reg::PIN_DATA, 0xffff_ffff);
+    assert_eq!(r.r32(reg::PIN_DATA), 0xffff_ffff);
+    r.w32(reg::PIN_DATA, 0);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x0c, "only the straps stay");
+}
+
+/// The Octane's pins 0 and 1 are the front lightbar: white power, shown as
+/// the status bar's green, and red fault. Only a change of the pin's value
+/// moves the bit, and other pins do not.
+#[test]
+fn the_octane_lightbar_follows_pins_0_and_1() {
+    let r = Rig::new();
+    let hb = Arc::new(AtomicU64::new(0));
+    r.c.set_heartbeat(hb.clone());
+    let lit = || hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    r.w32(reg::PIN_REG_FIRST, 1);
+    assert_eq!(lit(), Rex3::HB_LED_GREEN);
+    r.w32(reg::PIN_REG_FIRST + 4, 1);
+    assert_eq!(lit(), Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    r.w32(reg::PIN_REG_FIRST, 0);
+    assert_eq!(lit(), Rex3::HB_LED_RED);
+    r.w32(reg::PIN_REG_FIRST + 4 * 6, 1);
+    assert_eq!(lit(), Rex3::HB_LED_RED, "an unwired pin lights nothing");
+    r.w32(reg::PIN_DATA, 0b11);
+    assert_eq!(lit(), Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    r.w32(reg::PIN_DATA, 0);
+    assert_eq!(lit(), 0);
+}
+
 // The MicroLAN protocol (search, match, page reads, CRCs) is tested with the
 // wire in `dev::w1`; the register cell and the board's default wire are below.
 
@@ -457,7 +521,7 @@ fn the_default_wire_carries_the_mac_part_and_two_board_records() {
     r.w32(reg::PIN_CONTROL_SET, 1 << 21);
     r.w32(reg::MICROLAN, (500 << 10) | (13 << 2));
     assert_eq!(r.r32(reg::MICROLAN) & 1, 0, "a reset is answered with presence");
-    let mut families: Vec<u8> = r.c.sh.st.lock().wire().roms().iter().map(|rom| rom[0]).collect();
+    let mut families: Vec<u8> = r.c.sh.w1.roms().iter().map(|rom| rom[0]).collect();
     families.sort();
     assert_eq!(families, [0x0b, 0x0b, 0x91]);
 }
@@ -786,16 +850,15 @@ fn host_input_arrives_in_the_receive_ring_after_the_timer() {
     // looked. Hold the timer off while looking, then let it run out.
     let wait = Duration::from_nanos(0x200 * TIMER_TICK_NS);
     let due = {
-        let mut st = r.c.sh.st.lock();
-        let port = &mut st.sdma.port[0];
-        let due = port.rx_deadline.expect("the first character started the timer");
+        let serial = r.c.sh.serial[0].as_ref().unwrap();
+        let due = serial.rx_deadline().expect("the first character started the timer");
         assert!(due >= before + wait && due <= after + wait, "the reload's 32 ms from the character");
-        port.rx_deadline = Some(Instant::now() + Duration::from_secs(3600));
+        serial.set_rx_deadline(Some(Instant::now() + Duration::from_secs(3600)));
         due
     };
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) >> HELD_SHIFT & 7, 2, "two held in the packer");
     assert_eq!(r.r32(A + sdma_off::RX_CONSUME) & ARM_RX_TIMER, ARM_RX_TIMER);
-    r.c.sh.st.lock().sdma.port[0].rx_deadline = Some(due);
+    r.c.sh.serial[0].as_ref().unwrap().set_rx_deadline(Some(due));
     std::thread::sleep(due.saturating_duration_since(Instant::now()));
     r.c.service();
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE), 8, "posted when the timer ran out");
@@ -1198,6 +1261,98 @@ fn the_superio_line_never_ends_up_stale_across_threads() {
     }
 }
 
+/// A line that records every call it gets. The Bridge turns a rise into a
+/// packet, so each call must be a change of level: a repeat is an edge the
+/// registers never made.
+#[derive(Default)]
+struct EdgeProbe {
+    level: Mutex<bool>,
+    rises: std::sync::atomic::AtomicUsize,
+    repeats: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::irq::InterruptController for EdgeProbe {
+    fn set_line(&self, _line: u32, level: bool) {
+        let mut now = self.level.lock().unwrap();
+        if level == *now {
+            self.repeats.fetch_add(1, Ordering::SeqCst);
+        } else if level {
+            self.rises.fetch_add(1, Ordering::SeqCst);
+        }
+        *now = level;
+    }
+}
+
+/// Linux acknowledges a source and then unmasks it, as two writes. Status and
+/// enable are one pair under one lock, so the Bridge, which latches a rising
+/// edge, is not given one the words never made, whoever else reads or
+/// republishes the line meanwhile. The source here is raised only while it is
+/// masked, so the output is low for the whole run.
+#[test]
+fn the_superio_line_never_rises_while_status_and_enable_never_agree() {
+    let c = Arc::new(Ioc3::octane(MAC, false));
+    let probe = Arc::new(EdgeProbe::default());
+    c.connect_superio_interrupt(crate::irq::IrqLine::new(probe.clone(), 0));
+    let bit = int::KEYBOARD;
+    let done = Arc::new(AtomicBool::new(false));
+    let others: Vec<_> = (0..2)
+        .map(|_| {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    c.sh.core.republish();
+                    let _ = c.bar_read(0, reg::INT_STATUS, 4);
+                }
+            })
+        })
+        .collect();
+    for _ in 0..100_000 {
+        c.sh.core.set_bits(bit);
+        c.bar_write(0, reg::INT_STATUS, bit, 4);
+        c.bar_write(0, reg::INT_ENABLE_SET, bit, 4);
+        c.bar_write(0, reg::INT_ENABLE_CLR, bit, 4);
+    }
+    done.store(true, Ordering::SeqCst);
+    for t in others {
+        t.join().unwrap();
+    }
+    assert_eq!(probe.rises.load(Ordering::SeqCst), 0, "a rising edge the words never made");
+}
+
+/// Four threads raise, lower, enable and disable one source. The line is
+/// driven under the words' lock and only on a change, so it is never given a
+/// repeated level (a stale or duplicate edge), rises and falls alternate, and
+/// it ends where the words say.
+#[test]
+fn the_superio_line_is_driven_only_on_change_and_in_order_across_threads() {
+    for _ in 0..20 {
+        let c = Arc::new(Ioc3::octane(MAC, false));
+        let probe = Arc::new(EdgeProbe::default());
+        c.connect_superio_interrupt(crate::irq::IrqLine::new(probe.clone(), 0));
+        // Connecting states the line's level once, changed or not.
+        probe.repeats.store(0, Ordering::SeqCst);
+        let bit = int::KEYBOARD;
+        let ops: [fn(&Core, u32); 4] = [Core::set_bits, Core::clear_bits, Core::enable, Core::disable];
+        let threads: Vec<_> = ops
+            .into_iter()
+            .map(|op| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        op(&c.sh.core, bit);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(probe.repeats.load(Ordering::SeqCst), 0, "a level repeated to the parent");
+        let want = c.sh.core.status() & c.sh.core.enabled() != 0;
+        assert_eq!(*probe.level.lock().unwrap(), want);
+    }
+}
+
 #[test]
 fn the_ethernet_pin_follows_the_last_level_given() {
     let c = Ioc3::octane(MAC, false);
@@ -1558,7 +1713,7 @@ fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
     r.c.set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
     assert_eq!(std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5], 0, "not written per byte");
-    assert!(r.c.sh.st.lock().rtc.dirty_since.is_some(), "the RAM counts as unsaved");
+    assert!(r.c.sh.rtc.lock().dirty_since.is_some(), "the RAM counts as unsaved");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1599,9 +1754,9 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
     std::thread::sleep(Duration::from_millis(20));
-    assert!(r.c.sh.st.lock().uart[0].core.rx_pending() == 0);
+    assert!(r.c.rx_pending(0) == 0);
     r.c.start();
-    assert!(eventually(|| r.c.sh.st.lock().uart[0].core.rx_pending() != 0));
+    assert!(eventually(|| r.c.rx_pending(0) != 0));
     assert!(timer_pending(&r, K_INT_OUT), "start arms the deadlines the chip holds");
     r.c.stop();
 }
@@ -1620,27 +1775,42 @@ fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
     r.c.stop();
 }
 
-/// A receive thread's pass that read the chip before a register write
-/// cannot arm after that write from what it read, and so cannot remove the
-/// timer the write set. The test holds the timer table so the pass stops
-/// just short of arming, and the write must then wait for it.
+/// A pass that read the chip's deadlines before a register write must not arm
+/// from them after it. A thread re-arms as the receive polls do while the
+/// test rewrites the interrupt output, and after each write has returned the
+/// timer slot must serve the chip's deadline. A stale pass would put the older
+/// deadline back, or a timer for an output the write had just cleared.
 #[test]
 fn a_pass_that_read_the_chip_first_arms_first() {
     let (r, _tm) = running_rig();
     r.c.start();
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     let sh = &r.c.sh;
+    // A callback re-arming on its own would blur what the slot should hold.
+    let idle = sh.gate.lock();
+    let stop = AtomicBool::new(false);
     std::thread::scope(|s| {
-        let table = sh.armed.lock();
-        // The chip still holds no output deadline when this pass reads it.
-        let pass = s.spawn(|| sh.with_st(false, |_, _| ()));
-        assert!(eventually(|| sh.st.is_locked()), "the pass keeps the chip until it has the table");
-        let write = s.spawn(|| r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000));
-        drop(table);
-        pass.join().unwrap();
-        write.join().unwrap();
+        let poller = s.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                sh.rearm();
+                std::thread::yield_now();
+            }
+        });
+        for i in 0..5_000u32 {
+            r.w32(reg::INT_OUTPUT, if i % 2 == 0 { IO_PERIODIC | (0x1000 + i) } else { 0 });
+            let held = sh.armed.lock()[K_INT_OUT].map(|(_, d)| d);
+            let want = decode(sh.io_due.load(Ordering::SeqCst));
+            if held != want {
+                stop.store(true, Ordering::SeqCst);
+                poller.join().unwrap();
+                panic!("write {i} left the slot at {held:?}, the chip holds {want:?}");
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        poller.join().unwrap();
     });
-    assert!(timer_pending(&r, K_INT_OUT));
+    // `stop` waits out a callback, so it cannot run while the gate is held.
+    drop(idle);
     r.c.stop();
 }
 
@@ -1728,13 +1898,12 @@ fn save_load_round_trip() {
         let dst = Rig::with(build());
         dst.c.load_state(&v1).expect("load_state");
         // Seconds may pass between the load and the save, as on a loaded host.
-        dst.c.sh.st.lock().rtc.dev.advance_clock(2);
+        dst.c.sh.rtc.lock().dev.advance_clock(2);
         let v2 = dst.c.save_state();
         assert_eq!(without_clock(&v1), without_clock(&v2));
         assert_eq!(clock_seconds(&v2), clock_seconds(&v1) + 2, "the restored clock runs on from the saved time");
-        let st = dst.c.sh.st.lock();
-        assert_eq!(st.uart[0].predivider, 6);
-        assert_eq!(st.ssram[0x40] & SSRAM_DATA, 0x1234);
+        assert_eq!(dst.c.predivider(0), 6);
+        assert_eq!(dst.c.sh.ssram.lock()[0x40] & SSRAM_DATA, 0x1234);
     }
 }
 
@@ -1757,7 +1926,7 @@ fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
     used.c.load_state(&v).unwrap();
     fresh.c.load_state(&v).unwrap();
     // The loads and saves are not at one instant, so the clock may have moved.
-    used.c.sh.st.lock().rtc.dev.advance_clock(1);
+    used.c.sh.rtc.lock().dev.advance_clock(1);
     assert_eq!(without_clock(&used.c.save_state()), without_clock(&fresh.c.save_state()));
     assert_eq!(without_clock(&used.c.save_state()), without_clock(&v));
 }
@@ -1771,14 +1940,13 @@ fn a_pending_output_keeps_its_time_left() {
     let at_save = Instant::now();
     let left = Duration::from_micros(20);
     let v = {
-        let mut st = src.sh.st.lock();
-        st.int_out.next = Some(at_save + left);
-        st.save_state(at_save)
+        src.sh.int_out.lock().next = Some(at_save + left);
+        src.sh.save_state(at_save)
     };
     let dst = Ioc3::octane(MAC, false);
     let at_load = at_save + Duration::from_millis(5);
-    dst.sh.st.lock().load_state(&v, at_load).unwrap();
-    assert_eq!(dst.sh.st.lock().int_out.next, Some(at_load + left));
+    dst.sh.load_state(&v, at_load).unwrap();
+    assert_eq!(dst.sh.int_out.lock().next, Some(at_load + left));
 }
 
 #[test]
