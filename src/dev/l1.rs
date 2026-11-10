@@ -28,7 +28,7 @@ use std::sync::{
 
 mod model;
 use model::State;
-pub use model::{parse_revision, L1Config, L1Event, DEFAULT_BRICK_SERIAL, DEFAULT_REVISION};
+pub use model::{parse_revision, BoardIdentity, CpuContext, L1Config, L1Event, DEFAULT_BRICK_SERIAL, DEFAULT_REVISION};
 
 fn fcs(mut crc: u16, byte: u8) -> u16 {
     crc ^= byte as u16;
