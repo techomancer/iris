@@ -77,7 +77,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IP29, IP30, IP34, IP34_NO_PS2};
+pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IP29, IP30, IP34, IP34_NO_PS2, MIO};
 pub use self::dma::Ioc3Dma;
 use self::gpio::Gpio;
 pub use self::gpio::{PinUse, PinWire};
@@ -533,6 +533,8 @@ struct Shared {
     /// port: nothing reads it.
     ps2_idle: Arc<Ps2Controller>,
     parallel: Option<Parallel>,
+    /// The MicroLAN master. The engine is the chip's; whether anything sits on
+    /// its wire is the board's.
     w1: W1,
     gpio: Gpio,
     int_out: Mutex<IntOut>,
@@ -1058,7 +1060,7 @@ impl Ioc3 {
             );
             // The subsystem identity selects what a guest instantiates.
             pci.set_subsystem_identity(((board.subsystem_id as u32) << 16) | VENDOR_ID as u32);
-            let w1 = W1::new(default_wire(mac));
+            let w1 = W1::new(if cells.w1 { default_wire(mac) } else { onewire::Bus::new() });
             Shared {
                 pci: PciFunctionState::new(pci),
                 core: core.clone(),
@@ -1450,9 +1452,10 @@ impl Shared {
                 .u64("next", until(o.next, now));
             t.value("int_out", int_out.build());
         }
-        let (microlan, wire) = self.w1.save_state();
         let (pin_control, pin_data) = self.gpio.words();
-        t.u32("microlan", microlan).u32("pin_control", pin_control).u32("pin_data", pin_data);
+        t.u32("pin_control", pin_control).u32("pin_data", pin_data);
+        let (microlan, wire) = self.w1.save_state();
+        t.u32("microlan", microlan).value("wire", wire);
         if let Some(sio) = &self.sio {
             for p in 0..2 {
                 if self.serial[p].is_some() {
@@ -1483,7 +1486,7 @@ impl Shared {
             t.value("rtc", r.save_state());
         }
         // The power-off now goes out as the guest writes it, so nothing waits.
-        t.u32s("ssram", &self.ssram.lock()).value("wire", wire).bool("power_off_pending", false);
+        t.u32s("ssram", &self.ssram.lock()).bool("power_off_pending", false);
         t.build()
     }
 
