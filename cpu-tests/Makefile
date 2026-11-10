@@ -109,18 +109,9 @@ IRIS ?= ../target/release/iris
 run: $(TARGET)
 	@run/run-local.sh $(TARGET)
 
-# Run the suite on one cell and judge it against expected-failures.txt, as CI
-# does. The cargo test builds the emulator for ENGINE and runs the guest that
-# `make all` built; this only picks the case.
-CPU    ?= r4400
-ENGINE ?= interp
-
-.PHONY: check-run
-check-run:
-	$(if $(filter $(CPU),r4400 r5000 r10000 r12000 r14000),,$(error CPU=$(CPU): check-run runs r4400, r5000, r10000, r12000 or r14000))
-	$(if $(filter $(ENGINE),interp jitv2),,$(error ENGINE=$(ENGINE): check-run runs interp or jitv2))
-	cd .. && cargo test --release $(if $(filter jitv2,$(ENGINE)),--features jitv2) \
-	    --test cpu_tests -- --ignored --exact $(CPU)
+# Judging a run against expected-failures.txt is a cargo test, which builds
+# the emulator for the engine it names:
+#   cargo test --release [--features jitv2] --test cpu_tests -- --ignored
 
 # ── bootable image ───────────────────────────────────────────────────────────
 MKVH ?= ../target/release/mkvh

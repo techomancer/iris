@@ -82,7 +82,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
 - CI judges `cpu-tests` by test name, not by failure count: the harness prints TAP, `cpu-tests/expected-failures.txt` lists the failing tests per CPU and engine, and `cargo test --release --test cpu_tests -- --ignored` runs the suite and the check, locally as in CI.
-- `cpu-tests` and the benchmark's accuracy check are cargo integration tests, one case per CPU: `cargo test --release [--features jitv2] --test cpu_tests --test bench_accuracy -- --ignored` builds the emulator for the engine it names, so it cannot judge a stale or wrong-engine binary. `make -C cpu-tests check-run CPU=... ENGINE=...` now runs that test for one cell, and `cpu-tests/run/matrix.sh` is gone. CI runs the same tests and marks a failing case, with the tests that broke, on the pull request.
+- `cpu-tests` and the benchmark's accuracy check are cargo integration tests, one case per CPU: `cargo test --release [--features jitv2] --test cpu_tests --test bench_accuracy -- --ignored` builds the emulator for the engine it names, so it cannot judge a stale or wrong-engine binary. It replaces `make -C cpu-tests check-run` and `cpu-tests/run/matrix.sh`. CI runs the same tests and marks a failing case, with the tests that broke, on the pull request.
 
 ### Interpreter hot-path check
 
