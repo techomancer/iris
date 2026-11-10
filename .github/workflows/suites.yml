@@ -70,7 +70,7 @@ env:
 jobs:
   guests:
     name: Build the guest binaries
-    runs-on: ubuntu-24.04
+    runs-on: &ubuntu ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -125,7 +125,7 @@ jobs:
   # here means a kernel is not deterministic even against itself.
   host-baseline:
     name: Host baseline
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -146,7 +146,7 @@ jobs:
   # the CPU model, so one run is enough.
   embedded:
     name: Embedded runner
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -162,7 +162,7 @@ jobs:
   suites:
     name: ${{ matrix.engine }}
     needs: guests
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -249,7 +249,7 @@ jobs:
     name: Comparison report
     needs: suites
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5

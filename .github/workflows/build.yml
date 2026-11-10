@@ -37,7 +37,7 @@ on:
         required: true
       macos_runner:
         type: string
-        default: macos-26
+        default: &macos_runner macos-26
       require_notarization:
         description: Fail the macOS job instead of shipping an unnotarized app
         type: boolean
@@ -52,7 +52,7 @@ on:
         default: lightning,jitv2,gpujit,idle-pause,hostgl
       macos_runner:
         description: macOS runner image
-        default: macos-26
+        default: *macos_runner
 
 permissions:
   contents: read
@@ -70,7 +70,7 @@ env:
 jobs:
   version:
     name: Version
-    runs-on: ubuntu-24.04
+    runs-on: &ubuntu ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
       ref: ${{ steps.v.outputs.ref }}
@@ -95,7 +95,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: windows-latest }
+          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: &windows windows-latest }
           - { arch: arm64, target: aarch64-pc-windows-msvc, runner: windows-11-arm }
     steps:
       - uses: actions/checkout@v5
@@ -228,8 +228,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
-          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - &linux_x64   { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: *ubuntu }
+          - &linux_arm64 { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v5
         with:
@@ -274,8 +274,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
-          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - *linux_x64
+          - *linux_arm64
     steps:
       # git first, so checkout makes a real clone (build.rs reads the commit).
       - name: git
@@ -312,7 +312,7 @@ jobs:
   riscv64:
     name: Linux riscv64 (cross)
     needs: version
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     container: debian:trixie
     env:
       # The container runs as root but Actions sets HOME=/github/home; rustup
@@ -397,9 +397,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: linux,   arch: x64,       runner: ubuntu-24.04 }
+          - { os: linux,   arch: x64,       runner: *ubuntu }
           - { os: macos,   arch: universal, runner: "${{ inputs.macos_runner || 'macos-26' }}" }
-          - { os: windows, arch: x64,       runner: windows-latest }
+          - { os: windows, arch: x64,       runner: *windows }
     defaults:
       run:
         shell: bash
@@ -504,7 +504,7 @@ jobs:
   check:
     name: Check the release files
     needs: [version, windows, macos, linux, appimage, riscv64]
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     steps:
       - uses: actions/checkout@v5
         with:
