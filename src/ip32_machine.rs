@@ -190,6 +190,9 @@ impl O2Machine {
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
             mac,
+            // Beside the flash, as the clock reference is beside its image.
+            rtc_file: Some(format!("{}.rtc", cfg.nvram).into()),
+            rtc_offset: cfg.rtc_offset,
         };
         let bus = Ip32Bus::with_options(mem, prom, opts);
         // MACE audio plays through the host unless audio is off.
@@ -519,6 +522,7 @@ impl O2Machine {
                 eprintln!("iris: the O2 switched itself off");
                 dev.stop();
                 bus.save_flash();
+                bus.save_rtc();
                 // The machine-events thread stops the machine and exits,
                 // unless the host embeds iris (IRIS_NO_EXIT_ON_POWEROFF).
                 if controller_up.load(Ordering::SeqCst) && events.try_send(MachineEvent::PowerOff).is_ok() {
@@ -555,6 +559,7 @@ impl O2Machine {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
         self.bus.save_flash();
+        self.bus.save_rtc();
         // Not through the display: this stop leaves the guest's writes durable
         // whatever follows it.
         if let Err(e) = self.bus.flush_disks() {

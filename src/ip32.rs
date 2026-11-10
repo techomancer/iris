@@ -196,6 +196,12 @@ pub struct Ip32Options {
     pub keyboard: Option<bool>,
     /// The Ethernet address in the 1-Wire ID chip, if not the default.
     pub mac: Option<[u8; 6]>,
+    /// A file holding the DS1687's RAM, in the 512-byte image the Octane's
+    /// DS1685 uses, with its clock beside it once the guest sets it, so both
+    /// survive from run to run as the battery keeps them.
+    pub rtc_file: Option<std::path::PathBuf>,
+    /// Where the clock starts with no saved clock (`[rtc_offset]`).
+    pub rtc_offset: crate::config::RtcOffset,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -437,6 +443,8 @@ pub struct Ip32Bus {
     /// caller supplied: settings written by a guest belong in the user's
     /// working directory, not in their copy of the PROM.
     flash_file: Option<std::path::PathBuf>,
+    /// Where to keep the DS1687's RAM and clock between runs, if anywhere.
+    rtc_file: Option<std::path::PathBuf>,
     /// CRIME: its registers (interrupts, memory banks) and its rendering
     /// engine, which draws into RAM through its tile tables.
     pub crime: CrimeSpace,
@@ -492,6 +500,7 @@ impl Ip32Bus {
             ram: ram.clone(),
             flash: O2Flash { bytes: Mutex::new(prom), writes: Mutex::new(Vec::new()) },
             flash_file: opts.flash_file.clone(),
+            rtc_file: opts.rtc_file.clone(),
             crime: CrimeSpace::new(crime.clone(), ram.clone()),
             vice: Stub::new("vice"),
             gbe: {
@@ -546,6 +555,20 @@ impl Ip32Bus {
                 }
                 Ok(_) => eprintln!("ip32: flash {} is the wrong size; ignoring", path.display()),
                 Err(_) => {}
+            }
+        }
+        bus.mace.rtc.set_offset(crate::dev::battery_clock::seed(&opts.rtc_offset));
+        if let Some(path) = &bus.rtc_file {
+            match std::fs::read(path) {
+                Ok(saved) if bus.mace.rtc.load_image(&saved) => {}
+                Ok(_) => eprintln!("ip32: RTC {} is the wrong size; ignoring", path.display()),
+                Err(_) => {}
+            }
+            let clock = crate::dev::battery_clock::companion(path);
+            if let Some(guest) = crate::dev::battery_clock::read_or_warn(&clock)
+                .and_then(|r| bus.mace.rtc.restore_clock(&r))
+            {
+                crate::dev::battery_clock::note_override(&opts.rtc_offset, &clock, guest);
             }
         }
         let bus = Arc::new(bus);
@@ -647,6 +670,19 @@ impl Ip32Bus {
         match std::fs::write(path, &p[..]) {
             Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
             Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
+        }
+    }
+
+    /// Write the DS1687's RAM out, and its clock once the guest has set it,
+    /// if a file was named for them.
+    pub fn save_rtc(&self) {
+        let Some(path) = &self.rtc_file else { return };
+        let mut result = crate::dev::battery_clock::write(path, &self.mace.rtc.image());
+        if let (Ok(()), Some(c)) = (&result, self.mace.rtc.clock_reference()) {
+            result = crate::dev::battery_clock::write(&crate::dev::battery_clock::companion(path), &c);
+        }
+        if let Err(e) = result {
+            eprintln!("ip32: RTC {}: {e}", path.display());
         }
     }
 
