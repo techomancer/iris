@@ -24,6 +24,7 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::{Bridge, RawFlash};
 use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
+use crate::dev::ds1685::Ds1685;
 use crate::dev::ioc3::{self, ByteBus, Ioc3};
 use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
@@ -146,6 +147,8 @@ pub struct OctaneMachine {
     /// own, in config order.
     pub xio_boards: Vec<XioPciBoard>,
     pub ioc3: Arc<Ioc3>,
+    /// The clock on IOC3's byte bus, which IOC3 starts and stops.
+    rtc: Arc<Ds1685>,
     pub scsi: [Arc<Isp1040>; 2],
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
@@ -297,23 +300,24 @@ impl OctaneMachine {
             })
             .transpose()?;
         disks.extend(nvme.as_ref().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)));
-        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685));
+        // The DS1685 on IOC3's byte bus: the guest switching the machine off
+        // through it, and its NVRAM in a file.
+        let rtc = Ds1685::new(Some(event_tx.clone()));
+        rtc.set_rtc_offset(&cfg.rtc_offset);
+        if let Err(e) = rtc.set_nvram_file(&cfg.nvram) {
+            eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
+        }
+        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
         ioc3.set_microlan(ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = ioc3.eth().expect("the Octane's IOC3 fits Ethernet").clone();
         pci.attach(slot(2), ioc3.clone());
         ioc3.connect_superio(pci);
         ioc3.set_timer_manager(timer_manager.clone());
-        // The guest switching the machine off through the clock.
-        ioc3.set_event_sender(event_tx.clone());
         // ... and resetting itself through HEART.
         heart.on_soft_reset(Box::new(move || {
             let _ = event_tx.try_send(MachineEvent::HardReset);
         }));
-        ioc3.set_rtc_offset(&cfg.rtc_offset);
-        if let Err(e) = ioc3.set_nvram_file(&cfg.nvram) {
-            eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
-        }
         let rad = Arc::new(Rad1::new());
         rad.set_timer_manager(timer_manager.clone());
         if !cfg.no_audio {
@@ -587,6 +591,7 @@ impl OctaneMachine {
             bridge,
             xio_boards,
             ioc3,
+            rtc,
             scsi,
             eth,
             rad,
@@ -1213,7 +1218,7 @@ impl Workstation for OctaneMachine {
         if self.nvram_path.is_empty() {
             return Err("no nvram file configured".into());
         }
-        self.ioc3.flush_nvram();
+        self.rtc.flush();
         Ok(self.nvram_path.clone())
     }
     fn scratch_path(&self) -> Option<&std::path::Path> {
