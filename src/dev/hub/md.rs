@@ -107,7 +107,7 @@ impl State {
     }
 }
 
-pub struct HubMd {
+pub struct Md {
     clock: Clock,
     signals: SlotSignals,
     state: Mutex<State>,
@@ -120,7 +120,7 @@ fn unimp(what: &str, off: u64, value: Option<u64>) {
     }
 }
 
-impl HubMd {
+impl Md {
     pub fn new(clock: Clock, signals: SlotSignals) -> Self {
         Self { clock, signals, state: Mutex::new(State::new(None)) }
     }
@@ -203,14 +203,14 @@ impl HubMd {
     }
 }
 
-impl HubMd {
+impl Md {
     /// Whether the register state is locked now, for the `locks` monitor command.
     pub fn is_locked(&self) -> bool {
         self.state.is_locked()
     }
 }
 
-impl Resettable for HubMd {
+impl Resettable for Md {
     /// A slot started before reset must not complete after it.
     fn power_on(&self) {
         let mut s = self.state.lock();
@@ -223,7 +223,7 @@ impl Resettable for HubMd {
     }
 }
 
-impl BusDevice for HubMd {
+impl BusDevice for Md {
     fn read64(&self, addr: u64) -> BusRead64 {
         BusRead64::ok(self.read(addr))
     }

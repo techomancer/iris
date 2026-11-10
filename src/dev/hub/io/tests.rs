@@ -54,14 +54,14 @@ impl NodeFabric for Fabric {
     }
 }
 
-fn io() -> (HubIo, Arc<Fabric>) {
+fn io() -> (Io, Arc<Fabric>) {
     let fabric = Fabric::new();
-    let io = HubIo::new(1, 0x36);
+    let io = Io::new(1, 0x36);
     let weak: Weak<dyn NodeFabric> = Arc::downgrade(&(fabric.clone() as Arc<dyn NodeFabric>));
     io.set_fabric(weak);
     (io, fabric)
 }
-fn r(io: &HubIo, off: u64) -> u64 {
+fn r(io: &Io, off: u64) -> u64 {
     io.read64(off).data
 }
 
@@ -92,7 +92,7 @@ fn the_widget_identifies_itself_and_refuses_writes() {
     io.write64(reg::WIDGET_ID, 0);
     assert_eq!(r(&io, reg::WIDGET_ID), 0x1c10_106d);
     // The revision and manufacturer are the machine's to choose and survive reset.
-    let other = HubIo::new(5, 0x123);
+    let other = Io::new(5, 0x123);
     assert_eq!(other.widget_id(), (5 << 28) | (0xc101 << 12) | (0x123 << 1) | 1);
     other.power_on();
     assert_eq!(other.widget_id(), (5 << 28) | (0xc101 << 12) | (0x123 << 1) | 1);
@@ -326,7 +326,7 @@ fn the_queue_and_request_buffer_registers_read_zero() {
 fn engine(n: u64) -> u64 {
     reg::BTE_BASE + n * BTE_STRIDE
 }
-fn start(io: &HubIo, n: u64, source: u64, dest: u64, lines: u64, control: u64) {
+fn start(io: &Io, n: u64, source: u64, dest: u64, lines: u64, control: u64) {
     io.write64(engine(n) + bte::SOURCE, source);
     io.write64(engine(n) + bte::DEST, dest);
     io.write64(engine(n) + bte::LENGTH, BTE_BUSY | lines);
@@ -457,7 +457,7 @@ fn a_zero_length_launch_completes_at_once_and_busy_clear_launches_nothing() {
 
 #[test]
 fn an_engine_with_no_fabric_fails_the_launch() {
-    let io = HubIo::new(1, 0x36);
+    let io = Io::new(1, 0x36);
     start(&io, 0, 0, 0x1000, 1, 0);
     assert_eq!(r(&io, engine(0) + bte::LENGTH), BTE_BUSY | BTE_ERROR | 1);
 }

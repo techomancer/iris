@@ -43,8 +43,8 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
-use crate::dev::hub::{HubObserver, Store};
-use crate::dev::hub_pi::MODIFY_SET;
+use super::pi::MODIFY_SET;
+use super::{HubObserver, Store};
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
@@ -210,7 +210,7 @@ struct Windows {
     packets: OnceLock<Arc<dyn BusDevice>>,
 }
 
-pub struct HubIo {
+pub struct Io {
     widget_revision: u8,
     manufacturer: u16,
     state: Mutex<State>,
@@ -221,7 +221,7 @@ pub struct HubIo {
     observer: OnceLock<Arc<dyn HubObserver>>,
 }
 
-impl HubIo {
+impl Io {
     /// `widget_revision` is the chip revision in bits 31:28 of the widget
     /// identification word and `manufacturer` its 11-bit manufacturer code.
     pub fn new(widget_revision: u8, manufacturer: u16) -> Self {
@@ -553,14 +553,14 @@ impl HubIo {
     }
 }
 
-impl HubIo {
+impl Io {
     /// Whether the register state is locked now, for the `locks` monitor command.
     pub fn is_locked(&self) -> bool {
         self.state.is_locked()
     }
 }
 
-impl Resettable for HubIo {
+impl Resettable for Io {
     fn power_on(&self) {
         *self.state.lock() = State::new();
         // Entries reset to zero with the windows enabled: a guest calls a zero
@@ -571,7 +571,7 @@ impl Resettable for HubIo {
     }
 }
 
-impl BusDevice for HubIo {
+impl BusDevice for Io {
     fn read64(&self, addr: u64) -> BusRead64 {
         BusRead64::ok(self.read(addr))
     }

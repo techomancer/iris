@@ -1,8 +1,10 @@
 //! The Hub, the node controller of the SN0 machines (Origin 200, Origin 2000,
 //! Onyx2): one per node, joining the node's processors, memory and directory,
 //! one XIO port and one CrayLink port. The register window is split by
-//! section into `hub_pi`, `hub_md`, `hub_io` and `hub_ni`, as the Bedrock
-//! files are; this module is the window itself and what the sections share.
+//! section into the processor interface (`pi`), memory and directory (`md`),
+//! I/O (`io`) and network (`ni`) units, private to this module; the module is
+//! the window itself and what the units share. Machines reach the Hub only
+//! through its methods.
 //!
 //! Address decode is data, not a flag tested per access. Each Hub keeps a
 //! table from node number to the Hub that answers it, rebuilt when a node
@@ -29,6 +31,30 @@
 //!   stores such a mechanism would watch, and changes no value.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
+
+mod io;
+mod md;
+mod ni;
+mod pi;
+
+pub use self::md::SlotSignals;
+
+/// Register offsets in the Hub's window, by unit. Machines and their tests
+/// name registers by these; the units themselves are private.
+pub mod reg {
+    pub mod pi {
+        pub use super::super::pi::reg::*;
+    }
+    pub mod md {
+        pub use super::super::md::reg::*;
+    }
+    pub mod io {
+        pub use super::super::io::reg::*;
+    }
+    pub mod ni {
+        pub use super::super::ni::reg::*;
+    }
+}
 
 /// Length of the register window: 8 MiB.
 pub const WINDOW_SIZE: u64 = 8 << 20;
@@ -94,12 +120,14 @@ pub trait HubHooks: Send + Sync {
 }
 
 use crate::dev::heart::Clock;
-use crate::dev::hub_io::{self, HubIo, NodeFabric};
-use crate::dev::hub_md::{self, HubMd, SlotSignals};
-use crate::dev::hub_ni::{self, HubNi, NetPeer, NiEvents};
-use crate::dev::hub_pi::{self, HubPi};
+use self::io::{Io, NodeFabric};
+use self::md::Md;
+use self::ni::{NetPeer, Ni, NiEvents};
+use self::pi::Pi;
 use crate::devlog::LogModule;
+use crate::dev::w1;
 use crate::irq::InterruptController;
+use crate::hptimer::TimerManager;
 use crate::physical::{read_bytes, write_bytes};
 use crate::xtalk::{HostPort, XtalkHost};
 use crate::traits::{
@@ -171,7 +199,7 @@ pub const IO_BUS_ERROR_PROBE: u64 = 0x0240_0208;
 const XIO_IO_VIEW: u64 = 1 << 47;
 const XIO_NODE_SHIFT: u32 = 38;
 const XIO_MEMORY_SIZE: u64 = 1 << 40;
-const XIO_INT_MODIFY: u64 = IO_REGISTERS_NAMED + hub_pi::reg::INT_PEND_MOD;
+const XIO_INT_MODIFY: u64 = IO_REGISTERS_NAMED + pi::reg::INT_PEND_MOD;
 const XIO_IDENTITY: u64 = 0x0160_0000;
 
 // A slot of the claim map: which Hub answers a node number.
@@ -235,7 +263,7 @@ impl NiEvents for Remap {
 /// banks. It holds no reference back to the Hub, so a cable can share it.
 struct NodeView {
     spaces: [OnceLock<Arc<dyn BusDevice>>; SPACES],
-    pi: Arc<HubPi>,
+    pi: Arc<Pi>,
 }
 
 /// The register window's sections. Kept apart from the Hub's address decode
@@ -243,10 +271,10 @@ struct NodeView {
 /// the Hub owns the spaces, and a space that held the Hub would be a cycle
 /// that frees neither.
 pub struct Regs {
-    pi: Arc<HubPi>,
-    md: HubMd,
-    io: HubIo,
-    ni: Arc<HubNi>,
+    pi: Arc<Pi>,
+    md: Md,
+    io: Io,
+    ni: Arc<Ni>,
     /// The node's I2C controller and bring-up UART, mapped over the MD block.
     i2c: OnceLock<Arc<dyn BusDevice>>,
     uart: OnceLock<Arc<dyn BusDevice>>,
@@ -255,10 +283,10 @@ pub struct Regs {
 impl Regs {
     fn section_read(&self, off: u64, clear: bool) -> u64 {
         match off {
-            ..hub_pi::END => self.pi.read(off, clear),
-            hub_md::START..hub_md::END => self.md.read(off),
-            hub_io::START..hub_io::END => self.io.read(off),
-            hub_ni::START..hub_ni::END => self.ni.read(off, clear),
+            ..pi::END => self.pi.read(off, clear),
+            md::START..md::END => self.md.read(off),
+            io::START..io::END => self.io.read(off),
+            ni::START..ni::END => self.ni.read(off, clear),
             _ => {
                 crate::dlog!(LogModule::Hub, "Hub: read of unimplemented register {off:#x}");
                 0
@@ -268,20 +296,20 @@ impl Regs {
 
     fn section_peek(&self, off: u64) -> Option<u64> {
         match off {
-            ..hub_pi::END => self.pi.peek(off),
-            hub_md::START..hub_md::END => self.md.peek(off),
-            hub_io::START..hub_io::END => self.io.peek(off),
-            hub_ni::START..hub_ni::END => self.ni.peek(off),
+            ..pi::END => self.pi.peek(off),
+            md::START..md::END => self.md.peek(off),
+            io::START..io::END => self.io.peek(off),
+            ni::START..ni::END => self.ni.peek(off),
             _ => None,
         }
     }
 
     fn section_write(&self, off: u64, value: u64, size: u32) {
         match off {
-            ..hub_pi::END => self.pi.write_sized(off, value, size),
-            hub_md::START..hub_md::END => self.md.write(off, value),
-            hub_io::START..hub_io::END => self.io.write(off, value),
-            hub_ni::START..hub_ni::END => self.ni.write(off, value),
+            ..pi::END => self.pi.write_sized(off, value, size),
+            md::START..md::END => self.md.write(off, value),
+            io::START..io::END => self.io.write(off, value),
+            ni::START..ni::END => self.ni.write(off, value),
             _ => crate::dlog!(LogModule::Hub, "Hub: write of {value:#x} to unimplemented register {off:#x}"),
         }
     }
@@ -289,8 +317,8 @@ impl Regs {
     /// The narrow device over an offset, for the I2C controller and UART
     /// mapped over the MD block.
     fn overlay(&self, off: u64) -> Option<(&dyn BusDevice, u64)> {
-        const I2C: std::ops::Range<u64> = hub_md::reg::I2C_BASE..hub_md::reg::I2C_BASE + 0x10;
-        const UART: std::ops::Range<u64> = hub_md::reg::UART_BASE..hub_md::reg::UART_END;
+        const I2C: std::ops::Range<u64> = md::reg::I2C_BASE..md::reg::I2C_BASE + 0x10;
+        const UART: std::ops::Range<u64> = md::reg::UART_BASE..md::reg::UART_END;
         if I2C.contains(&off) {
             self.i2c.get().map(|d| (&**d, off - I2C.start))
         } else if UART.contains(&off) {
@@ -330,17 +358,17 @@ impl Hub {
     pub fn new(cfg: HubConfig, clock: Clock) -> Arc<Self> {
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
             let hooks = Arc::new(Hooks { hub: weak.clone(), machine: OnceLock::new() });
-            let pi = HubPi::new(cfg.cpus, cfg.cpu_base, clock.clone());
+            let pi = Pi::new(cfg.cpus, cfg.cpu_base, clock.clone());
             let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone() });
-            let ni = Arc::new(HubNi::new(cfg.ni_revision, cfg.nasid));
+            let ni = Arc::new(Ni::new(cfg.ni_revision, cfg.nasid));
             pi.set_hooks(hooks.clone());
             ni.set_hooks(hooks.clone());
             ni.set_events(Arc::new(Remap(weak.clone())));
-            let io = HubIo::new(cfg.widget_revision, cfg.manufacturer);
+            let io = Io::new(cfg.widget_revision, cfg.manufacturer);
             io.set_fabric(weak.clone() as Weak<dyn NodeFabric>);
             let regs = Arc::new(Regs {
                 pi,
-                md: HubMd::new(clock, cfg.slot),
+                md: Md::new(clock, cfg.slot),
                 io,
                 ni,
                 i2c: OnceLock::new(),
@@ -351,7 +379,7 @@ impl Hub {
                 view,
                 claims: std::array::from_fn(|_| AtomicU8::new(NOBODY)),
                 peer: OnceLock::new(),
-                calias: AtomicU64::new(hub_pi::calias_bytes(15)),
+                calias: AtomicU64::new(pi::calias_bytes(15)),
                 hooks,
                 weak: weak.clone(),
             }
@@ -360,19 +388,58 @@ impl Hub {
         hub
     }
 
-    pub fn pi(&self) -> &Arc<HubPi> {
+    fn pi(&self) -> &Arc<Pi> {
         &self.pi
     }
-    pub fn md(&self) -> &HubMd {
+    fn md(&self) -> &Md {
         &self.md
     }
-    pub fn io(&self) -> &HubIo {
+    fn io(&self) -> &Io {
         &self.io
     }
-    pub fn ni(&self) -> &Arc<HubNi> {
+    fn ni(&self) -> &Arc<Ni> {
         &self.ni
     }
 
+    /// Answer the widget's small window with `dev`.
+    pub fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
+        self.io.connect_widget(widget, dev);
+    }
+
+    /// Where a peer's packets to this Hub's big windows land; see
+    /// [`crate::dev::xbow::Xbow::packets`].
+    pub fn connect_packets(&self, dev: Arc<dyn BusDevice>) {
+        self.io.connect_packets(dev);
+    }
+
+    /// The machine's timer manager, for the real-time comparator's timer.
+    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
+        self.pi.set_timer_manager(tm);
+    }
+
+    /// The one-wire net the memory section's master drives.
+    pub fn set_onewire(&self, bus: w1::Bus) {
+        self.md.set_onewire(bus);
+    }
+
+    /// Set the node's PI_CPU_ENABLE bit of `slice`. A Hub comes out of reset
+    /// with both enables clear, and the stock PROM never sets its own, so the
+    /// board does what the processor module's strap does on the machine.
+    pub fn enable_cpu(&self, slice: usize) {
+        let reg = pi::reg::CPU_ENABLE_A + 8 * slice as u64;
+        assert!(reg <= pi::reg::CPU_ENABLE_B, "a node has two processor slices");
+        self.write64(reg, 1);
+    }
+
+    /// The cached-alias window size PI_CALIAS_SIZE currently names.
+    pub fn calias_bytes(&self) -> u64 {
+        self.pi.calias_bytes()
+    }
+
+    /// Where the processors' interrupt lines go.
+    pub fn set_interrupt_controller(&self, irq: Arc<dyn InterruptController>) {
+        self.pi.set_interrupt_controller(irq);
+    }
     /// The machine's side of the node: processors, the cached alias and
     /// restart.
     pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
@@ -703,11 +770,11 @@ impl BusDevice for ProcessorIo {
 
 /// A line is an interrupt number; a rising level sets its pending bit and a
 /// falling one clears it.
-struct InterruptTarget(Arc<HubPi>);
+struct InterruptTarget(Arc<Pi>);
 impl InterruptController for InterruptTarget {
     fn set_line(&self, line: u32, level: bool) {
         if line < 128 {
-            self.0.int_modify(u64::from(line) | if level { hub_pi::MODIFY_SET } else { 0 });
+            self.0.int_modify(u64::from(line) | if level { pi::MODIFY_SET } else { 0 });
         }
     }
 }
@@ -744,7 +811,7 @@ impl Inbound {
         let offset = a & ((1 << XIO_NODE_SHIFT) - 1);
         match value {
             // A peer's identity probe: node field zero, the status register.
-            None if size == 8 && a == (XIO_IO_VIEW | XIO_IDENTITY) => BusRead64::ok(hub.ni.read(hub_ni::reg::STATUS, false)),
+            None if size == 8 && a == (XIO_IO_VIEW | XIO_IDENTITY) => BusRead64::ok(hub.ni.read(ni::reg::STATUS, false)),
             // A device interrupt: a doubleword write to a node's
             // interrupt-modify register lands on that node's Hub.
             Some(v) if size == 8 && offset == XIO_INT_MODIFY => {
@@ -869,7 +936,7 @@ impl BusDevice for Regs {
             return dev.write32(at + (a & 7), v);
         }
         let aligned = a & !7;
-        let mut merged = if matches!(aligned, hub_pi::reg::INT_PEND_MOD | hub_ni::reg::PORT_ERROR) {
+        let mut merged = if matches!(aligned, pi::reg::INT_PEND_MOD | ni::reg::PORT_ERROR) {
             0
         } else {
             self.section_peek(aligned).unwrap_or(0)

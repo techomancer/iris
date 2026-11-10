@@ -35,7 +35,7 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
-use crate::dev::hub::{HubHooks, HubObserver, Store};
+use super::{HubHooks, HubObserver, Store};
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
 use parking_lot::Mutex;
@@ -200,7 +200,7 @@ impl State {
     }
 }
 
-pub struct HubNi {
+pub struct Ni {
     revision: u8,
     nasid: u16,
     state: Mutex<State>,
@@ -212,7 +212,7 @@ pub struct HubNi {
     observer: OnceLock<Arc<dyn HubObserver>>,
 }
 
-impl HubNi {
+impl Ni {
     /// `revision` is the chip revision code in NI_STATUS_REV_ID bits 7:4 (3 is
     /// Hub 2.1, 5 is Hub 2.3) and `nasid` the node number a synthesized
     /// firmware preprograms, zero otherwise.
@@ -650,13 +650,13 @@ impl HubNi {
     }
 }
 
-impl NetPeer for HubNi {
+impl NetPeer for Ni {
     fn receive(&self, request: &VectorRequest) -> (Option<u64>, u16) {
         let answer = if self.enabled.load(Ordering::Acquire) { self.vector_access(request) } else { None };
         (answer, self.number())
     }
     fn number(&self) -> u16 {
-        HubNi::number(self)
+        Ni::number(self)
     }
     fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
@@ -678,14 +678,14 @@ impl NetPeer for HubNi {
     }
 }
 
-impl HubNi {
+impl Ni {
     /// Whether the register state is locked now, for the `locks` monitor command.
     pub fn is_locked(&self) -> bool {
         self.state.is_locked()
     }
 }
 
-impl Resettable for HubNi {
+impl Resettable for Ni {
     fn power_on(&self) {
         {
             let mut s = self.state.lock();
@@ -700,7 +700,7 @@ impl Resettable for HubNi {
     }
 }
 
-impl BusDevice for HubNi {
+impl BusDevice for Ni {
     fn read64(&self, addr: u64) -> BusRead64 {
         BusRead64::ok(self.read(addr, true))
     }

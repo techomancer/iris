@@ -44,7 +44,6 @@ use crate::dev::elsc::{Elsc, ElscConfig, ModuleOutput};
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::hub::{Hub, HubConfig, HubHooks, Space};
-use crate::dev::hub_pi;
 use crate::dev::i2c::{BusBusy, I2cBus};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::isp1040::Isp1040;
@@ -168,7 +167,7 @@ impl Node {
     /// both enables clear, and the stock PROM never sets its own, so the
     /// board does what the processor module's strap does on the machine.
     fn enable_cpu(&self) {
-        self.hub.write64(hub_pi::reg::CPU_ENABLE_A, 1);
+        self.hub.enable_cpu(0);
     }
 }
 
@@ -306,11 +305,11 @@ struct Hooks {
     /// Where a cached reference naming node zero goes, as the node's number
     /// and cached alias set it.
     zero: Arc<ip27::NodeZero>,
-    pi: Weak<crate::dev::hub_pi::HubPi>,
+    hub: Weak<Hub>,
 }
 impl Hooks {
     fn route(&self, number: u16) {
-        let calias = self.pi.upgrade().map_or(0, |pi| pi.calias_bytes());
+        let calias = self.hub.upgrade().map_or(0, |hub| hub.calias_bytes());
         self.zero.update(number, calias);
     }
 }
@@ -497,7 +496,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             let memory = NodeMemory::new(spec.banks_mb)?;
             memory.map_reset_view(&flash);
             let hub = Hub::new(spec.hub, clock.clone());
-            hub.pi().set_timer_manager(timers.clone());
+            hub.set_timer_manager(timers.clone());
             // The Hub's one-wire master reads the node board's record, whose
             // serial is the node's identity: the other node's PROM reads it
             // as the remote NIC.
@@ -511,7 +510,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
                 }
                 None => onewire.add(Box::new(w1::Ds2505::new(0x0b, serial, &[]))),
             }
-            hub.md().set_onewire(onewire);
+            hub.set_onewire(onewire);
             hub.set_space(Space::Memory, memory.home());
             hub.set_space(
                 Space::HubSpecial,
@@ -532,14 +531,14 @@ impl<B: Ip27Board> Ip27Machine<B> {
         let mut units = Vec::new();
         for (node, spec) in parts.into_iter().zip(&specs) {
             let cpu = Self::build_cpu(cfg, &spec.module, &node, spec.hub.cpu_base, specs.len() > 1)?;
-            node.hub.pi().set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
+            node.hub.set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
             let zero = node.memory.node_zero();
             node.hub.set_hooks(Arc::new(Hooks {
                 name: product(cfg),
                 cpu: Arc::downgrade(&cpu),
                 events: tx.clone(),
                 zero,
-                pi: Arc::downgrade(node.hub.pi()),
+                hub: Arc::downgrade(&node.hub),
             }));
             node.hub.register_locks();
             cpu.register_locks();
@@ -935,7 +934,7 @@ impl Ip27Board for Origin200 {
         bridge.set_microlan(Self::board_record());
         // The Bridge answers every small window but the Hub's own.
         for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
-            node.hub.io().connect_widget(widget, bridge.clone());
+            node.hub.connect_widget(widget, bridge.clone());
         }
         pci_devices(node, cfg, PciPopulation { bridge, ioc3: &crate::dev::ioc3::IP29, controller })
     }

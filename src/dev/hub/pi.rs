@@ -38,7 +38,7 @@
 
 use crate::cpu::smp::on_cpu_thread;
 use crate::dev::heart::Clock;
-use crate::dev::hub::{HubHooks, HubObserver, Store, PENDING_BANKS};
+use super::{HubHooks, HubObserver, Store, PENDING_BANKS};
 use crate::dev::odyssey::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -169,7 +169,7 @@ impl State {
     }
 }
 
-pub struct HubPi {
+pub struct Pi {
     cpus: u8,
     cpu_base: usize,
     clock: Clock,
@@ -198,7 +198,7 @@ pub struct HubPi {
     weak: Weak<Self>,
 }
 
-impl HubPi {
+impl Pi {
     /// `cpus` is how many processor sockets the node populates (1 or 2) and
     /// `cpu_base` the global index of its slice A, which PI_CPU_NUM subtracts
     /// from the reading processor's.
@@ -640,7 +640,7 @@ impl HubPi {
     }
 }
 
-impl Resettable for HubPi {
+impl Resettable for Pi {
     /// Everything returns to its reset value except the error stack
     /// addresses, which firmware uses as a warm-start marker. Both processor
     /// enables clear, so the node's processors halt until firmware releases
@@ -674,7 +674,7 @@ impl Resettable for HubPi {
     }
 }
 
-impl BusDevice for HubPi {
+impl BusDevice for Pi {
     fn read64(&self, addr: u64) -> BusRead64 {
         BusRead64::ok(self.read(addr, true))
     }

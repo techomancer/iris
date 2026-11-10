@@ -11,7 +11,7 @@ use super::*;
 use std::sync::atomic::AtomicU8;
 
 struct Fixture {
-    pi: Arc<HubPi>,
+    pi: Arc<Pi>,
     now: Arc<AtomicU64>,
     lines: Arc<Lines>,
     hooks: Arc<Hooks>,
@@ -48,7 +48,7 @@ impl Fixture {
     fn new(cpus: u8) -> Self {
         let now = Arc::new(AtomicU64::new(1_000_000));
         let clock = now.clone();
-        let pi = HubPi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
+        let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
         let lines = Arc::new(Lines::default());
         let hooks = Arc::new(Hooks::default());
         pi.set_interrupt_controller(lines.clone());
@@ -112,7 +112,7 @@ fn the_processor_number_names_the_reading_processor() {
     t.w(reg::CPU_NUM, 1);
     assert_eq!(t.r(reg::CPU_NUM), 0);
     // A node whose slice A is global CPU 2.
-    let node = HubPi::new(2, 2, Arc::new(|| 0));
+    let node = Pi::new(2, 2, Arc::new(|| 0));
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(3);
         assert_eq!(node.read64(reg::CPU_NUM).data, 1);

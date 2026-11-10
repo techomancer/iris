@@ -119,31 +119,31 @@ fn r64(d: &dyn BusDevice, a: u64) -> u64 {
 }
 const NODE: fn(u64) -> u64 = |n| n << NODE_SHIFT;
 fn number(hub: &Hub, n: u64) {
-    assert_eq!(hub.write64(hub_ni::reg::STATUS, n << 8), BUS_OK);
+    assert_eq!(hub.write64(ni::reg::STATUS, n << 8), BUS_OK);
 }
 
 #[test]
 fn a_32_bit_access_selects_the_big_endian_half() {
     let hub = hub(1, 3);
-    let status = r64(&*hub, hub_ni::reg::STATUS);
+    let status = r64(&*hub, ni::reg::STATUS);
     // The reset value is all in the low word, so a swap would show.
     assert_ne!(status, 0);
-    assert_eq!(u64::from(hub.read32(hub_ni::reg::STATUS).data), status >> 32);
-    assert_eq!(u64::from(hub.read32(hub_ni::reg::STATUS + 4).data), status & 0xffff_ffff);
+    assert_eq!(u64::from(hub.read32(ni::reg::STATUS).data), status >> 32);
+    assert_eq!(u64::from(hub.read32(ni::reg::STATUS + 4).data), status & 0xffff_ffff);
     // A register with reset bits in both halves separates them sharply.
-    assert_eq!(hub.read32(hub_md::reg::CONFIG).data, 0x001e_7fbc);
-    assert_eq!(hub.read32(hub_md::reg::CONFIG + 4).data, 0x3fff_ffff);
+    assert_eq!(hub.read32(md::reg::CONFIG).data, 0x001e_7fbc);
+    assert_eq!(hub.read32(md::reg::CONFIG + 4).data, 0x3fff_ffff);
     // A 32-bit write replaces its own half and leaves the other alone.
-    hub.write64(hub_ni::reg::SCRATCH_0, 0x1111_2222_3333_4444);
-    hub.write32(hub_ni::reg::SCRATCH_0, 0xaaaa_bbbb);
-    assert_eq!(r64(&*hub, hub_ni::reg::SCRATCH_0), 0xaaaa_bbbb_3333_4444);
-    hub.write32(hub_ni::reg::SCRATCH_0 + 4, 0xcccc_dddd);
-    assert_eq!(r64(&*hub, hub_ni::reg::SCRATCH_0), 0xaaaa_bbbb_cccc_dddd);
+    hub.write64(ni::reg::SCRATCH_0, 0x1111_2222_3333_4444);
+    hub.write32(ni::reg::SCRATCH_0, 0xaaaa_bbbb);
+    assert_eq!(r64(&*hub, ni::reg::SCRATCH_0), 0xaaaa_bbbb_3333_4444);
+    hub.write32(ni::reg::SCRATCH_0 + 4, 0xcccc_dddd);
+    assert_eq!(r64(&*hub, ni::reg::SCRATCH_0), 0xaaaa_bbbb_cccc_dddd);
     // A half write still passes through the field mask (bits 31:3).
-    hub.write32(hub_pi::reg::ERR_STACK_ADDR_A + 4, 0xdead_beef);
-    assert_eq!(r64(&*hub, hub_pi::reg::ERR_STACK_ADDR_A), 0xdead_bee8);
-    hub.write32(hub_pi::reg::ERR_STACK_ADDR_A, 0xffff_ffff);
-    assert_eq!(r64(&*hub, hub_pi::reg::ERR_STACK_ADDR_A), 0xdead_bee8);
+    hub.write32(pi::reg::ERR_STACK_ADDR_A + 4, 0xdead_beef);
+    assert_eq!(r64(&*hub, pi::reg::ERR_STACK_ADDR_A), 0xdead_bee8);
+    hub.write32(pi::reg::ERR_STACK_ADDR_A, 0xffff_ffff);
+    assert_eq!(r64(&*hub, pi::reg::ERR_STACK_ADDR_A), 0xdead_bee8);
     // Only whole words, and only inside the window.
     assert_eq!(hub.read32(2).status, BUS_ERR);
     assert_eq!(hub.write32(WINDOW_SIZE, 0), BUS_ERR);
@@ -157,33 +157,33 @@ fn a_32_bit_access_selects_the_big_endian_half() {
 #[test]
 fn a_32_bit_read_of_a_read_to_clear_register_does_not_clear_it() {
     let (a, b) = pair();
-    b.write64(hub_ni::reg::SCRATCH_0, 7);
-    a.write64(hub_ni::reg::VECTOR, 0);
-    a.write64(hub_ni::reg::VECTOR_PARMS, hub_ni::reg::SCRATCH_0 - hub_ni::reg::STATUS);
-    let status = r64(&*a, hub_ni::reg::VECTOR_STATUS);
+    b.write64(ni::reg::SCRATCH_0, 7);
+    a.write64(ni::reg::VECTOR, 0);
+    a.write64(ni::reg::VECTOR_PARMS, ni::reg::SCRATCH_0 - ni::reg::STATUS);
+    let status = r64(&*a, ni::reg::VECTOR_STATUS);
     assert_ne!(status, 0);
-    assert_eq!(a.read32(hub_ni::reg::VECTOR_CLEAR).data, 0);
-    assert_eq!(r64(&*a, hub_ni::reg::VECTOR_STATUS), status);
-    assert_eq!(r64(&*a, hub_ni::reg::VECTOR_CLEAR), 0);
-    assert_eq!(r64(&*a, hub_ni::reg::VECTOR_STATUS), 0);
+    assert_eq!(a.read32(ni::reg::VECTOR_CLEAR).data, 0);
+    assert_eq!(r64(&*a, ni::reg::VECTOR_STATUS), status);
+    assert_eq!(r64(&*a, ni::reg::VECTOR_CLEAR), 0);
+    assert_eq!(r64(&*a, ni::reg::VECTOR_STATUS), 0);
     // And a half write of the write-one-to-clear port error does not merge
     // with the old value, which would clear more than was asked.
     a.ni().latch_port_error(0x6);
-    a.write32(hub_ni::reg::PORT_ERROR + 4, 0x2);
-    assert_eq!(r64(&*a, hub_ni::reg::PORT_ERROR), 0x4);
+    a.write32(ni::reg::PORT_ERROR + 4, 0x2);
+    assert_eq!(r64(&*a, ni::reg::PORT_ERROR), 0x4);
     // The interrupt-modify register stores nothing: the other half is zero.
-    a.write32(hub_pi::reg::INT_PEND_MOD + 4, (hub_pi::MODIFY_SET | 9) as u32);
-    assert_eq!(r64(&*a, hub_pi::reg::INT_PEND0), 1 << 9);
+    a.write32(pi::reg::INT_PEND_MOD + 4, (pi::MODIFY_SET | 9) as u32);
+    assert_eq!(r64(&*a, pi::reg::INT_PEND0), 1 << 9);
 }
 
 #[test]
 fn every_section_answers_through_the_window_and_the_rest_reads_zero() {
     let hub = hub(2, 5);
-    assert_eq!(r64(&*hub, hub_pi::reg::CALIAS_SIZE), 15);
-    assert_eq!(r64(&*hub, hub_md::reg::CONFIG), 0x001e_7fbc_3fff_ffff);
-    assert_eq!(r64(&*hub, hub_io::reg::WIDGET_ID), 0x1c10_106d);
-    assert_eq!(r64(&*hub, hub_ni::reg::STATUS) & 0xff, 5 << 4);
-    assert_eq!(r64(&*hub, hub_pi::reg::RT_COUNT) < 1_000, true);
+    assert_eq!(r64(&*hub, pi::reg::CALIAS_SIZE), 15);
+    assert_eq!(r64(&*hub, md::reg::CONFIG), 0x001e_7fbc_3fff_ffff);
+    assert_eq!(r64(&*hub, io::reg::WIDGET_ID), 0x1c10_106d);
+    assert_eq!(r64(&*hub, ni::reg::STATUS) & 0xff, 5 << 4);
+    assert_eq!(r64(&*hub, pi::reg::RT_COUNT) < 1_000, true);
     for off in [0x10_0000, 0x30_0000, 0x50_0000, 0x70_0000, 0x7f_fff8] {
         assert_eq!(hub.write64(off, !0), BUS_OK);
         assert_eq!(r64(&*hub, off), 0, "{off:#x}");
@@ -194,33 +194,33 @@ fn every_section_answers_through_the_window_and_the_rest_reads_zero() {
 fn the_i2c_controller_and_the_uart_take_narrow_accesses_over_the_md_block() {
     let hub = hub(1, 3);
     // With nothing fitted, narrow accesses fail like any other.
-    assert_eq!(hub.read8(hub_md::reg::UART_BASE).status, BUS_ERR);
+    assert_eq!(hub.read8(md::reg::UART_BASE).status, BUS_ERR);
     let (i2c, uart) = (Arc::new(Bytes::default()), Arc::new(Bytes::default()));
     hub.attach_i2c(i2c.clone());
     hub.attach_uart(uart.clone());
     // The PCF8584's S0 and S1, eight bytes apart.
-    assert_eq!(hub.write8(hub_md::reg::I2C_BASE, 0x5a), BUS_OK);
-    assert_eq!(hub.write8(hub_md::reg::I2C_BASE + 8, 0x3c), BUS_OK);
+    assert_eq!(hub.write8(md::reg::I2C_BASE, 0x5a), BUS_OK);
+    assert_eq!(hub.write8(md::reg::I2C_BASE + 8, 0x3c), BUS_OK);
     let (s0, s1) = {
         let regs = i2c.0.lock();
         (regs[0], regs[8])
     };
     assert_eq!((s0, s1), (0x5a, 0x3c));
-    assert_eq!(hub.read8(hub_md::reg::I2C_BASE).data, 0x5a);
+    assert_eq!(hub.read8(md::reg::I2C_BASE).data, 0x5a);
     // The UART's eight-byte register stride, the range exact.
-    hub.write8(hub_md::reg::UART_BASE + 8 * 3, 0x77);
+    hub.write8(md::reg::UART_BASE + 8 * 3, 0x77);
     assert_eq!(uart.0.lock()[24], 0x77);
-    assert_eq!(hub.read8(hub_md::reg::UART_END).status, BUS_ERR);
-    assert_eq!(hub.read8(hub_md::reg::UART_BASE - 8).status, BUS_ERR);
+    assert_eq!(hub.read8(md::reg::UART_END).status, BUS_ERR);
+    assert_eq!(hub.read8(md::reg::UART_BASE - 8).status, BUS_ERR);
     // The registers between them are still the MD block's.
-    assert_eq!(r64(&*hub, hub_md::reg::SLOTID_USTAT), 0x95);
+    assert_eq!(r64(&*hub, md::reg::SLOTID_USTAT), 0x95);
     // A doubleword access to the overlay is one register access too: the
     // PROM polls the controller's status with 8-byte loads.
-    assert_eq!(hub.write64(hub_md::reg::I2C_BASE, 1), BUS_OK);
+    assert_eq!(hub.write64(md::reg::I2C_BASE, 1), BUS_OK);
     assert_eq!(i2c.0.lock()[0], 1);
-    assert_eq!(hub.read64(hub_md::reg::I2C_BASE + 8).data, 0x3c);
+    assert_eq!(hub.read64(md::reg::I2C_BASE + 8).data, 0x3c);
     i2c.0.lock()[0] = 0x81;
-    assert_eq!(hub.read64(hub_md::reg::I2C_BASE).data, 0x81, "an 8-byte read reaches the PCF8584 status");
+    assert_eq!(hub.read64(md::reg::I2C_BASE).data, 0x81, "an 8-byte read reaches the PCF8584 status");
 }
 
 #[test]
@@ -229,11 +229,11 @@ fn hooks_carry_the_nodes_processor_controls_to_the_machine() {
     let machine = Arc::new(Machine::default());
     hub.set_hooks(machine.clone());
     let take = || std::mem::take(&mut *machine.0.lock());
-    hub.write64(hub_pi::reg::CPU_ENABLE_A, 1);
-    hub.write64(hub_pi::reg::NMI_B, 1);
-    hub.write64(hub_pi::reg::SOFTRESET, 1);
-    hub.write64(hub_pi::reg::CALIAS_SIZE, 2);
-    hub.write64(hub_ni::reg::PORT_RESET, 0x81);
+    hub.write64(pi::reg::CPU_ENABLE_A, 1);
+    hub.write64(pi::reg::NMI_B, 1);
+    hub.write64(pi::reg::SOFTRESET, 1);
+    hub.write64(pi::reg::CALIAS_SIZE, 2);
+    hub.write64(ni::reg::PORT_RESET, 0x81);
     assert_eq!(take(), ["enable 0 true", "nmi 1", "soft 0", "calias 0x2000", "restart"]);
     number(&hub, 4);
     assert_eq!(take(), ["number 4"]);
@@ -244,17 +244,17 @@ fn hooks_carry_the_nodes_processor_controls_to_the_machine() {
 #[test]
 fn reset_restores_the_registers_and_keeps_what_firmware_parks() {
     let hub = hub(2, 3);
-    hub.write64(hub_pi::reg::ERR_STACK_ADDR_B, 0xabcd_0000);
-    hub.write64(hub_pi::reg::CALIAS_SIZE, 1);
-    hub.write64(hub_md::reg::CONFIG, 5);
-    hub.write64(hub_io::reg::SCRATCH_0, 6);
+    hub.write64(pi::reg::ERR_STACK_ADDR_B, 0xabcd_0000);
+    hub.write64(pi::reg::CALIAS_SIZE, 1);
+    hub.write64(md::reg::CONFIG, 5);
+    hub.write64(io::reg::SCRATCH_0, 6);
     number(&hub, 3);
     hub.power_on();
-    assert_eq!(r64(&*hub, hub_pi::reg::ERR_STACK_ADDR_B), 0xabcd_0000);
-    assert_eq!(r64(&*hub, hub_pi::reg::CALIAS_SIZE), 15);
+    assert_eq!(r64(&*hub, pi::reg::ERR_STACK_ADDR_B), 0xabcd_0000);
+    assert_eq!(r64(&*hub, pi::reg::CALIAS_SIZE), 15);
     assert_eq!(hub.calias.load(Ordering::SeqCst), 64 << 20);
-    assert_eq!(r64(&*hub, hub_md::reg::CONFIG), 0x001e_7fbc_3fff_ffff);
-    assert_eq!(r64(&*hub, hub_io::reg::SCRATCH_0), 0);
+    assert_eq!(r64(&*hub, md::reg::CONFIG), 0x001e_7fbc_3fff_ffff);
+    assert_eq!(r64(&*hub, io::reg::SCRATCH_0), 0);
     assert_eq!(hub.ni().number(), 0);
     assert_eq!(hub.claims[0].load(Ordering::SeqCst), THIS_HUB);
     assert_eq!(hub.claims[3].load(Ordering::SeqCst), NOBODY);
@@ -314,7 +314,7 @@ fn two_cabled_hubs_each_claim_the_others_programmed_number() {
 fn the_cached_alias_keeps_node_zero_local_until_the_numbering_moves_it() {
     let hub = hub(1, 3);
     let cpu = hub.cpu_memory();
-    hub.write64(hub_pi::reg::CALIAS_SIZE, 1);
+    hub.write64(pi::reg::CALIAS_SIZE, 1);
     number(&hub, 6);
     // Within the 4 KiB window a node-zero address stays on this node even
     // though node 0 is held by nobody now.
@@ -324,17 +324,17 @@ fn the_cached_alias_keeps_node_zero_local_until_the_numbering_moves_it() {
     assert_eq!(cpu.read8(0x1000).status, BUS_ERR);
     assert_eq!(cpu.read8(NODE(6) + 0x1000).data, 0x00);
     // The window tracks the register: 8 KiB, then none.
-    hub.write64(hub_pi::reg::CALIAS_SIZE, 2);
+    hub.write64(pi::reg::CALIAS_SIZE, 2);
     assert_eq!(cpu.read8(0x1000).data, 0x00);
     assert_eq!(cpu.read8(0x2000).status, BUS_ERR);
-    hub.write64(hub_pi::reg::CALIAS_SIZE, 0);
+    hub.write64(pi::reg::CALIAS_SIZE, 0);
     assert_eq!(cpu.read8(0x10).status, BUS_ERR);
     // Reset sets it back to its 64 MiB sentinel, and node zero is this
     // node's own again before anything is numbered.
     hub.power_on();
     assert_eq!(cpu.read8(RAM_SIZE as u64 - 1).data, 0xff);
     // The plain claim never honours the alias.
-    hub.write64(hub_pi::reg::CALIAS_SIZE, 0);
+    hub.write64(pi::reg::CALIAS_SIZE, 0);
     assert_eq!(hub.claim(Space::Memory).read8(0x10).data, 0x10);
 }
 
@@ -403,16 +403,16 @@ fn an_interrupt_modify_write_lands_on_the_hub_the_packet_names() {
     let xio = a.inbound();
     let packet = |node: u64| (1 << 47) | (node << 38) | 0x0180_0090;
     // Local: set interrupt 70, which is bit 6 of the second bank.
-    assert_eq!(xio.write64(packet(1), hub_pi::MODIFY_SET | 70), BUS_OK);
+    assert_eq!(xio.write64(packet(1), pi::MODIFY_SET | 70), BUS_OK);
     assert_eq!(a.pi().pending(1), 1 << 6);
     assert_eq!(b.pi().pending(1), 0);
     // Across the cable, by the peer's programmed number.
-    assert_eq!(xio.write64(packet(2), hub_pi::MODIFY_SET | 9), BUS_OK);
+    assert_eq!(xio.write64(packet(2), pi::MODIFY_SET | 9), BUS_OK);
     assert_eq!(b.pi().pending(0), 1 << 9);
     assert_eq!(xio.write64(packet(2), 9), BUS_OK);
     assert_eq!(b.pi().pending(0), 0);
     // A number nobody holds, a narrow write and any other offset fail.
-    assert_eq!(xio.write64(packet(3), hub_pi::MODIFY_SET | 1), BUS_ERR);
+    assert_eq!(xio.write64(packet(3), pi::MODIFY_SET | 1), BUS_ERR);
     assert_eq!(xio.write32(packet(1), 1), BUS_ERR);
     assert_eq!(xio.write64(packet(1) + 8, 1), BUS_ERR);
     assert_eq!(a.pi().pending(0), 0);
@@ -423,7 +423,7 @@ fn a_peers_identity_probe_reads_the_network_status_and_nothing_else_is_answered(
     let (a, _) = pair();
     let xio = a.inbound();
     let probe = (1u64 << 47) | 0x0160_0000;
-    assert_eq!(xio.read64(probe).data, a.ni().read64(hub_ni::reg::STATUS).data);
+    assert_eq!(xio.read64(probe).data, a.ni().read64(ni::reg::STATUS).data);
     assert_eq!(xio.read32(probe).status, BUS_ERR, "a doubleword read only");
     assert_eq!(xio.read64(probe + 8).status, BUS_ERR);
     assert_eq!(xio.write64(probe, 0).status_ok(), false);
@@ -457,11 +457,11 @@ fn the_io_space_holds_the_registers_at_both_offsets_and_the_widgets_behind_them(
     // Both the reader's own alias and the node-explicit window.
     let regs = [IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED];
     for base in regs {
-        assert_eq!(io.read64(base + hub_md::reg::CONFIG).data, 0x001e_7fbc_3fff_ffff);
+        assert_eq!(io.read64(base + md::reg::CONFIG).data, 0x001e_7fbc_3fff_ffff);
     }
-    io.write64(IO_REGISTERS_LOCAL + hub_io::reg::SCRATCH_1, 0x1234);
-    assert_eq!(io.read64(IO_REGISTERS_NAMED + hub_io::reg::SCRATCH_1).data, 0x1234);
-    assert_eq!(io.read32(IO_REGISTERS_NAMED + hub_io::reg::SCRATCH_1 + 4).data, 0x1234);
+    io.write64(IO_REGISTERS_LOCAL + io::reg::SCRATCH_1, 0x1234);
+    assert_eq!(io.read64(IO_REGISTERS_NAMED + io::reg::SCRATCH_1).data, 0x1234);
+    assert_eq!(io.read32(IO_REGISTERS_NAMED + io::reg::SCRATCH_1 + 4).data, 0x1234);
     // Past the second window the space is widget 2's.
     assert_eq!(io.read64(0x0200_0000).status, BUS_ERR);
     // A widget at its small window and through a big window.
@@ -469,11 +469,11 @@ fn the_io_space_holds_the_registers_at_both_offsets_and_the_widgets_behind_them(
     hub.io().connect_widget(9, widget.clone());
     io.write8(9 << 24 | 5, 0x77);
     assert_eq!(widget.0.lock()[5], 0x77);
-    hub.write64(hub_io::reg::BWIN_TABLE + 8, 9 << 8);
-    io.write8(IO_BIG_WINDOWS + hub_io::BIG_WINDOW_SIZE + 6, 0x66);
+    hub.write64(io::reg::BWIN_TABLE + 8, 9 << 8);
+    io.write8(IO_BIG_WINDOWS + io::BIG_WINDOW_SIZE + 6, 0x66);
     assert_eq!(widget.0.lock()[6], 0x66);
-    assert_eq!(io.read8(IO_BIG_WINDOWS + hub_io::BIG_WINDOW_SIZE + 6).data, 0x66);
-    assert_eq!(io.read8(IO_BIG_WINDOWS + 7 * hub_io::BIG_WINDOW_SIZE).status, BUS_ERR);
+    assert_eq!(io.read8(IO_BIG_WINDOWS + io::BIG_WINDOW_SIZE + 6).data, 0x66);
+    assert_eq!(io.read8(IO_BIG_WINDOWS + 7 * io::BIG_WINDOW_SIZE).status, BUS_ERR);
 }
 
 #[test]
@@ -483,23 +483,23 @@ fn a_processors_own_register_alias_stays_on_its_node_whatever_the_number() {
         hub.set_space(Space::Io, hub.io_space());
     }
     number(&b, 1);
-    let at = IO_REGISTERS_LOCAL + hub_io::reg::SCRATCH_1;
+    let at = IO_REGISTERS_LOCAL + io::reg::SCRATCH_1;
     // The claim by node number sends node zero's alias to the node holding
     // zero; the processor's view keeps it on its own.
     assert_eq!(b.claim(Space::Io).write64(at, 0x11), BUS_OK);
-    assert_eq!(r64(&*a, hub_io::reg::SCRATCH_1), 0x11);
+    assert_eq!(r64(&*a, io::reg::SCRATCH_1), 0x11);
     assert_eq!(b.cpu_io().write64(at, 0x22), BUS_OK);
-    assert_eq!(r64(&*b, hub_io::reg::SCRATCH_1), 0x22);
-    assert_eq!(r64(&*a, hub_io::reg::SCRATCH_1), 0x11);
+    assert_eq!(r64(&*b, io::reg::SCRATCH_1), 0x22);
+    assert_eq!(r64(&*a, io::reg::SCRATCH_1), 0x11);
     // The node-explicit window still goes by node number.
-    assert_eq!(b.cpu_io().read64(IO_REGISTERS_NAMED + hub_io::reg::SCRATCH_1).data, 0x11);
-    assert_eq!(b.cpu_io().read64(NODE(1) + IO_REGISTERS_NAMED + hub_io::reg::SCRATCH_1).data, 0x22);
+    assert_eq!(b.cpu_io().read64(IO_REGISTERS_NAMED + io::reg::SCRATCH_1).data, 0x11);
+    assert_eq!(b.cpu_io().read64(NODE(1) + IO_REGISTERS_NAMED + io::reg::SCRATCH_1).data, 0x22);
     // The alias is the one with node field zero: another node's number at
     // the same offset goes to that node.
     assert_eq!(b.cpu_io().read64(NODE(0) + at).data, 0x22);
     assert_eq!(a.cpu_io().write64(NODE(1) + at, 0x33), BUS_OK);
-    assert_eq!(r64(&*b, hub_io::reg::SCRATCH_1), 0x33);
-    assert_eq!(r64(&*a, hub_io::reg::SCRATCH_1), 0x11);
+    assert_eq!(r64(&*b, io::reg::SCRATCH_1), 0x33);
+    assert_eq!(r64(&*a, io::reg::SCRATCH_1), 0x11);
 }
 
 // ---- the engines through the fabric ----
@@ -509,13 +509,13 @@ fn an_engine_addresses_memory_by_node_number_and_interrupts_the_node_it_names() 
     let (a, b) = pair();
     number(&a, 1);
     number(&b, 2);
-    let (engine, bte) = (hub_io::reg::BTE_BASE, hub_io::bte::LENGTH);
+    let (engine, bte) = (io::reg::BTE_BASE, io::bte::LENGTH);
     // Copy two lines from this node's memory into the peer's.
-    a.write64(hub_io::reg::BTE_BASE + hub_io::bte::SOURCE, NODE(1) + 0x1000);
-    a.write64(hub_io::reg::BTE_BASE + hub_io::bte::DEST, NODE(2) + 0x2000);
-    a.write64(hub_io::reg::BTE_BASE + hub_io::bte::INTERRUPT, (17 << 16) | 2);
+    a.write64(io::reg::BTE_BASE + io::bte::SOURCE, NODE(1) + 0x1000);
+    a.write64(io::reg::BTE_BASE + io::bte::DEST, NODE(2) + 0x2000);
+    a.write64(io::reg::BTE_BASE + io::bte::INTERRUPT, (17 << 16) | 2);
     a.write64(engine + bte, (1 << 20) | 2);
-    a.write64(engine + hub_io::bte::CONTROL, 0);
+    a.write64(engine + io::bte::CONTROL, 0);
     for i in 0..256 {
         assert_eq!(b.claim(Space::Memory).read8(NODE(2) + 0x2000 + i).data, a.claim(Space::Memory).read8(NODE(1) + 0x1000 + i).data);
     }
@@ -524,19 +524,19 @@ fn an_engine_addresses_memory_by_node_number_and_interrupts_the_node_it_names() 
     assert_eq!(b.pi().pending(0), 1 << 17);
     // An engine's addresses ignore the cached alias: node zero is whichever
     // Hub holds zero, which nobody does now.
-    a.write64(hub_pi::reg::CALIAS_SIZE, 15);
-    a.write64(engine + hub_io::bte::SOURCE, 0x1000);
-    a.write64(engine + hub_io::bte::DEST, NODE(1) + 0x3000);
+    a.write64(pi::reg::CALIAS_SIZE, 15);
+    a.write64(engine + io::bte::SOURCE, 0x1000);
+    a.write64(engine + io::bte::DEST, NODE(1) + 0x3000);
     a.write64(engine + bte, (1 << 20) | 1);
-    a.write64(engine + hub_io::bte::CONTROL, 0);
+    a.write64(engine + io::bte::CONTROL, 0);
     assert_eq!(a.read64(engine + bte).data, (1 << 20) | (1 << 16) | 1);
     // Completion aimed at a node nobody holds drops the interrupt softly.
-    a.write64(engine + hub_io::bte::LENGTH, 0);
-    a.write64(hub_io::reg::ERROR_CLEAR, 1 << 17);
-    a.write64(engine + hub_io::bte::SOURCE, NODE(1) + 0x1000);
-    a.write64(engine + hub_io::bte::INTERRUPT, 9);
+    a.write64(engine + io::bte::LENGTH, 0);
+    a.write64(io::reg::ERROR_CLEAR, 1 << 17);
+    a.write64(engine + io::bte::SOURCE, NODE(1) + 0x1000);
+    a.write64(engine + io::bte::INTERRUPT, 9);
     a.write64(engine + bte, (1 << 20) | 1);
-    a.write64(engine + hub_io::bte::CONTROL, 0);
+    a.write64(engine + io::bte::CONTROL, 0);
     assert_eq!(a.read64(engine + bte).data, 0);
 }
 
@@ -587,7 +587,7 @@ fn a_failed_processor_read_is_recorded_for_the_slice_that_issued_it() {
     // A good read records nothing.
     let i = io.clone();
     on_cpu(0, Box::new(move || assert_eq!(i.read64(0x0100_0000).data, 0x0100_0000)));
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_A).data, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_A).data, 0);
     // The PROM's probe: the Hub fails 0x0240_0208 itself, whatever node
     // it names, and the first failure latches the address.
     let i = io.clone();
@@ -595,7 +595,7 @@ fn a_failed_processor_read_is_recorded_for_the_slice_that_issued_it() {
         assert_eq!(i.read64(IO_BUS_ERROR_PROBE).status, BUS_ERR);
         assert_eq!(i.read64(NODE(9) + IO_BUS_ERROR_PROBE).status, BUS_ERR);
     }));
-    let record = hub.read64(hub_pi::reg::ERR_STATUS0_A).data;
+    let record = hub.read64(pi::reg::ERR_STATUS0_A).data;
     assert_eq!(record >> 62, 0b11, "valid, and overrun from the second");
     assert_eq!((record >> 25) & ((1 << 37) - 1), IO_BUS_ERROR_PROBE >> 3);
     // A narrower read of that address goes downstream instead.
@@ -605,16 +605,16 @@ fn a_failed_processor_read_is_recorded_for_the_slice_that_issued_it() {
     down.fail.store(true, Ordering::SeqCst);
     let i = io.clone();
     on_cpu(1, Box::new(move || assert_eq!(i.read32(0x0300_0004).status, BUS_ERR)));
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_B).data, (1 << 63) | ((0x0300_0004u64 >> 3) << 25));
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_B).data, (1 << 63) | ((0x0300_0004u64 >> 3) << 25));
     // Writes are not reads: a failing store records nothing.
-    hub.read64(hub_pi::reg::ERR_STATUS0_B_RCLR);
+    hub.read64(pi::reg::ERR_STATUS0_B_RCLR);
     let i = io.clone();
     on_cpu(1, Box::new(move || assert_eq!(i.write64(0x10, 0), BUS_ERR)));
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_B).data, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_B).data, 0);
     // A full-width zero store to the status-1 alias ends the record
     // (inferred).
-    hub.write64(hub_pi::reg::ERR_STATUS1_A_RCLR, 0);
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_A).data, 0);
+    hub.write64(pi::reg::ERR_STATUS1_A_RCLR, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_A).data, 0);
 }
 
 /// A read the device answers busy is retried, not failed: it records nothing,
@@ -634,7 +634,7 @@ fn a_busy_processor_read_records_no_error() {
     })
     .join()
     .unwrap();
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_A).data, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_A).data, 0);
 }
 
 /// A debugger's access, a device's DMA and a processor of another node record
@@ -649,8 +649,8 @@ fn a_failed_read_from_a_thread_that_is_not_one_of_the_nodes_processors_records_n
     assert_eq!(io.read64(0x0300_0000).status, BUS_ERR);
     assert_eq!(io.read64(IO_BUS_ERROR_PROBE).status, BUS_ERR);
     assert_eq!(hub.pi().reader_slice(), None);
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_A).data, 0);
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_B).data, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_A).data, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_B).data, 0);
     // Nor does a processor numbered outside this node's.
     let (h, i) = (hub.clone(), io.clone());
     std::thread::spawn(move || {
@@ -660,8 +660,8 @@ fn a_failed_read_from_a_thread_that_is_not_one_of_the_nodes_processors_records_n
     })
     .join()
     .unwrap();
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_A).data, 0);
-    assert_eq!(hub.read64(hub_pi::reg::ERR_STATUS0_B).data, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_A).data, 0);
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_B).data, 0);
 }
 
 // ---- the Bridge's side ----
@@ -715,10 +715,10 @@ fn the_observer_sees_the_stores_a_processor_rendezvous_posts() {
     a.set_observer(seen.clone());
     let take = || std::mem::take(&mut *seen.0.lock());
     // The pair handshake: a compare post, and the failure tail's enable clear.
-    a.write64(hub_pi::reg::RT_COMPARE_A, 0x24);
-    a.write64(hub_pi::reg::RT_COMPARE_B, !0);
-    a.write64(hub_pi::reg::CPU_ENABLE_B, 0);
-    a.write64(hub_pi::reg::CPU_ENABLE_A, 0xff);
+    a.write64(pi::reg::RT_COMPARE_A, 0x24);
+    a.write64(pi::reg::RT_COMPARE_B, !0);
+    a.write64(pi::reg::CPU_ENABLE_B, 0);
+    a.write64(pi::reg::CPU_ENABLE_A, 0xff);
     assert_eq!(
         take(),
         [
@@ -729,14 +729,14 @@ fn the_observer_sees_the_stores_a_processor_rendezvous_posts() {
         ]
     );
     // The values are the registers': nothing was held back.
-    assert_eq!(a.read64(hub_pi::reg::RT_COMPARE_A).data, 0x24);
+    assert_eq!(a.read64(pi::reg::RT_COMPARE_A).data, 0x24);
     // II scratch 0 holds the pair's outcome bits; the mask applies.
-    a.write64(hub_io::reg::SCRATCH_0, (1 << 23) | (1 << 40));
-    a.write64(hub_io::reg::SCRATCH_1, 5);
+    a.write64(io::reg::SCRATCH_0, (1 << 23) | (1 << 40));
+    a.write64(io::reg::SCRATCH_1, 5);
     assert_eq!(take(), [Store::IoScratch { index: 0, value: 1 << 23 }, Store::IoScratch { index: 1, value: 5 }]);
     // The node barrier and numbering posts, on the bus.
-    a.write64(hub_ni::reg::SCRATCH_0, !0);
-    a.write64(hub_ni::reg::SCRATCH_1, 1 << 17);
+    a.write64(ni::reg::SCRATCH_0, !0);
+    a.write64(ni::reg::SCRATCH_1, 1 << 17);
     assert_eq!(
         take(),
         [
@@ -745,15 +745,15 @@ fn the_observer_sees_the_stores_a_processor_rendezvous_posts() {
         ]
     );
     // And from another node over the cable, by vector PIO.
-    b.write64(hub_ni::reg::VECTOR, 0);
-    b.write64(hub_ni::reg::VECTOR_DATA, 0x77);
-    b.write64(hub_ni::reg::VECTOR_PARMS, (hub_ni::reg::SCRATCH_1 - hub_ni::reg::STATUS) | 1);
+    b.write64(ni::reg::VECTOR, 0);
+    b.write64(ni::reg::VECTOR_DATA, 0x77);
+    b.write64(ni::reg::VECTOR_PARMS, (ni::reg::SCRATCH_1 - ni::reg::STATUS) | 1);
     assert_eq!(take(), [Store::NiScratch { index: 1, value: 0x77, vector: true }]);
     // The launch poke: a pending bit raised, one cleared, and one set twice.
-    let poke = (hub_pi::MODIFY_SET | 12) as u64;
-    a.write64(hub_pi::reg::INT_PEND_MOD, poke);
-    a.write64(hub_pi::reg::INT_PEND_MOD, poke);
-    a.write64(hub_pi::reg::INT_PEND_MOD, 12);
+    let poke = (pi::MODIFY_SET | 12) as u64;
+    a.write64(pi::reg::INT_PEND_MOD, poke);
+    a.write64(pi::reg::INT_PEND_MOD, poke);
+    a.write64(pi::reg::INT_PEND_MOD, 12);
     assert_eq!(
         take(),
         [
@@ -764,9 +764,9 @@ fn the_observer_sees_the_stores_a_processor_rendezvous_posts() {
     );
     // A device interrupt arrives through the same register.
     a.interrupt_target().set_line(3, true);
-    assert_eq!(take(), [Store::IntPendMod { value: hub_pi::MODIFY_SET | 3, changed: true }]);
+    assert_eq!(take(), [Store::IntPendMod { value: pi::MODIFY_SET | 3, changed: true }]);
     // The port reset is reported before it acts.
-    a.write64(hub_ni::reg::PORT_RESET, 0x81);
+    a.write64(ni::reg::PORT_RESET, 0x81);
     assert_eq!(take(), [Store::PortReset { value: 0x81 }]);
 }
 
@@ -774,22 +774,22 @@ fn the_observer_sees_the_stores_a_processor_rendezvous_posts() {
 fn the_observer_does_not_see_reads_or_other_stores_and_is_optional() {
     let hub = hub(2, 3);
     // Nothing connected: every one of those stores simply works.
-    hub.write64(hub_pi::reg::RT_COMPARE_A, 5);
-    hub.write64(hub_pi::reg::INT_PEND_MOD, hub_pi::MODIFY_SET | 1);
-    hub.write64(hub_ni::reg::SCRATCH_0, 1);
-    hub.write64(hub_io::reg::SCRATCH_0, 1);
-    hub.write64(hub_ni::reg::PORT_RESET, 0x80);
+    hub.write64(pi::reg::RT_COMPARE_A, 5);
+    hub.write64(pi::reg::INT_PEND_MOD, pi::MODIFY_SET | 1);
+    hub.write64(ni::reg::SCRATCH_0, 1);
+    hub.write64(io::reg::SCRATCH_0, 1);
+    hub.write64(ni::reg::PORT_RESET, 0x80);
     let seen = Arc::new(Seen::default());
     hub.set_observer(seen.clone());
-    hub.read64(hub_pi::reg::RT_COMPARE_A);
-    hub.read64(hub_pi::reg::RT_COUNT);
-    hub.read64(hub_pi::reg::INT_PEND0);
-    hub.read64(hub_ni::reg::SCRATCH_0);
-    hub.write64(hub_pi::reg::INT_MASK0_A, !0);
-    hub.write64(hub_pi::reg::RT_COUNT, 0);
-    hub.write64(hub_md::reg::CONFIG, 0);
-    hub.write64(hub_ni::reg::STATUS, 0);
-    hub.write64(hub_io::reg::SCRATCH_0 + 0x100, 0);
+    hub.read64(pi::reg::RT_COMPARE_A);
+    hub.read64(pi::reg::RT_COUNT);
+    hub.read64(pi::reg::INT_PEND0);
+    hub.read64(ni::reg::SCRATCH_0);
+    hub.write64(pi::reg::INT_MASK0_A, !0);
+    hub.write64(pi::reg::RT_COUNT, 0);
+    hub.write64(md::reg::CONFIG, 0);
+    hub.write64(ni::reg::STATUS, 0);
+    hub.write64(io::reg::SCRATCH_0 + 0x100, 0);
     assert!(seen.0.lock().is_empty());
 }
 
