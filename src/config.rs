@@ -725,7 +725,7 @@ impl MachineProfile {
     pub fn prom_path(self, prom: &str) -> String {
         match self {
             Self::OctaneIp30 => prom_file(prom, crate::ip30_machine::OCTANE_PROM_FILE),
-            Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => prom_file(prom, crate::ip27_machine::ORIGIN200_PROM_FILE),
+            _ if self.is_ip27() => prom_file(prom, crate::ip27_machine::ORIGIN200_PROM_FILE),
             Self::O2Ip32 => prom_file(prom, crate::ip32_machine::O2_PROM_FILE),
             _ => prom.to_string(),
         }
@@ -759,6 +759,22 @@ impl MachineProfile {
             Self::Onyx2Ip27 => "onyx2_ip27",
             Self::FuelIp34 => "fuel_ip34",
             Self::TezroIp53 => "tezro_ip53",
+        }
+    }
+
+    /// The three SN0 machines, which share the Hub node, the module controller
+    /// and the IP27 PROM.
+    pub fn is_ip27(self) -> bool {
+        matches!(self, Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27)
+    }
+
+    /// An SN0 product's name as a sentence has it, `None` for the other machines.
+    pub fn ip27_name(self) -> Option<&'static str> {
+        match self {
+            Self::Origin200Ip29 => Some("Origin 200"),
+            Self::Origin2000Ip27 => Some("Origin 2000"),
+            Self::Onyx2Ip27 => Some("Onyx2"),
+            _ => None,
         }
     }
 
@@ -841,10 +857,7 @@ impl MachineProfile {
     /// WD33C93As) and the O2 (two Adaptec 7880s, the second on the external
     /// connector), one on the Indy.
     pub fn scsi_controllers(self) -> u8 {
-        match self {
-            Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 | Self::FuelIp34 | Self::TezroIp53 => 2,
-            _ => 1,
-        }
+        if self.is_ip27() || matches!(self, Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::FuelIp34 | Self::TezroIp53) { 2 } else { 1 }
     }
 
     /// The highest SCSI id a `[scsi.N]` table can name. The Octane's ISP1040
@@ -853,10 +866,7 @@ impl MachineProfile {
     /// Adaptec buses are wide too, but stay at 7 until they are widened on
     /// purpose. The Fuel's and the Tezro's ISP12160 buses are wide.
     pub fn max_scsi_id(self) -> u8 {
-        match self {
-            Self::OctaneIp30 | Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 | Self::FuelIp34 | Self::TezroIp53 => 15,
-            _ => 7,
-        }
+        if self.is_ip27() || matches!(self, Self::OctaneIp30 | Self::FuelIp34 | Self::TezroIp53) { 15 } else { 7 }
     }
 
     /// How many memory banks the machine has: four on the MC, HEART and O2
@@ -996,7 +1006,7 @@ impl GraphicsBoard {
     pub fn supports(self, profile: MachineProfile) -> bool {
         match profile {
             MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
-            MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => self == Self::None,
+            p if p.is_ip27() => self == Self::None,
             MachineProfile::FuelIp34 => matches!(self, Self::V10 | Self::V12 | Self::None),
             MachineProfile::TezroIp53 => matches!(self, Self::None | Self::V12),
             MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
@@ -1008,7 +1018,7 @@ impl GraphicsBoard {
     pub fn default_for(profile: MachineProfile) -> Self {
         match profile {
             MachineProfile::OctaneIp30 => Self::SolidImpact,
-            MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => Self::None,
+            p if p.is_ip27() => Self::None,
             MachineProfile::FuelIp34 | MachineProfile::TezroIp53 => Self::None,
             _ => Self::Newport,
         }
@@ -2601,9 +2611,9 @@ impl MachineConfig {
             }
             // The Octane has a PCI bridge with a free slot.
             MachineProfile::OctaneIp30 => Ok(()),
-            MachineProfile::Origin200Ip29 => Err("[virtio_serial] is not wired on the Origin 200".into()),
-            MachineProfile::Origin2000Ip27 => Err("[virtio_serial] is not wired on the Origin 2000".into()),
-            MachineProfile::Onyx2Ip27 => Err("[virtio_serial] is not wired on the Onyx2".into()),
+            p @ (MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) => {
+                Err(format!("[virtio_serial] is not wired on the {}", p.ip27_name().expect("an SN0 product")))
+            }
             MachineProfile::FuelIp34 => Err(
                 "[virtio_serial] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
             ),
@@ -2901,12 +2911,8 @@ impl MachineConfig {
             if !board.supports(self.machine.profile) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
                     format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
-                } else if self.machine.profile == MachineProfile::Origin200Ip29 {
-                    format!("graphics.board \"{name}\" is not modelled on the Origin 200 (valid: none)")
-                } else if self.machine.profile == MachineProfile::Origin2000Ip27 {
-                    format!("graphics.board \"{name}\" is not modelled on the Origin 2000 (valid: none)")
-                } else if self.machine.profile == MachineProfile::Onyx2Ip27 {
-                    format!("graphics.board \"{name}\" is not modelled on the Onyx2 (valid: none)")
+                } else if let Some(product) = self.machine.profile.ip27_name() {
+                    format!("graphics.board \"{name}\" is not modelled on the {product} (valid: none)")
                 } else if self.machine.profile == MachineProfile::FuelIp34 {
                     format!("graphics.board \"{name}\" is not a Fuel board (valid: v12, v10, none)")
                 } else {
@@ -2940,9 +2946,10 @@ impl MachineConfig {
                 return Err(format!("scsi.{}: controller {} is invalid (valid: 0, 1)", key, controller));
             }
             if controller != 0 && self.machine.profile.scsi_controllers() < 2 {
+                let two: Vec<_> = MachineProfile::EVERY.iter().filter(|p| p.scsi_controllers() > 1).map(|p| p.name()).collect();
                 return Err(format!(
-                    "scsi.{}: controller {} is only valid on Indigo2 (machine.profile = indigo2_ip22) and O2 (o2_ip32), which have two SCSI controllers — this machine has one (0)",
-                    key, controller
+                    "scsi.{}: controller {} is only valid on the machines with two SCSI controllers (machine.profile = {}) — this machine has one (0)",
+                    key, controller, two.join(", ")
                 ));
             }
             if let Some(other) = placed.insert((controller, id), key) {
@@ -2950,9 +2957,10 @@ impl MachineConfig {
                     "scsi.{} and scsi.{} both name {}", other, key, scsi_label(controller, id)
                 ));
             }
-            if dev.is_daynaport() && matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
+            if dev.is_daynaport() && (matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) || self.machine.profile.is_ip27()) {
+                let on = self.machine.profile.ip27_name().map_or_else(|| self.machine.profile.label().to_string(), |p| format!("the {p}"));
                 return Err(format!(
-                    "scsi.{}: kind = \"daynaport\" is not available on {} (its Ethernet is built in)", key, self.machine.profile.label()
+                    "scsi.{}: kind = \"daynaport\" is not available on {on} (its Ethernet is built in)", key
                 ));
             }
             if dev.is_daynaport() && self.network.mode == NetMode::Stream {
@@ -2993,12 +3001,7 @@ impl MachineConfig {
                 }
             }
             crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
-        } else if matches!(self.machine.profile, MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) {
-            let name = match self.machine.profile {
-                MachineProfile::Origin200Ip29 => "Origin 200",
-                MachineProfile::Onyx2Ip27 => "Onyx2",
-                _ => "Origin 2000",
-            };
+        } else if let Some(name) = self.machine.profile.ip27_name() {
             // The node has four banks of a DIMM pair each, filled from
             // bank 0 without a gap.
             let banks = &self.banks[..bank_count];
@@ -3087,8 +3090,8 @@ impl MachineConfig {
             }
         }
         match (self.network.mode, self.machine.profile) {
-            (NetMode::Off, p) if !matches!(p, MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) => {
-                return Err("network.mode = \"off\" is only available on the O2, the Octane, the Fuel, the Tezro and the Origin 200 and 2000 for now; the Indy and Indigo2 always have their Ethernet".into());
+            (NetMode::Off, p) if !matches!(p, MachineProfile::O2Ip32 | MachineProfile::OctaneIp30 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) && !p.is_ip27() => {
+                return Err("network.mode = \"off\" is only available on the O2, the Octane, the Fuel, the Tezro, the Origin 200, the Origin 2000 and the Onyx2 for now; the Indy and Indigo2 always have their Ethernet".into());
             }
             (NetMode::Stream, _) => {
                 let ep = self.network.stream.as_deref()
@@ -4327,6 +4330,35 @@ mod export_tests {
         assert!(e.contains("[origin2000]") && e.contains("reads [origin200]"), "{e}");
         let e = sn0("octane_ip30", "[onyx2]\nflash = \"f\"\n").validate().unwrap_err();
         assert!(e.contains("[onyx2]") && e.contains("octane_ip30"), "{e}");
+    }
+
+    /// The three SN0 machines answer `is_ip27` and nothing else does, and a
+    /// refusal that names the machine names the one configured.
+    #[test]
+    fn refusals_name_the_sn0_machine_configured() {
+        let sn0_profiles: Vec<_> = MachineProfile::EVERY.into_iter().filter(|p| p.is_ip27()).collect();
+        assert_eq!(sn0_profiles, [MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27]);
+        for (profile, product) in [("origin200_ip29", "Origin 200"), ("origin2000_ip27", "Origin 2000"), ("onyx2_ip27", "Onyx2")] {
+            let e = sn0(profile, "[scsi.4]\nkind = \"daynaport\"\n").validate().unwrap_err();
+            assert!(e.contains(&format!("not available on the {product} ")), "{e}");
+            let e = sn0(profile, "[graphics]\nboard = \"v12\"\n").validate().unwrap_err();
+            assert!(e.contains(&format!("not modelled on the {product} ")), "{e}");
+            let e = sn0(profile, "[virtio_serial]\nenabled = true\n").validate().unwrap_err();
+            assert!(e.contains(&format!("not wired on the {product}")), "{e}");
+        }
+    }
+
+    #[test]
+    fn network_off_and_a_second_scsi_controller_name_the_machines_that_take_them() {
+        let mut cfg = sn0("indy_ip24", "");
+        cfg.network.mode = NetMode::Off;
+        let e = cfg.validate().unwrap_err();
+        assert!(e.contains("the Origin 200, the Origin 2000 and the Onyx2"), "{e}");
+        sn0("onyx2_ip27", "[network]\nmode = \"off\"\n").validate().unwrap();
+        let e = sn0("indy_ip24", "[scsi.17]\npath = \"d.raw\"\n").validate().unwrap_err();
+        for p in MachineProfile::EVERY.into_iter().filter(|p| p.scsi_controllers() > 1) {
+            assert!(e.contains(p.name()), "{e}");
+        }
     }
 
     #[test]
