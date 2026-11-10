@@ -16,6 +16,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # libchdman-rs fetches a prebuilt archive at build time; compile from source
+  # when that download fails.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
 
 # Runner images match release.yml: ubuntu-24.04 (glibc floor), macos-26 (pinned
 # through GitHub's macos-15 -> macos-26 migration; arm64), windows-latest (x64).
