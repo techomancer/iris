@@ -161,6 +161,9 @@ fn board_with_chip(cpus: usize, chip: &'static TezroChip) -> TezroBoard {
         memory: &MemoryPopulation::default(),
         cpus,
         chip,
+        v12: false,
+        graphics_pool: (2, 32),
+        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
     })
     .unwrap()
 }
@@ -335,6 +338,9 @@ fn board_with_clock(cpus: usize) -> (TezroBoard, Arc<AtomicU64>) {
         memory: &MemoryPopulation::default(),
         cpus,
         chip: &CHIPS[0],
+        v12: false,
+        graphics_pool: (2, 32),
+        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
     })
     .unwrap();
     (board, now)
@@ -484,6 +490,9 @@ fn the_board_refuses_a_population_it_cannot_fit() {
         memory: &MemoryPopulation::default(),
         cpus: 1,
         chip: one_ghz,
+        v12: false,
+        graphics_pool: (2, 32),
+        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
     });
     assert!(refused.err().is_some_and(|e| e.contains("fitted with 2, 4 processors only")));
 }
@@ -500,6 +509,9 @@ fn board_with(chip: &Part) -> TezroBoard {
         memory: &MemoryPopulation::one_gib(),
         cpus: usize::from(self::chip(chip).cpus[0]),
         chip: self::chip(chip),
+        v12: false,
+        graphics_pool: (2, 32),
+        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
     })
     .unwrap()
 }
@@ -654,6 +666,57 @@ fn the_processor_reads_and_writes_ioc4_registers_in_its_own_byte_order() {
     assert_eq!(io.pio_read(reg(0x24), 4).data, 1, "MISC: the 66 MHz clock");
     assert_eq!(io.pio_write(reg(0x314), 4, 0x3f8), BUS_OK);
     assert_eq!(io.pio_read(reg(0x314), 4).data, 0x3f8, "port 0 TX producer");
+}
+
+// VPro host-interface registers the tests below touch, as byte offsets in
+// the board's widget space. The board's own constants are private to it.
+const ODSY_IDENTITY: u64 = 0x00;
+
+fn board_with_v12(cpus: usize) -> TezroBoard {
+    TezroBoard::with_config(TezroBoardConfig {
+        payload: &[],
+        clock: Arc::new(|| 0),
+        flash_path: None,
+        station_mac: L1Config::default().mac,
+        timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+        memory: &MemoryPopulation::default(),
+        cpus,
+        chip: &CHIPS[0],
+        v12: true,
+        graphics_pool: (2, 32),
+        graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+    })
+    .unwrap()
+}
+
+/// The V12 answers as widget 12 behind the PXBOW on either board, and
+/// widget 12 stays empty without one. (On the one-processor board the
+/// placement is inferred; see V12_WIDGET.)
+#[test]
+fn the_v12_answers_at_widget_12_on_both_boards() {
+    for cpus in [1, 4] {
+        let board = board_with_v12(cpus);
+        let id = pio_read(&board.bedrock, widget(12, ODSY_IDENTITY), 4);
+        let direct = board.v12.as_ref().unwrap().read32(ODSY_IDENTITY);
+        assert_eq!((id.status, id.data), (BUS_OK, u64::from(direct.data)), "{cpus} CPUs");
+        assert_eq!(board.pics[board.pics.len() - 1].pxbow().unwrap().endpoint_widgets() & (1 << 12), 1 << 12);
+    }
+    assert_eq!(pio_read(&TezroBoard::new(1).unwrap().bedrock, widget(12, ODSY_IDENTITY), 4).status, BUS_ERR);
+}
+
+/// The monitor's `vpro` commands resolve on a Tezro that has a V12, and are
+/// unknown on one that has none.
+#[test]
+fn the_monitor_resolves_vpro_commands_on_a_tezro_with_a_v12() {
+    let resolves = |board: &TezroBoard, command: &str| {
+        board.monitor_devices().iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command))
+    };
+    let with = board_with_v12(4);
+    assert!(resolves(&with, "vpro"), "a Tezro with a V12 answers `vpro`");
+    assert!(resolves(&with, "ps2"), "the other board commands stay");
+    let without = TezroBoard::new(1).unwrap();
+    assert!(!resolves(&without, "vpro"), "a Tezro with no V12 has no `vpro`");
+    assert!(resolves(&without, "ps2"));
 }
 
 /// The cached view the processors' caches sit on swaps RAM above 4 GiB, so

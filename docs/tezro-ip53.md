@@ -72,7 +72,8 @@ carrying the IO9. The two- and four-processor board adds a second PIC at
 widget 11, with nothing on its buses. It sits on link 11 of the IO9 PIC's
 PXBOW, beside the hub's link 10 and the IO9's link 15, so the PROM and IRIX
 find it through that crossbar's link status. Whether it has a crossbar of
-its own in front of it is not known.
+its own in front of it is not known. Either board takes a V12 at widget 12
+with `[graphics] board = "v12"`.
 
 The IO9's PCI bus, head 0 of the PIC at widget 15, holds the IOC4 at device
 1, a TI PCI2050 PCI-to-PCI bridge (`104c:ac28`, revision 1) at device 2, the
@@ -204,7 +205,17 @@ The IRIX 6.5.30 disks tested so far were installed on an Origin 300, not a
 Tezro. On them the IOC4 serial ports appear as `tty3` and `tty4`, as on
 real single-node IP59 inventories.
 
-Graphics is not attached. Machine snapshots are unsupported.
+`[graphics] board = "v12"` fits a VPro V12 at widget 12 behind the PXBOW,
+on either board, using the VPro model the Octane and the Fuel use. On the
+two- and four-processor board this is QEMU's graphics slot. On the
+one-processor board the tower guide gives one XIO connector for a VPro board
+but names neither its widget nor its route, so widget 12 there is inferred.
+Each PI keeps its graphics flow-control registers as written, as on the Fuel;
+nothing counts a processor's stores into the graphics page or returns credits
+for them. IRIX 6.5.30 with the VPro driver reaches the X desktop on the V12
+that way.
+Without the V12 the machine has no graphics.
+Machine snapshots are unsupported.
 
 ## Source basis
 
