@@ -1570,4 +1570,34 @@ mod tests {
         let img = img.unwrap();
         assert_eq!((img.width, img.height, img.px), (2, 1, vec![1, 2, 3, 4, 5, 6]));
     }
+
+    /// The boot test's golden at the default limits: the worst difference
+    /// between its own login screenshots matches, and the smallest piece of
+    /// text on the screen going missing does not.
+    #[test]
+    fn the_login_golden_allows_the_cursors_and_not_a_missing_name() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/boot-goldens/indy-irix53.png");
+        let golden = read_rgb(std::path::Path::new(path)).unwrap();
+        let copy = || Rgb { width: golden.width, height: golden.height, px: golden.px.clone() };
+        let paint = |img: &mut Rgb, (x0, y0, x1, y1): (u32, u32, u32, u32), c: [u8; 3]| {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let i = 3 * (y * img.width + x) as usize;
+                    img.px[i..i + 3].copy_from_slice(&c);
+                }
+            }
+        };
+        let panel = [216, 216, 216];
+        // As far off as the 2026-11-09 nightly's login screenshots ever were,
+        // 100 pixels (the pointer and the text cursor), here as one block in
+        // the empty login field.
+        let mut cursors = copy();
+        paint(&mut cursors, (500, 705, 509, 714), [0, 0, 0]);
+        assert_eq!(count_differing(&golden, &cursors, 32), Some(100));
+        // The user name "root" under its icon, the smallest text there.
+        let mut no_root = copy();
+        paint(&mut no_root, (365, 310, 412, 334), panel);
+        assert_eq!(count_differing(&golden, &no_root, 32), Some(156));
+        assert!(100 <= SCREEN_MAX_PIXELS && SCREEN_MAX_PIXELS < 156);
+    }
 }

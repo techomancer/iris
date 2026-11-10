@@ -1,7 +1,15 @@
 #!/bin/bash
-# Boot an installed IRIX disk in iris (Indy, R4400) and pass if "login:" reaches serial.
+# Boot an installed IRIX disk in iris (Indy, R4400) twice, and pass if both
+# boots reach the login:
+#   1. serial console (console=d): "login:" reaches serial.
+#   2. graphics console (console=g): IRIX draws its login on the framebuffer
+#      only, so `iris-ci screen-wait` waits for the screen to match $GOLDEN.
+#      On a mismatch it leaves gfx-screen.png and gfx-diff.png in <out-dir>.
 # Each check is also a case in <out-dir>/boot-test.xml, a JUnit report for CI.
+# The serial boot stays alongside the graphics one: it is cheap, and when a
+# boot fails its transcript shows how far it got, which a screenshot does not.
 # Usage: ci-boot-test.sh <bin-dir> <disk-image> <out-dir> [timeout-seconds]
+# The timeout applies to each boot.
 
 set -u
 
@@ -9,6 +17,8 @@ BIN_DIR=$1
 IMAGE=$2
 OUT=$3
 TIMEOUT=${4:-900}
+# A screenshot of the login screen of the disk CI boots.
+GOLDEN=${GOLDEN:-$(cd "$(dirname "$0")" && pwd)/boot-goldens/indy-irix53.png}
 
 EXE=""
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;; esac
@@ -46,7 +56,7 @@ cdrom   = false
 overlay = true
 EOF
 
-rm -f nvram.bin serial.log phase-a.log transcript.log iris-*.log boot-test.xml
+rm -f nvram.bin serial.log phase-a.log transcript.log iris-*.log gfx-*.png boot-test.xml
 
 log() { echo "[boot-test $(date -u +%H:%M:%S)] $*"; }
 ic() { "$IRIS_CI" "$@"; }
@@ -75,6 +85,18 @@ stop_iris() {
   [ "$QUIT" = exited ] && QUIT="exit $rc"
   IRIS_PID=""
   [ -z "$EXE" ] && rm -f "$IRIS_SOCKET"
+}
+
+# check_quit <name>: stop iris and check that it quit by itself, status 0. A
+# machine that will not stop when asked would hang a user's session too.
+check_quit() {
+  [ -z "$IRIS_PID" ] && return
+  stop_iris
+  if [ "$QUIT" = "exit 0" ]; then
+    check pass 0 "$1"
+  else
+    check fail 0 "$1" "iris after quit: $QUIT"; RESULT=1
+  fi
 }
 
 finish() {
@@ -107,37 +129,44 @@ monitor_cmd() {
 }
 
 # ── Phase A: seed NVRAM ──────────────────────────────────────────────────────
-# A blank NVRAM has no boot path; headless puts the PROM on serial so we can setenv.
+# A blank NVRAM has no boot path; headless puts the PROM on serial so we can
+# setenv. The console variable then decides where IRIX puts its login.
 
-log "phase A: seeding NVRAM (headless, serial console)"
-CHECK="seed NVRAM"
-SEED_START=$(date +%s)
-start_iris iris-phase-a.log --headless
-ic -q start
-if ! ic serial-wait --timeout 180 "Option?" >> phase-a.log 2>&1; then
-  cat phase-a.log; fail "phase A: PROM menu never appeared on serial"
-fi
-ic -q serial-send 5   # Enter Command Monitor
-ic serial-wait --timeout 30 ">> " >> phase-a.log 2>&1 \
-  || { cat phase-a.log; fail "phase A: no Command Monitor prompt"; }
-for c in \
-  "setenv -f SystemPartition scsi(0)disk(1)rdisk(0)partition(8)" \
-  "setenv -f OSLoadPartition scsi(0)disk(1)rdisk(0)partition(0)" \
-  "setenv -f OSLoadFilename /unix" \
-  "setenv -f AutoLoad Yes" \
-  "setenv -f console d" \
-  "printenv"; do
-  monitor_cmd "$c" || { cat phase-a.log; fail "phase A: '$c' got no prompt back"; }
-done
-ic -q rtc-save || fail "phase A: rtc-save failed"
-stop_iris
-check pass $(( $(date +%s) - SEED_START )) "$CHECK"
-log "phase A: done"
+# seed_nvram <console>
+seed_nvram() {
+  log "phase A: seeding NVRAM (headless, console=$1)"
+  CHECK="seed NVRAM (console=$1)"
+  local start=$(date +%s)
+  # A seeded NVRAM has AutoLoad on, and the PROM would boot past its menu.
+  rm -f nvram.bin
+  start_iris "iris-phase-a-$1.log" --headless
+  ic -q start
+  if ! ic serial-wait --timeout 180 "Option?" >> phase-a.log 2>&1; then
+    cat phase-a.log; fail "phase A: PROM menu never appeared on serial"
+  fi
+  ic -q serial-send 5   # Enter Command Monitor
+  ic serial-wait --timeout 30 ">> " >> phase-a.log 2>&1 \
+    || { cat phase-a.log; fail "phase A: no Command Monitor prompt"; }
+  for c in \
+    "setenv -f SystemPartition scsi(0)disk(1)rdisk(0)partition(8)" \
+    "setenv -f OSLoadPartition scsi(0)disk(1)rdisk(0)partition(0)" \
+    "setenv -f OSLoadFilename /unix" \
+    "setenv -f AutoLoad Yes" \
+    "setenv -f console $1" \
+    "printenv"; do
+    monitor_cmd "$c" || { cat phase-a.log; fail "phase A: '$c' got no prompt back"; }
+  done
+  ic -q rtc-save || fail "phase A: rtc-save failed"
+  stop_iris
+  check pass $(( $(date +%s) - start )) "$CHECK"
+  log "phase A: done"
+}
 
-# ── Phase B: boot ────────────────────────────────────────────────────────────
-# Serial console (console=d) + AutoLoad: the PROM boots the disk unattended
-# and the login arrives on serial, where the wait below sees it.
+# ── Phase B: boot on the serial console ──────────────────────────────────────
+# console=d + AutoLoad: the PROM boots the disk unattended and the login
+# arrives on serial, where the wait below sees it.
 
+seed_nvram d
 CHECK="serial console: login prompt"
 start_iris iris.log
 log "phase B: booting; deadline ${TIMEOUT}s"
@@ -171,16 +200,23 @@ while :; do
   sleep 5
 done
 
+check_quit "iris quits when asked, serial boot"
 log "last serial output:"
 tail -n 40 transcript.log
 
-# A machine that will not stop when asked would hang a user's session too.
-if [ -n "$IRIS_PID" ]; then
-  stop_iris
-  if [ "$QUIT" = "exit 0" ]; then
-    check pass 0 "iris quits when asked"
-  else
-    check fail 0 "iris quits when asked" "iris after quit: $QUIT"; RESULT=1
-  fi
+# ── Phase C: boot on the graphics console ────────────────────────────────────
+# console=g: the login is drawn on the framebuffer and serial stays silent.
+
+seed_nvram g
+CHECK="graphics console: login screen"
+start_iris iris-gfx.log
+log "phase C: booting; deadline ${TIMEOUT}s"
+ic -q start
+if ic screen-wait "$GOLDEN" --timeout "$TIMEOUT" \
+     --actual gfx-screen.png --diff gfx-diff.png; then
+  log "graphics login matches $(basename "$GOLDEN")"
+else
+  log "graphics login does not match $(basename "$GOLDEN")"
+  RESULT=1
 fi
 exit $RESULT

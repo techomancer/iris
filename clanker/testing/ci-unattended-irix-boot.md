@@ -23,6 +23,18 @@ SystemPartition scsi(0)disk(1)rdisk(0)partition(8)`, `OSLoadPartition
 → quit. The next run auto-boots the disk unattended. The script also sets
 `console d`, so `login:` arrives on serial; the framebuffer stays dark (irix-install.md §8).
 
+The script then seeds NVRAM again with `console g` and boots a second time.
+The login is drawn on the framebuffer and serial stays silent, so `iris-ci
+screen-wait` polls screenshots until one matches
+`scripts/boot-goldens/indy-irix53.png`. It counts pixels with a channel more
+than 32 away from the golden and allows 128. On the IRIX 5.3 login screen
+the mouse pointer (44) and text cursor (56) account for up to 100 between
+frames, the smallest text, a user name under its icon, is 156, and a missing
+window or a half-drawn screen is hundreds of thousands. The golden must be a
+screenshot of the disk CI boots: a different install shows other users and
+another hostname. To replace it, take `gfx-screen.png` from a failing run's
+`boot-test-*` artifact once you have checked it is the login screen.
+
 ## Each check is a JUnit case
 
 The script records each check (seeding NVRAM, the login prompt, iris quitting
@@ -40,7 +52,8 @@ With no front-end, Newport composes in software on its refresh thread, so this
 needs no GPU and works on headless CI runners.
 
 The first screenshot right after `start` fails with `the display has no video
-mode yet`: VC2 timings aren't programmed. Wait ~15s.
+mode yet`: VC2 timings aren't programmed. `screen-wait` treats that as not
+matching yet and keeps polling.
 
 ## Other gotchas hit on the way
 

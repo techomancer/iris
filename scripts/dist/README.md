@@ -45,8 +45,11 @@ scripts/dist/package-linux.sh --version 1.2.3
   `IRIX53_BOOT_IMAGE_URL` secret holds the URL of an installed IRIX 5.3 CHD, it
   also boots that disk to a login prompt on Linux, macOS and Windows with
   `scripts/ci-boot-test.sh`, and a failed boot stops the nightly or release
-  from publishing. The test sets the PROM console to serial and watches it for
-  `login:`; the logs are attached to the run.
+  from publishing. It boots twice. With the PROM console on serial it watches
+  for `login:`. With the console on the graphics board, where IRIX draws its
+  login on the framebuffer only, `iris-ci screen-wait` waits for the screen to
+  match `scripts/boot-goldens/indy-irix53.png`. The logs and screenshots are
+  attached to the run, with a diff image when the screen does not match.
 - `nightly.yml` runs daily at 05:00 UTC, builds `main` as
   `nightly.YYYY.MM.DD`, and replaces the single `nightly` pre-release. It skips
   the day when `main` has not moved.
