@@ -60,11 +60,19 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
 /// host id its guest will print, and where it comes from. `None` for other
 /// machines, and for a configuration the machine itself will refuse.
 fn host_id_line(cfg: &MachineConfig) -> Option<String> {
-    use crate::identity::hostid_from_text;
+    use crate::identity::{hostid_from_mac, hostid_from_text};
     match cfg.machine.profile {
         crate::config::MachineProfile::TezroIp53 if cfg.validate().is_ok() => {
             let serial = cfg.tezro_system_serial();
             Some(format!("host id {:08x} (system serial {serial})", hostid_from_text(&serial)))
+        }
+        crate::config::MachineProfile::FuelIp34 if cfg.validate().is_ok() => {
+            let m = cfg.network().mac;
+            Some(format!(
+                "host id {:08x} (station address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+                hostid_from_mac(&m),
+                m[0], m[1], m[2], m[3], m[4], m[5]
+            ))
         }
         _ => None,
     }
@@ -72,13 +80,17 @@ fn host_id_line(cfg: &MachineConfig) -> Option<String> {
 
 #[cfg(test)]
 #[test]
-fn a_tezro_says_which_host_id_its_guest_will_print() {
+fn an_ip35_machine_says_which_host_id_its_guest_will_print() {
     let cfg = |text: &str| -> MachineConfig { toml::from_str(text).unwrap() };
     let tezro = cfg("[machine]\nprofile = \"tezro_ip53\"\nemu_id = 42\n");
     assert_eq!(host_id_line(&tezro).as_deref(), Some("host id d5200420 (system serial LEMU200420)"));
     let tezro = cfg("[machine]\nprofile = \"tezro_ip53\"\n");
     assert_eq!(host_id_line(&tezro).as_deref(), Some("host id d5200000 (system serial LEMU200000)"));
     assert_eq!(host_id_line(&cfg("[machine]\nprofile = \"tezro_ip53\"\nemu_id = 4096\n")), None);
+    let fuel = cfg("banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\nemu_id = 7\n");
+    assert_eq!(host_id_line(&fuel).as_deref(), Some("host id 69e20070 (station address 08:00:69:e2:00:70)"));
+    let fuel = cfg("banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\n");
+    assert_eq!(host_id_line(&fuel).as_deref(), Some("host id 69123456 (station address 08:00:69:12:34:56)"));
     assert_eq!(host_id_line(&cfg("[machine]\nprofile = \"indy_ip24\"\n")), None);
 }
 

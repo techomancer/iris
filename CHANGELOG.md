@@ -63,6 +63,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **The Fuel takes a VPro board**: `[graphics] board = "v12"` or `"v10"`
   fits the Octane's VPro model at crossbar widget 13. IRIX 6.5.30 with the
   VPro driver brings the X login screen up on it.
+- `[machine] emu_id` (0 to 4095) gives a Fuel its own host id: the station
+  address becomes `08:00:69:e2:<emu_id>` and IRIX prints its last four bytes
+  (`69e20070` for emu_id 7). Unset, the Fuel keeps `08:00:69:12:34:56`.
 - **jitv2 compiles the reset PROM from the PROM.** The PROM runs from the reset
   window uncached; once memory covers that window the cached view returns RAM
   there, and the compile pool used to compile RAM's bytes in place of the
