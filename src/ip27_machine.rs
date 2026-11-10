@@ -81,6 +81,12 @@ pub(crate) fn section(cfg: &MachineConfig) -> &Ip27Section {
     cfg.ip27_section().expect("an SN0 machine reads its product's table")
 }
 
+/// The product's name as a sentence has it: "Origin 200", "Origin 2000" or
+/// "Onyx2".
+pub(crate) fn product(cfg: &MachineConfig) -> &'static str {
+    cfg.machine.profile.ip27_name().expect("an SN0 machine is one of three products")
+}
+
 /// The name of that table, for the prefix of an error about one of its keys.
 pub(crate) fn table(cfg: &MachineConfig) -> &'static str {
     cfg.machine.profile.ip27_table().expect("an SN0 machine reads its product's table")
@@ -241,10 +247,10 @@ pub struct Nat {
     pub frames: Arc<AtomicU64>,
 }
 
-/// A product. Only wiring differs in behaviour between SN0 boards; everything
-/// else about one is the [`BoardSpec`].
+/// A board type. Only wiring differs in behaviour between SN0 boards;
+/// everything else about one is the [`BoardSpec`]. A board type serves every
+/// product that is wired alike: the desksides are one.
 pub trait Ip27Board: 'static {
-    const NAME: &'static str;
     /// The nodes the board carries, in slot order.
     fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String>;
     /// Wire the board's I/O to the nodes, and the nodes to each other.
@@ -270,6 +276,8 @@ pub struct Ip27Machine<B: Ip27Board> {
     monitor_port: u16,
     ci: bool,
     nvram: String,
+    /// The product's name, for messages.
+    name: &'static str,
     events: Option<Receiver<MachineEvent>>,
     slot: Option<MachineSlot>,
     lifecycle: GuestState,
@@ -367,7 +375,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
         cfg.validate()?;
         let specs = B::specs(cfg)?;
         let prom = prom_image::load(Path::new(&cfg.machine.profile.prom_path(&cfg.prom)), node_flash::SIZE)
-            .map_err(|e| format!("{} {e}", B::NAME))?;
+            .map_err(|e| format!("{} {e}", product(cfg)))?;
         let mut parts = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
             let image = node_flash::initial_image(&prom, &spec.flash)?;
@@ -418,7 +426,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             node.hub.pi().set_interrupt_controller(Arc::new(CpuIrq(Arc::downgrade(&cpu))));
             let zero = node.memory.node_zero();
             node.hub.set_hooks(Arc::new(Hooks {
-                name: B::NAME,
+                name: product(cfg),
                 cpu: Arc::downgrade(&cpu),
                 events: tx.clone(),
                 zero,
@@ -442,7 +450,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
 
         eprintln!(
             "iris: {}, {} node{}, {}, {} MB each",
-            B::NAME,
+            product(cfg),
             units.len(),
             if units.len() == 1 { "" } else { "s" },
             specs[0].module.part.label(),
@@ -458,6 +466,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
             ci: cfg.ci,
             nvram: cfg.nvram.clone(),
+            name: product(cfg),
             events: Some(rx),
             slot: None,
             lifecycle: GuestState::Idle,
@@ -618,7 +627,7 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
             u.node.hub.stop();
         }
         if let Err(e) = self.io.timekeeper.flush_nvram() {
-            crate::dlog!(LogModule::Hub, "{} NVRAM: {e}", B::NAME);
+            crate::dlog!(LogModule::Hub, "{} NVRAM: {e}", self.name);
         }
         if self.lifecycle != GuestState::Idle {
             self.lifecycle = GuestState::Halted;
@@ -703,7 +712,7 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
     }
     fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
         if path.is_some_and(|p| p != self.nvram) {
-            return Err(format!("{} NVRAM save uses the configured path", B::NAME));
+            return Err(format!("{} NVRAM save uses the configured path", self.name));
         }
         self.io.timekeeper.flush_nvram()?;
         Ok(self.nvram.clone())
@@ -813,8 +822,6 @@ impl ModuleController for Origin200Controller {
 }
 
 impl Ip27Board for Origin200 {
-    const NAME: &'static str = "Origin 200";
-
     fn specs(cfg: &MachineConfig) -> Result<Vec<BoardSpec>, String> {
         let module = *cpu_module(cfg.cpu_part()?).ok_or("an Origin 200 has an R10000 or an R12000")?;
         Ok(vec![BoardSpec {
@@ -825,7 +832,7 @@ impl Ip27Board for Origin200 {
             flash: FlashValues {
                 cpu_mode_bits: module.mode_word,
                 cpu_clock_hz: module.clock_hz(),
-                ..FlashValues::ORIGIN200_R10000_180_1M
+                ..FlashValues::STOCK_R10000_180
             },
             flash_file: section(cfg).flash.as_ref().map(PathBuf::from),
             node_record: (module.part == &parts::R10000_180).then_some(NodeRecord::PIMM_1XT5),
@@ -842,7 +849,7 @@ impl Ip27Board for Origin200 {
         for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
             node.hub.io().connect_widget(widget, bridge.clone());
         }
-        pci_devices(node, cfg, bridge, &crate::dev::ioc3::IP29, controller, "origin200", Self::NAME)
+        pci_devices(node, cfg, bridge, &crate::dev::ioc3::IP29, controller, table(cfg), product(cfg))
     }
 }
 

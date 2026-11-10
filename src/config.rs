@@ -670,12 +670,12 @@ pub enum MachineProfile {
     Origin200Ip29,
     /// SGI Origin 2000 deskside: one or two IP27 node boards, each the host
     /// of a Crossbow, the first carrying the BaseIO. Configured by the shared
-    /// keys and `[origin2000]`; see `src/ip27_origin2000.rs`.
+    /// keys and `[origin2000]`; see `src/ip27_deskside.rs`.
     Origin2000Ip27,
     /// SGI Onyx2 deskside: one or two IP27 node boards sharing one Crossbow,
     /// the BaseIO-G at widget 15 and a graphics slot at widget 8, which holds
     /// a test widget. Configured by the shared keys and `[onyx2]`; see
-    /// `src/ip27_onyx2.rs`.
+    /// `src/ip27_deskside.rs`.
     Onyx2Ip27,
     /// SGI Fuel: the IP34 board on the IP35 software platform, headless or
     /// with a VPro in its graphics slot. See `src/ip34_machine.rs`.
