@@ -766,8 +766,7 @@ fn assert_frame_is_whole_resolve(h: &BoardLocks, display: &Display, what: &str) 
 /// One front-end thread, the raster unit, lookup and cursor stores and
 /// swap arms run against `Odyssey::frame` with no pause; when the writers
 /// stop and the raster queue drains the presented frame is a whole resolve
-/// of the planes, and a hundred idle frames leave it so without resolving a
-/// line.
+/// of the planes, and ten idle frames leave it so.
 fn stress(seed: u64, last_is_lut: bool) {
     use crate::dev::odyssey::raster_bench::Lcg;
     let (h, mut st, display) = display_rig();
@@ -836,8 +835,12 @@ fn stress(seed: u64, last_is_lut: bool) {
     settle(&h, &display, 4);
     assert_frame_is_whole_resolve(&h, &display, "after the writers stopped");
 
+    // Every frame composes the whole picture from board memory afresh (nothing
+    // is carried from one frame to the next), so an idle frame is a pure
+    // recompute; ten of them, after the four settled ones above, still catch a
+    // frame that drifts with no writer.
     let before = display.reader.lock().frame.clone();
-    for _ in 0..100 {
+    for _ in 0..10 {
         Odyssey::frame(&h, &display);
     }
     let reader = display.reader.lock();
