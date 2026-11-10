@@ -94,7 +94,7 @@ benchmark result recorded from it was indistinguishable from an R4400 one. The
 CPU is a runtime setting now (`--cpu`; the `r5k`/`mips4` features are gone), so
 the banner cannot name it. `iris-bench matrix` cross-checks the guest's own
 `#machine cpu=` line, read from PRId — same guard, and for the same reason, as
-`cpu-tests/run/matrix.sh`.
+`tests/bench_accuracy.rs`.
 
 ## Moving a line in a guest source changes the prebuilt image
 

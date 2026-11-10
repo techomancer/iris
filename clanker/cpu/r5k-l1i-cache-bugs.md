@@ -13,8 +13,8 @@
 > `compile_error!` in `src/lib.rs`. The feature-combination commands below are
 > as they were when this was written; re-check them before relying on them.
 
-Discovered while building `run/matrix.sh`'s R5000 cell for the cpu-tests
-findings pass ([[project_cpu_tests_findings]]). Not one of dani's findings —
+Discovered while setting up the cpu-tests R5000 cell for the findings
+pass ([[project_cpu_tests_findings]]). Not one of dani's findings —
 this is in `src/cpu/mips_cache_v2.rs`'s unit tests, found by running `cargo test`
 under different R5000 feature combinations.
 
@@ -49,8 +49,8 @@ re-testing.
 `r5ksc_triton` so this can't be silently shipped broken. Plain `r5k` (R5000
 CPU/FPU semantics, no secondary cache) still builds — its own L1I model has
 the two failures above, but nothing depends on a working secondary cache for
-CPU/FPU correctness work, which is what `cpu-tests` and `run/matrix.sh`'s
-R5000 cell actually need. `matrix.sh` builds the R5000 cell with plain `r5k`.
+CPU/FPU correctness work, which is what the `cpu-tests` R5000 cell actually
+needs.
 
 ## The actual bug
 

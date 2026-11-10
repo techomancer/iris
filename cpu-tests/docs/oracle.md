@@ -144,4 +144,5 @@ because the *same binary* runs on both sides and any disagreement is a bug:
   jitv2's lockstep checks per instruction, but the suite remains the only
   differential that needs no special build.
 
-`run/matrix.sh` runs all four cells.
+`tests/cpu_tests.rs` runs both CPUs; one `cargo test` per engine covers all
+four cells.

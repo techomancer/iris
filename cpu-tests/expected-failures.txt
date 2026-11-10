@@ -1,4 +1,4 @@
-# The cpu-tests that fail today, per CPU and engine. run/check.py fails a run
+# The cpu-tests that fail today, per CPU and engine. tests/cpu_tests.rs fails a run
 # when a test fails that is not listed for its cell and when a listed test
 # passes, so this file always says exactly what is broken. Every test here
 # passes on a real Indy (oracle/): each is an IRIS bug, not a test bug.

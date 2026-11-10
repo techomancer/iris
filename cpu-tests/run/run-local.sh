@@ -34,7 +34,7 @@ rm -f "$LOG" "$DUMP"
 # the guest's console to its own stdout, and --serial-log tees the channel-B
 # *backend*, which in non-CI mode is the TCP listener nothing is attached to —
 # so it produced an empty file and the diagnostics below had nothing to show.
-# matrix.sh and the CI workflow capture stdout for the same reason.
+# tests/cpu_tests.rs captures stdout for the same reason.
 timeout "$TIMEOUT" "$IRIS" \
     --config run/bare.toml \
     --load-elf "$ELF" \

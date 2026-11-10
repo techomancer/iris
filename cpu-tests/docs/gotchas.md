@@ -164,7 +164,8 @@ this, had the conversion tables been part of what it checks.
 configuration applied: `default_scsi()` attaches `scsi1.raw` and `cdrom4.iso`,
 neither of which exists anywhere in this tree, and startup is fatal when a
 configured disk is missing. `make run` failed before the guest ran a single
-instruction, while `run/matrix.sh` — which passes the config — worked fine.
+instruction, while the matrix runner of the time, which passed the config,
+worked fine.
 
 ## Under `--load-elf` the SCC produces nothing, and `--serial-log` is empty
 
@@ -183,7 +184,7 @@ rather than the tee.
 
 So under `--load-elf` the test device is the only working output path, and
 headless IRIS prints it to its own stdout. `run/run-local.sh` now tees that,
-which is what `matrix.sh` and the CI workflow always did. Making the serial
+which is what the CI runs always did (now `tests/cpu_tests.rs`). Making the serial
 path work in this mode means programming WR5 (and probably WR4/WR9/WR11-14) in
 `con_init()`; the hook is already there, with a comment saying so.
 

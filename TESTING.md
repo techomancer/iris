@@ -18,7 +18,7 @@ and R5000, both passing every check); see
 
 ```sh
 make -C cpu-tests all && make -C cpu-tests run   # compiler: see cpu-tests/docs/toolchain.md
-cpu-tests/run/matrix.sh                 # R4400/R5000 x interp/jitv2
+cargo test --release [--features jitv2] --test cpu_tests -- --ignored   # judged, both CPUs
 ```
 
 **`bench/`** — how fast is this build, and is it still right after ten million
@@ -34,6 +34,7 @@ interpreter and jitv2.
 cargo build --release --bin iris-bench
 ./target/release/iris-bench run         # ~60 s; --quick for about half that
 ./target/release/iris-bench run --quick
+cargo test --release [--features jitv2] --test bench_accuracy -- --ignored   # accuracy, every CPU
 
 make -C bench all && make -C bench hostbench        # only to change the suite; compiler as above
 make -C bench prebuilt      # only after changing a kernel; see bench/prebuilt/README.md

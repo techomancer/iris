@@ -11,15 +11,12 @@ is an associated const on that type parameter (`R4400Cache::MIPS4 == false`,
 `--cpu r5000` really does get MIPS IV, and `--cpu r4400` really does raise
 Reserved Instruction on it. No rebuild, no feature flag.
 
-## Matrix builds
+## One build per engine
 
-`cpu-tests/README.md` and `run/matrix.sh` describe CPU selection at runtime.
-The runner retains separate cached files per cell (`build/iris-<cpu>-<engine>`)
-but passes no CPU Cargo feature; only the JIT engine needs `jitv2`.
-
-The matrix still produces correct results; it is just doing two builds where one
-would do. For a plain R4400-vs-R5000 comparison, one binary and two runs is
-enough:
+`tests/cpu_tests.rs` and `tests/bench_accuracy.rs` run every CPU on the one
+build their `cargo test` made; only the JIT engine needs a second build
+(`--features jitv2`). For a plain R4400-vs-R5000 comparison by hand, one
+binary and two runs is enough:
 
 ```sh
 run/run-local.sh build/cputest.elf --cpu r4400
