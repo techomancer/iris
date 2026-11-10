@@ -1,5 +1,11 @@
 # The pending-interrupt check, not block structure, is what blocks GPR forwarding
 
+Status: history. These are measurements of Cranelift's *implicit*
+store-to-load forwarding. Since 2026-11-10 loops keep their registers in
+explicit variables, which neither the interrupt check nor a callout
+invalidates: [gpr-cache.md](gpr-cache.md). The per-region register cache this
+note ends by asking for is that.
+
 Measured 2026-09-19 with `zz_forwarding::zz_cl_forwarding` (a six-shape
 Cranelift probe, `src/cpu/jitv2/mod.rs`) plus real emitted code from the corpus.
 

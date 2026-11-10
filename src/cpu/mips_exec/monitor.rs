@@ -596,7 +596,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2-pcp-dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 memhelpers [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2-pcp-dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 gprcache [N] (guest registers kept in host registers per compiled function; 0 = off) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 memhelpers [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -1936,7 +1936,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                 // one of them (`intrun`/`flushkeep`/`corpus`/`dumppcp` were
                 // all missing here after being added only to the help table).
                 if actual_args.is_empty() {
-                    return Err("Usage: j2 <analyze <addr>|pcp [addr]|dumppcp [addr] [path]|corpus [dir]|status|inline|dispatch|fallback|inline_mem|memhelpers [on|off]|pagewb|instrs|threads|opt [none|speed]|intrun [N]|min-instrs|max-instrs|min-calls|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string());
+                    return Err("Usage: j2 <analyze <addr>|pcp [addr]|dumppcp [addr] [path]|corpus [dir]|status|inline|dispatch|fallback|inline_mem|memhelpers [on|off]|pagewb|instrs|threads|opt [none|speed]|intrun [N]|gprcache [N]|min-instrs|max-instrs|min-calls|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string());
                 }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
@@ -2302,6 +2302,26 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                     writeln!(writer, "j2 max-instrs: {}", crate::cpu::jitv2::comp::max_instrs_per_compile()).unwrap();
                                 }
                                 Err(_) => return Err("Usage: j2 max-instrs [N]".to_string()),
+                            },
+                        }
+                    }
+
+                    "gprcache" => {
+                        // How many guest GPRs a compiled function keeps in
+                        // host registers (`CODEGEN_GPR_CACHE`). Applies to
+                        // regions compiled from now on.
+                        use crate::cpu::jitv2::codegen::{Codegen, MAX_GPR_CACHE};
+                        match actual_args.get(1).copied() {
+                            None => writeln!(writer, "j2 gprcache: {} (0 = off, max {})", Codegen::gpr_cache(), MAX_GPR_CACHE).unwrap(),
+                            Some(n) => match n.parse::<u32>() {
+                                Ok(n) if cfg!(feature = "jitv2_lockstep") && n != 0 => {
+                                    return Err("j2 gprcache: always 0 under jitv2_lockstep".to_string());
+                                }
+                                Ok(n) => {
+                                    Codegen::set_gpr_cache(n);
+                                    writeln!(writer, "j2 gprcache: {} — new compiles only; `stop` + `j2 flush` to rebuild existing code", Codegen::gpr_cache()).unwrap();
+                                }
+                                Err(_) => return Err(format!("j2 gprcache: expected 0..={}", MAX_GPR_CACHE)),
                             },
                         }
                     }

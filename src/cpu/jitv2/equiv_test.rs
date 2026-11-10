@@ -2448,6 +2448,124 @@ mod tests {
         assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, /*max_instrs=*/16, steps);
     }
 
+    // ---- GPR cache (`Codegen::gpr_cache`) ------
+    //
+    // The budget is process-wide and read at compile time, so each test
+    // re-runs itself in a child process with `IRIS_GPRCACHE` set: nothing
+    // else in this binary can change the setting under it, and it cannot
+    // change the setting under anything else.
+
+    /// Re-run `test` once per mode in a child, or return `(budget,
+    /// mem_helpers)` when this *is* the child. A mode is a budget, then `h`
+    /// for the shared memory helpers or `e` for `IRIS_GPRCACHE_EVERYWHERE`.
+    fn gpr_cache_mode(test: &str) -> Option<(u32, bool)> {
+        let digits = |mode: &str| mode.trim_end_matches(|c| c == 'h' || c == 'e').to_string();
+        if let Ok(mode) = std::env::var("IRIS_TEST_GPR_CACHE_MODE") {
+            let budget: u32 = digits(&mode).parse().unwrap();
+            assert_eq!(Codegen::gpr_cache(), if cfg!(feature = "jitv2_lockstep") { 0 } else { budget });
+            return Some((budget, mode.ends_with('h')));
+        }
+        for mode in ["0", "1", "3", "31", "31h", "2e", "31e"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", &format!("cpu::jitv2::equiv_test::tests::{test}"), "--test-threads=1"])
+                .env("IRIS_TEST_GPR_CACHE_MODE", mode)
+                .env("IRIS_GPRCACHE", digits(mode))
+                .env_remove("IRIS_MEM_HELPERS")
+                .env_remove("IRIS_GPRCACHE_EVERYWHERE");
+            if mode.ends_with('h') { child.env("IRIS_MEM_HELPERS", "1"); }
+            if mode.ends_with('e') { child.env("IRIS_GPRCACHE_EVERYWHERE", "1"); }
+            let out = child.output().unwrap();
+            assert!(out.status.success(), "gprcache mode {mode} failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        None
+    }
+
+    /// A loop that carries registers across a back edge, a store and a load
+    /// through the Rust callouts, a delay slot that changes a register on
+    /// every iteration, and a final load that faults: the destination keeps
+    /// its old value, in `MipsCore` and in every later read.
+    ///
+    /// Not built under `jitv2_lockstep`: the cache is off there, and this
+    /// calls the compiled function without the lockstep reference set up.
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    #[test]
+    fn gpr_cache_loop_callouts_and_faulting_load() {
+        let Some((_, helpers)) = gpr_cache_mode("gpr_cache_loop_callouts_and_faulting_load") else { return };
+        use crate::cpu::mips_isa::*;
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let page = [
+            (0, make_i(OP_ADDIU, 0, 2, 3)),            // r2 = 3 (loop count)
+            (1, make_i(OP_ADDIU, 0, 3, 10)),           // r3 = 10
+            (2, make_i(OP_SW, 1, 3, 0)),               // loop: [r1] = r3
+            (3, make_i(OP_LW, 1, 4, 0)),               //       r4 = [r1]
+            (4, make_i(OP_ADDIU, 4, 3, 7)),            //       r3 = r4 + 7
+            (5, make_i(OP_ADDIU, 2, 2, 0xffff)),       //       r2 -= 1
+            (6, make_i(OP_BNE, 2, 0, (-5i16) as u16)), //       bne r2, r0, loop
+            (7, make_i(OP_ADDIU, 5, 5, 1)),            //       (slot) r5 += 1
+            (8, make_i(OP_LW, 1, 4, 1)),               // AdEL: r4 must survive
+            (9, JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_A010_0000; // kseg1: every access is a callout
+        let interp = run_interpreter_page(&page, gpr, pc, 2 + 6 * 3 + 1);
+
+        let mut words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, raw) in &page { words[word as usize] = raw; }
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&words, 0, pc as u32, 32);
+        assert!(non_empty);
+        let mut instrs = *walked;
+        let mut codegen = Codegen::new();
+        if helpers {
+            assert!(crate::cpu::jitv2::codegen::mem_helpers_enabled());
+            // The real destination-writing helpers, forced down their slow
+            // path: PassthroughCache has no L1-D to inline against.
+            codegen.dc_geometry.supported = true;
+            crate::cpu::jitv2::codegen::set_inline_mem_enabled(false);
+            codegen.emit_mem_helpers();
+        }
+        let jit_fn = codegen.compile_region(&mut instrs, 0, true, false).unwrap();
+        let (exec, _) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        let jit = CoreSnapshot::capture(&exec.core);
+        assert_eq!(jit.gpr[3], 31);
+        assert_eq!(jit.gpr[4], 24, "a faulting load must leave its destination alone");
+        assert_eq!(jit.gpr[5], 3, "the delay slot retires once per iteration");
+        assert_eq!(jit, interp);
+    }
+
+    /// An interpreter-fallback head writes a GPR the region already holds in
+    /// a variable; the instruction after it must read the new value.
+    #[test]
+    fn gpr_cache_reloads_after_interpreter_fallback() {
+        let Some(_) = gpr_cache_mode("gpr_cache_reloads_after_interpreter_fallback") else { return };
+        let _fb = fallback_on_guard();
+        use crate::cpu::mips_isa::*;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0x0180_0000; // lands in Context's writable PTEBase field
+        let page = [
+            (entry_word,     make_i(OP_ADDIU, 0, 2, 7)),            // r2 = 7 (cached)
+            (entry_word + 1, benign_excluded_mtc0()),               // Context = r1 (interpreter)
+            (entry_word + 2, make_r(OP_COP0, RS_MFC0, 2, 4, 0, 0)), // r2 = Context (interpreter)
+            (entry_word + 3, make_i(OP_ADDIU, 2, 3, 5)),            // r3 = r2 + 5
+            (entry_word + 4, make_i(OP_ADDIU, 2, 2, 1)),            // r2 += 1
+            // Never taken, but a backward edge: registers are only cached in
+            // loops, and this makes the whole page one.
+            (entry_word + 5, make_i(OP_BNE, 0, 0, (-6i16) as u16)),
+            (entry_word + 6, make_i(OP_ADDIU, 3, 3, 1)),            // (slot) r3 += 1
+            (entry_word + 7, JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+        let interp = run_interpreter_page(&page, gpr, pc, 7);
+        assert_ne!(interp.gpr[3], 13, "MFC0 must change r2, or this test proves nothing");
+        assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 7, 16);
+    }
+
     // ---- Branches and jumps: batch B (unconditional J/JAL) ------
 
     fn make_j(op: u32, target26: u32) -> u32 {

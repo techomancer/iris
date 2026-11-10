@@ -13,6 +13,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### jitv2: registers in loops stay in host registers
+
+- A compiled page with a loop keeps the registers its loops use most in host
+  registers instead of reloading them from the CPU state at every use, and an
+  inline load or store checks a status only on its slow path. The benchmark
+  suite runs 24 to 28% faster on the R4400, R5000 and R10000 (integer loops
+  up to 3.8x, CRC-32 2.2x, Dhrystone 13 to 16%). An IRIX boot and a C compile
+  are unchanged: there the guest waits for the compiler, not for the compiled
+  code. `j2 gprcache [N]` or `IRIS_GPRCACHE` sets how many registers (default
+  6, 10 on AArch64; 0 turns it off). Idea from xiri's `perf/sgiemu-port` and
+  atomchild's revenir. (`src/cpu/jitv2/codegen.rs`)
+- Iris prints how many pages jitv2 compiled and how long that took when it
+  stops, and reports the first page Cranelift rejects in every build.
+
 ### A date set on an Octane sticks
 
 - Setting the date on an Octane under IRIX 6.5 lasted only until the next
