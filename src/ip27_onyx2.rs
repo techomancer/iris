@@ -195,16 +195,7 @@ impl Ip27Board for Onyx2Deskside {
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
         fit_io_prom(&bridge, cfg)?;
-        let links = xbow.clone();
-        bridge.set_link_alive(Box::new(move |w| links.carries(w)));
-        let weak = Arc::downgrade(&bridge);
-        xbow.on_link_reset(Box::new(move |w| {
-            if w == WIDGET_BASEIO {
-                if let Some(b) = weak.upgrade() {
-                    b.link_reset();
-                }
-            }
-        }));
+        xbow.serve_bridge(WIDGET_BASEIO, &bridge);
 
         let peers: Vec<(u8, Arc<dyn BusDevice>)> = nodes
             .iter()
