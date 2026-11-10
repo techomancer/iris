@@ -18,10 +18,8 @@
 //!   node number (see [`crate::ip27`]).
 //! - The Hub's per-slice enable, NMI and cached-alias hooks only log: what a
 //!   store to those registers does to a processor is not established.
-//! - The Bridge reaches the Hub through [`Hub::inbound`] for DMA and
-//!   [`Hub::interrupt_target`] for interrupts, with the Hub addressed as
-//!   widget 0xa. Both are the smallest adapter the Bridge needs and are meant
-//!   to be replaced by the shared host interface.
+//! - The Bridge reaches the Hub as an XIO host ([`Hub::host_port`]) addressed
+//!   as widget 0xa, with no Crossbow between them.
 //! - The module controller's configuration store comes from
 //!   `ElscNvram::origin200`; the machine never looks inside it.
 //! - The Bridge answers at fifteen widget numbers (every one but the Hub's
@@ -69,7 +67,7 @@ use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
 use crate::scsi::ScsiBus;
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Signal, BUS_ERR};
-use crate::xtalk::{Upstream, XtalkHost};
+use crate::xtalk::Upstream;
 use crate::workstation::{register_system_controller, DiscChanger, MachineRef, MachineSlot, Workstation};
 use parking_lot::Mutex;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -763,10 +761,9 @@ impl<B: Ip27Board> Drop for Ip27Machine<B> {
     }
 }
 
-/// The Hub as the Bridge addresses it: the master widget the PROM programs
-/// for DMA and interrupts, taking an interrupt packet at any address and
-/// naming one of 128 vectors.
-const HUB_HOST: XtalkHost = XtalkHost { widget: 0xa, int_packet: 0, int_packet_mask: 0, vectors: 128 };
+/// The widget number the Bridge addresses the Hub as: the master widget the
+/// PROM programs for DMA and interrupts.
+const HUB_HOST_WIDGET: u8 = 0xa;
 /// The IP29 System Board's Bridge revision.
 const BRIDGE_REVISION: u32 = 4;
 
@@ -838,7 +835,7 @@ impl Ip27Board for Origin200 {
     fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
         let node = nodes[0];
         let controller = Origin200Controller::new(node, section(cfg).controller_store.as_deref().map(Path::new))?;
-        let bridge = Bridge::new(Upstream::single(HUB_HOST, node.hub.inbound(), node.hub.interrupt_target()), &crate::ip30::PCI0);
+        let bridge = Bridge::new(Upstream::new().with(node.hub.host_port(HUB_HOST_WIDGET)), &crate::ip30::PCI0);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
         // The Bridge answers every small window but the Hub's own.

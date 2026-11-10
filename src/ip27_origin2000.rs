@@ -43,7 +43,6 @@ use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::Xbow;
 use crate::ip27_machine::{section, table, cpu_module, fit_io_prom, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord};
-use crate::xtalk::{Upstream, XtalkHost};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -66,11 +65,6 @@ const fn slot_bits(node: usize) -> u8 {
 pub(crate) const XBOW_REVISION: u32 = 2;
 /// The BaseIO's Bridge revision.
 pub(crate) const BRIDGE_REVISION: u32 = 4;
-
-/// The Hub as its Crossbow and the widgets below address it.
-const fn hub_host(node: usize) -> XtalkHost {
-    XtalkHost { widget: widget_hub(node), int_packet: 0, int_packet_mask: 0, vectors: 128 }
-}
 
 /// The module number the controller's store starts with.
 const MODULE_NUMBER: u8 = 1;
@@ -184,18 +178,18 @@ impl Ip27Board for Origin2000 {
         let controller = Self::controller(nodes, cfg)?;
         let mut io = None;
         for (i, node) in nodes.iter().enumerate() {
-            let host = hub_host(i);
-            let mut widgets = 1u16 << host.widget;
+            let host = node.hub.host_port(widget_hub(i));
+            let mut widgets = 1u16 << host.host.widget;
             if i == 0 {
                 widgets |= 1 << WIDGET_BASEIO;
             }
             let xbow = Arc::new(Xbow::new(XBOW_REVISION, widgets));
-            xbow.connect_host(host, node.hub.interrupt_target());
+            xbow.connect_host(host.host, node.hub.interrupt_target());
             node.hub.io().connect_widget(0, xbow.clone());
-            node.hub.io().connect_widget(host.widget, xbow.port(host.widget, node.hub.widget_face()));
+            node.hub.io().connect_widget(host.host.widget, xbow.port(host.host.widget, node.hub.widget_face()));
             xbow.register_locks();
             if i == 0 {
-                let bridge = Bridge::new(Upstream::single(host, node.hub.inbound(), node.hub.interrupt_target()), &crate::ip30::PCI0);
+                let bridge = Bridge::new(xbow.upstream(vec![host]), &crate::ip30::PCI0);
                 bridge.set_revision(BRIDGE_REVISION);
                 bridge.set_microlan(Self::board_record());
                 fit_io_prom(&bridge, cfg)?;

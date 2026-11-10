@@ -11,11 +11,8 @@
 //! alias by its size. A machine places the views [`Hub::claim`],
 //! [`Hub::cpu_memory`] and [`Hub::io_space`] in its address map.
 //!
-//! The Bridge reaches the Hub through [`Hub::inbound`] for DMA and
-//! interrupt-modify writes, and [`Hub::interrupt_target`] for a controller
-//! whose lines are interrupt numbers. Both are the minimum a Bridge needs
-//! and are meant to be replaced by whatever shared host interface the
-//! widgets settle on.
+//! A Bridge reaches the Hub as an XIO host ([`Hub::host_port`]): DMA lands in
+//! node memory and an interrupt packet sets one of 128 interrupt numbers.
 //!
 //! # What is approximated here
 //!
@@ -104,6 +101,7 @@ use crate::dev::hub_pi::{self, HubPi};
 use crate::devlog::LogModule;
 use crate::irq::InterruptController;
 use crate::physical::{read_bytes, write_bytes};
+use crate::xtalk::{HostPort, XtalkHost};
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK,
 };
@@ -479,6 +477,19 @@ impl Hub {
     /// the seven big windows.
     pub fn io_space(self: &Arc<Self>) -> Arc<dyn BusDevice> {
         Arc::new(IoSpace { regs: self.regs.clone(), small: self.io.small_windows(), big: self.io.big_windows() })
+    }
+
+    /// This Hub as the XIO host a Bridge sends to, addressed as `widget`: DMA
+    /// goes to node memory, an interrupt packet to any address of the widget
+    /// sets or clears one of its 128 interrupt numbers. Behind a Crossbow,
+    /// pass it to [`crate::dev::xbow::Xbow::upstream`] so the port's link
+    /// gates it.
+    pub fn host_port(&self, widget: u8) -> HostPort {
+        HostPort::new(
+            XtalkHost { widget, int_packet: 0, int_packet_mask: 0, vectors: 128 },
+            self.inbound(),
+            self.interrupt_target(),
+        )
     }
 
     /// The Hub as a bus master's target for interrupts: a line is the
