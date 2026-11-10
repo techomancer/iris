@@ -270,6 +270,23 @@ impl Bedrock {
     pub fn scratch1_joined(&self, cpu: usize) -> bool {
         self.lb.scratch1_joined(cpu)
     }
+    /// II scratch 0 (0x150), where the IP35 PROM publishes each interface's
+    /// processors, bit 4 + n for slot n (A, B on PI0, C, D on PI1). One
+    /// atomic load.
+    pub fn io_scratch0(&self) -> u64 {
+        self.io.scratch0()
+    }
+    /// Whether LB scratch 3's bit 0, which the IP35 PROM takes as its hub
+    /// lock, is clear. One atomic load.
+    pub fn hub_lock_free(&self) -> bool {
+        self.lb.hub_lock_free()
+    }
+    /// The processors, one bit per CPU number, that have stored to their own
+    /// PI real-time compare register since their presence join on LB
+    /// scratch 1: the IP35 PROM's pair liveness posts. One atomic load.
+    pub fn rt_posted(&self) -> u64 {
+        self.lb.rt_posted()
+    }
     #[cfg(feature = "jitv2")]
     pub(crate) fn generation_base(&self) -> *mut AtomicU64 {
         self.md.generation_base()
@@ -432,6 +449,12 @@ impl Bedrock {
                 pi.read(a, now, &self.levels).map_or(BusRead64::err(), BusRead64::ok)
             }
             (8, Some(v)) if a < pi::SIZE && a & 7 == 0 => {
+                if a == pi::reg::RT_COMPARE_A || a == pi::reg::RT_COMPARE_B {
+                    let slot = (index as u8, usize::from(a == pi::reg::RT_COMPARE_B));
+                    if let Some(cpu) = crate::cpu::smp::on_cpu_thread().filter(|&cpu| self.processors.slot_of(cpu) == Some(slot)) {
+                        self.lb.note_rt_compare(cpu);
+                    }
+                }
                 if pi.write(a, v, now, &self.levels) {
                     let tm = self.timer_manager();
                     pi.reschedule(tm.as_deref().map(|tm| self.host_timer(tm)).as_ref(), now);

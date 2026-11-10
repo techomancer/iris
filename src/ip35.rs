@@ -431,5 +431,6 @@ impl BusDevice for CachedPhysical {
 }
 
 pub(crate) mod node;
+pub(crate) mod presence;
 #[cfg(test)]
 mod tests;

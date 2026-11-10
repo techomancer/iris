@@ -144,7 +144,20 @@ reset barrier on LB scratch 1 depends on that: every processor clears the
 word before the boot master stores its release there. Bedrock's LB orders
 those stores itself, by who stored in what order, so a late clear does not
 land on the release (`src/dev/bedrock/lb.rs`); hardware drops no store, so
-this is a model rule. An NMI, and a write that clears a running processor's
+this is a model rule. Two later handshakes need more. In the first, each
+processor of an interface with both slots fitted posts a status value in
+its own PI real-time compare register and reads its partner's, at most
+200,000 times, before it declares the partner dead (`peer_pled failed: Other
+CPU on this node died.`). In the second, the lowest processor of each
+interface publishes its interface's processors in II scratch 0, waits a
+fixed 2,000 units of the PI's real-time counter and then looks for the other
+interface's; if they are not there yet it carries on without them. The host threads drift apart by more than either
+wait allows, so the first of a pair to post is held at its batch boundary
+until its partner posts, and a publisher that has published while the other
+interface has not is held until that interface publishes; each hold also
+ends once the processors it waits for have retired 2,000,000,000 cycles
+(`src/ip35/presence.rs`). The holds change when a processor runs, never a
+value it reads, and have no hardware counterpart. An NMI, and a write that clears a running processor's
 enable bit, are logged by the Bedrock PI and not carried out: the CPU has no
 NMI entry.
 
