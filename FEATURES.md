@@ -104,8 +104,9 @@ features are removed. Select devices/ISA at runtime instead.
 
 The repository pins **nightly** in [rust-toolchain.toml](rust-toolchain.toml).
 A plain `cargo build` selects the root `iris` package; `-p iris-gui` selects
-the frontend, and `--workspace` also includes `iris-hostcall`. `iris-hostgl`
-is excluded from the workspace and built through the optional dependency.
+the frontend, and `--workspace` also includes `iris-hostcall` and the
+test-only `iris-checks`. `iris-hostgl` is excluded from the workspace and
+built through the optional dependency.
 Select Cargo's target triple with `--target <triple>`; platform backends and
 packaging still impose the host restrictions described above.
 

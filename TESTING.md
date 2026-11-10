@@ -190,3 +190,16 @@ the same files and reads every sector back. Another test fails on any
 ```sh
 cargo nextest run --release --lib exit_persistence_tests
 ```
+
+## Interpreter hot paths
+
+`iris-checks/tests/hot_paths.rs` reads a lightning release binary and fails
+when interpreter code outside its cold list calls a formatting function, or
+when a hit-path cache `fetch` has a symbol of its own. Its tests are ignored in
+a normal run; CI runs them on Linux x86-64 after the release build. The rule
+they enforce is in [hot-path-inlining-must-be-explicit.md](clanker/perf/hot-path-inlining-must-be-explicit.md).
+
+```sh
+cargo build --release --features lightning
+cargo test -p iris-checks -- --ignored   # IRIS_HOT_PATH_BINARY picks another binary
+```

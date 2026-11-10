@@ -1,0 +1,15 @@
+[package]
+name = "iris-checks"
+version = "0.1.0"
+edition = "2021"
+description = "Checks on a built iris binary and the repository, run as ignored tests"
+license = "BSD-3-Clause"
+publish = false
+
+# Tests only: the checks read artifacts that are already built, so this crate
+# must never depend on iris (that would make `cargo test` rebuild it).
+[dev-dependencies]
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info"] }
+object = { version = "0.37", default-features = false, features = ["read_core", "elf", "std"] }
+regex = "1"
+rustc-demangle = "0.1"
