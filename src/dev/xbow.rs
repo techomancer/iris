@@ -23,6 +23,19 @@
 //! stock PROM resets each link it finds and expects it back), and register
 //! accesses are 32-bit at the data half of each eight-byte slot only.
 //!
+//! # The XBridge's crossbar
+//!
+//! The IP35 boards' XBridge carries widget 0's Crossbow register map for its
+//! own crossbar, built as [`Part::XBridge`] with [`Xbow::xbridge`]. It
+//! differs in identification (part 0xd000, revision 2, with the fences and
+//! the resource lock), Control's reset value and writable bits, the
+//! performance counters' reset value and select field, the requesting
+//! port in status bits 9:6, and the MicroLAN register's busy bit. It
+//! interrupts for access errors alone, not for link events, and records
+//! no multiple error; a malformed access answers zero rather than a bus
+//! error. These follow hw/misc/sgi-xbridge-xbow.c in
+//! jamesbraid/qemu-sgi-origami, not a published specification.
+//!
 //! Ported from hw/misc/sgi-xbow.c in jamesbraid/qemu-sgi-origami.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -155,22 +168,42 @@ struct Regs {
     lock: u32,
 }
 
+/// Which crossbar a [`Xbow`] is: see the module documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The Octane's and the Origin 2000's Crossbow.
+    Crossbow,
+    /// The crossbar inside the IP35 boards' XBridge.
+    XBridge,
+}
+
+/// The XBridge crossbar's identification: part 0xd000, revision 2.
+const XBRIDGE_ID: u32 = widget_id(2, 0xd000, 0);
+const XBRIDGE_CONTROL_RESET: u32 = 0x80;
+const XBRIDGE_CONTROL_MASK: u32 = 0xfe;
+const XBRIDGE_PERF_SELECT_MASK: u32 = 0x0070_0000;
+/// Status bits 9:6 name the port whose request this is.
+const XBRIDGE_REQUESTER_SHIFT: u32 = 6;
+/// The XBridge clears its widget 0 errors and request together.
+const XBRIDGE_STATUS_CLEARED: u32 = STATUS_REQUEST | 0x3f;
+
 impl Regs {
     /// `startup`: the links present, which come up alive.
-    fn reset(startup: u8) -> Self {
+    fn reset(part: Part, startup: u8) -> Self {
+        let xbridge = part == Part::XBridge;
         Self {
             status: 0,
             err_upper: 0,
             err_lower: 0,
-            control: 0,
+            control: if xbridge { XBRIDGE_CONTROL_RESET } else { 0 },
             packet_timeout: PACKET_TIMEOUT_MASK,
             int_upper: INT_UPPER_TARGET_HIGH,
             int_lower: 0,
             err_cmd: 0,
             llp_control: LLP_CONTROL_RESET,
             arb_reload: ARB_RELOAD_RESET,
-            perf_a: PERF_RESET,
-            perf_b: PERF_RESET,
+            perf_a: if xbridge { 0 } else { PERF_RESET },
+            perf_b: if xbridge { 0 } else { PERF_RESET },
             nic: NIC_RESET,
             link_control: [LINK_CREDIT_RESET; LINKS],
             link_status: [0; LINKS],
@@ -200,6 +233,7 @@ struct Out {
 pub struct Xbow {
     regs: Mutex<Regs>,
     revision: u32,
+    part: Part,
     /// Links with something attached, bit n for widget 8 + n.
     present: AtomicU8,
     /// Links passing traffic, as `present`. Written under `regs`.
@@ -230,10 +264,21 @@ impl Xbow {
     /// A Crossbow of `revision` with the links in `widgets` (a widget mask,
     /// bit n for widget n) attached and alive at power-on.
     pub fn new(revision: u32, widgets: u16) -> Self {
+        Self::with_part(Part::Crossbow, revision, widgets)
+    }
+
+    /// The XBridge's crossbar with the links in `widgets` attached and
+    /// alive at power-on.
+    pub fn xbridge(widgets: u16) -> Self {
+        Self::with_part(Part::XBridge, 2, widgets)
+    }
+
+    fn with_part(part: Part, revision: u32, widgets: u16) -> Self {
         let present = (widgets >> FIRST_WIDGET) as u8;
         Self {
-            regs: Mutex::new(Regs::reset(present)),
+            regs: Mutex::new(Regs::reset(part, present)),
             revision,
+            part,
             present: AtomicU8::new(present),
             alive: AtomicU8::new(present),
             irq_order: Mutex::new(()),
@@ -317,8 +362,20 @@ impl Xbow {
     }
 
     fn identification(&self) -> u32 {
-        // Part number and manufacturer are zero on Crossbow.
-        (self.revision << 28) | 1
+        match self.part {
+            // Part number and manufacturer are zero on Crossbow.
+            Part::Crossbow => (self.revision << 28) | 1,
+            Part::XBridge => XBRIDGE_ID,
+        }
+    }
+
+    /// The status register as the host reads it: on the XBridge, with the
+    /// host's port as the requester.
+    fn status(&self, r: &Regs) -> u32 {
+        match (self.part, self.host.get()) {
+            (Part::XBridge, Some((host, _))) => r.status | u32::from(host.widget) << XBRIDGE_REQUESTER_SHIFT,
+            _ => r.status,
+        }
     }
 
     fn link_state(&self, r: &Regs, link: usize) -> u32 {
@@ -363,7 +420,8 @@ impl Xbow {
     /// deassertion once every request is acknowledged. A packet to anything
     /// but the host chip goes nowhere on this machine.
     fn update_interrupt(&self, r: &mut Regs, out: &mut Out) {
-        for link in 0..LINKS {
+        // The XBridge's crossbar interrupts for its own errors alone.
+        for link in (0..LINKS).filter(|_| self.part == Part::Crossbow) {
             if Self::link_requesting(r, link) {
                 r.status |= 1 << (24 + link);
             } else {
@@ -389,7 +447,7 @@ impl Xbow {
     }
 
     fn record_access_error(&self, r: &mut Regs, out: &mut Out) {
-        if r.status & STATUS_ACCESS_ERROR != 0 {
+        if r.status & STATUS_ACCESS_ERROR != 0 && self.part == Part::Crossbow {
             r.status |= STATUS_MULTIPLE_ERROR;
         }
         r.status |= STATUS_ACCESS_ERROR;
@@ -410,7 +468,8 @@ impl Xbow {
     }
 
     fn accessible(&self, slot: u32, write: bool) -> bool {
-        if self.revision >= REVISION_FENCES && ((FENCE_BASE..FENCE_END).contains(&slot) || slot == LOCK || slot == LOCK_CLEAR) {
+        let fences = self.revision >= REVISION_FENCES || self.part == Part::XBridge;
+        if fences && ((FENCE_BASE..FENCE_END).contains(&slot) || slot == LOCK || slot == LOCK_CLEAR) {
             return slot % 8 == 0;
         }
         match slot {
@@ -430,9 +489,10 @@ impl Xbow {
     /// Decode an access to widget 0's window. Registers are 32 bits in the
     /// low half of an eight-byte slot; an eight-byte access has no
     /// established packet form and is refused without a status flag, any
-    /// other malformed access is an access error.
+    /// other malformed access is an access error. The XBridge's crossbar
+    /// takes an eight-byte access as an access error too.
     fn decode(&self, r: &mut Regs, out: &mut Out, off: u32, size: usize, write: bool) -> Option<u32> {
-        if size == 8 {
+        if size == 8 && self.part == Part::Crossbow {
             self.note(off, size, write);
             return None;
         }
@@ -446,12 +506,15 @@ impl Xbow {
     }
 
     /// A processor read of widget 0's window at `off`; `None` is a bus error.
+    /// The XBridge's crossbar answers a malformed read with zero.
     pub fn read(&self, off: u32, size: usize) -> Option<u64> {
         self.locked(|r, out| {
-            let slot = self.decode(r, out, off, size, false)?;
+            let Some(slot) = self.decode(r, out, off, size, false) else {
+                return (self.part == Part::XBridge).then_some(0);
+            };
             let v = match slot {
                 IDENTIFICATION => self.identification(),
-                STATUS => r.status,
+                STATUS => self.status(r),
                 ERR_UPPER => r.err_upper,
                 ERR_LOWER => r.err_lower,
                 CONTROL => r.control,
@@ -463,8 +526,11 @@ impl Xbow {
                 STATUS_CLEAR => {
                     // Acknowledges widget 0's own errors and request; each
                     // link's request is acknowledged at its own alias.
-                    let v = r.status;
-                    r.status &= !(STATUS_WIDGET0_ERRORS | STATUS_REQUEST);
+                    let v = self.status(r);
+                    r.status &= !match self.part {
+                        Part::Crossbow => STATUS_WIDGET0_ERRORS | STATUS_REQUEST,
+                        Part::XBridge => XBRIDGE_STATUS_CLEARED,
+                    };
                     self.update_interrupt(r, out);
                     v
                 }
@@ -500,14 +566,16 @@ impl Xbow {
         })
     }
 
-    /// A processor write; false is a bus error.
+    /// A processor write; false is a bus error. The XBridge's crossbar
+    /// takes a malformed write and drops it.
     pub fn write(&self, off: u32, size: usize, val: u64) -> bool {
+        let xbridge = self.part == Part::XBridge;
         self.locked(|r, out| {
-            let Some(slot) = self.decode(r, out, off, size, true) else { return false };
+            let Some(slot) = self.decode(r, out, off, size, true) else { return xbridge };
             let val = val as u32;
             match slot {
                 CONTROL => {
-                    r.control = val & CONTROL_MASK;
+                    r.control = val & if xbridge { XBRIDGE_CONTROL_MASK } else { CONTROL_MASK };
                     self.update_interrupt(r, out);
                 }
                 PACKET_TIMEOUT => r.packet_timeout = val & PACKET_TIMEOUT_MASK,
@@ -522,8 +590,13 @@ impl Xbow {
                 LLP_CONTROL => r.llp_control = val & LLP_CONTROL_MASK,
                 ARB_RELOAD => r.arb_reload = val & ARB_RELOAD_MASK,
                 // The selector is kept; nothing counts.
-                PERF_A => r.perf_a = val & PERF_SELECT_MASK,
-                PERF_B => r.perf_b = val & PERF_SELECT_MASK,
+                PERF_A | PERF_B => {
+                    let v = val & if xbridge { XBRIDGE_PERF_SELECT_MASK } else { PERF_SELECT_MASK };
+                    *if slot == PERF_A { &mut r.perf_a } else { &mut r.perf_b } = v;
+                }
+                // The XBridge's one-wire master is not modelled: it reports
+                // itself done (bit 1) at once.
+                NIC if xbridge => r.nic = (val & NIC_MASK & !3) | NIC_RESET,
                 NIC => r.nic = val & NIC_MASK,
                 s if (FENCE_BASE..FENCE_END).contains(&s) => r.fences[((s - FENCE_BASE) / 8) as usize] = val & FENCE_MASK,
                 // Test-and-set: stored only while the lock is free.
@@ -590,7 +663,7 @@ impl crate::traits::Resettable for Xbow {
     fn power_on(&self) {
         self.locked(|r, _| {
             let present = self.present.load(Ordering::Acquire);
-            *r = Regs::reset(present);
+            *r = Regs::reset(self.part, present);
             self.alive.store(present, Ordering::Release);
         });
     }
@@ -914,6 +987,96 @@ mod tests {
         let weak = Arc::downgrade(&x);
         drop(x);
         assert!(weak.upgrade().is_none());
+    }
+
+    // The XBridge's crossbar. Cases follow tests/qtest/sn1-xbridge-xbow-test.c
+    // (reset-values, lock, fences) and sn1-xbridge-test.c (access-errors) in
+    // jamesbraid/qemu-sgi-origami.
+
+    /// The Fuel's: Bedrock at 10 and the two PCI heads at 14 and 15.
+    fn xbridge() -> Xbow {
+        Xbow::xbridge(1 << 10 | 1 << 14 | 1 << 15)
+    }
+
+    fn get(x: &Xbow, slot: u32) -> u32 {
+        x.read(slot + 4, 4).unwrap() as u32
+    }
+
+    /// Software probing the crossbar after reset sees these values. Each
+    /// link's control word resets to 0x80000; that value belongs in the
+    /// control word, not in the link reset register, which no read can see.
+    #[test]
+    fn the_xbridge_crossbar_resets_to_its_own_values() {
+        let x = xbridge();
+        for (slot, value) in [
+            (IDENTIFICATION, 0x2d00_0001),
+            (ERR_UPPER, 0),
+            (ERR_LOWER, 0),
+            (CONTROL, 0x80),
+            (PACKET_TIMEOUT, 0xf_ffff),
+            (INT_UPPER, 0x8_0000),
+            (INT_LOWER, 0),
+            (ERR_CMD, 0),
+            (LLP_CONTROL, 0x03ff_1810),
+            (ARB_RELOAD, 2),
+            (PERF_A, 0),
+            (PERF_B, 0),
+            (NIC, 2),
+            (FENCE_BASE, 0xff),
+            (LOCK, 0),
+        ] {
+            assert_eq!(get(&x, slot), value, "{slot:#x}");
+        }
+        for link in 0..LINKS as u32 {
+            let base = LINK_BASE + link * LINK_STRIDE;
+            assert_eq!(get(&x, FENCE_BASE + 8 + link * 8), 0xff);
+            assert_eq!(get(&x, base + LINK_CONTROL), 0x8_0000, "link {}", link + 8);
+            assert_eq!(get(&x, base + LINK_ARB_UPPER), 0);
+            assert_eq!(get(&x, base + LINK_ARB_LOWER), 0);
+        }
+        assert!(x.carries(10) && x.carries(14) && x.carries(15) && !x.carries(13));
+    }
+
+    /// A write takes the resource lock only while it is free, and every
+    /// reset fence bit is read and write in the low eight bits.
+    #[test]
+    fn the_xbridge_crossbar_has_the_lock_and_the_fences() {
+        let x = xbridge();
+        assert!(x.write(LOCK + 4, 4, 0x5a));
+        assert!(x.write(LOCK + 4, 4, 0x3c));
+        assert_eq!((get(&x, LOCK), get(&x, LOCK_CLEAR)), (0x5a, 0x5a));
+        assert!(x.write(LOCK_CLEAR + 4, 4, 0));
+        assert!(x.write(LOCK + 4, 4, 0x3c));
+        assert_eq!(get(&x, LOCK), 0x3c);
+        for slot in (FENCE_BASE..FENCE_END).step_by(8) {
+            assert!(x.write(slot + 4, 4, 0));
+            assert_eq!(get(&x, slot), 0);
+            assert!(x.write(slot + 4, 4, u64::from(u32::MAX)));
+            assert_eq!(get(&x, slot), 0xff);
+        }
+    }
+
+    /// A malformed access answers zero and latches the access error, which
+    /// interrupts once while enabled; status carries the host's port in
+    /// bits 9:6, and reading the clear alias drops the interrupt. Link
+    /// events do not interrupt.
+    #[test]
+    fn the_xbridge_crossbar_reports_its_first_error_once() {
+        let x = xbridge();
+        let isr = Arc::new(Isr::default());
+        x.connect_host(XtalkHost { widget: 10, int_packet: 0, int_packet_mask: 0, vectors: 256 }, isr.clone());
+        assert!(x.write(INT_UPPER + 4, 4, 0x150a_0000));
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_CONTROL + 4, 4, LINK_ALIVE_ENABLE as u64));
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
+        assert_eq!(isr.0.load(Ordering::SeqCst), 0, "a link event does not interrupt");
+        assert!(x.write(CONTROL + 4, 4, u64::from(STATUS_ACCESS_ERROR)));
+        assert_eq!(x.read(IDENTIFICATION, 8), Some(0));
+        assert!(x.write(IDENTIFICATION + 4, 4, 1));
+        assert_eq!(isr.0.load(Ordering::SeqCst), 1 << 0x15);
+        assert_eq!(get(&x, STATUS), STATUS_REQUEST | STATUS_ACCESS_ERROR | 10 << 6);
+        assert_eq!(get(&x, STATUS_CLEAR) & (STATUS_REQUEST | STATUS_ACCESS_ERROR), STATUS_REQUEST | STATUS_ACCESS_ERROR);
+        assert_eq!(isr.0.load(Ordering::SeqCst), 0);
+        assert_eq!(get(&x, STATUS), 10 << 6);
     }
 
     #[test]
