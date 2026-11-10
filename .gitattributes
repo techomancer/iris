@@ -1,0 +1,3 @@
+# Tests compare these byte for byte with LF output.
+src/dev/odyssey/testdata/golden/*.txt text eol=lf
+src/dev/odyssey/testdata/golden/*.tsv text eol=lf
