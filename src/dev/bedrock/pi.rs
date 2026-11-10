@@ -1,8 +1,8 @@
 //! A Bedrock processor interface: processor-slot control, pending
 //! interrupts, the real-time counter and its comparators, the profile timer,
 //! error records and the graphics flow-control registers. A node has two
-//! PIs with two processor slots each, A and B. The Fuel fits one processor,
-//! in PI0 slot A.
+//! PIs with two processor slots each, A and B; the board names which of the
+//! four slots hold a processor ([`Population`]). The Fuel fits PI0 slot A.
 //!
 //! Each slot drives IP2..IP6 of its processor: bank 0 under the slot's bank
 //! 0 mask, bank 1 under its bank 1 mask, its RT comparator, the profile
@@ -14,10 +14,10 @@
 //!
 //! # What is approximated here
 //!
-//! The processor runs from reset, with its CPU-enable bit set, whatever the
-//! register later holds: no cold-reset value for the bit is known and the
-//! register is not known to stop a processor. A write that clears its enable
-//! is stored and logged, not carried out.
+//! Every fitted slot runs its processor from reset, with its CPU-enable bit
+//! set, whatever the register later holds: no cold-reset value for the bit
+//! is known and the register is not known to stop a processor. A write that
+//! clears a running slot's enable is stored and logged, not carried out.
 //!
 //! For a slot with no processor nothing is delivered. A store that arms
 //! such a slot is logged under the `bedrock` module instead of being dropped
@@ -27,8 +27,9 @@
 //! has an NMI entry, so every NMI is logged.
 //!
 //! The CPU-number register answers the reading processor's slice: its slot
-//! in bit 0 and the interface in bit 1. Every read answers slot A, the one
-//! processor's.
+//! in bit 0 and the interface in bit 1. A read from a thread that runs no
+//! processor (a device, the monitor, a test) answers slot A; hardware always
+//! has a requester.
 //!
 //! The model accepts Linux's public `SGIrules` key at offset 0x8 for
 //! compatibility. Linux documents the literal for Hub I/O, but the available
@@ -129,6 +130,58 @@ pub mod reg {
     pub const GRAPHICS_BASE: u64 = 0x300;
     pub const GRAPHICS_END: u64 = 0x350;
 }
+
+/// The processor slots a board fits, one bit per slot: bit `interface * 2 +
+/// slot`, slot 0 being A. CPU 0 sits in PI0 slot A, so every population has
+/// it; a board fills the others in the order PI0/A, PI1/A, PI0/B, PI1/B, so
+/// two processors sit one per interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Population(u8);
+impl Default for Population {
+    fn default() -> Self {
+        Self::SINGLE
+    }
+}
+impl Population {
+    /// One processor, in PI0 slot A.
+    pub const SINGLE: Self = Self(0b0001);
+    /// Slots named by `mask`. CPU 0 runs in PI0/A, so it must be fitted, and
+    /// only the four slots exist.
+    pub fn new(mask: u8) -> Result<Self, String> {
+        if mask & !0b1111 != 0 {
+            return Err(format!("processor mask {mask:#x} names a slot outside the node's four"));
+        }
+        if mask & 1 == 0 {
+            return Err(format!("processor mask {mask:#x} leaves PI0 slot A empty, where CPU 0 runs"));
+        }
+        Ok(Self(mask))
+    }
+    /// `count` processors in the board's order: PI0/A, PI1/A, PI0/B, PI1/B.
+    pub fn fitted_cpus(count: usize) -> Result<Self, String> {
+        if !(1..=4).contains(&count) {
+            return Err(format!("{count} processors; a node fits 1 to 4"));
+        }
+        Self::new(ORDER[..count].iter().fold(0, |mask, bit| mask | (1 << bit)))
+    }
+    /// The slot (interface, 0 = A or 1 = B) CPU `cpu` sits in: the board puts
+    /// CPU n in the nth slot of this set in its order.
+    pub fn slot_of(self, cpu: usize) -> Option<(u8, usize)> {
+        ORDER.iter().filter(|&&bit| self.0 & (1 << bit) != 0).nth(cpu).map(|&bit| (bit / 2, usize::from(bit % 2)))
+    }
+    pub fn mask(self) -> u8 {
+        self.0
+    }
+    pub fn count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+    /// Whether a processor is fitted in `slot` (0 = A, 1 = B) of `interface`.
+    pub fn fitted(self, interface: u8, slot: usize) -> bool {
+        self.0 & (1 << (usize::from(interface) * 2 + slot)) != 0
+    }
+}
+/// The board's population order, as slot numbers `interface * 2 + slot`:
+/// PI0/A, PI1/A, PI0/B, PI1/B.
+const ORDER: [u8; 4] = [0, 2, 1, 3];
 
 /// Bank 0 bit 4 and bank 1 bits 54, 55 and 62: levels other blocks of the
 /// chip drive, which both PIs reflect. Each writer sets its own bit under
@@ -242,6 +295,7 @@ impl State {
 
 pub(super) struct Pi {
     interface: u8,
+    processors: Population,
     pending: [AtomicU64; 2],
     /// Each slot's bank 0 and bank 1 masks: 0xa8 and 0xb0 for A, 0xb8 and
     /// 0xc0 for B.
@@ -271,9 +325,10 @@ pub(super) struct Pi {
 }
 
 impl Pi {
-    pub(super) fn new(interface: u8, now: u64) -> Self {
+    pub(super) fn new(interface: u8, processors: Population, now: u64) -> Self {
         let pi = Self {
             interface,
+            processors,
             pending: Default::default(),
             mask: Default::default(),
             request: Default::default(),
@@ -319,10 +374,9 @@ impl Pi {
         out[slot] = unsafe { word.as_ref() }.map_or(0, |w| (w.load(SeqCst) >> CAUSE_IP2) & 0x1f);
     }
 
-    /// Whether a processor sits in `slot` of this interface: only PI0 slot A
-    /// holds one.
+    /// Whether a processor sits in `slot` of this interface.
     fn started(&self, slot: usize) -> bool {
-        self.interface == 0 && slot == 0
+        self.processors.fitted(self.interface, slot)
     }
 
     /// Report an access to a register the model does not implement.
@@ -580,10 +634,15 @@ impl Pi {
         self.counter.read().paused == RUNNING
     }
 
-    /// The CPU-number register: the reading processor's slot in bit 0, A
-    /// for the one processor, and this interface in bit 1.
+    /// The CPU-number register: the reading processor's slot in bit 0 and
+    /// this interface in bit 1; slot A for a reader that is no processor
+    /// here.
     fn cpu_number(&self) -> u64 {
-        u64::from(self.interface) << 1
+        let slot = crate::cpu::smp::on_cpu_thread()
+            .and_then(|cpu| self.processors.slot_of(cpu))
+            .filter(|&(interface, _)| interface == self.interface)
+            .map_or(0, |(_, slot)| slot as u64);
+        slot | u64::from(self.interface) << 1
     }
 
     /// A doubleword read at `off`, publishing a comparator that latched on

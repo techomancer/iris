@@ -44,6 +44,7 @@ mod tests;
 use tests::{test_config, Rig};
 
 pub use mem::{RamExtent, BANK_SPAN, SLOTS};
+pub use pi::Population;
 
 use crate::dev::heart::Clock;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -90,6 +91,9 @@ pub struct BedrockConfig<'a> {
     /// Host nanoseconds: the PIs' counter and timers run on it, and the
     /// other units' clocked work.
     pub clock: Clock,
+    /// The processor slots the board fits. CPU n sits in
+    /// `processors.slot_of(n)`; a fitted slot starts with its enable bit set.
+    pub processors: Population,
     /// The memory banks in MiB, locational bank 0 upward.
     pub banks_mib: &'a [u32],
     /// Where a node reset goes: LB's soft reset and NI's local reset each
@@ -140,6 +144,7 @@ impl HostTimer<'_> {
 pub struct Bedrock {
     name: &'static str,
     clock: Clock,
+    processors: Population,
     pi: [Pi; 2],
     md: Md,
     io: Io,
@@ -159,14 +164,14 @@ pub struct Bedrock {
 
 impl Bedrock {
     pub fn new(config: BedrockConfig<'_>) -> Result<Arc<Self>, String> {
-        let BedrockConfig { name, clock, banks_mib, events } = config;
+        let BedrockConfig { name, clock, processors, banks_mib, events } = config;
         let memory = mem::Memory::new(banks_mib)?;
         let now = clock();
         let chip = Arc::new_cyclic(|weak: &Weak<Self>| {
             let md = Md::new(memory, clock.clone());
             Self {
                 name,
-                pi: [Pi::new(0, now), Pi::new(1, now)],
+                pi: [Pi::new(0, processors, now), Pi::new(1, processors, now)],
                 dma: md.dma_view(),
                 md,
                 io: Io::new(),
@@ -178,6 +183,7 @@ impl Bedrock {
                 timers: OnceLock::new(),
                 events,
                 clock,
+                processors,
                 weak: weak.clone(),
             }
         });
@@ -204,10 +210,22 @@ impl Bedrock {
     // The faces a board maps into its processor bus. Each is its own type,
     // so no access tests which face it came through.
 
-    /// The 8 MiB register window. With the node's one processor on PI0, the
-    /// local and node XIO forms are the same window.
+    /// The 8 MiB register window in its node XIO form.
     pub fn registers(self: &Arc<Self>) -> Arc<dyn BusDevice> {
-        Arc::new(Registers(self.clone()))
+        Arc::new(Registers::<false>(self.clone()))
+    }
+    /// The register window in its local XIO form: PI0's range answers the
+    /// requester's own PI when the board fits processors on both PIs, as
+    /// QEMU's IP35 node overlays PI1 there for a processor on it (OpenBSD
+    /// expects the local form to select the requester's interface). That the
+    /// chip answers so is an approximation pending a hardware read. With
+    /// processors on PI0 alone it is the node form.
+    pub fn local_registers(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        if (0..2).any(|slot| self.processors.fitted(1, slot)) {
+            Arc::new(Registers::<true>(self.clone()))
+        } else {
+            self.registers()
+        }
     }
     /// The II's PIO face: the processor's uncached I/O view below 4 GiB,
     /// decoded to a widget.
@@ -307,14 +325,15 @@ impl Bedrock {
 
     // Processors.
 
-    /// Where the processor's IP2..IP6 go: Cause bits 10-14 of its interrupt
-    /// word (`MipsCpu::interrupts_ptr`). The node's one processor, CPU 0,
-    /// sits in PI0 slot A. The chip writes no other bit, and no other device
-    /// may write these. The word must outlive the chip.
+    /// Where CPU `cpu`'s IP2..IP6 go: Cause bits 10-14 of its interrupt word
+    /// (`MipsCpu::interrupts_ptr`), from the slot the board's population
+    /// gives it. The chip writes no other bit, and no other device may write
+    /// these. The word must outlive the chip.
     pub fn set_cpu_interrupts(&self, cpu: usize, word: *const AtomicU64) {
-        if cpu == 0 {
-            self.pi[0].set_word(0, word);
-            self.pi[0].publish(&self.levels);
+        if let Some((interface, slot)) = self.processors.slot_of(cpu) {
+            let pi = &self.pi[usize::from(interface)];
+            pi.set_word(slot, word);
+            pi.publish(&self.levels);
         }
     }
     /// The PIs' comparators and profile timers fire on `tm`. Held weakly.
@@ -368,15 +387,23 @@ impl Bedrock {
         }
     }
 
+    /// The PI a local-form access at offset 0 reaches: the requester's own.
+    /// A reader that is no processor reaches PI0.
+    fn own_pi(&self) -> usize {
+        crate::cpu::smp::on_cpu_thread()
+            .and_then(|cpu| self.processors.slot_of(cpu))
+            .map_or(0, |(interface, _)| usize::from(interface))
+    }
+
     /// An access of `size` bytes at `offset` in the register window, a write
-    /// when `value` is given. What no unit answers, the padding after a
-    /// unit's registers included, is a bus error.
-    fn access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
+    /// when `value` is given; PI0's range reaches PI `pi0`. What no unit
+    /// answers, the padding after a unit's registers included, is a bus error.
+    fn access(&self, pi0: usize, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
         if !self.md.cell_permits() {
             return BusRead64::err();
         }
         match offset {
-            reg::PI0_BASE..reg::PI1_BASE => self.pi_access(0, offset, size, value),
+            reg::PI0_BASE..reg::PI1_BASE => self.pi_access(pi0, offset, size, value),
             reg::PI1_BASE..reg::IO_BASE => self.pi_access(1, offset - reg::PI1_BASE, size, value),
             reg::IO_BASE..reg::MD_BASE => self.block_access(offset, size, value),
             reg::MD_BASE..reg::WINDOW => {
@@ -489,12 +516,14 @@ impl Resettable for Bedrock {
     }
 }
 
-/// The register window.
-struct Registers(Arc<Bedrock>);
-impl Registers {
+/// The register window. With `LOCAL`, PI0's range answers the requester's
+/// own PI.
+struct Registers<const LOCAL: bool>(Arc<Bedrock>);
+impl<const LOCAL: bool> Registers<LOCAL> {
     #[inline]
     fn access(&self, offset: u64, size: u8, value: Option<u64>) -> BusRead64 {
-        self.0.access(offset, size, value)
+        let pi0 = if LOCAL { self.0.own_pi() } else { 0 };
+        self.0.access(pi0, offset, size, value)
     }
 }
 macro_rules! face_access {
@@ -508,7 +537,7 @@ macro_rules! face_access {
         }
     };
 }
-impl BusDevice for Registers {
+impl<const LOCAL: bool> BusDevice for Registers<LOCAL> {
     face_access!(read8, write8, u8, BusRead8, 1);
     face_access!(read16, write16, u16, BusRead16, 2);
     face_access!(read32, write32, u32, BusRead32, 4);

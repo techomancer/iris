@@ -26,7 +26,7 @@
 use crate::config::{scsi_label, FuelConsole, GraphicsBoard, MachineConfig};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
-use crate::dev::bedrock::Bedrock;
+use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc3::{Ioc3, Ioc3Config};
@@ -612,6 +612,7 @@ impl FuelBoard {
             clock: clock.clone(),
             flash_path,
             banks_mib: &FUEL_BANKS_MIB,
+            processors: Population::SINGLE,
             firmware: FirmwareRecord::FUEL,
             board_id: FUEL_BOARD_ID,
             l1: l1_config,

@@ -15,7 +15,7 @@
 
 use super::{map_device, Ip35Bus, Window};
 use crate::cpu::mips_exec::CpuDevice;
-use crate::dev::bedrock::{Bedrock, BedrockConfig, BANK_SPAN, SLOTS};
+use crate::dev::bedrock::{Bedrock, BedrockConfig, Population, BANK_SPAN, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash, PART_SIZE};
 use crate::dev::heart::Clock;
 use crate::dev::l1::{L1Config, L1Event, L1};
@@ -36,6 +36,8 @@ pub(crate) struct NodeConfig<'a> {
     pub flash_path: Option<&'a Path>,
     /// The memory banks in MiB, locational bank 0 upward.
     pub banks_mib: &'a [u32],
+    /// The processor slots the board fits.
+    pub processors: Population,
     pub firmware: FirmwareRecord,
     /// The word the board reads back at the Hub-special board-id window.
     pub board_id: u64,
@@ -62,11 +64,12 @@ pub(crate) struct Node {
 
 impl Node {
     pub fn build(config: NodeConfig<'_>) -> Result<Self, String> {
-        let NodeConfig { name, payload, clock, flash_path, banks_mib, firmware, board_id, l1 } = config;
+        let NodeConfig { name, payload, clock, flash_path, banks_mib, processors, firmware, board_id, l1 } = config;
         let (events, receiver) = channel();
         let bedrock = Bedrock::new(BedrockConfig {
             name,
             clock: clock.clone(),
+            processors,
             banks_mib,
             events: Some(events.clone()),
         })?;
@@ -80,11 +83,10 @@ impl Node {
         let mut bus = Ip35Bus::new(phys.clone());
         bedrock.rebuild_memory();
         bus.set_fallback(1, 1 << 32, bedrock.pio());
-        // The local and node XIO register forms: with the one processor on
-        // PI0, the same window.
-        let registers = bedrock.registers();
-        bus.map(1, 0x0100_0000, 0x80_0000, registers.clone());
-        bus.map(1, 0x0180_0000, 0x80_0000, registers);
+        // The local and node XIO register forms: with processors on PI0
+        // alone, the same window.
+        bus.map(1, 0x0100_0000, 0x80_0000, bedrock.local_registers());
+        bus.map(1, 0x0180_0000, 0x80_0000, bedrock.registers());
         // Uncached RAM reaches the banks directly, as cached RAM does; the
         // diagnostic views stay separate.
         let uncached = bedrock.uncached_view();
@@ -142,9 +144,9 @@ impl Node {
 
 }
 
-/// Give a node's memory and interrupts to its processors, CPU 0 first: a
-/// cached view of memory for every one, and CPU 0's IP2..IP6 from PI0 slot
-/// A, where the node's one processor sits. The L1's power events reach
+/// Give a node's memory and interrupts to its processors, CPU 0 first, each
+/// in the slot the board's population gives it: a cached view of memory for
+/// every one and its IP2..IP6 from its PI slot. The L1's power events reach
 /// the system controller on `events`, and its soft reset every processor.
 pub(crate) fn connect_cpus(
     name: &'static str,
