@@ -131,6 +131,10 @@ struct Shared {
     /// access needs the pipe for more than a pure read.
     pipe: Mutex<Pipe>,
     ring: Box<Ring>,
+    /// The back end's pixel reads, which need not wait for the state.
+    pixels: back::display::Pixels,
+    /// The window the back end draws the screen into.
+    display: Arc<dyn crate::gfx_display::GfxDisplay>,
     /// How long a monitor command that reads state waits for it.
     monitor_wait: AtomicU64,
     /// The thread died (its back end panicked): bus accesses fail.
@@ -278,12 +282,15 @@ impl Kona {
     /// flash is held in that file, which must be exactly `FLASH_SIZE` bytes:
     /// every byte the pipe programs is written through, so the contents outlast
     /// the process as they outlast power-off on a pipe.
-    pub fn new(cfg: KonaConfig, irq: Arc<dyn InterruptController>, mem: Arc<dyn BusDevice>, _status: Arc<crate::disp::StatusSource>, flash: Option<File>) -> Result<Arc<Kona>, String> {
+    pub fn new(cfg: KonaConfig, irq: Arc<dyn InterruptController>, mem: Arc<dyn BusDevice>, status: Arc<crate::disp::StatusSource>, flash: Option<File>) -> Result<Arc<Kona>, String> {
         let flash = match flash {
             Some(f) => flash::Flash::backed(f)?,
             None => flash::Flash::fresh(),
         };
         let backend = KonaBackend::new(cfg);
+        backend.set_status(status);
+        let pixels = backend.pixels();
+        let display: Arc<dyn crate::gfx_display::GfxDisplay> = backend.display();
         let mut front = Front::new(&cfg);
         front.probe_value = cfg.probe;
         let host = Arc::new(Host {
@@ -304,6 +311,8 @@ impl Kona {
                 host,
                 pipe: Mutex::new(Pipe { core: Core::new(cfg, flash), backend }),
                 ring,
+                pixels,
+                display,
                 monitor_wait: AtomicU64::new(MONITOR_WAIT.as_nanos() as u64),
                 dead: AtomicBool::new(false),
                 running: AtomicBool::new(false),
@@ -525,6 +534,11 @@ impl Kona {
         }
     }
 
+    /// The window the pipe shows the guest, for the machine's `get_display`.
+    pub fn display(&self) -> Arc<dyn crate::gfx_display::GfxDisplay> {
+        self.shared.display.clone()
+    }
+
     /// The widget the pipe's DMA requests go to: bits 25:22 of the widget
     /// control register, which host software fills with its interrupt
     /// target. A machine's DMA handle may choose the destination with it.
@@ -724,21 +738,26 @@ impl Device for Kona {
     }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("kona".into(), "InfiniteReality pipe: status|counters (kona help)".into())]
+        vec![("kona".into(), "InfiniteReality pipe: status|counters|hash|pix X Y|shot FILE.png (kona help)".into())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         if cmd != "kona" {
             return Err(format!("unknown kona command: {cmd}"));
         }
-        // The commands that read the back end's state wait for the command
-        // stream at most this long, then say so.
+        // Pixel reads never wait. The commands that read the back end's state
+        // wait for the command stream at most this long, then say so.
+        match self.shared.pixels.read(args, &mut *w) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => return Err(e.to_string()),
+        }
         let Some(mut guard) = self.shared.pipe.try_lock_for(std::time::Duration::from_nanos(self.shared.monitor_wait.load(Relaxed))) else {
             return Err("kona: board busy".into());
         };
         match guard.backend.monitor(args, &mut *w) {
             Ok(true) => Ok(()),
-            Ok(false) => Err("kona: status|counters".into()),
+            Ok(false) => Err("kona: status|counters|hash|pix X Y|shot FILE.png".into()),
             Err(e) => Err(e.to_string()),
         }
     }
