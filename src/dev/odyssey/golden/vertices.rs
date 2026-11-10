@@ -139,7 +139,8 @@ fn limits(text: &str) -> Limits {
 
 #[test]
 fn the_vertex_side_gives_the_golden_numbers() {
-    let want = std::fs::read_to_string(path()).expect("vertices.txt: run scripts/vpro-goldens.sh bless");
+    // A Windows checkout may turn the file's line endings into CRLF; the render has LF.
+    let want = std::fs::read_to_string(path()).expect("vertices.txt: run scripts/vpro-goldens.sh bless").replace("\r\n", "\n");
     let got = render();
     if got == want {
         return;
