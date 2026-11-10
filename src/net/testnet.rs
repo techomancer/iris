@@ -1356,8 +1356,7 @@ fn engine_sleeps_until_signalled() {
     assert!(t0.elapsed() < Duration::from_millis(100), "a notify didn't end the wait: {:?}", t0.elapsed());
 }
 
-/// A host socket becoming readable ends the wait (Unix: it is in the poll set).
-#[cfg(unix)]
+/// A host socket becoming readable ends the wait.
 #[test]
 fn engine_wakes_for_host_data() {
     let (port, h) = udp_echo_host();
