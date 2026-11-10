@@ -350,9 +350,24 @@ impl Hub {
         self.pi.calias_bytes()
     }
 
-    /// Where the processors' interrupt lines go.
-    pub fn set_interrupt_controller(&self, irq: Arc<dyn InterruptController>) {
-        self.pi.set_interrupt_controller(irq);
+    /// Where processor `slice`'s three interrupt lines go: its interrupt word
+    /// (`MipsCpu::interrupts_ptr`), Cause bits 10 to 12. The Hub touches no
+    /// other bit. The word must outlive the Hub, or be let go of with
+    /// [`Self::clear_cpu_interrupts`] first; a machine clears it before it
+    /// frees its processors.
+    pub fn set_cpu_interrupts(&self, slice: usize, word: *const std::sync::atomic::AtomicU64) {
+        self.pi.set_cpu_interrupts(slice, word);
+    }
+
+    /// Stop publishing to the processors' words.
+    pub fn clear_cpu_interrupts(&self) {
+        self.pi.clear_cpu_interrupts();
+    }
+
+    /// Whether slice `slice` has a word to publish to.
+    #[cfg(test)]
+    pub(crate) fn publishes_to_cpu(&self, slice: usize) -> bool {
+        self.pi.publishes_to(slice)
     }
     /// The machine's side of the node: processors, the cached alias and
     /// restart.

@@ -273,6 +273,26 @@ fn a_dropped_machine_frees_its_hub_memory_and_timers() {
     });
 }
 
+/// The Hub publishes straight into its processor's interrupt word, so the
+/// machine lets go of the word before the processor goes: a cabled Hub, or any
+/// other holder of this one, can still raise an interrupt afterwards.
+#[test]
+fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
+    big_stack(|| {
+        let dir = Scratch::new("o200-interrupt-word");
+        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let hub = m.node().hub.clone();
+        let cpu = Arc::downgrade(m.cpu_at(0));
+        assert!(hub.publishes_to_cpu(0), "the machine wired the processor's word");
+        drop(m);
+        assert_eq!(cpu.strong_count(), 0, "the processor is freed with the machine");
+        assert!(!hub.publishes_to_cpu(0), "and the Hub no longer holds its word");
+        // Raising and unmasking an interrupt now publishes nowhere.
+        assert_eq!(hub.write64(hub_pi::INT_MASK0_A, !0), BUS_OK);
+        hub.interrupt_target().set_line(3, true);
+    });
+}
+
 /// The PROM of a board's second node keeps its stack in uncached Hub-special
 /// memory above the 4 KiB cached alias it programs, and renumbers the node
 /// between saving its return address there and reloading it. The Hub-special
