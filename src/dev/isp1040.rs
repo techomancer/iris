@@ -80,7 +80,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::dev::qlogic_ring::{self, IrqOrder, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE, Notes, RingCtl, RingState, RingThread};
+use crate::dev::qlogic_ring::{self, IrqLevel, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE, Notes, RingCtl, RingState, RingThread};
 
 use crate::devlog::LogModule;
 use crate::irq::IrqLine;
@@ -450,6 +450,8 @@ pub struct State {
     pub(crate) dma_bank: [u16; BANK_WORDS],
     pub(crate) reset_delay1: u16,
     ctl: Ctl,
+    /// What the interrupt line was last driven to; see [`Core::drive_irq`].
+    irq: IrqLevel,
     bus_cfg1: u16,
     bus_ctrl: u16,
     bus_status: u16,
@@ -499,6 +501,7 @@ impl State {
             dma_bank: [0; BANK_WORDS],
             reset_delay1: 0,
             ctl: Ctl::default(),
+            irq: IrqLevel::default(),
             bus_cfg1: 0,
             bus_ctrl: 0,
             bus_status: 0,
@@ -626,16 +629,15 @@ impl<P: IspPart> std::ops::Deref for Isp<P> {
 /// The state lock, the fence and the thread are the shared [`RingThread`],
 /// reached through `Deref`.
 ///
-/// Lock order: `line_order`, then `st`. Nothing else is taken with `st`
-/// held except the leaf locks (`notes`, `dma_misses`, `odd_accesses`): DMA,
-/// either bus and `fence` are reached with it released. `fence` is held
-/// across one guest-memory store at a time, and either bus across one
-/// target command; neither is held with the other.
+/// Nothing else is taken with `st` held except the leaf locks (`notes`,
+/// `dma_misses`, `odd_accesses`) and the interrupt line, which is driven
+/// under it and whose parent never calls back down: DMA, either bus and
+/// `fence` are reached with it released. `fence` is held across one
+/// guest-memory store at a time, and either bus across one target command;
+/// neither is held with the other.
 #[allow(private_bounds)]
 pub struct Core<P: IspPart> {
     ring: RingThread<State>,
-    /// Serialises driving the interrupt line; see [`Core::sync_irq`].
-    line_order: IrqOrder,
     /// Generation for commands cancelled by aborts without resetting the chip.
     cancel: AtomicU64,
     /// Part policy, shared by register, worker and snapshot paths.
@@ -758,7 +760,6 @@ impl<P: IspPart> Core<P> {
             part,
             cancel: AtomicU64::new(0),
             ring: RingThread::new(st),
-            line_order: IrqOrder::default(),
             buses,
             targets_reset: [AtomicBool::new(false), AtomicBool::new(false)],
             index,
@@ -787,9 +788,10 @@ impl<P: IspPart> Core<P> {
             if self.part.reset_targets(&mut st) { self.kick(&mut st); }
             self.publish_gen(&st);
             self.wake.notify_all();
+            self.drive_irq(&mut st);
+            self.assert_driven(&st);
         }
         self.retire_stores();
-        self.sync_irq();
     }
 
     /// Light the status bar's SCSI activity bits in `heartbeat`.
@@ -802,12 +804,37 @@ impl<P: IspPart> Core<P> {
         self.st.lock().irq_level()
     }
 
-    /// Drive the line to the level the state gives. The level is read
-    /// after taking `line_order`, so whichever of the CPU and the ring
-    /// thread drives last has seen the latest state. `st` is never held
-    /// when this is called.
-    fn sync_irq(&self) {
-        self.line_order.sync(&self.pci, || self.st.lock().irq_level());
+    /// Drive the line to the level the state gives, writing it only when it
+    /// differs from what the line last held. Call it with `st` held, in the
+    /// same hold that changed the state: the edges the parent sees are then
+    /// the state's changes, in order, and a fall and a rise that follow each
+    /// other are two edges and not a steady high.
+    fn drive_irq(&self, st: &mut State) {
+        let level = st.irq_level();
+        st.irq.drive(level, self.pci.irq());
+    }
+
+    /// What the adapter checks before it lets go of `st` after a change: the
+    /// line is where the state says. A change driven in a later hold, which
+    /// would let another thread's fall and rise coalesce between the two,
+    /// fails here. Compiled only into tests.
+    #[cfg(test)]
+    fn assert_driven(&self, st: &State) {
+        if self.pci.irq().is_some() {
+            assert_eq!(st.irq.last(), Some(st.irq_level()), "the state changed and the line was not driven in the same hold");
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn assert_driven(&self, _st: &State) {}
+
+    /// As [`Core::drive_irq`], writing the line whatever it last held.
+    fn resync_irq(&self) {
+        let mut st = self.st.lock();
+        st.irq.forget();
+        let level = st.irq_level();
+        st.irq.drive(level, self.pci.irq());
     }
 
     /// Block until the ring thread has run everything it was given and is
@@ -1731,7 +1758,7 @@ impl<P: IspPart> Core<P> {
                 }
                 let p = st.pending.pop_front().unwrap();
                 st = self.post(st, p);
-                MutexGuard::unlocked(&mut st, || self.sync_irq());
+                self.drive_irq(&mut st);
                 continue;
             }
             // A selection whose entry the driver replaced the ring under
@@ -1743,7 +1770,7 @@ impl<P: IspPart> Core<P> {
                     if let Some(sel) = st.ctl.selecting.take() {
                         st = self.post(st, sel.done);
                     }
-                    MutexGuard::unlocked(&mut st, || self.sync_irq());
+                    self.drive_irq(&mut st);
                 }
                 continue;
             }
@@ -1778,7 +1805,7 @@ impl<P: IspPart> Core<P> {
                         if let Some(p) = done {
                             st = self.post(st, p);
                         }
-                        MutexGuard::unlocked(&mut st, || self.sync_irq());
+                        self.drive_irq(&mut st);
                         continue;
                     }
                 }
@@ -1832,7 +1859,7 @@ impl<P: IspPart> Core<P> {
             if let Some(p) = done {
                 st = self.post(st, p);
             }
-            MutexGuard::unlocked(&mut st, || self.sync_irq());
+            self.drive_irq(&mut st);
         }
     }
 
@@ -1938,6 +1965,13 @@ impl<P: IspPart> Core<P> {
             return;
         }
         let mut st = self.st.lock();
+        self.reg_write_locked(&mut st, off, val);
+        // The write that changed the state drives the line, in the same hold.
+        self.drive_irq(&mut st);
+        self.assert_driven(&st);
+    }
+
+    fn reg_write_locked(&self, st: &mut MutexGuard<'_, State>, off: u32, val: u16) {
         if off == reg::RESPONSE_QUEUE {
             // The consumer acknowledgement: recorded, never over the
             // adapter's own producer count.
@@ -1946,7 +1980,7 @@ impl<P: IspPart> Core<P> {
             } else {
                 st.resp_cons = val % st.resp_len;
                 // The ring thread posts what was held for this room.
-                self.kick(&mut st);
+                self.kick(st);
             }
             return;
         }
@@ -1954,7 +1988,7 @@ impl<P: IspPart> Core<P> {
             st.mailbox[((off - reg::MAILBOX_BASE) / 2) as usize] = val;
             // Writing the request-in pointer is itself the trigger.
             if off == reg::REQUEST_QUEUE {
-                self.kick(&mut st);
+                self.kick(st);
             }
             return;
         }
@@ -1977,11 +2011,13 @@ impl<P: IspPart> Core<P> {
                 // The command in flight is cancelled, not waited for.
                 if val & CTRL_SOFT_RESET != 0 {
                     st.reset();
-                    if self.part.reset_targets(&mut st) { self.kick(&mut st); }
-                    self.publish_gen(&st);
+                    if self.part.reset_targets(st) { self.kick(st); }
+                    self.publish_gen(st);
                     self.wake.notify_all();
-                    drop(st);
-                    self.retire_stores();
+                    // Drive before letting go: another thread can change the
+                    // interrupt while this one waits out the fence.
+                    self.drive_irq(st);
+                    MutexGuard::unlocked(st, || self.retire_stores());
                 }
             }
             reg::SEMAPHORE => st.semaphore = val & SEMAPHORE_MASK,
@@ -1990,13 +2026,11 @@ impl<P: IspPart> Core<P> {
             reg::DMA_DATA_CFG => st.dma_data_cfg = val & DMA_CFG_WRITE_MASK,
             // Nothing to quiesce: a command's transfers are its own.
             reg::DMA_CMD_CTRL | reg::DMA_DATA_CTRL => {}
-            reg::HOST_CMD => self.host_command(&mut st, val),
+            reg::HOST_CMD => self.host_command(st, val),
             reg::ID_LOW | reg::ID_HIGH | reg::BUS_CFG0 | reg::BUS_STATUS => {
-                drop(st);
                 self.note(format!("write {val:#06x} to read-only register {off:#04x}"));
             }
             _ => {
-                drop(st);
                 self.note(format!("write {val:#06x} to unimplemented register {off:#04x}"));
             }
         }
@@ -2017,7 +2051,6 @@ impl<P: IspPart> Core<P> {
             return;
         }
         self.reg_write(off, val as u16);
-        self.sync_irq();
     }
 
     fn odd_access(&self, what: &str, off: u32, width: usize) {
@@ -2099,7 +2132,8 @@ impl<P: IspPart> PciFunction for Isp<P> {
 
     /// Drive the pin the bus wired to the adapter's state.
     fn attached(&self) {
-        self.sync_irq();
+        // The controller's input may not be what the last write left.
+        self.resync_irq();
     }
 
     fn reset(&self) {
@@ -2128,7 +2162,8 @@ impl<P: IspPart> crate::traits::Saveable for Isp<P> {
             self.cancel.store(0, Ordering::Release);
             self.publish_gen(st);
         });
-        self.sync_irq();
+        // The controller took its own state from the snapshot.
+        self.resync_irq();
         Ok(())
     }
 }

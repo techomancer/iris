@@ -54,10 +54,11 @@ impl IrqLine {
 
 struct Unconnected;
 
-/// A controller with one input, for tests: the level last driven.
+/// A controller with one input, for tests: the level last driven, and every
+/// level driven.
 #[cfg(test)]
 #[derive(Default)]
-pub struct LevelProbe(std::sync::Mutex<bool>);
+pub struct LevelProbe(std::sync::Mutex<(bool, Vec<bool>)>);
 
 #[cfg(test)]
 impl LevelProbe {
@@ -68,14 +69,63 @@ impl LevelProbe {
     }
 
     pub fn level(&self) -> bool {
-        *self.0.lock().unwrap()
+        self.0.lock().unwrap().0
+    }
+
+    /// Every level the device drove, in order, repeats included.
+    pub fn writes(&self) -> Vec<bool> {
+        self.0.lock().unwrap().1.clone()
     }
 }
 
 #[cfg(test)]
 impl InterruptController for LevelProbe {
     fn set_line(&self, _line: u32, level: bool) {
-        *self.0.lock().unwrap() = level;
+        let mut probe = self.0.lock().unwrap();
+        probe.0 = level;
+        probe.1.push(level);
+    }
+}
+
+/// A [`LevelProbe`] that can hold one delivery on its way in, as a slow
+/// parent would: [`StallingProbe::arm`] makes the next `set_line` report that
+/// it has started and wait to be let go before it records its level. A test
+/// uses it to see whether a second thread can change the level, and have its
+/// own change delivered, while a first delivery is in flight.
+#[cfg(test)]
+pub struct StallingProbe {
+    pub probe: Arc<LevelProbe>,
+    stall: std::sync::Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+#[cfg(test)]
+impl StallingProbe {
+    /// A stalling probe and a line into it.
+    pub fn line() -> (Arc<Self>, IrqLine) {
+        let s = Arc::new(Self { probe: Arc::new(LevelProbe::default()), stall: Default::default() });
+        (s.clone(), IrqLine::new(s, 0))
+    }
+
+    /// Hold the next delivery. Returns the signal that it has begun and the
+    /// release; a delivery nobody releases goes on after five seconds, so a
+    /// failing test does not hang.
+    pub fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (begun_tx, begun_rx) = std::sync::mpsc::sync_channel(1);
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        *self.stall.lock().unwrap() = Some((begun_tx, go_rx));
+        (begun_rx, go_tx)
+    }
+}
+
+#[cfg(test)]
+impl InterruptController for StallingProbe {
+    fn set_line(&self, line: u32, level: bool) {
+        let stall = self.stall.lock().unwrap().take();
+        if let Some((begun, go)) = stall {
+            begun.send(()).unwrap();
+            let _ = go.recv_timeout(std::time::Duration::from_secs(5));
+        }
+        self.probe.set_line(line, level);
     }
 }
 

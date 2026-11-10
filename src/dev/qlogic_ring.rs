@@ -8,7 +8,7 @@
 //! saving state, a pause for a stopped machine with the time it stood still,
 //! and the thread's start and stop. The ring walks stay with the adapters.
 //!
-//! The interrupt line's ordering, the notes list `scsi notes` prints and the
+//! The interrupt line's driving, the notes list `scsi notes` prints and the
 //! guest-memory transfers are the same for every adapter too, and live here.
 //!
 //! A command's data length and how its buffer segments are placed and read
@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::irq::IrqLine;
 use crate::pci::PciFunctionState;
 use crate::scsi::scsi_cmd;
 
@@ -243,21 +244,47 @@ impl Notes {
     }
 }
 
-/// Serialises driving an adapter's interrupt line, so the level written last
-/// is the one the latest state gives. Lock order: this, then the state lock.
+/// What an adapter last drove its interrupt line to. It lives in the adapter's
+/// state, so it is only reachable with the state lock held: the adapter
+/// drives the line in the same hold of the lock that changed the state, and
+/// the lock orders the edges. The line goes to its parent only when the level
+/// changes, as the hardware's output pin does.
+///
+/// The parent must never call back into the adapter while it holds a lock the
+/// line's delivery takes. The Bridge, HEART and the Hub's processor interface
+/// all deliver and return without calling down. The one place that reaches an
+/// adapter from the parent's side is `Bridge::reg_write`, which resets a PCI
+/// function only after `irq_locked` has returned; keep it that way.
 #[derive(Default)]
-pub struct IrqOrder {
-    order: Mutex<()>,
+pub struct IrqLevel {
+    /// The level last written to the line, or `None` when the controller's
+    /// input may not be what was last written, as after power-on.
+    last: Option<bool>,
 }
 
-impl IrqOrder {
-    /// Drive the line to `level()`, which is read after taking the order lock,
-    /// so whichever thread drives last has seen the latest state. The state
-    /// lock must not be held by the caller: `level` takes it.
-    pub fn sync(&self, pci: &PciFunctionState, level: impl FnOnce() -> bool) {
-        let _order = self.order.lock();
-        let level = level();
-        if let Some(line) = pci.irq() {
+impl IrqLevel {
+    /// The level last written, for a test to check against the state.
+    #[cfg(test)]
+    pub fn last(&self) -> Option<bool> {
+        self.last
+    }
+
+    /// The controller's input may differ from what was last written: the
+    /// device was wired to a new line, or its state was loaded over the run
+    /// the controller knew. The next drive writes the line even when its level
+    /// has not changed, as the first one after power-on does.
+    pub fn forget(&mut self) {
+        self.last = None;
+    }
+
+    /// Drive `line` to `level` if it is not already there. Call it with the
+    /// state lock held, with the level that state gives. A function the bus
+    /// has not wired to a line yet has nothing to drive, and keeps what it
+    /// remembers.
+    pub fn drive(&mut self, level: bool, line: Option<&IrqLine>) {
+        let Some(line) = line else { return };
+        if self.last != Some(level) {
+            self.last = Some(level);
             line.set(level);
         }
     }
@@ -354,6 +381,110 @@ pub fn parse_segments(segs: &mut Vec<(u64, u32)>, p: &[u8], n: usize, a64: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::irq::{LevelProbe, StallingProbe};
+
+    /// Stands for an adapter's state: the level it gives and the line's
+    /// memory of it, under one lock.
+    struct Adapter {
+        state: Mutex<(bool, IrqLevel)>,
+        line: IrqLine,
+    }
+
+    impl Adapter {
+        fn new(line: IrqLine) -> Arc<Self> {
+            Arc::new(Adapter { state: Mutex::new((false, IrqLevel::default())), line })
+        }
+
+        /// Change the level and drive the line in one critical section.
+        fn set(&self, level: bool) {
+            let mut st = self.state.lock();
+            st.0 = level;
+            let (level, irq) = (st.0, &mut st.1);
+            irq.drive(level, Some(&self.line));
+        }
+    }
+
+    /// Thread B raises the level and stalls in the parent's delivery. C then
+    /// tries to drop it. C must wait for B, so the parent sees a rise and then
+    /// a fall in that order, and the line ends low. This pins the primitive
+    /// with a stand-in for an adapter; the adapters' own tests, which drive
+    /// their real register paths, are in `isp1040/tests.rs` and
+    /// `isp2200/tests.rs`.
+    #[test]
+    fn a_stalled_delivery_is_not_overtaken() {
+        let (stall, line) = StallingProbe::line();
+        let adapter = Adapter::new(line);
+        let (started, go) = stall.arm();
+        std::thread::scope(|scope| {
+            let b = adapter.clone();
+            scope.spawn(move || b.set(true));
+            started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let c = adapter.clone();
+            let done = scope.spawn(move || c.set(false));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!done.is_finished(), "C waits for B's delivery");
+            go.send(()).unwrap();
+        });
+        assert_eq!(stall.probe.writes(), [true, false], "no spurious edge, and in order");
+        assert!(!stall.probe.level());
+        assert!(!adapter.state.lock().0);
+    }
+
+    /// Many threads raise and drop the level. Whatever the interleaving, each
+    /// edge the parent sees is a change of the level, in the order the levels
+    /// were set, and the line ends where the last one left it.
+    #[test]
+    fn racing_adapters_drive_only_real_edges() {
+        for round in 0..200u32 {
+            let (probe, line) = LevelProbe::line();
+            let adapter = Adapter::new(line);
+            // The levels in the order they were set, recorded under the same
+            // lock that drives.
+            let set = Arc::new(Mutex::new(Vec::new()));
+            let workers: Vec<_> = (0..6u32)
+                .map(|t| {
+                    let (adapter, set) = (adapter.clone(), set.clone());
+                    std::thread::spawn(move || {
+                        for i in 0..200u32 {
+                            let level = (i + t + round) % 3 != 0;
+                            let mut st = adapter.state.lock();
+                            st.0 = level;
+                            set.lock().push(level);
+                            let irq = &mut st.1;
+                            irq.drive(level, Some(&adapter.line));
+                        }
+                    })
+                })
+                .collect();
+            workers.into_iter().for_each(|w| w.join().unwrap());
+            let mut want = set.lock().clone();
+            want.dedup();
+            assert_eq!(probe.writes(), want, "round {round}: one write per change, in order");
+            assert_eq!(probe.level(), adapter.state.lock().0, "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_forgotten_line_is_written_again() {
+        let (probe, line) = LevelProbe::line();
+        let mut irq = IrqLevel::default();
+        irq.drive(true, Some(&line));
+        irq.drive(true, Some(&line));
+        assert_eq!(probe.writes(), [true]);
+        irq.forget();
+        irq.drive(true, Some(&line));
+        irq.drive(true, Some(&line));
+        assert_eq!(probe.writes(), [true, true], "one write for the forgetting, none after");
+    }
+
+    #[test]
+    fn a_function_without_a_line_keeps_what_it_remembers() {
+        let (probe, line) = LevelProbe::line();
+        let mut irq = IrqLevel::default();
+        irq.drive(true, None);
+        irq.drive(true, Some(&line));
+        assert_eq!(probe.writes(), [true], "the first level reaches the line once it is wired");
+    }
 
     #[test]
     fn segments_read_in_both_formats() {

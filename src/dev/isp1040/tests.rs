@@ -272,6 +272,224 @@ fn bus_ctrl_status_and_the_interrupt_line() {
     assert!(!probe.level());
 }
 
+/// The line is written when the level changes and not otherwise. Every
+/// register access re-derives the level; a controller that takes a rising
+/// level as an edge would see each repeat of a high level as another one.
+#[test]
+fn the_line_is_written_only_when_its_level_changes() {
+    let r = Rig::bare();
+    let (probe, line) = LevelProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    // Attaching writes the line once, whatever its level.
+    assert_eq!(probe.writes(), [false]);
+    r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+    assert_eq!(probe.writes(), [false], "an idle adapter leaves the line alone");
+    r.w(r.mb(0), mbox::NOP);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert_eq!(probe.writes(), [false, true]);
+    for _ in 0..4 {
+        r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+        r.w(reg::SEMAPHORE, 0);
+        let _ = r.r(reg::BUS_STATUS);
+    }
+    assert_eq!(probe.writes(), [false, true], "accesses that leave the level alone are one rising edge, not five");
+    r.w(reg::HOST_CMD, 0x7 << HOST_CMD_SHIFT);
+    assert_eq!(probe.writes(), [false, true, false]);
+}
+
+/// The controller's input can change without the adapter writing it: the old
+/// code rewrote the line on every access, which put it right again.
+#[test]
+fn the_line_is_rewritten_after_the_bus_attaches_and_after_a_load() {
+    use crate::irq::IrqLine;
+    let r = Rig::bare();
+    let (probe, line) = LevelProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+    r.w(r.mb(0), mbox::NOP);
+    r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
+    assert!(probe.level());
+    let behind_its_back = IrqLine::new(probe.clone(), 0);
+
+    behind_its_back.set(false);
+    r.isp.attached();
+    assert!(probe.level(), "attaching writes the line again");
+    r.isp.attached();
+    assert_eq!(probe.writes(), [false, true, false, true, true], "one write per attach");
+
+    let saved = r.isp.save_state();
+    behind_its_back.set(false);
+    r.isp.load_state(&saved).unwrap();
+    assert!(probe.level(), "a load writes the line again");
+}
+
+/// Raise the line the way a driver does: enable it and run a mailbox command.
+fn raise_line<P: IspPart>(r: &Rig<P>) {
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2);
+}
+
+fn clear_line<P: IspPart>(r: &Rig<P>) {
+    r.isp.write(reg::HOST_CMD, (0x7 << HOST_CMD_SHIFT) as u32, 2);
+}
+
+/// The line is written once for each change of level, on the real register
+/// path of each part.
+fn the_level_reaches_the_line_once_per_change<P: IspPart>(r: Rig<P>) {
+    let (probe, line) = LevelProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    raise_line(&r);
+    for _ in 0..3 {
+        r.w(reg::SEMAPHORE, 0);
+        let _ = r.r(reg::BUS_STATUS);
+    }
+    clear_line(&r);
+    assert_eq!(probe.writes(), [false, true, false]);
+}
+
+#[test]
+fn the_isp12160_writes_its_line_only_when_its_level_changes() {
+    the_level_reaches_the_line_once_per_change(rig12160());
+}
+
+/// A second thread changes the level while a first one's delivery is held in
+/// the parent. The adapter drives the line in the hold that changed its
+/// state, so the second change waits for the first to be delivered: the
+/// parent sees the rise and then the fall. A driver that read the level in
+/// one hold and wrote the line outside it would deliver the fall first.
+fn a_stalled_delivery_is_not_overtaken<P: IspPart>(r: Rig<P>) {
+    use crate::irq::StallingProbe;
+    let (stall, line) = StallingProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    let (started, go) = stall.arm();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
+        started.recv_timeout(Duration::from_secs(5)).expect("the rise is in the parent");
+        let c = scope.spawn(|| clear_line(&r));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!c.is_finished(), "the fall waits for the rise to be delivered");
+        go.send(()).unwrap();
+    });
+    assert_eq!(stall.probe.writes(), [false, true, false]);
+    assert!(!stall.probe.level());
+    assert!(!r.isp.interrupting());
+}
+
+#[test]
+fn the_isp1040_does_not_let_a_fall_overtake_a_rise_in_delivery() {
+    a_stalled_delivery_is_not_overtaken(Rig::bare());
+}
+
+#[test]
+fn the_isp12160_does_not_let_a_fall_overtake_a_rise_in_delivery() {
+    a_stalled_delivery_is_not_overtaken(rig12160());
+}
+
+/// Four threads raise and clear the interrupt as fast as they can. Every
+/// write the parent sees is a change of level, and the line ends where the
+/// adapter's state says.
+fn racing_writers_deliver_only_real_edges<P: IspPart>(r: Rig<P>) {
+    let (probe, line) = LevelProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..500 {
+                    r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2);
+                    clear_line(&r);
+                }
+            });
+        }
+    });
+    let writes = probe.writes();
+    assert!(writes.windows(2).all(|w| w[0] != w[1]), "a repeated level reached the parent: {writes:?}");
+    assert_eq!(probe.level(), r.isp.interrupting());
+}
+
+#[test]
+fn racing_register_writers_on_the_isp1040_deliver_only_real_edges() {
+    racing_writers_deliver_only_real_edges(Rig::bare());
+}
+
+#[test]
+fn racing_register_writers_on_the_isp12160_deliver_only_real_edges() {
+    racing_writers_deliver_only_real_edges(rig12160());
+}
+
+/// A completion posted on the ring thread rises while another thread clears
+/// the interrupt. The ring thread drives in the hold that posted it, so the
+/// fall waits for the rise to be delivered. (Not generic over the part: the
+/// ISP12160 runs the same ring loop.)
+#[test]
+fn a_completion_posted_by_the_ring_thread_is_delivered_before_a_later_fall() {
+    use crate::irq::StallingProbe;
+    let r = Rig::with_disk("irq-ring", 1, 64);
+    r.init_rings(4, 4);
+    let (stall, line) = StallingProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.put_entry(0, &request(0x1234, 1, &[0x12, 0, 0, 0, 36, 0], &[(BUF, 36)]));
+    let (started, go) = stall.arm();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::REQUEST_QUEUE, 1, 2));
+        started.recv_timeout(Duration::from_secs(5)).expect("the completion's rise is in the parent");
+        let c = scope.spawn(|| {
+            // As a driver does: read the producer count, then clear.
+            let _ = r.isp.read(reg::RESPONSE_QUEUE, 2);
+            clear_line(&r);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!c.is_finished(), "the fall waits for the rise to be delivered");
+        go.send(()).unwrap();
+    });
+    r.isp.wait_idle();
+    assert_eq!(stall.probe.writes(), [false, true, false]);
+    assert!(!r.isp.interrupting());
+}
+
+/// A soft reset through BUS_CTRL drops the line before it waits out the
+/// fence, not after: another thread can change the interrupt meanwhile, and
+/// a fall driven late would be lost behind its rise.
+fn a_soft_reset_drives_the_line_before_it_waits_for_the_fence<P: IspPart>(r: Rig<P>) {
+    let (probe, line) = LevelProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    raise_line(&r);
+    assert!(probe.level());
+    let fence = r.isp.fence.lock();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::BUS_CTRL, CTRL_SOFT_RESET as u32, 2));
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while probe.level() && std::time::Instant::now() < end {
+            std::thread::yield_now();
+        }
+        assert!(!probe.level(), "the line fell while the reset still waited for the fence");
+        drop(fence);
+    });
+    assert_eq!(probe.writes(), [false, true, false]);
+}
+
+#[test]
+fn the_isp1040_soft_reset_drives_the_line_before_the_fence() {
+    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(Rig::bare());
+}
+
+#[test]
+fn the_isp12160_soft_reset_drives_the_line_before_the_fence() {
+    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(rig12160());
+}
+
 #[test]
 fn semaphore_holds_two_bits() {
     let r = Rig::bare();

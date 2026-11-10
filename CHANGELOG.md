@@ -175,6 +175,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - jitv2 does not compile a page any CPU's cache holds lines in: that CPU runs it from its own view in the interpreter, and every other page stays compiled.
 - The O2 keeps POST's stack in those lines. CRIME's side page for the uncached path and the tag-store hook are gone, and an O2 snapshot an older iris took during POST is refused.
 
+### QLogic adapters' interrupt line
+
+- The ISP1040 and the ISP12160 (the Octane's and the Origin's SCSI, and the Fuel's and the Tezro's) change their interrupt state and drive the line in one hold of the state lock, and write the line only when the level changes (and once more after the bus attaches them or a snapshot loads). There is no guest-visible change: the parents already ignored a repeated level. It removes the second lock the ISP1040 took and a line write on every register access.
+
 ### R10000 family fixes, R12000 and R14000
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
