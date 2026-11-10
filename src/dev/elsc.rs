@@ -881,7 +881,7 @@ impl State {
         // committed fires instead and the shutdown is lost.
         if self.deferred_committed {
             dlog!(
-                LogModule::Bedrock,
+                LogModule::Module,
                 "elsc: \"pwr d\" countdown expired while a {} is committed; that action fires instead",
                 self.deferred_action.name()
             );
@@ -903,14 +903,14 @@ impl State {
             // The module drives the pulse itself and frees the lock as it
             // starts.
             if !m.nmi() {
-                dlog!(LogModule::Bedrock, "elsc: the module could not pulse its NMI output");
+                dlog!(LogModule::Module, "elsc: the module could not pulse its NMI output");
                 return;
             }
             self.tas_lock = TAS_FREE;
             return;
         }
         if self.nmi_pulse_active {
-            dlog!(LogModule::Bedrock, "elsc: NMI requested during an NMI pulse");
+            dlog!(LogModule::Module, "elsc: NMI requested during an NMI pulse");
             return;
         }
         self.nmi_pulse_active = true;
@@ -922,7 +922,7 @@ impl State {
         self.tas_lock = TAS_FREE;
         if self.module.is_some() {
             if !self.can_execute(Action::Reset) {
-                dlog!(LogModule::Bedrock, "elsc: the module refused the reset an acknowledged \"rst\" asked for");
+                dlog!(LogModule::Module, "elsc: the module refused the reset an acknowledged \"rst\" asked for");
                 return;
             }
             self.outbox.push(Action::Reset);
@@ -970,7 +970,7 @@ impl State {
                     // running; the cycle follows once it has ended.
                     self.arm_ms(T_HBT, NMI_PULSE_MS);
                 } else {
-                    dlog!(LogModule::Bedrock, "elsc: the heartbeat watchdog's power cycle cannot run on this module");
+                    dlog!(LogModule::Module, "elsc: the heartbeat watchdog's power cycle cannot run on this module");
                     self.hbt_stage = Heartbeat::Idle;
                 }
             }
@@ -1121,7 +1121,7 @@ impl State {
             self.deferred_action = action;
         } else {
             dlog!(
-                LogModule::Bedrock,
+                LogModule::Module,
                 "elsc: \"{command}\" while a {} is already committed; that action fires and this \"ok\" may not match it",
                 self.deferred_action.name()
             );
@@ -1506,7 +1506,7 @@ impl State {
     fn log_unimp_once(&mut self, bit: u8, what: &str) {
         if self.unimp_logged & bit == 0 {
             self.unimp_logged |= bit;
-            dlog!(LogModule::Bedrock, "elsc: {what}");
+            dlog!(LogModule::Module, "elsc: {what}");
         }
     }
 
@@ -1697,7 +1697,7 @@ impl State {
             }
             if self.cfg.master && (c == b'o' || (0x04..=0x06).contains(&c)) {
                 dlog!(
-                    LogModule::Bedrock,
+                    LogModule::Module,
                     "elsc: \"sla\" report {c:#04x} from a slave controller; the shutdown or fan report it starts is not modelled"
                 );
             }
@@ -2475,7 +2475,7 @@ impl I2cTarget for Elsc {
     fn send(&self, byte: u8) -> bool {
         self.run(|st| {
             if st.rx.len() > MAX_FRAME {
-                dlog!(LogModule::Bedrock, "elsc: request longer than the protocol allows, byte dropped");
+                dlog!(LogModule::Module, "elsc: request longer than the protocol allows, byte dropped");
             } else {
                 st.rx.push(byte);
             }

@@ -120,7 +120,7 @@ impl State {
         };
         match nv_storage::save(&path.to_string_lossy(), &self.mem) {
             Ok(()) => self.dirty = false,
-            Err(err) => dlog!(LogModule::Bedrock, "elsc nvram: write to {} failed: {err}", path.display()),
+            Err(err) => dlog!(LogModule::Module, "elsc nvram: write to {} failed: {err}", path.display()),
         }
     }
 
