@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::dev::ioc3::eth::MiiPhy;
+use crate::dev::mii::MiiPhy;
 use crate::snapshot::{field_bool, field_u16, field_u32, field_u64, field_u8, StateTable};
 
 /// Ordinary and command-override writable masks, by register.
@@ -81,9 +81,7 @@ impl Ics1890 {
         p
     }
 
-    pub fn address(&self) -> u8 {
-        self.addr
-    }
+
 
     /// Hardware and software reset: defaults, no override, no latches, and a
     /// fresh negotiation if enabled.
@@ -137,61 +135,20 @@ impl Ics1890 {
         }
     }
 
-    /// When a negotiation in progress completes, if one is.
-    pub fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
 
-    /// Advance the negotiation deadline and note link transitions. Reads never
-    /// start or postpone negotiation; this only observes the clock.
-    pub fn sync(&mut self, now: Instant) {
-        if let Some(d) = self.deadline {
-            if now >= d && !self.power_down() && self.backend_up {
-                self.deadline = None;
-                self.nego_done = true;
-                self.partner = 0x01e1;
-                self.page_received = true;
-            }
-        }
-        let link = self.link();
-        if self.last_link && !link {
-            self.link_low_latch = true;
-        }
-        self.last_link = link;
-    }
 
-    /// The packet backend's cable state.
-    pub fn set_backend_link(&mut self, up: bool, now: Instant) {
-        self.sync(now);
-        if self.backend_up == up {
-            return;
-        }
-        self.backend_up = up;
-        if up {
-            // Recovery starts a fresh negotiation.
-            self.start_negotiation(now);
-        } else {
-            self.deadline = None;
-            self.nego_done = false;
-        }
-        self.sync(now);
-    }
 
-    /// BMCR loopback turns frames round inside the part. Isolate and
-    /// power-down take precedence.
-    pub fn in_loopback(&self) -> bool {
-        self.bmcr & 0x4000 != 0 && !self.power_down() && !self.isolated()
-    }
+
+
+
+
 
     /// Frames may cross the MII at all.
     pub fn data_path(&self) -> bool {
         !self.power_down() && !self.isolated()
     }
 
-    /// Frames may go to or come from the packet backend.
-    pub fn wire_enabled(&self) -> bool {
-        self.data_path() && self.link()
-    }
+
 
     fn resolved(&self) -> (bool, bool) {
         // (100 Mb/s, full duplex)
@@ -211,7 +168,60 @@ impl Ics1890 {
         }
     }
 
-    pub fn read(&mut self, r: u8, now: Instant) -> u16 {
+
+
+
+}
+
+// The transceiver's registers and auto-negotiation progress for a
+// snapshot. Its one deadline is saved as the time it had left.
+impl Ics1890 {
+
+
+
+}
+
+
+impl MiiPhy for Ics1890 {
+    fn address(&self) -> u8 {
+        self.addr
+    }
+
+    /// When a negotiation in progress completes, if one is.
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Frames may go to or come from the packet backend.
+    fn wire_enabled(&self) -> bool {
+        self.data_path() && self.link()
+    }
+
+    /// BMCR loopback turns frames round inside the part. Isolate and
+    /// power-down take precedence.
+    fn in_loopback(&self) -> bool {
+        self.bmcr & 0x4000 != 0 && !self.power_down() && !self.isolated()
+    }
+
+    /// Advance the negotiation deadline and note link transitions. Reads never
+    /// start or postpone negotiation; this only observes the clock.
+    fn sync(&mut self, now: Instant) {
+        if let Some(d) = self.deadline {
+            if now >= d && !self.power_down() && self.backend_up {
+                self.deadline = None;
+                self.nego_done = true;
+                self.partner = 0x01e1;
+                self.page_received = true;
+            }
+        }
+        let link = self.link();
+        if self.last_link && !link {
+            self.link_low_latch = true;
+        }
+        self.last_link = link;
+    }
+
+    fn read(&mut self, r: u8, now: Instant) -> u16 {
         self.sync(now);
         match r {
             0 => self.bmcr,
@@ -273,7 +283,7 @@ impl Ics1890 {
         }
     }
 
-    pub fn write(&mut self, r: u8, val: u16, now: Instant) {
+    fn write(&mut self, r: u8, val: u16, now: Instant) {
         self.sync(now);
         let r = usize::from(r);
         let armed = self.override_armed;
@@ -349,12 +359,25 @@ impl Ics1890 {
         }
         self.sync(now);
     }
-}
 
-// The transceiver's registers and auto-negotiation progress for a
-// snapshot. Its one deadline is saved as the time it had left.
-impl Ics1890 {
-    pub(crate) fn save_state(&self, now: Instant) -> toml::Value {
+    /// The packet backend's cable state.
+    fn set_backend_link(&mut self, up: bool, now: Instant) {
+        self.sync(now);
+        if self.backend_up == up {
+            return;
+        }
+        self.backend_up = up;
+        if up {
+            // Recovery starts a fresh negotiation.
+            self.start_negotiation(now);
+        } else {
+            self.deadline = None;
+            self.nego_done = false;
+        }
+        self.sync(now);
+    }
+
+    fn save_state(&self, now: Instant) -> toml::Value {
         StateTable::new()
             .u8("addr", self.addr)
             .u16("bmcr", self.bmcr)
@@ -380,7 +403,7 @@ impl Ics1890 {
             .build()
     }
 
-    pub(crate) fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
+    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
         let deadline = field_u64(v, "deadline")?;
         *self = Self {
             addr: field_u8(v, "addr")?,
@@ -406,18 +429,52 @@ impl Ics1890 {
         };
         Ok(())
     }
+    fn power_on(&mut self) {
+        Ics1890::reset(self, Instant::now());
+    }
 }
 
-impl MiiPhy for Ics1890 {
-    fn address(&self) -> u8 { Ics1890::address(self) }
-    fn deadline(&self) -> Option<Instant> { Ics1890::deadline(self) }
-    fn wire_enabled(&self) -> bool { Ics1890::wire_enabled(self) }
-    fn in_loopback(&self) -> bool { Ics1890::in_loopback(self) }
-    fn sync(&mut self, now: Instant) { Ics1890::sync(self, now) }
-    fn read(&mut self, register: u8, now: Instant) -> u16 { Ics1890::read(self, register, now) }
-    fn write(&mut self, register: u8, value: u16, now: Instant) { Ics1890::write(self, register, value, now) }
-    fn set_backend_link(&mut self, up: bool, now: Instant) { Ics1890::set_backend_link(self, up, now) }
-    fn power_on(&mut self) { Ics1890::reset(self, Instant::now()) }
-    fn save_state(&self, now: Instant) -> toml::Value { Ics1890::save_state(self, now) }
-    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> { Ics1890::load_state(self, v, now) }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phy() -> (Ics1890, Instant) {
+        let now = Instant::now();
+        (Ics1890::new(1, Duration::from_millis(100)), now)
+    }
+
+    /// The identity and advertisement a driver's probe compares.
+    #[test]
+    fn the_reset_values_are_what_a_probe_reads() {
+        let (mut p, now) = phy();
+        assert_eq!(p.read(2, now), 0x0015);
+        assert_eq!(p.read(3, now), 0xf423);
+        assert_eq!(p.read(4, now), 0x01e1);
+        assert_eq!(p.read(0, now) & 0x1000, 0x1000, "negotiation is enabled");
+        assert_eq!(p.read(0x10, now) >> 6 & 0x1f, 1, "the address strap shows in the extended control");
+        assert_eq!(p.read(0x13, now) & 0x4000, 0x4000, "node mode");
+    }
+
+    /// An ordinary write reaches only the writable bits of a register, and
+    /// the identity registers need the command override.
+    #[test]
+    fn writes_stop_at_the_writable_mask() {
+        let (mut p, now) = phy();
+        p.write(4, 0xffff, now);
+        assert_eq!(p.read(4, now), 0x01e1 & !0x21e0 | 0x21e0);
+        p.write(2, 0x1234, now);
+        assert_eq!(p.read(2, now), 0x0015, "the identity is read-only without the override");
+        p.write(0x10, 0x8000, now);
+        p.write(2, 0x1234, now);
+        assert_eq!(p.read(2, now), 0x1234, "armed by a write to extended control bit 15");
+        p.write(2, 0x4321, now);
+        assert_eq!(p.read(2, now), 0x1234, "the override is spent by one write");
+    }
+
+    #[test]
+    fn a_register_the_part_lacks_reads_zero_and_counts() {
+        let (mut p, now) = phy();
+        assert_eq!(p.read(0x1f, now), 0);
+        assert_eq!(p.unimplemented_accesses, 1);
+    }
 }

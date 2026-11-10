@@ -19,7 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::dev::ioc3::eth::MiiPhy;
+use crate::dev::mii::MiiPhy;
 use crate::snapshot::{field_bool, field_u16, field_u64, field_u8, StateTable};
 
 pub mod reg {

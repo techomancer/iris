@@ -11,6 +11,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::dev::mii::MiiPhy;
+
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, toml_u16, StateTable};
 pub mod reg {
     pub const BASIC_CONTROL: u8 = 0x0;
@@ -85,15 +87,11 @@ impl Dp83843 {
         self.pending = false;
         self.restarting = false;
     }
-    pub fn address(&self) -> u8 {
-        (self.regs[reg::PHY_CONTROL as usize] & 31) as u8
-    }
+
     pub fn backend_up(&self) -> bool {
         self.backend_up
     }
-    pub fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
+
     fn autoneg(&self) -> bool {
         self.regs[reg::BASIC_CONTROL as usize] & 0x1000 != 0
     }
@@ -115,15 +113,11 @@ impl Dp83843 {
     pub fn data_path(&self) -> bool {
         self.supported() && self.regs[reg::BASIC_CONTROL as usize] & 0xc00 == 0
     }
-    pub fn wire_enabled(&self) -> bool {
-        self.data_path() && self.link()
-    }
+
     fn loopback_selected(&self) -> bool {
         self.regs[reg::BASIC_CONTROL as usize] & 0x4000 != 0 || self.regs[reg::LOOPBACK as usize] & 0x30 != 0
     }
-    pub fn in_loopback(&self) -> bool {
-        self.data_path() && self.loopback_selected()
-    }
+
     fn status(&self) -> u16 {
         let mut v = if self.autoneg() { 0x200 } else { 0 };
         if self.loopback_selected() {
@@ -170,7 +164,51 @@ impl Dp83843 {
             crate::dlog!(crate::devlog::LogModule::Ioc, "dp83843: no common supported advertised mode");
         }
     }
-    pub fn sync(&mut self, now: Instant) {
+
+
+    fn unimplemented(&mut self, r: u8) {
+        self.unimplemented_accesses += 1;
+        crate::dlog!(crate::devlog::LogModule::Ioc, "dp83843: unsupported register or control at {r:#x}");
+    }
+
+
+}
+// The registers and negotiation progress for a snapshot. The two instants
+// are saved as the time they had left.
+impl Dp83843 {
+    fn instant_left(at: Option<Instant>, now: Instant) -> u64 {
+        // Nanoseconds left plus one; zero for none.
+        at.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
+    }
+
+    fn instant_from(left: u64, now: Instant) -> Option<Instant> {
+        (left != 0).then(|| now + Duration::from_nanos(left - 1))
+    }
+
+
+
+
+}
+
+
+impl MiiPhy for Dp83843 {
+    fn address(&self) -> u8 {
+        (self.regs[reg::PHY_CONTROL as usize] & 31) as u8
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn wire_enabled(&self) -> bool {
+        self.data_path() && self.link()
+    }
+
+    fn in_loopback(&self) -> bool {
+        self.data_path() && self.loopback_selected()
+    }
+
+    fn sync(&mut self, now: Instant) {
         if self.deadline.is_some_and(|d| now >= d) {
             let before = self.status();
             if let Some(end) = self.complete.take() {
@@ -187,17 +225,8 @@ impl Dp83843 {
             self.event(before);
         }
     }
-    pub fn set_backend_link(&mut self, up: bool, now: Instant) {
-        self.sync(now);
-        let before = self.status();
-        self.backend_up = up;
-        self.event(before);
-    }
-    fn unimplemented(&mut self, r: u8) {
-        self.unimplemented_accesses += 1;
-        crate::dlog!(crate::devlog::LogModule::Ioc, "dp83843: unsupported register or control at {r:#x}");
-    }
-    pub fn read(&mut self, r: u8, now: Instant) -> u16 {
+
+    fn read(&mut self, r: u8, now: Instant) -> u16 {
         self.sync(now);
         let v = match r {
             reg::BASIC_CONTROL => self.regs[reg::BASIC_CONTROL as usize],
@@ -273,7 +302,8 @@ impl Dp83843 {
         }
         v
     }
-    pub fn write(&mut self, r: u8, val: u16, now: Instant) {
+
+    fn write(&mut self, r: u8, val: u16, now: Instant) {
         self.sync(now);
         let before = self.status();
         match r {
@@ -370,20 +400,15 @@ impl Dp83843 {
             self.pending = true;
         }
     }
-}
-// The registers and negotiation progress for a snapshot. The two instants
-// are saved as the time they had left.
-impl Dp83843 {
-    fn instant_left(at: Option<Instant>, now: Instant) -> u64 {
-        // Nanoseconds left plus one; zero for none.
-        at.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
+
+    fn set_backend_link(&mut self, up: bool, now: Instant) {
+        self.sync(now);
+        let before = self.status();
+        self.backend_up = up;
+        self.event(before);
     }
 
-    fn instant_from(left: u64, now: Instant) -> Option<Instant> {
-        (left != 0).then(|| now + Duration::from_nanos(left - 1))
-    }
-
-    pub(crate) fn save_state(&self, now: Instant) -> toml::Value {
+    fn save_state(&self, now: Instant) -> toml::Value {
         StateTable::new()
             .u8("configured_addr", self.configured_addr)
             .u16s("regs", &self.regs)
@@ -400,7 +425,7 @@ impl Dp83843 {
             .build()
     }
 
-    pub(crate) fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
+    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
         let items = field(v, "regs")?.as_array().ok_or("regs: not a list")?;
         if items.len() != 32 {
             return Err(format!("regs: {} entries, expected 32", items.len()));
@@ -425,20 +450,9 @@ impl Dp83843 {
         };
         Ok(())
     }
-}
-
-impl crate::dev::ioc3::eth::MiiPhy for Dp83843 {
-    fn address(&self) -> u8 { Dp83843::address(self) }
-    fn deadline(&self) -> Option<Instant> { Dp83843::deadline(self) }
-    fn wire_enabled(&self) -> bool { Dp83843::wire_enabled(self) }
-    fn in_loopback(&self) -> bool { Dp83843::in_loopback(self) }
-    fn sync(&mut self, now: Instant) { Dp83843::sync(self, now) }
-    fn read(&mut self, register: u8, now: Instant) -> u16 { Dp83843::read(self, register, now) }
-    fn write(&mut self, register: u8, value: u16, now: Instant) { Dp83843::write(self, register, value, now) }
-    fn set_backend_link(&mut self, up: bool, now: Instant) { Dp83843::set_backend_link(self, up, now) }
-    fn power_on(&mut self) { Dp83843::reset(self) }
-    fn save_state(&self, now: Instant) -> toml::Value { Dp83843::save_state(self, now) }
-    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> { Dp83843::load_state(self, v, now) }
+    fn power_on(&mut self) {
+        Dp83843::reset(self);
+    }
 }
 
 #[cfg(test)]
