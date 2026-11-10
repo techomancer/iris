@@ -800,6 +800,8 @@ impl Drop for O2Machine {
         self.monitor.shutdown();
         // The rendering engine's thread runs from construction and holds the bus.
         self.bus.crime.re.stop();
+        // A placed BAR's device holds the card, whose DMA memory owns the bus.
+        self.bus.phys.release_devices();
     }
 }
 
@@ -1269,6 +1271,30 @@ mod drop_tests {
         assert!(machine.bus.nvme.get().is_some());
         machine.bus.flush_disks().unwrap();
         drop(machine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A card whose BAR the guest has placed is mapped on the bus, and the
+    /// card holds memory for its DMA, which owns the bus: the drop must
+    /// still free it.
+    #[test]
+    fn a_dropped_o2_with_a_placed_pci_bar_frees_its_bus() {
+        let dir = scratch("o2-bar-drop");
+        let disk = dir.join("nvme.raw");
+        std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.nvme = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, bridge: false, board: None, slot: None };
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        let pci = machine.bus.mace.pci.bus();
+        let at = crate::pci::DevFn { device: crate::dev::mace_pci::IP32_OPTION_SLOT, function: 0 };
+        let kept = machine.bus.phys.kept_len();
+        pci.config_write(at, 0x10, 4, 0x8000_4000);
+        pci.config_write(at, 0x14, 4, 0);
+        pci.config_write(at, 0x04, 2, crate::pci::PCI_COMMAND_MEMORY);
+        assert!(machine.bus.phys.kept_len() > kept, "the BAR is mapped on the bus");
+        let phys = Arc::downgrade(&machine.bus.phys);
+        drop(machine);
+        assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

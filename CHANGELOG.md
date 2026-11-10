@@ -32,6 +32,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   interpreter, the Cranelift JIT and the GPU engine against one another; Linux
   CI runs its CPU half. See `TESTING.md`.
 
+### A dropped O2 with a PCI card frees its bus
+
+- An O2 whose PCI card had its BAR placed by the PROM or the guest kept its
+  physical bus and decode table after the machine dropped (a GUI Stop then
+  Start, or a test). The BAR's mapping holds the card, and the card holds
+  memory for its DMA, which owns the bus. The O2's drop now lets go of the
+  bus's devices, as the other machines' do.
+
 ### jitv2: registers in loops stay in host registers
 
 - A compiled page with a loop keeps the registers its loops use most in host
