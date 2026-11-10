@@ -473,6 +473,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
 | [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
+| [jitv2-gpr-forwarding.md](plans/jitv2-gpr-forwarding.md) | plan | Guest registers as SSA values in jitv2: what xiri and revenir measured, why the all-31 cache regresses, staged plan (mem-join value, local forwarding, budgeted region cache), verification |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
 | [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
