@@ -56,6 +56,45 @@ pub struct L1Config {
     /// Answer the router command-interpreter `brick` request. Only the brick
     /// types in `router_type_name` have a reply.
     pub router: bool,
+    /// The CPU configuration the node board's record carries, if any.
+    pub cpu_context: Option<CpuContext>,
+    /// The node board's identity in component 0's board area. Unset, the
+    /// board is the Fuel's system board, which answers as both the node
+    /// board and the I/O board, the I/O area carrying the station address.
+    /// Set, component 0 names this board and no I/O board record is given,
+    /// as QEMU's L1 does for an IP53 node.
+    pub node_board: Option<BoardIdentity>,
+}
+
+/// A board's identity as its board area names it: product name, part number
+/// and revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoardIdentity {
+    pub name: &'static str,
+    pub part: &'static str,
+    pub revision: &'static str,
+}
+impl BoardIdentity {
+    /// The Fuel's system board as the model names it: a placeholder, not a
+    /// read record.
+    pub const FUEL: Self = Self { name: "IP34", part: "030-1707-003", revision: "-G" };
+}
+
+/// The CPU configuration an IP35 node board's EEPROM record carries beside
+/// its identity: the processor mode word and the processor and Hub clocks.
+/// At start-up the PROM checks the configuration block in its boot flash
+/// against these, and when a board record carries none it falls back to a
+/// table row chosen by the board word; a block that matches neither draws
+/// "CPU configuration values mismatch". The encoding is the one QEMU's L1
+/// gives the Tezro and Origin 350 boards, which the stock PROM 6.210
+/// accepts; no factory record has been read, so the bytes are a software
+/// input, not a capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuContext {
+    /// The full 32-bit mode word, as the configuration block holds it.
+    pub mode_word: u32,
+    pub cpu_mhz: u32,
+    pub hub_mhz: u32,
 }
 impl Default for L1Config {
     fn default() -> Self {
@@ -70,6 +109,8 @@ impl Default for L1Config {
             auto_power: true,
             port_speed_first: 0,
             router: false,
+            cpu_context: None,
+            node_board: None,
         }
     }
 }
@@ -170,15 +211,31 @@ fn ia_text(area: &mut Vec<u8>, text: &str) {
     area.push(0xc0 | text.len() as u8);
     area.extend_from_slice(text.as_bytes());
 }
-fn board(mac: Option<[u8; 6]>) -> Vec<u8> {
+fn board(identity: BoardIdentity, mac: Option<[u8; 6]>, cpu: Option<CpuContext>) -> Vec<u8> {
     let mut b = vec![0; 6];
-    for s in ["SYNTHETIC", "IP34", "EMUN00", "030-1707-003"] {
+    for s in ["SYNTHETIC", identity.name, "EMUN00", identity.part] {
         ia_text(&mut b, s);
     }
     b.push(0);
-    ia_text(&mut b, "-G");
+    ia_text(&mut b, identity.revision);
     b.extend_from_slice(&[1, 0]);
     ia_text(&mut b, "00");
+    if let Some(cpu) = cpu {
+        // Format 2 and a one-byte binary 3 select the CPU fields: the Hub
+        // mode bits, Config0 to Config3, the Hub and CPU clocks in MHz and
+        // three minimum versions. Only Config0 and the clocks are known;
+        // the rest are empty fields, not zeros.
+        b[0] = 2;
+        b.extend_from_slice(&[1, 3, 0]);
+        b.push(4);
+        b.extend_from_slice(&cpu.mode_word.to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0]);
+        for mhz in [cpu.hub_mhz, cpu.cpu_mhz] {
+            b.push(4);
+            b.extend_from_slice(&mhz.to_be_bytes());
+        }
+        b.extend_from_slice(&[0, 0, 0]);
+    }
     for _ in 0..3 {
         b.extend_from_slice(&[4, 0, 0, 0, 0]);
     }
@@ -198,9 +255,10 @@ impl State {
         let mut records: [[Vec<u8>; 3]; 16] =
             std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
         let chassis = area_finish(vec![0, 2, 0, 0xc2, b'N', b'A', 0xc2, b'N', b'A', 0xc1]);
-        for c in 0..2 {
-            records[c][0] = chassis.clone();
-            records[c][1] = board(if c == 1 { Some(config.mac) } else { None });
+        let identity = config.node_board.unwrap_or(BoardIdentity::FUEL);
+        records[0] = [chassis.clone(), board(identity, None, config.cpu_context), Vec::new()];
+        if config.node_board.is_none() {
+            records[1] = [chassis, board(identity, Some(config.mac), None), Vec::new()];
         }
         let powered = config.auto_power;
         let port = config.node_position << 5;

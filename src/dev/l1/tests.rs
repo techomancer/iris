@@ -88,6 +88,58 @@ fn the_l1_returns_identity_and_validated_eeprom_records() {
     assert_eq!(request(&l1, 5, &[], 0), integer_reply(&[1, 48, 1]));
 }
 
+/// A configured CPU configuration goes into component 0's board area, after
+/// the identity fields, as format 2 with the one-byte selector 3, the Hub mode
+/// bits, Config0 to Config3, the Hub and CPU MHz and three versions, the
+/// unknown ones as empty fields; the I/O board's area and the default record
+/// carry none. The layout is QEMU's (`l1_build_board_area`).
+#[test]
+fn the_node_board_record_carries_a_configured_cpu_configuration() {
+    let plain = L1::new(Default::default()).unwrap().record(0, 2).unwrap();
+    let cpu = CpuContext { mode_word: 0x589b_ad85, cpu_mhz: 700, hub_mhz: 200 };
+    let l1 = L1::new(L1Config { cpu_context: Some(cpu), ..Default::default() }).unwrap();
+    let area = l1.record(0, 2).unwrap();
+    assert_eq!(area.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
+    assert_eq!((area.len() % 8, usize::from(area[1]) * 8), (0, area.len()));
+    assert_eq!((plain[0], area[0]), (0, 2));
+    // The identity fields end with the two-character text field "00".
+    let identity = plain.windows(3).position(|w| w == [0xc2, b'0', b'0']).unwrap() + 3;
+    assert_eq!(&area[2..identity], &plain[2..identity], "the identity fields are unchanged");
+    let mut fields = vec![1, 3, 0, 4, 0x58, 0x9b, 0xad, 0x85, 0, 0, 0, 4, 0, 0, 0, 200, 4, 0, 0, 0x02, 0xbc, 0, 0, 0];
+    for _ in 0..3 {
+        fields.extend_from_slice(&[4, 0, 0, 0, 0]);
+    }
+    fields.push(0xc1);
+    assert_eq!(&area[identity..identity + fields.len()], fields);
+    assert_eq!(l1.record(1, 2), L1::new(Default::default()).unwrap().record(1, 2), "the I/O board's area");
+}
+
+/// A board that names its node board gets that identity in component 0's
+/// board area, empty fields included, and no I/O board record; with none
+/// named the Fuel's placeholder answers in both, as before.
+#[test]
+fn a_named_node_board_answers_in_component_0_alone() {
+    let ip53 = BoardIdentity { name: "IP53_4CPU", part: "030-1868-001", revision: "-C" };
+    let l1 = L1::new(L1Config { node_board: Some(ip53), ..Default::default() }).unwrap();
+    let area = l1.record(0, 2).unwrap();
+    assert_eq!(area.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
+    for text in [b"IP53_4CPU".as_slice(), b"030-1868-001", b"-C"] {
+        assert!(area.windows(text.len()).any(|x| x == text), "{}", String::from_utf8_lossy(text));
+    }
+    assert!(!area.windows(4).any(|x| x == b"IP34"));
+    assert_eq!(l1.record(1, 2), None, "no I/O board record");
+    assert_eq!(l1.record(1, 1), None);
+    let empty = BoardIdentity { name: "", part: "", revision: "" };
+    let area = L1::new(L1Config { node_board: Some(empty), ..Default::default() }).unwrap().record(0, 2).unwrap();
+    // SYNTHETIC, then an empty name, the serial, an empty part, the FRU file
+    // byte and an empty revision.
+    let at = area.windows(10).position(|x| x == b"\xc9SYNTHETIC").unwrap() + 10;
+    assert_eq!(&area[at..at + 11], b"\xc0\xc6EMUN00\xc0\x00\xc0");
+    let fuel = L1::new(Default::default()).unwrap();
+    assert_eq!(fuel.record(0, 2), L1::new(L1Config { node_board: None, ..Default::default() }).unwrap().record(0, 2));
+    assert!(fuel.record(1, 2).is_some());
+}
+
 /// A successful reply carrying one text field.
 fn text_reply(text: &str) -> Vec<u8> {
     let mut p = vec![0x30, 0, 0, 0, 0, 1];
