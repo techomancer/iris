@@ -58,6 +58,57 @@ struct TexSlot {
 @group(2) @binding(1) var<storage, read> tex_slots: array<TexSlot>;
 // log2(1 + i/256) in 1/256 (fixed::log2_q8's table), i in 0..256.
 @group(2) @binding(3) var<storage, read> log2_table: array<u32, 256>;
+// Board memory again (the buffer of binding 0) as plain words, for the
+// texel reads. Through vram's atomics every tap was an atomic load, which
+// skips the vector caches and goes to the L2. Nothing in a raster pass
+// writes the texture memory it samples (texture loads and copies flush the
+// batch first), so plain cached loads see the same words. Declared
+// read_write: one dispatch may not use a buffer as both read-only and
+// writable storage, but it may bind it writable twice.
+@group(2) @binding(4) var<storage, read_write> vram_texels: array<u32>;
+
+// vram_load and vram_load64 (vram.wgsl) through vram_texels.
+fn texel_word(a: u32) -> u32 {
+    return ((a >> 3u) & VRAM_WORD_MASK) * 2u;
+}
+
+fn texel_load(a: u32, n: u32) -> u32 {
+    let w = texel_word(a);
+    let shift = 64u - 8u * ((a & 7u) + n);
+    let m = vram_mask(n);
+    if shift >= 32u {
+        return (vram_texels[w + 1u] >> (shift - 32u)) & m;
+    }
+    let lo = vram_texels[w];
+    if shift + 8u * n <= 32u {
+        return (lo >> shift) & m;
+    }
+    let hi = vram_texels[w + 1u];
+    return ((lo >> shift) | (hi << (32u - shift))) & m;
+}
+
+fn texel_load64(a: u32, n: u32) -> vec2<u32> {
+    let w = texel_word(a);
+    let shift = 64u - 8u * ((a & 7u) + n);
+    let lo = vram_texels[w];
+    let hi = vram_texels[w + 1u];
+    var r: vec2<u32>;
+    if shift >= 32u {
+        r = vec2<u32>(hi >> (shift - 32u), 0u);
+    } else if shift == 0u {
+        r = vec2<u32>(lo, hi);
+    } else {
+        r = vec2<u32>((lo >> shift) | (hi << (32u - shift)), hi >> shift);
+    }
+    if n < 4u {
+        r = vec2<u32>(r.x & vram_mask(n), 0u);
+    } else if n == 4u {
+        r.y = 0u;
+    } else {
+        r.y &= vram_mask(n - 4u);
+    }
+    return r;
+}
 
 const TEX_LOD: u32 = 1u;
 const TEX_POST: u32 = 2u;
@@ -280,9 +331,9 @@ fn axis_tap(lv: TexLevel, axis: u32, x_in: i32, wrap: u32, border: bool) -> Tap 
 fn texel_at(lv: TexLevel, cls: u32, a: u32) -> vec4<u32> {
     var w: u32;
     if lv.bytes >= 8u {
-        w = word_of_lanes(vram_load64(a, 6u));
+        w = word_of_lanes(texel_load64(a, 6u));
     } else {
-        w = texel_unpack(vram_load(a, lv.bytes), lv.bytes, lv.field);
+        w = texel_unpack(texel_load(a, lv.bytes), lv.bytes, lv.field);
     }
     var c: vec4<u32>;
     for (var k = 0u; k < 4u; k++) {

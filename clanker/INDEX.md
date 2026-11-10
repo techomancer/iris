@@ -434,7 +434,7 @@ The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels 
 | Note | Kind | Title |
 |---|---|---|
 | [gpu-floats-are-not-the-hosts.md](wgpu/gpu-floats-are-not-the-hosts.md) | rule | GPU float division is not correctly rounded and products get fused: `div_exact` and the multiply-by-one guard before comparing with the CPU model (measured on RADV) |
-| [vram-accesses-are-atomic.md](wgpu/vram-accesses-are-atomic.md) | design | Board memory on the GPU is accessed with atomics, because two pixels can share a word |
+| [vram-accesses-are-atomic.md](wgpu/vram-accesses-are-atomic.md) | design | Board memory on the GPU is accessed with atomics, because two pixels can share a word; texel reads use a second plain binding (1%); what relaxed atomics compile to; never mix atomic and plain on one word |
 | [the-mirror-and-its-dirty-maps.md](wgpu/the-mirror-and-its-dirty-maps.md) | design | The GPU unit's board memory has a CPU mirror; dirty maps both ways keep them in step, and the front end must wait before it touches memory |
 | [read-storage-in-place.md](wgpu/read-storage-in-place.md) | rule | Read records, slots and tables from their buffers in place: a 4.8 KB struct copied by value gave silently wrong texels on RADV once the kernel grew |
 | [swaps-wait-on-stream-positions-not-fences.md](wgpu/swaps-wait-on-stream-positions-not-fences.md) | design | A swap latches once the GPU unit has submitted the stores before its arm (stream positions, no CPU wait); polled idle words could follow the same scheme (open, minor) |
