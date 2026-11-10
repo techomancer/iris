@@ -8,11 +8,19 @@
 //! The slot is decoded immediately and completes after one microsecond of
 //! machine time; no 1-wire part answers, so a reset pulse and a short write
 //! slot read back as presence-free and as a one. Permission registers retain
-//! guest writes, but the register path carries no requester identity, so it
-//! cannot enforce those permissions.
+//! guest writes, but the register path carries no requester identity except
+//! the calling CPU thread's, which only the scratch-1 rule uses, so it does
+//! not enforce those permissions.
 //!
 //! The plain register words sit in a sparse map keyed by offset, since the
 //! 0xc040-byte block holds only a few dozen of them.
+//!
+//! Scratch 1 orders the PROM's reset barrier ([`Barrier`]): a processor's
+//! first store after the block's reset that arrives once another
+//! processor's later store has landed does not land. That is a model rule
+//! with no hardware counterpart, standing in for processors that leave
+//! reset on one clock edge (inferred: the processors share the node's
+//! reset; no timing specification is retained).
 //!
 //! Ported from hw/misc/sgi-bedrock-lb.c in jamesbraid/qemu-sgi-origami.
 
@@ -22,7 +30,7 @@ use super::{Effect, NodeReset};
 use crate::dev::w1;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Length of the block-relative register aperture.
 pub(super) const SIZE: u64 = 0xc040;
@@ -60,6 +68,8 @@ pub mod reg {
 }
 
 const ID: u64 = (0x36 << 1) | (0x3012 << 12) | (2 << 28);
+/// Scratch 1 in the plain scratch window.
+const SCRATCH1: u64 = reg::PIO_WINDOW + 8;
 const VECTOR_MASK: u64 = 3 | (0x1fffff << 3) | (0xff << 32) | (0x7ff << 40);
 struct Regs {
     words: BTreeMap<u64, u64>,
@@ -68,13 +78,99 @@ struct Regs {
     region: u8,
     deadline: Option<u64>,
     sample: bool,
+    barrier: Barrier,
 }
 impl Default for Regs {
     fn default() -> Self {
         let mut words = BTreeMap::new();
         words.insert(reg::PIO_PERMISSION, !0);
         words.insert(reg::INBOUND_PERMISSION, !0);
-        Self { words, scratch: [0; 5], node: 0, region: 0, deadline: None, sample: true }
+        Self { words, scratch: [0; 5], node: 0, region: 0, deadline: None, sample: true, barrier: Barrier::default() }
+    }
+}
+
+/// The order of the processors' stores to scratch 1 since the block's last
+/// reset, for the PROM's reset barrier.
+///
+/// Every processor of a node clears scratch 1 on its reset path, then the
+/// boot master stores its release there and the others poll for it. On
+/// hardware every processor leaves reset on the same clock edge, so every
+/// clear lands before the release (inferred: the processors share the
+/// node's reset; no timing specification is retained). Here each processor is a host thread
+/// that can start or stall late, and a late clear would erase the release:
+/// the PROM then counts that processor as absent. So a processor's first
+/// store of the epoch that arrives after another processor's second or
+/// later store (the release) has landed does not land: it is ordered below
+/// the release, as it would have been on hardware. Until that processor
+/// stores again it reads the release, whatever has landed since: on
+/// hardware it would have polled the release long before the others'
+/// next stores (the four-processor PROM's come millions of instructions
+/// later).
+///
+/// Model rule, approximated: no hardware rule drops a store or answers one
+/// processor differently from another. It is a function of the store
+/// sequence alone (who stored, in what order), never of values or host
+/// time. An access no processor makes (a monitor, a test, a peer node)
+/// is plain storage and changes nothing here.
+///
+/// Limitations: an L1 soft reset restarts the processors without an LB
+/// reset, so a second PROM run in the same epoch gets no ordering. A
+/// processor that cleared on time but stalls until after the others' joins
+/// reads those, not the release. A peer node's store is plain storage, and
+/// a late local clear after it is dropped, keeping the peer's value. The
+/// requester is the calling thread's CPU number (`smp::on_cpu_thread`),
+/// not a field of the access.
+#[derive(Default)]
+struct Barrier {
+    /// Processors, by CPU number, that have stored this epoch.
+    stored: u64,
+    /// The first processor's second or later store this epoch: the release.
+    release: Option<u64>,
+    /// Processors whose only store this epoch was ordered below the release.
+    behind: u64,
+}
+
+/// What [`Barrier::store`] makes of one store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scratch1Store {
+    /// It lands.
+    Lands,
+    /// It lands, and is its processor's first after the release: the PROM's
+    /// presence join. Holds the processor's bit.
+    Joins(u64),
+    /// A first store after the release: it does not land, and its processor
+    /// reads the release until it stores again.
+    BelowRelease,
+}
+
+fn cpu_bit(cpu: Option<usize>) -> Option<u64> {
+    cpu.and_then(|c| 1u64.checked_shl(c as u32))
+}
+
+impl Barrier {
+    /// Order a store of `value` from `cpu`, or from no processor.
+    fn store(&mut self, cpu: Option<usize>, value: u64) -> Scratch1Store {
+        let Some(bit) = cpu_bit(cpu) else { return Scratch1Store::Lands };
+        if self.stored & bit == 0 {
+            self.stored |= bit;
+            if self.release.is_none() {
+                return Scratch1Store::Lands;
+            }
+            self.behind |= bit;
+            return Scratch1Store::BelowRelease;
+        }
+        self.behind &= !bit;
+        if self.release.is_some() {
+            return Scratch1Store::Joins(bit);
+        }
+        self.release = Some(value);
+        Scratch1Store::Lands
+    }
+
+    /// What a read from `cpu` sees, if not the register: the release, for a
+    /// processor still behind it.
+    fn read(&self, cpu: Option<usize>) -> Option<u64> {
+        cpu_bit(cpu).filter(|bit| self.behind & bit != 0).and(self.release)
     }
 }
 impl Regs {
@@ -85,11 +181,20 @@ impl Regs {
 
 pub(super) struct Lb {
     regs: Mutex<Regs>,
+    /// Processors, by CPU number, whose presence join on scratch 1 has
+    /// landed since the block's last reset ([`Scratch1Store::Joins`]).
+    /// Written under the block's lock, read without it.
+    joined: AtomicU64,
 }
 
 impl Lb {
     pub(super) fn new() -> Self {
-        Self { regs: Mutex::new(Regs::default()) }
+        Self { regs: Mutex::new(Regs::default()), joined: AtomicU64::new(0) }
+    }
+    /// Whether processor `cpu`'s presence join on scratch 1 has landed since
+    /// the block's last reset. One atomic load.
+    pub(super) fn scratch1_joined(&self, cpu: usize) -> bool {
+        cpu_bit(Some(cpu)).is_some_and(|bit| self.joined.load(Ordering::Acquire) & bit != 0)
     }
     pub(super) fn locked(&self) -> bool {
         self.regs.is_locked()
@@ -117,23 +222,27 @@ impl Lb {
         })
     }
     /// The block's reset, under its lock: the scratch words 1 and 2 and the
-    /// error status survive it. The node number returns to 0.
-    fn reset(r: &mut Regs, node: &AtomicU8) {
+    /// error status survive it. The node number returns to 0, and the reset
+    /// barrier starts a new epoch.
+    fn reset(&self, r: &mut Regs, node: &AtomicU8) {
         let survivors = [r.scratch[1], r.scratch[2], r.words.get(&reg::ERROR_STATUS).copied().unwrap_or(0)];
         *r = Regs::default();
+        self.joined.store(0, Ordering::Release);
         r.scratch[1] = survivors[0];
         r.scratch[2] = survivors[1];
         r.words.insert(reg::ERROR_STATUS, survivors[2]);
         node.store(0, Ordering::Release);
     }
     pub(super) fn power_on(&self, node: &AtomicU8) {
-        Self::reset(&mut self.regs.lock(), node);
+        self.reset(&mut self.regs.lock(), node);
     }
-    pub(super) fn read(&self, a: u64, now: u64) -> u64 {
+    /// A doubleword read at `a` by processor `requester`, or by none.
+    pub(super) fn read(&self, a: u64, now: u64, requester: Option<usize>) -> u64 {
         let mut r = self.regs.lock();
         Self::complete(&mut r, now);
         match a {
             reg::NODE_REGION => ID | ((r.node as u64) << 32) | ((r.region as u64) << 46),
+            SCRATCH1 => r.barrier.read(requester).unwrap_or(r.scratch[1]),
             reg::PIO_WINDOW..=reg::PIO_WINDOW_END => r.scratch[(a - reg::PIO_WINDOW) as usize / 8],
             reg::ATOMIC_READ0 | reg::ATOMIC_READ1 => {
                 let n = 3 + (a - reg::ATOMIC_READ0) as usize / 8;
@@ -150,11 +259,11 @@ impl Lb {
             }
         }
     }
-    /// A doubleword store at `a`. The error level reaches `levels` and the
-    /// node number `node` under the block's lock, so concurrent stores
-    /// publish in register order. A soft reset resets the block and asks
-    /// for the node's.
-    pub(super) fn write(&self, a: u64, v: u64, now: u64, levels: &Levels, node: &AtomicU8) -> Effect {
+    /// A doubleword store at `a` by processor `requester`, or by none. The
+    /// error level reaches `levels` and the node number `node` under the
+    /// block's lock, so concurrent stores publish in register order. A soft
+    /// reset resets the block and asks for the node's.
+    pub(super) fn write(&self, a: u64, v: u64, now: u64, requester: Option<usize>, levels: &Levels, node: &AtomicU8) -> Effect {
         let mut r = self.regs.lock();
         Self::complete(&mut r, now);
         match a {
@@ -166,6 +275,18 @@ impl Lb {
                     r.node = (v >> 32) as u8;
                     r.region = region;
                     node.store(r.node, Ordering::Release);
+                }
+            }
+            SCRATCH1 => {
+                let order = r.barrier.store(requester, v);
+                crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock LB scratch 1 store {v:#x} from CPU {requester:?}: {order:?}");
+                match order {
+                    Scratch1Store::BelowRelease => {}
+                    Scratch1Store::Lands => r.scratch[1] = v,
+                    Scratch1Store::Joins(bit) => {
+                        r.scratch[1] = v;
+                        self.joined.fetch_or(bit, Ordering::Release);
+                    }
                 }
             }
             reg::PIO_WINDOW..=reg::PIO_WINDOW_END => {
@@ -185,7 +306,7 @@ impl Lb {
             }
             reg::SOFT_RESET => {
                 if v & 1 != 0 {
-                    Self::reset(&mut r, node);
+                    self.reset(&mut r, node);
                     return Effect::Reset(NodeReset::LocalBlock);
                 }
             }
@@ -307,6 +428,177 @@ mod tests {
         rig.set_time(3000);
         assert_eq!(rig.r(LB_BASE + reg::MICRO_LAN), 0);
     }
+    const RELEASE: u64 = 0x07f8_0000;
+    /// The PROM's flags word that follows the joins.
+    const FLAGS: u64 = 0x6000_0000_0000_0000;
+    const SCRATCH1_AT: u64 = LB_BASE + SCRATCH1;
+
+    /// Run `f` on a thread that is processor `cpu`.
+    fn as_cpu<T: Send + 'static>(cpu: u8, f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            crate::cpu::smp::set_current_cpu(cpu);
+            f()
+        })
+        .join()
+        .unwrap()
+    }
+    fn store_as(rig: &Rig, cpu: u8, value: u64) {
+        let regs = rig.regs.clone();
+        assert_eq!(as_cpu(cpu, move || regs.write64(SCRATCH1_AT, value)), crate::traits::BUS_OK);
+    }
+    fn read_as(rig: &Rig, cpu: u8) -> u64 {
+        let regs = rig.regs.clone();
+        as_cpu(cpu, move || regs.read64(SCRATCH1_AT).data)
+    }
+    /// Scratch 1 as a reader that is no processor sees it.
+    fn scratch1(rig: &Rig) -> u64 {
+        rig.r(SCRATCH1_AT)
+    }
+    fn joined(rig: &Rig, cpu: usize) -> bool {
+        rig.chip.scratch1_joined(cpu)
+    }
+
+    /// A processor's reset-path clear that arrives after the master's
+    /// release does not erase it, and that processor's next store joins.
+    #[test]
+    fn a_late_clear_lands_below_the_release() {
+        let rig = Rig::new();
+        store_as(&rig, 0, 0);
+        store_as(&rig, 0, RELEASE);
+        store_as(&rig, 1, 0);
+        assert_eq!(scratch1(&rig), RELEASE, "the late clear did not land");
+        assert_eq!(read_as(&rig, 1), RELEASE);
+        assert!(!joined(&rig, 1));
+        store_as(&rig, 1, 0x101);
+        assert_eq!(scratch1(&rig), 0x101);
+        assert!(joined(&rig, 1) && !joined(&rig, 0));
+    }
+
+    /// A processor whose clear came after the release reads the release
+    /// until it stores again, even once another processor's next store has
+    /// replaced it; everyone else reads the register.
+    #[test]
+    fn a_late_processor_reads_the_release_until_it_stores_again() {
+        let rig = Rig::new();
+        store_as(&rig, 0, 0);
+        store_as(&rig, 1, 0);
+        store_as(&rig, 0, RELEASE);
+        store_as(&rig, 2, 0);
+        store_as(&rig, 1, 0);
+        assert_eq!(read_as(&rig, 2), RELEASE, "CPU 2 is still behind the release");
+        assert_eq!((read_as(&rig, 1), read_as(&rig, 0), scratch1(&rig)), (0, 0, 0));
+        store_as(&rig, 2, 0x102);
+        assert_eq!(read_as(&rig, 2), 0x102);
+        assert!(joined(&rig, 2));
+    }
+
+    /// Clears that come before the release land, the release lands over
+    /// them, and the release itself is no join.
+    #[test]
+    fn a_release_after_every_clear_lands() {
+        let rig = Rig::new();
+        for cpu in 0..4 {
+            store_as(&rig, cpu, 0x55);
+            assert_eq!(scratch1(&rig), 0x55);
+        }
+        store_as(&rig, 0, RELEASE);
+        assert_eq!(scratch1(&rig), RELEASE);
+        assert!((0..4).all(|c| !joined(&rig, c)));
+        for cpu in 0..4u8 {
+            store_as(&rig, cpu, 0x100 + u64::from(cpu));
+            assert_eq!(scratch1(&rig), 0x100 + u64::from(cpu));
+            assert!(joined(&rig, usize::from(cpu)));
+        }
+    }
+
+    /// The block's reset, at power-on or from its soft-reset bit, starts a
+    /// new epoch: every processor's next store is a first store again, and
+    /// the joins are forgotten.
+    #[test]
+    fn each_block_reset_starts_a_new_barrier() {
+        let rig = Rig::new();
+        let epoch = |late: u8| {
+            store_as(&rig, 1 - late, 0);
+            assert_eq!(scratch1(&rig), 0, "a first store");
+            store_as(&rig, 1 - late, RELEASE);
+            store_as(&rig, late, 0);
+            assert_eq!(scratch1(&rig), RELEASE);
+            store_as(&rig, late, 0x100);
+            assert!(joined(&rig, usize::from(late)));
+        };
+        epoch(1);
+        rig.chip.lb.power_on(&rig.chip.node);
+        assert!(!joined(&rig, 1));
+        assert_eq!(scratch1(&rig), 0x100, "scratch 1 survives the reset");
+        epoch(0);
+        rig.w(LB_BASE + reg::SOFT_RESET, 1);
+        assert!(!joined(&rig, 0));
+        epoch(1);
+    }
+
+    /// Stores no processor makes (a monitor, a test, a peer node's vector
+    /// write) always land and move nothing.
+    #[test]
+    fn a_store_from_no_processor_always_lands() {
+        let rig = Rig::new();
+        for value in [RELEASE, 0, RELEASE, 0] {
+            rig.w(SCRATCH1_AT, value);
+            assert_eq!(scratch1(&rig), value);
+        }
+        store_as(&rig, 1, 0);
+        assert_eq!(scratch1(&rig), 0, "no release has landed from a processor");
+    }
+
+    /// (CPU, value stored, scratch 1 after) for the four-processor PROM's
+    /// stores to scratch 1 up to its flags word, in the order a Tezro boot
+    /// with every processor on time logged them reaching the LB: four
+    /// clears, CPU 0's release, each processor's join (a store of 0), then
+    /// each processor's flags word.
+    const ON_TIME_PROM_SEQUENCE: &[(u8, u64, u64)] = &[
+        (0, 0, 0), (1, 0, 0), (3, 0, 0), (2, 0, 0),
+        (0, RELEASE, RELEASE),
+        (1, 0, 0), (0, 0, 0), (2, 0, 0), (3, 0, 0),
+        (3, FLAGS, FLAGS), (2, FLAGS, FLAGS), (1, FLAGS, FLAGS), (0, FLAGS, FLAGS),
+    ];
+
+    /// With every processor on time the rule changes nothing.
+    #[test]
+    fn the_on_time_prom_sequence_is_plain_storage() {
+        let rig = Rig::new();
+        for &(cpu, value, after) in ON_TIME_PROM_SEQUENCE {
+            store_as(&rig, cpu, value);
+            assert_eq!(scratch1(&rig), after, "CPU {cpu} storing {value:#x}");
+        }
+        assert!((0..4).all(|c| joined(&rig, c)));
+    }
+
+    /// The same, from a four-processor Tezro boot in which CPUs 2 and 3
+    /// cleared after CPU 0's release (and CPU 1 joined before either had
+    /// stored again).
+    const LATE_PROM_SEQUENCE: &[(u8, u64, u64)] = &[
+        (1, 0, 0), (0, 0, 0),
+        (0, RELEASE, RELEASE),
+        (2, 0, RELEASE), (3, 0, RELEASE),
+        (1, 0, 0), (2, 0, 0), (3, 0, 0), (0, 0, 0),
+        (2, FLAGS, FLAGS), (0, FLAGS, FLAGS), (3, FLAGS, FLAGS), (1, FLAGS, FLAGS),
+    ];
+
+    /// Replayed, the late clears do not erase the release, and the late
+    /// processors read the release until their joins even after CPU 1's
+    /// join has replaced it.
+    #[test]
+    fn the_logged_late_prom_sequence_keeps_the_release() {
+        let rig = Rig::new();
+        for (i, &(cpu, value, after)) in LATE_PROM_SEQUENCE.iter().enumerate() {
+            store_as(&rig, cpu, value);
+            assert_eq!(scratch1(&rig), after, "store {i}: CPU {cpu} storing {value:#x}");
+            if i == 5 {
+                assert_eq!((read_as(&rig, 2), read_as(&rig, 3)), (RELEASE, RELEASE));
+            }
+        }
+        assert!((0..4).all(|c| joined(&rig, c)));
+    }
+
     /// The soft-reset bit resets the block, as a power-on does, and asks the
     /// board for a node reset once; the other bits do neither.
     #[test]
