@@ -58,10 +58,10 @@ on:
     paths: *suite_paths
   workflow_dispatch:
 
-# One run per workflow per pull request: a new push cancels the runs it
-# replaces. Pushes to main are never cancelled.
+# One run per pull request; a new push cancels the run it replaces. Main
+# pushes are never cancelled and get a group per commit, so none queues.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -71,6 +71,7 @@ jobs:
   guests:
     name: Build the guest binaries
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -125,6 +126,7 @@ jobs:
   host-baseline:
     name: Host baseline
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - name: Build and run
@@ -145,6 +147,7 @@ jobs:
   embedded:
     name: Embedded runner
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - name: Install build dependencies
@@ -160,6 +163,7 @@ jobs:
     name: ${{ matrix.engine }}
     needs: guests
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -246,6 +250,7 @@ jobs:
     needs: suites
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       # iris-bench links libasound at run time.
