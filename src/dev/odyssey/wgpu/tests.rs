@@ -113,6 +113,19 @@ impl Pair {
         DestMem::of(self.cpu.ptr(), &self.dv)
     }
 
+    /// The depth plane at its far value in both memories. The random
+    /// memory holds depths about half as far as the test triangles' (near
+    /// 0.97), so under GL_LESS or GL_LEQUAL nothing at all was drawn.
+    fn clear_depth(&mut self) {
+        let planes = self.planes();
+        for y in 0..GRID as i32 {
+            for x in 0..GRID as i32 {
+                planes.depth.store_word(x, y, ODSY_DEPTH24_MAX);
+            }
+        }
+        self.gpu.write_words(0, self.cpu.words_mut());
+    }
+
     /// A raster state over the destination: the clip list, no scissor
     /// beyond the plane, the pipeline's 32-bit depth, no pre-test.
     fn raster_state(&mut self, words: &RasterWords, depth_range: [f64; 2]) -> RasterState {
@@ -513,6 +526,7 @@ fn flat_triangles_store_as_the_cpu_pipeline() {
     let Some(gpu) = gpu() else { return };
     let mut rng = Lcg(1);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
+    p.clear_depth();
     let d = DrawState::plain().depth(1);
     for &size in &[6, 40, 300, 3000] {
         let t = tris(&mut rng, &mut p, false, 150, size);
@@ -528,6 +542,7 @@ fn smooth_triangles_and_the_alpha_test() {
     let Some(gpu) = gpu() else { return };
     let mut rng = Lcg(2);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
+    p.clear_depth();
     for round in 0..6 {
         let mut d = DrawState::plain().depth(3);
         if round % 2 == 1 {
@@ -563,6 +578,7 @@ fn polygon_stipples_with_and_without_a_background() {
     let Some(gpu) = gpu() else { return };
     let mut rng = Lcg(4);
     let mut p = Pair::new(&gpu, &mut rng, &RGBA_MODE);
+    p.clear_depth();
     for round in 0..4 {
         let mut d = DrawState::plain().depth(1);
         d.shade.stipple = Some(std::array::from_fn(|_| rng.next()));
