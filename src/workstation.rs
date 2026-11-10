@@ -39,6 +39,9 @@ use crate::traits::{Device, MachineEvent};
 /// a thread with a large one, as `main.rs` and iris-gui do.
 pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
     crate::machine::set_emulator_profile(cfg.machine.profile);
+    if let Some(line) = host_id_line(&cfg) {
+        eprintln!("iris: {line}");
+    }
     match cfg.machine.profile {
         crate::config::MachineProfile::FuelIp34 => Ok(Box::new(crate::ip34_machine::FuelMachine::new(&cfg)?)),
         crate::config::MachineProfile::TezroIp53 => Ok(Box::new(crate::ip53_machine::TezroMachine::new(&cfg)?)),
@@ -51,6 +54,32 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
         crate::config::MachineProfile::Onyx2Ip27 => Ok(Box::new(crate::ip27_onyx2::Onyx2Machine::new(&cfg)?)),
         _ => Ok(Box::new(Machine::new(cfg))),
     }
+}
+
+/// The line a machine that takes `[machine] emu_id` prints at start-up: the
+/// host id its guest will print, and where it comes from. `None` for other
+/// machines, and for a configuration the machine itself will refuse.
+fn host_id_line(cfg: &MachineConfig) -> Option<String> {
+    use crate::identity::hostid_from_text;
+    match cfg.machine.profile {
+        crate::config::MachineProfile::TezroIp53 if cfg.validate().is_ok() => {
+            let serial = cfg.tezro_system_serial();
+            Some(format!("host id {:08x} (system serial {serial})", hostid_from_text(&serial)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_tezro_says_which_host_id_its_guest_will_print() {
+    let cfg = |text: &str| -> MachineConfig { toml::from_str(text).unwrap() };
+    let tezro = cfg("[machine]\nprofile = \"tezro_ip53\"\nemu_id = 42\n");
+    assert_eq!(host_id_line(&tezro).as_deref(), Some("host id d5200420 (system serial LEMU200420)"));
+    let tezro = cfg("[machine]\nprofile = \"tezro_ip53\"\n");
+    assert_eq!(host_id_line(&tezro).as_deref(), Some("host id d5200000 (system serial LEMU200000)"));
+    assert_eq!(host_id_line(&cfg("[machine]\nprofile = \"tezro_ip53\"\nemu_id = 4096\n")), None);
+    assert_eq!(host_id_line(&cfg("[machine]\nprofile = \"indy_ip24\"\n")), None);
 }
 
 /// An emulated machine as the front ends see it. See the module header.

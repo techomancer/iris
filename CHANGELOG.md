@@ -556,6 +556,7 @@ where they differed:
 - A Tezro refuses a `banks` list whose two banks of a pair differ in size: Bedrock keeps one size code for each pair.
 - The Tezro's BCM5701 reports PCI revision 0x15 and has the chip's capability list with vital product data reads, so IRIX's driver no longer waits out its VPD poll at every attach.
 - The Tezro's PIC fails a configuration read of an empty slot as a master timeout, so the PROM no longer records two phantom devices per empty slot.
+- `[machine] emu_id` (0 to 4095) gives a Tezro its own host id: the L1 answers the system serial request with `LEMU2<emu_id>0`, IRIX's `sysinfo -s` and `lmhostid` print its fold (`d5200420` for emu_id 42), and iris prints both at start-up. The board serial stays `EMUN00`, so the PROM keeps its NVRAM across an emu_id change.
 
 ### `IRIS_GUI_GL` works in iris-gui
 

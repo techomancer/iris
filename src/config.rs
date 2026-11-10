@@ -454,7 +454,8 @@ pub struct NetworkSection {
     pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
     /// Ethernet station address for the built-in SEEQ controller (`ec0`), e.g.
     /// "08:00:69:12:34:56" (SGI's registered OUI). Defaults to
-    /// `08:00:69:12:34:56` when unset. Real hardware has no way to leave this
+    /// `08:00:69:12:34:56` when unset, or on a machine that takes
+    /// `[machine] emu_id` to the address that gives. Real hardware has no way to leave this
     /// unset — every SGI ships with a MAC burned into NVRAM (Indy) or a serial
     /// EEPROM (Indigo2) — so iris backdoor-injects it into the emulated
     /// NVRAM/EEPROM before boot rather than requiring a guest-side `setenv`.
@@ -1222,6 +1223,16 @@ pub struct MachineSection {
     /// Tezro.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u8>,
+    /// Mints the machine's system id (what `sysinfo -s` and `lmhostid`
+    /// print) in iris's own layout: 0 to 4095, 0 the default and a plainly
+    /// generic id. Machines with different ids can hold node-locked licenses
+    /// side by side. Only the Tezro takes it. See [`crate::identity`].
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub emu_id: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl MachineSection {
@@ -1238,7 +1249,7 @@ impl MachineSection {
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: None, cache: CacheModel::default(), cpus: None }
+        Self { profile: MachineProfile::default(), cpu: None, cache: CacheModel::default(), cpus: None, emu_id: 0 }
     }
 }
 
@@ -3040,6 +3051,13 @@ impl MachineConfig {
         if let Some(ref mac) = self.network.mac {
             parse_mac(mac).map_err(|e| format!("network.mac: {}", e))?;
         }
+        let emu_id = self.machine.emu_id;
+        if emu_id > crate::identity::EMU_ID_MAX {
+            return Err(format!("machine identity: emu_id must be 0 to {}, not {emu_id}", crate::identity::EMU_ID_MAX));
+        }
+        if emu_id != 0 && self.machine.profile != MachineProfile::TezroIp53 {
+            return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Tezro takes it"));
+        }
         for (id, dev) in &self.scsi {
             // A CD-ROM may legitimately start with an empty tray (no path, no
             // discs) and have media loaded at runtime; any discs list is valid
@@ -3135,6 +3153,25 @@ impl MachineConfig {
         }
     }
 
+    /// The station address when `[network] mac` is unset: the address
+    /// `[machine] emu_id` gives on a machine that takes it, else
+    /// [`DEFAULT_MAC`], which is also what emu_id 0 keeps.
+    fn default_station_mac(&self) -> [u8; 6] {
+        use crate::identity::{default_mac, KIND};
+        match self.machine.profile {
+            MachineProfile::TezroIp53 if self.machine.emu_id != 0 => {
+                default_mac(KIND, self.machine.emu_id, 0).expect("node 0 always fits the default address")
+            }
+            _ => DEFAULT_MAC,
+        }
+    }
+
+    /// The system serial a Tezro's L1 answers with, the text its IRIX folds
+    /// into the host id: `LEMU`, iris's kind and `[machine] emu_id`.
+    pub fn tezro_system_serial(&self) -> String {
+        crate::identity::system_serial(crate::identity::KIND, self.machine.emu_id)
+    }
+
     /// Extract network-related settings into a `NetworkConfig`.
     /// Parses `nat_subnet` from CIDR — safe to unwrap because `validate()` already accepted it.
     pub fn network(&self) -> NetworkConfig {
@@ -3145,7 +3182,7 @@ impl MachineConfig {
         });
         let mac = self.network.mac.as_deref()
             .map(|s| parse_mac(s).expect("network.mac: validate() should have caught this"))
-            .unwrap_or(DEFAULT_MAC);
+            .unwrap_or_else(|| self.default_station_mac());
         NetworkConfig {
             nfs:          self.nfs.clone(),
             port_forward: self.port_forward.clone(),
@@ -4657,6 +4694,55 @@ mod fuel_input_tests {
     /// The Fuel's processor is fixed, so `machine.cpu` may only name it (or the
     /// family, as the key did before the R14000 had a name); the default
     /// `r4400` is refused rather than silently ignored.
+    fn identity_cfg(profile: &str, extra: &str) -> MachineConfig {
+        toml::from_str(&format!("[machine]\nprofile = \"{profile}\"\n{extra}")).expect("parse")
+    }
+
+    /// The Tezro's id is the fold of the system serial its L1 answers with,
+    /// LEMU, the kind, the emu_id and 0; the station address follows the
+    /// emu_id unless `[network] mac` names one, and is never the id.
+    #[test]
+    fn the_tezro_takes_its_id_from_the_l1_system_serial() {
+        use crate::identity::hostid_from_text;
+        let cfg = identity_cfg("tezro_ip53", "");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.tezro_system_serial(), "LEMU200000");
+        assert_eq!(hostid_from_text(&cfg.tezro_system_serial()), 0xd520_0000);
+        assert_eq!(cfg.network().mac, DEFAULT_MAC);
+        let cfg = identity_cfg("tezro_ip53", "emu_id = 42\n");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.tezro_system_serial(), "LEMU200420");
+        assert_eq!(hostid_from_text(&cfg.tezro_system_serial()), 0xd520_0420);
+        assert_eq!(cfg.network().mac, [0x08, 0x00, 0x69, 0xe2, 0x02, 0xa0]);
+        let mut cfg = identity_cfg("tezro_ip53", "emu_id = 42\n");
+        cfg.network.mac = Some("08:00:69:aa:bb:cc".into());
+        assert_eq!(hostid_from_text(&cfg.tezro_system_serial()), 0xd520_0420);
+        assert_eq!(cfg.network().mac, [0x08, 0x00, 0x69, 0xaa, 0xbb, 0xcc]);
+        identity_cfg("tezro_ip53", "emu_id = 4095\n").validate().unwrap();
+        let e = identity_cfg("tezro_ip53", "emu_id = 4096\n").validate().unwrap_err();
+        assert!(e.contains("emu_id must be 0 to 4095, not 4096"), "{e}");
+    }
+
+    /// A machine that does not take emu_id refuses one rather than ignoring
+    /// it, and keeps the station address it had.
+    #[test]
+    fn emu_id_is_refused_where_it_sets_nothing() {
+        let e = identity_cfg("octane_ip30", "emu_id = 7\n").validate().unwrap_err();
+        assert!(e.contains("emu_id = 7 is not taken by this machine"), "{e}");
+        let cfg = identity_cfg("octane_ip30", "emu_id = 0\n");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.network().mac, DEFAULT_MAC);
+    }
+
+    #[test]
+    fn emu_id_round_trips_and_stays_out_of_a_default_file() {
+        let cfg = identity_cfg("tezro_ip53", "emu_id = 7\n");
+        let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back.machine.emu_id, 7);
+        let plain = toml::to_string_pretty(&MachineConfig::default()).unwrap();
+        assert!(!plain.contains("emu_id"), "{plain}");
+    }
+
     /// The L1 identity keys parse, validate and round trip; unset they are
     /// left out of a written config.
     #[test]
