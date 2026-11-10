@@ -197,6 +197,7 @@ pub struct KonaBackend {
     /// What the texture commands did.
     tex_counts: gl::texture::TexCounts,
     pix_counts: gl::pixels::Counts,
+    query_counts: gl::query::Counts,
     /// Test hooks: a back end test double that may answer a job.
     #[cfg(test)]
     pub(super) hook: Option<TestHook>,
@@ -258,6 +259,7 @@ impl KonaBackend {
             channels: display::channels::Channels::new(cfg.rm_count),
             tex_counts: Default::default(),
             pix_counts: Default::default(),
+            query_counts: Default::default(),
             #[cfg(test)]
             hook: None,
             gl: gl::GlPath::new(cfg.managed),
@@ -457,6 +459,7 @@ impl KonaBackend {
             writeln!(w, "last layout       colour {:?} depth {:?} stencil {:?} multisample {:?} accumulation {:?}", l.colour, l.depth, l.stencil, l.multisample, l.accumulation)?;
         }
         writeln!(w, "pixel operations  {}", self.pix_counts.render())?;
+        writeln!(w, "queries           {}", self.query_counts.render())?;
         for (s, n) in &g.unmodelled {
             writeln!(w, "not taken         {s:#x} x {n}")?;
         }
@@ -525,6 +528,7 @@ impl KonaBackend {
         self.sync_blank();
         self.tex_counts = Default::default();
         self.pix_counts = Default::default();
+        self.query_counts = Default::default();
         #[cfg(test)]
         let census = self.gl.census;
         self.gl = gl::GlPath::new(self.cfg.managed);
@@ -1105,6 +1109,39 @@ impl KonaBackend {
             Job::Command { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, .. } => return self.texel_draw(port, args),
             Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, words } => self.texel_words(port, args, words),
             Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args, .. } => self.texel_read(port, args),
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::query::is_query(selector) => {
+                let c = self.contexts.select(port.context());
+                let words = gl::query::answer(&mut c.gl, &mut self.query_counts, selector, args);
+                // The reply: the count at byte 4, the words from byte 8, then the completion word.
+                if port.context().is_some() && port.return_page_valid() {
+                    port.post_return(4, &gl::query::reply_bytes(&words));
+                } else {
+                    self.query_counts.unposted += 1;
+                }
+            }
+            // A push-attributes token is a bracketed read-back whatever its mask: the client waits for the
+            // completion word after every one.
+            Job::Command { grammar: Grammar::Gl, selector: PUSH_ATTRIBUTE_STACK, args, .. } => {
+                let c = self.contexts.select(port.context());
+                let words = gl::query::push_attributes(&mut c.gl, &mut self.query_counts, args.first().copied().unwrap_or(0));
+                if port.context().is_some() && port.return_page_valid() {
+                    port.post_return(4, &gl::query::reply_bytes(&words));
+                } else {
+                    self.query_counts.unposted += 1;
+                }
+            }
+            Job::Command { grammar: Grammar::Gl, selector: POP_ATTRIBUTE_STACK, .. } => {
+                let c = self.contexts.select(port.context());
+                gl::query::pop_attributes(&mut c.gl, &mut self.query_counts);
+            }
+            // The restart (token 0x1bc) reprograms the output DMA from the saved start words while a feed is active.
+            // The client sends it when it registers the instruments buffer again, which the model does not
+            // keep; the select and feedback passes here have no DMA channel to reprogram, so it changes nothing.
+            Job::Command { grammar: Grammar::Gl, selector: RESTART_SELECT_OR_FEEDBACK, .. } => {}
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::query::is_mode(selector) => {
+                let c = self.contexts.select(port.context());
+                gl::query::mode_command(&mut c.gl, &mut self.query_counts, selector, args);
+            }
             Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::pixels::is_state(selector) || gl::pixels::is_plane(selector) => return self.pixel_command(port, selector, args),
             Job::Data { grammar: Grammar::Gl, selector, args, words } if gl::pixels::is_data(selector) => self.pixel_data(port, selector, args, words),
             Job::Data { grammar: Grammar::Gl, selector: LOAD_ONE_ENTRY_OF_ARM_TEXTURE_TABLE, args: &[slot], words } => {
@@ -1188,6 +1225,32 @@ impl KonaBackend {
                 match selector {
                     START_SELECT_FEEDBACK_RETURN_DMA => {
                         x.feed_start(args, port.context().is_some());
+                        if let (Some(&bytes), true) = (args.get(2), port.context().is_some()) {
+                            c.gl.feed.start(bytes);
+                        }
+                    }
+                    // A bracket opened in a select or feedback mode takes the pass's records; the client
+                    // switches the mode before it finishes the one it leaves.
+                    FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE if c.gl.feed.bracket => {
+                        let echo = args.get(1).copied().unwrap_or(0);
+                        let (words, overflow) = c.gl.feed.take();
+                        let buffer = x.feed_buffer();
+                        self.query_counts.overflows += overflow as u64;
+                        self.query_counts.feedback_values += words.len() as u64;
+                        let mut remaining = buffer.map_or(0, |b| b.3);
+                        if let Some((io, pitch, line, total)) = buffer {
+                            let mut data: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+                            data.truncate(total);
+                            let done = x::pixel::FeedDone { io, pitch, line, data, echo };
+                            if write_lines(port, &done) {
+                                remaining = total - done.data.len();
+                            } else {
+                                crate::dlog!(crate::devlog::LogModule::Kona, "kona: select or feedback buffer not written");
+                            }
+                        }
+                        if port.reason_page_valid() {
+                            port.post_reason_words(FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE, &[0x100, echo, remaining as u32, if overflow { gl::query::OVERFLOW_BIT } else { 0 }]);
+                        }
                     }
                     FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE => {
                         if let Some(done) = x.feed_finish(args) {
@@ -1853,6 +1916,49 @@ mod tests {
         one[1..3].copy_from_slice(&[2, 1]);
         read_texels(&mut b, &mut r, &one);
         assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 2), [0x10, 0x80]);
+    }
+
+    /// A push-attributes token is answered whatever its mask: the pipe's handler opens and closes the
+    /// read-back on every path, so the completion word is set last and the count word is zero. A
+    /// push onto a full stack is answered as well (and sets the overflow error); a pop and a bare
+    /// light-state step (0x10b) post nothing.
+    #[test]
+    fn a_push_of_attributes_posts_its_completion_on_every_path() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        let gl_token = |b: &mut KonaBackend, r: &mut Rig, selector: u32, args: &[u32]| {
+            r.send(b, Job::Command { grammar: Grammar::Gl, selector, args, packed: 0, handled: false });
+        };
+        let words = |r: &Rig| (r.ram.word(RETURN_PAGE), r.ram.bytes(RETURN_PAGE + 4, 4));
+        // The list bit alone: nothing is read back, and the client still waits.
+        gl_token(&mut b, &mut r, PUSH_ATTRIBUTE_STACK, &[0x20000]);
+        assert_eq!(words(&r), (1, vec![0; 4]));
+        // A mask with a bit the pipe reads back is answered too, with no data, and counted.
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        gl_token(&mut b, &mut r, PUSH_ATTRIBUTE_STACK, &[0x8]);
+        assert_eq!(words(&r), (1, vec![0; 4]));
+        assert_eq!((b.query_counts.pushes, b.query_counts.pushes_unread), (2, 1));
+        // Fill the stack to 16 entries; the push onto the full stack still completes.
+        for _ in 0..14 {
+            gl_token(&mut b, &mut r, PUSH_ATTRIBUTE_STACK, &[0x20000]);
+        }
+        assert_eq!(b.contexts.select(Some(0)).gl.attrib_depth, 16);
+        assert_eq!(b.contexts.select(Some(0)).gl.error, 0);
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        gl_token(&mut b, &mut r, PUSH_ATTRIBUTE_STACK, &[0x20000]);
+        assert_eq!(r.ram.word(RETURN_PAGE), 1, "a push onto a full stack completes");
+        assert_eq!((b.contexts.select(Some(0)).gl.attrib_depth, b.contexts.select(Some(0)).gl.error, b.query_counts.pushes_full), (16, 0x503, 1));
+        // A pop posts nothing and frees an entry.
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        gl_token(&mut b, &mut r, POP_ATTRIBUTE_STACK, &[0]);
+        assert_eq!(r.ram.word(RETURN_PAGE), 0);
+        assert_eq!(b.contexts.select(Some(0)).gl.attrib_depth, 15);
+        // The light-state step posts no completion of its own.
+        gl_token(&mut b, &mut r, SAVE_LIGHT_ATTRIBUTES_ON_ENGINE_ATTRIBUTE_STACK, &[0]);
+        assert_eq!(r.ram.word(RETURN_PAGE), 0);
+        // With no return page the completion is dropped and counted.
+        r.core.return_page = None;
+        gl_token(&mut b, &mut r, PUSH_ATTRIBUTE_STACK, &[0x20000]);
+        assert_eq!(b.query_counts.unposted, 1);
     }
 
     /// A bare read whose image would not fit the page is not built: only the completion word is posted, the
@@ -2995,6 +3101,79 @@ mod tests {
     }
 
     // ---- Queries, select and feedback ----
+
+    /// A feedback pass takes what survives clipping and culling as GL's records and draws nothing; a
+    /// pass-through marker is a record of its own; a culled polygon is not fed back.
+    #[test]
+    fn a_feedback_pass_collects_records_and_draws_nothing() {
+        use crate::dev::kona::back::gl::query::*;
+        let mut b = gl_window();
+        b.contexts.select(None).gl.feed.start(256);
+        command(&mut b, Grammar::Gl, SELECT_FEEDBACK_RECORD_TYPE, &[FEEDBACK_3D]);
+        command(&mut b, Grammar::Gl, SWITCH_BETWEEN_RENDER_SELECT_AND_FEEDBACK_MODES, &[FEEDBACK]);
+        command(&mut b, Grammar::Gl, INSERT_FEEDBACK_PASS_THROUGH_MARKER, &[7.0f32.to_bits()]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[(8.0, 8.0), (40.0, 8.0), (8.0, 40.0)]);
+        vertices(&mut b, BEGIN_PRIMITIVE_POINTS, &[(20.0, 30.0)]);
+        // The back-face cull: this winding is clockwise.
+        command(&mut b, Grammar::Gl, SET_FACE_CULLING, &[crate::dev::kona::defs::gl::BACK]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[crate::dev::kona::defs::gl::CULL_FACE]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[(8.0, 8.0), (8.0, 40.0), (40.0, 8.0)]);
+        command(&mut b, Grammar::Gl, SWITCH_BETWEEN_RENDER_SELECT_AND_FEEDBACK_MODES, &[RENDER]);
+        let (words, overflow) = b.contexts.select(None).gl.feed.take();
+        assert!(!overflow);
+        let f = |v: f32| v.to_bits();
+        // Pass-through; a polygon of three vertices, x y z each (z is half the depth range for z = 0, as the
+        // formatter's scales leave it); a point. The culled triangle is absent.
+        let half = 0.5 * 1_048_575.0 / 1_048_576.0;
+        let want = [PASS_THROUGH, f(7.0), POLYGON, 3, f(8.0), f(8.0), f(half), f(40.0), f(8.0), f(half), f(8.0), f(40.0), f(half), POINT, f(20.0), f(30.0), f(half)];
+        assert_eq!(words, want);
+        assert!(lit_pixels(&mut b).is_empty(), "feedback draws nothing");
+        assert!(run(&mut b, &["gl"]).1.contains("1 passes"));
+    }
+
+    /// A select pass writes a hit per name change: the marker, the name count, the nearest and farthest depth, the names.
+    #[test]
+    fn a_select_pass_records_hits_by_name() {
+        use crate::dev::kona::back::gl::query::*;
+        let mut b = gl_window();
+        b.contexts.select(None).gl.feed.start(256);
+        command(&mut b, Grammar::Gl, SWITCH_BETWEEN_RENDER_SELECT_AND_FEEDBACK_MODES, &[SELECT]);
+        command(&mut b, Grammar::Gl, CLEAR_SELECTION_NAME_STACK, &[0]);
+        command(&mut b, Grammar::Gl, PUSH_SELECTION_NAME, &[5]);
+        vertices(&mut b, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[(8.0, 8.0), (40.0, 8.0), (8.0, 40.0)]);
+        command(&mut b, Grammar::Gl, REPLACE_TOP_SELECTION_NAME, &[6]);
+        // Beyond the far plane (z = 2): no hit.
+        command(&mut b, Grammar::Gl, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[0]);
+        for (x, y) in [(8.0, 8.0), (40.0, 8.0), (8.0, 40.0)] {
+            command(&mut b, Grammar::Gl, SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT, &[ndc(x), ndc(y), 2.0f32.to_bits()]);
+        }
+        command(&mut b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+        command(&mut b, Grammar::Gl, REPLACE_TOP_SELECTION_NAME, &[7]);
+        vertices(&mut b, BEGIN_PRIMITIVE_POINTS, &[(10.0, 10.0)]);
+        command(&mut b, Grammar::Gl, SWITCH_BETWEEN_RENDER_SELECT_AND_FEEDBACK_MODES, &[RENDER]);
+        let (words, _) = b.contexts.select(None).gl.feed.take();
+        let z = (0.5f32 * 4_294_967_040.0) as u32;
+        assert_eq!(words, vec![1, 1, z, z, 5, 1, 1, z, z, 7]);
+        assert!(lit_pixels(&mut b).is_empty());
+    }
+
+    /// The query tokens reach the context's state: the model-view matrix and the error come back, an
+    /// unknown generic name is counted.
+    #[test]
+    fn queries_are_answered_from_the_contexts_state() {
+        let mut b = gl_window();
+        command(&mut b, Grammar::Gl, SELECT_CURRENT_MATRIX_STACK, &[crate::dev::kona::defs::gl::MODELVIEW]);
+        command(&mut b, Grammar::Gl, TRANSLATE_FLOATS, &[2.0f32.to_bits(), 3.0f32.to_bits(), 4.0f32.to_bits()]);
+        let c = b.contexts.select(None);
+        let r = gl::query::answer(&mut c.gl, &mut b.query_counts, QUERY_STATE_GENERIC, &[0xba6]);
+        assert_eq!(r.len(), 16);
+        assert_eq!([f32::from_bits(r[12]), f32::from_bits(r[13]), f32::from_bits(r[14]), f32::from_bits(r[15])], [2.0, 3.0, 4.0, 1.0]);
+        // A query token through the job path counts (no return page here, so nothing is posted).
+        command(&mut b, Grammar::Gl, QUERY_STATE_GENERIC, &[0x9999]);
+        command(&mut b, Grammar::Gl, QUERY_HISTOGRAM, &[0]);
+        let text = run(&mut b, &["gl"]).1;
+        assert!(text.contains("3 answered") && text.contains("0x9999 x 1") && text.contains("0x104 x 1"), "{text}");
+    }
 
 
     // ---- Multisample ----
