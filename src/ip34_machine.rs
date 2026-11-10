@@ -29,7 +29,7 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::heart::{host_clock, Clock};
-use crate::dev::ioc3::{Ioc3, Ioc3Config};
+use crate::dev::ioc3::{ByteBus, Ioc3, IP34, IP34_NO_PS2};
 use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp12160::Isp12160;
@@ -642,11 +642,9 @@ impl FuelBoard {
             bedrock.connect_widget(widget, xbridge.widget(widget).unwrap());
         }
         let mac = l1.station_mac();
-        let mut ioc3_config = Ioc3Config::fuel(mac);
-        ioc3_config.keyboard_mouse = ps2_input;
-        let ioc3 = Arc::new(Ioc3::new(ioc3_config));
+        let board = if ps2_input { &IP34 } else { &IP34_NO_PS2 };
+        let ioc3 = Arc::new(Ioc3::new(board, mac, ByteBus::M48t35(timekeeper)));
         let eth = ioc3.eth().expect("the Fuel's IOC3 fits Ethernet").clone();
-        ioc3.attach_timekeeper(timekeeper);
         ioc3.set_serial_backend(0, serial[1].clone());
         ioc3.set_serial_backend(1, serial[2].clone());
         let scsi = Arc::new(Isp12160::new(

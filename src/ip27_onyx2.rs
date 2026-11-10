@@ -25,14 +25,13 @@ use crate::config::MachineConfig;
 use crate::dev::bridge::Bridge;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
-use crate::dev::ioc3::Ioc3Config;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::devlog::LogModule;
 use crate::ip27_machine::{cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, Node, NodeRecord};
-use crate::ip27_origin2000::{Origin2000, BRIDGE_REVISION, MAX_NODES, SUPERIO_PIN, XBOW_REVISION};
+use crate::ip27_origin2000::{Origin2000, BRIDGE_REVISION, MAX_NODES, XBOW_REVISION};
 use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_ERR};
 use crate::xtalk::{HostPort, XtalkHost};
 use std::sync::Arc;
@@ -89,12 +88,6 @@ impl Onyx2Deskside {
         let record = BoardRecord { barcode: "EMUB01", part: "030-0734-002", revision: "N", name: "BASEIO" };
         bus.add(Box::new(board_record_part(&record, 0x5145_4d55_4201)));
         bus
-    }
-
-    /// The Origin 2000 BaseIO's IOC3 with the keyboard and mouse the BaseIO-G
-    /// adds.
-    fn ioc3_config(mac: [u8; 6]) -> Ioc3Config {
-        Ioc3Config { keyboard_mouse: true, ..Origin2000::ioc3_config(mac) }
     }
 }
 
@@ -187,8 +180,7 @@ impl Ip27Board for Onyx2Deskside {
                 node.memory.route_nodes(node.hub.claim(Space::Memory));
             }
         }
-        let mac = cfg.network().mac;
-        pci_devices(owner, cfg, bridge, Self::ioc3_config(mac), controller, SUPERIO_PIN, "onyx2", Self::NAME)
+        pci_devices(owner, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, "onyx2", Self::NAME)
     }
 }
 

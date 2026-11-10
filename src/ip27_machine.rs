@@ -48,8 +48,7 @@ use crate::dev::heart::{host_clock, Clock};
 use crate::dev::hub::{Hub, HubConfig, HubHooks, Space};
 use crate::dev::hub_pi;
 use crate::dev::i2c::{BusBusy, I2cBus};
-use crate::dev::ioc3::{Ioc3, Ioc3Config};
-use crate::dev::ioc3::eth::Phy;
+use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::isp1040::Isp1040;
 use crate::dev::node_flash::{self, FlashValues, NodeFlash};
 use crate::dev::pcf8584::Pcf8584;
@@ -757,10 +756,6 @@ impl<B: Ip27Board> Drop for Ip27Machine<B> {
 /// for DMA and interrupts, taking an interrupt packet at any address and
 /// naming one of 128 vectors.
 const HUB_HOST: XtalkHost = XtalkHost { widget: 0xa, int_packet: 0, int_packet_mask: 0, vectors: 128 };
-/// The IP29 System Board's PCI subsystem identification.
-const SUBSYS_IP29_SYSBOARD: u16 = 0xc303;
-/// The Bridge input the IOC3's SuperIO interrupt is wired to.
-const SUPERIO_PIN: u8 = 3;
 /// The IP29 System Board's Bridge revision.
 const BRIDGE_REVISION: u32 = 4;
 
@@ -769,23 +764,6 @@ const BRIDGE_REVISION: u32 = 4;
 pub struct Origin200;
 
 impl Origin200 {
-    fn ioc3_config(mac: [u8; 6]) -> Ioc3Config {
-        Ioc3Config {
-            subsystem_id: SUBSYS_IP29_SYSBOARD,
-            pci_policy: Default::default(),
-            reset_pci_on_power_on: false,
-            mac,
-            phy: Some(Phy::Dp83840),
-            serial: [true, true],
-            parallel: true,
-            keyboard_mouse: true,
-            rtc: false,
-            gpio_input_mask: 0,
-            gpio_input_values: 0,
-            records: Vec::new(),
-        }
-    }
-
     /// The Bridge's one-wire line carries the System Board's record. The
     /// barcode and ROM serial are synthetic.
     fn board_record() -> w1::Bus {
@@ -856,7 +834,7 @@ impl Ip27Board for Origin200 {
         for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
             node.hub.io().connect_widget(widget, bridge.clone());
         }
-        pci_devices(node, cfg, bridge, Self::ioc3_config(cfg.network().mac), controller, SUPERIO_PIN, "origin200", Self::NAME)
+        pci_devices(node, cfg, bridge, &crate::dev::ioc3::IP29, controller, "origin200", Self::NAME)
     }
 }
 
@@ -866,9 +844,8 @@ pub(crate) fn pci_devices(
     node: &Node,
     cfg: &MachineConfig,
     bridge: Arc<Bridge>,
-    ioc3_config: Ioc3Config,
+    ioc3_board: &'static Ioc3Board,
     controller: Arc<dyn ModuleController>,
-    superio_pin: u8,
     scsi_name: &str,
     name: &str,
 ) -> Result<BoardIo, String> {
@@ -890,15 +867,14 @@ pub(crate) fn pci_devices(
     let slot = |device| crate::pci::DevFn { device, function: 0 };
     pci.attach(slot(0), scsi[0].clone());
     pci.attach(slot(1), scsi[1].clone());
-    let ioc3 = Arc::new(Ioc3::new(ioc3_config));
+    // The Fuel's M48T35 Timekeeper is the same part.
+    let timekeeper = Arc::new(Timekeeper::fuel_with_nvram_file(Path::new(&cfg.nvram))?);
+    let ioc3 = Arc::new(Ioc3::new(ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 fits Ethernet").clone();
     pci.attach(slot(2), ioc3.clone());
-    ioc3.connect_superio_interrupt(pci.board_irq(crate::pci::BoardIrq(superio_pin)));
+    ioc3.connect_superio(pci);
     ioc3.set_timer_manager(node.timers.clone());
-    // The Fuel's M48T35 Timekeeper is the same part.
-    let timekeeper = Arc::new(Timekeeper::fuel_with_nvram_file(Path::new(&cfg.nvram))?);
-    ioc3.attach_timekeeper(timekeeper.clone());
 
     let console = cfg.ci.then(|| Arc::new(CiSerialBackend::new()));
     let (port_a, port_b) = crate::dev::serial_host::console_backends(cfg, name, console.as_ref());
