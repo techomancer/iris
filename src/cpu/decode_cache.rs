@@ -25,8 +25,8 @@
 //! the same in every build and every region.
 //!
 //! A RAM remap (MEMCFG) changes which regions are RAM and which counters back
-//! a page: the cache records the region bitmap it was filled under and starts
-//! over when it changes. Snapshot restore and power-on flush everything.
+//! a page: the cache records the window key it was filled under, which moves
+//! with every change of the window's maps, and starts over when it changes. Snapshot restore and power-on flush everything.
 
 use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 #[cfg(feature = "opcodefusion")]
@@ -75,10 +75,9 @@ impl Page {
 
 pub struct DecodeCache {
     pages: Box<[Page]>,
-    /// The ppmem region bitmap the pages were filled under.
-    bitmap: u64,
-    /// The bitmap's region size, as `ppmem::window_shift`.
-    window_shift: u32,
+    /// The window key (`PpMemSpace::add_key_sink`) the pages were filled
+    /// under: it moves whenever the window's maps do.
+    key: u64,
 }
 
 impl Default for DecodeCache {
@@ -86,13 +85,8 @@ impl Default for DecodeCache {
 }
 
 impl DecodeCache {
-    /// The window is larger than 4GB. Set before anything is fetched.
-    pub fn set_window_shift(&mut self, shift: u32) {
-        self.window_shift = shift;
-    }
-
     pub fn new() -> Self {
-        Self { pages: (0..PAGES).map(|_| Page::new()).collect(), bitmap: 0, window_shift: crate::ppmem::BITMAP_SHIFT }
+        Self { pages: (0..PAGES).map(|_| Page::new()).collect(), key: 0 }
     }
 
     /// Forget everything: memory may have changed without any counter moving.
@@ -104,24 +98,25 @@ impl DecodeCache {
 
     /// The decoded slot for the instruction at `phys`, filled on a miss.
     ///
-    /// `window` and `bitmap` are ppmem's window base
-    /// and region bitmap: a page in a RAM region reads its words straight out
-    /// of the window. `ic_line` is the I-cache line size: opcode fusion pairs a
-    /// word with the next one only within a line. `word` reads a word through
-    /// the bus, returning the bus status on failure.
+    /// `key` is the window's key: a change drops every page. `host` gives a
+    /// page's words in ppmem's window, or null for a page the window does not
+    /// map, which reads them through `word` instead. `ic_line` is the I-cache
+    /// line size: opcode fusion pairs a word with the next one only within a
+    /// line. `word` reads a word through the bus, returning the bus status on
+    /// failure.
     #[inline(always)]
     pub fn fetch(
         &mut self,
         phys: u64,
-        window: *const u8,
-        bitmap: u64,
+        key: u64,
         ic_line: usize,
+        host: impl Fn(u64) -> *const u32,
         word: impl Fn(u64) -> Result<u32, u32>,
     ) -> Result<*const DecodedInstr, u32> {
         // The common case, kept small enough to inline into the interpreter
         // loop: a RAM page already here, the slot filled, its word (and a
         // fused pair's second word) unchanged. One or two host loads.
-        if bitmap == self.bitmap {
+        if key == self.key {
             let pfn = phys >> 12;
             let k = (phys as usize >> 2) & (SLOTS - 1);
             let (w, bit) = (k >> 6, 1u64 << (k & 63));
@@ -135,40 +130,32 @@ impl DecodeCache {
                 }
             }
         }
-        self.fetch_slow(phys, window, bitmap, ic_line, word)
+        self.fetch_slow(phys, key, ic_line, host, word)
     }
 
-    /// Everything else: a new bitmap, a page change, a bus page, a fill.
+    /// Everything else: a new key, a page change, a bus page, a fill.
     #[inline(never)]
     #[cold]
     fn fetch_slow(
         &mut self,
         phys: u64,
-        window: *const u8,
-        bitmap: u64,
+        key: u64,
         ic_line: usize,
+        host: impl Fn(u64) -> *const u32,
         word: impl Fn(u64) -> Result<u32, u32>,
     ) -> Result<*const DecodedInstr, u32> {
-        if bitmap != self.bitmap {
+        if key != self.key {
             self.flush();
-            self.bitmap = bitmap;
+            self.key = key;
         }
         let pfn = phys >> 12;
         let k = (phys as usize >> 2) & (SLOTS - 1);
         let (w, bit) = (k >> 6, 1u64 << (k & 63));
-        let window_shift = self.window_shift;
         let page = &mut self.pages[index(pfn)];
         let _ = ic_line;
-        let host_for = || -> *const u32 {
-            if !window.is_null() && crate::ppmem::bitmap_maps_at(bitmap, window_shift, phys) {
-                unsafe { window.add((pfn << 12) as usize) as *const u32 }
-            } else {
-                std::ptr::null()
-            }
-        };
 
         if page.pfn != pfn {
-            page.reset(pfn, host_for());
+            page.reset(pfn, host(pfn << 12));
         }
         if page.valid[w] & bit != 0 {
             let now = read(page.host, k, phys, &word)?;
@@ -227,6 +214,10 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
+    fn no_window(_: u64) -> *const u32 {
+        std::ptr::null()
+    }
+
     fn mem(words: &[(u64, u32)]) -> RefCell<HashMap<u64, u32>> {
         RefCell::new(words.iter().copied().collect())
     }
@@ -240,14 +231,14 @@ mod tests {
             let read = |a: u64| Ok(*m.borrow().get(&a).unwrap_or(&0));
             let mut dc = DecodeCache::new();
 
-            let p = dc.fetch(0x1000, std::ptr::null(), 0, 16, read).unwrap();
+            let p = dc.fetch(0x1000, 0, 16, no_window, read).unwrap();
             unsafe { (*(p as *mut DecodedInstr)).flags = 0 }; // the executor decoded it
-            let q = dc.fetch(0x1000, std::ptr::null(), 0, 16, read).unwrap();
+            let q = dc.fetch(0x1000, 0, 16, no_window, read).unwrap();
             assert_eq!(p, q);
             assert_eq!(unsafe { (*q).flags }, 0, "served decoded, not refilled");
 
             m.borrow_mut().insert(0x1000, 0x2400_0002);
-            let r = dc.fetch(0x1000, std::ptr::null(), 0, 16, read).unwrap();
+            let r = dc.fetch(0x1000, 0, 16, no_window, read).unwrap();
             assert_eq!(unsafe { (*r).raw }, 0x2400_0002, "refilled");
             assert_ne!(unsafe { (*r).flags } & FLAG_NOT_DECODED, 0);
         }
@@ -257,7 +248,7 @@ mod tests {
     #[test]
     fn a_bus_error_is_returned() {
         let mut dc = DecodeCache::new();
-        assert_eq!(dc.fetch(0x2000, std::ptr::null(), 0, 16, |_| Err(0x0800_001c)).err(), Some(0x0800_001c));
+        assert_eq!(dc.fetch(0x2000, 0, 16, no_window, |_| Err(0x0800_001c)).err(), Some(0x0800_001c));
     }
 
     /// Pages that share a table entry evict each other rather than alias.
@@ -268,9 +259,9 @@ mod tests {
         let m = mem(&[(a, 0x1111_1111), (b, 0x2222_2222)]);
         let read = |x: u64| Ok(*m.borrow().get(&x).unwrap_or(&0));
         let mut dc = DecodeCache::new();
-        assert_eq!(unsafe { (*dc.fetch(a, std::ptr::null(), 0, 16, read).unwrap()).raw }, 0x1111_1111);
-        assert_eq!(unsafe { (*dc.fetch(b, std::ptr::null(), 0, 16, read).unwrap()).raw }, 0x2222_2222);
-        assert_eq!(unsafe { (*dc.fetch(a, std::ptr::null(), 0, 16, read).unwrap()).raw }, 0x1111_1111);
+        assert_eq!(unsafe { (*dc.fetch(a, 0, 16, no_window, read).unwrap()).raw }, 0x1111_1111);
+        assert_eq!(unsafe { (*dc.fetch(b, 0, 16, no_window, read).unwrap()).raw }, 0x2222_2222);
+        assert_eq!(unsafe { (*dc.fetch(a, 0, 16, no_window, read).unwrap()).raw }, 0x1111_1111);
     }
 
     /// Coloured pages, which agree in their low page-number bits, spread over
@@ -282,24 +273,26 @@ mod tests {
         assert!(used.len() > PAGES / 2, "{} of {PAGES} entries", used.len());
     }
 
-    /// A page in a RAM region reads its words through the window pointer, not
-    /// the bus; a changed region bitmap (a remap) starts the cache over.
+    /// A page the window maps reads its words through the window pointer, not
+    /// the bus; a new key (a remap) starts the cache over.
     #[test]
     fn ram_pages_read_through_the_window_and_a_remap_flushes() {
         let mut ram = vec![0u32; 2 * 1024];
         ram[1024 + 3] = 0x2400_0007; // phys 0x100c, page 1 word 3
         let window = ram.as_ptr() as *const u8;
+        let mapped = |page: u64| unsafe { window.add(page as usize) as *const u32 };
         let bus = |_| -> Result<u32, u32> { panic!("RAM must not go through the bus") };
         let mut dc = DecodeCache::new();
-        let p = dc.fetch(0x100c, window, 1, 16, bus).unwrap();
+        let p = dc.fetch(0x100c, 1, 16, mapped, bus).unwrap();
         assert_eq!(unsafe { (*p).raw }, 0x2400_0007);
 
-        // Same bitmap: served (and validated) from the window.
+        // Same key: served (and validated) from the window.
         ram[1024 + 3] = 0x2400_0008;
-        assert_eq!(unsafe { (*dc.fetch(0x100c, window, 1, 16, bus).unwrap()).raw }, 0x2400_0008);
+        let mapped = |page: u64| unsafe { window.add(page as usize) as *const u32 };
+        assert_eq!(unsafe { (*dc.fetch(0x100c, 1, 16, mapped, bus).unwrap()).raw }, 0x2400_0008);
 
-        // Region no longer RAM: everything goes to the bus now.
-        let p = dc.fetch(0x100c, window, 0, 16, |_| Ok(0x2400_0009)).unwrap();
+        // The window no longer maps the page: everything goes to the bus now.
+        let p = dc.fetch(0x100c, 2, 16, no_window, |_| Ok(0x2400_0009)).unwrap();
         assert_eq!(unsafe { (*p).raw }, 0x2400_0009);
     }
 
@@ -311,10 +304,10 @@ mod tests {
         let m = mem(&[(0x1000, 0x03e0_0008), (0x1004, 0)]); // jr ra; nop
         let read = |a: u64| Ok(*m.borrow().get(&a).unwrap_or(&0));
         let mut dc = DecodeCache::new();
-        let p = dc.fetch(0x1000, std::ptr::null(), 0, 16, read).unwrap();
+        let p = dc.fetch(0x1000, 0, 16, no_window, read).unwrap();
         unsafe { (*(p as *mut DecodedInstr)).flags = 0 };
         m.borrow_mut().insert(0x1004, 0x2402_0001); // the delay slot is no longer a NOP
-        let q = dc.fetch(0x1000, std::ptr::null(), 0, 16, read).unwrap();
+        let q = dc.fetch(0x1000, 0, 16, no_window, read).unwrap();
         assert_ne!(unsafe { (*q).flags } & FLAG_NOT_DECODED, 0, "refilled");
         assert_eq!(unsafe { (*q).imm }, 0x2402_0001);
     }

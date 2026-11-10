@@ -818,6 +818,8 @@ impl Machine {
                     .expect("ppmem: the CPU's cached view");
                 unsafe { cpu.set_tcache_window(sp.view_base(v)) };
                 unsafe { cpu.set_cached_view(sp, v) };
+                // The decode cache keys its window pointers on the maps.
+                unsafe { sp.add_key_sink(v, cpu.tcache_key_ptr()) };
                 // Window writes bypass BusDevice, so the cache needs the gen
                 // window to bump page counters itself — otherwise jitv2 keeps
                 // running compiled code for pages the guest has modified.

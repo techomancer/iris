@@ -34,10 +34,6 @@ A disk installed on an Onyx2 boots; the machine cannot install without a pipe.
   it, and both Hubs are hosts, each behind its Crossbow port's link. With two
   nodes the PROM and IRIX program widget 9, the master's Hub; with one, widget
   10.
-- With two nodes the ppmem window, which the processors' caches read
-  directly, reaches node numbers 0 and 1 in 128 MiB regions. A 64 or 256 MiB
-  bank leaves its regions part empty, and those take the slower bus path on
-  both nodes.
 - The BaseIO-G carries the MediaIO daughtercard: a second IOC3 at PCI device 6
   and the RAD1 audio chip at device 7, with the daughtercard's own board
   record. The MediaIO's serial ports have no host backend, and the host's keys

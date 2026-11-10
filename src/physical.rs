@@ -337,6 +337,12 @@ impl Physical {
     /// [`Self::new`] with a ppmem window of `window` bytes, for memory that
     /// runs past 4GB.
     pub fn with_window(banks: Vec<RamBank>, window: u64) -> Arc<Self> {
+        Self::with_window_regions(banks, window, crate::ppmem::window_shift(window))
+    }
+
+    /// [`Self::with_window`] whose region bitmap counts `1 << shift` byte
+    /// regions, as `PpMemSpace::over_window_regions`.
+    pub fn with_window_regions(banks: Vec<RamBank>, window: u64, shift: u32) -> Arc<Self> {
         let host_freq = crate::platform::get_host_tick_frequency();
         let start_tick = crate::platform::get_host_ticks();
 
@@ -348,7 +354,7 @@ impl Physical {
         // ppmem: reserve the window over these banks. A failure here is
         // not fatal — the bus path works regardless — so log and carry on
         // rather than refusing to boot.
-        let ppmem_space = match PpMemSpace::over_window(&banks, window) {
+        let ppmem_space = match PpMemSpace::over_window_regions(&banks, window, shift) {
             Ok(sp) => Some(sp),
             Err(e) => {
                 dlog_dev!(LogModule::Mc, "ppmem: could not reserve the window ({e}); \
@@ -373,7 +379,7 @@ impl Physical {
             #[cfg(feature = "jitv2")]
             ppmem_gen_base,
             ppmem_bitmap: AtomicPtr::new(ppmem_bitmap),
-            ppmem_shift: crate::ppmem::window_shift(window),
+            ppmem_shift: shift,
             devmap,
             map_base,
             devices: Mutex::new(Vec::new()),

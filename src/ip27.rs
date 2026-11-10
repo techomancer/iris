@@ -24,10 +24,13 @@
 //!   other node numbers through the Hub ([`NodeMemory::route_nodes`]), and
 //!   sends node zero's, beyond the cached alias, to the Hub that holds zero
 //!   once the node holds another number ([`NodeZero`]). The ppmem window
-//!   shows the same memory at the same addresses ([`Windows`]).
-//! - A two-node board's ppmem window reaches node numbers 0 and 1, in 128 MiB
-//!   regions. Memory at a higher number, and a region that a 64 or 256 MiB
-//!   bank leaves part empty, take the bus path: same answers, slower.
+//!   shows the same memory at the same addresses ([`Windows`]). Each node
+//!   reserves host address space for it, 4 GiB for one node and
+//!   `next_power_of_two(nodes) x 4 GiB` for a board with a cable, as an
+//!   inaccessible mapping that commits nothing (`mmap` with `PROT_NONE` and
+//!   `MAP_NORESERVE` on Unix, a `VirtualAlloc2` placeholder on Windows). That
+//!   is by reading the host code: only Linux was run, macOS and Windows were
+//!   not.
 //! - The low 128 KiB of the Hub-special memory view is not private to each
 //!   processor of the pair.
 //! - A bank no larger than 128 MiB is one run at its 512 MiB stride; a larger
@@ -133,19 +136,20 @@ pub struct NodeMemory {
 
 impl NodeMemory {
     pub fn new(banks_mb: [u32; BANKS]) -> Result<Self, String> {
-        Self::with_window(banks_mb, crate::ppmem::WINDOW_SIZE)
+        Self::with_window(banks_mb, crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
     }
 
-    /// [`Self::new`] with a ppmem window of `window` bytes: a board of
-    /// several nodes reaches each node's memory at its number ([`window`]).
-    pub fn with_window(banks_mb: [u32; BANKS], window: u64) -> Result<Self, String> {
+    /// [`Self::new`] with a ppmem window of `window` bytes whose region bitmap
+    /// counts `1 << shift` byte regions: a board of several nodes reaches each
+    /// node's memory at its number ([`window`]).
+    pub fn with_window(banks_mb: [u32; BANKS], window: u64, shift: u32) -> Result<Self, String> {
         let mut banks = Vec::new();
         for (i, &mb) in banks_mb.iter().enumerate() {
             if mb != 0 {
                 banks.push(RamBank::try_new(mb as usize).map_err(|e| format!("bank {i}: {e}"))?);
             }
         }
-        let phys = Physical::with_window(banks, window);
+        let phys = Physical::with_window_regions(banks, window, shift);
         phys.set_default(Arc::new(Absent), "unfitted memory");
         let layout = layout(banks_mb);
         for &Run { bank, index, at, len, src } in layout.iter() {
@@ -527,13 +531,24 @@ impl NodeZero {
     }
 }
 
-/// The ppmem window for a board of `nodes` nodes, with room for each node's
-/// memory at its number: node `n`'s memory starts at `n << 32`. One node
-/// keeps the 4 GiB window. Two take 8 GiB, whose region bitmap counts 128 MiB
-/// regions, so a 64 or 256 MiB bank fills no region whole and stays on the
-/// bus path.
-pub fn window(nodes: usize) -> u64 {
-    (nodes.max(1) as u64 * crate::ppmem::WINDOW_SIZE).next_power_of_two()
+/// The ppmem window for a board of `nodes` nodes, and its region bitmap's
+/// region shift. One node keeps the 4 GiB window and its 64 MiB regions. A
+/// board with a cable spans node numbers up to the next power of two above the
+/// node count, node `n`'s memory starting at `n << 32`, so two nodes reserve
+/// 8 GiB of host address space and four reserve 16 GiB. The bitmap's 64
+/// regions of 128 MiB cover numbers 0 and 1, which the stock PROM gives the
+/// two nodes; memory the bitmap does not hold whole, a 64 or 256 MiB bank's or
+/// a higher number's, is reached through the window's fine table, at 64 MiB.
+///
+/// The window only speeds cached references up. A node that a guest gives a
+/// number past the window still works: its memory stays on the bus path, which
+/// answers every number up to 255.
+pub fn window(nodes: usize) -> (u64, u32) {
+    if nodes > 1 {
+        (nodes.next_power_of_two().min(NODE_WINDOWS as usize) as u64 * NODE_SPAN, 27)
+    } else {
+        (crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT)
+    }
 }
 
 /// What every node's ppmem window shows, which is what its processor's cache

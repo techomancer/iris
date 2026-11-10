@@ -46,7 +46,6 @@ through an I2C adapter per node.
 - A node that holds a nonzero number sends cached references to node zero's
   window beyond its cached alias to the Hub that holds zero, and its own RAM
   is then reached through its own number. Each processor's ppmem window shows
-  both nodes' memory at the same addresses, so both nodes run at the same
-  speed. With two nodes it counts 128 MiB regions: a 64 or 256 MiB bank
-  leaves its regions part empty, and those take the slower bus path.
+  both nodes' memory at the same addresses, whatever their bank sizes and
+  numbers, so both nodes run at the same speed.
 - Snapshots are not supported.

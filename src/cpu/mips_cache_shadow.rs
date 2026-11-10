@@ -232,6 +232,13 @@ pub struct ShadowCache<
     tc_bitmap: AtomicU64,
     /// The window's `ppmem::window_shift`, set before the CPU runs.
     tc_shift: UnsafeCell<u32>,
+    /// The window's fine table and its length in regions, for an access the
+    /// bitmap misses (`PpMemSpace::fine_table`). Zero regions until set.
+    tc_fine: UnsafeCell<*const std::sync::atomic::AtomicU64>,
+    tc_fine_regions: UnsafeCell<u64>,
+    /// The key the decode cache holds its window pointers under, published
+    /// on every change of the bitmap or the fine table.
+    tc_key: AtomicU64,
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
     /// Decoded instructions, by physical page. Never touches the shadow
@@ -302,6 +309,9 @@ impl<
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             tc_bitmap: AtomicU64::new(0),
             tc_shift: UnsafeCell::new(crate::ppmem::BITMAP_SHIFT),
+            tc_fine: UnsafeCell::new(std::ptr::null()),
+            tc_fine_regions: UnsafeCell::new(0),
+            tc_key: AtomicU64::new(0),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
@@ -319,11 +329,22 @@ impl<
     /// set bit also means the base is valid.
     #[inline(always)]
     fn ram(&self, phys: u64) -> Option<*mut u8> {
-        if crate::ppmem::bitmap_maps_at(self.tc_bitmap.load(Ordering::Relaxed), unsafe { *self.tc_shift.get() }, phys) {
+        if crate::ppmem::bitmap_maps_at(self.tc_bitmap.load(Ordering::Relaxed), unsafe { *self.tc_shift.get() }, phys)
+            || self.fine_maps(phys)
+        {
             Some(unsafe { *self.tc_base.get() })
         } else {
             None
         }
+    }
+
+    /// Whether the fine table holds `phys`'s region whole: for an access the
+    /// bitmap missed, before it takes the bus. False until a table is set.
+    #[inline(always)]
+    fn fine_maps(&self, phys: u64) -> bool {
+        let r = phys >> crate::ppmem::FINE_SHIFT;
+        r < unsafe { *self.tc_fine_regions.get() }
+            && unsafe { (*(*self.tc_fine.get()).add((r / 64) as usize)).load(std::sync::atomic::Ordering::Relaxed) } >> (r % 64) & 1 != 0
     }
 
     /// A window store skips `BusDevice`, so it bumps the page's jitv2
@@ -780,11 +801,17 @@ impl<
     }
 
     fn set_tcache_shift(&self, shift: u32) {
+        unsafe { *self.tc_shift.get() = shift };
+    }
+
+    unsafe fn set_tcache_fine(&self, table: *const std::sync::atomic::AtomicU64, regions: u64) {
         unsafe {
-            *self.tc_shift.get() = shift;
-            (*self.decode.get()).set_window_shift(shift);
+            *self.tc_fine.get() = table;
+            *self.tc_fine_regions.get() = regions;
         }
     }
+
+    fn tcache_key_ptr(&self) -> *mut u64 { self.tc_key.as_ptr() }
 
     fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.as_ptr() }
 
@@ -842,8 +869,13 @@ impl<
             let r = self.downstream.read32(a);
             if r.is_ok() { Ok(r.data) } else { Err(r.status) }
         };
-        let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, self.tc_bitmap.load(Ordering::Relaxed)) };
-        match dc.fetch(phys_addr, window, bitmap, IC_LINE, word) {
+        let key = self.tc_key.load(Ordering::Relaxed);
+        // A page's words straight from the window, if it maps the page.
+        let host = |page: u64| match self.ram(page) {
+            Some(window) if !window.is_null() => unsafe { window.add(page as usize) as *const u32 },
+            _ => std::ptr::null(),
+        };
+        match dc.fetch(phys_addr, key, IC_LINE, host, word) {
             Ok(p) => FetchInstrResult::hit(p),
             Err(status) => FetchInstrResult::fault(status),
         }

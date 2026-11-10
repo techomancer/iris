@@ -3044,6 +3044,19 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.cache.tcache_bitmap_ptr()
     }
 
+    /// tcache: see `MipsCache::set_tcache_fine`.
+    ///
+    /// # Safety
+    /// As `MipsCache::set_tcache_fine`.
+    pub unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64) {
+        unsafe { self.cache.set_tcache_fine(table, regions) };
+    }
+
+    /// tcache: see `MipsCache::tcache_key_ptr`.
+    pub fn tcache_key_ptr(&self) -> *mut u64 {
+        self.cache.tcache_key_ptr()
+    }
+
     /// tcache + jitv2: see `CpuCache::set_tcache_gen_window`.
     ///
     /// # Safety
@@ -10774,6 +10787,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         self.executor.lock().tcache_bitmap_ptr()
     }
 
+    /// tcache: see `MipsCache::set_tcache_fine`.
+    ///
+    /// # Safety
+    /// As `MipsCache::set_tcache_fine`.
+    pub unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64) {
+        unsafe { self.executor.lock().set_tcache_fine(table, regions) };
+    }
+
+    /// tcache: see `MipsCache::tcache_key_ptr`.
+    pub fn tcache_key_ptr(&self) -> *mut u64 {
+        self.executor.lock().tcache_key_ptr()
+    }
+
     /// tcache + jitv2: see `MipsExecutor::set_tcache_gen_window`.
     ///
     /// # Safety
@@ -11506,6 +11532,13 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn set_tcache_shift(&self, shift: u32);
     /// tcache: pointer to the cache's inline mapped-region bitmap.
     fn tcache_bitmap_ptr(&self) -> *mut u64;
+    /// tcache: see `MipsCache::set_tcache_fine`.
+    ///
+    /// # Safety
+    /// As `MipsCache::set_tcache_fine`.
+    unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64);
+    /// tcache: see `MipsCache::tcache_key_ptr`.
+    fn tcache_key_ptr(&self) -> *mut u64;
     /// tcache + jitv2: hand the cache ppmem's generation-window base.
     ///
     /// # Safety
@@ -11573,6 +11606,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
         unsafe { MipsCpu::set_cached_view(self, sp, view) }
     }
     fn tcache_bitmap_ptr(&self) -> *mut u64 { MipsCpu::tcache_bitmap_ptr(self) }
+    unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64) {
+        unsafe { MipsCpu::set_tcache_fine(self, table, regions) }
+    }
+    fn tcache_key_ptr(&self) -> *mut u64 { MipsCpu::tcache_key_ptr(self) }
     #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
         unsafe { MipsCpu::set_tcache_gen_window(self, gen_base) }
