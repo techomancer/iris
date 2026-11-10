@@ -20,6 +20,11 @@ pub struct MaceRtc {
     /// seconds to change, and a stopped clock leaves it waiting for ever
     /// (OpenBSD, straight after autoconfiguration).
     clock: Mutex<(i64, std::time::Instant)>,
+    /// The century while SET is up, as the guest last wrote it (binary).
+    /// SET freezes the century with the other time bytes, and clearing SET
+    /// commits all of them together: IRIX writes the century between the
+    /// year and the weekday.
+    held_century: Mutex<Option<i64>>,
     /// Set when the guest writes PAB in extended control register 4A: on an
     /// O2 that is software power-off (the RTC lets go of the supply). Both
     /// NetBSD and OpenBSD power down this way; without it OpenBSD retries
@@ -92,6 +97,7 @@ impl MaceRtc {
         Self {
             cells: Mutex::new(c),
             clock: Mutex::new((now, std::time::Instant::now())),
+            held_century: Mutex::new(None),
             powered_off: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -237,13 +243,17 @@ impl Resettable for MaceRtc {
     }
 }
 
-/// The cells, and the clock as guest seconds: a restored machine's clock
-/// runs on from the moment it was saved.
+/// The cells, the clock as guest seconds and a century written under SET:
+/// a restored machine's clock runs on from the moment it was saved, and a
+/// clock write the save interrupted completes when SET comes down.
 impl Saveable for MaceRtc {
     fn save_state(&self) -> toml::Value {
         let mut tbl = toml::map::Map::new();
         tbl.insert("cells".into(), u8_slice_to_toml(&self.cells.lock().unwrap()));
         tbl.insert("time".into(), toml::Value::Integer(self.now()));
+        if let Some(c) = *self.held_century.lock().unwrap() {
+            tbl.insert("held_century".into(), toml::Value::Integer(c));
+        }
         tbl.insert("powered_off".into(), toml::Value::Boolean(self.powered_off()));
         toml::Value::Table(tbl)
     }
@@ -255,6 +265,7 @@ impl Saveable for MaceRtc {
         if let Some(t) = get_field(v, "time").and_then(|t| t.as_integer()) {
             *self.clock.lock().unwrap() = (t, std::time::Instant::now());
         }
+        *self.held_century.lock().unwrap() = get_field(v, "held_century").and_then(|c| c.as_integer());
         let off = get_field(v, "powered_off").and_then(|b| b.as_bool()).unwrap_or(false);
         self.powered_off.store(off, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -270,8 +281,10 @@ impl BusDevice for MaceRtc {
         let Some(r) = Self::reg_of(addr as u32) else { return BusRead8::ok(0) };
         let b = self.peek(rtc_reg::B);
         if r == rtc_reg::CENTURY && self.peek(rtc_reg::A) & rtc_reg::A_DV0 != 0 {
-            let days = self.now().div_euclid(86400);
-            let c = (civil_from_days(days).0 / 100) as u8;
+            let c = match *self.held_century.lock().unwrap() {
+                Some(c) if b & rtc_reg::B_SET != 0 => c as u8,
+                _ => (civil_from_days(self.now().div_euclid(86400)).0 / 100) as u8,
+            };
             return BusRead8::ok(if b & rtc_reg::B_BINARY != 0 { c } else { (c / 10) << 4 | c % 10 });
         }
         // While SET is up the clock is frozen at what is being written.
@@ -290,13 +303,18 @@ impl BusDevice for MaceRtc {
             return BUS_OK;
         }
         if r == rtc_reg::CENTURY && self.peek(rtc_reg::A) & rtc_reg::A_DV0 != 0 {
+            let c = if b & rtc_reg::B_BINARY != 0 { val } else { (val >> 4) * 10 + (val & 0x0f) };
+            if b & rtc_reg::B_SET != 0 {
+                // Held with the other time bytes until SET comes down.
+                *self.held_century.lock().unwrap() = Some(c as i64);
+                return BUS_OK;
+            }
             // The century, in the extended bank: keep the rest of the time.
             let t = self.now();
             for &f in &rtc_reg::TIME {
                 let v = self.field(f, t, b);
                 self.poke(f, v);
             }
-            let c = if b & rtc_reg::B_BINARY != 0 { val } else { (val >> 4) * 10 + (val & 0x0f) };
             self.set_from_cells_in(Some(c as i64));
             return BUS_OK;
         }
@@ -308,11 +326,15 @@ impl BusDevice for MaceRtc {
                 let v = self.field(f, t, b);
                 self.poke(f, v);
             }
+            // A century the guest does not rewrite is left to the year's
+            // pivot, as before.
+            *self.held_century.lock().unwrap() = None;
         }
         self.poke(r, val);
         if r == rtc_reg::B && b & rtc_reg::B_SET != 0 && val & rtc_reg::B_SET == 0 {
             // SET coming down: the clock runs on from what was written.
-            self.set_from_cells();
+            let century = self.held_century.lock().unwrap().take();
+            self.set_from_cells_in(century);
         } else if rtc_reg::TIME.contains(&r) && b & rtc_reg::B_SET == 0 {
             // A field written without SET: freeze the others at the current
             // time first, then take the whole lot as the new time.
@@ -380,6 +402,75 @@ mod tests {
         r.write8(reg(0x4a), 0x08);
         assert!(r.powered_off(), "PAB switches the machine off");
         assert_eq!(civil_from_days(10957), (2000, 1, 1));
+    }
+
+    /// SET holds the century with the other time bytes. IRIX's clock write
+    /// raises SET, writes the seconds through the year, then the century,
+    /// then the weekday, and clears SET; the clock must then run from the
+    /// date written, not from the time SET went up.
+    #[test]
+    fn a_century_written_under_set_waits_for_set_to_clear() {
+        let r = MaceRtc::new();
+        let reg = |n: u32| ((n << 8) | 7) as u64;
+        r.write8(reg(0x0a), 0x30);
+        r.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
+        for (n, v) in [(0u32, 0u8), (2, 0), (4, 19), (7, 1), (8, 6), (9, 4), (0x48, 20), (6, 3)] {
+            r.write8(reg(n), v);
+        }
+        assert_eq!(r.read8(reg(0x48)).data, 20, "the held century reads back under SET");
+        r.write8(reg(0x0b), 0x04 | 0x02);
+        assert_eq!(r.now(), 1_086_116_400, "2004-06-01 19:00:00 UTC");
+        assert_eq!((r.read8(reg(9)).data, r.read8(reg(8)).data, r.read8(reg(7)).data), (4, 6, 1));
+        assert_eq!(r.read8(reg(0x48)).data, 20);
+        // A century of 19 under SET lands in the 1900s.
+        r.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
+        r.write8(reg(9), 99);
+        r.write8(reg(0x48), 19);
+        r.write8(reg(0x0b), 0x04 | 0x02);
+        assert_eq!(civil_from_days(r.now().div_euclid(86400)).0, 1999);
+    }
+
+    /// Set 2004-06-01 19:00:00 UTC the way IRIX does, century included.
+    fn set_2004(r: &MaceRtc) {
+        let reg = |n: u32| ((n << 8) | 7) as u64;
+        r.write8(reg(0x0a), 0x30);
+        r.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
+        for (n, v) in [(0u32, 0u8), (2, 0), (4, 19), (7, 1), (8, 6), (9, 4), (0x48, 20), (6, 3)] {
+            r.write8(reg(n), v);
+        }
+        r.write8(reg(0x0b), 0x04 | 0x02);
+    }
+
+    /// A snapshot taken mid-write, between the century and SET clearing,
+    /// completes the write after a restore.
+    #[test]
+    fn a_snapshot_keeps_a_century_written_under_set() {
+        let reg = |n: u32| ((n << 8) | 7) as u64;
+        let src = MaceRtc::new();
+        src.write8(reg(0x0a), 0x30);
+        src.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
+        for (n, v) in [(0u32, 0u8), (2, 0), (4, 19), (7, 1), (8, 6), (9, 70), (0x48, 20)] {
+            src.write8(reg(n), v);
+        }
+        let dst = MaceRtc::new();
+        dst.load_state(&src.save_state()).unwrap();
+        dst.write8(reg(0x0b), 0x04 | 0x02);
+        assert_eq!(dst.now(), 3_168_874_800, "2070-06-01 19:00:00 UTC, not 1970");
+        // A save with no write in progress restores none.
+        let after = MaceRtc::new();
+        after.load_state(&dst.save_state()).unwrap();
+        assert_eq!(*after.held_century.lock().unwrap(), None);
+    }
+
+    /// A snapshot after a date set restores the set date, not host time.
+    #[test]
+    fn a_snapshot_keeps_a_set_date() {
+        let src = MaceRtc::new();
+        set_2004(&src);
+        let dst = MaceRtc::new();
+        dst.load_state(&src.save_state()).unwrap();
+        assert!((1_086_116_400..=1_086_116_402).contains(&dst.now()));
+        assert_eq!(civil_from_days(dst.now().div_euclid(86400)), (2004, 6, 1));
     }
 
     #[test]
