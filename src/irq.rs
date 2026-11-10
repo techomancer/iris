@@ -15,6 +15,15 @@ pub trait InterruptController: Send + Sync {
     /// Drive input `line` to `level`. An input the controller latches takes
     /// a rising level as its edge.
     fn set_line(&self, line: u32, level: bool);
+
+    /// A crosstalk interrupt packet that widget `source` sent to `address`,
+    /// naming vector `line`; whether the host took it. HEART and the Hub
+    /// decode the vector alone, as this default does. A host whose packet
+    /// address picks the destination overrides it.
+    fn packet(&self, _source: u8, _address: u64, line: u32, level: bool) -> bool {
+        self.set_line(line, level);
+        true
+    }
 }
 
 /// One input of one controller, as a device sees it.

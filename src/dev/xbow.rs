@@ -191,8 +191,8 @@ impl Regs {
 /// What an access leaves to do once the register lock is dropped.
 #[derive(Default)]
 struct Out {
-    /// Widget 0's interrupt packets to HEART: (vector, set).
-    packets: Vec<(u8, bool)>,
+    /// Widget 0's interrupt packets to the host: (address, vector, set).
+    packets: Vec<(u64, u8, bool)>,
     /// A link reset's far-end widget.
     link_reset: Option<u8>,
 }
@@ -281,8 +281,8 @@ impl Xbow {
         let mut out = Out::default();
         let ret = f(&mut self.regs.lock(), &mut out);
         if let Some((_, h)) = self.host.get() {
-            for (vector, set) in out.packets {
-                h.set_line(vector as u32, set);
+            for (address, vector, set) in out.packets {
+                h.packet(0, address, vector as u32, set);
             }
         }
         drop(order);
@@ -385,7 +385,8 @@ impl Xbow {
             Some((host, _)) if target == host.widget && self.carries(target) => {}
             _ => return,
         }
-        out.packets.push((vector, pending));
+        let address = (((r.int_upper & 0xffff) as u64) << 32) | r.int_lower as u64;
+        out.packets.push((address, vector, pending));
         r.interrupt_asserted = pending;
     }
 
@@ -878,6 +879,32 @@ mod tests {
         assert!(x.write(INT_UPPER + 4, 4, (0x2b << 24) | (15 << 16)));
         assert!(x.write(reset, 4, 0));
         assert_eq!(isr.0.load(Ordering::SeqCst), 1 << 0x2b);
+    }
+
+    /// A host that decodes the packet itself gets the destination address
+    /// the interrupt registers name, from widget 0.
+    #[test]
+    fn a_host_that_decodes_packets_sees_their_address() {
+        #[derive(Default)]
+        struct Decoder(Mutex<Vec<(u8, u64, u32, bool)>>);
+        impl InterruptController for Decoder {
+            fn set_line(&self, _: u32, _: bool) {
+                unreachable!("a packet host takes packets");
+            }
+            fn packet(&self, source: u8, address: u64, line: u32, level: bool) -> bool {
+                self.0.lock().push((source, address, line, level));
+                true
+            }
+        }
+        let x = octane();
+        let decoder = Arc::new(Decoder::default());
+        x.connect_host(HEART_HOST, decoder.clone());
+        assert!(x.write(INT_UPPER + 4, 4, (0x2a << 24) | (8 << 16) | 0x12));
+        assert!(x.write(INT_LOWER + 4, 4, 0x0180_0090));
+        assert!(x.write(CONTROL + 4, 4, STATUS_ACCESS_ERROR as u64));
+        assert_eq!(x.read(0x00, 4), None);
+        x.read(STATUS_CLEAR + 4, 4).unwrap();
+        assert_eq!(*decoder.0.lock(), [(0, 0x12_0180_0090, 0x2a, true), (0, 0x12_0180_0090, 0x2a, false)]);
     }
 
     #[test]
