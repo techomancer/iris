@@ -32,7 +32,7 @@ use crate::dev::bridge::*;
 use crate::dev::heart::{Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::physical::{read_bytes, write_bytes, Physical};
 use crate::dev::ioc3::{self, Ioc3};
-use crate::dev::ioc3_eth::{bits as ebit, reg as ereg, Ioc3Eth};
+use crate::dev::ioc3::eth::{bits as ebit, reg as ereg, Ioc3Eth};
 use crate::dev::isp1040::{mbox, reg as ireg, Isp1040, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, ENTRY_SIZE, ENTRY_TYPE_REQUEST, ENTRY_TYPE_STATUS};
 use crate::dev::mgras::hq4::ImpactXio;
 use crate::dev::xbow::Xbow;

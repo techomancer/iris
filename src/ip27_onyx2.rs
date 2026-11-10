@@ -26,7 +26,7 @@ use crate::dev::bridge::Bridge;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
 use crate::dev::ioc3::Ioc3Config;
-use crate::dev::ioc3_eth::Ioc3Eth;
+use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};

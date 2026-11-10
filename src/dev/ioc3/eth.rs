@@ -20,23 +20,18 @@
 //! Frames use iris's shared network link. The machine attaches it through
 //! [`Ioc3Eth::attach`].
 //!
-//! Approximations (the QEMU model this was ported from has the same ones,
-//! plus one it dropped):
-//! - Receive completions are published as soon as the frame is in memory.
-//!   The QEMU model holds each one back for a modelled minimum arrival
-//!   latency; this port has no such delay.
+//! Approximations:
+//! - Receive completions are published as soon as the frame is in memory,
+//!   with no modelled minimum arrival latency.
 //! - A non-zero receive timer reload is stored but not timed; only the
 //!   "interrupt immediately" setting every public driver uses is modelled.
-//! - The PHY's 100 ms negotiation delay is wall-clock time (the QEMU model
-//!   used virtual time) and the synthetic peer never faults.
+//! - The PHY's 100 ms negotiation delay is wall-clock time and the synthetic
+//!   peer never faults.
 //! - Quick Poll status (PHY register 0x11) reports live state without the
 //!   per-bit latches the datasheet describes.
-//! - A PHY register the model does not implement reads 0. The QEMU model
-//!   answers 0xffff, and the ICS1890 datasheet has an unanswered management
-//!   read float to all ones.
-//! - Frames go to the wire only while the PHY reports link. The QEMU model
-//!   sends whenever the PHY's data path is open (not powered down or
-//!   isolated), link or not.
+//! - A PHY register the model does not implement reads 0, though the
+//!   ICS1890 datasheet has an unanswered management read float to all ones.
+//! - Frames go to the wire only while the PHY reports link.
 //!
 //! Ported from hw/net/sgi-ioc3-eth.c in jamesbraid/qemu-sgi-origami. The
 //! Octane PHY model lives in `ics1890.rs`.
@@ -47,7 +42,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::dev::ioc3_port::Ioc3EthPort;
+use crate::dev::ioc3::port::Ioc3EthPort;
 use crate::dev::ics1890::Ics1890;
 use crate::pci::{PciDma, PciDmaStatus};
 use crate::snapshot::{field, field_bool, field_u16, field_u32, field_u32s, field_u64, StateTable};

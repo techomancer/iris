@@ -37,7 +37,7 @@ use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
 use crate::dev::ioc3::Ioc3Config;
-use crate::dev::ioc3_eth::Ioc3Eth;
+use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::o2000_module::{ModuleConfig, ModuleEvent, Origin2000Module};
 use crate::traits::Resettable;

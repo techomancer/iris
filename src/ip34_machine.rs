@@ -31,7 +31,7 @@ use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc3::{Ioc3, Ioc3Config};
 use crate::dev::odyssey::{Odyssey, PacketSender};
-use crate::dev::ioc3_eth::Ioc3Eth;
+use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1, L1Config};
 use crate::dev::ohci::Ohci;
