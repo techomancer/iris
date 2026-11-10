@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### A date set on an Octane sticks
+
+- Setting the date on an Octane under IRIX 6.5 lasted only until the next
+  boot: the century IRIX writes while SET is up restarted the clock from the
+  old time. The DS1685/DS1687 model now holds a century written under SET
+  until SET clears, as the part does, and snapshots keep it.
+
 ### Benchmark and test suites: one pinned compiler
 
 - One pinned compiler, Fedora 45's GCC 16.2.1 for MIPS, builds the `cpu-tests` and `bench` guest binaries, in a container (`cpu-tests/docs/toolchain.md`). Builds are reproducible: debug information no longer records the checkout's path. `make -C cpu-tests toolchain-local` is gone.
