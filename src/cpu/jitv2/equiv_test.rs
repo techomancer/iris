@@ -688,6 +688,7 @@ mod tests {
     #[cfg(feature = "developer")]
     fn every_instr_origin_class_is_tagged_in_traceback() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         let pc = 0xFFFF_FFFF_8000_2000u64;
         let entry0 = ((pc & 0xFFF) / 4) as u16;
         let mut gpr = [0u64; 32];
@@ -752,7 +753,7 @@ mod tests {
         assert_eq!(find(pc + 8).2, crate::cpu::mips_exec::InstrOrigin::JitDelaySlot,
             "the BEQ's inlined delay slot must be tagged JitDelaySlot");
         assert_eq!(find(pc + 12).2, crate::cpu::mips_exec::InstrOrigin::FallbackWord,
-            "the MTC0 fallback head must be tagged FallbackWord");
+            "the BC1F fallback head must be tagged FallbackWord");
         assert_eq!(find(pc + 16).2, crate::cpu::mips_exec::InstrOrigin::FallbackSuccessor,
             "the word after the fallback must be tagged FallbackSuccessor");
     }
@@ -835,6 +836,7 @@ mod tests {
     #[cfg(feature = "developer")]
     fn fallback_successor_back_edge_is_still_recorded() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         let pc = 0xFFFF_FFFF_8000_4000u64;
         let entry0 = ((pc & 0xFFF) / 4) as u16;
         let mut gpr = [0u64; 32];
@@ -1181,6 +1183,7 @@ mod tests {
     /// all covered for each.
     #[test]
     fn bc1_all_conditions_match_interpreter() {
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
         for cc in 0..8u32 {
             for tf in [false, true] {
                 for nd in [false, true] {
@@ -1204,6 +1207,7 @@ mod tests {
     /// interpreter, so a harness that ran neither side's slot couldn't pass.
     #[test]
     fn bc1_likely_not_taken_annuls_its_delay_slot() {
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
         let pc = 0xFFFF_FFFF_8000_0000u64;
         // BC1TL with cc0 clear: not taken, so the slot is annulled.
         let page = bc1_layout(0, true, true);
@@ -1225,6 +1229,7 @@ mod tests {
     /// emits one in `emit_cond`'s `Fcc` arm, and this is what proves it.
     #[test]
     fn bc1_without_cu1_raises_coprocessor_unusable_like_the_interpreter() {
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
         let page = bc1_layout(0, true, false);
         // cc set, so it would be TAKEN if CU1 were on — the exception must
         // win over the branch. One step: the exception is the only thing
@@ -1432,6 +1437,26 @@ mod tests {
     /// `RegionBoundary` sentinel are flag-independent and don't need it.
     fn fallback_on_guard() -> crate::cpu::jitv2::analyzer::TestFallbackGuard {
         crate::cpu::jitv2::analyzer::test_fallback_guard()
+    }
+
+    /// BC1 compiles as an ordinary branch, so a test that needs a fallback
+    /// *branch* (the only kind that arms a delay slot through the
+    /// interpreter, see `analyzer::is_fallback_branch`) turns its emitter off
+    /// for its own duration, as `j2 bc1 off` does on a live machine. Holds
+    /// the enable table exclusively: no other test compiles meanwhile.
+    struct Bc1InterpretedGuard {
+        _table: std::sync::RwLockWriteGuard<'static, ()>,
+    }
+    impl Drop for Bc1InterpretedGuard {
+        fn drop(&mut self) {
+            crate::cpu::jitv2::opcode_support::set_instr_enabled(crate::cpu::mips_instr_stats::InstrKind::Bc1, true);
+        }
+    }
+    #[must_use]
+    fn bc1_interpreted_guard() -> Bc1InterpretedGuard {
+        let table = crate::cpu::jitv2::opcode_support::table_exclusive();
+        crate::cpu::jitv2::opcode_support::set_instr_enabled(crate::cpu::mips_instr_stats::InstrKind::Bc1, false);
+        Bc1InterpretedGuard { _table: table }
     }
 
     /// Not a diff against `assert_jit_matches_interpreter`'s `opt_level=none`
@@ -8323,6 +8348,7 @@ mod tests {
     #[test]
     fn bc1_fallback_taken_matches_interpreter() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         // BC1T cc0, +2 (target = word0+1+2 = word3). cc0=true -> taken.
         let bc1t = 0x45010002u32;
         assert_bc1_fallback_matches(bc1t, true, 12);
@@ -8332,6 +8358,7 @@ mod tests {
     #[test]
     fn bc1_fallback_not_taken_matches_interpreter() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         // BC1T cc0, +2. cc0=false -> not taken (non-likely): slot still runs.
         let bc1t = 0x45010002u32;
         assert_bc1_fallback_matches(bc1t, false, 12);
@@ -8341,6 +8368,7 @@ mod tests {
     #[test]
     fn bc1_fallback_likely_annul_matches_interpreter() {
         let _fb = fallback_on_guard();
+        let _bc1 = bc1_interpreted_guard();
         // BC1TL cc0, +2 (likely). cc0=false -> not taken -> slot ANNULLED (pc+8).
         // rt = (cc<<2)|(likely<<1)|tf = (0<<2)|(1<<1)|1 = 3.
         let bc1tl = (crate::cpu::mips_isa::OP_COP1 << 26) | (crate::cpu::mips_isa::RS_BC1 << 21) | (3u32 << 16) | 2;
