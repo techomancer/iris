@@ -91,18 +91,43 @@ impl HostConn {
         if let Ok(Some(e)) | Err(e) = sock.take_error().map(|o| o.map(Into::into)) {
             return Some(Err(e));
         }
-        match sock.peer_addr() {
-            Ok(_) => {
+        match connect_done(sock) {
+            Ok(true) => {
                 let stream: TcpStream = self.sock.take().unwrap().into();
                 self.stream = Some(stream);
                 Some(Ok(()))
             }
-            Err(_) if self.started.elapsed() > CONNECT_TIMEOUT => {
+            Err(e) => Some(Err(e)),
+            Ok(false) if self.started.elapsed() > CONNECT_TIMEOUT => {
                 Some(Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")))
             }
-            Err(_) => None,
+            Ok(false) => None,
         }
     }
+}
+
+/// Whether a non-blocking connect has finished: getpeername fails until it has.
+#[cfg(not(windows))]
+fn connect_done(sock: &Socket) -> io::Result<bool> {
+    Ok(sock.peer_addr().is_ok())
+}
+
+/// Windows: getpeername can succeed for a connect to a closed port, so ask WSAPoll,
+/// which flags a failed connect POLLERR | POLLHUP (Windows 10 2004 and later).
+#[cfg(windows)]
+fn connect_done(sock: &Socket) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLERR, POLLHUP, POLLWRNORM, WSAPOLLFD};
+    let mut fd = WSAPOLLFD { fd: sock.as_raw_socket() as usize, events: POLLWRNORM, revents: 0 };
+    // SAFETY: one valid WSAPOLLFD, polled without waiting.
+    let n = unsafe { WSAPoll(&mut fd, 1, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if fd.revents & (POLLERR | POLLHUP) != 0 {
+        return Err(sock.take_error()?.unwrap_or_else(|| io::ErrorKind::ConnectionRefused.into()));
+    }
+    Ok(fd.revents & POLLWRNORM != 0)
 }
 
 fn in_progress(e: &io::Error) -> bool {
