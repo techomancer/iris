@@ -45,6 +45,8 @@
 //! - `pixel_dma`: DMA between guest memory and planes.
 //! - `depth_word`: the board's 24-bit float depth word and its offset.
 //! - `consts`: register, command and field constants.
+//! - `regs`: generated layouts of the command and DMA words as named fields,
+//!   vendored unedited.
 //!
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code
 //! (hw/display/sgi/) in jamesbraid/qemu-sgi-origami.
@@ -92,6 +94,7 @@ mod raster_bench;
 mod raster_unit;
 mod record;
 mod reader;
+mod regs;
 mod registers;
 mod scanout;
 mod trace;
