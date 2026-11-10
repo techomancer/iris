@@ -1627,6 +1627,30 @@ fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
     r.c.stop();
 }
 
+/// A receive thread's pass that read the chip before a register write
+/// cannot arm after that write from what it read, and so cannot remove the
+/// timer the write set. The test holds the timer table so the pass stops
+/// just short of arming, and the write must then wait for it.
+#[test]
+fn a_pass_that_read_the_chip_first_arms_first() {
+    let (r, _tm) = running_rig();
+    r.c.start();
+    r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
+    let sh = &r.c.sh;
+    std::thread::scope(|s| {
+        let table = sh.armed.lock();
+        // The chip still holds no output deadline when this pass reads it.
+        let pass = s.spawn(|| sh.with_st(false, |_, _| ()));
+        assert!(eventually(|| sh.st.is_locked()), "the pass keeps the chip until it has the table");
+        let write = s.spawn(|| r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000));
+        drop(table);
+        pass.join().unwrap();
+        write.join().unwrap();
+    });
+    assert!(timer_pending(&r, K_INT_OUT));
+    r.c.stop();
+}
+
 /// Dropping a running chip joins its threads; they hold it only weakly.
 #[test]
 fn dropping_a_running_chip_ends_its_threads() {

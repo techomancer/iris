@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, OnceLock, Weak};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::dev::battery_clock;
@@ -2200,15 +2200,13 @@ impl Shared {
     /// Run `f` with the chip locked, then arm the timers for the deadlines it
     /// left and drive the lines from its state.
     fn with_st<R>(&self, parity: bool, f: impl FnOnce(&mut St, &Ctx) -> R) -> R {
-        let (r, want, power_off) = {
-            let mut st = self.st.lock();
-            let ctx = Ctx { ps2: &self.ps2, eth_parity: parity };
-            let pins = st.pin_data;
-            let r = f(&mut st, &ctx);
-            self.show_lightbar(&st, pins);
-            (r, st.deadlines(), std::mem::take(&mut st.power_off_pending))
-        };
-        self.arm(want);
+        let mut st = self.st.lock();
+        let ctx = Ctx { ps2: &self.ps2, eth_parity: parity };
+        let pins = st.pin_data;
+        let r = f(&mut st, &ctx);
+        self.show_lightbar(&st, pins);
+        let power_off = std::mem::take(&mut st.power_off_pending);
+        self.arm(st);
         self.sync_superio();
         if power_off {
             if let Some(tx) = self.events.get() {
@@ -2244,12 +2242,20 @@ impl Shared {
         }
     }
 
-    /// Make the pending timers match `want`: one one-shot per deadline. A
-    /// timer whose deadline moved is replaced; with none set or the chip not
-    /// running, deadlines are only evaluated lazily, by the next access.
-    fn arm(&self, want: Deadlines) {
+    /// Make the pending timers match the deadlines `st` holds: one one-shot
+    /// per deadline. A timer whose deadline moved is replaced; with none set
+    /// or the chip not running, deadlines are only evaluated lazily, by the
+    /// next access.
+    ///
+    /// `armed` is taken before `st` is let go, so passes set the timers in
+    /// the order they saw the chip. Otherwise a receive thread's pass that
+    /// read the chip just before a register write could arm after that
+    /// write, from the older deadlines, and remove the timer it set.
+    fn arm(&self, st: MutexGuard<'_, St>) {
+        let want = st.deadlines();
         let Some(tm) = self.timers.get() else { return };
         let mut armed = self.armed.lock();
+        drop(st);
         // Checked under the lock `stop` clears the slots with: a pass that
         // sees `running` set has its timers removed by that stop.
         if !self.running.load(Ordering::SeqCst) {
@@ -2306,8 +2312,7 @@ impl Shared {
 
     /// Arm for whatever deadlines the chip holds now.
     fn rearm(&self) {
-        let want = self.st.lock().deadlines();
-        self.arm(want);
+        self.arm(self.st.lock());
     }
 
     /// Feed host input from serial backend `port` into its FIFO until the
