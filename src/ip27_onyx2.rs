@@ -14,8 +14,9 @@
 //! - Either Hub's processor reaches the BaseIO-G, and the Bridge takes DMA and
 //!   interrupts to the Hub whose widget the guest programs into it, so the
 //!   board the stock PROM makes the global master receives them.
-//! - The BaseIO-G is its base board only: the MediaIO daughtercard and the
-//!   audio chip are not fitted, and the board record is the base board's.
+//! - The MediaIO's two serial ports have no host backend, and the host's keys
+//!   and pointer go to the board IOC3's controller only; which of the two
+//!   keyboard and mouse connectors reaches which IOC3 is not known.
 //! - The rest is as the Origin 2000 deskside's list in
 //!   [`crate::ip27_origin2000`].
 //!
@@ -25,18 +26,23 @@ use crate::config::MachineConfig;
 use crate::dev::bridge::Bridge;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub_md::SlotSignals;
+use crate::dev::ioc3::{ByteBus, Ioc3};
 use crate::dev::node_flash::FlashValues;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::devlog::LogModule;
 use crate::ip27_machine::{cpu_module, pci_devices, BoardIo, BoardSpec, Ip27Board, Ip27Machine, Node, NodeRecord};
+use crate::pci::DevFn;
 use crate::ip27_origin2000::{Origin2000, BRIDGE_REVISION, MAX_NODES, XBOW_REVISION};
-use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_ERR};
+use crate::traits::{BusDevice, BusRead32, BusRead64, Resettable, BUS_ERR};
 use crate::xtalk::{HostPort, XtalkHost};
 use std::sync::Arc;
 
 pub type Onyx2Machine = Ip27Machine<Onyx2Deskside>;
+
+/// The MediaIO daughtercard's IOC3, a PCI device of the BaseIO-G's Bridge.
+const MEDIAIO_DEVICE: u8 = 6;
 
 /// The graphics slot's widget, and the BaseIO-G's.
 const WIDGET_PIPE: u8 = 8;
@@ -97,6 +103,30 @@ impl Onyx2Deskside {
             bus.add(Box::new(board_record_part(&record, serial)));
         }
         bus
+    }
+}
+
+impl Onyx2Deskside {
+    /// The MediaIO daughtercard's IOC3, at PCI device 6 of the BaseIO-G's
+    /// Bridge: both serial ports, a keyboard and mouse controller and the
+    /// parallel port, but no Ethernet, clock or one-wire part. Its ports have
+    /// no host backend: they are peripheral lines, where the board IOC3's
+    /// first is the console. The host's keys and pointer go to the board
+    /// IOC3's controller.
+    fn fit_mediaio(node: &Node, bridge: &Bridge, io: &mut BoardIo) {
+        let pci = bridge.bus();
+        let mio = Arc::new(Ioc3::new(&crate::dev::ioc3::MIO, [0; 6], ByteBus::None));
+        pci.attach(DevFn { device: MEDIAIO_DEVICE, function: 0 }, mio.clone());
+        mio.connect_superio(pci);
+        mio.set_timer_manager(node.timers.clone());
+        mio.register_locks();
+        io.devices.push(mio.clone());
+        io.monitor.push(mio.ps2());
+        let board = std::mem::replace(&mut io.reset, Box::new(|| {}));
+        io.reset = Box::new(move || {
+            board();
+            mio.power_on();
+        });
     }
 }
 
@@ -189,7 +219,10 @@ impl Ip27Board for Onyx2Deskside {
                 node.memory.route_nodes(node.hub.claim(Space::Memory));
             }
         }
-        pci_devices(owner, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, "onyx2", Self::NAME)
+        let pci_bridge = bridge.clone();
+        let mut io = pci_devices(owner, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, "onyx2", Self::NAME)?;
+        Self::fit_mediaio(owner, &pci_bridge, &mut io);
+        Ok(io)
     }
 }
 
