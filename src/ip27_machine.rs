@@ -240,6 +240,13 @@ pub struct BoardIo {
     pub controller: Arc<dyn ModuleController>,
     /// Put the board's devices back to power-on.
     pub reset: Box<dyn Fn() + Send + Sync>,
+    /// The window of the graphics board, when one is fitted.
+    pub display: Option<Arc<dyn GfxDisplay>>,
+    /// The status bar's source, to learn the processors' clocks once they exist.
+    pub status: Option<Arc<crate::disp::StatusSource>>,
+    /// The InfiniteReality pipe, for a test to drive.
+    #[cfg(test)]
+    pub pipe: Option<Arc<crate::dev::kona::Kona>>,
     /// The Bridge, for a test to drive.
     #[cfg(test)]
     pub bridge: Arc<Bridge>,
@@ -493,6 +500,14 @@ impl<B: Ip27Board> Ip27Machine<B> {
             units.push(Unit { node, cpu });
         }
         let watch = ControllerWatch::new(io.controller.clone(), tx, &units[0].node.timers);
+        if let Some(status) = &io.status {
+            let cpu = &units[0].cpu;
+            status.set_cpu_cycles(cpu.cycles_ptr());
+            status.set_count_hz(cpu.count_hz_atomic());
+            for u in &units[1..] {
+                status.add_cpu_stats(u.cpu.cycles_ptr(), u.cpu.fasttick_count());
+            }
+        }
 
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
@@ -538,6 +553,12 @@ impl<B: Ip27Board> Ip27Machine<B> {
     #[cfg(test)]
     pub(crate) fn cpu_at(&self, n: usize) -> &Arc<dyn CpuDevice> {
         &self.units[n].cpu
+    }
+
+    /// The InfiniteReality pipe, for tests.
+    #[cfg(test)]
+    pub(crate) fn pipe(&self) -> Option<&Arc<crate::dev::kona::Kona>> {
+        self.io.pipe.as_ref()
     }
 
     /// The board's Bridge, for tests.
@@ -714,7 +735,13 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         self.lifecycle = state;
     }
     fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        None
+        self.io.display.clone()
+    }
+    fn save_snapshot(&mut self, _name: &str) -> Result<(), String> {
+        Err(format!("snapshots of the {} are not supported yet: the Hubs and node memory have no saved state", self.name))
+    }
+    fn load_snapshot(&mut self, _name: &str) -> Result<(), String> {
+        Err(format!("snapshots of the {} are not supported yet: the Hubs and node memory have no saved state", self.name))
     }
     fn register_monitor_device(&self, device: Arc<dyn Device>) {
         self.monitor.register_device(device);
@@ -892,7 +919,7 @@ impl Ip27Board for Origin200 {
         for widget in (0..16).filter(|&w| w != WIDGET_HUB) {
             node.hub.connect_widget(widget, bridge.clone());
         }
-        pci_devices(node, cfg, PciPopulation { bridge, ioc3: &crate::dev::ioc3::IP29, controller })
+        pci_devices(node, cfg, PciPopulation { bridge, ioc3: &crate::dev::ioc3::IP29, controller, heartbeat: Arc::new(AtomicU64::new(0)) })
     }
 }
 
@@ -915,14 +942,15 @@ pub(crate) struct PciPopulation {
     /// SuperIO interrupt takes.
     pub ioc3: &'static Ioc3Board,
     pub controller: Arc<dyn ModuleController>,
+    /// The status bar's activity bits, which the Bridge's devices set.
+    pub heartbeat: Arc<AtomicU64>,
 }
 
 /// The PCI devices both IP27 I/O boards carry behind their Bridge: two
 /// ISP1040s and an IOC3 with its Ethernet, serial ports and Timekeeper.
 pub(crate) fn pci_devices(node: &Node, cfg: &MachineConfig, population: PciPopulation) -> Result<BoardIo, String> {
-    let PciPopulation { bridge, ioc3: ioc3_board, controller } = population;
+    let PciPopulation { bridge, ioc3: ioc3_board, controller, heartbeat } = population;
     let (scsi_name, name) = (table(cfg), product(cfg));
-    let heartbeat = Arc::new(AtomicU64::new(0));
     let (bus_a, bus_b) = (Isp1040::new_bus(), Isp1040::new_bus());
     let attached = crate::scsi::attach_from_config(cfg, Some(scsi_name), &|c| match c {
         0 => Ok(&bus_a),
@@ -994,6 +1022,10 @@ pub(crate) fn pci_devices(node: &Node, cfg: &MachineConfig, population: PciPopul
         nat,
         controller,
         reset,
+        display: None,
+        status: None,
+        #[cfg(test)]
+        pipe: None,
         #[cfg(test)]
         bridge: test_bridge,
     })

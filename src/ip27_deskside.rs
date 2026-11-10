@@ -38,10 +38,13 @@
 //! - Origin 2000: node 2 has no I/O of its own, since a deskside's second
 //!   Crossbow carries the other six XIO slots, none of them fitted here. The
 //!   Bridge reaches only the Hub that owns its Crossbow, node 1's.
-//! - Onyx2: the graphics slot holds a test widget that answers its
-//!   identification and nothing else, not an InfiniteReality pipe. Either
-//!   Hub's processor reaches the BaseIO-G, and the Bridge takes DMA and
-//!   interrupts to the Hub whose widget the guest programs into it, so the
+//! - Onyx2: the graphics slot holds an InfiniteReality2 or 2E pipe
+//!   (`[graphics] board = "ir2"`, `"ir2:2rm"`, `"ir2e"` or `"ir2e:2rm"`), or
+//!   with `none` a test widget that answers its identification and nothing
+//!   else. The pipe's DMA and interrupt packets
+//!   reach the Hub at the widget the guest programs into it, as the Bridge's
+//!   do. Either Hub's processor reaches the BaseIO-G, and the Bridge takes DMA
+//!   and interrupts to the Hub whose widget the guest programs into it, so the
 //!   board the stock PROM makes the global master receives them.
 //! - Cached accesses to node numbers 1 and up route through the Hub, and a
 //!   number no Hub holds fails. A node that holds a nonzero number sends node
@@ -53,9 +56,11 @@ use crate::config::{MachineConfig, MachineProfile};
 use crate::dev::bridge::Bridge;
 use crate::dev::elsc::ModuleOutput;
 use crate::dev::elsc_nvram::ElscNvram;
+use crate::devlog::LogModule;
 use crate::dev::hub::{Hub, HubConfig, Space};
 use crate::dev::hub::SlotSignals;
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
+use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::rad1::Rad1;
 use crate::dev::node_flash::FlashValues;
 use crate::dev::o2000_module::{ModuleConfig, Origin2000Module};
@@ -64,9 +69,12 @@ use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::dev::xbow::{widget_id, Xbow};
 use crate::pci::DevFn;
 use crate::ip27_machine::{cpu_module, fit_io_prom, pci_devices, product, PciPopulation, section, table, BoardIo, BoardSpec, Ip27Board, Ip27Machine, ModuleController, Node, NodeRecord, Unmodelled};
-use crate::traits::{BusDevice, Resettable};
+use crate::irq::InterruptController;
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR};
+use crate::xtalk::Upstream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 pub type DesksideMachine = Ip27Machine<Deskside>;
@@ -169,6 +177,50 @@ pub static ONYX2: DesksideLayout = DesksideLayout {
 
 /// The test widget's identification: not a real part.
 const TEST_WIDGET_ID: u32 = widget_id(0, 0x7e57, 0x36);
+
+/// Where the pipe's interrupt packets and DMA go: the host at the widget the
+/// guest has programmed into the pipe, behind that widget's Crossbow link.
+/// Nothing is delivered while the widget names no host with a live link.
+struct PipeHosts {
+    pipe: OnceLock<Weak<Kona>>,
+    up: Upstream,
+}
+
+impl PipeHosts {
+    fn host(&self) -> Option<&crate::xtalk::HostPort> {
+        let widget = self.pipe.get()?.upgrade()?.dma_widget() as u8;
+        let host = self.up.get(widget).filter(|h| h.link_up());
+        if host.is_none() {
+            crate::dlog!(LogModule::Kona, "Onyx2: the pipe names widget {widget}, which is no Hub with a live link");
+        }
+        host
+    }
+}
+
+impl InterruptController for PipeHosts {
+    fn set_line(&self, line: u32, level: bool) {
+        if let Some(h) = self.host() {
+            h.irq.set_line(line, level);
+        }
+    }
+}
+
+macro_rules! pipe_dma {
+    ($r:ident, $w:ident, $t:ty, $out:ident) => {
+        fn $r(&self, a: u64) -> $out {
+            self.host().map_or($out::err(), |h| h.mem.$r(a))
+        }
+        fn $w(&self, a: u64, v: $t) -> u32 {
+            self.host().map_or(BUS_ERR, |h| h.mem.$w(a, v))
+        }
+    };
+}
+impl BusDevice for PipeHosts {
+    pipe_dma!(read8, write8, u8, BusRead8);
+    pipe_dma!(read16, write16, u16, BusRead16);
+    pipe_dma!(read32, write32, u32, BusRead32);
+    pipe_dma!(read64, write64, u64, BusRead64);
+}
 
 /// The module management as the machine drives it: the adapters to reset
 /// with the module, and the outputs to drain.
@@ -311,7 +363,14 @@ impl Deskside {
     /// Every node board is a host of the one Crossbow, which carries the
     /// BaseIO and the graphics slot. Returns the Bridge and the node that owns
     /// the Crossbow.
-    fn wire_shared<'a>(nodes: &[&'a Node], cfg: &MachineConfig, layout: &DesksideLayout) -> Result<(Arc<Bridge>, &'a Node), String> {
+    /// An InfiniteReality2 pipe in the graphics slot too, when the configuration
+    /// names one: `status` is its status bar's source.
+    fn wire_shared<'a>(
+        nodes: &[&'a Node],
+        cfg: &MachineConfig,
+        layout: &DesksideLayout,
+        status: &Arc<crate::disp::StatusSource>,
+    ) -> Result<(Arc<Bridge>, &'a Node, Option<Arc<Kona>>), String> {
         let mut widgets = 1u16 << layout.baseio_widget;
         widgets |= layout.graphics_widget.map_or(0, |w| 1 << w);
         for i in 0..nodes.len() {
@@ -329,9 +388,23 @@ impl Deskside {
         xbow.connect_host(owner_port.host, owner.hub.interrupt_target());
         xbow.register_locks();
 
-        let hosts = nodes.iter().enumerate().map(|(i, n)| n.hub.host_port(layout.hub_widgets[i])).collect();
-        let bridge = Self::baseio_bridge(cfg, layout, xbow.upstream(hosts))?;
+        let hosts = || nodes.iter().enumerate().map(|(i, n)| n.hub.host_port(layout.hub_widgets[i])).collect::<Vec<_>>();
+        let bridge = Self::baseio_bridge(cfg, layout, xbow.upstream(hosts()))?;
         xbow.serve_bridge(layout.baseio_widget, &bridge);
+
+        let pipe = match (cfg.graphics_board().kona(), layout.graphics_widget) {
+            (Some((product, rm_count)), Some(_)) => {
+                let pipe_hosts = Arc::new(PipeHosts { pipe: OnceLock::new(), up: xbow.upstream(hosts()) });
+                let kona_cfg = KonaConfig::new(product, rm_count)?
+                    .with_host_widget(owner_port.host.widget)?
+                    .with_pool(cfg.graphics.threads, cfg.graphics.tile);
+                let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
+                let pipe = Kona::new(kona_cfg, pipe_hosts.clone(), pipe_hosts.clone(), status.clone(), flash)?;
+                let _ = pipe_hosts.pipe.set(Arc::downgrade(&pipe));
+                Some(pipe)
+            }
+            _ => None,
+        };
 
         let peers: Vec<(u8, Arc<dyn BusDevice>)> =
             nodes.iter().enumerate().map(|(i, n)| (layout.hub_widgets[i], n.hub.inbound())).collect();
@@ -339,7 +412,11 @@ impl Deskside {
             let hub = &node.hub;
             hub.connect_widget(0, xbow.clone());
             if let Some(w) = layout.graphics_widget {
-                hub.connect_widget(w, xbow.port(w, Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID))));
+                let slot: Arc<dyn BusDevice> = match &pipe {
+                    Some(p) => p.clone(),
+                    None => Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID)),
+                };
+                hub.connect_widget(w, xbow.port(w, slot));
             }
             hub.connect_widget(layout.baseio_widget, xbow.port(layout.baseio_widget, bridge.clone()));
             for (i, n) in nodes.iter().enumerate() {
@@ -348,7 +425,7 @@ impl Deskside {
             }
             hub.connect_packets(xbow.packets(peers.clone()));
         }
-        Ok((bridge, owner))
+        Ok((bridge, owner, pipe))
     }
 }
 
@@ -391,9 +468,15 @@ impl Ip27Board for Deskside {
     fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
         let layout = Self::layout(cfg.machine.profile)?;
         let controller = Self::controller(nodes, cfg)?;
-        let (bridge, host) = match layout.crossbows {
-            Crossbows::PerNode => Self::wire_per_node(nodes, cfg, layout)?,
-            Crossbows::Shared => Self::wire_shared(nodes, cfg, layout)?,
+        // The status bar's activity bits, shared with the Bridge's devices.
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let status = crate::disp::StatusSource::new(heartbeat.clone(), Arc::new(AtomicU64::new(0)));
+        let (bridge, host, pipe) = match layout.crossbows {
+            Crossbows::PerNode => {
+                let (bridge, host) = Self::wire_per_node(nodes, cfg, layout)?;
+                (bridge, host, None)
+            }
+            Crossbows::Shared => Self::wire_shared(nodes, cfg, layout, &status)?,
         };
         if let [a, b] = nodes {
             Hub::cable(&a.hub, &b.hub);
@@ -402,10 +485,26 @@ impl Ip27Board for Deskside {
             }
         }
         let pci_bridge = bridge.clone();
-        let population = PciPopulation { bridge, ioc3: layout.ioc3, controller };
+        let population = PciPopulation { bridge, ioc3: layout.ioc3, controller, heartbeat };
         let mut io = pci_devices(host, cfg, population)?;
         if let Some(media) = &layout.mediaio {
             Self::fit_mediaio(host, cfg, &pci_bridge, media, &mut io);
+        }
+        if let Some(p) = pipe {
+            io.display = Some(p.display());
+            io.status = Some(status);
+            io.devices.push(p.clone());
+            io.monitor.push(p.clone());
+            let reset = std::mem::replace(&mut io.reset, Box::new(|| {}));
+            let board = p.clone();
+            io.reset = Box::new(move || {
+                reset();
+                board.power_on();
+            });
+            #[cfg(test)]
+            {
+                io.pipe = Some(p);
+            }
         }
         Ok(io)
     }
