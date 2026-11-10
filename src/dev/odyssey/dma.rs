@@ -993,10 +993,10 @@ pub(super) fn field_value(word: u32, chan: u32, width: u32) -> u32 {
 
 impl Board {
     /// Pack the read's rectangle into out, host row by host row, rowbytes each.
-    /// A colour-index byte is the plane word itself, taken only where scanout
-    /// would take that word as an index: a colour-buffer pixel whose main
-    /// drawable's display mode is an index group, with a word that fits eight
-    /// bits. Anything else refuses the whole read, reported once. A colour
+    /// A colour-index byte is the plane word's index bits, taken only where
+    /// scanout would take that word as an index: a colour-buffer pixel whose
+    /// main drawable's display mode is an index group. Anything else refuses
+    /// the whole read, reported once. A colour
     /// layout over an index-mode pixel returns the raw index word's bytes as
     /// colour and is reported once: no inverse colormap is applied.
     pub fn dma_read_pack(&mut self, src: &DmaSource, l: &DmaLayout, w: u32, h: u32, bottom_up: bool, out: &mut [u8]) -> bool {
@@ -1033,7 +1033,7 @@ impl Board {
                     o += n;
                     continue;
                 }
-                let word = self.dma_read_pixel(src, x, y);
+                let mut word = self.dma_read_pixel(src, x, y);
                 let mut group = ODSY_GAMMA_GROUP;
 
                 if src.drawable {
@@ -1042,15 +1042,32 @@ impl Board {
                 }
                 let indexed = index_read || (index_or_red && group < ODSY_GAMMA_GROUP);
 
-                if indexed && (group >= ODSY_GAMMA_GROUP || word > index_max) {
+                if indexed && group >= ODSY_GAMMA_GROUP {
                     if self.dma_report(dma::REPORT_INDEX) {
                         crate::dlog!(
                             LogModule::Odyssey,
-                            "sgi-odyssey: DMA index read at ({}, {}) finds word {:#x} in display-mode group {}, not an eight-bit index",
+                            "sgi-odyssey: DMA index read at ({}, {}) finds word {:#x} in display-mode group {}, not an index group",
                             x, y, word, group
                         );
                     }
                     return false;
+                }
+                // APPROXIMATION, not what the board is known to do: the bits of
+                // the word above the width the read names (8 bits for the
+                // read header's class 0 code 1, 12 for class 1 code 14) are
+                // dropped. What the board returns for a word wider than the
+                // read is UNKNOWN; refusing the read, as this once did, broke
+                // cicopy --bits 8 because an 8-bit visual's index mask leaves
+                // the bits above it alone on a clear or a draw, so a window
+                // holds whatever the screen held before (0xff03 where 3 was
+                // cleared), and a refused read left the guest buffer stale.
+                // To settle it, store 0xff03 into an 8-bit PseudoColor pixel
+                // past the write mask and glReadPixels it as COLOR_INDEX,
+                // UNSIGNED_BYTE and UNSIGNED_SHORT: 0x03 and 0x0003 means the
+                // board masks, 0xff03 that it passes the word through, and a
+                // refused read that it faults.
+                if indexed {
+                    word &= index_max;
                 }
                 if !indexed && group < ODSY_GAMMA_GROUP && self.dma_report(dma::REPORT_COLOUR_OVER_INDEX) {
                     crate::dlog!(

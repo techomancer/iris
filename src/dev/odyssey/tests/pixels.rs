@@ -308,6 +308,20 @@ fn a_colour_index_read_returns_the_index() {
     assert_eq!(got[..2], [0xa5, 0xa5], "the red byte of 0xa55a3cff");
 }
 
+/// An 8-bit colour-index window's clear and draws write the index under
+/// the index mask, 0xff, and leave the field's upper bits as they were.
+/// A one-byte index read returns the low byte, an approximation (see
+/// `dma_read_pack`). cicopy --bits 8 found the whole read refused, the
+/// guest buffer left holding the previous read.
+#[test]
+fn an_eight_bit_index_read_ignores_the_bits_above_the_index() {
+    let (mut s, ram) = read_window();
+    s.regs().set_dispmode((0) as usize, 0);
+    pixel_write(&mut s, 31, 40, 0xff03);
+    let got = dma_read(&mut s, &ram, (31, 40, 1), read_word4(0, 1), 1);
+    assert_eq!(got[..2], [0x03, 0xa5]);
+}
+
 /// A GL image write by DMA to the draw drawable: the table at `TABLE` names
 /// `payload` for a `w` x 1 box at (x, y) under word 4 `word4` and word 7's
 /// low bits `code`, four bytes a pixel, rows bottom-up.

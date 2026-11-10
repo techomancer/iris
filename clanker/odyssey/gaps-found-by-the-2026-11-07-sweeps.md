@@ -25,7 +25,10 @@ the GPU raster unit: these are model gaps, not GPU regressions.
   buffer bit toggles).
 - **`cicopy`**: the back-to-front copy's front bit (word 2 bit 31) is now
   honoured: the copy lands in the buffer the window displays
-  (`front, copied from back`).
+  (`front, copied from back`). `--bits 8` read refused an index word with
+  stale upper bits (`back, cleared`); the read now drops the bits above the
+  index width, an approximation (see `dma_read_pack`). `--bits 8` still
+  fails `back, drawn from host shorts`.
 - **glstate**: 5 failures (fog index, index write mask, index clear value,
   `PIXEL_TEXTURE_SGIS` enable), as before.
 - **pixtest RGBA**: 53 failures, the ones the first V10 comparison listed
