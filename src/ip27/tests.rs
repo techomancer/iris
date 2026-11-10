@@ -36,10 +36,27 @@ fn fitted_memory_answers_where_the_runs_are_and_nowhere_else() {
     assert_eq!(phys.read32(0x1000).data, 0xdead_beef);
     assert_eq!(phys.write32(0x4000_0008, 7), BUS_OK);
     assert_eq!(phys.read32(0x4000_0008).data, 7);
-    // Past the 64 MiB bank and in the empty bank 1: zero, writes dropped.
-    assert_eq!(phys.write32(0x400_0000, 1), BUS_OK);
-    assert_eq!(phys.read32(0x400_0000).data, 0);
-    assert_eq!(phys.read32(0x2000_0000).data, 0);
+}
+
+/// A bank that is not fitted, and the gap past a smaller one, fail every
+/// access at every width: the firmware's sizing walk takes the bus error a
+/// machine without that memory would give it.
+#[test]
+fn unfitted_memory_bus_errors_reads_and_writes() {
+    let mem = NodeMemory::new([64, 0, 128, 0]).unwrap();
+    let phys = mem.physical();
+    for a in [0x400_0000, 0x2000_0000, 0x6000_0000] {
+        assert_eq!(phys.read8(a).status, BUS_ERR, "{a:#x}");
+        assert_eq!(phys.read16(a).status, BUS_ERR, "{a:#x}");
+        assert_eq!(phys.read32(a).status, BUS_ERR, "{a:#x}");
+        assert_eq!(phys.read64(a).status, BUS_ERR, "{a:#x}");
+        assert_eq!(phys.write8(a, 1), BUS_ERR, "{a:#x}");
+        assert_eq!(phys.write16(a, 1), BUS_ERR, "{a:#x}");
+        assert_eq!(phys.write32(a, 1), BUS_ERR, "{a:#x}");
+        assert_eq!(phys.write64(a, 1), BUS_ERR, "{a:#x}");
+    }
+    assert_eq!(phys.write32(0x3ff_fffc, 5), BUS_OK, "the last word of the fitted bank still answers");
+    assert_eq!(phys.read32(0x3ff_fffc).data, 5);
 }
 
 #[test]
