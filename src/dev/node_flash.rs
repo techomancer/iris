@@ -63,8 +63,10 @@ pub struct FlashValues {
 }
 
 impl FlashValues {
-    /// The Origin 200 with a 180 MHz R10000 and 1 MiB of secondary cache.
-    pub const ORIGIN200_R10000_180_1M: Self = Self {
+    /// The stock PROM image's own values: the Origin 200 with a 180 MHz R10000
+    /// and 1 MiB of secondary cache. Every product starts from them and
+    /// replaces what differs for it and its processor module.
+    pub const STOCK_R10000_180: Self = Self {
         machine_type: 1,
         read_cycles: 15,
         write_cycles: 4,
