@@ -1343,9 +1343,7 @@ fn ntp_answers_with_the_host_clock() {
 
 // ── The event loop ───────────────────────────────────────────────────────────
 
-/// The engine sleeps when idle and wakes at once when the NIC signals (Unix:
-/// elsewhere it waits in 1 ms ticks).
-#[cfg(unix)]
+/// The engine sleeps when idle and wakes at once when the NIC signals.
 #[test]
 fn engine_sleeps_until_signalled() {
     let mut net = TestNet::default();
@@ -1358,8 +1356,7 @@ fn engine_sleeps_until_signalled() {
     assert!(t0.elapsed() < Duration::from_millis(100), "a notify didn't end the wait: {:?}", t0.elapsed());
 }
 
-/// A host socket becoming readable ends the wait (Unix: it is in the poll set).
-#[cfg(unix)]
+/// A host socket becoming readable ends the wait.
 #[test]
 fn engine_wakes_for_host_data() {
     let (port, h) = udp_echo_host();
