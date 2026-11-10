@@ -186,6 +186,63 @@ pub struct Timing {
     pub pairs: u64,
     /// Batches by raster time: under 0.1, 0.3, 1, 3, 10 ms and over.
     pub raster_hist: [u64; 6],
+    /// `WGPU_BATCH_LOG=file`: one line a batch (prims, busy tiles, pairs,
+    /// bin ns, raster ns, graphics and memory clock MHz or 0).
+    log: Option<std::io::LineWriter<std::fs::File>>,
+    /// The card's clocks, when Linux reports them.
+    clocks: Option<Clocks>,
+    /// Raster time the clocks were read for, and it weighted by them
+    /// (ns x MHz).
+    clock_ns: f64,
+    gfx_ns_mhz: f64,
+    mem_ns_mhz: f64,
+}
+
+/// The card's average graphics and memory clocks from amdgpu's
+/// `gpu_metrics` (Linux, readable without root): what a timing was taken
+/// at, since the driver lowers the clocks while the GPU is mostly idle and
+/// a GPU time means little without them. Only the layouts of format 1,
+/// content revisions 1 to 3 (discrete RDNA and Vega cards) are read; any
+/// other card, driver or system has none, and the report leaves them out.
+struct Clocks {
+    path: std::path::PathBuf,
+}
+
+impl Clocks {
+    /// The `gpu_metrics` of the card with the adapter's PCI ids.
+    fn of(gpu: &Gpu) -> Option<Clocks> {
+        let info = gpu.adapter.get_info();
+        let hex = |p: &std::path::Path| std::fs::read_to_string(p).ok().and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+        for e in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+            let dev = e.path().join("device");
+            if hex(&dev.join("vendor")) == Some(info.vendor) && hex(&dev.join("device")) == Some(info.device) && dev.join("gpu_metrics").exists() {
+                let c = Clocks { path: dev.join("gpu_metrics") };
+                return c.read().map(|_| c);
+            }
+        }
+        None
+    }
+
+    /// The average graphics and memory clocks, in MHz.
+    fn read(&self) -> Option<(f64, f64)> {
+        Clocks::parse(&std::fs::read(&self.path).ok()?)
+    }
+
+    /// The clocks in a `gpu_metrics` blob, when it has a layout we know.
+    fn parse(b: &[u8]) -> Option<(f64, f64)> {
+        // Header: size, format revision 1, content revision 1 to 3; the
+        // average gfxclk and uclk at bytes 40 and 44.
+        if b.len() < 46 || b[2] != 1 || !(1..=3).contains(&b[3]) {
+            return None;
+        }
+        let at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let (gfx, mem) = (at(40), at(44));
+        // 0xffff: the firmware does not report it.
+        if gfx == u16::MAX || mem == u16::MAX || gfx == 0 {
+            return None;
+        }
+        Some((gfx as f64, mem as f64))
+    }
 }
 
 impl Timing {
@@ -197,7 +254,7 @@ impl Timing {
         let resolve = gpu.buffer("batch timing resolve", 32, wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
         let read = gpu.buffer("batch timing read", 48, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         let period_ns = gpu.queue.get_timestamp_period() as f64;
-        Some(Timing { queries, resolve, read, period_ns, batches: 0, prims: 0, bin_ns: 0.0, raster_ns: 0.0, tiles: 0, tiles_max: 0, pairs: 0, raster_hist: [0; 6] })
+        Some(Timing { queries, resolve, read, period_ns, batches: 0, prims: 0, bin_ns: 0.0, raster_ns: 0.0, tiles: 0, tiles_max: 0, pairs: 0, raster_hist: [0; 6], log: std::env::var("WGPU_BATCH_LOG").ok().and_then(|f| std::fs::File::create(f).ok()).map(std::io::LineWriter::new), clocks: Clocks::of(gpu), clock_ns: 0.0, gfx_ns_mhz: 0.0, mem_ns_mhz: 0.0 })
     }
 
     fn writes(&self, first: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
@@ -234,12 +291,27 @@ impl Timing {
         let ms = raster / 1e6;
         let i = [0.1, 0.3, 1.0, 3.0, 10.0].iter().position(|&l| ms < l).unwrap_or(5);
         self.raster_hist[i] += 1;
+        let (gfx, mem) = self.clocks.as_ref().and_then(|c| c.read()).unwrap_or((0.0, 0.0));
+        if gfx != 0.0 {
+            self.clock_ns += raster;
+            self.gfx_ns_mhz += raster * gfx;
+            self.mem_ns_mhz += raster * mem;
+        }
+        if let Some(l) = &mut self.log {
+            use std::io::Write;
+            let _ = writeln!(l, "{} {} {} {:.0} {:.0} {:.0} {:.0}", prims, busy.count, busy.pairs, ns(t[0], t[1]), raster, gfx, mem);
+        }
     }
 
     /// One line: the totals and the averages per batch.
     pub fn report(&self) -> String {
         let n = self.batches.max(1) as f64;
-        format!(
+        let clocks = if self.clock_ns > 0.0 {
+            format!(", raster at gfx {:.0} MHz mem {:.0} MHz", self.gfx_ns_mhz / self.clock_ns, self.mem_ns_mhz / self.clock_ns)
+        } else {
+            String::new()
+        };
+        let line = format!(
             "gpu timing: {} batches, {:.1} prims/batch, bin {:.3} s, raster {:.3} s ({:.3} ms/batch), busy tiles {:.0}/batch (max {}), {:.2} prims/busy tile, raster ms <0.1/<0.3/<1/<3/<10/more: {:?}",
             self.batches,
             self.prims as f64 / n,
@@ -250,7 +322,8 @@ impl Timing {
             self.tiles_max,
             self.pairs as f64 / self.tiles.max(1) as f64,
             self.raster_hist
-        )
+        );
+        line + &clocks
     }
 }
 
@@ -527,4 +600,42 @@ impl<R: Pod, S: Pod> Batch<R, S> {
 
 fn entry(binding: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::Clocks;
+
+    /// A `gpu_metrics` blob of format 1, content `rev`, with the average
+    /// graphics and memory clocks at their places.
+    fn blob(rev: u8, gfx: u16, mem: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 120];
+        b[0] = 120;
+        b[2] = 1;
+        b[3] = rev;
+        b[40..42].copy_from_slice(&gfx.to_le_bytes());
+        b[44..46].copy_from_slice(&mem.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn known_layouts_give_the_average_clocks() {
+        for rev in 1..=3 {
+            assert_eq!(Clocks::parse(&blob(rev, 2639, 1000)), Some((2639.0, 1000.0)));
+        }
+    }
+
+    #[test]
+    fn other_layouts_and_unreported_clocks_give_none() {
+        assert_eq!(Clocks::parse(&blob(0, 2639, 1000)), None);
+        assert_eq!(Clocks::parse(&blob(4, 2639, 1000)), None);
+        let mut apu = blob(1, 2639, 1000);
+        apu[2] = 2;
+        assert_eq!(Clocks::parse(&apu), None);
+        assert_eq!(Clocks::parse(&blob(3, u16::MAX, 1000)), None);
+        assert_eq!(Clocks::parse(&blob(3, 2639, u16::MAX)), None);
+        assert_eq!(Clocks::parse(&blob(3, 0, 1000)), None);
+        assert_eq!(Clocks::parse(&[1, 0, 1, 3]), None);
+        assert_eq!(Clocks::parse(&[]), None);
+    }
 }

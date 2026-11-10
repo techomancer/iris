@@ -280,6 +280,8 @@ where they differed:
   Maximum IMPACT 3.6 to 1.3; bin and raster together 13% and 12% less.
 - Texture reads on the GPU unit go through a plain binding of board
   memory with cached loads instead of atomics (1% of raster time).
+- `WGPU_BATCH_TIMING` reports the clocks the GPU ran at (amdgpu
+  `gpu_metrics`), and `WGPU_BATCH_LOG` writes a line per batch.
 - `WGPU_BATCH_TIMING` times each GPU batch's bin and raster passes with
   timestamp queries and counts its busy tiles and primitives per busy
   tile; `IRIS_WGPU_LOAD` compiles edited kernels from a directory instead
