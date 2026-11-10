@@ -2293,16 +2293,21 @@ fn cvt_f64_to_int_by_value(x: f64, dst_bits: u32) -> (u64, bool, bool) {
 /// 2 bits for plain CVT.W/CVT.L.
 fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
     let dst_bits = if dst_i64 { 64 } else { 32 };
+    // Inexact is judged against the source, not the rounded intermediate:
+    // the by-value helpers only ever see an integral value, so their own
+    // inexact result cannot tell 3.7 -> 3 from 3.0 -> 3.
     let (result, invalid, inexact) = if src_f64 {
         let bits = if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) };
         let x = f64::from_bits(bits);
         let rounded = round_f64_to_int_mode(x, rm);
-        cvt_f64_to_int_by_value(rounded, dst_bits)
+        let (result, invalid, _) = cvt_f64_to_int_by_value(rounded, dst_bits);
+        (result, invalid, !invalid && rounded != x)
     } else {
         let bits = if fr1 { core.read_fpr_w(fs_reg) } else { read_fpr_w_fr0(core, fs_reg) };
         let x = f32::from_bits(bits);
         let rounded = round_f32_to_int_mode(x, rm);
-        cvt_f32_to_int_by_value(rounded, dst_bits)
+        let (result, invalid, _) = cvt_f32_to_int_by_value(rounded, dst_bits);
+        (result, invalid, !invalid && rounded != x)
     };
 
     core.fpu_fcsr &= !FCSR_CM;
