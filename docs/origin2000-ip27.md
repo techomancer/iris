@@ -35,10 +35,8 @@ through an I2C adapter per node.
 - One node boots the stock PROM to the System Maintenance Menu and IRIX
   6.5.30 to a serial login.
 - Two nodes: the PROM finds both Hubs, numbers them, chooses the first as the
-  global master, passes its diagnostics with both processors and 256 MB and
-  reaches the menu. IRIX then stops with "Processor #1 did not start": the
-  second node's processor takes a TLB exception in the PROM (the master
-  reports "has taken an exception"), so it never waits to be launched.
+  global master, passes its diagnostics with both processors and 256 MB, and
+  IRIX 6.5.30 boots to a root login with both processors.
 - The BaseIO's boot flash is fitted only when `[origin2000] io_prom` names an
   I/O PROM image; without one the PROM falls back to its own copy of the I/O
   PROM.
