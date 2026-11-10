@@ -85,7 +85,7 @@ pub use ident::{KonaConfig, Product as KonaProduct};
 use back::KonaBackend;
 
 #[cfg(test)]
-use job::{Job, Reply};
+use job::{ContextEvent, Job, Reply};
 
 use defs::APERTURE;
 use handle::DisplayHandle;

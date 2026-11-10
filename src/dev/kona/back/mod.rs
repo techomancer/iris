@@ -9,14 +9,17 @@
 //! - `store`: the pixel store and the plane layout inside a pixel's words.
 //! - `raster`: drawing into the store, the fill rule, and triangle set-up.
 //! - `tiles`: the tile scheduler (slot ring, tile queues, workers, budget).
-//! - `textport`: the PROM's console.
+//! - `x`, `textport`: the X server's integer path and the PROM's console;
+//!   `context`: the state each rendering context keeps.
 //! - `display`: the tables the scan-out reads and the frame's composition.
 
 pub mod display;
 pub mod raster;
 pub mod tiles;
 pub mod store;
+pub mod context;
 pub mod textport;
+pub mod x;
 
 
 use super::defs::*;
@@ -30,6 +33,7 @@ use display::tables::Tables;
 use display::{ColourMap, Compositor};
 use store::layout::{BufferConfig, Layout, Refusal};
 use textport::Textport;
+use context::Contexts;
 use tiles::Tiles;
 use store::texture::TextureStore;
 use store::PixelStore;
@@ -179,6 +183,8 @@ pub struct KonaBackend {
     tables: Arc<parking_lot::Mutex<Tables>>,
     store: Arc<PixelStore>,
     textport: Textport,
+    /// The X path's state, one copy per rendering context.
+    contexts: Contexts,
     regions: RegionCounts,
     /// DAC cursor loads and refusals, as counts. The cursors themselves are in the display tables.
     dac_cursor_loads: u64,
@@ -206,6 +212,18 @@ pub struct KonaBackend {
 /// Where on the return page a video Get's reply goes.
 const VIDEO_REPLY_OFFSET: u32 = 8;
 
+/// Where on the return page a pixel read's bytes go: after the ready word and
+/// the word the reader skips.
+const PIXEL_REPLY_OFFSET: u32 = 8;
+
+/// Write a finished read to its host buffer a line at a time, after checking
+/// that every line has somewhere to go, so a read is written whole or not at
+/// all. False if a line is unmapped or fails on the bus.
+fn write_lines(port: &mut BackPort<'_>, done: &x::pixel::FeedDone) -> bool {
+    let lines = || done.data.chunks(done.line).enumerate().map(|(i, line)| (done.io + i as u64 * done.pitch, line));
+    lines().all(|(at, line)| port.device_mapped(at, line.len())) && lines().all(|(at, line)| port.device_write(at, line))
+}
+
 impl KonaBackend {
     pub fn new(cfg: KonaConfig) -> Self {
         let map = Arc::new(parking_lot::Mutex::new(ColourMap::default()));
@@ -219,6 +237,7 @@ impl KonaBackend {
             map,
             tables,
             display,
+            contexts: Contexts::default(),
             regions: RegionCounts::default(),
             dac_cursor_loads: 0,
             dac_cursor_refused: 0,
@@ -299,6 +318,38 @@ impl KonaBackend {
         writeln!(w, "display           {} frames, {} retraces completed, thread {}", self.clock.frames(), self.clock.completed(), if self.thread.is_some() { "running" } else { "stopped" })?;
         writeln!(w, "pixel store       {} word arrays of {} x {}", self.store.allocated().len(), self.store.width(), self.store.height())?;
         writeln!(w, "textport          colour {} raster {:?}, {} drawn, {} unmodelled", self.textport.colour(), self.textport.raster(), self.textport.drawn, self.textport.unmodelled)?;
+        let x = &self.contexts.current().x;
+        let gc = match x.gc() {
+            Ok(g) => format!("{:?} fg {:#x} bg {:#x} mask {:#x} gx {}", g.target, g.foreground, g.background, g.mask, g.gx),
+            Err(why) => format!("not decoded ({why:?})"),
+        };
+        writeln!(w, "X contexts        {} loaded; the last job's:", self.contexts.held())?;
+        writeln!(w, "X gc              {gc}")?;
+        writeln!(
+            w,
+            "X state           origin {:?}, {} clip rects ({} refused), scissor {:?}, {} runs dropped",
+            x.origin(),
+            x.clip_rects().len(),
+            x.clips_refused,
+            x.scissor(),
+            x.runs_dropped
+        )?;
+        writeln!(w, "X stipple         {}", if x.stipple.is_loaded() { "loaded" } else { "none loaded" })?;
+        let f = &x.fills;
+        writeln!(w, "X fills           {} drawn, refused: {} context, {} target, {} destination", f.drawn, f.bad_context, f.other_target, f.bad_destination)?;
+        let p = x.pixel_counts();
+        writeln!(
+            w,
+            "X pixels          {} setups, {} writes ({} by DMA), {} copies, {} reads, {} finishes",
+            p.setups, p.writes, p.dma_writes, p.copies, p.reads, p.finishes
+        )?;
+        writeln!(
+            w,
+            "  refused         {} context, {} target, {} destination, {} window copies, {} reads answered with zeros ({} frame-buffer word)",
+            p.bad_context, p.other_target, p.bad_destination, p.window_copies, p.reads_refused, p.fb_word_reads
+        )?;
+        writeln!(w, "  rows            {} short or left owing, {} with no write waiting", p.short, p.unexpected)?;
+        writeln!(w, "  read brackets   {} refused, {} with no completion posted (host buffer unwritable or no reason page)", p.bracket_refused, p.bracket_unposted)?;
         let r = &self.regions;
         writeln!(
             w,
@@ -384,6 +435,7 @@ impl KonaBackend {
         self.store.reset();
         self.textport.reset();
         self.tables.lock().reset();
+        self.contexts.reset();
         self.regions = RegionCounts::default();
         self.dac_cursor_loads = 0;
         self.dac_cursor_refused = 0;
@@ -473,6 +525,39 @@ impl KonaBackend {
         self.tiles.as_ref().is_some_and(|t| t.is_poisoned())
     }
 
+    /// A DMA packet: the rows of a pixel write that announced them, read a
+    /// line at a time into words (big-endian, as the programmed-I/O path
+    /// sends them). A packet with no write waiting is unclaimed. A read that
+    /// fails on the bus faults the packet and draws nothing.
+    fn dma_rows(&mut self, port: &mut BackPort<'_>, io: u64, physical: bool, lines: u32, per_line: u32, pitch: u64) -> Reply {
+        let x = &mut self.contexts.select(port.context()).x;
+        let Some(owed) = x.dma_write_words() else {
+            x.pixel_unexpected();
+            return Reply::Unclaimed;
+        };
+        let surface = raster::surface(&mut self.tiles, &self.store, textport::COLOUR_WORD);
+        let total = lines as u64 * per_line as u64;
+        // The packet's bytes, held to what the write owes: more is dropped.
+        let take = (total.min(owed as u64 * 4) as usize) / 4 * 4;
+        let mut bytes = vec![0u8; take];
+        let mut done = 0;
+        for l in 0..lines as u64 {
+            if done == take {
+                break;
+            }
+            let n = (per_line as usize).min(take - done);
+            if !port.dma_read(io.wrapping_add(l.wrapping_mul(pitch)), physical, &mut bytes[done..done + n]) {
+                port.dma_fault();
+                x.pixel_rows(&surface, &[]);
+                return Reply::Done;
+            }
+            done += n;
+        }
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+        x.pixel_rows(&surface, &words);
+        Reply::Done
+    }
+
     fn handle_job(&mut self, port: &mut BackPort<'_>, job: Job<'_>) -> Reply {
         self.counts[JobKind::of(&job) as usize] += 1;
         // What reads or writes the store without a surface waits for the jobs queued before it.
@@ -487,8 +572,7 @@ impl KonaBackend {
                 Some(h) if self.thread.is_some() => self.clock.request(h.epoch(), tag),
                 _ => port.retrace_done(tag),
             },
-            // No pixel write is waiting for a packet yet.
-            Job::DmaIn { .. } => return Reply::Unclaimed,
+            Job::DmaIn { io, physical, lines, per_line, pitch } => return self.dma_rows(port, io, physical, lines, per_line, pitch),
             Job::FirmwareStart { combination } => {
                 // The store keeps the configured size; a combination that sets another is logged and the
                 // configured size is what the configuration request reports.
@@ -519,9 +603,61 @@ impl KonaBackend {
                     (DISPLAY_MODE_BYTE, &[0, id, mode]) => self.tables.lock().load_mode(id, mode),
                     _ => {}
                 }
+                let c = self.contexts.select(port.context());
+                let x = &mut c.x;
+                if !x.command(selector, args) {
+                    if x::fill::paints(selector) {
+                        let surface = raster::surface(&mut self.tiles, &self.store, textport::COLOUR_WORD);
+                        x.draw_command(&surface, selector, args);
+                    } else if x::fill::is_draw(selector) {
+                        // A data token only collects words for the paint that follows.
+                        x.collect_command(selector, args);
+                    } else if x::pixel::is_pixel(selector) {
+                        let surface = raster::surface(&mut self.tiles, &self.store, textport::COLOUR_WORD);
+                        let answered = port.context().is_some() && port.return_page_valid();
+                        match x.pixel_command(&surface, selector, args, answered) {
+                            x::pixel::Next::Nothing => {}
+                            x::pixel::Next::Words(n) => return Reply::Data(n),
+                            x::pixel::Next::Dma => {}
+                            x::pixel::Next::Return(data) => {
+                                if answered {
+                                    port.post_return(PIXEL_REPLY_OFFSET, &data);
+                                }
+                            }
+                        }
+                    }
+                }
+                match selector {
+                    START_SELECT_FEEDBACK_RETURN_DMA => {
+                        x.feed_start(args, port.context().is_some());
+                    }
+                    FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE => {
+                        if let Some(done) = x.feed_finish(args) {
+                            // As the recorder's model does: a read that cannot be
+                            // written, or a finish with no reason page to post to,
+                            // posts no completion. It is counted and logged.
+                            if port.reason_page_valid() && write_lines(port, &done) {
+                                port.post_reason_words(FINISH_SELECT_FEEDBACK_WITH_EVENT_CODE, &[0x100, done.echo, 0, 0]);
+                            } else {
+                                x.bracket_unposted();
+                                crate::dlog!(crate::devlog::LogModule::Kona, "kona: read bracket's {} bytes not written or no reason page; no completion posted", done.data.len());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // A stipple store's rows follow it as a run the back end sizes.
+                if selector == x::stipple::X_STORE_STIPPLE && x.stipple.pending_rows() != 0 {
+                    return Reply::Data(x.stipple.pending_rows());
+                }
             }
             Job::Data { grammar: Grammar::Kernel, selector: LOAD_GAMMA_TABLE_ENTRIES, args: &[start, _], words } => self.tables.lock().load_gamma(start, words),
             Job::Data { grammar: Grammar::Kernel, selector: LOAD_COLOUR_MAP_ENTRIES, args: &[start, _], words } => self.tables.lock().load_colours(start, words),
+            Job::Data { grammar: Grammar::Kernel, selector: x::stipple::X_STORE_STIPPLE, words, .. } => self.contexts.select(port.context()).x.stipple.rows(words),
+            Job::Data { grammar: Grammar::Kernel, selector: x::pixel::X_PIXEL_WRITE, words, .. } => {
+                let surface = raster::surface(&mut self.tiles, &self.store, textport::COLOUR_WORD);
+                self.contexts.select(port.context()).x.pixel_rows(&surface, words);
+            }
             Job::Data { grammar: Grammar::Kernel, selector: LOAD_CURSOR_IMAGE_BLOCK, args: &[at], words } => self.tables.lock().load_cursor(at, words),
             Job::Indirect { selector, value } => self.tables.lock().indirect(selector, value),
             Job::Video { command: VIDEO_DAC_CURSOR_LOAD, data } => {
@@ -539,6 +675,7 @@ impl KonaBackend {
                     port.post_return(VIDEO_REPLY_OFFSET, &reply);
                 }
             }
+            Job::Context(e) => self.contexts.event(e),
             Job::Bitmap { header, payload } => {
                 let surface = raster::surface(&mut self.tiles, &self.store, textport::COLOUR_WORD);
                 self.textport.bitmap(&surface, header, payload)
@@ -753,6 +890,71 @@ mod tests {
         assert_eq!(b.store.read(3, 3, 1), 0);
     }
 
+    /// X state commands load the context, position, clip and scissor; the
+    /// monitor shows what was understood.
+    #[test]
+    fn x_state_commands_are_taken_and_shown() {
+        let mut b = backend();
+        let gc = [0x5a000, 0x1ffe, 0xa5000, 0x1ffe, 0xf00fff, 0, 0x180c, 0x40001, 1, 6, 5, 1, 1];
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &gc);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_DRAWABLE_ORIGIN_AND_SIZE_LOAD, &[240, 295, 100, 50]);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_CLIP_LOAD, &[1, 10, 20, 110, 220]);
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_SCISSOR_LOAD, &[10, 20, 100, 200]);
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("MainIndex16 fg 0x5a00 bg 0xa500 mask 0xffff gx 3"), "{text}");
+        assert!(text.contains("origin (240, 295), 1 clip rects (0 refused), scissor Some([10, 20, 100, 200])"), "{text}");
+        // The same selector numbers in another grammar are not X state.
+        command(&mut b, Grammar::Gl, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &[0; 13]);
+        command(&mut b, Grammar::Kernel, PIPE_SET_UP, &[0, 0, 0]);
+        assert!(run(&mut b, &["status"]).1.contains("MainIndex16"));
+        b.reset();
+        assert!(run(&mut b, &["status"]).1.contains("not decoded"));
+    }
+
+    /// An X box through `Backend::job` draws into the colour word of the store
+    /// under the loaded context, and a command that is no X token leaves a
+    /// waiting run alone only if it belongs to the run.
+    #[test]
+    fn an_x_box_draws_into_the_store() {
+        let mut b = backend();
+        let gc = [0x5a000, 0x1ffe, 0xa5000, 0x1ffe, 0xf00fff, 0, 0x180c, 0x40001, 1, 6, 5, 1, 1];
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &gc);
+        command(&mut b, Grammar::Kernel, FILL_BOXES_TWO_CORNERS, &[2 << 16 | 3, 5 << 16 | 7]);
+        assert_eq!(b.store.read(2, 1023 - 3, 1), 0x5a00);
+        assert_eq!(b.store.read(5, 1023 - 3, 1), 0);
+        // A data token, another command, then a box: the run did not survive.
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_2_WORD_DATA_PRELOAD, &[10 << 16 | 10, 12 << 16 | 12]);
+        command(&mut b, Grammar::Kernel, PIPE_SET_UP, &[0, 0, 0]);
+        command(&mut b, Grammar::Kernel, FILL_BOXES_TWO_CORNERS, &[20 << 16 | 20, 21 << 16 | 21]);
+        assert_eq!(b.store.read(10, 1023 - 10, 1), 0);
+        assert_eq!(b.store.read(20, 1023 - 20, 1), 0x5a00);
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("X fills           2 drawn, refused: 0 context, 0 target, 0 destination"), "{text}");
+    }
+
+    /// A stipple store asks for its rows as a data run; with the pattern
+    /// stored and loaded, a box fill is masked by it.
+    #[test]
+    fn a_stipple_is_stored_loaded_and_masks_a_fill() {
+        let mut b = backend();
+        let gc = [0x5a000, 0x1ffe, 0xa5000, 0x1ffe, 0xf00fff, 0, 0x180c, 0x40001, 1, 6, 5, 1, 1];
+        command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &gc);
+        // A 2 x 2 checkerboard in entry 4: the reply asks for its two rows.
+        assert_eq!(command(&mut b, Grammar::Kernel, STORE_WINDOW_SYSTEM_STIPPLE, &[4, 2, 2]), Reply::Data(2));
+        send(&mut b, Job::Data { grammar: Grammar::Kernel, selector: STORE_WINDOW_SYSTEM_STIPPLE, args: &[4, 2, 2], words: &[0x8000_0000, 0x4000_0000] });
+        assert_eq!(command(&mut b, Grammar::Kernel, LOAD_WINDOW_SYSTEM_STIPPLE, &[4]), Reply::Done);
+        command(&mut b, Grammar::Kernel, FILL_BOXES_TWO_CORNERS, &[0, 4 << 16 | 4]);
+        assert_eq!(b.store.read(0, 1023 - 0, 1), 0x5a00);
+        assert_eq!(b.store.read(1, 1023 - 0, 1), 0);
+        assert_eq!(b.store.read(1, 1023 - 1, 1), 0x5a00);
+        assert!(run(&mut b, &["status"]).1.contains("X stipple         loaded"));
+        command(&mut b, Grammar::Kernel, LOAD_WINDOW_SYSTEM_STIPPLE, &[u32::MAX]);
+        command(&mut b, Grammar::Kernel, FILL_BOXES_TWO_CORNERS, &[10 << 16 | 10, 12 << 16 | 12]);
+        assert_eq!(b.store.read(11, 1023 - 10, 1), 0x5a00, "no stipple: solid");
+        // A store of no rows asks for none.
+        assert_eq!(command(&mut b, Grammar::Kernel, STORE_WINDOW_SYSTEM_STIPPLE, &[4, 2, 0]), Reply::Done);
+    }
+
     /// With the board running, a retrace request waits for the display thread's
     /// next frame boundary; the tag register then reads its tag and `status` shows
     /// the thread and its frames.
@@ -806,6 +1008,92 @@ mod tests {
     }
 
     const INDEX_GC: [u32; 13] = [0x5a000, 0x1ffe, 0xa5000, 0x1ffe, 0xf00fff, 0, 0x180c, 0x40001, 1, 6, 5, 1, 1];
+
+    /// An image whose rows follow the command as a data run draws once the
+    /// run is in, the store's top row first.
+    #[test]
+    fn an_inline_pixel_write_asks_for_its_rows_and_draws_them() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        r.x(&mut b, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &INDEX_GC);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_PATH_SET_UP, &[0, 0, 1, 8, 3, 2, 0]);
+        assert_eq!(r.x(&mut b, WINDOW_SYSTEM_PIXEL_WRITE, &[4, 2]), Reply::Data(2));
+        r.send(&mut b, Job::Data { grammar: Grammar::Kernel, selector: WINDOW_SYSTEM_PIXEL_WRITE, args: &[4, 2], words: &[0x0102_0300, 0x0405_0600] });
+        assert_eq!([b.store.read(4, 1021, 1), b.store.read(6, 1021, 1), b.store.read(5, 1020, 1)], [0x100, 0x300, 0x500]);
+        assert_eq!(r.x(&mut b, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]), Reply::Done);
+        assert!(run(&mut b, &["status"]).1.contains("1 writes (0 by DMA), 0 copies, 0 reads, 1 finishes"));
+    }
+
+    /// With the DMA bit set the command asks for nothing and the DMA packet
+    /// that arrives next carries the rows, read from the guest a line at a
+    /// time; one that arrives with no write waiting is unclaimed, and a read
+    /// that fails faults the packet and draws nothing.
+    #[test]
+    fn a_dma_pixel_write_takes_the_packet_that_follows() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        r.x(&mut b, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &INDEX_GC);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_PATH_SET_UP, &[0x10, 0, 1, 8, 4, 2, 0]);
+        assert_eq!(r.x(&mut b, WINDOW_SYSTEM_PIXEL_WRITE, &[0, 0]), Reply::Done);
+        // Two rows of one word each, the lines 8 bytes apart.
+        r.ram.put_words(0x40_0000, &[0x0102_0304, 0xdead_beef, 0x0506_0708]);
+        let dma = |io, lines, per_line, pitch| Job::DmaIn { io, physical: true, lines, per_line, pitch };
+        assert_eq!(r.send(&mut b, dma(0x40_0000, 2, 4, 8)), Reply::Done);
+        assert_eq!([b.store.read(0, 1023, 1), b.store.read(3, 1023, 1), b.store.read(3, 1022, 1)], [0x100, 0x400, 0x800]);
+        assert_eq!(r.send(&mut b, dma(0x40_0000, 1, 4, 4)), Reply::Unclaimed, "nothing waits for it");
+        assert!(!r.core.dma_fault);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_PATH_SET_UP, &[0x10, 0, 1, 8, 4, 1, 0]);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_WRITE, &[0, 4]);
+        assert_eq!(r.send(&mut b, dma(0x7f_ff_ff_00, 1, 4, 4)), Reply::Done);
+        assert!(r.core.dma_fault, "the bus read failed");
+        assert_eq!(b.store.read(0, 1019, 1), 0);
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("1 writes (1 by DMA)") && text.contains("1 with no write waiting"), "{text}");
+    }
+
+    /// A read answers on the return page after its first word, which is set
+    /// last; with no context current it is not answered.
+    #[test]
+    fn a_pixel_read_answers_on_the_return_page() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        r.x(&mut b, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &INDEX_GC);
+        r.x(&mut b, FILL_BOXES_TWO_CORNERS, &[2 << 16, 4 << 16 | 1]);
+        assert_eq!(b.store.read(3, 1023, 1), 0x5a00);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_PATH_SET_UP, &[2, 1, 0, 8, 3, 1, 0]);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_READ, &[2, 0]);
+        assert_eq!(r.ram.word(RETURN_PAGE), 1);
+        assert_eq!(r.ram.bytes(RETURN_PAGE + 8, 4), [0x5a, 0x5a, 0, 0], "pixels 2 and 3 are filled, 4 is not");
+        r.ram.put(RETURN_PAGE, &[0; 16]);
+        r.core.current = None;
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_READ, &[2, 0]);
+        assert_eq!(r.ram.word(RETURN_PAGE), 0, "no context, no answer");
+    }
+
+    /// A copy under the context moves pixels the same way a write puts them.
+    #[test]
+    fn a_pixel_copy_moves_pixels_inside_the_store() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        r.x(&mut b, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &INDEX_GC);
+        r.x(&mut b, FILL_BOXES_TWO_CORNERS, &[0, 2 << 16 | 1]);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_PATH_SET_UP, &[1, 1, 1, 0, 2, 1, 0]);
+        r.x(&mut b, WINDOW_SYSTEM_PIXEL_COPY, &[0, 0, 10, 5]);
+        assert_eq!([b.store.read(10, 1018, 1), b.store.read(11, 1018, 1), b.store.read(12, 1018, 1)], [0x5a00, 0x5a00, 0]);
+    }
+
+    /// Each context has its own X state, and a fresh activation starts over.
+    #[test]
+    fn the_x_state_follows_the_context() {
+        let (mut b, mut r) = (backend(), Rig::new());
+        r.x(&mut b, WINDOW_SYSTEM_GRAPHICS_CONTEXT_LOAD, &INDEX_GC);
+        r.core.current = Some(1);
+        r.send(&mut b, Job::Context(super::super::ContextEvent::Activated { slot: 1, fresh: true }));
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("X contexts        1 loaded"), "{text}");
+        assert!(text.contains("X gc              not decoded"), "{text}");
+        r.x(&mut b, FILL_BOXES_TWO_CORNERS, &[0, 2 << 16 | 2]);
+        assert_eq!(b.store.read(0, 1023, 1), 0, "context 1 loaded no colour");
+        r.core.current = Some(0);
+        r.x(&mut b, FILL_BOXES_TWO_CORNERS, &[0, 2 << 16 | 2]);
+        assert_eq!(b.store.read(1, 1022, 1), 0x5a00, "context 0 kept its own");
+    }
 
     /// A DAC cursor load is decoded and held by channel, and draws nothing until channel 0's control register enables it; a load of another length, or
     /// for a channel the table does not give, is refused and counted.
@@ -898,6 +1186,80 @@ mod tests {
         r.x(&mut b, PIPE_MEMORY_SWAP_IN, &[3, 0, 2, 0x400, 1, 0]);
         let text = run(&mut b, &["status"]).1;
         assert!(text.contains("1 placed, 1 copied down, 1 swapped out (4096 bytes), 1 swapped in (2048 bytes)"), "{text}");
+    }
+
+    /// A bracketed read whose host buffer is not mapped writes nothing, posts no
+    /// completion and is counted, as the recorder's model does.
+    #[test]
+    fn a_bracketed_read_into_an_unmapped_buffer_posts_nothing() {
+        use crate::traits::{Device, BUS_OK};
+        let (host, kona) = board();
+        let w = |v: u32| assert_eq!(kona.test_write(0xc10000, 4, v as u64), BUS_OK);
+        let words = |ws: &[u32]| ws.iter().for_each(|&v| w(v));
+        let phys = |a: u64| 0x1000_0000 | (a >> 12) as u32;
+        words(&[0x1f1, phys(REASON_PAGE), 0, 0x4000]);
+        words(&[0x1fd, phys(0x50_0000), 0, 0x10000]);
+        words(&[0x1f2, phys(RETURN_PAGE), 0, 0x4000]);
+        words(&[0x129]);
+        words(&INDEX_GC);
+        words(&[0x154, 0, 2 << 16 | 1]);
+        words(&[0x136, 2, 1, 0, 8, 2, 1, 0]);
+        // Device page 0x1c1 has no map RAM entry.
+        let dev = 0x1c1u64 << 14;
+        words(&[0x1f5, (dev >> 12) as u32, 0x9000 | (dev & 0xfff) as u32, 2, 2, 0, 0]);
+        words(&[0x138, 0, 0]);
+        words(&[0x1f6, 0x100, 0x77]);
+        assert_eq!(host.word(REASON_PAGE), 0, "no completion");
+        let text = monitor(&kona, &["status"]).1;
+        assert!(text.contains("read brackets   0 refused, 1 with no completion posted"), "{text}");
+        kona.stop();
+    }
+
+    /// A read inside a select-feed bracket goes to the host buffer at the
+    /// bracket's finish, which then posts its completion with the second word
+    /// the finish carried. Through the board's own command port.
+    #[test]
+    fn a_bracketed_read_reaches_the_host_buffer() {
+        use crate::traits::{Device, BUS_OK};
+        let (host, kona) = board();
+        let w = |v: u32| assert_eq!(kona.test_write(0xc10000, 4, v as u64), BUS_OK);
+        let words = |ws: &[u32]| ws.iter().for_each(|&v| w(v));
+        let phys = |a: u64| 0x1000_0000 | (a >> 12) as u32;
+        words(&[0x1f1, phys(REASON_PAGE), 0, 0x4000]);
+        words(&[0x1fd, phys(0x50_0000), 0, 0x10000]);
+        words(&[0x1f2, phys(RETURN_PAGE), 0, 0x4000]);
+        // Device page 0x1c0 maps the host buffer.
+        let buf = 0x70_0000u64;
+        assert_eq!(kona.test_write(0x100000 + 4 * 0x1c0, 4, 0x2000_0000 | (buf >> 12) as u64), BUS_OK);
+        let dev = 0x1c0u64 << 14;
+        words(&[0x129]);
+        words(&INDEX_GC);
+        words(&[0x154, 0, 2 << 16 | 1]);
+        words(&[0x136, 2, 1, 0, 8, 2, 1, 0]);
+        words(&[0x1f5, (dev >> 12) as u32, 0x9000 | (dev & 0xfff) as u32, 2, 2, 0, 0]);
+        words(&[0x138, 0, 0]);
+        assert_eq!(host.word(RETURN_PAGE), 0, "inside a bracket the bytes wait");
+        words(&[0x1f6, 0x100, 0x77]);
+        assert_eq!(host.bytes(buf, 2), [0x5a, 0x5a]);
+        assert_eq!([host.word(REASON_PAGE), host.word(REASON_PAGE + 4), host.word(REASON_PAGE + 8)], [0x100, 0x77, 0]);
+        let text = monitor(&kona, &["status"]).1;
+        assert!(text.contains("1 reads"), "{text}");
+        kona.stop();
+    }
+
+    /// While someone holds the pipe's state, the pixel commands still answer
+    /// and a wait for the state gives up instead of hanging.
+    #[test]
+    fn pixel_reads_do_not_wait_for_the_state() {
+        use crate::traits::Device;
+        let (_host, kona) = board();
+        kona.with_backend(|_| {
+            let out = Capture::default();
+            kona.execute_command("kona", &["hash"], Box::new(out.clone())).unwrap();
+            assert_eq!(out.text().trim().len(), 16);
+            kona.execute_command("kona", &["pix", "1", "1"], Box::new(out.clone())).unwrap();
+            assert!(out.text().contains("word arrays allocated"));
+        });
     }
 
     /// A command that reads the back end's state gives up waiting for it and
