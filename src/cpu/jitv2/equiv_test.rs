@@ -6030,6 +6030,51 @@ mod tests {
         }
     }
 
+    /// RECIP of a number above 2^126 (single) or 2^1022 (double) has a
+    /// denormal result, which follows the same rule as the multiply above.
+    /// The first operand is the one olperi's seed 4844 takes the reciprocal
+    /// of; 2^126 gives the smallest normal and nothing to flag.
+    #[test]
+    fn recip_denormal_result_flushes_like_the_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FRECIP, OP_COP1, RS_D, RS_S};
+        const FS: u32 = 0x0100_0000;
+        for (fmt, op) in [(RS_S, 0x7EDD_A9BEu64), (RS_S, 0xFF00_0000), (RS_D, 0xFFE0_0000_0000_0000), (RS_S, 0x7E80_0000)] {
+            for fcsr in [FS, FS | 0x0100, 0] {
+                let mut fpr = [0u64; 32];
+                fpr[1] = op;
+                fpr[3] = 0xDEAD_BEEF_DEAD_BEEF;
+                assert_fpu_matches_interpreter_fcsr(
+                    make_r(OP_COP1, fmt, 0, 1, 3, FUNCT_FRECIP), [0u64; 32], fpr, true, Some(fcsr));
+            }
+        }
+    }
+
+    /// The multiply-add family's denormal sum follows the same rule: a
+    /// normal product, 2^-125 or 2^-1021, plus or minus 1.75 times the
+    /// smallest normal leaves an exact 2^-128 or 2^-1024, negated by NMADD
+    /// and NMSUB.
+    #[test]
+    fn madd_denormal_result_flushes_like_the_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_MADD_S, FUNCT_MSUB_S, FUNCT_NMADD_S, FUNCT_NMSUB_S, OP_COP1X};
+        const FS: u32 = 0x0100_0000;
+        for (funct, fr_neg) in [(FUNCT_MADD_S, true), (FUNCT_MSUB_S, false), (FUNCT_NMADD_S, true), (FUNCT_NMSUB_S, false)] {
+            for is_d in [false, true] {
+                let (fs, fr, one, sign) = if is_d {
+                    (0x0020_0000_0000_0000u64, 0x001C_0000_0000_0000u64, 0x3FF0_0000_0000_0000u64, 1u64 << 63)
+                } else {
+                    (0x0100_0000, 0x00E0_0000, 0x3F80_0000, 1 << 31)
+                };
+                for fcsr in [FS, FS | 0x0100, 0] {
+                    let mut fpr = [0u64; 32];
+                    (fpr[1], fpr[2], fpr[3], fpr[4]) = (fr | if fr_neg { sign } else { 0 }, one, fs, 0xDEAD_BEEF_DEAD_BEEF);
+                    // fr = f1, ft = f2, fs = f3, fd = f4
+                    assert_fpu_matches_interpreter_fcsr(
+                        make_r(OP_COP1X, 1, 2, 3, 4, funct + is_d as u32), [0u64; 32], fpr, true, Some(fcsr));
+                }
+            }
+        }
+    }
+
     /// SQRT, RSQRT, the multiply-add family and CVT.S.D leave an Invalid
     /// Operation's result as the MIPS default NaN, not the host's
     /// (0xFFC00000 on x86, which is a signalling NaN under the MIPS

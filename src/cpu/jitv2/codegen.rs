@@ -5707,6 +5707,13 @@ fn emit_fix_invalid(ctx: &mut EmitCtx, is_d: bool, flags: Value, result_bits: Va
 /// adds no branch to the ordinary path. Cold, an infinity or NaN evaluates
 /// `flags_fn`, applies `emit_fix_invalid` and does the full FCSR update, and
 /// a finite result with Cause set only clears it.
+///
+/// RECIP and the multiply-add family can give a denormal result
+/// (`fpu_fix_invalid_denorm_s/d`), so the compare is a range test that also
+/// sends zero and denormal results cold, where a denormal one goes through
+/// `emit_fpu_update_fcsr_arith`: flushed to a signed zero under FCSR.FS,
+/// otherwise Unimplemented Operation. RSQRT shares the test and never
+/// takes that arm.
 fn emit_commit_finite_first(
     ctx: &mut EmitCtx,
     is_d: bool,
@@ -5718,20 +5725,20 @@ fn emit_commit_finite_first(
     let mem = MemFlagsData::trusted();
     let i32t = ir::types::I32;
     const FCSR_CM: i64 = 0x0001_f000;
-    let non_finite = if is_d {
+    let (mag, min_normal, inf) = if is_d {
         let hi = ctx.builder.ins().ushr_imm_s(result_bits, 32);
         let hi = ctx.builder.ins().ireduce(i32t, hi);
-        let hi = ctx.builder.ins().band_imm_s(hi, 0x7FFF_FFFF);
-        ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, hi, 0x7FF0_0000)
+        (ctx.builder.ins().band_imm_s(hi, 0x7FFF_FFFF), 0x0010_0000, 0x7FF0_0000)
     } else {
-        let abs = ctx.builder.ins().band_imm_s(result_bits, 0x7FFF_FFFF);
-        ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, abs, 0x7F80_0000)
+        (ctx.builder.ins().band_imm_s(result_bits, 0x7FFF_FFFF), 0x0080_0000, 0x7F80_0000)
     };
+    let biased = ctx.builder.ins().iadd_imm_s(mag, -min_normal);
+    let off_range = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, biased, inf - min_normal);
     let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
     let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
     let cause = ctx.builder.ins().band_imm_s(fcsr, FCSR_CM);
     let cause_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cause, 0);
-    let off_path = ctx.builder.ins().bor(non_finite, cause_set);
+    let off_path = ctx.builder.ins().bor(off_range, cause_set);
     let fast_block = ctx.builder.create_block();
     let cold_block = ctx.builder.create_block();
     let full_block = ctx.builder.create_block();
@@ -5742,6 +5749,7 @@ fn emit_commit_finite_first(
     ctx.builder.switch_to_block(cold_block);
     ctx.builder.set_cold_block(cold_block);
     ctx.builder.seal_block(cold_block);
+    let non_finite = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, mag, inf);
     ctx.builder.ins().brif(non_finite, full_block, &[], clear_block, &[]);
     ctx.builder.seal_block(full_block);
     ctx.builder.seal_block(clear_block);
@@ -5755,9 +5763,16 @@ fn emit_commit_finite_first(
 
     ctx.builder.switch_to_block(clear_block);
     ctx.builder.set_cold_block(clear_block);
-    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
-    ctx.builder.ins().store(mem, cleared, ctx.core_ptr, fcsr_off);
-    write_result(ctx, result_bits);
+    // Finite here: zero, denormal, or a normal result with Cause set.
+    let is_denorm = if is_d { emit_is_subnormal_d(ctx, result_bits) } else { emit_is_subnormal_s(ctx, result_bits) };
+    let sign_mask = if is_d { i64::MIN } else { 0x8000_0000u32 as i32 as i64 };
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    let signed_zero = ctx.builder.ins().band_imm_s(result_bits, sign_mask);
+    emit_fpu_update_fcsr_arith(
+        ctx, None, is_denorm, is_negative,
+        |ctx| write_result(ctx, result_bits),
+        |ctx, _| write_result(ctx, signed_zero),
+    );
     ctx.builder.ins().jump(done_block, &[]);
 
     ctx.builder.switch_to_block(fast_block);
@@ -10645,23 +10660,17 @@ fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 
 /// MADD/MSUB/NMADD/NMSUB.S/D — COP1X multiply-add, `fd = ±(fs*ft ± fr)`.
 ///
-/// Three things here are deliberately *unlike* `emit_fbinop_s/d`, because
+/// Two things here are deliberately *unlike* `emit_fbinop_s/d`, because
 /// they are unlike the interpreter's `exec_madd_*` too, and lockstep compares
 /// against the interpreter rather than against the other emitters:
 ///
 /// - **No `emit_check_denorm_operand`.** The binop handlers call
 ///   `fpu_check_denorm_operand_*` on each operand and can trap before
 ///   computing; `exec_madd_d` does not.
-/// - **No flush-to-zero on a denormal result.** The binops route through
-///   `fpu_update_fcsr_full` with a `Some(is_negative)` denorm argument;
-///   `exec_madd_d` uses plain `fpu_update_fcsr`, i.e. `denorm = None`, so the
-///   result is written as computed.
 /// - **Invalid is computed over all three sources**, not two.
 ///
-/// (Whether the interpreter *should* do the denormal handling for this family
-/// as it does for ADD/SUB/MUL is a real question, but it is a question about
-/// the interpreter. Diverging here would only break lockstep while leaving
-/// the behaviour just as wrong.)
+/// A denormal result is flushed or trapped as for the binops, through
+/// `emit_commit_finite_first`.
 ///
 /// Not fused: MIPS IV rounds the product to the format and then adds,
 /// rounding again — on the R10000, one pass through the multiplier and a
@@ -10752,9 +10761,9 @@ fn emit_nmsub_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fternop_d(ctx, fr_mod
 ///
 /// Mirrors `exec_frecip_*`/`exec_frsqrt_*`: the flags come from the DIV rule
 /// with a constant `1.0` as the dividend (so a zero operand raises
-/// divide-by-zero), and the FCSR tail is plain `fpu_update_fcsr` — no denorm
-/// operand check and no flush-to-zero, same as the multiply-add family above
-/// and unlike `emit_fbinop_*`.
+/// divide-by-zero). There is no denorm operand check, as for the
+/// multiply-add family above and unlike `emit_fbinop_*`. RECIP's result can
+/// be denormal and gets the flush-to-zero rule; RSQRT's cannot.
 ///
 /// Computed as a real divide (and `1/sqrt` as divide-of-sqrt) rather than any
 /// reciprocal-estimate instruction: the interpreter computes `1.0 / fs` at
