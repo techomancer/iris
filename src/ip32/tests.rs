@@ -1015,3 +1015,55 @@ fn configuration_writes_do_not_make_the_physical_bus_keep_more_devices() {
     assert_eq!(bus.phys.kept_len(), moved, "both placements are already mapped");
 }
 
+
+/// The DS1687's RAM survives a relaunch in the 512-byte image beside the
+/// flash, and a clock the guest set in the reference beside that; a clock
+/// it never set starts where `[rtc_offset]` puts it, with no reference.
+#[test]
+fn the_rtc_survives_a_relaunch_in_its_file() {
+    let path = std::env::temp_dir().join(format!("iris-o2-rtc-{}", std::process::id()));
+    let clock = crate::dev::battery_clock::companion(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&clock);
+    let bus = |years: i64| Ip32Bus::with_options(
+        O2Memory::single(1 << 20),
+        vec![0u8; PROM_SIZE as usize],
+        Ip32Options {
+            rtc_file: Some(path.clone()),
+            rtc_offset: crate::config::RtcOffset { years, ..Default::default() },
+            ..Default::default()
+        },
+    );
+    let reg = |n: u64| MACE_RTC as u64 + (n << 8) + 7;
+    let year = |b: &Ip32Bus| { let y = b.mace.rtc.read8(reg(9)).data; i32::from((y >> 4) * 10 + (y & 0x0f)) };
+    let host = year(&bus(0));
+    let first = bus(-10);
+    assert_eq!((host - year(&first)).rem_euclid(100), 10, "no file: the seed, ten years back");
+    first.save_rtc();
+    assert!(!clock.exists(), "no reference until the guest sets the clock");
+    // IRIX's order: SET, the seconds through the year, the century, the
+    // weekday, SET clear. 2004-06-01 19:00:30, binary, 24-hour.
+    let rtc = &first.mace.rtc;
+    rtc.write8(reg(0x0a), 0x30);
+    rtc.write8(reg(0x0b), 0x86);
+    for (n, v) in [(0, 30), (2, 0), (4, 19), (7, 1), (8, 6), (9, 4), (0x48, 20), (6, 3)] {
+        rtc.write8(reg(n), v);
+    }
+    rtc.write8(reg(0x0b), 0x06);
+    rtc.write8(reg(0x0a), 0x20);
+    rtc.write8(reg(0x40), 0x99);
+    first.save_rtc();
+    drop(first);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
+    let second = bus(0);
+    let rtc = &second.mace.rtc;
+    assert_eq!(rtc.read8(reg(0x40)).data, 0x99, "the RAM");
+    // A new run: register B is the part's power-up BCD, 24-hour.
+    assert_eq!(
+        [9, 8, 7, 4, 2].map(|n| rtc.read8(reg(n)).data),
+        [0x04, 0x06, 0x01, 0x19, 0x00],
+        "2004-06-01 19:00, not host time"
+    );
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&clock).ok();
+}

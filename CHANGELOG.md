@@ -337,6 +337,10 @@ where they differed:
   Without that file the clock starts where `[rtc_offset]` puts it, which
   the Octane now honours, host time by default; the file is written only
   once the guest sets the clock.
+- The O2 keeps its DS1687's RAM in `<nvram>.rtc` beside the flash, in the
+  Octane's 512-byte image, and its clock in `<nvram>.rtc.clock`, saved
+  when the machine stops or switches itself off. Before, both started
+  afresh every run. The O2 now honours `[rtc_offset]` too.
 
 ### A dropped Octane frees its device table
 
