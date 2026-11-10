@@ -1,4 +1,4 @@
-# The IOC3's PS/2 keyboard and mouse ports on the Octane
+# The IOC3's PS/2 keyboard and mouse ports
 
 What an emulated IOC3 keyboard and mouse controller has to look like for
 PROM 4.17, IRIX 6.5, Linux and OpenBSD to drive it: five registers, two
@@ -16,7 +16,7 @@ three at a time in one 32-bit register. Everything a driver knows about
 keyboards and mice (reset, identify, scan code sets, sample rates) is
 spoken to the devices themselves, so an emulation is a thin controller in
 front of an ordinary PS/2 keyboard and mouse. IRIS's model is in
-`src/dev/ioc3.rs` over the PS/2 devices in `src/dev/ps2.rs`; §8 says how
+`src/dev/ioc3/kbd.rs` over the PS/2 devices in `src/dev/ps2.rs`; §8 says how
 it answers each point below.
 
 ## Sources
@@ -422,7 +422,7 @@ modelling only to exercise the drivers' error paths.
 
 ## 8. In IRIS
 
-`src/dev/ioc3.rs` models the controller (`kbc_*`, ported with the rest of
+`src/dev/ioc3/kbd.rs` models the controller (`Kbd`, ported with the rest of
 the IOC3 from the Origami QEMU model) in front of IRIS's shared PS/2
 keyboard and mouse (`src/dev/ps2.rs`, the same devices the Indy's 8042
 uses, with set 1, 2 and 3 tables and set 3's per-key modes). Against the
