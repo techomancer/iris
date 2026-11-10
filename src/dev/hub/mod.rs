@@ -27,8 +27,7 @@
 //!   unmaps the register window. The network port reads disabled at the peer.
 //! - Failing, rather than timing out, an access to a node number no reachable
 //!   Hub holds is an approximation.
-//! - A processor rendezvous hold is not modelled. [`HubObserver`] reports the
-//!   stores such a mechanism would watch, and changes no value.
+//! - A processor rendezvous hold is not modelled.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
@@ -61,37 +60,6 @@ pub const WINDOW_SIZE: u64 = 8 << 20;
 
 /// Pending interrupts are two banks of 64 bits.
 pub const PENDING_BANKS: usize = 2;
-
-/// A store the stock PROM's processor rendezvous depends on, reported after
-/// it has taken effect. These are the registers the processors of a node, and
-/// the nodes of a machine, use as mailboxes: a mechanism that holds a
-/// processor until a partner has run needs to see them, and the Hub changes
-/// no register value on its account.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Store {
-    /// PI_RT_COMPARE of `slice`, as stored (52 bits).
-    RtCompare { slice: usize, value: u64 },
-    /// PI_CPU_ENABLE of `slice`, whether or not the node populates it.
-    CpuEnable { slice: usize, enabled: bool },
-    /// PI_INT_PEND_MOD, as written; `changed` says whether it flipped a
-    /// pending bit. Interrupts from a Bridge or an engine arrive here too.
-    IntPendMod { value: u64, changed: bool },
-    /// IIO_SCRATCH_REG0 or 1, as stored (36 bits).
-    IoScratch { index: usize, value: u64 },
-    /// NI_SCRATCH_REG0 or 1, as stored. `vector` is set when a vector PIO
-    /// from another node wrote it rather than a load or store on the bus.
-    NiScratch { index: usize, value: u64, vector: bool },
-    /// NI_PORT_RESET, as written.
-    PortReset { value: u64 },
-}
-
-/// An optional observer of those stores, connected by the board. Nothing in
-/// the Hub waits for it: it is called outside every section lock, on the
-/// thread that did the store, and when none is connected a store costs one
-/// atomic load.
-pub trait HubObserver: Send + Sync {
-    fn stored(&self, store: Store);
-}
 
 /// What the Hub asks of the machine around it. Called outside every section
 /// lock, on the thread that wrote the register. All defaults do nothing, so a
@@ -146,8 +114,6 @@ pub struct HubConfig {
     pub cpus: u8,
     /// Global index of this node's slice A, which PI_CPU_NUM subtracts.
     pub cpu_base: usize,
-    /// The node number a synthesized firmware preprograms; zero otherwise.
-    pub nasid: u16,
     /// NI_STATUS_REV_ID bits 7:4. The model reports 3 (Hub 2.1) on the
     /// Origin 200 and 5 (Hub 2.3) on the Origin 2000 rack and deskside and the
     /// Onyx2.
@@ -162,7 +128,7 @@ pub struct HubConfig {
 }
 impl Default for HubConfig {
     fn default() -> Self {
-        Self { cpus: 1, cpu_base: 0, nasid: 0, ni_revision: 3, widget_revision: 1, manufacturer: 0x36, slot: SlotSignals::default() }
+        Self { cpus: 1, cpu_base: 0, ni_revision: 3, widget_revision: 1, manufacturer: 0x36, slot: SlotSignals::default() }
     }
 }
 
@@ -275,9 +241,8 @@ pub struct Regs {
     md: Md,
     io: Io,
     ni: Arc<Ni>,
-    /// The node's I2C controller and bring-up UART, mapped over the MD block.
+    /// The node's I2C controller, mapped over the MD block.
     i2c: OnceLock<Arc<dyn BusDevice>>,
-    uart: OnceLock<Arc<dyn BusDevice>>,
 }
 
 impl Regs {
@@ -314,15 +279,12 @@ impl Regs {
         }
     }
 
-    /// The narrow device over an offset, for the I2C controller and UART
-    /// mapped over the MD block.
+    /// The narrow device over an offset, for the I2C controller mapped over
+    /// the MD block.
     fn overlay(&self, off: u64) -> Option<(&dyn BusDevice, u64)> {
         const I2C: std::ops::Range<u64> = md::reg::I2C_BASE..md::reg::I2C_BASE + 0x10;
-        const UART: std::ops::Range<u64> = md::reg::UART_BASE..md::reg::UART_END;
         if I2C.contains(&off) {
             self.i2c.get().map(|d| (&**d, off - I2C.start))
-        } else if UART.contains(&off) {
-            self.uart.get().map(|d| (&**d, off - UART.start))
         } else {
             None
         }
@@ -360,7 +322,7 @@ impl Hub {
             let hooks = Arc::new(Hooks { hub: weak.clone(), machine: OnceLock::new() });
             let pi = Pi::new(cfg.cpus, cfg.cpu_base, clock.clone());
             let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone() });
-            let ni = Arc::new(Ni::new(cfg.ni_revision, cfg.nasid));
+            let ni = Arc::new(Ni::new(cfg.ni_revision));
             pi.set_hooks(hooks.clone());
             ni.set_hooks(hooks.clone());
             ni.set_events(Arc::new(Remap(weak.clone())));
@@ -372,7 +334,6 @@ impl Hub {
                 io,
                 ni,
                 i2c: OnceLock::new(),
-                uart: OnceLock::new(),
             });
             Self {
                 regs,
@@ -454,14 +415,6 @@ impl Hub {
         crate::locks::register_mutex_fn("hub-ni", self, |h| h.ni.is_locked());
     }
 
-    /// Observe the stores a processor rendezvous depends on. Connected by the
-    /// board; with none connected the stores cost an atomic load.
-    pub fn set_observer(&self, observer: Arc<dyn HubObserver>) {
-        self.pi.set_observer(observer.clone());
-        self.io.set_observer(observer.clone());
-        self.ni.set_observer(observer);
-    }
-
     /// Where this node's four spaces answer, for the node-qualified claims of
     /// every Hub that reaches this one and for its own engines.
     pub fn set_space(&self, space: Space, dev: Arc<dyn BusDevice>) {
@@ -471,11 +424,6 @@ impl Hub {
     /// The node's I2C controller, answering at 0x22_0000 of the window.
     pub fn attach_i2c(&self, dev: Arc<dyn BusDevice>) {
         self.i2c.set(dev).unwrap_or_else(|_| panic!("the I2C controller is wired twice"));
-    }
-
-    /// The bring-up UART, answering at 0x22_00c0 of the window.
-    pub fn attach_uart(&self, dev: Arc<dyn BusDevice>) {
-        self.uart.set(dev).unwrap_or_else(|_| panic!("the bring-up UART is wired twice"));
     }
 
     /// Join the Hubs across a direct CrayLink cable, as on a two-module
@@ -589,11 +537,6 @@ impl Hub {
         self.pi.read_error(slice, physical);
     }
 
-    /// Whether the node is powered down is the machine's to express: it
-    /// unmaps the window, and the network port reads down at the peer.
-    pub fn set_powered(&self, on: bool) {
-        self.ni.set_enabled(on);
-    }
 
 }
 

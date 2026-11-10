@@ -38,7 +38,7 @@
 
 use crate::cpu::smp::on_cpu_thread;
 use crate::dev::heart::Clock;
-use super::{HubHooks, HubObserver, Store, PENDING_BANKS};
+use super::{HubHooks, PENDING_BANKS};
 use crate::dev::odyssey::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -185,7 +185,6 @@ pub struct Pi {
     rt_enable: [AtomicBool; 2],
     state: Mutex<State>,
     hooks: OnceLock<Arc<dyn HubHooks>>,
-    observer: OnceLock<Arc<dyn HubObserver>>,
     irq: Mutex<Option<Arc<dyn InterruptController>>>,
     /// Serialises line publication, so two writers cannot publish a stale
     /// level after a fresh one. Reentrant: a controller may read a register.
@@ -216,7 +215,6 @@ impl Pi {
             rt_enable: Default::default(),
             state: Mutex::new(State::new()),
             hooks: OnceLock::new(),
-            observer: OnceLock::new(),
             irq: Mutex::new(None),
             dispatch: ReentrantMutex::new(()),
             driven: Mutex::new([None; 2 * LINES_PER_CPU]),
@@ -228,17 +226,6 @@ impl Pi {
 
     pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
         let _ = self.hooks.set(hooks);
-    }
-
-    /// Report the stores a processor rendezvous depends on (see [`Store`]).
-    pub fn set_observer(&self, observer: Arc<dyn HubObserver>) {
-        let _ = self.observer.set(observer);
-    }
-
-    fn observe(&self, store: Store) {
-        if let Some(observer) = self.observer.get() {
-            observer.stored(store);
-        }
     }
 
     /// The machine owns the manager; the interface only keeps a weak handle to
@@ -382,13 +369,12 @@ impl Pi {
     pub fn int_modify(&self, value: u64) {
         let number = value & MODIFY_NUMBER;
         let (bank, bit) = ((number / 64) as usize, 1u64 << (number % 64));
-        let before = if value & MODIFY_SET != 0 {
-            self.pend[bank].fetch_or(bit, Ordering::AcqRel)
+        if value & MODIFY_SET != 0 {
+            self.pend[bank].fetch_or(bit, Ordering::AcqRel);
         } else {
-            self.pend[bank].fetch_and(!bit, Ordering::AcqRel)
-        };
+            self.pend[bank].fetch_and(!bit, Ordering::AcqRel);
+        }
         self.drive();
-        self.observe(Store::IntPendMod { value, changed: (before & bit != 0) != (value & MODIFY_SET != 0) });
     }
 
     /// A processor read failed: record it in that slice's error status 0.
@@ -523,7 +509,6 @@ impl Pi {
                         h.cpu_enable(slice, on);
                     }
                 }
-                self.observe(Store::CpuEnable { slice, enabled: on });
             }
             reg::NMI_A | reg::NMI_B => {
                 let slice = ((off - reg::NMI_A) / 8) as usize;
@@ -556,7 +541,6 @@ impl Pi {
                 self.arm(&mut s, slot, now());
                 drop(s);
                 self.schedule();
-                self.observe(Store::RtCompare { slice: slot, value: value & RT_MASK });
             }
             reg::RT_PEND_A | reg::RT_PEND_B => {
                 // The handler acknowledges by writing zero, which drops the line.

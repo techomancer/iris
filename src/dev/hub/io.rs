@@ -44,7 +44,6 @@
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
 use super::pi::MODIFY_SET;
-use super::{HubObserver, Store};
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
@@ -218,7 +217,6 @@ pub struct Io {
     fabric: OnceLock<Weak<dyn NodeFabric>>,
     /// The far end's reset input, where a warm reset from IIO_ILCSR goes.
     reset_out: OnceLock<Arc<dyn Fn() + Send + Sync>>,
-    observer: OnceLock<Arc<dyn HubObserver>>,
 }
 
 impl Io {
@@ -237,13 +235,7 @@ impl Io {
             }),
             fabric: OnceLock::new(),
             reset_out: OnceLock::new(),
-            observer: OnceLock::new(),
         }
-    }
-
-    /// Report stores to the scratch registers (see [`Store`]).
-    pub fn set_observer(&self, observer: Arc<dyn HubObserver>) {
-        let _ = self.observer.set(observer);
     }
 
     pub fn set_fabric(&self, fabric: Weak<dyn NodeFabric>) {
@@ -418,10 +410,6 @@ impl Io {
             reg::SCRATCH_0 | reg::SCRATCH_1 => {
                 let index = ((off - reg::SCRATCH_0) / 8) as usize;
                 s.scratch[index] = value & SCRATCH_MASK;
-                drop(s);
-                if let Some(observer) = self.observer.get() {
-                    observer.stored(Store::IoScratch { index, value: value & SCRATCH_MASK });
-                }
             }
             reg::MISC_ENABLE => {
                 if value & MISC_PRECISE_CLEAR != 0 {

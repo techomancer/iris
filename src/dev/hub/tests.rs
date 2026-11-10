@@ -1,7 +1,7 @@
 // Cases follow tests/qtest/sn0-hub-test.c, sn0-hub-inbound-test.c,
 // sn0-pi-error-test.c and sn0-widget-decode-test.c in
 // jamesbraid/qemu-sgi-origami: 32-bit-access-selects-the-big-endian-half,
-// 32-bit-vector-clear-read-leaves-the-status, the junk-uart and I2C overlay
+// 32-bit-vector-clear-read-leaves-the-status, the I2C overlay
 // cases, stock-prom-hubs-start-unnumbered,
 // qualified-window-follows-the-programmed-number, unclaimed-node-number-fails,
 // qualified-memory-follows-the-programmed-number, the calias-* cases,
@@ -51,7 +51,7 @@ impl BusDevice for Ram {
     ram_access!(read64, write64, u64, BusRead64);
 }
 
-/// A few byte registers, standing in for the I2C controller and the UART.
+/// A few byte registers, standing in for the I2C controller.
 struct Bytes(Mutex<[u8; 64]>);
 impl Default for Bytes {
     fn default() -> Self {
@@ -191,13 +191,12 @@ fn every_section_answers_through_the_window_and_the_rest_reads_zero() {
 }
 
 #[test]
-fn the_i2c_controller_and_the_uart_take_narrow_accesses_over_the_md_block() {
+fn the_i2c_controller_takes_narrow_accesses_over_the_md_block() {
     let hub = hub(1, 3);
     // With nothing fitted, narrow accesses fail like any other.
-    assert_eq!(hub.read8(md::reg::UART_BASE).status, BUS_ERR);
-    let (i2c, uart) = (Arc::new(Bytes::default()), Arc::new(Bytes::default()));
+    assert_eq!(hub.read8(md::reg::I2C_BASE).status, BUS_ERR);
+    let i2c = Arc::new(Bytes::default());
     hub.attach_i2c(i2c.clone());
-    hub.attach_uart(uart.clone());
     // The PCF8584's S0 and S1, eight bytes apart.
     assert_eq!(hub.write8(md::reg::I2C_BASE, 0x5a), BUS_OK);
     assert_eq!(hub.write8(md::reg::I2C_BASE + 8, 0x3c), BUS_OK);
@@ -207,11 +206,6 @@ fn the_i2c_controller_and_the_uart_take_narrow_accesses_over_the_md_block() {
     };
     assert_eq!((s0, s1), (0x5a, 0x3c));
     assert_eq!(hub.read8(md::reg::I2C_BASE).data, 0x5a);
-    // The UART's eight-byte register stride, the range exact.
-    hub.write8(md::reg::UART_BASE + 8 * 3, 0x77);
-    assert_eq!(uart.0.lock()[24], 0x77);
-    assert_eq!(hub.read8(md::reg::UART_END).status, BUS_ERR);
-    assert_eq!(hub.read8(md::reg::UART_BASE - 8).status, BUS_ERR);
     // The registers between them are still the MD block's.
     assert_eq!(r64(&*hub, md::reg::SLOTID_USTAT), 0x95);
     // A doubleword access to the overlay is one register access too: the
@@ -302,11 +296,6 @@ fn two_cabled_hubs_each_claim_the_others_programmed_number() {
     // Renumbering moves the claim.
     number(&b, 2);
     assert_eq!(ma.read8(NODE(1) + 0x40).status, BUS_ERR);
-    assert_eq!(ma.read8(NODE(2) + 0x40).data, 0x5a);
-    // A powered-down peer is not reachable.
-    b.set_powered(false);
-    assert_eq!(ma.read8(NODE(2) + 0x40).status, BUS_ERR);
-    b.set_powered(true);
     assert_eq!(ma.read8(NODE(2) + 0x40).data, 0x5a);
 }
 
@@ -695,104 +684,6 @@ fn the_hub_is_a_device_whose_counter_is_its_clock() {
     assert!(!hub.is_running());
 }
 
-// ---- the rendezvous observer ----
-
-#[derive(Default)]
-struct Seen(Mutex<Vec<Store>>);
-impl HubObserver for Seen {
-    fn stored(&self, store: Store) {
-        self.0.lock().push(store);
-    }
-}
-
-/// A mechanism that holds a processor until a partner has run needs to see the
-/// registers the processors post to. The Hub reports each store after it has
-/// taken effect and changes no value on its account.
-#[test]
-fn the_observer_sees_the_stores_a_processor_rendezvous_posts() {
-    let (a, b) = pair();
-    let seen = Arc::new(Seen::default());
-    a.set_observer(seen.clone());
-    let take = || std::mem::take(&mut *seen.0.lock());
-    // The pair handshake: a compare post, and the failure tail's enable clear.
-    a.write64(pi::reg::RT_COMPARE_A, 0x24);
-    a.write64(pi::reg::RT_COMPARE_B, !0);
-    a.write64(pi::reg::CPU_ENABLE_B, 0);
-    a.write64(pi::reg::CPU_ENABLE_A, 0xff);
-    assert_eq!(
-        take(),
-        [
-            Store::RtCompare { slice: 0, value: 0x24 },
-            Store::RtCompare { slice: 1, value: (1 << 52) - 1 },
-            Store::CpuEnable { slice: 1, enabled: false },
-            Store::CpuEnable { slice: 0, enabled: true },
-        ]
-    );
-    // The values are the registers': nothing was held back.
-    assert_eq!(a.read64(pi::reg::RT_COMPARE_A).data, 0x24);
-    // II scratch 0 holds the pair's outcome bits; the mask applies.
-    a.write64(io::reg::SCRATCH_0, (1 << 23) | (1 << 40));
-    a.write64(io::reg::SCRATCH_1, 5);
-    assert_eq!(take(), [Store::IoScratch { index: 0, value: 1 << 23 }, Store::IoScratch { index: 1, value: 5 }]);
-    // The node barrier and numbering posts, on the bus.
-    a.write64(ni::reg::SCRATCH_0, !0);
-    a.write64(ni::reg::SCRATCH_1, 1 << 17);
-    assert_eq!(
-        take(),
-        [
-            Store::NiScratch { index: 0, value: !0, vector: false },
-            Store::NiScratch { index: 1, value: 1 << 17, vector: false },
-        ]
-    );
-    // And from another node over the cable, by vector PIO.
-    b.write64(ni::reg::VECTOR, 0);
-    b.write64(ni::reg::VECTOR_DATA, 0x77);
-    b.write64(ni::reg::VECTOR_PARMS, (ni::reg::SCRATCH_1 - ni::reg::STATUS) | 1);
-    assert_eq!(take(), [Store::NiScratch { index: 1, value: 0x77, vector: true }]);
-    // The launch poke: a pending bit raised, one cleared, and one set twice.
-    let poke = (pi::MODIFY_SET | 12) as u64;
-    a.write64(pi::reg::INT_PEND_MOD, poke);
-    a.write64(pi::reg::INT_PEND_MOD, poke);
-    a.write64(pi::reg::INT_PEND_MOD, 12);
-    assert_eq!(
-        take(),
-        [
-            Store::IntPendMod { value: poke, changed: true },
-            Store::IntPendMod { value: poke, changed: false },
-            Store::IntPendMod { value: 12, changed: true },
-        ]
-    );
-    // A device interrupt arrives through the same register.
-    a.interrupt_target().set_line(3, true);
-    assert_eq!(take(), [Store::IntPendMod { value: pi::MODIFY_SET | 3, changed: true }]);
-    // The port reset is reported before it acts.
-    a.write64(ni::reg::PORT_RESET, 0x81);
-    assert_eq!(take(), [Store::PortReset { value: 0x81 }]);
-}
-
-#[test]
-fn the_observer_does_not_see_reads_or_other_stores_and_is_optional() {
-    let hub = hub(2, 3);
-    // Nothing connected: every one of those stores simply works.
-    hub.write64(pi::reg::RT_COMPARE_A, 5);
-    hub.write64(pi::reg::INT_PEND_MOD, pi::MODIFY_SET | 1);
-    hub.write64(ni::reg::SCRATCH_0, 1);
-    hub.write64(io::reg::SCRATCH_0, 1);
-    hub.write64(ni::reg::PORT_RESET, 0x80);
-    let seen = Arc::new(Seen::default());
-    hub.set_observer(seen.clone());
-    hub.read64(pi::reg::RT_COMPARE_A);
-    hub.read64(pi::reg::RT_COUNT);
-    hub.read64(pi::reg::INT_PEND0);
-    hub.read64(ni::reg::SCRATCH_0);
-    hub.write64(pi::reg::INT_MASK0_A, !0);
-    hub.write64(pi::reg::RT_COUNT, 0);
-    hub.write64(md::reg::CONFIG, 0);
-    hub.write64(ni::reg::STATUS, 0);
-    hub.write64(io::reg::SCRATCH_0 + 0x100, 0);
-    assert!(seen.0.lock().is_empty());
-}
-
 // ---- ownership ----
 
 /// A node that is built, wired and dropped must free its Hub and the decode
@@ -818,8 +709,6 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     a.pi().set_timer_manager(timers.clone());
     assert_eq!(Arc::strong_count(&timers), 1, "the interface holds the timer manager strongly");
     a.attach_i2c(Arc::new(Bytes::default()));
-    a.attach_uart(Arc::new(Bytes::default()));
-    a.set_observer(Arc::new(Seen::default()));
     a.set_hooks(Arc::new(Machine::default()));
     a.io().connect_widget(9, Arc::new(Bytes::default()));
     a.io().connect_widget(8, a.widget_face());
