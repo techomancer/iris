@@ -35,7 +35,7 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
-use super::{HubHooks, HubObserver, Store};
+use super::HubHooks;
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
 use parking_lot::Mutex;
@@ -174,9 +174,9 @@ struct State {
     local_written: u16,
 }
 impl State {
-    fn new(revision: u8, nasid: u16) -> Self {
+    fn new(revision: u8) -> Self {
         Self {
-            status: STATUS_RESET | (u64::from(revision) << 4) | (u64::from(nasid) << 8),
+            status: STATUS_RESET | (u64::from(revision) << 4),
             scratch: [0; 2],
             vector: 0,
             vector_data: 0,
@@ -202,48 +202,31 @@ impl State {
 
 pub struct Ni {
     revision: u8,
-    nasid: u16,
     state: Mutex<State>,
     peer: Mutex<Option<Weak<dyn NetPeer>>>,
     /// The module has power. A disabled port reads down at its peer.
     enabled: AtomicBool,
     hooks: OnceLock<Arc<dyn HubHooks>>,
     events: OnceLock<Arc<dyn NiEvents>>,
-    observer: OnceLock<Arc<dyn HubObserver>>,
 }
 
 impl Ni {
     /// `revision` is the chip revision code in NI_STATUS_REV_ID bits 7:4 (3 is
-    /// Hub 2.1, 5 is Hub 2.3) and `nasid` the node number a synthesized
-    /// firmware preprograms, zero otherwise.
-    pub fn new(revision: u8, nasid: u16) -> Self {
-        assert!(revision < 16 && nasid < 512);
+    /// Hub 2.1, 5 is Hub 2.3).
+    pub fn new(revision: u8) -> Self {
+        assert!(revision < 16);
         Self {
             revision,
-            nasid,
-            state: Mutex::new(State::new(revision, nasid)),
+            state: Mutex::new(State::new(revision)),
             peer: Mutex::new(None),
             enabled: AtomicBool::new(true),
             hooks: OnceLock::new(),
             events: OnceLock::new(),
-            observer: OnceLock::new(),
         }
     }
 
     pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
         let _ = self.hooks.set(hooks);
-    }
-
-    /// Report stores to the scratch registers and the port reset (see
-    /// [`Store`]).
-    pub fn set_observer(&self, observer: Arc<dyn HubObserver>) {
-        let _ = self.observer.set(observer);
-    }
-
-    fn observe(&self, store: Store) {
-        if let Some(observer) = self.observer.get() {
-            observer.stored(store);
-        }
     }
 
     pub fn set_events(&self, events: Arc<dyn NiEvents>) {
@@ -257,7 +240,9 @@ impl Ni {
     }
 
     /// Power to the module comes or goes. A disabled port reads down at the
-    /// peer, with the reason left at "failed".
+    /// peer, with the reason left at "failed". No machine takes a module's
+    /// power from its Hub, so only the tests do this.
+    #[cfg(test)]
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Release);
         if let Some(peer) = self.peer() {
@@ -499,15 +484,12 @@ impl Ni {
                 }
                 reg::PORT_RESET => {
                     drop(s);
-                    self.observe(Store::PortReset { value });
                     self.port_reset(value);
                 }
                 reg::PROTECTION => s.protection = value & PROTECTION_MASK,
                 reg::SCRATCH_0 | reg::SCRATCH_1 => {
                     let index = ((off - reg::SCRATCH_0) / 8) as usize;
                     s.scratch[index] = value;
-                    drop(s);
-                    self.observe(Store::NiScratch { index, value, vector });
                 }
                 reg::DIAG_PARMS => s.diag_parms = value & DIAG_MASK,
                 reg::VECTOR_PARMS => {
@@ -689,13 +671,13 @@ impl Resettable for Ni {
     fn power_on(&self) {
         {
             let mut s = self.state.lock();
-            *s = State::new(self.revision, self.nasid);
+            *s = State::new(self.revision);
         }
         // The link comes out of reset now: its width is settled from both
         // ends' force bits as they stand.
         self.announce();
         if let Some(h) = self.hooks.get() {
-            h.node_number_changed(self.nasid);
+            h.node_number_changed(0);
         }
     }
 }
