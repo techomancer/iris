@@ -47,10 +47,24 @@ renumber rebuilds the mapping list under a `hold_line_page` that is reading it
 (`a_renumber_on_one_processor_does_not_disturb_the_others_line_pages`). Lock
 order is `Windows`, then the space.
 
-A two-node window is 8 GiB, so its region bitmap counts 128 MiB regions; a 64
-or 256 MiB bank leaves regions part empty, and those take the bus path. Do not
-add a decision to the access path for any of this: the rare state change lays
-a different mapping, and nothing is tested per access.
+A cabled board's window spans the node numbers up to the next power of two
+above its node count (8 GiB for two nodes), reserved as inaccessible address
+space that commits nothing. A number past it stays on the bus path. Its
+one-word region bitmap, the test on every load, store and fetch, counts 64
+regions of 128 MiB, numbers 0 and 1. A region it does not hold whole, a 64 or
+256 MiB bank leaves half of each, or another number's, is found in the window's
+fine table (`PpMemSpace::fine_table`, one bit per 64 MiB) on the bitmap's miss
+branch, before the bus. The decode cache keeps window pointers for both, so it
+keys them on a value the space moves with every change of either
+(`add_key_sink`), not on the bitmap. Do not add a decision to the hit path for
+any of this: the rare state change lays a different mapping.
+
+Limit: a CPU's lines are private to it (`hold_line_page`) only for pages the
+bitmap names, its first 64 regions. A page past them returns `None`, so on a
+three- or four-node board the lines of node numbers 2 and 3 are not modelled as
+the CPU's own, and a store there is visible to the other CPUs at once. Numbers
+0 and 1, which the stock PROM gives, are covered. Nothing observed depends on
+it.
 
 ## A Bridge behind a Crossbow picks its host by the widget the guest programs
 

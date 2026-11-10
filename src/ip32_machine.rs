@@ -263,6 +263,7 @@ impl O2Machine {
             unsafe {
                 cpu.set_tcache_window(sp.view_base(v));
                 cpu.set_cached_view(sp, v);
+                sp.add_key_sink(v, cpu.tcache_key_ptr());
                 #[cfg(feature = "jitv2")]
                 {
                     use crate::ppmem::MappedMemory;

@@ -176,13 +176,17 @@ fn a_node_that_holds_another_number_sends_node_zero_beyond_the_cached_alias_to_t
 /// table does: each shows its own memory and the other's at their numbers,
 /// and a node that holds another number keeps its own memory below the
 /// cached alias and shows node zero's above it. A number given up leaves
-/// both windows, and one past the window's reach is left to the bus.
+/// both windows. What the region bitmap does not hold whole, the second
+/// number's memory here, the fine table does.
 #[test]
 fn each_window_shows_both_nodes_memory_at_their_numbers() {
-    use crate::ppmem::{bitmap_maps_at, window_shift};
+    use crate::ppmem::{bitmap_maps_at, FINE_SHIFT};
+    use std::sync::atomic::Ordering;
+    // The windows of a four-node board, so node number two fits.
+    let (size, shift) = window(4);
     let windows = Arc::new(Windows::default());
     let echo: Arc<dyn BusDevice> = Arc::new(Echo);
-    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], window(2)).unwrap()).collect();
+    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], size, shift).unwrap()).collect();
     let zeros: Vec<_> = mems
         .iter()
         .map(|m| {
@@ -190,16 +194,21 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
             m.node_zero(Routing::new(), &windows)
         })
         .collect();
-    let (near, far) = (0x1000, (96 << 20) + 0x1000);
+    let (near, mid, far) = (0x1000, (2 << 20) + 0x1000, (96 << 20) + 0x1000);
     for (n, m) in mems.iter().enumerate() {
         let n = n as u64;
         assert_eq!(m.physical().banks()[0].write64(near, n << 4), BUS_OK);
         assert_eq!(m.physical().banks()[0].write64(far, n << 4 | 1), BUS_OK);
+        assert_eq!(m.physical().banks()[0].write64(mid, n << 4 | 2), BUS_OK);
     }
     let seen = |n: usize, at: u64| {
         let sp = mems[n].physical().ppmem_space().unwrap();
-        bitmap_maps_at(sp.mapped_bitmap(), window_shift(sp.window_size()), at)
-            .then(|| unsafe { (*(sp.window_base().add(at as usize) as *const u64)).rotate_left(32) })
+        let (fine, regions) = sp.fine_table();
+        let r = at >> FINE_SHIFT;
+        let whole = r < regions && unsafe { (*fine.add((r / 64) as usize)).load(Ordering::Relaxed) } >> (r % 64) & 1 != 0;
+        // The fine table holds everything the bitmap does.
+        assert!(whole || !bitmap_maps_at(sp.mapped_bitmap(), sp.region_shift(), at));
+        whole.then(|| unsafe { (*(sp.window_base().add(at as usize) as *const u64)).rotate_left(32) })
     };
     let alias = 64 << 20;
     let one = 1 << 32;
@@ -213,25 +222,39 @@ fn each_window_shows_both_nodes_memory_at_their_numbers() {
     assert_eq!(seen(1, near), Some(0x10));
     assert_eq!(seen(1, far), Some(0x01));
     assert_eq!(seen(1, one + near), Some(0x10));
-    // A smaller alias shows more of node zero to the second node.
-    zeros[1].update(1, 4 << 10);
-    assert_eq!(seen(1, near), Some(0x00));
-    // Two is past an 8 GiB window: both leave it to the bus.
+    // A smaller alias shows more of node zero to the second node. It is a
+    // multiple of 2 MiB, which the jitv2 build maps at the finest.
+    zeros[1].update(1, 2 << 20);
+    assert_eq!(seen(1, near), Some(0x10));
+    assert_eq!(seen(1, mid), Some(0x02));
+    // Two: one leaves both windows, and the second node's memory is at two.
     zeros[1].update(2, alias);
     assert_eq!((seen(0, one + near), seen(1, one + near)), (None, None));
-    assert_eq!(seen(0, (2 << 32) + near), None);
+    assert_eq!((seen(0, (2 << 32) + near), seen(1, (2 << 32) + far)), (Some(0x10), Some(0x11)));
     assert_eq!(seen(1, near), Some(0x10));
     // Back to zero.
     zeros[1].update(0, alias);
     assert_eq!((seen(0, near), seen(1, near), seen(1, far)), (Some(0x00), Some(0x10), Some(0x11)));
 }
 
+/// A board reserves host address space for the node numbers it can hold, not
+/// for all 256, and a number past the window leaves it for the bus path.
+#[test]
+fn the_window_spans_the_next_power_of_two_node_numbers() {
+    assert_eq!(window(1), (crate::ppmem::WINDOW_SIZE, crate::ppmem::BITMAP_SHIFT));
+    assert_eq!(window(2), (2 * NODE_SPAN, 27));
+    assert_eq!(window(3), (4 * NODE_SPAN, 27));
+    assert_eq!(window(4), (4 * NODE_SPAN, 27));
+    assert_eq!(window(200), (256 * NODE_SPAN, 27));
+}
+
 /// Two nodes on a two-node board, each with a window: what the renumbering
 /// test below drives.
 fn two_nodes() -> (Arc<Windows>, Vec<NodeMemory>, Vec<Arc<NodeZero>>, Vec<Arc<Routing>>) {
+    let (size, shift) = window(2);
     let windows = Arc::new(Windows::default());
     let echo: Arc<dyn BusDevice> = Arc::new(Echo);
-    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], window(2)).unwrap()).collect();
+    let mems: Vec<_> = (0..2).map(|_| NodeMemory::with_window([128, 0, 0, 0], size, shift).unwrap()).collect();
     let routing: Vec<_> = (0..2).map(|_| Routing::new()).collect();
     let zeros = mems
         .iter()
@@ -256,9 +279,11 @@ fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
     use std::sync::Barrier;
     let (_windows, mems, zeros, routing) = two_nodes();
     let sp = mems[1].physical().ppmem_space().unwrap();
-    // The view has a sink like a processor's: a plain word the space writes.
+    // The view has sinks like a processor's: plain words the space writes.
     let mut bitmap = Box::new(0u64);
+    let mut key = Box::new(0u64);
     let v = sp.add_cached_view(&[&mut *bitmap as *mut u64]).unwrap();
+    unsafe { sp.add_key_sink(v, &mut *key as *mut u64) };
     let pages: Vec<u64> = (0..16).map(|n| 0x10_0000 + n * 0x1000).collect();
     const RENUMBERS: u32 = 3000;
     let (start, done) = (Barrier::new(2), AtomicBool::new(false));

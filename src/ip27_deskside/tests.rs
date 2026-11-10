@@ -127,49 +127,75 @@ fn the_cable_joins_the_nodes_once_they_are_numbered() {
 /// Each node's processor reads both nodes' memory through its own ppmem
 /// window once the PROM has numbered the nodes, as the first node's processor
 /// always read its own: a cached access is a load on either node, not a walk
-/// through the Hubs, so the second node runs code as fast as the first. The
-/// alias below 64 MiB, the reset size, stays the second node's own.
+/// through the Hubs, so the second node runs code as fast as the first. That
+/// holds for every bank size a node takes (256 MiB on the R12000 module) and
+/// for the numbers the stock PROM gives, 0 and 1. A number past the window
+/// reaches the same memory over the bus path. The alias below 64 MiB, the
+/// reset size, stays the second node's own.
 #[test]
 fn both_processors_reach_both_nodes_memory_through_their_windows() {
-    use crate::ppmem::{bitmap_maps_at, window_shift, MappedMemory};
-    big_stack(|| {
-        let dir = Scratch::new("windows");
-        let mut cfg = config(ORIGIN_2000_PROFILE, &dir.0, 2);
-        // 128 MiB, so the bank fills the window's 128 MiB regions.
-        cfg.banks[0] = 128;
-        let m = DesksideMachine::new(&cfg).unwrap();
-        let (a, b) = (&m.node_at(0).hub, &m.node_at(1).hub);
-        assert_eq!(b.write64(hub_ni::STATUS, 1 << 8), BUS_OK);
-        let near = 0x1000;
-        let far = (64 << 20) + 0x1000;
-        let one = 1u64 << 32;
-        // Through the Hubs: node 0's memory at its number, node 1's at its.
-        for (at, v) in [(near, 0x0a), (far, 0x0b), (one + near, 0x1a), (one + far, 0x1b)] {
-            assert_eq!(a.claim(Space::Memory).write64(at, v), BUS_OK);
-        }
-        let window = |n: usize, at: u64| {
-            let sp = m.node_at(n).memory.physical().ppmem_space().unwrap();
-            let bitmap = unsafe { *m.cpu_at(n).ppmem_bitmap_ptr() };
-            assert!(bitmap_maps_at(bitmap, window_shift(sp.window_size()), at), "node {n}'s processor reaches {at:#x} by the bus");
-            unsafe { (*(sp.window_base().add(at as usize) as *const u64)).rotate_left(32) }
-        };
-        // The first node: its own memory at zero, the second's at one.
-        assert_eq!(window(0, near), 0x0a);
-        assert_eq!(window(0, far), 0x0b);
-        assert_eq!(window(0, one + near), 0x1a);
-        // The second: its own below the alias and at one, node zero's above.
-        assert_eq!(window(1, near), 0x1a);
-        assert_eq!(window(1, far), 0x0b);
-        assert_eq!(window(1, one + far), 0x1b);
-        // A store through a window lands in the memory the Hubs reach.
-        unsafe {
-            let sp = m.node_at(1).memory.physical().ppmem_space().unwrap();
-            *(sp.window_base().add(far as usize) as *mut u64) = 0x2b_u64.rotate_left(32);
-        }
-        assert_eq!(a.claim(Space::Memory).read64(far).data, 0x2b);
-    });
+    use crate::ppmem::{bitmap_maps_at, MappedMemory, FINE_SHIFT};
+    use std::sync::atomic::Ordering;
+    for mb in [64, 128, 256] {
+        big_stack(move || {
+            let dir = Scratch::new(&format!("windows-{mb}"));
+            let mut cfg = config(ORIGIN_2000_PROFILE, &dir.0, 2);
+            if mb == 256 {
+                cfg.set_cpu(&crate::cpu::parts::R12000_270);
+            }
+            cfg.banks[0] = mb;
+            cfg.banks[1] = mb;
+            let m = DesksideMachine::new(&cfg).unwrap();
+            let (a, b) = (&m.node_at(0).hub, &m.node_at(1).hub);
+            // Bank 0 lies below the alias, bank 1 above it.
+            let (near, far) = (0x1000, (512 << 20) + 0x1000);
+            // What node `n`'s processor reads at `at` through its window, as
+            // the cache finds it there: the bitmap, or on a miss the fine table.
+            let window = |n: usize, at: u64| {
+                let sp = m.node_at(n).memory.physical().ppmem_space().unwrap();
+                let bitmap = unsafe { *m.cpu_at(n).ppmem_bitmap_ptr() };
+                let (fine, regions) = sp.fine_table();
+                let r = at >> FINE_SHIFT;
+                let whole = r < regions && unsafe { (*fine.add((r / 64) as usize)).load(Ordering::Relaxed) } >> (r % 64) & 1 != 0;
+                assert!(
+                    bitmap_maps_at(bitmap, sp.region_shift(), at) || whole,
+                    "{mb} MiB banks: node {n}'s processor reaches {at:#x} by the bus"
+                );
+                unsafe { (*(sp.window_base().add(at as usize) as *const u64)).rotate_left(32) }
+            };
+            for number in [1u64, 5] {
+                assert_eq!(b.write64(hub_ni::STATUS, number << 8), BUS_OK);
+                let other = number << 32;
+                // Through the Hubs: node 0's memory at its number, node 1's at its.
+                for (at, v) in [(near, 0x0a), (far, 0x0b), (other + near, 0x1a), (other + far, 0x1b)] {
+                    assert_eq!(a.claim(Space::Memory).write64(at, v + number), BUS_OK);
+                }
+                if number >= 2 {
+                    // Past the two nodes' window, the bus path answers.
+                    let phys = m.node_at(0).memory.physical();
+                    assert_eq!(phys.read64(other + near).data, 0x1a + number);
+                    assert_eq!(phys.read64(other + far).data, 0x1b + number);
+                    continue;
+                }
+                // The first node: its own memory at zero, the second's at its number.
+                assert_eq!(window(0, near), 0x0a + number);
+                assert_eq!(window(0, far), 0x0b + number);
+                assert_eq!(window(0, other + far), 0x1b + number);
+                // The second: its own below the alias and at its number, node
+                // zero's above the alias.
+                assert_eq!(window(1, near), 0x1a + number);
+                assert_eq!(window(1, far), 0x0b + number);
+                assert_eq!(window(1, other + near), 0x1a + number);
+            }
+            // A store through a window lands in the memory the Hubs reach.
+            unsafe {
+                let sp = m.node_at(1).memory.physical().ppmem_space().unwrap();
+                *(sp.window_base().add(far as usize) as *mut u64) = 0x2b_u64.rotate_left(32);
+            }
+            assert_eq!(a.claim(Space::Memory).read64(far).data, 0x2b);
+        });
+    }
 }
-
 
 /// The BaseIO's Bridge sits behind the first node's Crossbow, so it reaches
 /// that node's Hub as the host at widget 9, through the port's link. A

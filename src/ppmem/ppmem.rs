@@ -66,6 +66,9 @@ pub fn bitmap_maps(bitmap: u64, phys: u64) -> bool {
     bitmap_maps_at(bitmap, BITMAP_SHIFT, phys)
 }
 
+/// Size of a fine region: [`PpMemSpace::fine_table`] has a bit for each.
+pub const FINE_SHIFT: u32 = 26;
+
 /// [`bitmap_maps`] for a window of any size: `shift` is its [`window_shift`].
 #[inline(always)]
 pub fn bitmap_maps_at(bitmap: u64, shift: u32, phys: u64) -> bool {
@@ -719,6 +722,9 @@ pub struct PpMemSpace {
 struct SpaceState {
     /// The window's size in bytes. Never changes.
     window: u64,
+    /// The region bitmap's region size: the window's [`window_shift`] unless
+    /// the space was made with another. Never changes.
+    shift: u32,
     mappings: Vec<Mapping>,
     /// Where the bitmap is published. Points at `own_bitmap` until a consumer
     /// hands over its own inline field, so it is never null and publication is
@@ -731,6 +737,12 @@ struct SpaceState {
     sink2: *mut u64,
     /// The bitmap last published to the sinks above.
     bits: u64,
+    /// One bit per [`FINE_SHIFT`] region of the whole window, set when the
+    /// region is wholly mapped: [`PpMemSpace::fine_table`].
+    fine: Box<[AtomicU64]>,
+    /// Bumped whenever the fine table changes, so that a view can tell it
+    /// moved: [`PpMemSpace::add_key_sink`].
+    fine_epoch: u64,
     /// Each CPU's cached view of memory: see [`PpMemSpace::add_cached_view`].
     views: Vec<View>,
     /// Ranges where a held page may stand with no memory mapped behind it:
@@ -749,6 +761,12 @@ struct View {
     /// holds. Only its CPU changes them, at CACHE instructions, under the
     /// contract below.
     held: std::collections::BTreeMap<u64, u32>,
+    /// Where this view's key is published: [`PpMemSpace::add_key_sink`].
+    key_sinks: Vec<*mut u64>,
+    /// Moves whenever the bitmap this view publishes or the fine table does.
+    key: u64,
+    /// The bitmap and fine epoch `key` was last moved for.
+    seen: (u64, u64),
 }
 
 /// The bitmap `PpMemSpace` publishes into before a CPU claims it.
@@ -765,7 +783,7 @@ struct OwnBitmap(Box<u64>);
 //
 //   * Taking `guard` for the whole call: the remaps (`map_bank`, `map_alias`,
 //     `map_range`, `map_range_of`, `unmap_range`, through `remapping`, and
-//     `clear_mappings` directly), `set_bitmap_sink2`, `add_cached_view`,
+//     `clear_mappings` directly), `set_bitmap_sink2`, `add_key_sink`, `add_cached_view`,
 //     `hold_line_page`, `release_line_page` and `held_line_pages`. Two threads
 //     can reach one space: the SN0 boards re-lay every node's window from the
 //     thread that stored a Hub's node number (`ip27::Windows`), while the
@@ -778,13 +796,13 @@ struct OwnBitmap(Box<u64>);
 //     the sink pointer, which is fixed once the CPU is wired, and the word
 //     through an atomic load; `view_base` reads a view's base, which never
 //     moves after `add_cached_view`; `fine_table` hands out words that only
-//     ever change in place. `add_cached_view`, `set_bitmap_sink2` and the
-//     sink setters run before the CPUs do, except on a stopped world.
+//     ever change in place. The setters take the guard too, and run before
+//     the CPUs do, bar a stopped world.
 //   * The guard is never on a hit path. A load, store or fetch goes through
 //     the CPU's inline `MipsCore::ppmem_bitmap` word (an `AtomicU64`, read
-//     `Relaxed`) and its view's base pointer, neither of which goes through
-//     here. The words a remap publishes to a running CPU are atomics, stored
-//     `Relaxed` by `publish_word`: the CPU needs no ordering between the
+//     `Relaxed`), its decode-cache key (the same) and its view's base pointer, neither of which goes through
+//     here. The words a remap publishes to a running CPU (bitmap and key) are
+//     atomics, stored `Relaxed` by `publish_word`: the CPU needs no ordering between the
 //     bitmap and the window it covers, because the window is never unmapped.
 //   * Device threads (MC-DMA, seeq, VINO) reach RAM through `BusDevice` on the
 //     individual `PpMemory` banks. They read the bitmap through
@@ -819,6 +837,13 @@ impl PpMemSpace {
 
     /// [`Self::over`] with a window of `window` bytes.
     pub fn over_window(banks: &[PpMemory], window: u64) -> io::Result<Self> {
+        Self::over_window_regions(banks, window, window_shift(window))
+    }
+
+    /// [`Self::over_window`] whose region bitmap counts regions of
+    /// `1 << shift` bytes, covering the window's first 64 of them. The rest of
+    /// the window is reached through [`Self::fine_table`].
+    pub fn over_window_regions(banks: &[PpMemory], window: u64, shift: u32) -> io::Result<Self> {
         let space = AddrSpace::reserve(window as usize)?;
         let own_bitmap = OwnBitmap(Box::new(0u64));
         let sink = &*own_bitmap.0 as *const u64 as *mut u64;
@@ -834,10 +859,13 @@ impl PpMemSpace {
             guard: parking_lot::Mutex::new(()),
             state: UnsafeCell::new(SpaceState {
                 window,
+                shift,
                 mappings: Vec::new(),
                 sink,
                 sink2,
                 bits: 0,
+                fine: (0..(window >> FINE_SHIFT).div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+                fine_epoch: 0,
                 views: Vec::new(),
                 unbacked: Vec::new(),
             }),
@@ -847,6 +875,39 @@ impl PpMemSpace {
     /// The window's size in bytes.
     pub fn window_size(&self) -> u64 {
         unsafe { (*self.state.get()).window }
+    }
+
+    /// The region bitmap's region size, as a shift.
+    pub fn region_shift(&self) -> u32 {
+        unsafe { (*self.state.get()).shift }
+    }
+
+    /// The fine table and how many regions it has: bit `r % 64` of word
+    /// `r / 64` is set when region `r`, the [`FINE_SHIFT`] bytes from
+    /// `r << FINE_SHIFT`, is wholly mapped. It spans the whole window, where
+    /// the region bitmap spans 64 regions, so a consumer that misses the
+    /// bitmap tests it before taking the bus. Its words never move.
+    pub fn fine_table(&self) -> (*const AtomicU64, u64) {
+        let st = unsafe { &*self.state.get() };
+        (st.fine.as_ptr(), st.window >> FINE_SHIFT)
+    }
+
+    /// Publish a key to `ptr` for view `v` that changes whenever the region
+    /// bitmap the view publishes or the fine table does, starting with the
+    /// current one: a consumer that keeps window pointers keys them on it, and
+    /// drops them when it moves. Null is skipped.
+    ///
+    /// # Safety
+    /// `ptr` must stay valid for the space's life, and must be an
+    /// `AtomicU64` the view's CPU thread reads atomically (`Relaxed`).
+    pub unsafe fn add_key_sink(&self, v: usize, ptr: *mut u64) {
+        if ptr.is_null() {
+            return;
+        }
+        let _held = self.guard.lock();
+        let st = unsafe { &mut *self.state.get() };
+        publish_word(ptr, st.views[v].key);
+        st.views[v].key_sinks.push(ptr);
     }
 
     /// Test/bench helper: allocate fresh banks of the given sizes in MB and
@@ -995,7 +1056,7 @@ impl PpMemSpace {
     /// is partially mapped — or mapped alongside MMIO — reads as unmapped and
     /// keeps taking the bus path.
     fn recompute_bitmap(state: &mut SpaceState) {
-        let region = 1u64 << window_shift(state.window);
+        let region = 1u64 << state.shift;
         let mut bits = 0u64;
         for bit in 0..64u32 {
             let start = (bit as u64) * region;
@@ -1025,6 +1086,7 @@ impl PpMemSpace {
         publish_word(state.sink, bits);
         publish_word(state.sink2, bits);
         state.bits = bits;
+        Self::recompute_fine(state);
         for v in 0..state.views.len() {
             Self::publish_view(state, v);
         }
@@ -1032,12 +1094,48 @@ impl PpMemSpace {
 
     /// Publish view `v`'s bitmap: the shared one, plus every region the view
     /// holds a page in, which `hold_line_page` made safe to touch whole.
-    fn publish_view(state: &SpaceState, v: usize) {
-        let shift = window_shift(state.window);
-        let view = &state.views[v];
-        let bits = view.held.keys().fold(state.bits, |b, &page| b | 1u64 << (page >> shift));
+    fn publish_view(state: &mut SpaceState, v: usize) {
+        let shift = state.shift;
+        let (base, epoch) = (state.bits, state.fine_epoch);
+        let view = &mut state.views[v];
+        let bits = view.held.keys().fold(base, |b, &page| b | 1u64 << (page >> shift));
         for &s in &view.sinks {
             publish_word(s, bits);
+        }
+        if view.seen != (bits, epoch) {
+            view.seen = (bits, epoch);
+            view.key += 1;
+            for &s in &view.key_sinks {
+                publish_word(s, view.key);
+            }
+        }
+    }
+
+    /// Recompute the fine table from the live mapping list, and move the fine
+    /// epoch if it changed.
+    fn recompute_fine(state: &mut SpaceState) {
+        let mut spans: Vec<(u64, u64)> = state.mappings.iter().map(|m| (m.at, m.at + m.len)).collect();
+        spans.sort_unstable();
+        let mut fine = vec![0u64; state.fine.len()];
+        let mut i = 0;
+        while i < spans.len() {
+            let (start, mut end) = spans[i];
+            i += 1;
+            while i < spans.len() && spans[i].0 <= end {
+                end = end.max(spans[i].1);
+                i += 1;
+            }
+            let first = start.div_ceil(1 << FINE_SHIFT);
+            for r in first..end >> FINE_SHIFT {
+                fine[(r / 64) as usize] |= 1 << (r % 64);
+            }
+        }
+        let mut changed = false;
+        for (word, new) in state.fine.iter().zip(fine) {
+            changed |= word.swap(new, Ordering::Release) != new;
+        }
+        if changed {
+            state.fine_epoch += 1;
         }
     }
 
@@ -1075,7 +1173,7 @@ impl PpMemSpace {
         let st = unsafe { &mut *self.state.get() };
         let space = AddrSpace::reserve(st.window as usize)?;
         let sinks = sinks.iter().copied().filter(|p| !p.is_null()).collect();
-        st.views.push(View { space, sinks, held: Default::default() });
+        st.views.push(View { space, sinks, held: Default::default(), key_sinks: Vec::new(), key: 0, seen: (0, 0) });
         let v = st.views.len() - 1;
         for m in st.mappings.clone() {
             self.lay(st, v, &m, m.at, m.at + m.len)?;
@@ -1101,6 +1199,14 @@ impl PpMemSpace {
     /// it back. Returns whether the page is newly held, or `None` when no
     /// memory is mapped behind it.
     ///
+    /// It also returns `None` for a page past the region bitmap's 64
+    /// regions: the bitmap is all a CPU tests for a private page, and memory
+    /// beyond it is reached through the fine table with nothing held. On an
+    /// SN0 board with 128 MiB regions that is node numbers 2 and 3 of a
+    /// three- or four-node board; numbers 0 and 1 are unaffected. Lines
+    /// there are not modelled as the CPU's alone: a store reaches every
+    /// other CPU at once, as it does without views.
+    ///
     /// The region bitmap is all a CPU tests, so the page's whole region is
     /// the view's while it stands, reading zeros where nothing is mapped. The
     /// O2's POST holds lines for page 0 before CRIME maps the rest of its
@@ -1113,7 +1219,12 @@ impl PpMemSpace {
         if !self.backs(page) && !st.unbacked.iter().any(|&(a, b)| page >= a && page + gran <= b) {
             return None;
         }
-        let shift = window_shift(st.window);
+        let shift = st.shift;
+        // The bitmap names the window's first 64 regions; a page past them is
+        // reached through the fine table, with nothing held.
+        if page >> shift >= 64 {
+            return None;
+        }
         if let Some(n) = st.views[v].held.get_mut(&page) {
             *n += 1;
             return Some(false);
@@ -1315,7 +1426,10 @@ impl MappedMemory for PpMemSpace {
                 }
             }
         }
-        for m in std::mem::take(&mut st.mappings) {
+        let mappings = std::mem::take(&mut st.mappings);
+        // The fine table goes before the pages do.
+        Self::recompute_fine(st);
+        for m in mappings {
             // Best-effort: a failure here leaves the range mapped, which is
             // still safe — it just isn't reverted.
             // `scrub`, not `unmap`: see `AddrSpace::scrub`.

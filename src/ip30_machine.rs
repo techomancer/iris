@@ -564,6 +564,7 @@ impl OctaneMachine {
                     c.set_tcache_window(sp.view_base(v));
                     c.set_cached_view(sp, v);
                     c.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
+                    sp.add_key_sink(v, c.tcache_key_ptr());
                     #[cfg(feature = "jitv2")]
                     {
                         use crate::ppmem::MappedMemory;

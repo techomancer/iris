@@ -723,6 +723,16 @@ pub trait MipsCache: Send + Sync {
     unsafe fn set_cached_view(&self, _sp: *const crate::ppmem::PpMemSpace, _view: usize) {}
     /// The ppmem window's `window_shift`, when it is not the 4GB window's.
     fn set_tcache_shift(&self, _shift: u32) {}
+    /// tcache: the window's fine table (`PpMemSpace::fine_table`), which the
+    /// cache tests on a miss in the region bitmap before taking the bus.
+    /// Default no-op: such a cache takes the bus.
+    ///
+    /// # Safety
+    /// `table` must hold `regions` bits and outlive this cache.
+    unsafe fn set_tcache_fine(&self, _table: *const std::sync::atomic::AtomicU64, _regions: u64) {}
+    /// tcache: pointer to this cache's key for the window pointers it keeps,
+    /// for `PpMemSpace::add_key_sink`. Null when it keeps none.
+    fn tcache_key_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
 
     /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
     /// tag change, no exception. Then a caller that does not need the

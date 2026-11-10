@@ -443,7 +443,8 @@ impl<B: Ip27Board> Ip27Machine<B> {
             };
             let clock = host_clock();
             let timers = Arc::new(TimerManager::new());
-            let memory = NodeMemory::with_window(spec.banks_mb, ip27::window(specs.len()))?;
+            let (window, shift) = ip27::window(specs.len());
+            let memory = NodeMemory::with_window(spec.banks_mb, window, shift)?;
             memory.map_reset_view(&flash);
             let hub = Hub::new(spec.hub, clock.clone());
             hub.set_timer_manager(timers.clone());
@@ -577,7 +578,10 @@ impl<B: Ip27Board> Ip27Machine<B> {
                 .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
             unsafe {
                 cpu.set_tcache_window(sp.view_base(v));
-                cpu.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
+                cpu.set_tcache_shift(sp.region_shift());
+                let (fine, regions) = sp.fine_table();
+                cpu.set_tcache_fine(fine, regions);
+                sp.add_key_sink(v, cpu.tcache_key_ptr());
                 #[cfg(feature = "jitv2")]
                 {
                     use crate::ppmem::MappedMemory;
