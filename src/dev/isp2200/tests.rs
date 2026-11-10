@@ -337,6 +337,40 @@ fn soft_reset_orders() {
     }
 }
 
+/// Soft reset clears the interface, the rings and the work in flight.
+#[test]
+fn soft_reset_clears() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+    r.wr(reg::ICR, ICR_ENABLE);
+
+    // One completion posted and unread, a second held behind its latch.
+    r.publish(&entry_command(ENTRY_CMD64, 0x1111, 1, 0, 0));
+    r.publish(&entry_command(ENTRY_CMD64, 0x2222, 1, 0, 0));
+    assert_eq!(r.rd(reg::ISR), ISR_PENDING | ISR_RISC);
+
+    r.soft_reset();
+    assert_eq!(r.rd(reg::ICR), 0);
+    assert_eq!(r.rd(reg::ISR), 0);
+    assert_eq!(r.rd(reg::SEMAPHORE), 0);
+    assert_eq!(r.rd(reg::NVRAM), 0);
+    r.wr(reg::HCCR, HCCR_RELEASE);
+
+    // The rings are gone: mailbox 4 is plain storage again.
+    r.wr(reg::REQUEST_QUEUE, 0x55aa);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 0x55aa);
+
+    // The firmware is gone too, and comes back with a download.
+    assert_eq!(r.call_ack(mbox::GET_FW_STATE, 0, 0, 0), mbox::INVALID);
+    r.start();
+    r.rings(8, 8);
+    // The held completion did not survive into the new ring.
+    assert_eq!(r.response(0)[0], 0);
+    assert_eq!(r.rd(reg::ISR), 0);
+    r.tur(0x3333);
+}
+
 /// HCCR reset holds, release boots, pause defers a mailbox command.
 #[test]
 fn risc_control() {
@@ -936,6 +970,825 @@ fn mailbox_storage() {
     assert_eq!(r.rd(reg::REQUEST_QUEUE), 0);
     r.ack();
     assert_eq!(r.rd(reg::REQUEST_QUEUE), 0);
+}
+
+const ENTRY_CMD32: u8 = ENTRY_TYPE_COMMAND;
+const ENTRY_CMD64: u8 = ENTRY_TYPE_COMMAND_A64;
+const ENTRY_CMD_LIST: u8 = ENTRY_TYPE_COMMAND_LIST;
+const ENTRY_CONT32: u8 = ENTRY_TYPE_CONTINUATION;
+const ENTRY_CONT64: u8 = ENTRY_TYPE_CONTINUATION_A64;
+const ENTRY_STATUS: u8 = ENTRY_TYPE_STATUS;
+const ENTRY_MARKER: u8 = ENTRY_TYPE_MARKER;
+
+type Entry = [u8; ENTRY_SIZE];
+
+fn p16(e: &mut [u8], off: usize, v: u16) {
+    e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+}
+fn p32(e: &mut [u8], off: usize, v: u32) {
+    e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn p64(e: &mut [u8], off: usize, v: u64) {
+    e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn g16(e: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([e[off], e[off + 1]])
+}
+fn g32(e: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(e[off..off + 4].try_into().unwrap())
+}
+fn put_seg64(e: &mut [u8], off: usize, addr: u64, len: u32) {
+    p64(e, off, addr);
+    p32(e, off + 8, len);
+}
+fn put_seg32(e: &mut [u8], off: usize, addr: u32, len: u32) {
+    p32(e, off, addr);
+    p32(e, off + 4, len);
+}
+
+fn entry_command(kind: u8, handle: u32, loop_id: u8, lun: u16, opcode: u8) -> Entry {
+    let mut e = [0u8; ENTRY_SIZE];
+    e[0] = kind;
+    e[1] = 1;
+    p32(&mut e, 4, handle);
+    e[9] = loop_id;
+    p16(&mut e, 10, lun);
+    e[20] = opcode;
+    e
+}
+
+impl Rig {
+    /// Both rings at fixed places, built with INIT_FIRMWARE.
+    fn rings_at(&self, rqlen: u16, rslen: u16, rq: u64, rs: u64, options: u16, xopts: u8) {
+        self.rqlen.set(rqlen);
+        self.rslen.set(rslen);
+        self.rq_next.set(0);
+        self.rs_next.set(0);
+        if rs + u64::from(rslen) * 64 <= crate::dev::isp1040::tests::MEM as u64 {
+            self.mem.put(rs as u32, &vec![0u8; usize::from(rslen) * ENTRY_SIZE]);
+        }
+        let mut icb = icb_build(rqlen, rslen, rq, rs, options);
+        icb[64] = xopts;
+        self.mem.put(ICB_AT, &icb);
+        assert_eq!(self.init_firmware(u64::from(ICB_AT)), mbox::COMPLETE);
+        self.ack();
+    }
+
+    fn rings(&self, rqlen: u16, rslen: u16) {
+        self.rings_at(rqlen, rslen, u64::from(RQST_AT), u64::from(RESP_AT), 0, 0);
+    }
+
+    fn put_request(&self, index: u16, e: &Entry) {
+        self.mem.put(RQST_AT + u32::from(index) * 64, e);
+    }
+
+    /// Writes the entry at the producer and publishes it.
+    fn publish(&self, e: &Entry) {
+        self.put_request(self.rq_next.get(), e);
+        self.rq_next.set((self.rq_next.get() + 1) % self.rqlen.get());
+        self.wr(reg::REQUEST_QUEUE, self.rq_next.get());
+    }
+
+    fn response(&self, index: u16) -> Entry {
+        self.mem.get(RESP_AT + u32::from(index) * 64, ENTRY_SIZE).try_into().unwrap()
+    }
+
+    /// Linux's ring handler order: consume, write response-out, clear.
+    fn consume(&self, n: u16) {
+        self.rs_next.set((self.rs_next.get() + n) % self.rslen.get());
+        self.wr(reg::RESPONSE_QUEUE, self.rs_next.get());
+        self.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    }
+
+    /// One TEST UNIT READY through the whole ring round trip.
+    fn tur(&self, handle: u32) {
+        self.publish(&entry_command(ENTRY_CMD64, handle, 1, 0, 0x00));
+        assert_eq!(self.rd(reg::ISR) & ISR_RISC, ISR_RISC);
+        assert_eq!(self.rd(reg::SEMAPHORE), 0);
+        let e = self.response(self.rs_next.get());
+        assert_eq!(e[0], ENTRY_STATUS);
+        assert_eq!(g32(&e, 4), handle);
+        assert_eq!(g16(&e, 10), COMPLETION_PORT_UNAVAILABLE);
+        self.consume(1);
+    }
+
+    /// The entry at the response consumer, then consumed.
+    fn assert_rejected(&self, kind: u8, handle: u32, flag: u8) {
+        let e = self.response(self.rs_next.get());
+        assert_eq!((e[0], e[3], g32(&e, 4)), (kind, flag, handle));
+        self.consume(1);
+    }
+}
+
+/// A 64-bit command comes back as a whole 64-byte status entry: every byte of
+/// the slot is written, so Linux's signature in bytes 60..63 is overwritten.
+/// No disk is on the loop, so the completion is "port unavailable".
+#[test]
+fn command_round_trip() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+    r.mem.put(RESP_AT, &[0xde; ENTRY_SIZE]);
+
+    // A READ(10) whose every CDB byte differs, and a byte count.
+    let mut e = entry_command(ENTRY_CMD64, 0xcafe0001, 5, 2, 0x28);
+    p16(&mut e, 12, 0x0028);
+    for i in 1..16 {
+        e[20 + i] = 0xa0 + i as u8;
+    }
+    p32(&mut e, 36, 0x12345);
+    p16(&mut e, 18, 1);
+    put_seg64(&mut e, 40, 0x0210_0000, 0x12345);
+    r.publish(&e);
+
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 1);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 1);
+
+    let e = r.response(0);
+    assert_eq!((e[0], e[1], e[3]), (ENTRY_STATUS, 1, 0));
+    assert_eq!(g32(&e, 4), 0xcafe0001);
+    assert_eq!(g16(&e, 8), 0);
+    assert_eq!(g16(&e, 10), COMPLETION_PORT_UNAVAILABLE);
+    assert!(e[12..].iter().all(|&b| b == 0));
+}
+
+/// 32-bit commands are equivalent, and segments past the first entry come
+/// from continuations: the entry count steps over them, and none is
+/// dispatched as a command of its own.
+#[test]
+fn continuations() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+
+    // A 32-bit command alone.
+    let mut e = entry_command(ENTRY_CMD32, 0x32, 3, 0, 0x12);
+    p16(&mut e, 18, 1);
+    put_seg32(&mut e, 40, 0x0210_0000, 36);
+    r.publish(&e);
+    assert_eq!(g32(&r.response(0), 4), 0x32);
+    r.consume(1);
+
+    // 64-bit: two inline segments, two more in a 0x0a continuation.
+    let mut e = entry_command(ENTRY_CMD64, 0x64, 3, 0, 0x2a);
+    e[1] = 2;
+    p16(&mut e, 18, 4);
+    put_seg64(&mut e, 40, 0x0210_0000, 0x100);
+    put_seg64(&mut e, 52, 0x0220_0000, 0x200);
+    let mut c = [0u8; ENTRY_SIZE];
+    c[0] = ENTRY_CONT64;
+    c[1] = 1;
+    put_seg64(&mut c, 4, 0x0230_0000, 0x300);
+    put_seg64(&mut c, 16, 0x0240_0000, 0x400);
+    r.put_request(1, &e);
+    r.put_request(2, &c);
+    r.rq_next.set(3);
+    r.wr(reg::REQUEST_QUEUE, 3);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 3);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 2);
+    assert_eq!(g32(&r.response(1), 4), 0x64);
+    r.consume(1);
+
+    // 32-bit: three inline, one in a 0x02 continuation from byte 8.
+    let mut e = entry_command(ENTRY_CMD32, 0x320, 3, 0, 0x28);
+    e[1] = 2;
+    p16(&mut e, 18, 4);
+    put_seg32(&mut e, 40, 0x0210_0000, 1);
+    put_seg32(&mut e, 48, 0x0220_0000, 2);
+    put_seg32(&mut e, 56, 0x0230_0000, 4);
+    let mut c = [0u8; ENTRY_SIZE];
+    c[0] = ENTRY_CONT32;
+    c[1] = 1;
+    put_seg32(&mut c, 8, 0x0240_0000, 8);
+    r.put_request(3, &e);
+    r.put_request(4, &c);
+    r.rq_next.set(5);
+
+    // Only the command is published: it waits for its continuation.
+    r.wr(reg::REQUEST_QUEUE, 4);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 3);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 2);
+    r.wr(reg::REQUEST_QUEUE, 5);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 5);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 3);
+}
+
+/// OpenBSD's segment-list command reads its list from host memory.
+#[test]
+fn segment_list() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+
+    let mut list = [0u8; 36];
+    put_seg64(&mut list, 0, 0x0210_0000, 0x1000);
+    put_seg64(&mut list, 12, 0x0220_0000, 0x2000);
+    put_seg64(&mut list, 24, 0x0230_0000, 0x0800);
+    r.mem.put(0x6000, &list);
+
+    let mut e = entry_command(ENTRY_CMD_LIST, 0x15, 4, 1, 0x28);
+    p16(&mut e, 18, 3);
+    p16(&mut e, 40, 1);
+    p64(&mut e, 46, 0x6000);
+    r.publish(&e);
+    let e = r.response(0);
+    assert_eq!(e[0], ENTRY_STATUS);
+    assert_eq!(g32(&e, 4), 0x15);
+}
+
+/// Approximation: a marker is consumed and answers nothing.
+#[test]
+fn marker() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+    let mut e = [0u8; ENTRY_SIZE];
+    e[0] = ENTRY_MARKER;
+    e[1] = 1;
+    e[10] = 2;
+    r.publish(&e);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 1);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 0);
+    assert_eq!(r.rd(reg::ISR), 0);
+}
+
+/// The producer wraps at the ring length; entries either side are taken.
+#[test]
+fn request_wrap() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(4, 8);
+    for i in 0..6 {
+        r.tur(0x100 + i);
+        assert_eq!(r.rd(reg::REQUEST_QUEUE), r.rq_next.get());
+    }
+    assert_eq!(r.rq_next.get(), 2);
+}
+
+/// A completion posted on the ring thread rises while another thread consumes
+/// it and clears the interrupt. The ring thread drives in the hold that
+/// posted the completion, so the fall waits for the rise to be delivered.
+#[test]
+fn a_completion_posted_by_the_ring_thread_is_delivered_before_a_later_fall() {
+    use crate::irq::StallingProbe;
+    let r = Rig::bare();
+    r.start();
+    r.rings(4, 8);
+    let (stall, line) = StallingProbe::line();
+    r.isp.state().connect_irq(line);
+    r.isp.attached();
+    r.wr(reg::ICR, ICR_ENABLE);
+    r.put_request(0, &entry_command(ENTRY_CMD64, 0x100, 1, 0, 0x00));
+    let (started, go) = stall.arm();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::REQUEST_QUEUE, 1, 2));
+        started.recv_timeout(std::time::Duration::from_secs(5)).expect("the completion's rise is in the parent");
+        let c = scope.spawn(|| {
+            r.isp.write(reg::RESPONSE_QUEUE, 1, 2);
+            r.isp.write(reg::HCCR, u32::from(HCCR_CLEAR_RISC), 2);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!c.is_finished(), "the fall waits for the rise to be delivered");
+        go.send(()).unwrap();
+    });
+    r.isp.wait_idle();
+    assert_eq!(stall.probe.writes(), [false, true, false]);
+    assert!(!r.isp.interrupting());
+}
+
+/// Approximation: response-in advances after each whole entry; with the ring
+/// full, later completions wait and post in order once the host frees room.
+#[test]
+fn response_ring_full() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 4);
+    for i in 0..5u32 {
+        r.publish(&entry_command(ENTRY_CMD64, 0x500 + i, 1, 0, 0));
+        if i < 3 {
+            assert_eq!(r.rd(reg::RESPONSE_QUEUE), i as u16 + 1);
+        }
+        // The host clears the latch without consuming anything.
+        r.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    }
+    // Three of four slots hold entries; two completions wait.
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 3);
+    assert_eq!(r.rd(reg::ISR), 0);
+
+    r.wr(reg::RESPONSE_QUEUE, 3);
+    r.rs_next.set(3);
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 1);
+    assert_eq!(g32(&r.response(3), 4), 0x503);
+    assert_eq!(g32(&r.response(0), 4), 0x504);
+}
+
+/// Approximation: an unknown type comes back as itself, flagged.
+#[test]
+fn unknown_entry_type() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+    r.publish(&entry_command(0x33, 0xabcd0033, 1, 0, 0));
+    let e = r.response(0);
+    assert_eq!((e[0], e[3], g32(&e, 4)), (0x33, ENTRY_FLAG_BAD_TYPE, 0xabcd0033));
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 1);
+}
+
+/// Approximation: which entry-status flag a malformed request carries is the
+/// model's choice. An entry count of 0 or one that does not fit the ring sets
+/// bit 4 (invalid count); more segments than the command's entries hold sets
+/// bit 3 (invalid parameter); a continuation with no command, or one of the
+/// other width, sets bit 5 (invalid order). None reaches the service, and
+/// each takes the slots its count claims.
+#[test]
+fn malformed_entries() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+
+    let mut e = entry_command(ENTRY_CMD64, 0xbad00000, 1, 0, 0);
+    e[1] = 0;
+    r.publish(&e);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 1);
+    r.assert_rejected(ENTRY_CMD64, 0xbad00000, ENTRY_FLAG_BAD_COUNT);
+
+    let mut e = entry_command(ENTRY_CMD32, 0xbad00008, 1, 0, 0);
+    e[1] = 8;
+    r.publish(&e);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 2);
+    r.assert_rejected(ENTRY_CMD32, 0xbad00008, ENTRY_FLAG_BAD_COUNT);
+
+    // A lone 0x19 holds two segments, not three.
+    let mut e = entry_command(ENTRY_CMD64, 0xbad00003, 1, 0, 0);
+    p16(&mut e, 18, 3);
+    r.publish(&e);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 3);
+    r.assert_rejected(ENTRY_CMD64, 0xbad00003, ENTRY_FLAG_BAD_PARAM);
+
+    // Continuations with no command before them.
+    let mut c = [0u8; ENTRY_SIZE];
+    c[0] = ENTRY_CONT64;
+    c[1] = 1;
+    p32(&mut c, 4, 0xc0a);
+    r.publish(&c);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 4);
+    r.assert_rejected(ENTRY_CONT64, 0xc0a, ENTRY_FLAG_BAD_ORDER);
+
+    c[0] = ENTRY_CONT32;
+    p32(&mut c, 4, 0xc02);
+    r.publish(&c);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 5);
+    r.assert_rejected(ENTRY_CONT32, 0xc02, ENTRY_FLAG_BAD_ORDER);
+
+    // A 64-bit command followed by a 32-bit continuation: both slots go.
+    let mut e = entry_command(ENTRY_CMD64, 0xbad00064, 1, 0, 0);
+    e[1] = 2;
+    p16(&mut e, 18, 3);
+    put_seg64(&mut e, 40, 0x0210_0000, 0x100);
+    put_seg64(&mut e, 52, 0x0220_0000, 0x100);
+    let mut c = [0u8; ENTRY_SIZE];
+    c[0] = ENTRY_CONT32;
+    c[1] = 1;
+    put_seg32(&mut c, 8, 0x0230_0000, 0x100);
+    r.put_request(5, &e);
+    r.put_request(6, &c);
+    r.rq_next.set(7);
+    r.wr(reg::REQUEST_QUEUE, 7);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 7);
+    r.assert_rejected(ENTRY_CMD64, 0xbad00064, ENTRY_FLAG_BAD_ORDER);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 6);
+}
+
+/// Approximation: a refused read after the entry's own header -- the segment
+/// list of a 0x15 command, or a continuation -- returns the command with
+/// entry-status bit 6 (request-queue DMA error).
+#[test]
+fn descriptor_dma_errors() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+    let mut e = entry_command(ENTRY_CMD_LIST, 0xd15, 4, 0, 0x28);
+    p16(&mut e, 18, 3);
+    p16(&mut e, 40, 1);
+    p64(&mut e, 46, 1 << 40);
+    r.publish(&e);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 1);
+    r.assert_rejected(ENTRY_CMD_LIST, 0xd15, ENTRY_FLAG_DMA_ERROR);
+
+    // The ring's last backed slot is slot 0; its continuation is not backed.
+    let last = (crate::dev::isp1040::tests::MEM - ENTRY_SIZE) as u64;
+    r.rings_at(4, 8, last, u64::from(RESP_AT), 0, 0);
+    let mut e = entry_command(ENTRY_CMD64, 0xd0a, 1, 0, 0x28);
+    e[1] = 2;
+    p16(&mut e, 18, 3);
+    r.mem.put(last as u32, &e);
+    r.rq_next.set(2);
+    r.wr(reg::REQUEST_QUEUE, 2);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 2);
+    r.assert_rejected(ENTRY_CMD64, 0xd0a, ENTRY_FLAG_DMA_ERROR);
+}
+
+impl Rig {
+    fn assert_event(&self, code: u16) {
+        assert_eq!(self.rd(reg::SEMAPHORE), SEM_LOCK);
+        assert_eq!(self.rd(reg::ISR) & ISR_RISC, ISR_RISC);
+        assert_eq!(self.rd(mb(0)), code);
+        for i in 1..4 {
+            assert_eq!(self.rd(mb(i)), 0);
+        }
+        self.ack();
+    }
+}
+
+/// Approximation: a refused request-ring read raises 0x8003 and a refused
+/// response write 0x8004, both through the semaphore path.
+#[test]
+fn ring_dma_errors() {
+    let r = Rig::bare();
+    r.start();
+    let beyond = 1u64 << 40;
+    r.rings_at(8, 8, beyond, u64::from(RESP_AT), 0, 0);
+    r.wr(reg::REQUEST_QUEUE, 1);
+    r.assert_event(event::REQUEST_DMA_ERROR);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 0);
+
+    r.rings_at(8, 8, u64::from(RQST_AT), beyond, 0, 0);
+    r.publish(&entry_command(ENTRY_CMD64, 0x8004, 1, 0, 0));
+    r.assert_event(event::RESPONSE_DMA_ERROR);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 0);
+}
+
+/// Approximation: a posted result stays readable while the host writes a
+/// command's mailboxes behind it. Linux writes all 24 mailboxes and rings
+/// without draining a result first; the IRIX 6.5.30 driver wrote only
+/// mailbox 0 over a posted event on the model. In both, mailboxes 0..3 read
+/// the event until its release, and the command then completes on what the
+/// host wrote. A model that lets the write through to the read side fails
+/// both halves.
+#[test]
+fn writes_behind_posted_result() {
+    let r = Rig::bare();
+    r.start();
+    r.rings_at(8, 8, 1 << 40, u64::from(RESP_AT), 0, 0);
+
+    // Linux's order: every mailbox, ascending, then the doorbell.
+    r.wr(reg::REQUEST_QUEUE, 1);
+    assert_eq!(r.rd(mb(0)), event::REQUEST_DMA_ERROR);
+    let mut input = [0u16; MAILBOX_COUNT];
+    input[0] = mbox::REGISTER_TEST;
+    for (i, v) in input.iter_mut().enumerate().skip(1) {
+        *v = 0x5a00 | i as u16;
+    }
+    r.mbox(&input);
+    for i in 0..4 {
+        assert_eq!(r.rd(mb(i)), if i == 0 { event::REQUEST_DMA_ERROR } else { 0 });
+    }
+    assert_eq!(r.rd(mb(8)), 0);
+    r.ack();
+    assert_eq!(r.rd(reg::SEMAPHORE), SEM_LOCK);
+    assert_eq!(r.rd(mb(0)), mbox::COMPLETE);
+    for i in 1..8 {
+        assert_eq!(r.rd(mb(i)), input[i]);
+    }
+    r.ack();
+
+    // IRIX's case: mailbox 0 alone, then the doorbell.
+    r.wr(reg::REQUEST_QUEUE, 2);
+    assert_eq!(r.rd(mb(0)), event::REQUEST_DMA_ERROR);
+    r.wr(mb(0), mbox::NOP);
+    assert_eq!(r.rd(mb(0)), event::REQUEST_DMA_ERROR);
+    r.wr(reg::HCCR, HCCR_SET_HOST);
+    assert_eq!(r.rd(mb(0)), event::REQUEST_DMA_ERROR);
+    r.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    assert_eq!(r.rd(mb(0)), event::REQUEST_DMA_ERROR);
+    r.wr(reg::SEMAPHORE, 0);
+    assert_eq!(r.rd(reg::SEMAPHORE), SEM_LOCK);
+    assert_eq!(r.rd(mb(0)), mbox::COMPLETE);
+    r.ack();
+
+    // With the lock free and nothing posted, a write reads back.
+    assert_eq!(r.rd(reg::SEMAPHORE), 0);
+    r.wr(mb(1), 0x1234);
+    assert_eq!(r.rd(mb(1)), 0x1234);
+}
+
+/// Approximation: events are never dropped, and a refused request read adds
+/// no event while an identical one still waits to be posted: that one already
+/// reports it. One 0x8003 can wait behind a posted one.
+#[test]
+fn request_dma_error_waits() {
+    let r = Rig::bare();
+    r.start();
+    r.rings_at(8, 8, 1 << 40, u64::from(RESP_AT), 0, 0);
+
+    // Posted, then one waiting, then retries that add nothing.
+    for n in 1..=4 {
+        r.wr(reg::REQUEST_QUEUE, n);
+    }
+    r.assert_event(event::REQUEST_DMA_ERROR);
+    r.assert_event(event::REQUEST_DMA_ERROR);
+    assert_eq!(r.rd(reg::SEMAPHORE), 0);
+    assert_eq!(r.rd(reg::ISR), 0);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 0);
+
+    // Released, the next producer write reports the ring again.
+    r.wr(reg::REQUEST_QUEUE, 5);
+    r.assert_event(event::REQUEST_DMA_ERROR);
+}
+
+/// With bus mastering off, nothing that needs DMA moves, and it says so.
+#[test]
+fn bus_master_disabled() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+    r.isp.state().config().write(1, 0x3);
+
+    assert_eq!(r.call_ack(mbox::NOP, 0, 0, 0), mbox::COMPLETE);
+    assert_eq!(r.load_ram(mbox::LOAD_RAM, 0x2000, 0x6000, 4, 0), mbox::HOST_INTERFACE_ERROR);
+    r.ack();
+    r.wr(reg::REQUEST_QUEUE, 1);
+    r.assert_event(event::REQUEST_DMA_ERROR);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 0);
+}
+
+/// Three commands through, so both request pointers read 3.
+fn three_commands(r: &Rig) {
+    r.start();
+    r.rings(8, 8);
+    r.tur(1);
+    r.tur(2);
+    r.tur(3);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 3);
+}
+
+/// Approximation: Linux writes all 24 mailboxes on every command, mailbox 4
+/// included; inside the command window that is an input, so the ring stays
+/// put and nothing is resubmitted.
+#[test]
+fn window_linux_order() {
+    let r = Rig::bare();
+    three_commands(&r);
+    let mut input = [0u16; MAILBOX_COUNT];
+    assert_eq!(r.mbox(&input), mbox::COMPLETE);
+    r.ack();
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 3);
+
+    r.tur(4);
+
+    input[4] = 0x1234;
+    input[5] = 0x5678;
+    assert_eq!(r.mbox(&input), mbox::COMPLETE);
+    r.ack();
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 4);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 4);
+    assert_eq!(r.response(4)[0], 0);
+}
+
+/// Approximation: OpenBSD's INIT_FIRMWARE writes m4 = m5 = 0 as inputs, with
+/// the queues already live; the command resets the rings and a new entry is
+/// taken once.
+#[test]
+fn window_openbsd_init() {
+    let r = Rig::bare();
+    three_commands(&r);
+    let icb = u64::from(ICB_AT);
+    for (i, v) in [(0, mbox::INIT_FIRMWARE), (2, (icb >> 16) as u16), (3, icb as u16), (4, 0), (5, 0), (6, 0), (7, 0)] {
+        r.wr(mb(i), v);
+    }
+    r.wr(reg::HCCR, HCCR_SET_HOST);
+    assert_eq!(r.rd(mb(0)), mbox::COMPLETE);
+    r.ack();
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 0);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 0);
+
+    r.rq_next.set(0);
+    r.rs_next.set(0);
+    r.mem.put(RESP_AT, &[0u8; ENTRY_SIZE]);
+    r.publish(&entry_command(ENTRY_CMD64, 0x38, 1, 0, 0));
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 1);
+    assert_eq!(g32(&r.response(0), 4), 0x38);
+}
+
+/// OpenBSD's soft-reset sequence writes all four pointers as 0 after the
+/// release; with no queue they are mailbox storage.
+#[test]
+fn window_openbsd_reset() {
+    let r = Rig::bare();
+    three_commands(&r);
+    r.soft_reset();
+    r.wr(reg::HCCR, HCCR_RESET);
+    r.wr(reg::SEMAPHORE, 0);
+    r.wr(reg::HCCR, HCCR_PARITY4);
+    r.wr(reg::HCCR, HCCR_RELEASE);
+    for off in [reg::REQUEST_QUEUE, reg::REQUEST_QUEUE, reg::RESPONSE_QUEUE, reg::RESPONSE_QUEUE] {
+        r.wr(off, 0);
+    }
+    assert_eq!(r.rd(reg::ISR), 0);
+
+    r.start();
+    r.rings(8, 8);
+    r.tur(0x39);
+}
+
+/// Approximation, the window's limits: an open window turns a producer write
+/// into storage until the doorbell; a reset closes it too, and takes the
+/// queues and firmware with it.
+#[test]
+fn window_boundaries() {
+    let r = Rig::bare();
+    three_commands(&r);
+    r.put_request(3, &entry_command(ENTRY_CMD64, 4, 1, 0, 0));
+
+    // (a) Mailbox 0, no doorbell: the producer write publishes nothing.
+    r.wr(mb(0), mbox::NOP);
+    r.wr(reg::REQUEST_QUEUE, 4);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 3);
+
+    // (b) The doorbell closes the window; the same write now publishes.
+    r.wr(reg::HCCR, HCCR_SET_HOST);
+    assert_eq!(r.rd(mb(0)), mbox::COMPLETE);
+    r.ack();
+    r.wr(reg::REQUEST_QUEUE, 4);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 4);
+    r.consume(1);
+
+    // (c) A reset closes it as well, and empties the adapter.
+    r.wr(mb(0), mbox::NOP);
+    r.wr(reg::HCCR, HCCR_RESET);
+    r.wr(reg::HCCR, HCCR_RELEASE);
+    r.wr(reg::REQUEST_QUEUE, 4);
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 4);
+    assert_eq!(r.call_ack(mbox::INIT_FIRMWARE, 0, 0, 0), mbox::INVALID);
+
+    r.start();
+    r.rings(8, 8);
+    r.put_request(0, &entry_command(ENTRY_CMD64, 5, 1, 0, 0));
+    r.rq_next.set(1);
+    r.wr(reg::REQUEST_QUEUE, 1);
+    assert_eq!(g32(&r.response(0), 4), 5);
+}
+
+impl Rig {
+    /// Fills a two-slot response ring (one usable slot) and leaves one more
+    /// completion held behind it, latch clear.
+    fn fill_response_ring(&self) {
+        self.start();
+        self.rings(8, 2);
+        self.publish(&entry_command(ENTRY_CMD64, 0xa1, 1, 0, 0));
+        self.wr(reg::HCCR, HCCR_CLEAR_RISC);
+        self.publish(&entry_command(ENTRY_CMD64, 0xa2, 1, 0, 0));
+        assert_eq!(self.rd(reg::RESPONSE_QUEUE), 1);
+        assert_eq!(self.rd(reg::ISR), 0);
+        assert_eq!(self.response(1)[0], 0);
+    }
+}
+
+/// Approximation: a response-out write inside the window is an input and
+/// leaves the ring where it was; after the doorbell it moves it.
+#[test]
+fn window_response_out() {
+    let r = Rig::bare();
+    r.fill_response_ring();
+    r.wr(mb(0), mbox::NOP);
+    r.wr(reg::RESPONSE_QUEUE, 1);
+    r.wr(reg::HCCR, HCCR_SET_HOST);
+    assert_eq!(r.rd(mb(0)), mbox::COMPLETE);
+    r.ack();
+    assert_eq!(r.response(1)[0], 0);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 1);
+
+    r.wr(reg::RESPONSE_QUEUE, 1);
+    assert_eq!(g32(&r.response(1), 4), 0xa2);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 0);
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+}
+
+/// Approximation: nothing is written while the latch is set. A response-out
+/// write alone posts nothing; the clear does, and a batch of held completions
+/// posts in order under one latch.
+#[test]
+fn posting_waits_for_latch() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+
+    r.publish(&entry_command(ENTRY_CMD64, 0xb1, 1, 0, 0));
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+    r.publish(&entry_command(ENTRY_CMD64, 0xb2, 1, 0, 0));
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 1);
+    assert_eq!(r.response(1)[0], 0);
+
+    r.wr(reg::RESPONSE_QUEUE, 1);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 1);
+    assert_eq!(r.response(1)[0], 0);
+
+    r.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 2);
+    assert_eq!(g32(&r.response(1), 4), 0xb2);
+
+    // Three more held behind the standing latch post as one batch.
+    for i in 0..3 {
+        r.publish(&entry_command(ENTRY_CMD64, 0xc0 + i, 1, 0, 0));
+    }
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 2);
+    r.wr(reg::RESPONSE_QUEUE, 2);
+    r.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 5);
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+    for i in 0..3 {
+        assert_eq!(g32(&r.response(2 + i), 4), 0xc0 + u32::from(i));
+    }
+}
+
+/// Approximation: nothing is written while a mailbox result holds the
+/// semaphore; a queued mailbox result posts first and alone; and nothing
+/// posts while the RISC is paused.
+#[test]
+fn posting_waits_for_semaphore() {
+    let r = Rig::bare();
+    r.start();
+    r.rings(8, 8);
+
+    // A result holds the semaphore; its latch is cleared, the lock kept.
+    r.call(mbox::NOP, 0, 0, 0);
+    r.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    r.publish(&entry_command(ENTRY_CMD64, 0xd1, 1, 0, 0));
+    assert_eq!(r.response(0)[0], 0);
+    assert_eq!(r.rd(reg::ISR), 0);
+    r.wr(reg::SEMAPHORE, 0);
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 1);
+    assert_eq!(g32(&r.response(0), 4), 0xd1);
+
+    // With the latch still set: a mailbox result and a completion queue.
+    r.call(mbox::NOP, 0, 0, 0);
+    assert_eq!(r.rd(reg::SEMAPHORE), 0);
+    r.publish(&entry_command(ENTRY_CMD64, 0xd2, 1, 0, 0));
+    r.consume(1);
+    // The mailbox result went first, alone.
+    assert_eq!(r.rd(reg::SEMAPHORE), SEM_LOCK);
+    assert_eq!(r.rd(mb(0)), mbox::COMPLETE);
+    assert_eq!(r.response(1)[0], 0);
+    r.ack();
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 2);
+    assert_eq!(g32(&r.response(1), 4), 0xd2);
+
+    // Held by the latch, then paused: the clear posts nothing.
+    r.publish(&entry_command(ENTRY_CMD64, 0xd3, 1, 0, 0));
+    r.wr(reg::HCCR, HCCR_PAUSE);
+    r.consume(1);
+    assert_eq!(r.rd(reg::ISR), 0);
+    assert_eq!(r.response(2)[0], 0);
+    r.wr(reg::HCCR, HCCR_RELEASE);
+    assert_eq!(r.rd(reg::ISR), ISR_RISC);
+    assert_eq!(g32(&r.response(2), 4), 0xd3);
+}
+
+/// Approximation, not a hardware fact: OpenBSD can land a pointer write
+/// between a command's mailbox 0 write and its doorbell. The model takes it
+/// as mailbox storage. A producer write is lost until the next one.
+#[test]
+fn window_openbsd_interleave() {
+    let r = Rig::bare();
+    three_commands(&r);
+    r.put_request(3, &entry_command(ENTRY_CMD64, 0x47a, 1, 0, 0));
+    r.put_request(4, &entry_command(ENTRY_CMD64, 0x47b, 1, 0, 0));
+
+    r.wr(mb(0), mbox::NOP);
+    r.wr(reg::REQUEST_QUEUE, 4);
+    r.wr(reg::HCCR, HCCR_SET_HOST);
+    assert_eq!(r.rd(mb(0)), mbox::COMPLETE);
+    r.ack();
+    assert_eq!(r.rd(reg::REQUEST_QUEUE), 3, "the pointer write took nothing");
+    r.wr(reg::REQUEST_QUEUE, 5);
+    r.consume(3);
+    assert_eq!(r.rd(reg::RESPONSE_QUEUE), 5);
+    assert_eq!((g32(&r.response(3), 4), g32(&r.response(4), 4)), (0x47a, 0x47b), "each taken once");
+}
+
+/// A response-out write is lost, and the held completion stays held. The
+/// repeat without the mailbox 0 write shows the difference.
+#[test]
+fn window_openbsd_interleave_response() {
+    let r = Rig::bare();
+    r.fill_response_ring();
+    r.wr(mb(0), mbox::NOP);
+    r.wr(reg::RESPONSE_QUEUE, 1);
+    r.wr(reg::HCCR, HCCR_SET_HOST);
+    r.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    r.wr(reg::SEMAPHORE, 0);
+    assert_eq!(r.response(1)[0], 0);
+
+    // The same, without the mailbox 0 write.
+    r.wr(reg::RESPONSE_QUEUE, 1);
+    r.wr(reg::HCCR, HCCR_SET_HOST);
+    r.wr(reg::HCCR, HCCR_CLEAR_RISC);
+    r.wr(reg::SEMAPHORE, 0);
+    assert_eq!(g32(&r.response(1), 4), 0xa2);
 }
 
 mod nvram_tests;

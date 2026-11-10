@@ -4,10 +4,7 @@
 //! mailboxes and two rings of 64-byte entries in host memory. As with the
 //! SCSI parts ([`crate::dev::isp1040`]), the firmware a driver downloads is
 //! retained, so a checksum can be verified and read back, and never run: the
-//! mailbox commands the firmware would provide are done here. This part is
-//! the host interface: registers, mailboxes and the ROM, RAM and firmware
-//! commands up to the control block that places the rings. Nothing walks the
-//! rings yet.
+//! mailbox commands and rings the firmware would provide are done here.
 //!
 //! No chip programming manual for the part was found. Every register,
 //! mailbox and ring fact comes from the public Linux, OpenBSD and NetBSD
@@ -19,6 +16,9 @@
 //!   writes dropped). A real bus would signal an error for the byte
 //!   access; `PciFunction::bar_read` and `bar_write` have no error path to
 //!   signal it with. Whether the chip takes either is unknown.
+//! * Commands run one at a time, in ring order, on the adapter's own
+//!   thread. No loop is behind the adapter yet, so every command completes
+//!   "port unavailable" with no SCSI status.
 //! * Every reset state, the command window that tells a ring pointer write
 //!   from a mailbox input, the posting rules and the per-command error
 //!   codes are model choices the drivers leave open.
@@ -32,8 +32,8 @@ use std::time::Duration;
 
 use parking_lot::MutexGuard;
 
-use crate::dev::isp1040::{self, HOST_CMD_SHIFT, MAX_REQUESTS, PCI_VENDOR_QLOGIC, RAM_WORDS, RISC_FLAG_HOST_INT, RISC_FLAG_PAUSED, RISC_FLAG_RESET, SEMAPHORE_LOCK, SIG1, SIG2, SIG3};
-use crate::dev::qlogic_ring::{self, IrqLevel, Notes, RingCtl, RingState, RingThread};
+use crate::dev::isp1040::{self, ENTRY_SIZE, HOST_CMD_SHIFT, MAX_REQUESTS, PCI_VENDOR_QLOGIC, RAM_WORDS, RISC_FLAG_HOST_INT, RISC_FLAG_PAUSED, RISC_FLAG_RESET, SEMAPHORE_LOCK, SIG1, SIG2, SIG3, ENTRY_TYPE_MARKER, ENTRY_TYPE_STATUS};
+use crate::dev::qlogic_ring::{self, IrqLevel, Notes, RingCtl, RingState, RingThread, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG64_SIZE};
 use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState, PCI_INTA};
 use crate::scsi::{ScsiBus, ScsiIdentities, CDROM_IDENTITY, DISK_IDENTITY};
 
@@ -195,6 +195,52 @@ pub mod event {
     pub const PORT_DB_GLOBAL: u16 = 0xffff;
 }
 
+const ENTRY_TYPE_CONTINUATION: u8 = 0x02;
+const ENTRY_TYPE_CONTINUATION_A64: u8 = 0x0a;
+const ENTRY_TYPE_COMMAND: u8 = 0x11;
+const ENTRY_TYPE_COMMAND_LIST: u8 = 0x15;
+const ENTRY_TYPE_COMMAND_A64: u8 = 0x19;
+
+/// Entry status flags a response entry can carry.
+const ENTRY_FLAG_BAD_TYPE: u8 = 0x04;
+const ENTRY_FLAG_BAD_PARAM: u8 = 0x08;
+const ENTRY_FLAG_BAD_COUNT: u8 = 0x10;
+const ENTRY_FLAG_BAD_ORDER: u8 = 0x20;
+const ENTRY_FLAG_DMA_ERROR: u8 = 0x40;
+
+const ENTRY_OFF_TYPE: usize = 0;
+const ENTRY_OFF_COUNT: usize = 1;
+const ENTRY_OFF_STATUS: usize = 3;
+
+const CMD_OFF_HANDLE: usize = 4;
+/// High byte of the field at 8.
+const CMD_OFF_TARGET: usize = 9;
+const CMD_OFF_LUN: usize = 10;
+const CMD_OFF_CONTROL: usize = 12;
+const CMD_OFF_SEGCOUNT: usize = 18;
+const CMD_OFF_CDB: usize = 20;
+const CMD_CDB_LEN: usize = 16;
+const CMD_OFF_BYTECOUNT: usize = 36;
+const CMD_OFF_SEGS: usize = 40;
+const CMD_OFF_LIST_TYPE: usize = 40;
+const CMD_OFF_LIST_ADDR: usize = 46;
+
+const CMD_SEGS32: usize = 3;
+const CMD_SEGS64: usize = 2;
+
+const STATUS_OFF_HANDLE: usize = 4;
+const STATUS_OFF_SCSI_STATUS: usize = 8;
+const STATUS_OFF_COMPLETION: usize = 10;
+const STATUS_OFF_SENSE_LEN: usize = 18;
+const STATUS_OFF_RESIDUAL: usize = 20;
+const STATUS_OFF_SENSE: usize = 32;
+const STATUS_SENSE_MAX: usize = 32;
+const STATUS_OFF_SIGNATURE: usize = 60;
+/// What Linux writes over the last word of each response it has read.
+const RESPONSE_PROCESSED: u32 = 0xdead_dead;
+
+const COMPLETION_PORT_UNAVAILABLE: u16 = 0x0028;
+
 /// A model constant, deliberately not any vendor firmware release.
 const FW_VERSION: [u16; 3] = [1, 0, 0];
 /// Expanded LUN only: no fabric, no 2K logins.
@@ -215,6 +261,13 @@ const ICB_OFF_RESP_LEN: usize = 38;
 const ICB_OFF_RQST_BASE: usize = 40;
 const ICB_OFF_RESP_BASE: usize = 48;
 const ICB_OPT_FAST_POST: u16 = 0x0008;
+/// Events waiting for the host to release the result before them. No result
+/// is ever dropped, so the queue is sized for every event that can wait: the
+/// host interface raises two kinds itself, each queued at most once (see
+/// [`State::raise_event`]), and the loop queues at most one bring-up's three.
+/// That is five; the queue keeps a power of two.
+const EVENTS_MAX: usize = 8;
+
 fn le16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
 }
@@ -297,18 +350,62 @@ pub struct State {
     /// before it. It goes ahead of every queued event.
     completion_held: bool,
     completion: Mailboxes,
+    events: VecDeque<Mailboxes>,
+    /// Response entries waiting for the host to clear the latch, release the
+    /// semaphore or make ring room. Every request entry produces at most
+    /// one, and consumption stops once the announced command budget is
+    /// held, so the queue never needs more.
+    held: VecDeque<[u8; ENTRY_SIZE]>,
     /// What Get Firmware State reports.
     loop_state: u16,
-    ctl: RingCtl,
+    /// A request-ring read was refused: the entry stays unconsumed until the
+    /// next producer write.
+    rqst_blocked: bool,
+    ctl: Ctl,
+}
+
+/// What the register side and the ring thread tell each other: the shared
+/// plumbing ([`RingCtl`], reached through `Deref`) and the one thing the ring walk here adds.
+#[derive(Default)]
+struct Ctl {
+    ring: RingCtl,
+    /// A thread is writing response entries with the state unlocked.
+    posting: bool,
+}
+
+impl std::ops::Deref for Ctl {
+    type Target = RingCtl;
+    fn deref(&self) -> &RingCtl {
+        &self.ring
+    }
+}
+
+impl std::ops::DerefMut for Ctl {
+    fn deref_mut(&mut self) -> &mut RingCtl {
+        &mut self.ring
+    }
 }
 
 impl RingState for State {
     fn ring_ctl(&self) -> &RingCtl {
-        &self.ctl
+        &self.ctl.ring
     }
     fn ring_ctl_mut(&mut self) -> &mut RingCtl {
-        &mut self.ctl
+        &mut self.ctl.ring
     }
+}
+
+/// One SCSI command as the host interface hands it to the Fibre Channel
+/// service.
+#[derive(Clone, Debug, Default)]
+struct Command {
+    handle: u32,
+    loop_id: u8,
+    lun: u16,
+    control: u16,
+    cdb: [u8; CMD_CDB_LEN],
+    byte_count: u32,
+    segs: Vec<(u64, u32)>,
 }
 
 impl State {
@@ -350,8 +447,11 @@ impl State {
             resp_out: 0,
             completion_held: false,
             completion: [0; MAILBOX_COUNT],
+            events: VecDeque::new(),
+            held: VecDeque::new(),
             loop_state: FW_STATE_CONFIG_WAIT,
-            ctl: RingCtl::default(),
+            rqst_blocked: false,
+            ctl: Ctl::default(),
         };
         st.power_on();
         st
@@ -419,6 +519,8 @@ impl State {
 
     fn drop_queued(&mut self) {
         self.completion_held = false;
+        self.events.clear();
+        self.held.clear();
     }
 
     fn clear_queues(&mut self) {
@@ -431,7 +533,55 @@ impl State {
         self.rqst_out = 0;
         self.resp_in = 0;
         self.resp_out = 0;
+        self.rqst_blocked = false;
         self.icb = [0; ICB_SIZE];
+    }
+
+    fn resp_space(&self) -> usize {
+        let used = (usize::from(self.resp_in) + usize::from(self.resp_len) - usize::from(self.resp_out)) % usize::from(self.resp_len);
+        // One slot stays empty so that in == out always means empty.
+        usize::from(self.resp_len) - 1 - used
+    }
+
+    /// A status entry for the host. Every one of its 64 bytes is written,
+    /// because Linux finds new entries by a signature it writes over the
+    /// last four bytes of each one it has processed.
+    fn complete(&mut self, handle: u32, scsi_status: u16, completion: u16, residual: u32, sense: &[u8]) {
+        let mut entry = [0u8; ENTRY_SIZE];
+        let mut sense_len = sense.len().min(STATUS_SENSE_MAX);
+        entry[STATUS_OFF_SENSE..STATUS_OFF_SENSE + sense_len].copy_from_slice(&sense[..sense_len]);
+        // Linux would take an entry ending in its own processed mark for one
+        // it had already read, and never see it. Sense that ends that way
+        // loses its last word instead.
+        if u32::from_le_bytes(entry[STATUS_OFF_SIGNATURE..STATUS_OFF_SIGNATURE + 4].try_into().unwrap()) == RESPONSE_PROCESSED {
+            sense_len = STATUS_OFF_SIGNATURE - STATUS_OFF_SENSE;
+            entry[STATUS_OFF_SIGNATURE..STATUS_OFF_SIGNATURE + 4].fill(0);
+        }
+        entry[ENTRY_OFF_TYPE] = ENTRY_TYPE_STATUS;
+        entry[ENTRY_OFF_COUNT] = 1;
+        entry[STATUS_OFF_HANDLE..][..4].copy_from_slice(&handle.to_le_bytes());
+        entry[STATUS_OFF_SCSI_STATUS..][..2].copy_from_slice(&scsi_status.to_le_bytes());
+        entry[STATUS_OFF_COMPLETION..][..2].copy_from_slice(&completion.to_le_bytes());
+        entry[STATUS_OFF_SENSE_LEN..][..2].copy_from_slice(&(sense_len as u16).to_le_bytes());
+        entry[STATUS_OFF_RESIDUAL..][..4].copy_from_slice(&residual.to_le_bytes());
+        self.held.push_back(entry);
+    }
+
+    /// A malformed request goes back as itself, its entry status flagged.
+    fn reject_entry(&mut self, req: &[u8; ENTRY_SIZE], flag: u8) {
+        let mut entry = *req;
+        entry[ENTRY_OFF_STATUS] = flag;
+        self.held.push_back(entry);
+    }
+
+    /// Whether response entries may be written now.
+    fn can_post_entries(&self) -> bool {
+        self.queues_init
+            && self.can_post()
+            && !self.completion_held
+            && self.events.is_empty()
+            && !self.held.is_empty()
+            && self.resp_space() > 0
     }
 
     /// The line follows the latch when both enables are set.
@@ -517,7 +667,29 @@ impl State {
 
     // ---- posting -----------------------------------------------------
 
-    /// A mailbox result writes the output bank, takes the
+    /// The payload of the events the host interface raises itself is zero.
+    /// Such an event that finds an identical one still queued adds nothing:
+    /// the queued one reports the same failure, and the host reads it once it
+    /// has released the result before. A guest that keeps retrying a refused
+    /// ring therefore cannot grow the queue.
+    fn raise_event(&mut self, code: u16) {
+        let mut mb = [0; MAILBOX_COUNT];
+        mb[0] = code;
+        if !self.events.contains(&mb) {
+            self.push_event(code, 0);
+        }
+    }
+
+    fn push_event(&mut self, code: u16, m1: u16) {
+        let mut mb = [0; MAILBOX_COUNT];
+        mb[0] = code;
+        mb[1] = m1;
+        // Bounded by its sources; see EVENTS_MAX.
+        debug_assert!(self.events.len() < EVENTS_MAX);
+        self.events.push_back(mb);
+    }
+
+    /// A mailbox result or event writes the output bank, takes the
     /// semaphore lock and sets the RISC interrupt latch.
     fn post_mailbox(&mut self, mb: &Mailboxes) {
         self.mbox_out = *mb;
@@ -525,7 +697,7 @@ impl State {
         self.risc_int = true;
     }
 
-    /// Whether the RISC may write a result now. Nothing
+    /// Whether the RISC may write a result or a response entry now. Nothing
     /// is written while the latch is set or the semaphore is held: Linux
     /// clears the latch after walking the ring, so an entry landing in
     /// between would lose its interrupt.
@@ -533,7 +705,7 @@ impl State {
         !(self.risc_reset || self.risc_paused || self.risc_int || self.semaphore & SEMAPHORE_LOCK != 0)
     }
 
-    /// Post a waiting mailbox result. True if one posted.
+    /// Post a waiting mailbox result, or event, alone. True if one posted.
     fn post_waiting_mailbox(&mut self) -> bool {
         if !self.can_post() {
             return false;
@@ -541,6 +713,10 @@ impl State {
         if self.completion_held {
             self.completion_held = false;
             let mb = self.completion;
+            self.post_mailbox(&mb);
+            return true;
+        }
+        if let Some(mb) = self.events.pop_front() {
             self.post_mailbox(&mb);
             return true;
         }
@@ -895,6 +1071,7 @@ impl Core {
         // ones, or still to come from commands in flight, would land in the
         // new ones under stale handles.
         st.ctl.gen += 1;
+        st.held.clear();
         st.icb = icb;
         st.queues_init = true;
         st.rqst_base = rqst_base;
@@ -905,6 +1082,7 @@ impl Core {
         st.rqst_out = 0;
         st.resp_in = 0;
         st.resp_out = 0;
+        st.rqst_blocked = false;
         mbox::COMPLETE
     }
 
@@ -1033,9 +1211,20 @@ impl Core {
         while self.pump(st) {}
     }
 
-    /// One post: a waiting mailbox result. True if one was made.
+    /// One post: a waiting mailbox result or event, alone, or a batch of
+    /// response entries. True if one was made.
     fn pump(&self, st: &mut MutexGuard<'_, State>) -> bool {
-        st.post_waiting_mailbox()
+        if st.post_waiting_mailbox() {
+            return true;
+        }
+        if st.can_post_entries() && !st.ctl.posting {
+            st.ctl.posting = true;
+            self.post_entries(st);
+            st.ctl.posting = false;
+            self.wake.notify_all();
+            return true;
+        }
+        false
     }
 
     // ---- the ring thread ---------------------------------------------
@@ -1076,7 +1265,8 @@ impl Core {
         }
     }
 
-    /// Post what is waiting until nothing more can go.
+    /// Post what is waiting and take the request ring's entries until
+    /// neither can go further.
     fn walk<'a>(&'a self, mut st: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
         loop {
             if st.ctl.shutdown || st.ctl.hold > 0 || st.ctl.paused {
@@ -1084,11 +1274,213 @@ impl Core {
                 st.ctl.work = true;
                 return st;
             }
-            if !self.pump(&mut st) {
+            if self.pump(&mut st) {
+                self.drive_irq(&mut st);
+                continue;
+            }
+            if !self.consume_one(&mut st) {
                 return st;
             }
             self.drive_irq(&mut st);
         }
+    }
+
+    /// Writes held response entries into the ring, as many as fit, then
+    /// advances response-in once and sets the latch once. A refused write
+    /// drops its entry and queues an event in its place.
+    fn post_entries(&self, st: &mut MutexGuard<'_, State>) {
+        let take = st.resp_space().min(st.held.len());
+        let gen = st.ctl.gen;
+        let batch: Vec<(u64, [u8; ENTRY_SIZE])> = st
+            .held
+            .iter()
+            .take(take)
+            .enumerate()
+            .map(|(i, entry)| {
+                let slot = (usize::from(st.resp_in) + i) % usize::from(st.resp_len);
+                (st.resp_base.wrapping_add(slot as u64 * ENTRY_SIZE as u64), *entry)
+            })
+            .collect();
+        // Whole 64 bytes: Linux finds new entries by their last word.
+        let (written, refused) = MutexGuard::unlocked(st, || {
+            let mut written = 0;
+            for (addr, entry) in &batch {
+                match self.fenced(gen, || self.dma_write(*addr, entry)) {
+                    Some(true) => written += 1,
+                    Some(false) => {
+                        self.note(format!("response entry write to {addr:#x} refused; entry dropped"));
+                        return (written, true);
+                    }
+                    None => return (written, false),
+                }
+            }
+            (written, false)
+        });
+        // A reset took the rings away while the entries were written.
+        if st.ctl.gen != gen {
+            return;
+        }
+        st.held.drain(..written + usize::from(refused));
+        if refused {
+            st.raise_event(event::RESPONSE_DMA_ERROR);
+        }
+        if written > 0 {
+            st.resp_in = ((usize::from(st.resp_in) + written) % usize::from(st.resp_len)) as u16;
+            st.risc_int = true;
+        }
+    }
+
+    /// The adapter consumes the request ring as fast as the host fills it, so
+    /// the ring is never seen full. It stops short only when the entry's
+    /// continuations are not all published yet, when a read is refused, or
+    /// when the announced command budget -- commands in flight plus
+    /// completions waiting to post -- is used up. True if it did anything
+    /// the walk should look at again.
+    fn consume_one(&self, st: &mut MutexGuard<'_, State>) -> bool {
+        if !st.queues_init || st.risc_reset || st.risc_paused || st.rqst_out == st.rqst_in || st.rqst_blocked {
+            return false;
+        }
+        if st.held.len() >= usize::from(MAX_REQUESTS) {
+            return false;
+        }
+        let gen = st.ctl.gen;
+        let len = usize::from(st.rqst_len);
+        let out = usize::from(st.rqst_out);
+        let avail = (usize::from(st.rqst_in) + len - out) % len;
+        let addr = st.rqst_base.wrapping_add(out as u64 * ENTRY_SIZE as u64);
+        let mut req = [0u8; ENTRY_SIZE];
+        let read = MutexGuard::unlocked(st, || self.dma_read(addr, &mut req));
+        if st.ctl.gen != gen {
+            return true;
+        }
+        // Not consumed: the next producer write tries the entry again.
+        if !read {
+            self.note(format!("request entry read at {addr:#x} refused"));
+            st.rqst_blocked = true;
+            st.raise_event(event::REQUEST_DMA_ERROR);
+            return true;
+        }
+        let count = usize::from(req[ENTRY_OFF_COUNT]);
+        let mut consumed = 1;
+        match req[ENTRY_OFF_TYPE] {
+            ENTRY_TYPE_COMMAND | ENTRY_TYPE_COMMAND_A64 | ENTRY_TYPE_COMMAND_LIST => {
+                if count == 0 || count >= len {
+                    st.reject_entry(&req, ENTRY_FLAG_BAD_COUNT);
+                } else if count > avail {
+                    // The host has not published the whole command yet.
+                    return false;
+                } else {
+                    consumed = count;
+                    self.command_entry(st, &req, count);
+                }
+            }
+            // A marker resynchronises firmware state; nothing is posted.
+            ENTRY_TYPE_MARKER => {}
+            ENTRY_TYPE_CONTINUATION | ENTRY_TYPE_CONTINUATION_A64 => st.reject_entry(&req, ENTRY_FLAG_BAD_ORDER),
+            _ => st.reject_entry(&req, ENTRY_FLAG_BAD_TYPE),
+        }
+        // A reset inside the dispatch has taken the ring with it.
+        if st.ctl.gen != gen || !st.queues_init {
+            return true;
+        }
+        st.rqst_out = ((out + consumed) % len) as u16;
+        true
+    }
+
+    /// A command entry and the continuations its entry count claims. The
+    /// count, not each entry's type, says how many slots the command takes:
+    /// a 64-bit continuation has no handle, only segment data from byte 4.
+    fn command_entry(&self, st: &mut MutexGuard<'_, State>, req: &[u8; ENTRY_SIZE], count: usize) {
+        let kind = req[ENTRY_OFF_TYPE];
+        let a64 = kind != ENTRY_TYPE_COMMAND;
+        let segcount = usize::from(le16(req, CMD_OFF_SEGCOUNT));
+        let mut cmd = Command {
+            handle: u32::from_le_bytes(req[CMD_OFF_HANDLE..][..4].try_into().unwrap()),
+            loop_id: req[CMD_OFF_TARGET],
+            lun: le16(req, CMD_OFF_LUN),
+            control: le16(req, CMD_OFF_CONTROL),
+            byte_count: u32::from_le_bytes(req[CMD_OFF_BYTECOUNT..][..4].try_into().unwrap()),
+            ..Default::default()
+        };
+        cmd.cdb.copy_from_slice(&req[CMD_OFF_CDB..CMD_OFF_CDB + CMD_CDB_LEN]);
+        let gen = st.ctl.gen;
+
+        if kind == ENTRY_TYPE_COMMAND_LIST {
+            let list = le64(req, CMD_OFF_LIST_ADDR);
+            let list_type = le16(req, CMD_OFF_LIST_TYPE);
+            if list_type != 1 {
+                self.note(format!("segment list type {list_type}, read as type 1"));
+            }
+            if segcount != 0 {
+                let mut buf = vec![0u8; segcount * SEG64_SIZE];
+                let read = MutexGuard::unlocked(st, || self.dma_read(list, &mut buf));
+                if st.ctl.gen != gen {
+                    return;
+                }
+                if !read {
+                    st.reject_entry(req, ENTRY_FLAG_DMA_ERROR);
+                    return;
+                }
+                qlogic_ring::parse_segments(&mut cmd.segs, &buf, segcount, true);
+            }
+            self.submit(st, cmd);
+            return;
+        }
+
+        let (inline_segs, cont_segs, cont_off, cont_type) = if a64 {
+            (CMD_SEGS64, CONT_SEGS64, CONT_OFF_SEGS64, ENTRY_TYPE_CONTINUATION_A64)
+        } else {
+            (CMD_SEGS32, CONT_SEGS32, CONT_OFF_SEGS32, ENTRY_TYPE_CONTINUATION)
+        };
+        if segcount > inline_segs + (count - 1) * cont_segs {
+            st.reject_entry(req, ENTRY_FLAG_BAD_PARAM);
+            return;
+        }
+        qlogic_ring::parse_segments(&mut cmd.segs, &req[CMD_OFF_SEGS..], segcount.min(inline_segs), a64);
+        let len = usize::from(st.rqst_len);
+        for i in 1..count {
+            if cmd.segs.len() >= segcount {
+                break;
+            }
+            let index = (usize::from(st.rqst_out) + i) % len;
+            let addr = st.rqst_base.wrapping_add(index as u64 * ENTRY_SIZE as u64);
+            let mut cont = [0u8; ENTRY_SIZE];
+            let read = MutexGuard::unlocked(st, || self.dma_read(addr, &mut cont));
+            if st.ctl.gen != gen {
+                return;
+            }
+            if !read {
+                st.reject_entry(req, ENTRY_FLAG_DMA_ERROR);
+                return;
+            }
+            if cont[ENTRY_OFF_TYPE] != cont_type {
+                st.reject_entry(req, ENTRY_FLAG_BAD_ORDER);
+                return;
+            }
+            let want = (segcount - cmd.segs.len()).min(cont_segs);
+            qlogic_ring::parse_segments(&mut cmd.segs, &cont[cont_off..], want, a64);
+        }
+        self.submit(st, cmd);
+    }
+
+    // ---- commands ------------------------------------------------------
+
+    /// A command from the host interface. No loop is behind the adapter yet,
+    /// so every command completes "port unavailable" with no SCSI status, as a
+    /// disconnected adapter's do.
+    fn submit(&self, st: &mut MutexGuard<'_, State>, cmd: Command) {
+        crate::dlog!(
+            crate::devlog::LogModule::Scsi,
+            "isp2200: command {:#x} to loop ID {} LUN {} (cdb {:02x?}, control {:#06x}, {} bytes in {} segments) has no loop",
+            cmd.handle,
+            cmd.loop_id,
+            cmd.lun,
+            &cmd.cdb[..],
+            cmd.control,
+            cmd.byte_count,
+            cmd.segs.len()
+        );
+        st.complete(cmd.handle, 0, COMPLETION_PORT_UNAVAILABLE, 0, &[]);
     }
 
     // ---- registers ---------------------------------------------------
@@ -1164,6 +1556,7 @@ impl Core {
                 return;
             }
             st.rqst_in = val;
+            st.rqst_blocked = false;
             self.kick(st);
             return;
         }
