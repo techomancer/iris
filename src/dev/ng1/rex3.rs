@@ -1714,13 +1714,59 @@ impl Rex3 {
     #[cfg(feature = "rex-gpu")]
     fn flush_gpu_replay(&self, reason: FlushReason) {
         let mut slot = self.gpu_replay.lock();
-        let Some(gpu) = slot.as_mut() else {
-            return;
-        };
+        if let Some(gpu) = slot.as_mut() {
+            self.flush_gpu_replay_locked(gpu, reason);
+        }
+    }
+
+    /// Bring the CPU plane up to date with every accepted GPU draw. Returns
+    /// false if the GPU failed; the CPU plane is then recovered from the
+    /// journal and the engine stays disabled.
+    #[cfg(feature = "rex-gpu")]
+    fn flush_gpu_replay_locked(
+        &self,
+        gpu: &mut crate::dev::ng1::rex3_gpu::Rex3Gpu,
+        reason: FlushReason,
+    ) -> bool {
+        if gpu.is_disabled() {
+            return false;
+        }
         let rgb = unsafe { &mut *self.fb_rgb.get() };
         match gpu.flush(rgb, reason) {
-            Ok(damage) => self.fb_damage.publish(&damage),
-            Err(error) => log::error!("REX3 GPU replay flush failed: {error}"),
+            Ok(damage) => {
+                self.fb_damage.publish(&damage);
+                true
+            }
+            Err(error) => {
+                self.recover_gpu_replay(gpu, error);
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    fn recover_gpu_replay(&self, gpu: &mut crate::dev::ng1::rex3_gpu::Rex3Gpu, error: String) {
+        log::error!("REX3 GPU failed; continuing on the CPU renderer: {error}");
+        eprintln!("REX3: live GPU renderer failed; continuing on the CPU: {error}");
+        let rgb = unsafe { &mut *self.fb_rgb.get() };
+        let damage = gpu.recover(rgb, error);
+        self.fb_damage.publish(&damage);
+    }
+
+    /// Run `write` on the CPU RGB plane outside the draw path. Outstanding
+    /// GPU work is synchronized first, and the next GPU draw re-uploads the
+    /// plane, so neither copy can overwrite the other.
+    fn with_cpu_rgb_write(&self, write: impl FnOnce(&mut [u32])) {
+        #[cfg(feature = "rex-gpu")]
+        let mut slot = self.gpu_replay.lock();
+        #[cfg(feature = "rex-gpu")]
+        if let Some(gpu) = slot.as_mut() {
+            self.flush_gpu_replay_locked(gpu, FlushReason::Explicit);
+        }
+        write(unsafe { &mut *self.fb_rgb.get() });
+        #[cfg(feature = "rex-gpu")]
+        if let Some(gpu) = slot.as_mut() {
+            gpu.cpu_framebuffer_changed();
         }
     }
 
@@ -1730,6 +1776,9 @@ impl Rex3 {
         let Some(gpu) = slot.as_mut() else {
             return false;
         };
+        if gpu.is_disabled() {
+            return false;
+        }
         loop {
             let result = {
                 let rgb = unsafe { &*self.fb_rgb.get() };
@@ -1738,29 +1787,24 @@ impl Rex3 {
             match result {
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Enqueued) => return true,
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::FlushRequired) => {
-                    if let Err(error) = gpu.submit(FlushReason::BatchFull) {
-                        log::error!("REX3 GPU could not submit a full batch: {error}");
+                    if gpu.checkpoint_required() {
+                        if !self.flush_gpu_replay_locked(gpu, FlushReason::Explicit) {
+                            return false;
+                        }
+                    } else if let Err(error) = gpu.submit(FlushReason::BatchFull) {
+                        self.recover_gpu_replay(gpu, error);
                         return false;
                     }
                 }
                 Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Unsupported(reason)) => {
                     gpu.note_fallback(reason);
-                    let rgb = unsafe { &mut *self.fb_rgb.get() };
-                    match gpu.flush(rgb, FlushReason::CpuFallback) {
-                        Ok(damage) => {
-                            self.fb_damage.publish(&damage);
-                            gpu.cpu_framebuffer_changed();
-                        }
-                        Err(error) => {
-                            log::error!(
-                                "REX3 GPU could not synchronize before CPU fallback: {error}"
-                            );
-                        }
+                    if self.flush_gpu_replay_locked(gpu, FlushReason::CpuFallback) {
+                        gpu.cpu_framebuffer_changed();
                     }
                     return false;
                 }
                 Err(error) => {
-                    log::error!("REX3 GPU replay draw failed: {error}");
+                    self.recover_gpu_replay(gpu, error);
                     return false;
                 }
             }
@@ -1847,13 +1891,12 @@ impl Rex3 {
             const FILL: u32 = 0x0060_0000; // dark blue, Newport BGR (B<<16|G<<8|R)
             let w = w as usize;
             let h = h as usize;
-            unsafe {
-                let fb = &mut *self.fb_rgb.get();
+            self.with_cpu_rgb_write(|fb| {
                 for y in 0..h.min(1024) {
                     let row = y * 2048;
                     fb[row..row + w.min(2048)].fill(FILL);
                 }
-            }
+            });
             if let Some(rect) = DamageRect::clipped(0, 0, w as i64, h as i64) {
                 self.mark_framebuffer_rect(DamagePlane::Rgb, rect);
             }
@@ -2981,9 +3024,6 @@ impl Rex3 {
                 ctx.xend as f32 / 2048.0, ctx.yend as f32 / 2048.0);
         }
 
-        #[cfg(feature = "rex-dirty-upload")]
-        let damage = Self::go_damage(ctx);
-
         #[cfg(feature = "rex-gpu")]
         if self.try_gpu_replay_draw(ctx) {
             #[cfg(feature = "rexdiag")]
@@ -2991,6 +3031,11 @@ impl Rex3 {
                 .fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
             return;
         }
+
+        // After the GPU attempt: an accepted draw publishes its own damage at
+        // the checkpoint, and a refused one has not touched the context.
+        #[cfg(feature = "rex-dirty-upload")]
+        let damage = Self::go_damage(ctx);
 
         crate::pf_scope!(crate::perfetto::events::REX3_RASTER, opcode);
 
@@ -5306,10 +5351,8 @@ impl Resettable for Rex3 {
         self.config.status.store(0, Ordering::Relaxed);
         *self.dcb.lock() = Rex3DcbState::default();
         // Clear framebuffers
-        unsafe {
-            (*self.fb_rgb.get()).fill(0);
-            (*self.fb_aux.get()).fill(0);
-        }
+        self.with_cpu_rgb_write(|fb| fb.fill(0));
+        unsafe { (*self.fb_aux.get()).fill(0); }
         self.mark_framebuffer_full(DamagePlane::Rgb);
         self.mark_framebuffer_full(DamagePlane::Aux);
         // Reset Vc2, Xmap, Cmap

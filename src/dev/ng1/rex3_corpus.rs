@@ -21,6 +21,10 @@ const PROVENANCE: &str =
     "Independently authored register programs on zeroed power-on boards; no guest captures or pixels.";
 const CPU_FEATURES: &[&str] = &["gputrace", "rex-jit", "rexdiag"];
 const GPU_FEATURES: &[&str] = &["rex-gpu", "rexdiag"];
+#[cfg(feature = "rex-gpu")]
+const CORPUS_GPU_BATCH_DRAWS: usize = 1024;
+#[cfg(feature = "rex-gpu")]
+const CORPUS_GPU_JOURNAL_DRAWS: usize = 65536;
 
 const CM: u32 = 0xf << CLIPMODE_CIDMATCH_SHIFT;
 const CM_CLIPPED: u32 = CM | CLIPMODE_ENSMASK_SMASK0;
@@ -1059,7 +1063,9 @@ fn compare_fence_images(expected: &FenceImage, actual: &FenceImage) -> Result<()
 
 #[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
 fn verify_gpu_fence(
-    image: &FenceImage,
+    // Readback is damage-limited, so its size no longer equals the image's;
+    // the planes themselves are compared by compare_fence_images.
+    _image: &FenceImage,
     report: Option<&crate::dev::ng1::rex3_gpu::ReplayReport>,
 ) -> Result<(), String> {
     let report = report.ok_or("GPU report missing at display fence publication")?;
@@ -1072,7 +1078,8 @@ fn verify_gpu_fence(
         || report.pending_draws != 0
         || report.submissions != 2
         || report.fences != 1
-        || report.bytes_read_back != (image.rgb.len() * std::mem::size_of::<u32>()) as u64
+        || report.bytes_read_back == 0
+        || report.bytes_read_back > crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES
         || reasons.display_fence != 1
         || reasons.batch_full != 1
         || reasons.idle != 0
@@ -1282,9 +1289,17 @@ fn run_case(
                 "hardware GPU corpus validation unavailable: {diagnostics}"
             );
             assert_eq!(
-                diagnostics.max_batch_draws, 1024,
-                "GPU corpus requires the default 1,024-draw batch; unset REX3_GPU_BATCH_DRAWS"
+                diagnostics.max_batch_draws,
+                crate::dev::ng1::rex3_gpu::DEFAULT_MAX_BATCH_DRAWS,
+                "GPU corpus requires the default batch size; unset REX3_GPU_BATCH_DRAWS"
             );
+            // The committed batch_1025_fence recording was authored around a
+            // 1,024-draw boundary; pin it independently of the default.
+            rex.gpu_replay
+                .lock()
+                .as_mut()
+                .expect("GPU replay enabled")
+                .set_test_limits(CORPUS_GPU_BATCH_DRAWS, CORPUS_GPU_JOURNAL_DRAWS);
             eprintln!("{}: GPU {diagnostics}", def.name);
         }
     }

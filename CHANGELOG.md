@@ -13,6 +13,25 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Newport: experimental live rendering on the host GPU
+
+- A `rex-gpu` build renders Newport's flat fills on the host GPU when
+  `IRIS_REX3_GPU=auto|vulkan|metal|dx12` is set. It is experimental and off by
+  default; without the variable a `rex-gpu` build renders as before, and
+  default and release builds are unchanged. Everything outside the supported
+  subset (complete RGB blocks and spans with `SRC` logic, no blending,
+  shading, patterns or host pixels) still runs on the CPU, which is
+  synchronized first. On an RTX 5070 long spans run about 2.5x as fast as
+  on the CPU renderer, and 8-pixel draws about as fast.
+- Fills are binned on the CPU into 32 x 32 screen tiles and drawn by one
+  workgroup per tile, without GPU barriers; synchronization reads back only
+  the tiles that were drawn.
+- If the GPU fails, the draws it had not yet returned are replayed on the
+  CPU and rendering continues there for the rest of the run.
+- A strict synthetic REX3 replay corpus (`src/dev/ng1/testdata`) checks the
+  interpreter, the Cranelift JIT and the GPU engine against one another; Linux
+  CI runs its CPU half. See `TESTING.md`.
+
 ### jitv2: registers in loops stay in host registers
 
 - A compiled page with a loop keeps the registers its loops use most in host

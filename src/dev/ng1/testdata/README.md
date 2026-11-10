@@ -99,7 +99,8 @@ directory symlinks when the configured job runs.
 GPU validation is optional and explicitly ignored unless selected:
 `cargo test -p iris --lib --features rex-gpu,rex-jit,rexdiag
 rex3_corpus_gpu_ -- --ignored --nocapture --test-threads=1`. It requires an actual
-integrated/discrete adapter and the default 1,024-draw batch. It verifies
+integrated/discrete adapter and the default batch size; the test then pins the
+batch to the 1,024 draws these recordings were authored for. It verifies
 handled/fallback counts and reasons, interpreter fallback, state equivalence,
 and the batch-full and display-fence flushes. The batch case preserves pixel
 (6,5) from the first 1,024 draws while draw 1,025 overwrites (5,5); dropping

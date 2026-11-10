@@ -42,7 +42,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `wgpu` | Host-GPU rasterisation through wgpu compute: the common batch layer in `src/wgpu` and the boards' GPU raster units under `src/dev/<board>/wgpu` (VPro, IMPACT). Work in progress; see `clanker/plans/wgpu-raster.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
-| `rex-gpu` | Experimental Newport wgpu/WGSL engine for replay and explicit live experiments. The CPU renderer remains the default; this feature is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
+| `rex-gpu` | Experimental Newport wgpu/WGSL flat-fill engine for replay and, with `IRIS_REX3_GPU`, live rendering. The CPU renderer remains the default; this feature is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `dep:bytemuck`, `dep:pollster`, `dep:wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit`, `gr2-jit` |
@@ -843,29 +843,50 @@ monitor inspects and controls it.
 cargo run --release --features rex-jit
 ```
 
-### REX3 host-GPU prototype (`--features rex-gpu`)
+### REX3 live GPU renderer (experimental, `--features rex-gpu`)
 
-`rex-gpu` adds a headless wgpu/WGSL compute path for differential REX3
-recording replay and explicit live experiments. It is deliberately separate
-from `gpujit` and is not enabled by default or in release packaging. Compiling
-it also enables `gputrace`, which supplies the existing REX3 record/replay
-harness, and `rex-dirty-upload`, whose damage snapshots publish completed GPU
-batches to the existing presentation path.
+`rex-gpu` adds a wgpu/WGSL compute path for Newport flat fills, used for
+differential replay of REX3 recordings and, when `IRIS_REX3_GPU` is set, as an
+**experimental** live renderer. It is deliberately separate from `gpujit` and is
+not enabled by default or in release packaging; without `IRIS_REX3_GPU` a
+`rex-gpu` build renders exactly as before. Compiling it also enables
+`gputrace`, which supplies the REX3 record/replay harness, and
+`rex-dirty-upload`, whose damage snapshots publish completed GPU work to the
+existing presentation path.
 
-The initial GPU subset is intentionally narrow: complete `DRAW` blocks and
-spans with positive integer coordinates, 24-bit RGB planes, RGB color mode,
-`SRC` logic operation, disabled alpha compare, no screen masks, and no
-shading, blending, dithering, patterns, host pixels, fast clear, XY move,
-Y-flip, skip flags, continuation state, or length-32 mode. RGB write masks and
-screen-edge clipping are supported. Unsupported draws first synchronize
-pending GPU work, then use the existing CPU path.
+The GPU subset is intentionally narrow: complete `DRAW` blocks and spans with
+positive integer coordinates, 24-bit RGB planes, RGB color mode, `SRC` logic
+operation, disabled alpha compare, no screen masks, and no shading, blending,
+dithering, patterns, host pixels or batched host transfers, fast clear, XY
+move, Y-flip, skip flags, continuation state, or length-32 mode. Write masks
+(including the upper byte) and screen-edge clipping are supported. Unsupported
+draws first synchronize pending GPU work, then use the existing CPU path.
+
+The CPU bins each accepted fill into the 32 x 32 screen tiles it covers. The
+shader runs one workgroup per tile and applies that tile's fills in submission
+order, so draw order is kept without GPU barriers. The GPU copy of the RGB
+plane holds only the 1,344 x 1,024 screen, stored tile by tile (5.25 MiB).
 
 Supported fills share bounded command batches. Consecutive full batches remain
 GPU-resident; a CPU observation boundary, display fence, unsupported draw, or
-idle GFIFO synchronizes the full 8 MiB RGB plane back to the CPU. A CPU
-fallback invalidates the GPU copy so the next supported batch uploads the
-current CPU plane. Transfers, submissions, fences, handled draws, fallbacks,
-and fallback reasons are reported.
+idle GFIFO synchronizes the tiles drawn since the last synchronization back to
+the CPU. A CPU fallback, or any other CPU write to the plane (snapshot restore,
+reset, framebuffer load), invalidates the GPU copy so the next supported batch
+uploads the current CPU plane. Transfers, submissions, fences, handled draws,
+fallbacks, and fallback reasons are reported.
+
+Accepted draws are also kept in an ordered journal until the next
+synchronization, capped at 65,536 draws and 4,194,304 pixels; reaching a cap
+synchronizes first. If the GPU reports an error, loses its device, or a
+readback does not complete within 10 seconds, the journal is replayed onto the
+CPU plane, the GPU engine is disabled for the rest of the run, and rendering
+continues on the CPU. The failed device is deliberately leaked rather than
+destroyed, because destroying a lost device can block or abort inside wgpu.
+
+On an RTX 5070 under Vulkan, long spans (1,280 pixels) render at about 2.5x
+the CPU renderer's throughput through the full GFIFO; 8-pixel draws are about
+even (0.96x), because both renderers then spend most of their time on shared
+GFIFO handling.
 
 `REX3_GPU_TELEMETRY=1` adds host stage timings, parameter bytes, flush reasons,
 and a power-of-two batch-size histogram to the GPU report. Match and enqueue
@@ -912,8 +933,10 @@ hardware probe checks adapter selection, two ordered overlapping fills,
 architectural context progression, batching, and readback:
 
 `REX3_GPU_BATCH_DRAWS` changes the bounded batch size for experiments from its
-default of 1,024 draws; accepted values are 1 through 65,536. It does not
-enable the GPU engine by itself.
+default of 16,384 draws; accepted values are 1 through 65,536. A batch is also
+submitted early when its fills would cover more than 1,048,576 tiles in total,
+counting a tile once per fill that touches it. It does not enable the GPU
+engine by itself.
 
 ```sh
 REX3_GPU_BACKEND=vulkan cargo run --release --example rex3-gpu-probe --features rex-gpu

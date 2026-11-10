@@ -8901,8 +8901,8 @@ fn gpu_replay_batches_flat_rgb_fills_and_matches_the_cpu() {
         "both draws should share one GPU batch"
     );
     assert_eq!(report.fences, 1);
-    assert_eq!(report.bytes_uploaded, (2048 * 1024 * 4) as u64);
-    assert_eq!(report.bytes_read_back, (2048 * 1024 * 4) as u64);
+    assert_eq!(report.bytes_uploaded, crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES);
+    assert!((1..=crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES).contains(&report.bytes_read_back));
     assert_eq!(report.error, None);
     assert_gpu_timestamp_report(&report, 1);
 }
@@ -8962,8 +8962,8 @@ fn gpu_replay_synchronizes_before_cpu_fallback() {
     assert_eq!(report.fallback_reasons.get("draw mode 0"), Some(&1));
     assert_eq!(report.submissions, 2);
     assert_eq!(report.fences, 2);
-    assert_eq!(report.bytes_uploaded, (2 * 2048 * 1024 * 4) as u64);
-    assert_eq!(report.bytes_read_back, (2 * 2048 * 1024 * 4) as u64);
+    assert_eq!(report.bytes_uploaded, 2 * crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES);
+    assert!((1..=2 * crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES).contains(&report.bytes_read_back));
     assert_eq!(report.error, None);
     assert_gpu_timestamp_report(&report, 2);
 }
@@ -9286,7 +9286,7 @@ fn live_gate_sample(rex: &Rex3, len: i32, gpu: bool, seed: u64, frame: &[u32]) -
     if let Some(delta) = &sample.gpu_delta {
         assert_eq!(
             delta.bytes_uploaded,
-            (2048 * 1024 * 4) as u64,
+            crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES,
             "reseeded GPU framebuffer was not uploaded"
         );
     }
@@ -9646,7 +9646,7 @@ fn gpu_live_framebuffer_reseed_rejects_stale_output() {
             .unwrap();
         assert_eq!(delta.handled_draws, 1024);
         assert_eq!(delta.fallback_draws, 0);
-        assert_eq!(delta.bytes_uploaded, (2048 * 1024 * 4) as u64);
+        assert_eq!(delta.bytes_uploaded, crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES);
         assert_eq!(delta.error, None);
         assert!(
             live_gate_framebuffer_difference(unsafe { &*gpu.fb_rgb.get() }, expected).is_none()
