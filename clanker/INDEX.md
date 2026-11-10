@@ -325,6 +325,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [machine-profile-vs-guest-ip22.md](gui/machine-profile-vs-guest-ip22.md) | design | Machine profile vs guest "IP22" in Software Manager |
 | [windows-silent-exit-0xc000041d.md](gui/windows-silent-exit-0xc000041d.md) | rule | Windows: CLI vanishes with exit 0xC000041D and no message |
 | [winit-window-calls-must-be-on-event-thread.md](gui/winit-window-calls-must-be-on-event-thread.md) | rule | Window methods must only be called on the event-loop thread (Windows crash) |
+| [wgpu-raster-needs-egl-not-glx.md](gui/wgpu-raster-needs-egl-not-glx.md) | rule | `--raster wgpu` panics in `eglMakeCurrent` (BadAccess) unless the window's GL is EGL, not GLX |
 
 ## vnc/
 
