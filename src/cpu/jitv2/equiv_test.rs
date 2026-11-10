@@ -6458,6 +6458,16 @@ mod tests {
         assert_fpu_matches_interpreter(instr, [0u64; 32], [0u64; 32], true);
     }
 
+    /// CTC1 stores every bit it is given, so a guest that writes all ones
+    /// leaves FCSR bits 22:18 set. Those bits are reserved and read back as
+    /// zero (`MipsCore::read_fpu_control`).
+    #[test]
+    fn cfc1_fcsr_reads_reserved_bits_as_zero() {
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CFC1, 3, 31, 0, 0);
+        let jit = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], [0u64; 32], true, Some(0x007C_0000));
+        assert_eq!(jit.gpr[3], 0);
+    }
+
     #[test]
     fn ctc1_fexr_fenr_match_interpreter() {
         let mut gpr = [0u64; 32];

@@ -5399,7 +5399,11 @@ fn emit_cfc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
         }
         26 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fexr())),
         28 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fenr())),
-        31 => ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr())),
+        31 => {
+            // Bits 22:18 are reserved and read as zero, whatever CTC1 stored.
+            let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_fpu_fcsr()));
+            ctx.builder.ins().band_imm_s(fcsr, !0x007C_0000i64)
+        }
         _ => ctx.builder.ins().iconst(ir::types::I32, 0),
     };
     let sext = ctx.builder.ins().sextend(ir::types::I64, value);
