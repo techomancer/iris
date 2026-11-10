@@ -124,6 +124,10 @@ pub(super) struct Io {
     device_permission: AtomicU64,
     /// The large-window translation entries (0x160..0x190).
     itte: [AtomicU64; ITTES],
+    /// Scratch register 0 (0x150), which the IP35 PROM uses to publish each
+    /// interface's processors; an atomic so a board can read it without a
+    /// lock.
+    scratch0: AtomicU64,
     widgets: [OnceLock<Arc<dyn BusDevice>>; 16],
 }
 
@@ -136,6 +140,7 @@ impl Io {
             widget_permission: AtomicU64::new(0),
             device_permission: AtomicU64::new(0),
             itte: Default::default(),
+            scratch0: AtomicU64::new(0),
             widgets: Default::default(),
         };
         io.reset_permissions();
@@ -217,6 +222,7 @@ impl Io {
             reg::WIDGET_PERMISSION => Some(&self.widget_permission),
             reg::INBOUND_DEVICE_PERMISSION => Some(&self.device_permission),
             reg::ITTE_BASE..=reg::ITTE_LAST if a % 8 == 0 => Some(&self.itte[((a - reg::ITTE_BASE) / 8) as usize]),
+            reg::REGISTER_0150 => Some(&self.scratch0),
             _ => None,
         }
     }
@@ -423,6 +429,11 @@ impl Io {
             *r.words.entry(reg::XIO_STATUS).or_default() |= PEER;
         }
         self.reset_permissions();
+        self.scratch0.store(0, Relaxed);
+    }
+    /// Scratch register 0. One atomic load.
+    pub(super) fn scratch0(&self) -> u64 {
+        self.scratch0.load(Relaxed)
     }
 }
 

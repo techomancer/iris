@@ -185,11 +185,39 @@ pub(super) struct Lb {
     /// landed since the block's last reset ([`Scratch1Store::Joins`]).
     /// Written under the block's lock, read without it.
     joined: AtomicU64,
+    /// Scratch 3's bit 0, which the IP35 PROM takes as its hub lock through
+    /// the test-and-set twin at 0x8058: kept with the register under the
+    /// block's lock, read without it.
+    scratch3: AtomicU64,
+    /// Processors, by CPU number, that have stored to their own PI
+    /// real-time compare register since their presence join: the IP35
+    /// PROM's pair liveness post ([`Lb::note_rt_compare`]). Cleared with
+    /// the join mask.
+    posted: AtomicU64,
 }
 
 impl Lb {
     pub(super) fn new() -> Self {
-        Self { regs: Mutex::new(Regs::default()), joined: AtomicU64::new(0) }
+        Self { regs: Mutex::new(Regs::default()), joined: AtomicU64::new(0), scratch3: AtomicU64::new(0), posted: AtomicU64::new(0) }
+    }
+    /// Processor `cpu` stored to its own real-time compare register. The
+    /// first such store after its presence join is the PROM's liveness post
+    /// to its pair partner, whatever the value: the PROM's earlier stores
+    /// there are progress codes. A store before the join changes nothing.
+    pub(super) fn note_rt_compare(&self, cpu: usize) {
+        if let Some(bit) = cpu_bit(Some(cpu)).filter(|bit| self.joined.load(Ordering::Acquire) & bit != 0) {
+            self.posted.fetch_or(bit, Ordering::Release);
+        }
+    }
+    /// The processors, one bit per CPU number, that have posted since their
+    /// presence join. One atomic load.
+    pub(super) fn rt_posted(&self) -> u64 {
+        self.posted.load(Ordering::Acquire)
+    }
+    /// Whether scratch 3's bit 0, the PROM's hub lock, is clear. One atomic
+    /// load.
+    pub(super) fn hub_lock_free(&self) -> bool {
+        self.scratch3.load(Ordering::Acquire) & 1 == 0
     }
     /// Whether processor `cpu`'s presence join on scratch 1 has landed since
     /// the block's last reset. One atomic load.
@@ -228,6 +256,8 @@ impl Lb {
         let survivors = [r.scratch[1], r.scratch[2], r.words.get(&reg::ERROR_STATUS).copied().unwrap_or(0)];
         *r = Regs::default();
         self.joined.store(0, Ordering::Release);
+        self.posted.store(0, Ordering::Release);
+        self.scratch3.store(0, Ordering::Release);
         r.scratch[1] = survivors[0];
         r.scratch[2] = survivors[1];
         r.words.insert(reg::ERROR_STATUS, survivors[2]);
@@ -248,6 +278,7 @@ impl Lb {
                 let n = 3 + (a - reg::ATOMIC_READ0) as usize / 8;
                 let v = r.scratch[n];
                 r.scratch[n] = 1;
+                self.scratch3.store(r.scratch[3], Ordering::Release);
                 v
             }
             reg::VECTOR_STATUS_ALIAS => r.words.remove(&reg::VECTOR_STATUS).unwrap_or(0),
@@ -352,6 +383,7 @@ impl Lb {
                 }
             }
         }
+        self.scratch3.store(r.scratch[3], Ordering::Release);
         if levels.set(Levels::LB_ERROR, r.error_level()) { Effect::Reflect } else { Effect::None }
     }
 }

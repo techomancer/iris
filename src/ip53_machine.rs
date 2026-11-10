@@ -51,8 +51,10 @@
 //!   is inferred from them.
 //! - Every fitted processor runs from reset, each on its own thread, as in
 //!   QEMU's IP35 node; CPU enable is stored and starts or stops nothing. The
-//!   PROM's reset barrier is ordered by Bedrock's LB, an approximation with
-//!   no hardware counterpart.
+//!   PROM's reset barrier is ordered by Bedrock's LB; the first of a pair
+//!   to post its liveness is held until its partner posts, and a presence
+//!   publisher until the other interface publishes ([`PresenceHold`]):
+//!   approximations with no hardware counterpart.
 //! - The second PIC is a port of the IO9 PIC's PXBOW, beside the host's
 //!   and the IO9 PIC's links: the PROM and IRIX learn which widgets exist
 //!   only from widget 0's link status and auxiliary status, so one
@@ -104,6 +106,7 @@ use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
 use crate::ip35::{Ip35Bus, CPU_PHYS_MASK};
 use crate::ip35::node::{connect_cpus, Node, NodeConfig};
+use crate::ip35::presence::PresenceHold;
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};
@@ -530,6 +533,7 @@ impl TezroMachine {
                 c.share_jitv2(jit.clone(), world.clone());
             }
         }
+        board.presence.set_cpus(&cpus);
         connect_cpus("Tezro", &board.bedrock, &board.l1, &board.events, &cpus)?;
         board.bedrock.set_timer_manager(&timers);
         let rx = board.receiver.lock().take().expect("the board's events are taken once");
@@ -873,8 +877,9 @@ fn build_cpus(board: &Arc<TezroBoard>, timers: &Arc<TimerManager>, count_hz: u64
 }
 
 /// Processor `id` of `count`, of type `C`, with its timers; CPU 0 also
-/// runs the board's poll. A chip with a secondary cache of another size is
-/// another type, instantiated here.
+/// runs the board's poll, and on a board of several processors every one
+/// takes part in the PROM's holds at its batch boundary. A chip with a
+/// secondary cache of another size is another type, instantiated here.
 fn start_cpu<C>(board: &Arc<TezroBoard>, timers: &Arc<TimerManager>, count_hz: u64, id: u8, count: usize) -> Arc<dyn CpuDevice>
 where
     C: CacheCpuModel + From<Arc<dyn BusDevice>> + 'static,
@@ -888,10 +893,17 @@ where
     exec.core.count_write_samples = true;
     exec.core.cpu_id = id;
     exec.core.smp = count > 1;
-    if id == 0 {
-        let poll_board = board.clone();
-        exec.batch_hook = Some(Box::new(move |_| poll_board.poll()));
-    }
+    let poll_board = board.clone();
+    let cpu = usize::from(id);
+    exec.batch_hook = match (id, count > 1) {
+        (0, false) => Some(Box::new(move |_| poll_board.poll())),
+        (0, true) => Some(Box::new(move |_| {
+            poll_board.poll();
+            poll_board.presence.at_batch(cpu);
+        })),
+        (_, true) => Some(Box::new(move |_| poll_board.presence.at_batch(cpu))),
+        (_, false) => None,
+    };
     Arc::new(MipsCpu::new(*exec))
 }
 
@@ -960,6 +972,9 @@ pub(crate) struct TezroBoard {
     receiver: Mutex<Option<Receiver<MachineEvent>>>,
     /// The slots whose processors run: every fitted one.
     pub processors: Population,
+    /// The holds on the PROM's pair liveness check and presence publisher
+    /// across them.
+    pub presence: Arc<PresenceHold>,
     /// The PICs in QEMU's host order, which numbers their PI level sources:
     /// widget 11's first when the board has it, then the IO9's at widget 15.
     pub pics: Vec<Arc<Pic>>,
@@ -1055,6 +1070,7 @@ impl TezroBoard {
         let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
         bedrock.connect_widget(0, pxbow.widget_zero());
         bedrock.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
+        let presence = PresenceHold::new(running, clock.clone(), &bedrock);
         let heartbeat = Arc::new(AtomicU64::new(0));
         let fasttick = Arc::new(AtomicU64::new(0));
         let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
@@ -1106,6 +1122,7 @@ impl TezroBoard {
             events,
             receiver: Mutex::new(Some(receiver)),
             processors: running,
+            presence,
             pics,
             ioc4,
             scsi,
@@ -1134,6 +1151,7 @@ impl TezroBoard {
 
     /// Everything back to its power-on state.
     pub fn power_on(&self) {
+        self.presence.reset();
         self.bedrock.power_on();
         self.l1.power_on();
         self.flash.power_on();
