@@ -4,9 +4,14 @@ Status: implemented 2026-11-10 (candidate 3 below) and carried into the
 experimental live-renderer PR. On Vulkan the final tree passed both gates in
 three of three runs (raster ~2.5x, tiny ~0.96x); D3D12 passed raster and
 missed tiny at 0.947x. The tiny margin is a few percent; see "Where the tiny
-gate stands". The measurements below were taken on the hardened tree (process
-lease, deferred stop); the PR's lean tree shares the shader, bins, plane
-layout and per-draw path, but its numbers have not been retaken.
+gate stands". The step measurements below were taken on the hardened tree (process
+lease, deferred stop). The PR's lean tree, same shader, bins and plane
+layout, measured 2026-11-10 on Vulkan, three runs: raster 3.323 / 3.305 /
+3.272x (CPU ~1,315 Mpx/s, GPU ~4,340 Mpx/s) and tiny 1.532 / 1.552 / 1.541x
+(CPU ~67.5 Mpx/s, GPU ~104 Mpx/s). The likely difference is the hardened
+tree's framebuffer-access gate, taken for every GFIFO register in `rex-gpu`
+builds, which costs the GPU path more than the CPU path. Not yet isolated;
+the tiny-gate analysis below applies to the hardened tree.
 
 ## What was built
 

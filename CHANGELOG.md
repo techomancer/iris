@@ -21,8 +21,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   default and release builds are unchanged. Everything outside the supported
   subset (complete RGB blocks and spans with `SRC` logic, no blending,
   shading, patterns or host pixels) still runs on the CPU, which is
-  synchronized first. On an RTX 5070 long spans run about 2.5x as fast as
-  on the CPU renderer, and 8-pixel draws about as fast.
+  synchronized first. On an RTX 5070 long spans run about 3.3x as fast as
+  on the CPU renderer, and 8-pixel draws about 1.5x.
 - Fills are binned on the CPU into 32 x 32 screen tiles and drawn by one
   workgroup per tile, without GPU barriers; synchronization reads back only
   the tiles that were drawn.

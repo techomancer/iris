@@ -883,10 +883,10 @@ CPU plane, the GPU engine is disabled for the rest of the run, and rendering
 continues on the CPU. The failed device is deliberately leaked rather than
 destroyed, because destroying a lost device can block or abort inside wgpu.
 
-On an RTX 5070 under Vulkan, long spans (1,280 pixels) render at about 2.5x
-the CPU renderer's throughput through the full GFIFO; 8-pixel draws are about
-even (0.96x), because both renderers then spend most of their time on shared
-GFIFO handling.
+On an RTX 5070 under Vulkan, long spans (1,280 pixels) render at about 3.3x
+the CPU renderer's throughput through the full GFIFO, and 8-pixel draws at
+about 1.5x, where both renderers spend most of their time on shared GFIFO
+handling. Both are measured in the same `rex-gpu,rex-jit` release build.
 
 `REX3_GPU_TELEMETRY=1` adds host stage timings, parameter bytes, flush reasons,
 and a power-of-two batch-size histogram to the GPU report. Match and enqueue

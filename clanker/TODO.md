@@ -175,7 +175,7 @@ guide and changelog when it lands.
   is a follow-up: [follow-up plan](plans/rex3-gpu-live-follow-ups.md).
 - [x] **Experiment — order-preserving REX3 tiles.** Tile binning on the CPU,
   one workgroup per 32x32 tile, tile-major GPU plane, damage-limited readback.
-  Vulkan: raster ~2.5x, tiny ~0.96x (gates 1.20x / 0.95x). See
+  Vulkan, lean PR tree: raster ~3.3x, tiny ~1.54x (gates 1.20x / 0.95x). See
   [the parallelization plan](plans/rex3-gpu-parallelization.md).
 - [ ] **Implementation — VPro quad worker pool.** Balance shading and stores over a pool fed by the rasteriser in batches of ~16 quads, the rasteriser running a quad itself when the pool is dry, in-order completion by atomics per 8x8-grid position. See `clanker/plans/odyssey-quad-pipeline.md`, "Idea: a quad worker pool".
 - [ ] **Implementation — VPro memory access, specialised.** Board-memory

@@ -52,13 +52,13 @@ Each is independent of the GPU work and should be its own PR:
   one-writer-per-tile rule. Porting REX3 onto it would drop a second device
   and pipeline set; `clanker/plans/wgpu-raster.md` currently leaves Newport
   out of scope.
-- **Tiny-draw gate.** 0.96x on Vulkan is at the 0.95x threshold; see
-  [the parallelization plan](rex3-gpu-parallelization.md). The project has
-  accepted current small-draw performance for an experimental renderer.
+- **Tiny-draw gate.** The lean tree measures ~1.54x; the hardened tree was
+  at 0.96x, apparently because of its per-register framebuffer-access gate.
+  Re-measure when item 1 is rebased, and keep that gate off the per-register
+  path if possible. See [the parallelization plan](rex3-gpu-parallelization.md).
 - **Real workload.** No IRIX X/GL Newport capture has been replayed on the
   GPU yet; the IRIX 6.5.3 guest with the Newport subsystem installed is the
   next step ([guest capture note](../rex3/guest-synthetic-capture-and-replay-divergence.md)).
-- **Backends.** Vulkan is measured; D3D12 passes correctness and missed the
-  tiny gate once (0.947x); Metal is untested.
-- **Lean-tree numbers.** The release gates were last measured on the
-  hardened tree; rerun `gpu_live_gfifo_performance_gate` on the lean tree.
+- **Backends.** Vulkan is measured on this tree. D3D12 passed correctness on
+  the hardened tree (tiny 0.947x there) and has not been re-measured; Metal
+  is untested.
