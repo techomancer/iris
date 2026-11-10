@@ -868,7 +868,7 @@ pub(crate) fn pci_devices(
     pci.attach(slot(0), scsi[0].clone());
     pci.attach(slot(1), scsi[1].clone());
     // The Fuel's M48T35 Timekeeper is the same part.
-    let timekeeper = Arc::new(Timekeeper::fuel_with_nvram_file(Path::new(&cfg.nvram))?);
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
     let ioc3 = Arc::new(Ioc3::new(ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 fits Ethernet").clone();

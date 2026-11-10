@@ -299,7 +299,7 @@ fn the_configured_station_address_reaches_the_l1_and_the_ethernet() {
     let board = crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: mac,
-        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
+        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
         ps2_input: true,
         l1: Default::default(),
         graphics: crate::config::GraphicsBoard::None,
@@ -318,7 +318,7 @@ fn the_l1_identity_overrides_reach_the_controller() {
     let build = |l1| FuelBoard::with_config(FuelBoardConfig {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
-        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
+        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
         ps2_input: true, l1,
         graphics: crate::config::GraphicsBoard::None,
         graphics_pool: (2, 32),
@@ -625,7 +625,7 @@ fn fuel_with_graphics(graphics: crate::config::GraphicsBoard) -> crate::ip34_mac
     crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
         payload: &[], clock: Arc::new(|| 0), flash_path: None,
         station_mac: [0x08, 0x00, 0x69, 0x21, 0x43, 0x65],
-        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
+        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::new().unwrap()),
         ps2_input: true,
         l1: Default::default(),
         graphics,

@@ -90,7 +90,7 @@ impl FuelMachine {
         cfg.validate()?;
         let prom = prom_image::load(Path::new(&cfg.prom), 8 * 1024 * 1024)
             .map_err(|e| format!("Fuel {e}"))?;
-        let timekeeper = Arc::new(Timekeeper::fuel_with_nvram_file(
+        let timekeeper = Arc::new(Timekeeper::with_nvram_file(
             Path::new(&cfg.nvram),
         )?);
         let board = Arc::new(FuelBoard::with_config(FuelBoardConfig {
@@ -587,7 +587,7 @@ impl FuelBoard {
         Self::with_config(FuelBoardConfig {
             payload, clock, flash_path: None,
             station_mac: L1Config::default().mac,
-            timekeeper: Arc::new(Timekeeper::fuel()?),
+            timekeeper: Arc::new(Timekeeper::new()?),
             ps2_input: true,
             l1: L1Identity::default(),
             graphics: GraphicsBoard::None,
