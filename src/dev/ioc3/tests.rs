@@ -12,6 +12,7 @@ use super::serial::*;
 use super::superio::*;
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use crate::dev::ds1685::{Ds1685, NVRAM_OFF_NV};
 use crate::pci::PciDmaStatus;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
@@ -28,6 +29,10 @@ impl Ioc3 {
 
     fn baudbase(&self, p: usize) -> u32 {
         self.sh.sio.as_ref().unwrap().uart(p, |u| u.core.baudbase())
+    }
+
+    fn rtc(&self) -> &Arc<Ds1685> {
+        self.sh.rtc.as_ref().unwrap()
     }
 
     fn rx_pending(&self, p: usize) -> usize {
@@ -88,7 +93,7 @@ impl PciDma for TestMem {
 
 /// The Octane's IOC3, as the machine builds it but for the records.
 fn octane() -> Ioc3 {
-    Ioc3::new(&IP30, MAC, ByteBus::Ds1685)
+    Ioc3::new(&IP30, MAC, ByteBus::Ds1685(Ds1685::new(None)))
 }
 
 struct Rig {
@@ -164,7 +169,7 @@ fn each_board_reads_back_as_its_row_says() {
     for board in [&IP30, &IP29, &BASEIO, &BASEIO6G, &IP34, &IP34_NO_PS2] {
         let bus = match board.cells.byte_bus {
             ByteBusPart::None => ByteBus::None,
-            ByteBusPart::Ds1685 => ByteBus::Ds1685,
+            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None)),
             ByteBusPart::M48t35 => {
                 ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap()))
             }
@@ -561,7 +566,7 @@ fn each_row_wires_its_pins_as_listed() {
     for (board, straps, bits) in rows {
         let bus = match board.cells.byte_bus {
             ByteBusPart::None => ByteBus::None,
-            ByteBusPart::Ds1685 => ByteBus::Ds1685,
+            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None)),
             ByteBusPart::M48t35 => {
                 ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap()))
             }
@@ -1081,13 +1086,13 @@ fn nvram_survives_in_a_file() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-{}", std::process::id()));
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         r.w8(reg::BYTEBUS_DEV1, 0x30);
         r.w8(reg::BYTEBUS_DEV2, 0xc3);
     }
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         r.w8(reg::BYTEBUS_DEV1, 0x30);
         assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0xc3);
     }
@@ -1101,13 +1106,13 @@ fn nvram_writes_reach_the_file_after_a_pause() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-quiet-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let r = Rig::new();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5];
     assert_eq!(in_file(), 0, "not yet written");
-    r.c.flush_nvram_after(Duration::from_secs(3600));
+    r.c.rtc().flush_after(Duration::from_secs(3600));
     assert_eq!(in_file(), 0, "the writes have not paused for long enough");
-    r.c.flush_nvram_after(Duration::ZERO);
+    r.c.rtc().flush_after(Duration::ZERO);
     assert_eq!(in_file(), 0x66);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0x200);
     let _ = std::fs::remove_file(&path);
@@ -1116,12 +1121,12 @@ fn nvram_writes_reach_the_file_after_a_pause() {
 #[test]
 fn software_power_off_is_reported() {
     let r = Rig::new();
-    assert!(!r.c.powered_off());
+    assert!(!r.c.rtc().powered_off());
     r.w8(reg::BYTEBUS_DEV1, 0x0a);
     r.w8(reg::BYTEBUS_DEV2, 0x10); // bank 1
     r.w8(reg::BYTEBUS_DEV1, 0x4a);
     r.w8(reg::BYTEBUS_DEV2, 0x08);
-    assert!(r.c.powered_off());
+    assert!(r.c.rtc().powered_off());
 }
 
 const ECP: u32 = reg::PAR_ECP_BASE;
@@ -1555,7 +1560,7 @@ fn nvram_and_extended_ram_survive_in_a_512_byte_file() {
     let _ = std::fs::remove_file(&path);
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         rtc_w(&r, 0x0f, 0x5c);
         rtc_w(&r, 0x45, 0x66); // bank 0 RAM
         rtc_w(&r, 0x0a, 0x10);
@@ -1568,7 +1573,7 @@ fn nvram_and_extended_ram_survive_in_a_512_byte_file() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0x200);
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         assert_eq!(rtc_r(&r, 0x0f), 0x5c);
         assert_eq!(rtc_r(&r, 0x45), 0x66);
         rtc_w(&r, 0x0a, 0x10);
@@ -1591,7 +1596,7 @@ fn a_qemu_layout_image_loads() {
     img[0xc0 + 1] = 0x02;
     std::fs::write(&path, &img).unwrap();
     let r = Rig::new();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     assert_eq!(rtc_r(&r, 0x0f), 0x42);
     rtc_w(&r, 0x0a, 0x10);
     rtc_w(&r, 0x50, 9);
@@ -1626,7 +1631,7 @@ fn a_set_date_survives_a_relaunch() {
     let _ = std::fs::remove_file(&clock);
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         assert!(!clock.exists(), "no reference until the guest sets the clock");
         set_2004(&r);
     }
@@ -1635,8 +1640,8 @@ fn a_set_date_survives_a_relaunch() {
     assert_eq!((reference.len(), &reference[..8]), (24, &b"DS168RF1"[..]));
     {
         let r = Rig::new();
-        r.c.set_rtc_offset(&crate::config::RtcOffset { years: -5, ..Default::default() });
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_rtc_offset(&crate::config::RtcOffset { years: -5, ..Default::default() });
+        r.c.rtc().set_nvram_file(&path).unwrap();
         // A new run: register B is the part's power-up BCD, 24-hour.
         rtc_w(&r, 0x0a, 0x30);
         assert_eq!(rtc_r(&r, 0x48), 0x20);
@@ -1662,7 +1667,7 @@ fn an_unreadable_clock_file_leaves_the_nvram_usable() {
     let _ = std::fs::remove_dir_all(&clock);
     std::fs::create_dir(&clock).unwrap(); // reading a directory fails
     let r = Rig::new();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     assert_eq!(rtc_r(&r, 0x0f), 0x42);
     assert!(rtc_r(&r, 0x09) >= 0x26, "host time, in BCD");
     drop(r);
@@ -1680,8 +1685,8 @@ fn rtc_offset_starts_a_clock_with_no_reference() {
     let _ = std::fs::remove_file(&clock);
     let year = |years| {
         let r = Rig::new();
-        r.c.set_rtc_offset(&crate::config::RtcOffset { years, ..Default::default() });
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_rtc_offset(&crate::config::RtcOffset { years, ..Default::default() });
+        r.c.rtc().set_nvram_file(&path).unwrap();
         let y = rtc_r(&r, 0x09);
         drop(r);
         assert!(!clock.exists(), "a seed writes no reference");
@@ -1797,10 +1802,10 @@ fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-perbyte-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (r, _tm) = running_rig();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
     assert_eq!(std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5], 0, "not written per byte");
-    assert!(r.c.sh.rtc.lock().dirty_since.is_some(), "the RAM counts as unsaved");
+    assert!(r.c.rtc().dirty_since().is_some(), "the RAM counts as unsaved");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1811,7 +1816,7 @@ fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-timer-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (r, _tm) = running_rig();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     r.c.start();
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).map(|f| f[NVRAM_OFF_NV + 5]).unwrap_or(0);
@@ -1829,7 +1834,8 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     r.c.start();
     r.c.start();
     assert!(r.c.is_running());
-    assert_eq!(r.c.threads.lock().len(), 3, "two receive threads and the NVRAM writer");
+    assert_eq!(r.c.threads.lock().len(), 2, "two receive threads");
+    assert!(r.c.rtc().is_running(), "and the clock's NVRAM writer");
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
     assert!(timer_pending(&r, K_INT_OUT));
@@ -1837,6 +1843,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     r.c.stop();
     assert!(!r.c.is_running());
     assert!(r.c.threads.lock().is_empty());
+    assert!(!r.c.rtc().is_running());
     assert!(r.c.sh.armed.lock().iter().all(|a| a.is_none()));
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
@@ -1914,9 +1921,8 @@ fn dropping_a_running_chip_ends_its_threads() {
 /// The clock's power-off bit tells the machine once, through its event sender.
 #[test]
 fn the_clocks_power_off_is_sent_to_the_machine_once() {
-    let r = Rig::new();
     let (tx, rx) = std::sync::mpsc::sync_channel(4);
-    r.c.set_event_sender(tx);
+    let r = Rig::with(Ioc3::new(&IP30, MAC, ByteBus::Ds1685(Ds1685::new(Some(tx)))));
     rtc_w(&r, 0x0a, 0x10); // bank 1
     assert!(rx.try_recv().is_err());
     rtc_w(&r, 0x4a, 0x08);
@@ -1985,7 +1991,7 @@ fn save_load_round_trip() {
         let dst = Rig::with(build());
         dst.c.load_state(&v1).expect("load_state");
         // Seconds may pass between the load and the save, as on a loaded host.
-        dst.c.sh.rtc.lock().dev.advance_clock(2);
+        dst.c.sh.rtc.as_ref().unwrap().advance_clock(2);
         let v2 = dst.c.save_state();
         assert_eq!(without_clock(&v1), without_clock(&v2));
         assert_eq!(clock_seconds(&v2), clock_seconds(&v1) + 2, "the restored clock runs on from the saved time");
@@ -2013,7 +2019,7 @@ fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
     used.c.load_state(&v).unwrap();
     fresh.c.load_state(&v).unwrap();
     // The loads and saves are not at one instant, so the clock may have moved.
-    used.c.sh.rtc.lock().dev.advance_clock(1);
+    used.c.sh.rtc.as_ref().unwrap().advance_clock(1);
     assert_eq!(without_clock(&used.c.save_state()), without_clock(&fresh.c.save_state()));
     assert_eq!(without_clock(&used.c.save_state()), without_clock(&v));
 }
