@@ -33,11 +33,12 @@
 
 use super::mem::{Memory, RamExtent, BANK_SPAN};
 use super::Bedrock;
+use crate::cpu::smp::World;
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 pub mod reg {
     pub const CELL: u64 = 0x0;
@@ -156,6 +157,10 @@ pub(super) struct Md {
     /// and the board's Hub-special windows make. Written under `state`.
     cell: AtomicU64,
     unsupported: AtomicU64,
+    /// The node's processors. A bank configuration write moves memory in
+    /// every processor's cached view, which only a remap with the others
+    /// parked may do (`PpMemSpace`'s contract).
+    world: OnceLock<Arc<World>>,
 }
 #[derive(Clone, Copy)]
 pub(super) enum View {
@@ -182,7 +187,12 @@ impl Md {
             remapping: Mutex::new(()),
             cell: AtomicU64::new(State::default().cell),
             unsupported: AtomicU64::new(0),
+            world: OnceLock::new(),
         }
+    }
+    /// The processors a bank configuration write parks while it remaps.
+    pub(super) fn set_world(&self, world: Arc<World>) {
+        let _ = self.world.set(world);
     }
     /// Where fitted RAM can answer, for the processor bus's cached view.
     pub(super) fn ram_extent(&self) -> RamExtent {
@@ -269,8 +279,17 @@ impl Md {
             return self.refuse("access", addr);
         }
         // A bank configuration write remaps memory, on the CPU thread as
-        // HEART's MEMCFG does.
+        // HEART's MEMCFG does, with the other processors parked: another
+        // processor's cache instruction changes the pages its view holds,
+        // and the remap walks every view's held pages. Parked before taking
+        // `remapping`, which a processor waiting to park could be waiting for.
         let reconfigure = write.is_some() && matches!(view, View::Registers) && addr == reg::CONFIG;
+        match self.world.get() {
+            Some(world) if reconfigure => world.stop_others(|| self.access_inner(view, addr, bytes, write, true)),
+            _ => self.access_inner(view, addr, bytes, write, reconfigure),
+        }
+    }
+    fn access_inner(&self, view: View, addr: u64, bytes: u64, write: Option<u64>, reconfigure: bool) -> Option<u64> {
         let remapping = reconfigure.then(|| self.remapping.lock());
         // Sample outside state: even an injected clock must not call out under
         // the lock. Only register observations need the self-test timer.
@@ -1097,6 +1116,82 @@ mod tests {
         assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
         md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32));
         assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
+    }
+
+    /// A bank configuration write moves memory under every processor's
+    /// cached view, so the others park for it; another register write
+    /// leaves them running. The other processor holds and drops line
+    /// pages in its view while it runs, as its cache instructions do: the
+    /// remap walks those pages, and doing so unparked panicked a Tezro.
+    /// MD reads its clock inside the write, which is where the test looks.
+    #[test]
+    fn a_bank_configuration_write_parks_the_other_processors() {
+        use crate::cpu::smp::{on_cpu_thread, set_current_cpu, ParkSlot, World, HOST_PARK_BIT};
+        use std::sync::atomic::AtomicBool;
+        let watched: Arc<OnceLock<Arc<ParkSlot>>> = Arc::new(OnceLock::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let clock: crate::dev::heart::Clock = {
+            let (watched, seen) = (watched.clone(), seen.clone());
+            Arc::new(move || {
+                if let Some(slot) = watched.get().filter(|_| on_cpu_thread() == Some(0)) {
+                    seen.lock().push(slot.is_parked());
+                }
+                0
+            })
+        };
+        let md = TestMd::with_clock(&FUEL_BANKS, clock).unwrap();
+        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
+        let space = md.physical().ppmem_space().expect("a window");
+        let _mine = space.add_cached_view(&[]).unwrap();
+        let theirs = space.add_cached_view(&[]).unwrap();
+        let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let slots: Vec<Arc<ParkSlot>> = words.iter().map(|w| Arc::new(ParkSlot::new(Arc::as_ptr(w)))).collect();
+        let world = Arc::new(World::new());
+        world.set_slots(slots.clone());
+        md.0.set_world(world);
+        let running = Arc::new(AtomicBool::new(true));
+        slots[1].set_active(true);
+        let other = {
+            let (md, slot, word, running) = (md.clone(), slots[1].clone(), words[1].clone(), running.clone());
+            std::thread::spawn(move || {
+                set_current_cpu(1);
+                let space = md.physical().ppmem_space().unwrap();
+                let page = crate::ppmem::map::granularity() as u64;
+                while running.load(Ordering::Relaxed) {
+                    if word.load(Ordering::Relaxed) & HOST_PARK_BIT != 0 {
+                        slot.park(&running);
+                        continue;
+                    }
+                    for n in 0..32 {
+                        space.hold_line_page(theirs, 0x10_0000 + n * page);
+                    }
+                    for n in 0..32 {
+                        space.release_line_page(theirs, 0x10_0000 + n * page);
+                    }
+                }
+                slot.set_active(false);
+            })
+        };
+        let _ = watched.set(slots[1].clone());
+        let regs = md.md_bus();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                set_current_cpu(0);
+                for swap in [1u64, 0, 1, 0] {
+                    assert_eq!(regs.write64(reg::CONFIG, 0x33 | swap << 32), BUS_OK);
+                    assert_eq!(std::mem::take(&mut *seen.lock()), [true], "the other processor parked for the remap");
+                }
+                // Once it runs again, other registers leave it running.
+                while watched.get().unwrap().is_parked() {
+                    std::thread::yield_now();
+                }
+                assert_eq!(regs.write64(reg::REFRESH, 0), BUS_OK);
+                assert_eq!(std::mem::take(&mut *seen.lock()), [false], "a refresh write moves no memory");
+            });
+        });
+        running.store(false, Ordering::Relaxed);
+        other.join().unwrap();
+        assert_eq!(md.physical().read64(BANK_SPAN).status, BUS_OK);
     }
 
     /// Guest density settings remap fitted RAM, and reset restores the default map.
