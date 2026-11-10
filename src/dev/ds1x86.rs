@@ -4,10 +4,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, u8_slice_to_toml, load_u8_slice};
 use crate::config::{format_unix_utc, RtcOffset};
+use crate::dev::battery_clock;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::fs::File;
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
+
+/// Tag of the clock reference kept beside the NVRAM file.
+const CLOCK_TAG: &[u8; 8] = b"DS138RF1";
 
 // Command register bit definitions
 const CMD_REG_OFFSET: usize = 0xB;
@@ -28,6 +32,9 @@ struct RtcData {
     base_centiseconds: u64,
     // Timestamp when time registers were last set (for delta calculation)
     time_base: Instant,
+    /// Set when a guest write moves the clock or a saved clock is restored:
+    /// the clock is then the guest's and is saved beside the NVRAM.
+    set: bool,
 }
 
 pub struct Ds1x86 {
@@ -38,8 +45,9 @@ pub struct Ds1x86 {
     /// `MachineConfig::nvram` so different toml configs can use
     /// independent NVRAM files.
     nvram_path: String,
-    /// Shift applied to host time whenever the clock is seeded from it
-    /// (`[rtc_offset]`). Only the seed moves; the clock then runs normally.
+    /// Where the clock starts relative to host time while the NVRAM file
+    /// keeps no clock of the guest's (`[rtc_offset]`). Only the seed moves;
+    /// the clock then runs normally.
     offset: RtcOffset,
 }
 
@@ -52,14 +60,23 @@ impl Ds1x86 {
                 regs: vec![0; size],
                 base_centiseconds: 0,
                 time_base: Instant::now(),
+                set: false,
             }),
             size,
             nvram_path,
             offset,
         };
 
-        if !offset.is_zero() {
-            let host = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        // The clock starts where `[rtc_offset]` puts it, unless a clock the
+        // guest set was saved beside the NVRAM.
+        rtc.start_clock(&mut rtc.data.lock(), battery_clock::seed(&offset));
+        let mut restored = false;
+        if Path::new(&rtc.nvram_path).exists() {
+            restored = rtc.load_nvram(&rtc.nvram_path).unwrap_or(false);
+            dlog!(LogModule::Rtc, "RTC: Loaded NVRAM from {}", rtc.nvram_path);
+        }
+        if !restored && !offset.is_zero() {
+            let host = battery_clock::unix_now();
             let (guest, clamped) = offset.apply_clamped(host);
             eprintln!("RTC: clock offset {} from host time; guest clock starts at {} UTC", offset.describe(), format_unix_utc(guest));
             if clamped {
@@ -67,20 +84,21 @@ impl Ds1x86 {
             }
         }
 
-        // Initialize with current time
-        let mut data = rtc.data.lock();
-        rtc.set_current_time(&mut data.regs);
-        data.base_centiseconds = rtc.regs_to_centiseconds(&data.regs, 0);
-        data.time_base = Instant::now();
-        drop(data);
-
-        // Load NVRAM if exists
-        if Path::new(&rtc.nvram_path).exists() {
-            let _ = rtc.load_nvram(&rtc.nvram_path);
-            dlog!(LogModule::Rtc, "RTC: Loaded NVRAM from {}", rtc.nvram_path);
-        }
-
         rtc
+    }
+
+    /// Run the clock `offset` seconds from host time.
+    fn start_clock(&self, data: &mut RtcData, offset: i64) {
+        let (host, at) = battery_clock::host_second();
+        data.base_centiseconds = (host + offset).max(0) as u64 * 100;
+        data.time_base = at;
+        let base = data.base_centiseconds;
+        self.centiseconds_to_regs(base, &mut data.regs, 0);
+    }
+
+    /// The guest's time now, in whole seconds since 1970.
+    fn guest_now(data: &RtcData) -> i64 {
+        ((data.base_centiseconds + data.time_base.elapsed().as_millis() as u64 / 10) / 100) as i64
     }
 
     /// Default save path for this NVRAM (the same file we loaded from).
@@ -186,15 +204,6 @@ impl Ds1x86 {
         ((days * 24 + hours) * 60 + minutes) * 60 * 100 + seconds * 100 + centiseconds
     }
 
-    // Set registers to current system time, shifted by the configured offset
-    fn set_current_time(&self, regs: &mut [u8]) {
-        if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
-            let (secs, _) = self.offset.apply_clamped(duration.as_secs() as i64);
-            let centiseconds = secs as u64 * 100 + (duration.subsec_nanos() / 10_000_000) as u64;
-            self.centiseconds_to_regs(centiseconds, regs, 0);
-        }
-    }
-
     // Update time registers based on elapsed time since time_base
     // Should only be called when TE bit is 1 (updates enabled)
     fn update_time(&self, rtc_data: &mut RtcData) {
@@ -206,16 +215,27 @@ impl Ds1x86 {
         self.centiseconds_to_regs(current_centiseconds, &mut rtc_data.regs, 0);
     }
 
+    /// Save the RAM, and beside it (`<file>.clock`, see [`battery_clock`])
+    /// the clock, once the guest has set it.
     pub fn save_nvram(&self, filename: &str) -> std::io::Result<()> {
         let mut data = self.data.lock();
         // Ensure time registers are up to date before saving
         if (data.regs[CMD_REG_OFFSET] & TE_BIT) != 0 {
             self.update_time(&mut data);
         }
-        crate::nv_storage::save(filename, &data.regs)
+        crate::nv_storage::save(filename, &data.regs)?;
+        if data.set {
+            let r = battery_clock::encode(CLOCK_TAG, battery_clock::unix_now(), Some(Self::guest_now(&data)));
+            battery_clock::write(&battery_clock::companion(Path::new(filename)), &r)?;
+        }
+        Ok(())
     }
 
-    pub fn load_nvram(&self, filename: &str) -> std::io::Result<()> {
+    /// Load the RAM, and run the clock from the reference beside the file
+    /// with the host time since the save added, as the battery kept it
+    /// running. Without one the clock stays where it was. Returns whether
+    /// a reference was found.
+    pub fn load_nvram(&self, filename: &str) -> std::io::Result<bool> {
         let mut file = File::open(filename)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
@@ -224,12 +244,24 @@ impl Ds1x86 {
         let len = std::cmp::min(data.regs.len(), buffer.len());
         data.regs[..len].copy_from_slice(&buffer[..len]);
 
-        // Update time base to current time (simulate battery backed clock continuing)
-        self.set_current_time(&mut data.regs);
-        data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
-        data.time_base = Instant::now();
-
-        Ok(())
+        let clock = battery_clock::companion(Path::new(filename));
+        let now = battery_clock::unix_now();
+        let guest = battery_clock::read_or_warn(&clock)
+            .and_then(|r| battery_clock::decode(&r, CLOCK_TAG, true))
+            .and_then(|r| r.guest_now(now));
+        match guest {
+            Some(g) => {
+                self.start_clock(&mut data, g - now);
+                data.set = true;
+                battery_clock::note_override(&self.offset, &clock, g);
+            }
+            // The time registers in the file are stale: run on from the seed.
+            None => {
+                let base = data.base_centiseconds + data.time_base.elapsed().as_millis() as u64 / 10;
+                self.centiseconds_to_regs(base, &mut data.regs, 0);
+            }
+        }
+        Ok(guest.is_some())
     }
 
     /// Backdoor-inject an Ethernet station address into the PROM's `eaddr`
@@ -295,9 +327,14 @@ impl Ds1x86 {
         let is_cmd_reg = offset == base + CMD_REG_OFFSET;
 
         if is_time_reg {
-            // Update base time when time registers are written
+            // Update base time when time registers are written. A write
+            // that moves the clock sets it.
+            let before = Self::guest_now(&rtc_data);
             rtc_data.base_centiseconds = self.regs_to_centiseconds(&rtc_data.regs, base);
             rtc_data.time_base = Instant::now();
+            if battery_clock::sets(before, Self::guest_now(&rtc_data)) {
+                rtc_data.set = true;
+            }
         } else if is_cmd_reg {
             // Check if TE bit transitioned (using XOR)
             if (old_cmd ^ val) & TE_BIT != 0 {
@@ -358,7 +395,8 @@ impl Device for Ds1x86 {
                     }
                     writeln!(writer, "RTC Status:").unwrap();
                     if !self.offset.is_zero() {
-                        writeln!(writer, "  Offset from host at startup: {}", self.offset.describe()).unwrap();
+                        let from = if data.set { " (overridden: the guest set the clock)" } else { "" };
+                        writeln!(writer, "  Offset from host at startup: {}{from}", self.offset.describe()).unwrap();
                     }
                     writeln!(writer, "  Time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:02}",
                         Self::from_bcd(data.regs[0x0A]) as u16 + 1940, Self::from_bcd(data.regs[0x09] & 0x1f), Self::from_bcd(data.regs[0x08]),
@@ -539,6 +577,74 @@ mod tests {
         let d = rtc.data.lock();
         let got = rtc.regs_to_centiseconds(&d.regs, 0) as i64 / 100;
         assert!((got - want).abs() <= 2, "RTC seeded {} want {}", format_unix_utc(got), format_unix_utc(want));
+    }
+
+    /// Set 2004-06-01 19:00:30 the way IRIX does: TE off, the time
+    /// registers, TE on.
+    fn set_2004(rtc: &Ds1x86) {
+        rtc.write(CMD_REG_OFFSET as u32, 0x00);
+        for (r, v) in [(0u32, 0u8), (1, 0x30), (2, 0x00), (4, 0x19), (6, 3), (8, 0x01), (9, 0x06), (0x0a, 0x64)] {
+            rtc.write(r, v);
+        }
+        rtc.write(CMD_REG_OFFSET as u32, TE_BIT);
+    }
+
+    /// The time registers as seconds since 1970.
+    fn now(rtc: &Ds1x86) -> i64 {
+        let mut d = rtc.data.lock();
+        rtc.update_time(&mut d);
+        rtc.regs_to_centiseconds(&d.regs, 0) as i64 / 100
+    }
+
+    /// A date the guest sets survives a relaunch, still running, from the
+    /// reference beside the file, and wins over `[rtc_offset]`; the file
+    /// stays the chip's 8192 bytes.
+    #[test]
+    fn a_set_date_survives_a_relaunch() {
+        let path = std::env::temp_dir().join(format!("ds1x86-clock-{}", std::process::id()));
+        let clock = battery_clock::companion(&path);
+        let path = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&clock);
+        let rtc = Ds1x86::new(8192, path.clone(), RtcOffset::default());
+        rtc.save_nvram(&path).unwrap();
+        assert!(!clock.exists(), "no reference until the guest sets the clock");
+        // Rewriting the time it reads is not a set.
+        let secs = rtc.read(1).data;
+        rtc.write(1, secs);
+        rtc.save_nvram(&path).unwrap();
+        assert!(!clock.exists(), "the same time rewritten");
+        set_2004(&rtc);
+        rtc.write(100, 0x5a);
+        // As if the date had been set an hour ago.
+        rtc.data.lock().time_base -= std::time::Duration::from_secs(3600);
+        rtc.save_nvram(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+        assert_eq!(&std::fs::read(&clock).unwrap()[..8], b"DS138RF1");
+        let set = 1_086_116_430;
+        let again = Ds1x86::new(8192, path.clone(), RtcOffset { years: -5, ..Default::default() });
+        assert_eq!(again.read(100).data, 0x5a);
+        let t = now(&again);
+        assert!((set + 3599..=set + 3601).contains(&t), "2004-06-01 20:00:30, got {}", format_unix_utc(t));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&clock).ok();
+    }
+
+    /// A file with no reference beside it, as an older iris left it, loads,
+    /// and the clock starts where `[rtc_offset]` puts it.
+    #[test]
+    fn a_file_without_a_reference_starts_at_rtc_offset() {
+        let path = std::env::temp_dir().join(format!("ds1x86-old-{}", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let mut old = vec![0u8; 8192];
+        old[100] = 0x5a;
+        std::fs::write(&path, &old).unwrap();
+        let off = RtcOffset { years: -5, ..Default::default() };
+        let rtc = Ds1x86::new(8192, path.clone(), off);
+        assert_eq!(rtc.read(100).data, 0x5a);
+        let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert!((now(&rtc) - off.apply(host)).abs() <= 2);
+        std::fs::remove_file(&path).ok();
     }
 
     /// The MAC backdoor must land on the exact bytes SGI's documented
