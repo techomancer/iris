@@ -672,7 +672,10 @@ mod tests {
                 std::thread::sleep(Duration::from_micros(200));
             }
         }
-        assert!(queued > 1000, "only {queued} frames went in before the backend stalled");
+        // The ring holds 8. A socket pair that took more than that has filled and
+        // stalled the write; how much more is the host's buffer size (about 1.5 MB
+        // of frames on Linux loopback, about 220 KB on Windows).
+        assert!(queued > 64, "only {queued} frames went in before the backend stalled");
         let t = Instant::now();
         r.stop();
         assert!(t.elapsed() < Duration::from_secs(2), "stop took {:?}", t.elapsed());
