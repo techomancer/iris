@@ -213,3 +213,13 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
         }
     });
 }
+
+/// The BaseIO-G's Bridge line carries the base board's record and the
+/// MediaIO's, as two parts with distinct ROM numbers.
+#[test]
+fn the_bridge_carries_the_baseio_and_mediaio_records() {
+    let bus = Onyx2Deskside::board_record();
+    let roms = bus.roms();
+    assert_eq!(roms.len(), 2);
+    assert_ne!(roms[0], roms[1], "a search tells the boards apart");
+}
