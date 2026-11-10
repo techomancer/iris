@@ -142,6 +142,28 @@ jobs:
         cargo test -p iris --lib --features rex-dirty-upload go_damage_classifies_planes_bounds_and_non_writes
         cargo test -p iris --lib --features rex-dirty-upload register_traffic_is_clean_and_draws_publish_selected_plane
 
+  # Full-size JIT-vs-interpreter sweeps. Debug builds run them scaled down, so
+  # main runs them at full size in release (no LTO: it costs 4x the build).
+  jit-sweeps:
+    name: JIT sweeps (release)
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install pinned toolchain
+      run: rustup show
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Run the sweeps
+      run: cargo test --release -p iris --lib --features gpujit -- rss_jit_tests re3_jit_tests
+
   # The distribution scripts run only in nightly and release builds, so lint
   # them here where a mistake shows up on the pull request.
   dist-scripts:
