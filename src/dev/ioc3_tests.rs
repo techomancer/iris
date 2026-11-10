@@ -1473,18 +1473,6 @@ fn timer_pending(r: &Rig, kind: usize) -> bool {
     r.c.sh.armed.lock()[kind].is_some()
 }
 
-/// Poll `cond` for up to two seconds.
-fn within_two_seconds(cond: impl Fn() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < end {
-        if cond() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    cond()
-}
-
 /// Typed input reaches the ring and the receive timer posts it and raises its
 /// line with no register access at all: the receive thread feeds the FIFO and
 /// a timer runs the expiry. This guards the removal of the polling thread.
@@ -1499,7 +1487,7 @@ fn the_receive_timer_fires_with_no_guest_access() {
     r.w32(reg::INT_ENABLE_SET, int::serial(0, int::RX_TIMER));
     r.c.start();
     r.wire[0].inp.lock().unwrap().extend(b"hi");
-    assert!(within_two_seconds(|| r.superio.level()), "the expiry raised the line");
+    assert!(eventually(|| r.superio.level()), "the expiry raised the line");
     // `int_status` is a plain read of the latch: it catches nothing up.
     assert_ne!(r.c.int_status() & int::serial(0, int::RX_TIMER), 0);
     assert_eq!(&get(&r, 0x3000, 2), b"hi");
@@ -1514,7 +1502,7 @@ fn the_interrupt_output_pulses_with_no_guest_access() {
     r.c.start();
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 100);
-    assert!(within_two_seconds(|| r.superio.level()));
+    assert!(eventually(|| r.superio.level()));
     assert_ne!(r.c.int_status() & int::RT_OUTPUT_PULSE, 0);
     r.c.stop();
 }
@@ -1531,9 +1519,14 @@ fn a_transmit_delay_ends_with_no_guest_access() {
     put(&r, 0x2000, &[5, 0, 0, 0, TX_DELAY | TX_INTERRUPT, 0, 0, 0]);
     r.w32(reg::INT_ENABLE_SET, int::serial(0, int::TX_EXPLICIT));
     r.w32(A, sdma_ctl::ENABLE);
-    r.w32(A + sdma_off::TX_PRODUCE, 8);
-    assert!(!r.superio.level(), "the delay has not ended inside the write");
-    assert!(within_two_seconds(|| r.superio.level()));
+    {
+        // Holding the callback gate keeps the timer from ending the delay
+        // while the test is preempted past 5 ms between write and read.
+        let _idle = r.c.sh.gate.lock();
+        r.w32(A + sdma_off::TX_PRODUCE, 8);
+        assert!(!r.superio.level(), "the delay has not ended inside the write");
+    }
+    assert!(eventually(|| r.superio.level()));
     r.c.stop();
 }
 
@@ -1608,7 +1601,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     std::thread::sleep(Duration::from_millis(20));
     assert!(r.c.sh.st.lock().uart[0].core.rx_pending() == 0);
     r.c.start();
-    assert!(within_two_seconds(|| r.c.sh.st.lock().uart[0].core.rx_pending() != 0));
+    assert!(eventually(|| r.c.sh.st.lock().uart[0].core.rx_pending() != 0));
     assert!(timer_pending(&r, K_INT_OUT), "start arms the deadlines the chip holds");
     r.c.stop();
 }
