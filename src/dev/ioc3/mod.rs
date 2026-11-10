@@ -647,13 +647,8 @@ struct Core {
     ring_lo: AtomicU32,
     dma: OnceLock<Arc<dyn PciDma>>,
     superio_line: OnceLock<IrqLine>,
-    /// PCI interrupt pin A: the Ethernet block.
-    pin_line: Mutex<Option<IrqLine>>,
-    /// What the pin was last driven to, and the Ethernet block's level.
-    pin_level: AtomicBool,
-    eth_level: AtomicBool,
-    /// Serialises driving the PCI pin; see [`Core::sync_pin`].
-    line_order: Mutex<()>,
+    /// PCI interrupt pin A: the Ethernet block, which drives it.
+    inta: OnceLock<IrqLine>,
 }
 
 /// What `Core`'s lock guards.
@@ -680,42 +675,12 @@ impl Core {
             ring_lo: AtomicU32::new(0),
             dma: OnceLock::new(),
             superio_line: OnceLock::new(),
-            pin_line: Mutex::new(None),
-            pin_level: AtomicBool::new(false),
-            eth_level: AtomicBool::new(false),
-            line_order: Mutex::new(()),
+            inta: OnceLock::new(),
         }
     }
 
     fn dma(&self) -> Option<&Arc<dyn PciDma>> {
         self.dma.get()
-    }
-
-    /// The Ethernet block's level, on the PCI pin.
-    fn set_inta(&self, level: bool) {
-        self.eth_level.store(level, Ordering::SeqCst);
-        self.sync_pin();
-    }
-
-    /// The PCI pin follows the Ethernet block's level.
-    fn sync_pin(&self) {
-        let _order = self.line_order.lock();
-        let level = self.eth_level.load(Ordering::SeqCst);
-        if self.pin_level.swap(level, Ordering::SeqCst) != level {
-            if let Some(l) = self.pin_line.lock().as_ref() {
-                l.set(level);
-            }
-        }
-    }
-
-    /// The bus gave the function its interrupt pin.
-    fn connect_pin(&self, line: IrqLine) {
-        {
-            let _order = self.line_order.lock();
-            line.set(self.pin_level.load(Ordering::SeqCst));
-            *self.pin_line.lock() = Some(line);
-        }
-        self.sync_pin();
     }
 
     /// The interrupt status word.
@@ -1611,8 +1576,7 @@ impl Ioc3 {
     /// only a weak reference to them.
     pub fn register_locks(&self) {
         for (what, probe) in [
-            ("line_order", (|s: &Shared| s.core.line_order.is_locked()) as fn(&Shared) -> bool),
-            ("int_out", |s| s.int_out.is_locked()),
+            ("int_out", (|s: &Shared| s.int_out.is_locked()) as fn(&Shared) -> bool),
             ("rtc", |s| s.rtc.is_locked()),
         ] {
             let sh = Arc::downgrade(&self.sh);
@@ -1837,7 +1801,11 @@ impl PciFunction for Ioc3 {
             let _ = self.sh.core.dma.set(Arc::new(Ioc3Dma::new(dma.clone())));
         }
         if let Some(line) = self.sh.pci.irq() {
-            self.sh.core.connect_pin(line.clone());
+            if self.sh.core.inta.set(line.clone()).is_ok() {
+                if let Some(e) = &self.sh.eth {
+                    e.republish();
+                }
+            }
         }
     }
 }
@@ -2028,7 +1996,9 @@ impl Saveable for Ioc3 {
         self.sh.load_state(field(v, "chip")?, now)?;
         self.sh.rearm();
         self.sh.core.republish();
-        self.sh.core.sync_pin();
+        if let Some(e) = &self.sh.eth {
+            e.republish();
+        }
         Ok(())
     }
 }
