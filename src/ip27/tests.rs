@@ -12,6 +12,22 @@ fn a_small_bank_is_one_run_and_a_large_one_four() {
     assert!(bank_runs(3, 0).is_empty());
 }
 
+/// The layout skips empty banks, numbers the RAM of the fitted ones in order,
+/// and a 512 MiB bank is four runs of 128 MiB at 128 MiB intervals, each
+/// starting where the last ended in the bank's own storage.
+#[test]
+fn the_layout_numbers_fitted_banks_and_splits_a_large_one_in_four() {
+    const MIB: u64 = 1 << 20;
+    let runs = layout([64, 0, 512, 0]);
+    assert_eq!(runs.len(), 5);
+    assert_eq!(runs[0], Run { bank: 0, index: 0, at: 0, len: 64 * MIB, src: 0 });
+    for (n, run) in runs[1..].iter().enumerate() {
+        let n = n as u64;
+        assert_eq!(*run, Run { bank: 2, index: 1, at: 1024 * MIB + n * 128 * MIB, len: 128 * MIB, src: n * 128 * MIB });
+    }
+    assert!(layout([0; BANKS]).is_empty());
+}
+
 #[test]
 fn fitted_memory_answers_where_the_runs_are_and_nowhere_else() {
     let mem = NodeMemory::new([64, 0, 128, 0]).unwrap();

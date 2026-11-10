@@ -76,10 +76,46 @@ pub fn bank_runs(bank: usize, mb: u32) -> Vec<(u64, u64)> {
     }
 }
 
+/// One fitted run of node memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    /// The bank whose stride the run lies in.
+    pub bank: usize,
+    /// The run's RAM bank among the fitted ones, in the order they were built.
+    pub index: usize,
+    /// Where the run lies in the node's offsets.
+    pub at: u64,
+    pub len: u64,
+    /// Where in its RAM bank the run starts.
+    pub src: u64,
+}
+
+/// Every fitted run of `banks_mb`, in the order they take their storage. The
+/// one place that skips empty banks and numbers the RAM they are built from;
+/// the decode table, the node-zero reroute, the Hub's direct lookup and the
+/// memory map all read it.
+fn layout(banks_mb: [u32; BANKS]) -> Arc<[Run]> {
+    let mut runs = Vec::new();
+    let mut index = 0;
+    for (bank, &mb) in banks_mb.iter().enumerate() {
+        if mb == 0 {
+            continue;
+        }
+        let mut src = 0;
+        for (at, len) in bank_runs(bank, mb) {
+            runs.push(Run { bank, index, at, len, src });
+            src += len;
+        }
+        index += 1;
+    }
+    runs.into()
+}
+
 /// The node's memory: the banks on a decode table, placed at their stride.
 pub struct NodeMemory {
     phys: Arc<Physical>,
     banks_mb: [u32; BANKS],
+    layout: Arc<[Run]>,
     /// The view [`Self::route_nodes`] sent the other node numbers to, held
     /// weakly: it reaches the Hub, which holds this memory's users.
     claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
@@ -95,24 +131,16 @@ impl NodeMemory {
         }
         let phys = Physical::new(banks);
         phys.set_default(Arc::new(Absent), "unfitted memory");
-        let mut index = 0;
-        for (bank, &mb) in banks_mb.iter().enumerate() {
-            if mb == 0 {
-                continue;
-            }
-            let mut src = 0u64;
-            for (at, len) in bank_runs(bank, mb) {
-                phys.fill_slots(at >> SLOT_SHIFT, len >> SLOT_SHIFT, phys.bank_view(index, at.wrapping_sub(src)));
-                if let Some(sp) = phys.ppmem_space() {
-                    if at + len <= sp.window_size() {
-                        sp.map_range(index, src, at, len).map_err(|e| format!("bank {bank}: window map: {e}"))?;
-                    }
+        let layout = layout(banks_mb);
+        for &Run { bank, index, at, len, src } in layout.iter() {
+            phys.fill_slots(at >> SLOT_SHIFT, len >> SLOT_SHIFT, phys.bank_view(index, at.wrapping_sub(src)));
+            if let Some(sp) = phys.ppmem_space() {
+                if at + len <= sp.window_size() {
+                    sp.map_range(index, src, at, len).map_err(|e| format!("bank {bank}: window map: {e}"))?;
                 }
-                src += len;
             }
-            index += 1;
         }
-        Ok(Self { phys, banks_mb, claim: Arc::default() })
+        Ok(Self { phys, banks_mb, layout, claim: Arc::default() })
     }
 
     pub fn physical(&self) -> &Arc<Physical> {
@@ -143,7 +171,7 @@ impl NodeMemory {
     pub fn node_zero(&self) -> Arc<NodeZero> {
         Arc::new(NodeZero {
             phys: Arc::downgrade(&self.phys),
-            banks_mb: self.banks_mb,
+            layout: self.layout.clone(),
             claim: self.claim.clone(),
             state: Mutex::new(NodeZeroState { number: 0, calias: 0, away: false }),
         })
@@ -154,7 +182,7 @@ impl NodeMemory {
     /// reference another Hub or an engine makes by the node's number.
     /// [`NodeZero`] reroutes only the processor's own cached references.
     pub fn home(&self) -> Arc<dyn BusDevice> {
-        Arc::new(Home::new(self.phys.clone(), self.banks_mb))
+        Arc::new(Home::new(self.phys.clone(), &self.layout))
     }
 
     /// Place the boot flash's reset view in node memory.
@@ -165,18 +193,8 @@ impl NodeMemory {
     /// The ranges the CPU model reports as memory.
     pub fn memory_map(&self) -> crate::memory_map::MemoryMap {
         use crate::memory_map::{MemKind, MemRange, MemoryMap};
-        const NAMES: [&str; 16] = [
-            "bank 0 run 0", "bank 0 run 1", "bank 0 run 2", "bank 0 run 3",
-            "bank 1 run 0", "bank 1 run 1", "bank 1 run 2", "bank 1 run 3",
-            "bank 2 run 0", "bank 2 run 1", "bank 2 run 2", "bank 2 run 3",
-            "bank 3 run 0", "bank 3 run 1", "bank 3 run 2", "bank 3 run 3",
-        ];
-        let mut ranges = Vec::new();
-        for (bank, &mb) in self.banks_mb.iter().enumerate() {
-            for (run, (at, len)) in bank_runs(bank, mb).into_iter().enumerate() {
-                ranges.push(MemRange::new(NAMES[bank * 4 + run], MemKind::Ram, at, at + len));
-            }
-        }
+        const NAMES: [&str; BANKS] = ["bank 0", "bank 1", "bank 2", "bank 3"];
+        let mut ranges: Vec<_> = self.layout.iter().map(|r| MemRange::new(NAMES[r.bank], MemKind::Ram, r.at, r.at + r.len)).collect();
         ranges.push(MemRange::new(
             "boot flash",
             MemKind::Rom,
@@ -197,35 +215,17 @@ impl NodeMemory {
 /// other offset is the decode table's.
 struct Home {
     phys: Arc<Physical>,
-    /// Each bank's fitted runs, built once: a node offset names a bank by
-    /// its stride, and a bank has at most four runs.
-    runs: [[Option<HomeRun>; 4]; BANKS],
-}
-
-/// One fitted run: where it lies in the node's offsets, which RAM bank holds
-/// it and where in that bank it starts.
-#[derive(Clone, Copy)]
-struct HomeRun {
-    at: u64,
-    len: u64,
-    index: usize,
-    src: u64,
+    /// Each bank's fitted runs, laid out by stride: a node offset names a
+    /// bank by its stride, and a bank has at most four runs.
+    runs: [[Option<Run>; 4]; BANKS],
 }
 
 impl Home {
-    fn new(phys: Arc<Physical>, banks_mb: [u32; BANKS]) -> Self {
+    fn new(phys: Arc<Physical>, layout: &[Run]) -> Self {
         let mut runs = [[None; 4]; BANKS];
-        let mut index = 0;
-        for (bank, &mb) in banks_mb.iter().enumerate() {
-            if mb == 0 {
-                continue;
-            }
-            let mut src = 0;
-            for (n, (at, len)) in bank_runs(bank, mb).into_iter().enumerate() {
-                runs[bank][n] = Some(HomeRun { at, len, index, src });
-                src += len;
-            }
-            index += 1;
+        for run in layout {
+            let slot = runs[run.bank].iter().position(Option::is_none).expect("a bank has at most four runs");
+            runs[run.bank][slot] = Some(*run);
         }
         Self { phys, runs }
     }
@@ -438,7 +438,7 @@ impl BusDevice for Ip27Bus {
 pub struct NodeZero {
     /// Weak: the Hub that owns this through its hooks also owns the memory.
     phys: Weak<Physical>,
-    banks_mb: [u32; BANKS],
+    layout: Arc<[Run]>,
     claim: Arc<Mutex<Option<Weak<dyn BusDevice>>>>,
     state: Mutex<NodeZeroState>,
 }
@@ -477,37 +477,27 @@ impl NodeZero {
         if let Some(sp) = ppmem {
             sp.clear_mappings();
         }
-        let mut index = 0;
-        for (bank, &mb) in self.banks_mb.iter().enumerate() {
-            if mb == 0 {
-                continue;
+        for &Run { index, at, len, src, .. } in self.layout.iter() {
+            let end = at + len;
+            // The part of the run past the alias goes through the claim; the
+            // rest, and every run when the number is zero, is the bank.
+            let split = if away { st.calias.clamp(at, end) } else { end };
+            if split > at {
+                let first = at >> SLOT_SHIFT;
+                phys.fill_slots(first, (split - at) >> SLOT_SHIFT, phys.bank_view(index, at.wrapping_sub(src)));
             }
-            let mut src = 0u64;
-            for (at, len) in bank_runs(bank, mb) {
-                let end = at + len;
-                // The part of the run past the alias goes through the claim;
-                // the rest, and every run when the number is zero, is the
-                // bank.
-                let split = if away { st.calias.clamp(at, end) } else { end };
-                if split > at {
-                    let first = at >> SLOT_SHIFT;
-                    phys.fill_slots(first, (split - at) >> SLOT_SHIFT, phys.bank_view(index, at.wrapping_sub(src)));
+            if split < end {
+                if let Some(claim) = &claim {
+                    phys.map(split, end, claim.clone(), "node zero beyond the cached alias");
                 }
-                if split < end {
-                    if let Some(claim) = &claim {
-                        phys.map(split, end, claim.clone(), "node zero beyond the cached alias");
+            }
+            if !away {
+                if let Some(sp) = ppmem {
+                    if end <= sp.window_size() {
+                        let _ = sp.map_range(index, src, at, len);
                     }
                 }
-                if !away {
-                    if let Some(sp) = ppmem {
-                        if end <= sp.window_size() {
-                            let _ = sp.map_range(index, src, at, len);
-                        }
-                    }
-                }
-                src += len;
             }
-            index += 1;
         }
         st.away = away;
     }
