@@ -568,6 +568,38 @@ fn nmi_pulses_the_modules_output_after_a_second() {
     assert_eq!(rig.cmd(0, "ver"), "ok VER 3.2 ");
 }
 
+/// The module is due when its controller's reset wait ends and again when the
+/// 100 ms pulse does, and not otherwise.
+#[test]
+fn the_module_reports_when_it_is_next_due() {
+    let ms = Duration::from_millis;
+    let rig = Rig::new();
+    rig.events();
+    assert_eq!(rig.module.next_due(), None);
+    rig.assert_cmd(1, "rst", "ok ");
+    assert_eq!(rig.module.next_due(), Some(ms(1000)));
+    rig.step_ms(1000);
+    assert_eq!(rig.events(), [ModuleOutput::Reset]);
+    assert_eq!(rig.module.next_due(), Some(ms(100)), "the pulse ends");
+    rig.step_ms(100);
+    assert!(rig.events().is_empty());
+    assert_eq!(rig.module.next_due(), None);
+}
+
+/// An access that finds the module's outputs already queued leaves them due,
+/// whatever it does to the schedule, so the machine takes them at once rather
+/// than at the next unrelated visit.
+#[test]
+fn queued_outputs_leave_the_module_due_now() {
+    let rig = Rig::new();
+    rig.events();
+    rig.assert_cmd(2, "nmi", "ok ");
+    rig.step_ms(1100);
+    assert_eq!(rig.cmd(0, "ver"), "ok VER 3.2 ");
+    assert_eq!(rig.module.next_due(), Some(Duration::ZERO), "the queued outputs are due now");
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(true)]);
+}
+
 #[test]
 fn rst_pulses_the_modules_reset_output() {
     let rig = Rig::new();

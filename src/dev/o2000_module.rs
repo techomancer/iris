@@ -52,6 +52,7 @@ use crate::devlog::LogModule;
 use crate::dlog;
 use crate::traits::Resettable;
 use parking_lot::Mutex;
+use std::time::Duration;
 use std::sync::{Arc, Weak};
 
 /// One adapter per node board on a four-node module.
@@ -687,6 +688,28 @@ impl Origin2000Module {
     pub fn take_events(&self) -> Vec<ModuleOutput> {
         self.elsc.poll();
         self.shared.run(|s| std::mem::take(&mut s.events))
+    }
+
+    /// Call `wake` after any access that may have moved [`Self::next_due`];
+    /// see [`Elsc::set_wake`]. The module's own pulse starts only from an
+    /// action its controller hands it, so the controller's report covers it.
+    pub fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        self.elsc.set_wake(wake);
+    }
+
+    /// How long until the module or its controller has an output to give, or
+    /// a committed action to run; zero if it is due now, `None` if nothing is
+    /// pending.
+    pub fn next_due(&self) -> Option<Duration> {
+        let (pulse_ends, queued) = {
+            let st = self.shared.state.lock();
+            (st.pulse_deadline, !st.events.is_empty())
+        };
+        if queued {
+            return Some(Duration::ZERO);
+        }
+        let pulse = pulse_ends.map(|d| Duration::from_nanos(d.saturating_sub((self.shared.clock)())));
+        [self.elsc.next_due(), pulse].into_iter().flatten().min()
     }
 
     /// Let time pass for the module and its controller when no guest is

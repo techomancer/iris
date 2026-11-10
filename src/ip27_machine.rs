@@ -73,7 +73,9 @@ use parking_lot::Mutex;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{atomic::AtomicU64, Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 /// The profile's own `[origin200]`, `[origin2000]` or `[onyx2]` table. Only an
 /// SN0 machine is built from it.
@@ -94,11 +96,6 @@ pub(crate) fn table(cfg: &MachineConfig) -> &'static str {
 
 /// The PROM image tried when `prom` is left at the shared default.
 pub const ORIGIN200_PROM_FILE: &str = "ip27prom.img";
-
-/// How often the module controller is brought up to date when the guest
-/// leaves its bus idle. The controller keeps its own time, so a late visit
-/// loses nothing.
-const CONTROLLER_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The Hub's own widget number: a small window there is not the Bridge's.
 const WIDGET_HUB: u8 = 1;
@@ -214,6 +211,13 @@ pub trait ModuleController: Send + Sync {
     /// The controller's outputs since the last call, with its time brought
     /// up to date.
     fn take_events(&self) -> Vec<ModuleOutput>;
+    /// How long until the controller has an output to give or an action to
+    /// run with no bus access to bring it up to date: zero if due now, `None`
+    /// if nothing is pending.
+    fn next_due(&self) -> Option<Duration>;
+    /// `wake` runs, with no controller lock held, after any access that may
+    /// have moved [`Self::next_due`]. Once, when the machine is built.
+    fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>);
 }
 
 /// What a board's I/O hands the machine once it is wired to the node.
@@ -269,9 +273,8 @@ pub struct Ip27Machine<B: Ip27Board> {
     io: BoardIo,
     _board: std::marker::PhantomData<fn() -> B>,
     units: Vec<Unit>,
-    controller_events: Sender<MachineEvent>,
-    /// The recurring timer that brings the controller up to date.
-    controller_timer: Option<TimerId>,
+    /// Brings the module controller up to date when it is next due.
+    watch: Arc<ControllerWatch>,
     monitor: Arc<Monitor>,
     monitor_port: u16,
     ci: bool,
@@ -332,6 +335,90 @@ impl HubHooks for Hooks {
     }
     fn machine_restart(&self) {
         let _ = self.events.send(MachineEvent::HardReset);
+    }
+}
+
+/// Brings the module controller up to date when it is next due. The
+/// controller keeps its own time and a bus access brings it up to date, so
+/// this exists for a guest that leaves the bus idle while a countdown or a
+/// pulse ends. It holds one one-shot timer, armed for the controller's next
+/// due time and re-armed after each visit and each access that may have moved
+/// it, so an idle machine with nothing pending wakes nothing.
+struct ControllerWatch {
+    controller: Arc<dyn ModuleController>,
+    events: Sender<MachineEvent>,
+    timers: Weak<TimerManager>,
+    /// The armed timer, if any. Held across the arming so two arms cannot
+    /// leave two timers.
+    timer: Mutex<Option<TimerId>>,
+    /// Whether the machine is running its peripherals.
+    running: AtomicBool,
+    me: Weak<ControllerWatch>,
+}
+
+impl ControllerWatch {
+    fn new(controller: Arc<dyn ModuleController>, events: Sender<MachineEvent>, timers: &Arc<TimerManager>) -> Arc<Self> {
+        let watch = Arc::new_cyclic(|me| Self {
+            controller,
+            events,
+            timers: Arc::downgrade(timers),
+            timer: Mutex::new(None),
+            running: AtomicBool::new(false),
+            me: me.clone(),
+        });
+        let me = Arc::downgrade(&watch);
+        watch.controller.set_wake(Box::new(move || {
+            if let Some(watch) = me.upgrade() {
+                watch.arm();
+            }
+        }));
+        watch
+    }
+
+    fn start(&self) {
+        self.running.store(true, Ordering::Release);
+        self.arm();
+    }
+
+    fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+        self.arm();
+    }
+
+    /// Arm the timer for the controller's next due time, replacing the last.
+    fn arm(&self) {
+        let Some(timers) = self.timers.upgrade() else { return };
+        let mut timer = self.timer.lock();
+        if let Some(id) = timer.take() {
+            timers.remove(id);
+        }
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(due) = self.controller.next_due() else { return };
+        // Never zero: a controller that is due now and stays due after a
+        // visit must not spin the timer thread.
+        let due = due.max(Duration::from_nanos(1));
+        let me = self.me.clone();
+        *timer = Some(timers.add_one_shot(due, me, |me| {
+            if let Some(watch) = me.upgrade() {
+                watch.visit();
+            }
+            TimerReturn::Delete
+        }));
+    }
+
+    /// Carry out what the controller has due, and arm for what is next.
+    fn visit(&self) {
+        for event in self.controller.take_events() {
+            controller_output(event, &self.events);
+        }
+        self.arm();
+    }
+
+    #[cfg(test)]
+    fn armed(&self) -> Option<TimerId> {
+        *self.timer.lock()
     }
 }
 
@@ -458,6 +545,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             cpu.register_locks();
             units.push(Unit { node, cpu });
         }
+        let watch = ControllerWatch::new(io.controller.clone(), tx, &units[0].node.timers);
 
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
@@ -482,8 +570,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             io,
             _board: std::marker::PhantomData,
             units,
-            controller_events: tx,
-            controller_timer: None,
+            watch,
             monitor: Arc::new(monitor),
             monitor_port: cfg.monitor_port.unwrap_or(DEFAULT_MONITOR_PORT),
             ci: cfg.ci,
@@ -572,33 +659,6 @@ impl<B: Ip27Board> Ip27Machine<B> {
         Ok(cpu)
     }
 
-    /// The controller's timers run when a bus access or this timer touches
-    /// it. A guest that leaves the bus idle (an operator typing at the AUX
-    /// port, a countdown expiring) still needs them, and its outputs, so a
-    /// recurring timer brings it up to date. Nothing runs per instruction.
-    fn start_controller_timer(&mut self) {
-        self.stop_controller_timer();
-        let (controller, events) = (self.io.controller.clone(), self.controller_events.clone());
-        let id = self.units[0].node.timers.add_recurring(
-            std::time::Instant::now() + CONTROLLER_PERIOD,
-            CONTROLLER_PERIOD,
-            (),
-            move |_| {
-                for event in controller.take_events() {
-                    controller_output(event, &events);
-                }
-                TimerReturn::Continue
-            },
-        );
-        self.controller_timer = Some(id);
-    }
-
-    fn stop_controller_timer(&mut self) {
-        if let Some(id) = self.controller_timer.take() {
-            self.units[0].node.timers.remove(id);
-        }
-    }
-
     fn cpu<C>(
         module: &CpuModule,
         bus: Arc<Ip27Bus>,
@@ -641,7 +701,7 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         for u in &self.units {
             u.cpu.clone().as_device().stop();
         }
-        self.stop_controller_timer();
+        self.watch.stop();
         for d in self.io.devices.iter().rev() {
             d.stop();
         }
@@ -675,7 +735,7 @@ impl<B: Ip27Board> Workstation for Ip27Machine<B> {
         for d in &self.io.devices {
             d.start();
         }
-        self.start_controller_timer();
+        self.watch.start();
     }
     fn cpu_start(&self) {
         for u in &self.units {
@@ -840,6 +900,12 @@ impl ModuleController for Origin200Controller {
     }
     fn take_events(&self) -> Vec<ModuleOutput> {
         self.elsc.take_events()
+    }
+    fn next_due(&self) -> Option<Duration> {
+        self.elsc.next_due()
+    }
+    fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        self.elsc.set_wake(wake);
     }
 }
 
