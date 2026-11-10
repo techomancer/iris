@@ -744,8 +744,8 @@ fn no_process_exit_bypasses_the_flush() {
         ("crash_diag.rs", 1, "fatal-signal handler: the process is already dying"),
     ];
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found: Vec<(String, usize)> = Vec::new();
-    fn walk(dir: &Path, root: &Path, found: &mut Vec<(String, usize)>) {
+    let mut found: Vec<(PathBuf, usize)> = Vec::new();
+    fn walk(dir: &Path, root: &Path, found: &mut Vec<(PathBuf, usize)>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
             if p.is_dir() {
@@ -755,7 +755,7 @@ fn no_process_exit_bypasses_the_flush() {
                 }
             } else if p.extension().is_some_and(|x| x == "rs") {
                 let text = std::fs::read_to_string(&p).unwrap();
-                let rel = p.strip_prefix(root).unwrap().display().to_string();
+                let rel = p.strip_prefix(root).unwrap().to_path_buf();
                 if rel.ends_with("exit_persistence_tests.rs") {
                     continue;
                 }
@@ -780,21 +780,22 @@ fn no_process_exit_bypasses_the_flush() {
     let after_start = started.lines().filter(|l| !l.trim_start().starts_with("//") && l.contains("process::exit(")).count();
     assert_eq!(after_start, 2, "main.rs exits after the machine starts; each must flush through exit_process");
     for (file, n) in &found {
-        if file == "main.rs" {
+        if file == Path::new("main.rs") {
             continue;
         }
-        let ok = allowed.iter().any(|(f, max, _)| f == file && n <= max);
+        let ok = allowed.iter().any(|(f, max, _)| Path::new(f) == file && n <= max);
         assert!(
             ok,
-            "{file} calls std::process::exit {n} time(s). Machine and device code must end the process through \
+            "{} calls std::process::exit {n} time(s). Machine and device code must end the process through \
              workstation::exit_process so the disks are flushed first; if this one cannot touch a disk, add it to \
-             this test's list with the reason."
+             this test's list with the reason.",
+            file.display()
         );
     }
     // A listed file that no longer exits should leave the list, so the list
     // does not grow stale slack another exit could hide in.
     for (f, max, why) in allowed {
-        let n = found.iter().find(|(file, _)| file == f).map_or(0, |(_, n)| *n);
+        let n = found.iter().find(|(file, _)| file == Path::new(f)).map_or(0, |(_, n)| *n);
         assert_eq!(n, *max, "{f} ({why}) now has {n} exits, the list says {max}");
     }
 }
