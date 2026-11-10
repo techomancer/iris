@@ -344,7 +344,7 @@ impl State {
 
     fn set_message(&mut self, processor: usize, pending: bool) {
         if processor >= PROCESSOR_CODES {
-            dlog!(LogModule::Bedrock, "o2000 module: message for processor {processor}, outside the eight published codes");
+            dlog!(LogModule::Module, "o2000 module: message for processor {processor}, outside the eight published codes");
             return;
         }
         if pending {
@@ -360,11 +360,11 @@ impl State {
 
     fn start_pulse(&mut self, nmi: bool) -> bool {
         if !(if nmi { self.cfg.can_nmi } else { self.cfg.can_reset }) {
-            dlog!(LogModule::Bedrock, "o2000 module: {} requested on a module that declares no such path", if nmi { "NMI" } else { "reset" });
+            dlog!(LogModule::Module, "o2000 module: {} requested on a module that declares no such path", if nmi { "NMI" } else { "reset" });
             return false;
         }
         if self.pulse_active {
-            dlog!(LogModule::Bedrock, "o2000 module: pulse requested during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
+            dlog!(LogModule::Module, "o2000 module: pulse requested during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
             return false;
         }
         self.pulse_active = true;
@@ -376,7 +376,7 @@ impl State {
 
     fn set_power(&mut self, on: bool) -> bool {
         if !self.cfg.can_power {
-            dlog!(LogModule::Bedrock, "o2000 module: power {} requested on a module that declares no power path", if on { "up" } else { "down" });
+            dlog!(LogModule::Module, "o2000 module: power {} requested on a module that declares no power path", if on { "up" } else { "down" });
             return false;
         }
         if !on {
@@ -403,13 +403,13 @@ impl State {
             Action::None => return false,
         };
         if !declared {
-            dlog!(LogModule::Bedrock, "o2000 module: destructive command refused, this module declares no {} path", if action == Action::Reset { "reset" } else { "power" });
+            dlog!(LogModule::Module, "o2000 module: destructive command refused, this module declares no {} path", if action == Action::Reset { "reset" } else { "power" });
             return false;
         }
         if self.pulse_active {
             // No source settles that overlap, so every destructive action is
             // refused for the duration of a pulse. A model choice.
-            dlog!(LogModule::Bedrock, "o2000 module: destructive command during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
+            dlog!(LogModule::Module, "o2000 module: destructive command during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
             return false;
         }
         true
@@ -485,7 +485,7 @@ impl ModuleOps for Link {
             Action::Cycle | Action::None => unreachable!("the controller never hands over {action:?}"),
         });
         if !done {
-            dlog!(LogModule::Bedrock, "o2000 module: an acknowledged action did not happen");
+            dlog!(LogModule::Module, "o2000 module: an acknowledged action did not happen");
         }
     }
 
@@ -504,7 +504,7 @@ impl ModuleOps for Link {
     fn console_owner(&self, processor: usize) {
         self.0.with(|s| {
             if processor >= PROCESSOR_CODES {
-                dlog!(LogModule::Bedrock, "o2000 module: console output from processor {processor}, outside the eight published codes");
+                dlog!(LogModule::Module, "o2000 module: console output from processor {processor}, outside the eight published codes");
             } else {
                 s.console_processor = processor;
             }

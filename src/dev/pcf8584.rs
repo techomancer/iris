@@ -410,7 +410,7 @@ impl State {
             return;
         }
         if self.recv {
-            dlog!(LogModule::Bedrock, "pcf8584: data written during a receive transfer, ignored");
+            dlog!(LogModule::Module, "pcf8584: data written during a receive transfer, ignored");
             return;
         }
         self.status |= sts::PIN;

@@ -72,6 +72,10 @@ pub enum LogModule {
     Nvme = 34,
     L1 = 35,
     Usb = 36,
+    /// The SN0 module controller (ELSC and the Origin 2000 module), its
+    /// configuration NVRAM and its I2C controller: protocol surprises and
+    /// refused commands.
+    Module = 37,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -86,7 +90,7 @@ pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the
 pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 37;
+    pub const COUNT: usize = 38;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -127,6 +131,7 @@ impl LogModule {
             "nvme"   => Some(Self::Nvme),
             "l1" => Some(Self::L1),
             "usb" => Some(Self::Usb),
+            "module" => Some(Self::Module),
             _        => None,
         }
     }
@@ -170,6 +175,7 @@ impl LogModule {
             Self::Nvme   => "nvme",
             Self::L1 => "l1",
             Self::Usb => "usb",
+            Self::Module => "module",
         }
     }
 
@@ -182,7 +188,7 @@ impl LogModule {
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
             Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
-            Self::L1, Self::Usb,
+            Self::L1, Self::Usb, Self::Module,
         ]
     }
 
@@ -349,6 +355,7 @@ impl DevLog {
                 ModuleLog::new(), // Nvme
                 ModuleLog::new(), // L1
                 ModuleLog::new(), // Usb
+                ModuleLog::new(), // Module
             ],
         }
     }
@@ -609,5 +616,27 @@ impl Device for DevLog {
             _ => return Err("Usage: log <module|all> <on|off|mask <cat|hex>|file <path>>  |  log status".to_string()),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every module has a name that `from_str` takes back, `all` lists each
+    /// once and `COUNT` covers them: a category added to the enum but not
+    /// to one of the tables shows here.
+    #[test]
+    fn every_module_name_round_trips() {
+        let all = LogModule::all();
+        assert_eq!(all.len(), LogModule::COUNT);
+        for (i, m) in all.iter().enumerate() {
+            assert_eq!(LogModule::from_str(m.name()), Some(*m), "{}", m.name());
+            assert_eq!(*m as usize, all.iter().position(|o| o == m).unwrap());
+            assert!((*m as usize) < LogModule::COUNT, "{}", m.name());
+            assert!(all[..i].iter().all(|o| o != m), "{} is listed twice", m.name());
+        }
+        assert_eq!(LogModule::from_str("module"), Some(LogModule::Module));
+        assert_eq!(LogModule::from_str("nothing"), None);
     }
 }

@@ -602,7 +602,12 @@ Per-module logging; all of it needs a developer build to produce output.
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
 Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
-xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock pci bridge heart nvme l1 usb`. `pci` logs every
+Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
+xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock hub module pci bridge heart nvme l1 usb`. `hub`
+logs the SN0 Hub's unsupported register accesses and accesses to unfitted
+node memory. `module` logs the module controller's refused commands and
+protocol surprises (the Origin 200's ELSC and the Origin 2000 module's
+controller, with their NVRAM and I2C controller). `pci` logs every
 configuration cycle on a PCI bus (MACE's, the Octane Bridge's) and
 whether a function answered it. `bridge` logs the Octane Bridge's
 register and translation-table accesses by name, and any transfer a PCI
