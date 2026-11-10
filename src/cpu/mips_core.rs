@@ -2508,6 +2508,15 @@ pub fn read_fpr_l_fr1(core: &MipsCore, reg: u32) -> u64        { core.read_fpr_l
 pub fn write_fpr_l_fr1(core: &mut MipsCore, reg: u32, v: u64)  { core.write_fpr_l(reg, v) }
 pub fn read_fpr_w_fr1(core: &MipsCore, reg: u32) -> u32        { core.read_fpr_w(reg) }
 pub fn write_fpr_w_fr1(core: &mut MipsCore, reg: u32, v: u32)  { core.write_fpr_w(reg, v) }
+/// FR=1 single/word write on a part that zeroes the upper word
+/// (`CpuModel::SINGLE_CLEARS_UPPER`).
+#[inline]
+pub fn write_fpr_w_fr1_zx(core: &mut MipsCore, reg: u32, v: u32) { core.fpr[reg as usize] = v as u64 }
+/// The FR=1 single/word writer for a part: `write_fpr_w_fr1_zx` or `write_fpr_w_fr1`.
+#[inline(always)]
+pub fn write_fpr_w_fr1_for(core: &mut MipsCore, clears_upper: bool, reg: u32, v: u32) {
+    if clears_upper { write_fpr_w_fr1_zx(core, reg, v) } else { core.write_fpr_w(reg, v) }
+}
 
 impl MipsCore {
 

@@ -872,6 +872,9 @@ impl Codegen {
         if self.jit_consts.lwr_keeps_upper {
             s.push_str(" lwr_upper=1");
         }
+        if self.jit_consts.single_clears_upper {
+            s.push_str(" single_zx=1");
+        }
         s.push_str(" ops=");
         s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
         Some(blake3::hash(s.as_bytes()).as_bytes()[..16].try_into().unwrap())
@@ -4414,6 +4417,10 @@ pub struct JitConsts {
     /// core one, published beside the core address because both reach a worker's
     /// `Codegen` the same way. The code-cache fingerprint carries it when set.
     pub lwr_keeps_upper: bool,
+    /// With FR set, a single or word result zeroes bits 63:32 of the
+    /// destination (`CpuModel::SINGLE_CLEARS_UPPER`). Published and
+    /// fingerprinted the same way as `lwr_keeps_upper`.
+    pub single_clears_upper: bool,
 }
 
 impl JitConsts {
@@ -6306,10 +6313,11 @@ fn emit_read_fpr_w(ctx: &mut EmitCtx, reg: u32, fr_mode: FrMode) -> Value {
 }
 
 /// Write `value` (32-bit single/word bits) to `reg`. Mirrors
-/// `write_fpr_w_fr0`/`_fr1`: FR=0 must preserve the other half of the
-/// 64-bit slot (read-modify-write with a shift+mask); FR=1 stores the low
-/// 32 bits directly, leaving the slot's upper 32 bits untouched (matches
-/// `MipsCore::write_fpr_w`'s `(self.fpr[reg] & 0xFFFFFFFF_00000000) | value`).
+/// `write_fpr_w_fr0`/`_fr1`/`_fr1_zx`: FR=0 must preserve the other half of
+/// the 64-bit slot (read-modify-write with a shift+mask); FR=1 stores the low
+/// 32 bits, leaving the slot's upper 32 bits untouched (matches
+/// `MipsCore::write_fpr_w`'s `(self.fpr[reg] & 0xFFFFFFFF_00000000) | value`),
+/// or zeroing them on a part that does (`JitConsts::single_clears_upper`).
 fn emit_write_fpr_w(ctx: &mut EmitCtx, reg: u32, value: Value, fr_mode: FrMode) {
     let mem = MemFlagsData::trusted();
     match fr_mode {
@@ -6329,10 +6337,14 @@ fn emit_write_fpr_w(ctx: &mut EmitCtx, reg: u32, value: Value, fr_mode: FrMode) 
         }
         FrMode::Fr1 => {
             let off = ir::immediates::Offset32::new(core_offset_of_fpr(reg));
-            let slot = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
-            let masked = ctx.builder.ins().band_imm_s(slot, 0xFFFF_FFFF_0000_0000u64 as i64);
             let value_64 = ctx.builder.ins().uextend(ir::types::I64, value);
-            let result = ctx.builder.ins().bor(masked, value_64);
+            let result = if ctx.jit_consts.single_clears_upper {
+                value_64
+            } else {
+                let slot = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
+                let masked = ctx.builder.ins().band_imm_s(slot, 0xFFFF_FFFF_0000_0000u64 as i64);
+                ctx.builder.ins().bor(masked, value_64)
+            };
             ctx.builder.ins().store(mem, result, ctx.core_ptr, off);
         }
     }
@@ -8148,10 +8160,10 @@ fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// never touch FCSR — mirrors `exec_fabs_s`/`exec_fneg_s`/`exec_fmov_s`
 /// (and their `_d` counterparts) exactly: no `clear_fpu_status` call, no
 /// `fpu_update_fcsr` tail call, just the raw bit/value operation and a
-/// plain write. MOV additionally moves the full 64-bit register value via
-/// `fpr_read_l`/`fpr_write_l` even in S format (matches
-/// `exec_fmov_s`'s use of the `_l` accessors, not `_w`) — a straight
-/// register-to-register copy needs no width truncation either way.
+/// plain write. MOV.S moves the full 64-bit register value via
+/// `fpr_read_l`/`fpr_write_l` (matches `exec_fmov_s`), except on a part
+/// whose single results zero the upper word, where it moves the word like
+/// any other single result.
 fn emit_fabs_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -8189,13 +8201,20 @@ fn emit_fneg_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     emit_check_snan_operand(ctx, fs_bits, true, |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
 }
 fn emit_fmov_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    if ctx.jit_consts.single_clears_upper {
+        let fs = field_rd(ctx.raw);
+        let fd = field_sa(ctx.raw);
+        let value = emit_read_fpr_w(ctx, fs, fr_mode);
+        emit_write_fpr_w(ctx, fd, value, fr_mode);
+    } else {
+        emit_fmov_d(ctx, fr_mode);
+    }
+}
+fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let value = emit_read_fpr_l(ctx, fs, fr_mode);
     emit_write_fpr_l(ctx, fd, value, fr_mode);
-}
-fn emit_fmov_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    emit_fmov_s(ctx, fr_mode);
 }
 
 /// MOVCF.fmt fd, fs, cc, tf: fd = fs if FPU condition code `cc` == `tf`

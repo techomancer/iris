@@ -1848,7 +1848,7 @@ unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: CpuModel>(
     rm: u32,
 ) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
+    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
 }
 
 /// Single-implementation CVT.S.W/D.W/S.L/D.L — see `cvt_int_to_float_and_commit`'s
@@ -1863,7 +1863,7 @@ unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: CpuModel>(
     dst_f64: u32,
 ) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    cvt_int_to_float_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, src_i64 != 0, dst_f64 != 0) as u32
+    cvt_int_to_float_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, src_i64 != 0, dst_f64 != 0) as u32
 }
 
 /// Single-implementation CVT.S.D — see `cvt_d_to_s_and_commit`'s doc
@@ -1871,7 +1871,7 @@ unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: CpuModel>(
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, fs_reg: u32, fd_reg: u32, fr1: u32) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    cvt_d_to_s_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0) as u32
+    cvt_d_to_s_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER) as u32
 }
 
 /// Everything about an ADD/SUB/MUL/DIV that compiled code does not handle
@@ -1892,7 +1892,7 @@ unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_
 /// (bit 8), FR=1 (bit 9), fd (bits 10..14), fs (15..19) and ft (20..24).
 /// Returns true if the instruction traps.
 #[cfg(feature = "jitv2")]
-fn fpu_binop_commit(core: &mut MipsCore, op: u32, r: u64) -> bool {
+fn fpu_binop_commit(core: &mut MipsCore, op: u32, r: u64, clears_upper: bool) -> bool {
     let funct = op & 0x3F;
     let is_d = op & 0x100 != 0;
     let fr1 = op & 0x200 != 0;
@@ -1948,7 +1948,7 @@ fn fpu_binop_commit(core: &mut MipsCore, op: u32, r: u64) -> bool {
     match (is_d, fr1) {
         (true, true) => core.write_fpr_l(fd, bits),
         (true, false) => write_fpr_l_fr0(core, fd, bits),
-        (false, true) => core.write_fpr_w(fd, bits as u32),
+        (false, true) => write_fpr_w_fr1_for(core, clears_upper, fd, bits as u32),
         (false, false) => write_fpr_w_fr0(core, fd, bits as u32),
     }
     core.fpu_fcsr |= if denorm.is_some() { FCSR_FU | FCSR_FI } else { flags & FCSR_FM };
@@ -1956,9 +1956,9 @@ fn fpu_binop_commit(core: &mut MipsCore, op: u32, r: u64) -> bool {
 }
 
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_fpu_binop_commit(ctx: *mut core::ffi::c_void, op: u32, r: u64) -> u32 {
+unsafe extern "C" fn jit_fpu_binop_commit<C: CpuModel>(ctx: *mut core::ffi::c_void, op: u32, r: u64) -> u32 {
     let core = unsafe { &mut *core_from_arg(ctx) };
-    fpu_binop_commit(core, op, r) as u32
+    fpu_binop_commit(core, op, r, C::SINGLE_CLEARS_UPPER) as u32
 }
 
 /// Inline lockstep step hook (`core.lockstep_step_fn`), called by compiled code
@@ -2262,7 +2262,7 @@ fn cvt_f64_to_int_by_value(x: f64, dst_bits: u32) -> (u64, bool, bool) {
 /// encoding (0=nearest-even, 1=toward-zero, 2=toward+inf, 3=toward-inf) —
 /// callers pass a fixed mode for ROUND/TRUNC/CEIL/FLOOR or FCSR's live low
 /// 2 bits for plain CVT.W/CVT.L.
-fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
+fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
     let dst_bits = if dst_i64 { 64 } else { 32 };
     let (result, invalid, inexact) = if src_f64 {
         let bits = if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) };
@@ -2281,7 +2281,7 @@ fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
         if dst_i64 {
             if fr1 { core.write_fpr_l(fd_reg, result) } else { write_fpr_l_fr0(core, fd_reg, result) }
         } else if fr1 {
-            core.write_fpr_w(fd_reg, result as u32)
+            write_fpr_w_fr1_for(core, clears_upper, fd_reg, result as u32)
         } else {
             write_fpr_w_fr0(core, fd_reg, result as u32)
         }
@@ -2311,7 +2311,7 @@ fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
 /// MXCSR/FPSR race `cvt_to_int_and_commit`'s doc comment describes (found
 /// live in the opposite conversion direction; the same hazard applies here
 /// since `fcvt_from_sint` is just as real a hardware instruction).
-fn cvt_int_to_float_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, src_i64: bool, dst_f64: bool) -> bool {
+fn cvt_int_to_float_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, src_i64: bool, dst_f64: bool) -> bool {
     let src: i64 = if src_i64 {
         (if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) }) as i64
     } else {
@@ -2325,7 +2325,7 @@ fn cvt_int_to_float_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr
     } else {
         let result = src as f32;
         let bits = result.to_bits();
-        if fr1 { core.write_fpr_w(fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
+        if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
         (result as i64) != src
     };
     core.fpu_fcsr &= !FCSR_CM;
@@ -2350,7 +2350,7 @@ fn cvt_int_to_float_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr
 /// the magnitude exceeds `f32::MAX`, in which case the destination is
 /// infinity with the source's sign — matches Rust's own narrowing behavior
 /// for this case, so no manual saturation is needed, just cause reporting.
-fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool) -> bool {
+fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool) -> bool {
     let src = if fr1 { core.read_fpr_d(fs_reg) } else { read_fpr_d_fr0(core, fs_reg) };
     let result = src as f32;
     let overflow = result.is_infinite() && !src.is_infinite();
@@ -2358,7 +2358,7 @@ fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
     let bits = result.to_bits();
     core.fpu_fcsr &= !FCSR_CM;
     if !overflow && !inexact {
-        if fr1 { core.write_fpr_w(fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
+        if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
         return false;
     }
     // A NaN source never takes the path above (it is not equal to itself),
@@ -2370,7 +2370,7 @@ fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
         if core.fpu_fcsr & 0x800 != 0 { // Enable.V = bit 11
             return true;
         }
-        if fr1 { core.write_fpr_w(fd_reg, FPU_DEFAULT_NAN_S) } else { write_fpr_w_fr0(core, fd_reg, FPU_DEFAULT_NAN_S) }
+        if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, FPU_DEFAULT_NAN_S) } else { write_fpr_w_fr0(core, fd_reg, FPU_DEFAULT_NAN_S) }
         core.fpu_fcsr |= FCSR_FV;
         return false;
     }
@@ -2380,7 +2380,7 @@ fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
     if (core.fpu_fcsr & enable_bit) != 0 {
         return true;
     }
-    if fr1 { core.write_fpr_w(fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
+    if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
     core.fpu_fcsr |= if overflow { FCSR_FO } else { FCSR_FI };
     false
 }
@@ -3031,6 +3031,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 // Several CPUs share compiled code, so no one core's address.
                 core: if self.core.smp || std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
                 lwr_keeps_upper: C::PARTIAL_LWR_KEEPS_UPPER,
+                single_clears_upper: C::SINGLE_CLEARS_UPPER,
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -3112,7 +3113,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.fpu_cvt_to_int_fn = jit_cvt_to_int::<T, C>;
         self.core.fpu_cvt_int_to_float_fn = jit_cvt_int_to_float::<T, C>;
         self.core.fpu_cvt_d_to_s_fn = jit_cvt_d_to_s::<T, C>;
-        self.core.fpu_binop_commit_fn = jit_fpu_binop_commit;
+        self.core.fpu_binop_commit_fn = jit_fpu_binop_commit::<C>;
         #[cfg(feature = "jitv2_lockstep")]
         {
             self.core.lockstep_step_fn = jit_lockstep_step::<T, C>;
@@ -3667,7 +3668,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             read_fpr_d_fr0, write_fpr_d_fr0, read_fpr_l_fr0, write_fpr_l_fr0,
             read_fpr_w_fr0, write_fpr_w_fr0,
             read_fpr_d_fr1, write_fpr_d_fr1, read_fpr_l_fr1, write_fpr_l_fr1,
-            read_fpr_w_fr1, write_fpr_w_fr1,
+            read_fpr_w_fr1, write_fpr_w_fr1, write_fpr_w_fr1_zx,
         };
         if (self.core.cp0_status & STATUS_FR) != 0 {
             self.fpr_read_d  = read_fpr_d_fr1;
@@ -3675,7 +3676,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.fpr_read_l  = read_fpr_l_fr1;
             self.fpr_write_l = write_fpr_l_fr1;
             self.fpr_read_w  = read_fpr_w_fr1;
-            self.fpr_write_w = write_fpr_w_fr1;
+            self.fpr_write_w = if C::SINGLE_CLEARS_UPPER { write_fpr_w_fr1_zx } else { write_fpr_w_fr1 };
         } else {
             self.fpr_read_d  = read_fpr_d_fr0;
             self.fpr_write_d = write_fpr_d_fr0;
@@ -8390,8 +8391,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     fn exec_fmov_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        let value = (self.fpr_read_l)(&self.core, fs_reg);
-        (self.fpr_write_l)(&mut self.core, fd_reg, value);
+        if C::SINGLE_CLEARS_UPPER {
+            // A single result like any other: the word moves and, with FR
+            // set, the upper word is zeroed (`CpuModel::SINGLE_CLEARS_UPPER`).
+            let value = (self.fpr_read_w)(&self.core, fs_reg);
+            (self.fpr_write_w)(&mut self.core, fd_reg, value);
+        } else {
+            let value = (self.fpr_read_l)(&self.core, fs_reg);
+            (self.fpr_write_l)(&mut self.core, fd_reg, value);
+        }
         self.handle_exec_complete()
     }
     fn exec_fneg_s(&mut self, d: &DecodedInstr) -> ExecStatus {
@@ -8576,7 +8584,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn fpu_cvt_to_int(&mut self, fs_reg: u32, fd_reg: u32, src_f64: bool, dst_i64: bool, rm: u8) -> ExecStatus {
         let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
-        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, src_f64, dst_i64, rm) {
+        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, src_f64, dst_i64, rm) {
             let s = exec_exception(EXC_FPE);
             self.handle_exception(s)
         } else {
@@ -8587,7 +8595,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn fpu_cvt_int_to_float(&mut self, fs_reg: u32, fd_reg: u32, src_i64: bool, dst_f64: bool) -> ExecStatus {
         let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
-        if cvt_int_to_float_and_commit(&mut self.core, fs_reg, fd_reg, fr1, src_i64, dst_f64) {
+        if cvt_int_to_float_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, src_i64, dst_f64) {
             let s = exec_exception(EXC_FPE);
             self.handle_exception(s)
         } else {
@@ -8598,7 +8606,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn fpu_cvt_d_to_s(&mut self, fs_reg: u32, fd_reg: u32) -> ExecStatus {
         let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
-        if cvt_d_to_s_and_commit(&mut self.core, fs_reg, fd_reg, fr1) {
+        if cvt_d_to_s_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER) {
             let s = exec_exception(EXC_FPE);
             self.handle_exception(s)
         } else {
