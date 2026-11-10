@@ -171,6 +171,7 @@ pub(crate) fn connect_cpus(
             unsafe {
                 cpu.set_tcache_window(space.view_base(v));
                 cpu.set_cached_view(space, v);
+                cpu.set_tcache_shift(crate::ppmem::window_shift(space.window_size()));
                 #[cfg(feature = "jitv2")]
                 cpu.set_tcache_gen_window(bedrock.generation_base());
             }

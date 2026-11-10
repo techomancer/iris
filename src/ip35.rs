@@ -46,13 +46,14 @@ pub(crate) const RESET_WINDOW_FETCH: u64 = 0x2_0000_0000;
 /// can hold RAM, as far as its largest bank reaches, and the reset PROM.
 /// Which bank lands in which slot of a group of four depends on how the PROM
 /// programs the memory controller; the Fuel's two 256 MiB banks can be in any
-/// of the first four. Uncached fetches of the PROM's own code land in its
+/// of the first four, and a Tezro's banks 4 and 5 in any of the next four. Uncached fetches of the PROM's own code land in its
 /// range. A slot 0 larger than 508 MiB reaches the PROM's range, which the
 /// node maps over it, so its RAM is listed on either side.
 pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
     use crate::dev::bedrock::{BANK_SPAN, SLOTS};
     use crate::memory_map::{MemKind, MemRange, MemoryMap};
-    const NAMES: [&str; SLOTS] = ["ram slot 0", "ram slot 1", "ram slot 2", "ram slot 3"];
+    const NAMES: [&str; SLOTS] =
+        ["ram slot 0", "ram slot 1", "ram slot 2", "ram slot 3", "ram slot 4", "ram slot 5", "ram slot 6", "ram slot 7"];
     const PROM: (u64, u64) = (RESET_WINDOW, RESET_WINDOW + RESET_WINDOW_SIZE);
     let mut ranges = vec![MemRange::new("prom", MemKind::Rom, PROM.0, PROM.1)];
     for (slot, &name) in NAMES.iter().enumerate() {
