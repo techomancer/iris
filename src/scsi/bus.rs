@@ -53,8 +53,9 @@ pub trait ScsiTarget: Send {
 
     /// A SCSI bus reset reached this target, which owes the initiator a
     /// unit attention on its next command. The ISP12160 calls this when the
-    /// guest resets either of its buses; the WD33C93A, AIC-7880 and ISP1040
-    /// models never told their targets about a reset and still do not.
+    /// guest resets either of its buses, and the Fibre Channel adapter when
+    /// the host resets a loop, target or LUN; the WD33C93A, AIC-7880 and
+    /// ISP1040 models never told their targets about a reset and still do not.
     fn bus_reset(&mut self) {}
 
     /// The AIC-7880's bus reset: block size back to what that controller
@@ -155,6 +156,12 @@ impl ScsiBus {
     /// and a command.
     pub fn lock(&self) -> MutexGuard<'_, Targets> {
         self.targets.lock()
+    }
+
+    /// Take the table if no command holds it, for a controller that must not
+    /// wait for a disk.
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, Targets>> {
+        self.targets.try_lock()
     }
 
     /// Whether the table is held; for the lock registry.
@@ -401,6 +408,18 @@ mod tests {
         let r = b.request(3, &inquiry()).expect("target answers").unwrap();
         assert_eq!(&r.data[8..16], b"TEST    ");
         assert!(b.request(2, &inquiry()).is_none(), "an empty id does not answer");
+    }
+
+    /// A controller's register path can look at the bus while a command
+    /// holds it, and gets nothing rather than waiting.
+    #[test]
+    fn try_lock_gives_nothing_while_a_command_holds_the_bus() {
+        let b = bus(8);
+        assert!(b.try_lock().is_some());
+        let held = b.lock();
+        assert!(b.try_lock().is_none());
+        drop(held);
+        assert!(b.try_lock().is_some());
     }
 
     #[test]
