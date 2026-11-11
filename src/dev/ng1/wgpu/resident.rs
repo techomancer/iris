@@ -13,8 +13,9 @@ use parking_lot::Mutex;
 
 use crate::dev::ng1::rex3::{
     Rex3Context, DRAWMODE0_ADRMODE_A_LINE, DRAWMODE0_ADRMODE_F_LINE,
-    DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_LOGICOP_SRC,
-    OCTANT_XDEC, OCTANT_YDEC, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
+    DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_NOOP,
+    DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_LOGICOP_SRC, OCTANT_XDEC, OCTANT_YDEC,
+    REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
 use crate::dev::ng1::rex3_flat_fill::{
     prepare_resident_flat_fill, FillKind, FillPlane,
@@ -27,8 +28,9 @@ use super::command::{
     cid_test, COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE,
     COMMAND_COPY_A_LINE, COMMAND_COPY_BLOCK, COMMAND_COPY_F_LINE, COMMAND_COPY_I_LINE,
     COMMAND_COPY_SPAN, COMMAND_I_LINE, COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING,
-    FLAG_LINE_Y_MAJOR, FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
-    MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
+    FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_LINE_Y_MAJOR, FLAG_READ_AUX,
+    FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
+    MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
     STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
     STATE_COLOR_RED, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE, STATE_LINE_PATTERN,
     STATE_PATTERN_BITS, STATE_SLOPE_ALPHA, STATE_SLOPE_BLUE, STATE_SLOPE_GREEN,
@@ -833,6 +835,8 @@ impl ResidentGpu {
                 ("REX_FLAG_LINE_Y_MAJOR", FLAG_LINE_Y_MAJOR),
                 ("REX_FLAG_LINE_MAJOR_DECREASING", FLAG_LINE_MAJOR_DECREASING),
                 ("REX_FLAG_SHADED", FLAG_SHADED),
+                ("REX_FLAG_FILL_FIRST_ROW_COMPLETE", FLAG_FILL_FIRST_ROW_COMPLETE),
+                ("REX_FLAG_FILL_BLOCK", FLAG_FILL_BLOCK),
                 ("REX_OCTANT_XDEC", OCTANT_XDEC),
                 ("REX_OCTANT_YDEC", OCTANT_YDEC),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),
@@ -1237,8 +1241,19 @@ impl ResidentBackend for ResidentGpu {
 
     fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         self.gpu.check().map_err(gpu_error)?;
-        if context.drawmode0.opcode() == DRAWMODE0_OPCODE_SCR2SCR {
+        let opcode = context.drawmode0.opcode();
+        if opcode == DRAWMODE0_OPCODE_NOOP {
+            let position = self.progress.lock().next_position()?;
+            self.progress.lock().accept(position, None);
+            context.host_len = 1;
+            context.host_cursor = 0;
+            return Ok(());
+        }
+        if opcode == DRAWMODE0_OPCODE_SCR2SCR {
             return self.enqueue_copy(context);
+        }
+        if opcode != DRAWMODE0_OPCODE_DRAW {
+            return Err(ResidentError::Unsupported("opcode"));
         }
         if matches!(
             context.drawmode0.adrmode(),

@@ -14,7 +14,10 @@ use super::rex3::{
 use super::rex3_generic::{fastclear_color, ls_pattern_state_after, Mode};
 use super::rex3_shape;
 #[cfg(test)]
-use super::wgpu::shade::ShadeDda;
+use super::wgpu::{
+    fill_walk::{prepare_fill_walk, FillCompletion, FillOperation, FillWalkKind},
+    shade::ShadeDda,
+};
 
 #[cfg(test)]
 const RESIDENT_PAYLOAD_WORDS: u64 = 1024 * 1024 / size_of::<u32>() as u64;
@@ -49,8 +52,14 @@ pub(crate) struct FlatFill {
     pub(crate) height: u32,
     pub(crate) walker_x0: i32,
     pub(crate) walker_y0: i32,
+    pub(crate) walker_xsave: i32,
     pub(crate) walker_x1: i32,
     pub(crate) walker_y1: i32,
+    pub(crate) walker_block: bool,
+    pub(crate) first_row_visits: u32,
+    pub(crate) full_row_visits: u32,
+    pub(crate) rows: u32,
+    pub(crate) first_row_complete: bool,
     pub(crate) color: u32,
     pub(crate) write_mask: u32,
 }
@@ -59,6 +68,8 @@ pub(crate) struct FlatFill {
 enum ContextAdvance {
     Block { xsave: i32, y_after: i32 },
     Span { xend: i32 },
+    #[cfg(test)]
+    Resident(FillCompletion),
 }
 
 /// A matched GO and its context completion, prepared once after setup.
@@ -105,6 +116,11 @@ impl PreparedFlatFill {
             ContextAdvance::Span { xend } => {
                 context.xstart = xend + (1 << 11);
             }
+            #[cfg(test)]
+            ContextAdvance::Resident(completion) => {
+                completion.apply(context);
+                return;
+            }
         }
         context.pat_bit = 31;
         context.zpat_bit = 31;
@@ -129,7 +145,85 @@ pub(crate) fn prepare_flat_fill(context: &Rex3Context) -> Result<PreparedFlatFil
 pub(crate) fn prepare_resident_flat_fill(
     context: &Rex3Context,
 ) -> Result<PreparedFlatFill, &'static str> {
-    prepare(context, true)
+    let walk = prepare_fill_walk(context, FillOperation::Draw)?;
+    let mode = rex3_shape::unpack(
+        context.drawmode0.0,
+        context.drawmode1.0,
+        context.clipmode,
+    );
+    let fast_clear = mode.fastclear() != 0;
+    let completion = walk.completion(
+        context,
+        mode.enzpattern() != 0,
+        mode.enlspattern() != 0,
+    );
+    let fill = if walk.writes_possible(context) {
+        let color = if fast_clear {
+            fastclear_color(context, &mode)
+        } else {
+            (context.get_colori() & 0x00ff_ffff)
+                | (Rex3Context::clamp_color_component(context.coloralpha) << 24)
+        };
+        Some(FlatFill {
+            kind: if fast_clear {
+                FillKind::Clear
+            } else if walk.kind == FillWalkKind::Block {
+                FillKind::Block
+            } else {
+                FillKind::Span
+            },
+            plane: walk.plane.expect("writeable fill has a plane"),
+            min_x: walk.min_x as u32,
+            min_y: walk.min_y as u32,
+            width: (walk.max_x - walk.min_x + 1) as u32,
+            height: (walk.max_y - walk.min_y + 1) as u32,
+            walker_x0: walk.walker_x0,
+            walker_y0: walk.walker_y0,
+            walker_xsave: walk.walker_xsave,
+            walker_x1: walk.walker_x1,
+            walker_y1: walk.walker_y1,
+            walker_block: walk.kind == FillWalkKind::Block,
+            first_row_visits: walk.first_row_visits,
+            full_row_visits: walk.full_row_visits,
+            rows: walk.rows,
+            first_row_complete: walk.first_row_complete,
+            color,
+            write_mask: context.wrmask,
+        })
+    } else {
+        None
+    };
+    let (shade_payload, final_shade) = if mode.shade() != 0 {
+        let mut shade = ShadeDda::from_context(context);
+        let payload_words = walk
+            .visits
+            .checked_add(31)
+            .and_then(|pixels| pixels.checked_div(32))
+            .and_then(|checkpoints| checkpoints.checked_mul(4))
+            .ok_or("shade payload length")?;
+        if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
+            return Err("shade payload length");
+        }
+        let mut payload = fill.map(|_| Vec::with_capacity(payload_words as usize));
+        for index in 0..walk.visits {
+            if index & 31 == 0 {
+                if let Some(payload) = payload.as_mut() {
+                    payload.extend_from_slice(&shade.components());
+                }
+            }
+            shade.advance();
+        }
+        (payload, Some(shade))
+    } else {
+        (None, None)
+    };
+    Ok(PreparedFlatFill {
+        fill,
+        advance: ContextAdvance::Resident(completion),
+        final_lsrcount: None,
+        shade_payload,
+        final_shade,
+    })
 }
 
 fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &'static str> {
@@ -284,6 +378,8 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     let max_x = x0.max(x1).min(REX3_SCREEN_WIDTH - 1);
     let min_y = y0.min(y1).max(0);
     let max_y = y0.max(y1).min(REX3_SCREEN_HEIGHT - 1);
+    let pixel_width = i64::from(walker_x1).abs_diff(i64::from(walker_x0)) + 1;
+    let pixel_height = i64::from(walker_y1).abs_diff(i64::from(walker_y0)) + 1;
     let fill = if min_x > max_x || min_y > max_y || context.wrmask == 0 {
         None
     } else {
@@ -310,8 +406,14 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
             height: (max_y - min_y + 1) as u32,
             walker_x0,
             walker_y0,
+            walker_xsave: context.xsave >> 11,
             walker_x1,
             walker_y1,
+            walker_block: block,
+            first_row_visits: pixel_width as u32,
+            full_row_visits: pixel_width as u32,
+            rows: pixel_height as u32,
+            first_row_complete: true,
             color,
             write_mask: context.wrmask,
         })
@@ -324,8 +426,6 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     } else {
         ContextAdvance::Span { xend: context.xend }
     };
-    let pixel_width = i64::from(walker_x1).abs_diff(i64::from(walker_x0)) + 1;
-    let pixel_height = i64::from(walker_y1).abs_diff(i64::from(walker_y0)) + 1;
     let pattern_advances = pixel_width
         .checked_mul(pixel_height)
         .ok_or("pattern length")?;
@@ -583,8 +683,14 @@ mod tests {
                     height: 1,
                     walker_x0: 1342 + REX3_COORD_BIAS,
                     walker_y0: 1023 + REX3_COORD_BIAS,
+                    walker_xsave: 1342 + REX3_COORD_BIAS,
                     walker_x1: 1350 + REX3_COORD_BIAS,
                     walker_y1: 1028 + REX3_COORD_BIAS,
+                    walker_block: true,
+                    first_row_visits: 9,
+                    full_row_visits: 9,
+                    rows: 6,
+                    first_row_complete: true,
                     color: 0x7A33_2211,
                     write_mask: 0xAA00_00FF,
                 })

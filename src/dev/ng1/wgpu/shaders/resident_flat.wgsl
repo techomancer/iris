@@ -432,18 +432,77 @@ struct PatternResult {
     background: bool,
 }
 
-fn sequence_mod(row: u32, width: u32, column: u32, modulus: u32) -> u32 {
-    return (
-        (row % modulus) * (width % modulus)
-        + column % modulus
-    ) % modulus;
+struct FillPosition {
+    covered: bool,
+    row: u32,
+    column: u32,
+    index: u32,
+    last: bool,
 }
 
-fn sequence_capped(row: u32, width: u32, column: u32) -> u32 {
-    let row_part = min(row, 256u);
-    let width_part = min(width, 256u);
-    let base = min(row_part * width_part, 256u);
-    return min(base + min(column, 256u), 256u);
+fn fill_position(
+    state: RexStateSlot,
+    command: RexCommand,
+    px: i32,
+    py: i32,
+) -> FillPosition {
+    let mode = state.words[REX_STATE_DRAW_MODE0];
+    let octant = (state.words[34] >> 24u) & 7u;
+    let block = (command.flags & REX_FLAG_FILL_BLOCK) != 0u;
+    let x_decreasing = block && (octant & REX_OCTANT_XDEC) != 0u;
+    let y_decreasing = block && (octant & REX_OCTANT_YDEC) != 0u;
+    let y_stride = select(1u, 2u, block && ((mode >> 23u) & 1u) != 0u);
+    let walker = walker_position(state, px, py);
+    let y_delta = select(
+        walker.y - command.src_y0,
+        command.src_y0 - walker.y,
+        y_decreasing,
+    );
+    if y_delta < 0 || u32(y_delta) % y_stride != 0u {
+        return FillPosition(false, 0u, 0u, 0u, false);
+    }
+    let row = u32(y_delta) / y_stride;
+    let rows = u32(abs(command.src_y1 - command.src_y0)) / y_stride + 1u;
+    if row >= rows {
+        return FillPosition(false, 0u, 0u, 0u, false);
+    }
+    let first_width = command.data[1];
+    let full_width = command.data[2];
+    let width = select(first_width, full_width, row > 0u);
+    let row_start = select(command.src_x0, bitcast<i32>(command.data[0]), row > 0u);
+    let x_delta = select(
+        walker.x - row_start,
+        row_start - walker.x,
+        x_decreasing,
+    );
+    if x_delta < 0 || u32(x_delta) >= width {
+        return FillPosition(false, 0u, 0u, 0u, false);
+    }
+    let column = u32(x_delta);
+    var before_row = 0u;
+    if row > 0u {
+        before_row = first_width + (row - 1u) * full_width;
+    }
+    let first_complete =
+        (command.flags & REX_FLAG_FILL_FIRST_ROW_COMPLETE) != 0u;
+    let last = column + 1u == width && (row > 0u || first_complete);
+    let skip_first = ((mode >> 10u) & 1u) != 0u;
+    let skip_last = ((mode >> 11u) & 1u) != 0u;
+    let lr_skip = block
+        && ((mode >> 19u) & 1u) != 0u
+        && x_decreasing;
+    let suppressed = select(
+        (column == 0u && skip_first) || (last && skip_last),
+        skip_first || (last && skip_last) || lr_skip,
+        block,
+    );
+    return FillPosition(
+        !suppressed,
+        row,
+        column,
+        before_row + column,
+        last,
+    );
 }
 
 fn line_pattern_state_after(
@@ -529,11 +588,7 @@ fn shade_source(
         let major = select(px, py, y_major);
         index = u32(select(major - command.src_x0, command.src_x0 - major, decreasing));
     } else {
-        let walker = walker_position(state, px, py);
-        let column = u32(abs(walker.x - command.src_x0));
-        let row = u32(abs(walker.y - command.src_y0));
-        let width = u32(abs(command.src_x1 - command.src_x0)) + 1u;
-        index = row * width + column;
+        index = fill_position(state, command, px, py).index;
     }
     let line_words = select(0u, command.payload_words, line);
     let checkpoint = command.payload_offset + line_words + (index >> 5u) * 4u;
@@ -566,8 +621,7 @@ fn shade_source(
 fn fill_pattern(
     state: RexStateSlot,
     command: RexCommand,
-    px: i32,
-    py: i32,
+    position: FillPosition,
 ) -> PatternResult {
     let mode = state.words[REX_STATE_DRAW_MODE0];
     let z_enabled = ((mode >> 12u) & 1u) != 0u;
@@ -576,10 +630,8 @@ fn fill_pattern(
         return PatternResult(true, false);
     }
 
-    let walker = walker_position(state, px, py);
-    let column = u32(abs(walker.x - command.src_x0));
-    let row = u32(abs(walker.y - command.src_y0));
-    let width = u32(abs(command.src_x1 - command.src_x0)) + 1u;
+    let column = position.column;
+    let row = position.row;
     var background = false;
 
     if z_enabled {
@@ -601,8 +653,9 @@ fn fill_pattern(
         let repeat = max((line_mode >> 8u) & 0xffu, 1u);
         let length = ((line_mode >> 24u) & 0xffu) + 17u;
         let cycle = repeat * length;
-        let row_advances_mod = sequence_mod(row, width, 0u, cycle);
-        let row_advances_capped = sequence_capped(row, width, 0u);
+        let before_row = position.index - column;
+        let row_advances_mod = before_row % cycle;
+        let row_advances_capped = min(before_row, 256u);
         let row_state = line_pattern_state_after(
             initial_count,
             repeat,
@@ -779,30 +832,30 @@ fn copy_fill(state: RexStateSlot, command: RexCommand) {
         && ((mode >> 19u) & 1u) != 0u
         && (octant & REX_OCTANT_XDEC) != 0u;
 
-    var y = command.src_y0;
-    loop {
-        var x = command.src_x0;
-        var first = true;
-        loop {
-            let last = x == command.src_x1;
+    let y_stride = u32(abs(y_step));
+    let rows = u32(abs(command.src_y1 - command.src_y0)) / y_stride + 1u;
+    for (var row = 0u; row < rows; row++) {
+        let row_start = select(
+            command.src_x0,
+            bitcast<i32>(command.data[0]),
+            row > 0u,
+        );
+        let width = select(command.data[1], command.data[2], row > 0u);
+        let row_complete = row > 0u
+            || (command.flags & REX_FLAG_FILL_FIRST_ROW_COMPLETE) != 0u;
+        let y = command.src_y0 + i32(row) * y_step;
+        for (var column = 0u; column < width; column++) {
+            let x = row_start + i32(column) * x_step;
+            let last = column + 1u == width && row_complete;
             let suppressed = select(
-                (first && skip_first) || (last && skip_last),
+                (column == 0u && skip_first) || (last && skip_last),
                 skip_first || (last && skip_last) || lr_skip,
                 block,
             );
             if !suppressed {
                 copy_pixel(state, command, vec2<i32>(x, y));
             }
-            if last {
-                break;
-            }
-            x += x_step;
-            first = false;
         }
-        if !block || y == command.src_y1 {
-            break;
-        }
-        y += y_step;
     }
 }
 
@@ -864,13 +917,17 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
     let line = command.kind == REX_COMMAND_I_LINE
         || command.kind == REX_COMMAND_F_LINE
         || command.kind == REX_COMMAND_A_LINE;
-    var covered = fill;
+    var covered = false;
     var use_background = false;
     let state = states[command.state_slot];
-    if fill && command.kind != REX_COMMAND_CLEAR {
-        let pattern = fill_pattern(state, command, px, py);
-        covered = pattern.draws;
-        use_background = pattern.background;
+    if fill {
+        let position = fill_position(state, command, px, py);
+        covered = position.covered;
+        if covered && command.kind != REX_COMMAND_CLEAR {
+            let pattern = fill_pattern(state, command, position);
+            covered = pattern.draws;
+            use_background = pattern.background;
+        }
     }
     if line {
         let y_major = (command.flags & REX_FLAG_LINE_Y_MAJOR) != 0u;

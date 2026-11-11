@@ -31,6 +31,8 @@ pub(super) const FLAG_BARRIER_AFTER: u32 = 1 << 5;
 pub(super) const FLAG_LINE_Y_MAJOR: u32 = 1 << 6;
 pub(super) const FLAG_LINE_MAJOR_DECREASING: u32 = 1 << 7;
 pub(super) const FLAG_SHADED: u32 = 1 << 8;
+pub(super) const FLAG_FILL_FIRST_ROW_COMPLETE: u32 = 1 << 9;
+pub(super) const FLAG_FILL_BLOCK: u32 = 1 << 10;
 
 pub(super) const STATE_WORDS: usize = 64;
 pub(super) const STATE_DRAW_MODE0: usize = 0;
@@ -113,6 +115,12 @@ impl RexCommand {
         if shaded {
             flags |= FLAG_SHADED;
         }
+        if fill.first_row_complete {
+            flags |= FLAG_FILL_FIRST_ROW_COMPLETE;
+        }
+        if fill.walker_block {
+            flags |= FLAG_FILL_BLOCK;
+        }
         Self {
             kind,
             state_slot,
@@ -127,6 +135,11 @@ impl RexCommand {
             src_y0: fill.walker_y0,
             src_x1: fill.walker_x1,
             src_y1: fill.walker_y1,
+            data: [
+                fill.walker_xsave as u32,
+                fill.first_row_visits,
+                fill.full_row_visits,
+            ],
             ..Self::default()
         }
     }
@@ -198,6 +211,12 @@ impl RexCommand {
         if cid_test {
             flags |= FLAG_READ_AUX;
         }
+        if fill.first_row_complete {
+            flags |= FLAG_FILL_FIRST_ROW_COMPLETE;
+        }
+        if fill.kind == CopyKind::Block {
+            flags |= FLAG_FILL_BLOCK;
+        }
         Self {
             kind,
             state_slot,
@@ -210,6 +229,11 @@ impl RexCommand {
             src_y0: fill.walker_y0,
             src_x1: fill.walker_x1,
             src_y1: fill.walker_y1,
+            data: [
+                fill.walker_xsave as u32,
+                fill.first_row_visits,
+                fill.full_row_visits,
+            ],
             ..Self::default()
         }
     }
@@ -493,8 +517,14 @@ mod tests {
             height: 19,
             walker_x0: 101,
             walker_y0: 103,
+            walker_xsave: 97,
             walker_x1: 117,
             walker_y1: 121,
+            walker_block: true,
+            first_row_visits: 17,
+            full_row_visits: 21,
+            rows: 19,
+            first_row_complete: true,
             color: 0x1234_5678,
             write_mask: 0xa5a5_5a5a,
         }
@@ -511,8 +541,10 @@ mod tests {
                 | FLAG_BARRIER_AFTER
                 | FLAG_LINE_Y_MAJOR
                 | FLAG_LINE_MAJOR_DECREASING
-                | FLAG_SHADED,
-            0x1ff,
+                | FLAG_SHADED
+                | FLAG_FILL_FIRST_ROW_COMPLETE
+                | FLAG_FILL_BLOCK,
+            0x7ff,
         );
         assert_eq!(size_of::<RexCommand>(), 16 * size_of::<u32>());
         assert_eq!(std::mem::offset_of!(RexCommand, state_slot), 4);
@@ -556,7 +588,10 @@ mod tests {
                 RexCommand::flat_fill(23, fill, PayloadRef::EMPTY, false, false, false);
             assert_eq!(command.kind, COMMAND_CLEAR);
             assert_eq!(command.state_slot, 23);
-            assert_eq!(command.flags, FLAG_WRITE_AUX);
+            assert_eq!(
+                command.flags,
+                FLAG_WRITE_AUX | FLAG_FILL_FIRST_ROW_COMPLETE | FLAG_FILL_BLOCK
+            );
             assert_eq!(
                 (
                     command.dst_x0,
@@ -569,13 +604,27 @@ mod tests {
             assert_eq!(command.payload(), PayloadRef::EMPTY);
             assert_eq!(
                 RexCommand::flat_fill(23, fill, PayloadRef::EMPTY, false, true, false).flags,
-                FLAG_WRITE_AUX | FLAG_READ_AUX,
+                FLAG_WRITE_AUX
+                    | FLAG_READ_AUX
+                    | FLAG_FILL_FIRST_ROW_COMPLETE
+                    | FLAG_FILL_BLOCK,
             );
             let mut rgb_fill = fill;
             rgb_fill.plane = FillPlane::Rgb;
             assert_eq!(
                 RexCommand::flat_fill(23, rgb_fill, PayloadRef::EMPTY, false, false, true).flags,
-                FLAG_WRITE_RGB | FLAG_READ_RGB,
+                FLAG_WRITE_RGB
+                    | FLAG_READ_RGB
+                    | FLAG_FILL_FIRST_ROW_COMPLETE
+                    | FLAG_FILL_BLOCK,
+            );
+            assert_eq!(
+                command.data,
+                [
+                    fill.walker_xsave as u32,
+                    fill.first_row_visits,
+                    fill.full_row_visits,
+                ],
             );
             assert_eq!(
                 (

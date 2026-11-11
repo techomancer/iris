@@ -2,15 +2,16 @@ use super::*;
 use crate::dev::ng1::rex3::{
     DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_BLOCK_SH,
     DRAWMODE0_ADRMODE_F_LINE_SH, DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE0_ADRMODE_SPAN_SH,
-    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_READ, DRAWMODE0_OPCODE_SCR2SCR,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_NOOP, DRAWMODE0_OPCODE_READ,
+    DRAWMODE0_OPCODE_SCR2SCR,
     DRAWMODE1_COMPARE_DISABLE_SH,
     DRAWMODE1_COMPARE_GT, DRAWMODE1_COMPARE_SHIFT, DRAWMODE1_DRAWDEPTH_4,
     DRAWMODE1_DRAWDEPTH_8, DRAWMODE1_DRAWDEPTH_12, DRAWMODE1_DRAWDEPTH_24,
     DRAWMODE1_LOGICOP_AND_SH, DRAWMODE1_LOGICOP_MASK, DRAWMODE1_LOGICOP_NOR_SH,
     DRAWMODE1_LOGICOP_NSRC_SH, DRAWMODE1_LOGICOP_OR_SH, DRAWMODE1_LOGICOP_SRC_SH,
     DRAWMODE1_LOGICOP_XNOR_SH, DRAWMODE1_LOGICOP_XOR_SH, DRAWMODE1_PLANES_CID,
-    DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB,
-    DRAWMODE1_PLANES_RGBA,
+    DRAWMODE1_PLANES_NONE, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP,
+    DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_SMASK0, GFIFO_DISP_SYNC, HOSTRW_BUF_QWORDS, REX3_BASE, REX3_CLIPMODE, REX3_COLORALPHA,
     REX3_COLORBLUE, REX3_COLORGRN, REX3_COLORRED, REX3_COORD_BIAS, REX3_DRAWMODE0,
     REX3_DRAWMODE1, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
@@ -885,7 +886,10 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
         );
         unsupported.drawmode0.0 |= 1 << 6;
         let unchanged = unsupported;
-        assert_eq!(resident.enqueue(&mut unsupported), Err(ResidentError::Unsupported("draw mode 0")));
+        assert_eq!(
+            resident.enqueue(&mut unsupported),
+            Err(ResidentError::Unsupported("host transfer"))
+        );
         assert_context_eq(&unsupported, &unchanged, "rejected host-color mode");
         let status = resident.status().unwrap();
         assert_eq!(status.accepted, before_rejection.accepted);
@@ -1833,6 +1837,336 @@ fn resident_gpu_screen_copies_match_complete_cpu_planes() {
         compare_observed(observed.rgb().unwrap(), &expected_rgb, "copied RGB");
         compare_observed(observed.aux().unwrap(), &expected_aux, "copied aux");
         assert!(resident.payload.is_empty(), "copy submission drained line payload");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_continuation_and_noop_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x6d31_a7c5);
+        let seed_aux = seeded_plane(0x92ce_583a);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .expect("activate continuation resident planes");
+
+        macro_rules! run_steps {
+            ($label:expr, $context:expr, $steps:expr) => {{
+                let mut actual = $context;
+                let mut expected = actual;
+                for step in 0..$steps {
+                    resident
+                        .enqueue(&mut actual)
+                        .unwrap_or_else(|error| panic!("{} step {step}: {error}", $label));
+                    cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+                    assert_context_eq(
+                        &actual,
+                        &expected,
+                        &format!("{} step {step}", $label),
+                    );
+                }
+            }};
+        }
+
+        let advancing_block = |x: i32, y: i32, stops: u32| {
+            let mut draw = context(
+                DRAWMODE1_PLANES_RGB,
+                true,
+                false,
+                (x, y),
+                (x + 1, y + 1),
+                0x00ff_ffff,
+                0,
+            );
+            draw.drawmode0.0 &= !((1 << 8) | (1 << 9));
+            draw.drawmode0.0 |= stops | (1 << 12) | (1 << 13) | (1 << 18);
+            draw.zpattern = u32::MAX;
+            draw.lspattern = u32::MAX;
+            draw.lsmode.set_lsrcount(2);
+            draw.lsmode.set_lsrepeat(3);
+            draw.lsmode.set_lslength(5);
+            draw.colorred = 0x0001_8123;
+            draw.colorgrn = 0x0002_9345;
+            draw.colorblue = 0x0003_a567;
+            draw.coloralpha = 0x0004_b789;
+            draw.slopered = 0x0000_0101;
+            draw.slopegrn = 0x0000_0203;
+            draw.slopeblue = -0x0000_0305;
+            draw.slopealpha = 0x0000_0407;
+            draw
+        };
+        run_steps!("block single-step rows", advancing_block(20, 40, 0), 4);
+        run_steps!("block row-at-a-time", advancing_block(30, 50, 1 << 8), 2);
+        run_steps!("block stop-on-y single-step", advancing_block(40, 60, 1 << 9), 4);
+        run_steps!(
+            "block complete",
+            advancing_block(50, 70, (1 << 8) | (1 << 9)),
+            1
+        );
+
+        let mut partial = advancing_block(270, 300, (1 << 8) | (1 << 9));
+        partial.xsave = (260 + REX3_COORD_BIAS) << 11;
+        partial.yend = (302 + REX3_COORD_BIAS) << 11;
+        partial.mid_primitive = true;
+        run_steps!("partial first block row", partial, 1);
+
+        let mut reverse_stride = context(
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            false,
+            (360, 340),
+            (356, 334),
+            0x00ff_ff00,
+            0x8a4c_2e17,
+        );
+        reverse_stride.bresoctinc1.set_octant(
+            crate::dev::ng1::rex3::OCTANT_XDEC
+                | crate::dev::ng1::rex3::OCTANT_YDEC,
+        );
+        reverse_stride.drawmode0.0 |= 1 << 23;
+        run_steps!("reverse YSTRIDE block", reverse_stride, 1);
+
+        let mut length_span = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (410, 370),
+            (455, 370),
+            0xffff_00ff,
+            0x8f63_4127,
+        );
+        length_span.drawmode0.0 |= 1 << 15;
+        run_steps!("LENGTH32 span", length_span, 2);
+
+        let mut fractional_span = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (470, 390),
+            (475, 390),
+            0x00ff_ffff,
+            0x9a74_5213,
+        );
+        fractional_span.xstart += 7 * 128;
+        fractional_span.xsave = fractional_span.xstart;
+        fractional_span.xend += 3 * 128;
+        fractional_span.ystart += 5 * 128;
+        run_steps!("fractional span endpoints", fractional_span, 1);
+
+        let mut no_plane = advancing_block(500, 400, (1 << 8) | (1 << 9));
+        no_plane.drawmode1.0 =
+            (no_plane.drawmode1.0 & !7) | DRAWMODE1_PLANES_NONE;
+        run_steps!("no-plane state advancement", no_plane, 1);
+
+        for (index, shape) in [
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = 560 + index as i32 * 24;
+            let mut line = line_context(
+                shape,
+                DRAWMODE1_PLANES_RGB,
+                true,
+                (x * 16 + 3, 440 * 16 + 5),
+                ((x + 5) * 16 + 9, 440 * 16 + 11),
+                0x00ff_ffff,
+                0x9b75_4312 ^ index as u32,
+            );
+            line.drawmode0.0 &= !((1 << 8) | (1 << 9));
+            line.drawmode0.0 |= (1 << 10) | (1 << 11);
+            run_steps!(&format!("single-step line {index}"), line, 6);
+        }
+
+        let mut length_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_CID,
+            false,
+            (640 * 16, 480 * 16),
+            (685 * 16, 480 * 16),
+            0x0000_0033,
+            3,
+        );
+        length_line.drawmode0.0 |= 1 << 15;
+        run_steps!("LENGTH32 integer line", length_line, 2);
+
+        let mut copy_span = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (720, 520),
+            (765, 520),
+            0x00ff_ffff,
+            0,
+        );
+        copy_span.drawmode0.0 =
+            (copy_span.drawmode0.0 & !3) | DRAWMODE0_OPCODE_SCR2SCR | (1 << 15);
+        copy_span.xymove = 1 << 16;
+        run_steps!("overlapping LENGTH32 copy span", copy_span, 2);
+
+        let mut fractional_copy = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            true,
+            (780, 540),
+            (785, 540),
+            0x00ff_ffff,
+            0,
+        );
+        fractional_copy.drawmode0.0 =
+            (fractional_copy.drawmode0.0 & !3) | DRAWMODE0_OPCODE_SCR2SCR;
+        fractional_copy.xstart += 11 * 128;
+        fractional_copy.xsave = fractional_copy.xstart;
+        fractional_copy.xend += 2 * 128;
+        fractional_copy.xymove = (-1i16 as u16 as u32) << 16;
+        run_steps!("fractional copy span endpoints", fractional_copy, 1);
+
+        let mut copy_rows = context(
+            DRAWMODE1_PLANES_PUP,
+            false,
+            false,
+            (820, 560),
+            (827, 561),
+            0x0000_00cc,
+            0,
+        );
+        copy_rows.drawmode0.0 =
+            (copy_rows.drawmode0.0 & !3 & !(1 << 9)) | DRAWMODE0_OPCODE_SCR2SCR;
+        copy_rows.xymove = 1;
+        run_steps!("row-at-a-time copy block", copy_rows, 2);
+
+        let mut noop = advancing_block(900, 600, (1 << 8) | (1 << 9));
+        noop.drawmode0.0 = (noop.drawmode0.0 & !3) | DRAWMODE0_OPCODE_NOOP;
+        let mut expected_noop = noop;
+        resident.enqueue(&mut noop).expect("accept NOOP");
+        cpu_draw(
+            &mut expected_noop,
+            &mut expected_rgb,
+            &mut expected_aux,
+        );
+        assert_context_eq(&noop, &expected_noop, "direct NOOP");
+
+        let observed = resident
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe continuation planes");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "continuation RGB",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "continuation aux",
+        );
+
+        let outer_rgb = seeded_plane(0x14b8_6c2f);
+        let outer_aux = seeded_plane(0xeb47_93d0);
+        let mut resident_board =
+            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut cpu_board =
+            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        for board in [&mut resident_board, &mut cpu_board] {
+            board.0.fb_rgb.get_mut().copy_from_slice(&outer_rgb);
+            board.0.fb_aux.get_mut().copy_from_slice(&outer_aux);
+        }
+        #[cfg(feature = "rex-jit")]
+        cpu_board.0.jit_enabled.store(false, Ordering::Relaxed);
+        let outer_resident = Arc::new(Mutex::new(
+            ResidentGpu::activate_with_limits(
+                Arc::clone(&gpu),
+                &outer_rgb,
+                &outer_aux,
+                1,
+                NonZeroUsize::new(1).unwrap(),
+                None,
+            )
+            .unwrap(),
+        ));
+        resident_board
+            .0
+            .attach_resident_raster(SharedResident(Arc::clone(&outer_resident)))
+            .unwrap();
+
+        let mut armed = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (1000, 700),
+            (1001, 701),
+            0x00ff_ffff,
+            0xb583_6142,
+        );
+        armed.host_len = 2;
+        armed.host_cursor = 0;
+        armed.hostcnt = 7;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let host = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = armed;
+            board.0.context.get_mut().host = host;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "armed non-host retry",
+        );
+
+        let mut armed_noop = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (1040 * 16 + 3, 740 * 16 + 5),
+            (1047 * 16 + 11, 744 * 16 + 7),
+            0x00ff_ffff,
+            0,
+        );
+        armed_noop.drawmode0.0 =
+            (armed_noop.drawmode0.0 & !3) | DRAWMODE0_OPCODE_NOOP | (1 << 5);
+        armed_noop.host_len = 2;
+        armed_noop.host_cursor = 0;
+        armed_noop.hostcnt = 9;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let host = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = armed_noop;
+            board.0.context.get_mut().host = host;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "armed NOOP retry",
+        );
+        let mut backend = outer_resident.lock();
+        let outer_observed = backend
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe armed retry planes");
+        compare_observed(
+            outer_observed.rgb().unwrap(),
+            unsafe { &*cpu_board.0.fb_rgb.get() },
+            "armed retry RGB",
+        );
+        compare_observed(
+            outer_observed.aux().unwrap(),
+            unsafe { &*cpu_board.0.fb_aux.get() },
+            "armed retry aux",
+        );
+        assert_eq!(backend.status().unwrap().accepted.sequence, Sequence(4));
         gpu.check().unwrap();
     });
 }
