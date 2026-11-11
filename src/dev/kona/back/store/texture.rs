@@ -38,6 +38,8 @@
 //!
 //! The producer (`kona-hip`) writes only after the tiles are drained, and a draw's workers only
 //! read, so a plane may change under `UnsafeCell` without a lock: no reader runs while it changes.
+//! The mutators belong to `Exclusive`, which only an `unsafe` call on the store makes, so the
+//! drain is a promise written at the call, not something each caller remembers.
 
 use crate::dev::kona::defs::CONTEXT_SLOTS;
 use std::cell::UnsafeCell;
@@ -180,73 +182,6 @@ impl TextureStore {
         st.resident + missing <= self.cap_pages
     }
 
-    /// Zero the `n` words of plane `plane` from `from`. A page the range covers is given back, a page it
-    /// part covers is zeroed in the range, and none is made. A range past the bank is cut at its end
-    /// (`contains` is the caller's check). Call only with the tiles drained.
-    pub fn clear(&self, plane: u16, from: u32, n: usize) {
-        // SAFETY: no reader runs (the caller drained the tiles).
-        let st = unsafe { &mut *self.inner.get() };
-        let end = (from as usize + n).min(self.bank_words());
-        let from = from as usize;
-        let Some(pl) = st.planes.get_mut(plane as usize).filter(|_| from < end) else { return };
-        let mut freed = 0;
-        for pg in from >> PAGE_SHIFT..=(end - 1) >> PAGE_SHIFT {
-            let (lo, hi) = (pg << PAGE_SHIFT, (pg + 1) << PAGE_SHIFT);
-            let Some(slot) = pl.pages.get_mut(pg) else { break };
-            if from <= lo && hi <= end {
-                freed += slot.take().is_some() as usize;
-            } else if let Some(p) = slot {
-                p[from.max(lo) - lo..end.min(hi) - lo].fill(0);
-            }
-        }
-        pl.trim();
-        st.resident -= freed;
-    }
-
-    /// Give plane `plane` back: its words are gone and its memory is returned. Call only with the tiles drained.
-    pub fn drop_plane(&self, plane: u16) {
-        // SAFETY: as for `clear`.
-        let st = unsafe { &mut *self.inner.get() };
-        if let Some(pl) = st.planes.get_mut(plane as usize) {
-            st.resident -= pl.held();
-            pl.pages = Vec::new();
-        }
-    }
-
-    /// Write word `at` of plane `plane`. False when the word is not written: past the bank, or the page it
-    /// needs would pass the ceiling. A zero into a page that is not held writes nothing and is true. Call only
-    /// with the tiles drained.
-    pub fn set(&self, plane: u16, at: u32, v: u32) -> bool {
-        // SAFETY: as for `clear`.
-        let st = unsafe { &mut *self.inner.get() };
-        if plane as usize >= PLANES || at as usize >= self.bank_words() {
-            return false;
-        }
-        let (pg, i) = (at as usize >> PAGE_SHIFT, at as usize & (PAGE_WORDS - 1));
-        if st.planes.len() <= plane as usize {
-            st.planes.resize_with(PLANES, Plane::default);
-        }
-        let pl = &mut st.planes[plane as usize];
-        if !pl.has(pg) {
-            if v == 0 {
-                return true;
-            }
-            if st.resident >= self.cap_pages {
-                return false;
-            }
-            if pl.pages.len() <= pg {
-                pl.pages.resize_with(pg + 1, || None);
-            }
-            pl.pages[pg] = Some(new_page());
-            st.resident += 1;
-            st.peak = st.peak.max(st.resident);
-        }
-        if let Some(Some(p)) = pl.pages.get_mut(pg) {
-            p[i] = v;
-        }
-        true
-    }
-
     /// Word `at` of plane `plane`; 0 where nothing has been written.
     #[inline(always)]
     pub fn get(&self, plane: u16, at: u32) -> u32 {
@@ -276,30 +211,6 @@ impl TextureStore {
         self.bank_words().div_ceil(PAGE_WORDS)
     }
 
-    /// Take `pages` as plane `plane`, as a snapshot saved them. False, and nothing changed, for a plane the
-    /// store has not, a table longer than a bank, or pages that would take the store past its ceiling. Call
-    /// only with the tiles drained.
-    pub fn set_pages(&self, plane: u16, pages: Vec<Option<Box<Page>>>) -> bool {
-        // SAFETY: as for `clear`.
-        let st = unsafe { &mut *self.inner.get() };
-        if plane as usize >= PLANES || pages.len() > self.plane_pages() {
-            return false;
-        }
-        if st.planes.len() <= plane as usize {
-            st.planes.resize_with(PLANES, Plane::default);
-        }
-        let mut pl = Plane { pages };
-        pl.trim();
-        let (old, new) = (st.planes[plane as usize].held(), pl.held());
-        if st.resident - old + new > self.cap_pages {
-            return false;
-        }
-        st.resident = st.resident - old + new;
-        st.peak = st.peak.max(st.resident);
-        st.planes[plane as usize] = pl;
-        true
-    }
-
     /// Pages held across all planes.
     pub fn resident_pages(&self) -> usize {
         // SAFETY: as for `plane`.
@@ -311,11 +222,136 @@ impl TextureStore {
         // SAFETY: as for `plane`.
         unsafe { &*self.inner.get() }.peak
     }
+}
 
-    /// Forget every image (power-on). Call only with the tiles drained.
-    pub fn reset(&self) {
+/// Exclusive use of a texture store: the right to change it. A draw's workers read the
+/// planes without a lock, so a plane may change only while none runs; holding this says
+/// the producer has drained its tiles and runs nothing that reads until it lets go.
+pub struct Exclusive<'a>(&'a TextureStore);
+
+impl std::ops::Deref for Exclusive<'_> {
+    type Target = TextureStore;
+    fn deref(&self) -> &TextureStore {
+        self.0
+    }
+}
+
+impl TextureStore {
+    /// Take exclusive use of the store to change it.
+    ///
+    /// # Safety
+    ///
+    /// No tile worker is running a job that reads the store, and none starts while the
+    /// result lives: the caller has drained its tiles. No other thread reads or changes
+    /// the store meanwhile.
+    pub unsafe fn exclusive(&self) -> Exclusive<'_> {
+        Exclusive(self)
+    }
+}
+
+#[cfg(test)]
+impl TextureStore {
+    /// Exclusive use for a test, which runs no tile worker.
+    pub fn ex(&self) -> Exclusive<'_> {
+        // SAFETY: a test that calls this has no tile worker running against the store.
+        unsafe { self.exclusive() }
+    }
+}
+
+impl Exclusive<'_> {
+    /// Zero the `n` words of plane `plane` from `from`. A page the range covers is given back, a page it
+    /// part covers is zeroed in the range, and none is made. A range past the bank is cut at its end
+    /// (`contains` is the caller's check).
+    pub fn clear(&mut self, plane: u16, from: u32, n: usize) {
+        // SAFETY: `Exclusive` is the promise that no reader runs, and `&mut self` keeps the planes it handed out borrowed.
+        let st = unsafe { &mut *self.0.inner.get() };
+        let end = (from as usize + n).min(self.0.bank_words());
+        let from = from as usize;
+        let Some(pl) = st.planes.get_mut(plane as usize).filter(|_| from < end) else { return };
+        let mut freed = 0;
+        for pg in from >> PAGE_SHIFT..=(end - 1) >> PAGE_SHIFT {
+            let (lo, hi) = (pg << PAGE_SHIFT, (pg + 1) << PAGE_SHIFT);
+            let Some(slot) = pl.pages.get_mut(pg) else { break };
+            if from <= lo && hi <= end {
+                freed += slot.take().is_some() as usize;
+            } else if let Some(p) = slot {
+                p[from.max(lo) - lo..end.min(hi) - lo].fill(0);
+            }
+        }
+        pl.trim();
+        st.resident -= freed;
+    }
+
+    /// Give plane `plane` back: its words are gone and its memory is returned.
+    pub fn drop_plane(&mut self, plane: u16) {
         // SAFETY: as for `clear`.
-        let st = unsafe { &mut *self.inner.get() };
+        let st = unsafe { &mut *self.0.inner.get() };
+        if let Some(pl) = st.planes.get_mut(plane as usize) {
+            st.resident -= pl.held();
+            pl.pages = Vec::new();
+        }
+    }
+
+    /// Write word `at` of plane `plane`. False when the word is not written: past the bank, or the page it
+    /// needs would pass the ceiling. A zero into a page that is not held writes nothing and is true.
+    pub fn set(&mut self, plane: u16, at: u32, v: u32) -> bool {
+        // SAFETY: as for `clear`.
+        let st = unsafe { &mut *self.0.inner.get() };
+        if plane as usize >= PLANES || at as usize >= self.0.bank_words() {
+            return false;
+        }
+        let (pg, i) = (at as usize >> PAGE_SHIFT, at as usize & (PAGE_WORDS - 1));
+        if st.planes.len() <= plane as usize {
+            st.planes.resize_with(PLANES, Plane::default);
+        }
+        let pl = &mut st.planes[plane as usize];
+        if !pl.has(pg) {
+            if v == 0 {
+                return true;
+            }
+            if st.resident >= self.0.cap_pages {
+                return false;
+            }
+            if pl.pages.len() <= pg {
+                pl.pages.resize_with(pg + 1, || None);
+            }
+            pl.pages[pg] = Some(new_page());
+            st.resident += 1;
+            st.peak = st.peak.max(st.resident);
+        }
+        if let Some(Some(p)) = pl.pages.get_mut(pg) {
+            p[i] = v;
+        }
+        true
+    }
+
+    /// Take `pages` as plane `plane`, as a snapshot saved them. False, and nothing changed, for a plane the
+    /// store has not, a table longer than a bank, or pages that would take the store past its ceiling.
+    pub fn set_pages(&mut self, plane: u16, pages: Vec<Option<Box<Page>>>) -> bool {
+        // SAFETY: as for `clear`.
+        let st = unsafe { &mut *self.0.inner.get() };
+        if plane as usize >= PLANES || pages.len() > self.0.plane_pages() {
+            return false;
+        }
+        if st.planes.len() <= plane as usize {
+            st.planes.resize_with(PLANES, Plane::default);
+        }
+        let mut pl = Plane { pages };
+        pl.trim();
+        let (old, new) = (st.planes[plane as usize].held(), pl.held());
+        if st.resident - old + new > self.0.cap_pages {
+            return false;
+        }
+        st.resident = st.resident - old + new;
+        st.peak = st.peak.max(st.resident);
+        st.planes[plane as usize] = pl;
+        true
+    }
+
+    /// Forget every image (power-on).
+    pub fn reset(&mut self) {
+        // SAFETY: as for `clear`.
+        let st = unsafe { &mut *self.0.inner.get() };
         st.planes.clear();
         st.resident = 0;
         st.peak = 0;
@@ -329,17 +365,17 @@ mod tests {
     #[test]
     fn a_word_is_where_its_address_puts_it_zeroed_and_bounded() {
         let t = TextureStore::default();
-        assert!(t.set(0, 17, 0xdead_beef) && t.set(1, 3, 7));
+        assert!(t.ex().set(0, 17, 0xdead_beef) && t.ex().set(1, 3, 7));
         assert_eq!((t.resident_pages(), t.used()), (2, vec![(0, 1), (1, 1)]));
         assert_eq!((t.get(0, 17), t.get(0, 16), t.get(0, 99), t.get(1, 3), t.get(7, 0)), (0xdead_beef, 0, 0, 7, 0));
-        assert!(t.set(0, 20, 0) && t.set(5, 4, 0), "a zero into a page that is not held writes nothing");
+        assert!(t.ex().set(0, 20, 0) && t.ex().set(5, 4, 0), "a zero into a page that is not held writes nothing");
         assert_eq!(t.resident_pages(), 2);
-        assert!(!t.set(0, t.bank_units() * UNIT_WORDS, 1), "past the bank");
-        t.clear(0, 17, 1);
+        assert!(!t.ex().set(0, t.bank_units() * UNIT_WORDS, 1), "past the bank");
+        t.ex().clear(0, 17, 1);
         assert_eq!(t.get(0, 17), 0, "cleared again");
-        t.drop_plane(0);
+        t.ex().drop_plane(0);
         assert_eq!((t.used(), t.resident_pages()), (vec![(1, 1)], 1));
-        t.reset();
+        t.ex().reset();
         assert_eq!((t.resident_pages(), t.peak_pages()), (0, 0));
     }
 
@@ -348,10 +384,10 @@ mod tests {
     fn a_word_at_the_top_of_a_bank_holds_one_page() {
         let t = TextureStore::default();
         let top = t.bank_units() * UNIT_WORDS - 1;
-        assert!(t.set(3, top, 9));
+        assert!(t.ex().set(3, top, 9));
         assert_eq!((t.resident_pages(), t.get(3, top), t.get(3, top - 1)), (1, 9, 0));
         assert!(t.page(3, t.plane_pages() - 1).is_some() && t.page(3, 0).is_none());
-        t.clear(3, 0, usize::MAX / 2);
+        t.ex().clear(3, 0, usize::MAX / 2);
         assert_eq!(t.resident_pages(), 0, "a clear over the plane gives the pages back");
     }
 
@@ -361,13 +397,13 @@ mod tests {
         let t = TextureStore::default();
         let w = PAGE_WORDS as u32;
         for pg in 0..3 {
-            assert!(t.set(0, pg * w + 5, 1));
+            assert!(t.ex().set(0, pg * w + 5, 1));
         }
-        t.clear(0, 4, PAGE_WORDS + 3);
+        t.ex().clear(0, 4, PAGE_WORDS + 3);
         assert_eq!((t.resident_pages(), t.get(0, 5), t.get(0, w + 5), t.get(0, 2 * w + 5)), (3, 0, 0, 1), "pages 0 and 1 are only part covered");
-        t.clear(0, 0, 2 * PAGE_WORDS);
+        t.ex().clear(0, 0, 2 * PAGE_WORDS);
         assert_eq!((t.resident_pages(), t.used()), (1, vec![(0, 3)]));
-        t.clear(1, 0, 10);
+        t.ex().clear(1, 0, 10);
         assert_eq!(t.resident_pages(), 1, "a clear makes nothing");
     }
 
@@ -380,17 +416,17 @@ mod tests {
         let w = PAGE_WORDS as u64;
         for (plane, pages) in [(0u16, 64u32), (1, 63)] {
             for pg in 0..pages {
-                assert!(t.set(plane, pg * PAGE_WORDS as u32, 1), "plane {plane} page {pg}");
+                assert!(t.ex().set(plane, pg * PAGE_WORDS as u32, 1), "plane {plane} page {pg}");
             }
         }
         assert_eq!(t.resident_pages(), 127);
         assert!(t.fits(2, 0, 1, 1, 1) && !t.fits(2, 0, 2 * w, 2 * w, 1) && t.fits(0, 0, 64 * w, 64 * w, 1), "pages held cost nothing");
-        assert!(t.set(2, 0, 1) && !t.set(2, PAGE_WORDS as u32, 1), "the 129th page is refused");
-        assert!(t.set(2, 5, 2), "a page already held takes more words");
+        assert!(t.ex().set(2, 0, 1) && !t.ex().set(2, PAGE_WORDS as u32, 1), "the 129th page is refused");
+        assert!(t.ex().set(2, 5, 2), "a page already held takes more words");
         assert!(!t.fits(1, 63 * w, 1, 1, 1));
         assert_eq!(t.peak_pages(), 128);
-        t.drop_plane(0);
-        assert!(t.fits(2, w, 1, 1, 1) && t.set(2, PAGE_WORDS as u32, 1));
+        t.ex().drop_plane(0);
+        assert!(t.fits(2, w, 1, 1, 1) && t.ex().set(2, PAGE_WORDS as u32, 1));
     }
 
     /// Rows that share a page cost it once.
@@ -401,7 +437,7 @@ mod tests {
         assert_eq!((t.plane_pages(), t.cap_pages()), (3, 6));
         for (plane, pages) in [(1u16, 3u32), (2, 1)] {
             for pg in 0..pages {
-                assert!(t.set(plane, pg * PAGE_WORDS as u32, 1));
+                assert!(t.ex().set(plane, pg * PAGE_WORDS as u32, 1));
             }
         }
         let w = PAGE_WORDS as u64;
@@ -419,15 +455,15 @@ mod tests {
             p[2] = 3;
             Some(p)
         };
-        assert!(t.set_pages(3, vec![None, page()]));
+        assert!(t.ex().set_pages(3, vec![None, page()]));
         assert_eq!((t.used(), t.get(3, PAGE_WORDS as u32 + 2), t.resident_pages()), (vec![(3, 2)], 3, 1));
-        assert!(!t.set_pages(3, (0..t.plane_pages() + 1).map(|_| None).collect()), "a table past the bank");
-        assert!(!t.set_pages(PLANES as u16, vec![page()]), "no such plane");
-        assert!(t.set_pages(4, (0..64).map(|_| page()).collect()) && t.set_pages(5, (0..63).map(|_| page()).collect()));
-        assert!(!t.set_pages(6, vec![page(), page()]), "past the ceiling");
-        assert!(t.set_pages(4, vec![]) && t.set_pages(5, vec![]));
+        assert!(!t.ex().set_pages(3, (0..t.plane_pages() + 1).map(|_| None).collect()), "a table past the bank");
+        assert!(!t.ex().set_pages(PLANES as u16, vec![page()]), "no such plane");
+        assert!(t.ex().set_pages(4, (0..64).map(|_| page()).collect()) && t.ex().set_pages(5, (0..63).map(|_| page()).collect()));
+        assert!(!t.ex().set_pages(6, vec![page(), page()]), "past the ceiling");
+        assert!(t.ex().set_pages(4, vec![]) && t.ex().set_pages(5, vec![]));
         assert_eq!((t.used(), t.resident_pages()), (vec![(3, 2)], 1), "refused: unchanged");
-        assert!(t.set_pages(3, vec![]) && t.used().is_empty());
+        assert!(t.ex().set_pages(3, vec![]) && t.used().is_empty());
     }
 
     /// A product with more texture memory holds addresses a smaller one refuses.

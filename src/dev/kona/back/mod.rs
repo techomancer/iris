@@ -52,7 +52,7 @@ use context::Contexts;
 use raster::setup::Shape;
 use raster::Rect;
 use tiles::{ClearJob, RasterJob, Tiles};
-use store::texture::{TextureStore, PAGE_WORDS};
+use store::texture::{Exclusive, TextureStore, PAGE_WORDS};
 use store::PixelStore;
 use super::stream;
 use crate::devlog::LogModule;
@@ -625,7 +625,8 @@ impl KonaBackend {
         self.clock.cancel();
         // Jobs queued before the reset finish first: they write the store it clears.
         self.drain();
-        self.store.reset();
+        // SAFETY: the tiles are drained, and nothing draws until the reset returns.
+        unsafe { self.store.reset() };
         self.textport.reset();
         self.tables.lock().reset();
         self.contexts.reset();
@@ -724,6 +725,18 @@ fn drains_first(job: &Job<'_>) -> bool {
         }
         _ => false,
     }
+}
+
+/// Exclusive use of the texture store, taken after the tile workers have finished. The workers read
+/// the planes without a lock, so a write may happen only while none runs; every writer in the
+/// back end gets its `Exclusive` here, which waits for them first, so a write that skips the wait
+/// cannot be written down. Nothing draws until the caller returns: the producer is this thread.
+fn texture_exclusive<'a>(tiles: &mut Option<Tiles>, store: &'a PixelStore) -> Exclusive<'a> {
+    if let Some(t) = tiles {
+        let _ = t.drain();
+    }
+    // SAFETY: the tiles are drained, and the producer submits nothing until the caller is done.
+    unsafe { store.texture().exclusive() }
 }
 
 /// What set-up counted, over the draws handed to it.
@@ -889,9 +902,8 @@ impl KonaBackend {
             return Reply::Done;
         }
         if n == 0 {
-            self.drain();
-            let tex = &mut self.contexts.select(port.context()).tex;
-            tex.load(self.store.texture(), args, &[], false, &mut self.tex_counts);
+            let mut store = texture_exclusive(&mut self.tiles, &self.store);
+            self.contexts.select(port.context()).tex.load(&mut store, args, &[], false, &mut self.tex_counts);
             return Reply::Done;
         }
         Reply::Data(n)
@@ -899,9 +911,9 @@ impl KonaBackend {
 
     /// A texel draw's image words, in the stream, as bytes in the client's order.
     fn texel_words(&mut self, port: &BackPort<'_>, args: &[u32], words: &[u32]) {
-        self.drain();
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        self.contexts.select(port.context()).tex.load(self.store.texture(), args, &bytes, false, &mut self.tex_counts);
+        let mut store = texture_exclusive(&mut self.tiles, &self.store);
+        self.contexts.select(port.context()).tex.load(&mut store, args, &bytes, false, &mut self.tex_counts);
     }
 
     /// A texel read-back (token 0x052): the named level's texels from the texture arena, packed in the
@@ -997,7 +1009,10 @@ impl KonaBackend {
             BIND_TEXTURE_CURRENT_FORM | BIND_LINEAR_TEXTURE => c.tex.short_bind(args),
             BIND_2D_MIP_MAPPED_TEXTURE => {
                 self.tex_counts.binds += 1;
-                match c.tex.record(self.store.texture(), args, Default::default(), &mut self.tex_counts) {
+                // A bind decodes a level loaded raw in place, which writes texture memory the tile workers
+                // read; `record` asks for the store only then, so a bind of decoded levels waits for nothing.
+                let (tiles, store) = (&mut self.tiles, &self.store);
+                match c.tex.record(|| texture_exclusive(tiles, store), args, Default::default(), &mut self.tex_counts) {
                     Some(d) => c.gl.set_texture(Some(d)),
                     None => {
                         self.tex_counts.bind_refused += 1;
@@ -1014,7 +1029,9 @@ impl KonaBackend {
             BIND_3D_MIP_MAPPED_TEXTURE | BIND_3D_TEXTURE => {
                 self.tex_counts.binds += 1;
                 self.tex_counts.volume_binds += 1;
-                match c.tex.volume_record(self.store.texture(), args, selector == BIND_3D_MIP_MAPPED_TEXTURE, Default::default()) {
+                // As for the 2D bind, the store is asked for only when a level is raw.
+                let (tiles, store) = (&mut self.tiles, &self.store);
+                match c.tex.volume_record(|| texture_exclusive(tiles, store), args, selector == BIND_3D_MIP_MAPPED_TEXTURE, Default::default()) {
                     Some(d) => c.gl.set_texture(Some(d)),
                     None => {
                         self.tex_counts.bind_refused += 1;
@@ -1144,9 +1161,9 @@ impl KonaBackend {
                 port.dma_fault();
                 return Reply::Done;
             }
-            self.drain();
             self.tex_counts.dma_loads += 1;
-            self.contexts.select(port.context()).tex.load(self.store.texture(), &args, &bytes, true, &mut self.tex_counts);
+            let mut store = texture_exclusive(&mut self.tiles, &self.store);
+            self.contexts.select(port.context()).tex.load(&mut store, &args, &bytes, true, &mut self.tex_counts);
             return Reply::Done;
         }
         if let Some(args) = self.contexts.select(port.context()).gl.pix.pending.take() {
@@ -1415,8 +1432,8 @@ impl KonaBackend {
                 // after the workers that may be reading it are done.
                 if let super::job::ContextEvent::Activated { slot, fresh: true } = e {
                     if slot < CONTEXT_SLOTS && self.contexts.select(Some(slot)).tex.holds() {
-                        self.drain();
-                        self.contexts.select(Some(slot)).tex.release(self.store.texture());
+                        let mut store = texture_exclusive(&mut self.tiles, &self.store);
+                        self.contexts.select(Some(slot)).tex.release(&mut store);
                     }
                 }
                 self.contexts.event(e)
@@ -2838,6 +2855,111 @@ mod tests {
         b.quiesce();
         assert_eq!(drains(&b), expect + 1, "a quiesce drains");
         assert_eq!(b.tiles.as_ref().map_or(0, |t| t.stats().busy_drains), 0, "no worker had anything queued");
+    }
+
+    /// A raw 16-bit luminance level of 8 x 4 texels at `address` in bank 0, the words zero. A bind of it
+    /// under a colour format decodes it in place, which writes texture memory: a zero word becomes opaque black,
+    /// so a page that held nothing is made. `target` is 0x0de1 for a 2D level, 0x806f for a volume slice.
+    fn load_raw_level(b: &mut KonaBackend, target: u32, address: u32) {
+        let mut hdr = [0u32; 20];
+        hdr[..5].copy_from_slice(&[target, 8, 4, 6, 3]);
+        hdr[9] = 0xd;
+        hdr[13] = 7;
+        hdr[14] = 3;
+        hdr[16] = if target == 0x0de1 { 0x23 } else { 0x123 };
+        hdr[17] = 0x2200;
+        hdr[18] = address;
+        assert_eq!(command(b, Grammar::Gl, DRAW_TEXELS_INTO_TEXTURE_MEMORY, &hdr), Reply::Data(16));
+        send(b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &hdr, words: &[0; 16] });
+    }
+
+    /// Bind the level at `address` under the 5-6-5 colour format (0x18): the 2D form, the single-level volume form
+    /// or the mip-mapped volume form, by `selector`.
+    fn bind_level(b: &mut KonaBackend, selector: u32, address: u32) {
+        let (modes, record): (_, Vec<u32>) = match selector {
+            BIND_2D_MIP_MAPPED_TEXTURE => ([0xffff_ffff, 2 << 12, 0x18 << 14, 0x23, 1], [&[0x44, 0, 0, 0, 0, 0, address, 0xffff_ffff][..], &[0; 14]].concat()),
+            BIND_3D_TEXTURE => ([0xffff_ffff, 3 << 28 | 2 << 12, 0x18 << 14, 0x0123, 1], vec![0x44, 0x123, address, 0]),
+            _ => ([0xffff_ffff, 3 << 28 | 2 << 12, 0x18 << 14, 0x0123, 1], [&[0x44, 0x123, 0, 0, address][..], &[0xffff_ffff; 9]].concat()),
+        };
+        command(b, Grammar::Gl, BIND_TEXTURE_CURRENT_FORM, &modes);
+        command(b, Grammar::Gl, selector, &record[..match selector { BIND_2D_MIP_MAPPED_TEXTURE => 22, BIND_3D_TEXTURE => 4, _ => 14 }]);
+    }
+
+    /// A bind that decodes a raw level writes texture memory, so the tile workers finish first; one that has
+    /// nothing to decode leaves them alone. Counted, so the test does not depend on a worker being slow enough
+    /// to lose a race. Each bind form is checked: the 2D mip-mapped, the single-level volume and the mip-mapped volume.
+    #[test]
+    fn a_bind_that_decodes_a_raw_level_drains_the_tiles_first() {
+        let mut b = KonaBackend::new(test_cfg().with_pool(2, 32));
+        b.tiles();
+        let drains = |b: &KonaBackend| b.tiles.as_ref().map_or(0, |t| t.stats().drains);
+        for (selector, target, address) in [(BIND_2D_MIP_MAPPED_TEXTURE, 0x0de1, 0x1000), (BIND_3D_TEXTURE, 0x806f, 0x2000), (BIND_3D_MIP_MAPPED_TEXTURE, 0x806f, 0x3000)] {
+            load_raw_level(&mut b, target, address);
+            assert!(b.contexts.select(None).tex.holds_raw());
+            let before = drains(&b);
+            bind_level(&mut b, selector, address);
+            assert!(drains(&b) > before, "{selector:#x}: the bind wrote texture memory without waiting for the workers");
+            assert!(!b.contexts.select(None).tex.holds_raw(), "{selector:#x}: decoded in place");
+            let settled = drains(&b);
+            bind_level(&mut b, selector, address);
+            assert_eq!(drains(&b), settled, "{selector:#x}: a bind of a level already decoded leaves the workers alone");
+        }
+        let text = run(&mut b, &["status"]).1;
+        assert!(text.contains("0 refused"), "{text}");
+    }
+
+    /// Workers sample one texture while binds decode raw levels into the same plane, each past the last so the
+    /// plane's page table grows. The binds wait for the workers, so the sampled texture is never disturbed.
+    #[test]
+    fn workers_sampling_a_texture_survive_binds_that_grow_the_store() {
+        use crate::dev::kona::defs::gl::TEXTURE_2D;
+        let mut b = KonaBackend::new(test_cfg().with_pool(2, 8));
+        command(&mut b, Grammar::Kernel, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 13, 0]);
+        command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 0, 0]);
+        command(&mut b, Grammar::Gl, SET_VIEWPORT, &[0, 0, 64, 64]);
+        command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_4_COMPONENTS_SINGLE_FLOAT, &[1.0f32.to_bits(); 4]);
+        let mut hdr = [0u32; 20];
+        hdr[..5].copy_from_slice(&[0x0de1, 2, 2, 5, 1]);
+        hdr[9] = 0x30;
+        hdr[13] = 1;
+        hdr[14] = 1;
+        hdr[16] = 0x11;
+        hdr[17] = 0x2200;
+        hdr[18] = 0x1000;
+        assert_eq!(command(&mut b, Grammar::Gl, DRAW_TEXELS_INTO_TEXTURE_MEMORY, &hdr), Reply::Data(4));
+        send(&mut b, Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args: &hdr, words: &[0xff00_00ff; 4] });
+        command(&mut b, Grammar::Gl, SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM, &[0x2200, (0x1e01 as f32).to_bits(), 0, 0, 0]);
+        command(&mut b, Grammar::Gl, ENABLE_CAPABILITY, &[TEXTURE_2D]);
+        let mut rec = [0u32; 22];
+        rec[0] = 0x44;
+        rec[1] = 0x1010;
+        rec[6] = 0x1000;
+        rec[7] = 0xffff_ffff;
+        let quad = |b: &mut KonaBackend| {
+            command(b, Grammar::Gl, BIND_TEXTURE_CURRENT_FORM, &[0xffff_ffff, 2 << 12, 0, 0x0011, 1]);
+            command(b, Grammar::Gl, BIND_2D_MIP_MAPPED_TEXTURE, &rec);
+            command(b, Grammar::Gl, BEGIN_PRIMITIVE_INDEPENDENT_TRIANGLES, &[0]);
+            for (x, y, s, t) in [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (0.0, 64.0, 0.0, 1.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)] {
+                command(b, Grammar::Gl, SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_SINGLE_FLOAT, &[(s as f32).to_bits(), (t as f32).to_bits()]);
+                command(b, Grammar::Gl, SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT, &[ndc(x), ndc(y), 0.0f32.to_bits()]);
+            }
+            command(b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+        };
+        let drains = |b: &KonaBackend| b.tiles.as_ref().map_or(0, |t| t.stats().drains);
+        for i in 0..64u32 {
+            // Each level is a page or more beyond the last, so the page table has to grow.
+            let address = 0x4000 + i * 0x2000;
+            for _ in 0..4 {
+                quad(&mut b);
+            }
+            load_raw_level(&mut b, 0x0de1, address);
+            let before = drains(&b);
+            bind_level(&mut b, BIND_2D_MIP_MAPPED_TEXTURE, address);
+            assert!(drains(&b) > before, "bind {i} wrote the store without waiting for the workers");
+        }
+        quad(&mut b);
+        assert!(lit_pixels(&mut b).len() == 64 * 64, "every pixel drawn");
+        assert!((0..64).all(|y| (0..64).all(|x| b.store.read(x, y, 2) == 0xffff_0000)), "every sample of the texture is its red texel");
     }
 
     /// The region commands are counted with the bytes the swaps name, and the

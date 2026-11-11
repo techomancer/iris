@@ -251,9 +251,14 @@ impl PixelStore {
     /// relaxed atomic store rather than a `memset`, which may write a word in
     /// pieces: a reader racing a reset must see the old value or zero, never a
     /// torn one. It is a cold path.
-    pub fn reset(&self) {
+    ///
+    /// # Safety
+    ///
+    /// No tile worker is running: the caller has drained its tiles, as `TextureStore::exclusive` asks.
+    pub unsafe fn reset(&self) {
         self.touch();
-        self.tex.reset();
+        // SAFETY: the caller's promise.
+        unsafe { self.tex.exclusive() }.reset();
         for w in self.allocated() {
             let a = self.array(w).expect("allocated");
             // SAFETY: the array has `a.len()` entries and is live for `&self`.
@@ -337,7 +342,8 @@ mod tests {
         s.write(1, 1, 9, 7);
         s.ensure(9);
         assert_eq!(s.array(9).unwrap().base, before);
-        s.reset();
+        // SAFETY: no tile worker runs in this test.
+        unsafe { s.reset() };
         assert_eq!(s.array(9).unwrap().base, before);
         assert_eq!(s.read(1, 1, 9), 0);
         assert_eq!(s.allocated(), [9]);
@@ -403,7 +409,8 @@ mod tests {
             })
         };
         for _ in 0..200 {
-            s.reset();
+            // SAFETY: no tile worker runs in this test.
+        unsafe { s.reset() };
             for x in 0..128 {
                 s.write(x, 7, 2, VALUE);
             }
@@ -430,7 +437,8 @@ mod tests {
         assert_eq!(a.checksum(), b.checksum(), "writing a zero changes nothing");
         b.ensure(9);
         assert_ne!(a.checksum(), b.checksum(), "an allocated array of zeros counts");
-        a.reset();
+        // SAFETY: no tile worker runs in this test.
+        unsafe { a.reset() };
         assert_ne!(a.checksum(), PixelStore::new(8, 8).checksum());
     }
 
