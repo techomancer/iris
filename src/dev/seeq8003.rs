@@ -152,6 +152,9 @@ pub struct SeeqState {
     /// room, and how often a hold ran out.
     rx_holds: u64,
     rx_hold_timeouts: u64,
+    /// Frames the guest sent that the host side had no room for. The wire
+    /// acknowledges nothing, so the guest sees them sent all the same.
+    tx_dropped: u64,
     /// Monotonic lock counter — incremented on every mutex acquisition.
     /// Prefix all debug messages with this to correlate across threads.
     pub ts:       u32,
@@ -241,7 +244,8 @@ macro_rules! lock_state {
 /// Result of a TX pump: applied under SeeqState lock.
 enum TxPumpResult {
     Nothing,
-    Sent { dma_irq: bool },
+    /// `dropped`: the host ring was full, so the frame went nowhere.
+    Sent { dma_irq: bool, dropped: bool },
 }
 
 /// Result of an RX pump: applied under SeeqState lock.
@@ -296,6 +300,7 @@ impl Seeq8003 {
                 rx_overflows: 0,
                 rx_holds: 0,
                 rx_hold_timeouts: 0,
+                tx_dropped: 0,
                 ts:           0,
             })),
             irq, rx_dma, tx_dma,
@@ -424,10 +429,10 @@ impl Seeq8003 {
         dlog_dev!(LogModule::Seeq, "SEEQ TX {} dma_st={:#x}", eth_summary(&frame), dma_st.0);
 
         crate::pf_instant!(crate::perfetto::events::ENET_TX, frame.len());
-        let _ = tx_prod.push(frame);
+        let dropped = tx_prod.push(frame).is_err();
         tx_wake.notify();
 
-        TxPumpResult::Sent { dma_irq: dma_st.irq() }
+        TxPumpResult::Sent { dma_irq: dma_st.irq(), dropped }
     }
 
     /// Inject one pending RX frame into guest RAM via HPC3 RX DMA.
@@ -814,8 +819,9 @@ impl Device for Seeq8003 {
                 let tx_activity = !matches!(tx_result, TxPumpResult::Nothing);
                 let tx_moved = matches!(tx_result, TxPumpResult::Sent { .. });
                 match tx_result {
-                    TxPumpResult::Sent { dma_irq: irq } => {
-                        dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ TX complete dma_irq={}", st.ts, irq);
+                    TxPumpResult::Sent { dma_irq: irq, dropped } => {
+                        dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ TX complete dma_irq={} dropped={}", st.ts, irq, dropped);
+                        st.tx_dropped += dropped as u64;
                         st.tx_stat = tx_stat::SUCCESS;
                         dma_irq |= irq;
                     }
@@ -925,6 +931,7 @@ impl Device for Seeq8003 {
                                  st.intpend, st.rx_delivered, st.rx_lost, st.rx_truncated, st.rx_nothing).ok();
                         writeln!(w, "rx_filtered={} (receiver off: {}) rx_overflows={}", st.rx_filtered, st.rx_disabled, st.rx_overflows).ok();
                         writeln!(w, "rx_hold={} rx_holds={} rx_hold_timeouts={}", self.config.rx_hold, st.rx_holds, st.rx_hold_timeouts).ok();
+                        writeln!(w, "tx_dropped={} (host ring full)", st.tx_dropped).ok();
                         writeln!(w, "rx_cmd={:#04x} rx_stat={:#04x} tx_cmd={:#04x} tx_stat={:#04x}",
                                  st.rx_cmd, st.rx_stat, st.tx_cmd, st.tx_stat).ok();
                         writeln!(w, "threads: {}", if self.is_running() { "running" } else { "stopped" }).ok();
@@ -1155,6 +1162,52 @@ mod tests {
             *self.overflows.lock() += 1;
             *self.stopped.lock() = true;
         }
+    }
+
+    /// A transmit channel that hands out `frames` one byte at a time.
+    struct Frames(Mutex<std::collections::VecDeque<Vec<u8>>>, Mutex<usize>);
+
+    impl DmaClient for Frames {
+        fn read(&self) -> Option<(u32, DmaStatus)> {
+            let mut q = self.0.lock();
+            let at = &mut *self.1.lock();
+            let frame = q.front()?;
+            let b = frame[*at] as u32;
+            *at += 1;
+            let eop = *at == frame.len();
+            if eop { q.pop_front(); *at = 0; }
+            Some((b, DmaStatus(if eop { DmaStatus::EOP } else { 0 })))
+        }
+        fn write(&self, _val: u32, _eop: bool) -> DmaStatus { DmaStatus::ok() }
+    }
+
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().extend_from_slice(b); Ok(b.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// A frame the host ring has no room for is still reported sent to the
+    /// guest, and `seeq status` counts it.
+    #[test]
+    fn a_frame_sent_while_the_host_ring_is_full_is_counted() {
+        let (link, sent, _inject) = Link::loopback();
+        // A link's ring holds 256 frames; one more has no room.
+        let frames: std::collections::VecDeque<_> = (0..257).map(|_| vec![0x5a; 60]).collect();
+        let tx = Arc::new(Frames(Mutex::new(frames), Mutex::new(0)));
+        let seeq = Arc::new(Seeq8003::new(None, None, Some(tx), Arc::new(AtomicU64::new(0))));
+        seeq.attach(link);
+        seeq.start();
+        // Nothing reads `sent`, so the last frame has nowhere to go.
+        let out = Arc::new(Mutex::new(Vec::new()));
+        wait_for("the dropped frame to show in the status", || {
+            out.lock().clear();
+            seeq.execute_command("seeq", &["status"], Box::new(Sink(out.clone()))).unwrap();
+            String::from_utf8_lossy(&out.lock()).contains("tx_dropped=1")
+        });
+        seeq.stop();
+        drop(sent);
     }
 
     /// Wait for a condition another thread brings about. Fails the test
