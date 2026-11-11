@@ -1,7 +1,6 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::net::TcpStream;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use parking_lot::Mutex;
@@ -364,13 +363,6 @@ impl DevLog {
                 ModuleLog::new(), // Kona
             ],
         }
-    }
-
-    /// Register a new monitor connection. Called from monitor::handle_client at connect time.
-    pub fn add_writer(&self, w: Arc<Mutex<BufWriter<TcpStream>>>) {
-        self.writers.lock().push(w);
-        // Writers alone don't activate log output — a module must be enabled too.
-        // any_active is set when a module is enabled.
     }
 
     /// Register a generic Write+Send sink (e.g. stderr for diagnostic runs).
