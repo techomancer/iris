@@ -1304,17 +1304,8 @@ impl ScsiTarget for ScsiDevice {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use crate::test_temp::TempPath;
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn tmp(tag: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "iris-scsi-{}-{}-{}",
-            tag,
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
 
     fn request(cdb: &[u8], data_in: Option<Vec<u8>>) -> ScsiRequest {
         ScsiRequest {
@@ -1327,7 +1318,8 @@ mod tests {
     /// The direct backend's read/write call sites now go through `BlockNode`.
     #[test]
     fn direct_backend_reads_and_writes_through_the_node() {
-        let path = tmp("direct");
+        let dir = TempPath::dir("scsi");
+        let path = dir.join("img");
         std::fs::write(&path, vec![0u8; 4 * 512]).unwrap();
         let node = crate::block_node::RawNode::open(&path).unwrap();
         let mut dev = ScsiDevice::new(
@@ -1355,16 +1347,16 @@ mod tests {
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(&on_disk[512..1024], &[0xABu8; 512]);
 
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The COW overlay's commit/reset/export/import call sites still behave as
     /// before the migration onto `CowNode`.
     #[test]
     fn cow_backend_manages_its_overlay_through_the_node() {
-        let base = tmp("cow-base");
-        let overlay = tmp("cow-overlay");
-        let export = tmp("cow-export");
+        let dir = TempPath::dir("scsi");
+        let base = dir.join("base");
+        let overlay = dir.join("overlay");
+        let export = dir.join("export");
         std::fs::write(&base, vec![0xAAu8; 2 * 512]).unwrap();
         let backing = crate::block_node::RawNode::open_readonly(&base).unwrap();
         let node = crate::block_node::CowNode::new(Some(Box::new(backing)), &overlay, 2 * 512)
@@ -1402,16 +1394,14 @@ mod tests {
         let on_disk = std::fs::read(&base).unwrap();
         assert_eq!(&on_disk[..512], &[0x55u8; 512]);
 
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(&overlay);
-        let _ = std::fs::remove_file(&export);
-        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
     }
 
     /// A CD-ROM target on a 100-sector image, past its power-on unit
     /// attention.
     fn cdrom() -> ScsiDevice {
-        let path = std::env::temp_dir().join(format!("iris-scsi-alloc-{}.iso", std::process::id()));
+        let dir = TempPath::dir("scsi");
+        // The node holds its own handle, so the file can go when this returns.
+        let path = dir.join("disc.iso");
         std::fs::write(&path, vec![0u8; 100 * 2048]).expect("test image");
         let node = crate::block_node::RawNode::open(&path).expect("open");
         let identity = ScsiIdentity::new(b"TEST    ", b"CD-ROM          ", b"1.0 ");
@@ -1427,11 +1417,11 @@ mod tests {
 
     /// A raw 64-sector disk target.
     fn disk() -> ScsiDevice {
-        let path = tmp("disk");
+        let dir = TempPath::dir("scsi");
+        let path = dir.join("img");
         std::fs::write(&path, vec![0u8; 64 * 512]).expect("test image");
         let node = crate::block_node::RawNode::open(&path).expect("open");
         let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
-        let _ = std::fs::remove_file(&path); // the open handle keeps it
         ScsiDevice::new(Box::new(node), false, "test".into(), Vec::new(), identity).with_write_cache(true)
     }
 
@@ -1786,9 +1776,10 @@ mod tests {
     /// The raw and overlay backends take FUA without error.
     #[test]
     fn write_10_with_fua_on_the_real_backends() {
-        let base = tmp("fua-base");
+        let dir = TempPath::dir("scsi");
+        let base = dir.join("base");
         std::fs::write(&base, vec![0u8; 8 * 512]).unwrap();
-        let overlay = tmp("fua-overlay");
+        let overlay = dir.join("overlay");
         let identity = ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 ");
         let raw = crate::block_node::RawNode::open(&base).unwrap();
         let backing = crate::block_node::RawNode::open_readonly(&base).unwrap();
@@ -1798,9 +1789,6 @@ mod tests {
             let r = dev.request(&request(&[0x2a, 0x08, 0, 0, 0, 2, 0, 0, 1, 0], Some(vec![0x77; 512]))).unwrap();
             assert_eq!(r.status, 0x00);
         }
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(&overlay);
-        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
     }
 
     /// A WRITE to a disk is synced in the background within the flush
@@ -1808,8 +1796,9 @@ mod tests {
     /// is shortened from the real 5 s; the node tests cover the timer.)
     #[test]
     fn a_disk_write_is_synced_in_the_background_and_an_idle_disk_is_not() {
+        let dir = TempPath::dir("scsi");
         let interval = std::time::Duration::from_millis(100);
-        let path = tmp("bgsync");
+        let path = dir.join("img");
         std::fs::write(&path, vec![0u8; 8 * 512]).unwrap();
         let node = crate::block_node::RawNode::open_with_flush_interval(&path, interval).unwrap();
         let bg = node.background().expect("a writable image has one");
@@ -1836,7 +1825,6 @@ mod tests {
         assert_eq!(bg.syncs(), 1, "idle again");
         // Dropping the disk ends the thread.
         drop(dev);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// NetBSD's cd driver reads the TOC asking for 12 bytes: header and
@@ -1875,8 +1863,7 @@ mod tests {
     #[test]
     fn a_disc_change_loads_a_chd_cd() {
         use libchdman_rs::cd::{create_from_iso, CdCreateOptions};
-        let dir = std::env::temp_dir().join(format!("iris-discswap-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempPath::dir("discswap");
         let iso = dir.join("disc.iso");
         std::fs::write(&iso, vec![0x42u8; 16 * 2048]).unwrap();
         let chd = dir.join("disc.chd");
@@ -1901,7 +1888,6 @@ mod tests {
         let read = cd.request(&request(&[0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0], None)).unwrap();
         assert_eq!(read.status, 0x00);
         assert_eq!(read.data, vec![0x42u8; 2048]);
-        let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn bus_reset_reports_unit_attention_once_and_keeps_block_size() {
