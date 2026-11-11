@@ -378,6 +378,11 @@ impl DevLog {
         self.writers.lock().push(sink);
     }
 
+    /// Unregister a sink `add_sink` took, such as a monitor client that hung up.
+    pub fn remove_sink(&self, sink: &DevLogWriter) {
+        self.writers.lock().retain(|w| !Arc::ptr_eq(w, sink));
+    }
+
     /// Enable a module. Output will go to all connected monitor clients.
     pub fn enable(&self, m: LogModule) {
         self.modules[m as usize].enabled.store(true, Ordering::Relaxed);
@@ -644,5 +649,33 @@ mod tests {
         }
         assert_eq!(LogModule::from_str("module"), Some(LogModule::Module));
         assert_eq!(LogModule::from_str("nothing"), None);
+    }
+
+    /// A monitor connection's log sink holds a handle on its socket. One left
+    /// behind after the client hangs up is a file descriptor until a log line
+    /// happens to fail on it, and with no module logging that is never: a
+    /// harness that opens a connection per command runs out of descriptors.
+    #[test]
+    fn a_monitor_connection_takes_its_log_sink_away() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let dl = init_devlog();
+        let dl = DEVLOG.get().unwrap_or(&dl);
+        let monitor = Arc::new(crate::monitor::Monitor::new());
+        monitor.clone().start_server("127.0.0.1:0".to_string());
+        let addr = monitor.bound_addr().expect("bound");
+        let before = dl.writers.lock().len();
+        for _ in 0..20 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            s.write_all(b"quit\n").unwrap();
+            let mut sink = Vec::new();
+            s.read_to_end(&mut sink).expect("the monitor hung up");
+        }
+        monitor.shutdown();
+        // Other tests' connections may come and go meanwhile; twenty left
+        // behind cannot hide in that.
+        let after = dl.writers.lock().len();
+        assert!(after < before + 5, "{} sinks left by 20 connections", after - before);
     }
 }
