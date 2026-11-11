@@ -791,18 +791,18 @@ within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-3 flat-fill and 3 direct-state tests, plus 10 resident GPU and 8
-direct-scanout tests on each of Vulkan and D3D12, for 67 tests total. It
-requires the named backend on an integrated/discrete adapter and a native
-desktop, and fails rather than skipping when unavailable; a single-backend
-run is not the complete gate. See
+3 flat-fill, 3 command-ABI and 3 direct-state tests, plus 10 resident GPU and 8
+direct-scanout tests on each of Vulkan and D3D12. It requires the named
+backend on an integrated/discrete adapter and a native desktop, and fails
+rather than skipping when unavailable; a single-backend run is not the
+complete 70-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
 
-- [ ] Define plain-data command, state-slot and payload layouts.
-- [ ] Use fixed buffers/bind groups and bounded reusable batch sets.
-- [ ] Preserve ordered per-tile command lists.
+- [x] Define plain-data command, state-slot and payload layouts.
+- [x] Use fixed buffers/bind groups and bounded reusable batch sets.
+- [x] Preserve ordered per-tile command lists.
 - [ ] Implement blocks, spans and clears.
 - [ ] Implement integer, fractional and antialiased lines.
 - [ ] Implement RGB, auxiliary/CID/overlay and Z effects.
@@ -814,6 +814,15 @@ run is not the complete gate. See
 
 Complete when the strict corpus and representative live workloads report zero
 unsupported or CPU-fallback draws.
+
+The first M3 infrastructure slice is complete in the gated test-only backend.
+Its Rust and WGSL sides share a fixed 64-byte `RexCommand` and 256-byte
+normalized state slot. Each bounded reusable batch set permanently binds a
+1 MiB payload buffer large enough for one maximum HostRW batch; current flat
+fills use an empty payload, while later M3/M4 commands will reference ranges
+by word offset and length. Flat fills now execute through this ABI and the
+common ordered per-tile lists on Vulkan and D3D12. This does not broaden
+opcode coverage or enable live Newport wgpu rasterization.
 
 ### M4 - HostW staging
 

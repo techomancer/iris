@@ -744,6 +744,18 @@ the accepted prefix before latching a typed error. GPU failures also latch
 typed errors. The ordinary start does not create a resident refresh thread;
 tests may explicitly start a resident display worker on the injected device.
 
+The first M3 slice routes those fills through the command ABI that later
+opcodes extend: one fixed 64-byte command names a 256-byte normalized REX3
+state slot, inclusive destination and source bounds, ordering/hazard flags,
+and a payload word range. The full 1 MiB `Rex3Context` and its HostRW array
+are not uploaded as draw state. A bounded reusable pool (three sets by
+default) owns fixed command, state and 1 MiB payload buffers and stable bind
+groups for its lifetime. The accept-all bin pass omits board bind groups it
+does not read, keeping the raster requirement at eight storage buffers per
+shader stage. Current flat fills have empty payloads but already exercise
+the shared ordered per-tile command lists and the real Rust/WGSL layouts on
+both hardware backends.
+
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
 plane separately records its last possible write and whether its CPU shadow is
