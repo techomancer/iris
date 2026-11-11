@@ -42,7 +42,7 @@
 //!   interval late means the host held up the timer thread that also
 //!   delivers the clock interrupt IRIX refills the ring from, so the card's
 //!   clock is set back to the completion's due time (see
-//!   [`Inner::absorb_stall`]). The clock, output rate and UST fall behind
+//!   [`CardClock::absorb_stall`]). The clock, output rate and UST fall behind
 //!   wall time by the hold-ups; on-time completions win 1/32 of an interval
 //!   back each, and at most 200 ms is held back. Time the guest has read is
 //!   never taken back.
@@ -59,15 +59,16 @@
 //! Ported from hw/audio/sgi-rad1-audio.c in jamesbraid/qemu-sgi-origami.
 
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::AudioConfig;
+use crate::dev::host_pcm::{CardClock, Sink, Wav, PCM_CHANNELS};
 use crate::devlog::LogModule;
-use crate::host_audio::{HostOut, Resampler, WavWriter};
+use crate::host_audio::{HostOut, Resampler};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -163,16 +164,9 @@ const STATUS_ONESHOT_START: u32 = 0x40001;
 const STATUS_STOP: u32 = 0x1fffc;
 
 const UST_NS_PER_TICK: i64 = 960;
-/// Most of the card's clock held back for hold-ups, and the share of an
-/// interval won back per on-time completion (see [`Inner::absorb_stall`]).
-const STALL_MAX_NS: i64 = 200_000_000;
-const STALL_REPAY_DIV: i64 = 32;
-
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// The rate of a clock generator no guest has programmed.
 const FREQ_ANALOG: u64 = 44100;
-/// The WAV capture's rate.
-const WAV_RATE: u32 = 44100;
 const FREQ_AES_SUB: u64 = 48000 / 192;
 /// Ring bytes moved per DMA access; a whole number of frames of any type.
 const CHUNK_BYTES: u64 = 1024;
@@ -196,8 +190,6 @@ const STATUS_INTERVAL_MASK: u32 = 0x7fff;
 
 /// A 16-bit host sample sits in bits [23:8] of its 24-bit ring sample.
 const SAMPLE_SHIFT: u32 = 8;
-/// Words a host frame carries: the mixer takes two channels.
-const PCM_CHANNELS: usize = 2;
 /// The analog rings' words per frame.
 const ANALOG_WORDS: usize = 2;
 
@@ -295,94 +287,6 @@ impl Rate {
     /// The nearest whole rate, for the host stream.
     fn rounded_hz(self) -> u32 {
         ((self.num + self.den / 2) / self.den) as u32
-    }
-}
-
-/// Where decoded output goes: the host stream (through the shared resampler),
-/// an optional 44.1 kHz WAV file of what the card played, and for tests a
-/// plain buffer of the card's own frames.
-struct Sink {
-    host: Option<(HostOut, Resampler)>,
-    /// When the host stream was last tried and failed to open.
-    host_failed_at: Option<Instant>,
-    wav: Option<Wav>,
-    tap: Option<Arc<Mutex<Vec<i16>>>>,
-}
-
-/// How long to wait before trying to open the host stream again.
-const HOST_RETRY: Duration = Duration::from_secs(1);
-
-impl Sink {
-    /// Whether the host stream, wanted but not open, is due another try.
-    fn host_retry_due(&self, now: Instant) -> bool {
-        self.host.is_none() && self.host_failed_at.is_none_or(|t| now.duration_since(t) >= HOST_RETRY)
-    }
-
-    /// Play stereo frames the card produced at `rate` Hz. A muted output
-    /// still moves the ring; the host and the WAV get silence. Returns the
-    /// host ring's free and total samples.
-    fn play(&mut self, pcm: &[i16], rate: u32, muted: bool) -> Option<(usize, usize)> {
-        let silence;
-        let host_pcm = if muted {
-            silence = vec![0i16; pcm.len()];
-            &silence[..]
-        } else {
-            pcm
-        };
-        if let Some((out, rs)) = self.host.as_mut() {
-            if rs.in_rate != rate {
-                *rs = Resampler::new(rate, out.stream_rate);
-            }
-            for p in host_pcm.chunks_exact(PCM_CHANNELS) {
-                rs.push(p[0], p[1], &mut out.producer);
-            }
-        }
-        if let Some(w) = self.wav.as_mut() {
-            w.play(host_pcm, rate);
-        }
-        if let Some(t) = self.tap.as_ref() {
-            t.lock().extend_from_slice(pcm);
-        }
-        self.host.as_ref().map(|(out, _)| (out.producer.slots(), out.producer.buffer().capacity()))
-    }
-}
-
-/// A 44.1 kHz stereo 16-bit WAV of the output, converted from the card's
-/// rate, its sizes rewritten after every append so a file from a killed run
-/// still plays. A debugging aid: `IRIS_OCTANE_AUDIO_WAV`.
-struct Wav {
-    out: WavWriter,
-    rs: Resampler,
-}
-
-impl Wav {
-    fn create(path: &std::ffi::OsStr) -> Option<Self> {
-        let out = WavWriter::create(std::path::Path::new(path), WAV_RATE, PCM_CHANNELS as u16).ok()?;
-        Some(Self { out, rs: Resampler::new(WAV_RATE, WAV_RATE) })
-    }
-
-    /// Append frames the card produced at `rate` Hz.
-    fn play(&mut self, pcm: &[i16], rate: u32) {
-        if self.rs.in_rate != rate {
-            self.rs = Resampler::new(rate, WAV_RATE);
-        }
-        if self.rs.passthrough() {
-            self.append(pcm);
-            return;
-        }
-        // The resampler writes into a ring; take its output back out.
-        let frames = pcm.len() / PCM_CHANNELS;
-        let room = (frames * WAV_RATE as usize / rate.max(1) as usize + 2) * PCM_CHANNELS;
-        let (mut prod, mut cons) = rtrb::RingBuffer::<i16>::new(room);
-        for p in pcm.chunks_exact(PCM_CHANNELS) {
-            self.rs.push(p[0], p[1], &mut prod);
-        }
-        let out: Vec<i16> = std::iter::from_fn(|| cons.pop().ok()).collect();
-        self.append(&out);
-    }
-
-    fn append(&mut self, pcm: &[i16]) {
-        let _ = self.out.append(pcm);
     }
 }
 
@@ -773,14 +677,19 @@ impl Default for Rad1 {
 
 impl Rad1 {
     pub fn new() -> Self {
-        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION)) }
+        Self::with_clock(CardClock::new())
+    }
+
+    /// The card on a sample clock of the caller's.
+    pub(crate) fn with_clock(clock: CardClock) -> Self {
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), clock, RAD1_REVISION)) }
     }
 
     /// The RAD1 on the Onyx2's MediaIO daughtercard. Its PCI revision byte
     /// differs from the Octane's, and 0x88 and 0x8c do not mute it; the rest
     /// of the model is the same.
     pub fn mediaio() -> Self {
-        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), RAD1_REVISION_MEDIAIO)) }
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), CardClock::new(), RAD1_REVISION_MEDIAIO)) }
     }
 }
 
@@ -793,33 +702,18 @@ impl Rad1 {
     }
 }
 
-/// Lock order: `tick_pass`, then `stopped_at` (a leaf, taken by `now`),
+/// Lock order: `tick_pass`, then `stopped_at` (a leaf, taken by `now`; both
+/// in [`CardClock`]),
 /// then `state`. Rings and status slots are moved with `state` held: the
 /// DMA goes down through the Bridge and HEART, which never call back into
 /// the card, and a catch-up moves at most two revolutions of a ring.
 pub struct Inner {
     pci: PciFunctionState,
     state: Mutex<State>,
-    start: Instant,
-    /// When not `i64::MIN`, the clock in nanoseconds, for tests; no timer
-    /// is armed then.
-    fake_ns: AtomicI64,
-    /// Nanoseconds the card's clock stood still while the machine was
-    /// stopped, and when the current stop began: the sample clock, the UST
-    /// and the status schedule do not run on while the guest cannot see
-    /// them.
-    stopped_ns: AtomicI64,
-    stopped_at: Mutex<Option<Instant>>,
-    /// Nanoseconds taken off the card's clock for timer hold-ups (see
-    /// [`Inner::absorb_stall`]), and the latest time it has handed out.
-    stalled_ns: AtomicI64,
-    seen_ns: AtomicI64,
-    /// Held across each timer callback's work, so a stop can wait one out.
-    tick_pass: Mutex<()>,
+    /// The sample clock, its stops and hold-ups, and the timer bookkeeping
+    /// shared with other audio cards; reached through `Deref`.
+    clock: CardClock,
     timers: OnceLock<Arc<TimerManager>>,
-    /// Between `Device::start` and `Device::stop`: timers are armed only
-    /// then.
-    armed: AtomicBool,
     /// `[audio]` settings once host output is enabled; `None` (tests,
     /// `no_audio`) keeps the output channel running silently.
     audio_cfg: Mutex<Option<AudioConfig>>,
@@ -841,8 +735,15 @@ fn open_host_output(card: &Inner, cfg: &AudioConfig) -> Option<HostOut> {
     crate::host_audio::open_output(cfg, card.underruns.clone(), Arc::new(AtomicBool::new(true)), ring, "Octane audio", "IRIS_OCTANE_AUDIO_CAPTURE")
 }
 
+impl Deref for Inner {
+    type Target = CardClock;
+    fn deref(&self) -> &CardClock {
+        &self.clock
+    }
+}
+
 impl Inner {
-    fn new(me: Weak<Inner>, revision: u8) -> Self {
+    fn new(me: Weak<Inner>, clock: CardClock, revision: u8) -> Self {
         Self {
             pci: PciFunctionState::new(PciConfig::new(
                 PCI_VENDOR_SGI,
@@ -853,15 +754,8 @@ impl Inner {
                 0,
             )),
             state: Mutex::new(State::new(0)),
-            start: Instant::now(),
-            fake_ns: AtomicI64::new(i64::MIN),
-            stopped_ns: AtomicI64::new(0),
-            stalled_ns: AtomicI64::new(0),
-            seen_ns: AtomicI64::new(i64::MIN),
-            stopped_at: Mutex::new(None),
-            tick_pass: Mutex::new(()),
+            clock,
             timers: OnceLock::new(),
-            armed: AtomicBool::new(false),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
             open_host: open_host_output,
@@ -892,7 +786,7 @@ impl Inner {
     /// Whether timers may be armed: started, on a real clock, with a
     /// manager.
     fn timers_live(&self) -> Option<&Arc<TimerManager>> {
-        if !self.armed.load(Ordering::SeqCst) || self.fake_ns.load(Ordering::Relaxed) != i64::MIN {
+        if !self.armed.load(Ordering::SeqCst) || !self.runs_by_itself() {
             return None;
         }
         self.timers.get()
@@ -985,62 +879,10 @@ impl Inner {
         }
     }
 
-    fn now(&self) -> i64 {
-        let at = self.stopped_at.lock();
-        let t = self.clock_locked(&at);
-        self.seen_ns.fetch_max(t, Ordering::SeqCst);
-        t
-    }
-
-    /// The card's clock, with `stopped_at` held; not recorded as seen.
-    fn clock_locked(&self, at: &Option<Instant>) -> i64 {
-        let t = match self.fake_ns.load(Ordering::Relaxed) {
-            i64::MIN => {
-                let at = at.unwrap_or_else(Instant::now);
-                at.duration_since(self.start).as_nanos() as i64 - self.stopped_ns.load(Ordering::SeqCst)
-            }
-            t => t,
-        };
-        t - self.stalled_ns.load(Ordering::SeqCst)
-    }
-
-    /// The card's clock as a status completion due at `due` sees it. One
-    /// more than `interval` late means the host held up the timer thread and
-    /// the guest's clock interrupt with it; crediting that would carry the
-    /// pointer past IRIX's write point (36 to 90 frames ahead) and replay a
-    /// stale lap. So the clock goes back to `due`, at most [`STALL_MAX_NS`]
-    /// in all and never behind a time already handed out. An on-time one
-    /// wins back `interval / STALL_REPAY_DIV` of what is held back.
-    /// Emulator approximation; see the module notes.
-    fn absorb_stall(&self, due: i64, interval: i64) -> i64 {
-        let at = self.stopped_at.lock();
-        let t = self.clock_locked(&at);
-        let held = self.stalled_ns.load(Ordering::SeqCst);
-        let late = t - due;
-        if late > interval {
-            crate::pf_instant!(crate::perfetto::events::RAD_LATE, late / 1000);
-        }
-        let shift = if late > interval {
-            let floor = self.seen_ns.load(Ordering::SeqCst);
-            -late.min(STALL_MAX_NS - held).min(t.saturating_sub(floor)).max(0)
-        } else {
-            held.min(interval / STALL_REPAY_DIV)
-        };
-        self.stalled_ns.fetch_sub(shift, Ordering::SeqCst);
-        let t = t + shift;
-        self.seen_ns.fetch_max(t, Ordering::SeqCst);
-        t
-    }
-
     /// Stop the card's clock and hold the timers off guest memory while the
     /// machine is stopped. Once this returns no timer callback is under way.
     fn pause(&self) {
-        {
-            let mut at = self.stopped_at.lock();
-            if at.is_none() {
-                *at = Some(Instant::now());
-            }
-        }
+        self.stop_clock();
         self.disarm();
         drop(self.tick_pass.lock());
     }
@@ -1049,12 +891,7 @@ impl Inner {
     /// host stream (see [`Inner::enable_output`]).
     fn resume(&self) {
         self.open_sink(false);
-        {
-            let mut at = self.stopped_at.lock();
-            if let Some(t) = at.take() {
-                self.stopped_ns.fetch_add(t.elapsed().as_nanos() as i64, Ordering::SeqCst);
-            }
-        }
+        self.start_clock();
         self.armed.store(true, Ordering::SeqCst);
         let mut s = self.state.lock();
         self.arm_audio(&mut s);
@@ -1072,10 +909,6 @@ impl Inner {
                 tm.remove(id);
             }
         }
-    }
-
-    fn stopped(&self) -> bool {
-        self.stopped_at.lock().is_some()
     }
 
     /// Back to the power-on state.
@@ -1880,15 +1713,7 @@ impl Saveable for Rad1 {
         // The clock reads `saved_now` again, with the same time held back
         // for timer hold-ups, which later on-time completions repay; and
         // nothing later than the saved time has been handed out.
-        i.stalled_ns.store(saved_stalled, Ordering::SeqCst);
-        if i.fake_ns.load(Ordering::Relaxed) != i64::MIN {
-            i.fake_ns.store(saved_now + saved_stalled, Ordering::Relaxed);
-        } else {
-            let at = i.stopped_at.lock().unwrap_or_else(Instant::now);
-            let since_start = at.duration_since(i.start).as_nanos() as i64;
-            i.stopped_ns.store(since_start - saved_now - saved_stalled, Ordering::SeqCst);
-        }
-        i.seen_ns.store(saved_now, Ordering::SeqCst);
+        i.restore(saved_now, saved_stalled);
         Ok(())
     }
 }
