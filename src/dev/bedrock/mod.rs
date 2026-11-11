@@ -291,6 +291,10 @@ impl Bedrock {
     pub(crate) fn generation_base(&self) -> *mut AtomicU64 {
         self.md.generation_base()
     }
+    #[cfg(feature = "jitv2")]
+    pub(crate) fn inline_generation_base(&self) -> *mut AtomicU64 {
+        self.md.inline_generation_base()
+    }
     /// MD's cell register bit 0, which gates the register window and the
     /// board's Hub-special windows. One atomic load.
     #[inline]

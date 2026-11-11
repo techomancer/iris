@@ -133,6 +133,12 @@ pub trait MappedMemory {
     #[cfg(feature = "jitv2")]
     fn gen_window_base(&self) -> *mut AtomicU64;
 
+    /// Base of the inline counters' window (`GenPtr::inline`), laid out as
+    /// the generation window is. Compiled stores bump these, and nothing else
+    /// does.
+    #[cfg(feature = "jitv2")]
+    fn inline_gen_window_base(&self) -> *mut AtomicU64;
+
     /// Bitmap of which 64MB regions are wholly backed by a direct mapping,
     /// one bit per region — 4GB / 64 = 64MB per bit, so the whole space fits
     /// in a single `u64`.
@@ -197,6 +203,14 @@ pub struct PpMemory {
     gen_base: *mut AtomicU64,
     #[cfg(feature = "jitv2")]
     _gen_own: AddrSpace,
+    /// The counters compiled stores bump (`GenPtr::inline`), laid out and
+    /// mapped exactly as `gen_mem` is. Nothing else writes them.
+    #[cfg(feature = "jitv2")]
+    inline_mem: Arc<SharedMem>,
+    #[cfg(feature = "jitv2")]
+    inline_base: *mut AtomicU64,
+    #[cfg(feature = "jitv2")]
+    _inline_own: AddrSpace,
 }
  
 // Safety: same contract as `Memory` — access is serialized through the bus.
@@ -233,16 +247,21 @@ impl PpMemory {
 
         // Generation counters get the same treatment: a shared object, sized
         // at the fixed 512:1 ratio, plus a private mapping of their own. The
-        // ratio is what lets a window map data and gen in lockstep.
+        // ratio is what lets a window map data and gen in lockstep. Both
+        // kinds, shared and inline (`GenPtr`), are laid out the same way.
         #[cfg(feature = "jitv2")]
-        let (gen_mem, gen_base, gen_own) = {
+        let counters = || -> io::Result<_> {
             let gen_bytes = super::map::align_up(size_bytes / GEN_RATIO as usize);
             let gm = Arc::new(SharedMem::new(gen_bytes)?);
             let go = AddrSpace::reserve(gen_bytes)?;
             unsafe { go.map(0, gen_bytes, &gm, 0, Prot::ReadWrite)? };
             let gb = go.base() as *mut AtomicU64;
-            (gm, gb, go)
+            Ok((gm, gb, go))
         };
+        #[cfg(feature = "jitv2")]
+        let (gen_mem, gen_base, gen_own) = counters()?;
+        #[cfg(feature = "jitv2")]
+        let (inline_mem, inline_base, inline_own) = counters()?;
 
         Ok(Self {
             mem,
@@ -256,6 +275,12 @@ impl PpMemory {
             gen_base,
             #[cfg(feature = "jitv2")]
             _gen_own: gen_own,
+            #[cfg(feature = "jitv2")]
+            inline_mem,
+            #[cfg(feature = "jitv2")]
+            inline_base,
+            #[cfg(feature = "jitv2")]
+            _inline_own: inline_own,
         })
     }
 
@@ -280,7 +305,7 @@ impl PpMemory {
     pub fn bump_gen_off(&self, off: usize) {
         let page = (off & self.mask()) / JITV2_PAGE_SIZE;
         // Release, after the bytes, as `bump_gen`.
-        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Release) };
+        unsafe { crate::cpu::jitv2::page_gen::bump(&*self.gen_base.add(page)) };
     }
 
     /// The shared object behind this bank, for mapping it into a window.
@@ -313,6 +338,12 @@ impl PpMemory {
         &self.gen_mem
     }
 
+    /// JIT v2: the shared object holding the counters compiled stores bump.
+    #[cfg(feature = "jitv2")]
+    pub fn inline_gen_shared(&self) -> &Arc<SharedMem> {
+        &self.inline_mem
+    }
+
     /// Number of generation counters this bank has (one per 4KB page).
     #[cfg(feature = "jitv2")]
     #[inline(always)]
@@ -327,27 +358,33 @@ impl PpMemory {
         let page = self.off(addr) / JITV2_PAGE_SIZE;
         // Release, after the bytes, for the same reason `Memory::bump_gen` is: a
         // compile snapshot that sees the new generation must see them too.
-        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Release) };
+        unsafe { crate::cpu::jitv2::page_gen::bump(&*self.gen_base.add(page)) };
     }
 
-    /// JIT v2: raw pointer to the generation counter for `addr`'s page.
+    /// JIT v2: raw pointers to the generation counters for `addr`'s page.
     ///
     /// Valid for the lifetime of `&self`. Note the window offers the same
-    /// counter at `gen_window_base + (phys >> 12) * 8` — the two resolve to the
-    /// same physical memory whenever this bank is mapped, because
-    /// [`PpMemSpace::map_bank`] maps data and gen from these same two objects
+    /// counters at `gen_window_base + (phys >> 12) * 8` and
+    /// `inline_gen_window_base + (phys >> 12) * 8` — they resolve to the same
+    /// physical memory whenever this bank is mapped, because
+    /// [`PpMemSpace::map_bank`] maps data and counters from these same objects
     /// in lockstep.
     #[cfg(feature = "jitv2")]
     #[inline]
-    pub fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
+    pub fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         let page = self.off(addr) / JITV2_PAGE_SIZE;
-        unsafe { self.gen_base.add(page) as *const AtomicU64 }
+        unsafe {
+            crate::traits::GenPtr {
+                shared: self.gen_base.add(page) as *const AtomicU64,
+                inline: self.inline_base.add(page) as *const AtomicU64,
+            }
+        }
     }
 
     #[cfg(feature = "jitv2")]
     pub fn bump_gen_all(&self) {
         for i in 0..self.gen_count() {
-            unsafe { (*self.gen_base.add(i)).fetch_add(1, Ordering::Release) };
+            unsafe { crate::cpu::jitv2::page_gen::bump(&*self.gen_base.add(i)) };
         }
     }
 
@@ -531,7 +568,7 @@ impl BusDevice for PpMemory {
             let end = self.off(last) / JITV2_PAGE_SIZE;
             // Release, after the bytes (`bump_gen`).
             let bump = |page: usize| unsafe {
-                (*self.gen_base.add(page)).fetch_add(1, Ordering::Release);
+                crate::cpu::jitv2::page_gen::bump(&*self.gen_base.add(page));
             };
             if end >= start {
                 for page in start..=end {
@@ -593,7 +630,7 @@ impl BusDevice for PpMemory {
 
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         PpMemory::gen_ptr(self, addr)
     }
 }
@@ -630,7 +667,7 @@ impl BusDevice for Arc<PpMemory> {
     fn write_block(&self, addr: u64, buf: &[u64]) -> u32 { (**self).write_block(addr, buf) }
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 { (**self).gen_ptr(addr) }
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr { (**self).gen_ptr(addr) }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +713,12 @@ pub struct PpMemSpace {
     /// Per-bank generation objects, parallel to `banks`.
     #[cfg(feature = "jitv2")]
     gen_banks: Vec<Arc<SharedMem>>,
+    /// The inline counters' window and objects (`GenPtr::inline`), mapped
+    /// wherever and whenever `gen_space` is.
+    #[cfg(feature = "jitv2")]
+    inline_space: AddrSpace,
+    #[cfg(feature = "jitv2")]
+    inline_banks: Vec<Arc<SharedMem>>,
     /// Default publication target — see [`OwnBitmap`]. Read through
     /// `mapped_bitmap()`; written only via `state.sink`.
     own_bitmap: OwnBitmap,
@@ -775,6 +818,10 @@ impl PpMemSpace {
             gen_space: AddrSpace::reserve((window / GEN_RATIO) as usize)?,
             #[cfg(feature = "jitv2")]
             gen_banks: banks.iter().map(|b| b.gen_shared().clone()).collect(),
+            #[cfg(feature = "jitv2")]
+            inline_space: AddrSpace::reserve((window / GEN_RATIO) as usize)?,
+            #[cfg(feature = "jitv2")]
+            inline_banks: banks.iter().map(|b| b.inline_gen_shared().clone()).collect(),
             own_bitmap,
             state: UnsafeCell::new(SpaceState {
                 window,
@@ -836,7 +883,7 @@ impl PpMemSpace {
                 let gran = super::map::granularity() as u64;
                 if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 && gen_src % gran == 0 {
                     unsafe {
-                        self.gen_space.map(gen_off as usize, gen_len as usize, &self.gen_banks[bank], gen_src, Prot::ReadWrite)?;
+                        self.map_gens(gen_off, gen_len, bank, gen_src)?;
                     }
                 } else {
                     debug_assert!(false, "ppmem: range gen [{gen_off:#x}, +{gen_len:#x}) not mappable at granularity {gran:#x}");
@@ -1056,6 +1103,31 @@ impl PpMemSpace {
         }
     }
 
+    /// Map `len` bytes of bank `bank`'s counters, both kinds, at `off` in
+    /// their windows, from `src` in the bank's objects.
+    ///
+    /// # Safety
+    /// As `AddrSpace::map`.
+    #[cfg(feature = "jitv2")]
+    unsafe fn map_gens(&self, off: u64, len: u64, bank: usize, src: u64) -> io::Result<()> {
+        unsafe {
+            self.gen_space.map(off as usize, len as usize, &self.gen_banks[bank], src, Prot::ReadWrite)?;
+            self.inline_space.map(off as usize, len as usize, &self.inline_banks[bank], src, Prot::ReadWrite)
+        }
+    }
+
+    /// Scrub `len` bytes of both counter windows at `off`.
+    ///
+    /// # Safety
+    /// As `AddrSpace::scrub`.
+    #[cfg(feature = "jitv2")]
+    unsafe fn scrub_gens(&self, off: u64, len: u64) -> io::Result<()> {
+        unsafe {
+            self.gen_space.scrub(off as usize, len as usize)?;
+            self.inline_space.scrub(off as usize, len as usize)
+        }
+    }
+
     /// Run a mapping change with every held page's mark off, and put the
     /// marks back after, whether or not the change succeeded.
     fn remapping(&self, change: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
@@ -1094,7 +1166,7 @@ impl PpMemSpace {
                 let (gs, ge) = ((at / GEN_RATIO) & !(g - 1), (next / GEN_RATIO).div_ceil(g) * g);
                 let touches = |m: &Mapping| m.at < ge * GEN_RATIO && m.at + m.len > gs * GEN_RATIO;
                 if !st.mappings.iter().any(touches) {
-                    let _ = unsafe { self.gen_space.scrub(gs as usize, (ge - gs) as usize) };
+                    let _ = unsafe { self.scrub_gens(gs, ge - gs) };
                 }
             }
             at = next;
@@ -1181,9 +1253,7 @@ impl MappedMemory for PpMemSpace {
                 let gen_len = m.len / GEN_RATIO;
                 let gran = super::map::granularity() as u64;
                 if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 {
-                    let _ = unsafe {
-                        self.gen_space.scrub(gen_off as usize, gen_len as usize)
-                    };
+                    let _ = unsafe { self.scrub_gens(gen_off, gen_len) };
                 }
             }
         }
@@ -1228,15 +1298,7 @@ impl MappedMemory for PpMemSpace {
                     let gen_len = chunk / GEN_RATIO;
                     let gran = super::map::granularity() as u64;
                     if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 {
-                        unsafe {
-                            self.gen_space.map(
-                                gen_off as usize,
-                                gen_len as usize,
-                                &self.gen_banks[bank],
-                                0,
-                                Prot::ReadWrite,
-                            )?;
-                        }
+                        unsafe { self.map_gens(gen_off, gen_len, bank, 0)? };
                     }
                 }
                 placed += chunk;
@@ -1299,15 +1361,7 @@ impl MappedMemory for PpMemSpace {
                 let gen_len_mapped = super::map::align_up(gen_len as usize) as u64;
                 let gen_bank_len = self.gen_banks[bank].len() as u64;
                 if gen_off % gran == 0 && gen_len_mapped <= gen_bank_len {
-                    unsafe {
-                        self.gen_space.map(
-                            gen_off as usize,
-                            gen_len_mapped as usize,
-                            &self.gen_banks[bank],
-                            0,
-                            Prot::ReadWrite,
-                        )?;
-                    }
+                    unsafe { self.map_gens(gen_off, gen_len_mapped, bank, 0)? };
                 } else {
                     debug_assert!(false,
                         "ppmem: alias gen range [{gen_off:#x}, +{gen_len_mapped:#x}) not mappable \
@@ -1328,6 +1382,11 @@ impl MappedMemory for PpMemSpace {
     #[cfg(feature = "jitv2")]
     fn gen_window_base(&self) -> *mut AtomicU64 {
         self.gen_space.base() as *mut AtomicU64
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn inline_gen_window_base(&self) -> *mut AtomicU64 {
+        self.inline_space.base() as *mut AtomicU64
     }
 
     unsafe fn set_bitmap_sink2(&self, ptr: *mut u64) {
@@ -1546,6 +1605,30 @@ mod tests {
             *(w.add(3 * 8 * MB + 64) as *mut u32) = 0xABCD_EF01;
             assert_eq!(*(w.add(64) as *const u32), 0xABCD_EF01, "mirror not bidirectional");
         }
+    }
+
+    /// Compiled stores bump the inline counters through their window, and a
+    /// page claimed through the bank must read the very same counter, at
+    /// every mirror. Bus writes bump the shared counter and leave it alone.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn inline_counters_are_mapped_in_lockstep_and_apart_from_the_shared_ones() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (space, banks) = PpMemSpace::with_bank_sizes(&[8]).unwrap();
+        let base = 0x0800_0000u64;
+        space.map_bank(0, base, 16 * MB as u64, 8 * MB as u64).unwrap();
+        let page = 0x3000u64;
+        let inline_at = |at: u64| unsafe { &*space.inline_gen_window_base().add((at >> 12) as usize) };
+        inline_at(base + page).fetch_add(1, Relaxed);
+        assert_eq!(inline_at(base + 8 * MB as u64 + page).load(Relaxed), 1, "a mirror shares the counter");
+        let g = banks[0].gen_ptr(page);
+        assert_eq!(unsafe { (*g.inline).load(Relaxed) }, 1, "the bank's own pointer reads it");
+        let shared = unsafe { (*g.shared).load(Relaxed) };
+        assert_eq!(banks[0].write32(page, 1), crate::traits::BUS_OK);
+        assert_eq!(unsafe { (*g.shared).load(Relaxed) }, shared + 1, "a bus write bumps the shared counter");
+        assert_eq!(unsafe { (*g.inline).load(Relaxed) }, 1, "and not the inline one");
+        space.clear_mappings();
+        assert_eq!(inline_at(base + page).load(Relaxed), 0, "a cleared window reads zero");
     }
 
     /// Clearing the mappings must leave the window readable. JIT compile
@@ -1818,12 +1901,12 @@ mod tests {
     #[test]
     fn write_bumps_only_the_touched_page_gen() {
         let m = PpMemory::new(8);
-        let g0 = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
+        let g0 = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
+        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) };
         m.write32(0, 0x1234);
-        assert_eq!(unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) }, g0 + 1);
+        assert_eq!(unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) }, g0 + 1);
         assert_eq!(
-            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) },
+            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) },
             g1,
             "untouched page must not bump"
         );
@@ -1833,9 +1916,9 @@ mod tests {
     #[test]
     fn read_does_not_bump_gen() {
         let m = PpMemory::new(8);
-        let before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let before = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
         let _ = m.read32(0);
-        assert_eq!(unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) }, before);
+        assert_eq!(unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) }, before);
     }
 
     #[cfg(feature = "jitv2")]
@@ -1843,12 +1926,12 @@ mod tests {
     fn write_block_bumps_every_page_it_spans() {
         let m = PpMemory::new(8);
         let start = (JITV2_PAGE_SIZE - 8) as u64;
-        let g0 = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
+        let g0 = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
+        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) };
         m.write_block(start, &[0u64, 0u64]);
-        assert_eq!(unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) }, g0 + 1);
+        assert_eq!(unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) }, g0 + 1);
         assert_eq!(
-            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) },
+            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) },
             g1 + 1
         );
     }
@@ -2071,7 +2154,7 @@ mod tests {
         space.clear_mappings();
         space.map_bank(1, 0, 64 * MB as u64, 64 * MB as u64).unwrap();
         assert_eq!(gen(at()) / GEN_HELD, 2, "on the counter that backs the page now");
-        assert_eq!(gen(banks[0].gen_ptr(0x2000)) / GEN_HELD, 0, "and off the old one");
+        assert_eq!(gen(banks[0].gen_ptr(0x2000).shared) / GEN_HELD, 0, "and off the old one");
         space.release_line_page(a, 0x2000);
         assert_eq!(gen(at()) / GEN_HELD, 1);
         space.release_line_page(b, 0x2040);
@@ -2144,7 +2227,7 @@ mod tests {
         assert!(space.held_line_pages(a).is_empty() && space.held_line_pages(b).is_empty());
         #[cfg(feature = "jitv2")]
         for n in 0..64 {
-            let gen = unsafe { (*banks[0].gen_ptr(n * page)).load(Ordering::Relaxed) };
+            let gen = unsafe { (*banks[0].gen_ptr(n * page).shared).load(Ordering::Relaxed) };
             assert!(gen < crate::cpu::jitv2::jitv2::GEN_HELD, "page {n} keeps a mark");
         }
         let _ = banks;

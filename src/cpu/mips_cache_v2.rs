@@ -305,9 +305,10 @@ pub struct JitDcGeometry {
     /// probe, no LRU and no dirty bit (the R10000's shadow cache). The other
     /// fields are then unused.
     pub tagless: bool,
-    /// Inline stores bump the page generation with an atomic add: other writers
-    /// are active, and a plain add landing after theirs would move the counter
-    /// backwards and let stale code publish.
+    /// Inline stores bump the page's inline counter (`GenPtr::inline`) with an
+    /// atomic add: several CPUs store into one page, and a plain add landing
+    /// after another CPU's would lose its bump and let stale code publish. On
+    /// one CPU the counter has no other writer.
     pub atomic_gen: bool,
     /// The ppmem window's `window_shift`: its bitmap's region size, baked
     /// into the mapped test on every guest load and store.
@@ -742,10 +743,10 @@ pub trait MipsCache: Send + Sync {
     /// (`tc_base + phys`). Null until `set_transparent_base` runs.
     fn tcache_base_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
 
-    /// tcache: base of the jitv2 per-page generation array (`[AtomicU64]`,
-    /// indexed by `phys >> 12`). An inline store through the ppmem window
-    /// must bump this or self-modifying code stops invalidating compiled
-    /// regions — see `tc_bump_gen`. Null when jitv2/ppmem is not wired up.
+    /// tcache: base of the jitv2 per-page inline counters (`[AtomicU64]`,
+    /// indexed by `phys >> 12`, `GenPtr::inline`), which compiled stores
+    /// through the ppmem window bump, or self-modifying code stops
+    /// invalidating compiled regions. Null when jitv2/ppmem is not wired up.
     #[cfg(feature = "jitv2")]
     fn tcache_gen_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
 
@@ -791,14 +792,15 @@ pub trait MipsCache: Send + Sync {
     /// where there is no LRU state at all.
     fn jit_dc_lru_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
 
-    /// tcache + jitv2: hand the cache ppmem's generation-window base, so window
-    /// writes bump the per-page counter jitv2 validates compiled code against.
-    /// Default no-op.
+    /// tcache + jitv2: hand the cache ppmem's two counter windows, so window
+    /// writes bump the per-page counters jitv2 validates compiled code
+    /// against: `gen_base` for the cache's own window stores, `inline_base`
+    /// for compiled ones (`GenPtr`). Default no-op.
     ///
     /// # Safety
-    /// `gen_base` must be ppmem's gen window base and outlive this cache.
+    /// Both must be ppmem's counter window bases and outlive this cache.
     #[cfg(feature = "jitv2")]
-    unsafe fn set_tcache_gen_window(&self, _gen_base: *mut AtomicU64) {}
+    unsafe fn set_tcache_gen_window(&self, _gen_base: *mut AtomicU64, _inline_base: *mut AtomicU64) {}
 
     /// L1/L2 geometry, so CP0 Config reports this model rather than a build-time constant.
     const IC_SIZE: usize;
@@ -1470,6 +1472,9 @@ pub struct CpuCache<
     /// the guest just modified.
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut AtomicU64>,
+    /// The inline counters' window, for compiled stores: `tcache_gen_ptr`.
+    #[cfg(feature = "jitv2")]
+    tc_inline_gen: UnsafeCell<*mut AtomicU64>,
 
     // Debug tracking - cache line boundaries and indices for tracked address
     #[cfg(feature = "debug_cache")]
@@ -1694,6 +1699,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             tc_bitmap: UnsafeCell::new(0),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
+            #[cfg(feature = "jitv2")]
+            tc_inline_gen: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "r5ksc_triton")]
             l2_enabled: false, // starts disabled; PROM enables via CONFIG_SE
             // Const-guarded: a direct-mapped model allocates none of these.
@@ -1860,8 +1867,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// `gen_base` must be ppmem's gen window base, valid for the process
     /// lifetime.
     #[cfg(feature = "jitv2")]
-    pub unsafe fn set_tcache_gen_window_impl(&self, gen_base: *mut AtomicU64) {
+    pub unsafe fn set_tcache_gen_window_impl(&self, gen_base: *mut AtomicU64, inline_base: *mut AtomicU64) {
         unsafe { *self.tc_gen.get() = gen_base };
+        unsafe { *self.tc_inline_gen.get() = inline_base };
     }
 
     /// tcache: is this cache transparent? A constant (the feature and `TC`),
@@ -3780,7 +3788,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
 
     #[cfg(feature = "jitv2")]
-    fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_gen.get() as *mut u8 } }
+    fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_inline_gen.get() as *mut u8 } }
 
     fn jit_l2_tags_ptr(&self) -> *mut u8 {
         if !HAS_L2 {
@@ -3816,6 +3824,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             }
             if unsafe { *self.tc_base.get() }.is_null()
                 || unsafe { *self.tc_gen.get() }.is_null()
+                || unsafe { *self.tc_inline_gen.get() }.is_null()
             {
                 return JitDcGeometry::unsupported();
             }
@@ -3857,8 +3866,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     #[cfg(feature = "jitv2")]
-    unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
-        unsafe { self.set_tcache_gen_window_impl(gen_base) }
+    unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64, inline_base: *mut AtomicU64) {
+        unsafe { self.set_tcache_gen_window_impl(gen_base, inline_base) }
     }
 
     const IC_SIZE: usize = IC_SIZE;
@@ -6821,7 +6830,7 @@ mod tcache_tests {
         unsafe {
             tc.set_tcache_window_impl(space.window_base());
             space.set_bitmap_sink2(tc.tc_bitmap_ptr());
-            tc.set_tcache_gen_window_impl(space.gen_window_base());
+            tc.set_tcache_gen_window_impl(space.gen_window_base(), space.inline_gen_window_base());
         }
 
         let phys = BASE + 0x3000;

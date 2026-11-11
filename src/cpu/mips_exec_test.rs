@@ -152,8 +152,8 @@ mod tests {
         // staying null here is still fine (and simplest — no per-page
         // counter storage needed in this basic MockMemory at all).
         #[cfg(feature = "jitv2")]
-        fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
-            std::ptr::null()
+        fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr {
+            crate::traits::GenPtr::NONE
         }
     }
 
@@ -5772,11 +5772,11 @@ mod tests {
         }
         fn read64(&self, addr: u64) -> BusRead64 { BusRead64::ok(self.get_double((addr & !7) as u64)) }
         fn write64(&self, addr: u64, val: u64) -> u32 { self.set_double((addr & !7) as u64, val); BUS_OK }
-        fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+        fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
             let page = (addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32;
             let mut gens = self.gens.lock().unwrap();
             let counter = gens.entry(page).or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
-            counter.as_ref() as *const std::sync::atomic::AtomicU64
+            crate::traits::GenPtr::bus_only(counter.as_ref())
         }
     }
 

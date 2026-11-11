@@ -235,6 +235,10 @@ impl Md {
     pub(super) fn generation_base(&self) -> *mut AtomicU64 {
         self.memory.generations().base()
     }
+    #[cfg(feature = "jitv2")]
+    pub(super) fn inline_generation_base(&self) -> *mut AtomicU64 {
+        self.memory.generations().inline_base()
+    }
     fn advance(s: &mut State, elapsed: u64) {
         s.clock_ns = s.clock_ns.saturating_add(elapsed);
         if s.selftest_deadline.is_some_and(|end| s.clock_ns >= end) {
@@ -596,7 +600,7 @@ impl BusDevice for DmaView {
         Some(swapped)
     }
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, address: u64) -> crate::traits::GenPtr {
         self.0.gen_ptr(address)
     }
 }
@@ -632,7 +636,7 @@ impl BusDevice for UncachedView {
     uncached_rw!(read32, write32, BusRead32, u32);
     uncached_rw!(read64, write64, BusRead64, u64);
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, address: u64) -> crate::traits::GenPtr {
         self.0.gen_ptr(address)
     }
 }
@@ -1053,7 +1057,7 @@ mod tests {
         let at = 5 * BANK_SPAN + 0x40;
         assert_eq!(view.write64(at, 7), BUS_OK);
         #[cfg(feature = "jitv2")]
-        let before = unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) };
+        let before = unsafe { (*view.gen_ptr(at).shared).load(Ordering::Relaxed) };
         assert_eq!(view.cas64(at, 6, 9), Some(false));
         assert_eq!(view.read64(at).data, 7);
         assert_eq!(view.cas64(at, 7, 9), Some(true));
@@ -1061,7 +1065,7 @@ mod tests {
         assert_eq!(view.cas32(at + 4, 9, 3), Some(true));
         assert_eq!(view.read64(at).data, 3);
         #[cfg(feature = "jitv2")]
-        assert!(unsafe { (*view.gen_ptr(at)).load(Ordering::Relaxed) } > before);
+        assert!(unsafe { (*view.gen_ptr(at).shared).load(Ordering::Relaxed) } > before);
         assert_eq!(view.cas64(7 * BANK_SPAN, 0, 1), None, "no bank there");
     }
 
@@ -1106,16 +1110,16 @@ mod tests {
     fn code_pages_above_4_gib_keep_a_logical_generation() {
         let md = tezro();
         let above = 4 * BANK_SPAN + 0x2000;
-        let pointer = md.dma_view().gen_ptr(above);
+        let pointer = md.dma_view().gen_ptr(above).shared;
         assert!(!pointer.is_null());
-        assert_ne!(pointer, md.dma_view().gen_ptr(5 * BANK_SPAN + 0x2000));
-        assert!(md.dma_view().gen_ptr(8 * BANK_SPAN).is_null(), "past the node's 8 GiB");
-        assert!(md.dma_view().gen_ptr(4 * BANK_SPAN + (512 << 20)).is_null(), "past the largest bank there");
+        assert_ne!(pointer, md.dma_view().gen_ptr(5 * BANK_SPAN + 0x2000).shared);
+        assert!(md.dma_view().gen_ptr(8 * BANK_SPAN).shared.is_null(), "past the node's 8 GiB");
+        assert!(md.dma_view().gen_ptr(4 * BANK_SPAN + (512 << 20)).shared.is_null(), "past the largest bank there");
         let before = unsafe { (*pointer).load(Ordering::Relaxed) };
         assert_eq!(md.dma_view().write64(above, 1), BUS_OK);
         assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
         md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32));
-        assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
+        assert_eq!(md.dma_view().gen_ptr(above).shared, pointer, "a bank swap keeps the counter");
     }
 
     /// A bank configuration write moves memory under every processor's
@@ -1227,8 +1231,8 @@ mod tests {
         {
             let md = configured();
             let ram = md.physical();
-            let first = ram.gen_ptr(0);
-            let second = ram.gen_ptr(BANK_SPAN);
+            let first = ram.gen_ptr(0).shared;
+            let second = ram.gen_ptr(BANK_SPAN).shared;
             assert!(!first.is_null() && !second.is_null());
             assert_ne!(first, second);
             let before = unsafe { (*first).load(Ordering::Relaxed) };
@@ -1236,10 +1240,10 @@ mod tests {
             assert!(unsafe { (*first).load(Ordering::Relaxed) } > before);
             md.md_bus().write64(8, 0x33 | (1 << 32));
             // The window address stays fixed while its backing bank changes.
-            assert_eq!(ram.gen_ptr(0), first);
-            assert_eq!(ram.gen_ptr(BANK_SPAN), second);
-            let bank0 = ram.banks()[0].gen_ptr(0);
-            let bank1 = ram.banks()[1].gen_ptr(0);
+            assert_eq!(ram.gen_ptr(0).shared, first);
+            assert_eq!(ram.gen_ptr(BANK_SPAN).shared, second);
+            let bank0 = ram.banks()[0].gen_ptr(0).shared;
+            let bank1 = ram.banks()[1].gen_ptr(0).shared;
             let before0 = unsafe { (*bank0).load(Ordering::Relaxed) };
             let before1 = unsafe { (*bank1).load(Ordering::Relaxed) };
             assert_eq!(ram.write64(0, 0xaa), BUS_OK);
@@ -1247,8 +1251,8 @@ mod tests {
             assert_eq!(unsafe { (*bank1).load(Ordering::Relaxed) }, before1 + 1);
             assert_eq!(unsafe { (*first).load(Ordering::Relaxed) }, before1 + 1);
             let view = md.uncached_view();
-            let logical = view.gen_ptr(0);
-            assert_eq!(logical, md.memory.gen_ptr(0));
+            let logical = view.gen_ptr(0).shared;
+            assert_eq!(logical, md.memory.gen_ptr(0).shared);
             let logical_before = unsafe { (*logical).load(Ordering::Relaxed) };
             drop(md);
             assert_eq!(unsafe { (*logical).load(Ordering::Relaxed) }, logical_before,

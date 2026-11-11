@@ -18,7 +18,8 @@ plan as written. Line numbers will drift.
   `PfnMap::insert` publishes the slot. Only the map went atomic.
 - **Masked stores:** a CAS loop, decided with the user; see 2.1.
 - **The atomic gen bump is gated** by `JitDcGeometry::atomic_gen` (several CPUs, or
-  `IRIS_JIT_ATOMIC_GEN`) until its single-CPU cost is known.
+  `IRIS_JIT_ATOMIC_GEN`). With one CPU, compiled stores bump a counter of their own
+  (`GenPtr::inline`, 2026-11-10), so the plain bump no longer races DMA.
 - **Idle-park `wake()` wakes every parked CPU** rather than taking a slot. Each looks at
   its own word. Interrupt sources kept their signatures.
 - **`CachedFlashLines`** also holds read lines with several CPUs, filled from the array:
@@ -51,8 +52,9 @@ Guest seconds, 16 runs per row over two boots, 45 s after telnet answered.
 - **One CPU did not regress.**
 - **Two CPUs scale about 2x**: two processes take as long as one.
 - **The atomic gen bump costs about 30%** on this pure store loop, which is the worst
-  case. That is why it stays off for one CPU, leaving the latent race against DMA there
-  (4.9 item 2) as it was. Deciding that is still open.
+  case. That is why it stays off for one CPU. The race against DMA there (4.9 item 2)
+  was closed on 2026-11-10 by giving compiled stores a counter only they bump, which
+  costs a guest store nothing (`src/cpu/jitv2/page_gen.rs`).
 - **Gen counter contention (6.3) did not show** here: the 2-process store time equals
   the 1-process time. The two arrays are in different processes' pages, so this does not
   rule it out for data the CPUs actually share.

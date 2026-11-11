@@ -947,7 +947,7 @@ mod tests {
         fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_ERR }
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
-        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
+        fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr { crate::traits::GenPtr::NONE }
     }
 
     /// Every word decodes as the JIT region-boundary sentinel — a genuine
@@ -969,7 +969,7 @@ mod tests {
         fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_ERR }
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
-        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
+        fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr { crate::traits::GenPtr::NONE }
     }
 
     struct ErrDevice;
@@ -982,7 +982,7 @@ mod tests {
         fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_ERR }
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
-        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
+        fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr { crate::traits::GenPtr::NONE }
     }
 
     #[test]
@@ -1348,7 +1348,7 @@ mod tests {
     #[test]
     fn a_snapshot_never_pairs_a_generation_with_older_bytes_ram() {
         let mem = Arc::new(crate::dev::mem::Memory::new(1));
-        let gen = mem.gen_ptr(0);
+        let gen = mem.gen_ptr(0).shared;
         let taken = race_stores_with_snapshots(mem, gen, 1500).unwrap();
         assert!(taken > 0, "no snapshot held still long enough to check");
     }
@@ -1356,7 +1356,7 @@ mod tests {
     #[test]
     fn a_snapshot_never_pairs_a_generation_with_older_bytes_ppmem() {
         let mem = Arc::new(crate::ppmem::ppmem::PpMemory::new(1));
-        let gen = mem.gen_ptr(0);
+        let gen = mem.gen_ptr(0).shared;
         let taken = race_stores_with_snapshots(mem, gen, 1500).unwrap();
         assert!(taken > 0, "no snapshot held still long enough to check");
     }

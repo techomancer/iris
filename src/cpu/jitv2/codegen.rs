@@ -5063,11 +5063,12 @@ fn emit_mem_write_fast(ctx: &mut EmitCtx, value: Value, size: MemSize, path: &In
     //   tcache:      tc_write(phys, val) + tc_bump_gen(phys)
     //
     // Any change to `MipsCache::write`'s hit path must be mirrored here.
-    // tcache: bump the per-page jitv2 generation, exactly as `tc_bump_gen`
-    // does — `gen[phys >> 12] += 1`. Relaxed ordering matches the Rust side.
+    // tcache: bump the page's inline generation counter, `inline[phys >> 12]
+    // += 1` (`GenPtr`). `tc_bump_gen` bumps the shared counter instead: only
+    // compiled stores touch this one, so on one CPU it needs no atomic add.
     {
         let ptr_ty = ctx.module.target_config().pointer_type();
-        // No null check: `jit_tc_gen` is published by
+        // No null check: `jit_tc_gen`, the inline counters' window, is published by
         // `set_tcache_gen_window` (machine.rs) before the CPU thread starts,
         // and `emit_inline_mem_guard` declines the whole inline path when the
         // geometry is unsupported. Testing it per store would cost a load and

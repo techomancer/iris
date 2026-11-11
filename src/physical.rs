@@ -138,7 +138,7 @@ impl BusDevice for AliasBus {
     /// `PpMemSpace::map_alias` — both had to be wrong for the symptom to appear
     /// in every build, and fixing only one leaves the other configuration broken.
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         unsafe { (*self.target).gen_ptr(self.target_addr(addr)) }
     }
     fn cas32(&self, addr: u64, old: u32, new: u32) -> Option<bool> {
@@ -189,7 +189,7 @@ impl BusDevice for BankView {
     #[inline] fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 { self.bank().read_block(self.at(a), buf) }
     #[inline] fn write_block(&self, a: u64, buf: &[u64]) -> u32 { self.bank().write_block(self.at(a), buf) }
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 { self.bank().gen_ptr(self.at(a)) }
+    fn gen_ptr(&self, a: u64) -> crate::traits::GenPtr { self.bank().gen_ptr(self.at(a)) }
 }
 
 /// Guest memory from `addr` into `buf`, through `bus` as a DMA master sees
@@ -277,6 +277,9 @@ pub struct Physical {
     /// Base of ppmem's 8MB generation window (jitv2 only).
     #[cfg(feature = "jitv2")]
     ppmem_gen_base: *mut std::sync::atomic::AtomicU64,
+    /// Base of its inline counters' window (`GenPtr::inline`).
+    #[cfg(feature = "jitv2")]
+    ppmem_inline_base: *mut std::sync::atomic::AtomicU64,
     /// The live mapped-region bitmap. Points at the CPU's inline
     /// `MipsCore::ppmem_bitmap` once the CPU claims it (see
     /// [`Self::resync_ppmem_bitmap`]), at `PpMemSpace`'s own `u64` before
@@ -365,6 +368,11 @@ impl Physical {
             Some(sp) => sp.gen_window_base(),
             None => std::ptr::null_mut(),
         };
+        #[cfg(feature = "jitv2")]
+        let ppmem_inline_base = match &ppmem_space {
+            Some(sp) => sp.inline_gen_window_base(),
+            None => std::ptr::null_mut(),
+        };
 
         Arc::new(Self {
             banks,
@@ -372,6 +380,8 @@ impl Physical {
             ppmem_base,
             #[cfg(feature = "jitv2")]
             ppmem_gen_base,
+            #[cfg(feature = "jitv2")]
+            ppmem_inline_base,
             ppmem_bitmap: AtomicPtr::new(ppmem_bitmap),
             ppmem_shift: crate::ppmem::window_shift(window),
             devmap,
@@ -649,15 +659,20 @@ impl Physical {
         Some(unsafe { self.ppmem_base.add(addr as usize) as *mut u64 })
     }
 
-    /// Generation counter for a directly-mapped physical address.
+    /// Generation counters for a directly-mapped physical address.
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn ppmem_gen_ptr(&self, addr: u64) -> Option<*const std::sync::atomic::AtomicU64> {
+    fn ppmem_gen_ptr(&self, addr: u64) -> Option<crate::traits::GenPtr> {
         if !self.ppmem_mapped(addr) || self.ppmem_gen_base.is_null() {
             return None;
         }
         let page = (addr >> 12) as usize;
-        Some(unsafe { self.ppmem_gen_base.add(page) as *const std::sync::atomic::AtomicU64 })
+        Some(unsafe {
+            crate::traits::GenPtr {
+                shared: self.ppmem_gen_base.add(page),
+                inline: self.ppmem_inline_base.add(page),
+            }
+        })
     }
 
     /// Bump generation counters for every page a block write touches — the
@@ -1009,7 +1024,7 @@ impl BusDevice for Physical {
 
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         let addr = addr & PHYS_MASK;
         // ppmem: the counter for a directly-mapped page is at a constant
         // offset in the gen window — a pure shift off the physical address,
@@ -1146,10 +1161,10 @@ mod tests {
             fn read64(&self, _a: u64) -> BusRead64 { BusRead64::ok(0) }
             fn write64(&self, _a: u64, _v: u64) -> u32 { BUS_OK }
             #[cfg(feature = "jitv2")]
-            fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+            fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
                 // Only the page at `base` has a counter — anything else is a
                 // different page and must NOT resolve here.
-                if addr & !0xFFF == self.base { &self.ctr as *const _ } else { std::ptr::null() }
+                if addr & !0xFFF == self.base { crate::traits::GenPtr::bus_only(&self.ctr) } else { crate::traits::GenPtr::NONE }
             }
         }
 
@@ -1157,8 +1172,8 @@ mod tests {
         let target_ptr: *const dyn BusDevice = &target;
         let alias = AliasBus::new(target_ptr, TARGET);
 
-        let via_alias = alias.gen_ptr(0);
-        let via_direct = target.gen_ptr(TARGET as u64);
+        let via_alias = alias.gen_ptr(0).shared;
+        let via_direct = target.gen_ptr(TARGET as u64).shared;
 
         assert!(!via_alias.is_null(),
             "AliasBus must forward gen_ptr — the trait default returns null, and a null \
@@ -1166,7 +1181,7 @@ mod tests {
              is never invalidated");
         assert_eq!(via_alias, via_direct,
             "the alias and the real address must resolve to ONE counter");
-        assert!(alias.gen_ptr(0x1000).is_null(),
+        assert!(alias.gen_ptr(0x1000).shared.is_null(),
             "forwarding must apply the offset, not blanket-return the first counter");
     }
 }

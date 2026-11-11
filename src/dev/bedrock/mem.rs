@@ -73,17 +73,24 @@ impl BusDevice for NoMemory {}
 /// JIT pages belong to physical addresses, not to the bank currently
 /// answering there. Keep these counters separate from the banks' counters:
 /// a compiled page pins its pointer across later bank reconfiguration.
+/// The second array holds the counters compiled stores bump
+/// (`GenPtr::inline`); nothing else writes them.
 #[cfg(feature = "jitv2")]
-pub(crate) struct Generations(Box<[AtomicU64]>);
+pub(crate) struct Generations(Box<[AtomicU64]>, Box<[AtomicU64]>);
 #[cfg(feature = "jitv2")]
 impl Generations {
-    /// One counter per 4 KiB page, up to the last slot that can hold RAM.
+    /// One counter of each kind per 4 KiB page, up to the last slot that can
+    /// hold RAM.
     fn new(extent: &RamExtent) -> Self {
         let pages = extent.slots() << (BANK_SPAN.trailing_zeros() - 12);
-        Self((0..pages).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice())
+        let counters = || (0..pages).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice();
+        Self(counters(), counters())
     }
     pub(crate) fn base(&self) -> *mut AtomicU64 {
         self.0.as_ptr() as *mut AtomicU64
+    }
+    pub(crate) fn inline_base(&self) -> *mut AtomicU64 {
+        self.1.as_ptr() as *mut AtomicU64
     }
     pub(crate) fn pages(&self) -> usize {
         self.0.len()
@@ -175,12 +182,18 @@ impl Memory {
     #[cfg(feature = "jitv2")]
     pub(crate) fn generations(&self) -> Arc<Generations> { self.generations.clone() }
     #[cfg(feature = "jitv2")]
-    pub(crate) fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
+    pub(crate) fn gen_ptr(&self, address: u64) -> crate::traits::GenPtr {
         // Disabled RAM must still have a counter: a JIT page may already
         // have claimed it before the guest enables or moves a bank.
         if self.extent.contains(address) {
-            unsafe { self.generations.base().add((address >> 12) as usize) }
-        } else { std::ptr::null() }
+            let page = (address >> 12) as usize;
+            unsafe {
+                crate::traits::GenPtr {
+                    shared: self.generations.base().add(page),
+                    inline: self.generations.inline_base().add(page),
+                }
+            }
+        } else { crate::traits::GenPtr::NONE }
     }
     pub(crate) fn written(&self, _address: u64) {
         #[cfg(feature = "jitv2")]

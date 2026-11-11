@@ -524,7 +524,7 @@ impl BusDevice for CachedFlashLines {
     }
 
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         self.bus.gen_ptr(addr)
     }
 }

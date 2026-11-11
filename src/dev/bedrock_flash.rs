@@ -547,8 +547,8 @@ impl BusDevice for FlashView {
         BUS_OK
     }
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
-        &self.flash.gen
+    fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr {
+        crate::traits::GenPtr::bus_only(&self.flash.gen)
     }
 }
 

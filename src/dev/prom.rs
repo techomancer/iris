@@ -235,8 +235,8 @@ impl BusDevice for PromPort {
     }
 
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
-        &self.inner.gen as *const AtomicU64
+    fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr {
+        crate::traits::GenPtr::bus_only(&self.inner.gen)
     }
 }
 

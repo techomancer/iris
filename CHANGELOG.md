@@ -13,6 +13,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### jitv2: a DMA write no longer leaves stale code runnable
+
+- With one CPU, a DMA write that landed in the middle of a compiled store's
+  generation bump on the same page lost its bump, and a compile at that moment
+  could keep code built from bytes without the store runnable until the next
+  write to the page. Compiled stores now bump a counter only they write, and a
+  page's generation is the sum of its two counters. A guest store costs what
+  it did; an atomic add on every store, the other fix, costs about 30% on a
+  store loop. (`src/cpu/jitv2/page_gen.rs`, `GenPtr` in `src/traits.rs`)
+
 ### jitv2: stopping the compile pool wakes its barrier
 
 - Stopping the compile pool (a flush from the CPU thread, `j2 inline on`, a

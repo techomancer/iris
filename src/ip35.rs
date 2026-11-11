@@ -129,8 +129,8 @@ macro_rules! window_access {
 }
 impl BusDevice for Window {
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        self.local(address, 1).map(|local| self.device.gen_ptr(local)).unwrap_or(std::ptr::null())
+    fn gen_ptr(&self, address: u64) -> crate::traits::GenPtr {
+        self.local(address, 1).map(|local| self.device.gen_ptr(local)).unwrap_or(crate::traits::GenPtr::NONE)
     }
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
         if a & 7 != 0 {
@@ -221,8 +221,8 @@ macro_rules! sparse_access {
 }
 impl BusDevice for SparseWindowMap {
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        self.target(address).map(|window| window.gen_ptr(address)).unwrap_or(std::ptr::null())
+    fn gen_ptr(&self, address: u64) -> crate::traits::GenPtr {
+        self.target(address).map(|window| window.gen_ptr(address)).unwrap_or(crate::traits::GenPtr::NONE)
     }
     fn write64_masked(&self, address: u64, value: u64, mask: u64) -> u32 {
         self.target(address).map(|window| window.write64_masked(address, value, mask))
@@ -306,7 +306,7 @@ impl BusDevice for CodeViews {
             self.cached.read32(a)
         }
     }
-    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, a: u64) -> crate::traits::GenPtr {
         if in_fetch_window(a) { self.uncached.gen_ptr(a) } else { self.cached.gen_ptr(a) }
     }
 }
@@ -354,7 +354,7 @@ macro_rules! processor_access {
 }
 impl BusDevice for Ip35Bus {
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, address: u64) -> crate::traits::GenPtr {
         // Only the reset PROM's page asks this bus: its generation is the PROM
         // device's, so a flash command invalidates it and a store to RAM never
         // does. The counter covers the whole flash, so any flash write
@@ -362,7 +362,7 @@ impl BusDevice for Ip35Bus {
         if in_fetch_window(address) {
             return self.views[0].gen_ptr(address);
         }
-        std::ptr::null()
+        crate::traits::GenPtr::NONE
     }
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
         if a & 7 != 0 {
@@ -391,11 +391,11 @@ impl BusDevice for CachedPhysical {
         self.target(a, 8).and_then(|(view, pa)| view.mem_ptr(pa))
     }
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, a: u64) -> crate::traits::GenPtr {
         self.target(a, 1).map(|(view, pa)| {
             let generation = self.plain_memory.gen_ptr(pa);
             if generation.is_null() { view.gen_ptr(pa) } else { generation }
-        }).unwrap_or(std::ptr::null())
+        }).unwrap_or(crate::traits::GenPtr::NONE)
     }
     fn read_block(&self, a: u64, out: &mut [u64]) -> u32 {
         self.target(a, 8)

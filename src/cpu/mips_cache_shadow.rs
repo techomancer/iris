@@ -233,6 +233,9 @@ pub struct ShadowCache<
     tc_shift: UnsafeCell<u32>,
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
+    /// The inline counters' window, which compiled stores bump (`GenPtr`).
+    #[cfg(feature = "jitv2")]
+    tc_inline_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
     /// Decoded instructions, by physical page. Never touches the shadow
     /// arrays above — see `decode_cache`.
     decode: UnsafeCell<crate::cpu::decode_cache::DecodeCache>,
@@ -303,6 +306,8 @@ impl<
             tc_shift: UnsafeCell::new(crate::ppmem::BITMAP_SHIFT),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
+            #[cfg(feature = "jitv2")]
+            tc_inline_gen: UnsafeCell::new(std::ptr::null_mut()),
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
             view_space: UnsafeCell::new(std::ptr::null()),
             view: UnsafeCell::new(0),
@@ -602,7 +607,7 @@ impl<
             let foreign = unsafe { &mut *self.foreign.get() };
             if held {
                 for a in (page..page + crate::ppmem::granularity() as u64).step_by(4096) {
-                    let g = self.downstream.gen_ptr(a);
+                    let g = self.downstream.gen_ptr(a).shared;
                     let own = unsafe { sp.gen_window_base().add((a >> 12) as usize) as *const AtomicU64 };
                     if !g.is_null() && g != own {
                         unsafe { (*g).fetch_add(GEN_HELD, Ordering::Release) };
@@ -809,11 +814,12 @@ impl<
     fn fetch_is_pure(&self) -> bool { true }
 
     #[cfg(feature = "jitv2")]
-    fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_gen.get() as *mut u8 } }
+    fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_inline_gen.get() as *mut u8 } }
 
     #[cfg(feature = "jitv2")]
-    unsafe fn set_tcache_gen_window(&self, gen_base: *mut std::sync::atomic::AtomicU64) {
+    unsafe fn set_tcache_gen_window(&self, gen_base: *mut std::sync::atomic::AtomicU64, inline_base: *mut std::sync::atomic::AtomicU64) {
         unsafe { *self.tc_gen.get() = gen_base };
+        unsafe { *self.tc_inline_gen.get() = inline_base };
     }
 
     /// Under tcache, a tagless geometry: the inline path is the window alone.
@@ -822,7 +828,9 @@ impl<
     /// every access calls out, exactly as for `PassthroughCache`.
     fn jit_dc_geometry(&self) -> crate::cpu::mips_cache_v2::JitDcGeometry {
         #[cfg(feature = "jitv2")]
-        if !unsafe { *self.tc_base.get() }.is_null() && !unsafe { *self.tc_gen.get() }.is_null() {
+        if !unsafe { *self.tc_base.get() }.is_null() && !unsafe { *self.tc_gen.get() }.is_null()
+            && !unsafe { *self.tc_inline_gen.get() }.is_null()
+        {
             return crate::cpu::mips_cache_v2::JitDcGeometry {
                 supported: true,
                 tagless: true,
@@ -1570,7 +1578,8 @@ mod tests {
         unsafe { c.set_tcache_window(window.as_mut_ptr()) };
         assert!(!c.jit_dc_geometry().supported, "no generation window yet");
         let mut gens = [std::sync::atomic::AtomicU64::new(0)];
-        unsafe { c.set_tcache_gen_window(gens.as_mut_ptr()) };
+        let mut inline = [std::sync::atomic::AtomicU64::new(0)];
+        unsafe { c.set_tcache_gen_window(gens.as_mut_ptr(), inline.as_mut_ptr()) };
         let g = c.jit_dc_geometry();
         assert!(g.supported && g.tagless && !g.has_l2,
             "tagless, and no L2 decode slots for a store to invalidate: {g:?}");

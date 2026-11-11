@@ -248,8 +248,8 @@ impl BusDevice for CfiFlash {
     }
 
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
-        &self.gen
+    fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr {
+        crate::traits::GenPtr::bus_only(&self.gen)
     }
 }
 

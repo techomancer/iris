@@ -824,7 +824,7 @@ impl Machine {
                 // window to bump page counters itself — otherwise jitv2 keeps
                 // running compiled code for pages the guest has modified.
                 #[cfg(feature = "jitv2")]
-                unsafe { cpu.set_tcache_gen_window(sp.gen_window_base()) };
+                unsafe { cpu.set_tcache_gen_window(sp.gen_window_base(), sp.inline_gen_window_base()) };
             }
         }
 

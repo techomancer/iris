@@ -240,15 +240,50 @@ pub trait BusDevice: Send + Sync {
         if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
     }
 
-    /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
-    /// for the 4KB physical page containing `addr`, or null if this device doesn't
-    /// back JIT-compilable memory (MMIO, etc). RAM devices return one counter per
-    /// page, bumped on every mutation to that page; ROM devices may point every
-    /// page at a single counter that is never bumped (content is immutable).
-    /// The pointer is valid for the lifetime of the device.
+    /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): the generation counters
+    /// for the 4KB physical page containing `addr`, or [`GenPtr::NONE`] if
+    /// this device doesn't back JIT-compilable memory (MMIO, etc). RAM devices
+    /// return counters per page, bumped on every mutation to that page; ROM
+    /// devices may point every page at a single counter that is never bumped
+    /// (content is immutable). The pointers are valid for the lifetime of the
+    /// device.
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
-        std::ptr::null()
+    fn gen_ptr(&self, _addr: u64) -> GenPtr {
+        GenPtr::NONE
+    }
+}
+
+/// JIT v2: a page's generation is the sum of two counters, so that compiled
+/// stores can bump theirs without an atomic add.
+///
+/// Compiled code bumps `inline` with a plain load, add and store on one CPU.
+/// Every other writer (devices on their own threads, the bus, the cache's own
+/// window stores, holds) bumps `shared` with an atomic add. Were they one
+/// counter, a DMA bump landing between the inline store's load and store
+/// would be lost, and a compile in that window could pair the bumped
+/// generation with bytes missing the CPU's store, leaving stale code
+/// runnable. With several CPUs `inline` has several writers, and the inline
+/// store bumps it atomically.
+#[cfg(feature = "jitv2")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenPtr {
+    pub shared: *const std::sync::atomic::AtomicU64,
+    /// Null where no compiled store can reach the page: memory outside a
+    /// RAM window, ROM, MMIO.
+    pub inline: *const std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "jitv2")]
+impl GenPtr {
+    pub const NONE: Self = Self { shared: std::ptr::null(), inline: std::ptr::null() };
+
+    /// A page only the bus writes, so it has one counter.
+    pub fn bus_only(shared: *const std::sync::atomic::AtomicU64) -> Self {
+        Self { shared, inline: std::ptr::null() }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.shared.is_null()
     }
 }
 

@@ -3049,8 +3049,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// # Safety
     /// Same contract as that method.
     #[cfg(feature = "jitv2")]
-    pub unsafe fn set_tcache_gen_window(&mut self, gen_base: *mut std::sync::atomic::AtomicU64) {
-        unsafe { self.cache.set_tcache_gen_window(gen_base) };
+    pub unsafe fn set_tcache_gen_window(&mut self, gen_base: *mut std::sync::atomic::AtomicU64, inline_base: *mut std::sync::atomic::AtomicU64) {
+        unsafe { self.cache.set_tcache_gen_window(gen_base, inline_base) };
         // The jitv2 inline store path reads this pointer from `MipsCore` at a
         // fixed offset, so the copy taken at `install_jit_hooks` time is stale
         // the moment the window is (re)published — refresh it here. Same for
@@ -10777,8 +10777,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// # Safety
     /// Same contract as that method.
     #[cfg(feature = "jitv2")]
-    pub unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
-        unsafe { self.executor.lock().set_tcache_gen_window(gen_base) };
+    pub unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64, inline_base: *mut AtomicU64) {
+        unsafe { self.executor.lock().set_tcache_gen_window(gen_base, inline_base) };
     }
 
     pub fn running_flag(&self) -> Arc<AtomicBool> {
@@ -11509,7 +11509,7 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_gen_window`.
     #[cfg(feature = "jitv2")]
-    unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64);
+    unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64, inline_base: *mut AtomicU64);
     fn core_ptr(&self) -> *const crate::cpu::mips_core::MipsCore;
     fn register_locks(&self);
     fn load_elf(&self, path: &str) -> Result<String, String>;
@@ -11572,8 +11572,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     }
     fn tcache_bitmap_ptr(&self) -> *mut u64 { MipsCpu::tcache_bitmap_ptr(self) }
     #[cfg(feature = "jitv2")]
-    unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
-        unsafe { MipsCpu::set_tcache_gen_window(self, gen_base) }
+    unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64, inline_base: *mut AtomicU64) {
+        unsafe { MipsCpu::set_tcache_gen_window(self, gen_base, inline_base) }
     }
     fn core_ptr(&self) -> *const crate::cpu::mips_core::MipsCore { MipsCpu::core_ptr(self) }
     fn register_locks(&self) { MipsCpu::register_locks(self) }

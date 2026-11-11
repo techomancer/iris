@@ -77,9 +77,9 @@ impl Memory {
     /// is valid for the lifetime of `&self` (the `gen` vec is never resized after `new`).
     #[cfg(feature = "jitv2")]
     #[inline]
-    pub fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
+    pub fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         let page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
-        &self.gen[page] as *const AtomicU64
+        crate::traits::GenPtr::bus_only(&self.gen[page])
     }
 
     /// Set a new address mask. The provided mask is AND-ed with `mem_size_bytes-1`
@@ -331,7 +331,7 @@ impl BusDevice for Memory {
 
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         Memory::gen_ptr(self, addr)
     }
 }
@@ -383,7 +383,7 @@ impl BusDevice for Arc<Memory> {
     }
 
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
         (**self).gen_ptr(addr)
     }
 }
@@ -527,13 +527,13 @@ mod tests {
     #[test]
     fn write_bumps_page_generation_only_for_touched_page() {
         let m = Memory::new(1); // 1 MB = 256 pages of 4KB
-        let gen0_before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
+        let gen0_before = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
+        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) };
 
         m.write32(0, 0x1234); // page 0 only
 
-        let gen0_after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
+        let gen0_after = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
+        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) };
         assert_eq!(gen0_after, gen0_before + 1, "written page must bump gen");
         assert_eq!(gen1_after, gen1_before, "untouched page must not bump gen");
     }
@@ -542,9 +542,9 @@ mod tests {
     #[test]
     fn read_does_not_bump_generation() {
         let m = Memory::new(1);
-        let before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let before = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
         let _ = m.read32(0);
-        let after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
+        let after = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
         assert_eq!(before, after);
     }
 
@@ -554,13 +554,13 @@ mod tests {
         let m = Memory::new(1);
         // Straddle the page-0/page-1 boundary: last qword lands in page 1.
         let start = (JITV2_PAGE_SIZE - 8) as u64;
-        let gen0_before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
+        let gen0_before = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
+        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) };
 
         m.write_block(start, &[0u64, 0u64]);
 
-        let gen0_after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
+        let gen0_after = unsafe { (*m.gen_ptr(0).shared).load(Ordering::Relaxed) };
+        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64).shared).load(Ordering::Relaxed) };
         assert_eq!(gen0_after, gen0_before + 1);
         assert_eq!(gen1_after, gen1_before + 1);
     }

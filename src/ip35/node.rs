@@ -175,7 +175,7 @@ pub(crate) fn connect_cpus(
                 cpu.set_cached_view(space, v);
                 cpu.set_tcache_shift(crate::ppmem::window_shift(space.window_size()));
                 #[cfg(feature = "jitv2")]
-                cpu.set_tcache_gen_window(bedrock.generation_base());
+                cpu.set_tcache_gen_window(bedrock.generation_base(), bedrock.inline_generation_base());
             }
         }
         bedrock.rebuild_memory();

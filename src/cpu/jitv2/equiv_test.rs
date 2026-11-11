@@ -213,19 +213,19 @@ mod tests {
             BUS_OK
         }
         #[cfg(feature = "jitv2")]
-        fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
+        fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
             // Real enforcement of no_jitv2 is seeded_executor_over's
             // denylist_all() call, not this null return (a null gen_ptr no
             // longer means "not dispatchable" — see the no_jitv2 field's own
             // doc comment) — kept null here anyway since it's still
             // factually true that this device has no real gen tracking.
             if self.no_jitv2 {
-                return std::ptr::null();
+                return crate::traits::GenPtr::NONE;
             }
             let page = (addr / PAGE_SIZE as u64) as u32;
             let mut gens = self.gens.lock().unwrap();
             let counter = gens.entry(page).or_insert_with(|| Box::new(AtomicU64::new(0)));
-            counter.as_ref() as *const AtomicU64
+            crate::traits::GenPtr::bus_only(counter.as_ref())
         }
     }
 

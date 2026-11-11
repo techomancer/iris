@@ -11,6 +11,7 @@ pub mod opcode_support;
 pub mod analyzer;
 pub mod codegen;
 pub mod paged_memory;
+pub(crate) mod page_gen;
 pub(crate) mod pool_barrier;
 // Always compiled with jitv2: `j2 dumppcp`
 // and `j2 corpus` are monitor-console diagnostics, and the corpus capture

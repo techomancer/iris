@@ -181,10 +181,10 @@ fn stores_through_the_bus_invalidate_compiled_code() {
     let p = &b.phys;
     let gen = |g: *const AtomicU64| unsafe { (*g).load(Ordering::Acquire) };
     assert_eq!(p.write32(PIU_BASE + 0x20, 0x8003_0000), BUS_OK);
-    let (g0, g1) = (p.gen_ptr(0x180), p.gen_ptr(0x1000));
+    let (g0, g1) = (p.gen_ptr(0x180).shared, p.gen_ptr(0x1000).shared);
     assert!(!g0.is_null() && !g1.is_null() && g0 != g1);
     let dma = b.bus.memory();
-    assert_eq!(g0, dma.gen_ptr(0x2000_0180), "low memory shares SDRAM's counter");
+    assert_eq!(g0, dma.gen_ptr(0x2000_0180).shared, "low memory shares SDRAM's counter");
     // At the SDRAM address the window's counter answers (the window maps
     // whole 32 MiB units); it is the same memory, so it moves with g0.
     let (a, c) = (gen(g0), gen(g1));
@@ -194,12 +194,12 @@ fn stores_through_the_bus_invalidate_compiled_code() {
     let v = gen(g0);
     assert_eq!(dma.write8(0x2000_0181, 1), BUS_OK);
     assert_ne!(gen(g0), v, "a bus master's store at the SDRAM address advances it too");
-    assert!(p.gen_ptr(0x4000).is_null(), "the hole after low memory has none");
-    let g = p.gen_ptr(0x2000_8000);
+    assert!(p.gen_ptr(0x4000).shared.is_null(), "the hole after low memory has none");
+    let g = p.gen_ptr(0x2000_8000).shared;
     let v = gen(g);
     assert_eq!(p.write8(0x2000_8001, 1), BUS_OK);
     assert_ne!(gen(g), v);
-    assert!(p.gen_ptr(0x1fc0_0000).is_null(), "the flash has none");
+    assert!(p.gen_ptr(0x1fc0_0000).shared.is_null(), "the flash has none");
 }
 
 #[test]
@@ -351,9 +351,9 @@ fn map_the_alias_and_sdram_share_page_generations() {
     set_bank(p, 0, 0x8003_0000);
     let dma = b.bus.memory();
     let gen = |g: *const AtomicU64| unsafe { (*g).load(Ordering::Acquire) };
-    let low = p.gen_ptr(0x2000);
+    let low = p.gen_ptr(0x2000).shared;
     assert!(!low.is_null());
-    assert_eq!(low, dma.gen_ptr(0x2000_2000));
+    assert_eq!(low, dma.gen_ptr(0x2000_2000).shared);
     let v = gen(low);
     assert_eq!(p.write_block(0x2000, &[1, 2]), BUS_OK);
     assert_ne!(gen(low), v, "a block store through the alias");

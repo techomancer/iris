@@ -464,7 +464,7 @@ impl OctaneMachine {
                     #[cfg(feature = "jitv2")]
                     {
                         use crate::ppmem::MappedMemory;
-                        c.set_tcache_gen_window(sp.gen_window_base());
+                        c.set_tcache_gen_window(sp.gen_window_base(), sp.inline_gen_window_base());
                     }
                 }
             }

@@ -242,7 +242,7 @@ fn processor_stores_advance_the_counter_of_the_slot_they_reach() {
     let memory = board.bedrock.dma_view();
     let counter = |_at: u64| -> u64 {
         #[cfg(feature = "jitv2")]
-        return unsafe { (*memory.gen_ptr(_at)).load(std::sync::atomic::Ordering::Relaxed) };
+        return unsafe { (*memory.gen_ptr(_at).shared).load(std::sync::atomic::Ordering::Relaxed) };
         #[cfg(not(feature = "jitv2"))]
         0
     };
@@ -508,8 +508,8 @@ fn code_generations_use_the_stable_ram_endpoint() {
         }
     }
     impl BusDevice for Generations {
-        fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-            if !self.ram_only || address < 0x1000 { &self.generation } else { std::ptr::null() }
+        fn gen_ptr(&self, address: u64) -> crate::traits::GenPtr {
+            if !self.ram_only || address < 0x1000 { crate::traits::GenPtr::bus_only(&self.generation) } else { crate::traits::GenPtr::NONE }
         }
         fn write64(&self, address: u64, value: u64) -> u32 {
             self.writes.lock().unwrap().push((address, value));
@@ -533,8 +533,8 @@ fn code_generations_use_the_stable_ram_endpoint() {
     map_device(&physical, 0, 0x1000, raw_ram.clone(), "raw RAM generation");
     map_device(&physical, 0x1fc00000, 0x1000, rom.clone(), "ROM generation");
     let cached = bus.cached_view(stable_ram.clone(), crate::dev::bedrock::RamExtent::new(&[256, 256]));
-    assert_eq!(cached.gen_ptr(0x40), &stable_ram.generation as *const AtomicU64);
-    assert_eq!(cached.gen_ptr(0x1fc00000), &rom.generation as *const AtomicU64);
+    assert_eq!(cached.gen_ptr(0x40).shared, &stable_ram.generation as *const AtomicU64);
+    assert_eq!(cached.gen_ptr(0x1fc00000).shared, &rom.generation as *const AtomicU64);
     assert_eq!(cached.write64(0x40, 0x1234), BUS_OK);
     assert_eq!(cached.write_block(0x48, &[0x5678]), BUS_OK);
     assert_eq!(cached.write64_masked(0x50, 0xaabb, 0xff), BUS_OK);
@@ -789,8 +789,8 @@ fn uncached_fetch_compiles_the_prom_body() {
         fn read64(&self, _: u64) -> BusRead64 {
             BusRead64::ok((self.word as u64) << 32 | self.word as u64)
         }
-        fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
-            &self.generation
+        fn gen_ptr(&self, _: u64) -> crate::traits::GenPtr {
+            crate::traits::GenPtr::bus_only(&self.generation)
         }
     }
 
@@ -887,8 +887,8 @@ mod code_views {
         fn read64(&self, _: u64) -> BusRead64 {
             BusRead64::ok((self.0 as u64) << 32 | self.0 as u64)
         }
-        fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
-            &self.1
+        fn gen_ptr(&self, _: u64) -> crate::traits::GenPtr {
+            crate::traits::GenPtr::bus_only(&self.1)
         }
     }
 

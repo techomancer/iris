@@ -412,8 +412,8 @@ impl BusDevice for DmaView {
         self.at(addr).map_or(BUS_ERR, |(d, a)| d.write_block(a, buf))
     }
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
-        self.at(addr).map_or(std::ptr::null(), |(d, a)| d.gen_ptr(a))
+    fn gen_ptr(&self, addr: u64) -> crate::traits::GenPtr {
+        self.at(addr).map_or(crate::traits::GenPtr::NONE, |(d, a)| d.gen_ptr(a))
     }
 }
 
@@ -632,7 +632,7 @@ mod tests {
         let m = ram(128);
         let d = DESC_VALID | (3 << 16);
         bank0(&m, d);
-        let g = m.phys().gen_ptr(RAM_BASE + 0x8000);
+        let g = m.phys().gen_ptr(RAM_BASE + 0x8000).shared;
         let v = gen(g);
         bank0(&m, d);
         assert_eq!(gen(g), v, "the same descriptors leave it");
@@ -747,7 +747,7 @@ mod tests {
         w(&m, at, 0x0123_4567_89ab_cdef);
         let p = unsafe { sp.window_base().add(at as usize) } as *const u32;
         assert_eq!(unsafe { p.read_unaligned() }, 0x0123_4567, "the window holds the bus's words");
-        let g = m.phys().gen_ptr(at);
+        let g = m.phys().gen_ptr(at).shared;
         let before = unsafe { (*g).load(Ordering::Relaxed) };
         w(&m, at, 1);
         assert_eq!(unsafe { (*g).load(Ordering::Relaxed) }, before + 1);
@@ -817,15 +817,15 @@ mod tests {
         let m = ram(64);
         bank0(&m, DESC_VALID | (1 << 16));
         let (p, dma) = (m.phys(), m.dma_view());
-        assert_eq!(p.gen_ptr(0x180), dma.gen_ptr(RAM_BASE + 0x180));
-        assert_ne!(p.gen_ptr(0x180), p.gen_ptr(0x1000));
-        let (l0, a0) = (p.gen_ptr(0x180), gen(p.gen_ptr(0x180)));
+        assert_eq!(p.gen_ptr(0x180).shared, dma.gen_ptr(RAM_BASE + 0x180).shared);
+        assert_ne!(p.gen_ptr(0x180).shared, p.gen_ptr(0x1000).shared);
+        let (l0, a0) = (p.gen_ptr(0x180).shared, gen(p.gen_ptr(0x180).shared));
         assert_eq!(p.write64(0x180, 0xdf5a_c000_0340_0008), BUS_OK);
         assert_ne!(gen(l0), a0, "a low-memory store advances the page");
         let v = gen(l0);
         assert_eq!(dma.write64(RAM_BASE + 0x180, 1), BUS_OK);
         assert_ne!(gen(l0), v, "and so does a bus master's at its SDRAM address");
-        assert!(p.gen_ptr(0x4000).is_null());
+        assert!(p.gen_ptr(0x4000).shared.is_null());
     }
 
     #[test]

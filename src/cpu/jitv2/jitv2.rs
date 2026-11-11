@@ -650,6 +650,10 @@ pub struct PhysicalCodePage {
     /// returns null) gets pointed at the shared [`NEVER_COMPILABLE_GEN`]
     /// fallback instead, by `claim()`.
     gen: *const AtomicU64,
+    /// The counter compiled stores bump (`GenPtr::inline`): the page's
+    /// generation is the sum of the two. [`NEVER_COMPILABLE_GEN`] where no
+    /// compiled store reaches the page.
+    inline_gen: *const AtomicU64,
     /// Offsets some dispatch has asked for an entry point at (§13.2) — a
     /// superset of `compiled` in general (a bit can be requested long before
     /// any compile picks it up, and stays requested across however many
@@ -1194,6 +1198,7 @@ impl PhysicalCodePage {
             pfn,
             next: NO_SLOT,
             gen: if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen },
+            inline_gen: &NEVER_COMPILABLE_GEN,
             requested: new_bitmap(),
             denied: new_bitmap_all_set(),
             compiled: new_bitmap(),
@@ -1287,14 +1292,15 @@ impl PhysicalCodePage {
         self.pfn != UNCLAIMED_PFN
     }
 
-    pub fn claim(&mut self, pfn: Pfn, gen: *const AtomicU64, fr1: bool) {
+    pub fn claim(&mut self, pfn: Pfn, gen: crate::traits::GenPtr, fr1: bool) {
         debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn == UNCLAIMED_PFN,
             "claim() called on a slot that wasn't clean (pfn={:#x}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
             self.pfn);
         debug_assert!(self.func.load(Ordering::Relaxed).is_null(),
             "claim() called on a slot with a still-published function — mega_flush must reset_to_unclaimed before this slot can be reused");
         self.pfn = pfn;
-        self.gen = if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen };
+        self.gen = if gen.shared.is_null() { &NEVER_COMPILABLE_GEN } else { gen.shared };
+        self.inline_gen = if gen.inline.is_null() { &NEVER_COMPILABLE_GEN } else { gen.inline };
         self.fr1.store(fr1, Ordering::Relaxed);
         // A freshly-claimed slot has no bail outstanding: `fr1` was just set
         // from the live mode, so there is nothing to correct.
@@ -1373,6 +1379,7 @@ impl PhysicalCodePage {
         self.reset_entries_and_bitmaps();
         self.pfn = UNCLAIMED_PFN;
         self.gen = &NEVER_COMPILABLE_GEN;
+        self.inline_gen = &NEVER_COMPILABLE_GEN;
     }
 
     /// Reset `requested`/`denied`/`compiled` bitmaps, the compiled `func`
@@ -1387,17 +1394,17 @@ impl PhysicalCodePage {
         self.reset_entries_and_bitmaps();
     }
 
-    /// Current generation count for this page.    /// Current generation count for this page. `self.gen` is never null (see
-    /// its own doc comment) — a page whose backing device has no real gen
-    /// tracking (MMIO, etc) reads the shared, never-bumped
-    /// [`NEVER_COMPILABLE_GEN`] fallback here instead, so this is
-    /// unconditionally safe to call on any claimed or unclaimed page, no
-    /// branch needed on the caller's part.
+    /// Current generation count for this page: the sum of its two counters
+    /// (`page_gen::generation`). Neither pointer is ever null (see their doc
+    /// comments) — a page whose backing device has no real gen tracking
+    /// (MMIO, etc) reads the shared, never-bumped [`NEVER_COMPILABLE_GEN`]
+    /// fallback here instead, so this is unconditionally safe to call on any
+    /// claimed or unclaimed page, no branch needed on the caller's part.
     #[inline]
     pub fn current_gen(&self) -> u64 {
         // Relaxed: publish-time (§13.3) and mutation-time (§7) orderings are
         // established by the fetch_or/re-read pair at those call sites, not here.
-        unsafe { (*self.gen).load(Ordering::Relaxed) }
+        unsafe { crate::cpu::jitv2::page_gen::generation(&*self.gen, &*self.inline_gen) }
     }
 
     /// Relaxed read of `entry_gen` — the generation `func`/`compiled` were
@@ -3692,7 +3699,7 @@ mod tests {
     /// `claim` debug-asserts the slot is clean, so it must start unclaimed.
     fn claimed_page(fr1: bool) -> Box<PhysicalCodePage> {
         let mut page = Box::new(PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null()));
-        page.claim(0x1234, std::ptr::null(), fr1);
+        page.claim(0x1234, crate::traits::GenPtr::NONE, fr1);
         page
     }
 
@@ -3850,6 +3857,29 @@ mod tests {
         fn drop(&mut self) {
             crate::cpu::jitv2::comp::set_max_instrs_per_compile(self.0);
         }
+    }
+
+    /// A page's generation is the sum of its shared and inline counters: a
+    /// bump on either retires its code, and a compile snapshotted before an
+    /// inline bump does not publish.
+    #[test]
+    fn a_page_follows_both_of_its_counters() {
+        let (shared, inline) = (AtomicU64::new(3), AtomicU64::new(4));
+        let mut page = Box::new(PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null()));
+        page.claim(0x1234, crate::traits::GenPtr { shared: &shared, inline: &inline }, false);
+        assert_eq!(page.current_gen(), 7);
+        let offset = 9usize;
+        let mut bits = [0u64; BITMAP_WORDS];
+        bits[0] |= 1 << offset;
+        assert!(page.publish(&bits, 0x1000usize as *const (), 7, 1, 0, false));
+        assert!(page.is_runnable(offset));
+        inline.fetch_add(1, Ordering::Relaxed);
+        assert!(!page.is_runnable(offset), "a compiled store retires the code");
+        assert!(!page.publish(&bits, 0x2000usize as *const (), 7, 1, 0, false),
+            "a snapshot from before the compiled store must not publish");
+        assert!(page.publish(&bits, 0x2000usize as *const (), 8, 1, 0, false));
+        shared.fetch_add(1, Ordering::Relaxed);
+        assert!(!page.is_runnable(offset), "so does a DMA write");
     }
 
     #[test]
@@ -4033,7 +4063,7 @@ mod tests {
         let mut jit = Jitv2::new(sizes.len());
 
         for (i, sz) in sizes.iter().enumerate() {
-            jit.pages[i].claim(i as Pfn + 1, &counter as *const AtomicU64, false);
+            jit.pages[i].claim(i as Pfn + 1, crate::traits::GenPtr::bus_only(&counter), false);
             let mut bits = [0u64; BITMAP_WORDS];
             bits[0] |= 1u64;
             assert!(jit.pages[i].publish(&bits, 0x1000 as *const (), 0, 1, *sz, false));
@@ -4897,7 +4927,7 @@ mod tests {
         fn write32(&self, _addr: u64, _val: u32) -> u32 { crate::traits::BUS_ERR }
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { crate::traits::BUS_ERR }
-        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
+        fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr { crate::traits::GenPtr::bus_only(&self.0) }
     }
 
     #[test]
@@ -5100,7 +5130,7 @@ mod tests {
         fn write32(&self, _addr: u64, _val: u32) -> u32 { crate::traits::BUS_ERR }
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { crate::traits::BUS_ERR }
-        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
+        fn gen_ptr(&self, _addr: u64) -> crate::traits::GenPtr { crate::traits::GenPtr::bus_only(&self.0) }
     }
 
     #[test]
