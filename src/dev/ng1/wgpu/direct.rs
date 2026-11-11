@@ -97,6 +97,18 @@ pub(crate) struct CaptureCount {
     pub(crate) successful_bytes: u64,
 }
 
+impl CaptureCount {
+    pub(crate) fn attempt(&mut self, bytes: u64) {
+        self.attempts += 1;
+        self.attempted_bytes += bytes;
+    }
+
+    pub(crate) fn success(&mut self, bytes: u64) {
+        self.successes += 1;
+        self.successful_bytes += bytes;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DispatchCount {
     pub(crate) attempts: u64,
@@ -179,8 +191,8 @@ impl Ng1ResidentFrame<'_> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum CaptureFault {
-    BeforeCopy,
-    AfterMap,
+    BeforeCapture,
+    AfterStaging,
 }
 
 /// The group retains the raster's plane buffers without exposing their
@@ -334,22 +346,20 @@ impl Ng1ResidentScanout {
             return Err(ResidentError::InvalidState("resident capture output is too small"));
         }
         let bytes = pixels as u64 * 4;
-        self.traffic.composed_readbacks.attempts += 1;
-        self.traffic.composed_readbacks.attempted_bytes += bytes;
+        self.traffic.composed_readbacks.attempt(bytes);
         let fault = self.capture_fault.take();
-        if matches!(fault, Some(CaptureFault::BeforeCopy)) {
-            return Err(ResidentError::Failed("injected composed capture failure before copy".into()));
+        if matches!(fault, Some(CaptureFault::BeforeCapture)) {
+            return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
         }
         self.capture_scratch.resize(pixels, 0);
         self.scanout.read_output(stamp.width, stamp.height, &mut self.capture_scratch)
             .map_err(scanout_error)?;
-        if matches!(fault, Some(CaptureFault::AfterMap)) {
-            return Err(ResidentError::Failed("injected composed capture failure after map".into()));
+        if matches!(fault, Some(CaptureFault::AfterStaging)) {
+            return Err(ResidentError::Failed("injected composed capture failure after staging".into()));
         }
         self.scanout.gpu().check().map_err(scanout_error)?;
         out[..pixels].copy_from_slice(&self.capture_scratch);
-        self.traffic.composed_readbacks.successes += 1;
-        self.traffic.composed_readbacks.successful_bytes += bytes;
+        self.traffic.composed_readbacks.success(bytes);
         Ok(())
     }
 

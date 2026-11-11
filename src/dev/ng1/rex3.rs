@@ -1969,21 +1969,8 @@ impl Rex3 {
         if self.raster.lock().kind() != RasterModeKind::Resident {
             return Err(ResidentError::InvalidState("resident raster is not active"));
         }
-        let resident_gpu = match &*self.raster.lock() {
-            RasterMode::Resident(raster) => raster.gpu(),
-            _ => None,
-        };
-        if let Some(renderer) = self.head.renderer_slot().lock().as_deref() {
-            if renderer.takes_gpu_frames() {
-                let gpu = resident_gpu.as_ref()
-                    .ok_or(ResidentError::Unsupported("resident renderer requires a GPU"))?;
-                frame::validate_presenter(renderer, gpu)?;
-            } else if !renderer.takes_resident_readback_frames() {
-                return Err(ResidentError::Unsupported(
-                    "resident frames require a wgpu presenter or labeled readback renderer",
-                ));
-            }
-        }
+        // The processor does not select a display; the explicitly chosen
+        // display mode validates its renderer when it starts and renders.
         let mut processor = self.processor_thread.lock();
         if let Some(error) = self.resident_fault() {
             return Err(error);

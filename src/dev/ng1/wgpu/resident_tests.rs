@@ -683,26 +683,35 @@ fn resident_gpu_partial_restore_keeps_suffix_and_rebases_stream() {
 #[test]
 #[ignore = "requires the requested conformant host GPU"]
 fn resident_gpu_failed_observation_is_counted_and_latched() {
-    struct FailingObservation(Arc<Mutex<ResidentGpu>>);
+    struct FailingObservation {
+        resident: Arc<Mutex<ResidentGpu>>,
+        gpu: Arc<Gpu>,
+    }
 
     impl ResidentBackend for FailingObservation {
+        fn gpu(&self) -> Option<&Arc<Gpu>> { Some(&self.gpu) }
+
         fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
-            self.0.lock().enqueue(context)
+            self.resident.lock().enqueue(context)
         }
 
         fn submit(&mut self) -> Result<(), ResidentError> {
-            self.0.lock().submit()
+            self.resident.lock().submit()
         }
 
         fn observe(&mut self, reason: ObservationReason, planes: PlaneMask) -> Result<Observation, ResidentError> {
-            self.0.lock().observe_using(reason, planes, |backend, planes| {
+            self.resident.lock().observe_using(reason, planes, |backend, planes| {
                 let _ = backend.read_planes(planes)?;
                 Err(ResidentError::Failed("injected observation failure after map".into()))
             })
         }
 
+        fn status(&mut self) -> Result<ResidentStatus, ResidentError> {
+            self.resident.lock().status()
+        }
+
         fn recorded_status(&self) -> Result<ResidentStatus, ResidentError> {
-            self.0.lock().recorded_status()
+            self.resident.lock().recorded_status()
         }
     }
 
@@ -711,7 +720,10 @@ fn resident_gpu_failed_observation_is_counted_and_latched() {
         let rgb = seeded_plane(0x0011_2233);
         let aux = seeded_plane(0xaabb_ccdd);
         let resident = Arc::new(Mutex::new(ResidentGpu::activate(Arc::clone(&gpu), &rgb, &aux).unwrap()));
-        let mut raster = ResidentRaster::new(FailingObservation(Arc::clone(&resident)));
+        let mut raster = ResidentRaster::new(FailingObservation {
+            resident: Arc::clone(&resident),
+            gpu: Arc::clone(&gpu),
+        });
         let failure = ResidentError::Failed("injected observation failure after map".into());
         assert_eq!(raster.observe(ObservationReason::Snapshot, PlaneMask::Both).unwrap_err(), failure);
         let diagnostics = raster.diagnostics().unwrap();
@@ -732,6 +744,66 @@ fn resident_gpu_failed_observation_is_counted_and_latched() {
             ObservationCounts::default(),
             "a request refused by the sticky fault is not a transfer attempt",
         );
+
+        drop(raster);
+        drop(resident);
+        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        board.0.fb_rgb.get_mut().copy_from_slice(&rgb);
+        board.0.fb_aux.get_mut().copy_from_slice(&aux);
+        board.0.fb_rgb.get_mut().isolate().unwrap();
+        board.0.fb_aux.get_mut().isolate().unwrap();
+        let resident = Arc::new(Mutex::new(ResidentGpu::activate(
+            Arc::clone(&gpu), board.0.fb_rgb.get_mut(), board.0.fb_aux.get_mut(),
+        ).unwrap()));
+        board.0.attach_resident_raster(FailingObservation {
+            resident: Arc::clone(&resident),
+            gpu: Arc::clone(&gpu),
+        }).unwrap();
+        board.0.fb_rgb.get_mut().reset_access_counts();
+        board.0.fb_aux.get_mut().reset_access_counts();
+        let rgb_guard = unsafe { (&*board.0.fb_rgb.get()).protect() }.unwrap();
+        let aux_guard = unsafe { (&*board.0.fb_aux.get()).protect() }.unwrap();
+        {
+            let mut screen = board.0.head.screen().lock();
+            screen.width = 2;
+            screen.height = 2;
+            screen.rgba[0] = 0xff12_3456;
+            screen.frame_seq = 7;
+        }
+        use crate::dev::ng1::rex3::frame::{ResidentDisplay, ResidentDisplayMode};
+        use crate::gfx_display::GfxDisplay;
+        board.0.start();
+        let mut display = ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::ReadbackCompatibility).unwrap();
+        display.suppress_screenshot_files();
+        board.0.request_frame();
+        board.0.request_screenshot();
+        assert_eq!(
+            display.render(&board.0, std::time::Duration::from_secs(5), |_| {}),
+            Err(failure.clone()),
+        );
+        assert!(board.0.frame_pending() && board.0.screenshot_pending());
+        assert!(!board.0.frame_available());
+        {
+            let screen = board.0.head.screen().lock();
+            assert_eq!((screen.frame_seq, screen.rgba[0]), (7, 0xff12_3456));
+        }
+        assert_eq!(display.capture_count(), Default::default());
+        assert_eq!(
+            board.0.resident_composed_captures(ResidentDisplayMode::ReadbackCompatibility),
+            Default::default()
+        );
+        let status = resident.lock().recorded_status().unwrap();
+        let counts = status.observations.for_reason(ObservationReason::Compatibility);
+        assert_eq!((counts.attempts, counts.successes), (1, 0));
+        assert_eq!((counts.attempted_transfers, counts.successful_transfers), (2, 0));
+        assert_eq!((counts.attempted_bytes, counts.successful_bytes), (READBACK_BYTES, 0));
+        assert_eq!(status.raw_plane_map_attempts, 1);
+        assert_eq!(board.0.resident_status(), Err(failure));
+        assert_eq!(unsafe { (&*board.0.fb_rgb.get()).access_counts() }, Default::default());
+        assert_eq!(unsafe { (&*board.0.fb_aux.get()).access_counts() }, Default::default());
+        board.0.stop();
+        drop(aux_guard);
+        drop(rgb_guard);
     });
 }
 
