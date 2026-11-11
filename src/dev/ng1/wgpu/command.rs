@@ -7,9 +7,14 @@ use crate::dev::ng1::rex3::{Rex3Context, HOSTRW_BUF_QWORDS};
 use crate::dev::ng1::rex3_flat_fill::{FillKind, FillPlane, FlatFill};
 use crate::wgpu::Full;
 
+use super::line::{LineCommand, LineKind};
+
 pub(super) const COMMAND_BLOCK: u32 = 1;
 pub(super) const COMMAND_SPAN: u32 = 2;
 pub(super) const COMMAND_CLEAR: u32 = 3;
+pub(super) const COMMAND_I_LINE: u32 = 4;
+pub(super) const COMMAND_F_LINE: u32 = 5;
+pub(super) const COMMAND_A_LINE: u32 = 6;
 
 pub(super) const FLAG_WRITE_RGB: u32 = 1 << 0;
 pub(super) const FLAG_WRITE_AUX: u32 = 1 << 1;
@@ -17,6 +22,8 @@ pub(super) const FLAG_READ_RGB: u32 = 1 << 2;
 pub(super) const FLAG_READ_AUX: u32 = 1 << 3;
 pub(super) const FLAG_BARRIER_BEFORE: u32 = 1 << 4;
 pub(super) const FLAG_BARRIER_AFTER: u32 = 1 << 5;
+pub(super) const FLAG_LINE_Y_MAJOR: u32 = 1 << 6;
+pub(super) const FLAG_LINE_MAJOR_DECREASING: u32 = 1 << 7;
 
 pub(super) const STATE_WORDS: usize = 64;
 pub(super) const STATE_WRITE_MASK: usize = 4;
@@ -70,6 +77,37 @@ impl RexCommand {
         }
     }
 
+    pub(super) fn line(state_slot: u32, line: LineCommand, payload: PayloadRef) -> Self {
+        let kind = match line.kind {
+            LineKind::Integer => COMMAND_I_LINE,
+            LineKind::Fractional => COMMAND_F_LINE,
+            LineKind::Antialiased => COMMAND_A_LINE,
+        };
+        let mut flags = match line.plane {
+            FillPlane::Rgb => FLAG_WRITE_RGB,
+            FillPlane::Aux => FLAG_WRITE_AUX,
+        };
+        if line.y_major {
+            flags |= FLAG_LINE_Y_MAJOR;
+        }
+        if line.major_decreasing {
+            flags |= FLAG_LINE_MAJOR_DECREASING;
+        }
+        Self {
+            kind,
+            state_slot,
+            flags,
+            payload_offset: payload.offset,
+            payload_words: payload.words,
+            dst_x0: line.min_x,
+            dst_y0: line.min_y,
+            dst_x1: line.max_x,
+            dst_y1: line.max_y,
+            src_x0: line.start_major,
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     fn payload(&self) -> PayloadRef {
         PayloadRef {
@@ -89,6 +127,14 @@ pub(super) struct RexStateSlot {
 
 impl RexStateSlot {
     pub(super) fn for_flat_fill(context: &Rex3Context, fill: FlatFill) -> Self {
+        Self::with_source_color(context, fill.color)
+    }
+
+    pub(super) fn for_line(context: &Rex3Context, line: LineCommand) -> Self {
+        Self::with_source_color(context, line.color)
+    }
+
+    fn with_source_color(context: &Rex3Context, source_color: u32) -> Self {
         let mut words = [0; STATE_WORDS];
         words[0] = context.drawmode0.0;
         words[1] = context.drawmode1.0;
@@ -145,7 +191,7 @@ impl RexStateSlot {
         words[47] = context.xymove;
         words[48] = context.stall0;
         words[49] = context.stall1;
-        words[STATE_SOURCE_COLOR] = fill.color;
+        words[STATE_SOURCE_COLOR] = source_color;
         Self { words }
     }
 }
@@ -191,6 +237,25 @@ impl PayloadBatch {
             words: words.len() as u32,
         };
         self.words.extend_from_slice(words);
+        Ok(reference)
+    }
+
+    pub(super) fn append_iter(
+        &mut self,
+        words: impl ExactSizeIterator<Item = u32>,
+    ) -> Result<PayloadRef, Full> {
+        if words.len() == 0 {
+            return Ok(PayloadRef::EMPTY);
+        }
+        let end = self.words.len().checked_add(words.len()).ok_or(Full)?;
+        if end > self.capacity || end > u32::MAX as usize {
+            return Err(Full);
+        }
+        let reference = PayloadRef {
+            offset: self.words.len() as u32,
+            words: words.len() as u32,
+        };
+        self.words.extend(words);
         Ok(reference)
     }
 
@@ -260,8 +325,10 @@ mod tests {
                 | FLAG_READ_RGB
                 | FLAG_READ_AUX
                 | FLAG_BARRIER_BEFORE
-                | FLAG_BARRIER_AFTER,
-            0x3f,
+                | FLAG_BARRIER_AFTER
+                | FLAG_LINE_Y_MAJOR
+                | FLAG_LINE_MAJOR_DECREASING,
+            0xff,
         );
         assert_eq!(size_of::<RexCommand>(), 16 * size_of::<u32>());
         assert_eq!(std::mem::offset_of!(RexCommand, state_slot), 4);
@@ -347,7 +414,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            payload.append(&[13]),
+            payload.append_iter([13].into_iter()),
             Ok(PayloadRef {
                 offset: 3,
                 words: 1

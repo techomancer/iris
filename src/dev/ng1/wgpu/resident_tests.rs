@@ -1,6 +1,7 @@
 use super::*;
 use crate::dev::ng1::rex3::{
-    DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_BLOCK_SH, DRAWMODE0_ADRMODE_SPAN_SH,
+    DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_BLOCK_SH,
+    DRAWMODE0_ADRMODE_F_LINE_SH, DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE0_ADRMODE_SPAN_SH,
     DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_COMPARE_DISABLE_SH,
     DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_CID,
     DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB,
@@ -8,7 +9,7 @@ use crate::dev::ng1::rex3::{
     REX3_COLORBLUE, REX3_COLORGRN, REX3_COLORRED, REX3_COORD_BIAS, REX3_DRAWMODE0,
     REX3_DRAWMODE1, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
 };
-use crate::dev::ng1::rex3_generic::{draw_with_fb, Framebuffers};
+use crate::dev::ng1::rex3_generic::{draw_with_fb, fline_setup, Framebuffers};
 use crate::dev::ng1::rex3_shape;
 use crate::traits::{BusDevice, Device, Resettable, BUS_BUSY, BUS_OK};
 use crate::wgpu::GpuOptions;
@@ -124,6 +125,45 @@ fn context(
     ctx.hostrw[0] = 0x0123_4567_89ab_cdef;
     ctx.hostrw[HOSTRW_BUF_QWORDS / 2] = 0xa5a5_5a5a_f0f0_0f0f;
     ctx.hostrw[HOSTRW_BUF_QWORDS - 1] = 0xfedc_ba98_7654_3210;
+    ctx
+}
+
+fn line_context(
+    shape: u32,
+    plane: u32,
+    rgbmode: bool,
+    start: (i32, i32),
+    end: (i32, i32),
+    mask: u32,
+    color: u32,
+) -> Rex3Context {
+    let mut ctx = context(plane, rgbmode, true, (0, 0), (0, 0), mask, color);
+    ctx.drawmode0 = DrawMode0(DRAWMODE0_OPCODE_DRAW | shape | (1 << 8) | (1 << 9));
+    let fixed = |sixteenths: i32| (REX3_COORD_BIAS << 11) + sixteenths * 128;
+    ctx.xstart = fixed(start.0);
+    ctx.xsave = ctx.xstart;
+    ctx.ystart = fixed(start.1);
+    ctx.xend = fixed(end.0);
+    ctx.yend = fixed(end.1);
+    if shape == DRAWMODE0_ADRMODE_I_LINE_SH {
+        let dx = ctx.xend - ctx.xstart;
+        let dy = ctx.yend - ctx.ystart;
+        let adx = dx.abs() >> 11;
+        let ady = dy.abs() >> 11;
+        let mut octant = 0;
+        if dy < 0 { octant |= crate::dev::ng1::rex3::OCTANT_YDEC; }
+        if dx < 0 { octant |= crate::dev::ng1::rex3::OCTANT_XDEC; }
+        if adx > ady { octant |= crate::dev::ng1::rex3::OCTANT_XMAJOR; }
+        let (major, minor) = if adx > ady { (adx, ady) } else { (ady, adx) };
+        let incr1 = 2 * minor;
+        let incr2 = 2 * (minor - major);
+        ctx.bresoctinc1.set_octant(octant);
+        ctx.bresoctinc1.set_incr1(incr1 as u32 & 0x000f_ffff);
+        ctx.bresrndinc2.set_incr2(incr2 as u32 & 0x001f_ffff);
+        ctx.bresd = ((incr1 - major) as u32) & 0x07ff_ffff;
+    } else {
+        fline_setup(&mut ctx);
+    }
     ctx
 }
 
@@ -829,6 +869,114 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
             assert_eq!(status.raw_plane_map_attempts, before_rejection.raw_plane_map_attempts);
         }
         gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_lines_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x49a2_8c17);
+        let seed_aux = seeded_plane(0xb65d_73e8);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate line resident planes");
+
+        let deltas = [
+            (3, 7), (3, -7), (-3, 7), (-3, -7),
+            (7, 3), (7, -3), (-7, 3), (-7, -3),
+        ];
+        let mut draws = 0u64;
+        for (index, delta) in deltas.into_iter().enumerate() {
+            let x = 40 + index as i32 * 12;
+            let y = 80 + index as i32 * 10;
+            let mut actual = line_context(
+                DRAWMODE0_ADRMODE_I_LINE_SH,
+                DRAWMODE1_PLANES_RGB,
+                true,
+                (x * 16, y * 16),
+                ((x + delta.0) * 16, (y + delta.1) * 16),
+                0xff0f_ffff,
+                0x5a31_72b4 ^ index as u32,
+            );
+            actual.bresrndinc2.set_rnd(if index & 1 == 0 { 0 } else { 0xff });
+            if index == 2 { actual.drawmode0.0 |= 1 << 10; }
+            if index == 5 { actual.drawmode0.0 |= 1 << 11; }
+            let mut expected = actual;
+            resident.enqueue(&mut actual).expect("enqueue integer line");
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, &format!("integer line context {index}"));
+            draws += 1;
+        }
+
+        let mut fractional = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (220 * 16 + 3, 180 * 16 + 11),
+            (246 * 16 + 13, 193 * 16 + 2),
+            0xffff_00ff,
+            0x7d26_a159,
+        );
+        fractional.xywin = ((2i16 as u16 as u32) << 16) | (-3i16 as u16 as u32);
+        let mut expected = fractional;
+        resident.enqueue(&mut fractional).expect("enqueue fractional line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&fractional, &expected, "fractional line context");
+        draws += 1;
+
+        let mut antialiased = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (300 * 16 + 7, 210 * 16 + 5),
+            (316 * 16 + 9, 239 * 16 + 12),
+            u32::MAX,
+            0x0135_79bd,
+        );
+        antialiased.drawmode0.0 |= (1 << 10) | (1 << 22);
+        antialiased.aweight0 = u32::MAX;
+        antialiased.aweight1 = 0;
+        let mut expected = antialiased;
+        resident.enqueue(&mut antialiased).expect("enqueue antialiased line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&antialiased, &expected, "antialiased line context");
+        draws += 1;
+
+        let mut auxiliary = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_CID,
+            false,
+            (360 * 16, 280 * 16),
+            (389 * 16, 291 * 16),
+            0x00ff_0f0f,
+            0x2a00_0237,
+        );
+        let mut expected = auxiliary;
+        resident.enqueue(&mut auxiliary).expect("enqueue auxiliary line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&auxiliary, &expected, "auxiliary line context");
+        draws += 1;
+
+        resident.submit().unwrap();
+        assert!(resident.payload.is_empty());
+        assert_eq!(resident.batch.prims_total, draws);
+        gpu.wait(None).unwrap();
+        let lines = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(lines.rgb().unwrap(), &expected_rgb, "RGB lines");
+        compare_observed(lines.aux().unwrap(), &expected_aux, "auxiliary lines");
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(draws));
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(status.completed, Some(status.submitted));
     });
 }
 

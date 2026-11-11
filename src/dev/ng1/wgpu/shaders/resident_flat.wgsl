@@ -49,7 +49,22 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
     let fill = command.kind == REX_COMMAND_BLOCK
         || command.kind == REX_COMMAND_SPAN
         || command.kind == REX_COMMAND_CLEAR;
-    if fill && in_bounds
+    let line = command.kind == REX_COMMAND_I_LINE
+        || command.kind == REX_COMMAND_F_LINE
+        || command.kind == REX_COMMAND_A_LINE;
+    var covered = fill;
+    if line {
+        let y_major = (command.flags & REX_FLAG_LINE_Y_MAJOR) != 0u;
+        let decreasing = (command.flags & REX_FLAG_LINE_MAJOR_DECREASING) != 0u;
+        let major = select(px, py, y_major);
+        let delta = select(major - command.src_x0, command.src_x0 - major, decreasing);
+        if delta >= 0 && u32(delta) < command.payload_words {
+            let minor = select(py, px, y_major);
+            let expected = bitcast<i32>(payload[command.payload_offset + u32(delta)]);
+            covered = minor == expected;
+        }
+    }
+    if covered && in_bounds
         && px >= command.dst_x0 && px <= command.dst_x1
         && py >= command.dst_y0 && py <= command.dst_y1 {
         let state = states[command.state_slot];
