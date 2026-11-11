@@ -25,7 +25,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `perfetto` | Perfetto trace recording (`--perfetto FILE`, monitor `perfetto`); see [docs/perfetto.md](docs/perfetto.md). Lightning-compatible. | — |
 | `rexdiag` | REX3 per-GO activity and dispatch counters. Default on; removable in a core build. | — |
 | `fetchverify` | Compare executed instruction bytes with memory in interpreter/JIT; expensive stale-code detector. | — |
-| `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. | — |
+| `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. Also times the Indy's DS1386 and 8254 on the cycle count. | — |
 | `opcodefusion` | Interpreter instruction fusion; breakpoints on a fused second instruction cannot fire. | — |
 | `lightning` | Strip breakpoints/traceback for speed; hides GUI Debug controls. | `opcodefusion` |
 | `tlbvmap` | Compatibility flag: vmap translation is unconditional. | — |
