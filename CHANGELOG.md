@@ -134,6 +134,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The nightly boot test also boots IRIX 5.3 on the graphics console and fails
   unless the login screen matches a golden image. `iris-ci screen-wait GOLDEN`
   waits for a screen match.
+- `iris-ci boot-test DISK` runs that boot test on any IRIX disk, starting its own
+  iris, and writes `boot-test.xml`. Exit status 6 means a check failed. It
+  replaces `scripts/ci-boot-test.sh` and adds a check that the seeded NVRAM reads
+  back from the PROM and from the booted guest.
 
 ### PCI
 

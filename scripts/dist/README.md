@@ -44,7 +44,7 @@ scripts/dist/package-linux.sh --version 1.2.3
   downloads table links to exists. Run it by hand to test a branch. It also
   boots a stock IRIX 5.3 disk, downloaded from a pinned URL and checked against
   a pinned SHA-256, to a login prompt on Linux, macOS and Windows with
-  `scripts/ci-boot-test.sh`, and a failed boot stops the nightly or release
+  `iris-ci boot-test`, and a failed boot stops the nightly or release
   from publishing. It boots twice. With the PROM console on serial it watches
   for `login:`. With the console on the graphics board, where IRIX draws its
   login on the framebuffer only, `iris-ci screen-wait` waits for the screen to

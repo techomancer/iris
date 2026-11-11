@@ -370,25 +370,14 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Boots IRIX 5.3 to a login prompt with the CLI just built, through
-  # scripts/ci-boot-test.sh: once on serial, where "login:" is read, and once
-  # on the graphics board, where the screen must match
-  # scripts/boot-goldens/indy-irix53.png. The disk image is a public, hash-pinned
-  # download (see clanker/testing/ci-irix53-disk.md); the job fails if it
-  # cannot be fetched or its checksum differs. nightly.yml and release.yml
-  # publish only if this whole workflow succeeds, so a failed boot stops the
-  # publish.
+  # Boots IRIX 5.3 with `iris-ci boot-test`; see
+  # clanker/testing/ci-unattended-irix-boot.md. Publishing waits on it.
   boot-test:
     name: Boot test (${{ matrix.os }}-${{ matrix.arch }})
     needs: [version, windows, macos, linux]
     runs-on: ${{ matrix.runner }}
-    # Every wait in scripts/ci-boot-test.sh running out, per boot: seeding
-    # NVRAM (60 s for the CI socket, 180 s for the PROM menu, 30 s for the
-    # monitor prompt, 6 x 30 s for its commands, 5 s to stop) and the boot
-    # (60 s for the socket, BOOT_TIMEOUT, 5 s between polls, 5 s to stop) is
-    # about 1125 s, so the two boots are about 2250 s. The steps before the
-    # boot took under 30 s in the 2026-11-09 nightly.
-    timeout-minutes: 40
+    # Worst case, every wait running out on both boots, is about 2540 s.
+    timeout-minutes: 50
     env:
       VER: ${{ needs.version.outputs.version }}
       # Per boot. The graphical login appeared within 80 s on all three
@@ -451,9 +440,9 @@ jobs:
           ls -la boot-image
 
       - name: Boot IRIX 5.3 on the serial and graphics consoles
-        run: bash scripts/ci-boot-test.sh core boot-image/irix53.chd boot-test "$BOOT_TIMEOUT"
+        run: core/iris-ci boot-test boot-image/irix53.chd --out boot-test --timeout "$BOOT_TIMEOUT"
 
-      # The script writes each check as a JUnit case, so a failed run is
+      # boot-test writes each check as a JUnit case, so a failed run is
       # annotated with the check that failed.
       - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
         if: ${{ always() }}

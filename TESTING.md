@@ -322,9 +322,11 @@ space; a skipped test (`# SKIP`) reports `ok`.
 `build.yml` boots IRIX 5.3 with each CLI build, on Linux, macOS and Windows,
 from a pinned, checksummed stock disk
 ([clanker/testing/ci-irix53-disk.md](clanker/testing/ci-irix53-disk.md)).
-`scripts/ci-boot-test.sh` seeds
-NVRAM on a first headless run, boots with the console on serial and waits up to
-15 minutes for `login:`, then checks that iris quits cleanly. Each check is a
+`iris-ci boot-test` seeds NVRAM on a first headless run, boots with the console
+on serial and waits up to 15 minutes for `login:`, then does the same with the
+console on the graphics board and a screenshot to match. It reads the seeded
+NVRAM back from the PROM and from the booted guest, and checks that iris quits
+cleanly. What it seeds and checks is `tests/irix/boot.toml`. Each check is a
 JUnit case, so a failed run is annotated with the check that failed, and the run
 keeps the logs. [clanker/testing/ci-unattended-irix-boot.md](clanker/testing/ci-unattended-irix-boot.md)
 has the details.

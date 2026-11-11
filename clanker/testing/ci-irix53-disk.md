@@ -53,7 +53,7 @@ swapped download fails the job. There is no Actions cache: the repository's
 10 GB quota is full of Rust caches and a 222 MB entry was evicted before the
 next night.
 
-`scripts/ci-boot-test.sh` opens the CHD with `overlay = true`, which keeps
+`iris-ci boot-test` opens the CHD with `overlay = true`, which keeps
 writes in a `<name>.chd.diff.chd` beside it and reuses that file on the next
 open. A local run in a reused directory therefore starts from the last run's
 writes. Copy the CHD into a fresh directory for every run.
@@ -62,13 +62,13 @@ writes. Copy the CHD into a fresh directory for every run.
 
 1. Build the new disk and publish it under a path that carries the new CHD
    hash, as above. Leave the old object alone.
-2. Run `bash scripts/ci-boot-test.sh <bin-dir> <fresh-copy>.chd <out> 600`
-   with a release build of the CLI (`cargo build --release --bin iris --bin
-   iris-ci` with the nightly features in `scripts/dist/lib.sh`). It fails the
-   graphics check against the old golden and leaves `gfx-screen.png`.
+2. Run `iris-ci boot-test <fresh-copy>.chd --out <out> --timeout 600` with a
+   release build of the CLI (`cargo build --release --bin iris --bin iris-ci`
+   with the nightly features in `scripts/dist/lib.sh`). It fails the graphics
+   check against the old golden and leaves `gfx-screen.png`.
 3. Look at `gfx-screen.png`. It must be the login screen of the new disk. Copy it
-   to `scripts/boot-goldens/indy-irix53.png`, run the script again from another
-   fresh copy (exit 0, six passing cases in `boot-test.xml`) and run `cargo
+   to `scripts/boot-goldens/indy-irix53.png`, run the test again from another
+   fresh copy (exit 0, ten passing cases in `boot-test.xml`) and run `cargo
    test --release --bin iris-ci` for the golden's unit test.
 4. Change `IRIX53_IMAGE_URL` and `IRIX53_IMAGE_SHA256` in `build.yml`, the table
    above and the golden in one commit, so the job never runs the new disk against
