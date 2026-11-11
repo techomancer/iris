@@ -726,11 +726,11 @@ pub trait Rex3RegisterOps {
     ///
     /// # Example
     /// For a 12.4.7 format (12+4=16 value bits, top 9 bits unused, 7 bottom bits masked):
-    /// ```
-    /// use iris::dev::ng1::rex3::Rex3RegisterOps;
+    /// ```text
     /// let val = 0x12345678u32.rexset(9, 7); // Input: uuuuuuuuuVVVVVVVVVVVVVVVVbbbbbbb
     ///                                        // Output: SSSSSSSSSVVVVVVVVVVVVVVVV0000000
     /// ```
+    /// Checked by `rexset_masks_the_bottom_bits_and_sign_extends` in `rex3_tests.rs`.
     fn rexset(self, top_bits: u32, bottom_bits: u32) -> u32;
 
     /// Read from a REX3 register with masking
@@ -743,12 +743,11 @@ pub trait Rex3RegisterOps {
     ///
     /// # Example
     /// For reading a 12.4.7 format register (16 value bits, 9 top bits, 7 bottom bits):
-    /// ```
-    /// use iris::dev::ng1::rex3::Rex3RegisterOps;
-    /// let raw_register = 0u32;
+    /// ```text
     /// let val = raw_register.rexget(9, 7); // Input: SSSSSSSSSVVVVVVVVVVVVVVVV0000000
     ///                                       // Output: 000000000VVVVVVVVVVVVVVVV0000000
     /// ```
+    /// Checked by `rexget_clears_the_sign_extension` in `rex3_tests.rs`.
     fn rexget(self, top_bits: u32, bottom_bits: u32) -> u32;
 }
 
