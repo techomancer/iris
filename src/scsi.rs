@@ -489,11 +489,10 @@ impl ScsiDevice {
             });
         }
 
-        // Writes always go through as 512-byte sectors (HDD path only, phys=logical=512)
         if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         }
-        if self.media.node_mut().write(lba * 512, data).is_err() {
+        if self.media.node_mut().write(lba * self.logical_block_size, data).is_err() {
             return Ok(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
         }
         // The backend has the data, but only a sync puts it on the host's disk.
@@ -1487,6 +1486,21 @@ mod tests {
         let cdb = [0x55, 0x10, 0, 0, 0, 0, 0, 0, list.len() as u8, 0];
         assert_eq!(dev.request(&request(&cdb, Some(list))).unwrap().status, 0x00);
         assert_eq!(caching_flags(&mut dev), 0x00);
+    }
+
+    /// A block descriptor that sets 1024-byte blocks moves writes as well
+    /// as reads: block 1 written is block 1 read back.
+    #[test]
+    fn a_block_length_from_mode_select_applies_to_writes() {
+        let mut dev = disk();
+        let list = vec![0u8, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0x04, 0x00];
+        assert_eq!(dev.request(&request(&[0x15, 0x10, 0, 0, list.len() as u8, 0], Some(list))).unwrap().status, 0x00);
+        assert_eq!(dev.block_sizes().1, 1024);
+        let write = [0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0];
+        assert_eq!(dev.request(&request(&write, Some(vec![0xab; 1024]))).unwrap().status, 0x00);
+        let read = run(&mut dev, &[0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0]);
+        assert_eq!(read.status, 0x00);
+        assert!(read.data == vec![0xab; 1024], "block 1 reads back what was written to it");
     }
 
     #[test]
