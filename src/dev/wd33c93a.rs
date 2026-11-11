@@ -2275,3 +2275,48 @@ mod data_out_phase_tests {
         let _ = std::fs::remove_file(img);
     }
 }
+
+/// The worker's doorbell, checked by loom: a writer sets a command and
+/// notifies; the worker waits for it. The real worker uses parking_lot, whose
+/// guard API differs from loom's, so this transcribes its wait loop on loom's
+/// `Mutex` and `Condvar` (as `intx.rs` swaps its atomics). Run with
+/// `RUSTFLAGS="--cfg loom" cargo test --lib wd33c93a::loom_tests`.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::sync::{Arc, Condvar, Mutex};
+    use loom::thread;
+
+    struct Doorbell {
+        /// `pending_command.is_some()` and `running`, behind the one lock.
+        state: Mutex<(bool, bool)>,
+        cond: Condvar,
+    }
+
+    /// The worker takes one command. Its wait is the worker's loop: with an
+    /// unconditional `wait` in its place, a write that lands first is lost and
+    /// loom reports the worker as deadlocked.
+    #[test]
+    fn a_command_is_taken_however_the_write_and_the_wait_interleave() {
+        loom::model(|| {
+            let bell = Arc::new(Doorbell { state: Mutex::new((false, true)), cond: Condvar::new() });
+            let worker = {
+                let bell = bell.clone();
+                thread::spawn(move || {
+                    let mut st = bell.state.lock().unwrap();
+                    while !st.0 && st.1 {
+                        st = bell.cond.wait(st).unwrap();
+                    }
+                    assert!(st.0, "the worker woke without its command");
+                    st.0 = false;
+                })
+            };
+            // A COMMAND write: set under the lock, notify.
+            {
+                let mut st = bell.state.lock().unwrap();
+                st.0 = true;
+                bell.cond.notify_one();
+            }
+            worker.join().unwrap();
+        });
+    }
+}
