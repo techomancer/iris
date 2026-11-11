@@ -1846,7 +1846,9 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert!(r.c.sh.armed.lock().iter().all(|a| a.is_none()));
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
-    std::thread::sleep(Duration::from_millis(20));
+    // The threads are joined, so nothing can take the character: it is
+    // still in the backend, not in the UART.
+    assert_eq!(r.wire[0].inp.lock().unwrap().len(), 1);
     assert!(r.c.rx_pending(0) == 0);
     r.c.start();
     assert!(eventually(|| r.c.rx_pending(0) != 0));
