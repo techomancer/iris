@@ -78,6 +78,10 @@ pub trait ScsiTarget: Send {
     /// Uncommitted sectors, `None` when the target has no such layer.
     fn cow_dirty(&self) -> Option<usize> { None }
 
+    /// What `cow status` says of the layer's uncommitted writes, `None` when
+    /// the target has no such layer.
+    fn cow_summary(&self) -> Option<String> { None }
+
     /// Merge the layer into the base image; how much was committed.
     fn cow_commit(&mut self) -> io::Result<usize> { Ok(0) }
 
@@ -608,6 +612,27 @@ mod tests {
             "no empty diff is made until the disk is used again"
         );
         assert_eq!(sector_2(&b1), vec![0x5Au8; 512], "the folded disk is back for a resumed guest");
+    }
+
+    /// `cow status` counts a raw overlay's sectors, and says only whether a
+    /// CHD diff holds changes, as it has no count to give.
+    #[test]
+    fn cow_summary_counts_sectors_only_where_there_are_sectors() {
+        let dir = TempPath::dir("scsibus-summary");
+        let (_, b) = chd_bus_with_a_write(&dir);
+        let summary = |b: &ScsiBus, id: u8| {
+            let mut s = None;
+            b.for_each(|i, t| if i == id as usize { s = t.cow_summary() });
+            s
+        };
+        assert_eq!(summary(&b, 4).as_deref(), Some("uncommitted changes"));
+        let raw = image(&dir, 4);
+        attach(&b, 1, &raw, true).unwrap();
+        assert_eq!(summary(&b, 1).as_deref(), Some("0 dirty sectors"));
+        b.request(1, &write_block(2, 0x77)).unwrap().unwrap();
+        assert_eq!(summary(&b, 1).as_deref(), Some("1 dirty sector"));
+        b.request(1, &write_block(3, 0x77)).unwrap().unwrap();
+        assert_eq!(summary(&b, 1).as_deref(), Some("2 dirty sectors"));
     }
 
     #[test]
