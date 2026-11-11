@@ -686,6 +686,65 @@ fn ping_the_gateway() {
                (gw, packet::ICMP_ECHO_REPLY, 0xbeef, 7, &b"payload"[..]));
 }
 
+/// Send a `size`-byte ping to `dst`, fragmented to the MTU as a guest sends it.
+fn send_big_ping(net: &mut TestNet, dst: Ipv4Addr, size: usize) {
+    let id = net.next_id();
+    for f in net.route_to(dst).icmp_fragments(id, packet::ICMP_ECHO_REQUEST, 0, [0xbe, 0xef, 0, 7], &pattern(size)) {
+        net.send(f);
+    }
+}
+
+/// Wait for the reply to `send_big_ping`. Checks that every frame fits the
+/// MTU, reassembles them, and checks the reply against the request.
+fn big_ping_reply(net: &mut TestNet, src: Ipv4Addr, size: usize) -> usize {
+    let last = net.wait_for("the echo reply's last frame", |f| {
+        Ether::parse(f).and_then(|e| e.ipv4()).is_some_and(|i| i.proto() == packet::PROTO_ICMP && !i.more_fragments())
+    });
+    net.inbox.push_back(last);
+    let frames = net.inbox.len();
+    let mut whole = Vec::new();
+    for f in net.inbox.drain(..) {
+        let ip = Ether::parse(&f).unwrap().ipv4().unwrap();
+        assert!(ip.total_len() as usize <= packet::MTU, "{size}-byte ping: a reply frame exceeds the MTU");
+        assert_eq!((ip.src(), ip.proto(), ip.frag_offset()), (src, packet::PROTO_ICMP, whole.len()));
+        whole.extend_from_slice(ip.payload());
+    }
+    assert_eq!(packet::checksum(&whole), 0, "{size}-byte ping: ICMP checksum");
+    let i = packet::Icmp::parse(&whole).unwrap();
+    assert_eq!((i.ty(), i.ident(), i.seq(), i.body().len()), (packet::ICMP_ECHO_REPLY, 0xbeef, 7, size));
+    assert!(i.body() == pattern(size), "{size}-byte ping: reply payload");
+    frames
+}
+
+/// A ping too large for one frame arrives as IP fragments; the gateway's
+/// reply goes back fragmented to the MTU. One that fits gets one frame.
+#[test]
+fn ping_the_gateway_past_the_mtu() {
+    for (size, frames) in [(1472, 1), (1473, 2), (8000, 6)] {
+        let mut net = TestNet::default();
+        let gw = net.gw_ip;
+        send_big_ping(&mut net, gw, size);
+        assert_eq!(big_ping_reply(&mut net, gw, size), frames, "{size}-byte ping: reply frames");
+    }
+}
+
+/// The same through a host ICMP socket. The request goes out whole and the
+/// host reassembles the reply before the engine reads it, so this checks the
+/// engine reads a datagram larger than one frame. Skipped where the host
+/// gives no ICMP socket: Linux outside `net.ipv4.ping_group_range`, Windows
+/// without administrator rights.
+#[test]
+fn ping_the_host_past_the_mtu() {
+    let mut net = TestNet::default();
+    let host = Ipv4Addr::LOCALHOST;
+    send_big_ping(&mut net, host, 8000);
+    if net.e.icmp_unavailable {
+        eprintln!("skipped: no host ICMP socket");
+        return;
+    }
+    assert_eq!(big_ping_reply(&mut net, host, 8000), 6);
+}
+
 // ── Inbound port forwards ────────────────────────────────────────────────────
 
 fn forward_config(proto: ForwardProto, host_port: u16, guest_port: u16) -> GatewayConfig {
