@@ -517,6 +517,8 @@ guest. `y = 0` is the top display line throughout.
 `iris-ci screenshot` captures the composed screen from any board, also
 headless. `iris-ci screen-wait GOLDEN.png` takes screenshots until one
 matches a PNG and, on a timeout, leaves the last one and a diff image behind.
+The `screenshot` reply carries `"fresh": false` when the display had not
+composed a new frame in time, so the PNG shows the previous one.
 
 **Screen, pointer and keyboard (any board)**
 

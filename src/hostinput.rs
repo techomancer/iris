@@ -444,33 +444,43 @@ impl HostInput {
         }).count()
     }
 
-    /// A fresh frame, tight, with its size.
-    pub fn frame(&self) -> Result<(usize, usize, Vec<u32>), String> {
+    /// A frame, tight, with its size, and whether it is fresh: false when the
+    /// board did not compose a new one within 250 ms, so it is the last one
+    /// it did.
+    pub fn frame(&self) -> Result<(usize, usize, Vec<u32>, bool), String> {
         let d = self.display.as_ref().ok_or("no display (headless)")?;
+        let fresh = crate::gfx_display::wait_fresh_frame(&**d, Duration::from_millis(250));
         let mut px = Vec::new();
-        let (w, h, _) = crate::gfx_display::fresh_frame(&**d, &mut px, Duration::from_millis(250))
-            .ok_or("the display has no video mode yet")?;
-        Ok((w, h, px))
+        let (w, h, _) = crate::gfx_display::copy_frame(&**d, &mut px).ok_or("the display has no video mode yet")?;
+        Ok((w, h, px, fresh))
     }
 
     /// Wait until the screen has not changed for `quiet`, at most `timeout`.
-    /// Returns whether it settled.
+    /// Returns whether it settled. Only fresh frames count: an old frame
+    /// repeats whatever the guest draws.
     pub fn wait_still(&self, quiet: Duration, timeout: Duration) -> Result<bool, String> {
         let start = Instant::now();
-        let mut last = self.frame()?;
+        let mut last = None;
         let mut since = Instant::now();
         while start.elapsed() < timeout {
-            std::thread::sleep(Duration::from_millis(50));
-            let f = self.frame()?;
-            if f != last {
-                last = f;
-                since = Instant::now();
-            } else if since.elapsed() >= quiet {
-                return Ok(true);
+            let (w, h, px, fresh) = self.frame()?;
+            if fresh {
+                if last.as_ref() != Some(&(w, h, px.clone())) {
+                    last = Some((w, h, px));
+                    since = Instant::now();
+                } else if since.elapsed() >= quiet {
+                    return Ok(true);
+                }
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
         Ok(false)
     }
+}
+
+/// What a reply adds when its frame is not a fresh one.
+fn stale_note(fresh: bool) -> &'static str {
+    if fresh { "" } else { " (an old frame: the display composed no new one in 250 ms)" }
 }
 
 /// A hotspot is inside its glyph, give or take how far the board draws the
@@ -579,19 +589,19 @@ impl crate::traits::Device for HostInput {
                 let crop = if args.len() >= 6 {
                     Some((num(args, 2, "x")?, num(args, 3, "y")?, num(args, 4, "w")?, num(args, 5, "h")?))
                 } else { None };
-                let (fw, fh, px) = self.frame()?;
+                let (fw, fh, px, fresh) = self.frame()?;
                 let (cw, ch) = save_png(path, &px, fw, fh, crop)?;
-                out(&mut w, format!("saved {path} {cw}x{ch} (screen {fw}x{fh})"));
+                out(&mut w, format!("saved {path} {cw}x{ch} (screen {fw}x{fh}){}", stale_note(fresh)));
                 Ok(())
             }
             ("screen", "pix") => {
                 let (x, y): (usize, usize) = (num(args, 1, "x")?, num(args, 2, "y")?);
-                let (fw, fh, px) = self.frame()?;
+                let (fw, fh, px, fresh) = self.frame()?;
                 if x >= fw || y >= fh {
                     return Err(format!("{x},{y} is outside the {fw}x{fh} screen"));
                 }
                 let p = px[y * fw + x];
-                out(&mut w, format!("{x},{y} = {:02x}{:02x}{:02x}", p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff));
+                out(&mut w, format!("{x},{y} = {:02x}{:02x}{:02x}{}", p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff, stale_note(fresh)));
                 Ok(())
             }
             ("screen", "wait") => {
@@ -708,6 +718,19 @@ mod tests {
         other[4] = 1;
         let d = HwCursor { x: 0, y: 0, size: 32, mask: other };
         assert_ne!(c.shape_key(), d.shape_key());
+    }
+
+    /// A board that composes no new frame says nothing about whether the
+    /// screen is still: the old frame repeats however the guest draws, so
+    /// `screen wait` must not call that settled.
+    #[test]
+    fn a_screen_that_composes_no_frame_is_not_still() {
+        let display: Arc<dyn GfxDisplay> = Arc::new(crate::gfx_display::testing::FakeDisplay::new(4, 2, true));
+        let hi = HostInput::new(Some(display), Arc::new(Ps2Controller::new(None)));
+        assert!(!hi.wait_still(Duration::from_millis(1), Duration::from_millis(600)).unwrap());
+        let display: Arc<dyn GfxDisplay> = Arc::new(crate::gfx_display::testing::FakeDisplay::new(4, 2, false));
+        let hi = HostInput::new(Some(display), Arc::new(Ps2Controller::new(None)));
+        assert!(hi.wait_still(Duration::from_millis(1), Duration::from_secs(5)).unwrap(), "a composed, unchanging screen is still");
     }
 
     #[test]
