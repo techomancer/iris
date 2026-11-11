@@ -1424,6 +1424,10 @@ mod tests {
         v
     }
 
+    /// The page a line for `pa` holds: the host granule around it, which is
+    /// 16 KB on Apple silicon and 64 KB on Windows.
+    fn page(pa: u64) -> u64 { pa & !(crate::ppmem::granularity() as u64 - 1) }
+
     /// TagLo of a DirtyExclusive primary data line for `pa`'s page.
     fn pd_dirty(pa: u64) -> u64 { (pa >> 12) << 8 | 3 << PD_STATE_SHIFT }
 
@@ -1477,7 +1481,7 @@ mod tests {
         let (at_a, at_a4) = (0x2404_0002u64, 0x03e0_0008u64); // addiu $4,$0,2; jr $31
         c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3008, at_a4 << 32 | at_a);
         c.cache_op(C_IST | CACH_SD, 0x8000_3000, sd_tag(0x3000, 2));
-        assert_eq!(space.held_line_pages(0), vec![0x3000]);
+        assert_eq!(space.held_line_pages(0), vec![page(0x3000)]);
         assert_eq!(c.read::<4>(0, 0x3008).data, at_a, "the word at A");
         assert_eq!(c.read::<4>(0, 0x300c).data, at_a4, "the word at A + 4");
         c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3000, 0x9999);
@@ -1570,7 +1574,7 @@ mod tests {
         c.cache_op(C_IST | CACH_SD, 0x8000_0000, 0x1 << 13 | 5 << 10);
         assert!(space.held_line_pages(0).is_empty());
         c.cache_op(C_IST | CACH_PD, 0x8000_4fe0, 0x5 << 8 | 0xc0);
-        assert_eq!(space.held_line_pages(0), vec![0x5000]);
+        assert_eq!(space.held_line_pages(0), vec![page(0x5000)]);
         assert_eq!(c.cache_op(C_ILT | CACH_PD, 0x8000_0fe0, 0) & 0xc0, 0, "way 0 is untouched");
         c.power_on();
         assert!(space.held_line_pages(0).is_empty());
@@ -1627,7 +1631,7 @@ mod tests {
         c.cache_op(C_IST | CACH_PD, 0x8000_6040, pd_dirty(0x6000));
         c.write::<4>(0, 0x6000, 0xbad);
         c.cache_op(C_IST | CACH_PD, 0x8000_6000, 0);
-        assert_eq!(space.held_line_pages(v), vec![0x6000]);
+        assert_eq!(space.held_line_pages(v), vec![page(0x6000)]);
         assert_eq!(c.read::<4>(0, 0x6000).data, 0xbad, "the page stays the view's");
         c.cache_op(C_IWBINV | CACH_PD, 0x8000_6040, 0);
         assert!(space.held_line_pages(v).is_empty());
