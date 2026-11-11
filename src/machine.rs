@@ -2228,7 +2228,7 @@ mod drop_tests {
 #[cfg(test)]
 mod controller_lifetime_tests {
     use super::*;
-    use crate::test_temp::{nvram_in, TempPath};
+    use crate::test_temp::{nvram_in, TempImage, TempPath};
 
     /// `nv` holds the machine's NVRAM files, so a stop writes them there and
     /// not into the working directory.
@@ -2286,10 +2286,8 @@ mod controller_lifetime_tests {
     #[test]
     fn guest_power_off_flushes_overlay_disks() {
         use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest};
-        let path = std::env::temp_dir().join(format!("iris-poweroff-{}", std::process::id()));
-        std::fs::write(&path, vec![0u8; 8 * 512]).unwrap();
+        let path = TempImage::file("poweroff", &vec![0u8; 8 * 512]);
         let sidecar = format!("{}.overlay.dirty", path.display());
-        let _ = std::fs::remove_file(&sidecar);
         let nv = TempPath::dir("machine-nv");
         let nv_dir = nv.to_path_buf();
 
@@ -2333,10 +2331,8 @@ mod controller_lifetime_tests {
         let held = crate::cow_disk::load_dirty_sidecar(std::path::Path::new(&sidecar)).unwrap_or_default();
         assert!(held.contains(&3) && held.contains(&4), "power-off left no record of the written sectors");
 
+        // The machine closes its disks as it drops, before `path` goes.
         drop(machine);
-        let _ = std::fs::remove_file(format!("{}.overlay", path.display()));
-        let _ = std::fs::remove_file(&sidecar);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// iris-gui drops a Machine on Stop while the monitor keeps its
