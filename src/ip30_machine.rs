@@ -21,7 +21,7 @@ use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
-use crate::dev::bridge::{Bridge, RawFlash};
+use crate::dev::bridge::{Bridge, RawFlash, PIN_WIRING};
 use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
 use crate::dev::ds1685::Ds1685;
@@ -342,7 +342,7 @@ impl OctaneMachine {
         // The onboard Bridge: memory and interrupts through HEART, the boot
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
-        let bridge = Bridge::new(Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()), &crate::ip30::PCI0);
+        let bridge = Bridge::new(Upstream::single(crate::ip30::HEART_HOST, mem.clone(), heart.clone()), &PIN_WIRING);
         bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.

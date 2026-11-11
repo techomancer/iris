@@ -42,7 +42,7 @@
 //! Ported from hw/misc/sgi-bedrock-pi.c in jamesbraid/qemu-sgi-origami.
 
 use super::reg::IIO_PROTECT_OVRRD_KEY;
-use crate::dev::odyssey::{PiGfx, PI_GFX_REGS};
+use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
 use super::HostTimer;
 use crate::hptimer::TimerId;
 use parking_lot::Mutex;

@@ -760,7 +760,7 @@ impl MachineProfile {
     pub fn prom_path(self, prom: &str) -> String {
         match self {
             Self::OctaneIp30 => prom_file(prom, crate::ip30_machine::OCTANE_PROM_FILE),
-            _ if self.is_ip27() => prom_file(prom, crate::ip27_machine::ORIGIN200_PROM_FILE),
+            _ if self.is_ip27() => prom_file(prom, crate::ip27_machine::IP27_PROM_FILE),
             Self::O2Ip32 => prom_file(prom, crate::ip32_machine::O2_PROM_FILE),
             _ => prom.to_string(),
         }

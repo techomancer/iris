@@ -42,7 +42,7 @@ use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
-use crate::dev::bridge::Bridge;
+use crate::dev::bridge::{Bridge, PIN_WIRING};
 use crate::dev::elsc::{Elsc, ElscConfig, ModuleOutput};
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::heart::{host_clock, Clock};
@@ -95,8 +95,9 @@ pub(crate) fn table(cfg: &MachineConfig) -> &'static str {
     cfg.machine.profile.ip27_table().expect("an SN0 machine reads its product's table")
 }
 
-/// The PROM image tried when `prom` is left at the shared default.
-pub const ORIGIN200_PROM_FILE: &str = "ip27prom.img";
+/// The PROM image tried when `prom` is left at the shared default, for all
+/// three SN0 products.
+pub const IP27_PROM_FILE: &str = "ip27prom.img";
 
 /// The Hub's own widget number: a small window there is not the Bridge's.
 const WIDGET_HUB: u8 = 1;
@@ -912,7 +913,7 @@ impl Ip27Board for Origin200 {
     fn wire(nodes: &[&Node], cfg: &MachineConfig) -> Result<BoardIo, String> {
         let node = nodes[0];
         let controller = Origin200Controller::new(node, section(cfg).controller_store.as_deref().map(Path::new))?;
-        let bridge = Bridge::new(Upstream::new().with(node.hub.host_port(HUB_HOST_WIDGET)), &crate::ip30::PCI0);
+        let bridge = Bridge::new(Upstream::new().with(node.hub.host_port(HUB_HOST_WIDGET)), &PIN_WIRING);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record());
         // The Bridge answers every small window but the Hub's own.

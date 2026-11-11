@@ -53,7 +53,7 @@
 //! Ported from hw/mips/sgi/sn-machine.c in jamesbraid/qemu-sgi-origami.
 
 use crate::config::{MachineConfig, MachineProfile};
-use crate::dev::bridge::Bridge;
+use crate::dev::bridge::{Bridge, PIN_WIRING};
 use crate::dev::elsc::ModuleOutput;
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::devlog::LogModule;
@@ -336,7 +336,7 @@ impl Deskside {
     /// The BaseIO's Bridge, as `upstream` reaches its host: revision, board
     /// record and, when the machine names an I/O PROM, the boot flash.
     fn baseio_bridge(cfg: &MachineConfig, layout: &DesksideLayout, upstream: crate::xtalk::Upstream) -> Result<Arc<Bridge>, String> {
-        let bridge = Bridge::new(upstream, &crate::ip30::PCI0);
+        let bridge = Bridge::new(upstream, &PIN_WIRING);
         bridge.set_revision(BRIDGE_REVISION);
         bridge.set_microlan(Self::board_record(layout));
         fit_io_prom(&bridge, cfg)?;

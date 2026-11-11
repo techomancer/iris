@@ -1,13 +1,14 @@
-//! Crossbow, the Octane's XIO crossbar: widget 0's registers, and which of
-//! the eight links (widgets 8 to 15) are present and carrying traffic.
+//! Crossbow, the XIO crossbar of the Octane and of the Origin 2000 and Onyx2
+//! deskside modules: widget 0's registers, and which of the eight links
+//! (widgets 8 to 15) are present and carrying traffic.
 //!
-//! Cut to what the Octane uses; registers follow the Crossbow ASIC
+//! Cut to what those machines use; registers follow the Crossbow ASIC
 //! specification, revision 12.0 (`docs/datasheets/octane/`). The switch
 //! translates no address: the machine routes a processor access by widget
 //! number and asks [`Xbow::carries`] whether the link is up. Packets from
 //! widget 0 itself are its interrupts, which go to the target its interrupt
-//! destination registers name; on the Octane that is HEART, which the machine
-//! gives as an [`XtalkHost`].
+//! destination registers name: HEART on the Octane and a node's Hub on the
+//! deskside modules, which the machine gives as an [`XtalkHost`].
 //!
 //! Which links are present and alive are atomics, so the routing decision
 //! (`carries`) never takes a lock; they change only under the register
@@ -43,14 +44,13 @@
 //! widget in its status reads: what [`Pxbow`](super::pxbow::Pxbow) needs
 //! behind a PIC.
 //!
-//! With a clock ([`Xbow::with_clock`]) a link reset is the two-core-cycle
-//! pulse the QEMU model has: the link is down for 20 ns of the clock, and
+//! With a clock ([`Xbow::with_clock`]) a link reset is a two-core-cycle
+//! pulse: the link is down for 20 ns of the clock, and
 //! the chip ends the pulse the next time anything reads its registers or
 //! asks [`Xbow::carries_timed`], so what the guest sees follows the clock and not
 //! host scheduling. Without one the pulse is over at once. [`Xbow::warm_reset`]
 //! takes a warm reset from a link through the revision-5 fences. No board in
-//! this tree sends one yet: the Hub's link control is the only sender the
-//! QEMU model names.
+//! this tree sends one yet.
 //!
 //! Ported from hw/misc/sgi-xbow.c in jamesbraid/qemu-sgi-origami.
 
@@ -357,8 +357,7 @@ impl Xbow {
     /// processor sees is the other half: an uncached store is a write
     /// request with no completion response (NEC U10278EJ4V0UM p.104, table
     /// 6-1), so no error can come back to it. A stock IP35 PROM writes the
-    /// lower register on purpose in its crossbar check. QEMU's
-    /// `complete-posted-error-address-writes` property.
+    /// lower register on purpose in its crossbar check.
     pub fn with_posted_error_address_writes(mut self) -> Self {
         self.posted_error_address_writes = true;
         self
@@ -1353,11 +1352,9 @@ mod tests {
     }
 
     /// A write to a read-only error address register is an access error and
-    /// changes nothing. With posted error
-    /// address writes the store still completes, as QEMU's crossbar does with
-    /// `complete-posted-error-address-writes` (hw/misc/sgi-xbow.c, asserted
-    /// set on the Origin 2000 by sn0-origin2000-test's xio-owner case); other
-    /// read-only registers are refused as before.
+    /// changes nothing. With posted error address writes
+    /// ([`Xbow::with_posted_error_address_writes`]) the store still completes;
+    /// other read-only registers are refused as before.
     #[test]
     fn a_posted_error_address_write_completes_and_still_records_the_access_error() {
         let refusing = octane();
@@ -1538,9 +1535,9 @@ mod tests {
     /// another port leaves it alone.
     #[test]
     fn a_link_reset_resets_the_bridge_behind_that_port_only() {
-        use crate::dev::bridge::reg;
+        use crate::dev::bridge::{reg, PIN_WIRING};
         let x = Arc::new(octane());
-        let bridge = Bridge::new(Upstream::new(), &crate::ip30::PCI0);
+        let bridge = Bridge::new(Upstream::new(), &PIN_WIRING);
         x.serve_bridge(15, &bridge);
         let enable = |v: u32| assert_eq!(BusDevice::write32(&*bridge, u64::from(reg::INT_ENABLE + 4), v), BUS_OK);
         enable(0x44);

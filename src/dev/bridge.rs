@@ -1,12 +1,14 @@
-//! The Octane's onboard Bridge: the XIO-to-PCI host bridge at widget 0xf. The
-//! same chip sits on the PCI option boards ([`super::xio_pci`]), each on a
+//! The Bridge: the XIO-to-PCI host bridge. It is the Octane's onboard I/O
+//! chip at widget 0xf, the BaseIO's on the Origin 200, Origin 2000 and
+//! Onyx2, and sits on the PCI option boards ([`super::xio_pci`]), each on a
 //! port of its own.
 //!
 //! One side is an ordinary XIO widget whose 16 MB small window holds the
 //! common widget registers, the translation table, PCI configuration space,
 //! eight device windows onto PCI and the 4 MB boot-flash aperture. The other
 //! side is a PCI bus with eight slots, an eight-pin interrupt controller that
-//! sends its interrupts to HEART, and a translator for transfers a function
+//! sends its interrupts to the host chip (HEART on the Octane, a node's Hub
+//! on the SN0 machines), and a translator for transfers a function
 //! initiates.
 //!
 //! Window layout (offsets in the small window):
@@ -50,9 +52,9 @@
 //! * Only function 0 of a slot exists.
 //!
 //! Interrupts leave the chip outside its state lock. A pin's level is
-//! decided under the state lock and the packet to HEART goes out after it
-//! is dropped, with a separate ordering lock held across both so two
-//! threads' edges on one pin reach HEART in the order they were decided.
+//! decided under the state lock and the packet to the host chip goes out
+//! after it is dropped, with a separate ordering lock held across both so two
+//! threads' edges on one pin arrive in the order they were decided.
 //! DMA goes to the memory every bus master shares (`Arc<dyn BusDevice>`).
 //!
 //! # The XBridge
@@ -92,6 +94,29 @@ use crate::xtalk::Upstream;
 const WIDGET_BRIDGE: u8 = 0xf;
 /// A widget's 16 MB small window.
 const WIDGET_SMALL_SIZE: u32 = 0x0100_0000;
+
+/// How a Bridge wires its PCI bus's interrupts: the outputs are the
+/// Bridge's eight interrupt pins, on every board that carries one.
+/// Pins A and C of a device reach the pin numbered as the device, B and D
+/// that number with bit two flipped. That rule is inferred from the system's
+/// software and is not established by a board document. `BoardIrq(i)` is the
+/// Bridge's pin `i`, which the GPIO inputs share with PCI; the IOC3's
+/// SuperIO interrupt is `BoardIrq(4)`. The wire numbering is iris's own.
+pub static PIN_WIRING: IntxRouting = IntxRouting {
+    devices: 8,
+    irqs: 8,
+    intx: &[
+        (0, [Some(0), Some(4), Some(0), Some(4)]),
+        (1, [Some(1), Some(5), Some(1), Some(5)]),
+        (2, [Some(2), Some(6), Some(2), Some(6)]),
+        (3, [Some(3), Some(7), Some(3), Some(7)]),
+        (4, [Some(4), Some(0), Some(4), Some(0)]),
+        (5, [Some(5), Some(1), Some(5), Some(1)]),
+        (6, [Some(6), Some(2), Some(6), Some(2)]),
+        (7, [Some(7), Some(3), Some(7), Some(3)]),
+    ],
+    board_irqs: &[0, 1, 2, 3, 4, 5, 6, 7],
+};
 
 /// Byte offsets of the registers (the slot's base; the data is at +4).
 pub mod reg {
