@@ -168,9 +168,12 @@ Writes go to `scsi1.raw.overlay`. Monitor commands:
 - `cow commit [id]` - merge overlay into base image (permanent)
 - `cow reset [id]` - discard all overlay writes
 
-CHD images get the same protection automatically: writes go
-to a `.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or
-the GUI's "Commit changes to disk") folds the diff back into the base.
+A compressed CHD gets the same protection automatically: writes go to a
+`.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or the
+GUI's "Commit changes to disk") folds the diff back into the base. An
+uncompressed CHD is written in place unless `overlay = true`, which puts its
+writes in a diff too; that diff is kept apart until `cow commit`, and the
+folds above leave it alone.
 
 
 ## Snapshots and rollback
@@ -182,8 +185,8 @@ See [TODO.md](clanker/TODO.md) for remaining device and restore work.
 
 Capture RAM, supported device state, and the COW overlay into
 `saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
-SCSI controller, and the Seeq Ethernet chip all round-trip. Current schema
-version is 3: postcard-encoded binary device state plus content-addressable
+SCSI controller, and the Seeq Ethernet chip all round-trip. The current schema
+version is 7: postcard-encoded binary device state plus content-addressable
 chunked RAM under `saves/.cas/`. A second snapshot taken from the same parent
 adds **zero bytes** to disk for any RAM region that didn't change — same
 storage model as Docker layers. A snapshot records which CPU it was taken on

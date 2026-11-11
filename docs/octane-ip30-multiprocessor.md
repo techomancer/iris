@@ -89,4 +89,5 @@ See [debug.md](../debug.md#several-cpus) for the monitor commands: `cpus`,
 - The GDB stub sees processor 0 only.
 - A breakpoint stops the processor that hit it. The other keeps running until
   `stop`.
-- Snapshots are not available on the Octane at all.
+- Snapshots are refused on a two-processor Octane: the stop does not bring
+  both processors to one recorded instruction boundary.

@@ -4,8 +4,8 @@ The Octane is SGI's 1997 workstation: one or two R10000s on HEART (the memory
 controller and interrupt hub), a Crossbow switch joining the widgets, the
 onboard Bridge (XIO to PCI) carrying two QLogic ISP1040 SCSI controllers, the
 IOC3 I/O chip (serial ports, keyboard and mouse, the clock, Ethernet) and RAD
-audio, and a graphics board on one of the XIO ports. IRIS emulates a
-single-processor Octane with a 195 MHz R10000. The Bridge's PCI bus, its
+audio, and a graphics board on one of the XIO ports. IRIS emulates an
+Octane with one or two 195 MHz R10000s ([two processors](octane-ip30-multiprocessor.md)). The Bridge's PCI bus, its
 wiring and reset are described in [pci.md](pci.md).
 
 With the stock IP30 PROM (the 879,312-byte image, SHA-256 `ee4722ca6f9b821f…`)
@@ -81,8 +81,8 @@ file of any other size is refused with an error and left untouched. Without it t
 ## Memory
 
 `banks` lists the megabytes in each of HEART's four banks (each a matched
-pair of DIMMs). Valid sizes are 64, 128, 256 and 512; fill the banks from the
-first with no gap, 2 GB at most. The shared default `[128, 128]` is 256 MB.
+pair of DIMMs). Valid sizes are 64, 128, 256, 512, 1024 and 2048; fill the
+banks from the first with no gap, 8 GB at most. The shared default `[128, 128]` is 256 MB.
 The PROM sizes the banks itself; IRIX has been booted with 128 MB.
 
 ## NVRAM
@@ -185,8 +185,8 @@ The monitor (`monitor_port`) has, besides the usual CPU and device commands:
   `heart unsupported`: HEART registers a guest touched that are not modelled.
 - `scsi notes`: what the ISP1040 driver did that the model noted.
 
-`IRIS_IP30_TRACE=1` prints failed accesses, unsupported HEART registers and
-HEART's bank mapping as they happen.
+`IRIS_IP30_TRACE=1` prints failed accesses and unsupported HEART registers as
+they happen.
 
 ## Threads
 
@@ -203,7 +203,8 @@ through its event channel. `HACKING.md` lists the thread names.
 
 ## What is approximated or not modelled
 
-- One processor only.
+- Two processors at most, with the limits in
+  [octane-ip30-multiprocessor.md](octane-ip30-multiprocessor.md).
 - HEART: the answer to the PROM's bank-size probe is an approximation; ECC
   error injection is not modelled (a mode write that asks for it is
   recorded); the 16 KiB at physical 0 are the first 16 KiB of SDRAM,
@@ -211,6 +212,22 @@ through its event channel. `HACKING.md` lists the thread names.
   0x2000_0000..+16 KiB is a bus error, as the stock IDE memory diagnostics
   expect; cached accesses are the next item). Whether bus masters reach
   that range is not known; the DMA view does.
+- HEART's timer: the compare register is stored but not compared, so ISR
+  bit 50 is never raised. IRIX takes its clock from the processor's own
+  Count and Compare.
+- HEART's error interrupts, ISR bits 51 to 63 (widget errors, the Crossbow,
+  processor bus errors and HEART's own), are never raised, and the bus and
+  memory error address registers read zero. Which event sets which bit of
+  HEART's cause register (0x10040), and what the error registers capture, is
+  not documented, so nothing here raises them. A DMA write that
+  reaches no memory is the case that would: the Bridge posts it and records
+  nothing, and HEART does not record it either; `ip30 bridge` counts it.
+- PCI Interrupt Disable (command register bit 10, from PCI 2.3) is not
+  modelled. The onboard functions (the ISP1040Bs, the IOC3, RAD1) predate it.
+  The NVMe card is a later function that has it: iris stores the bit and
+  keeps driving the pin, so a guest that masks INTx this way still sees the
+  interrupt. The Bridge itself has no such bit; its interrupt enable
+  register masks its pins.
 - A cached access to 0x2000_0000..+16 KiB reaches the bytes. On an Octane2
   (HEART rev F) cached and uncached reads there both take a data bus
   error; here only uncached accesses do, because the processor's cache

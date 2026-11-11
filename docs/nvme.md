@@ -109,7 +109,9 @@ file.
 ## Storage
 
 The namespace is a disk of the shared SCSI target layer, so images, CHD,
-copy-on-write overlays, the background sync and the `cow` commands are those
-of [STORAGE.md](../STORAGE.md). A snapshot saves the controller's state and
+copy-on-write overlays and the `cow` commands are those of
+[STORAGE.md](../STORAGE.md). It has no volatile write cache (Identify says
+so): every write is on the host's disk before it completes, as on a SCSI disk
+with `write_cache = false`, and `--no-write-cache` does not change it. A snapshot saves the controller's state and
 the overlay with the other disks, and records the disk's size under slot 240
 in its manifest.

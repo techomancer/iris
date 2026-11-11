@@ -291,7 +291,8 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 | `scsi.<ID>.kind` | `disk` | disk, cdrom, daynaport; serialized key is kind. |
 | `scsi.<ID>.mac` | `00:80:19:44:50:<SCSI ID> when unset` | DaynaPort-only station MAC. |
 | `scsi.<ID>.subnet` | `192.168.10.0/24 when unset` | DaynaPort NAT network; separate from ec0. |
-| `scsi.<ID>.overlay` | `false` | Raw-image COW sidecar; CHD uses its own diff sidecar. |
+| `scsi.<ID>.overlay` | `false` | COW sidecar: a raw image's overlay, or a CHD's `.diff.chd` kept until `cow commit` (a compressed CHD gets a diff without it). |
+| `scsi.<ID>.write_cache` | `true` | Hard disks: report a write cache, so a write completes once the host has it and a sync follows within about 5 s; `false` stores every write on the host's disk first. See STORAGE.md. |
 | `scsi.<ID>.scratch` | `false` | Host-managed raw scratch volume; cannot be CD-ROM/overlay. |
 | `scsi.<ID>.size_mb` | `64 when unset` | Size of a newly created scratch image; existing files are unchanged. |
 | `scsi.<ID>.controller` | `0` | 0 or 1; controller 1 is accepted on indigo2_ip22 and o2_ip32 (on the O2 it is the external bus). A key of 16 + ID names controller 1 directly and does not need it. |
@@ -308,14 +309,14 @@ An explicit non-disk kind takes precedence over the legacy cdrom flag.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `network.mode` | `nat` | nat, pcap, stream or off (no Ethernet; O2, Octane and Fuel only). Stream needs `network.stream`. PCAP needs build support and host capture permissions. PCAP works on every Ethernet; stream on every onboard one, not on a DaynaPort. |
+| `network.mode` | `nat` | nat, pcap, stream or off (no Ethernet; every machine but the Indy and Indigo2). Stream needs `network.stream`. PCAP needs build support and host capture permissions. PCAP works on every Ethernet; stream on every onboard one, not on a DaynaPort. |
 | `network.stream` | `unset` | `tcp:IP:PORT` or `unix:PATH`: the server of the private segment for `mode = "stream"` (QEMU `-netdev stream` framing). See NETWORKING.md. |
 | `network.pcap_interface` | `auto-pick when unset` | Interface name or numeric list index; PCAP only. |
 | `network.nfs_pcap_ip` | `unset` | Virtual LAN IP for the built-in NFS responder in PCAP mode. |
 | `network.mac` | `08:00:69:12:34:56 when unset` | ec0 MAC; injected only into blank PROM battery-backed MAC slots. |
 | `network.tftp_dir` | `unset` | Read-only TFTP root at the NAT gateway for PROM network boot. |
 | `network.rsh_dir` | `unset` | Root for the built-in rsh server at the NAT gateway (TCP 514): `rsh <gateway> cat\|dd\|ls\|echo\|pwd`, read-only, nothing runs on the host. |
-| `network.rx_hold` | `true` | Indy: frames for the guest wait in iris, off the virtual wire, while the next one would fill the last descriptor of its receive ring before the driver has reaped the filled ones, and for at most 100 ms. A frame that reaches a stopped receive channel is lost either way, as on the wire. `false` never waits. |
+| `network.rx_hold` | `true` | Indy and Indigo2: frames for the guest wait in iris, off the virtual wire, while the next one would fill the last descriptor of its receive ring before the driver has reaped the filled ones, and for at most 100 ms. A frame that reaches a stopped receive channel is lost either way, as on the wire. `false` never waits. |
 
 ### [nfs]
 
@@ -574,11 +575,12 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--audio-host <HOST>` | Host audio system for HAL2: `default`, `alsa` or `pulseaudio` (overrides `[audio] host`) |
 | `--nfs-dir` | Enable NFS share: path to the directory to export (enables NFS) |
 | `--nat-subnet` | NAT subnet in CIDR notation (e.g. 192.168.5.0/24). Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24. |
-| `--net-mode` | Networking backend: "nat" (default, software gateway) or "pcap" (bridge onto a real host interface; requires --features pcap). |
+| `--net-mode` | Networking backend: "nat" (default, software gateway), "pcap" (bridge onto a real host interface; requires --features pcap), "stream" (a private segment; needs `network.stream`) or "off". |
 | `--pcap-interface` | Host interface to bridge onto in PCAP mode (e.g. eth0, en0). Implies --net-mode pcap. List candidates with --list-net-interfaces. |
 | `--validate` | Check the configuration (parse, settings, files, directories, ports) without starting the machine; exit 0 or 1. See [HELP.md](HELP.md#checking-a-configuration). |
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
+| `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `[scsi.N]`): slower, but a host crash loses no completed write. |
 | `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`.  |
 | `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel). |
 | `--raster` | VPro and IMPACT: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |

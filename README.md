@@ -160,7 +160,7 @@ configuration inventory for both `iris` and `iris-gui`.
 | [HACKING.md](HACKING.md) | How the emulator is built: bus and device traits, threads and locks, the GFIFO, jitv2. |
 | [iris-gui-README.md](iris-gui-README.md) | GUI build, machine management, input, disks, networking, benchmarks, and distribution. |
 | [FEATURES.md](FEATURES.md) | All build features, profiles, configuration keys, CLI switches, GUI settings, diagnostic environment controls, CPU specifications, and JIT behavior. |
-| [NETWORKING.md](NETWORKING.md) | PCAP bridging and DaynaPort setup; [DaynaPort protocol](docs/dev/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
+| [NETWORKING.md](NETWORKING.md) | PCAP bridging, the stream segment and DaynaPort setup; [DaynaPort protocol](docs/dev/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
 | [STORAGE.md](STORAGE.md) | CHD, overlays, snapshots, CI automation, and scratch-volume file transfer. |
 | [TESTING.md](TESTING.md) | Rust and guest tests, benchmark commands, CPU matrices, and performance methodology. |
 | [CHANGELOG.md](CHANGELOG.md) | Dated repository changes. |
