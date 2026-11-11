@@ -59,6 +59,38 @@ fn unfitted_memory_bus_errors_reads_and_writes() {
     assert_eq!(phys.read32(0x3ff_fffc).data, 5);
 }
 
+/// A block through the node's home view lands where the word accesses see it,
+/// splits at the end of a run and fails there when the next stretch is not
+/// fitted.
+#[test]
+fn a_block_through_home_matches_word_accesses_and_stops_at_the_end_of_a_run() {
+    // A 256 MiB bank is four 64 MiB runs at 128 MiB intervals.
+    let mem = NodeMemory::new([256, 0, 0, 0]).unwrap();
+    let home = mem.home();
+    let run_end = 0x400_0000u64;
+    let words: Vec<u64> = (0..16u64).map(|i| 0xa5a5_0000_0000_0000 | i << 8 | i).collect();
+    assert_eq!(home.write_block(0x1000, &words), BUS_OK);
+    let mut back = vec![0u64; 16];
+    assert_eq!(home.read_block(0x1000, &mut back), BUS_OK);
+    assert_eq!(back, words);
+    for (i, w) in words.iter().enumerate() {
+        assert_eq!(home.read64(0x1000 + 8 * i as u64).data, *w);
+        assert_eq!(home.read32(0x1000 + 8 * i as u64).data, (*w >> 32) as u32);
+    }
+    // The last two words of the run, then four that are in the hole.
+    let tail = [1u64, 2, 3, 4, 5, 6];
+    assert_eq!(home.write_block(run_end - 16, &tail), BUS_ERR);
+    assert_eq!(home.read64(run_end - 16).data, 1);
+    assert_eq!(home.read64(run_end - 8).data, 2);
+    let mut back = [0u64; 6];
+    assert_eq!(home.read_block(run_end - 16, &mut back), BUS_ERR);
+    assert_eq!(back[..2], [1, 2]);
+    // The next run starts a stride on and is a separate stretch of the bank.
+    let next = 0x800_0000u64;
+    assert_eq!(home.write_block(next, &[7, 8]), BUS_OK);
+    assert_eq!(home.read64(next + 8).data, 8);
+}
+
 #[test]
 fn the_reset_view_holds_the_flash_where_bank_zero_does_not_reach() {
     let mem = NodeMemory::new([64, 0, 0, 0]).unwrap();

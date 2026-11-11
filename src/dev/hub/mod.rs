@@ -817,7 +817,33 @@ macro_rules! inbound_access {
         }
     };
 }
+impl Inbound {
+    /// A block of doublewords in node memory, under one upgrade and one node
+    /// decode. DMA masters move memory this way; a block that leaves the
+    /// 40-bit space or the node it starts in is refused, and so is any block
+    /// in the I/O view, which carries only single-word packets.
+    fn block<R>(&self, a: u64, words: usize, f: impl FnOnce(&dyn BusDevice, u64) -> R) -> Option<R> {
+        let hub = self.0.upgrade()?;
+        let bytes = (words as u64).checked_mul(8)?;
+        let offset = a & (NODE_SPAN - 1);
+        if a & XIO_IO_VIEW != 0 {
+            crate::dlog!(LogModule::Hub, "Hub: unsupported inbound XIO block at {a:#x} of {words} doublewords");
+            return None;
+        }
+        if a >= XIO_MEMORY_SIZE || bytes > XIO_MEMORY_SIZE - a || bytes > NODE_SPAN - offset {
+            return None;
+        }
+        let number = ((a >> NODE_SHIFT) & NODE_MASK) as u8;
+        hub.with_node(number, |node| node.spaces[Space::Memory as usize].get().map(|mem| f(&**mem, offset))).flatten()
+    }
+}
 impl BusDevice for Inbound {
+    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
+        self.block(a, buf.len(), |mem, at| mem.read_block(at, buf)).unwrap_or(BUS_ERR)
+    }
+    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
+        self.block(a, buf.len(), |mem, at| mem.write_block(at, buf)).unwrap_or(BUS_ERR)
+    }
     inbound_access!(read8, write8, u8, BusRead8);
     inbound_access!(read16, write16, u16, BusRead16);
     inbound_access!(read32, write32, u32, BusRead32);

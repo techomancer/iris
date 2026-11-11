@@ -269,8 +269,38 @@ impl Home {
     /// if a fitted run holds it. No allocation: this is on every access.
     #[inline]
     fn bank(&self, a: u64) -> Option<(usize, u64)> {
+        self.run(a).map(|r| (r.index, r.src + a - r.at))
+    }
+
+    #[inline]
+    fn run(&self, a: u64) -> Option<&Run> {
         let runs = self.runs.get((a / BANK_STRIDE) as usize)?;
-        runs.iter().flatten().find(|r| (r.at..r.at + r.len).contains(&a)).map(|r| (r.index, r.src + a - r.at))
+        runs.iter().flatten().find(|r| (r.at..r.at + r.len).contains(&a))
+    }
+
+    /// Walk `words` doublewords from `a`: a stretch inside one fitted run goes
+    /// to its bank in a single call, so a DMA transfer costs one run lookup
+    /// per run it touches and not one per byte. Anything else goes to the
+    /// decode table a word at a time, as every access outside the runs does.
+    /// `f` gets the bank or table, the offset in it and the word range.
+    fn blocks(&self, a: u64, words: usize, mut f: impl FnMut(&dyn BusDevice, u64, std::ops::Range<usize>) -> u32) -> u32 {
+        let mut done = 0usize;
+        while done < words {
+            let at = a.wrapping_add(8 * done as u64);
+            let (dev, offset, n): (&dyn BusDevice, u64, usize) = match self.run(at) {
+                Some(r) => {
+                    let n = (((r.at + r.len - at) / 8) as usize).min(words - done);
+                    (&self.phys.banks()[r.index], r.src + at - r.at, n)
+                }
+                None => (&*self.phys, at, 1),
+            };
+            let status = f(dev, offset, done..done + n);
+            if status != BUS_OK {
+                return status;
+            }
+            done += n;
+        }
+        BUS_OK
     }
 }
 
@@ -302,6 +332,12 @@ impl BusDevice for Home {
             Some((i, at)) => self.phys.banks()[i].cas64(at, old, new),
             None => self.phys.cas64(a, old, new),
         }
+    }
+    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
+        self.blocks(a, buf.len(), |dev, at, range| dev.read_block(at, &mut buf[range]))
+    }
+    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
+        self.blocks(a, buf.len(), |dev, at, range| dev.write_block(at, &buf[range]))
     }
     home_access!(read8, write8, u8, BusRead8);
     home_access!(read16, write16, u16, BusRead16);
