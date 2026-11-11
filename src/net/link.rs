@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use crate::config::{NetMode, NetworkConfig};
 
-use super::stream::StreamBackend;
-use super::{GatewayConfig, NatControl, NatEngine, NetBackend, Wake};
+use super::stream::{StreamBackend, RECONNECT};
+use super::{GatewayConfig, NatControl, NatEngine, NetBackend, NetReport, Wake};
 
 /// The adapter's ends of a link.
 pub struct Rings {
@@ -64,7 +64,7 @@ pub struct Link {
     nat: Arc<NatControl>,
     /// The built backend, for its status report; only a backend with
     /// something to say is kept.
-    reporter: Option<Arc<dyn NetBackend + Send + Sync>>,
+    reporter: Option<Arc<dyn NetReport>>,
     /// Cleared to stop the backend.
     running: Arc<AtomicBool>,
     config: GatewayConfig,
@@ -134,7 +134,7 @@ impl Link {
     /// The built backend's status report, once it is built (`spawn` builds it):
     /// `None` for a backend that has none, as the NAT's tables are read from
     /// `nat` instead. The handle outlives the link, which `into_rings` consumes.
-    pub fn reporter(&self) -> Option<Arc<dyn NetBackend + Send + Sync>> {
+    pub fn reporter(&self) -> Option<Arc<dyn NetReport>> {
         self.reporter.clone()
     }
 
@@ -155,8 +155,8 @@ impl Link {
         let (running, ctl) = (self.running.clone(), self.nat.clone());
         if config.mode == NetMode::Stream {
             let endpoint = config.stream_endpoint().expect("validated stream peer");
-            let b = Arc::new(StreamBackend::new(endpoint, tx_cons, rx_prod, tx_wake, rx_wake, running, self.frames.clone()));
-            self.reporter = Some(b.clone());
+            let b = StreamBackend::new(endpoint, tx_cons, rx_prod, tx_wake, rx_wake, running, self.frames.clone(), RECONNECT);
+            self.reporter = Some(b.stats());
             return Some(Box::new(b));
         }
         #[cfg(feature = "pcap")]

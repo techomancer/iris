@@ -17,9 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
-
-use super::{NetBackend, Wake};
+use super::{NetBackend, NetReport, Wake};
 use crate::devlog::LogModule;
 
 /// The largest frame the peer may send: an Ethernet frame without FCS, plus
@@ -275,13 +273,10 @@ impl super::GatewayConfig {
 /// sends while there is no peer are dropped, as on an unplugged cable. It
 /// returns when `running` clears or the NIC drops its end of the rings, and
 /// may be run again.
-///
-/// It is shared (`Arc<StreamBackend>` is a [`NetBackend`] too): one handle
-/// runs on the link's thread while another reports its counters. The rings
-/// belong to the running handle alone.
 pub struct StreamBackend {
-    endpoint: StreamEndpoint,
-    io: Mutex<Io>,
+    tx_cons: rtrb::Consumer<Vec<u8>>,
+    // Held by the receive thread during a session, which hands it back.
+    rx_prod: Option<rtrb::Producer<Vec<u8>>>,
     tx_wake: Arc<Wake>,
     rx_wake: Arc<Wake>,
     running: Arc<AtomicBool>,
@@ -291,18 +286,12 @@ pub struct StreamBackend {
     frames: Arc<AtomicU64>,
 }
 
-/// The rings the running backend owns.
-struct Io {
-    tx_cons: rtrb::Consumer<Vec<u8>>,
-    // Held by the receive thread during a session, which hands it back.
-    rx_prod: Option<rtrb::Producer<Vec<u8>>>,
-}
-
-const RECONNECT: Duration = Duration::from_secs(1);
+/// How long the adapter's backend waits between attempts to reach the peer.
+pub(super) const RECONNECT: Duration = Duration::from_secs(1);
 
 /// What the segment has carried, for the adapter's status command.
-#[derive(Default)]
 pub struct StreamStats {
+    endpoint: StreamEndpoint,
     connected: AtomicBool,
     to_peer: AtomicU64,
     from_peer: AtomicU64,
@@ -311,7 +300,33 @@ pub struct StreamStats {
     oversize: AtomicU64,
 }
 
+impl StreamStats {
+    fn new(endpoint: StreamEndpoint) -> Self {
+        Self {
+            endpoint,
+            connected: AtomicBool::new(false),
+            to_peer: AtomicU64::new(0),
+            from_peer: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            runts: AtomicU64::new(0),
+            oversize: AtomicU64::new(0),
+        }
+    }
+}
+
+impl NetReport for StreamStats {
+    fn report(&self, w: &mut dyn Write) -> io::Result<()> {
+        writeln!(w, "Stream segment {}: {}", self.endpoint,
+                 if self.connected.load(Ordering::Relaxed) { "connected" } else { "waiting for the peer" })?;
+        writeln!(w, "  {} frames to the peer, {} from it, {} dropped while it was away, {} runts and {} oversize frames from it dropped",
+                 self.to_peer.load(Ordering::Relaxed), self.from_peer.load(Ordering::Relaxed),
+                 self.dropped.load(Ordering::Relaxed), self.runts.load(Ordering::Relaxed), self.oversize.load(Ordering::Relaxed))
+    }
+}
+
 impl StreamBackend {
+    /// `retry` is how long to wait between attempts to reach the peer.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint: StreamEndpoint,
         tx_cons: rtrb::Consumer<Vec<u8>>,
@@ -320,45 +335,50 @@ impl StreamBackend {
         rx_wake: Arc<Wake>,
         running: Arc<AtomicBool>,
         frames: Arc<AtomicU64>,
+        retry: Duration,
     ) -> Self {
-        let stats = Arc::new(StreamStats::default());
-        let io = Mutex::new(Io { tx_cons, rx_prod: Some(rx_prod) });
-        Self { endpoint, io, tx_wake, rx_wake, running, retry: RECONNECT, stats, frames }
+        let stats = Arc::new(StreamStats::new(endpoint));
+        Self { tx_cons, rx_prod: Some(rx_prod), tx_wake, rx_wake, running, retry, stats, frames }
     }
 
-    fn live(&self, io: &Io) -> bool {
-        self.running.load(Ordering::SeqCst) && !io.tx_cons.is_abandoned()
+    /// The counters and status report, which outlive the backend's thread.
+    pub fn stats(&self) -> Arc<StreamStats> {
+        self.stats.clone()
+    }
+
+    fn live(&self) -> bool {
+        self.running.load(Ordering::SeqCst) && !self.tx_cons.is_abandoned()
     }
 
     /// Discard the frames the guest has queued, counting them.
-    fn drain(&self, io: &mut Io) {
-        while io.tx_cons.pop().is_ok() {
+    fn drain(&mut self) {
+        while self.tx_cons.pop().is_ok() {
             self.frames.fetch_add(1, Ordering::Relaxed);
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Sleep until `until`, or until the backend stops.
-    fn pause(&self, io: &Io, until: Instant) {
-        while self.live(io) && Instant::now() < until {
+    fn pause(&self, until: Instant) {
+        while self.live() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20).min(self.retry));
         }
     }
 
     /// Connect, retrying until it works. `None` if the backend stopped first.
-    fn connect(&self, io: &mut Io) -> Option<Session> {
+    fn connect(&mut self) -> Option<Session> {
         let mut said = false;
-        while self.live(io) {
-            match self.endpoint.connect() {
+        while self.live() {
+            match self.stats.endpoint.connect() {
                 Ok(c) => return Some(c),
                 Err(e) => {
                     // Once per outage; the connection is logged when it comes.
                     if !std::mem::replace(&mut said, true) {
-                        eprintln!("iris: network stream {}: {e}; retrying", self.endpoint);
+                        eprintln!("iris: network stream {}: {e}; retrying", self.stats.endpoint);
                     }
                     // Frames the guest sends meanwhile have nowhere to go.
-                    self.drain(io);
-                    self.pause(io, Instant::now() + self.retry);
+                    self.drain();
+                    self.pause(Instant::now() + self.retry);
                 }
             }
         }
@@ -435,18 +455,15 @@ impl StreamBackend {
     }
 }
 
-impl StreamBackend {
-    /// `NetBackend::run` for a shared backend.
-    fn run_shared(&self) {
-        let mut guard = self.io.lock();
-        let io = &mut *guard;
-        while let Some((rd, mut wr, close)) = self.connect(io) {
-            eprintln!("iris: network stream connected to {}", self.endpoint);
+impl NetBackend for StreamBackend {
+    fn run(&mut self) {
+        while let Some((rd, mut wr, close)) = self.connect() {
+            eprintln!("iris: network stream connected to {}", self.stats.endpoint);
             let started = Instant::now();
             // Frames queued during an outage are stale; the new peer never
             // saw the conversation they belonged to.
-            self.drain(io);
-            let prod = io.rx_prod.take().expect("receive producer");
+            self.drain();
+            let prod = self.rx_prod.take().expect("receive producer");
             let ended = Arc::new(AtomicBool::new(false));
             let ended_wake = Wake::new();
             let (rw, stats) = (self.rx_wake.clone(), self.stats.clone());
@@ -459,16 +476,16 @@ impl StreamBackend {
             loop {
                 self.tx_wake.wait(Duration::from_millis(10));
                 let mut failed = false;
-                while let Ok(frame) = io.tx_cons.pop() {
+                while let Ok(frame) = self.tx_cons.pop() {
                     self.frames.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = write_frame_while(&mut wr, &frame, &|| self.live(io)) {
+                    if let Err(e) = write_frame_while(&mut wr, &frame, &|| self.live()) {
                         eprintln!("iris: network stream write: {e}");
                         failed = true;
                         break;
                     }
                     self.stats.to_peer.fetch_add(1, Ordering::Relaxed);
                 }
-                if failed || rx.is_finished() || !self.live(io) {
+                if failed || rx.is_finished() || !self.live() {
                     break;
                 }
             }
@@ -476,36 +493,11 @@ impl StreamBackend {
             ended_wake.notify();
             close();
             self.stats.connected.store(false, Ordering::Relaxed);
-            io.rx_prod = Some(rx.join().expect("net-stream rx thread"));
+            self.rx_prod = Some(rx.join().expect("net-stream rx thread"));
             // A peer that accepts and hangs up must not be redialled in a
             // tight loop: wait out the rest of the retry interval.
-            self.pause(io, started + self.retry);
+            self.pause(started + self.retry);
         }
-    }
-}
-
-impl NetBackend for StreamBackend {
-    fn run(&mut self) {
-        self.run_shared();
-    }
-
-    fn report(&self, w: &mut dyn Write) -> io::Result<()> {
-        let s = &self.stats;
-        writeln!(w, "Stream segment {}: {}", self.endpoint,
-                 if s.connected.load(Ordering::Relaxed) { "connected" } else { "waiting for the peer" })?;
-        writeln!(w, "  {} frames to the peer, {} from it, {} dropped while it was away, {} runts and {} oversize frames from it dropped",
-                 s.to_peer.load(Ordering::Relaxed), s.from_peer.load(Ordering::Relaxed),
-                 s.dropped.load(Ordering::Relaxed), s.runts.load(Ordering::Relaxed), s.oversize.load(Ordering::Relaxed))
-    }
-}
-
-impl NetBackend for Arc<StreamBackend> {
-    fn run(&mut self) {
-        self.run_shared();
-    }
-
-    fn report(&self, w: &mut dyn Write) -> io::Result<()> {
-        (**self).report(w)
     }
 }
 
@@ -544,8 +536,11 @@ mod tests {
         rx_wake: Arc<Wake>,
         running: Arc<AtomicBool>,
         frames: Arc<AtomicU64>,
-        status: Arc<StreamBackend>,
-        thread: Option<std::thread::JoinHandle<()>>,
+        stats: Arc<StreamStats>,
+        /// The backend while it is not running; a run takes it away on its
+        /// thread and the thread hands it back.
+        idle: Option<StreamBackend>,
+        thread: Option<std::thread::JoinHandle<StreamBackend>>,
     }
 
     fn rig(endpoint: StreamEndpoint, retry: Duration) -> Rig {
@@ -554,9 +549,8 @@ mod tests {
         let (tx_wake, rx_wake) = (Wake::new(), Wake::new());
         let running = Arc::new(AtomicBool::new(true));
         let frames = Arc::new(AtomicU64::new(0));
-        let mut b = StreamBackend::new(endpoint, tx_cons, rx_prod, tx_wake.clone(), rx_wake.clone(), running.clone(), frames.clone());
-        b.retry = retry;
-        let mut r = Rig { to_net, from_net, tx_wake, rx_wake, running, frames, status: Arc::new(b), thread: None };
+        let b = StreamBackend::new(endpoint, tx_cons, rx_prod, tx_wake.clone(), rx_wake.clone(), running.clone(), frames.clone(), retry);
+        let mut r = Rig { to_net, from_net, tx_wake, rx_wake, running, frames, stats: b.stats(), idle: Some(b), thread: None };
         r.start();
         r
     }
@@ -564,20 +558,23 @@ mod tests {
     impl Rig {
         fn start(&mut self) {
             self.running.store(true, Ordering::SeqCst);
-            let mut runner = self.status.clone();
-            self.thread = Some(std::thread::spawn(move || runner.run()));
+            let mut backend = self.idle.take().expect("the backend is not running");
+            self.thread = Some(std::thread::spawn(move || {
+                backend.run();
+                backend
+            }));
         }
 
         fn stop(&mut self) {
             self.running.store(false, Ordering::SeqCst);
-            self.thread.take().unwrap().join().unwrap();
+            self.idle = Some(self.thread.take().unwrap().join().unwrap());
         }
 
         /// One frame from the guest to `peer`, and one back.
         fn exchange(&mut self, peer: &mut impl ReadWrite, out: u8, back: u8) {
             // A frame queued before the session is up is stale and discarded.
             let deadline = Instant::now() + Duration::from_secs(10);
-            while !self.status.stats.connected.load(Ordering::Relaxed) {
+            while !self.stats.connected.load(Ordering::Relaxed) {
                 assert!(Instant::now() < deadline, "backend never reported the session");
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -612,12 +609,12 @@ mod tests {
         // The backend counts a frame once its write returns, which can be
         // after the peer has read it and answered; wait for the count.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while r.status.stats.to_peer.load(Ordering::Relaxed) < 1 {
+        while r.stats.to_peer.load(Ordering::Relaxed) < 1 {
             assert!(Instant::now() < deadline, "the frame sent to the peer is never counted");
             std::thread::sleep(Duration::from_millis(2));
         }
         let mut text = Vec::new();
-        r.status.report(&mut text).unwrap();
+        r.stats.report(&mut text).unwrap();
         let text = String::from_utf8(text).unwrap();
         assert_eq!(r.frames.load(Ordering::Relaxed), 1, "the guest's frame is counted for the GUI");
         assert!(text.contains(": connected") && text.contains("1 frames to the peer, 1 from it"), "{text}");
@@ -696,7 +693,7 @@ mod tests {
             }
         }
         assert_eq!(got, [14, 60]);
-        assert_eq!(r.status.stats.runts.load(Ordering::Relaxed), 3);
+        assert_eq!(r.stats.runts.load(Ordering::Relaxed), 3);
         r.stop();
     }
 
@@ -719,8 +716,8 @@ mod tests {
             r.rx_wake.wait(Duration::from_millis(10));
         };
         assert_eq!(got, vec![0x22; 60]);
-        assert!(r.status.stats.connected.load(Ordering::Relaxed), "the session ended");
-        assert_eq!(r.status.stats.oversize.load(Ordering::Relaxed), 1);
+        assert!(r.stats.connected.load(Ordering::Relaxed), "the session ended");
+        assert_eq!(r.stats.oversize.load(Ordering::Relaxed), 1);
         r.stop();
     }
 
@@ -794,7 +791,7 @@ mod tests {
         let mut r = rig(StreamEndpoint::Tcp(listener.local_addr().unwrap()), Duration::from_millis(500));
         let wait_for = |want: bool, r: &Rig| {
             let deadline = Instant::now() + Duration::from_secs(10);
-            while r.status.stats.connected.load(Ordering::Relaxed) != want {
+            while r.stats.connected.load(Ordering::Relaxed) != want {
                 assert!(Instant::now() < deadline, "session never became {want}");
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -854,7 +851,7 @@ mod tests {
         let ended = Arc::new(AtomicBool::new(false));
         let (rx_ended, rx_wake) = (ended.clone(), Wake::new());
         let rx = std::thread::spawn(move || {
-            StreamBackend::receive(rd, prod, rx_wake, rx_ended, Wake::new(), Arc::new(StreamStats::default()))
+            StreamBackend::receive(rd, prod, rx_wake, rx_ended, Wake::new(), Arc::new(StreamStats::new(StreamEndpoint::Tcp("127.0.0.1:1".parse().unwrap()))))
         });
         // A frame split by a pause longer than a read timeout.
         let mut buf = Vec::new();

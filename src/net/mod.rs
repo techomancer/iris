@@ -168,13 +168,13 @@ pub trait NetBackend: Send {
     /// Run the backend loop until the shared `running` flag goes false. Blocks
     /// the calling thread (the `seeq-net` thread).
     fn run(&mut self);
+}
 
-    /// Write the backend's own account of itself, for an adapter's status
-    /// command. The default says nothing: the NAT's tables are read from its
-    /// controls instead.
-    fn report(&self, _w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        Ok(())
-    }
+/// A backend's own account of itself, for an adapter's status command. It
+/// outlives the backend's thread. The NAT has none: its tables are read from
+/// its controls instead.
+pub trait NetReport: Send + Sync {
+    fn report(&self, w: &mut dyn std::io::Write) -> std::io::Result<()>;
 }
 
 /// Live status of the PCAP bridged-capture backend, surfaced to an embedder (the

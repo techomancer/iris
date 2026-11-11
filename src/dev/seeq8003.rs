@@ -225,7 +225,7 @@ struct Net {
     /// enet waits on this for frames from the backend; `kick_*` notifies it.
     rx_wake: Option<Arc<crate::net::Wake>>,
     /// The running backend's status report, for a backend that has one.
-    reporter: Option<Arc<dyn crate::net::NetBackend + Send + Sync>>,
+    reporter: Option<Arc<dyn crate::net::NetReport>>,
     frames: Option<Arc<AtomicU64>>,
     /// The backend's controls, which every link of the run shares. A SEEQ
     /// with no link has a set of its own, so the monitor's `net` commands work.
