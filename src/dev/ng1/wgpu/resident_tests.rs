@@ -882,10 +882,10 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
         let mut unsupported = context(
             DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
         );
-        unsupported.drawmode0.0 |= 1 << 12;
+        unsupported.drawmode0.0 |= 1 << 18;
         let unchanged = unsupported;
         assert_eq!(resident.enqueue(&mut unsupported), Err(ResidentError::Unsupported("draw mode 0")));
-        assert_context_eq(&unsupported, &unchanged, "rejected stipple mode");
+        assert_context_eq(&unsupported, &unchanged, "rejected shade mode");
         let status = resident.status().unwrap();
         assert_eq!(status.accepted, before_rejection.accepted);
         assert_eq!(status.observations, before_rejection.observations);
@@ -1194,6 +1194,180 @@ fn resident_gpu_blending_matches_complete_cpu_planes() {
             .expect("observe blended planes");
         compare_observed(observed.rgb().unwrap(), &expected_rgb, "blended RGB");
         compare_observed(observed.aux().unwrap(), &expected_aux, "blended aux");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_patterns_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x2ad7_61b4);
+        let seed_aux = seeded_plane(0xd528_9e4b);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate pattern resident planes");
+
+        let mut cases = Vec::new();
+
+        let mut z_transparent = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (-5, 240),
+            (29, 247),
+            0x00ff_ffff,
+            0x7942_b6d3,
+        );
+        z_transparent.drawmode0.0 |= (1 << 12) | (1 << 13);
+        z_transparent.zpattern = 0xa5c3_69f0;
+        z_transparent.zpat_bit = 27;
+        z_transparent.lspattern = 0xd79a_c000;
+        z_transparent.pat_bit = 26;
+        z_transparent.lsmode.set_lsrcount(2);
+        z_transparent.lsmode.set_lsrepeat(4);
+        z_transparent.lsmode.set_lslength(6);
+        cases.push(("offscreen transparent combined-pattern block", z_transparent));
+
+        let mut z_opaque = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (40, 250),
+            (71, 258),
+            u32::MAX,
+            0x9071_3ec5,
+        );
+        z_opaque.drawmode0.0 |= (1 << 12) | (1 << 16);
+        z_opaque.zpattern = 0xc639_5aa5;
+        z_opaque.zpat_bit = 23;
+        z_opaque.colorback = 0x304d_a287;
+        z_opaque.drawmode1.0 = (z_opaque.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+            | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        z_opaque.alpharef = 0x50;
+        cases.push(("opaque Z pattern alpha compare", z_opaque));
+
+        let mut line_transparent = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (90 * 16, 270 * 16),
+            (137 * 16, 284 * 16),
+            0x00ff_ffff,
+            0x6835_c291,
+        );
+        line_transparent.drawmode0.0 |= 1 << 13;
+        line_transparent.lspattern = 0xd6b5_a000;
+        line_transparent.pat_bit = 26;
+        line_transparent.lsmode.set_lsrcount(2);
+        line_transparent.lsmode.set_lsrepeat(3);
+        line_transparent.lsmode.set_lslength(5);
+        cases.push(("transparent repeated line pattern", line_transparent));
+
+        let mut line_opaque = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            (150 * 16 + 3, 292 * 16 + 11),
+            (192 * 16 + 9, 306 * 16 + 2),
+            0x00ff_0000,
+            0xa861_4fd2,
+        );
+        line_opaque.drawmode0.0 |= (1 << 13) | (1 << 14) | (1 << 17);
+        line_opaque.lspattern = 0x9b6d_4000;
+        line_opaque.pat_bit = 29;
+        line_opaque.lsmode.set_lsrcount(1);
+        line_opaque.lsmode.set_lsrepeat(4);
+        line_opaque.lsmode.set_lslength(7);
+        line_opaque.colorback = 0x5c27_b391;
+        cases.push(("opaque repeated line pattern", line_opaque));
+
+        let mut combined_reverse = context(
+            DRAWMODE1_PLANES_CID,
+            false,
+            false,
+            (236, 326),
+            (204, 318),
+            0x0000_0033,
+            0x7a00_0002,
+        );
+        combined_reverse.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 17);
+        combined_reverse.bresoctinc1.set_octant(
+            crate::dev::ng1::rex3::OCTANT_XDEC | crate::dev::ng1::rex3::OCTANT_YDEC,
+        );
+        combined_reverse.zpattern = 0xe7a5_39c6;
+        combined_reverse.zpat_bit = 25;
+        combined_reverse.lspattern = 0xb5ca_d000;
+        combined_reverse.pat_bit = 24;
+        combined_reverse.lsmode.set_lsrcount(5);
+        combined_reverse.lsmode.set_lsrepeat(6);
+        combined_reverse.lsmode.set_lslength(9);
+        combined_reverse.colorback = 0x9300_0001;
+        cases.push(("combined reverse block patterns", combined_reverse));
+
+        let mut flipped = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (252, 0x13ff - 340),
+            (283, 0x13ff - 331),
+            0x00ff_ffff,
+            0xc357_8d21,
+        );
+        flipped.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 16);
+        flipped.drawmode1.0 |= (1 << 6) | (1 << 16);
+        flipped.zpattern = 0x96e1_5ab4;
+        flipped.zpat_bit = 28;
+        flipped.lspattern = 0xe6b9_8000;
+        flipped.pat_bit = 27;
+        flipped.lsmode.set_lsrcount(3);
+        flipped.lsmode.set_lsrepeat(5);
+        flipped.lsmode.set_lslength(4);
+        flipped.colorback = 0x4138_a6d9;
+        cases.push(("dithered YFLIP combined patterns", flipped));
+
+        let mut flipped_line = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (310 * 16 + 5, (0x13ff - 360) * 16 + 7),
+            (327 * 16 + 11, (0x13ff - 399) * 16 + 3),
+            u32::MAX,
+            0x0172_4eb9,
+        );
+        flipped_line.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17);
+        flipped_line.drawmode1.0 |= 1 << 6;
+        flipped_line.zpattern = 0xdb69_a5c3;
+        flipped_line.zpat_bit = 30;
+        flipped_line.lspattern = 0xacd3_6000;
+        flipped_line.pat_bit = 28;
+        flipped_line.lsmode.set_lsrcount(4);
+        flipped_line.lsmode.set_lsrepeat(3);
+        flipped_line.lsmode.set_lslength(8);
+        flipped_line.colorback = 0x6d28_91c4;
+        flipped_line.aweight0 = u32::MAX;
+        flipped_line.aweight1 = u32::MAX;
+        cases.push(("YFLIP antialiased combined patterns", flipped_line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe patterned planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "patterned RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "patterned aux");
         gpu.check().unwrap();
     });
 }

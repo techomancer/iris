@@ -6,8 +6,10 @@ use crate::dev::ng1::rex3::{
     REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
 use crate::dev::ng1::rex3_flat_fill::FillPlane;
+use crate::dev::ng1::rex3_generic::ls_pattern_state_after;
 
-const SKIPPED_PIXEL: u32 = i32::MIN as u32;
+const SKIPPED_PIXEL: u32 = u32::MAX;
+const BACKGROUND_PIXEL: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LineKind {
@@ -53,6 +55,18 @@ struct LineGeometry {
     x_window: i32,
     y_window: i32,
     y_flip: bool,
+    z_pattern: u32,
+    line_pattern: u32,
+    z_pattern_enabled: bool,
+    line_pattern_enabled: bool,
+    z_opaque: bool,
+    line_opaque: bool,
+    z_pattern_bit: u8,
+    line_pattern_bit: u8,
+    line_pattern_count: u32,
+    line_pattern_repeat: u32,
+    line_pattern_length: u32,
+    advance_last_pattern: bool,
 }
 
 impl LineGeometry {
@@ -90,10 +104,47 @@ impl LineGeometry {
             absolute - REX3_COORD_BIAS
         }
     }
+
+    fn pattern(self, index: u32) -> (bool, bool) {
+        let mut background = false;
+        if self.z_pattern_enabled {
+            let bit = self.z_pattern_bit.wrapping_sub(index as u8) & 31;
+            if (self.z_pattern >> bit) & 1 == 0 {
+                if self.z_opaque {
+                    background = true;
+                } else {
+                    return (false, false);
+                }
+            }
+        }
+        if self.line_pattern_enabled {
+            let (_, bit) = ls_pattern_state_after(
+                self.line_pattern_count,
+                self.line_pattern_repeat,
+                self.line_pattern_length,
+                self.line_pattern_bit,
+                index as u64,
+            );
+            if (self.line_pattern >> bit) & 1 == 0 {
+                if self.line_opaque {
+                    background = true;
+                } else {
+                    return (false, false);
+                }
+            }
+        }
+        (true, background)
+    }
+
+    fn pattern_advances(self) -> u64 {
+        u64::from(self.pixel_count.saturating_sub(1))
+            + u64::from(self.advance_last_pattern)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct LinePixel {
+    index: u32,
     x: i32,
     y: i32,
     d: i32,
@@ -119,6 +170,7 @@ impl Iterator for LinePixels {
         }
         let last = self.index + 1 == self.geometry.pixel_count;
         let pixel = LinePixel {
+            index: self.index,
             x: self.x,
             y: self.y,
             d: self.d,
@@ -161,12 +213,16 @@ impl Iterator for LinePayload {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.pixels.next().map(|pixel| {
-            if pixel.skip {
+            let (pattern_draws, background) = self.pixels.geometry.pattern(pixel.index);
+            if pixel.skip || !pattern_draws {
                 SKIPPED_PIXEL
-            } else if self.pixels.geometry.y_major {
-                pixel.physical_x as u32
             } else {
-                pixel.physical_y as u32
+                let minor = if self.pixels.geometry.y_major {
+                    pixel.physical_x as u32
+                } else {
+                    pixel.physical_y as u32
+                } & !BACKGROUND_PIXEL;
+                minor | if background { BACKGROUND_PIXEL } else { 0 }
             }
         })
     }
@@ -205,6 +261,23 @@ impl PreparedLine {
         context.xstart = self.final_x << 11;
         context.ystart = self.final_y << 11;
         context.bresd = (self.final_d as u32) & 0x07ff_ffff;
+        let advances = self.geometry.pattern_advances();
+        if self.geometry.z_pattern_enabled {
+            context.zpat_bit = self.geometry.z_pattern_bit
+                .wrapping_sub(advances as u8)
+                & 31;
+        }
+        if self.geometry.line_pattern_enabled {
+            let (count, bit) = ls_pattern_state_after(
+                self.geometry.line_pattern_count,
+                self.geometry.line_pattern_repeat,
+                self.geometry.line_pattern_length,
+                self.geometry.line_pattern_bit,
+                advances,
+            );
+            context.lsmode.set_lsrcount(count);
+            context.pat_bit = bit;
+        }
         context.host_len = 1;
         context.host_cursor = 0;
     }
@@ -233,11 +306,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
     }
     if dm0.colorhost()
         || dm0.alphahost()
-        || dm0.enzpattern()
-        || dm0.enlspattern()
         || dm0.length32()
-        || dm0.zpopaque()
-        || dm0.lsopaque()
         || dm0.shade()
         || dm0.lronly()
         || dm0.ciclamp()
@@ -302,6 +371,18 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         x_window,
         y_window,
         y_flip: dm1.yflip(),
+        z_pattern: context.zpattern,
+        line_pattern: context.lspattern,
+        z_pattern_enabled: dm0.enzpattern(),
+        line_pattern_enabled: dm0.enlspattern(),
+        z_opaque: dm0.zpopaque(),
+        line_opaque: dm0.lsopaque(),
+        z_pattern_bit: context.zpat_bit,
+        line_pattern_bit: context.pat_bit,
+        line_pattern_count: context.lsmode.lsrcount(),
+        line_pattern_repeat: context.lsmode.lsrepeat(),
+        line_pattern_length: context.lsmode.lslength(),
+        advance_last_pattern: dm0.lsadvlast(),
     };
 
     let mut min_x = i32::MAX;
@@ -474,11 +555,11 @@ mod tests {
             return;
         };
         assert_eq!(prepared.payload().len(), line.payload_words as usize);
-        for (index, minor) in prepared.payload().enumerate() {
-            let minor = minor as i32;
-            if minor == i32::MIN {
+        for (index, word) in prepared.payload().enumerate() {
+            if word == SKIPPED_PIXEL {
                 continue;
             }
+            let minor = (word & !BACKGROUND_PIXEL) as i32;
             let delta = if line.major_decreasing {
                 -(index as i32)
             } else {
@@ -532,6 +613,13 @@ mod tests {
         assert_eq!(actual.xstart, expected.xstart, "{label}: xstart");
         assert_eq!(actual.ystart, expected.ystart, "{label}: ystart");
         assert_eq!(actual.bresd, expected.bresd, "{label}: bresd");
+        assert_eq!(actual.pat_bit, expected.pat_bit, "{label}: pat_bit");
+        assert_eq!(actual.zpat_bit, expected.zpat_bit, "{label}: zpat_bit");
+        assert_eq!(
+            actual.lsmode.lsrcount(),
+            expected.lsmode.lsrcount(),
+            "{label}: lsrcount",
+        );
         assert_eq!(actual.host_len, expected.host_len, "{label}: host_len");
         assert_eq!(
             actual.host_cursor, expected.host_cursor,
@@ -582,6 +670,22 @@ mod tests {
             fractional.bresrndinc2.set_rnd(0xa5);
             fline_setup(&mut fractional);
             check(fractional, "fractional line");
+
+            let mut patterned = context(
+                LineKind::Integer,
+                (42 * 16, 64 * 16),
+                (79 * 16, 73 * 16),
+            );
+            patterned.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 14);
+            patterned.zpattern = 0xd6a5_39c7;
+            patterned.lspattern = 0xb5ca_d000;
+            patterned.zpat_bit = 27;
+            patterned.pat_bit = 25;
+            patterned.lsmode.set_lsrcount(4);
+            patterned.lsmode.set_lsrepeat(5);
+            patterned.lsmode.set_lslength(7);
+            setup_integer(&mut patterned, 0x5a);
+            check(patterned, "transparent combined-pattern line");
 
             let mut antialiased = context(
                 LineKind::Antialiased,

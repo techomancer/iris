@@ -363,6 +363,69 @@ pub(crate) fn advance_lspat(ctx: &mut Rex3Context) {
     }
 }
 
+pub(crate) fn ls_pattern_state_after(
+    count: u32,
+    repeat_field: u32,
+    length_field: u32,
+    bit: u8,
+    advances: u64,
+) -> (u32, u8) {
+    let repeat = repeat_field.max(1) as u64;
+    if advances <= count as u64 {
+        return (count - advances as u32, bit);
+    }
+
+    let remaining = advances - count as u64 - 1;
+    let bit_advances = 1 + remaining / repeat;
+    let count = repeat - 1 - remaining % repeat;
+    let length = (length_field + 17) as u64;
+    let offset = (31 - bit as u64 + bit_advances) % length;
+    (count as u32, (31 - offset) as u8)
+}
+
+#[cfg(test)]
+mod pattern_state_tests {
+    use super::ls_pattern_state_after;
+
+    #[test]
+    fn line_pattern_closed_form_matches_scalar_advancement() {
+        for repeat_field in 0..=8 {
+            let repeat = repeat_field.max(1);
+            for length_field in [0, 7, 15] {
+                let length = length_field + 17;
+                for start_offset in 0..length {
+                    let start_bit = (31 - start_offset) as u8;
+                    for start_count in 0..=10 {
+                        for advances in [0, 1, 2, 3, 7, 16, 31, 32, 63, 127, 200] {
+                            let mut count = start_count;
+                            let mut bit = start_bit;
+                            for _ in 0..advances {
+                                if count == 0 {
+                                    count = repeat - 1;
+                                    let wrap = 32 - length;
+                                    bit = if bit as u32 == wrap { 31 } else { bit - 1 };
+                                } else {
+                                    count -= 1;
+                                }
+                            }
+                            assert_eq!(
+                                ls_pattern_state_after(
+                                    start_count,
+                                    repeat_field,
+                                    length_field,
+                                    start_bit,
+                                    advances,
+                                ),
+                                (count, bit),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn rgb4_to_rgb24(val: u32) -> u32 {
     let r = if (val & 1) != 0 { 0xFF } else { 0 };
     let g_raw = (val >> 1) & 3;

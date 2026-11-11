@@ -45,6 +45,8 @@ const REX_PLANES_CID: u32 = 6u;
 const REX_DRAWDEPTH_4: u32 = 0u;
 const REX_DRAWDEPTH_8: u32 = 1u;
 const REX_DRAWDEPTH_12: u32 = 2u;
+const REX_LINE_BACKGROUND: u32 = 0x80000000u;
+const REX_LINE_SKIPPED: u32 = 0xffffffffu;
 const REX_BAYER: array<u32, 16> = array<u32, 16>(
     0u, 8u, 2u, 10u,
     12u, 4u, 14u, 6u,
@@ -411,6 +413,114 @@ fn pixel_result(
     return logic_operation(state, compressed_source, destination);
 }
 
+struct PatternResult {
+    draws: bool,
+    background: bool,
+}
+
+fn sequence_mod(row: u32, width: u32, column: u32, modulus: u32) -> u32 {
+    return (
+        (row % modulus) * (width % modulus)
+        + column % modulus
+    ) % modulus;
+}
+
+fn sequence_capped(row: u32, width: u32, column: u32) -> u32 {
+    let row_part = min(row, 256u);
+    let width_part = min(width, 256u);
+    let base = min(row_part * width_part, 256u);
+    return min(base + min(column, 256u), 256u);
+}
+
+fn line_pattern_state_after(
+    count: u32,
+    repeat: u32,
+    length: u32,
+    bit: u32,
+    advances_mod: u32,
+    advances_capped: u32,
+) -> vec2<u32> {
+    if advances_capped <= count {
+        return vec2<u32>(count - advances_capped, bit);
+    }
+    let cycle = repeat * length;
+    let delta = (advances_mod + cycle - ((count + 1u) % cycle)) % cycle;
+    let bit_advances = 1u + delta / repeat;
+    let next_count = repeat - 1u - delta % repeat;
+    let offset = (31u - bit + bit_advances) % length;
+    return vec2<u32>(next_count, 31u - offset);
+}
+
+fn fill_pattern(
+    state: RexStateSlot,
+    command: RexCommand,
+    px: i32,
+    py: i32,
+) -> PatternResult {
+    let mode = state.words[REX_STATE_DRAW_MODE0];
+    let z_enabled = ((mode >> 12u) & 1u) != 0u;
+    let line_enabled = ((mode >> 13u) & 1u) != 0u;
+    if !z_enabled && !line_enabled {
+        return PatternResult(true, false);
+    }
+
+    let walker = walker_position(state, px, py);
+    let column = u32(abs(walker.x - command.src_x0));
+    let row = u32(abs(walker.y - command.src_y0));
+    let width = u32(abs(command.src_x1 - command.src_x0)) + 1u;
+    var background = false;
+
+    if z_enabled {
+        let initial_bit = (state.words[REX_STATE_PATTERN_BITS] >> 8u) & 0xffu;
+        let row_bit = select(31u, initial_bit, row == 0u);
+        let bit = (row_bit + 32u - (column & 31u)) & 31u;
+        if ((state.words[REX_STATE_Z_PATTERN] >> bit) & 1u) == 0u {
+            if ((mode >> 16u) & 1u) != 0u {
+                background = true;
+            } else {
+                return PatternResult(false, false);
+            }
+        }
+    }
+
+    if line_enabled {
+        let line_mode = state.words[REX_STATE_LINE_MODE];
+        let initial_count = line_mode & 0xffu;
+        let repeat = max((line_mode >> 8u) & 0xffu, 1u);
+        let length = ((line_mode >> 24u) & 0xffu) + 17u;
+        let cycle = repeat * length;
+        let row_advances_mod = sequence_mod(row, width, 0u, cycle);
+        let row_advances_capped = sequence_capped(row, width, 0u);
+        let row_state = line_pattern_state_after(
+            initial_count,
+            repeat,
+            length,
+            31u,
+            row_advances_mod,
+            row_advances_capped,
+        );
+        let initial_bit = state.words[REX_STATE_PATTERN_BITS] & 0xffu;
+        let row_bit = select(31u, initial_bit, row == 0u);
+        let column_state = line_pattern_state_after(
+            row_state.x,
+            repeat,
+            length,
+            row_bit,
+            column % cycle,
+            min(column, 256u),
+        );
+        if ((state.words[REX_STATE_LINE_PATTERN] >> column_state.y) & 1u) == 0u {
+            if ((mode >> 17u) & 1u) != 0u {
+                background = true;
+            } else {
+                return PatternResult(false, false);
+            }
+        }
+    }
+
+    return PatternResult(true, background);
+}
+
 fn clip_allows(state: RexStateSlot, px: i32, py: i32) -> bool {
     let clipmode = state.words[REX_STATE_CLIP_MODE];
     let enabled = clipmode & 0x1fu;
@@ -470,6 +580,13 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
         || command.kind == REX_COMMAND_F_LINE
         || command.kind == REX_COMMAND_A_LINE;
     var covered = fill;
+    var use_background = false;
+    let state = states[command.state_slot];
+    if fill && command.kind != REX_COMMAND_CLEAR {
+        let pattern = fill_pattern(state, command, px, py);
+        covered = pattern.draws;
+        use_background = pattern.background;
+    }
     if line {
         let y_major = (command.flags & REX_FLAG_LINE_Y_MAJOR) != 0u;
         let decreasing = (command.flags & REX_FLAG_LINE_MAJOR_DECREASING) != 0u;
@@ -477,14 +594,17 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
         let delta = select(major - command.src_x0, command.src_x0 - major, decreasing);
         if delta >= 0 && u32(delta) < command.payload_words {
             let minor = select(py, px, y_major);
-            let expected = bitcast<i32>(payload[command.payload_offset + u32(delta)]);
-            covered = minor == expected;
+            let pattern_word = payload[command.payload_offset + u32(delta)];
+            if pattern_word != REX_LINE_SKIPPED {
+                let expected = i32(pattern_word & ~REX_LINE_BACKGROUND);
+                covered = minor == expected;
+                use_background = (pattern_word & REX_LINE_BACKGROUND) != 0u;
+            }
         }
     }
     if covered && in_bounds
         && px >= command.dst_x0 && px <= command.dst_x1
         && py >= command.dst_y0 && py <= command.dst_y1 {
-        let state = states[command.state_slot];
         let cid_mask = (state.words[REX_STATE_CLIP_MODE] >> 9u) & 0xfu;
         let cid_allows = (command.flags & REX_FLAG_READ_AUX) == 0u
             || (cid_mask & (1u << (aux_value & 3u))) != 0u;
@@ -492,7 +612,11 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
             return;
         }
         let mask = state.words[REX_STATE_WRITE_MASK];
-        let raw_source = state.words[REX_STATE_SOURCE_COLOR];
+        let raw_source = select(
+            state.words[REX_STATE_SOURCE_COLOR],
+            state.words[REX_STATE_COLOR_BACK],
+            use_background,
+        );
         if (command.flags & REX_FLAG_WRITE_RGB) != 0u {
             if command.kind == REX_COMMAND_CLEAR {
                 rgb_value = (rgb_value & ~mask) | (raw_source & mask);

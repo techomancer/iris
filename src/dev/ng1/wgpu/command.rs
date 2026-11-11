@@ -28,6 +28,7 @@ pub(super) const FLAG_LINE_MAJOR_DECREASING: u32 = 1 << 7;
 pub(super) const STATE_WORDS: usize = 64;
 pub(super) const STATE_DRAW_MODE0: usize = 0;
 pub(super) const STATE_DRAW_MODE1: usize = 1;
+pub(super) const STATE_LINE_MODE: usize = 2;
 pub(super) const STATE_CLIP_MODE: usize = 3;
 pub(super) const STATE_WRITE_MASK: usize = 4;
 pub(super) const STATE_XYWIN: usize = 5;
@@ -36,6 +37,9 @@ pub(super) const STATE_ALPHA_REF: usize = 12;
 pub(super) const STATE_SMASK0X: usize = 13;
 pub(super) const STATE_SMASK0Y: usize = 14;
 pub(super) const STATE_SMASK1X: usize = 15;
+pub(super) const STATE_LINE_PATTERN: usize = 7;
+pub(super) const STATE_Z_PATTERN: usize = 9;
+pub(super) const STATE_PATTERN_BITS: usize = 43;
 pub(super) const STATE_XYMOVE: usize = 47;
 pub(super) const STATE_SOURCE_COLOR: usize = 63;
 
@@ -97,6 +101,10 @@ impl RexCommand {
             dst_y0: fill.min_y as i32,
             dst_x1: (fill.min_x + fill.width - 1) as i32,
             dst_y1: (fill.min_y + fill.height - 1) as i32,
+            src_x0: fill.walker_x0,
+            src_y0: fill.walker_y0,
+            src_x1: fill.walker_x1,
+            src_y1: fill.walker_y1,
             ..Self::default()
         }
     }
@@ -181,7 +189,7 @@ impl RexStateSlot {
         let mut words = [0; STATE_WORDS];
         words[STATE_DRAW_MODE0] = context.drawmode0.0;
         words[STATE_DRAW_MODE1] = context.drawmode1.0;
-        words[2] = context.lsmode.lsrcount()
+        words[STATE_LINE_MODE] = context.lsmode.lsrcount()
             | context.lsmode.lsrepeat() << 8
             | context.lsmode.lsrcntsave() << 16
             | context.lsmode.lslength() << 24;
@@ -189,9 +197,9 @@ impl RexStateSlot {
         words[STATE_WRITE_MASK] = context.wrmask;
         words[STATE_XYWIN] = context.xywin;
         words[6] = context.topscan;
-        words[7] = context.lspattern;
+        words[STATE_LINE_PATTERN] = context.lspattern;
         words[8] = context.lspatsave;
-        words[9] = context.zpattern;
+        words[STATE_Z_PATTERN] = context.zpattern;
         words[STATE_COLOR_BACK] = context.colorback;
         words[11] = context.colorvram;
         words[STATE_ALPHA_REF] = context.alpharef;
@@ -225,7 +233,7 @@ impl RexStateSlot {
         words[40] = context.stepz;
         words[41] = context.lssave;
         words[42] = context.lsrestore;
-        words[43] = context.pat_bit as u32
+        words[STATE_PATTERN_BITS] = context.pat_bit as u32
             | (context.zpat_bit as u32) << 8
             | (context.mid_primitive as u32) << 16;
         words[44] = context.hostcnt;
@@ -355,6 +363,10 @@ mod tests {
             min_y: 13,
             width: 17,
             height: 19,
+            walker_x0: 101,
+            walker_y0: 103,
+            walker_x1: 117,
+            walker_y1: 121,
             color: 0x1234_5678,
             write_mask: 0xa5a5_5a5a,
         }
@@ -442,7 +454,12 @@ mod tests {
                     command.src_x1,
                     command.src_y1
                 ),
-                (0, 0, 0, 0),
+                (
+                    fill.walker_x0,
+                    fill.walker_y0,
+                    fill.walker_x1,
+                    fill.walker_y1,
+                ),
             );
 
             let mut block = fill;
