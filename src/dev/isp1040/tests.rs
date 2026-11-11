@@ -1114,7 +1114,7 @@ fn time_the_machine_was_stopped_does_not_count_against_a_selection() {
     r.init_rings(4, 4);
     assert_eq!(r.cmd(&[mbox::SET_SELECTION_TIMEOUT, 300]), mbox::COMPLETE);
     queue_absent(&r, 0, 0x6d);
-    while r.isp.lock().ctl.selecting.is_none() { std::thread::yield_now(); }
+    spin_until("a selection to begin", || r.isp.lock().ctl.selecting.is_some());
     r.isp.pause();
     let frozen = r.isp.now_ns(&r.isp.lock());
     std::thread::sleep(Duration::from_millis(600));
@@ -1707,7 +1707,7 @@ fn a_soft_reset_during_a_store_drops_the_completion() {
     std::thread::scope(|s| {
         let reset = s.spawn(|| r.isp.write(reg::BUS_CTRL, CTRL_SOFT_RESET as u32, 2));
         // The reset has moved the generation on and waits for the store.
-        while r.isp.gen.load(Ordering::Acquire) == before { std::thread::yield_now(); }
+        spin_until("the generation to move", || r.isp.gen.load(Ordering::Acquire) != before);
         assert!(!reset.is_finished());
         gate.open();
         reset.join().unwrap();
@@ -1782,7 +1782,7 @@ fn pausing_lets_the_command_in_flight_finish() {
     gate.wait_arrival();
     std::thread::scope(|s| {
         let pause = s.spawn(|| r.isp.pause());
-        while !r.isp.lock().ctl.paused { std::thread::yield_now(); }
+        spin_until("the pause to take", || r.isp.lock().ctl.paused);
         gate.open();
         pause.join().unwrap();
     });
@@ -1804,7 +1804,7 @@ fn saving_waits_for_the_command_in_flight() {
     gate.wait_arrival();
     let saved = std::thread::scope(|s| {
         let save = s.spawn(|| r.isp.save_state());
-        while !r.isp.waiting_on_command() { std::thread::yield_now(); }
+        spin_until("the save to wait on the command", || r.isp.waiting_on_command());
         gate.open();
         save.join().unwrap()
     });
@@ -2784,6 +2784,15 @@ fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
 /// the bound can be long enough for a loaded host.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// Wait for `cond`, and fail the test, not hang it, if it never holds.
+fn spin_until(what: &str, cond: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + WAIT;
+    while !cond() {
+        assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
+        std::thread::yield_now();
+    }
+}
+
 fn wait_resp<P: IspPart>(r: &Rig<P>, n: u16, max: Duration) -> bool {
     let t = std::time::Instant::now();
     while t.elapsed() < max {
@@ -2906,7 +2915,7 @@ fn a_command_taken_up_before_a_pause_is_retired_once_by_a_later_reset() {
     bus_reset(&r, 1, 0);
     queue_absent(&r, 0, 0x53);
     r.clock(S);
-    while r.isp.lock().ctl.selecting.is_none() { std::thread::yield_now(); }
+    spin_until("a selection to begin", || r.isp.lock().ctl.selecting.is_some());
     r.isp.pause();
     bus_reset(&r, 5, 0);
     r.isp.resume();

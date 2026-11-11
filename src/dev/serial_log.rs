@@ -283,6 +283,7 @@ mod tests {
         assert_eq!(stamp.len(), 30, "{stamp:?}");
         assert!(stamp.starts_with('['));
         assert!(stamp.ends_with("Z] "));
-        assert_eq!(&stamp[1..5], "2026");
+        let year: u32 = stamp[1..5].parse().expect("a four-digit year");
+        assert!(year >= 2026, "{stamp:?}");
     }
 }

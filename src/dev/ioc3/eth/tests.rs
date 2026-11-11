@@ -791,7 +791,7 @@ fn a_stopped_mac_takes_no_frames_until_it_starts() {
     assert!(t.eth.threads.lock().is_empty());
     t.inject.push(frame(STATION, 60)).unwrap();
     wake.notify();
-    std::thread::sleep(Duration::from_millis(30));
+    // The receive thread is joined: there is nothing to take the frame.
     assert_eq!(t.r(RX_CONSUME), 8, "nothing taken while stopped");
     t.eth.start();
     assert!(waits_for(|| t.r(RX_CONSUME) == 16), "the queued frame is taken on start");
