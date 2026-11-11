@@ -378,6 +378,13 @@ The rules, in order of importance:
 6. **Register long-lived locks** with `locks::register_mutex` /
    `register_spin`, so the lock registry can show which locks are held at any
    moment (see [debug.md](debug.md)).
+7. **A thread that sleeps until another gives it work waits on a
+   `sync::Doorbell`.** The state it waits for lives inside the doorbell, a
+   wait names its condition and tests it under the lock before sleeping,
+   a ring changes the state and wakes every waiter, and `close` stops the
+   waiters. A condition variable with a hand-written check loses wakeups
+   when the check, the store or the stop falls outside its lock
+   (`src/sync/doorbell.rs`, checked by loom).
 
 When a device has several locks, document their order next to them and keep
 to it. Graphics recording is an example: `rec` before `trace`, and the

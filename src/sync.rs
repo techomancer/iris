@@ -31,6 +31,9 @@ pub use loom::thread;
 #[cfg(loom)]
 pub use loom_shim::{Condvar, Mutex, MutexGuard};
 
+mod doorbell;
+pub use doorbell::{Doorbell, DoorbellGuard};
+
 /// parking_lot's calling convention over loom's std-shaped types.
 #[cfg(loom)]
 mod loom_shim {
