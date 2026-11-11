@@ -539,6 +539,7 @@ impl KonaBackend {
         let g = &self.gl.counts;
         writeln!(w, "commands          {}", g.commands)?;
         writeln!(w, "begins by mode    {:?} (points, lines, loop, strip, triangles, tri strip, fan, quads, quad strip, polygon)", g.begins)?;
+        writeln!(w, "rectangle begins  {} (drawn as quads)", g.rectangles)?;
         writeln!(w, "vertices          {} in {} primitives; {} outside a begin", g.vertices, g.primitives, g.stray)?;
         #[cfg(test)]
         writeln!(w, "vertex census     {} inside the window, {} outside it, {} outside the volume, {} behind the eye", g.inside, g.outside_window, g.outside_volume, g.behind)?;
