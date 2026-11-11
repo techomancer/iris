@@ -166,7 +166,7 @@ impl Rig {
     fn with_host(host: XtalkHost) -> Self {
         let sink = Arc::new(Sink::default());
         let mem = Arc::new(Mem::new());
-        Rig { bridge: Bridge::new(Upstream::single(host, mem.clone(), sink.clone()), &crate::ip30::PCI0), sink, mem }
+        Rig { bridge: Bridge::new(Upstream::single(host, mem.clone(), sink.clone()), &PIN_WIRING), sink, mem }
     }
 
     /// Write register `off` (a slot base such as `reg::CONTROL`).
@@ -1213,7 +1213,7 @@ fn pin_fall_then_rise_gives_the_bridge_one_heart_packet_each() {
         }
     }
     let heart = Arc::new(Slow { log: Mutex::new(Vec::new()), stall: Mutex::new(None) });
-    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(Mem::new()), heart.clone()), &crate::ip30::PCI0);
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(Mem::new()), heart.clone()), &PIN_WIRING);
     let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
     let c = r.card(2, PCI_INTA);
     r.route(2, 1);
@@ -1435,7 +1435,7 @@ fn a_host_that_decodes_packets_sees_their_source_and_address() {
     }
     let host = XtalkHost { widget: 0xa, int_packet: 0, int_packet_mask: 0, vectors: 256 };
     let decoder = Arc::new(Decoder::default());
-    let r = Rig { bridge: Bridge::new(Upstream::single(host, Arc::new(Mem::new()), decoder.clone()), &crate::ip30::PCI0),
+    let r = Rig { bridge: Bridge::new(Upstream::single(host, Arc::new(Mem::new()), decoder.clone()), &PIN_WIRING),
         sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
     let c = r.card(2, PCI_INTA);
     r.set(reg::CONTROL, (r.get(reg::CONTROL) & !0xf) | 0xd);
@@ -1466,7 +1466,7 @@ fn the_programmed_widget_picks_the_host_behind_a_crossbow() {
             HostPort::new(HEART_HOST, mem_a.clone(), sink_a.clone()),
             HostPort::new(host_b, mem_b.clone(), sink_b.clone()),
         ]);
-        let r = Rig { bridge: Bridge::new(up, &crate::ip30::PCI0), sink: sink_a.clone(), mem: mem_a };
+        let r = Rig { bridge: Bridge::new(up, &PIN_WIRING), sink: sink_a.clone(), mem: mem_a };
         (r, mem_b, sink_b)
     };
     let (r, mem_b, sink_b) = build(1 << 8 | 1 << 10 | 1 << 15);
@@ -1713,7 +1713,7 @@ fn a_packet_reaches_heart_outside_the_state_lock() {
         }
     }
     let heart = Arc::new(Prying(Mutex::new(None), Mutex::new(Vec::new())));
-    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(Mem::new()), heart.clone()), &crate::ip30::PCI0);
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, Arc::new(Mem::new()), heart.clone()), &PIN_WIRING);
     *heart.0.lock() = Some(bridge.clone());
     let r = Rig { bridge, sink: Arc::new(Sink::default()), mem: Arc::new(Mem::new()) };
     r.route(4, 3);
@@ -1950,7 +1950,7 @@ impl Head {
     fn new() -> Self {
         let sink = Arc::new(Sink::default());
         let mem = Arc::new(Mem::new());
-        let bridge = Bridge::with_part(Part::XBridge, Upstream::single(BEDROCK_HOST, mem.clone(), sink.clone()), &crate::ip30::PCI0);
+        let bridge = Bridge::with_part(Part::XBridge, Upstream::single(BEDROCK_HOST, mem.clone(), sink.clone()), &PIN_WIRING);
         bridge.set_revision(2);
         bridge.set_widget(15);
         bridge.set_control_strap(1 << 4);

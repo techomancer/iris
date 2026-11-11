@@ -32,34 +32,11 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::dev::heart_mem::HeartRam;
-use crate::pci::IntxRouting;
 use crate::physical::Physical;
 use crate::ppmem::devmap::{entry_eq, SLOT_SHIFT};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
 
 /// Widget numbers on the Octane's Crossbow.
-/// The Bridge's PCI bus; the outputs are the Bridge's eight interrupt pins.
-/// Pins A and C of a device reach the pin numbered as the device, B and D
-/// that number with bit two flipped. That rule is inferred from the system's
-/// software and is not established by a board document. `BoardIrq(i)` is the
-/// Bridge's pin `i`, which the GPIO inputs share with PCI; the IOC3's
-/// SuperIO interrupt is `BoardIrq(4)`. The wire numbering is iris's own.
-pub static PCI0: IntxRouting = IntxRouting {
-    devices: 8,
-    irqs: 8,
-    intx: &[
-        (0, [Some(0), Some(4), Some(0), Some(4)]),
-        (1, [Some(1), Some(5), Some(1), Some(5)]),
-        (2, [Some(2), Some(6), Some(2), Some(6)]),
-        (3, [Some(3), Some(7), Some(3), Some(7)]),
-        (4, [Some(4), Some(0), Some(4), Some(0)]),
-        (5, [Some(5), Some(1), Some(5), Some(1)]),
-        (6, [Some(6), Some(2), Some(6), Some(2)]),
-        (7, [Some(7), Some(3), Some(7), Some(3)]),
-    ],
-    board_irqs: &[0, 1, 2, 3, 4, 5, 6, 7],
-};
-
 pub const WIDGET_XBOW: u8 = 0x0;
 pub const WIDGET_HEART: u8 = 0x8;
 pub const WIDGET_BRIDGE: u8 = 0xf;

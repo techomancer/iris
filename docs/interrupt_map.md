@@ -400,7 +400,7 @@ Sources: `src/ip30.rs` (the Bridge's PCI routing), `src/dev/heart.rs`,
 ### Bridge pins
 
 The Bridge has eight interrupt pins. Each PCI device's pins reach them by
-the rule in `ip30::PCI0`: INTA and INTC of device n go to pin n, INTB and
+the rule in `bridge::PIN_WIRING`: INTA and INTC of device n go to pin n, INTB and
 INTD to pin n ^ 4. No board document gives the rule; it is taken from how
 the system's software numbers the pins.
 

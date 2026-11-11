@@ -81,6 +81,7 @@ pub mod z85c30;
 pub mod baseio_flash;
 pub mod node_flash;
 pub mod hub;
+pub mod pi_gfx;
 pub mod dp83840;
 pub mod bedrock;
 pub mod bedrock_flash;

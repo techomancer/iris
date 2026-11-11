@@ -75,7 +75,7 @@ use crate::cpu::mips_exec::SOFT_RESET_BIT;
 use crate::cpu::smp::on_cpu_thread;
 use crate::dev::heart::Clock;
 use super::{Effect, Routing, PENDING_BANKS};
-use crate::dev::odyssey::{PiGfx, PI_GFX_REGS};
+use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};

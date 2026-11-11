@@ -75,7 +75,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let heart = Arc::new(Heart::new(HeartConfig::octane(banks_mb.map(|mb| (mb as u64) << 20)), crate::dev::heart::host_clock()));
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
     xbow.connect_host(HEART_HOST, heart.clone());
-    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()), &crate::ip30::PCI0);
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()), &PIN_WIRING);
     bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
     let phys = Ip30Bus::new(ram);
     phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
@@ -431,7 +431,7 @@ fn a_run_above_16_mib_without_a_2gb_window_maps_nothing() {
     let ram = Arc::new(HeartRam::new([128, 0, 0, 0]));
     let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::dev::heart::host_clock()));
     let _release = Release(ram.phys().clone());
-    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart), &PCI0);
+    let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart), &PIN_WIRING);
     let p = Arc::new(Ip30Bus::new(ram));
     let dev: Arc<dyn BusDevice> = bridge;
     p.attach_widget(WIDGET_BRIDGE, dev, false);
@@ -531,7 +531,7 @@ impl Octane {
         ram.set_memcfg([0x8001_0000, 0, 0, 0]);
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig::octane([64 << 20, 0, 0, 0]), Arc::new(|| 0)));
-        let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()), &crate::ip30::PCI0);
+        let bridge = Bridge::new(Upstream::single(HEART_HOST, mem.clone(), heart.clone()), &PIN_WIRING);
 
         let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, MAC, ioc3::ByteBus::Ds1685(crate::dev::ds1685::Ds1685::new(None))));
         let eth = ioc3.eth().unwrap().clone();

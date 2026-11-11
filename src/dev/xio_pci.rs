@@ -27,7 +27,7 @@
 //! * Interrupts, inferred for both boards: a slot's INTA and INTC reach the
 //!   Bridge pin numbered as its device, INTB and INTD that number with bit
 //!   two flipped. That is the default Bridge board wiring OpenBSD and Linux
-//!   use for any Bridge and the onboard one has ([`crate::ip30::PCI0`]); no
+//!   use for any Bridge and the onboard one has ([`crate::dev::bridge::PIN_WIRING`]); no
 //!   board trace is held.
 //! * The widget is a Bridge-class one, established; that it reports the Bridge
 //!   (part 0xc002) and not the XBridge (0xd002) is inferred. Its revision is
@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::dev::bridge::{Bridge, RawFlash};
+use crate::dev::bridge::{Bridge, RawFlash, PIN_WIRING};
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::pci::{DevFn, PciBus, PciFunction};
@@ -132,7 +132,7 @@ impl XioPciBoard {
     /// alive ([`Bridge::set_link_alive`]) and resets the board with the
     /// machine.
     pub fn new(kind: Kind, widget: u8, up: Upstream, revision: u32) -> Self {
-        let bridge = Bridge::new(up, &crate::ip30::PCI0);
+        let bridge = Bridge::new(up, &PIN_WIRING);
         bridge.set_widget(widget);
         bridge.set_revision(match kind {
             Kind::Shoehorn => SHOEHORN_BRIDGE_REVISION,
