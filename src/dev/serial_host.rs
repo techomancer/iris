@@ -100,6 +100,7 @@ impl UnixSocketBackend {
         let path = path.as_ref().to_path_buf();
         let listener = bind_unix_socket(&path)?;
         listener.set_nonblocking(true)?;
+        crate::workstation::remove_at_exit(&path);
         Ok(Self { path, listener, stream: Mutex::new(None) })
     }
 }
@@ -108,6 +109,7 @@ impl UnixSocketBackend {
 impl Drop for UnixSocketBackend {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        crate::workstation::keep_at_exit(&self.path);
     }
 }
 

@@ -464,8 +464,9 @@ port is served on TCP, so several `--ci` instances coexist.
 Each serial line can also be served on a Unix socket:
 `serial_socket_a` / `serial_socket_b` (or `--serial-socket-a` /
 `--serial-socket-b`). The socket carries raw bytes with no telnet negotiation,
-takes one client at a time, and is removed when iris exits; a stale socket file
-from a crashed run is replaced, a file that is not a socket is refused. A
+takes one client at a time. iris removes the socket file when it exits, even
+through power-off, `quit` or a signal; after a crash the next start replaces
+the leftover, and it refuses a file that is not a socket. A
 client that reads too slowly loses output, as on the TCP port. `serial_log`
 writes the console's transcript and `serial_log_a` / `serial_log_b` the other
 line's (the Indy and Indigo2 console is channel B, the Octane's and O2's

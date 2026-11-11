@@ -688,6 +688,30 @@ unsafe fn errno_location() -> *mut libc::c_int {
 #[cfg(test)]
 pub(crate) static EXIT_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Files a process that ends through [`exit_process`] removes first: the
+/// Unix sockets it serves, whose owners' `Drop` that exit skips.
+#[cfg(unix)]
+static EXIT_FILES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// Have [`exit_process`] remove `path` before it ends the process.
+#[cfg(unix)]
+pub(crate) fn remove_at_exit(path: &std::path::Path) {
+    EXIT_FILES.lock().push(path.to_path_buf());
+}
+
+/// Take `path` off that list, for an owner that has removed it itself.
+#[cfg(unix)]
+pub(crate) fn keep_at_exit(path: &std::path::Path) {
+    EXIT_FILES.lock().retain(|p| p != path);
+}
+
+#[cfg(unix)]
+fn remove_listed(list: &Mutex<Vec<std::path::PathBuf>>) {
+    for path in std::mem::take(&mut *list.lock()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// End the process. This is the only place machine and device code may call
 /// `std::process::exit`: it skips every Drop, which is where a copy-on-write
 /// overlay would otherwise write its sector record, so the caller has to hand
@@ -706,6 +730,8 @@ pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce() -> Flushe
         EXIT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         return;
     }
+    #[cfg(unix)]
+    remove_listed(&EXIT_FILES);
     std::process::exit(code);
 }
 
@@ -888,5 +914,27 @@ impl Device for SystemController {
             }
             _ => Err(format!("Unknown command: {}", cmd)),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exit_file_tests {
+    use super::*;
+
+    /// What an exit removes is what was registered and not given back.
+    #[test]
+    fn the_exit_removes_the_files_still_listed() {
+        let dir = crate::test_temp::TempPath::dir("exit-files");
+        let (listed, kept) = (dir.join("listed"), dir.join("kept"));
+        std::fs::write(&listed, b"1").unwrap();
+        std::fs::write(&kept, b"2").unwrap();
+        remove_at_exit(&listed);
+        remove_at_exit(&kept);
+        keep_at_exit(&kept);
+        let mine = Mutex::new(EXIT_FILES.lock().iter().filter(|p| p.starts_with(&*dir)).cloned().collect());
+        EXIT_FILES.lock().retain(|p| !p.starts_with(&*dir));
+        remove_listed(&mine);
+        assert!(!listed.exists());
+        assert!(kept.exists());
     }
 }

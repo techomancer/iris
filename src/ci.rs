@@ -24,10 +24,6 @@ use crate::workstation::{MachineSlot, Workstation};
 use crate::gfx_display::GfxDisplay;
 use crate::dev::serial_host::CiSerialBackend;
 
-/// Set at `start_server`; consulted by `quit` so the socket file is cleaned up
-/// before `std::process::exit` (which skips Drop).
-static SOCKET_PATH: Mutex<Option<String>> = Mutex::new(None);
-
 #[derive(Deserialize)]
 struct Request {
     cmd: String,
@@ -97,7 +93,10 @@ fn cleanup_socket_path(path: &str) {
         return;
     }
     #[cfg(unix)]
-    let _ = std::fs::remove_file(path);
+    {
+        let _ = std::fs::remove_file(path);
+        crate::workstation::keep_at_exit(std::path::Path::new(path));
+    }
 }
 
 impl CiServer {
@@ -161,10 +160,10 @@ pub fn start_server(
         connections: AtomicUsize::new(0),
     });
 
-    *SOCKET_PATH.lock() = Some(path.clone());
-
     #[cfg(unix)]
     if let Some(listener) = unix {
+        // The exit that follows `quit` skips Drop, which removes the file.
+        crate::workstation::remove_at_exit(std::path::Path::new(&path));
         start_unix_server(server.clone(), &path, listener)?;
         return Ok(server);
     }
@@ -442,9 +441,6 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
 }
 
 fn exit_after_quit(machine: &MachineSlot) {
-    if let Some(p) = SOCKET_PATH.lock().take() {
-        cleanup_socket_path(&p);
-    }
     // Library hosts set IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI
     // socket does not kill the embedder. `cmd_quit` already stopped and
     // flushed the machine; this flush is a no-op unless something wrote since.
