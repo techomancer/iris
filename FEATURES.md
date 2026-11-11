@@ -365,7 +365,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `jitv2.threads` | `1` | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). |
+| `jitv2.threads` | one per CPU, at most 4 | Fixed compile-pool size at startup; must be at least 1 (0 is rejected). Unset, the pool has one thread per guest CPU, up to 4. |
 | `jitv2.cache` | `false` | Opt-in compiled-page disk cache; needs jitv2. |
 | `jitv2.cache_dir` | `""` | Blank selects platform user cache directory plus iris/jitv2. |
 
@@ -868,7 +868,7 @@ cargo run --release --features jitv2,gpujit
 ```
 
 What it does today: compiles on a pool of background threads (`[jitv2]
-threads` / `--jitv2-threads`, default 1), inlines L1 data-cache loads and stores
+threads` / `--jitv2-threads`, default one per guest CPU up to 4), inlines L1 data-cache loads and stores
 for R4400/R5000, uses the direct memory window for R10000, detects
 self-modifying code through per-page generation counters, and falls back to the
 interpreter for unsupported instructions. Each physical page has one function

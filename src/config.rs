@@ -1688,6 +1688,8 @@ pub enum JitCompile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Jitv2Config {
+    /// Compile-pool threads. Unset, one per guest CPU, at most
+    /// `AUTO_JITV2_THREADS_MAX` (see [`MachineConfig::settle_jitv2_threads`]).
     #[serde(default = "default_jitv2_threads")]
     pub threads: usize,
     /// Compile on the pool's threads (`async`, the default) or on the CPU
@@ -1708,6 +1710,11 @@ pub struct Jitv2Config {
 }
 
 fn default_jitv2_threads() -> usize { 1 }
+
+/// Most compile threads an unset `[jitv2] threads` gives: what was measured.
+/// Four threads cut IRIX login time by 12-19% against one in the median and
+/// single-CPU runs measured.
+pub const AUTO_JITV2_THREADS_MAX: usize = 4;
 
 impl Default for Jitv2Config {
     fn default() -> Self {
@@ -2313,6 +2320,11 @@ pub struct MachineConfig {
     #[serde(skip)]
     pub banks_set: bool,
 
+    /// Whether `[jitv2] threads` was given (in the config file or by
+    /// `--jitv2-threads`). When not, the pool follows the CPU count.
+    #[serde(skip)]
+    pub jitv2_threads_set: bool,
+
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
     pub scale: u32,
@@ -2753,6 +2765,7 @@ impl Default for MachineConfig {
             nveeprom: default_nveeprom(),
             banks: default_banks(),
             banks_set: false,
+            jitv2_threads_set: false,
             scsi: default_scsi(),
             scale: default_scale(),
             nfs: None,
@@ -3006,8 +3019,19 @@ impl MachineConfig {
         let mut cfg = toml::from_str::<Self>(text)?;
         let table = toml::from_str::<toml::Table>(text)?;
         cfg.banks_set = table.contains_key("banks");
+        cfg.jitv2_threads_set = table.get("jitv2").and_then(|j| j.get("threads")).is_some();
         cfg.fold_deprecated();
+        cfg.settle_jitv2_threads();
         Ok(cfg)
+    }
+
+    /// Give an unset `[jitv2] threads` one compile thread per guest CPU, at
+    /// most `AUTO_JITV2_THREADS_MAX`. Each CPU asks for its own pages, and a
+    /// single thread kept a 4-CPU Tezro's boot waiting on compiles.
+    pub fn settle_jitv2_threads(&mut self) {
+        if !self.jitv2_threads_set {
+            self.jitv2.threads = (self.machine.cpus() as usize).clamp(1, AUTO_JITV2_THREADS_MAX);
+        }
     }
 
     /// Load from `iris.toml` if it exists, otherwise return defaults.
@@ -4027,7 +4051,9 @@ impl Cli {
         if let Some(v) = self.bank1    { cfg.banks[1] = v; cfg.banks_set = true; }
         if let Some(v) = self.bank2    { cfg.banks[2] = v; cfg.banks_set = true; }
         if let Some(v) = self.bank3    { cfg.banks[3] = v; cfg.banks_set = true; }
-        if let Some(n) = self.jitv2_threads { cfg.jitv2.threads = n; }
+        if let Some(n) = self.jitv2_threads { cfg.jitv2.threads = n; cfg.jitv2_threads_set = true; }
+        // After `--machine`, which can change the CPU count.
+        cfg.settle_jitv2_threads();
         if let Some(m) = self.jitv2_compile { cfg.jitv2.compile = m; }
 
         // Helper: insert or update a SCSI device entry.
@@ -4562,6 +4588,21 @@ mod export_tests {
         assert_eq!(cfg.jitv2.compile, JitCompile::Async);
         let parsed: MachineConfig = toml::from_str("").expect("parse");
         assert_eq!(parsed.jitv2.compile, JitCompile::Async);
+    }
+
+    #[test]
+    fn jitv2_threads_follow_the_cpus_unless_set() {
+        let parse = |t: &str| MachineConfig::parse_toml(t).expect("parse");
+        assert_eq!(parse("").jitv2.threads, 1);
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\ncpus = 2\n").jitv2.threads, 2);
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n").jitv2.threads, 4);
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n[jitv2]\nthreads = 1\n").jitv2.threads, 1);
+
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53"]).expect("parse flags");
+        assert_eq!(cli.apply(parse("")).jitv2.threads, 4, "--machine changes the CPU count");
+        let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53", "--jitv2-threads", "2"]).expect("parse flags");
+        assert_eq!(cli.apply(parse("")).jitv2.threads, 2);
     }
 
     #[test]

@@ -263,7 +263,8 @@ mode           = "nat"
 #rex3_core       = 3
 #refresh_core    = 4
 
-# jitv2 (--features jitv2): compile-pool threads (same as --jitv2-threads),
+# jitv2 (--features jitv2): compile-pool threads (same as --jitv2-threads;
+# unset, one per guest CPU, at most 4),
 # and the persistent on-disk compiled-page cache across runs (see
 # docs/jitv2-persistent-cache.md). cache_dir blank/unset = the platform's
 # user cache directory; a directory that doesn't exist yet is created.
