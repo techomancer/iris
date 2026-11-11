@@ -37,7 +37,7 @@ use crate::dev::ng1::vc2::{
 use crate::dev::ng1::xmap9::Xmap9;
 use crate::disp::{Ng1DisplaySource, Rex3Screen, FB_STRIDE};
 use crate::gfx_display::GfxDisplay;
-use crate::traits::{BusDevice, Device, BUS_BUSY, BUS_OK};
+use crate::traits::{BusDevice, Device, Saveable, BUS_BUSY, BUS_OK};
 use crate::wgpu::{Gpu, GpuOptions, Staging};
 
 const WIDTH: usize = 64;
@@ -2386,4 +2386,119 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
         .expect("spawn resident headless integration")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_frame_gpu_restore_invalidates_capture_and_rebinds_display() {
+    std::thread::Builder::new().name("resident-frame-restore".into()).stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            use std::time::Duration;
+
+            let gpu = required_gpu();
+            let (rgb, aux) = seed_planes();
+            for mode in [ResidentDisplayMode::DirectWgpu, ResidentDisplayMode::ReadbackCompatibility] {
+                let mut expected_rgb = rgb.clone();
+                let mut expected_aux = aux.clone();
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                rex.fb_rgb.get_mut().copy_from_slice(&rgb);
+                rex.fb_aux.get_mut().copy_from_slice(&aux);
+                rex.fb_rgb.get_mut().isolate().unwrap();
+                rex.fb_aux.get_mut().isolate().unwrap();
+                configure_board_display(&rex);
+                rex.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+                rex.fb_rgb.get_mut().reset_access_counts();
+                rex.fb_aux.get_mut().reset_access_counts();
+                let rgb_guard = unsafe { (&*rex.fb_rgb.get()).protect() }.unwrap();
+                let aux_guard = unsafe { (&*rex.fb_aux.get()).protect() }.unwrap();
+                let board = SharedTestBoard(Arc::from(rex));
+                let display: Arc<dyn GfxDisplay> = board.0.clone();
+                let ps2 = Arc::new(crate::dev::ps2::Ps2Controller::new(None));
+                let frontend = crate::hostinput::HostInput::new(Some(display), ps2);
+                board.0.start();
+                board.0.start_resident_display(Arc::clone(&gpu), mode).unwrap();
+                let mut first = fill_context();
+                first.drawmode0.0 |= 1 << 5;
+                enqueue_fill(&board.0, &first);
+                draw_reference(first, &mut expected_rgb, &mut expected_aux);
+                let mut captured = Vec::new();
+                crate::gfx_display::fresh_frame(&*board.0, &mut captured, Duration::from_secs(10))
+                    .expect("capture initial drawn frame");
+                assert_eq!(frontend.screen_size(), (WIDTH, HEIGHT));
+                assert!(board.0.hw_cursor().is_some());
+                assert_pixels_eq("snapshot display", &captured, &software_frame(&board.0, &expected_rgb, &expected_aux));
+                let original_capture = captured.clone();
+                board.0.stop();
+                let registers = board.0.save_state();
+                let (saved_rgb, saved_aux) = board.0.snapshot_framebuffers_inmem();
+                assert_eq!((&saved_rgb, &saved_aux), (&expected_rgb, &expected_aux));
+                let saved_epoch = board.0.resident_status().unwrap().accepted.epoch;
+
+                board.0.start();
+                board.0.start_resident_display(Arc::clone(&gpu), mode).unwrap();
+                let mut replacement = fill_context();
+                replacement.drawmode0.0 |= 1 << 5;
+                replacement.colorred = 0xee << 11;
+                replacement.colorgrn = 0x11 << 11;
+                replacement.colorblue = 0x33 << 11;
+                enqueue_fill(&board.0, &replacement);
+                draw_reference(replacement, &mut expected_rgb, &mut expected_aux);
+                let (_, _, changed_seq) =
+                    crate::gfx_display::fresh_frame(&*board.0, &mut captured, Duration::from_secs(10))
+                        .expect("capture replacement frame");
+                assert_pixels_eq("replacement display", &captured, &software_frame(&board.0, &expected_rgb, &expected_aux));
+                assert_ne!(captured, original_capture);
+                board.0.stop();
+
+                let mut source = &*board.0;
+                let mut stale = Ng1Scanout::new_resident(&gpu, &source).unwrap();
+                let old_stamp = {
+                    let mut screen = board.0.head.screen().lock();
+                    stale.compose(&screen.display_state(), &mut source).unwrap().stamp()
+                };
+                assert!(board.0.frame_available());
+                board.0.load_state(&registers).unwrap();
+                assert!(!board.0.frame_available());
+                assert_eq!(frontend.screen_size(), (0, 0));
+                assert!(board.0.hw_cursor().is_none());
+                assert!(crate::gfx_display::copy_frame(&*board.0, &mut captured).is_none());
+                board.0.request_frame();
+                assert!(board.0.frame_pending());
+                board.0.restore_framebuffers_inmem(&saved_rgb, &saved_aux);
+                assert!(board.0.frame_pending(), "restore must retain pending requests");
+                assert!(crate::gfx_display::copy_frame(&*board.0, &mut captured).is_none());
+                let new_epoch = board.0.resident_status().unwrap().accepted.epoch;
+                assert_ne!(new_epoch, saved_epoch);
+                assert!(matches!(
+                    stale.capture(old_stamp, &mut source, &mut captured),
+                    Err(ResidentError::InvalidState("resident composed frame belongs to an old epoch"))
+                ));
+                {
+                    let mut screen = board.0.head.screen().lock();
+                    assert!(matches!(
+                        stale.compose(&screen.display_state(), &mut source),
+                        Err(ResidentError::InvalidState("resident scanout bindings belong to an old or different epoch"))
+                    ));
+                }
+
+                board.0.start();
+                board.0.start_resident_display(Arc::clone(&gpu), mode).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while board.0.frame_pending() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert!(!board.0.frame_pending(), "new display must complete the pending capture");
+                let (_, _, restored_seq) = crate::gfx_display::copy_frame(&*board.0, &mut captured)
+                    .expect("capture restored frame");
+                assert!(restored_seq > changed_seq);
+                assert_eq!(frontend.screen_size(), (WIDTH, HEIGHT));
+                assert!(board.0.hw_cursor().is_some());
+                assert_pixels_eq("restored display", &captured, &original_capture);
+                assert_pixels_eq("restored software oracle", &captured, &software_frame(&board.0, &saved_rgb, &saved_aux));
+                board.0.stop();
+                assert_no_cpu_plane_access(&board.0);
+                drop(aux_guard);
+                drop(rgb_guard);
+            }
+        }).unwrap().join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

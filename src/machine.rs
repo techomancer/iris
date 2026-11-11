@@ -173,6 +173,9 @@ pub struct Machine {
     lifecycle: GuestState,
 }
 
+#[cfg(all(test, feature = "wgpu"))]
+type ResidentCheckpoint = (toml::Value, (Vec<u32>, Vec<u32>));
+
 /// In-memory snapshot of the just-restored guest state. Populated at the end
 /// of `ci_restore`; consumed by `ci_rollback`. Trades ~270 MB of RSS for
 /// disk-IO-free rollback.
@@ -193,6 +196,8 @@ struct RollbackCheckpoint {
 
     /// Framebuffer contents (RGB, aux). `None` when running headless.
     framebuffers: Option<(Vec<u32>, Vec<u32>)>,
+    #[cfg(all(test, feature = "wgpu"))]
+    resident_head1_framebuffers: Option<(Vec<u32>, Vec<u32>)>,
 
     /// Parsed device save_state TOMLs. Holding `toml::Value` directly skips
     /// the ~80 ms cpu.toml string-parse cost on every rollback.
@@ -269,6 +274,8 @@ pub(crate) fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> 
 pub(crate) struct LiveCheckpoint {
     bank_words: [Vec<u32>; 4],
     framebuffers: Option<(Vec<u32>, Vec<u32>)>,
+    #[cfg(all(test, feature = "wgpu"))]
+    resident_head1_framebuffers: Option<(Vec<u32>, Vec<u32>)>,
     cpu: toml::Value,
     mc: toml::Value,
     ioc: toml::Value,
@@ -1055,12 +1062,17 @@ impl Machine {
         } else {
             self.display_resolution
         };
-        if let Some(rex3) = &self.board.rex3 {
+        let apply = |rex3: &Rex3| {
+            #[cfg(all(test, feature = "wgpu"))]
+            if rex3.resident_active() {
+                rex3.apply_resident_display_resolution(mode, true)
+                    .unwrap_or_else(|error| panic!("REX3 {error}"));
+                return;
+            }
             rex3.apply_display_resolution(mode);
-        }
-        if let Some(rex3) = &self.board.rex3_head1 {
-            rex3.apply_display_resolution(mode);
-        }
+        };
+        if let Some(rex3) = &self.board.rex3 { apply(rex3); }
+        if let Some(rex3) = &self.board.rex3_head1 { apply(rex3); }
     }
 
     /// Path of the configured scratch SCSI volume, if any. Used by the CI
@@ -1516,10 +1528,53 @@ impl Machine {
         result
     }
 
+    #[cfg(all(test, feature = "wgpu"))]
+    fn capture_resident_checkpoint(rex: Option<&Rex3>) -> Result<Option<ResidentCheckpoint>, String> {
+        rex.filter(|rex| rex.resident_active())
+            .map(|rex| rex.snapshot_resident_checkpoint().map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn validate_resident_primary_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
+        if self.board.rex3.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
+            return Err("resident REX3 checkpoint requires registers and both planes".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn validate_resident_head1_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
+        if self.board.rex3_head1.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
+            return Err("resident REX3 head 1 checkpoint requires registers and both planes".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn restore_resident_head1_framebuffers(
+        &self,
+        has_registers: bool,
+        planes: Option<&(Vec<u32>, Vec<u32>)>,
+    ) -> Result<(), String> {
+        if let Some(rex) = self.board.rex3_head1.as_ref().filter(|rex| rex.resident_active()) {
+            if !has_registers {
+                return Err("resident REX3 head 1 checkpoint has no registers".into());
+            }
+            let (rgb, aux) = planes.ok_or("resident REX3 head 1 checkpoint has no planes")?;
+            rex.restore_framebuffers_inmem(rgb, aux);
+        }
+        Ok(())
+    }
+
     /// Capture in-memory state for fast rollback. Stops the CPU briefly.
     fn capture_rollback_checkpoint(&mut self, name: &str) -> Result<RollbackCheckpoint, String> {
         self.stop();
 
+        #[cfg(all(test, feature = "wgpu"))]
+        let resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())?;
+        #[cfg(all(test, feature = "wgpu"))]
+        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())?;
         let cpu = self.cpu.save_state();
         let mc = self.mc.save_state();
         let ioc = self.hpc3.ioc().save_state();
@@ -1532,8 +1587,16 @@ impl Machine {
         let scsi1 = self.hpc3.scsi1().map(|dev| dev.save_state());
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| {
+            #[cfg(all(test, feature = "wgpu"))]
+            if let Some((state, _)) = &resident_primary { return state.clone(); }
+            r.save_state()
+        });
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| {
+            #[cfg(all(test, feature = "wgpu"))]
+            if let Some((state, _)) = &resident_head1 { return state.clone(); }
+            r.save_state()
+        });
 
         let bank_words: [Vec<u32>; 4] = [
             self.board.phys.snapshot_bank_inmem(0),
@@ -1542,8 +1605,15 @@ impl Machine {
             self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self.board.rex3.as_ref()
-            .map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(all(test, feature = "wgpu"))]
+        let framebuffers = match resident_primary {
+            Some((_, planes)) => Some(planes),
+            None => self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem()),
+        };
+        #[cfg(not(all(test, feature = "wgpu")))]
+        let framebuffers = self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(all(test, feature = "wgpu"))]
+        let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
 
         // Re-read cow.toml (and cow1.toml, for controller 1) so rollback
         // knows which dirty sectors to import back. The files were just
@@ -1563,6 +1633,8 @@ impl Machine {
             overlay_sets1,
             bank_words,
             framebuffers,
+            #[cfg(all(test, feature = "wgpu"))]
+            resident_head1_framebuffers,
             cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, scsi1, seeq, hpc3, rex3, rex3_head1,
         })
     }
@@ -1571,6 +1643,10 @@ impl Machine {
     /// the moment of capture. Skips disk IO and TOML string-parsing.
     fn apply_rollback_checkpoint(&mut self, cp: &RollbackCheckpoint) -> Result<(), String> {
         self.stop();
+        #[cfg(all(test, feature = "wgpu"))]
+        self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
+        #[cfg(all(test, feature = "wgpu"))]
+        self.validate_resident_head1_checkpoint(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.is_some())?;
         self.power_on_devices();
 
         self.cpu.load_state(&cp.cpu)?;
@@ -1600,6 +1676,8 @@ impl Machine {
         if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
             rex3.restore_framebuffers_inmem(rgb, aux);
         }
+        #[cfg(all(test, feature = "wgpu"))]
+        self.restore_resident_head1_framebuffers(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.as_ref())?;
 
         // Reflink the overlay back into place. saves/<name>/scsi*.overlay is
         // unchanged by guest writes (writes go to the live overlay), so this
@@ -1631,6 +1709,12 @@ impl Machine {
     pub(crate) fn capture_live_checkpoint(&mut self) -> LiveCheckpoint {
         self.stop();
 
+        #[cfg(all(test, feature = "wgpu"))]
+        let resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())
+            .unwrap_or_else(|error| panic!("REX3 {error}"));
+        #[cfg(all(test, feature = "wgpu"))]
+        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())
+            .unwrap_or_else(|error| panic!("REX3 {error}"));
         let cpu = self.cpu.save_state();
         let mc = self.mc.save_state();
         let ioc = self.hpc3.ioc().save_state();
@@ -1641,8 +1725,16 @@ impl Machine {
         let eeprom = self.hpc3.eeprom().lock().save_state_owned();
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| {
+            #[cfg(all(test, feature = "wgpu"))]
+            if let Some((state, _)) = &resident_primary { return state.clone(); }
+            r.save_state()
+        });
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| {
+            #[cfg(all(test, feature = "wgpu"))]
+            if let Some((state, _)) = &resident_head1 { return state.clone(); }
+            r.save_state()
+        });
 
         let bank_words: [Vec<u32>; 4] = [
             self.board.phys.snapshot_bank_inmem(0),
@@ -1651,8 +1743,15 @@ impl Machine {
             self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self.board.rex3.as_ref()
-            .map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(all(test, feature = "wgpu"))]
+        let framebuffers = match resident_primary {
+            Some((_, planes)) => Some(planes),
+            None => self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem()),
+        };
+        #[cfg(not(all(test, feature = "wgpu")))]
+        let framebuffers = self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(all(test, feature = "wgpu"))]
+        let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
 
         // Deliberately NOT restart_peripherals()/cpu.start() here — see this
         // function's own doc comment.
@@ -1660,6 +1759,8 @@ impl Machine {
         LiveCheckpoint {
             bank_words,
             framebuffers,
+            #[cfg(all(test, feature = "wgpu"))]
+            resident_head1_framebuffers,
             cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, rex3, rex3_head1,
         }
     }
@@ -1679,6 +1780,10 @@ impl Machine {
     /// stayed unresponsive after every `jitcheck` for no reason).
     pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
         self.stop();
+        #[cfg(all(test, feature = "wgpu"))]
+        self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
+        #[cfg(all(test, feature = "wgpu"))]
+        self.validate_resident_head1_checkpoint(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.is_some())?;
 
         self.cpu.load_state(&cp.cpu)?;
         self.mc.load_state(&cp.mc)?;
@@ -1703,6 +1808,8 @@ impl Machine {
         if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
             rex3.restore_framebuffers_inmem(rgb, aux);
         }
+        #[cfg(all(test, feature = "wgpu"))]
+        self.restore_resident_head1_framebuffers(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.as_ref())?;
 
         // Peripherals back up; CPU deliberately left stopped — see this
         // function's own doc comment.
@@ -1781,9 +1888,24 @@ impl Machine {
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
         self.stop();
 
+        #[cfg(all(test, feature = "wgpu"))]
+        let mut resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())?;
+        #[cfg(all(test, feature = "wgpu"))]
+        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())?;
         let dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&dir);
         snap.ensure_dir().map_err(|e| e.to_string())?;
+        #[cfg(all(test, feature = "wgpu"))]
+        let incomplete = dir.join("resident_snapshot_incomplete");
+        #[cfg(all(test, feature = "wgpu"))]
+        let remove_incomplete = {
+            let resident = resident_primary.is_some() || resident_head1.is_some();
+            if resident {
+                std::fs::write(&incomplete, b"resident machine snapshot is incomplete\n")
+                    .map_err(|e| e.to_string())?;
+            }
+            resident || incomplete.try_exists().map_err(|e| e.to_string())?
+        };
 
         // Write the manifest first so `read_manifest` succeeds even if a later
         // step crashes — the partial snapshot is at least diagnosable.
@@ -1822,8 +1944,23 @@ impl Machine {
         // included in the chunks manifest below for v3+; v2 wrote them as
         // standalone .bin files.
         if let Some(rex3) = &self.board.rex3 {
-            snap.write_state("rex3", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
+            #[cfg(all(test, feature = "wgpu"))]
+            let resident_state = resident_primary.as_ref().map(|(state, _)| state);
+            #[cfg(not(all(test, feature = "wgpu")))]
+            let resident_state: Option<&toml::Value> = None;
+            match resident_state {
+                Some(state) => snap.write_state("rex3", state, sv),
+                None => snap.write_state("rex3", &rex3.save_state(), sv),
+            }.map_err(|e| e.to_string())?;
             if sv < 3 {
+                #[cfg(all(test, feature = "wgpu"))]
+                if let Some((_, (rgb, aux))) = &resident_primary {
+                    Rex3::write_captured_resident_framebuffers(&snap.dir, "rex3", rgb, aux)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+                }
+                #[cfg(not(all(test, feature = "wgpu")))]
                 rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
@@ -1831,9 +1968,30 @@ impl Machine {
             snap.write_state("testdev", &td.save_state(), sv).map_err(|e| e.to_string())?;
         }
         if let Some(rex3) = &self.board.rex3_head1 {
-            snap.write_state("rex3_head1", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
-            if sv < 3 {
+            #[cfg(all(test, feature = "wgpu"))]
+            let resident_state = resident_head1.as_ref().map(|(state, _)| state);
+            #[cfg(not(all(test, feature = "wgpu")))]
+            let resident_state: Option<&toml::Value> = None;
+            match resident_state {
+                Some(state) => snap.write_state("rex3_head1", state, sv),
+                None => snap.write_state("rex3_head1", &rex3.save_state(), sv),
+            }.map_err(|e| e.to_string())?;
+            // The v3 chunk manifest covers only the primary head. Keep the
+            // gated second head in the existing named-plane format.
+            #[cfg(all(test, feature = "wgpu"))]
+            let save_planes = sv < 3 || rex3.resident_active();
+            #[cfg(not(all(test, feature = "wgpu")))]
+            let save_planes = sv < 3;
+            if save_planes {
                 let dir = &snap.dir;
+                #[cfg(all(test, feature = "wgpu"))]
+                if let Some((_, (rgb, aux))) = &resident_head1 {
+                    Rex3::write_captured_resident_framebuffers(dir, "rex3_head1", rgb, aux)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
+                }
+                #[cfg(not(all(test, feature = "wgpu")))]
                 rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
             }
         }
@@ -1857,7 +2015,11 @@ impl Machine {
                     .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
             }
             if let Some(rex3) = &self.board.rex3 {
-                let (rgb, aux) = rex3.snapshot_framebuffers_inmem();
+                #[cfg(all(test, feature = "wgpu"))]
+                let planes = resident_primary.take().map(|(_, planes)| planes);
+                #[cfg(not(all(test, feature = "wgpu")))]
+                let planes: Option<(Vec<u32>, Vec<u32>)> = None;
+                let (rgb, aux) = planes.unwrap_or_else(|| rex3.snapshot_framebuffers_inmem());
                 let rgb_chunks = put_words_as_chunks(&store, &rgb)
                     .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
                 let aux_chunks = put_words_as_chunks(&store, &aux)
@@ -1889,6 +2051,15 @@ impl Machine {
                 .map_err(|e| e.to_string())?;
         }
 
+        #[cfg(all(test, feature = "wgpu"))]
+        if remove_incomplete {
+            for rex3 in [self.board.rex3.as_ref(), self.board.rex3_head1.as_ref()].into_iter().flatten() {
+                if rex3.resident_active() {
+                    rex3.resident_status().map_err(|error| error.to_string())?;
+                }
+            }
+            std::fs::remove_file(incomplete).map_err(|e| e.to_string())?;
+        }
         self.restart_peripherals();
         // Resume execution so the session feels like it never paused.
         // Without this the user sees JIT shutdown stats and a dead prompt
@@ -1934,6 +2105,12 @@ impl Machine {
     fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
         self.stop();
 
+        let dir = std::path::PathBuf::from("saves").join(name);
+        #[cfg(all(test, feature = "wgpu"))]
+        if dir.join("resident_snapshot_incomplete").try_exists().map_err(|e| e.to_string())? {
+            return Err("resident machine snapshot is incomplete".into());
+        }
+
         // Any prior in-memory rollback checkpoint is now stale (it described
         // a different snapshot). ci_restore will recapture if reached via
         // that path; the monitor `load` command leaves it cleared.
@@ -1942,7 +2119,6 @@ impl Machine {
         // Reset to clean state before loading
         self.power_on_devices();
 
-        let dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&dir);
 
         // Validate the manifest before reading anything else. Legacy snapshots
@@ -2101,9 +2277,20 @@ impl Machine {
             }
         }
         if let Some(rex3) = &self.board.rex3_head1 {
-            if let Ok(rex3_v) = snap.read_state("rex3_head1", schema_version) {
+            let head1_state = snap.read_state("rex3_head1", schema_version);
+            #[cfg(all(test, feature = "wgpu"))]
+            if rex3.resident_active() {
+                if let Err(error) = &head1_state {
+                    return Err(format!("resident REX3 head 1 state: {error}"));
+                }
+            }
+            if let Ok(rex3_v) = head1_state {
                 rex3.load_state(&rex3_v)?;
-                if schema_version < 3 {
+                #[cfg(all(test, feature = "wgpu"))]
+                let load_planes = schema_version < 3 || rex3.resident_active();
+                #[cfg(not(all(test, feature = "wgpu")))]
+                let load_planes = schema_version < 3;
+                if load_planes {
                     rex3.load_framebuffers_named(&snap.dir, "rex3_head1").map_err(|e| e.to_string())?;
                 }
             }
@@ -2125,6 +2312,8 @@ impl Machine {
             let store = ChunkStore::new("saves");
             let chunks = snap.read_chunks_manifest()
                 .map_err(|e| format!("read chunks.bin: {}", e))?;
+            #[cfg(all(test, feature = "wgpu"))]
+            self.validate_resident_primary_checkpoint(true, chunks.framebuffer_chunks.is_some())?;
             for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
                 if hashes.is_empty() { continue; }
                 let words = get_chunks_as_words(&store, hashes)

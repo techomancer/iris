@@ -138,8 +138,13 @@ impl ResidentFrameControl {
         self.captured.store(true, Ordering::Release);
     }
 
-    fn invalidate(&self) {
+    pub(super) fn invalidate(&self) {
         self.captured.store(false, Ordering::Release);
+    }
+
+    pub(super) fn quiescent(&self) -> bool {
+        let Some(_serial) = self.serial.try_lock() else { return false; };
+        self.marker.lock().active.is_none()
     }
 
     fn capture_count(&self, mode: ResidentDisplayMode) -> CaptureCount {
@@ -318,14 +323,24 @@ impl Rex3 {
         gpu: Arc<Gpu>,
         mode: ResidentDisplayMode,
     ) -> Result<(), ResidentError> {
+        let _lifecycle = self.resident_lifecycle.write();
         if !self.running.load(Ordering::Acquire) {
             return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
         }
+        self.check_resident_health(false)?;
         let mut thread_slot = self.refresh_thread.lock();
         if thread_slot.is_some() {
             return Err(ResidentError::InvalidState("resident display already started"));
         }
-        let mut display = ResidentDisplay::new(self, &gpu, mode)?;
+        let mut display = match ResidentDisplay::new(self, &gpu, mode) {
+            Ok(display) => display,
+            Err(error) => {
+                if matches!(error, ResidentError::DeviceLost(_) | ResidentError::Failed(_)) {
+                    self.fail_resident(error.clone());
+                }
+                return Err(error);
+            }
+        };
         if !self.running.load(Ordering::Acquire) {
             return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
         }
@@ -335,8 +350,15 @@ impl Rex3 {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| display.run(rex))).is_err() {
                     rex.fail_resident(ResidentError::Failed("resident display worker panicked".into()));
                 }
-            })
-            .map_err(|error| ResidentError::Failed(format!("start resident display: {error}")))?;
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                let error = ResidentError::Failed(format!("start resident display: {error}"));
+                self.fail_resident(error.clone());
+                return Err(error);
+            }
+        };
         *thread_slot = Some(handle);
         Ok(())
     }
@@ -939,6 +961,14 @@ mod tests {
             });
             rex.running.store(false, Ordering::Release);
             rex.gfifo.reset();
+            assert!(rex.snapshot_resident_registers().is_ok());
+            let serial = rex.resident_frame.serial.lock();
+            assert!(rex.snapshot_resident_registers().is_err());
+            drop(serial);
+            rex.resident_frame.marker.lock().active = Some(Marker { id: 1, reached: None });
+            assert!(rex.snapshot_resident_registers().is_err());
+            rex.resident_frame.marker.lock().active = None;
+            assert!(rex.snapshot_resident_registers().is_ok());
         }).unwrap().join().unwrap();
     }
 

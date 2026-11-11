@@ -66,7 +66,7 @@ function Invoke-ResidentTests {
 }
 
 try {
-    Invoke-ResidentTests 'resident_' 28 $false
+    Invoke-ResidentTests 'resident_' 36 $false
     Invoke-ResidentTests 'dev::ng1::rex3_flat_fill::tests' 4 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::line::tests' 2 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::host::tests' 2 $false
@@ -78,8 +78,8 @@ try {
     Invoke-ResidentTests 'direct_ng1_scanout_' 3 $false
     foreach ($name in $requestedBackends) {
         $env:REX3_RESIDENT_BACKEND = $name
-        Invoke-ResidentTests 'resident_gpu_' 19 $true
-        Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 9 $true
+        Invoke-ResidentTests 'resident_gpu_' 21 $true
+        Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 10 $true
     }
 } finally {
     [Environment]::SetEnvironmentVariable('REX3_RESIDENT_BACKEND', $previousBackend, 'Process')
