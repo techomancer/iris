@@ -1324,7 +1324,19 @@ impl KonaBackend {
                             if !raster::ops::Ownership::encode(a[9] as i32).1 {
                                 self.gl.counts.odd_window_ids += 1;
                             }
-                            self.contexts.select(port.context()).gl.place([signed(a[0]), signed(a[1])], clip, a[9], shown, a[10] != 0)
+                            // An index window's words are indices where the scan-out reads them: the entry's
+                            // index width says where (see `Tables::window`).
+                            let shift = match (a[9] as usize) < display::tables::IDS {
+                                true => match self.tables.lock().snapshot().window(a[9] as usize) {
+                                    display::tables::Window::Index8 { .. } => Some(8),
+                                    display::tables::Window::Index12 { .. } => Some(4),
+                                    _ => None,
+                                },
+                                false => None,
+                            };
+                            let gl = &mut self.contexts.select(port.context()).gl;
+                            gl.place([signed(a[0]), signed(a[1])], clip, a[9], shown, a[10] != 0);
+                            gl.set_index_window(shift);
                         }
                     }
                     (WINDOW_READ_CLIP_SET_UP, a) if a.len() == 3 => self.contexts.select(port.context()).gl.move_to(a[0] as u16 as i16 as i32, a[1] as u16 as i16 as i32),

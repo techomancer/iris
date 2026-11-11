@@ -221,6 +221,13 @@ fn strips_fans_quads_and_polygons_are_assembled() {
     assert_eq!(r.tris.len(), 2, "a quad is a fan of two triangles");
     assert!(r.tris.iter().all(|t| t[0] == r.tris[0][0]), "from its first vertex");
     r.tris.clear();
+    // The rectangle begin carries a mask word and then four vertices, as a quad does (read from a
+    // client's stream): it is not a begin that takes the vertices as strays.
+    r.cmd(BEGIN_PRIMITIVE_RECTANGLE, &[0xe]);
+    sq.iter().for_each(|&(x, y)| r.v(x, y));
+    r.end();
+    assert_eq!((r.tris.len(), r.path.counts.stray, r.path.counts.errors), (2, 0, 0), "a rectangle is a quad");
+    r.tris.clear();
     r.begin(BEGIN_PRIMITIVE_POLYGON);
     for (x, y) in [(0.0, 0.0), (0.5, 0.0), (0.7, 0.3), (0.5, 0.6), (0.0, 0.5)] {
         r.v(x, y);
@@ -759,9 +766,9 @@ fn a_clear_is_a_request_over_the_clip_rectangle() {
 #[test]
 fn what_is_not_taken_is_counted() {
     let mut r = Rig::new();
-    r.cmd(SET_CURRENT_COLOUR_INDEX_DOUBLE, &[0; 2]);
+    r.cmd(SET_COLOUR_INDEX_WRITE_MASK, &[0xff0]);
     r.cmd(SET_LIGHT_PARAMETER_FLOAT_FORM, &[gl::LIGHT0, 0x9999, 0, 0, 0, 0]);
-    assert_eq!(r.path.counts.unmodelled.get(&0x72), Some(&1));
+    assert_eq!(r.path.counts.unmodelled.get(&0x23), Some(&1));
     assert_eq!(r.path.counts.unmodelled.get(&0x7), Some(&1));
     r.v(0.0, 0.0);
     assert_eq!((r.path.counts.stray, r.tris.len()), (1, 0));
@@ -1194,4 +1201,37 @@ fn a_rectangle_fills_the_pixels_its_corners_enclose() {
     assert!(rect.iter().all(|&(x, y)| (25..75).contains(&x) && (37..63).contains(&y)));
     let (quad, _) = run(BEGIN_PRIMITIVE_INDEPENDENT_QUADS, 0);
     assert_eq!(rect, quad, "the same fill as a quad on the four corners");
+}
+
+/// In a colour-index window the vertices carry the current index as the colour whose word is the
+/// index at the window's shift, whatever colour was set, and lighting does not change it.
+#[test]
+fn a_colour_index_window_gives_its_vertices_the_index() {
+    let mut r = Rig::new();
+    r.gl.set_index_window(Some(4));
+    r.colour(1.0, 0.0, 0.0);
+    r.cmd(SET_CURRENT_COLOUR_INDEX_SIGNED_SHORT, &[0x0123 << 16]);
+    assert_eq!(r.gl.index, 291.0);
+    r.triangle([(-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)]);
+    assert_eq!(r.tris.len(), 1);
+    let word = |c: [u16; 4]| {
+        let byte = |v: u16| ((v as f32 / vertex::COLOUR_MAX) * 255.0 + 0.5) as u32;
+        byte(c[3]) << 24 | byte(c[0]) << 16 | byte(c[1]) << 8 | byte(c[2])
+    };
+    assert_eq!(word(r.tris[0][0].c), 0x123 << 4, "index 0x123 at shift 4, not the red colour");
+    // An 8-bit window reads the top byte; the index is cut to the width.
+    r.tris.clear();
+    r.gl.set_index_window(Some(8));
+    r.cmd(SET_CURRENT_COLOUR_INDEX_SIGNED_32_BIT_INTEGER, &[0x1ff]);
+    r.triangle([(-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)]);
+    assert_eq!(word(r.tris[0][0].c), 0xff << 8);
+    // The state the index word must not be altered by is off for the draw.
+    r.cmd(ENABLE_CAPABILITY, &[gl::BLEND]);
+    r.cmd(ENABLE_CAPABILITY, &[gl::DITHER]);
+    r.triangle([(-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)]);
+    let ds = r.states.last().expect("a triangle was made");
+    assert!(!ds.blend.enabled && !ds.dither, "no blending or dither of an index");
+    r.gl.set_index_window(None);
+    r.triangle([(-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)]);
+    assert!(r.states.last().expect("made").blend.enabled, "a colour window blends again");
 }
