@@ -933,6 +933,24 @@ fn pci_interrupts_reach_the_input_of_their_device() {
     assert_eq!(r.r64(0x100) & (1 << 6), 1 << 6);
 }
 
+/// A function at an even device number behind a PCI-to-PCI bridge has its
+/// INTA carried to the bridge's INTC by the bridge's rotation, and INTC is
+/// wired to the same input as the bridge slot's INTA.
+#[test]
+fn a_function_behind_a_bridge_reaches_the_input_of_the_bridges_device() {
+    use crate::pci::{DevFn, PciToPciBridge};
+    let r = rig();
+    let ppb = PciToPciBridge::new(r.pic.bus(0), DevFn { device: 2, function: 0 }, 0x104c, 0xac28);
+    r.pic.attach(0, 2, ppb.clone(), Function::default());
+    let behind = Card::new(0x7203);
+    ppb.secondary().attach(DevFn { device: 2, function: 0 }, behind.clone());
+    r.w64(0x130 + 8, destination(0x31));
+    r.w64(0x108, 1 << 1);
+    behind.raise(true);
+    assert_eq!(r.r64(0x100), 1 << 1, "bridge at device 2 is input 1, by INTA or INTC");
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x131)]);
+}
+
 /// Force-always (0x180 + 8n) sends input n's set packet on any write,
 /// whether the input is active or not and whether it was sent before. The
 /// status bit follows the input, not the force.

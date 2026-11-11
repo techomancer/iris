@@ -46,9 +46,21 @@
 //! - The PCI devices at 1 to 4 and the revisions of the IOC4 (0x53), the
 //!   ISP12160 (6) and the BCM5701 (0x15) are as Tezro and Origin 350
 //!   consoles print them (established for those captures). Device d's INTA
-//!   reaching PIC input d - 1 is what IRIX's pin rule assigns and what an
-//!   Origin 350 under OpenBSD reports (established as software
-//!   expectation); the board wiring itself, and INTB to INTD, are unknown.
+//!   and INTC reaching PIC input d - 1 is what IRIX's pin rule assigns, and
+//!   INTA is what an Origin 350 under OpenBSD reports (established as
+//!   software expectation); the board wiring itself, and INTB and INTD, are
+//!   unknown.
+//! - The audio controller, off unless `[tezro] audio` adds it, is the
+//!   ICE1724 with the DM8's converters and configuration EEPROM, at device 2
+//!   of the TI bridge's secondary bus ([`AUDIO_DEVICE`]). Where it sits is
+//!   inferred by exclusion from the IRIX hardware listings of Tezro towers,
+//!   which print `1412:1724` at device 2 beside the bridge; what the
+//!   Tezro's board carries for converters, subsystem IDs and EEPROM is unknown,
+//!   so it takes the one board design with a documented recipe, a stated
+//!   model choice and not Tezro evidence. Its INTA is
+//!   rotated by the bridge to INTC of the bridge's slot and reaches PIC
+//!   input 1; whether the board wires it so is unknown, and the controller
+//!   masks every source at reset.
 //! - The one-processor board has one PIC. The tower guide gives that board
 //!   two PCI-X buses and one XIO connector; that it is one PIC at widget 15
 //!   is inferred from them.
@@ -84,7 +96,7 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
-use crate::config::{scsi_label, GraphicsBoard, MachineConfig, TezroConsole};
+use crate::config::{scsi_label, AudioConfig, GraphicsBoard, MachineConfig, TezroConsole};
 use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
 use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
@@ -94,6 +106,7 @@ use crate::cpu::smp::World;
 use crate::dev::bcm5701::{Bcm5701, Bcm5701Config};
 use crate::dev::bedrock::{Bedrock, Population, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
+use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ds1744::{Ds1744, YearBase};
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
@@ -148,13 +161,17 @@ const ETH_DEVICE: u8 = 4;
 /// The TI PCI2050 PCI-to-PCI bridge every Tezro capture that prints widget
 /// 15 shows at its device 2 (`104c:ac28`, revision 1; established for those
 /// captures, and absent from every Origin 350 and Onyx 350 IO9 capture
-/// found, for a reason not known). No capture shows anything behind it, so
-/// its secondary bus is empty (inferred). Only the type 1 header is
-/// modelled, not the chip's own registers or capability list.
+/// found, for a reason not known). Its secondary bus is empty unless the
+/// audio controller is added (see [`AUDIO_DEVICE`]). Only the type 1 header
+/// is modelled, not the chip's own registers or capability list.
 const TI_BRIDGE_DEVICE: u8 = 2;
 const TI_BRIDGE_VENDOR: u16 = 0x104c;
 const TI_BRIDGE_ID: u16 = 0xac28;
 const TI_BRIDGE_REVISION: u8 = 1;
+/// The audio controller's device number on the TI bridge's secondary bus:
+/// inferred (the listings print `1412:1724` at "slot 2" beside the bridge,
+/// and the slot of a function behind a bridge is its device number there).
+const AUDIO_DEVICE: u8 = 2;
 
 /// A DIMM size the Tezro's IP53 board takes, which is also the size of each
 /// locational bank it provides: each DIMM pair provides two banks of the
@@ -526,9 +543,18 @@ impl TezroMachine {
             v12: cfg.graphics_board() == GraphicsBoard::V12,
             graphics_pool: (cfg.graphics.threads, cfg.graphics.tile),
             graphics_raster: (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
+            audio: match (cfg.tezro.audio, cfg.no_audio) {
+                (false, _) => TezroAudio::Absent,
+                (true, true) => TezroAudio::Silent,
+                (true, false) => TezroAudio::Host(cfg.audio.clone()),
+            },
         })?);
         let timers = Arc::new(TimerManager::new());
         board.ioc4.set_timer_manager(timers.clone());
+        if let Some(audio) = &board.audio {
+            audio.set_timer_manager(timers.clone());
+            audio.register_locks();
+        }
         let count_hz = cfg.clock.fixed_mhz.map_or(chip.chip.count_hz(), |mhz| (mhz * 1_000_000.0) as u64).max(1);
         let cpus = build_cpus(&board, &timers, count_hz);
         let cpu = cpus[0].clone();
@@ -929,6 +955,25 @@ pub(crate) struct TezroBoardConfig<'a> {
     pub graphics_pool: (usize, u32),
     /// Which unit draws and, for the GPU, the wgpu backend (`[graphics]`).
     pub graphics_raster: (crate::config::RasterUnit, &'a str),
+    /// The audio controller behind the TI bridge.
+    pub audio: TezroAudio,
+}
+
+/// Said at startup and by `--validate` when the audio card is added with
+/// `no_audio` set: the guest sees the card and nothing is played.
+pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
+    "[tezro] audio is set but no_audio is too: the audio card is added and plays to nowhere";
+
+/// Whether the audio controller is present, and whether it plays to the host.
+#[derive(Default)]
+pub(crate) enum TezroAudio {
+    /// Absent: the bridge's secondary bus is empty.
+    #[default]
+    Absent,
+    /// Present, with no host output.
+    Silent,
+    /// Present, playing to the host as `[audio]` says.
+    Host(AudioConfig),
 }
 
 /// The Tezro's devices around its Bedrock node.
@@ -959,6 +1004,8 @@ pub(crate) struct TezroBoard {
     pub ioc4: Arc<Ioc4>,
     pub scsi: Arc<Isp12160>,
     pub eth: Arc<Bcm5701>,
+    /// The audio controller behind the TI bridge, when present.
+    pub audio: Option<Arc<Ice1724>>,
     pub timekeeper: Arc<Ds1744>,
     pub serial: [Arc<CiSerialBackend>; SERIAL_PORTS],
     /// The R16000 chip fitted, whose flash record the node holds.
@@ -980,7 +1027,8 @@ pub(crate) struct TezroBoard {
 impl TezroBoard {
     /// The board's devices that take monitor commands: the physical map, the
     /// L1, the SCSI controller, the keyboard and mouse (`ps2 type` and
-    /// friends) and, when one is fitted, the VPro (`vpro ...`).
+    /// friends) and, when one is present, the VPro (`vpro ...`) and the audio
+    /// controller (`ice1724 status`).
     pub fn monitor_devices(&self) -> Vec<Arc<dyn Device>> {
         let mut devices: Vec<Arc<dyn Device>> = vec![
             self.bedrock.physical().clone(),
@@ -990,6 +1038,9 @@ impl TezroBoard {
         ];
         if let Some(v12) = &self.v12 {
             devices.push(v12.clone());
+        }
+        if let Some(audio) = &self.audio {
+            devices.push(audio.clone());
         }
         devices
     }
@@ -1014,11 +1065,12 @@ impl TezroBoard {
             v12: false,
             graphics_pool: (2, 32),
             graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+            audio: TezroAudio::Absent,
         })
     }
 
     pub fn with_config(config: TezroBoardConfig<'_>) -> Result<Self, String> {
-        let TezroBoardConfig { payload, clock, flash_path, station_mac, system_serial, timekeeper, memory, cpus, chip, v12, graphics_pool, graphics_raster } = config;
+        let TezroBoardConfig { payload, clock, flash_path, station_mac, system_serial, timekeeper, memory, cpus, chip, v12, graphics_pool, graphics_raster, audio } = config;
         if ![1, 2, 4].contains(&cpus) {
             return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
         }
@@ -1097,14 +1149,27 @@ impl TezroBoard {
         // The Ethernet slot drives REQ64#, which the chip samples as reset ends.
         let eth = Bcm5701::new(Bcm5701Config { req64: true, ..Bcm5701Config::new(l1.station_mac()) })?;
         io9.attach(0, IOC4_DEVICE, ioc4.clone(), Function { self_ordered_pio: true, req64: false });
-        let ti = PciToPciBridge::with_revision(
+        let ti = PciToPciBridge::with_wide_windows(
             io9.bus(0),
             DevFn { device: TI_BRIDGE_DEVICE, function: 0 },
             TI_BRIDGE_VENDOR,
             TI_BRIDGE_ID,
             TI_BRIDGE_REVISION,
         );
-        io9.attach(0, TI_BRIDGE_DEVICE, ti, Function::default());
+        io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
+        let audio = match audio {
+            TezroAudio::Absent => None,
+            on => {
+                let card = Arc::new(Ice1724::new(Variant::Dm8));
+                if let TezroAudio::Host(host) = on {
+                    card.enable_output(host);
+                } else {
+                    eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
+                }
+                ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
+                Some(card)
+            }
+        };
         io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
         io9.attach(0, ETH_DEVICE, eth.clone(), Function { self_ordered_pio: false, req64: true });
         Ok(Self {
@@ -1123,6 +1188,7 @@ impl TezroBoard {
             ioc4,
             scsi,
             eth,
+            audio,
             timekeeper,
             serial,
             chip,
@@ -1174,6 +1240,9 @@ impl TezroBoard {
         self.ioc4.start();
         self.eth.start();
         self.scsi.start();
+        if let Some(audio) = &self.audio {
+            audio.start();
+        }
     }
 
     /// The boot flash's command timing, on CPU 0's batch boundary.
@@ -1191,6 +1260,9 @@ impl TezroBoard {
             v12.stop();
         }
         self.running.store(false, Ordering::Release);
+        if let Some(audio) = &self.audio {
+            audio.stop();
+        }
         self.scsi.stop();
         self.eth.stop();
         self.ioc4.stop();

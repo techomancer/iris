@@ -40,7 +40,8 @@ fn missing_parent(what: &str, path: &str, problems: &mut Vec<String>) {
 }
 
 /// What the machine would warn about and carry on: a PROM file named by
-/// `prom` that is not there, on a machine with a built-in one.
+/// `prom` that is not there, on a machine with a built-in one, and the
+/// Tezro's audio card added with `no_audio` set.
 pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     if cfg.machine.profile.has_embedded_prom() && cfg.prom != DEFAULT_PROM {
@@ -48,6 +49,9 @@ pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
         for w in &mut warnings {
             w.push_str("; the built-in PROM would run");
         }
+    }
+    if cfg.machine.profile == MachineProfile::TezroIp53 && cfg.tezro.audio && cfg.no_audio {
+        warnings.push(crate::ip53_machine::AUDIO_WITH_NO_AUDIO.to_string());
     }
     warnings
 }
@@ -257,6 +261,20 @@ mod tests {
         cfg.banks = banks_from4([128, 0, 0, 0]);
         assert!(warnings(&cfg).is_empty());
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")));
+    }
+
+    /// The Tezro's audio card with `no_audio` set is present and silent; that
+    /// is worth saying, and not an error.
+    #[test]
+    fn the_tezro_audio_card_with_no_audio_is_a_warning() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::TezroIp53;
+        cfg.tezro.audio = true;
+        assert!(warnings(&cfg).is_empty());
+        cfg.no_audio = true;
+        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")), "{:?}", warnings(&cfg));
+        cfg.tezro.audio = false;
+        assert!(warnings(&cfg).is_empty());
     }
 
     /// A scratch volume only needs its directory and an empty CD-ROM tray is

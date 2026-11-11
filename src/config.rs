@@ -2242,6 +2242,11 @@ pub struct TezroSection {
     pub serial_port_c: Option<u16>,
     #[serde(default)]
     pub serial_port_d: Option<u16>,
+    /// Add the audio controller (IC Ensemble ICE1724) behind the IO9's PCI
+    /// bridge. Off by default: the bridge's bus is then empty. `no_audio`
+    /// keeps the controller but gives it no host output.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 impl Default for TezroSection {
@@ -2253,6 +2258,7 @@ impl Default for TezroSection {
             l1_log: None,
             serial_port_c: None,
             serial_port_d: None,
+            audio: false,
         }
     }
 }
@@ -2266,6 +2272,7 @@ impl TezroSection {
             && self.l1_log.is_none()
             && self.serial_port_c.is_none()
             && self.serial_port_d.is_none()
+            && !self.audio
     }
 }
 
@@ -5561,6 +5568,18 @@ mod tezro_config_tests {
         cfg.set_cpu(&parts::R16000_700_EARLY);
         cfg.scsi.clear();
         cfg
+    }
+
+    /// The audio controller is off unless `[tezro] audio` adds it, and a
+    /// config that adds it is written back.
+    #[test]
+    fn tezro_audio_is_opt_in_and_survives_a_save() {
+        assert!(!tezro().tezro.audio);
+        let on = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\n[tezro]\naudio = true\n").unwrap();
+        assert!(on.tezro.audio && !on.tezro.is_default());
+        assert!(TezroSection::default().is_default());
+        let text = toml::to_string(&on).unwrap();
+        assert!(MachineConfig::parse_toml(&text).unwrap().tezro.audio, "{text}");
     }
 
     /// Left at the generic default, `banks` gives the Tezro its 4 GiB layout;

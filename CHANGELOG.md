@@ -43,6 +43,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   controllers do. The CD-ROM was reported with the disk's `IRIS EMULATED`
   product string.
 
+### Tezro: optional PCI audio
+
+- `[tezro] audio = true` adds an ICE1724 audio controller behind the IO9's PCI
+  bridge. It plays through `[audio]`, or silently with `no_audio`, and is off
+  by default. See the [Tezro guide](docs/tezro-ip53.md).
+
 ### Host audio
 
 - `[audio] file = "out.wav"` plays every machine's sound into a WAV file in

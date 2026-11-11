@@ -233,6 +233,7 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 | `l1_port` | `8882` | Host TCP port for the L1 console. |
 | `l1_log` | unset | Optional serial log path for L1 output when an IOC4 port is selected as console. |
 | `serial_port_c`, `serial_port_d` | `8883`, `8884` | Host TCP ports of IOC4 ports 2 and 3; ports 0 and 1 use `serial_port_a` and `serial_port_b`. |
+| `audio` | `false` | Add the ICE1724 audio controller on the IO9's PCI bridge. Off, the bridge's bus is empty. On, it plays to the host as `[audio]` sets, or silently with `no_audio`. See the [Tezro guide](docs/tezro-ip53.md). |
 
 The machine runs the 700 MHz R16000 (`r16000_700`, the default), or the 800, 900
 or 1000 MHz one (`r16000_800`, `r16000_900`, `r16000_1000`, with 4, 8 and 16 MiB

@@ -173,6 +173,7 @@ fn the_system_serial_moves_and_the_board_serial_stays() {
             v12: false,
             graphics_pool: (2, 32),
             graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+            audio: TezroAudio::Absent,
         })
         .unwrap()
     };
@@ -205,6 +206,7 @@ fn board_with_chip(cpus: usize, chip: &'static TezroChip) -> TezroBoard {
         v12: false,
         graphics_pool: (2, 32),
         graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        audio: TezroAudio::Absent,
     })
     .unwrap()
 }
@@ -259,6 +261,50 @@ fn the_io9_has_a_ti_bridge_with_an_empty_bus_at_device_2() {
             assert_eq!(behind.config_read(DevFn { device, function: 0 }, 0, 4), Some(u32::MAX), "device {device} behind the bridge");
         }
     }
+}
+
+/// With `[tezro] audio`, the ICE1724 answers at device 2 of the TI bridge's
+/// secondary bus and nowhere else on it, and its reset state is the DM8
+/// board's; without it the bus stays empty.
+#[test]
+fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on() {
+    let with_audio = |audio| {
+        TezroBoard::with_config(TezroBoardConfig {
+            payload: &[],
+            clock: Arc::new(|| 0),
+            flash_path: None,
+            station_mac: L1Config::default().mac,
+            system_serial: None,
+            timekeeper: Arc::new(Ds1744::new(YearBase::From(1968)).unwrap()),
+            memory: &MemoryPopulation::default(),
+            cpus: 1,
+            chip: &CHIPS[0],
+            v12: false,
+            graphics_pool: (2, 32),
+            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+            audio,
+        })
+        .unwrap()
+    };
+    let behind = |board: &TezroBoard| {
+        let io9 = board.pics.last().unwrap().bus(0);
+        assert!(io9.config_write(DevFn { device: TI_BRIDGE_DEVICE, function: 0 }, 0x18, 4, 0x0001_0100));
+        io9.find_bus(1).expect("the bridge's secondary bus")
+    };
+    let silent = with_audio(TezroAudio::Silent);
+    assert!(silent.audio.is_some());
+    let bus = behind(&silent);
+    for device in 0..32 {
+        let id = bus.config_read(DevFn { device, function: 0 }, 0, 4);
+        assert_eq!(id, Some(if device == AUDIO_DEVICE { 0x1724_1412 } else { u32::MAX }), "device {device}");
+    }
+    let at = DevFn { device: AUDIO_DEVICE, function: 0 };
+    assert_eq!(bus.config_read(at, 8, 4), Some(0x0401_0001), "an audio device, revision 1");
+    assert_eq!(bus.config_read(at, 0x2c, 4), Some(0x3630_1412), "the DM8 board's subsystem pair");
+    assert_eq!(bus.config_read(at, 0x3c, 4).map(|v| v >> 8 & 0xff), Some(1), "INTA");
+    let absent = with_audio(TezroAudio::Absent);
+    assert!(absent.audio.is_none());
+    assert_eq!(behind(&absent).config_read(at, 0, 4), Some(u32::MAX));
 }
 
 /// PIC DMA reaches memory through Bedrock IO in naturally aligned legs, and
@@ -412,6 +458,7 @@ fn board_with_clock(cpus: usize) -> (TezroBoard, Arc<AtomicU64>) {
         v12: false,
         graphics_pool: (2, 32),
         graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        audio: TezroAudio::Absent,
     })
     .unwrap();
     (board, now)
@@ -565,6 +612,7 @@ fn the_board_refuses_a_population_it_cannot_fit() {
         v12: false,
         graphics_pool: (2, 32),
         graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        audio: TezroAudio::Absent,
     });
     assert!(refused.err().is_some_and(|e| e.contains("fitted with 2, 4 processors only")));
 }
@@ -585,6 +633,7 @@ fn board_with(chip: &Part) -> TezroBoard {
         v12: false,
         graphics_pool: (2, 32),
         graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        audio: TezroAudio::Absent,
     })
     .unwrap()
 }
@@ -766,6 +815,7 @@ fn a_store_through_the_ioc4_nvram_window_reaches_the_nvram_file() {
             v12: false,
             graphics_pool: (2, 32),
             graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+            audio: TezroAudio::Absent,
         })
         .unwrap();
         // IOC4's BAR at PCI memory 0x200000, as the PROM maps it.
@@ -815,6 +865,7 @@ fn board_with_v12(cpus: usize) -> TezroBoard {
         v12: true,
         graphics_pool: (2, 32),
         graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
+        audio: TezroAudio::Absent,
     })
     .unwrap()
 }

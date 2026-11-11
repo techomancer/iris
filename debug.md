@@ -569,6 +569,7 @@ to learn the cursor's hotspot exactly.
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
 | `hal2 status` | HAL2 audio state |
+| `ice1724 status` | The Tezro's ICE1724 audio controller (`[tezro] audio`): frames each engine moved, converter writes, accesses nothing establishes |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000 these, `ps2 key` and `ps2 mouse` go to the I-brick's USB keyboard and mouse, and `ps2 status` still shows the unused PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |
@@ -617,7 +618,7 @@ Per-module logging; all of it needs a developer build to produce output.
 
 Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
 Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
-xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock hub module pci bridge heart nvme l1 usb`. `hub`
+xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock hub module pci bridge heart nvme l1 usb ice1724`. `hub`
 logs the SN0 Hub's unsupported register accesses and accesses to unfitted
 node memory. `module` logs the module controller's refused commands and
 protocol surprises (the Origin 200's ELSC and the Origin 2000 module's
@@ -633,7 +634,8 @@ interrupt vector raised or lowered. Mask categories: `pdma` —
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
 every module also takes `on`/`all`, `off`/`none` or a hex mask.
 `bedrock` covers the Fuel's devices on its Bedrock hub, `l1` its system
-controller and `usb` its USB host controller.
+controller and `usb` its USB host controller. `ice1724` logs the Tezro's audio
+controller's accesses and values nothing establishes.
 `IRIS_DEBUG_LOG` or `[debug] debug_log` set the same thing at startup.
 
 ### Performance and locks

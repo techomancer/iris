@@ -316,25 +316,27 @@ impl State {
     }
 }
 
-/// The head's PCI interrupt routing. Device `d`'s INTA reaches input `d - 1`;
-/// INTB to INTD are not wired. The eight inputs are shared with the board's
-/// own interrupts, which reach a head through [`Pic::pin_line`]. Device 0 is
-/// the bridge itself and holds no function.
+/// The head's PCI interrupt routing. Device `d`'s INTA and INTC reach input
+/// `d - 1`; INTB and INTD are not wired. The eight inputs are shared with the
+/// board's own interrupts, which reach a head through [`Pic::pin_line`].
+/// Device 0 is the bridge itself and holds no function.
 ///
-/// INTA of device `d` on input `d - 1` is what IRIX 6.5.30's pin rule
-/// assigns (INTA and INTC to input `d - 1`, INTB and INTD to input
-/// `(d - 1) ^ 4`), and an Origin 350's IO9 reports its IOC4, ISP12160 and
-/// BCM5701 on inputs 0, 2 and 3 under OpenBSD: established as what software
-/// expects. The board's own wiring is inferred from that, and INTB to INTD
-/// are unknown; no function on the IO9 uses them.
+/// INTA and INTC of device `d` on input `d - 1`, and INTB and INTD on input
+/// `(d - 1) ^ 4`, is what IRIX 6.5.30's pin rule assigns, and an Origin
+/// 350's IO9 reports its IOC4, ISP12160 and BCM5701 on inputs 0, 2 and 3
+/// under OpenBSD: established as what software expects. The board's own
+/// wiring is inferred from that. INTC is routed so that a function at an even
+/// device number behind a PCI-to-PCI bridge, whose INTA the bridge's rotation
+/// carries to the bridge's INTC, has a line; no function on the IO9 uses it
+/// otherwise, and INTB and INTD are unknown.
 static PIC_ROUTING: IntxRouting = IntxRouting {
     devices: DEVICES + 1,
     irqs: PINS as u8,
     intx: &[
-        (1, [Some(0), None, None, None]),
-        (2, [Some(1), None, None, None]),
-        (3, [Some(2), None, None, None]),
-        (4, [Some(3), None, None, None]),
+        (1, [Some(0), None, Some(0), None]),
+        (2, [Some(1), None, Some(1), None]),
+        (3, [Some(2), None, Some(2), None]),
+        (4, [Some(3), None, Some(3), None]),
     ],
     board_irqs: &[0, 1, 2, 3, 4, 5, 6, 7],
 };
