@@ -375,13 +375,13 @@ consumer thread never takes `rec`.
 
 Bedrock, the Fuel's node chip, shows rule 4 at the scale of a whole chip.
 Each processor interface's interrupt inputs (pending banks, masks, timer and
-error status) are atomics, and a store or an inbound packet changes one and
-then publishes the slot's levels into Cause bits 10-14 of its CPU's interrupt
-word with no lock: a writer that published a stale level re-reads the inputs
-and corrects it, so the last write always matches the registers. A mask
-store, an interrupt packet, a counter read, inbound DMA and PIO take no lock.
-The comparators fire on host timers, as the Hub's do, not from the CPU's
-batch hook.
+error status) are atomics, so a register read takes no lock. A store, an
+inbound packet or a comparator changes one and publishes the slot's levels
+into Cause bits 10-14 of its CPU's interrupt word under one lock per
+interface, which keeps the last levels it wrote, as the Interrupts section
+asks. The CPU reads its word without a lock. A counter read, inbound DMA
+and PIO take no lock. The comparators fire on host timers, as the Hub's do,
+not from the CPU's batch hook.
 
 ## 6. The CPU
 

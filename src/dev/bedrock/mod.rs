@@ -191,6 +191,8 @@ impl Bedrock {
         register_mutex_fn("bedrock-pi1::state", self, |c| c.pi[1].state_locked());
         register_mutex_fn("bedrock-pi0::timer", self, |c| c.pi[0].timer_locked());
         register_mutex_fn("bedrock-pi1::timer", self, |c| c.pi[1].timer_locked());
+        register_mutex_fn("bedrock-pi0::out", self, |c| c.pi[0].out_locked());
+        register_mutex_fn("bedrock-pi1::out", self, |c| c.pi[1].out_locked());
         register_mutex_fn("bedrock-md::state", self, |c| c.md.state_locked());
         register_mutex_fn("bedrock-md::remapping", self, |c| c.md.remapping_locked());
         register_mutex_fn("bedrock-io", self, |c| c.io.locked());
@@ -295,11 +297,7 @@ impl Bedrock {
     /// An interrupt packet to PI `pi`'s pending-modify register; whether the
     /// PI took it.
     fn interrupt(&self, pi: usize, value: u64) -> bool {
-        let taken = self.pi[pi].io_modify(value, 0);
-        if taken {
-            self.pi[pi].publish(&self.levels);
-        }
-        taken
+        self.pi[pi].io_modify(value, 0, &self.levels)
     }
     /// Widget `widget`'s DMA as a bus device: crosstalk addresses, with the
     /// widget's inbound permissions applied.
@@ -341,9 +339,7 @@ impl Bedrock {
     /// PI `interface`'s host timer fired.
     fn expire(&self, interface: usize) {
         let Some(tm) = self.timer_manager() else { return };
-        if self.pi[interface].expire(&self.host_timer(&tm), (self.clock)()) {
-            self.pi[interface].publish(&self.levels);
-        }
+        self.pi[interface].expire(&self.host_timer(&tm), (self.clock)(), &self.levels);
     }
     fn publish_all(&self) {
         for pi in &self.pi {
@@ -395,18 +391,13 @@ impl Bedrock {
         let now = (self.clock)();
         match (size, value) {
             (8, None) if a < pi::SIZE && a & 7 == 0 => {
-                let (data, latched) = pi.read(a, now, &self.levels);
-                if latched {
-                    pi.publish(&self.levels);
-                }
-                data.map_or(BusRead64::err(), BusRead64::ok)
+                pi.read(a, now, &self.levels).map_or(BusRead64::err(), BusRead64::ok)
             }
             (8, Some(v)) if a < pi::SIZE && a & 7 == 0 => {
-                if pi.write(a, v, now) {
+                if pi.write(a, v, now, &self.levels) {
                     let tm = self.timer_manager();
                     pi.reschedule(tm.as_deref().map(|tm| self.host_timer(tm)).as_ref(), now);
                 }
-                pi.publish(&self.levels);
                 BusRead64 { status: BUS_OK, data: 0 }
             }
             // The counter's two halves, high word first.
@@ -467,10 +458,9 @@ impl Device for Bedrock {
         let tm = self.timer_manager();
         let host = tm.as_deref().map(|tm| self.host_timer(tm));
         for pi in &self.pi {
-            pi.stop(host.as_ref(), now);
+            pi.stop(host.as_ref(), now, &self.levels);
         }
         self.md.stop_clock();
-        self.publish_all();
     }
     fn is_running(&self) -> bool {
         self.pi[0].is_running()
@@ -487,7 +477,7 @@ impl Resettable for Bedrock {
         let tm = self.timer_manager();
         let host = tm.as_deref().map(|tm| self.host_timer(tm));
         for pi in &self.pi {
-            pi.power_on(now);
+            pi.power_on(now, &self.levels);
             pi.reschedule(host.as_ref(), now);
         }
         self.md.power_on();

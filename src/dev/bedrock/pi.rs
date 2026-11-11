@@ -7,9 +7,10 @@
 //! Each slot drives IP2..IP6 of its processor: bank 0 under the slot's bank
 //! 0 mask, bank 1 under its bank 1 mask, its RT comparator, the profile
 //! timer and the error summary under its error cause. The inputs of those
-//! five levels are atomics. A register store or an inbound packet changes
-//! one and then publishes the slot's levels into Cause bits 10-14 of its
-//! processor's interrupt word, without a lock; see [`Pi::publish`].
+//! five levels are atomics, which reads take without a lock. A register
+//! store, an inbound packet or a comparator changes one and publishes the
+//! slot's levels into Cause bits 10-14 of its processor's interrupt word
+//! under one lock, the PI's `out`; see [`Pi::publish`].
 //!
 //! # What is approximated here
 //!
@@ -258,6 +259,10 @@ pub(super) struct Pi {
     error_cause: [AtomicU64; 2],
     /// Each slot's processor's interrupt word, null for an empty slot.
     words: [AtomicPtr<AtomicU64>; 2],
+    /// Each slot's IP2..IP6 as last written to its word. Held across every
+    /// change of an interrupt input and the publish after it, so a slot's
+    /// levels reach the processor in the order the inputs changed.
+    out: Mutex<[u64; 2]>,
     counter: Counter,
     /// The earliest deadline in host nanoseconds; `u64::MAX` while stopped.
     next_due: AtomicU64,
@@ -281,6 +286,7 @@ impl Pi {
             error_summary: AtomicU64::new(0),
             error_cause: Default::default(),
             words: Default::default(),
+            out: Mutex::new([0; 2]),
             counter: Counter::new(now),
             next_due: AtomicU64::new(RUNNING),
             timer: Mutex::new(Timer { rt_compare: [0; 2], profile_compare: 0, rt_due: [0; 2], profile_due: 0, id: None }),
@@ -301,9 +307,16 @@ impl Pi {
     pub(super) fn timer_locked(&self) -> bool {
         self.timer.is_locked()
     }
+    pub(super) fn out_locked(&self) -> bool {
+        self.out.is_locked()
+    }
     /// Where slot `slot`'s IP2..IP6 go.
     pub(super) fn set_word(&self, slot: usize, word: *const AtomicU64) {
+        let mut out = self.out.lock();
         self.words[slot].store(word as *mut AtomicU64, SeqCst);
+        // SAFETY: `Bedrock::set_cpu_interrupts`' contract: the word
+        // outlives the chip.
+        out[slot] = unsafe { word.as_ref() }.map_or(0, |w| (w.load(SeqCst) >> CAUSE_IP2) & 0x1f);
     }
 
     /// Whether a processor sits in `slot` of this interface: only PI0 slot A
@@ -345,17 +358,21 @@ impl Pi {
             | u64::from(self.error_summary.load(SeqCst) & self.error_cause[slot].load(SeqCst) != 0) << 4
     }
 
-    /// Bring each processor's IP2..IP6 to what the registers say. Every
-    /// input change is a sequentially consistent store or read-modify-write
-    /// followed by a publish, so no lock is needed: take the last write to a
-    /// word. Its writer read the inputs again after it, and would have
-    /// written again had any change before that read left the word stale. A
-    /// change after that read is followed by its own publish, which would
-    /// make a later write. So once writers stop, the word matches the
-    /// registers. A publish that changes nothing reads the inputs and the
-    /// word and stores nothing. Only the PI writes Cause bits 10-14.
+    /// Bring each processor's IP2..IP6 to what the registers say, after a
+    /// change outside the PI: a reflected level or a new word.
     pub(super) fn publish(&self, levels: &Levels) {
-        for slot in 0..2 {
+        self.drive(&mut self.out.lock(), levels);
+    }
+
+    /// Write each slot's IP2..IP6 where they differ from what was last
+    /// written, with `out` held. Every input but the reflected levels
+    /// changes only under `out`, and each output bit reads one reflected
+    /// bank at most, in a single load, so each level written is one the
+    /// registers held at some instant and the writes follow the changes in
+    /// order: no level rises that the registers never raised. Only the PI
+    /// writes Cause bits 10-14, so `out` is what the word holds there.
+    fn drive(&self, out: &mut [u64; 2], levels: &Levels) {
+        for (slot, have) in out.iter_mut().enumerate() {
             let p = self.words[slot].load(Acquire);
             if p.is_null() {
                 continue;
@@ -363,21 +380,18 @@ impl Pi {
             // SAFETY: `Bedrock::set_cpu_interrupts`' contract: the word
             // outlives the chip.
             let word = unsafe { &*p };
-            loop {
-                let want = self.outputs(slot, levels);
-                let have = (word.load(SeqCst) >> CAUSE_IP2) & 0x1f;
-                if want == have {
-                    break;
-                }
-                let (set, clear) = (want & !have, have & !want);
-                if set != 0 {
-                    word.fetch_or(set << CAUSE_IP2, SeqCst);
-                    #[cfg(feature = "idle-pause")]
-                    crate::cpu::idle_park::wake();
-                }
-                if clear != 0 {
-                    word.fetch_and(!(clear << CAUSE_IP2), SeqCst);
-                }
+            let want = self.outputs(slot, levels);
+            #[cfg(test)]
+            tests::sampled(want);
+            let (set, clear) = (want & !*have, *have & !want);
+            *have = want;
+            if set != 0 {
+                word.fetch_or(set << CAUSE_IP2, SeqCst);
+                #[cfg(feature = "idle-pause")]
+                crate::cpu::idle_park::wake();
+            }
+            if clear != 0 {
+                word.fetch_and(!(clear << CAUSE_IP2), SeqCst);
             }
         }
     }
@@ -399,13 +413,16 @@ impl Pi {
     }
 
     /// An interrupt packet from region `region` to the pending-modify
-    /// register. Refused, and false, unless the region may send one.
-    pub(super) fn io_modify(&self, value: u64, region: u8) -> bool {
+    /// register, published. Refused, and false, unless the region may send
+    /// one.
+    pub(super) fn io_modify(&self, value: u64, region: u8, levels: &Levels) -> bool {
         if region >= 64 || self.region.load(SeqCst) & (1 << region) == 0 {
             self.note(reg::PENDING_MODIFY, true);
             return false;
         }
+        let mut out = self.out.lock();
         self.modify(value);
+        self.drive(&mut out, levels);
         true
     }
 
@@ -464,21 +481,36 @@ impl Pi {
         latched
     }
 
-    /// Latch what is due at `now`: one load when nothing is. Whether a
-    /// comparator latched, so the caller publishes.
-    pub(super) fn sync(&self, now: u64) -> bool {
+    /// Latch and publish what is due at `now`: one load, and no lock, when
+    /// nothing is.
+    fn sync(&self, now: u64, levels: &Levels) {
         if now < self.next_due.load(SeqCst) {
-            return false;
+            return;
         }
-        self.latch(&mut self.timer.lock(), now)
+        let mut out = self.out.lock();
+        if self.latch(&mut self.timer.lock(), now) {
+            self.drive(&mut out, levels);
+        }
     }
 
-    /// The host timer fired: latch what is due and arm the next deadline.
-    pub(super) fn expire(&self, host: &HostTimer, now: u64) -> bool {
+    /// Latch what is due at `now`, with `out` held.
+    fn catch_up(&self, now: u64) {
+        if now >= self.next_due.load(SeqCst) {
+            self.latch(&mut self.timer.lock(), now);
+        }
+    }
+
+    /// The host timer fired: latch and publish what is due and arm the next
+    /// deadline.
+    pub(super) fn expire(&self, host: &HostTimer, now: u64, levels: &Levels) {
+        let mut out = self.out.lock();
         let mut t = self.timer.lock();
         let latched = self.latch(&mut t, now);
         self.arm_host(&mut t, host, now);
-        latched
+        drop(t);
+        if latched {
+            self.drive(&mut out, levels);
+        }
     }
 
     /// (Re)arm the host timer for the earliest deadline, under the timer
@@ -523,8 +555,10 @@ impl Pi {
         }
     }
 
-    /// The machine stopped at `now`: latch what is due, then freeze the counter.
-    pub(super) fn stop(&self, host: Option<&HostTimer>, now: u64) -> bool {
+    /// The machine stopped at `now`: latch and publish what is due, then
+    /// freeze the counter.
+    pub(super) fn stop(&self, host: Option<&HostTimer>, now: u64, levels: &Levels) {
+        let mut out = self.out.lock();
         let mut t = self.timer.lock();
         let latched = self.latch(&mut t, now);
         let mut o = self.counter.read();
@@ -536,7 +570,10 @@ impl Pi {
         if let (Some(host), Some(id)) = (host, t.id.take()) {
             host.tm.remove(id);
         }
-        latched
+        drop(t);
+        if latched {
+            self.drive(&mut out, levels);
+        }
     }
 
     pub(super) fn is_running(&self) -> bool {
@@ -549,11 +586,9 @@ impl Pi {
         u64::from(self.interface) << 1
     }
 
-    /// A doubleword read at `off`, and whether a comparator latched on the
-    /// way, so the caller publishes. `None` for a register the model does
-    /// not have.
-    pub(super) fn read(&self, off: u64, now: u64, levels: &Levels) -> (Option<u64>, bool) {
-        let mut latched = false;
+    /// A doubleword read at `off`, publishing a comparator that latched on
+    /// the way. `None` for a register the model does not have.
+    pub(super) fn read(&self, off: u64, now: u64, levels: &Levels) -> Option<u64> {
         let value = match off {
             reg::INTERFACE_ID => self.cpu_number(),
             reg::INTERFACE_SLOT_A => u64::from(self.started(0)),
@@ -571,11 +606,11 @@ impl Pi {
             reg::RT_COMPARE_A | reg::RT_COMPARE_B => self.timer.lock().rt_compare[((off - reg::RT_COMPARE_A) / 8) as usize],
             reg::PROFILE_COMPARE => self.timer.lock().profile_compare,
             reg::RT_STATUS_A | reg::RT_STATUS_B => {
-                latched = self.sync(now);
+                self.sync(now, levels);
                 self.rt_status[((off - reg::RT_STATUS_A) / 8) as usize].load(SeqCst)
             }
             reg::PROFILE_STATUS_A | reg::PROFILE_STATUS_B => {
-                latched = self.sync(now);
+                self.sync(now, levels);
                 self.profile_status[((off - reg::PROFILE_STATUS_A) / 8) as usize].load(SeqCst)
             }
             reg::RT_ENABLE_A | reg::RT_ENABLE_B => self.rt_enable[((off - reg::RT_ENABLE_A) / 8) as usize].load(SeqCst),
@@ -595,15 +630,38 @@ impl Pi {
             _ if stored(off) => self.state.lock().w[off as usize / 8],
             _ => {
                 self.note(off, false);
-                return (None, false);
+                return None;
             }
         };
-        (Some(value), latched)
+        Some(value)
     }
 
     /// A doubleword store at `off`. Whether the comparators or the counter
-    /// moved, so the caller re-arms the host timer. The caller publishes.
-    pub(super) fn write(&self, off: u64, value: u64, now: u64) -> bool {
+    /// moved, so the caller re-arms the host timer. A store that can change
+    /// an interrupt input publishes under `out`.
+    pub(super) fn write(&self, off: u64, value: u64, now: u64, levels: &Levels) -> bool {
+        match off {
+            reg::GRAPHICS_BASE..reg::GRAPHICS_END if off % 8 == 0 => {
+                let n = ((off - reg::GRAPHICS_BASE) / 8) as u32;
+                debug_assert!(n < PI_GFX_REGS);
+                self.state.lock().gfx.write(n, value);
+                false
+            }
+            reg::CREDIT_MODE => {
+                self.state.lock().credit_mode = value & 1;
+                false
+            }
+            _ => {
+                let mut out = self.out.lock();
+                let moved = self.store(off, value, now);
+                self.drive(&mut out, levels);
+                moved
+            }
+        }
+    }
+
+    /// Any other store, with `out` held.
+    fn store(&self, off: u64, value: u64, now: u64) -> bool {
         let index = |base: u64| ((off - base) / 8) as usize;
         match off {
             reg::OFFSET_0010 => self.region.store(value, SeqCst),
@@ -624,11 +682,11 @@ impl Pi {
             reg::OFFSET_00E8 => self.request_enable.store(value, SeqCst),
             reg::RT_STATUS_A | reg::RT_STATUS_B => {
                 // Latch a deadline that has passed first, so the clear takes it.
-                self.sync(now);
+                self.catch_up(now);
                 self.rt_status[index(reg::RT_STATUS_A)].store(0, SeqCst);
             }
             reg::PROFILE_STATUS_A | reg::PROFILE_STATUS_B => {
-                self.sync(now);
+                self.catch_up(now);
                 self.profile_status[index(reg::PROFILE_STATUS_A)].store(0, SeqCst);
             }
             reg::RT_ENABLE_A | reg::RT_ENABLE_B | reg::PROFILE_ENABLE_A | reg::PROFILE_ENABLE_B => {
@@ -684,12 +742,6 @@ impl Pi {
                 self.set_next_due(&t, &o);
                 return true;
             }
-            reg::GRAPHICS_BASE..reg::GRAPHICS_END if off % 8 == 0 => {
-                let n = ((off - reg::GRAPHICS_BASE) / 8) as u32;
-                debug_assert!(n < PI_GFX_REGS);
-                self.state.lock().gfx.write(n, value);
-            }
-            reg::CREDIT_MODE => self.state.lock().credit_mode = value & 1,
             _ => self.write_stored(off, value),
         }
         false
@@ -760,7 +812,8 @@ impl Pi {
     /// The PI block's local reset at `now`. The controls and captures
     /// hardware keeps across it survive; the interrupt inputs, timers,
     /// counter and graphics registers start over.
-    pub(super) fn power_on(&self, now: u64) {
+    pub(super) fn power_on(&self, now: u64, levels: &Levels) {
+        let mut out = self.out.lock();
         let mut s = self.state.lock();
         let old = s.w;
         *s = State::new();
@@ -784,6 +837,8 @@ impl Pi {
         let time = o.time(now);
         self.counter.write(Origin { base: 0, epoch: time, paused: o.paused });
         self.arm_all(&mut t, now);
+        drop(t);
+        self.drive(&mut out, levels);
     }
 }
 
@@ -817,4 +872,4 @@ fn stored(off: u64) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
