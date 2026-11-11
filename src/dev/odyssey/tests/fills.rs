@@ -10,7 +10,6 @@ use crate::dev::odyssey::clip::ClipRect;
 use crate::dev::odyssey::consts::{
     mode, ODSY_DRAW_MASK_BUFFER0, ODSY_DRAW_MASK_BUFFER1, ODSY_ID_COMPARE_ENABLE, ODSY_ID_COMPARE_MASK_SHIFT, ODSY_PLANE_MASK_SHIFT,
 };
-use crate::dev::odyssey::debug::memory_hash;
 use crate::dev::odyssey::raster_bench::Bench;
 
 /// The window-id buffer as the destination (the B format).
@@ -115,6 +114,18 @@ impl Case {
     }
 }
 
+/// The two boards' memory is the same, all 128 MB of it. Compared as two
+/// slices rather than through `memory_hash`: hashing both boards in an
+/// unoptimised build took most of each case's time.
+fn assert_same_memory(fill: &Board, pixels: &Board, what: impl Fn() -> String) {
+    let (fill, pixels) = (fill.vram.ptr_shared(), pixels.vram.ptr_shared());
+    let (a, b) = (fill.words_at(0, fill.size()), pixels.words_at(0, pixels.size()));
+    if a != b {
+        let i = a.iter().zip(b).position(|(x, y)| x != y).unwrap();
+        panic!("{}: the word at {:#x} is {:#018x} after the fill, {:#018x} pixel by pixel", what(), 8 * i, a[i], b[i]);
+    }
+}
+
 #[test]
 fn a_rectangle_fill_stores_what_its_pixels_would() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -133,7 +144,7 @@ fn a_rectangle_fill_stores_what_its_pixels_would() {
         }
         fill.gpu_sync();
         pixels.gpu_sync();
-        assert_eq!(memory_hash(&fill), memory_hash(&pixels), "case {case}: id planes {}, clips {}, id test {:#x}, draw mask {:#x}, plane mask {:#x}, op {}, mode {:#x}, index {}", c.id_planes, c.clips.len(), c.id_compare, c.draw_mask, c.plane_mask, c.logic, c.pattern_mode, c.is_index);
+        assert_same_memory(&fill, &pixels, || format!("case {case}: id planes {}, clips {}, id test {:#x}, draw mask {:#x}, plane mask {:#x}, op {}, mode {:#x}, index {}", c.id_planes, c.clips.len(), c.id_compare, c.draw_mask, c.plane_mask, c.logic, c.pattern_mode, c.is_index));
     }
 }
 
@@ -168,6 +179,6 @@ fn an_id_plane_write_changes_the_masked_bits_of_the_pixels_the_window_passes() {
         }
         fill.gpu_sync();
         pixels.gpu_sync();
-        assert_eq!(memory_hash(&fill), memory_hash(&pixels), "case {case}: clips {}, id test {:#x}, draw mask {:#x}", c.clips.len(), c.id_compare, c.draw_mask);
+        assert_same_memory(&fill, &pixels, || format!("case {case}: clips {}, id test {:#x}, draw mask {:#x}", c.clips.len(), c.id_compare, c.draw_mask));
     }
 }
