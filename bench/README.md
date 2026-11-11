@@ -439,7 +439,8 @@ rounds the interval is the whole range of the ratios, which misses the median
 with probability 2^(1-n), and 11 is the first count where that is under 0.1%. The table
 warns when guest instructions per iteration differ between A and B, a checksum
 fails, the whole-suite ratio scatters by more than the threshold, or there are
-too few rounds.
+too few rounds. A round in which either run fails is left out and named in the
+warnings; the comparison goes on with the others.
 
 * **Short timed runs.** Each kernel runs at `--time-pct 10` (10% of its
   default length, the shortest the guest runs) and keeps the best of
