@@ -4,7 +4,8 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::thread;
 use std::sync::Arc;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
+use crate::sync::Doorbell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, FifoDevice, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog};
@@ -306,8 +307,8 @@ pub const INDY_CDROM: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new
 pub struct Wd33c93a {
     /// The targets, also held by the state the worker thread runs on.
     bus: Arc<ScsiBus>,
-    state: Arc<Mutex<Wd33c93aState>>,
-    cond: Arc<Condvar>,
+    /// Rung when a command is queued for the worker thread.
+    state: Arc<Doorbell<Wd33c93aState>>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     running: Arc<AtomicBool>,
     dma: Option<Arc<dyn DmaClient>>,
@@ -348,7 +349,7 @@ impl Wd33c93a {
         let bus = Arc::new(bus);
         Self {
             bus: bus.clone(),
-            state: Arc::new(Mutex::new(Wd33c93aState {
+            state: Arc::new(Doorbell::new(Wd33c93aState {
                 id,
                 regs: [0; 32],
                 ar: 0,
@@ -374,7 +375,6 @@ impl Wd33c93a {
                 last_cmd: 0,
                 deferred_int: deferred_int_arc.clone(),
             })),
-            cond: Arc::new(Condvar::new()),
             thread: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
             dma,
@@ -461,7 +461,7 @@ impl Wd33c93a {
         let mut state = self.state.lock();
         state.fifo.push_back(val);
         if notify {
-            self.cond.notify_one();
+            state.ring();
         }
     }
 
@@ -717,8 +717,7 @@ impl Wd33c93a {
                             dlog!(state.log_module(), "WD33C93A({}): PIO xfer complete phase=0x{:02x}, waking worker ({} bytes)", state.id, cmd_phase, state.fifo.len());
                             state.update_asr(asr::DBR, 0);
                             state.pending_command = Some(state.regs[regs::COMMAND as usize]);
-                            drop(state);
-                            self.cond.notify_one();
+                            state.ring();
                             return BUS_OK;
                         }
                     } else {
@@ -790,7 +789,7 @@ impl Wd33c93a {
                 }
 
                 state.pending_command = Some(val);
-                self.cond.notify_one();
+                state.ring();
                 // COMMAND register does not auto-increment
             } else if ar != regs::AUX_STATUS_DIRECT {
                 // Auto-increment for registers except COMMAND, DATA, AUX_STATUS
@@ -821,17 +820,12 @@ impl FifoDevice for Wd33c93a {
 impl Device for Wd33c93a {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {
-        // Under the state lock: the worker checks `running` holding it and
-        // then waits, so a store and notify between the two would be lost
-        // and the join below would wait forever.
-        {
-            let _state = self.state.lock();
-            self.running.store(false, Ordering::SeqCst);
-        }
-        self.cond.notify_all();
+        self.running.store(false, Ordering::SeqCst);
+        self.state.close();
         if let Some(t) = self.thread.lock().take() {
             let _ = t.join();
         }
+        self.state.reopen();
         // Any DaynaPort target owns a backend thread of its own; stop it too
         // (after the worker is joined, so nothing is mid-command).
         self.bus.for_each(|_, dev| dev.stop());
@@ -842,8 +836,6 @@ impl Device for Wd33c93a {
         // first boot — add_daynaport() already started them.
         self.bus.for_each(|_, dev| dev.start());
         let state = self.state.clone();
-        let cond = self.cond.clone();
-        let running = self.running.clone();
         let dma = self.dma.clone();
         // CyclesPtr is Copy + Send + Sync — extracted once here, before the
         // thread spawns (see that type's and cpu_cycles's own doc comments).
@@ -852,9 +844,14 @@ impl Device for Wd33c93a {
 
         *self.thread.lock() = Some(thread::Builder::new().name("WD33C93A".to_string()).spawn(move || {
             let mut state_guard = state.lock();
-            while running.load(Ordering::Relaxed) {
-                cond.wait(&mut state_guard);
-                if !running.load(Ordering::Relaxed) { break; }
+            loop {
+                // A command written while the worker was not waiting (before
+                // its first wait, or while it spun for a deferred interrupt)
+                // is already pending: the wait looks before it sleeps.
+                state_guard = match state_guard.wait_until(|s| s.pending_command.is_some()) {
+                    Ok(guard) => guard,
+                    Err(_) => break, // stopped
+                };
 
                 // Process command if one was queued.
                 if let Some(cmd_reg) = state_guard.pending_command.take() {
@@ -2025,12 +2022,37 @@ impl Wd33c93aState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
     fn make_scsi() -> Wd33c93a {
         Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// A command written before the worker first waits is still run. The
+    /// worker takes the state lock when it starts; a COMMAND write and its
+    /// ring that land first used to be lost, because the worker then waited
+    /// without looking at `pending_command` and slept until some later write.
+    /// Hold the lock across `start()` so the write is guaranteed to come first.
+    #[test]
+    fn a_command_written_before_the_worker_waits_is_not_lost() {
+        let wd = make_scsi();
+        {
+            let mut state = wd.state.lock();
+            wd.start();
+            state.pending_command = Some(cmd::RESET);
+            state.ring();
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wd.state.lock().pending_command.is_some() {
+            if std::time::Instant::now() > until {
+                wd.stop();
+                panic!("the worker never took a command written before it first waited");
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        wd.stop();
     }
 
     /// The chip's reset reaches its disks and puts the write cache bit back
@@ -2077,7 +2099,7 @@ mod tests {
         assert_eq!(v1, v2, "Wd33c93a save_state mismatch after load_state round-trip");
     }
 }
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod pio_direction_tests {
     use super::*;
 
@@ -2127,7 +2149,7 @@ mod pio_direction_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod data_out_phase_tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
