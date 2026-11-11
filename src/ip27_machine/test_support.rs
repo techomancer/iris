@@ -3,26 +3,9 @@
 
 use crate::config::{MachineConfig, MachineProfile, NetMode};
 use crate::cpu::parts;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) use crate::display_stop_tests::big_stack;
-
-/// A directory that goes away with the value. `name` is unique across the
-/// SN0 tests, since they run as threads of one process.
-pub(crate) struct Scratch(pub PathBuf);
-impl Scratch {
-    pub(crate) fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("iris-sn0-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// A PROM stand-in: a recognisable first word and a configuration block in
 /// the shape the flash initialiser patches.

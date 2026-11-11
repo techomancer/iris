@@ -1,6 +1,7 @@
 use super::*;
+use crate::test_temp::TempPath;
 use crate::config::GraphicsBoard;
-use super::test_support::{self, big_stack, Scratch};
+use super::test_support::{self, big_stack};
 use crate::dev::hub::reg::{ni as hub_ni, pi as hub_pi};
 use crate::traits::BUS_OK;
 
@@ -36,7 +37,8 @@ fn a_modules_config_word_part_and_cache_type_say_the_same_secondary_cache() {
 
 #[test]
 fn the_r12000_module_has_no_record_on_its_one_wire_part() {
-    let mut cfg = config(&std::env::temp_dir());
+    let dir = TempPath::dir("sn0-o200-node-record");
+    let mut cfg = config(&dir);
     cfg.set_cpu(&parts::R12000_270);
     assert!(Origin200::specs(&cfg).unwrap()[0].node_record.is_none());
     cfg.set_cpu(&parts::R10000_180);
@@ -45,8 +47,8 @@ fn the_r12000_module_has_no_record_on_its_one_wire_part() {
 
 #[test]
 fn the_profile_takes_an_r10000_or_r12000_and_fills_banks_from_zero() {
-    let dir = Scratch::new("o200-config");
-    let mut cfg = config(&dir.0);
+    let dir = TempPath::dir("sn0-o200-config");
+    let mut cfg = config(&dir);
     assert_eq!(cfg.validate(), Ok(()));
     cfg.set_cpu(&parts::R14000_600);
     assert!(cfg.validate().unwrap_err().contains("takes [machine] cpu"));
@@ -77,8 +79,8 @@ fn the_profile_is_chosen_by_its_snake_case_name() {
 #[test]
 fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
     big_stack(|| {
-        let dir = Scratch::new("o200-reset");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-reset");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         // Node memory view, the Hub-special views of the flash (own and named),
         // all show the PROM's first word at the reset address and the window.
         let memory = m.node().hub.cpu_memory();
@@ -99,8 +101,8 @@ fn the_reset_vector_reaches_the_flash_and_the_processor_is_enabled() {
 #[test]
 fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
     big_stack(|| {
-        let dir = Scratch::new("o200-bridge");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-bridge");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         let io = m.node().hub.claim(Space::Io);
         let widget = |w: u64| w << 24;
         // The Bridge's identification register, in the data half of its slot.
@@ -116,8 +118,8 @@ fn the_bridge_answers_through_the_hub_at_every_widget_but_its_own() {
 #[test]
 fn a_reset_enables_the_processor_again() {
     big_stack(|| {
-        let dir = Scratch::new("o200-restart");
-        let mut m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-restart");
+        let mut m = Origin200Machine::new(&config(&dir)).unwrap();
         m.reset();
         let io = m.node().hub.claim(Space::Io);
         assert_eq!(io.read64(crate::dev::hub::IO_REGISTERS_LOCAL + hub_pi::CPU_ENABLE_A).data, 1);
@@ -132,8 +134,8 @@ fn a_reset_enables_the_processor_again() {
 fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
     use std::sync::atomic::Ordering;
     big_stack(|| {
-        let dir = Scratch::new("o200-softreset");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-softreset");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         let cpu = m.cpu_at(0);
         cpu.step_n_inline(5).unwrap();
         assert_ne!(cpu.state_digest().unwrap().pc, 0xffff_ffff_bfc0_0000, "the processor has left the reset vector");
@@ -151,8 +153,8 @@ fn a_soft_reset_write_through_the_hubs_io_space_restarts_the_processor() {
 #[test]
 fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
     big_stack(|| {
-        let dir = Scratch::new("o200-flash");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-flash");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         let word = |at: u64| m.node().hub.cpu_special().read32(0x1000_0000 + at).data;
         // Offsets 0x8c, 0x90, 0x94 and 0x9c of the configuration block.
         assert_eq!(word(0x8c), 15);
@@ -167,9 +169,9 @@ fn the_flash_carries_the_products_machine_type_and_cycle_counts() {
 #[test]
 fn a_scratch_volume_is_the_machines_scratch_path() {
     big_stack(|| {
-        let dir = Scratch::new("o200-scratch");
-        let mut cfg = config(&dir.0);
-        let disk = dir.0.join("scratch.raw");
+        let dir = TempPath::dir("sn0-o200-scratch");
+        let mut cfg = config(&dir);
+        let disk = dir.join("scratch.raw");
         cfg.scsi.clear();
         cfg.scsi.insert(2, toml::from_str(&format!("path = {:?}\nscratch = true\nsize_mb = 4", disk.to_string_lossy())).unwrap());
         let m = Origin200Machine::new(&cfg).unwrap();
@@ -260,8 +262,8 @@ fn the_controller_is_visited_when_due_and_not_while_stopped() {
 #[test]
 fn a_machines_controller_is_armed_for_what_it_has_pending_and_stopped_with_the_machine() {
     big_stack(|| {
-        let dir = Scratch::new("o200-timer");
-        let mut m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-timer");
+        let mut m = Origin200Machine::new(&config(&dir)).unwrap();
         assert!(m.watch.armed().is_none());
         m.restart_peripherals();
         assert_eq!(m.watch.armed().is_some(), m.io.controller.next_due().is_some());
@@ -276,8 +278,8 @@ fn a_machines_controller_is_armed_for_what_it_has_pending_and_stopped_with_the_m
 #[test]
 fn a_dropped_machine_frees_its_hub_memory_and_timers() {
     big_stack(|| {
-        let dir = Scratch::new("o200-free");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-free");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         // A single node has nothing that holds its Hub from its own memory
         // map. Route the other node numbers through the Hub, as a board with
         // a cable does, so that only the release in `Drop` can free it.
@@ -302,8 +304,8 @@ fn a_dropped_machine_frees_its_hub_memory_and_timers() {
 #[test]
 fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
     big_stack(|| {
-        let dir = Scratch::new("o200-interrupt-word");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-interrupt-word");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         let hub = m.node().hub.clone();
         let cpu = Arc::downgrade(m.cpu_at(0));
         assert!(hub.publishes_to_cpu(0), "the machine wired the processor's word");
@@ -325,8 +327,8 @@ fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
 #[test]
 fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
     big_stack(|| {
-        let dir = Scratch::new("o200-renumber");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-renumber");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));
         const SLOT: u64 = 0x1bef_e78;
@@ -347,8 +349,8 @@ fn renumbering_moves_only_node_zero_beyond_the_alias_off_the_node() {
 #[test]
 fn a_reference_by_node_number_can_compare_and_swap() {
     big_stack(|| {
-        let dir = Scratch::new("o200-cas");
-        let m = Origin200Machine::new(&config(&dir.0)).unwrap();
+        let dir = TempPath::dir("sn0-o200-cas");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
         let hub = &m.node().hub;
         m.node().memory.route_nodes(hub.claim(Space::Memory));
         assert_eq!(hub.write64(hub_ni::STATUS, 1 << 8), BUS_OK);
