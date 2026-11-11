@@ -21,6 +21,11 @@
 //! and the conversion of a packed pixel to the plane's word, are inferred
 //! there and here.
 //!
+//! A write aimed at the popup planes is drawn, in the two forms the X server uses for a pull-down
+//! menu: an 8-bit image (a menu's marks) and a one-bit glyph (an entry's text), each pixel kept to
+//! the two bits the popup holds. Those planes are where the menus' text goes, so refusing the
+//! write leaves a menu's frame and separators with no labels.
+//!
 //! Approximated: the model applies each row as it arrives, where the model
 //! this was taken from stages a batch of writes and commits it at the finish.
 //! The two agree because a logic operation acts on each bit alone, so applying
@@ -29,9 +34,9 @@
 //! the write in hand, not for the whole batch.
 //!
 //! Refused, counted and drawn nowhere: the window-copy pair (source and
-//! destination packing 3), a write or copy aimed at the overlay, popup or
-//! display-ID planes (fills draw those; transfers do not) and the two-buffer RGB
-//! form, and a frame-buffer word read, which tells an index from a direct colour by a tag
+//! destination packing 3), a write or copy aimed at the overlay or display-ID
+//! planes (fills draw those; transfers do not), a copy aimed at the popup planes, the
+//! two-buffer RGB form, and a frame-buffer word read, which tells an index from a direct colour by a tag
 //! this store does not keep. A read that is refused still completes, with the
 //! whole usable page zeroed: the X server waits on the page's first word with
 //! no timeout, and what the pipe answers to a read it cannot perform is
@@ -674,11 +679,7 @@ impl XState {
         let Some(setup) = self.pixel.setup else { return };
         let Some((stride, _)) = setup.words() else { return };
         let gc = match decode_write(&self.gc, &setup) {
-            Ok(gc) if gc.target != Target::Popup => gc,
-            Ok(_) => {
-                self.pixel.counts.other_target += 1;
-                return;
-            }
+            Ok(gc) => gc,
             Err(_) => {
                 self.pixel.counts.bad_context += 1;
                 return;
@@ -694,7 +695,12 @@ impl XState {
             fg: gc.foreground,
             bg: gc.background,
             shift: if gc.target == Target::MainRgb8 { 0 } else { setup.shift },
-            mask: if gc.target == Target::MainRgb8 { 0xff_ffff } else { 0xffff },
+            // The popup planes hold two bits, so a wider source pixel keeps its low two.
+            mask: match gc.target {
+                Target::MainRgb8 => 0xff_ffff,
+                Target::Popup => 3,
+                _ => 0xffff,
+            },
             bits,
             pad: setup.pad,
         };
@@ -973,7 +979,7 @@ impl XState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev::kona::back::store::PixelStore;
+    use crate::dev::kona::back::store::{PixelStore, POPUP_PLANE};
 
     /// An index context, native 16-bit index, full mask.
     const INDEX: [u32; 13] = [0x5a000, 0x1ffe, 0xa5000, 0x1ffe, 0xf00fff, 0, 0x180c, 0x40001, 1, 6, 5, 1, 1];
@@ -1113,8 +1119,7 @@ mod tests {
     }
 
     /// A write whose rows do not number what the setup announced draws nothing
-    /// and is counted; so is one with no setup, a packing that is not known and
-    /// a target with no store (the popup planes).
+    /// and is counted; so is one with no setup and a packing that is not known.
     #[test]
     fn writes_that_cannot_be_drawn_are_counted() {
         let (mut x, s) = rig(&INDEX);
@@ -1127,19 +1132,47 @@ mod tests {
         assert_eq!((c.bad_context, c.short, c.writes), (1, 1, 0));
         assert_eq!(write(&mut x, &s, [0, 3, 1, 8, 2, 1, 0], (0, 0), &[1]), Next::Nothing, "packing 3 has no framing");
         assert_eq!(x.pixel_counts().bad_context, 2);
-        let mut popup = INDEX;
-        popup[0] = 0x78;
-        popup[2] = 0x38;
-        popup[4] = 0x30_0000;
-        popup[6] = 0x1020;
-        popup[7] = 1;
-        popup[8] = 0;
-        let (mut x, s) = rig(&popup);
-        write(&mut x, &s, [0, 0, 1, 0, 1, 1, 0], (0, 0), &[0x0100_0000]);
-        assert_eq!((x.pixel_counts().other_target, at(&s, 0, 0)), (1, 0), "{:?}", x.pixel_counts());
         // A rows packet with no write waiting is counted too.
         x.pixel_rows(&Surface::new(&s, 1), &[0]);
         assert_eq!(x.pixel_counts().unexpected, 1);
+    }
+
+    /// The popup planes, as a pull-down menu draws them.
+    fn popup(s: &PixelStore, x: u32, y: u32) -> u32 {
+        s.read(x, 31 - y, POPUP_PLANE)
+    }
+
+    /// An 8-bit image into the popup planes (a menu's marks) is drawn there, a pixel
+    /// kept to the plane's two bits, and leaves the main plane alone.
+    #[test]
+    fn an_eight_bit_image_lands_in_the_popup_planes() {
+        let mut gc = INDEX;
+        gc[0] = 0x78;
+        gc[2] = 0x38;
+        gc[4] = 0x30_0000;
+        gc[6] = 0x1020;
+        gc[7] = 1;
+        gc[8] = 0;
+        let (mut x, s) = rig(&gc);
+        write(&mut x, &s, [0, 0, 1, 0, 3, 1, 0], (4, 2), &[0x0102_0700]);
+        assert_eq!([popup(&s, 4, 2), popup(&s, 5, 2), popup(&s, 6, 2), popup(&s, 7, 2)], [1, 2, 3, 0]);
+        assert_eq!(row(&s, 2, 8), [0; 8], "the main plane is not written");
+        let c = x.pixel_counts();
+        assert_eq!((c.writes, c.other_target, c.bad_context, c.bad_destination), (1, 0, 0, 0));
+    }
+
+    /// A one-bit glyph into the popup planes (a menu entry's text) paints the
+    /// context's popup index where a bit is set and nothing where it is clear.
+    #[test]
+    fn a_glyph_lands_in_the_popup_planes() {
+        // Foreground index 2 in the one-bit senders' form, the popup's configuration and mask.
+        let gc = [0xfff0, 2 << 20, 0, 0, 0x30_0000, 0, 0x1820, 1, 0, 6, 0, 1, 1];
+        let (mut x, s) = rig(&gc);
+        write(&mut x, &s, [0, 4, 1, 0, 8, 1, 0], (1, 3), &[0xa500_0000]);
+        assert_eq!((0..10).map(|c| popup(&s, c, 3)).collect::<Vec<_>>(), [0, 2, 0, 2, 0, 0, 2, 0, 2, 0]);
+        assert_eq!(row(&s, 3, 10), [0; 10], "the main plane is not written");
+        let c = x.pixel_counts();
+        assert_eq!((c.writes, c.other_target, c.bad_context), (1, 0, 0));
     }
 
     /// The DMA bit of the mode word sends the rows by DMA: the write waits for
