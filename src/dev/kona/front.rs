@@ -322,8 +322,10 @@ impl Front {
     }
 
     /// A write of a register this file owns: false for any other offset.
-    /// `packet` receives a packet the write raised.
-    pub fn write(&mut self, off: u32, value: u32, packet: &mut Option<InterruptPacket>) -> bool {
+    /// `packet` receives a packet the write raised. `idle` says the command
+    /// ring is empty and the thread has nothing left to run, so no drain is
+    /// still to come that would raise the FIFO-low cause.
+    pub fn write(&mut self, off: u32, value: u32, idle: bool, packet: &mut Option<InterruptPacket>) -> bool {
         match off {
             // Unknown control fields are stored without interpreted effects.
             WIDGET_CONTROL => self.widget_control = value,
@@ -335,8 +337,15 @@ impl Front {
             RESET_ARG => self.reset_arg = value,
             CREDIT_CONFIG => self.credit_config = value,
             INT_ENABLE => {
+                let was = self.int_enable;
                 self.int_enable = value & INT_ENABLE_MASK;
-                *packet = self.video_deliver();
+                let video = self.video_deliver();
+                // The driver enables the FIFO-low cause to wait for the pipe to drain. If the pipe drained
+                // before it did, no drain is left to raise the cause and the wait would never end, so
+                // enabling it on an idle pipe raises it at once. Both causes use the general vector, so
+                // one packet serves either.
+                let low = if idle && was & CAUSE_LOWATER == 0 { self.lowater() } else { None };
+                *packet = video.or(low);
             }
             INT_CAUSE => {
                 // Write-1-to-clear, the geometry-engine bit included.
