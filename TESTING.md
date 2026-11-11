@@ -226,8 +226,10 @@ hung job fails in under an hour instead of holding its concurrency group for
 six. A new push cancels the run it replaces on a pull request; each push to
 `main` gets its own run and none is cancelled.
 
-The Linux x86-64 test job compiles the `iris` crate fewer times than the
-others: it skips `cargo build --workspace` and the SIMD lane step because
+The Linux x86-64 test job builds with `--features jitv2` (which implies
+`tcache`); arm64 and Windows keep default features, and the nightly workflow
+runs default features on x86-64, so both paths are tested. It compiles the
+`iris` crate fewer times than the others: it skips `cargo build --workspace` and the SIMD lane step because
 nextest builds and runs the same code, and runs the REX3 matcher test through
 `cargo test`, which compiles its replay example. Pull requests restore `main`'s
 build cache but never save one, so they cannot push `main`'s entries out of the
