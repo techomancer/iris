@@ -913,6 +913,38 @@ fn translations_that_go_nowhere_fail_and_reads_return_zero() {
     assert_eq!(c.dma().dma_write(0x1000_0000, &[1]), PciDmaStatus::MasterAbort);
 }
 
+/// The response-buffer error registers hold the PCI address and device of
+/// the read that timed out. Another master's
+/// transfer between that read's translation and its time-out must not
+/// change what they hold. Here the other master's read runs from inside
+/// the Crossbow's link check, which falls exactly in that gap.
+#[test]
+fn a_timed_out_read_captures_its_own_address_when_another_master_runs_meanwhile() {
+    let r = Rig::new();
+    let lost = r.card(2, PCI_INTA);
+    let other = r.card(3, PCI_INTA);
+    r.direct_to_heart(false);
+    r.set(reg::INT_DEST_UPPER, (WIDGET_HEART as u32) << 16);
+    r.set(reg::INT_DEST_LOWER, 0x80);
+    r.set(reg::INT_ENABLE, INT_XREAD_REQ_TIMEOUT);
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (o, flag) = (other.clone(), ran.clone());
+    r.bridge.set_link_alive(Box::new(move |w| {
+        if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let mut b = [0u8; 4];
+            assert!(o.dma().dma_read(0x8000_0100, &mut b).is_ok(), "the other master's read reaches memory");
+        }
+        w == WIDGET_HEART
+    }));
+    // Widget 9 is not a host and has no live link: the read is dropped.
+    let a = (9u64 << 60) | 0x4560;
+    assert_eq!(lost.dma().dma_read(a, &mut [0u8; 4]), PciDmaStatus::MasterAbort);
+    assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "the other master ran in the gap");
+    assert_ne!(r.get(reg::INT_STATUS) & INT_XREAD_REQ_TIMEOUT, 0);
+    assert_eq!(r.get(reg::RESP_ERR_UPPER), 2 << 20, "the timed-out read's device");
+    assert_eq!(r.get(reg::RESP_ERR_LOWER), a as u32, "the timed-out read's address");
+}
+
 #[test]
 fn a_dropped_read_is_recorded_when_enabled() {
     let r = Rig::new();

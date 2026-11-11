@@ -519,9 +519,6 @@ struct State {
     pin_level: u8,
     /// Slots whose data phases are 64 bits wide.
     dma_64bit: u8,
-    /// The transfer the last DMA translation served, for error capture.
-    dma_pci_address: u64,
-    dma_device: u32,
     /// The XBridge's multiple-error register ([`reg::INT_MULTIPLE`]).
     multiple: u32,
 }
@@ -693,8 +690,6 @@ impl Bridge {
             int_error: 0,
             pin_level: 0,
             dma_64bit: 0,
-            dma_pci_address: 0,
-            dma_device: 0,
             multiple: 0,
         };
         st.reset_core(part, false, REVISION, 0);
@@ -1032,19 +1027,20 @@ impl Bridge {
         self.raise_host_error(st, p);
     }
 
-    /// A read this chip sent for a device and the crossbar dropped: the
-    /// request timer expires at once. The capture is the response-buffer
-    /// error pair (inferred from the specification, not stated by it);
-    /// the buffer field is zero because no response buffers are held.
-    fn read_timeout(&self, st: &mut State, p: &mut Packets) {
+    /// A read this chip sent for PCI device `device` at PCI address `addr`
+    /// and the crossbar dropped: the request timer expires at once. The
+    /// capture is the response-buffer error pair (inferred from the
+    /// specification, not stated by it); the buffer field is zero because
+    /// no response buffers are held. The first error of the group keeps the
+    /// registers until software clears it.
+    fn read_timeout(&self, st: &mut State, p: &mut Packets, device: u32, addr: u64) {
         if st.r(reg::INT_ENABLE) & INT_XREAD_REQ_TIMEOUT == 0 {
             return;
         }
         if st.int_error & INT_RESP_BUF_GROUP != 0 {
             st.int_error |= INT_MULTI_ERR;
         } else {
-            let (dev, addr) = (st.dma_device, st.dma_pci_address);
-            st.set_r(reg::RESP_ERR_UPPER, dev << RESP_ERR_DEVICE_SHIFT);
+            st.set_r(reg::RESP_ERR_UPPER, device << RESP_ERR_DEVICE_SHIFT);
             st.set_r(reg::RESP_ERR_LOWER, addr as u32);
         }
         st.int_error |= INT_XREAD_REQ_TIMEOUT;
@@ -1600,8 +1596,6 @@ impl Bridge {
             let step = (0x1000 - (a as usize & 0xfff)).min(len - done);
             let target = {
                 let mut st = self.st.lock();
-                st.dma_pci_address = a;
-                st.dma_device = slot as u32;
                 self.translate(&mut st, slot, a)
             };
             // Only the host chip is memory. The Crossbow drops a request to a widget
@@ -1659,7 +1653,7 @@ impl Bridge {
                 if let DmaBuf::Read(b) = &mut buf {
                     b[done..done + step].fill(0);
                     if dropped {
-                        self.irq_locked(|st, p| self.read_timeout(st, p));
+                        self.irq_locked(|st, p| self.read_timeout(st, p, slot as u32, a));
                     }
                 }
             }
@@ -2174,8 +2168,9 @@ impl Saveable for Bridge {
             .u64s("ate", &st.ate[..self.part.ate_entries()])
             .u32("int_error", st.int_error)
             .u8s("pins", &[st.pin_level, st.dma_64bit])
-            .u64("dma_pci_address", st.dma_pci_address)
-            .u32("dma_device", st.dma_device)
+            // Older builds require these keys; the capture they held now lives with the transfer.
+            .u64("dma_pci_address", 0)
+            .u32("dma_device", 0)
             .value("bus", self.bus.save_state())
             .value("microlan", microlan)
             .u32("revision", self.revision.load(Ordering::Acquire));
@@ -2213,8 +2208,6 @@ impl Saveable for Bridge {
             st.int_error = field_u32(v, "int_error")?;
             st.pin_level = pin_level;
             st.dma_64bit = dma_64bit;
-            st.dma_pci_address = field_u64(v, "dma_pci_address")?;
-            st.dma_device = field_u32(v, "dma_device")?;
         }
         self.bus.set_host_windows(&|| self.windows());
         Ok(())
