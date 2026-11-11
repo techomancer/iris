@@ -9,13 +9,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use bytemuck::{Pod, Zeroable};
 use parking_lot::Mutex;
 
 use crate::dev::ng1::rex3::{Rex3Context, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH};
 use crate::dev::ng1::rex3_flat_fill::{prepare_resident_flat_fill, FillPlane};
+use crate::wgpu::host::HostBuffer;
 use crate::wgpu::tiles::{COARSE, LIST_CAP, MASK_WORDS, TILE_H, TILE_W};
 use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileGrid};
+
+use super::command::{
+    COMMAND_FLAT_FILL, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
+    MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_SOURCE_COLOR,
+    STATE_WORDS, STATE_WRITE_MASK,
+};
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
@@ -374,10 +380,19 @@ fn validate_limits(limits: &wgpu::Limits) -> Result<(), ResidentError> {
     };
     let grid = TileGrid::new(REX3_SCREEN_WIDTH as u32, REX3_SCREEN_HEIGHT as u32);
     let workgroup_bytes = 4 * (MASK_WORDS * (1 + COARSE * COARSE) + 64 + 2);
-    check("max_buffer_size", limits.max_buffer_size, READBACK_BYTES.max(LIST_CAP as u64 * 4))?;
-    check("max_storage_buffer_binding_size", limits.max_storage_buffer_binding_size, PLANE_BYTES.max(LIST_CAP as u64 * 4))?;
-    // The bin layout has four storage buffers in group 0, two in group 1,
-    // and both planes in group 2.
+    check(
+        "max_buffer_size",
+        limits.max_buffer_size,
+        READBACK_BYTES.max(LIST_CAP as u64 * 4).max(MAX_PAYLOAD_BYTES),
+    )?;
+    check(
+        "max_storage_buffer_binding_size",
+        limits.max_storage_buffer_binding_size,
+        PLANE_BYTES.max(LIST_CAP as u64 * 4).max(MAX_PAYLOAD_BYTES),
+    )?;
+    // The raster layout has three storage buffers in group 0, two in group
+    // 1, and both planes plus the current payload set in group 2. The
+    // accept-all bin pipeline does not bind the board resources.
     check("max_storage_buffers_per_shader_stage", limits.max_storage_buffers_per_shader_stage as u64, 8)?;
     check("max_bind_groups", limits.max_bind_groups as u64, 3)?;
     check("max_bindings_per_bind_group", limits.max_bindings_per_bind_group as u64, 6)?;
@@ -386,25 +401,6 @@ fn validate_limits(limits: &wgpu::Limits) -> Result<(), ResidentError> {
     check("max_compute_workgroup_storage_size", limits.max_compute_workgroup_storage_size as u64, workgroup_bytes as u64)?;
     check("max_compute_workgroups_per_dimension", limits.max_compute_workgroups_per_dimension as u64, grid.tiles() as u64)?;
     Ok(())
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct FillRecord {
-    min_x: u32,
-    min_y: u32,
-    max_x: u32,
-    max_y: u32,
-    slot: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct FillSlot {
-    color: u32,
-    mask: u32,
-    plane: u32,
-    _pad: u32,
 }
 
 /// The only owner of the raw plane handles. The bind-group seam below gives
@@ -711,8 +707,9 @@ pub(crate) struct ResidentGpu {
     gpu: Arc<Gpu>,
     planes: Planes,
     pipelines: BatchPipelines,
-    group: wgpu::BindGroup,
-    batch: Batch<FillRecord, FillSlot>,
+    sets: Vec<RasterSet>,
+    batch: Batch<RexCommand, RexStateSlot>,
+    payload: PayloadBatch,
     progress: Arc<Mutex<ResidentStatus>>,
     readback: wgpu::Buffer,
     /// Allocation identities only; the backend never dereferences them.
@@ -720,6 +717,11 @@ pub(crate) struct ResidentGpu {
     aux_shadow: usize,
     max_slots: u32,
     max_sets: NonZeroUsize,
+}
+
+struct RasterSet {
+    payload: HostBuffer,
+    group: wgpu::BindGroup,
 }
 
 impl ResidentGpu {
@@ -764,19 +766,23 @@ impl ResidentGpu {
             }
         };
 
-        let entry = |binding| wgpu::BindGroupLayoutEntry {
+        let entry = |binding, read_only, bytes| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                ty: wgpu::BufferBindingType::Storage { read_only },
                 has_dynamic_offset: false,
-                min_binding_size: wgpu::BufferSize::new(PLANE_BYTES),
+                min_binding_size: wgpu::BufferSize::new(bytes),
             },
             count: None,
         };
         let layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("resident rex3 raster planes"),
-            entries: &[entry(0), entry(1)],
+            entries: &[
+                entry(0, false, PLANE_BYTES),
+                entry(1, false, PLANE_BYTES),
+                entry(2, true, MAX_PAYLOAD_BYTES),
+            ],
         });
         let pipelines = BatchPipelines::new(&gpu, &ArchShaders {
             label: "resident rex3",
@@ -787,18 +793,45 @@ impl ResidentGpu {
                 ("PLANE_STRIDE", STRIDE),
                 ("WRITE_WIDTH", REX3_SCREEN_WIDTH as u32),
                 ("PLANE_HEIGHT", HEIGHT),
+                ("REX_COMMAND_FLAT_FILL", COMMAND_FLAT_FILL),
+                ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
+                ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
+                ("REX_STATE_WORDS", STATE_WORDS as u32),
+                ("REX_STATE_WRITE_MASK", STATE_WRITE_MASK as u32),
+                ("REX_STATE_SOURCE_COLOR", STATE_SOURCE_COLOR as u32),
             ],
             layouts: &[&layout],
         }).map_err(ResidentError::Failed)?;
         let planes = Planes::new(&gpu);
-        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resident rex3 raster planes"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: planes.rgb.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: planes.aux.as_entire_binding() },
-            ],
-        });
+        let sets = (0..max_sets.get())
+            .map(|index| {
+                let payload = HostBuffer::new(
+                    &gpu,
+                    &format!("resident rex3 payload {index}"),
+                    MAX_PAYLOAD_BYTES,
+                    wgpu::BufferUsages::STORAGE,
+                );
+                let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("resident rex3 raster planes and payload"),
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: planes.rgb.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: planes.aux.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: payload.buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                RasterSet { payload, group }
+            })
+            .collect();
         let mut batch = Batch::new_bounded(
             &gpu,
             &pipelines,
@@ -822,7 +855,14 @@ impl ResidentGpu {
         record_completion(&gpu, &progress, seed);
         gpu.check().map_err(gpu_error)?;
         Ok(Self {
-            gpu, planes, pipelines, group, batch, progress, readback,
+            gpu,
+            planes,
+            pipelines,
+            sets,
+            batch,
+            payload: PayloadBatch::new(MAX_PAYLOAD_WORDS),
+            progress,
+            readback,
             rgb_shadow: rgb.as_ptr() as usize,
             aux_shadow: aux.as_ptr() as usize,
             max_slots, max_sets,
@@ -950,12 +990,7 @@ impl ResidentBackend for ResidentGpu {
         let position = self.progress.lock().next_position()?;
         let fill = command.fill();
         if let Some(fill) = fill {
-            let slot = FillSlot {
-                color: fill.color,
-                mask: fill.write_mask,
-                plane: match fill.plane { FillPlane::Rgb => 0, FillPlane::Aux => 1 },
-                _pad: 0,
-            };
+            let slot = RexStateSlot::for_flat_fill(context, fill);
             loop {
                 let result = self.batch.prim_with_slot(
                     slot,
@@ -963,13 +998,7 @@ impl ResidentBackend for ResidentGpu {
                     fill.min_y as i32,
                     (fill.min_x + fill.width - 1) as i32,
                     (fill.min_y + fill.height - 1) as i32,
-                    |slot| FillRecord {
-                        min_x: fill.min_x,
-                        min_y: fill.min_y,
-                        max_x: fill.min_x + fill.width - 1,
-                        max_y: fill.min_y + fill.height - 1,
-                        slot,
-                    },
+                    |slot| RexCommand::flat_fill(slot, fill),
                 );
                 match result {
                     Ok(Some(_)) => break,
@@ -993,8 +1022,27 @@ impl ResidentBackend for ResidentGpu {
         if accepted == submitted {
             return Ok(());
         }
-        let submission = self.batch.try_flush(&self.pipelines, &[&self.group])
-            .map_err(gpu_error)?;
+        if self.batch.is_empty() && !self.payload.is_empty() {
+            return Err(ResidentError::InvalidState("payload exists without a command"));
+        }
+        let result = if self.batch.is_empty() {
+            self.batch.try_flush(&self.pipelines, &[])
+        } else {
+            let batch = &mut self.batch;
+            let index = batch.try_next_set(&self.pipelines).map_err(gpu_error)?;
+            let set = self
+                .sets
+                .get(index)
+                .ok_or(ResidentError::InvalidState("batch selected an unknown payload set"))?;
+            if !self.payload.is_empty() {
+                set.payload.write(0, self.payload.bytes());
+            }
+            batch.try_flush(&self.pipelines, &[&set.group])
+        };
+        if result.is_ok() {
+            self.payload.clear();
+        }
+        let submission = result.map_err(gpu_error)?;
         if submission.is_none() {
             // A run of no-op GOs still needs a queue marker for its stream
             // position, but it does not change either plane's generation.

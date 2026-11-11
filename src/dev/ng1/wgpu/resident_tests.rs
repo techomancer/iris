@@ -646,6 +646,9 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
             Arc::clone(&gpu), &seed_rgb, &seed_aux, 1, NonZeroUsize::new(1).unwrap(), None,
         ).expect("activate linear resident planes");
         assert!(resident.batch.timing.is_none(), "resident submits never enable the batch timer's readback map");
+        assert_eq!(resident.sets.len(), 1);
+        assert_eq!(resident.sets[0].payload.size(), MAX_PAYLOAD_BYTES);
+        assert!(resident.payload.is_empty());
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         for plane in [&resident.planes.rgb, &resident.planes.aux] {
             assert_eq!(plane.size(), PLANE_BYTES);
