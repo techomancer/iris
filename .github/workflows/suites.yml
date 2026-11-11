@@ -15,7 +15,10 @@
 #              on R4400; the R10000, R12000 and R14000 because their FPU, CP0,
 #              TLB and cache differ from both (cpu-tests/docs/r10000.md).
 #              interp vs jitv2 because a guest-visible ISA suite is the
-#              cleanest JIT differential available.
+#              cleanest JIT differential available. The R4400 and R5000 also
+#              run the cache model the engine does not default to (shadow on
+#              the interpreter, full under jitv2), so both models are judged
+#              on both engines' binaries.
 #
 #   bench      is it still correct after ten million of them, with whatever
 #              state the last million left — and how long did that take.

@@ -21,19 +21,30 @@ pub fn guest_elf_path() -> PathBuf {
         .unwrap_or_else(|| repo("cpu-tests/build/cputest.elf"))
 }
 
-/// The tests a cell is expected to fail: its `[cpu-engine]` section of
-/// expected-failures.txt. `#` starts a comment anywhere on a line.
-pub fn expected_failures(cell: &str) -> BTreeSet<String> {
+/// The tests a cell is expected to fail: its `[cell]` section of
+/// expected-failures.txt, or `None` when the file has no such section. A
+/// header may name several cells, `[a, b]`. `#` starts a comment anywhere on
+/// a line.
+pub fn expected_failures(cell: &str) -> Option<BTreeSet<String>> {
     let text = std::fs::read_to_string(repo("cpu-tests/expected-failures.txt"))
         .expect("read cpu-tests/expected-failures.txt");
-    let mut want = BTreeSet::new();
+    parse_expected_failures(&text, cell)
+}
+
+/// `expected_failures` on the file's text.
+pub fn parse_expected_failures(text: &str, cell: &str) -> Option<BTreeSet<String>> {
+    let mut want = None;
     let mut section = None;
     for line in text.lines() {
         let line = line.split('#').next().unwrap().trim();
         if line.starts_with('[') {
-            section = Some(line.trim_matches(|c| c == '[' || c == ']').to_string());
-        } else if !line.is_empty() && section.as_deref() == Some(cell) {
-            want.insert(line.to_string());
+            let names = line.trim_matches(|c| c == '[' || c == ']');
+            section = Some(names.split(',').any(|n| n.trim() == cell));
+            if section == Some(true) {
+                want.get_or_insert_with(BTreeSet::new);
+            }
+        } else if !line.is_empty() && section == Some(true) {
+            want.get_or_insert_with(BTreeSet::new).insert(line.to_string());
         }
     }
     want
@@ -181,9 +192,15 @@ pub struct GuestRun {
 }
 
 impl GuestRun {
-    /// The cell's verdict: empty when it passes.
+    /// The cell's verdict: empty when it passes. A cell with no section in
+    /// expected-failures.txt fails, so a misspelt cell name cannot pass as
+    /// one that expects nothing to fail.
     pub fn errors(&self, cell: &str) -> Vec<Finding> {
-        let mut errs = judge(cell, &self.tap, &expected_failures(cell));
+        let Some(want) = expected_failures(cell) else {
+            return vec![Finding::run(format!(
+                "no [{cell}] section in cpu-tests/expected-failures.txt: add one, empty if nothing is expected to fail"))];
+        };
+        let mut errs = judge(cell, &self.tap, &want);
         if let Some(c) = &self.crash {
             errs.insert(0, Finding::run(c.clone()));
         }
@@ -191,11 +208,12 @@ impl GuestRun {
     }
 }
 
-/// Run the guest on `cpu` under this build's `iris`. An error is a run that
-/// never finished (a timeout or a failure to start); a crash is reported by
-/// the run and judged with it.
-pub fn run_guest(cpu: &str, elf: &Path) -> Result<GuestRun, String> {
-    let dir = run_dir(&format!("cpu-tests-{cpu}"));
+/// Run the guest on `cpu` under this build's `iris`, with the cache model
+/// `cache` (`auto`, `full` or `shadow`). An error is a run that never
+/// finished (a timeout or a failure to start); a crash is reported by the run
+/// and judged with it.
+pub fn run_guest(cpu: &str, cache: &str, elf: &Path) -> Result<GuestRun, String> {
+    let dir = run_dir(&format!("cpu-tests-{cpu}-{cache}"));
     let config = machine_config("cpu-tests/run/bare.toml", &dir);
     let log = dir.join("serial.log");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_iris"));
@@ -204,7 +222,7 @@ pub fn run_guest(cpu: &str, elf: &Path) -> Result<GuestRun, String> {
         .arg("--load-elf").arg(elf)
         .arg("--test-device")
         .arg("--test-device-dump").arg(dir.join("dump.json"))
-        .args(["--headless", "--noaudio", "--cpu", cpu]);
+        .args(["--headless", "--noaudio", "--cpu", cpu, "--cache", cache]);
     let out = run(cmd, timeout(TIMEOUT_S), &log)?;
     Ok(GuestRun { tap: parse_tap(&out.stdout), crash: out.crash(), stdout: out.stdout, log })
 }

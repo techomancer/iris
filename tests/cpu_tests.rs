@@ -11,6 +11,11 @@
 //! building nothing and calling it a pass; asked for explicitly with no guest
 //! binary, they fail and say how to build one.
 //!
+//! Each CPU runs the cache model `auto` picks for this build, in the cell
+//! `<cpu>-<engine>`. The R4400 and R5000 also run the other model, in the cell
+//! `<cpu>-<engine>-<model>`: the shadow model on the interpreter, the full
+//! model in a jitv2 build. Both models are judged without another build.
+//!
 //! A cell passes when exactly the tests listed for it in
 //! `cpu-tests/expected-failures.txt` fail and every planned test reported;
 //! the failure names each test that broke the rule. The R10000, R12000 and
@@ -23,9 +28,19 @@ mod common;
 use common::cputest::*;
 use common::*;
 
-fn cell(cpu: &str) {
+/// The R4400 or R5000 on the model `auto` does not pick in this build.
+fn other_cache(cpu: &str) {
+    let part = iris::cpu::parts::find(iris::cpu::parts::ALL, cpu).expect("a known CPU");
+    let other = if iris::config::CacheModel::Auto.is_shadow(part) { "full" } else { "shadow" };
+    cell(cpu, Some(other));
+}
+
+fn cell(cpu: &str, cache: Option<&str>) {
     require_optimised_build();
-    let cell = format!("{}-{}", cpu, engine());
+    let cell = match cache {
+        Some(model) => format!("{}-{}-{}", cpu, engine(), model),
+        None => format!("{}-{}", cpu, engine()),
+    };
     let elf = guest_elf_path();
     assert!(
         elf.is_file(),
@@ -33,7 +48,7 @@ fn cell(cpu: &str) {
          container (cpu-tests/docs/toolchain.md) or point IRIS_CPUTEST_ELF at one",
         elf.display()
     );
-    let run = run_guest(cpu, &elf).unwrap_or_else(|e| panic!("{cell}: {e}"));
+    let run = run_guest(cpu, cache.unwrap_or("auto"), &elf).unwrap_or_else(|e| panic!("{cell}: {e}"));
     let errs = run.errors(&cell);
     let reported = run.tap.results.len();
     let failed = run.tap.results.iter().filter(|(_, ok)| !ok).count();
@@ -55,31 +70,43 @@ fn cell(cpu: &str) {
 #[test]
 #[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
 fn r4400() {
-    cell("r4400");
+    cell("r4400", None);
+}
+
+#[test]
+#[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
+fn r4400_other_cache() {
+    other_cache("r4400");
 }
 
 #[test]
 #[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
 fn r5000() {
-    cell("r5000");
+    cell("r5000", None);
+}
+
+#[test]
+#[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
+fn r5000_other_cache() {
+    other_cache("r5000");
 }
 
 #[test]
 #[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
 fn r10000() {
-    cell("r10000");
+    cell("r10000", None);
 }
 
 #[test]
 #[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
 fn r12000() {
-    cell("r12000");
+    cell("r12000", None);
 }
 
 #[test]
 #[ignore = "bare-metal suite: needs an optimised build and the cpu-tests guest; cargo test --release --test cpu_tests -- --ignored"]
 fn r14000() {
-    cell("r14000");
+    cell("r14000", None);
 }
 
 mod parser {
@@ -110,6 +137,21 @@ mod parser {
         assert!(judge("x", &t, &want()).is_empty());
         let t = parse_tap(&format!("1..2\nnot ok 1 - a/b\nok 2 - c/d\n{DONE}"));
         assert_eq!(judge("x", &t, &want()).len(), 2, "a new failure and a new pass");
+    }
+
+    #[test]
+    fn a_cell_with_no_section_is_unknown_and_an_empty_section_expects_nothing() {
+        let text = "[a-interp, a-jitv2]\nc/d\n[b-interp]\n# nothing fails\n";
+        assert_eq!(parse_expected_failures(text, "a-interp"), Some(want()));
+        assert_eq!(parse_expected_failures(text, "a-jitv2"), Some(want()), "a header may name several cells");
+        assert_eq!(parse_expected_failures(text, "b-interp"), Some(BTreeSet::new()));
+        assert_eq!(parse_expected_failures(text, "c-interp"), None);
+        for cpu in ["r4400", "r5000", "r10000", "r12000", "r14000"] {
+            for engine in ["interp", "jitv2"] {
+                let cell = format!("{cpu}-{engine}");
+                assert!(expected_failures(&cell).is_some(), "no [{cell}] in expected-failures.txt");
+            }
+        }
     }
 
     #[test]
