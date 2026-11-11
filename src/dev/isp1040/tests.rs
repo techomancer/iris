@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::dev::isp12160::Isp12160Part;
-use crate::irq::LevelProbe;
+use crate::irq::{IrqLine, LevelProbe};
 use crate::test_temp::TempPath;
 use crate::pci::PciDmaStatus;
 use crate::traits::{Device, Saveable};
@@ -70,6 +70,20 @@ impl<P: IspPart> Rig<P> {
         isp.state().connect_dma(mem.clone());
         Rig { isp, mem }
     }
+
+    /// Like [`Rig::on`], with the interrupt line wired before the ring thread
+    /// starts. The thread drives the line whenever it waits, so a line
+    /// connected after it started can be written once by the thread and
+    /// again by `attached`, and a test that reads the exact writes would see
+    /// a repeat that belongs to the rig and not to the adapter.
+    fn on_line(isp: Isp<P>, line: IrqLine) -> Self {
+        let mem = FakeMem::new();
+        isp.state().connect_dma(mem.clone());
+        isp.state().connect_irq(line);
+        isp.attached();
+        Device::start(&isp);
+        Rig { isp, mem }
+    }
 }
 
 impl Rig {
@@ -79,8 +93,12 @@ impl Rig {
     /// A chip with a disk of `blocks` blocks at target `id`.
     fn with_disk(name: &str, id: u8, blocks: usize) -> Rig {
         let r = Rig::bare();
-        r.isp.bus().attach_image(id, &image(name, blocks), false).expect("attach");
+        r.disk(name, id, blocks);
         r
+    }
+
+    fn disk(&self, name: &str, id: u8, blocks: usize) {
+        self.isp.bus().attach_image(id, &image(name, blocks), false).expect("attach");
     }
 }
 
@@ -247,10 +265,8 @@ fn dma_block_config_is_storage_and_control_is_inert() {
 
 #[test]
 fn bus_ctrl_status_and_the_interrupt_line() {
-    let r = Rig::bare();
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp1040::new(), line);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     assert_eq!(r.r(reg::BUS_CTRL), CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     r.w(reg::BUS_CTRL, 0xffff);
@@ -278,10 +294,8 @@ fn bus_ctrl_status_and_the_interrupt_line() {
 /// level as an edge would see each repeat of a high level as another one.
 #[test]
 fn the_line_is_written_only_when_its_level_changes() {
-    let r = Rig::bare();
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp1040::new(), line);
     // Attaching writes the line once, whatever its level.
     assert_eq!(probe.writes(), [false]);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
@@ -304,10 +318,8 @@ fn the_line_is_written_only_when_its_level_changes() {
 #[test]
 fn the_line_is_rewritten_after_the_bus_attaches_and_after_a_load() {
     use crate::irq::IrqLine;
-    let r = Rig::bare();
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp1040::new(), line);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     r.w(r.mb(0), mbox::NOP);
     r.w(reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT);
@@ -339,10 +351,9 @@ fn clear_line<P: IspPart>(r: &Rig<P>) {
 
 /// The line is written once for each change of level, on the real register
 /// path of each part.
-fn the_level_reaches_the_line_once_per_change<P: IspPart>(r: Rig<P>) {
+fn the_level_reaches_the_line_once_per_change<P: IspPart>(isp: Isp<P>) {
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(isp, line);
     raise_line(&r);
     for _ in 0..3 {
         r.w(reg::SEMAPHORE, 0);
@@ -354,7 +365,7 @@ fn the_level_reaches_the_line_once_per_change<P: IspPart>(r: Rig<P>) {
 
 #[test]
 fn the_isp12160_writes_its_line_only_when_its_level_changes() {
-    the_level_reaches_the_line_once_per_change(rig12160());
+    the_level_reaches_the_line_once_per_change(isp12160());
 }
 
 /// A second thread changes the level while a first one's delivery is held in
@@ -362,11 +373,10 @@ fn the_isp12160_writes_its_line_only_when_its_level_changes() {
 /// state, so the second change waits for the first to be delivered: the
 /// parent sees the rise and then the fall. A driver that read the level in
 /// one hold and wrote the line outside it would deliver the fall first.
-fn a_stalled_delivery_is_not_overtaken<P: IspPart>(r: Rig<P>) {
+fn a_stalled_delivery_is_not_overtaken<P: IspPart>(isp: Isp<P>) {
     use crate::irq::StallingProbe;
     let (stall, line) = StallingProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(isp, line);
     r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
     r.isp.write(r.mb(0), mbox::NOP as u32, 2);
     let (started, go) = stall.arm();
@@ -385,21 +395,50 @@ fn a_stalled_delivery_is_not_overtaken<P: IspPart>(r: Rig<P>) {
 
 #[test]
 fn the_isp1040_does_not_let_a_fall_overtake_a_rise_in_delivery() {
-    a_stalled_delivery_is_not_overtaken(Rig::bare());
+    a_stalled_delivery_is_not_overtaken(Isp1040::new());
 }
 
 #[test]
 fn the_isp12160_does_not_let_a_fall_overtake_a_rise_in_delivery() {
-    a_stalled_delivery_is_not_overtaken(rig12160());
+    a_stalled_delivery_is_not_overtaken(isp12160());
+}
+
+/// A driver clears the interrupt and a second command raises it again while
+/// the first rise is still on its way to the parent. The parent must see the
+/// fall and the second rise, not one steady high: a controller that takes a
+/// rising level as an edge loses the second interrupt otherwise. A driver
+/// that changed the state in one hold and read the level to deliver in a
+/// later one would send both from the final level and drop the fall. Each
+/// thread makes a single register write, so the raise is not held up behind
+/// its own earlier write's delivery.
+#[test]
+fn a_fall_and_a_rise_queued_behind_a_stalled_rise_are_both_delivered() {
+    use crate::irq::StallingProbe;
+    let (stall, line) = StallingProbe::line();
+    let r = Rig::on_line(Isp1040::new(), line);
+    r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
+    r.isp.write(r.mb(0), mbox::NOP as u32, 2);
+    let (started, go) = stall.arm();
+    std::thread::scope(|scope| {
+        scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
+        started.recv_timeout(Duration::from_secs(5)).expect("the first rise is in the parent");
+        scope.spawn(|| clear_line(&r));
+        std::thread::sleep(Duration::from_millis(100));
+        scope.spawn(|| r.isp.write(reg::HOST_CMD, (0x5 << HOST_CMD_SHIFT) as u32, 2));
+        std::thread::sleep(Duration::from_millis(100));
+        go.send(()).unwrap();
+    });
+    assert_eq!(stall.probe.writes(), [false, true, false, true]);
+    assert!(stall.probe.level());
+    assert!(r.isp.interrupting());
 }
 
 /// Four threads raise and clear the interrupt as fast as they can. Every
 /// write the parent sees is a change of level, and the line ends where the
 /// adapter's state says.
-fn racing_writers_deliver_only_real_edges<P: IspPart>(r: Rig<P>) {
+fn racing_writers_deliver_only_real_edges<P: IspPart>(isp: Isp<P>) {
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(isp, line);
     r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
     r.isp.write(r.mb(0), mbox::NOP as u32, 2);
     std::thread::scope(|scope| {
@@ -419,12 +458,12 @@ fn racing_writers_deliver_only_real_edges<P: IspPart>(r: Rig<P>) {
 
 #[test]
 fn racing_register_writers_on_the_isp1040_deliver_only_real_edges() {
-    racing_writers_deliver_only_real_edges(Rig::bare());
+    racing_writers_deliver_only_real_edges(Isp1040::new());
 }
 
 #[test]
 fn racing_register_writers_on_the_isp12160_deliver_only_real_edges() {
-    racing_writers_deliver_only_real_edges(rig12160());
+    racing_writers_deliver_only_real_edges(isp12160());
 }
 
 /// A completion posted on the ring thread rises while another thread clears
@@ -434,11 +473,10 @@ fn racing_register_writers_on_the_isp12160_deliver_only_real_edges() {
 #[test]
 fn a_completion_posted_by_the_ring_thread_is_delivered_before_a_later_fall() {
     use crate::irq::StallingProbe;
-    let r = Rig::with_disk("irq-ring", 1, 64);
-    r.init_rings(4, 4);
     let (stall, line) = StallingProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp1040::new(), line);
+    r.disk("irq-ring", 1, 64);
+    r.init_rings(4, 4);
     r.isp.write(reg::BUS_CTRL, (CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE) as u32, 2);
     r.put_entry(0, &request(0x1234, 1, &[0x12, 0, 0, 0, 36, 0], &[(BUF, 36)]));
     let (started, go) = stall.arm();
@@ -462,10 +500,9 @@ fn a_completion_posted_by_the_ring_thread_is_delivered_before_a_later_fall() {
 /// A soft reset through BUS_CTRL drops the line before it waits out the
 /// fence, not after: another thread can change the interrupt meanwhile, and
 /// a fall driven late would be lost behind its rise.
-fn a_soft_reset_drives_the_line_before_it_waits_for_the_fence<P: IspPart>(r: Rig<P>) {
+fn a_soft_reset_drives_the_line_before_it_waits_for_the_fence<P: IspPart>(isp: Isp<P>) {
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(isp, line);
     raise_line(&r);
     assert!(probe.level());
     let fence = r.isp.fence.lock();
@@ -483,12 +520,12 @@ fn a_soft_reset_drives_the_line_before_it_waits_for_the_fence<P: IspPart>(r: Rig
 
 #[test]
 fn the_isp1040_soft_reset_drives_the_line_before_the_fence() {
-    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(Rig::bare());
+    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(Isp1040::new());
 }
 
 #[test]
 fn the_isp12160_soft_reset_drives_the_line_before_the_fence() {
-    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(rig12160());
+    a_soft_reset_drives_the_line_before_it_waits_for_the_fence(isp12160());
 }
 
 #[test]
@@ -1275,10 +1312,9 @@ fn an_acknowledgement_does_not_erase_a_later_completion() {
 
 #[test]
 fn clearing_the_interrupt_keeps_a_completion_the_driver_was_not_shown() {
-    let r = Rig::with_disk("unseen", 0, 64);
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    let r = Rig::on_line(Isp1040::new(), line);
+    r.disk("unseen", 0, 64);
     r.init_rings(8, 8);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     r.put_entry(0, &tur_entry(0x5001));
@@ -1608,12 +1644,12 @@ fn gated_rig(name: &str) -> (Rig, Arc<GatedMem>, Arc<LevelProbe>) {
     let mem = FakeMem::new();
     let gate = GatedMem::new(mem.clone(), BUF);
     let isp = Isp1040::new();
-    Device::start(&isp);
     isp.state().connect_dma(gate.clone());
     isp.bus().attach_image(1, &image(name, 64), false).expect("attach");
     let (probe, line) = LevelProbe::line();
     isp.state().connect_irq(line);
     isp.attached();
+    Device::start(&isp);
     let r = Rig { isp, mem };
     r.init_rings(4, 4);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
@@ -1649,13 +1685,13 @@ fn a_soft_reset_does_not_wait_for_the_target() {
     let mem = FakeMem::new();
     let gate = GatedMem::new(mem.clone(), BUF);
     let isp = Isp1040::new();
-    Device::start(&isp);
     isp.state().connect_dma(gate.clone());
     isp.bus().attach_image(1, &image("async-reset", 64), false).expect("attach");
-    let r = Rig { isp, mem };
     let (probe, line) = LevelProbe::line();
-    r.isp.state().connect_irq(line);
-    r.isp.attached();
+    isp.state().connect_irq(line);
+    isp.attached();
+    Device::start(&isp);
+    let r = Rig { isp, mem };
     r.init_rings(4, 4);
     r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
     r.mem.put(BUF, &[0x5a; BLOCK_SIZE]);
@@ -1950,7 +1986,9 @@ fn the_isp12160_preserves_queued_bus_and_target_resets_across_save_load() {
 
 // ---- ISP12160 second channel and recovery commands -----------------------
 
-fn rig12160() -> Rig<Isp12160Part> { Rig::on(Isp::new_12160(Isp1040::new_bus(), Isp1040::new_bus())) }
+fn isp12160() -> Isp<Isp12160Part> { Isp::new_12160(Isp1040::new_bus(), Isp1040::new_bus()) }
+
+fn rig12160() -> Rig<Isp12160Part> { Rig::on(isp12160()) }
 
 /// A 64-block image whose first block is `fill`, so a read says which disk answered.
 fn filled_image(name: &str, fill: u8) -> TempPath {
