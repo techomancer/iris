@@ -18,6 +18,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - New machine `origin3200_ip35`: one or two C-bricks and an I-brick. PROM 6.210 reaches
   the System Maintenance Menu on both and IRIX boots from a Fibre Channel disk
   (`[fibre_channel.disk.N]`).
+- The Origin 3200's I-brick has a USB keyboard and mouse (HID boot devices on its OHCI), driven by the same
+  `ps2` monitor commands.
 
 ### GPU raster on the GL backend draws the window directly
 
