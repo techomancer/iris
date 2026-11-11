@@ -43,12 +43,13 @@ jobs:
         # Platforms per event kind; a failure fails the job only where gates is true.
         # arm64 Linux gates: 24 of 24 recent pull-request runs passed every test there.
         # Windows gates: a Windows-only test failure used to pass the job unseen.
-        # features: x86-64 Linux also compiles and tests the jitv2 (and tcache) paths;
-        # arm64 and Windows keep default features, which cover the paths without them.
+        # features: x86-64 Linux also tests the jitv2 (and tcache) paths; arm64 and
+        # Windows keep the non-jitv2 paths. rex-gpu and rex-jit add the REX3 GPU matcher
+        # and replay-corpus tests to Linux's one build (rex-gpu implies gputrace).
         include: ${{ fromJSON('{
-          "push":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2"},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":true},{"os":"macos-26","gates":false}],
-          "draft":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2"}],
-          "ready":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2"},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":true}]
+          "push":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2,rex-gpu,rex-jit"},{"os":"ubuntu-24.04-arm","gates":true,"features":"--features rex-gpu,rex-jit"},{"os":"windows-latest","gates":true},{"os":"macos-26","gates":false}],
+          "draft":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2,rex-gpu,rex-jit"}],
+          "ready":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2,rex-gpu,rex-jit"},{"os":"ubuntu-24.04-arm","gates":true,"features":"--features rex-gpu,rex-jit"},{"os":"windows-latest","gates":true}]
           }')[github.event_name != 'pull_request' && 'push' || github.event.pull_request.draft && 'draft' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
@@ -76,19 +77,10 @@ jobs:
     - name: Build
       if: ${{ !matrix.gates }}
       run: cargo build --workspace --verbose
-    # Linux compiles the replay example inside the matcher test step below.
+    # Linux's nextest build below compiles the replay example.
     - name: Check REX3 GPU replay
       if: runner.os != 'Linux'
       run: cargo check -p iris --lib --example rex3-gpu-probe --features rex-gpu
-    - name: Test REX3 GPU matcher
-      if: runner.os == 'Linux'
-      run: cargo test -p iris --lib --example rex3-gpu-probe --features rex-gpu rex3_gpu::tests
-    - name: Validate strict synthetic REX3 CPU corpus
-      if: runner.os == 'Linux'
-      run: |
-        cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_replay_testdata -- --nocapture
-        cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_ -- --nocapture
-        REX3_CORPUS_IO_DIR=target cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_filesystem_security -- --ignored --nocapture
     # The VPro fragment pipeline's SIMD kernels against their scalar
     # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
     # lanes.rs): deterministic, so they gate everywhere. macos-26 and
@@ -107,6 +99,13 @@ jobs:
     - name: Run doctests
       continue-on-error: ${{ !matrix.gates }}
       run: cargo test --workspace --doc
+    # The one ignored test: it needs a relative scratch directory. Same build as
+    # above; the default profile keeps it from overwriting the ci JUnit report.
+    - name: Test the REX3 corpus filesystem checks
+      if: runner.os == 'Linux'
+      run: >
+        REX3_CORPUS_IO_DIR=target cargo nextest run --workspace ${{ matrix.features }}
+        --run-ignored only -E 'test(rex3_corpus_filesystem_security)'
     - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
       if: ${{ !cancelled() }}
       with:
