@@ -56,11 +56,10 @@
 //! refused, counted, if the context is not decoded, targets planes the model
 //! does not yet hold, or finds a destination word wider than the target. The
 //! planes not held are the overlays, the popup planes and the display-ID plane,
-//! which the display step takes, and the two-buffer RGB form (configuration 4,
-//! buffer selector 3), which the model's source draws into both buffers while
-//! this model has one colour word and refuses it rather than draw half. A
-//! request is checked whole before any pixel is written, so a refusal draws
-//! nothing. That a data run is the next box's or rectangle's words, and that a
+//! which the display step takes. The two-buffer RGB form (configuration 4, buffer selector 3)
+//! paints both colour words of a double-buffered window, the word the X path draws and the one
+//! after it (inferred: the selector's value 3 meaning both buffers). A request is checked whole
+//! before any pixel is written, so a refusal draws nothing. That a data run is the next box's or rectangle's words, and that a
 //! run of odd length is dropped, are inferred from the senders.
 //!
 //! The model carries no per-pixel tag saying what a word means (index or
@@ -183,6 +182,8 @@ pub(super) struct Plan<'a> {
     clips: &'a [[i32; 4]],
     pub(super) stipple: Option<StipplePattern>,
     pub(super) needs: bool,
+    /// The second colour buffer's words, when the context paints both buffers at once.
+    back: Option<WordArray<'a>>,
 }
 
 impl<'a> Plan<'a> {
@@ -193,7 +194,7 @@ impl<'a> Plan<'a> {
             Ok(gc) if stipple.is_some() || !gc.opaque_or_tiled => gc,
             _ => return Err(Refused::Context),
         };
-        Plan::with_gc(x, surface, gc, stipple)
+        Plan::build(x, surface, gc, stipple, true)
     }
 
     /// The plan for background points: the context's background colour as
@@ -201,7 +202,7 @@ impl<'a> Plan<'a> {
     fn background(x: &'a XState, surface: &Surface<'a>) -> Result<Option<Plan<'a>>, Refused> {
         let Ok(mut gc) = Gc::decode_for_fill(&x.gc) else { return Err(Refused::Context) };
         gc.foreground = gc.background;
-        Plan::with_gc(x, surface, gc, None)
+        Plan::build(x, surface, gc, None, true)
     }
 
     /// The plan for a request drawn under `gc`, which the caller decoded:
@@ -209,8 +210,16 @@ impl<'a> Plan<'a> {
     /// fills' own plan is the code it was before this had a second caller.
     #[inline(always)]
     pub(super) fn with_gc(x: &'a XState, surface: &Surface<'a>, gc: Gc, stipple: Option<StipplePattern>) -> Result<Option<Plan<'a>>, Refused> {
+        Plan::build(x, surface, gc, stipple, false)
+    }
+
+    /// `with_gc`, where `both` lets the two-buffer RGB form (configuration 4, buffer selector 3)
+    /// plan: the fills draw it into both colour words (see `request`), and the transfers, which do
+    /// not, refuse it.
+    #[inline(always)]
+    fn build(x: &'a XState, surface: &Surface<'a>, gc: Gc, stipple: Option<StipplePattern>, both: bool) -> Result<Option<Plan<'a>>, Refused> {
         let two_buffers = gc.target == Target::MainRgb8 && gc.raw[GC_FRAMEBUFFER_CONFIG] == 4 && gc.first_selector == 3;
-        if two_buffers || gc.target == Target::OverlayBoth {
+        if (two_buffers && !both) || gc.target == Target::OverlayBoth {
             return Err(Refused::Target);
         }
         if gc.is_noop() {
@@ -226,9 +235,17 @@ impl<'a> Plan<'a> {
             Target::Popup => surface.sibling(POPUP_PLANE).array(),
             Target::OverlayBoth => unreachable!("refused above"),
         };
+        // The word after the colour word is the second buffer's.
+        let back = two_buffers.then(|| surface.sibling(crate::dev::kona::back::textport::COLOUR_WORD + 1).array());
         let needs = gc.needs_destination();
         let clips = if x.clip_rects().len() > 1 { x.clip_rects() } else { &[] };
-        Ok(Some(Plan { gc, pitch: array.pitch(), array, height: height as i64, bounds: x.bounds(width, height), clips, stipple, needs }))
+        Ok(Some(Plan { gc, pitch: array.pitch(), array, height: height as i64, bounds: x.bounds(width, height), clips, stipple, needs, back }))
+    }
+
+    /// The same plan on the second buffer's words, if the context paints both.
+    fn second(&self) -> Option<Plan<'a>> {
+        let array = self.back?;
+        Some(Plan { gc: self.gc.clone(), array, pitch: array.pitch(), height: self.height, bounds: self.bounds, clips: self.clips, stipple: self.stipple, needs: self.needs, back: None })
     }
 
     /// The plan for `gc` over the whole managed area: the clip list and the scissor do not limit it.
@@ -418,13 +435,17 @@ impl XState {
             Ok(None) => return Outcome { drawn: 0, refused: None },
             Err(why) => return Outcome { drawn: 0, refused: Some(why) },
         };
-        if plan.needs && !boxes.clone().all(|b| plan.destination_fits(b, spans)) {
+        let back = plan.second();
+        if plan.needs && !boxes.clone().all(|b| plan.destination_fits(b, spans) && back.as_ref().is_none_or(|p| p.destination_fits(b, spans))) {
             return Outcome { drawn: 0, refused: Some(Refused::Destination) };
         }
         let mut drawn = 0;
         for b in boxes {
             if let Some(b) = plan.clip(b) {
                 draw(&plan, b, spans);
+                if let Some(p) = &back {
+                    draw(p, b, spans);
+                }
                 drawn += 1;
             }
         }
@@ -734,11 +755,6 @@ mod tests {
         x.command(0x129, &bad);
         x.draw_command(&d, X_BOX, &[pack(0, 0), pack(4, 4)]);
         assert_eq!((x.fills.bad_context, lit(&s)), (1, 0));
-        // The two-buffer RGB form draws two colour buffers at once, which the model has one word for.
-        let two_buffers = [0, 0, 0, 0, 0xff_ffff, 0xff_ffff, 4, 3, 1, 6, 0, 0, 0];
-        x.command(0x129, &two_buffers);
-        x.draw_command(&d, X_BOX, &[pack(0, 0), pack(4, 4)]);
-        assert_eq!((x.fills.other_target, lit(&s)), (1, 0));
         // An opaque stippled context with no stipple loaded.
         let mut opaque = GC;
         opaque[4] |= 0x8000_0000;
@@ -889,23 +905,32 @@ mod tests {
         assert_eq!((0..6).map(|c| at(&s, c, 1)).collect::<Vec<_>>(), [0x5a00, 0, 0x5a00, 0, 0x5a00, 0]);
     }
 
-    /// The two-buffer RGB form (configuration 4, buffer selector 3) is
-    /// refused, not drawn into one buffer.
+    /// The two-buffer RGB form (configuration 4, buffer selector 3) paints both colour words of a
+    /// double-buffered window, the one the X path draws and the one after it. The server paints a
+    /// window's background so when it exposes the window, and a refused paint left the old pixels
+    /// (another window's) behind it. The form with selector 1 paints the front word alone.
     #[test]
-    fn the_two_buffer_rgb_form_is_refused() {
+    fn the_two_buffer_rgb_form_paints_both_colour_words() {
         let (mut x, s) = rig();
         let d = Surface::new(&s, 1);
-        let rgb = [0, 0, 0, 0, 0xffffff, 0xffffff, 4, 3, 1, 6, 0, 0, 0];
-        x.command(0x129, &rgb);
-        assert!(Gc::decode_for_fill(&rgb).is_ok());
-        x.draw_command(&d, X_BOX, &[pack(0, 0), pack(4, 4)]);
-        assert_eq!((x.fills.other_target, lit(&s)), (1, 0));
-        // The same form with selector 1 draws.
-        let mut one = rgb;
+        // The context the server sent for an exposed window's background, a blue-grey.
+        let both = [0x56540, 0x42ae_9ffe, 0, 0x1ffe, 0xff_ffff, 0xff_ffff, 4, 3, 1, 6, 0, 0, 0];
+        let colour = Gc::decode_for_fill(&both).unwrap().foreground;
+        assert_ne!(colour, 0);
+        x.command(0x129, &both);
+        x.draw_command(&d, X_BOX, &[pack(2, 3), pack(5, 7)]);
+        for (px, py) in (0..32).flat_map(|y| (0..32).map(move |x| (x, y))) {
+            let inside = (2..5).contains(&px) && (3..7).contains(&py);
+            let want = if inside { colour } else { 0 };
+            assert_eq!((s.read(px, 31 - py, 1), s.read(px, 31 - py, 2)), (want, want), "({px}, {py})");
+        }
+        assert_eq!((x.fills.drawn, x.fills.other_target), (1, 0));
+        // The same form with selector 1 draws the front word alone.
+        let mut one = both;
         one[7] = 1;
         x.command(0x129, &one);
-        x.draw_command(&d, X_BOX, &[pack(0, 0), pack(4, 4)]);
-        assert_eq!(x.fills.other_target, 1);
+        x.draw_command(&d, X_BOX, &[pack(10, 10), pack(12, 12)]);
+        assert_eq!((s.read(10, 31 - 10, 1), s.read(10, 31 - 10, 2)), (colour, 0));
     }
 
     /// A pixel in two overlapping clip rectangles is painted once: under xor a
