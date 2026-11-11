@@ -1,8 +1,9 @@
 use super::*;
+use crate::test_temp::TempPath;
 use crate::config::MachineProfile;
 use crate::dev::hub::reg::ni as hub_ni;
 use crate::dev::hub::Space;
-use crate::ip27_machine::test_support::{self, big_stack, Scratch};
+use crate::ip27_machine::test_support::{self, big_stack};
 use crate::traits::{BusDevice, BUS_ERR, BUS_OK};
 use std::path::Path;
 
@@ -13,9 +14,9 @@ fn config(profile: MachineProfile, dir: &Path, nodes: u8) -> MachineConfig {
     test_support::config(profile, dir, nodes)
 }
 
-fn built(profile: MachineProfile, name: &str, nodes: u8) -> (Scratch, DesksideMachine) {
-    let dir = Scratch::new(&format!("{}-{name}", profile.name()));
-    let m = DesksideMachine::new(&config(profile, &dir.0, nodes)).unwrap();
+fn built(profile: MachineProfile, name: &str, nodes: u8) -> (TempPath, DesksideMachine) {
+    let dir = TempPath::dir(&format!("sn0-{}-{name}", profile.name()));
+    let m = DesksideMachine::new(&config(profile, &dir, nodes)).unwrap();
     (dir, m)
 }
 
@@ -48,11 +49,11 @@ fn a_layout_names_distinct_crossbow_ports() {
 
 #[test]
 fn the_deskside_has_one_or_two_node_boards() {
-    let dir = Scratch::new("o2k-count");
-    assert_eq!(config(ORIGIN_2000_PROFILE, &dir.0, 2).validate(), Ok(()));
-    let err = Deskside::specs(&config(ORIGIN_2000_PROFILE, &dir.0, 3)).err().unwrap();
+    let dir = TempPath::dir("sn0-o2k-count");
+    assert_eq!(config(ORIGIN_2000_PROFILE, &dir, 2).validate(), Ok(()));
+    let err = Deskside::specs(&config(ORIGIN_2000_PROFILE, &dir, 3)).err().unwrap();
     assert!(err.contains("one or two node boards"), "{err}");
-    assert!(Deskside::specs(&config(ORIGIN_2000_PROFILE, &dir.0, 0)).is_err());
+    assert!(Deskside::specs(&config(ORIGIN_2000_PROFILE, &dir, 0)).is_err());
 }
 
 #[test]
@@ -138,8 +139,8 @@ fn both_processors_reach_both_nodes_memory_through_their_windows() {
     use std::sync::atomic::Ordering;
     for mb in [64, 128, 256] {
         big_stack(move || {
-            let dir = Scratch::new(&format!("windows-{mb}"));
-            let mut cfg = config(ORIGIN_2000_PROFILE, &dir.0, 2);
+            let dir = TempPath::dir(&format!("sn0-windows-{mb}"));
+            let mut cfg = config(ORIGIN_2000_PROFILE, &dir, 2);
             if mb == 256 {
                 cfg.set_cpu(&crate::cpu::parts::R12000_270);
             }
@@ -358,8 +359,8 @@ fn a_two_node_onyx2_builds_with_a_pipe_that_answers_its_widget_identity() {
     use crate::config::GraphicsBoard;
     big_stack(|| {
         for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2x2] {
-            let dir = Scratch::new("pipe");
-            let m = DesksideMachine::new(&onyx2_with(&dir.0, 2, board)).unwrap();
+            let dir = TempPath::dir("sn0-pipe");
+            let m = DesksideMachine::new(&onyx2_with(&dir, 2, board)).unwrap();
             assert!(m.pipe().is_some());
             assert!(crate::workstation::Workstation::get_display(&m).is_some());
             for node in 0..2 {
@@ -433,8 +434,8 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     const GE_VECTOR: u32 = 0x11;
     const REASON_PAGE: u64 = 0x30_0000;
     big_stack(|| {
-        let dir = Scratch::new("route");
-        let m = DesksideMachine::new(&onyx2_with(&dir.0, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let dir = TempPath::dir("sn0-route");
+        let m = DesksideMachine::new(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
         let pipe = m.pipe().unwrap().clone();
         pipe.start();
         let memory = |i: usize| m.node_at(i).memory.physical().read32(REASON_PAGE).data;
@@ -480,8 +481,8 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
 #[test]
 fn a_dropped_machine_frees_its_pipe() {
     big_stack(|| {
-        let dir = Scratch::new("droppipe");
-        let m = DesksideMachine::new(&onyx2_with(&dir.0, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let dir = TempPath::dir("sn0-droppipe");
+        let m = DesksideMachine::new(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
         let pipe = Arc::downgrade(m.pipe().unwrap());
         let hub = Arc::downgrade(&m.node_at(0).hub);
         crate::traits::Device::start(&**m.pipe().unwrap());
@@ -496,17 +497,17 @@ fn a_dropped_machine_frees_its_pipe() {
 #[test]
 fn the_io_prom_image_fills_the_baseio_flash() {
     big_stack(|| {
-        let dir = Scratch::new("onyx2-ioprom");
+        let dir = TempPath::dir("sn0-onyx2-ioprom");
         let (_none, bare) = built(ONYX2_PROFILE, "noioprom", 1);
         assert_eq!(bare.bridge().read32(0xc0_0000).status, BUS_ERR);
-        let image = dir.0.join("io6prom.img");
+        let image = dir.join("io6prom.img");
         std::fs::write(&image, [0xde, 0xad, 0xbe, 0xef, 0x01]).unwrap();
-        let mut cfg = config(ONYX2_PROFILE, &dir.0, 1);
+        let mut cfg = config(ONYX2_PROFILE, &dir, 1);
         cfg.onyx2.io_prom = Some(image.to_string_lossy().into_owned());
         let m = DesksideMachine::new(&cfg).unwrap();
         assert_eq!(m.bridge().read32(0xc0_0000).data, 0xdead_beef);
         assert_eq!(m.bridge().read32(0xc0_0004).data, 0x01ff_ffff);
-        cfg.onyx2.io_prom = Some(dir.0.join("missing").to_string_lossy().into_owned());
+        cfg.onyx2.io_prom = Some(dir.join("missing").to_string_lossy().into_owned());
         assert!(DesksideMachine::new(&cfg).err().unwrap().contains("onyx2.io_prom"));
     });
 }
