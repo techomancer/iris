@@ -485,9 +485,9 @@ mod tests {
     /// A 2 x 2 texture at offset 0: red, green / blue, white, opaque.
     fn two() -> (TextureStore, TexDesc) {
         let t = TextureStore::default();
-        t.clear(0, 0, 4);
+        t.ex().clear(0, 0, 4);
         for (i, w) in [0xffff_0000u32, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff].into_iter().enumerate() {
-            t.set(0, i as u32, w);
+            t.ex().set(0, i as u32, w);
         }
         let mut d = TexDesc { count: 1, class: 3, ..Default::default() };
         d.levels[0] = TexLevel { off: 0, pitch: 2, ox: 0, oy: 0, w: 2, h: 2, ..Default::default() };
@@ -517,12 +517,12 @@ mod tests {
     #[test]
     fn a_mip_filter_picks_and_blends_levels() {
         let t = TextureStore::default();
-        t.clear(0, 0, 5);
-        t.set(0, 0, 0xffff_0000);
-        t.set(0, 1, 0xffff_0000);
-        t.set(0, 2, 0xffff_0000);
-        t.set(0, 3, 0xffff_0000);
-        t.set(0, 4, 0xff00_00ff);
+        t.ex().clear(0, 0, 5);
+        t.ex().set(0, 0, 0xffff_0000);
+        t.ex().set(0, 1, 0xffff_0000);
+        t.ex().set(0, 2, 0xffff_0000);
+        t.ex().set(0, 3, 0xffff_0000);
+        t.ex().set(0, 4, 0xff00_00ff);
         let mut d = TexDesc { count: 2, class: 3, ..Default::default() };
         d.levels[0] = TexLevel { off: 0, pitch: 2, w: 2, h: 2, ..Default::default() };
         d.levels[1] = TexLevel { off: 4, pitch: 1, w: 1, h: 1, ..Default::default() };
@@ -538,10 +538,10 @@ mod tests {
     /// A 2 x 2 x 2 volume at offset 0: slice 0 is red, slice 1 is blue (opaque), each slice 4 texels.
     fn volume() -> (TextureStore, TexDesc) {
         let t = TextureStore::default();
-        t.clear(0, 0, 8 + 2);
+        t.ex().clear(0, 0, 8 + 2);
         for i in 0..4 {
-            t.set(0, i, 0xffff_0000);
-            t.set(0, 4 + i, 0xff00_00ff);
+            t.ex().set(0, i, 0xffff_0000);
+            t.ex().set(0, 4 + i, 0xff00_00ff);
         }
         let mut d = TexDesc { count: 1, class: 3, volume: true, wrap: [Wrap::Clamp, Wrap::Clamp, Wrap::Repeat], ..Default::default() };
         d.levels[0] = TexLevel { off: 0, pitch: 2, w: 2, h: 2, d: 2, slice: 4, ..Default::default() };
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn a_volume_mip_chain_halves_every_axis() {
         let (t, mut d) = volume();
-        t.set(0, 8, 0xff00_ff00);
+        t.ex().set(0, 8, 0xff00_ff00);
         d.count = 2;
         d.levels[1] = TexLevel { off: 8, pitch: 1, w: 1, h: 1, d: 1, slice: 1, ..Default::default() };
         d.min = Filter::Mip { within_linear: false, between_linear: false };
@@ -627,12 +627,12 @@ mod tests {
     #[test]
     fn a_detail_combine_adds_or_modulates_on_magnification_only() {
         let t = TextureStore::default();
-        t.clear(0, 0, 4 + 8);
+        t.ex().clear(0, 0, 4 + 8);
         for i in 0..4 {
-            t.set(0, i, 0xff80_8080);
+            t.ex().set(0, i, 0xff80_8080);
         }
         for i in 0..8 {
-            t.set(0, 4 + i, if i % 2 == 0 { 0xff00_0000 } else { 0xffff_ffff });
+            t.ex().set(0, 4 + i, if i % 2 == 0 { 0xff00_0000 } else { 0xffff_ffff });
         }
         let weights = [0.25f32; CURVE_NODES];
         let mut d = TexDesc { count: 1, class: 3, mag: Filter::Linear, wrap: [Wrap::Clamp; 3], ..Default::default() };
@@ -667,11 +667,11 @@ mod tests {
     #[test]
     fn a_sharpen_combine_pushes_away_from_the_coarser_level() {
         let t = TextureStore::default();
-        t.clear(0, 0, 5);
+        t.ex().clear(0, 0, 5);
         for i in 0..4 {
-            t.set(0, i, 0xff80_8080);
+            t.ex().set(0, i, 0xff80_8080);
         }
-        t.set(0, 4, 0xff40_4040);
+        t.ex().set(0, 4, 0xff40_4040);
         let mut d = TexDesc { count: 2, class: 3, mag: Filter::Linear, wrap: [Wrap::Clamp; 3], combine: Combine::Sharpen(Sharpen { channels: 0, weights: [0.5; CURVE_NODES] }), ..Default::default() };
         d.levels[0] = TexLevel { off: 0, pitch: 2, w: 2, h: 2, ..Default::default() };
         d.levels[1] = TexLevel { off: 4, pitch: 1, w: 1, h: 1, ..Default::default() };

@@ -58,7 +58,7 @@
 //! a mip-mapped volume's level is its parity and that of a single-level volume is "bank state").
 
 use super::super::raster::texel::{default_weights, spline_samples, Combine, Detail, EnvMode, Filter, Sharpen, TexDesc, TexLevel, Wrap, MAX_LEVELS, CURVE_NODES};
-use super::super::store::texture::{TextureStore, PLANES_PER_CONTEXT, UNIT_WORDS};
+use super::super::store::texture::{Exclusive, TextureStore, PLANES_PER_CONTEXT, UNIT_WORDS};
 use crate::dev::kona::stream::Stream;
 use crate::dev::kona::defs::*;
 use std::collections::HashMap;
@@ -383,7 +383,7 @@ fn pack16(storage: u32, t: u32) -> Option<u32> {
 }
 
 /// Sample the raw 16-bit words of a level's loaded box under `format`, in place.
-fn decode_level(store: &TextureStore, l: &Level, format: u32) {
+fn decode_level(store: &mut Exclusive<'_>, l: &Level, format: u32) {
     for z in 0..l.pd {
         for y in l.min.1..=l.max.1.min(l.ph - 1) {
             for x in l.min.0..=l.max.0.min(l.pw - 1) {
@@ -574,14 +574,21 @@ impl TexContext {
         (self.slot.min(CONTEXT_SLOTS) * PLANES_PER_CONTEXT + detail as usize * 2 + (bank & 1) as usize) as u16
     }
 
+    /// Whether a level was loaded as raw 16-bit words, which a bind decodes in place under its
+    /// format and so writes texture memory.
+    #[cfg(test)]
+    pub fn holds_raw(&self) -> bool {
+        self.levels.values().chain(self.detail.values()).any(|l| l.raw)
+    }
+
     /// Whether the context holds any level.
     pub fn holds(&self) -> bool {
         !self.levels.is_empty() || !self.detail.is_empty()
     }
 
     /// Give the context's texture memory back and forget the levels, as when its slot is activated
-    /// afresh. Call only with the tiles drained.
-    pub fn release(&mut self, store: &TextureStore) {
+    /// afresh.
+    pub fn release(&mut self, store: &mut Exclusive<'_>) {
         for p in 0..PLANES_PER_CONTEXT {
             store.drop_plane((self.slot.min(CONTEXT_SLOTS) * PLANES_PER_CONTEXT + p) as u16);
         }
@@ -636,7 +643,7 @@ impl TexContext {
     /// Decode a texel draw's image (`bytes`, the stream as bytes after the first
     /// `offset` of its first word are skipped) into texture memory. False when the
     /// format or type is not decoded or the level's address lies outside the bank.
-    pub fn load(&mut self, store: &TextureStore, a: &[u32], bytes: &[u8], dma: bool, counts: &mut TexCounts) -> bool {
+    pub fn load(&mut self, store: &mut Exclusive<'_>, a: &[u32], bytes: &[u8], dma: bool, counts: &mut TexCounts) -> bool {
         let Some(h) = Header::parse(a) else { return false };
         let Some((p, stride, start)) = h.geometry(&self.unpack) else {
             counts.unsupported_load += 1;
@@ -839,7 +846,7 @@ impl TexContext {
     /// The 2D record (22 words) completes the bind: the levels its table names, found by
     /// the first level's bank (bit 28 of the short bind's mode word) flipped for every
     /// second level. None when no short bind came before it, or level 0 is not found.
-    pub fn record(&mut self, store: &TextureStore, r: &[u32], env: (EnvMode, [u32; 4]), counts: &mut TexCounts) -> Option<TexDesc> {
+    pub fn record<'s>(&mut self, mut store: impl FnMut() -> Exclusive<'s>, r: &[u32], env: (EnvMode, [u32; 4]), counts: &mut TexCounts) -> Option<TexDesc> {
         let b = self.bind.take()?;
         let r: &[u32; 22] = r.try_into().ok()?;
         let (ctl, mut mode, size) = (b[1], b[2], b[3]);
@@ -867,7 +874,7 @@ impl TexContext {
             let Some(l) = self.levels.get_mut(&(first_bank ^ (k as u8 & 1), addr)) else { break };
             // The bind's format samples whatever words the level holds, whatever loaded them.
             if l.raw {
-                decode_level(store, l, mode >> 14 & 0x7f);
+                decode_level(&mut store(), l, mode >> 14 & 0x7f);
                 l.raw = false;
                 l.storage = mode >> 14 & 0x7f;
             }
@@ -897,7 +904,7 @@ impl TexContext {
     /// the first level's bank for the single-level form. The logical depth is the size word's r exponent
     /// (bits 11:8) halved per level, as the other axes are (established). None when no short bind came
     /// before it or level 0 is not found.
-    pub fn volume_record(&mut self, store: &TextureStore, r: &[u32], mip: bool, env: (EnvMode, [u32; 4])) -> Option<TexDesc> {
+    pub fn volume_record<'s>(&mut self, mut store: impl FnMut() -> Exclusive<'s>, r: &[u32], mip: bool, env: (EnvMode, [u32; 4])) -> Option<TexDesc> {
         let b = self.bind.take()?;
         let (ctl, mode, size) = (b[1], b[2], b[3]);
         let table: &[u32] = if mip {
@@ -916,7 +923,7 @@ impl TexContext {
             let Some(key) = key else { break };
             let l = self.levels.get_mut(&key).expect("just found");
             if l.raw {
-                decode_level(store, l, mode >> 14 & 0x7f);
+                decode_level(&mut store(), l, mode >> 14 & 0x7f);
                 l.raw = false;
                 l.storage = mode >> 14 & 0x7f;
             }
@@ -1079,46 +1086,46 @@ mod tests {
         let store = TextureStore::default();
         let (mut c, mut n) = (TexContext::default(), TexCounts::default());
         let img = [0xff00_00ffu32, 0x00ff_00ff, 0x0000_ffff, 0xffff_ffff];
-        assert!(c.load(&store, &header(2, 2), &words_to_bytes(&img), false, &mut n));
+        assert!(c.load(&mut store.ex(), &header(2, 2), &words_to_bytes(&img), false, &mut n));
         assert_eq!([0, 1, 2, 3].map(|i| word(&c, &store, 0, 0x1000, i)), [0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]);
         let again = [0x0101_01ffu32; 4];
-        assert!(c.load(&store, &header(2, 2), &words_to_bytes(&again), false, &mut n));
+        assert!(c.load(&mut store.ex(), &header(2, 2), &words_to_bytes(&again), false, &mut n));
         assert_eq!((store.resident_pages(), word(&c, &store, 0, 0x1000, 0)), (1, 0xff01_0101), "same address and size: replaced in place");
         assert_eq!(n.loads, 2);
         // RGB: alpha is one. Luminance: the colour, alpha one. Luminance-alpha: both.
         let mut rgb = header(1, 1);
         rgb[3] = 4;
         rgb[18] = 0x2000;
-        c.load(&store, &rgb, &words_to_bytes(&[0x1020_3000]), false, &mut n);
+        c.load(&mut store.ex(), &rgb, &words_to_bytes(&[0x1020_3000]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x2000, 0), 0xff10_2030, "a level at another address is another place");
         let mut lum = header(1, 1);
         lum[3] = 6;
         lum[18] = 0x3000;
-        c.load(&store, &lum, &words_to_bytes(&[0x8000_0000]), false, &mut n);
+        c.load(&mut store.ex(), &lum, &words_to_bytes(&[0x8000_0000]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x3000, 0), 0xff80_8080);
         let mut la = header(1, 1);
         la[3] = 7;
         la[18] = 0x4000;
-        c.load(&store, &la, &words_to_bytes(&[0x4020_0000]), false, &mut n);
+        c.load(&mut store.ex(), &la, &words_to_bytes(&[0x4020_0000]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x4000, 0), 0x2040_4040);
         // Alpha only: no colour.
         let mut al = header(1, 1);
         al[3] = 3;
         al[18] = 0x5000;
-        c.load(&store, &al, &words_to_bytes(&[0x7700_0000]), false, &mut n);
+        c.load(&mut store.ex(), &al, &words_to_bytes(&[0x7700_0000]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x5000, 0), 0x7700_0000);
         // 16-bit unsigned shorts keep their top byte; a float clamps and scales.
         let mut sh = header(1, 1);
         sh[3] = 6;
         sh[4] = 3;
         sh[18] = 0x6000;
-        c.load(&store, &sh, &words_to_bytes(&[0x8000_0000]), false, &mut n);
+        c.load(&mut store.ex(), &sh, &words_to_bytes(&[0x8000_0000]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x6000, 0), 0xff80_8080);
         let mut fl = header(1, 1);
         fl[3] = 6;
         fl[4] = 6;
         fl[18] = 0x7000;
-        c.load(&store, &fl, &words_to_bytes(&[1.5f32.to_bits()]), false, &mut n);
+        c.load(&mut store.ex(), &fl, &words_to_bytes(&[1.5f32.to_bits()]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x7000, 0), 0xffff_ffff);
     }
 
@@ -1135,7 +1142,7 @@ mod tests {
             (a[3], a[4], a[9], a[16]) = (format, ty, storage, 0x33);
             let words = parse(&a).image_words(&u)?;
             assert_eq!(words as usize, bytes.len().div_ceil(4), "the stream is as long as the packed pixels");
-            c.load(&store, &a, bytes, false, &mut n).then(|| (0..w).map(|i| word(&c, &store, 0, 0x1000, i)).collect())
+            c.load(&mut store.ex(), &a, bytes, false, &mut n).then(|| (0..w).map(|i| word(&c, &store, 0, 0x1000, i)).collect())
         };
         assert_eq!(load(9, 5, 0x10, 2, &[0xf0, 0x5a, 0x12, 0x34]), Some(vec![0xaaff_0055, 0x4411_2233]), "4-4-4-4: red, green, blue, alpha from the top");
         assert_eq!(load(10, 5, 0x14, 2, &[0xf8, 0x01, 0x07, 0xc0]), Some(vec![0xffff_0000, 0x0000_ff00]), "5-5-5-1");
@@ -1150,7 +1157,7 @@ mod tests {
         let (mut c, mut n) = (TexContext { unpack: Unpack { swap_bytes: true, ..u }, ..Default::default() }, TexCounts::default());
         let mut a = header(2, 1);
         (a[3], a[4], a[9], a[16]) = (5, 9, 0x10, 0x33);
-        assert!(c.load(&store, &a, &[0x5a, 0xf0, 0x34, 0x12], false, &mut n));
+        assert!(c.load(&mut store.ex(), &a, &[0x5a, 0xf0, 0x34, 0x12], false, &mut n));
         assert_eq!((word(&c, &store, 0, 0x1000, 0), word(&c, &store, 0, 0x1000, 1)), (0xaaff_0055, 0x4411_2233));
     }
 
@@ -1161,17 +1168,17 @@ mod tests {
         let (mut c, mut n) = (TexContext::default(), TexCounts::default());
         let mut a = header(1, 1);
         a[9] = 0x10;
-        c.load(&store, &a, &words_to_bytes(&[0x8040_20ff]), false, &mut n);
+        c.load(&mut store.ex(), &a, &words_to_bytes(&[0x8040_20ff]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x1000, 0), 0xffff_0000 & 0xff00_0000 | 0x0088_4422, "4 bits a component: 0x80 is 8 of 15, 0x88");
         let mut a = header(1, 1);
         a[9] = 0x14;
         a[18] = 0x2000;
-        c.load(&store, &a, &words_to_bytes(&[0xff00_0000]), false, &mut n);
+        c.load(&mut store.ex(), &a, &words_to_bytes(&[0xff00_0000]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x2000, 0), 0x00ff_0000, "5-5-5-1: a clear alpha bit, full red");
         let mut a = header(1, 1);
         a[9] = 0x18;
         a[18] = 0x3000;
-        c.load(&store, &a, &words_to_bytes(&[0x8040_20ff]), false, &mut n);
+        c.load(&mut store.ex(), &a, &words_to_bytes(&[0x8040_20ff]), false, &mut n);
         assert_eq!(word(&c, &store, 0, 0x3000, 0), 0xff83_4020, "R5-G6-B5: red 0x80 is 16 of 31 (0x83), green 0x40 is 16 of 63 (0x40), blue 0x20 is 4 of 31 (0x20), alpha one");
     }
 
@@ -1182,12 +1189,12 @@ mod tests {
         let (mut c, mut n) = (TexContext::default(), TexCounts::default());
         let mut a = header(2, 1);
         a[6] = 1;
-        c.load(&store, &a, &[1, 2, 3, 4, 5, 6, 7, 8], true, &mut n);
+        c.load(&mut store.ex(), &a, &[1, 2, 3, 4, 5, 6, 7, 8], true, &mut n);
         assert_eq!((word(&c, &store, 0, 0x1000, 0), word(&c, &store, 0, 0x1000, 1)), (0x0401_0203, 0x0805_0607));
         // A load whose box leaves its physical rectangle is refused, and memory is not touched.
         let mut bad = header(2, 2);
         bad[13] = 9;
-        assert!(!c.load(&store, &bad, &[0; 16], false, &mut n));
+        assert!(!c.load(&mut store.ex(), &bad, &[0; 16], false, &mut n));
         assert_eq!(n.unsupported_load, 1);
     }
 
@@ -1203,32 +1210,32 @@ mod tests {
         l0[17] |= 8;
         l0[19] = 0x1000;
         l0[18] = 0;
-        c.load(&store, &l0, &words_to_bytes(&[0xff00_00ff; 4]), false, &mut n);
+        c.load(&mut store.ex(), &l0, &words_to_bytes(&[0xff00_00ff; 4]), false, &mut n);
         let mut l1 = header(1, 1);
         l1[18] = 0x2000;
         l1[16] = 0x00;
-        c.load(&store, &l1, &words_to_bytes(&[0x0000_ffff]), false, &mut n);
+        c.load(&mut store.ex(), &l1, &words_to_bytes(&[0x0000_ffff]), false, &mut n);
         let mut rec = [0u32; 22];
         rec[0] = 0x44;
         rec[1] = 0x2020;
         rec[6] = 0x1000;
         rec[7] = 0x2000;
         rec[8] = 0xffff_ffff;
-        assert!(c.record(&store, &rec, Default::default(), &mut TexCounts::default()).is_none(), "a record with no short bind");
+        assert!(c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).is_none(), "a record with no short bind");
         // Mode: minification 6 (mip, linear within, linear between), magnification 1, first bank 1.
         let bind = [0xffff_ffffu32, 2 << 12, 6 << 2 | 1 << 5 | 1 << 28, 0x3011, 1];
         c.short_bind(&bind);
-        let d = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).expect("both levels found");
+        let d = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).expect("both levels found");
         assert_eq!((d.count, d.levels[0].w, d.levels[1].w, d.class), (2, 2, 1, 3));
         assert_eq!(d.min, Filter::Mip { within_linear: true, between_linear: true });
         assert_eq!((d.mag, d.wrap, d.lod_scale), (Filter::Linear, [Wrap::Clamp, Wrap::Clamp, Wrap::Repeat], [0x20, 0x20, 0]));
         // The wrong first bank finds nothing.
         c.short_bind(&[0xffff_ffff, 2 << 12, 6 << 2, 0x11, 1]);
-        assert!(c.record(&store, &rec, Default::default(), &mut TexCounts::default()).is_none());
+        assert!(c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).is_none());
         // Only level 0 loaded: a table of two finds one.
         c.short_bind(&bind);
         rec[7] = 0x9999;
-        assert_eq!(c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap().count, 1);
+        assert_eq!(c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap().count, 1);
     }
 
     /// The bind's size word gives the logical size, so an update of part of a level changes nothing, and a small
@@ -1243,11 +1250,11 @@ mod tests {
         let mut rec = [0u32; 22];
         rec[6..8].copy_from_slice(&[0x100, 0xffff_ffff]);
         c.short_bind(&[0xffff_ffff, 2 << 12, 0, 0x23, 1]);
-        let d = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap();
+        let d = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap();
         assert_eq!([d.levels[0].ox, d.levels[0].oy, d.levels[0].w, d.levels[0].h], [0, 0, 8, 4]);
         rec[6] = 0x200;
         c.short_bind(&[0xffff_ffff, 2 << 12, 0, 0x00, 1]);
-        let d = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap();
+        let d = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap();
         assert_eq!([d.levels[0].ox, d.levels[0].oy, d.levels[0].w, d.levels[0].h], [7, 3, 1, 1]);
     }
 
@@ -1259,7 +1266,7 @@ mod tests {
         a[16] = 0x111;
         a[17] |= bank << 3;
         a[18 + bank as usize] = address;
-        c.load(store, &a, &words_to_bytes(&[texel; 4]), false, n)
+        c.load(&mut store.ex(), &a, &words_to_bytes(&[texel; 4]), false, n)
     }
 
     /// A volume's slices stack in one level found by the slices' shared address; a slice past the level's physical
@@ -1277,18 +1284,18 @@ mod tests {
         assert_eq!((store.resident_pages(), word(&c, &store, 0, 0x40, 0), word(&c, &store, 0, 0x40, 4)), (1, 0xffff_0000, 0xff00_00ff), "slices stacked a slice apart");
         // Size word: 2 x 2 x 2, s and t repeat, r clamps. Mode word: nearest, bank 0.
         c.short_bind(&[0xffff_ffff, 3 << 28 | 2 << 12, 0, 0x4011 | 1 << 8, 1]);
-        let d = c.volume_record(&store, &[0x44, 0x111, 0x40, 0], false, Default::default()).expect("the pair finds the level");
+        let d = c.volume_record(|| store.ex(), &[0x44, 0x111, 0x40, 0], false, Default::default()).expect("the pair finds the level");
         assert!(d.volume && d.count == 1);
         assert_eq!((d.levels[0].d, d.levels[0].slice, d.levels[0].w, d.levels[0].h), (2, 4, 2, 2));
         assert_eq!(d.wrap, [Wrap::Repeat, Wrap::Repeat, Wrap::Clamp]);
         assert_eq!(sample3(&store, &d, 0.25, 0.25, 0.25, 0.0), [255, 0, 0, 255]);
         assert_eq!(sample3(&store, &d, 0.25, 0.25, 0.75, 0.0), [0, 0, 255, 255]);
         // No short bind before it, a pair that names nothing, or a record of the wrong length binds nothing.
-        assert!(c.volume_record(&store, &[0x44, 0x111, 0x40, 0], false, Default::default()).is_none());
+        assert!(c.volume_record(|| store.ex(), &[0x44, 0x111, 0x40, 0], false, Default::default()).is_none());
         c.short_bind(&[0xffff_ffff, 3 << 28, 0, 0x111, 1]);
-        assert!(c.volume_record(&store, &[0x44, 0x111, 0x99, 0], false, Default::default()).is_none());
+        assert!(c.volume_record(|| store.ex(), &[0x44, 0x111, 0x99, 0], false, Default::default()).is_none());
         c.short_bind(&[0xffff_ffff, 3 << 28, 0, 0x111, 1]);
-        assert!(c.volume_record(&store, &[0x44, 0x111, 0x40], false, Default::default()).is_none());
+        assert!(c.volume_record(|| store.ex(), &[0x44, 0x111, 0x40], false, Default::default()).is_none());
     }
 
     /// A mip-mapped volume record (token 0x17b) lists one descriptor word a level and a level's bank is its parity:
@@ -1307,7 +1314,7 @@ mod tests {
         a[16] = 0;
         a[17] |= 8;
         a[19] = 0x80;
-        assert!(c.load(&store, &a, &words_to_bytes(&[0x0000_ffff]), false, &mut n));
+        assert!(c.load(&mut store.ex(), &a, &words_to_bytes(&[0x0000_ffff]), false, &mut n));
         let mut rec = [0u32; 14];
         rec[0] = 0x44;
         rec[1] = 0x10_20_30;
@@ -1315,7 +1322,7 @@ mod tests {
         rec[4] = 0x40;
         rec[5] = 0x80;
         c.short_bind(&[0xffff_ffff, 3 << 28, 6 << 2 | 1 << 5, 0x111, 1]);
-        let d = c.volume_record(&store, &rec, true, Default::default()).expect("both levels found");
+        let d = c.volume_record(|| store.ex(), &rec, true, Default::default()).expect("both levels found");
         assert_eq!(d.count, 2);
         assert_eq!(d.min, Filter::Mip { within_linear: true, between_linear: true });
         assert_eq!([(d.levels[0].w, d.levels[0].h, d.levels[0].d), (d.levels[1].w, d.levels[1].h, d.levels[1].d)], [(2, 2, 2), (1, 1, 1)]);
@@ -1359,14 +1366,14 @@ mod tests {
             d[0] = 0x8095;
             d[17] |= bank << 3;
             d[18 + bank as usize] = 0x200;
-            assert!(c.load(&store, &d, &vec![0x40; 8 * 4 * 4], false, &mut n));
+            assert!(c.load(&mut store.ex(), &d, &vec![0x40; 8 * 4 * 4], false, &mut n));
         }
         let mut rec = [0u32; 22];
         rec[6..8].copy_from_slice(&[0, 0xffff_ffff]);
         let mode1 = |row: u32| 2 << 28 | 1 << 24 | row << 12;
         let bind = |c: &mut TexContext, ctl: u32, code: u32, bank: u32, n: &mut TexCounts| {
             c.short_bind(&[0xffff_ffff, ctl, code << 5 | bank << 28, 0x23, 1]);
-            c.record(&store, &rec, Default::default(), n).unwrap()
+            c.record(|| store.ex(), &rec, Default::default(), n).unwrap()
         };
         let mut n = TexCounts::default();
         // No detail bind: every code is forced to linear, a nearest one and a sharpen one too (established).
@@ -1418,7 +1425,7 @@ mod tests {
         load_copy(&mut c, &store, &l1);
         let mut d = copy(8, 4, 0, 0, 0x200);
         d[0] = 0x8095;
-        assert!(c.load(&store, &d, &vec![0x40; 8 * 4 * 4], false, &mut n));
+        assert!(c.load(&mut store.ex(), &d, &vec![0x40; 8 * 4 * 4], false, &mut n));
         let mut rec = [0u32; 22];
         rec[6..9].copy_from_slice(&[0, 0x100, 0xffff_ffff]);
         let code = 256u32; // mantissa 64, exponent 0: one half
@@ -1431,7 +1438,7 @@ mod tests {
         let ctl = 2 << 28 | 1 << 24 | 0x31 << 12 | 7;
         let bind = |c: &mut TexContext, code: u32, level_code: u32, channels: u32| {
             c.short_bind(&[0xffff_ffff, ctl, code << 5 | level_code << 21 | channels << 26, 0x23, 1]);
-            c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap()
+            c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap()
         };
         match bind(&mut c, 3, 4, 1).combine {
             Combine::Detail(x) => assert_eq!((x.modulate, x.scale, x.channels, x.image.w, x.image.h, x.weights[10]), (false, 4, 1, 8, 4, 0.25)),
@@ -1445,19 +1452,19 @@ mod tests {
         // No table in the slot: the client's default curve, still combined. No image: no detail combine, only linear.
         let ctl = 2 << 28 | 1 << 24 | 0x31 << 12 | 8;
         c.short_bind(&[0xffff_ffff, ctl, 3 << 5, 0x23, 1]);
-        match c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap().combine {
+        match c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap().combine {
             Combine::Detail(x) => assert_eq!(x.weights, default_weights()),
             other => panic!("{other:?}"),
         }
         assert!(c.bind_detail(&[0xffff_ffff, 3, 2, 0x31, 0x900, 0x900]));
         c.short_bind(&[0xffff_ffff, ctl, 3 << 5, 0x23, 1]);
-        let d = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap();
+        let d = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap();
         assert_eq!((d.combine, d.mag), (Combine::None, Filter::Linear), "the detail image is not loaded: the base shows linearly");
         // A sharpen of a one-level texture has nothing to push away from.
         let mut one = [0u32; 22];
         one[6..8].copy_from_slice(&[0, 0xffff_ffff]);
         c.short_bind(&[0xffff_ffff, ctl, 5 << 5, 0x23, 1]);
-        assert_eq!(c.record(&store, &one, Default::default(), &mut TexCounts::default()).unwrap().combine, Combine::None);
+        assert_eq!(c.record(|| store.ex(), &one, Default::default(), &mut TexCounts::default()).unwrap().combine, Combine::None);
     }
 
     /// A detail image (target 0x8095) is sent once to each bank, at the offsets the base levels use too (0 and 0
@@ -1469,13 +1476,13 @@ mod tests {
         let mut c = TexContext::default();
         let mut n = TexCounts::default();
         let base = copy(8, 4, 0, 0, 0);
-        assert!(c.load(&store, &base, &vec![0x11; 8 * 4 * 4], false, &mut n));
+        assert!(c.load(&mut store.ex(), &base, &vec![0x11; 8 * 4 * 4], false, &mut n));
         for bank in [0u32, 1] {
             let mut d = copy(8, 4, 0, 0, 0);
             d[0] = 0x8095;
             d[17] |= bank << 3;
             d[18 + bank as usize] = 0;
-            assert!(c.load(&store, &d, &vec![0x77; 8 * 4 * 4], false, &mut n));
+            assert!(c.load(&mut store.ex(), &d, &vec![0x77; 8 * 4 * 4], false, &mut n));
         }
         assert_eq!((n.loads, n.detail_loads), (3, 2));
         assert_eq!(c.detail.len(), 2, "the same image in each bank");
@@ -1487,7 +1494,7 @@ mod tests {
         rec[6..8].copy_from_slice(&[0, 0xffff_ffff]);
         for (code, mag) in [(0, Filter::Nearest), (1, Filter::Linear), (3, Filter::Linear), (4, Filter::Linear), (5, Filter::Linear)] {
             c.short_bind(&[0xffff_ffff, 2 << 12 | 1 << 24, code << 5, 0x23, 1]);
-            let d = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap();
+            let d = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap();
             assert_eq!((d.count, d.mag), (1, mag), "magnification code {code}");
         }
     }
@@ -1506,7 +1513,7 @@ mod tests {
 
     fn load_copy(c: &mut TexContext, store: &TextureStore, a: &[u32; 20]) {
         let (w, h) = (a[1] as usize, a[2] as usize);
-        assert!(c.load(store, a, &vec![0x80; w * h * 4], false, &mut TexCounts::default()));
+        assert!(c.load(&mut store.ex(), a, &vec![0x80; w * h * 4], false, &mut TexCounts::default()));
     }
 
     /// A whole load of a `1 << se` by `1 << te` level at `address`.
@@ -1518,7 +1525,7 @@ mod tests {
 
     fn load_whole(c: &mut TexContext, store: &TextureStore, a: &[u32; 20], n: &mut TexCounts) -> bool {
         let (w, h) = (a[1] as usize, a[2] as usize);
-        c.load(store, a, &vec![0x80; w * h * 4], false, n)
+        c.load(&mut store.ex(), a, &vec![0x80; w * h * 4], false, n)
     }
 
     /// A long run of reloads at the same addresses keeps texture memory where the first round left it: a
@@ -1616,7 +1623,7 @@ mod tests {
             a[18] = 0;
             a[18 + bank_bit as usize] = address;
             let (w, h) = (a[1] as usize, a[2] as usize);
-            assert!(c.load(&store, &a, &vec![(step & 0xff) as u8; w * h * 4], false, &mut n), "step {step}: {se} {te} at {address}");
+            assert!(c.load(&mut store.ex(), &a, &vec![(step & 0xff) as u8; w * h * 4], false, &mut n), "step {step}: {se} {te} at {address}");
             let texel = (step as u32 & 0xff) * 0x0101_0101;
             assert_eq!(word(&c, &store, bank_bit, address, 0), texel, "step {step}");
             let mut spans: Vec<(u8, u64, u64)> = c.levels.iter().map(|(&(b, at), l)| (b, at as u64, at as u64 + units(l.pw, l.ph * l.pd, l.size_code))).collect();
@@ -1644,7 +1651,7 @@ mod tests {
         assert_eq!((n.full, c.levels.len()), (2, 2), "refused: the old level stays");
         assert!(load_whole(&mut c, &store, &whole(3, 2, 0x2fe), &mut n), "the same size at the same place is a reload");
         assert!(c.holds());
-        c.release(&store);
+        c.release(&mut store.ex());
         assert_eq!((c.holds(), store.used(), store.resident_pages()), (false, vec![], 0));
         assert!(load_whole(&mut c, &store, &whole(3, 2, 0x2ff - 1), &mut n));
     }
@@ -1662,7 +1669,7 @@ mod tests {
         // holds the page of its corner, not 64 MiB.
         let mut a = copy(1, 1, 0, 0, 0);
         a[16] = 0xcc;
-        assert!(c.load(&store, &a, &[0x80; 4], false, &mut n));
+        assert!(c.load(&mut store.ex(), &a, &[0x80; 4], false, &mut n));
         assert_eq!((store.resident_pages(), word(&c, &store, 0, top, 0), word(&c, &store, 0, 0, 0), n.full), (1, 0, 0x8080_8080, 0));
     }
 
@@ -1682,7 +1689,7 @@ mod tests {
                 a[18] = 0;
                 a[18 + bank as usize] = top;
                 asked += 1;
-                c.load(&store, &a, &[0x80; 4], false, &mut n);
+                c.load(&mut store.ex(), &a, &[0x80; 4], false, &mut n);
                 assert!(store.resident_pages() <= store.cap_pages());
             }
         }
@@ -1705,7 +1712,7 @@ mod tests {
             l[17] |= bank << 3;
             l[18] = 0;
             l[18 + bank as usize] = pg * page_units;
-            assert!(b.load(&store, &l, &[0x80; 4], false, &mut n));
+            assert!(b.load(&mut store.ex(), &l, &[0x80; 4], false, &mut n));
         }
         // `a` takes the sixth, with a 1 x 1 level at the start of bank 0.
         assert!(load_whole(&mut a, &store, &whole(0, 0, 0), &mut n));
@@ -1725,10 +1732,10 @@ mod tests {
         let store = TextureStore::default();
         let (mut a, mut b, mut n) = (TexContext::new(1), TexContext::new(2), TexCounts::default());
         let l = whole(1, 1, 0x40);
-        assert!(a.load(&store, &l, &[0x11; 16], false, &mut n));
-        assert!(b.load(&store, &l, &[0x22; 16], false, &mut n));
+        assert!(a.load(&mut store.ex(), &l, &[0x11; 16], false, &mut n));
+        assert!(b.load(&mut store.ex(), &l, &[0x22; 16], false, &mut n));
         assert_eq!((word(&a, &store, 0, 0x40, 0), word(&b, &store, 0, 0x40, 0)), (0x1111_1111, 0x2222_2222));
-        a.release(&store);
+        a.release(&mut store.ex());
         assert_eq!((word(&a, &store, 0, 0x40, 0), word(&b, &store, 0, 0x40, 0)), (0, 0x2222_2222), "releasing one leaves the other");
     }
 
@@ -1845,7 +1852,7 @@ mod tests {
         rec[6..11].copy_from_slice(&[0x100, 0x200, 0x300, 0x400, 0xffff_ffff]);
         // Level 0 is 8 x 4 (size nibbles 3 and 2), in bank 0; levels 1 and 3 are in bank 1.
         c.short_bind(&[0xffff_ffff, 2 << 12, 0, 0x23, 1]);
-        let d = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap();
+        let d = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap();
         let got: Vec<_> = d.levels[..d.count as usize].iter().map(|l| (l.ox, l.oy, l.w, l.h)).collect();
         assert_eq!(got, vec![(0, 0, 8, 4), (4, 2, 4, 2), (6, 3, 2, 1), (7, 3, 1, 1)]);
     }
@@ -1861,7 +1868,7 @@ mod tests {
         let mut rec = [0u32; 22];
         rec[6..8].copy_from_slice(&[0x100, 0xffff_ffff]);
         c.short_bind(&[0xffff_ffff, 2 << 12, 0, 0x23, 1]);
-        let d = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap();
+        let d = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap();
         assert_eq!([d.levels[0].ox, d.levels[0].oy, d.levels[0].w, d.levels[0].h], [0, 0, 8, 4]);
     }
 
@@ -1901,11 +1908,11 @@ mod tests {
             let (mut c, mut n) = (TexContext::default(), TexCounts::default());
             let mut a = copy(8, 4, 0, 0, 0x100);
             a[9] = storage;
-            assert!(c.load(&store, &a, &varied_bytes(), false, &mut n));
+            assert!(c.load(&mut store.ex(), &a, &varied_bytes(), false, &mut n));
             let mut rec = [0u32; 22];
             rec[6..8].copy_from_slice(&[0x100, 0xffff_ffff]);
             c.short_bind(&[0xffff_ffff, 2 << 12, storage << 14, 0x23, 1]);
-            let lv = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap().levels[0];
+            let lv = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap().levels[0];
             let before: Vec<u32> = (0..32).map(|i| store.get(lv.plane, lv.off + (i / 8) * 8 + i % 8)).collect();
             let words = read_words(&c, &store, 0x100);
             // The words are the quantised components in the lanes: texel 1 is red 8, green 247, blue 37, alpha 0.
@@ -1918,11 +1925,11 @@ mod tests {
             l[3] = 6;
             l[4] = 3;
             l[9] = 0xd;
-            assert!(c.load(&store, &l, &bytes, false, &mut n));
+            assert!(c.load(&mut store.ex(), &l, &bytes, false, &mut n));
             assert_eq!(read_words(&c, &store, 0x100), words, "a level reloaded as raw words reads back as it was loaded");
             // A bind under the original format samples the original texels, whatever storage loaded the words.
             c.short_bind(&[0xffff_ffff, 2 << 12, storage << 14, 0x23, 1]);
-            let lv = c.record(&store, &rec, Default::default(), &mut TexCounts::default()).unwrap().levels[0];
+            let lv = c.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).unwrap().levels[0];
             let after: Vec<u32> = (0..32).map(|i| store.get(lv.plane, lv.off + (i / 8) * 8 + i % 8)).collect();
             assert_eq!(after, before, "{storage:#x}");
             assert_eq!(read_words(&c, &store, 0x100), words, "and again after the bind has sampled them");
@@ -1940,15 +1947,18 @@ mod tests {
         l[4] = 3;
         l[9] = 0xd;
         let bytes: Vec<u8> = (0..32u32).flat_map(|i| ((i * 2000) as u16).to_be_bytes()).collect();
-        assert!(c.load(&store, &l, &bytes, false, &mut n));
+        assert!(c.load(&mut store.ex(), &l, &bytes, false, &mut n));
         assert_eq!(read_words(&c, &store, 0x100)[3], 6000);
         let mut rec = [0u32; 22];
         rec[6..8].copy_from_slice(&[0x100, 0xffff_ffff]);
         for (format, texel3) in [(0x0du32, unpack16(0xd, 6000)), (0x10, unpack16(0x10, 6000))] {
             let mut c2 = TexContext::default();
-            assert!(c2.load(&store, &l, &bytes, false, &mut n));
+            assert!(c2.load(&mut store.ex(), &l, &bytes, false, &mut n));
+            // The bind will write texture memory, so `record` asks for the store, and the back end drains the tiles then.
+            assert!(c2.holds_raw());
             c2.short_bind(&[0xffff_ffff, 2 << 12, format << 14, 0x23, 1]);
-            let lv = c2.record(&store, &rec, Default::default(), &mut TexCounts::default()).expect("found by bank and address, not by storage").levels[0];
+            let lv = c2.record(|| store.ex(), &rec, Default::default(), &mut TexCounts::default()).expect("found by bank and address, not by storage").levels[0];
+            assert!(!c2.holds_raw(), "decoded in place");
             assert_eq!(store.get(lv.plane, lv.off + 3), texel3, "{format:#x}");
         }
     }
@@ -1964,21 +1974,21 @@ mod tests {
         raw[4] = 3;
         raw[9] = 0xd;
         let words: Vec<u8> = (0..32u32).flat_map(|_| 0x8000u16.to_be_bytes()).collect();
-        assert!(c.load(&store, &raw, &words, false, &mut n));
+        assert!(c.load(&mut store.ex(), &raw, &words, false, &mut n));
         assert!(c.levels[&(0, 0x100)].raw);
         // An RGBA update of one corner: the raw words around it become luminance texels first.
         let mut part = copy(2, 1, 0, 0, 0x100);
         part[9] = 0x30;
-        assert!(c.load(&store, &part, &[1, 2, 3, 255, 4, 5, 6, 255], false, &mut n));
+        assert!(c.load(&mut store.ex(), &part, &[1, 2, 3, 255, 4, 5, 6, 255], false, &mut n));
         let l = c.levels[&(0, 0x100)];
         assert!(!l.raw);
         assert_eq!((store.get(l.plane, l.off), store.get(l.plane, l.off + 2)), (0xff01_0203, 0xff80_8080));
         // A partial raw load into a decoded level is decoded as luminance too.
-        assert!(c.load(&store, &{ let mut p = raw; p[1] = 2; p[2] = 1; p[13] = 1; p[14] = 0; p }, &[0xff, 0xff, 0, 0], false, &mut n));
+        assert!(c.load(&mut store.ex(), &{ let mut p = raw; p[1] = 2; p[2] = 1; p[13] = 1; p[14] = 0; p }, &[0xff, 0xff, 0, 0], false, &mut n));
         assert!(!c.levels[&(0, 0x100)].raw);
         assert_eq!(store.get(l.plane, l.off), 0xffff_ffff);
         // A raw load of everything it holds replaces it as raw again.
-        assert!(c.load(&store, &raw, &words, false, &mut n));
+        assert!(c.load(&mut store.ex(), &raw, &words, false, &mut n));
         assert!(c.levels[&(0, 0x100)].raw);
     }
 
@@ -2000,7 +2010,7 @@ mod tests {
             d[0] = 0x8095;
             d[17] |= bank << 3;
             d[18 + bank as usize] = 0x300;
-            assert!(c.load(&store, &d, &vec![0x77; 8 * 4 * 4], false, &mut n));
+            assert!(c.load(&mut store.ex(), &d, &vec![0x77; 8 * 4 * 4], false, &mut n));
         }
         assert!(slice(&mut c, &store, &mut n, 0, 0x40, 1, 0x1234_5678));
         assert!(c.filter_table(2, &[0xabcd; 33]) && c.bind_detail(&[1, 3, 2, 0x31, 0x300, 0x301]));

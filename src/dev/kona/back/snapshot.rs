@@ -189,9 +189,12 @@ pub fn prepare(store: &PixelStore, tables: &Tables, cs: &ChunkStore, list: &[Kon
 /// Put what `prepare` read into the store and tables: every array the snapshot names is allocated
 /// and filled, and the others are zeroed, so the store reads as it did when saved.
 pub fn apply(store: &PixelStore, tables: &mut Tables, p: Prepared) -> Result<(), String> {
-    store.reset();
+    // SAFETY: the caller drained the back end's tiles (`apply_chunks`), and nothing draws until this returns.
+    unsafe { store.reset() };
+    // SAFETY: as above.
+    let mut texture = unsafe { store.texture().exclusive() };
     for (plane, pages) in p.planes {
-        if !store.texture().set_pages(plane, pages) {
+        if !texture.set_pages(plane, pages) {
             return Err(format!("texture plane {plane}: refused"));
         }
     }
@@ -320,7 +323,7 @@ mod tests {
         let cs = ChunkStore::new(d.path());
         let mut a = board();
         let t = a.store.texture();
-        assert!(t.set(2, 0, 0xff01_0203) && t.set(2, 69_999, 0xff0a_0b0c) && t.set(5, 17, 7));
+        assert!(t.ex().set(2, 0, 0xff01_0203) && t.ex().set(2, 69_999, 0xff0a_0b0c) && t.ex().set(5, 17, 7));
         let list = a.save_chunks(&cs).unwrap();
         let named = |n: &str| list.iter().find(|c| c.name == n).map(|c| c.hashes.iter().filter(|h| **h != ZERO).count());
         assert_eq!((named("texture-g2-5"), named("texture-g5-1")), (Some(2), Some(1)), "a chunk to a held page, a marker to the rest");
@@ -338,7 +341,7 @@ mod tests {
         let d = dir("texture-planes");
         let cs = ChunkStore::new(d.path());
         let mut a = board();
-        assert!(a.store.texture().set(1, 0, 1));
+        assert!(a.store.texture().ex().set(1, 0, 1));
         let list = a.save_chunks(&cs).unwrap();
         let h = put(&cs, &[0; PAGE_WORDS]).unwrap();
         let with = |name: &str, n: usize| -> Vec<KonaChunk> { list.iter().cloned().chain([KonaChunk { name: name.into(), hashes: h.iter().cycle().take(n).copied().collect() }]).collect() };
