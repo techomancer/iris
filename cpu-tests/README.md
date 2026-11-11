@@ -6,8 +6,9 @@ count as the emulator's exit code.
 
 One binary covers every CPU it knows: it reads `PRId` at startup and picks
 expectations for R4400 (MIPS III) or R5000 (MIPS IV) — both validated on real
-Indys — or R4600 (MIPS III), whose expectations are inferred rather than
-measured; [docs/r4600.md](docs/r4600.md) says from what.
+Indys — or R4600 (MIPS III), whose expectations were inferred and have since
+passed on a real R4600 in a Killer Instinct arcade board, not an Indy;
+[docs/r4600.md](docs/r4600.md) says where each comes from.
 
 **The suite is tests only** — emulator fixes land separately. Findings are
 reported, not fixed here, so the suite keeps showing them until `src/` changes.

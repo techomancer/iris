@@ -21,6 +21,11 @@
  * same thing written out, and agrees with it — including the column showing
  * that "greater than" is always false, which is why sixteen comparisons cover
  * all thirty-two relations (BC1F negates the other half).
+ *
+ * Of the three CPUs measured, only the R4600 (KI board, PRId 0x2020) raises
+ * Invalid exactly as that pseudocode says: for any NaN when cond3 is set, and
+ * never when it is clear. The R4400 and R5000 differ for a quiet NaN; see the
+ * tests below.
  */
 
 #include "fpu_common.h"
@@ -168,11 +173,13 @@ static void t_signalling_predicates_and_quiet_nan(void)
     exc_clear();
     for (c = 0; c < 16; c++) {
         /* An R4400 raises Invalid for a quiet NaN on every predicate, not only
-         * the signalling half — measured on an Indy R4400 rev 6.0. The flags
-         * are cumulative, so the reset above matters: without it this samples
-         * whatever the previous test left behind. */
+         * the signalling half — measured on an Indy R4400 rev 6.0. A real
+         * R4600 (KI board, PRId 0x2020) raises it on the signalling half only.
+         * The flags are cumulative, so the reset above matters: without it
+         * this samples whatever the previous test left behind. */
+        u32 want = (is_r4600() && !(c & 8u)) ? 0u : (u32)FP_V;
         (void)compare_s(F_QNAN, F_1, preds[c].s);
-        CHECK_EQ_AT("cond", c, fcsr_flags() & FP_V, (u32)FP_V);
+        CHECK_EQ_AT("cond", c, fcsr_flags() & FP_V, want);
     }
     /* Nothing may trap: the Invalid Enable bit is clear throughout. */
     CHECK_NO_EXC();
@@ -244,12 +251,20 @@ static void t_signalling_compare_traps(void)
     /* With Invalid *enabled*, even a non-signalling predicate traps on this
      * machine, because the R4400 raises Invalid for a quiet NaN regardless of
      * predicate — so the comparison never writes its answer and CC0 keeps the
-     * value set below. Measured on an Indy R4400 rev 6.0. */
+     * value set below. Measured on an Indy R4400 rev 6.0. A real R4600 (KI
+     * board, PRId 0x2020) raises nothing for a non-signalling predicate, so
+     * there is no trap and the compare stores its answer: unordered, false. */
     exc_clear();
     fcsr_set(FCSR_ENABLE(FP_V) | FCSR_CC0);
     cs_olt();
-    CHECK_EQ(exc.count, 1u);
-    CHECK_EQ(fcsr() & FCSR_CC0, (u32)FCSR_CC0);  /* not stored: the trap won */
+    if (is_r4600()) {
+        CHECK_EQ(exc.count, 0u);
+        CHECK_EQ(fcsr() & FCSR_CC0, 0u);              /* stored: false */
+        CHECK_EQ(fcsr_flags() & FP_V, 0u);
+    } else {
+        CHECK_EQ(exc.count, 1u);
+        CHECK_EQ(fcsr() & FCSR_CC0, (u32)FCSR_CC0);  /* not stored: the trap won */
+    }
     fcsr_reset();
 }
 
