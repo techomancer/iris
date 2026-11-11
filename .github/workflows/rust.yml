@@ -43,10 +43,12 @@ jobs:
         # Platforms per event kind; a failure fails the job only where gates is true.
         # arm64 Linux gates: 24 of 24 recent pull-request runs passed every test there.
         # Windows gates: a Windows-only test failure used to pass the job unseen.
+        # features: x86-64 Linux also compiles and tests the jitv2 (and tcache) paths;
+        # arm64 and Windows keep default features, which cover the paths without them.
         include: ${{ fromJSON('{
-          "push":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":true},{"os":"macos-26","gates":false}],
-          "draft":[{"os":"ubuntu-24.04","gates":true}],
-          "ready":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":true}]
+          "push":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2"},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":true},{"os":"macos-26","gates":false}],
+          "draft":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2"}],
+          "ready":[{"os":"ubuntu-24.04","gates":true,"features":"--features jitv2"},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":true}]
           }')[github.event_name != 'pull_request' && 'push' || github.event.pull_request.draft && 'draft' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
@@ -101,7 +103,7 @@ jobs:
     # (a red step, which the API still counts as a pass) and carry on.
     - name: Run tests
       continue-on-error: ${{ !matrix.gates }}
-      run: cargo nextest run --workspace --profile ci
+      run: cargo nextest run --workspace --profile ci ${{ matrix.features }}
     - name: Run doctests
       continue-on-error: ${{ !matrix.gates }}
       run: cargo test --workspace --doc
