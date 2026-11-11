@@ -885,10 +885,17 @@ a following HostW command flushes an ordinary prefix before joining a new
 serial batch. State-slot or payload exhaustion submits the complete accepted
 prefix and retries the current transfer transactionally.
 
-Resident FASTCLEAR+ALPHAHOST remains a hard error for a later M4 slice; READ
-remains a hard error until M5 supplies an explicit synchronized source.
-Producer interleaving, staging wraparound and all-or-nothing `BUS_BUSY`
-coverage are also still required before M4 is complete.
+Bulk VDMA HostW reservations are likewise transactional at the shared GFIFO:
+the token and every payload entry are published with one tail update, or the
+device returns `BUS_BUSY` without changing the queue. This lets the VDMA worker
+retry the identical slice without duplicating a prefix. Scalar CPU writes and
+batched VDMA writes can contend safely, and the bounded resident payload,
+state slots and GPU sets are repeatedly flushed and reused without changing
+architectural order or advancing a HostW context twice.
+
+This completes the M4 ordinary/zoomed pixmap boundary. Resident
+FASTCLEAR+ALPHAHOST remains a hard error; READ remains a hard error until M5
+supplies an explicit synchronized source.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each

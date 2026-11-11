@@ -915,11 +915,11 @@ M4 work and READ remains rejected until M5 observation support.
 
 - [x] Port persistent host-visible upload sets and fixed ownership tracking.
 - [x] Make one VDMA block one staged payload plus one command where possible.
-- [ ] Preserve all-or-nothing `BUS_BUSY` behavior.
+- [x] Preserve all-or-nothing `BUS_BUSY` behavior.
 - [x] Add CPU-walked PIO and line transfer descriptors.
 - [x] Add zoom segment coalescing.
 - [x] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
-- [ ] Stress CPU and VDMA producer interleaving and staging wraparound.
+- [x] Stress CPU and VDMA producer interleaving and staging wraparound.
 
 The first M4 slice stages an immutable high-word/low-word copy of every HostRW
 qword in the bounded reusable payload set. One isolated serial command consumes
@@ -979,8 +979,18 @@ the current record without advancing its context twice. A 6x4 source grid of
 6x6 zoom blocks, both ordering directions and a one-slot capacity boundary
 match complete CPU planes on Vulkan and D3D12.
 
-Resident FASTCLEAR+ALPHAHOST, all-or-nothing `BUS_BUSY` and producer/staging
-wraparound stress remain deferred; HOSTR remains M5 work.
+The fifth M4 slice makes the shared GFIFO batch reservation nonblocking and
+all-or-nothing. A VDMA bulk write now returns `BUS_BUSY` without publishing a
+token or payload prefix when the complete transfer does not fit; retry lands
+the transfer exactly once. Concurrent scalar and batched producers exercise
+thousands of atomic units across repeated GFIFO ring wraps. The resident
+hardware oracle alternates 24 PIO and VDMA HostW records through the board
+boundary, then forces nine payload-capacity flushes and state-slot flushes
+through two reusable GPU sets. Complete planes, context, transfer counters and
+stream positions match the CPU model on Vulkan and D3D12.
+
+This meets M4's ordinary and zoomed pixmap completion boundary. Resident
+FASTCLEAR+ALPHAHOST remains an explicit hard error; HOSTR remains M5 work.
 
 Complete when ordinary and zoomed pixmaps match CPU mode with no CPU
 framebuffer store and no per-qword GPU submission.
