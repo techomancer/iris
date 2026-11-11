@@ -306,6 +306,72 @@ fn full_batches_flush_and_continue() {
 }
 
 #[test]
+#[ignore = "requires a conformant host GPU"]
+fn bounded_transactional_batches_keep_order() {
+    let options = GpuOptions {
+        backend: std::env::var("WGPU_TEST_BACKEND").unwrap_or_else(|_| "auto".into()),
+        ..GpuOptions::default()
+    };
+    let gpu = Gpu::new(&options).expect("initialize GPU for bounded batches");
+    let mut board = Board::new(Arc::clone(&gpu), 32, 32);
+    board.batch = Batch::new_bounded(
+        &gpu,
+        &board.pipelines,
+        TileGrid::new(32, 32),
+        1,
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    let mut reference = Reference {
+        plane: vec![0; (board.stride * board.height) as usize],
+        width: board.width,
+        height: board.height,
+        stride: board.stride,
+    };
+    let mut builds = 0;
+    for draw in 0..32u32 {
+        let r = Rec {
+            x: [0, 31 * 16, 0],
+            y: [0, 0, 31 * 16],
+            colour: draw.wrapping_mul(0x1020_4081),
+            slot: 0,
+        };
+        let mask = if draw % 2 == 0 { 0xFF00_00FF } else { 0x00FF_FF00 };
+        let (x0, y0, x1, y1) = bbox(&r);
+        loop {
+            let result = board.batch.prim_with_slot(
+                Slot { mask, pad: [0; 3] },
+                x0, y0, x1, y1,
+                |slot| {
+                    builds += 1;
+                    let mut record = r.wgsl();
+                    record.slot = slot;
+                    record
+                },
+            );
+            match result {
+                Ok(Some(_)) => break,
+                Ok(None) => panic!("test primitive unexpectedly offscreen"),
+                Err(Full) => {
+                    assert_eq!((board.batch.len(), board.batch.slots_used()), (1, 1));
+                    assert!(board.batch.try_flush(&board.pipelines, &[&board.vram_group])
+                        .expect("submit bounded batch").is_some());
+                    assert_eq!(board.batch.sets(), 1);
+                }
+            }
+        }
+        reference.draw(&r, mask);
+    }
+    assert!(board.batch.try_flush(&board.pipelines, &[&board.vram_group])
+        .expect("submit final bounded batch").is_some());
+    assert_eq!(board.batch.sets(), 1);
+    assert_eq!(board.batch.flushes, 32);
+    assert_eq!(builds, 32, "a full retry must not rebuild a record");
+    let plane = board.plane();
+    compare(&plane, &reference, "bounded transactional batches");
+    board.gpu.check().unwrap();
+}
+
+#[test]
 fn empty_flush_is_a_no_op() {
     let Some(gpu) = gpu() else { return };
     let mut board = Board::new(gpu, 64, 64);

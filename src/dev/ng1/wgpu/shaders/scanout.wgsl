@@ -4,11 +4,11 @@
 // Bt445 RAMDAC's gamma tables finish it. The same rules as
 // `SwCompositor::compose_pixels` (src/compositor.rs), word for word.
 //
-// The slot (group 1) holds the frame's registers and tables; group 2 holds
-// the planes: REX3's RGB and auxiliary planes (2048 x 1024, the frame's row
-// y read from row (topscan + y) mod 1024), the window-id map (one byte a
-// screen pixel, four to a word, rows of 2048) and the VC2's RAM (16-bit
-// words, two to a word, the lower address in the low half).
+// The slot (group 1) holds the frame's registers and tables. The included
+// bindings select either CPU-uploaded planes and display data together, or
+// the resident raster's read-only plane group and separate display data.
+// The RGB/aux planes are 2048 x 1024, the DID map has one byte per display
+// pixel, and VC2 RAM has two 16-bit words per word (lower address first).
 
 const H_CURSOR_X: u32 = 0u;     // the cursor's hot spot, as i32 bits
 const H_CURSOR_Y: u32 = 1u;
@@ -27,10 +27,7 @@ struct Ng1Slot {
 }
 
 @group(1) @binding(0) var<storage, read> slot: Ng1Slot;
-@group(2) @binding(0) var<storage, read> fb_rgb: array<u32>;
-@group(2) @binding(1) var<storage, read> fb_aux: array<u32>;
-@group(2) @binding(2) var<storage, read> did_map: array<u32>;
-@group(2) @binding(3) var<storage, read> vc2_ram: array<u32>;
+#include "ng1_bindings.wgsl"
 
 fn vc2_word(a: u32) -> u32 {
     let w = vc2_ram[a >> 1u];

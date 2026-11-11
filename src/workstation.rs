@@ -31,13 +31,14 @@ use crate::machine::Machine;
 use crate::machine_state::{GuestState, MachineStatus, TransitionAck};
 use crate::monitor::Monitor;
 use crate::net::NatControl;
-use crate::traits::{Device, MachineEvent};
+use crate::traits::{Device, MachineEvent, MachineFatal};
 
 /// Build the machine `cfg` describes, or say why it cannot be built.
 ///
 /// Construction can put more than a megabyte on the stack, so call this from
 /// a thread with a large one, as `main.rs` and iris-gui do.
 pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
+    cfg.validate_newport_raster_gate()?;
     crate::machine::set_emulator_profile(cfg.machine.profile);
     if let Some(line) = host_id_line(&cfg) {
         eprintln!("iris: {line}");
@@ -56,6 +57,22 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
             Ok(Box::new(crate::ip27_deskside::DesksideMachine::new(&cfg)?))
         }
         _ => Ok(Box::new(Machine::new(cfg))),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn build_rejects_newport_resident_wgpu_raster_without_prior_config_validation() {
+    for profile in [
+        crate::config::MachineProfile::IndyIp24,
+        crate::config::MachineProfile::Indigo2Ip22,
+        crate::config::MachineProfile::Indigo2Ip28,
+    ] {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = profile;
+        cfg.graphics.raster = crate::config::RasterUnit::Wgpu;
+        let error = build(cfg).err().expect("Newport raster gate");
+        assert!(error.contains("until M3") && error.contains("IRIS_REX3_GPU"), "{error}");
     }
 }
 
@@ -135,6 +152,16 @@ pub trait Workstation: Send {
     fn lifecycle(&self) -> GuestState;
     fn set_lifecycle(&mut self, state: GuestState);
 
+    /// The first terminal device fault, if this machine has one.
+    fn fatal_fault(&self) -> Option<MachineFatal> {
+        None
+    }
+
+    /// Latch a terminal device fault. Returns true only for the first fault.
+    fn latch_fatal_fault(&mut self, _fault: MachineFatal) -> bool {
+        false
+    }
+
     /// The guest's current state and whether the monitor is accepting
     /// commands. Every surface that reports state — `machine-status`, the
     /// `machine-start` acknowledgement, and the CI socket's `status` — goes
@@ -160,6 +187,9 @@ pub trait Workstation: Send {
     /// or `Halted` one also restarts its peripherals. The returned
     /// [`TransitionAck`] is what the monitor prints.
     fn start_guest(&mut self) -> Result<TransitionAck, String> {
+        if let Some(fault) = self.fatal_fault() {
+            return Err(format!("machine cannot restart after fatal device failure: {fault}"));
+        }
         let from = self.status().state;
         if from == GuestState::Running {
             return Ok(TransitionAck { from, via: None, to: from });
@@ -799,6 +829,33 @@ pub(crate) fn register_system_controller(
             }
         }).unwrap();
     }
+}
+
+/// Start the reliable, unbounded terminal-device-fault path for `slot`.
+///
+/// This is separate from the bounded reset/power event queue so a graphics
+/// worker can always request shutdown, and shutdown runs on a controller
+/// thread rather than trying to join the failed worker from itself.
+pub(crate) fn register_fatal_controller(
+    slot: MachineSlot,
+    faults: Option<std::sync::mpsc::Receiver<MachineFatal>>,
+) {
+    let Some(rx) = faults else { return };
+    std::thread::Builder::new().name("machine-fatal".to_string()).spawn(move || {
+        while let Ok(fault) = rx.recv() {
+            let label = format!("fatal {}", fault.source);
+            let result = with_machine_slot(&slot, |machine| {
+                if !machine.latch_fatal_fault(fault.clone()) {
+                    return;
+                }
+                eprintln!("iris: fatal device failure: {fault}");
+                stop_and_flush(machine, &label);
+            });
+            if result.is_err() {
+                break;
+            }
+        }
+    }).unwrap();
 }
 
 /// A thin monitor device that reaches the machine through its slot so the

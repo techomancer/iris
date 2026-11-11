@@ -16,6 +16,8 @@
 
 pub mod rex3;
 pub(crate) mod rex3_dirty;
+#[cfg(feature = "wgpu")]
+pub(crate) mod rex3_flat_fill;
 pub mod rex3_generic;
 #[cfg(feature = "rex-gpu")]
 pub mod rex3_gpu;
@@ -35,6 +37,8 @@ pub mod rex3_jit;
 pub mod vc2;
 /// The display composed on the host GPU (the wgpu window renderer).
 #[cfg(feature = "wgpu")]
+// Resident parity tests retain the existing unsafe Box-style plane indexing.
+#[cfg_attr(test, allow(dangerous_implicit_autorefs))]
 pub mod wgpu;
 pub mod vc2_timings;
 pub mod xmap9;

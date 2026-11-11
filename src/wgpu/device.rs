@@ -345,6 +345,7 @@ impl Gpu {
                 wgpu::Features::SHADER_INT64,
                 wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX,
                 wgpu::Features::TIMESTAMP_QUERY,
+                wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
             ] {
                 if have.contains(f) {
                     features |= f;
@@ -413,6 +414,11 @@ impl Gpu {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_device_loss(&self, message: &str) {
+        self.error.lock().get_or_insert(format!("wgpu device lost (test): {message}"));
     }
 
     /// Submit one command buffer, after the writes queued so far.

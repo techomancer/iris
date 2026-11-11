@@ -93,6 +93,675 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .expect("big-stack test thread panicked")
 }
 
+#[cfg(feature = "wgpu")]
+mod resident_gate_tests {
+    use super::*;
+    use crate::dev::ng1::wgpu::resident::{ResidentBackend, ResidentError, ResidentStatus};
+    use crate::workstation::Workstation;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Probe {
+        calls: Arc<AtomicUsize>,
+        result: Result<(), ResidentError>,
+    }
+
+    impl ResidentBackend for Probe {
+        fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()?;
+            context.colorred = 0x1234;
+            Ok(())
+        }
+
+        fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+    }
+
+    fn probe(result: Result<(), ResidentError>) -> (Probe, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (Probe { calls: Arc::clone(&calls), result }, calls)
+    }
+
+    struct LossProbe(Arc<AtomicUsize>);
+
+    impl LossProbe {
+        fn check(&self) -> Result<(), ResidentError> {
+            if self.0.load(Ordering::Acquire) != 0 {
+                Err(ResidentError::DeviceLost("injected first loss".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ResidentBackend for LossProbe {
+        fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> { self.check() }
+        fn submit(&mut self) -> Result<(), ResidentError> { self.check() }
+        fn poll_device_health(&mut self) -> Result<(), ResidentError> { self.check() }
+        fn status(&mut self) -> Result<ResidentStatus, ResidentError> {
+            self.check()?;
+            Ok(ResidentStatus::for_test())
+        }
+        fn reset(&mut self, _: &[u32], _: &[u32]) -> Result<(), ResidentError> { self.check() }
+    }
+
+    fn set_up_draw(rex: &Rex3) {
+        let ctx = unsafe { &mut *rex.context.get() };
+        ctx.drawmode0 = DrawMode0(DM0_DRAW_BLOCK);
+        ctx.drawmode1 = DrawMode1(DM1_RGB24_SRC);
+        ctx.clipmode = 0xf << CLIPMODE_CIDMATCH_SHIFT;
+        ctx.wrmask = 0x00ff_ffff;
+        ctx.xstart = (REX3_COORD_BIAS + 10) << 11;
+        ctx.xsave = ctx.xstart;
+        ctx.ystart = (REX3_COORD_BIAS + 20) << 11;
+        ctx.xend = (REX3_COORD_BIAS + 12) << 11;
+        ctx.yend = (REX3_COORD_BIAS + 22) << 11;
+    }
+
+    #[test]
+    fn resident_attachment_requires_a_quiescent_exclusive_board() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
+
+            rex.running.store(true, Ordering::Release);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("stopped"));
+            rex.running.store(false, Ordering::Release);
+            rex.gfxbusy.store(true, Ordering::Release);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("idle"));
+            rex.gfxbusy.store(false, Ordering::Release);
+            rex.gfifo_push(REX3_WRMASK, 0);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("idle"));
+            rex.gfifo.reset();
+
+            #[cfg(feature = "gputrace")]
+            {
+                rex.tap.store(rec::TAP_REC, Ordering::Release);
+                assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("recording"));
+                rex.tap.store(0, Ordering::Release);
+                let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target")
+                    .join(format!("resident-gate-trace-{}-{nonce}.log", std::process::id()));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                rex.start_trace(path.to_str().unwrap(), 0).unwrap();
+                assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("tracing"));
+                rex.stop_trace().unwrap();
+                std::fs::remove_file(path).unwrap();
+            }
+            rex.attach_resident_raster(probe(Ok(())).0).unwrap();
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Resident);
+            assert!(rex.attach_resident_raster(probe(Ok(())).0).unwrap_err().contains("already"));
+
+            rex.start();
+            assert!(rex.running.load(Ordering::Acquire));
+            assert!(rex.processor_thread.lock().is_some());
+            assert!(rex.refresh_thread.lock().is_none(), "resident display requires explicit test opt-in");
+            rex.stop();
+            assert!(!rex.running.load(Ordering::Acquire));
+            assert!(rex.processor_thread.lock().is_none());
+            assert!(rex.refresh_thread.lock().is_none());
+
+            #[cfg(feature = "rex-gpu")]
+            {
+                let error = rex.enable_gpu_replay("not-a-backend").err().unwrap();
+                assert!(error.contains("mutually exclusive"), "{error}");
+                assert!(rex.gpu_replay_report().is_none());
+            }
+        });
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    #[test]
+    fn resident_and_legacy_mode_selection_is_mutually_exclusive() {
+        assert!(RasterModeKind::Cpu.ensure_available(RasterModeKind::LegacyReplay).is_ok());
+        assert!(RasterModeKind::Cpu.ensure_available(RasterModeKind::Resident).is_ok());
+        assert!(RasterModeKind::LegacyReplay.ensure_available(RasterModeKind::LegacyReplay).is_err());
+        assert!(RasterModeKind::Resident.ensure_available(RasterModeKind::Resident).is_err());
+        assert!(RasterModeKind::LegacyReplay.ensure_available(RasterModeKind::Resident).is_err());
+        assert!(RasterModeKind::Resident.ensure_available(RasterModeKind::LegacyReplay).is_err());
+
+        with_big_stack(|| {
+            let rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let error = rex.enable_gpu_replay_using(|| Err("adapter unavailable".into())).err().unwrap();
+            assert_eq!(error, "adapter unavailable");
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
+        });
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    #[test]
+    #[ignore = "requires a conformant host GPU"]
+    fn gpu_replay_refuses_resident_attachment() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+            rex.enable_gpu_replay(&backend).expect("initialize legacy GPU replay");
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::LegacyReplay);
+            let error = rex.attach_resident_raster(probe(Ok(())).0).unwrap_err();
+            assert!(error.contains("mutually exclusive"), "{error}");
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::LegacyReplay);
+            assert!(rex.gpu_replay_report().is_some());
+            let error = rex.enable_gpu_replay("not-a-backend").err().unwrap();
+            assert!(error.contains("already enabled"), "{error}");
+        });
+    }
+
+    #[cfg(feature = "rex-gpu")]
+    #[test]
+    #[ignore = "requires a conformant host GPU"]
+    fn gpu_replay_live_environment_uses_the_legacy_prototype() {
+        const CHILD: &str = "IRIS_REX3_LEGACY_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let rex = make_rex3_unstarted();
+            rex.start();
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::LegacyReplay);
+            reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+            reg(&rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(&rex, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT);
+            reg(&rex, REX3_COLORRED, 0x11 << 11);
+            reg(&rex, REX3_COLORGRN, 0x22 << 11);
+            reg(&rex, REX3_COLORBLUE, 0x33 << 11);
+            reg(&rex, REX3_XYENDI, xy(10, 20));
+            reg(&rex, REX3_XYSTARTI, xy(10, 20));
+            reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            assert_eq!(read_pixel(&rex, 10, 20) & 0x00ff_ffff, 0x0033_2211);
+            let report = rex.gpu_replay_report().expect("legacy GPU report");
+            assert_eq!(report.handled_draws, 1);
+            assert_eq!(report.fallback_draws, 0);
+            return;
+        }
+
+        let name = std::thread::current().name().unwrap().to_owned();
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--ignored", "--nocapture"])
+            .env(CHILD, "1")
+            .env("IRIS_REX3_GPU", &backend)
+            .env("IRIS_REX_JIT_PROFILE", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env_remove("IRIS_REX3_REC")
+            .env_remove("IRIS_REX3_TRACE")
+            .env_remove("REX3_GPU_BATCH_DRAWS")
+            .env_remove("REX3_GPU_TIMESTAMPS")
+            .env_remove("REX3_GPU_TELEMETRY")
+            .output()
+            .expect("run isolated legacy environment test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+        assert!(stderr.contains("experimental live GPU renderer enabled"), "{stderr}");
+    }
+
+    #[test]
+    fn resident_gate_preserves_legacy_environment_selection() {
+        const CHILD: &str = "IRIS_REX3_RESIDENT_GATE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let rex = make_rex3_unstarted();
+            rex.start();
+            assert_eq!(rex.raster.lock().kind(), RasterModeKind::Cpu);
+            #[cfg(feature = "rex-gpu")]
+            assert!(rex.gpu_replay_report().is_none());
+            reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+            reg(&rex, REX3_WRMASK, 0x00ff_ffff);
+            reg(&rex, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT);
+            reg(&rex, REX3_COLORRED, 0x11 << 11);
+            reg(&rex, REX3_COLORGRN, 0x22 << 11);
+            reg(&rex, REX3_COLORBLUE, 0x33 << 11);
+            reg(&rex, REX3_XYENDI, xy(10, 20));
+            reg(&rex, REX3_XYSTARTI, xy(10, 20));
+            reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            assert_eq!(read_pixel(&rex, 10, 20) & 0x00ff_ffff, 0x0033_2211);
+            return;
+        }
+
+        let name = std::thread::current().name().unwrap().to_owned();
+        let exe = std::env::current_exe().unwrap();
+        for requested in [false, true] {
+            let mut child = std::process::Command::new(&exe);
+            child.args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("IRIS_REX_JIT_PROFILE", if cfg!(windows) { "NUL" } else { "/dev/null" })
+                .env_remove("IRIS_REX3_REC")
+                .env_remove("IRIS_REX3_TRACE")
+                .env_remove("IRIS_REX3_GPU");
+            if requested {
+                child.env("IRIS_REX3_GPU", if cfg!(feature = "rex-gpu") { "not-a-backend" } else { "auto" });
+            }
+            let out = child.output().expect("run isolated environment test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+            if requested {
+                let expected = if cfg!(feature = "rex-gpu") {
+                    "cannot enable IRIS_REX3_GPU=not-a-backend; using CPU renderer"
+                } else {
+                    "ignoring IRIS_REX3_GPU=auto; rebuild with --features rex-gpu"
+                };
+                assert!(stderr.contains(expected), "{stderr}");
+            } else {
+                assert!(!stderr.contains("IRIS_REX3_GPU="), "{stderr}");
+            }
+        }
+    }
+
+    #[test]
+    fn resident_go_dispatches_without_cpu_raster() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            set_up_draw(&rex);
+            let index = 20 * 2048 + 10;
+            let before_rgb = unsafe { (*rex.fb_rgb.get())[index] };
+            let before_aux = unsafe { (*rex.fb_aux.get())[index] };
+            let (backend, calls) = probe(Ok(()));
+            rex.attach_resident_raster(backend).unwrap();
+
+            rex.execute_go();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(unsafe { (*rex.context.get()).colorred }, 0x1234);
+            assert_eq!(unsafe { (*rex.fb_rgb.get())[index] }, before_rgb);
+            assert_eq!(unsafe { (*rex.fb_aux.get())[index] }, before_aux);
+            assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+            assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn resident_gate_rejects_unimplemented_cpu_plane_operations() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let before = unsafe { (*rex.fb_rgb.get())[0] };
+            unsafe { (*rex.context.get()).colorred = 0x1234; }
+            rex.attach_resident_raster(probe(Ok(())).0).unwrap();
+            let path = std::path::Path::new(".");
+            assert!(rex.save_framebuffers_named(path, "unused").is_err());
+            assert!(rex.load_framebuffers_named(path, "unused").is_err());
+            assert!(rex.dump_framebuffer_debug(path).is_err());
+            assert!(rex.load_state(&toml::Value::Table(Default::default())).is_err());
+            assert_eq!(rex.read32(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.read32(go_addr(REX3_HOSTRW1)).status, BUS_ERR);
+            assert_eq!(rex.read64(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
+            let mut words = [0x1234; 2];
+            assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut words), BUS_ERR);
+            assert_eq!(words, [0x1234; 2]);
+            assert!(rex.gfifo.is_empty());
+
+            let rejected = |operation: &dyn Fn()| {
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err());
+            };
+            rejected(&|| { let _ = rex.snapshot_framebuffers_inmem(); });
+            rejected(&|| rex.restore_framebuffers_inmem(&[0], &[0]));
+            rejected(&|| rex.power_on());
+            rejected(&|| { let _ = rex.save_state(); });
+            rex.wait_resident_idle().unwrap();
+            #[cfg(feature = "gputrace")]
+            {
+                assert!(rex.set_recording(None, false).is_err());
+                assert!(rex.start_trace("unused", trace::TRACE_ALL).is_err());
+            }
+            rex.stop();
+            assert_eq!(unsafe { (*rex.fb_rgb.get())[0] }, before);
+            assert_eq!(unsafe { (*rex.context.get()).colorred }, 0x1234);
+        });
+    }
+
+    #[test]
+    fn resident_errors_are_sticky_and_never_fall_back_to_cpu() {
+        with_big_stack(|| {
+            for error in [
+                ResidentError::Unsupported("test opcode"),
+                ResidentError::Failed("test device loss".into()),
+            ] {
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                set_up_draw(&rex);
+                let index = 20 * 2048 + 10;
+                let before_rgb = unsafe { (*rex.fb_rgb.get())[index] };
+                let before_aux = unsafe { (*rex.fb_aux.get())[index] };
+                let (backend, calls) = probe(Err(error.clone()));
+                rex.attach_resident_raster(backend).unwrap();
+
+                for attempt in 0..2 {
+                    if attempt == 1 {
+                        let ctx = unsafe { &mut *rex.context.get() };
+                        ctx.drawmode0.0 |= DM0_DOSETUP;
+                        ctx.pat_bit = 7;
+                        ctx.zpat_bit = 8;
+                    }
+                    rex.execute_go();
+                    assert_eq!(rex.resident_fault(), Some(error.clone()));
+                    assert_eq!(rex.wait_resident_idle(), Err(error.clone()));
+                }
+                assert_eq!(unsafe { (*rex.context.get()).pat_bit }, 7);
+                assert_eq!(unsafe { (*rex.context.get()).zpat_bit }, 8);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "the first fault must be sticky");
+                assert_eq!(unsafe { (*rex.fb_rgb.get())[index] }, before_rgb);
+                assert_eq!(unsafe { (*rex.fb_aux.get())[index] }, before_aux);
+                assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+                assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn resident_rejection_submits_the_accepted_prefix_before_latching_fault() {
+        struct PrefixBackend {
+            calls: Arc<AtomicUsize>,
+            submits: Arc<AtomicUsize>,
+            submit_error: Option<ResidentError>,
+        }
+        impl ResidentBackend for PrefixBackend {
+            fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(ResidentError::Unsupported("test opcode"))
+                }
+            }
+            fn submit(&mut self) -> Result<(), ResidentError> {
+                self.submits.fetch_add(1, Ordering::SeqCst);
+                self.submit_error.clone().map_or(Ok(()), Err)
+            }
+        }
+
+        with_big_stack(|| {
+            for submit_error in [None, Some(ResidentError::Failed("test submission".into()))] {
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                set_up_draw(&rex);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let submits = Arc::new(AtomicUsize::new(0));
+                rex.attach_resident_raster(PrefixBackend {
+                    calls: Arc::clone(&calls), submits: Arc::clone(&submits),
+                    submit_error: submit_error.clone(),
+                }).unwrap();
+                rex.execute_go();
+                rex.execute_go();
+                rex.execute_go();
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert_eq!(submits.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    rex.wait_resident_idle(),
+                    Err(submit_error.unwrap_or(ResidentError::Unsupported("test opcode"))),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn resident_failed_worker_with_full_gfifo_can_be_stopped() {
+        struct PanicBackend;
+        impl ResidentBackend for PanicBackend {
+            fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> {
+                panic!("injected resident worker failure");
+            }
+
+            fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+        }
+
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            set_up_draw(&rex);
+            rex.attach_resident_raster(PanicBackend).unwrap();
+            rex.start();
+            rex.gfifo_push(GFIFO_PURE_GO, 0);
+            assert!(matches!(rex.wait_resident_idle(), Err(ResidentError::Failed(_))));
+            let mut queued = 0;
+            while rex.gfifo.try_push(REX3_WRMASK, 0) {
+                queued += 1;
+            }
+            assert!(queued >= GFIFO_DEPTH - 2, "the failed worker leaves a full queue");
+            rex.stop();
+            assert!(!rex.is_running());
+            assert!(rex.processor_thread.lock().is_none());
+            assert!(rex.gfifo.is_empty());
+        });
+    }
+
+    #[test]
+    fn resident_status_reports_the_first_fault_to_machine_control_once() {
+        with_big_stack(|| {
+            let lost = Arc::new(AtomicUsize::new(1));
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            rex.set_fatal_sender(sender);
+            rex.attach_resident_raster(LossProbe(lost)).unwrap();
+            let first = ResidentError::DeviceLost("injected first loss".into());
+            assert_eq!(rex.resident_status(), Err(first.clone()));
+            rex.fail_resident(ResidentError::Failed("later failure".into()));
+            let notification = receiver.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert_eq!(notification.source, "Newport resident GPU");
+            assert_eq!(notification.message, first.to_string());
+            assert_eq!(rex.resident_fault(), Some(first));
+            assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        });
+    }
+
+    #[test]
+    fn resident_successful_reset_rearms_fault_notification() {
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            rex.set_fatal_sender(sender);
+            rex.attach_resident_raster(LossProbe(Arc::new(AtomicUsize::new(0)))).unwrap();
+            let first = ResidentError::Unsupported("recoverable test operation");
+            rex.fail_resident(first.clone());
+            assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(2)).unwrap().message, first.to_string());
+            rex.reset_resident_gpu().unwrap();
+            let lost = ResidentError::DeviceLost("loss after reset".into());
+            rex.fail_resident(lost.clone());
+            assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(2)).unwrap().message, lost.to_string());
+            rex.fail_resident(ResidentError::Failed("later failure".into()));
+            assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            assert_eq!(rex.resident_fault(), Some(lost));
+        });
+    }
+
+    #[test]
+    fn resident_idle_device_loss_wakes_machine_control_once() {
+        with_big_stack(|| {
+            let lost = Arc::new(AtomicUsize::new(0));
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            rex.set_fatal_sender(sender);
+            rex.attach_resident_raster(LossProbe(Arc::clone(&lost))).unwrap();
+            let rex = TestBoard::new(Arc::<Rex3>::from(rex));
+            rex.start();
+            rex.wait_resident_idle().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !rex.processor_parked.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline, "resident worker did not become idle");
+                std::thread::yield_now();
+            }
+            lost.store(1, Ordering::Release);
+            let notification = receiver.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("an idle device loss must notify machine control without another draw");
+            let first = ResidentError::DeviceLost("injected first loss".into());
+            assert_eq!(notification.message, first.to_string());
+            assert_eq!(rex.resident_status(), Err(first.clone()));
+            rex.fail_resident(ResidentError::Failed("later failure".into()));
+            assert_eq!(rex.resident_fault(), Some(first.clone()));
+            assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            rex.stop();
+            assert_eq!(rex.start_resident_processor(), Err(first));
+        });
+    }
+
+    #[test]
+    fn resident_board_loss_reaches_machine_with_the_event_queue_full() {
+        with_big_stack(|| {
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &crate::cpu::parts::R4400_150);
+            cfg.headless = false;
+            // This test must not load or overwrite a user's battery-backed state.
+            cfg.nvram.clear();
+            cfg.nveeprom.clear();
+            let mut machine = Box::new(crate::machine::Machine::new(cfg));
+            let rex = machine.get_rex3().expect("Newport board");
+            let lost = Arc::new(AtomicUsize::new(0));
+            assert!(!rex.is_running() && rex.gfifo.is_empty());
+            {
+                let mut raster = rex.raster.lock();
+                assert_eq!(raster.kind(), RasterModeKind::Cpu);
+                *raster = RasterMode::Resident(crate::dev::ng1::wgpu::resident::ResidentRaster::new(
+                    LossProbe(Arc::clone(&lost)),
+                ));
+            }
+            rex.resident_frame.activate();
+            let mut queued = 0;
+            while machine.event_tx.try_send(crate::traits::MachineEvent::HardReset).is_ok() {
+                queued += 1;
+            }
+            assert!(queued > 0, "the ordinary machine event queue must be full");
+            rex.start();
+            lost.store(1, Ordering::Release);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !rex.resident_fatal_notified.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline, "board did not send the fatal event");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let slot = machine.machine_slot();
+            crate::workstation::register_fatal_controller(slot.clone(), machine.take_fatal_receiver_for_test());
+            let expected = crate::traits::MachineFatal::new(
+                "Newport resident GPU", ResidentError::DeviceLost("injected first loss".into()).to_string(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let fault = crate::workstation::with_machine_slot(&slot, |machine| machine.fatal_fault()).unwrap();
+                if fault.is_some() {
+                    assert_eq!(fault, Some(expected.clone()));
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "machine controller did not latch board failure");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!rex.is_running(), "the controller must stop the failed board");
+            assert!(matches!(machine.event_tx.try_send(crate::traits::MachineEvent::HardReset),
+                Err(std::sync::mpsc::TrySendError::Full(_))));
+            assert!(machine.start_guest().unwrap_err().contains("injected first loss"));
+            machine.start();
+            assert!(!rex.is_running(), "a fatal machine cannot restart the board");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires the requested conformant hardware GPU backend"]
+    fn resident_gpu_device_loss_before_after_submission_and_while_idle() {
+        use crate::dev::ng1::wgpu::resident::{ObservationReason, PlaneMask};
+        use crate::wgpu::{Gpu, GpuOptions};
+
+        with_big_stack(|| {
+            for stage in ["before submission", "after submission", "while idle"] {
+                let backend = std::env::var("REX3_RESIDENT_BACKEND").unwrap_or_else(|_| "auto".into());
+                let gpu = Gpu::new(&GpuOptions { backend: backend.clone(), ..GpuOptions::default() })
+                    .unwrap_or_else(|error| panic!("required resident backend {backend}: {error}"));
+                let expected_backend = match backend.as_str() {
+                    "vulkan" => Some(wgpu::Backend::Vulkan),
+                    "dx12" => Some(wgpu::Backend::Dx12),
+                    "metal" => Some(wgpu::Backend::Metal),
+                    "gl" => Some(wgpu::Backend::Gl),
+                    "auto" => None,
+                    _ => panic!("unknown required backend {backend}"),
+                };
+                if let Some(expected) = expected_backend {
+                    assert_eq!(gpu.caps.backend, expected);
+                }
+                assert!(matches!(gpu.caps.device_type, wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu),
+                    "resident gate requires a hardware adapter: {}", gpu.caps);
+                eprintln!("resident device-loss {stage}: {}", gpu.caps);
+
+                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                rex.fb_rgb.get_mut().isolate().unwrap();
+                rex.fb_aux.get_mut().isolate().unwrap();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                rex.set_fatal_sender(sender);
+                rex.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+                set_up_draw(&rex);
+                rex.fb_rgb.get_mut().reset_access_counts();
+                rex.fb_aux.get_mut().reset_access_counts();
+                let rex = TestBoard::new(Arc::<Rex3>::from(rex));
+                let rgb_guard = unsafe { (&*rex.fb_rgb.get()).protect() }.unwrap();
+                let aux_guard = unsafe { (&*rex.fb_aux.get()).protect() }.unwrap();
+                let initial = rex.resident_status().unwrap();
+                rex.start();
+                if stage == "after submission" {
+                    rex.gfifo_push(GFIFO_PURE_GO, 0);
+                    rex.wait_resident_idle().unwrap();
+                    let submitted = rex.resident_status().unwrap();
+                    assert_ne!(submitted.accepted, initial.accepted);
+                    assert_eq!(submitted.submitted, submitted.accepted);
+                } else if stage == "while idle" {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !rex.processor_parked.load(Ordering::Acquire) {
+                        assert!(std::time::Instant::now() < deadline, "resident processor did not park");
+                        std::thread::yield_now();
+                    }
+                }
+                gpu.inject_device_loss(stage);
+                gpu.inject_device_loss("later loss must not replace the first");
+                if stage == "before submission" {
+                    rex.gfifo_push(GFIFO_PURE_GO, 0);
+                }
+                let fault = ResidentError::DeviceLost(format!("wgpu device lost (test): {stage}"));
+                let notification = receiver.recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("real GPU loss must reach machine control without further calls");
+                assert_eq!(notification.message, fault.to_string());
+                assert_eq!(rex.resident_fault(), Some(fault.clone()));
+                assert_eq!(rex.resident_status(), Err(fault.clone()));
+                {
+                    let mut mode = rex.raster.lock();
+                    let RasterMode::Resident(raster) = &mut *mode else { panic!("resident mode disappeared") };
+                    let diagnostics = raster.diagnostics().unwrap();
+                    assert_eq!(diagnostics.fault, Some(fault.clone()));
+                    assert_eq!(diagnostics.status.raw_plane_map_attempts, 0);
+                    assert_eq!(diagnostics.status.observations, Default::default());
+                    assert_eq!((diagnostics.status.restore_uploads, diagnostics.status.restore_bytes), (0, 0));
+                    if stage == "after submission" {
+                        assert_ne!(diagnostics.status.accepted, initial.accepted);
+                    } else {
+                        assert_eq!(diagnostics.status.accepted, initial.accepted);
+                    }
+                    assert_eq!(raster.observe(ObservationReason::Validation, PlaneMask::Both).unwrap_err(), fault);
+                    assert_eq!(raster.reset(&[], &[]), Err(fault.clone()));
+                }
+                rex.stop();
+                assert_eq!(rex.start_resident_processor(), Err(fault.clone()));
+                assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+                assert_eq!(rex.jit_go_count.load(Ordering::Relaxed), 0);
+                assert_eq!(rex.interp_go_count.load(Ordering::Relaxed), 0);
+                assert_eq!(unsafe { (&*rex.fb_rgb.get()).access_counts() }, Default::default());
+                assert_eq!(unsafe { (&*rex.fb_aux.get()).access_counts() }, Default::default());
+                drop(aux_guard);
+                drop(rgb_guard);
+            }
+        });
+    }
+
+    #[test]
+    fn resident_reset_replaces_the_worker_wakeup_handle() {
+        struct ResetBackend;
+        impl ResidentBackend for ResetBackend {
+            fn enqueue(&mut self, _: &mut Rex3Context) -> Result<(), ResidentError> { Ok(()) }
+            fn submit(&mut self) -> Result<(), ResidentError> { Ok(()) }
+            fn reset(&mut self, _: &[u32], _: &[u32]) -> Result<(), ResidentError> { Ok(()) }
+        }
+
+        with_big_stack(|| {
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            rex.attach_resident_raster(ResetBackend).unwrap();
+            rex.start();
+            while rex.processor_unparker.get().is_none() {
+                std::thread::yield_now();
+            }
+            let first = rex.processor_unparker.get().unwrap().id();
+            rex.stop();
+            rex.reset_resident_gpu().unwrap();
+            assert!(rex.processor_unparker.get().is_none());
+            rex.start();
+            while rex.processor_unparker.get().is_none() {
+                std::thread::yield_now();
+            }
+            assert_ne!(rex.processor_unparker.get().unwrap().id(), first);
+            rex.stop();
+        });
+    }
+}
+
 /// A freshly reset, running Rex3. The order mirrors `Machine::reset`:
 /// power-on with the threads stopped, then start.
 ///

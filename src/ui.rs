@@ -760,8 +760,8 @@ impl Renderer for GlRenderer {
 /// The window drawn through wgpu (`renderer = "wgpu"`): the frame, the
 /// debug overlay and the status bar presented by `crate::wgpu::Presenter`,
 /// on the device of the board that draws on one, else on its own. Newport's
-/// planes are composed on the CPU here (its GL compositor has no wgpu form
-/// yet); a board that composes its own frame hands it over finished.
+/// CPU-owned planes are composed on that device; a board that composes its
+/// own frame hands it over finished.
 #[cfg(feature = "wgpu")]
 struct WgpuRenderer {
     presenter: crate::wgpu::Presenter,
@@ -915,6 +915,41 @@ impl Renderer for WgpuRenderer {
         let sb = sbtex.render_pixels(status, stats, width as usize);
         let r = self.presenter.present(crate::wgpu::Frame::Gpu { buffer: frame, width, height }, ov, sb, crate::disp::FB_STRIDE);
         self.report(r);
+    }
+
+    #[cfg(test)]
+    fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> {
+        Some(self.presenter.gpu())
+    }
+
+    #[cfg(test)]
+    fn present_resident_gpu_frame(
+        &mut self,
+        frame: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        _screen: &mut Rex3Screen,
+        overlay: &mut DebugOverlay,
+        status: &mut StatusBar,
+        sbtex: &mut StatusBarTexture,
+        stats: &BarStats,
+    ) -> Result<(), String> {
+        // The debug overlay's pixel inspector expects CPU plane snapshots,
+        // which are intentionally stale in resident mode.
+        if overlay.active() {
+            return Err("resident debug overlays require a raw-plane observation".into());
+        }
+        if let Some((w, h)) = self.window_size.lock().take() {
+            self.presenter.resize(w, h);
+        }
+        *self.display_res.lock() = (width, height);
+        let sb = sbtex.render_pixels(status, stats, width as usize);
+        self.presenter.present(
+            crate::wgpu::Frame::Gpu { buffer: frame, width, height },
+            None,
+            sb,
+            crate::disp::FB_STRIDE,
+        )
     }
 }
 

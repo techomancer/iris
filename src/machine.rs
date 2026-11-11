@@ -8,7 +8,7 @@ use std::thread;
 
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig, ScsiDeviceConfig};
 use crate::machine_state::GuestState;
-use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
+use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent, MachineFatal};
 use crate::locks::LockMonitor;
 use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::physical::Physical;
@@ -122,6 +122,10 @@ pub struct Machine {
     /// Sender for async machine events (HardReset, PowerOff) from devices.
     pub event_tx: mpsc::SyncSender<MachineEvent>,
     event_rx: Option<mpsc::Receiver<MachineEvent>>,
+    /// Reliable, unbounded terminal-device-fault path.
+    fatal_rx: Option<mpsc::Receiver<MachineFatal>>,
+    /// First terminal device failure. A failed machine cannot restart.
+    fatal_fault: Option<MachineFatal>,
     timer_manager: Arc<TimerManager>,
     /// When `cfg.ci` is set, the channel-A backend is replaced by this
     /// in-process one so the CI control socket can drive the console.
@@ -413,6 +417,7 @@ impl Machine {
         // fetch counters and the cycle counter is wired in below.
         let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick_count.clone());
         let [decoded_count, l1i_hit_count, l1i_fetch_count, uncached_fetch_count] = status.fetch_counters();
+        let (fatal_tx, fatal_rx) = mpsc::channel::<MachineFatal>();
 
         // HPC3 (512KB at 0x1FB80000). The SCC's channels start wired to
         // nothing; each gets its host end below.
@@ -535,6 +540,7 @@ impl Machine {
             None
         } else {
             let r = Arc::new(Rex3::new(status.clone()));
+            r.set_fatal_sender(fatal_tx.clone());
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
             r.set_vblank_irq(ioc.irq_line(wiring.retrace));
             r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
@@ -545,6 +551,7 @@ impl Machine {
             None
         } else {
             let r = Arc::new(Rex3::new(status.clone()));
+            r.set_fatal_sender(fatal_tx.clone());
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
             r.set_vblank_irq(ioc.irq_line(wiring.retrace));
             r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
@@ -956,6 +963,8 @@ impl Machine {
             monitor_port,
             event_tx,
             event_rx: Some(event_rx),
+            fatal_rx: Some(fatal_rx),
+            fatal_fault: None,
             timer_manager,
             ci_serial,
             serial_log,
@@ -1005,6 +1014,10 @@ impl Machine {
     }
 
     pub fn start(&mut self) {
+        if let Some(fault) = &self.fatal_fault {
+            eprintln!("iris: refusing to start machine after fatal device failure: {fault}");
+            return;
+        }
         // Publish "starting" before the monitor binds, so a caller that polls
         // readiness can tell "not started" (Idle) from "startup under way".
         // Halted -> Starting covers the GUI's Stop then Start; a stored
@@ -1060,7 +1073,13 @@ impl Machine {
         assert!(!self.controller_registered, "register_system_controller called twice");
         self.controller_registered = true;
         let slot = self.machine_slot();
-        crate::workstation::register_system_controller(&self.monitor, slot, self.event_rx.take());
+        crate::workstation::register_system_controller(&self.monitor, slot.clone(), self.event_rx.take());
+        crate::workstation::register_fatal_controller(slot, self.fatal_rx.take());
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn take_fatal_receiver_for_test(&mut self) -> Option<mpsc::Receiver<MachineFatal>> {
+        self.fatal_rx.take()
     }
 
     pub fn stop(&mut self) {
@@ -1276,6 +1295,10 @@ impl Machine {
     /// `ci_restore`. In `--ci` mode the CPU is not autostarted in `start()`
     /// — the harness drives startup via `restore`.
     pub fn cpu_start(&self) {
+        if let Some(fault) = &self.fatal_fault {
+            eprintln!("iris: refusing to start CPU after fatal device failure: {fault}");
+            return;
+        }
         self.cpu.start();
     }
 
@@ -1631,6 +1654,10 @@ impl Machine {
     /// Restart everything `stop` stopped, less the CPU, without restarting the
     /// monitor server.
     fn restart_peripherals(&mut self) {
+        if let Some(fault) = &self.fatal_fault {
+            eprintln!("iris: refusing to restart peripherals after fatal device failure: {fault}");
+            return;
+        }
         self.mc.start();
         self.hpc3.start();
         if let Some(rex3) = &self.board.rex3 { rex3.start(); }
@@ -1678,6 +1705,10 @@ impl Machine {
     /// The CPU is left stopped — the monitor `run` command (or debugger) should start it.
     pub fn reset(&mut self) {
         self.stop();
+        if let Some(fault) = &self.fatal_fault {
+            eprintln!("iris: refusing to reset machine after fatal device failure: {fault}");
+            return;
+        }
 
         self.power_on_devices();
 
@@ -2118,6 +2149,15 @@ impl Workstation for Machine {
     fn monitor_addr(&self) -> Option<std::net::SocketAddr> { Machine::monitor_addr(self) }
     fn lifecycle(&self) -> GuestState { self.lifecycle }
     fn set_lifecycle(&mut self, state: GuestState) { self.lifecycle = state; }
+    fn fatal_fault(&self) -> Option<MachineFatal> { self.fatal_fault.clone() }
+    fn latch_fatal_fault(&mut self, fault: MachineFatal) -> bool {
+        if self.fatal_fault.is_some() {
+            false
+        } else {
+            self.fatal_fault = Some(fault);
+            true
+        }
+    }
 
     fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display(self) }
     fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display_head1(self) }
@@ -2316,6 +2356,38 @@ mod controller_lifetime_tests {
         let ack = machine.start_guest().expect("start after halt");
         assert_eq!(ack.text(), "halted -> starting -> running");
         machine.stop();
+    }
+
+    #[test]
+    fn fatal_device_event_stops_machine_and_blocks_restart() {
+        let mut machine = build_machine();
+        machine.start();
+        let slot = machine.machine_slot();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::workstation::register_fatal_controller(slot.clone(), Some(rx));
+
+        let first = MachineFatal::new("test GPU", "device lost");
+        tx.send(first.clone()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let fault = crate::workstation::with_machine_slot(&slot, |machine| machine.fatal_fault()).unwrap();
+            if fault.is_some() {
+                assert_eq!(fault, Some(first.clone()));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "fatal controller did not latch the failure");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(machine.start_guest().unwrap_err().contains("device lost"));
+        machine.start();
+        machine.cpu_start();
+        assert!(!machine.cpu_is_running());
+
+        tx.send(MachineFatal::new("second", "ignored")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let latched = crate::workstation::with_machine_slot(&slot, |machine| machine.fatal_fault()).unwrap();
+        assert_eq!(latched, Some(first));
     }
 
     /// A guest power-off ends the process without dropping the machine (and so

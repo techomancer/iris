@@ -8,15 +8,18 @@ use bytemuck::{Pod, Zeroable};
 use parking_lot::Mutex;
 use wgpu::util::DeviceExt;
 
+use crate::wgpu::{Gpu, GpuOptions};
+
 use super::rex3::{
-    DrawMode0, DrawMode1, Rex3Context, CLIPMODE_CIDMATCH_MASK, CLIPMODE_CIDMATCH_SHIFT,
-    CLIPMODE_ENSMASK_MASK, DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_BLOCK_SH,
-    DRAWMODE0_ADRMODE_SPAN, DRAWMODE0_ADRMODE_SPAN_SH, DRAWMODE0_OPCODE_DRAW,
-    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_COMPARE_DISABLE_SH, DRAWMODE1_DRAWDEPTH_24,
-    DRAWMODE1_LOGICOP_SRC, DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_RGB, OCTANT_XDEC,
-    OCTANT_YDEC, REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
+    DrawMode0, DrawMode1, Rex3Context, CLIPMODE_CIDMATCH_SHIFT, DRAWMODE0_ADRMODE_BLOCK_SH,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE1_COMPARE_DISABLE_SH, DRAWMODE1_DRAWDEPTH_24,
+    DRAWMODE1_LOGICOP_SRC_SH, DRAWMODE1_PLANES_RGB, REX3_COORD_BIAS, REX3_SCREEN_HEIGHT,
+    REX3_SCREEN_WIDTH,
 };
+#[cfg(test)]
+use super::rex3::DRAWMODE0_ADRMODE_SPAN_SH;
 use super::rex3_dirty::{DamagePlane, DamageRect, DamageSnapshot};
+use super::rex3_flat_fill::{prepare_flat_fill, FlatFill as NormalizedFlatFill, PreparedFlatFill};
 
 #[path = "rex3_gpu_telemetry.rs"]
 mod telemetry;
@@ -163,6 +166,7 @@ enum RequestedBackend {
     Vulkan,
     Metal,
     Dx12,
+    Gl,
 }
 
 impl RequestedBackend {
@@ -172,25 +176,20 @@ impl RequestedBackend {
             "vulkan" => Ok(Self::Vulkan),
             "metal" => Ok(Self::Metal),
             "dx12" => Ok(Self::Dx12),
+            "gl" => Ok(Self::Gl),
             other => Err(format!(
-                "REX3_GPU_BACKEND={other}: want auto, vulkan, metal, or dx12"
+                "REX3_GPU_BACKEND={other}: want auto, vulkan, metal, dx12, or gl"
             )),
         }
     }
 
-    fn candidates(self) -> Vec<(&'static str, wgpu::Backends)> {
+    fn as_str(self) -> &'static str {
         match self {
-            Self::Vulkan => vec![("vulkan", wgpu::Backends::VULKAN)],
-            Self::Metal => vec![("metal", wgpu::Backends::METAL)],
-            Self::Dx12 => vec![("dx12", wgpu::Backends::DX12)],
-            Self::Auto if cfg!(target_os = "windows") => vec![
-                ("vulkan", wgpu::Backends::VULKAN),
-                ("dx12", wgpu::Backends::DX12),
-            ],
-            Self::Auto if cfg!(target_os = "macos") => {
-                vec![("metal", wgpu::Backends::METAL)]
-            }
-            Self::Auto => vec![("vulkan", wgpu::Backends::VULKAN)],
+            Self::Auto => "auto",
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
+            Self::Dx12 => "dx12",
+            Self::Gl => "gl",
         }
     }
 }
@@ -241,11 +240,6 @@ pub enum EnqueueResult {
     Unsupported(&'static str),
 }
 
-enum FlatFillMatch {
-    Supported(Option<FlatFill>),
-    Unsupported(&'static str),
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProfilingOptions {
     pub telemetry: bool,
@@ -283,6 +277,22 @@ struct FlatFill {
     write_mask: u32,
     stride: u32,
     plane_len: u32,
+}
+
+impl From<NormalizedFlatFill> for FlatFill {
+    fn from(fill: NormalizedFlatFill) -> Self {
+        debug_assert_eq!(fill.plane, super::rex3_flat_fill::FillPlane::Rgb);
+        Self {
+            min_x: fill.min_x,
+            min_y: fill.min_y,
+            width: fill.width,
+            height: fill.height,
+            color: fill.color,
+            write_mask: fill.write_mask,
+            stride: FB_STRIDE,
+            plane_len: FB_PIXELS as u32,
+        }
+    }
 }
 
 impl FlatFill {
@@ -402,9 +412,7 @@ struct GpuBackend {
     bins: wgpu::Buffer,
     // References every buffer above.
     bind_group: wgpu::BindGroup,
-    queue: wgpu::Queue,
-    device: wgpu::Device,
-    instance: wgpu::Instance,
+    gpu: Arc<Gpu>,
 }
 
 struct TimestampResources {
@@ -476,83 +484,60 @@ impl Rex3Gpu {
             Err(std::env::VarError::NotPresent) => DEFAULT_MAX_BATCH_DRAWS,
             Err(error) => return Err(format!("read REX3_GPU_BATCH_DRAWS: {error}")),
         };
-        let mut failures = Vec::new();
-        for (name, backends) in requested.candidates() {
-            match Self::new_for_backend(backends, max_batch_draws, options) {
-                Ok(gpu) => return Ok(gpu),
-                Err(error) => failures.push(format!("{name}: {error}")),
+        let gpu_options = GpuOptions {
+            backend: requested.as_str().to_owned(),
+            optional_features: options.timestamps,
+            ..Default::default()
+        };
+        let (gpu, timestamp_failure) = match Gpu::new(&gpu_options) {
+            Ok(gpu) => (gpu, None),
+            Err(error) if options.timestamps => {
+                let fallback = Gpu::new(&GpuOptions {
+                    optional_features: false,
+                    ..gpu_options
+                })
+                .map_err(|retry| {
+                    format!(
+                        "open the common GPU with optional timestamps ({error}); \
+                         retry without optional features: {retry}"
+                    )
+                })?;
+                (
+                    fallback,
+                    Some(format!(
+                        "device rejected optional timestamp features: {error}"
+                    )),
+                )
             }
-        }
-        Err(format!(
-            "no usable REX3 GPU backend for {backend}: {}",
-            failures.join("; ")
-        ))
+            Err(error) => return Err(format!("open the common GPU: {error}")),
+        };
+        Self::new_on_gpu(gpu, max_batch_draws, options, timestamp_failure)
     }
 
-    fn new_for_backend(
-        backends: wgpu::Backends,
+    fn new_on_gpu(
+        gpu: Arc<Gpu>,
         max_batch_draws: usize,
         options: ProfilingOptions,
+        timestamp_failure: Option<String>,
     ) -> Result<Self, String> {
-        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        instance_desc.backends = backends;
-        let instance = wgpu::Instance::new(instance_desc);
-        let request_adapter = || {
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                ..Default::default()
-            }))
-        };
-        let adapter = request_adapter().map_err(|error| format!("request adapter: {error}"))?;
-
-        let mut info = adapter.get_info();
-        let mut limits = adapter.limits();
+        let info = gpu.adapter.get_info();
+        let limits = gpu.adapter.limits();
         check_limits(&info, &limits, max_batch_draws)?;
 
-        let features = adapter.features();
+        let features = gpu.device.features();
         let mut timestamp_support = if !options.timestamps {
             TimestampSupport::Disabled
+        } else if let Some(error) = timestamp_failure {
+            TimestampSupport::Unavailable(error)
         } else if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-            TimestampSupport::Unsupported("adapter does not expose TIMESTAMP_QUERY")
+            TimestampSupport::Unsupported("shared device does not expose TIMESTAMP_QUERY")
         } else {
             TimestampSupport::Enabled {
                 readback_transfer: features
                     .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             }
         };
-        let mut required_features = wgpu::Features::empty();
-        if let TimestampSupport::Enabled { readback_transfer } = timestamp_support {
-            required_features |= wgpu::Features::TIMESTAMP_QUERY;
-            if readback_transfer {
-                required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-            }
-        }
-        let mut descriptor = wgpu::DeviceDescriptor {
-            label: Some("IRIS REX3 replay device"),
-            required_features,
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        };
-        let (device, queue) = match pollster::block_on(adapter.request_device(&descriptor)) {
-            Ok(device) => device,
-            Err(error) if !required_features.is_empty() => {
-                timestamp_support = TimestampSupport::Unavailable(format!(
-                    "device rejected optional timestamp features: {error}"
-                ));
-                descriptor.required_features = wgpu::Features::empty();
-                let fallback = request_adapter().map_err(|retry| {
-                    format!("timestamp device request failed ({error}); request fallback adapter: {retry}")
-                })?;
-                info = fallback.get_info();
-                limits = fallback.limits();
-                check_limits(&info, &limits, max_batch_draws)?;
-                pollster::block_on(fallback.request_device(&descriptor)).map_err(|retry| {
-                    format!("timestamp device request failed ({error}); request device for {} without timestamps: {retry}", info.name)
-                })?
-            }
-            Err(error) => return Err(format!("request device for {}: {error}", info.name)),
-        };
-        let timestamp_period = queue.get_timestamp_period();
+        let timestamp_period = gpu.queue.get_timestamp_period();
         if matches!(timestamp_support, TimestampSupport::Enabled { .. })
             && (!timestamp_period.is_finite() || timestamp_period <= 0.0)
         {
@@ -562,15 +547,7 @@ impl Rex3Gpu {
         }
 
         let async_error = Arc::new(Mutex::new(None));
-        let uncaptured = Arc::clone(&async_error);
-        device.on_uncaptured_error(Arc::new(move |error| {
-            remember_first_error(&uncaptured, format!("uncaptured wgpu error: {error}"));
-        }));
-        let lost = Arc::clone(&async_error);
-        device.set_device_lost_callback(move |reason, message| {
-            remember_first_error(&lost, format!("wgpu device lost ({reason:?}): {message}"));
-        });
-
+        let device = &gpu.device;
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("IRIS REX3 flat-fill shader"),
@@ -643,6 +620,7 @@ impl Rex3Gpu {
         if let Some(error) = async_error.lock().clone() {
             return Err(error);
         }
+        gpu.check()?;
 
         Ok(Self {
             backend: Some(GpuBackend {
@@ -652,9 +630,7 @@ impl Rex3Gpu {
                 parameters,
                 bins,
                 bind_group,
-                queue,
-                device,
-                instance,
+                gpu,
             }),
             pending: Vec::new(),
             bins: TileBins::new(),
@@ -709,12 +685,22 @@ impl Rex3Gpu {
         &self.diagnostics
     }
 
+    pub(crate) fn gpu(&self) -> Option<Arc<Gpu>> {
+        self.backend
+            .as_ref()
+            .map(|backend| Arc::clone(&backend.gpu))
+    }
+
     pub fn report(&self) -> ReplayReport {
         let mut report = self.report.clone();
         report.pending_draws = self.pending.len();
         report.timestamp_support = self.diagnostics.timestamps.clone();
         if report.error.is_none() {
-            report.error = self.async_error.lock().clone();
+            report.error = self.async_error.lock().clone().or_else(|| {
+                self.backend
+                    .as_ref()
+                    .and_then(|backend| backend.gpu.check().err())
+            });
         }
         report
     }
@@ -782,7 +768,7 @@ impl Rex3Gpu {
         self.check_async_error()?;
         // Instance polling reports HAL failures through the device-lost
         // callback rather than the fatal path of a blocking device poll.
-        self.backend().instance.poll_all(false);
+        self.backend().gpu.instance.poll_all(false);
         self.check_async_error()
     }
 
@@ -839,7 +825,7 @@ impl Rex3Gpu {
             telemetry.match_attempts += 1;
             (telemetry.match_attempts % DRAW_TIMING_SAMPLE_INTERVAL == 0).then(Instant::now)
         });
-        let fill = flat_fill(context);
+        let fill = prepare_flat_fill(context);
         let enqueue_start = sample_start.map(|start| {
             let now = Instant::now();
             if let Some(telemetry) = &mut self.report.telemetry {
@@ -864,14 +850,15 @@ impl Rex3Gpu {
         &mut self,
         context: &mut Rex3Context,
         rgb: &[u32],
-        fill: FlatFillMatch,
+        fill: Result<PreparedFlatFill, &'static str>,
     ) -> Result<EnqueueResult, String> {
-        let fill = match fill {
-            FlatFillMatch::Supported(fill) => fill,
-            FlatFillMatch::Unsupported(reason) => {
+        let command = match fill {
+            Ok(command) => command,
+            Err(reason) => {
                 return Ok(EnqueueResult::Unsupported(reason));
             }
         };
+        let fill = command.fill().map(FlatFill::from);
 
         let replay_pixels = fill.map_or(0, FlatFill::replay_pixels);
         if replay_pixels > MAX_JOURNAL_REPLAY_PIXELS {
@@ -898,7 +885,7 @@ impl Rex3Gpu {
                 let upload_start = self.report.telemetry.as_ref().map(|_| Instant::now());
                 tile_major_from_linear(rgb, &mut self.upload_staging);
                 let backend = self.backend();
-                backend.queue.write_buffer(
+                backend.gpu.write(
                     &backend.rgb,
                     0,
                     bytemuck::cast_slice(&self.upload_staging),
@@ -918,7 +905,7 @@ impl Rex3Gpu {
             self.journal.push(fill);
             self.journal_pixels += replay_pixels;
         }
-        advance_flat_fill_context(context);
+        command.finish(context);
         self.report.handled_draws += 1;
         Ok(EnqueueResult::Enqueued)
     }
@@ -1064,12 +1051,12 @@ impl Rex3Gpu {
             // past this batch in the parameter buffer are never seen.
             let backend = self.backend.as_ref().expect("active GPU backend");
             backend
-                .queue
-                .write_buffer(&backend.parameters, 0, bytemuck::cast_slice(&self.pending));
+                .gpu
+                .write(&backend.parameters, 0, bytemuck::cast_slice(&self.pending));
             let words = self.bins.encode();
             backend
-                .queue
-                .write_buffer(&backend.bins, 0, bytemuck::cast_slice(words));
+                .gpu
+                .write(&backend.bins, 0, bytemuck::cast_slice(words));
         }
         let timestamps = self.timestamp_resources(dispatch, copy_to_readback);
 
@@ -1079,6 +1066,7 @@ impl Rex3Gpu {
         let encode_start = self.report.telemetry.as_ref().map(|_| Instant::now());
         let backend = self.backend.as_ref().expect("active GPU backend");
         let mut encoder = backend
+            .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("IRIS REX3 GPU batch"),
@@ -1137,12 +1125,11 @@ impl Rex3Gpu {
             );
             encoder.copy_buffer_to_buffer(&timestamps.resolve, 0, &timestamps.readback, 0, size);
         }
-        let commands = encoder.finish();
         if let (Some(start), Some(telemetry)) = (encode_start, &mut self.report.telemetry) {
             telemetry.command_encoding_ns += elapsed_ns(start);
         }
         let submit_start = self.report.telemetry.as_ref().map(|_| Instant::now());
-        let submission = backend.queue.submit([commands]);
+        let submission = backend.gpu.submit(encoder);
         if let Some(timestamps) = timestamps {
             self.timestamp_pending.push(PendingTimestamps {
                 readback: timestamps.readback,
@@ -1205,6 +1192,7 @@ impl Rex3Gpu {
         let size = u64::from(count) * u64::from(wgpu::QUERY_SIZE);
         let queries = self
             .backend()
+            .gpu
             .device
             .create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("IRIS REX3 GPU timestamps"),
@@ -1213,6 +1201,7 @@ impl Rex3Gpu {
             });
         let resolve = self
             .backend()
+            .gpu
             .device
             .create_buffer(&wgpu::BufferDescriptor {
                 label: Some("IRIS REX3 timestamp resolve"),
@@ -1222,6 +1211,7 @@ impl Rex3Gpu {
             });
         let readback = self
             .backend()
+            .gpu
             .device
             .create_buffer(&wgpu::BufferDescriptor {
                 label: Some("IRIS REX3 timestamp readback"),
@@ -1358,10 +1348,10 @@ impl Rex3Gpu {
                 .clone()
                 .unwrap_or_else(|| "REX3 GPU disabled".into()));
         }
-        match self.async_error.lock().clone() {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if let Some(error) = self.async_error.lock().clone() {
+            return Err(error);
         }
+        self.backend().gpu.check()
     }
 
     fn fail<T>(&mut self, error: String) -> Result<T, String> {
@@ -1376,7 +1366,11 @@ impl Drop for Rex3Gpu {
         // Destroy a healthy, idle engine normally. Anything else may be
         // waiting on a lost device, which can block or panic inside wgpu.
         let idle = self.pending.is_empty() && !self.submitted_work && self.journal.is_empty();
-        if !idle || self.async_error.lock().is_some() {
+        let device_failed = self
+            .backend
+            .as_ref()
+            .is_some_and(|backend| backend.gpu.check().is_err());
+        if !idle || self.async_error.lock().is_some() || device_failed {
             self.leak_backend();
         }
     }
@@ -1477,129 +1471,6 @@ fn probe_inner(backend: &str) -> Result<ProbeResult, String> {
     })
 }
 
-fn flat_fill(context: &Rex3Context) -> FlatFillMatch {
-    let dm0 = context.drawmode0;
-    let dm1 = context.drawmode1;
-    let adrmode = dm0.adrmode();
-    let full_primitive = match adrmode {
-        DRAWMODE0_ADRMODE_SPAN => dm0.stoponx(),
-        DRAWMODE0_ADRMODE_BLOCK => dm0.stoponx() && dm0.stopony(),
-        _ => false,
-    };
-    if dm0.opcode() != DRAWMODE0_OPCODE_DRAW {
-        return FlatFillMatch::Unsupported("opcode");
-    }
-    if !full_primitive {
-        return FlatFillMatch::Unsupported("primitive shape");
-    }
-    if context.mid_primitive {
-        return FlatFillMatch::Unsupported("continuation state");
-    }
-    if adrmode == DRAWMODE0_ADRMODE_BLOCK && context.xsave != context.xstart {
-        return FlatFillMatch::Unsupported("block start state");
-    }
-    // A batch token raises `host_len` for the GO that follows it. The CPU
-    // path then resumes the primitive until the batch cursor stops moving,
-    // even for a draw that reads no host data, so it is not a single fill.
-    if context.host_len > 1 {
-        return FlatFillMatch::Unsupported("host transfer");
-    }
-    if dm0.colorhost()
-        || dm0.alphahost()
-        || dm0.skipfirst()
-        || dm0.skiplast()
-        || dm0.enzpattern()
-        || dm0.enlspattern()
-        || dm0.length32()
-        || dm0.zpopaque()
-        || dm0.lsopaque()
-        || dm0.shade()
-        || dm0.lronly()
-        || dm0.xyoffset()
-        || dm0.ciclamp()
-        || dm0.endptfilter()
-        || dm0.ystride()
-    {
-        return FlatFillMatch::Unsupported("draw mode 0");
-    }
-    if dm1.planes() != DRAWMODE1_PLANES_RGB
-        || dm1.drawdepth() != DRAWMODE1_DRAWDEPTH_24
-        || !dm1.rgbmode()
-    {
-        return FlatFillMatch::Unsupported("pixel format");
-    }
-    if dm1.dblsrc()
-        || dm1.yflip()
-        || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
-        || dm1.dither()
-        || dm1.fastclear()
-        || dm1.blend()
-        || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
-    {
-        return FlatFillMatch::Unsupported("pixel operation");
-    }
-    if context.clipmode & CLIPMODE_ENSMASK_MASK != 0
-        || context.clipmode & CLIPMODE_CIDMATCH_MASK != 0xF << CLIPMODE_CIDMATCH_SHIFT
-    {
-        return FlatFillMatch::Unsupported("clip mode");
-    }
-    if (context.xstart | context.xend | context.ystart | context.yend) & 0x7FF != 0 {
-        return FlatFillMatch::Unsupported("fractional coordinates");
-    }
-    if context.xend < context.xstart
-        || (adrmode == DRAWMODE0_ADRMODE_BLOCK && context.yend < context.ystart)
-        || context.bresoctinc1.octant() & (OCTANT_XDEC | OCTANT_YDEC) != 0
-    {
-        return FlatFillMatch::Unsupported("negative direction");
-    }
-
-    let x_window = (context.xywin >> 16) as i16 as i32;
-    let y_window = context.xywin as i16 as i32;
-    let x0 = (context.xstart >> 11) + x_window - REX3_COORD_BIAS;
-    let x1 = (context.xend >> 11) + x_window - REX3_COORD_BIAS;
-    let y0 = (context.ystart >> 11) + y_window - REX3_COORD_BIAS;
-    let y1 = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
-        (context.yend >> 11) + y_window - REX3_COORD_BIAS
-    } else {
-        y0
-    };
-
-    let min_x = x0.max(0);
-    let max_x = x1.min(REX3_SCREEN_WIDTH - 1);
-    let min_y = y0.max(0);
-    let max_y = y1.min(REX3_SCREEN_HEIGHT - 1);
-    if min_x > max_x || min_y > max_y || context.wrmask == 0 {
-        return FlatFillMatch::Supported(None);
-    }
-
-    FlatFillMatch::Supported(Some(FlatFill {
-        min_x: min_x as u32,
-        min_y: min_y as u32,
-        width: (max_x - min_x + 1) as u32,
-        height: (max_y - min_y + 1) as u32,
-        color: (context.get_colori() & 0x00FF_FFFF)
-            | (Rex3Context::clamp_color_component(context.coloralpha) << 24),
-        write_mask: context.wrmask,
-        stride: FB_STRIDE,
-        plane_len: FB_PIXELS as u32,
-    }))
-}
-
-fn advance_flat_fill_context(context: &mut Rex3Context) {
-    if context.drawmode0.adrmode() == DRAWMODE0_ADRMODE_BLOCK {
-        context.xstart = context.xsave;
-        context.ystart = context.yend + (1 << 11);
-    } else {
-        context.xstart = context.xend + (1 << 11);
-    }
-    context.pat_bit = 31;
-    context.zpat_bit = 31;
-    context.mid_primitive = false;
-    // Every CPU GO retires the data port to its resting single-word state.
-    context.host_len = 1;
-    context.host_cursor = 0;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1643,20 +1514,15 @@ mod tests {
     }
 
     fn supported_fill(context: &Rex3Context) -> FlatFill {
-        match flat_fill(context) {
-            FlatFillMatch::Supported(Some(fill)) => fill,
-            FlatFillMatch::Supported(None) => panic!("expected a non-empty fill"),
-            FlatFillMatch::Unsupported(reason) => {
-                panic!("expected a supported fill, got {reason}")
-            }
-        }
+        prepare_flat_fill(context)
+            .unwrap_or_else(|reason| panic!("expected a supported fill, got {reason}"))
+            .fill()
+            .map(FlatFill::from)
+            .expect("expected a non-empty fill")
     }
 
     fn unsupported_reason(context: &Rex3Context) -> &'static str {
-        match flat_fill(context) {
-            FlatFillMatch::Unsupported(reason) => reason,
-            FlatFillMatch::Supported(_) => panic!("expected an unsupported fill"),
-        }
+        prepare_flat_fill(context).expect_err("expected an unsupported fill")
     }
 
     #[test]
@@ -1671,7 +1537,7 @@ mod tests {
             Ok(RequestedBackend::Metal)
         );
         assert_eq!(RequestedBackend::parse("dx12"), Ok(RequestedBackend::Dx12));
-        assert!(RequestedBackend::parse("gl").is_err());
+        assert_eq!(RequestedBackend::parse("gl"), Ok(RequestedBackend::Gl));
         assert!(RequestedBackend::parse("Vulkan").is_err());
     }
 
@@ -2116,7 +1982,9 @@ mod tests {
         let mut matched = 0u64;
         for draw in 0..DRAWS {
             place(&mut context, draw);
-            if let FlatFillMatch::Supported(Some(fill)) = flat_fill(std::hint::black_box(&context))
+            if let Some(fill) = prepare_flat_fill(std::hint::black_box(&context))
+                .ok()
+                .and_then(|command| command.fill())
             {
                 matched += u64::from(std::hint::black_box(fill).width);
             }
@@ -2211,10 +2079,10 @@ mod tests {
                 0 => 0,
                 selector => TEST_MASKS[(selector - 1) as usize % TEST_MASKS.len()],
             };
-            let fill = match flat_fill(ctx) {
-                FlatFillMatch::Supported(fill) => fill,
-                FlatFillMatch::Unsupported(reason) => panic!("draw {draw} unsupported: {reason}"),
-            };
+            let fill = prepare_flat_fill(ctx)
+                .unwrap_or_else(|reason| panic!("draw {draw} unsupported: {reason}"))
+                .fill()
+                .map(FlatFill::from);
             loop {
                 match gpu.try_enqueue(ctx, &rgb).expect("enqueue tiled fill") {
                     EnqueueResult::Enqueued => break,
@@ -2275,10 +2143,10 @@ mod tests {
             ctx.colorgrn = rng.below(256) << 11;
             ctx.colorblue = rng.below(256) << 11;
             ctx.wrmask = TEST_MASKS[rng.below(TEST_MASKS.len() as u32) as usize];
-            let fill = match flat_fill(&ctx) {
-                FlatFillMatch::Supported(fill) => fill,
-                FlatFillMatch::Unsupported(reason) => panic!("draw {draw} unsupported: {reason}"),
-            };
+            let fill = prepare_flat_fill(&ctx)
+                .unwrap_or_else(|reason| panic!("draw {draw} unsupported: {reason}"))
+                .fill()
+                .map(FlatFill::from);
             loop {
                 match gpu
                     .try_enqueue(&mut ctx, &rgb)
@@ -2371,17 +2239,14 @@ mod tests {
         masked.wrmask = 0xFF00_0000;
         assert_eq!(supported_fill(&masked).write_mask, 0xFF00_0000);
         masked.wrmask = 0;
-        assert!(matches!(flat_fill(&masked), FlatFillMatch::Supported(None)));
+        assert!(prepare_flat_fill(&masked).unwrap().fill().is_none());
 
         let offscreen = context(
             DRAWMODE0_ADRMODE_BLOCK_SH,
             (REX3_SCREEN_WIDTH + 1, 10),
             (REX3_SCREEN_WIDTH + 20, 20),
         );
-        assert!(matches!(
-            flat_fill(&offscreen),
-            FlatFillMatch::Supported(None)
-        ));
+        assert!(prepare_flat_fill(&offscreen).unwrap().fill().is_none());
     }
 
     #[test]
@@ -2439,10 +2304,11 @@ mod tests {
         let mut block = context(DRAWMODE0_ADRMODE_BLOCK_SH, (10, 20), (30, 40));
         block.pat_bit = 7;
         block.zpat_bit = 9;
-        block.mid_primitive = true;
         block.host_len = 0;
         block.host_cursor = 1;
-        advance_flat_fill_context(&mut block);
+        let command = prepare_flat_fill(&block).unwrap();
+        block.mid_primitive = true;
+        command.finish(&mut block);
         assert_eq!((block.host_len, block.host_cursor), (1, 0));
         assert_eq!(block.xstart, (10 + REX3_COORD_BIAS) << 11);
         assert_eq!(block.ystart, (41 + REX3_COORD_BIAS) << 11);
@@ -2450,8 +2316,54 @@ mod tests {
         assert!(!block.mid_primitive);
 
         let mut span = context(DRAWMODE0_ADRMODE_SPAN_SH, (10, 20), (30, 40));
-        advance_flat_fill_context(&mut span);
+        prepare_flat_fill(&span).unwrap().finish(&mut span);
         assert_eq!(span.xstart, (31 + REX3_COORD_BIAS) << 11);
         assert_eq!(span.ystart, (20 + REX3_COORD_BIAS) << 11);
+    }
+
+    #[test]
+    #[ignore = "requires a conformant host GPU"]
+    fn gpu_full_batch_retry_preserves_context_until_acceptance() {
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        let mut gpu = Rex3Gpu::new_with_options(&backend, ProfilingOptions::default())
+            .expect("initialize GPU for retry validation");
+        gpu.set_test_limits(1, 16);
+        let mut rgb = seeded_plane();
+        let mut expected = rgb.clone();
+        let mut first = context(DRAWMODE0_ADRMODE_BLOCK_SH, (10, 20), (12, 21));
+        let mut second = context(DRAWMODE0_ADRMODE_BLOCK_SH, (11, 21), (14, 23));
+        second.coloralpha = 0x7A << 11;
+        second.wrmask = 0xAA00_00FF;
+        second.pat_bit = 7;
+        second.zpat_bit = 9;
+        second.host_len = 0;
+        second.host_cursor = 1;
+        let first_fill = supported_fill(&first);
+        let second_fill = supported_fill(&second);
+        first_fill.replay(&mut expected);
+        second_fill.replay(&mut expected);
+
+        assert_eq!(gpu.try_enqueue(&mut first, &rgb).unwrap(), EnqueueResult::Enqueued);
+        let before = (
+            second.xstart, second.ystart, second.pat_bit, second.zpat_bit,
+            second.mid_primitive, second.host_len, second.host_cursor,
+        );
+        assert_eq!(gpu.try_enqueue(&mut second, &rgb).unwrap(), EnqueueResult::FlushRequired);
+        assert_eq!(
+            (second.xstart, second.ystart, second.pat_bit, second.zpat_bit,
+             second.mid_primitive, second.host_len, second.host_cursor),
+            before
+        );
+        assert_eq!(gpu.report().handled_draws, 1);
+        gpu.submit(FlushReason::BatchFull).expect("submit full batch");
+        assert_eq!(gpu.try_enqueue(&mut second, &rgb).unwrap(), EnqueueResult::Enqueued);
+        assert_eq!(second.xstart, (11 + REX3_COORD_BIAS) << 11);
+        assert_eq!(second.ystart, (24 + REX3_COORD_BIAS) << 11);
+        assert_eq!((second.pat_bit, second.zpat_bit, second.host_len, second.host_cursor), (31, 31, 1, 0));
+        assert_eq!(gpu.report().handled_draws, 2);
+        gpu.flush(&mut rgb, FlushReason::Explicit).expect("read back accepted fills");
+        if let Some(difference) = first_difference(&rgb, &expected) {
+            panic!("retried fill: {difference}");
+        }
     }
 }

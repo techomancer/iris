@@ -181,8 +181,9 @@ rex-dirty-upload = []
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # Host-GPU prototype for REX3 replay and opt-in live experiments. This is
 # deliberately separate from `gpujit`: it builds on the opt-in damage tracker
-# and adds a wgpu/WGSL engine. The live CPU renderer remains the default.
-rex-gpu = ["gputrace", "rex-dirty-upload", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
+# and the common wgpu device/presentation layer. The live CPU renderer remains
+# the default.
+rex-gpu = ["gputrace", "rex-dirty-upload", "wgpu"]
 # Host-GPU rasterisation on wgpu: board memory on the GPU, primitives binned
 # into 8x8 tiles and rasterised by compute kernels (src/wgpu, and
 # src/dev/<board>/wgpu for each board). See clanker/plans/wgpu-raster.md.

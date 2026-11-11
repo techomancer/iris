@@ -1829,7 +1829,7 @@ mod rex3_e2e_tests {
                     let i = y as usize * w as usize + x as usize;
                     let want = counter_byte(i) as u32;
                     let got = unsafe {
-                        (*rex.fb_rgb.get())[y as usize * 2048 + x as usize] & 0xFF
+                        (&*rex.fb_rgb.get())[y as usize * 2048 + x as usize] & 0xFF
                     };
                     assert_eq!(got, want,
                         "{w}x{h} at ({x},{y}) pixel {i}: got {got:#04x} want {want:#04x} \
