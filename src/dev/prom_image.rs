@@ -248,4 +248,56 @@ mod tests {
         let wrong = installer(&[9, 8, 7, 6], 5);
         assert_eq!(decode(&wrong, wrong.len()).unwrap(), wrong, "a mismatched length is raw");
     }
+
+    /// Every file under `dir`, for the real-image test below.
+    fn files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.is_dir() {
+                files_under(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+        out.sort();
+    }
+
+    /// Real PROM files load to the flash contents each machine runs from:
+    /// the Origin, Fuel and Tezro `.img` containers to the `.payload.bin`
+    /// beside them, the O2's `ip32prom.image` to the bytes behind its
+    /// header, and the Octane's raw `IP30prom.bin` to itself. The images
+    /// are not in git; `IRIS_PROM_DIR` (default `ignore/proms`) is searched
+    /// for them, whatever the layout, and the test skips without any.
+    #[test]
+    fn real_prom_files_load_to_their_payload() {
+        let dir = std::env::var("IRIS_PROM_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| "ignore/proms".into());
+        let mut files = Vec::new();
+        files_under(&dir, &mut files);
+        let mut checked = 0;
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy();
+            let raw = || std::fs::read(path).unwrap();
+            if let Some(stem) = name.strip_suffix(".img").filter(|s| s.ends_with("prom")) {
+                // The Origin 200/2000 PROM is a 1 MiB part, the Fuel's and Tezro's 8 MiB.
+                let limit = if stem.starts_with("ip27") { 1 << 20 } else { 8 << 20 };
+                let Ok(payload) = std::fs::read(path.with_file_name(format!("{stem}.payload.bin"))) else { continue };
+                assert_eq!(load(path, limit).unwrap(), payload, "{}", path.display());
+            } else if name == "ip32prom.image" {
+                let file = raw();
+                let payload = load(path, 1 << 19).unwrap();
+                assert_eq!(payload, &file[0x100..], "{}: the header is stripped", path.display());
+                assert!(payload.len() < 1 << 19, "{}: shorter than the part", path.display());
+            } else if name == "IP30prom.bin" {
+                assert_eq!(load(path, 1 << 20).unwrap(), raw(), "{}", path.display());
+            } else {
+                continue;
+            }
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("SKIPPED: no PROM images under {}", dir.display());
+        } else {
+            eprintln!("checked {checked} PROM images under {}", dir.display());
+        }
+    }
 }
