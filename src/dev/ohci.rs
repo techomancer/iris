@@ -196,7 +196,7 @@ impl Ohci {
                 registers: &[],
             },
         );
-        config.write(11, 0xffff_ffff);
+        config.set_subsystem_identity(0xffff_ffff);
         Arc::new(Self {
             pci: PciFunctionState::new(config),
             state: Mutex::new(State::new()),
