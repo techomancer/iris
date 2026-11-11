@@ -59,7 +59,7 @@ use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
 use crate::ip35::node::{connect_cpus, connect_placed_cpus, Node, NodeConfig, Placement};
-use crate::ip53_machine::{connect_serial_ports, SerialPort};
+use crate::ip35::serial::{connect_serial_ports, SerialPort};
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
 use crate::net::{GatewayConfig, Link, NatControl};

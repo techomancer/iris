@@ -37,7 +37,7 @@ use crate::dev::l1::{L1, L1Config};
 use crate::dev::ohci::Ohci;
 use crate::dev::prom_image;
 use crate::dev::ps2::Ps2Controller;
-use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend, CiSerialBackend, LogMode, SerialBackend, TeeBackend};
+use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::XBridge;
 use crate::pci::{BoardIrq, DevFn};
@@ -50,6 +50,7 @@ use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::ip35::inbound::{Inbound, BEDROCK_PORT};
 use crate::ip35::node::{connect_cpus, Node, NodeConfig};
+use crate::ip35::serial::{connect_serial_ports, SerialPort};
 use crate::ip35::{Ip35Bus, CPU_PHYS_MASK};
 use crate::machine_state::GuestState;
 use crate::monitor::{Monitor, DEFAULT_PORT as DEFAULT_MONITOR_PORT};
@@ -223,65 +224,25 @@ impl FuelMachine {
         Ok(attached.scratch)
     }
 
-    fn connect_serial(
-        cfg: &MachineConfig,
-        board: &FuelBoard,
-        console: usize,
-    ) -> Result<(), String> {
+    pub(crate) fn connect_serial(cfg: &MachineConfig, board: &FuelBoard, console: usize) -> Result<(), String> {
         let [a, b] = cfg.serial_ports();
-        let ports = [cfg.fuel.l1_port.unwrap_or(8882), a, b];
-        if ports[0] == ports[1] || ports[0] == ports[2] || ports[1] == ports[2] {
-            return Err("Fuel L1 and IOC3 serial ports must be distinct".into());
-        }
-        let labels = ["L1", "IOC3 A", "IOC3 B"];
-        let settings = ["fuel.l1_port", "serial_port_a", "serial_port_b"];
-        let mut log_config = cfg.clone();
-        for (index, port) in ports.into_iter().enumerate() {
-            log_config.serial_log = if index == console {
-                cfg.serial_log.clone()
-            } else if index == 0 {
-                cfg.fuel.l1_log.clone()
-            } else {
-                None
-            };
-            let tag = format!("Fuel {}", labels[index]);
-            let log = open_log(&log_config, &tag, LogMode::Fresh);
-            let backend: Arc<dyn SerialBackend> = if cfg.ci && index == console {
-                if let Some(log) = log {
-                    board.serial[index].set_log(log);
-                }
-                board.serial[index].clone()
-            } else {
-                let mut backend = null_serial_backend();
-                match tcp_serial_backend(port) {
-                    Some((socket, actual_port)) => {
-                        eprintln!("iris: {tag} on 127.0.0.1:{actual_port}");
-                        backend = socket;
-                    }
-                    None => eprintln!(
-                        "iris: {tag}: port {port} unavailable; is another iris using it? ({})",
-                        settings[index]
-                    ),
-                }
-                match log {
-                    Some(log) => Arc::new(TeeBackend::new(backend, log)),
-                    None => backend,
-                }
-            };
-            if index == 0 {
-                board.l1.set_serial_backend(backend);
-            } else {
-                board.ioc3.set_serial_backend(index - 1, backend);
-            }
-        }
-        Ok(())
+        let ioc3 = |port: usize| -> Box<dyn Fn(Arc<dyn SerialBackend>) + '_> {
+            Box::new(move |backend| board.ioc3.set_serial_backend(port, backend))
+        };
+        let ports = [
+            SerialPort {
+                label: "L1",
+                port: cfg.fuel.l1_port.unwrap_or(8882),
+                setting: "fuel.l1_port",
+                ci: &board.serial[0],
+                log: cfg.fuel.l1_log.clone(),
+                connect: Box::new(|backend| board.l1.set_serial_backend(backend)),
+            },
+            SerialPort { label: "IOC3 A", port: a, setting: "serial_port_a", ci: &board.serial[1], log: None, connect: ioc3(0) },
+            SerialPort { label: "IOC3 B", port: b, setting: "serial_port_b", ci: &board.serial[2], log: None, connect: ioc3(1) },
+        ];
+        connect_serial_ports(cfg, "Fuel", &ports, console)
     }
-
-    #[cfg(test)]
-    pub(crate) fn connect_serial_for_test(cfg: &MachineConfig, board: &FuelBoard, console: usize) -> Result<(), String> {
-        Self::connect_serial(cfg, board, console)
-    }
-
 }
 
 impl Workstation for FuelMachine {
