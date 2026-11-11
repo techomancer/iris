@@ -363,7 +363,14 @@ The rules, in order of importance:
    your state lock. The exception is a device that drives its line through
    `crate::irq::IrqMutex`: it drives it under its lock, which is safe only
    while no parent calls back into the device while holding a lock the
-   delivery takes (see Interrupts above).
+   delivery takes (see Interrupts above). The InfiniteReality pipe is the
+   other: its `kona-hip` thread holds the pipe's mutex for a batch of stores
+   across DMA into host memory and interrupt packets, because the stores in a
+   batch must see each other's effects. This is safe because nothing the
+   machine's memory or interrupt path calls takes the pipe's lock, and a
+   processor only `try_lock`s it (answering busy), so the CPU thread never waits
+   on it. Lifecycle calls (stop, quiesce, snapshot) do block on it; they run with
+   the processors stopped, from a thread holding no machine lock.
 3. **Keep the CPU thread moving.** Anything the CPU thread waits for (a lock
    another thread holds for long, a full FIFO, a host call) stalls the guest
    and with it the guest's sense of time. Long work belongs on the device's

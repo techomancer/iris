@@ -58,6 +58,14 @@
 //! writes that change the pipe's state, go into the ring and are applied by the
 //! thread in order. The mutex is registered with the lock monitor.
 //!
+//! Holding it across the machine's calls departs from the rule to drop a lock
+//! before calling out (HACKING.md, Locks). It cannot cycle: the memory and
+//! interrupt paths the pipe calls never reach back into it. The calls that do
+//! block on it (`stop`, `quiesce`, `resume`, `reset` and the snapshot calls)
+//! come from the machine's control path with the processors stopped, hold no
+//! machine lock while they wait, and wait only for a batch of at most 32
+//! stores. The monitor commands wait at most `MONITOR_WAIT`.
+//!
 //! Ported from hw/misc/sgi-kona.c, sgi-kona-ports.c, sgi-kona-dma.c and
 //! sgi-command-port.c in jamesbraid/qemu-sgi-origami.
 
