@@ -23,11 +23,19 @@
 //! compiler.
 
 use std::collections::VecDeque;
+#[cfg(loom)]
+use loom::sync::{Condvar, Mutex};
+#[cfg(not(loom))]
 use std::sync::{Condvar, Mutex};
 
 /// Depth of the cold (warm-up/prefetch) lane. A full cold lane drops the
 /// request; this is the old single-channel capacity.
+#[cfg(not(loom))]
 pub const COLD_QUEUE_CAPACITY: usize = 256;
+/// One slot keeps the loom model's state space small while still filling the
+/// lane on the second send.
+#[cfg(loom)]
+pub const COLD_QUEUE_CAPACITY: usize = 1;
 
 /// A compile request: the normalised `(DrawMode0, DrawMode1, clipmode)` triple
 /// that keys both the dispatch map and the compiler.
@@ -155,7 +163,7 @@ impl Default for CompileQueue {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -251,5 +259,71 @@ mod tests {
         producer.join().ok();
         worker.join().ok();
         assert!(finished, "worker never saw the whole profile: producer and worker both slept");
+    }
+}
+
+/// Model-checked under `RUSTFLAGS="--cfg loom" cargo test --lib rex3_jit_queue`.
+/// Loom ignores timeouts and reports a lost wakeup as every thread blocked.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    fn req(i: u32) -> CompileRequest {
+        CompileRequest { dm0: 0, dm1: i, cm: 0 }
+    }
+
+    /// The warm-up producer fills the one-slot cold lane and blocks for the
+    /// second request; the worker must drain both, in order, with no sleeper
+    /// left waiting on a wakeup that was never sent.
+    #[test]
+    fn warm_up_producer_and_worker_both_finish() {
+        loom::model(|| {
+            let q = Arc::new(CompileQueue::new());
+            let producer = {
+                let q = Arc::clone(&q);
+                thread::spawn(move || {
+                    q.send_cold_blocking(req(1)).unwrap();
+                    q.send_cold_blocking(req(2)).unwrap();
+                })
+            };
+            assert_eq!(q.recv(), Some(req(1)));
+            assert_eq!(q.recv(), Some(req(2)));
+            producer.join().unwrap();
+        });
+    }
+
+    /// A close can land while the producer waits for room. The producer must
+    /// wake and either queue or be refused, and the worker must see exactly
+    /// what was accepted, then `None`.
+    #[test]
+    fn close_releases_a_blocked_producer() {
+        loom::model(|| {
+            let q = Arc::new(CompileQueue::new());
+            let producer = {
+                let q = Arc::clone(&q);
+                thread::spawn(move || {
+                    let mut accepted = 0;
+                    for i in 1..=2 {
+                        if q.send_cold_blocking(req(i)).is_ok() {
+                            accepted += 1;
+                        }
+                    }
+                    accepted
+                })
+            };
+            let closer = {
+                let q = Arc::clone(&q);
+                thread::spawn(move || q.close())
+            };
+            let mut got = 0;
+            while q.recv().is_some() {
+                got += 1;
+            }
+            closer.join().unwrap();
+            // Every accepted request was delivered before the queue reported empty.
+            assert_eq!(got, producer.join().unwrap());
+        });
     }
 }
