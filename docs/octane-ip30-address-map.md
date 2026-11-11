@@ -134,7 +134,7 @@ space, the eight device windows and the flash; see §7.
 
 A GM10 (SI with texture: HQ4 in front of IMPACT) on snorlax. The register
 block is at the start of the widget's space (OpenBSD's `impact_xbow.c` maps
-2 MB at offset 0). Not modelled yet; see §11.
+2 MB at offset 0). iris fits its IMPACT or VPro board at widget 11 instead.
 
 ## 4. HEART's processor-side registers (0x0FF0_0000)
 
@@ -163,7 +163,7 @@ correctly only as 32-bit halves, one bank per word.
 | 0x10038 | IMSR |
 | 0x10040 | cause (error details) |
 | 0x20000 | count: 52 bits at 12.5 MHz (the 400 MHz XIO clock / 32, 80 ns) |
-| 0x30000 | compare: when count reaches it, ISR bit 50 |
+| 0x30000 | compare: on HEART, ISR bit 50 when count reaches it. iris stores it and never raises bit 50 (`heart.rs`) |
 | 0x40000 | trigger |
 | 0x50000 | processor ID of the CPU reading it |
 | 0x60000 | sync |
@@ -196,7 +196,7 @@ ISR and that processor's IMR:
 | 0 | 0 – 15 | hardware interrupt 0 (Cause bit 10, IRIX "IP3") | 0 generic, 1 and 2 graphics flow control, 3 – 15 widget interrupts |
 | 1 | 16 – 31 | hardware interrupt 1 (Cause bit 11) | widget interrupts: PROM 4.17 and IRIX put the IOC3's serial on 16 and its Ethernet on 17 |
 | 2 | 32 – 49 | hardware interrupt 2 (Cause bit 12) | 32 – 39 more widget interrupts, 41 power switch, 42 – 45 debugger per CPU, 46 – 49 IPI per CPU |
-| 3 | 50 | hardware interrupt 3 (Cause bit 13) | the HEART timer (count ≥ compare) |
+| 3 | 50 | hardware interrupt 3 (Cause bit 13) | the HEART timer (count ≥ compare); not raised by iris, which does not compare |
 | 4 | 51 – 63 | hardware interrupt 4 (Cause bit 14) | errors: 51 – 57 widgets 9 – 15, 58 the Xbow, 59 – 62 CPU 0 – 3 bus error, 63 HEART itself |
 
 Hardware interrupt 5 (Cause bit 15) is the R10000's own Count/Compare. The
@@ -460,7 +460,7 @@ noted with the PC for `ip30 unmapped`.
 | 0x1F70_0000 | device window 3: RAD, `dev/rad1.rs` |
 | 0x1FC0_0000 – 0x1FFF_FFFF | `dev/sflash.rs`: the boot flash with its command set; the CPU's cached view (`CachedFlashLines`) keeps the PROM's cached stores into it. `[octane] flash` keeps the part between runs |
 | 0x2000_0000 up | `dev/heart_mem.rs`: SDRAM as MEMCFG places it, each 32 MB unit a view of one run of a bank, its first 16 KB a bus error to uncached processor accesses; `remap_banks` redraws the table and the ppmem window when a descriptor is written |
-| widgets 9, 10, 12, 13, 14 | bus error |
+| widgets 9, 10, 12, 13, 14 | bus error, unless an `[[xio_board]]` fills the port |
 
 An Octane whose memory runs past 4 GB gets a 16 GB ppmem window in place of the
 usual 4 GB one, so all of it is reached directly and the JIT compiles code

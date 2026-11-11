@@ -689,7 +689,7 @@ cdrom = true
 # ── Networking ───────────────────────────────────────────────────────────────
 
 [network]
-mode = "nat"                # or "pcap" (--features pcap)
+mode = "nat"                # or "pcap" (--features pcap), "stream" or "off"
 # pcap_interface = "1"      # index, name, or '\Device\NPF_{...}' on Windows
 # nfs_pcap_ip = "192.168.1.250"   # PCAP only: LAN IP the NFS server answers on
 # mac = "08:00:69:12:34:56" # ec0 MAC, injected into blank NVRAM before boot
@@ -823,7 +823,7 @@ Display and audio
 
 Networking
   --nat-subnet <CIDR>         NAT subnet, e.g. 192.168.5.0/24
-  --net-mode <MODE>           nat (default) or pcap
+  --net-mode <MODE>           nat (default), pcap, stream or off
   --pcap-interface <IFACE>    Host interface to bridge onto (implies pcap)
   --list-net-interfaces       Print bridgeable interfaces and exit
   --nfs-dir <DIR>             Export DIR over the in-process NFS server

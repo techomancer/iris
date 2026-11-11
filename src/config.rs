@@ -74,8 +74,7 @@ pub struct ScsiDeviceConfig {
     /// bit. `true` (the default) reports it on: a plain write is complete once
     /// the host has it, SYNCHRONIZE CACHE and FUA store what came before them,
     /// and a background sync follows about 5 s after a write. A host crash or
-    /// power loss can lose that much, and a killed iris can lose it too when
-    /// the disk is a CHD. IRIX never sends SYNCHRONIZE CACHE or FUA, so it
+    /// power loss can lose that much. IRIX never sends SYNCHRONIZE CACHE or FUA, so it
     /// cannot force a write out. `false` reports it off and stores every write
     /// on the host's disk before the command completes, like the drives SGI
     /// shipped; it is slower. A guest can change the bit with MODE SELECT.
@@ -372,9 +371,8 @@ pub enum NetMode {
     /// The guest appears as a real L2 host on the physical LAN; NAT services
     /// (DHCP/DNS/NFS/port-forward) are NOT provided — use the real network's.
     Pcap,
-    /// No Ethernet: the adapter is not plugged into anything. O2 and Octane
-    /// only (`MachineConfig::validate`); the Indy and Indigo2 always have a
-    /// network.
+    /// No Ethernet: the adapter is not plugged into anything. Not on the
+    /// Indy and Indigo2, which always have a network (`MachineConfig::validate`).
     Off,
     /// A private segment carried over a stream socket in QEMU's `-netdev
     /// stream` framing, to a peer that serves it (`[network] stream`). iris
@@ -411,7 +409,7 @@ pub struct NetworkConfig {
     /// Directory served read-only by the gateway's built-in rsh server (TCP
     /// 514). None (the default) disables it.
     pub rsh_dir: Option<std::path::PathBuf>,
-    /// Hold frames for the guest while its receive ring is about to end (Indy).
+    /// Hold frames for the guest while its receive ring is about to end (SEEQ).
     pub rx_hold: bool,
     /// The peer for `NetMode::Stream`, as `tcp:IP:PORT` or `unix:PATH`.
     pub stream: Option<String>,
@@ -439,9 +437,9 @@ impl Default for NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSection {
-    /// Backend: "nat" (default) or "pcap".
+    /// Backend: "nat" (default), "pcap", "stream" (with `stream`) or "off",
+    /// which unplugs the Ethernet (not on the Indy and Indigo2).
     #[serde(default)]
-    /// `off` unplugs the Ethernet (O2 only for now).
     pub mode: NetMode,
     /// Host interface to bridge onto in PCAP mode (e.g. "eth0", "en0").
     /// Run `iris --list-net-interfaces` to enumerate candidates.
@@ -474,7 +472,7 @@ pub struct NetworkSection {
     /// executed on the host. Unset disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rsh_dir: Option<String>,
-    /// Indy: hold frames for the guest in the emulator while the next one
+    /// Indy and Indigo2: hold frames for the guest in the emulator while the next one
     /// would end its receive ring before the driver has reaped the filled
     /// descriptors, instead of letting the channel stop in the middle of the
     /// driver's interrupt pass. Default true.
@@ -3789,8 +3787,9 @@ pub struct Cli {
     #[arg(long = "nat-subnet", value_name = "CIDR")]
     pub nat_subnet: Option<String>,
 
-    /// Networking backend: "nat" (default, software gateway) or "pcap"
-    /// (bridge onto a real host interface; requires --features pcap).
+    /// Networking backend: "nat" (default, software gateway), "pcap"
+    /// (bridge onto a real host interface; requires --features pcap),
+    /// "stream" (a private segment; needs [network] stream) or "off".
     #[arg(long = "net-mode", value_name = "MODE")]
     pub net_mode: Option<NetMode>,
 

@@ -37,7 +37,8 @@ Programming Guide 007-3443-002, pp. 397-398, Table 15-3). That guide does not
 cover 64-bit accesses; iris sends one as two word cycles, the high word first,
 and the rule is unknown. The Bridge takes its order from the window's Device(x)
 register: the programmed swap bit gives `Stream`, and its 64-bit device bit
-gives the width. A `BarDevice` the physical bus maps over a host window holds
+gives the width. Its 32-bit PCI memory and I/O aliases take theirs from the
+Control register's memory and I/O swap bits instead, 4 bytes wide. A `BarDevice` the physical bus maps over a host window holds
 its `ByteOrder` by value, so a BAR access is one match and the function's own
 call.
 
@@ -151,7 +152,8 @@ its PCI Type 1 Configuration register names (table 26); a bus number no bridge's
 secondary to subordinate range holds, including 0, ends in a master time-out.
 IRIX 6.5.30 scans a bus behind a bridge this way. The header is the type 1
 header only (the caller names the PCI identity); the upper halves of the
-prefetchable and I/O windows read zero. No machine builds one yet.
+prefetchable and I/O windows read zero. The NVMe card's `bridge = true` puts
+one in front of the controller.
 
 ## Monitor
 

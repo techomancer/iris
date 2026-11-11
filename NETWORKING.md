@@ -3,8 +3,8 @@
 The built-in NAT gateway needs no optional build feature. For IRIX interface,
 DNS, NFS, and port-forward setup, see [HELP.md](HELP.md) and
 [IRIX networking guide](clanker/irix/networking.md). The full option inventory
-is in [FEATURES.md](FEATURES.md). This guide retains the PCAP and DaynaPort
-details previously in README.md.
+is in [FEATURES.md](FEATURES.md). This guide covers PCAP bridging, the stream
+segment and the DaynaPort.
 
 ## PCAP bridged networking (`--features pcap`)
 
@@ -106,9 +106,8 @@ answers nothing on the segment itself: no DHCP, DNS, TFTP, `[nfs]` or
 `[[port_forward]]`, and `nat_subnet` is unused. It needs no host privileges.
 The connection is retried once a second until the peer listens, so the server
 may start after iris, and made again if the peer goes away; frames the guest
-sends while disconnected are dropped. It works on every machine with an
-onboard Ethernet: the Indy and Indigo2 (SEEQ), the O2 (MEC) and the Octane
-(IOC3). A DaynaPort has its own subnet and cannot join the segment.
+sends while disconnected are dropped. It works on every machine's onboard
+Ethernet. A DaynaPort has its own subnet and cannot join the segment.
 
 ## DaynaPort SCSI/Link
 
