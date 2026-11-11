@@ -14,6 +14,7 @@ use crate::dev::ng1::rex3_shape;
 
 use super::host::HostStream;
 use super::shade::ShadeDda;
+use super::telemetry::Coverage;
 
 const SKIPPED_PIXEL: u32 = u32::MAX;
 const BACKGROUND_PIXEL: u32 = 1 << 31;
@@ -346,6 +347,7 @@ pub(super) struct PreparedHostLine {
     completion: HostLineCompletion,
     payload_qwords: usize,
     fast_clear: bool,
+    coverage: Option<Coverage>,
 }
 
 impl PreparedHostLine {
@@ -359,6 +361,10 @@ impl PreparedHostLine {
 
     pub(super) fn fast_clear(&self) -> bool {
         self.fast_clear
+    }
+
+    pub(super) fn coverage(&self) -> Option<Coverage> {
+        self.coverage
     }
 
     pub(super) fn finish(self, context: &mut Rex3Context) {
@@ -393,6 +399,7 @@ pub(super) fn prepare_host_line(
     let mut simulated = *context;
     let mut stream = HostStream::from_context(context);
     let mut line = None;
+    let mut coverage: Option<Coverage> = None;
     let mut previous_cursor = None;
     loop {
         let prepared = prepare_line_for(&simulated, LineOperation::Host)?;
@@ -410,13 +417,18 @@ pub(super) fn prepare_host_line(
                     if !background {
                         stream.consume(context);
                     }
-                    invocation_writes |= calculate_fb_address::<DynMode, true>(
+                    if let Some(address) = calculate_fb_address::<DynMode, true>(
                         &mode,
                         pixel.x,
                         pixel.y,
                         &simulated,
-                    )
-                    .is_some();
+                    ) {
+                        invocation_writes = true;
+                        match &mut coverage {
+                            Some(bounds) => bounds.include_address(address),
+                            None => coverage = Some(Coverage::from_address(address)),
+                        }
+                    }
                 }
             }
             let last = pixel.index + 1 == geometry.pixel_count;
@@ -468,6 +480,7 @@ pub(super) fn prepare_host_line(
         },
         payload_qwords: context.host_len as usize,
         fast_clear,
+        coverage,
     })
 }
 

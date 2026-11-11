@@ -1411,6 +1411,8 @@ pub struct Rex3 {
     resident_frame: frame::ResidentFrameControl,
     #[cfg(all(test, feature = "wgpu"))]
     resident_lifecycle: RwLock<lifecycle::ResidentLifecycle>,
+    #[cfg(all(test, feature = "wgpu"))]
+    resident_telemetry: Mutex<crate::dev::ng1::wgpu::telemetry::Board>,
     pub gfifo: GFifo,
 
     pub vc2: Mutex<Vc2>,
@@ -1626,6 +1628,8 @@ impl Rex3 {
             resident_frame: frame::ResidentFrameControl::default(),
             #[cfg(all(test, feature = "wgpu"))]
             resident_lifecycle: RwLock::new(lifecycle::ResidentLifecycle::default()),
+            #[cfg(all(test, feature = "wgpu"))]
+            resident_telemetry: Mutex::new(crate::dev::ng1::wgpu::telemetry::Board::default()),
             gfifo: GFifo::new(),
             vc2: Mutex::new(Vc2::new()),
             xmap0: Mutex::new(Xmap9::new()),
@@ -1833,6 +1837,15 @@ impl Rex3 {
         &mut self,
         gpu: Arc<crate::wgpu::Gpu>,
     ) -> Result<(), crate::dev::ng1::wgpu::resident::ResidentError> {
+        self.activate_resident_gpu_with_profiling(gpu, false)
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn activate_resident_gpu_with_profiling(
+        &mut self,
+        gpu: Arc<crate::wgpu::Gpu>,
+        profiling: bool,
+    ) -> Result<(), crate::dev::ng1::wgpu::resident::ResidentError> {
         use crate::dev::ng1::wgpu::resident::{ResidentError, ResidentGpu, ResidentRaster};
         self.raster.get_mut().kind().ensure_available(RasterModeKind::Resident)
             .map_err(ResidentError::Failed)?;
@@ -1840,7 +1853,10 @@ impl Rex3 {
         if self.head.renderer_slot().lock().is_some() {
             return Err(ResidentError::InvalidState("REX3 live resident scanout is not implemented"));
         }
-        let backend = ResidentGpu::activate(gpu, self.fb_rgb.get_mut(), self.fb_aux.get_mut())?;
+        let mut backend = ResidentGpu::activate(gpu, self.fb_rgb.get_mut(), self.fb_aux.get_mut())?;
+        if profiling {
+            backend.enable_profiling()?;
+        }
         self.processor_unparker.take();
         *self.raster.get_mut() = RasterMode::Resident(ResidentRaster::new(backend));
         self.resident_frame.activate();
@@ -1903,9 +1919,10 @@ impl Rex3 {
     #[cfg(all(test, feature = "wgpu"))]
     fn submit_resident(
         &self,
+        reason: crate::dev::ng1::wgpu::telemetry::FlushReason,
     ) -> Option<Result<(), crate::dev::ng1::wgpu::resident::ResidentError>> {
         let result = match &mut *self.raster.lock() {
-            RasterMode::Resident(raster) => Some(raster.submit()),
+            RasterMode::Resident(raster) => Some(raster.submit_for(reason)),
             _ => None,
         };
         if let Some(Err(error)) = &result {
@@ -1927,6 +1944,70 @@ impl Rex3 {
             self.fail_resident(error.clone());
         }
         result.unwrap_or(Err(ResidentError::InvalidState("resident raster is not active")))
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn resident_telemetry_snapshot(
+        &self,
+    ) -> Result<crate::dev::ng1::wgpu::telemetry::Snapshot, crate::dev::ng1::wgpu::resident::ResidentError> {
+        self.resident_snapshot_from_status(self.resident_status()?)
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn resident_telemetry_diagnostics(
+        &self,
+    ) -> Result<
+        (crate::dev::ng1::wgpu::telemetry::Snapshot, Option<crate::dev::ng1::wgpu::resident::ResidentError>),
+        crate::dev::ng1::wgpu::resident::ResidentError,
+    > {
+        use crate::dev::ng1::wgpu::resident::ResidentError;
+        let diagnostics = match &*self.raster.lock() {
+            RasterMode::Resident(raster) => raster.diagnostics(),
+            _ => Err(ResidentError::InvalidState("resident raster is not active")),
+        }?;
+        Ok((self.resident_snapshot_from_status(diagnostics.status)?, diagnostics.fault))
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn resident_snapshot_from_status(
+        &self,
+        status: crate::dev::ng1::wgpu::resident::ResidentStatus,
+    ) -> Result<crate::dev::ng1::wgpu::telemetry::Snapshot, crate::dev::ng1::wgpu::resident::ResidentError> {
+        use crate::dev::ng1::wgpu::resident::{ObservationReason, ResidentError};
+        use crate::dev::ng1::wgpu::telemetry::{Snapshot, Traffic};
+        let board = self.resident_telemetry.lock().clone();
+        if board.errors {
+            return Err(ResidentError::InvalidState("board telemetry overflow"));
+        }
+        let mut traffic = Traffic { raw_maps: status.raw_plane_map_attempts, ..Traffic::default() };
+        for (index, reason) in [
+            ObservationReason::HostRead, ObservationReason::Snapshot, ObservationReason::Monitor,
+            ObservationReason::Recording, ObservationReason::Validation, ObservationReason::Compatibility,
+        ].into_iter().enumerate() {
+            let counts = status.observations.for_reason(reason);
+            traffic.raw_attempts[index] = counts.attempts;
+            traffic.raw_bytes[index] = counts.successful_bytes;
+        }
+        for (index, mode) in [
+            frame::ResidentDisplayMode::DirectWgpu, frame::ResidentDisplayMode::ReadbackCompatibility,
+        ].into_iter().enumerate() {
+            let counts = self.resident_composed_captures(mode);
+            traffic.composed_attempts[index] = counts.attempts;
+            traffic.composed_bytes[index] = counts.successful_bytes;
+        }
+        Ok(Snapshot { epoch: status.accepted.epoch.value(), workload: status.workload, board, traffic })
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn flush_resident_if_due(&self) {
+        if !self.resident_frame.is_active() { return; }
+        let result = match &mut *self.raster.lock() {
+            RasterMode::Resident(raster) => Some(raster.flush_if_due(std::time::Instant::now())),
+            _ => None,
+        };
+        if let Some(Err(error)) = result {
+            self.fail_resident(error);
+        }
     }
 
     #[cfg(all(test, feature = "wgpu"))]
@@ -3095,6 +3176,13 @@ impl Rex3 {
     }
 
     fn gfifo_push(&self, addr: u32, val: u64) {
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.resident_frame.is_active() {
+            while !self.gfifo_try_push(addr, val) {
+                std::hint::spin_loop();
+            }
+            return;
+        }
         #[cfg(feature = "developer")]
         {
             let len = self.gfifo.len() + 1;
@@ -3126,7 +3214,18 @@ impl Rex3 {
                 if len > hwm { Some(len) } else { None }
             });
         }
-        if !self.gfifo.try_push(addr, val) {
+        #[cfg(all(test, feature = "wgpu"))]
+        let accepted = if self.resident_frame.is_active() {
+            let before = self.gfifo.len();
+            let result = self.gfifo.try_push_traced(addr, val);
+            self.note_resident_reservation(before, result);
+            result.is_ok()
+        } else {
+            self.gfifo.try_push(addr, val)
+        };
+        #[cfg(not(all(test, feature = "wgpu")))]
+        let accepted = self.gfifo.try_push(addr, val);
+        if !accepted {
             return false;
         }
         self.wake_gfifo_processor();
@@ -3153,7 +3252,18 @@ impl Rex3 {
                 if len > hwm { Some(len) } else { None }
             });
         }
-        if !self.gfifo.try_push2(addr0, val0, addr1, val1) {
+        #[cfg(all(test, feature = "wgpu"))]
+        let accepted = if self.resident_frame.is_active() {
+            let before = self.gfifo.len();
+            let result = self.gfifo.try_push2_traced(addr0, val0, addr1, val1);
+            self.note_resident_reservation(before, result);
+            result.is_ok()
+        } else {
+            self.gfifo.try_push2(addr0, val0, addr1, val1)
+        };
+        #[cfg(not(all(test, feature = "wgpu")))]
+        let accepted = self.gfifo.try_push2(addr0, val0, addr1, val1);
+        if !accepted {
             return false;
         }
         self.wake_gfifo_processor();
@@ -3173,11 +3283,35 @@ impl Rex3 {
                 if len > hwm { Some(len) } else { None }
             });
         }
-        if !self.gfifo.try_push_batch(token, vals.len() as u64, vals) {
+        #[cfg(all(test, feature = "wgpu"))]
+        let accepted = if self.resident_frame.is_active() {
+            let before = self.gfifo.len();
+            let result = self.gfifo.try_push_batch_traced(token, vals.len() as u64, vals);
+            self.note_resident_reservation(before, result);
+            result.is_ok()
+        } else {
+            self.gfifo.try_push_batch(token, vals.len() as u64, vals)
+        };
+        #[cfg(not(all(test, feature = "wgpu")))]
+        let accepted = self.gfifo.try_push_batch(token, vals.len() as u64, vals);
+        if !accepted {
             return false;
         }
         self.wake_gfifo_processor();
         true
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn note_resident_reservation(&self, before: usize, result: Result<(), crate::gfifo::PushFailure>) {
+        let occupancy = before.max(self.gfifo.len());
+        self.resident_telemetry.lock().reservation(occupancy, result);
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn note_resident_bus_busy(&self) {
+        if self.resident_frame.is_active() {
+            self.resident_telemetry.lock().bus_busy();
+        }
     }
 
     fn wait_gfifo_idle(&self) {
@@ -3217,7 +3351,8 @@ impl Rex3 {
             }
             thread::yield_now();
         }
-        self.submit_resident().ok_or(ResidentError::InvalidState("resident raster is not active"))?
+        self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::WaitIdle)
+            .ok_or(ResidentError::InvalidState("resident raster is not active"))?
     }
 
     pub(crate) fn wait_idle(&self) {
@@ -3241,7 +3376,12 @@ impl Rex3 {
                     return BUS_ERR;
                 }
                 drop(mode);
-                return if self.gfifo_try_push(token, count) { BUS_OK } else { BUS_BUSY };
+                return if self.gfifo_try_push(token, count) {
+                    BUS_OK
+                } else {
+                    self.note_resident_bus_busy();
+                    BUS_BUSY
+                };
             }
         }
         self.gfifo_push(token, count);
@@ -3278,6 +3418,8 @@ impl Rex3 {
                 if addr == GFIFO_RESIDENT_FRAME {
                     self.process_resident_frame_marker(val);
                     self.gfifo.consume();
+                    #[cfg(all(test, feature = "wgpu"))]
+                    self.flush_resident_if_due();
                     continue;
                 }
 
@@ -3318,17 +3460,19 @@ impl Rex3 {
 
                 if exit {
                     #[cfg(all(test, feature = "wgpu"))]
-                    let _ = self.submit_resident();
+                    let _ = self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::Exit);
                     #[cfg(feature = "rex-gpu")]
                     self.flush_gpu_replay(FlushReason::Exit);
                     self.gfxbusy.store(false, Ordering::Release);
                     self.gfifo.flush_head();
                     break; 
                 } // GFIFO_EXIT
+                #[cfg(all(test, feature = "wgpu"))]
+                self.flush_resident_if_due();
             } else {
                 if is_busy {
                     #[cfg(all(test, feature = "wgpu"))]
-                    let _ = self.submit_resident();
+                    let _ = self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::Idle);
                     #[cfg(feature = "rex-gpu")]
                     self.flush_gpu_replay(FlushReason::Idle);
                     self.gfxbusy.store(false, Ordering::Release);
@@ -3855,7 +3999,7 @@ impl Rex3 {
             // is tracked separately from this ordered submission fence.
             GFIFO_DISP_SYNC => {
                 #[cfg(all(test, feature = "wgpu"))]
-                if matches!(self.submit_resident(), Some(Err(_))) {
+                if matches!(self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::DisplayFence), Some(Err(_))) {
                     // A failed prefix is not a completed display fence.
                     return false;
                 }
@@ -4338,7 +4482,7 @@ impl Device for Rex3 {
             self.gfifo.flush_head();
             drop(processor);
             self.gfxbusy.store(false, Ordering::Release);
-            let _ = self.submit_resident();
+            let _ = self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::Exit);
             return;
         }
         // Close a recording and trace while the processor can still drain,
@@ -4938,9 +5082,13 @@ impl Rex3 {
                 // Contention here means a producer is mid-push, which is itself
                 // "not empty" — report busy and let the CPU retry.
                 if !self.gfifo.publish_tail() {
+                    #[cfg(all(test, feature = "wgpu"))]
+                    self.note_resident_bus_busy();
                     return BusRead32::busy();
                 }
                 if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
+                    #[cfg(all(test, feature = "wgpu"))]
+                    self.note_resident_bus_busy();
                     return BusRead32::busy();
                 }
                 BusRead32::ok($val)
@@ -5244,6 +5392,8 @@ impl Rex3 {
                 // as the queue stays full.
                 if !self.gfifo_try_push(offset, val as u64) {
                     crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::REX3_FIFO_FULL, true);
+                    #[cfg(all(test, feature = "wgpu"))]
+                    self.note_resident_bus_busy();
                     return BUS_BUSY;
                 }
                 crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::REX3_FIFO_FULL, false);
@@ -5270,9 +5420,13 @@ impl Rex3 {
         if reg_offset64r == REX3_HOSTRW0 {
             // Same rule as busy_or_val! on the 32-bit path: publish, then test.
             if !self.gfifo.publish_tail() {
+                #[cfg(all(test, feature = "wgpu"))]
+                self.note_resident_bus_busy();
                 return BusRead64::busy();
             }
             if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
+                #[cfg(all(test, feature = "wgpu"))]
+                self.note_resident_bus_busy();
                 return BusRead64::busy();
             }
             #[cfg(all(test, feature = "wgpu"))]
@@ -5371,6 +5525,8 @@ impl Rex3 {
         // the transfer ordered correctly against concurrent CPU register writes
         // — the words arrive in the stream at the point the producer put them.
         if !self.gfifo_try_push_batch(REX3_DMA_BATCH_W, vals) {
+            #[cfg(all(test, feature = "wgpu"))]
+            self.note_resident_bus_busy();
             return BUS_BUSY;
         }
         BUS_OK
@@ -5438,6 +5594,8 @@ impl Rex3 {
             // Sole effect of this write, so a full queue reports BUS_BUSY and
             // the CPU retries the store (see write32's default arm).
             if !self.gfifo_try_push(REX3_HOSTRW64 | (offset & 0x0800), val) {
+                #[cfg(all(test, feature = "wgpu"))]
+                self.note_resident_bus_busy();
                 return BUS_BUSY;
             }
             return BUS_OK;
@@ -5468,6 +5626,8 @@ impl Rex3 {
         // `is_go` puts the GO bit on the low word, matching the two-write order.
         let go_lo = if is_go { off_lo | 0x0800 } else { off_lo };
         if !self.gfifo_try_push2(off_hi, high as u64, go_lo, low as u64) {
+            #[cfg(all(test, feature = "wgpu"))]
+            self.note_resident_bus_busy();
             return BUS_BUSY;
         }
         BUS_OK
@@ -5595,7 +5755,10 @@ macro_rules! resident_bus_gate {
     ($board:expr, $on_error:expr) => {
         let _resident_bus = match $board.resident_bus_guard() {
             Ok(guard) => guard,
-            Err(status) => return ($on_error)(status),
+            Err(status) => {
+                if status == BUS_BUSY { $board.note_resident_bus_busy(); }
+                return ($on_error)(status);
+            }
         };
     };
 }

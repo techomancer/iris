@@ -191,6 +191,7 @@ pub struct Timing {
     resolve: wgpu::Buffer,
     read: wgpu::Buffer,
     period_ns: f64,
+    inspect_dispatch: bool,
     pub batches: u64,
     pub prims: u64,
     pub bin_ns: f64,
@@ -200,6 +201,8 @@ pub struct Timing {
     pub tiles_max: u32,
     /// Tile-primitive pairs the bin pass listed, summed over batches.
     pub pairs: u64,
+    /// A failed map, invalid timestamp or exhausted profiling counter.
+    pub failure: Option<&'static str>,
     /// Batches by raster time: under 0.1, 0.3, 1, 3, 10 ms and over.
     pub raster_hist: [u64; 6],
     /// `WGPU_BATCH_LOG=file`: one line a batch (prims, busy tiles, pairs,
@@ -263,14 +266,22 @@ impl Clocks {
 
 impl Timing {
     fn new(gpu: &Gpu) -> Option<Timing> {
-        if std::env::var("WGPU_BATCH_TIMING").is_err() || !gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        if std::env::var("WGPU_BATCH_TIMING").is_err() {
+            return None;
+        }
+        Self::new_explicit(gpu, false)
+    }
+
+    fn new_explicit(gpu: &Gpu, inspect_dispatch: bool) -> Option<Timing> {
+        if !gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
         }
         let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("batch timing"), ty: wgpu::QueryType::Timestamp, count: 4 });
         let resolve = gpu.buffer("batch timing resolve", 32, wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
-        let read = gpu.buffer("batch timing read", 48, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        let read = gpu.buffer("batch timing read", if inspect_dispatch { 64 } else { 48 }, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         let period_ns = gpu.queue.get_timestamp_period() as f64;
-        Some(Timing { queries, resolve, read, period_ns, batches: 0, prims: 0, bin_ns: 0.0, raster_ns: 0.0, tiles: 0, tiles_max: 0, pairs: 0, raster_hist: [0; 6], log: std::env::var("WGPU_BATCH_LOG").ok().and_then(|f| std::fs::File::create(f).ok()).map(std::io::LineWriter::new), clocks: Clocks::of(gpu), clock_ns: 0.0, gfx_ns_mhz: 0.0, mem_ns_mhz: 0.0 })
+        let log = (!inspect_dispatch).then(|| std::env::var("WGPU_BATCH_LOG").ok().and_then(|f| std::fs::File::create(f).ok()).map(std::io::LineWriter::new)).flatten();
+        Some(Timing { queries, resolve, read, period_ns, inspect_dispatch, batches: 0, prims: 0, bin_ns: 0.0, raster_ns: 0.0, tiles: 0, tiles_max: 0, pairs: 0, failure: None, raster_hist: [0; 6], log, clocks: Clocks::of(gpu), clock_ns: 0.0, gfx_ns_mhz: 0.0, mem_ns_mhz: 0.0 })
     }
 
     fn writes(&self, first: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
@@ -282,31 +293,79 @@ impl Timing {
         let slice = self.read.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         if gpu.wait(Some(submission)).is_err() {
+            self.failure = Some("profiling submission wait failed");
+            self.read.unmap();
             return;
         }
-        let _ = gpu.wait(None);
-        let (t, busy) = {
+        if gpu.wait(None).is_err() {
+            self.failure = Some("profiling map wait failed");
+            self.read.unmap();
+            return;
+        }
+        let (t, busy, args) = {
             let Ok(v) = slice.get_mapped_range() else {
+                self.failure = Some("profiling map failed");
                 self.read.unmap();
                 return;
             };
             let t: [u64; 4] = bytemuck::pod_read_unaligned(&v[0..32]);
             let head: BusyHead = bytemuck::pod_read_unaligned(&v[32..48]);
-            (t, head)
+            let args = self.inspect_dispatch.then(|| bytemuck::pod_read_unaligned::<DispatchArgs>(&v[48..64]));
+            (t, head, args)
         };
         self.read.unmap();
-        let ns = |a: u64, b: u64| b.saturating_sub(a) as f64 * self.period_ns;
+        if let Some(args) = args {
+            let expected_x = busy.count.min(crate::wgpu::tiles::MAX_GROUPS);
+            let expected_y = if busy.count == 0 { 1 } else {
+                (busy.count - 1) / crate::wgpu::tiles::MAX_GROUPS + 1
+            };
+            if args.x != expected_x || args.y != expected_y || args.z != 1 {
+                self.failure = Some("GPU-generated indirect dispatch does not match busy tiles");
+                return;
+            }
+        }
+        if t[1] < t[0] || t[3] < t[2] || !self.period_ns.is_finite() || self.period_ns <= 0.0 {
+            self.failure = Some("profiling timestamps decreased or have an invalid period");
+            return;
+        }
+        let ns = |a: u64, b: u64| (b - a) as f64 * self.period_ns;
         let raster = ns(t[2], t[3]);
-        self.batches += 1;
-        self.prims += prims as u64;
-        self.bin_ns += ns(t[0], t[1]);
-        self.raster_ns += raster;
-        self.tiles += busy.count as u64;
-        self.tiles_max = self.tiles_max.max(busy.count);
-        self.pairs += busy.pairs as u64;
         let ms = raster / 1e6;
         let i = [0.1, 0.3, 1.0, 3.0, 10.0].iter().position(|&l| ms < l).unwrap_or(5);
-        self.raster_hist[i] += 1;
+        let Some(batches) = self.batches.checked_add(1) else {
+            self.failure = Some("profiling batch counter overflow");
+            return;
+        };
+        let Some(total_prims) = self.prims.checked_add(prims as u64) else {
+            self.failure = Some("profiling primitive counter overflow");
+            return;
+        };
+        let Some(tiles) = self.tiles.checked_add(busy.count as u64) else {
+            self.failure = Some("profiling tile counter overflow");
+            return;
+        };
+        let Some(pairs) = self.pairs.checked_add(busy.pairs as u64) else {
+            self.failure = Some("profiling pair counter overflow");
+            return;
+        };
+        let Some(bucket) = self.raster_hist[i].checked_add(1) else {
+            self.failure = Some("profiling histogram overflow");
+            return;
+        };
+        let bin_ns = self.bin_ns + ns(t[0], t[1]);
+        let raster_ns = self.raster_ns + raster;
+        if !bin_ns.is_finite() || !raster_ns.is_finite() {
+            self.failure = Some("profiling duration overflow");
+            return;
+        }
+        self.batches = batches;
+        self.prims = total_prims;
+        self.bin_ns = bin_ns;
+        self.raster_ns = raster_ns;
+        self.tiles = tiles;
+        self.tiles_max = self.tiles_max.max(busy.count);
+        self.pairs = pairs;
+        self.raster_hist[i] = bucket;
         let (gfx, mem) = self.clocks.as_ref().and_then(|c| c.read()).unwrap_or((0.0, 0.0));
         if gfx != 0.0 {
             self.clock_ns += raster;
@@ -359,6 +418,13 @@ enum SetChoice {
     Free(usize),
     Grow,
     Wait(usize),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BatchWaitStats {
+    pub(crate) waits: u64,
+    pub(crate) nanoseconds: u64,
 }
 
 /// Choose a free set in rotation, grow if permitted, otherwise wait for
@@ -484,13 +550,17 @@ pub struct Batch<R: Pod, S: Pod> {
     pub prims_total: u64,
     /// GPU times, with WGPU_BATCH_TIMING.
     pub timing: Option<Timing>,
+    #[cfg(test)]
+    wait_stats: BatchWaitStats,
+    #[cfg(test)]
+    wait_probe: Option<std::sync::mpsc::Sender<()>>,
     _p: PhantomData<(R, S)>,
 }
 
 impl<R: Pod, S: Pod> Batch<R, S> {
     /// A recorder over `grid` with room for `max_slots` slots a batch.
     pub fn new(gpu: &Arc<Gpu>, pipelines: &BatchPipelines, grid: TileGrid, max_slots: u32) -> Batch<R, S> {
-        Self::with_set_policy(gpu, pipelines, grid, max_slots, SetPolicy::Grow)
+        Self::with_set_policy(gpu, pipelines, grid, max_slots, SetPolicy::Grow, true)
     }
 
     /// Like `new`, but cap the reusable sets. Once all are in flight, the
@@ -503,7 +573,30 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         max_slots: u32,
         max_sets: NonZeroUsize,
     ) -> Batch<R, S> {
-        Self::with_set_policy(gpu, pipelines, grid, max_slots, SetPolicy::Bounded(max_sets))
+        Self::with_set_policy(gpu, pipelines, grid, max_slots, SetPolicy::Bounded(max_sets), true)
+    }
+
+    /// Resident work must not inherit the shared batch profiler from the
+    /// environment: enabling its map-and-wait path requires an explicit opt-in.
+    #[cfg(test)]
+    pub(crate) fn new_bounded_unprofiled(
+        gpu: &Arc<Gpu>,
+        pipelines: &BatchPipelines,
+        grid: TileGrid,
+        max_slots: u32,
+        max_sets: NonZeroUsize,
+    ) -> Batch<R, S> {
+        Self::with_set_policy(gpu, pipelines, grid, max_slots, SetPolicy::Bounded(max_sets), false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_profiling(&mut self) -> Result<(), String> {
+        if !self.is_empty() || self.timing.is_some() {
+            return Err("batch profiling must be enabled once, between batches".into());
+        }
+        self.timing = Some(Timing::new_explicit(&self.gpu, true)
+            .ok_or("batch profiling requires timestamp queries")?);
+        Ok(())
     }
 
     fn with_set_policy(
@@ -512,6 +605,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         grid: TileGrid,
         max_slots: u32,
         set_policy: SetPolicy,
+        environment_timing: bool,
     ) -> Batch<R, S> {
         let initial_sets = match set_policy {
             SetPolicy::Grow => BATCH_SETS,
@@ -521,7 +615,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let list_buf = gpu.buffer("batch tile lists", LIST_CAP as u64 * 4, storage);
         let busy_buf = gpu.buffer("batch busy", 16 + tiles as u64 * BUSY_ENTRY, storage | wgpu::BufferUsages::COPY_SRC);
-        let args_buf = gpu.buffer("batch dispatch args", 16, storage | wgpu::BufferUsages::INDIRECT);
+        let args_buf = gpu.buffer("batch dispatch args", 16, storage | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC);
         let mut b = Batch {
             gpu: Arc::clone(gpu),
             grid,
@@ -536,7 +630,11 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             last_set: 0,
             flushes: 0,
             prims_total: 0,
-            timing: Timing::new(gpu),
+            timing: if environment_timing { Timing::new(gpu) } else { None },
+            #[cfg(test)]
+            wait_stats: BatchWaitStats::default(),
+            #[cfg(test)]
+            wait_probe: None,
             _p: PhantomData,
         };
         for _ in 0..initial_sets {
@@ -620,17 +718,35 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             }
             SetChoice::Wait(k) => {
                 let start = Instant::now();
-                loop {
+                #[cfg(test)]
+                {
+                    self.wait_stats.waits = self.wait_stats.waits.checked_add(1)
+                        .ok_or("wgpu bounded set wait counter overflow")?;
+                    if let Some(probe) = self.wait_probe.take() {
+                        probe.send(()).map_err(|_| "wgpu bounded set wait test receiver closed")?;
+                    }
+                }
+                let result = loop {
                     self.gpu.instance.poll_all(false);
-                    self.gpu.check()?;
+                    if let Err(error) = self.gpu.check() {
+                        break Err(error);
+                    }
                     if self.sets[k].done.load(Ordering::Acquire) {
-                        break;
+                        break Ok(());
                     }
                     if start.elapsed() >= SET_WAIT_TIMEOUT {
-                        return Err("timed out waiting for the oldest wgpu batch set".into());
+                        break Err("timed out waiting for the oldest wgpu batch set".into());
                     }
                     std::thread::sleep(Duration::from_micros(100));
+                };
+                #[cfg(test)]
+                {
+                    let elapsed = u64::try_from(start.elapsed().as_nanos())
+                        .map_err(|_| "wgpu bounded set wait duration overflow")?;
+                    self.wait_stats.nanoseconds = self.wait_stats.nanoseconds.checked_add(elapsed)
+                        .ok_or("wgpu bounded set wait duration overflow")?;
                 }
+                result?;
                 k
             }
         };
@@ -670,6 +786,29 @@ impl<R: Pod, S: Pod> Batch<R, S> {
 
     pub fn slots_used(&self) -> usize {
         self.recording.slots.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tile_pair_bound(&self) -> u64 {
+        u64::from(self.recording.pairs_bound)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_stats(&self) -> BatchWaitStats {
+        self.wait_stats
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_wait_for_test(
+        &mut self,
+        probe: std::sync::mpsc::Sender<()>,
+    ) -> Result<Arc<AtomicBool>, &'static str> {
+        if self.sets.len() != 1 || self.claimed.is_some() || !self.sets[0].done.load(Ordering::Acquire) {
+            return Err("test requires one completed, unclaimed batch set");
+        }
+        self.sets[0].done.store(false, Ordering::Release);
+        self.wait_probe = Some(probe);
+        Ok(Arc::clone(&self.sets[0].done))
     }
 
     /// Append a state slot; its index for records that follow.
@@ -777,6 +916,9 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             enc.resolve_query_set(&t.queries, 0..4, &t.resolve, 0);
             enc.copy_buffer_to_buffer(&t.resolve, 0, &t.read, 0, 32);
             enc.copy_buffer_to_buffer(&self.busy_buf, 0, &t.read, 32, 16);
+            if t.inspect_dispatch {
+                enc.copy_buffer_to_buffer(&self.args_buf, 0, &t.read, 48, 16);
+            }
         }
         set.done.store(false, Ordering::Release);
         let submission = self.gpu.submit(enc);

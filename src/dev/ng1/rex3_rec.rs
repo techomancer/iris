@@ -802,7 +802,7 @@ pub(crate) mod tests {
         replay_recs_with_hook(rex, bus, recs, check_hashes, |_, _| {})
     }
 
-    pub(super) fn replay_recs_with_hook(
+    pub(crate) fn replay_recs_with_hook(
         rex: &Rex3, bus: &dyn BusDevice, recs: &[Rec], check_hashes: bool,
         mut before_record: impl FnMut(usize, &Rec),
     ) -> Report {
@@ -908,6 +908,15 @@ pub(crate) mod tests {
         // A failed access can leave the processor blocked or already dead.
         // Only a completed replay may synchronously drain it.
         if rep.access_error.is_none() {
+            #[cfg(feature = "wgpu")]
+            if rex.resident_active() {
+                if rex.wait_resident_idle().is_err() {
+                    rep.access_error = Some("resident replay failed while draining".into());
+                }
+            } else {
+                rex.wait_idle();
+            }
+            #[cfg(not(feature = "wgpu"))]
             rex.wait_idle();
         }
         rep

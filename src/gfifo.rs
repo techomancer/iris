@@ -16,6 +16,12 @@ use crossbeam_utils::CachePadded;
 /// Address marker for the payload entries that follow a `push_batch` token.
 pub const GFIFO_PAYLOAD: u32 = 0xFFFF_0003;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushFailure {
+    Contended,
+    Full,
+}
+
 /// A GFIFO entry: plain addr + val, no synchronization fields.
 /// Ordering is guaranteed by the push spinlock (producers) and the
 /// tail Release store / head Acquire load (consumer).
@@ -219,11 +225,22 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     /// anyway.
     #[inline]
     pub fn try_push(&self, addr: u32, val: u64) -> bool {
+        self.push_one_result(addr, val).is_ok()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn try_push_traced(&self, addr: u32, val: u64) -> Result<(), PushFailure> {
+        self.push_one_result(addr, val)
+    }
+
+    #[inline]
+    fn push_one_result(&self, addr: u32, val: u64) -> Result<(), PushFailure> {
         // Acquire the spinlock — uncontested in the common case (one active
         // producer: IRIX only drives DMA for pixmap blits, never while the CPU
         // is writing REX3 registers), so a failure here is rare.
         if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return false;
+            return Err(PushFailure::Contended);
         }
         let tail = self.tail.load(Ordering::Relaxed);
         let next_tail = tail.wrapping_add(1) & Self::MASK;
@@ -235,7 +252,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
                 // Full — release the lock and let the caller retry once the
                 // consumer has drained something.
                 self.lock.store(false, Ordering::Release);
-                return false;
+                return Err(PushFailure::Full);
             }
         }
         // SAFETY: we hold the lock; no other producer touches this slot.
@@ -245,7 +262,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         // Release: consumer's Acquire on tail sees the slot write above.
         self.tail.store(next_tail, Ordering::Release);
         self.lock.store(false, Ordering::Release);
-        true
+        Ok(())
     }
 
     /// Push two consecutive register writes as one atomic unit.
@@ -266,8 +283,19 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     /// pair either lands completely or not at all.
     #[inline]
     pub fn try_push2(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> bool {
+        self.push_pair_result(addr0, val0, addr1, val1).is_ok()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn try_push2_traced(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> Result<(), PushFailure> {
+        self.push_pair_result(addr0, val0, addr1, val1)
+    }
+
+    #[inline]
+    fn push_pair_result(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> Result<(), PushFailure> {
         if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return false;
+            return Err(PushFailure::Contended);
         }
         let tail = self.tail.load(Ordering::Relaxed);
         let next = tail.wrapping_add(1) & Self::MASK;
@@ -280,7 +308,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
             self.shadow_head.set(cached_head);
             if next == cached_head || next2 == cached_head {
                 self.lock.store(false, Ordering::Release);
-                return false;
+                return Err(PushFailure::Full);
             }
         }
         // SAFETY: we hold the lock; no other producer touches these slots.
@@ -292,7 +320,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         // orders it after every write above.
         self.tail.store(next2, Ordering::Release);
         self.lock.store(false, Ordering::Release);
-        true
+        Ok(())
     }
 
     /// Push `entries` (address, value) as one unit: all of them or, when the
@@ -343,10 +371,20 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     /// has no EXEC_RETRY, and a partial commit followed by a retry would
     /// duplicate the prefix.
     pub fn try_push_batch(&self, token: u32, count_val: u64, vals: &[u64]) -> bool {
+        self.push_batch_result(token, count_val, vals).is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_push_batch_traced(&self, token: u32, count_val: u64, vals: &[u64]) -> Result<(), PushFailure> {
+        self.push_batch_result(token, count_val, vals)
+    }
+
+    #[inline]
+    fn push_batch_result(&self, token: u32, count_val: u64, vals: &[u64]) -> Result<(), PushFailure> {
         let need = vals.len() + 1;
         assert!(need < DEPTH, "batch of {} exceeds GFIFO capacity", vals.len());
         if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return false;
+            return Err(PushFailure::Contended);
         }
         let tail = self.tail.load(Ordering::Relaxed);
         let room = |head: usize| head.wrapping_sub(tail).wrapping_sub(1) & Self::MASK;
@@ -355,7 +393,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
             self.shadow_head.set(head);
             if room(head) < need {
                 self.lock.store(false, Ordering::Release);
-                return false;
+                return Err(PushFailure::Full);
             }
         }
         // SAFETY: we hold the lock and have verified capacity for all `need`
@@ -372,7 +410,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         // One Release publishes the token and every payload slot.
         self.tail.store(new_tail, Ordering::Release);
         self.lock.store(false, Ordering::Release);
-        true
+        Ok(())
     }
 
     /// Push a batch token followed by its payload words, waiting until the
@@ -680,6 +718,25 @@ and pixel data is being lost", slot.addr, GFIFO_PAYLOAD);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_gfifo_failure_reason_distinguishes_full_and_contention() {
+        let f: Box<GFifo<8>> = Box::new(GFifo::new());
+        for i in 0..6 {
+            assert_eq!(f.try_push_traced(i, i as u64), Ok(()));
+        }
+        assert_eq!(f.try_push2_traced(10, 10, 11, 11), Err(PushFailure::Full));
+        assert_eq!(f.try_push_batch_traced(12, 1, &[13]), Err(PushFailure::Full));
+        assert_eq!(f.len(), 6, "failed multi-entry reservations must be atomic");
+        assert_eq!(f.try_push_traced(6, 6), Ok(()));
+        assert_eq!(f.try_push_traced(7, 7), Err(PushFailure::Full));
+        f.lock.store(true, Ordering::Release);
+        assert_eq!(f.try_push_traced(8, 8), Err(PushFailure::Contended));
+        assert_eq!(f.try_push2_traced(8, 8, 9, 9), Err(PushFailure::Contended));
+        assert_eq!(f.try_push_batch_traced(8, 1, &[9]), Err(PushFailure::Contended));
+        f.lock.store(false, Ordering::Release);
+        assert_eq!(f.len(), 7);
+    }
 
     #[test]
     fn every_head_sees_every_entry() {
