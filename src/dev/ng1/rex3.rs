@@ -28,6 +28,12 @@ mod plane;
 #[path = "rex3_frame.rs"]
 pub(super) mod frame;
 #[cfg(all(test, feature = "wgpu"))]
+#[path = "rex3_lifecycle.rs"]
+mod lifecycle;
+#[cfg(all(test, feature = "wgpu"))]
+#[path = "rex3_lifecycle_tests.rs"]
+mod lifecycle_tests;
+#[cfg(all(test, feature = "wgpu"))]
 pub use plane::CpuPlane;
 #[cfg(not(all(test, feature = "wgpu")))]
 pub type CpuPlane = Box<[u32]>;
@@ -1403,6 +1409,8 @@ pub struct Rex3 {
     resident_fatal_notified: AtomicBool,
     #[cfg(all(test, feature = "wgpu"))]
     resident_frame: frame::ResidentFrameControl,
+    #[cfg(all(test, feature = "wgpu"))]
+    resident_lifecycle: RwLock<lifecycle::ResidentLifecycle>,
     pub gfifo: GFifo,
 
     pub vc2: Mutex<Vc2>,
@@ -1426,6 +1434,8 @@ pub struct Rex3 {
     /// Handle to the REX3-Processor thread, set once when it starts, used by
     /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
     processor_unparker: std::sync::OnceLock<thread::Thread>,
+    #[cfg(all(test, feature = "wgpu"))]
+    resident_unparker: Mutex<Option<thread::Thread>>,
     /// Original coarse dirty flag, retained verbatim when partial uploads are
     /// not compiled in.
     #[cfg(not(feature = "rex-dirty-upload"))]
@@ -1614,6 +1624,8 @@ impl Rex3 {
             resident_fatal_notified: AtomicBool::new(false),
             #[cfg(all(test, feature = "wgpu"))]
             resident_frame: frame::ResidentFrameControl::default(),
+            #[cfg(all(test, feature = "wgpu"))]
+            resident_lifecycle: RwLock::new(lifecycle::ResidentLifecycle::default()),
             gfifo: GFifo::new(),
             vc2: Mutex::new(Vc2::new()),
             xmap0: Mutex::new(Xmap9::new()),
@@ -1629,6 +1641,8 @@ impl Rex3 {
             refresh_thread: Mutex::new(None),
             processor_parked: AtomicBool::new(false),
             processor_unparker: std::sync::OnceLock::new(),
+            #[cfg(all(test, feature = "wgpu"))]
+            resident_unparker: Mutex::new(None),
             #[cfg(not(feature = "rex-dirty-upload"))]
             fb_dirty: AtomicBool::new(true),
             #[cfg(feature = "rex-dirty-upload")]
@@ -1755,9 +1769,9 @@ impl Rex3 {
             .set_telemetry_enabled(enabled)
     }
 
-    /// The caller must own the stopped board exclusively. The resident board
-    /// has no refresh thread or CPU-plane observers; explicit backend
-    /// observation is a separate test-only operation.
+    /// The caller serializes producers and lifecycle transitions. A stopped
+    /// worker and an empty, fully published FIFO are the only boundary at
+    /// which the context and both authoritative planes can be snapshotted.
     #[cfg(all(test, feature = "wgpu"))]
     fn check_resident_quiescent(
         &self,
@@ -1772,6 +1786,13 @@ impl Rex3 {
         {
             return Err(ResidentError::InvalidState("REX3 requires a stopped, idle board"));
         }
+        if !self.resident_frame.quiescent() {
+            return Err(ResidentError::InvalidState("REX3 has an active display frame"));
+        }
+        let context = unsafe { &*self.context.get() };
+        if context.host_len != 1 || context.host_cursor != 0 {
+            return Err(ResidentError::InvalidState("REX3 has an unfinished HOSTRW transfer"));
+        }
         #[cfg(feature = "gputrace")]
         if self.tap.load(Ordering::Acquire) != 0
             || self.rec.lock().is_some()
@@ -1779,10 +1800,12 @@ impl Rex3 {
         {
             return Err(ResidentError::InvalidState("REX3 cannot attach while recording or tracing"));
         }
-        if self.head.renderer_slot().lock().is_some() {
-            return Err(ResidentError::InvalidState("REX3 live resident scanout is not implemented"));
-        }
         Ok(())
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn resident_active(&self) -> bool {
+        self.resident_frame.is_active()
     }
 
     /// Attach a test double through the same gate as the GPU implementation.
@@ -1793,6 +1816,9 @@ impl Rex3 {
     ) -> Result<(), String> {
         self.raster.get_mut().kind().ensure_available(RasterModeKind::Resident)?;
         self.check_resident_quiescent().map_err(|error| error.to_string())?;
+        if self.head.renderer_slot().lock().is_some() {
+            return Err("REX3 live resident scanout is not implemented".into());
+        }
         self.processor_unparker.take();
         *self.raster.get_mut() =
             RasterMode::Resident(crate::dev::ng1::wgpu::resident::ResidentRaster::new(backend));
@@ -1811,6 +1837,9 @@ impl Rex3 {
         self.raster.get_mut().kind().ensure_available(RasterModeKind::Resident)
             .map_err(ResidentError::Failed)?;
         self.check_resident_quiescent()?;
+        if self.head.renderer_slot().lock().is_some() {
+            return Err(ResidentError::InvalidState("REX3 live resident scanout is not implemented"));
+        }
         let backend = ResidentGpu::activate(gpu, self.fb_rgb.get_mut(), self.fb_aux.get_mut())?;
         self.processor_unparker.take();
         *self.raster.get_mut() = RasterMode::Resident(ResidentRaster::new(backend));
@@ -1818,36 +1847,13 @@ impl Rex3 {
         Ok(())
     }
 
-    /// Reset only while exclusively owned and quiescent. Power-on supplies
-    /// fresh CPU seed data; the old GPU planes are never read back.
+    /// Test seam retained for existing callers; power-on uses the same
+    /// stopped resident lifecycle.
     #[cfg(all(test, feature = "wgpu"))]
     pub(crate) fn reset_resident_gpu(
         &mut self,
     ) -> Result<(), crate::dev::ng1::wgpu::resident::ResidentError> {
-        use crate::dev::ng1::wgpu::resident::ResidentError;
-        self.check_resident_quiescent()?;
-        match self.raster.get_mut() {
-            RasterMode::Resident(raster) => {
-                if let Some(error @ (ResidentError::DeviceLost(_) | ResidentError::Failed(_))) = raster.fault() {
-                    return Err(error.clone());
-                }
-            }
-            _ => return Err(ResidentError::InvalidState("resident raster is not active")),
-        }
-        // No other owner or worker can see this temporary mode. A reset
-        // discards old GPU contents rather than treating stale CPU data as a
-        // fallback; a failed reseed restores a sticky resident fault.
-        let mut mode = std::mem::replace(self.raster.get_mut(), RasterMode::Cpu);
-        self.power_on();
-        let RasterMode::Resident(raster) = &mut mode else { unreachable!() };
-        let result = raster.reset(self.fb_rgb.get_mut(), self.fb_aux.get_mut());
-        *self.raster.get_mut() = mode;
-        if result.is_ok() {
-            self.resident_fatal_notified.store(false, Ordering::Release);
-            self.processor_unparker.take();
-            self.resident_frame.activate();
-        }
-        result
+        self.reset_resident_board()
     }
 
     #[cfg(all(test, feature = "wgpu"))]
@@ -1966,18 +1972,20 @@ impl Rex3 {
         &self,
     ) -> Result<(), crate::dev::ng1::wgpu::resident::ResidentError> {
         use crate::dev::ng1::wgpu::resident::ResidentError;
+        let lifecycle = self.resident_lifecycle.write();
         if self.raster.lock().kind() != RasterModeKind::Resident {
             return Err(ResidentError::InvalidState("resident raster is not active"));
         }
-        // The processor does not select a display; the explicitly chosen
-        // display mode validates its renderer when it starts and renders.
-        let mut processor = self.processor_thread.lock();
-        if let Some(error) = self.resident_fault() {
-            return Err(error);
-        }
-        if self.running.swap(true, Ordering::SeqCst) {
+        self.check_resident_health(false)?;
+        if self.running.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.check_resident_quiescent()?;
+        if !lifecycle.ready() {
+            return Err(ResidentError::InvalidState("resident restore is incomplete"));
+        }
+        let mut processor = self.processor_thread.lock();
+        self.running.store(true, Ordering::SeqCst);
         let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
         unsafe { (*self.context.get()).host = rex3 as *const Rex3; }
         match thread::Builder::new().name("REX3-Resident-Processor-Test".into())
@@ -1990,7 +1998,9 @@ impl Rex3 {
             Ok(handle) => *processor = Some(handle),
             Err(error) => {
                 self.running.store(false, Ordering::Release);
-                return Err(ResidentError::Failed(format!("start resident processor: {error}")));
+                let error = ResidentError::Failed(format!("start resident processor: {error}"));
+                self.fail_resident(error.clone());
+                return Err(error);
             }
         }
         Ok(())
@@ -2199,7 +2209,11 @@ impl Rex3 {
     /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
     pub fn apply_display_resolution(&self, mode: crate::dev::ng1::vc2_timings::NewportResolution) {
         #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("display resolution changes").unwrap();
+        if self.resident_active() {
+            self.apply_resident_display_resolution(mode, false)
+                .unwrap_or_else(|error| panic!("REX3 {error}"));
+            return;
+        }
         if mode.is_guest() {
             return;
         }
@@ -3064,6 +3078,22 @@ impl Rex3 {
     // blend has spec-cited factor semantics — all of which a second copy would
     // get subtly wrong.
 
+    fn wake_gfifo_processor(&self) {
+        if !self.processor_parked.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.resident_frame.is_active() {
+            if let Some(t) = self.resident_unparker.lock().as_ref() {
+                t.unpark();
+            }
+            return;
+        }
+        if let Some(t) = self.processor_unparker.get() {
+            t.unpark();
+        }
+    }
+
     fn gfifo_push(&self, addr: u32, val: u64) {
         #[cfg(feature = "developer")]
         {
@@ -3077,11 +3107,7 @@ impl Rex3 {
         // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
         // on the hot path: a relaxed-ish load that is false whenever the
         // processor is actively draining.
-        if self.processor_parked.load(Ordering::Acquire) {
-            if let Some(t) = self.processor_unparker.get() {
-                t.unpark();
-            }
-        }
+        self.wake_gfifo_processor();
     }
 
     /// Non-blocking `gfifo_push`: returns `false` when the queue is full or a
@@ -3103,11 +3129,7 @@ impl Rex3 {
         if !self.gfifo.try_push(addr, val) {
             return false;
         }
-        if self.processor_parked.load(Ordering::Acquire) {
-            if let Some(t) = self.processor_unparker.get() {
-                t.unpark();
-            }
-        }
+        self.wake_gfifo_processor();
         true
     }
 
@@ -3134,11 +3156,7 @@ impl Rex3 {
         if !self.gfifo.try_push2(addr0, val0, addr1, val1) {
             return false;
         }
-        if self.processor_parked.load(Ordering::Acquire) {
-            if let Some(t) = self.processor_unparker.get() {
-                t.unpark();
-            }
-        }
+        self.wake_gfifo_processor();
         true
     }
 
@@ -3158,11 +3176,7 @@ impl Rex3 {
         if !self.gfifo.try_push_batch(token, vals.len() as u64, vals) {
             return false;
         }
-        if self.processor_parked.load(Ordering::Acquire) {
-            if let Some(t) = self.processor_unparker.get() {
-                t.unpark();
-            }
-        }
+        self.wake_gfifo_processor();
         true
     }
 
@@ -3246,6 +3260,13 @@ impl Rex3 {
 
     fn register_processor(&self) {
         // Publish our thread handle so gfifo_push can unpark us when we park.
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.resident_frame.is_active() {
+            *self.resident_unparker.lock() = Some(thread::current());
+        } else {
+            let _ = self.processor_unparker.set(thread::current());
+        }
+        #[cfg(not(all(test, feature = "wgpu")))]
         let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
@@ -4062,16 +4083,27 @@ impl Rex3 {
     /// Save RGB/aux planes with a custom filename prefix (e.g. `rex3_head1`).
     pub fn save_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
         #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("framebuffer snapshots").map_err(std::io::Error::other)?;
+        if self.resident_frame.is_active() {
+            return self.save_resident_framebuffers(dir, prefix);
+        }
         self.wait_idle();
         let rgb = unsafe { &*self.fb_rgb.get() };
+        let aux = unsafe { &*self.fb_aux.get() };
+        Self::write_framebuffer_files(dir, prefix, rgb, aux)
+    }
+
+    fn write_framebuffer_files(
+        dir: &std::path::Path,
+        prefix: &str,
+        rgb: &[u32],
+        aux: &[u32],
+    ) -> std::io::Result<()> {
         let mut bytes = Vec::with_capacity(rgb.len() * 4);
         for &word in rgb.iter() {
             bytes.extend_from_slice(&word.to_be_bytes());
         }
         std::fs::write(dir.join(format!("{prefix}_rgb.bin")), &bytes)?;
 
-        let aux = unsafe { &*self.fb_aux.get() };
         bytes.clear();
         for &word in aux.iter() {
             bytes.extend_from_slice(&word.to_be_bytes());
@@ -4085,7 +4117,9 @@ impl Rex3 {
     /// rollback checkpoint; bypasses the byte-shuffle the disk path needs.
     pub fn snapshot_framebuffers_inmem(&self) -> (Vec<u32>, Vec<u32>) {
         #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("framebuffer snapshots").unwrap();
+        if self.resident_frame.is_active() {
+            return self.snapshot_resident_planes().unwrap_or_else(|error| panic!("REX3 {error}"));
+        }
         self.wait_idle();
         let rgb = unsafe { &*self.fb_rgb.get() };
         let aux = unsafe { &*self.fb_aux.get() };
@@ -4097,7 +4131,10 @@ impl Rex3 {
     /// framebuffer size.
     pub fn restore_framebuffers_inmem(&self, rgb: &[u32], aux: &[u32]) {
         #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("framebuffer restores").unwrap();
+        if self.resident_frame.is_active() {
+            self.stage_resident_planes(rgb, aux).unwrap_or_else(|error| panic!("REX3 {error}"));
+            return;
+        }
         self.wait_idle();
         let dst_rgb = unsafe { &mut *self.fb_rgb.get() };
         let n = rgb.len().min(dst_rgb.len());
@@ -4167,7 +4204,9 @@ impl Rex3 {
 
     pub fn load_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
         #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("framebuffer restores").map_err(std::io::Error::other)?;
+        if self.resident_frame.is_active() {
+            return self.load_resident_framebuffers(dir, prefix);
+        }
         self.wait_idle();
         let mut rgb_changed = false;
         let path_rgb = dir.join(format!("{prefix}_rgb.bin"));
@@ -4250,6 +4289,7 @@ impl Device for Rex3 {
     fn stop(&self) {
         #[cfg(all(test, feature = "wgpu"))]
         if self.raster.lock().kind() == RasterModeKind::Resident {
+            let _lifecycle = self.resident_lifecycle.write();
             self.head.display_stop().request();
             self.running.store(false, Ordering::SeqCst);
             self.resident_frame.wake();
@@ -4262,11 +4302,13 @@ impl Device for Rex3 {
             }
             let mut processor = self.processor_thread.lock();
             if let Some(handle) = processor.take() {
+                let mut sent_exit = false;
                 // Unlike a blocking FIFO push, this also terminates if a
                 // test worker has already failed with the queue still full.
                 while !handle.is_finished() {
                     if self.gfifo_try_push(GFIFO_EXIT, 0) {
                         handle.thread().unpark();
+                        sent_exit = true;
                         break;
                     }
                     thread::yield_now();
@@ -4275,11 +4317,20 @@ impl Device for Rex3 {
                     self.fail_resident(crate::dev::ng1::wgpu::resident::ResidentError::Failed(
                         "resident GFIFO worker panicked".into(),
                     ));
+                } else if !sent_exit && self.resident_fault().is_none() {
+                    self.fail_resident(crate::dev::ng1::wgpu::resident::ResidentError::Failed(
+                        "resident GFIFO worker exited unexpectedly".into(),
+                    ));
                 }
             }
-            // After joining, normal FIFO consumption can safely discard
-            // leftovers even if a producer races teardown. Bound the drain
-            // so a continuing producer cannot make stop block indefinitely.
+            *self.resident_unparker.lock() = None;
+            // Leftovers cannot be presented as a successfully stopped
+            // prefix. Drain only after making that condition sticky.
+            if !self.gfifo.is_empty() && self.resident_fault().is_none() {
+                self.fail_resident(crate::dev::ng1::wgpu::resident::ResidentError::Failed(
+                    "resident GFIFO was not drained at stop".into(),
+                ));
+            }
             for _ in 0..GFIFO_DEPTH {
                 if self.gfifo.peek().is_none() { break; }
                 self.gfifo.consume();
@@ -4437,6 +4488,9 @@ impl Device for Rex3 {
         if args.is_empty() {
             return Err(format!("Usage: {} debug <on|off> | {} status", cmd, cmd));
         }
+
+        #[cfg(all(test, feature = "wgpu"))]
+        let _resident_monitor = self.resident_monitor_guard()?;
 
         if cmd == "rex" && args[0] == "status" {
             let ctx = unsafe { &*self.context.get() };
@@ -5536,8 +5590,24 @@ impl Rex3 {
     }
 }
 
+#[cfg(all(test, feature = "wgpu"))]
+macro_rules! resident_bus_gate {
+    ($board:expr, $on_error:expr) => {
+        let _resident_bus = match $board.resident_bus_guard() {
+            Ok(guard) => guard,
+            Err(status) => return ($on_error)(status),
+        };
+    };
+}
+
+#[cfg(not(all(test, feature = "wgpu")))]
+macro_rules! resident_bus_gate {
+    ($board:expr, $on_error:expr) => {};
+}
+
 impl BusDevice for Rex3 {
     fn read8(&self, addr: u64) -> BusRead8 {
+        resident_bus_gate!(self, |status| BusRead8 { status, data: 0 });
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5550,6 +5620,7 @@ impl BusDevice for Rex3 {
     }
 
     fn read16(&self, addr: u64) -> BusRead16 {
+        resident_bus_gate!(self, |status| BusRead16 { status, data: 0 });
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5562,6 +5633,7 @@ impl BusDevice for Rex3 {
     }
 
     fn read32(&self, addr: u64) -> BusRead32 {
+        resident_bus_gate!(self, |status| BusRead32 { status, data: 0 });
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5574,6 +5646,7 @@ impl BusDevice for Rex3 {
     }
 
     fn read64(&self, addr: u64) -> BusRead64 {
+        resident_bus_gate!(self, |status| BusRead64 { status, data: 0 });
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5586,6 +5659,7 @@ impl BusDevice for Rex3 {
     }
 
     fn write8(&self, addr: u64, val: u8) -> u32 {
+        resident_bus_gate!(self, |status| status);
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5598,6 +5672,7 @@ impl BusDevice for Rex3 {
     }
 
     fn write16(&self, addr: u64, val: u16) -> u32 {
+        resident_bus_gate!(self, |status| status);
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5610,6 +5685,7 @@ impl BusDevice for Rex3 {
     }
 
     fn write32(&self, addr: u64, val: u32) -> u32 {
+        resident_bus_gate!(self, |status| status);
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5622,6 +5698,7 @@ impl BusDevice for Rex3 {
     }
 
     fn write64(&self, addr: u64, val: u64) -> u32 {
+        resident_bus_gate!(self, |status| status);
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5634,6 +5711,7 @@ impl BusDevice for Rex3 {
     }
 
     fn dma_read64(&self, addr: u64) -> BusRead64 {
+        resident_bus_gate!(self, |status| BusRead64 { status, data: 0 });
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5646,6 +5724,7 @@ impl BusDevice for Rex3 {
     }
 
     fn dma_write64_bulk(&self, addr: u64, vals: &[u64]) -> u32 {
+        resident_bus_gate!(self, |status| status);
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5658,6 +5737,7 @@ impl BusDevice for Rex3 {
     }
 
     fn dma_read64_bulk(&self, addr: u64, out: &mut [u64]) -> u32 {
+        resident_bus_gate!(self, |status| status);
         let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
@@ -5759,7 +5839,8 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn frame_available(&self) -> bool {
         #[cfg(all(test, feature = "wgpu"))]
         if self.resident_frame.is_active() {
-            return self.resident_frame.frame_available();
+            return !self.resident_fatal_notified.load(Ordering::Acquire)
+                && self.resident_frame.frame_available();
         }
         true
     }
@@ -5789,7 +5870,18 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         use crate::dev::ng1::vc2::{VC2_REG_CURRENT_CURSOR_X, VC2_REG_CURSOR_Y_LOC,
             VC2_REG_CURSOR_ENTRY_PTR, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE};
-        let x_adjust = self.head.screen().lock().cursor_x_adjust;
+        let screen = self.head.screen().lock();
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.resident_frame.is_active()
+            && (self.resident_fatal_notified.load(Ordering::Acquire) || screen.width == 0 || screen.height == 0)
+        {
+            return None;
+        }
+        let x_adjust = screen.cursor_x_adjust;
+        #[cfg(all(test, feature = "wgpu"))]
+        let _resident_screen = self.resident_frame.is_active().then_some(screen);
+        #[cfg(not(all(test, feature = "wgpu")))]
+        drop(screen);
         let vc2 = self.vc2.lock();
         let ctrl = vc2.regs[VC2_REG_DISPLAY_CONTROL as usize];
         if ctrl & VC2_CTRL_CURSOR_EN == 0 {
@@ -5820,28 +5912,33 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     }
 }
 
-impl Resettable for Rex3 {
-    fn power_on(&self) {
-        #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("reset").unwrap();
-        // Reset drawing context
+impl Rex3 {
+    fn reset_registers(&self) {
         unsafe { *self.context.get() = Rex3Context::power_on_default(); }
-        // Reset config registers
         self.config.config.store(0, Ordering::Relaxed);
         self.config.status.store(0, Ordering::Relaxed);
         *self.dcb.lock() = Rex3DcbState::default();
-        // Clear framebuffers
-        self.with_cpu_rgb_write(|fb| fb.fill(0));
-        unsafe { (*self.fb_aux.get()).fill(0); }
-        self.mark_framebuffer_full(DamagePlane::Rgb);
-        self.mark_framebuffer_full(DamagePlane::Aux);
-        // Reset Vc2, Xmap, Cmap
         *self.vc2.lock() = crate::dev::ng1::vc2::Vc2::new();
         *self.xmap0.lock() = crate::dev::ng1::xmap9::Xmap9::new();
         *self.xmap1.lock() = crate::dev::ng1::xmap9::Xmap9::new();
         *self.cmap0.lock() = crate::dev::ng1::cmap::Cmap::new(0);
         *self.cmap1.lock() = crate::dev::ng1::cmap::Cmap::new(1);
         *self.bt445.lock() = crate::dev::ng1::bt445::Bt445::new();
+    }
+}
+
+impl Resettable for Rex3 {
+    fn power_on(&self) {
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.resident_frame.is_active() {
+            self.reset_resident_board().unwrap_or_else(|error| panic!("REX3 {error}"));
+            return;
+        }
+        self.reset_registers();
+        self.with_cpu_rgb_write(|fb| fb.fill(0));
+        unsafe { (*self.fb_aux.get()).fill(0); }
+        self.mark_framebuffer_full(DamagePlane::Rgb);
+        self.mark_framebuffer_full(DamagePlane::Aux);
     }
 }
 
@@ -5873,6 +5970,10 @@ fn save_rex3_context(ctx: &Rex3Context) -> toml::Value {
     tbl.insert("slopegrn".into(),   hex_u32(ctx.slopegrn as u32));
     tbl.insert("slopeblue".into(),  hex_u32(ctx.slopeblue as u32));
     tbl.insert("host_shifter".into(), hex_u64(ctx.host_shifter));
+    tbl.insert("hostrw0".into(), hex_u64(ctx.hostrw[0]));
+    tbl.insert("pat_bit".into(), hex_u8(ctx.pat_bit));
+    tbl.insert("zpat_bit".into(), hex_u8(ctx.zpat_bit));
+    tbl.insert("mid_primitive".into(), hex_u8(u8::from(ctx.mid_primitive)));
     tbl.insert("drawmode0".into(), hex_u32(ctx.drawmode0.0));
     tbl.insert("drawmode1".into(), hex_u32(ctx.drawmode1.0));
     tbl.insert("lsmode".into(),    hex_u32(ctx.lsmode.0));
@@ -5908,6 +6009,13 @@ fn load_rex3_context(ctx: &mut Rex3Context, v: &toml::Value) {
     if let Some(x) = get_field(v, "slopegrn")   { ctx.slopegrn   = toml_u32(x).unwrap_or(0) as i32; }
     if let Some(x) = get_field(v, "slopeblue")  { ctx.slopeblue  = toml_u32(x).unwrap_or(0) as i32; }
     if let Some(x) = get_field(v, "host_shifter") { ctx.host_shifter = toml_u64(x).unwrap_or(0); }
+    if let Some(x) = get_field(v, "hostrw0") {
+        ctx.hostrw[0] = toml_u64(x).unwrap_or(0);
+        ctx.hostrw_arm_single();
+    }
+    if let Some(x) = get_field(v, "pat_bit") { ctx.pat_bit = toml_u8(x).unwrap_or(0); }
+    if let Some(x) = get_field(v, "zpat_bit") { ctx.zpat_bit = toml_u8(x).unwrap_or(0); }
+    if let Some(x) = get_field(v, "mid_primitive") { ctx.mid_primitive = toml_u8(x).unwrap_or(0) != 0; }
     if let Some(x) = get_field(v, "drawmode0")    { ctx.drawmode0.0 = toml_u32(x).unwrap_or(0); }
     if let Some(x) = get_field(v, "drawmode1")    { ctx.drawmode1.0 = toml_u32(x).unwrap_or(0); }
     if let Some(x) = get_field(v, "lsmode")       { ctx.lsmode.0    = toml_u32(x).unwrap_or(0); }
@@ -5915,10 +6023,8 @@ fn load_rex3_context(ctx: &mut Rex3Context, v: &toml::Value) {
     if let Some(x) = get_field(v, "bresrndinc2")  { ctx.bresrndinc2.0 = toml_u32(x).unwrap_or(0); }
 }
 
-impl Saveable for Rex3 {
-    fn save_state(&self) -> toml::Value {
-        #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("state snapshots").unwrap();
+impl Rex3 {
+    fn save_state_fields(&self) -> toml::Value {
         let mut tbl = toml::map::Map::new();
 
         // Drawing context
@@ -5982,9 +6088,7 @@ impl Saveable for Rex3 {
         toml::Value::Table(tbl)
     }
 
-    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        #[cfg(all(test, feature = "wgpu"))]
-        self.reject_resident_operation("state restores")?;
+    fn load_state_fields(&self, v: &toml::Value) {
         if let Some(ctx_v) = get_field(v, "context") {
             let ctx = unsafe { &mut *self.context.get() };
             load_rex3_context(ctx, ctx_v);
@@ -5997,6 +6101,7 @@ impl Saveable for Rex3 {
             if let Some(x) = get_field(cfg_v, "dcbmode")  { dcb.dcbmode  = toml_u32(x).unwrap_or(0); }
             if let Some(x) = get_field(cfg_v, "dcbdata0") { dcb.dcbdata0 = toml_u32(x).unwrap_or(0); }
             if let Some(x) = get_field(cfg_v, "dcbdata1") { dcb.dcbdata1 = toml_u32(x).unwrap_or(0); }
+            dcb.backbusy_until = None;
         }
 
         if let Some(vv) = get_field(v, "vc2") {
@@ -6031,6 +6136,24 @@ impl Saveable for Rex3 {
         self.gfifo.reset();
         self.gfxbusy.store(false, Ordering::Relaxed);
 
+    }
+}
+
+impl Saveable for Rex3 {
+    fn save_state(&self) -> toml::Value {
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.resident_frame.is_active() {
+            return self.snapshot_resident_registers().unwrap_or_else(|error| panic!("REX3 {error}"));
+        }
+        self.save_state_fields()
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        #[cfg(all(test, feature = "wgpu"))]
+        if self.resident_frame.is_active() {
+            return self.stage_resident_registers(v);
+        }
+        self.load_state_fields(v);
         Ok(())
     }
 }
@@ -6041,6 +6164,7 @@ fn save_xmap9(xmap: &crate::dev::ng1::xmap9::Xmap9) -> toml::Value {
     tbl.insert("cursor_cmap_msb".into(),  hex_u32(xmap.cursor_cmap_msb as u32));
     tbl.insert("popup_cmap_msb".into(),   hex_u32(xmap.popup_cmap_msb  as u32));
     tbl.insert("mode_addr".into(),        hex_u32(xmap.mode_addr       as u32));
+    tbl.insert("fifo_avail".into(),       hex_u32(xmap.fifo_avail      as u32));
     tbl.insert("mode_table".into(), u32_slice_to_toml(&xmap.mode_table));
     toml::Value::Table(tbl)
 }
@@ -6050,6 +6174,7 @@ fn load_xmap9(xmap: &mut crate::dev::ng1::xmap9::Xmap9, v: &toml::Value) {
     if let Some(x) = get_field(v, "cursor_cmap_msb") { xmap.cursor_cmap_msb = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "popup_cmap_msb")  { xmap.popup_cmap_msb  = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "mode_addr")       { xmap.mode_addr       = toml_u32(x).unwrap_or(0) as u8; }
+    if let Some(x) = get_field(v, "fifo_avail")      { xmap.fifo_avail      = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(r) = get_field(v, "mode_table")      { load_u32_slice(r, &mut xmap.mode_table); }
     xmap.dirty = true;
 }
@@ -6058,7 +6183,11 @@ fn save_cmap(cmap: &crate::dev::ng1::cmap::Cmap) -> toml::Value {
     let mut tbl = toml::map::Map::new();
     tbl.insert("addr_lo".into(),   hex_u32(cmap.addr_lo  as u32));
     tbl.insert("addr_hi".into(),   hex_u32(cmap.addr_hi  as u32));
+    tbl.insert("rgb_counter".into(), hex_u32(cmap.rgb_counter as u32));
+    tbl.insert("red_temp".into(), hex_u32(cmap.red_temp as u32));
+    tbl.insert("green_temp".into(), hex_u32(cmap.green_temp as u32));
     tbl.insert("command".into(),   hex_u32(cmap.command  as u32));
+    tbl.insert("revision".into(),  hex_u32(cmap.revision as u32));
     tbl.insert("palette".into(), u32_slice_to_toml(&cmap.palette));
     toml::Value::Table(tbl)
 }
@@ -6066,7 +6195,11 @@ fn save_cmap(cmap: &crate::dev::ng1::cmap::Cmap) -> toml::Value {
 fn load_cmap(cmap: &mut crate::dev::ng1::cmap::Cmap, v: &toml::Value) {
     if let Some(x) = get_field(v, "addr_lo")  { cmap.addr_lo  = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "addr_hi")  { cmap.addr_hi  = toml_u32(x).unwrap_or(0) as u8; }
+    if let Some(x) = get_field(v, "rgb_counter") { cmap.rgb_counter = toml_u32(x).unwrap_or(0) as u8; }
+    if let Some(x) = get_field(v, "red_temp") { cmap.red_temp = toml_u32(x).unwrap_or(0) as u8; }
+    if let Some(x) = get_field(v, "green_temp") { cmap.green_temp = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "command")  { cmap.command  = toml_u32(x).unwrap_or(0) as u8; }
+    if let Some(x) = get_field(v, "revision") { cmap.revision = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(r) = get_field(v, "palette")  { load_u32_slice(r, &mut cmap.palette); }
     cmap.dirty = true;
 }

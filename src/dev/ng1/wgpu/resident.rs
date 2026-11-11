@@ -51,7 +51,7 @@ use super::line::{prepare_copy_line, prepare_host_line, prepare_line};
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
-const PLANE_WORDS: usize = (STRIDE * HEIGHT) as usize;
+pub(crate) const PLANE_WORDS: usize = (STRIDE * HEIGHT) as usize;
 const PLANE_BYTES: u64 = PLANE_WORDS as u64 * size_of::<u32>() as u64;
 const READBACK_BYTES: u64 = 2 * PLANE_BYTES;
 const MAX_SLOTS: u32 = 1024;
@@ -200,6 +200,22 @@ impl Observation {
     pub(crate) fn aux(&self) -> Option<&[u8]> { self.aux.as_deref() }
     pub(crate) fn rgb_generation(&self) -> Option<Position> { self.rgb_generation }
     pub(crate) fn aux_generation(&self) -> Option<Position> { self.aux_generation }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        reason: ObservationReason,
+        planes: PlaneMask,
+        rgb: Option<Vec<u8>>,
+        aux: Option<Vec<u8>>,
+    ) -> Self {
+        let position = ResidentStatus::for_test().accepted;
+        Self {
+            position, reason, planes,
+            rgb_generation: rgb.as_ref().map(|_| position),
+            aux_generation: aux.as_ref().map(|_| position),
+            rgb, aux,
+        }
+    }
 }
 
 /// Counts observations and their selected full-plane transfers separately.
@@ -289,7 +305,7 @@ pub(crate) struct ResidentStatus {
     pub(crate) aux: PlaneStatus,
     pub(crate) initialization_uploads: u32,
     pub(crate) initialization_bytes: u64,
-    /// Successfully queued restore-prefix uploads, not GPU completions.
+    /// Successfully completed restore-prefix uploads.
     pub(crate) restore_uploads: u64,
     pub(crate) restore_bytes: u64,
     /// Cumulative across resets and restores for this backend instance.
@@ -573,7 +589,7 @@ pub(crate) trait ResidentBackend: Send {
     }
 
     /// With GFIFO and scanout quiescent, discard the old stream and seed new
-    /// planes from the board's complete CPU-shadow allocations.
+    /// planes from the supplied complete data, without acknowledging shadows.
     fn reset(&mut self, _rgb: &[u32], _aux: &[u32]) -> Result<(), ResidentError> {
         Err(ResidentError::Unsupported("reset"))
     }
@@ -808,6 +824,7 @@ impl ResidentRaster {
         match self.backend.reset(rgb, aux) {
             Ok(()) => {
                 self.fault = None;
+                self.host_read = HostReadSnapshot::default();
                 Ok(())
             }
             Err(error) => {
@@ -818,7 +835,9 @@ impl ResidentRaster {
     }
 
     pub(crate) fn restore(&mut self, rgb: &[u32], aux: &[u32]) -> Result<(), ResidentError> {
-        self.run(|backend| backend.restore(rgb, aux))
+        self.run(|backend| backend.restore(rgb, aux))?;
+        self.host_read = HostReadSnapshot::default();
+        Ok(())
     }
 
     pub(in crate::dev::ng1) fn scanout_bindings(
@@ -1695,14 +1714,27 @@ impl ResidentBackend for ResidentGpu {
     }
 
     fn reset(&mut self, rgb: &[u32], aux: &[u32]) -> Result<(), ResidentError> {
-        let replacement = Self::activate_with_limits(
+        let rgb_is_shadow = rgb.as_ptr() as usize == self.rgb_shadow;
+        let aux_is_shadow = aux.as_ptr() as usize == self.aux_shadow;
+        let progress = Arc::new(Mutex::new(self.progress.lock().clone()));
+        let mut replacement = Self::activate_with_limits(
             Arc::clone(&self.gpu),
             rgb,
             aux,
             self.max_slots,
             self.max_sets,
-            Some((Arc::clone(&self.progress), self.readback.clone())),
+            Some((progress, self.readback.clone())),
         )?;
+        replacement.gpu.wait(None).map_err(gpu_error)?;
+        replacement.rgb_shadow = self.rgb_shadow;
+        replacement.aux_shadow = self.aux_shadow;
+        {
+            let mut status = replacement.progress.lock();
+            if !rgb_is_shadow { status.rgb.cpu_shadow = None; }
+            if !aux_is_shadow { status.aux.cpu_shadow = None; }
+            let seed = status.submitted;
+            status.confirm(seed);
+        }
         *self = replacement;
         Ok(())
     }
@@ -1713,18 +1745,19 @@ impl ResidentBackend for ResidentGpu {
         let epoch = next_epoch()?;
         let rgb_words = rgb.len().min(PLANE_WORDS);
         let aux_words = aux.len().min(PLANE_WORDS);
-        let next = self.progress.lock().restored(epoch, rgb_words, aux_words)?;
+        let mut next = self.progress.lock().restored(epoch, rgb_words, aux_words)?;
         if rgb_words != 0 {
             self.gpu.write(&self.planes.rgb, 0, bytemuck::cast_slice(&rgb[..rgb_words]));
         }
         if aux_words != 0 {
             self.gpu.write(&self.planes.aux, 0, bytemuck::cast_slice(&aux[..aux_words]));
         }
-        self.gpu.submit(self.gpu.encoder("resident rex3 restore"));
+        let submission = self.gpu.submit(self.gpu.encoder("resident rex3 restore"));
+        self.gpu.wait(Some(submission)).map_err(gpu_error)?;
         let seed = next.submitted;
+        next.confirm(seed);
         *self.progress.lock() = next;
-        record_completion(&self.gpu, &self.progress, seed);
-        self.gpu.check().map_err(gpu_error)
+        Ok(())
     }
 
     fn scanout_bindings(

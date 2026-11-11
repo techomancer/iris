@@ -18,7 +18,7 @@ use crate::dev::ng1::rex3::{
 };
 use crate::dev::ng1::rex3_generic::{draw_with_fb, fline_setup, Framebuffers};
 use crate::dev::ng1::rex3_shape;
-use crate::traits::{BusDevice, Device, Resettable, BUS_BUSY, BUS_OK};
+use crate::traits::{BusDevice, Device, Resettable, Saveable, BUS_BUSY, BUS_OK};
 use crate::wgpu::GpuOptions;
 
 fn on_large_stack(f: impl FnOnce() + Send + 'static) {
@@ -972,7 +972,8 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
         assert!(after_reset.rgb.cpu_shadow_current() && after_reset.aux.cpu_shadow_current());
         let completed = after_reset.completed;
         progress.lock().confirm(old_position);
-        assert_eq!(progress.lock().completed, completed, "stale completion changed reset status");
+        resident.progress.lock().confirm(old_position);
+        assert_eq!(resident.status().unwrap().completed, completed, "stale completion changed reset status");
         let reset_seed = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
         compare_observed(reset_seed.rgb().unwrap(), &seed_rgb, "reset RGB seed");
         compare_observed(reset_seed.aux().unwrap(), &seed_aux, "reset aux seed");
@@ -3806,6 +3807,189 @@ impl ResidentBackend for SharedResident {
 }
 
 #[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_gpu_snapshot_restore_reset_round_trip_without_cpu_shadows() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x3487_5612);
+        let seed_aux = seeded_plane(0xabcd_9876);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut rex = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        rex.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
+        rex.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
+        rex.0.fb_rgb.get_mut().isolate().unwrap();
+        rex.0.fb_aux.get_mut().isolate().unwrap();
+        rex.0.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+        rex.0.fb_rgb.get_mut().reset_access_counts();
+        rex.0.fb_aux.get_mut().reset_access_counts();
+        let rgb_guard = unsafe { (&*rex.0.fb_rgb.get()).protect() }.unwrap();
+        let aux_guard = unsafe { (&*rex.0.fb_aux.get()).protect() }.unwrap();
+        let original_binding = rex.0.resident_scanout_bindings(&gpu).unwrap();
+        rex.0.start();
+        let cases = [
+            (DRAWMODE1_PLANES_RGB, true, (10, 20), (22, 23), 0x7f33_2211),
+            (DRAWMODE1_PLANES_CID, false, (12, 21), (18, 24), 0x0000_0003),
+        ];
+        write_reg(&rex.0, REX3_CLIPMODE, 0xf << CLIPMODE_CIDMATCH_SHIFT, false);
+        for (plane, rgbmode, start, end, color) in cases {
+            let mut draw = context(plane, rgbmode, false, start, end, u32::MAX, color);
+            draw.drawmode0.0 |= 1 << 5;
+            enqueue_context(&rex.0, &draw, start, end);
+            cpu_draw(&mut draw, &mut expected_rgb, &mut expected_aux);
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rex.0.snapshot_framebuffers_inmem()
+        })).is_err());
+        rex.0.stop();
+        let before = rex.0.resident_status().unwrap();
+        assert_eq!(before.accepted.sequence, Sequence(2));
+        assert!(!before.rgb.cpu_shadow_current() && !before.aux.cpu_shadow_current());
+        let ctx = unsafe { &mut *rex.0.context.get() };
+        ctx.hostrw[0] = 0x1234_5678_9abc_def0;
+        ctx.host_shifter = 0xfedc_ba98_7654_3210;
+        ctx.hostcnt = 5;
+        ctx.pat_bit = 9;
+        ctx.zpat_bit = 3;
+        ctx.mid_primitive = true;
+        rex.0.cmap0.lock().rgb_counter = 2;
+        let registers = rex.0.save_state();
+        let (rgb, aux) = rex.0.snapshot_framebuffers_inmem();
+        compare_plane(&rgb, &expected_rgb, "snapshot RGB");
+        compare_plane(&aux, &expected_aux, "snapshot aux");
+        let observed = rex.0.resident_status().unwrap();
+        let counts = observed.observations.for_reason(ObservationReason::Snapshot);
+        assert_eq!((counts.attempts, counts.successes), (1, 1));
+        assert_eq!((counts.successful_transfers, counts.successful_bytes), (2, 2 * PLANE_BYTES));
+        assert_eq!(observed.completed, Some(observed.submitted));
+        assert_eq!((observed.rgb.cpu_shadow, observed.aux.cpu_shadow), (before.rgb.cpu_shadow, before.aux.cpu_shadow));
+
+        rex.0.power_on();
+        let reset = rex.0.resident_status().unwrap();
+        assert_ne!(reset.accepted.epoch, original_binding.epoch);
+        assert_eq!((reset.rgb.cpu_shadow, reset.aux.cpu_shadow), (None, None));
+        let (reset_rgb, reset_aux) = rex.0.snapshot_framebuffers_inmem();
+        assert!(reset_rgb.iter().all(|&word| word == 0));
+        assert!(reset_aux.iter().all(|&word| word == 0));
+
+        rex.0.restore_framebuffers_inmem(&rgb, &aux);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rex.0.start())).is_err());
+        rex.0.load_state(&registers).unwrap();
+        let restored = rex.0.resident_status().unwrap();
+        assert_ne!(restored.accepted.epoch, reset.accepted.epoch);
+        assert_eq!(restored.completed, Some(restored.submitted));
+        assert_eq!((restored.rgb.cpu_shadow, restored.aux.cpu_shadow), (None, None));
+        assert_eq!(restored.restore_uploads, 2);
+        assert_eq!(rex.0.resident_scanout_bindings(&gpu).unwrap().epoch, restored.accepted.epoch);
+        assert_eq!(rex.0.save_state(), registers);
+        let (restored_rgb, restored_aux) = rex.0.snapshot_framebuffers_inmem();
+        compare_plane(&restored_rgb, &expected_rgb, "restored RGB");
+        compare_plane(&restored_aux, &expected_aux, "restored aux");
+
+        rex.0.start();
+        let start = (30, 40);
+        let end = (35, 44);
+        let mut draw = context(DRAWMODE1_PLANES_RGB, true, false, start, end, u32::MAX, 0x4499_8877);
+        draw.drawmode0.0 |= 1 << 5;
+        enqueue_context(&rex.0, &draw, start, end);
+        cpu_draw(&mut draw, &mut expected_rgb, &mut expected_aux);
+        rex.0.stop();
+        let (resumed_rgb, resumed_aux) = rex.0.snapshot_framebuffers_inmem();
+        compare_plane(&resumed_rgb, &expected_rgb, "resumed RGB");
+        compare_plane(&resumed_aux, &expected_aux, "resumed aux");
+        assert_eq!(unsafe { (&*rex.0.fb_rgb.get()).access_counts() }, Default::default());
+        assert_eq!(unsafe { (&*rex.0.fb_aux.get()).access_counts() }, Default::default());
+        drop(aux_guard);
+        drop(rgb_guard);
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_gpu_hostw_continues_across_snapshot_restore() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x1357_2468);
+        let seed_aux = seeded_plane(0x8642_7531);
+        let mut resident = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut cpu = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        for board in [&mut resident, &mut cpu] {
+            board.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
+            board.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
+        }
+        #[cfg(feature = "rex-jit")]
+        cpu.0.jit_enabled.store(false, Ordering::Relaxed);
+        resident.0.fb_rgb.get_mut().isolate().unwrap();
+        resident.0.fb_aux.get_mut().isolate().unwrap();
+        resident.0.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+        resident.0.fb_rgb.get_mut().reset_access_counts();
+        resident.0.fb_aux.get_mut().reset_access_counts();
+        let rgb_guard = unsafe { (&*resident.0.fb_rgb.get()).protect() }.unwrap();
+        let aux_guard = unsafe { (&*resident.0.fb_aux.get()).protect() }.unwrap();
+        resident.0.start();
+        cpu.0.start();
+
+        let start = (100, 100);
+        let end = (115, 100);
+        let mut transfer = context(DRAWMODE1_PLANES_RGB, true, false, start, end, u32::MAX, 0);
+        transfer.drawmode0.0 |= 1 << 6;
+        transfer.drawmode0.0 &= !(1 << 9);
+        transfer.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        let host_go = (REX3_BASE | 0x0800 | REX3_HOSTRW0) as u64;
+        let send = |board: &Rex3, word: u64| loop {
+            match board.write64(host_go, word) {
+                BUS_OK => break,
+                BUS_BUSY => std::thread::yield_now(),
+                status => panic!("HostW continuation producer failed: {status:#x}"),
+            }
+        };
+        for board in [&resident.0, &cpu.0] {
+            write_reg(board, REX3_DRAWMODE1, transfer.drawmode1.0, false);
+            write_reg(board, REX3_WRMASK, transfer.wrmask, false);
+            write_reg(board, REX3_CLIPMODE, transfer.clipmode, false);
+            write_reg(board, REX3_XYSTARTI, xy(start.0, start.1), false);
+            write_reg(board, REX3_XYENDI, xy(end.0, end.1), false);
+            write_reg(board, REX3_DRAWMODE0, transfer.drawmode0.0, false);
+            send(board, 0x1020_3040_5060_7080);
+        }
+        resident.0.wait_resident_idle().unwrap();
+        cpu.0.wait_idle();
+        assert_context_eq(
+            unsafe { &*resident.0.context.get() }, unsafe { &*cpu.0.context.get() }, "before HostW checkpoint",
+        );
+        assert!(unsafe { (*resident.0.context.get()).mid_primitive });
+        resident.0.stop();
+        let registers = resident.0.save_state();
+        let (rgb, aux) = resident.0.snapshot_framebuffers_inmem();
+        compare_plane(&rgb, unsafe { &*cpu.0.fb_rgb.get() }, "HostW checkpoint RGB");
+        compare_plane(&aux, unsafe { &*cpu.0.fb_aux.get() }, "HostW checkpoint aux");
+        resident.0.power_on();
+        resident.0.load_state(&registers).unwrap();
+        resident.0.restore_framebuffers_inmem(&rgb, &aux);
+        assert_context_eq(
+            unsafe { &*resident.0.context.get() }, unsafe { &*cpu.0.context.get() }, "restored HostW checkpoint",
+        );
+
+        resident.0.start();
+        send(&resident.0, 0x90a0_b0c0_d0e0_f001);
+        send(&cpu.0, 0x90a0_b0c0_d0e0_f001);
+        resident.0.wait_resident_idle().unwrap();
+        cpu.0.wait_idle();
+        assert_context_eq(
+            unsafe { &*resident.0.context.get() }, unsafe { &*cpu.0.context.get() }, "resumed HostW",
+        );
+        resident.0.stop();
+        let (rgb, aux) = resident.0.snapshot_framebuffers_inmem();
+        compare_plane(&rgb, unsafe { &*cpu.0.fb_rgb.get() }, "resumed HostW RGB");
+        compare_plane(&aux, unsafe { &*cpu.0.fb_aux.get() }, "resumed HostW aux");
+        assert_eq!(unsafe { (&*resident.0.fb_rgb.get()).access_counts() }, Default::default());
+        assert_eq!(unsafe { (&*resident.0.fb_aux.get()).access_counts() }, Default::default());
+        drop(aux_guard);
+        drop(rgb_guard);
+    });
+}
+
+#[test]
 #[ignore = "requires the requested conformant host GPU"]
 fn resident_gpu_gfifo_draws_match_complete_cpu_planes() {
     on_large_stack(|| {
@@ -4047,7 +4231,7 @@ fn resident_gpu_gfifo_activation_reset_and_fault() {
         assert_ne!(reset.accepted.epoch, initial.accepted.epoch);
         assert_ne!(rex.0.resident_scanout_bindings(&gpu).unwrap().epoch, initial_bindings.epoch);
         assert_eq!(reset.accepted.sequence, Sequence(0));
-        assert!(reset.rgb.cpu_shadow_current() && reset.aux.cpu_shadow_current());
+        assert!(!reset.rgb.cpu_shadow_current() && !reset.aux.cpu_shadow_current());
         let reset_cpu_rgb = unsafe { (*rex.0.fb_rgb.get())[20 * STRIDE as usize + 10] };
         rex.0.start();
         write_reg(
@@ -4152,6 +4336,6 @@ fn resident_gpu_gfifo_activation_reset_and_fault() {
         let recovered = rex.0.resident_status().unwrap();
         assert_ne!(recovered.accepted.epoch, reset.accepted.epoch);
         assert_eq!(recovered.accepted.sequence, Sequence(0));
-        assert!(recovered.rgb.cpu_shadow_current() && recovered.aux.cpu_shadow_current());
+        assert!(!recovered.rgb.cpu_shadow_current() && !recovered.aux.cpu_shadow_current());
     });
 }

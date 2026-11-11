@@ -364,19 +364,20 @@ mod resident_gate_tests {
     }
 
     #[test]
-    fn resident_gate_rejects_unimplemented_cpu_plane_operations() {
+    fn resident_gate_rejects_unsupported_observers_and_invalid_restores() {
         with_big_stack(|| {
             let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
             let before = unsafe { (*rex.fb_rgb.get())[0] };
             unsafe { (*rex.context.get()).colorred = 0x1234; }
             rex.attach_resident_raster(probe(Ok(())).0).unwrap();
             let path = std::path::Path::new(".");
-            assert!(rex.save_framebuffers_named(path, "unused").is_err());
-            assert!(rex.load_framebuffers_named(path, "unused").is_err());
             assert!(rex.dump_framebuffer_debug(path).is_err());
             assert!(rex.load_state(&toml::Value::Table(Default::default())).is_err());
             assert!(rex.execute_command("rex", &["fbdump"], Box::new(std::io::sink())).is_err());
             assert!(rex.gfifo.is_empty());
+            assert!(rex.save_state().get("context").is_some());
+            assert!(rex.save_framebuffers_named(path, "unused").is_err());
+            assert!(rex.load_framebuffers_named(path, "unused").is_err());
 
             let rejected = |operation: &dyn Fn()| {
                 assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err());
@@ -385,7 +386,7 @@ mod resident_gate_tests {
             rejected(&|| rex.restore_framebuffers_inmem(&[0], &[0]));
             rejected(&|| rex.power_on());
             rejected(&|| { let _ = rex.save_state(); });
-            rex.wait_resident_idle().unwrap();
+            assert!(rex.wait_resident_idle().is_err());
             #[cfg(feature = "gputrace")]
             {
                 assert!(rex.set_recording(None, false).is_err());
@@ -745,18 +746,18 @@ mod resident_gate_tests {
             let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
             rex.attach_resident_raster(ResetBackend).unwrap();
             rex.start();
-            while rex.processor_unparker.get().is_none() {
+            while rex.resident_unparker.lock().is_none() {
                 std::thread::yield_now();
             }
-            let first = rex.processor_unparker.get().unwrap().id();
+            let first = rex.resident_unparker.lock().as_ref().unwrap().id();
             rex.stop();
             rex.reset_resident_gpu().unwrap();
-            assert!(rex.processor_unparker.get().is_none());
+            assert!(rex.resident_unparker.lock().is_none());
             rex.start();
-            while rex.processor_unparker.get().is_none() {
+            while rex.resident_unparker.lock().is_none() {
                 std::thread::yield_now();
             }
-            assert_ne!(rex.processor_unparker.get().unwrap().id(), first);
+            assert_ne!(rex.resident_unparker.lock().as_ref().unwrap().id(), first);
             rex.stop();
         });
     }
@@ -804,9 +805,9 @@ fn test_hostr_board_ports_and_batch_retirement() {
         let rex = TestBoard::new(Arc::<Rex3>::from(rex));
 
         rex.gfifo_push(REX3_WRMASK, 0);
-        assert_eq!(rex.read32(set_addr(REX3_HOSTRW0)).status, BUS_BUSY);
-        assert_eq!(rex.read32(go_addr(REX3_HOSTRW1)).status, BUS_BUSY);
-        assert_eq!(rex.read64(go_addr(REX3_HOSTRW0)).status, BUS_BUSY);
+        assert_eq!(rex.read32(set_addr(REX3_HOSTRW0)).status, BUS_ERR);
+        assert_eq!(rex.read32(go_addr(REX3_HOSTRW1)).status, BUS_ERR);
+        assert_eq!(rex.read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
         assert_eq!(rex.gfifo.len(), 1, "busy reads must not enqueue GO");
         let mut not_started = [LATCH; 2];
         assert_eq!(rex.dma_read64(go_addr(REX3_HOSTRW0)).status, BUS_ERR);
@@ -9660,6 +9661,46 @@ fn fill_24bpp_and_sample(rex: &Rex3, dm1: u32) -> u32 {
     reg(rex, REX3_XYSTARTI,  xy(0, 0));
     reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
     read_pixel(rex, 0, 0)
+}
+
+#[test]
+fn cpu_saveable_restores_partial_command_and_palette_state() {
+    with_big_stack(|| {
+        let rex = make_rex3_unstarted();
+        let ctx = unsafe { &mut *rex.context.get() };
+        ctx.hostrw[0] = 0x1234_5678_9abc_def0;
+        ctx.host_shifter = 0xfedc_ba98_7654_3210;
+        ctx.hostcnt = 5;
+        ctx.pat_bit = 7;
+        ctx.zpat_bit = 11;
+        ctx.mid_primitive = true;
+        {
+            let mut cmap = rex.cmap0.lock();
+            cmap.addr_lo = 3;
+            cmap.write_crs(crate::dev::ng1::cmap::CMAP_REG_PALETTE, 0x12);
+            cmap.write_crs(crate::dev::ng1::cmap::CMAP_REG_PALETTE, 0x34);
+        }
+        let saved = rex.save_state();
+        rex.power_on();
+        rex.load_state(&saved).unwrap();
+        assert_eq!(rex.save_state(), saved);
+        {
+            let mut cmap = rex.cmap0.lock();
+            cmap.write_crs(crate::dev::ng1::cmap::CMAP_REG_PALETTE, 0x56);
+            assert_eq!(cmap.palette[3], 0x563412);
+        }
+
+        let mut old = saved;
+        for field in ["hostrw0", "host_shifter", "pat_bit", "zpat_bit", "mid_primitive"] {
+            old["context"].as_table_mut().unwrap().remove(field);
+        }
+        for section in ["cmap0", "cmap1"] {
+            for field in ["rgb_counter", "red_temp", "green_temp"] {
+                old[section].as_table_mut().unwrap().remove(field);
+            }
+        }
+        rex.load_state(&old).unwrap();
+    });
 }
 
 /// After reset, DRAWMODE1 is at IRIS's reset value, not the hardware's.
