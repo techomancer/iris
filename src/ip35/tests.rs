@@ -639,10 +639,10 @@ fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
     config.fuel.l1_log = config.serial_log.clone();
     for (console, selection) in [FuelConsole::L1, FuelConsole::Ioc3A, FuelConsole::Ioc3B].into_iter().enumerate() {
         config.fuel.console = selection;
-        crate::ip34_machine::FuelMachine::connect_serial_for_test(&config, &board, console).unwrap();
+        crate::ip34_machine::FuelMachine::connect_serial(&config, &board, console).unwrap();
     }
     config.ci = false;
-    crate::ip34_machine::FuelMachine::connect_serial_for_test(&config, &board, 0).unwrap();
+    crate::ip34_machine::FuelMachine::connect_serial(&config, &board, 0).unwrap();
 }
 
 fn fuel_with_graphics(graphics: crate::config::GraphicsBoard) -> crate::ip34_machine::FuelBoard {

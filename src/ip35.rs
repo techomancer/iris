@@ -284,5 +284,6 @@ pub(crate) mod inbound;
 pub(crate) mod node;
 pub(crate) mod presence;
 pub(crate) mod routed;
+pub(crate) mod serial;
 #[cfg(test)]
 mod tests;
