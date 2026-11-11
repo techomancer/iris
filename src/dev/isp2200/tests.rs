@@ -34,15 +34,15 @@ const HCCR_PAUSE: u16 = 0x2000;
 const HCCR_RELEASE: u16 = 0x3000;
 const HCCR_PARITY4: u16 = 0x4000;
 const HCCR_PARITY_PAUSE: u16 = 0x4001;
-const HCCR_SET_HOST: u16 = 0x5000;
+pub(crate) const HCCR_SET_HOST: u16 = 0x5000;
 const HCCR_CLEAR_HOST: u16 = 0x6000;
-const HCCR_CLEAR_RISC: u16 = 0x7000;
+pub(crate) const HCCR_CLEAR_RISC: u16 = 0x7000;
 
-const CODE_ORG: u16 = 0x1000;
+pub(crate) const CODE_ORG: u16 = 0x1000;
 
 const MBOX_BUSY: u16 = 0x0004;
 
-pub(super) struct Rig {
+pub(crate) struct Rig {
     pub isp: Isp2200,
     pub mem: Arc<FakeMem>,
     /// The rings the host built: lengths, producer and consumer.
@@ -162,7 +162,7 @@ impl Rig {
 
     /// A stand-in image built to sum to zero over the length in its word 3.
     /// The model never runs it.
-    fn image_word(i: usize) -> u16 {
+    pub(crate) fn image_word(i: usize) -> u16 {
         const IMAGE: [u16; 8] = [0x1234, 0x5678, 0x9abc, 8, 0x1111, 0x2222, 0x3333, 0x0000];
         if i < IMAGE.len() - 1 {
             return IMAGE[i];
@@ -878,11 +878,11 @@ fn firmware_options() {
     r.ack();
 }
 
-const ICB_AT: u32 = 0x3000;
-const RQST_AT: u32 = 0x4000;
-const RESP_AT: u32 = 0x5000;
+pub(crate) const ICB_AT: u32 = 0x3000;
+pub(crate) const RQST_AT: u32 = 0x4000;
+pub(crate) const RESP_AT: u32 = 0x5000;
 
-fn icb_build(rqst_len: u16, resp_len: u16, rqst: u64, resp: u64, options: u16) -> [u8; ICB_SIZE] {
+pub(crate) fn icb_build(rqst_len: u16, resp_len: u16, rqst: u64, resp: u64, options: u16) -> [u8; ICB_SIZE] {
     let mut icb = [0u8; ICB_SIZE];
     icb[0] = 1;
     icb[2..4].copy_from_slice(&options.to_le_bytes());
@@ -1008,31 +1008,31 @@ fn mailbox_storage() {
 }
 
 const ENTRY_CMD32: u8 = ENTRY_TYPE_COMMAND;
-const ENTRY_CMD64: u8 = ENTRY_TYPE_COMMAND_A64;
+pub(crate) const ENTRY_CMD64: u8 = ENTRY_TYPE_COMMAND_A64;
 const ENTRY_CMD_LIST: u8 = ENTRY_TYPE_COMMAND_LIST;
 const ENTRY_CONT32: u8 = ENTRY_TYPE_CONTINUATION;
 const ENTRY_CONT64: u8 = ENTRY_TYPE_CONTINUATION_A64;
-const ENTRY_STATUS: u8 = ENTRY_TYPE_STATUS;
+pub(crate) const ENTRY_STATUS: u8 = ENTRY_TYPE_STATUS;
 const ENTRY_MARKER: u8 = ENTRY_TYPE_MARKER;
 
-type Entry = [u8; ENTRY_SIZE];
+pub(crate) type Entry = [u8; ENTRY_SIZE];
 
-fn p16(e: &mut [u8], off: usize, v: u16) {
+pub(crate) fn p16(e: &mut [u8], off: usize, v: u16) {
     e[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
-fn p32(e: &mut [u8], off: usize, v: u32) {
+pub(crate) fn p32(e: &mut [u8], off: usize, v: u32) {
     e[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 fn p64(e: &mut [u8], off: usize, v: u64) {
     e[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
-fn g16(e: &[u8], off: usize) -> u16 {
+pub(crate) fn g16(e: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([e[off], e[off + 1]])
 }
-fn g32(e: &[u8], off: usize) -> u32 {
+pub(crate) fn g32(e: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(e[off..off + 4].try_into().unwrap())
 }
-fn put_seg64(e: &mut [u8], off: usize, addr: u64, len: u32) {
+pub(crate) fn put_seg64(e: &mut [u8], off: usize, addr: u64, len: u32) {
     p64(e, off, addr);
     p32(e, off + 8, len);
 }
@@ -1041,7 +1041,7 @@ fn put_seg32(e: &mut [u8], off: usize, addr: u32, len: u32) {
     p32(e, off + 4, len);
 }
 
-fn entry_command(kind: u8, handle: u32, loop_id: u8, lun: u16, opcode: u8) -> Entry {
+pub(crate) fn entry_command(kind: u8, handle: u32, loop_id: u8, lun: u16, opcode: u8) -> Entry {
     let mut e = [0u8; ENTRY_SIZE];
     e[0] = kind;
     e[1] = 1;

@@ -158,6 +158,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   slot of an Octane's PCI module or shoehorn (`[[xio_board]]`). One namespace,
   raw or CHD image, optionally copy-on-write ([docs/nvme.md](docs/nvme.md)).
 
+### Fibre Channel
+
+- `[fibre_channel]` fits a QLogic ISP2200 Fibre Channel adapter in an Octane's
+  PCI-module or shoehorn slot; `[fibre_channel.disk.N]` (N the loop ID, 0 to 125) adds its disks.
+
 ### R10000 family
 
 - `cpu` takes the parts each machine shipped with, such as `r12000_360` on the

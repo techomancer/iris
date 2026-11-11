@@ -350,6 +350,7 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 | `scsi wdt [N]` / `scsi wdt file <path>` | WD33C93A transaction ring: last `N` / all to a file **[DEV]** |
 | `scsi debug <on\|off>` | Per-command trace **[DEV]** |
 | `scsi0 ...` / `scsi1 ...` | The same, for controller 0 / controller 1 (Indigo2 and O2) |
+| `scsi2 ...` / `cow2 ...` | The same, for the Fibre Channel adapter's loop (its disks are by loop ID); `scsi2 notes` lists what the driver did that the model does not decode |
 | `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlays (`cow1 ...` on the O2's second controller) |
 
 On the O2 the controllers are Adaptec 7880s: `scsi regs` shows that chip's
