@@ -167,7 +167,14 @@ impl PciConfig {
                 _ => {}
             }
         }
+        // The CardBus CIS pointer and the capabilities pointer are
+        // read-only, and dword 14 is reserved (PCI 2.2, 6.1). The subsystem
+        // IDs in dword 11 are read-only too, but the functions write theirs
+        // at construction.
         let mut writable_masks = [u32::MAX; 64];
+        for reg in [10, 13, 14] {
+            writable_masks[reg] = 0;
+        }
         for register in policy.registers {
             assert!(
                 matches!(register.reg_dword, 10 | 12..=14 | 16..=63),
@@ -461,6 +468,20 @@ mod tests {
         assert_eq!(dst.bar_base(1), 0x8000_1000);
         let other = PciConfig::new(0x1234, 0x5678, 0, 0, [Bar::Unused; 6], 0);
         assert!(other.load_state(&v1).is_err(), "a header loads only into the same kind of function");
+    }
+
+    /// The CardBus CIS pointer and the capabilities pointer are read-only
+    /// in a type 0 header, and dword 14 is reserved: a write leaves them as
+    /// they were, so it cannot give a function a capability list it does
+    /// not have.
+    #[test]
+    fn the_read_only_header_dwords_ignore_writes() {
+        let c = scsi_like();
+        for reg in [10, 13, 14] {
+            c.write(reg, 0x40);
+        }
+        assert_eq!([c.read(10), c.read(13), c.read(14)], [0, 0, 0]);
+        assert_eq!(c.read(1) & 0x0010_0000, 0, "no capability list");
     }
 
     fn nvme_like() -> PciConfig {
