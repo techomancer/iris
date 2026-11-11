@@ -364,6 +364,7 @@ impl ScsiBus {
 mod tests {
     use super::*;
     use crate::scsi::scsi_cmd;
+    use crate::test_temp::{TempImage, TempPath};
 
     const ID: ScsiIdentity = ScsiIdentity::new(b"TEST    ", b"BUS             ", b"1.0 ");
 
@@ -375,10 +376,8 @@ mod tests {
         b.attach_device(id, p.to_str().unwrap(), false, Vec::new(), overlay, None, false)
     }
 
-    fn image(tag: &str, blocks: usize) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("iris-scsibus-{tag}-{}", std::process::id()));
-        std::fs::write(&p, vec![0u8; blocks * 512]).unwrap();
-        p
+    fn image(tag: &str, blocks: usize) -> TempImage {
+        TempImage::file(&format!("scsibus-{tag}"), &vec![0u8; blocks * 512])
     }
 
     fn inquiry() -> ScsiRequest {
@@ -399,7 +398,6 @@ mod tests {
         let r = b.request(3, &inquiry()).expect("target answers").unwrap();
         assert_eq!(&r.data[8..16], b"TEST    ");
         assert!(b.request(2, &inquiry()).is_none(), "an empty id does not answer");
-        std::fs::remove_file(p).unwrap();
     }
 
     #[test]
@@ -409,7 +407,6 @@ mod tests {
         let e = attach(&b, 8, &p, false).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         assert!(attach(&bus(16), 8, &p, false).is_ok(), "a wide bus has id 8");
-        std::fs::remove_file(p).unwrap();
     }
 
     /// A disk's write_cache setting reaches the disk: it decides the WCE
@@ -422,7 +419,6 @@ mod tests {
             b.attach_device(id, p.to_str().unwrap(), false, Vec::new(), false, None, on).unwrap();
             assert_eq!(b.write_cache_reported(id), on, "write_cache = {on}");
         }
-        std::fs::remove_file(p).unwrap();
     }
 
     fn write_block(lba: u32, byte: u8) -> ScsiRequest {
@@ -464,9 +460,6 @@ mod tests {
             assert_eq!(r.data, vec![byte; 512], "block {lba}");
         }
         drop(second);
-        let _ = std::fs::remove_file(format!("{}.overlay", p.display()));
-        let _ = std::fs::remove_file(format!("{}.overlay.dirty", p.display()));
-        std::fs::remove_file(p).unwrap();
     }
 
     /// A guest's SYNCHRONIZE CACHE is its way of asking for the same.
@@ -489,32 +482,27 @@ mod tests {
         let r = second.request(1, &read_block(2)).unwrap().unwrap();
         assert_eq!(r.data, vec![0x77; 512]);
         drop(second);
-        let _ = std::fs::remove_file(format!("{}.overlay", p.display()));
-        let _ = std::fs::remove_file(format!("{}.overlay.dirty", p.display()));
-        std::fs::remove_file(p).unwrap();
     }
 
     #[test]
     fn overlays_export_and_import_by_id() {
-        let b = bus(8);
+        // The guard comes first so the bus, which writes its overlay's record
+        // as it drops, goes before it.
         let p = image("cow", 4);
+        let b = bus(8);
         attach(&b, 2, &p, true).unwrap();
-        let dir = std::env::temp_dir().join(format!("iris-scsibus-ov-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempPath::dir("scsibus-ov");
         let sets = b.export_overlays(&dir).unwrap();
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].0, 2);
         b.import_overlays(&dir, &sets).unwrap();
-        let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_file(format!("{}.overlay", p.display()));
-        std::fs::remove_file(p).unwrap();
     }
 
     #[test]
     fn a_chd_diff_is_counted_and_folded_on_every_bus_given() {
         use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
         use libchdman_rs::CHD_CODEC_ZLIB;
-        let base = std::env::temp_dir().join(format!("iris-scsibus-fold-{}.chd", std::process::id()));
+        let base = TempImage::with_ext("scsibus-fold", "chd");
         let logical = 128 * 1024u64;
         create_from_reader(
             std::io::Cursor::new(vec![0xABu8; logical as usize]),
@@ -545,7 +533,5 @@ mod tests {
         let n = ScsiBus::sync_chd_disks(&[&b0, &b1], None, &mut |_, _, _| {}, &|| false).unwrap();
         assert_eq!(n, 1);
         assert_eq!(b1.pending_chd_sync_count(), 0, "folded");
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
     }
 }
