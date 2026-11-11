@@ -78,7 +78,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
+
+use crate::dev::qlogic_ring::{self, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE, Notes, RingCtl, RingState, RingThread};
 
 use crate::devlog::LogModule;
 use crate::irq::{IrqGuard, IrqMutex};
@@ -194,7 +196,7 @@ pub mod mbox {
     pub const PARAM_ERROR: u16 = 0x4006;
 }
 
-const RAM_WORDS: usize = 0x10000;
+pub(crate) const RAM_WORDS: usize = 0x10000;
 /// The command budget the adapter announces in its firmware status.
 pub const MAX_REQUESTS: u16 = 512;
 pub(crate) const FW_VERSION: [u16; 3] = [1, 0, 0];
@@ -218,14 +220,8 @@ const REQ_OFF_CDB: u64 = 20;
 const CDB_FIELD_LEN: usize = 12;
 const REQ_OFF_SEGS: u64 = 32;
 const REQ_SEGS_INLINE: usize = 4;
-const SEG_SIZE: u64 = 8;
-const CONT_OFF_SEGS: u64 = 8;
-const CONT_SEGS: usize = 7;
 const A64_OFF_SEGS: u64 = 40;
 const A64_SEGS_INLINE: usize = 2;
-const A64_SEG_SIZE: u64 = 12;
-const A64_CONT_OFF_SEGS: u64 = 4;
-const A64_CONT_SEGS: usize = 5;
 
 const SENSE_MAX: usize = 32;
 pub const SCSI_STATUS_SENSE_VALID: u16 = 0x0200;
@@ -283,37 +279,37 @@ struct Pending {
     sense: Vec<u8>,
 }
 
-/// What the request-ring thread and the register side tell each other.
+/// What the request-ring thread and the register side tell each other: the
+/// plumbing every QLogic adapter has ([`RingCtl`], reached through `Deref`)
+/// and what only the ISP1040's ring walk needs.
 #[derive(Default)]
 struct Ctl {
-    /// Bumped by every reset: a command that finishes under another
-    /// generation was cancelled with the chip, and posts nothing.
-    gen: u64,
+    ring: RingCtl,
     /// Bumped when the request ring is replaced (and by a reset): a command
     /// read from the old ring does not advance the new one's consumer.
     rqst_epoch: u64,
     /// Bumped when the response ring is replaced (and by a reset): an entry
     /// written into the old ring is written again into the new one.
     resp_epoch: u64,
-    /// The ring may have entries the thread has not looked at.
-    work: bool,
-    /// The thread is walking the ring.
-    walking: bool,
     /// A command is running with the state unlocked.
     busy: bool,
-    /// Holders that need the thread not to start another command
-    /// (saving and loading state).
-    hold: u32,
-    /// The machine is stopped: the thread takes no further entries.
-    paused: bool,
-    shutdown: bool,
     /// The selection of an absent target the thread is waiting out. It
     /// survives the thread being parked meanwhile.
     selecting: Option<Selection>,
-    /// When the adapter's clock last stopped with the machine, and how long
-    /// it has stood still in all.
-    stopped_at: Option<Instant>,
-    stopped_ns: i64,
+}
+
+impl std::ops::Deref for Ctl {
+    type Target = RingCtl;
+    fn deref(&self) -> &RingCtl { &self.ring }
+}
+
+impl std::ops::DerefMut for Ctl {
+    fn deref_mut(&mut self) -> &mut RingCtl { &mut self.ring }
+}
+
+impl RingState for State {
+    fn ring_ctl(&self) -> &RingCtl { &self.ctl.ring }
+    fn ring_ctl_mut(&mut self) -> &mut RingCtl { &mut self.ctl.ring }
 }
 
 /// A selection of an absent target in progress.
@@ -452,7 +448,7 @@ struct Parked {
 /// adapter state, then the parent's locks, then the processor.
 pub(crate) type Locked<'a> = IrqGuard<'a, State>;
 
-pub(crate) struct State {
+pub struct State {
     pub(crate) reset_targets: bool,
     pub(crate) pending_target_resets: VecDeque<(u8, Option<u8>)>,
     pub(crate) active: Option<(u8, u8, u32)>,
@@ -624,7 +620,6 @@ impl State {
 #[allow(private_bounds)]
 pub struct Isp<P: IspPart> {
     core: Arc<Core<P>>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// The ISP1040.
@@ -636,6 +631,9 @@ impl<P: IspPart> std::ops::Deref for Isp<P> {
     fn deref(&self) -> &Core<P> { &self.core }
 }
 
+/// The state lock, the fence and the thread are the shared [`RingThread`],
+/// reached through `Deref`.
+///
 /// Nothing else is taken with `st` held except the leaf locks (`notes`,
 /// `dma_misses`, `odd_accesses`) and the interrupt line, which is driven
 /// under it and whose parent never calls back down: DMA, either bus and
@@ -644,17 +642,7 @@ impl<P: IspPart> std::ops::Deref for Isp<P> {
 /// neither is held with the other.
 #[allow(private_bounds)]
 pub struct Core<P: IspPart> {
-    st: IrqMutex<State>,
-    /// `st.ctl.gen`, readable without `st`: what a store into guest memory
-    /// checks under `fence`.
-    gen: AtomicU64,
-    /// Held across each store the ring thread makes into guest memory. A
-    /// reset moves the generation on and then passes through it, so once
-    /// the reset returns no store of a cancelled command is under way or
-    /// can start; the reset waits for one store, never for a disk.
-    fence: Mutex<()>,
-    /// Signals [`Ctl`] changes both ways.
-    wake: Condvar,
+    ring: RingThread<State>,
     /// Generation for commands cancelled by aborts without resetting the chip.
     cancel: AtomicU64,
     /// Part policy, shared by register, worker and snapshot paths.
@@ -672,15 +660,17 @@ pub struct Core<P: IspPart> {
     /// `scsi1`/`cow1` the second.
     index: u8,
     pci: PciFunctionState,
-    notes: Mutex<Vec<String>>,
+    notes: Notes,
     dma_misses: Mutex<std::collections::BTreeSet<u64>>,
-    odd_accesses: Mutex<u32>,
+    odd_accesses: AtomicU64,
     /// The status bar's activity bits, shared with the display thread.
     heartbeat: OnceLock<Arc<AtomicU64>>,
-    /// Where the adapter's clock starts.
-    start: Instant,
-    /// When not `i64::MIN`, the clock in nanoseconds, for tests.
-    fake_ns: AtomicI64,
+}
+
+#[allow(private_bounds)]
+impl<P: IspPart> std::ops::Deref for Core<P> {
+    type Target = RingThread<State>;
+    fn deref(&self) -> &RingThread<State> { &self.ring }
 }
 
 fn le16(b: &[u8], off: usize) -> u16 { u16::from_le_bytes([b[off], b[off + 1]]) }
@@ -718,37 +708,20 @@ impl<P: IspPart> Isp<P> {
     /// The controller at `index` with one bus per channel of `part`.
     pub(crate) fn with_part(index: u8, part: P, buses: Box<[ScsiBus]>) -> Self {
         assert_eq!(buses.len(), part.channels(), "one bus per channel");
-        Self { core: Arc::new(Core::new_at(index, part, buses)), worker: Mutex::new(None) }
+        Self { core: Arc::new(Core::new_at(index, part, buses)) }
     }
 
     /// Start the ring thread (idempotent) and let it take whatever was
     /// published while the adapter was stopped.
     fn start_ring(&self) {
-        let mut worker = self.worker.lock();
-        if worker.is_some() {
-            return;
-        }
-        self.lock().ctl.shutdown = false;
-        let c = self.core.clone();
-        *worker = Some(
-            std::thread::Builder::new()
-                .name(format!("{}-{}", self.core.model_name(), self.index))
-                .spawn(move || c.run_ring())
-                .expect("spawn isp1040 thread"),
-        );
-        drop(worker);
-        self.resume();
+        self.ring.start_thread(self.pci.irq_cell(), &self.core, format!("{}-{}", self.core.model_name(), self.index), Core::run_ring);
     }
 
     /// Park the ring between entries, then end and join the thread. A
     /// command in flight finishes and posts first; afterwards nothing
     /// touches guest memory or the interrupt line.
     fn stop_ring(&self) {
-        self.pause();
-        let Some(h) = self.worker.lock().take() else { return };
-        self.lock().ctl.shutdown = true;
-        self.wake.notify_all();
-        let _ = h.join();
+        self.ring.stop_thread(self.pci.irq_cell());
     }
 }
 
@@ -786,28 +759,22 @@ impl<P: IspPart> Drop for Isp<P> {
 impl<P: IspPart> Core<P> {
     fn new_at(index: u8, part: P, buses: Box<[ScsiBus]>) -> Self {
         let st = State::new();
-        let gen = st.ctl.gen;
         let bars = [Bar::Io(reg::WINDOW_SIZE), Bar::Mem(reg::WINDOW_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
         let pci = part.pci_config(bars);
         Self {
             part,
             cancel: AtomicU64::new(0),
-            st: IrqMutex::new(st, State::irq_level),
-            gen: AtomicU64::new(gen),
-            fence: Mutex::new(()),
-            wake: Condvar::new(),
+            ring: RingThread::new(st, State::irq_level),
             buses,
             targets_reset: [AtomicBool::new(false), AtomicBool::new(false)],
             index,
             // BAR 0 is the I/O window and BAR 1 its memory-space alias, one
             // register file.
             pci: PciFunctionState::new(pci),
-            notes: Mutex::new(Vec::new()),
+            notes: Notes::default(),
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
-            odd_accesses: Mutex::new(0),
+            odd_accesses: AtomicU64::new(0),
             heartbeat: OnceLock::new(),
-            start: Instant::now(),
-            fake_ns: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -828,23 +795,6 @@ impl<P: IspPart> Core<P> {
             self.wake.notify_all();
         }
         self.retire_stores();
-    }
-
-    fn publish_gen(&self, st: &State) {
-        self.gen.store(st.ctl.gen, Ordering::Release);
-    }
-
-    /// Wait out a store into guest memory that a cancelled command began
-    /// before the generation moved on; see `fence`.
-    fn retire_stores(&self) {
-        drop(self.fence.lock());
-    }
-
-    /// Run `store` for work of generation `gen`, unless a reset has
-    /// cancelled that work.
-    fn fenced<R>(&self, gen: u64, store: impl FnOnce() -> R) -> Option<R> {
-        let _fence = self.fence.lock();
-        (self.gen.load(Ordering::Acquire) == gen).then(store)
     }
 
     /// Light the status bar's SCSI activity bits in `heartbeat`.
@@ -879,18 +829,6 @@ impl<P: IspPart> Core<P> {
             || (st.ctl.walking && !st.ctl.selecting.as_ref().is_some_and(|sel| self.now_ns(&st) < sel.due))
         {
             st.wait(&self.wake);
-        }
-    }
-
-    /// The adapter's clock in nanoseconds: host wall time less the time the
-    /// machine was stopped.
-    fn now_ns(&self, st: &State) -> i64 {
-        match self.fake_ns.load(Ordering::Relaxed) {
-            i64::MIN => {
-                let at = st.ctl.stopped_at.unwrap_or_else(Instant::now);
-                at.duration_since(self.start).as_nanos() as i64 - st.ctl.stopped_ns
-            }
-            t => t,
         }
     }
 
@@ -993,25 +931,13 @@ impl<P: IspPart> Core<P> {
     /// interrupt until [`Core::resume`]. A command in flight finishes and
     /// posts first.
     pub fn pause(&self) {
-        let mut st = self.lock();
-        st.ctl.paused = true;
-        st.ctl.stopped_at.get_or_insert_with(Instant::now);
-        // Parked mid-selection, the thread lets go of its entry.
-        self.wake.notify_all();
-        while st.ctl.walking {
-            st.wait(&self.wake);
-        }
+        self.ring.pause(self.pci.irq_cell());
     }
 
     /// Let the ring thread run again, taking up whatever was published
     /// while it was paused.
     pub fn resume(&self) {
-        let mut st = self.lock();
-        st.ctl.paused = false;
-        if let Some(t) = st.ctl.stopped_at.take() {
-            st.ctl.stopped_ns += t.elapsed().as_nanos() as i64;
-        }
-        self.kick(&mut st);
+        self.ring.resume(self.pci.irq_cell());
     }
 
     /// A save or a load is waiting for the ring thread (tests).
@@ -1030,23 +956,7 @@ impl<P: IspPart> Core<P> {
     /// and none allowed to start: the quiesce point for saving and loading.
     /// A command in flight posts its completion first.
     fn quiesced<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let mut st = self.lock();
-        st.ctl.hold += 1;
-        self.wake.notify_all();
-        while st.ctl.walking {
-            st.wait(&self.wake);
-        }
-        let r = f(&mut st);
-        st.ctl.hold -= 1;
-        drop(st);
-        self.wake.notify_all();
-        r
-    }
-
-    /// Tell the ring thread the ring may have moved.
-    pub(crate) fn kick(&self, st: &mut State) {
-        st.ctl.work = true;
-        self.wake.notify_all();
+        self.ring.quiesced(self.pci.irq_cell(), f)
     }
 
     /// Commands run, for the whole session.
@@ -1058,14 +968,11 @@ impl<P: IspPart> Core<P> {
     /// width the part does not decode, DMA that is not memory, commands not
     /// modelled).
     pub fn notes(&self) -> Vec<String> {
-        self.notes.lock().clone()
+        self.notes.list()
     }
 
     fn note(&self, what: String) {
-        let mut n = self.notes.lock();
-        if n.len() < 256 {
-            n.push(what);
-        }
+        self.notes.push(what);
     }
 
     // ---- the bus ------------------------------------------------------
@@ -1086,10 +993,6 @@ impl<P: IspPart> Core<P> {
 
     // ---- DMA ---------------------------------------------------------
 
-    fn dma_ok(addr: u64, len: usize) -> bool {
-        addr.checked_add(len as u64).is_some()
-    }
-
     fn dma_miss(&self, addr: u64, write: bool) {
         let first = {
             let mut seen = self.dma_misses.lock();
@@ -1105,16 +1008,15 @@ impl<P: IspPart> Core<P> {
     /// `buf.len()` bytes from bus address `addr`; false (and zeros) if the
     /// fabric refuses any of them.
     fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        let ok = Self::dma_ok(addr, buf.len()) && self.pci.dma().is_some_and(|d| d.dma_read(addr, buf).is_ok());
+        let ok = qlogic_ring::dma_read(&self.pci, true, addr, buf);
         if !ok {
-            buf.iter_mut().for_each(|b| *b = 0);
             self.dma_miss(addr, false);
         }
         ok
     }
 
     fn dma_write(&self, addr: u64, data: &[u8]) -> bool {
-        let ok = Self::dma_ok(addr, data.len()) && self.pci.dma().is_some_and(|d| d.dma_write(addr, data).is_ok());
+        let ok = qlogic_ring::dma_write(&self.pci, true, addr, data);
         if !ok {
             self.dma_miss(addr, true);
         }
@@ -1570,56 +1472,11 @@ impl<P: IspPart> Core<P> {
 
     // ---- requests ----------------------------------------------------
 
-    /// How many bytes a command is declared to move, and whether they go to
-    /// the device. `block` is the target's logical block size. An opcode
-    /// with no rule here moves nothing; the target answers it as SCSI says.
-    fn cdb_transfer(cdb: &[u8], block: usize) -> (usize, bool) {
-        let at = |i: usize| cdb.get(i).copied().unwrap_or(0) as usize;
-        let be16 = |i: usize| (at(i) << 8) | at(i + 1);
-        let be24 = |i: usize| (at(i) << 16) | (at(i + 1) << 8) | at(i + 2);
-        let six = || if at(4) == 0 { 256 } else { at(4) };
-        match cdb[0] {
-            scsi_cmd::READ_6 => (six() * block, false),
-            scsi_cmd::WRITE_6 => (six() * block, true),
-            scsi_cmd::READ_10 => (be16(7) * block, false),
-            scsi_cmd::WRITE_10 => (be16(7) * block, true),
-            scsi_cmd::INQUIRY => (be16(3), false),
-            scsi_cmd::REQUEST_SENSE | scsi_cmd::MODE_SENSE_6 => (at(4), false),
-            scsi_cmd::MODE_SELECT_6 => (at(4), true),
-            scsi_cmd::MODE_SENSE_10
-            | scsi_cmd::READ_TOC_PMA_ATIP
-            | scsi_cmd::GET_CONFIGURATION
-            | scsi_cmd::READ_SUB_CHANNEL
-            | scsi_cmd::READ_DISC_INFORMATION => (be16(7), false),
-            scsi_cmd::MODE_SELECT_10 => (be16(7), true),
-            scsi_cmd::READ_CAPACITY_10 => (8, false),
-            scsi_cmd::READ_BUFFER => (be24(6), false),
-            scsi_cmd::WRITE_BUFFER => (be24(6), true),
-            scsi_cmd::SEND_DIAGNOSTIC => (be16(3), true),
-            scsi_cmd::RECEIVE_DIAGNOSTIC_RESULTS => (be16(3), false),
-            _ => (0, false),
-        }
-    }
-
-    /// One descriptor into the transfer. The descriptors name the host's
-    /// buffer and the command names how much of it the target has to fill,
-    /// so only that much is offered and a longer buffer keeps its tail. The
-    /// whole named length is still counted: the residual is measured against
-    /// it.
-    fn add_segment(segs: &mut Vec<(u64, u32)>, described: &mut u64, max: u64, base: u64, len: u32) {
-        let room = max.saturating_sub(*described);
-        let placed = (len as u64).min(room);
-        *described += len as u64;
-        if placed > 0 {
-            segs.push((base, placed as u32));
-        }
-    }
-
     fn read_segments(&self, ring: &Ring, entry_addr: u64, entry_count: u8, seg_count: u16, max: u64, a64: bool) -> (Vec<(u64, u32)>, u64) {
         let (inline_off, inline_n, seg_size, cont_off, cont_n) = if a64 {
-            (A64_OFF_SEGS, A64_SEGS_INLINE, A64_SEG_SIZE, A64_CONT_OFF_SEGS, A64_CONT_SEGS)
+            (A64_OFF_SEGS, A64_SEGS_INLINE, SEG64_SIZE as u64, CONT_OFF_SEGS64 as u64, CONT_SEGS64)
         } else {
-            (REQ_OFF_SEGS, REQ_SEGS_INLINE, SEG_SIZE, CONT_OFF_SEGS, CONT_SEGS)
+            (REQ_OFF_SEGS, REQ_SEGS_INLINE, SEG32_SIZE as u64, CONT_OFF_SEGS32 as u64, CONT_SEGS32)
         };
         let seg_at = |base: Option<u64>| -> (u64, u32) {
             let field = |off: u64| self.ld32(base.and_then(|b| Self::at(b, off)));
@@ -1635,7 +1492,7 @@ impl<P: IspPart> Core<P> {
         for i in 0..inline_n {
             if collected >= seg_count { break; }
             let (a, l) = seg_at(Self::at(entry_addr, inline_off + i as u64 * seg_size));
-            Self::add_segment(&mut segs, &mut described, max, a, l);
+            qlogic_ring::add_segment(&mut segs, &mut described, max, a, l);
             collected += 1;
         }
         let mut cont_index = ring.cons;
@@ -1646,7 +1503,7 @@ impl<P: IspPart> Core<P> {
             for i in 0..cont_n {
                 if collected >= seg_count { break; }
                 let (a, l) = seg_at(cont_addr.and_then(|c| Self::at(c, cont_off + i as u64 * seg_size)));
-                Self::add_segment(&mut segs, &mut described, max, a, l);
+                qlogic_ring::add_segment(&mut segs, &mut described, max, a, l);
                 collected += 1;
             }
             conts_left -= 1;
@@ -1724,7 +1581,7 @@ impl<P: IspPart> Core<P> {
             .map(|b| b as usize)
             .filter(|&b| b != 0)
             .unwrap_or(BLOCK_SIZE);
-        let (xfer, to_dev) = Self::cdb_transfer(cdb, block);
+        let (xfer, to_dev) = qlogic_ring::cdb_transfer(cdb, block);
         let (segs, described) = self.read_segments(ring, addr, entry_count, seg_count, xfer as u64, a64);
         let target = self.part.target_on(channel as u8, target);
         Prepared::Run(Job { handle, target, cdb: cdb.to_vec(), xfer, to_dev, segs, described })
@@ -2189,14 +2046,7 @@ impl<P: IspPart> Core<P> {
     }
 
     fn odd_access(&self, what: &str, off: u32, width: usize) {
-        let first = {
-            let mut n = self.odd_accesses.lock();
-            *n += 1;
-            *n <= 16
-        };
-        if first {
-            self.note(format!("{width}-byte {what} at {off:#04x} is not decoded"));
-        }
+        self.notes.push_first(&self.odd_accesses, 16, || format!("{width}-byte {what} at {off:#04x} is not decoded"));
     }
 }
 
@@ -2503,4 +2353,4 @@ impl<P: IspPart> Isp<P> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
