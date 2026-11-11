@@ -147,13 +147,38 @@ fn luminance_alpha_and_abgr_images_keep_alpha_and_rgb_stores_255() {
 #[test]
 fn an_x_server_abgr_put_still_stores_255() {
     let (mut s, ram) = window();
-    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, 0x2000_6950, 0] {
+    x_server_put(&mut s, &ram, 0x2000_6950, 0x8263_305a, (200, 300), [0x7f, 0x01, 0x9b, 0xfd]);
+    assert_eq!(pixel(&s, 0, 200, 300), 0xfd9b_01ff);
+}
+
+/// 4Dwm's minimised-window icon, traced on the V12 desktop: the X server
+/// draws the icon's frame in a colour-index window (select word
+/// 0x20086a00, 2-byte index fields), then puts the 24-bit image into the
+/// TrueColor icon window by DMA without selecting again. Word 4 names
+/// 4-byte fields at unit 2, where the window's display mode (0x5215a6)
+/// reads its colour. Packing the put as the index mode's 2-byte field kept
+/// only blue and alpha, and the purple icon showed lime.
+#[test]
+fn an_x_server_put_after_an_index_select_keeps_its_own_field_size() {
+    let (mut s, ram) = window();
+    x_server_put(&mut s, &ram, 0x2008_6a00, 0x8223_305a, (210, 16), [0x00, 0x31, 0x0d, 0x1b]);
+    s.gpu_sync();
+    let shown = crate::dev::odyssey::frame::mode_fields(0x0052_15a6)[0];
+    let rows = Rows::new(s.vram_ptr(), View::colour(&Surface::new(0x2000, 80, 4), shown, MAX_DIM));
+    assert_eq!(rows.load_word(210, 16), Some(0x1b0d_31ff));
+}
+
+/// The X server's one-pixel 24-bit put at (x, y) by DMA, A, B, G, R bytes
+/// `abgr` under code 0x4c and word 4 `word4`, after it selected the screen
+/// with third word `mode`.
+fn x_server_put(s: &mut Board, ram: &Ram, mode: u32, word4: u32, (x, y): (u32, u32), abgr: [u8; 4]) {
+    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, mode, 0] {
         s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
     }
     let table = 0xb80000u64;
     let page = 0xb84000u64;
-    ram.put(page, &[0x7f, 0x01, 0x9b, 0xfd]);
-    let header = [0x2000u32, 300 << 16 | 200, 0x50, 0x10001, 0x8263_305a, 0, 4, 0x3201_004c];
+    ram.put(page, &abgr);
+    let header = [0x2000u32, y << 16 | x, 0x50, 0x10001, word4, 0, 4, 0x3201_004c];
     let mut t = vec![0u8; dma::TABLE_HEADER as usize + 16];
     for (i, w) in header.iter().enumerate() {
         t[i * 4..][..4].copy_from_slice(&w.to_be_bytes());
@@ -161,9 +186,8 @@ fn an_x_server_abgr_put_still_stores_255() {
     t[dma::TABLE_HEADER as usize..][..8].copy_from_slice(&(page << dma::PTE_ADDR_SHIFT | 4).to_be_bytes());
     ram.put(table, &t);
     let half = |h: u64| (h & 0x1ffff) as u32 | ((h & 0xfe_0000) << 6) as u32;
-    cmd64(&mut s, dma::DESC_UPLOAD, half(table >> 24));
-    cmd64(&mut s, half(table & 0xff_ffff), 0);
-    assert_eq!(pixel(&s, 0, 200, 300), 0xfd9b_01ff);
+    cmd64(s, dma::DESC_UPLOAD, half(table >> 24));
+    cmd64(s, half(table & 0xff_ffff), 0);
 }
 
 /// Word 4 of a GL read from the bound read drawable, as the library builds
