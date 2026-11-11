@@ -24,16 +24,22 @@ SystemPartition scsi(0)disk(1)rdisk(0)partition(8)`, `OSLoadPartition
 `console d`, so `login:` arrives on serial; the framebuffer stays dark (irix-install.md §8).
 
 The script then seeds NVRAM again with `console g` and boots a second time.
-The login is drawn on the framebuffer and serial stays silent, so `iris-ci
-screen-wait` polls screenshots until one matches
-`scripts/boot-goldens/indy-irix53.png`. It counts pixels with a channel more
+The login is drawn on the framebuffer, so `iris-ci screen-wait` polls
+screenshots until one matches `scripts/boot-goldens/indy-irix53.png`. Serial is
+not silent on every disk: the stock disk has a getty on `ttyd1`, so `IRIS
+login:` also reaches `serial.log` in this boot (observed 2026-11-10). The disk
+CI used before it rebuilt its kernel on every start and printed nothing on
+serial; that is where the old "serial stays silent" claim came from, and it
+describes that disk, not IRIX. The screen is the check here because it is the
+graphics console's own output. It counts pixels with a channel more
 than 32 away from the golden and allows 128. On the IRIX 5.3 login screen
 the mouse pointer (44) and text cursor (56) account for up to 100 between
 frames, the smallest text, a user name under its icon, is 156, and a missing
 window or a half-drawn screen is hundreds of thousands. The golden must be a
 screenshot of the disk CI boots: a different install shows other users and
-another hostname. To replace it, take `gfx-screen.png` from a failing run's
-`boot-test-*` artifact once you have checked it is the login screen.
+another hostname. The disk is described in
+[ci-irix53-disk.md](ci-irix53-disk.md), which also says how to replace the
+golden.
 
 ## Each check is a JUnit case
 
