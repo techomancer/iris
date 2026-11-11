@@ -139,7 +139,7 @@ pub fn pull(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
     if sv >= 3 {
         let chunks_url = format!("{}/snapshots/{}/chunks.bin", base, name);
         let chunks_bytes = http_get(&chunks_url).map_err(|e| format!("fetch chunks.bin: {}", e))?;
-        let chunks: ChunksManifest = postcard::from_bytes(&chunks_bytes)
+        let chunks = ChunksManifest::from_bytes(&chunks_bytes)
             .map_err(|e| format!("parse chunks.bin: {}", e))?;
         std::fs::write(snap_dir.join("chunks.bin"), &chunks_bytes)
             .map_err(|e| format!("write chunks.bin: {}", e))?;
@@ -204,7 +204,7 @@ pub fn push(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
     if sv >= 3 {
         let chunks_path = snap_dir.join("chunks.bin");
         let chunks_bytes = std::fs::read(&chunks_path).map_err(|e| format!("read chunks.bin: {}", e))?;
-        let chunks: ChunksManifest = postcard::from_bytes(&chunks_bytes)
+        let chunks = ChunksManifest::from_bytes(&chunks_bytes)
             .map_err(|e| format!("parse chunks.bin: {}", e))?;
         let store = ChunkStore::new(saves_dir);
         let mut seen: std::collections::HashSet<ChunkHash> = std::collections::HashSet::new();
