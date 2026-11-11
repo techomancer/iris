@@ -365,7 +365,13 @@ impl ResidentDisplay {
         rex.resident_frame.invalidate();
         screen.topscan = cut.topscan;
         screen.status_bar_only = false;
-        let resized = screen.refresh_display_state(&rex.vc2, &rex.xmap0, &rex.cmap0, &rex.bt445, &rex.diag);
+        let resized = screen.refresh_resident_display_state(
+            &rex.vc2,
+            &rex.xmap0,
+            &rex.cmap0,
+            &rex.bt445,
+            &rex.diag,
+        );
         self.resize_pending |= resized;
         // A mode write after the initial wait may have published a later
         // fence. Its GFIFO entry cannot pass this marker, so defer rather
