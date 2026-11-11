@@ -985,8 +985,20 @@ resident. The idle processor polls the device error sink,
 and the first fault is sent once through the machine's fatal channel.
 Fatal GPU errors reject reset and restart before touching CPU planes; a
 successful quiescent reset after a recoverable rejection rearms notification.
-Newport still rejects `[graphics] raster = "wgpu"` until M3; full opcode and
-lifecycle coverage are future work. The legacy prototype remains
+Stopped resident snapshots take one lifecycle write lock against PIO, DMA and
+monitor producers. They require an empty published GFIFO, no worker or active
+display cut and no incomplete HostRW transfer, then capture register/context
+state and both complete GPU planes at one submitted stream position. The
+GFIFO itself is ephemeral and is not serialized. Restore stages validated
+register and full-plane halves, uploads both planes into a new epoch, and only
+then publishes the registers and permits processor/display restart. Old
+scanout bindings and composed captures are invalidated. Missing, duplicate or
+failed halves leave the board stopped rather than exposing partial state.
+Disk snapshots, CI rollback, live debugger checkpoints and a second Newport
+head share this transaction; reset clears authoritative GPU planes without
+refreshing stale CPU shadows.
+Newport still rejects `[graphics] raster = "wgpu"` until production activation;
+live frontend integration remains future work. The legacy prototype remains
 CPU-canonical.
 
 Residency tests can opt into replacing each CPU shadow with its own
