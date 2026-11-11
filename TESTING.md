@@ -435,17 +435,17 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The exact 117-case script requires 36 `resident_` CPU tests, four flat-fill
-tests, two line tests, two HostW walker tests, one HostW interpreter/JIT source
-test, one shade-DDA test, one pattern-state test, two resident HostR
+The exact 130-case script requires 43 `resident_` CPU tests, four flat-fill
+tests, two line tests, two HostW walker tests, one HostW interpreter/JIT
+source test, one shade-DDA test, one pattern-state test, two resident HostR
 port/retirement tests, three command-ABI tests and three direct-state tests,
-then **21 resident GPU tests and ten direct scanout tests on each backend**:
-117 tests in total. The window test requires an available native desktop and a
-GPU that can present to it. The script checks each libtest pass count, rejects
-hardware skips and prints the selected adapter; both Vulkan and D3D12 must
-succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
-or `-Backend dx12` runs just one hardware backend and is not the complete
-two-backend gate. For manual PowerShell runs set
+then **24 resident GPU tests and ten direct scanout tests on each backend**.
+That is 130 tests in total. The window test requires an available native
+desktop and a GPU that can present to it. The script checks each libtest pass
+count, rejects hardware skips and prints the selected adapter; both Vulkan and
+D3D12 must succeed for the full gate. `.\scripts\test-resident-gate.ps1
+-Backend vulkan` or `-Backend dx12` runs just one hardware backend and is not
+the complete two-backend gate. For manual PowerShell runs set
 `$env:REX3_RESIDENT_BACKEND = 'vulkan'` or `'dx12'` before each command
 instead of the shell prefix. A host that lacks either required hardware
 backend cannot claim the complete gate. Metal is not covered by this script.
@@ -469,6 +469,39 @@ GPU-written planes and both resident display modes while the CPU framebuffer
 mappings remain protected. Missing, duplicate, incomplete or failed snapshot
 halves must not publish registers, pixels, captures or a restartable board.
 Metal remains outside this gate.
+
+The M8 cases add checked histogram/delta accounting, exact GFIFO
+full-versus-contention telemetry, bounded-set wait accounting, a 4 ms
+continuous-stream batch-age boundary and profiling-only validation of the
+GPU-generated active-tile dispatch. The independent mixed-workload hardware
+gate compares complete planes and context against the CPU engine after fills,
+copies, integer/fractional/antialiased lines, HostW, HostR, direct
+presentations and explicit observations. It also requires zero ordinary
+raw-plane/composed readback and reports typed batch, GFIFO and latency
+aggregates.
+
+An optional local recorder file can be replayed through the resident backend
+without printing records or pixels. The file is not a test artifact and must
+not be committed. `REX3_RESIDENT_PROFILE` enables a 64-byte metadata map and
+wait per nonempty batch; omit it to verify the default map-free path.
+`REX3_RESIDENT_REPLAY_FRAMES` optionally presents the final replayed state
+through direct wgpu scanout that many times without requesting capture. The
+recording must contain valid final display state when that option is used.
+For example, on PowerShell:
+
+```powershell
+$env:REX3_RESIDENT_REPLAY = 'C:\local\newport.rec'
+$env:REX3_RESIDENT_BACKEND = 'vulkan' # repeat with dx12
+$env:REX3_RESIDENT_PROFILE = '1'
+$env:REX3_RESIDENT_REPLAY_FRAMES = '8'
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag,gputrace resident_replay_aggregate_file -- --ignored --nocapture --test-threads=1
+```
+
+The aggregate reports records and checked reads, accepted/no-op/unsupported
+operations, typed primitive/mode/coverage/HostRW distributions, nonempty
+batches and flush reasons, GFIFO/backpressure, attributed transfer bytes and
+conservative latency buckets. Replay throughput and optional post-replay
+presentations are test-path measurements, not live guest wall-clock timing.
 
 To deliberately regenerate, set `REX3_CORPUS_OUT` to an existing relative
 directory with a pre-existing regular `.rex3-corpus-root` file and run

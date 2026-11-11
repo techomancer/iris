@@ -997,6 +997,31 @@ failed halves leave the board stopped rather than exposing partial state.
 Disk snapshots, CI rollback, live debugger checkpoints and a second Newport
 head share this transaction; reset clears authoritative GPU planes without
 refreshing stale CPU shadows.
+
+Resident telemetry is aggregate-only and checked. It classifies primitive and
+address kinds, mode features, conservative clipped coverage, HostRW transfer
+sizes, nonempty batch sizes and flush reasons; board counters cover GFIFO
+occupancy, reservation failures, `BUS_BUSY`, frame cuts and render completion.
+Snapshots reject epoch changes, decreasing counters and overflow rather than
+wrapping. The ordinary resident path performs no telemetry map or readback.
+An explicit profiling option waits for each nonempty batch and maps one
+64-byte metadata record with timestamps, busy-tile totals and the generated
+indirect dispatch. Profiling metadata is separate from raw-plane and composed
+capture traffic.
+
+In addition to capacity and architectural boundaries, a continuously fed
+resident batch is submitted at the next GFIFO command boundary after 4 ms.
+This cannot split a command, HostRW transfer or bounded-set wait. A replay of
+66,741 embedded-PROM command-monitor records on Vulkan and D3D12 accepted
+20,987 operations with no unsupported operation or read mismatch. It formed
+43-51 real batches; 25-31 were latency flushes. Eight direct presentations of
+the replayed state had conservative p95 bounds of 2.10 ms for render
+completion and 0.26 ms for the frame cut with no capture readback. HostR was
+four operations and reused two selected-plane maps, so the measured design
+keeps full-plane HostR snapshots. The same evidence retains 8 x 8 tiles,
+GPU-generated active-tile dispatch, 1,024 state slots and three reusable sets.
+These are gated replay measurements, not production IRIX application timing.
+
 Newport still rejects `[graphics] raster = "wgpu"` until production activation;
 live frontend integration remains future work. The legacy prototype remains
 CPU-canonical.
