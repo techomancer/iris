@@ -770,8 +770,8 @@ per major-axis position; shader lanes derive the payload index from their
 major coordinate and test coverage in O(1). The three line families preserve
 BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
 selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion. Single-step
-and length-32 continuation, stipples, shade and blend effects are still
-rejected for later focused M3 slices.
+and length-32 continuation, stipples and shade effects are still rejected for
+later focused M3 slices.
 
 Simple fill and line commands also carry destination addressing through
 `XYOFFSET`/`XYMOVE`, SMASK0, OR-combined SMASK1-4 and CIDMATCH. Command bounds
@@ -787,8 +787,16 @@ WRMASK and the REX3 4x4 Bayer dither. Dither indexes use the original walker
 coordinates recovered before `XYMOVE`, `XYWIN` and YFLIP addressing. YFLIP
 also reverses y-major line payload direction while preserving the original
 context completion. Fast clears continue to bypass this pipeline and write
-their replicated `COLORVRAM` value directly. Z, stipple, shade and blending
-remain separate work.
+their replicated `COLORVRAM` value directly.
+
+When blending is active, the selected plane slot is expanded to 24-bit color
+before the shader applies the defined source and destination factor selectors.
+Its integer arithmetic, saturation, `BLENDALPHA` alpha-channel rule and
+`BACKBLEND` substitution of `COLORBACK` match the CPU model. The blended word
+then passes through dither, depth compression, slot amplification and WRMASK;
+the logic operation is not applied. Commands conservatively declare a
+destination-plane read except under `BACKBLEND`. Z, stipple and shade remain
+separate work.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each

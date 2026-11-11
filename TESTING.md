@@ -335,6 +335,11 @@ both `DBLSRC` slots, OLAY/PUP/CID packing, alpha pass and rejection, all logic
 operations used by the matrix, WRMASK, Bayer dithering and YFLIP blocks and
 lines. Complete seeded RGB and auxiliary planes are compared with the CPU
 oracle on both hardware backends.
+The hardware blending case runs the complete 6x6 matrix of defined source and
+destination factors with both `BLENDALPHA` behaviors, then covers
+`BACKBLEND`, 4/8/12-bit expansion and recompression, dithering, `DBLSRC`,
+OLAY/PUP/CID packing and a YFLIP line. Both complete planes and final context
+state are compared with the CPU oracle.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
@@ -364,8 +369,8 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 ```
 
 The script requires 25 `resident_` CPU tests, four flat-fill tests, two line
-tests, three command-ABI tests and three direct-state tests, then **13
-resident GPU tests and eight direct scanout tests on each backend**: 79 tests
+tests, three command-ABI tests and three direct-state tests, then **14
+resident GPU tests and eight direct scanout tests on each backend**: 81 tests
 in total. The window test requires an available native desktop and a GPU that
 can present to it. The script checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
