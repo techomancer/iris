@@ -220,8 +220,8 @@ pub struct Seeq8003 {
 struct Net {
     /// The link the next `start` runs.
     next: Option<Link>,
-    /// The flag the running backend watches.
-    live: Option<Arc<AtomicBool>>,
+    /// The running backend, until the next `start` has waited for it to end.
+    backend: Option<crate::net::Running>,
     /// enet waits on this for frames from the backend; `kick_*` notifies it.
     rx_wake: Option<Arc<crate::net::Wake>>,
     /// The running backend's status report, for a backend that has one.
@@ -309,7 +309,7 @@ impl Seeq8003 {
             hold_last_max: RX_HOLD_LAST_MAX,
             config,
             running:  Arc::new(AtomicBool::new(false)),
-            net:      Mutex::new(Net { next: None, live: None, rx_wake: None, reporter: None, frames: None, nat: NatControl::new() }),
+            net:      Mutex::new(Net { next: None, backend: None, rx_wake: None, reporter: None, frames: None, nat: NatControl::new() }),
             heartbeat,
         }
     }
@@ -711,14 +711,22 @@ impl Device for Seeq8003 {
                 Ok(next) => net.next = Some(next),
                 Err(e) => eprintln!("iris: network: {e}; the Ethernet stays down after this run"),
             }
-            net.live = Some(link.running());
             link
         };
 
+        // The previous run's backend has to end first: the NAT holds its
+        // port-forward listeners until its thread returns, and the new one
+        // would find them in use.
+        drop(self.net.lock().backend.take());
+
         // ── seeq-net thread: the network backend ─────────────────────────────
         eprintln!("iris: networking backend = {}", link.describe());
-        link.spawn("seeq-net");
-        self.net.lock().reporter = link.reporter();
+        let backend = link.spawn("seeq-net");
+        {
+            let mut net = self.net.lock();
+            net.reporter = link.reporter();
+            net.backend = backend;
+        }
         let Rings { to_net: tx_prod, from_net: rx_cons, tx_wake: tx_wake_enet, rx_wake: rx_wake_enet } = link.into_rings();
 
         // ── seeq-enet thread: DMA pump loop ───────────────────────────────────
@@ -901,8 +909,8 @@ impl Device for Seeq8003 {
         // but we don't join them here (Device::stop is &self, not &mut self).
         // The next start() runs a fresh link. Any in-flight frames are
         // discarded, which is fine — we're stopping.
-        if let Some(live) = self.net.lock().live.take() {
-            live.store(false, Ordering::SeqCst);
+        if let Some(b) = self.net.lock().backend.as_ref() {
+            b.stop();
         }
     }
 
@@ -1208,6 +1216,25 @@ mod tests {
         });
         seeq.stop();
         drop(sent);
+    }
+
+    /// A stop followed at once by a start, as a machine reset does, keeps the
+    /// port forwards: the old backend still holds its listeners when the new
+    /// one binds.
+    #[test]
+    fn a_restart_keeps_the_port_forwards() {
+        let (_hold, port, config) = Link::forward_on_a_held_port();
+        let seeq = Seeq8003::with_config(None, None, None, config.clone(), Arc::new(AtomicU64::new(0)));
+        seeq.attach(Link::with_gateway(config).unwrap().unwrap());
+        seeq.start();
+        wait_for("the forward to listen", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        seeq.stop();
+        seeq.start();
+        // Longer than the old backend takes to notice it was stopped.
+        thread::sleep(Duration::from_millis(500));
+        let up = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        seeq.stop();
+        assert!(up, "the forward is gone after a restart");
     }
 
     /// Wait for a condition another thread brings about. Fails the test

@@ -61,7 +61,7 @@ use parking_lot::Mutex;
 use crate::config::{NatSubnet, NetMode, NfsConfig, PortForwardConfig};
 
 pub use engine::NatEngine;
-pub use link::{Link, Rings};
+pub use link::{Link, Rings, Running};
 pub use wake::Wake;
 #[cfg(feature = "pcap")]
 pub(crate) use nfs_pcap::NfsVirtualHost;

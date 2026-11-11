@@ -138,8 +138,8 @@ pub struct DaynaPort {
     /// The link the next `start` runs. Each `start` attaches a fresh one for
     /// the next, so a restarted target gets new rings and a new backend.
     next: Option<Link>,
-    /// The flag the running backend watches.
-    live: Option<Arc<AtomicBool>>,
+    /// The running backend, until the next `start` has waited for it to end.
+    backend: Option<crate::net::Running>,
 
     stats: DpStats,
     /// Sense data served on REQUEST SENSE, set by the last CHECK CONDITION.
@@ -162,7 +162,7 @@ impl DaynaPort {
             rx_cons: None,
             tx_wake: None,
             next: None,
-            live: None,
+            backend: None,
             stats: DpStats::default(),
             pending_sense: [0u8; 18],
         }
@@ -200,9 +200,11 @@ impl DaynaPort {
             Ok(next) => self.next = Some(next),
             Err(e) => eprintln!("iris: DaynaPort {}: network: {e}; down after this run", self.target_id),
         }
-        self.live = Some(link.running());
+        // The previous run's backend has to end first: the NAT holds its
+        // port-forward listeners until its thread returns.
+        self.backend = None;
         eprintln!("iris: DaynaPort {} backend = {}", self.target_id, link.describe());
-        link.spawn(&format!("dayna{}-net", self.target_id));
+        self.backend = link.spawn(&format!("dayna{}-net", self.target_id));
         let rings = link.into_rings();
         self.tx_prod = Some(rings.to_net);
         self.rx_cons = Some(rings.from_net);
@@ -214,12 +216,10 @@ impl DaynaPort {
     /// frames are discarded — the same answer `seeq8003::stop` gives.
     pub fn stop(&mut self) {
         if !self.running.swap(false, Ordering::SeqCst) { return; }
-        if let Some(live) = self.live.take() {
-            live.store(false, Ordering::SeqCst);
+        if let Some(b) = self.backend.as_ref() {
+            b.stop();
         }
-        if let Some(w) = self.tx_wake.take() {
-            w.notify();
-        }
+        self.tx_wake = None;
         self.tx_prod = None;
         self.rx_cons = None;
     }
@@ -512,6 +512,30 @@ mod tests {
         d.attach(link);
         d.start();
         (d, tx_cons, rx_prod)
+    }
+
+    /// A stop followed at once by a start, as a machine reset does, keeps the
+    /// port forwards: the old backend must let go of its listeners before
+    /// the new one binds.
+    #[test]
+    fn a_restart_keeps_the_port_forwards() {
+        let (_hold, port, config) = Link::forward_on_a_held_port();
+        let mut d = DaynaPort::new(3, default_mac(3), config.clone(), Arc::new(AtomicU64::new(0)));
+        d.attach(Link::with_gateway(config).unwrap().unwrap());
+        d.start();
+        let listening = || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !listening() {
+            assert!(std::time::Instant::now() < deadline, "the forward never listened");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        d.stop();
+        d.start();
+        // Longer than the old backend takes to notice it was stopped.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let up = listening();
+        d.stop();
+        assert!(up, "the forward is gone after a restart");
     }
 
     fn cdb6(b: [u8; 6]) -> ScsiRequest {

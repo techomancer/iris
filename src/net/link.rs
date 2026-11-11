@@ -24,6 +24,35 @@ pub struct Rings {
     pub rx_wake: Arc<Wake>,
 }
 
+/// A backend running on its own thread, from [`Link::spawn`] until it is
+/// dropped. Dropping it waits for the thread to end, so the backend's host
+/// sockets (the NAT's port-forward listeners among them) are free once the
+/// adapter that owned it lets go: an adapter restarting, or the next machine,
+/// can bind them again.
+pub struct Running {
+    live: Arc<AtomicBool>,
+    tx_wake: Arc<Wake>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+    /// Ask the backend to end. It does on its next pass, which the wake-up
+    /// starts at once.
+    pub fn stop(&self) {
+        self.live.store(false, Ordering::SeqCst);
+        self.tx_wake.notify();
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 pub struct Link {
     rings: Rings,
     /// The backend's ends of the rings, until the backend is built.
@@ -137,13 +166,33 @@ impl Link {
         Some(Box::new(NatEngine::new(config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl)))
     }
 
-    /// Run the backend on a thread called `name` until `running` clears. The
-    /// thread is detached: a stopped adapter does not wait for it, and the
-    /// next start runs a renewed link on a thread of its own.
-    pub fn spawn(&mut self, name: &str) {
-        let Some(mut backend) = self.backend() else { return };
+    /// Run the backend on a thread called `name` until the returned handle
+    /// stops it. `None` if the backend was built already.
+    pub fn spawn(&mut self, name: &str) -> Option<Running> {
+        let mut backend = self.backend()?;
         self.running.store(true, Ordering::SeqCst);
-        std::thread::Builder::new().name(name.into()).spawn(move || backend.run()).expect("network backend thread");
+        let thread = std::thread::Builder::new().name(name.into()).spawn(move || backend.run()).expect("network backend thread");
+        Some(Running { live: self.running.clone(), tx_wake: self.rings.tx_wake.clone(), thread: Some(thread) })
+    }
+
+    /// A gateway with a TCP forward to guest port 23 from a host port held,
+    /// not listening, by the returned socket, so no other test is handed the
+    /// port meanwhile. Where a held port cannot be bound twice (not Unix) the
+    /// socket is let go first.
+    #[cfg(test)]
+    pub(crate) fn forward_on_a_held_port() -> (Option<socket2::Socket>, u16, GatewayConfig) {
+        use crate::config::{ForwardBind, ForwardProto, PortForwardConfig};
+        let hold = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        #[cfg(unix)]
+        hold.set_reuse_address(true).unwrap();
+        hold.bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
+        let port = hold.local_addr().unwrap().as_socket().unwrap().port();
+        let hold = cfg!(unix).then_some(hold);
+        let config = GatewayConfig {
+            port_forwards: vec![PortForwardConfig { proto: ForwardProto::Tcp, host_port: port, guest_port: 23, bind: ForwardBind::Localhost }],
+            ..GatewayConfig::default()
+        };
+        (hold, port, config)
     }
 
     /// Rings to nowhere, and their far ends, for adapter tests.
