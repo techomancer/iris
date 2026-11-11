@@ -160,18 +160,20 @@ impl Core {
             RESET_STROBE => {
                 // A write with bit 0 set resets what host software rewrites
                 // after its 1, read, 0, read pulse (inferred from that
-                // rewrite): the enable,
-                // the global enable, the credit configuration, the group word
-                // and every map RAM entry, which becomes invalid. It leaves
-                // the DMA registers, the low-water state, the command framers
-                // and the interrupt routing alone: the kernel never rewrites
-                // them after a pulse and what the pulse does to them is
-                // unknown. Bit 1 (ARM start) starts nothing: the model has no
-                // ARM.
+                // rewrite): the enable, the global enable, the credit
+                // configuration and the group word. It leaves the map RAM
+                // alone: the driver's adaptor reset runs when another
+                // server starts while a graphics process is live, and that
+                // process keeps transferring through its entries (inferred;
+                // clearing them left its next image transfer with no
+                // translation). It leaves the DMA registers, the low-water
+                // state, the command framers and the interrupt routing
+                // alone too: the kernel never rewrites them after a pulse
+                // and what the pulse does to them is unknown. Bit 1 (ARM
+                // start) starts nothing: the model has no ARM.
                 h.front.lock().reset_strobe = value;
                 if value & 1 != 0 {
                     h.front.lock().hip_reset();
-                    self.map_ram.fill(0);
                 }
                 return;
             }

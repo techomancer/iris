@@ -410,6 +410,18 @@ impl Deskside {
                 let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
                 let pipe = Kona::new(kona_cfg, pipe_hosts.clone(), pipe_hosts.clone(), status.clone(), flash)?;
                 let _ = pipe_hosts.widget.set(pipe.dma_widget_handle());
+                // The driver's adaptor reset link-resets the pipe's widget before it pulses the board's
+                // reset; the widget loses its Crosstalk interface registers.
+                if let Some(widget) = layout.graphics_widget {
+                    let weak = Arc::downgrade(&pipe);
+                    xbow.on_link_reset(Box::new(move |w| {
+                        if w == widget {
+                            if let Some(pipe) = weak.upgrade() {
+                                pipe.link_reset();
+                            }
+                        }
+                    }));
+                }
                 Some(pipe)
             }
             _ => None,
