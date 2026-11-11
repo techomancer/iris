@@ -4,8 +4,8 @@
 //! A level reaches texture memory as texel draws (`DRAW_TEXELS_INTO_TEXTURE_MEMORY`)
 //! and a load finish. The load does not name its level: the header's address word
 //! (word 18, or 19 when the bank bit is set) and the bank bit say where it lands.
-//! The model keeps its levels by (bank, address) per context (the plan keyed images
-//! by cache entry; the entry number reaches a level only through the bind's table,
+//! The model keeps its levels by (bank, address) per context (keying images by cache
+//! entry was the other choice; the entry number reaches a level only through the bind's table,
 //! which names the same addresses). A bind and its record list the levels' addresses
 //! in order; the levels are found by that table and the first level's bank, flipped
 //! for every second level. That is the contract for a numbered bind and for an

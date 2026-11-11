@@ -140,8 +140,8 @@ pub const MAPRAM_KIND_16K: u32 = 0x2000_0000;
 pub const MAPRAM_PAGE_SHIFT: u32 = 14;
 
 // The textport grammar, the PROM's text console, drawn before any window
-// exists. The table does not cover it; these are software expectations from
-// QEMU's model (inferred).
+// exists. The table does not cover it; these are software expectations
+// (inferred).
 /// The textport's sync word.
 pub const TEXTPORT_SYNC_WORD: u32 = 1;
 /// Commands framed and counted, with no drawing role known.

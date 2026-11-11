@@ -169,14 +169,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   own is refused. On a two-node machine the second processor now runs as fast
   as the first.
 
-### InfiniteReality front end
+### InfiniteReality graphics
 
-- `src/dev/kona/` is the InfiniteReality (KONA) pipe, fitted to the Onyx2 with
-  `[graphics] board`. It draws the PROM's textport, the X server's boxes,
-  points, lines and pixel operations, and GL triangles with depth, fog, clip
-  planes and 2D, volume and detail textures, on `[graphics] threads` workers
-  over `[graphics] tile`-pixel tiles. Overlays, the popup and the crosshair
-  cursor are not composed yet.
+- An Onyx2 can have an InfiniteReality2 or 2E pipe (`[graphics] board`);
+  `[graphics] threads` and `[graphics] tile` set its rasteriser's workers and
+  tile size.
 - The monitor's `kona status`, `kona counters`, `kona hash`, `kona pix <x> <y>`
   and `kona shot <file.png>` show its state.
 
