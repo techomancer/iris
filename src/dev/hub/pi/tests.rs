@@ -606,6 +606,16 @@ fn racing_writers_leave_the_word_matching_the_registers() {
     }
 }
 
+/// Let a thread that has started get as far as the lock it should be waiting
+/// on. A thread that is wrongly running would have finished by now. This
+/// counts scheduler turns, not wall-clock time, so a slow host does not
+/// change what it proves.
+fn give_a_blocked_thread_the_chance_to_run() {
+    for _ in 0..20_000 {
+        std::thread::yield_now();
+    }
+}
+
 /// A writer that stalls in the middle of writing the lines holds off every
 /// change of their inputs: the input changes under the same hold of `lines`
 /// as the write. Were an input changed before the lock, the second thread
@@ -649,6 +659,51 @@ fn a_stalled_line_write_holds_off_changes_to_its_input() {
     assert!(t.lines.get(0));
     // The bit rose, fell and rose: three edges in the order the registers made them.
     assert_eq!((t.pi.rises[0].load(Ordering::SeqCst), t.pi.falls[0].load(Ordering::SeqCst)), (2, 1));
+}
+
+/// The comparator timer's callback runs outside the timer manager's lock, so
+/// removing the timer does not wait for one already publishing. Clearing the
+/// words has to: the machine frees them as soon as it returns.
+#[test]
+fn clearing_the_words_waits_for_a_publish_in_flight() {
+    use std::sync::Barrier;
+    let t = Arc::new(Fixture::new(1));
+    t.w(reg::INT_MASK0_A, !0);
+    let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    {
+        let (entered, release) = (entered.clone(), release.clone());
+        *t.pi.stall.lock() = Some(Arc::new(move || {
+            entered.wait();
+            release.wait();
+        }));
+    }
+    // A publish that will raise line 0, as the timer's callback does for the
+    // comparator's line.
+    let publisher = {
+        let t = t.clone();
+        std::thread::spawn(move || t.pi.int_modify(MODIFY_SET | 5))
+    };
+    // It has loaded the word and is stalled before writing to it.
+    entered.wait();
+    let clearer = {
+        let t = t.clone();
+        // How many rises the word had seen by the time the clear returned.
+        std::thread::spawn(move || {
+            t.pi.clear_cpu_interrupts();
+            t.pi.rises[0].load(Ordering::SeqCst)
+        })
+    };
+    // The clear must not return while the publish is stalled.
+    give_a_blocked_thread_the_chance_to_run();
+    assert!(!clearer.is_finished(), "the clear returned while a publish held the word");
+    release.wait();
+    publisher.join().unwrap();
+    assert_eq!(clearer.join().unwrap(), 1, "the words were let go before the publish in flight finished");
+    assert!(!t.pi.publishes_to(0));
+    // Later publishes find no word.
+    t.pi.int_modify(5);
+    t.pi.int_modify(MODIFY_SET | 5);
+    assert_eq!(t.pi.rises[0].load(Ordering::SeqCst), 1);
 }
 
 /// A reset writes the lines with the registers it clears: a line that was up
