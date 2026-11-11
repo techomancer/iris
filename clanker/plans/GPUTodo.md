@@ -756,7 +756,7 @@ consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
 - [x] Add CPU-raster plus wgpu-compositor uploads.
 - [x] Add an eframe wgpu path or explicitly keep proper GPU mode unavailable in
       `iris-gui` until one exists.
-- [ ] Retain readback composition as a labeled validation mode.
+- [x] Retain readback composition as a labeled validation mode.
 
 Complete when a GPU-rendered live frame reaches the window with zero
 framebuffer readback and without a CPU plane upload.
@@ -783,13 +783,16 @@ contents. The initial resident frame explicitly rejects nonzero retained CPU
 DID history outside the area reconstructed by the current VC2 state. Before
 production activation, define how a CPU-to-GPU transition or device
 replacement preserves that history without violating the transfer contract.
-Production live integration, final on-screen validation and the labeled
-readback compositor mode remain open.
-`iris-gui` cannot select this mode.
+An explicit compatibility display attributes a complete two-plane observation
+to `Compatibility`, copies the 16 MiB snapshot into a separate CPU cache and
+calls the ordinary renderer without acknowledging the protected CPU shadows.
+It is deliberately slow and never an automatic fallback. M2 is complete
+within this gated test-only scope. Production live integration and final
+on-screen validation remain open; `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-3 flat-fill and 3 direct-state tests, plus 10 resident GPU and 7
-direct-scanout tests on each of Vulkan and D3D12, for 65 tests total. It
+3 flat-fill and 3 direct-state tests, plus 10 resident GPU and 8
+direct-scanout tests on each of Vulkan and D3D12, for 67 tests total. It
 requires the named backend on an integrated/discrete adapter and a native
 desktop, and fails rather than skipping when unavailable; a single-backend
 run is not the complete gate. See

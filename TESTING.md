@@ -308,6 +308,11 @@ byte-for-byte comparison with the CPU map; ordinary frames do not perform that
 test readback. The tests also cover scanout replacement, reset and restore
 epochs, switching displays, inactive display controls, and rejection of
 unreconstructible initial DID history or a different GPU device.
+The explicitly selected compatibility case does the opposite by design: it
+requires one successful, attributed
+`Compatibility` observation of both complete planes (16 MiB), composes from a
+separate CPU cache, leaves the board shadows stale and protected, and matches
+the software oracle. It is not a fallback from direct presentation.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
@@ -335,8 +340,8 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 ```
 
 The script requires 25 `resident_` CPU tests, three flat-fill tests and three
-direct-state tests, then **10 resident GPU tests and seven direct
-scanout tests on each backend**: 65 tests in total. The window test requires
+direct-state tests, then **10 resident GPU tests and eight direct
+scanout tests on each backend**: 67 tests in total. The window test requires
 an available native desktop and a GPU that can present to it. The script
 checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
