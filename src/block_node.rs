@@ -927,7 +927,7 @@ impl BlockNode for CowNode {
     }
 
     /// Merge every dirty overlay sector into the base image, then truncate the
-    /// overlay so it is empty. Mirrors [`crate::cow_disk::CowDisk::commit`].
+    /// overlay so it is empty.
     fn commit(&mut self) -> io::Result<usize> {
         let base_path = self.base_path.clone().ok_or_else(|| {
             io::Error::new(
@@ -956,8 +956,7 @@ impl BlockNode for CowNode {
         Ok(committed)
     }
 
-    /// Delete every overlay write and clear the on-disk dirty set. Mirrors
-    /// [`crate::cow_disk::CowDisk::reset_overlay`].
+    /// Delete every overlay write and clear the on-disk dirty set.
     fn rollback(&mut self) -> io::Result<()> {
         self.dirty.clear();
         self.unflushed = true;
@@ -970,7 +969,7 @@ impl BlockNode for CowNode {
     }
 
     /// Copy the current overlay to `dest` and return the dirty sector list
-    /// (sorted). Mirrors [`crate::cow_disk::CowDisk::export_overlay`].
+    /// (sorted).
     fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.overlay.sync_all()?;
         let mut dirty: Vec<u64> = self.dirty.iter().copied().collect();
@@ -979,8 +978,7 @@ impl BlockNode for CowNode {
         Ok(dirty)
     }
 
-    /// Replace the overlay contents with `source` and adopt `dirty`. Mirrors
-    /// [`crate::cow_disk::CowDisk::import_overlay`].
+    /// Replace the overlay contents with `source` and adopt `dirty`.
     ///
     /// The record is emptied (and synced) before the overlay is touched, and
     /// the new set written once the overlay holds the new contents. Between

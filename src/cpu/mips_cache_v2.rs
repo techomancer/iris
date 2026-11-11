@@ -770,20 +770,6 @@ pub trait MipsCache: Send + Sync {
     // Default null: a null `jit_dc_tags` is the signal that this cache cannot
     // support the inline path, and codegen must not emit it.
 
-    /// L1-D-resident fast read for the jitv2 memory hooks: on a tag hit
-    /// return the data, else `None` so the caller runs the full path.
-    ///
-    /// Deliberately does no fill, no LRU update, no breakpoint check and no
-    /// bus access — each of those is a reason to decline instead. See
-    /// docs/jit-inline-memory.md §7: the guard lives here, in one Rust
-    /// function, rather than as per-access Cranelift IR.
-    fn jit_fast_read<const SIZE: usize>(&self, _virt: u64, _phys: u64) -> Option<u64> { None }
-
-    /// L1-D-resident fast write. Declines unless the line is present *and*
-    /// already dirty: the clean->dirty transition is a tag read-modify-write
-    /// the slow path owns.
-    fn jit_fast_write<const SIZE: usize>(&self, _virt: u64, _phys: u64, _val: u64) -> bool { false }
-
     /// Base of the L2 tag array (`[L2Tag]`, one `u32` each). The inline
     /// tcache store path uses it to clear `has_code` for the written line,
     /// mirroring `tc_invalidate_l2_code`. Null when there is no L2.
@@ -1936,13 +1922,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         hit
     }
 
-    /// tcache: host pointer for a transparent physical address.
-    #[cfg(feature = "tcache")]
-    #[inline(always)]
-    fn tc_ptr(&self, phys_addr: u64) -> *mut u8 {
-        unsafe { (*self.tc_base.get()).add(phys_addr as usize) }
-    }
-
     /// tcache: read `ACC` bytes straight out of ppmem's window.
     ///
     /// **ppmem's layout is not the cache's layout.** ppmem stores u32 words in
@@ -2937,13 +2916,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
         (ic_eidx >> Self::IC_NUM_LINES_SHIFT) as u32
     }
-
-    /// Fill L1 data cache line. Ensures data is in L2 first, then copies to L1-D.
-    ///
-    /// Returns a `u32` with the same encoding as `ensure_l1d_line`:
-    ///   0  = filled into way0 (BUS_OK)
-    ///   1  = filled into way1 (BUS_OK, R5K only)
-    ///   >1 = BUS_VCE or BUS_ERR
 
     /// tcache debug: assert the foundational invariant — for a transparent
     /// address, ppmem's window is authoritative and no cache tier holds a
