@@ -68,6 +68,7 @@ function Invoke-ResidentTests {
 try {
     Invoke-ResidentTests 'resident_' 25 $false
     Invoke-ResidentTests 'dev::ng1::rex3_flat_fill::tests' 3 $false
+    Invoke-ResidentTests 'dev::ng1::wgpu::command::tests' 3 $false
     Invoke-ResidentTests 'direct_ng1_scanout_' 3 $false
     foreach ($name in $requestedBackends) {
         $env:REX3_RESIDENT_BACKEND = $name

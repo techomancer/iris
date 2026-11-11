@@ -23,6 +23,9 @@ use crate::wgpu::{Gpu, Scanout, ScanoutPipeline, ScanoutShaders};
 mod tests;
 
 #[cfg(test)]
+mod command;
+
+#[cfg(test)]
 pub(crate) mod resident;
 
 #[cfg(test)]
