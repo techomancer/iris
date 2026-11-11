@@ -850,9 +850,21 @@ CID or alpha rejection. COLORHOST, ALPHAHOST and their combination support
 packed and unpacked 4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, PIO
 replication, multiword row continuation, RGB/auxiliary destinations and the
 ordinary pixel pipeline. Accepted-transfer and staged-qword counters survive
-reset and restore. Host patterns, shade, endpoint skips, LENGTH32, LR-only
-shapes, host lines and zoom coalescing remain hard errors for later M4 slices;
-READ remains a hard error until M5 supplies an explicit synchronized source.
+reset and restore.
+
+The next M4 segment slice keeps that one-command transfer but adds transparent
+and opaque Z/line patterns, shade DDA, endpoint skips, LENGTH32 and LR-only
+BLOCK/SPAN behavior. Pattern decisions precede host fetch, so transparent and
+opaque-background visits consume no HostRW field; shade and both pattern
+machines nevertheless advance on every walker visit. Pattern bits reset per
+row while `LSRCOUNT` continues, including restored pattern-bit states outside
+the configured recirculation range. Command-free decreasing LR-only and
+BLOCK+SKIPFIRST transfers still commit their generic-walker context completion.
+The generic and Cranelift paths are also pinned to the same mixed-source rules:
+COLORHOST overrides shaded RGB, while ALPHAHOST alone preserves FASTCLEAR.
+Resident FASTCLEAR+ALPHAHOST, host lines and zoom coalescing remain hard errors
+for later M4 slices; READ remains a hard error until M5 supplies an explicit
+synchronized source.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
