@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::config::{AudioConfig, AudioHost};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rtrb::{RingBuffer, Producer};
+use rtrb::{Consumer, Producer, RingBuffer};
 
 // Sample rates to try when opening the persistent output stream, in order.
 const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
@@ -84,7 +84,7 @@ impl Resampler {
     /// every later pair would swap.
     pub fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) {
         if self.passthrough() {
-            push_pair(prod, l, r);
+            push_frame(prod, &[l, r]);
             return;
         }
         self.h = [self.h[1], self.h[2], self.h[3], [l as f32, r as f32]];
@@ -95,20 +95,56 @@ impl Resampler {
                 let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
                 v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
             });
-            push_pair(prod, l, r);
+            push_frame(prod, &[l, r]);
             self.acc += self.in_rate as u64;
         }
         self.acc -= out;
     }
 }
 
-/// Push a stereo pair only if both samples fit; the consumer pops single
-/// samples, so the free room can be odd.
-fn push_pair(prod: &mut Producer<i16>, l: i16, r: i16) {
-    if prod.slots() >= 2 {
-        let _ = prod.push(l);
-        let _ = prod.push(r);
+/// Push a whole frame, or none of it if the ring lacks room, and publish it
+/// with one commit so the consumer never sees part of a frame. Returns
+/// whether it fit.
+pub fn push_frame(prod: &mut Producer<i16>, frame: &[i16]) -> bool {
+    match prod.write_chunk_uninit(frame.len()) {
+        Ok(chunk) => {
+            chunk.fill_from_iter(frame.iter().copied());
+            true
+        }
+        Err(_) => false,
     }
+}
+
+/// Fill `out` from the ring a whole frame of `channels` samples at a time,
+/// each sample through `conv`. A frame the ring cannot supply whole is
+/// silence, and what it holds stays for the next call: an underrun in the
+/// middle of a frame would otherwise play the rest of the frame as zeros
+/// and start the next one a channel late for good. Returns the samples
+/// short.
+pub fn pop_frames<T>(c: &mut Consumer<i16>, channels: usize, out: &mut [T], mut conv: impl FnMut(i16) -> T) -> usize {
+    let mut missed = 0;
+    let mut frames = out.chunks_exact_mut(channels);
+    for frame in frames.by_ref() {
+        match c.read_chunk(channels) {
+            Ok(chunk) => {
+                let (a, b) = chunk.as_slices();
+                for (o, &v) in frame.iter_mut().zip(a.iter().chain(b)) {
+                    *o = conv(v);
+                }
+                chunk.commit_all();
+            }
+            Err(_) => {
+                frame.iter_mut().for_each(|o| *o = conv(0));
+                missed += channels;
+            }
+        }
+    }
+    // A buffer that is not a whole number of frames: the tail is silence,
+    // not what the host left in it.
+    for o in frames.into_remainder() {
+        *o = conv(0);
+    }
+    missed
 }
 
 /// The Catmull-Rom spline through p1 and p2 at t in [0, 1).
@@ -201,25 +237,15 @@ pub fn open_output(
                     .and_then(|p| std::fs::File::create(p).ok())
                     .map(std::io::BufWriter::new);
                 let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut short = false;
-                    for sample in data.iter_mut() {
-                        let v = match c.pop() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                if playing_cb.load(Ordering::Relaxed) {
-                                    underruns_cb.fetch_add(1, Ordering::Relaxed);
-                                    short = true;
-                                }
-                                0
-                            }
-                        };
+                    let missed = pop_frames(&mut c, 2, data, |v| {
                         if let Some(w) = capture.as_mut() {
                             use std::io::Write;
                             let _ = w.write_all(&v.to_le_bytes());
                         }
-                        *sample = v as f32 / 32768.0;
-                    }
-                    if short {
+                        v as f32 / 32768.0
+                    });
+                    if missed > 0 && playing_cb.load(Ordering::Relaxed) {
+                        underruns_cb.fetch_add(missed as u64, Ordering::Relaxed);
                         crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
                     }
                 };
@@ -231,20 +257,9 @@ pub fn open_output(
                         let underruns_cb = underruns.clone();
                         let playing_cb = playing.clone();
                         let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            let mut short = false;
-                            for sample in data.iter_mut() {
-                                *sample = match c.pop() {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        if playing_cb.load(Ordering::Relaxed) {
-                                            underruns_cb.fetch_add(1, Ordering::Relaxed);
-                                            short = true;
-                                        }
-                                        0
-                                    }
-                                };
-                            }
-                            if short {
+                            let missed = pop_frames(&mut c, 2, data, |v| v);
+                            if missed > 0 && playing_cb.load(Ordering::Relaxed) {
+                                underruns_cb.fetch_add(missed as u64, Ordering::Relaxed);
                                 crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
                             }
                         };
@@ -302,5 +317,38 @@ mod tests {
                 assert!(got.chunks(2).all(|q| q == [0, 0] || q[0] > 0 && q[1] < 0), "{in_rate}: channels swapped in {got:?}");
             }
         }
+    }
+
+    #[test]
+    fn an_underrun_in_the_middle_of_a_frame_keeps_the_channels_aligned() {
+        let (mut p, mut c) = RingBuffer::<i16>::new(64);
+        // One whole four-channel frame and half of the next, as a producer
+        // that pushes sample by sample leaves the ring between two pushes.
+        for v in [1, 2, 3, 4, 5, 6] {
+            p.push(v).unwrap();
+        }
+        let mut out = [9i16; 12];
+        let missed = pop_frames(&mut c, 4, &mut out, |v| v);
+        assert_eq!(out, [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(missed, 8);
+        // The rest of the frame arrives: it plays whole, first.
+        p.push(7).unwrap();
+        p.push(8).unwrap();
+        let mut out = [9i16; 8];
+        assert_eq!(pop_frames(&mut c, 4, &mut out, |v| v), 4);
+        assert_eq!(out, [5, 6, 7, 8, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_frame_goes_into_the_ring_whole_or_not_at_all() {
+        let (mut p, mut c) = RingBuffer::<i16>::new(6);
+        assert!(push_frame(&mut p, &[1, 2, 3, 4]));
+        // Two slots left, a four-sample frame does not fit: none of it is
+        // written.
+        assert!(!push_frame(&mut p, &[5, 6, 7, 8]));
+        assert_eq!(c.slots(), 4);
+        let mut out = [0i16; 4];
+        assert_eq!(pop_frames(&mut c, 4, &mut out, |v| v), 0);
+        assert_eq!(out, [1, 2, 3, 4]);
     }
 }
