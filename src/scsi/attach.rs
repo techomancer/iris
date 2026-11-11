@@ -56,6 +56,41 @@ pub fn attach_failed(msg: String, at: &str) -> Result<(), String> {
     }
 }
 
+/// Attach the target one table describes at `id` of `bus`, logging it as
+/// `{log_prefix}: {at}: ...` unless the prefix is `None`. `ci_overlay` is the
+/// path a `--ci` run keeps the copy-on-write overlay at. The Fibre Channel
+/// adapter's loop disks come through here too, so a disk is attached the same
+/// way wherever it sits.
+pub fn attach_table(
+    bus: &ScsiBus,
+    id: u8,
+    at: &str,
+    dev: &ScsiDeviceConfig,
+    ci_overlay: Option<&str>,
+    log_prefix: Option<&str>,
+) -> Result<(), String> {
+    let (path, discs) = dev.media();
+    match bus.attach_device(id, &path, dev.is_cdrom(), discs, dev.overlay, ci_overlay, dev.write_cache) {
+        Ok(blocks) => {
+            if let Some(prefix) = log_prefix {
+                if path.is_empty() {
+                    eprintln!("{prefix}: {at}: CD-ROM, tray empty");
+                } else {
+                    eprintln!("{prefix}: {at}: {path} ({blocks} blocks)");
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let msg = match ci_overlay {
+                Some(ov) => format!("could not attach {path} to {at} with its --ci overlay {ov}: {e}"),
+                None => format!("could not attach {path} to {at}: {e}"),
+            };
+            attach_failed(msg, at)
+        }
+    }
+}
+
 /// Attach every disk and CD-ROM table of `cfg`, logging each as
 /// `{log_prefix}: SCSI ID n: ...` unless the prefix is `None`. `route` names
 /// the bus a controller number is on, or says why there is none ("an O2 has
@@ -94,30 +129,11 @@ pub fn attach_from_config<'a>(
             }
         }
         let bus = route(controller).map_err(|e| format!("{at}: {e}"))?;
-        let (path, discs) = dev.media();
-        let cdrom = dev.is_cdrom();
         // CI mode isolates each copy-on-write overlay in the temporary
         // directory, so an interactive iris holding one and any number of CI
         // runs can share the image.
-        let ci_overlay = (cfg.ci && dev.overlay && !cdrom).then(|| ScsiDeviceConfig::ci_overlay_path(key));
-        match bus.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref(), dev.write_cache) {
-            Ok(blocks) => {
-                if let Some(prefix) = log_prefix {
-                    if path.is_empty() {
-                        eprintln!("{prefix}: {at}: CD-ROM, tray empty");
-                    } else {
-                        eprintln!("{prefix}: {at}: {path} ({blocks} blocks)");
-                    }
-                }
-            }
-            Err(e) => {
-                let msg = match &ci_overlay {
-                    Some(ov) => format!("could not attach {path} to {at} with its --ci overlay {ov}: {e}"),
-                    None => format!("could not attach {path} to {at}: {e}"),
-                };
-                attach_failed(msg, &at)?
-            }
-        }
+        let ci_overlay = (cfg.ci && dev.overlay && !dev.is_cdrom()).then(|| ScsiDeviceConfig::ci_overlay_path(key));
+        attach_table(bus, id, &at, dev, ci_overlay.as_deref(), log_prefix)?;
     }
     out.tables.sort_by_key(|t| t.slot);
     Ok(out)
