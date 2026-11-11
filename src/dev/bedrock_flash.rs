@@ -33,29 +33,45 @@ fn sum(bytes: &[u8]) -> u8 {
 
 /// The fields of the PROM's configuration block that depend on the board.
 ///
-/// The PROM reads them from flash before it touches the processor, so they
-/// must agree with the CPU the machine builds: a mismatch in the boot-mode
-/// word sends it to its error routine before it initialises GP. The values
-/// are not a measured flash dump; each record's doc says where they come
-/// from.
+/// The 80-byte record at flash 0x60 holds, in order: +0x00 0x15, +0x04 the
+/// CPU mode word, +0x08 "ip27conf", +0x10 CPU Hz, +0x18 bus Hz, +0x20
+/// 0x1312d0, +0x28 1, +0x2c flash timing 0x10, +0x30 machine type, +0x34 0,
+/// +0x3c write timing 0x10 (established from the PROM). "CPU configuration
+/// values mismatch" compares +0x00, 0x04, 0x08, 0x10, 0x18, 0x28, 0x2c, 0x30
+/// and 0x3c against the board EEPROM's record, then checks the speed table,
+/// so the machine type, mode word, both clocks and the timing bytes all have
+/// to agree with the row the board-id word selects. This struct sets the
+/// mode word, CPU Hz and machine type; the PROM image carries the rest, the
+/// 200 MHz hub clock among them (the same in every speed row).
+///
+/// The PROM reads the record before it touches the processor, so it must
+/// agree with the CPU the machine builds: a mismatch in the boot-mode word
+/// sends it to its error routine before it initialises GP. The values are
+/// not a measured flash dump of a 500 MHz Fuel; each field's doc says how
+/// far it is known. A real 800 MHz Fuel's mode word was 0x549baf85.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirmwareRecord {
     /// The CPU boot-mode word the PROM compares with the processor's mode.
     /// Its bits 24:0 are the mode inputs the processor latches into CP0
-    /// Config at reset (the R10000 family's reset-mode inputs).
+    /// Config at reset (the R10000 family's reset-mode inputs). The 500 MHz
+    /// value is chosen: this PROM accepts it with board nibble 4, but it was
+    /// not read from a 500 MHz Fuel. The 800 MHz row's real value, 0x549baf85,
+    /// differs from it in bits 16 and 10:9.
     pub cpu_mode_word: u32,
-    /// The processor clock the PROM reports and times against, in Hz.
+    /// The processor clock the PROM reports and times against, in Hz. It is
+    /// the clock of the speed-table row the board-id word selects.
     pub cpu_clock_hz: u32,
     /// The record's word at +0x30, which the PROM's start-up check compares
     /// with a machine class of its own. When the node board's L1 record
     /// carries a CPU configuration, the PROM derives that class from the
-    /// board word's top nibble (0x4 gives 2, 0x8 gives 1, any other 0; read
-    /// from the stock PROM 6.210's code, established for that PROM). The
-    /// Fuel's record is 2, SN11: a Fuel's PROM flash session takes 2 from
-    /// "(0)SN1 (1)SN10 (2)SN11 (3)SN12" and its IRIX logs "Selecting SN11"
-    /// (just.graphica.com.au/tips/sgi-o350-chimera-notes). With 1, PROM
-    /// 6.210 prints "CPU configuration values mismatch", which a real Fuel's
-    /// console does not.
+    /// board word's top nibble (0x4 gives 2, 0x8 gives 1, any other 0).
+    /// Established from the stock PROM 6.210's code: the class is 2 for every
+    /// row of the class-0x4000 speed table, so the Fuel's record is 2. With 1,
+    /// PROM 6.210 prints "CPU configuration values mismatch", which a real
+    /// Fuel's console does not. The name SN11 for type 2 is inferred from a
+    /// public flash transcript only: a Fuel's PROM flash session takes
+    /// 2 from "(0)SN1 (1)SN10 (2)SN11 (3)SN12" and its IRIX logs "Selecting
+    /// SN11" (just.graphica.com.au/tips/sgi-o350-chimera-notes).
     pub machine_type: u32,
 }
 
