@@ -339,6 +339,15 @@ impl BusDevice for Home {
     fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
         self.blocks(a, buf.len(), |dev, at, range| dev.write_block(at, &buf[range]))
     }
+    // The page generation is the bank's own where a run holds the address,
+    // so a view onto the same page counts the writes the bank takes.
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 {
+        match self.bank(a) {
+            Some((i, at)) => self.phys.banks()[i].gen_ptr(at),
+            None => self.phys.gen_ptr(a),
+        }
+    }
     home_access!(read8, write8, u8, BusRead8);
     home_access!(read16, write16, u16, BusRead16);
     home_access!(read32, write32, u32, BusRead32);

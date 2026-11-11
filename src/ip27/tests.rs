@@ -396,3 +396,19 @@ fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
     });
     assert_eq!(spurious, 0, "a line's page was found unmapped while another processor renumbered");
 }
+
+/// The generation counter the JIT watches for a page of a node's memory is
+/// the bank's own, wherever the page is reached from.
+#[cfg(feature = "jitv2")]
+#[test]
+fn the_nodes_home_view_hands_out_the_banks_page_generation() {
+    let mem = NodeMemory::new([64, 0, 0, 0]).unwrap();
+    let home = mem.home();
+    let bank = mem.physical().banks()[0].gen_ptr(0x2000);
+    assert!(!bank.is_null());
+    assert_eq!(home.gen_ptr(0x2000), bank);
+    assert_ne!(home.gen_ptr(0x3000), bank, "one counter per page");
+    // Past the fitted run the decode table answers, and fitted memory it
+    // does not hold has no counter.
+    assert!(home.gen_ptr(0x400_0000).is_null());
+}
