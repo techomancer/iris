@@ -1315,11 +1315,17 @@ impl KeyboardLayout {
 /// monomorphisation, picked when the machine is built.
 ///
 /// - `full`: the functional caches (`mips_cache_v2`): tags, line data, LRU,
-///   write-back, VCE. What the interpreter is fastest with, since its decoded
-///   instructions live in the cache lines.
+///   write-back, VCE. Memory is stale until a dirty line is written back, and
+///   Hit Invalidate discards one, as on a real Indy (cpu-tests'
+///   `cache/hit_inv_discards`). A `tcache` build, which every `jitv2` build
+///   is, makes it transparent: it keeps the tags and states but writes
+///   through to memory.
 /// - `shadow`: memory is the only store; tag arrays exist only to answer
-///   CACHE instructions (`mips_cache_shadow`). jitv2's inline loads and stores
-///   need no tag check against it.
+///   CACHE instructions (`mips_cache_shadow`). jitv2's inline loads and
+///   stores need no tag check against it, so it is the faster model under
+///   jitv2. On the interpreter neither model is clearly faster: the shadow
+///   costs fewer host instructions in iris-bench's kernel-mode kernels, but
+///   under IRIX the difference is within run-to-run spread.
 /// - `auto`: `shadow` in a `jitv2` build, `full` otherwise.
 ///
 /// The R10000 family only has the shadow model.
