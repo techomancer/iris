@@ -785,6 +785,12 @@ impl KonaBackend {
 
     /// Set up what the GL path made in `self.prims` and submit it, then empty it.
     fn flush(&mut self) {
+        // The GL path sets the state with every primitive it queues and `Prims::clear` unsets it,
+        // so no state means nothing is queued. This runs after every geometry command, and the
+        // moves below carry the whole `Prims` out and back.
+        if self.prims.state.is_none() {
+            return;
+        }
         let mut prims = std::mem::take(&mut self.prims);
         if let Some(ds) = prims.state.filter(|_| !prims.tris.is_empty() || !prims.lines.is_empty() || !prims.aa.is_empty() || !prims.discs.is_empty() || !prims.clears.is_empty()) {
             self.raster.draws += !(prims.tris.is_empty() && prims.lines.is_empty() && prims.aa.is_empty() && prims.discs.is_empty()) as u64;
@@ -1455,6 +1461,18 @@ mod tests {
         let mut out = Vec::new();
         let known = kona.with_backend(|b| b.monitor(args, &mut out)).unwrap();
         (known, String::from_utf8(out).unwrap())
+    }
+
+    /// A flush with nothing queued leaves the counters and the queue alone.
+    #[test]
+    fn a_flush_with_nothing_queued_changes_nothing() {
+        let mut be = KonaBackend::new(test_cfg());
+        be.prims.tris.reserve(64);
+        let capacity = be.prims.tris.capacity();
+        be.flush();
+        assert_eq!((be.raster.draws, be.raster.triangles, be.raster.clears, be.raster.off_target), (0, 0, 0, 0));
+        assert!(be.prims.state.is_none() && be.prims.tris.is_empty());
+        assert_eq!(be.prims.tris.capacity(), capacity);
     }
 
     #[test]
