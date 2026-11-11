@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use winit::keyboard::KeyCode;
@@ -56,8 +56,21 @@ struct Ps2State {
 /// The most a mouse packet carries an axis.
 const MOUSE_MAX: i32 = 127;
 
+/// A place for the host's keyboard and mouse to go instead of the PS/2 ports,
+/// for a machine whose real keyboard and mouse sit on another bus (the
+/// I-brick's are USB). The UI and the monitor keep talking to the controller.
+pub trait InputSink: Send + Sync {
+    fn key(&self, key: KeyCode, pressed: bool);
+    /// `buttons` as for [`Ps2Controller::push_mouse_input`], `dy` down-positive.
+    fn mouse(&self, buttons: u8, dx: i32, dy: i32, dz: i32);
+    fn mouse_enabled(&self) -> bool;
+    fn mouse_pending(&self) -> usize;
+}
+
 /// Combined PS/2 Keyboard and Mouse Controller
 pub struct Ps2Controller {
+    /// Where the host's input goes when it does not go to the PS/2 ports.
+    sink: OnceLock<Arc<dyn InputSink>>,
     state: Mutex<Ps2State>,
     /// The controller's interrupt: up while a byte waits to be read.
     irq: Option<IrqLine>,
@@ -71,6 +84,7 @@ impl Ps2Controller {
     /// Create a new PS/2 Controller
     pub fn new(irq: Option<IrqLine>) -> Self {
         Self {
+            sink: OnceLock::new(),
             state: Mutex::new(Ps2State {
                 rx_queue: VecDeque::new(),
                 mouse_queue_bytes: 0,
@@ -94,6 +108,11 @@ impl Ps2Controller {
             running: AtomicBool::new(false),
             layout: AtomicU8::new(KeyboardLayout::Ansi as u8),
         }
+    }
+
+    /// Send the host's keys and pointer to `sink` from now on. Once, at build.
+    pub fn redirect_input(&self, sink: Arc<dyn InputSink>) {
+        assert!(self.sink.set(sink).is_ok(), "input redirected twice");
     }
 
     /// Set the host keyboard's physical shape; see [`KeyboardLayout`].
@@ -525,17 +544,26 @@ impl Ps2Controller {
     /// Whether the guest has turned the mouse on: until it has, moves and
     /// clicks are dropped.
     pub fn mouse_enabled(&self) -> bool {
+        if let Some(sink) = self.sink.get() {
+            return sink.mouse_enabled();
+        }
         let state = self.state.lock();
         state.mouse_enabled && state.config & 0x20 == 0
     }
 
     /// Mouse bytes queued that the guest has not read yet.
     pub fn mouse_pending(&self) -> usize {
+        if let Some(sink) = self.sink.get() {
+            return sink.mouse_pending();
+        }
         self.state.lock().mouse_queue_bytes
     }
 
     /// Push a scancode byte to the keyboard queue (called from UI)
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
+        if let Some(sink) = self.sink.get() {
+            return sink.key(key, pressed);
+        }
         if !self.running.load(Ordering::Relaxed) { return; }
         let mut state = self.state.lock();
         if !state.scanning_enabled || state.config & 0x10 != 0 {
@@ -967,6 +995,9 @@ impl Ps2Controller {
     /// - `dx`, `dy`: signed X/Y delta (Y is screen-down-positive; flipped here)
     /// - `dz`: scroll wheel delta (positive = scroll up/away from user)
     pub fn push_mouse_input(&self, buttons: u8, dx: i32, dy: i32, dz: i32) {
+        if let Some(sink) = self.sink.get() {
+            return sink.mouse(buttons, dx, dy, dz);
+        }
         if !self.running.load(Ordering::Relaxed) { return; }
         let mut state = self.state.lock();
         if !state.mouse_enabled || state.config & 0x20 != 0 { return; }
@@ -1347,6 +1378,47 @@ impl Saveable for Ps2Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct Recorder {
+        events: Mutex<Vec<String>>,
+    }
+    impl InputSink for Recorder {
+        fn key(&self, key: KeyCode, pressed: bool) {
+            self.events.lock().push(format!("key {key:?} {pressed}"));
+        }
+        fn mouse(&self, buttons: u8, dx: i32, dy: i32, dz: i32) {
+            self.events.lock().push(format!("mouse {buttons} {dx} {dy} {dz}"));
+        }
+        fn mouse_enabled(&self) -> bool {
+            true
+        }
+        fn mouse_pending(&self) -> usize {
+            7
+        }
+    }
+
+    /// With a sink set, keys, typed text and the pointer go to it and the
+    /// PS/2 queue stays empty, even with the guest's scanning enabled.
+    #[test]
+    fn redirected_input_bypasses_the_ps2_queue() {
+        let p = Ps2Controller::new(None);
+        p.start();
+        p.write_to(0xF4, false);
+        assert_eq!(p.pop_from(false), Some(0xFA));
+        let sink = Arc::new(Recorder::default());
+        p.redirect_input(sink.clone());
+        p.push_kb(KeyCode::KeyA, true);
+        assert!(p.type_char('b'));
+        p.push_mouse_input(1, 2, 3, 0);
+        assert_eq!(
+            *sink.events.lock(),
+            ["key KeyA true", "key KeyB true", "key KeyB false", "mouse 1 2 3 0"]
+        );
+        assert_eq!(p.pop_from(false), None);
+        assert!(p.mouse_enabled());
+        assert_eq!(p.mouse_pending(), 7);
+    }
 
     /// `type_char` sends what the keys themselves would: Shift around a
     /// shifted character, Enter for a newline, and nothing for a character
