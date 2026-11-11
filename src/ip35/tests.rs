@@ -105,6 +105,51 @@ fn the_fuel_runs_the_r14000_at_revision_2_3() {
         .expect("thread panicked");
 }
 
+/// The board-id word's low nibble selects the PROM's speed-table row, and the
+/// flash record has to agree with that row's clock; the PROM reports a
+/// mismatch otherwise. Read through the processor's bus at the local
+/// `0x9000000014000000`.
+#[test]
+fn the_board_word_names_the_speed_row_of_the_fuels_processor() {
+    use crate::cpu::parts;
+    use crate::ip34_machine::{board_word, CPUS, FUEL_BOARD_ID, SPEED_ROWS};
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let word = board.bus.read64(0x1400_0000);
+    assert_eq!(word.status, BUS_OK);
+    assert_eq!(word.data, FUEL_BOARD_ID);
+    for part in CPUS {
+        assert_eq!(board_word(part), Some(word.data), "{}", part.name());
+        let row = SPEED_ROWS.iter().find(|r| r.nibble == word.data & 0xf).expect("a row for the nibble");
+        assert_eq!((row.mhz, row.l2_kb), (part.mhz, part.l2_kb));
+        assert_eq!(u64::from(crate::dev::bedrock_flash::FirmwareRecord::FUEL.cpu_clock_hz), u64::from(part.mhz) * 1_000_000);
+    }
+    // Class 4 is the Fuel; the nibble 4 is the 500 MHz, 2 MB module.
+    assert_eq!(word.data >> 12 & 0xf, 4);
+    assert_eq!(word.data, 0x4004);
+}
+
+/// The PROM's table, row by row (read from the PROM's code), and the nibbles
+/// with no row.
+#[test]
+fn the_speed_table_maps_each_established_row_and_refuses_the_rest() {
+    use crate::cpu::parts::{Part, R14000_500};
+    use crate::ip34_machine::{board_word, SPEED_ROWS};
+    let part = |mhz, l2_kb| Part { mhz, l2_kb, ..R14000_500 };
+    let rows = [(500, 2048, 0x4004), (600, 4096, 0x4007), (700, 4096, 0x4003), (800, 4096, 0x400c), (900, 8192, 0x4002)];
+    for (mhz, l2_kb, word) in rows {
+        assert_eq!(board_word(&part(mhz, l2_kb)), Some(word), "{mhz} MHz, {l2_kb} KB");
+    }
+    // A clock with the wrong cache, or a clock off the table, has no row.
+    assert_eq!(board_word(&part(500, 4096)), None);
+    assert_eq!(board_word(&part(600, 2048)), None);
+    assert_eq!(board_word(&part(400, 2048)), None);
+    // The nibbles the PROM reports as "Unknown PIMM_PSC type". Others are
+    // simply not in the table here: the PROM's table was read, not these.
+    for nibble in [0x0, 0x5, 0xf] {
+        assert!(SPEED_ROWS.iter().all(|r| r.nibble != nibble), "{nibble:#x}");
+    }
+}
+
 #[test]
 fn narrow_stores_carry_the_register_to_devices_that_ask_for_it() {
     let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
