@@ -21,8 +21,8 @@ fn node(revision: u8) -> Node {
 fn pair() -> (Node, Node) {
     let (a, b) = (node(3), node(3));
     let (wa, wb): (Weak<dyn NetPeer>, Weak<dyn NetPeer>) = (Arc::downgrade(&a.ni) as _, Arc::downgrade(&b.ni) as _);
-    a.ni.connect_peer(Some(wb));
-    b.ni.connect_peer(Some(wa));
+    a.ni.connect_peer(wb);
+    b.ni.connect_peer(wa);
     (a, b)
 }
 fn r(ni: &Ni, off: u64) -> u64 {

@@ -488,8 +488,8 @@ impl Hub {
     /// boards of an Origin 2000 or Onyx2 deskside.
     pub fn cable(a: &Arc<Hub>, b: &Arc<Hub>) {
         assert!(a.peer.set(b.view.clone()).is_ok() && b.peer.set(a.view.clone()).is_ok(), "a Hub is cabled once");
-        a.ni.connect_peer(Some(Arc::downgrade(&b.ni) as Weak<dyn NetPeer>));
-        b.ni.connect_peer(Some(Arc::downgrade(&a.ni) as Weak<dyn NetPeer>));
+        a.ni.connect_peer(Arc::downgrade(&b.ni) as Weak<dyn NetPeer>);
+        b.ni.connect_peer(Arc::downgrade(&a.ni) as Weak<dyn NetPeer>);
     }
 
     /// Run `f` on the Hub the node number names. This Hub always answers for

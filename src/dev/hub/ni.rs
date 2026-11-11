@@ -41,7 +41,7 @@ use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 pub mod reg {
     pub const STATUS: u64 = 0x60_0000;
@@ -199,7 +199,8 @@ impl State {
 pub struct Ni {
     revision: u8,
     state: Mutex<State>,
-    peer: Mutex<Option<Weak<dyn NetPeer>>>,
+    /// The far end of the cable, set once when the machine is wired.
+    peer: OnceLock<Weak<dyn NetPeer>>,
     /// The module has power. A disabled port reads down at its peer.
     enabled: AtomicBool,
     /// The node number and the neighbour's, mirrored from the state and the
@@ -219,16 +220,17 @@ impl Ni {
         Self {
             revision,
             state: Mutex::new(State::new(revision)),
-            peer: Mutex::new(None),
+            peer: OnceLock::new(),
             enabled: AtomicBool::new(true),
             routing,
             neighbour: AtomicU32::new(NO_NEIGHBOUR),
         }
     }
 
-    /// Join this port to the far end of a cable, or take the cable off.
-    pub fn connect_peer(&self, peer: Option<Weak<dyn NetPeer>>) {
-        *self.peer.lock() = peer;
+    /// Join this port to the far end of a cable. Done once, as the machine is
+    /// wired.
+    pub fn connect_peer(&self, peer: Weak<dyn NetPeer>) {
+        assert!(self.peer.set(peer).is_ok(), "a port is cabled once");
         self.announce();
     }
 
@@ -244,7 +246,7 @@ impl Ni {
     }
 
     fn peer(&self) -> Option<Arc<dyn NetPeer>> {
-        self.peer.lock().as_ref().and_then(Weak::upgrade)
+        self.peer.get().and_then(Weak::upgrade)
     }
 
     /// The neighbour, if the cable has one that is up.
