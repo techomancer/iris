@@ -61,13 +61,23 @@ impl Staging {
             staging.slice(..at).map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
-            gpu.wait(Some(submission))?;
-            rx.recv().map_err(|e| format!("readback callback: {e}"))?.map_err(|e| format!("map readback: {e}"))?;
-            {
+            let piece = (|| {
+                gpu.wait(Some(submission))?;
+                rx.recv().map_err(|e| format!("readback callback: {e}"))?.map_err(|e| format!("map readback: {e}"))?;
                 let view = staging.slice(..at).get_mapped_range().map_err(|e| format!("readback range: {e}"))?;
                 out.extend_from_slice(&view);
-            }
+                Ok::<(), String>(())
+            })();
             staging.unmap();
+            // A wait that timed out leaves the map pending: wgpu refuses any
+            // submission that uses a buffer not idle, so every later read
+            // would fail on it ("Buffer with 'readback' label is still
+            // mapped"). Unmap aborts the pending map; forget the buffer as
+            // well, so the next read starts on a fresh one.
+            if let Err(e) = piece {
+                self.buffer = None;
+                return Err(e);
+            }
             if rest.is_none() && ranges.peek().is_none() {
                 break;
             }
