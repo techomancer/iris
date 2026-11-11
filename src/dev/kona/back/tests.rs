@@ -959,6 +959,61 @@ fn a_pixel_read_by_dma_is_laid_out_under_the_pack_record() {
     assert_eq!(r.ram.word(REASON_PAGE), 0, "a descriptor that is not the read's size posts nothing");
 }
 
+/// A read in a colour-index window returns the indices the draw wrote, from the colour words they
+/// sit in (12-bit index, shifted 4), through the index shift and offset; in a window of colours a
+/// colour-index read has nothing to read and is refused, counted.
+#[test]
+fn a_colour_index_window_is_read_in_indices() {
+    use crate::dev::kona::defs::gl::{COLOR_BUFFER_BIT, FRONT};
+    use crate::dev::kona::defs::pixel::*;
+    let mut b = KonaBackend::new(KonaConfig::default());
+    command(&mut b, Grammar::Kernel, LOAD_ONE_ENTRY_OF_DISPLAY_ID_TABLE, &[14, 0x24005c]);
+    command(&mut b, Grammar::Kernel, DISPLAY_MODE_BYTE, &[0, 14, 8]);
+    command(&mut b, Grammar::Kernel, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 14, 0]);
+    command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 0, 0]);
+    command(&mut b, Grammar::Gl, SET_VIEWPORT, &[0, 0, 64, 64]);
+    command(&mut b, Grammar::Gl, SELECT_DRAW_BUFFER, &[FRONT]);
+    command(&mut b, Grammar::Gl, SELECT_READ_BUFFER, &[FRONT]);
+    command(&mut b, Grammar::Gl, SET_COLOUR_INDEX_CLEAR_VALUE, &[300.0f32.to_bits()]);
+    command(&mut b, Grammar::Gl, CLEAR_SELECTED_BUFFERS, &[COLOR_BUFFER_BIT]);
+    command(&mut b, Grammar::Gl, SET_CURRENT_COLOUR_INDEX_SIGNED_SHORT, &[6 << 16]);
+    command(&mut b, Grammar::Gl, BEGIN_PRIMITIVE_RECTANGLE, &[0xe]);
+    for (x, y) in [(10.5, 10.5), (30.5, 10.5), (30.5, 30.5), (10.5, 30.5)] {
+        command(&mut b, Grammar::Gl, SUBMIT_VERTEX_2_COMPONENTS_SINGLE_FLOAT, &[ndc(x), ndc(y)]);
+    }
+    command(&mut b, Grammar::Gl, END_OPEN_PRIMITIVE, &[0]);
+    command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+    let read = |b: &mut KonaBackend, args: &[u32]| {
+        let screen = b.gl.screen();
+        let ds = b.contexts.select(None).gl.draw_state(screen);
+        b.arrays(&ds);
+        let c = b.contexts.select(None);
+        let env = gl::pixels::Env { store: &b.store, ds };
+        gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, args)
+    };
+    let out = read(&mut b, &[9, 20, 1, 1, FORMAT_COLOUR_INDEX, TYPE_UNSIGNED_SHORT, 0]);
+    assert_eq!(out, gl::pixels::Out::Reply(vec![0x01, 0x2c, 0, 0]), "the clear index, 300, wants all twelve bits");
+    let out = read(&mut b, &[20, 20, 2, 1, FORMAT_COLOUR_INDEX, TYPE_UNSIGNED_SHORT, 0]);
+    assert_eq!(out, gl::pixels::Out::Reply(vec![0, 6, 0, 6]), "and the rectangle's index is 6");
+    let out = read(&mut b, &[20, 20, 2, 1, FORMAT_COLOUR_INDEX, TYPE_UNSIGNED_BYTE, 0]);
+    assert_eq!(out, gl::pixels::Out::Reply(vec![6, 6, 0, 0]));
+    // Pixels outside the window read zero, and the shift and offset apply to the indices as GL's
+    // do.
+    command(&mut b, Grammar::Gl, SET_PIXEL_TRANSFER_PARAMETER_FLOAT_FORM, &[INDEX_OFFSET, 10]);
+    let out = read(&mut b, &[20, 20, 1, 1, FORMAT_COLOUR_INDEX, TYPE_UNSIGNED_BYTE, 0]);
+    assert_eq!(out, gl::pixels::Out::Reply(vec![16, 0, 0, 0]));
+    // A window of colours has no indices.
+    let mut b = pixel_window();
+    let screen = b.gl.screen();
+    let ds = b.contexts.select(None).gl.draw_state(screen);
+    b.arrays(&ds);
+    let c = b.contexts.select(None);
+    let env = gl::pixels::Env { store: &b.store, ds };
+    let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, &[0, 0, 1, 1, FORMAT_COLOUR_INDEX, TYPE_UNSIGNED_BYTE, 0]);
+    assert_eq!(out, gl::pixels::Out::Nothing);
+    assert_eq!(b.pix_counts.refused, 1);
+}
+
 /// The reply to a read that fits the page has the rows of the width's own bytes: the client lays
 /// them out under the pack alignment, row length and skips as it copies them to the caller's
 /// buffer, so the board that padded them too put the padding in twice (a 13 by 5 RED read of bytes
@@ -992,6 +1047,57 @@ fn a_read_reply_is_not_padded_by_the_pack_record() {
     assert_eq!(read(&mut b, &[], &args), gl::pixels::Out::Reply(want.clone()));
     assert_eq!(read(&mut b, &[(PACK_BASE + 5, 1)], &args), gl::pixels::Out::Reply(want.clone()));
     assert_eq!(read(&mut b, &[(PACK_BASE + 5, 4), (PACK_BASE + 2, 21), (PACK_BASE + 3, 2), (PACK_BASE + 4, 3)], &args), gl::pixels::Out::Reply(want));
+}
+
+/// A pixel draw in a colour-index window writes indices into the colour words (12-bit index,
+/// shifted 4), not a grey or mapped colour: the index shift, offset and index-to-index map apply,
+/// the index wraps to the window's width, and a copy within the window moves indices through the
+/// same stages.
+#[test]
+fn a_pixel_draw_in_a_colour_index_window_writes_indices() {
+    use crate::dev::kona::defs::gl::FRONT;
+    use crate::dev::kona::defs::pixel::*;
+    let mut b = KonaBackend::new(KonaConfig::default());
+    command(&mut b, Grammar::Kernel, LOAD_ONE_ENTRY_OF_DISPLAY_ID_TABLE, &[14, 0x24005c]);
+    command(&mut b, Grammar::Kernel, DISPLAY_MODE_BYTE, &[0, 14, 8]);
+    command(&mut b, Grammar::Kernel, WINDOW_CLIP_SETUP, &[0, 0, 64, 64, 0, 0, 64, 64, 0, 14, 0]);
+    command(&mut b, Grammar::Gl, CONFIGURE_FRAME_BUFFER_LAYOUT, &[0, 8, 0, 1, 0, 0, 24, 0, 0, 0]);
+    command(&mut b, Grammar::Gl, SET_VIEWPORT, &[0, 0, 64, 64]);
+    command(&mut b, Grammar::Gl, SELECT_DRAW_BUFFER, &[FRONT]);
+    command(&mut b, Grammar::Gl, SELECT_READ_BUFFER, &[FRONT]);
+    // The front buffer is the layout's second colour word.
+    const FRONT_WORD: usize = 1;
+    let at = |b: &mut KonaBackend, x: f32, y: f32| command(b, Grammar::Gl, SET_RASTER_POSITION_2_COMPONENTS_FLOAT, &[ndc(x), ndc(y)]);
+    let words = |b: &mut KonaBackend| {
+        command(b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+        (0..4).map(|i| b.store.read(20 + i, 20, FRONT_WORD)).collect::<Vec<_>>()
+    };
+    // Two unsigned shorts, 17 and 300, make one row word.
+    at(&mut b, 20.5, 20.5);
+    let hdr = [2, 1, FORMAT_COLOUR_INDEX, TYPE_UNSIGNED_SHORT, 0, 0, 0, 0];
+    let draw = |b: &mut KonaBackend| {
+        assert_eq!(command(b, Grammar::Gl, DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, &hdr), Reply::Data(1));
+        send(b, Job::Data { grammar: Grammar::Gl, selector: DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA, args: &hdr, words: &[17 << 16 | 300] });
+    };
+    draw(&mut b);
+    assert_eq!(words(&mut b), [17 << 4, 300 << 4, 0, 0], "the index sits at the window's shift, not a grey or a replicated byte");
+    // An offset applies, and the result wraps to the twelve bits.
+    command(&mut b, Grammar::Gl, SET_PIXEL_TRANSFER_PARAMETER_FLOAT_FORM, &[INDEX_OFFSET, 4000]);
+    draw(&mut b);
+    assert_eq!(words(&mut b), [4017 << 4, 4300 % 4096 << 4, 0, 0]);
+    command(&mut b, Grammar::Gl, SET_PIXEL_TRANSFER_PARAMETER_FLOAT_FORM, &[INDEX_OFFSET, 0]);
+    // A copy of those pixels moves indices, and applies the offset to them.
+    command(&mut b, Grammar::Gl, SET_PIXEL_TRANSFER_PARAMETER_FLOAT_FORM, &[INDEX_OFFSET, 6]);
+    at(&mut b, 40.5, 20.5);
+    let screen = b.gl.screen();
+    let ds = b.contexts.select(None).gl.draw_state(screen);
+    b.arrays(&ds);
+    let c = b.contexts.select(None);
+    let env = gl::pixels::Env { store: &b.store, ds };
+    gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, COPY_PIXEL_RECTANGLE_WITHIN_FRAME_BUFFER, &[20, 20, 2, 1, 0, COPY_COLOUR, 0]);
+    command(&mut b, Grammar::Kernel, WINDOW_SYSTEM_PIXEL_PATH_FINISH, &[0]);
+    let copied: Vec<u32> = (0..2).map(|i| b.store.read(40 + i, 20, FRONT_WORD)).collect();
+    assert_eq!(copied, [(4017 + 6) % 4096 << 4, (4300 % 4096 + 6) << 4]);
 }
 
 /// A DAC cursor load is decoded and held by channel, and draws nothing until channel 0's control register enables it; a load of another length, or

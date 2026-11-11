@@ -986,9 +986,20 @@ impl Gl {
     /// The colour word an index is in a colour-index window: the index, to the window's width,
     /// at the shift the scan-out reads it from.
     pub fn index_word(&self, index: f32) -> u32 {
+        self.index_word_of(index.max(0.0) as u32 as i64)
+    }
+
+    /// The same for an integer index, which wraps to the window's width as the planes hold it.
+    pub fn index_word_of(&self, index: i64) -> u32 {
         let Some(shift) = self.ci else { return 0 };
         let width = if shift == 4 { 0xfff } else { 0xff };
-        ((index.max(0.0) as u32) & width) << shift
+        ((index & width) as u32) << shift
+    }
+
+    /// A colour word as the colour the draw path writes back unchanged: a byte to a component.
+    pub fn word_colour(w: u32) -> [f32; 4] {
+        let byte = |shift: u32| ((w >> shift) & 0xff) as f32 / 255.0;
+        [byte(16), byte(8), byte(0), byte(24)]
     }
 
     /// The colour the next vertex, raster position and fragment carry. In a colour-index window
@@ -998,9 +1009,7 @@ impl Gl {
         if self.ci.is_none() {
             return self.color;
         }
-        let w = self.index_word(self.index);
-        let byte = |shift: u32| ((w >> shift) & 0xff) as f32 / 255.0;
-        [byte(16), byte(8), byte(0), byte(24)]
+        Self::word_colour(self.index_word(self.index))
     }
 
     /// A swap of display id `id` that shows buffer `bank`.

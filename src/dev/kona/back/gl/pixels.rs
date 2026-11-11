@@ -18,9 +18,11 @@
 //!   CMYKA) are sized by the pipe's component table (four and five components) so the words
 //!   that follow a header are consumed, and refused. Type codes 14 to 20 are refused (their
 //!   element sizes are known, their bit layouts are not).
-//! - A colour-index image has no index window to land in: it goes through the
-//!   index-to-colour pixel maps when they are loaded, else as an eight-bit grey (the
-//!   model's own).
+//! - A colour-index image drawn into a window of colours goes through the index-to-colour
+//!   pixel maps when they are loaded, else as an eight-bit grey (the model's own). Drawn into a
+//!   colour-index window it is written as indices: the index through the shift, offset and
+//!   index-to-index map, to the window's width, at the shift the scan-out reads
+//!   (`Gl::index_word_of`). A copy in such a window moves indices the same way.
 //! - Accumulation keeps one float per component in the layout's accumulation words (three
 //!   words, or four with alpha). The storage format in frame-buffer memory is unknown, so the
 //!   floats are the model's own. An operation is one pass, except that a value of exactly 1.0
@@ -1005,6 +1007,7 @@ fn emit(gl: &Gl, c: &mut Counts, canvas: &Canvas<'_>, img: &Image) {
         (a.min(b), a.max(b))
     };
     let (rc, rz) = (pos.colour, pos.z);
+    let index_window = gl.ci.is_some();
     for j in 0..img.h {
         let (y0, y1) = span(ry, j, zy);
         for i in 0..img.w {
@@ -1015,7 +1018,10 @@ fn emit(gl: &Gl, c: &mut Counts, canvas: &Canvas<'_>, img: &Image) {
                     match &img.plane {
                         Plane::Colour(col) => canvas.frag(c, x, y, p.colour(col[k]), rz),
                         Plane::Index(v) => {
-                            let col = p.index_colour(p.integer(v[k], MAP_INDEX_TO_INDEX, p.map_colour), c);
+                            let i = p.integer(v[k], MAP_INDEX_TO_INDEX, p.map_colour);
+                            // A colour-index window keeps the index in its colour word, as the
+                            // index draws do.
+                            let col = if index_window { Gl::word_colour(gl.index_word_of(i)) } else { p.index_colour(i, c) };
                             canvas.frag(c, x, y, col, rz)
                         }
                         Plane::Depth(d) => canvas.frag(c, x, y, rc, depth32(p.depth(d[k]))),
@@ -1080,25 +1086,45 @@ fn capture(gl: &Gl, canvas: &Canvas<'_>, x: i32, y: i32, w: usize, h: usize, kin
     Some(Image { w, h, plane: match kind { COPY_COLOUR => Plane::Colour(col), COPY_DEPTH => Plane::Depth(zs), _ => Plane::Stencil(ints) } })
 }
 
-/// The pixels of a read, after the transfer stages. A colour-index read has no index plane to read
-/// and is refused, counted.
+/// The indices a colour-index window's colour words hold, back from the components `components8`
+/// took them as (eight bits to a component), before any transfer stage.
+fn indices(col: &[[f32; 4]], shift: u32) -> impl Iterator<Item = i64> + '_ {
+    let width = if shift == 4 { 0xfff } else { 0xff };
+    let byte = |v: f32| (v * 255.0 + 0.5) as u32;
+    col.iter().map(move |&[r, g, b, _]| ((byte(r) << 16 | byte(g) << 8 | byte(b)) >> shift & width) as i64)
+}
+
+/// The pixels of a read, after the transfer stages. A colour-index read takes the indices a
+/// colour-index window keeps in its colour words (`Gl::ci`: the index sits at the window's shift,
+/// to its width, as `Gl::index_word` writes it); in a window of colours it has nothing to read and
+/// is refused, counted.
 fn read_image(gl: &Gl, c: &mut Counts, canvas: &Canvas<'_>, [x, y, w, h]: [u32; 4], format: u32) -> Option<Image> {
     let kind = match format {
         FORMAT_DEPTH => COPY_DEPTH,
         FORMAT_STENCIL => COPY_STENCIL,
         _ => COPY_COLOUR,
     };
-    if format == FORMAT_COLOUR_INDEX {
-        c.refused += 1;
-        return None;
-    }
+    let shift = match (format, gl.ci) {
+        (FORMAT_COLOUR_INDEX, None) => {
+            c.refused += 1;
+            return None;
+        }
+        (FORMAT_COLOUR_INDEX, ci) => ci,
+        _ => None,
+    };
     let Some(mut img) = capture(gl, canvas, x as i32, y as i32, w as usize, h as usize, kind) else {
         c.refused += 1;
         return None;
     };
     let p = &gl.pix;
     match &mut img.plane {
-        Plane::Colour(col) => col.iter_mut().for_each(|v| *v = p.colour(*v)),
+        Plane::Colour(col) => match shift {
+            None => col.iter_mut().for_each(|v| *v = p.colour(*v)),
+            Some(shift) => {
+                let ints = indices(col, shift).map(|i| p.integer(i, MAP_INDEX_TO_INDEX, p.map_colour)).collect();
+                img.plane = Plane::Index(ints);
+            }
+        },
         Plane::Depth(d) => d.iter_mut().for_each(|v| *v = p.depth(*v)),
         Plane::Stencil(v) => v.iter_mut().for_each(|v| *v = p.integer(*v, MAP_STENCIL_TO_STENCIL, p.map_stencil)),
         Plane::Index(_) => {}
@@ -1184,10 +1210,15 @@ pub fn plane_command(gl: &mut Gl, c: &mut Counts, env: &Env<'_>, selector: u32, 
                 c.invalid_position += 1;
                 return Out::Nothing;
             }
-            let Some(img) = capture(gl, &canvas, x as i32, y as i32, w as usize, h as usize, kind) else {
+            let Some(mut img) = capture(gl, &canvas, x as i32, y as i32, w as usize, h as usize, kind) else {
                 c.refused += 1;
                 return Out::Nothing;
             };
+            // In a colour-index window the colour words are indices: they copy as indices, through
+            // the index shift, offset and map, not as colours through the colour stages.
+            if let (Some(shift), Plane::Colour(col)) = (gl.ci, &img.plane) {
+                img.plane = Plane::Index(indices(col, shift).collect());
+            }
             emit(gl, c, &canvas, &img);
             Out::Nothing
         }
@@ -1203,7 +1234,7 @@ pub fn plane_command(gl: &mut Gl, c: &mut Counts, env: &Env<'_>, selector: u32, 
             // misplace the rows the same way). So the reply is packed without them. Byte swapping
             // and bit order stay the board's, which the client's swapped reads show.
             let rec = Record { alignment: 1, row_length: 0, skip_rows: 0, skip_pixels: 0, ..gl.pix.pack };
-            let Some(bytes) = (format != FORMAT_COLOUR_INDEX).then(|| pack(&img, format, ty, low & 3, &rec)).flatten() else {
+            let Some(bytes) = pack(&img, format, ty, low & 3, &rec) else {
                 c.refused += 1;
                 return Out::Nothing;
             };
