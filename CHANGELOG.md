@@ -21,6 +21,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The Origin 3200's I-brick has a USB keyboard and mouse (HID boot devices on its OHCI), driven by the same
   `ps2` monitor commands.
 
+### Onyx 3000
+
+- New machine `onyx3000_ip35`: the Origin 3200 with an InfiniteReality3 G-brick
+  (`[graphics] board = "ir3"`) or a VPro V12 V-brick (`"v12"`, an approximation).
+
 ### GPU raster on the GL backend draws the window directly
 
 - With `raster = "wgpu"` and `gpu_backend = "gl"`, the wgpu window renderer now

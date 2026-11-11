@@ -36,6 +36,7 @@
 //! Board composition ported from hw/mips/sgi/sn-machine.c and
 //! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
+mod onyx3000;
 mod origin3200;
 
 use crate::config::MachineConfig;
@@ -74,10 +75,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use origin3200::CPUS;
+use onyx3000::Onyx3000;
 use origin3200::Origin3200;
 
 /// The Origin 3200: one or two C-bricks and an I-brick.
 pub(crate) type Origin3200Machine = Ip35Machine<Origin3200>;
+
+/// The Onyx 3000: the Origin 3200 with a graphics brick (`onyx3000`).
+pub(crate) type Onyx3000Machine = Ip35Machine<Onyx3000>;
 
 /// The most processors a machine numbers across its nodes: the CPU limit of
 /// the machine's park slots.
@@ -141,6 +146,11 @@ pub(crate) struct BoardIo {
     pub eth: Arc<Ioc3Eth>,
     /// The Fibre Channel adapter whose loop holds the machine's disks.
     pub fibre: Option<Arc<crate::dev::isp2200::Isp2200>>,
+    /// The graphics board's window, when the product has one.
+    pub display: Option<Arc<dyn GfxDisplay>>,
+    /// What the graphics board's status bar shows. The machine hands it the
+    /// first processor's cycle counter.
+    pub status: Option<Arc<crate::disp::StatusSource>>,
 }
 
 /// A product. Only wiring differs in behaviour between products;
@@ -355,6 +365,10 @@ impl<B: Ip35Board> Ip35Machine<B> {
         drop(ports);
         let ci_serial = cfg.ci.then(|| io.serial[io.console].ci.clone());
         let first = &units[0].cpu;
+        if let Some(status) = &io.status {
+            status.set_cpu_cycles(first.cycles_ptr());
+            status.set_count_hz(first.count_hz_atomic());
+        }
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(units.iter().map(|u| u.cpu.clone()).collect())));
@@ -555,7 +569,7 @@ impl<B: Ip35Board> Workstation for Ip35Machine<B> {
         self.lifecycle = state;
     }
     fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        None
+        self.io.display.clone()
     }
     // The C-bricks' Bedrock chips, their node memory and the I-brick's devices
     // keep no saved state, so a snapshot would restore a machine that is not
