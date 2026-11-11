@@ -41,9 +41,16 @@ impl<const N: usize> DeadlineTimers<N> {
     /// access. `floor` is the least delay for a kind, for a deadline that can
     /// recur faster than a timer should fire; `fire` runs on the timer thread
     /// with the device and the kind and deadline it was armed for.
-    pub fn arm<S: Send + Sync + 'static>(
+    ///
+    /// `held` is the device lock `want` was read under. It is let go only
+    /// once the table is taken, so passes set the timers in the order they
+    /// saw the device. Otherwise a pass that read the device just before a
+    /// register write could arm after that write, from the older deadlines,
+    /// and remove the timer the write set.
+    pub fn arm<S: Send + Sync + 'static, G>(
         &self,
         want: &[Option<Instant>; N],
+        held: G,
         running: &AtomicBool,
         device: &Weak<S>,
         floor: fn(usize) -> Duration,
@@ -51,6 +58,7 @@ impl<const N: usize> DeadlineTimers<N> {
     ) {
         let Some(tm) = self.manager.get() else { return };
         let mut armed = self.armed.lock();
+        drop(held);
         // Checked under the lock `cancel_all` clears the slots with: a pass
         // that sees `running` set has its timers removed by that stop.
         if !running.load(Ordering::SeqCst) {
@@ -151,7 +159,7 @@ mod tests {
     fn a_deadline_fires_once_and_its_slot_empties() {
         let d = device();
         let due = Instant::now() + Duration::from_millis(5);
-        d.timers.arm(&[Some(due), None], &d.running, &Arc::downgrade(&d), |_| Duration::ZERO, fire);
+        d.timers.arm(&[Some(due), None], (), &d.running, &Arc::downgrade(&d), |_| Duration::ZERO, fire);
         assert!(d.timers.is_armed(0));
         assert!(!d.timers.is_armed(1));
         assert!(wait_for(|| d.fired[0].load(Ordering::SeqCst) == 1));
@@ -164,9 +172,9 @@ mod tests {
         let d = device();
         let me = Arc::downgrade(&d);
         let far = Instant::now() + Duration::from_secs(3600);
-        d.timers.arm(&[Some(far), None], &d.running, &me, |_| Duration::ZERO, fire);
+        d.timers.arm(&[Some(far), None], (), &d.running, &me, |_| Duration::ZERO, fire);
         let near = Instant::now() + Duration::from_millis(5);
-        d.timers.arm(&[Some(near), None], &d.running, &me, |_| Duration::ZERO, fire);
+        d.timers.arm(&[Some(near), None], (), &d.running, &me, |_| Duration::ZERO, fire);
         assert!(wait_for(|| d.fired[0].load(Ordering::SeqCst) == 1));
         assert_eq!(d.fired[0].load(Ordering::SeqCst), 1, "the far timer was removed, not left to fire");
     }
@@ -177,10 +185,10 @@ mod tests {
         let me = Arc::downgrade(&d);
         let far = Some(Instant::now() + Duration::from_secs(3600));
         d.running.store(false, Ordering::SeqCst);
-        d.timers.arm(&[far, far], &d.running, &me, |_| Duration::ZERO, fire);
+        d.timers.arm(&[far, far], (), &d.running, &me, |_| Duration::ZERO, fire);
         assert!(d.timers.none_armed());
         d.running.store(true, Ordering::SeqCst);
-        d.timers.arm(&[far, far], &d.running, &me, |_| Duration::ZERO, fire);
+        d.timers.arm(&[far, far], (), &d.running, &me, |_| Duration::ZERO, fire);
         assert!(d.timers.is_armed(0) && d.timers.is_armed(1));
         d.timers.cancel_all();
         assert!(d.timers.none_armed());
@@ -190,11 +198,41 @@ mod tests {
     fn the_floor_delays_a_kind_that_recurs_quickly() {
         let d = device();
         let now = Instant::now();
-        d.timers.arm(&[Some(now), Some(now)], &d.running, &Arc::downgrade(&d), |k| {
+        d.timers.arm(&[Some(now), Some(now)], (), &d.running, &Arc::downgrade(&d), |k| {
             if k == 0 { Duration::from_millis(40) } else { Duration::ZERO }
         }, fire);
         assert!(wait_for(|| d.fired[1].load(Ordering::SeqCst) == 1));
         assert_eq!(d.fired[0].load(Ordering::SeqCst), 0, "kind 0 is held back by its floor");
         assert!(wait_for(|| d.fired[0].load(Ordering::SeqCst) == 1));
+    }
+
+    /// A pass that read the device before a write cannot arm after that
+    /// write from what it read, and so cannot remove the timer the write
+    /// set. The test holds the table so the pass stops just short of arming;
+    /// the write must then wait for it.
+    #[test]
+    fn a_pass_that_read_the_device_first_arms_first() {
+        let d = device();
+        let me = Arc::downgrade(&d);
+        let chip: Mutex<Option<Instant>> = Mutex::new(None);
+        let due = Instant::now() + Duration::from_secs(3600);
+        let pass = |set: Option<Instant>| {
+            let mut st = chip.lock();
+            if set.is_some() {
+                *st = set;
+            }
+            d.timers.arm(&[*st, None], st, &d.running, &me, |_| Duration::ZERO, fire);
+        };
+        std::thread::scope(|s| {
+            let table = d.timers.armed.lock();
+            let old = s.spawn(|| pass(None));
+            assert!(wait_for(|| chip.is_locked()), "the pass keeps the device until it has the table");
+            let write = s.spawn(|| pass(Some(due)));
+            drop(table);
+            old.join().unwrap();
+            write.join().unwrap();
+        });
+        assert_eq!(d.timers.armed.lock()[0].map(|(_, at)| at), Some(due));
+        d.timers.cancel_all();
     }
 }
