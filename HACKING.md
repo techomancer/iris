@@ -912,8 +912,25 @@ growing the fixed command or state-slot ABI. The shader bypasses shade,
 patterns, alpha comparison, logic, blending and dithering, matching the CPU
 mode fold even when stale raw mode bits request those operations.
 
-This completes the M4 ordinary/zoomed pixmap boundary. READ remains a hard
-error until M5 supplies an explicit synchronized source.
+This completes the M4 ordinary/zoomed pixmap boundary.
+
+Resident HostR uses the existing explicit raw-plane observation boundary. One
+reusable CPU snapshot holds only the selected RGB or auxiliary plane and is
+keyed by plane, resident epoch and last-write position. A cache miss submits
+the exact accepted prefix, maps the fixed readback staging buffer once and
+copies the complete selected plane; unchanged generations reuse that snapshot
+for every PIO or DMA word and may reuse it across transfer boundaries. The
+existing CPU HostR walker reads the snapshot rather than either board CPU
+framebuffer, then READ advances the resident stream without changing a plane
+generation. Selected-plane writes, reset and restore invalidate the key.
+
+The board interface preserves its asymmetric phase rules: a PIO GO read
+returns the current latch and queues the next word, while scalar and bulk DMA
+prime before returning data. A bulk token runs and retires its complete HostRW
+batch once. Observation counters attribute full-plane attempts, successful
+bytes and stream cuts to `HostRead`; snapshot and monitor reasons reuse the
+same synchronization primitive. Failures remain sticky and never fall back to
+the stale CPU planes. This completes M5 in the gated backend.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each

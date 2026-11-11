@@ -290,8 +290,8 @@ asynchronous device-error sink before and after submission and while idle,
 including a full GFIFO and a full ordinary machine event queue. They require
 a single first-fault notification and reject restart.
 These tests opt in to the test-only display worker; they do not enable resident
-raster in the emulator. They do not complete board-level HOSTR, snapshot or
-other raw consumers, full opcode/lifecycle coverage, or production guest
+raster in the emulator. They do not complete board-level snapshot or monitor
+raw consumers, full opcode/lifecycle coverage, or production guest
 validation. On Windows and Linux, an additional hardware test sends two
 ordered draws and a resize through the common wgpu presenter on a native
 window. It explicitly reads the presenter's unpacked frame texture, including
@@ -395,12 +395,22 @@ arena, three state slots and two reusable GPU sets to force repeated payload
 and state exhaustion. Complete planes, context, counters and stream positions
 must remain CPU-identical on both backends.
 
+Two focused CPU tests pin resident HostR board gating, sticky failure and
+batch retirement across PIO, scalar DMA and bulk DMA ports. The hardware
+observation case runs the existing CPU HostR walker against one reusable
+selected-plane snapshot and checks RGB/auxiliary cache reuse. The board oracle
+writes distinct GPU-resident RGB words, verifies PIO read-then-advance and
+bulk-DMA prime-then-read values, proves repeated GOs use one attributed
+full-plane map, then writes the selected plane and requires exactly one new
+map. The board CPU framebuffer remains stale throughout.
+
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::rex3_flat_fill::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::line::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::host::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag mixed_host_sources_match_between_interpreter_and_jit -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag test_hostr_board_ -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag line_pattern_closed_form_matches_scalar_advancement -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::command::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_ -- --test-threads=1
@@ -425,13 +435,13 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The exact 99-case script requires 28 `resident_` CPU tests, four flat-fill tests, two line
+The exact 101-case script requires 28 `resident_` CPU tests, four flat-fill tests, two line
 tests, two HostW walker tests, one HostW interpreter/JIT source test, one
-shade-DDA test, one pattern-state test, three command-ABI tests and three
-direct-state tests, then **19 resident GPU tests and eight direct scanout
-tests on each backend**: 99 tests in total. The window test requires an
-available native desktop and a GPU that can present to it. The script checks
-each libtest pass count, rejects
+shade-DDA test, one pattern-state test, two resident HostR port/retirement
+tests, three command-ABI tests and three direct-state tests, then **19
+resident GPU tests and eight direct scanout tests on each backend**: 101 tests
+in total. The window test requires an available native desktop and a GPU that
+can present to it. The script checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
 or `-Backend dx12` runs just one hardware backend and is not the complete
