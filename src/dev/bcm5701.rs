@@ -248,7 +248,7 @@ impl Bcm5701 {
             PCI_INTA,
             policy,
         );
-        pci.write(11, u32::from(SUBSYSTEM_ID) << 16 | u32::from(SUBSYSTEM_VENDOR_ID));
+        pci.set_subsystem_identity(u32::from(SUBSYSTEM_ID) << 16 | u32::from(SUBSYSTEM_VENDOR_ID));
         let now = Instant::now();
         let dev = Arc::new_cyclic(|me| Self {
             st: Mutex::new(State::new(

@@ -6,6 +6,7 @@ use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK
 use std::io::Write;
 use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, load_u8_slice, u8_slice_to_toml};
+use crate::config::{civil_from_days, days_from_civil};
 use crate::dev::battery_clock;
 
 /// A Dallas-style RTC with battery-backed NVRAM.
@@ -72,29 +73,6 @@ mod rtc_reg {
     pub const B_BINARY: u8 = 0x04;
     pub const B_24H: u8 = 0x02;
     pub const TIME: [usize; 7] = [SEC, MIN, HOUR, WDAY, MDAY, MONTH, YEAR];
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// The date for a count of days since 1970-01-01: (year, month, day).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 impl MaceRtc {

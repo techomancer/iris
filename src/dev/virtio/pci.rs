@@ -86,8 +86,8 @@ impl VirtioPci {
             PCI_INTA,
         )
         .with_capabilities(16, &caps);
-        // Subsystem: vendor and the virtio device ID, dword 11.
-        pci.write(11, ((id as u32) << 16) | VENDOR_ID as u32);
+        // Subsystem: vendor and the virtio device ID.
+        pci.set_subsystem_identity(((id as u32) << 16) | VENDOR_ID as u32);
         Self { core, pci: PciFunctionState::new(pci), sel: Default::default() }
     }
 
@@ -278,6 +278,13 @@ mod tests {
         dev.state().connect_irq(line);
         dev.attached();
         (dev, mem, port, probe)
+    }
+
+    #[test]
+    fn subsystem_survives_a_reset() {
+        let (dev, ..) = rig();
+        dev.power_on();
+        assert_eq!(dev.state().config().read(11), (3 << 16) | 0x1af4);
     }
 
     #[test]
