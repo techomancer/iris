@@ -64,15 +64,15 @@ pub const R14000_500: Part = Part { mhz: 500, rev: (2, 3), ..R14000_600 };
 
 /// The Tezro's and Origin 350's earliest R16000: rev 2.1, 4 MB secondary cache.
 /// A 700 MHz R16000 also shipped as rev 2.2, in the Fuel, so this one takes
-/// the `_EARLY` suffix and the plain `R16000_700` stays free for that part
-/// when the Fuel takes it. The configuration name `r16000_700` is this part.
+/// the `_EARLY` suffix. The configuration name `r16000_700` is this part.
 pub const R16000_700_EARLY: Part = Part { family: Family::R16000, mhz: 700, rev: (2, 1), l2_kb: 4096 };
 pub const R16000_800: Part = Part { mhz: 800, rev: (2, 2), ..R16000_700_EARLY };
 pub const R16000_900: Part = Part { mhz: 900, rev: (3, 0), l2_kb: 8192, ..R16000_700_EARLY };
 pub const R16000_1000: Part = Part { mhz: 1000, rev: (3, 0), l2_kb: 16384, ..R16000_700_EARLY };
 
 /// Every part, for the bare-metal bench rig, which takes any. A name matches
-/// the first listed, so the rig runs the later silicon of a clock that has two.
+/// the first listed, so the order picks the silicon of a clock that has two:
+/// the Indy's rev 1.0 R5000, which the bench runs, and the rev 2.7 R10000.
 pub const ALL: &[&Part] = &[
     &R4400_150, &R5000_180_EARLY, &R5000_180, &R10000_195, &R10000_195_EARLY, &R10000_250,
     &R10000_180, &R12000_270, &R12000_360, &R12000_400, &R12000_400_8M, &R14000_600,

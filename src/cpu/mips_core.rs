@@ -153,7 +153,7 @@ pub const KSU_USER: u32 = 0b10;
 /// default layout scatter them next to fields with completely different
 /// access patterns and risk false sharing).
 ///
-/// Both fields are inline (not `Arc<AtomicU64>`) so they're fixed
+/// The fields are inline (not `Arc<AtomicU64>`) so they're fixed
 /// `offset_of!` fields reachable directly from a bare `*mut MipsCore` — the
 /// interpreter's hot loop and JIT-compiled code both need to touch these
 /// with zero indirection (no Arc deref, no separate heap allocation to

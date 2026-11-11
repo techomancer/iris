@@ -291,8 +291,9 @@ impl PciBus {
     }
 
     /// Tell the host every output's level again, whatever it already has.
-    /// A restore ends with this, after the host and the interrupt
-    /// controller behind it have loaded.
+    /// A restore whose host does not keep its own copy of the levels ends
+    /// with this, after the host and the interrupt controller behind it have
+    /// loaded.
     pub fn redrive(&self) {
         if let Uplink::Root { combiner, .. } = &self.0.uplink {
             combiner.redrive();
@@ -404,10 +405,12 @@ impl PciBus {
     }
 }
 
-/// Every function's header, and the pin and board IRQ levels. A restore
-/// replaces all of it and forgets what the host was last told; the machine then
-/// calls [`PciBus::redrive`]. The functions behind the headers save their own
-/// state.
+/// Every function's header, and each interrupt source's level. A restore
+/// replaces all of it and takes the host to have the loaded levels, as a host
+/// that restores its own copy does (the Octane's Bridge keeps its pins' levels
+/// in its snapshot). A host that does not is told them again with
+/// [`PciBus::redrive`] once it has loaded (the O2's MACE bus, for CRIME). The
+/// functions behind the headers save their own state.
 impl Saveable for PciBus {
     fn save_state(&self) -> toml::Value {
         let i = &*self.0;

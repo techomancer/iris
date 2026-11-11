@@ -24,9 +24,10 @@
 //! on R5000, full-length iris-bench), so compare is the only mode: it works
 //! the same in every build and every region.
 //!
-//! A RAM remap (MEMCFG) changes which regions are RAM and which counters back
-//! a page: the cache records the window key it was filled under, which moves
-//! with every change of the window's maps, and starts over when it changes. Snapshot restore and power-on flush everything.
+//! A RAM remap (MEMCFG) changes which regions are RAM: the cache records the
+//! window key it was filled under, which moves with every change of the
+//! window's maps, and starts over when it changes. Snapshot restore and
+//! power-on flush everything.
 
 use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 #[cfg(feature = "opcodefusion")]
