@@ -83,7 +83,7 @@ use parking_lot::Mutex;
 use crate::dev::qlogic_ring::{self, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE, Notes, RingCtl, RingState, RingThread};
 
 use crate::devlog::LogModule;
-use crate::irq::{IrqGuard, IrqMutex};
+use crate::irq::{IrqGuard, IrqLevel, IrqMutex};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_INTA};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
 use crate::snapshot::{get_field, hex_u16, hex_u32, load_u16_slice, toml_u16, toml_u32, toml_u8, u16_slice_to_toml, u8_slice_to_toml};
@@ -495,6 +495,14 @@ pub struct State {
     total_cmds: u64,
 }
 
+/// Only the RISC request bit and its enable drive the line; they share a
+/// bit position.
+impl IrqLevel for State {
+    fn irq_level(&self) -> bool {
+        self.bus_status & self.bus_ctrl & STATUS_RISC_INT_REQ != 0
+    }
+}
+
 impl State {
     fn new() -> Self {
         let mut s = State {
@@ -590,12 +598,6 @@ impl State {
     /// bus-reset hold-off model choices record this.
     fn request_out(&self) -> u16 {
         self.parked.front().map_or(self.rqst_cons, |p| p.cons as u16)
-    }
-
-    /// Only the RISC request bit and its enable drive the line; they share a
-    /// bit position.
-    fn irq_level(&self) -> bool {
-        self.bus_status & self.bus_ctrl & STATUS_RISC_INT_REQ != 0
     }
 
     fn resp_has_room(&self) -> bool {
@@ -764,7 +766,7 @@ impl<P: IspPart> Core<P> {
         Self {
             part,
             cancel: AtomicU64::new(0),
-            ring: RingThread::new(st, State::irq_level),
+            ring: RingThread::new(st),
             buses,
             targets_reset: [AtomicBool::new(false), AtomicBool::new(false)],
             index,
