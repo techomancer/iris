@@ -6951,24 +6951,9 @@ mod tests {
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
-    /// FCSR's Inexact bits (Cause bit 12, Flag bit 2) for ROUND/TRUNC/CEIL/
-    /// FLOOR/CVT-to-int ops: masked out of the comparison below.
-    /// `MipsExecutor::fpu_update_fcsr`'s Inexact reporting for these ops
-    /// depends on whether the interpreter's own Rust `.round()`/`.trunc()`/
-    /// etc. happen to lower to a host FP instruction that touches MXCSR —
-    /// which differs between debug and release Rust builds (`.round()`
-    /// sets Precision/Inexact in debug builds via a real ROUNDSS-class
-    /// lowering, but not in release builds, where trunc/ceil/floor never
-    /// set it in either profile). That's an LLVM codegen artifact, not a
-    /// specified MIPS/FCSR behavior — the JIT (via emit_round_and_convert's
-    /// explicit clear before the final int conversion) deliberately never
-    /// reports Inexact for this op class, matching the *stable* behavior
-    /// (release-build interpreter, and trunc/ceil/floor in any profile)
-    /// rather than chasing whichever the current interpreter build happens
-    /// to produce for `.round()` specifically. See
-    /// clanker/jitv2/codegen-gotchas.md.
-    const FCSR_INEXACT_MASK: u32 = (1 << 12) | (1 << 2);
-
+    /// One float-to-integer conversion, compared in full with the
+    /// interpreter, FCSR Inexact included: both engines judge it by value
+    /// (rounded result against source), so it no longer depends on the build.
     fn cvt_to_int_case(funct: u32, fmt: u32, fs_val: f64) {
         let mut fpr = [0u64; 32];
         if fmt == crate::cpu::mips_isa::RS_S {
@@ -6982,11 +6967,7 @@ mod tests {
         let interp = run_interpreter_fpu(instr, [0u64; 32], fpr, pc, true);
         let jit = run_jit_fpu(instr, [0u64; 32], fpr, pc, word_offset, true)
             .expect("conversion must be compilable for this test to be meaningful");
-        let mut interp_masked = interp.clone();
-        let mut jit_masked = jit.clone();
-        interp_masked.fpu_fcsr &= !FCSR_INEXACT_MASK;
-        jit_masked.fpu_fcsr &= !FCSR_INEXACT_MASK;
-        assert_eq!(jit_masked, interp_masked, "JIT and interpreter diverged (ignoring the build-dependent Inexact bit) for instr=0x{:08x}", instr);
+        assert_eq!(jit, interp, "JIT and interpreter diverged for instr=0x{:08x}", instr);
     }
 
     #[test]
@@ -8691,7 +8672,7 @@ mod tests {
         const N: usize = 128;
         const REPS: usize = 20_000;
 
-        fn probe(instrs: &[u32], fr1: bool) -> f64 {
+        fn probe(instrs: &[u32], fr1: bool, src: Option<u64>) -> f64 {
             let mut page = [0u32; ENTRIES_PER_PAGE];
             page[..instrs.len()].copy_from_slice(instrs);
             let mut analyzer = Analyzer::new();
@@ -8711,6 +8692,7 @@ mod tests {
                 // so either direction stays on the fast path.
                 *slot = (i as u64) * 3;
             }
+            if let Some(bits) = src { fpr[2] = bits; }
             let (mut exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, 0xFFFF_FFFF_8000_1000, fr1);
             exec.core.fpu_fcsr = 0;
             exec.install_jit_hooks();
@@ -8733,30 +8715,42 @@ mod tests {
         // fd rotated over four registers; fs fixed (to-int) or rotated too
         // (from-int, so the source values differ).
         let fds = [4u32, 6, 8, 10];
-        let cases: &[(&str, Vec<u32>)] = &[
-            ("cvt.s.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_S))),
-            ("cvt.d.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_D))),
-            ("cvt.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
-            ("cvt.l.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
-            ("cvt.w.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
-            ("cvt.l.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
-            ("trunc.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W))),
-            ("cvt.s.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
-            ("cvt.d.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
-            ("cvt.s.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
-            ("cvt.d.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
+        let s32 = |v: f32| Some(v.to_bits() as u64);
+        let d64 = |v: f64| Some(v.to_bits());
+        let cases: &[(&str, Vec<u32>, Option<u64>)] = &[
+            ("cvt.s.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_S)), None),
+            ("cvt.d.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_D)), None),
+            ("cvt.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W)), None),
+            ("cvt.l.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_L)), None),
+            ("cvt.w.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W)), None),
+            ("cvt.l.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_L)), None),
+            ("trunc.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), None),
+            ("cvt.s.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S)), None),
+            ("cvt.d.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D)), None),
+            ("cvt.s.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S)), None),
+            ("cvt.d.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D)), None),
+            ("cvt.w.s 79.0", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W)), s32(79.0)),
+            ("cvt.w.s 3.7", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W)), s32(3.7)),
+            ("cvt.w.d 79.0", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W)), d64(79.0)),
+            ("cvt.w.d 3.7", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W)), d64(3.7)),
+            ("trunc.w.s 79.0", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), s32(79.0)),
+            ("trunc.w.s 3.7", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), s32(3.7)),
+            ("trunc.w.d 79.0", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), d64(79.0)),
+            ("trunc.w.d 3.7", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_W)), d64(3.7)),
+            ("trunc.l.d 79.0", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_L)), d64(79.0)),
+            ("trunc.l.d 3.7", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FTRUNC_L)), d64(3.7)),
         ];
 
         let mut best = std::collections::BTreeMap::new();
         for _ in 0..3 {
-            for (name, instrs) in cases {
-                let ns = probe(instrs, true);
+            for (name, instrs, src) in cases {
+                let ns = probe(instrs, true, *src);
                 let e = best.entry(*name).or_insert(f64::MAX);
                 if ns < *e { *e = ns; }
             }
         }
         for (name, ns) in &best {
-            println!("{:<12} {:8.3} ns/instruction", name, ns);
+            println!("{:<16} {:8.3} ns/instruction", name, ns);
         }
     }
 
