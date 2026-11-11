@@ -849,7 +849,7 @@ pub(crate) fn register_fatal_controller(
                     return;
                 }
                 eprintln!("iris: fatal device failure: {fault}");
-                stop_and_flush(machine, &label);
+                let _ = stop_and_flush(machine, &label);
             });
             if result.is_err() {
                 break;

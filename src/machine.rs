@@ -2360,7 +2360,8 @@ mod controller_lifetime_tests {
 
     #[test]
     fn fatal_device_event_stops_machine_and_blocks_restart() {
-        let mut machine = build_machine();
+        let nv = TempPath::dir("machine-fatal-nv");
+        let mut machine = build_machine(&nv);
         machine.start();
         let slot = machine.machine_slot();
         let (tx, rx) = std::sync::mpsc::channel();
