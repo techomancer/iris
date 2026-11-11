@@ -109,6 +109,9 @@ pub trait Renderer: Send {
 
     #[cfg(all(test, feature = "wgpu"))]
     fn resident_presented_texture(&self) -> Option<&wgpu::Texture> { None }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    fn takes_resident_readback_frames(&self) -> bool { false }
 }
 
 pub const REX3_SIZE: u32 = 0x2000; // 8KB
@@ -2032,9 +2035,15 @@ impl Rex3 {
             _ => None,
         };
         if let Some(renderer) = self.renderer.lock().as_deref() {
-            let gpu = resident_gpu.as_ref()
-                .ok_or(ResidentError::Unsupported("resident renderer requires a GPU"))?;
-            frame::validate_presenter(renderer, gpu)?;
+            if renderer.takes_gpu_frames() {
+                let gpu = resident_gpu.as_ref()
+                    .ok_or(ResidentError::Unsupported("resident renderer requires a GPU"))?;
+                frame::validate_presenter(renderer, gpu)?;
+            } else if !renderer.takes_resident_readback_frames() {
+                return Err(ResidentError::Unsupported(
+                    "resident frames require a wgpu presenter or labeled readback renderer",
+                ));
+            }
         }
         let mut processor = self.processor_thread.lock();
         if let Some(error) = self.resident_fault() {

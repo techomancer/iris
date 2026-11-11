@@ -8,7 +8,9 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use super::{RasterMode, Rex3, Renderer, GFIFO_RESIDENT_FRAME, STATUS_VRINT};
 use crate::dev::ng1::wgpu::direct::{CaptureFault, Ng1ResidentScanout, ResidentFrameStamp, ResidentScanoutTraffic};
-use crate::dev::ng1::wgpu::resident::{Position, ResidentError};
+use crate::dev::ng1::wgpu::resident::{
+    Observation, ObservationReason, PlaneMask, Position, ResidentError,
+};
 use crate::dev::ng1::wgpu::Ng1Scanout;
 use crate::disp::{BarStats, StatusBar, StatusBarTexture, FB_STRIDE};
 use crate::debug_overlay::DebugOverlay;
@@ -304,6 +306,130 @@ pub(super) fn validate_presenter(renderer: &dyn Renderer, gpu: &Arc<Gpu>) -> Res
         return Err(ResidentError::DeviceMismatch);
     }
     Ok(())
+}
+
+fn observed_words(observation: &Observation, rgb: bool) -> Result<Vec<u32>, ResidentError> {
+    let bytes = if rgb { observation.rgb() } else { observation.aux() }
+        .ok_or(ResidentError::InvalidState("compatibility observation is missing a plane"))?;
+    let mut chunks = bytes.chunks_exact(size_of::<u32>());
+    let words = chunks
+        .by_ref()
+        .map(|bytes| u32::from_ne_bytes(bytes.try_into().expect("u32-sized chunk")))
+        .collect();
+    if !chunks.remainder().is_empty() {
+        return Err(ResidentError::InvalidState("compatibility observation has a partial word"));
+    }
+    Ok(words)
+}
+
+/// Explicitly slow validation/compatibility path: read both authoritative
+/// planes, then hand the CPU snapshots to the ordinary renderer.
+pub(crate) struct ResidentCompatibilityDisplay {
+    overlay: DebugOverlay,
+    status: StatusBar,
+    sbtex: StatusBarTexture,
+    resize_pending: bool,
+}
+
+impl ResidentCompatibilityDisplay {
+    pub(crate) fn new(rex: &Rex3) -> Result<Self, ResidentError> {
+        if !rex.renderer.lock().as_deref()
+            .is_some_and(Renderer::takes_resident_readback_frames)
+        {
+            return Err(ResidentError::Unsupported("resident compatibility display requires a renderer"));
+        }
+        Ok(Self {
+            overlay: DebugOverlay::new(),
+            status: StatusBar::new(),
+            sbtex: StatusBarTexture::new(),
+            resize_pending: true,
+        })
+    }
+
+    pub(crate) fn render(
+        &mut self,
+        rex: &Rex3,
+        timeout: Duration,
+        at_marker: impl FnOnce(Position),
+    ) -> Result<Position, ResidentError> {
+        rex.wait_resident_display_fence(timeout)?;
+        let cut = rex.resident_frame_cut(timeout)?;
+        at_marker(cut.position);
+
+        let mut screen = rex.screen.lock();
+        rex.resident_frame.invalidate();
+        screen.topscan = cut.topscan;
+        screen.status_bar_only = false;
+        self.resize_pending |= screen.refresh_display_state(
+            &rex.vc2,
+            &rex.xmap0,
+            &rex.cmap0,
+            &rex.bt445,
+            &rex.diag,
+        );
+        if !rex.resident_display_fence_complete() {
+            return Err(ResidentError::Timeout("display fence after frame marker"));
+        }
+        self.overlay.show_cmap = rex.show_cmap.load(Ordering::Relaxed);
+        self.overlay.show_disp_debug = rex.show_disp_debug.load(Ordering::Relaxed);
+        self.overlay.show_draw_debug = rex.draw_debug_active();
+        let stats: BarStats = rex.status.snapshot(Instant::now(), rex.gfifo.len());
+
+        let mut renderer = rex.renderer.lock();
+        let renderer = renderer.as_deref_mut()
+            .ok_or(ResidentError::Unsupported("resident compatibility display requires a renderer"))?;
+        let mut mode = rex.raster.lock();
+        let RasterMode::Resident(raster) = &mut *mode else {
+            return Err(ResidentError::InvalidState("resident raster is not active"));
+        };
+        if raster.status()?.accepted != cut.position {
+            return Err(ResidentError::InvalidState("resident frame marker stream cut changed"));
+        }
+        let observation = raster.observe(ObservationReason::Compatibility, PlaneMask::Both)?;
+        if observation.position() != cut.position {
+            return Err(ResidentError::InvalidState("compatibility observation used the wrong stream cut"));
+        }
+        let rgb = observed_words(&observation, true)?;
+        let aux = observed_words(&observation, false)?;
+        screen.fb_rgb.resize(rgb.len(), 0);
+        screen.fb_aux.resize(aux.len(), 0);
+        #[cfg(feature = "rex-dirty-upload")]
+        let damage = {
+            use crate::dev::ng1::rex3_dirty::{DamagePlane, DamageSnapshot};
+            let mut damage = DamageSnapshot::default();
+            damage.mark_full(DamagePlane::Rgb);
+            damage.mark_full(DamagePlane::Aux);
+            damage
+        };
+        self.resize_pending |= screen.refresh(
+            &rgb,
+            &aux,
+            #[cfg(feature = "rex-dirty-upload")]
+            &damage,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            true,
+            &rex.vc2,
+            &rex.xmap0,
+            &rex.cmap0,
+            &rex.bt445,
+            &rex.diag,
+        );
+        if self.resize_pending {
+            renderer.resize(screen.width, screen.height);
+            self.resize_pending = false;
+        }
+        renderer.present(
+            &mut screen,
+            &mut self.overlay,
+            &mut self.status,
+            &mut self.sbtex,
+            &stats,
+            false,
+            None,
+            None,
+        );
+        Ok(cut.position)
+    }
 }
 
 /// Owns the composed output and its staging buffer across refreshes.
