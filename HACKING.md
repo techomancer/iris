@@ -893,9 +893,16 @@ batched VDMA writes can contend safely, and the bounded resident payload,
 state slots and GPU sets are repeatedly flushed and reused without changing
 architectural order or advancing a HostW context twice.
 
-This completes the M4 ordinary/zoomed pixmap boundary. Resident
-FASTCLEAR+ALPHAHOST remains a hard error; READ remains a hard error until M5
-supplies an explicit synchronized source.
+Canonical FASTCLEAR with ALPHAHOST is also resident for HostW fills and lines.
+The serial walker still fetches and retires every required HostRW field, while
+the field value is ignored and the precomputed replicated `COLORVRAM` value is
+written under clipping and WRMASK. A command flag selects this path without
+growing the fixed command or state-slot ABI. The shader bypasses shade,
+patterns, alpha comparison, logic, blending and dithering, matching the CPU
+mode fold even when stale raw mode bits request those operations.
+
+This completes the M4 ordinary/zoomed pixmap boundary. READ remains a hard
+error until M5 supplies an explicit synchronized source.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each

@@ -790,14 +790,14 @@ It is deliberately slow and never an automatic fallback. M2 is complete
 within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
-The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
+The Windows gate `.\scripts\test-resident-gate.ps1` checks 28 resident CPU,
 4 flat-fill, 2 line, 2 HostW walker, 1 HostW interpreter/JIT source oracle,
 1 shade-DDA, 1 pattern-state, 3 command-ABI and 3 direct-state tests, plus 19
 resident GPU and 8
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 96-test gate. See
+complete 99-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -920,6 +920,7 @@ M4 work and READ remains rejected until M5 observation support.
 - [x] Add zoom segment coalescing.
 - [x] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
 - [x] Stress CPU and VDMA producer interleaving and staging wraparound.
+- [x] Preserve canonical FASTCLEAR+ALPHAHOST consumption and output.
 
 The first M4 slice stages an immutable high-word/low-word copy of every HostRW
 qword in the bounded reusable payload set. One isolated serial command consumes
@@ -989,11 +990,19 @@ boundary, then forces nine payload-capacity flushes and state-slot flushes
 through two reusable GPU sets. Complete planes, context, transfer counters and
 stream positions match the CPU model on Vulkan and D3D12.
 
-This meets M4's ordinary and zoomed pixmap completion boundary. Resident
-FASTCLEAR+ALPHAHOST remains an explicit hard error; HOSTR remains M5 work.
+The final M4 slice accepts canonical FASTCLEAR with ALPHAHOST for HostW fills
+and lines without changing the 64-byte command or 256-byte state-slot ABI.
+HostRW fields are still fetched and retired exactly as the CPU walker does,
+but their values do not become the pixel source. One command flag selects the
+precomputed replicated `COLORVRAM` value and bypasses shade, patterns, alpha
+comparison, logic, blending and dithering in the shader. Geometry, clipping,
+WRMASK, payload accounting and final HostRW context remain active. Complete
+seeded planes and context match the CPU model with deliberately conflicting
+ordinary-pipeline state on Vulkan and D3D12.
 
-Complete when ordinary and zoomed pixmaps match CPU mode with no CPU
-framebuffer store and no per-qword GPU submission.
+M4 is complete within the gated resident backend: ordinary and zoomed pixmaps,
+including FASTCLEAR+ALPHAHOST, match CPU mode with no CPU framebuffer store and
+no per-qword GPU submission. HOSTR remains M5 work.
 
 ### M5 - HOSTR and CPU observation
 
