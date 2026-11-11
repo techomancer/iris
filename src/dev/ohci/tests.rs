@@ -8,14 +8,14 @@ use crate::traits::{Device, Resettable};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Weak;
 
-struct Memory {
-    bytes: Mutex<Vec<u8>>,
+pub(super) struct Memory {
+    pub(super) bytes: Mutex<Vec<u8>>,
     refuse_read: Mutex<Option<u32>>,
     refuse_write: Mutex<Option<u32>>,
     writes: Mutex<Vec<u64>>,
 }
 impl Memory {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             bytes: Mutex::new(vec![0xa5; 0x10000]),
             refuse_read: Mutex::new(None),
@@ -23,13 +23,13 @@ impl Memory {
             writes: Mutex::new(vec![]),
         })
     }
-    fn words(&self, at: u32, words: &[u32]) {
+    pub(super) fn words(&self, at: u32, words: &[u32]) {
         for (i, w) in words.iter().enumerate() {
             self.bytes.lock()[at as usize + i * 4..at as usize + i * 4 + 4]
                 .copy_from_slice(&w.to_le_bytes());
         }
     }
-    fn word(&self, at: u32) -> u32 {
+    pub(super) fn word(&self, at: u32) -> u32 {
         u32::from_le_bytes(
             self.bytes.lock()[at as usize..at as usize + 4]
                 .try_into()
@@ -97,7 +97,7 @@ impl UsbFunction for Function {
         self.reply.lock().clone()
     }
 }
-fn start_port_reset(h: &Ohci, port: u32) {
+pub(super) fn start_port_reset(h: &Ohci, port: u32) {
     let status = 0x54 + port * 4;
     h.bar_write(0, status, 0x100, 4);
     h.bar_write(0, status, 0x10, 4);
@@ -399,7 +399,7 @@ fn frame_number_follows_the_clock_with_no_poll_or_timer() {
     h.stop();
 }
 
-fn fake_clock_ohci(start_ns: usize) -> (Arc<Ohci>, Arc<AtomicUsize>) {
+pub(super) fn fake_clock_ohci(start_ns: usize) -> (Arc<Ohci>, Arc<AtomicUsize>) {
     let h = Ohci::new();
     let now = Arc::new(AtomicUsize::new(start_ns));
     let t = now.clone();

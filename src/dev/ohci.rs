@@ -59,6 +59,7 @@ pub trait UsbFunction: Send + Sync {
 }
 
 mod engine;
+pub mod hid;
 mod schedule;
 
 const EVENTS: u32 = 0x4000_007f;
@@ -249,7 +250,7 @@ impl Ohci {
             }
         }
     }
-    #[cfg(test)]
+    /// Plug a function into a root port.
     pub fn attach(&self, port: usize, function: Arc<dyn UsbFunction>) -> Result<(), String> {
         if port >= 2 {
             return Err("OHCI has two ports".into());
@@ -277,7 +278,6 @@ impl Ohci {
         self.drive_irq();
         Ok(())
     }
-    #[cfg(test)]
     pub fn detach(&self, port: usize) -> Result<(), String> {
         if port >= 2 {
             return Err("OHCI has two ports".into());
@@ -615,3 +615,7 @@ mod register_tests {
 #[cfg(test)]
 #[path = "ohci/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ohci/hid_tests.rs"]
+mod hid_tests;
