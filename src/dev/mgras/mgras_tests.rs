@@ -3764,13 +3764,15 @@ fn real_board_smooth_lines_and_points() {
             points.entry((v[0] == "pointal", n(1), n(2), n(3))).or_default().insert((n(4) as usize, n(5) as usize), n(6));
         }
     }
-    let compare = |what: &str, m: &Mgras, want: &HashMap<(usize, usize), u32>, x0: usize, y0: usize, w: usize, h: usize| {
+    // `want` is keyed from the window's corner at (x0, y0) less `origin`.
+    let compare = |what: &str, m: &Mgras, want: &HashMap<(usize, usize), u32>, origin: (usize, usize), x0: usize, y0: usize, w: usize, h: usize| {
         let (mut sum, mut worst, mut n) = (0u32, 0u32, 0u32);
         for y in y0..y0 + h {
             for x in x0..x0 + w {
                 let got = gl_px(m, x, y) & 0xFF;
-                let e = got.abs_diff(*want.get(&(x, y)).unwrap_or(&0));
-                if e > 0 || want.contains_key(&(x, y)) {
+                let at = (x - origin.0, y - origin.1);
+                let e = got.abs_diff(*want.get(&at).unwrap_or(&0));
+                if e > 0 || want.contains_key(&at) {
                     sum += e;
                     n += 1;
                     worst = worst.max(e);
@@ -3793,7 +3795,7 @@ fn real_board_smooth_lines_and_points() {
     }
     fifo_token(&m, 0x21, &[]);
     for (k, a) in angles.iter().enumerate() {
-        let (mean, worst) = compare(&format!("line at {a} degrees"), &m, &lines[&(k as u32)], (k % 4) * 128, (k / 4) * 128, 128, 128);
+        let (mean, worst) = compare(&format!("line at {a} degrees"), &m, &lines[&(k as u32)], (0, 0), (k % 4) * 128, (k / 4) * 128, 128, 128);
         assert!(mean <= 7.0 && worst <= 40, "line at {a} degrees: mean {mean:.2}, worst {worst}");
     }
     m.stop_engines();
@@ -3802,8 +3804,16 @@ fn real_board_smooth_lines_and_points() {
     // The GE sets a smooth point's pixel box up at glPointSize: 'pointal'
     // sets the size before enabling smoothing, which keeps the aliased box.
     let mut by_size: std::collections::BTreeMap<(bool, u32), (f64, u32, u32)> = Default::default();
-    for (aliased_box, s64, i, j) in keys {
-        let m = linetest_board();
+    // One board draws every point, each in its own 32-pixel cell of the
+    // window: the real board's pixels lie 4 to 12 from the cell's corner,
+    // so no point reaches another's 16 x 16 square. Smoothing goes off
+    // first, so the size and smoothing are set in the order a fresh board
+    // would see them.
+    assert!(keys.len() <= 16 * 16, "{} points do not fit the window's cells", keys.len());
+    let m = linetest_board();
+    for (cell, (aliased_box, s64, i, j)) in keys.into_iter().enumerate() {
+        let (cx, cy) = (cell % 16 * 32, cell / 16 * 32);
+        fifo_token(&m, 0x6C, &[0]);
         if aliased_box {
             fifo_token(&m, 0x4D, &[f(s64 as f32 / 64.0)]);
             fifo_token(&m, 0x6C, &[1]);
@@ -3812,15 +3822,15 @@ fn real_board_smooth_lines_and_points() {
             fifo_token(&m, 0x4D, &[f(s64 as f32 / 64.0)]);
         }
         fifo_token(&m, 0x16, &[]);
-        fifo_token(&m, 0x00, &[f(8.0 + i as f32 / 8.0), f(8.0 + j as f32 / 8.0), f(0.0)]);
+        fifo_token(&m, 0x00, &[f((cx + 8) as f32 + i as f32 / 8.0), f((cy + 8) as f32 + j as f32 / 8.0), f(0.0)]);
         fifo_token(&m, 0x20, &[]);
         let what = format!("point{} {} at ({i}, {j})/8", if aliased_box { " (size first)" } else { "" }, s64 as f32 / 64.0);
-        let (mean, worst) = compare(&what, &m, &points[&(aliased_box, s64, i, j)], 0, 0, 16, 16);
+        let (mean, worst) = compare(&what, &m, &points[&(aliased_box, s64, i, j)], (cx, cy), cx, cy, 16, 16);
         let e = by_size.entry((aliased_box, s64)).or_default();
         *e = (e.0 + mean, e.1.max(worst), e.2 + 1);
         assert!(mean <= 2.5 && worst <= 8, "{what}: mean {mean:.2}, worst {worst}");
-        m.stop_engines();
     }
+    m.stop_engines();
     for ((aliased_box, s64), (sum, worst, n)) in by_size {
         eprintln!(
             "points{} size {}: mean {:.2}, worst {worst}",
