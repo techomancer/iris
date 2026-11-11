@@ -19,39 +19,33 @@ mod common;
 use std::process::Command;
 
 use common::*;
+use iris::bench_report::{Run, EXPECT_EXC};
 
 /// Seconds before a hung guest is killed. A full run takes about a minute on
 /// the interpreter; the margin is for a loaded machine.
 const TIMEOUT_S: u64 = 2400;
 
-/// Kernels that take exceptions on purpose.
-const EXPECT_EXC: &[&str] = &["sys/exception", "sys/tlb_miss"];
-
 /// Every way the result could be wrong.
-fn judge(run: &serde_json::Value, cpu: &str) -> Vec<Finding> {
+fn judge(run: &Run, cpu: &str) -> Vec<Finding> {
     let mut errs = Vec::new();
     // A build whose features did not take runs the wrong CPU and every result
     // is mislabelled. The guest's banner is authoritative because it reads PRId.
     let want = cpu.split('_').next().unwrap().to_uppercase();
-    let got = run["machine"]["cpu"].as_str().unwrap_or("");
-    if got != want {
-        errs.push(Finding::run(format!("guest reports {got}, expected {want}")));
+    if run.machine.cpu != want {
+        errs.push(Finding::run(format!("guest reports {}, expected {want}", run.machine.cpu)));
     }
-    if !run["machine"]["timebase"].as_bool().unwrap_or(false) {
+    if !run.machine.timebase {
         errs.push(Finding::run("no host time base: every timing is a guess"));
     }
     // A kernel that faults is stepped over by the exception dispatcher and
     // still reports a throughput, so unexpected exceptions are checked as well
     // as the checksums themselves.
-    for r in run["rows"].as_array().map(Vec::as_slice).unwrap_or_default() {
-        let name = r["name"].as_str().unwrap_or("?");
-        if r["status"] == "MISMATCH" {
-            let s = |k: &str| r[k].as_str().unwrap_or("?").to_string();
-            errs.push(Finding::test(name, format!("checksum {} != {}", s("checksum"), s("golden"))));
+    for r in &run.rows {
+        if r.status == "MISMATCH" {
+            errs.push(Finding::test(&r.name, format!("checksum {} != {}", r.checksum, r.golden)));
         }
-        let exc = r["exc"].as_u64().unwrap_or(0);
-        if exc != 0 && !EXPECT_EXC.contains(&name) {
-            errs.push(Finding::test(name, format!("took {exc} unexpected exceptions")));
+        if r.exc != 0 && !EXPECT_EXC.contains(&r.name.as_str()) {
+            errs.push(Finding::test(&r.name, format!("took {} unexpected exceptions", r.exc)));
         }
     }
     errs
@@ -111,9 +105,9 @@ fn cell(cpu: &str) {
     let path = dir.join(wrote);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{cell}: no result at {}: {e}", path.display()));
-    let run: serde_json::Value = serde_json::from_str(&text).expect("parse the saved result");
+    let run: Run = serde_json::from_str(&text).expect("parse the saved result");
     let errs = judge(&run, cpu);
-    let (matched, checked) = (&run["matched"], &run["checked"]);
+    let (matched, checked) = (run.matched, run.checked);
     if !errs.is_empty() {
         panic!(
             "{}\n{matched}/{checked} matched\n{}",
