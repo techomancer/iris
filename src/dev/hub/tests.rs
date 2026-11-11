@@ -411,6 +411,24 @@ fn two_cabled_hubs_each_claim_the_others_programmed_number() {
     assert_eq!(ma.read8(NODE(2) + 0x40).data, 0x5a);
 }
 
+/// The Hub reads the neighbour's number from the neighbour when it decodes an
+/// address. A copy of it kept on this side can be left holding the old number
+/// when two announcements race, and then every access to the neighbour fails.
+/// Publishing a number without any announcement stands in for that: the
+/// decode has to follow what the neighbour holds now.
+#[test]
+fn the_decode_follows_the_number_the_neighbour_holds_now() {
+    let (a, b) = pair();
+    let ma = a.claim(Space::Memory);
+    number(&b, 1);
+    assert_eq!(ma.read8(NODE(1) + 0x10).data, 0x90);
+    b.routing().set(7, b.routing().calias());
+    assert_eq!(ma.read8(NODE(7) + 0x10).data, 0x90, "the neighbour's current number reaches it");
+    assert_eq!(ma.read8(NODE(1) + 0x10).status, BUS_ERR, "its old number reaches nothing");
+    assert_eq!(ma.write8(NODE(7) + 0x41, 0x33), BUS_OK);
+    assert_eq!(b.claim(Space::Memory).read8(NODE(7) + 0x41).data, 0x33);
+}
+
 #[test]
 fn the_cached_alias_keeps_node_zero_local_until_the_numbering_moves_it() {
     let hub = hub(1, 3);

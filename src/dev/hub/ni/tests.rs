@@ -242,13 +242,13 @@ fn vector_writes_land_only_on_rows_that_store() {
     assert_eq!((r(&a.ni, reg::VECTOR_READ_DATA), r(&b.ni, reg::PORT_ERROR)), (5, 0));
     // The remote vector write of the node number renumbers the neighbour,
     // which the launching Hub reports for the neighbour's machine, and the
-    // number each end mirrors for the decode follows.
+    // number the decode reads from that Hub follows.
     w(&a.ni, reg::VECTOR, 0);
     w(&a.ni, reg::VECTOR_DATA, 3 << 8);
     let effect = w(&a.ni, reg::VECTOR_PARMS, (reg::STATUS - reg::STATUS) | VECTOR_WRITE);
     assert!(matches!(effect, Effect::PeerNodeNumber), "{effect:?}");
     assert_eq!(b.ni.number(), 3);
-    assert_eq!(a.ni.neighbour_number(), Some(3));
+    assert!(a.ni.has_neighbour());
 }
 
 #[test]

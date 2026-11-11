@@ -224,6 +224,9 @@ struct NodeView {
     /// The machine's node-zero routing, if it has one: a neighbour that
     /// renumbers this node over the cable has it re-read the number.
     zero: OnceLock<Arc<NodeZero>>,
+    /// The node number and cached alias this node's Hub publishes. A Hub across
+    /// the cable reads the number live when it decodes an address.
+    routing: Arc<Routing>,
 }
 
 /// The register window's sections. Kept apart from the Hub's address decode
@@ -317,7 +320,7 @@ impl Hub {
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
             let routing = Routing::new();
             let pi = Pi::new(cfg.cpus, cfg.cpu_base, clock.clone(), routing.clone());
-            let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone(), zero: OnceLock::new() });
+            let view = Arc::new(NodeView { spaces: Default::default(), pi: pi.clone(), zero: OnceLock::new(), routing: routing.clone() });
             let ni = Arc::new(Ni::new(cfg.ni_revision, routing.clone()));
             let io = Io::new(cfg.widget_revision, cfg.manufacturer);
             let regs = Arc::new(Regs {
@@ -495,14 +498,18 @@ impl Hub {
     /// Run `f` on the Hub the node number names. This Hub always answers for
     /// its own first: while two Hubs both hold the reset value zero, each
     /// keeps zero for itself. The peer is looked up only across the cable, and
-    /// a number no reachable Hub holds fails. Both numbers are the network
-    /// unit's own mirrors, so the decode takes no lock.
+    /// a number no reachable Hub holds fails. Each Hub publishes its number
+    /// ([`Routing`]) and the network unit whether a neighbour is across, so the
+    /// decode takes no lock. The neighbour's number is read from the neighbour
+    /// itself on every decode, never kept here: a copy re-derived by two
+    /// threads at once could end up holding the old number, and every access
+    /// to the neighbour would fail until the next renumbering.
     fn with_node<R>(&self, number: u8, f: impl FnOnce(&NodeView) -> R) -> Option<R> {
         let number = u16::from(number);
         if number == self.routing.number() {
             Some(f(&self.view))
-        } else if self.ni.neighbour_number() == Some(number) {
-            self.peer.get().map(|peer| f(peer))
+        } else if self.ni.has_neighbour() {
+            self.peer.get().filter(|peer| peer.routing.number() == number).map(|peer| f(peer))
         } else {
             None
         }

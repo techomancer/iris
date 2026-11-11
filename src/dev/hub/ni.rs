@@ -40,7 +40,7 @@ use super::{Effect, Routing};
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 pub mod reg {
@@ -203,14 +203,15 @@ pub struct Ni {
     peer: OnceLock<Weak<dyn NetPeer>>,
     /// The module has power. A disabled port reads down at its peer.
     enabled: AtomicBool,
-    /// The node number and the neighbour's, mirrored from the state and the
-    /// cable whenever either changes, so the Hub's node decode reads them
-    /// without a lock. `NO_NEIGHBOUR` while no powered neighbour is across.
+    /// The node number, published for the Hub's node decode to read without a
+    /// lock.
     routing: Arc<Routing>,
-    neighbour: AtomicU32,
+    /// Whether a powered neighbour is across the cable, mirrored whenever the
+    /// cable or the far end's power changes. The neighbour's number is not
+    /// mirrored: two re-derivations racing could leave the stale one stored,
+    /// so the decode reads the far end's own [`Routing`].
+    neighbour: AtomicBool,
 }
-
-const NO_NEIGHBOUR: u32 = u32::MAX;
 
 impl Ni {
     /// `revision` is the chip revision code in NI_STATUS_REV_ID bits 7:4 (3 is
@@ -223,7 +224,7 @@ impl Ni {
             peer: OnceLock::new(),
             enabled: AtomicBool::new(true),
             routing,
-            neighbour: AtomicU32::new(NO_NEIGHBOUR),
+            neighbour: AtomicBool::new(false),
         }
     }
 
@@ -295,7 +296,7 @@ impl Ni {
         self.state.lock().port_error |= errors & PORT_ERROR_MASK;
     }
 
-    /// Re-derive the link bits and the neighbour's number from the cable.
+    /// Re-derive the link bits and whether a neighbour is across from the cable.
     pub fn refresh(&self) {
         self.derive();
     }
@@ -310,13 +311,10 @@ impl Ni {
         }
     }
 
-    /// Whether a powered neighbour is across the cable, and its node number,
-    /// as the cable and the neighbour last announced them. Lock-free.
-    pub fn neighbour_number(&self) -> Option<u16> {
-        match self.neighbour.load(Ordering::Acquire) {
-            NO_NEIGHBOUR => None,
-            number => Some(number as u16),
-        }
+    /// Whether a powered neighbour is across the cable, as the cable and the
+    /// neighbour last announced them. Lock-free.
+    pub fn has_neighbour(&self) -> bool {
+        self.neighbour.load(Ordering::Acquire)
     }
 
     /// The link bits: up when a powered neighbour is across the cable. The
@@ -327,7 +325,7 @@ impl Ni {
         // never hold their locks across a call to each other.
         let neighbour = self.neighbour();
         let forces = neighbour.as_ref().map(|peer| peer.forces_eight_bit());
-        self.neighbour.store(neighbour.as_ref().map_or(NO_NEIGHBOUR, |peer| u32::from(peer.number())), Ordering::Release);
+        self.neighbour.store(neighbour.is_some(), Ordering::Release);
         let mut s = self.state.lock();
         match forces {
             None => s.status &= !(STATUS_LINK_UP | STATUS_EIGHT_BIT),
