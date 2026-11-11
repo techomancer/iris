@@ -13,6 +13,7 @@ use super::superio::*;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use crate::dev::ds1685::{Ds1685, NVRAM_OFF_NV};
+use crate::dev::ioc3_kbc::{ctrl, RX_OVERFLOW};
 use crate::pci::PciDmaStatus;
 use crate::irq::LevelProbe;
 use crate::test_temp::TempPath;
@@ -696,7 +697,7 @@ fn type_keys(r: &Rig) {
 #[test]
 fn the_ps2_receive_holds_three_behind_the_clamp() {
     let r = Rig::new();
-    r.w32(CTRL, KBC_K_CLAMP_3 | KBC_M_CLAMP_3);
+    r.w32(CTRL, ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3);
     r.w32(K_TX, 0xf4); // enable scanning
     let _ = r.r32(K_RX);
     r.w32(reg::INT_STATUS, int::KEYBOARD);
@@ -704,7 +705,7 @@ fn the_ps2_receive_holds_three_behind_the_clamp() {
     assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0);
     let first = r.r32(K_RX);
     assert_eq!(first & (VALID[0] | VALID[1] | VALID[2]), VALID[0] | VALID[1] | VALID[2]);
-    assert_eq!(first & KBC_RX_OVERFLOW, 0, "nothing lost");
+    assert_eq!(first & RX_OVERFLOW, 0, "nothing lost");
     // The read released the clamp; the stopped keyboard resumed.
     let second = r.r32(K_RX);
     assert_ne!(second & VALID[2], 0, "the rest were held back, not dropped");
@@ -718,7 +719,7 @@ fn the_ps2_receive_overflows_without_a_clamp() {
     let _ = r.r32(K_RX);
     type_keys(&r);
     let v = r.r32(K_RX);
-    assert_ne!(v & KBC_RX_OVERFLOW, 0, "a fourth character was lost");
+    assert_ne!(v & RX_OVERFLOW, 0, "a fourth character was lost");
 }
 
 #[test]
@@ -735,7 +736,7 @@ fn the_ps2_control_masks_writes() {
     r.w32(CTRL, 0xffff_ffff);
     assert_eq!(
         r.r32(CTRL),
-        0x0000_ffff | K_TO_EN | M_TO_EN | KBC_K_CLAMP_1 | KBC_M_CLAMP_1 | KBC_K_CLAMP_3 | KBC_M_CLAMP_3
+        0x0000_ffff | K_TO_EN | M_TO_EN | ctrl::K_CLAMP_1 | ctrl::M_CLAMP_1 | ctrl::K_CLAMP_3 | ctrl::M_CLAMP_3
     );
     r.c.reset();
     assert_eq!(r.r32(CTRL), 0);

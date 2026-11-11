@@ -22,6 +22,8 @@
 //! * IOC4 stops a port after a failed transfer until a channel reset (its
 //!   error sources are named "serial halted by mem err"). Whether an IOC3
 //!   port halts is not known.
+//! * IOC4 puts a looped-back character on the line for a character time.
+//!   The IOC3 model has it arrive at once, as its ring engine always has.
 //!
 //! # What is approximated here
 //!
@@ -51,8 +53,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::dev::ioc3::{due, span, unspan, until, usize_field};
-use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u8s, StateTable};
+use crate::dev::deadline::{due, span, unspan, until};
+use crate::snapshot::{field, usize_field, get_field, field_bool, field_u32, field_u32s, field_u64, field_u8s, StateTable};
 
 use crate::dev::ns16550::Ns16550;
 
@@ -141,6 +143,9 @@ pub struct SerialDmaParams {
     pub held_counts: bool,
     /// A failed transfer stops the port until a channel reset.
     pub halt_on_dma_error: bool,
+    /// A character the port loops back reaches its receiver inside the
+    /// write, instead of a character time later.
+    pub loopback_at_once: bool,
 }
 
 /// A 16550 as the engine drives it.
@@ -610,7 +615,7 @@ impl SerialDma {
                             self.receive(p, since, host);
                         }
                         host.uart(p).write(UART_THR, entry[slot]);
-                        if looped {
+                        if looped && !self.params.loopback_at_once {
                             self.port[p].loop_due = Some(since + host.uart(p).char_time());
                         }
                         // Drain per character or loopback overruns the FIFO.
@@ -951,8 +956,10 @@ mod tests {
         }
     }
 
-    const FOUR: SerialDmaParams = SerialDmaParams { held_counts: false, halt_on_dma_error: true };
-    const TWO: SerialDmaParams = SerialDmaParams { held_counts: true, halt_on_dma_error: false };
+    const FOUR: SerialDmaParams =
+        SerialDmaParams { held_counts: false, halt_on_dma_error: true, loopback_at_once: false };
+    const TWO: SerialDmaParams =
+        SerialDmaParams { held_counts: true, halt_on_dma_error: false, loopback_at_once: false };
 
     /// One transmit entry holding `byte`, in the port's transmit ring.
     fn queue_char(sdma: &mut SerialDma, chip: &mut Chip, p: usize, byte: u8) {
@@ -1016,6 +1023,20 @@ mod tests {
         chip.refuse_below = 0;
         sdma.run(0, &mut chip);
         assert_eq!(chip.uart[0].sent, b"a", "the walk retries once the transfer works");
+    }
+
+    /// The IOC3 wrote its port tables before the engine was shared, without
+    /// the halt and loop keys. They load, with both off.
+    #[test]
+    fn a_port_table_written_before_the_engine_was_shared_loads() {
+        let now = Instant::now();
+        let mut table = SerialDma::new(2, TWO).save_port(0, now);
+        let keys = table.as_table_mut().expect("a table");
+        assert!(keys.remove("halted").is_some() && keys.remove("loop_due").is_some());
+        let mut dst = SerialDma::new(2, TWO);
+        dst.load_port(0, &table, now).expect("loads without the newer keys");
+        assert!(!dst.halted(0));
+        assert_eq!(dst.loop_deadline(0), None);
     }
 
     #[test]
@@ -1094,13 +1115,32 @@ impl SerialDmaPort {
             tx_delay_frozen: unspan(field_u64(v, "tx_delay_frozen")?),
             tx_delay_irq: field_bool(v, "tx_delay_irq")?,
             post_refused: field_bool(v, "post_refused")?,
-            halted: field_bool(v, "halted")?,
-            loop_due: due(field_u64(v, "loop_due")?, now),
+            // A table saved before the keys existed has neither.
+            halted: get_field(v, "halted").map(|_| field_bool(v, "halted")).transpose()?.unwrap_or(false),
+            loop_due: get_field(v, "loop_due").map(|_| field_u64(v, "loop_due")).transpose()?.and_then(|n| due(n, now)),
         })
     }
 }
 
 impl SerialDma {
+    /// One port's state, timers as the time left after `now`: for a chip
+    /// that keeps each port's table beside its own.
+    pub fn save_port(&self, p: usize, now: Instant) -> toml::Value {
+        self.port[p].save_state(now)
+    }
+
+    /// Replace one port's state with what `save_port` described, timers set
+    /// that far after `now`.
+    pub fn load_port(&mut self, p: usize, v: &toml::Value, now: Instant) -> Result<(), String> {
+        self.port[p] = SerialDmaPort::load_state(v, now)?;
+        Ok(())
+    }
+
+    /// One port back to power-on, ring bases and the other ports as they are.
+    pub fn clear_port(&mut self, p: usize) {
+        self.port[p] = SerialDmaPort::default();
+    }
+
     /// The ring bases and each port's state, timers as the time left after
     /// `now`.
     pub fn save_state(&self, now: Instant) -> toml::Value {

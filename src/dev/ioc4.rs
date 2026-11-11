@@ -182,7 +182,8 @@ const SERIAL_CONTROL_IDLE: u32 = 0x80;
 
 /// IOC4's engine halts a port on a failed transfer and does not define the
 /// packer's held count.
-const IOC4_SDMA_PARAMS: SerialDmaParams = SerialDmaParams { held_counts: false, halt_on_dma_error: true };
+const IOC4_SDMA_PARAMS: SerialDmaParams =
+    SerialDmaParams { held_counts: false, halt_on_dma_error: true, loopback_at_once: false };
 
 /// The UART input clock the board feeds the chip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
