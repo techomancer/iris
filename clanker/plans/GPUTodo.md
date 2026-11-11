@@ -916,8 +916,9 @@ M4 work and READ remains rejected until M5 observation support.
 - [x] Port persistent host-visible upload sets and fixed ownership tracking.
 - [x] Make one VDMA block one staged payload plus one command where possible.
 - [ ] Preserve all-or-nothing `BUS_BUSY` behavior.
-- [ ] Add CPU-walked PIO/zoom segment descriptors.
-- [ ] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
+- [x] Add CPU-walked PIO and line transfer descriptors.
+- [ ] Add zoom segment coalescing.
+- [x] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
 - [ ] Stress CPU and VDMA producer interleaving and staging wraparound.
 
 The first M4 slice stages an immutable high-word/low-word copy of every HostRW
@@ -947,7 +948,25 @@ matrix covers COLORHOST, ALPHAHOST and both with shade, clipping, row reset,
 increasing and decreasing LR-only shapes, and command-free transfers whose
 architectural state still retires. An interpreter/Cranelift oracle now pins
 that COLORHOST overrides shaded RGB and that ALPHAHOST alone does not disable
-FASTCLEAR. Resident FASTCLEAR+ALPHAHOST, host lines, zoom coalescing and
+FASTCLEAR.
+
+The third M4 slice adds integer, fractional and antialiased HostW lines without
+changing the fixed command or state-slot ABI. The immutable payload remains
+only the staged high-word/low-word HostRW stream; one shader lane serially
+replays the post-setup Bresenham state rather than expanding pixels, coverage
+or shade checkpoints on the CPU. A framebuffer-independent normalizer
+transactionally simulates the same outer multiword retry and commits exact
+coordinates, `BRESD`, shade, pattern and residual HostRW state only after the
+command fits. All octants, programmable BRESROUND ties, endpoint skips,
+`LENGTH32`, single-step continuation, XYOFFSET, YFLIP, shade, transparent and
+opaque patterns, clipping, CID/alpha rejection and ordinary pixel operations
+match complete CPU planes on Vulkan and D3D12. Host fields are consumed before
+clipping or rejection, while skipped, transparent and opaque-background
+visits consume none. Antialiased start-endpoint filtering applies only to the
+first outer invocation; later `LENGTH32` retries begin from the integer
+continuation state.
+
+Resident FASTCLEAR+ALPHAHOST, zoom coalescing, all-or-nothing `BUS_BUSY` and
 producer/wraparound stress remain deferred; HOSTR remains M5 work.
 
 Complete when ordinary and zoomed pixmaps match CPU mode with no CPU

@@ -862,9 +862,24 @@ the configured recirculation range. Command-free decreasing LR-only and
 BLOCK+SKIPFIRST transfers still commit their generic-walker context completion.
 The generic and Cranelift paths are also pinned to the same mixed-source rules:
 COLORHOST overrides shaded RGB, while ALPHAHOST alone preserves FASTCLEAR.
-Resident FASTCLEAR+ALPHAHOST, host lines and zoom coalescing remain hard errors
-for later M4 slices; READ remains a hard error until M5 supplies an explicit
-synchronized source.
+
+The following M4 slice adds integer, fractional and antialiased HostW lines as
+isolated serial commands. The fixed command and state-slot ABIs do not grow:
+the payload is still exactly the immutable high-word/low-word HostRW stream.
+A framebuffer-independent CPU normalizer walks the post-setup Bresenham state
+and any outer multiword retries transactionally, while one shader lane performs
+the same walk against the authoritative planes. This preserves all octants,
+BRESROUND, endpoint filtering, `LENGTH32`, single-step continuation, shade,
+patterns, clipping, YFLIP/XYOFFSET and residual HostRW state without
+pre-expanding line pixels. Host fields are fetched before clipping, CID and
+alpha rejection. Antialiased start-endpoint filtering is applied only on the
+first outer invocation, matching the generic walker's integer continuation
+state on later retries.
+
+Resident FASTCLEAR+ALPHAHOST and zoom coalescing remain hard errors for later
+M4 slices; READ remains a hard error until M5 supplies an explicit synchronized
+source. Producer interleaving, staging wraparound and all-or-nothing
+`BUS_BUSY` coverage are also still required before M4 is complete.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each
