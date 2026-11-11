@@ -600,3 +600,71 @@ fn each_ioc3_super_io_interrupt_reaches_its_own_bridge_input() {
         assert_eq!(pending(), 1 << 6 | 1 << 4, "the board IOC3's is input 4");
     });
 }
+
+/// What `PipeHosts` needs of a pipe: the widget its DMA goes to, here a fixed
+/// one.
+fn pipe_hosts_for(m: &DesksideMachine, widget: u8) -> (PipeHosts, Arc<std::sync::atomic::AtomicU8>) {
+    let handle = Arc::new(std::sync::atomic::AtomicU8::new(widget));
+    let hosts = PipeHosts {
+        widget: OnceLock::new(),
+        up: Upstream::new()
+            .with(m.node_at(0).hub.host_port(10))
+            .with(m.node_at(1).hub.host_port(9)),
+    };
+    hosts.widget.set(handle.clone()).unwrap();
+    (hosts, handle)
+}
+
+/// A block the pipe moves goes to the node whose Hub the widget names, and
+/// follows the widget when the guest reprograms it.
+#[test]
+fn the_pipes_dma_blocks_follow_its_widget() {
+    big_stack(|| {
+        let (_dir, m) = built(ONYX2_PROFILE, "pipeblock", 2);
+        let (hosts, widget) = pipe_hosts_for(&m, 10);
+        let at = 0x10_0000u64;
+        let words = [0x0102_0304_0506_0708u64, 0x1112_1314_1516_1718];
+        for (w, node, other) in [(10u8, 0usize, 1usize), (9, 1, 0)] {
+            widget.store(w, std::sync::atomic::Ordering::Relaxed);
+            for n in 0..2 {
+                assert_eq!(m.node_at(n).memory.physical().write32(at, 0), BUS_OK);
+            }
+            assert_eq!(hosts.write_block(at, &words), BUS_OK, "widget {w}");
+            assert_eq!(m.node_at(node).memory.physical().read32(at).data, 0x0102_0304, "widget {w}");
+            assert_eq!(m.node_at(other).memory.physical().read32(at).data, 0, "widget {w}: the other node saw it");
+            let mut back = [0u64; 2];
+            assert_eq!(hosts.read_block(at, &mut back), BUS_OK, "widget {w}");
+            assert_eq!(back, words, "widget {w}");
+        }
+        // A widget that is no Hub fails the block as it fails a word.
+        widget.store(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(hosts.write_block(at, &words), BUS_ERR);
+        assert_eq!(hosts.read_block(at, &mut [0u64; 2]), BUS_ERR);
+    });
+}
+
+/// Pipe DMA words a second through `PipeHosts` into node memory, as a
+/// 64 KiB texture load moves them. Run it from a release build:
+///
+///     cargo test --release --lib ip27_deskside::tests::pipe_dma_rate -- --ignored --nocapture
+#[test]
+#[ignore]
+fn pipe_dma_rate() {
+    big_stack(|| {
+        let (_dir, m) = built(ONYX2_PROFILE, "pipedmarate", 2);
+        let (hosts, _widget) = pipe_hosts_for(&m, 9);
+        let mut buf = vec![0u8; 64 * 1024];
+        let at = 0x10_0000u64;
+        let mut best = 0f64;
+        for _ in 0..5 {
+            let (start, mut loads) = (std::time::Instant::now(), 0u64);
+            while start.elapsed() < std::time::Duration::from_millis(400) {
+                assert_eq!(crate::physical::write_bytes(&hosts, at, &buf), BUS_OK);
+                assert_eq!(crate::physical::read_bytes(&hosts, at, &mut buf), BUS_OK);
+                loads += 1;
+            }
+            best = best.max(loads as f64 * 2.0 * 64.0 / 1024.0 / start.elapsed().as_secs_f64());
+        }
+        println!("pipe DMA through the Hub: {best:.1} MiB/s");
+    });
+}

@@ -240,17 +240,7 @@ impl TestHost {
 /// A register file and a stream state with no thread, over a fake machine: for a
 /// test that calls the front end or a back end's port directly.
 pub(in crate::dev::kona) fn bare(t: &Arc<TestHost>, cfg: KonaConfig) -> (super::super::front::Host, super::super::pipe::Core) {
-    let host = super::super::front::Host {
-        front: Mutex::new(super::super::front::Front::new(&cfg)),
-        irq: t.clone(),
-        mem: t.clone(),
-        unrouted: Default::default(),
-        held_words: Default::default(),
-        reasons_waiting: Default::default(),
-        list_running: Default::default(),
-        activity: Default::default(),
-        video_acks: Default::default(),
-    };
+    let host = super::super::front::Host::new(super::super::front::Front::new(&cfg), t.clone(), t.clone());
     (host, super::super::pipe::Core::new(cfg, super::super::flash::Flash::fresh()))
 }
 

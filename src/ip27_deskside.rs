@@ -73,8 +73,8 @@ use crate::irq::InterruptController;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR};
 use crate::xtalk::Upstream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub type DesksideMachine = Ip27Machine<Deskside>;
@@ -182,13 +182,14 @@ const TEST_WIDGET_ID: u32 = widget_id(0, 0x7e57, 0x36);
 /// guest has programmed into the pipe, behind that widget's Crossbow link.
 /// Nothing is delivered while the widget names no host with a live link.
 struct PipeHosts {
-    pipe: OnceLock<Weak<Kona>>,
+    /// The pipe's DMA widget, read without taking the pipe's register lock.
+    widget: OnceLock<Arc<AtomicU8>>,
     up: Upstream,
 }
 
 impl PipeHosts {
     fn host(&self) -> Option<&crate::xtalk::HostPort> {
-        let widget = self.pipe.get()?.upgrade()?.dma_widget() as u8;
+        let widget = self.widget.get()?.load(Ordering::Relaxed);
         let host = self.up.get(widget).filter(|h| h.link_up());
         if host.is_none() {
             crate::dlog!(LogModule::Kona, "Onyx2: the pipe names widget {widget}, which is no Hub with a live link");
@@ -220,6 +221,14 @@ impl BusDevice for PipeHosts {
     pipe_dma!(read16, write16, u16, BusRead16);
     pipe_dma!(read32, write32, u32, BusRead32);
     pipe_dma!(read64, write64, u64, BusRead64);
+
+    // One lookup of the host per block rather than one per word.
+    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
+        self.host().map_or(BUS_ERR, |h| h.mem.read_block(a, buf))
+    }
+    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
+        self.host().map_or(BUS_ERR, |h| h.mem.write_block(a, buf))
+    }
 }
 
 /// The module management as the machine drives it: the adapters to reset
@@ -394,13 +403,13 @@ impl Deskside {
 
         let pipe = match (cfg.graphics_board().kona(), layout.graphics_widget) {
             (Some((product, rm_count)), Some(_)) => {
-                let pipe_hosts = Arc::new(PipeHosts { pipe: OnceLock::new(), up: xbow.upstream(hosts()) });
+                let pipe_hosts = Arc::new(PipeHosts { widget: OnceLock::new(), up: xbow.upstream(hosts()) });
                 let kona_cfg = KonaConfig::new(product, rm_count)?
                     .with_host_widget(owner_port.host.widget)?
                     .with_pool(cfg.graphics.threads, cfg.graphics.tile);
                 let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
                 let pipe = Kona::new(kona_cfg, pipe_hosts.clone(), pipe_hosts.clone(), status.clone(), flash)?;
-                let _ = pipe_hosts.pipe.set(Arc::downgrade(&pipe));
+                let _ = pipe_hosts.widget.set(pipe.dma_widget_handle());
                 Some(pipe)
             }
             _ => None,
