@@ -252,7 +252,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         }
         _ => return Err("pixel format"),
     };
-    if dm1.fastclear() || dm1.blend() {
+    if dm1.fastclear() {
         return Err("pixel operation");
     }
     let x = context.xstart >> 11;

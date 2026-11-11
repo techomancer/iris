@@ -239,6 +239,29 @@ fn resident_limits_cover_plane_bindings_and_batch_dispatch() {
 }
 
 #[test]
+fn destination_hazards_follow_logic_and_blend_sources() {
+    on_large_stack(|| {
+        let mut ctx = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (0, 0),
+            (1, 1),
+            u32::MAX,
+            0x7f12_3456,
+        );
+        assert!(!reads_destination(&ctx));
+        ctx.drawmode1.0 = (ctx.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK)
+            | DRAWMODE1_LOGICOP_XOR_SH;
+        assert!(reads_destination(&ctx));
+        ctx.drawmode1.0 |= 1 << 18;
+        assert!(reads_destination(&ctx));
+        ctx.drawmode1.0 |= 1 << 25;
+        assert!(!reads_destination(&ctx));
+    });
+}
+
+#[test]
 fn resident_positions_confirm_only_submitted_current_epoch_work() {
     let mut status = ResidentStatus::seeded(Epoch(41));
     let seed = status.accepted;
@@ -1021,6 +1044,156 @@ fn resident_gpu_pixel_formats_logic_and_yflip_match_complete_cpu_planes() {
             "pixel-format aux",
         );
         assert!(resident.payload.is_empty(), "fill and line submission drained payload");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_blending_matches_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x73c1_4ea9);
+        let seed_aux = seeded_plane(0x8c3e_b156);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate blending resident planes");
+
+        let set_depth = |ctx: &mut Rex3Context, depth: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !(0x3 << 3)) | (depth << 3);
+        };
+        let set_blend = |
+            ctx: &mut Rex3Context,
+            source_factor: u32,
+            destination_factor: u32,
+            backblend: bool,
+            blend_alpha: bool,
+        | {
+            ctx.drawmode1.0 &= !(
+                (1 << 18) | (0x7 << 19) | (0x7 << 22) | (1 << 25) | (1 << 27)
+            );
+            ctx.drawmode1.0 |= (1 << 18)
+                | (source_factor << 19)
+                | (destination_factor << 22)
+                | ((backblend as u32) << 25)
+                | ((blend_alpha as u32) << 27);
+        };
+
+        let mut cases = Vec::new();
+        for source_factor in 0..=5 {
+            for destination_factor in 0..=5 {
+                let x = 20 + destination_factor as i32 * 7;
+                let y = 130 + source_factor as i32 * 7;
+                let alpha = 0x20 + (source_factor * 29 + destination_factor * 17) % 0xc0;
+                let color = (alpha << 24)
+                    | ((0x31 + source_factor * 19) << 16)
+                    | ((0x57 + destination_factor * 13) << 8)
+                    | (0xa3 ^ (source_factor * 11 + destination_factor * 7));
+                let mut ctx = context(
+                    DRAWMODE1_PLANES_RGB,
+                    true,
+                    false,
+                    (x, y),
+                    (x + 3, y + 3),
+                    u32::MAX,
+                    color,
+                );
+                set_blend(
+                    &mut ctx,
+                    source_factor,
+                    destination_factor,
+                    false,
+                    (source_factor + destination_factor) & 1 != 0,
+                );
+                cases.push(("RGB24 blend factor matrix", ctx));
+            }
+        }
+
+        let mut backblend = context(
+            DRAWMODE1_PLANES_RGB, true, false, (80, 130), (91, 141), u32::MAX, 0x6d28_b4e1,
+        );
+        backblend.colorback = 0xb739_5ac2;
+        set_blend(&mut backblend, 2, 3, true, false);
+        cases.push(("RGB24 background blend", backblend));
+
+        let mut rgb4 = context(
+            DRAWMODE1_PLANES_RGB, true, false, (100, 148), (115, 159), 0x0000_00ff, 0x4a37_8bd5,
+        );
+        set_depth(&mut rgb4, DRAWMODE1_DRAWDEPTH_4);
+        rgb4.drawmode1.0 |= 1 << 16;
+        set_blend(&mut rgb4, 4, 5, false, false);
+        cases.push(("dithered RGB4 alpha blend", rgb4));
+
+        let mut rgb8 = context(
+            DRAWMODE1_PLANES_RGB, true, false, (124, 156), (139, 167), 0x0000_ff00, 0x9c61_27eb,
+        );
+        set_depth(&mut rgb8, DRAWMODE1_DRAWDEPTH_8);
+        rgb8.drawmode1.0 |= (1 << 5) | (1 << 16);
+        set_blend(&mut rgb8, 3, 4, false, true);
+        cases.push(("dithered RGB8 double-source blend", rgb8));
+
+        let mut rgba12 = context(
+            DRAWMODE1_PLANES_RGBA, true, false, (148, 164), (163, 175), 0x00ff_f000, 0xc583_4a16,
+        );
+        set_depth(&mut rgba12, DRAWMODE1_DRAWDEPTH_12);
+        rgba12.drawmode1.0 |= 1 << 16;
+        set_blend(&mut rgba12, 2, 5, false, true);
+        cases.push(("dithered RGBA12 blend", rgba12));
+
+        let mut overlay = context(
+            DRAWMODE1_PLANES_OLAY, true, false, (172, 172), (187, 183), 0x00ff_0000, 0x7f42_9dc3,
+        );
+        set_depth(&mut overlay, DRAWMODE1_DRAWDEPTH_8);
+        overlay.drawmode1.0 |= 1 << 5;
+        set_blend(&mut overlay, 4, 5, false, true);
+        cases.push(("overlay blend", overlay));
+
+        let mut popup = context(
+            DRAWMODE1_PLANES_PUP, false, false, (196, 180), (211, 191), 0x0000_00cc, 0x5300_0002,
+        );
+        popup.colorback = 0xa739_61d4;
+        set_blend(&mut popup, 3, 2, true, false);
+        cases.push(("popup background blend", popup));
+
+        let mut cid = context(
+            DRAWMODE1_PLANES_CID, false, false, (220, 188), (235, 199), 0x0000_0030, 0xb100_0003,
+        );
+        cid.drawmode1.0 |= 1 << 5;
+        set_blend(&mut cid, 5, 1, false, true);
+        cases.push(("CID double-source blend", cid));
+
+        let mut line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (260 * 16, (0x13ff - 210) * 16),
+            (285 * 16, (0x13ff - 218) * 16),
+            0x00ff_ffff,
+            0x723e_95c1,
+        );
+        line.drawmode1.0 |= (1 << 6) | (1 << 16);
+        set_depth(&mut line, DRAWMODE1_DRAWDEPTH_12);
+        set_blend(&mut line, 4, 5, false, true);
+        cases.push(("dithered YFLIP line blend", line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe blended planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "blended RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "blended aux");
         gpu.check().unwrap();
     });
 }

@@ -44,6 +44,14 @@ const MAX_SETS: usize = 3;
 const READBACK_CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const FLAT: Fragment = Fragment::new("resident_flat.wgsl", include_str!("shaders/resident_flat.wgsl"));
 
+fn reads_destination(context: &Rex3Context) -> bool {
+    if context.drawmode1.blend() {
+        !context.drawmode1.backblend()
+    } else {
+        context.drawmode1.logicop() != DRAWMODE1_LOGICOP_SRC
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResidentError {
     Unsupported(&'static str),
@@ -1037,7 +1045,7 @@ impl ResidentGpu {
                             line,
                             payload,
                             cid_test(context.clipmode),
-                            context.drawmode1.logicop() != DRAWMODE1_LOGICOP_SRC,
+                            reads_destination(context),
                         )
                     },
                 );
@@ -1099,8 +1107,7 @@ impl ResidentBackend for ResidentGpu {
                             slot,
                             fill,
                             cid_test(context.clipmode),
-                            fill.kind != FillKind::Clear
-                                && context.drawmode1.logicop() != DRAWMODE1_LOGICOP_SRC,
+                            fill.kind != FillKind::Clear && reads_destination(context),
                         )
                     },
                 );

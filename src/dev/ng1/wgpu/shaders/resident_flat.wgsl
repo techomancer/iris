@@ -216,6 +216,94 @@ fn amplify(state: RexStateSlot, value: u32) -> u32 {
     }
 }
 
+fn expand_destination(state: RexStateSlot, value: u32) -> u32 {
+    let mode = state.words[REX_STATE_DRAW_MODE1];
+    if ((mode >> 15u) & 1u) == 0u {
+        return value;
+    }
+    switch (mode >> 3u) & 0x3u {
+        case REX_DRAWDEPTH_4: {
+            let red = select(0u, 0xffu, (value & 1u) != 0u);
+            let green_raw = (value >> 1u) & 3u;
+            let green = (green_raw << 6u) | (green_raw << 4u)
+                | (green_raw << 2u) | green_raw;
+            let blue = select(0u, 0xffu, (value & 8u) != 0u);
+            return (blue << 16u) | (green << 8u) | red;
+        }
+        case REX_DRAWDEPTH_8: {
+            let red_raw = value & 7u;
+            let red = (red_raw << 5u) | (red_raw << 2u) | (red_raw >> 1u);
+            let green_raw = (value >> 3u) & 7u;
+            let green = (green_raw << 5u) | (green_raw << 2u) | (green_raw >> 1u);
+            let blue_raw = (value >> 6u) & 3u;
+            let blue = (blue_raw << 6u) | (blue_raw << 4u)
+                | (blue_raw << 2u) | blue_raw;
+            return (blue << 16u) | (green << 8u) | red;
+        }
+        case REX_DRAWDEPTH_12: {
+            let red_raw = value & 0xfu;
+            let red = (red_raw << 4u) | red_raw;
+            let green_raw = (value >> 4u) & 0xfu;
+            let green = (green_raw << 4u) | green_raw;
+            let blue_raw = (value >> 8u) & 0xfu;
+            let blue = (blue_raw << 4u) | blue_raw;
+            return (blue << 16u) | (green << 8u) | red;
+        }
+        default: {
+            return value;
+        }
+    }
+}
+
+fn blend_factor(selector: u32, other: u32, source_alpha: u32) -> u32 {
+    switch selector {
+        case 0u: {
+            return 0u;
+        }
+        case 1u: {
+            return 0xffu;
+        }
+        case 2u: {
+            return other;
+        }
+        case 3u: {
+            return 0xffu - other;
+        }
+        case 4u: {
+            return source_alpha;
+        }
+        case 5u: {
+            return 0xffu - source_alpha;
+        }
+        default: {
+            return 0u;
+        }
+    }
+}
+
+fn blend_colors(state: RexStateSlot, source: u32, destination: u32) -> u32 {
+    let mode = state.words[REX_STATE_DRAW_MODE1];
+    let source_factor = (mode >> 19u) & 0x7u;
+    let destination_factor = (mode >> 22u) & 0x7u;
+    let source_alpha = (source >> 24u) & 0xffu;
+    let blend_alpha = ((mode >> 27u) & 1u) != 0u;
+    var result = 0u;
+    for (var channel = 0u; channel < 4u; channel++) {
+        let shift = channel * 8u;
+        let source_component = (source >> shift) & 0xffu;
+        let destination_component = (destination >> shift) & 0xffu;
+        let alpha_factor = select(0xffu, source_alpha, channel != 3u || blend_alpha);
+        let sf = blend_factor(source_factor, destination_component, alpha_factor);
+        let df = blend_factor(destination_factor, source_component, source_alpha);
+        let component = min(
+            (source_component * sf + destination_component * df) / 0xffu,
+            0xffu,
+        );
+        result |= component << shift;
+    }
+    return result;
+}
+
 fn alpha_allows(state: RexStateSlot, source: u32) -> bool {
     let source_alpha = (source >> 24u) & 0xffu;
     let reference = state.words[REX_STATE_ALPHA_REF] & 0xffu;
@@ -298,6 +386,29 @@ fn logic_operation(state: RexStateSlot, source: u32, destination: u32) -> u32 {
             return 0xffffffffu;
         }
     }
+}
+
+fn pixel_result(
+    state: RexStateSlot,
+    source: u32,
+    destination_word: u32,
+    px: i32,
+    py: i32,
+) -> u32 {
+    let mode = state.words[REX_STATE_DRAW_MODE1];
+    if ((mode >> 18u) & 1u) != 0u {
+        var destination = expand_destination(state, read_plane(state, destination_word));
+        if ((mode >> 25u) & 1u) != 0u {
+            destination = state.words[REX_STATE_COLOR_BACK];
+        }
+        return amplify(
+            state,
+            compress_source(state, blend_colors(state, source, destination), px, py),
+        );
+    }
+    let compressed_source = amplify(state, compress_source(state, source, px, py));
+    let destination = amplify(state, read_plane(state, destination_word));
+    return logic_operation(state, compressed_source, destination);
 }
 
 fn clip_allows(state: RexStateSlot, px: i32, py: i32) -> bool {
@@ -387,9 +498,7 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
                 rgb_value = (rgb_value & ~mask) | (raw_source & mask);
                 rgb_written = true;
             } else if alpha_allows(state, raw_source) {
-                let source = amplify(state, compress_source(state, raw_source, px, py));
-                let destination = amplify(state, read_plane(state, rgb_value));
-                let result = logic_operation(state, source, destination);
+                let result = pixel_result(state, raw_source, rgb_value, px, py);
                 rgb_value = (rgb_value & ~mask) | (result & mask);
                 rgb_written = true;
             }
@@ -399,9 +508,7 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
                 aux_value = (aux_value & ~mask) | (raw_source & mask);
                 aux_written = true;
             } else if alpha_allows(state, raw_source) {
-                let source = amplify(state, compress_source(state, raw_source, px, py));
-                let destination = amplify(state, read_plane(state, aux_value));
-                let result = logic_operation(state, source, destination);
+                let result = pixel_result(state, raw_source, aux_value, px, py);
                 aux_value = (aux_value & ~mask) | (result & mask);
                 aux_written = true;
             }
