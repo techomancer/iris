@@ -213,6 +213,14 @@ impl Memory {
         #[cfg(feature = "jitv2")]
         self.generations.bump(_address);
     }
+    /// `bytes` from `address` were written: invalidate each page they touch,
+    /// once.
+    pub(crate) fn written_block(&self, _address: u64, _bytes: u64) {
+        #[cfg(feature = "jitv2")]
+        for page in (_address >> 12)..=((_address + _bytes.max(1) - 1) >> 12) {
+            self.generations.bump(page << 12);
+        }
+    }
 
     fn runs(&self, config: u64) -> Vec<Run> {
         (0..SLOTS as u64).filter_map(|slot| {
@@ -266,6 +274,13 @@ impl Memory {
         self.epoch.fetch_add(1, Ordering::Release);
     }
     pub(crate) fn decode(&self, config: u64, addr: u64, bytes: u64) -> Option<(usize, u64)> {
+        self.run(config, addr).and_then(|(bank, offset, left)| (bytes <= left).then_some((bank, offset)))
+    }
+    /// The run of fitted memory that holds `addr` as `config` places the
+    /// banks: its bank, the offset of `addr` in it and the bytes from there
+    /// to the end of the run. A run never crosses a software slot, so a
+    /// transfer that walks on past one decodes again.
+    pub(crate) fn run(&self, config: u64, addr: u64) -> Option<(usize, u64, u64)> {
         let software = addr / BANK_SPAN;
         if software >= SLOTS as u64 {
             return None;
@@ -278,7 +293,7 @@ impl Memory {
         }
         let limit = self.fitted(bank).min((32 << 20) << code);
         let offset = addr % BANK_SPAN;
-        (offset < limit && bytes <= limit - offset).then_some((bank as usize, offset))
+        (offset < limit).then(|| (bank as usize, offset, limit - offset))
     }
     pub(crate) fn raw_read(&self, bank: usize, at: u64) -> u64 {
         self.physical.banks()[bank].read64(at).data

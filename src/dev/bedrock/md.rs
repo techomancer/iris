@@ -568,11 +568,16 @@ impl Resettable for Md {
 }
 /// Resolve each DMA access through the atomic Physical table, as HEART
 /// does. Do not ask Physical for mem_ptr or gen_ptr: those read the inline
-/// CPU bitmap. Default block methods split accesses at 4 KiB pages.
+/// CPU bitmap. A block goes to its bank in one call per run (see
+/// [`DmaView::blocks`]); `physical::read_bytes` and `write_bytes` hand it
+/// over a page at a time.
 struct DmaView(Arc<Memory>);
 impl DmaView {
     fn at(&self, address: u64, bytes: u64) -> Option<&dyn BusDevice> {
         self.0.decode(self.0.config(), address, bytes)?;
+        self.entry(address)
+    }
+    fn entry(&self, address: u64) -> Option<&dyn BusDevice> {
         let phys = self.0.physical();
         let entry = phys.entry_at(address);
         if crate::ppmem::devmap::entry_eq(entry, phys.default_entry()) {
@@ -581,6 +586,27 @@ impl DmaView {
         // SAFETY: the memory this view holds retains Physical, which keeps
         // every entry alive across remaps.
         Some(unsafe { &*entry })
+    }
+    /// Walk `words` doublewords from `address`: one decode and one table
+    /// lookup per run of fitted memory, and the stretch inside the run goes
+    /// to its bank in a single call. The split is where the run ends, at
+    /// the bank's limit or its 1 GiB slot; the first non-OK status ends the
+    /// walk and is returned, with what came before it already moved. `f`
+    /// gets the bank, the address and the word range.
+    fn blocks(&self, address: u64, words: usize, mut f: impl FnMut(&dyn BusDevice, u64, std::ops::Range<usize>) -> u32) -> u32 {
+        let mut done = 0usize;
+        while done < words {
+            let at = address.wrapping_add(8 * done as u64);
+            let Some((_, _, left)) = self.0.run(self.0.config(), at) else { return BUS_ERR };
+            let Some(bank) = self.entry(at) else { return BUS_ERR };
+            let n = ((left / 8).max(1) as usize).min(words - done);
+            let status = f(bank, at, done..done + n);
+            if status != BUS_OK {
+                return status;
+            }
+            done += n;
+        }
+        BUS_OK
     }
 }
 macro_rules! dma_rw {
@@ -613,6 +639,16 @@ impl BusDevice for DmaView {
         let swapped = self.at(address, 8)?.cas64(address, old, new)?;
         if swapped { self.0.written(address); }
         Some(swapped)
+    }
+    fn read_block(&self, address: u64, buf: &mut [u64]) -> u32 {
+        self.blocks(address, buf.len(), |bank, at, range| bank.read_block(at, &mut buf[range]))
+    }
+    fn write_block(&self, address: u64, buf: &[u64]) -> u32 {
+        self.blocks(address, buf.len(), |bank, at, range| {
+            let status = bank.write_block(at, &buf[range.clone()]);
+            if status == BUS_OK { self.0.written_block(at, 8 * range.len() as u64); }
+            status
+        })
     }
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
@@ -1050,6 +1086,60 @@ mod tests {
         assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 4) | (0x3 << 8) | (0x3 << 12) | (0x3 << 16) | (0x3 << 20));
         assert_eq!(md.dma_view().read64(5 * BANK_SPAN).data, 0x1111 * 6, "DMA reaches it too");
         assert_eq!(md.uncached_view().read64(4 * BANK_SPAN).data, 0x1111 * 5, "and uncached");
+    }
+
+    /// A DMA block moves the words it would move one at a time, goes on into
+    /// the next bank where the first one's slot ends, and stops at the first
+    /// stretch no bank holds with the words before it already moved.
+    #[test]
+    fn a_dma_block_matches_word_accesses_and_stops_where_memory_ends() {
+        let md = tezro();
+        let dma = md.dma_view();
+        let words: Vec<u64> = (0..16).map(|i| 0x0123_4567_89ab_cdef ^ (i * 0x1111_0000_0001)).collect();
+        // Inside one run: the same words, read either way.
+        assert_eq!(dma.write_block(0x2000, &words), BUS_OK);
+        for (i, &w) in words.iter().enumerate() {
+            assert_eq!(dma.read64(0x2000 + 8 * i as u64).data, w);
+        }
+        let mut back = vec![0u64; words.len()];
+        assert_eq!(dma.read_block(0x2000, &mut back), BUS_OK);
+        assert_eq!(back, words);
+        // Across the end of bank 0's slot into bank 1.
+        let edge = BANK_SPAN - 32;
+        assert_eq!(dma.write_block(edge, &words), BUS_OK);
+        assert_eq!(md.physical().banks()[0].read64(BANK_SPAN - 8).data, words[3]);
+        assert_eq!(md.physical().banks()[1].read64(0).data, words[4]);
+        assert_eq!(dma.read_block(edge, &mut back), BUS_OK);
+        assert_eq!(back, words);
+        // Past the top of bank 5 (512 MiB): the words below it landed.
+        let end = 5 * BANK_SPAN + (512 << 20) - 16;
+        assert_eq!(dma.write_block(end, &words[..4]), BUS_ERR);
+        assert_eq!(dma.read64(end).data, words[0]);
+        assert_eq!(dma.read64(end + 8).data, words[1]);
+        let mut short = [0xaa; 4];
+        assert_eq!(dma.read_block(end, &mut short), BUS_ERR);
+        assert_eq!(short[..2], words[..2], "what came before the failure was read");
+        assert_eq!(dma.read_block(6 * BANK_SPAN, &mut short), BUS_ERR);
+        assert_eq!(dma.write_block(6 * BANK_SPAN, &short), BUS_ERR);
+        // A bank the configuration disables answers nothing, as for a word.
+        let fuel = configured();
+        assert_eq!(fuel.dma_view().write_block(FITTED_BANK - 8, &words[..2]), BUS_ERR);
+        assert_eq!(fuel.dma_view().read64(FITTED_BANK - 8).data, words[0]);
+        assert_eq!(fuel.dma_view().write_block(2 * BANK_SPAN, &words[..1]), BUS_ERR);
+    }
+
+    /// Every page a block touches is invalidated for compiled code, once.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn a_dma_block_invalidates_each_page_it_touches() {
+        let md = configured();
+        let dma = md.dma_view();
+        let counter = |page: u64| unsafe { (*dma.gen_ptr(page * 4096)).load(Ordering::Relaxed) };
+        let before: Vec<u64> = (1..6).map(counter).collect();
+        // 2 pages and a bit, from the middle of page 1 to the start of page 3.
+        assert_eq!(dma.write_block(4096 + 2048, &[0x55; 1032]), BUS_OK);
+        let after: Vec<u64> = (1..6).map(counter).collect();
+        assert_eq!(after.iter().zip(&before).map(|(a, b)| a - b).collect::<Vec<_>>(), [1, 1, 1, 0, 0]);
     }
 
     /// A node whose banks all lie below 4 GiB, as the Fuel's do, keeps the

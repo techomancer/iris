@@ -280,11 +280,40 @@ fn pic_dma_reaches_memory_through_bedrock_io_only() {
     assert_eq!(peer.dma_read(15, 0, 0x1003, &mut back), Err(Refused));
 }
 
+/// A transfer of many pages arrives as the bytes it carried, whatever its
+/// alignment, and what it leaves in memory is what the same bytes would have
+/// left through single accesses.
+#[test]
+fn a_long_pic_transfer_lands_byte_for_byte_in_memory() {
+    let board = TezroBoard::new(1).unwrap();
+    assert_eq!(board.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x33), BUS_OK);
+    let peer = BedrockPeer(Arc::downgrade(&board.bedrock));
+    let memory = board.bedrock.dma_view();
+    for (start, len) in [(0x10_0000u64, 20_000usize), (0x20_0003, 9_000), (0x30_0004, 4_100), (0x40_0000, 4_103)] {
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+        assert_eq!(peer.dma_write(15, HOST_WIDGET, start, &data), Ok(()));
+        for (i, byte) in data.iter().enumerate() {
+            assert_eq!(memory.read8(start + i as u64).data, *byte, "write at {start:#x}+{i}");
+        }
+        let mut back = vec![0; len];
+        assert_eq!(peer.dma_read(15, HOST_WIDGET, start, &mut back), Ok(()));
+        assert_eq!(back, data, "read at {start:#x}");
+    }
+    // Memory no bank holds refuses the transfer.
+    let mut back = [0u8; 64];
+    assert_eq!(peer.dma_read(15, HOST_WIDGET, 6 << 30, &mut back), Err(Refused));
+    assert_eq!(peer.dma_write(15, HOST_WIDGET, 6 << 30, &back), Err(Refused));
+}
+
 #[test]
 fn transfer_legs_keep_aligned_widths() {
     let legs: Vec<_> = BedrockPeer::legs(0x1003, 19).collect();
     assert_eq!(legs, [(0, 1), (1, 4), (5, 8), (13, 4), (17, 2)]);
-    assert_eq!(BedrockPeer::legs(0x2000, 16).collect::<Vec<_>>(), [(0, 8), (8, 8)]);
+    // Whole doublewords from an aligned address are one run; ragged bytes
+    // around it stay as the fields they were.
+    assert_eq!(BedrockPeer::legs(0x2000, 16).collect::<Vec<_>>(), [(0, 16)]);
+    assert_eq!(BedrockPeer::legs(0x2004, 4100).collect::<Vec<_>>(), [(0, 4), (4, 4096)]);
+    assert_eq!(BedrockPeer::legs(0x2000, 4103).collect::<Vec<_>>(), [(0, 4096), (4096, 4), (4100, 2), (4102, 1)]);
     assert_eq!(BedrockPeer::legs(0x2000, 0).count(), 0);
 }
 

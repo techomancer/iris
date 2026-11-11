@@ -1312,8 +1312,11 @@ impl BedrockPeer {
         }
     }
 
-    /// The legs of a transfer: each the largest naturally aligned size of
-    /// eight bytes or fewer that fits, so word accesses keep their width.
+    /// The legs of a transfer, as (offset, bytes). Whole doublewords from an
+    /// 8-aligned address go as one leg, a run for the memory to take in a
+    /// block; the ragged bytes around it are each the largest naturally
+    /// aligned size of four bytes or fewer that fits, so a word or halfword
+    /// the device writes whole stays one access.
     fn legs(address: u64, len: usize) -> impl Iterator<Item = (usize, usize)> {
         let mut offset = 0;
         std::iter::from_fn(move || {
@@ -1321,16 +1324,26 @@ impl BedrockPeer {
                 return None;
             }
             let at = address + offset as u64;
-            let size = [8usize, 4, 2, 1]
-                .into_iter()
-                .find(|&n| at.is_multiple_of(n as u64) && n <= len - offset)
-                .unwrap_or(1);
+            let left = len - offset;
+            let size = if at.is_multiple_of(8) && left >= 8 {
+                left & !7
+            } else {
+                [4usize, 2, 1]
+                    .into_iter()
+                    .find(|&n| at.is_multiple_of(n as u64) && n <= left)
+                    .unwrap_or(1)
+            };
             let leg = (offset, size);
             offset += size;
             Some(leg)
         })
     }
 }
+
+/// Doublewords moved per call to memory. A stack buffer of this size is
+/// zeroed on every transfer, so it is small: 512 bytes cost a few stores,
+/// a whole page a `rep stos` that outweighed the saving in the guest.
+const BLOCK_WORDS: usize = 64;
 
 impl PicPeer for BedrockPeer {
     fn interrupt(&self, source_widget: u8, address: u64, payload: u64) -> Result<(), Refused> {
@@ -1344,11 +1357,25 @@ impl PicPeer for BedrockPeer {
         Self::host(widget)?;
         let io = self.io()?;
         for (offset, size) in Self::legs(address, data.len()) {
-            let value = io.inbound_read(source_widget, Some(INBOUND_DEVICE), address + offset as u64, size as u8);
-            if value.status != BUS_OK {
-                return Err(Refused);
+            let at = address + offset as u64;
+            if size < 8 {
+                let value = io.inbound_read(source_widget, Some(INBOUND_DEVICE), at, size as u8);
+                if value.status != BUS_OK {
+                    return Err(Refused);
+                }
+                data[offset..offset + size].copy_from_slice(&value.data.to_be_bytes()[8 - size..]);
+                continue;
             }
-            data[offset..offset + size].copy_from_slice(&value.data.to_be_bytes()[8 - size..]);
+            let mut words = [0u64; BLOCK_WORDS];
+            for (n, part) in data[offset..offset + size].chunks_mut(8 * BLOCK_WORDS).enumerate() {
+                let words = &mut words[..part.len() / 8];
+                if io.inbound_read_block(source_widget, Some(INBOUND_DEVICE), at + (n * 8 * BLOCK_WORDS) as u64, words) != BUS_OK {
+                    return Err(Refused);
+                }
+                for (bytes, word) in part.chunks_exact_mut(8).zip(words.iter()) {
+                    bytes.copy_from_slice(&word.to_be_bytes());
+                }
+            }
         }
         Ok(())
     }
@@ -1357,9 +1384,23 @@ impl PicPeer for BedrockPeer {
         Self::host(widget)?;
         let io = self.io()?;
         for (offset, size) in Self::legs(address, data.len()) {
-            let value = data[offset..offset + size].iter().fold(0u64, |v, b| (v << 8) | u64::from(*b));
-            if io.inbound_write(source_widget, Some(INBOUND_DEVICE), address + offset as u64, size as u8, value) != BUS_OK {
-                return Err(Refused);
+            let at = address + offset as u64;
+            if size < 8 {
+                let value = data[offset..offset + size].iter().fold(0u64, |v, b| (v << 8) | u64::from(*b));
+                if io.inbound_write(source_widget, Some(INBOUND_DEVICE), at, size as u8, value) != BUS_OK {
+                    return Err(Refused);
+                }
+                continue;
+            }
+            let mut words = [0u64; BLOCK_WORDS];
+            for (n, part) in data[offset..offset + size].chunks(8 * BLOCK_WORDS).enumerate() {
+                let words = &mut words[..part.len() / 8];
+                for (word, bytes) in words.iter_mut().zip(part.chunks_exact(8)) {
+                    *word = u64::from_be_bytes(bytes.try_into().unwrap());
+                }
+                if io.inbound_write_block(source_widget, Some(INBOUND_DEVICE), at + (n * 8 * BLOCK_WORDS) as u64, words) != BUS_OK {
+                    return Err(Refused);
+                }
             }
         }
         Ok(())
