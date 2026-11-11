@@ -13,6 +13,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### GPU raster on the GL backend draws the window directly
+
+- With `raster = "wgpu"` and `gpu_backend = "gl"`, the wgpu window renderer now
+  presents the board's frames instead of falling back to the GL renderer, which
+  read every frame back from the GPU. `WGPU_BACKEND` overrides `gpu_backend`,
+  and wgpu's other environment variables (`WGPU_VALIDATION`,
+  `WGPU_GL_FENCE_BEHAVIOR`, ...) now apply.
+
 ### Guest clocks keep their rate on Windows
 
 - On Windows the CP0 Compare interrupt ran at 64-80 Hz instead of the guest's

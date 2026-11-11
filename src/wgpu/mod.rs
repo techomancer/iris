@@ -63,7 +63,7 @@ pub mod library {
 }
 
 pub use batch::{ArchShaders, Batch, BatchPipelines, Full};
-pub use device::{Gpu, GpuOptions};
+pub use device::{set_display, Gpu, GpuOptions};
 pub use memory::{GpuMemory, Staging};
 pub use present::{Frame, Placement, Presenter};
 pub use scanout::{Scanout, ScanoutPipeline, ScanoutShaders};
