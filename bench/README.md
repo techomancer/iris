@@ -505,6 +505,9 @@ A step may set `timeout` (seconds, default the run's `--timeout`). When it
 overruns, the step is `FAILED`, iris-bench sends the guest Ctrl-C and runs a
 no-op to check the shell is back, and the run stops only if it is not. The X
 steps have one, since an X client waits forever on a server that does not answer.
+A run that stops because the guest no longer answers records the steps it did
+not reach as `FAILED`, still saves the result and the JUnit report, and then
+exits nonzero.
 
 `iris-bench report` lists a guest run in its own "Guest steps" table (step,
 status, time, rate) and keeps it out of the kernel tables; `--format text`
