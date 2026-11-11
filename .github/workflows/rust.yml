@@ -42,10 +42,11 @@ jobs:
       fail-fast: false
       matrix:
         # Platforms per event kind; a failure fails the job only where gates is true.
+        # arm64 Linux gates: 24 of 24 recent pull-request runs passed every test there.
         include: ${{ fromJSON('{
-          "push":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":false},{"os":"windows-latest","gates":false},{"os":"macos-26","gates":false}],
+          "push":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":false},{"os":"macos-26","gates":false}],
           "draft":[{"os":"ubuntu-24.04","gates":true}],
-          "ready":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":false},{"os":"windows-latest","gates":false}]
+          "ready":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":false}]
           }')[github.event_name != 'pull_request' && 'push' || github.event.pull_request.draft && 'draft' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
