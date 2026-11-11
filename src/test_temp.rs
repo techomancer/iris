@@ -67,12 +67,6 @@ impl AsRef<Path> for TempPath {
 
 impl Drop for TempPath {
     fn drop(&mut self) {
-        // A disk opened with copy-on-write keeps its writes in `<path>.overlay`
-        // beside the image, with the dirty-sector record in `.overlay.dirty`.
-        let overlay = format!("{}.overlay", self.0.display());
-        for p in [overlay.clone(), format!("{overlay}.dirty")] {
-            let _ = std::fs::remove_file(p);
-        }
         // Removing an open file fails on Windows; the device that holds it
         // has closed it by the time the test's locals unwind.
         if self.0.is_dir() {
@@ -83,26 +77,87 @@ impl Drop for TempPath {
     }
 }
 
+/// A device image in a directory of its own. A disk or an NVRAM file puts
+/// more files beside its image: a copy-on-write overlay and its record of
+/// dirty sectors, a CHD's diff, a battery clock's reference. The directory
+/// holds them all, so removing it takes every one, and `TempPath` need not
+/// know what a device writes.
+pub(crate) struct TempImage {
+    path: PathBuf,
+    _dir: TempPath,
+}
+
+impl TempImage {
+    /// The image's path, `tag` naming the test's directory. Nothing exists there yet.
+    pub(crate) fn new(tag: &str) -> Self {
+        Self::named(tag, "img")
+    }
+
+    /// Like [`new`](Self::new) with `ext` as the file extension, for images
+    /// whose type is read from the name.
+    pub(crate) fn with_ext(tag: &str, ext: &str) -> Self {
+        Self::named(tag, &format!("img.{ext}"))
+    }
+
+    /// An image holding `bytes`.
+    pub(crate) fn file(tag: &str, bytes: &[u8]) -> Self {
+        let img = Self::new(tag);
+        std::fs::write(&img.path, bytes).expect("write temp file");
+        img
+    }
+
+    fn named(tag: &str, name: &str) -> Self {
+        let dir = TempPath::dir(tag);
+        Self { path: dir.join(name), _dir: dir }
+    }
+}
+
+impl Deref for TempImage {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempImage {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempImage {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_file_is_removed_with_its_overlay_even_on_panic() {
-        let (img, overlay) = {
-            let t = TempPath::file("temp-test", b"abc");
-            let overlay = PathBuf::from(format!("{}.overlay", t.display()));
-            std::fs::write(&overlay, b"x").unwrap();
-            assert_eq!(std::fs::read(&t).unwrap(), b"abc");
-            let paths = (t.to_path_buf(), overlay.clone());
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let _t = t;
-                panic!("test failed");
-            }));
-            assert!(r.is_err());
-            paths
-        };
-        assert!(!img.exists() && !overlay.exists());
+    fn a_file_is_removed_even_on_panic() {
+        let t = TempPath::file("temp-test", b"abc");
+        assert_eq!(std::fs::read(&t).unwrap(), b"abc");
+        let path = t.to_path_buf();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _t = t;
+            panic!("test failed");
+        }));
+        assert!(r.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_image_takes_the_files_a_device_keeps_beside_it() {
+        let img = TempImage::with_ext("temp-test", "chd");
+        assert_eq!(img.extension().unwrap(), "chd");
+        std::fs::write(&*img, b"abc").unwrap();
+        let beside = PathBuf::from(format!("{}.overlay.dirty", img.display()));
+        std::fs::write(&beside, b"x").unwrap();
+        let dir = img.parent().unwrap().to_path_buf();
+        drop(img);
+        assert!(!beside.exists() && !dir.exists());
     }
 
     #[test]

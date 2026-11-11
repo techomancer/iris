@@ -1572,18 +1572,20 @@ impl BlockNode for ChangerNode {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_temp::TempImage;
 
-    fn tmp_path(tag: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "iris-blocknode-{}-{}-{}",
-            tag,
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
+    /// A path the test owns, in a directory of its own that takes the overlay,
+    /// dirty-sector record and CHD diff with it when the value drops, a failed
+    /// assert included.
+    fn tmp_path(tag: &str) -> TempImage {
+        TempImage::new(&format!("blocknode-{tag}"))
     }
 
-    fn raw_filled(byte: u8, len: usize) -> (RawNode, PathBuf) {
+    fn tmp_chd(tag: &str) -> TempImage {
+        TempImage::with_ext(&format!("blocknode-{tag}"), "chd")
+    }
+
+    fn raw_filled(byte: u8, len: usize) -> (RawNode, TempImage) {
         let path = tmp_path("raw");
         std::fs::write(&path, vec![byte; len]).unwrap();
         (RawNode::open(&path).unwrap(), path)
@@ -1591,17 +1593,17 @@ mod tests {
 
     /// Build a 256 KiB compressed hard-disk CHD full of `byte`, and return its
     /// path. MAME's v5 compression map asserts below one hunk, so keep it large.
-    fn compressed_chd(byte: u8) -> PathBuf {
+    fn compressed_chd(byte: u8) -> TempImage {
         compressed_chd_of(vec![byte; 256 * 1024])
     }
 
     /// Build a compressed hard-disk CHD with 4 KiB hunks holding `data`.
-    fn compressed_chd_of(data: Vec<u8>) -> PathBuf {
+    fn compressed_chd_of(data: Vec<u8>) -> TempImage {
         use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
         use libchdman_rs::CHD_CODEC_ZLIB;
         use std::io::Cursor;
 
-        let base = tmp_path("chd").with_extension("chd");
+        let base = tmp_chd("chd");
         let logical = data.len() as u64;
         create_from_reader(
             Cursor::new(data),
@@ -1619,11 +1621,6 @@ mod tests {
         )
         .unwrap();
         base
-    }
-
-    fn cleanup(overlay: &Path) {
-        let _ = std::fs::remove_file(overlay);
-        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(overlay));
     }
 
     /// A node left behind by `process::exit` is never closed. `mem::forget`
@@ -1654,7 +1651,6 @@ mod tests {
                     node.read(lba * SECTOR_SIZE, &mut got).unwrap();
                     assert_eq!(got, [0x5A; SECTOR_BYTES], "{sync} cow={cow} lba={lba}");
                     drop(node);
-                    remove_chd(&base);
                 }
             }
         }
@@ -1690,7 +1686,6 @@ mod tests {
         assert_eq!(&hunk[512..1024], &[0x5A; SECTOR_BYTES][..], "the entry points at the write");
         assert_eq!(&hunk[..512], &[0xAB; SECTOR_BYTES][..], "and the rest of the hunk is the base's");
         drop(node);
-        remove_chd(&base);
     }
 
     /// The background thread alone, with no explicit flush, makes writes
@@ -1721,7 +1716,7 @@ mod tests {
         }
         // Whether every write is on the host's disk yet: reopen a copy of
         // the files and read them all back.
-        let copy = tmp_path("chd-kill").with_extension("chd");
+        let copy = tmp_chd("chd-kill");
         let durable = || {
             let ok = std::fs::copy(&base, &copy).is_ok()
                 && std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).is_ok()
@@ -1735,13 +1730,11 @@ mod tests {
                     }),
                     Err(_) => false,
                 };
-            remove_chd(&copy);
             ok
         };
         assert!(wait_for(durable), "the background sync alone made the writes durable");
         fast.finish();
         drop(node);
-        remove_chd(&base);
     }
 
     /// A kill leaves the CHD as the host's files have it. Whatever it loses,
@@ -1761,7 +1754,7 @@ mod tests {
         node.write(3 * 4096, &[0x22; SECTOR_BYTES]).unwrap();
         node.write(SECTOR_SIZE, &[0x33; SECTOR_BYTES]).unwrap();
 
-        let copy = tmp_path("chd-order").with_extension("chd");
+        let copy = tmp_chd("chd-order");
         std::fs::copy(&base, &copy).unwrap();
         std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).unwrap();
         let mut again = ChdNode::open(copy.to_str().unwrap(), false).unwrap();
@@ -1770,14 +1763,12 @@ mod tests {
         let mut later = [0u8; SECTOR_BYTES];
         again.read(SECTOR_SIZE, &mut later).unwrap();
         drop(again);
-        remove_chd(&copy);
         assert!(
             later != [0x33; SECTOR_BYTES] || earlier == [0x22; SECTOR_BYTES],
             "the later write survived the kill and the earlier one did not (earlier reads {:#04x})",
             earlier[0]
         );
         drop(node);
-        remove_chd(&base);
     }
 
     /// Zeroes written over a hunk a diff does not hold yet read back as
@@ -1832,7 +1823,6 @@ mod tests {
                 }
             }
             drop(node);
-            remove_chd(&base);
         }
     }
 
@@ -1849,9 +1839,9 @@ mod tests {
     /// A CHD node whose commit folded its diff but could not reopen, with its
     /// base then moved to `away`. Windows refuses to move a file the CHD
     /// reader has open, so the move also checks the node let go of it.
-    fn closed_chd_node() -> (ChdNode, PathBuf, PathBuf) {
+    fn closed_chd_node() -> (ChdNode, TempImage, TempImage) {
         let base = compressed_chd(0xAB);
-        let away = base.with_extension("away");
+        let away = tmp_path("chd-away");
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
         let blocker = block_new_diff(&base);
@@ -1862,11 +1852,6 @@ mod tests {
         assert!(node.is_cow(), "the node still reopens with a diff");
         assert_eq!(node.dirty_count(), 0, "the fold took the changes");
         (node, base, away)
-    }
-
-    fn remove_chd(base: &Path) {
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(base));
-        let _ = std::fs::remove_file(base);
     }
 
     /// Writing, committing or rolling back a node whose reopen failed is an
@@ -1894,7 +1879,6 @@ mod tests {
         assert_eq!(got, [0x5A; SECTOR_BYTES], "the commit's fold stays in the base");
         drop(node);
         for b in [base, base2, base3] {
-            remove_chd(&b);
         }
     }
 
@@ -1915,7 +1899,6 @@ mod tests {
             let want = if rollback { 0xAB } else { 0x5A };
             assert_eq!(got, [want; SECTOR_BYTES], "rollback={rollback}");
             drop(node);
-            remove_chd(&base);
         }
     }
 
@@ -1939,7 +1922,6 @@ mod tests {
         assert_eq!(got, [0x00u8; SECTOR_BYTES], "discard zero-fills a raw node");
 
         node.flush().unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1949,7 +1931,6 @@ mod tests {
         assert!(node.read(SECTOR_SIZE, &mut buf).is_ok());
         assert!(node.read(2 * SECTOR_SIZE, &mut buf).is_err());
         assert!(node.block_status(SECTOR_SIZE, SECTOR_SIZE + 1).is_err());
-        let _ = std::fs::remove_file(path);
     }
 
     /// The process can exit without dropping the node (`process::exit` after a
@@ -1987,8 +1968,6 @@ mod tests {
         assert!(got == expect, "reopened overlay does not read back what was written");
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A guest can issue SYNCHRONIZE CACHE often; a flush with nothing new
@@ -2012,8 +1991,6 @@ mod tests {
         assert!(sidecar.exists(), "a discard is a change the record must carry");
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// Reopen `overlay_path` over a fresh handle on `backing_path`, as the next
@@ -2047,8 +2024,6 @@ mod tests {
         assert_eq!(sector(&mut node, 3), [0x33u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// After a flush, a sector the record already lists is rewritten in place
@@ -2075,8 +2050,6 @@ mod tests {
         assert_eq!(sector(&mut node, 2), [0x02u8; SECTOR_BYTES], "the new sector came back from the base");
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A kill in the middle of an append leaves a short last entry. The next
@@ -2105,8 +2078,6 @@ mod tests {
         assert_eq!(sector(&mut node, 1), [0x02u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A commit empties the overlay; a kill before the next flush must not
@@ -2129,8 +2100,6 @@ mod tests {
         assert_eq!(sector(&mut node, 1), [0x55u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A discard takes a sector out of the record at once, so a kill does not
@@ -2151,8 +2120,6 @@ mod tests {
         assert_eq!(sector(&mut node, 0), [0xAAu8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// An import that fails after taking the live overlay away (here the
@@ -2198,8 +2165,6 @@ mod tests {
         }
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A write that fails to record its new sector is an error to the guest,
@@ -2227,8 +2192,6 @@ mod tests {
         assert_eq!(sector(&mut node, 1), [0x02u8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     /// A record that cannot be read, or has no whole header, stops the open
@@ -2271,8 +2234,6 @@ mod tests {
         std::fs::remove_file(&sidecar).unwrap();
         assert!(open().is_ok());
 
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(backing_path);
     }
 
     #[test]
@@ -2295,8 +2256,6 @@ mod tests {
         assert_eq!(status.backing_offset, Some(SECTOR_SIZE));
         assert_eq!(status.len, SECTOR_SIZE);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
@@ -2320,8 +2279,6 @@ mod tests {
         node.read(2 * SECTOR_SIZE, &mut got).unwrap();
         assert_eq!(got, [0xAAu8; SECTOR_BYTES]);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
@@ -2342,8 +2299,6 @@ mod tests {
         assert_eq!(status.state, BlockState::Allocated);
         assert_eq!(status.backing_offset, Some(SECTOR_SIZE));
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
@@ -2365,7 +2320,6 @@ mod tests {
         node.discard(0, SECTOR_SIZE).unwrap();
         assert_eq!(node.block_status(0, SECTOR_SIZE).unwrap().state, BlockState::Zero);
 
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
@@ -2393,8 +2347,6 @@ mod tests {
         assert_eq!(second.state, BlockState::Data);
         assert_eq!(second.len, SECTOR_SIZE);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
@@ -2412,8 +2364,6 @@ mod tests {
         assert_eq!(&got[100..200], &[0x11u8; 100]);
         assert_eq!(&got[200..], &[0xAAu8; SECTOR_BYTES - 200]);
 
-        let _ = std::fs::remove_file(backing_path);
-        let _ = std::fs::remove_file(overlay_path);
     }
 
     #[test]
@@ -2422,7 +2372,7 @@ mod tests {
         use libchdman_rs::CHD_CODEC_ZLIB;
         use std::io::Cursor;
 
-        let base = tmp_path("chd").with_extension("chd");
+        let base = tmp_chd("chd");
         // MAME's v5 compression map asserts on a logical size smaller than one
         // hunk, so use the same 256 KiB the chd_disk tests use.
         let logical = 256 * 1024u64;
@@ -2460,8 +2410,6 @@ mod tests {
         node.flush().unwrap();
 
         drop(node);
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
     }
 
     #[test]
@@ -2493,8 +2441,6 @@ mod tests {
         assert_eq!(got, [0x55u8; SECTOR_BYTES]);
 
         node.flush().unwrap();
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
     }
 
     #[test]
@@ -2515,8 +2461,6 @@ mod tests {
         assert_eq!(got, [0xAAu8; SECTOR_BYTES], "reset falls back to the base");
 
         node.flush().unwrap();
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
     }
 
     #[test]
@@ -2538,8 +2482,6 @@ mod tests {
         node.read(SECTOR_SIZE, &mut got).unwrap();
         assert_eq!(got, [0x55u8; SECTOR_BYTES], "overlay bytes are read back after reopen");
 
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
     }
 
     #[test]
@@ -2564,9 +2506,6 @@ mod tests {
         node.read(0, &mut got).unwrap();
         assert_eq!(got, [0x42u8; SECTOR_BYTES]);
 
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(&export_path);
     }
 
     /// An import of an unsorted dirty list, then a kill: the record the next
@@ -2596,9 +2535,6 @@ mod tests {
         assert_eq!(sector(&mut node, 3), [0xAAu8; SECTOR_BYTES]);
 
         drop(node);
-        cleanup(&overlay_path);
-        let _ = std::fs::remove_file(&backing_path);
-        let _ = std::fs::remove_file(&export_path);
     }
 
     #[test]
@@ -2617,8 +2553,6 @@ mod tests {
         assert!(node.pending_sync().is_some(), "COW off: the diff auto-folds on exit");
 
         drop(node);
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
     }
 
     /// The overlay contract — dirty_count / commit / rollback — is exercised
@@ -2651,8 +2585,6 @@ mod tests {
         let on_disk = std::fs::read(&backing_path).unwrap();
         assert_eq!(&on_disk[SECTOR_BYTES..2 * SECTOR_BYTES], &[0x55u8; SECTOR_BYTES]);
 
-        let _ = std::fs::remove_file(&backing_path);
-        cleanup(&overlay_path);
     }
 
     /// A CHD's commit folds the diff into the base (the flatten operation) and
@@ -2683,15 +2615,15 @@ mod tests {
         assert_eq!(got, [0x5Au8; SECTOR_BYTES], "rollback restores the committed base");
 
         drop(node);
-        let _ = std::fs::remove_file(&base);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
     }
 
     /// An ISO of `sectors` CD sectors, each filled with `fill`.
-    fn iso(tag: &str, fill: u8, sectors: usize) -> String {
+    /// Returns the guard that removes it and the path as the changer names it.
+    fn iso(tag: &str, fill: u8, sectors: usize) -> (TempImage, String) {
         let p = tmp_path(tag);
         std::fs::write(&p, vec![fill; sectors * 2048]).unwrap();
-        p.display().to_string()
+        let name = p.display().to_string();
+        (p, name)
     }
 
     fn first_byte(c: &mut ChangerNode) -> u8 {
@@ -2707,7 +2639,7 @@ mod tests {
 
     #[test]
     fn ejecting_the_only_disc_empties_the_tray() {
-        let a = iso("only", 1, 4);
+        let (_a_file, a) = iso("only", 1, 4);
         let mut c = drive_with(&[&a]);
         assert!(c.present());
         assert_eq!(c.eject().unwrap(), None);
@@ -2720,7 +2652,7 @@ mod tests {
 
     #[test]
     fn ejecting_with_two_discs_turns_the_queue() {
-        let (a, b) = (iso("turn-a", 1, 4), iso("turn-b", 2, 8));
+        let ((_a_file, a), (_b_file, b)) = (iso("turn-a", 1, 4), iso("turn-b", 2, 8));
         let mut c = drive_with(&[&a, &b]);
         assert_eq!(first_byte(&mut c), 1);
         assert_eq!(c.eject().unwrap().as_deref(), Some(b.as_str()));
@@ -2732,7 +2664,7 @@ mod tests {
 
     #[test]
     fn loading_a_disc_raises_the_medium_change_once() {
-        let (a, b) = (iso("change-a", 1, 4), iso("change-b", 2, 4));
+        let ((_a_file, a), (_b_file, b)) = (iso("change-a", 1, 4), iso("change-b", 2, 4));
         let mut c = ChangerNode::empty();
         assert!(!c.take_changed(), "a drive starting empty has not changed");
         c.load(&a).unwrap();
@@ -2746,9 +2678,9 @@ mod tests {
     #[test]
     fn a_chd_cd_in_the_queue_loads_on_eject() {
         use libchdman_rs::cd::{create_from_iso, CdCreateOptions};
-        let a = iso("chd-a", 1, 4);
-        let src = iso("chd-src", 0x42, 16);
-        let chd = tmp_path("chd-cd").with_extension("chd");
+        let (_a_file, a) = iso("chd-a", 1, 4);
+        let (_src_file, src) = iso("chd-src", 0x42, 16);
+        let chd = tmp_chd("chd-cd");
         create_from_iso(Path::new(&src), &chd, CdCreateOptions::default(), &mut |_| {}, &|| false).unwrap();
         let chd = chd.display().to_string();
         let mut c = drive_with(&[&a, &chd]);
@@ -2758,7 +2690,7 @@ mod tests {
 
     #[test]
     fn a_disc_that_will_not_open_leaves_the_drive_as_it_was() {
-        let a = iso("bad-a", 1, 4);
+        let (_a_file, a) = iso("bad-a", 1, 4);
         let mut c = drive_with(&[&a, "/nonexistent/disc.iso"]);
         assert!(c.eject().is_err());
         assert!(c.present());
@@ -2768,16 +2700,16 @@ mod tests {
 
     #[test]
     fn queueing_a_missing_file_is_refused() {
-        let a = iso("queue-a", 1, 4);
+        let (_a_file, a) = iso("queue-a", 1, 4);
         let mut c = drive_with(&[&a]);
         assert!(c.add("/nonexistent/disc.iso".into()).unwrap_err().contains("not found"));
         assert_eq!(c.discs().len(), 1);
-        let b = iso("queue-b", 2, 4);
+        let (_b_file, b) = iso("queue-b", 2, 4);
         c.add(b.clone()).unwrap();
         assert_eq!(c.discs(), [a, b], "a queued disc follows the active one, unopened");
     }
 
-    fn bg_file(tag: &str) -> (PathBuf, File) {
+    fn bg_file(tag: &str) -> (TempImage, File) {
         let path = tmp_path(tag);
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
@@ -2820,7 +2752,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(syncs(), 2, "a burst is one sync");
         bg.finish();
-        let _ = std::fs::remove_file(path);
     }
 
     /// A write marked before the thread exists is synced once it does.
@@ -2832,7 +2763,6 @@ mod tests {
         bg.spawn().unwrap();
         assert!(wait_for(|| bg.syncs() == 1), "synced without another write");
         bg.finish();
-        let _ = std::fs::remove_file(path);
     }
 
     /// A node's own sync clears the flag before it runs and sets it again if
@@ -2854,7 +2784,6 @@ mod tests {
             Ok(())
         });
         assert!(bg.is_pending());
-        let _ = std::fs::remove_file(path);
     }
 
     /// A node's own flush leaves nothing for the thread to do.
@@ -2868,7 +2797,6 @@ mod tests {
         assert!(bg.is_pending());
         node.flush().unwrap();
         assert!(!bg.is_pending());
-        let _ = std::fs::remove_file(path);
     }
 
     /// So does a sync of the data alone, as a write with FUA makes: the
@@ -2883,7 +2811,6 @@ mod tests {
         assert!(bg.is_pending());
         raw.flush_data().unwrap();
         assert!(!bg.is_pending());
-        let _ = std::fs::remove_file(&path);
 
         let overlay = tmp_path("bg-data-cow");
         let mut cow = CowNode::new(None, &overlay, 8 * 512).unwrap();
@@ -2911,7 +2838,5 @@ mod tests {
         assert!(bg.is_pending(), "a write after a flush marks again");
         assert!(RawNode::open_readonly(&overlay).unwrap().background().is_none());
         drop(node);
-        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
-        let _ = std::fs::remove_file(overlay);
     }
 }
