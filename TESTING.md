@@ -316,7 +316,9 @@ space; a skipped test (`# SKIP`) reports `ok`.
 ### Nightly boot
 
 `build.yml` boots IRIX 5.3 with each CLI build, on Linux, macOS and Windows,
-when the `IRIX53_BOOT_IMAGE_URL` secret is set. `scripts/ci-boot-test.sh` seeds
+from a pinned, checksummed stock disk
+([clanker/testing/ci-irix53-disk.md](clanker/testing/ci-irix53-disk.md)).
+`scripts/ci-boot-test.sh` seeds
 NVRAM on a first headless run, boots with the console on serial and waits up to
 15 minutes for `login:`, then checks that iris quits cleanly. Each check is a
 JUnit case, so a failed run is annotated with the check that failed, and the run

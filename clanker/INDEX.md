@@ -407,6 +407,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 |---|---|---|
 | [cpu-tests-must-not-depend-on-code-size.md](testing/cpu-tests-must-not-depend-on-code-size.md) | rule | cpu-tests: a moved stack broke `index_tag_rt` (discarded dirty lines) and `load_miss_third` (a silent Virtual Coherency exception); clean lines first, keep VA[14:12] |
 | [cpu-tests-make-dry-run-is-a-fork-bomb.md](testing/cpu-tests-make-dry-run-is-a-fork-bomb.md) | rule | `make -n` in cpu-tests recurses without end: 11k processes and an OOM |
+| [ci-irix53-disk.md](testing/ci-irix53-disk.md) | howto | The boot test's stock IRIX 5.3 disk: its pinned URL and checksum, how it was built, and how to rotate it |
 | [ci-unattended-irix-boot.md](testing/ci-unattended-irix-boot.md) | howto | Unattended IRIX boot under `--ci`: seed NVRAM first, and what the boot test needs from the disk |
 | [arcs-console-from-bare-metal.md](testing/arcs-console-from-bare-metal.md) | howto | Calling ARCS firmware from the bare-metal harness |
 | [bare-metal-harness-platform-assumptions.md](testing/bare-metal-harness-platform-assumptions.md) | howto | What the bare-metal suites assume about the machine |
