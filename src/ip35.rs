@@ -238,7 +238,12 @@ impl BusDevice for CachedPhysical {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
         self.target(a, 1).map(|(view, pa)| {
-            let generation = self.plain_memory.gen_ptr(pa);
+            // MD's logical counters belong to a view that names its RAM. A
+            // node of several leaves the extent empty: its stores reach the
+            // banks, which bump their own counters, so a compiled page must
+            // watch those. Handing it a logical counter that only DMA and
+            // uncached stores bump leaves stale code running.
+            let generation = if self.extent.is_empty() { std::ptr::null() } else { self.plain_memory.gen_ptr(pa) };
             if generation.is_null() { view.gen_ptr(pa) } else { generation }
         }).unwrap_or(std::ptr::null())
     }
@@ -275,6 +280,7 @@ impl BusDevice for CachedPhysical {
     }
 }
 
+pub(crate) mod inbound;
 pub(crate) mod node;
 pub(crate) mod presence;
 pub(crate) mod routed;

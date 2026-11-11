@@ -185,3 +185,23 @@ pub static IP34_NO_PS2: Ioc3Board = Ioc3Board {
     pci_policy: IP34_POLICY,
     reset_pci_on_power_on: true,
 };
+
+/// The I-brick's base I/O ("IO7"). Linux sets it up as device 4 of the
+/// I-brick's XBridge head F (`bridge_setup_io7`). Published inventories show
+/// its IOC3 with Ethernet, serial and a clock and no PS/2 or parallel port.
+///
+/// Approximations: the chip has no subsystem register, so the id is the
+/// placeholder `0xffff` no guest reads. The clock part is unidentified, so the
+/// byte bus fits the Fuel's M48T35-compatible Timekeeper, and the transceiver
+/// and the PCI header behaviour are the Fuel's (DP83843), none of them
+/// observed on an I-brick.
+pub static IO7: Ioc3Board = Ioc3Board {
+    name: "IO7 Base I/O",
+    subsystem_id: 0xffff,
+    cells: SERIAL_ETH,
+    phy: Phy::Dp83843,
+    superio_pin: 0,
+    gpio: &[],
+    pci_policy: IP34_POLICY,
+    reset_pci_on_power_on: true,
+};

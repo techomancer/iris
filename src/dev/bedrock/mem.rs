@@ -58,6 +58,8 @@ impl RamExtent {
     fn slots(&self) -> usize {
         self.0.iter().rposition(|&size| size != 0).map_or(0, |last| last + 1)
     }
+    /// Whether no slot can hold RAM.
+    pub fn is_empty(&self) -> bool { self.0.iter().all(|&size| size == 0) }
     /// The most RAM software slot `slot` can hold, in bytes.
     pub fn prefix(&self, slot: usize) -> u64 { self.0[slot] }
 }

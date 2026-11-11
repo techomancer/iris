@@ -177,8 +177,8 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)). |
-| `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`); independent of build features. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with). The first listed is the default. |
+| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)), origin3200_ip35 (configured by `[origin3200]`, see [the Origin 3200 guide](docs/origin3200-ip35.md)). |
+| `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`); independent of build features. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
 | `machine.cpus` | `1`; `4` on the Tezro | Processors fitted. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro, each run on its own host thread; one selects the one-processor board with one PIC, two or four the board with two PICs. |
 | `machine.emu_id` | `0` | 0 to 4095; only the Fuel and Tezro take it, and other machines refuse a nonzero one. Mints the machine's system id (`sysinfo -s`, `lmhostid`) in iris's layout. When nonzero it gives the station address `08:00:69:e2:<emu_id>`, which is the Fuel's id. The Tezro's L1 system serial is `LEMU2<emu_id>0`, whose fold is the Tezro's id. 0 is the generic id. See [the Fuel guide](docs/fuel-ip34.md) and [the Tezro guide](docs/tezro-ip53.md). |
 
@@ -239,6 +239,25 @@ takes 512 or 1024 MiB banks from bank 0; left unset, it is the 4 GiB layout of
 1024, 1024 and four 512 MiB banks. A `[tezro]` table is written to a saved
 config only when one of these keys is set. See the
 [Tezro guide](docs/tezro-ip53.md), which lists its limits.
+
+### [origin3200]
+
+Origin 3200 settings apply when `machine.profile = "origin3200_ip35"`.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `c_bricks` | `1` | 1 or 2 C-bricks, each with one processor. Two are joined by the direct NUMAlink cable. |
+| `flash` | unset | Persistent 16 MiB boot-flash file of the first C-brick; the second keeps its own at the name with `.1` added. Unset, the flash is volatile. |
+| `console` | `l1` | `l1`, `ioc3_a` or `ioc3_b`. Selects the guest console connection. |
+| `l1_port` | `8882` | Host TCP port for the first C-brick's L1 console. |
+| `l1_log` | unset | Optional serial log path for L1 output when an IOC3 port is selected as console. |
+| `l1_revision`, `brick_serial` | `1.48.1`, `EMUN00` | What the first C-brick's L1 reports, as for the Fuel. |
+
+`banks` is per C-brick and defaults to two 256 MiB banks; 256 and 512 MiB banks
+are accepted, in the matched pairs a lane of the memory controller holds. The I-brick's Fibre Channel
+adapter is always fitted; its disks are `[fibre_channel.disk.N]`. A `[origin3200]` table is
+written to a saved config only when one of these keys is set. See the
+[Origin 3200 guide](docs/origin3200-ip35.md), which lists its limits.
 
 ### [graphics]
 

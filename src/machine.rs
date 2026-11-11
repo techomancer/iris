@@ -71,6 +71,7 @@ fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static s
         Some(MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) => &["IRIX", "Iris", "IPsomething", "IP27"],
         Some(MachineProfile::FuelIp34) => &["IRIX", "Iris", "IPsomething", "IP34"],
         Some(MachineProfile::TezroIp53) => &["IRIX", "Iris", "IP53"],
+        Some(MachineProfile::Origin3200Ip35) => &["IRIX", "Iris", "IPsomething", "IP35"],
         None => &["IRIX", "Iris", "IPsomething"],
     }
 }
@@ -2173,6 +2174,7 @@ mod emulator_name_tests {
                 Some(MachineProfile::OctaneIp30) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP32", "O2"],
                 Some(MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 | MachineProfile::FuelIp34) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
                 Some(MachineProfile::TezroIp53) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "IP34", "O2"],
+                Some(MachineProfile::Origin3200Ip35) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
                 None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
             }
         };

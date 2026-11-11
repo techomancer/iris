@@ -680,13 +680,13 @@ impl TezroMachine {
 /// One of the board's serial connections: what it is called, the TCP port
 /// and the setting that names the port, the CI backend it uses when it is
 /// the console, the log it keeps when it is not, and where the host end goes.
-struct SerialPort<'a> {
-    label: &'static str,
-    port: u16,
-    setting: &'static str,
-    ci: &'a Arc<CiSerialBackend>,
-    log: Option<String>,
-    connect: Box<dyn Fn(Arc<dyn SerialBackend>) + 'a>,
+pub(crate) struct SerialPort<'a> {
+    pub(crate) label: &'static str,
+    pub(crate) port: u16,
+    pub(crate) setting: &'static str,
+    pub(crate) ci: &'a Arc<CiSerialBackend>,
+    pub(crate) log: Option<String>,
+    pub(crate) connect: Box<dyn Fn(Arc<dyn SerialBackend>) + 'a>,
 }
 
 /// Connect the board's serial ports to the host. The console takes
@@ -694,7 +694,7 @@ struct SerialPort<'a> {
 /// their TCP ports, and a port that is taken leaves its stream unconnected
 /// rather than stopping the machine. Port 0 takes any free port, so several
 /// lines may name it.
-fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[SerialPort<'_>], console: usize) -> Result<(), String> {
+pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[SerialPort<'_>], console: usize) -> Result<(), String> {
     for (i, a) in ports.iter().enumerate() {
         if let Some(b) = ports[i + 1..].iter().find(|b| b.port == a.port && a.port != 0) {
             return Err(format!("{name} {} and {} serial ports must be distinct", a.label, b.label));

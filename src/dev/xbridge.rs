@@ -134,6 +134,11 @@ impl XBridge {
         self.heads[Self::index(widget)].bus()
     }
 
+    /// Mark `slot` of head `widget` as running 64-bit data phases ([`Bridge::set_dma_64bit`]).
+    pub fn set_dma_64bit(&self, widget: u8, slot: u8, wide: bool) {
+        self.heads[Self::index(widget)].set_dma_64bit(slot, wide);
+    }
+
     /// The DMA head `widget` gives the function in `slot`.
     pub fn dma(&self, widget: u8, slot: u8) -> Arc<dyn PciDma> {
         assert!(slot < 8);
