@@ -81,11 +81,37 @@ approximations are in
 ## Limits
 
 - Machine snapshots are unsupported.
-- Two values are chosen to match what the guests expect, not read from a
-  board: the board-id word's bits 11:0 (`0x4004`; bits 15:12 are the
-  Fuel's product code as OpenBSD reads it), which PROM 6.210's CPU
-  configuration check accepts, and NI port status bit 0, set so IRIX
-  6.5.30 prints no link-reset notice on a faulting widget probe.
+- The board-id word (`0x4004`) and NI port status are partly chosen, not
+  read from a board. For the board word, the PROM masks bits 15:12 as the
+  class and compares 0x2000, 0x4000, 0x8000 and 0xc000, and the kernel
+  compares 4, 8 and c (established); 4 is the Fuel. For class 4 the low
+  nibble selects a row of the PROM's CPU speed table (established): 4 or 6
+  is 500 MHz with 2 MB of secondary cache, 7 or 8 is 600 MHz with 4 MB, 3 is
+  700 MHz (R16000) with 4 MB, c is 800 MHz with 4 MB and 2 is 900 MHz with
+  8 MB; the hub clock is 200 MHz in every row. Nibbles 0, 5 and f have no
+  row, and the PROM prints "Unknown PIMM_PSC type" for them. That the nibble
+  is the processor module's code is inferred. The emulator derives it from
+  the processor's clock and cache, so the board is 4 for the Fuel's 500 MHz
+  R14000A, and a test pins the mapping. Bits 11:4 and 63:16 of a real
+  board's word are unknown and read zero. Only bit 1 of NI port status is
+  read by the PROM and IRIX, as link-up (established): with no peer the PROM
+  prints "Local hub NUMAlink is down", records code 0x9c and continues, and
+  the model reads bit 1 clear. Bits 0 and 2 on a real uncabled Fuel are
+  unknown; bit 0 is set because without it IRIX 6.5.30 prints a link-reset
+  notice on every faulting widget probe.
+- The boot flash's 80-byte record at flash 0x60 holds the CPU mode word, CPU
+  and bus clocks, the machine type and the flash timing bytes. The PROM
+  compares them with the board's EEPROM record and then the speed table, and
+  prints "CPU configuration values mismatch" if any disagree, so the record
+  follows the board word's row (established). The machine type is 2 for every
+  class-4 row (established); the name SN11 for it comes from a public flash
+  transcript only (inferred). The 500 MHz mode word `0x549aa985` is chosen:
+  the PROM accepts it, but it was not read from a 500 MHz Fuel (a real
+  800 MHz Fuel's was `0x549baf85`).
+- The XBridge's 1024-entry address translation table is stored whole and
+  zero at reset. IRIX's driver treats entries 512 to 1023 like 0 to 511 and
+  zeroes them at attach (established); the model still faults DMA through entries
+  512 and up, a limit the driver's treatment does not settle (open).
 - The Hub-special head windows read zero and acknowledge writes with no
   side effect. PROM 6.210 writes the 64-bit word `0x2000` at offsets
   `0x0` and `0x40` before it finds DRAM; what those registers do is
