@@ -53,9 +53,9 @@
 //! a processor next runs, never a value it reads. A held processor stops at
 //! its next batch boundary, not at once. Nothing holds with fewer than two
 //! processors, and the liveness hold needs both slots of an interface
-//! fitted. QEMU holds the same processors, the first poster at its post and
-//! the publisher at its release of the hub lock, and bounds both at 2 s of
-//! its virtual clock.
+//! fitted. The same processors are held, the first poster at its post and
+//! the publisher at its release of the hub lock, and both holds are bounded
+//! at 2 s.
 //!
 //! Ported from hw/misc/sgi-bedrock.c in jamesbraid/qemu-sgi-origami.
 
@@ -70,8 +70,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// How far the processors a hold waits for may run, in their retired
-/// cycles, before the hold gives up: 2 s of a 1 GHz processor, the order of
-/// QEMU's 2 s bound.
+/// cycles, before the hold gives up: 2 s of a 1 GHz processor.
 pub(crate) const HOLD_CYCLES: u64 = 2_000_000_000;
 /// The longest a hold lasts in board nanoseconds whatever the processors
 /// do: a deadlock safety net, far past any host stall.

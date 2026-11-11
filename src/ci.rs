@@ -2,7 +2,7 @@
 //!
 //! Unix domain socket (Linux/macOS) or TCP localhost (Windows) that drives the
 //! emulator for automated testing. The protocol is newline-delimited JSON,
-//! strict request/response, single client. See `ci_mode_plan.md` in the repo root.
+//! strict request/response on each connection. STORAGE.md describes the commands.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;

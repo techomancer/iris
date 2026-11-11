@@ -338,10 +338,10 @@ impl Bedrock {
         Arc::new(Registers::<false>(self.clone()))
     }
     /// The register window in its local XIO form: PI0's range answers the
-    /// requester's own PI when the board fits processors on both PIs, as
-    /// QEMU's IP35 node overlays PI1 there for a processor on it (OpenBSD
-    /// expects the local form to select the requester's interface). That the
-    /// chip answers so is an approximation pending a hardware read. With
+    /// requester's own PI when the board fits processors on both PIs: PI1's
+    /// registers appear there for a processor on PI1 (OpenBSD expects the
+    /// local form to select the requester's interface). That the chip
+    /// answers so is an approximation pending a hardware read. With
     /// processors on PI0 alone it is the node form.
     pub fn local_registers(self: &Arc<Self>) -> Arc<dyn BusDevice> {
         if (0..2).any(|slot| self.processors.fitted(1, slot)) {

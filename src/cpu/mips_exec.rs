@@ -4300,7 +4300,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         }
                     } else if page.note_waiting_arrival() {
                         // Already queued, and being executed hard while it
-                        // waits: jump the queue (jitv2::HOT_QUEUE).
+                        // waits: jump the queue (`CompileQueue::hot`).
                         crate::pf_instant!(crate::perfetto::events::JIT_HOT_REQUEST, pc);
                         crate::cpu::jitv2::jitv2::push_hot_request(&self.jitv2_hot_queue_handle, req);
                     }

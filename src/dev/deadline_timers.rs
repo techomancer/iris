@@ -2,13 +2,9 @@
 //!
 //! A device evaluates its deadlines lazily, on every access, and arms one
 //! timer per deadline so the work still happens when the guest is idle. The
-//! IOC3 and IOC4 do this for their serial ring timers and transmit delays,
-//! and the IOC3 for its interrupt output. This holds the part they share:
-//! which timer serves which deadline, replacing one whose deadline moved,
-//! and taking them all away on stop.
-//!
-//! QEMU has no counterpart: its timers belong to the virtual clock and are
-//! armed where they are set.
+//! IOC4 does this for its serial ring timers and transmit delays. This holds
+//! the bookkeeping: which timer serves which deadline, replacing one whose
+//! deadline moved, and taking them all away on stop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
