@@ -321,10 +321,16 @@ Four flat-fill normalizer tests additionally compare blocks, spans, consistent
 reverse-direction resident blocks and active `COLORVRAM` fast clears with the
 CPU walker, including exact context advancement. The dual-backend hardware
 fill case includes the reverse fast-clear command.
+Two line-normalizer tests compare payload coverage and exact context
+completion with the CPU walker across all octants, both BRESROUND tie modes,
+fractional endpoints, skip-first/last and antialiased endpoint filtering. The
+hardware line case executes integer, fractional and antialiased commands
+against complete seeded RGB and auxiliary planes on both backends.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::rex3_flat_fill::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::line::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::command::tests -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_ -- --test-threads=1
 REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
@@ -348,11 +354,11 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The script requires 25 `resident_` CPU tests, four flat-fill tests, three
-command-ABI tests and three direct-state tests, then **10 resident GPU tests
-and eight direct scanout tests on each backend**: 71 tests in total. The
-window test requires an available native desktop and a GPU that can present
-to it. The script checks each libtest pass count, rejects
+The script requires 25 `resident_` CPU tests, four flat-fill tests, two line
+tests, three command-ABI tests and three direct-state tests, then **11
+resident GPU tests and eight direct scanout tests on each backend**: 75 tests
+in total. The window test requires an available native desktop and a GPU that
+can present to it. The script checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
 or `-Backend dx12` runs just one hardware backend and is not the complete

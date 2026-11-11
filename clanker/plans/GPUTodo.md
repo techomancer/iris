@@ -791,11 +791,12 @@ within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-4 flat-fill, 3 command-ABI and 3 direct-state tests, plus 10 resident GPU and 8
+4 flat-fill, 2 line, 3 command-ABI and 3 direct-state tests, plus 11 resident
+GPU and 8
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 71-test gate. See
+complete 75-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -804,7 +805,7 @@ complete 71-test gate. See
 - [x] Use fixed buffers/bind groups and bounded reusable batch sets.
 - [x] Preserve ordered per-tile command lists.
 - [x] Implement blocks, spans and clears.
-- [ ] Implement integer, fractional and antialiased lines.
+- [x] Implement integer, fractional and antialiased lines.
 - [ ] Implement RGB, auxiliary/CID/overlay and Z effects.
 - [ ] Implement clipping, stipples, masks, logic operations, blending and
       dithering.
@@ -829,8 +830,18 @@ command kinds. Resident blocks accept consistent increasing or decreasing X/Y
 directions, spans retain the hardware's left-to-right walk, and active fast
 clears use the canonical REX3 mode fold and replicated `COLORVRAM` value
 rather than COLORI or a destination read. WRMASK and RGB/auxiliary plane
-selection remain exact. Clipping, stipples, continuation, line families and
-the general pixel-operation pipeline remain later M3 slices.
+selection remain exact. Clipping, stipples, continuation and the general
+pixel-operation pipeline remain later M3 slices.
+
+The line slice adds distinct integer, fractional and antialiased command
+kinds. It consumes the post-setup Bresenham state, records one bounded payload
+word per major-axis position, and lets each shader lane test coverage in O(1)
+without rerunning setup or walking a full bounding box. All octants,
+BRESROUND ties, fractional endpoints, skip-first/last, AWEIGHT endpoint
+filtering, RGB/auxiliary writes and exact `XSTART`/`YSTART`/`BRESD` completion
+match the CPU oracle on Vulkan and D3D12. Length-32/single-step continuation,
+clipping, stipples and the general pixel-operation pipeline remain later M3
+slices.
 
 ### M4 - HostW staging
 
