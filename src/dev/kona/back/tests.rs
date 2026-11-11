@@ -669,6 +669,25 @@ fn a_push_of_attributes_posts_its_completion_on_every_path() {
     assert_eq!(b.query_counts.unposted, 1);
 }
 
+/// A finish with its wait flag set is a bare read-back: the client polls the completion word until
+/// the pipe has drained, so it is posted with a zero count. A finish with the flag clear is not waited
+/// on and posts nothing.
+#[test]
+fn a_finish_with_its_wait_flag_posts_a_bare_completion() {
+    let (mut b, mut r) = (backend(), Rig::new());
+    let finish = |b: &mut KonaBackend, r: &mut Rig, flag: u32| {
+        r.send(b, Job::Command { grammar: Grammar::Gl, selector: FINISH_DRAIN_PIPE_AND_SIGNAL_COMPLETION, args: &[flag], packed: 0, handled: false });
+    };
+    finish(&mut b, &mut r, 0);
+    assert_eq!(r.ram.word(RETURN_PAGE), 0, "a finish nobody waits on posts nothing");
+    finish(&mut b, &mut r, 1);
+    assert_eq!((r.ram.word(RETURN_PAGE), r.ram.bytes(RETURN_PAGE + 4, 4)), (1, vec![0; 4]));
+    // With no return page registered the completion is dropped and counted, as a query's is.
+    r.core.return_page = None;
+    finish(&mut b, &mut r, 1);
+    assert_eq!(b.query_counts.unposted, 1);
+}
+
 /// A bare read whose image would not fit the page is not built: only the completion word is posted, the
 /// page's reply area is not written past, and the read is counted. Inside a bracket the same read is
 /// refused when it asks for more texels than the model will build.
