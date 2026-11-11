@@ -837,8 +837,9 @@ Automation and debugging
   --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
                               iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
-  --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
-  --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
+  --serial-log <FILE>         Log everything the guest prints on its serial console to FILE
+  --serial-log-overwrite      Start the serial logs over each run instead of adding to them
+  --serial-log-timestamps <MODE>  off (raw), wall (stamp each completed line) or ecs
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
   --validate                  Check the --config file and exit; 0 if iris would start
