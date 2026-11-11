@@ -436,12 +436,60 @@ pub const CPUS: &[&Part] = &[&parts::R14000_500];
 /// type once here.
 pub(crate) type FuelCpu = MipsExecutor<MipsTlb, R12000ShadowCache>;
 
-/// The board-id word. Bits 15:12 are the Fuel's product code, 4, as OpenBSD
-/// reads them (IP35_FUEL, sys/arch/sgi/sgi/ip27.h). The low bits are chosen
-/// to match what PROM 6.210 expects, not read from a board: with them and the
-/// flash record's machine type 2 the PROM's CPU configuration check passes,
-/// as on a real Fuel. A real board's bits 11:0 are unknown.
-const FUEL_BOARD_ID: u64 = 0x4004;
+/// A row of the PROM's CPU speed table, found by the board-id word's low
+/// nibble when its class (bits 15:12) is 4, the Fuel's. The PROM prints
+/// "Unknown PIMM_PSC type" for a nibble with no row (0, 5, f) and falls back
+/// to zeros. The hub clock is 200 MHz in every row (established, from the
+/// PROM's code). That the nibble is the processor module's own code is
+/// inferred; the rows say nothing of what else the word holds.
+pub(crate) struct SpeedRow {
+    pub(crate) nibble: u64,
+    pub(crate) mhz: u32,
+    pub(crate) l2_kb: u32,
+}
+
+/// Every row of the PROM 6.210 table (established). Two nibbles share 500 MHz
+/// (4 and 6) and two 600 MHz (7 and 8); the first listed is the one used.
+/// The 700 MHz row is the R16000.
+pub(crate) const SPEED_ROWS: [SpeedRow; 7] = [
+    SpeedRow { nibble: 0x4, mhz: 500, l2_kb: 2048 },
+    SpeedRow { nibble: 0x6, mhz: 500, l2_kb: 2048 },
+    SpeedRow { nibble: 0x7, mhz: 600, l2_kb: 4096 },
+    SpeedRow { nibble: 0x8, mhz: 600, l2_kb: 4096 },
+    SpeedRow { nibble: 0x3, mhz: 700, l2_kb: 4096 },
+    SpeedRow { nibble: 0xc, mhz: 800, l2_kb: 4096 },
+    SpeedRow { nibble: 0x2, mhz: 900, l2_kb: 8192 },
+];
+
+/// The class bits 15:12 of the board-id word for a Fuel. The PROM masks them
+/// and compares 0x2000, 0x4000, 0x8000 and 0xc000; the kernel compares 4, 8
+/// and c (established). OpenBSD names 4 IP35_FUEL.
+const FUEL_BOARD_CLASS: u64 = 0x4000;
+
+/// The board-id word of a Fuel built with `part`, or `None` when the PROM's
+/// speed table has no row for its clock and secondary cache. The PROM checks
+/// the flash record's mode word, clocks, timing bytes and machine type against
+/// this row, so the word has to follow the processor.
+///
+/// Bits 11:4 and 63:16 of a real board's word are unknown; they read zero
+/// here and the PROM does not look at them.
+pub(crate) const fn board_word(part: &Part) -> Option<u64> {
+    let mut i = 0;
+    while i < SPEED_ROWS.len() {
+        let row = &SPEED_ROWS[i];
+        if row.mhz == part.mhz && row.l2_kb == part.l2_kb {
+            return Some(FUEL_BOARD_CLASS | row.nibble);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The word for the Fuel's only processor, [`CPUS`]`[0]`.
+pub(crate) const FUEL_BOARD_ID: u64 = match board_word(&parts::R14000_500) {
+    Some(word) => word,
+    None => panic!("the Fuel's processor has no row in the PROM's speed table"),
+};
 /// Two 256 MiB banks, locational banks 0 and 1.
 const FUEL_BANKS_MIB: [u32; 2] = [256, 256];
 
