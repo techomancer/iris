@@ -33,9 +33,12 @@
 //! this model checks the destination before any pixel is written only for
 //! the write in hand, not for the whole batch.
 //!
-//! Refused, counted and drawn nowhere: the window-copy pair (source and
-//! destination packing 3), a write or copy aimed at the overlay or display-ID
-//! planes (fills draw those; transfers do not), a copy aimed at the popup planes, the
+//! A window copy (source and destination packing 3, the copy that moves a window) is drawn, for each buffer, under
+//! a context that `Gc::decode_window_copy` reads by its pack code, buffer selector and clip-ignore bits.
+//!
+//! Refused, counted and drawn nowhere: a window copy under a context that does not decode so, a
+//! write or copy aimed at the overlay or display-ID planes (fills draw those; transfers do not), a
+//! copy aimed at the popup planes, the
 //! two-buffer RGB form, and a frame-buffer word read, which tells an index from a direct colour by a tag
 //! this store does not keep. A read that is refused still completes, with the
 //! whole usable page zeroed: the X server waits on the page's first word with
@@ -926,8 +929,7 @@ impl XState {
             return;
         };
         if s.src == 3 && s.dst == 3 {
-            self.pixel.counts.window_copies += 1;
-            return;
+            return self.window_copy(surface, &s, [sx, sy, dx, dy]);
         }
         let gc = match Gc::decode_for_fill(&self.gc) {
             Ok(gc) => gc,
@@ -949,6 +951,47 @@ impl XState {
         let (mut spans, mut row) = (std::mem::take(&mut self.spans), std::mem::take(&mut self.pixel.row));
         let verdict = match Plan::with_gc(self, surface, gc, None) {
             Ok(Some(plan)) => copy_rows(&plan, &s, [sx as i32 as i64, sy as i32 as i64, dx as i32 as i64, dy as i32 as i64], &mut spans, &mut row),
+            Ok(None) => Verdict::Done,
+            Err(Refused::Target) => Verdict::Target,
+            Err(_) => Verdict::Context,
+        };
+        self.spans = spans;
+        self.pixel.row = row;
+        self.pixel.count(verdict);
+    }
+
+    /// 0x137 with the window packing at both ends: the copy of a window's colour words that moves a
+    /// window. The context says which buffer: the front is the plane the X path draws (word 1), the
+    /// back is the word after it, where a window with a second buffer keeps it and nothing is copied
+    /// for a window that has none. With the context's clip-ignore bits set, as the X server sends
+    /// them, neither the clip list nor the scissor limits it: the server sends the old window's border
+    /// region as the clip list, which does not contain the place the window moves to or the window's
+    /// own contents (inferred; the copy is the whole rectangle the setup sizes). With them clear the
+    /// clip list and the scissor limit it as they do any copy (inferred). The display ID plane is
+    /// not moved: the server fills the new place with the window's ID itself. A form the context does not decode as (`Gc::decode_window_copy`) is refused and
+    /// counted as a window copy.
+    fn window_copy(&mut self, surface: &Surface<'_>, s: &Setup, [sx, sy, dx, dy]: [u32; 4]) {
+        let Some((gc, ignores_clip)) = Gc::decode_window_copy(&self.gc).filter(|_| s.mode == 1 && s.shift == 0 && s.pad == 0) else {
+            self.pixel.counts.window_copies += 1;
+            return;
+        };
+        let rect = [sx as i32 as i64, sy as i32 as i64, dx as i32 as i64, dy as i32 as i64];
+        let back = gc.first_selector == 2;
+        let (mut spans, mut row) = (std::mem::take(&mut self.spans), std::mem::take(&mut self.pixel.row));
+        let plan = if ignores_clip { Plan::unclipped(self, surface, gc) } else { Plan::with_gc(self, surface, gc, None) };
+        let verdict = match plan {
+            Ok(Some(mut plan)) => {
+                // The back buffer's words: the plan was made for the front's.
+                let other = if back { surface.sibling_array(crate::dev::kona::back::textport::COLOUR_WORD + 1) } else { Some(plan.array) };
+                match other {
+                    Some(array) => {
+                        plan.pitch = array.pitch();
+                        plan.array = array;
+                        copy_rows(&plan, s, rect, &mut spans, &mut row)
+                    }
+                    None => Verdict::Done,
+                }
+            }
             Ok(None) => Verdict::Done,
             Err(Refused::Target) => Verdict::Target,
             Err(_) => Verdict::Context,
@@ -1243,6 +1286,106 @@ mod tests {
         cmd(&mut x, &s, X_PIXEL_SETUP, &[1, 2, 2, 0, 1, 1, 0]);
         cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 5, 5]);
         assert_eq!(at(&s, 5, 5), 0xab_cdef);
+    }
+
+    /// The two contexts of a window copy, as the X server sends them: the front buffer's and the back's.
+    const WINDOW_FRONT: [u32; 13] = [0, 0, 0, 0, 0xff_ffff, 0xff_ffff, 0x2804, 0x7c001, 1, 6, 17, 0, 0];
+    const WINDOW_BACK: [u32; 13] = [0, 0, 0, 0, 0xff_ffff, 0xff_ffff, 0x3804, 0xbc002, 1, 6, 17, 0, 0];
+
+    /// A window copy moves the colour words of the buffer its context names, over an overlap too, and
+    /// is not refused: dragging a window is a copy of each buffer from where it was to where it goes.
+    /// A window with no second buffer has nothing to copy for the back, and none is made.
+    #[test]
+    fn a_window_copy_moves_the_buffer_its_context_names() {
+        let (mut x, s) = rig(&RGB);
+        for (px, py) in (0..8).flat_map(|py| (0..8).map(move |px| (px, py))) {
+            s.write(px, 31 - py, 1, 0x10_0000 | py << 8 | px);
+            s.write(px, 31 - py, 2, 0x20_0000 | py << 8 | px);
+        }
+        let before: Vec<Vec<u32>> = (0..8).map(|y| row(&s, y, 8)).collect();
+        // The window packing at both ends, a copy of 4 x 3 words, down by one and right by two: over itself.
+        cmd(&mut x, &s, X_PIXEL_SETUP, &[1, 3, 3, 0, 4, 3, 0]);
+        x.command(0x129, &WINDOW_FRONT);
+        // The clip list names a place the copy neither reads nor writes, and a scissor smaller than it.
+        x.command(0x12b, &[1, 20, 20, 24, 24]);
+        x.command(0x12d, &[0, 0, 1, 1]);
+        cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 2, 1]);
+        assert_eq!(x.pixel_counts().window_copies, 0, "a window copy under the front context is drawn");
+        for (j, i) in (0..3).flat_map(|j| (0..4).map(move |i| (j, i))) {
+            assert_eq!(at(&s, 2 + i, 1 + j), before[j as usize][i as usize], "front ({i}, {j})");
+        }
+        assert_eq!(s.read(3, 31 - 2, 2), 0x20_0000 | 2 << 8 | 3, "the back buffer is not touched by the front's copy");
+        // Then the back's, which moves the other word.
+        x.command(0x129, &WINDOW_BACK);
+        cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 2, 1]);
+        assert_eq!(s.read(2, 31 - 1, 2), 0x20_0000);
+        assert_eq!(s.read(5, 31 - 3, 2), 0x20_0000 | 2 << 8 | 3);
+        assert_eq!((x.pixel_counts().copies, x.pixel_counts().window_copies), (2, 0));
+        // A context of another form, and a setup of another mode, are refused and counted.
+        let mut other = WINDOW_FRONT;
+        other[10] = 5;
+        x.command(0x129, &other);
+        cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 2, 1]);
+        x.command(0x129, &WINDOW_FRONT);
+        cmd(&mut x, &s, X_PIXEL_SETUP, &[2, 3, 3, 0, 4, 3, 0]);
+        cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 2, 1]);
+        assert_eq!((x.pixel_counts().copies, x.pixel_counts().window_copies), (2, 2));
+
+        // A window with one buffer: the back's copy draws nothing and allocates nothing.
+        let (mut x, s) = rig(&RGB);
+        s.write(0, 31, 1, 0xab_cdef);
+        cmd(&mut x, &s, X_PIXEL_SETUP, &[1, 3, 3, 0, 1, 1, 0]);
+        x.command(0x129, &WINDOW_BACK);
+        cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 5, 5]);
+        assert_eq!((s.allocated(), x.pixel_counts().window_copies), (vec![1], 0));
+    }
+
+    /// The window-copy context is read by field: pack code 17, the buffer selector (operation bits 1:0
+    /// repeated in 23:18, agreeing with the configuration word) and the clip-ignore bits. The same rule
+    /// with the bits clear is a copy that honours the clip list; a context that breaks the rule is
+    /// refused and counted.
+    #[test]
+    fn a_window_copy_context_is_read_by_its_fields() {
+        let sources = |s: &PixelStore| {
+            for (px, py) in (0..8).flat_map(|py| (0..8).map(move |px| (px, py))) {
+                s.write(px, 31 - py, 1, 0x10_0000 | py << 8 | px);
+            }
+        };
+        // The clip-ignore bits clear: the front buffer's copy is limited to the clip list, x 3 to 4, y 1 to 2.
+        let (mut x, s) = rig(&RGB);
+        sources(&s);
+        let mut honours = WINDOW_FRONT;
+        honours[7] = 0x60001;
+        x.command(0x129, &honours);
+        x.command(0x12b, &[1, 3, 1, 5, 3]);
+        cmd(&mut x, &s, X_PIXEL_SETUP, &[1, 3, 3, 0, 4, 3, 0]);
+        cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 2, 1]);
+        assert_eq!(x.pixel_counts().window_copies, 0);
+        for (j, i) in (0..3).flat_map(|j| (0..4).map(move |i| (j, i))) {
+            let (px, py) = (2 + i, 1 + j);
+            let want = if (3..5).contains(&px) && (1..3).contains(&py) { 0x10_0000 | j << 8 | i } else { 0x10_0000 | py << 8 | px };
+            assert_eq!(at(&s, px, py), want, "({px}, {py})");
+        }
+        // The same words with the bits set ignore that clip list: the whole rectangle moves.
+        let (mut x, s) = rig(&WINDOW_FRONT);
+        sources(&s);
+        x.command(0x12b, &[1, 3, 1, 5, 3]);
+        cmd(&mut x, &s, X_PIXEL_SETUP, &[1, 3, 3, 0, 4, 3, 0]);
+        cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 2, 1]);
+        assert_eq!(at(&s, 2, 1), 0x10_0000);
+        // Contexts that break the rule are refused whatever else they say: only some of the clip bits,
+        // a second selector that differs from the first, a configuration that disagrees with the buffer,
+        // and another pack code.
+        for (word, value) in [(7, 0x7c001 & !0x4000), (7, 0xbc001), (6, 0x3804), (10, 8)] {
+            let (mut x, s) = rig(&WINDOW_FRONT);
+            sources(&s);
+            let mut gc = WINDOW_FRONT;
+            gc[word] = value;
+            x.command(0x129, &gc);
+            cmd(&mut x, &s, X_PIXEL_SETUP, &[1, 3, 3, 0, 4, 3, 0]);
+            cmd(&mut x, &s, X_PIXEL_COPY, &[0, 0, 2, 1]);
+            assert_eq!((x.pixel_counts().copies, x.pixel_counts().window_copies, at(&s, 2, 1)), (0, 1, 0x10_0000 | 1 << 8 | 2), "word {word} = {value:#x}");
+        }
     }
 
     /// A read packs the words as the setup asks, and a read that cannot be

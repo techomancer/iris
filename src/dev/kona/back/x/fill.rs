@@ -231,6 +231,17 @@ impl<'a> Plan<'a> {
         Ok(Some(Plan { gc, pitch: array.pitch(), array, height: height as i64, bounds: x.bounds(width, height), clips, stipple, needs }))
     }
 
+    /// The plan for `gc` over the whole managed area: the clip list and the scissor do not limit it.
+    pub(super) fn unclipped(x: &'a XState, surface: &Surface<'a>, gc: Gc) -> Result<Option<Plan<'a>>, Refused> {
+        let mut plan = Plan::with_gc(x, surface, gc, None)?;
+        if let Some(p) = &mut plan {
+            let (width, height) = surface.size();
+            p.bounds = super::state::Bounds { x1: 0, y1: 0, x2: width as i64, y2: height as i64 };
+            p.clips = &[];
+        }
+        Ok(plan)
+    }
+
     /// `b` clipped to the bounds; None if nothing is left.
     pub(super) fn clip(&self, b: Box4) -> Option<Box4> {
         let (x1, y1, x2, y2) = (b.0.max(self.bounds.x1), b.1.max(self.bounds.y1), b.2.min(self.bounds.x2), b.3.min(self.bounds.y2));
