@@ -1114,13 +1114,12 @@ fn flash_serves_a_synthetic_image_big_endian() {
 }
 
 #[test]
+#[ignore = "needs the stock IP30 PROM; set IRIS_IP30_PROM and run with --ignored"]
 fn flash_serves_the_stock_prom_as_the_processor_sees_it() {
-    // Skipped without the stock PROM (it is not in the repository).
+    // The stock PROM is not in the repository, so a run that asks for this
+    // test and has no image fails rather than passing unchecked.
     let path = std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "/inputs/IP30prom.bin".into());
-    let Ok(image) = std::fs::read(&path) else {
-        eprintln!("skipped: no stock PROM at {path}");
-        return;
-    };
+    let image = std::fs::read(&path).unwrap_or_else(|e| panic!("no stock PROM at {path} ({e}): set IRIS_IP30_PROM"));
     // The reset vector's first instruction is a MIPS J: opcode 000010.
     assert_eq!(image[0] >> 2, 0b000010);
     flash_first_words(&image);

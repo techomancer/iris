@@ -1374,15 +1374,13 @@ mod snapshot_tests {
     use super::*;
     use crate::cpu::mips_exec::CpuStateDigest;
 
-    /// The stock PROM is not in the repository; without it the test that
-    /// runs it says so and passes.
-    fn prom() -> Option<String> {
+    /// The stock PROM is not in the repository. The test that runs it is
+    /// `#[ignore]`d, so a run that asks for it and has no image fails here
+    /// rather than passing without checking anything.
+    fn prom() -> String {
         let path = std::env::var("IRIS_IP30_PROM").unwrap_or_else(|_| "/inputs/IP30prom.bin".into());
-        if !std::path::Path::new(&path).exists() {
-            eprintln!("skipped: no stock PROM at {path}");
-            return None;
-        }
-        Some(path)
+        assert!(std::path::Path::new(&path).exists(), "no stock PROM at {path}: set IRIS_IP30_PROM");
+        path
     }
 
     /// A test's own directory, removed when the test ends, failed or not.
@@ -1533,8 +1531,9 @@ mod snapshot_tests {
     /// and memory come back exactly, and both machines agree a million
     /// instructions on.
     #[test]
+    #[ignore = "needs the stock IP30 PROM; set IRIS_IP30_PROM and run with --ignored"]
     fn a_restored_octane_continues_from_the_saved_state() {
-        let Some(prom) = prom() else { return };
+        let prom = prom();
         std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
             let dir = scratch("continue");
             let mut a = machine(&prom, &dir);
