@@ -322,6 +322,42 @@ fn the_bridge_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     });
 }
 
+/// The packet's address, not the Crossbow port it leaves by, picks the node
+/// that hears a device interrupt: a Bridge on the first node's port aimed at
+/// the other node's number sets that node's pending bit.
+#[test]
+fn a_bridge_interrupt_aimed_at_the_other_nodes_number_reaches_that_node() {
+    use crate::dev::bridge::reg;
+    use crate::dev::hub::{reg::ni, reg::pi};
+    big_stack(|| {
+        let (_dir, m) = built(ONYX2_PROFILE, "bridge-node", 2);
+        let bridge = m.bridge().clone();
+        let card = test_support::Card::new();
+        bridge.bus().attach(crate::pci::DevFn { device: 4, function: 0 }, card.clone());
+        let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
+        let pending = |i: usize| m.node_at(i).hub.read64(pi::INT_PEND0).data;
+        // As the PROM numbers an Onyx2: the second slot's node holds 0 and
+        // the first slot's holds 1.
+        assert_eq!(m.node_at(0).hub.write64(ni::STATUS, 1 << 8), BUS_OK);
+        assert_eq!(m.node_at(1).hub.write64(ni::STATUS, 0), BUS_OK);
+
+        // Widget 9 is the second slot's port. The pin's host-address field
+        // replaces bits 47:38 of the destination: bit 47 for the I/O view and
+        // number 1, which the first slot's Hub holds.
+        set(reg::INT_DEST_UPPER, 9 << 16);
+        set(reg::INT_DEST_LOWER, 0x0180_0090);
+        set(reg::int_host(4), 5 | (1 << 9 | 1) << 8);
+        set(reg::INT_ENABLE, 1 << 4);
+        card.state.irq().unwrap().set(true);
+        assert_eq!(pending(0) & 1 << 5, 1 << 5, "the node the address names did not hear it");
+        assert_eq!(pending(1) & 1 << 5, 0, "the node whose port it left by heard it");
+        card.state.irq().unwrap().set(false);
+        // The guest's handler clears the pending bit on the node that heard it.
+        assert_eq!(m.node_at(0).hub.write64(pi::INT_PEND_MOD, 5), BUS_OK);
+        assert_eq!(pending(0) & 1 << 5, 0);
+    });
+}
+
 const WIDGET_PIPE: u8 = 8;
 
 fn onyx2_with(dir: &Path, nodes: u8, board: crate::config::GraphicsBoard) -> MachineConfig {

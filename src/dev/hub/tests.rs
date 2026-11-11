@@ -864,6 +864,31 @@ fn the_interrupt_target_sets_and_clears_pending_bits_by_vector() {
 }
 
 #[test]
+fn an_interrupt_packet_sets_the_pending_bit_on_the_node_its_address_names() {
+    let (a, b) = pair();
+    number(&a, 1);
+    number(&b, 2);
+    // The Bridge on the first node's Crossbow sends to the first node's Hub;
+    // the address names which node's processors hear it.
+    let target = a.interrupt_target();
+    let packet = |node: u64| (1 << 47) | (node << 38) | 0x0180_0090;
+    assert!(target.packet(9, packet(1), 3, true));
+    assert_eq!((a.pi().pending(0), b.pi().pending(0)), (1 << 3, 0));
+    assert!(target.packet(9, packet(2), 5, true));
+    assert_eq!((a.pi().pending(0), b.pi().pending(0)), (1 << 3, 1 << 5), "node 2 heard it, not node 1");
+    assert!(target.packet(9, packet(2), 5, false));
+    assert_eq!(b.pi().pending(0), 0);
+    // A number nobody holds is refused and nothing is set, and so is a
+    // vector the Hub does not have.
+    assert!(!target.packet(9, packet(3), 1, true));
+    assert!(!target.packet(9, packet(1), 128, true));
+    assert_eq!((a.pi().pending(0), a.pi().pending(1), b.pi().pending(0)), (1 << 3, 0, 0));
+    // The peer's target sends back across the cable the same way.
+    assert!(b.interrupt_target().packet(0, packet(1), 70, true));
+    assert_eq!(a.pi().pending(1), 1 << 6);
+}
+
+#[test]
 fn the_hub_is_a_device_whose_counter_is_its_clock() {
     let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let clock = now.clone();

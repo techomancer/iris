@@ -557,7 +557,7 @@ impl Hub {
     /// interrupt number 0 to 127, set and cleared through interrupt-modify. A
     /// Bridge that reaches the Hub by an XIO write is equivalent.
     pub fn interrupt_target(&self) -> Arc<dyn InterruptController> {
-        Arc::new(InterruptTarget(self.pi.clone()))
+        Arc::new(InterruptTarget { pi: self.pi.clone(), hub: self.weak.clone() })
     }
 
     /// The XIO port's packet face: what a widget's bus-master requests reach,
@@ -775,12 +775,30 @@ impl BusDevice for ProcessorIo {
 
 /// A line is an interrupt number; a rising level sets its pending bit and a
 /// falling one clears it.
-struct InterruptTarget(Arc<Pi>);
+struct InterruptTarget {
+    pi: Arc<Pi>,
+    /// Weak: the Hub owns its spaces, and a packet may name another node.
+    hub: Weak<Hub>,
+}
 impl InterruptController for InterruptTarget {
     fn set_line(&self, line: u32, level: bool) {
         if line < 128 {
-            self.0.int_modify(u64::from(line) | if level { pi::MODIFY_SET } else { 0 });
+            self.pi.int_modify(u64::from(line) | if level { pi::MODIFY_SET } else { 0 });
         }
+    }
+
+    /// The packet's address carries the node whose Hub takes it, as the
+    /// interrupt-modify write of [`Inbound`] does: a device on this node's
+    /// Bridge can interrupt a processor of the other node, and the packet
+    /// goes there rather than to this node's pending word.
+    fn packet(&self, _source: u8, address: u64, line: u32, level: bool) -> bool {
+        let Some(hub) = self.hub.upgrade() else { return false };
+        if line >= 128 {
+            return false;
+        }
+        let number = ((address >> XIO_NODE_SHIFT) & NODE_MASK) as u16;
+        let value = u64::from(line) | if level { pi::MODIFY_SET } else { 0 };
+        NodeFabric::interrupt(&*hub, number, value)
     }
 }
 
