@@ -3,6 +3,7 @@ use crate::test_temp::TempPath;
 use crate::config::GraphicsBoard;
 use super::test_support::{self, big_stack};
 use crate::dev::hub::reg::{ni as hub_ni, pi as hub_pi};
+use crate::irq::InterruptController;
 use crate::traits::BUS_OK;
 
 fn config(dir: &Path) -> MachineConfig {
@@ -315,6 +316,25 @@ fn a_hub_that_outlives_its_machine_publishes_into_no_freed_processor() {
         // Raising and unmasking an interrupt now publishes nowhere.
         assert_eq!(hub.write64(hub_pi::INT_MASK0_A, !0), BUS_OK);
         hub.interrupt_target().set_line(3, true);
+    });
+}
+
+/// A single-node board's Bridge reaches its Hub through the packet entry
+/// point, so a device interrupt naming this node's number (zero before the
+/// PROM numbers it) sets the node's own pending bit, and one naming a node
+/// the board does not have is refused.
+#[test]
+fn a_device_interrupt_naming_this_node_sets_its_pending_bit() {
+    big_stack(|| {
+        let dir = TempPath::dir("sn0-o200-device-interrupt");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
+        let hub = &m.node().hub;
+        let target = hub.interrupt_target();
+        let packet = |node: u64| (1u64 << 47) | (node << 38) | 0x0180_0090;
+        assert!(target.packet(9, packet(0), 3, true));
+        assert_eq!(hub.read64(hub_pi::INT_PEND0).data, 1 << 3);
+        assert!(!target.packet(9, packet(1), 4, true));
+        assert_eq!(hub.read64(hub_pi::INT_PEND0).data, 1 << 3);
     });
 }
 
