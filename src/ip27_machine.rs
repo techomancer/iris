@@ -499,6 +499,7 @@ impl<B: Ip27Board> Ip27Machine<B> {
             cpu.register_locks();
             units.push(Unit { node, cpu });
         }
+        Self::link_world(&units, specs.iter().map(|s| s.hub.cpu_base));
         let watch = ControllerWatch::new(io.controller.clone(), tx, &units[0].node.timers);
         if let Some(status) = &io.status {
             let cpu = &units[0].cpu;
@@ -569,6 +570,29 @@ impl<B: Ip27Board> Ip27Machine<B> {
 
     pub(crate) fn node_at(&self, n: usize) -> &Node {
         &self.units[n].node
+    }
+
+    /// Let every Hub park the other nodes' processors while it renumbers its
+    /// node. A processor finds its park slot by the id its thread runs under,
+    /// which is the node's `cpu_base`, so the slots stand at those indices
+    /// and any index between them is a processor that does not exist.
+    fn link_world(units: &[Unit], ids: impl Iterator<Item = usize>) {
+        // A sink for the park bit: holding or releasing the slot of a processor
+        // that does not exist flips a bit here, and nothing reads it. That is
+        // why one static can serve every machine.
+        static ABSENT: AtomicU64 = AtomicU64::new(0);
+        let ids: Vec<usize> = ids.collect();
+        let mut slots: Vec<_> = (0..=ids.iter().copied().max().unwrap_or(0))
+            .map(|_| Arc::new(crate::cpu::smp::ParkSlot::new(&ABSENT)))
+            .collect();
+        for (u, &id) in units.iter().zip(&ids) {
+            slots[id] = u.cpu.park_slot();
+        }
+        let world = Arc::new(crate::cpu::smp::World::new());
+        world.set_slots(slots);
+        for u in units {
+            u.node.hub.set_world(world.clone());
+        }
     }
 
     /// `smp` when the board carries more than one node: the processors then

@@ -100,12 +100,13 @@ impl NodeShape for HubShape {
 ///
 /// A store to any Hub's number or alias, from whichever processor made it,
 /// publishes the numbers ([`Routing`]) and lays every node's window at once
-/// from that thread, as the hardware takes the new number at once. The other
-/// node's processor can be running or issuing CACHE instructions meanwhile.
-/// [`crate::ppmem::PpMemSpace`] serializes the layout against those with its
-/// own lock, taken by a remap or a held-line change and never by an access
-/// that hits. Windows' lock orders two renumberings; the space's lock is
-/// taken inside it, never the other way round.
+/// from that thread, as the hardware takes the new number at once. The Hub
+/// parks the other processors first ([`crate::dev::hub::Hub::set_world`]), so
+/// no access sees a window half laid. [`crate::ppmem::PpMemSpace`] still
+/// serializes the layout against a CACHE instruction with its own lock, taken
+/// by a remap or a held-line change and never by an access that hits.
+/// Windows' lock orders two renumberings; the space's lock is taken inside it,
+/// never the other way round.
 pub struct Windows {
     /// The bit the node number sits at in a physical address.
     shift: u32,

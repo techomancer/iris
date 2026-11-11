@@ -108,6 +108,7 @@ impl Routing {
     }
 }
 
+use crate::cpu::smp::World;
 use crate::dev::heart::Clock;
 use crate::ip27::NodeZero;
 use self::io::{Io, NodeFabric};
@@ -299,6 +300,8 @@ pub struct Hub {
     /// Where NI_PORT_RESET bit 0 restarts the machine: the receiver goes to
     /// the machine's system controller, as the Indy IOC's does.
     events: OnceLock<Sender<MachineEvent>>,
+    /// The machine's processors, parked while a node's memory is laid again.
+    world: OnceLock<Arc<World>>,
     weak: Weak<Hub>,
 }
 
@@ -330,6 +333,7 @@ impl Hub {
                 peer: OnceLock::new(),
                 routing,
                 events: OnceLock::new(),
+                world: OnceLock::new(),
                 weak: weak.clone(),
             }
         });
@@ -421,6 +425,21 @@ impl Hub {
         let _ = self.view.zero.set(zero);
     }
 
+    /// The machine's processors. A change of node number or cached alias
+    /// lays memory out again with the other node's processor stopped, so no
+    /// access sees memory half moved.
+    pub fn set_world(&self, world: Arc<World>) {
+        let _ = self.world.set(world);
+    }
+
+    /// Run `relayout` with every processor but the caller's parked.
+    fn parked(&self, relayout: impl FnOnce()) {
+        match self.world.get() {
+            Some(world) => world.stop_others(relayout),
+            None => relayout(),
+        }
+    }
+
     /// Act on what a register write changed, now that the unit that made it
     /// has let go of its lock.
     fn apply(&self, effect: Effect) {
@@ -428,12 +447,12 @@ impl Hub {
             Effect::None => {}
             Effect::NodeNumber | Effect::CachedAlias => {
                 if let Some(zero) = self.view.zero.get() {
-                    zero.refresh();
+                    self.parked(|| zero.refresh());
                 }
             }
             Effect::PeerNodeNumber => {
                 if let Some(zero) = self.peer.get().and_then(|peer| peer.zero.get()) {
-                    zero.refresh();
+                    self.parked(|| zero.refresh());
                 }
             }
             Effect::Restart => match self.events.get() {

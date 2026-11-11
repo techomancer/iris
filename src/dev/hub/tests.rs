@@ -265,6 +265,57 @@ fn a_node_number_write_reaches_the_node_zero_routing() {
     assert_ne!(phys.read64(b).status, BUS_OK);
 }
 
+/// Run `store` on a Hub whose node zero routing is wired, with another
+/// processor running beside it, and count how often that processor was
+/// parked meanwhile. The hold is released by the time `store` returns.
+fn parks_during(store: impl FnOnce(&Arc<Hub>)) -> usize {
+    use crate::cpu::smp::{ParkSlot, World, HOST_PARK_BIT};
+    use crate::ip27::NodeMemory;
+    use std::sync::atomic::AtomicUsize;
+    let mem = NodeMemory::new([128, 0, 0, 0]).unwrap();
+    let hub = hub(1, 3);
+    mem.route_nodes(hub.claim(Space::Memory));
+    hub.set_node_zero(mem.node_zero(hub.routing().clone(), &Default::default()));
+    // Another processor: it runs until a hold sets the park bit, then parks.
+    let word = Arc::new(AtomicU64::new(0));
+    let slot = Arc::new(ParkSlot::new(Arc::as_ptr(&word)));
+    slot.set_active(true);
+    let world = Arc::new(World::new());
+    world.set_slots(vec![slot.clone()]);
+    hub.set_world(world);
+    let (running, parks) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicUsize::new(0)));
+    let cpu = {
+        let (slot, word, running, parks) = (slot.clone(), word.clone(), running.clone(), parks.clone());
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                if word.load(Ordering::Relaxed) & HOST_PARK_BIT != 0 {
+                    parks.fetch_add(1, Ordering::SeqCst);
+                    slot.park(&running);
+                }
+                std::thread::yield_now();
+            }
+            slot.set_active(false);
+        })
+    };
+    store(&hub);
+    assert_eq!(slot.holds(), 0, "the processor is let go");
+    running.store(false, Ordering::SeqCst);
+    cpu.join().unwrap();
+    parks.load(Ordering::SeqCst)
+}
+
+/// Laying memory out again for a new node number stops the other processors
+/// first, so none sees memory half moved.
+#[test]
+fn a_node_number_store_parks_the_other_processors() {
+    assert_eq!(parks_during(|hub| number(hub, 6)), 1);
+}
+
+#[test]
+fn a_cached_alias_store_parks_the_other_processors() {
+    assert_eq!(parks_during(|hub| assert_eq!(hub.write64(pi::reg::CALIAS_SIZE, 1), BUS_OK)), 1);
+}
+
 /// A neighbour that renumbers this node over the cable has its routing
 /// re-read the number too.
 #[test]
