@@ -230,8 +230,9 @@ The Linux x86-64 test job builds with `--features jitv2` (which implies
 `tcache`); arm64 and Windows keep default features, and the nightly workflow
 runs default features on x86-64, so both paths are tested. It compiles the
 `iris` crate fewer times than the others: it skips `cargo build --workspace` and the SIMD lane step because
-nextest builds and runs the same code, and runs the REX3 matcher test through
-`cargo test`, which compiles its replay example. Pull requests restore `main`'s
+nextest builds and runs the same code, and runs the REX3 GPU matcher and replay
+corpus tests in the same build (the Linux jobs add `rex-gpu` and `rex-jit`; the
+one ignored filesystem test runs in a second invocation over that build). Pull requests restore `main`'s
 build cache but never save one, so they cannot push `main`'s entries out of the
 repository's cache quota. The Linux, AppImage and Windows package builds in
 `build.yml` cache only the cargo registry and git checkouts, not their target
