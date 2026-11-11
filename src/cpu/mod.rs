@@ -8,6 +8,8 @@ pub mod mips_core;
 pub mod mips_tlb;
 pub mod mips_cache_v2;
 pub mod mips_cache_shadow;
+#[cfg(test)]
+mod cache_models_tests;
 pub mod build;
 pub mod parts;
 pub mod decode_cache;
