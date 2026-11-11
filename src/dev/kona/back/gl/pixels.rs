@@ -341,7 +341,7 @@ impl Counts {
 }
 
 /// The tokens `command` takes.
-pub fn is_state(selector: u32) -> bool {
+pub const fn is_state(selector: u32) -> bool {
     matches!(
         selector,
         SET_PIXEL_STORE_PARAMETER_INTEGER_FORM
@@ -366,7 +366,7 @@ pub fn is_data(selector: u32) -> bool {
 }
 
 /// The tokens that read or write the planes: they wait for the drawing queued before them.
-pub fn is_plane(selector: u32) -> bool {
+pub const fn is_plane(selector: u32) -> bool {
     matches!(selector, DRAW_BITMAP_FROM_DISPLAY_LIST | DRAW_BITMAP | DRAW_PIXEL_RECTANGLE_FROM_HOST_DATA | COPY_PIXEL_RECTANGLE_WITHIN_FRAME_BUFFER | READ_PIXEL_RECTANGLE_BACK_TO_HOST | ACCUMULATION_BUFFER_OPERATION | ASK_WHETHER_COPY_SOURCE_OVERLAPS_ITS_DESTINATION | ASK_WHETHER_CONVOLUTION_COPY_OVERLAPS | RESOLVE_WHETHER_PIXEL_FORMAT_IS_SINGLE_COMPONENT)
 }
 

@@ -976,7 +976,7 @@ fn format_class(index: u32) -> u8 {
 }
 
 /// Whether `selector` is a texture token the texture path takes.
-pub fn is_texture(selector: u32) -> bool {
+pub const fn is_texture(selector: u32) -> bool {
     matches!(
         selector,
         DRAW_TEXELS_INTO_TEXTURE_MEMORY

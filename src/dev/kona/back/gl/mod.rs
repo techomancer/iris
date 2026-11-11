@@ -73,8 +73,73 @@ pub const END: u32 = END_OPEN_PRIMITIVE;
 pub const TEXCOORD: [u32; 5] = [SET_CURRENT_TEXTURE_COORDINATE_1_COMPONENTS_SINGLE_FLOAT, SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_SINGLE_FLOAT, SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_SIGNED_SHORT, SET_CURRENT_TEXTURE_COORDINATE_3_COMPONENTS_SINGLE_FLOAT, SET_CURRENT_TEXTURE_COORDINATE_4_COMPONENTS_SINGLE_FLOAT];
 
 /// Whether `selector` is one of the commands `GlPath::command` is given.
-pub fn is_geometry(selector: u32) -> bool {
+pub const fn is_geometry(selector: u32) -> bool {
     matches!(selector, CLEAR_SELECTED_BUFFERS | SET_COLOUR_CLEAR_VALUE | SET_COLOUR_INDEX_CLEAR_VALUE | SET_COLOUR_INDEX_WRITE_MASK | SET_CURRENT_COLOUR_INDEX_DOUBLE..=SET_CURRENT_COLOUR_INDEX_SIGNED_SHORT | SET_DEPTH_CLEAR_VALUE | SELECT_DRAW_BUFFER | SELECT_CURRENT_MATRIX_STACK..=TRANSLATE_FLOATS | SET_VIEWPORT | SET_SCISSOR_BOX | ENABLE_CAPABILITY | DISABLE_CAPABILITY | SET_FLAT_OR_SMOOTH_SHADING | SET_FACE_CULLING | SET_FRONT_FACE_WINDING | SET_DEPTH_TEST | SET_ALPHA_TEST | SET_STENCIL_TEST | SET_STENCIL_OPERATIONS | SET_STENCIL_WRITE_MASK | SET_BLEND_FACTORS | SET_CONSTANT_BLEND_COLOUR | SET_BLEND_EQUATION | SET_LOGIC_OPERATION | SET_COLOUR_WRITE_MASK | SET_DEPTH_WRITE_MASK | SET_POLYGON_OFFSET | SET_STENCIL_CLEAR_VALUE | SET_LINE_WIDTH | SET_POINT_SIZE | SET_LINE_STIPPLE | SET_MULTISAMPLE_PATTERN | SET_MULTISAMPLE_COVERAGE_MASK | SET_TEXTURE_ENVIRONMENT_PARAMETER_FLOAT_FORM | SET_TEXTURE_ENVIRONMENT_PARAMETER_INTEGER_FORM | SET_LIGHT_PARAMETER_FLOAT_FORM | SET_LIGHT_PARAMETER_INTEGER_FORM | SET_LIGHTING_MODEL_PARAMETER_FLOAT_FORM | SET_LIGHTING_MODEL_PARAMETER_INTEGER_FORM | SET_MATERIAL_PARAMETER_FLOAT_FORM | BEGIN_FIRST..=BEGIN_LAST | BEGIN_PRIMITIVE_RECTANGLE | END | SET_CURRENT_COLOUR_3_COMPONENTS_SIGNED_BYTE..=SET_CURRENT_COLOUR_4_COMPONENTS_UNSIGNED_32_BIT_INTEGER | SET_CURRENT_NORMAL_3_COMPONENTS_SIGNED_BYTE..=SET_CURRENT_NORMAL_3_COMPONENTS_SIGNED_SHORT | SET_CURRENT_TEXTURE_COORDINATE_1_COMPONENTS_SINGLE_FLOAT | SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_SINGLE_FLOAT | SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_SIGNED_SHORT | SET_CURRENT_TEXTURE_COORDINATE_3_COMPONENTS_SINGLE_FLOAT | SET_CURRENT_TEXTURE_COORDINATE_4_COMPONENTS_SINGLE_FLOAT | SET_CURRENT_TEXTURE_COORDINATE_1_COMPONENTS_DOUBLE | SET_CURRENT_TEXTURE_COORDINATE_2_COMPONENTS_DOUBLE | SET_CURRENT_TEXTURE_COORDINATE_3_COMPONENTS_DOUBLE | SET_CURRENT_TEXTURE_COORDINATE_4_COMPONENTS_DOUBLE | SUBMIT_VERTEX_2_COMPONENTS_DOUBLE..=SUBMIT_VERTEX_4_COMPONENTS_SIGNED_SHORT | SET_USER_CLIP_PLANE | TEXTURE_COORDINATE_GENERATION_FLOAT_FORM | SET_CURRENT_EDGE_FLAG)
+}
+
+/// What the back end does with a GL command, decided by its selector alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// A selector with an arm of its own in the back end, or none.
+    Other,
+    /// A state query: answered on the return page.
+    Query,
+    /// A select or feedback mode token.
+    Mode,
+    /// A pixel-state token or a pixel operation.
+    Pixel,
+    /// A texture token that is not an image.
+    Texture,
+    /// A command `GlPath::command` takes: state, vertices, primitives, clears.
+    Geometry,
+}
+
+/// Selectors below this have a place in the class table; any other is `Other`.
+const CLASSES: usize = 0x200;
+
+/// The class of `selector` by asking each family in the order the back end's jobs are matched: the
+/// selectors with arms of their own first, then queries, the select and feedback tokens, pixel
+/// tokens, textures, and geometry last. The table is this evaluated once for every selector.
+const fn class_of(selector: u32) -> Class {
+    if matches!(selector, CONFIGURE_FRAME_BUFFER_LAYOUT | DRAW_TEXELS_INTO_TEXTURE_MEMORY | QUERY_TEXTURE_IMAGE) {
+        Class::Other
+    } else if query::is_query(selector) {
+        Class::Query
+    } else if matches!(selector, PUSH_ATTRIBUTE_STACK | POP_ATTRIBUTE_STACK | RESTART_SELECT_OR_FEEDBACK) {
+        Class::Other
+    } else if query::is_mode(selector) {
+        Class::Mode
+    } else if pixels::is_state(selector) || pixels::is_plane(selector) {
+        Class::Pixel
+    } else if texture::is_texture(selector) {
+        Class::Texture
+    } else if selector == LOAD_POLYGON_STIPPLE_PATTERN {
+        Class::Other
+    } else if is_geometry(selector) {
+        Class::Geometry
+    } else {
+        Class::Other
+    }
+}
+
+static CLASS_TABLE: [Class; CLASSES] = {
+    let mut t = [Class::Other; CLASSES];
+    let mut s = 0;
+    while s < CLASSES {
+        t[s] = class_of(s as u32);
+        s += 1;
+    }
+    t
+};
+
+/// The class of a GL command's selector: one load, where asking each family in turn took a
+/// comparison chain that put the commonest commands (colour, normal, texture coordinate, vertex) last.
+#[inline]
+pub fn class(selector: u32) -> Class {
+    match CLASS_TABLE.get(selector as usize) {
+        Some(&c) => c,
+        None => Class::Other,
+    }
 }
 
 /// The float form a double-precision colour, normal, texture-coordinate or vertex token runs as,
