@@ -294,7 +294,7 @@ impl Counts {
 
 /// The tokens `answer` handles: every query token the table lists, including those that
 /// nothing sends.
-pub fn is_query(selector: u32) -> bool {
+pub const fn is_query(selector: u32) -> bool {
     matches!(
         selector,
         QUERY_CURRENT_VERTEX_ATTRIBUTES
@@ -329,7 +329,7 @@ pub fn is_query(selector: u32) -> bool {
 }
 
 /// The tokens of the select and feedback modes that act on the context.
-pub fn is_mode(selector: u32) -> bool {
+pub const fn is_mode(selector: u32) -> bool {
     matches!(selector, SWITCH_BETWEEN_RENDER_SELECT_AND_FEEDBACK_MODES | SELECT_FEEDBACK_RECORD_TYPE | CLEAR_SELECTION_NAME_STACK | REPLACE_TOP_SELECTION_NAME | PUSH_SELECTION_NAME | POP_SELECTION_NAME | INSERT_FEEDBACK_PASS_THROUGH_MARKER)
 }
 

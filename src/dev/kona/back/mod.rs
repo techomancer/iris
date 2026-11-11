@@ -1226,6 +1226,15 @@ impl KonaBackend {
             self.drain();
         }
         match job {
+            // The commonest jobs first: a geometry command, by its selector's class.
+            Job::Command { grammar: Grammar::Gl, selector, args, packed, .. } if gl::class(selector) == gl::Class::Geometry => {
+                if selector == CLEAR_SELECTED_BUFFERS && args.first().is_some_and(|m| m & crate::dev::kona::defs::gl::ACCUM_BUFFER_BIT != 0) {
+                    self.clear_accumulation(port);
+                }
+                let c = self.contexts.select(port.context());
+                self.gl.command(&mut c.gl, selector, args, packed, &mut self.prims);
+                self.flush();
+            }
             // With the display thread running, a retrace completes at its next
             // frame boundary; with none (before the board starts, in a test)
             // there is no boundary, so it completes at once.
@@ -1253,7 +1262,7 @@ impl KonaBackend {
             Job::Command { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, .. } => return self.texel_draw(port, args),
             Job::Data { grammar: Grammar::Gl, selector: DRAW_TEXELS_INTO_TEXTURE_MEMORY, args, words } => self.texel_words(port, args, words),
             Job::Command { grammar: Grammar::Gl, selector: QUERY_TEXTURE_IMAGE, args, .. } => self.texel_read(port, args),
-            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::query::is_query(selector) => {
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::class(selector) == gl::Class::Query => {
                 let c = self.contexts.select(port.context());
                 let words = gl::query::answer(&mut c.gl, &mut self.query_counts, selector, args);
                 // The reply: the count at byte 4, the words from byte 8, then the completion word.
@@ -1292,30 +1301,22 @@ impl KonaBackend {
             // The client sends it when it registers the instruments buffer again, which the model does not
             // keep; the select and feedback passes here have no DMA channel to reprogram, so it changes nothing.
             Job::Command { grammar: Grammar::Gl, selector: RESTART_SELECT_OR_FEEDBACK, .. } => {}
-            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::query::is_mode(selector) => {
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::class(selector) == gl::Class::Mode => {
                 let c = self.contexts.select(port.context());
                 gl::query::mode_command(&mut c.gl, &mut self.query_counts, selector, args);
             }
-            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::pixels::is_state(selector) || gl::pixels::is_plane(selector) => return self.pixel_command(port, selector, args),
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::class(selector) == gl::Class::Pixel => return self.pixel_command(port, selector, args),
             Job::Data { grammar: Grammar::Gl, selector, args, words } if gl::pixels::is_data(selector) => self.pixel_data(port, selector, args, words),
             Job::Data { grammar: Grammar::Gl, selector: LOAD_ONE_ENTRY_OF_ARM_TEXTURE_TABLE, args: &[slot], words } => {
                 self.tex_counts.filter_tables += self.contexts.select(port.context()).tex.filter_table(slot, words) as u64;
             }
-            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::texture::is_texture(selector) => self.texture_command(port, selector, args),
+            Job::Command { grammar: Grammar::Gl, selector, args, .. } if gl::class(selector) == gl::Class::Texture => self.texture_command(port, selector, args),
             // The polygon stipple's 32 rows follow its command as a run the back end sizes.
             Job::Command { grammar: Grammar::Gl, selector: LOAD_POLYGON_STIPPLE_PATTERN, .. } => return Reply::Data(32),
             Job::Data { grammar: Grammar::Gl, selector: LOAD_POLYGON_STIPPLE_PATTERN, words, .. } => {
                 if let Ok(rows) = <[u32; 32]>::try_from(words) {
                     self.contexts.select(port.context()).gl.set_polygon_stipple(rows);
                 }
-            }
-            Job::Command { grammar: Grammar::Gl, selector, args, packed, .. } if gl::is_geometry(selector) => {
-                if selector == CLEAR_SELECTED_BUFFERS && args.first().is_some_and(|m| m & crate::dev::kona::defs::gl::ACCUM_BUFFER_BIT != 0) {
-                    self.clear_accumulation(port);
-                }
-                let c = self.contexts.select(port.context());
-                self.gl.command(&mut c.gl, selector, args, packed, &mut self.prims);
-                self.flush();
             }
             Job::Command { grammar: Grammar::Textport, selector, args, .. } => {
                 let (tiles, store) = (&mut self.tiles, &self.store);

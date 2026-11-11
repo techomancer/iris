@@ -1267,3 +1267,40 @@ fn the_blend_equation_token_picks_the_equation_and_the_logic_one_becomes_a_logic
     let mut c = query::Counts::default();
     assert_eq!(query::answer(&mut r.gl, &mut c, QUERY_STATE_GENERIC, &[0x8009]), vec![gl::LOGIC_OP]);
 }
+
+/// The back end dispatches a GL command by its selector's class, with the geometry arm
+/// first. That is the same as asking the families in turn only because no geometry
+/// selector is claimed by an earlier family or by an arm of its own; and the table is
+/// the families asked in turn for every selector, with any selector past it `Other`.
+#[test]
+fn the_class_table_is_the_families_asked_in_order() {
+    use super::{class, class_of, Class};
+    use super::{pixels, query, texture};
+    for s in 0..0x400u32 {
+        let want = if s < 0x200 { class_of(s) } else { Class::Other };
+        assert_eq!(class(s), want, "selector {s:#x}");
+        // Past the table every selector is `Other`, so none may belong to a family: a
+        // selector there would be dropped without a sign.
+        if s >= 0x200 {
+            assert!(
+                !(super::is_geometry(s) || query::is_query(s) || query::is_mode(s) || pixels::is_state(s) || pixels::is_plane(s) || texture::is_texture(s)),
+                "selector {s:#x} is past the class table but a family claims it"
+            );
+        }
+        if class(s) == Class::Geometry {
+            let earlier = query::is_query(s)
+                || query::is_mode(s)
+                || pixels::is_state(s)
+                || pixels::is_plane(s)
+                || texture::is_texture(s)
+                || [CONFIGURE_FRAME_BUFFER_LAYOUT, PUSH_ATTRIBUTE_STACK, POP_ATTRIBUTE_STACK, RESTART_SELECT_OR_FEEDBACK, LOAD_POLYGON_STIPPLE_PATTERN, QUERY_TEXTURE_IMAGE, FINISH_DRAIN_PIPE_AND_SIGNAL_COMPLETION].contains(&s);
+            assert!(!earlier, "selector {s:#x} is geometry and also claimed by an earlier arm");
+        }
+    }
+    // The commonest commands are in the table at all.
+    assert_eq!(class(SET_CURRENT_COLOUR_3_COMPONENTS_SIGNED_BYTE), Class::Geometry);
+    assert_eq!(class(SUBMIT_VERTEX_3_COMPONENTS_SINGLE_FLOAT), Class::Geometry);
+    assert_eq!(class(QUERY_PENDING_ERROR), Class::Query);
+    assert_eq!(class(BIND_2D_MIP_MAPPED_TEXTURE), Class::Texture);
+    assert_eq!(class(SET_PIXEL_STORE_PARAMETER_INTEGER_FORM), Class::Pixel, "pixel state wins over the texture family that also lists it");
+}
