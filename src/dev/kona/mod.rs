@@ -786,6 +786,16 @@ impl Device for Kona {
         if let Some(th) = s.sleeper.lock().as_ref() {
             th.unpark();
         }
+        // The last reference to the board can be dropped by its own thread: a DMA or interrupt call
+        // goes through a weak reference to the machine that it upgrades for the call, and if the
+        // machine let go meanwhile the upgrade is the last one. The thread cannot join itself, and
+        // holds the pipe, which the back end's stop would take. It ends once the batch it is in does
+        // (`exit` is set), and the back end, which the thread's reference to `Shared` keeps, stops in
+        // its own drop when that reference goes.
+        if t.thread().id() == std::thread::current().id() {
+            s.running.store(false, SeqCst);
+            return;
+        }
         let _ = t.join();
         s.running.store(false, SeqCst);
         // What the thread had not taken runs here, unless it died: its back
