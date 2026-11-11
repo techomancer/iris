@@ -106,9 +106,11 @@ answers nothing on the segment itself: no DHCP, DNS, TFTP, `[nfs]` or
 `[[port_forward]]`, and `nat_subnet` is unused. It needs no host privileges.
 The connection is retried once a second until the peer listens, so the server
 may start after iris, and made again if the peer goes away; frames the guest
-sends while disconnected are dropped. It works on every machine with an
-onboard Ethernet: the Indy and Indigo2 (SEEQ), the O2 (MEC) and the Octane
-(IOC3). A DaynaPort has its own subnet and cannot join the segment.
+sends while disconnected are dropped. A peer frame longer than 1518 bytes is
+skipped and counted in `net status`, and the session carries on. It works on
+every machine with an onboard Ethernet: the Indy and Indigo2 (SEEQ), the O2
+(MEC) and the Octane (IOC3). A DaynaPort has its own subnet and cannot join
+the segment.
 
 ## DaynaPort SCSI/Link
 

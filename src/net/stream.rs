@@ -23,8 +23,14 @@ use super::{NetBackend, Wake};
 use crate::devlog::LogModule;
 
 /// The largest frame the peer may send: an Ethernet frame without FCS, plus
-/// room for a VLAN tag. A longer length means the stream lost framing.
+/// room for a VLAN tag. A longer frame is read and discarded.
 pub const MAX_FRAME: usize = 1518;
+
+/// The longest frame read through to discard. A peer with a jumbo MTU sends
+/// frames up to about 9 KB, and an IP packet is at most 64 KiB. A longer
+/// length is no frame of any peer's: the stream lost framing, so the session
+/// ends rather than swallow gigabytes.
+const MAX_DISCARD: usize = 1 << 16;
 
 /// The shortest frame the guest's NIC can be handed: an Ethernet header.
 const MIN_FRAME: usize = 14;
@@ -139,30 +145,55 @@ fn write_frame_while(w: &mut impl Write, frame: &[u8], keep_going: &dyn Fn() -> 
     Ok(())
 }
 
-/// Read one frame. `Ok(None)` is a clean end of stream between frames.
+/// What [`read_frame_while`] found next on the stream.
+enum Incoming {
+    End,
+    Frame(Vec<u8>),
+    /// A frame longer than [`MAX_FRAME`], whose bytes have been read and dropped.
+    Oversize(usize),
+}
+
+/// Read one frame. `Ok(None)` is a clean end of stream between frames. A frame
+/// longer than [`MAX_FRAME`] is an `InvalidData` error.
 pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
-    read_frame_while(r, &|| false)
+    match read_frame_while(r, &|| false)? {
+        Incoming::End => Ok(None),
+        Incoming::Frame(f) => Ok(Some(f)),
+        Incoming::Oversize(len) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame length {len}"))),
+    }
 }
 
 /// [`read_frame`] for a reader with a read timeout: a timed-out read is
 /// retried while `keep_going` holds, keeping the part of the frame already
 /// read, and otherwise fails as the read did.
-fn read_frame_while(r: &mut impl Read, keep_going: &dyn Fn() -> bool) -> io::Result<Option<Vec<u8>>> {
+fn read_frame_while(r: &mut impl Read, keep_going: &dyn Fn() -> bool) -> io::Result<Incoming> {
     let mut len = [0u8; 4];
     match fill(r, &mut len, keep_going)? {
-        0 => return Ok(None),
+        0 => return Ok(Incoming::End),
         4 => {}
         _ => return Err(io::ErrorKind::UnexpectedEof.into()),
     }
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
+    if len > MAX_DISCARD {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame length {len}")));
+    }
+    if len > MAX_FRAME {
+        let mut skip = [0u8; MAX_FRAME];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(skip.len());
+            if fill(r, &mut skip[..n], keep_going)? < n {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            left -= n;
+        }
+        return Ok(Incoming::Oversize(len));
     }
     let mut frame = vec![0u8; len];
     if fill(r, &mut frame, keep_going)? < len {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(Some(frame))
+    Ok(Incoming::Frame(frame))
 }
 
 /// Read until `buf` is full or the stream ends, returning how much arrived.
@@ -234,6 +265,7 @@ pub struct StreamStats {
     from_peer: AtomicU64,
     dropped: AtomicU64,
     runts: AtomicU64,
+    oversize: AtomicU64,
 }
 
 impl StreamBackend {
@@ -302,9 +334,17 @@ impl StreamBackend {
         stats: Arc<StreamStats>,
     ) -> rtrb::Producer<Vec<u8>> {
         let mut last_runt_log: Option<Instant> = None;
+        let mut said_oversize = false;
         loop {
             match read_frame_while(&mut rd, &|| !ended.load(Ordering::SeqCst)) {
-                Ok(Some(frame)) if frame.len() < MIN_FRAME => {
+                Ok(Incoming::Oversize(len)) => {
+                    // The NICs cannot take it, and the next frame is intact.
+                    stats.oversize.fetch_add(1, Ordering::Relaxed);
+                    if !std::mem::replace(&mut said_oversize, true) {
+                        crate::dlog!(LogModule::Net, "stream: dropped a {len} byte frame from the peer (more are counted in net status)");
+                    }
+                }
+                Ok(Incoming::Frame(frame)) if frame.len() < MIN_FRAME => {
                     // Shorter than an Ethernet header is not a frame; the
                     // NICs would take it for one, so it never reaches them.
                     let n = stats.runts.fetch_add(1, Ordering::Relaxed) + 1;
@@ -313,7 +353,7 @@ impl StreamBackend {
                         crate::dlog!(LogModule::Net, "stream: dropped a {} byte frame from the peer ({n} so far)", frame.len());
                     }
                 }
-                Ok(Some(mut frame)) => {
+                Ok(Incoming::Frame(mut frame)) => {
                     // Counted before the NIC can see it, so a status read after
                     // a delivery includes it.
                     stats.from_peer.fetch_add(1, Ordering::Relaxed);
@@ -337,7 +377,7 @@ impl StreamBackend {
                     }
                     rx_wake.notify();
                 }
-                Ok(None) => {
+                Ok(Incoming::End) => {
                     eprintln!("iris: network stream closed by peer");
                     return rx_prod;
                 }
@@ -410,9 +450,9 @@ impl NetBackend for StreamBackend {
         let s = &self.stats;
         writeln!(w, "Stream segment {}: {}", self.endpoint,
                  if s.connected.load(Ordering::Relaxed) { "connected" } else { "waiting for the peer" })?;
-        writeln!(w, "  {} frames to the peer, {} from it, {} dropped while it was away, {} runts from it dropped",
+        writeln!(w, "  {} frames to the peer, {} from it, {} dropped while it was away, {} runts and {} oversize frames from it dropped",
                  s.to_peer.load(Ordering::Relaxed), s.from_peer.load(Ordering::Relaxed),
-                 s.dropped.load(Ordering::Relaxed), s.runts.load(Ordering::Relaxed))
+                 s.dropped.load(Ordering::Relaxed), s.runts.load(Ordering::Relaxed), s.oversize.load(Ordering::Relaxed))
     }
 }
 
@@ -441,7 +481,9 @@ mod tests {
         assert_eq!(read_frame(&mut r).unwrap(), None);
         // Too long for an Ethernet frame, a cut-off length, a cut-off frame.
         for (bad, kind) in [
-            (&[0u8, 0, 0x10, 0][..], io::ErrorKind::InvalidData),
+            (&[0u8, 0, 0x10, 0, 0][..], io::ErrorKind::UnexpectedEof),
+            (&[0u8, 0, 0x06, 0xdc][..], io::ErrorKind::UnexpectedEof),
+            (&[0u8, 1, 0, 1][..], io::ErrorKind::InvalidData),
             (&[0, 0][..], io::ErrorKind::UnexpectedEof),
             (&[0, 0, 0, 4, 9][..], io::ErrorKind::UnexpectedEof),
         ] {
@@ -612,6 +654,30 @@ mod tests {
         }
         assert_eq!(got, [14, 60]);
         assert_eq!(r.status.stats.runts.load(Ordering::Relaxed), 3);
+        r.stop();
+    }
+
+    /// A frame longer than an Ethernet frame is skipped, not the end of the
+    /// session: the frame after it still arrives.
+    #[test]
+    fn an_oversize_frame_from_the_peer_is_skipped() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut r = rig(StreamEndpoint::Tcp(listener.local_addr().unwrap()), RECONNECT);
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write_frame(&mut peer, &[0x11; 2000]).unwrap();
+        write_frame(&mut peer, &[0x22; 60]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            if let Ok(f) = r.from_net.pop() {
+                break f;
+            }
+            assert!(Instant::now() < deadline, "no frame after the oversize one");
+            r.rx_wake.wait(Duration::from_millis(10));
+        };
+        assert_eq!(got, vec![0x22; 60]);
+        assert!(r.status.stats.connected.load(Ordering::Relaxed), "the session ended");
+        assert_eq!(r.status.stats.oversize.load(Ordering::Relaxed), 1);
         r.stop();
     }
 
