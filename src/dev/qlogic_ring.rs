@@ -27,11 +27,12 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 
-use crate::irq::{IrqLine, IrqMutex};
+use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::pci::PciFunctionState;
 use crate::scsi::scsi_cmd;
+use crate::sync::Condvar;
 
 /// What the thread and the register side tell each other. An adapter's own
 /// control state holds one of these and lends it through [`RingState`].
@@ -65,7 +66,7 @@ pub trait RingState {
 /// The state lock, its signal, the fence and the thread. The methods that
 /// take the state lock are given the cell holding the adapter's interrupt
 /// line, which the lock drives; see [`IrqMutex::lock`].
-pub struct RingThread<S> {
+pub struct RingThread<S: IrqLevel> {
     pub(crate) st: IrqMutex<S>,
     /// `ring_ctl().gen`, readable without `st`: what a store into guest
     /// memory checks under `fence`.
@@ -84,12 +85,12 @@ pub struct RingThread<S> {
     pub(crate) fake_ns: AtomicI64,
 }
 
-impl<S: RingState> RingThread<S> {
-    /// `level` is the interrupt level the state gives.
-    pub fn new(state: S, level: fn(&S) -> bool) -> Self {
+impl<S: RingState + IrqLevel> RingThread<S> {
+    /// The interrupt line follows the level the state gives.
+    pub fn new(state: S) -> Self {
         let gen = state.ring_ctl().gen;
         Self {
-            st: IrqMutex::new(state, level),
+            st: IrqMutex::new(state),
             gen: AtomicU64::new(gen),
             fence: Mutex::new(()),
             wake: Condvar::new(),

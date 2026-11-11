@@ -38,7 +38,7 @@ jobs:
       with:
         fetch-depth: 2
     - id: find
-      run: echo "models=$(git diff --name-only HEAD^1 HEAD -- '*.rs' | xargs -r git grep -l 'cfg(loom)' -- | xargs)" >> "$GITHUB_OUTPUT"
+      run: echo "models=$(git diff --name-only HEAD^1 HEAD -- '*.rs' | xargs -r git grep -lw loom -- | xargs)" >> "$GITHUB_OUTPUT"
 
   loom:
     name: Loom models

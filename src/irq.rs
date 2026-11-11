@@ -11,7 +11,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use crate::sync::{Condvar, Mutex, MutexGuard};
 
 /// Something interrupt lines lead into.
 pub trait InterruptController: Send + Sync {
@@ -66,10 +66,19 @@ struct Unconnected;
 /// Delivery runs under the device's lock. That is safe only while the
 /// controller never calls back into the device while holding a lock the
 /// delivery takes.
-pub struct IrqMutex<S> {
+///
+/// A device that adopts this is the line's only driver. Nothing stops code
+/// holding the same [`IrqLine`] (a PCI function's `irq()`) from setting it
+/// directly, but that write bypasses the remembered level: the guard would
+/// not send the next change if it matched what it believes is on the line,
+/// and a late direct write could land after a newer guarded one.
+pub struct IrqMutex<S: IrqLevel> {
     inner: Mutex<(S, Last)>,
-    /// The level the state gives.
-    level: fn(&S) -> bool,
+}
+
+/// A device state that gives the level of its interrupt line.
+pub trait IrqLevel {
+    fn irq_level(&self) -> bool;
 }
 
 /// The level last written to the line, or `None` when the controller's input
@@ -77,9 +86,9 @@ pub struct IrqMutex<S> {
 #[derive(Default)]
 struct Last(Option<bool>);
 
-impl<S> IrqMutex<S> {
-    pub fn new(state: S, level: fn(&S) -> bool) -> Self {
-        Self { inner: Mutex::new((state, Last::default())), level }
+impl<S: IrqLevel> IrqMutex<S> {
+    pub fn new(state: S) -> Self {
+        Self { inner: Mutex::new((state, Last::default())) }
     }
 
     /// Lock the state. `line` is where the device's line is set, which the
@@ -87,7 +96,7 @@ impl<S> IrqMutex<S> {
     /// drives. A device without a line has nothing to drive and keeps what it
     /// remembers.
     pub fn lock<'a>(&'a self, line: &'a OnceLock<IrqLine>) -> IrqGuard<'a, S> {
-        IrqGuard { guard: self.inner.lock(), line, level: self.level }
+        IrqGuard { guard: self.inner.lock(), line }
     }
 
     pub fn is_locked(&self) -> bool {
@@ -95,16 +104,15 @@ impl<S> IrqMutex<S> {
     }
 }
 
-pub struct IrqGuard<'a, S> {
+pub struct IrqGuard<'a, S: IrqLevel> {
     guard: MutexGuard<'a, (S, Last)>,
     line: &'a OnceLock<IrqLine>,
-    level: fn(&S) -> bool,
 }
 
-impl<S> IrqGuard<'_, S> {
+impl<S: IrqLevel> IrqGuard<'_, S> {
     fn drive(&mut self) {
         let Some(line) = self.line.get() else { return };
-        let level = (self.level)(&self.guard.0);
+        let level = self.guard.0.irq_level();
         if self.guard.1.0 != Some(level) {
             self.guard.1.0 = Some(level);
             line.set(level);
@@ -117,6 +125,20 @@ impl<S> IrqGuard<'_, S> {
     /// has not changed.
     pub fn forget(&mut self) {
         self.guard.1.0 = None;
+    }
+
+    /// Take the line low and high again, if the state holds it high and the
+    /// line was last written high: an event the state cannot show as a
+    /// change, because the line never got to rest low between the two. The
+    /// controller sees a fall and a rise, in that order, before the lock is
+    /// let go. Otherwise the line has a rise or a fall owing, or none, and
+    /// the next drive gives it.
+    pub fn retrigger(&mut self) {
+        let Some(line) = self.line.get() else { return };
+        if self.guard.1.0 == Some(true) && self.guard.0.irq_level() {
+            line.set(false);
+            line.set(true);
+        }
     }
 
     /// Wait on `cv`, which lets go of the lock.
@@ -138,16 +160,16 @@ impl<S> IrqGuard<'_, S> {
     }
 }
 
-impl<S> std::ops::Deref for IrqGuard<'_, S> {
+impl<S: IrqLevel> std::ops::Deref for IrqGuard<'_, S> {
     type Target = S;
     fn deref(&self) -> &S { &self.guard.0 }
 }
 
-impl<S> std::ops::DerefMut for IrqGuard<'_, S> {
+impl<S: IrqLevel> std::ops::DerefMut for IrqGuard<'_, S> {
     fn deref_mut(&mut self) -> &mut S { &mut self.guard.0 }
 }
 
-impl<S> Drop for IrqGuard<'_, S> {
+impl<S: IrqLevel> Drop for IrqGuard<'_, S> {
     /// Runs before the field `guard` drops, so before the lock is released.
     fn drop(&mut self) {
         self.drive();
@@ -260,9 +282,15 @@ mod tests {
 mod irq_mutex_tests {
     use super::*;
 
+    impl IrqLevel for bool {
+        fn irq_level(&self) -> bool {
+            *self
+        }
+    }
+
     fn device() -> (Arc<LevelProbe>, OnceLock<IrqLine>, IrqMutex<bool>) {
         let (probe, line) = LevelProbe::line();
-        (probe, OnceLock::from(line), IrqMutex::new(false, |s| *s))
+        (probe, OnceLock::from(line), IrqMutex::new(false))
     }
 
     #[test]
@@ -273,6 +301,26 @@ mod irq_mutex_tests {
         drop(dev.lock(&line));
         *dev.lock(&line) = false;
         assert_eq!(probe.writes(), [true, false]);
+    }
+
+    #[test]
+    fn retriggering_a_high_line_falls_and_rises() {
+        let (probe, line, dev) = device();
+        *dev.lock(&line) = true;
+        dev.lock(&line).retrigger();
+        drop(dev.lock(&line));
+        assert_eq!(probe.writes(), [true, false, true]);
+    }
+
+    #[test]
+    fn retriggering_a_line_that_is_not_high_leaves_it_to_the_drive() {
+        let (probe, line, dev) = device();
+        let mut g = dev.lock(&line);
+        g.retrigger();
+        *g = true;
+        g.retrigger();
+        drop(g);
+        assert_eq!(probe.writes(), [true]);
     }
 
     #[test]
@@ -321,5 +369,75 @@ mod irq_mutex_tests {
             g.wait_for(&cv, Duration::from_secs(5));
         });
         assert_eq!(probe.writes(), [true]);
+    }
+}
+
+/// The guard's edge rule under every interleaving of two threads changing a
+/// device's state, checked by loom (`RUSTFLAGS="--cfg loom" cargo test
+/// --release --lib loom_tests`). The model drives the real [`IrqMutex`];
+/// only the lock comes from `crate::sync`, which is loom's under that cfg.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    struct Pin(bool);
+
+    impl IrqLevel for Pin {
+        fn irq_level(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// A parent that takes a lock of its own on every delivery, as a cascade
+    /// into another controller does, so a thread can be preempted inside it.
+    struct Parent(Mutex<Vec<bool>>);
+
+    impl InterruptController for Parent {
+        fn set_line(&self, _line: u32, level: bool) {
+            self.0.lock().push(level);
+        }
+    }
+
+    struct Dev {
+        line: OnceLock<IrqLine>,
+        st: IrqMutex<Pin>,
+    }
+
+    /// One thread raises the pin and drops it again while another drops it.
+    /// Whichever takes the lock first, the controller sees the levels
+    /// alternate with none written twice running, and ends on the level the
+    /// state ended on. A delivery let out of the lock lets the drop overtake
+    /// the rise.
+    #[test]
+    fn two_threads_leave_alternating_edges_and_the_final_level() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(4);
+        model.check(|| {
+            let parent = std::sync::Arc::new(Parent(Mutex::new(Vec::new())));
+            let line = IrqLine::new(parent.clone(), 0);
+            let dev = Arc::new(Dev { line: OnceLock::from(line), st: IrqMutex::new(Pin(false)) });
+            // The first drive always writes; get it out of the way.
+            drop(dev.st.lock(&dev.line));
+            let a = {
+                let dev = Arc::clone(&dev);
+                thread::spawn(move || {
+                    dev.st.lock(&dev.line).0 = true;
+                    dev.st.lock(&dev.line).0 = false;
+                })
+            };
+            let b = {
+                let dev = Arc::clone(&dev);
+                thread::spawn(move || dev.st.lock(&dev.line).0 = false)
+            };
+            a.join().unwrap();
+            b.join().unwrap();
+            let end = dev.st.lock(&dev.line).0;
+            let writes = parent.0.lock().clone();
+            assert_eq!(writes[0], false);
+            assert!(writes.windows(2).all(|w| w[0] != w[1]), "a level was written twice running: {writes:?}");
+            assert_eq!(writes.last(), Some(&end), "the line ended off the state: {writes:?}");
+        });
     }
 }
