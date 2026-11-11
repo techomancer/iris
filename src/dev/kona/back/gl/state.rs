@@ -11,7 +11,7 @@
 //! tables are not taken (counted).
 
 use crate::dev::kona::back::raster::fog::Fog;
-use crate::dev::kona::back::raster::ops::{BlendEq, BlendFactor, Compare, LogicOp, Ownership, StencilOp};
+use crate::dev::kona::back::raster::ops::{BlendEq, BlendFactor, Compare, Equation, LogicOp, Ownership, StencilOp};
 use crate::dev::kona::back::raster::texel::{EnvMode, TexDesc};
 use crate::dev::kona::back::raster::{AlphaTest, BlendState, DrawState, Rect, Smooth, StencilState};
 use crate::dev::kona::defs::{gl, *};
@@ -97,6 +97,8 @@ pub struct Raster {
     pub stencil_ops: [u32; 3],
     pub blend: bool,
     pub blend_factors: [u32; 2],
+    /// The blend equation's GL enumerant (`gl::FUNC_ADD` at start-up), as `BlendEq::from_gl` reads it.
+    pub blend_eq: u32,
     pub blend_colour: [f32; 4],
     pub logic_op_on: bool,
     pub logic_op: u32,
@@ -153,6 +155,7 @@ impl Default for Raster {
             stencil_ops: [gl::KEEP; 3],
             blend: false,
             blend_factors: [1, 0],
+            blend_eq: gl::FUNC_ADD,
             blend_colour: [0.0; 4],
             logic_op_on: false,
             logic_op: gl::LOGIC_OP_CLEAR + 3,
@@ -366,7 +369,7 @@ impl Raster {
     /// from the layout and the window when the draw state is built.
     fn visit<S: Stream>(&mut self, s: &mut S) {
         // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
-        let Self { viewport: _, depth_range: _, scissor: _, scissor_test: _, depth_test: _, depth_func: _, cull: _, cull_mode: _, front_cw: _, flat: _, texture_2d: _, texture_3d: _, lighting: _, target: _, alpha_test: _, alpha_func: _, alpha_ref: _, stencil_test: _, stencil_func: _, stencil_ref: _, stencil_read_mask: _, stencil_write_mask: _, stencil_ops: _, blend: _, blend_factors: _, blend_colour: _, logic_op_on: _, logic_op: _, colour_mask: _, depth_mask: _, dither: _, offset_fill: _, offset: _, line_width: _, point_size: _, line_stipple_on: _, line_stipple: _, polygon_stipple_on: _, polygon_stipple: _, env_mode: _, env_colour: _, fog: _, polygon_mode: _, point_smooth: _, line_smooth: _, polygon_smooth: _, ms: _ } = self;
+        let Self { viewport: _, depth_range: _, scissor: _, scissor_test: _, depth_test: _, depth_func: _, cull: _, cull_mode: _, front_cw: _, flat: _, texture_2d: _, texture_3d: _, lighting: _, target: _, alpha_test: _, alpha_func: _, alpha_ref: _, stencil_test: _, stencil_func: _, stencil_ref: _, stencil_read_mask: _, stencil_write_mask: _, stencil_ops: _, blend: _, blend_factors: _, blend_eq: _, blend_colour: _, logic_op_on: _, logic_op: _, colour_mask: _, depth_mask: _, dither: _, offset_fill: _, offset: _, line_width: _, point_size: _, line_stipple_on: _, line_stipple: _, polygon_stipple_on: _, polygon_stipple: _, env_mode: _, env_colour: _, fog: _, polygon_mode: _, point_smooth: _, line_smooth: _, polygon_smooth: _, ms: _ } = self;
         s.f32s(&mut self.viewport);
         s.f32s(&mut self.depth_range);
         s.i32s(&mut self.scissor);
@@ -378,6 +381,7 @@ impl Raster {
         }
         s.u32s(&mut self.stencil_ops);
         s.u32s(&mut self.blend_factors);
+        s.u32(&mut self.blend_eq);
         s.f32(&mut self.alpha_ref);
         s.f32s(&mut self.blend_colour);
         for b in self.colour_mask.iter_mut() {
@@ -697,6 +701,15 @@ impl Gl {
             (SET_STENCIL_OPERATIONS, 3) => self.raster.stencil_ops = [a[0], a[1], a[2]],
             (SET_STENCIL_WRITE_MASK, 1) => self.raster.stencil_write_mask = a[0],
             (SET_BLEND_FACTORS, 2) => self.raster.blend_factors = [a[0], a[1]],
+            // The equation: one word, taken as GL's enumerant (inferred; see `BlendEq`). A word that
+            // names none of the six equations leaves the equation as it was and is counted.
+            (SET_BLEND_EQUATION, 1) => {
+                if BlendEq::from_gl(a[0]).is_none() {
+                    crate::dlog!(crate::devlog::LogModule::Kona, "kona: blend equation word {:#x} is none of the six; the equation stays", a[0]);
+                    return Taken::Unmodelled;
+                }
+                self.raster.blend_eq = a[0];
+            }
             (SET_CONSTANT_BLEND_COLOUR, 4) => self.raster.blend_colour = [f(a[0]), f(a[1]), f(a[2]), f(a[3])],
             (SET_LOGIC_OPERATION, 1) => self.raster.logic_op = a[0],
             (SET_COLOUR_WRITE_MASK, 4) => self.raster.colour_mask = [a[0] != 0, a[1] != 0, a[2] != 0, a[3] != 0],
@@ -1086,6 +1099,13 @@ impl Gl {
                 let (x0, y0) = (ox.saturating_add(s[0]), oy.saturating_add(s[1]));
                 clip = clip.intersect(&Rect { x0, y0, x1: x0.saturating_add(s[2]), y1: y0.saturating_add(s[3]) });
             }
+            // The blend equation, read once here: the logic-operation equation turns blending into the
+            // context's logic operation, so a fragment never tests which equation it runs under.
+            let (arithmetic, logic_eq) = match BlendEq::from_gl(r.blend_eq) {
+                Some(Equation::Arithmetic(e)) => (e, false),
+                Some(Equation::Logic) => (BlendEq::Add, true),
+                None => (BlendEq::Add, false),
+            };
             let [vx, vy, vw, vh] = r.viewport;
             // The viewport rectangle holds every pixel the viewport touches.
             let (ox, oy) = (ox as f64, oy as f64);
@@ -1121,13 +1141,13 @@ impl Gl {
                 // The alpha reference is the token's float in 13-bit units, rounded: the model's own.
                 alpha: AlphaTest { enabled: r.alpha_test && !ci, func: Compare::from_gl(r.alpha_func).unwrap_or_default(), reference: (r.alpha_ref.clamp(0.0, 1.0) * 8191.0 + 0.5) as u32 },
                 blend: BlendState {
-                    enabled: r.blend && !ci,
+                    enabled: r.blend && !ci && !logic_eq,
                     src: BlendFactor::from_gl(r.blend_factors[0]).unwrap_or(BlendFactor::One),
                     dst: BlendFactor::from_gl(r.blend_factors[1]).unwrap_or(BlendFactor::Zero),
-                    eq: BlendEq::Add,
+                    eq: arithmetic,
                     constant: r.blend_colour.map(|c| (c.clamp(0.0, 1.0) * 8191.0 + 0.5) as u32),
                 },
-                logic: (r.logic_op_on && !ci).then(|| LogicOp::from_gl(r.logic_op)).flatten(),
+                logic: ((r.logic_op_on || (r.blend && logic_eq)) && !ci).then(|| LogicOp::from_gl(r.logic_op)).flatten(),
                 colour_mask: r.colour_mask,
                 dither: r.dither && !ci,
                 offset: r.offset_fill.then_some(r.offset),

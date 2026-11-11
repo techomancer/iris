@@ -21,7 +21,8 @@
 //! clipped to it and keeps the window's own pixel grid, so a tiled run is
 //! bit-exact with an inline one. There is one per-fragment path, which reads the
 //! draw state and branches on the operations that are on, and the loop is
-//! specialised once for each draw on the features the draw uses (see `run_tri`),
+//! specialised once for each draw on the features the draw uses (see `run_tri`: fog,
+//! smoothing, stipples, the texture kind and whether the blend equation is add),
 //! so a draw does not pay for those it does not use; other speed work is deferred.
 
 use super::setup::{Tri, TriJob};
@@ -31,7 +32,7 @@ use super::{DrawState, Rect};
 use crate::dev::kona::back::store::texture::TextureStore;
 use crate::dev::kona::back::store::{PixelStore, WordArray, DID_PLANE};
 
-use super::ops::{blend, ownership_plane, pack_colour, to8, unpack_colour};
+use super::ops::{blend, blend_add, ownership_plane, pack_colour, to8, unpack_colour};
 
 /// An attribute plane's value at a sample, clamped to `0..=max` and rounded.
 #[inline(always)]
@@ -125,10 +126,22 @@ impl<'a> Planes<'a> {
         }
     }
 
+    /// `shade_with` for a caller that reads the draw's blend equation per fragment (a pixel transfer).
+    #[inline(always)]
+    pub fn shade(&self, ds: &DrawState, index: usize, src: [u32; 4], z: u32) {
+        self.shade_with::<false>(ds, index, src, z)
+    }
+
+    /// `shade_samples_with` for a caller that reads the draw's blend equation per fragment.
+    #[inline(always)]
+    pub fn shade_samples(&self, ds: &DrawState, index: usize, src: [u32; 4], z_at: impl Fn(usize) -> u32, covered: u32) {
+        self.shade_samples_with::<false>(ds, index, src, z_at, covered)
+    }
+
     /// One fragment at plane index `index`, through the tests and writes that come after
     /// ownership and the stipples: alpha, stencil, depth, blend, logic operation, colour mask.
     #[inline(always)]
-    pub fn shade(&self, ds: &DrawState, index: usize, src: [u32; 4], z: u32) {
+    pub fn shade_with<const ADD: bool>(&self, ds: &DrawState, index: usize, src: [u32; 4], z: u32) {
         let all = [true; 4];
         let (depth, arrays) = (&self.depth, &self.colour);
         let test = ds.depth_test && depth.is_some();
@@ -168,7 +181,7 @@ impl<'a> Planes<'a> {
             // SAFETY: as above.
             let old = if reads_dst { unsafe { a.load(index) } } else { 0 };
             // SAFETY: as above.
-            unsafe { a.store(index, colour_out(ds, src, old)) };
+            unsafe { a.store(index, colour_out::<ADD>(ds, src, old)) };
         }
     }
 
@@ -177,7 +190,7 @@ impl<'a> Planes<'a> {
     /// sample (a fraction of `u32::MAX`). The pixel's colour word is then the mean of its samples, so
     /// samples two triangles cover between them add up to a whole pixel. A pixel is tested with the alpha
     /// once, before its samples (alpha is a fragment's, not a sample's).
-    pub fn shade_samples(&self, ds: &DrawState, index: usize, src: [u32; 4], z_at: impl Fn(usize) -> u32, covered: u32) {
+    pub fn shade_samples_with<const ADD: bool>(&self, ds: &DrawState, index: usize, src: [u32; 4], z_at: impl Fn(usize) -> u32, covered: u32) {
         let (Some(ms), Some(sa)) = (&ds.samples, &self.samples) else { return };
         if ds.alpha.enabled && !ds.alpha.func.passes(src[3], ds.alpha.reference) {
             return;
@@ -226,7 +239,7 @@ impl<'a> Planes<'a> {
         for k in 0..count {
             let mut rgb = sample_get(&sa.colour, index, k, cstride, 24);
             if live >> k & 1 != 0 {
-                let out = colour_out(ds, src, alpha << 24 | rgb);
+                let out = colour_out::<ADD>(ds, src, alpha << 24 | rgb);
                 rgb = out & 0xff_ffff;
                 sample_set(&sa.colour, index, k, cstride, 24, rgb);
             }
@@ -290,12 +303,15 @@ impl Planes<'_> {
     }
 }
 
-/// The colour a fragment writes over `old`: blend, then the logic operation, then the colour mask.
+/// The colour a fragment writes over `old`: blend, then the logic operation, then the colour mask. `ADD`:
+/// the draw's blend equation is add, or it does not blend, so the fragment takes the add arithmetic and
+/// reads no equation (`run` picks the loop once for the draw).
 #[inline(always)]
-fn colour_out(ds: &DrawState, src: [u32; 4], old: u32) -> u32 {
+fn colour_out<const ADD: bool>(ds: &DrawState, src: [u32; 4], old: u32) -> u32 {
     let mut c = src;
     if ds.blend.enabled {
-        c = blend(src, unpack_colour(old), ds.blend.src, ds.blend.dst, ds.blend.eq, ds.blend.constant);
+        let (sf, df, k) = (ds.blend.src, ds.blend.dst, ds.blend.constant);
+        c = if ADD { blend_add(src, unpack_colour(old), sf, df, k) } else { blend(src, unpack_colour(old), sf, df, ds.blend.eq, k) };
     }
     let mut word = pack_colour(c);
     if let Some(op) = ds.logic {
@@ -409,28 +425,34 @@ pub fn run(store: &PixelStore, job: &RasterJob, ds: &DrawState, clip: Rect) {
             // code for either in it.
             let plain = ds.samples.is_none() && if job.line { ds.line_stipple.is_none() } else { ds.polygon_stipple.is_none() };
             macro_rules! go {
-                ($fog:expr) => {
+                ($fog:expr, $add:expr) => {
                     match (aa, tex, plain) {
-                        (false, Kind::Plain, false) => run_tri::<{ $fog }, false, false, Plain>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Plain, false) => run_tri::<{ $fog }, true, false, Plain>(store, job, ds, r, pitch, &owns),
-                        (false, Kind::Volume, false) => run_tri::<{ $fog }, false, false, Volume>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Volume, false) => run_tri::<{ $fog }, true, false, Volume>(store, job, ds, r, pitch, &owns),
-                        (false, Kind::Enhanced, false) => run_tri::<{ $fog }, false, false, Enhanced>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Enhanced, false) => run_tri::<{ $fog }, true, false, Enhanced>(store, job, ds, r, pitch, &owns),
-                        (false, Kind::Plain, true) => run_tri::<{ $fog }, false, true, Plain>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Plain, true) => run_tri::<{ $fog }, true, true, Plain>(store, job, ds, r, pitch, &owns),
-                        (false, Kind::Volume, true) => run_tri::<{ $fog }, false, true, Volume>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Volume, true) => run_tri::<{ $fog }, true, true, Volume>(store, job, ds, r, pitch, &owns),
-                        (false, Kind::Enhanced, true) => run_tri::<{ $fog }, false, true, Enhanced>(store, job, ds, r, pitch, &owns),
-                        (true, Kind::Enhanced, true) => run_tri::<{ $fog }, true, true, Enhanced>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Plain, false) => run_tri::<{ $fog }, false, false, { $add }, Plain>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Plain, false) => run_tri::<{ $fog }, true, false, { $add }, Plain>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Volume, false) => run_tri::<{ $fog }, false, false, { $add }, Volume>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Volume, false) => run_tri::<{ $fog }, true, false, { $add }, Volume>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Enhanced, false) => run_tri::<{ $fog }, false, false, { $add }, Enhanced>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Enhanced, false) => run_tri::<{ $fog }, true, false, { $add }, Enhanced>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Plain, true) => run_tri::<{ $fog }, false, true, { $add }, Plain>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Plain, true) => run_tri::<{ $fog }, true, true, { $add }, Plain>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Volume, true) => run_tri::<{ $fog }, false, true, { $add }, Volume>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Volume, true) => run_tri::<{ $fog }, true, true, { $add }, Volume>(store, job, ds, r, pitch, &owns),
+                        (false, Kind::Enhanced, true) => run_tri::<{ $fog }, false, true, { $add }, Enhanced>(store, job, ds, r, pitch, &owns),
+                        (true, Kind::Enhanced, true) => run_tri::<{ $fog }, true, true, { $add }, Enhanced>(store, job, ds, r, pitch, &owns),
                     }
                 };
             }
-            match super::fog::curve_of(ds) {
-                0 => go!(0),
-                super::fog::LINEAR => go!(super::fog::LINEAR),
-                super::fog::EXP => go!(super::fog::EXP),
-                _ => go!(super::fog::EXP2),
+            // The blend equation too: a draw that adds, or does not blend, runs the loop that reads no equation.
+            let add = !ds.blend.enabled || ds.blend.eq == super::ops::BlendEq::Add;
+            match (super::fog::curve_of(ds), add) {
+                (0, true) => go!(0, true),
+                (0, false) => go!(0, false),
+                (super::fog::LINEAR, true) => go!(super::fog::LINEAR, true),
+                (super::fog::LINEAR, false) => go!(super::fog::LINEAR, false),
+                (super::fog::EXP, true) => go!(super::fog::EXP, true),
+                (super::fog::EXP, false) => go!(super::fog::EXP, false),
+                (_, true) => go!(super::fog::EXP2, true),
+                (_, false) => go!(super::fog::EXP2, false),
             }
         }
     }
@@ -484,7 +506,7 @@ impl Sampler for Enhanced {
 /// The triangle `job`, in the pixels of `r`, with fog of curve `FOG` (0: none; `fog::LINEAR`,
 /// `fog::EXP`, `fog::EXP2`), with coverage (`AA`) when it is a triangle of a smoothed primitive,
 /// without multisampling or a stipple when `PLAIN`, and sampling a texture with `S`.
-fn run_tri<const FOG: u8, const AA: bool, const PLAIN: bool, S: Sampler>(store: &PixelStore, job: &TriJob, ds: &DrawState, r: Rect, pitch: usize, owns: &impl Fn(usize) -> bool) {
+fn run_tri<const FOG: u8, const AA: bool, const PLAIN: bool, const ADD: bool, S: Sampler>(store: &PixelStore, job: &TriJob, ds: &DrawState, r: Rect, pitch: usize, owns: &impl Fn(usize) -> bool) {
     let t = &job.tri;
     let planes = Planes::new(store, ds);
     // Quads aligned to even screen coordinates, clipped to the rectangle: the
@@ -604,11 +626,11 @@ fn run_tri<const FOG: u8, const AA: bool, const PLAIN: bool, S: Sampler>(store: 
                 }
                 let (i, j) = ((x - t.origin[0]) as i64, (y - t.origin[1]) as i64);
                 if PLAIN {
-                    planes.shade(ds, index, src, depth_at(t, i, j));
+                    planes.shade_with::<ADD>(ds, index, src, depth_at(t, i, j));
                     continue;
                 }
                 match &ds.samples {
-                    None => planes.shade(ds, index, src, depth_at(t, i, j)),
+                    None => planes.shade_with::<ADD>(ds, index, src, depth_at(t, i, j)),
                     // A multisampled fragment keeps the samples the sample mask and alpha-to-mask leave it,
                     // shaded once and written to each, at the depth of the sample.
                     Some(ms) => {
@@ -620,7 +642,7 @@ fn run_tri<const FOG: u8, const AA: bool, const PLAIN: bool, S: Sampler>(store: 
                             src[3] = 8191;
                         }
                         if m != 0 {
-                            planes.shade_samples(ds, index, src, |k| depth_at_sample(t, i, j, ms.at[k]), m);
+                            planes.shade_samples_with::<ADD>(ds, index, src, |k| depth_at_sample(t, i, j, ms.at[k]), m);
                         }
                     }
                 }

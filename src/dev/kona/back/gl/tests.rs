@@ -1235,3 +1235,35 @@ fn a_colour_index_window_gives_its_vertices_the_index() {
     r.triangle([(-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)]);
     assert!(r.states.last().expect("made").blend.enabled, "a colour window blends again");
 }
+
+/// The blend-equation token selects the equation the draw state runs; the logic-operation equation turns
+/// blending into the context's logic operation, and a word that names none leaves the equation and is counted.
+#[test]
+fn the_blend_equation_token_picks_the_equation_and_the_logic_one_becomes_a_logic_operation() {
+    use crate::dev::kona::back::raster::ops::{BlendEq, LogicOp};
+    let mut r = Rig::new();
+    let screen = Rect { x0: 0, y0: 0, x1: 100, y1: 100 };
+    r.cmd(ENABLE_CAPABILITY, &[gl::BLEND]);
+    assert_eq!(r.gl.draw_state(screen).blend.eq, BlendEq::Add, "start-up");
+    for (word, want) in [(gl::FUNC_SUBTRACT, BlendEq::Subtract), (gl::FUNC_REVERSE_SUBTRACT, BlendEq::ReverseSubtract), (gl::MIN, BlendEq::Min), (gl::MAX, BlendEq::Max), (gl::FUNC_ADD, BlendEq::Add)] {
+        r.cmd(SET_BLEND_EQUATION, &[word]);
+        let ds = r.gl.draw_state(screen);
+        assert_eq!((ds.blend.eq, ds.blend.enabled, ds.logic), (want, true, None), "{word:#x}");
+    }
+    // The logic-operation equation: no arithmetic blend, the logic operation of glLogicOp in its place,
+    // whether or not the colour logic operation is on.
+    r.cmd(SET_LOGIC_OPERATION, &[gl::LOGIC_OP_CLEAR + 6]);
+    r.cmd(SET_BLEND_EQUATION, &[gl::LOGIC_OP]);
+    let ds = r.gl.draw_state(screen);
+    assert_eq!((ds.blend.enabled, ds.logic), (false, Some(LogicOp::Xor)));
+    r.cmd(DISABLE_CAPABILITY, &[gl::BLEND]);
+    assert_eq!(r.gl.draw_state(screen).logic, None, "blending off: no logic operation");
+    r.cmd(ENABLE_CAPABILITY, &[gl::BLEND]);
+    // A word that is none of the six keeps the equation and is counted.
+    r.cmd(SET_BLEND_EQUATION, &[0x1234]);
+    assert_eq!(r.path.counts.unmodelled.get(&SET_BLEND_EQUATION), Some(&1));
+    assert_eq!(r.gl.raster.blend_eq, gl::LOGIC_OP);
+    // The generic state query reads the equation back.
+    let mut c = query::Counts::default();
+    assert_eq!(query::answer(&mut r.gl, &mut c, QUERY_STATE_GENERIC, &[0x8009]), vec![gl::LOGIC_OP]);
+}

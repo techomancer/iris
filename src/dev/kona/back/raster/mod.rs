@@ -149,7 +149,7 @@ impl Default for StencilState {
     }
 }
 
-/// Blending: `src * src_factor + dst * dst_factor` under `eq` (add is all there is), with
+/// Blending: `src * src_factor + dst * dst_factor` under `eq` (add, subtract, reverse subtract, minimum or maximum; the logic-operation equation is the draw state's `logic`), with
 /// the constant colour in 13-bit units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlendState {
