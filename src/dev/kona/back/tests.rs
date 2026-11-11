@@ -2163,6 +2163,14 @@ fn copy_and_read_pixels() {
     assert_eq!(out, gl::pixels::Out::Reply(vec![0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff]));
     let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, &[30, 30, 1, 1, FORMAT_RED, TYPE_UNSIGNED_SHORT, 2]);
     assert_eq!(out, gl::pixels::Out::Reply(vec![0, 0, 0x11, 0x11]), "the destination's byte offset leads");
+    // The ABGR format's packed types are answered, alpha first from the high bits, not refused: a
+    // refusal sends no reply and the client waits for one forever.
+    let refused = b.pix_counts.refused;
+    let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, &[30, 30, 2, 1, FORMAT_ABGR, TYPE_8_8_8_8, 0]);
+    assert_eq!(out, gl::pixels::Out::Reply(vec![0xff, 0x33, 0x22, 0x11, 0xff, 0x66, 0x55, 0x44]));
+    let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, &[30, 30, 2, 1, FORMAT_ABGR, TYPE_4_4_4_4, 0]);
+    assert_eq!(out, gl::pixels::Out::Reply(vec![0xf3, 0x21, 0xf6, 0x54]));
+    assert_eq!(b.pix_counts.refused, refused);
     // The overlap query: the copy's source and its destination meet when the rectangles do.
     let out = gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, ASK_WHETHER_COPY_SOURCE_OVERLAPS_ITS_DESTINATION, &[29, 29, 4, 4]);
     assert_eq!(out, gl::pixels::Out::Reply(vec![0, 0, 0, 4]));

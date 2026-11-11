@@ -13,11 +13,13 @@
 //!   it runs, so the stages are GL's (approximated). Post-convolution and post-colour-matrix
 //!   scale and bias are stored and not applied (counted).
 //! - A packed type's component layout is the public one (the table does not record the
-//!   pipe's unpacker). Format 8 (the ABGR extension) is read and written with its components
-//!   in the order alpha, blue, green, red, in the plain types only. Formats 9 and 10 (CMYK and
-//!   CMYKA) are sized by the pipe's component table (four and five components) so the words
-//!   that follow a header are consumed, and refused. Type codes 14 to 20 are refused (their
-//!   element sizes are known, their bit layouts are not).
+//!   pipe's unpacker): the format's components from the high bits down. Format 8 (the ABGR
+//!   extension) is read and written with its components in the order alpha, blue, green,
+//!   red, in the plain types and, by the same rule, the packed ones (inferred: its packed
+//!   layouts are not recorded either, and a refusal left the client waiting for the reply).
+//!   Formats 9 and 10 (CMYK and CMYKA) are sized by the pipe's component table (four and five
+//!   components) so the words that follow a header are consumed, and refused. Type codes 14 to
+//!   20 are refused (their element sizes are known, their bit layouts are not).
 //! - A colour-index image drawn into a window of colours goes through the index-to-colour
 //!   pixel maps when they are loaded, else as an eight-bit grey (the model's own). Drawn into a
 //!   colour-index window it is written as indices: the index through the shift, offset and
@@ -548,13 +550,9 @@ fn pixel_bytes(format: u32, ty: u32) -> Option<usize> {
     }
     let (b, packed) = element_bytes(ty)?;
     if packed {
-        // The ABGR extension's packed layouts are not recorded.
-        if format == FORMAT_ABGR {
-            return None;
-        }
-        // A packed type is a whole pixel: RGB for the 3-3-2 form, RGBA for the others.
+        // A packed type is a whole pixel: RGB for the 3-3-2 form, RGBA (or ABGR) for the others.
         let want = if ty == TYPE_3_3_2 { 3 } else { 4 };
-        return (n == want).then_some(b);
+        return (n == want && !(format == FORMAT_ABGR && ty == TYPE_3_3_2)).then_some(b);
     }
     Some(b * n)
 }
@@ -720,7 +718,7 @@ pub fn unpack(h: &Header, rec: &Record, bytes: &[u8]) -> Option<Image> {
             let at = row_at[j] + i * g.p;
             if packed {
                 let c = unpack_packed(h.ty, word_at(bytes, at, esize, swap)?);
-                colour.push(if h.ty == TYPE_3_3_2 || h.format == FORMAT_RGB { [c[0], c[1], c[2], 1.0] } else { c });
+                colour.push(if h.ty == TYPE_3_3_2 || h.format == FORMAT_RGB { [c[0], c[1], c[2], 1.0] } else { to_colour(h.format, &c) });
                 continue;
             }
             if int_plane {
@@ -1519,7 +1517,15 @@ mod tests {
         assert_eq!(&b[..4], &[0, 64, 128, 255], "alpha, blue, green, red");
         assert_eq!(unpack(&header(1, 1, FORMAT_ABGR, TYPE_UNSIGNED_BYTE, 0), &rec, &b).unwrap().plane, Plane::Colour(vec![[1.0, 128.0 / 255.0, 64.0 / 255.0, 0.0]]));
         assert_eq!(pixel_bytes(FORMAT_ABGR, TYPE_UNSIGNED_SHORT), Some(8));
-        assert_eq!(pixel_bytes(FORMAT_ABGR, TYPE_8_8_8_8), None, "its packed layouts are not recorded");
+        // The packed types are a whole pixel in the format's order from the high bits: alpha first.
+        assert_eq!((pixel_bytes(FORMAT_ABGR, TYPE_4_4_4_4), pixel_bytes(FORMAT_ABGR, TYPE_8_8_8_8), pixel_bytes(FORMAT_ABGR, TYPE_3_3_2)), (Some(2), Some(4), None));
+        let rec2 = Record { alignment: 1, ..Record::default() };
+        let b = pack(&rgba, FORMAT_ABGR, TYPE_4_4_4_4, 0, &rec2).unwrap();
+        assert_eq!(&b[..2], &[0x04, 0x8f], "alpha 0, blue 4/15, green 8/15, red 15/15 from the high nibble");
+        let b = pack(&rgba, FORMAT_ABGR, TYPE_8_8_8_8, 0, &rec2).unwrap();
+        assert_eq!(&b[..4], &[0, 64, 128, 255]);
+        assert_eq!(header(3, 2, FORMAT_ABGR, TYPE_4_4_4_4, 0).image_words(&rec2), Some(3), "a draw's words are consumed: two rows of three shorts");
+        assert_eq!(unpack(&header(1, 1, FORMAT_ABGR, TYPE_8_8_8_8, 0), &rec2, &b).unwrap().plane, Plane::Colour(vec![[1.0, 128.0 / 255.0, 64.0 / 255.0, 0.0]]));
         assert_eq!((pixel_bytes(FORMAT_CMYK, TYPE_UNSIGNED_BYTE), pixel_bytes(FORMAT_CMYKA, TYPE_UNSIGNED_BYTE)), (Some(4), Some(5)));
         assert!(unpack(&header(1, 1, FORMAT_CMYK, TYPE_UNSIGNED_BYTE, 0), &rec, &[0; 4]).is_none());
         assert!(pack(&rgba, FORMAT_CMYKA, TYPE_UNSIGNED_BYTE, 0, &rec).is_none());
