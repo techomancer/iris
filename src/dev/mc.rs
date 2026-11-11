@@ -1,5 +1,5 @@
 use std::sync::{Arc, Weak, OnceLock};
-use parking_lot::{Mutex, Condvar};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::devlog::LogModule;
 use std::sync::mpsc;
@@ -554,7 +554,6 @@ impl MemoryController {
     /// Current GIO64_ARB value (bus widths / arbitration per GIO slot).
     pub(crate) fn gio64_arb(&self) -> u32 { self.state.lock().regs[(REG_GIO64_ARB / 4) as usize] }
 
-    pub(crate) fn dma_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
 
     pub(crate) fn vdma_debug_enabled(&self) -> bool { self.vdma_debug.load(Ordering::Relaxed) }
 
@@ -953,8 +952,7 @@ impl BusDevice for MemoryController {
                 state.gio_adr = val;
                 state.run |= DMA_RUN_RUN;
                 state.run_real = true; // set before releasing lock so CPU sees it immediately
-                drop(state);
-                self.giodma.cond.notify_all();
+                state.ring();
                 BUS_OK
             }
             REG_DMA_MODE => { self.giodma.state.lock().mode = val; BUS_OK }
@@ -966,8 +964,7 @@ impl BusDevice for MemoryController {
                     dlog_dev!(LogModule::Mc, "MC: DMA Start via STDMA write: {:08x}", val);
                     state.run |= DMA_RUN_RUN;
                     state.run_real = true;
-                    drop(state);
-                    self.giodma.cond.notify_all();
+                    state.ring();
                 }
                 BUS_OK
             }
@@ -981,8 +978,7 @@ impl BusDevice for MemoryController {
                 state.memadr = val;
                 state.run |= DMA_RUN_RUN;
                 state.run_real = true;
-                drop(state);
-                self.giodma.cond.notify_all();
+                state.ring();
                 BUS_OK
             }
             REG_EEROM => {
@@ -1052,18 +1048,13 @@ impl Device for MemoryController {
     }
 
     fn stop(&self) {
-        // Store under the state lock: the worker tests `dma_running` and
-        // then waits while holding it, so a store between the two with no
-        // lock would notify before the wait and `join` below would hang.
-        {
-            let _state = self.giodma.state.lock();
-            self.running.store(false, Ordering::SeqCst);
-        }
-        self.giodma.cond.notify_all();
+        self.running.store(false, Ordering::SeqCst);
+        self.giodma.state.close();
         let mut threads = self.threads.lock();
         for t in threads.drain(..) {
             let _ = t.join();
         }
+        self.giodma.state.reopen();
     }
 
     fn start(&self) {
@@ -1374,7 +1365,7 @@ impl Saveable for MemoryController {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 

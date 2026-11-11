@@ -64,7 +64,8 @@
 //! step and is deliberately not done here.
 
 use std::sync::atomic::Ordering;
-use parking_lot::{Mutex, Condvar};
+use parking_lot::Mutex;
+use crate::sync::Doorbell;
 use std::io::Write as IoWrite;
 
 use crate::devlog::LogModule;
@@ -148,14 +149,15 @@ pub struct GioDmaState {
 }
 
 pub struct GioDma {
-    pub state: Mutex<GioDmaState>,
-    pub cond: Condvar,
+    /// Rung when a register write starts a transfer, which the MC-DMA
+    /// thread waits for.
+    pub state: Doorbell<GioDmaState>,
 }
 
 impl GioDma {
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(GioDmaState {
+            state: Doorbell::new(GioDmaState {
                 gio_mask: 0,
                 gio_sub: 0,
                 cause: 0,
@@ -172,7 +174,6 @@ impl GioDma {
                 stdma: 0,
                 run_real: false,
             }),
-            cond: Condvar::new(),
         }
     }
 }
@@ -1194,19 +1195,16 @@ impl MemoryController {
     /// The MC-DMA thread body: wait for a run signal, latch, dispatch, retire.
     pub(crate) fn dma_worker(&self) {
         let giodma = self.giodma().clone();
-        let (lock, cvar) = (&giodma.state, &giodma.cond);
+        let lock = &giodma.state;
 
         let mut state = lock.lock();
-        while self.dma_running() {
-            // Wait for run signal. A trigger sets `run_real` under the lock
-            // before it notifies, so test it before sleeping: one that lands
-            // before the worker first waits (right after `start`) would
-            // otherwise be lost, and the guest would poll RUNNING forever.
-            while !state.run_real && self.dma_running() {
-                cvar.wait(&mut state);
-            }
-
-            if !self.dma_running() { break; }
+        loop {
+            // Wait for run signal, or stop. A trigger that lands before the
+            // worker first waits (right after `start`) is already set.
+            state = match state.wait_until(|s| s.run_real) {
+                Ok(state) => state,
+                Err(_) => break,
+            };
 
             state.run |= DMA_RUN_RUN; // ensure set (may already be set by write handler)
 
@@ -1314,7 +1312,7 @@ impl MemoryController {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::dev::mem::Memory;
@@ -1481,7 +1479,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod zoom_tests {
     use super::*;
 
@@ -1509,7 +1507,7 @@ mod zoom_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod zoom_semantics_tests {
     use super::*;
     use crate::dev::mem::Memory;
@@ -1579,7 +1577,7 @@ mod zoom_semantics_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod pixmap_tests {
     use super::*;
 
@@ -1639,7 +1637,7 @@ mod pixmap_tests {
 /// That extra level is what catches a mismatch between how MC chunks a transfer
 /// and how REX3 consumes it — neither component's own tests can see it, because
 /// each is self-consistent.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod rex3_e2e_tests {
     use super::*;
     use crate::dev::eeprom_93c56::Eeprom93c56;
@@ -1851,7 +1849,7 @@ mod rex3_e2e_tests {
 /// Shapes deliberately include ragged line widths (164 — the real Start-menu
 /// blit), non-zero stride, and zoom repeats: exactly the cases the flat qword
 /// path rejects and the ones the new path exists to serve.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod line_bulk_tests_support {
     use super::*;
     use crate::dev::eeprom_93c56::Eeprom93c56;
@@ -2185,7 +2183,7 @@ mod line_bulk_tests_support {
 ///
 /// The shapes here use a line width large enough that many chunks are needed
 /// for a modest line count, so the boundary is crossed repeatedly.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod line_bulk_chunk_tests {
     use super::*;
     use super::line_bulk_tests_support::*;
@@ -2228,7 +2226,7 @@ mod line_bulk_chunk_tests {
 
 /// Regression: a multi-line job whose *lines* are ragged must never take the
 /// linear path, even when the aggregate byte count happens to divide by 8.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod ragged_line_regression_tests {
     use super::*;
     use super::line_bulk_tests_support::{base_job, compare_read, compare_write};
@@ -2317,7 +2315,7 @@ mod ragged_line_regression_tests {
 
 /// 32-bit GIO slots (GR2): bus width follows GIO64_ARB, and each word is one
 /// register access at the port, MSB-first.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod gio32_tests {
     use super::*;
     use crate::dev::eeprom_93c56::Eeprom93c56;
@@ -2439,25 +2437,25 @@ mod gio32_tests {
         mc.stop();
     }
 
-    /// `stop` must clear the running flag under the state lock, the lock the
-    /// worker holds between testing the flag and waiting on the condition
-    /// variable. Without it a stop landing in that gap notifies nobody and
-    /// `join` hangs. Hold the lock here, as the worker does in the gap, and
-    /// check `stop` cannot get past it.
+    /// `stop` ends an MC-DMA thread waiting for a transfer. The wait has no
+    /// timeout, so a stop that left the doorbell open would leave the join in
+    /// `stop` waiting forever. The race between the wait and the close is the
+    /// doorbell's, checked in `sync::doorbell::loom_tests`.
     #[test]
-    fn stop_waits_for_the_state_lock_before_clearing_the_running_flag() {
+    fn stop_ends_a_dma_thread_waiting_for_a_transfer() {
         use crate::traits::Device;
         let (_bus, mc) = setup();
         mc.start();
-        std::thread::scope(|s| {
-            let held = mc.giodma().state.lock();
-            let stopper = s.spawn(|| mc.stop());
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            assert!(mc.dma_running(), "stop cleared the flag without taking the state lock");
-            drop(held);
-            stopper.join().unwrap();
-        });
-        assert!(!mc.dma_running());
+        let (done, stopped) = std::sync::mpsc::channel();
+        let stopper = {
+            let mc = mc.clone();
+            std::thread::spawn(move || {
+                mc.stop();
+                done.send(()).unwrap();
+            })
+        };
+        assert!(stopped.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "stop never joined the MC-DMA thread");
+        stopper.join().unwrap();
     }
 
     #[test]
