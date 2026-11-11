@@ -1564,6 +1564,23 @@ pub type R10000Cache = CpuCache<32768, 64, 1, 512,
                                 1048576, 128, 8192, 131072, 262144, true,
                                 true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
+/// The three models with `TC = false`: caches that hold their data in every
+/// build, `tcache` or not. A test of something only a cache holding data does
+/// (memory stale until written back, a dirty line discarded) names one of
+/// these.
+#[cfg(test)]
+pub(crate) type RealR4400Cache = CpuCache<16384, 16, 1, 1024, 16384, 16, 1, 1024, 2048,
+    1048576, 128, 8192, 131072, 262144, true,
+    false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }, false>;
+#[cfg(test)]
+pub(crate) type RealR5000Cache = CpuCache<32768, 32, 2, 1024, 32768, 32, 2, 1024, 4096,
+    128, 128, 1, 16, 0, false,
+    true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }, false>;
+#[cfg(test)]
+pub(crate) type RealR10000Cache = CpuCache<32768, 64, 1, 512, 32768, 32, 1, 1024, 4096,
+    1048576, 128, 8192, 131072, 262144, true,
+    true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }, false>;
+
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
@@ -5578,15 +5595,6 @@ mod tests {
     /// then puts it in RAM.
     #[test]
     fn a_cache_with_tc_off_holds_data_until_written_back() {
-        type HoldingR4400 = CpuCache<16384, 16, 1, 1024, 16384, 16, 1, 1024, 2048,
-            1048576, 128, 8192, 131072, 262144, true,
-            false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }, false>;
-        type HoldingR5000 = CpuCache<32768, 32, 2, 1024, 32768, 32, 2, 1024, 4096,
-            128, 128, 1, 16, 0, false,
-            true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }, false>;
-        type HoldingR10000 = CpuCache<32768, 64, 1, 512, 32768, 32, 1, 1024, 4096,
-            1048576, 128, 8192, 131072, 262144, true,
-            true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }, false>;
         let mem = Arc::new(Memory::new(MEM_MB));
         let check = |name: &str, writeback: &dyn Fn(), write: &dyn Fn(u64, u32), read: &dyn Fn(u64, u32) -> u32| {
             let pa = 0x4040u32;
@@ -5596,15 +5604,15 @@ mod tests {
             writeback();
             assert_eq!(mem_read(&mem, pa), 0x1234_5678, "{name}: writeback_all left it in the cache");
         };
-        let r10k: HoldingR10000 = make_cache_of(mem.clone());
+        let r10k: RealR10000Cache = make_cache_of(mem.clone());
         check("R10000", &|| r10k.writeback_all(),
             &|va, v| { let _ = r10k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r10k.read::<4>(va, pa as u64).data as u32);
-        let r5k: HoldingR5000 = make_cache_of(mem.clone());
+        let r5k: RealR5000Cache = make_cache_of(mem.clone());
         check("R5000", &|| r5k.writeback_all(),
             &|va, v| { let _ = r5k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r5k.read::<4>(va, pa as u64).data as u32);
-        let r4k: HoldingR4400 = make_cache_of(mem.clone());
+        let r4k: RealR4400Cache = make_cache_of(mem.clone());
         check("R4400", &|| r4k.writeback_all(),
             &|va, v| { let _ = r4k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
             &|va, pa| r4k.read::<4>(va, pa as u64).data as u32);
@@ -5843,10 +5851,9 @@ mod tests {
     /// written against `R4400Cache` passes whether the bug is present or not.
     /// It did, until that was noticed.
     #[test]
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn index_store_tag_discards_the_line_instead_of_writing_it_back() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache: R5000Cache = make_cache_of::<R5000Cache>(mem.clone());
+        let cache: RealR5000Cache = make_cache_of(mem.clone());
 
         let phys: u32 = 0x7000;
         let virt = kseg0(phys);
@@ -5929,12 +5936,7 @@ mod tests {
     /// words it was filled with, and Hit_Writeback(I) puts them back after
     /// memory has changed under it. Hit_Writeback(I) was a no-op, so `icache2`
     /// reported `Cache err: … Actual:0xffffffff` on every word.
-    ///
-    /// Not under tcache: there a cached store goes straight to RAM, so the
-    /// I-cache fill already sees the new words — the same trade
-    /// `cache/hit_inv_discards` makes.
     #[test]
-    #[cfg(not(feature = "tcache"))]
     fn icache_hit_writeback_restores_the_words_it_was_filled_with() {
         fn check<C: MipsCache + From<Arc<dyn BusDevice>>>(name: &str) {
             let mem = Arc::new(Memory::new(MEM_MB));
@@ -5966,8 +5968,8 @@ mod tests {
                            "{name}: word {i} is not what the I-cache was filled with");
             }
         }
-        check::<R4400Cache>("R4400");
-        check::<R5000Cache>("R5000");
+        check::<RealR4400Cache>("R4400");
+        check::<RealR5000Cache>("R5000");
     }
 
     /// A snapshot carries I-cache tags but not the words, so a restore must
@@ -6175,10 +6177,10 @@ mod tests {
 
     /// Index_Load_Tag(SD) on ordinary data loads the computed data ECC.
     #[test]
-    #[cfg(all(feature = "cache-ecc", not(feature = "tcache")))]
+    #[cfg(feature = "cache-ecc")]
     fn index_load_tag_returns_the_data_ecc() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
         let phys: u32 = 0xd000;
         let va = kseg0(phys);
         mem_write(&mem, phys, 0x1234_5678);
@@ -6467,14 +6469,9 @@ mod tests {
     /// `writeback(Some(virt), phys, size)`: dirty lines in range land in memory
     /// and are no longer reported dirty; nothing outside the range is touched.
     #[test]
-    // tcache writes through to RAM, so "memory is still stale until an explicit
-    // writeback" — the property this test asserts — is false by construction.
-    // The test still describes the real cache correctly; it simply does not
-    // apply when the cache holds no data.
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn writeback_virt_range_flushes_dirty_lines() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
 
         let base: u32 = 0x1000;
         // Two full L1D lines (16 bytes each) inside the range, one word in a
@@ -6518,14 +6515,9 @@ mod tests {
     /// `writeback(None, phys, size)`: without a virtual address, the phys-only
     /// path must still find the dirty line via VIPT alias scanning and flush it.
     #[test]
-    // tcache writes through to RAM, so "memory is still stale until an explicit
-    // writeback" — the property this test asserts — is false by construction.
-    // The test still describes the real cache correctly; it simply does not
-    // apply when the cache holds no data.
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn writeback_phys_only_finds_line_via_alias_scan() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
 
         let phys: u32 = 0x2040;
         let virt = kseg0(phys);
@@ -6541,14 +6533,9 @@ mod tests {
     /// `writeback` must also flush a dirty L2 line that has no matching L1D
     /// line anymore (L1D already wrote through to L2 and was invalidated).
     #[test]
-    // tcache writes through to RAM, so "memory is still stale until an explicit
-    // writeback" — the property this test asserts — is false by construction.
-    // The test still describes the real cache correctly; it simply does not
-    // apply when the cache holds no data.
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
     fn writeback_flushes_dirty_l2_line() {
         let mem = Arc::new(Memory::new(MEM_MB));
-        let cache = make_cache(mem.clone());
+        let cache: RealR4400Cache = make_cache_of(mem.clone());
 
         let phys: u32 = 0x3000;
         let virt = kseg0(phys);
@@ -6626,7 +6613,8 @@ mod tcache_tests {
     /// evictions.
     #[test]
     fn transparent_and_real_cache_agree() {
-        let (bank_a, _sa, real) = setup(false);
+        let bank_a = Arc::new(PpMemory::new(BANK_MB));
+        let real = RealR4400Cache::new(bank_a.clone() as Arc<dyn BusDevice>);
         let (bank_b, _sb, tc) = setup(true);
 
         // The bank's own addressing is offset-based; the cache sees physical
@@ -6697,22 +6685,16 @@ mod tcache_tests {
     /// every tcache test above builds an `R4400Cache`.
     #[test]
     fn r5000_transparent_and_real_cache_agree() {
-        fn setup_r5k(transparent: bool) -> (Arc<PpMemory>, PpMemSpace, R5000Cache) {
-            let bank = Arc::new(PpMemory::new(BANK_MB));
-            let space = PpMemSpace::over(std::slice::from_ref(&*bank)).expect("window");
-            space.map_bank(0, BASE, REGION, REGION).expect("map");
-            let cache = R5000Cache::new(bank.clone() as Arc<dyn BusDevice>);
-            if transparent {
-                unsafe {
-                    cache.set_tcache_window_impl(space.window_base());
-                    space.set_bitmap_sink2(cache.tc_bitmap_ptr());
-                }
-            }
-            (bank, space, cache)
+        let bank_a = Arc::new(PpMemory::new(BANK_MB));
+        let real = RealR5000Cache::new(bank_a.clone() as Arc<dyn BusDevice>);
+        let bank_b = Arc::new(PpMemory::new(BANK_MB));
+        let space = PpMemSpace::over(std::slice::from_ref(&*bank_b)).expect("window");
+        space.map_bank(0, BASE, REGION, REGION).expect("map");
+        let tc = R5000Cache::new(bank_b.clone() as Arc<dyn BusDevice>);
+        unsafe {
+            tc.set_tcache_window_impl(space.window_base());
+            space.set_bitmap_sink2(tc.tc_bitmap_ptr());
         }
-
-        let (bank_a, _sa, real) = setup_r5k(false);
-        let (bank_b, _sb, tc) = setup_r5k(true);
 
         let mut seed = Rng(0x0F1E_2D3C_4B5A_6978);
         for i in 0..4096u32 {
@@ -7217,7 +7199,8 @@ mod tcache_tests {
         assert_ne!(space.mapped_bitmap(), 0);
     }
 
-    /// With no window set, tcache is inert and every access is a real one.
+    /// With no window set, the transparent path is never taken: every
+    /// access goes to the bus, still writing through.
     #[test]
     fn inert_without_a_window() {
         let (_b, _s, tc) = setup(false);
