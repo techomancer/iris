@@ -329,7 +329,9 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         true
     }
 
-    /// Push a batch token followed by its payload words, as one atomic unit.
+    /// Try to push a batch token followed by its payload words as one atomic
+    /// unit. Returns `false` without changing the queue when the producer lock
+    /// is held or there is not room for the complete token and payload.
     ///
     /// The token carries the count; the `vals.len()` entries after it carry the
     /// data, and the consumer streams them into `ctx.hostrw[]`. Payload entries
@@ -340,46 +342,45 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     /// so this is all-or-nothing in the same way `try_push2` is: the DMA worker
     /// has no EXEC_RETRY, and a partial commit followed by a retry would
     /// duplicate the prefix.
-    ///
-    /// Blocks rather than reporting busy. The batch may be larger than the
-    /// queue, so "wait for room" is the only workable contract; callers are the
-    /// DMA worker, which has nothing better to do, never the CPU store path.
-    pub fn push_batch(&self, token: u32, count_val: u64, vals: &[u64]) {
+    pub fn try_push_batch(&self, token: u32, count_val: u64, vals: &[u64]) -> bool {
         let need = vals.len() + 1;
         assert!(need < DEPTH, "batch of {} exceeds GFIFO capacity", vals.len());
-        loop {
-            if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                spin_loop();
-                continue;
-            }
-            let tail = self.tail.load(Ordering::Relaxed);
+        if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        let tail = self.tail.load(Ordering::Relaxed);
+        let room = |head: usize| head.wrapping_sub(tail).wrapping_sub(1) & Self::MASK;
+        if room(self.shadow_head.get()) < need {
             let head = self.slowest_head(tail);
             self.shadow_head.set(head);
-            // Free slots, keeping the one-empty-slot invariant the ring uses to
-            // distinguish full from empty.
-            let used = tail.wrapping_sub(head) & Self::MASK;
-            let free = Self::MASK - used;
-            if free < need {
-                // Not enough room yet — drop the lock so the consumer can drain.
+            if room(head) < need {
                 self.lock.store(false, Ordering::Release);
-                spin_loop();
-                continue;
+                return false;
             }
-            // SAFETY: we hold the lock and have verified capacity for all
-            // `need` slots; no other producer touches them.
-            unsafe {
-                self.slot(tail).write(token, count_val);
-                let mut idx = tail;
-                for &v in vals {
-                    idx = idx.wrapping_add(1) & Self::MASK;
-                    self.slot(idx).write(GFIFO_PAYLOAD, v);
-                }
+        }
+        // SAFETY: we hold the lock and have verified capacity for all `need`
+        // slots; no other producer touches them.
+        unsafe {
+            self.slot(tail).write(token, count_val);
+            let mut idx = tail;
+            for &v in vals {
+                idx = idx.wrapping_add(1) & Self::MASK;
+                self.slot(idx).write(GFIFO_PAYLOAD, v);
             }
-            let new_tail = tail.wrapping_add(need) & Self::MASK;
-            // One Release publishes the token and every payload slot.
-            self.tail.store(new_tail, Ordering::Release);
-            self.lock.store(false, Ordering::Release);
-            return;
+        }
+        let new_tail = tail.wrapping_add(need) & Self::MASK;
+        // One Release publishes the token and every payload slot.
+        self.tail.store(new_tail, Ordering::Release);
+        self.lock.store(false, Ordering::Release);
+        true
+    }
+
+    /// Push a batch token followed by its payload words, waiting until the
+    /// complete batch fits. Callers that can report back-pressure should use
+    /// [`try_push_batch`](Self::try_push_batch) instead.
+    pub fn push_batch(&self, token: u32, count_val: u64, vals: &[u64]) {
+        while !self.try_push_batch(token, count_val, vals) {
+            spin_loop();
         }
     }
 
@@ -815,6 +816,114 @@ mod tests {
             assert_eq!(out, [1, 2, 3]);
             assert_eq!(f.peek_at(h), None);
         }
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn resident_batch_backpressure_is_all_or_nothing_across_wrap() {
+        let f: Box<GFifo<8>> = Box::new(GFifo::new());
+        for i in 0..5 {
+            assert!(f.try_push(i, i as u64));
+        }
+        let before = (0..5).map(|i| f.peek_nth_at(0, i)).collect::<Vec<_>>();
+        assert!(
+            !f.try_push_batch(0x42, 2, &[0xaa, 0xbb]),
+            "three entries cannot fit in the two free slots"
+        );
+        assert_eq!(f.len(), 5);
+        assert_eq!(
+            (0..5).map(|i| f.peek_nth_at(0, i)).collect::<Vec<_>>(),
+            before,
+            "a refused batch must not publish a token or payload prefix"
+        );
+
+        f.consume_n_at(0, 4);
+        f.flush_head();
+        let payload = [0x10, 0x20, 0x30, 0x40];
+        assert!(f.try_push_batch(0x42, payload.len() as u64, &payload));
+        assert_eq!(f.peek(), Some((4, 4)));
+        f.consume();
+        assert_eq!(f.peek(), Some((0x42, payload.len() as u64)));
+        let mut out = [0; 4];
+        assert_eq!(f.drain_payload(payload.len(), &mut out), payload.len());
+        f.consume();
+        assert_eq!(out, payload);
+        assert!(f.is_empty(), "the wrapped retry must retire exactly once");
+    }
+
+    #[test]
+    fn resident_gfifo_interleaved_producers_preserve_atomic_batches() {
+        use std::sync::{Arc, Barrier};
+
+        const SCALAR: u32 = 0x5100;
+        const BATCH: u32 = 0xb100;
+        const RUNS: usize = 2048;
+
+        let f = Arc::new(GFifo::<64>::new());
+        let start = Arc::new(Barrier::new(3));
+        let scalar_fifo = Arc::clone(&f);
+        let scalar_start = Arc::clone(&start);
+        let scalar = std::thread::spawn(move || {
+            scalar_start.wait();
+            for index in 0..RUNS {
+                while !scalar_fifo.try_push(SCALAR, index as u64) {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+        let batch_fifo = Arc::clone(&f);
+        let batch_start = Arc::clone(&start);
+        let batch = std::thread::spawn(move || {
+            batch_start.wait();
+            for index in 0..RUNS {
+                let base = (index as u64) << 8;
+                let payload = [base, base | 1, base | 2];
+                while !batch_fifo.try_push_batch(BATCH, payload.len() as u64, &payload) {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        start.wait();
+        let mut scalars = vec![false; RUNS];
+        let mut batches = vec![false; RUNS];
+        let (mut scalar_count, mut batch_count) = (0, 0);
+        while scalar_count < RUNS || batch_count < RUNS {
+            match f.peek() {
+                Some((SCALAR, value)) => {
+                    let index = value as usize;
+                    assert!(index < RUNS && !scalars[index]);
+                    scalars[index] = true;
+                    scalar_count += 1;
+                    f.consume();
+                }
+                Some((BATCH, 3)) => {
+                    let mut payload = [0; 3];
+                    assert_eq!(f.drain_payload(payload.len(), &mut payload), payload.len());
+                    f.consume();
+                    let index = (payload[0] >> 8) as usize;
+                    assert!(index < RUNS && !batches[index]);
+                    assert_eq!(
+                        payload,
+                        [
+                            (index as u64) << 8,
+                            ((index as u64) << 8) | 1,
+                            ((index as u64) << 8) | 2,
+                        ]
+                    );
+                    batches[index] = true;
+                    batch_count += 1;
+                }
+                Some((addr, value)) => {
+                    panic!("interleaved stream contained {addr:#x}={value:#x}");
+                }
+                None => std::thread::yield_now(),
+            }
+        }
+        scalar.join().unwrap();
+        batch.join().unwrap();
+        assert!(scalars.into_iter().all(|seen| seen));
+        assert!(batches.into_iter().all(|seen| seen));
         assert!(f.is_empty());
     }
 

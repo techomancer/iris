@@ -66,7 +66,7 @@ function Invoke-ResidentTests {
 }
 
 try {
-    Invoke-ResidentTests 'resident_' 25 $false
+    Invoke-ResidentTests 'resident_' 28 $false
     Invoke-ResidentTests 'dev::ng1::rex3_flat_fill::tests' 4 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::line::tests' 2 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::host::tests' 2 $false

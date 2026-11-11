@@ -14,7 +14,7 @@ use crate::dev::ng1::rex3::{
     DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_SMASK0, GFIFO_DISP_SYNC, HOSTRW_BUF_QWORDS, REX3_BASE, REX3_CLIPMODE, REX3_COLORALPHA,
     REX3_COLORBLUE, REX3_COLORGRN, REX3_COLORRED, REX3_COORD_BIAS, REX3_DRAWMODE0,
-    REX3_DRAWMODE1, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
+    REX3_DRAWMODE1, REX3_HOSTRW0, REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
 };
 use crate::dev::ng1::rex3_generic::{draw_with_fb, fline_setup, Framebuffers};
 use crate::dev::ng1::rex3_shape;
@@ -3003,6 +3003,101 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             &expected_aux,
             "HostW complete auxiliary plane",
         );
+        drop(resident);
+
+        let wrap_rgb = seeded_plane(0x721c_4da9);
+        let wrap_aux = seeded_plane(0x8de3_b256);
+        let mut wrap_expected_rgb = wrap_rgb.clone();
+        let mut wrap_expected_aux = wrap_aux.clone();
+        let mut wrapping = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &wrap_rgb,
+            &wrap_aux,
+            3,
+            NonZeroUsize::new(2).unwrap(),
+            None,
+        )
+        .expect("activate bounded HostW staging");
+
+        let mut run_records = |resident: &mut ResidentGpu, first: usize, count: usize| {
+            for index in first..first + count {
+                let x = 900 + (index % 10) as i32;
+                let y = 520 + (index / 10) as i32;
+                let mut actual = context(
+                    DRAWMODE1_PLANES_RGB,
+                    true,
+                    false,
+                    (x, y),
+                    (x, y),
+                    u32::MAX,
+                    0,
+                );
+                actual.drawmode0.0 |= 1 << 6;
+                actual.drawmode1.0 |= (1 << 7) | (3 << 8);
+                actual.host_len = 1;
+                actual.host_cursor = 0;
+                actual.hostcnt = 0;
+                actual.host_shifter = 0;
+                actual.hostrw[0] =
+                    ((0xff00_0000 | (index as u32).wrapping_mul(0x0013_579b)) as u64) << 32;
+                assert_eq!(
+                    prepare_host_fill(&actual).expect("prepare wrapping HostW").payload_qwords(),
+                    1
+                );
+                let mut expected = actual;
+                resident.enqueue(&mut actual).expect("enqueue wrapping HostW");
+                cpu_host_draw(
+                    &mut expected,
+                    &mut wrap_expected_rgb,
+                    &mut wrap_expected_aux,
+                );
+                assert_context_eq(&actual, &expected, "wrapping HostW");
+            }
+        };
+
+        wrapping.payload = PayloadBatch::new(4);
+        run_records(&mut wrapping, 0, 9);
+        let payload_boundary = wrapping.status().unwrap();
+        assert_eq!(payload_boundary.accepted.sequence, Sequence(9));
+        assert_eq!(payload_boundary.submitted.sequence, Sequence(8));
+        wrapping.submit().unwrap();
+
+        wrapping.payload = PayloadBatch::new(MAX_PAYLOAD_WORDS);
+        run_records(&mut wrapping, 9, 10);
+        let state_boundary = wrapping.status().unwrap();
+        assert_eq!(state_boundary.accepted.sequence, Sequence(19));
+        assert_eq!(state_boundary.submitted.sequence, Sequence(18));
+        wrapping.submit().unwrap();
+        gpu.wait(None).unwrap();
+        let wrapped_status = wrapping.status().unwrap();
+        assert_eq!(wrapped_status.submitted, wrapped_status.accepted);
+        assert_eq!(wrapped_status.completed, Some(wrapped_status.submitted));
+        assert_eq!(
+            (
+                wrapped_status.host_write_transfers,
+                wrapped_status.host_write_qwords,
+            ),
+            (19, 19)
+        );
+        assert_eq!(wrapping.batch.sets(), 2);
+        assert!(
+            wrapping.batch.flushes >= 9,
+            "payload and state boundaries must repeatedly reuse bounded sets"
+        );
+        let wrapped = wrapping
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe wrapped HostW staging");
+        compare_observed(
+            wrapped.rgb().unwrap(),
+            &wrap_expected_rgb,
+            "wrapped HostW RGB",
+        );
+        compare_observed(
+            wrapped.aux().unwrap(),
+            &wrap_expected_aux,
+            "wrapped HostW auxiliary",
+        );
+        drop(wrapping);
 
         let board_rgb = seeded_plane(0x3e91_7ac4);
         let board_aux = seeded_plane(0xc16e_853b);
@@ -3098,6 +3193,77 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             assert!(board_backend.serial_host_batch);
         }
 
+        resident_board.0.start();
+        cpu_board.0.start();
+        let host_addr = (REX3_BASE | 0x0800 | REX3_HOSTRW0) as u64;
+        let enqueue_record =
+            |rex: &Rex3, transfer: &Rex3Context, start: (i32, i32), end: (i32, i32),
+             words: &[u64], bulk: bool| {
+                write_reg(rex, REX3_DRAWMODE1, transfer.drawmode1.0, false);
+                write_reg(rex, REX3_WRMASK, transfer.wrmask, false);
+                write_reg(rex, REX3_CLIPMODE, transfer.clipmode, false);
+                write_reg(rex, REX3_XYSTARTI, xy(start.0, start.1), false);
+                write_reg(rex, REX3_XYENDI, xy(end.0, end.1), false);
+                write_reg(rex, REX3_DRAWMODE0, transfer.drawmode0.0, false);
+                loop {
+                    let status = if bulk {
+                        rex.dma_write64_bulk(host_addr, words)
+                    } else {
+                        assert_eq!(words.len(), 1);
+                        rex.write64(host_addr, words[0])
+                    };
+                    match status {
+                        BUS_OK => break,
+                        BUS_BUSY => std::thread::yield_now(),
+                        status => panic!("HostW producer failed: {status:#x}"),
+                    }
+                }
+            };
+        let mut interleaved_qwords = 0u64;
+        for index in 0..24 {
+            let bulk = index & 1 != 0;
+            let start = (260 + (index % 8) * 5, 180 + (index / 8) * 5);
+            let end = if bulk {
+                (start.0 + 1, start.1 + 1)
+            } else {
+                start
+            };
+            let mut transfer = context(
+                DRAWMODE1_PLANES_RGB,
+                true,
+                false,
+                start,
+                end,
+                u32::MAX,
+                0,
+            );
+            transfer.drawmode0.0 |= 1 << 6;
+            transfer.drawmode1.0 |= (1 << 7) | (3 << 8);
+            let words = if bulk {
+                vec![
+                    0xff00_0000_0000_0000 | (index as u64 * 0x0001_0011_0101_1011),
+                    0x8040_2010_0000_0000 | (index as u64 * 0x0000_1101_0011_0101),
+                ]
+            } else {
+                vec![0xff00_0000_0000_0000 | (index as u64 * 0x0001_0101_0011_1011)]
+            };
+            for board in [&resident_board, &cpu_board] {
+                enqueue_record(&board.0, &transfer, start, end, &words, bulk);
+            }
+            interleaved_qwords += words.len() as u64;
+        }
+        resident_board
+            .0
+            .wait_resident_idle()
+            .expect("submit interleaved HostW producers");
+        cpu_board.0.wait_idle();
+        gpu.wait(None).unwrap();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "interleaved PIO and VDMA HostW",
+        );
+
         let mut board_backend = board_resident.lock();
         let board_observed = board_backend
             .observe(ObservationReason::Validation, PlaneMask::Both)
@@ -3113,13 +3279,13 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             "board HostW auxiliary",
         );
         let board_status = board_backend.status().unwrap();
-        assert_eq!(board_status.accepted.sequence, Sequence(2));
+        assert_eq!(board_status.accepted.sequence, Sequence(26));
         assert_eq!(
             (
                 board_status.host_write_transfers,
                 board_status.host_write_qwords
             ),
-            (2, 4)
+            (26, 4 + interleaved_qwords)
         );
         gpu.check().unwrap();
     });

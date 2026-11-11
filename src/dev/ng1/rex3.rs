@@ -3153,11 +3153,12 @@ impl Rex3 {
         true
     }
 
-    /// Push a batch token plus its payload words through the GFIFO.
+    /// Try to push a batch token plus its payload words through the GFIFO.
     ///
-    /// See `GFifo::push_batch`. Wakes a parked consumer the same way
-    /// `gfifo_push` does.
-    fn gfifo_push_batch(&self, token: u32, vals: &[u64]) {
+    /// See `GFifo::try_push_batch`. Wakes a parked consumer after a successful
+    /// reservation and otherwise leaves the queue unchanged.
+    #[must_use]
+    fn gfifo_try_push_batch(&self, token: u32, vals: &[u64]) -> bool {
         #[cfg(feature = "developer")]
         {
             let len = self.gfifo.len() + vals.len() + 1;
@@ -3165,12 +3166,15 @@ impl Rex3 {
                 if len > hwm { Some(len) } else { None }
             });
         }
-        self.gfifo.push_batch(token, vals.len() as u64, vals);
+        if !self.gfifo.try_push_batch(token, vals.len() as u64, vals) {
+            return false;
+        }
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
             }
         }
+        true
     }
 
     fn wait_gfifo_idle(&self) {
@@ -5261,8 +5265,8 @@ impl Rex3 {
     /// shader once over the whole run.
     ///
     /// Replaces N `gfifo_push(REX3_HOSTRW64)` round trips with one token. The
-    /// payload is copied into `host_buf` **before** the token is pushed, so the
-    /// consumer never observes a token pointing at a half-written buffer.
+    /// token and every payload entry are published together, so the consumer
+    /// never observes a token pointing at a partial transfer.
     ///
     /// All-or-nothing, as the trait requires: the capacity check and the single
     /// token push both happen before anything is consumed, so a refusal leaves
@@ -5287,7 +5291,9 @@ impl Rex3 {
         // (rather than writing the array behind the queue's back) is what makes
         // the transfer ordered correctly against concurrent CPU register writes
         // — the words arrive in the stream at the point the producer put them.
-        self.gfifo_push_batch(REX3_DMA_BATCH_W, vals);
+        if !self.gfifo_try_push_batch(REX3_DMA_BATCH_W, vals) {
+            return BUS_BUSY;
+        }
         BUS_OK
     }
 

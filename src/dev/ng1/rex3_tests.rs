@@ -8023,6 +8023,48 @@ fn test_gfifo_back_to_back_batches_stay_separate() {
     }).expect("spawn").join().expect("test thread panicked");
 }
 
+#[test]
+fn resident_dma_bulk_busy_is_all_or_nothing() {
+    let rex = &make_rex3_unstarted();
+    let _reset = FifoResetGuard(rex);
+    let queued = GFIFO_DEPTH - 4;
+    for index in 0..queued {
+        assert!(rex.gfifo.try_push(REX3_WRMASK, index as u64));
+    }
+    let words = [0x1020_3040_5060_7080, 0x90a0_b0c0_d0e0_f000, 0x55aa_33cc_77ee_11dd];
+    assert_eq!(rex.gfifo.len(), queued);
+    assert_eq!(
+        rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+        BUS_BUSY
+    );
+    assert_eq!(
+        rex.gfifo.len(),
+        queued,
+        "BUS_BUSY must not publish a token or payload prefix"
+    );
+    assert_eq!(rex.gfifo.peek_nth_at(0, queued), None);
+
+    rex.gfifo.consume_n_at(0, queued);
+    rex.gfifo.flush_head();
+    assert!(rex.gfifo.is_empty());
+    assert_eq!(
+        rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+        BUS_OK
+    );
+    assert_eq!(
+        rex.gfifo.peek(),
+        Some((REX3_DMA_BATCH_W, words.len() as u64))
+    );
+    let mut actual = [0; 3];
+    assert_eq!(
+        rex.gfifo.drain_payload(words.len(), &mut actual),
+        words.len()
+    );
+    rex.gfifo.consume();
+    assert_eq!(actual, words);
+    assert!(rex.gfifo.is_empty(), "the successful retry must land once");
+}
+
 /// `drain_payload` must return exactly the promised count, even when the
 /// producer is still publishing and `tail` is sampled mid-batch.
 ///
