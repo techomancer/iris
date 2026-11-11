@@ -101,7 +101,7 @@ use parking_lot::Mutex;
 use pipe::Core;
 use regs::{classify, Access};
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Relaxed, SeqCst}};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::{Relaxed, SeqCst}};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -295,17 +295,7 @@ impl Kona {
         let display: Arc<dyn crate::gfx_display::GfxDisplay> = backend.display();
         let mut front = Front::new(&cfg);
         front.probe_value = cfg.probe;
-        let host = Arc::new(Host {
-            front: Mutex::new(front),
-            irq,
-            mem,
-            unrouted: Default::default(),
-            held_words: Default::default(),
-            reasons_waiting: Default::default(),
-            list_running: Default::default(),
-            activity: Default::default(),
-            video_acks: Default::default(),
-        });
+        let host = Arc::new(Host::new(front, irq, mem));
         // SAFETY: a zeroed GFifo is an empty one (`GFifo::new`); built in
         // place because the ring is too big for the stack.
         let ring: Box<Ring> = unsafe { Box::new_zeroed().assume_init() };
@@ -547,7 +537,13 @@ impl Kona {
     /// control register, which host software fills with its interrupt
     /// target. A machine's DMA handle may choose the destination with it.
     pub fn dma_widget(&self) -> u32 {
-        (self.shared.host.front.lock().widget_control >> 22) & 0xf
+        self.shared.host.dma_widget.load(Relaxed) as u32
+    }
+
+    /// The same widget as a handle the machine's DMA path keeps, so a DMA
+    /// word does not take the register file's lock to learn where it goes.
+    pub fn dma_widget_handle(&self) -> Arc<AtomicU8> {
+        self.shared.host.dma_widget.clone()
     }
 
     /// Why the pipe stopped taking commands, if it did.

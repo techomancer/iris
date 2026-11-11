@@ -16,11 +16,15 @@ use super::defs::*;
 use super::ident::{self, Identity, KonaConfig};
 use crate::devlog::LogModule;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Arc;
 
 pub(super) struct Front {
-    pub widget_control: u32,
+    widget_control: u32,
+    /// Bits 25:22 of `widget_control`, where the pipe's DMA and interrupt
+    /// packets go. Kept beside the register so the DMA path reads it without
+    /// the register file's lock; every change to the register republishes it.
+    dma_widget: Arc<AtomicU8>,
     /// What it resets to: the host widget in bits 25:22 (the model's choice).
     widget_control_reset: u32,
     pub identity: Identity,
@@ -59,10 +63,16 @@ pub(super) struct Front {
     epoch: u64,
 }
 
+/// The host widget field of the widget control register.
+fn widget_of(widget_control: u32) -> u8 {
+    ((widget_control >> 22) & 0xf) as u8
+}
+
 impl Front {
     pub fn new(cfg: &KonaConfig) -> Self {
         Front {
             widget_control: cfg.widget_control_reset(),
+            dma_widget: Arc::new(AtomicU8::new(widget_of(cfg.widget_control_reset()))),
             widget_control_reset: cfg.widget_control_reset(),
             identity: Identity::new(cfg),
             onewire_reg: 0,
@@ -90,13 +100,29 @@ impl Front {
         }
     }
 
+    /// The widget the pipe's DMA and interrupt packets go to, shared with the
+    /// DMA path.
+    pub fn dma_widget_handle(&self) -> Arc<AtomicU8> {
+        self.dma_widget.clone()
+    }
+
+    fn set_widget_control(&mut self, value: u32) {
+        self.widget_control = value;
+        self.publish_widget();
+    }
+
+    fn publish_widget(&self) {
+        self.dma_widget.store(widget_of(self.widget_control), Relaxed);
+    }
+
     /// The registers, as the stream module reads and writes them. The configuration
     /// (the widget's reset value, the probe) and the epoch are the board's, not the
     /// guest's, and stay. The identity chain's state goes as the text its own save makes.
     pub fn visit<S: super::stream::Stream>(&mut self, s: &mut S) {
         // Every field is named, so a new one fails to compile until it is saved here or left out on purpose.
-        let Self { widget_control: _, widget_control_reset: _, identity: _, onewire_reg: _, probe_value: _, low_window_write: _, int_dest_upper: _, int_dest_lower: _, int_vectors: _, reset_arg: _, int_enable: _, credit_config: _, int_cause: _, mailbox: _, mailbox_len: _, mailbox_pos: _, completions: _, retrace_tag: _, reset_strobe: _, eeprom_enable: _, loader_3b0: _, loader_328: _, video_delivered: _, video_unrouted_logged: _, epoch: _ } = self;
+        let Self { widget_control: _, dma_widget: _, widget_control_reset: _, identity: _, onewire_reg: _, probe_value: _, low_window_write: _, int_dest_upper: _, int_dest_lower: _, int_vectors: _, reset_arg: _, int_enable: _, credit_config: _, int_cause: _, mailbox: _, mailbox_len: _, mailbox_pos: _, completions: _, retrace_tag: _, reset_strobe: _, eeprom_enable: _, loader_3b0: _, loader_328: _, video_delivered: _, video_unrouted_logged: _, epoch: _ } = self;
         s.u32(&mut self.widget_control);
+        self.publish_widget();
         let mut bus = self.identity.bus.save_state().to_string();
         s.string(&mut bus);
         if s.loading() {
@@ -141,7 +167,7 @@ impl Front {
     /// Power-on state. The identity chain and the probe value are the
     /// board's, not the driver's, and stay.
     pub fn reset(&mut self) {
-        self.widget_control = self.widget_control_reset;
+        self.set_widget_control(self.widget_control_reset);
         self.onewire_reg = 0;
         self.low_window_write = 0;
         self.int_dest_upper = 0;
@@ -335,7 +361,7 @@ impl Front {
     pub fn write(&mut self, off: u32, value: u32, idle: bool, packet: &mut Option<InterruptPacket>) -> bool {
         match off {
             // Unknown control fields are stored without interpreted effects.
-            WIDGET_CONTROL => self.widget_control = value,
+            WIDGET_CONTROL => self.set_widget_control(value),
             ONEWIRE | NIC => self.onewire_reg = self.identity.write(value),
             LOW_WINDOW_WRITE => self.low_window_write = value,
             INT_DEST_UPPER => self.int_dest_upper = value,
@@ -451,9 +477,27 @@ pub(super) struct Host {
     /// Writes of the activity register's bit 0 (the kernel's once-per-video-interrupt
     /// acknowledgement of the status bit; nothing reads it back).
     pub video_acks: AtomicU64,
+    /// `Front::dma_widget`, read by the DMA path and `deliver` without the
+    /// register file's lock.
+    pub dma_widget: Arc<AtomicU8>,
 }
 
 impl Host {
+    pub fn new(front: Front, irq: Arc<dyn InterruptController>, mem: Arc<dyn BusDevice>) -> Self {
+        Host {
+            dma_widget: front.dma_widget_handle(),
+            front: Mutex::new(front),
+            irq,
+            mem,
+            unrouted: Default::default(),
+            held_words: Default::default(),
+            reasons_waiting: Default::default(),
+            list_running: Default::default(),
+            activity: Default::default(),
+            video_acks: Default::default(),
+        }
+    }
+
     /// Run `f` on the register file, then send the packet it returns, with
     /// the lock dropped.
     pub fn with_front<R>(&self, f: impl FnOnce(&mut Front) -> (R, Option<InterruptPacket>)) -> R {
@@ -467,7 +511,7 @@ impl Host {
     /// Send `p` to the interrupt controller, with no board lock held. A packet
     /// for a widget other than the host's is counted, and logged once.
     pub fn deliver(&self, p: InterruptPacket) {
-        let host_widget = ((self.front.lock().widget_control >> 22) & 0xf) as u8;
+        let host_widget = self.dma_widget.load(Relaxed);
         if p.widget == host_widget {
             self.irq.set_line(p.vector as u32, true);
         } else if self.unrouted.fetch_add(1, Relaxed) == 0 {

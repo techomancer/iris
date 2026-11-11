@@ -573,6 +573,26 @@ fn the_dma_widget_is_a_field_of_widget_control() {
     assert_eq!(f.kona.dma_widget(), 3);
 }
 
+/// The handle a machine's DMA path keeps follows every change to the
+/// register: a store, a reset, and a snapshot restore.
+#[test]
+fn the_dma_widget_handle_follows_the_register() {
+    let f = Fixture::new();
+    let handle = f.kona.dma_widget_handle();
+    assert_eq!(handle.load(std::sync::atomic::Ordering::Relaxed), 9);
+    f.w(WIDGET_CONTROL, 5 << 22);
+    assert_eq!(handle.load(std::sync::atomic::Ordering::Relaxed), 5);
+    let dir = crate::test_temp::TempPath::dir("kona-widget-handle");
+    let cs = crate::chunk_store::ChunkStore::new(dir.join("saves"));
+    let saved = f.kona.save_chunks(&cs).unwrap();
+    f.w(WIDGET_CONTROL, 2 << 22);
+    assert_eq!(handle.load(std::sync::atomic::Ordering::Relaxed), 2);
+    f.kona.load_chunks(&cs, &saved).unwrap();
+    assert_eq!(handle.load(std::sync::atomic::Ordering::Relaxed), 5);
+    f.kona.power_on();
+    assert_eq!(handle.load(std::sync::atomic::Ordering::Relaxed), 9);
+}
+
 /// The widget control register resets to the host widget in bits 25:22, so a
 /// pipe's DMA has a destination before software programs it (the model's
 /// choice; the power-on value is unknown).
