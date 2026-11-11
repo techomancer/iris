@@ -475,7 +475,8 @@ pub(super) struct Host {
     /// file's lock.
     pub activity: AtomicBool,
     /// Writes of the activity register's bit 0 (the kernel's once-per-video-interrupt
-    /// acknowledgement of the status bit; nothing reads it back).
+    /// acknowledgement of the status bit; nothing reads it back, so only a test counts it).
+    #[cfg(test)]
     pub video_acks: AtomicU64,
     /// `Front::dma_widget`, read by the DMA path and `deliver` without the
     /// register file's lock.
@@ -494,6 +495,7 @@ impl Host {
             reasons_waiting: Default::default(),
             list_running: Default::default(),
             activity: Default::default(),
+            #[cfg(test)]
             video_acks: Default::default(),
         }
     }

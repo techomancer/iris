@@ -214,11 +214,11 @@ mod tests {
     use crate::dev::kona::back::store::{DID_PLANE, POPUP_PLANE};
     use crate::dev::kona::back::KonaBackend;
     use crate::dev::kona::KonaConfig;
-    use crate::dev::kona::tests::ScratchDir;
+    use crate::test_temp::TempPath;
 
     /// A chunk store's directory that goes with the test, however it ends.
-    fn dir(tag: &str) -> ScratchDir {
-        ScratchDir::new(&format!("snap-{tag}"))
+    fn dir(tag: &str) -> TempPath {
+        TempPath::dir(&format!("kona-snap-{tag}"))
     }
 
     fn board() -> KonaBackend {
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn a_saved_store_restores_into_a_fresh_board_and_saves_the_same() {
         let d = dir("round");
-        let cs = ChunkStore::new(d.path());
+        let cs = ChunkStore::new(&*d);
         let mut a = drawn();
         let first = a.save_chunks(&cs).unwrap();
         let mut b = board();
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn zero_chunks_are_not_stored() {
         let d = dir("zero");
-        let cs = ChunkStore::new(d.path());
+        let cs = ChunkStore::new(&*d);
         let mut a = drawn();
         let list = a.save_chunks(&cs).unwrap();
         let popup = list.iter().find(|c| c.name == format!("pixel-{POPUP_PLANE}")).unwrap();
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn a_bad_snapshot_leaves_the_board_alone() {
         let d = dir("bad");
-        let cs = ChunkStore::new(d.path());
+        let cs = ChunkStore::new(&*d);
         let mut a = drawn();
         let list = a.save_chunks(&cs).unwrap();
         let mut b = board();
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn the_cursor_memory_is_restored() {
         let d = dir("cursor");
-        let cs = ChunkStore::new(d.path());
+        let cs = ChunkStore::new(&*d);
         let mut a = board();
         {
             let mut t = a.tables.lock();
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn texture_memory_is_restored_by_page() {
         let d = dir("texture");
-        let cs = ChunkStore::new(d.path());
+        let cs = ChunkStore::new(&*d);
         let mut a = board();
         let t = a.store.texture();
         assert!(t.ex().set(2, 0, 0xff01_0203) && t.ex().set(2, 69_999, 0xff0a_0b0c) && t.ex().set(5, 17, 7));
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn texture_planes_from_a_snapshot_are_checked() {
         let d = dir("texture-planes");
-        let cs = ChunkStore::new(d.path());
+        let cs = ChunkStore::new(&*d);
         let mut a = board();
         assert!(a.store.texture().ex().set(1, 0, 1));
         let list = a.save_chunks(&cs).unwrap();
@@ -358,7 +358,7 @@ mod tests {
     fn the_manifest_keeps_the_boards_chunks_alive() {
         use crate::snapshot::ChunksManifest;
         let d = dir("gc");
-        let cs = ChunkStore::new(d.path());
+        let cs = ChunkStore::new(&*d);
         let mut a = drawn();
         let list = a.save_chunks(&cs).unwrap();
         let orphan = cs.put(b"nothing refers to this").unwrap();

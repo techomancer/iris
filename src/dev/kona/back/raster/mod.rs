@@ -35,6 +35,9 @@
 //! - the order of the fragment operations, the blend and dither arithmetic and
 //!   the line and point shapes are the model's own, not read from the board.
 
+// Every unsafe block in the per-fragment code says why it is sound.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod fog;
 pub mod multisample;
 pub mod ops;

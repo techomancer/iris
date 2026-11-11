@@ -9,6 +9,7 @@
 //! indirect port at internal 0x87ff00.
 
 use super::*;
+use crate::test_temp::TempPath;
 
 const PORT_ADDR: u64 = 0x8003e8;
 const PORT_DATA: u64 = 0x8003f0;
@@ -363,7 +364,7 @@ fn a_slot_store_drops_a_partial_operation() {
 /// file, and a new board over the file reads it.
 #[test]
 fn a_flash_file_outlasts_the_board() {
-    let dir = ScratchDir::new("eeprom-flash");
+    let dir = TempPath::dir("kona-eeprom-flash");
     let path = dir.join("flash.bin");
     std::fs::write(&path, vec![0u8; crate::dev::kona::FLASH_SIZE]).unwrap();
     let open = || std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
@@ -389,7 +390,7 @@ fn a_flash_file_outlasts_the_board() {
 #[test]
 fn a_snapshot_that_does_not_parse_leaves_the_board_and_its_flash_file_alone() {
     use crate::dev::kona::back::snapshot::put_bytes;
-    let dir = ScratchDir::new("eeprom-snapshot");
+    let dir = TempPath::dir("kona-eeprom-snapshot");
     let file = |name: &str| {
         let path = dir.join(name);
         std::fs::write(&path, vec![0u8; crate::dev::kona::FLASH_SIZE]).unwrap();

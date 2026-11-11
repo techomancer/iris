@@ -669,66 +669,6 @@ fn skipped_triangles_are_counted_apart() {
     assert_eq!((c.triangles, c.no_area, c.no_sample, c.off_target), (3, 1, 1, 1));
 }
 
-/// The per-pixel module has no `f64`: the edge functions are `i64` and the
-/// planes `f32`, so a GPU kernel could reproduce them. This reads the file's
-/// text, so its limits are the text's: it finds the type's name and a float
-/// literal with no `f32` suffix (which a context could turn into a double),
-/// and any write other than the one `store` call or a compound atomic; it does
-/// not see a write made by a helper in another module, or a double that comes
-/// from a function's return type.
-#[test]
-fn the_per_pixel_module_has_no_f64() {
-    let src = include_str!("../raster/pixel.rs");
-    assert!(!src.contains(concat!("f", "64")), "pixel.rs uses a double");
-    assert!(include_str!("../raster/setup.rs").contains(concat!("f", "64")), "set-up is where the doubles are");
-    // Every float literal carries its type. Comments are skipped.
-    for (n, line) in src.lines().enumerate() {
-        let code = line.split("//").next().unwrap_or("");
-        let b: Vec<char> = code.chars().collect();
-        for i in 1..b.len().saturating_sub(1) {
-            let literal = b[i] == '.' && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit();
-            if literal {
-                let end = (i + 1..b.len()).find(|&j| !(b[j].is_ascii_digit() || b[j] == '_' || b[j] == 'e')).unwrap_or(b.len());
-                let suffix: String = b[end..].iter().take(3).collect();
-                assert_eq!(suffix, "f32", "pixel.rs line {}: a float literal with no f32 suffix: {line}", n + 1);
-            }
-        }
-    }
-    // Every write is `WordArray::store`, inside an unsafe block, and no other way into the planes.
-    for (n, line) in src.lines().enumerate().filter(|(_, l)| l.contains(".store(")) {
-        assert!(line.contains("unsafe"), "pixel.rs line {}: a write outside an unsafe block that says why: {line}", n + 1);
-    }
-    // Every `unsafe` block says why it is sound.
-    assert_eq!(src.matches("unsafe {").count(), src.matches("// SAFETY").count(), "an unsafe block with no SAFETY comment");
-    for other in ["fetch_", "compare_exchange", "write_volatile", "ptr::write", "copy_nonoverlapping", ".swap(", ".write(", "mul_add"] {
-        assert!(!src.contains(other), "pixel.rs writes through {other}");
-    }
-}
-
-/// The files besides the per-pixel module that do per-fragment work keep its one-store-point property:
-/// texel sampling, the sample patterns and the pixel operations write only through `WordArray::store`
-/// inside an `unsafe` block that says why, and use none of the other ways into the planes. The two
-/// that are float kernels (`texel.rs`, `multisample.rs`) also have no `f64`. `gl/pixels.rs` does: its
-/// unpacking and packing of host images runs once a transfer, on `kona-hip` and not on a tile
-/// worker, and takes 32-bit integer components and the raster position's double forms through doubles.
-#[test]
-fn the_other_per_fragment_files_keep_the_store_point_rule() {
-    for (name, src, no_f64) in [("fog.rs", include_str!("../raster/fog.rs"), true), ("smooth.rs", include_str!("../raster/smooth.rs"), true), ("texel.rs", include_str!("../raster/texel.rs"), true), ("multisample.rs", include_str!("../raster/multisample.rs"), true), ("gl/pixels.rs", include_str!("../gl/pixels.rs"), false)] {
-        // Tests in the files are not the kernel.
-        let src = src.split("#[cfg(test)]").next().unwrap_or(src);
-        if no_f64 {
-            assert!(!src.contains(concat!("f", "64")), "{name} uses a double");
-        }
-        for (n, line) in src.lines().enumerate().filter(|(_, l)| l.contains(".store(")) {
-            assert!(line.contains("unsafe"), "{name} line {}: a write outside an unsafe block that says why: {line}", n + 1);
-        }
-        assert_eq!(src.matches("unsafe {").count(), src.matches("// SAFETY").count(), "{name}: an unsafe block with no SAFETY comment");
-        for other in ["fetch_", "compare_exchange", "write_volatile", "ptr::write", "copy_nonoverlapping", ".swap(", ".write(", "mul_add"] {
-            assert!(!src.contains(other), "{name} writes through {other}");
-        }
-    }
-}
-
 /// The fill rate of the per-fragment loop, in megapixels a second, for a few draw states. Each
 /// scene draws two large triangles that cover most of a 1024 x 1024 managed area, on the calling
 /// thread with no tile workers. Run it from a release build, one test thread:

@@ -135,53 +135,6 @@ pub(in crate::dev::kona) fn test_cfg() -> KonaConfig {
     KonaConfig { host_widget: 9, ..KonaConfig::default() }
 }
 
-/// A directory under the host's temp directory for a test to write files in, removed when this is
-/// dropped, whether the test passed or panicked: a `remove_dir_all` at the end of a test is skipped
-/// by the first failed assert, and a directory with a flash image in it is half a megabyte.
-pub(in crate::dev::kona) struct ScratchDir(std::path::PathBuf);
-
-impl ScratchDir {
-    /// A new, empty directory named for `tag`, this process and a counter, so tests that run at
-    /// once do not share one.
-    pub fn new(tag: &str) -> ScratchDir {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("iris-kona-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        ScratchDir(path)
-    }
-
-    pub fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-
-    pub fn join(&self, name: &str) -> std::path::PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A test that panics takes its directory with it, which is the point of the guard.
-#[test]
-fn a_scratch_dir_is_removed_when_its_test_panics() {
-    let seen = Mutex::new(None);
-    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let dir = ScratchDir::new("panics");
-        std::fs::write(dir.join("file"), b"left behind").unwrap();
-        *seen.lock() = Some(dir.path().to_path_buf());
-        panic!("a failed assert, made on purpose");
-    }));
-    assert!(ended.is_err());
-    let path = seen.lock().take().expect("the directory was made");
-    assert!(!path.exists(), "{} outlived the panic", path.display());
-}
-
 pub(in crate::dev::kona) const RAM: usize = 16 << 20;
 
 impl TestHost {

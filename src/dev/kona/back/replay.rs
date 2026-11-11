@@ -18,12 +18,14 @@
 //! `KONA_SHOT_DIR`, when set, keeps the frame the desktop test composes there as
 //! `irix-desktop-ours.png`, to look at beside the capture.
 //!
-//! The recordings are not in the repository. `KONA_RECORDINGS` names the
-//! directory that holds them; without it, or when it is not readable (as in a
-//! build container without the storage), the tests that need them skip, with a
-//! line on stderr that says so.
+//! The recordings are not in the repository, so the tests that need them are
+//! ignored. `KONA_RECORDINGS` names the directory that holds them (and
+//! `KONA_GL_RECORDING` and `KONA_QUAKE_RECORDING` the two large streams); run
+//! the built test binary on a host that has them with `--ignored`. An ignored
+//! test run without its recording fails.
 
-use crate::dev::kona::tests::{ScratchDir, TestHost};
+use crate::dev::kona::tests::TestHost;
+use crate::test_temp::TempPath;
 use super::super::defs::{ACTIVITY, CAUSE_VIDEO, CREDIT, INT_CAUSE, PROBE};
 use super::super::ident::{KonaConfig, Product};
 use super::super::Kona;
@@ -212,29 +214,24 @@ impl Recording {
     }
 }
 
-/// The directory the recordings are in, if the environment names one that
-/// exists. Prints why a test is skipping when not.
-pub(super) fn recordings_dir() -> Option<std::path::PathBuf> {
+/// The directory the recordings are in. The tests that need them are ignored by
+/// default (they are not in the repository, and a build container cannot see their
+/// storage): run the built test binary on a host that has them, with
+/// `KONA_RECORDINGS` set and `--ignored`. Asking for it without them fails.
+pub(super) fn recordings_dir() -> std::path::PathBuf {
     match std::env::var_os("KONA_RECORDINGS") {
-        Some(d) if std::path::Path::new(&d).is_dir() => Some(d.into()),
-        Some(d) => {
-            skip_note(&format!("KONA_RECORDINGS={d:?} is not a readable directory here"));
-            None
-        }
-        None => {
-            skip_note("KONA_RECORDINGS is not set");
-            None
-        }
+        Some(d) if std::path::Path::new(&d).is_dir() => d.into(),
+        Some(d) => panic!("KONA_RECORDINGS={d:?} is not a readable directory here"),
+        None => panic!("KONA_RECORDINGS is not set"),
     }
 }
 
-/// One line saying a replay test is skipping, written to stderr directly so the
-/// test harness's capture does not hide it. A build container that cannot see
-/// the recordings' storage skips this way: run the built test binary on the
-/// host with `KONA_RECORDINGS` set to run them.
-fn skip_note(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "kona replay test skipped: {why}; the recordings are not readable from here (run the test binary on a host that has them)");
+/// The recording `var` names, for the ignored tests that replay a whole GL or game stream.
+fn recording_env(var: &str) -> std::path::PathBuf {
+    match std::env::var_os(var) {
+        Some(p) => p.into(),
+        None => panic!("{var} is not set"),
+    }
 }
 
 /// Builds the machine side of a replay: a test host that serves the board's reads
@@ -711,8 +708,8 @@ pub(super) fn gl_resume(path: &std::path::Path, splits: &[usize], checks: &[usiz
         Ok((Kona::new(KonaConfig { probe: probe.unwrap_or(0), ..cfg.clone() }, host.clone(), host.clone(), crate::dev::kona::tests::test_status(), None)?, host))
     };
     let (a, a_host) = make()?;
-    let saves = ScratchDir::new("gl-resume");
-    let cs = crate::chunk_store::ChunkStore::new(saves.path());
+    let saves = TempPath::dir("kona-gl-resume");
+    let cs = crate::chunk_store::ChunkStore::new(&*saves);
     let mut seconds: Vec<Arc<Kona>> = Vec::new();
     let (mut taken, mut done) = (Vec::new(), Vec::new());
     let mut stream = open()?;
@@ -1202,13 +1199,10 @@ mod tests {
     /// The recordings, when KONA_RECORDINGS names them. The PROM stream uses
     /// the register aperture only; the IRIX stream adds DMA, contexts and
     /// the GL grammar.
-    fn replay_file(name: &str) -> Option<(Recording, Report, Census)> {
-        let dir = recordings_dir()?;
+    fn replay_file(name: &str) -> (Recording, Report, Census) {
+        let dir = recordings_dir();
         let path = dir.join(name);
-        if !path.exists() {
-            eprintln!("skipping: {} is not there", path.display());
-            return None;
-        }
+        assert!(path.exists(), "{} is not there", path.display());
         let rec = Recording::parse(&std::fs::read(&path).unwrap()).unwrap();
         let (rep, census) = replay(&rec).unwrap();
         eprintln!("{name}\n{}", rep.render());
@@ -1216,7 +1210,7 @@ mod tests {
         if let Some(before) = &census.before_long_drop {
             eprintln!("\n=== the same census up to record {}, where the front end could no longer size the stream ===\n{}", rep.exact_until, before.render());
         }
-        Some((rec, rep, census))
+        (rec, rep, census)
     }
 
     /// The PROM stream drawn into the store, to its end. The hash is the
@@ -1225,13 +1219,11 @@ mod tests {
     /// the capture. Reset markers clear the store, so this is the last
     /// screen the console drew.
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_prom_recording_draws_into_the_store() {
-        let Some(dir) = recordings_dir() else { return };
+        let dir = recordings_dir();
         let path = dir.join("onyx2-deskside-prom.kona.rec");
-        if !path.exists() {
-            eprintln!("skipping: {} is not there", path.display());
-            return;
-        }
+        assert!(path.exists(), "{} is not there", path.display());
         let rec = Recording::parse(&std::fs::read(&path).unwrap()).unwrap();
         let (status, hash) = replay_drawing(&rec, None).unwrap();
         eprintln!("{status}\nstore hash {hash}");
@@ -1248,13 +1240,11 @@ mod tests {
     /// pixels. The whole stream, which only a back end can frame, is
     /// `the_irix_recording_replays_into_the_back_end`.
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_irix_recording_draws_into_the_store_over_its_exact_window() {
-        let Some(dir) = recordings_dir() else { return };
+        let dir = recordings_dir();
         let path = dir.join("onyx2-deskside-irix-4dwm.kona.rec");
-        if !path.exists() {
-            eprintln!("skipping: {} is not there", path.display());
-            return;
-        }
+        assert!(path.exists(), "{} is not there", path.display());
         let rec = Recording::parse(&std::fs::read(&path).unwrap()).unwrap();
         let (status, hash) = replay_drawing(&rec, Some(IRIX_EXACT_RECORDS)).unwrap();
         eprintln!("{status}\nstore hash {hash}");
@@ -1265,19 +1255,16 @@ mod tests {
     /// rest, ends with the store and the chunks the uninterrupted board ends with. Chunks of a
     /// saved board that is loaded and saved again are identical.
     fn resumed_from_a_snapshot(name: &str, splits: &[usize]) {
-        let Some(dir) = recordings_dir() else { return };
+        let dir = recordings_dir();
         let path = dir.join(name);
-        if !path.exists() {
-            eprintln!("skipping: {} is not there", path.display());
-            return;
-        }
+        assert!(path.exists(), "{} is not there", path.display());
         let rec = Recording::parse(&std::fs::read(&path).unwrap()).unwrap();
         let whole = replay_board(&rec, None).unwrap();
         let want = monitor(&whole, &["hash"]).unwrap();
         for &split in splits {
             let mut split = split.min(rec.records.len());
-            let saves = ScratchDir::new(&format!("replay-snap-{split}"));
-            let cs = crate::chunk_store::ChunkStore::new(saves.path());
+            let saves = TempPath::dir(&format!("kona-replay-snap-{split}"));
+            let cs = crate::chunk_store::ChunkStore::new(&*saves);
             // A snapshot is refused in the middle of a command; take the next record that is not.
             let (first, saved) = loop {
                 let first = replay_board(&rec, Some(split)).unwrap();
@@ -1299,11 +1286,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_prom_replay_resumed_from_a_snapshot_reaches_the_same_frame() {
         resumed_from_a_snapshot("onyx2-deskside-prom.kona.rec", &[1000, 20_000, 40_000]);
     }
 
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_irix_replay_resumed_from_a_snapshot_reaches_the_same_store() {
         resumed_from_a_snapshot("onyx2-deskside-irix-4dwm.kona.rec", &[IRIX_EXACT_RECORDS / 2, IRIX_EXACT_RECORDS]);
     }
@@ -1314,11 +1303,9 @@ mod tests {
     /// inside atlantis (a multisampled window with a texture), ivview and tex_cube. Slow: the file is replayed once
     /// with up to four boards.
     #[test]
+    #[ignore = "needs KONA_GL_RECORDING: cargo test -- --ignored"]
     fn the_gl_replay_resumed_from_snapshots_ends_the_same() {
-        let Some(path) = std::env::var_os("KONA_GL_RECORDING").map(std::path::PathBuf::from) else {
-            eprintln!("skipping: set KONA_GL_RECORDING to the GL demo recording");
-            return;
-        };
+        let path = recording_env("KONA_GL_RECORDING");
         // The boards are compared once all three exist (tex_cube's), at its start, at its end and at the recording's.
         let (taken, checks) = gl_resume(&path, &[33_586_058 + 1_000_000, 65_508_173 + 500_000, 71_263_133 + 10_000], &[71_273_200, 71_283_374, 71_292_000]).unwrap();
         eprintln!("snapshots at {taken:?}; checks {checks:?}");
@@ -1332,11 +1319,9 @@ mod tests {
     /// matrices the demos read back every frame) and line-limit queries, against what this board writes. The recorder
     /// is a model of the same board, so agreement is a behaviour match and not a claim about the hardware.
     #[test]
+    #[ignore = "needs KONA_GL_RECORDING: cargo test -- --ignored"]
     fn the_gl_demo_query_replies_match_the_recording() {
-        let Some(path) = std::env::var_os("KONA_GL_RECORDING").map(std::path::PathBuf::from) else {
-            eprintln!("skipping: set KONA_GL_RECORDING to the GL demo recording");
-            return;
-        };
+        let path = recording_env("KONA_GL_RECORDING");
         let mut replies = Replies::default();
         census_spans_replies(&path, Behind::Real, Some(&mut replies)).unwrap();
         // The replies of the three query kinds, by size: current values (52 bytes), a matrix (64) and the line limits (128).
@@ -1388,16 +1373,14 @@ mod tests {
     /// evidence). It catches a layout, placement or colour-map
     /// disagreement to look into; it is not a claim about the hardware's pixels.
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_prom_frame_matches_its_capture_within_a_tolerance() {
-        let Some(dir) = recordings_dir() else { return };
+        let dir = recordings_dir();
         let (rec_path, png_path) = (dir.join("onyx2-deskside-prom.kona.rec"), dir.join("onyx2-deskside-prom-graphics-console.png"));
-        if !rec_path.exists() || !png_path.exists() {
-            eprintln!("skipping: the PROM recording or its capture is not in {}", dir.display());
-            return;
-        }
+        assert!(rec_path.exists() && png_path.exists(), "the PROM recording or its capture is not in {}", dir.display());
         let rec = Recording::parse(&std::fs::read(&rec_path).unwrap()).unwrap();
         let kona = replay_board(&rec, None).unwrap();
-        let shots = ScratchDir::new("prom-shot");
+        let shots = TempPath::dir("kona-prom-shot");
         let shot = shots.join("shot.png");
         let said = monitor(&kona, &["shot", shot.to_str().unwrap()]).unwrap();
         assert!(said.contains("1280 x 1024"), "{said}");
@@ -1413,15 +1396,13 @@ mod tests {
     /// once the board runs, a frame request is answered at a retrace with the
     /// frame in the screen's buffer, which matches the capture as the shot does.
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn a_frame_request_on_the_running_board_returns_the_prom_frame() {
         use crate::gfx_display::GfxDisplay;
         use crate::traits::Device;
-        let Some(dir) = recordings_dir() else { return };
+        let dir = recordings_dir();
         let (rec_path, png_path) = (dir.join("onyx2-deskside-prom.kona.rec"), dir.join("onyx2-deskside-prom-graphics-console.png"));
-        if !rec_path.exists() || !png_path.exists() {
-            eprintln!("skipping: the PROM recording or its capture is not in {}", dir.display());
-            return;
-        }
+        assert!(rec_path.exists() && png_path.exists(), "the PROM recording or its capture is not in {}", dir.display());
         let rec = Recording::parse(&std::fs::read(&rec_path).unwrap()).unwrap();
         let (kona, display) = replay_board_with_display(&rec, None).unwrap();
         kona.start();
@@ -1452,15 +1433,12 @@ mod tests {
 
     /// The IRIX recording replayed whole into the drawing back end, with the
     /// board's board built from its `C` record.
-    fn replay_irix_into_the_back_end() -> Option<(Report, Census, Arc<Kona>)> {
-        let dir = recordings_dir()?;
+    fn replay_irix_into_the_back_end() -> (Report, Census, Arc<Kona>) {
+        let dir = recordings_dir();
         let path = dir.join("onyx2-deskside-irix-4dwm.kona.rec");
-        if !path.exists() {
-            eprintln!("skipping: {} is not there", path.display());
-            return None;
-        }
+        assert!(path.exists(), "{} is not there", path.display());
         let rec = Recording::parse(&std::fs::read(&path).unwrap()).unwrap();
-        Some(replay_into(&rec, Behind::Real).unwrap())
+        replay_into(&rec, Behind::Real).unwrap()
     }
 
     /// The video Get replies the IRIX recording holds.
@@ -1475,8 +1453,9 @@ mod tests {
     /// are approximations of one board, so that agreement is a behaviour match
     /// and not a statement about the hardware's pixels.
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_irix_recording_replays_into_the_back_end() {
-        let Some((rep, census, kona)) = replay_irix_into_the_back_end() else { return };
+        let (rep, census, kona) = replay_irix_into_the_back_end();
         eprintln!("{}", rep.render());
         let status = monitor(&kona, &["status"]).unwrap();
         eprintln!("{status}");
@@ -1525,15 +1504,13 @@ mod tests {
     /// entry). The glyph cursor is enabled at the end of the stream, but neither this shot nor
     /// the capture shows one, so none is compared.
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_irix_desktop_frame_matches_its_capture_within_a_tolerance() {
-        let Some(dir) = recordings_dir() else { return };
+        let dir = recordings_dir();
         let png_path = dir.join("onyx2-deskside-irix-4dwm-desktop.png");
-        if !png_path.exists() {
-            eprintln!("skipping: {} is not there", png_path.display());
-            return;
-        }
-        let Some((_, _, kona)) = replay_irix_into_the_back_end() else { return };
-        let shots = ScratchDir::new("irix-shot");
+        assert!(png_path.exists(), "{} is not there", png_path.display());
+        let (_, _, kona) = replay_irix_into_the_back_end();
+        let shots = TempPath::dir("kona-irix-shot");
         let shot = shots.join("shot.png");
         monitor(&kona, &["shot", shot.to_str().unwrap()]).unwrap();
         let (ours, theirs) = (decode_png(&shot), decode_png(&png_path));
@@ -1566,8 +1543,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_prom_recording_replays() {
-        let Some((rec, rep, ..)) = replay_file("onyx2-deskside-prom.kona.rec") else { return };
+        let (rec, rep, ..) = replay_file("onyx2-deskside-prom.kona.rec");
         assert_eq!(rec.end, Some(rec.records.len() as u64 + 1));
         assert!(rep.failure.is_none(), "{}", rep.render());
         assert!(rep.load_mismatches.is_empty(), "{}", rep.render());
@@ -1576,8 +1554,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs KONA_RECORDINGS: cargo test -- --ignored"]
     fn the_irix_recording_replays() {
-        let Some((rec, rep, census)) = replay_file("onyx2-deskside-irix-4dwm.kona.rec") else { return };
+        let (rec, rep, census) = replay_file("onyx2-deskside-irix-4dwm.kona.rec");
         assert_eq!(rec.end, Some(rec.records.len() as u64 + 1));
         assert!(rep.failure.is_none(), "{}", rep.render());
         // Exact as far as the front end can frame the stream alone: every
@@ -1604,11 +1583,9 @@ mod tests {
     /// minute or two in a debug build). Prints each demo's span; asserts that
     /// the marks are there and that GL commands reached the back end.
     #[test]
+    #[ignore = "needs KONA_GL_RECORDING: cargo test -- --ignored"]
     fn the_gl_demo_recording_is_censused() {
-        let Some(path) = std::env::var_os("KONA_GL_RECORDING").map(std::path::PathBuf::from) else {
-            eprintln!("skipping: set KONA_GL_RECORDING to the GL demo recording");
-            return;
-        };
+        let path = recording_env("KONA_GL_RECORDING");
         let spans = census_spans(&path).unwrap();
         let marks: Vec<u32> = spans.iter().map(|s| s.mark).collect();
         for m in [210, 220, 230] {
@@ -1627,11 +1604,9 @@ mod tests {
     /// sends, what the path does not take. Prints each demo's span. The
     /// recording is a gigabyte (a few minutes in a debug build).
     #[test]
+    #[ignore = "needs KONA_GL_RECORDING: cargo test -- --ignored"]
     fn the_gl_demo_recording_is_censused_through_the_gl_path() {
-        let Some(path) = std::env::var_os("KONA_GL_RECORDING").map(std::path::PathBuf::from) else {
-            eprintln!("skipping: set KONA_GL_RECORDING to the GL demo recording");
-            return;
-        };
+        let path = recording_env("KONA_GL_RECORDING");
         let cfg = KonaConfig::default();
         let spans = census_spans_into(&path, Behind::Real).unwrap();
         for sp in spans.iter().filter(|s| [210, 220, 230].contains(&s.mark)) {
@@ -1651,11 +1626,9 @@ mod tests {
     /// so a long run must not fill the product's memory (`back::store::texture`). The recording is four
     /// gigabytes (several minutes in a release build).
     #[test]
+    #[ignore = "needs KONA_QUAKE_RECORDING: cargo test -- --ignored"]
     fn the_quake_recording_keeps_texture_memory_in_bounds() {
-        let Some(path) = std::env::var_os("KONA_QUAKE_RECORDING").map(std::path::PathBuf::from) else {
-            eprintln!("skipping: set KONA_QUAKE_RECORDING to the Quake recording");
-            return;
-        };
+        let path = recording_env("KONA_QUAKE_RECORDING");
         let spans = census_spans_into(&path, Behind::Real).unwrap();
         // The "textures" line reads "... {E} past memory), {F} finishes, {G} binds ({H} of volumes, {I} refused) ...".
         let past_of = |text: &str| -> u64 { text.lines().find(|l| l.starts_with("textures")).and_then(|l| l.split(" past memory").next()).and_then(|l| l.split_whitespace().last()).and_then(|t| t.parse().ok()).unwrap_or(0) };

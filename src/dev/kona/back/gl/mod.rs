@@ -152,9 +152,13 @@ pub struct GlCounts {
     /// Vertices outside a vertex command's begin, which draw nothing.
     pub stray: u64,
     /// With `census` on: each vertex's place against the window, once.
+    #[cfg(test)]
     pub behind: u64,
+    #[cfg(test)]
     pub outside_volume: u64,
+    #[cfg(test)]
     pub outside_window: u64,
+    #[cfg(test)]
     pub inside: u64,
 }
 

@@ -45,11 +45,6 @@ pub trait Stream {
         self.u32(&mut x);
         *v = x as i32;
     }
-    fn i64(&mut self, v: &mut i64) {
-        let mut x = *v as u64;
-        self.u64(&mut x);
-        *v = x as i64;
-    }
     fn f32(&mut self, v: &mut f32) {
         let mut x = v.to_bits();
         self.u32(&mut x);

@@ -540,7 +540,8 @@ impl KonaBackend {
         writeln!(w, "commands          {}", g.commands)?;
         writeln!(w, "begins by mode    {:?} (points, lines, loop, strip, triangles, tri strip, fan, quads, quad strip, polygon)", g.begins)?;
         writeln!(w, "vertices          {} in {} primitives; {} outside a begin", g.vertices, g.primitives, g.stray)?;
-        writeln!(w, "vertex census     {} inside the window, {} outside it, {} outside the volume, {} behind the eye (counted only in tests)", g.inside, g.outside_window, g.outside_volume, g.behind)?;
+        #[cfg(test)]
+        writeln!(w, "vertex census     {} inside the window, {} outside it, {} outside the volume, {} behind the eye", g.inside, g.outside_window, g.outside_volume, g.behind)?;
         writeln!(w, "texcoord forms    1f {}, 2f {}, 2s {}, 3f {}, 4f {}", g.texcoord[0], g.texcoord[1], g.texcoord[2], g.texcoord[3], g.texcoord[4])?;
         writeln!(w, "clipping          {} clipped ({} away), {} culled, {} with no window position", g.clipped, g.clipped_away, g.culled, g.no_window_position)?;
         writeln!(w, "handed over       {} draws, {} triangles", self.raster.draws, self.raster.triangles)?;
