@@ -429,6 +429,7 @@ pub mod gl {
     pub const STACK_OVERFLOW: u32 = 0x503;
     pub const STACK_UNDERFLOW: u32 = 0x504;
     pub const CW: u32 = 0x900;
+    pub const CCW: u32 = 0x901;
     pub const CULL_FACE: u32 = 0xb44;
     pub const LIGHTING: u32 = 0xb50;
     pub const LIGHT_MODEL_LOCAL_VIEWER: u32 = 0xb51;
@@ -441,6 +442,7 @@ pub mod gl {
     pub const TEXTURE_2D: u32 = 0xde1;
     pub const TEXTURE_3D: u32 = 0x806f;
     pub const FLAT: u32 = 0x1d00;
+    pub const SMOOTH: u32 = 0x1d01;
     pub const COLOR_BUFFER_BIT: u32 = 0x4000;
     /// Light n is `LIGHT0 + n`.
     pub const LIGHT0: u32 = 0x4000;
