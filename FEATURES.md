@@ -447,6 +447,7 @@ O2 and Octane only; on the Octane it sits in a slot of an `[[xio_board]]`.
 |---|---|---|
 | `nvme.path` | none | Disk image for the namespace (raw or CHD, at most 2 TiB). The card is present when this is set. |
 | `nvme.overlay` | `false` | Copy-on-write: writes go to `PATH.overlay`, as for `[scsi.N]`. |
+| `nvme.write_cache` | `true` | The volatile write cache the disk powers up with, as `write_cache` for `[scsi.N]`. On, a write is acknowledged once the disk layer has it and synced within about 5 s; off, each write is stored first. Flush and FUA always store. The guest can change it with Set Features. |
 | `nvme.bridge` | `false` | Put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
 | `nvme.board` | `0` | Octane: which `[[xio_board]]` table holds the card, counting from 0. Refused on the O2. |
 | `nvme.slot` | first free | Octane: the board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). Refused on the O2. |
@@ -582,7 +583,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--validate` | Check the configuration (parse, settings, files, directories, ports) without starting the machine; exit 0 or 1. See [HELP.md](HELP.md#checking-a-configuration). |
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
-| `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `[scsi.N]`): slower, but a host crash loses no completed write. |
+| `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `[scsi.N]` and in `[nvme]`): slower, but a host crash loses no completed write. |
 | `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`.  |
 | `--graphics` | Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel). |
 | `--raster` | VPro and IMPACT: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |

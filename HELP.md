@@ -815,7 +815,7 @@ Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
   --cdrom4/5/6 <FILE>         CD-ROM primary disc at that SCSI ID
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
-  --no-write-cache            Turn every hard disk's write cache off (write_cache = false): slower, but a host crash loses no completed write
+  --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 
 Display and audio

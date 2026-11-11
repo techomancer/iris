@@ -96,6 +96,7 @@ pub mod feature {
     pub const POWER_MANAGEMENT: u8 = 0x02;
     pub const TEMPERATURE_THRESHOLD: u8 = 0x04;
     pub const ERROR_RECOVERY: u8 = 0x05;
+    pub const VOLATILE_WRITE_CACHE: u8 = 0x06;
     pub const NUMBER_OF_QUEUES: u8 = 0x07;
     pub const INTERRUPT_COALESCING: u8 = 0x08;
     pub const INTERRUPT_VECTOR_CONFIG: u8 = 0x09;

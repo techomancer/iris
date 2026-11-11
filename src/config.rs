@@ -605,7 +605,7 @@ pub const OCTANE_XIO_SLOTS: [u8; 4] = [10, 12, 9, 11];
 
 /// `[nvme]`: an NVM Express card in the O2's PCI option slot or in a slot of
 /// an Octane's `[[xio_board]]`. See `docs/nvme.md`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NvmeConfig {
     /// The namespace's disk image (raw or CHD). Empty: no card.
     #[serde(default)]
@@ -625,6 +625,21 @@ pub struct NvmeConfig {
     /// first free one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u8>,
+    /// The namespace's volatile write cache, as `[scsi.N] write_cache`: `true`
+    /// (the default) reports one, so a plain write completes once the host
+    /// has it, Flush and a write with FUA store what came before them, and a
+    /// background sync follows about 5 s after a write. A host crash or power
+    /// loss can lose that much. `false` stores every write on the host's disk
+    /// before the command completes; it is slower. A guest can change it with
+    /// Set Features. STORAGE.md says what each setting loses.
+    #[serde(default = "default_write_cache")]
+    pub write_cache: bool,
+}
+
+impl Default for NvmeConfig {
+    fn default() -> Self {
+        Self { path: String::new(), overlay: false, bridge: false, board: None, slot: None, write_cache: true }
+    }
 }
 
 impl NvmeConfig {
@@ -3761,7 +3776,7 @@ pub struct Cli {
     pub scsi7: Option<String>,
 
     /// Report every hard disk's write cache off (`write_cache = false` in each
-    /// `[scsi.N]`): every write is stored on the host's disk before the guest
+    /// `[scsi.N]` and in `[nvme]`): every write is stored on the host's disk before the guest
     /// is told it is done, as on the drives SGI shipped. Slower. The default
     /// is a write cache, which can lose about 5 s of writes in a host crash
     /// (see STORAGE.md)
@@ -4041,6 +4056,7 @@ impl Cli {
             for dev in cfg.scsi.values_mut().filter(|d| !d.cdrom && d.kind() == ScsiKind::Disk) {
                 dev.write_cache = false;
             }
+            cfg.nvme.write_cache = false;
         }
 
         // Resolved by `MachineConfig::cpu_part` once the profile is final.
@@ -4429,6 +4445,21 @@ mod export_tests {
         assert!(on.scsi[&1].write_cache && on.scsi[&2].write_cache, "no flag, no change");
         let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
         assert!(!off.scsi[&1].write_cache && !off.scsi[&2].write_cache);
+        assert!(on.nvme.write_cache, "the NVMe default");
+        assert!(!off.nvme.write_cache, "NVMe too");
+    }
+
+    #[test]
+    fn nvme_write_cache_defaults_on_and_round_trips() {
+        let cfg: MachineConfig = toml::from_str("[nvme]\npath = \"a.raw\"\n").expect("parse");
+        assert!(cfg.nvme.write_cache, "the default");
+        assert!(NvmeConfig::default().write_cache, "the default in code");
+        let off: MachineConfig = toml::from_str("[nvme]\npath = \"a.raw\"\nwrite_cache = false\n").expect("parse");
+        assert!(!off.nvme.write_cache);
+        let s = toml::to_string_pretty(&off).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert!(!back.nvme.write_cache, "survives export:\n{s}");
+        assert!(NvmeConfig::default().is_default());
     }
 
     #[test]
