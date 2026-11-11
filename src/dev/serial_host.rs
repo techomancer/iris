@@ -562,7 +562,8 @@ pub fn serial_line(
 /// `serial_port_a` (nothing, if the port is taken), either teed to
 /// `serial_log`. The second port serves TCP on `serial_port_b`, teed to
 /// `serial_log_b`, or is `None` when nothing could serve it, so the caller
-/// leaves it unwired. Each also takes a Unix socket, `serial_socket_a` and
+/// leaves it unwired. In CI mode neither port is served on TCP, so several
+/// `--ci` instances coexist. Each also takes a Unix socket, `serial_socket_a` and
 /// `serial_socket_b`.
 pub fn console_backends(
     cfg: &MachineConfig,
@@ -588,7 +589,7 @@ pub fn console_backends(
     let (second, served) = serial_line(
         &SerialLine {
             label: &label,
-            tcp_port: Some(port_b),
+            tcp_port: ci.is_none().then_some(port_b),
             tcp_setting: "serial_port_b",
             socket: cfg.serial_socket_b.as_deref(),
             socket_setting: "serial_socket_b",
@@ -604,7 +605,8 @@ mod tests {
     use super::*;
 
     /// The console is the CI backend in CI mode and TCP otherwise, either
-    /// teed to the same fresh log, and the second port comes up on its own.
+    /// teed to the same fresh log, and the second port comes up on its own
+    /// outside CI mode only.
     #[test]
     fn the_console_is_ci_or_tcp_and_both_log_the_same_bytes() {
         let dir = std::env::temp_dir().join(format!("iris-serial-host-{}", std::process::id()));
@@ -621,9 +623,10 @@ mod tests {
         console.send_byte(b'c');
         assert_eq!(ci.drain_guest(), b"c");
         assert_eq!(std::fs::read(&log).unwrap(), b"c", "a fresh log, not the stale one");
-        assert!(second.is_some());
+        assert!(second.is_none(), "CI mode serves no TCP port, so the second port stays unwired");
 
-        let (console, _) = console_backends(&cfg, "Test", None);
+        let (console, second) = console_backends(&cfg, "Test", None);
+        assert!(second.is_some());
         console.send_byte(b't');
         assert_eq!(std::fs::read(&log).unwrap(), b"t");
         let _ = std::fs::remove_dir_all(&dir);
