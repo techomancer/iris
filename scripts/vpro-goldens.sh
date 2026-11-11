@@ -44,7 +44,7 @@ bless)
     cargo_test VPRO_GOLDEN_BLESS=1 -- odyssey::golden::bless --ignored --nocapture
     ;;
 replay)
-    cargo_test VPRO_REPLAY_REQUIRE=1 -- odyssey::golden::replay::recorded_sessions --nocapture
+    cargo_test -- odyssey::golden::replay::recorded_sessions --ignored --nocapture
     ;;
 replay-bless)
     cargo_test VPRO_REPLAY_BLESS=1 -- odyssey::golden::replay::replay_bless --ignored --nocapture

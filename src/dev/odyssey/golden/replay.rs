@@ -489,19 +489,17 @@ fn recordings() -> Vec<PathBuf> {
 /// to guest memory (the pixels the guest reads back) and leave the same
 /// board memory. The recordings are short guest test programs (vissweep
 /// cases, pixtest groups, cicopy); like the others they are not in git, and
-/// the test skips without them.
+/// the test is `#[ignore]`d and fails without them.
 #[cfg(feature = "wgpu")]
 #[test]
+#[ignore = "needs recordings in ignore/recordings/gpu-cases (or VPRO_PARITY_DIR); run with --ignored"]
 fn the_raster_units_agree_on_recorded_sessions() {
     let dir = std::env::var("VPRO_PARITY_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("ignore/recordings/gpu-cases"));
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "rec")).collect())
         .unwrap_or_default();
     files.sort();
-    if files.is_empty() {
-        eprintln!("SKIPPED: no recordings in {}", dir.display());
-        return;
-    }
+    assert!(!files.is_empty(), "no recordings in {}", dir.display());
     let mut bad = vec![];
     for f in &files {
         let recs = record::load(&f.to_string_lossy()).expect("a recording");
@@ -524,20 +522,17 @@ fn the_raster_units_agree_on_recorded_sessions() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
-/// With no recordings the test says so and passes, since they are not in the
-/// tree; `VPRO_REPLAY_REQUIRE=1` (the script's `replay`) makes that a failure.
+/// The recordings are not in the tree, so the test is `#[ignore]`d and a run
+/// that asks for it without them fails (the script's `replay` passes
+/// `--ignored`).
 #[test]
+#[ignore = "needs the recordings (see testdata/README.md); run with --ignored"]
 fn recorded_sessions_replay_to_their_checkpoints() {
     let files = match std::env::var("VPRO_REPLAY") {
         Ok(f) => vec![PathBuf::from(f)],
         Err(_) => recordings(),
     };
-    if files.is_empty() {
-        let msg = format!("no recordings in {}: see testdata/README.md", recordings_dir().display());
-        assert!(std::env::var("VPRO_REPLAY_REQUIRE").is_err(), "{msg}");
-        eprintln!("SKIPPED: {msg}");
-        return;
-    }
+    assert!(!files.is_empty(), "no recordings in {}: see testdata/README.md", recordings_dir().display());
     let png = std::env::var("VPRO_REPLAY_OUT").ok();
     let mut errs = vec![];
     for f in &files {

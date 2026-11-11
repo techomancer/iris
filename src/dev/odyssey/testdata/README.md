@@ -41,8 +41,9 @@ is a function in `golden/scenes.rs` and a line in its `scenes!` list.
 
 The recordings are large (tens of MB) and stay out of git, as IMPACT's `.rec`
 files do. They are found in `ignore/vpro-golden/` (git-ignored) or in
-`VPRO_REPLAY_DIR`. Without them the replay test prints SKIPPED and passes;
-`scripts/vpro-goldens.sh replay` fails instead.
+`VPRO_REPLAY_DIR`. Without them the replay test is `#[ignore]`d, so it shows
+as ignored in a normal run; `scripts/vpro-goldens.sh replay` runs it with
+`--ignored` and fails when they are missing.
 
 Record from power-on with `IRIS_ODSY_REC=<file>.rec iris ...` (the board is
 built with the recorder; the file is gzip-compressed and stays readable if the
