@@ -25,6 +25,33 @@ use std::sync::{
 
 pub const PART_SIZE: usize = 8 << 20;
 pub const FLASH_SIZE: usize = 2 * PART_SIZE;
+
+/// The environment records that mark the processor positions `absent` (letters
+/// A to D) disabled, with their offsets in the store: the records the stock
+/// PROM writes itself after its failed-start recovery has given up on each
+/// empty position, at consecutive 64-byte slots from the first. Seeding a
+/// fresh store with them spares the PROM three power cycles per position.
+/// That a board ships in this state is a model policy, not a recovered
+/// factory image. The first two records are the ones a captured Origin 300
+/// PROM wrote for B and D; the offset of a third is extended from them, not
+/// observed.
+///
+/// Ported from tests/functional/mips64/lib_origin300.py in
+/// jamesbraid/qemu-sgi-origami.
+pub fn disabled_positions_environment(absent: &str) -> Vec<(usize, Vec<u8>)> {
+    const VALUE: &[u8] = b"32: CPU failed early init.";
+    let record = |position: u8| {
+        let mut bytes = vec![0x10];
+        bytes.extend_from_slice(b"Disable");
+        bytes.push(position);
+        bytes.extend_from_slice(&[0; 7]);
+        bytes.extend_from_slice(VALUE);
+        bytes.extend_from_slice(&[0; 22]);
+        bytes
+    };
+    let records = PART_SIZE + 0x1e0100;
+    absent.bytes().enumerate().map(|(slot, position)| (records + slot * 0x40, record(position))).collect()
+}
 pub const SECOND_POSITION: u64 = 32 << 20;
 
 fn sum(bytes: &[u8]) -> u8 {
@@ -310,6 +337,12 @@ impl Flash {
     /// Format a fresh two-position store from a decoded payload, with the
     /// board's firmware record.
     pub fn new(payload: &[u8], record: FirmwareRecord) -> io::Result<Self> {
+        Self::seeded(payload, record, &[])
+    }
+
+    /// [`Self::new`], with environment `records` written into the volume
+    /// after its label, each at its own offset into the store.
+    pub fn seeded(payload: &[u8], record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
         if payload.len() > PART_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -323,6 +356,9 @@ impl Flash {
         data[label + 0x14..label + 0x18].copy_from_slice(&1u32.to_be_bytes());
         data[label + 0x18..label + 0x1c].copy_from_slice(&1u32.to_be_bytes());
         format_header(&mut data, &record);
+        for (offset, bytes) in records {
+            data[*offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
         Ok(Self {
             st: Mutex::new(State::new(data)),
             gen: AtomicU64::new(0),
@@ -334,7 +370,13 @@ impl Flash {
     /// and leaves an authored one as the store holds it.
     /// Completed guest programming and erasure write through to this file.
     pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
-        let mut data = Self::new(payload, record)?.st.into_inner().data;
+        Self::with_file_seeded(payload, path, record, &[])
+    }
+
+    /// [`Self::with_file`], seeding a missing or empty store with `records`
+    /// as [`Self::seeded`] does. A store that exists keeps what it holds.
+    pub fn with_file_seeded(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
+        let mut data = Self::seeded(payload, record, records)?.st.into_inner().data;
         let mut backing = FlashBacking::open(path, &mut data).map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 io::Error::new(
@@ -575,6 +617,56 @@ mod tests {
         assert_eq!(v.write64(part + 8 * 0x555, 0x80), BUS_OK);
         unlock(v, part);
         assert_eq!(v.write64(part + 4 * offset, 0x30), BUS_OK);
+    }
+
+    /// A board names the positions it leaves empty: B and D give the two
+    /// records a captured Origin 300 PROM wrote, a one-processor C-brick's B,
+    /// C and D one record each at consecutive slots, and a store that
+    /// already exists keeps what it holds. `new` and `with_file` seed nothing.
+    #[test]
+    fn a_board_names_its_empty_positions() {
+        let records = disabled_positions_environment("BD");
+        let bytes = Flash::seeded(&[], FirmwareRecord::TEZRO, &records).unwrap().contents();
+        let mut expected = vec![0x10];
+        expected.extend_from_slice(b"DisableB\0\0\0\0\0\0\032: CPU failed early init.");
+        expected.extend_from_slice(&[0; 22]);
+        assert_eq!(&bytes[0x9e0100..0x9e0140], expected.as_slice());
+        expected[8] = b'D';
+        assert_eq!(&bytes[0x9e0140..0x9e0180], expected.as_slice());
+        assert!(bytes[0x9e0180..0x9e0200].iter().all(|&b| b == 0xff));
+
+        let records = disabled_positions_environment("BCD");
+        assert_eq!(records.len(), 3);
+        let bytes = Flash::seeded(&[], FirmwareRecord::FUEL, &records).unwrap().contents();
+        for (slot, position) in ['B', 'C', 'D'].into_iter().enumerate() {
+            let at = PART_SIZE + 0x1e0100 + slot * 0x40;
+            assert_eq!(bytes[at], 0x10);
+            assert_eq!(&bytes[at + 1..at + 9], format!("Disable{position}").as_bytes());
+            assert_eq!(&bytes[at + 16..at + 42], b"32: CPU failed early init.");
+        }
+        assert!(bytes[PART_SIZE + 0x1e0100 + 3 * 0x40..PART_SIZE + 0x1e0100 + 4 * 0x40].iter().all(|b| *b == 0xff));
+
+        for record in [FirmwareRecord::FUEL, FirmwareRecord::TEZRO] {
+            assert_eq!(Flash::new(&[], record).unwrap().contents()[0x9e0100], 0xff, "new seeds nothing");
+        }
+    }
+
+    /// A store file that already exists keeps what it holds; a missing one is
+    /// seeded.
+    #[test]
+    fn an_existing_store_file_keeps_what_it_holds() {
+        let dir = crate::test_temp::TempPath::dir("flash-seed");
+        let path = dir.join("flash.bin");
+        let records = disabled_positions_environment("BD");
+        let fresh = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &records).unwrap();
+        assert_eq!(fresh.contents()[0x9e0100 + 8], b'B', "a missing store is seeded");
+        drop(fresh);
+        let mut held = std::fs::read(&path).unwrap();
+        held[0x9e0100 + 8] = b'X';
+        std::fs::write(&path, &held).unwrap();
+        let again = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &records).unwrap();
+        assert_eq!(again.contents()[0x9e0100 + 8], b'X', "an existing store keeps what it holds");
+        drop(again);
     }
 
     /// The PROM reads CPU configuration and the volume label from its boot flash.

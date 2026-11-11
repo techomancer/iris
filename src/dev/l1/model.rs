@@ -40,6 +40,39 @@ pub fn parse_revision(text: &str) -> Result<[u32; 3], String> {
     Ok(rev)
 }
 
+/// The brick on a C-brick's XIO cable. The C-brick's L1 reaches the brick's
+/// own controller through requests addressed to `0x4ffff` and names its
+/// letter in the PROM's I/O interface set-up (request 0xa).
+///
+/// Approximation: this is a stub of the I-brick's own L1. It answers only
+/// the module identity (bay and letter) itself; every other request is
+/// served as the C-brick's, so the I-brick shares the C-brick's revision and
+/// board records instead of holding its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachedBrick {
+    pub bay: u32,
+    /// The brick type character: 0x49 for an I-brick.
+    pub type_code: u32,
+}
+
+/// The attached-brick destination in a request address, above the task bits.
+const ATTACHED_KEY: u32 = 0x4ffff;
+
+/// What a C-brick holds beside its node board: the processor modules, from
+/// the product's row. The node board itself is `L1Config::node_board`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeNode {
+    /// The node's position in the machine. It numbers the synthetic serials
+    /// of the node board and the modules, so two nodes differ.
+    pub index: u8,
+    /// Bit n set when PIMM n is fitted. Approximation: which count a
+    /// one-processor C-brick reports is not established; the PROM reset the
+    /// module in a model run when two were reported and one processor ran.
+    pub pimm_mask: u8,
+    /// The module's identity as its board area names it.
+    pub pimm: BoardIdentity,
+}
+
 #[derive(Clone, Debug)]
 pub struct L1Config {
     pub rack: u32,
@@ -70,6 +103,11 @@ pub struct L1Config {
     /// Set, component 0 names this board and no I/O board record is given,
     /// as QEMU's L1 does for an IP53 node.
     pub node_board: Option<BoardIdentity>,
+    /// A brick on the XIO cable whose controller this one relays to.
+    pub attached: Option<AttachedBrick>,
+    /// Set on a C-brick: its processor modules at components 1 and 2, with
+    /// marked synthetic serials. Needs `node_board`.
+    pub compute_node: Option<ComputeNode>,
 }
 
 /// A board's identity as its board area names it: product name, part number
@@ -118,6 +156,8 @@ impl Default for L1Config {
             router: false,
             cpu_context: None,
             node_board: None,
+            attached: None,
+            compute_node: None,
         }
     }
 }
@@ -218,9 +258,9 @@ fn ia_text(area: &mut Vec<u8>, text: &str) {
     area.push(0xc0 | text.len() as u8);
     area.extend_from_slice(text.as_bytes());
 }
-fn board(identity: BoardIdentity, mac: Option<[u8; 6]>, cpu: Option<CpuContext>) -> Vec<u8> {
+fn board(identity: BoardIdentity, serial: &str, mac: Option<[u8; 6]>, cpu: Option<CpuContext>) -> Vec<u8> {
     let mut b = vec![0; 6];
-    for s in ["SYNTHETIC", identity.name, "EMUN00", identity.part] {
+    for s in ["SYNTHETIC", identity.name, serial, identity.part] {
         ia_text(&mut b, s);
     }
     b.push(0);
@@ -263,9 +303,21 @@ impl State {
             std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
         let chassis = area_finish(vec![0, 2, 0, 0xc2, b'N', b'A', 0xc2, b'N', b'A', 0xc1]);
         let identity = config.node_board.unwrap_or(BoardIdentity::FUEL);
-        records[0] = [chassis.clone(), board(identity, None, config.cpu_context), Vec::new()];
+        let node_serial = match config.compute_node {
+            Some(node) => format!("EMUN{:02}", node.index),
+            None => "EMUN00".into(),
+        };
+        records[0] = [chassis.clone(), board(identity, &node_serial, None, config.cpu_context), Vec::new()];
         if config.node_board.is_none() {
-            records[1] = [chassis, board(identity, Some(config.mac), None), Vec::new()];
+            records[1] = [chassis.clone(), board(identity, "EMUN00", Some(config.mac), None), Vec::new()];
+        }
+        if let Some(node) = config.compute_node {
+            for pimm in 0..2u8 {
+                if node.pimm_mask & (1 << pimm) != 0 {
+                    let serial = format!("EMUD{:02}", node.index * 2 + pimm);
+                    records[1 + pimm as usize] = [chassis.clone(), board(node.pimm, &serial, None, None), Vec::new()];
+                }
+            }
         }
         let powered = config.auto_power;
         let port = config.node_position << 5;
@@ -445,7 +497,8 @@ impl State {
         let address = word(&p[1..]);
         let cmd = u16::from_be_bytes([p[5], p[6]]);
         let key = address >> 12;
-        if key != 0xffff && key != ((self.config.rack << 6) | self.config.bay) {
+        let attached = (key == ATTACHED_KEY).then_some(self.config.attached).flatten();
+        if attached.is_none() && key != 0xffff && key != ((self.config.rack << 6) | self.config.bay) {
             crate::dlog!(LogModule::L1, "L1 unsupported destination {address:#x}");
             self.emit(&[0x20 | channel, 255, 255, 255, 255, 0, 0, 0, 8]);
             return;
@@ -490,7 +543,9 @@ impl State {
             // No debug switch set.
             1 => values.push(0),
             3 => {
-                if self.config.type_code == 0 {
+                if let Some(brick) = attached {
+                    values.extend([(self.config.rack << 6) | brick.bay, brick.type_code]);
+                } else if self.config.type_code == 0 {
                     error = -104;
                 } else {
                     values.extend([
@@ -532,7 +587,9 @@ impl State {
             }
             // Not partitioned.
             9 => values.push(0),
-            0xa => values.extend([self.config.port_speed_first, 0]),
+            // The PROM's I/O interface set-up: the port-speed word, and the
+            // letter of the brick on the XIO cable.
+            0xa => values.extend([self.config.port_speed_first, self.config.attached.map_or(0, |brick| brick.type_code)]),
             // Zero: the PROM's partition check goes no further.
             0xb => values.push(0),
             0xc => values.extend([0; 8]),

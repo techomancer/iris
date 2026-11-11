@@ -663,3 +663,76 @@ fn the_router_reply_reports_rack_slot_type_and_serial() {
          serial:, source: OTHER\n\n",
     );
 }
+
+const C_BRICK_NODE: BoardIdentity = BoardIdentity { name: "NODE-ROW", part: "030-NODE-ROW", revision: "-R" };
+const C_BRICK_PIMM: BoardIdentity = BoardIdentity { name: "PIMM-ROW", part: "030-PIMM-ROW", revision: "-P" };
+
+fn cbrick(index: u8, pimm_mask: u8) -> L1 {
+    L1::new(L1Config {
+        bay: 4,
+        type_code: 0x43,
+        brick_serial: Some("EMUN00".into()),
+        node_board: Some(C_BRICK_NODE),
+        attached: Some(AttachedBrick { bay: 14, type_code: 0x49 }),
+        compute_node: Some(ComputeNode { index, pimm_mask, pimm: C_BRICK_PIMM }),
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+/// A C-brick names itself, and answers for the brick on its XIO cable when a
+/// request is addressed there; the PROM's I/O set-up names that brick's letter.
+#[test]
+fn a_c_brick_reports_itself_and_relays_to_its_i_brick() {
+    let l1 = cbrick(0, 1);
+    assert_eq!(request(&l1, 3, &[], 0), integer_reply(&[(1 << 6) | 4, 0x43]));
+    assert_eq!(request(&l1, 0xa, &[], 0), integer_reply(&[0, 0x49]));
+    let attached = |l1: &L1, command: u16| {
+        send(l1, &encode(&[0x10, 0x4f, 0xff, 0xf0, 6, (command >> 8) as u8, command as u8, 0]));
+        drain(l1)
+    };
+    assert_eq!(attached(&l1, 3), integer_reply(&[(1 << 6) | 14, 0x49]));
+    // A brick with nothing on the cable refuses the attached form and
+    // answers the I/O set-up as before.
+    let lone = L1::new(Default::default()).unwrap();
+    assert_eq!(attached(&lone, 3), encode(&[0x30, 255, 255, 255, 255, 0, 0, 0, 8]));
+    assert_eq!(request(&lone, 0xa, &[], 0), integer_reply(&[0, 0]));
+}
+
+/// The node board is component 0 and the PIMM mask names the fitted PIMMs,
+/// each with a checksummed record carrying the row's identity and its own
+/// synthetic serial; the second node's serials differ from the first's.
+#[test]
+fn a_c_brick_holds_a_node_board_and_the_fitted_pimms() {
+    let has = |area: &[u8], text: &[u8]| area.windows(text.len()).any(|x| x == text);
+    let l1 = cbrick(1, 0b10);
+    let node = l1.record(0, 2).unwrap();
+    for text in [b"NODE-ROW".as_slice(), b"EMUN01", b"030-NODE-ROW"] {
+        assert!(has(&node, text), "{}", String::from_utf8_lossy(text));
+    }
+    assert!(l1.record(1, 2).is_none(), "PIMM 0 is not fitted");
+    let pimm = l1.record(2, 2).unwrap();
+    for text in [b"PIMM-ROW".as_slice(), b"EMUD03", b"030-PIMM-ROW"] {
+        assert!(has(&pimm, text), "{}", String::from_utf8_lossy(text));
+    }
+    for board in [&node, &pimm] {
+        assert_eq!(board.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
+    }
+    assert!(l1.record(1, 0).is_none() && cbrick(0, 1).record(1, 2).is_some() && cbrick(0, 1).record(2, 2).is_none());
+}
+
+/// A config with neither new field answers as it did, and a compute node
+/// without a node board is refused rather than given the Fuel's.
+#[test]
+fn a_config_without_the_c_brick_fields_is_unchanged() {
+    let plain = L1Config { node_board: Some(C_BRICK_NODE), ..Default::default() };
+    let l1 = L1::new(plain).unwrap();
+    assert!(has_text(&l1.record(0, 2).unwrap(), b"EMUN00"));
+    assert!(l1.record(1, 2).is_none() && l1.record(2, 2).is_none());
+    let refused = L1::new(L1Config { compute_node: Some(ComputeNode { index: 0, pimm_mask: 1, pimm: C_BRICK_PIMM }), ..Default::default() });
+    assert!(refused.is_err());
+}
+
+fn has_text(area: &[u8], text: &[u8]) -> bool {
+    area.windows(text.len()).any(|x| x == text)
+}
