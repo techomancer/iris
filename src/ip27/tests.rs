@@ -327,7 +327,10 @@ fn a_renumber_on_one_processor_does_not_disturb_the_others_line_pages() {
     let mut key = Box::new(0u64);
     let v = sp.add_cached_view(&[&mut *bitmap as *mut u64]).unwrap();
     unsafe { sp.add_key_sink(v, &mut *key as *mut u64) };
-    let pages: Vec<u64> = (0..16).map(|n| 0x10_0000 + n * 0x1000).collect();
+    // One line per host granule (4 KB on Linux, 16 KB on Apple silicon,
+    // 64 KB on Windows), so each hold takes a page no other line shares.
+    let granule = crate::ppmem::granularity() as u64;
+    let pages: Vec<u64> = (0..16).map(|n| 0x10_0000 + n * granule).collect();
     const RENUMBERS: u32 = 3000;
     let (start, done) = (Barrier::new(2), AtomicBool::new(false));
     let spurious = std::thread::scope(|s| {
