@@ -180,14 +180,11 @@ pub struct Bcm5701 {
     irq_order: Mutex<()>,
     link: Mutex<Option<crate::net::Rings>>,
     rx_wake: Mutex<Option<Arc<crate::net::Wake>>>,
-    /// Between `start` and `stop`; the NAT engine watches it too.
+    /// Between `start` and `stop`.
     running: Arc<AtomicBool>,
-    /// The flag the network backend watches, set and cleared with `running`.
-    net_running: Mutex<Option<Arc<AtomicBool>>>,
-    /// The network backend, between runs. A NAT engine keeps its flows across
-    /// a stop.
-    backend: Arc<Mutex<Option<Box<dyn crate::net::NetBackend>>>>,
-    /// The NAT and receive threads, joined in `stop`.
+    /// The network backend: each `start` runs a fresh one with new rings.
+    session: Mutex<crate::net::Session>,
+    /// The receive thread, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     me: Weak<Self>,
     /// Tests freeze the clock to step it exactly.
@@ -266,8 +263,7 @@ impl Bcm5701 {
             link: Mutex::new(None),
             rx_wake: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
-            net_running: Mutex::new(None),
-            backend: Arc::new(Mutex::new(None)),
+            session: Mutex::new(Default::default()),
             threads: Mutex::new(Vec::new()),
             me: me.clone(),
             #[cfg(test)]
@@ -415,33 +411,12 @@ impl Bcm5701 {
     /// `link.to_net`, frames on `link.from_net` are received, and
     /// `link.rx_wake` is notified when the guest does something that can
     /// unblock a waiting frame. The backend and receive threads run between
-    /// `start` and `stop`; a NAT engine, which only trades frames with the
-    /// host and never reaches the guest, keeps its flows across a stop.
+    /// `start` and `stop`; the first `start` runs this link's backend on these
+    /// rings and each later one a fresh backend on fresh rings.
     pub fn attach(&self, mut link: crate::net::Link) {
-        let backend = link.backend();
-        let running = link.running();
-        let rings = link.into_rings();
-        *self.rx_wake.lock() = Some(rings.rx_wake.clone());
-        *self.link.lock() = Some(rings);
-        *self.net_running.lock() = Some(running.clone());
-        *self.backend.lock() = backend;
-        if self.running.load(Ordering::SeqCst) {
-            running.store(true, Ordering::SeqCst);
-            self.spawn_nat();
-        }
-    }
-
-    fn spawn_nat(&self) {
-        let slot = self.backend.clone();
-        let Some(mut engine) = slot.lock().take() else { return };
-        let t = std::thread::Builder::new()
-            .name("bcm5701-net".into())
-            .spawn(move || {
-                engine.run();
-                *slot.lock() = Some(engine);
-            })
-            .expect("bcm5701 NAT thread");
-        self.threads.lock().push(t);
+        *self.rx_wake.lock() = Some(link.rx_wake());
+        *self.link.lock() = link.take_rings();
+        self.session.lock().attach(link);
     }
 
     /// Take frames into guest memory as they arrive and as the guest makes
@@ -668,10 +643,14 @@ const RX_IDLE: Duration = Duration::from_secs(60);
 impl Device for Bcm5701 {
     fn step(&self, _cycles: u64) {}
 
-    /// Start the receive thread, and the NAT engine's if one is attached.
+    /// Run the backend with new rings, and start the receive thread.
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
+        }
+        if let Some((Some(rings), _)) = self.session.lock().start("bcm5701-net") {
+            *self.rx_wake.lock() = Some(rings.rx_wake.clone());
+            *self.link.lock() = Some(rings);
         }
         let wake = self.rx_wake.lock().get_or_insert_with(crate::net::Wake::new).clone();
         let (me, running) = (self.me.clone(), self.running.clone());
@@ -680,27 +659,18 @@ impl Device for Bcm5701 {
             .spawn(move || Self::rx_loop(me, running, wake))
             .expect("bcm5701 rx thread");
         self.threads.lock().push(rx);
-        if let Some(r) = self.net_running.lock().as_ref() {
-            r.store(true, Ordering::SeqCst);
-        }
-        self.spawn_nat();
         // Frames queued while stopped.
         self.wake_rx();
     }
 
-    /// Join the threads: no frame reaches guest memory and no line moves
-    /// afterwards. Frames the NAT engine takes meanwhile queue for `start`.
+    /// Join the receive thread: no frame reaches guest memory and no line
+    /// moves afterwards. The backend is told to end; the next `start` waits for it.
     fn stop(&self) {
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        if let Some(r) = self.net_running.lock().as_ref() {
-            r.store(false, Ordering::SeqCst);
-        }
         self.wake_rx();
-        if let Some(l) = self.link.lock().as_ref() {
-            l.tx_wake.notify();
-        }
+        self.session.lock().stop();
         // The receive thread can hold the last reference for a moment, and
         // then this runs on it; it cannot join itself.
         let me = std::thread::current().id();

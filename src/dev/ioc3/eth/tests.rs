@@ -772,10 +772,10 @@ fn threads_racing_a_reset_leave_only_real_edges_in_order() {
     }
 }
 
-/// While stopped no frame reaches guest memory; on start the queued one is
-/// taken, with nobody calling `poll`.
+/// While stopped no frame reaches guest memory, and one queued meanwhile is
+/// discarded: the next run has fresh rings, as on the other adapters.
 #[test]
-fn a_stopped_mac_takes_no_frames_until_it_starts() {
+fn a_stopped_mac_takes_no_frames_and_a_restart_drops_the_queued_one() {
     let mut t = rig();
     let (link, _sent, inject) = crate::net::Link::loopback();
     let wake = link.rx_wake();
@@ -794,7 +794,8 @@ fn a_stopped_mac_takes_no_frames_until_it_starts() {
     std::thread::sleep(Duration::from_millis(30));
     assert_eq!(t.r(RX_CONSUME), 8, "nothing taken while stopped");
     t.eth.start();
-    assert!(waits_for(|| t.r(RX_CONSUME) == 16), "the queued frame is taken on start");
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(t.r(RX_CONSUME), 8, "the frame queued while stopped is gone");
     t.eth.stop();
 }
 
@@ -828,9 +829,8 @@ fn waits_for(cond: impl Fn() -> bool) -> bool {
     cond()
 }
 
-/// Stopping joins the device's NAT and receive threads and a restart brings
-/// both back with the NAT engine's state intact; dropping a running device
-/// ends them.
+/// Stopping joins the device's receive thread and a restart brings it back;
+/// dropping a running device ends it.
 #[test]
 fn stopping_the_mac_joins_its_threads() {
     let eth = standalone(Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO)));
@@ -839,12 +839,11 @@ fn stopping_the_mac_joins_its_threads() {
     eth.attach(crate::net::Link::open(&net).unwrap().expect("NAT is the default"));
     assert!(eth.threads.lock().is_empty(), "no thread before start");
     eth.start();
-    assert_eq!(eth.threads.lock().len(), 2);
+    assert_eq!(eth.threads.lock().len(), 1);
     eth.stop();
     assert!(eth.threads.lock().is_empty());
-    assert!(eth.backend.lock().is_some(), "the engine is back for the next run");
     eth.start();
-    assert_eq!(eth.threads.lock().len(), 2);
+    assert_eq!(eth.threads.lock().len(), 1);
     let probe = Arc::downgrade(&eth);
     let running = eth.running.clone();
     drop(eth);
@@ -853,6 +852,15 @@ fn stopping_the_mac_joins_its_threads() {
     // device is gone a moment after the caller's drop, not at it.
     assert!(waits_for(|| probe.upgrade().is_none()), "the device is freed");
     assert!(waits_for(|| !running.load(Ordering::SeqCst)), "dropping stops it");
+}
+
+/// A stop followed at once by a start keeps the port forwards.
+#[test]
+fn a_restart_keeps_the_port_forwards() {
+    let (_hold, port, config) = crate::net::Link::forward_on_a_held_port();
+    let eth = standalone(Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO)));
+    eth.attach(crate::net::Link::with_gateway(config).unwrap().unwrap());
+    crate::net::Link::assert_restart_keeps_the_forward(port, &|| eth.start(), &|| eth.stop());
 }
 
 /// Dropping the caller's reference to a running device while another thread
