@@ -632,6 +632,9 @@ impl<B: Ip27Board> Ip27Machine<B> {
                 .map_err(|e| format!("ppmem: a CPU's cached view: {e}"))?;
             unsafe {
                 cpu.set_tcache_window(sp.view_base(v));
+                // The shadow cache makes a page private to this view while a
+                // line the PROM made valid with Index Store Tag stands on it.
+                cpu.set_cached_view(sp, v);
                 cpu.set_tcache_shift(sp.region_shift());
                 let (fine, regions) = sp.fine_table();
                 cpu.set_tcache_fine(fine, regions);

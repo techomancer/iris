@@ -11,7 +11,7 @@ VR10000 user's manual p. 75), and every other master see memory. What the shippe
 | Octane | a tag and data RAM test on secondary set 0, read back only with Index Load Tag/Data | no: the patterns name no memory |
 | IP28 | a secondary line for page 0, once while the PROM starts, then released | yes |
 | Fuel | primary data lines for 0x100000-0x107fff hold the stack | no, until memory is configured mid-phase |
-| Origin 200 | none held in a boot to the IRIX login | - |
+| Origin 200 | none held in a boot to the IRIX login, measured before the shadow cache was given its view, so not a result for the wired path | - |
 | Indy, Indigo2 (R4400) | none: an R4400 line never holds a page | - |
 
 Every line ends by Index Store Tag. None is written back, and none is read back
