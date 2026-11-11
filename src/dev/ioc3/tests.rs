@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use crate::dev::ds1685::{Ds1685, NVRAM_OFF_NV};
 use crate::pci::PciDmaStatus;
 use crate::irq::LevelProbe;
+use crate::test_temp::TempImage;
 use crate::traits::MachineEvent;
 use crate::pci::PciFunction;
 use crate::dev::ng1::rex3::Rex3;
@@ -1091,7 +1092,7 @@ fn the_clock_tells_the_time() {
 
 #[test]
 fn nvram_survives_in_a_file() {
-    let path = std::env::temp_dir().join(format!("ioc3-nvram-{}", std::process::id()));
+    let path = TempImage::new("ioc3-nvram");
     {
         let r = Rig::new();
         r.c.rtc().set_nvram_file(&path).unwrap();
@@ -1104,15 +1105,13 @@ fn nvram_survives_in_a_file() {
         r.w8(reg::BYTEBUS_DEV1, 0x30);
         assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0xc3);
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The file is not rewritten per byte: it catches up once the writes
 /// pause, replaced whole, and on a flush with no wait.
 #[test]
 fn nvram_writes_reach_the_file_after_a_pause() {
-    let path = std::env::temp_dir().join(format!("ioc3-nvram-quiet-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = TempImage::new("ioc3-nvram-quiet");
     let r = Rig::new();
     r.c.rtc().set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
@@ -1123,7 +1122,6 @@ fn nvram_writes_reach_the_file_after_a_pause() {
     r.c.rtc().flush_after(Duration::ZERO);
     assert_eq!(in_file(), 0x66);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0x200);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -1564,8 +1562,7 @@ fn the_extended_ram_is_reached_through_its_address_and_data_ports() {
 
 #[test]
 fn nvram_and_extended_ram_survive_in_a_512_byte_file() {
-    let path = std::env::temp_dir().join(format!("ioc3-xram-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = TempImage::new("ioc3-xram");
     {
         let r = Rig::new();
         r.c.rtc().set_nvram_file(&path).unwrap();
@@ -1591,13 +1588,12 @@ fn nvram_and_extended_ram_survive_in_a_512_byte_file() {
         rtc_w(&r, 0x50, 0x01);
         assert_eq!(rtc_r(&r, 0x53), 0x02);
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 /// A full image in the QEMU layout loads, extended RAM included.
 #[test]
 fn a_qemu_layout_image_loads() {
-    let path = std::env::temp_dir().join(format!("ioc3-qimg-{}", std::process::id()));
+    let path = TempImage::new("ioc3-qimg");
     let mut img = vec![0u8; 0x200];
     img[0x0f] = 0x42;
     img[0xc0 + 9] = b'1';
@@ -1614,7 +1610,6 @@ fn a_qemu_layout_image_loads() {
     // With no clock reference beside it, the clock starts at host time.
     rtc_w(&r, 0x0a, 0x20);
     assert!(rtc_r(&r, 0x09) >= 0x26, "host time, in BCD");
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Set 2004-06-01 19:00:30 UTC in IRIX's order: SET, the seconds through
@@ -1633,10 +1628,8 @@ fn set_2004(r: &Rig) {
 /// reference beside the file, in QEMU's layout, carries it.
 #[test]
 fn a_set_date_survives_a_relaunch() {
-    let path = std::env::temp_dir().join(format!("ioc3-clock-{}", std::process::id()));
+    let path = TempImage::new("ioc3-clock");
     let clock = crate::dev::battery_clock::companion(&path);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&clock);
     {
         let r = Rig::new();
         r.c.rtc().set_nvram_file(&path).unwrap();
@@ -1659,38 +1652,32 @@ fn a_set_date_survives_a_relaunch() {
             "2004-06-01 19:00, not host time or the seed"
         );
     }
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&clock);
 }
 
 /// A clock file that cannot be read is reported and passed over: the
 /// NVRAM file still loads and the clock starts from host time.
 #[test]
 fn an_unreadable_clock_file_leaves_the_nvram_usable() {
-    let path = std::env::temp_dir().join(format!("ioc3-clock-bad-{}", std::process::id()));
+    let path = TempImage::new("ioc3-clock-bad");
     let clock = crate::dev::battery_clock::companion(&path);
     let mut img = vec![0u8; 0x200];
     img[0x0f] = 0x42;
     std::fs::write(&path, &img).unwrap();
-    let _ = std::fs::remove_dir_all(&clock);
     std::fs::create_dir(&clock).unwrap(); // reading a directory fails
     let r = Rig::new();
     r.c.rtc().set_nvram_file(&path).unwrap();
     assert_eq!(rtc_r(&r, 0x0f), 0x42);
     assert!(rtc_r(&r, 0x09) >= 0x26, "host time, in BCD");
     drop(r);
-    let _ = std::fs::remove_dir_all(&clock);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// `[rtc_offset]` starts a clock the guest has not set, at every run, so an
 /// edit to it takes effect.
 #[test]
 fn rtc_offset_starts_a_clock_with_no_reference() {
-    let path = std::env::temp_dir().join(format!("ioc3-clock-seed-{}", std::process::id()));
+    let path = TempImage::new("ioc3-clock-seed");
     let clock = crate::dev::battery_clock::companion(&path);
     std::fs::write(&path, vec![0u8; 0x200]).unwrap();
-    let _ = std::fs::remove_file(&clock);
     let year = |years| {
         let r = Rig::new();
         r.c.rtc().set_rtc_offset(&crate::config::RtcOffset { years, ..Default::default() });
@@ -1703,7 +1690,6 @@ fn rtc_offset_starts_a_clock_with_no_reference() {
     let (now, back10, back20) = (year(0), year(-10), year(-20));
     assert_eq!((now - back10).rem_euclid(100), 10);
     assert_eq!((back10 - back20).rem_euclid(100), 10, "the edited offset took effect");
-    let _ = std::fs::remove_file(&path);
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,22 +1793,19 @@ fn eventually(mut done: impl FnMut() -> bool) -> bool {
 /// debounce itself on a slow host.
 #[test]
 fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
-    let path = std::env::temp_dir().join(format!("ioc3-nvram-perbyte-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = TempImage::new("ioc3-nvram-perbyte");
     let (r, _tm) = running_rig();
     r.c.rtc().set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
     assert_eq!(std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5], 0, "not written per byte");
     assert!(r.c.rtc().dirty_since().is_some(), "the RAM counts as unsaved");
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The file catches up once the guest's NVRAM writes have paused, written by
 /// the chip's own writer with nobody calling a flush.
 #[test]
 fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
-    let path = std::env::temp_dir().join(format!("ioc3-nvram-timer-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = TempImage::new("ioc3-nvram-timer");
     let (r, _tm) = running_rig();
     r.c.rtc().set_nvram_file(&path).unwrap();
     r.c.start();
@@ -1830,7 +1813,6 @@ fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
     let in_file = || std::fs::read(&path).map(|f| f[NVRAM_OFF_NV + 5]).unwrap_or(0);
     assert!(eventually(|| in_file() == 0x66), "the writer saved the RAM");
     r.c.stop();
-    let _ = std::fs::remove_file(&path);
 }
 
 /// `stop` leaves no thread, no timer and no host input taken; `start` brings
