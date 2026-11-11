@@ -28,7 +28,7 @@ use std::sync::{
 
 mod model;
 use model::State;
-pub use model::{parse_revision, BoardIdentity, CpuContext, L1Config, L1Event, DEFAULT_BRICK_SERIAL, DEFAULT_REVISION};
+pub use model::{parse_revision, AttachedBrick, BoardIdentity, ComputeNode, CpuContext, L1Config, L1Event, DEFAULT_BRICK_SERIAL, DEFAULT_REVISION};
 
 fn fcs(mut crc: u16, byte: u8) -> u16 {
     crc ^= byte as u16;
@@ -134,6 +134,9 @@ impl L1 {
     pub fn new(config: L1Config) -> Result<Self, String> {
         if config.rack > 0x3ff || config.bay > 0x3f || config.node_position > 3 {
             return Err("L1 rack, bay or node position out of range".into());
+        }
+        if config.compute_node.is_some() && config.node_board.is_none() {
+            return Err("L1 compute node needs a node board".into());
         }
         if config.port_speed_first > 1 {
             return Err("L1 first port-speed value must be zero or one".into());
