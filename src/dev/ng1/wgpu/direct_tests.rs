@@ -8,7 +8,10 @@ use super::direct::{
     validate_initial_did, CaptureFault, Ng1ResidentScanout, ResidentScanoutSource,
     ResidentScanoutTraffic,
 };
-use super::resident::{ObservationCounters, ResidentError, ResidentFaultInjection, ResidentGpu, ResidentRaster};
+use super::resident::{
+    ObservationCounters, ObservationReason, ResidentError, ResidentFaultInjection, ResidentGpu,
+    ResidentRaster,
+};
 use super::{Ng1Scanout, Ng1Slot, VC2_WORDS};
 use crate::compositor::{CompositorSource, SwCompositor};
 use crate::dev::ng1::bt445::Bt445;
@@ -22,7 +25,7 @@ use crate::dev::ng1::rex3::{
     REX3_DCBDATA0, REX3_DCBMODE, REX3_DRAWMODE0, REX3_DRAWMODE1, REX3_TOPSCAN,
     REX3_WRMASK, REX3_XYENDI, REX3_XYSTARTI,
 };
-use crate::dev::ng1::rex3::frame::ResidentDisplay;
+use crate::dev::ng1::rex3::frame::{ResidentCompatibilityDisplay, ResidentDisplay};
 use crate::dev::ng1::rex3_generic::{draw_with_fb, Framebuffers};
 use crate::dev::ng1::rex3_shape;
 use crate::dev::ng1::vc2::{
@@ -1144,6 +1147,43 @@ struct QueuePresenter {
     resizes: Arc<Mutex<Vec<(usize, usize)>>>,
 }
 
+struct CompatibilityPresenter {
+    frames: Arc<Mutex<Vec<Vec<u32>>>>,
+    resizes: Arc<Mutex<Vec<(usize, usize)>>>,
+}
+
+impl crate::dev::ng1::rex3::Renderer for CompatibilityPresenter {
+    fn present(
+        &mut self,
+        screen: &mut Rex3Screen,
+        _overlay: &mut crate::debug_overlay::DebugOverlay,
+        _status: &mut crate::disp::StatusBar,
+        _sbtex: &mut crate::disp::StatusBarTexture,
+        _stats: &crate::disp::BarStats,
+        need_readback: bool,
+        live_rgb: Option<&[u32]>,
+        live_aux: Option<&[u32]>,
+    ) {
+        assert!(!need_readback);
+        assert!(live_rgb.is_none() && live_aux.is_none());
+        let mut compositor = SwCompositor::new();
+        compositor.compose_pixels(&screen.compositor_source());
+        let mut frame = Vec::with_capacity(screen.width * screen.height);
+        for y in 0..screen.height {
+            frame.extend_from_slice(
+                &compositor.pixels()[y * FB_STRIDE..y * FB_STRIDE + screen.width],
+            );
+        }
+        self.frames.lock().push(frame);
+    }
+
+    fn resize(&mut self, width: usize, height: usize) {
+        self.resizes.lock().push((width, height));
+    }
+
+    fn takes_resident_readback_frames(&self) -> bool { true }
+}
+
 impl crate::dev::ng1::rex3::Renderer for QueuePresenter {
     fn present(
         &mut self,
@@ -1603,6 +1643,84 @@ fn resident_frame_gpu_common_presenter_pixels_without_routine_readback() {
         .stack_size(64 * 1024 * 1024)
         .spawn(run_common_presenter_window_test)
         .expect("spawn common presenter test")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[test]
+#[ignore = "requires the requested conformant hardware GPU backend"]
+fn resident_frame_gpu_readback_compatibility_is_labeled() {
+    std::thread::Builder::new()
+        .name("resident-readback-compatibility".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let gpu = required_gpu();
+            let (rgb, aux) = seed_planes();
+            let mut expected_rgb = rgb.clone();
+            let mut expected_aux = aux.clone();
+            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            rex.fb_rgb.get_mut().copy_from_slice(&rgb);
+            rex.fb_aux.get_mut().copy_from_slice(&aux);
+            rex.fb_rgb.get_mut().isolate().unwrap();
+            rex.fb_aux.get_mut().isolate().unwrap();
+            configure_board_display(&rex);
+            rex.activate_resident_gpu(Arc::clone(&gpu)).unwrap();
+            rex.fb_rgb.get_mut().reset_access_counts();
+            rex.fb_aux.get_mut().reset_access_counts();
+            let rgb_guard = unsafe { (&*rex.fb_rgb.get()).protect() }.unwrap();
+            let aux_guard = unsafe { (&*rex.fb_aux.get()).protect() }.unwrap();
+            let board = TestBoard(rex);
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let resizes = Arc::new(Mutex::new(Vec::new()));
+            *board.0.renderer.lock() = Some(Box::new(CompatibilityPresenter {
+                frames: Arc::clone(&frames),
+                resizes: Arc::clone(&resizes),
+            }));
+
+            board.0.start();
+            let mut display = ResidentCompatibilityDisplay::new(&board.0)
+                .expect("create compatibility display");
+            let mut fill = fill_context();
+            fill.drawmode0.0 |= 1 << 5;
+            draw_reference(fill.clone(), &mut expected_rgb, &mut expected_aux);
+            enqueue_fill(&board.0, &fill);
+            let position = display
+                .render(&board.0, std::time::Duration::from_secs(5), |_| {})
+                .expect("render compatibility frame");
+
+            let expected = software_frame(&board.0, &expected_rgb, &expected_aux);
+            let frames = frames.lock();
+            assert_eq!(frames.len(), 1);
+            assert_pixels_eq("readback compatibility frame", &frames[0], &expected);
+            assert_eq!(&*resizes.lock(), &[(WIDTH, HEIGHT)]);
+            let status = board.0.resident_status().unwrap();
+            assert_eq!(position, status.submitted);
+            let compatibility = status.observations.for_reason(ObservationReason::Compatibility);
+            assert_eq!(
+                (
+                    compatibility.attempts,
+                    compatibility.successes,
+                    compatibility.attempted_transfers,
+                    compatibility.successful_transfers,
+                    compatibility.attempted_bytes,
+                    compatibility.successful_bytes,
+                ),
+                (1, 1, 2, 2, 2 * PLANE_WORDS as u64 * 4, 2 * PLANE_WORDS as u64 * 4),
+            );
+            assert_eq!(
+                status.observations.for_reason(ObservationReason::Validation).attempts,
+                0,
+            );
+            assert_eq!(status.raw_plane_map_attempts, 1);
+            assert!(!status.rgb.cpu_shadow_current());
+            assert!(status.aux.cpu_shadow_current());
+            assert_no_cpu_plane_access(&board.0);
+            board.0.stop();
+            assert_no_cpu_plane_access(&board.0);
+            drop(aux_guard);
+            drop(rgb_guard);
+        })
+        .expect("spawn compatibility display test")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

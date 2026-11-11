@@ -741,6 +741,9 @@ impl Renderer for GlRenderer {
         format!("compositor={} shader=integer+fallback", comp)
     }
 
+    #[cfg(all(test, feature = "wgpu"))]
+    fn takes_resident_readback_frames(&self) -> bool { true }
+
     // Called from the monitor/CI socket thread — NOT the context-owning refresh
     // thread — so it must not touch GL. Record the request; `present()` applies
     // it. The returned name is what the swap will settle on, which for a Legacy
@@ -894,6 +897,9 @@ impl Renderer for WgpuRenderer {
     fn takes_gpu_frames(&self) -> bool {
         self.board_device
     }
+
+    #[cfg(test)]
+    fn takes_resident_readback_frames(&self) -> bool { true }
 
     fn present_gpu_frame(
         &mut self,
