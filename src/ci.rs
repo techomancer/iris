@@ -134,6 +134,24 @@ pub fn start_server(
     let display_head1 = machine.get_display_head1();
 
     let path = socket_path.to_string();
+    // Bind before the server exists: its drop removes the socket file, and a
+    // path that was refused is not ours to remove.
+    #[cfg(unix)]
+    let unix = if ci_socket_is_tcp(&path) {
+        None
+    } else {
+        Some(
+            crate::dev::serial_host::bind_unix_socket(std::path::Path::new(&path))
+                .map_err(|e| format!("failed to bind {}: {}", path, e))?,
+        )
+    };
+    #[cfg(not(unix))]
+    if !ci_socket_is_tcp(&path) {
+        return Err(format!(
+            "CI socket path {} requires a Unix domain socket; use host:port on this platform",
+            path
+        ));
+    }
     let server = Arc::new(CiServer {
         socket_path: path.clone(),
         machine: machine.machine_slot(),
@@ -145,26 +163,18 @@ pub fn start_server(
 
     *SOCKET_PATH.lock() = Some(path.clone());
 
-    if ci_socket_is_tcp(&path) {
-        start_tcp_server(server.clone(), &path)?;
-    } else {
-        #[cfg(unix)]
-        start_unix_server(server.clone(), &path)?;
-        #[cfg(not(unix))]
-        return Err(format!(
-            "CI socket path {} requires a Unix domain socket; use host:port on this platform",
-            path
-        ));
+    #[cfg(unix)]
+    if let Some(listener) = unix {
+        start_unix_server(server.clone(), &path, listener)?;
+        return Ok(server);
     }
+    start_tcp_server(server.clone(), &path)?;
 
     Ok(server)
 }
 
 #[cfg(unix)]
-fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
-    cleanup_socket_path(path);
-    let listener = UnixListener::bind(path)
-        .map_err(|e| format!("failed to bind {}: {}", path, e))?;
+fn start_unix_server(server: Arc<CiServer>, path: &str, listener: UnixListener) -> Result<(), String> {
     eprintln!("iris: --ci control socket listening at {}", path);
     let server_clone = server.clone();
     thread::Builder::new()

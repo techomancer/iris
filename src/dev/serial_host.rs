@@ -73,26 +73,32 @@ pub(crate) struct UnixSocketBackend {
     stream: Mutex<Option<UnixStream>>,
 }
 
+/// Bind a Unix socket at `path`. A socket file left by an earlier iris is
+/// replaced; one that something still answers on, or any other kind of
+/// file, is an error and left alone.
+#[cfg(unix)]
+pub(crate) fn bind_unix_socket(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, "another process is listening on it"));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists and is not a socket")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    UnixListener::bind(path)
+}
+
 #[cfg(unix)]
 impl UnixSocketBackend {
-    /// Bind `path`. A socket file left by an earlier iris is replaced; one
-    /// that something still answers on, or any other kind of file, is an
-    /// error and left alone.
+    /// Bind `path`, as `bind_unix_socket` does.
     pub(crate) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        use std::os::unix::fs::FileTypeExt;
         let path = path.as_ref().to_path_buf();
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_socket() => {
-                if UnixStream::connect(&path).is_ok() {
-                    return Err(io::Error::new(io::ErrorKind::AddrInUse, "another process is listening on it"));
-                }
-                std::fs::remove_file(&path)?;
-            }
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists and is not a socket")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let listener = UnixListener::bind(&path)?;
+        let listener = bind_unix_socket(&path)?;
         listener.set_nonblocking(true)?;
         Ok(Self { path, listener, stream: Mutex::new(None) })
     }
