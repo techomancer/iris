@@ -500,16 +500,16 @@ impl Drop for ChdFileIo {
 }
 
 #[cfg(unix)]
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(f, buf, offset)
 }
 
 #[cfg(windows)]
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(f, buf, offset)
 }
 
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
         match read_at(f, buf, offset)? {
             0 => return Err(io::ErrorKind::UnexpectedEof.into()),
@@ -522,7 +522,7 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()
     Ok(())
 }
 
-fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
         #[cfg(unix)]
         let n = std::os::unix::fs::FileExt::write_at(f, buf, offset)?;
