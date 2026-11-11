@@ -2228,13 +2228,20 @@ mod drop_tests {
 #[cfg(test)]
 mod controller_lifetime_tests {
     use super::*;
+    use crate::test_temp::{nvram_in, TempPath};
 
-    fn build_machine() -> Box<Machine> {
+    /// `nv` holds the machine's NVRAM files, so a stop writes them there and
+    /// not into the working directory.
+    fn build_machine(nv: &TempPath) -> Box<Machine> {
+        let nv = nv.to_path_buf();
         // Machine::new needs more stack than a test thread has (see main.rs).
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(|| Box::new(Machine::new(crate::bench_runner::bench_config(
-                [16, 0, 0, 0], &parts::R4400_150))))
+            .spawn(move || {
+                let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+                nvram_in(&mut cfg, &nv);
+                Box::new(Machine::new(cfg))
+            })
             .unwrap()
             .join()
             .unwrap()
@@ -2247,7 +2254,8 @@ mod controller_lifetime_tests {
     /// `tests/monitor_ready.rs` covers the monitor command and readiness.
     #[test]
     fn start_guest_acknowledges_the_lifecycle_transition() {
-        let mut machine = build_machine();
+        let nv = TempPath::dir("machine-nv");
+        let mut machine = build_machine(&nv);
         assert_eq!(machine.status().state, GuestState::Idle);
         assert!(!machine.status().monitor_ready(), "no monitor before Machine::start");
 
@@ -2282,12 +2290,15 @@ mod controller_lifetime_tests {
         std::fs::write(&path, vec![0u8; 8 * 512]).unwrap();
         let sidecar = format!("{}.overlay.dirty", path.display());
         let _ = std::fs::remove_file(&sidecar);
+        let nv = TempPath::dir("machine-nv");
+        let nv_dir = nv.to_path_buf();
 
         let path_str = path.to_str().unwrap().to_string();
         let mut machine = std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+                nvram_in(&mut cfg, &nv_dir);
                 cfg.scsi.insert(1, crate::config::ScsiDeviceConfig { path: path_str, overlay: true, ..Default::default() });
                 Box::new(Machine::new(cfg))
             })
@@ -2333,7 +2344,8 @@ mod controller_lifetime_tests {
     /// to dereference freed memory (SIGSEGV in `save_snapshot`).
     #[test]
     fn controller_outliving_its_machine_reports_not_running() {
-        let mut machine = build_machine();
+        let nv = TempPath::dir("machine-nv");
+        let mut machine = build_machine(&nv);
         machine.register_system_controller();
         let ctrl = SystemController { machine: machine.machine_slot() };
         drop(machine);
@@ -2356,8 +2368,10 @@ mod stop_order_tests {
     fn stopping_the_disks_comes_before_stopping_the_graphics() {
         // A REX3 saves its shape corpus when it stops; keep it out of $HOME.
         let dir = crate::display_stop_tests::scratch("indy-order");
-        let mut machine = big_stack(|| {
+        let nv = dir.clone();
+        let mut machine = big_stack(move || {
             let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+            crate::test_temp::nvram_in(&mut cfg, &nv);
             cfg.headless = false;
             Box::new(Machine::new(cfg))
         });
@@ -2369,6 +2383,8 @@ mod stop_order_tests {
         machine.stop();
         assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
         assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
+        // The machine writes its NVRAM into `dir` as it drops.
+        drop(machine);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -2382,10 +2398,13 @@ mod virtio_tests {
     use crate::dev::virtio::mmio::{MAGIC, REG_DEVICE_ID, REG_MAGIC};
 
     fn probe(profile: MachineProfile, slot: VirtioGioSlot, base: u64) {
+        let nv = crate::test_temp::TempPath::dir("virtio-nv");
+        let nv_dir = nv.to_path_buf();
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 let mut cfg = MachineConfig::default();
+                crate::test_temp::nvram_in(&mut cfg, &nv_dir);
                 cfg.scsi.clear();
                 cfg.headless = true;
                 cfg.machine.profile = profile;

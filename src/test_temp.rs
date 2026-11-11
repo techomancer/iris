@@ -16,6 +16,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) struct TempPath(PathBuf);
 
+/// Point a machine's NVRAM and EEPROM files into `dir`. A config that leaves
+/// them at their defaults writes `nvram.bin` and `nveeprom.bin` into the
+/// working directory when the machine stops, which under cargo is the
+/// package root.
+pub(crate) fn nvram_in(cfg: &mut crate::config::MachineConfig, dir: &Path) {
+    cfg.nvram = dir.join("nvram").to_string_lossy().into_owned();
+    cfg.nveeprom = dir.join("nveeprom").to_string_lossy().into_owned();
+}
+
 impl TempPath {
     /// A fresh path under the temp dir named after `tag`. Nothing exists there yet.
     pub(crate) fn new(tag: &str) -> Self {
