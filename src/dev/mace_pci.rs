@@ -670,7 +670,6 @@ mod tests {
         // host's reading them dropped it.
         assert!(crime.0.lock().unwrap().contains(&(10, true)));
         assert_eq!(crime.0.lock().unwrap().last(), Some(&(10, false)));
-        let _ = std::fs::remove_file(img);
     }
 
     fn bridge_reg(reg: u32) -> u64 {

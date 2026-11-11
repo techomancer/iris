@@ -8,6 +8,7 @@
 use super::*;
 use crate::dev::isp12160::Isp12160Part;
 use crate::irq::LevelProbe;
+use crate::test_temp::TempPath;
 use crate::pci::PciDmaStatus;
 use crate::traits::{Device, Saveable};
 use std::sync::Mutex;
@@ -54,10 +55,10 @@ struct Rig<P: IspPart = Isp1040Part> {
     mem: Arc<FakeMem>,
 }
 
-fn image(name: &str, blocks: usize) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("iris-isp1040-{}-{name}.img", std::process::id()));
-    std::fs::write(&p, vec![0u8; blocks * BLOCK_SIZE]).expect("test image");
-    p
+/// A zeroed disk image, removed when the returned path is dropped. The bus
+/// keeps its own handle, so it can go while the chip lives.
+fn image(name: &str, blocks: usize) -> TempPath {
+    TempPath::file(&format!("isp1040-{name}"), &vec![0u8; blocks * BLOCK_SIZE])
 }
 
 impl<P: IspPart> Rig<P> {
@@ -1633,8 +1634,7 @@ fn the_ring_thread_lives_between_start_and_stop() {
 /// through the same bus.
 #[test]
 fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
-    let img = std::env::temp_dir().join(format!("iris-isp1040-filled-{}.img", std::process::id()));
-    std::fs::write(&img, vec![0u8; 64 * 512]).unwrap();
+    let img = image("filled", 64);
     let bus = Isp1040::new_bus();
     bus.attach_image(3, &img, false).unwrap();
     let isp = Isp1040::new_at(1, bus);
@@ -1650,7 +1650,6 @@ fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
     assert_eq!(&r.data[16..32], b"IRIS EMUL DISK  ");
     isp.bus().attach_image(4, &img, false).unwrap();
     assert!(isp.bus().has_target(4), "a target attached after boot goes on the same bus");
-    let _ = std::fs::remove_file(img);
 }
 
 
@@ -1734,12 +1733,10 @@ fn the_isp12160_preserves_queued_bus_and_target_resets_across_save_load() {
 fn rig12160() -> Rig<Isp12160Part> { Rig::on(Isp::new_12160(Isp1040::new_bus(), Isp1040::new_bus())) }
 
 /// A 64-block image whose first block is `fill`, so a read says which disk answered.
-fn filled_image(name: &str, fill: u8) -> std::path::PathBuf {
-    let p = image(name, 64);
+fn filled_image(name: &str, fill: u8) -> TempPath {
     let mut data = vec![0u8; 64 * BLOCK_SIZE];
     data[..BLOCK_SIZE].fill(fill);
-    std::fs::write(&p, data).expect("test image");
-    p
+    TempPath::file(&format!("isp1040-{name}"), &data)
 }
 
 /// A 12160 with a different disk at target 1 on each channel.

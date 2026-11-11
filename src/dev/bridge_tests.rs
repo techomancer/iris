@@ -1871,7 +1871,6 @@ fn nvme_ready_follows_enable_through_every_lane_mode_and_width() {
         assert_eq!((ld32(0x14), ld32(0x1c), ld64_csts()), (cc, 1, 1), "{mode:?}: doubleword store, ready at once");
         st64_cc(0);
         assert_eq!(ld32(0x1c), 0, "{mode:?}: disabled by a doubleword store");
-        let _ = std::fs::remove_file(img);
     }
 }
 
