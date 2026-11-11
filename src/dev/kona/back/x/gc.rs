@@ -18,6 +18,13 @@
 use crate::dev::kona::back::raster::ops::LogicOp;
 use crate::dev::kona::defs::*;
 
+/// The pack code of a window copy's context.
+const WINDOW_COPY_PACK_CODE: u32 = 17;
+
+/// The operation bits that make a window copy ignore the clip list and the scissor (inferred; see
+/// `Gc::decode_window_copy`).
+const WINDOW_COPY_CLIP_IGNORE: u32 = 0x1_c000;
+
 /// Which planes a context draws into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -149,6 +156,58 @@ impl Gc {
 
     pub fn decode(w: &[u32; GC_WORDS]) -> Result<Gc, Status> {
         decode(w, false)
+    }
+
+    /// The context of a window copy (a pixel copy whose setup names the window packing 3 for both
+    /// ends): the X server's copy of a window's colour words from one place to another. Returns the
+    /// context and whether the copy ignores the clip list and the scissor. The words encode a rule,
+    /// read here by field rather than by value (inferred from the senders, as the other contexts are):
+    ///
+    /// - the pack code is 17, where an ordinary RGB pixel context has 8;
+    /// - the buffer is the selector in operation bits 1:0, repeated in bits 23:18, 1 for the front
+    ///   buffer and 2 for the back, and the configuration word agrees with it as for an RGB fill
+    ///   (0x2804 for the front, 0x3804 for the back);
+    /// - operation bits 16:14 are set together to make the copy ignore the clip, and clear for a copy
+    ///   that honours it. Which one of the three does the work is unknown, so a context with only some
+    ///   of them set is refused;
+    /// - no colours, a full colour mask and bit 17 of the operation, the RGB form's, as the rest.
+    ///
+    /// Any other context is refused. What the pack code 17 means to the pipe is unknown: the copy is
+    /// read as a straight copy of each pixel's colour word under the logic operation (inferred).
+    pub fn decode_window_copy(w: &[u32; GC_WORDS]) -> Option<(Gc, bool)> {
+        let op = w[GC_OPERATION];
+        let buffer = op & 3;
+        let ignores_clip = op & WINDOW_COPY_CLIP_IGNORE == WINDOW_COPY_CLIP_IGNORE;
+        let residual = op & !0xfc_0003 & !WINDOW_COPY_CLIP_IGNORE;
+        let selected = (1..=2).contains(&buffer)
+            && (op >> 18) & 0x3f == buffer
+            && w[GC_FRAMEBUFFER_CONFIG] == if buffer == 2 { 0x3804 } else { 0x2804 }
+            && residual == 0x2_0000
+            && (ignores_clip || op & WINDOW_COPY_CLIP_IGNORE == 0);
+        let plain = w[GC_FOREGROUND_HIGH..=GC_BACKGROUND_LOW].iter().all(|&v| v == 0)
+            && w[GC_WRITE_MASK_FIRST] == 0xff_ffff
+            && w[GC_WRITE_MASK_SECOND] == 0xff_ffff
+            && w[GC_FRAMEBUFFER_BASES] == 1
+            && w[GC_BLEND_AND_LOGIC] <= 30
+            && w[GC_BLEND_AND_LOGIC] & 1 == 0
+            && w[GC_PIXEL_PACK_CODE] == WINDOW_COPY_PACK_CODE
+            && w[GC_TEXTURE_FILTER_COLOUR_FLAG] == 0
+            && w[GC_TEXTURE_FILTER_PIXEL_FLAG] == 0;
+        (selected && plain).then_some((
+            Gc {
+                raw: *w,
+                target: Target::MainRgb8,
+                foreground: 0,
+                background: 0,
+                mask: 0xff_ffff,
+                width_mask: 0xff_ffff,
+                gx: (w[GC_BLEND_AND_LOGIC] / 2) as u8,
+                first_selector: buffer as u8,
+                second_selector: buffer as u8,
+                opaque_or_tiled: false,
+            },
+            ignores_clip,
+        ))
     }
 
     /// Keep the full native main-plane index and mask.

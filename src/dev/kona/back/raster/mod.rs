@@ -354,6 +354,13 @@ impl<'a> Surface<'a> {
         Surface::new(self.store, word)
     }
 
+    /// The array at another word position; nothing is allocated for it. `None`
+    /// if that word has no array, as for the second buffer of a window that has
+    /// none, which a copy has nothing to move from.
+    pub fn sibling_array(&self, word: usize) -> Option<WordArray<'a>> {
+        self.store.array(word)
+    }
+
     /// The managed area's size.
     pub fn size(&self) -> (u32, u32) {
         (self.store.width(), self.store.height())
