@@ -374,7 +374,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - `build.yml` can boot IRIX 5.3 to a login prompt on Linux, macOS and Windows
   with the CLI it just built, and a failed boot stops the nightly or release
-  from publishing. It runs when the `IRIX53_BOOT_IMAGE_URL` secret is set.
+  from publishing. It downloads a stock IRIX 5.3 Indy disk from a pinned URL
+  and checks its SHA-256 first, so it needs no secret.
 
 ### Networking
 

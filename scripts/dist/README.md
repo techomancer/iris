@@ -41,9 +41,9 @@ scripts/dist/package-linux.sh --version 1.2.3
 ## Workflows
 
 - `build.yml` builds everything for one commit and checks that every file the
-  downloads table links to exists. Run it by hand to test a branch. When the
-  `IRIX53_BOOT_IMAGE_URL` secret holds the URL of an installed IRIX 5.3 CHD, it
-  also boots that disk to a login prompt on Linux, macOS and Windows with
+  downloads table links to exists. Run it by hand to test a branch. It also
+  boots a stock IRIX 5.3 disk, downloaded from a pinned URL and checked against
+  a pinned SHA-256, to a login prompt on Linux, macOS and Windows with
   `scripts/ci-boot-test.sh`, and a failed boot stops the nightly or release
   from publishing. It boots twice. With the PROM console on serial it watches
   for `login:`. With the console on the graphics board, where IRIX draws its

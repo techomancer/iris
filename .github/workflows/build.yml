@@ -9,8 +9,8 @@
 # to check that a branch builds everywhere without publishing anything.
 #
 # The boot-test job then boots IRIX 5.3 with the Linux, macOS and Windows CLI
-# builds, once on the serial console and once on the graphics console, when the
-# IRIX53_BOOT_IMAGE_URL secret is set.
+# builds, once on the serial console and once on the graphics console. The disk
+# is the stock IRIX 5.3 Indy image pinned in that job's env.
 #
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
@@ -373,10 +373,11 @@ jobs:
   # Boots IRIX 5.3 to a login prompt with the CLI just built, through
   # scripts/ci-boot-test.sh: once on serial, where "login:" is read, and once
   # on the graphics board, where the screen must match
-  # scripts/boot-goldens/indy-irix53.png. The disk image comes from the
-  # IRIX53_BOOT_IMAGE_URL secret; without it every step is skipped and the job
-  # passes with a warning. nightly.yml and release.yml publish only if this
-  # whole workflow succeeds, so a failed boot stops the publish.
+  # scripts/boot-goldens/indy-irix53.png. The disk image is a public, hash-pinned
+  # download (see clanker/testing/ci-irix53-disk.md); the job fails if it
+  # cannot be fetched or its checksum differs. nightly.yml and release.yml
+  # publish only if this whole workflow succeeds, so a failed boot stops the
+  # publish.
   boot-test:
     name: Boot test (${{ matrix.os }}-${{ matrix.arch }})
     needs: [version, windows, macos, linux]
@@ -393,6 +394,11 @@ jobs:
       # Per boot. The graphical login appeared within 80 s on all three
       # runners in the 2026-11-09 nightly, the one run there is so far.
       BOOT_TIMEOUT: 600
+      # Stock IRIX 5.3 Indy install, 222 MB. The path carries the first eight
+      # hex digits of the file's sha256, so a rebuilt disk is a new URL.
+      # To rotate it, change both lines and the golden together.
+      IRIX53_IMAGE_URL: https://origami-dist.irix.fans/irix/5.3/indy-3a9ea895.chd
+      IRIX53_IMAGE_SHA256: 3a9ea8952be5a55cdca5559916264e3be7883b037869d4ce47ea1cef00a850de
     strategy:
       fail-fast: false
       matrix:
@@ -404,39 +410,17 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Check for the disk image secret
-        id: image
-        env:
-          IMAGE_URL: ${{ secrets.IRIX53_BOOT_IMAGE_URL }}
-        run: |
-          if [ -z "$IMAGE_URL" ]; then
-            echo "::warning::IRIX53_BOOT_IMAGE_URL is not set - boot test skipped."
-            echo "### Boot test skipped: \`IRIX53_BOOT_IMAGE_URL\` secret not set" >> "$GITHUB_STEP_SUMMARY"
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if command -v sha256sum >/dev/null; then
-            HASH=$(printf '%s' "$IMAGE_URL" | sha256sum | cut -c1-16)
-          else
-            HASH=$(printf '%s' "$IMAGE_URL" | shasum -a 256 | cut -c1-16)
-          fi
-          echo "present=true" >> "$GITHUB_OUTPUT"
-          echo "hash=$HASH"   >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v5
-        if: ${{ steps.image.outputs.present == 'true' }}
         with:
           ref: ${{ needs.version.outputs.ref }}
 
       - name: Download the CLI build
-        if: ${{ steps.image.outputs.present == 'true' }}
         uses: actions/download-artifact@v8
         with:
           name: dist-${{ matrix.os }}-${{ matrix.arch }}
           path: dist
 
       - name: Unpack the CLI build
-        if: ${{ steps.image.outputs.present == 'true' }}
         run: |
           mkdir -p core
           if [ "${{ matrix.os }}" = windows ]; then
@@ -448,48 +432,38 @@ jobs:
 
       # The CLI links libGL through the hostgl feature.
       - name: Install runtime libraries
-        if: ${{ steps.image.outputs.present == 'true' && matrix.os == 'linux' }}
+        if: ${{ matrix.os == 'linux' }}
         run: sudo apt-get update && sudo apt-get install -y libasound2t64 libgl1
 
-      - name: Restore the disk image
-        if: ${{ steps.image.outputs.present == 'true' }}
-        id: cache
-        uses: actions/cache/restore@v5
-        with:
-          path: boot-image
-          key: irix53-boot-image-${{ steps.image.outputs.hash }}
-
+      # No Actions cache: the repository's 10 GB quota is already full of Rust
+      # caches, so the image would be evicted before the next night.
       - name: Download the disk image
-        if: ${{ steps.image.outputs.present == 'true' && steps.cache.outputs.cache-hit != 'true' }}
-        env:
-          IMAGE_URL: ${{ secrets.IRIX53_BOOT_IMAGE_URL }}
         run: |
           mkdir -p boot-image
-          curl -fL --retry 3 --retry-delay 10 -o boot-image/irix53.chd "$IMAGE_URL"
+          curl -fL --retry 3 --retry-delay 10 -o boot-image/irix53.chd "$IRIX53_IMAGE_URL"
+          # shasum first, as scripts/build-manifest.sh does: macOS ships a BSD
+          # sha256sum whose -c does not read a GNU check line from stdin.
+          got=$({ shasum -a 256 2>/dev/null || sha256sum; } < boot-image/irix53.chd | cut -d' ' -f1)
+          if [ "$got" != "$IRIX53_IMAGE_SHA256" ]; then
+            echo "::error::boot-image/irix53.chd sha256 $got, expected $IRIX53_IMAGE_SHA256"
+            exit 1
+          fi
           ls -la boot-image
 
-      - name: Save the disk image to the cache
-        if: ${{ steps.image.outputs.present == 'true' && steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v5
-        with:
-          path: boot-image
-          key: irix53-boot-image-${{ steps.image.outputs.hash }}
-
       - name: Boot IRIX 5.3 on the serial and graphics consoles
-        if: ${{ steps.image.outputs.present == 'true' }}
         run: bash scripts/ci-boot-test.sh core boot-image/irix53.chd boot-test "$BOOT_TIMEOUT"
 
       # The script writes each check as a JUnit case, so a failed run is
       # annotated with the check that failed.
       - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
-        if: ${{ always() && steps.image.outputs.present == 'true' }}
+        if: ${{ always() }}
         with:
           report_paths: boot-test/boot-test.xml
           annotate_only: true
 
       # Named boot-test-*, so the publish jobs' dist-* download leaves it out.
       - name: Upload the boot test results
-        if: ${{ always() && steps.image.outputs.present == 'true' }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: boot-test-${{ matrix.os }}-${{ matrix.arch }}
