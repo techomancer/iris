@@ -692,10 +692,11 @@ struct SerialPort<'a> {
 /// Connect the board's serial ports to the host. The console takes
 /// `serial_log` and, under CI, the in-process backend; the others listen on
 /// their TCP ports, and a port that is taken leaves its stream unconnected
-/// rather than stopping the machine.
+/// rather than stopping the machine. Port 0 takes any free port, so several
+/// lines may name it.
 fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[SerialPort<'_>], console: usize) -> Result<(), String> {
     for (i, a) in ports.iter().enumerate() {
-        if let Some(b) = ports[i + 1..].iter().find(|b| b.port == a.port) {
+        if let Some(b) = ports[i + 1..].iter().find(|b| b.port == a.port && a.port != 0) {
             return Err(format!("{name} {} and {} serial ports must be distinct", a.label, b.label));
         }
     }
