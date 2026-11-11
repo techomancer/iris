@@ -78,6 +78,9 @@ pub enum LogModule {
     /// The InfiniteReality (KONA) graphics pipe's host interface: guest
     /// accesses and command words the model does not support.
     Kona = 38,
+    /// The ICE1724 audio controller: accesses and values nothing
+    /// establishes.
+    Ice1724 = 39,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -92,7 +95,7 @@ pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the
 pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 39;
+    pub const COUNT: usize = 40;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -135,6 +138,7 @@ impl LogModule {
             "usb" => Some(Self::Usb),
             "module" => Some(Self::Module),
             "kona" => Some(Self::Kona),
+            "ice1724" => Some(Self::Ice1724),
             _        => None,
         }
     }
@@ -180,6 +184,7 @@ impl LogModule {
             Self::Usb => "usb",
             Self::Module => "module",
             Self::Kona => "kona",
+            Self::Ice1724 => "ice1724",
         }
     }
 
@@ -193,6 +198,7 @@ impl LogModule {
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
             Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
             Self::L1, Self::Usb, Self::Module, Self::Kona,
+            Self::Ice1724,
         ]
     }
 
@@ -361,6 +367,7 @@ impl DevLog {
                 ModuleLog::new(), // Usb
                 ModuleLog::new(), // Module
                 ModuleLog::new(), // Kona
+                ModuleLog::new(), // Ice1724
             ],
         }
     }

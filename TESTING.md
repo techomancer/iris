@@ -144,7 +144,8 @@ sends to the host:
   these tests print `SKIPPED: IRIS_AUDIO_LOOPBACK not set` and pass. With it
   set, a missing source or silence fails them.
 
-The tests, for HAL2, O2 audio, Octane RAD1 and the host output on its own:
+The tests, for HAL2, O2 audio, Octane RAD1, the Tezro's ICE1724 and the host
+output on its own:
 
 - `a_tone_in_guest_memory_reaches_the_host_on_the_real_clock` (file only):
   the card built as a machine builds it, playing a tone from memory laid
@@ -160,9 +161,12 @@ The tests, for HAL2, O2 audio, Octane RAD1 and the host output on its own:
   level. The sound must last no more than 110% of what the card played, at
   the capture's rate, and at least half of it: a busy host can make the
   card catch up in a burst that overflows the host ring. The card's
-  underrun counter must move during the pause. HAL2 and the host test play
-  440 and 880 Hz. The O2's and RAD1's 512-frame rings hold whole cycles of
-  468.75 and 937.5 Hz, and of 430.7 and 861.3 Hz.
+  underrun counter must move during the pause. HAL2, the ICE1724 and the host
+  test play 440 and 880 Hz. The O2's and RAD1's 512-frame rings hold whole
+  cycles of 468.75 and 937.5 Hz, and of 430.7 and 861.3 Hz. The ICE1724's
+  guest writes eight-slot frames just ahead of the address it reads and looks
+  away for 30 ms twice; its tone rises 2 Hz a second, and into a file its
+  frames must come out in the guest's order, none replayed.
 
 nextest runs the real-device tests one at a time (the `real-audio` group in
 `.config/nextest.toml`): two cards on one output would mix. Under plain

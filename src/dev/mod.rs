@@ -36,6 +36,7 @@ pub mod mace_ust;
 pub mod nvme;
 pub mod ns16550;
 pub mod qlogic_ring;
+pub mod ice1724;
 pub mod rad1;
 pub mod mgras;
 pub mod odyssey;
