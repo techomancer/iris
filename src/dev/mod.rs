@@ -13,6 +13,7 @@ pub mod mace_audio;
 pub mod mace_isa;
 pub mod crime;
 pub mod battery_clock;
+pub mod chip_clock;
 pub mod deadline_timers;
 pub mod deadline;
 pub mod ds1685;

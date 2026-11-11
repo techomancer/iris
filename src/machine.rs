@@ -889,6 +889,10 @@ impl Machine {
             }
         }
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
+        #[cfg(feature = "ci_clock")]
+        hpc3.rtc().set_cpu_cycles(cpu.cycles_ptr());
+        #[cfg(feature = "ci_clock")]
+        hpc3.ioc().pit().set_cpu_cycles(cpu.cycles_ptr());
 
         // Inject the CPU/self handles jitv2's compile-thread worker needs to
         // pause the CPU around its own memory-growth flush (see
