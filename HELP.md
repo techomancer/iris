@@ -730,7 +730,7 @@ thread_affinity = false     # pin threads to cores
 # refresh_core = 4
 
 [jitv2]
-threads = 1                 # compile-pool threads, --features jitv2
+# threads = 1               # compile-pool threads, --features jitv2 (unset: one per CPU, at most 4)
 cache = false               # reuse compiled pages across runs (opt-in)
 # cache_dir = ""            # blank: platform user cache directory / iris/jitv2
 
