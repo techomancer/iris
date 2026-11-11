@@ -11,6 +11,11 @@ pub const PCI_COMMAND_MEMORY: u32 = 0x2;
 /// Secondary status (dword 7 bit 29): received master abort.
 const SEC_STATUS_MASTER_ABORT: u32 = 1 << 29;
 
+/// A type 1 header's I/O base and limit registers read 1 in bits 3:0 when the
+/// bridge decodes 32-bit I/O addresses (PCI-to-PCI Bridge Architecture
+/// Specification 1.2, 3.2.5.6).
+const IO_32BIT: u32 = 0x0101;
+
 /// Interrupt pins, as register 0x3d holds them.
 pub const PCI_INTA: u8 = 1;
 
@@ -119,6 +124,9 @@ pub struct PciConfig {
     /// A type 1 header (PCI-to-PCI bridge): no BARs, and dwords 6 to 12 are
     /// bus numbers and forwarding windows.
     type1: bool,
+    /// A type 1 header with the TI PCI2050's wide windows: 32-bit I/O
+    /// addressing and 32-bit upper halves of the prefetchable window.
+    wide: bool,
 }
 
 impl PciConfig {
@@ -194,6 +202,7 @@ impl PciConfig {
             writable_masks,
             caps_end: 0,
             type1: false,
+            wide: false,
         }
     }
 
@@ -216,6 +225,23 @@ impl PciConfig {
         c
     }
 
+    /// As [`Self::type1`], with the windows of the TI PCI2050 (SCPS053B,
+    /// 4.17, 4.18, 4.26 and 4.27 and the prefetchable upper registers): I/O
+    /// base and limit read 1 in bits 3:0 for 32-bit I/O addressing, the
+    /// upper 16 bits of both (dword 12) are stored, and the upper 32 bits of
+    /// the prefetchable base and limit (dwords 10 and 11) are stored. The
+    /// prefetchable low nibbles stay 0, so the window is 32-bit. A window
+    /// above 4 GiB is stored but never forwarded: what the chip does there is
+    /// unknown.
+    pub fn type1_wide(vendor: u16, device: u16, revision: u8) -> Self {
+        let mut c = Self::type1(vendor, device, revision);
+        c.wide = true;
+        let r = c.regs.get_mut().unwrap();
+        r[7] = IO_32BIT;
+        c.power_on = *r;
+        c
+    }
+
     /// Whether this type 1 header forwards the range `base..base + size` of
     /// `space` to its secondary bus: the range lies wholly inside one
     /// enabled window (I/O, memory or prefetchable memory). A range that
@@ -227,7 +253,11 @@ impl PciConfig {
         let inside = |wlo: u64, whi: u64| wlo <= whi && wlo <= lo && hi <= whi;
         match space {
             Space::Io => {
-                r[1] & PCI_COMMAND_IO != 0 && inside(((r[7] & 0xf0) as u64) << 8, ((r[7] >> 8 & 0xf0) as u64) << 8 | 0xfff)
+                // Bits 15:12 from the base and limit registers, 31:16 from
+                // the upper registers, and 11:0 all zeros or all ones.
+                let (base_hi, limit_hi) = ((r[12] & 0xffff) as u64, (r[12] >> 16) as u64);
+                r[1] & PCI_COMMAND_IO != 0
+                    && inside(base_hi << 16 | ((r[7] & 0xf0) as u64) << 8, limit_hi << 16 | ((r[7] >> 8 & 0xf0) as u64) << 8 | 0xfff)
             }
             Space::Mem => {
                 r[1] & PCI_COMMAND_MEMORY != 0 && {
@@ -314,16 +344,23 @@ impl PciConfig {
                     | (val & mask & self.command_mask as u32);
             }
             // A bridge's bus numbers and forwarding windows. The low nibbles
-            // of the base and limit registers are read-only zero (16-bit I/O
-            // and 32-bit memory), which also makes the upper halves of the
-            // prefetchable and I/O windows (dwords 10 to 12) read-only zero;
-            // the I/O secondary status is not kept.
+            // of the memory base and limit registers are read-only zero (32-bit
+            // memory); the I/O secondary status is not kept. The upper halves
+            // of the prefetchable and I/O windows (dwords 10 to 12) are plain
+            // storage in a wide bridge and read-only zero in any other.
             6 if self.type1 => r[reg] = (r[reg] & !mask) | (val & mask),
-            10..=12 if self.type1 => {}
-            // I/O base and limit; the secondary status above them is
+            10..=12 if self.type1 => {
+                if self.wide {
+                    r[reg] = (r[reg] & !mask) | (val & mask);
+                }
+            }
+            // I/O base and limit, whose low nibbles are the read-only 32-bit
+            // capability in a wide bridge; the secondary status above them is
             // write-one-to-clear, and only received master abort is kept.
             7 if self.type1 => {
-                r[reg] = (((r[reg] & !mask) | (val & mask)) & 0x0000_f0f0) | (r[reg] & !(val & mask) & SEC_STATUS_MASTER_ABORT)
+                r[reg] = (((r[reg] & !mask) | (val & mask)) & 0x0000_f0f0)
+                    | if self.wide { IO_32BIT } else { 0 }
+                    | (r[reg] & !(val & mask) & SEC_STATUS_MASTER_ABORT)
             }
             8 | 9 if self.type1 => r[reg] = ((r[reg] & !mask) | (val & mask)) & 0xfff0_fff0,
             // A type 1 header's expansion ROM base is dword 14, and the

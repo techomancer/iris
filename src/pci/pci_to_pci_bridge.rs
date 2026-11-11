@@ -35,6 +35,17 @@ impl PciToPciBridge {
             sec: PciBus::secondary(parent.clone(), at),
         })
     }
+
+    /// As [`Self::with_revision`], with the windows of the TI PCI2050: 32-bit
+    /// I/O addressing and stored upper halves of the prefetchable window (see
+    /// [`PciConfig::type1_wide`]). Other bridges keep the plain 16-bit I/O
+    /// window until the same registers are known for their chips.
+    pub fn with_wide_windows(parent: &PciBus, at: DevFn, vendor: u16, device: u16, revision: u8) -> Arc<Self> {
+        Arc::new(Self {
+            pci: PciFunctionState::new(PciConfig::type1_wide(vendor, device, revision)),
+            sec: PciBus::secondary(parent.clone(), at),
+        })
+    }
 }
 
 impl PciToPciBridge {
@@ -78,7 +89,7 @@ impl PciFunction for PciToPciBridge {
 mod tests {
     use super::*;
     use crate::pci::testing::{TestCard, TestHost};
-    use crate::pci::{Bar, CpuWindow, IntxRouting, PciHost, Space, PCI_COMMAND_MEMORY};
+    use crate::pci::{Bar, CpuWindow, IntxRouting, PciHost, Space, PCI_COMMAND_IO, PCI_COMMAND_MEMORY};
     use std::sync::{Mutex, Weak};
 
     // The bridge sits at device 3, whose INTA..INTD reach outputs 0 to 3.
@@ -106,10 +117,23 @@ mod tests {
     /// A bridge at device 3 numbering a bus 1 behind it, with window
     /// registers programmed for memory 0x8000_0000..0x800f_ffff.
     fn rig() -> Rig {
+        rig_with(false)
+    }
+
+    /// As [`rig`], with a bridge that has the PCI2050's wide windows.
+    fn rig_wide() -> Rig {
+        rig_with(true)
+    }
+
+    fn rig_with(wide: bool) -> Rig {
         let host = Arc::new(TestHost::default());
         let up: Weak<dyn PciHost> = Arc::downgrade(&(host.clone() as Arc<dyn PciHost>));
         let root = PciBus::new(0, &W, up);
-        let bridge = PciToPciBridge::new(&root, at(3, 0), 0x1234, 0x5678);
+        let bridge = if wide {
+            PciToPciBridge::with_wide_windows(&root, at(3, 0), 0x1234, 0x5678, 0)
+        } else {
+            PciToPciBridge::new(&root, at(3, 0), 0x1234, 0x5678)
+        };
         root.attach(at(3, 0), bridge.clone());
         root.config_write(at(3, 0), 0x18, 4, 0x0001_0100); // primary 0, secondary 1, subordinate 1
         root.config_write(at(3, 0), 0x20, 4, 0x8000_8000);
@@ -158,6 +182,23 @@ mod tests {
         assert_eq!(read(0x10, 4), 0, "no BARs");
         root.config_write(at(3, 0), 0x19, 1, 0x05);
         assert_eq!(read(0x19, 1), 0x05, "the secondary bus number is a byte");
+    }
+
+    /// The PCI2050's windows: 32-bit I/O, and the upper halves of the
+    /// prefetchable window stored; the low nibbles of 0x24 read 0, so the
+    /// window is 32-bit.
+    #[test]
+    fn a_wide_bridge_stores_the_upper_halves_of_its_windows() {
+        let host = Arc::new(TestHost::default());
+        let up: Weak<dyn PciHost> = Arc::downgrade(&(host.clone() as Arc<dyn PciHost>));
+        let root = PciBus::new(0, &W, up);
+        root.attach(at(3, 0), PciToPciBridge::with_wide_windows(&root, at(3, 0), 0x104c, 0xac28, 1));
+        let read = |off, w| root.config_read(at(3, 0), off, w).unwrap();
+        assert_eq!((read(0x1c, 4), read(0x24, 4), read(0x28, 4), read(0x2c, 4), read(0x30, 4)), (0x0101, 0, 0, 0, 0), "reset");
+        for (off, stuck) in [(0x1c, 0xf1f1), (0x20, 0xfff0_fff0), (0x24, 0xfff0_fff0), (0x28, !0), (0x2c, !0), (0x30, !0), (0x38, 0)] {
+            root.config_write(at(3, 0), off, 4, !0);
+            assert_eq!(read(off, 4), stuck, "register {off:#x}");
+        }
     }
 
     #[test]
@@ -219,6 +260,35 @@ mod tests {
         assert!(r.root.decode(Space::Mem, 0x8000_2010).is_none());
         r.root.config_write(at(3, 0), 0x04, 2, PCI_COMMAND_MEMORY);
         assert_eq!(seen.lock().unwrap().len(), 1, "and enabling it brings the run back");
+    }
+
+    /// The I/O window is 32 bits wide: bits 15:12 from the base and limit
+    /// registers and 31:16 from the upper registers, so an I/O BAR above 64
+    /// KiB forwards only inside both halves.
+    #[test]
+    fn an_io_window_forwards_by_its_32_bit_base_and_limit() {
+        let r = rig_wide();
+        let sec = r.bridge.secondary();
+        let card = TestCard::new([Bar::Io(0x20), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0);
+        sec.attach(at(2, 0), card);
+        sec.config_write(at(2, 0), 0x04, 2, PCI_COMMAND_IO);
+        let reaches = |addr| r.root.decode(Space::Io, addr).map(|(_, bar, off)| (bar, off));
+        // Window 0x0012_2000..0x0012_3fff.
+        r.root.config_write(at(3, 0), 0x1c, 2, 0x3020);
+        r.root.config_write(at(3, 0), 0x30, 4, 0x0012_0012);
+        sec.config_write(at(2, 0), 0x10, 4, 0x0012_3001);
+        assert_eq!(reaches(0x0012_3004), None, "the bridge's I/O enable is off");
+        r.root.config_write(at(3, 0), 0x04, 2, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
+        assert_eq!(reaches(0x0012_3004), Some((0, 4)));
+        // The upper halves matter: the same low bits at another 64 KiB.
+        sec.config_write(at(2, 0), 0x10, 4, 0x0013_3001);
+        assert_eq!(reaches(0x0013_3004), None);
+        // And a window with zero upper halves is the 16-bit window.
+        r.root.config_write(at(3, 0), 0x30, 4, 0);
+        sec.config_write(at(2, 0), 0x10, 4, 0x3001);
+        assert_eq!(reaches(0x3004), Some((0, 4)));
+        sec.config_write(at(2, 0), 0x10, 4, 0x4001);
+        assert_eq!(reaches(0x4004), None, "past the limit");
     }
 
     /// A pin of the function at device `d` behind the bridge reaches the
