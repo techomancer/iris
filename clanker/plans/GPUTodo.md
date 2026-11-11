@@ -917,7 +917,7 @@ M4 work and READ remains rejected until M5 observation support.
 - [x] Make one VDMA block one staged payload plus one command where possible.
 - [ ] Preserve all-or-nothing `BUS_BUSY` behavior.
 - [x] Add CPU-walked PIO and line transfer descriptors.
-- [ ] Add zoom segment coalescing.
+- [x] Add zoom segment coalescing.
 - [x] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
 - [ ] Stress CPU and VDMA producer interleaving and staging wraparound.
 
@@ -966,8 +966,21 @@ visits consume none. Antialiased start-endpoint filtering applies only to the
 first outer invocation; later `LENGTH32` retries begin from the integer
 continuation state.
 
-Resident FASTCLEAR+ALPHAHOST, zoom coalescing, all-or-nothing `BUS_BUSY` and
-producer/wraparound stress remain deferred; HOSTR remains M5 work.
+The fourth M4 slice coalesces consecutive serial HostW commands into one
+resident batch and submission. This directly covers IRIX `glPixelZoom`, which
+emits one COLORHOST+ALPHAHOST full-block GO per source pixel: each architectural
+record remains one command and one immutable qword, but a complete run no
+longer submits once per source pixel. All commands share the ordered anchor
+tile and execute serially in one shader workgroup. An ordinary DRAW or SCR2SCR
+boundary flushes the HostW prefix before accepting parallel raster work, and a
+following HostW command likewise flushes an ordinary prefix. Payload or
+state-slot exhaustion submits the complete accepted HostW prefix and retries
+the current record without advancing its context twice. A 6x4 source grid of
+6x6 zoom blocks, both ordering directions and a one-slot capacity boundary
+match complete CPU planes on Vulkan and D3D12.
+
+Resident FASTCLEAR+ALPHAHOST, all-or-nothing `BUS_BUSY` and producer/staging
+wraparound stress remain deferred; HOSTR remains M5 work.
 
 Complete when ordinary and zoomed pixmaps match CPU mode with no CPU
 framebuffer store and no per-qword GPU submission.
