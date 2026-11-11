@@ -1,0 +1,64 @@
+name: Loom
+
+# Model-checks the concurrency models (`loom_tests` modules, built only under
+# --cfg loom). Pull requests run them when a changed file holds a loom model;
+# main runs them nightly, ahead of Nightly, to catch breakage from other files.
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+    paths: [ "**/*.rs" ]
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # libchdman-rs fetches a prebuilt archive at build time; compile from source
+  # when that download fails.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
+  # The cfg changes every crate's build, so this job has its own cache key.
+  RUSTFLAGS: --cfg loom
+  # Debug info is most of the compile time and the models don't need it.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  # The changed .rs files that hold loom models (they sit beside the code they
+  # check). Empty means the pull request skips the models.
+  scope:
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      models: ${{ steps.find.outputs.models }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 2
+    - id: find
+      run: echo "models=$(git diff --name-only HEAD^1 HEAD -- '*.rs' | xargs -r git grep -l 'cfg(loom)' -- | xargs)" >> "$GITHUB_OUTPUT"
+
+  loom:
+    name: Loom models
+    needs: scope
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.scope.outputs.models != '') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install pinned toolchain
+      run: rustup show
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+    # Pull requests restore main's cache but never save their own; the nightly
+    # run on main saves it.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: loom
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Run the loom models
+      run: cargo test --lib loom_tests
