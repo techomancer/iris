@@ -704,9 +704,12 @@ pub struct PpMemSpace {
     /// Default publication target — see [`OwnBitmap`]. Read through
     /// `mapped_bitmap()`; written only via `state.sink`.
     own_bitmap: OwnBitmap,
-    /// Read and written only with `guard` held, except `window` and `shift`,
-    /// which never change, and the setup calls that run before any CPU does.
-    /// (`unsafe impl Sync` below records that contract.)
+    /// What never changes after the space is made: read by anyone, with no
+    /// guard.
+    geo: Geometry,
+    /// Read and written only with `guard` held, and by the setup calls that
+    /// run before any CPU does. (`unsafe impl Sync` below records that
+    /// contract.)
     state: UnsafeCell<SpaceState>,
     /// Serializes the paths that change `state`: a remap (`map_bank`,
     /// `map_alias`, `map_range`, `unmap_range`, `clear_mappings`) and a CPU's
@@ -719,12 +722,20 @@ pub struct PpMemSpace {
     guard: parking_lot::Mutex<()>,
 }
 
-struct SpaceState {
-    /// The window's size in bytes. Never changes.
+/// A space's fixed shape. Its fine table words change in place under `guard`,
+/// but the table itself, the window and the region size never move.
+struct Geometry {
+    /// The window's size in bytes.
     window: u64,
     /// The region bitmap's region size: the window's [`window_shift`] unless
-    /// the space was made with another. Never changes.
+    /// the space was made with another.
     shift: u32,
+    /// One bit per [`FINE_SHIFT`] region of the whole window, set when the
+    /// region is wholly mapped: [`PpMemSpace::fine_table`].
+    fine: Box<[AtomicU64]>,
+}
+
+struct SpaceState {
     mappings: Vec<Mapping>,
     /// Where the bitmap is published. Points at `own_bitmap` until a consumer
     /// hands over its own inline field, so it is never null and publication is
@@ -737,9 +748,6 @@ struct SpaceState {
     sink2: *mut u64,
     /// The bitmap last published to the sinks above.
     bits: u64,
-    /// One bit per [`FINE_SHIFT`] region of the whole window, set when the
-    /// region is wholly mapped: [`PpMemSpace::fine_table`].
-    fine: Box<[AtomicU64]>,
     /// Bumped whenever the fine table changes, so that a view can tell it
     /// moved: [`PpMemSpace::add_key_sink`].
     fine_epoch: u64,
@@ -815,13 +823,11 @@ struct OwnBitmap(Box<u64>);
 //
 // Limit: an access that races the instant a range changes meaning can see the
 // old memory, the new, or zeros, and a store that reads the bitmap just before
-// a bit drops can land in a page about to be scrubbed and be lost. That is the
-// hardware's own contract for an access to an address while its node number
-// is being rewritten: the routing registers are not ordered against another
-// processor's accesses, and software renumbers a node before it uses the new
-// number (the PROM does, then the kernel). Neither sequence is known to touch
-// the old range during the change, and a booted two-node Onyx2 runs correctly
-// on both processors. A guest that did would lose a store on the hardware too.
+// a bit drops can land in a page about to be scrubbed and be lost. A caller
+// that remaps while the CPUs run has to accept that. The machines that remap
+// after boot stop the other CPUs first: the Octane for a memory
+// reconfiguration and the SN0 boards for a node renumbering
+// (`Hub::set_world`), so for them it cannot happen.
 //
 unsafe impl Send for PpMemSpace {}
 unsafe impl Sync for PpMemSpace {}
@@ -857,14 +863,16 @@ impl PpMemSpace {
             gen_banks: banks.iter().map(|b| b.gen_shared().clone()).collect(),
             own_bitmap,
             guard: parking_lot::Mutex::new(()),
-            state: UnsafeCell::new(SpaceState {
+            geo: Geometry {
                 window,
                 shift,
+                fine: (0..(window >> FINE_SHIFT).div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            },
+            state: UnsafeCell::new(SpaceState {
                 mappings: Vec::new(),
                 sink,
                 sink2,
                 bits: 0,
-                fine: (0..(window >> FINE_SHIFT).div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
                 fine_epoch: 0,
                 views: Vec::new(),
                 unbacked: Vec::new(),
@@ -874,12 +882,12 @@ impl PpMemSpace {
 
     /// The window's size in bytes.
     pub fn window_size(&self) -> u64 {
-        unsafe { (*self.state.get()).window }
+        self.geo.window
     }
 
     /// The region bitmap's region size, as a shift.
     pub fn region_shift(&self) -> u32 {
-        unsafe { (*self.state.get()).shift }
+        self.geo.shift
     }
 
     /// The fine table and how many regions it has: bit `r % 64` of word
@@ -888,8 +896,7 @@ impl PpMemSpace {
     /// the region bitmap spans 64 regions, so a consumer that misses the
     /// bitmap tests it before taking the bus. Its words never move.
     pub fn fine_table(&self) -> (*const AtomicU64, u64) {
-        let st = unsafe { &*self.state.get() };
-        (st.fine.as_ptr(), st.window >> FINE_SHIFT)
+        (self.geo.fine.as_ptr(), self.geo.window >> FINE_SHIFT)
     }
 
     /// Publish a key to `ptr` for view `v` that changes whenever the region
@@ -996,7 +1003,7 @@ impl PpMemSpace {
                 }
             }
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, obj: b.clone(), src, period: 0 });
+            Self::record(&self.geo, st, Mapping { at: offset, len: size, obj: b.clone(), src, period: 0 });
             Ok(())
         })
     }
@@ -1009,7 +1016,7 @@ impl PpMemSpace {
         let _ = self.remapping(|| {
             let st = unsafe { &mut *self.state.get() };
             Self::cut(st, offset, size);
-            Self::recompute_bitmap(st);
+            Self::recompute_bitmap(&self.geo, st);
             let _ = unsafe { self.space.scrub(offset as usize, size as usize) };
             // Views keep the pages they hold, as `clear_mappings` leaves them.
             for view in &st.views {
@@ -1055,8 +1062,8 @@ impl PpMemSpace {
     /// A bit is set only if the whole region (64MB in a 4GB window) is covered, so a region that
     /// is partially mapped — or mapped alongside MMIO — reads as unmapped and
     /// keeps taking the bus path.
-    fn recompute_bitmap(state: &mut SpaceState) {
-        let region = 1u64 << state.shift;
+    fn recompute_bitmap(geo: &Geometry, state: &mut SpaceState) {
+        let region = 1u64 << geo.shift;
         let mut bits = 0u64;
         for bit in 0..64u32 {
             let start = (bit as u64) * region;
@@ -1086,16 +1093,15 @@ impl PpMemSpace {
         publish_word(state.sink, bits);
         publish_word(state.sink2, bits);
         state.bits = bits;
-        Self::recompute_fine(state);
+        Self::recompute_fine(geo, state);
         for v in 0..state.views.len() {
-            Self::publish_view(state, v);
+            Self::publish_view(geo.shift, state, v);
         }
     }
 
     /// Publish view `v`'s bitmap: the shared one, plus every region the view
     /// holds a page in, which `hold_line_page` made safe to touch whole.
-    fn publish_view(state: &mut SpaceState, v: usize) {
-        let shift = state.shift;
+    fn publish_view(shift: u32, state: &mut SpaceState, v: usize) {
         let (base, epoch) = (state.bits, state.fine_epoch);
         let view = &mut state.views[v];
         let bits = view.held.keys().fold(base, |b, &page| b | 1u64 << (page >> shift));
@@ -1113,10 +1119,10 @@ impl PpMemSpace {
 
     /// Recompute the fine table from the live mapping list, and move the fine
     /// epoch if it changed.
-    fn recompute_fine(state: &mut SpaceState) {
+    fn recompute_fine(geo: &Geometry, state: &mut SpaceState) {
         let mut spans: Vec<(u64, u64)> = state.mappings.iter().map(|m| (m.at, m.at + m.len)).collect();
         spans.sort_unstable();
-        let mut fine = vec![0u64; state.fine.len()];
+        let mut fine = vec![0u64; geo.fine.len()];
         let mut i = 0;
         while i < spans.len() {
             let (start, mut end) = spans[i];
@@ -1131,7 +1137,7 @@ impl PpMemSpace {
             }
         }
         let mut changed = false;
-        for (word, new) in state.fine.iter().zip(fine) {
+        for (word, new) in geo.fine.iter().zip(fine) {
             changed |= word.swap(new, Ordering::Release) != new;
         }
         if changed {
@@ -1139,11 +1145,11 @@ impl PpMemSpace {
         }
     }
 
-    fn record(state: &mut SpaceState, m: Mapping) {
+    fn record(geo: &Geometry, state: &mut SpaceState, m: Mapping) {
         // Drop or trim what this mapping replaces, then record it.
         Self::cut(state, m.at, m.len);
         state.mappings.push(m);
-        Self::recompute_bitmap(state);
+        Self::recompute_bitmap(geo, state);
     }
 }
 
@@ -1171,14 +1177,14 @@ impl PpMemSpace {
     pub fn add_cached_view(&self, sinks: &[*mut u64]) -> io::Result<usize> {
         let _held = self.guard.lock();
         let st = unsafe { &mut *self.state.get() };
-        let space = AddrSpace::reserve(st.window as usize)?;
+        let space = AddrSpace::reserve(self.geo.window as usize)?;
         let sinks = sinks.iter().copied().filter(|p| !p.is_null()).collect();
         st.views.push(View { space, sinks, held: Default::default(), key_sinks: Vec::new(), key: 0, seen: (0, 0) });
         let v = st.views.len() - 1;
         for m in st.mappings.clone() {
             self.lay(st, v, &m, m.at, m.at + m.len)?;
         }
-        Self::publish_view(st, v);
+        Self::publish_view(self.geo.shift, st, v);
         Ok(v)
     }
 
@@ -1219,7 +1225,7 @@ impl PpMemSpace {
         if !self.backs(page) && !st.unbacked.iter().any(|&(a, b)| page >= a && page + gran <= b) {
             return None;
         }
-        let shift = st.shift;
+        let shift = self.geo.shift;
         // The bitmap names the window's first 64 regions; a page past them is
         // reached through the fine table, with nothing held.
         if page >> shift >= 64 {
@@ -1242,7 +1248,7 @@ impl PpMemSpace {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len());
         }
         st.views[v].held.insert(page, 1);
-        Self::publish_view(st, v);
+        Self::publish_view(self.geo.shift, st, v);
         Some(true)
     }
 
@@ -1283,7 +1289,7 @@ impl PpMemSpace {
         for m in st.mappings.iter().filter(|m| m.at < page + gran && m.at + m.len > page) {
             let _ = self.lay(st, v, m, page.max(m.at), (page + gran).min(m.at + m.len));
         }
-        Self::publish_view(st, v);
+        Self::publish_view(self.geo.shift, st, v);
         true
     }
 
@@ -1428,7 +1434,7 @@ impl MappedMemory for PpMemSpace {
         }
         let mappings = std::mem::take(&mut st.mappings);
         // The fine table goes before the pages do.
-        Self::recompute_fine(st);
+        Self::recompute_fine(&self.geo, st);
         for m in mappings {
             // Best-effort: a failure here leaves the range mapped, which is
             // still safe — it just isn't reverted.
@@ -1446,7 +1452,7 @@ impl MappedMemory for PpMemSpace {
                 }
             }
         }
-        Self::recompute_bitmap(st);
+        Self::recompute_bitmap(&self.geo, st);
     }
 
     fn map_bank(&self, bank: usize, offset: u64, size: u64, period: u64) -> io::Result<()> {
@@ -1502,7 +1508,7 @@ impl MappedMemory for PpMemSpace {
             }
 
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period });
+            Self::record(&self.geo, st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period });
             Ok(())
         })
     }
@@ -1575,7 +1581,7 @@ impl MappedMemory for PpMemSpace {
                 }
             }
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period: 0 });
+            Self::record(&self.geo, st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period: 0 });
             Ok(())
         })
     }
