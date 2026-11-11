@@ -1160,3 +1160,38 @@ fn texgen_and_clip_plane_state_round_trips_through_a_stream() {
     assert_eq!(g.texgen, r.gl.texgen);
     assert_eq!((g.user_plane, g.user_on), (r.gl.user_plane, r.gl.user_on));
 }
+
+/// The rectangle begin (token 0x003) with its count word and four corners, as the client's
+/// glRect sends them, fills the pixels the corners enclose, as the independent-quads begin does.
+#[test]
+fn a_rectangle_fills_the_pixels_its_corners_enclose() {
+    use crate::dev::kona::back::KonaBackend;
+    use crate::dev::kona::KonaConfig;
+    let run = |begin: u32, count: u32| {
+        let mut r = Rig::new();
+        r.colour(1.0, 1.0, 1.0);
+        r.cmd(begin, &[count]);
+        // glRect(-0.5, -0.25, 0.5, 0.25): (x1,y1) (x2,y1) (x2,y2) (x1,y2).
+        for (x, y) in [(-0.5, -0.25), (0.5, -0.25), (0.5, 0.25), (-0.5, 0.25)] {
+            r.v(x, y);
+        }
+        r.end();
+        assert_eq!(r.gl.in_begin, false);
+        let full = Rect { x0: 0, y0: 0, x1: 100, y1: 100 };
+        let ds = DrawState { clip: full, viewport: full, colour: [1, 0], colours: 1, depth_word: 3, depth_bits: 32, ..DrawState::default() };
+        let mut st = KonaBackend::new(KonaConfig { managed: (100, 100), ..KonaConfig::default() }.with_pool(0, 32));
+        let store = st.store.clone();
+        st.prims = Prims { tris: r.tris.clone(), state: Some(ds), ..Default::default() };
+        st.flush();
+        let lit: Vec<(u32, u32)> = (0..100).flat_map(|y| (0..100).map(move |x| (x, y))).filter(|&(x, y)| store.read(x, y, 1) != 0).collect();
+        (lit, r.path.counts.rectangles)
+    };
+    let (rect, rects) = run(BEGIN_PRIMITIVE_RECTANGLE, 14);
+    // x = (ndc + 1) / 2 * 100 gives 25..75 across and 37.5..62.5 up: 50 by 25 pixels, the
+    // half-pixel rows kept or dropped by the pixel-centre rule.
+    assert_eq!(rects, 1);
+    assert!(rect.len() >= 50 * 24 && rect.len() <= 50 * 26, "{}", rect.len());
+    assert!(rect.iter().all(|&(x, y)| (25..75).contains(&x) && (37..63).contains(&y)));
+    let (quad, _) = run(BEGIN_PRIMITIVE_INDEPENDENT_QUADS, 0);
+    assert_eq!(rect, quad, "the same fill as a quad on the four corners");
+}
