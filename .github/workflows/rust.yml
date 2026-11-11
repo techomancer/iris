@@ -153,16 +153,20 @@ jobs:
       with:
         report_paths: target/nextest/ci/junit.xml
         annotate_only: true
-    - name: Build opt-in REX3 dirty uploads
-      run: |
-        cargo build -p iris --features rex-dirty-upload
-        cargo build -p iris-gui --features rex-dirty-upload
+    # The tests below build iris with the feature on Linux; the GUI crate only
+    # needs to compile, and so does iris elsewhere.
     - name: Test REX3 dirty uploads
       if: runner.os == 'Linux'
       run: |
         cargo test -p iris --test rex3_dirty --features rex-dirty-upload
         cargo test -p iris --lib --features rex-dirty-upload go_damage_classifies_planes_bounds_and_non_writes
         cargo test -p iris --lib --features rex-dirty-upload register_traffic_is_clean_and_draws_publish_selected_plane
+    - name: Check REX3 dirty uploads in the GUI
+      if: runner.os == 'Linux'
+      run: cargo check -p iris-gui --features rex-dirty-upload
+    - name: Check opt-in REX3 dirty uploads
+      if: runner.os != 'Linux'
+      run: cargo check -p iris -p iris-gui --features rex-dirty-upload
 
   # Full-size JIT-vs-interpreter sweeps. Debug builds run them scaled down, so
   # main runs them at full size in release (no LTO: it costs 4x the build).
