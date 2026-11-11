@@ -323,8 +323,11 @@ CPU walker, including exact context advancement. The dual-backend hardware
 fill case includes the reverse fast-clear command.
 Two line-normalizer tests compare payload coverage and exact context
 completion with the CPU walker across all octants, both BRESROUND tie modes,
-fractional endpoints, skip-first/last and antialiased endpoint filtering. The
-hardware line case executes integer, fractional and antialiased commands
+fractional endpoints, skip-first/last and antialiased endpoint filtering.
+Their HostW coverage also checks transactional integer, fractional and
+antialiased completion, mixed shade/pattern state, single-step continuation,
+`LENGTH32` outer retries and restored fractional endpoint state. The hardware
+line case executes ordinary integer, fractional and antialiased commands
 against complete seeded RGB and auxiliary planes on both backends.
 The hardware clipping case compares complete planes after offset blocks and
 lines using SMASK0, OR-combined SMASK1-4 and CIDMATCH. It also verifies that a
@@ -359,15 +362,20 @@ each direct segment and after the board-level retry on both backends.
 Two CPU HostW walker tests compare transactional completion with the generic
 walker, including restored noncanonical line-pattern phase, and pin the
 remaining fast-clear rejection. A separate interpreter/Cranelift oracle pins
-mixed host-source selection. The hardware HostW case stages PIO and multiword
-BLOCK/SPAN transfers and compares both complete planes and full context with
-the CPU oracle. Its matrix covers COLORHOST, ALPHAHOST and both, packed and
-unpacked 4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, residual input state,
-row-boundary continuation, PIO replication, clipping, logic, blending,
-WRMASK, RGB/auxiliary planes and the board-level outer GO integration. It also
-covers transparent and opaque combined patterns, row reset, shade with host
-color and/or alpha, endpoint skips, LENGTH32 continuation and increasing and
-decreasing LR-only semantics.
+mixed host-source selection. The hardware HostW case stages PIO and multiword BLOCK/SPAN and line transfers
+and compares both complete planes and full context with the CPU oracle. Its
+segment matrix covers COLORHOST, ALPHAHOST and both, packed and unpacked
+4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, residual input state, row-boundary
+continuation, PIO replication, clipping, logic, blending, WRMASK,
+RGB/auxiliary planes and board-level outer GO integration. It also covers
+transparent and opaque combined patterns, row reset, shade with host color
+and/or alpha, endpoint skips, LENGTH32 continuation and increasing and
+decreasing LR-only semantics. The line matrix adds all integer octants,
+fractional and antialiased lines, BRESROUND state, restored fractional
+endpoint filtering across multiword `LENGTH32` retries, single-step
+continuation, YFLIP/XYOFFSET, shade, transparent and opaque patterns, partial
+clipping, CID and alpha rejection, packed/unpacked input and command-free
+no-progress retirement.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
