@@ -138,6 +138,14 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         save-if: ${{ github.ref == 'refs/heads/main' }}
+    # Windows only compiles here, so skip fat LTO; Linux's hot-path check below
+    # reads the real binary.
+    - name: Skip fat LTO
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        echo "CARGO_PROFILE_RELEASE_LTO=off" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
     - name: Build
       run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
     # Reads the binary built above (lightning, fat LTO); x86-64 only.
