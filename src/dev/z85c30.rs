@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
+use crate::sync::Doorbell;
 use std::sync::atomic::{AtomicU8, AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::io::{self, Write, Read};
@@ -349,8 +350,10 @@ impl Channel {
 
 #[derive(Clone)]
 pub struct Z85c30 {
-    pub channel_a: Arc<(Mutex<Channel>, Condvar)>,
-    pub channel_b: Arc<(Mutex<Channel>, Condvar)>,
+    /// Each channel's state, rung when its TX thread may have a character
+    /// to send.
+    pub channel_a: Arc<Doorbell<Channel>>,
+    pub channel_b: Arc<Doorbell<Channel>>,
     // Swappable so CI mode can replace the default TCP backend with a
     // `CiSerialBackend` before `start()` is called. Wrapped in `Arc<Mutex<_>>`
     // so `Z85c30` stays `Clone` and the swap is thread-safe.
@@ -393,9 +396,9 @@ impl Z85c30 {
             (Arc::new(NullBackend), Arc::new(NullBackend));
 
         Self {
-            channel_a: Arc::new((Mutex::new(Channel::new("A", ip_a.clone(), ip_b.clone(), irq.clone())), Condvar::new())),
+            channel_a: Arc::new(Doorbell::new(Channel::new("A", ip_a.clone(), ip_b.clone(), irq.clone()))),
             // Note: Channel B gets ip_b as its 'num' and ip_a as 'other'
-            channel_b: Arc::new((Mutex::new(Channel::new("B", ip_b, ip_a, irq)), Condvar::new())),
+            channel_b: Arc::new(Doorbell::new(Channel::new("B", ip_b, ip_a, irq))),
             backend_a: Arc::new(Mutex::new(backend_a)),
             backend_b: Arc::new(Mutex::new(backend_b)),
             inject_b: Arc::new(Mutex::new(VecDeque::new())),
@@ -444,7 +447,7 @@ impl Z85c30 {
     }
 
     pub fn read_a_control(&self) -> u8 { 
-        let mut a = self.channel_a.0.lock();
+        let mut a = self.channel_a.lock();
         if a.reg_ptr == 2 {
             // RR2: Interrupt Vector (modified in Channel B)
             // TODO: Implement Status Affects Vector modification
@@ -465,24 +468,24 @@ impl Z85c30 {
         a.read_control() 
     }
     pub fn write_a_control(&self, val: u8) { 
-        let mut a = self.channel_a.0.lock();
-        let mut b = self.channel_b.0.lock();
+        let mut a = self.channel_a.lock();
+        let mut b = self.channel_b.lock();
         
         let update = a.write_control(val);
-        self.channel_a.1.notify_one();
+        a.ring();
         if let Some(wr2) = update {
             b.regs[2] = wr2;
         }
     }
-    pub fn read_a_data(&self) -> u8 { self.channel_a.0.lock().read_data() }
+    pub fn read_a_data(&self) -> u8 { self.channel_a.lock().read_data() }
     pub fn write_a_data(&self, val: u8) { 
-        let mut lock = self.channel_a.0.lock();
+        let mut lock = self.channel_a.lock();
         lock.write_data(val);
-        self.channel_a.1.notify_one();
+        lock.ring();
     }
 
     pub fn read_b_control(&self) -> u8 { 
-        let mut b = self.channel_b.0.lock();
+        let mut b = self.channel_b.lock();
         if b.reg_ptr == 2 {
             let val = b.regs[2];
             b.reg_ptr = 0;
@@ -495,26 +498,26 @@ impl Z85c30 {
         b.read_control() 
     }
     pub fn write_b_control(&self, val: u8) { 
-        let mut a = self.channel_a.0.lock();
-        let mut b = self.channel_b.0.lock();
+        let mut a = self.channel_a.lock();
+        let mut b = self.channel_b.lock();
         
         let update = b.write_control(val);
-        self.channel_b.1.notify_one();
+        b.ring();
         if let Some(wr2) = update {
             a.regs[2] = wr2;
         }
     }
-    pub fn read_b_data(&self) -> u8 { self.channel_b.0.lock().read_data() }
+    pub fn read_b_data(&self) -> u8 { self.channel_b.lock().read_data() }
     pub fn write_b_data(&self, val: u8) { 
-        let mut lock = self.channel_b.0.lock();
+        let mut lock = self.channel_b.lock();
         lock.write_data(val);
-        self.channel_b.1.notify_one();
+        lock.ring();
     }
 
     pub fn get_ip(&self) -> u8 {
         // Check both channels for pending interrupts
         // Lock A to get its status and read B's atomic (ip_other on A is B's ip)
-        let a = self.channel_a.0.lock();
+        let a = self.channel_a.lock();
         let ip_a = a.get_ip();
         let ip_b = a.ip_other.load(Ordering::SeqCst);
         ip_a | ip_b
@@ -547,8 +550,8 @@ impl Z85c30 {
     }
     pub fn register_locks(&self) {
         use crate::locks::{register_mutex, register_mutex_fn};
-        register_mutex_fn("scc::channel_a", &self.channel_a, |c| c.0.is_locked());
-        register_mutex_fn("scc::channel_b", &self.channel_b, |c| c.0.is_locked());
+        register_mutex_fn("scc::channel_a", &self.channel_a, |c| c.is_locked());
+        register_mutex_fn("scc::channel_b", &self.channel_b, |c| c.is_locked());
         register_mutex("scc::threads", &self.threads);
     }
 }
@@ -558,25 +561,20 @@ impl Device for Z85c30 {
     
     fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        // Each TX thread tests `running` holding its channel's lock and then
-        // waits, so a notify between the two would be lost and the join below
-        // would wait forever. Taking the lock first waits out a thread in that
-        // gap, so the notify finds it waiting.
-        for (lock, cvar) in [&*self.channel_a, &*self.channel_b] {
-            drop(lock.lock());
-            cvar.notify_all();
-        }
+        self.channel_a.close();
+        self.channel_b.close();
         let mut threads = self.threads.lock();
         for t in threads.drain(..) {
             let _ = t.join();
         }
+        self.channel_a.reopen();
+        self.channel_b.reopen();
     }
 
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
         }
-
         let pairs = [
             (self.channel_a.clone(), self.backend_a.lock().clone()),
             (self.channel_b.clone(), self.backend_b.lock().clone()),
@@ -589,35 +587,21 @@ impl Device for Z85c30 {
             // TX Thread
             let tx_channel = channel_arc.clone();
             let tx_backend = backend.clone();
-            let running = self.running.clone();
             // Channel B (i == 1) is the IRIX serial console — mirror its output
             // into console_buf for in-process readers (the GUI network probe).
             let tx_tap = if i == 1 { Some(self.console_buf.clone()) } else { None };
 
             threads.push(thread::Builder::new().name(format!("SCC-TX-{}", ch_name)).spawn(move || {
                 let mut last_tx_time = Instant::now();
-                let channel_name = {
-                    let (lock, _) = &*tx_channel;
-                    lock.lock().name.clone()
-                };
+                let channel_name = tx_channel.lock().name.clone();
 
-                while running.load(Ordering::Relaxed) {
-                    let (lock, cvar) = &*tx_channel;
-                    let mut channel = lock.lock();
-                    
-                    loop {
-                        if !running.load(Ordering::Relaxed) { break; }
-
-                        let wr5 = channel.regs[scc_regs::WR5 as usize];
-                        let tx_enabled = (wr5 & wr5::TX_ENABLE) != 0;
-                        if !channel.tx_queue.is_empty() && tx_enabled {
-                            break;
-                        }
-                        
-                        cvar.wait(&mut channel);
-                    }
-
-                    if !running.load(Ordering::Relaxed) { break; }
+                loop {
+                    // A character to send with the transmitter enabled, or stop.
+                    let Ok(mut channel) = tx_channel.wait_until(|ch| {
+                        !ch.tx_queue.is_empty() && (ch.regs[scc_regs::WR5 as usize] & wr5::TX_ENABLE) != 0
+                    }) else {
+                        break;
+                    };
 
                     // Pop data to simulate moving to Shift Register
                     let val = channel.tx_queue.pop_front();
@@ -661,8 +645,7 @@ impl Device for Z85c30 {
 
                         // Transmission complete: fire Tx interrupt (once) to
                         // tell the driver the buffer is ready for the next char.
-                        let (lock, _) = &*tx_channel;
-                        lock.lock().notify_tx_empty();
+                        tx_channel.lock().notify_tx_empty();
                     }
                 }
             }).unwrap());
@@ -708,8 +691,7 @@ impl Device for Z85c30 {
                         byte = 0x04;
                     }
 
-                    let (lock, _cvar) = &*rx_channel;
-                    let mut channel = lock.lock();
+                    let mut channel = rx_channel.lock();
 
                     let wr3 = channel.regs[scc_regs::WR3 as usize];
                     let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
@@ -769,7 +751,7 @@ impl Device for Z85c30 {
         if cmd == "serial" {
             if args.first().copied() == Some("status") || args.is_empty() {
                 for (label, arc) in [("A", &self.channel_a), ("B", &self.channel_b)] {
-                    let ch = arc.0.lock();
+                    let ch = arc.lock();
                     writeln!(writer, "=== Channel {} ===", label).unwrap();
                     writeln!(writer, "  reg_ptr : {}", ch.reg_ptr).unwrap();
                     writeln!(writer, "  status  : {:02x}  (RX_AVAIL={} TX_EMPTY={} DCD={} CTS={})",
@@ -807,13 +789,8 @@ impl Resettable for Z85c30 {
     /// The backend TcpStream is NOT touched — the host console connection survives.
     /// Threads keep running (they idle when tx_enabled / rx_enabled are off).
     fn power_on(&self) {
-        let (lock_a, cvar_a) = &*self.channel_a;
-        lock_a.lock().reset();
-        cvar_a.notify_all();
-
-        let (lock_b, cvar_b) = &*self.channel_b;
-        lock_b.lock().reset();
-        cvar_b.notify_all();
+        self.channel_a.ring(|ch| ch.reset());
+        self.channel_b.ring(|ch| ch.reset());
     }
 }
 
@@ -850,25 +827,23 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
 impl Saveable for Z85c30 {
     fn save_state(&self) -> toml::Value {
         let mut tbl = toml::map::Map::new();
-        tbl.insert("ch_a".into(), channel_to_toml(&self.channel_a.0.lock()));
-        tbl.insert("ch_b".into(), channel_to_toml(&self.channel_b.0.lock()));
+        tbl.insert("ch_a".into(), channel_to_toml(&self.channel_a.lock()));
+        tbl.insert("ch_b".into(), channel_to_toml(&self.channel_b.lock()));
         toml::Value::Table(tbl)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         if let Some(ca) = get_field(v, "ch_a") {
-            channel_from_toml(ca, &mut self.channel_a.0.lock());
-            self.channel_a.1.notify_all();
+            self.channel_a.ring(|ch| channel_from_toml(ca, ch));
         }
         if let Some(cb) = get_field(v, "ch_b") {
-            channel_from_toml(cb, &mut self.channel_b.0.lock());
-            self.channel_b.1.notify_all();
+            self.channel_b.ring(|ch| channel_from_toml(cb, ch));
         }
         Ok(())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::dev::serial_host::{CiSerialBackend, TcpSocketBackend};
@@ -939,7 +914,7 @@ mod tests {
     fn save_load_round_trip() {
         let src = Z85c30::new(None);
         {
-            let mut ch = src.channel_a.0.lock();
+            let mut ch = src.channel_a.lock();
             ch.regs[0]  = 0x44;
             ch.regs[1]  = 0x12;
             ch.regs[3]  = 0xc1;
@@ -948,7 +923,7 @@ mod tests {
             ch.status   = 0x44;
         }
         {
-            let mut ch = src.channel_b.0.lock();
+            let mut ch = src.channel_b.lock();
             ch.regs[0]  = 0x88;
             ch.regs[2]  = 0x10;
             ch.regs[15] = 0x05;
@@ -986,7 +961,7 @@ mod tests {
         // tx-direction baud-rate emulation; set a small value so the test
         // doesn't pay 19.2 kbaud-per-char latency.
         {
-            let mut ch = scc.channel_a.0.lock();
+            let mut ch = scc.channel_a.lock();
             ch.regs[scc_regs::WR3 as usize] |= wr3::RX_ENABLE;
             ch.tx_delay = 50; // 50 µs/byte
         }
@@ -1003,7 +978,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while received.len() < line.len() && Instant::now() < deadline {
             let popped = {
-                let mut ch = scc.channel_a.0.lock();
+                let mut ch = scc.channel_a.lock();
                 ch.rx_queue.pop_front()
             };
             match popped {
@@ -1022,13 +997,13 @@ mod tests {
     #[test]
     fn restore_clears_rx_char_available() {
         let src = Z85c30::new(None);
-        src.channel_a.0.lock().status |= rr0::RX_CHAR_AVAILABLE;
+        src.channel_a.lock().status |= rr0::RX_CHAR_AVAILABLE;
         let saved = src.save_state();
 
         let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
-        assert_eq!(dst.channel_a.0.lock().status & rr0::RX_CHAR_AVAILABLE, 0,
+        assert_eq!(dst.channel_a.lock().status & rr0::RX_CHAR_AVAILABLE, 0,
             "restore emptied rx_queue, and `read_data` leaves the bit alone on an \
              empty queue, so a guest polling RR0 would never see it drop");
     }
@@ -1036,13 +1011,13 @@ mod tests {
     #[test]
     fn restore_forces_tx_buffer_empty() {
         let src = Z85c30::new(None);
-        src.channel_a.0.lock().status &= !rr0::TX_BUFFER_EMPTY;
+        src.channel_a.lock().status &= !rr0::TX_BUFFER_EMPTY;
         let saved = src.save_state();
 
         let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
-        assert_ne!(dst.channel_a.0.lock().status & rr0::TX_BUFFER_EMPTY, 0,
+        assert_ne!(dst.channel_a.lock().status & rr0::TX_BUFFER_EMPTY, 0,
             "a guest that gates its write on TX_BUFFER_EMPTY would wait on a \
              transmitter whose queue restore already emptied");
     }
@@ -1051,7 +1026,7 @@ mod tests {
     fn restore_rearms_tx_int_pending() {
         let src = Z85c30::new(None);
         {
-            let mut ch = src.channel_a.0.lock();
+            let mut ch = src.channel_a.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
             ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
         }
@@ -1060,7 +1035,7 @@ mod tests {
         let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
-        assert!(dst.channel_a.0.lock().tx_int_pending,
+        assert!(dst.channel_a.lock().tx_int_pending,
             "clearing tx_queue destroyed the character whose completion would \
              have driven the only setter, `notify_tx_empty`");
     }
@@ -1071,13 +1046,13 @@ mod tests {
     #[test]
     fn restore_leaves_latch_disarmed_when_tx_int_disabled() {
         let src = Z85c30::new(None);
-        src.channel_a.0.lock().regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        src.channel_a.lock().regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
         let saved = src.save_state();
 
         let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
-        assert!(!dst.channel_a.0.lock().tx_int_pending,
+        assert!(!dst.channel_a.lock().tx_int_pending,
             "WR1 has TX_INT_EN clear, so nothing should be latched");
     }
 
@@ -1086,13 +1061,13 @@ mod tests {
     #[test]
     fn restore_leaves_latch_disarmed_when_transmitter_disabled() {
         let src = Z85c30::new(None);
-        src.channel_a.0.lock().regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+        src.channel_a.lock().regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
         let saved = src.save_state();
 
         let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
-        assert!(!dst.channel_a.0.lock().tx_int_pending,
+        assert!(!dst.channel_a.lock().tx_int_pending,
             "WR5 has TX_ENABLE clear, so the TX thread could never have latched");
     }
 
@@ -1103,7 +1078,7 @@ mod tests {
     fn restore_channel_b_tx_int_reaches_rr3_via_a() {
         let src = Z85c30::new(None);
         {
-            let mut ch = src.channel_b.0.lock();
+            let mut ch = src.channel_b.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
             ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
         }
@@ -1112,7 +1087,7 @@ mod tests {
         let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
-        dst.channel_a.0.lock().reg_ptr = scc_regs::RR3;
+        dst.channel_a.lock().reg_ptr = scc_regs::RR3;
         assert_eq!(dst.read_a_control() & (1 << 1), 1 << 1,
             "B's Tx IP occupies bits 2..0 of A's RR3");
     }
@@ -1121,7 +1096,7 @@ mod tests {
     fn restore_redrives_irq_line() {
         let src = Z85c30::new(None);
         {
-            let mut ch = src.channel_a.0.lock();
+            let mut ch = src.channel_a.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
             ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
         }
@@ -1136,34 +1111,24 @@ mod tests {
              restored it wholesale, so only the SCC can put the line back up");
     }
 
-    /// A TX thread tests `running` holding its channel's lock and then waits
-    /// on the channel's condition variable. `stop` must not notify in between,
-    /// or the thread sleeps on and the join in `stop` never returns (a machine
-    /// stopping for a guest power-off hung there). Play such a thread on
-    /// channel A: test the flag holding the lock, let `stop` clear it, then
-    /// wait. The wait must be woken.
+    /// `stop` ends both TX threads while they wait for a character. Their
+    /// wait has no timeout, so a stop that left a channel's doorbell open
+    /// would leave the join in `stop` waiting forever (a machine stopping for
+    /// a guest power-off hung there once). The race between a wait and the
+    /// close is the doorbell's, checked in `sync::doorbell::loom_tests`.
     #[test]
-    fn stop_wakes_a_tx_thread_caught_between_its_check_and_its_wait() {
+    fn stop_ends_tx_threads_waiting_for_a_character() {
         let scc = Z85c30::new(None);
         scc.start();
-        let (lock, cvar) = &*scc.channel_a;
-        thread::scope(|s| {
-            let mut ch = lock.lock();
-            assert!(scc.running.load(Ordering::SeqCst));
-            s.spawn(|| scc.stop());
-            let until = Instant::now() + Duration::from_secs(10);
-            while scc.running.load(Ordering::SeqCst) {
-                assert!(Instant::now() < until, "stop never cleared the running flag");
-                thread::yield_now();
-            }
-            // A stop that notifies without the lock does so right after the
-            // store: give it the time, so its notify lands ahead of the wait
-            // as it did in the hang. A stop that takes the lock is held off
-            // until the wait, however long this is.
-            thread::sleep(Duration::from_millis(200));
-            let woken = !cvar.wait_for(&mut ch, Duration::from_secs(10)).timed_out();
-            drop(ch);
-            assert!(woken, "stop notified the TX thread before it waited: the wakeup was lost");
-        });
+        let (done, stopped) = std::sync::mpsc::channel();
+        let stopper = {
+            let scc = scc.clone();
+            thread::spawn(move || {
+                scc.stop();
+                done.send(()).unwrap();
+            })
+        };
+        assert!(stopped.recv_timeout(Duration::from_secs(10)).is_ok(), "stop never joined the TX threads");
+        stopper.join().unwrap();
     }
 }
