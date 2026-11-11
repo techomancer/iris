@@ -534,7 +534,7 @@ mod tests {
     /// doing.
     #[test]
     #[cfg(feature = "ci_clock")]
-    fn deterministic_mode_repeats_a_time_sized_guest_exactly() {
+    fn ci_clock_deterministic_mode_repeats_a_time_sized_guest_exactly() {
         let a = run_clock_spin(true);
         let b = run_clock_spin(true);
         assert_eq!(a.len(), 4, "the guest prints its loop count: {a:?}");

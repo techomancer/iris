@@ -66,11 +66,12 @@ jobs:
       gui_features: ${{ needs.prepare.outputs.gui_features }}
       cli_features: ${{ needs.prepare.outputs.cli_features }}
 
-  # Default features on x86-64 Linux: the pull-request run tests the jitv2 build
-  # there, so this daily run covers the paths that exclude it. Publish does not
-  # wait for it; a failure turns the run red without stopping the nightly.
-  test-default-features:
-    name: Test (default features)
+  # Test sets the pull-request run leaves out, on x86-64 Linux: default features
+  # (the pull-request run tests the jitv2 build, which excludes some paths), and
+  # the four tests that need the instruction-driven clock. Publish does not wait
+  # for it; a failure turns the run red without stopping the nightly.
+  test-nightly-sets:
+    name: Test (nightly feature sets)
     needs: prepare
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-24.04
@@ -95,6 +96,12 @@ jobs:
           tool: nextest
       - name: Run tests
         run: cargo nextest run --workspace --profile ci
+      # ci_clock replaces the host clock with one driven by retired
+      # instructions, so these tests can't share a build with the rest. Which
+      # tests run is the ci-clock profile's filter in .config/nextest.toml.
+      - name: Run the instruction-driven clock tests
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --workspace --profile ci-clock --features jitv2,ci_clock,idle-pause
       - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
         if: ${{ !cancelled() }}
         with:

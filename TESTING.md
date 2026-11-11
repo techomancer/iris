@@ -201,7 +201,7 @@ That single-file run is not corpus coverage.
 | `rust.yml` | every pull request and push to `main` | `cargo nextest run` on the workspace, a build of the release feature set, the interpreter's hot paths |
 | `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models, e.g. `intx::loom_tests`; locally `RUSTFLAGS="--cfg loom" cargo test --lib loom_tests` |
 | `suites.yml` | pull requests and pushes that touch the CPU, `cpu-tests/`, `bench/` or the test code | the two bare-metal suites on each engine |
-| `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests the pull-request run leaves out. It gates no publish |
+| `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests and the `ci_clock` tests (`cargo nextest run --profile ci-clock --features jitv2,ci_clock,idle-pause`; the profile selects tests named `ci_clock_...`) the pull-request run leaves out. It gates no publish |
 | `build.yml` | nightly and release | packages for every OS, then boots IRIX 5.3 to the login prompt on each CLI build |
 
 ### Which pull requests run what

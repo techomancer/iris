@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ci_clock")]
-    fn the_guest_clock_follows_retired_instructions_and_nothing_else() {
+    fn ci_clock_guest_clock_follows_retired_instructions_and_nothing_else() {
         let d = TestDevice::new("unused");
         let mut core = MipsCore::new();
         d.attach_core(&core as *const MipsCore);
