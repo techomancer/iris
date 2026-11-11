@@ -95,9 +95,11 @@ impl Generations {
     pub(crate) fn pages(&self) -> usize {
         self.0.len()
     }
+    /// After the write's bytes, with release (`page_gen::bump`): a compile
+    /// that reads the new generation must read the bytes too.
     fn bump(&self, address: u64) {
         if let Some(counter) = self.0.get((address >> 12) as usize) {
-            counter.fetch_add(1, Ordering::Relaxed);
+            crate::cpu::jitv2::page_gen::bump(counter);
         }
     }
     fn bump_all(&self, extent: &RamExtent) {
@@ -105,7 +107,7 @@ impl Generations {
             let first = slot * (BANK_SPAN >> 12) as usize;
             let pages = (extent.prefix(slot) >> 12) as usize;
             for counter in &self.0[first..first + pages] {
-                counter.fetch_add(1, Ordering::Relaxed);
+                crate::cpu::jitv2::page_gen::bump(counter);
             }
         }
     }
