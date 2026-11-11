@@ -24,6 +24,7 @@ pub(super) const FLAG_BARRIER_BEFORE: u32 = 1 << 4;
 pub(super) const FLAG_BARRIER_AFTER: u32 = 1 << 5;
 pub(super) const FLAG_LINE_Y_MAJOR: u32 = 1 << 6;
 pub(super) const FLAG_LINE_MAJOR_DECREASING: u32 = 1 << 7;
+pub(super) const FLAG_SHADED: u32 = 1 << 8;
 
 pub(super) const STATE_WORDS: usize = 64;
 pub(super) const STATE_DRAW_MODE0: usize = 0;
@@ -37,6 +38,14 @@ pub(super) const STATE_ALPHA_REF: usize = 12;
 pub(super) const STATE_SMASK0X: usize = 13;
 pub(super) const STATE_SMASK0Y: usize = 14;
 pub(super) const STATE_SMASK1X: usize = 15;
+pub(super) const STATE_COLOR_RED: usize = 23;
+pub(super) const STATE_COLOR_ALPHA: usize = 24;
+pub(super) const STATE_COLOR_GREEN: usize = 25;
+pub(super) const STATE_COLOR_BLUE: usize = 26;
+pub(super) const STATE_SLOPE_RED: usize = 27;
+pub(super) const STATE_SLOPE_ALPHA: usize = 28;
+pub(super) const STATE_SLOPE_GREEN: usize = 29;
+pub(super) const STATE_SLOPE_BLUE: usize = 30;
 pub(super) const STATE_LINE_PATTERN: usize = 7;
 pub(super) const STATE_Z_PATTERN: usize = 9;
 pub(super) const STATE_PATTERN_BITS: usize = 43;
@@ -72,6 +81,8 @@ impl RexCommand {
     pub(super) fn flat_fill(
         state_slot: u32,
         fill: FlatFill,
+        payload: PayloadRef,
+        shaded: bool,
         cid_test: bool,
         read_destination: bool,
     ) -> Self {
@@ -93,10 +104,15 @@ impl RexCommand {
                 FillPlane::Aux => FLAG_READ_AUX,
             };
         }
+        if shaded {
+            flags |= FLAG_SHADED;
+        }
         Self {
             kind,
             state_slot,
             flags,
+            payload_offset: payload.offset,
+            payload_words: payload.words,
             dst_x0: fill.min_x as i32,
             dst_y0: fill.min_y as i32,
             dst_x1: (fill.min_x + fill.width - 1) as i32,
@@ -140,12 +156,15 @@ impl RexCommand {
                 FillPlane::Aux => FLAG_READ_AUX,
             };
         }
+        if line.shaded {
+            flags |= FLAG_SHADED;
+        }
         Self {
             kind,
             state_slot,
             flags,
             payload_offset: payload.offset,
-            payload_words: payload.words,
+            payload_words: line.payload_words,
             dst_x0: line.min_x,
             dst_y0: line.min_y,
             dst_x1: line.max_x,
@@ -254,7 +273,7 @@ pub(super) struct PayloadRef {
 }
 
 impl PayloadRef {
-    const EMPTY: Self = Self {
+    pub(super) const EMPTY: Self = Self {
         offset: 0,
         words: 0,
     };
@@ -382,8 +401,9 @@ mod tests {
                 | FLAG_BARRIER_BEFORE
                 | FLAG_BARRIER_AFTER
                 | FLAG_LINE_Y_MAJOR
-                | FLAG_LINE_MAJOR_DECREASING,
-            0xff,
+                | FLAG_LINE_MAJOR_DECREASING
+                | FLAG_SHADED,
+            0x1ff,
         );
         assert_eq!(size_of::<RexCommand>(), 16 * size_of::<u32>());
         assert_eq!(std::mem::offset_of!(RexCommand, state_slot), 4);
@@ -423,7 +443,8 @@ mod tests {
             assert_eq!(state.words[43], 7 | 9 << 8 | 1 << 16);
             assert_eq!(state.words[STATE_SOURCE_COLOR], fill.color);
 
-            let command = RexCommand::flat_fill(23, fill, false, false);
+            let command =
+                RexCommand::flat_fill(23, fill, PayloadRef::EMPTY, false, false, false);
             assert_eq!(command.kind, COMMAND_CLEAR);
             assert_eq!(command.state_slot, 23);
             assert_eq!(command.flags, FLAG_WRITE_AUX);
@@ -438,13 +459,13 @@ mod tests {
             );
             assert_eq!(command.payload(), PayloadRef::EMPTY);
             assert_eq!(
-                RexCommand::flat_fill(23, fill, true, false).flags,
+                RexCommand::flat_fill(23, fill, PayloadRef::EMPTY, false, true, false).flags,
                 FLAG_WRITE_AUX | FLAG_READ_AUX,
             );
             let mut rgb_fill = fill;
             rgb_fill.plane = FillPlane::Rgb;
             assert_eq!(
-                RexCommand::flat_fill(23, rgb_fill, false, true).flags,
+                RexCommand::flat_fill(23, rgb_fill, PayloadRef::EMPTY, false, false, true).flags,
                 FLAG_WRITE_RGB | FLAG_READ_RGB,
             );
             assert_eq!(
@@ -465,12 +486,12 @@ mod tests {
             let mut block = fill;
             block.kind = FillKind::Block;
             assert_eq!(
-                RexCommand::flat_fill(0, block, false, false).kind,
+                RexCommand::flat_fill(0, block, PayloadRef::EMPTY, false, false, false).kind,
                 COMMAND_BLOCK
             );
             block.kind = FillKind::Span;
             assert_eq!(
-                RexCommand::flat_fill(0, block, false, false).kind,
+                RexCommand::flat_fill(0, block, PayloadRef::EMPTY, false, false, false).kind,
                 COMMAND_SPAN
             );
         });

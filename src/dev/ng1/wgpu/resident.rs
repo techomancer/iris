@@ -26,12 +26,13 @@ use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileG
 use super::command::{
     cid_test, COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE,
     COMMAND_I_LINE, COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING, FLAG_LINE_Y_MAJOR,
-    FLAG_READ_AUX, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS,
-    PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF, STATE_CLIP_MODE,
-    STATE_COLOR_BACK, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE,
-    STATE_LINE_PATTERN, STATE_PATTERN_BITS, STATE_SMASK0X, STATE_SMASK0Y,
-    STATE_SMASK1X, STATE_SOURCE_COLOR, STATE_WORDS, STATE_WRITE_MASK, STATE_XYMOVE,
-    STATE_XYWIN, STATE_Z_PATTERN,
+    FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
+    MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
+    STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
+    STATE_COLOR_RED, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE, STATE_LINE_PATTERN,
+    STATE_PATTERN_BITS, STATE_SLOPE_ALPHA, STATE_SLOPE_BLUE, STATE_SLOPE_GREEN,
+    STATE_SLOPE_RED, STATE_SMASK0X, STATE_SMASK0Y, STATE_SMASK1X, STATE_SOURCE_COLOR,
+    STATE_WORDS, STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
 };
 use super::line::prepare_line;
 
@@ -824,6 +825,7 @@ impl ResidentGpu {
                 ("REX_FLAG_READ_AUX", FLAG_READ_AUX),
                 ("REX_FLAG_LINE_Y_MAJOR", FLAG_LINE_Y_MAJOR),
                 ("REX_FLAG_LINE_MAJOR_DECREASING", FLAG_LINE_MAJOR_DECREASING),
+                ("REX_FLAG_SHADED", FLAG_SHADED),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),
                 ("REX_STATE_DRAW_MODE0", STATE_DRAW_MODE0 as u32),
                 ("REX_STATE_DRAW_MODE1", STATE_DRAW_MODE1 as u32),
@@ -836,6 +838,14 @@ impl ResidentGpu {
                 ("REX_STATE_SMASK0X", STATE_SMASK0X as u32),
                 ("REX_STATE_SMASK0Y", STATE_SMASK0Y as u32),
                 ("REX_STATE_SMASK1X", STATE_SMASK1X as u32),
+                ("REX_STATE_COLOR_RED", STATE_COLOR_RED as u32),
+                ("REX_STATE_COLOR_ALPHA", STATE_COLOR_ALPHA as u32),
+                ("REX_STATE_COLOR_GREEN", STATE_COLOR_GREEN as u32),
+                ("REX_STATE_COLOR_BLUE", STATE_COLOR_BLUE as u32),
+                ("REX_STATE_SLOPE_RED", STATE_SLOPE_RED as u32),
+                ("REX_STATE_SLOPE_ALPHA", STATE_SLOPE_ALPHA as u32),
+                ("REX_STATE_SLOPE_GREEN", STATE_SLOPE_GREEN as u32),
+                ("REX_STATE_SLOPE_BLUE", STATE_SLOPE_BLUE as u32),
                 ("REX_STATE_LINE_PATTERN", STATE_LINE_PATTERN as u32),
                 ("REX_STATE_Z_PATTERN", STATE_Z_PATTERN as u32),
                 ("REX_STATE_PATTERN_BITS", STATE_PATTERN_BITS as u32),
@@ -1022,7 +1032,7 @@ impl ResidentGpu {
         let position = self.progress.lock().next_position()?;
         let line = command.line();
         if let Some(line) = line {
-            if line.payload_words as usize > MAX_PAYLOAD_WORDS {
+            if command.payload().len() > MAX_PAYLOAD_WORDS {
                 return Err(ResidentError::Unsupported("line payload length"));
             }
             let slot = RexStateSlot::for_line(context, line);
@@ -1075,6 +1085,61 @@ impl ResidentGpu {
         command.finish(context);
         Ok(())
     }
+
+    fn enqueue_fill(
+        &mut self,
+        context: &Rex3Context,
+        fill: crate::dev::ng1::rex3_flat_fill::FlatFill,
+        slot: RexStateSlot,
+        words: &[u32],
+        shaded: bool,
+    ) -> Result<(), ResidentError> {
+        loop {
+            let checkpoint = self.payload.checkpoint();
+            let payload = match self.payload.append(words) {
+                Ok(payload) => payload,
+                Err(Full) if !self.batch.is_empty() => {
+                    self.submit()?;
+                    continue;
+                }
+                Err(Full) => {
+                    return Err(ResidentError::InvalidState("one fill exceeds the payload arena"));
+                }
+            };
+            let result = self.batch.prim_with_slot(
+                slot,
+                fill.min_x as i32,
+                fill.min_y as i32,
+                (fill.min_x + fill.width - 1) as i32,
+                (fill.min_y + fill.height - 1) as i32,
+                |slot| {
+                    RexCommand::flat_fill(
+                        slot,
+                        fill,
+                        payload,
+                        shaded,
+                        cid_test(context.clipmode),
+                        fill.kind != FillKind::Clear && reads_destination(context),
+                    )
+                },
+            );
+            match result {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState("prepared fill missed its raster grid"));
+                }
+                Err(Full) if !self.batch.is_empty() => {
+                    self.payload.rollback(checkpoint);
+                    self.submit()?;
+                }
+                Err(Full) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState("one fill exceeds an empty batch"));
+                }
+            }
+        }
+    }
 }
 
 impl ResidentBackend for ResidentGpu {
@@ -1100,29 +1165,12 @@ impl ResidentBackend for ResidentGpu {
         let fill = command.fill();
         if let Some(fill) = fill {
             let slot = RexStateSlot::for_flat_fill(context, fill);
-            loop {
-                let result = self.batch.prim_with_slot(
-                    slot,
-                    fill.min_x as i32,
-                    fill.min_y as i32,
-                    (fill.min_x + fill.width - 1) as i32,
-                    (fill.min_y + fill.height - 1) as i32,
-                    |slot| {
-                        RexCommand::flat_fill(
-                            slot,
-                            fill,
-                            cid_test(context.clipmode),
-                            fill.kind != FillKind::Clear && reads_destination(context),
-                        )
-                    },
-                );
-                match result {
-                    Ok(Some(_)) => break,
-                    Ok(None) => return Err(ResidentError::InvalidState("prepared fill missed its raster grid")),
-                    Err(Full) if !self.batch.is_empty() => self.submit()?,
-                    Err(Full) => return Err(ResidentError::InvalidState("one fill exceeds an empty batch")),
-                }
+            let shade_payload = command.shade_payload();
+            let words = shade_payload.unwrap_or_default();
+            if words.len() > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("fill shade payload length"));
             }
+            self.enqueue_fill(context, fill, slot, words, shade_payload.is_some())?;
         }
         self.progress.lock().accept(position, fill.map(|fill| fill.plane));
         command.finish(context);
