@@ -8,8 +8,8 @@ use crate::pci::{PciDma, PciDmaStatus};
 /// The chip's view of bus-master memory. Internal byte `a` sits at bus
 /// address `a ^ 3` (a word is big-endian on the bus with the bridge's swap
 /// clear), so rings, descriptors and frames keep their layout whatever the
-/// bridge then does to them. This is what the Ethernet block and the serial
-/// and parallel engines are handed.
+/// bridge then does to them. This is what the IOC3's Ethernet block and
+/// serial and parallel engines are handed, and the IOC4's serial engine.
 pub struct Ioc3Dma {
     raw: Arc<dyn PciDma>,
 }

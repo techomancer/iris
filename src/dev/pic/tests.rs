@@ -493,6 +493,8 @@ fn direct_map_dma_goes_where_each_heads_direct_map_says() {
     r.fit(1, 1, &b, Function::default());
     r.w64(0x80, 10 << 20);
     r.w64(HEAD1 + 0x80, (11 << 20) | 1);
+    r.w64(0x200, 0x18001000 | (1 << 19));
+    r.w64(HEAD1 + 0x200, 0x18001000 | (1 << 19));
     let data: Vec<u8> = (0x11..0x19).collect();
     assert!(a.dma().dma_write(0x8000_1000, &data).is_ok());
     let other: Vec<u8> = (0x21..0x29).collect();
@@ -514,23 +516,30 @@ fn direct_map_dma_goes_where_each_heads_direct_map_says() {
     assert_eq!(sizes, [(0x1ffd, 1), (0x1ffe, 2), (0x2000, 2), (0x2002, 1)].map(|(a, l)| (a as u64, l)));
 }
 
-/// A slot whose Device register sets the swap bit puts each byte at its
-/// address with the low two bits flipped, and still moves whole words as
-/// one packet.
+/// A slot whose Device register has bit 19 clear (the reset value) keeps
+/// each 32-bit value, so a byte lands at its address with the low two bits
+/// flipped, and a word still moves as one packet. Set, the bytes keep their
+/// addresses; the PIC's sense is inferred from the public drivers, not
+/// measured.
 #[test]
-fn a_swapping_slot_flips_the_byte_address_within_each_word() {
+fn bit19_set_keeps_addresses_and_clear_flips_the_byte_address_within_each_word() {
     let r = rig();
     let card = Card::new(0x7003);
     r.fit(0, 1, &card, Function::default());
     r.w64(0x80, 10 << 20);
+    let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
     r.w64(0x200, 0x18001000 | (1 << 19));
-    assert!(card.dma().dma_write(0x8000_0100, &[1, 2, 3, 4, 5, 6, 7, 8]).is_ok());
-    assert_eq!(r.peer.bytes(10, 0x100, 8), [4, 3, 2, 1, 8, 7, 6, 5]);
+    assert!(card.dma().dma_write(0x8000_0100, &data).is_ok());
+    assert_eq!(r.peer.bytes(10, 0x100, 8), data, "set: address-preserving");
+    r.peer.dma.lock().clear();
+    r.w64(0x200, 0x18001000);
+    assert!(card.dma().dma_write(0x8000_0200, &data).is_ok());
+    assert_eq!(r.peer.bytes(10, 0x200, 8), [4, 3, 2, 1, 8, 7, 6, 5], "clear: lane-preserving");
     let mut back = [0u8; 8];
-    assert!(card.dma().dma_read(0x8000_0100, &mut back).is_ok());
-    assert_eq!(back, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert!(card.dma().dma_read(0x8000_0200, &mut back).is_ok());
+    assert_eq!(back, data);
     let packets: Vec<_> = r.peer.dma.lock().iter().map(|p| (p.address, p.len)).collect();
-    assert_eq!(packets, [(0x100, 8), (0x100, 8)]);
+    assert_eq!(packets, [(0x200, 8), (0x200, 8)]);
 }
 
 #[test]
@@ -1187,4 +1196,58 @@ fn overlapping_bars_go_to_the_lower_device() {
     assert_eq!(r.r32(at), 0x20);
     r.w32(config(0, 1) + 4, MEMORY_AND_MASTER);
     assert_eq!(r.r32(at), 0x40, "device 1 answers again");
+}
+
+#[derive(Default)]
+struct Line(Mutex<Vec<u8>>);
+
+impl crate::dev::serial_host::SerialBackend for Line {
+    fn send_byte(&self, b: u8) {
+        self.0.lock().push(b);
+    }
+    fn recv_byte(&self) -> std::io::Result<u8> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    }
+}
+
+/// The two halves of the byte order meet: IOC4 behind a PIC slot whose
+/// Device register has bit 19 clear (the reset value, and what IRIX leaves),
+/// with a ring in memory in the order a byte-stream driver writes it. The
+/// PIC flips the window's addresses and the chip flips them back, so the
+/// line gets the characters in order.
+#[test]
+fn ioc4_behind_a_bit19_clear_slot_sends_a_memory_order_ring_in_order() {
+    use crate::dev::ioc4::{reg as ioc4_reg, Ioc4, Ioc4Clock, Ioc4Config};
+    use crate::dev::ioc_serial_dma::off;
+    use crate::pci::PciFunction;
+
+    let r = rig();
+    let ioc4 = Arc::new(Ioc4::new(Ioc4Config::bare(Ioc4Clock::Mhz33)));
+    let line = Arc::new(Line::default());
+    ioc4.set_serial_backend(0, line.clone());
+    r.pic.attach(0, 1, ioc4.clone(), Function::default());
+    r.w64(0x80, 10 << 20);
+    r.w64(0x200, 0x18001000);
+    let cfg = config(0, 1);
+    r.w32(cfg + 0x10, BAR_BASE);
+    r.w32(cfg + 4, MEMORY_AND_MASTER);
+
+    let ring = 0x4000u64;
+    let entries: [([u8; 4], [u8; 4]); 4] = [
+        (*b"bit1", [0x40; 4]),
+        (*b"9pro", [0x40; 4]),
+        (*b"be\0\0", [0x40, 0x40, 0, 0]),
+        (*b"\r\n\0\0", [0x40, 0x40, 0, 0]),
+    ];
+    for (i, (data, control)) in entries.iter().enumerate() {
+        r.peer.put(10, ring + 8 * i as u64, data);
+        r.peer.put(10, ring + 8 * i as u64 + 4, control);
+    }
+    // Registers take the processor's value, byte-reversed.
+    let w = |at: u32, v: u32| ioc4.bar_write(0, at, v.swap_bytes(), 4);
+    w(ioc4_reg::SDMA_BASE + 4, 0);
+    w(ioc4_reg::SDMA_BASE, 0x8000_0000 | ring as u32);
+    w(ioc4_reg::SDMA_PORT + off::CONTROL, 1 << 28);
+    w(ioc4_reg::SDMA_PORT + off::TX_PRODUCE, 32);
+    assert_eq!(line.0.lock().as_slice(), b"bit19probe\r\n");
 }
