@@ -192,9 +192,7 @@ impl Rig {
         let old = config.read(reg);
         config.write_masked(reg, val << shift, (u32::MAX >> (32 - 8 * width)) << shift);
         let new = config.read(reg);
-        if new != old {
-            self.dev.config_written(reg, old, new);
-        }
+        self.dev.config_written(reg, old, new);
     }
     fn cfg_write(&self, reg: usize, val: u32) {
         self.cfg_write_sized(reg * 4, 4, val);
@@ -318,6 +316,21 @@ fn a_vpd_read_completes_at_once_through_config_or_the_bar_alias() {
     assert_eq!(rig.cfg_read_sized(0x52, 2), 0x0008);
     assert_eq!(rig.refusals(Refused::VpdWrite), 1);
     assert_eq!(rig.dev.eeprom_bytes().unwrap(), image, "storage untouched");
+}
+
+/// The first VPD read IRIX's driver makes is of address 0, a halfword write
+/// of 0 at 0x52 that leaves the register as reset left it. The write still
+/// starts the read: a model that waited for a change left the flag clear,
+/// and the driver polled it for 100 ms before giving up on that word.
+#[test]
+fn a_vpd_read_of_the_address_already_held_still_completes() {
+    let rig = Rig::new();
+    rig.dev.bar_write(0, 0x52, 0x0000, 2);
+    assert_eq!(rig.dev.bar_read(0, 0x52, 2), 0x8000, "through the BAR alias");
+    assert_eq!(rig.readl(0x54), 0xffff_ffff);
+    let rig = Rig::new();
+    rig.cfg_write_sized(0x52, 2, 0x0000);
+    assert_eq!(rig.cfg_read_sized(0x52, 2), 0x8000, "through a configuration cycle");
 }
 
 /// The chip id in MISC_CTL decodes to the BCM5701, ASIC revision 0, and is

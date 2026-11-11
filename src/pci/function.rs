@@ -88,9 +88,11 @@ pub trait PciFunction: Send + Sync {
         false
     }
 
-    /// The bus wrote configuration dword `reg` of this function's header and
-    /// it changed from `old` to `new`. A PCI-to-PCI bridge acts on bridge
-    /// control here; every other function has nothing to do.
+    /// The bus wrote configuration dword `reg` of this function's header,
+    /// which held `old` and now holds `new`. They are equal when the write
+    /// changed nothing, and a register whose write starts something (a VPD
+    /// address) acts then too. A PCI-to-PCI bridge acts on bridge control
+    /// here.
     fn config_written(&self, _reg: usize, _old: u32, _new: u32) {}
 
     /// The bus behind this function, if it is a PCI-to-PCI bridge.
