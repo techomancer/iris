@@ -1406,8 +1406,8 @@ mod snapshot_tests {
         Scratch(dir)
     }
 
-    /// A one-processor Octane with 256 MiB, no graphics, no network and a
-    /// small overlay disk.
+    /// A one-processor Octane with 64 MiB (the smallest bank `validate()`
+    /// accepts), no graphics, no network and a small overlay disk.
     fn machine(prom: &str, dir: &std::path::Path) -> OctaneMachine {
         machine_with(prom, dir, |_| {})
     }
@@ -1416,7 +1416,7 @@ mod snapshot_tests {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = crate::config::MachineProfile::OctaneIp30;
         cfg.machine.cpu = Some("r10000".into());
-        cfg.banks = [256, 0, 0, 0, 0, 0, 0, 0];
+        cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
         cfg.prom = prom.into();
         cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
         cfg.headless = true;
