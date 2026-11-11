@@ -82,9 +82,15 @@ impl StreamEndpoint {
                 s.set_nodelay(true)?;
                 s.set_write_timeout(Some(IO_TICK))?;
                 // Windows does not end a blocked recv when another handle shuts
-                // the socket down, so the reader must wake to see the session end.
+                // the socket down, so the reader must wake to see the session
+                // end. It does not do that with a receive timeout either: a
+                // receive that times out leaves the socket in an undefined
+                // state there, and the reader resumes a frame after one.
+                #[cfg(not(windows))]
                 s.set_read_timeout(Some(IO_TICK))?;
                 let r = s.try_clone()?;
+                #[cfg(windows)]
+                let r = PolledRead::new(r)?;
                 let c = s.try_clone()?;
                 Ok((Box::new(r), Box::new(s), Box::new(move || { let _ = c.shutdown(Shutdown::Both); })))
             }
@@ -108,6 +114,43 @@ impl std::fmt::Display for StreamEndpoint {
             #[cfg(unix)]
             Self::Unix(p) => write!(f, "unix:{}", p.display()),
         }
+    }
+}
+
+/// A TCP read half that waits for the socket to be readable instead of
+/// relying on a receive timeout: a read that finds nothing within
+/// [`IO_TICK`] fails with `TimedOut` without having touched the socket.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct PolledRead {
+    sock: TcpStream,
+    poller: polling::Poller,
+    events: polling::Events,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl PolledRead {
+    fn new(sock: TcpStream) -> io::Result<Self> {
+        let poller = polling::Poller::new()?;
+        // SAFETY: `drop` removes the socket from the poller before it closes.
+        unsafe { poller.add_with_mode(&sock, polling::Event::readable(0), polling::PollMode::Level)? };
+        Ok(Self { sock, poller, events: polling::Events::new() })
+    }
+}
+
+impl Read for PolledRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.events.clear();
+        self.poller.wait(&mut self.events, Some(IO_TICK))?;
+        if self.events.iter().next().is_none() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.sock.read(buf)
+    }
+}
+
+impl Drop for PolledRead {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(&self.sock);
     }
 }
 
@@ -679,6 +722,34 @@ mod tests {
         assert!(r.status.stats.connected.load(Ordering::Relaxed), "the session ended");
         assert_eq!(r.status.stats.oversize.load(Ordering::Relaxed), 1);
         r.stop();
+    }
+
+    /// A reader that polls instead of using a receive timeout keeps a frame
+    /// whole across a pause longer than its tick, and reports a quiet socket
+    /// as a timeout.
+    #[test]
+    fn a_polled_reader_keeps_a_frame_across_a_pause() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut rd = PolledRead::new(client).unwrap();
+        assert_eq!(rd.read(&mut [0u8; 4]).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[0x3c; 60]).unwrap();
+        let (head, tail) = (buf[..10].to_vec(), buf[10..].to_vec());
+        let writer = std::thread::spawn(move || {
+            peer.write_all(&head).unwrap();
+            std::thread::sleep(IO_TICK * 2);
+            peer.write_all(&tail).unwrap();
+            peer
+        });
+        match read_frame_while(&mut rd, &|| true).unwrap() {
+            Incoming::Frame(f) => assert_eq!(f, vec![0x3c; 60]),
+            _ => panic!("no frame"),
+        }
+        let peer = writer.join().unwrap();
+        drop(peer);
+        assert!(matches!(read_frame_while(&mut rd, &|| true).unwrap(), Incoming::End));
     }
 
     /// A peer that accepts and hangs up at once is redialled once per retry
