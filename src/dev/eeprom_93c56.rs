@@ -121,42 +121,23 @@ impl Eeprom93c56 {
         }
     }
 
-    /// Initialize an erased IP28 motherboard EEPROM before the PROM's early
-    /// chime reads. Preserve its MAC, and leave existing guest settings alone.
-    /// Layout/defaults: SGI IP22nvram.h and libsk/ml/nvram.c; checksum:
-    /// IPXXprom/IPXXnvram.c nvchecksum(). This is not a CPU EEPROM image.
-    pub fn initialize_ip28_if_erased(&mut self) -> bool {
-        if self.data[..0x7D].iter().any(|&word| word != 0xFFFF) {
+    /// Fill an erased motherboard EEPROM with the PROM's own defaults before
+    /// its early chime reads the volume (see `sgi_nvram`). Preserves the MAC
+    /// and leaves any existing guest settings alone. This is not a CPU EEPROM
+    /// image. Returns true if it wrote anything.
+    pub fn initialize_if_erased(&mut self, rev: u8) -> bool {
+        let mut block = [0u8; 256];
+        for (pair, word) in block.chunks_exact_mut(2).zip(&self.data) {
+            pair.copy_from_slice(&word.to_be_bytes());
+        }
+        if !crate::dev::sgi_nvram::is_erased(&block, 0xFF) {
             return false;
         }
-        let mac = [self.data[0x7D], self.data[0x7E], self.data[0x7F]];
-        let mut bytes = [0u8; 256];
-        bytes[1] = 9; // IP26/IP28 NVRAM layout revision
-        for (offset, value) in [
-            (2, "g"), (116, "9600"), (121, "0"), (122, "PST8PDT"),
-            (178, "Y"), (232, "80"), (235, "0"), (236, "y"),
-            (239, "y"), (242, "1"),
-        ] {
-            bytes[offset..offset + value.len()].copy_from_slice(value.as_bytes());
-        }
-        for (word, pair) in self.data.iter_mut().zip(bytes.chunks_exact(2)) {
+        crate::dev::sgi_nvram::write_defaults(&mut block, rev);
+        for (word, pair) in self.data.iter_mut().zip(block.chunks_exact(2)) {
             *word = u16::from_be_bytes([pair[0], pair[1]]);
         }
-        self.data[0x7D..].copy_from_slice(&mac);
-        self.update_ip28_checksum();
         true
-    }
-
-    /// SGI XOR/rotate checksum, including the Ethernet address and excluding
-    /// only the checksum byte itself.
-    pub fn update_ip28_checksum(&mut self) {
-        let mut checksum = 0xA5u8;
-        for (i, &word) in self.data.iter().enumerate() {
-            checksum ^= word as u8;
-            if i != 0 { checksum ^= (word >> 8) as u8; }
-            checksum = checksum.rotate_left(1);
-        }
-        self.data[0] = (self.data[0] & 0xFF) | ((checksum as u16) << 8);
     }
 
     /// Load the full 128-word array from `filename` (raw big-endian bytes,
@@ -517,7 +498,7 @@ mod tests {
     fn erased_ip28_gets_defaults_and_checksum_without_losing_mac() {
         let mut ee = Eeprom93c56::new();
         ee.backdoor_set_mac([8, 0, 0x69, 0x12, 0x34, 0x56]);
-        assert!(ee.initialize_ip28_if_erased());
+        assert!(ee.initialize_if_erased(crate::dev::sgi_nvram::REV_IP28));
         assert_eq!(ee.data[0] & 0xff, 9);
         assert_eq!(ee.data[0x74], 0x3830); // volume 80
         assert_eq!(ee.data[0x79] >> 8, b'1' as u16);
@@ -534,8 +515,21 @@ mod tests {
         assert_eq!(bytes[0], sum);
         ee.data[0x74] = 0x3000; // guest muted chime
         let before = ee.data.clone();
-        assert!(!ee.initialize_ip28_if_erased());
+        assert!(!ee.initialize_if_erased(crate::dev::sgi_nvram::REV_IP28));
         assert_eq!(ee.data, before);
+    }
+
+    #[test]
+    fn erased_ip22_gets_volume_and_checksum_without_losing_mac() {
+        let mut ee = Eeprom93c56::new();
+        ee.backdoor_set_mac([8, 0, 0x69, 0x12, 0x34, 0x56]);
+        assert!(ee.initialize_if_erased(crate::dev::sgi_nvram::REV_IP22));
+        assert_eq!(ee.data[0] & 0xff, 8);
+        assert_eq!(ee.data[0x74], 0x3830); // volume 80
+        assert_eq!(ee.data[0x79] >> 8, 0, "the IP28-only slot stays empty");
+        assert_eq!(ee.data[0x7d..], [0x0800, 0x6912, 0x3456]);
+        let bytes: Vec<u8> = ee.data.iter().flat_map(|w| w.to_be_bytes()).collect();
+        assert_eq!(bytes[0], crate::dev::sgi_nvram::checksum(bytes.as_slice().try_into().unwrap()));
     }
 
     fn send_bits(eeprom: &mut Eeprom93c56, bits: u32, count: u32) {
