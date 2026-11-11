@@ -1950,6 +1950,45 @@ mod tests {
         assert_eq!(exec.core.read_gpr(2), 7, "released, the instruction runs");
     }
 
+    /// Under `ci_clock` the Compare deadline is a `hot.cycles` threshold that
+    /// only a step checks, and a WAIT's stall runs no steps. The stall must
+    /// raise IP7 itself when it moves `hot.cycles` past the deadline, or an
+    /// R5000 IRIX idling in WAIT gets no clock tick until some device
+    /// interrupts. Nothing else is pending here; a soft reset after 1 s
+    /// stands in for the device so a regression fails instead of hanging.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_wait_wakes_on_the_compare_deadline() {
+        let (mut exec, _) = create_executor();
+        exec.core.pc = 0xFFFF_FFFF_8000_1000;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::CAUSE_IP7;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        let deadline = exec.core.hot.cycles + 100_000; // 1 ms of stall at 10 ns/cycle
+        exec.core.count_fire_cycle = deadline;
+
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let (done, stop) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let irq = irq;
+            if stop.recv_timeout(std::time::Duration::from_secs(1)).is_err() {
+                // SAFETY: the executor outlives this thread, which is joined below.
+                unsafe { &*irq.0 }.fetch_or(crate::cpu::mips_exec::SOFT_RESET_BIT, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        let _ = done.send(());
+        watchdog.join().unwrap();
+
+        let pending = exec.core.hot.interrupts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(pending & crate::cpu::mips_exec::SOFT_RESET_BIT, 0,
+            "the stall ran 1 s past a 1 ms Compare deadline");
+        assert_ne!(pending & crate::cpu::mips_core::CAUSE_IP7 as u64, 0, "IP7 must be pending");
+        assert!(exec.core.hot.cycles >= deadline);
+    }
+
     #[test]
     fn test_eret() {
         let (mut exec, _) = create_executor();
@@ -7361,6 +7400,110 @@ mod tests {
             let _ = done_tx.send(());
         });
         done_rx.recv_timeout(Duration::from_secs(5)).expect("second stop did not return");
+    }
+
+    /// Under `ci_clock` the Compare deadline is a `hot.cycles` threshold, with
+    /// no timer thread to raise IP7 once it passes, so compiled code has to
+    /// test it as well as `hot.interrupts`. This loop jumps between two
+    /// compiled pages, entering compiled code through `step_jit` on every
+    /// pass, and must take the timer interrupt once the deadline passes.
+    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    #[test]
+    fn ci_clock_compiled_code_takes_the_compare_deadline() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_IE, STATUS_IM_SHIFT};
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        // Compiled code calls the Compare hook at a cycle flush.
+        exec.install_jit_hooks();
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        let j = |pa: u32| (OP_J << 26) | ((0x8000_0000 | pa) >> 2 & 0x03FF_FFFF);
+        mem.set_word(0x1000, j(0x2000));
+        mem.set_word(0x1004, 0);
+        mem.set_word(0x2000, j(0x1000));
+        mem.set_word(0x2004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+
+        let jit = exec.jitv2.clone();
+        let compiled = |pa: u64| {
+            let mut jit = jit.lock();
+            let slot = jit.page_for(1, pa, mem.as_ref(), false).expect("page for the loop");
+            unsafe { (*jit.page_ptr(slot)).is_runnable(0) }
+        };
+        let mut steps = 0;
+        while !(compiled(0x1000) && compiled(0x2000)) {
+            exec.step_jit();
+            steps += 1;
+            assert!(steps < 1_000_000, "the loop was never compiled");
+        }
+        assert_eq!(exec.core.cp0_status & STATUS_EXL, 0);
+
+        exec.core.count_fire_cycle = exec.core.hot.cycles + 100;
+        for _ in 0..10_000 {
+            exec.step_jit();
+            if exec.core.cp0_status & STATUS_EXL != 0 {
+                break;
+            }
+        }
+        assert_ne!(exec.core.cp0_status & STATUS_EXL, 0,
+            "no interrupt taken {} cycles past the Compare deadline",
+            exec.core.hot.cycles - exec.core.count_fire_cycle);
+        assert_eq!((exec.core.cp0_cause >> 2) & 0x1F, 0, "the exception is an interrupt");
+        assert_ne!(exec.core.cp0_cause & crate::cpu::mips_core::CAUSE_IP7, 0);
+    }
+
+    /// The same deadline inside one compiled page: a spin on one `beq` never
+    /// leaves compiled code, so only compiled code can deliver it.
+    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    #[test]
+    fn ci_clock_a_compiled_spin_takes_the_compare_deadline() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_IE, STATUS_IM_SHIFT};
+        use crate::cpu::smp::HOST_PARK_BIT;
+        use std::sync::atomic::Ordering;
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        // Compiled code calls the Compare hook at a cycle flush.
+        exec.install_jit_hooks();
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        exec.core.count_fire_cycle = 100;
+
+        // A failed run spins in compiled code for good; the park bit, which
+        // compiled code does see, gets it out so the test fails instead.
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let (done, stop) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let irq = irq;
+            if stop.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                // SAFETY: the executor outlives this thread, which is joined below.
+                unsafe { &*irq.0 }.fetch_or(HOST_PARK_BIT, Ordering::SeqCst);
+            }
+        });
+        for _ in 0..100_000 {
+            exec.step_jit();
+            if exec.core.cp0_status & STATUS_EXL != 0
+                || exec.core.hot.interrupts.load(Ordering::SeqCst) & HOST_PARK_BIT != 0 {
+                break;
+            }
+        }
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        assert_eq!(exec.core.hot.interrupts.load(Ordering::SeqCst) & HOST_PARK_BIT, 0,
+            "the compiled spin ran 2 s past the deadline");
+        assert_ne!(exec.core.cp0_status & STATUS_EXL, 0, "no interrupt taken");
     }
 
     #[test]
