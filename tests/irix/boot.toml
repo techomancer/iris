@@ -1,0 +1,35 @@
+# Read by `iris-ci boot-test`; --steps names another file. How it works:
+# clanker/testing/ci-unattended-irix-boot.md.
+
+[[nvram]]
+name = "SystemPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(8)"
+guest = true
+
+[[nvram]]
+name = "OSLoadPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(0)"
+guest = true
+
+[[nvram]]
+name = "OSLoadFilename"
+value = "/unix"
+guest = true
+
+[[nvram]]
+name = "AutoLoad"
+value = "Yes"
+
+[[boot]]
+name = "serial console: login prompt"
+console = "d"
+quit = "iris quits when asked, serial boot"
+serial = "login:"
+
+# Built into iris-ci from scripts/boot-goldens/; a file of the same name beside
+# a --steps file replaces it.
+[[boot]]
+name = "graphics console: login screen"
+console = "g"
+quit = "iris quits when asked, graphics boot"
+screen = "indy-irix53.png"

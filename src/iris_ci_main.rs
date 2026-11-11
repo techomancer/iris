@@ -16,8 +16,9 @@
 //!
 //! Returns 0 on success, 1 on socket error, 2 on iris error response,
 //! 3 on local error (file not found etc), 4 when `run` ran a guest command
-//! that exited nonzero, and 5 when a wait for the guest timed out. A caller
-//! tells those apart by the status, not by reading the message.
+//! that exited nonzero, 5 when a wait for the guest timed out, and 6 when a
+//! check of `boot-test` failed. A caller tells those apart by the status, not
+//! by reading the message.
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -28,6 +29,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+
+#[path = "iris_ci_boot.rs"]
+mod boot;
 
 /// The socket iris listens on when neither names one.
 fn default_socket() -> PathBuf {
@@ -126,12 +130,18 @@ enum Cmd {
         #[arg(long, default_value = "screen-diff.png")]
         diff: PathBuf,
         /// A pixel differs when a channel is off by more than this.
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = SCREEN_THRESHOLD)]
         threshold: u8,
         /// The most differing pixels a match allows (see SCREEN_MAX_PIXELS).
         #[arg(long, default_value_t = SCREEN_MAX_PIXELS)]
         max_pixels: usize,
     },
+
+    /// Boot an installed IRIX disk with the console on serial and on the
+    /// graphics board, check that each reaches its login, and write a JUnit
+    /// report, boot-test.xml, of the checks. Starts its own iris. Exits 6 when
+    /// a check fails.
+    BootTest(boot::Args),
 
     /// Write a JUnit report of checks a script has made, one case per
     /// --case, so a CI test reporter can name the one that failed. Needs no
@@ -315,6 +325,10 @@ fn main() {
             eprintln!("iris-ci: {}", e);
             5
         }
+        Err(Error::Failed(e)) => {
+            eprintln!("iris-ci: {}", e);
+            6
+        }
     };
     std::process::exit(exit);
 }
@@ -348,6 +362,7 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::Gc                    => cmd_gc(opts),
         Cmd::Validate { name, n }  => cmd_validate(opts, &name, n),
         Cmd::Screenshot { path }   => simple(opts, "screenshot", json!({"path": path.display().to_string()}), "screenshot"),
+        Cmd::BootTest(args) => boot::run(args),
         Cmd::Junit { path, suite, cases } => {
             let cases = cases.iter().map(|c| junit_case(c)).collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::Local)?;
@@ -406,6 +421,8 @@ enum Error {
     GuestExit(i32),
     /// iris answered that a wait ran out.
     Timeout(String),
+    /// A check of `boot-test` failed.
+    Failed(String),
 }
 type Result<T> = std::result::Result<T, Error>;
 impl From<std::io::Error> for Error {
@@ -772,6 +789,9 @@ const SCREEN_POLL: Duration = Duration::from_secs(1);
 /// 156. A screen of other content may need its own limit.
 const SCREEN_MAX_PIXELS: usize = 128;
 
+/// A pixel differs when a channel is off by more than this.
+const SCREEN_THRESHOLD: u8 = 32;
+
 /// An 8-bit RGB image, three bytes a pixel.
 struct Rgb {
     width: u32,
@@ -781,12 +801,17 @@ struct Rgb {
 
 fn read_rgb(path: &std::path::Path) -> std::result::Result<Rgb, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    let mut dec = png::Decoder::new(BufReader::new(file));
+    decode_rgb(BufReader::new(file), &path.display().to_string())
+}
+
+/// The PNG in `src`, which `what` names in an error.
+fn decode_rgb(src: impl BufRead + std::io::Seek, what: &str) -> std::result::Result<Rgb, String> {
+    let mut dec = png::Decoder::new(src);
     // A golden re-saved by an image tool may come back palette or 16-bit.
     dec.set_transformations(png::Transformations::normalize_to_color8());
-    let bad = |e: png::DecodingError| format!("{}: {}", path.display(), e);
+    let bad = |e: png::DecodingError| format!("{what}: {e}");
     let mut r = dec.read_info().map_err(bad)?;
-    let mut buf = vec![0; r.output_buffer_size().ok_or_else(|| format!("{}: too large", path.display()))?];
+    let mut buf = vec![0; r.output_buffer_size().ok_or_else(|| format!("{what}: too large"))?];
     let info = r.next_frame(&mut buf).map_err(bad)?;
     buf.truncate(info.buffer_size());
     let px = match info.color_type {
@@ -794,7 +819,7 @@ fn read_rgb(path: &std::path::Path) -> std::result::Result<Rgb, String> {
         png::ColorType::Rgba => buf.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g]).collect(),
         png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0]]).collect(),
-        png::ColorType::Indexed => return Err(format!("{}: palette left unexpanded", path.display())),
+        png::ColorType::Indexed => return Err(format!("{what}: palette left unexpanded")),
     };
     Ok(Rgb { width: info.width, height: info.height, px })
 }
@@ -837,9 +862,7 @@ fn diff_image(golden: &Rgb, actual: &Rgb, threshold: u8) -> Rgb {
 }
 
 /// `iris-ci screen-wait`: wait for the screen to show what the golden does.
-/// A boot draws its screen in stages and no one signal says it has finished,
-/// so poll screenshots until one matches or the deadline passes. Screenshots
-/// fail until the board has a video mode; those count as not matching yet.
+/// Says what matched when it did.
 fn cmd_screen_wait(
     opts: &Opts,
     golden_path: &std::path::Path,
@@ -850,6 +873,26 @@ fn cmd_screen_wait(
     max_pixels: usize,
 ) -> Result<()> {
     let golden = read_rgb(golden_path).map_err(|e| Error::Local(format!("golden: {e}")))?;
+    let said = screen_wait(opts, &golden_path.display().to_string(), &golden, timeout_s, actual_path,
+                           diff_path, threshold, max_pixels)?;
+    print_response(opts, &said, &Value::Null);
+    Ok(())
+}
+
+/// Wait for the screen to show what the golden does.
+/// A boot draws its screen in stages and no one signal says it has finished,
+/// so poll screenshots until one matches or the deadline passes. Screenshots
+/// fail until the board has a video mode; those count as not matching yet.
+fn screen_wait(
+    opts: &Opts,
+    golden_name: &str,
+    golden: &Rgb,
+    timeout_s: u64,
+    actual_path: &std::path::Path,
+    diff_path: &std::path::Path,
+    threshold: u8,
+    max_pixels: usize,
+) -> Result<String> {
     // iris writes the screenshot, from its own working directory.
     let actual_path = std::path::absolute(actual_path)
         .map_err(|e| Error::Local(format!("{}: {}", actual_path.display(), e)))?;
@@ -860,11 +903,10 @@ fn cmd_screen_wait(
         match send(opts, "screenshot", json!({"path": actual_path.display().to_string()})) {
             Ok(_) => match read_rgb(&actual_path) {
                 Ok(img) => {
-                    let n = count_differing(&golden, &img, threshold);
+                    let n = count_differing(golden, &img, threshold);
                     if n.is_some_and(|n| n <= max_pixels) {
-                        print_response(opts, &format!(
-                            "screen matches {} ({} pixels differ)", golden_path.display(), n.unwrap()), &Value::Null);
-                        return Ok(());
+                        return Ok(format!(
+                            "screen matches {golden_name} ({} pixels differ)", n.unwrap()));
                     }
                     if !opts.quiet && last.as_ref().map(|l| l.1) != Some(n) {
                         match n {
@@ -893,11 +935,11 @@ fn cmd_screen_wait(
             "screen still {}x{} after {timeout_s}s, golden is {}x{}; see {}",
             img.width, img.height, golden.width, golden.height, actual_path.display())));
     };
-    write_rgb(diff_path, &diff_image(&golden, &img, threshold)).map_err(Error::Local)?;
+    write_rgb(diff_path, &diff_image(golden, &img, threshold)).map_err(Error::Local)?;
     Err(Error::Timeout(format!(
-        "screen did not match {} within {timeout_s}s: {n} pixels differ by more than {threshold} \
+        "screen did not match {golden_name} within {timeout_s}s: {n} pixels differ by more than {threshold} \
          (limit {max_pixels}); see {} and {}",
-        golden_path.display(), actual_path.display(), diff_path.display())))
+        actual_path.display(), diff_path.display())))
 }
 
 // ---- boot/login/run macros --------------------------------------------------

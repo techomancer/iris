@@ -206,6 +206,7 @@ pub mod bench_report;
 pub mod benchsuite;
 pub mod bench_runner;
 pub mod junit;
+pub mod guest_steps;
 pub mod cow_disk;
 pub mod chd_disk;
 pub mod block_node;
