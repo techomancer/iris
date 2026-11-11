@@ -4,8 +4,13 @@
 **Category:** testing
 
 Two things stop a scripted `--ci` boot of an installed disk from working out of
-the box. `scripts/ci-boot-test.sh` handles both; read it before writing another.
-The `boot-test` job in `.github/workflows/build.yml` runs it.
+the box. `iris-ci boot-test` (`src/iris_ci_boot.rs`) handles both; read it
+before writing another. The `boot-test` job in `.github/workflows/build.yml`
+runs it, and `tests/irix/boot.toml` says what it seeds and which boots it checks.
+iris-ci embeds that file and the golden screenshot, so it runs from any
+directory; `--steps` and `--golden` replace them. It starts its own iris, so
+run it as `iris-ci boot-test <disk> --out <dir>` with `iris` beside `iris-ci`
+or named with `--iris`.
 
 ## A fresh NVRAM can't boot anything
 
@@ -20,10 +25,13 @@ Fix: a headless pass first. With `--headless` the PROM falls back to the serial
 console, which the CI socket can drive: wait `Option?` → `5` → `setenv -f
 SystemPartition scsi(0)disk(1)rdisk(0)partition(8)`, `OSLoadPartition
 ...partition(0)`, `OSLoadFilename /unix`, `AutoLoad Yes` → `iris-ci rtc-save`
-→ quit. The next run auto-boots the disk unattended. The script also sets
+→ quit. The next run auto-boots the disk unattended. The test also sets
 `console d`, so `login:` arrives on serial; the framebuffer stays dark (irix-install.md §8).
 
-The script then seeds NVRAM again with `console g` and boots a second time.
+The serial boot stays alongside the graphics one: it is cheap, and when a boot
+fails its transcript shows how far it got, which a screenshot does not. The
+PROM lists a seeded `AutoLoad` as `Yes` and the guest's `nvram` as `Y`, so only
+the PROM's listing is checked. The test then seeds NVRAM again with `console g` and boots a second time.
 The login is drawn on the framebuffer, so `iris-ci screen-wait` polls
 screenshots until one matches `scripts/boot-goldens/indy-irix53.png`. Serial is
 not silent on every disk: the stock disk has a getty on `ttyd1`, so `IRIS
@@ -43,14 +51,17 @@ golden.
 
 ## Each check is a JUnit case
 
-The script records each check (seeding NVRAM, the serial login prompt, the
-graphics login screen with screen-wait's pixel count, iris quitting when asked
-after each boot) with `check`, and its exit trap writes them all to
-`boot-test/boot-test.xml` with `iris-ci junit`, also after a failure that stops
-the script early. The job hands that file to the JUnit reporter with
-`annotate_only`, which needs no `checks: write`, so a failed run is annotated
-with the check that failed. Add a check the same way rather than another exit
-code.
+Each boot records five checks: seeding NVRAM, the PROM's `printenv` listing
+the seeded variables, the login (the serial prompt, or the graphics screen
+with screen-wait's pixel count), the guest's own `nvram` showing `console` and
+the partitions that were seeded, and iris quitting when asked. The guest check
+logs in on serial, where the stock disk's getty answers whichever console the
+PROM chose, and is skipped when the login check failed. They are written to
+`boot-test/boot-test.xml`, also after a failure that stops the test early. The
+job hands that file to the JUnit reporter with `annotate_only`, which needs no
+`checks: write`, so a failed run is annotated with the check that failed. Add a
+check to the data in `tests/irix/boot.toml` or to `src/iris_ci_boot.rs`
+rather than another exit code. `iris-ci` exits 6 when a check failed.
 
 ## Screenshots under --ci
 
