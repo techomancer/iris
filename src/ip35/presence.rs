@@ -31,16 +31,21 @@
 //!   held until that interface publishes.
 //!
 //! A held processor ([`HOLD_RENDEZVOUS`]) stops at its batch boundary. The
-//! check runs on every processor's batch boundary and reads atomics Bedrock
+//! check runs on every processor's batch boundary, starts the hold of any
+//! processor that is due one, not only its own, and reads atomics Bedrock
 //! exposes ([`Bedrock::rt_posted`], [`Bedrock::io_scratch0`],
-//! [`Bedrock::hub_lock_free`]); nothing calls back from the chip. A hold is
+//! [`Bedrock::hub_lock_free`]); nothing calls back from the chip. A
+//! processor whose post and poll run as one compiled loop reaches no
+//! boundary of its own until the poll has run out, so its hold is started
+//! from another processor's boundary, and the hold's park request takes it
+//! out of the compiled loop to its own boundary. A hold is
 //! bounded by the cycles the processors it waits for have retired
 //! ([`HOLD_CYCLES`]), not host time, so a host thread the scheduler leaves
 //! off a core cannot run it out; host time backs it only as a deadlock
 //! safety net ([`SAFETY_NS`]). A liveness hold that runs out ends only
 //! itself, and the PROM then finds the partner dead as it would a dead one;
 //! a publisher's hold that runs out ends the join until the next reset.
-//! While nothing is held and the processor has no hold to start, the check
+//! While nothing is held and no processor has a hold to start, the check
 //! takes no lock; once every populated interface has published, it is one
 //! atomic load.
 //!
@@ -213,17 +218,32 @@ impl PresenceHold {
         }
     }
 
-    /// CPU `cpu`'s batch boundary: end the holds that are satisfied or past
-    /// their bound, and hold `cpu` if it has posted and waits for its
-    /// partner's post, or is a publisher waiting for the other interface.
-    pub fn at_batch(&self, cpu: usize) {
+    /// What processor `cpu` should be held for now, if anything: its
+    /// partner's post once it has posted, or the other interface's
+    /// publication if it is a publisher that has published.
+    fn due(&self, presence: u64, posted: u64, abandoned: bool, cpu: usize) -> Option<Kind> {
+        if self.awaits_partner(posted, cpu) {
+            Some(Kind::Partner)
+        } else if !abandoned && self.may_hold(presence, cpu) {
+            Some(Kind::Publication)
+        } else {
+            None
+        }
+    }
+
+    /// A processor's batch boundary: end the holds that are satisfied or
+    /// past their bound, and hold every processor that has posted and waits
+    /// for its partner's post, or is a publisher waiting for the other
+    /// interface.
+    pub fn at_batch(&self) {
         if self.done.load(Ordering::Relaxed) {
             return;
         }
         let presence = self.bedrock.io_scratch0();
         let posted = self.bedrock.rt_posted();
-        // Nothing held and nothing for this processor to start: no lock.
-        if !self.holding.load(Ordering::Acquire) && !self.may_hold(presence, cpu) && !self.awaits_partner(posted, cpu) {
+        let count = self.processors.count();
+        // Nothing held and nothing to start: no lock.
+        if !self.holding.load(Ordering::Acquire) && (0..count).all(|cpu| self.due(presence, posted, false, cpu).is_none()) {
             let all = (0..2).filter(|&i| self.populated(i)).all(|i| Self::published(presence, i));
             if all && !self.done.swap(true, Ordering::Relaxed) {
                 dlog!(LogModule::Bedrock, "presence: the join is over");
@@ -257,28 +277,21 @@ impl PresenceHold {
             }
             return;
         }
-        let kind = if s.held[cpu].is_some() {
-            None
-        } else if self.awaits_partner(posted, cpu) {
-            Some(Kind::Partner)
-        } else if !s.abandoned && self.may_hold(presence, cpu) {
-            Some(Kind::Publication)
-        } else {
-            None
-        };
-        let Some(kind) = kind else {
-            self.holding.store(s.held.iter().any(Option::is_some), Ordering::Release);
-            return;
-        };
-        s.held[cpu] = Some(Held { kind, since: now, progress: self.waited_progress(cpu, kind) });
-        self.holding.store(true, Ordering::Release);
-        match kind {
-            Kind::Partner => dlog!(LogModule::Bedrock, "presence: holding CPU {cpu} until its partner posts"),
-            Kind::Publication => dlog!(LogModule::Bedrock, "presence: holding CPU {cpu} until the other interface publishes"),
+        for cpu in 0..count {
+            if s.held[cpu].is_some() {
+                continue;
+            }
+            let Some(kind) = self.due(presence, posted, s.abandoned, cpu) else { continue };
+            s.held[cpu] = Some(Held { kind, since: now, progress: self.waited_progress(cpu, kind) });
+            match kind {
+                Kind::Partner => dlog!(LogModule::Bedrock, "presence: holding CPU {cpu} until its partner posts"),
+                Kind::Publication => dlog!(LogModule::Bedrock, "presence: holding CPU {cpu} until the other interface publishes"),
+            }
+            if let Some(c) = self.cpus.get().and_then(|cpus| cpus.get(cpu)) {
+                c.slot.hold(HOLD_RENDEZVOUS);
+            }
         }
-        if let Some(c) = self.cpus.get().and_then(|cpus| cpus.get(cpu)) {
-            c.slot.hold(HOLD_RENDEZVOUS);
-        }
+        self.holding.store(s.held.iter().any(Option::is_some), Ordering::Release);
     }
 
     /// Whether `cpu` is a publisher that should wait now: its interface has

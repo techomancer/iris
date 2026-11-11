@@ -84,26 +84,22 @@ impl Rig {
 }
 
 /// PI0's publisher, having published with the lock free while PI1 has not,
-/// is held at its batch boundary; its partner on PI0 and PI1's processors
-/// are not. PI1's publication releases it at the next boundary any
-/// processor reaches, and the join is over.
+/// is held at the next boundary any processor reaches; its partner on PI0
+/// and PI1's processors are not. PI1's publication releases it the same
+/// way, and the join is over.
 #[test]
 fn a_publisher_waits_for_the_other_interface() {
     let rig = Rig::new(4);
     rig.hub_lock(true);
     rig.publish(0x30);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty(), "not while the hub lock is held");
     rig.hub_lock(false);
-    for cpu in [2, 1, 3] {
-        rig.hold.at_batch(cpu);
-    }
-    assert!(rig.hold.held().is_empty(), "only a publisher whose interface has published");
-    rig.hold.at_batch(0);
-    assert_eq!(rig.hold.held(), [0]);
+    rig.hold.at_batch();
+    assert_eq!(rig.hold.held(), [0], "only the publisher whose interface has published");
     assert!(rig.parked(0));
     rig.publish(0xf0);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty() && !rig.parked(0));
     assert!(rig.hold.is_done());
 }
@@ -115,21 +111,21 @@ fn a_publisher_waits_for_the_other_interface() {
 fn a_hold_ends_once_the_other_interface_has_run_its_bound() {
     let rig = Rig::new(2);
     rig.publish(0x10);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0]);
     rig.cycles[1].store(HOLD_CYCLES - 1, Ordering::SeqCst);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0], "not yet");
     rig.cycles[0].store(u64::MAX, Ordering::SeqCst);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0], "the held processor's own cycles do not count");
     rig.cycles[1].store(HOLD_CYCLES, Ordering::SeqCst);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty() && !rig.parked(0));
     assert!(rig.hold.is_done(), "abandoned");
     rig.hold.reset();
     assert!(!rig.hold.is_done());
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0], "a reset starts the join over");
     rig.hold.reset();
     assert!(rig.hold.held().is_empty() && !rig.parked(0));
@@ -140,12 +136,12 @@ fn a_hold_ends_once_the_other_interface_has_run_its_bound() {
 fn the_safety_net_ends_a_hold_whatever_the_cycles() {
     let rig = Rig::new(2);
     rig.publish(0x10);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     rig.now.store(SAFETY_NS - 1, Ordering::SeqCst);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0]);
     rig.now.store(SAFETY_NS, Ordering::SeqCst);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty());
 }
 
@@ -155,24 +151,28 @@ fn one_processor_is_never_held() {
     let rig = Rig::new(1);
     assert!(rig.hold.is_done());
     rig.publish(0x10);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty());
 }
 
-/// A boundary with nothing held and no hold to start takes no lock: CPU 2,
-/// not a publisher, passes its boundary while the state is locked, and so
-/// does a publisher whose partner interface has published.
+/// A boundary with nothing held and no hold to start takes no lock: before
+/// anyone has posted, once both of a pair have posted, and once both
+/// interfaces have published, a boundary passes while the state is locked.
 #[test]
 fn a_boundary_with_nothing_to_do_takes_no_lock() {
     let rig = Rig::new(4);
-    rig.publish(0x30);
+    rig.barrier(&[0, 1, 2, 3]);
     let held = rig.hold.state.lock();
-    rig.hold.at_batch(2);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
+    drop(held);
+    rig.post(0);
+    rig.post(2);
+    let held = rig.hold.state.lock();
+    rig.hold.at_batch();
     drop(held);
     rig.publish(0xf0);
     let held = rig.hold.state.lock();
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     drop(held);
     assert!(rig.hold.is_done());
 }
@@ -186,24 +186,20 @@ fn the_first_of_a_pair_to_post_waits_for_its_partner() {
     let rig = Rig::new(4);
     rig.barrier(&[0, 1, 2, 3]);
     rig.post(0);
-    for cpu in [1, 2, 3, 0] {
-        rig.hold.at_batch(cpu);
-    }
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0]);
     assert!(rig.parked(0));
     rig.post(3);
-    rig.hold.at_batch(3);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0, 3]);
     rig.post(2);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [3], "CPU 2's post released CPU 0");
     assert!(!rig.parked(0));
     rig.post(1);
-    rig.hold.at_batch(2);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty() && !rig.parked(3));
-    for cpu in 0..4 {
-        rig.hold.at_batch(cpu);
-    }
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty(), "both pairs posted");
 }
 
@@ -214,14 +210,14 @@ fn the_first_of_a_pair_to_post_waits_for_its_partner() {
 fn only_a_store_to_its_own_register_after_its_join_posts() {
     let rig = Rig::new(4);
     rig.post(0);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty(), "a progress code before the join");
     rig.barrier(&[0, 2]);
     rig.compare(0, 0, 1, 0x24);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty(), "CPU 0 wrote CPU 2's register");
     rig.post(0);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0]);
 }
 
@@ -233,18 +229,18 @@ fn a_liveness_hold_runs_out_on_the_partners_cycles_and_ends_only_itself() {
     let rig = Rig::new(4);
     rig.barrier(&[0, 1, 2, 3]);
     rig.post(0);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0]);
     rig.cycles[1].store(u64::MAX, Ordering::SeqCst);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0], "only the partner's cycles count");
     rig.cycles[2].store(HOLD_CYCLES, Ordering::SeqCst);
-    rig.hold.at_batch(2);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty() && !rig.parked(0));
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty(), "not held for that partner again");
     rig.publish(0x10);
-    rig.hold.at_batch(0);
+    rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0], "the publisher's hold still applies");
 }
 
@@ -255,7 +251,25 @@ fn two_processors_have_no_pair() {
     rig.barrier(&[0, 1]);
     rig.post(0);
     rig.post(1);
-    rig.hold.at_batch(0);
-    rig.hold.at_batch(1);
+    rig.hold.at_batch();
     assert!(rig.hold.held().is_empty());
+}
+
+/// A processor whose post and poll run as one compiled loop makes no batch
+/// boundary of its own until its poll has run out. Its hold starts at
+/// another processor's boundary: CPU 2 (PI0/B) posts before its partner
+/// CPU 0 and is held without a boundary of its own, and CPU 0's post
+/// releases it. That the park request takes a processor out of compiled
+/// code is the CPU's contract, not tested here.
+#[test]
+fn a_poster_with_no_boundary_of_its_own_is_held_from_another() {
+    let rig = Rig::new(4);
+    rig.barrier(&[0, 1, 2, 3]);
+    rig.post(2);
+    rig.hold.at_batch();
+    assert_eq!(rig.hold.held(), [2]);
+    assert!(rig.parked(2));
+    rig.post(0);
+    rig.hold.at_batch();
+    assert!(rig.hold.held().is_empty() && !rig.parked(2));
 }

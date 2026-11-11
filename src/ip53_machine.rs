@@ -905,14 +905,13 @@ where
     exec.core.cpu_id = id;
     exec.core.smp = count > 1;
     let poll_board = board.clone();
-    let cpu = usize::from(id);
     exec.batch_hook = match (id, count > 1) {
         (0, false) => Some(Box::new(move |_| poll_board.poll())),
         (0, true) => Some(Box::new(move |_| {
             poll_board.poll();
-            poll_board.presence.at_batch(cpu);
+            poll_board.presence.at_batch();
         })),
-        (_, true) => Some(Box::new(move |_| poll_board.presence.at_batch(cpu))),
+        (_, true) => Some(Box::new(move |_| poll_board.presence.at_batch())),
         (_, false) => None,
     };
     Arc::new(MipsCpu::new(*exec))
