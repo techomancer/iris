@@ -728,3 +728,54 @@ fn the_other_per_fragment_files_keep_the_store_point_rule() {
         }
     }
 }
+
+/// The fill rate of the per-fragment loop, in megapixels a second, for a few draw states. Each
+/// scene draws two large triangles that cover most of a 1024 x 1024 managed area, on the calling
+/// thread with no tile workers. Run it from a release build, one test thread:
+///
+///     cargo test --release --lib kona::back::golden::triangle_fill_rate -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn triangle_fill_rate() {
+    use std::time::{Duration, Instant};
+    const S: i32 = 1024;
+    let full = Rect { x0: 0, y0: 0, x1: S, y1: S };
+    let scene = |name: &str, f: &dyn Fn(&mut DrawState)| {
+        let mut st = KonaBackend::new(KonaConfig { managed: (S as u32, S as u32), ..KonaConfig::default() }.with_pool(0, 32));
+        let mut ds = DrawState { clip: full, viewport: full, colour: [1, 0], colours: 1, depth_word: 3, depth_bits: 32, depth_func: Compare::Less, depth_test: true, depth_mask: true, ..DrawState::default() };
+        f(&mut ds);
+        let (a, b) = (1000.0f32, 1000.0f32);
+        let tris = [
+            tri([(10.0, 10.0), (a, 10.0), (a, b)], [[8191, 0, 0, 8191], [0, 8191, 0, 8191], [0, 0, 8191, 8191]], [1 << 20, 1 << 21, 1 << 22]),
+            tri([(10.0, 10.0), (a, b), (10.0, b)], [[8191, 0, 0, 8191], [0, 0, 8191, 8191], [0, 8191, 0, 8191]], [1 << 20, 1 << 22, 1 << 21]),
+        ];
+        let pixels = (((a - 10.0) * (b - 10.0)) as u64).max(1);
+        let mut best: f64 = 0.0;
+        for _ in 0..5 {
+            let (start, mut draws) = (Instant::now(), 0u64);
+            while start.elapsed() < Duration::from_millis(300) {
+                // A clear each time so the depth test passes and the same pixels are written.
+                clear(&mut st, &ds, Some(0), Some(u32::MAX));
+                draw(&mut st, &ds, &tris);
+                draws += 1;
+            }
+            best = best.max((draws * pixels) as f64 / start.elapsed().as_secs_f64() / 1e6);
+        }
+        assert!(pixels_written(&st.store), "{name} drew nothing");
+        println!("{name:<28} {best:>8.1} Mpix/s");
+    };
+    scene("colour and depth", &|_| {});
+    scene("colour only", &|d| d.depth_test = false);
+    scene("blended", &|d| {
+        d.depth_test = false;
+        d.blend.enabled = true;
+        d.blend.src = BlendFactor::SrcAlpha;
+        d.blend.dst = BlendFactor::OneMinusSrcAlpha;
+    });
+    scene("polygon stipple", &|d| d.polygon_stipple = Some([0xaaaa_aaaa; 32]));
+}
+
+/// Whether any colour word of the store was written.
+fn pixels_written(s: &PixelStore) -> bool {
+    (0..1024).any(|y| (0..1024).any(|x| s.read(x, y, 1) != 0))
+}
