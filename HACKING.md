@@ -770,7 +770,7 @@ per major-axis position; shader lanes derive the payload index from their
 major coordinate and test coverage in O(1). The three line families preserve
 BRESROUND, skip-first/last, AWEIGHT endpoint filtering, RGB/auxiliary
 selection, WRMASK and exact `XSTART`/`YSTART`/`BRESD` completion. Single-step
-and length-32 continuation, stipples and general pixel effects are still
+and length-32 continuation, stipples, shade and blend effects are still
 rejected for later focused M3 slices.
 
 Simple fill and line commands also carry destination addressing through
@@ -779,8 +779,16 @@ include coordinate movement and remain conservative; each shader lane applies
 the exact window-relative and absolute tests. CIDMATCH reads the lane's current
 ordered auxiliary value, not the plane value from batch start, so an earlier
 overlapping CID command affects later commands without forcing a submission.
-YFLIP and the remaining stipple/shade/compare/logic/blend/dither pipeline are
-still separate work.
+
+Ordinary commands retain an uncompressed source in their state slot. Shader
+lanes then implement RGB/RGBA and CI depths 4, 8, 12 and 24, `DBLSRC` plane
+slot selection, OLAY/PUP/CID packing, alpha compare, all logic operations,
+WRMASK and the REX3 4x4 Bayer dither. Dither indexes use the original walker
+coordinates recovered before `XYMOVE`, `XYWIN` and YFLIP addressing. YFLIP
+also reverses y-major line payload direction while preserving the original
+context completion. Fast clears continue to bypass this pipeline and write
+their replicated `COLORVRAM` value directly. Z, stipple, shade and blending
+remain separate work.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
 positions distinguish accepted, submitted and callback-confirmed work; each

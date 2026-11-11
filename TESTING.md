@@ -330,6 +330,11 @@ The hardware clipping case compares complete planes after offset blocks and
 lines using SMASK0, OR-combined SMASK1-4 and CIDMATCH. It also verifies that a
 CID write earlier in one ordered batch affects a later overlapping RGB
 command without a submission boundary.
+The hardware pixel-format case covers RGB/RGBA and CI depths 4, 8, 12 and 24,
+both `DBLSRC` slots, OLAY/PUP/CID packing, alpha pass and rejection, all logic
+operations used by the matrix, WRMASK, Bayer dithering and YFLIP blocks and
+lines. Complete seeded RGB and auxiliary planes are compared with the CPU
+oracle on both hardware backends.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
@@ -359,8 +364,8 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 ```
 
 The script requires 25 `resident_` CPU tests, four flat-fill tests, two line
-tests, three command-ABI tests and three direct-state tests, then **12
-resident GPU tests and eight direct scanout tests on each backend**: 77 tests
+tests, three command-ABI tests and three direct-state tests, then **13
+resident GPU tests and eight direct scanout tests on each backend**: 79 tests
 in total. The window test requires an available native desktop and a GPU that
 can present to it. The script checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
