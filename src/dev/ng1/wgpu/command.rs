@@ -7,6 +7,7 @@ use crate::dev::ng1::rex3::{Rex3Context, HOSTRW_BUF_QWORDS};
 use crate::dev::ng1::rex3_flat_fill::{FillKind, FillPlane, FlatFill};
 use crate::wgpu::Full;
 
+use super::copy::{CopyFill, CopyKind};
 use super::line::{LineCommand, LineKind};
 
 pub(super) const COMMAND_BLOCK: u32 = 1;
@@ -15,6 +16,11 @@ pub(super) const COMMAND_CLEAR: u32 = 3;
 pub(super) const COMMAND_I_LINE: u32 = 4;
 pub(super) const COMMAND_F_LINE: u32 = 5;
 pub(super) const COMMAND_A_LINE: u32 = 6;
+pub(super) const COMMAND_COPY_BLOCK: u32 = 7;
+pub(super) const COMMAND_COPY_SPAN: u32 = 8;
+pub(super) const COMMAND_COPY_I_LINE: u32 = 9;
+pub(super) const COMMAND_COPY_F_LINE: u32 = 10;
+pub(super) const COMMAND_COPY_A_LINE: u32 = 11;
 
 pub(super) const FLAG_WRITE_RGB: u32 = 1 << 0;
 pub(super) const FLAG_WRITE_AUX: u32 = 1 << 1;
@@ -144,6 +150,7 @@ impl RexCommand {
         if line.y_major {
             flags |= FLAG_LINE_Y_MAJOR;
         }
+
         if line.major_decreasing {
             flags |= FLAG_LINE_MAJOR_DECREASING;
         }
@@ -158,6 +165,79 @@ impl RexCommand {
         }
         if line.shaded {
             flags |= FLAG_SHADED;
+        }
+        Self {
+            kind,
+            state_slot,
+            flags,
+            payload_offset: payload.offset,
+            payload_words: line.payload_words,
+            dst_x0: line.min_x,
+            dst_y0: line.min_y,
+            dst_x1: line.max_x,
+            dst_y1: line.max_y,
+            src_x0: line.start_major,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn copy_fill(
+        state_slot: u32,
+        fill: CopyFill,
+        cid_test: bool,
+    ) -> Self {
+        let kind = match fill.kind {
+            CopyKind::Block => COMMAND_COPY_BLOCK,
+            CopyKind::Span => COMMAND_COPY_SPAN,
+        };
+        let mut flags = FLAG_BARRIER_BEFORE | FLAG_BARRIER_AFTER;
+        flags |= match fill.plane {
+            FillPlane::Rgb => FLAG_READ_RGB | FLAG_WRITE_RGB,
+            FillPlane::Aux => FLAG_READ_AUX | FLAG_WRITE_AUX,
+        };
+        if cid_test {
+            flags |= FLAG_READ_AUX;
+        }
+        Self {
+            kind,
+            state_slot,
+            flags,
+            dst_x0: fill.min_x,
+            dst_y0: fill.min_y,
+            dst_x1: fill.max_x,
+            dst_y1: fill.max_y,
+            src_x0: fill.walker_x0,
+            src_y0: fill.walker_y0,
+            src_x1: fill.walker_x1,
+            src_y1: fill.walker_y1,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn copy_line(
+        state_slot: u32,
+        line: LineCommand,
+        payload: PayloadRef,
+        cid_test: bool,
+    ) -> Self {
+        let kind = match line.kind {
+            LineKind::Integer => COMMAND_COPY_I_LINE,
+            LineKind::Fractional => COMMAND_COPY_F_LINE,
+            LineKind::Antialiased => COMMAND_COPY_A_LINE,
+        };
+        let mut flags = FLAG_BARRIER_BEFORE | FLAG_BARRIER_AFTER;
+        flags |= match line.plane {
+            FillPlane::Rgb => FLAG_READ_RGB | FLAG_WRITE_RGB,
+            FillPlane::Aux => FLAG_READ_AUX | FLAG_WRITE_AUX,
+        };
+        if line.y_major {
+            flags |= FLAG_LINE_Y_MAJOR;
+        }
+        if line.major_decreasing {
+            flags |= FLAG_LINE_MAJOR_DECREASING;
+        }
+        if cid_test {
+            flags |= FLAG_READ_AUX;
         }
         Self {
             kind,
@@ -202,6 +282,35 @@ impl RexStateSlot {
 
     pub(super) fn for_line(context: &Rex3Context, line: LineCommand) -> Self {
         Self::with_source_color(context, line.color)
+    }
+
+    pub(super) fn for_copy(context: &Rex3Context) -> Self {
+        let mut state = Self::with_source_color(context, 0);
+        let mut dm0 = context.drawmode0.0;
+        let mut dm1 = context.drawmode1.0;
+        if dm1 & (1 << 17) != 0 {
+            dm1 &= !(1 << 18);
+        } else {
+            dm1 &= !(1 << 16);
+        }
+        dm1 &= !(1 << 17);
+        if dm1 & (1 << 18) != 0 {
+            dm1 &= !(0xf << 28);
+        } else {
+            dm1 &= !((7 << 19) | (7 << 22) | (1 << 25) | (1 << 27));
+        }
+        if dm0 & (1 << 18) == 0 {
+            dm0 &= !(1 << 21);
+        }
+        if dm0 & (1 << 13) == 0 {
+            dm0 &= !(1 << 14);
+        }
+        if dm0 & (3 << 6) == 0 {
+            dm1 &= !(0x1f << 7);
+        }
+        state.words[STATE_DRAW_MODE0] = dm0;
+        state.words[STATE_DRAW_MODE1] = dm1;
+        state
     }
 
     fn with_source_color(context: &Rex3Context, source_color: u32) -> Self {
