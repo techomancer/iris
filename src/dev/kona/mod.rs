@@ -523,7 +523,9 @@ impl Kona {
             return;
         }
         let mut packet = None;
-        let known = host.front.lock().write(off, value, &mut packet);
+        // Read after the stores are in the ring: a store pushed meanwhile is followed by its own drain.
+        let idle = off == defs::INT_ENABLE && s.ring.is_empty();
+        let known = host.front.lock().write(off, value, idle, &mut packet);
         if let Some(p) = packet {
             host.deliver(p);
         }

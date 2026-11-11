@@ -185,7 +185,7 @@ impl Core {
             _ => {}
         }
         let mut packet = None;
-        let known = h.front.lock().write(off, value, &mut packet);
+        let known = h.front.lock().write(off, value, false, &mut packet);
         if let Some(p) = packet {
             h.deliver(p);
         }

@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::traits::Device;
+use std::sync::atomic::Ordering::SeqCst;
 
 const PORT_DATA: u64 = 0x8003f0;
 const CREDIT: u64 = 0x800208;
@@ -157,6 +158,51 @@ fn the_low_watermark_cause_follows_the_work() {
     f.r(PORT_DATA);
     let sent = f.host.sent();
     assert!(sent.iter().any(|p| p.vector == 0x10), "{sent:?}");
+}
+
+/// A board with the interrupt destination programmed as the driver does (the general vector is 0x10), its
+/// thread running and parked with nothing left to run, so no drain is still to come.
+fn quiet_board_with_destination() -> (Fixture, TestBoard<Kona>) {
+    let (f, board) = threaded();
+    f.w(0x34, 0x98000);
+    f.w(0x3c, 0x180_0090);
+    f.w(0x5c, 0x3e2210);
+    f.settle();
+    retry(|| f.kona.shared.asleep.load(SeqCst));
+    (f, board)
+}
+
+/// The driver enables the FIFO-low cause to wait for the pipe to drain. If the pipe drained first, nothing is
+/// left to raise it, so the enable on an idle pipe raises it. Only the enable that turns the bit on does:
+/// one that leaves it on, or one made with stores still waiting (whose drain will raise it), does not.
+#[test]
+fn enabling_the_low_watermark_on_an_idle_pipe_raises_it() {
+    let (f, _board) = quiet_board_with_destination();
+    f.w(INT_ENABLE, 2);
+    assert_eq!(f.r(INT_CAUSE) & 2, 2, "enabled after the work was done, it rises at once");
+    assert!(f.host.sent().iter().any(|p| p.vector == 0x10), "{:?}", f.host.sent());
+    // Acknowledged, and enabled again with the bit already on: nothing new.
+    f.w(INT_CAUSE, 2);
+    let sent = f.host.sent().len();
+    f.w(INT_ENABLE, 2);
+    assert_eq!(f.r(INT_CAUSE) & 2, 0);
+    assert_eq!(f.host.sent().len(), sent);
+    // Off and on again after the acknowledge: a new wait, a new rise.
+    f.w(INT_ENABLE, 0);
+    f.w(INT_ENABLE, 2);
+    assert_eq!(f.r(INT_CAUSE) & 2, 2);
+}
+
+/// With a store still in the ring the enable raises nothing: the drain after the store does.
+#[test]
+fn enabling_the_low_watermark_with_stores_waiting_leaves_it_to_the_drain() {
+    let (f, _board) = quiet_board_with_destination();
+    let held = f.kona.shared.pipe.lock();
+    assert_eq!(f.kona.bus_write(COMMAND_PORT, 4, 1), BUS_OK);
+    assert_eq!(f.kona.bus_write(INT_ENABLE, 4, 2), BUS_OK);
+    assert_eq!(f.r(INT_CAUSE) & 2, 0, "the ring is not empty");
+    drop(held);
+    retry(|| f.r(INT_CAUSE) & 2 == 2);
 }
 
 /// Without the thread the same stores run in the store, so a test sees the
