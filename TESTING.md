@@ -350,6 +350,12 @@ and vertical overlap orders, packed-slot copies, clipping, logic/WRMASK
 feedback, ignored compare and pattern tests with state advancement,
 SKIPFIRST, auxiliary planes, spans and all three line families. It compares
 both complete planes and final context with the CPU walker on both backends.
+The hardware continuation case covers every block stop-bit combination,
+partial `XSAVE` rows, reverse YSTRIDE, fractional and no-plane draws,
+LENGTH32 spans and lines, single-step integer/fractional/antialiased lines,
+partial overlapping copies, NOOP, and an armed non-host HostRW token's
+no-progress retry. It compares complete planes and the full context after
+each direct segment and after the board-level retry on both backends.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
@@ -381,8 +387,8 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 
 The script requires 25 `resident_` CPU tests, four flat-fill tests, two line
 tests, one shade-DDA test, one pattern-state test, three command-ABI tests and
-three direct-state tests, then **17 resident GPU tests and eight direct
-scanout tests on each backend**: 89 tests in total. The window test requires
+three direct-state tests, then **18 resident GPU tests and eight direct
+scanout tests on each backend**: 91 tests in total. The window test requires
 an available native desktop and a GPU that can present to it. The script
 checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
