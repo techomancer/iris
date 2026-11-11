@@ -110,12 +110,15 @@ fn setup(
     be: u32,
     flags: u32,
 ) -> (Arc<Ohci>, Arc<Memory>, Arc<Function>) {
-    let h = Ohci::new();
+    // A clock that never moves leaves advance_frames as the only source of
+    // frames. On the host clock, a test thread descheduled for a millisecond
+    // gets an extra frame inside its next register access, and that frame's
+    // transaction locks the Function a test may be holding.
+    let (h, _) = fake_clock_ohci(0);
     let m = Memory::new();
     let f = Function::new(reply);
     h.state().connect_dma(m.clone());
     h.attach(0, f.clone()).unwrap();
-    h.start();
     start_port_reset(&h, 0);
     h.advance_frames(10);
     m.words(0x1000, &[0; 64]);
