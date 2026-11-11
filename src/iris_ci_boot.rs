@@ -178,6 +178,7 @@ fn config(disk: &Path, socket: &str) -> String {
     t.insert("no_audio".into(), true.into());
     t.insert("nvram".into(), "nvram.bin".into());
     t.insert("serial_log".into(), "serial.log".into());
+    t.insert("serial_log_overwrite".into(), true.into());
     t.insert("ci".into(), true.into());
     t.insert("ci_socket".into(), socket.into());
     t.insert("scsi".into(), scsi.into());

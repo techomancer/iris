@@ -437,35 +437,27 @@ impl SerialBackend for CiSerialBackend {
     }
 }
 
-/// How [`open_log`] treats a transcript that is already there.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LogMode {
-    /// One boot's transcript: truncate, so scripts tailing the file see only
-    /// this boot's prompts.
-    Fresh,
-    /// Keep what an earlier run wrote and add to it.
-    Append,
-}
-
 /// Open `cfg.serial_log`, if one is set, as the sink the machine's CI and
 /// TCP consoles both write through, so the two logs are the same bytes
 /// (timestamps included). A file that cannot be opened is reported and the
-/// machine boots without a log. `tag` names the machine in the messages.
-pub fn open_log(cfg: &MachineConfig, tag: &str, mode: LogMode) -> Option<Arc<SerialLog>> {
-    open_log_at(cfg, cfg.serial_log.as_deref(), tag, mode)
+/// machine boots without a log. `tag` names the machine in the messages. An
+/// existing file is added to, or started over with `serial_log_overwrite`.
+pub fn open_log(cfg: &MachineConfig, tag: &str) -> Option<Arc<SerialLog>> {
+    open_log_at(cfg, cfg.serial_log.as_deref(), tag)
 }
 
 /// As [`open_log`] for the transcript at `path` (a line's own log, when it
 /// is not the console's), with `cfg`'s timestamp setting.
-pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str, mode: LogMode) -> Option<Arc<SerialLog>> {
+pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str) -> Option<Arc<SerialLog>> {
     let path = path?;
     let p = Path::new(path);
     let opened = if path == "-" {
         Ok(SerialLog::stdout(cfg.serial_log_timestamps))
     } else {
-        match mode {
-            LogMode::Fresh => SerialLog::create(p, cfg.serial_log_timestamps),
-            LogMode::Append => SerialLog::open(p, cfg.serial_log_timestamps),
+        if cfg.serial_log_overwrite {
+            SerialLog::create(p, cfg.serial_log_timestamps)
+        } else {
+            SerialLog::open(p, cfg.serial_log_timestamps)
         }
     };
     match opened {
@@ -579,7 +571,7 @@ pub fn console_backends(
     ci: Option<&Arc<CiSerialBackend>>,
 ) -> (Arc<dyn SerialBackend>, Option<Arc<dyn SerialBackend>>) {
     let [port_a, port_b] = cfg.serial_ports();
-    let log = open_log(cfg, tag, LogMode::Fresh);
+    let log = open_log(cfg, tag);
     let label = format!("{tag} serial port 1");
     let (console, _) = serial_line(
         &SerialLine {
@@ -593,7 +585,7 @@ pub fn console_backends(
         ci,
     );
     let label = format!("{tag} serial port 2");
-    let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label, LogMode::Fresh);
+    let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label);
     let (second, served) = serial_line(
         &SerialLine {
             label: &label,
@@ -613,8 +605,9 @@ mod tests {
     use super::*;
 
     /// The console is the CI backend in CI mode and TCP otherwise, either
-    /// teed to the same fresh log, and the second port comes up on its own
-    /// outside CI mode only.
+    /// teed to the same log, and the second port comes up on its own outside
+    /// CI mode only. The log adds to what is there, or starts over with
+    /// `serial_log_overwrite`.
     #[test]
     fn the_console_is_ci_or_tcp_and_both_log_the_same_bytes() {
         let dir = std::env::temp_dir().join(format!("iris-serial-host-{}", std::process::id()));
@@ -630,9 +623,15 @@ mod tests {
         let (console, second) = console_backends(&cfg, "Test", Some(&ci));
         console.send_byte(b'c');
         assert_eq!(ci.drain_guest(), b"c");
-        assert_eq!(std::fs::read(&log).unwrap(), b"c", "a fresh log, not the stale one");
+        assert_eq!(std::fs::read(&log).unwrap(), b"stalec", "added to what was there");
+        drop(console);
+        cfg.serial_log_overwrite = true;
+        let (console, _) = console_backends(&cfg, "Test", Some(&ci));
+        console.send_byte(b'c');
+        assert_eq!(std::fs::read(&log).unwrap(), b"c", "started over");
         assert!(second.is_none(), "CI mode serves no TCP port, so the second port stays unwired");
 
+        drop(console);
         let (console, second) = console_backends(&cfg, "Test", None);
         assert!(second.is_some());
         console.send_byte(b't');

@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Serial logs append on every machine
+
+- New `serial_log_overwrite` (`--serial-log-overwrite`) starts `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them.
+- Compatibility: the Octane, O2, Fuel, Tezro, Onyx2, Origin 200, Origin 3200 and Onyx 3000 started their serial logs fresh each run; they now add to an existing file, as the Indy and Indigo2 always did. Set `serial_log_overwrite` for the old behaviour. `iris-ci boot-test` sets it itself.
+
 ### Origin 3200
 
 - New machine `origin3200_ip35`: one or two C-bricks and an I-brick. PROM 6.210 reaches

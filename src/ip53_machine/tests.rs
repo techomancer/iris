@@ -897,3 +897,22 @@ fn a_fresh_flash_starts_with_no_environment_records() {
         assert!(bytes[0x9e0100..0x9e0200].iter().all(|&b| b == 0xff), "{cpus} CPUs");
     }
 }
+
+/// The connector adds to an existing console log, and starts it over when
+/// `serial_log_overwrite` is set.
+#[test]
+fn the_serial_connector_appends_to_the_log_unless_told_to_overwrite() {
+    let dir = crate::test_temp::TempPath::dir("ip53-serial-log");
+    let log = dir.join("console.log");
+    for (overwrite, want) in [(false, &b"stale"[..]), (true, &b""[..])] {
+        std::fs::write(&log, "stale").unwrap();
+        let mut cfg = MachineConfig::default();
+        cfg.ci = true;
+        cfg.serial_log = Some(log.to_string_lossy().into_owned());
+        cfg.serial_log_overwrite = overwrite;
+        let ci = Arc::new(CiSerialBackend::new());
+        let ports = [SerialPort { label: "L1", port: 0, setting: "test", ci: &ci, log: None, connect: Box::new(|_| ()) }];
+        connect_serial_ports(&cfg, "Test", &ports, 0).unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), want, "serial_log_overwrite = {overwrite}");
+    }
+}

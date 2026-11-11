@@ -2426,11 +2426,17 @@ pub struct MachineConfig {
     #[serde(default)]
     pub renderer: UiRenderer,
 
-    /// Optional file path that will receive every byte emitted on ttyd1
-    /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
-    /// keeping a continuously-updated transcript of the install or test run.
+    /// Optional file path that will receive every byte the guest emits on
+    /// its serial console, added to if the file exists (see
+    /// `serial_log_overwrite`). Useful for keeping a continuously-updated
+    /// transcript of the install or test run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log: Option<String>,
+
+    /// Start `serial_log` and the other serial logs over each run instead of
+    /// adding to them, so a script tailing the file sees only this run.
+    #[serde(default)]
+    pub serial_log_overwrite: bool,
 
     /// Prefix each completed line of `serial_log` with a UTC ISO-8601 stamp.
     /// `off` (the default) writes raw bytes, byte-for-byte a transcript.
@@ -2758,6 +2764,7 @@ impl Default for MachineConfig {
             ci_socket: default_ci_socket(),
             ci_display: false,
             serial_log: None,
+            serial_log_overwrite: false,
             serial_log_timestamps: Default::default(),
             serial_log_a: None,
             serial_log_b: None,
@@ -3957,13 +3964,17 @@ pub struct Cli {
     #[arg(long = "ci-display", default_value_t = false)]
     pub ci_display: bool,
 
-    /// With --ci, append every byte the guest emits on ttyd1 (IRIX serial
-    /// console) to this file. Useful for live tailing during an install.
+    /// Write every byte the guest emits on its serial console to this file.
+    /// Useful for live tailing during an install.
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
 
-    /// `off` (raw transcript) or `wall`: prefix each completed serial-log
-    /// line with a UTC ISO-8601 timestamp.
+    /// Start the serial logs over each run instead of adding to them.
+    #[arg(long = "serial-log-overwrite", default_value_t = false)]
+    pub serial_log_overwrite: bool,
+
+    /// `off` (raw transcript), `wall` (prefix each completed serial-log line
+    /// with a UTC ISO-8601 timestamp) or `ecs` (one JSON document a line).
     #[arg(long = "serial-log-timestamps", value_name = "MODE")]
     pub serial_log_timestamps: Option<crate::dev::serial_log::SerialLogTimestamps>,
 
@@ -4048,6 +4059,7 @@ impl Cli {
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
+        if self.serial_log_overwrite { cfg.serial_log_overwrite = true; }
         if let Some(mode) = self.serial_log_timestamps { cfg.serial_log_timestamps = mode; }
         if let Some(p) = &self.serial_log_a { cfg.serial_log_a = Some(p.clone()); }
         if let Some(p) = &self.serial_log_b { cfg.serial_log_b = Some(p.clone()); }

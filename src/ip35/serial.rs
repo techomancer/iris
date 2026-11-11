@@ -3,7 +3,7 @@
 //! process.
 
 use crate::config::MachineConfig;
-use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend, CiSerialBackend, LogMode, SerialBackend, TeeBackend};
+use crate::dev::serial_host::{null_serial_backend, open_log, tcp_serial_backend, CiSerialBackend, SerialBackend, TeeBackend};
 use std::sync::Arc;
 
 /// One of the board's serial connections: what it is called, the TCP port
@@ -33,7 +33,7 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
     for (index, port) in ports.iter().enumerate() {
         log_config.serial_log = if index == console { cfg.serial_log.clone() } else { port.log.clone() };
         let tag = format!("{name} {}", port.label);
-        let log = open_log(&log_config, &tag, LogMode::Fresh);
+        let log = open_log(&log_config, &tag);
         let backend: Arc<dyn SerialBackend> = if cfg.ci && index == console {
             if let Some(log) = log {
                 port.ci.set_log(log);
