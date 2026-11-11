@@ -1118,6 +1118,41 @@ fn the_pixel_and_bitmap_tokens_take_their_framed_words() {
     }
 }
 
+/// The typed query tokens are framed. The guest's own stream shows a light, material and texture-generation
+/// query as two words behind the opener, a texture-environment, clip-plane and polygon-stipple query as one; the
+/// integer and generic float forms are framed with their siblings' counts. Unframed, the opener and its words
+/// are dropped, the client waits for a reply the model never posts and a word that equals a selector opens
+/// a command that was never sent. Each query is followed by a known command that must come out whole.
+#[test]
+fn the_typed_query_tokens_take_their_framed_words() {
+    let f = Fixture::hooked();
+    f.cmd(&[0x1fd, 0x1000_0000 | (0x50_0000 >> 12), 0, 0x10000]);
+    f.take_jobs();
+    let classes: [(&str, &[(u32, usize)]); 7] = [
+        ("light", &[(0x041, 2), (0x042, 2)]),
+        ("material", &[(0x046, 2), (0x047, 2)]),
+        ("texture generation", &[(0x050, 2)]),
+        ("texture environment", &[(0x04d, 1), (0x04e, 1)]),
+        ("polygon stipple and clip plane", &[(0x04b, 1), (0x03c, 1)]),
+        ("pixel map", &[(0x048, 3)]),
+        ("state, float and integer", &[(0x03f, 1), (0x040, 1)]),
+    ];
+    for (class, tokens) in classes {
+        for &(selector, words) in tokens {
+            let mut cmd = vec![selector];
+            // Words that are themselves selectors would show a misframe.
+            cmd.extend((0..words as u32).map(|w| 0x1200 + w));
+            cmd.extend([0x57, 0]);
+            f.cmd(&cmd);
+            let jobs = f.take_jobs();
+            let args = jobs[0].split('[').nth(1).and_then(|a| a.split(']').next()).unwrap_or("").split(", ").count();
+            assert!(jobs[0].starts_with(&format!("Gl {selector:#x} [")) && args == words, "{class}: {selector:#x} framed {args} words, not {words}: {jobs:?}");
+            assert_eq!(jobs.len(), 2, "{class}: {selector:#x}: the next command follows it: {jobs:?}");
+            assert!(jobs[1].starts_with("Gl 0x57 [0]"), "{jobs:?}");
+        }
+    }
+}
+
 /// New: before the first activation only the whole GL selectors the early
 /// grammar knows open a GL command; the PROM's textport words are not misread.
 #[test]
