@@ -865,6 +865,32 @@ fn a_failed_read_from_a_thread_that_is_not_one_of_the_nodes_processors_records_n
     assert_eq!(hub.read64(pi::reg::ERR_STATUS0_B).data, 0);
 }
 
+#[test]
+fn the_processor_view_records_a_failed_read_but_not_the_io_probe_address() {
+    let hub = hub(1, 3);
+    let down = Arc::new(Downstream::default());
+    let view = hub.processor_view(down.clone());
+    let b = view.clone();
+    // The Hub fails 0x0240_0208 only in the I/O space; in memory it is an
+    // address like any other.
+    std::thread::spawn(move || {
+        crate::cpu::smp::set_current_cpu(0);
+        assert_eq!(b.read64(IO_BUS_ERROR_PROBE).status, BUS_OK);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_A).data, 0);
+    // A read that fails downstream records, as in the I/O space.
+    down.fail.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        crate::cpu::smp::set_current_cpu(0);
+        assert_eq!(view.read32(0x4000_0004).status, BUS_ERR);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(hub.read64(pi::reg::ERR_STATUS0_A).data, (1 << 63) | ((0x4000_0004u64 >> 3) << 25));
+}
+
 // ---- the Bridge's side ----
 
 #[test]

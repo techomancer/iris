@@ -363,3 +363,47 @@ fn a_reference_by_node_number_can_compare_and_swap() {
         assert_eq!(hub.cpu_special().read64(0x61_c000).data, 0x9c);
     });
 }
+
+/// A processor's read of memory that is not fitted fails with a bus error and
+/// leaves the Hub's error record, as a failed read in the I/O space does. The
+/// record is software's only account of which address failed. A good read
+/// leaves nothing, the record keeps the first address, and a bank that is
+/// fitted still answers a read at the address the I/O space's probe fails.
+#[test]
+fn a_processors_read_of_unfitted_memory_leaves_the_hubs_error_record() {
+    use crate::dev::hub::reg::pi;
+    big_stack(|| {
+        let dir = TempPath::dir("sn0-o200-memory-error");
+        let m = Origin200Machine::new(&config(&dir)).unwrap();
+        let hub = m.node().hub.clone();
+        let bus = Origin200Machine::processor_bus(m.node());
+        // Bank 0 is fitted; a bank three of the way up is not. Attribute 3 is
+        // the uncached memory view.
+        let memory = |a: u64| (3u64 << 57) | a;
+        let fitted = 0x0240_0208;
+        let unfitted = 0x6000_0010;
+        let record = || hub.read64(pi::ERR_STATUS0_A).data;
+        let on_cpu = |f: Box<dyn FnOnce() + Send>| {
+            std::thread::spawn(move || {
+                crate::cpu::smp::set_current_cpu(0);
+                f();
+            })
+            .join()
+            .unwrap()
+        };
+        let b = bus.clone();
+        on_cpu(Box::new(move || assert_eq!(b.read64(memory(fitted)).status, BUS_OK)));
+        assert_eq!(record(), 0, "a read that works leaves no record");
+        let b = bus.clone();
+        on_cpu(Box::new(move || assert_eq!(b.read64(memory(unfitted)).status, BUS_ERR)));
+        assert_eq!(record() >> 62, 0b10, "valid, not overrun");
+        assert_eq!((record() >> 25) & ((1 << 37) - 1), unfitted >> 3);
+        // A failed write records nothing.
+        assert_eq!(bus.write32(memory(unfitted), 1), BUS_ERR);
+        assert_eq!(record() >> 62, 0b10);
+        // A second failure only sets overrun.
+        let b = bus.clone();
+        on_cpu(Box::new(move || assert_eq!(b.read32(memory(unfitted + 8)).status, BUS_ERR)));
+        assert_eq!(record() >> 62, 0b11);
+    });
+}

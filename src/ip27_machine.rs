@@ -596,15 +596,23 @@ impl<B: Ip27Board> Ip27Machine<B> {
         }
     }
 
+    /// The uncached connection of the node's processors: the four spaces its
+    /// Hub shows, each through the Hub's error record, so a read that fails in
+    /// any of them (an unfitted bank's, not only the I/O space's) leaves the
+    /// record software reads afterwards.
+    fn processor_bus(node: &Node) -> Arc<Ip27Bus> {
+        Arc::new(Ip27Bus::new(
+            node.hub.processor_view(node.hub.cpu_special()),
+            node.hub.processor_io(node.hub.cpu_io()),
+            node.hub.processor_view(node.hub.claim(Space::Special)),
+            node.hub.processor_view(node.hub.cpu_memory()),
+        ))
+    }
+
     /// `smp` when the board carries more than one node: the processors then
     /// share memory, and a store-conditional has to be a compare-and-swap.
     fn build_cpu(cfg: &MachineConfig, module: &CpuModule, node: &Node, memory: &Arc<crate::memory_map::MemoryMap>, cpu_id: usize, smp: bool) -> Result<Arc<dyn CpuDevice>, String> {
-        let bus = Arc::new(Ip27Bus::new(
-            node.hub.cpu_special(),
-            node.hub.processor_io(node.hub.cpu_io()),
-            node.hub.claim(Space::Special),
-            node.hub.cpu_memory(),
-        ));
+        let bus = Self::processor_bus(node);
         let phys: Arc<dyn BusDevice> = node.memory.physical().clone();
         let memory = memory.clone();
         let count_hz = cfg.clock.count_hz(module.part).max(1);

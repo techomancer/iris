@@ -582,7 +582,16 @@ impl Hub {
     /// Wrap the downstream I/O space a processor reaches through this Hub, so
     /// a failed read records in that slice's error status.
     pub fn processor_io(self: &Arc<Self>, downstream: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
-        Arc::new(ProcessorIo { hub: self.clone(), downstream })
+        Arc::new(ProcessorIo::<true> { hub: self.clone(), downstream })
+    }
+
+    /// Wrap any other space a processor reaches through this Hub (memory, the
+    /// Hub-special and fetch-and-op spaces), so a failed read there records in
+    /// the slice's error status too: an unfitted bank's bus error leaves the
+    /// record software reads afterwards. It adds nothing else; the I/O
+    /// space's bus-error probe address is I/O space's alone.
+    pub fn processor_view(self: &Arc<Self>, downstream: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+        Arc::new(ProcessorIo::<false> { hub: self.clone(), downstream })
     }
 
     /// Record a failed processor read in slice `slice`'s error status.
@@ -724,14 +733,18 @@ impl BusDevice for IoSpace {
     io_access!(read64, write64, u64, BusRead64);
 }
 
-/// Every I/O-space request a processor makes passes through its Hub. A read
+/// Every uncached request a processor makes passes through its Hub. A read
 /// that fails there, or downstream, is recorded in the issuing slice's error
 /// status 0; a debugger's access or a device's DMA does not come this way.
-struct ProcessorIo {
+///
+/// `IO` is set for the I/O space, where the Hub fails one address of its own.
+/// It is a type parameter so the other spaces' reads never test for that
+/// address.
+struct ProcessorIo<const IO: bool> {
     hub: Arc<Hub>,
     downstream: Arc<dyn BusDevice>,
 }
-impl ProcessorIo {
+impl<const IO: bool> ProcessorIo<IO> {
     /// Record a failed read for the issuing slice. A debugger's access, or
     /// any thread that is not one of the node's processors, records nothing.
     fn failed(&self, a: u64) {
@@ -752,7 +765,7 @@ macro_rules! processor_read {
         }
     };
 }
-impl BusDevice for ProcessorIo {
+impl<const IO: bool> BusDevice for ProcessorIo<IO> {
     processor_read!(read8, BusRead8);
     processor_read!(read16, BusRead16);
     processor_read!(read32, BusRead32);
@@ -760,7 +773,7 @@ impl BusDevice for ProcessorIo {
         // The Hub fails one address itself: a doubleword read at node offset
         // 0x0240_0208 (IIO_IIBUSERR, "reads here cause a bus error"), whatever
         // node it names. Nothing goes out on the XIO link.
-        let r = if a & (NODE_SPAN - 1) == IO_BUS_ERROR_PROBE { BusRead64::err() } else { self.downstream.read64(a) };
+        let r = if IO && a & (NODE_SPAN - 1) == IO_BUS_ERROR_PROBE { BusRead64::err() } else { self.downstream.read64(a) };
         if r.status != BUS_OK && r.status != BUS_BUSY {
             self.failed(a);
         }
