@@ -35,9 +35,9 @@ board with it is an `IP53_4CPU`, and the two-processor 800 MHz board
 chip is fitted as four only, a model choice, since no board at that clock
 is captured. The 1 GHz chip is fitted as two or four, as the captured
 `IP59_4CPU` and `IP59_2CPU` boards are. Every chip boots the PROM and IRIX
-to login with four processors. The 1 GHz chip's mode word is computed, so
-its clean boot shows the model is self-consistent, not that hardware uses
-that word. An 800 MHz part with an 8 MB cache (PROM row 0x549caf85) is on
+to login with four processors. The 1 GHz chip's mode word is derived, not
+read from hardware, so its clean boot shows the model is self-consistent, not
+that hardware uses that word. An 800 MHz part with an 8 MB cache (PROM row 0x549caf85) is on
 Onyx 350 inventories but on no Tezro capture found, and is not modelled. The
 Tezro tower guide gives every processor 4 MB of cache; the captures, not the
 manual, back the 8 and 16 MB caches. The processor clock in the flash record and the count rate (half
@@ -116,7 +116,11 @@ block it replaced did and the whole image still sums to zero. The volume label
 goes in the second position. A flash store that already exists keeps the
 configuration block it holds, so a block the PROM rewrote survives the next
 start. The processor resets with the matching Config, `0x6c9bad85` for the 700
-MHz chip.
+MHz chip. Its bits 28:25 read 0x6: the primary data cache size code in 28:26,
+hardwired on the R10000 family, and a reserved zero at 25. The cache tap is
+not a Config field, so the PROM's report of the live Config, which prints no
+tap, shows no gap against the flash record's `0xc`. The model resets bit 25
+to zero on an R14000 or R16000 too; no software reads it.
 
 The PROM brings up only the processor positions the node board's product
 name allows (IP53_1CPU position A, IP53_2CPU A and C, IP53_4CPU all four),
@@ -131,9 +135,10 @@ The mode word is a different field from the processor's Config: its low 25
 bits are the Config reset bits, and the bits above carry, among others, the
 cache tap. The mode words of the 700, 800 and 900 MHz chips (`0x589bad85`,
 `0x549baf85`, `0x569cb185`) are rows of the stock PROM's CPU speed table. The
-table stops at 900 MHz, so the 1 GHz word `0x4aedb385` is built from the
-formulas the PROM's editor uses for the other rows and the cache clock and tap
-its inventories print; it is approximated. A flash store keeps the block it was
+table stops at 900 MHz, so the 1 GHz word `0x4aedb385` is derived from the
+processor's clock rule and the bit pattern of the 700 to 900 MHz rows, with
+the cache clock and tap its inventories print. A read from a 1 GHz board is
+the only thing that would confirm it. A flash store keeps the block it was
 formatted with, and the PROM checks its mode word against the processor's, so
 give a different chip a fresh `[tezro] flash` file.
 
@@ -142,10 +147,16 @@ give a different chip a fresh `[tezro] flash` file.
 Every fitted processor runs, each on its own host thread. The IP35 PROM
 assumes its processors left reset together and run at hardware speed. Its
 reset barrier on LB scratch 1 depends on that: every processor clears the
-word before the boot master stores its release there. Bedrock's LB orders
-those stores itself, by who stored in what order, so a late clear does not
-land on the release (`src/dev/bedrock/lb.rs`); hardware drops no store, so
-this is a model rule. Two later handshakes need more. In the first, each
+word before the boot master stores its release there. In hardware the
+word is a plain node-wide register: nothing orders or drops a store. The
+model's rule, which keeps a late clear from landing on the release
+(`src/dev/bedrock/lb.rs`), has no hardware counterpart. It stands in for a
+margin the hardware has: between a processor's clear and the master's release
+the PROM runs at least 124 instructions, each an uncached fetch from the boot
+flash, so a clear is late only if a processor lags the master by more than
+that. Real boots pass, so the skew on hardware stays under it, but its size is
+not known. The host threads can drift further apart than that, which is why
+the model needs the rule. Two later handshakes need more. In the first, each
 processor of an interface with both slots fitted posts a status value in
 its own PI real-time compare register and reads its partner's, at most
 200,000 times, before it declares the partner dead (`peer_pled failed: Other
@@ -158,7 +169,13 @@ until its partner posts, and a publisher that has published while the other
 interface has not is held until that interface publishes; each hold also
 ends once the processors it waits for have retired 2,000,000,000 cycles
 (`src/ip35/presence.rs`). The holds change when a processor runs, never a
-value it reads, and have no hardware counterpart. An NMI, and a write that clears a running processor's
+value it reads, and have no hardware counterpart. The PROM's counter waits
+are in units of the PI real-time counter, which ticks every 800 ns (1.25 MHz)
+with the clock divider the PROM programs from the flash record's shipped
+values, so the 2,000-unit wait is 1.6 ms. The 200,000-read bound on the partner
+marker counts loop passes, and how long a pass takes depends on the cost of an
+uncached fetch and of an uncached register read, which is not documented. The
+holds end on a retired-cycle count that is not derived from either. An NMI, and a write that clears a running processor's
 enable bit, are logged by the Bedrock PI and not carried out: the CPU has no
 NMI entry.
 
@@ -201,6 +218,24 @@ device answers; what silicon does there is not defined. A configuration read
 of an empty PCI slot fails as a master timeout; the error enable gating and
 the treatment of device 0 there are inferred.
 
+The BCM5701 holds a received frame's completion until 200 us have passed and
+until every processor that rang the send doorbell before the frame arrived has
+run 20,000 cycles past it, so a reply never lands before the send that
+provoked it has finished. The 20,000 cycles are 20 to 29 us at the chips' core
+clocks. That is inside the range the wire time, the DMA and the chip's receive
+coalescing allow, and below the 350 us the Linux driver allows a loopback
+frame, but it is a modelling choice: the chip's doorbell-to-completion latency
+is not published, and one constant cannot follow frame size, link rate or the
+coalescing state.
+
+A guest `ping` at normal priority loses a few replies in a few hundred, with
+the interpreter and with jitv2. The cause is IRIX's scheduling, not the
+BCM5701 model. The guest's ICMP input counts every reply, the loss is the same
+to the guest's own address, where no NIC is involved, and it is as large on a
+Fuel with its IOC3 Ethernet. It goes away when `ping` runs at non-degrading
+priority 30 (`npri -h 30`), which points at IRIX dropping a reply when `ping`
+is switched out in the middle of `sendto`. The model does not drop replies.
+
 The L1 answers the system serial request with `LEMU`, iris's kind digit 2,
 `[machine] emu_id` as four digits and `0` (`LEMU200420` for emu_id 42,
 `LEMU200000` by default), and IRIX folds the low nibble of each of its first
@@ -217,6 +252,21 @@ The IRIX 6.5.30 disks tested so far were installed on an Origin 300, not a
 Tezro. On them the IOC4 serial ports appear as `tty3` and `tty4`, as on
 real single-node IP59 inventories.
 
+Boot from any IRIX 6.5.x disk installed on an IP35 machine (an Origin 300
+class install): attach it as `[scsi.1]`. A second data disk goes on another
+`[scsi.N]` with `overlay = true` when its filesystem needs recovery.
+
+A disk installed for another machine family, for example an Octane install,
+does not boot a Tezro: the PROM loads that disk's `/unix` and stops with
+`Cannot load dksc(0,1,0)unix`.
+
+With `[graphics] board = "v12"` the PROM autoboots (a fresh NVRAM has
+`AutoLoad=Yes` and `OSLoadFilename=unix`). Without graphics it stops at the
+PROM menu.
+
+`stopgfx` turns the `windowsystem` setting off, so a later reboot has no X
+until `chkconfig windowsystem on`.
+
 `[graphics] board = "v12"` fits a VPro V12 at widget 12 behind the PXBOW,
 on either board, using the VPro model the Octane and the Fuel use. On the
 two- and four-processor board this is QEMU's graphics slot. On the
@@ -227,7 +277,59 @@ nothing counts a processor's stores into the graphics page or returns credits
 for them. IRIX 6.5.30 with the VPro driver reaches the X desktop on the V12
 that way.
 Without the V12 the machine has no graphics.
+
+A guest `reboot` restarts the whole node. Bedrock's network-port reset ends in
+a machine hard reset, which powers the V12 on again with everything else, so
+the board starts from its reset state each time, and X and GL clients come
+back as from a cold start. Real hardware has not been read, so whether a
+network-port reset reaches the V12 there is not known, nor is what the
+driver's write of 0x200 to the board's `+0x100c` does; iris accepts and logs
+that write and nothing depends on it.
+
 Machine snapshots are unsupported.
+
+## What persists, and what the guest sees of the IO9
+
+The PROM's environment (`nvram` in IRIX, `printenv` in the PROM monitor) lives
+in the `nvram` file, the DS1744 window in the IOC4's BAR, not in the flash. A
+byte the processor stores there is written to the file at once, so values set
+with `nvram` in IRIX (`srvaddr`, `gateaddr`) change `nvram.bin`, leave
+`flash.bin` alone, and survive `halt -p` (which ends the iris process) and a
+new start over the same files. `netaddr` only looks like a lost write: during
+the next boot the guest sets it to the address of `tg0`, over the value set by
+hand. `reboot` returns to the PROM with all four processors found and the
+diagnostics passing.
+
+The two serial ports IRIX lists, `ttyd3` and `ttyd4`, are IOC4 ports 0 and 1,
+which listen on `serial_port_a` and `serial_port_b`. IRIX shows no device for
+ports 2 and 3.
+
+The IOC4's ATA channel is not modelled beyond the readback word the PROM
+probes. IRIX's `hinv` lists "Integral SCSI controller 2: Version IDE
+(ATA/ATAPI) IOC4" with no drive behind it, and a CD or DVD reaches the guest
+only as a `cdrom = true` SCSI device. The model fits no USB controller on the
+IO9.
+
+## Where a boot's time goes
+
+A four-processor boot on jitv2 with one compile thread takes minutes from
+process start to the login prompt, in three stretches:
+
+- From start to the kernel, mostly the PROM: the 4 GiB memory test and a walk
+  of the SCSI buses, in which the PROM waits out a 250 ms selection timeout
+  for each absent target. The guest sets that timeout itself, as on hardware.
+- From the kernel to the start of the rc scripts, of which a good part is the
+  kernel's own SCSI scan of absent targets, again the timeout the guest set.
+- From rc to login, the longest. This phase is guest work and waits on
+  jitv2's compile thread, which runs flat out for the whole phase. The default
+  is one compile thread for any number of processors; `[jitv2] threads = 4`
+  shortens the four-processor login, at about twice the compile CPU time.
+
+The Tezro is no slower than the Fuel per guest instruction; its PROM takes a
+few seconds longer because it tests 4 GiB. Every processor thread
+uses a whole host core after login, idle or not; a four-processor Tezro keeps
+four or more host cores busy at an idle shell, and the V12's display thread
+composes the full frame at 60 Hz.
 
 ## Source basis
 
