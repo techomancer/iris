@@ -13,6 +13,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Guest clocks keep their rate on Windows
+
+- On Windows the CP0 Compare interrupt ran at 64-80 Hz instead of the guest's
+  1000 Hz: the timer thread's sleeps rounded up to the 15.6 ms system tick, so
+  everything IRIX paces by its clock took ten times as long (glquake on the
+  Octane looked hung after a timedemo). The timer thread now waits on a
+  high-resolution waitable timer and works around its 0.5 ms grid, and iris
+  raises its process timer resolution to 1 ms for the other timed waits.
+  Linux and macOS are unchanged.
+
 ### Indy and Indigo2 chime on the first boot
 
 - A new or blank `nvram.bin` (Indy) or `nveeprom.bin` (Indigo2) no longer makes
