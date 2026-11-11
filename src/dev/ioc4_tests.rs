@@ -1020,8 +1020,11 @@ fn receive_ring_full_is_a_level_while_an_entry_waits() {
     r.w32(reg::SERIAL_PENDING, RX_FULL);
     assert_eq!(r.r32(reg::SERIAL_PENDING) & RX_FULL, RX_FULL, "a level ignores the acknowledge");
 
+    // Making room posts the held entry at once, and the character behind it
+    // starts the one-tick timer that posts it too. Wait the timer out, so
+    // the test does not depend on seeing the index between the two posts.
     r.sw(0, sdma_off::RX_CONSUME, 16 | ARM);
-    r.until("room", |r| r.sr(0, sdma_off::RX_PRODUCE) & 0x3f8 == 0);
+    r.settle(1);
     let entry = r.get(r.ring(0, 1, 0x400) + 0x3f8, 8);
     assert_eq!((&entry[..4], entry[4], entry[7]), (&[0xa1, 0xa2, 0xa3, 0xa4][..], RX_FROM_LINE, RX_FROM_LINE));
     assert_eq!(r.r32(reg::SERIAL_PENDING) & RX_FULL, 0, "it fell once the consumer made room");
