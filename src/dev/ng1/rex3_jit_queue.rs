@@ -48,7 +48,12 @@ struct State {
 /// A two-lane compile queue. See the module docs for the cold/hot split.
 pub struct CompileQueue {
     state: Mutex<State>,
+    /// Wakes the worker: a request was queued, or the queue closed.
     ready: Condvar,
+    /// Wakes a producer parked in `send_cold_blocking`: the cold lane has
+    /// room, or the queue closed. A separate condvar so a pop cannot wake
+    /// another worker instead of the producer.
+    room: Condvar,
 }
 
 impl CompileQueue {
@@ -56,6 +61,7 @@ impl CompileQueue {
         Self {
             state: Mutex::new(State::default()),
             ready: Condvar::new(),
+            room: Condvar::new(),
         }
     }
 
@@ -80,7 +86,7 @@ impl CompileQueue {
     pub fn send_cold_blocking(&self, req: CompileRequest) -> Result<(), CompileRequest> {
         let mut st = self.state.lock().unwrap();
         while !st.closed && st.cold.len() >= COLD_QUEUE_CAPACITY {
-            st = self.ready.wait(st).unwrap();
+            st = self.room.wait(st).unwrap();
         }
         if st.closed {
             return Err(req);
@@ -114,6 +120,8 @@ impl CompileQueue {
                 return Some(req);
             }
             if let Some(req) = st.cold.pop_front() {
+                // Free slot: let a blocked warm-up producer refill the lane.
+                self.room.notify_one();
                 return Some(req);
             }
             if st.closed {
@@ -137,6 +145,7 @@ impl CompileQueue {
         let mut st = self.state.lock().unwrap();
         st.closed = true;
         self.ready.notify_all();
+        self.room.notify_all();
     }
 }
 
@@ -205,5 +214,42 @@ mod tests {
         assert_eq!(q.recv(), Some(cold));
         assert_eq!(q.recv(), None);
         assert_eq!(q.send_hot(hot), Err(hot));
+    }
+
+    /// A warm-up profile larger than the cold lane must reach the worker in
+    /// full. The producer parks in `send_cold_blocking` once the lane fills;
+    /// the worker's pops have to wake it, or both sleep until a guest draw.
+    #[test]
+    fn blocking_cold_send_resumes_when_the_worker_drains() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let total = COLD_QUEUE_CAPACITY as u32 + 8;
+        let q = Arc::new(CompileQueue::new());
+        let producer = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || {
+                for i in 0..total {
+                    q.send_cold_blocking(CompileRequest { dm0: 0, dm1: i, cm: 0 }).unwrap();
+                }
+            })
+        };
+        let (done, rx) = mpsc::channel();
+        let worker = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || {
+                for _ in 0..total {
+                    q.recv().unwrap();
+                }
+                done.send(()).unwrap();
+            })
+        };
+        let finished = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // Release a stuck pair so the test does not leak blocked threads.
+        q.close();
+        producer.join().ok();
+        worker.join().ok();
+        assert!(finished, "worker never saw the whole profile: producer and worker both slept");
     }
 }
