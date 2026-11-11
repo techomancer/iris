@@ -1954,6 +1954,24 @@ fn an_xbridge_head_identifies_itself_and_keeps_its_speed_strap() {
     }
 }
 
+/// IRIX's driver treats all 1024 entries like the first 512 and zeroes them at
+/// attach (established from the driver's code); the head keeps every one, so
+/// the upper half stores and reads back like the lower, and a reset zeroes
+/// the whole table.
+#[test]
+fn every_entry_of_an_xbridge_table_stores_and_a_reset_zeroes_them_all() {
+    let h = Head::new();
+    for i in [0u64, 511, 512, 1023] {
+        h.win.write64(u64::from(ATE_BASE) + i * 8, 0x1234_0000_0000 | i);
+        assert_eq!(h.win.read32(u64::from(XBRIDGE_ATE_LOW_BASE) + i * 8 + 4).data, i as u32, "entry {i}");
+    }
+    h.bridge.reset();
+    for i in 0..1024u64 {
+        assert_eq!(h.win.read32(u64::from(XBRIDGE_ATE_LOW_BASE) + i * 8 + 4).data, 0, "entry {i} low");
+        assert_eq!(h.win.read32(u64::from(ATE_BASE) + i * 8 + 4).data, 0, "entry {i} high");
+    }
+}
+
 /// The head's table holds 1024 entries, written whole and read a half at a
 /// time; 512 of them map a window that repeats with bytes swapped at bit
 /// 29, and an entry's own swap bit swaps too. A transfer through an entry
