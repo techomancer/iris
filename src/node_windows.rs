@@ -193,18 +193,31 @@ impl Windows {
 
     /// Lay node `i`'s window to the numbers and aliases the Hubs publish now.
     fn lay(nodes: &mut [Shown], i: usize, shift: u32) {
+        Self::lay_by(nodes, i, shift, &mut |sp, bank, p| sp.map_range_of(bank, p.src, p.at, p.len));
+    }
+
+    /// [`Self::lay`] with the host mapping call given, so a test can fail it.
+    fn lay_by(
+        nodes: &mut [Shown],
+        i: usize,
+        shift: u32,
+        map: &mut dyn FnMut(&crate::ppmem::PpMemSpace, &crate::physical::RamBank, &Piece) -> std::io::Result<()>,
+    ) {
         let numbers: Vec<_> = nodes.iter().map(|n| (n.shape.number(), n.shape.calias())).collect();
         let runs: Vec<_> = nodes.iter().map(|n| n.shape.runs()).collect();
         let phys: Vec<_> = nodes.iter().map(|n| n.phys.upgrade()).collect();
         let Some(sp) = phys[i].as_ref().and_then(|p| p.ppmem_space()) else { return };
         let want = Self::wanted(nodes, &runs, &numbers, i, sp, shift);
         // A piece the host could not map is not recorded as laid, so the
-        // next call tries it again.
+        // next call tries it again. What was mapped there before it is no
+        // longer what the Hubs route, and nothing tracks it now: it comes out
+        // of the window, and the processor reaches the span over the bus.
         let mut failed = Vec::new();
         for p in want.iter().filter(|p| !nodes[i].laid.contains(p)) {
             let Some(owner) = &phys[p.owner] else { continue };
-            if let Err(e) = sp.map_range_of(&owner.banks()[p.index], p.src, p.at, p.len) {
+            if let Err(e) = map(sp, &owner.banks()[p.index], p) {
                 crate::dlog!(LogModule::Hub, "Hub: node {i} window at {:#x}: {e}", p.at);
+                sp.unmap_range(p.at, p.len);
                 failed.push(*p);
             }
         }
