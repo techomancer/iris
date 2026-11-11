@@ -79,6 +79,9 @@ struct State {
     now_ms: u64,
     active_fi: u32,
     bit_credit: u64,
+    /// The level last driven onto the line; `None` until the first drive
+    /// after a reset, which always reaches the line.
+    out: Option<bool>,
 }
 impl State {
     fn new() -> Self {
@@ -97,6 +100,7 @@ impl State {
             now_ms: 0,
             active_fi: 0x2edf,
             bit_credit: 0,
+            out: None,
         }
     }
     fn soft_reset(&mut self) {
@@ -232,16 +236,16 @@ impl Ohci {
         };
         self.advance_frames(elapsed);
     }
+    /// Drive the line to the level the state gives, under the state lock,
+    /// when it differs from the level last driven. The lock orders the
+    /// levels as the state changed; the parent never calls back down.
     fn drive_irq(&self) {
-        loop {
-            let level = self.state.lock().irq();
+        let mut s = self.state.lock();
+        let level = s.irq();
+        if s.out != Some(level) {
+            s.out = Some(level);
             if let Some(line) = self.pci.irq() {
                 line.set(level);
-            }
-            // A callback may acknowledge the interrupt or another writer may
-            // change it while delivery is outside the state lock.
-            if self.state.lock().irq() == level {
-                break;
             }
         }
     }

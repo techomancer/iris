@@ -472,33 +472,73 @@ fn operational_entry_sets_overflow_and_loads_the_interval_toggle() {
     }
 }
 
-/// An interrupt handler can acknowledge a line while the controller raises it.
+/// One rise and one fall of the interrupt, driven by three threads in the
+/// worst order: A raises it and is held before its level reaches the line,
+/// C drives the same rise, then B acknowledges it and drives the fall, all
+/// before A's level lands. The line must see the one rise only: A's late
+/// level must not raise it again after B's acknowledgement.
 #[test]
-fn reentrant_irq_acknowledgement_leaves_final_line_clear() {
-    struct Ack {
-        hc: Weak<Ohci>,
-        level: AtomicBool,
-        once: AtomicBool,
+fn a_late_driver_raises_the_line_once() {
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::time::Duration;
+    struct Line {
+        levels: Mutex<Vec<bool>>,
+        held: Mutex<Option<Sender<()>>>,
+        release: Mutex<Option<Receiver<()>>>,
     }
-    impl crate::irq::InterruptController for Ack {
+    impl crate::irq::InterruptController for Line {
         fn set_line(&self, _: u32, level: bool) {
-            if level && !self.once.swap(true, Ordering::SeqCst) {
-                self.hc.upgrade().unwrap().bar_write(0, 0xc, RHSC, 4);
+            if level && std::thread::current().name() == Some("a") {
+                if let Some(held) = self.held.lock().take() {
+                    held.send(()).unwrap();
+                    // A driver that holds the controller's lock here keeps
+                    // B out until this gives up.
+                    let release = self.release.lock().take().unwrap();
+                    let _ = release.recv_timeout(Duration::from_millis(300));
+                }
             }
-            self.level.store(level, Ordering::SeqCst);
+            self.levels.lock().push(level);
         }
     }
-    let h = Ohci::new();
-    let ack = Arc::new(Ack {
-        hc: Arc::downgrade(&h),
-        level: AtomicBool::new(false),
-        once: AtomicBool::new(false),
+    let (held, is_held) = channel();
+    let (release, released) = channel();
+    let line = Arc::new(Line {
+        levels: Mutex::new(vec![]),
+        held: Mutex::new(Some(held)),
+        release: Mutex::new(Some(released)),
     });
-    h.state().connect_irq(IrqLine::new(ack.clone(), 0));
-    h.attached();
-    h.bar_write(0, 0x10, 0x80000040, 4);
-    h.attach(0, Function::new(UsbOutcome::Nak)).unwrap();
-    assert!(!ack.level.load(Ordering::SeqCst));
+    let h = Ohci::new();
+    h.state().connect_irq(IrqLine::new(line.clone(), 0));
+    // Interrupts on, for the ownership change alone.
+    h.bar_write(0, 0x10, 0x8000_0000 | 1 << 30, 4);
+    let spawn = |name: &str, work: Box<dyn FnOnce() + Send>| {
+        std::thread::Builder::new().name(name.into()).spawn(work).unwrap()
+    };
+    let a = spawn("a", Box::new({
+        let h = h.clone();
+        move || h.bar_write(0, 8, 8, 4)
+    }));
+    is_held.recv().unwrap();
+    spawn("c", Box::new({
+        let h = h.clone();
+        move || h.attached()
+    }))
+    .join()
+    .unwrap();
+    spawn("b", Box::new({
+        let h = h.clone();
+        move || {
+            h.bar_write(0, 0xc, 1 << 30, 4);
+            let _ = release.send(());
+        }
+    }))
+    .join()
+    .unwrap();
+    a.join().unwrap();
+    let levels = line.levels.lock().clone();
+    let rises = std::iter::once(false).chain(levels.iter().copied()).collect::<Vec<_>>()
+        .windows(2).filter(|w| !w[0] && w[1]).count();
+    assert_eq!((rises, levels.last().copied()), (1, Some(false)), "line levels: {levels:?}");
 }
 
 /// The guest sees the documented write masks, HCR exemptions, and ownership bit.
