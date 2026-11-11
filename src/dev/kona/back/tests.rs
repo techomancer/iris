@@ -959,6 +959,41 @@ fn a_pixel_read_by_dma_is_laid_out_under_the_pack_record() {
     assert_eq!(r.ram.word(REASON_PAGE), 0, "a descriptor that is not the read's size posts nothing");
 }
 
+/// The reply to a read that fits the page has the rows of the width's own bytes: the client lays
+/// them out under the pack alignment, row length and skips as it copies them to the caller's
+/// buffer, so the board that padded them too put the padding in twice (a 13 by 5 RED read of bytes
+/// arrived with 3 zeros after each row, which the client then skipped again). Byte order stays the
+/// board's.
+#[test]
+fn a_read_reply_is_not_padded_by_the_pack_record() {
+    use crate::dev::kona::defs::pixel::*;
+    let mut b = pixel_window();
+    at(&mut b, 0, 0);
+    let words: Vec<u32> = (0..13 * 5).map(|i| (i % 13) << 24 | 0xff).collect();
+    draw_pixels(&mut b, 13, 5, FORMAT_RGBA, TYPE_UNSIGNED_BYTE, &words);
+    command(&mut b, Grammar::Gl, SELECT_READ_BUFFER, &[crate::dev::kona::defs::gl::BACK]);
+    let tight: Vec<u8> = (0..5).flat_map(|_| 0..13u8).collect();
+    let mut want = tight.clone();
+    want.resize(68, 0);
+    let mut read = |b: &mut KonaBackend, store: &[(u32, u32)], args: &[u32]| {
+        for &(name, value) in store {
+            command(b, Grammar::Gl, SET_PIXEL_STORE_PARAMETER_INTEGER_FORM, &[name, value]);
+        }
+        let screen = b.gl.screen();
+        let ds = b.contexts.select(None).gl.draw_state(screen);
+        b.arrays(&ds);
+        let c = b.contexts.select(None);
+        let env = gl::pixels::Env { store: &b.store, ds };
+        gl::pixels::plane_command(&mut c.gl, &mut b.pix_counts, &env, READ_PIXEL_RECTANGLE_BACK_TO_HOST, args)
+    };
+    let args = [0, 0, 13, 5, FORMAT_RED, TYPE_UNSIGNED_BYTE, 0];
+    // Alignment 4 (GL's default), then 1: the same bytes. Row length 21 and skips change nothing
+    // either.
+    assert_eq!(read(&mut b, &[], &args), gl::pixels::Out::Reply(want.clone()));
+    assert_eq!(read(&mut b, &[(PACK_BASE + 5, 1)], &args), gl::pixels::Out::Reply(want.clone()));
+    assert_eq!(read(&mut b, &[(PACK_BASE + 5, 4), (PACK_BASE + 2, 21), (PACK_BASE + 3, 2), (PACK_BASE + 4, 3)], &args), gl::pixels::Out::Reply(want));
+}
+
 /// A DAC cursor load is decoded and held by channel, and draws nothing until channel 0's control register enables it; a load of another length, or
 /// for a channel the table does not give, is refused and counted.
 #[test]
