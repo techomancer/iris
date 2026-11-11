@@ -185,9 +185,9 @@ screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 Serial lines have two halves. A UART model owns the registers: the Indy's
 `Z85c30`, and `Ns16550` (`src/dev/ns16550.rs`), the 16550A core that the O2's
 `MaceUart` (lane decode, interrupt line, monitor) and the Octane's IOC3 wrap.
-The IOC4's serial ring-DMA engine is its own module, `ioc_serial_dma.rs`, which
-the chip drives through its `SerialDmaHost` trait (its 16550s, interrupt bits and
-bus master); the IOC3 keeps its own copy for now.
+The IOC3's and the IOC4's serial ring-DMA engine is its own module,
+`ioc_serial_dma.rs`, which each chip drives through its `SerialDmaHost` trait
+(its 16550s, interrupt bits and bus master).
 The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
 machine constructors pick with `console_backends`: the CI backend, a TCP
 console, or a log tee. A UART's transmit is instant and its receive side

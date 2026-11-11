@@ -564,6 +564,31 @@ fn dma_outside_the_direct_window_is_refused_and_a_read_comes_back_zero() {
     assert_eq!(r.pic.heads[0].dma(5, 0x8000_0000, &mut [0; 4], false), PciDmaStatus::MasterAbort);
 }
 
+/// This bridge refuses a function's DMA aimed at a bus address a function
+/// decodes, and the direct window goes to the peer, so a chip that holds its
+/// locks across a transfer (the IOC3's serial engine does) is not called back
+/// from it. The Octane's Bridge and the O2's host memory are not covered
+/// here: they reach host memory only, by reading their DMA paths.
+#[test]
+fn the_bridge_does_not_route_dma_to_a_function() {
+    let r = rig();
+    let card = Card::new(0x7004);
+    r.fit(0, 1, &card, Function::default());
+    card.bar_write(0, 0x10, 0x5a5a_5a5a, 4);
+    let mut buf = [0xffu8; 4];
+    // At the BAR's own bus address, which is below the window DMA can use.
+    assert_eq!(card.dma().dma_write(BAR_BASE as u64 + 0x10, &[1; 4]), PciDmaStatus::MasterAbort);
+    assert_eq!(card.dma().dma_read(BAR_BASE as u64 + 0x10, &mut buf), PciDmaStatus::MasterAbort);
+    assert_eq!(buf, [0; 4]);
+    // Through the direct window the same offset goes to the peer, not the card.
+    let at = 0x8000_0000 | (BAR_BASE as u64 + 0x10);
+    assert!(card.dma().dma_write(at, &[1; 4]).is_ok());
+    assert!(card.dma().dma_read(at, &mut buf).is_ok());
+    assert_eq!(buf, [1; 4]);
+    assert_eq!(r.peer.dma.lock().len(), 2, "both transfers went to the peer");
+    assert_eq!(card.bar_read(0, 0x10, 4), 0x5a5a_5a5a, "the card's register is untouched");
+}
+
 fn direct64(widget: u64, flags: u64, payload: u64) -> u64 {
     (widget << 60) | flags | payload
 }

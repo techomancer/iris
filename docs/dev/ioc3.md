@@ -29,8 +29,8 @@ and mouse registers are described in [ioc3-ps2.md](ioc3-ps2.md).
 | `board.rs` | `Ioc3Board`, the rows | `ioc3_infos` | | |
 | `dma.rs` | `Ioc3Dma` | the parent's DMA device | | |
 | `superio.rs` | `SuperIo` | `ioc3-serial8250` (the 16550 halves) | 0x20000 window: UARTs, parallel ECP | pass-through bits 6, 15, 18 |
-| `serial.rs` | `Serial`, one per port | `ioc3-serial8250` (the ring engine) | 0xb8 and 0xd4, the page aliases at 0x8000 and 0xc000 | the port's nine bits |
-| `kbd.rs` | `Kbd` | `ioc3-kbd` | 0x9c to 0xac | bit 22, edge |
+| `serial.rs` | `Serial`, one per port, over the engine in `ioc_serial_dma.rs` | `ioc3-serial8250` (the ring engine) | 0xb8 and 0xd4, the page aliases at 0x8000 and 0xc000 | the port's nine bits |
+| `kbd.rs` | `Kbd`, over `Ioc3Kbc` in `ioc3_kbc.rs` | `ioc3-kbd` | 0x9c to 0xac | bit 22, edge |
 | `parallel.rs` | `Parallel` | none in Linux; OpenBSD `lpt` | 0x80 to 0x98 | bits 18 to 21 |
 | `w1.rs` | `W1` | `sgi_w1` | 0x30 | none |
 | `gpio.rs` | `Gpio` | none; `ip30-leds` binds to its first two pins | 0x34 to 0x60: control, data, one register per pin | none |

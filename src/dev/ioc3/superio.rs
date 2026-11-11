@@ -27,32 +27,12 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use super::{int, Core};
+use crate::dev::ns16550::com_reg;
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::snapshot::{field, field_bytes, field_u8, StateTable};
 
-pub(super) mod uart_reg {
-    pub const RBR_THR: u32 = 0;
-    pub const IIR_FCR: u32 = 2;
-    pub const MCR: u32 = 4;
-    pub const LSR: u32 = 5;
-    pub const MSR: u32 = 6;
-    pub const SCR: u32 = 7;
-}
-pub(super) const LSR_DR: u8 = 0x01;
-pub(super) const LSR_OE: u8 = 0x02;
-pub(super) const LSR_PE: u8 = 0x04;
-pub(super) const LSR_FE: u8 = 0x08;
-pub(super) const LSR_BI: u8 = 0x10;
-pub(super) const MCR_DTR: u8 = 0x01;
-pub(super) const MCR_RTS: u8 = 0x02;
-pub(super) const MCR_OUT1: u8 = 0x04;
-pub(super) const MCR_OUT2: u8 = 0x08;
-pub(super) const MCR_LOOP: u8 = 0x10;
 pub(super) const MCR_AFE: u8 = 0x20;
-pub(super) const MSR_DCTS: u8 = 0x01;
-pub(super) const MSR_CTS: u8 = 0x10;
-pub(super) const MSR_DCD: u8 = 0x80;
 pub(super) const LSR_TEST_MASK: u8 = 0x7f;
 pub(super) const MSR_TEST_MASK: u8 = 0x0f;
 /// The reference clock of the UART crystal: the pre-divider divides it, and
@@ -117,12 +97,12 @@ impl Uart {
     pub(super) fn read(&mut self, r: u32) -> u8 {
         let mut v = self.read_core(r);
         match r {
-            uart_reg::MCR => v |= self.mcr_afe,
-            uart_reg::LSR => {
+            com_reg::MCR => v |= self.mcr_afe,
+            com_reg::LSR => {
                 v |= self.lsr_test;
                 self.lsr_test = 0;
             }
-            uart_reg::MSR => {
+            com_reg::MSR => {
                 v |= self.msr_test;
                 self.msr_test = 0;
             }
@@ -133,10 +113,10 @@ impl Uart {
 
     pub(super) fn write(&mut self, r: u32, v: u8) {
         match r {
-            uart_reg::MCR => self.mcr_afe = v & MCR_AFE,
-            uart_reg::LSR => self.lsr_test = v & LSR_TEST_MASK,
-            uart_reg::MSR => self.msr_test = v & MSR_TEST_MASK,
-            uart_reg::SCR => {
+            com_reg::MCR => self.mcr_afe = v & MCR_AFE,
+            com_reg::LSR => self.lsr_test = v & LSR_TEST_MASK,
+            com_reg::MSR => self.msr_test = v & MSR_TEST_MASK,
+            com_reg::SCR => {
                 // Scratch writes with the divisor latch up program the clock
                 // pre-divider; twice the divide wanted. 0 and 1 mean nothing.
                 if self.core.dlab() && v / 2 != 0 {
@@ -296,8 +276,9 @@ impl Ecp {
     }
 }
 
-struct Sio {
-    uart: [Uart; 2],
+/// What the Super I/O's lock guards.
+pub(super) struct Sio {
+    pub(super) uart: [Uart; 2],
     ecp: Ecp,
 }
 
@@ -332,6 +313,13 @@ impl SuperIo {
         let r = f(&mut st.uart[p]);
         self.core.level(int::serial(p, int::PASSTHROUGH), st.uart[p].irq());
         r
+    }
+
+    /// The part's lock, held by the serial ring engine for the length of a
+    /// pass: it reads and writes the UARTs and posts their interrupt level
+    /// itself (see [`Uart`]'s `SerialDmaUart` impl and the engine's host).
+    pub(super) fn lock(&self) -> parking_lot::MutexGuard<'_, Sio> {
+        self.st.lock()
     }
 
     pub(super) fn set_serial_backend(&self, p: usize, backend: Arc<dyn SerialBackend>) {
@@ -414,5 +402,41 @@ impl SuperIo {
     /// ECR is the caller's to follow with the DMA engine.
     pub(super) fn ecp_write(&self, r: u32, v: u8) {
         self.st.lock().ecp.write(r, v);
+    }
+}
+
+/// The UART as the shared ring engine drives it: the 16550 proper for the
+/// reads that have no side effects, and the chip's additions on a write.
+impl crate::dev::ioc_serial_dma::SerialDmaUart for Uart {
+    fn loopback(&self) -> bool {
+        self.core.loopback()
+    }
+
+    fn tx_ready(&self) -> bool {
+        self.core.tx_ready()
+    }
+
+    fn char_time(&self) -> std::time::Duration {
+        self.core.char_time()
+    }
+
+    fn read_core(&mut self, reg: u32) -> u8 {
+        Uart::read_core(self, reg)
+    }
+
+    fn write(&mut self, reg: u32, val: u8) {
+        Uart::write(self, reg, val)
+    }
+
+    fn lsr(&self) -> u8 {
+        self.core.lsr()
+    }
+
+    fn mcr(&self) -> u8 {
+        self.core.mcr()
+    }
+
+    fn msr(&self) -> u8 {
+        self.core.msr()
     }
 }
