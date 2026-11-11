@@ -273,9 +273,10 @@ fn dma(kind: Kind, widget: u8) {
     assert!(dma.dma_read(0x8000_1000, &mut buf).is_ok());
     assert_eq!(buf, [1, 2, 3, 4]);
 
-    // A request that names the board's own port goes nowhere.
+    // A request that names the board's own port goes nowhere; the write
+    // was posted, so the card saw it complete.
     rig.set(reg::DIRECT_MAP, (widget as u32) << 20);
-    assert!(!dma.dma_write(0x8000_2000, &[9; 4]).is_ok());
+    assert!(dma.dma_write(0x8000_2000, &[9; 4]).is_ok());
     assert_eq!(rig.mem.peek(0x2000, 4), [0; 4]);
 }
 

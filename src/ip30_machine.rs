@@ -1431,9 +1431,11 @@ impl Ip30Monitor {
             "bridge" => {
                 let (wid, addr) = self.bridge.interrupt_destination();
                 let mut s = format!(
-                    "interrupt destination widget {wid} address {addr:#x}; enable {:#04x} status {:#010x}\n",
+                    "interrupt destination widget {wid} address {addr:#x}; enable {:#04x} status {:#010x}; \
+                     DMA writes that reached no memory: {}\n",
                     self.bridge.register(reg::INT_ENABLE),
-                    self.bridge.register(reg::INT_STATUS)
+                    self.bridge.register(reg::INT_STATUS),
+                    self.bridge.lost_writes()
                 );
                 for n in 0..8 {
                     s.push_str(&format!(
