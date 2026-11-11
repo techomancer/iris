@@ -791,13 +791,13 @@ within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
 The Windows gate `.\scripts\test-resident-gate.ps1` checks 25 resident CPU,
-4 flat-fill, 2 line, 1 shade-DDA, 1 pattern-state, 3 command-ABI and 3
-direct-state tests, plus 18
+4 flat-fill, 2 line, 2 HostW walker, 1 shade-DDA, 1 pattern-state, 3
+command-ABI and 3 direct-state tests, plus 19
 resident GPU and 8
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 91-test gate. See
+complete 95-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -913,12 +913,28 @@ M4 work and READ remains rejected until M5 observation support.
 
 ### M4 - HostW staging
 
-- [ ] Port persistent host-visible upload sets and fixed ownership tracking.
-- [ ] Make one VDMA block one staged payload plus one command where possible.
+- [x] Port persistent host-visible upload sets and fixed ownership tracking.
+- [x] Make one VDMA block one staged payload plus one command where possible.
 - [ ] Preserve all-or-nothing `BUS_BUSY` behavior.
 - [ ] Add CPU-walked PIO/zoom segment descriptors.
 - [ ] Preserve packing, residual shifts, row flushes and STOPX/STOPY.
 - [ ] Stress CPU and VDMA producer interleaving and staging wraparound.
+
+The first M4 slice stages an immutable high-word/low-word copy of every HostRW
+qword in the bounded reusable payload set. One isolated serial command consumes
+the complete PIO or multiword transfer, while a framebuffer-independent CPU
+walker computes the exact final coordinates, residual shifter/count and
+STOPONX/STOPONY row continuation before the command is accepted. Unpatterned,
+unshaded BLOCK and SPAN draws cover COLORHOST, ALPHAHOST and both together,
+packed and unpacked 4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, clipping,
+CID/alpha rejection, logic, blending and WRMASK. Full blocks reproduce an
+underfed final qword; segmented rows discard residual fields at the same outer
+GO boundary as the CPU model. The shader fetches host data before clipping or
+pixel rejection, and no CPU framebuffer pointer reaches this path.
+
+Host patterns, shade, endpoint skips, LENGTH32, LR-only shapes, host lines,
+zoom segment coalescing and producer/wraparound stress remain explicit errors
+for later focused M4 slices. HOSTR remains M5 work.
 
 Complete when ordinary and zoomed pixmaps match CPU mode with no CPU
 framebuffer store and no per-qword GPU submission.

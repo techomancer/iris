@@ -837,7 +837,21 @@ where endpoint skips are overridden and Bresenham advances after the pixel,
 and LENGTH32 mode, where the next GO revisits the chunk boundary. NOOP
 advances the resident stream without a plane write. An armed multiword token
 on a non-host operation performs the CPU model's one no-progress retry before
-retiring to the single-word state. Host-sourced DRAW remains staged M4 work;
+retiring to the single-word state.
+
+The first M4 HostW slice stages each PIO or batched BLOCK/SPAN transfer as
+immutable high-word/low-word qword pairs in one reusable payload set and
+executes it as one isolated serial command. A framebuffer-independent CPU
+walker calculates final coordinates, residual shifter/count, row flushes and
+STOPONX/STOPONY continuation transactionally; only after the command and
+payload fit does it update the architectural context. The shader consumes the
+same starting shifter/cursor state and fetches source fields before clipping,
+CID or alpha rejection. COLORHOST, ALPHAHOST and their combination support
+packed and unpacked 4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, PIO
+replication, multiword row continuation, RGB/auxiliary destinations and the
+ordinary pixel pipeline. Accepted-transfer and staged-qword counters survive
+reset and restore. Host patterns, shade, endpoint skips, LENGTH32, LR-only
+shapes, host lines and zoom coalescing remain hard errors for later M4 slices;
 READ remains a hard error until M5 supplies an explicit synchronized source.
 
 Each activation or quiescent reset establishes a new epoch. Typed stream
