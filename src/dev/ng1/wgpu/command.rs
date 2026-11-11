@@ -24,6 +24,9 @@ pub(super) const COMMAND_COPY_F_LINE: u32 = 10;
 pub(super) const COMMAND_COPY_A_LINE: u32 = 11;
 pub(super) const COMMAND_HOST_BLOCK: u32 = 12;
 pub(super) const COMMAND_HOST_SPAN: u32 = 13;
+pub(super) const COMMAND_HOST_I_LINE: u32 = 14;
+pub(super) const COMMAND_HOST_F_LINE: u32 = 15;
+pub(super) const COMMAND_HOST_A_LINE: u32 = 16;
 
 pub(super) const FLAG_WRITE_RGB: u32 = 1 << 0;
 pub(super) const FLAG_WRITE_AUX: u32 = 1 << 1;
@@ -309,6 +312,42 @@ impl RexCommand {
         }
         if read_destination {
             flags |= match fill.plane {
+                FillPlane::Rgb => FLAG_READ_RGB,
+                FillPlane::Aux => FLAG_READ_AUX,
+            };
+        }
+        Self {
+            kind,
+            state_slot,
+            flags,
+            payload_offset: payload.offset,
+            payload_words: payload.words,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn host_line(
+        state_slot: u32,
+        line: LineCommand,
+        payload: PayloadRef,
+        cid_test: bool,
+        read_destination: bool,
+    ) -> Self {
+        let kind = match line.kind {
+            LineKind::Integer => COMMAND_HOST_I_LINE,
+            LineKind::Fractional => COMMAND_HOST_F_LINE,
+            LineKind::Antialiased => COMMAND_HOST_A_LINE,
+        };
+        let mut flags = FLAG_BARRIER_BEFORE | FLAG_BARRIER_AFTER;
+        flags |= match line.plane {
+            FillPlane::Rgb => FLAG_WRITE_RGB,
+            FillPlane::Aux => FLAG_WRITE_AUX,
+        };
+        if cid_test {
+            flags |= FLAG_READ_AUX;
+        }
+        if read_destination {
+            flags |= match line.plane {
                 FillPlane::Rgb => FLAG_READ_RGB,
                 FillPlane::Aux => FLAG_READ_AUX,
             };
@@ -759,6 +798,49 @@ mod tests {
             assert_eq!(
                 RexCommand::host_fill(0, host, PayloadRef::EMPTY, false, false).kind,
                 COMMAND_HOST_SPAN,
+            );
+
+            let mut line = LineCommand {
+                kind: LineKind::Integer,
+                plane: FillPlane::Rgb,
+                min_x: 3,
+                min_y: 5,
+                max_x: 7,
+                max_y: 11,
+                start_major: 3,
+                y_major: false,
+                major_decreasing: false,
+                color: 0x1234_5678,
+                write_mask: u32::MAX,
+                payload_words: 9,
+                shaded: false,
+            };
+            let payload = PayloadRef {
+                offset: 17,
+                words: 19,
+            };
+            let command = RexCommand::host_line(13, line, payload, true, true);
+            assert_eq!(command.kind, COMMAND_HOST_I_LINE);
+            assert_eq!(command.state_slot, 13);
+            assert_eq!(command.payload(), payload);
+            assert_eq!(
+                command.flags,
+                FLAG_BARRIER_BEFORE
+                    | FLAG_BARRIER_AFTER
+                    | FLAG_WRITE_RGB
+                    | FLAG_READ_RGB
+                    | FLAG_READ_AUX,
+            );
+            line.kind = LineKind::Fractional;
+            line.plane = FillPlane::Aux;
+            assert_eq!(
+                RexCommand::host_line(0, line, PayloadRef::EMPTY, false, false).kind,
+                COMMAND_HOST_F_LINE,
+            );
+            line.kind = LineKind::Antialiased;
+            assert_eq!(
+                RexCommand::host_line(0, line, PayloadRef::EMPTY, false, false).kind,
+                COMMAND_HOST_A_LINE,
             );
         });
     }

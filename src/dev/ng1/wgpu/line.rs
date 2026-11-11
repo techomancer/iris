@@ -3,12 +3,16 @@ use crate::dev::ng1::rex3::{
     DRAWMODE0_ADRMODE_F_LINE, DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW,
     DRAWMODE0_OPCODE_SCR2SCR,
     DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP,
-    DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA, REX3_BRES_OCTANTS, REX3_COORD_BIAS,
-    REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
+    DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA, HOSTRW_BUF_QWORDS, REX3_BRES_OCTANTS,
+    REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
 use crate::dev::ng1::rex3_flat_fill::FillPlane;
-use crate::dev::ng1::rex3_generic::ls_pattern_state_after;
+use crate::dev::ng1::rex3_generic::{
+    calculate_fb_address, ls_pattern_state_after, DynMode, Mode,
+};
+use crate::dev::ng1::rex3_shape;
 
+use super::host::HostStream;
 use super::shade::ShadeDda;
 
 const SKIPPED_PIXEL: u32 = u32::MAX;
@@ -273,6 +277,10 @@ impl PreparedLine {
     }
 
     pub(super) fn finish(self, context: &mut Rex3Context) {
+        self.finish_state(context, true);
+    }
+
+    fn finish_state(self, context: &mut Rex3Context, retire_host: bool) {
         if let Some(shade) = self.final_shade {
             shade.write_back(context);
         }
@@ -296,8 +304,10 @@ impl PreparedLine {
             context.lsmode.set_lsrcount(count);
             context.pat_bit = bit;
         }
-        context.host_len = 1;
-        context.host_cursor = 0;
+        if retire_host {
+            context.host_len = 1;
+            context.host_cursor = 0;
+        }
     }
 }
 
@@ -305,6 +315,7 @@ impl PreparedLine {
 enum LineOperation {
     Draw,
     Copy,
+    Host,
 }
 
 pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'static str> {
@@ -313,6 +324,197 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
 
 pub(super) fn prepare_copy_line(context: &Rex3Context) -> Result<PreparedLine, &'static str> {
     prepare_line_for(context, LineOperation::Copy)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostLineCompletion {
+    xstart: i32,
+    ystart: i32,
+    bresd: u32,
+    pat_bit: u8,
+    zpat_bit: u8,
+    lsrcount: u32,
+    hostcnt: u32,
+    host_shifter: u64,
+    shade: ShadeDda,
+}
+
+#[must_use]
+#[derive(Debug)]
+pub(super) struct PreparedHostLine {
+    line: Option<LineCommand>,
+    completion: HostLineCompletion,
+    payload_qwords: usize,
+}
+
+impl PreparedHostLine {
+    pub(super) fn line(&self) -> Option<LineCommand> {
+        self.line
+    }
+
+    pub(super) fn payload_qwords(&self) -> usize {
+        self.payload_qwords
+    }
+
+    pub(super) fn finish(self, context: &mut Rex3Context) {
+        context.xstart = self.completion.xstart;
+        context.ystart = self.completion.ystart;
+        context.bresd = self.completion.bresd;
+        context.pat_bit = self.completion.pat_bit;
+        context.zpat_bit = self.completion.zpat_bit;
+        context.lsmode.set_lsrcount(self.completion.lsrcount);
+        context.hostcnt = self.completion.hostcnt;
+        context.host_shifter = self.completion.host_shifter;
+        self.completion.shade.write_back(context);
+        context.host_len = 1;
+        context.host_cursor = 0;
+    }
+}
+
+pub(super) fn prepare_host_line(
+    context: &Rex3Context,
+) -> Result<PreparedHostLine, &'static str> {
+    if context.drawmode0.opcode() != DRAWMODE0_OPCODE_DRAW
+        || !(context.drawmode0.colorhost() || context.drawmode0.alphahost())
+    {
+        return Err("host transfer");
+    }
+    if context.host_len as usize > HOSTRW_BUF_QWORDS {
+        return Err("host payload length");
+    }
+    let mode = rex3_shape::unpack(context.drawmode0.0, context.drawmode1.0, context.clipmode);
+    if mode.fastclear() != 0 {
+        return Err("host fast clear");
+    }
+
+    let mut simulated = *context;
+    let mut stream = HostStream::from_context(context);
+    let mut line = None;
+    let mut previous_cursor = None;
+    loop {
+        let prepared = prepare_line_for(&simulated, LineOperation::Host)?;
+        let geometry = prepared.geometry;
+        let candidate = prepared.line();
+        let mut pat_bit = simulated.pat_bit;
+        let mut zpat_bit = simulated.zpat_bit;
+        let mut lsrcount = simulated.lsmode.lsrcount();
+        let mut invocation_writes = false;
+        for pixel in geometry.pixels() {
+            if !pixel.skip {
+                let (draws, background) =
+                    host_pattern(&simulated, &mode, pat_bit, zpat_bit);
+                if draws {
+                    if !background {
+                        stream.consume(context);
+                    }
+                    invocation_writes |= calculate_fb_address::<DynMode, true>(
+                        &mode,
+                        pixel.x,
+                        pixel.y,
+                        &simulated,
+                    )
+                    .is_some();
+                }
+            }
+            let last = pixel.index + 1 == geometry.pixel_count;
+            if !last || mode.lsadvlast() != 0 {
+                advance_host_pattern(
+                    &simulated,
+                    &mode,
+                    &mut pat_bit,
+                    &mut zpat_bit,
+                    &mut lsrcount,
+                );
+            }
+        }
+
+        prepared.finish_state(&mut simulated, false);
+        simulated.pat_bit = pat_bit;
+        simulated.zpat_bit = zpat_bit;
+        simulated.lsmode.set_lsrcount(lsrcount);
+        simulated.hostcnt = stream.count();
+        simulated.host_shifter = stream.shifter();
+        simulated.host_cursor = stream.cursor();
+        if invocation_writes {
+            line = candidate;
+        }
+
+        if previous_cursor == Some(stream.cursor())
+            || stream.length() <= 1
+            || stream.drained()
+        {
+            break;
+        }
+        previous_cursor = Some(stream.cursor());
+        stream.reset_count();
+        simulated.hostcnt = 0;
+    }
+
+    Ok(PreparedHostLine {
+        line,
+        completion: HostLineCompletion {
+            xstart: simulated.xstart,
+            ystart: simulated.ystart,
+            bresd: simulated.bresd,
+            pat_bit: simulated.pat_bit,
+            zpat_bit: simulated.zpat_bit,
+            lsrcount: simulated.lsmode.lsrcount(),
+            hostcnt: stream.count(),
+            host_shifter: stream.shifter(),
+            shade: ShadeDda::from_context(&simulated),
+        },
+        payload_qwords: context.host_len as usize,
+    })
+}
+
+fn host_pattern(
+    context: &Rex3Context,
+    mode: &DynMode,
+    pat_bit: u8,
+    zpat_bit: u8,
+) -> (bool, bool) {
+    let mut background = false;
+    if mode.enzpattern() != 0 && (context.zpattern >> zpat_bit) & 1 == 0 {
+        if mode.zpopaque() != 0 {
+            background = true;
+        } else {
+            return (false, false);
+        }
+    }
+    if mode.enlspattern() != 0 && (context.lspattern >> pat_bit) & 1 == 0 {
+        if mode.lsopaque() != 0 {
+            background = true;
+        } else {
+            return (false, false);
+        }
+    }
+    (true, background)
+}
+
+fn advance_host_pattern(
+    context: &Rex3Context,
+    mode: &DynMode,
+    pat_bit: &mut u8,
+    zpat_bit: &mut u8,
+    lsrcount: &mut u32,
+) {
+    if mode.enzpattern() != 0 {
+        *zpat_bit = zpat_bit.wrapping_sub(1) & 31;
+    }
+    if mode.enlspattern() != 0 {
+        let repeat = context.lsmode.lsrepeat().max(1);
+        if *lsrcount == 0 {
+            *lsrcount = repeat - 1;
+            let wrap = 32 - (context.lsmode.lslength() + 17);
+            *pat_bit = if u32::from(*pat_bit) == wrap {
+                31
+            } else {
+                pat_bit.wrapping_sub(1) & 31
+            };
+        } else {
+            *lsrcount -= 1;
+        }
+    }
 }
 
 fn prepare_line_for(
@@ -328,13 +530,16 @@ fn prepare_line_for(
         _ => return Err("primitive shape"),
     };
     let expected_opcode = match operation {
-        LineOperation::Draw => DRAWMODE0_OPCODE_DRAW,
+        LineOperation::Draw | LineOperation::Host => DRAWMODE0_OPCODE_DRAW,
         LineOperation::Copy => DRAWMODE0_OPCODE_SCR2SCR,
     };
     if dm0.opcode() != expected_opcode {
         return Err("opcode");
     }
     if operation == LineOperation::Draw && (dm0.colorhost() || dm0.alphahost()) {
+        return Err("host transfer");
+    }
+    if operation == LineOperation::Host && !(dm0.colorhost() || dm0.alphahost()) {
         return Err("host transfer");
     }
     let plane = match dm1.planes() {
@@ -417,7 +622,7 @@ fn prepare_line_for(
         line_pattern_repeat: context.lsmode.lsrepeat(),
         line_pattern_length: context.lsmode.lslength(),
         advance_last_pattern: dm0.enlspattern() && dm0.lsadvlast(),
-        filter_patterns: operation == LineOperation::Draw,
+        filter_patterns: operation != LineOperation::Copy,
         step_after_last: single_step,
     };
 
@@ -686,6 +891,61 @@ mod tests {
         );
     }
 
+    fn check_host(mut actual: Rex3Context, label: &str) {
+        let mut expected = actual;
+        let mut expected_rgb = seed(0x2468_ace0);
+        let mut expected_aux = seed(0x1357_9bdf);
+
+        let prepared =
+            prepare_host_line(&actual).unwrap_or_else(|reason| panic!("{label}: {reason}"));
+        prepared.finish(&mut actual);
+
+        let framebuffers = Framebuffers {
+            rgb: expected_rgb.as_mut_ptr(),
+            aux: expected_aux.as_mut_ptr(),
+        };
+        let mode = rex3_shape::unpack(
+            expected.drawmode0.0,
+            expected.drawmode1.0,
+            expected.clipmode,
+        );
+        draw_with_fb(&mut expected, &framebuffers, &mode);
+        while expected.host_len > 1 && expected.host_cursor < expected.host_len {
+            let before = expected.host_cursor;
+            expected.hostcnt = 0;
+            draw_with_fb(&mut expected, &framebuffers, &mode);
+            if expected.host_cursor == before {
+                break;
+            }
+        }
+        expected.host_len = 1;
+        expected.host_cursor = 0;
+
+        assert_eq!(actual.xstart, expected.xstart, "{label}: xstart");
+        assert_eq!(actual.ystart, expected.ystart, "{label}: ystart");
+        assert_eq!(actual.bresd, expected.bresd, "{label}: bresd");
+        assert_eq!(actual.pat_bit, expected.pat_bit, "{label}: pat_bit");
+        assert_eq!(actual.zpat_bit, expected.zpat_bit, "{label}: zpat_bit");
+        assert_eq!(actual.lsmode.0, expected.lsmode.0, "{label}: lsmode");
+        assert_eq!(actual.hostcnt, expected.hostcnt, "{label}: hostcnt");
+        assert_eq!(
+            actual.host_shifter, expected.host_shifter,
+            "{label}: host_shifter"
+        );
+        assert_eq!(
+            actual.host_cursor, expected.host_cursor,
+            "{label}: host_cursor"
+        );
+        assert_eq!(actual.host_len, expected.host_len, "{label}: host_len");
+        assert_eq!(actual.colorred, expected.colorred, "{label}: colorred");
+        assert_eq!(
+            actual.coloralpha, expected.coloralpha,
+            "{label}: coloralpha"
+        );
+        assert_eq!(actual.colorgrn, expected.colorgrn, "{label}: colorgrn");
+        assert_eq!(actual.colorblue, expected.colorblue, "{label}: colorblue");
+    }
+
     #[test]
     fn line_payloads_match_cpu_geometry_and_completion() {
         on_large_stack(|| {
@@ -779,6 +1039,83 @@ mod tests {
             assert_eq!(rejected.xstart, unchanged.xstart);
             assert_eq!(rejected.ystart, unchanged.ystart);
             assert_eq!(rejected.bresd, unchanged.bresd);
+
+            let mut integer =
+                context(LineKind::Integer, (20 * 16, 30 * 16), (39 * 16, 37 * 16));
+            integer.drawmode0.0 |= 1 << 6;
+            integer.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+            integer.host_len = 2;
+            integer.hostrw[0] = 0x1234_5678_9abc_def0;
+            integer.hostrw[1] = 0x0fed_cba9_8765_4321;
+            setup_integer(&mut integer, 0x5a);
+            check_host(integer, "integer HostW line");
+
+            let mut fractional = context(
+                LineKind::Fractional,
+                (50 * 16 + 3, 60 * 16 + 11),
+                (67 * 16 + 13, 69 * 16 + 2),
+            );
+            fractional.drawmode0.0 |=
+                (1 << 7) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18);
+            fractional.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+            fractional.zpattern = 0xd6a5_39c7;
+            fractional.lspattern = 0xb5ca_d00f;
+            fractional.zpat_bit = 9;
+            fractional.pat_bit = 7;
+            fractional.lsmode.set_lsrcount(1);
+            fractional.lsmode.set_lsrepeat(2);
+            fractional.lsmode.set_lslength(7);
+            fractional.slopered = 0x0000_0101;
+            fractional.slopealpha = -0x0000_0203;
+            fractional.slopegrn = 0x0000_0305;
+            fractional.slopeblue = -0x0000_0407;
+            fractional.host_len = 2;
+            fractional.hostrw[0] = 0x2040_6080_a0c0_e0ff;
+            fractional.hostrw[1] = 0x1133_5577_99bb_ddff;
+            fline_setup(&mut fractional);
+            check_host(fractional, "patterned shaded fractional HostW line");
+
+            let mut antialiased = context(
+                LineKind::Antialiased,
+                (80 * 16 + 7, 90 * 16 + 5),
+                (126 * 16 + 9, 101 * 16 + 12),
+            );
+            antialiased.drawmode0.0 |=
+                (1 << 6) | (1 << 7) | (1 << 15) | (1 << 22);
+            antialiased.drawmode1.0 |= (3 << 8) | (1 << 10);
+            antialiased.aweight0 = 0;
+            antialiased.aweight1 = 0;
+            antialiased.host_len = 40;
+            for index in 0..antialiased.host_len as usize {
+                antialiased.hostrw[index] =
+                    0x1020_3040_5060_7080 ^ (index as u64 * 0x0101_0101);
+            }
+            fline_setup(&mut antialiased);
+            antialiased.xstart += 7 * 128;
+            antialiased.ystart += 5 * 128;
+            check_host(antialiased, "endpoint-filtered LENGTH32 HostW line");
+
+            let mut single_step =
+                context(LineKind::Integer, (140 * 16, 120 * 16), (146 * 16, 124 * 16));
+            single_step.drawmode0.0 &= !((1 << 8) | (1 << 9));
+            single_step.drawmode0.0 |= (1 << 6) | (1 << 10) | (1 << 11);
+            single_step.drawmode1.0 |= 3 << 8;
+            single_step.hostrw[0] = 0x7f31_5926_0000_0000;
+            setup_integer(&mut single_step, 0);
+            check_host(single_step, "single-step HostW line");
+
+            let mut fast_clear = integer;
+            fast_clear.drawmode0.0 &= !(1 << 6);
+            fast_clear.drawmode0.0 |= 1 << 7;
+            fast_clear.drawmode1.0 |= 1 << 17;
+            let unchanged = fast_clear;
+            assert_eq!(
+                prepare_host_line(&fast_clear).unwrap_err(),
+                "host fast clear"
+            );
+            assert_eq!(fast_clear.xstart, unchanged.xstart);
+            assert_eq!(fast_clear.ystart, unchanged.ystart);
+            assert_eq!(fast_clear.host_cursor, unchanged.host_cursor);
         });
     }
 }

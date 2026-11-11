@@ -78,7 +78,7 @@ struct WalkState {
 }
 
 #[derive(Clone, Copy)]
-struct HostStream {
+pub(super) struct HostStream {
     count: u32,
     shifter: u64,
     cursor: u32,
@@ -86,7 +86,16 @@ struct HostStream {
 }
 
 impl HostStream {
-    fn consume(&mut self, context: &Rex3Context) {
+    pub(super) fn from_context(context: &Rex3Context) -> Self {
+        Self {
+            count: context.hostcnt,
+            shifter: context.host_shifter,
+            cursor: context.host_cursor,
+            length: context.host_len,
+        }
+    }
+
+    pub(super) fn consume(&mut self, context: &Rex3Context) {
         if self.count == 0 {
             let last = self.length.saturating_sub(1);
             let index = self.cursor.min(last) as usize;
@@ -109,8 +118,28 @@ impl HostStream {
         self.count -= 1;
     }
 
-    fn drained(self) -> bool {
+    pub(super) fn drained(self) -> bool {
         self.cursor >= self.length
+    }
+
+    pub(super) fn reset_count(&mut self) {
+        self.count = 0;
+    }
+
+    pub(super) fn count(self) -> u32 {
+        self.count
+    }
+
+    pub(super) fn shifter(self) -> u64 {
+        self.shifter
+    }
+
+    pub(super) fn cursor(self) -> u32 {
+        self.cursor
+    }
+
+    pub(super) fn length(self) -> u32 {
+        self.length
     }
 }
 
@@ -147,12 +176,7 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
         lsrcount: context.lsmode.lsrcount(),
         shade: ShadeDda::from_context(context),
     };
-    let mut stream = HostStream {
-        count: context.hostcnt,
-        shifter: context.host_shifter,
-        cursor: context.host_cursor,
-        length: context.host_len,
-    };
+    let mut stream = HostStream::from_context(context);
     let mut write_address_seen = false;
     run_invocation(
         context,
