@@ -2357,8 +2357,16 @@ impl App {
         if let Err(e) = machines::validate_name(new) { self.toast(e); return; }
         if self.cfg_dirty && !self.flush_machine() { return; }
         let name = self.prefs.unique_name(new);
-        let result = self.prefs.root().and_then(|root| machines::rename(root, &old, &name));
-        if let Err(e) = result { self.toast(t!("toast-rename-failed", error = e)); return; }
+        // The folder is the working directory, and Windows won't rename that.
+        let result = self.prefs.root().and_then(|root| {
+            std::env::set_current_dir(root).map_err(|e| e.to_string())?;
+            machines::rename(root, &old, &name)
+        });
+        if let Err(e) = result {
+            self.toast(t!("toast-rename-failed", error = e));
+            if let Err(e) = self.prefs.machine_dir(&old).and_then(|d| Self::enter_directory(&d)) { self.toast(e); }
+            return;
+        }
         self.prefs.machines.remove(&old);
         self.prefs.machines.insert(name.clone(), self.cfg.clone());
         self.prefs.active_machine = Some(name.clone());
@@ -3958,7 +3966,7 @@ mod machine_storage_integration {
         app.switch_to("alpha");
         assert_eq!(app.cfg.banks, iris::config::banks_from4([16, 16, 0, 0]));
         app.apply_rename("renamed");
-        assert_eq!(app.prefs.active_machine.as_deref(), Some("renamed"));
+        assert_eq!(app.prefs.active_machine.as_deref(), Some("renamed"), "rename failed: {:?}", app.toast);
         assert_eq!(std::env::current_dir().unwrap(), root.join("machines/renamed"));
         assert!(root.join("machines/renamed/renamed.toml").is_file());
         app.delete_machine("renamed");
