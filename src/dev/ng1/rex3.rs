@@ -1856,7 +1856,24 @@ impl Rex3 {
         context: &mut Rex3Context,
     ) -> Option<Result<(), crate::dev::ng1::wgpu::resident::ResidentError>> {
         let result = match &mut *self.raster.lock() {
-            RasterMode::Resident(raster) => Some(raster.enqueue(context)),
+            RasterMode::Resident(raster) => {
+                let host_len = context.host_len;
+                let host_cursor = context.host_cursor;
+                let mut result = raster.enqueue(context);
+                if result.is_ok() && host_len > 1 && host_cursor < host_len {
+                    // M3 consumes no host words, but execute_go still retries one
+                    // armed non-host walker before its no-progress break.
+                    context.host_len = host_len;
+                    context.host_cursor = host_cursor;
+                    context.hostcnt = 0;
+                    result = raster.enqueue(context);
+                }
+                if result.is_ok() {
+                    context.host_len = 1;
+                    context.host_cursor = 0;
+                }
+                Some(result)
+            }
             _ => None,
         };
         if let Some(Err(error)) = &result {

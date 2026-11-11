@@ -29,6 +29,9 @@ mod command;
 mod copy;
 
 #[cfg(test)]
+pub(super) mod fill_walk;
+
+#[cfg(test)]
 mod line;
 
 #[cfg(test)]

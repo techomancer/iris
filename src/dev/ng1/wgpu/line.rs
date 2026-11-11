@@ -72,6 +72,7 @@ struct LineGeometry {
     line_pattern_length: u32,
     advance_last_pattern: bool,
     filter_patterns: bool,
+    step_after_last: bool,
 }
 
 impl LineGeometry {
@@ -189,7 +190,7 @@ impl Iterator for LinePixels {
                 || (last && self.geometry.skip_last),
         };
         self.index += 1;
-        if !last {
+        if !last || self.geometry.step_after_last {
             let straight = self.d < 0 || (self.d == 0 && self.geometry.straight_on_zero);
             if straight {
                 self.x += self.geometry.incrx1;
@@ -333,29 +334,15 @@ fn prepare_line_for(
     if dm0.opcode() != expected_opcode {
         return Err("opcode");
     }
-    if !dm0.stoponx() && !dm0.stopony() {
-        return Err("continuation line");
-    }
-    if context.mid_primitive {
-        return Err("continuation state");
-    }
-    if context.host_len > 1 {
+    if operation == LineOperation::Draw && (dm0.colorhost() || dm0.alphahost()) {
         return Err("host transfer");
     }
-    if dm0.colorhost()
-        || dm0.alphahost()
-        || dm0.length32()
-        || dm0.lronly()
-        || dm0.ystride()
-    {
-        return Err("draw mode 0");
-    }
     let plane = match dm1.planes() {
-        DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => FillPlane::Rgb,
+        DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => Some(FillPlane::Rgb),
         DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => {
-            FillPlane::Aux
+            Some(FillPlane::Aux)
         }
-        _ => return Err("pixel format"),
+        _ => None,
     };
     if operation == LineOperation::Draw && dm1.fastclear() {
         return Err("pixel operation");
@@ -373,8 +360,19 @@ fn prepare_line_for(
     } else {
         i64::from((x_end - x).abs())
     };
-    let pixel_count = u32::try_from(major + 1).map_err(|_| "line length")?;
-    let endpoint_skip = endpoint_skips(context, kind);
+    let mut pixel_count = u32::try_from(major + 1).map_err(|_| "line length")?;
+    if dm0.length32() {
+        pixel_count = pixel_count.min(32);
+    }
+    let single_step = !dm0.stoponx() && !dm0.stopony();
+    if single_step {
+        pixel_count = 1;
+    }
+    let endpoint_skip = if single_step {
+        (false, false)
+    } else {
+        endpoint_skips(context, kind)
+    };
     let x_move = if operation == LineOperation::Copy || dm0.xyoffset() {
         (context.xymove >> 16) as i16 as i32
     } else {
@@ -400,8 +398,8 @@ fn prepare_line_for(
         y_major,
         straight_on_zero: bres_straight_on_zero(context, octant),
         pixel_count,
-        skip_first: dm0.skipfirst() || endpoint_skip.0,
-        skip_last: dm0.skiplast() || endpoint_skip.1,
+        skip_first: !single_step && (dm0.skipfirst() || endpoint_skip.0),
+        skip_last: !single_step && (dm0.skiplast() || endpoint_skip.1),
         x_move,
         y_move,
         x_window,
@@ -420,19 +418,15 @@ fn prepare_line_for(
         line_pattern_length: context.lsmode.lslength(),
         advance_last_pattern: dm0.enlspattern() && dm0.lsadvlast(),
         filter_patterns: operation == LineOperation::Draw,
+        step_after_last: single_step,
     };
 
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
     let mut max_x = i32::MIN;
     let mut max_y = i32::MIN;
-    let mut final_x = x;
-    let mut final_y = y;
-    let mut final_d = geometry.d;
-    for pixel in geometry.pixels() {
-        final_x = pixel.x;
-        final_y = pixel.y;
-        final_d = pixel.d;
+    let mut pixels = geometry.pixels();
+    for pixel in &mut pixels {
         if !pixel.skip
             && pixel.physical_x >= 0
             && pixel.physical_x < REX3_SCREEN_WIDTH
@@ -445,6 +439,9 @@ fn prepare_line_for(
             max_y = max_y.max(pixel.physical_y);
         }
     }
+    let final_x = pixels.x;
+    let final_y = pixels.y;
+    let final_d = pixels.d;
 
     let (shade_payload, final_shade) = if dm0.shade() {
         let mut shade = ShadeDda::from_context(context);
@@ -464,7 +461,11 @@ fn prepare_line_for(
     } else {
         (Vec::new(), None)
     };
-    let line = if min_x > max_x || min_y > max_y || context.wrmask == 0 {
+    let line = if min_x > max_x
+        || min_y > max_y
+        || context.wrmask == 0
+        || plane.is_none()
+    {
         None
     } else {
         let alpha = if kind == LineKind::Antialiased {
@@ -475,7 +476,7 @@ fn prepare_line_for(
         let raw_color = (context.get_colori() & 0x00ff_ffff) | (alpha << 24);
         Some(LineCommand {
             kind,
-            plane,
+            plane: plane.unwrap(),
             min_x,
             min_y,
             max_x,
@@ -772,9 +773,9 @@ mod tests {
             prepared.finish(&mut line);
 
             let mut rejected = original;
-            rejected.drawmode0.0 |= 1 << 15;
+            rejected.drawmode0.0 |= 1 << 6;
             let unchanged = rejected;
-            assert_eq!(prepare_line(&rejected).unwrap_err(), "draw mode 0");
+            assert_eq!(prepare_line(&rejected).unwrap_err(), "host transfer");
             assert_eq!(rejected.xstart, unchanged.xstart);
             assert_eq!(rejected.ystart, unchanged.ystart);
             assert_eq!(rejected.bresd, unchanged.bresd);

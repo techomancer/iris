@@ -1833,7 +1833,8 @@ fn draw_line_bresenham<M: Mode>(
     // integer deltas can say the other axis is longer.
     let major = if fract { if y_major { ady } else { adx } } else { adx.max(ady) };
     let mut pixel_count = major + 1;
-    if m.length32() != 0 && pixel_count > 32 {
+    let length32_truncated = m.length32() != 0 && pixel_count > 32;
+    if length32_truncated {
         pixel_count = 32;
     }
 
@@ -1893,7 +1894,7 @@ fn draw_line_bresenham<M: Mode>(
         // implementations only guarantee landing in the endpoint's pixel *column/row*,
         // not its exact minor-axis coordinate).
         debug_assert!(
-            fract || iterate_one || !is_last || (x == x2 && y == y2),
+            fract || iterate_one || length32_truncated || !is_last || (x == x2 && y == y2),
             "I_LINE bres mismatch: pos ({},{}) != end ({},{})", x, y, x2, y2
         );
 
