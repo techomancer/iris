@@ -270,6 +270,10 @@ pub(super) const TRACEBACK_SIZE: usize = 1048576; // 1M entries
 /// instruction is (an entry word reached as a back-edge has different live
 /// state than one reached externally; a fallback successor is architecturally
 /// a delay slot even though its own raw bits don't look like one).
+///
+/// The discriminants are the codes `codegen::dev_trace_origin` bakes into
+/// compiled code, so `origin as u32` and [`InstrOrigin::from_u32`] are inverses
+/// and the traceback ring can store the code as it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum InstrOrigin {
@@ -277,11 +281,11 @@ pub(crate) enum InstrOrigin {
     /// word's *external* arrival (step() records it before ever handing off
     /// to JIT-compiled code, so the JIT never double-records it).
     #[default]
-    Interp,
+    Interp = 0,
     /// A plain (non-entry, non-slot) instruction inside a compiled region —
     /// the common case, recorded by `emit_dev_trace_bp` in the pass-2 head
     /// loop.
-    Jit,
+    Jit = 1,
     /// A compiled region's entry word, reached via the compiled function's
     /// own dispatch-head `Switch` — a real external arrival (jumping
     /// straight into `jit_fn` for the first time this exact PC was reached
@@ -294,30 +298,30 @@ pub(crate) enum InstrOrigin {
     /// before this variant existed (a real external dispatch landing on this
     /// exact word) — just resolved into a compiled function instead of the
     /// interpreter.
-    JitEntry,
+    JitEntry = 7,
     /// The region's entry word, but reached via an *internal* in-region edge
     /// (a backward branch looping to the top of the same compiled function)
     /// rather than step()'s external dispatch — still JIT-executed, still
     /// worth distinguishing from a plain interior instruction since entry
     /// words get special foreign-slot/exception handling.
-    JitEntryBackEdge,
+    JitEntryBackEdge = 2,
     /// A delay slot's own instruction, inlined into its branch/jump/regjump's
     /// compiled unit (`emit_slot_semantics`) — architecturally a distinct
     /// instruction from its branch, with its own address and (for lockstep)
     /// its own verification.
-    JitDelaySlot,
+    JitDelaySlot = 3,
     /// An interpreter-fallback head (`Classify::Excluded`, kept in-region) —
     /// runs through `interp_dispatch_one`, not native codegen, but still
     /// inside a compiled region's dispatch, distinct from a plain step().
-    FallbackWord,
+    FallbackWord = 4,
     /// The word immediately after a fallback that is itself a branch (BC1) —
     /// architecturally a delay slot (`is_branch_fallback_successor`), reached
     /// externally the first time (from the fallback's own interpreter run).
-    FallbackSuccessor,
+    FallbackSuccessor = 5,
     /// A fallback successor reached via an internal in-region back-edge,
     /// same distinction as `JitEntryBackEdge` but for a fallback successor
     /// word instead of the region's own entry word.
-    FallbackSuccessorBackEdge,
+    FallbackSuccessorBackEdge = 6,
 }
 
 impl InstrOrigin {
@@ -334,15 +338,14 @@ impl InstrOrigin {
         }
     }
 
-    /// Decode the `origin` code `emit_dev_trace_bp`'s codegen call sites pass
-    /// (a compile-time constant baked in per call site — see
+    /// Decode an origin code: the one `emit_dev_trace_bp`'s codegen call sites
+    /// pass, and the one the traceback ring stores (a compile-time constant baked in per call site — see
     /// `codegen::core_offset_of_dev_trace_bp_fn`'s callers). `u32`,
     /// deliberately not `u8` — see `MipsCore::dev_trace_bp_fn`'s doc comment.
     /// Any value outside the known set (shouldn't happen — every call site
     /// uses one of `dev_trace_origin`'s constants) falls back to `Jit` rather
     /// than panicking, since this runs inside an `extern "C"` hook where
     /// unwinding aborts the process.
-    #[cfg(all(feature = "jitv2", feature = "developer"))]
     pub(super) fn from_u32(v: u32) -> Self {
         match v {
             0 => InstrOrigin::Interp,
@@ -365,8 +368,13 @@ pub(super) struct TracebackEntry {
     pub(super) origin: InstrOrigin,
 }
 
+/// The ring stores each entry as two words, `pc` and `instr | origin << 32`,
+/// so the 1M-entry buffer is a zeroed allocation the OS hands out lazily.
+/// A `Vec<TracebackEntry>` filled with `default()` is written element by
+/// element, which in a debug build costs tens of milliseconds for every
+/// executor a test builds.
 pub(super) struct TracebackBuffer {
-    pub(super) entries: Vec<TracebackEntry>,
+    entries: Vec<[u64; 2]>,
     pub(super) head: usize,
     pub(super) count: usize,
 }
@@ -374,14 +382,14 @@ pub(super) struct TracebackBuffer {
 impl TracebackBuffer {
     pub(super) fn new() -> Self {
         Self {
-            entries: vec![TracebackEntry::default(); TRACEBACK_SIZE],
+            entries: vec![[0u64; 2]; TRACEBACK_SIZE],
             head: 0,
             count: 0,
         }
     }
 
     pub(super) fn push(&mut self, pc: u64, instr: u32, origin: InstrOrigin) {
-        self.entries[self.head] = TracebackEntry { pc, instr, origin };
+        self.entries[self.head] = [pc, instr as u64 | (origin as u64) << 32];
         self.head = (self.head + 1) % TRACEBACK_SIZE;
         if self.count < TRACEBACK_SIZE {
             self.count += 1;
@@ -394,7 +402,8 @@ impl TracebackBuffer {
 
         for i in 0..count {
             let idx = (self.head + TRACEBACK_SIZE - 1 - i) % TRACEBACK_SIZE;
-            result.push(self.entries[idx]);
+            let [pc, word] = self.entries[idx];
+            result.push(TracebackEntry { pc, instr: word as u32, origin: InstrOrigin::from_u32((word >> 32) as u32) });
         }
         result.reverse();
         result
@@ -524,4 +533,34 @@ pub struct Breakpoint {
     pub hits: u64,
     /// Matches still to let pass before stopping (`bp ignore`).
     pub ignore: u64,
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    /// The ring stores the origin's numeric code and decodes it with `from_u32`;
+    /// a variant whose code differs from the JIT's would read back as another.
+    #[test]
+    fn every_origin_survives_the_traceback_ring() {
+        let all = [
+            InstrOrigin::Interp,
+            InstrOrigin::Jit,
+            InstrOrigin::JitEntry,
+            InstrOrigin::JitEntryBackEdge,
+            InstrOrigin::JitDelaySlot,
+            InstrOrigin::FallbackWord,
+            InstrOrigin::FallbackSuccessor,
+            InstrOrigin::FallbackSuccessorBackEdge,
+        ];
+        let mut ring = TracebackBuffer::new();
+        for (i, o) in all.iter().enumerate() {
+            ring.push(0x8000_0000 + i as u64 * 4, i as u32, *o);
+        }
+        let back: Vec<_> = ring.get_last(all.len()).iter().map(|e| e.origin).collect();
+        assert_eq!(back, all);
+        for (i, e) in ring.get_last(all.len()).iter().enumerate() {
+            assert_eq!((e.pc, e.instr), (0x8000_0000 + i as u64 * 4, i as u32));
+        }
+    }
 }
