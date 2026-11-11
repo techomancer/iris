@@ -21,10 +21,12 @@ use crate::wgpu::tiles::{COARSE, LIST_CAP, MASK_WORDS, TILE_H, TILE_W};
 use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileGrid};
 
 use super::command::{
-    COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE, COMMAND_I_LINE,
-    COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING, FLAG_LINE_Y_MAJOR, FLAG_WRITE_AUX,
-    FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand,
-    RexStateSlot, STATE_SOURCE_COLOR, STATE_WORDS, STATE_WRITE_MASK,
+    cid_test, COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE,
+    COMMAND_I_LINE, COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING, FLAG_LINE_Y_MAJOR,
+    FLAG_READ_AUX, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS,
+    PayloadBatch, RexCommand, RexStateSlot, STATE_CLIP_MODE, STATE_SMASK0X,
+    STATE_SMASK0Y, STATE_SMASK1X, STATE_SOURCE_COLOR, STATE_WORDS, STATE_WRITE_MASK,
+    STATE_XYWIN,
 };
 use super::line::prepare_line;
 
@@ -806,10 +808,16 @@ impl ResidentGpu {
                 ("REX_COMMAND_A_LINE", COMMAND_A_LINE),
                 ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
                 ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
+                ("REX_FLAG_READ_AUX", FLAG_READ_AUX),
                 ("REX_FLAG_LINE_Y_MAJOR", FLAG_LINE_Y_MAJOR),
                 ("REX_FLAG_LINE_MAJOR_DECREASING", FLAG_LINE_MAJOR_DECREASING),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),
+                ("REX_STATE_CLIP_MODE", STATE_CLIP_MODE as u32),
                 ("REX_STATE_WRITE_MASK", STATE_WRITE_MASK as u32),
+                ("REX_STATE_XYWIN", STATE_XYWIN as u32),
+                ("REX_STATE_SMASK0X", STATE_SMASK0X as u32),
+                ("REX_STATE_SMASK0Y", STATE_SMASK0Y as u32),
+                ("REX_STATE_SMASK1X", STATE_SMASK1X as u32),
                 ("REX_STATE_SOURCE_COLOR", STATE_SOURCE_COLOR as u32),
             ],
             layouts: &[&layout],
@@ -1014,7 +1022,7 @@ impl ResidentGpu {
                     line.min_y,
                     line.max_x,
                     line.max_y,
-                    |slot| RexCommand::line(slot, line, payload),
+                    |slot| RexCommand::line(slot, line, payload, cid_test(context.clipmode)),
                 );
                 match result {
                     Ok(Some(_)) => break,
@@ -1069,7 +1077,7 @@ impl ResidentBackend for ResidentGpu {
                     fill.min_y as i32,
                     (fill.min_x + fill.width - 1) as i32,
                     (fill.min_y + fill.height - 1) as i32,
-                    |slot| RexCommand::flat_fill(slot, fill),
+                    |slot| RexCommand::flat_fill(slot, fill, cid_test(context.clipmode)),
                 );
                 match result {
                     Ok(Some(_)) => break,

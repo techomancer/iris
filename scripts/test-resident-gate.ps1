@@ -73,7 +73,7 @@ try {
     Invoke-ResidentTests 'direct_ng1_scanout_' 3 $false
     foreach ($name in $requestedBackends) {
         $env:REX3_RESIDENT_BACKEND = $name
-        Invoke-ResidentTests 'resident_gpu_' 11 $true
+        Invoke-ResidentTests 'resident_gpu_' 12 $true
         Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 8 $true
     }
 } finally {

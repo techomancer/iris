@@ -851,23 +851,17 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
             Err(ResidentError::DeviceMismatch)
         ));
         let before_rejection = resident.status().unwrap();
-        for clipmode in [
-            (0xf << CLIPMODE_CIDMATCH_SHIFT) | CLIPMODE_ENSMASK_SMASK0,
-            (0xf << CLIPMODE_CIDMATCH_SHIFT) | (1 << 1),
-            0,
-        ] {
-            let mut unsupported = context(
-                DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
-            );
-            unsupported.clipmode = clipmode;
-            let unchanged = unsupported;
-            assert_eq!(resident.enqueue(&mut unsupported), Err(ResidentError::Unsupported("clip mode")));
-            assert_context_eq(&unsupported, &unchanged, "rejected scissor/CID mode");
-            let status = resident.status().unwrap();
-            assert_eq!(status.accepted, before_rejection.accepted);
-            assert_eq!(status.observations, before_rejection.observations);
-            assert_eq!(status.raw_plane_map_attempts, before_rejection.raw_plane_map_attempts);
-        }
+        let mut unsupported = context(
+            DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
+        );
+        unsupported.drawmode0.0 |= 1 << 12;
+        let unchanged = unsupported;
+        assert_eq!(resident.enqueue(&mut unsupported), Err(ResidentError::Unsupported("draw mode 0")));
+        assert_context_eq(&unsupported, &unchanged, "rejected stipple mode");
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted, before_rejection.accepted);
+        assert_eq!(status.observations, before_rejection.observations);
+        assert_eq!(status.raw_plane_map_attempts, before_rejection.raw_plane_map_attempts);
         gpu.check().unwrap();
     });
 }
@@ -975,6 +969,117 @@ fn resident_gpu_lines_match_complete_cpu_planes() {
         compare_observed(lines.aux().unwrap(), &expected_aux, "auxiliary lines");
         let status = resident.status().unwrap();
         assert_eq!(status.accepted.sequence, Sequence(draws));
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(status.completed, Some(status.submitted));
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_clipping_matches_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x5ca1_37e9);
+        let seed_aux = seeded_plane(0xa35e_c816);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            8,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate clipped resident planes");
+        let range = |min: i32, max: i32| {
+            ((min as i16 as u16 as u32) << 16) | max as i16 as u16 as u32
+        };
+
+        let mut block = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (20, 20),
+            (45, 40),
+            0xff0f_ffff,
+            0x6a31_72b4,
+        );
+        block.drawmode0.0 |= 1 << 20;
+        block.xymove = ((3i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+        block.xywin = ((5i16 as u16 as u32) << 16) | 4;
+        block.smask0x = range(REX3_COORD_BIAS + 25, REX3_COORD_BIAS + 43);
+        block.smask0y = range(REX3_COORD_BIAS + 20, REX3_COORD_BIAS + 35);
+        block.smask1x = range(REX3_COORD_BIAS + 30, REX3_COORD_BIAS + 36);
+        block.smask1y = range(REX3_COORD_BIAS + 22, REX3_COORD_BIAS + 42);
+        block.smask2x = range(REX3_COORD_BIAS + 40, REX3_COORD_BIAS + 50);
+        block.smask2y = range(REX3_COORD_BIAS + 25, REX3_COORD_BIAS + 32);
+        block.clipmode = CLIPMODE_ENSMASK_SMASK0 | (1 << 1) | (1 << 2) | (0b1010 << CLIPMODE_CIDMATCH_SHIFT);
+        let mut expected = block;
+        resident.enqueue(&mut block).expect("enqueue clipped block");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&block, &expected, "clipped block context");
+
+        let mut line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (60 * 16, 50 * 16),
+            (100 * 16, 70 * 16),
+            0x00ff_ffff,
+            0x5531_97c2,
+        );
+        line.drawmode0.0 |= 1 << 20;
+        line.xymove = ((-4i16 as u16 as u32) << 16) | 3;
+        line.xywin = ((2i16 as u16 as u32) << 16) | (-1i16 as u16 as u32);
+        line.smask0x = range(REX3_COORD_BIAS + 64, REX3_COORD_BIAS + 92);
+        line.smask0y = range(REX3_COORD_BIAS + 53, REX3_COORD_BIAS + 72);
+        line.smask1x = range(REX3_COORD_BIAS + 68, REX3_COORD_BIAS + 82);
+        line.smask1y = range(REX3_COORD_BIAS + 55, REX3_COORD_BIAS + 65);
+        line.smask2x = range(REX3_COORD_BIAS + 83, REX3_COORD_BIAS + 96);
+        line.smask2y = range(REX3_COORD_BIAS + 61, REX3_COORD_BIAS + 72);
+        line.clipmode = CLIPMODE_ENSMASK_SMASK0 | (1 << 1) | (1 << 2) | (0b0101 << CLIPMODE_CIDMATCH_SHIFT);
+        let mut expected = line;
+        resident.enqueue(&mut line).expect("enqueue clipped line");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&line, &expected, "clipped line context");
+
+        let mut cid = context(
+            DRAWMODE1_PLANES_CID,
+            false,
+            false,
+            (120, 80),
+            (135, 90),
+            0x0000_0003,
+            0x0000_0003,
+        );
+        let mut expected = cid;
+        resident.enqueue(&mut cid).expect("enqueue CID update");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&cid, &expected, "CID update context");
+
+        let mut ordered = context(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (120, 80),
+            (135, 90),
+            u32::MAX,
+            0x7f42_68ac,
+        );
+        ordered.clipmode = 1 << (CLIPMODE_CIDMATCH_SHIFT + 3);
+        let mut expected = ordered;
+        resident.enqueue(&mut ordered).expect("enqueue ordered CID-tested fill");
+        cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&ordered, &expected, "ordered CID fill context");
+
+        resident.submit().unwrap();
+        assert_eq!(resident.batch.prims_total, 4);
+        gpu.wait(None).unwrap();
+        let clipped = resident.observe(ObservationReason::Validation, PlaneMask::Both).unwrap();
+        compare_observed(clipped.rgb().unwrap(), &expected_rgb, "clipped RGB");
+        compare_observed(clipped.aux().unwrap(), &expected_aux, "clipped auxiliary");
+        let status = resident.status().unwrap();
+        assert_eq!(status.accepted.sequence, Sequence(4));
         assert_eq!(status.submitted, status.accepted);
         assert_eq!(status.completed, Some(status.submitted));
     });

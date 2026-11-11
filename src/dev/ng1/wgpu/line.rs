@@ -1,10 +1,10 @@
 use crate::dev::ng1::rex3::{
-    bres_straight_on_zero, Rex3Context, CLIPMODE_CIDMATCH_MASK, CLIPMODE_CIDMATCH_SHIFT,
-    CLIPMODE_ENSMASK_MASK, DRAWMODE0_ADRMODE_A_LINE, DRAWMODE0_ADRMODE_F_LINE,
-    DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW, DRAWMODE1_COMPARE_DISABLE,
-    DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC, DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY,
-    DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA, REX3_BRES_OCTANTS,
-    REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
+    bres_straight_on_zero, Rex3Context, DRAWMODE0_ADRMODE_A_LINE,
+    DRAWMODE0_ADRMODE_F_LINE, DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW,
+    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC,
+    DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP,
+    DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA, REX3_BRES_OCTANTS, REX3_COORD_BIAS,
+    REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
 use crate::dev::ng1::rex3_flat_fill::FillPlane;
 
@@ -49,6 +49,8 @@ struct LineGeometry {
     pixel_count: u32,
     skip_first: bool,
     skip_last: bool,
+    x_move: i32,
+    y_move: i32,
     x_window: i32,
     y_window: i32,
 }
@@ -66,9 +68,9 @@ impl LineGeometry {
 
     fn start_major(self) -> i32 {
         if self.y_major {
-            self.y + self.y_window - REX3_COORD_BIAS
+            self.y + self.y_move + self.y_window - REX3_COORD_BIAS
         } else {
-            self.x + self.x_window - REX3_COORD_BIAS
+            self.x + self.x_move + self.x_window - REX3_COORD_BIAS
         }
     }
 
@@ -111,8 +113,10 @@ impl Iterator for LinePixels {
             x: self.x,
             y: self.y,
             d: self.d,
-            physical_x: self.x + self.geometry.x_window - REX3_COORD_BIAS,
-            physical_y: self.y + self.geometry.y_window - REX3_COORD_BIAS,
+            physical_x: self.x + self.geometry.x_move + self.geometry.x_window
+                - REX3_COORD_BIAS,
+            physical_y: self.y + self.geometry.y_move + self.geometry.y_window
+                - REX3_COORD_BIAS,
             skip: (self.index == 0 && self.geometry.skip_first)
                 || (last && self.geometry.skip_last),
         };
@@ -228,7 +232,6 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         || dm0.lsopaque()
         || dm0.shade()
         || dm0.lronly()
-        || dm0.xyoffset()
         || dm0.ciclamp()
         || dm0.ystride()
     {
@@ -257,12 +260,6 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
     {
         return Err("pixel operation");
     }
-    if context.clipmode & CLIPMODE_ENSMASK_MASK != 0
-        || context.clipmode & CLIPMODE_CIDMATCH_MASK != 0xF << CLIPMODE_CIDMATCH_SHIFT
-    {
-        return Err("clip mode");
-    }
-
     let x = context.xstart >> 11;
     let y = context.ystart >> 11;
     let x_end = context.xend >> 11;
@@ -278,6 +275,16 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
     };
     let pixel_count = u32::try_from(major + 1).map_err(|_| "line length")?;
     let endpoint_skip = endpoint_skips(context, kind);
+    let x_move = if dm0.xyoffset() {
+        (context.xymove >> 16) as i16 as i32
+    } else {
+        0
+    };
+    let y_move = if dm0.xyoffset() {
+        context.xymove as i16 as i32
+    } else {
+        0
+    };
     let x_window = (context.xywin >> 16) as i16 as i32;
     let y_window = context.xywin as i16 as i32;
     let geometry = LineGeometry {
@@ -295,6 +302,8 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         pixel_count,
         skip_first: dm0.skipfirst() || endpoint_skip.0,
         skip_last: dm0.skiplast() || endpoint_skip.1,
+        x_move,
+        y_move,
         x_window,
         y_window,
     };
@@ -387,7 +396,7 @@ fn endpoint_skips(context: &Rex3Context, kind: LineKind) -> (bool, bool) {
 mod tests {
     use super::*;
     use crate::dev::ng1::rex3::{
-        DrawMode0, DrawMode1, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_F_LINE_SH,
+        DrawMode0, DrawMode1, CLIPMODE_CIDMATCH_SHIFT, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_F_LINE_SH,
         DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE1_COMPARE_DISABLE_SH, DRAWMODE1_LOGICOP_SRC_SH,
     };
     use crate::dev::ng1::rex3_generic::{draw_with_fb, fline_setup, Framebuffers};
@@ -576,6 +585,8 @@ mod tests {
                 (20 * 16 + 3, 30 * 16 + 11),
                 (31 * 16 + 13, 36 * 16 + 2),
             );
+            fractional.drawmode0.0 |= 1 << 20;
+            fractional.xymove = ((-4i16 as u16 as u32) << 16) | 2;
             fractional.xywin = ((2i16 as u16 as u32) << 16) | (-3i16 as u16 as u32);
             fractional.bresrndinc2.set_rnd(0xa5);
             fline_setup(&mut fractional);

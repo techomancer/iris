@@ -33,6 +33,57 @@ var<private> in_bounds: bool;
 var<private> rgb_written: bool;
 var<private> aux_written: bool;
 
+fn high_i16(value: u32) -> i32 {
+    return bitcast<i32>(value) >> 16;
+}
+
+fn low_i16(value: u32) -> i32 {
+    return bitcast<i32>(value << 16u) >> 16;
+}
+
+fn inside_rect(x: i32, y: i32, sx: u32, sy: u32) -> bool {
+    return x >= high_i16(sx) && x <= low_i16(sx)
+        && y >= high_i16(sy) && y <= low_i16(sy);
+}
+
+fn clip_allows(state: RexStateSlot, px: i32, py: i32) -> bool {
+    let clipmode = state.words[REX_STATE_CLIP_MODE];
+    let enabled = clipmode & 0x1fu;
+    let xywin = state.words[REX_STATE_XYWIN];
+    let x_abs = px + 4096;
+    let y_abs = py + 4096;
+    let x_curr = x_abs - high_i16(xywin);
+    let y_curr = y_abs - low_i16(xywin);
+    if (enabled & 1u) != 0u
+        && !inside_rect(
+            x_curr,
+            y_curr,
+            state.words[REX_STATE_SMASK0X],
+            state.words[REX_STATE_SMASK0Y],
+        ) {
+        return false;
+    }
+
+    if (enabled & 0x1eu) != 0u {
+        var inside_any = false;
+        for (var index = 0u; index < 4u; index++) {
+            if (enabled & (1u << (index + 1u))) != 0u {
+                let offset = REX_STATE_SMASK1X + index * 2u;
+                inside_any = inside_any || inside_rect(
+                    x_abs,
+                    y_abs,
+                    state.words[offset],
+                    state.words[offset + 1u],
+                );
+            }
+        }
+        if !inside_any {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn arch_tile_begin(tile: u32, px: i32, py: i32, lane: u32) {
     in_bounds = px >= 0 && py >= 0 && u32(px) < WRITE_WIDTH && u32(py) < PLANE_HEIGHT;
     rgb_written = false;
@@ -68,6 +119,12 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
         && px >= command.dst_x0 && px <= command.dst_x1
         && py >= command.dst_y0 && py <= command.dst_y1 {
         let state = states[command.state_slot];
+        let cid_mask = (state.words[REX_STATE_CLIP_MODE] >> 9u) & 0xfu;
+        let cid_allows = (command.flags & REX_FLAG_READ_AUX) == 0u
+            || (cid_mask & (1u << (aux_value & 3u))) != 0u;
+        if !clip_allows(state, px, py) || !cid_allows {
+            return;
+        }
         let mask = state.words[REX_STATE_WRITE_MASK];
         let color = state.words[REX_STATE_SOURCE_COLOR];
         if (command.flags & REX_FLAG_WRITE_RGB) != 0u {
