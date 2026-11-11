@@ -193,7 +193,10 @@ impl Board {
         let bytes = 2u8 << ((fmt >> 13) & 7);
         // The field's packing: the pixel mode's when the transfer goes to the
         // surface it selects (the library selects a level before it uploads
-        // to it), else what word 4's code and class name.
+        // to it) and the mode's field there is word 4's size, else what word
+        // 4's code and class name. The X server puts a TrueColor window's
+        // image straight after drawing in an index window, with the index
+        // mode still selected (traced: 4Dwm's icons).
         let mode = Format::decode(self.pixel_mode[2]);
         let layout = super::field::Layout::of(mode);
         let selected = !drawable && addr == self.pixel_mode[0] & ADDR_MASK;
@@ -209,7 +212,7 @@ impl Board {
             if drawable && read {
                 return self.drawable_codec(origin.0, origin.1, at).filter(|c| super::copy::codec_bytes(*c) == bytes).unwrap_or(named);
             }
-            match [layout.front, layout.back].into_iter().find(|f| selected && f.at == at) {
+            match [layout.front, layout.back].into_iter().find(|f| selected && f.at == at && super::copy::codec_bytes(f.codec) == bytes) {
                 Some(f) => f.codec,
                 None => named,
             }
