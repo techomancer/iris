@@ -495,6 +495,48 @@ impl Bedrock {
         }
         self.peer().is_some_and(|peer| peer.interrupt(pi, value))
     }
+    /// A block of doublewords arriving from widget `source`'s device
+    /// `device`, into memory below bit 47: the admission check and the range
+    /// check once, then the whole block to the DMA view. A block that starts
+    /// in the register-packet space is that many single-word packets, each
+    /// taking the single-word path; one that runs from memory into that
+    /// space, or leaves the 48-bit space, is refused.
+    pub fn inbound_read_block(&self, source: u8, device: Option<u8>, address: u64, buf: &mut [u64]) -> u32 {
+        if address & (1 << 47) != 0 {
+            for (i, word) in buf.iter_mut().enumerate() {
+                let r = self.inbound(source, device, address.wrapping_add(8 * i as u64), 8, None);
+                if r.status != BUS_OK {
+                    return r.status;
+                }
+                *word = r.data;
+            }
+            return BUS_OK;
+        }
+        self.inbound_block(source, device, address, buf.len(), |dma| dma.read_block(address, buf)).unwrap_or(BUS_ERR)
+    }
+    /// The write twin of [`Self::inbound_read_block`].
+    pub fn inbound_write_block(&self, source: u8, device: Option<u8>, address: u64, buf: &[u64]) -> u32 {
+        if address & (1 << 47) != 0 {
+            for (i, &word) in buf.iter().enumerate() {
+                let status = self.inbound(source, device, address.wrapping_add(8 * i as u64), 8, Some(word)).status;
+                if status != BUS_OK {
+                    return status;
+                }
+            }
+            return BUS_OK;
+        }
+        self.inbound_block(source, device, address, buf.len(), |dma| dma.write_block(address, buf)).unwrap_or(BUS_ERR)
+    }
+    fn inbound_block<R>(&self, widget: u8, device: Option<u8>, address: u64, words: usize, f: impl FnOnce(&dyn BusDevice) -> R) -> Option<R> {
+        let bytes = (words as u64).checked_mul(8)?;
+        if address >= (1 << 48) || bytes > (1 << 48) - address || !self.io.admits(widget, device) {
+            return None;
+        }
+        if bytes > (1 << 47) - address {
+            return None;
+        }
+        Some(f(self.memory()))
+    }
     /// An interrupt packet to PI `pi`'s pending-modify register; whether the
     /// PI took it.
     fn interrupt(&self, pi: usize, value: u64) -> bool {
@@ -881,6 +923,12 @@ impl WidgetDma {
     }
 }
 impl BusDevice for WidgetDma {
+    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
+        self.chip.upgrade().map_or(BUS_ERR, |chip| chip.inbound_read_block(self.widget, None, a, buf))
+    }
+    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
+        self.chip.upgrade().map_or(BUS_ERR, |chip| chip.inbound_write_block(self.widget, None, a, buf))
+    }
     face_access!(read8, write8, u8, BusRead8, 1);
     face_access!(read16, write16, u16, BusRead16, 2);
     face_access!(read32, write32, u32, BusRead32, 4);

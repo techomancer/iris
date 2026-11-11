@@ -381,25 +381,15 @@ impl Io {
             b.status = remaining | ERROR;
         } else {
             while remaining != 0 {
+                // A line is read whole, then written whole, in order, so a
+                // destination that overlaps the source behaves as it always did.
                 let mut line = [0u64; 16];
                 let mut status = BUS_OK;
                 if b.control & 1 == 0 {
-                    for (i, v) in line.iter_mut().enumerate() {
-                        let r = memory.read64(b.source + i as u64 * 8);
-                        status = r.status;
-                        if status != BUS_OK {
-                            break;
-                        }
-                        *v = r.data;
-                    }
+                    status = memory.read_block(b.source, &mut line);
                 }
                 if status == BUS_OK {
-                    for (i, v) in line.into_iter().enumerate() {
-                        status = memory.write64(b.destination + i as u64 * 8, v);
-                        if status != BUS_OK {
-                            break;
-                        }
-                    }
+                    status = memory.write_block(b.destination, &line);
                 }
                 if status != BUS_OK {
                     break;
@@ -544,6 +534,13 @@ mod tests {
             assert_eq!(chip.inbound_read(14, Some(2), 0x80, 8).status, BUS_ERR);
             assert_eq!(chip.inbound_read(14, None, 0x80, 8).status, BUS_ERR);
             assert_eq!(chip.inbound_read(14, Some(1), 0x80, 8).status, BUS_OK);
+            // A block needs the same admission, and a refused one touches nothing.
+            assert_eq!(chip.inbound_write_block(14, Some(2), 0x2000, &[1, 2]), BUS_ERR);
+            assert_eq!(chip.inbound_write_block(14, None, 0x2000, &[1, 2]), BUS_ERR);
+            assert_eq!(chip.inbound_read_block(14, Some(2), 0x80, &mut [0]), BUS_ERR);
+            assert_eq!(chip.dma_view().read64(0x2000).data, 0);
+            assert_eq!(chip.inbound_write_block(14, Some(1), 0x2000, &[1, 2]), BUS_OK);
+            assert_eq!(chip.dma_view().read64(0x2008).data, 2);
             // An interrupt packet to PI0's pending-modify register sets bank 0 bit 35.
             let a = (1 << 47) | 0x1800090;
             assert_eq!(chip.inbound_write(15, Some(0), a, 8, 0x123), BUS_OK);
@@ -609,6 +606,25 @@ mod tests {
             launch(&rig, reg::BTE1_BASE, 0, 0, 0, 0, 0x10);
             assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 0);
         }
+    }
+    /// The copy goes a line at a time, read whole and then written whole: a
+    /// destination one line above its source repeats the first line down the
+    /// range.
+    #[test]
+    fn the_bte_copies_line_by_line_so_an_overlapping_destination_repeats_the_first_line() {
+        let rig = rig();
+        let m = rig.chip.dma_view();
+        let line = |n: u64| 0x1000 + n * 128;
+        for i in 0..16 {
+            m.write64(line(0) + i * 8, 0xa0 + i);
+        }
+        launch(&rig, reg::BTE1_BASE, 4, line(0), line(1), 0, 0x10);
+        for n in 1..5 {
+            for i in 0..16 {
+                assert_eq!(m.read64(line(n) + i * 8).data, 0xa0 + i, "line {n} word {i}");
+            }
+        }
+        assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 0);
     }
     /// A widget that is busy answers busy through PIO, so the CPU retries.
     #[test]

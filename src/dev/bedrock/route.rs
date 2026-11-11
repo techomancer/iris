@@ -700,6 +700,26 @@ mod tests {
         assert_eq!(dma(&a, node_at(1) + PROBE), None, "a downed link carries nothing");
     }
 
+    /// A block of inbound DMA goes where its node number sends it, as its
+    /// words one at a time do: across the cable into the peer's memory, and
+    /// nothing at all once the link is down.
+    #[test]
+    fn an_inbound_block_crosses_the_cable_by_node_number() {
+        let (a, b) = pair();
+        number(&b, 1);
+        let words = [0x1111, 0x2222, 0x3333, 0x4444];
+        assert_eq!(a.chip.inbound_write_block(15, Some(0), node_at(1) + 0x9000, &words), BUS_OK);
+        for (i, &w) in words.iter().enumerate() {
+            assert_eq!(b.chip.dma_view().read64(0x9000 + 8 * i as u64).data, w, "word {i} lands on node 1");
+            assert_eq!(a.chip.dma_view().read64(0x9000 + 8 * i as u64).data, 0, "not on the writer's own node");
+        }
+        let mut back = [0; 4];
+        assert_eq!(a.chip.inbound_read_block(15, Some(0), node_at(1) + 0x9000, &mut back), BUS_OK);
+        assert_eq!(back, words);
+        a.chip.set_link(false);
+        assert_eq!(a.chip.inbound_write_block(15, Some(0), node_at(1) + 0x9000, &words), BUS_ERR, "a downed link carries nothing");
+    }
+
     /// A chip with no cable keeps its DMA as it was: node-qualified addresses
     /// are not memory, whatever number the node carries.
     #[test]

@@ -366,6 +366,52 @@ fn both_ends_launching_at_once_complete() {
     }
 }
 
+/// An inbound block is the same traffic as its words one at a time: it
+/// stops at the end of the bank, delivers a packet that starts in the
+/// register-packet space as single words, and never runs from memory into
+/// that space.
+#[test]
+fn an_inbound_block_follows_the_rules_of_its_words() {
+    let rig = Rig::new();
+    let chip = &rig.chip;
+    rig.w(MD_BASE + md::CONFIG, 0x11);
+    let bank = 64u64 << 20;
+    let words = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x99, 0xaa];
+    assert_eq!(chip.inbound_write_block(14, Some(2), 0x1000, &words), BUS_OK);
+    for (i, &w) in words.iter().enumerate() {
+        assert_eq!(chip.inbound_read(14, Some(2), 0x1000 + 8 * i as u64, 8).data, w);
+    }
+    let mut back = [0; 4];
+    assert_eq!(chip.inbound_read_block(14, Some(2), 0x1000, &mut back), BUS_OK);
+    assert_eq!(back, words);
+    // The end of the bank: the words below it land, then the error.
+    assert_eq!(chip.inbound_write_block(14, Some(1), bank - 16, &words), BUS_ERR);
+    assert_eq!(chip.dma_view().read64(bank - 8).data, words[1]);
+    assert_eq!(chip.inbound_read_block(14, Some(1), bank - 16, &mut back), BUS_ERR);
+    // The packet space, the 48-bit limit and an empty block. A DMA engine
+    // that moves one doubleword to a PI's pending-modify register sends an
+    // interrupt packet, whichever way it hands the word over.
+    rig.w(pi::OFFSET_0010, 0);
+    assert_eq!(chip.inbound_write_block(15, Some(0), packet_address(0, 0), &[0x109]), BUS_ERR);
+    assert_eq!(rig.r(pi::PENDING_STATUS_A), 0);
+    rig.w(pi::OFFSET_0010, 1);
+    assert_eq!(chip.inbound_write_block(15, Some(0), packet_address(0, 0), &[0x109]), BUS_OK);
+    assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 9);
+    assert_eq!(chip.inbound_read_block(15, Some(0), packet_address(0, 0), &mut back[..1]), BUS_ERR);
+    assert_eq!(chip.inbound_write_block(14, Some(1), (1 << 47) - 8, &words[..2]), BUS_ERR);
+    assert_eq!(chip.inbound_write_block(14, Some(1), (1 << 48) - 8, &words[..2]), BUS_ERR);
+    assert_eq!(chip.inbound_read_block(14, Some(1), 0x1000, &mut []), BUS_OK);
+    // The widget's DMA face carries blocks the same way.
+    let rig = Rig::new();
+    rig.w(MD_BASE + md::CONFIG, 0x11);
+    let face = rig.chip.widget_dma(14);
+    assert_eq!(face.write_block(0x3000, &words), BUS_OK);
+    assert_eq!(face.read64(0x3008).data, words[1]);
+    assert_eq!(face.read_block(0x3000, &mut back), BUS_OK);
+    assert_eq!(back, words);
+    assert_eq!(face.read_block(bank, &mut back), BUS_ERR);
+}
+
 /// A test chip's configuration: the Fuel's one processor and one 64 MiB
 /// bank, on `clock`.
 pub(super) fn test_config(clock: Clock) -> BedrockConfig<'static> {

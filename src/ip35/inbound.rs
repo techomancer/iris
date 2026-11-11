@@ -8,7 +8,7 @@
 //! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::bedrock::Bedrock;
-use crate::traits::{BusDevice, BusRead64, BUS_OK};
+use crate::traits::{BusDevice, BusRead64, BUS_ERR, BUS_OK};
 use crate::xtalk::XtalkHost;
 use std::sync::{Arc, Weak};
 
@@ -18,8 +18,8 @@ pub(crate) const BEDROCK_PORT: XtalkHost =
     XtalkHost { widget: crate::dev::xbridge::HOST_WIDGET, int_packet: 0, int_packet_mask: 0, vectors: 256 };
 
 /// Bedrock as a widget sending through the XBridge reaches it: the
-/// widget's DMA as inbound reads and writes, a doubleword at a time where
-/// the transfer allows, and its interrupt packets as inbound doubleword
+/// widget's DMA as inbound reads and writes, or blocks of doublewords
+/// that take the admission and routing once, and its interrupt packets as inbound doubleword
 /// writes to the address they name. Bedrock checks the widget's
 /// permissions on each, for every master on the widget.
 pub(crate) struct Inbound {
@@ -59,24 +59,15 @@ impl BusDevice for Inbound {
     inbound_access!(read16, write16, u16, BusRead16, 2);
     inbound_access!(read32, write32, u32, BusRead32, 4);
     inbound_access!(read64, write64, u64, BusRead64, 8);
+    // A block takes Bedrock's admission and routing once, so a run that
+    // crosses the cable window goes where each word's node number sends it.
     fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
-        for (i, word) in buf.iter_mut().enumerate() {
-            let r = self.read64(a + 8 * i as u64);
-            if r.status != BUS_OK {
-                return r.status;
-            }
-            *word = r.data;
-        }
-        BUS_OK
+        let Some(bedrock) = self.bedrock.upgrade() else { return BUS_ERR };
+        bedrock.inbound_read_block(self.widget, None, a, buf)
     }
     fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
-        for (i, &word) in buf.iter().enumerate() {
-            let status = self.write64(a + 8 * i as u64, word);
-            if status != BUS_OK {
-                return status;
-            }
-        }
-        BUS_OK
+        let Some(bedrock) = self.bedrock.upgrade() else { return BUS_ERR };
+        bedrock.inbound_write_block(self.widget, None, a, buf)
     }
 }
 
