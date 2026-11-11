@@ -934,31 +934,38 @@ fn host_write_pixel(
         && (cid_mask & (1u << (destination_aux & 3u))) == 0u {
         return;
     }
-    if !alpha_allows(state, source) {
+    let fast_clear = (command.flags & REX_FLAG_FAST_CLEAR) != 0u;
+    if !fast_clear && !alpha_allows(state, source) {
         return;
     }
 
     let mask = state.words[REX_STATE_WRITE_MASK];
     if (command.flags & REX_FLAG_WRITE_RGB) != 0u {
         let old = rgb[destination_address];
-        let result = pixel_result(
-            state,
-            source,
-            old,
-            destination.x,
-            destination.y,
-        );
+        var result = source;
+        if !fast_clear {
+            result = pixel_result(
+                state,
+                source,
+                old,
+                destination.x,
+                destination.y,
+            );
+        }
         rgb[destination_address] = (old & ~mask) | (result & mask);
     }
     if (command.flags & REX_FLAG_WRITE_AUX) != 0u {
         let old = destination_aux;
-        let result = pixel_result(
-            state,
-            source,
-            old,
-            destination.x,
-            destination.y,
-        );
+        var result = source;
+        if !fast_clear {
+            result = pixel_result(
+                state,
+                source,
+                old,
+                destination.x,
+                destination.y,
+            );
+        }
         aux[destination_address] = (old & ~mask) | (result & mask);
     }
 }
@@ -1064,6 +1071,7 @@ fn host_invocation(
     let lr_skip = block
         && ((draw_mode >> 19u) & 1u) != 0u
         && x_decreasing;
+    let fast_clear = (command.flags & REX_FLAG_FAST_CLEAR) != 0u;
 
     var walk = input;
     let span_length = select(
@@ -1090,10 +1098,13 @@ fn host_invocation(
             block,
         );
         if !suppressed {
-            let pattern = host_pattern(state, walk);
+            var pattern = PatternResult(true, false);
+            if !fast_clear {
+                pattern = host_pattern(state, walk);
+            }
             if pattern.draws {
                 var source = state.words[REX_STATE_SOURCE_COLOR];
-                if ((draw_mode >> 18u) & 1u) != 0u {
+                if !fast_clear && ((draw_mode >> 18u) & 1u) != 0u {
                     source = host_shade_source(state, walk.shade);
                 }
                 if pattern.background {
@@ -1109,7 +1120,9 @@ fn host_invocation(
                     if alpha_host {
                         alpha = fetched.pixel >> 24u;
                     }
-                    source = (color & 0x00ffffffu) | (alpha << 24u);
+                    if !fast_clear {
+                        source = (color & 0x00ffffffu) | (alpha << 24u);
+                    }
                 }
                 host_write_pixel(state, command, walker, source);
             }
@@ -1338,19 +1351,23 @@ fn host_line_invocation(
     let round = (state.words[35] >> 24u) & 0xffu;
     let straight_on_zero =
         ((round >> host_line_round_bit(octant)) & 1u) == 0u;
+    let fast_clear = (command.flags & REX_FLAG_FAST_CLEAR) != 0u;
 
     var walk = input;
     for (var index = 0u; index < pixel_count; index++) {
         let last = index + 1u == pixel_count;
         let suppressed = (index == 0u && skip_first) || (last && skip_last);
         if !suppressed {
-            let pattern = host_pattern_bits(state, walk.pat_bit, walk.zpat_bit);
+            var pattern = PatternResult(true, false);
+            if !fast_clear {
+                pattern = host_pattern_bits(state, walk.pat_bit, walk.zpat_bit);
+            }
             if pattern.draws {
                 var source = state.words[REX_STATE_SOURCE_COLOR];
-                if shaded {
+                if !fast_clear && shaded {
                     source = host_shade_source(state, walk.shade);
                 }
-                if antialiased && !alpha_host {
+                if !fast_clear && antialiased && !alpha_host {
                     source = (source & 0x00ffffffu) | 0xff000000u;
                 }
                 if pattern.background {
@@ -1366,7 +1383,9 @@ fn host_line_invocation(
                     if alpha_host {
                         alpha = fetched.pixel >> 24u;
                     }
-                    source = (color & 0x00ffffffu) | (alpha << 24u);
+                    if !fast_clear {
+                        source = (color & 0x00ffffffu) | (alpha << 24u);
+                    }
                 }
                 host_write_pixel(
                     state,

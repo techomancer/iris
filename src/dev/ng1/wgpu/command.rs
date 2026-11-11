@@ -5,6 +5,8 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::dev::ng1::rex3::{Rex3Context, HOSTRW_BUF_QWORDS};
 use crate::dev::ng1::rex3_flat_fill::{FillKind, FillPlane, FlatFill};
+use crate::dev::ng1::rex3_generic::{fastclear_color, Mode};
+use crate::dev::ng1::rex3_shape;
 use crate::wgpu::Full;
 
 use super::copy::{CopyFill, CopyKind};
@@ -39,6 +41,7 @@ pub(super) const FLAG_LINE_MAJOR_DECREASING: u32 = 1 << 7;
 pub(super) const FLAG_SHADED: u32 = 1 << 8;
 pub(super) const FLAG_FILL_FIRST_ROW_COMPLETE: u32 = 1 << 9;
 pub(super) const FLAG_FILL_BLOCK: u32 = 1 << 10;
+pub(super) const FLAG_FAST_CLEAR: u32 = 1 << 11;
 
 pub(super) const STATE_WORDS: usize = 64;
 pub(super) const STATE_DRAW_MODE0: usize = 0;
@@ -295,6 +298,7 @@ impl RexCommand {
         state_slot: u32,
         fill: HostFill,
         payload: PayloadRef,
+        fast_clear: bool,
         cid_test: bool,
         read_destination: bool,
     ) -> Self {
@@ -307,6 +311,9 @@ impl RexCommand {
             FillPlane::Rgb => FLAG_WRITE_RGB,
             FillPlane::Aux => FLAG_WRITE_AUX,
         };
+        if fast_clear {
+            flags |= FLAG_FAST_CLEAR;
+        }
         if cid_test {
             flags |= FLAG_READ_AUX;
         }
@@ -330,6 +337,7 @@ impl RexCommand {
         state_slot: u32,
         line: LineCommand,
         payload: PayloadRef,
+        fast_clear: bool,
         cid_test: bool,
         read_destination: bool,
     ) -> Self {
@@ -343,6 +351,9 @@ impl RexCommand {
             FillPlane::Rgb => FLAG_WRITE_RGB,
             FillPlane::Aux => FLAG_WRITE_AUX,
         };
+        if fast_clear {
+            flags |= FLAG_FAST_CLEAR;
+        }
         if cid_test {
             flags |= FLAG_READ_AUX;
         }
@@ -422,8 +433,17 @@ impl RexStateSlot {
     }
 
     pub(super) fn for_host_fill(context: &Rex3Context) -> Self {
-        let source = (context.get_colori() & 0x00ff_ffff)
-            | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
+        let mode = rex3_shape::unpack(
+            context.drawmode0.0,
+            context.drawmode1.0,
+            context.clipmode,
+        );
+        let source = if mode.fastclear() != 0 {
+            fastclear_color(context, &mode)
+        } else {
+            (context.get_colori() & 0x00ff_ffff)
+                | (Rex3Context::clamp_color_component(context.coloralpha) << 24)
+        };
         Self::with_source_color(context, source)
     }
 
@@ -640,8 +660,9 @@ mod tests {
                 | FLAG_LINE_MAJOR_DECREASING
                 | FLAG_SHADED
                 | FLAG_FILL_FIRST_ROW_COMPLETE
-                | FLAG_FILL_BLOCK,
-            0x7ff,
+                | FLAG_FILL_BLOCK
+                | FLAG_FAST_CLEAR,
+            0xfff,
         );
         assert_eq!(size_of::<RexCommand>(), 16 * size_of::<u32>());
         assert_eq!(std::mem::offset_of!(RexCommand, state_slot), 4);
@@ -776,6 +797,7 @@ mod tests {
                 },
                 true,
                 true,
+                true,
             );
             assert_eq!(host_command.kind, COMMAND_HOST_BLOCK);
             assert_eq!(host_command.state_slot, 7);
@@ -789,14 +811,15 @@ mod tests {
                     | FLAG_BARRIER_AFTER
                     | FLAG_WRITE_RGB
                     | FLAG_READ_RGB
-                    | FLAG_READ_AUX,
+                    | FLAG_READ_AUX
+                    | FLAG_FAST_CLEAR,
             );
             let host = HostFill {
                 kind: HostKind::Span,
                 plane: FillPlane::Aux,
             };
             assert_eq!(
-                RexCommand::host_fill(0, host, PayloadRef::EMPTY, false, false).kind,
+                RexCommand::host_fill(0, host, PayloadRef::EMPTY, false, false, false).kind,
                 COMMAND_HOST_SPAN,
             );
 
@@ -819,7 +842,7 @@ mod tests {
                 offset: 17,
                 words: 19,
             };
-            let command = RexCommand::host_line(13, line, payload, true, true);
+            let command = RexCommand::host_line(13, line, payload, true, true, true);
             assert_eq!(command.kind, COMMAND_HOST_I_LINE);
             assert_eq!(command.state_slot, 13);
             assert_eq!(command.payload(), payload);
@@ -829,17 +852,18 @@ mod tests {
                     | FLAG_BARRIER_AFTER
                     | FLAG_WRITE_RGB
                     | FLAG_READ_RGB
-                    | FLAG_READ_AUX,
+                    | FLAG_READ_AUX
+                    | FLAG_FAST_CLEAR,
             );
             line.kind = LineKind::Fractional;
             line.plane = FillPlane::Aux;
             assert_eq!(
-                RexCommand::host_line(0, line, PayloadRef::EMPTY, false, false).kind,
+                RexCommand::host_line(0, line, PayloadRef::EMPTY, false, false, false).kind,
                 COMMAND_HOST_F_LINE,
             );
             line.kind = LineKind::Antialiased;
             assert_eq!(
-                RexCommand::host_line(0, line, PayloadRef::EMPTY, false, false).kind,
+                RexCommand::host_line(0, line, PayloadRef::EMPTY, false, false, false).kind,
                 COMMAND_HOST_A_LINE,
             );
         });

@@ -29,10 +29,9 @@ use super::command::{
     COMMAND_COPY_A_LINE, COMMAND_COPY_BLOCK, COMMAND_COPY_F_LINE, COMMAND_COPY_I_LINE,
     COMMAND_COPY_SPAN, COMMAND_HOST_A_LINE, COMMAND_HOST_BLOCK, COMMAND_HOST_F_LINE,
     COMMAND_HOST_I_LINE, COMMAND_HOST_SPAN, COMMAND_I_LINE, COMMAND_SPAN,
-    FLAG_LINE_MAJOR_DECREASING,
-    FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_LINE_Y_MAJOR, FLAG_READ_AUX,
-    FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
-    MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
+    FLAG_FAST_CLEAR, FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_LINE_MAJOR_DECREASING,
+    FLAG_LINE_Y_MAJOR, FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
+    MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
     STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
     STATE_COLOR_RED, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE, STATE_LINE_PATTERN,
     STATE_HOST_CURSOR, STATE_HOST_LENGTH, STATE_HOST_XEND, STATE_HOST_XSAVE,
@@ -856,6 +855,7 @@ impl ResidentGpu {
                 ("REX_FLAG_LINE_Y_MAJOR", FLAG_LINE_Y_MAJOR),
                 ("REX_FLAG_LINE_MAJOR_DECREASING", FLAG_LINE_MAJOR_DECREASING),
                 ("REX_FLAG_SHADED", FLAG_SHADED),
+                ("REX_FLAG_FAST_CLEAR", FLAG_FAST_CLEAR),
                 ("REX_FLAG_FILL_FIRST_ROW_COMPLETE", FLAG_FILL_FIRST_ROW_COMPLETE),
                 ("REX_FLAG_FILL_BLOCK", FLAG_FILL_BLOCK),
                 ("REX_OCTANT_XDEC", OCTANT_XDEC),
@@ -1280,6 +1280,7 @@ impl ResidentGpu {
         };
         let line = prepared.line();
         if let Some(line) = line {
+            let fast_clear = prepared.fast_clear();
             let payload_words = prepared
                 .payload_qwords()
                 .checked_mul(2)
@@ -1289,7 +1290,7 @@ impl ResidentGpu {
             }
             let slot = RexStateSlot::for_host_fill(context);
             let cid_test = cid_test(context.clipmode);
-            let read_destination = reads_destination(context);
+            let read_destination = !fast_clear && reads_destination(context);
             self.enqueue_host_command(
                 context,
                 slot,
@@ -1300,6 +1301,7 @@ impl ResidentGpu {
                         slot,
                         line,
                         payload,
+                        fast_clear,
                         cid_test,
                         read_destination,
                     )
@@ -1342,6 +1344,7 @@ impl ResidentGpu {
         };
         let fill = prepared.fill();
         if let Some(fill) = fill {
+            let fast_clear = prepared.fast_clear();
             let payload_words = prepared
                 .payload_qwords()
                 .checked_mul(2)
@@ -1351,7 +1354,7 @@ impl ResidentGpu {
             }
             let slot = RexStateSlot::for_host_fill(context);
             let cid_test = cid_test(context.clipmode);
-            let read_destination = reads_destination(context);
+            let read_destination = !fast_clear && reads_destination(context);
             self.enqueue_host_command(
                 context,
                 slot,
@@ -1362,6 +1365,7 @@ impl ResidentGpu {
                         slot,
                         fill,
                         payload,
+                        fast_clear,
                         cid_test,
                         read_destination,
                     )
