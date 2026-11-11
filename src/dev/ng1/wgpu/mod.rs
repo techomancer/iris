@@ -26,6 +26,9 @@ mod tests;
 mod command;
 
 #[cfg(test)]
+mod copy;
+
+#[cfg(test)]
 mod line;
 
 #[cfg(test)]

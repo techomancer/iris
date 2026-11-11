@@ -1,6 +1,7 @@
 use crate::dev::ng1::rex3::{
     bres_straight_on_zero, Rex3Context, DRAWMODE0_ADRMODE_A_LINE,
     DRAWMODE0_ADRMODE_F_LINE, DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_DRAW,
+    DRAWMODE0_OPCODE_SCR2SCR,
     DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP,
     DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA, REX3_BRES_OCTANTS, REX3_COORD_BIAS,
     REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
@@ -70,6 +71,7 @@ struct LineGeometry {
     line_pattern_repeat: u32,
     line_pattern_length: u32,
     advance_last_pattern: bool,
+    filter_patterns: bool,
 }
 
 impl LineGeometry {
@@ -109,6 +111,9 @@ impl LineGeometry {
     }
 
     fn pattern(self, index: u32) -> (bool, bool) {
+        if !self.filter_patterns {
+            return (true, false);
+        }
         let mut background = false;
         if self.z_pattern_enabled {
             let bit = self.z_pattern_bit.wrapping_sub(index as u8) & 31;
@@ -295,7 +300,24 @@ impl PreparedLine {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineOperation {
+    Draw,
+    Copy,
+}
+
 pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'static str> {
+    prepare_line_for(context, LineOperation::Draw)
+}
+
+pub(super) fn prepare_copy_line(context: &Rex3Context) -> Result<PreparedLine, &'static str> {
+    prepare_line_for(context, LineOperation::Copy)
+}
+
+fn prepare_line_for(
+    context: &Rex3Context,
+    operation: LineOperation,
+) -> Result<PreparedLine, &'static str> {
     let dm0 = context.drawmode0;
     let dm1 = context.drawmode1;
     let kind = match dm0.adrmode() {
@@ -304,7 +326,11 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         DRAWMODE0_ADRMODE_A_LINE => LineKind::Antialiased,
         _ => return Err("primitive shape"),
     };
-    if dm0.opcode() != DRAWMODE0_OPCODE_DRAW {
+    let expected_opcode = match operation {
+        LineOperation::Draw => DRAWMODE0_OPCODE_DRAW,
+        LineOperation::Copy => DRAWMODE0_OPCODE_SCR2SCR,
+    };
+    if dm0.opcode() != expected_opcode {
         return Err("opcode");
     }
     if !dm0.stoponx() && !dm0.stopony() {
@@ -331,7 +357,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         }
         _ => return Err("pixel format"),
     };
-    if dm1.fastclear() {
+    if operation == LineOperation::Draw && dm1.fastclear() {
         return Err("pixel operation");
     }
     let x = context.xstart >> 11;
@@ -349,12 +375,12 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
     };
     let pixel_count = u32::try_from(major + 1).map_err(|_| "line length")?;
     let endpoint_skip = endpoint_skips(context, kind);
-    let x_move = if dm0.xyoffset() {
+    let x_move = if operation == LineOperation::Copy || dm0.xyoffset() {
         (context.xymove >> 16) as i16 as i32
     } else {
         0
     };
-    let y_move = if dm0.xyoffset() {
+    let y_move = if operation == LineOperation::Copy || dm0.xyoffset() {
         context.xymove as i16 as i32
     } else {
         0
@@ -392,7 +418,8 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
         line_pattern_count: context.lsmode.lsrcount(),
         line_pattern_repeat: context.lsmode.lsrepeat(),
         line_pattern_length: context.lsmode.lslength(),
-        advance_last_pattern: dm0.lsadvlast(),
+        advance_last_pattern: dm0.enlspattern() && dm0.lsadvlast(),
+        filter_patterns: operation == LineOperation::Draw,
     };
 
     let mut min_x = i32::MAX;
@@ -422,9 +449,13 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
     let (shade_payload, final_shade) = if dm0.shade() {
         let mut shade = ShadeDda::from_context(context);
         let checkpoints = pixel_count.saturating_add(31) / 32;
-        let mut payload = Vec::with_capacity(checkpoints as usize * 4);
+        let mut payload = if operation == LineOperation::Draw {
+            Vec::with_capacity(checkpoints as usize * 4)
+        } else {
+            Vec::new()
+        };
         for index in 0..pixel_count {
-            if index & 31 == 0 {
+            if operation == LineOperation::Draw && index & 31 == 0 {
                 payload.extend_from_slice(&shade.components());
             }
             shade.advance();
@@ -455,7 +486,7 @@ pub(super) fn prepare_line(context: &Rex3Context) -> Result<PreparedLine, &'stat
             color: raw_color,
             write_mask: context.wrmask,
             payload_words: pixel_count,
-            shaded: final_shade.is_some(),
+            shaded: operation == LineOperation::Draw && final_shade.is_some(),
         })
     };
     Ok(PreparedLine {

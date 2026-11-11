@@ -2,7 +2,8 @@ use super::*;
 use crate::dev::ng1::rex3::{
     DrawMode0, DrawMode1, Rex3, DRAWMODE0_ADRMODE_A_LINE_SH, DRAWMODE0_ADRMODE_BLOCK_SH,
     DRAWMODE0_ADRMODE_F_LINE_SH, DRAWMODE0_ADRMODE_I_LINE_SH, DRAWMODE0_ADRMODE_SPAN_SH,
-    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_COMPARE_DISABLE_SH,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_READ, DRAWMODE0_OPCODE_SCR2SCR,
+    DRAWMODE1_COMPARE_DISABLE_SH,
     DRAWMODE1_COMPARE_GT, DRAWMODE1_COMPARE_SHIFT, DRAWMODE1_DRAWDEPTH_4,
     DRAWMODE1_DRAWDEPTH_8, DRAWMODE1_DRAWDEPTH_12, DRAWMODE1_DRAWDEPTH_24,
     DRAWMODE1_LOGICOP_AND_SH, DRAWMODE1_LOGICOP_MASK, DRAWMODE1_LOGICOP_NOR_SH,
@@ -1534,6 +1535,310 @@ fn resident_gpu_shade_dda_matches_complete_cpu_planes() {
 
 #[test]
 #[ignore = "requires the requested conformant host GPU"]
+fn resident_gpu_screen_copies_match_complete_cpu_planes() {
+    on_large_stack(|| {
+        let gpu = required_gpu();
+        let seed_rgb = seeded_plane(0x35a7_c19e);
+        let seed_aux = seeded_plane(0xca58_3e61);
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        let mut resident = ResidentGpu::activate_with_limits(
+            Arc::clone(&gpu),
+            &seed_rgb,
+            &seed_aux,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        ).expect("activate copy resident planes");
+
+        let copy = |
+            plane: u32,
+            rgbmode: bool,
+            span: bool,
+            start: (i32, i32),
+            end: (i32, i32),
+            movement: (i16, i16),
+            mask: u32,
+        | {
+            let mut context = context(plane, rgbmode, span, start, end, mask, 0);
+            context.drawmode0.0 =
+                (context.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+            context.xymove =
+                ((movement.0 as u16 as u32) << 16) | movement.1 as u16 as u32;
+            context
+        };
+        let set_depth = |ctx: &mut Rex3Context, depth: u32| {
+            ctx.drawmode1.0 = (ctx.drawmode1.0 & !(0x3 << 3)) | (depth << 3);
+        };
+        let set_logic = |ctx: &mut Rex3Context, operation: u32| {
+            ctx.drawmode1.0 =
+                (ctx.drawmode1.0 & !DRAWMODE1_LOGICOP_MASK) | operation;
+        };
+        let mut cases = Vec::new();
+
+        let mut right_smear = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (20, 700),
+            (43, 700),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut right_smear, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("right-moving overlap feedback", right_smear));
+
+        let mut right_reverse = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (83, 704),
+            (60, 704),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut right_reverse, DRAWMODE1_DRAWDEPTH_8);
+        right_reverse
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC);
+        cases.push(("right-moving reverse-safe overlap", right_reverse));
+
+        let mut left_forward = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (101, 708),
+            (124, 708),
+            (-1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut left_forward, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("left-moving forward-safe overlap", left_forward));
+
+        let mut left_reverse = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (164, 712),
+            (141, 712),
+            (-1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut left_reverse, DRAWMODE1_DRAWDEPTH_8);
+        left_reverse
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_XDEC);
+        cases.push(("left-moving reverse overlap feedback", left_reverse));
+
+        let mut down_smear = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (190, 720),
+            (197, 743),
+            (0, 1),
+            0x0000_00ff,
+        );
+        set_depth(&mut down_smear, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("down-moving overlap feedback", down_smear));
+
+        let mut down_reverse = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (214, 783),
+            (221, 760),
+            (0, 1),
+            0x0000_00ff,
+        );
+        set_depth(&mut down_reverse, DRAWMODE1_DRAWDEPTH_8);
+        down_reverse
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_YDEC);
+        cases.push(("down-moving reverse-safe overlap", down_reverse));
+
+        let mut low_to_high = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (250, 724),
+            (273, 724),
+            (1, 0),
+            0x0000_ff00,
+        );
+        set_depth(&mut low_to_high, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("low-to-high packed slot copy", low_to_high));
+
+        let mut high_to_low = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (290, 728),
+            (313, 728),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut high_to_low, DRAWMODE1_DRAWDEPTH_8);
+        high_to_low.drawmode1.0 |= 1 << 5;
+        cases.push(("high-to-low packed slot copy", high_to_low));
+
+        let mut clipped = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (330, 732),
+            (361, 732),
+            (1, 0),
+            0x0000_00ff,
+        );
+        set_depth(&mut clipped, DRAWMODE1_DRAWDEPTH_8);
+        clipped.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+        clipped.smask0x =
+            (((REX3_COORD_BIAS + 345) as u16 as u32) << 16)
+                | (REX3_COORD_BIAS + 400) as u16 as u32;
+        clipped.smask0y =
+            (((REX3_COORD_BIAS + 732) as u16 as u32) << 16)
+                | (REX3_COORD_BIAS + 732) as u16 as u32;
+        cases.push(("clipped overlap feedback", clipped));
+
+        let mut logic_feedback = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (380, 736),
+            (411, 736),
+            (1, 0),
+            0x0000_00f3,
+        );
+        set_depth(&mut logic_feedback, DRAWMODE1_DRAWDEPTH_8);
+        set_logic(&mut logic_feedback, DRAWMODE1_LOGICOP_XOR_SH);
+        cases.push(("logic and WRMASK overlap feedback", logic_feedback));
+
+        let mut ignored_effects = copy(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (430, 740),
+            (461, 747),
+            (3, 2),
+            0x00ff_ffff,
+        );
+        ignored_effects.drawmode0.0 |= (1 << 12) | (1 << 13) | (1 << 18);
+        ignored_effects.zpattern = 0;
+        ignored_effects.lspattern = 0;
+        ignored_effects.slopered = 0x0000_1235;
+        ignored_effects.slopegrn = -0x0000_0711;
+        ignored_effects.slopeblue = 0x0000_0953;
+        ignored_effects.slopealpha = 0x0000_03a7;
+        ignored_effects.drawmode1.0 =
+            (ignored_effects.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+                | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        ignored_effects.alpharef = 0xff;
+        cases.push(("copy ignores compare and patterns but advances state", ignored_effects));
+
+        let mut skipped = copy(
+            DRAWMODE1_PLANES_RGB,
+            true,
+            false,
+            (490, 752),
+            (521, 759),
+            (2, 1),
+            u32::MAX,
+        );
+        skipped.drawmode0.0 |= (1 << 10) | (1 << 12) | (1 << 18);
+        skipped.slopered = 0x0000_0101;
+        skipped.slopegrn = 0x0000_0203;
+        skipped.slopeblue = -0x0000_0305;
+        skipped.slopealpha = 0x0000_0407;
+        cases.push(("block skip-first suppresses writes but advances state", skipped));
+
+        let mut overlay = copy(
+            DRAWMODE1_PLANES_OLAY,
+            true,
+            false,
+            (550, 764),
+            (581, 771),
+            (1, 1),
+            0x00ff_ff00,
+        );
+        set_depth(&mut overlay, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("overlay overlap feedback", overlay));
+
+        let span = copy(
+            DRAWMODE1_PLANES_CID,
+            false,
+            true,
+            (610, 776),
+            (641, 776),
+            (1, 0),
+            0x0000_0033,
+        );
+        cases.push(("CID span overlap feedback", span));
+
+        let mut integer_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            false,
+            (680 * 16, 784 * 16),
+            (727 * 16, 795 * 16),
+            0x0000_00ff,
+            0,
+        );
+        integer_line.drawmode0.0 =
+            (integer_line.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+        integer_line.xymove = (1u32 << 16) | 1;
+        set_depth(&mut integer_line, DRAWMODE1_DRAWDEPTH_8);
+        cases.push(("integer line copy", integer_line));
+
+        let mut fractional_line = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (760 * 16 + 3, 804 * 16 + 11),
+            (803 * 16 + 9, 829 * 16 + 2),
+            0x00ff_ffff,
+            0,
+        );
+        fractional_line.drawmode0.0 =
+            (fractional_line.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+        fractional_line.xymove =
+            ((-2i16 as u16 as u32) << 16) | 3i16 as u16 as u32;
+        cases.push(("fractional line copy", fractional_line));
+
+        let mut antialiased_line = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_PUP,
+            false,
+            (840 * 16 + 5, (0x13ff - 850) * 16 + 7),
+            (867 * 16 + 11, (0x13ff - 899) * 16 + 3),
+            0x0000_00cc,
+            0,
+        );
+        antialiased_line.drawmode0.0 =
+            (antialiased_line.drawmode0.0 & !0x3) | DRAWMODE0_OPCODE_SCR2SCR;
+        antialiased_line.drawmode1.0 |= 1 << 6;
+        antialiased_line.xymove =
+            ((2i16 as u16 as u32) << 16) | (-1i16 as u16 as u32);
+        cases.push(("YFLIP antialiased popup line copy", antialiased_line));
+
+        for (label, mut actual) in cases {
+            let mut expected = actual;
+            resident.enqueue(&mut actual).unwrap_or_else(|error| panic!("{label}: {error}"));
+            cpu_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, label);
+        }
+
+        let observed = resident.observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe copied planes");
+        compare_observed(observed.rgb().unwrap(), &expected_rgb, "copied RGB");
+        compare_observed(observed.aux().unwrap(), &expected_aux, "copied aux");
+        assert!(resident.payload.is_empty(), "copy submission drained line payload");
+        gpu.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires the requested conformant host GPU"]
 fn resident_gpu_lines_match_complete_cpu_planes() {
     on_large_stack(|| {
         let gpu = required_gpu();
@@ -1896,7 +2201,7 @@ fn resident_gpu_gfifo_draws_match_complete_cpu_planes() {
         cpu_draw(&mut prefix, &mut expected_rgb, &mut expected_aux);
         write_reg(
             &rex.0, REX3_DRAWMODE0,
-            DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true,
+            DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true,
         );
         assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
         gpu.wait(None).unwrap();
@@ -2072,7 +2377,7 @@ fn resident_gpu_gfifo_activation_reset_and_fault() {
         assert_eq!(reset.accepted.sequence, Sequence(0));
         assert!(reset.rgb.cpu_shadow_current() && reset.aux.cpu_shadow_current());
         rex.0.start();
-        write_reg(&rex.0, REX3_DRAWMODE0, DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true);
+        write_reg(&rex.0, REX3_DRAWMODE0, DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | (1 << 8) | (1 << 9), true);
         assert_eq!(rex.0.wait_resident_idle(), Err(ResidentError::Unsupported("opcode")));
         assert_eq!(rex.0.resident_status(), Err(ResidentError::Unsupported("opcode")));
         rex.0.stop();

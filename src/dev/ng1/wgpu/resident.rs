@@ -13,8 +13,8 @@ use parking_lot::Mutex;
 
 use crate::dev::ng1::rex3::{
     Rex3Context, DRAWMODE0_ADRMODE_A_LINE, DRAWMODE0_ADRMODE_F_LINE,
-    DRAWMODE0_ADRMODE_I_LINE, DRAWMODE1_LOGICOP_SRC, REX3_SCREEN_HEIGHT,
-    REX3_SCREEN_WIDTH,
+    DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE1_LOGICOP_SRC,
+    OCTANT_XDEC, OCTANT_YDEC, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
 use crate::dev::ng1::rex3_flat_fill::{
     prepare_resident_flat_fill, FillKind, FillPlane,
@@ -25,16 +25,18 @@ use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileG
 
 use super::command::{
     cid_test, COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE,
-    COMMAND_I_LINE, COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING, FLAG_LINE_Y_MAJOR,
-    FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
-    MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
+    COMMAND_COPY_A_LINE, COMMAND_COPY_BLOCK, COMMAND_COPY_F_LINE, COMMAND_COPY_I_LINE,
+    COMMAND_COPY_SPAN, COMMAND_I_LINE, COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING,
+    FLAG_LINE_Y_MAJOR, FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
+    MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
     STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
     STATE_COLOR_RED, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE, STATE_LINE_PATTERN,
     STATE_PATTERN_BITS, STATE_SLOPE_ALPHA, STATE_SLOPE_BLUE, STATE_SLOPE_GREEN,
     STATE_SLOPE_RED, STATE_SMASK0X, STATE_SMASK0Y, STATE_SMASK1X, STATE_SOURCE_COLOR,
     STATE_WORDS, STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
 };
-use super::line::prepare_line;
+use super::copy::prepare_copy_fill;
+use super::line::{prepare_copy_line, prepare_line};
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
@@ -820,12 +822,19 @@ impl ResidentGpu {
                 ("REX_COMMAND_I_LINE", COMMAND_I_LINE),
                 ("REX_COMMAND_F_LINE", COMMAND_F_LINE),
                 ("REX_COMMAND_A_LINE", COMMAND_A_LINE),
+                ("REX_COMMAND_COPY_BLOCK", COMMAND_COPY_BLOCK),
+                ("REX_COMMAND_COPY_SPAN", COMMAND_COPY_SPAN),
+                ("REX_COMMAND_COPY_I_LINE", COMMAND_COPY_I_LINE),
+                ("REX_COMMAND_COPY_F_LINE", COMMAND_COPY_F_LINE),
+                ("REX_COMMAND_COPY_A_LINE", COMMAND_COPY_A_LINE),
                 ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
                 ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
                 ("REX_FLAG_READ_AUX", FLAG_READ_AUX),
                 ("REX_FLAG_LINE_Y_MAJOR", FLAG_LINE_Y_MAJOR),
                 ("REX_FLAG_LINE_MAJOR_DECREASING", FLAG_LINE_MAJOR_DECREASING),
                 ("REX_FLAG_SHADED", FLAG_SHADED),
+                ("REX_OCTANT_XDEC", OCTANT_XDEC),
+                ("REX_OCTANT_YDEC", OCTANT_YDEC),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),
                 ("REX_STATE_DRAW_MODE0", STATE_DRAW_MODE0 as u32),
                 ("REX_STATE_DRAW_MODE1", STATE_DRAW_MODE1 as u32),
@@ -1027,6 +1036,82 @@ impl ResidentGpu {
         Ok(())
     }
 
+    fn enqueue_copy(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let line_shape = matches!(
+            context.drawmode0.adrmode(),
+            DRAWMODE0_ADRMODE_I_LINE
+                | DRAWMODE0_ADRMODE_F_LINE
+                | DRAWMODE0_ADRMODE_A_LINE
+        );
+        if line_shape {
+            let prepared = prepare_copy_line(context).map_err(ResidentError::Unsupported)?;
+            let line = prepared.line();
+            if line.is_some() && prepared.payload().len() > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("copy line payload length"));
+            }
+            self.submit()?;
+            let position = self.progress.lock().next_position()?;
+            if let Some(line) = line {
+                let slot = RexStateSlot::for_copy(context);
+                let checkpoint = self.payload.checkpoint();
+                let payload = self
+                    .payload
+                    .append_iter(prepared.payload())
+                    .map_err(|Full| ResidentError::InvalidState("one copy line exceeds the payload arena"))?;
+                let result = self.batch.prim_with_slot(
+                    slot,
+                    line.min_x,
+                    line.min_y,
+                    line.min_x,
+                    line.min_y,
+                    |slot| RexCommand::copy_line(slot, line, payload, cid_test(context.clipmode)),
+                );
+                match result {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("copy line missed its anchor tile"));
+                    }
+                    Err(Full) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("one copy line exceeds an empty batch"));
+                    }
+                }
+            }
+            self.progress.lock().accept(position, line.map(|line| line.plane));
+            prepared.finish(context);
+            return self.submit();
+        }
+
+        let prepared = prepare_copy_fill(context).map_err(ResidentError::Unsupported)?;
+        let fill = prepared.fill();
+        self.submit()?;
+        let position = self.progress.lock().next_position()?;
+        if let Some(fill) = fill {
+            let slot = RexStateSlot::for_copy(context);
+            let result = self.batch.prim_with_slot(
+                slot,
+                fill.min_x,
+                fill.min_y,
+                fill.min_x,
+                fill.min_y,
+                |slot| RexCommand::copy_fill(slot, fill, cid_test(context.clipmode)),
+            );
+            match result {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(ResidentError::InvalidState("copy fill missed its anchor tile"));
+                }
+                Err(Full) => {
+                    return Err(ResidentError::InvalidState("one copy fill exceeds an empty batch"));
+                }
+            }
+        }
+        self.progress.lock().accept(position, fill.map(|fill| fill.plane));
+        prepared.finish(context);
+        self.submit()
+    }
+
     fn enqueue_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         let command = prepare_line(context).map_err(ResidentError::Unsupported)?;
         let position = self.progress.lock().next_position()?;
@@ -1152,6 +1237,9 @@ impl ResidentBackend for ResidentGpu {
 
     fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         self.gpu.check().map_err(gpu_error)?;
+        if context.drawmode0.opcode() == DRAWMODE0_OPCODE_SCR2SCR {
+            return self.enqueue_copy(context);
+        }
         if matches!(
             context.drawmode0.adrmode(),
             DRAWMODE0_ADRMODE_I_LINE
