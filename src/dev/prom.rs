@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::Path;
+
+use crate::dev::prom_image;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -44,7 +46,7 @@ impl Prom {
 
     /// Load PROM from `path`; if that fails, fall back to the embedded binary.
     pub fn from_file_or_embedded(path: &str) -> Self {
-        match fs::read(path) {
+        match prom_image::load(Path::new(path), PROM_SIZE as usize) {
             Ok(bytes) => {
                 println!("Loaded PROM from {}", path);
                 Self::from_bytes(&bytes)
@@ -81,7 +83,7 @@ impl Prom {
             paths.push(default_path);
         }
         for path in paths {
-            match fs::read(path) {
+            match prom_image::load(Path::new(path), PROM_SIZE as usize) {
                 Ok(bytes) => {
                     println!("Loaded PROM from {}", path);
                     return Self::from_bytes(&bytes);
@@ -281,6 +283,14 @@ mod tests {
         // An explicit file wins over both the default and embedded images.
         fs::write(&configured, [0x87, 0x65, 0x43, 0x21]).unwrap();
         assert_eq!(load(configured.to_str().unwrap()).read32(PROM_BASE).data, 0x87654321);
+
+        // The shared loader also takes the installer's header form.
+        let mut image = vec![0u8; 0x100];
+        image[..4].copy_from_slice(b"PROM");
+        image[12..16].copy_from_slice(&4u32.to_be_bytes());
+        image.extend([0x0b, 0xf0, 0x00, 0xf0]);
+        fs::write(&configured, &image).unwrap();
+        assert_eq!(load(configured.to_str().unwrap()).read32(PROM_BASE).data, 0x0bf000f0);
         fs::remove_dir_all(dir).unwrap();
     }
 

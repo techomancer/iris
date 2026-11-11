@@ -115,6 +115,15 @@ recordings of a failing case (`vpro rec`) replay on both raster units offline:
 unit and the GPU unit with live-style slice ends, and compares what the board
 wrote to guest memory and its final memory.
 
+## Real PROM images
+
+`real_prom_files_load_to_their_payload` (in `src/dev/prom_image.rs`) loads the
+real PROM files through the shared loader: Origin, Fuel and Tezro `.img`
+containers against the `.payload.bin` beside them, the O2's `ip32prom.image`
+and the Octane's `IP30prom.bin`. It searches `ignore/proms` (or
+`IRIS_PROM_DIR`) for them and skips when there are none; the images are not in
+git.
+
 ## Strict synthetic REX3 replay corpus
 
 The redistributable [REX3 corpus](src/dev/ng1/testdata/README.md) contains

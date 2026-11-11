@@ -285,11 +285,8 @@ impl OctaneMachine {
         // `prom`, or IRIX's file name when `prom` is the shared default and
         // that file is not there: there is no embedded Octane PROM.
         let prom_path = MachineProfile::OctaneIp30.prom_path(&cfg.prom);
-        let prom = std::fs::read(&prom_path)
-            .map_err(|e| format!("Octane PROM {prom_path}: {e} (set `prom` to an IP30 PROM image, the 1 MB flash contents)"))?;
-        if prom.len() > FLASH_SIZE {
-            return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
-        }
+        let prom = crate::dev::prom_image::load(std::path::Path::new(&prom_path), FLASH_SIZE)
+            .map_err(|e| format!("Octane {e} (set `prom` to an IP30 PROM image, the 1 MB flash contents)"))?;
         let cpu_count = cfg.machine.cpus();
         MachineProfile::OctaneIp30.accepts_cpus(cpu_count)?;
         let banks = heart_banks(cfg);
@@ -1507,6 +1504,24 @@ mod tests {
             drop(machine);
             assert_eq!(phys.strong_count(), 0, "{board:?}: the bus outlives its machine");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Octane's PROM goes through the shared loader: a file longer than
+    /// the 1 MiB flash is refused with the machine named, and a shorter raw
+    /// one still runs from the start of the flash.
+    #[test]
+    fn the_octane_prom_is_bounded_by_its_flash() {
+        use crate::config::{GraphicsBoard, MachineProfile};
+        use crate::display_stop_tests::{big_stack, config, scratch};
+        let dir = scratch("octane-prom-size");
+        let cfg = config(&dir, MachineProfile::OctaneIp30, GraphicsBoard::None);
+        std::fs::write(&cfg.prom, vec![0u8; FLASH_SIZE + 1]).unwrap();
+        let big = cfg.clone();
+        let e = big_stack(move || OctaneMachine::new(&big).err()).expect("an oversized PROM is refused");
+        assert!(e.starts_with("Octane PROM image") && e.contains("exceeds flash capacity"), "{e}");
+        std::fs::write(&cfg.prom, vec![0x5a; 0x1000]).unwrap();
+        assert!(big_stack(move || OctaneMachine::new(&cfg).is_ok()), "a short raw PROM loads");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
