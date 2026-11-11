@@ -380,7 +380,15 @@ no-progress retirement. A 6x4 `glPixelZoom`-style source grid verifies that
 then match the CPU plane. Overlapping HostW-to-ordinary-to-HostW draws verify
 both ordering boundaries, while the board-level one-slot backend proves that
 capacity exhaustion submits the accepted prefix and retries the next HostW
-record without duplicated context advancement.
+record without duplicated context advancement. The producer reliability
+coverage refuses a bulk VDMA transfer with `BUS_BUSY` while the GFIFO lacks
+room, proves that neither token nor payload prefix was published, and retries
+the complete transfer exactly once. Concurrent scalar and batch producers run
+2048 records apiece across repeated ring wraps. The hardware oracle alternates
+24 PIO and VDMA HostW records through the board, then uses a four-word payload
+arena, three state slots and two reusable GPU sets to force repeated payload
+and state exhaustion. Complete planes, context, counters and stream positions
+must remain CPU-identical on both backends.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
@@ -412,7 +420,7 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The script requires 25 `resident_` CPU tests, four flat-fill tests, two line
+The exact 98-case script requires 28 `resident_` CPU tests, four flat-fill tests, two line
 tests, two HostW walker tests, one HostW interpreter/JIT source test, one
 shade-DDA test, one pattern-state test, three command-ABI tests and three
 direct-state tests, then **19 resident GPU tests and eight direct scanout
