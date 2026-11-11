@@ -11,8 +11,10 @@
 //! worker led a seal and waited for the other to park, while the other led a
 //! flush and waited for the first.
 //!
-//! The pool's run flag lives here too. Every wait re-checks it every
-//! [`POLL`], which is how a stopping pool gets its waiters out.
+//! The pool's run flag lives here too, so that clearing it
+//! ([`PoolBarrier::stop`]) always wakes whoever waits on the barrier. Every
+//! change to a waiter's condition is made under the barrier's mutex and
+//! followed by a notify, so no wait needs a timeout to make progress.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, Ordering};
@@ -22,10 +24,6 @@ use loom::sync::{Condvar, Mutex, MutexGuard};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// How often a barrier wait re-checks the run flag and the cycle.
-#[cfg(not(loom))]
-const POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 struct State<A> {
     /// Workers parked in the current cycle. Reset by the leader's release.
@@ -61,7 +59,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 #[cfg(not(loom))]
 fn wait<'a, T>(cv: &Condvar, mut g: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-    cv.wait_for(&mut g, POLL);
+    cv.wait(&mut g);
     g
 }
 #[cfg(loom)]
@@ -90,9 +88,15 @@ impl<A: Clone> PoolBarrier<A> {
         self.running.load(Ordering::Relaxed)
     }
 
-    /// Clear the run flag. Waiters see it at their next poll.
+    /// Clear the run flag and wake every waiter, so a leader waiting for a
+    /// worker that has already left, and a worker parked behind a leader
+    /// that is gone, both see it. Taking the mutex orders the store before
+    /// any waiter's next look at the flag: a waiter between its check and
+    /// its wait holds the mutex.
     pub(crate) fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        let _state = lock(&self.state);
+        self.cv.notify_all();
     }
 
     /// A worker leads a cycle.
@@ -123,19 +127,20 @@ impl<A: Clone> PoolBarrier<A> {
 
     /// The leader: end the cycle and wake the parked workers. `Some` for a
     /// flush, with the arena they must rebuild on; `None` for a seal-only or
-    /// abandoned cycle, after which they resume in place.
+    /// abandoned cycle, after which they resume in place. The flag clears
+    /// under the mutex: a worker that saw the cycle in progress but reaches
+    /// [`Self::park`] after this sees it over, rather than parking for a
+    /// generation nobody will bump.
     pub(crate) fn release(&self, arena: Option<A>) {
-        {
-            let mut state = lock(&self.state);
-            state.was_flush = arena.is_some();
-            if let Some(a) = arena {
-                state.arena = Some(a);
-            }
-            state.parked = 0;
-            state.generation += 1;
-            self.cv.notify_all();
+        let mut state = lock(&self.state);
+        state.was_flush = arena.is_some();
+        if let Some(a) = arena {
+            state.arena = Some(a);
         }
+        state.parked = 0;
+        state.generation += 1;
         self.quiesce.store(false, Ordering::Release);
+        self.cv.notify_all();
     }
 
     /// A worker that saw a cycle in progress: park until the leader releases
@@ -152,10 +157,10 @@ impl<A: Clone> PoolBarrier<A> {
         state.parked += 1;
         self.cv.notify_all();
         while state.generation == generation {
-            if !self.running() || !self.in_progress() {
-                // Stopping, or the cycle ended without us: leave the count as
-                // we found it for whoever leads next.
-                state.parked = state.parked.saturating_sub(1);
+            if !self.running() {
+                // Leave the count as it was for the leader, which may still
+                // be counting.
+                state.parked -= 1;
                 return None;
             }
             state = wait(&self.cv, state);
@@ -242,7 +247,8 @@ mod tests {
     }
 
     /// A worker parked when the pool stops, with no leader left to release
-    /// it, must come back so `stop()`'s join returns.
+    /// it, must come back so `stop()`'s join returns. Nothing times the
+    /// wait out: only `stop`'s wakeup gets it out.
     #[test]
     fn a_parked_worker_returns_when_the_pool_stops() {
         let (b, followers) = parked_barrier(1);
@@ -251,5 +257,22 @@ mod tests {
             assert_eq!(returns(move || f.join().unwrap()), None);
         }
         assert_eq!(b.parked(), 0);
+    }
+
+    /// A leader waiting for a worker that left instead of parking must see
+    /// the stop.
+    #[test]
+    fn a_leader_waiting_for_followers_returns_when_the_pool_stops() {
+        let b = Arc::new(PoolBarrier::<u32>::new());
+        b.start(1);
+        assert!(b.try_lead());
+        let leader = {
+            let b = b.clone();
+            std::thread::spawn(move || b.wait_for_followers(1))
+        };
+        // Give the leader time to block; the result does not depend on it.
+        std::thread::sleep(Duration::from_millis(10));
+        b.stop();
+        assert!(!returns(move || leader.join().unwrap()));
     }
 }

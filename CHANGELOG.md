@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### jitv2: stopping the compile pool wakes its barrier
+
+- Stopping the compile pool (a flush from the CPU thread, `j2 inline on`, a
+  machine's drop) wakes the workers parked at its flush barrier and a leader
+  waiting for them. They used to notice only at their next 20 ms poll, and a
+  worker that reached the barrier just after a cycle ended waited out a poll
+  too. No barrier wait polls now.
+  (`src/cpu/jitv2/pool_barrier.rs`)
+
 ### Newport: experimental live rendering on the host GPU
 
 - A `rex-gpu` build renders Newport's flat fills on the host GPU when
