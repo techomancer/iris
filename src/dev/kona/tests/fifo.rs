@@ -501,6 +501,71 @@ fn a_reset_revives_a_dead_board() {
     assert_eq!(kona.bus_read(PORT_DATA, 4).0, BUS_OK);
 }
 
+/// Guest memory that lets go of the board's last reference to it on a write once armed, as the machine's
+/// own memory path can when it holds a weak reference to the machine it upgrades for the call.
+struct LetsGoOfTheBoard {
+    host: Arc<TestHost>,
+    board: Mutex<Option<Arc<Kona>>>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl LetsGoOfTheBoard {
+    fn let_go(&self) {
+        if self.armed.load(SeqCst) {
+            let board = self.board.lock().take();
+            drop(board);
+        }
+    }
+}
+
+impl crate::traits::BusDevice for LetsGoOfTheBoard {
+    fn read8(&self, addr: u64) -> crate::traits::BusRead8 {
+        self.host.read8(addr)
+    }
+    fn read32(&self, addr: u64) -> crate::traits::BusRead32 {
+        self.host.read32(addr)
+    }
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        self.let_go();
+        self.host.write8(addr, val)
+    }
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        self.let_go();
+        self.host.write32(addr, val)
+    }
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 {
+        self.let_go();
+        self.host.write_block(addr, buf)
+    }
+}
+
+/// If the board's thread drops the last reference to the board, in the middle of a DMA write, the drop
+/// cannot join the thread it is running on. The thread ends on its own, as it does for any stop, and is
+/// not taken for a back end that panicked.
+#[test]
+fn the_board_dropped_by_its_own_thread_ends_the_thread_cleanly() {
+    let host = TestHost::new();
+    let mem = Arc::new(LetsGoOfTheBoard { host: host.clone(), board: Mutex::new(None), armed: Default::default() });
+    let kona = Kona::new(test_cfg(), host.clone(), mem.clone(), crate::dev::kona::tests::test_status(), None).unwrap();
+    let shared = kona.shared.clone();
+    *mem.board.lock() = Some(kona.clone());
+    crate::traits::Device::start(&*kona);
+    // A reply buffer and a request that writes to it, queued while the pipe is held so the thread
+    // runs them after the test has dropped its own reference.
+    let held = shared.pipe.lock();
+    for w in [EEPROM_OPERATION, OP_REPLY_BUFFER, 0x1000_0000 | (REPLY_PAGE >> 12) as u32, (REPLY_PAGE & 0xfff) as u32, 0x4000, EEPROM_OPERATION, OP_IDENTIFY, 0] {
+        assert_eq!(kona.bus_write(COMMAND_PORT, 4, w as u64), BUS_OK);
+    }
+    drop(kona);
+    mem.armed.store(true, SeqCst);
+    drop(held);
+    // The thread's reference to the shared state goes when the thread does; the test's is the last.
+    retry(|| Arc::strong_count(&shared) == 1);
+    assert!(mem.board.lock().is_none(), "the write let go of the board");
+    assert!(!shared.dead.load(SeqCst), "the thread did not panic");
+    assert!(shared.exit.load(SeqCst));
+}
+
 /// A monitor waiting for the processor's state sleeps until it is put back.
 #[test]
 fn a_monitor_waits_for_the_state_and_gets_it() {
