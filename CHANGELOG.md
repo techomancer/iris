@@ -13,6 +13,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Indy and Indigo2 chime on the first boot
+
+- A new or blank `nvram.bin` (Indy) or `nveeprom.bin` (Indigo2) made the first
+  boot silent: the PROM plays the tune before it checks the settings block,
+  and reads the blank volume as zero. iris now fills a blank block with the
+  values the PROM writes itself, as it already did for the IP28. Files that
+  already hold settings are left alone.
+
 ### Newport: experimental live rendering on the host GPU
 
 - A `rex-gpu` build renders Newport's flat fills on the host GPU when

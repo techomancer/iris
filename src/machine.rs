@@ -490,14 +490,18 @@ impl Machine {
         // disk (see cfg.nvram / cfg.nveeprom), so both only patch while the
         // `eaddr` slot is still blank — never clobbers a MAC the guest
         // already `setenv`'d (Indy) or that a prior run already saved
-        // (Indigo2).
+        // (Indigo2). A settings block that is still blank apart from that
+        // address then gets the PROM's own defaults (`sgi_nvram`): the PROM
+        // reads the volume for the boot tune before it repairs a bad block,
+        // so a blank one would make the first boot silent.
         if guinness {
             hpc3.rtc().backdoor_set_mac_if_blank(cfg.network().mac);
+            hpc3.rtc().initialize_nvram_if_erased(crate::dev::sgi_nvram::REV_IP22);
         } else {
             let mut eeprom = eeprom_hpc3.lock();
-            let initialized = cfg.machine.profile.ip28() && eeprom.initialize_ip28_if_erased();
             eeprom.backdoor_set_mac_if_blank(cfg.network().mac);
-            if initialized { eeprom.update_ip28_checksum(); }
+            let rev = if cfg.machine.profile.ip28() { crate::dev::sgi_nvram::REV_IP28 } else { crate::dev::sgi_nvram::REV_IP22 };
+            eeprom.initialize_if_erased(rev);
         }
 
         // A DaynaPort is built where the gateway is, by Hpc3; a target that

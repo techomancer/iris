@@ -26,6 +26,10 @@ const TE_BIT: u8 = 0x80; // Transfer Enable bit (when 0, time updates disabled)
 // so those 6 physical addresses land on regs[314..=319].
 const MAC_REGS_OFFSET: usize = 314;
 
+/// Where the PROM's 256-byte settings block starts in the NVRAM (just after
+/// the 64 bytes of clock registers); the MAC above is its last six bytes.
+const NVRAM_REGS_OFFSET: usize = MAC_REGS_OFFSET - crate::dev::sgi_nvram::MAC_OFFSET;
+
 struct RtcData {
     regs: Vec<u8>,
     // Base time in centiseconds since epoch
@@ -279,6 +283,20 @@ impl Ds1x86 {
         data.regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6].copy_from_slice(&mac);
         dlog!(LogModule::Rtc, "RTC: backdoor-injected eaddr {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        true
+    }
+
+    /// Fill a never-programmed NVRAM with the settings block the PROM would
+    /// write on its first boot (see `sgi_nvram`). Call after the MAC backdoor
+    /// so the station address survives. Returns true if it wrote anything.
+    pub fn initialize_nvram_if_erased(&self, rev: u8) -> bool {
+        let mut data = self.data.lock();
+        let block = &mut data.regs[NVRAM_REGS_OFFSET..NVRAM_REGS_OFFSET + 256];
+        let block: &mut [u8; 256] = block.try_into().unwrap();
+        if !crate::dev::sgi_nvram::is_erased(block, 0) {
+            return false;
+        }
+        crate::dev::sgi_nvram::write_defaults(block, rev);
         true
     }
 
@@ -669,5 +687,32 @@ mod tests {
         let patched = rtc.backdoor_set_mac_if_blank([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
         assert!(!patched, "backdoor must not overwrite a non-blank eaddr slot");
         assert_eq!(&rtc.data.lock().regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6], &guest_mac);
+    }
+
+    /// A new `nvram.bin` starts as zeros, which the PROM's chime player reads
+    /// as volume 0 and skips. Real machines are programmed at the factory, so
+    /// an erased image must come up with the PROM's own defaults, a valid
+    /// checksum and the station address.
+    #[test]
+    fn erased_indy_nvram_gets_defaults_and_checksum_without_losing_mac() {
+        let rtc = Ds1x86::new(8192, "test_erased_indy_nvram.bin".to_string(), RtcOffset::default());
+        let mac = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
+        assert!(rtc.backdoor_set_mac_if_blank(mac));
+        assert!(rtc.initialize_nvram_if_erased(crate::dev::sgi_nvram::REV_IP22));
+        let d = rtc.data.lock();
+        let nv = &d.regs[NVRAM_REGS_OFFSET..NVRAM_REGS_OFFSET + 256];
+        assert_eq!(nv[1], 8);
+        assert_eq!(&nv[232..234], b"80", "volume");
+        assert_eq!(&nv[0xfa..], &mac);
+        assert_eq!(nv[0], crate::dev::sgi_nvram::checksum(nv.try_into().unwrap()));
+    }
+
+    #[test]
+    fn indy_nvram_with_guest_settings_is_left_alone() {
+        let rtc = Ds1x86::new(8192, "test_kept_indy_nvram.bin".to_string(), RtcOffset::default());
+        rtc.data.lock().regs[NVRAM_REGS_OFFSET + 232] = b'0'; // muted
+        let before = rtc.data.lock().regs.clone();
+        assert!(!rtc.initialize_nvram_if_erased(crate::dev::sgi_nvram::REV_IP22));
+        assert_eq!(rtc.data.lock().regs, before);
     }
 }
