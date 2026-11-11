@@ -474,20 +474,11 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // ILLEGAL REQUEST: LBA out of range
         }
 
-        let Some(data) = data_in else {
-            return Ok(ScsiResponse {
-                status: 0x02,
-                data: vec![],
-            });
+        // ABORTED COMMAND: data phase error, when the data did not arrive or
+        // not in the length the CDB asked for.
+        let Some(data) = data_in.filter(|d| d.len() as u64 == count as u64 * self.logical_block_size) else {
+            return Ok(self.check_condition(0x0b, 0x4b, 0x00));
         };
-
-        let expected_len = count as u64 * self.logical_block_size;
-        if data.len() as u64 != expected_len {
-            return Ok(ScsiResponse {
-                status: 0x02,
-                data: vec![],
-            });
-        }
 
         if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
@@ -1461,6 +1452,19 @@ mod tests {
     fn sense_key_asc(dev: &mut ScsiDevice) -> (u8, u8) {
         let r = run(dev, &[0x03, 0, 0, 0, 18, 0]);
         (r.data[2] & 0x0f, r.data[12])
+    }
+
+    /// A write whose data never arrived, or arrived at the wrong length, is
+    /// refused with sense data, so the REQUEST SENSE after it says why.
+    #[test]
+    fn a_write_without_its_data_reports_a_data_phase_error() {
+        let (mut dev, _) = CountingNode::device(8);
+        let none = dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], None)).unwrap();
+        assert_eq!(none.status, 0x02);
+        assert_eq!(sense_key_asc(&mut dev), (0x0b, 0x4b), "ABORTED COMMAND, data phase error");
+        let short = dev.request(&request(&[0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0], Some(vec![0x5a; 100]))).unwrap();
+        assert_eq!(short.status, 0x02);
+        assert_eq!(sense_key_asc(&mut dev), (0x0b, 0x4b));
     }
 
     /// A disk with a write cache says so, with the read cache on.
