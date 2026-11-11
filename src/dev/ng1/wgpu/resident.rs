@@ -27,7 +27,8 @@ use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileG
 use super::command::{
     cid_test, COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE,
     COMMAND_COPY_A_LINE, COMMAND_COPY_BLOCK, COMMAND_COPY_F_LINE, COMMAND_COPY_I_LINE,
-    COMMAND_COPY_SPAN, COMMAND_HOST_BLOCK, COMMAND_HOST_SPAN, COMMAND_I_LINE, COMMAND_SPAN,
+    COMMAND_COPY_SPAN, COMMAND_HOST_A_LINE, COMMAND_HOST_BLOCK, COMMAND_HOST_F_LINE,
+    COMMAND_HOST_I_LINE, COMMAND_HOST_SPAN, COMMAND_I_LINE, COMMAND_SPAN,
     FLAG_LINE_MAJOR_DECREASING,
     FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_LINE_Y_MAJOR, FLAG_READ_AUX,
     FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES,
@@ -42,7 +43,7 @@ use super::command::{
 };
 use super::copy::prepare_copy_fill;
 use super::host::prepare_host_fill;
-use super::line::{prepare_copy_line, prepare_line};
+use super::line::{prepare_copy_line, prepare_host_line, prepare_line};
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
@@ -844,6 +845,9 @@ impl ResidentGpu {
                 ("REX_COMMAND_COPY_A_LINE", COMMAND_COPY_A_LINE),
                 ("REX_COMMAND_HOST_BLOCK", COMMAND_HOST_BLOCK),
                 ("REX_COMMAND_HOST_SPAN", COMMAND_HOST_SPAN),
+                ("REX_COMMAND_HOST_I_LINE", COMMAND_HOST_I_LINE),
+                ("REX_COMMAND_HOST_F_LINE", COMMAND_HOST_F_LINE),
+                ("REX_COMMAND_HOST_A_LINE", COMMAND_HOST_A_LINE),
                 ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
                 ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
                 ("REX_FLAG_READ_AUX", FLAG_READ_AUX),
@@ -1197,7 +1201,95 @@ impl ResidentGpu {
         Ok(())
     }
 
+    fn enqueue_host_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let prepared = prepare_host_line(context).map_err(ResidentError::Unsupported)?;
+        let payload_qwords = prepared.payload_qwords() as u64;
+        let position = {
+            let status = self.progress.lock();
+            status
+                .host_write_transfers
+                .checked_add(1)
+                .ok_or(ResidentError::InvalidState(
+                    "HostW transfer counter exhausted",
+                ))?;
+            status.host_write_qwords.checked_add(payload_qwords).ok_or(
+                ResidentError::InvalidState("HostW payload counter exhausted"),
+            )?;
+            status.next_position()?
+        };
+        let line = prepared.line();
+        if let Some(line) = line {
+            let payload_words = prepared
+                .payload_qwords()
+                .checked_mul(2)
+                .ok_or(ResidentError::Unsupported("host payload length"))?;
+            if payload_words > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("host payload length"));
+            }
+            let slot = RexStateSlot::for_host_fill(context);
+            self.submit()?;
+            let checkpoint = self.payload.checkpoint();
+            let payload = self
+                .payload
+                .append_iter((0..payload_words).map(|index| {
+                    let value = context.hostrw[index / 2];
+                    if index & 1 == 0 {
+                        (value >> 32) as u32
+                    } else {
+                        value as u32
+                    }
+                }))
+                .map_err(|Full| {
+                    ResidentError::InvalidState("one host transfer exceeds the payload arena")
+                })?;
+            let result = self.batch.prim_with_slot(slot, 0, 0, 0, 0, |slot| {
+                RexCommand::host_line(
+                    slot,
+                    line,
+                    payload,
+                    cid_test(context.clipmode),
+                    reads_destination(context),
+                )
+            });
+            match result {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(
+                        "host line missed its anchor tile",
+                    ));
+                }
+                Err(Full) => {
+                    self.payload.rollback(checkpoint);
+                    return Err(ResidentError::InvalidState(
+                        "one host transfer exceeds an empty batch",
+                    ));
+                }
+            }
+        }
+        {
+            let mut status = self.progress.lock();
+            status.host_write_transfers += 1;
+            status.host_write_qwords += payload_qwords;
+            status.accept(position, line.map(|line| line.plane));
+        }
+        prepared.finish(context);
+        if line.is_some() {
+            self.submit()
+        } else {
+            Ok(())
+        }
+    }
+
     fn enqueue_host(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        if matches!(
+            context.drawmode0.adrmode(),
+            DRAWMODE0_ADRMODE_I_LINE
+                | DRAWMODE0_ADRMODE_F_LINE
+                | DRAWMODE0_ADRMODE_A_LINE
+        ) {
+            return self.enqueue_host_line(context);
+        }
         let prepared = prepare_host_fill(context).map_err(ResidentError::Unsupported)?;
         let payload_qwords = prepared.payload_qwords() as u64;
         let position = {

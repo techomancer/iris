@@ -2460,6 +2460,7 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
 
         let mut expected_prims = 0u64;
         let mut submitted_sequence = 0u64;
+        let mut expected_qwords = 0u64;
         for (index, case) in cases.iter().enumerate() {
             let mut actual = context(
                 case.plane,
@@ -2562,18 +2563,314 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             assert_eq!(status.accepted.sequence, Sequence(index as u64 + 1));
             assert_eq!(status.submitted.sequence, Sequence(submitted_sequence));
             assert_eq!(status.host_write_transfers, index as u64 + 1);
+            expected_qwords += case.words.len() as u64;
+        }
+
+        let mut host_lines = Vec::new();
+        let set_payload = |line: &mut Rex3Context, words: &[u64]| {
+            line.host_len = words.len() as u32;
+            line.host_cursor = 0;
+            line.hostcnt = 0;
+            line.host_shifter = 0;
+            for (index, word) in words.iter().copied().enumerate() {
+                line.hostrw[index] = word;
+            }
+        };
+        let deltas = [
+            (3, 7),
+            (3, -7),
+            (-3, 7),
+            (-3, -7),
+            (7, 3),
+            (7, -3),
+            (-7, 3),
+            (-7, -3),
+        ];
+        for (index, delta) in deltas.into_iter().enumerate() {
+            let x = 340 + index as i32 * 16;
+            let y = 120 + index as i32 * 13;
+            let mut line = line_context(
+                DRAWMODE0_ADRMODE_I_LINE_SH,
+                DRAWMODE1_PLANES_RGB,
+                true,
+                (x * 16, y * 16),
+                ((x + delta.0) * 16, (y + delta.1) * 16),
+                0xffff_ffff,
+                0x5a31_72b4,
+            );
+            line.drawmode0.0 |= 1 << 6;
+            line.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+            set_payload(
+                &mut line,
+                &[
+                    0x1020_3040_5060_7080 ^ index as u64,
+                    0x90a0_b0c0_d0e0_f000 ^ index as u64,
+                ],
+            );
+            host_lines.push((format!("packed integer HostW octant {index}"), line));
+        }
+
+        let mut fractional = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (250 * 16 + 3, 330 * 16 + 5),
+            (285 * 16 + 13, 348 * 16 + 2),
+            0xffff_00ff,
+            0x7d26_a159,
+        );
+        fractional.drawmode0.0 |=
+            (1 << 7) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18) | (1 << 20);
+        fractional.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        fractional.zpattern = 0xd6a5_39c7;
+        fractional.lspattern = 0xb5ca_d000;
+        fractional.zpat_bit = 27;
+        fractional.pat_bit = 3;
+        fractional.lsmode.set_lsrcount(2);
+        fractional.lsmode.set_lsrepeat(3);
+        fractional.lsmode.set_lslength(7);
+        fractional.xymove = ((-4i16 as u16 as u32) << 16) | 2;
+        fractional.xywin = ((2i16 as u16 as u32) << 16) | (-3i16 as u16 as u32);
+        fractional.colorred = 0x0001_8123;
+        fractional.coloralpha = 0x0002_9345;
+        fractional.colorgrn = 0x0003_a567;
+        fractional.colorblue = 0x0004_b789;
+        fractional.slopered = 0x0000_0101;
+        fractional.slopealpha = -0x0000_0203;
+        fractional.slopegrn = 0x0000_0305;
+        fractional.slopeblue = -0x0000_0407;
+        set_payload(
+            &mut fractional,
+            &[
+                0x2040_6080_a0c0_e0ff,
+                0x1133_5577_99bb_ddff,
+                0x1234_5678_9abc_def0,
+                0x0fed_cba9_8765_4321,
+            ],
+        );
+        host_lines.push((
+            "patterned shaded fractional alpha HostW".into(),
+            fractional,
+        ));
+
+        let mut opaque = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGBA,
+            true,
+            (500 * 16, 370 * 16),
+            (540 * 16, 390 * 16),
+            0xffff_ffff,
+            0x3141_5926,
+        );
+        opaque.drawmode0.0 |=
+            (1 << 6) | (1 << 7) | (1 << 12) | (1 << 13) | (1 << 16) | (1 << 17)
+                | (1 << 18);
+        opaque.drawmode1.0 |= (1 << 7) | (2 << 8) | (1 << 10);
+        opaque.zpattern = 0x6ca5_39d7;
+        opaque.lspattern = 0xb5ca_d000;
+        opaque.colorback = 0xd249_7316;
+        opaque.lsmode.set_lsrcount(1);
+        opaque.lsmode.set_lsrepeat(2);
+        opaque.lsmode.set_lslength(5);
+        opaque.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+        opaque.smask0x =
+            ((REX3_COORD_BIAS + 510) as u32) << 16 | (REX3_COORD_BIAS + 532) as u32;
+        opaque.smask0y =
+            ((REX3_COORD_BIAS + 374) as u32) << 16 | (REX3_COORD_BIAS + 388) as u32;
+        opaque.slopered = 0x0000_0101;
+        opaque.slopealpha = 0x0000_0203;
+        opaque.slopegrn = -0x0000_0305;
+        opaque.slopeblue = 0x0000_0407;
+        set_payload(
+            &mut opaque,
+            &[
+                0x3141_5926_5358_9793,
+                0x2384_6264_3383_2795,
+                0x0288_4197_1693_9937,
+                0x5105_8209_7494_4592,
+            ],
+        );
+        host_lines.push(("opaque patterned clipped color-alpha HostW".into(), opaque));
+
+        let mut antialiased = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (580 * 16 + 7, 420 * 16 + 5),
+            (660 * 16 + 9, 459 * 16 + 12),
+            u32::MAX,
+            0x0135_79bd,
+        );
+        antialiased.drawmode0.0 |= (1 << 7) | (1 << 15) | (1 << 22);
+        antialiased.drawmode1.0 |= 3 << 8;
+        antialiased.xstart += 7 * 128;
+        antialiased.ystart += 5 * 128;
+        antialiased.aweight0 = 0;
+        antialiased.aweight1 = 0;
+        let antialiased_words = (0..40)
+            .map(|index| {
+                let alpha = (index as u64 * 5 + 0x20) & 0xff;
+                (alpha << 56) | (0x1020_3040_5060_7080 ^ index as u64)
+            })
+            .collect::<Vec<_>>();
+        set_payload(&mut antialiased, &antialiased_words);
+        host_lines.push((
+            "endpoint-filtered LENGTH32 multiword antialiased HostW".into(),
+            antialiased,
+        ));
+
+        let mut single_step = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (710 * 16, 500 * 16),
+            (716 * 16, 504 * 16),
+            u32::MAX,
+            0x2718_2818,
+        );
+        single_step.drawmode0.0 =
+            (single_step.drawmode0.0 & !(3 << 8)) | (1 << 6) | (1 << 10) | (1 << 11);
+        single_step.drawmode1.0 |= 3 << 8;
+        set_payload(
+            &mut single_step,
+            &[
+                0x7f31_5926_0000_0000,
+                0x8e53_5897_0000_0000,
+                0x9a23_8462_0000_0000,
+            ],
+        );
+        host_lines.push(("single-step multiword HostW continuation".into(), single_step));
+
+        let mut yflip = line_context(
+            DRAWMODE0_ADRMODE_F_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (760 * 16 + 3, 4200 * 16 + 11),
+            (790 * 16 + 13, 4218 * 16 + 2),
+            0x00ff_ffff,
+            0x1618_0339,
+        );
+        yflip.drawmode0.0 |= (1 << 6) | (1 << 20);
+        yflip.drawmode1.0 |= (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10);
+        yflip.xymove = ((3i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+        yflip.xywin = ((-5i16 as u16 as u32) << 16) | 4;
+        set_payload(
+            &mut yflip,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+            ],
+        );
+        host_lines.push(("YFLIP XYOFFSET fractional HostW".into(), yflip));
+
+        let mut cid_reject = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (820 * 16, 550 * 16),
+            (845 * 16, 561 * 16),
+            u32::MAX,
+            0x5772_1566,
+        );
+        cid_reject.drawmode0.0 |= 1 << 6;
+        cid_reject.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        cid_reject.clipmode &= !(0xf << CLIPMODE_CIDMATCH_SHIFT);
+        set_payload(
+            &mut cid_reject,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+                0x2141_6181_a1c1_e101,
+            ],
+        );
+        host_lines.push(("CID-rejected HostW consumption".into(), cid_reject));
+
+        let mut alpha_reject = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (870 * 16, 590 * 16),
+            (895 * 16, 601 * 16),
+            u32::MAX,
+            0x2036_9bc5,
+        );
+        alpha_reject.drawmode0.0 |= 1 << 7;
+        alpha_reject.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        alpha_reject.drawmode1.0 =
+            (alpha_reject.drawmode1.0 & !(0x7 << DRAWMODE1_COMPARE_SHIFT))
+                | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT);
+        alpha_reject.alpharef = 0xf0;
+        set_payload(
+            &mut alpha_reject,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+                0x2141_6181_a1c1_e101,
+            ],
+        );
+        host_lines.push(("alpha-rejected HostW consumption".into(), alpha_reject));
+
+        let mut transparent = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (920 * 16, 630 * 16),
+            (950 * 16, 643 * 16),
+            u32::MAX,
+            0x1414_2135,
+        );
+        transparent.drawmode0.0 |= (1 << 6) | (1 << 12) | (1 << 18);
+        transparent.zpattern = 0;
+        transparent.slopered = 0x0000_0101;
+        transparent.slopealpha = -0x0000_0203;
+        transparent.slopegrn = 0x0000_0305;
+        transparent.slopeblue = -0x0000_0407;
+        set_payload(
+            &mut transparent,
+            &[
+                0x1020_3040_5060_7080,
+                0x90a0_b0c0_d0e0_f000,
+                0x1939_5979_99b9_d9f9,
+            ],
+        );
+        host_lines.push(("transparent no-progress HostW line".into(), transparent));
+
+        for (index, (label, mut actual)) in host_lines.into_iter().enumerate() {
+            let sequence = cases.len() as u64 + index as u64 + 1;
+            let mut expected = actual;
+            let payload_qwords = actual.host_len as u64;
+            if prepare_host_line(&actual)
+                .unwrap_or_else(|reason| panic!("{label}: {reason}"))
+                .line()
+                .is_some()
+            {
+                expected_prims += 1;
+                submitted_sequence = sequence;
+            }
+            resident
+                .enqueue(&mut actual)
+                .unwrap_or_else(|error| panic!("enqueue {label}: {error}"));
+            cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+            assert_context_eq(&actual, &expected, &label);
+            expected_qwords += payload_qwords;
+            let status = resident.status().unwrap();
+            assert_eq!(status.accepted.sequence, Sequence(sequence), "{label}");
+            assert_eq!(
+                status.submitted.sequence,
+                Sequence(submitted_sequence),
+                "{label}"
+            );
+            assert_eq!(status.host_write_transfers, sequence, "{label}");
+            assert_eq!(status.host_write_qwords, expected_qwords, "{label}");
         }
 
         gpu.wait(None).unwrap();
         assert!(resident.payload.is_empty());
         assert_eq!(resident.batch.prims_total, expected_prims);
-        assert_eq!(
-            resident.status().unwrap().host_write_qwords,
-            cases
-                .iter()
-                .map(|case| case.words.len() as u64)
-                .sum::<u64>(),
-        );
+        assert_eq!(resident.status().unwrap().host_write_qwords, expected_qwords);
         let observed = resident
             .observe(ObservationReason::Validation, PlaneMask::Both)
             .expect("observe HostW planes");
@@ -2642,6 +2939,39 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             unsafe { &*cpu_board.0.context.get() },
             "board HostW batch",
         );
+
+        let mut board_line = line_context(
+            DRAWMODE0_ADRMODE_A_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (170 * 16 + 7, 120 * 16 + 5),
+            (201 * 16 + 9, 139 * 16 + 12),
+            0xffff_ffff,
+            0x0135_79bd,
+        );
+        board_line.drawmode0.0 |= (1 << 7) | (1 << 22);
+        board_line.drawmode1.0 |= (1 << 7) | (1 << 8) | (1 << 10);
+        board_line.aweight0 = u32::MAX;
+        board_line.aweight1 = 0;
+        board_line.host_len = 2;
+        board_line.host_cursor = 0;
+        board_line.hostcnt = 0;
+        board_line.host_shifter = 0;
+        board_line.hostrw[0] = 0x1020_3040_5060_7080;
+        board_line.hostrw[1] = 0x90a0_b0c0_d0e0_f000;
+        for board in [&mut resident_board, &mut cpu_board] {
+            let owner = &*board.0 as *const Rex3;
+            *board.0.context.get_mut() = board_line;
+            board.0.context.get_mut().host = owner;
+        }
+        resident_board.0.execute_go();
+        cpu_board.0.execute_go();
+        assert_context_eq(
+            unsafe { &*resident_board.0.context.get() },
+            unsafe { &*cpu_board.0.context.get() },
+            "board HostW line",
+        );
+
         let mut board_backend = board_resident.lock();
         let board_observed = board_backend
             .observe(ObservationReason::Validation, PlaneMask::Both)
@@ -2657,13 +2987,13 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             "board HostW auxiliary",
         );
         let board_status = board_backend.status().unwrap();
-        assert_eq!(board_status.accepted.sequence, Sequence(1));
+        assert_eq!(board_status.accepted.sequence, Sequence(2));
         assert_eq!(
             (
                 board_status.host_write_transfers,
                 board_status.host_write_qwords
             ),
-            (1, 2)
+            (2, 4)
         );
         gpu.check().unwrap();
     });
