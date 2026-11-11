@@ -1,7 +1,10 @@
 # wgpu's GL backend presents only from an instance opened on the window's display
 
 **Status:** fixed 2026-11-11 (`set_display` in `src/wgpu/device.rs`, called from
-`src/main.rs`). Found in issue #564; not yet checked live on a GL-backend host.
+`src/main.rs`). Found in issue #564. Checked 2026-11-11 on an RX 6600 XT (radeonsi,
+Mesa 26.1.8) with `WGPU_BACKEND=gl`, High IMPACT on IP28: "drawing the window
+with wgpu", IRIX desktop up, `screen info` frame counter 0 through the boot (no
+read-back), and a monitor screenshot read back in 0.3 s.
 
 ## Symptom
 

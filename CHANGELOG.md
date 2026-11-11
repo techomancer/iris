@@ -20,6 +20,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   read every frame back from the GPU. `WGPU_BACKEND` overrides `gpu_backend`,
   and wgpu's other environment variables (`WGPU_VALIDATION`,
   `WGPU_GL_FENCE_BEHAVIOR`, ...) now apply.
+- A GPU frame read-back that times out (seen on the GL backend) now drops that
+  frame instead of wedging every later read-back and the display with it.
 
 ### Guest clocks keep their rate on Windows
 
