@@ -656,9 +656,17 @@ impl MaceAudio {
                 k += 1;
             }
         }
-        for v in mixed {
-            let _ = p.out.producer.push(v.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
-        }
+        push_mixed(&mut p.out.producer, &mixed);
+    }
+}
+
+/// Clamp the mixed stereo pairs to 16 bits and push each pair whole or not
+/// at all: with one slot left the left sample alone would go in and every
+/// later pair would be swapped.
+fn push_mixed(prod: &mut rtrb::Producer<i16>, mixed: &[i32]) {
+    for pair in mixed.chunks_exact(2) {
+        let [l, r] = [pair[0], pair[1]].map(|v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        crate::host_audio::push_frame(prod, &[l, r]);
     }
 }
 
@@ -805,6 +813,17 @@ mod tests {
     fn read_codec(a: &MaceAudio, reg: u32) -> u16 {
         a.write(MACE_AUDIO + 0x08, (reg as u64) << 17 | 1 << 16);
         a.read(MACE_AUDIO + 0x18) as u16
+    }
+
+    #[test]
+    fn a_pair_that_does_not_fit_is_dropped_whole() {
+        // Three slots: the first pair fits and leaves one, which the left
+        // sample of the second must not take.
+        let (mut p, mut c) = rtrb::RingBuffer::<i16>::new(3);
+        push_mixed(&mut p, &[1, -2, 40000, -40000]);
+        assert_eq!(std::iter::from_fn(|| c.pop().ok()).collect::<Vec<_>>(), [1, -2]);
+        push_mixed(&mut p, &[40000, -40000]);
+        assert_eq!(std::iter::from_fn(|| c.pop().ok()).collect::<Vec<_>>(), [i16::MAX, i16::MIN]);
     }
 
     #[test]
