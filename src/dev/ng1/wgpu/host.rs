@@ -40,6 +40,7 @@ pub(super) struct PreparedHostFill {
     fill: Option<HostFill>,
     completion: HostCompletion,
     payload_qwords: usize,
+    fast_clear: bool,
 }
 
 impl PreparedHostFill {
@@ -49,6 +50,10 @@ impl PreparedHostFill {
 
     pub(super) fn payload_qwords(&self) -> usize {
         self.payload_qwords
+    }
+
+    pub(super) fn fast_clear(&self) -> bool {
+        self.fast_clear
     }
 
     pub(super) fn finish(self, context: &mut Rex3Context) {
@@ -159,9 +164,7 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
     }
 
     let mode = rex3_shape::unpack(context.drawmode0.0, context.drawmode1.0, context.clipmode);
-    if mode.fastclear() != 0 {
-        return Err("host fast clear");
-    }
+    let fast_clear = mode.fastclear() != 0;
     let plane = match context.drawmode1.planes() {
         DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => Some(FillPlane::Rgb),
         DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => Some(FillPlane::Aux),
@@ -221,6 +224,7 @@ pub(super) fn prepare_host_fill(context: &Rex3Context) -> Result<PreparedHostFil
             shade: walk.shade,
         },
         payload_qwords: context.host_len.max(1) as usize,
+        fast_clear,
     })
 }
 
@@ -690,14 +694,22 @@ mod tests {
 
             let mut fast_clear = context(false, 1 << 7, 1 << 7);
             fast_clear.drawmode1.0 |= 1 << 17;
-            assert_eq!(
-                prepare_host_fill(&fast_clear).unwrap_err(),
-                "host fast clear"
-            );
+            fast_clear.colorvram = 0x0065_4321;
+            let prepared = prepare_host_fill(&fast_clear).expect("ALPHAHOST fast clear");
+            assert!(prepared.fast_clear());
+            let mut actual = fast_clear;
+            prepared.finish(&mut actual);
+            let mut expected = fast_clear;
+            run_cpu(&mut expected);
+            assert_completion(&actual, &expected, "ALPHAHOST fast clear");
 
             let mut color_host = context(false, (1 << 6) | (1 << 8), 1 << 7);
             color_host.drawmode1.0 |= 1 << 17;
-            let _ = prepare_host_fill(&color_host).expect("COLORHOST overrides fast clear");
+            assert!(
+                !prepare_host_fill(&color_host)
+                    .expect("COLORHOST overrides fast clear")
+                    .fast_clear()
+            );
         });
     }
 }

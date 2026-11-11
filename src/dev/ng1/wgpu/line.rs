@@ -345,6 +345,7 @@ pub(super) struct PreparedHostLine {
     line: Option<LineCommand>,
     completion: HostLineCompletion,
     payload_qwords: usize,
+    fast_clear: bool,
 }
 
 impl PreparedHostLine {
@@ -354,6 +355,10 @@ impl PreparedHostLine {
 
     pub(super) fn payload_qwords(&self) -> usize {
         self.payload_qwords
+    }
+
+    pub(super) fn fast_clear(&self) -> bool {
+        self.fast_clear
     }
 
     pub(super) fn finish(self, context: &mut Rex3Context) {
@@ -383,9 +388,7 @@ pub(super) fn prepare_host_line(
         return Err("host payload length");
     }
     let mode = rex3_shape::unpack(context.drawmode0.0, context.drawmode1.0, context.clipmode);
-    if mode.fastclear() != 0 {
-        return Err("host fast clear");
-    }
+    let fast_clear = mode.fastclear() != 0;
 
     let mut simulated = *context;
     let mut stream = HostStream::from_context(context);
@@ -464,6 +467,7 @@ pub(super) fn prepare_host_line(
             shade: ShadeDda::from_context(&simulated),
         },
         payload_qwords: context.host_len as usize,
+        fast_clear,
     })
 }
 
@@ -1108,14 +1112,11 @@ mod tests {
             fast_clear.drawmode0.0 &= !(1 << 6);
             fast_clear.drawmode0.0 |= 1 << 7;
             fast_clear.drawmode1.0 |= 1 << 17;
-            let unchanged = fast_clear;
-            assert_eq!(
-                prepare_host_line(&fast_clear).unwrap_err(),
-                "host fast clear"
-            );
-            assert_eq!(fast_clear.xstart, unchanged.xstart);
-            assert_eq!(fast_clear.ystart, unchanged.ystart);
-            assert_eq!(fast_clear.host_cursor, unchanged.host_cursor);
+            fast_clear.colorvram = 0x0065_4321;
+            assert!(prepare_host_line(&fast_clear)
+                .expect("ALPHAHOST fast-clear line")
+                .fast_clear());
+            check_host(fast_clear, "ALPHAHOST fast-clear line");
         });
     }
 }

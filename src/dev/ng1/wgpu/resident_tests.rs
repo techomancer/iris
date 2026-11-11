@@ -896,22 +896,55 @@ fn resident_gpu_linear_fills_match_complete_cpu_planes() {
             resident.scanout_bindings(&other_gpu),
             Err(ResidentError::DeviceMismatch)
         ));
-        let before_rejection = resident.status().unwrap();
-        let mut unsupported = context(
-            DRAWMODE1_PLANES_RGB, true, false, (1, 2), (10, 12), u32::MAX, 0x1234_5678,
+        let mut fast_clear = context(
+            DRAWMODE1_PLANES_RGB, true, false, (1, 2), (3, 2), u32::MAX, 0x1234_5678,
         );
-        unsupported.drawmode0.0 |= 1 << 7;
-        unsupported.drawmode1.0 |= 1 << 17;
-        let unchanged = unsupported;
-        assert_eq!(
-            resident.enqueue(&mut unsupported),
-            Err(ResidentError::Unsupported("host fast clear"))
+        fast_clear.drawmode0.0 |= (1 << 7) | (1 << 12) | (1 << 13) | (1 << 18);
+        fast_clear.drawmode1.0 |=
+            (1 << 7) | (3 << 8) | (1 << 10) | (1 << 16) | (1 << 17) | (1 << 18)
+                | DRAWMODE1_LOGICOP_XOR_SH;
+        fast_clear.colorvram = 0x0065_4321;
+        fast_clear.host_len = 2;
+        fast_clear.host_cursor = 0;
+        fast_clear.hostcnt = 0;
+        fast_clear.host_shifter = 0;
+        fast_clear.hostrw[0] = 0x1020_3040_5060_7080;
+        fast_clear.hostrw[1] = 0x90a0_b0c0_d0e0_f000;
+        assert!(
+            prepare_host_fill(&fast_clear)
+                .expect("prepare ALPHAHOST fast clear")
+                .fast_clear()
         );
-        assert_context_eq(&unsupported, &unchanged, "rejected fast-clear host mode");
+        let mut expected = fast_clear;
+        let mut expected_rgb = seed_rgb.clone();
+        let mut expected_aux = seed_aux.clone();
+        resident
+            .enqueue(&mut fast_clear)
+            .expect("enqueue ALPHAHOST fast clear");
+        cpu_host_draw(&mut expected, &mut expected_rgb, &mut expected_aux);
+        assert_context_eq(&fast_clear, &expected, "ALPHAHOST fast-clear context");
+        resident.submit().unwrap();
+        gpu.wait(None).unwrap();
+        let observed = resident
+            .observe(ObservationReason::Validation, PlaneMask::Both)
+            .expect("observe ALPHAHOST fast clear");
+        compare_observed(
+            observed.rgb().unwrap(),
+            &expected_rgb,
+            "ALPHAHOST fast-clear RGB",
+        );
+        compare_observed(
+            observed.aux().unwrap(),
+            &expected_aux,
+            "ALPHAHOST fast-clear auxiliary",
+        );
         let status = resident.status().unwrap();
-        assert_eq!(status.accepted, before_rejection.accepted);
-        assert_eq!(status.observations, before_rejection.observations);
-        assert_eq!(status.raw_plane_map_attempts, before_rejection.raw_plane_map_attempts);
+        assert_eq!(status.accepted.sequence, Sequence(2));
+        assert_eq!(status.submitted, status.accepted);
+        assert_eq!(
+            (status.host_write_transfers, status.host_write_qwords),
+            (1, 2)
+        );
         gpu.check().unwrap();
     });
 }
@@ -2456,6 +2489,19 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 initial_count: 0,
                 initial_shifter: 0,
             },
+            Case {
+                label: "ALPHAHOST fast-clear span",
+                plane: DRAWMODE1_PLANES_RGB,
+                rgb_mode: true,
+                span: true,
+                start: (301, 81),
+                end: (304, 81),
+                draw_mode: (1 << 7) | (1 << 12) | (1 << 13) | (1 << 18),
+                host_mode: (1 << 7) | (3 << 8) | (1 << 10),
+                words: &[0x1020_3040_5060_7080, 0x90a0_b0c0_d0e0_f000],
+                initial_count: 0,
+                initial_shifter: 0,
+            },
         ];
         let mut expected_prims = 0u64;
         let mut expected_qwords = 0u64;
@@ -2543,6 +2589,30 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
                 }
                 "decreasing LR-only block" | "decreasing LR-only span" => {
                     actual.bresoctinc1.set_octant(crate::dev::ng1::rex3::OCTANT_XDEC);
+                }
+                "ALPHAHOST fast-clear span" => {
+                    actual.drawmode1.0 = (actual.drawmode1.0
+                        & !((7 << DRAWMODE1_COMPARE_SHIFT) | DRAWMODE1_LOGICOP_MASK))
+                        | (DRAWMODE1_COMPARE_GT << DRAWMODE1_COMPARE_SHIFT)
+                        | DRAWMODE1_LOGICOP_XOR_SH
+                        | (1 << 16)
+                        | (1 << 17)
+                        | (1 << 18);
+                    actual.colorvram = 0x0065_4321;
+                    actual.alpharef = 0xff;
+                    actual.wrmask = 0x00ff_0ff0;
+                    actual.zpattern = 0;
+                    actual.lspattern = 0;
+                    actual.clipmode |= CLIPMODE_ENSMASK_SMASK0;
+                    actual.smask0x =
+                        ((REX3_COORD_BIAS + 302) as u32) << 16 | (REX3_COORD_BIAS + 304) as u32;
+                    actual.smask0y =
+                        ((REX3_COORD_BIAS + 81) as u32) << 16 | (REX3_COORD_BIAS + 81) as u32;
+                    assert!(
+                        prepare_host_fill(&actual)
+                            .expect("prepare ALPHAHOST fast-clear span")
+                            .fast_clear()
+                    );
                 }
                 _ => {}
             }
@@ -2809,6 +2879,34 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
             ],
         );
         host_lines.push(("alpha-rejected HostW consumption".into(), alpha_reject));
+
+        let mut fast_clear_line = line_context(
+            DRAWMODE0_ADRMODE_I_LINE_SH,
+            DRAWMODE1_PLANES_RGB,
+            true,
+            (910 * 16, 615 * 16),
+            (920 * 16, 619 * 16),
+            0x00ff_ffff,
+            0x2036_9bc5,
+        );
+        fast_clear_line.drawmode0.0 |=
+            (1 << 7) | (1 << 12) | (1 << 13) | (1 << 18);
+        fast_clear_line.drawmode1.0 |=
+            (1 << 7) | (3 << 8) | (1 << 16) | (1 << 17) | (1 << 18)
+                | DRAWMODE1_LOGICOP_XOR_SH;
+        fast_clear_line.colorvram = 0x0031_7259;
+        fast_clear_line.zpattern = 0;
+        fast_clear_line.lspattern = 0;
+        let fast_clear_words = (0..12)
+            .map(|index| 0x1020_3040_5060_7080 ^ index as u64)
+            .collect::<Vec<_>>();
+        set_payload(&mut fast_clear_line, &fast_clear_words);
+        assert!(
+            prepare_host_line(&fast_clear_line)
+                .expect("prepare ALPHAHOST fast-clear line")
+                .fast_clear()
+        );
+        host_lines.push(("ALPHAHOST fast-clear line".into(), fast_clear_line));
 
         let mut transparent = line_context(
             DRAWMODE0_ADRMODE_I_LINE_SH,
