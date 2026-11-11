@@ -2130,3 +2130,40 @@ fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
         assert_eq!(v & (1 << 27), 0, "from the keyboard");
     }
 }
+
+/// A reset while the receive thread is feeding a port must not leave the
+/// UART's interrupt latched. The thread latches the bit from a byte that
+/// arrived just before the reset clears the UART; if the words were zeroed
+/// first, that bit survives with nothing behind it to clear it. The guest
+/// is the only thing that re-enables the UART's interrupt, and this loop
+/// does it before the reset, not after, so after a reset the bit must
+/// always read clear.
+#[test]
+fn a_reset_racing_the_receive_thread_leaves_no_stale_interrupt() {
+    let (r, _tm) = running_rig();
+    r.w32(reg::INT_ENABLE_SET, int::SERIAL_A);
+    r.c.start();
+    let rx: Vec<std::thread::Thread> = r.c.threads.lock().iter().map(|t| t.thread().clone()).collect();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let feeder = {
+        let (wire, stop) = (r.wire[0].clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                wire.inp.lock().unwrap().push_back(b'x');
+                // Wake the receive thread so it runs while the reset does.
+                for t in &rx {
+                    t.unpark();
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    for i in 0..3000 {
+        r.w8(reg::SERIAL_A + 1, 0x01); // IER: receive data
+        r.c.reset();
+        assert_eq!(r.c.int_status() & int::SERIAL_A, 0, "reset {i} left the UART's bit latched");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    feeder.join().unwrap();
+    r.c.stop();
+}
