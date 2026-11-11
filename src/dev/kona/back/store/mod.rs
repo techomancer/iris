@@ -36,7 +36,7 @@ pub mod texture;
 
 use std::alloc::{alloc_zeroed, dealloc, Layout as MemLayout};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering::{Acquire, Relaxed, Release}};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 
 /// Words in a pixel's record: the largest class.
 pub const MAX_WORDS: usize = 64;
@@ -114,6 +114,11 @@ pub struct PixelStore {
     slots: [AtomicPtr<AtomicU32>; POSITIONS],
     /// Texture memory, which a draw reads beside the planes.
     tex: texture::TextureStore,
+    /// Set after the pixels, or what they are shown through, may have changed;
+    /// the display clears it as it starts a frame. The store is written through
+    /// raw word arrays, so it cannot tell a write from a read: whoever finishes
+    /// a piece of drawing says so with `touch`.
+    touched: AtomicBool,
 }
 
 impl PixelStore {
@@ -126,7 +131,22 @@ impl PixelStore {
 
     /// A store whose texture memory is `tex`: a product's own size.
     pub fn with_texture(width: u32, height: u32, tex: texture::TextureStore) -> PixelStore {
-        PixelStore { width: width as usize, height: height as usize, slots: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())), tex }
+        PixelStore { width: width as usize, height: height as usize, slots: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())), tex, touched: AtomicBool::new(true) }
+    }
+
+    /// Say the pixels changed, after the writes: a frame started from now on
+    /// shows them. Every call stores, even when the flag is already up, because a
+    /// frame that clears it between this caller's writes and its call would
+    /// otherwise lose them.
+    #[inline]
+    pub fn touch(&self) {
+        self.touched.store(true, Release);
+    }
+
+    /// Whether anything was touched since the last call, clearing the flag. The
+    /// display calls it before it reads the pixels.
+    pub fn take_touched(&self) -> bool {
+        self.touched.swap(false, AcqRel)
     }
 
     /// Texture memory.
@@ -232,6 +252,7 @@ impl PixelStore {
     /// pieces: a reader racing a reset must see the old value or zero, never a
     /// torn one. It is a cold path.
     pub fn reset(&self) {
+        self.touch();
         self.tex.reset();
         for w in self.allocated() {
             let a = self.array(w).expect("allocated");

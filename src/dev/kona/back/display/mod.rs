@@ -7,8 +7,8 @@
 //! to do with a run of pixels once and not per pixel.
 //!
 //! Deferred, as speed work the model does not do: composing by runs of equal
-//! (main, overlay) ID pairs, and presenting only the changed lines (the board
-//! presents every frame, as VPro's does). The popup and overlay planes stay word
+//! (main, overlay) ID pairs, and presenting only the changed lines (a frame is
+//! composed whole, and only when something drew; see `Compositor`). The popup and overlay planes stay word
 //! positions beside the display-ID plane; splitting them into a main-ID and an
 //! overlay-ID plane would move the recorded stores' hashes and is not done.
 //!
@@ -244,10 +244,15 @@ fn compose_layers(store: &PixelStore, tables: &Baked, row: &mut [u32], src: usiz
     }
 }
 
-/// The display thread's frame: compose the store through the tables every
-/// retrace and present it, as VPro's display does. The store is not told when
-/// drawing changes it, so a frame composed from a half-drawn store is simply
-/// replaced by the next.
+/// Frames composed with nothing drawn before one is composed anyway, so a window
+/// that missed a frame catches up. About ten a second at 60 Hz.
+pub const IDLE_REFRESH: u32 = 6;
+
+/// The display thread's frame: at each retrace, compose the store through the
+/// tables and present it when something drew since the last frame, when a
+/// screenshot or frame is wanted, and on every sixth frame otherwise. A frame
+/// composed from a half-drawn store is replaced by the next, because whoever
+/// finishes drawing raises the store's flag after its writes.
 pub struct Compositor {
     store: Arc<PixelStore>,
     word: usize,
@@ -255,20 +260,31 @@ pub struct Compositor {
     tables: Arc<Mutex<Tables>>,
     display: Arc<Display>,
     frame: Vec<u32>,
+    /// Frames passed over since one was composed.
+    idle: u32,
 }
 
 impl Compositor {
     pub fn new(store: Arc<PixelStore>, word: usize, map: Arc<Mutex<ColourMap>>, tables: Arc<Mutex<Tables>>, display: Arc<Display>) -> Compositor {
         let n = store.width() as usize * store.height() as usize;
-        Compositor { store, word, map, tables, display, frame: vec![0; n] }
+        Compositor { store, word, map, tables, display, frame: vec![0; n], idle: 0 }
     }
 }
 
 impl Compositor {
-    /// Compose the frame and present it.
+    /// Compose the frame and present it, unless nothing has changed.
     pub fn frame(&mut self) {
-        // The requests this frame answers are noted before it is composed.
+        // The requests this frame answers are noted before it is composed, and
+        // the flag is cleared before the pixels are read.
         let noted = self.display.note();
+        let drawn = self.store.take_touched();
+        if !drawn && !self.display.wanted() {
+            self.idle += 1;
+            if self.idle < IDLE_REFRESH {
+                return;
+            }
+        }
+        self.idle = 0;
         // The tables are copied once per frame, under their lock; the store
         // is read as it is, without waiting for drawing.
         let map = self.map.lock().clone();
@@ -352,6 +368,34 @@ impl Pixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame is composed and presented when the store was touched, when a frame or
+    /// screenshot is wanted, and on every sixth frame otherwise.
+    #[test]
+    fn an_idle_display_composes_a_frame_in_six() {
+        use crate::gfx_display::GfxDisplay;
+        let store = Arc::new(PixelStore::new(4, 3));
+        let display = Arc::new(Display::detached());
+        let mut c = Compositor::new(store.clone(), 1, Arc::default(), Arc::default(), display.clone());
+        let shown = || display.screen().lock().frame_seq;
+        c.frame();
+        assert_eq!(shown(), 1, "a new store is shown once");
+        for _ in 0..IDLE_REFRESH - 1 {
+            c.frame();
+        }
+        assert_eq!(shown(), 1, "nothing drew: the frames are passed over");
+        c.frame();
+        assert_eq!(shown(), 2, "the sixth idle frame is composed");
+        store.touch();
+        c.frame();
+        assert_eq!(shown(), 3, "a touched store is shown at once");
+        c.frame();
+        assert_eq!(shown(), 3, "and only once");
+        display.request_frame();
+        c.frame();
+        assert_eq!(shown(), 4, "a wanted frame is composed");
+        assert!(!display.frame_pending());
+    }
 
     #[test]
     fn a_load_keeps_the_top_eight_bits_of_each_ten() {

@@ -401,7 +401,9 @@ impl KonaBackend {
     /// Put what `prepare_chunks` read into the store.
     pub fn apply_chunks(&mut self, p: snapshot::Prepared) -> Result<(), String> {
         self.drain();
-        snapshot::apply(&self.store, &mut self.tables.lock(), p)
+        let applied = snapshot::apply(&self.store, &mut self.tables.lock(), p);
+        self.store.touch();
+        applied
     }
 
     /// Restore the bulk state from chunks.
@@ -586,7 +588,15 @@ impl KonaBackend {
                 }
             }
         }
-        self.handle_job(port, job)
+        // A retrace changes no pixel; every other job may. The flag goes up after
+        // the job's own writes (the tiles raise it for theirs), so a frame the
+        // display started meanwhile is followed by another.
+        let retrace = matches!(job, Job::Retrace { .. });
+        let reply = self.handle_job(port, job);
+        if !retrace {
+            self.store.touch();
+        }
+        reply
     }
 
     /// The board is starting: spawn the display thread, which completes retrace
@@ -1612,6 +1622,20 @@ mod tests {
         let text = run(&mut b, &["status"]).1;
         assert!(text.contains("layouts           1 made") && text.contains("1 x not 10 words"), "{text}");
         assert!(text.contains("(13 words)"), "{text}");
+    }
+
+    /// A job raises the store's flag for the display once it has run, and a
+    /// retrace, which changes no pixel, does not.
+    #[test]
+    fn a_job_touches_the_store_unless_it_is_a_retrace() {
+        let mut b = backend();
+        assert!(b.store.take_touched(), "a new store is shown once");
+        send(&mut b, Job::Retrace { tag: 1 });
+        assert!(!b.store.take_touched());
+        command(&mut b, Grammar::Textport, 2, &[7]);
+        assert!(b.store.take_touched());
+        b.reset();
+        assert!(b.store.take_touched(), "a reset is shown");
     }
 
     /// Textport commands draw into the colour word of the store, a bitmap
