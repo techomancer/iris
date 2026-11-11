@@ -772,15 +772,14 @@ It is deliberately slow and never an automatic fallback. M2 is complete
 within this gated test-only scope. Production live integration and final
 on-screen validation remain open; `iris-gui` cannot select this mode.
 
-The Windows gate `.\scripts\test-resident-gate.ps1` checks 28 resident CPU,
-4 flat-fill, 2 line, 2 HostW walker, 1 HostW interpreter/JIT source oracle,
-2 resident HostR port/retirement, 1 shade-DDA, 1 pattern-state, 3 command-ABI
-and 3 direct-state tests, plus 19
-resident GPU and 8
+The Windows gate `.\scripts\test-resident-gate.ps1` checks 103 cases: 28
+resident CPU, 4 flat-fill, 2 line, 1 shade-DDA, 1 pattern-state, 3 command-ABI
+and 3 direct-state tests, 2 HostW walker tests, 1 HostW interpreter/JIT source
+oracle, 2 resident HostR port/retirement tests, plus 19 resident GPU and 9
 direct-scanout tests on each of Vulkan and D3D12. It requires the named
 backend on an integrated/discrete adapter and a native desktop, and fails
 rather than skipping when unavailable; a single-backend run is not the
-complete 101-test gate. See
+complete 103-test gate. See
 `TESTING.md` for commands and prerequisites.
 
 ### M3 - Command ABI and complete uber-shader
@@ -1025,18 +1024,35 @@ primitive.
 
 ### M6 - Explicit observers and frontend matrix
 
-- [ ] Read back composed output for screenshots and VNC/CI capture.
-- [ ] Keep raw-plane reads separate from composed-frame reads.
-- [ ] Validate CPU+GL, CPU+wgpu, wgpu+wgpu and readback wgpu+GL/CPU modes.
-- [ ] Label the readback compositor mode as compatibility/validation only.
-- [ ] Ensure capture users cannot silently force the proper GPU path into
+- [x] Read back composed output for screenshots and VNC/CI capture.
+- [x] Keep raw-plane reads separate from composed-frame reads.
+- [x] Validate CPU+GL, CPU+wgpu, wgpu+wgpu and readback wgpu+GL/CPU modes.
+- [x] Label the readback compositor mode as compatibility/validation only.
+- [x] Ensure capture users cannot silently force the proper GPU path into
       continuous raw-plane readback without reporting the mode change.
 
 Complete when all four combinations produce matching images and only the
 documented combinations/readers increment readback counters.
 
-Composed-output screenshot, headless and VNC capture are exercised by the
-test-only resident display; live frontend integration remains open.
+Complete within the gated resident backend. The test-only display has a fixed,
+typed `DirectWgpu` or `ReadbackCompatibility` mode. Renderer rejection,
+capture demand and capture failure cannot change that selection. Direct
+presentation and its screenshot, frame-request, headless and VNC consumers
+read back only the composed output; they produce no raw-plane observation.
+Compatibility presentation performs an attributed two-plane
+`Compatibility` observation, then uses a separate CPU cache and the ordinary
+renderer. Per-mode composed-capture attempts, successes and bytes are counted
+separately from typed raw-plane observation traffic and survive display
+shutdown and resident reset.
+
+The dual-backend matrix compares CPU software/GL composition, CPU planes
+through wgpu scanout, resident planes through same-device wgpu scanout and
+resident readback through the ordinary CPU renderer. Capture tickets are
+coalesced at the frame cut, newer tickets remain pending, and failures neither
+publish stale pixels nor advance `frame_seq`. The complete screenshot,
+headless frame and loopback VNC cases run in both resident modes. Live
+frontend integration remains open; no production selector exposes either
+resident mode yet.
 
 ### M7 - Snapshot, reset and failure lifecycle
 
