@@ -279,6 +279,13 @@ impl Md {
     }
     /// An access through `view`.
     pub(super) fn access(&self, view: View, addr: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
+        self.access_then(view, addr, bytes, write, || {})
+    }
+    /// An access through `view`; `after` runs once it is done and, for a bank
+    /// configuration write, while the other processors are still parked (a
+    /// machine with no `World` has none to park). No unit lock is held then,
+    /// nor `remapping`.
+    pub(super) fn access_then(&self, view: View, addr: u64, bytes: u64, write: Option<u64>, after: impl FnOnce()) -> Option<u64> {
         if ![1, 2, 4, 8].contains(&bytes) || addr % bytes != 0 {
             return self.refuse("access", addr);
         }
@@ -289,8 +296,16 @@ impl Md {
         // `remapping`, which a processor waiting to park could be waiting for.
         let reconfigure = write.is_some() && matches!(view, View::Registers) && addr == reg::CONFIG;
         match self.world.get() {
-            Some(world) if reconfigure => world.stop_others(|| self.access_inner(view, addr, bytes, write, true)),
-            _ => self.access_inner(view, addr, bytes, write, reconfigure),
+            Some(world) if reconfigure => world.stop_others(|| {
+                let result = self.access_inner(view, addr, bytes, write, true);
+                after();
+                result
+            }),
+            _ => {
+                let result = self.access_inner(view, addr, bytes, write, reconfigure);
+                after();
+                result
+            }
         }
     }
     fn access_inner(&self, view: View, addr: u64, bytes: u64, write: Option<u64>, reconfigure: bool) -> Option<u64> {
@@ -1202,11 +1217,15 @@ mod tests {
     /// configuration write holds the other node's processor still whichever
     /// node's thread makes it, whether through the register window or as the
     /// peer's vector engine: each chip counts a thread of the other node as
-    /// no processor of its own, and the world skips only the writer.
+    /// no processor of its own, and the world skips only the writer. The
+    /// windows that show the remapped memory are laid before the other
+    /// processor runs again, not after.
     #[test]
     fn a_bank_configuration_write_parks_the_other_nodes_processor() {
         use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT};
         use crate::dev::bedrock::Population;
+        use crate::node_windows::{NodeShape, Windows};
+        use parking_lot::Mutex;
         use std::sync::atomic::AtomicBool;
         let chips: Vec<_> = (0..2)
             .map(|n| {
@@ -1222,6 +1241,28 @@ mod tests {
         world.set_slots(slots.clone());
         for chip in &chips {
             chip.set_world(world.clone());
+        }
+        // Each node's shape notes, whenever the windows read it, whether its
+        // processor is held at that moment.
+        struct Watched {
+            shape: Arc<dyn NodeShape>,
+            word: Arc<AtomicU64>,
+            seen: Arc<Mutex<Vec<bool>>>,
+        }
+        impl NodeShape for Watched {
+            fn number(&self) -> u16 { self.shape.number() }
+            fn calias(&self) -> u64 { self.shape.calias() }
+            fn routed(&self) -> bool { self.shape.routed() }
+            fn runs(&self) -> Arc<[crate::node_windows::Run]> {
+                self.seen.lock().push(self.word.load(Ordering::SeqCst) & HOST_PARK_BIT != 0);
+                self.shape.runs()
+            }
+        }
+        let windows = Arc::new(Windows::new(33));
+        let seen: Vec<Arc<Mutex<Vec<bool>>>> = (0..2).map(|_| Arc::default()).collect();
+        for (n, chip) in chips.iter().enumerate() {
+            windows.add_node(chip.md.physical(), Arc::new(Watched { shape: chip.shape(), word: words[n].clone(), seen: seen[n].clone() }));
+            chip.set_windows(&windows);
         }
         let running = Arc::new(AtomicBool::new(true));
         // How many times each processor stopped for a hold.
@@ -1245,6 +1286,7 @@ mod tests {
         for writer in 0..2usize {
             let (target, other) = (&chips[1 - writer], 1 - writer);
             let before: Vec<u64> = parks.iter().map(|p| p.load(Ordering::SeqCst)).collect();
+            seen[other].lock().clear();
             std::thread::scope(|s| {
                 s.spawn(|| {
                     set_current_cpu(writer as u8);
@@ -1260,6 +1302,9 @@ mod tests {
             }
             assert_eq!(parks[other].load(Ordering::SeqCst), before[other] + 1, "CPU {other} was not held for CPU {writer}'s write to the other node");
             assert_eq!(parks[writer].load(Ordering::SeqCst), before[writer], "the writer, CPU {writer}, held itself");
+            let seen = seen[other].lock();
+            assert!(!seen.is_empty(), "the write did not lay the windows");
+            assert!(seen.iter().all(|&held| held), "CPU {other} ran while the windows were laid after CPU {writer}'s write: {seen:?}");
         }
         running.store(false, Ordering::Relaxed);
         for t in spinners {

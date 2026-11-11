@@ -635,11 +635,15 @@ impl Bedrock {
             reg::PI1_BASE..reg::IO_BASE => self.pi_access(who, 1, offset - reg::PI1_BASE, size, value),
             reg::IO_BASE..reg::MD_BASE => self.block_access(who, offset, size, value),
             reg::MD_BASE..reg::WINDOW => {
-                let result = self.md.access(View::Registers, offset - reg::MD_BASE, u64::from(size), value);
-                // The other processors run again; the window is laid afresh.
-                if value.is_some() && offset - reg::MD_BASE == md::reg::CONFIG {
-                    self.lay_windows();
-                }
+                // A bank configuration write remaps this node's memory, and
+                // the window that shows it to the peer is laid afresh before
+                // the other processors run again: a peer must not see the old
+                // layout beside the new one.
+                let result = self.md.access_then(View::Registers, offset - reg::MD_BASE, u64::from(size), value, || {
+                    if value.is_some() && offset - reg::MD_BASE == md::reg::CONFIG {
+                        self.lay_windows();
+                    }
+                });
                 result.map_or(BusRead64::err(), BusRead64::ok)
             }
             _ => BusRead64::err(),

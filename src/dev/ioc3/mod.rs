@@ -77,7 +77,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IP29, IP30, IP34, IP34_NO_PS2, MIO};
+pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IO7, IP29, IP30, IP34, IP34_NO_PS2, MIO};
 pub use self::dma::Ioc3Dma;
 use self::gpio::Gpio;
 pub use self::gpio::{PinUse, PinWire};

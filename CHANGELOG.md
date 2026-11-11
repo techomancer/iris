@@ -13,6 +13,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Origin 3200
+
+- New machine `origin3200_ip35`: one or two C-bricks and an I-brick. PROM 6.210 reaches
+  the System Maintenance Menu on both and IRIX boots from a Fibre Channel disk
+  (`[fibre_channel.disk.N]`).
+
 ### GPU raster on the GL backend draws the window directly
 
 - With `raster = "wgpu"` and `gpu_backend = "gl"`, the wgpu window renderer now

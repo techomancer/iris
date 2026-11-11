@@ -45,6 +45,7 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
     match cfg.machine.profile {
         crate::config::MachineProfile::FuelIp34 => Ok(Box::new(crate::ip34_machine::FuelMachine::new(&cfg)?)),
         crate::config::MachineProfile::TezroIp53 => Ok(Box::new(crate::ip53_machine::TezroMachine::new(&cfg)?)),
+        crate::config::MachineProfile::Origin3200Ip35 => Ok(Box::new(crate::ip35_machine::Origin3200Machine::new(&cfg)?)),
         // The O2 is its own machine (CRIME, MACE, GBE), not an MC/HPC3 one.
         crate::config::MachineProfile::O2Ip32 => Ok(Box::new(crate::ip32_machine::O2Machine::new(&cfg)?)),
         // So is the Octane (HEART, Xbow, Bridge).
