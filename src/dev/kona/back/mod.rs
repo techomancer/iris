@@ -1262,6 +1262,16 @@ impl KonaBackend {
                     self.query_counts.unposted += 1;
                 }
             }
+            // A finish drains the pipe (above), and with its flag set it runs the read-back's start and
+            // finish back to back, which is the completion the client's wait polls for
+            // (inferred; the flag's meaning is inferred from the sender, which always sends 1).
+            Job::Command { grammar: Grammar::Gl, selector: FINISH_DRAIN_PIPE_AND_SIGNAL_COMPLETION, args, .. } if args.first().is_some_and(|&f| f != 0) => {
+                if port.context().is_some() && port.return_page_valid() {
+                    port.post_return(4, &gl::query::reply_bytes(&[]));
+                } else {
+                    self.query_counts.unposted += 1;
+                }
+            }
             Job::Command { grammar: Grammar::Gl, selector: POP_ATTRIBUTE_STACK, .. } => {
                 let c = self.contexts.select(port.context());
                 gl::query::pop_attributes(&mut c.gl, &mut self.query_counts);
