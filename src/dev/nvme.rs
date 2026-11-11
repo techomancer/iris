@@ -575,9 +575,8 @@ impl Nvme {
         if !st.backlog.is_empty() || st.csts & (CSTS_RDY | CSTS_CFS) != CSTS_RDY {
             return None;
         }
-        let n = st.sqs.len();
-        let order: Vec<usize> = std::iter::once(0).chain((0..n - 1).map(|i| 1 + (st.cursor + i) % (n - 1))).collect();
-        for qid in order {
+        let (n, cursor) = (st.sqs.len(), st.cursor);
+        for qid in std::iter::once(0).chain((0..n - 1).map(|i| 1 + (cursor + i) % (n - 1))) {
             let Some(sq) = st.sqs[qid].as_ref() else { continue };
             if sq.head == sq.tail || st.cqs[sq.cqid as usize].as_ref().is_none_or(Cq::is_full) {
                 continue;
