@@ -231,6 +231,9 @@ pub struct Mec {
     ram: Arc<crate::dev::crime_mem::O2Memory>,
     st: Mutex<State>,
     link: Mutex<Option<crate::net::Rings>>,
+    /// The backend behind `link`, stopped and waited for when the chip is
+    /// dropped, so the next machine can bind its host sockets.
+    backend: std::sync::OnceLock<crate::net::Running>,
     /// CRIME's Ethernet input.
     irq: std::sync::OnceLock<crate::irq::IrqLine>,
     /// The status bar's activity bits, shared with the display thread.
@@ -239,7 +242,7 @@ pub struct Mec {
 
 impl Mec {
     pub fn new(ram: Arc<crate::dev::crime_mem::O2Memory>) -> Self {
-        Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None), irq: std::sync::OnceLock::new(), heartbeat: std::sync::OnceLock::new() }
+        Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None), backend: std::sync::OnceLock::new(), irq: std::sync::OnceLock::new(), heartbeat: std::sync::OnceLock::new() }
     }
 
     /// Light the status bar's Ethernet activity bits in `heartbeat`.
@@ -271,7 +274,9 @@ impl Mec {
     /// its own: frames sent go on `link.to_net`, frames on `link.from_net` are
     /// received.
     pub fn attach(&self, mut link: crate::net::Link) {
-        link.spawn("ip32-mec-net");
+        if let Some(b) = link.spawn("ip32-mec-net") {
+            let _ = self.backend.set(b);
+        }
         *self.link.lock().unwrap() = Some(link.into_rings());
     }
 
@@ -802,6 +807,22 @@ mod tests {
         m.write64(reg::PHY_ADDRESS, u64::from((phy << 5) | r));
         m.write64(reg::PHY_READ_INITIATE, 1);
         m.read64(reg::PHY_DATA)
+    }
+
+    /// A dropped MEC lets go of its backend's host sockets at once, so the
+    /// machine built next can bind the same port forwards.
+    #[test]
+    fn a_dropped_mec_frees_its_port_forwards() {
+        let (_hold, port, config) = crate::net::Link::forward_on_a_held_port();
+        let (m, _) = mec();
+        m.attach(crate::net::Link::with_gateway(config).unwrap().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(std::time::Instant::now() < deadline, "the forward never listened");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(m);
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "the old backend still holds the forward");
     }
 
     #[test]
