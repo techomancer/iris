@@ -201,6 +201,7 @@ pub mod physical;
 pub mod ip22_bus;
 pub mod monitor;
 pub mod locks;
+pub mod sync;
 pub mod net;
 pub mod bench_report;
 pub mod benchsuite;

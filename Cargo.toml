@@ -378,8 +378,8 @@ libc = "0.2"
 # and CI socket's JSON replies.
 serde_json = "1.0"
 
-# Model checking of the PCI interrupt combiner's handshake: built only with
-# RUSTFLAGS="--cfg loom" (src/pci/intx.rs, `cargo test --lib intx::loom_tests`).
+# Model checking: built only with RUSTFLAGS="--cfg loom", which swaps the
+# primitives in src/sync.rs for loom's (`cargo test --lib intx::loom_tests`).
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
 

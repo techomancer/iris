@@ -33,10 +33,7 @@
 //! host as a steady 1. Run them with
 //! `RUSTFLAGS="--cfg loom" cargo test --release --lib intx::loom_tests`.
 
-#[cfg(loom)]
-use loom::sync::atomic::{AtomicU64, Ordering::*};
-#[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, Ordering::*};
+use crate::sync::atomic::{AtomicU64, Ordering::*};
 use std::sync::{Arc, Weak};
 
 use crossbeam_utils::CachePadded;
