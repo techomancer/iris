@@ -23,12 +23,12 @@
 //! never the other way round, so nothing in the Hub is called while it is
 //! held. Readers stay lock-free.
 //!
-//! The lines are written inside the hold. That is an exception to HACKING.md's
-//! Locks rule 2, which raises interrupts outside a state lock: a writer that
+//! The lines are written inside the hold. That is an exception to the rule
+//! that interrupts are raised outside a state lock: a writer that
 //! sampled the inputs and was then descheduled would write a level the
 //! registers no longer held, after another writer's fall and rise. The
-//! Interrupts section's order (a controller drives the next one up under its
-//! own lock) is the one kept, and it holds only while nothing calls down into
+//! order every other controller keeps (one drives the next up under its own
+//! lock) is the one kept here, and it holds only while nothing calls down into
 //! the Hub with `lines` held. (A parked processor's wake, with `idle-pause`,
 //! takes only the parker's own leaf lock.)
 //!
@@ -292,7 +292,12 @@ impl Pi {
     }
 
     /// Let go of the processors' words: nothing is published to them again.
+    /// A publish already inside [`Self::write_lines`], such as the comparator
+    /// timer's callback that removing the timer does not wait for, holds
+    /// `lines`; taking it here makes the clear wait that publish out, so the
+    /// words can be freed once this returns.
     pub fn clear_cpu_interrupts(&self) {
+        let _lines = self.lines.lock();
         for word in &self.words {
             word.store(std::ptr::null_mut(), Ordering::SeqCst);
         }
@@ -375,6 +380,9 @@ impl Pi {
     /// reset vector. The word is the one the three lines are published into,
     /// so this needs no lock and no machine; a slice with no word wired
     /// resets nothing. What the store does beyond that is not established.
+    /// It runs only from a processor's store to PI_SOFTRESET, and a machine
+    /// stops its processors before it clears the words, so it needs no wait
+    /// of its own for [`Self::clear_cpu_interrupts`].
     fn soft_reset(&self, slice: usize) {
         let p = self.words[slice].load(Ordering::SeqCst);
         if p.is_null() {
@@ -403,14 +411,11 @@ impl Pi {
         if p.is_null() {
             return;
         }
-        // SAFETY: `set_cpu_interrupts`'s contract. The pointer was loaded just
-        // above, and nothing here keeps `clear_cpu_interrupts` from running
-        // before the write, so this is sound only while no thread can reach
-        // here after the word is freed. A machine guarantees that by stopping
-        // every thread that publishes (processors, devices, the Hub's timers)
-        // before it clears the words and frees the processors; the clear then
-        // guards a publisher that arrives later, it does not wait for one that
-        // is running.
+        // SAFETY: `set_cpu_interrupts`'s contract. The pointer was loaded under
+        // `lines`, which `clear_cpu_interrupts` also takes: the clear waits for
+        // this write to finish and every later publish sees a null pointer. A
+        // machine clears the words before it frees the processors, so the word
+        // outlives every publish that loads it.
         let word = unsafe { &*p };
         let want = self.outputs(s);
         let have = (word.load(Ordering::SeqCst) >> CAUSE_SHIFT) & LINE_MASK;
