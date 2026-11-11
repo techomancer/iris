@@ -68,11 +68,12 @@ function Invoke-ResidentTests {
 try {
     Invoke-ResidentTests 'resident_' 25 $false
     Invoke-ResidentTests 'dev::ng1::rex3_flat_fill::tests' 4 $false
+    Invoke-ResidentTests 'dev::ng1::wgpu::line::tests' 2 $false
     Invoke-ResidentTests 'dev::ng1::wgpu::command::tests' 3 $false
     Invoke-ResidentTests 'direct_ng1_scanout_' 3 $false
     foreach ($name in $requestedBackends) {
         $env:REX3_RESIDENT_BACKEND = $name
-        Invoke-ResidentTests 'resident_gpu_' 10 $true
+        Invoke-ResidentTests 'resident_gpu_' 11 $true
         Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 8 $true
     }
 } finally {

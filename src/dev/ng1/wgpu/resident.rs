@@ -11,17 +11,22 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::dev::ng1::rex3::{Rex3Context, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH};
+use crate::dev::ng1::rex3::{
+    Rex3Context, DRAWMODE0_ADRMODE_A_LINE, DRAWMODE0_ADRMODE_F_LINE,
+    DRAWMODE0_ADRMODE_I_LINE, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
+};
 use crate::dev::ng1::rex3_flat_fill::{prepare_resident_flat_fill, FillPlane};
 use crate::wgpu::host::HostBuffer;
 use crate::wgpu::tiles::{COARSE, LIST_CAP, MASK_WORDS, TILE_H, TILE_W};
 use crate::wgpu::{ArchShaders, Batch, BatchPipelines, Fragment, Full, Gpu, TileGrid};
 
 use super::command::{
-    COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_SPAN, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
-    MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot,
-    STATE_SOURCE_COLOR, STATE_WORDS, STATE_WRITE_MASK,
+    COMMAND_A_LINE, COMMAND_BLOCK, COMMAND_CLEAR, COMMAND_F_LINE, COMMAND_I_LINE,
+    COMMAND_SPAN, FLAG_LINE_MAJOR_DECREASING, FLAG_LINE_Y_MAJOR, FLAG_WRITE_AUX,
+    FLAG_WRITE_RGB, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand,
+    RexStateSlot, STATE_SOURCE_COLOR, STATE_WORDS, STATE_WRITE_MASK,
 };
+use super::line::prepare_line;
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
@@ -796,8 +801,13 @@ impl ResidentGpu {
                 ("REX_COMMAND_BLOCK", COMMAND_BLOCK),
                 ("REX_COMMAND_SPAN", COMMAND_SPAN),
                 ("REX_COMMAND_CLEAR", COMMAND_CLEAR),
+                ("REX_COMMAND_I_LINE", COMMAND_I_LINE),
+                ("REX_COMMAND_F_LINE", COMMAND_F_LINE),
+                ("REX_COMMAND_A_LINE", COMMAND_A_LINE),
                 ("REX_FLAG_WRITE_RGB", FLAG_WRITE_RGB),
                 ("REX_FLAG_WRITE_AUX", FLAG_WRITE_AUX),
+                ("REX_FLAG_LINE_Y_MAJOR", FLAG_LINE_Y_MAJOR),
+                ("REX_FLAG_LINE_MAJOR_DECREASING", FLAG_LINE_MAJOR_DECREASING),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),
                 ("REX_STATE_WRITE_MASK", STATE_WRITE_MASK as u32),
                 ("REX_STATE_SOURCE_COLOR", STATE_SOURCE_COLOR as u32),
@@ -976,6 +986,57 @@ impl ResidentGpu {
         }
         Ok(())
     }
+
+    fn enqueue_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
+        let command = prepare_line(context).map_err(ResidentError::Unsupported)?;
+        let position = self.progress.lock().next_position()?;
+        let line = command.line();
+        if let Some(line) = line {
+            if line.payload_words as usize > MAX_PAYLOAD_WORDS {
+                return Err(ResidentError::Unsupported("line payload length"));
+            }
+            let slot = RexStateSlot::for_line(context, line);
+            loop {
+                let checkpoint = self.payload.checkpoint();
+                let payload = match self.payload.append_iter(command.payload()) {
+                    Ok(payload) => payload,
+                    Err(Full) if !self.batch.is_empty() => {
+                        self.submit()?;
+                        continue;
+                    }
+                    Err(Full) => {
+                        return Err(ResidentError::InvalidState("one line exceeds the payload arena"));
+                    }
+                };
+                let result = self.batch.prim_with_slot(
+                    slot,
+                    line.min_x,
+                    line.min_y,
+                    line.max_x,
+                    line.max_y,
+                    |slot| RexCommand::line(slot, line, payload),
+                );
+                match result {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("prepared line missed its raster grid"));
+                    }
+                    Err(Full) if !self.batch.is_empty() => {
+                        self.payload.rollback(checkpoint);
+                        self.submit()?;
+                    }
+                    Err(Full) => {
+                        self.payload.rollback(checkpoint);
+                        return Err(ResidentError::InvalidState("one line exceeds an empty batch"));
+                    }
+                }
+            }
+        }
+        self.progress.lock().accept(position, line.map(|line| line.plane));
+        command.finish(context);
+        Ok(())
+    }
 }
 
 impl ResidentBackend for ResidentGpu {
@@ -988,6 +1049,14 @@ impl ResidentBackend for ResidentGpu {
 
     fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
         self.gpu.check().map_err(gpu_error)?;
+        if matches!(
+            context.drawmode0.adrmode(),
+            DRAWMODE0_ADRMODE_I_LINE
+                | DRAWMODE0_ADRMODE_F_LINE
+                | DRAWMODE0_ADRMODE_A_LINE
+        ) {
+            return self.enqueue_line(context);
+        }
         let command = prepare_resident_flat_fill(context).map_err(ResidentError::Unsupported)?;
         let position = self.progress.lock().next_position()?;
         let fill = command.fill();

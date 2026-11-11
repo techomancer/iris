@@ -1710,14 +1710,14 @@ pub fn draw_aline_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
         let yef = (ctx.yend >> 7) & 0xF;
         if xsf != 0 || ysf != 0 {
             let wi = ((xsf + ysf) as usize).min(15);
-            let w = (ctx.aweight0 >> (wi * 4)) & 0xF;
+            let w = ctx.aweight0.checked_shr((wi * 4) as u32).unwrap_or(0) & 0xF;
             if w == 0 {
                 extra_skip_first = true;
             }
         }
         if xef != 0 || yef != 0 {
             let wi = ((xef + yef) as usize).min(15);
-            let w = (ctx.aweight1 >> (wi * 4)) & 0xF;
+            let w = ctx.aweight1.checked_shr((wi * 4) as u32).unwrap_or(0) & 0xF;
             if w == 0 {
                 extra_skip_last = true;
             }

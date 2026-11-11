@@ -26,6 +26,9 @@ mod tests;
 mod command;
 
 #[cfg(test)]
+mod line;
+
+#[cfg(test)]
 pub(crate) mod resident;
 
 #[cfg(test)]
