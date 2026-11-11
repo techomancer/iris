@@ -724,3 +724,34 @@ fn a_reset_drops_the_lines_that_were_up() {
     let falls = |l: usize| t.pi.falls[l].load(Ordering::SeqCst);
     assert_eq!((falls(0), falls(2)), (1, 1));
 }
+
+/// A failed uncached load sets its processor's "uncached uncorrectable" bit
+/// of the error pending register (bit 21 for A, 20 for B), and a store of
+/// ones clears it. The stock PROM 6.156 writes 0x30_0000 after its probe,
+/// which is those two bits. Other bits are not sources here and a clear
+/// leaves the ones it does not name.
+#[test]
+fn a_failed_read_sets_the_error_pending_bit_a_store_of_ones_clears() {
+    let t = Fixture::new(2);
+    assert_eq!(t.r(reg::ERR_INT_PEND), 0);
+    t.pi.read_error(0, 0x240_0208);
+    assert_eq!(t.r(reg::ERR_INT_PEND), 1 << 21);
+    t.pi.read_error(1, 0x240_0208);
+    assert_eq!(t.r(reg::ERR_INT_PEND), 0x30_0000);
+    // Writing zero, or the other processor's bit, clears nothing of A's.
+    t.pi.write_sized(reg::ERR_INT_PEND, 0, 8);
+    t.pi.write_sized(reg::ERR_INT_PEND, 1 << 20, 8);
+    assert_eq!(t.r(reg::ERR_INT_PEND), 1 << 21);
+    // The status record is a separate latch and survives the clear.
+    assert_ne!(t.r(reg::ERR_STATUS0_A), 0);
+    t.pi.write_sized(reg::ERR_INT_PEND, 0x30_0000, 8);
+    assert_eq!(t.r(reg::ERR_INT_PEND), 0);
+    assert_ne!(t.r(reg::ERR_STATUS0_A), 0);
+    // Bit 24 is the directory unit's; a store cannot touch it.
+    t.pi.write_sized(reg::ERR_INT_PEND, 1 << 24, 8);
+    assert_eq!(t.r(reg::ERR_INT_PEND), 0);
+    // Reset clears it.
+    t.pi.read_error(0, 8);
+    t.pi.power_on();
+    assert_eq!(t.r(reg::ERR_INT_PEND), 0);
+}
