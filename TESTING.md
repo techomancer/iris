@@ -375,11 +375,11 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 ```
 
 The script requires 25 `resident_` CPU tests, four flat-fill tests, two line
-tests, one pattern-state test, three command-ABI tests and three direct-state
-tests, then **15 resident GPU tests and eight direct scanout tests on each
-backend**: 84 tests in total. The window test requires an available native
-desktop and a GPU that can present to it. The script checks each libtest pass
-count, rejects
+tests, one shade-DDA test, one pattern-state test, three command-ABI tests and
+three direct-state tests, then **16 resident GPU tests and eight direct
+scanout tests on each backend**: 87 tests in total. The window test requires
+an available native desktop and a GPU that can present to it. The script
+checks each libtest pass count, rejects
 hardware skips and prints the selected adapter; both Vulkan and D3D12 must
 succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
 or `-Backend dx12` runs just one hardware backend and is not the complete
