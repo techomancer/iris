@@ -22,11 +22,12 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 
 use crate::dev::deadline::{decode, encode};
 use crate::dev::battery_clock;
 use crate::dev::ds1687::{image, MaceRtc};
+use crate::sync::Doorbell;
 use crate::snapshot::{field, field_bool, field_u8, field_u8s, StateTable};
 use crate::traits::{BusDevice, Device, MachineEvent, Saveable};
 
@@ -210,9 +211,9 @@ pub struct Ds1685 {
     /// Where the guest's power-off goes: one `PowerOff` event when it writes
     /// the bit.
     events: Option<SyncSender<MachineEvent>>,
-    /// The NVRAM image the writer thread has yet to put in the file.
-    job: Mutex<Option<NvramJob>>,
-    ready: Condvar,
+    /// The NVRAM image the writer thread has yet to put in the file, rung
+    /// when the timer hands one over.
+    job: Doorbell<Option<NvramJob>>,
     running: AtomicBool,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     me: Weak<Ds1685>,
@@ -224,8 +225,7 @@ impl Ds1685 {
             st: Mutex::new(Rtc::new()),
             dirty: AtomicU64::new(0),
             events,
-            job: Mutex::new(None),
-            ready: Condvar::new(),
+            job: Doorbell::new(None),
             running: AtomicBool::new(false),
             thread: Mutex::new(None),
             me: me.clone(),
@@ -312,8 +312,7 @@ impl Ds1685 {
     /// The debounce ran out: hand the image to the writer thread.
     pub fn hand_over(&self) {
         if let Some(job) = self.take_dirty(NVRAM_QUIET) {
-            *self.job.lock() = Some(job);
-            self.ready.notify_all();
+            self.job.ring(|slot| *slot = Some(job));
         }
     }
 
@@ -344,10 +343,8 @@ impl Ds1685 {
         loop {
             let job = {
                 let Some(d) = me.upgrade() else { return };
-                let mut slot = d.job.lock();
-                while slot.is_none() && d.running.load(Ordering::SeqCst) {
-                    d.ready.wait(&mut slot);
-                }
+                // Stopped, the writer still saves an image it was handed.
+                let mut slot = d.job.wait_until(|slot| slot.is_some()).unwrap_or_else(|slot| slot);
                 match slot.take() {
                     Some(j) => j,
                     None => return,
@@ -422,10 +419,7 @@ impl Device for Ds1685 {
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        // The writer waits on the job slot's lock: take it so the wake-up
-        // cannot fall between its check of `running` and its wait.
-        drop(self.job.lock());
-        self.ready.notify_all();
+        self.job.close();
         // The writer can hold the last reference for a moment, and then this
         // runs on it; it cannot join itself.
         if let Some(t) = self.thread.lock().take() {
@@ -433,6 +427,7 @@ impl Device for Ds1685 {
                 let _ = t.join();
             }
         }
+        self.job.reopen();
         self.flush();
     }
 

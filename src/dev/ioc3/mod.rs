@@ -1570,5 +1570,5 @@ impl Saveable for Ioc3 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests;
