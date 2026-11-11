@@ -590,8 +590,8 @@ impl TezroMachine {
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
         monitor.register_device(Arc::new(CpuMonitor::new(cpus.clone())));
-        monitor.register_device(PerfMonitor::new(
-            cpu.running_flag(), cpu.cycles_ptr(), cpu.fasttick_count(), None, None,
+        monitor.register_device(PerfMonitor::with_cpus(
+            cpu.running_flag(), cpus.iter().map(|c| c.cycles_ptr()).collect(), cpu.fasttick_count(),
         ));
         for device in board.monitor_devices() {
             monitor.register_device(device);
