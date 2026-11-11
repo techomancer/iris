@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::dev::ds1744::Ds1744;
 use crate::dev::ioc3_kbc::{self, Ioc3Kbc, KbcLine, KbcOwner};
@@ -693,19 +693,16 @@ impl Shared {
     /// Run `f` with the chip locked, then arm the timers for the deadlines it
     /// left and drive the line from its state.
     fn with_st<R>(&self, f: impl FnOnce(&mut St) -> R) -> R {
-        let (r, want) = {
-            let mut st = self.st.lock();
-            let r = f(&mut st);
-            (r, st.deadlines())
-        };
-        self.arm(want);
+        let mut st = self.st.lock();
+        let r = f(&mut st);
+        self.arm(st);
         self.sync_line();
         r
     }
 
-    /// Arm a timer for each deadline the chip holds.
-    fn arm(&self, want: Deadlines) {
-        self.timers.arm(&want, &self.running, &self.me, |_| Duration::ZERO, Shared::fire);
+    /// Arm a timer for each deadline the chip holds, then let the chip go.
+    fn arm(&self, st: MutexGuard<'_, St>) {
+        self.timers.arm(&st.deadlines(), st, &self.running, &self.me, |_| Duration::ZERO, Shared::fire);
     }
 
     /// A deadline passed with no guest access to notice it. Runs on the timer
@@ -873,8 +870,7 @@ impl Device for Ioc4 {
             );
         }
         drop(threads);
-        let want = self.sh.st.lock().deadlines();
-        self.sh.arm(want);
+        self.sh.arm(self.sh.st.lock());
     }
 
     /// Remove the timers, wait out a callback in flight and join the threads.
