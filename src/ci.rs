@@ -537,12 +537,24 @@ fn cmd_list(_args: &Value) -> Response {
     Response::data(serde_json::json!({ "snapshots": out }))
 }
 
+/// `saves/<name>`, if `name` is one plain directory name. A name that is
+/// absolute, `.` or nested would reach outside the snapshot it names.
+fn snapshot_dir(name: &str) -> Option<std::path::PathBuf> {
+    let mut parts = std::path::Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Some(std::path::Path::new("saves").join(name)),
+        _ => None,
+    }
+}
+
 fn cmd_info(args: &Value) -> Response {
     let name = match args.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
         None => return Response::err("info: missing 'name' arg"),
     };
-    let dir = std::path::Path::new("saves").join(name);
+    let Some(dir) = snapshot_dir(name) else {
+        return Response::err("info: invalid name");
+    };
     if !dir.is_dir() {
         return Response::err(format!("info: snapshot '{}' not found", name));
     }
@@ -589,10 +601,9 @@ fn cmd_delete(args: &Value) -> Response {
         Some(n) => n,
         None => return Response::err("delete: missing 'name' arg"),
     };
-    if name.is_empty() || name.contains("..") {
+    let Some(dir) = snapshot_dir(name) else {
         return Response::err("delete: invalid name");
-    }
-    let dir = std::path::Path::new("saves").join(name);
+    };
     if !dir.is_dir() {
         return Response::err(format!("delete: snapshot '{}' not found", name));
     }
@@ -1005,12 +1016,9 @@ fn cmd_diff(args: &Value) -> Response {
         Some(s) => s.to_string(),
         None => return Response::err("diff: missing 'b' arg"),
     };
-    if a.is_empty() || a.contains("..") || b.is_empty() || b.contains("..") {
+    let (Some(dir_a), Some(dir_b)) = (snapshot_dir(&a), snapshot_dir(&b)) else {
         return Response::err("diff: invalid name");
-    }
-
-    let dir_a = std::path::PathBuf::from("saves").join(&a);
-    let dir_b = std::path::PathBuf::from("saves").join(&b);
+    };
     if !dir_a.is_dir() {
         return Response::err(format!("diff: snapshot '{}' not found", a));
     }
@@ -1277,6 +1285,19 @@ fn cmd_push(args: &Value) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot name is one directory under `saves/`: an absolute path,
+    /// `.` or a nested path names something else, and `delete` would remove it.
+    #[test]
+    fn delete_takes_only_a_snapshot_name() {
+        let dir = crate::test_temp::TempPath::dir("ci-delete");
+        std::fs::write(dir.join("keep"), b"1").unwrap();
+        for name in [dir.to_str().unwrap(), ".", "a/b"] {
+            let r = cmd_delete(&serde_json::json!({ "name": name }));
+            assert!(!r.ok, "{name} refused");
+        }
+        assert!(dir.join("keep").exists());
+    }
 
     #[test]
     fn only_a_wait_that_ran_out_says_timeout() {
