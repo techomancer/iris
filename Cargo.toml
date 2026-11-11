@@ -386,11 +386,17 @@ loom = "0.7"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
-# blake3 hashes all 128 MB of VPro board memory in the replay, monitor and
-# fill tests. On x86-64 it runs hand-written assembly whatever the profile; on
-# aarch64 its NEON code is C intrinsics, which its build script compiles at
-# the profile's opt-level, so an unoptimised test build hashes there at a
-# small fraction of its speed.
+# Every dependency is built optimised in debug and test builds, iris itself is
+# not. The tests spend most of their time in dependencies: Cranelift and
+# regalloc2 compile the JIT's test cases, and blake3 hashes the 128 MB of VPro
+# board memory in the replay, monitor and fill tests.
+# Level 1 is as fast as 2 or 3 for these tests and costs less to build.
+[profile.dev.package."*"]
+opt-level = 1
+
+# blake3 stays at 3: it was measured at level 1 only on x86-64, where it runs
+# assembly whatever the level, and nothing says level 1 is enough for the NEON
+# intrinsics.
 [profile.dev.package.blake3]
 opt-level = 3
 
