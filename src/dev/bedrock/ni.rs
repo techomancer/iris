@@ -19,15 +19,22 @@ use parking_lot::Mutex;
 /// Length of the block-relative register aperture.
 pub(super) const SIZE: u64 = 0x2008;
 
-/// Port status bits 1:0 of a node with no cable. Bit 1, link up, is clear:
-/// real Fuels' PROM 6.210 consoles print "Local hub NUMAlink is down"
+/// Port status of a node with no cable.
+///
+/// Established from the PROM's and IRIX's code: only bit 1 is read, as
+/// link-up, and nothing reads bit 0 alone. With no peer the PROM polls bit 1,
+/// prints "Local hub NUMAlink is down", records code 0x9c and carries on, so
+/// bit 1 is clear here. Real Fuels' consoles show the same line
 /// (comp.sys.sgi.admin, Atro Tossavainen 2005-04-13, Tristram Scott
-/// 2007-07-18). Bit 0 is chosen to keep IRIX quiet and is unconfirmed: with
-/// bits 1:0 at 0 and reset enable 0, the IRIX 6.5.30 bus-error handler prints
+/// 2007-07-18).
+///
+/// Unknown: bits 0 and 2 and the word as a whole on a real uncabled Fuel.
+/// Bit 0 is our choice, kept because the IRIX 6.5.30 bus-error handler prints
 /// "Detected a link reset due to other partition reset" on every faulting
-/// widget probe, and the 2005 Fuel's IRIX took a PIO read error with no such
-/// line. Which nonzero value hardware reads is unknown; a PROM-monitor read
-/// of this register on an uncabled node would settle it.
+/// widget probe when this word and the reset-enable register are both zero,
+/// and the 2005 Fuel's IRIX took a PIO read error with no such line. The
+/// choice only has to keep the word nonzero with bit 1 clear. A read of this
+/// register on an uncabled node would settle the real value.
 const PORT_STATUS_UNCABLED: u64 = 1;
 
 pub mod reg {
