@@ -6712,6 +6712,7 @@ mod tests {
 
     #[test]
     fn fpu_load_store_with_mem_helpers_matches_interpreter() {
+        let _lock = crate::cpu::jitv2::codegen::MEM_HELPERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = crate::cpu::jitv2::codegen::mem_helpers_enabled();
         crate::cpu::jitv2::codegen::set_mem_helpers_enabled(true);
 

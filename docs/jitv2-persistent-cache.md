@@ -80,11 +80,16 @@ Compiled code can bake two kinds of host address:
   (ASLR). **Only under `IRIS_BAKE_HOOKS=1`**: baking measured as a code-size
   loss, so it is off by default, and codegen loads the pointer from the core.
 - **Shared memory-helper addresses** (`emit_mem_helper_call`): they live in
-  the JIT arena. Off by default (`IRIS_MEM_HELPERS` enables them).
+  the JIT arena. The helpers are built whenever the data cache's geometry
+  allows them, but code calls them only when `IRIS_MEM_HELPERS` (or
+  `j2 memhelpers on`) enables them, which by default it does not.
 
 So default compiled code is already position independent: the core pointer is
 a function argument, never baked. `Codegen::cache_fingerprint` refuses (no
-caching) when either switch would put an address in the code.
+caching) only when a switch is on that puts an address in the code: baked
+hooks, or helpers that are both built and enabled. Each compile also reads the
+helper switch once and stores nothing that had a helper address to call, so
+turning the helpers on mid-run can't leave a baked address in the cache.
 
 Correction: an earlier draft reported a cost for `IRIS_JIT_PIC=1` (median
 +1.1%, geometric mean +2.7% on jitcov). With `IRIS_BAKE_HOOKS` unset, the
