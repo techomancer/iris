@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -334,6 +335,11 @@ pub fn null_serial_backend() -> Arc<dyn SerialBackend> {
 pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
     guest_to_host: Mutex<Vec<u8>>,
+    /// Counts the times the buffer was emptied (a drain, a reset or a wait
+    /// taking its match), changed under the buffer's lock. A `wait_for` that
+    /// sees it change searches from the start again, as what it had searched
+    /// is gone.
+    drains: AtomicU64,
     cv: Condvar,
     /// Optional file mirror: every byte that flows through ttyd1 in either
     /// direction is appended here. Host-injected bytes are echoed by IRIX
@@ -347,6 +353,7 @@ impl CiSerialBackend {
         Self {
             host_to_guest: Mutex::new(VecDeque::new()),
             guest_to_host: Mutex::new(Vec::new()),
+            drains: AtomicU64::new(0),
             cv: Condvar::new(),
             log: Mutex::new(None),
         }
@@ -368,6 +375,7 @@ impl CiSerialBackend {
     /// the buffer; the returned Vec is the guest output as raw bytes.
     pub fn drain_guest(&self) -> Vec<u8> {
         let mut q = self.guest_to_host.lock();
+        self.drains.fetch_add(1, Ordering::Relaxed);
         std::mem::take(&mut *q)
     }
 
@@ -381,26 +389,34 @@ impl CiSerialBackend {
         }
         let deadline = Instant::now() + timeout;
         let mut q = self.guest_to_host.lock();
+        // How much of the buffer earlier passes searched, so a pass after a
+        // wakeup looks at the new bytes only. The guest's transmit thread
+        // waits on the lock this holds. A match can straddle the old end,
+        // hence the needle's length less one is searched again.
+        let mut scanned = 0usize;
+        let mut seen = self.drains.load(Ordering::Relaxed);
+        let mut last = false;
         loop {
-            if let Some(pos) = find_subseq(&q, needle) {
-                let end = pos + needle.len();
+            // Another reader emptied the buffer under us, and it may have
+            // filled again past `scanned`: start over.
+            let drains = self.drains.load(Ordering::Relaxed);
+            if drains != seen {
+                (scanned, seen) = (0, drains);
+            }
+            let from = scanned.saturating_sub(needle.len() - 1);
+            if let Some(pos) = find_subseq(&q[from..], needle) {
+                let end = from + pos + needle.len();
                 let consumed: Vec<u8> = q.drain(..end).collect();
+                self.drains.fetch_add(1, Ordering::Relaxed);
                 return Some(consumed);
             }
-            let now = Instant::now();
-            if now >= deadline {
+            // One more pass after the wait times out, in case bytes arrived
+            // between the last pass and the timeout.
+            if last || Instant::now() >= deadline {
                 return None;
             }
-            if self.cv.wait_until(&mut q, deadline).timed_out() {
-                // One more scan in case bytes arrived between the last check
-                // and the timeout.
-                if let Some(pos) = find_subseq(&q, needle) {
-                    let end = pos + needle.len();
-                    let consumed: Vec<u8> = q.drain(..end).collect();
-                    return Some(consumed);
-                }
-                return None;
-            }
+            scanned = q.len();
+            last = self.cv.wait_until(&mut q, deadline).timed_out();
         }
     }
 
@@ -408,7 +424,9 @@ impl CiSerialBackend {
     /// output from the previous run doesn't leak into the next test.
     pub fn reset(&self) {
         self.host_to_guest.lock().clear();
-        self.guest_to_host.lock().clear();
+        let mut q = self.guest_to_host.lock();
+        self.drains.fetch_add(1, Ordering::Relaxed);
+        q.clear();
     }
 }
 
@@ -669,6 +687,49 @@ mod tests {
         assert_eq!(std::fs::read(&log_path).unwrap(), b"n");
         assert!(backend.recv_byte().is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A needle that arrives a byte at a time, so no wakeup sees all of it,
+    /// is still found, and only up to its end is consumed.
+    #[test]
+    fn wait_for_finds_a_match_split_across_wakeups() {
+        let ci = Arc::new(CiSerialBackend::new());
+        let waiter = {
+            let ci = ci.clone();
+            std::thread::spawn(move || ci.wait_for(b"login: ", Duration::from_secs(10)))
+        };
+        for &b in b"boot\r\nlogin: more" {
+            ci.send_byte(b);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(waiter.join().unwrap().as_deref(), Some(&b"boot\r\nlogin: "[..]));
+        assert_eq!(ci.drain_guest(), b"more");
+    }
+
+    /// A drain and a refill that land together, past the point a parked
+    /// waiter last searched, must not hide the needle at the start of the new
+    /// output. The refill is made without a wake-up and one follows it, so the
+    /// waiter first looks at it after both.
+    #[test]
+    fn wait_for_sees_output_that_refilled_a_drained_buffer() {
+        let ci = Arc::new(CiSerialBackend::new());
+        ci.guest_to_host.lock().extend_from_slice(b"0123456789");
+        let waiter = {
+            let ci = ci.clone();
+            std::thread::spawn(move || ci.wait_for(b"NEEDLE", Duration::from_secs(10)))
+        };
+        // notify_all reports how many threads it woke, so a non-zero count
+        // proves the waiter has searched the ten bytes and parked. Nothing
+        // changed, so it searches again and parks again with the same offset.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ci.cv.notify_all() == 0 {
+            assert!(Instant::now() < deadline, "waiter never parked");
+            std::thread::yield_now();
+        }
+        assert_eq!(ci.drain_guest(), b"0123456789");
+        ci.guest_to_host.lock().extend_from_slice(b"NEEDLE and more bytes");
+        ci.cv.notify_all();
+        assert_eq!(waiter.join().unwrap().as_deref(), Some(&b"NEEDLE"[..]));
     }
 
     #[cfg(unix)]
