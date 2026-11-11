@@ -132,7 +132,7 @@ impl Unmapped {
         let mut u = self.misses.lock();
         if !u.iter().any(|&(a, w, _)| a == addr && w == write) {
             if std::env::var_os("IRIS_IP30_TRACE").is_some() {
-                crate::safe_eprintln!("ip30: unmapped {} at {addr:#x} (pc {pc:#x})", if write { "write" } else { "read" });
+                eprintln!("ip30: unmapped {} at {addr:#x} (pc {pc:#x})", if write { "write" } else { "read" });
             }
             u.push((addr, write, pc));
             if u.len() == 64 {

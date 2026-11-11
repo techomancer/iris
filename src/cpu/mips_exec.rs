@@ -2639,7 +2639,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     #[allow(clippy::too_many_arguments)]
     fn report_bus_error(&self, op: BusErrorOp, size: usize, virt_addr: u64, phys_addr: u64, val: u64, mask: u64, status: u32) {
         match op {
-            BusErrorOp::Fetch => crate::safe_eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}{}", virt_addr, phys_addr, status, self.fault_note(phys_addr, size)),
+            BusErrorOp::Fetch => eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}{}", virt_addr, phys_addr, status, self.fault_note(phys_addr, size)),
             BusErrorOp::Read => {
                 // jitcheck tag: which pass this read happened in, so a
                 // divergence investigation can tell at a glance whether
@@ -2657,10 +2657,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 };
                 #[cfg(not(feature = "developer"))]
                 let jitcheck_pass = "";
-                crate::safe_eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}{}", size*8, self.core.pc, virt_addr, phys_addr, status, jitcheck_pass, self.fault_note(phys_addr, size));
+                eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}{}{}", size*8, self.core.pc, virt_addr, phys_addr, status, jitcheck_pass, self.fault_note(phys_addr, size));
             }
-            BusErrorOp::Write => crate::safe_eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", size*8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size)),
-            BusErrorOp::MaskedWrite => crate::safe_eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, status, self.fault_note(phys_addr, size)),
+            BusErrorOp::Write => eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}", size*8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size)),
+            BusErrorOp::MaskedWrite => eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}{}", self.core.pc, virt_addr, phys_addr, val, mask, status, self.fault_note(phys_addr, size)),
         }
     }
 
@@ -2678,7 +2678,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     #[cold]
     #[inline(never)]
     fn post_refused_store(&mut self, virt_addr: u64, phys_addr: u64, size: usize, val: u64, status: u32) {
-        crate::safe_eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
+        eprintln!("Unsupported uncached write{} (posted, completes): PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}{}",
             size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
     }
 
@@ -4653,7 +4653,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             };
             let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
             if exc_code == EXC_IBE || exc_code == EXC_DBE {
-                crate::safe_eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
+                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
                     if exc_code == EXC_IBE { "IBE" } else { "DBE" },
                     self.core.pc, epc);
                 return EXEC_BREAKPOINT;
@@ -4739,7 +4739,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             };
             let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
             if exc_code == EXC_IBE || exc_code == EXC_DBE {
-                crate::safe_eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
+                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
                     if exc_code == EXC_IBE { "IBE" } else { "DBE" },
                     fault_pc, epc);
                 return EXEC_BREAKPOINT;
@@ -4818,7 +4818,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             };
             let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
             if exc_code == EXC_IBE || exc_code == EXC_DBE {
-                crate::safe_eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
+                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
                     if exc_code == EXC_IBE { "IBE" } else { "DBE" },
                     self.core.pc, epc);
                 return EXEC_BREAKPOINT;

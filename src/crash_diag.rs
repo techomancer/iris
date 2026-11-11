@@ -120,48 +120,13 @@ fn install_panic_hook() {
         );
 
         append_to_log(report.as_bytes());
-        // Not `eprint!`: that panics when stderr is unwritable (a full disk),
-        // and a panic inside the hook aborts before the default hook runs.
-        write_report(&mut std::io::stderr().lock(), &report);
+        eprint!("{report}");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
 
         IN_HOOK.store(false, Ordering::SeqCst);
         default_hook(info);
     }));
-}
-
-/// Write a crash report to `w`, ignoring a write error: the report has
-/// already gone to the log file, and a stderr that cannot take it is no
-/// reason to lose the original panic.
-fn write_report(w: &mut dyn std::io::Write, report: &str) {
-    let _ = w.write_all(report.as_bytes());
-    let _ = w.flush();
-}
-
-/// Print `args` and a newline to stderr, ignoring any error.
-///
-/// `eprintln!` panics when stderr cannot be written, as when the disk it is
-/// redirected to is full. The diagnostics that fire on a guest's bad access
-/// are exactly the ones that repeat while that goes on, and the panic hook
-/// would then fail the same way and abort the emulator. Use this through
-/// [`safe_eprintln!`] for such prints; ordinary output keeps `eprintln!`.
-#[cold]
-#[inline(never)]
-pub fn safe_eprintln(args: std::fmt::Arguments<'_>) {
-    write_line(&mut std::io::stderr().lock(), args);
-}
-
-/// `args` and a newline to `w` in one call, errors ignored.
-fn write_line(w: &mut dyn std::io::Write, args: std::fmt::Arguments<'_>) {
-    let _ = w.write_fmt(format_args!("{args}\n"));
-}
-
-/// `eprintln!` that does not panic when stderr is unwritable. See
-/// [`safe_eprintln`].
-#[macro_export]
-macro_rules! safe_eprintln {
-    ($($arg:tt)*) => {
-        $crate::crash_diag::safe_eprintln(format_args!($($arg)*))
-    };
 }
 
 fn payload_str<'a>(info: &'a std::panic::PanicHookInfo<'a>) -> &'a str {
@@ -646,42 +611,5 @@ mod windows {
         fn as_str(&self) -> &str {
             core::str::from_utf8(&self.data[..self.len]).unwrap_or("<bad-utf8>")
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io;
-
-    /// A stderr whose disk is full: every write fails, as `ENOSPC` does.
-    struct Full;
-    impl io::Write for Full {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from_raw_os_error(28))
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(28))
-        }
-    }
-
-    #[test]
-    fn a_line_goes_out_whole() {
-        let mut out = Vec::new();
-        write_line(&mut out, format_args!("Bus error: PA={:08x}", 0x1fa0_0000u32));
-        assert_eq!(out, b"Bus error: PA=1fa00000\n");
-    }
-
-    #[test]
-    fn a_line_to_an_unwritable_stream_is_dropped_quietly() {
-        write_line(&mut Full, format_args!("Bus error"));
-    }
-
-    #[test]
-    fn a_crash_report_to_an_unwritable_stream_is_dropped_quietly() {
-        write_report(&mut Full, "iris panic");
-        let mut out = Vec::new();
-        write_report(&mut out, "iris panic");
-        assert_eq!(out, b"iris panic");
     }
 }
