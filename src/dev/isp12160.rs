@@ -11,18 +11,15 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 
 use crate::dev::isp1040::{
-    mbox, reg, Bank, Core, Isp, IspPart, Locked, State, CFG1_BANK_SELECT, FW_VERSION, IOCB_ABORTED, IOCB_RESET, MAILBOX_COUNT,
+    mbox, Isp1040, reg, Bank, Core, Isp, IspPart, Locked, State, CFG1_BANK_SELECT, FW_VERSION, IOCB_ABORTED, IOCB_RESET, MAILBOX_COUNT,
     MAX_REQUESTS, MAX_TARGET, PCI_CLASS_SCSI, PCI_VENDOR_QLOGIC, SEMAPHORE_LOCK, STATE_ALL_PHASES,
 };
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_INTA};
-use crate::scsi::{ScsiBus, ScsiIdentities, ScsiIdentity};
+use crate::scsi::ScsiBus;
 use crate::snapshot::{get_field, hex_u16, hex_u32, load_u16_slice, toml_u16, toml_u32, toml_u8, u16_slice_to_toml};
 use crate::traits::{Device, Resettable, Saveable};
 use crate::workstation::DiscChanger;
-
-const ISP_DISK: ScsiIdentity = ScsiIdentity::new(b"SGI     ", b"IRIS EMULATED   ", b"1.0 ");
-const ISP_CDROM: ScsiIdentity = ISP_DISK;
 
 pub struct Isp12160Part;
 
@@ -188,9 +185,10 @@ impl Isp12160 {
         self.0.set_heartbeat(heartbeat);
     }
 
-    /// A 16-id bus with the ISP controller's disk and CD-ROM identities.
+    /// A 16-id bus with the ISP controllers' disk and CD-ROM identities:
+    /// the ISP1040's bus, which is the same 16 ids.
     pub fn new_bus() -> ScsiBus {
-        ScsiBus::new(16, ScsiIdentities { disk: ISP_DISK, cdrom: ISP_CDROM })
+        Isp1040::new_bus()
     }
 
     /// The controller with its two channel buses already populated.
@@ -320,6 +318,20 @@ impl PciFunction for Isp12160 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CD-ROM answers INQUIRY with the CD-ROM identity every other
+    /// controller gives an emulated drive, not the disk's.
+    #[test]
+    fn an_emulated_cdrom_reports_the_cdrom_identity() {
+        use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiRequest, CDROM_IDENTITY};
+        let bus = Isp12160::new_bus();
+        bus.attach_device(2, "", true, Vec::new(), false, None, false).unwrap();
+        let mut targets = bus.lock();
+        let req = ScsiRequest { cdb: vec![scsi_cmd::INQUIRY, 0, 0, 0, 36, 0], data_len: ScsiDataLength::Unlimited, data_in: None };
+        let inquiry = targets[2].as_mut().unwrap().request(&req).unwrap().data;
+        assert_eq!(&inquiry[8..16], &CDROM_IDENTITY.vendor);
+        assert_eq!(&inquiry[16..32], &CDROM_IDENTITY.product);
+    }
 
     /// The machine disc API uses target 17 for channel 1, target 1.
     #[test]

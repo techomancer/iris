@@ -36,6 +36,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   Ctrl-R search), cursor movement and mid-line editing. History persists across
   runs, the last 1000 lines, in the user's data directory. Piped input and the
   monitor's TCP port are unchanged.
+### Fuel and Tezro SCSI disk names
+
+- The ISP12160 controller on the Fuel and Tezro boards now reports its disks
+  as `IRIS EMUL DISK` and its CD-ROM as `IRIS EMUL CDROM`, as the other SCSI
+  controllers do. The CD-ROM was reported with the disk's `IRIS EMULATED`
+  product string.
 
 ### Host audio
 
